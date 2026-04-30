@@ -19,25 +19,43 @@
 
 ---
 
-## 2. 为什么单 agent / 多 phase、不串联多 agent？
+## 2. agent 数量怎么选：可单可多、phase 之间走文件 hand-off
 
-### 多 agent 串联的 4 大失败模式（Cognition Labs 总结）
+### 项目本质是 workflow、不是 multi-agent
 
-1. **上下文断裂**：AI1 → AI2 hand-off 时丢失关键信息（如 PM 备注、隐性约束）
-2. **错误放大**：AI1 错一点、AI2 基于错的输入做、AI3 基于错错的输出 review、最终全错
-3. **debug 灾难**：5 段哪段错的、查到崩溃；日志再多也定位难
-4. **共识盲点**：同生态 AI 共识 80%、剩下 20% 它们一起看不到——AI 自审悖论
+spec → plan → build 是 phase chain、每段产物落盘、下一段读上一段产物作为输入。这就是 Anthropic *Building Effective Agents* 描述的「Prompt Chaining」+「Orchestrator-Workers」混合模式。
 
-### 单 agent 多 phase 的优势
+### 两种合法的 agent 实现路径（按场景选）
 
-- 单 agent 的会话自然带连贯上下文（spec → plan → build 链路里、agent 知道前面做过什么）
-- HITL 在 phase 之间介入、用户可以修 spec、agent 基于修后版本继续
-- 一旦失败、只需重跑当前 phase、不重跑全链路
+| 实现 | 优势 | 代价 | 适合场景 |
+|---|---|---|---|
+| **单 agent 全程**（一个 SDKAgent 跑到底） | 会话天然带连贯上下文、agent 知道前面做过什么；少一次 prompt 注入；token 略省 | 长任务 context window 会爆；不能给不同 phase 用不同模型 | 小到中等需求、走通流程优先 |
+| **每 phase 独立 agent**（每段起新 SDKAgent、读文件作输入） | 隔离 context、避免长会话失控；每 phase 可独立换模型 / 改 prompt；失败重跑成本低 | 多次 prompt 注入；hand-off 要严格按 schema | 大需求、长时间任务、想给 build 用更强模型 |
 
-### 但要注意
+二者本项目都要支持、UI 上让用户在新建任务时切换。具体怎么暴露这个 toggle、留给 W2 主流程设计时定。
 
-- 单 agent 长会话有 context window 上限——本项目当前每 phase 独立创建 agent、未来 W2+ 可考虑共享会话；权衡上下文 vs 会话寿命
-- composer-2 当前 200k 上下文、足够支撑 spec → plan → build 三段
+### Cognition *Don't Build Multi-Agents* 警告什么、不警告什么
+
+| Cognition 反对 | 本项目 |
+|---|---|
+| 多 agent 同时跑、互相谈判（如 PM 和 Dev 互相砍需求） | 否、phase 串行 |
+| 隐式 hand-off（agent A 把状态留在记忆里、agent B 自动读） | 否、走 markdown 文件 + 明确 schema |
+| 共享记忆 / 共享会话池在多 agent 间分裂 | 否、每个 phase 的 agent 自带独立会话 |
+| 「workflow 里多个 agent 节点」 | **没反对**——这是 Anthropic 推荐范式 |
+
+> 业界容易把所有「多 agent」混为一谈、其实 Cognition 警告的是**「真·multi-agent 协作」**那种、不是 phase chain。本项目走的是后者、引用 Cognition 时要分清。
+
+### Cognition 列的 4 大失败模式我们怎么规避
+
+1. **上下文断裂**：phase 间 hand-off 走 markdown 文件 + 严格 schema、不靠隐式记忆
+2. **错误放大**：每 phase 之间强制 HITL ack、用户能修 spec.md 后再进 plan
+3. **debug 灾难**：每 phase 产物落盘 + jsonl 日志、定位到具体 phase 不需要看 agent 内部
+4. **共识盲点**：不做 AI 自审 review bot、关键决策走 HITL
+
+### 工程注意
+
+- 单 agent 长会话有 context window 上限——`composer-2` 当前 200k 够支撑 spec → plan → build 三段、但大 swagger / 大 PRD 时要切「每 phase 独立 agent」
+- 不论单/多 agent、phase 之间的产物落盘是**绝对底线**——没有这个、debug 和重跑都没法做
 
 ---
 
@@ -166,7 +184,7 @@ const reader = res.body.getReader();
 
 - **LangGraph**：状态机抽象、本项目当前 phase 间是直线、没必要
 - **LangChain**：抽象层叠太多、调试痛苦、不可控
-- **Mastra / CrewAI**：multi-agent 取向、和单 agent 哲学相悖
+- **Mastra / CrewAI**：定位「真·multi-agent 协作」（角色谈判、共享记忆）、和本项目「workflow + 多 agent 节点、文件 hand-off」哲学不同；本项目目前用 `@cursor/sdk` 直接管 agent 即可、没必要套这层框架
 
 **结论**：保持简单——`@cursor/sdk` + `fs` + Next.js、足够。等真有复杂状态机需求再说。
 

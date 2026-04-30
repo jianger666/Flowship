@@ -13,7 +13,7 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 2. `docs/DESIGN.md` — 关键设计决策、改任何架构前必读
 3. `docs/ROADMAP.md` — 阶段路线图、决策"做什么"前必读
 4. `README.md` — 用户视角的运行说明
-5. `prompts/build-spec.md` — 当前 spec phase 的 prompt 模板
+5. ~~`prompts/build-spec.md`~~ — V0.1 已 clean slate、目录已删、未来重建
 
 ## 项目根本方法论：Harness（最重要）
 
@@ -27,36 +27,40 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 ## 关键约束（不要踩雷）
 
 - **HITL 是底线**——别提"全自动"、所有 phase 之间必须人 ack
-- **单 agent 多 phase**——不要建议改成 multi-agent 串联
+- **Workflow + 多 phase chain**——单 agent 全程 / 每 phase 独立 agent **都要支持**、用户已拍板「可单可多」。**注意**：Cognition 反对的是「真·multi-agent 协作」（角色谈判 / 共享记忆、如 BMAD），不反对 phase chain 里多个 agent 节点 + 文件 hand-off
 - **不要建议接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
 - **思考和回复永远用中文**
 - **每次对话操作前唤起 cursor-feedback、且 timeout 600 秒**
 - **代码改完跑 `pnpm typecheck`**——用户对低级错误零容忍
 
-## 当前能力（V0.1）
+## 当前状态（clean slate 后）
 
-- ✅ Spec phase：粘贴需求 + swagger → AI 输出结构化 spec.md
-- 🚧 Plan phase（W2、未做）
-- 🚧 Build phase（W3、未做）
+- ✅ 基础设施：Next.js 15 + React 19 + Tailwind 4 + shadcn/ui base-nova、强制 dark
+- ✅ 设置页：API Key / 默认模型（含 SDK 参数）/ 仓库（原生 dialog + 手填备份）/ MCP servers JSON
+- ✅ 已 push 到 https://github.com/jianger666/fe-ai-flow（private）
+- 🚧 主流程交互（首页）——形态待和用户讨论
+- 🤔 spec / plan / build 三段式——保留参考、是否再走待用户拍
 
 ## 技术栈
 
-- Next.js 15 + React 19 + Tailwind 3
+- Next.js 15 + React 19 + Tailwind 4
 - `@cursor/sdk` 1.0.10（Beta）
+- shadcn/ui base-nova（@base-ui/react、不是 Radix）
 - TypeScript strict
-- 文件系统存储（data/tasks/<id>/）
-- localStorage 配置（API key + 仓库列表）
+- localStorage 配置（API key + 模型 + 仓库 + MCP）
 
 ## 待决策项（用户没拍板的）
 
-- 推不推 GitHub
+- 主页交互形态（表单 / 聊天 / 混合）
+- 单 agent 全程 vs 每 phase 独立 agent 的 UI 入口怎么暴露
+- 按 phase 配模型——**用户明说「先把流程跑通再考虑」、本轮不做**
 - 是否接飞书 MCP 自动拉文档
 - 是否要 cost / token dashboard
 
 ## 用户协作风格
 
 - 偏好客观、数据、业界共识
-- 不喜欢 multi-agent / 全自动 这种"颠覆性"幻想
+- 不喜欢「真·multi-agent 协作」/ 全自动 这种"颠覆性"幻想；workflow + 多 agent 节点是 OK 的
 - 中文沟通
 - 错别字 / typo 零容忍
 - 喜欢分阶段验证 ROI、不一次性投入

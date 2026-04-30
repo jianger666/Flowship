@@ -173,8 +173,8 @@ gitlab MR API 创 draft MR
 
 | 不做的事 | 为什么 |
 |---|---|
-| Multi-agent 串联 | Cognition 警告、共识盲点、debug 灾难 |
-| AI 自审 review bot | 单 agent 自审悖论、性价比低 |
+| 真·multi-agent 协作（PM/Dev/QA 互相谈判式、如 BMAD） | Cognition 警告、共识盲点、debug 灾难。注：phase chain 里多 agent 节点是合法的、跟这条不冲突 |
+| AI 自审 review bot | 共识盲点问题、性价比低 |
 | 跨 AI 厂商路由（LiteLLM） | 没必要、增加复杂度 |
 | 自动跑测试用例 | 公司没单测 / e2e、强行做没意义 |
 | 自动 merge MR | 责任归属问题、永远不该自动 |
