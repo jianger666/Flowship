@@ -1,0 +1,21 @@
+node_modules
+.next
+out
+build
+dist
+
+.env
+.env.local
+.env.*.local
+
+# Persisted task data (per-user)
+data/
+
+# TS incremental cache
+*.tsbuildinfo
+
+# Vercel
+.vercel
+
+.DS_Store
+*.log

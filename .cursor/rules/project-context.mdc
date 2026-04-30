@@ -1,0 +1,64 @@
+---
+alwaysApply: true
+description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
+---
+
+# fe-ai-flow 项目核心上下文
+
+**身份**：我是 `fe-ai-flow`、用户的私人项目、定位为公司前端项目通用自动化工具。
+
+## 必读文档（按优先级）
+
+1. `docs/HANDOFF.md` — 给 AI 对话的接力上下文、必读
+2. `docs/DESIGN.md` — 关键设计决策、改任何架构前必读
+3. `docs/ROADMAP.md` — 阶段路线图、决策"做什么"前必读
+4. `README.md` — 用户视角的运行说明
+5. `prompts/build-spec.md` — 当前 spec phase 的 prompt 模板
+
+## 项目根本方法论：Harness（最重要）
+
+**本项目就是 harness 工程化方法论的实操落地——所有架构决策、迭代建议都必须在 harness 框架内进行。**
+
+- 看 `docs/HANDOFF.md`「项目根本方法论：基于 Harness」章节是必读项
+- 加新能力之前先问：它对应 harness 哪个组件（角色 / 工具 / 记忆 / 流程 / 守门 / 观测 / 评估）？解决什么 reliability gap？
+- 业界共识来源排序：Anthropic *Building Effective Agents* > Cognition *Don't Build Multi-Agents* > 真生产案例（Copilot Workspace / Cursor Cloud / Aider / Replit）> 《AI Coding 工程化》（参考、不照搬）> 凭直觉
+- 用户问 harness 时不要套那本书的"五元素"、给业界主流答案
+
+## 关键约束（不要踩雷）
+
+- **HITL 是底线**——别提"全自动"、所有 phase 之间必须人 ack
+- **单 agent 多 phase**——不要建议改成 multi-agent 串联
+- **不要建议接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
+- **思考和回复永远用中文**
+- **每次对话操作前唤起 cursor-feedback、且 timeout 600 秒**
+- **代码改完跑 `pnpm typecheck`**——用户对低级错误零容忍
+
+## 当前能力（V0.1）
+
+- ✅ Spec phase：粘贴需求 + swagger → AI 输出结构化 spec.md
+- 🚧 Plan phase（W2、未做）
+- 🚧 Build phase（W3、未做）
+
+## 技术栈
+
+- Next.js 15 + React 19 + Tailwind 3
+- `@cursor/sdk` 1.0.10（Beta）
+- TypeScript strict
+- 文件系统存储（data/tasks/<id>/）
+- localStorage 配置（API key + 仓库列表）
+
+## 待决策项（用户没拍板的）
+
+- 推不推 GitHub
+- 是否接飞书 MCP 自动拉文档
+- 是否要 cost / token dashboard
+
+## 用户协作风格
+
+- 偏好客观、数据、业界共识
+- 不喜欢 multi-agent / 全自动 这种"颠覆性"幻想
+- 中文沟通
+- 错别字 / typo 零容忍
+- 喜欢分阶段验证 ROI、不一次性投入
+
+更细节看 `docs/HANDOFF.md`。
