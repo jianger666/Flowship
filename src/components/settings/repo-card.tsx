@@ -3,20 +3,22 @@
 /**
  * 仓库列表卡片
  *
- * 选目录优先走 macOS 原生 dialog（/api/fs/pick-folder）；
- * 失败 / 非 macOS 时降级到「手填路径」对话框、避免 Linux/Windows 同事完全用不了。
+ * 选目录走 FsPickerDialog（服务端文件浏览器、跨平台、能拿绝对路径）。
+ * 之前用 macOS osascript 限制了 Linux / Windows 同事用、已下线（保留路由文件做归档参考）。
  *
  * 仓库名规则：
  * - 默认取目录 basename
  * - 用户可重命名、但提交（onBlur）时如果是空串、自动 fallback 回 basename
  */
 
-import { FolderOpen, Loader2, Plus, Trash2 } from "lucide-react";
+import { FolderOpen, Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
+import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import {
   Card,
   CardAction,
@@ -25,6 +27,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { useDialog } from "@/hooks/use-dialog";
 
 import type { RepoConfig } from "@/lib/types";
 import { SaveButton } from "./save-button";
@@ -44,8 +47,10 @@ interface RepoCardProps {
 }
 
 export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
-  // 弹原生 dialog 期间禁止重复点（osascript 是模态阻塞的）
-  const [pickingFolder, setPickingFolder] = useState(false);
+  const { prompt } = useDialog();
+
+  // FsPickerDialog 的打开状态
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   // 添加一条仓库（路径已确定的情况）、name 默认 basename、重复路径直接拒绝
   const addRepo = (path: string) => {
@@ -57,44 +62,23 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
     onChange([...repos, { name: basename(path), path }]);
   };
 
-  // 走 macOS 原生 dialog；非 macOS 会被 server 拒绝（501）、走 fallback 手填
-  const pickFolder = async () => {
-    setPickingFolder(true);
-    try {
-      const res = await fetch("/api/fs/pick-folder", { method: "POST" });
-      const json = await res.json();
-      if (json.canceled) return;
-      if (res.status === 501) {
-        // 非 macOS server、降级让用户手填
-        promptManualPath();
-        return;
-      }
-      if (!res.ok) {
-        toast.error(json.error || "选择失败");
-        return;
-      }
-      addRepo(json.path);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPickingFolder(false);
-    }
-  };
-
-  // 手填路径备份入口（非 macOS / 远程部署时用）
-  const promptManualPath = () => {
-    const input = window.prompt("输入仓库的绝对路径（仅 server 同机有效）");
+  // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
+  // 用 useDialog().prompt 替代 window.prompt——shadcn 风格 + 内联校验、不阻塞主线程
+  const promptManualPath = async () => {
+    const input = await prompt({
+      title: "手填仓库路径",
+      description: "输入绝对路径（以 / 开头）、仅 server 同机有效",
+      placeholder: "/Users/me/some-repo",
+      confirmLabel: "添加",
+      validate: (v) => {
+        const trimmed = v.trim().replace(/\/+$/, "");
+        if (!trimmed) return "路径不能为空";
+        if (!trimmed.startsWith("/")) return "请填绝对路径（以 / 开头）";
+        return "";
+      },
+    });
     if (input === null) return;
-    const trimmed = input.trim().replace(/\/+$/, "");
-    if (!trimmed) {
-      toast.error("路径不能为空");
-      return;
-    }
-    if (!trimmed.startsWith("/")) {
-      toast.error("请填绝对路径（以 / 开头）");
-      return;
-    }
-    addRepo(trimmed);
+    addRepo(input.replace(/\/+$/, ""));
   };
 
   // 仓库重命名：受控输入、空串 fallback 回 basename
@@ -118,7 +102,7 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」会调起 macOS 原生 dialog、其它平台请用「手填路径」
+          点「选择文件夹」会弹出服务端文件浏览器、跨平台都能用
         </CardDescription>
         <CardAction>
           <SaveButton dirty={dirty} onSave={onSave} />
@@ -126,9 +110,9 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
       </CardHeader>
       <CardContent className="space-y-3">
         {repos.length === 0 ? (
-          <div className="text-xs text-muted-foreground border border-dashed rounded-lg p-6 text-center">
+          <EmptyHint size="lg" align="center">
             尚未添加任何仓库
-          </div>
+          </EmptyHint>
         ) : (
           <div className="space-y-2">
             {repos.map((r) => (
@@ -163,23 +147,34 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
           <Button
             type="button"
             variant="outline"
-            onClick={pickFolder}
-            disabled={pickingFolder}
+            onClick={() => setPickerOpen(true)}
           >
-            {pickingFolder ? <Loader2 className="animate-spin" /> : <FolderOpen />}
+            <FolderOpen />
             选择文件夹
           </Button>
           <Button
             type="button"
             variant="ghost"
             onClick={promptManualPath}
-            disabled={pickingFolder}
           >
             <Plus />
             手填路径
           </Button>
         </div>
       </CardContent>
+
+      {/* 文件夹选择器：仅目录、单选 */}
+      <FsPickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        mode="dir"
+        title="选择仓库目录"
+        description="选一个目录作为仓库根、agent 启动时会以此为 cwd"
+        onConfirm={(paths) => {
+          const p = paths[0];
+          if (p) addRepo(p);
+        }}
+      />
     </Card>
   );
 };

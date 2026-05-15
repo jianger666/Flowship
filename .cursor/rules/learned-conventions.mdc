@@ -11,6 +11,16 @@ alwaysApply: true
 - 页面尽量由组件组合而成、避免在 page.tsx 里直接堆 `<input>` `<button>` 等原始标签。
 - shadcn 组件放在 `src/components/ui/`、业务组件放在 `src/components/`。
 
+## 禁用浏览器原生弹窗
+
+- **`window.alert` / `window.confirm` / `window.prompt` 一律禁用**——dark 主题下白底白字、带浏览器 chrome、风格违和、还会阻塞主线程。
+- 替代方案（已封装好）：
+  - **确认 / 二次确认** → `const { confirm } = useDialog()`、`await confirm({ title, description, destructive, ... })`、返 `Promise<boolean>`。
+  - **输入框 prompt** → `const { prompt } = useDialog()`、`await prompt({ title, defaultValue, validate, ... })`、返 `Promise<string | null>`、`null` 表示用户取消。
+  - **toast 通知**（不需要交互）→ `import { toast } from "sonner"`、`toast.success(...) / toast.error(...)`。
+- hook 实现：`src/hooks/use-dialog.tsx`、Provider 已挂在 `src/components/providers.tsx`、所有客户端组件可直接 `useDialog()`。
+- 写新代码 / 改老代码遇到 `window.alert/confirm/prompt`——直接换成上面三选一。
+
 ## 函数声明
 
 - **统一用箭头函数**——避免 `function foo() {}` 形式；
@@ -27,3 +37,41 @@ alwaysApply: true
   - **每个 useState / useRef / useMemo 等 state 声明、跟一行短注释说明这个状态是干什么的**
 - 但避免**废话注释**（如 `// 调用接口`、`// 返回 null`），注释要有信息密度。
 - 注释一律中文。
+
+## 共享常量 / 文案 / 工具的单一源
+
+- **PHASE_LABEL / STATUS_LABEL / STATUS_VARIANT / formatRelative 等任务展示文案** → 统一放 `src/lib/task-display.ts`、不要在组件 / 页面里各自定义一份。
+  - 改 phase 文案只改这一个文件、不会出现 task-card 显示「上下文 + 方案」、artifact-panel 显示「上下文 + 方案规划」这种漂移。
+  - artifact-panel 那种「中文（英文）」复合标题在本文件里组合、不要污染基础表。
+- **客户端「准备 SDK run 参数」逻辑** → 统一走 `src/lib/run-args.ts` 里的 `prepareRunArgs(task)`。
+  - 任何「getSettings → 校验 apiKey/model → parseMcpServers → filterMcpServersByTask」组合都应该走它、不要复制粘贴这一段。
+  - 校验失败 helper 内部 toast.error 后返 `null`、调用方 `if (!args) return;` 即可。
+  - MCP 解析错误 prefix 通过 `options.mcpErrorPrefix` 切语境（启动 / 续接 / etc）。
+- **`local-store.ts` export 的 `DEFAULT_SETTINGS` / `DEFAULT_MCP_JSON`** 是唯一来源、`use-settings.ts` / `mcp-card.tsx` 等不要再自己定义 `EMPTY_SETTINGS` / `EMPTY_MCP_JSON`。
+- **`task-store.ts` 的 `handleJson<T>` 错误归一**——所有客户端 fetch 任务相关 API 应该通过 task-store 暴露的 helper 走、不要在组件里裸 `fetch + JSON.parse + 错误拼接`（参见 `submitAskReply` / `submitPhaseAck` / `addContextDoc` 等）。
+
+## 共享 hook：SSE 订阅
+
+- **任务事件流订阅一律走 `useTaskWatch(taskId, callbacks, enabled?)`**——别再自己写一遍 `AbortController + watchChatStream + AbortError 静默 + ref 化 callback` 那一套。
+- enabled 开关用于「父子组件二选一订阅」场景（如 task page + ChatView 都能订阅同一个任务、但只让其中一方订）。
+- 回调里需要拿最新 task / state 时、调用方自己用 ref 模式（hook 内部已经把 callbacks 集合做了 ref 化、不需要再 ref 化包一层）。
+
+## 共享 UI：LoadingState / EmptyHint / ChoiceButton
+
+- **加载中**一律用 `<LoadingState variant="block" | "card" | "inline" />`、不要再写裸 `<div>加载中…</div>` 或自己拼 Card 包一遍。
+  - block：页面级（默认占满 viewport 减顶 bar）
+  - card：列表区位（首页任务列表 loading 用、视觉跟 TaskCard 对齐）
+  - inline：行内小段落
+  - 文案统一中文省略号「加载中…」、调用方需要的话覆盖 `label`。
+- **空态提示**一律用 `<EmptyHint variant="dashed" | "solid" size="sm|md|lg" align="left|center" />`、不要重新写 `border border-dashed rounded-md ...`。
+- **「可选中卡片 / chip / tab」交互按钮**一律用 `<ChoiceButton shape="card" | "chip" | "tab" selected={...}>`：
+  - card：方块卡（mode 选择、option 选择块、可包多行内容）
+  - chip：圆角小药丸（preset 标签、Other 切换）
+  - tab：行内按钮（phase-progress 那种 hover 态切换）
+  - 这是给「shadcn `<Button>` 不能直接套的自定义视觉选中态」准备的——不要自己拼 `cn("rounded border ...", selected && "border-primary")`。
+
+## 关于 useEffect 依赖
+
+- 不要随便加 `// eslint-disable-next-line react-hooks/exhaustive-deps`——大概率是真依赖漏了、会 stale closure。
+- 例外：「故意只在 X 变化时重连」类场景、把 callback 做 ref 化（`callbackRef.current = callback`）后再放进 effect、然后依赖就只剩 X 一个、不需要 disable。`use-task-watch.ts` 里就是这么做的。
+- 写完 effect 后跑 `pnpm lint`、warning 不能留。

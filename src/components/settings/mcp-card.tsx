@@ -13,7 +13,7 @@ import { FileCode } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+import { CodeEditor } from "@/components/ui/code-editor";
 import {
   Card,
   CardAction,
@@ -22,6 +22,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { useDialog } from "@/hooks/use-dialog";
+import { DEFAULT_MCP_JSON } from "@/lib/local-store";
 
 import { SaveButton } from "./save-button";
 
@@ -50,8 +52,6 @@ export const MCP_EXAMPLE_JSON = `{
     }
   }
 }`;
-
-const EMPTY_MCP_JSON = '{\n  "mcpServers": {}\n}';
 
 // 校验 MCP JSON：必须有 mcpServers 这层 wrapper、且为对象
 // 与 Cursor IDE ~/.cursor/mcp.json schema 对齐、便于直接复制粘贴
@@ -88,14 +88,24 @@ interface McpCardProps {
 }
 
 export const McpCard = ({ value, onChange, dirty, onSave }: McpCardProps) => {
+  const { confirm } = useDialog();
+
   // 同步派生：边输边校验、避免 effect roundtrip 也避免每 keypress 多 1 帧延迟
   const mcpError = useMemo(() => validateMcpJson(value), [value]);
 
   // 是否「空」状态、决定「填入示例」点击时要不要 confirm
-  const isEmpty = !value.trim() || value.trim() === EMPTY_MCP_JSON.trim();
+  const isEmpty = !value.trim() || value.trim() === DEFAULT_MCP_JSON.trim();
 
-  const fillExample = () => {
-    if (!isEmpty && !window.confirm("当前已有内容、确认用示例覆盖？")) return;
+  const fillExample = async () => {
+    if (!isEmpty) {
+      const ok = await confirm({
+        title: "覆盖当前 MCP 配置？",
+        description: "当前编辑器已有内容、点确认会用示例 JSON 替换。",
+        confirmLabel: "覆盖",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
     onChange(MCP_EXAMPLE_JSON);
   };
 
@@ -129,14 +139,14 @@ export const McpCard = ({ value, onChange, dirty, onSave }: McpCardProps) => {
             填入示例
           </Button>
         </div>
-        <Textarea
+        <CodeEditor
           id="mcp-json"
           value={value}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={onChange}
+          language="json"
           placeholder={MCP_EXAMPLE_JSON}
           rows={14}
-          className="font-mono text-xs"
-          spellCheck={false}
+          ariaInvalid={!!mcpError}
         />
         {mcpError && <div className="text-destructive text-xs">{mcpError}</div>}
         <p className="text-xs text-muted-foreground">

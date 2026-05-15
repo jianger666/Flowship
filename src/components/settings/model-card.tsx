@@ -15,7 +15,9 @@
  */
 
 import { useMemo } from "react";
+import { Loader2, RefreshCw } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import {
   Card,
@@ -69,6 +71,10 @@ interface ModelCardProps {
   onChange: (next: ModelSelection) => void;
   dirty: boolean;
   onSave: () => void;
+  // 用于「获取列表」按钮：直接传 apiKey 给 fetchModels、不强制用户先去 ApiKeyCard 点验证
+  apiKey: string;
+  refreshing: boolean;
+  onRefresh: (apiKey: string) => void;
 }
 
 export const ModelCard = ({
@@ -78,6 +84,9 @@ export const ModelCard = ({
   onChange,
   dirty,
   onSave,
+  apiKey,
+  refreshing,
+  onRefresh,
 }: ModelCardProps) => {
   // 当前选中的 base model 完整定义（用 id 反查），用 useMemo 避免每次 render 重算
   const selectedModel = useMemo(
@@ -107,10 +116,26 @@ export const ModelCard = ({
         <CardTitle>默认模型</CardTitle>
         <CardDescription>
           {models.length === 0
-            ? "先填 API key 并点「验证」、自动拉取可用模型列表"
+            ? "点右侧「获取列表」按钮拉取可用模型（需先保存 API key）"
             : `共 ${models.length} 个可用模型`}
         </CardDescription>
-        <CardAction>
+        <CardAction className="flex items-center gap-2">
+          {/* 直接基于已保存的 apiKey 拉模型、和 ApiKeyCard 的「验证」按钮共用同一份 fetchModels */}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onRefresh(apiKey)}
+            disabled={refreshing || !apiKey.trim()}
+            title={apiKey.trim() ? "重新拉取可用模型列表" : "请先填 API key"}
+          >
+            {refreshing ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <RefreshCw />
+            )}
+            获取列表
+          </Button>
           <SaveButton dirty={dirty} onSave={onSave} />
         </CardAction>
       </CardHeader>

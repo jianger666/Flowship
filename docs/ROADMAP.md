@@ -2,125 +2,131 @@
 
 > 渐进式、不一次性做完。每个阶段验证 ROI 后再投资源。
 
-> ⚠️ **2026-04-30 同步**：原 V0.1 spec phase 代码已被用户 clean slate 清空、当前正在重新设计主流程交互形态。下面 V0.1 / V0.2 / V0.3 的具体方案是**上一版本的设想**、保留作参考、不一定再走老路。
-> 当前实际进度看 HANDOFF.md「当前状态（最新）」一节。
+> ⚠️ **2026-05-15 同步**：V1 流程历经 spec→plan→build → context→plan→build→ship → 最终定型 **`plan → build` 双阶段**（V0.3.4）+ 「**chat 自由对话**」双模式。保活机制从 `wait_for_user` MCP + `keep_alive_a/b/c` 重构为 `shell + curl long-poll`（V0.3.5）。**V0.4 引入多角色 schema**（`Task.role`、当前仅 fe、未来扩 be/data/mobile/qa、详见 `docs/MULTI-ROLE.md`）+ 大规模代码质量清扫（chat-runner / phase prompts / SKILL.md 多处 prompt drift 修复）。当前实际进度看 HANDOFF.md「V0.2 → V0.3.5 演进 + V0.4」段、Chat 架构看 DESIGN.md 第 16 节。
 
 ---
 
-## 当前阶段（重新规划中）
+## 当前阶段（2026-05-15 同步）
 
 | 阶段 | 状态 | 备注 |
 |---|---|---|
 | 基础设施（设置页 / shadcn / Tailwind 4 / SDK 验证） | ✅ 完成 | clean slate 重做 |
-| 主流程交互（首页 UI 形态） | 🚧 待和用户讨论 | 单段还是分段、表单还是聊天 |
-| spec / plan / build 三段式 | 🤔 暂保留为参考 | 用户在思考是否还分段 |
-| 飞书 / swagger 自动拉 | 🔲 未启动 | 老路线 W4 |
+| 任务列表 + 详情 + 双模式 UI 路由 | ✅ 完成 | 主页卡片列表 / `tasks/[id]` 按 mode 分两套 UI |
+| **Plan workflow（V0.3.4 起 = 2 phase chain、单 SDK Run）** | ✅ 完成 | `plan-runner.ts` + 2 个 phase prompt 模板（plan / build） |
+| **Chat 模式（wait_for_user MCP）** | ✅ 完成 | `chat-runner.ts` + `chat-mcp.ts` + `watch-chat` |
+| **ContextDocsPanel（任务级上下文文档面板）** | ✅ V0.3 完成 | `context-docs-panel.tsx`（V0.3.4 起 plan 自己读、不用 phase 重划） |
+| **ask_user 弹窗 modal**（一次打包 + ABCD）| ✅ V0.3.2 完成、V0.3.3 微调 | `ask-user-dialog.tsx`（Other 选中保留其它 option、textarea 移下方） |
+| **任务级 MCP 黑名单**（每任务可关闭部分 MCP）| ✅ V0.3.3 完成 | `Task.disabledMcpServers` |
+| **shell + curl long-poll 保活**（取代 keep_alive_a/b/c）| ✅ V0.3.5 完成 | 新增 `wait-ack/route.ts`、删 keep_alive 三件套 |
+| **断线手动「继续监听」**（Agent.resume）| ✅ V0.3.5 完成 | 新增 `resume-waiting/route.ts` + UI 按钮 |
+| **ask_user race fix（grace window）** | ✅ V0.3.5 完成 | `finalizeEntry` 60 秒延迟清 |
+| **task-fs 原子写 + 任务级互斥锁** | ✅ V0.3.1 完成 | 修 readMeta race |
+| **status=error 诊断增强**（dump CursorSdkError）| ✅ V0.3.2 完成 | `plan-runner.ts` catch dump |
+| **多角色 schema（V0.4）** | ✅ V0.4 完成 | `Task.role` + `TASK_ROLE_LABEL` + `phase-1-plan.md` 注入 `{{role}}` + `new-task-dialog.tsx` 选择器、当前仅 fe |
+| **代码质量大清扫（V0.4）** | ✅ V0.4 完成 | 修 chat-runner 严重 prompt drift（keep_alive_a/b/c → shell long-poll）、删老 phase prompt 文件、修 SKILL.md / `ask_user` description 残留 |
+| Plan + Build 端到端跑通 | 🚧 待用户 demo | 用户最近已能跑通 plan、build phase 也能写 artifact、但 wait-ack 长连接 / 代理稳定性还是隐患 |
+| 自动 retry on ConnectError | 🔲 不做 | 用户决定：靠手动「继续监听」、避免 agent 反复踩坑 |
+| Cancel chat（保留任务、停 agent） | 🔲 未启动 | 当前只能"删任务" |
+| 飞书 / swagger 自动拉 | 🔲 未启动 | 用户已配飞书 MCP、还没接到任务流 |
 | cost / token dashboard | 🔲 未启动 | 老路线 W5 |
 
 ---
 
-## V0.1（旧设想·保留参考）：Spec 生成
+## V1 拍板（2026-05-08 → 2026-05-11 演化版）
 
-**目标**：粘贴需求 + swagger → AI 输出结构化 spec.md。
+### 流程：双模式
 
-**验收标准**：
+```
+plan 模式（阶段化、HITL 在 phase 边界）：
+  [raw_input] → plan → [前端 ack] → build → [前端 ack] → 完
+                ✅                  🚧
 
-- [ ] pnpm dev 跑通、http://localhost:3000 打得开
-- [ ] 设置页配 API key、加仓库
-- [ ] 主页提交一个真实需求（如 6961355105）
-- [ ] 流式输出 spec.md、产物落 data/tasks/<id>/spec.md
-- [ ] spec.md 命中 80%+：改动文件清单准、source 标了、不编
+chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
+  [raw_input] → 整段对话（agent 反复 wait_for_user、用户在 ChatView 输入触发 chat-reply）→ 用户停 / done
+                ✅
+```
 
-**当前缺失**：spec phase 整套代码已删、要不要重建看用户拍板。
+老版本拍的「spec → plan → build」三步流程：spec 已砍（实测产出对开发参考价值低、反而拉长链路）。chat 模式是 2026-05-09 ~ 2026-05-11 新增的第二条路径、跟 plan 阶段化互补。
+
+### 每步 7 维度缰绳（不变）
+1. 输入产物（schema / 上游文件）
+2. 工具白名单（哪些 MCP / SDK / 命令可用）
+3. 输出产物（含 frontmatter 的 markdown）
+4. HITL 闸门（plan 模式 = 前端 ack 按钮、chat 模式 = wait_for_user 阻塞）
+5. 自验证（eslint / typecheck / prompt review）
+6. 失败回滚（git reset / 上一步重跑）
+7. 事件日志（events.jsonl 全量记录）
+
+### B 端阶段二定位
+不是「Figma + Token」、是「接口契约 + 数据模型」（权限矩阵 V1.x 待评估）。
+
+### V1 必接 vs 选接 vs V2+
+**plan phase（已落地）**：仓库只读 / 类型定义 read / write-disabled / plan.md frontmatter / Task List schema（必）；git log / blame、self-review（选）。
+**build phase（待启动）**：Cursor SDK / git 每 task commit / file allowlist / eslint / typecheck / typecheck 失败重试上限（必）；prettier / Cursor rule / Skill（选）；hook / 浏览器截图 / token 上限（V2 补）。
+**chat 模式**：用户配的 MCP servers + 内置 `feAiFlowChat` HTTP MCP（提供 wait_for_user）；任务级 MCP 白名单（`Task.enabledMcpServers`）；agent 自由调 SDK 内置工具。
+
+### 预留扩展点（V2 不重构）
+1. phase 可注册（`PhaseId` union type、加新 phase 时只扩这个 + 注册 runner）
+2. 产物 frontmatter（V2 加字段不动表结构）
+3. 「完成」= 最后一个 phase 被 ack、不写死 build 跑完
+4. `TaskMode` 留扩展位（未来要加 review 模式之类的、直接扩 union）
+
+详细工具清单看 `docs/DESIGN.md` 第 14 节、reliability 4 件事看第 13 节、与公司 5 阶段对齐看第 15 节、Chat 模式架构看第 16 节。
 
 ---
 
-## V0.2 / W2：Plan 生成（旧设想·保留参考）
+## 已完成里程碑（保留作演化记录）
 
-**目标**：spec.md → plan.md（改动文件 checkbox + grep 校验）
+### 2026-05-08 ~ 2026-05-09：基础设施 + Plan phase
 
-**输出物 schema**：
+- 设置页（4 张 Card、每张独立保存）
+- 任务列表 + 详情页
+- `data/tasks/<id>/` 三件套（meta.json / events.jsonl / *.md）
+- Plan phase：`prompts/plan-phase.md` + `plan-runner.ts` 流式消费 SDKMessage、artifact 增量写
 
-```markdown
-# Plan-{ID}
+### 2026-05-09 ~ 2026-05-10：砍 spec phase
 
-## 改动文件 checkbox（按执行顺序）
-- [ ] src/views/set/allocationRules.vue
-  - 操作：编辑
-  - 段落：line 580-610（submitRules 内 stuParam 数组）
-  - 改动：tags 字段从顶层移到 stuParam.push({ fieldName: "tags", ... })
-  - 校验命令：grep -n "fieldName: 'tags'" src/views/set/allocationRules.vue
-- [ ] ...
+实测下来 spec 对开发参考价值有限、plan agent 自己进仓库 grep 一遍后产出的 Task List 已经够准。砍 spec、改 `PhaseId = "plan" | "build"`。
 
-## 跨文件依赖
-- (说明哪些文件改动有依赖关系、谁先谁后)
+### 2026-05-09 ~ 2026-05-11：Chat 模式落地
 
-## 风险点
-- (AI 不确定的地方)
-```
-
-**关键设计**：
-
-1. AI2 不能"自由发挥"——必须按 checkbox 逐项执行
-2. 每条改动必须**附 grep / awk 校验命令**——执行完用 shell 跑一下、验证改对了
-3. plan.md 跑完、用户必须点 ack 才能进 build phase
-
-**实现要点**：
-
-- 复用 `runSpecPhase` 同样的 SDK 流式架构
-- 新增 `prompts/build-plan.md`
-- spec.md 作为 plan phase 的输入（注入到 prompt 里）
-- API route：`/api/tasks/[id]/run/plan` 单独跑
-
-**预计**：1.5 天。
+- 新建 `TaskMode = "plan" | "chat"`、新建任务默认 chat
+- 本地 HTTP MCP `feAiFlowChat`（chat-mcp.ts）+ `wait_for_user(task_id)` 阻塞工具
+- `chat-runner.ts` publish-subscribe 模式、`runningChats / subscribers` 挂 globalThis
+- `start-chat`（POST、fire-and-forget）+ `watch-chat`（GET、SSE 订阅）拆开、刷新页面不断 agent
+- 50s keepalive + 反 anti-loop 双重压制（keepalive 文本变体化 + prompt 反反思指令）
+- `completed` 状态可"再聊一次"重启 agent（计费再算一次、UI 有提示）
+- 任务删除 cleanup 三步：cancelChat → cleanupChatTaskState → deleteTask
 
 ---
 
-## V0.3 / W3：Build 执行（旧设想·保留参考）
+## V0.4 / W4：多角色 schema + 通用化（已落地）
 
-**目标**：plan.md → 实际改动 + git commit + draft MR
+**目标**：让 fe-ai-flow 不只服务前端、能扩到后端 / 数仓 / 测试 / 移动端
 
-**关键挑战**：
+**实现**（详见 `docs/MULTI-ROLE.md`）：
 
-1. AI 改的代码必须**通过 lint / typecheck**
-2. **每个 checkbox 改完跑一次校验命令**、失败回退
-3. **不污染当前分支**——自动 checkout 新分支 `feature/ai-flow/<story-id>`
+- `Task.role: TaskRole`（当前仅 `"fe"`、未来扩）+ `TASK_ROLE_LABEL` 中文映射、单一来源
+- `task-fs.ts` 老数据兜底 `"fe"`、`plan-runner.ts` 把 `{{role}}` / `{{roleLabel}}` 注入 phase prompt
+- `phase-1-plan.md` 强调「以 role 视角、只挑相关部分做、不收集其他角色实现细节」
+- `new-task-dialog.tsx` 加角色选择器（当前单值、UI 保留以信号未来扩）
+- 顶部 metadata / description 去掉「前端」字眼
 
-**执行流**：
+**已做的代码质量大清扫**：
 
-```
-读 plan.md
-  ↓
-for each checkbox:
-  git stash（保护现场）
-  agent.send("执行改动 N、按描述操作 ${file}")
-  跑 lint / typecheck
-  跑 plan.md 里的校验命令
-  通过 → git add + commit
-  失败 → git stash pop（回退）+ 标记 failed
-↓
-git push -u origin <branch>
-↓
-gitlab MR API 创 draft MR
-```
+- 修 `chat-runner.ts` 严重 prompt drift（buildInitialPrompt 还在教 keep_alive_a/b/c 轮转、chat 模式实际坏了）
+- 删 `prompts/phase-{1-context,2-plan,3-build,4-ship}.md` 老文件（V0.3.4 起不再使用）
+- 修 phase prompt / SKILL.md / chat-mcp ask_user description 里 `keep_alive` 残留
+- README.md 整篇重写到 V0.4、DESIGN.md 顶部 warning 改完整版本演进表
 
-**HITL 介入点**：
+**未启动子项（V0.5+ 再说）**：
 
-- AI 跑完所有 checkbox 后、**不自动 push**
-- UI 显示 diff、用户点"确认推送"才推
-- MR 创建后、用户决定何时 approve
-
-**实现要点**：
-
-- 新增 `src/lib/git.ts`（git operations、用 simple-git 或直接 child_process）
-- 新增 `src/lib/lint.ts`（跑 ESLint / tsc / 用户自定义脚本）
-- API route：`/api/tasks/[id]/run/build`
-
-**预计**：3-4 天。
+- 角色枚举扩展（be / data / mobile / qa）：等真有 1 个非 fe 用户来开新坑、不空设
+- `prompts/roles/<role>.md` 片段化（当前角色提示直接写在 phase-1-plan.md「当前角色提示」段、扩展时再抽）
 
 ---
 
-## V0.4 / W4：飞书 MCP 集成（未启动）
+## V0.5 / W5：飞书 MCP 自动拉文档（未启动）
 
 **目标**：用户只输入 storyId、自动拉飞书需求 + swagger
 
@@ -139,7 +145,7 @@ gitlab MR API 创 draft MR
 
 ---
 
-## V0.5 / W5：Cost / Token Dashboard（未启动）
+## V0.6 / W6：Cost / Token Dashboard（未启动）
 
 **目标**：知道每个任务花了多少 token / 多少钱
 
@@ -158,14 +164,40 @@ gitlab MR API 创 draft MR
 
 ---
 
-## V0.6+ / W6+：体验优化
+## V0.3 候选区
 
-- [ ] 任务搜索 + 标签 + 归档
-- [ ] cancel 中途打断（agent.cancel()）
-- [ ] retry 单 phase（改 prompt 后重跑、不重做整个链路）
-- [ ] 比较同一 storyId 多次执行的 spec 差异
+### A. 任务级「上下文文档面板」 ✅ 已落地（V0.3）
+
+详情页顶部加可折叠面板、用户随时增 / 删上下文文档（URL / path / 自由文本）、agent 后续 phase 都能用。
+
+- **场景**：飞书 story 链接建任务后、产品 / 后端陆续补 PRD / 接口文档 / 评论、不该被「建任务时一次性填」绑死
+- **设计要点**（避坑）：清单 inject + 按需拉取（不全量塞 super-prompt）、prompt 教 agent 发现冲突列「不确定项」
+- **已附带做的**：Phase 1 角色变窄（只综合用户提供的上下文、不扫仓库）、Phase 2 接管仓库扫描、Phase 1/2 重叠消失
+- **关联**：用户答完的 ask_user 答案会自动落到 contextDocs（title=`Q: 问题`）、后续 phase 复用
+
+### B. Phase 3 ack 前「cursor-rule 沉淀」步骤
+
+Phase 3 build 完成后、ack 前、agent 把本次改动中发现的「值得沉淀的仓库约定」整理成 `proposed-rules.md`、HITL 让用户选哪些写进仓库的 `.cursor/rules/`、下个 task 自动生效。
+
+- **场景**：B 端仓库存在大量隐性约定（dialog 样式 / api 封装 / store 路径）、agent 每次重头摸索成本高、应该一次发现长期沉淀
+- **为什么放 Phase 3 之后**：只有真改过代码才知道哪些约定是「真的重要」、凭空扫仓库提议出来的 rule 多半不接地气
+- **harness 立场**：「把可重复的知识结构化沉淀」是 harness 的核心命题、这是正统路子
+
+### C. Phase 边界重划（如果 A 不做）
+
+不做 A 的话、备选路径：Phase 1 改成「只拉文档 + 与用户澄清需求」、Phase 2 接管「扫仓库 + 出方案」。如果做了 A、这条自然落地。
+
+---
+
+## V0.7+ / W7+：体验优化
+
+- [ ] 任务搜索 + 标签（归档已落 ✅）
+- [ ] cancel 中途打断（不删任务）——chat 模式当前只能"删任务"
+- [ ] retry 单 phase（改 prompt 后重跑 plan、不重做整个链路）
+- [ ] 比较同一 task 多次执行的 plan 差异
 - [ ] 多语言 prompt 模板（B / C 端分开）
 - [ ] 团队共享 prompt 库（git submodule？）
+- [ ] chat prompt 外提 `prompts/chat-init.md`（待 chat 模式跑稳定 ≥2 周不踩坑）
 
 ---
 

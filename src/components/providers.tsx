@@ -10,6 +10,8 @@
 import { ThemeProvider } from "next-themes";
 import type { ReactNode } from "react";
 
+import { DialogProvider } from "@/hooks/use-dialog";
+
 interface ProvidersProps {
   children: ReactNode;
 }
@@ -23,7 +25,9 @@ export const Providers = ({ children }: ProvidersProps) => {
       enableSystem={false}
       disableTransitionOnChange
     >
-      {children}
+      {/* DialogProvider 提供全局 confirm/prompt——禁用 window.{alert,confirm,prompt}、
+          统一走 shadcn 风格弹窗。组件内用 useDialog() 拿到 confirm / prompt */}
+      <DialogProvider>{children}</DialogProvider>
     </ThemeProvider>
   );
 };

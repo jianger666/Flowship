@@ -25,6 +25,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { LoadingState } from "@/components/ui/loading-state";
 
 import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
@@ -39,11 +40,7 @@ const SettingsPage = () => {
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
 
   if (!loaded) {
-    return (
-      <div className="max-w-3xl mx-auto px-6 py-12 text-muted-foreground">
-        加载中…
-      </div>
-    );
+    return <LoadingState variant="block" />;
   }
 
   return (
@@ -54,6 +51,7 @@ const SettingsPage = () => {
           variant="ghost"
           size="sm"
           className="px-2 -ml-2 mb-2"
+          nativeButton={false}
           render={<Link href="/" className="no-underline" />}
         >
           <ArrowLeft />
@@ -81,6 +79,9 @@ const SettingsPage = () => {
         onChange={(next) => update("defaultModel", next)}
         dirty={dirty.defaultModel}
         onSave={() => saveField("defaultModel")}
+        apiKey={settings.apiKey}
+        refreshing={modelsLoading}
+        onRefresh={fetchModels}
       />
 
       <RepoCard

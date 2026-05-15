@@ -19,15 +19,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { getSettings, saveSettings } from "@/lib/local-store";
+import { DEFAULT_SETTINGS, getSettings, saveSettings } from "@/lib/local-store";
 import type { FeAiFlowSettings } from "@/lib/types";
-
-const EMPTY_SETTINGS: FeAiFlowSettings = {
-  apiKey: "",
-  defaultModel: { id: "" },
-  repos: [],
-  mcpServersJson: '{\n  "mcpServers": {}\n}',
-};
 
 export type SettingsField = keyof FeAiFlowSettings;
 
@@ -69,10 +62,10 @@ const isFieldEqual = (
 
 export const useSettings = (): UseSettingsResult => {
   // 当前编辑中的设置快照（草稿）、可能跟磁盘上不同
-  const [settings, setSettings] = useState<FeAiFlowSettings>(EMPTY_SETTINGS);
+  const [settings, setSettings] = useState<FeAiFlowSettings>(DEFAULT_SETTINGS);
 
   // 已经写到 localStorage 的快照（已保存版本）、和草稿对比算 dirty
-  const [savedSettings, setSavedSettings] = useState<FeAiFlowSettings>(EMPTY_SETTINGS);
+  const [savedSettings, setSavedSettings] = useState<FeAiFlowSettings>(DEFAULT_SETTINGS);
 
   // 是否已从 localStorage 读到初值；防止 SSR 渲染时闪现空表单
   const [loaded, setLoaded] = useState(false);

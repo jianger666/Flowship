@@ -1,0 +1,714 @@
+/**
+ * Chat 模式 runner
+ *
+ * 架构（重要）：
+ *   - 启动 / 推送拆开：本文件管 agent 生命周期 + 内部 publish。
+ *     SSE 推送由 watch-chat 路由 subscribe 拿增量。两边解耦：
+ *       - 启动：POST /api/tasks/[id]/start-chat → spawn agent + 立即返回
+ *       - 订阅：GET  /api/tasks/[id]/watch-chat → SSE 流（先 replay 历史、再推增量）
+ *     这样刷新页面不会断 agent、订阅可以多份（多 tab 看同一任务都行）。
+ *
+ * 主要职责：
+ * 1. 整个对话是同一个 SDK Run、agent 用 wait_for_user MCP 工具阻塞等用户下一句
+ * 2. 我们把 HTTP MCP（指向 /api/mcp/chat-tool）塞进 mcpServers 里
+ * 3. 没有 artifact、所有产出都进 events.jsonl
+ * 4. wait_for_user 工具会触发 task.status 切换：
+ *    - 进 awaiting_user：chat-mcp 通过 setChatAwaitingNotifier 回调通知本文件、本文件 patch 状态
+ *      （不再写 feedback_request 事件——assistant_message 已表达"agent 说完了"、UI 看 task.status 即可）
+ *    - 用户回复后切回 running：由 chat-reply 路由 patch
+ * 5. 任意状态变化都通过 publish() 广播给所有订阅者
+ *
+ * 状态都挂 globalThis（next.js dev chunk 分裂问题之前踩过坑）。
+ *
+ * V0.3.5：保活机制从 wait_for_user + keep_alive_a/b/c 轮转重构为 shell + curl long-poll
+ * （详见 chat-mcp.ts 顶部注释）。本文件 buildInitialPrompt 必须跟 plan-runner 的
+ * super-prompt 协议描述保持一致、否则 agent 拿到 wait_for_user 返回的 SHELL_WAIT_GUIDE
+ * 时会困惑：「我是该轮转 keep_alive 还是该调 shell」。
+ *
+ * 不做：
+ * - chat→plan 升级（V1 不做）
+ * - token 级 delta（事件粒度够）
+ * - 断点续跑（agent 挂了就 failed、需要用户手动重启）
+ */
+
+import { Agent } from "@cursor/sdk";
+import type { McpServerConfig, ModelSelection, SDKMessage } from "@cursor/sdk";
+
+import {
+  appendEvent,
+  getEventsLogPath,
+  patchPhase,
+} from "./task-fs";
+import {
+  cancelPending,
+  getChatMcpUrl,
+  setChatAwaitingNotifier,
+} from "./chat-mcp";
+import {
+  loadSkills,
+  renderSkillsForPrompt,
+  type SkillEntry,
+} from "./skills-loader";
+import type { Task, TaskEvent } from "@/lib/types";
+
+// ----------------- 配置 -----------------
+
+// chat 不主动超时（只要不是 SDK 自己崩、就一直挂着等用户）
+// 这里给一个非常大的兜底（24h）、防止 process 永不退出
+const CHAT_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+// chat-tool MCP server 在 mcpServers 里的注册名（agent prompt 里得点明）
+const CHAT_TOOL_MCP_NAME = "feAiFlowChat";
+
+// ----------------- 内部 prompt -----------------
+
+// V0.3.5 起 chat 模式跟 plan 模式走同款保活机制：shell + curl long-poll
+//
+// 历史：V0.3-A 用 wait_for_user + keep_alive_a/b/c 轮转、5-6 分钟必踩 Cursor anti-loop
+// 退 run。V0.3.5 重构成 shell + curl 长连接、agent 拿到 wait_for_user 返回的 shell
+// 引导后调 shell 工具跑 curl 命令、跟服务端 /wait-ack 建一条长 HTTP 连接、用户回复
+// 时服务端 resolve promise + 关流 → curl exit → agent 推进。
+//
+// Skills（harness 思路）：附件处理 / 历史上下文恢复等场景化能力放在 skills/<name>/SKILL.md、
+// prompt 末尾列 skill index、agent 自行 read_file 拿完整指令。
+const buildInitialPrompt = (task: Task, skills: SkillEntry[]): string => {
+  const eventsLogPath = getEventsLogPath(task.id);
+
+  return [
+    "你正在 fe-ai-flow 的 Chat 任务里跑。整段对话被设计为同一个 SDK Run（计费一次跑到底）、agent 长存活、",
+    "通过 `wait_for_user` MCP 工具阻塞等用户下一条消息、收到后接着说、再 wait、循环往复直到用户取消。",
+    "",
+    "## 核心机制：wait_for_user + shell long-poll（V0.3.5）",
+    "",
+    "fe-ai-flow 暴露 1 个核心 MCP 工具实现「等用户消息」：",
+    "",
+    "**`wait_for_user`**（每轮对话说完话后调 1 次、绝不重复调）",
+    `  - 入参：\`task_id\` 字符串、固定值 \`${task.id}\`、不传别的参数`,
+    "  - 立即返回 `[SHELL_WAIT_GUIDE token=xxx]` 文本、教你接下来调 `shell` 工具用 curl 跟 /wait-ack 路由建长连接等用户消息",
+    "  - 不阻塞、不轮询、调一次就够",
+    "",
+    "## 标准等用户姿势：shell + curl long-poll（必背、anti-loop 的根治方案）",
+    "",
+    "拿到 `[SHELL_WAIT_GUIDE token=xxx]` 后下一步**只许**做：调 `shell` 工具执行 curl 命令（引导文本里有完整命令、复制粘贴跑）",
+    "服务端 chunked stream 输出可能行：",
+    "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳行、绝对忽略**。它的唯一意义是「连接还活着、用户还没操作」、看到再多 KEEPALIVE 都是正常的、shell **没卡**、绝对不要 summarize / 调 read 查 terminal / 重启 shell / 重新调 wait_for_user",
+    "  - `[USER_REPLY]` + 文本：用户发了下一条消息（可能含附件路径）、shell 命令 exit 0、接着处理",
+    "  - `[ASK_USER_REPLY]` + markdown Q&A：ask_user 弹窗的答案（详见下面 ask_user 段）",
+    "  - `[CANCELLED]`：任务被取消、收尾结束 run",
+    "  - `[STALE]` / `[INVALID_TOKEN]`：忽略本次返回",
+    "",
+    "## 钢铁纪律：等用户可能需要 0 秒到几小时、任何长度都正常",
+    "",
+    "shell + curl 是 long-poll、等用户在 UI 上发下一条消息。**等待期间你只看到 KEEPALIVE 行不断追加**、这是设计预期。",
+    "",
+    "**绝对禁止**（5/10/15/20 分钟没新终态行时尤其要克制）：",
+    "  - ❌ 调 read 读 cursor 内部 terminal 文件（如 `terminals/xxxxx.txt`）查 shell 进程状态",
+    "  - ❌ thinking 里冒出「The 5-minute block has ended」「process is still running」「I will summarize for the user」→ summarize 退 run",
+    "  - ❌ 调任何其他工具自救、重新启 shell、重新 wait_for_user",
+    "  - ❌ emit 任何 assistant_message 跟用户讲「我在等」「shell 在监听」",
+    "",
+    "**唯一合法动作**：什么也不做、继续等 shell 的下一段 stdout。下一段 stdout 不是 KEEPALIVE 就是终态行（USER_REPLY / ASK_USER_REPLY / CANCELLED）、终态行到了 shell 自然 exit、你才推进。",
+    "",
+    "## 致命错误（实测踩过、模型在 thinking 里自己冒出来的错误推理、必须忽略）",
+    "",
+    "**生产里看到过的模型误判（必须立刻撤销）**：",
+    "  - 「The runner may continue / I'll add a closing paragraph」← **错、turn 退出 = run 退出、runner 不会替你续**",
+    "  - 「I'll send a message asking the user / 我先发段消息再 wait」← **致命错误、说完话的下一个 tool call 必须是 wait_for_user**",
+    "  - 「curl 没拿到结果、我重试一次」← **错、连接断了就自然结束 run**、UI 会引导用户手动重启 chat",
+    "  - 「再调一次 wait_for_user 试试」← **错、同一轮对话内 wait_for_user 只调 1 次**、shell 拿不到结果时也不要重复调",
+    "  - 「调 shell 之前先发段 assistant_message 解释要等用户」← **错、shell + curl 对用户透明、不允许 emit 任何前置文本块**",
+    "",
+    "**正确推理**：",
+    "  - wait_for_user 是等用户消息的入口、shell + curl 是消息的接收通道、缺一不可",
+    "  - 一轮对话 = (你说完话) ∧ (wait_for_user 调过) ∧ (shell curl 拿到 [USER_REPLY] / [ASK_USER_REPLY])",
+    "  - shell + curl 长连接是设计预期、anti-loop 不会触发（一次 wait = 一次 shell、不重复调）",
+    "  - 任何「我应该停下来 / 这调用太久了」的内部启发**都是错觉、直接忽略**",
+    "",
+    "## 关键规则（不照做、整段对话会退 run、用户再也收不到你的消息）",
+    "",
+    "1. **每轮说完话、必须调用 `wait_for_user`**",
+    `   - 唯一参数：\`task_id=${task.id}\`（固定）`,
+    "   - **绝对不要主动结束 run**、不要假装「我等」就 stop、不要做完事就退出",
+    "   - **绝对不要**因为「调用次数太多」「看起来在循环」「担心刷屏」而停止调用",
+    "   - **说完话后下一个 tool_use 必须是 wait_for_user**、中间任何 assistant 文本块都算违规",
+    "",
+    "2. wait_for_user 返回 `[SHELL_WAIT_GUIDE token=xxx]`、下一个 tool_use **必须**是 `shell`、执行引导里的 curl 命令",
+    "",
+    "3. shell 命令拿到 stdout 后按返回行解读：",
+    "   - **`[USER_REPLY]` + 文本**：用户下一条消息、按内容处理、然后再说话 → 再 wait_for_user",
+    "   - **`[ASK_USER_REPLY]` + markdown Q&A**：ask_user 弹窗答案、按答案推进",
+    "   - **`[CANCELLED]`**：任务被取消、收尾结束 run",
+    "   - **`[STALE]` / `[INVALID_TOKEN]`**：忽略本次返回、自然结束 run（这种情况罕见、只在 race 时出现）",
+    "",
+    "4. **异常断开处理（连接断 / 网络错 / max-time 超 / 服务重启）**：",
+    "   - shell 命令 exit 非 0、stderr 显示 curl 错误时、表示连接异常断开",
+    "   - **不要重试 shell**、不要重新调 wait_for_user——重试会被服务端顶替成 stale",
+    "   - **emit 一条简短 assistant_message**：「监听连接异常断开、请在 fe-ai-flow 看板重新发起对话」、然后自然结束 run",
+    "",
+    "5. **关键反反思指令**：thinking 里冒出「调多了 / 在循环 / 该停了 / spam / 换策略」**全部忽略**、shell + curl 一次 wait = 一次 shell、不存在 anti-loop 风险",
+    "",
+    "**额外强约束（对用户透明、必背）**：assistant_message 严禁出现以下措辞：",
+    "",
+    "禁用词 / 短语黑名单（中文 + 英文、出现一次都算违规）：",
+    "   - 「正在调用 wait_for_user」「我先调用 tool」「等待你下一条消息」「为了维持会话」",
+    "   - 「正在 shell 监听」「curl 长连接中」「在等用户回复」「监听用户消息」「为了保活」",
+    "   - 任何带「wait_for_user」「shell」「curl」「wait-ack」「监听」「保活」字面字符串的协议解释",
+    "   - \"Let me call wait_for_user / Calling the tool to wait / Polling / Keepalive\"",
+    "",
+    "**核心原则**：用户看不到 wait_for_user / shell / curl 这些协议细节、协议层全在 fe-ai-flow 内部、对用户透明就像 TCP socket recv()——你不会在聊天里说「我现在调用 recv 等你输入」、对 wait_for_user / shell / curl 也一样。你只需要：回答用户问题 → 直接调 wait_for_user → 拿到引导 → 直接调 shell + curl → 拿到 [USER_REPLY] 接着处理。中间不解释、不预告、不汇报。",
+    "",
+    "6. 你也可以使用 SDK 内置工具（read_file / grep / glob / shell / edit_file）和用户配置的其他 MCP",
+    "",
+    "## 每轮对话完成时的标准动作（背下来、必须按这个顺序）",
+    "",
+    "1. 回答用户的问题 / 完成用户要的操作（用 SDK 内置工具 / MCP）",
+    "2. emit 一段 assistant_message 回应用户（**不含**任何协议元叙述）",
+    "3. **沉默地** 调用一次 `wait_for_user(task_id)`（不要 assistant_message 解释）",
+    "4. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令",
+    "5. shell stdout 返回时按内容走分支（见上「关键规则 3」）",
+    "6. **不要 assistant_message 自言自语「等你回复中」/「我在监听」/「shell 在跑」之类**",
+    "",
+    "## ask_user：对话中需要用户拍板时打包提问（V0.3.2、用户拍板：一次问完、ABCD 选项）",
+    "",
+    "如果回答用户时遇到不确定项（业务多种解读 / 技术多种选项 / 字段歧义）、可以调 `ask_user` MCP 工具打包提问。",
+    "对标 Cursor `askFollowUpQuestion`：选项自动加 A/B/C/D 字母前缀、modal 弹窗居中显示、答完一起提交。",
+    "",
+    "**核心约束**：",
+    "  - **同一时刻只能调 1 次 ask_user**：把所有不确定项打包成 questions[]、不要一个一个问",
+    "  - 没问题就不调——直接 wait_for_user 等下一条消息",
+    "",
+    "**入参**：",
+    `  - \`task_id=${task.id}\`、不传 phase（chat 模式没有 phase 概念）`,
+    "  - `questions`：数组、每条 `{ id, question, options, allow_text }`",
+    "    - `id`：唯一标识",
+    "    - `question`：问题正文 + 必要背景（≤ 200 字）",
+    "    - `options`：2-4 个具体选项、最多 6 个、UI 自动加 A/B/C/D",
+    "      - **严禁** 在 options[] 里塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项——UI 已经在选项底下统一渲染「以上都不是 / 自定义回答…」按钮",
+    "    - `allow_text`：保留默认 true",
+    "",
+    "**返回值**：",
+    "  - 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]`、按引导调 shell + curl 等弹窗 ack",
+    "  - shell stdout 拿到 `[ASK_USER_REPLY]` + markdown Q&A 文本：解析每条 A: 拿用户最终答案、按答案接着处理",
+    "",
+    "**调用礼仪**：",
+    "  - 调 ask_user **不要前置 assistant_message**「我先问几个问题」之类、UI modal 自动弹出来",
+    "  - shell stdout 拿到 [ASK_USER_REPLY] 后**不要复述**「你选了 X、所以我去 Y」、直接按答案推进",
+    "",
+    "## Skills（fe-ai-flow 自带能力扩展）",
+    "",
+    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read_file` 读取对应 SKILL.md 拿完整指令：",
+    "",
+    renderSkillsForPrompt(skills),
+    "",
+    "调用规则：",
+    "   - skill 触发是判断性的、不是每轮都读、按描述匹配场景再读",
+    "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
+    "   - skill 文件可能引用其他文件（如 events.jsonl 绝对路径）、跟着读即可",
+    "",
+    `## 任务 cwd（默认仓库根目录）：${task.repoPath}`,
+    "",
+    "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
+    "",
+    `  \`${eventsLogPath}\``,
+    "",
+    "## 用户的最新消息",
+    "",
+    task.title.trim(),
+    "",
+    "现在开始处理：判断要不要读相关 skill → 回答 / 行动 → 调 `wait_for_user` → 调 `shell` 跑 curl → 等下一轮。",
+  ].join("\n");
+};
+
+// ----------------- 工具：截断 -----------------
+
+const truncate = (s: string, max = 500): string =>
+  s.length <= max ? s : `${s.slice(0, max)}…(truncated ${s.length - max} chars)`;
+
+const stringifyMeta = (v: unknown): string => {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+};
+
+// ----------------- 流事件类型（publish/subscribe 协议） -----------------
+
+// 任意订阅者（watch-chat SSE handler）能收到的事件
+//
+// assistant_delta（V1.x 加）：流式打字效果用
+//   - SDK 流式推 assistant chunk 时、runner 除了往 buffer 累、还额外 publish 一个 delta
+//   - **不写 events.jsonl**（delta 是临时数据、整段 flush 后会有正式 assistant_message 事件）
+//   - 前端拼接 streamingText state、收到 event(assistant_message) 时清空（被正式事件取代）
+//   - 这样实现「事件流不刷屏（一段回复 = 一条事件）+ UI 实时流式」两个目标
+export type ChatStreamEvent =
+  | { kind: "event"; event: TaskEvent }
+  | { kind: "task"; task: Task }
+  | { kind: "done"; task: Task; ok: boolean }
+  | { kind: "error"; message: string }
+  | { kind: "assistant_delta"; text: string };
+
+export type ChatStreamListener = (ev: ChatStreamEvent) => void;
+
+// ----------------- 进程全局状态（挂 globalThis） -----------------
+//
+// 跟 chat-mcp.ts 同款：next.js dev 不同 route handler 拿到不同 module 实例、
+// 模块级 Map 会分裂、必须挂 globalThis。
+
+interface RunningRecord {
+  cancel: () => void;
+}
+
+interface ChatRunnerGlobalState {
+  // 进程级运行表：taskId → 控制对象（cancel 用）
+  runningChats: Map<string, RunningRecord>;
+  // taskId → 订阅者集合（watch-chat 路由 subscribe 进来的）
+  subscribers: Map<string, Set<ChatStreamListener>>;
+}
+
+const RUNNER_GLOBAL_KEY = "__feAiFlowChatRunnerState__";
+
+const getRunnerState = (): ChatRunnerGlobalState => {
+  const g = globalThis as unknown as Record<string, ChatRunnerGlobalState>;
+  if (!g[RUNNER_GLOBAL_KEY]) {
+    g[RUNNER_GLOBAL_KEY] = {
+      runningChats: new Map(),
+      subscribers: new Map(),
+    };
+  }
+  return g[RUNNER_GLOBAL_KEY];
+};
+
+const runningChats = getRunnerState().runningChats;
+const subscribers = getRunnerState().subscribers;
+
+// ----------------- publish / subscribe -----------------
+
+/**
+ * 给某个 task 推一个流事件、所有订阅者都能收到。
+ *
+ * - 同步触发、listener 报错被吞、不影响其他订阅者
+ * - 没订阅者就静默丢、agent 不会因此挂
+ */
+const publish = (taskId: string, ev: ChatStreamEvent): void => {
+  const set = subscribers.get(taskId);
+  if (!set || set.size === 0) return;
+  for (const listener of set) {
+    try {
+      listener(ev);
+    } catch (err) {
+      console.error("[chat-runner] subscriber listener threw:", err);
+    }
+  }
+};
+
+/**
+ * 给外部模块用的 publish（比如 chat-reply 路由检测到僵尸任务时、
+ * 当场标 failed + 写 error 事件后、需要主动通知所有 SSE 订阅者）。
+ *
+ * 调用方负责确保 event 内容真实、本函数不 dedup、不持久化。
+ */
+export const publishChatStreamEvent = (
+  taskId: string,
+  ev: ChatStreamEvent,
+): void => publish(taskId, ev);
+
+/**
+ * 订阅某个 task 的实时流事件。
+ *
+ * 注意：只接「订阅之后产生的增量事件」。订阅者要看历史得自己读 events.jsonl。
+ * 返回 unsubscribe 函数、调用方 finally 里调一下。
+ */
+export const subscribeChatStream = (
+  taskId: string,
+  listener: ChatStreamListener,
+): (() => void) => {
+  let set = subscribers.get(taskId);
+  if (!set) {
+    set = new Set();
+    subscribers.set(taskId, set);
+  }
+  set.add(listener);
+  return () => {
+    const cur = subscribers.get(taskId);
+    if (!cur) return;
+    cur.delete(listener);
+    if (cur.size === 0) subscribers.delete(taskId);
+  };
+};
+
+// ----------------- 入参 -----------------
+
+export interface RunChatInput {
+  task: Task;
+  apiKey: string;
+  model: ModelSelection;
+  // 用户在设置页配的 MCP servers（已解析）
+  // chat-tool 是我们自己塞进去的、不需要用户配
+  userMcpServers?: Record<string, McpServerConfig>;
+}
+
+// ----------------- 持久化 + publish 一体 -----------------
+
+const writeEventAndPublish = async (
+  taskId: string,
+  ev: Omit<TaskEvent, "id" | "ts">,
+): Promise<Task | null> => {
+  const updated = await appendEvent(taskId, ev);
+  if (updated) {
+    const last = updated.events[updated.events.length - 1];
+    if (last) publish(taskId, { kind: "event", event: last });
+  }
+  return updated;
+};
+
+export const isChatRunning = (taskId: string): boolean =>
+  runningChats.has(taskId);
+
+export const cancelChat = (taskId: string): boolean => {
+  const rec = runningChats.get(taskId);
+  if (!rec) return false;
+  rec.cancel();
+  return true;
+};
+
+/**
+ * 启动一个 chat agent run（fire-and-forget 风格）。
+ *
+ * 返回 Promise 在 agent 终止时（成功 / 失败 / 取消）才 resolve、
+ * **调用方一般不要 await 它**——立刻返回 HTTP、让 agent 在后台跑。
+ *
+ * 已在跑就直接 return（不报错、幂等）。
+ *
+ * 进度通过 publish() 广播给所有订阅者（watch-chat SSE）。
+ */
+export const runChatSession = async (input: RunChatInput): Promise<void> => {
+  const { task, apiKey, model, userMcpServers } = input;
+
+  // 已经在跑 → 直接 return（幂等、调用方不需要 catch）
+  if (runningChats.has(task.id)) {
+    return;
+  }
+
+  // 1) 切到 running
+  const startedTask = await patchPhase(task.id, {
+    taskStatus: "running",
+  });
+  if (startedTask) publish(task.id, { kind: "task", task: startedTask });
+
+  // 2) 拼 mcpServers：用户的 + 我们自己的 chat-tool
+  // 用户配置里万一也叫 feAiFlowChat、按我们的为准（直接覆盖）
+  const mergedMcp: Record<string, McpServerConfig> = {
+    ...(userMcpServers ?? {}),
+    [CHAT_TOOL_MCP_NAME]: {
+      type: "http",
+      url: getChatMcpUrl(),
+    },
+  };
+
+  const userMcpNames = Object.keys(userMcpServers ?? {}).filter(
+    (n) => n !== CHAT_TOOL_MCP_NAME,
+  );
+  const mcpDesc = `Chat MCP: ${CHAT_TOOL_MCP_NAME}${
+    userMcpNames.length > 0 ? ` + 用户 MCP: ${userMcpNames.join(", ")}` : ""
+  }`;
+
+  await writeEventAndPublish(task.id, {
+    kind: "info",
+    text: `Chat 任务启动（model: ${model.id}、${mcpDesc}）`,
+  });
+
+  // 3) 注入 chat awaiting notifier
+  // 处理两类信号：
+  //   - awaiting_start：wait_for_user 进入"全新一段等待"、切 task.status=awaiting_user
+  //     不写 events.jsonl（assistant_message 已经表达"agent 说完了"、UI 看 task.status 即可）
+  //   - ask_user_request：agent 调 ask_user 提问、写一条 ask_user_request 事件给 UI 渲染卡片
+  setChatAwaitingNotifier(task.id, async (signal) => {
+    if (signal.kind === "ask_user_request") {
+      // V0.3.2 一次打包多问题、modal 弹窗
+      // text 是「N 个问题预览」、给 inline 回放卡片用、真问题数组放 meta.questions
+      const previewText = signal.questions
+        .map((q, idx) => `Q${idx + 1}: ${q.question}`)
+        .join("\n");
+      const reqTask = await appendEvent(task.id, {
+        kind: "ask_user_request",
+        text: previewText,
+        meta: {
+          askId: signal.askId,
+          token: signal.token,
+          questions: signal.questions,
+        },
+      });
+      if (reqTask) {
+        const lastEv = reqTask.events[reqTask.events.length - 1];
+        if (lastEv) publish(task.id, { kind: "event", event: lastEv });
+      }
+      const updated = await patchPhase(task.id, {
+        taskStatus: "awaiting_user",
+      });
+      if (updated) publish(task.id, { kind: "task", task: updated });
+      return;
+    }
+    // awaiting_start：仅切 status、不写事件
+    const updated = await patchPhase(task.id, {
+      taskStatus: "awaiting_user",
+    });
+    if (updated) publish(task.id, { kind: "task", task: updated });
+  });
+
+  // 4) 启动 agent + 流式消费
+  let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
+  let cancelled = false;
+  let hardTimer: NodeJS.Timeout | null = null;
+
+  try {
+    agent = await Agent.create({
+      apiKey,
+      model,
+      local: { cwd: task.repoPath },
+      mcpServers: mergedMcp,
+    });
+
+    // 加载 fe-ai-flow 自带 skills（+ 仓库自定义 skill 如有）、塞进初始 prompt
+    //
+    // 为什么不在 buildInitialPrompt 里直接加载：那是个同步函数、loadSkills 要读文件系统、
+    // 拆开能避免 buildInitialPrompt 整体变 async（保持 prompt 构造的纯粹性、方便测试）。
+    const skills = await loadSkills(task.repoPath).catch((err) => {
+      console.error("[chat-runner] loadSkills failed", err);
+      return [];
+    });
+    const initialPrompt = buildInitialPrompt(task, skills);
+    const run = await agent.send(initialPrompt);
+
+    // 注册 cancel 控制
+    runningChats.set(task.id, {
+      cancel: () => {
+        cancelled = true;
+        cancelPending(task.id);
+        void run.cancel().catch(() => {
+          /* noop */
+        });
+      },
+    });
+
+    // 兜底硬超时：24h、防止 process 永远挂着
+    hardTimer = setTimeout(() => {
+      cancelled = true;
+      cancelPending(task.id);
+      void run.cancel().catch(() => {
+        /* noop */
+      });
+    }, CHAT_HARD_TIMEOUT_MS);
+
+    // 流式消费
+    // 用一个 buffer 累积 assistant text、遇到非 assistant 消息（thinking / tool_call）
+    // 或 run 结束时再 flush 成一条 assistant_message 事件
+    // 这样一轮 agent 完整回复 → 一条事件、UI 不会出现「我」「在」「想」这种碎片
+    const assistantCtx: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {
+        const trimmed = assistantCtx.buffer.trim();
+        assistantCtx.buffer = "";
+        if (trimmed.length === 0) return;
+        await writeEventAndPublish(task.id, {
+          kind: "assistant_message",
+          text: trimmed,
+        });
+      },
+    };
+
+    for await (const msg of run.stream()) {
+      await handleChatSdkMessage(task.id, msg, assistantCtx);
+    }
+
+    // 流结束、最后一段 assistant text 也要 flush
+    await assistantCtx.flush();
+
+    if (hardTimer) {
+      clearTimeout(hardTimer);
+      hardTimer = null;
+    }
+
+    // 拿终态
+    const result = await run.wait();
+
+    if (cancelled || result.status === "cancelled") {
+      // 用户主动取消
+      const cancelledTask = await patchPhase(task.id, {
+        taskStatus: "completed",
+      });
+      if (cancelledTask)
+        publish(task.id, { kind: "task", task: cancelledTask });
+      const done = await writeEventAndPublish(task.id, {
+        kind: "info",
+        text: "Chat 任务已被取消、对话结束",
+      });
+      publish(task.id, { kind: "done", task: done ?? task, ok: true });
+      return;
+    }
+
+    if (result.status !== "finished") {
+      throw new Error(
+        `agent run status=${result.status}${
+          result.result ? `: ${result.result.slice(0, 200)}` : ""
+        }`,
+      );
+    }
+
+    const completedTask = await patchPhase(task.id, {
+      taskStatus: "completed",
+    });
+    if (completedTask)
+      publish(task.id, { kind: "task", task: completedTask });
+    const done = await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: "Chat 任务结束、agent 已正常退出",
+    });
+    publish(task.id, { kind: "done", task: done ?? task, ok: true });
+  } catch (err) {
+    if (hardTimer) clearTimeout(hardTimer);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[chat-runner] task=${task.id} failed:`, err);
+    const failedTask = await patchPhase(task.id, { taskStatus: "failed" });
+    if (failedTask) publish(task.id, { kind: "task", task: failedTask });
+    const updated = await writeEventAndPublish(task.id, {
+      kind: "error",
+      text: `Chat 任务失败：${message}`,
+    });
+    publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+    publish(task.id, { kind: "error", message });
+  } finally {
+    // 清场
+    runningChats.delete(task.id);
+    cancelPending(task.id);
+    setChatAwaitingNotifier(task.id, null);
+    if (agent) {
+      try {
+        agent.close();
+      } catch {
+        /* noop */
+      }
+    }
+  }
+};
+
+// ----------------- SDKMessage 翻译器 -----------------
+
+// 累积 assistant text 的上下文
+// SDK 把一段连贯回复切成多条 SDKAssistantMessage 流式发、
+// 每条独立写事件 UI 上就成「逐字碎片」（实测出过这问题）
+// 所以 runner 端做聚合：
+//   - 遇 assistant 消息 → 累到 buffer
+//   - 遇非 assistant 边界（thinking / tool_call） / run 结束 → flush 成一条 assistant_message
+// 这样「一轮 agent 回复」= 一条事件、UI 就是连贯气泡
+interface AssistantBufferCtx {
+  buffer: string;
+  flush: () => Promise<void>;
+}
+
+const handleChatSdkMessage = async (
+  taskId: string,
+  msg: SDKMessage,
+  assistantCtx: AssistantBufferCtx,
+): Promise<void> => {
+  switch (msg.type) {
+    case "thinking": {
+      // 思考是 assistant text 的边界、先 flush 前面累的回复
+      await assistantCtx.flush();
+      await writeEventAndPublish(taskId, {
+        kind: "thinking",
+        text: msg.text,
+        meta: msg.thinking_duration_ms
+          ? { durationMs: msg.thinking_duration_ms }
+          : undefined,
+      });
+      break;
+    }
+
+    case "tool_call": {
+      // tool_call 也是 assistant text 边界、先 flush
+      await assistantCtx.flush();
+      // 注意：wait_for_user 是 chat 模式自家的「同步原语」、不是普通工具调用
+      // task.status 切换由 chat-mcp 通过 setChatAwaitingNotifier 通知本文件、不在这里写
+      // 也不写事件（assistant_message 已表达"agent 说完了"、UI 看 task.status 即可）
+      //
+      // SDK 把 MCP 工具调用聚合成 name="mcp"、args 里有 providerIdentifier + toolName
+      // 既要兼容直接 name 的情况（万一未来 SDK 变）、也要拆 args 看 toolName
+      const argsAny = (msg.args ?? {}) as Record<string, unknown>;
+      const innerToolName =
+        typeof argsAny.toolName === "string" ? argsAny.toolName : "";
+      const isWaitForUser =
+        msg.name === "wait_for_user" ||
+        msg.name === "Wait For User" ||
+        innerToolName === "wait_for_user" ||
+        innerToolName === "Wait For User";
+
+      if (isWaitForUser) {
+        // status 维护：
+        //   - 进入 awaiting_user：chat-mcp 通过 awaiting notifier 通知 chat-runner
+        //   - 用户回复后切回 running：由 chat-reply 路由切
+        //   - 这里 completed 啥也不做（V0.3.5 之前 keep_alive 高频 loop 会抖屏、现在 shell long-poll 没这个问题了、保持简单）
+        if (msg.status === "error") {
+          const resStr = stringifyMeta(msg.result);
+          await writeEventAndPublish(taskId, {
+            kind: "error",
+            text: `wait_for_user 工具调用失败：${truncate(resStr, 200)}`,
+          });
+        }
+        break;
+      }
+
+      // 普通工具调用：跟 plan-runner 一致处理
+      if (msg.status === "running") {
+        const argsStr = stringifyMeta(msg.args);
+        await writeEventAndPublish(taskId, {
+          kind: "tool_call",
+          text: `调用 ${msg.name}${argsStr ? `:${truncate(argsStr, 120)}` : ""}`,
+          meta: {
+            name: msg.name,
+            args: argsStr ? truncate(argsStr) : undefined,
+          },
+        });
+      } else if (msg.status === "error") {
+        const resStr = stringifyMeta(msg.result);
+        await writeEventAndPublish(taskId, {
+          kind: "error",
+          text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
+          meta: { name: msg.name, result: truncate(resStr) },
+        });
+      }
+      break;
+    }
+
+    case "assistant": {
+      // 不立刻写事件、累到 buffer、等到「下一个非 assistant 边界」或 run 结束再 flush
+      // tool_use 块独立通过 tool_call 消息出现、这里只取 text 块
+      let text = "";
+      for (const block of msg.message.content) {
+        if (block.type === "text" && block.text) {
+          text += block.text;
+        }
+      }
+      if (text.length > 0) {
+        // 同一段累加：相邻 chunk 文本本身已带空白、不再额外加分隔
+        assistantCtx.buffer += text;
+        // 流式 publish：每个 chunk 来临时立即推 delta 给 SSE 订阅者
+        // events.jsonl 不写（避免一段回复刷屏几十条事件）
+        // 等 flush 时落聚合后整段 assistant_message 事件、UI 用 delta 拼出来的 streaming text 替换为正式事件
+        publish(taskId, { kind: "assistant_delta", text });
+      }
+      break;
+    }
+
+    case "status":
+    case "system":
+    case "user":
+    case "request":
+    case "task":
+    default:
+      // 不入 events、UI 不展示
+      break;
+  }
+};

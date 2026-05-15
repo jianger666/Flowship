@@ -9,7 +9,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "fe-ai-flow",
-  description: "前端需求自动化流水线（spec → plan → build）",
+  description: "项目级 AI Harness 平台 · 飞书 story → PR 自动化",
 };
 
 /**
@@ -33,13 +33,16 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
               >
                 fe-ai-flow
                 <span className="text-xs text-muted-foreground font-normal">
-                  前端需求自动化流水线
+                  项目级 AI Harness · 飞书 story → PR
                 </span>
               </Link>
-              {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild */}
+              {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild
+                  nativeButton={false} 是因为 render 出来的是 <a>、不是 <button>、
+                  不传会被 Base UI runtime warn */}
               <Button
                 variant="ghost"
                 size="sm"
+                nativeButton={false}
                 render={<Link href="/settings" className="no-underline" />}
               >
                 <Settings />

@@ -12,11 +12,12 @@ const KEY = "fe-ai-flow:settings";
 
 // MCP 配置默认值：与 Cursor IDE 的 ~/.cursor/mcp.json 同 schema
 // 用 mcpServers 外层 wrapper 是为了让用户能直接从 IDE 配置粘贴过来
-const DEFAULT_MCP_JSON = `{
+// export 出去给 use-settings / mcp-card 等复用、避免多处独立定义漂移
+export const DEFAULT_MCP_JSON = `{
   "mcpServers": {}
 }`;
 
-const DEFAULT_SETTINGS: FeAiFlowSettings = {
+export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
   defaultModel: { id: "" },
   repos: [],
