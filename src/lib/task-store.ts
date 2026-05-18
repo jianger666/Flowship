@@ -21,16 +21,9 @@ import type {
   TaskEvent,
 } from "./types";
 
-// V0.2 phase 推进表（feishu-story-impl workflow）
-// V0.3.3 移除 ship、V0.3.4 合并 context 进 plan
-// V0.5 加 review、review 是最后一个 phase
-// 详情页用、知道下一步该提示用户去哪
-// 改 workflow 时记得也改这里、TODO：未来抽到 WORKFLOWS 注册表里
-export const FEISHU_WORKFLOW_NEXT_PHASE: Record<PhaseId, PhaseId | null> = {
-  plan: "build",
-  build: "review",
-  review: null,
-};
+// V0.5.3：原来的 `FEISHU_WORKFLOW_NEXT_PHASE` 静态表已删——
+// 它只有定义、没人 import（漏网死代码）；下一 phase 计算改走 `getNextPhase(workflowDef, current)`
+// helper（在 types.ts、跟 WORKFLOWS 同源、扩 phase 时只需改 workflow.phases）
 
 /**
  * 从设置页存的 mcpServersJson 字符串解析出 SDK 能直接用的 mcpServers 对象

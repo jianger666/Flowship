@@ -44,7 +44,12 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useModels } from "@/hooks/use-models";
 import { PHASE_LABEL } from "@/lib/task-display";
-import { WORKFLOWS, type ModelSelection, type PhaseId } from "@/lib/types";
+import {
+  getNextPhase,
+  WORKFLOWS,
+  type ModelSelection,
+  type PhaseId,
+} from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -126,12 +131,9 @@ export const ApprovePhaseDialog = ({
   };
 
   const phaseLabel = PHASE_LABEL[phaseId];
-  // 找下一 phase（feishu-story-impl: plan → build → review）
+  // 找下一 phase（V0.5.3 起复用 lib/types.getNextPhase、跟 WORKFLOWS 单源）
   // review 是最后一个、approve 后 workflow 结束、没有下一 phase
-  const wfPhases = WORKFLOWS["feishu-story-impl"].phases;
-  const curIdx = wfPhases.indexOf(phaseId);
-  const nextPhase =
-    curIdx >= 0 && curIdx < wfPhases.length - 1 ? wfPhases[curIdx + 1] : null;
+  const nextPhase = getNextPhase(WORKFLOWS["feishu-story-impl"], phaseId);
   const nextPhaseLabel = nextPhase ? PHASE_LABEL[nextPhase] : null;
 
   return (

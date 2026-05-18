@@ -75,7 +75,7 @@ import type {
   TaskEvent,
   WorkflowDef,
 } from "@/lib/types";
-import { TASK_ROLE_LABEL, WORKFLOWS } from "@/lib/types";
+import { getNextPhase, TASK_ROLE_LABEL, WORKFLOWS } from "@/lib/types";
 
 // ----------------- 配置 -----------------
 
@@ -730,11 +730,7 @@ export const markPhaseAcked = async (
     });
   }
   // currentPhase 推进到下一个（agent 还没真切、但 UI 上先体现进度）
-  const idx = rec.workflowDef.phases.indexOf(phaseId);
-  const nextPhase =
-    idx >= 0 && idx + 1 < rec.workflowDef.phases.length
-      ? rec.workflowDef.phases[idx + 1]!
-      : null;
+  const nextPhase = getNextPhase(rec.workflowDef, phaseId);
   const updated = await patchPhase(taskId, {
     phaseId,
     status: "ack",

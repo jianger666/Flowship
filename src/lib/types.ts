@@ -85,7 +85,7 @@ export interface ModelOption {
 // V0.2 workflow phase 序列 = [plan, build]、单 SDK Run 跨 2 phase
 // 通过 wait_for_user MCP 在 phase 间阻塞等用户 ack（不是每 phase 起新 Run、省 Cursor 计费)
 //
-// V0.5 引入 review phase（详见 docs/HANDOFF.md「V0.5 设计预告」段）：
+// V0.5 引入 review phase（详见 docs/HANDOFF.md「V0.5：review phase + 多 phase 模型选择 + plan 校验前移」段）：
 //   - "review"：build 之后、拿 `git diff × 01-plan.md × 02-build.md × contextDocs` 做结构化差值
 //     按 4 类分流（范围扩张 / 范围收缩 / 实现偏差 / 未完成）、产出 03-review.md
 //     含整体一致性总评 + 4 类差异表 + 飞书需求对照 + 交付信息（commit msg / PR body / 飞书评论草稿 / 自测 checklist）
@@ -203,10 +203,11 @@ export interface TaskEvent {
 /**
  * 任务模式：决定整个任务的交互形态
  *
- * - `plan`：方案规划任务、走 2-phase workflow（plan → build）
+ * - `plan`：方案规划任务、走多 phase workflow（V0.5 起 plan → build → review）
  *   - V0.2 起：整段任务跑在一次 SDK Run、phase 间用 wait_for_user 阻塞等 ack
  *   - V0.3.3 起：移除原 phase 4（ship、提 PR + 同步飞书）
  *   - V0.3.4 起：把 context phase 合进 plan phase（合并理由见 PhaseId 注释）
+ *   - V0.5 起：build 之后加 review phase（拿 git diff × plan × build × 飞书 做差值对照）
  *   - 配合 `workflowId` 决定具体走哪条 phase 序列（目前只有 feishu-story-impl）
  * - `chat`：自由对话、agent 长存活、调 wait_for_user MCP 等用户输入
  *
@@ -217,8 +218,9 @@ export type TaskMode = "plan" | "chat";
 /**
  * Plan 模式下的 workflow 标识：决定 phase 序列 / prompt 模板 / 必填字段
  *
- * - `feishu-story-impl`：从飞书 story 出发、走 2 phase 出方案 + 实现
- *   - phase 序列：[plan, build]（V0.3.3 移除原 ship phase、V0.3.4 合并原 context 进 plan）
+ * - `feishu-story-impl`：从飞书 story 出发、走 3 phase 方案 + 实现 + 复核
+ *   - phase 序列：[plan, build, review]
+ *     （V0.3.3 移除原 ship phase、V0.3.4 合并原 context 进 plan、V0.5 加 review）
  *   - 必填：feishuStoryUrl
  *
  * V0.2 只有这一种。后面会加 `pr-review` / `interface-binding` 等。
@@ -364,5 +366,27 @@ export const WORKFLOWS: Record<WorkflowId, WorkflowDef> = {
     phases: ["plan", "build", "review"],
     requiredFields: ["feishuStoryUrl"],
   },
+};
+
+/**
+ * 取「下一 phase」的统一入口（V0.5.3 抽出、消除多处重复算法）
+ *
+ * 之前 plan-runner / phase-ack route / approve-phase-dialog 三处都自己写
+ * `phases.indexOf(cur) + 1 < length ? phases[idx+1] : null`、容易漂移。
+ *
+ * 入参用 `WorkflowDef`（不是 `WorkflowId`）：避免 client-side 反查 WORKFLOWS、
+ * 也方便单测；调用方通常已经拿到 workflowDef、直接传过去。
+ *
+ * - 返 `null` = 当前是最后一个 phase（approve 后 workflow 结束）
+ * - 返 PhaseId = 下一 phase 的 id
+ * - `current` 不在 workflowDef.phases 里（异常）也返 null、由调用方决定怎么 fallback
+ */
+export const getNextPhase = (
+  workflowDef: WorkflowDef,
+  current: PhaseId,
+): PhaseId | null => {
+  const idx = workflowDef.phases.indexOf(current);
+  if (idx < 0) return null;
+  return workflowDef.phases[idx + 1] ?? null;
 };
 

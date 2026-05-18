@@ -52,7 +52,7 @@ import {
   waitForPlanToStop,
 } from "@/lib/server/plan-runner";
 import { publishChatStreamEvent } from "@/lib/server/chat-runner";
-import { WORKFLOWS, type PhaseId } from "@/lib/types";
+import { getNextPhase, WORKFLOWS, type PhaseId } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -254,11 +254,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (!workflowDef) {
     return errorResponse(`workflow ${task.workflowId} 未注册`, 500);
   }
-  const ackIdx = workflowDef.phases.indexOf(ackPhase);
-  const nextPhase =
-    ackIdx >= 0 && ackIdx + 1 < workflowDef.phases.length
-      ? workflowDef.phases[ackIdx + 1]!
-      : null;
+  const nextPhase = getNextPhase(workflowDef, ackPhase);
   if (!nextPhase) {
     // 最后一个 phase 已 ack、没下一 phase 可跑、直接当普通 approve 走
     // （走到这说明用户在最后一个 phase 选了 fork、其实没必要、按普通 approve 兜底）
