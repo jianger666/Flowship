@@ -367,7 +367,7 @@ export interface ChatReplyBootArgs {
  * @param text         用户消息文本（可为空、但 images / attachments 至少有一个）
  * @param images       可选附图、由后端校验白名单 / size、落盘 + 把绝对路径塞给 wait_for_user
  * @param attachments  可选附路径（文件 / 目录绝对路径数组、来自 FsPickerDialog）、由后端校验存在 +
- *                     拼成 `[ATTACHED_PATHS]` 段塞给 wait_for_user、agent 用 read_file 自己读
+ *                     拼成 `[ATTACHED_PATHS]` 段塞给 wait_for_user、agent 用 `read` 工具自己读
  * @param bootArgs     V0.4：终态发消息时用来启 agent（apiKey/model/mcpServers）
  *                     调用方建议无脑传、后端自己判断要不要启动
  *

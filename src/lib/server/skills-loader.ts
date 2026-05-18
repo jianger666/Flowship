@@ -10,7 +10,7 @@
  *        → 用户的项目仓库本来就有 `.cursor/` 目录（rules / 配置）、skills 跟着进 .cursor/skills/ 即可
  *        → 同一份 SKILL.md 既能给 fe-ai-flow chat 用、又能直接给 Cursor IDE 加载
  *   - **progressive loading**：启动 agent 时只把每个 skill 的 name + description + absPath 拼进 prompt、
- *     agent 看到场景匹配时**主动 read_file** 完整 SKILL.md 拿到详情。
+ *     agent 看到场景匹配时**主动用 `read` 工具读** 完整 SKILL.md 拿到详情。
  *     节省 prompt token、跟 Cursor IDE 加载行为一致。
  *
  * 不做的事（V1）：
@@ -46,7 +46,7 @@ export interface SkillEntry {
   description: string;
   // 可选：限定该 skill 对哪些 paths 生效（V1 列出但不强制过滤、给 LLM 做参考）
   paths?: string[];
-  // SKILL.md 绝对路径、agent 用这个去 read_file
+  // SKILL.md 绝对路径、agent 用这个调 `read` 工具读
   absPath: string;
   // 来源：fe-ai-flow 自带 / 工作仓库专属
   // UI 可能展示标签、prompt 里 agent 也能区分「项目通用」vs「这个仓库特化」
@@ -208,7 +208,7 @@ export const loadSkills = async (
  * 每个 skill 占 3 行：
  *   - skill_name (source)
  *   - desc: 单行简介
- *   - path: 绝对路径（agent read_file 用）
+ *   - path: 绝对路径（agent 调 `read` 工具用）
  *
  * 整段总 token 量预估：N × 80~120 token；N=10 时 ~1k token、可接受
  */

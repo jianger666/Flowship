@@ -100,7 +100,7 @@ export type PhaseId = "plan" | "build" | "review";
 // 用户在任务详情页随时加 / 删上下文（飞书文档 URL / 本地路径 / 自由文本）、
 // agent 在 super-prompt 里看到清单、但内容不全量 inject——
 //  - URL 类型：agent 用 feishu-mcp / fetch 工具按需拉
-//  - path 类型：agent 用 SDK read_file 按需读
+//  - path 类型：agent 用 SDK 内置 `read` 工具按需读
 //  - text 类型：内容 ≤ 1000 字默认直接 inject（短文本反正不占 token）、> 1000 字截断
 //
 // 跟 Skill 类比：title + type = SKILL.md frontmatter；content = SKILL.md 正文
@@ -146,7 +146,7 @@ export type EventKind =
   | "phase_start"
   | "phase_ack"
   | "phase_failed"
-  | "tool_call" // agent 调工具（read_file / grep / shell 等）
+  | "tool_call" // agent 调工具（read / grep / shell / write / edit 等）
   | "user_reply" // chat 模式：用户的消息
   | "assistant_message" // chat 模式 agent 完整一轮回复（不像 plan 那样累积成 artifact）
   // V0.3 ask_user 机制（phase 内细粒度问答、跟 wait_for_user 是不同语义）

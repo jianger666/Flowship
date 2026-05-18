@@ -91,10 +91,10 @@ export type ToolReturn = {
     | "cancelled";
   text: string;
   // user_reply 携带的图片附件绝对路径列表（仅 kind === "user_reply" 用、其他为 undefined）
-  // wait-ack 路由会把这些路径拼到 text 里、agent 用 SDK 内置 read_file 读看图
+  // wait-ack 路由会把这些路径拼到 text 里、agent 用 SDK 内置 `read` 工具读看图
   imagePaths?: string[];
   // user_reply 携带的文件 / 目录附件绝对路径列表（仅 kind === "user_reply" 用）
-  // wait-ack 路由会把这些路径拼到 text 里、agent 用 read_file / grep / glob 自己读
+  // wait-ack 路由会把这些路径拼到 text 里、agent 用 read / grep / glob 自己读
   attachmentPaths?: string[];
   // phase_revise 携带的修改意见文本（agent 根据这个改 artifact）
   feedback?: string;
@@ -940,9 +940,9 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
  * 用户在 UI 输入了下一条消息、API 路由调这个、把消息塞给被阻塞的 agent。
  *
  * @param imagePaths      用户消息附带的图片绝对路径（已落盘）、可空。
- *   非空时 wait_for_user return 会拼 [ATTACHED_IMAGES] 段、agent 用 read_file 读它能看图
+ *   非空时 wait_for_user return 会拼 [ATTACHED_IMAGES] 段、agent 用 `read` 工具读它能看图
  * @param attachmentPaths 用户消息附带的文件 / 目录绝对路径（FsPickerDialog 选的）、可空。
- *   非空时 wait_for_user return 会拼 [ATTACHED_PATHS] 段、agent 按需 read_file / grep / glob
+ *   非空时 wait_for_user return 会拼 [ATTACHED_PATHS] 段、agent 按需 read / grep / glob
  *
  * 返回值：
  *   - true：成功 resolve、agent 会拿到这段文本

@@ -662,8 +662,8 @@ start-workflow：
     └─ fire-and-forget、立即返回 { task, already }
 
 agent 跑一个 phase（重复 4 次）：
-  agent: read_file / grep / 仓库扫描 / 飞书 MCP / ...
-  agent: edit_file → 写 artifacts/<NN>-<phase>.md
+  agent: read / grep / 仓库扫描 / 飞书 MCP / ...
+  agent: write → 写 artifacts/<NN>-<phase>.md
   agent: tool_call wait_for_user(task_id, phase="context"|"plan"|"build"|"ship", artifact)
        ├─ 50s 没用户 ack → resolve { kind: "keepalive", text: "[KEEPALIVE #N @hh:mm:ss] ..." }
        │   agent: 立刻再调 wait_for_user（同 phase 同 artifact）

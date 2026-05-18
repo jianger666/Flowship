@@ -72,7 +72,7 @@ const CHAT_TOOL_MCP_NAME = "feAiFlowChat";
 // 时服务端 resolve promise + 关流 → curl exit → agent 推进。
 //
 // Skills（harness 思路）：附件处理 / 历史上下文恢复等场景化能力放在 skills/<name>/SKILL.md、
-// prompt 末尾列 skill index、agent 自行 read_file 拿完整指令。
+// prompt 末尾列 skill index、agent 自行用 `read` 工具拿完整指令。
 /**
  * V0.4 自由化：用户发首条消息时同时启动 agent
  *

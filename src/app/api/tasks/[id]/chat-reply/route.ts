@@ -64,7 +64,7 @@ interface PostBody {
   text?: string;
   // 用户上传的图片附件、纯 base64（不带 data: 前缀）
   // 后端会 1. 校验 mimeType 白名单 + 单图 size 上限 2. 落盘到 data/tasks/<id>/uploads/<uuid>.<ext>
-  // 3. 把绝对路径塞给 wait_for_user return、agent 用 SDK 内置 read_file 读看图
+  // 3. 把绝对路径塞给 wait_for_user return、agent 用 SDK 内置 `read` 工具读看图
   images?: Array<{
     data?: string;
     mimeType?: string;
@@ -72,7 +72,7 @@ interface PostBody {
   }>;
   // 用户附加的文件 / 目录绝对路径（FsPickerDialog 选的、纯路径不传内容）
   // 后端会 1. 校验路径必须绝对 + 存在 2. 写 user_reply.meta.attachments
-  // 3. 把路径塞给 wait_for_user return（[ATTACHED_PATHS] 段）、agent 用 read_file / grep / glob 自己读
+  // 3. 把路径塞给 wait_for_user return（[ATTACHED_PATHS] 段）、agent 用 read / grep / glob 自己读
   attachments?: string[];
   // V0.4 chat 自由化：当 task 处于 draft / completed / failed 状态时
   // 用户发消息要同时启动 agent、需要 SDK 启动参数
@@ -407,8 +407,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 正常对话回合：resolve 阻塞中的 wait_for_user
   // wait-ack 路由会把附件路径拼到 text 里：
-  //   - [ATTACHED_IMAGES]：图片专用、agent 调 read_file → SDK 自动 vision 处理
-  //   - [ATTACHED_PATHS]：任意文件 / 目录、agent 按需 read_file / grep / glob
+  //   - [ATTACHED_IMAGES]：图片专用、agent 调 `read` 工具 → SDK 自动 vision 处理
+  //   - [ATTACHED_PATHS]：任意文件 / 目录、agent 按需 read / grep / glob
   const ok = submitUserMessage(
     task.id,
     text,

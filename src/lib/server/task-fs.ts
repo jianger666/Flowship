@@ -81,7 +81,7 @@ const taskDir = (id: string): string =>
  *
  * 为啥要绝对路径：agent 的 cwd 是 task.repoPath（用户的业务仓库）、
  * 而 events.jsonl 在 fe-ai-flow 项目自己的 data/ 下、跨 cwd 必须用绝对路径
- * 否则 agent read_file 时按 cwd 解析直接 ENOENT。
+ * 否则 agent 调 `read` 工具时按 cwd 解析直接 ENOENT。
  *
  * 不做 exists 检查、给路径就行（首次启动文件可能还不存在、agent 自己处理）。
  */
@@ -92,7 +92,8 @@ export const getEventsLogPath = (taskId: string): string =>
  * 给 agent prompt 用的 artifacts 目录绝对路径。
  *
  * V0.2 约定 artifact 文件名格式：`<NN>-<phase>.md`、NN 是 phase 在 workflow 里的序号、补 0 到 2 位。
- * agent 用 SDK edit_file 工具写到这个绝对路径下、然后 hydrateTask 时按这套约定读出来。
+ * agent 用 SDK 内置 `write` 工具（args `{ path, fileText }`）写到这个绝对路径下、
+ * 然后 hydrateTask 时按这套约定读出来。
  *
  * 例如 feishu-story-impl workflow（V0.3.4 起 [plan, build]）：
  *   data/tasks/<id>/artifacts/01-plan.md
@@ -126,7 +127,7 @@ export const getPhaseArtifactPath = (
 //
 // 思路：用户在 chat 里粘贴 / 拖 / 选图 → 前端 base64 → 后端这里落盘到
 // data/tasks/<id>/uploads/<uuid>.<ext>、再把绝对路径塞给 wait_for_user 工具的 return text。
-// agent 看到路径 → 用 SDK 内置 read_file 读 → SDK 自动检测 image magic bytes →
+// agent 看到路径 → 用 SDK 内置 `read` 工具读 → SDK 自动检测 image magic bytes →
 // 走 vision 通道 → 模型真能看图。
 //
 // 不用 base64 + MCP image content（实测 SDK 拒收）、改走文件路径 + 内置工具 = 三全其美：
@@ -137,7 +138,7 @@ export const getPhaseArtifactPath = (
 // 安全：mimeType 白名单 + 单图 size 上限 + 落盘文件名只用 uuid（防穿越）
 const UPLOADS_DIR = "uploads";
 
-// 允许的图片 mime（agent 实测 read_file 都能 vision、范围跟 Cursor IDE 一致）
+// 允许的图片 mime（agent 实测 `read` 工具都能 vision、范围跟 Cursor IDE 一致）
 const ALLOWED_IMAGE_MIME: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -158,7 +159,7 @@ export interface ImageAttachmentInput {
 }
 
 export interface ImageAttachmentSaved {
-  // 落盘的绝对路径（agent 用这个 read_file）
+  // 落盘的绝对路径（agent 用 `read` 工具读这个路径）
   absPath: string;
   // 相对 data/ 的路径（events.jsonl 里存的轻量引用、未来换机器还能用）
   relPath: string;

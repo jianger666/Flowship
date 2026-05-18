@@ -183,7 +183,7 @@ interface Props {
   // V1 仅 chat 模式用、plan 模式不传
   streamingText?: string;
   // attachments：附加的文件 / 目录绝对路径数组、后端 wait_for_user return 会拼成
-  // [ATTACHED_PATHS] 段给 agent、agent 用 read_file 自己读
+  // [ATTACHED_PATHS] 段给 agent、agent 用 `read` 工具自己读
   onUserReply?: (
     text: string,
     images?: ChatReplyImage[],
@@ -627,7 +627,7 @@ const EventStreamImpl = ({
               disabled={!isAwaitingUser}
               onClick={() => setPathPickerOpen(true)}
               className="h-7 gap-1 px-2 text-xs"
-              title="附文件 / 目录路径（agent 会用 read_file 看）"
+              title="附文件 / 目录路径（agent 会用 `read` 工具看）"
             >
               <FolderOpen className="size-3.5" />
               附文件
@@ -646,14 +646,14 @@ const EventStreamImpl = ({
           </div>
         </div>
       </div>
-      {/* 文件 / 目录选择对话框：mode=any、多选、agent 拿到这些路径后自己用 read_file 读 */}
+      {/* 文件 / 目录选择对话框：mode=any、多选、agent 拿到这些路径后自己用 `read` 工具读 */}
       <FsPickerDialog
         open={pathPickerOpen}
         onOpenChange={setPathPickerOpen}
         mode="any"
         multiple
         title="附加文件 / 目录"
-        description="选完点确认、绝对路径会跟你的消息一起发给 agent、由它用 read_file 自己读"
+        description="选完点确认、绝对路径会跟你的消息一起发给 agent、由它用 `read` 工具自己读"
         initialPath={task.repoPath}
         onConfirm={handlePathsPicked}
       />
