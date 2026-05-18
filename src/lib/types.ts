@@ -84,7 +84,14 @@ export interface ModelOption {
 //   读上下文 → 扫仓库 → 出方案、用户只审 1 次、效率高。
 // V0.2 workflow phase 序列 = [plan, build]、单 SDK Run 跨 2 phase
 // 通过 wait_for_user MCP 在 phase 间阻塞等用户 ack（不是每 phase 起新 Run、省 Cursor 计费)
-export type PhaseId = "plan" | "build";
+//
+// V0.5 引入 review phase（详见 docs/HANDOFF.md「V0.5 设计预告」段）：
+//   - "review"：build 之后、拿 `git diff × 01-plan.md × 02-build.md × contextDocs` 做结构化差值
+//     按 4 类分流（范围扩张 / 范围收缩 / 实现偏差 / 未完成）、产出 03-review.md
+//     含整体一致性总评 + 4 类差异表 + 飞书需求对照 + 交付信息（commit msg / PR body / 飞书评论草稿 / 自测 checklist）
+//   - HITL 边界：用户「整体通过」一次性 ack、或对单项 revise（agent 按指示动 build 或 plan 后再 review）
+//   - 不做 ship 那种「自动 git push / 自动改飞书状态」、只输出信息让用户复制
+export type PhaseId = "plan" | "build" | "review";
 
 // ===========================================
 // 上下文文档（V0.3、跟 Skill 同理：清单 inject + 按需拉取）
@@ -340,12 +347,14 @@ export interface AddContextDocInput {
 
 // V0.2 workflow 注册表（顶层导出、前后端共享）
 // 现阶段只有一个；以后扩 workflow 时往这里加
+// V0.5：phases 加 review、整条 workflow = plan → build → review
 export const WORKFLOWS: Record<WorkflowId, WorkflowDef> = {
   "feishu-story-impl": {
     id: "feishu-story-impl",
     displayName: "飞书 story 实现",
-    description: "从飞书 story 链接出发、agent 自己读上下文 / 扫仓库 / 出方案 → SDK Agent 按 plan 写代码（V0.3.4 把 context 合进 plan、2 phase 一气呵成）",
-    phases: ["plan", "build"],
+    description:
+      "从飞书 story 链接出发、agent 读上下文 / 扫仓库 / 出方案（plan）→ SDK Agent 按 plan 写代码（build）→ 拿 git diff × plan × 飞书原文做差值对照 + 产出交付信息（review）",
+    phases: ["plan", "build", "review"],
     requiredFields: ["feishuStoryUrl"],
   },
 };

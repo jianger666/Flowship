@@ -1,7 +1,7 @@
 /**
  * POST /api/tasks/[id]/start-workflow
  *
- * plan 模式任务专用：启动 workflow agent run（V0.3.4 起 plan → build 共 2 phase、一次 SDK Run 跑全程）。
+ * plan 模式任务专用：启动 workflow agent run（V0.5 起 plan → build → review 共 3 phase、一次 SDK Run 跑全程）。
  *
  * Body: { apiKey: string; model: ModelSelection; mcpServers?: Record<string, McpServerConfig> }
  *

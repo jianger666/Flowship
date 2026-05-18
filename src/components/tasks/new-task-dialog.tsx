@@ -191,7 +191,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 onClick={() => setMode("plan")}
                 icon={<Workflow className="size-4" />}
                 title="方案规划（推荐）"
-                desc="从飞书 story 起步、走 plan→build 2 phase、agent 自己读上下文 + 扫仓库 + 出方案、每段你 ack 才推进"
+                desc="从飞书 story 起步、走 plan → build → review 三段、agent 自己读上下文 + 扫仓库 + 出方案 + 写代码 + 复核交付、每段你 ack 才推进"
               />
               <ModeCard
                 active={mode === "chat"}

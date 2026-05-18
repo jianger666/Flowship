@@ -28,7 +28,7 @@
 | **代码质量大清扫（V0.4）** | ✅ V0.4 完成 | 修 chat-runner 严重 prompt drift（keep_alive_a/b/c → shell long-poll）、删老 phase prompt 文件、修 SKILL.md / `ask_user` description 残留、顶部品牌改「开发流水线」 |
 | Plan + Build 端到端跑通 | 🚧 待用户 demo | 用户最近已能跑通 plan、build phase 也能写 artifact、但 wait-ack 长连接 / 代理稳定性还是隐患 |
 | 自动 retry on ConnectError | 🔲 不做 | 用户决定：靠手动「继续监听」、避免 agent 反复踩坑 |
-| **review phase（V0.5 设计已对齐）** | 🚧 待启动 | 4 类差异 + plan 校验前移 + 模型 / agent 自由切换、详见 HANDOFF V0.5 段 |
+| **review phase（V0.5 代码已落地）** | 🚧 待联测 | 4 类差异 + plan 校验前移 + 模型 / agent 自由切换、详见 HANDOFF V0.5 段 |
 | Cancel chat（保留任务、停 agent） | 🔲 未启动 | 当前只能"删任务" |
 | 飞书 / swagger 自动拉 | 🔲 未启动 | V0.6 启动、用户已配飞书 MCP |
 | cost / token dashboard | 🔲 未启动 | V0.7 启动 |
@@ -147,9 +147,9 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 
 ---
 
-## V0.5 / W5：review phase + 多 phase 模型选择 + plan 校验前移（未启动、设计已对齐）
+## V0.5 / W5：review phase + 多 phase 模型选择 + plan 校验前移（代码已落地、待联测）
 
-**目标**：在 build 之后补一道 review phase、把编码完成到「真的可以交付」之间那段手工活吃掉。设计详见 `docs/HANDOFF.md` V0.5 设计预告段（含完整 artifact 模板）、本节只列里程碑。
+**目标**：在 build 之后补一道 review phase、把编码完成到「真的可以交付」之间那段手工活吃掉。设计 + 实施详见 `docs/HANDOFF.md` V0.5 段（含完整 artifact 模板 + fork 流程实现细节）、本节只列里程碑。
 
 **核心改动**：
 
@@ -167,12 +167,20 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 - ❌ 默认强制起新 agent run（决定权给用户）
 - ❌ review 之后再加 phase（V0.5 收敛到 review）
 
-**先做什么 / 不先做什么**：
+**已落地（2026-05-18）**：
 
-- 先做：03-review.md artifact 模板示例 + 实际跑出 1-2 个真任务验证形态 → 调差异分类 → 写正式 prompt → 落代码
-- 不先做：模型选择 UI（先把 review phase 跑出来、模型切换是第二优先级 / 体验优化）
+- ✅ `prompts/phase-3-review.md` 写完（含 4 类差异分流 + 严格只输出文本约束）
+- ✅ `prompts/phase-1-plan.md` 加「§1.1 我的理解 vs 飞书原文」校验前移段
+- ✅ `plan-runner.ts` 加 fork 模式（`Agent.create` 新 agent、super-prompt 顶部 fork banner 提示从哪 phase 开始）
+- ✅ `phase-ack` 路由支持 `forkAgent` / `nextModel` / `bootArgs`、fork 流程 `markPlanForFork → cancelPlan → waitForPlanToStop → markPhaseAcked → runPlanWorkflow(fork)`
+- ✅ `src/components/tasks/approve-phase-dialog.tsx` 新增、含模型 selector + 「换新 agent」switch
+- ✅ task-fs.ts / task-display.ts / types.ts 加 review phase 元数据
 
-**预计**：3-5 天（含 prompt 调试和 1-2 轮真任务验证）
+**待联测**：
+
+- 跑 1-2 个真任务、走完 plan → build → review 三 phase（含 plan ack / build ack / review ack 三次 HITL）
+- 测 fork：在 build ack 时切换模型 / 勾「换新 agent」、确认旧 agent 干净退出 + 新 agent 接管 review
+- 调差异分类：跑出 03-review.md 后看 4 类差异的实际效果、按用户反馈调 prompt
 
 ---
 

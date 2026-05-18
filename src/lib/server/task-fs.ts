@@ -54,8 +54,8 @@ const ARTIFACTS_DIR = "artifacts";
 
 // V0.2 全 phase 序、UI / hydrate 时用
 // （workflow 自己也定义了 phases、但 hydrateTask 不知道是哪条 workflow、就用全集兜底）
-// V0.3.3 移除 ship phase、V0.3.4 把 context 合进 plan
-const PHASE_ORDER: PhaseId[] = ["plan", "build"];
+// V0.3.3 移除 ship phase、V0.3.4 把 context 合进 plan、V0.5 加 review
+const PHASE_ORDER: PhaseId[] = ["plan", "build", "review"];
 
 // ----------------- 工具 -----------------
 
@@ -600,6 +600,7 @@ const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
 const buildEmptyPhases = (): Record<PhaseId, MetaPhaseState> => ({
   plan: { id: "plan", status: "pending" },
   build: { id: "build", status: "pending" },
+  review: { id: "review", status: "pending" },
 });
 
 // ----------------- 进程冷启动恢复（chat 僵尸任务） -----------------
@@ -952,8 +953,12 @@ export const patchPhase = async (
     const now = Date.now();
 
     // 改 phase 状态（必须 phaseId + status 同时给）
+    // V0.5 兼容：老 meta.phases 可能没 review 字段、prevPhase 就是 undefined、得兜底
     if (input.phaseId && input.status) {
-      const prevPhase = meta.phases[input.phaseId];
+      const prevPhase: MetaPhaseState = meta.phases[input.phaseId] ?? {
+        id: input.phaseId,
+        status: "pending",
+      };
       meta.phases[input.phaseId] = {
         ...prevPhase,
         status: input.status,

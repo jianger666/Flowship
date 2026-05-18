@@ -2,8 +2,9 @@
  * Plan workflow runner（V0.2）
  *
  * V0.2 重定义：plan 任务 = 4 phase workflow（context → plan → build → ship）
- * V0.3.3 改为 3 phase（移除 ship）
+ * V0.3.3 改为 3 phase（移除 ship、注意力管理决策）
  * V0.3.4 改为 2 phase（context 并入 plan、plan 自己读上下文 + 扫仓库 + 出方案）
+ * V0.5 改为 3 phase（plan → build → review、加 review phase 拿确定性产物做差值对照 + 产出交付信息）
  * 整段任务跑在一次 SDK Run 里、phase 之间用 wait_for_user MCP 工具阻塞等 phase ack。
  *
  * 架构（跟 chat-runner 同款骨架）：
@@ -14,7 +15,7 @@
  *   - wait_for_user 工具在 workflow 模式下传 phase / artifact 参数、
  *     chat-mcp 的 awaiting notifier 携带 phase 透出来、本文件据此 patch phase 状态。
  *
- * Phase 边界 / 状态机（V0.3.4 起 2 phase: plan → build）：
+ * Phase 边界 / 状态机（V0.5 起 3 phase: plan → build → review）：
  *   1. start：plan phase 开始、status=running、currentPhase=plan
  *   2. agent 跑 plan（读 contextDocs + 拉飞书 + 扫仓库 + 出方案）、写 01-plan.md、
  *      调 wait_for_user(phase=plan, artifact=...)
@@ -89,9 +90,11 @@ const PROMPTS_DIR = path.join(process.cwd(), "prompts");
 // V0.3.3 移除 ship phase（原 phase 4）
 // V0.3.4 把原 context phase 合入 plan phase（phase 1 一气呵成读上下文 + 扫仓库 + 出方案）
 // V0.4 起按 task.role 在 prompt 渲染时注入角色视角（详见 fillTemplate vars）
+// V0.5 加 review phase：拿 git diff × plan × build × contextDocs 做差值对照 + 产出交付信息
 const PHASE_PROMPT_FILE: Record<PhaseId, string> = {
   plan: "phase-1-plan.md",
   build: "phase-2-build.md",
+  review: "phase-3-review.md",
 };
 
 const NULL_PLACEHOLDER = "（未提供）";
@@ -121,7 +124,7 @@ const loadPhasePrompt = async (
       : "（无）";
   // phase 自身的 artifact 绝对路径（agent 写入用、避免相对路径 cwd 歧义）
   const artifactPath = getPhaseArtifactPath(task.id, phaseId, phaseIdx);
-  // 上一 phase 的 artifact（给 Phase 2/3/4 读上游）
+  // 上一 phase 的 artifact（给 Phase 2/3 读上游）
   // Phase 1 没有上游、塞「（未提供）」
   const prevArtifactPath =
     phaseIdx > 0
@@ -131,9 +134,19 @@ const loadPhasePrompt = async (
           phaseIdx - 1,
         )
       : undefined;
+  // V0.5：planArtifactPath = workflow 里 phase=plan 的 artifact 绝对路径
+  // Review phase 同时要读 plan（取需求理解 / §1.1 自我校验 / §4 涉及面 / §6 task）和 build（取实施日志 / 偏离段）
+  // prevArtifactPath 对 review 是 build、planArtifactPath 是再上一个、单独抽一个变量给 review 模板用
+  // phase 1/2 模板不用这个变量、缺失替换成「（未提供）」也无影响
+  const planPhaseIdx = workflowDef.phases.indexOf("plan");
+  const planArtifactPath =
+    planPhaseIdx >= 0
+      ? getPhaseArtifactPath(task.id, "plan", planPhaseIdx)
+      : undefined;
   // V0.3.4 删除 contextArtifactPath：原本给 phase 3+ 读 phase 1 的 context artifact、
   // 现在 context 已合进 plan、plan 自己就是上游、用 prevArtifactPath 就够
   // V0.4：注入 role / roleLabel、phase prompt 按 role 调整视角
+  // V0.5：注入 planArtifactPath 给 review phase 读 01-plan.md（prev 是 build、再上一个才是 plan）
   return fillTemplate(tpl, {
     taskId: task.id,
     taskTitle: task.title,
@@ -146,6 +159,7 @@ const loadPhasePrompt = async (
     artifactPath,
     artifactsDir: getArtifactsDir(task.id),
     prevArtifactPath,
+    planArtifactPath,
     role: task.role,
     roleLabel: TASK_ROLE_LABEL[task.role],
   });
@@ -170,6 +184,9 @@ const buildSuperPrompt = async (
   task: Task,
   workflowDef: WorkflowDef,
   skills: SkillEntry[],
+  // V0.5：fork 模式提示用、传入时 super-prompt 顶部加 fork 提示段
+  // fork agent 看到「上游 phase 已完成、artifact 在 ...、请从 fromPhase 开始」、不重复跑前面 phase
+  fork?: { fromPhase: PhaseId; reason?: string },
 ): Promise<string> => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -202,7 +219,35 @@ const buildSuperPrompt = async (
     })
     .join("\n");
 
+  // V0.5：fork 模式时拼一段 fork 提示放在 super-prompt 顶部
+  // 让新 agent 知道：前面 phase 不是它做的、artifact 已经在硬盘、直接从 fromPhase 接力即可
+  const forkBanner = fork
+    ? (() => {
+        const fromIdx = workflowDef.phases.indexOf(fork.fromPhase);
+        const completed = workflowDef.phases
+          .slice(0, fromIdx)
+          .map((pid, i) => {
+            const ap = getPhaseArtifactPath(task.id, pid, i);
+            return `  - Phase \`${pid}\` → artifact \`${ap}\``;
+          })
+          .join("\n");
+        return [
+          "## ⚠️ Fork 启动（V0.5：上一 agent 已完成前面的 phase、你接力）",
+          "",
+          `**这是 fork 启动的新 agent**${fork.reason ? `（原因：${fork.reason}）` : ""}。前面的 phase 由上一个 agent 完成、artifact 已经在硬盘、**不要重做**：`,
+          "",
+          completed.length > 0 ? completed : "  （无）",
+          "",
+          `**直接从 Phase \`${fork.fromPhase}\` 开始**：用 SDK 内置 \`read_file\` 读上面已完成 phase 的 artifact 拿上下文、然后按下面对应 phase 的指令做 \`${fork.fromPhase}\` 的产出。`,
+          "",
+          "不需要重读 contextDocs / 不需要重扫仓库、上一 agent 已经做过、信息已经在 artifact 里。",
+          "",
+        ].join("\n");
+      })()
+    : "";
+
   return [
+    forkBanner,
     "你正在 fe-ai-flow 的 plan 任务里跑、走 workflow：",
     `**${workflowDef.displayName}**（${workflowDef.description}）`,
     "",
@@ -408,7 +453,9 @@ const buildSuperPrompt = async (
     "",
     "---",
     "",
-    "现在开始执行 Phase 1。",
+    fork
+      ? `现在开始执行 Phase \`${fork.fromPhase}\`（fork 模式、跳过前面已完成的 phase）。`
+      : "现在开始执行 Phase 1。",
   ].join("\n");
 };
 
@@ -506,23 +553,43 @@ interface RunningRecord {
 
 interface PlanRunnerGlobalState {
   runningPlans: Map<string, RunningRecord>;
+  // V0.5：标记「这个 task 正在被 fork（cancel 旧 agent 起新 agent）」
+  // cancel 旧 run 时如果命中、cancelled 分支跳过 done 发送 + 不把 task 标 completed、保留 SSE 通道
+  // 新 agent 启动时由 phase-ack 路由直接 runPlanWorkflow(fork=...)、共用同一条 SSE
+  forkPendingTasks: Set<string>;
 }
 
 // V1：2026-05-15 加版本号后缀作防御；后续改 runner 内部 state 字段结构时 bump 版本号
-// 避免 dev hot reload 拿到旧版残留字段、跟 chat-mcp.ts GLOBAL_KEY 同款套路
-const PLAN_RUNNER_GLOBAL_KEY = "__feAiFlowPlanRunnerStateV1__";
+// V2：2026-05-18 加 forkPendingTasks 字段、bump 版本号
+const PLAN_RUNNER_GLOBAL_KEY = "__feAiFlowPlanRunnerStateV2__";
 
 const getRunnerState = (): PlanRunnerGlobalState => {
   const g = globalThis as unknown as Record<string, PlanRunnerGlobalState>;
   if (!g[PLAN_RUNNER_GLOBAL_KEY]) {
     g[PLAN_RUNNER_GLOBAL_KEY] = {
       runningPlans: new Map(),
+      forkPendingTasks: new Set(),
     };
   }
   return g[PLAN_RUNNER_GLOBAL_KEY];
 };
 
 const runningPlans = getRunnerState().runningPlans;
+const forkPendingTasks = getRunnerState().forkPendingTasks;
+
+/**
+ * V0.5：标记 task 即将被 fork、cancel 旧 run 收尾时跳过 done 发送、保留 SSE 给新 agent 用。
+ *
+ * 调用方（phase-ack 路由）：
+ *   1. markPlanForFork(taskId)
+ *   2. cancelPlan(taskId)
+ *   3. waitForPlanToStop(taskId)
+ *   4. markPhaseAcked(taskId, ackPhase)
+ *   5. runPlanWorkflow({ task, ..., fork: { fromPhase: nextPhase } })
+ */
+export const markPlanForFork = (taskId: string): void => {
+  forkPendingTasks.add(taskId);
+};
 
 export const isPlanRunning = (taskId: string): boolean =>
   runningPlans.has(taskId);
@@ -531,6 +598,28 @@ export const cancelPlan = (taskId: string): boolean => {
   const rec = runningPlans.get(taskId);
   if (!rec) return false;
   rec.cancel();
+  return true;
+};
+
+/**
+ * V0.5：等 runningPlans 里 task 对应记录被 finally 块清空。
+ *
+ * 触发：phase-ack 路由收到 forkAgent=true、需要先 cancelPlan 让旧 agent 收尾、
+ * 再 runPlanWorkflow 起新 agent。两者中间必须确认旧 agent 已经从 runningPlans 里删除、
+ * 否则新 runPlanWorkflow 会因为 `runningPlans.has(task.id)` 直接 return（幂等保护）。
+ *
+ * 实现：每 100ms 轮询一次、最长等 timeoutMs（默认 8 秒）。
+ * 超时返 false、调用方决定是否重试 / 报错。
+ */
+export const waitForPlanToStop = async (
+  taskId: string,
+  timeoutMs = 8000,
+): Promise<boolean> => {
+  const start = Date.now();
+  while (runningPlans.has(taskId)) {
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
   return true;
 };
 
@@ -599,6 +688,15 @@ export interface RunPlanInput {
     agentId: string;
     prompt: string;
   };
+  // V0.5：fork 模式——phase-ack 时用户主动选「换新 agent」/「切模型」
+  //   - 走 Agent.create 新 agent（区别于 resume 的同 agentId）
+  //   - super-prompt 顶部加 fork 提示、明确「fromPhase 之前的 phase 已完成、artifact 在 ...、直接从 fromPhase 开始」
+  //   - phase 状态不重置（已 ack 的还是 ack、fromPhase 还是 running、等 agent 跑完调 wait_for_user）
+  //   - 调用前调用方应：cancelPlan(taskId)→ 等 runningPlans delete → markPhaseAcked(prevPhase)
+  fork?: {
+    fromPhase: PhaseId;
+    reason?: string;
+  };
 }
 
 // ----------------- 主入口 -----------------
@@ -611,8 +709,9 @@ export interface RunPlanInput {
  * 已在跑就直接 return（幂等）。
  */
 export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
-  const { task, apiKey, model, userMcpServers, resume } = input;
+  const { task, apiKey, model, userMcpServers, resume, fork } = input;
   const isResume = !!resume;
+  const isFork = !!fork;
 
   if (runningPlans.has(task.id)) {
     return;
@@ -633,15 +732,29 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
   //    - resume：保留 phase 状态（极可能是 awaiting_ack）、只切 taskStatus=running
   //      因为 agent 还没真醒、wait_for_user 还没重新调、awaiting_ack/awaiting_user 仍是事实
   //      只是「running」表示「agent 又在跑了」、用户能从 UI 看到 agent 不再是 dead 状态
+  //    - fork（V0.5）：上游 phase 已 ack、fromPhase status=running + currentPhase=fromPhase
+  //      跟首次启动的区别：firstPhase 换成 fork.fromPhase、phase 不重置全部、只切 fromPhase 为 running
   const firstPhase = workflowDef.phases[0]!;
-  const started = isResume
-    ? await patchPhase(task.id, { taskStatus: "running" })
-    : await patchPhase(task.id, {
-        phaseId: firstPhase,
-        status: "running",
-        currentPhase: firstPhase,
-        taskStatus: "running",
-      });
+  const startPhase = isFork ? fork!.fromPhase : firstPhase;
+  let started: Task | null = null;
+  if (isResume) {
+    started = await patchPhase(task.id, { taskStatus: "running" });
+  } else if (isFork) {
+    // fork：上游 phase 已经在 phase-ack 路由里 patch 成 ack 状态、这里只切 fromPhase 为 running
+    started = await patchPhase(task.id, {
+      phaseId: startPhase,
+      status: "running",
+      currentPhase: startPhase,
+      taskStatus: "running",
+    });
+  } else {
+    started = await patchPhase(task.id, {
+      phaseId: firstPhase,
+      status: "running",
+      currentPhase: firstPhase,
+      taskStatus: "running",
+    });
+  }
   if (started) publish(task.id, { kind: "task", task: started });
 
   // 2) 拼 mcpServers：用户的 + 我们自己的 chat-tool（plan 也复用 wait_for_user 工具）
@@ -661,11 +774,21 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
   }`;
 
   // resume 不写 phase_start（phase 没真重新开始、只是 agent 续接）、写 info 提示用户「正在续接」
+  // fork（V0.5）写 phase_start、phase 是新 agent 真要跑的（fromPhase）、text 标明是 fork
   if (isResume) {
     await writeEventAndPublish(task.id, {
       kind: "info",
       phase: (task.currentPhase as PhaseId) ?? firstPhase,
       text: `继续监听用户 ack（agent.resume、model: ${model.id}、${mcpDesc}）`,
+    });
+  } else if (isFork) {
+    await writeEventAndPublish(task.id, {
+      kind: "phase_start",
+      phase: startPhase,
+      text: `Fork 启动新 agent（${workflowDef.id}、model: ${model.id}、${mcpDesc}、从 phase ${startPhase} 开始${
+        fork!.reason ? `、原因: ${fork!.reason}` : ""
+      }）`,
+      meta: { fork: true, fromPhase: startPhase, reason: fork!.reason },
     });
   } else {
     await writeEventAndPublish(task.id, {
@@ -737,8 +860,11 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     //   - resume：Agent.resume(agentId) + send(resumePrompt) 续接同一会话
     //     注：Agent.resume 内部会从 Cursor backend 拉之前的对话历史、不需要重发 superPrompt
     if (isResume) {
+      // V0.5 修复：Agent.resume 也必须传 model（SDK 1.0.13 起 local agent 强制要求）
+      // 之前漏传、resume 时 agent.send 报 ConfigurationError: "Local SDK agents require an explicit `model`"
       agent = await Agent.resume(resume!.agentId, {
         apiKey,
+        model,
         local: { cwd: task.repoPath },
         mcpServers: mergedMcp,
       });
@@ -779,7 +905,14 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
         console.error("[plan-runner] loadSkills failed", err);
         return [];
       });
-      const superPrompt = await buildSuperPrompt(task, workflowDef, skills);
+      // V0.5：fork 模式下 buildSuperPrompt 顶部多一段「fork 启动提示」
+      // agent 看到后跳过前面 phase、直接从 fromPhase 开始
+      const superPrompt = await buildSuperPrompt(
+        task,
+        workflowDef,
+        skills,
+        fork,
+      );
       run = await agent.send(superPrompt);
     }
 
@@ -791,7 +924,7 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
           /* noop */
         });
       },
-      currentPhase: firstPhase,
+      currentPhase: startPhase,
       workflowDef,
     });
 
@@ -830,6 +963,17 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     const result = await run.wait();
 
     if (cancelled || result.status === "cancelled") {
+      // V0.5：如果是 fork 引起的 cancel、跳过 done 发送、不切 task.status=completed
+      // 让客户端 SSE 流保留、phase-ack 路由后续 runPlanWorkflow(fork=true) 会继续 publish 事件
+      const isForkPending = forkPendingTasks.has(task.id);
+      if (isForkPending) {
+        forkPendingTasks.delete(task.id);
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          text: "旧 agent 已收尾、正在为 fork 启动新 agent...",
+        });
+        return;
+      }
       const cancelledTask = await patchPhase(task.id, {
         taskStatus: "completed",
       });

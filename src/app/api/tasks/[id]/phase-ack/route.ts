@@ -3,24 +3,37 @@
  *
  * V0.2 workflow 任务：用户在 UI 点「通过」或「补意见再跑」、本路由把动作 ack 给阻塞中的 agent。
  *
- * Body: { action: "approve" | "revise"、feedback?: string、phase?: PhaseId }
+ * Body: {
+ *   action: "approve" | "revise",
+ *   feedback?: string,
+ *   phase?: PhaseId,
+ *   // V0.5：approve 时可选「换新 agent / 切模型」
+ *   forkAgent?: boolean,
+ *   nextModel?: ModelSelection,
+ *   bootArgs?: { apiKey: string; mcpServers?: Record<string, McpServerConfig> }
+ * }
  *
  * 行为：
- *   - approve：调 submitPhaseAck(approve) + markPhaseAcked(phase) 推进 task.currentPhase
- *   - revise：调 submitPhaseAck(revise, feedback) + 写一条 user_reply 事件（meta.kind=revise）
- *             phase 状态保持 awaiting_ack（按用户拍板：不抖屏、agent 改完再调 wait_for_user）
+ *   - approve（默认）：调 submitPhaseAck(approve) + markPhaseAcked(phase) 推进 task.currentPhase
+ *     旧 agent 在同一 SDK Run 内继续跑下一 phase、不消耗新 send 配额
+ *   - approve + (forkAgent || nextModel)：cancel 旧 agent + 起新 Agent.create run、可切模型
+ *     消耗 1 次新 send 配额、但用户主动选了
+ *   - revise：调 submitPhaseAck(revise, feedback) + 写一条 user_reply 事件
  *
  * 失败语义：
  *   - task 不存在 → 404
  *   - task.mode !== "plan" → 409
  *   - hasPending=false 且 task.status 在 awaiting_user/running → 410（僵尸态、当场标 failed）
  *   - hasPending=false 但 task.status 已终态 → 409
+ *   - fork 时缺 bootArgs → 400
  *
  * 跟 chat-reply 路由的差异：
  *   - 解码用户动作（approve/revise）、不是裸文本
  *   - approve 时调 markPhaseAcked 推进 currentPhase + 上一 phase 状态
  *   - revise 时不推进 phase、agent 自己改完 artifact 再调 wait_for_user
  */
+
+import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
   appendEvent,
@@ -31,9 +44,15 @@ import {
   hasPending,
   submitPhaseAck,
 } from "@/lib/server/chat-mcp";
-import { markPhaseAcked } from "@/lib/server/plan-runner";
+import {
+  cancelPlan,
+  markPhaseAcked,
+  markPlanForFork,
+  runPlanWorkflow,
+  waitForPlanToStop,
+} from "@/lib/server/plan-runner";
 import { publishChatStreamEvent } from "@/lib/server/chat-runner";
-import type { PhaseId } from "@/lib/types";
+import { WORKFLOWS, type PhaseId } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -45,7 +64,30 @@ interface PostBody {
   // 可选：用户期望 ack 的 phase id（防止 race 导致 ack 到错的 phase）
   // 不传时按 task.currentPhase 兜底
   phase?: PhaseId;
+  // V0.5：approve 时可选「换新 agent / 切模型」
+  forkAgent?: boolean;
+  nextModel?: ModelSelection;
+  bootArgs?: {
+    apiKey: string;
+    mcpServers?: Record<string, McpServerConfig>;
+  };
 }
+
+const isValidModel = (m: unknown): m is ModelSelection => {
+  if (!m || typeof m !== "object") return false;
+  const x = m as Partial<ModelSelection>;
+  return typeof x.id === "string" && x.id.length > 0;
+};
+
+const isValidMcpServers = (
+  v: unknown,
+): v is Record<string, McpServerConfig> | undefined => {
+  if (v == null) return true;
+  if (typeof v !== "object" || Array.isArray(v)) return false;
+  return Object.values(v).every(
+    (cfg) => cfg != null && typeof cfg === "object",
+  );
+};
 
 const errorResponse = (message: string, status = 400) =>
   new Response(JSON.stringify({ error: message }), {
@@ -78,6 +120,28 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const feedback = (body.feedback ?? "").trim();
   if (action === "revise" && feedback.length === 0) {
     return errorResponse("revise 必须带 feedback 文本");
+  }
+
+  // V0.5：approve 时检测 fork 意图（forkAgent=true 或 nextModel 提供时都视为 fork）
+  // revise 时如果带了 fork 参数、明确拒绝（fork 只对 approve 有意义）
+  if (action === "revise" && (!!body.forkAgent || !!body.nextModel)) {
+    return errorResponse("revise 不允许 fork、请改用 approve + fork");
+  }
+  const wantsFork =
+    action === "approve" && (!!body.forkAgent || !!body.nextModel);
+  if (wantsFork) {
+    if (body.nextModel != null && !isValidModel(body.nextModel)) {
+      return errorResponse("nextModel 非法");
+    }
+    if (body.bootArgs == null) {
+      return errorResponse("fork 时缺 bootArgs（需 apiKey）");
+    }
+    if (!body.bootArgs.apiKey || typeof body.bootArgs.apiKey !== "string") {
+      return errorResponse("fork 时 bootArgs.apiKey 不能为空");
+    }
+    if (!isValidMcpServers(body.bootArgs.mcpServers)) {
+      return errorResponse("bootArgs.mcpServers 必须是对象（key=server名）");
+    }
   }
 
   const task = await getTask(id);
@@ -131,7 +195,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   console.log(
-    `[phase-ack] task=${task.id} action=${action} phase=${ackPhase} feedback=${feedback.slice(0, 60)}`,
+    `[phase-ack] task=${task.id} action=${action} phase=${ackPhase} wantsFork=${wantsFork} feedback=${feedback.slice(0, 60)}`,
   );
 
   // 1) 先写一条事件、让用户视角立刻看到自己点了什么
@@ -147,33 +211,126 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
-  // 2) ack agent：把消息塞给被阻塞的 wait_for_user
-  const ok = submitPhaseAck(
-    task.id,
-    action,
-    action === "revise" ? feedback : undefined,
-  );
-  if (!ok) {
-    return errorResponse(
-      "agent 已不在等待 ack（可能并发处理 / keepalive 切换）、稍后重试",
-      409,
+  // 2a) 非 fork 路径：把动作塞给阻塞中的 wait_for_user、旧 agent 继续跑
+  if (!wantsFork) {
+    const ok = submitPhaseAck(
+      task.id,
+      action,
+      action === "revise" ? feedback : undefined,
+    );
+    if (!ok) {
+      return errorResponse(
+        "agent 已不在等待 ack（可能并发处理 / keepalive 切换）、稍后重试",
+        409,
+      );
+    }
+
+    let updated = task;
+    if (action === "approve") {
+      const newTask = await markPhaseAcked(task.id, ackPhase);
+      if (newTask) updated = newTask;
+    } else {
+      const newTask = await getTask(task.id);
+      if (newTask) updated = newTask;
+    }
+
+    return new Response(
+      JSON.stringify({ ok: true, task: updated }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
     );
   }
 
-  // 3) approve 时推进 phase 状态机
-  let updated = task;
-  if (action === "approve") {
+  // 2b) V0.5 fork 路径：cancel 旧 agent + 起新 Agent.create run
+  //
+  // 标准步骤：
+  //   i.   markPlanForFork：让旧 run 收尾时跳过 done 发送（保留 SSE 给新 agent）
+  //   ii.  cancelPlan：让旧 agent 拿到 [CANCELLED]、自然 stream 结束 + run.cancel
+  //   iii. waitForPlanToStop：等 runningPlans delete（防止新 run 启动时被幂等保护拦截）
+  //   iv.  markPhaseAcked：patch 数据库到 phase=ack、currentPhase=下一phase（不调 submitPhaseAck）
+  //   v.   runPlanWorkflow(fork={...})：起新 agent、super-prompt 顶部提示「从下一 phase 接力」
+  //
+  // 计费影响：消耗 1 次新 Agent.create + send 配额（明确告知用户、由用户主动选）
+  const workflowDef = WORKFLOWS[task.workflowId ?? "feishu-story-impl"];
+  if (!workflowDef) {
+    return errorResponse(`workflow ${task.workflowId} 未注册`, 500);
+  }
+  const ackIdx = workflowDef.phases.indexOf(ackPhase);
+  const nextPhase =
+    ackIdx >= 0 && ackIdx + 1 < workflowDef.phases.length
+      ? workflowDef.phases[ackIdx + 1]!
+      : null;
+  if (!nextPhase) {
+    // 最后一个 phase 已 ack、没下一 phase 可跑、直接当普通 approve 走
+    // （走到这说明用户在最后一个 phase 选了 fork、其实没必要、按普通 approve 兜底）
+    const ok = submitPhaseAck(task.id, "approve");
+    if (!ok) {
+      return errorResponse(
+        "agent 已不在等待 ack（可能并发处理 / keepalive 切换）、稍后重试",
+        409,
+      );
+    }
     const newTask = await markPhaseAcked(task.id, ackPhase);
-    if (newTask) updated = newTask;
-  } else {
-    // revise：保持 awaiting_user、agent 改完会再调 wait_for_user 重新触发 awaiting notifier
-    // 不在这里 patch、避免抖屏
-    const newTask = await getTask(task.id);
-    if (newTask) updated = newTask;
+    return new Response(
+      JSON.stringify({ ok: true, task: newTask ?? task, fork: false }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
   }
 
+  // 模型：用户传了就用、没传按旧 model 续（这种走 forkAgent=true 但不换模型也合法、相当于「就想要新 agent」）
+  // 但实际上用户没换模型也没换 agent 是默认路径、走到这里说明 forkAgent 显式 true、需要 model
+  // 旧 task 不存 model（避免 token 落盘），所以用户必须提供 nextModel 或前端用 settings.model 兜底
+  if (!body.nextModel) {
+    return errorResponse(
+      "fork 时必须提供 nextModel（前端默认用 settings.model）",
+      400,
+    );
+  }
+  const newModel = body.nextModel;
+  const newApiKey = body.bootArgs!.apiKey;
+  const newMcp = body.bootArgs!.mcpServers;
+
+  // i. 标记 fork 中
+  markPlanForFork(task.id);
+  // ii. cancel 旧 agent
+  cancelPlan(task.id);
+  // iii. 等旧 run 退出
+  const stopped = await waitForPlanToStop(task.id, 10000);
+  if (!stopped) {
+    // 8 秒内没退出、保险起见标 failed
+    console.warn(
+      `[phase-ack] task=${task.id} fork: waitForPlanToStop timeout 10s、旧 agent 没干净退出`,
+    );
+    return errorResponse(
+      "旧 agent 收尾超时、未能 fork、请稍后重试或重启任务",
+      503,
+    );
+  }
+  // iv. patch 数据库（用 markPhaseAcked 推进 currentPhase 到 nextPhase）
+  await markPhaseAcked(task.id, ackPhase);
+  const refreshed = await getTask(task.id);
+  if (!refreshed) return errorResponse("task 丢失", 500);
+
+  // v. 异步启动新 agent（fire-and-forget、跟 start-workflow 一样）
+  void runPlanWorkflow({
+    task: refreshed,
+    apiKey: newApiKey,
+    model: newModel,
+    userMcpServers: newMcp,
+    fork: {
+      fromPhase: nextPhase,
+      reason: `用户在 phase ${ackPhase} ack 时选择 fork 新 agent`,
+    },
+  }).catch((err) => {
+    console.error(
+      `[phase-ack] task=${task.id} fork: runPlanWorkflow threw:`,
+      err,
+    );
+  });
+
+  // 等一小会让新 run 把 phase_start / phase 状态 patch 到 fs、给前端立刻看到 currentPhase 切了
+  // 不 await 启动完成（启动是长 IO、客户端自己通过 SSE 拿）
   return new Response(
-    JSON.stringify({ ok: true, task: updated }),
+    JSON.stringify({ ok: true, task: refreshed, fork: true }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

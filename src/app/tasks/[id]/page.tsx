@@ -6,7 +6,7 @@
  * 两种模式：
  *
  * - **plan 模式**（V0.2 主流程、feishu-story-impl workflow）：
- *   - 整段任务跑在一次 SDK Run 里、按 phase 顺序执行（plan→build、V0.3.4 合并原 context 进 plan）
+ *   - 整段任务跑在一次 SDK Run 里、按 phase 顺序执行（plan → build → review、V0.5 起）
  *   - 每个 phase 完成后 agent 调 wait_for_user 阻塞、用户在右侧底部点「通过」/「跟 AI 再聊聊」
  *   - 启动按钮：draft / failed / completed 时显示、点击调 /start-workflow
  *   - 自动 watch SSE：进页面立即订阅、agent 输出 → 事件流、phase 边界 → PhaseProgress
@@ -35,6 +35,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  ApprovePhaseDialog,
+  ApprovePhaseDialogTrigger,
+} from "@/components/tasks/approve-phase-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatView } from "@/components/tasks/chat-view";
@@ -55,9 +59,12 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import { getSettings } from "@/lib/local-store";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
+  parseMcpServers,
+  filterMcpServersByTask,
   resumeWaiting,
   startWorkflow,
   submitPhaseAck,
@@ -82,6 +89,8 @@ const TaskDetailPage = () => {
   const [reviseDraft, setReviseDraft] = useState("");
   // 「通过 / 跟 AI 聊」按钮提交锁、防连点
   const [ackSubmitting, setAckSubmitting] = useState(false);
+  // V0.5：phase ack 高级选项 dialog 开关（点齿轮图标打开、配 fork agent / 切模型）
+  const [approveDialogOpen, setApproveDialogOpen] = useState(false);
   // 流式打字态（assistant chunk 累加、收到正式 assistant_message 事件清空）
   // plan 模式跟 chat 一样需要、SDK 的 assistant_delta 也走这条
   const [streamingText, setStreamingText] = useState("");
@@ -160,7 +169,7 @@ const TaskDetailPage = () => {
     if (!task) return ["plan"];
     if (task.mode !== "plan") return ["plan"];
     const wf = task.workflowId ? WORKFLOWS[task.workflowId] : null;
-    return wf?.phases ?? ["plan", "build"];
+    return wf?.phases ?? ["plan", "build", "review"];
   }, [task]);
 
   const activePhaseState = useMemo(
@@ -249,6 +258,53 @@ const TaskDetailPage = () => {
       const updated = await submitPhaseAck(task.id, "approve", undefined, cur);
       setTask(updated);
       toast.success(`${PHASE_LABEL[cur]} 已通过、agent 正在进入下一 phase`);
+    } catch (err) {
+      toast.error(`通过失败：${(err as Error).message}`);
+    } finally {
+      setAckSubmitting(false);
+    }
+  };
+
+  // ---- V0.5 Phase ack：起新 agent 并通过（用户在 ApprovePhaseDialog 里点确认）----
+  // 跟普通 approve 区别：透传 forkAgent + nextModel + bootArgs（apiKey + mcpServers）
+  // 失败 toast 后 dialog 不关、让用户可以重试 / 改选项
+  const handleApproveWithFork = async (opts: {
+    forkAgent: boolean;
+    nextModel: { id: string; params?: Array<{ id: string; value: string }> };
+  }) => {
+    // forkAgent=false 时走普通 approve、不需要 bootArgs
+    if (!opts.forkAgent) {
+      setApproveDialogOpen(false);
+      await handleApprove();
+      return;
+    }
+    setAckSubmitting(true);
+    try {
+      // 准备 fork 用的 bootArgs（apiKey + mcpServers、按任务级 disable 过滤）
+      const settings = getSettings();
+      if (!settings.apiKey?.trim()) {
+        toast.error("缺少 API Key、请先在设置页填好");
+        return;
+      }
+      let mcpServers;
+      try {
+        mcpServers = parseMcpServers(settings.mcpServersJson);
+      } catch (err) {
+        toast.error(`MCP 配置有问题：${(err as Error).message}`);
+        return;
+      }
+      mcpServers = filterMcpServersByTask(mcpServers, task.disabledMcpServers);
+
+      const updated = await submitPhaseAck(task.id, "approve", undefined, cur, {
+        forkAgent: true,
+        nextModel: opts.nextModel,
+        bootArgs: { apiKey: settings.apiKey, mcpServers },
+      });
+      setTask(updated);
+      setApproveDialogOpen(false);
+      toast.success(
+        `${PHASE_LABEL[cur]} 已通过、新 agent 已启动接管下一 phase`,
+      );
     } catch (err) {
       toast.error(`通过失败：${(err as Error).message}`);
     } finally {
@@ -358,7 +414,7 @@ const TaskDetailPage = () => {
                   size="sm"
                   onClick={handleStart}
                   disabled={starting}
-                  title="启动 workflow run、agent 自动跑 phase 1-4、phase 间会停下来等你 ack"
+                  title="启动 workflow run、agent 自动跑 plan → build → review、phase 间会停下来等你 ack"
                 >
                   {starting ? <Loader2 className="animate-spin" /> : <Zap />}
                   {startLabel}
@@ -371,7 +427,7 @@ const TaskDetailPage = () => {
                     size="sm"
                     onClick={handleApprove}
                     disabled={ackSubmitting}
-                    title={`通过 ${PHASE_LABEL[cur]} 的产物、推进到下一 phase`}
+                    title={`通过 ${PHASE_LABEL[cur]} 的产物、推进到下一 phase（同 agent 续跑、不计费）`}
                   >
                     {ackSubmitting ? (
                       <Loader2 className="animate-spin" />
@@ -380,6 +436,11 @@ const TaskDetailPage = () => {
                     )}
                     通过 {PHASE_LABEL[cur]}
                   </Button>
+                  {/* V0.5：高级选项入口、用户点开 dialog 切模型 / 起新 agent */}
+                  <ApprovePhaseDialogTrigger
+                    onOpen={() => setApproveDialogOpen(true)}
+                    disabled={ackSubmitting}
+                  />
                   <Button
                     variant="outline"
                     size="sm"
@@ -460,6 +521,23 @@ const TaskDetailPage = () => {
 
       {/* AskUserDialog：agent 调 ask_user 时弹窗、统一渲染（chat + plan 两个模式都用、用户拍板） */}
       <AskUserDialog task={task} />
+
+      {/* V0.5：phase ack 高级选项 dialog（点齿轮图标打开、配 fork agent / 切模型） */}
+      <ApprovePhaseDialog
+        open={approveDialogOpen}
+        onOpenChange={setApproveDialogOpen}
+        phaseId={cur}
+        defaultModel={(() => {
+          // 读 settings.defaultModel、没拿到时传 null（dialog 显示「请先在设置页选好模型」）
+          // 这里 useState 化代价不大、每次 dialog open 时 useEffect 已经重置 pickedModelId
+          if (typeof window === "undefined") return null;
+          const s = getSettings();
+          return s.defaultModel?.id ? s.defaultModel : null;
+        })()}
+        apiKey={typeof window !== "undefined" ? getSettings().apiKey : ""}
+        onSubmit={handleApproveWithFork}
+        submitting={ackSubmitting}
+      />
 
       {/* 跟 AI 聊聊 Dialog（plan 模式专用、用户对当前 phase 产物有疑问 / 想补充澄清时打开） */}
       <Dialog open={reviseOpen} onOpenChange={setReviseOpen}>

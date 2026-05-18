@@ -43,21 +43,25 @@ export const STATUS_VARIANT: Record<
 // V0.3.4 合并原 context 进 plan 后、plan 涵盖「读上下文 + 扫仓库 + 出方案」
 // 文案上不再强调「上下文」（用户对「上下文 + 方案」的复合标签接受度一般、改成更短的「方案规划」、
 //   语义上「规划」自然包含「读上下文 → 出方案」、不需要并列两个词）
+// V0.5：加 review phase（拿 git diff × plan × 飞书原文做差值 + 产出交付信息）
 export const PHASE_LABEL: Record<PhaseId, string> = {
   plan: "方案规划",
   build: "编码实现",
+  review: "复核交付",
 };
 
 // Phase 英文短标（团队沟通锚点、用在 phase-progress 副标）
 export const PHASE_LABEL_EN: Record<PhaseId, string> = {
   plan: "Plan",
   build: "Build",
+  review: "Review",
 };
 
 // Phase 中文短标（用在 event-stream 等空间紧凑的地方）
 export const PHASE_LABEL_SHORT: Record<PhaseId, string> = {
   plan: "方案",
   build: "实现",
+  review: "复核",
 };
 
 /**

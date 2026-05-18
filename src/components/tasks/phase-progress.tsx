@@ -2,7 +2,7 @@
 
 /**
  * Phase 进度条
- * - 顶部按 workflow.phases 顺序展示（feishu-story-impl：plan→build、V0.3.4 合并原 context 进 plan）
+ * - 顶部按 workflow.phases 顺序展示（feishu-story-impl：plan → build → review、V0.5 起）
  * - 当前 phase 高亮、ack 过的打勾、awaiting_ack 琥珀色待确认、failed 红色
  * - 点击 phase 圆点切换右侧产物面板的 active tab（受控）
  *
@@ -49,7 +49,7 @@ const dotClass = (status: PhaseStatus, isCurrent: boolean): string =>
   );
 
 interface Props {
-  // 按 workflow 顺序的 phase id 列表（feishu-story-impl: [plan, build]、V0.3.4 起）
+  // 按 workflow 顺序的 phase id 列表（feishu-story-impl: [plan, build, review]、V0.5 起）
   phaseOrder: PhaseId[];
   phases: Record<PhaseId, PhaseState>;
   currentPhase: PhaseId;

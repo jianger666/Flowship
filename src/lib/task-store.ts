@@ -23,11 +23,13 @@ import type {
 
 // V0.2 phase 推进表（feishu-story-impl workflow）
 // V0.3.3 移除 ship、V0.3.4 合并 context 进 plan
+// V0.5 加 review、review 是最后一个 phase
 // 详情页用、知道下一步该提示用户去哪
 // 改 workflow 时记得也改这里、TODO：未来抽到 WORKFLOWS 注册表里
 export const FEISHU_WORKFLOW_NEXT_PHASE: Record<PhaseId, PhaseId | null> = {
   plan: "build",
-  build: null,
+  build: "review",
+  review: null,
 };
 
 /**
@@ -411,7 +413,7 @@ export const sendChatReply = async (
 // ----------------- Plan workflow（V0.2） -----------------
 
 /**
- * 启动 plan workflow agent run（一次 SDK Run 跑全程 4 phase）
+ * 启动 plan workflow agent run（一次 SDK Run 跑全程 3 phase：plan → build → review、V0.5）
  *
  * 行为：幂等、立即返回 task；已 spawn 则返 already=true。SSE 订阅走 watchChatStream（路由复用）。
  */
@@ -460,24 +462,54 @@ export const resumeWaiting = async (
 };
 
 /**
+ * V0.5 phase-ack 选项（approve 时可选用）
+ *
+ * 默认：旧 agent 继续跑下一 phase（同一 SDK Run、不再计费）。
+ *
+ * 用户主动选「换新 agent」/「切模型」时：
+ *   - forkAgent=true：cancel 旧 agent + 起一个新 Agent.create run（消耗 1 次新 send 配额）
+ *   - nextModel 提供时隐含 forkAgent=true（旧 agent 已经用旧模型跑、模型不可中途切）
+ *   - bootArgs 必填（apiKey + mcpServers 用于 Agent.create 新 agent）
+ *
+ * 默认值约定：UI 默认 forkAgent=false 且 nextModel 未传、即「同 agent 继续」
+ */
+export interface PhaseAckForkOptions {
+  forkAgent?: boolean;
+  nextModel?: ModelSelection;
+  bootArgs?: {
+    apiKey: string;
+    mcpServers?: Record<string, McpServerConfig>;
+  };
+}
+
+/**
  * 用户在 plan 任务详情页点「通过」或「补意见再跑」、把动作 ack 给阻塞中的 workflow agent
  *
  * @param action   approve / revise
  * @param feedback revise 必填（用户的修改意见）、approve 可空
  * @param phase    可选、防 race 用 currentPhase 兜底
+ * @param fork     V0.5：approve 时可选「换新 agent / 切模型」、详见 PhaseAckForkOptions
  */
 export const submitPhaseAck = async (
   taskId: string,
   action: "approve" | "revise",
   feedback?: string,
   phase?: PhaseId,
+  fork?: PhaseAckForkOptions,
 ): Promise<Task> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/phase-ack`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, feedback, phase }),
+      body: JSON.stringify({
+        action,
+        feedback,
+        phase,
+        forkAgent: fork?.forkAgent,
+        nextModel: fork?.nextModel,
+        bootArgs: fork?.bootArgs,
+      }),
     },
   );
   const data = await handleJson<{ ok: true; task: Task }>(res);
