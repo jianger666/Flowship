@@ -37,7 +37,7 @@
 
 - **一次 SDK Run 跑完全程**：3 phase 默认共享一个 agent / 一个 SDK Run、计费一次（用户在 ack 时可手动 fork 起新 agent、+1 send 配额）
 - **HITL 是底线**：每个 phase 边界都要用户 ack、不会偷偷往下走
-- **revise 闭环**（V0.5.1 优化）：用户「补意见」→ agent **永远先弹 `ask_user`** 跟你复述自己的理解、确认后再改 artifact（不再闷头改）
+- **「再聊聊」意图二分**（V0.5.2、想改 / 想问都走这里）：用户点「再聊聊」→ agent **永远先弹 `ask_user`** 让你选「我想改 / 我想问 / 先答再决定」→ 想改就改 artifact、想问就只答疑（**严禁偷偷动 artifact**）、含混就再问一轮
 - **per-phase 模型选择 + agent fork（V0.5）**：新建任务表单挑模型、每 phase ack 时还能再切；切了模型 → 自动隐含起新 agent run（SDK 限制：同 run 不能换模型）
 - **artifact-writer skill 渐进式披露（V0.5.1）**：写 artifact 用 `write` / 修 artifact 用 `edit`、规则集中放在 `skills/artifact-writer/SKILL.md`、agent 自己 read 查阅、prompt 不再反复教
 - **shell + curl long-poll 保活（V0.3.5）**：agent 拿到 wait_for_user 返回的 shell 引导后调 `shell` 工具 curl 跟服务端长连接、根治旧版 5-6 分钟必踩 anti-loop 的问题
@@ -64,7 +64,7 @@ pnpm dev
 3. 新建任务时选 **mode**：
    - **plan**（默认、推荐）：粘飞书 story + 选角色 + 选仓库 + 选模型（默认 = 设置页默认模型）、自动跑 `plan → build → review`
    - **chat**（V0.4 起全选填）：可只输入飞书项目链接 / 仓库 / 标题、不绑仓库默认 `~`、进任务后底部输入框发首条消息自动启 agent；`completed` / `failed` 状态再发消息自动重启新一段 SDK Run
-4. plan 任务详情页：左侧 artifact 预览（按 phase 切换）、右侧事件流、顶部「补意见 / 通过 PHASE」按钮；点「通过 PHASE」弹 dialog、可挑下一 phase 用的模型 / 勾「换新 agent」
+4. plan 任务详情页：左侧 artifact 预览（按 phase 切换）、右侧事件流、顶部「再聊聊 / 通过 PHASE」按钮；点「再聊聊」弹 dialog 输入意见 / 疑问（agent 会先复述意图、想改就改、想问就只答）；点「通过 PHASE」弹 dialog、可挑下一 phase 用的模型 / 勾「换新 agent」
 5. 不想要的任务可手动归档 / 删除；completed/failed 7 天没动会自动归档
 
 ---
@@ -191,8 +191,7 @@ fe-ai-flow/
 
 ## 下一步
 
-- 优先：跑通真飞书 story → plan → build → review 全流程的端到端 demo（V0.5 / V0.5.1 联测）
-- 待启动：**「问 AI」答疑入口**（用户已提出、方向 A：跟「补意见 / 通过」并列加按钮、新协议 `[USER_QUESTION]`、agent 收到只答疑不动 artifact、详见 HANDOFF V0.5.1 §10）
+- 优先：跑通真飞书 story → plan → build → review 全流程的端到端 demo（V0.5 / V0.5.1 / V0.5.2 联测）
 - 待启动：扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）
 - 待启动：phase 内部部分失败恢复（从某个 phase 续跑、不要从头）
 - 待启动：用户自定义 workflow（V0.2 写死 `feishu-story-impl`、未来支持多 workflow 注册）

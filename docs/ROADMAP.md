@@ -30,7 +30,7 @@
 | 自动 retry on ConnectError | 🔲 不做 | 用户决定：靠手动「继续监听」、避免 agent 反复踩坑 |
 | **review phase（V0.5 代码已落地）** | 🚧 待联测 | 4 类差异 + plan 校验前移 + 模型 / agent 自由切换、详见 HANDOFF V0.5 段 |
 | **V0.5.1 prompt / UI 打磨**（联测中边走边修）| 🚧 持续打磨 | SDK 工具名修正 / revise 永远 ask_user / resume artifact 真实性 / artifact-writer skill / ack dialog 回归 / 任务级模型字段、详见 HANDOFF V0.5.1 段 |
-| **「问 AI」答疑入口**（用户提出、未动手）| 🔲 待启动 | 「补意见」会改 artifact、「通过」直接推进、缺一个「只问不改」path、用户拍板方向 A、待实施 |
+| **V0.5.2「再聊聊」意图二分**（V0.5.1 §10 方向 A 简化版）| ✅ 完成 | 「补意见」→「再聊聊」、agent 在 ask_user 时让用户选「我想改 / 我想问 / 先答再决定」、A 改 artifact / B 仅答疑（严禁 edit）、协议层不动、详见 HANDOFF V0.5.2 段 |
 | Cancel chat（保留任务、停 agent） | 🔲 未启动 | 当前只能"删任务" |
 | 飞书 / swagger 自动拉 | 🔲 未启动 | V0.6 启动、用户已配飞书 MCP |
 | cost / token dashboard | 🔲 未启动 | V0.7 启动 |
@@ -201,10 +201,14 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 - ✅ **任务级模型字段 `Task.model`**：新建任务表单加 selector、默认 `settings.defaultModel`、可为本任务挑别的、`prepareRunArgs` 优先 task.model 启动 agent
 - ✅ **弹窗文案统一极简化**：所有 `DialogDescription` 解释性文案删掉、字段帮助文案缩到一句话、「跟 AI 再聊聊」按钮文案缩为「补意见」
 
-**待联测 / 待启动**：
+**已落地（V0.5.2、2026-05-18 收尾）**：
 
-- 🚧 **真任务联测**：跑 1-2 个真飞书 story、走完 plan → build → review 全链路、验证 V0.5 + V0.5.1 所有打磨
-- 🔲 **「问 AI」答疑入口**：用户在最后一轮提出、缺一个「只问不改」的 path、用户拍板方向 A（跟「补意见 / 通过」并列加按钮、新协议 `[USER_QUESTION]`、agent 收到只答疑后回到 wait_for_user）、工作量估 1.5h、详见 HANDOFF V0.5.1 §10
+- ✅ **「再聊聊」意图二分**：「补意见」按钮 → 「再聊聊」、agent 在 ask_user 复述时让用户选「我想改 / 我想问 / 先答再决定」、Path A 改 artifact、Path B 仅答疑（严禁 `edit`/`write`、只读 `read`/`grep`/`glob` OK）、Path C 先答再决定。**协议层不动**、复用 `[PHASE_ACK revise]` 通道、不新加 API。原 V0.5.1 §10 方向 A（新加「问 AI」按钮 + 新协议）的简化版、UI 改一个文案 + prompt 改 D-scheme 即可。详见 HANDOFF V0.5.2 段。
+
+**待联测**：
+
+- 🚧 **真任务联测**：跑 1-2 个真飞书 story、走完 plan → build → review 全链路、验证 V0.5 + V0.5.1 + V0.5.2 所有打磨
+- 🚧 **「再聊聊」意图二分实测**：分别试「明确想改」/ 「明确想问」/ 「含混」三种输入、确认 agent 不偷偷动 artifact
 
 ---
 

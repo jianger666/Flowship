@@ -190,7 +190,7 @@ interface Props {
     attachments?: string[],
   ) => void;
   // V0.2 plan workflow 模式下传 true、不渲染底部「自由回复」输入框
-  // 因为 plan 模式的 HITL 是 phase ack（通过 / 补意见再跑）、不是 free-form 聊天
+  // 因为 plan 模式的 HITL 是 phase ack（通过 / 再聊聊）、不是 free-form 聊天
   // ack 按钮由父组件渲染在顶部 / 详情区其他位置
   hideReplyComposer?: boolean;
   // V0.4：输入框可用判定下放给父组件
@@ -214,7 +214,7 @@ const pathBasename = (p: string): string => {
   return idx >= 0 ? cleaned.slice(idx + 1) || cleaned : cleaned;
 };
 
-// 用 React.memo 包裹：详情页输入交互（如「补意见」对话框输入）触发 page 重渲染时、
+// 用 React.memo 包裹：详情页输入交互（如「再聊聊」对话框输入）触发 page 重渲染时、
 // 只要 task / streamingText 引用没变就跳过本组件、避免几百条 events 的子树参与 reconcile
 // 这是用户实测踩过的性能坑（输入卡顿 / [Violation] message handler took XXXms）
 const EventStreamImpl = ({

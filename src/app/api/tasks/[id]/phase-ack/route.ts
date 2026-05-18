@@ -1,7 +1,7 @@
 /**
  * POST /api/tasks/[id]/phase-ack
  *
- * V0.2 workflow 任务：用户在 UI 点「通过」或「补意见再跑」、本路由把动作 ack 给阻塞中的 agent。
+ * V0.2 workflow 任务：用户在 UI 点「通过」或「再聊聊」（V0.5.2 文案、协议名沿用 revise）、本路由把动作 ack 给阻塞中的 agent。
  *
  * Body: {
  *   action: "approve" | "revise",

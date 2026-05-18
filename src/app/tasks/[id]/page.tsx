@@ -7,7 +7,7 @@
  *
  * - **plan 模式**（V0.2 主流程、feishu-story-impl workflow）：
  *   - 整段任务跑在一次 SDK Run 里、按 phase 顺序执行（plan → build → review、V0.5 起）
- *   - 每个 phase 完成后 agent 调 wait_for_user 阻塞、用户在右侧底部点「通过」/「补意见」
+ *   - 每个 phase 完成后 agent 调 wait_for_user 阻塞、用户在右侧底部点「通过」/「再聊聊」
  *   - 启动按钮：draft / failed / completed 时显示、点击调 /start-workflow
  *   - 自动 watch SSE：进页面立即订阅、agent 输出 → 事件流、phase 边界 → PhaseProgress
  *
@@ -80,11 +80,12 @@ const TaskDetailPage = () => {
   const [activePhase, setActivePhase] = useState<PhaseId>("plan");
   // 启动按钮 loading 态、提交期间 disable
   const [starting, setStarting] = useState(false);
-  // 「补意见」对话框开关（用户对当前 phase 产物有疑问 / 需要澄清时打开）
+  // 「再聊聊」对话框开关
+  // 用户可能是想改 artifact、可能只是有疑问想问、AI 会先弹 ask_user 复述、再自己判断
   const [reviseOpen, setReviseOpen] = useState(false);
   // 跟 AI 的留言草稿
   const [reviseDraft, setReviseDraft] = useState("");
-  // 「通过 / 补意见」按钮提交锁、防连点
+  // 「通过 / 再聊聊」按钮提交锁、防连点
   const [ackSubmitting, setAckSubmitting] = useState(false);
   // 流式打字态（assistant chunk 累加、收到正式 assistant_message 事件清空）
   // plan 模式跟 chat 一样需要、SDK 的 assistant_delta 也走这条
@@ -307,7 +308,10 @@ const TaskDetailPage = () => {
     }
   };
 
-  // ---- Phase ack：补意见（补充澄清、提改进意见、追问） ----
+  // ---- Phase ack：再聊聊（补充澄清、提改进意见、追问、纯答疑都走这条）
+  // V0.5.2：协议层还是 [PHASE_ACK revise]、但 agent 拿到后会先 ask_user 复述、
+  // 然后自己判断「用户是要改」还是「用户只是想问问」、改 → 动 artifact、问 → 仅答疑后回 wait_for_user
+  // ----
   const handleSubmitRevise = async () => {
     const fb = reviseDraft.trim();
     if (!fb) {
@@ -422,10 +426,10 @@ const TaskDetailPage = () => {
                     size="sm"
                     onClick={() => setReviseOpen(true)}
                     disabled={ackSubmitting}
-                    title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
+                    title={`想改 ${PHASE_LABEL[cur]} 产物、或对它有疑问想问问——都走这里。AI 会先弹窗复述、然后自己判断要不要改`}
                   >
                     <MessageCircleQuestion />
-                    补意见
+                    再聊聊
                   </Button>
                   {/* 通过 PHASE：直接打开 dialog 让用户配「下一 phase 模型 / 换 agent」、再通过
                       之前试过 ack 行内 inline 配置、用户拍板：逻辑走通先、UI 优化后说 */}
@@ -529,18 +533,18 @@ const TaskDetailPage = () => {
         submitting={ackSubmitting}
       />
 
-      {/* 补意见 Dialog（plan 模式专用、用户对当前 phase 产物有疑问 / 想补充澄清时打开） */}
+      {/* 再聊聊 Dialog（plan 模式专用、想改 artifact 或想答疑都走这里） */}
       <Dialog open={reviseOpen} onOpenChange={setReviseOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>对 {PHASE_LABEL[cur]} 补意见</DialogTitle>
+            <DialogTitle>跟 AI 再聊聊 · {PHASE_LABEL[cur]}</DialogTitle>
           </DialogHeader>
           <div className="flex flex-col gap-2">
             <Textarea
               value={reviseDraft}
               onChange={(e) => setReviseDraft(e.target.value)}
               rows={6}
-              placeholder="如：第 3 条业务规则原文请搬过来、关联文档少了 xxx 链接、xxx 字段我理解是只读……"
+              placeholder="想改的地方、有疑问、想问问 AI——都行。AI 会先弹窗复述、再判断要不要动 artifact"
               autoFocus
             />
           </div>

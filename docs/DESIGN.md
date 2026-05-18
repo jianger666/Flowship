@@ -25,8 +25,9 @@
 >   5. `artifact-writer` skill 渐进式披露（不再 prompt 反复教 `write` vs `edit`、改成 skill 自查）
 >   6. ack UI 回到 dialog（行内 / 两行 / 回归 dialog 三次来回后用户拍板：先走通逻辑、再优化交互）
 >   7. 任务级模型字段 `Task.model`（新建任务表单加 selector、`prepareRunArgs` 优先 task.model）
->   8. 弹窗文案统一极简化、「跟 AI 再聊聊」按钮缩为「补意见」
+>   8. 弹窗文案统一极简化
 >   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.1」段（含全 commit 清单 + 用户拍板理由）。
+> - **V0.5.2（「再聊聊」意图二分、2026-05-18 收尾）**：把「补意见」按钮改名「再聊聊」、agent 在 ask_user 复述时让用户选「我想改 / 我想问 / 先答再决定」、Path A 改 artifact、Path B 仅答疑（严禁 `edit` / `write`、只读 `read`/`grep`/`glob` OK）、Path C 先答疑再决定。**协议层不动**——复用 `[PHASE_ACK revise]` 通道、不新加 API。原 V0.5.1 §10 方向 A（新加「问 AI」按钮 + 新协议）的简化版、UI 改一个文案 + prompt 改 D-scheme 即可。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.2」段。
 >
 > **本文档下游各节的有效性**：
 >

@@ -483,7 +483,7 @@ export interface PhaseAckForkOptions {
 }
 
 /**
- * 用户在 plan 任务详情页点「通过」或「补意见再跑」、把动作 ack 给阻塞中的 workflow agent
+ * 用户在 plan 任务详情页点「通过」或「再聊聊」、把动作 ack 给阻塞中的 workflow agent
  *
  * @param action   approve / revise
  * @param feedback revise 必填（用户的修改意见）、approve 可空

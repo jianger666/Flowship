@@ -516,22 +516,54 @@ fd2ff12 chore: 跟随工具名修正、清理代码注释 / UI 文案 / DESIGN.m
 b85cfe5 fix(prompts): SDK 1.0.13 工具名修正 edit_file → write / read_file → read
 ```
 
-#### 10. V0.5.1 待办（接力 AI 该接的）
+#### 10. V0.5.2 文案 + 意图二分（2026-05-18 收尾、答疑入口最终方案）
 
-**用户已经提出、没动的功能需求**：
+**演进**：V0.5.1 §10 原本提议方向 A（新加「问 AI」按钮 + 新协议）、但用户最后拍板了**更简单的方向**——直接把「补意见」按钮**改名「再聊聊」**、不加新协议、**让 agent 在 ask_user 复述时自己判断「用户是想改还是想问」**。
 
-1. **「问 AI」入口**（用户在最后一轮提出、未动手）：
-   - 场景：用户对仓库代码 / 当前 plan / build 产出有疑问、希望 agent 答疑而不动 artifact
-   - 当前 UI 没这个 path：「通过」直接推进、「补意见」会改 artifact、没有「只问不改」
-   - 用户倾向方向 **A**：跟「补意见 / 通过」并列加个「问 AI」按钮、新协议 `[USER_QUESTION]`、agent 收到只答疑后回到 `wait_for_user`、不动 artifact
-   - 工作量估算：UI ~30min + API/协议 ~30min + prompt ~30min ≈ 1.5h
-   - 实施路径：复用 `wait_for_user` 长连接通道（pendingMap）传 `[USER_QUESTION]` payload、`plan-runner` prompt 加新协议分支「只答不动」、`task-store.ts` 加 `submitUserQuestion`、UI 加按钮 + textarea dialog
+**最终交互**：
 
-2. **真任务联测**（用户多次提到、还没完整跑通一遍）：
-   - 跑 1-2 个真飞书 story、走完 plan → build → review 三 phase
-   - 测 fork：build ack 时切模型、确认旧 agent 干净退出、新 agent 接管 review
-   - 测 03-review.md 4 类差异分流的实际效果、按反馈调 review prompt
-   - 测新建任务模型字段：选非默认模型 → 跑 plan → 看 SDK Run 用的是不是该模型
+```
+用户点「再聊聊」→ 输入想说的话（想改 / 想问 / 含混都行）
+  → 服务端发 [PHASE_ACK revise] + feedback（协议名沿用、不新增）
+  → agent 永远先调 ask_user 复述意图、option 给「我想改 / 我想问 / 先答疑再决定 / 我重新说」
+  → 用户在弹窗里选 → agent 走 Path A（改）/ B（只答疑）/ C（先答再决定）
+    - Path A: edit artifact → 再 wait_for_user
+    - Path B: emit assistant_message 答疑、不动 artifact → 再 wait_for_user
+    - Path C: 先 B 答疑、再 ask_user 问「还需要改吗」、按答案走 A 或 B
+```
+
+**为什么最终选这个而不是 V0.5.1 §10 的方向 A**：
+- 用户视角：少一个按钮、文案更友好（「再聊聊」比「问 AI / 补意见」二选一更直白）
+- 实施视角：不新加协议、复用 `[PHASE_ACK revise]` 通道、UI 只改一个文案、prompt 改 D-scheme 即可、工作量从 1.5h 降到 0.5h
+- 风险：agent 自己判断意图、可能误判（用户说「这块怎么改」可能是问也可能是要求改）→ 用 ask_user 显式让用户拍板这一步、把判断权重新还给用户
+
+**改动文件**：
+- `src/app/tasks/[id]/page.tsx`：按钮文案「补意见」→「再聊聊」、Dialog title「对 X 补意见」→「跟 AI 再聊聊 · X」、Textarea placeholder 改成「想改的地方、有疑问、想问问 AI——都行」、button title 同步
+- `src/lib/server/plan-runner.ts`：D-scheme §3 改成「Path A/B/C 三分」、步骤 3 拆 3a（改）+ 3b（仅答疑、严禁 `edit`/`write`、用 `read`/`grep`/`glob` 只读查询 OK）、ask_user options 模板改成「我想改 / 我想问 / 先答再决定 / 我重新说」、绝对禁止段加「走 Path B 答疑时偷偷动 artifact」
+- `src/lib/server/chat-mcp.ts` / `src/lib/task-store.ts` / `src/app/api/tasks/[id]/phase-ack/route.ts`：文案 / 注释同步「补意见」→「再聊聊」、说明意图二分
+- `src/components/tasks/event-stream.tsx`：注释里的「补意见」改「再聊聊」
+
+**协议层不动**：
+- `[PHASE_ACK revise]` 协议名保留（不叫 `[USER_QUESTION]`）、避免老 events.jsonl 兼容问题
+- 服务端 phase-ack route 接的还是 `action: "revise" | "approve"`、不变
+- agent 自由决定要不要动 artifact、不需要服务端区分
+
+**接力 AI 注意**：
+- 走 Path B 时 agent **不能调 `edit` / `write` / `delete`**——这是 prompt 里的绝对禁止、违反 = 用户会发现「我只问了一句、artifact 怎么被偷偷改了」
+- `read` / `grep` / `glob` 只读查询 OK、答疑时可能需要查代码或 artifact
+- 这次 ask_user 调用**不计入「写 artifact 初稿阶段最多 1 次 ask_user」限额**
+
+#### 11. V0.5.2 之后的待办（接力 AI 该接的）
+
+**真任务联测**（用户多次提到、还没完整跑通一遍）：
+- 跑 1-2 个真飞书 story、走完 plan → build → review 三 phase
+- 测 fork：build ack 时切模型、确认旧 agent 干净退出、新 agent 接管 review
+- 测 03-review.md 4 类差异分流的实际效果、按反馈调 review prompt
+- 测新建任务模型字段：选非默认模型 → 跑 plan → 看 SDK Run 用的是不是该模型
+- **测「再聊聊」意图二分**（V0.5.2 新加）：分别试三种输入
+  - 「字段 X 改只读」（明确想改）→ 看 ask_user 弹的是不是「我想改：…」、选「我想改」后是不是真改了 artifact
+  - 「为什么这块用 useReducer？」（明确想问）→ 看 ask_user 弹的是不是「想问还是想改」、选「我想问」后是不是只回了答案、artifact 没动
+  - 「111」（含混）→ 看 ask_user 是不是给了「我想改 / 我想问 / 重新说」三选项、是不是没瞎改 artifact
 
 **已知 / 容忍的小坑**：
 

@@ -80,7 +80,8 @@ const WAIT_ACK_KEEPALIVE_MS = 60 * 1000;
 export type ToolReturn = {
   // user_reply：chat 模式、真正的用户消息文本（agent 该接着处理）
   // phase_approve：workflow 模式、用户点了「通过」、agent 该进下一 phase
-  // phase_revise：workflow 模式、用户点了「补意见再跑」、agent 该按 feedback 改产物再调一次
+  // phase_revise：workflow 模式、用户点了「再聊聊」（V0.5.2 文案、协议名沿用 revise）
+  // agent 该先 ask_user 复述意图、然后按 Path A（改 artifact）/ Path B（仅答疑）处理、最后再调一次
   // stale：被新一轮 wait_for_user 顶掉、agent 直接放弃这次返回即可
   // cancelled：任务被取消、agent 该结束 run
   kind:
@@ -531,7 +532,7 @@ const buildShellWaitGuidance = (
     "",
     "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳、忽略它**。它的唯一意义是告诉你「连接还活着、用户还没操作」。看到再多 KEEPALIVE 都是正常的、**绝对不要**因此 summarize 退出 / 调 read 检查 terminal / 重新调 wait_for_user / 调其他工具自救。",
     "  - `[PHASE_ACK approve]`：用户在 UI 点了「通过」、shell 命令立刻 exit 0、按 prompt 推进下一 phase",
-    "  - `[PHASE_ACK revise] <feedback 文本>`：用户「补意见再跑」、按 feedback 改 artifact 后再调 wait_for_user",
+    "  - `[PHASE_ACK revise] <feedback 文本>`：用户点了「再聊聊」（可能想改 artifact、可能只是想问问）、**先 ask_user 复述意图**、按 Path A（改）/ B（仅答疑、不动 artifact）处理后再调 wait_for_user",
     "  - `[USER_REPLY] <markdown Q&A 文本>`：chat 模式用户回复 / ask_user 答完、按内容推进",
     "  - `[CANCELLED]`：任务被取消、收尾结束 run",
     "  - `[STALE]` / `[INVALID_TOKEN]`：本 token 已失效、不要重试、自然结束 run",
@@ -1020,7 +1021,7 @@ export const submitAskReply = (
 };
 
 /**
- * V0.2 workflow 模式：用户在 UI 点了「通过」或「补意见再跑」、API 路由调这个 ack 阻塞中的 agent。
+ * V0.2 workflow 模式：用户在 UI 点了「通过」或「再聊聊」、API 路由调这个 ack 阻塞中的 agent。
  *
  * @param action   "approve" → agent 拿到 [PHASE_ACK approve] 进下一 phase
  *                 "revise"  → agent 拿到 [PHASE_ACK revise] + feedback、改 artifact 再调一次
