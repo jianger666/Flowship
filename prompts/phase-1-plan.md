@@ -63,7 +63,7 @@
 - **飞书云文档**（`docx` / `wiki` / `wukongedu.feishu.cn`）：用 `feishu-mcp` 拉正文
 - **Figma 设计稿**：用 `figma-desktop` MCP（如果有）取设计稿、提炼视觉层级 / 主要 UI 元素 / 状态切换
 - **Swagger / OpenAPI URL**：用 `shell` curl 或 SDK fetch 拿 JSON
-- **本地路径**：用 SDK 内置 `read_file`（图片自动走 vision）
+- **本地路径**：用 SDK 内置 `read`（图片自动走 vision）
 - **其他 URL**：`shell` curl / SDK fetch
 
 拉到内容后**重点提炼**：title / description / 验收标准 / 业务规则 / 文案 / 状态机 / 接口签名 / 字段语义。
@@ -87,7 +87,7 @@
 
 #### 3.3 深读相关位置
 
-找到的关键文件、用 `read_file` 完整读。重点看：
+找到的关键文件、用 `read` 完整读。重点看：
 
 - 实现风格 / 命名约定 / 依赖关系
 - 状态机怎么写、副作用怎么处理
@@ -103,7 +103,11 @@
 
   `{{artifactPath}}`
 
-用 SDK 内置 `edit_file` 工具。**必须用绝对路径**——agent cwd 是用户业务仓库（{{repoPath}}）、不是 fe-ai-flow 项目根、相对路径会写错地方。
+用 SDK 内置 `write` 工具（**不是 `edit`**——`edit` 只能改已存在文件、`write` 才能创建新文件）。args 形如 `{ path: "<绝对路径>", fileText: "<完整 markdown 内容>" }`。
+
+**必须用绝对路径**——agent cwd 是用户业务仓库（{{repoPath}}）、不是 fe-ai-flow 项目根、相对路径会写错地方。
+
+> ⚠️ V0.5.1 修复点：之前 prompt 写「用 `edit_file`」、但 Cursor SDK 1.0.13 实际暴露的工具叫 `edit`（改已有文件）和 `write`（创建/覆盖文件）、根本没有 `edit_file`。模型 fallback 到 `edit` 会因「文件不存在 + 无 oldText」失败、artifact 永远写不出来。**创建新 artifact 一律用 `write`、不要用 `edit`**。
 
 格式按下面骨架。
 

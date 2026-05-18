@@ -181,7 +181,17 @@ const buildInitialPrompt = (
     "",
     "**核心原则**：用户看不到 wait_for_user / shell / curl 这些协议细节、协议层全在 fe-ai-flow 内部、对用户透明就像 TCP socket recv()——你不会在聊天里说「我现在调用 recv 等你输入」、对 wait_for_user / shell / curl 也一样。你只需要：回答用户问题 → 直接调 wait_for_user → 拿到引导 → 直接调 shell + curl → 拿到 [USER_REPLY] 接着处理。中间不解释、不预告、不汇报。",
     "",
-    "6. 你也可以使用 SDK 内置工具（read_file / grep / glob / shell / edit_file）和用户配置的其他 MCP",
+    "6. 你也可以使用 SDK 内置工具和用户配置的其他 MCP。**SDK 1.0.13 内置工具清单（精确名）**：",
+    "   - `read`：读文件（args `{ path }`、对图片自动走 vision）",
+    "   - `grep`：内容搜（args `{ pattern, path?, glob?, ... }`）",
+    "   - `glob`：找文件名（args `{ globPattern, targetDirectory? }`）",
+    "   - `shell`：跑命令（args `{ command, workingDirectory?, timeout? }`）",
+    "   - `edit`：**改已存在的文件**（args `{ path, oldText, newText, replaceAll? }` 或多段批量替换形式）",
+    "   - `write`：**创建新文件 / 整文件覆盖**（args `{ path, fileText }`）",
+    "   - `delete`：删文件（args `{ path }`）",
+    "   - `task`：分派子任务",
+    "",
+    "   ⚠️ **不要写 `edit_file` / `read_file` / `write_file` 这些带 `_file` 后缀的名字**——SDK 1.0.13 没有这些工具、调用会失败。**创建不存在的文件用 `write`、不要用 `edit`**（edit 没 oldText 可改、会拒）。",
     "",
     "## 每轮对话完成时的标准动作（背下来、必须按这个顺序）",
     "",
@@ -220,7 +230,7 @@ const buildInitialPrompt = (
     "",
     "## Skills（fe-ai-flow 自带能力扩展）",
     "",
-    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read_file` 读取对应 SKILL.md 拿完整指令：",
+    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：",
     "",
     renderSkillsForPrompt(skills),
     "",
@@ -229,7 +239,7 @@ const buildInitialPrompt = (
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "   - skill 文件可能引用其他文件（如 events.jsonl 绝对路径）、跟着读即可",
     "",
-    `## 任务 cwd（agent shell / read_file 默认基准目录）：${task.repoPath}`,
+    `## 任务 cwd（agent shell / read 默认基准目录）：${task.repoPath}`,
     "",
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
     "",
@@ -237,7 +247,7 @@ const buildInitialPrompt = (
     "",
     renderContextDocsSection(
       task,
-      "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read_file / grep 摸资料。",
+      "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read / grep 摸资料。",
     ),
     "",
     ...buildOpeningStanceSection(task, firstMessage),
@@ -268,7 +278,7 @@ const buildOpeningStanceSection = (
     ];
     if (firstMessage.imagePaths && firstMessage.imagePaths.length > 0) {
       parts.push(
-        "**用户附带的图片**（用 SDK 内置 `read_file` 读、自动走 vision）：",
+        "**用户附带的图片**（用 SDK 内置 `read` 工具读、自动走 vision）：",
         "",
         ...firstMessage.imagePaths.map((p) => `  - \`${p}\``),
         "",
@@ -276,7 +286,7 @@ const buildOpeningStanceSection = (
     }
     if (firstMessage.attachmentPaths && firstMessage.attachmentPaths.length > 0) {
       parts.push(
-        "**用户附带的文件 / 目录**（用 `read_file` / `grep` / `glob` 按需读）：",
+        "**用户附带的文件 / 目录**（用 `read` / `grep` / `glob` 按需读）：",
         "",
         ...firstMessage.attachmentPaths.map((p) => `  - \`${p}\``),
         "",
@@ -312,7 +322,7 @@ const buildOpeningStanceSection = (
     "**禁忌**：",
     "  - ❌ 起手就根据任务标题猜用户想问什么、自顾自说一段「关于 xxx、我可以…」",
     "  - ❌ 起手就发 assistant_message 说「你好、请告诉我…」（这种欢迎语没必要、UI 直接显示输入框就够）",
-    "  - ❌ 起手就调 read_file / grep 之类的工具去摸仓库——用户还没说要做什么、你瞎摸毫无价值",
+    "  - ❌ 起手就调 read / grep 之类的工具去摸仓库——用户还没说要做什么、你瞎摸毫无价值",
     "",
     "**正确顺序**：",
     "  1. 起手什么都不做、立刻调 `wait_for_user(task_id=" + task.id + ")`",

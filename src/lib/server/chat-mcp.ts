@@ -248,14 +248,14 @@ export const formatToolReturnAsText = (result: ToolReturn): string => {
     if (result.imagePaths && result.imagePaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read_file` 工具逐一读取（SDK 内置 read_file 会把图片转成 vision、你能直接看到图像内容）：",
+        "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read` 工具逐一读取（SDK 内置 `read` 会把图片转成 vision、你能直接看到图像内容）：",
         ...result.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
     if (result.attachmentPaths && result.attachmentPaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read_file` / `grep` / `glob` 读取（路径已是绝对路径、直接用）：",
+        "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取（路径已是绝对路径、直接用）：",
         ...result.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }

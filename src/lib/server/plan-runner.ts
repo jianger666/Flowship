@@ -238,7 +238,7 @@ const buildSuperPrompt = async (
           "",
           completed.length > 0 ? completed : "  （无）",
           "",
-          `**直接从 Phase \`${fork.fromPhase}\` 开始**：用 SDK 内置 \`read_file\` 读上面已完成 phase 的 artifact 拿上下文、然后按下面对应 phase 的指令做 \`${fork.fromPhase}\` 的产出。`,
+          `**直接从 Phase \`${fork.fromPhase}\` 开始**：用 SDK 内置 \`read\` 工具读上面已完成 phase 的 artifact 拿上下文、然后按下面对应 phase 的指令做 \`${fork.fromPhase}\` 的产出。`,
           "",
           "不需要重读 contextDocs / 不需要重扫仓库、上一 agent 已经做过、信息已经在 artifact 里。",
           "",
@@ -357,11 +357,22 @@ const buildSuperPrompt = async (
     `   - 你**没拿到**最后一个 phase 的 approve 之前、绝对不许结束 run`,
     `   - 中间任何 phase 写完 artifact 后**必须**调 wait_for_user、否则 fe-ai-flow 会把整段 workflow 标 failed（runner 侧已硬检测）`,
     "",
-    "8. 你也可以使用 SDK 内置工具（read_file / grep / glob / shell / edit_file）和用户配置的其他 MCP",
+    "8. 你也可以使用 SDK 内置工具和用户配置的其他 MCP。**SDK 1.0.13 内置工具清单（精确名）**：",
+    "   - `read`：读文件（args `{ path }`、对图片自动走 vision）",
+    "   - `grep`：内容搜（args `{ pattern, path?, glob?, ... }`）",
+    "   - `glob`：找文件名（args `{ globPattern, targetDirectory? }`）",
+    "   - `shell`：跑命令（args `{ command, workingDirectory?, timeout? }`）",
+    "   - `edit`：**改已存在的文件**（args `{ path, oldText, newText, replaceAll? }` 或 `{ path, edits: [{ oldText, newText }, ...] }`）",
+    "   - `write`：**创建新文件 / 整文件覆盖**（args `{ path, fileText, returnFileContentAfterWrite? }`）",
+    "   - `delete`：删文件（args `{ path }`）",
+    "   - `task`：分派子任务",
+    "",
+    "   ⚠️ **核心坑（V0.5.1 修复）**：不要写 `edit_file` / `read_file` / `write_file` 这些**带 `_file` 后缀**的工具名——SDK 根本没有这些工具、调用会失败。**精确用上面 6 个名字**。",
+    "   ⚠️ **创建不存在的文件一律用 `write`、不要用 `edit`**——`edit` 没有 oldText 可改、SDK 会拒绝、artifact 永远写不出来。",
     "",
     "## 每个 phase 完成时的标准动作（背下来、必须按这个顺序）",
     "",
-    "1. 用 `edit_file` 把 artifact 写到对应绝对路径（见下面 artifact 表）",
+    "1. 用 `write` 工具把 artifact 写到对应绝对路径（见下面 artifact 表）、args `{ path: <绝对路径>, fileText: <完整 markdown> }`",
     "2. **沉默地** 调用一次 `wait_for_user(task_id, phase, artifact)`（不要 assistant_message 解释）",
     "3. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令",
     "4. shell stdout 返回时按内容走分支（见上「关键规则 3」）",
@@ -400,9 +411,9 @@ const buildSuperPrompt = async (
     "  - **不要因为「有合理 default 能推进」就不问**——用户希望你问、Default 只在用户主动说「不清楚 / 你定」时才用",
     "",
     "**何时不该问（只有这一类、其他一律打包问）**：",
-    "  - 能从 contextDocs（飞书 story / 技术方案 / 已添加上下文）里读到答案 → 先 `read_file` 再说",
+    "  - 能从 contextDocs（飞书 story / 技术方案 / 已添加上下文）里读到答案 → 先 `read` 再说",
     "  - 能从 01-plan.md「上下文冲突已通过 ask_user 澄清」段读到之前问过的 Q&A → 直接用结论、不要重问",
-    "  - 能从代码 grep / read_file 看出现状 → 先看代码再说（V0.3.4 起 plan phase 就该读仓库、不要等到 build）",
+    "  - 能从代码 grep / read 看出现状 → 先看代码再说（V0.3.4 起 plan phase 就该读仓库、不要等到 build）",
     "",
     "**用户在自由文本里写「不清楚 / 你定」的处理**：",
     "  - 这是合法答案、agent 按合理 default 推进、artifact 对应位置加 `> （ack 待澄清：xxx）` 标记",
@@ -437,7 +448,7 @@ const buildSuperPrompt = async (
     "",
     "## Skills（fe-ai-flow 自带能力扩展）",
     "",
-    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read_file` 读取对应 SKILL.md 拿完整指令：",
+    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：",
     "",
     renderSkillsForPrompt(skills),
     "",
@@ -1227,8 +1238,8 @@ const handlePlanSdkMessage = async (
         innerToolName === "wait_for_user" ||
         innerToolName === "Wait For User";
 
-      // edit_file / write_file 调用时如果路径形如 artifacts/01-plan.md、把 artifact 内容也推一份给 SSE
-      // 不严格依赖工具名（不同 SDK 版本可能叫 edit_file / write_file / Edit）
+      // write / edit 调用时如果路径形如 artifacts/01-plan.md、把 artifact 内容也推一份给 SSE
+      // 不严格依赖工具名（SDK 1.0.13 是 `write` / `edit`、不带 _file 后缀）
       // 通过 args.target_file 模式识别（agent 跑约定的路径时才推）
       if (msg.status === "running") {
         const possibleTarget =
