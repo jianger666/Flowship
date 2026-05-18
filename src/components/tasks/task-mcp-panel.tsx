@@ -83,7 +83,7 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
           <DialogHeader>
             <DialogTitle>MCP servers</DialogTitle>
             <DialogDescription>
-              选本任务启用哪些 MCP。改完下次启动 workflow / chat 时生效——已在跑的 SDK Run 不会热改
+              选本任务启用哪些 MCP
             </DialogDescription>
           </DialogHeader>
 

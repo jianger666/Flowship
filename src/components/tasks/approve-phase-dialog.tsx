@@ -28,7 +28,6 @@ import { Loader2, RotateCcw, Settings2 } from "lucide-react";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -135,11 +134,6 @@ export const ApprovePhaseDialog = ({
           <DialogTitle>
             通过 {phaseLabel}：高级选项
           </DialogTitle>
-          <DialogDescription className="text-xs">
-            默认：同 agent 继续跑下一 phase、不消耗新 send 配额。
-            <br />
-            勾选「换新 agent」或切换模型 = 起一个新 Agent.create run、消耗 +1 配额。
-          </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-4 py-2">
@@ -222,14 +216,6 @@ export const ApprovePhaseDialog = ({
             />
           </div>
 
-          {/* 计费提示 */}
-          {effectiveFork && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-              <strong>注意</strong>：起新 agent 会消耗 1 次新的 send 配额。
-              新 agent 不知道旧对话历史、只能读到硬盘上已落盘的 artifact。
-              小需求建议保持同 agent 继续。
-            </div>
-          )}
         </div>
 
         <DialogFooter className="gap-2">

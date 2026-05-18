@@ -158,7 +158,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
           <DialogHeader>
             <DialogTitle>上下文文档</DialogTitle>
             <DialogDescription>
-              agent 在 phase 启动时会看到清单、按需拉取（URL → 飞书 / fetch；路径 → SDK `read` 工具）
+              agent 启动时会看到清单、按需读取
             </DialogDescription>
           </DialogHeader>
 
@@ -253,7 +253,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 className="resize-none"
               />
               <p className="text-[11px] text-muted-foreground">
-                URL → agent 用 feishu-mcp / fetch 拉取；/ 起手 → agent 用 `read` 工具读；其他 → 当文本看
+                URL → 自动拉取；/ 起手 → 当文件路径；其他 → 当文本
               </p>
             </div>
 

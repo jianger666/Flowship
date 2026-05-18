@@ -546,11 +546,6 @@ const TaskDetailPage = () => {
             <DialogTitle>对 {PHASE_LABEL[cur]} 补意见</DialogTitle>
           </DialogHeader>
           <div className="flex flex-col gap-2">
-            <p className="text-xs text-muted-foreground">
-              发现 artifact 有信息缺失 / 理解偏差 / 想补充说明？写下你的意见、
-              AI 收到后会**先弹窗复述它的理解**、你确认后再动产物——避免它瞎猜瞎改。
-              整个过程不会重启 workflow、phase 保持「等你确认」状态。
-            </p>
             <Textarea
               value={reviseDraft}
               onChange={(e) => setReviseDraft(e.target.value)}
