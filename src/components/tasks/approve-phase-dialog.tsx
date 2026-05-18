@@ -23,7 +23,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, RotateCcw, Settings2 } from "lucide-react";
+import { ArrowRight, Loader2, RotateCcw } from "lucide-react";
 
 import {
   Dialog,
@@ -44,7 +44,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useModels } from "@/hooks/use-models";
 import { PHASE_LABEL } from "@/lib/task-display";
-import type { ModelSelection, PhaseId } from "@/lib/types";
+import { WORKFLOWS, type ModelSelection, type PhaseId } from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -126,13 +126,26 @@ export const ApprovePhaseDialog = ({
   };
 
   const phaseLabel = PHASE_LABEL[phaseId];
+  // 找下一 phase（feishu-story-impl: plan → build → review）
+  // review 是最后一个、approve 后 workflow 结束、没有下一 phase
+  const wfPhases = WORKFLOWS["feishu-story-impl"].phases;
+  const curIdx = wfPhases.indexOf(phaseId);
+  const nextPhase =
+    curIdx >= 0 && curIdx < wfPhases.length - 1 ? wfPhases[curIdx + 1] : null;
+  const nextPhaseLabel = nextPhase ? PHASE_LABEL[nextPhase] : null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>
-            通过 {phaseLabel}：高级选项
+          <DialogTitle className="flex items-center gap-2">
+            <span>通过 {phaseLabel}</span>
+            {nextPhaseLabel && (
+              <>
+                <ArrowRight className="size-4 text-muted-foreground" />
+                <span className="text-muted-foreground">{nextPhaseLabel}</span>
+              </>
+            )}
           </DialogTitle>
         </DialogHeader>
 
@@ -249,30 +262,3 @@ export const ApprovePhaseDialog = ({
   );
 };
 
-/**
- * 主按钮旁的「齿轮」图标按钮、点开 ApprovePhaseDialog。
- *
- * 抽出来给 page.tsx 一个简洁挂载点、避免散在 page 里。
- */
-interface TriggerProps {
-  onOpen: () => void;
-  disabled?: boolean;
-}
-
-export const ApprovePhaseDialogTrigger = ({
-  onOpen,
-  disabled,
-}: TriggerProps) => {
-  return (
-    <Button
-      variant="ghost"
-      size="sm"
-      onClick={onOpen}
-      disabled={disabled}
-      title="高级 ack 选项（切模型 / 换新 agent）"
-      className="px-2"
-    >
-      <Settings2 />
-    </Button>
-  );
-};
