@@ -27,6 +27,7 @@ import Link from "next/link";
 import { notFound, useParams } from "next/navigation";
 import {
   ArrowLeft,
+  ArrowRight,
   CheckCircle2,
   Loader2,
   MessageCircleQuestion,
@@ -453,9 +454,11 @@ const TaskDetailPage = () => {
                 </Button>
               )}
               {canAck && (() => {
-                // V0.5：ack 行内的模型 selector + 换 agent toggle
-                // defaultModel / apiKey 只在 client 侧能拿、用 typeof window 兜底
-                // pickedModelId !== defaultModel.id → 隐含 fork
+                // V0.5：ack 区分两行
+                //   row 1（下一 phase 配置）：[➜ 下一 phase（X）：模型 ▼ 换 agent]
+                //     - 这是给「下一个待跑 phase」用的模型 / agent、跟当前 phase 操作语义分开
+                //     - 只在「有下一 phase」时显示（review approve 是 workflow 终点、不显示）
+                //   row 2（当前 phase 操作）：[补意见] [通过 PHASE]
                 const settings =
                   typeof window !== "undefined" ? getSettings() : null;
                 const defaultModelId = settings?.defaultModel?.id ?? "";
@@ -465,106 +468,123 @@ const TaskDetailPage = () => {
                   !!pickedModelId &&
                   pickedModelId !== defaultModelId;
                 const showFork = forkAgent || modelChanged;
-                // selector disabled：没默认模型 / 没 apiKey / 还没拉到列表
                 const selectorDisabled =
                   !defaultModelId ||
                   !apiKey.trim() ||
                   ackModels.length === 0 ||
                   ackSubmitting;
+                // 找下一 phase（cur 后一个 phase、没有就 null）
+                const curIdx = workflowPhases.indexOf(cur);
+                const nextPhase =
+                  curIdx >= 0 && curIdx < workflowPhases.length - 1
+                    ? workflowPhases[curIdx + 1]
+                    : null;
                 return (
-                  <>
-                    {/* 模型选择器：默认显示 settings.defaultModel、可切到列表里其他模型 */}
-                    <Select
-                      value={pickedModelId || undefined}
-                      onValueChange={(v) => v && setPickedModelId(v)}
-                      disabled={selectorDisabled}
-                    >
-                      <SelectTrigger
+                  <div className="flex flex-col items-end gap-2">
+                    {/* row 1：下一 phase 配置（只在有 nextPhase 时显示） */}
+                    {nextPhase && (
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <ArrowRight className="size-3" />
+                        <span>
+                          下一 phase（{PHASE_LABEL[nextPhase]}）：
+                        </span>
+                        <Select
+                          value={pickedModelId || undefined}
+                          onValueChange={(v) => v && setPickedModelId(v)}
+                          disabled={selectorDisabled}
+                        >
+                          <SelectTrigger
+                            size="sm"
+                            className="w-[160px]"
+                            title={
+                              !defaultModelId
+                                ? "请先在设置页选默认模型"
+                                : !apiKey.trim()
+                                  ? "请先在设置页填 API Key"
+                                  : ackModels.length === 0
+                                    ? "正在拉模型列表..."
+                                    : `${PHASE_LABEL[nextPhase]} 用的模型；切了会自动起新 agent`
+                            }
+                          >
+                            <SelectValue
+                              placeholder={
+                                !defaultModelId
+                                  ? "未配模型"
+                                  : ackModels.length === 0
+                                    ? "拉取中..."
+                                    : "选模型"
+                              }
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {ackModels.map((m) => (
+                              <SelectItem key={m.id} value={m.id}>
+                                <span className="flex flex-col">
+                                  <span className="text-xs">
+                                    {m.displayName}
+                                  </span>
+                                  <span className="font-mono text-[10px] text-muted-foreground">
+                                    {m.id}
+                                  </span>
+                                </span>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          variant={showFork ? "secondary" : "outline"}
+                          size="sm"
+                          onClick={() =>
+                            !modelChanged && setForkAgent(!forkAgent)
+                          }
+                          disabled={modelChanged || ackSubmitting}
+                          title={
+                            modelChanged
+                              ? "切了模型必须起新 agent（不可关）"
+                              : showFork
+                                ? "已勾选：通过时起新 Agent.create run、+1 send 配额"
+                                : "默认：同 agent 续跑、不计费"
+                          }
+                        >
+                          <UserPlus />
+                          换 agent
+                        </Button>
+                      </div>
+                    )}
+                    {/* row 2：当前 phase 操作 */}
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
                         size="sm"
-                        className="w-[160px]"
+                        onClick={() => setReviseOpen(true)}
+                        disabled={ackSubmitting}
+                        title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
+                      >
+                        <MessageCircleQuestion />
+                        补意见
+                      </Button>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        onClick={handleApprove}
+                        disabled={ackSubmitting}
                         title={
-                          !defaultModelId
-                            ? "请先在设置页选默认模型"
-                            : !apiKey.trim()
-                              ? "请先在设置页填 API Key"
-                              : ackModels.length === 0
-                                ? "正在拉模型列表..."
-                                : "下一 phase 用的模型；切了会自动起新 agent"
+                          !nextPhase
+                            ? `通过 ${PHASE_LABEL[cur]}、整个 workflow 结束`
+                            : showFork
+                              ? `通过 ${PHASE_LABEL[cur]}、起新 agent 跑 ${PHASE_LABEL[nextPhase]}（+1 配额）`
+                              : `通过 ${PHASE_LABEL[cur]}、同 agent 续跑 ${PHASE_LABEL[nextPhase]}（不计费）`
                         }
                       >
-                        <SelectValue
-                          placeholder={
-                            !defaultModelId
-                              ? "未配模型"
-                              : ackModels.length === 0
-                                ? "拉取中..."
-                                : "选模型"
-                          }
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {ackModels.map((m) => (
-                          <SelectItem key={m.id} value={m.id}>
-                            <span className="flex flex-col">
-                              <span className="text-xs">{m.displayName}</span>
-                              <span className="font-mono text-[10px] text-muted-foreground">
-                                {m.id}
-                              </span>
-                            </span>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {/* 换 agent toggle：跟其他按钮同 size、selected 时 secondary 突出 */}
-                    <Button
-                      variant={showFork ? "secondary" : "outline"}
-                      size="sm"
-                      onClick={() => !modelChanged && setForkAgent(!forkAgent)}
-                      disabled={modelChanged || ackSubmitting}
-                      title={
-                        modelChanged
-                          ? "切了模型必须起新 agent（不可关）"
-                          : showFork
-                            ? "已勾选：通过时起新 Agent.create run、+1 send 配额"
-                            : "默认：同 agent 续跑、不计费"
-                      }
-                    >
-                      <UserPlus />
-                      换 agent
-                    </Button>
-                    {/* 补意见（倒数第二） */}
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setReviseOpen(true)}
-                      disabled={ackSubmitting}
-                      title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
-                    >
-                      <MessageCircleQuestion />
-                      补意见
-                    </Button>
-                    {/* 通过 PHASE（最后） */}
-                    <Button
-                      variant="default"
-                      size="sm"
-                      onClick={handleApprove}
-                      disabled={ackSubmitting}
-                      title={
-                        showFork
-                          ? `通过 ${PHASE_LABEL[cur]}、起新 agent 跑下一 phase（+1 配额）`
-                          : `通过 ${PHASE_LABEL[cur]}、同 agent 续跑下一 phase（不计费）`
-                      }
-                    >
-                      {ackSubmitting ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <CheckCircle2 />
-                      )}
-                      {showFork
-                        ? `起新 agent 并通过`
-                        : `通过 ${PHASE_LABEL[cur]}`}
-                    </Button>
-                  </>
+                        {ackSubmitting ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <CheckCircle2 />
+                        )}
+                        通过 {PHASE_LABEL[cur]}
+                      </Button>
+                    </div>
+                  </div>
                 );
               })()}
               {/* running 状态显示一个静默的 loading 状态条、不挂按钮 */}
