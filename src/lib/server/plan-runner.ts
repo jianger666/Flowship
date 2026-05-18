@@ -308,6 +308,9 @@ const buildSuperPrompt = async (
     "  - 「写完 artifact 后做个收尾 / 给用户一个 confirm 提示 / 输出 Phase X 结论」← **错、写完 artifact 的下一个 tool call 必须是 wait_for_user、中间不允许 emit 任何 assistant 文本**",
     "  - 「I will output the final assistant message summarizing Phase X results」/「final assistant message」/「summarizing Phase」/「写个 Phase X 总结回复用户」← **致命错误**——本协议唯一的 phase 结尾出口是 `wait_for_user`、不是 assistant_message。用户在看板 UI 里直接看 artifact + 点 ack 按钮、不需要你 summarize。",
     "  - **V0.5.1 实测 2 次踩过**：拿到 `[PHASE_ACK approve]` 后 emit「Phase X 已结束、看板上已通过、approve 已收到」之类总结、然后 run 退出 → 中间 phase 的 approve 不是结束信号、是「进下一 phase」信号、emit 总结 + 退出 = 整段 workflow failed",
+    "  - **V0.5.1 实测踩过**：写 artifact 初稿时用 `edit` 工具（args 含 `oldText`/`newText`） → artifact 文件不存在、edit 没法找 oldText → SDK 拒掉这次 tool 调用、模型再 retry 还用 edit → SDK 再拒 → 几次后整个 run status=error 退出 → workflow failed",
+    "    **正确做法**：写 artifact 初稿（不管是 plan / build / review 哪一个）**永远用 `write`**、args = `{ path: <绝对路径>, fileText: <完整 markdown> }`。`edit` 工具只能改已存在文件、永远不要用 `edit` 创建新文件。",
+    "    这条**在『每个 phase 完成时的标准动作』§1 已经写过、再次强调一遍**：模型 fast 模式经常跳过细节、踩这个坑——这条不照做、整段 workflow 一定 failed。",
     "  - 「curl 没拿到结果、我重试一次」← **错、连接断了就自然结束 run**、UI 会引导用户手动续接（详见下面「异常断开处理」）",
     "  - 「再调一次 wait_for_user 试试」← **错、同 phase 内 wait_for_user 只调 1 次**、shell 拿不到结果时也不要重复调",
     "  - 「调 shell 之前先发段 assistant_message 解释要等用户」← **错、shell + curl 对用户透明、不允许 emit 任何前置文本块**",
@@ -428,7 +431,10 @@ const buildSuperPrompt = async (
     "",
     "## 每个 phase 完成时的标准动作（背下来、必须按这个顺序）",
     "",
-    "1. 用 `write` 工具把 artifact 写到对应绝对路径（见下面 artifact 表）、args `{ path: <绝对路径>, fileText: <完整 markdown> }`",
+    "1. ⚠️ **用 `write` 工具**把 artifact 写到对应绝对路径（见下面 artifact 表）、args `{ path: <绝对路径>, fileText: <完整 markdown> }`",
+    "   - **绝对不要用 `edit`**——artifact 文件还不存在、`edit` 没法找 oldText、SDK 会拒、run 直接 error 退出",
+    "   - **V0.5.1 实测踩过**：composer-2 fast 模式喜欢用 `edit` 写新文件 → SDK 拒 → run status=error → workflow failed",
+    "   - 工具名就叫 `write`、不是 `write_file` / 不是 `edit` / 不是 `create_file`、SDK 1.0.13 内置工具清单上面已经列过",
     "2. **沉默地** 调用一次 `wait_for_user(task_id, phase, artifact)`（不要 assistant_message 解释）",
     "3. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令",
     "4. shell stdout 返回时按内容走分支（见上「关键规则 3」）",
@@ -1301,7 +1307,8 @@ const handlePlanSdkMessage = async (
       // write / edit 调用时如果路径形如 artifacts/01-plan.md、把 artifact 内容也推一份给 SSE
       // 不严格依赖工具名（SDK 1.0.13 是 `write` / `edit`、不带 _file 后缀）
       // 通过 args.target_file 模式识别（agent 跑约定的路径时才推）
-      if (msg.status === "running") {
+      // V0.5.1 修：之前直接 break 把 edit / write 失败事件吞了、改成 running 推 tool_call、error 推 error
+      {
         const possibleTarget =
           (argsAny.target_file as string | undefined) ??
           (argsAny.file_path as string | undefined) ??
@@ -1311,17 +1318,47 @@ const handlePlanSdkMessage = async (
           typeof possibleTarget === "string" &&
           possibleTarget.includes("artifacts/")
         ) {
-          // artifact 写入由 agent 自己负责（agent 用 SDK 工具写到 task workdir）
-          // 这里只记一条事件、不重复写文件
-          const argsStr = stringifyMeta(msg.args);
-          await writeEventAndPublish(taskId, {
-            kind: "tool_call",
-            text: `agent 在写 artifact: ${possibleTarget}`,
-            meta: {
-              name: msg.name,
-              args: argsStr ? truncate(argsStr) : undefined,
-            },
-          });
+          if (msg.status === "running") {
+            const argsStr = stringifyMeta(msg.args);
+            await writeEventAndPublish(taskId, {
+              kind: "tool_call",
+              text: `agent 在写 artifact: ${possibleTarget}`,
+              meta: {
+                name: msg.name,
+                args: argsStr ? truncate(argsStr) : undefined,
+              },
+            });
+            // V0.5.1 兜底：检测 agent 用 `edit` 工具写不存在的 artifact
+            // 这是 fast 模型常见 anti-pattern、给用户一条 warning 解释原因
+            if (msg.name === "edit" || msg.name === "Edit") {
+              try {
+                const stat = await fs.stat(possibleTarget);
+                if (!stat.isFile()) throw new Error("not a file");
+              } catch {
+                await writeEventAndPublish(taskId, {
+                  kind: "error",
+                  text:
+                    `⚠️ agent 在用 edit 工具创建不存在的 artifact 文件 (${possibleTarget})、` +
+                    `SDK 会拒掉这次调用。正确做法：写 artifact 初稿用 write 工具、不是 edit。` +
+                    `（这是 V0.5.1 已知 anti-pattern、可能导致 run failed）`,
+                });
+              }
+            }
+            break;
+          }
+          if (msg.status === "error") {
+            const resStr = stringifyMeta(msg.result);
+            await writeEventAndPublish(taskId, {
+              kind: "error",
+              text: `artifact 写入失败 ${msg.name} → ${possibleTarget}：${truncate(resStr, 200)}`,
+              meta: {
+                name: msg.name,
+                target: possibleTarget,
+                result: truncate(resStr),
+              },
+            });
+            break;
+          }
           break;
         }
       }
