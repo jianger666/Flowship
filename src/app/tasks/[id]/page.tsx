@@ -31,14 +31,11 @@ import {
   Loader2,
   MessageCircleQuestion,
   Sparkles,
+  UserPlus,
   Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 
-import {
-  ApprovePhaseDialog,
-  ApprovePhaseDialogTrigger,
-} from "@/components/tasks/approve-phase-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatView } from "@/components/tasks/chat-view";
@@ -48,6 +45,7 @@ import { PhaseProgress } from "@/components/tasks/phase-progress";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
   DialogContent,
@@ -56,8 +54,16 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LoadingState } from "@/components/ui/loading-state";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
+import { useModels } from "@/hooks/use-models";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { getSettings } from "@/lib/local-store";
 import { prepareRunArgs } from "@/lib/run-args";
@@ -87,13 +93,19 @@ const TaskDetailPage = () => {
   const [reviseOpen, setReviseOpen] = useState(false);
   // 跟 AI 的留言草稿
   const [reviseDraft, setReviseDraft] = useState("");
-  // 「通过 / 跟 AI 聊」按钮提交锁、防连点
+  // 「通过 / 补意见」按钮提交锁、防连点
   const [ackSubmitting, setAckSubmitting] = useState(false);
-  // V0.5：phase ack 高级选项 dialog 开关（点齿轮图标打开、配 fork agent / 切模型）
-  const [approveDialogOpen, setApproveDialogOpen] = useState(false);
   // 流式打字态（assistant chunk 累加、收到正式 assistant_message 事件清空）
   // plan 模式跟 chat 一样需要、SDK 的 assistant_delta 也走这条
   const [streamingText, setStreamingText] = useState("");
+
+  // V0.5：phase ack 时下一 phase 用的模型 id；默认 = settings.defaultModel.id
+  // 用户在 ack 行内 Select 切换；切了 → 隐含 forkAgent（旧 agent 已经在用旧 model、不可热切）
+  const [pickedModelId, setPickedModelId] = useState<string>("");
+  // V0.5：用户显式勾的「换新 agent」状态；切了 model 时强制 true 且 disable 关闭
+  const [forkAgent, setForkAgent] = useState(false);
+  // 拉模型列表（apiKey 有时拉、用于 ack 行内 selector）
+  const { models: ackModels, fetchModels: fetchAckModels } = useModels();
 
   // ---- 拉一次任务详情 ----
   const refresh = useCallback(async () => {
@@ -130,6 +142,19 @@ const TaskDetailPage = () => {
   useEffect(() => {
     setStreamingText("");
   }, [task?.id]);
+
+  // V0.5：模型列表 + pickedModelId 初始化
+  // page 挂载 + 切换任务时：拉一次模型列表、把 pickedModelId 重置回 settings.defaultModel.id
+  // 拉不到（无 apiKey）= ack 行内 selector 显灰、用户得去设置页配
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const s = getSettings();
+    setPickedModelId(s.defaultModel?.id ?? "");
+    setForkAgent(false);
+    if (s.apiKey?.trim()) {
+      void fetchAckModels(s.apiKey);
+    }
+  }, [task?.id, fetchAckModels]);
 
   useTaskWatch(
     task?.id,
@@ -252,37 +277,38 @@ const TaskDetailPage = () => {
   };
 
   // ---- Phase ack：通过 ----
+  // V0.5 起：合并 fork / non-fork、根据 ack 行内 state 自动判断
+  // - 没切模型 + 没勾换 agent → 普通 approve（同 agent 续跑、不计费）
+  // - 切了模型 或 勾了换 agent → fork approve（cancel 旧 run、起新 Agent.create、+1 配额）
   const handleApprove = async () => {
-    setAckSubmitting(true);
-    try {
-      const updated = await submitPhaseAck(task.id, "approve", undefined, cur);
-      setTask(updated);
-      toast.success(`${PHASE_LABEL[cur]} 已通过、agent 正在进入下一 phase`);
-    } catch (err) {
-      toast.error(`通过失败：${(err as Error).message}`);
-    } finally {
-      setAckSubmitting(false);
-    }
-  };
+    const settings = typeof window !== "undefined" ? getSettings() : null;
+    const defaultModel = settings?.defaultModel ?? null;
 
-  // ---- V0.5 Phase ack：起新 agent 并通过（用户在 ApprovePhaseDialog 里点确认）----
-  // 跟普通 approve 区别：透传 forkAgent + nextModel + bootArgs（apiKey + mcpServers）
-  // 失败 toast 后 dialog 不关、让用户可以重试 / 改选项
-  const handleApproveWithFork = async (opts: {
-    forkAgent: boolean;
-    nextModel: { id: string; params?: Array<{ id: string; value: string }> };
-  }) => {
-    // forkAgent=false 时走普通 approve、不需要 bootArgs
-    if (!opts.forkAgent) {
-      setApproveDialogOpen(false);
-      await handleApprove();
-      return;
-    }
+    // 模型变更检测：pickedModelId 跟 defaultModel.id 比、空字符串当作没切
+    const modelChanged =
+      !!defaultModel &&
+      !!pickedModelId &&
+      pickedModelId !== defaultModel.id;
+    const wantsFork = forkAgent || modelChanged;
+
     setAckSubmitting(true);
     try {
-      // 准备 fork 用的 bootArgs（apiKey + mcpServers、按任务级 disable 过滤）
-      const settings = getSettings();
-      if (!settings.apiKey?.trim()) {
+      if (!wantsFork) {
+        const updated = await submitPhaseAck(
+          task.id,
+          "approve",
+          undefined,
+          cur,
+        );
+        setTask(updated);
+        toast.success(
+          `${PHASE_LABEL[cur]} 已通过、agent 正在进入下一 phase`,
+        );
+        return;
+      }
+
+      // ---- fork 分支：需要 apiKey + mcpServers + nextModel ----
+      if (!settings?.apiKey?.trim()) {
         toast.error("缺少 API Key、请先在设置页填好");
         return;
       }
@@ -295,13 +321,20 @@ const TaskDetailPage = () => {
       }
       mcpServers = filterMcpServersByTask(mcpServers, task.disabledMcpServers);
 
+      // 切了 model 时构造新 ModelSelection、保留 default params（用户没编辑 variant）
+      // 没切：用 default
+      const nextModel = modelChanged
+        ? { id: pickedModelId, params: defaultModel?.params }
+        : (defaultModel ?? { id: pickedModelId });
+
       const updated = await submitPhaseAck(task.id, "approve", undefined, cur, {
         forkAgent: true,
-        nextModel: opts.nextModel,
+        nextModel,
         bootArgs: { apiKey: settings.apiKey, mcpServers },
       });
       setTask(updated);
-      setApproveDialogOpen(false);
+      // ack 行内 state 复位（下一 phase 从 default 重新开始）
+      setForkAgent(false);
       toast.success(
         `${PHASE_LABEL[cur]} 已通过、新 agent 已启动接管下一 phase`,
       );
@@ -420,39 +453,122 @@ const TaskDetailPage = () => {
                   {startLabel}
                 </Button>
               )}
-              {canAck && (
-                <>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={handleApprove}
-                    disabled={ackSubmitting}
-                    title={`通过 ${PHASE_LABEL[cur]} 的产物、推进到下一 phase（同 agent 续跑、不计费）`}
-                  >
-                    {ackSubmitting ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <CheckCircle2 />
-                    )}
-                    通过 {PHASE_LABEL[cur]}
-                  </Button>
-                  {/* V0.5：高级选项入口、用户点开 dialog 切模型 / 起新 agent */}
-                  <ApprovePhaseDialogTrigger
-                    onOpen={() => setApproveDialogOpen(true)}
-                    disabled={ackSubmitting}
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setReviseOpen(true)}
-                    disabled={ackSubmitting}
-                    title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
-                  >
-                    <MessageCircleQuestion />
-                    补意见
-                  </Button>
-                </>
-              )}
+              {canAck && (() => {
+                // V0.5：ack 行内的模型 selector + 换 agent toggle
+                // defaultModel / apiKey 只在 client 侧能拿、用 typeof window 兜底
+                // pickedModelId !== defaultModel.id → 隐含 fork
+                const settings =
+                  typeof window !== "undefined" ? getSettings() : null;
+                const defaultModelId = settings?.defaultModel?.id ?? "";
+                const apiKey = settings?.apiKey ?? "";
+                const modelChanged =
+                  !!defaultModelId &&
+                  !!pickedModelId &&
+                  pickedModelId !== defaultModelId;
+                const showFork = forkAgent || modelChanged;
+                // selector disabled：没默认模型 / 没 apiKey / 还没拉到列表
+                const selectorDisabled =
+                  !defaultModelId ||
+                  !apiKey.trim() ||
+                  ackModels.length === 0 ||
+                  ackSubmitting;
+                return (
+                  <>
+                    {/* 模型选择器：默认显示 settings.defaultModel、可切到列表里其他模型 */}
+                    <Select
+                      value={pickedModelId || undefined}
+                      onValueChange={(v) => v && setPickedModelId(v)}
+                      disabled={selectorDisabled}
+                    >
+                      <SelectTrigger
+                        size="sm"
+                        className="h-8 w-[150px] text-xs"
+                        title={
+                          !defaultModelId
+                            ? "请先在设置页选默认模型"
+                            : !apiKey.trim()
+                              ? "请先在设置页填 API Key"
+                              : ackModels.length === 0
+                                ? "正在拉模型列表..."
+                                : "下一 phase 用的模型；切了会自动起新 agent"
+                        }
+                      >
+                        <SelectValue
+                          placeholder={
+                            !defaultModelId
+                              ? "未配模型"
+                              : ackModels.length === 0
+                                ? "拉取中..."
+                                : "选模型"
+                          }
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {ackModels.map((m) => (
+                          <SelectItem key={m.id} value={m.id}>
+                            <span className="flex flex-col">
+                              <span className="text-xs">{m.displayName}</span>
+                              <span className="font-mono text-[10px] text-muted-foreground">
+                                {m.id}
+                              </span>
+                            </span>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {/* 换 agent toggle（chip）：切了模型时隐含 true 且 disable */}
+                    <ChoiceButton
+                      shape="chip"
+                      selected={showFork}
+                      onClick={() => !modelChanged && setForkAgent(!forkAgent)}
+                      disabled={modelChanged || ackSubmitting}
+                      title={
+                        modelChanged
+                          ? "切了模型必须起新 agent（不可关）"
+                          : showFork
+                            ? "勾选：通过时起新 Agent.create run、+1 send 配额"
+                            : "默认：同 agent 续跑、不计费"
+                      }
+                      className="inline-flex items-center gap-1"
+                    >
+                      <UserPlus className="size-3" />
+                      换 agent{modelChanged ? "（必）" : ""}
+                    </ChoiceButton>
+                    {/* 补意见（倒数第二） */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setReviseOpen(true)}
+                      disabled={ackSubmitting}
+                      title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
+                    >
+                      <MessageCircleQuestion />
+                      补意见
+                    </Button>
+                    {/* 通过 PHASE（最后） */}
+                    <Button
+                      variant="default"
+                      size="sm"
+                      onClick={handleApprove}
+                      disabled={ackSubmitting}
+                      title={
+                        showFork
+                          ? `通过 ${PHASE_LABEL[cur]}、起新 agent 跑下一 phase（+1 配额）`
+                          : `通过 ${PHASE_LABEL[cur]}、同 agent 续跑下一 phase（不计费）`
+                      }
+                    >
+                      {ackSubmitting ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <CheckCircle2 />
+                      )}
+                      {showFork
+                        ? `起新 agent 并通过`
+                        : `通过 ${PHASE_LABEL[cur]}`}
+                    </Button>
+                  </>
+                );
+              })()}
               {/* running 状态显示一个静默的 loading 状态条、不挂按钮 */}
               {task.status === "running" && !canStart && !canAck && (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -522,22 +638,8 @@ const TaskDetailPage = () => {
       {/* AskUserDialog：agent 调 ask_user 时弹窗、统一渲染（chat + plan 两个模式都用、用户拍板） */}
       <AskUserDialog task={task} />
 
-      {/* V0.5：phase ack 高级选项 dialog（点齿轮图标打开、配 fork agent / 切模型） */}
-      <ApprovePhaseDialog
-        open={approveDialogOpen}
-        onOpenChange={setApproveDialogOpen}
-        phaseId={cur}
-        defaultModel={(() => {
-          // 读 settings.defaultModel、没拿到时传 null（dialog 显示「请先在设置页选好模型」）
-          // 这里 useState 化代价不大、每次 dialog open 时 useEffect 已经重置 pickedModelId
-          if (typeof window === "undefined") return null;
-          const s = getSettings();
-          return s.defaultModel?.id ? s.defaultModel : null;
-        })()}
-        apiKey={typeof window !== "undefined" ? getSettings().apiKey : ""}
-        onSubmit={handleApproveWithFork}
-        submitting={ackSubmitting}
-      />
+      {/* V0.5：phase ack 行内 selector + chip 已经把「切模型 / 换新 agent」外置了、
+          原来的 ApprovePhaseDialog 不再挂载（文件保留作为后续扩展点、目前无引用）。 */}
 
       {/* 补意见 Dialog（plan 模式专用、用户对当前 phase 产物有疑问 / 想补充澄清时打开） */}
       <Dialog open={reviseOpen} onOpenChange={setReviseOpen}>
