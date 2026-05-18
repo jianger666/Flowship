@@ -12,7 +12,7 @@
 |---|---|---|
 | 基础设施（设置页 / shadcn / Tailwind 4 / SDK 验证） | ✅ 完成 | clean slate 重做 |
 | 任务列表 + 详情 + 双模式 UI 路由 | ✅ 完成 | 主页卡片列表 / `tasks/[id]` 按 mode 分两套 UI |
-| **Plan workflow（V0.3.4 起 = 2 phase chain、单 SDK Run）** | ✅ 完成 | `plan-runner.ts` + 2 个 phase prompt 模板（plan / build） |
+| **Plan workflow（V0.5 起 = 3 phase chain、单 SDK Run）** | ✅ 完成 | `plan-runner.ts` + 3 个 phase prompt 模板（plan / build / review）、V0.5 起加 fork 模式（ack 时换新 agent） |
 | **Chat 模式（wait_for_user MCP）** | ✅ 完成 | `chat-runner.ts` + `chat-mcp.ts` + `watch-chat` |
 | **ContextDocsPanel（任务级上下文文档面板）** | ✅ V0.3 完成 | `context-docs-panel.tsx`（V0.3.4 起 plan 自己读、不用 phase 重划） |
 | **ask_user 弹窗 modal**（一次打包 + ABCD）| ✅ V0.3.2 完成、V0.3.3 微调 | `ask-user-dialog.tsx`（Other 选中保留其它 option、textarea 移下方） |
@@ -29,6 +29,8 @@
 | Plan + Build 端到端跑通 | 🚧 待用户 demo | 用户最近已能跑通 plan、build phase 也能写 artifact、但 wait-ack 长连接 / 代理稳定性还是隐患 |
 | 自动 retry on ConnectError | 🔲 不做 | 用户决定：靠手动「继续监听」、避免 agent 反复踩坑 |
 | **review phase（V0.5 代码已落地）** | 🚧 待联测 | 4 类差异 + plan 校验前移 + 模型 / agent 自由切换、详见 HANDOFF V0.5 段 |
+| **V0.5.1 prompt / UI 打磨**（联测中边走边修）| 🚧 持续打磨 | SDK 工具名修正 / revise 永远 ask_user / resume artifact 真实性 / artifact-writer skill / ack dialog 回归 / 任务级模型字段、详见 HANDOFF V0.5.1 段 |
+| **「问 AI」答疑入口**（用户提出、未动手）| 🔲 待启动 | 「补意见」会改 artifact、「通过」直接推进、缺一个「只问不改」path、用户拍板方向 A、待实施 |
 | Cancel chat（保留任务、停 agent） | 🔲 未启动 | 当前只能"删任务" |
 | 飞书 / swagger 自动拉 | 🔲 未启动 | V0.6 启动、用户已配飞书 MCP |
 | cost / token dashboard | 🔲 未启动 | V0.7 启动 |
@@ -181,6 +183,28 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 - 跑 1-2 个真任务、走完 plan → build → review 三 phase（含 plan ack / build ack / review ack 三次 HITL）
 - 测 fork：在 build ack 时切换模型 / 勾「换新 agent」、确认旧 agent 干净退出 + 新 agent 接管 review
 - 调差异分类：跑出 03-review.md 后看 4 类差异的实际效果、按用户反馈调 prompt
+
+---
+
+## V0.5.1 / W5.1：联测中的 prompt / UI 打磨（2026-05-17 ~ 2026-05-18、持续）
+
+**目标**：用户开始走真任务联测 V0.5、把发现的所有 prompt 边缘 case / UI 不顺 / SDK 工具名错配吃掉、不开新功能口子。详细修复清单 + 全 commit 列表见 `docs/HANDOFF.md` V0.5.1 段、本节只列重点。
+
+**已落地**：
+
+- ✅ **SDK 1.0.13 工具名全量修正**：`read_file` → `read`、`edit_file`/`write_file` → `edit`/`write`、`prompts/*` + `plan-runner.ts` + `chat-runner.ts` + `skills/*` + UI + docs 全清
+- ✅ **revise feedback 永远先 ask_user 复述**：用户点「补意见」后 agent 不再闷头改、永远先调 `ask_user` 跟用户复述理解 + 改动计划（不再做 feedback 质量判断分支）
+- ✅ **resume-waiting artifact 真实性检查**：`fs.stat` 读 artifact 大小、空 / 不存在 → `[RESUME_INCOMPLETE]`、有内容 → `[RESUME_WAITING]`、防 agent 撒谎说「已产出」
+- ✅ **agent 中间 phase 提前退 run 修复**：prompt 加强约束 + 阶段转换 banner、ack approve 后必须进下一 phase
+- ✅ **`artifact-writer` skill 渐进式披露**：prompt 不再反复教「`write` vs `edit`」、改成「写前先 read 这个 skill」、prompt 短了一大截、agent 第一次写之前自行查阅
+- ✅ **ack UI 回到 dialog**（三次来回后用户拍板）：「通过 PHASE」按钮直接打开 `ApprovePhaseDialog`、内含模型 selector + fork toggle、行内布局撤回（先把所有逻辑走通、再回来优化交互）
+- ✅ **任务级模型字段 `Task.model`**：新建任务表单加 selector、默认 `settings.defaultModel`、可为本任务挑别的、`prepareRunArgs` 优先 task.model 启动 agent
+- ✅ **弹窗文案统一极简化**：所有 `DialogDescription` 解释性文案删掉、字段帮助文案缩到一句话、「跟 AI 再聊聊」按钮文案缩为「补意见」
+
+**待联测 / 待启动**：
+
+- 🚧 **真任务联测**：跑 1-2 个真飞书 story、走完 plan → build → review 全链路、验证 V0.5 + V0.5.1 所有打磨
+- 🔲 **「问 AI」答疑入口**：用户在最后一轮提出、缺一个「只问不改」的 path、用户拍板方向 A（跟「补意见 / 通过」并列加按钮、新协议 `[USER_QUESTION]`、agent 收到只答疑后回到 wait_for_user）、工作量估 1.5h、详见 HANDOFF V0.5.1 §10
 
 ---
 

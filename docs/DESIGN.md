@@ -2,31 +2,41 @@
 
 > 这份文档解释**为什么这么做**——不写就忘的细节、给后续维护和扩展用。
 >
-> ⚠️ **2026-05-15 V0.4 同步**：plan 模式 phase 模型已大幅收敛、保活机制改造、引入多角色 schema + chat 自由化。新写代码前对齐到当前实际、不要被本文档下面 V0.2 时期的描述误导。
+> ⚠️ **2026-05-18 V0.5 + V0.5.1 同步**：phase 拓扑扩到 3 phase、review 落地、prompt / UI 联测中持续打磨。新写代码前对齐到当前实际、不要被本文档下面 V0.2 时期的描述误导。
 >
-> **当前 phase 模型（V0.3.4 起）**：`plan → build`（2 phase、不是早期 4 phase）
+> **当前 phase 模型（V0.5 起）**：`plan → build → review`（3 phase、不是早期 4 phase 也不是 V0.3.4 ~ V0.4 的 2 phase）
 >
 > - V0.1：plan 模式产 plan.md、用户读完后手工 build；chat 模式自由对话
 > - V0.2：升级到 4 phase（context → plan → build → ship）、单 SDK Run 跑完全程
 > - V0.3.3：砍 ship phase（提 PR + 同步飞书状态）——**注意力管理决策**、不是技术决策（一个 phase 一个 phase 做扎实、先不让 ship 影响 plan/build 调试）
-> - **V0.3.4（当前 phase 拓扑）**：context 合并进 plan（实操中分离价值未兑现、用户审 context 跟审 plan 判断点重合）→ 现在是 `plan → build`
+> - **V0.3.4**：context 合并进 plan（实操中分离价值未兑现、用户审 context 跟审 plan 判断点重合）→ 变 `plan → build`
 > - **V0.3.5（保活机制重写）**：MCP `wait_for_user` 立刻返回 shell 引导、agent 调 `shell` 工具 curl 一条长 HTTP 连接到 `/api/tasks/:id/wait-ack`、用户 ack 时 resolve → 写一行结果 → 关流 → agent 推进。**不**走 `keep_alive_a/b/c` 那套（已删）。**ask_user race fix**：60s grace 期、修了「ack 信号比工具返回还快」的丢消息问题。
 > - **V0.4（多角色 schema + chat 自由化）**：
 >   1. `Task.role: TaskRole`（当前只有 `"fe"`、未来扩 `be / data / mobile / qa`）、agent prompt 按 `{{role}}` 调整视角、同一 story 跨角色多 task 并行（详见 [MULTI-ROLE.md](./MULTI-ROLE.md)）
 >   2. chat 自由化：删 `/start-chat` 路由（启动合并到 `/chat-reply`）、表单全选填、首条消息直接 inject `chat-runner.buildInitialPrompt` 第三参数 `firstMessage`、agent 第一次 turn 就回答（不走 wait_for_user 那一圈）
 >   3. 字段统一：删 `feishuUrl` 字段、plan/chat 都用 `feishuStoryUrl`
 >   4. chat 模式也 inject `contextDocs`、`renderContextDocsSection` 抽到 `src/lib/server/context-docs-prompt.ts`、plan / chat 共用
-> - **V0.5 设计预告（代码未动）**：phase 拓扑加 `review`、变为 `plan → build → review`。review 拿 `git diff × 01-plan.md × 02-build.md × contextDocs` 做结构化差值、4 类差异分流（范围扩张 / 收缩 / 实现偏差 / 未完成）、产出含 commit msg / PR body / 飞书评论草稿。同步加 plan 校验前移（plan agent 在 artifact 里写「我的理解 vs 飞书原文」对照）、多 phase 模型选择（settings 默认模型 + 每 phase ack 时可切）、可选「换新 agent」（默认不强制、用户决定）。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5 设计预告」段（含完整 artifact 模板）。
+> - **V0.5（review phase 落地、2026-05-18）**：phase 拓扑加 `review`、变为 `plan → build → review`。review 拿 `git diff × 01-plan.md × 02-build.md × contextDocs` 做结构化差值、4 类差异分流（范围扩张 / 收缩 / 实现偏差 / 未完成）、产出含 commit msg / PR body / 飞书评论草稿。同步加 plan 校验前移（plan agent 在 artifact 里写「我的理解 vs 飞书原文」对照）、多 phase 模型选择（settings 默认模型 + 每 phase ack 时可切）、可选「换新 agent」fork（默认不强制、用户决定）。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5」段。
+> - **V0.5.1（联测打磨、2026-05-17 ~ 2026-05-18 持续）**：联测 V0.5 时发现 + 修复的一堆边缘 case：
+>   1. SDK 1.0.13 工具名全量修正（`read_file` → `read` / `edit_file` → `edit` / `write_file` → `write`、影响所有 prompt / skill / UI / docs）
+>   2. revise feedback 永远先 ask_user 复述（用户拍板：不分支、永远弹、不做 feedback 质量判断）
+>   3. resume-waiting 真实性检查（`fs.stat` artifact 大小、防 agent 撒谎说「已产出」）
+>   4. agent 中间 phase 提前退 run 修复（prompt 加强约束）
+>   5. `artifact-writer` skill 渐进式披露（不再 prompt 反复教 `write` vs `edit`、改成 skill 自查）
+>   6. ack UI 回到 dialog（行内 / 两行 / 回归 dialog 三次来回后用户拍板：先走通逻辑、再优化交互）
+>   7. 任务级模型字段 `Task.model`（新建任务表单加 selector、`prepareRunArgs` 优先 task.model）
+>   8. 弹窗文案统一极简化、「跟 AI 再聊聊」按钮缩为「补意见」
+>   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.1」段（含全 commit 清单 + 用户拍板理由）。
 >
 > **本文档下游各节的有效性**：
 >
 > - 第 1 节「为什么用 Cursor SDK」——依然有效
-> - 第 2 节「单 agent vs 每 phase 独立 agent」——依然有效、当前 plan/chat 都走单 agent 长 Run
-> - 第 6 节「Prompt 文件化」——**节内描述还是 4 phase**、当前是 2 phase（plan + build）、文件名见 `prompts/phase-{1,2}-*.md`
+> - 第 2 节「单 agent vs 每 phase 独立 agent」——依然有效、当前 plan/chat 都走单 agent 长 Run、V0.5 起 ack 时可手动 fork 起新 agent
+> - 第 6 节「Prompt 文件化」——**节内描述还是 4 phase**、当前是 3 phase（plan + build + review）、文件名见 `prompts/phase-{1,2,3}-*.md`
 > - 第 14 / 15 节是 V1 三步流程（spec → plan → build）的设计推导、**保留作历史参考**
 > - 第 16 节「Chat 模式架构」——基本有效、但 keep-alive 机制已改成 V0.3.5 shell + curl long-poll
-> - 第 17 节「V0.2 Workflow 架构」——**节标题写 4 phase、实际当前 2 phase**、其余原则有效
-> - 详见 `HANDOFF.md` 「V0.3.4 / V0.3.5 演进」段（最新）
+> - 第 17 节「V0.2 Workflow 架构」——**节标题写 4 phase、实际当前 3 phase**、其余原则有效
+> - 详见 `HANDOFF.md` 「V0.5 / V0.5.1 演进」段（最新）
 
 ---
 

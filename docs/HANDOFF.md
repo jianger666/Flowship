@@ -191,7 +191,7 @@
 
 ### V0.5：review phase + 多 phase 模型选择 + plan 校验前移
 
-> **状态：代码已落地（2026-05-18）、待用户三 phase 联测**。用户拍板「先按 A 来进行、写完三 phase 一起测」、本段记录设计 + 落地结果。
+> **状态：代码已落地（2026-05-18）、V0.5.1 持续打磨中**（详见下面 V0.5.1 段）。用户拍板「先按 A 来进行、写完三 phase 一起测」、本段记录设计 + 落地结果。
 
 #### 动机
 
@@ -399,8 +399,148 @@ feat(users): 加用户列表批量导出
 
 > ⚠️ 这是设计稿、prompt 拿这个当 schema、不要原样让 agent 复制。实际产出 agent 会按真实改动填、4 类差异里有 0 项时整段省略。
 
+---
 
-| 想找 | 看这里 |
+### V0.5.1：联测中的 prompt / UI 打磨（2026-05-17 ~ 2026-05-18、持续）
+
+> 用户开始走真任务联测、发现一堆 prompt 边缘 case、UI 交互不顺、SDK 工具名错配。本段记录所有 V0.5.1 的修复与决策、给后续 AI 接力用。
+
+#### 1. SDK 1.0.13 工具名修正（影响所有 prompt + skill）
+
+SDK 1.0.13 工具名是 **`read` / `edit` / `write` / `delete` / `shell` / `grep` / `glob` / `task`**——**不是** `read_file` / `edit_file` / `write_file`。早期 prompt 里大量带 `_file` 后缀的写法导致 agent 调失败 / SDK 拒掉、看起来像 agent 在 hallucinate 工具名、实际是我们 prompt 教错了。
+
+- 全量修：`prompts/phase-1-plan.md` / `prompts/phase-2-build.md` / `prompts/phase-3-review.md` / `src/lib/server/plan-runner.ts` / `src/lib/server/chat-runner.ts` / `skills/*/SKILL.md` / UI 文案 / 代码注释 / `docs/DESIGN.md` 全清
+- 关键 commit：`b85cfe5`（prompts 主修）+ `fd2ff12`（代码注释 / UI / docs 清扫）
+
+#### 2. revise feedback 不闷头改、永远先 ask_user 复述（D 方案最终态）
+
+**坑**：用户点「补意见」（旧文案「跟 AI 再聊聊」）只随便打了 `111` 或一句模糊话、agent 直接修改 artifact。
+**根因**：旧 prompt 教 agent「拿到 `[PHASE_ACK revise] + feedback` 就改 artifact」、agent 不验证理解就动手、用户根本来不及确认。
+
+**最终方案（用户拍板：不分支、永远弹）**：
+
+- 拿到 `[PHASE_ACK revise] + feedback` 后、**无论 feedback 多清晰、永远先调一次 `ask_user`** 跟用户复述自己的理解 + 改动计划。问题文案动态生成（feedback 清晰 vs 模糊 vs 极短分三档文案）
+- 这次 `ask_user` 调用 **不计入「写 artifact 初稿阶段最多 1 次 ask_user」限额**（这俩限制此前打架、agent 优先后者直接动 artifact、所以必须分开计）
+- agent 在 `tool_call` 触发的 `assistant_message` 里**严禁泄露协议名**（`[PHASE_ACK revise]` / 「反馈过短」/ 「无具体改进意图」这类公文措辞）、必须自然口吻直接跟用户对话
+
+走过的弯路（按时间顺序）：
+- `45d9030`：先做 4 步条件 D 方案（feedback 清晰 → 直接改 / 模糊 → ask_user）→ 用户立刻反馈「我打 `111` 也照样改、不要让 agent 判断质量」
+- `b281bb3`：修「ask_user 限额冲突」+「协议泄露」两个坑、但还是有条件分支
+- `8a5298e`：彻底拆掉分支、改成「永远先弹」最终态
+
+#### 3. resume-waiting 别撒谎说「artifact 已产出」
+
+**坑**：用户 SSE 断线 → 点「继续监听」、agent resume 后说「方案已完成」、但 `artifacts/01-plan.md` 根本没写完（断线时 agent 还在调 `ask_user`）。
+**修复**：`src/app/api/tasks/[id]/resume-waiting/route.ts` 用 `fs.stat` 真实读 artifact 文件大小、空 / 不存在 → 拼 `[RESUME_INCOMPLETE]` 给 agent（明示「artifact 没写完、接着写、写完再 wait_for_user」）；有内容 → 拼 `[RESUME_WAITING]`（提示 artifact 已就绪、继续等用户 ack）。
+关键 commit：`a37614c`。
+
+#### 4. agent 中间 phase 提前退 run
+
+**坑**：plan ack approve 后、agent 不进 build、直接 emit「workflow 已完成」退 run。
+**修复**：`buildSuperPrompt` 加多段强约束 + 阶段转换 banner、`PHASE_ACK approve` 拿到后必须 emit「进入 X phase」+ 调 phase tool、严禁 summarize 收尾。
+关键 commit：`002fae2`。
+
+#### 5. artifact-writer skill（渐进式披露、不再靠 prompt 反复教）
+
+**坑**：plan / build / review 三个 prompt 都得反复教 agent「写 artifact 用 `write` 工具、不要 `edit`」、prompt 越来越长、agent 还是踩坑。
+**用户拍板**：用 Skills（Anthropic Agent Skills 标准）做渐进式披露——prompt 里只写一句「写 artifact 前先 `read` `artifact-writer` skill」、agent 第一次写之前自己读 skill 看完整规则。
+
+- 新增：`skills/artifact-writer/SKILL.md`（含工具映射 / 路径规则 / 标准动作 / revise 写法 / 排错 / 跨 phase 复用 6 段）
+- `plan-runner.ts` super-prompt + 三个 phase prompt 都简化成「按 `artifact-writer` skill 教的方式」一句话引用
+- 关键 commit：`12b9496`
+
+**后续观察**：用 `composer-2 fast` 跑测时偶尔仍用 `edit` 创建新 artifact、起初以为 SDK 会拒、加了「edit + 文件不存在」warning。但实测 **SDK 1.0.13 的 `edit` 工具能创建不存在的文件**、warning 是误报、已删（commit `9df5a9f`）。**当前结论：`write` 是推荐、`edit` 也能用、不再硬拦**。
+
+#### 6. UI 演进：ack 区交互来回三次、最终回到 dialog
+
+ack 区怎么暴露「下一 phase 选模型」「换新 agent」、user-DX 反复磨：
+
+| 版本 | 形态 | 用户反馈 |
+|---|---|---|
+| V0.5（初版） | 「通过」主按钮 + 齿轮图标打开高级选项 dialog | 「太不显眼了、只有个 icon」 |
+| `eecbc18` | 行内化：「下一 phase 模型」selector + 「换 agent」按钮 + 「补意见」+ 「通过」并列、按钮顺序「通过」最后 | 「不太规范、按钮高度对不齐」 |
+| `ed23ea1` | 两行布局：上行 muted「下一 phase（X）: [model] [fork]」、下行「[补意见] [通过]」、语义分组 | 「按钮在当前 phase、模型针对下一 phase、很别扭」 |
+| `4a7a102`（**最终**） | 回到 dialog：「通过 PHASE」按钮直接打开 `ApprovePhaseDialog`、内含模型 selector + fork toggle、文案标题「通过 X → Y」 | 用户拍板：「先把所有逻辑走通、再回来优化交互」 |
+
+`ApprovePhaseDialog` 同步简化：删了 `DialogDescription` / 警告条 / `ApprovePhaseDialogTrigger`、标题加箭头明示「current → next phase」。
+
+#### 7. 任务级模型字段（`Task.model`、新建任务表单加 selector）
+
+**坑**：ack 回到 dialog 后、plan 阶段（第一个 phase）启动前没有 ack 入口、就没法挑模型——只能用 settings 默认。
+**修复**：新建任务表单加「模型」字段、默认值 = `settings.defaultModel`、用户可为本任务单独挑别的。
+
+- `src/lib/types.ts`：`Task` / `NewTaskInput` 加 `model?: ModelSelection`
+- `src/lib/server/task-fs.ts`：`TaskMeta` 持久化 `model`、`hydrateTask` 读出来、`createTask` 写进 meta.json
+- `src/lib/run-args.ts`：`prepareRunArgs` 优先 `task.model`、空时回退 `settings.defaultModel`（老任务无该字段时自动兜底）
+- `src/components/tasks/new-task-dialog.tsx`：加 model selector、列表懒加载（已拉过不重复拉、避免每次开弹窗 toast 噪音）、切到非默认模型时下方 amber 提示
+- 关键 commit：`43d3e76`
+
+**模型选择全链路**：
+```
+新建任务表单（默认 settings.defaultModel、可改）
+  → task.model 持久化
+  → prepareRunArgs 优先取 task.model 启动 plan/build/review agent
+  → 每次 phase ack 时 ApprovePhaseDialog 可再切（切了不同 model 自动隐含 fork）
+```
+
+#### 8. 弹窗文案统一极简化
+
+用户拍板「所有弹窗的解释性文案去掉、极简就行」：
+- `task-mcp-panel.tsx` `DialogDescription`：从「改完下次启动 workflow / chat 时生效…」缩到「选本任务启用哪些 MCP」
+- `context-docs-panel.tsx` `DialogDescription` + 字段帮助文案：从「agent 在 phase 启动时会看到清单、按需拉取（URL → 飞书 / fetch；路径 → SDK `read` 工具）」缩到「agent 启动时会看到清单、按需读取」
+- 「跟 AI 再聊聊」按钮文案缩为「补意见」（commit `dfab2b2`）
+
+关键 commit：`8759836`（弹窗）+ `dfab2b2`（按钮）。
+
+#### 9. V0.5.1 commit 全景
+
+按时间倒序（看 `git log` 也行）：
+
+```
+43d3e76 feat(new-task): 新建任务表单加模型选择
+4a7a102 revert(ui): ack 回到 dialog 弹窗（用户拍板：先走通再优化）
+9df5a9f fix(observability): 删 edit+不存在文件的 warning 误报
+ed23ea1 feat(ui): ack 区分两行布局
+0325021 chore(ui): 换 agent toggle 改用 Button + secondary 状态
+eecbc18 feat(ui): phase ack 行内化、模型 selector 外置
+12b9496 feat(skill): 加 artifact-writer skill、用渐进式披露替代 prompt 反复教
+3f0a9f1 fix(prompts+observability): edit 写新 artifact 第三轮压制
+8759836 chore(ui): 弹窗解释性文案统一精简
+dfab2b2 chore(ui): 「跟 AI 再聊聊」按钮文案缩短为「补意见」
+8a5298e fix(prompts): revise feedback 永远弹 ask_user、不再分支判断
+b281bb3 fix(prompts): revise 复述确认两处坑：限额冲突 + 协议泄露
+45d9030 fix(prompts): revise feedback 闷头改修复（D 方案：先复述 + ask_user 确认）
+a37614c fix(resume): 检查 artifact 实际存在性
+002fae2 fix(prompts): 防止 agent 在中间 phase approve 后退 run
+fd2ff12 chore: 跟随工具名修正、清理代码注释 / UI 文案 / DESIGN.md
+b85cfe5 fix(prompts): SDK 1.0.13 工具名修正 edit_file → write / read_file → read
+```
+
+#### 10. V0.5.1 待办（接力 AI 该接的）
+
+**用户已经提出、没动的功能需求**：
+
+1. **「问 AI」入口**（用户在最后一轮提出、未动手）：
+   - 场景：用户对仓库代码 / 当前 plan / build 产出有疑问、希望 agent 答疑而不动 artifact
+   - 当前 UI 没这个 path：「通过」直接推进、「补意见」会改 artifact、没有「只问不改」
+   - 用户倾向方向 **A**：跟「补意见 / 通过」并列加个「问 AI」按钮、新协议 `[USER_QUESTION]`、agent 收到只答疑后回到 `wait_for_user`、不动 artifact
+   - 工作量估算：UI ~30min + API/协议 ~30min + prompt ~30min ≈ 1.5h
+   - 实施路径：复用 `wait_for_user` 长连接通道（pendingMap）传 `[USER_QUESTION]` payload、`plan-runner` prompt 加新协议分支「只答不动」、`task-store.ts` 加 `submitUserQuestion`、UI 加按钮 + textarea dialog
+
+2. **真任务联测**（用户多次提到、还没完整跑通一遍）：
+   - 跑 1-2 个真飞书 story、走完 plan → build → review 三 phase
+   - 测 fork：build ack 时切模型、确认旧 agent 干净退出、新 agent 接管 review
+   - 测 03-review.md 4 类差异分流的实际效果、按反馈调 review prompt
+   - 测新建任务模型字段：选非默认模型 → 跑 plan → 看 SDK Run 用的是不是该模型
+
+**已知 / 容忍的小坑**：
+
+- `composer-2 fast` 偶尔用 `edit` 创建新 artifact（不是 hard fail、SDK 能处理、warning 已删）
+- dev hot reload 杀任务（已知、改 watch 范围内文件就触发、长任务建议 `pnpm build && pnpm start:prod`）
+- 代理偶发 ECONNRESET（已知、走科学上网 fake-ip 模式节点抽风、靠手动「继续监听」恢复）
+
+---
+
 |---|---|
 | Plan workflow 整体逻辑 + super-prompt | `src/lib/server/plan-runner.ts` |
 | Chat workflow 整体逻辑 + V0.4 firstMessage 注入 | `src/lib/server/chat-runner.ts` |
