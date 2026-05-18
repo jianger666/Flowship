@@ -256,8 +256,14 @@ const buildSuperPrompt = async (
     "## Phase 列表（按序执行）",
     "",
     workflowDef.phases
-      .map((p, i) => `  ${i + 1}. \`${p}\``)
+      .map((p, i, arr) => {
+        const next = i + 1 < arr.length ? arr[i + 1] : "（终点、自然结束 run）";
+        const tag = i + 1 < arr.length ? `→ approve 后进 \`${next}\`` : `→ approve 后**结束 run**`;
+        return `  ${i + 1}. \`${p}\`  ${tag}`;
+      })
       .join("\n"),
+    "",
+    `> ⚠️ **中间 phase 的 approve 不是结束信号、是「进下一 phase」信号**。只有最后一个 phase（\`${workflowDef.phases[workflowDef.phases.length - 1]}\`）的 approve 才允许结束 run。`,
     "",
     "## 核心机制：wait_for_user + shell long-poll（V0.3.5）",
     "",
@@ -301,6 +307,7 @@ const buildSuperPrompt = async (
     "  - 「I'll send a message asking the user to approve and end the run」← **致命错误、wait_for_user + shell + curl 拿到 PHASE_ACK 才是 ack 唯一出口**",
     "  - 「写完 artifact 后做个收尾 / 给用户一个 confirm 提示 / 输出 Phase X 结论」← **错、写完 artifact 的下一个 tool call 必须是 wait_for_user、中间不允许 emit 任何 assistant 文本**",
     "  - 「I will output the final assistant message summarizing Phase X results」/「final assistant message」/「summarizing Phase」/「写个 Phase X 总结回复用户」← **致命错误**——本协议唯一的 phase 结尾出口是 `wait_for_user`、不是 assistant_message。用户在看板 UI 里直接看 artifact + 点 ack 按钮、不需要你 summarize。",
+    "  - **V0.5.1 实测 2 次踩过**：拿到 `[PHASE_ACK approve]` 后 emit「Phase X 已结束、看板上已通过、approve 已收到」之类总结、然后 run 退出 → 中间 phase 的 approve 不是结束信号、是「进下一 phase」信号、emit 总结 + 退出 = 整段 workflow failed",
     "  - 「curl 没拿到结果、我重试一次」← **错、连接断了就自然结束 run**、UI 会引导用户手动续接（详见下面「异常断开处理」）",
     "  - 「再调一次 wait_for_user 试试」← **错、同 phase 内 wait_for_user 只调 1 次**、shell 拿不到结果时也不要重复调",
     "  - 「调 shell 之前先发段 assistant_message 解释要等用户」← **错、shell + curl 对用户透明、不允许 emit 任何前置文本块**",
@@ -328,6 +335,15 @@ const buildSuperPrompt = async (
     "",
     "3. shell 命令拿到 stdout 后按返回行解读：",
     "   - **`[PHASE_ACK approve]` 开头**：用户认可、agent 进入下一个 phase",
+    "     ⚠️ **V0.5.1 实测踩过 2 次的致命 anti-pattern（必须死记）**：",
+    "       拿到 `[PHASE_ACK approve]` 后、模型经常冒出「报告下用户、本 phase 完成、可以歇了」的冲动、emit 一段总结、然后 run 自然退出。**这是错的**。",
+    "       具体反例（生产事件流原话）：",
+    "         ❌ \"Phase 1 已结束：方案 artifact 已更新为 ready_for_ack、并在看板上 通过\" → run 退出 → build/review 没跑 → workflow failed",
+    "         ❌ \"Phase build 已按 revise 落实：代码已改、02-build.md 已写入、看板 approve 已收到\" → run 退出 → review 没跑 → workflow failed",
+    "       **正确推理**：`[PHASE_ACK approve]` = 「上一 phase 通过、**立刻进入下一 phase**」、不是 「可以停了」。",
+    "       **下一个 tool_use 必须**是下一 phase 的产出动作（`read` 上一 phase artifact 拿上下文、或者直接 `write` 下一 phase 的 artifact、或者按下一 phase 指令做的别的动作）。",
+    "       **绝对禁止**在拿到 approve 后 emit 任何「我做了什么 / 你看板上通过了 / approve 已收到」之类的总结——用户在看板 UI 上看到 phase 进度推进就够、不需要你 narrate。",
+    "       **唯一允许结束 run 的 approve**：最后一个 phase（见下面 §7「全部 phase 完成」）的 approve 拿到后才能自然退 run。中间 phase 的 approve = 必须接着干。",
     "   - **`[PHASE_ACK revise]` + feedback**：用户要求修改、按 feedback 改 artifact、然后**立刻再调一次 wait_for_user**（同 phase）",
     "   - **`[USER_REPLY]` + 文本**：chat 模式用户消息 / ask_user 答案、按内容推进",
     "   - **`[CANCELLED]`**：任务被取消、收尾结束 run",
