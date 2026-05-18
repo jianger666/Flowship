@@ -1,7 +1,6 @@
 # fe-ai-flow 多角色通用化路线图
 
 > 沉淀 V0.4「按角色读 story」设计的来龙去脉、以及未来扩 enum 时的操作指南。
-> 飞书设计文档同步更新前、本文是多角色机制的工程权威。
 
 ## 起因
 
@@ -111,6 +110,5 @@ story 6993079032（产品需求）
 
 ## 关联文档
 
-- 飞书设计文档：[fe-ai-flow 设计（V0.2 草稿）](https://wukongedu.feishu.cn/docx/Ue7Td9mOWoU57cxVctfcLA68nic)
 - 项目核心约束：`.cursor/rules/project-context.mdc`
-- V0.3.4 phase 合并：`docs/HANDOFF.md`「V0.3.4」段
+- V0.3.4 phase 合并 / V0.4 演进：`docs/HANDOFF.md`

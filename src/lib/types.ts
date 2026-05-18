@@ -274,9 +274,8 @@ export interface Task {
   repoPath: string;
   // 可选输入源
   // V0.2 workflow 用 feishuStoryUrl（指向飞书项目 story 详情页）
+  // V0.4 起 chat 模式建任务的「飞书相关链接」也复用这个字段、不分 feishuUrl
   feishuStoryUrl?: string;
-  // V1 legacy 字段、保留兼容
-  feishuUrl?: string;
   swaggerUrl?: string;
   description?: string;
   // 创建时附的额外文档 / 路径（后端校验过的绝对路径）
@@ -321,7 +320,6 @@ export type NewTaskInput = Pick<
   Task,
   | "title"
   | "repoPath"
-  | "feishuUrl"
   | "feishuStoryUrl"
   | "swaggerUrl"
   | "description"

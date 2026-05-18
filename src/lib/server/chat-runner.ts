@@ -4,9 +4,10 @@
  * 架构（重要）：
  *   - 启动 / 推送拆开：本文件管 agent 生命周期 + 内部 publish。
  *     SSE 推送由 watch-chat 路由 subscribe 拿增量。两边解耦：
- *       - 启动：POST /api/tasks/[id]/start-chat → spawn agent + 立即返回
+ *       - 启动：POST /api/tasks/[id]/chat-reply（V0.4 起合并、终态发消息时自动启动）
  *       - 订阅：GET  /api/tasks/[id]/watch-chat → SSE 流（先 replay 历史、再推增量）
  *     这样刷新页面不会断 agent、订阅可以多份（多 tab 看同一任务都行）。
+ *     原 /start-chat 路由已删（V0.4）、启动职责合到 /chat-reply 里。
  *
  * 主要职责：
  * 1. 整个对话是同一个 SDK Run、agent 用 wait_for_user MCP 工具阻塞等用户下一句
@@ -44,6 +45,7 @@ import {
   getChatMcpUrl,
   setChatAwaitingNotifier,
 } from "./chat-mcp";
+import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -71,7 +73,29 @@ const CHAT_TOOL_MCP_NAME = "feAiFlowChat";
 //
 // Skills（harness 思路）：附件处理 / 历史上下文恢复等场景化能力放在 skills/<name>/SKILL.md、
 // prompt 末尾列 skill index、agent 自行 read_file 拿完整指令。
-const buildInitialPrompt = (task: Task, skills: SkillEntry[]): string => {
+/**
+ * V0.4 自由化：用户发首条消息时同时启动 agent
+ *
+ * 这个对象表示「用户已经发了的首条消息」、buildInitialPrompt 会把它直接拼进 prompt、
+ * agent 第一次说话就是回答这条消息、不需要走「调 wait_for_user → shell + curl」绕一圈。
+ *
+ * 为什么不走 pendingFirstMessage 队列绕一圈：
+ *   1. 体验差：UI 会先短暂切到 awaiting_user（wait_for_user 进来）、输入框变可用、误导
+ *   2. agent 起手 emit 一句「正在调用 wait_for_user 等你」之类废话（即使 prompt 严禁也压不住）
+ *   3. agent 多走两轮 tool call（wait_for_user + shell）才能拿到用户消息、慢
+ * 直接塞 prompt 一步到位、agent 第一次 turn 就是回答。
+ */
+interface InitialUserMessage {
+  text: string;
+  imagePaths?: string[];
+  attachmentPaths?: string[];
+}
+
+const buildInitialPrompt = (
+  task: Task,
+  skills: SkillEntry[],
+  firstMessage?: InitialUserMessage,
+): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
   return [
@@ -205,18 +229,102 @@ const buildInitialPrompt = (task: Task, skills: SkillEntry[]): string => {
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "   - skill 文件可能引用其他文件（如 events.jsonl 绝对路径）、跟着读即可",
     "",
-    `## 任务 cwd（默认仓库根目录）：${task.repoPath}`,
+    `## 任务 cwd（agent shell / read_file 默认基准目录）：${task.repoPath}`,
     "",
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
     "",
     `  \`${eventsLogPath}\``,
     "",
-    "## 用户的最新消息",
+    renderContextDocsSection(
+      task,
+      "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read_file / grep 摸资料。",
+    ),
     "",
-    task.title.trim(),
-    "",
-    "现在开始处理：判断要不要读相关 skill → 回答 / 行动 → 调 `wait_for_user` → 调 `shell` 跑 curl → 等下一轮。",
+    ...buildOpeningStanceSection(task, firstMessage),
   ].join("\n");
+};
+
+/**
+ * 「起手姿势」段：根据有没有首条用户消息分两种姿势
+ *
+ * - 有首条（V0.4 自由化主路径、99% 场景）：直接回答用户首条、答完调 wait_for_user
+ * - 没首条（极少数边界情况、比如 resume run 或外部触发）：先 wait_for_user 等用户说话
+ */
+const buildOpeningStanceSection = (
+  task: Task,
+  firstMessage: InitialUserMessage | undefined,
+): string[] => {
+  if (firstMessage) {
+    // 主路径：用户已经在 UI 上发了首条、我们把它直接传给 agent
+    const parts: string[] = [
+      "## 起手姿势：用户已经发了首条消息、立刻回答",
+      "",
+      "**用户的首条消息（已 enqueue 给你处理、不要再调 wait_for_user 去等）**：",
+      "",
+      "```",
+      firstMessage.text.length > 0 ? firstMessage.text : "(空文本、看下方附件)",
+      "```",
+      "",
+    ];
+    if (firstMessage.imagePaths && firstMessage.imagePaths.length > 0) {
+      parts.push(
+        "**用户附带的图片**（用 SDK 内置 `read_file` 读、自动走 vision）：",
+        "",
+        ...firstMessage.imagePaths.map((p) => `  - \`${p}\``),
+        "",
+      );
+    }
+    if (firstMessage.attachmentPaths && firstMessage.attachmentPaths.length > 0) {
+      parts.push(
+        "**用户附带的文件 / 目录**（用 `read_file` / `grep` / `glob` 按需读）：",
+        "",
+        ...firstMessage.attachmentPaths.map((p) => `  - \`${p}\``),
+        "",
+      );
+    }
+    parts.push(
+      "**第一轮标准动作**：",
+      "  1. 直接按用户消息内容处理、需要查资料 / 摸仓库就调 SDK 内置工具或 MCP",
+      "  2. 处理完、emit assistant_message 回应用户（**不含**任何协议元叙述）",
+      "  3. 回应完、**沉默地**调 `wait_for_user(task_id=" + task.id + ")` 等下一条消息",
+      "  4. 之后进入「调 wait_for_user → shell + curl → 处理用户下一句」标准循环",
+      "",
+      "**绝对禁忌**：",
+      "  - ❌ 起手就调 `wait_for_user`——用户消息已经在上方、不需要再等",
+      "  - ❌ emit 任何「我收到你的消息了、正在处理」「正在调用 wait_for_user」之类协议元叙述",
+      "  - ❌ 复述用户问题（「你问我 xxx」）——直接回答就行",
+      "",
+      "现在开始：第一个动作是按用户消息内容处理 / 回答、不要先调任何「等用户」类工具。",
+    );
+    return parts;
+  }
+
+  // 边界情况：没有 firstMessage（理论上 V0.4 chat 进 runChatSession 都会带、这里是兜底）
+  return [
+    "## 起手姿势（边界情况：没有预设首条消息）",
+    "",
+    "**整个 chat 任务从「等用户第一句」开始**——你**没有**初始问题、用户在 UI 里建任务时可能填了标题（如：`" +
+      task.title +
+      "`）、但这**仅作任务标识、不是消息正文**。**不要**把标题当成「用户的第一句话」来回答。",
+    "",
+    "**第一个动作必须是**：直接调 `wait_for_user(task_id)` 阻塞等用户发第一条消息、拿到 [SHELL_WAIT_GUIDE] → 调 shell 跑 curl → stdout 拿 `[USER_REPLY] <用户的真正首条消息>` → 然后才回答。",
+    "",
+    "**禁忌**：",
+    "  - ❌ 起手就根据任务标题猜用户想问什么、自顾自说一段「关于 xxx、我可以…」",
+    "  - ❌ 起手就发 assistant_message 说「你好、请告诉我…」（这种欢迎语没必要、UI 直接显示输入框就够）",
+    "  - ❌ 起手就调 read_file / grep 之类的工具去摸仓库——用户还没说要做什么、你瞎摸毫无价值",
+    "",
+    "**正确顺序**：",
+    "  1. 起手什么都不做、立刻调 `wait_for_user(task_id=" + task.id + ")`",
+    "  2. 拿到 [SHELL_WAIT_GUIDE]、立刻调 shell 跑 curl 命令",
+    "  3. shell stdout 拿到 `[USER_REPLY] <消息>` → 这才是用户真正想聊的、按内容判断要不要读 skill / 摸仓库 / 直接答",
+    "  4. 处理完、emit assistant_message 回应（**不含**任何协议元叙述）",
+    "  5. 回到「调 wait_for_user → shell + curl → 等下一句」循环",
+    "",
+    "现在开始：第一个动作就是调 `wait_for_user(task_id=" +
+      task.id +
+      ")`、不要在调用之前 emit 任何 assistant_message。",
+  ];
 };
 
 // ----------------- 工具：截断 -----------------
@@ -268,7 +376,9 @@ interface ChatRunnerGlobalState {
   subscribers: Map<string, Set<ChatStreamListener>>;
 }
 
-const RUNNER_GLOBAL_KEY = "__feAiFlowChatRunnerState__";
+// V1：2026-05-15 加版本号后缀作防御；后续改 runner 内部 state 字段结构时 bump 版本号
+// 避免 dev hot reload 拿到旧版残留字段、跟 chat-mcp.ts GLOBAL_KEY 同款套路
+const RUNNER_GLOBAL_KEY = "__feAiFlowChatRunnerStateV1__";
 
 const getRunnerState = (): ChatRunnerGlobalState => {
   const g = globalThis as unknown as Record<string, ChatRunnerGlobalState>;
@@ -348,6 +458,14 @@ export interface RunChatInput {
   // 用户在设置页配的 MCP servers（已解析）
   // chat-tool 是我们自己塞进去的、不需要用户配
   userMcpServers?: Record<string, McpServerConfig>;
+  // V0.4 自由化：用户在 UI 上发的首条消息（terminal status 触发自动启动场景）
+  // 有则会拼进 initialPrompt、agent 第一次 turn 就回答这条、不需要 wait_for_user 等
+  // 无则走旧路径：agent 起手 wait_for_user 等用户消息（极少数边界场景）
+  firstMessage?: {
+    text: string;
+    imagePaths?: string[];
+    attachmentPaths?: string[];
+  };
 }
 
 // ----------------- 持久化 + publish 一体 -----------------
@@ -385,7 +503,7 @@ export const cancelChat = (taskId: string): boolean => {
  * 进度通过 publish() 广播给所有订阅者（watch-chat SSE）。
  */
 export const runChatSession = async (input: RunChatInput): Promise<void> => {
-  const { task, apiKey, model, userMcpServers } = input;
+  const { task, apiKey, model, userMcpServers, firstMessage } = input;
 
   // 已经在跑 → 直接 return（幂等、调用方不需要 catch）
   if (runningChats.has(task.id)) {
@@ -479,7 +597,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       console.error("[chat-runner] loadSkills failed", err);
       return [];
     });
-    const initialPrompt = buildInitialPrompt(task, skills);
+    const initialPrompt = buildInitialPrompt(task, skills, firstMessage);
     const run = await agent.send(initialPrompt);
 
     // 注册 cancel 控制

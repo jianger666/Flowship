@@ -55,6 +55,8 @@ const errorResponse = (message: string, status = 400) =>
 
 export const runtime = "nodejs";
 
+// hasPending 瞬时 false 时 200ms 后再查一次（细节见 chat-reply/route.ts 同名常量注释）
+// V0.3.5 shell + curl long-poll 下 race 窗口已大幅缩小、仍保留作防御
 const KEEPALIVE_RACE_RETRY_MS = 200;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));

@@ -193,6 +193,14 @@ interface Props {
   // 因为 plan 模式的 HITL 是 phase ack（通过 / 补意见再跑）、不是 free-form 聊天
   // ack 按钮由父组件渲染在顶部 / 详情区其他位置
   hideReplyComposer?: boolean;
+  // V0.4：输入框可用判定下放给父组件
+  // - 不传：用旧行为（task.status === "awaiting_user" 才可用、给 plan 用）
+  // - 传：父组件决定（chat-view 传：draft / completed / failed / awaiting_user 都可用、running / starting 不可用）
+  // 命名上跟 awaiting_user 解耦——父组件知道更多状态（如 starting）、UI 该不该可用归它判
+  canReply?: boolean;
+  // V0.4：禁用时底部的状态文案（chat 自由化下、文案需要随 task.status / starting 动态变）
+  // 不传：用旧 plan 文案「agent 在等待你回复时输入框才会激活」
+  disabledHint?: string;
 }
 
 // chat 单次最多附几条路径（防滥用 / context 爆）
@@ -214,6 +222,8 @@ const EventStreamImpl = ({
   streamingText,
   onUserReply,
   hideReplyComposer,
+  canReply,
+  disabledHint,
 }: Props) => {
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
@@ -264,9 +274,17 @@ const EventStreamImpl = ({
     }
   }, [renderEvents.length, streamingText?.length]);
 
-  const isAwaitingUser = task.status === "awaiting_user";
+  // V0.4：输入框可用 = 父组件传 canReply（chat-view 自由化用）
+  // 父组件没传时回退老行为 status === "awaiting_user"（plan 模式用、不影响）
+  // 重命名内部变量为 canCompose、避免「awaiting_user」语义跟可用判定耦合
+  const canCompose = canReply ?? task.status === "awaiting_user";
 
-  // 自动聚焦：进入 awaiting_user 时把光标放进输入框、用户立刻可以打字
+  // 输入框自动聚焦判定：跟 canCompose 同款（之前用 isAwaitingUser、现在统一走 canCompose）
+  // - chat 自由化下、agent 起手就 wait_for_user、进 ChatView 时 status 大概率立刻变 awaiting_user
+  //   → canCompose 变 true 触发 focus
+  const isAwaitingUser = canCompose;
+
+  // 自动聚焦：进入「可输入」时把光标放进输入框、用户立刻可以打字
   // - 解决以前的痛点：agent 回完话、用户得鼠标点输入框才能输入
   // - 仅在 status「变成」awaiting_user 的边缘触发、避免用户主动点别处后被强抢焦点
   // - autoFocus 属性不行（只 mount 时生效）、必须 useEffect 跟着 status 变
@@ -565,7 +583,7 @@ const EventStreamImpl = ({
           placeholder={
             isAwaitingUser
               ? "回复 / 粘贴或拖拽图片 / 点附图按钮（Cmd+Enter 发送）"
-              : "agent 当前没有等待你回复"
+              : (disabledHint ?? "agent 当前没有等待你回复")
           }
           disabled={!isAwaitingUser}
           className="resize-none text-sm"
@@ -586,7 +604,7 @@ const EventStreamImpl = ({
               ? attachedImages.length > 0 || attachedPaths.length > 0
                 ? `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`
                 : "agent 在等你回复"
-              : "agent 在等待你回复时输入框才会激活"}
+              : (disabledHint ?? "agent 在等待你回复时输入框才会激活")}
           </span>
           {/* 右边一行：附图 / 附文件 / 发送（聊一起、对齐发送动作）*/}
           <div className="flex shrink-0 items-center gap-1">

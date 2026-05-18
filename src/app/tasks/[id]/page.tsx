@@ -403,11 +403,10 @@ const TaskDetailPage = () => {
           )}
         </div>
         {/* 上下文文档 + MCP：两个紧凑按钮、点击各自弹 Dialog
-            不再占顶部高度、内容区不被挤 */}
+            不再占顶部高度、内容区不被挤
+            V0.4：chat 模式也展示 ContextDocsPanel（用户可随时补 / 删上下文给 agent） */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          {!isChatMode && (
-            <ContextDocsPanel task={task} onTaskUpdate={setTask} />
-          )}
+          <ContextDocsPanel task={task} onTaskUpdate={setTask} />
           <TaskMcpPanel task={task} />
         </div>
         {/* phase 进度条：plan 模式才有 */}

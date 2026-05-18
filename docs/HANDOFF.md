@@ -1,27 +1,27 @@
 # fe-ai-flow Handoff
 
-> 本项目的**完整设计文档**已经移到飞书、以飞书为唯一权威源、本文件不再维护正文。
+> **权威源**：代码 + 本文件。其余 docs/*.md 为辅助、有冲突以代码 + 本文件为准。
 >
-> 任何架构 / 路线图 / 设计原则的讨论、都先看飞书文档：
->
-> **[fe-ai-flow 设计（V0.2 草稿）](https://wukongedu.feishu.cn/docx/Ue7Td9mOWoU57cxVctfcLA68nic)**
+> （历史：曾经以飞书 V0.2 草稿为权威、已废弃。）
 
----
+## 项目定位（一句话）
+
+站在 Cursor SDK 肩膀上的**项目级 AI Harness 平台 · 飞书 story → PR 自动化**。核心是 Harness（缰绳）：每个 phase 边界用确定性工具（typecheck / lint / hooks / Skills / MCP / HITL ack）压住 LLM 非确定性、保证产出可观测、可回退、可复用。
 
 ## 给 AI 接力的最小上下文
 
-如果你是接力的 AI、在动手改代码 / 加功能之前**先读上面飞书文档**、它包含：
+接力的 AI 进来后顺序读：
 
-- 项目定位（站在 Cursor 肩膀上的企业 / 项目级 AI Harness 平台）
-- 主场景预演（飞书 story 链接 → PR 的完整 workflow）
-- 4 张架构图（用户工作流 / 架构全貌 / phase 状态机 / 飞书链接处理时序）
-- 跟 Cursor / Claude Code 的层级关系
-- 团队 12 步 Harness 方法论及 fe-ai-flow phase 对应
-- 现有代码怎么处理（保留 70% / 重构 20% / 砍掉 10%）
-- V0.2 路线图（P0 / P1 / P2 / P3）
-- 关键设计原则
+1. `.cursor/rules/project-context.mdc` —— 强制约束
+2. `.cursor/rules/learned-conventions.mdc` —— 编码风格
+3. 本文件 V0.4 段（最新架构）
+4. `docs/DESIGN.md` 顶部 warning + 第 16 节（chat 架构、注意节首 V0.3.5 + V0.4 警告）
+5. `docs/ROADMAP.md` 当前阶段表
+6. `docs/MULTI-ROLE.md`（V0.4 多角色机制）
+7. `src/lib/server/chat-mcp.ts` 顶部注释（保活机制核心）
+8. `src/lib/server/chat-runner.ts` 顶部注释 + `buildInitialPrompt`
 
-## 代码层面要点（不在飞书文档里）
+## 代码层面要点
 
 ### 强制
 
@@ -87,7 +87,9 @@
 - prompt 同步重写、把原 phase-1-context 内容并入 phase-2-plan
 - artifact 结构变成 `artifacts/01-plan.md` + `artifacts/02-build.md`（原 `01-context.md` 概念删除）
 
-#### V0.4（2026-05-15）：多角色 schema + 通用化
+#### V0.4（2026-05-15）：多角色 schema + 通用化 + chat 自由化
+
+##### 4.1 多角色 schema
 
 **核心动机**：飞书 story 是「跨角色共享」的——同一条 story 通常涉及前端 / 后端 / 数仓 / 测试 / 移动端、每个研发只关心其中一部分。之前 prompt / UI 把「前端」写死、扩到其他角色得到处改 prompt。
 
@@ -98,18 +100,43 @@
 - **`plan-runner.ts`**：`loadPhasePrompt` 把 `{{role}}` + `{{roleLabel}}` 注入 phase prompt、super-prompt 顶部多加一行「当前角色：xxx」提示
 - **`phase-1-plan.md`**：明确「以 `{{roleLabel}}` 视角、为本地仓库出方案」、「只挑跟你这个角色相关的部分做」、列出当前角色 fe 的细化提示
 - **`new-task-dialog.tsx`**：新建任务多一个「角色 \*」选择器（当前只有「前端」一项、保留 UI 以信号未来扩展）
-- **顶部导航 / metadata**：去掉「前端需求自动化流水线」字眼、改成「项目级 AI Harness · 飞书 story → PR」
 - **路线图**：详见 `docs/MULTI-ROLE.md`（含扩 role 的 checklist）
 
-**代码质量大清扫（V0.4 同步做）**：
+##### 4.2 chat 自由化（用户拍板 2026-05-15）
+
+**核心动机**：之前 chat 模式表单要求填标题 / 仓库 / 首条消息、还要点「启动 Chat」按钮才能进对话——「自由对话」却被表单卡得不自由。
+
+**改造**：
+
+- **表单全选填**：`new-task-dialog.tsx` chat 模式下标题 / 仓库 / 飞书链接 / 描述全可空、不填 `task-fs.createTask` 给默认值（标题占位「未命名对话 MM-DD HH:mm」、仓库默认 `os.homedir()`）
+- **删 `/start-chat` 路由**：启动职责合并进 `/chat-reply`、用户在 UI 输入框发首条消息时后端自动 spawn agent
+- **首条消息直接 inject prompt**：`chat-runner.buildInitialPrompt(task, skills, firstMessage?)` 加 firstMessage 参数、`runChatSession` 透传、agent 第一次 turn 就回答用户首条、答完才调 `wait_for_user` 进等待
+  - 走过的弯路：先做了 `pendingFirstMessage` 队列（agent 起手 wait_for_user → 后端 race 消费）、但 wait_for_user 进来会让 task.status 短暂切 awaiting_user、UI 输入框闪可用、agent 还偏好 emit「正在调用 wait_for_user 等你」之类协议元叙述。直接塞 prompt 一步到位、彻底绕过 race
+- **chat 模式也 inject contextDocs**：`buildInitialPrompt` 调 `renderContextDocsSection`、跟 plan 一致。`renderContextDocsSection` / `renderContextDocBody` / `TEXT_INLINE_INJECT_MAX` 从 `plan-runner.ts` 抽到 `src/lib/server/context-docs-prompt.ts`、plan / chat 共用
+- **chat 模式详情页打开 ContextDocsPanel**：原本 `!isChatMode && <ContextDocsPanel>` 守卫拿掉、chat 任务也能随时加 / 删上下文
+
+##### 4.3 字段统一：删 feishuUrl
+
+**核心动机**：之前 plan 模式建任务用 `feishuStoryUrl` 字段、chat 模式用 `feishuUrl` 字段、`task-fs.createTask` 又只把 `feishuStoryUrl` 落 contextDocs——chat 模式用户填的「飞书需求文档链接」**两层都没拼进 agent prompt**、agent 看不到。
+
+**改造**：
+
+- 彻底删 `feishuUrl` 字段（`Task` / `NewTaskInput` / `TaskMeta` / API route / plan-runner 模板变量全砍）
+- chat 模式表单 label 改「飞书项目链接（选填）」、复用 `feishuStoryUrl` 字段
+- `createTask` 不分 mode、`feishuStoryUrl` 有就落「飞书 story」contextDoc
+
+##### 4.4 代码质量大清扫（V0.4 同步做）
 
 - 修 `chat-runner.ts` `buildInitialPrompt`：原本还在教 agent 走 `keep_alive_a/b/c`、chat 模式严重 prompt drift；重写跟 plan-runner 同款 V0.3.5 shell + curl long-poll
 - 删 `prompts/phase-1-context.md` / `phase-2-plan.md` / `phase-3-build.md` / `phase-4-ship.md` 老文件（V0.3.4 起不再使用）
 - 修 `phase-1-plan.md` / `phase-2-build.md` 内残留的 `keep_alive_a/b/c` 协议描述
 - 修 `chat-mcp.ts` `ask_user` 工具 description：返回值从 `[USER_AWAITING]` 改为正确的 `[SHELL_WAIT_GUIDE]` + shell long-poll
 - 修 `skills/context-docs-handler/SKILL.md`：4 phase 描述改 2 phase、`01-context.md` 改 `01-plan.md`
+- 顶部导航 / metadata 改成「开发流水线」（之前几版叫过「前端需求自动化流水线」「项目级 AI Harness 平台」、用户拍板顶部 UI 用这个最简）
+  - ⚠️ **「项目级 AI Harness 平台」仍是项目灵魂**：README.md 开头 / docs 文档都保留这个表述、不要因为顶栏简化就把灵魂去掉。Harness（缰绳）= 用确定性工具压 LLM 非确定性、是这个项目区别于「再造一个 Cursor」的核心命题
 - `README.md` 整篇重写到 V0.4
 - `DESIGN.md` 顶部 warning 改成完整版本演进表
+- `chat-mcp.ts` GLOBAL_KEY bump 到 `__feAiFlowChatStateV6__`（dev 热重载不混入旧 V5 状态）
 
 #### V0.3.5（2026-05-14 ~ 2026-05-15）：保活机制大重构 + race fix
 
@@ -162,23 +189,23 @@
 | 想找 | 看这里 |
 |---|---|
 | Plan workflow 整体逻辑 + super-prompt | `src/lib/server/plan-runner.ts` |
-| Chat workflow 整体逻辑 | `src/lib/server/chat-runner.ts` |
+| Chat workflow 整体逻辑 + V0.4 firstMessage 注入 | `src/lib/server/chat-runner.ts` |
+| **contextDocs prompt 渲染 helper（V0.4 抽出、plan/chat 共用）** | `src/lib/server/context-docs-prompt.ts` |
 | `wait_for_user` / `ask_user` 实现 + pendingMap + grace race fix | `src/lib/server/chat-mcp.ts` |
 | **wait-ack 长连接路由（V0.3.5 新加、保活核心）** | `src/app/api/tasks/[id]/wait-ack/route.ts` |
 | **resume-waiting 路由（手动重连、Agent.resume）** | `src/app/api/tasks/[id]/resume-waiting/route.ts` |
+| **chat-reply 路由（V0.4 合并启动职责）** | `src/app/api/tasks/[id]/chat-reply/route.ts` |
 | Phase 状态机怎么 patch / 任务级互斥锁 / 原子写 / `lastAgentId` | `src/lib/server/task-fs.ts:withTaskLock` + `patchPhase` + `markPhaseAcked` + `setTaskLastAgentId` |
-| ContextDocsPanel | `src/components/tasks/context-docs-panel.tsx` |
+| ContextDocsPanel（chat / plan 都用） | `src/components/tasks/context-docs-panel.tsx` |
 | ask_user 弹窗（V0.3.2 modal 形态、V0.3.3 微调）| `src/components/tasks/ask-user-dialog.tsx` |
 | 事件流（含 ask_user 历史回放）| `src/components/tasks/event-stream.tsx` |
+| Chat 视图（V0.4 自由化、无启动按钮） | `src/components/tasks/chat-view.tsx` |
 | Plan 模式 UI（含「重启 workflow」/「继续监听」按钮）| `src/app/tasks/[id]/page.tsx` |
 | 启动 / phase ack / ask reply / mcp 黑名单 API | `src/app/api/tasks/[id]/start-workflow/route.ts` + `phase-ack/route.ts` + `ask-reply/route.ts` + `route.ts`（PATCH） |
 | Plan / build phase prompt（V0.3.4 合并版） | `prompts/phase-1-plan.md` + `prompts/phase-2-build.md` |
 | 任务角色 schema + 展示文案（V0.4） | `src/lib/types.ts: TaskRole / TASK_ROLE_LABEL` + `docs/MULTI-ROLE.md` |
 | Skills loader | `src/lib/server/skills-loader.ts` |
 
-### 飞书文档同步
+### 设计变动流程
 
-如果飞书文档有更新、应当：
-1. 在本仓库改架构 / 加功能时、读最新飞书文档
-2. 不要把飞书文档内容复制粘贴到 docs/ 下任何 md 文件（**单一权威源**）
-3. 设计层面变动 → 先在飞书文档讨论 + 修改、再落代码
+权威源 = 代码 + 本文件。设计层面变动直接落代码 + 同步更新本文件 V0.x 演进段、不要散落到其它 md 写一份新的。

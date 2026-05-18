@@ -26,6 +26,7 @@
  */
 
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -325,10 +326,9 @@ interface TaskMeta {
   // V0.2 plan 模式下的 workflow 标识（feishu-story-impl 等）
   workflowId?: WorkflowId;
   repoPath: string;
-  // V0.2 主要入口（飞书 story 链接）
+  // V0.2 主要入口（飞书 story / 项目链接）
+  // V0.4 起 chat 模式建任务也复用这个字段、统一以 feishuStoryUrl 为起点
   feishuStoryUrl?: string;
-  // V1 legacy 字段、保留兼容
-  feishuUrl?: string;
   swaggerUrl?: string;
   description?: string;
   // 创建时附的额外文档 / 路径（绝对路径）
@@ -581,7 +581,6 @@ const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
     role: meta.role ?? "fe",
     repoPath: meta.repoPath,
     feishuStoryUrl: meta.feishuStoryUrl,
-    feishuUrl: meta.feishuUrl,
     swaggerUrl: meta.swaggerUrl,
     description: meta.description,
     attachedDocs: meta.attachedDocs,
@@ -758,6 +757,15 @@ export const getTask = async (id: string): Promise<Task | null> => {
   return await hydrateTask(meta);
 };
 
+// 给 chat 模式不填 title 的任务生成默认占位标题
+// 格式：「未命名对话 MM-DD HH:mm」、便于在任务列表里区分
+// 不带秒：用户连点也基本不会撞标题、秒级精度信息量没必要
+const buildDefaultChatTitle = (now: number): string => {
+  const d = new Date(now);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `未命名对话 ${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
 export const createTask = async (input: NewTaskInput): Promise<Task> => {
   const now = Date.now();
   // V0.2：默认 mode=plan、默认 workflow=feishu-story-impl（公司主要场景）
@@ -770,13 +778,11 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     workflowId && WORKFLOWS[workflowId]
       ? WORKFLOWS[workflowId].phases[0]!
       : "plan";
-  // V0.3：初始化 contextDocs
-  // - plan 模式：如果有 feishuStoryUrl、自动作为第一条 contextDoc（title="飞书 story"）
-  //   后续用户可以在详情页面板里继续加
-  // - chat 模式：暂时不预填、保持空数组、有需要将来再说
-  // - 如果 description 不空、第二条 contextDoc（title="补充说明"、type=text 自动）
+  // V0.3：初始化 contextDocs（V0.4 起 plan/chat 一视同仁、统一以 feishuStoryUrl 为起点）
+  // - feishuStoryUrl：落「飞书 story」（plan 必填、chat 选填、字段意义都是「飞书项目链接」）
+  // - description：落「补充说明」
   const initialContextDocs: TaskContextDoc[] = [];
-  if (mode === "plan" && input.feishuStoryUrl && input.feishuStoryUrl.trim()) {
+  if (input.feishuStoryUrl && input.feishuStoryUrl.trim()) {
     initialContextDocs.push({
       id: newContextDocId(),
       title: "飞书 story",
@@ -795,17 +801,33 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     });
   }
 
+  // V0.4：chat 模式所有字段选填
+  // - title 不填：用「未命名对话 MM-DD HH:mm」占位
+  // - repoPath 不填：用 os.homedir()（agent 默认 cwd 在用户 home、不绑特定项目）
+  // plan 模式保持原约束（title + repoPath + feishuStoryUrl 必填、上层 API 路由校验）
+  const finalTitle =
+    input.title && input.title.trim()
+      ? input.title.trim()
+      : mode === "chat"
+        ? buildDefaultChatTitle(now)
+        : input.title;
+  const finalRepoPath =
+    input.repoPath && input.repoPath.trim()
+      ? input.repoPath.trim()
+      : mode === "chat"
+        ? os.homedir()
+        : input.repoPath;
+
   const meta: TaskMeta = {
     id: newTaskId(),
-    title: input.title,
+    title: finalTitle,
     mode,
     workflowId,
     // V0.4：role 默认 "fe"（当前 enum 只这一个值、UI 可选但实际只有这个选项）
     // 未来扩枚举（be / data / mobile / qa）时、UI 选择器会暴露多个值、这里也按 input 取
     role: input.role ?? "fe",
-    repoPath: input.repoPath,
+    repoPath: finalRepoPath,
     feishuStoryUrl: input.feishuStoryUrl,
-    feishuUrl: input.feishuUrl,
     swaggerUrl: input.swaggerUrl,
     description: input.description,
     attachedDocs: input.attachedDocs,

@@ -2,7 +2,7 @@
 
 > 渐进式、不一次性做完。每个阶段验证 ROI 后再投资源。
 
-> ⚠️ **2026-05-15 同步**：V1 流程历经 spec→plan→build → context→plan→build→ship → 最终定型 **`plan → build` 双阶段**（V0.3.4）+ 「**chat 自由对话**」双模式。保活机制从 `wait_for_user` MCP + `keep_alive_a/b/c` 重构为 `shell + curl long-poll`（V0.3.5）。**V0.4 引入多角色 schema**（`Task.role`、当前仅 fe、未来扩 be/data/mobile/qa、详见 `docs/MULTI-ROLE.md`）+ 大规模代码质量清扫（chat-runner / phase prompts / SKILL.md 多处 prompt drift 修复）。当前实际进度看 HANDOFF.md「V0.2 → V0.3.5 演进 + V0.4」段、Chat 架构看 DESIGN.md 第 16 节。
+> ⚠️ **2026-05-15 同步**：V1 流程历经 spec→plan→build → context→plan→build→ship → 最终定型 **`plan → build` 双阶段**（V0.3.4）+ 「**chat 自由对话**」双模式。保活机制从 `wait_for_user` MCP + `keep_alive_a/b/c` 重构为 `shell + curl long-poll`（V0.3.5）。**V0.4 大动**：多角色 schema（`Task.role`、当前仅 fe、未来扩 be/data/mobile/qa、详见 `docs/MULTI-ROLE.md`）+ chat 自由化（删 `/start-chat` 路由、首条消息直接 inject prompt、表单全选填、详情页打开 ContextDocsPanel）+ 字段统一删 `feishuUrl` + 顶部品牌改「开发流水线」+ 大规模代码质量清扫。当前实际进度看 HANDOFF.md「V0.2 → V0.3.5 演进 + V0.4」段、Chat 架构看 DESIGN.md 第 16 节。
 
 ---
 
@@ -23,7 +23,9 @@
 | **task-fs 原子写 + 任务级互斥锁** | ✅ V0.3.1 完成 | 修 readMeta race |
 | **status=error 诊断增强**（dump CursorSdkError）| ✅ V0.3.2 完成 | `plan-runner.ts` catch dump |
 | **多角色 schema（V0.4）** | ✅ V0.4 完成 | `Task.role` + `TASK_ROLE_LABEL` + `phase-1-plan.md` 注入 `{{role}}` + `new-task-dialog.tsx` 选择器、当前仅 fe |
-| **代码质量大清扫（V0.4）** | ✅ V0.4 完成 | 修 chat-runner 严重 prompt drift（keep_alive_a/b/c → shell long-poll）、删老 phase prompt 文件、修 SKILL.md / `ask_user` description 残留 |
+| **chat 自由化（V0.4）** | ✅ V0.4 完成 | 删 `/start-chat` 路由（合并进 `/chat-reply`）、表单全选填、首条消息直接 inject `buildInitialPrompt` 第三参数、agent 第一次 turn 就回答、详情页打开 ContextDocsPanel |
+| **字段统一（V0.4）** | ✅ V0.4 完成 | 删 `feishuUrl` 字段、plan/chat 都用 `feishuStoryUrl`；chat-runner 用共享 helper `renderContextDocsSection` inject contextDocs |
+| **代码质量大清扫（V0.4）** | ✅ V0.4 完成 | 修 chat-runner 严重 prompt drift（keep_alive_a/b/c → shell long-poll）、删老 phase prompt 文件、修 SKILL.md / `ask_user` description 残留、顶部品牌改「开发流水线」 |
 | Plan + Build 端到端跑通 | 🚧 待用户 demo | 用户最近已能跑通 plan、build phase 也能写 artifact、但 wait-ack 长连接 / 代理稳定性还是隐患 |
 | 自动 retry on ConnectError | 🔲 不做 | 用户决定：靠手动「继续监听」、避免 agent 反复踩坑 |
 | Cancel chat（保留任务、停 agent） | 🔲 未启动 | 当前只能"删任务" |
@@ -94,32 +96,50 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 - 本地 HTTP MCP `feAiFlowChat`（chat-mcp.ts）+ `wait_for_user(task_id)` 阻塞工具
 - `chat-runner.ts` publish-subscribe 模式、`runningChats / subscribers` 挂 globalThis
 - `start-chat`（POST、fire-and-forget）+ `watch-chat`（GET、SSE 订阅）拆开、刷新页面不断 agent
+  - ⚠️ V0.4 已删 `start-chat`、启动职责合并进 `/chat-reply`
 - 50s keepalive + 反 anti-loop 双重压制（keepalive 文本变体化 + prompt 反反思指令）
+  - ⚠️ V0.3.5 已删、改成 shell + curl long-poll
 - `completed` 状态可"再聊一次"重启 agent（计费再算一次、UI 有提示）
+  - V0.4 起：`completed` / `failed` 状态再发消息会自动重启 agent、不需要专门按钮
 - 任务删除 cleanup 三步：cancelChat → cleanupChatTaskState → deleteTask
 
 ---
 
-## V0.4 / W4：多角色 schema + 通用化（已落地）
+## V0.4 / W4：多角色 schema + chat 自由化 + 代码质量大清扫（已落地）
 
-**目标**：让 fe-ai-flow 不只服务前端、能扩到后端 / 数仓 / 测试 / 移动端
+**目标**：让 fe-ai-flow 不只服务前端、能扩到后端 / 数仓 / 测试 / 移动端；把 chat 模式真的「自由化」（不强制填表 / 不强制点启动）；清扫前几版残留的 prompt drift 和死字段。
 
-**实现**（详见 `docs/MULTI-ROLE.md`）：
+### 多角色 schema（详见 `docs/MULTI-ROLE.md`）
 
 - `Task.role: TaskRole`（当前仅 `"fe"`、未来扩）+ `TASK_ROLE_LABEL` 中文映射、单一来源
 - `task-fs.ts` 老数据兜底 `"fe"`、`plan-runner.ts` 把 `{{role}}` / `{{roleLabel}}` 注入 phase prompt
 - `phase-1-plan.md` 强调「以 role 视角、只挑相关部分做、不收集其他角色实现细节」
 - `new-task-dialog.tsx` 加角色选择器（当前单值、UI 保留以信号未来扩）
-- 顶部 metadata / description 去掉「前端」字眼
 
-**已做的代码质量大清扫**：
+### chat 模式自由化（用户拍板 2026-05-15）
+
+- 表单全选填：标题 / 仓库 / 飞书项目链接都可空、不填 `task-fs.createTask` 给默认值（占位标题 + `os.homedir()` 仓库）
+- 删 `/start-chat` 路由：启动职责合并进 `/chat-reply`、用户在输入框发首条消息时后端自动 spawn agent
+- 首条消息直接 inject prompt：`chat-runner.buildInitialPrompt(task, skills, firstMessage)` 第三参数、agent 第一次 turn 就回答（不绕 wait_for_user）
+  - 走过的弯路：先做 `pendingFirstMessage` 队列让 agent 起手 wait_for_user 时消费、但 wait_for_user 进来会让 UI 输入框短暂可用、还会被 agent emit「正在调用 wait_for_user 等你」之类协议元叙述。直接塞 prompt 一步到位
+- 详情页打开 ContextDocsPanel：chat 任务也能随时加 / 删上下文（之前 `!isChatMode` 守卫拿掉）
+- chat 模式 inject contextDocs：`renderContextDocsSection` 从 `plan-runner.ts` 抽到 `src/lib/server/context-docs-prompt.ts`、plan / chat 共用
+
+### 字段统一
+
+- 删 `feishuUrl` 字段（之前 chat 模式表单用、根本没拼进 prompt、是个死字段）
+- plan / chat 都用 `feishuStoryUrl`、`createTask` 不分 mode 都把它落「飞书 story」contextDoc
+
+### 代码质量大清扫
 
 - 修 `chat-runner.ts` 严重 prompt drift（buildInitialPrompt 还在教 keep_alive_a/b/c 轮转、chat 模式实际坏了）
 - 删 `prompts/phase-{1-context,2-plan,3-build,4-ship}.md` 老文件（V0.3.4 起不再使用）
 - 修 phase prompt / SKILL.md / chat-mcp ask_user description 里 `keep_alive` 残留
-- README.md 整篇重写到 V0.4、DESIGN.md 顶部 warning 改完整版本演进表
+- 顶部品牌改「开发流水线」（产品形态命名、用户拍板顶部 UI 用这个；**README + DESIGN / HANDOFF / PRODUCT-COMPARISON 里「项目级 AI Harness 平台」表述照旧**——Harness 是项目灵魂、不能因顶栏简化就丢）
+- `chat-mcp.ts` GLOBAL_KEY bump 到 `__feAiFlowChatStateV6__`（dev 热重载不混入旧 V5 状态）
+- README.md 整篇重写到 V0.4、DESIGN.md 顶部 warning 改完整版本演进表、HANDOFF.md V0.4 段细化
 
-**未启动子项（V0.5+ 再说）**：
+### 未启动子项（V0.5+ 再说）
 
 - 角色枚举扩展（be / data / mobile / qa）：等真有 1 个非 fe 用户来开新坑、不空设
 - `prompts/roles/<role>.md` 片段化（当前角色提示直接写在 phase-1-plan.md「当前角色提示」段、扩展时再抽）

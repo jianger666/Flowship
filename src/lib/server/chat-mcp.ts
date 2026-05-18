@@ -36,8 +36,9 @@
  * 新版：wait_for_user / ask_user 工具**立即返回 shell 引导**、教 agent 调
  * `shell` 工具 `curl -sN '<url>/api/tasks/:id/wait-ack?token=…'` 跟服务端建一条
  * 长 HTTP 连接。/wait-ack 路由 subscribeWaitAck 拿 pendingMap 里的 promise、
- * 服务端 chunked write 每 4 分钟一次 keepalive、用户 ack/reply 时 resolve 这个
- * promise → 写一行结果 + 关连接 → curl 拿到 stdout → agent 推进下一步。
+ * 服务端 chunked write 每 60 秒一次 `[KEEPALIVE ts=...]` 普通文本行、
+ * 用户 ack/reply 时 resolve 这个 promise → 写一行结果 + 关连接 → curl 拿到 stdout →
+ * agent 推进下一步。整段 SDK Run 没退出、单次 send 配额一直够用。
  *
  * 实证（scripts/test-shell-sleep.mjs）：SDK 的 shell 工具**不受 MCP 60s 硬超时**、
  * `sleep 300` (5 分钟) 都能跑完、且不踩 anti-loop（一次 wait = 一次 shell、
@@ -61,16 +62,15 @@ import { z } from "zod";
 
 // ----------------- 配置 -----------------
 
-// chunked keepalive 间隔：服务端在长连接里每隔这么久 write 一段 `: keepalive <ts>\n`
-// 让中间链路（nginx / 浏览器 proxy）不把 idle 连接掐掉。curl 静默吃掉这种行（以 `:` 开头是 SSE 注释惯例、
-// curl 不当数据返出来）、agent 看不到。
-// 取 4 分钟：业界常见 keep-alive idle 阈值（nginx 默认 75s、AWS ELB 60s、企业网关 5-10min）、
-// 4min 比绝大多数都短一截、稳。
-// wait-ack 长连接的 keepalive 间隔
-// V0.3.5 实测（2026-05-14）：4 分钟一次太稀疏、`: keepalive` 是 SSE 注释格式还可能被
-// SDK shell-output-delta 过滤、agent 5 分钟没看到 stdout 新行就触发训练 bias 主动 summarize
-// 退出。改成 60 秒一次普通文本行 `[KEEPALIVE ts=...]`、上下文成本可控（30 分钟 30 行、
-// 每行 ~25 字节）、足够压住模型 bias。
+// wait-ack 长连接 keepalive 间隔：服务端在长连接里每隔这么久 write 一段
+// `[KEEPALIVE ts=<ms>]\n` 普通文本行。双重作用：
+//   1. 维持中间链路（nginx / ELB / 浏览器 proxy）connection、不被 idle 砍
+//   2. 让 agent 通过 shell-output-delta 持续看到 stdout 有新行、防 Cursor 模型层
+//      训练 bias 在「shell 静默几分钟」时主动 summarize 退出
+//
+// V0.3.5 实测（2026-05-14）：旧版用 `: keepalive` SSE 注释 + 4 分钟间隔、curl
+// 静默吃下 stdout 没新行、agent 5 分钟内就触发上述 bias 退 run。换成 60 秒一次
+// 普通文本行后稳。上下文成本可控：30 分钟 30 行、每行 ~25 字节、~750 字节。
 const WAIT_ACK_KEEPALIVE_MS = 60 * 1000;
 
 // ToolReturn：wait-ack 路由把它序列化成单行文本写给 curl、agent 在 shell 输出里读到
@@ -123,7 +123,7 @@ interface PendingEntry {
 // ----------------- 进程全局状态（挂 globalThis） -----------------
 //
 // Next.js dev mode 下、不同 Route Handler（/api/mcp/chat-tool 跟
-// /api/tasks/[id]/start-chat）会被打成不同 webpack chunk、`import` 同一个
+// /api/tasks/[id]/chat-reply）会被打成不同 webpack chunk、`import` 同一个
 // 模块拿到的实际是 **不同的 module 实例**、module-level 的 Map / Set 各跑各的
 // 完全分裂。chat-runner 注的 logger、wait_for_user 这边查不到、就是踩这个坑。
 //
@@ -187,10 +187,12 @@ interface ChatMcpGlobalState {
   tokenToTask: Map<string, string>;
 }
 
+// V6：2026-05-15 删 pendingFirstMessage（chat 自由化首条改进 prompt 注入、不走队列、详见 chat-runner buildInitialPrompt）
+// V5：2026-05-15 加 pendingFirstMessage（已撤销）
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
-// → bump 版本后缀强制让 dev 重启时拿到全新 state（旧 V3 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV4__";
+// → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
+const GLOBAL_KEY = "__feAiFlowChatStateV6__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -493,7 +495,7 @@ const safeNotifyAskUserRequest = async (
 //
 // 这段文本是新方案的核心、决定 agent 行为质量。要素：
 //   1. **明确告知 shell + curl 是唯一正确动作**、不允许 emit assistant_message
-//   2. **解释 curl 输出的几种可能行**（PHASE_ACK / USER_REPLY / : keepalive / CANCELLED / STALE / 网络错误）
+//   2. **解释 curl 输出的几种可能行**（[KEEPALIVE] / [PHASE_ACK] / [USER_REPLY] / [CANCELLED] / [STALE] / [INVALID_TOKEN]）
 //   3. **断线不要重试**、自然 emit 一条简短文本结束 run、UI 会引导用户手动续接
 //   4. **对用户透明**：不要在 assistant_message 里讲协议细节
 const buildShellWaitGuidance = (
@@ -548,16 +550,6 @@ const buildShellWaitGuidance = (
     "",
     `## 这次 wait 的目的`,
     contextLine,
-    "",
-    "## curl stdout 你可能看到这些行",
-    "",
-    "  - `: keepalive <ts>`：服务端 4 分钟一次心跳行（SSE 注释、curl 不当数据返出来、但 connection 保活、忽略它即可、不要把它当结果）",
-    "  - `[PHASE_ACK approve]` (workflow 模式)：用户点了「通过」、curl 已 exit 0、继续下一 phase",
-    "  - `[PHASE_ACK revise]` + 后续 feedback 文本：用户点了「补意见再跑」、按 feedback 改 artifact 后再调一次 wait_for_user（同 phase）",
-    "  - `[USER_REPLY]` + 文本（chat 模式 / ask_user 答案）：处理这条消息",
-    "  - `[CANCELLED]`：任务被取消、收尾结束 run",
-    "  - `[STALE]`：本次 wait 被新调用顶掉、忽略本次 shell 返回即可",
-    "  - `[INVALID_TOKEN]`：token 已被消费 / 失效、忽略",
     "",
     "## 异常处理（重要！）",
     "",

@@ -154,7 +154,7 @@ export const setTaskDisabledMcpServers = async (
 /**
  * 按 task.disabledMcpServers 过滤全量 mcpServers
  *
- * 用在 startChat / startWorkflow 调用前：UI 拿全量 mcpServers（从 settings 解析）、
+ * 用在 sendChatReply / startWorkflow 调用前：UI 拿全量 mcpServers（从 settings 解析）、
  * 这里按任务黑名单过掉、再传给后端 SDK。
  *
  * - servers undefined：返 undefined（无 MCP 走）
@@ -241,33 +241,6 @@ const parseSseEvent = (frame: string): SSEEnvelope | null => {
 };
 
 // ----------------- Chat / Workflow 共享 SSE 订阅 -----------------
-
-/**
- * 启动 chat agent run（不订阅事件流）。
- *
- * 行为：
- *   - 已经在跑 → 200 already=true（幂等）
- *   - 没跑 → spawn agent + 立即返回最新 task
- *   - agent 全程在服务端跑、跟客户端连接无关
- *
- * 调用方拿到 task 后该立刻 watchChatStream 订阅事件、否则错过中间事件。
- */
-export const startChat = async (
-  taskId: string,
-  apiKey: string,
-  model: ModelSelection,
-  mcpServers: Record<string, McpServerConfig> | undefined,
-): Promise<{ task: Task; already: boolean }> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/start-chat`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey, model, mcpServers }),
-    },
-  );
-  return await handleJson<{ ok: true; task: Task; already: boolean }>(res);
-};
 
 /**
  * 订阅 chat 任务的事件流（GET SSE）
@@ -370,14 +343,40 @@ export interface ChatReplyImage {
 }
 
 /**
- * 给阻塞中的 chat agent 发一条用户消息
+ * V0.4 chat 自由化：发消息时给后端的「自动启动 agent」配置
  *
+ * task.status ∈ {draft, completed, failed} 时、chat-reply 路由会：
+ *   1. 写 user_reply 事件
+ *   2. 用 bootArgs 启 agent
+ *   3. 把这条消息塞进 agent 第一次 wait_for_user
+ *
+ * task.status === awaiting_user 时这个字段可省（agent 在跑、不需要重新启动）。
+ * 调用方为简化逻辑、可以**永远传 bootArgs**、后端按需取用。
+ */
+export interface ChatReplyBootArgs {
+  apiKey: string;
+  model: ModelSelection;
+  mcpServers?: Record<string, McpServerConfig>;
+}
+
+/**
+ * 给 chat agent 发一条用户消息（V0.4 起兼具「自动启动」职责）
+ *
+ * @param text         用户消息文本（可为空、但 images / attachments 至少有一个）
  * @param images       可选附图、由后端校验白名单 / size、落盘 + 把绝对路径塞给 wait_for_user
  * @param attachments  可选附路径（文件 / 目录绝对路径数组、来自 FsPickerDialog）、由后端校验存在 +
  *                     拼成 `[ATTACHED_PATHS]` 段塞给 wait_for_user、agent 用 read_file 自己读
+ * @param bootArgs     V0.4：终态发消息时用来启 agent（apiKey/model/mcpServers）
+ *                     调用方建议无脑传、后端自己判断要不要启动
+ *
+ * 后端语义（详见 chat-reply route 顶部注释）：
+ *   - awaiting_user → 走 submitUserMessage（正常对话回合）
+ *   - draft/completed/failed → 走自动启动 + 投递首条（V0.4 自由化）
  *
  * 失败语义：
- *   - HTTP 4xx：agent 不在等用户输入 / task 不存在 / 图片或路径校验失败
+ *   - HTTP 4xx：参数错 / 终态发消息但没传 bootArgs / 图片或路径校验失败
+ *   - HTTP 409：状态冲突（如终态但 agent run 还残留）
+ *   - HTTP 410：僵尸态、agent 已断开
  *   - 调用方 catch 后用 toast 提示
  */
 export const sendChatReply = async (
@@ -385,7 +384,8 @@ export const sendChatReply = async (
   text: string,
   images?: ChatReplyImage[],
   attachments?: string[],
-): Promise<Task> => {
+  bootArgs?: ChatReplyBootArgs,
+): Promise<{ task: Task; autoStarted: boolean }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
     {
@@ -396,11 +396,16 @@ export const sendChatReply = async (
         images: images && images.length > 0 ? images : undefined,
         attachments:
           attachments && attachments.length > 0 ? attachments : undefined,
+        bootArgs,
       }),
     },
   );
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
+  const data = await handleJson<{
+    ok: true;
+    task: Task;
+    autoStarted?: boolean;
+  }>(res);
+  return { task: data.task, autoStarted: !!data.autoStarted };
 };
 
 // ----------------- Plan workflow（V0.2） -----------------
@@ -408,7 +413,7 @@ export const sendChatReply = async (
 /**
  * 启动 plan workflow agent run（一次 SDK Run 跑全程 4 phase）
  *
- * 行为：跟 startChat 同款幂等、立即返回 task。SSE 订阅走 watchChatStream（路由复用）。
+ * 行为：幂等、立即返回 task；已 spawn 则返 already=true。SSE 订阅走 watchChatStream（路由复用）。
  */
 export const startWorkflow = async (
   taskId: string,

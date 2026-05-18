@@ -9,7 +9,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "fe-ai-flow",
-  description: "项目级 AI Harness 平台 · 飞书 story → PR 自动化",
+  description: "开发流水线",
 };
 
 /**
@@ -33,7 +33,7 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
               >
                 fe-ai-flow
                 <span className="text-xs text-muted-foreground font-normal">
-                  项目级 AI Harness · 飞书 story → PR
+                  开发流水线
                 </span>
               </Link>
               {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild

@@ -1,21 +1,27 @@
 "use client";
 
 /**
- * 新建任务 Dialog（V0.2）
+ * 新建任务 Dialog
  *
- * V0.2 主流程：默认 plan 模式 + feishu-story-impl workflow、用户贴一条飞书 story 链接即可启动
- * chat 模式仍保留、给非需求性的临时探索 / 调试用
+ * V0.2 起：默认 plan 模式 + feishu-story-impl workflow、用户贴一条飞书 story 链接即可启动
+ * chat 模式：自由对话、临时探索 / 调试用
  *
  * 字段（plan 模式）：
  *   - 任务标题 *
- *   - 仓库 * （select 自 settings.repos）
+ *   - 仓库 *（select 自 settings.repos）
+ *   - 角色 *（V0.4、当前仅 fe、未来扩 be / data / mobile / qa）
  *   - 飞书 story 链接 *（plan workflow 的核心输入、不填没法跑）
  *   - 描述补充（可选）
  *
- * 字段（chat 模式）：
- *   - 首条消息 *（充当 title）
- *   - 仓库 *
- *   - 飞书需求链接（可选、agent 可顺手拉来当上下文）
+ * 字段（chat 模式、V0.4 起全选填）：
+ *   - 任务名称（选填、不填用「未命名对话 MM-DD HH:mm」占位）
+ *   - 仓库（选填、不填用 ~ 作为 agent cwd、跟 ChatGPT/Claude 一样不绑项目）
+ *   - 飞书项目链接（选填、复用 feishuStoryUrl 字段、agent 可顺手拉来当上下文）
+ *
+ *   chat 模式自由化意图（用户拍板 2026-05-15）：
+ *     - 不强制填首条消息、进任务后用户在底部输入框直接发即可（chat-view 自动启 agent）
+ *     - 不强制绑仓库、自由聊天 / 写脚本 / 查资料场景不需要仓库上下文
+ *     - 飞书链接复用 plan 模式的 feishuStoryUrl 字段、UI 文案改通用「飞书项目链接」
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -75,10 +81,10 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [title, setTitle] = useState("");
   // 目标仓库绝对路径
   const [repoPath, setRepoPath] = useState("");
-  // V0.2 plan 模式核心输入：飞书 story 详情页链接
+  // 飞书项目链接（V0.4 起 plan/chat 共用同一字段、不再分 feishuUrl）
+  // plan 模式：必填、agent 用来拉 story 详情页
+  // chat 模式：选填、agent 当作上下文文档之一
   const [feishuStoryUrl, setFeishuStoryUrl] = useState("");
-  // chat 模式可选的飞书需求文档链接（不是 story、是 docx）
-  const [feishuUrl, setFeishuUrl] = useState("");
   // plan 模式可选的描述补充（story 文档信息不够时用）
   const [description, setDescription] = useState("");
   // 仓库下拉源、open 时从 settings 同步过来
@@ -112,7 +118,6 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     setTitle("");
     setRepoPath("");
     setFeishuStoryUrl("");
-    setFeishuUrl("");
     setDescription("");
     setDisabledMcp([]);
     setMcpExpanded(false);
@@ -121,11 +126,16 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   // 提交锁、避免连点
   const [submitting, setSubmitting] = useState(false);
 
-  // 可提交判定（plan 模式必填 feishuStoryUrl、chat 模式不强制）
+  // 可提交判定
+  // V0.4：chat 模式全选填、任何输入都能直接提交（后端 task-fs.createTask 给默认值）
+  // plan 模式保留原约束：title + repoPath + feishuStoryUrl 必填
   const canSubmit = useMemo(() => {
     if (submitting) return false;
-    if (!title.trim() || !repoPath.trim()) return false;
-    if (mode === "plan" && !feishuStoryUrl.trim()) return false;
+    if (mode === "plan") {
+      if (!title.trim() || !repoPath.trim() || !feishuStoryUrl.trim()) {
+        return false;
+      }
+    }
     return true;
   }, [submitting, title, repoPath, mode, feishuStoryUrl]);
 
@@ -141,12 +151,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         role,
         title: title.trim(),
         repoPath: repoPath.trim(),
-        feishuStoryUrl:
-          mode === "plan" && feishuStoryUrl.trim()
-            ? feishuStoryUrl.trim()
-            : undefined,
-        feishuUrl:
-          mode === "chat" && feishuUrl.trim() ? feishuUrl.trim() : undefined,
+        // V0.4：plan/chat 共用 feishuStoryUrl 字段、统一以飞书项目链接为起点
+        feishuStoryUrl: feishuStoryUrl.trim() || undefined,
         description:
           mode === "plan" && description.trim() ? description.trim() : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
@@ -199,7 +205,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
           <div className="grid gap-1.5">
             <Label htmlFor="t-title">
-              {mode === "chat" ? "首条消息 *" : "需求标题 *"}
+              {mode === "chat" ? "任务名称（选填）" : "需求标题 *"}
             </Label>
             <Input
               id="t-title"
@@ -207,15 +213,22 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               onChange={(e) => setTitle(e.target.value)}
               placeholder={
                 mode === "chat"
-                  ? "想聊什么、想让 agent 干什么、直接说"
+                  ? "选填、不填用「未命名对话 MM-DD HH:mm」"
                   : "如：用户列表批量导出"
               }
               autoFocus
             />
+            {mode === "chat" && (
+              <p className="text-xs text-muted-foreground">
+                只是任务标识、不会作为发给 agent 的首条消息。进任务后在底部输入框发即可
+              </p>
+            )}
           </div>
 
           <div className="grid gap-1.5">
-            <Label htmlFor="t-repo">目标仓库 *</Label>
+            <Label htmlFor="t-repo">
+              {mode === "chat" ? "目标仓库（选填）" : "目标仓库 *"}
+            </Label>
             {repos.length > 0 ? (
               <Select
                 value={repoPath}
@@ -254,10 +267,19 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                   ))}
                 </SelectContent>
               </Select>
+            ) : mode === "chat" ? (
+              <EmptyHint size="sm">
+                还没配置仓库——自由对话默认在你 home 目录跑、不绑特定项目也没关系。需要绑仓库就先去 <strong>设置</strong> 加一个
+              </EmptyHint>
             ) : (
               <EmptyHint size="sm">
                 还没配置仓库、先去 <strong>设置</strong> 加一个、回来再建任务
               </EmptyHint>
+            )}
+            {mode === "chat" && (
+              <p className="text-xs text-muted-foreground">
+                选填、不填 agent 默认 cwd 在你 home 目录（适合纯聊天 / 查资料 / 写脚本）
+              </p>
             )}
           </div>
 
@@ -317,13 +339,16 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
             </>
           ) : (
             <div className="grid gap-1.5">
-              <Label htmlFor="t-feishu">飞书需求文档链接（可选）</Label>
+              <Label htmlFor="t-story">飞书项目链接（选填）</Label>
               <Input
-                id="t-feishu"
-                value={feishuUrl}
-                onChange={(e) => setFeishuUrl(e.target.value)}
-                placeholder="https://wukongedu.feishu.cn/docx/..."
+                id="t-story"
+                value={feishuStoryUrl}
+                onChange={(e) => setFeishuStoryUrl(e.target.value)}
+                placeholder="https://project.feishu.cn/<space>/story/detail/..."
               />
+              <p className="text-xs text-muted-foreground">
+                填了 agent 会把它作为上下文文档之一、对话里可主动拉来看
+              </p>
             </div>
           )}
 

@@ -10,7 +10,12 @@
 
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
-import { WORKFLOWS, type NewTaskInput, type WorkflowId } from "@/lib/types";
+import {
+  WORKFLOWS,
+  type NewTaskInput,
+  type TaskRole,
+  type WorkflowId,
+} from "@/lib/types";
 
 const isNonEmptyString = (v: unknown): v is string =>
   typeof v === "string" && v.trim().length > 0;
@@ -19,6 +24,12 @@ const isNonEmptyString = (v: unknown): v is string =>
 const sanitizeWorkflowId = (v: unknown): WorkflowId | undefined => {
   if (typeof v !== "string") return undefined;
   return (v in WORKFLOWS ? v : undefined) as WorkflowId | undefined;
+};
+
+// V0.4：角色字段、当前只允许 "fe"。未来扩 enum 时这里加白名单
+const sanitizeRole = (v: unknown): TaskRole | undefined => {
+  if (v === "fe") return "fe";
+  return undefined;
 };
 
 export const GET = async () => {
@@ -34,26 +45,29 @@ export const GET = async () => {
 export const POST = async (req: Request) => {
   try {
     const body = (await req.json()) as Partial<NewTaskInput>;
-    if (!isNonEmptyString(body.title) || !isNonEmptyString(body.repoPath)) {
-      return NextResponse.json(
-        { error: "title 和 repoPath 必填" },
-        { status: 400 },
-      );
-    }
     // mode 校验：只接受 chat / plan、其他值都拒；不传时 createTask 会默认 plan（V0.2 起）
     const mode =
       body.mode === "chat" || body.mode === "plan" ? body.mode : undefined;
+    // V0.4：chat 模式所有字段选填、plan 模式仍要 title + repoPath（前端表单已校验、这里再兜一道）
+    // chat 模式 title / repoPath 缺省由 task-fs.createTask 兜底
+    if (mode !== "chat") {
+      if (!isNonEmptyString(body.title) || !isNonEmptyString(body.repoPath)) {
+        return NextResponse.json(
+          { error: "plan 模式 title 和 repoPath 必填" },
+          { status: 400 },
+        );
+      }
+    }
     const workflowId = sanitizeWorkflowId(body.workflowId);
     const task = await createTask({
-      title: body.title.trim(),
-      repoPath: body.repoPath.trim(),
+      // 不强行 trim：task-fs.createTask 内部会判空并按 mode 兜底（chat 给占位标题、用户 home）
+      title: isNonEmptyString(body.title) ? body.title.trim() : "",
+      repoPath: isNonEmptyString(body.repoPath) ? body.repoPath.trim() : "",
       mode,
       workflowId,
+      role: sanitizeRole(body.role),
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
-        : undefined,
-      feishuUrl: isNonEmptyString(body.feishuUrl)
-        ? body.feishuUrl.trim()
         : undefined,
       swaggerUrl: isNonEmptyString(body.swaggerUrl)
         ? body.swaggerUrl.trim()

@@ -1,14 +1,16 @@
 /**
  * POST /api/tasks/[id]/start-workflow
  *
- * V0.2 plan 模式任务专用：启动 workflow agent run（一次 SDK Run 跑全程 4 phase）。
+ * plan 模式任务专用：启动 workflow agent run（V0.3.4 起 plan → build 共 2 phase、一次 SDK Run 跑全程）。
  *
  * Body: { apiKey: string; model: ModelSelection; mcpServers?: Record<string, McpServerConfig> }
  *
- * 跟 start-chat 同款的「启动 / 订阅拆开」设计：
+ * 「启动 / 订阅拆开」设计：
  *   - 本路由只管启动 + 立即返回最新 task
  *   - SSE 订阅走 GET /watch-chat（plan 模式也复用同一条流、watch-chat 已放开 mode 校验）
  *   - 已经在跑 → 200 already=true（幂等、刷新页面随便点不报错）
+ *
+ * 备注：chat 模式没有专门的 start 路由（V0.4 已删 /start-chat）、启动职责合到 /chat-reply。
  */
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
@@ -81,7 +83,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   if (task.mode !== "plan") {
     return errorResponse(
-      `任务 mode=${task.mode}、不是 plan 模式、走 /start-chat`,
+      `任务 mode=${task.mode}、不是 plan 模式、chat 模式走 /chat-reply`,
       409,
     );
   }

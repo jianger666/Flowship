@@ -61,6 +61,7 @@ import {
   publishChatStreamEvent,
   type ChatStreamEvent,
 } from "./chat-runner";
+import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -69,7 +70,6 @@ import {
 import type {
   PhaseId,
   Task,
-  TaskContextDoc,
   TaskEvent,
   WorkflowDef,
 } from "@/lib/types";
@@ -140,7 +140,6 @@ const loadPhasePrompt = async (
     title: task.title,
     repoPath: task.repoPath,
     feishuStoryUrl: task.feishuStoryUrl,
-    feishuUrl: task.feishuUrl ?? task.feishuStoryUrl,
     swaggerUrl: task.swaggerUrl,
     description: task.description,
     attachedDocs,
@@ -152,66 +151,9 @@ const loadPhasePrompt = async (
   });
 };
 
-// ----------------- 上下文文档清单（V0.3） -----------------
-//
-// V0.3 设计：只 inject「数据」（清单本身）、规则都搬到 skill `context-docs-handler`。
-//   - 命中 skill 触发条件 → agent 自己 read SKILL.md 拿规则
-//   - super-prompt 末尾仍然给一行明确指引、防止 agent 不主动 read
-//
-// 对 text 类型仍然「短文本默认全 inject、长文本截断」——
-// 这是「数据呈现规则」（信息保真要求）、不是「处理规则」、所以留在这里。
-// 长 text 截断标记的语义解释 / 怎么处理截断、是 skill 的事。
-
-const TEXT_INLINE_INJECT_MAX = 1000;
-
-// text 类型 inject 规则
-const renderContextDocBody = (doc: TaskContextDoc): string => {
-  if (doc.type !== "text") {
-    return `   ${doc.content.trim()}`;
-  }
-  const t = doc.content.trim();
-  if (t.length <= TEXT_INLINE_INJECT_MAX) {
-    return t
-      .split("\n")
-      .map((line) => `   ${line}`)
-      .join("\n");
-  }
-  const head = t.slice(0, TEXT_INLINE_INJECT_MAX);
-  return [
-    ...head.split("\n").map((line) => `   ${line}`),
-    `   …（**已截断、原文共 ${t.length} 字、超过 ${TEXT_INLINE_INJECT_MAX} 字上限**）`,
-  ].join("\n");
-};
-
-const renderContextDocsSection = (task: Task): string => {
-  const docs = task.contextDocs ?? [];
-  if (docs.length === 0) {
-    return [
-      "## 用户提供的上下文文档（0 份）",
-      "",
-      "用户目前没有提供任何上下文文档。",
-      "",
-      "→ 如果 plan phase 上下文极度缺失、在 01-plan.md 的「待澄清 / 不确定项」段写「需要用户补 XX 上下文」、然后正常调 wait_for_user 等用户在面板里补。",
-    ].join("\n");
-  }
-  const items = docs.map((doc, i) => {
-    const idx = i + 1;
-    const titleLine =
-      doc.type === "text"
-        ? `${idx}. **【${doc.title}】**（text、${doc.content.trim().length} 字）`
-        : `${idx}. **【${doc.title}】**（${doc.type}）`;
-    return [titleLine, renderContextDocBody(doc)].join("\n");
-  });
-  return [
-    `## 用户提供的上下文文档（${docs.length} 份）`,
-    "",
-    items.join("\n\n"),
-    "",
-    "→ **不确定怎么拉 / 怎么处理 doc 间冲突 / text 截断标记是什么意思**、read skill `context-docs-handler`",
-  ].join("\n");
-};
-
 // ----------------- 起手 super-prompt -----------------
+//
+// V0.3 上下文文档清单 inject 已抽到 ./context-docs-prompt.ts、plan / chat 共用
 
 /**
  * 一次性告诉 agent 整套 workflow 怎么跑：phase 列表 + 每个 phase 的 prompt 内容 + 调用约定。
@@ -437,7 +379,10 @@ const buildSuperPrompt = async (
     `- 仓库根目录（agent cwd）：${task.repoPath}`,
     `- 当前角色：${TASK_ROLE_LABEL[task.role]}（role=${task.role}）—— 飞书 story 通常是跨角色共享的、你只挑跟你这个角色相关的部分做`,
     "",
-    renderContextDocsSection(task),
+    renderContextDocsSection(
+      task,
+      "→ 如果 plan phase 上下文极度缺失、在 01-plan.md 的「待澄清 / 不确定项」段写「需要用户补 XX 上下文」、然后正常调 wait_for_user 等用户在面板里补。",
+    ),
     "",
     "## Artifact 文件绝对路径（按 phase 序、写入用绝对路径避免 cwd 歧义）",
     "",
@@ -563,7 +508,9 @@ interface PlanRunnerGlobalState {
   runningPlans: Map<string, RunningRecord>;
 }
 
-const PLAN_RUNNER_GLOBAL_KEY = "__feAiFlowPlanRunnerState__";
+// V1：2026-05-15 加版本号后缀作防御；后续改 runner 内部 state 字段结构时 bump 版本号
+// 避免 dev hot reload 拿到旧版残留字段、跟 chat-mcp.ts GLOBAL_KEY 同款套路
+const PLAN_RUNNER_GLOBAL_KEY = "__feAiFlowPlanRunnerStateV1__";
 
 const getRunnerState = (): PlanRunnerGlobalState => {
   const g = globalThis as unknown as Record<string, PlanRunnerGlobalState>;

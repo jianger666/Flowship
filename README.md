@@ -2,10 +2,12 @@
 
 **项目级 AI Harness 平台 · 飞书 story → PR 自动化**——站在 Cursor SDK 肩膀上、把「读飞书 / 拉接口文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验」这 80% 的手工活自动化、用户只在每个 phase 边界 ack 一次。
 
+**核心是 Harness（缰绳）**：每个 phase 边界都用确定性工具（typecheck / lint / hooks / Skills / MCP / HITL ack）加固质量、用 12 步 harness 方法论压住 LLM 的非确定性、保证产出可观测、可回退、可复用。UI 上的「开发流水线」是产品形态、底下是「AI 写代码 + harness 保质量」这套工程哲学。
+
 **V0.4 当前能力**：
 
 - **plan 模式（推荐）**：粘飞书 story 链接 + 选角色（当前仅前端、未来扩后端 / 数仓 / 测试…）→ `plan → build` 2 phase workflow 自动跑、每个 phase 边界你 ack 才推进
-- **chat 模式**：长会话、一次 SDK Run 跑到底、agent 用 `wait_for_user` MCP 反复阻塞等用户下一句、维持单次扣费
+- **chat 模式（V0.4 自由化）**：表单全选填、进任务后底部输入框直接发消息自动启 agent；长会话、一次 SDK Run 跑到底、agent 用 `wait_for_user` MCP 反复阻塞等用户下一句、维持单次扣费
 
 **主流程**：
 
@@ -53,9 +55,9 @@ pnpm dev
    - **仓库**：点「选择文件夹」弹原生 dialog 选目录、自动填仓库名
    - **MCP servers**：JSON 编辑器、自由配（建议至少配 `feishu-project-mcp` + `feishu-mcp`、plan 模式拉 story / wiki 要用）
 2. **主页 `/`**：任务卡片看板、点「新建任务」开始
-3. 新建任务时选 **mode + 角色**：
+3. 新建任务时选 **mode**：
    - **plan**（默认、推荐）：粘飞书 story + 选角色 + 选仓库、自动跑 `plan → build`
-   - **chat**：整页对话 UI、说一句 agent 答一句、`completed` 后还能「再聊一次」重启
+   - **chat**（V0.4 起全选填）：可只输入飞书项目链接 / 仓库 / 标题、不绑仓库默认 `~`、进任务后底部输入框发首条消息自动启 agent；`completed` / `failed` 状态再发消息自动重启新一段 SDK Run
 4. plan 任务详情页：左侧 artifact 预览（按 phase 切换）、右侧事件流、顶部「通过 / 跟 AI 再聊聊」按钮
 5. 不想要的任务可手动归档 / 删除；completed/failed 7 天没动会自动归档
 
@@ -78,10 +80,9 @@ fe-ai-flow/
 │   │       ├── tasks/route.ts               # GET 列表 / POST 新建（mode + workflowId + role + feishuStoryUrl）
 │   │       ├── tasks/[id]/route.ts          # GET / PATCH / DELETE
 │   │       ├── tasks/[id]/events/           # GET：events SSE 增量
-│   │       ├── tasks/[id]/start-chat/       # POST：spawn chat agent（fire-and-forget）
 │   │       ├── tasks/[id]/start-workflow/   # POST：spawn plan workflow agent
 │   │       ├── tasks/[id]/watch-chat/       # GET：SSE 订阅（chat / plan 共用、replay + 增量）
-│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复、resolve agent 阻塞
+│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（V0.4 起兼具自动启 agent 职责）
 │   │       ├── tasks/[id]/phase-ack/        # POST：plan 用户 phase ack（approve / revise）
 │   │       ├── tasks/[id]/ask-reply/        # POST：ask_user 弹窗答复
 │   │       ├── tasks/[id]/wait-ack/         # GET：V0.3.5 shell long-poll 长连接、保活核心
@@ -106,8 +107,9 @@ fe-ai-flow/
 │       └── server/
 │           ├── task-fs.ts                   # 服务端：data/tasks/ 持久化（meta.json + events.jsonl + artifacts/、含原子写 + 任务级互斥锁）
 │           ├── plan-runner.ts               # plan workflow runner：单 SDK Run 跑 2 phase + super-prompt 注入 task.role
-│           ├── chat-runner.ts               # chat 模式 agent 生命周期 + publish/subscribe（plan 共用）
+│           ├── chat-runner.ts               # chat 模式 agent 生命周期 + V0.4 firstMessage 注入 + publish/subscribe（plan 共用）
 │           ├── chat-mcp.ts                  # 本地 HTTP MCP（wait_for_user / ask_user、V0.3.5 race fix + grace 60s）
+│           ├── context-docs-prompt.ts      # contextDocs prompt 渲染 helper（V0.4 抽出、plan / chat 共用）
 │           └── skills-loader.ts             # 自定义 SKILL.md 加载器
 ├── prompts/
 │   ├── phase-1-plan.md                      # Phase 1 prompt 模板（V0.3.4 起：context + plan 合并、按 {{role}} 调整视角）
