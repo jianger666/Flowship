@@ -45,7 +45,6 @@ import { PhaseProgress } from "@/components/tasks/phase-progress";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
   DialogContent,
@@ -482,7 +481,7 @@ const TaskDetailPage = () => {
                     >
                       <SelectTrigger
                         size="sm"
-                        className="h-8 w-[150px] text-xs"
+                        className="w-[160px]"
                         title={
                           !defaultModelId
                             ? "请先在设置页选默认模型"
@@ -516,24 +515,23 @@ const TaskDetailPage = () => {
                         ))}
                       </SelectContent>
                     </Select>
-                    {/* 换 agent toggle（chip）：切了模型时隐含 true 且 disable */}
-                    <ChoiceButton
-                      shape="chip"
-                      selected={showFork}
+                    {/* 换 agent toggle：跟其他按钮同 size、selected 时 secondary 突出 */}
+                    <Button
+                      variant={showFork ? "secondary" : "outline"}
+                      size="sm"
                       onClick={() => !modelChanged && setForkAgent(!forkAgent)}
                       disabled={modelChanged || ackSubmitting}
                       title={
                         modelChanged
                           ? "切了模型必须起新 agent（不可关）"
                           : showFork
-                            ? "勾选：通过时起新 Agent.create run、+1 send 配额"
+                            ? "已勾选：通过时起新 Agent.create run、+1 send 配额"
                             : "默认：同 agent 续跑、不计费"
                       }
-                      className="inline-flex items-center gap-1"
                     >
-                      <UserPlus className="size-3" />
-                      换 agent{modelChanged ? "（必）" : ""}
-                    </ChoiceButton>
+                      <UserPlus />
+                      换 agent
+                    </Button>
                     {/* 补意见（倒数第二） */}
                     <Button
                       variant="outline"
