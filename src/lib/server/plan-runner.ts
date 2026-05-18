@@ -1323,22 +1323,9 @@ const handlePlanSdkMessage = async (
                 args: argsStr ? truncate(argsStr) : undefined,
               },
             });
-            // V0.5.1 兜底：检测 agent 用 `edit` 工具写不存在的 artifact
-            // 这是 fast 模型常见 anti-pattern、给用户一条 warning 解释原因
-            if (msg.name === "edit" || msg.name === "Edit") {
-              try {
-                const stat = await fs.stat(possibleTarget);
-                if (!stat.isFile()) throw new Error("not a file");
-              } catch {
-                await writeEventAndPublish(taskId, {
-                  kind: "error",
-                  text:
-                    `⚠️ agent 在用 edit 工具创建不存在的 artifact 文件 (${possibleTarget})、` +
-                    `SDK 会拒掉这次调用。正确做法：写 artifact 初稿用 write 工具、不是 edit。` +
-                    `（这是 V0.5.1 已知 anti-pattern、可能导致 run failed）`,
-                });
-              }
-            }
+            // 注：之前在这做过「edit + 文件不存在」的 warning 检测、是误报
+            // 实测 SDK 1.0.13 的 edit 工具能创建不存在文件、不会拒
+            // 如果真的失败、会走下面 status=error 分支报「artifact 写入失败」
             break;
           }
           if (msg.status === "error") {
