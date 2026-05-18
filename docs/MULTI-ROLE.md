@@ -105,7 +105,7 @@ story 6993079032（产品需求）
 ## 未来探索（不在路线图）
 
 - **跨 repo 协同**：前端 task 跑完、自动建一个后端 task 让后端同事跑（需要全员都用 fe-ai-flow、目前用户基数不够）
-- **story 自动状态同步**：phase ack 后自动改飞书 story 的「前端完成度 / 后端完成度」字段（V0.3.3 已砍 ship phase、效果不稳）
+- **story 自动状态同步**：phase ack 后自动改飞书 story 的「前端完成度 / 后端完成度」字段（V0.3.3 已砍 ship phase——出于注意力管理、先把 plan/build 做扎实）
 - **角色协作仪表盘**：在 story 维度看「前端 task=plan ack、后端 task=build running」之类的全局视图
 
 ## 关联文档

@@ -74,7 +74,10 @@
 
 #### V0.3.3（2026-05-13）：砍 ship phase + 周边 UX
 
-- **删 ship phase**（提 PR + 同步飞书 story 状态、效果不稳、改用户手提）
+- **删 ship phase**（提 PR + 同步飞书 story 状态）
+  - **砍掉理由 = 注意力管理、不是技术决策**：用户拍板「一个 phase 一个 phase 做扎实、先不让后面的 phase 影响当前焦点」。当时 plan / build 本身的产出还在打磨、ship 自动化（git push / 飞书 MCP）一旦掺进来、踩坑面会同时变大、调试链路变长。先收敛到 `plan → build`、把这两 phase 跑稳之后再考虑后续 phase。
+  - ⚠️ **不要再写"砍 ship 因为效果不稳"**——这是早期 commit message 里的错误表述、已统一更正
+  - V0.5 起会重新引入"build 之后的 phase"、但形态变了（review、不是 ship）、见下方 V0.5 设计段
 - **任务级 MCP 黑名单** `Task.disabledMcpServers`：UI 给每个任务一个开关、settings 加新 MCP 自动对所有任务生效、用户能按任务关掉某些 MCP（黑名单语义而不是白名单）
 - **Settings 优化**：模型列表按钮不需要 API key 验证、MCP servers JSON 加 prismjs 高亮
 - **AskUserDialog**：「Other」选中时同时显示其它 option（不是切换式）、textarea 移到下方、有底部间距
@@ -184,7 +187,196 @@
 - **自定义 workflow**：V0.2 写死 `feishu-story-impl`、未来支持多 workflow 注册
 - **cost / token dashboard**
 
-### 关键文件速查（V0.3.5 更新）
+---
+
+### V0.5 设计预告：review phase + 多 phase 模型选择 + plan 校验前移
+
+> **状态：设计阶段、代码未动**。用户拍板「先落 HANDOFF 再动代码」、本段是接力 AI 进来后判断「下一步做什么」的权威。设计 2026-05-18 跟用户对齐。
+
+#### 动机
+
+V0.3.3 砍掉 ship phase 是注意力管理决策（先把 plan / build 做扎实、不让后面的 phase 影响）、不是「ship 这个方向不对」。现在 plan + build 走得相对稳了、是时候补"编码完成之后"那一段——但形态从 ship（自动 PR / 飞书同步）转向 **review**（拿确定性产物做差值对照）、因为：
+
+1. **ship 的"动作部分"风险高**：git push / 改飞书 story 状态都是不可逆动作、LLM 选错工具就麻烦
+2. **ship 的"信息部分"价值高**：commit msg / PR body / 飞书评论草稿用户每次都要写、自动化 ROI 直接
+3. **review 是真正的 harness 增量**：拿 `git diff`（确定性产物）跟 `01-plan.md`（确定性约束）做结构化差值、给用户喂 review 弹药、不让 LLM "判断对错"（避开 Cognition 警告的 AI 自审共识盲点）
+
+#### Phase 拓扑变化
+
+```
+当前（V0.4）：plan → build
+V0.5 起：     plan → build → review
+```
+
+review 完成后任务 = `completed`。PR 提交 + 飞书状态回写 **仍然**由用户手动（不重新自动化）、但 review artifact 里会带 commit msg / PR body / 飞书评论草稿、用户复制走。
+
+#### review phase 设计要点
+
+| 维度 | 设计 |
+|---|---|
+| **输入** | `01-plan.md` + `02-build.md` + `git diff`（本次 build 实际改动） + contextDocs（飞书需求 + 用户补充文档） + 仓库现状 |
+| **产出** | `artifacts/03-review.md` |
+| **artifact 结构** | 顶部「整体一致性」总评 + 4 类差异表 + 跟飞书需求对照 + 交付信息（commit msg / PR body / 飞书评论草稿） |
+| **HITL** | 用户「整体通过」一次性 ack、或对单项 revise（agent 按指示动 build 或 plan） |
+| **差异由谁改** | **按差异类型分流**（详见下表）、不做 agent 自动循环修复 |
+
+**4 类差异分流**（用户拍板「先做出来看效果」、表格仅作设计预案、artifact 模板会给最终形态）：
+
+| 差异类型 | 默认建议 | 谁拍板 |
+|---|---|---|
+| 范围扩张（plan 没列、实际改了） | 更新 plan task 加上、agent 解释为什么必要 | 用户 ack（默认通过） |
+| 范围收缩（plan 列了、实际没改） | 从 plan 删 / 加「已无必要」注解 | 用户 ack |
+| 实现偏差（plan 描述跟实际改法不一致） | 🚨 标红、必看 | 用户必选：a) 改回 plan b) 接受偏差 + 更新 plan 描述 |
+| 未完成（plan task N 没做） | 列原因 | 用户必选：a) 现在补 b) 建 follow-up task c) 接受 |
+
+**坚决不做** "agent 发现差异自己修、再 review 一轮" 这种自动循环（会死循环 / 烧 token、HITL 闸门被绕过）。
+
+#### plan phase 增强：校验前移（防御性、不开新坑）
+
+review phase 兜底的逻辑可能让 plan / 飞书文档的差异留到 review 才发现、循环回 plan 浪费 1 次 ack。所以 V0.5 同步增强 plan：
+
+- plan agent 生成 `01-plan.md` 时、如果发现自己对飞书 story / contextDocs 的理解跟原文有差异（hallucinate / 偏离 / 信息缺失）、必须在 artifact 里写**「我的理解 vs 飞书原文」对照段**
+- 用户审 plan 时直接看到差异、当场修正、不留到 review 阶段
+- 实现：改 `prompts/phase-1-plan.md`、加一段「自我校验」步骤 + artifact section 模板
+
+#### agent 复用策略（用户拍板：决定权给用户）
+
+```
+默认（V0.5 起）：plan → build → review 全程同一 agent（同一 SDK Run、+0 send 配额、上下文连续）
+可选：用户在 phase ack 时手动切「换新 agent」、+1 send 配额、reviewer ≠ author
+```
+
+**为什么默认同一个 agent**（不是默认强制起新的）：用户老套餐是 500 次请求计费、不是 token 计费、小需求起新 agent 浪费配额。决定权给用户、复杂 / 重要任务用户自己点「换新 agent」。UI 上 phase ack 弹窗加 toggle、默认关闭、关闭时灰色提示「→ 起新 run、+1 send 配额、reviewer ≠ author、更接近真人 code review」。
+
+#### 模型选择策略（用户提议、值得做）
+
+```
+settings.defaultModel = 默认模型（所有 phase / 新建任务的初始选中值）
++ 每个 phase ack 时可切模型（默认值 = settings.defaultModel）
++ 切了不同模型 → UI 暗示「下一 phase 必须起新 agent run」（SDK 限制：同一 run 内不能换模型）
+```
+
+实现要点：
+- settings 加 / 复用 `defaultModel` 字段（已有）
+- 新建任务表单、phase ack 弹窗都加 model selector、初始值 = `defaultModel`
+- 切了不同模型 → 自动勾上「换新 agent」toggle、不让用户手动两步操作
+
+#### artifact 模板：03-review.md
+
+放在本文档下方「附录 A: 03-review.md artifact 模板示例」段、供 prompt 设计时直接抄。
+
+#### 不做（V0.5 明确止损）
+
+- ❌ 自动 git push / 自动调飞书 MCP 改 story 状态（V0.3.3 砍 ship 的核心规避项、V0.5 不重新拾起）
+- ❌ agent 自动循环修复差异（HITL 闸门优先）
+- ❌ 默认强制起新 agent run（用户拍板：决定权给用户、500 次套餐计费现实）
+- ❌ 给 review 强制配「专用模型」（用户拍板：默认就是 settings 默认模型、不过度设计）
+- ❌ review 之后再加 phase（V0.5 收敛到 review、不一次开多个口子）
+
+#### 实施 checklist（未启动、给将来做的 AI 用）
+
+| 步骤 | 文件 | 说明 |
+|---|---|---|
+| 1. 加 PhaseId | `src/lib/types.ts` | `PhaseId = "plan" \| "build" \| "review"` + `WORKFLOWS.feishu-story-impl.phases` 加 review |
+| 2. 写 review prompt | `prompts/phase-3-review.md` | 拿 git diff + plan + build artifact 做差值对照、按 4 类差异分流、产出 commit msg / PR body / 飞书评论草稿 |
+| 3. plan 校验前移 | `prompts/phase-1-plan.md` | 加「我的理解 vs 飞书原文」对照段要求 |
+| 4. plan-runner 支持 review | `src/lib/server/plan-runner.ts` | super-prompt 把 review 段加进去、artifact 路径加 `03-review.md` |
+| 5. UI 加模型 selector | `src/components/tasks/new-task-dialog.tsx` + phase ack 弹窗 | 默认值 = settings.defaultModel |
+| 6. UI 加「换新 agent」toggle | phase ack 弹窗（plan-mode 详情页） | 默认关闭、选不同模型时自动勾上 |
+| 7. plan-runner 支持换模型 / 换 agent | `src/lib/server/plan-runner.ts` | ack 带 `nextModel` / `forkAgent` 字段时、起新 `Agent.create` run |
+| 8. phase 进度条 / 任务列表展示 review | `src/components/tasks/phase-progress.tsx` + `task-card.tsx` | review 灰 / 黄 / 绿三态 |
+
+#### 附录 A：03-review.md artifact 模板示例
+
+````markdown
+---
+phase: review
+status: awaiting_ack
+upstream: 01-plan.md, 02-build.md
+downstream: (final)
+task_id: t_xxx
+generated_at: 2026-05-18T10:00:00+08:00
+---
+
+# Review · 任务名称
+
+## 一、整体一致性总评
+
+- **plan 实施完整度**：5/7 task 完成（71%）
+- **代码改动跟 plan 范围匹配度**：高 / 中 / 低（附理由）
+- **跟飞书 story 原始需求一致性**：高 / 中 / 低（附理由）
+- **建议结论**：✅ 可交付 / ⚠️ 有偏差需用户决策 / ❌ 实施严重偏离 plan
+
+## 二、差异分类对照
+
+### 2.1 范围扩张（plan 没列、实际改了）
+
+| 文件 | 改动概要 | 为什么必要 | 建议 |
+|---|---|---|---|
+| `src/lib/foo.ts` | 新增 utility 函数 | task 3 用到、plan 漏列 | 加入 plan task 3 |
+
+### 2.2 范围收缩（plan 列了、实际没改）
+
+| plan task | 原计划 | 实际状况 | 建议 |
+|---|---|---|---|
+| task 5 | 改 BarComponent.tsx | 实际已是目标形态、无需改 | 从 plan 删 |
+
+### 2.3 🚨 实现偏差（plan 描述跟实际改法不一致、用户必看）
+
+> 这里每条用户必须选一个处理路径、否则 review 不能 ack。
+
+#### 偏差 1：task 2 的状态管理
+
+- **plan 描述**：用 `useState` 维护表单 state
+- **实际改法**：改用 `useReducer`
+- **原因**：字段联动复杂、useState 写出来要 5 个 setter 互相调
+- **用户选择**：
+  - a) 改回 useState（agent 会按 plan 改代码）
+  - b) 接受偏差、更新 plan 描述
+
+### 2.4 未完成（plan task N 没做）
+
+| plan task | 原计划 | 为什么没做 | 建议 |
+|---|---|---|---|
+| task 7 | 加单测 | 时间不足 / 仓库无单测惯例 | a) 现在补 b) follow-up task c) 接受 |
+
+## 三、跟飞书需求对照
+
+| 飞书需求项 | 本次是否覆盖 | 实施位置 | 备注 |
+|---|---|---|---|
+| 用户列表批量导出 | ✅ | `src/pages/users/list.tsx:42-86` | |
+| 导出权限校验 | ❌ | (未实施) | plan 漏列、需要补 |
+
+## 四、交付信息（用户复制走）
+
+### 4.1 Commit message 草稿
+
+```
+feat(users): 加用户列表批量导出
+
+- 新增 ExportButton 组件、调 /api/users/export
+- ...
+```
+
+### 4.2 PR title + body 草稿
+
+**标题**：`feat(users): 用户列表批量导出 [STORY-12345]`
+
+**正文**：（agent 按团队 PR template 填）
+
+### 4.3 飞书评论草稿（给 PM / 测试看）
+
+> 用户列表批量导出已完成、已开 PR #xxx。改动范围：xxx。需要测试关注：xxx。
+
+### 4.4 自测 checklist
+
+- [ ] 启动 dev server、访问 /users/list
+- [ ] 点「批量导出」按钮、确认弹窗 → 确认下载文件
+- [ ] xxx
+````
+
+> ⚠️ 这是设计稿、prompt 拿这个当 schema、不要原样让 agent 复制。实际产出 agent 会按真实改动填、4 类差异里有 0 项时整段省略。
+
 
 | 想找 | 看这里 |
 |---|---|

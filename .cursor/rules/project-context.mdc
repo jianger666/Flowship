@@ -41,7 +41,7 @@ plan → build
 
 历史演进：
 - V0.2 是 `context → plan → build → ship`（4 phase）
-- V0.3.3 砍了 ship（提 PR + 同步飞书 story 状态、效果不稳）
+- V0.3.3 砍了 ship（注意力管理、先把 plan / build 做扎实、不是因为效果不稳）
 - V0.3.4 把 context 合进 plan（实操中分离价值未兑现、用户审 context 跟审 plan 判断点重合、合并后 plan 一气呵成 1 次 ack）
 
 V1 legacy 模式（chat-only）的代码保留、新功能不再往那边加。
