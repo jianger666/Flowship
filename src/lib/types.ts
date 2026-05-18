@@ -316,6 +316,12 @@ export interface Task {
   //   服务端 Agent.resume(this.id) + send "[RESUME] 继续监听用户 ack" 推进
   // - 没有 lastAgentId（如老数据、或 chat 模式）→ /resume-waiting 路由降级走 new agent
   lastAgentId?: string;
+
+  // V0.5.1：任务级模型选择（新建任务时表单里挑、可跟 settings.defaultModel 不同）
+  // - 启动 workflow / chat 时优先用 task.model、回退到 settings.defaultModel
+  // - ack 时切了模型 = 隐含 fork（旧 agent 已经在用旧 model、不可热切）
+  // - 老数据没此字段、prepareRunArgs 兜底走 settings.defaultModel
+  model?: ModelSelection;
 }
 
 // 新建任务表单的入参（不含运行期字段）
@@ -332,6 +338,7 @@ export type NewTaskInput = Pick<
   | "description"
   | "attachedDocs"
   | "disabledMcpServers"
+  | "model"
 > & {
   mode?: TaskMode;
   workflowId?: WorkflowId;

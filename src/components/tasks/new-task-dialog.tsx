@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
 import { createTask, parseMcpServers } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
@@ -95,8 +96,16 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起——MCP 多的话能撑很高、用户大多不需要改
   const [mcpExpanded, setMcpExpanded] = useState(false);
+  // V0.5.1：任务级模型 id；默认 = settings.defaultModel.id、open 时初始化
+  // 用户可以为本任务挑跟设置页 default 不同的模型（如 chat 用 fast、plan 用 thinking）
+  const [pickedModelId, setPickedModelId] = useState<string>("");
+  // 默认模型 id（来自 settings、用于「选了跟默认一样就保留 params、否则清空 params」的判断）
+  const [defaultModelId, setDefaultModelId] = useState<string>("");
+  // 模型列表（异步拉、apiKey 有时才能拉到）
+  // 已经拉过的情况下不重复拉、避免每次打开弹窗都「已加载 N 个模型」toast
+  const { models: availableModels, loading: modelsLoading, fetchModels } = useModels();
 
-  // 打开时读 settings.repos + 解析 mcpServersJson
+  // 打开时读 settings.repos + 解析 mcpServersJson + 拉模型列表
   useEffect(() => {
     if (!open) return;
     const s = getSettings();
@@ -108,7 +117,15 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
       // 配置坏了不阻断建任务、设置页有错会单独提示
       setAvailableMcp([]);
     }
-  }, [open]);
+    // 模型默认 = settings.defaultModel.id
+    const defaultId = s.defaultModel?.id ?? "";
+    setDefaultModelId(defaultId);
+    setPickedModelId(defaultId);
+    // 只在没拉过时拉一次、避免每次开弹窗都 toast「已加载 N 个模型」
+    if (s.apiKey?.trim() && availableModels.length === 0 && !modelsLoading) {
+      void fetchModels(s.apiKey);
+    }
+  }, [open, fetchModels, availableModels.length, modelsLoading]);
 
   // 关闭时重置、防止下次再开还显示上次的输入
   useEffect(() => {
@@ -121,6 +138,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     setDescription("");
     setDisabledMcp([]);
     setMcpExpanded(false);
+    setPickedModelId("");
+    setDefaultModelId("");
   }, [open]);
 
   // 提交锁、避免连点
@@ -143,6 +162,23 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     if (!canSubmit) return;
     setSubmitting(true);
     try {
+      // V0.5.1：构造任务级 model
+      // - 选了跟 default 一样的 id → 用 settings.defaultModel（保留 params）
+      // - 选了别的 id → 新 ModelSelection（params 为空、用户没在这里编辑 variant）
+      // - 没选（apiKey 没填、列表没拉到）→ undefined、走 settings.defaultModel fallback
+      const settings = getSettings();
+      let model;
+      if (pickedModelId) {
+        if (
+          pickedModelId === defaultModelId &&
+          settings.defaultModel?.id === pickedModelId
+        ) {
+          model = settings.defaultModel;
+        } else {
+          model = { id: pickedModelId };
+        }
+      }
+
       const task = await createTask({
         mode,
         // plan 默认 workflow（task-fs.createTask 兜底也会塞、这里显式更清楚）
@@ -156,6 +192,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         description:
           mode === "plan" && description.trim() ? description.trim() : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
+        model,
       });
       toast.success("任务已创建（草稿）");
       setOpen(false);
@@ -351,6 +388,53 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               </p>
             </div>
           )}
+
+          {/* V0.5.1：任务级模型选择
+              - 默认 = settings.defaultModel.id（设置页选的那个）
+              - 用户可以为这一个任务挑别的模型、不影响 settings 默认
+              - 列表没拉到（没填 apiKey / 没在设置页拉过）时显示 disable + 提示 */}
+          <div className="grid gap-1.5">
+            <Label htmlFor="t-model">模型</Label>
+            <Select
+              value={pickedModelId || undefined}
+              onValueChange={(v) => v && setPickedModelId(v)}
+              disabled={availableModels.length === 0}
+            >
+              <SelectTrigger id="t-model" className="w-full">
+                <SelectValue
+                  placeholder={
+                    availableModels.length === 0
+                      ? defaultModelId
+                        ? `默认: ${defaultModelId}（API Key 没填、改不了）`
+                        : "未配模型、请先去设置页选"
+                      : "选模型"
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {availableModels.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    <span className="flex flex-col">
+                      <span>{m.displayName}</span>
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {m.id}
+                      </span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              默认 = 设置页的模型；可以为本任务单独挑别的
+              {pickedModelId &&
+                defaultModelId &&
+                pickedModelId !== defaultModelId && (
+                  <span className="ml-1 text-amber-500">
+                    （已切到非默认模型）
+                  </span>
+                )}
+            </p>
+          </div>
 
           {/* MCP 开关：默认全开 + 默认折叠（避免 MCP 多时撑弹窗）
               视觉风格跟详情页的 TaskMcpPanel 对齐、滚动区限高避免无限增高 */}

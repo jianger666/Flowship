@@ -29,6 +29,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import type { ModelSelection } from "@cursor/sdk";
+
 import {
   WORKFLOWS,
   type NewTaskInput,
@@ -357,6 +359,10 @@ interface TaskMeta {
   //     /resume-waiting 路由用这个 id 走 Agent.resume + send 继续等用户 ack
   //   - +1 send 配额、但只在异常路径才付出、绝大多数顺路 ack 不花
   lastAgentId?: string;
+  // V0.5.1：任务级模型选择（创建时表单里挑、可跟 settings.defaultModel 不同）
+  // - 启动 workflow / chat 时优先用 task.model、回退 settings.defaultModel
+  // - 老数据没此字段、hydrate 时按 undefined（调用方再 fallback）
+  model?: ModelSelection;
 }
 
 // 自动归档：completed / failed 且 7 天没动 → archived=true
@@ -595,6 +601,7 @@ const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
     lastAgentId: meta.lastAgentId,
+    model: meta.model,
   };
 };
 
@@ -839,6 +846,9 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
       input.disabledMcpServers && input.disabledMcpServers.length > 0
         ? input.disabledMcpServers
         : undefined,
+    // V0.5.1：任务级模型选择（new-task-dialog 表单里挑、可跟 settings.defaultModel 不同）
+    // 不传 → undefined、prepareRunArgs 兜底走 settings.defaultModel（保兼容老数据）
+    model: input.model,
     status: "draft",
     currentPhase: firstPhase,
     phases: buildEmptyPhases(),

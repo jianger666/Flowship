@@ -50,8 +50,20 @@ export const prepareRunArgs = (
     toast.error("缺少 API Key、请先在设置页填好");
     return null;
   }
-  if (!settings.defaultModel?.id?.trim()) {
-    toast.error("缺少默认模型、请先在设置页选好");
+
+  // V0.5.1：优先用任务级 model（new-task-dialog 创建时表单挑的）、回退到 settings.defaultModel
+  // 老数据没 task.model 字段、走 settings.defaultModel 兜底
+  const taskModel = task.model;
+  const fallbackModel = settings.defaultModel;
+  const model: ModelSelection | null =
+    taskModel?.id?.trim()
+      ? taskModel
+      : fallbackModel?.id?.trim()
+        ? fallbackModel
+        : null;
+
+  if (!model) {
+    toast.error("缺少模型、请在任务表单或设置页选好");
     return null;
   }
 
@@ -67,7 +79,7 @@ export const prepareRunArgs = (
 
   return {
     apiKey: settings.apiKey,
-    model: settings.defaultModel,
+    model,
     mcpServers,
   };
 };
