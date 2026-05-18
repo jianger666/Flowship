@@ -103,11 +103,7 @@
 
   `{{artifactPath}}`
 
-用 SDK 内置 `write` 工具（**不是 `edit`**——`edit` 只能改已存在文件、`write` 才能创建新文件）。args 形如 `{ path: "<绝对路径>", fileText: "<完整 markdown 内容>" }`。
-
-**必须用绝对路径**——agent cwd 是用户业务仓库（{{repoPath}}）、不是 fe-ai-flow 项目根、相对路径会写错地方。
-
-> ⚠️ V0.5.1 修复点：之前 prompt 写「用 `edit_file`」、但 Cursor SDK 1.0.13 实际暴露的工具叫 `edit`（改已有文件）和 `write`（创建/覆盖文件）、根本没有 `edit_file`。模型 fallback 到 `edit` 会因「文件不存在 + 无 oldText」失败、artifact 永远写不出来。**创建新 artifact 一律用 `write`、不要用 `edit`**。
+写 artifact 用 `artifact-writer` skill 教的方式——**首次写前 `read` 一次 skill 完整内容**（路径在 super-prompt 的 Skills 段、按 name 找）。简记：用 SDK 内置 `write` 工具、绝对路径、args `{ path, fileText }`。
 
 格式按下面骨架。
 

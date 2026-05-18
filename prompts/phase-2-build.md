@@ -67,12 +67,14 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 下一个 task
 ```
 
-**SDK 工具选择**：
+**SDK 工具选择（改业务代码）**：
 
-- **改已存在的文件** → 用 `edit` 工具、args 形如 `{ path, oldText, newText, replaceAll? }` 或 `{ path, edits: [{ oldText, newText }, ...] }` 做多段批量替换
-- **创建新文件 / 整文件覆盖** → 用 `write` 工具、args 形如 `{ path, fileText }`（**不要用 `edit` 创建新文件——会因没有 oldText 失败**）
+- **改已存在的代码文件** → 用 `edit` 工具、args `{ path, oldText, newText, replaceAll? }` 或 `{ path, edits: [...] }` 批量
+- **创建新的代码文件** → 用 `write` 工具、args `{ path, fileText }`
 - **删除文件** → 用 `delete` 工具
 - **跑命令** → 用 `shell` 工具
+
+**写 02-build.md artifact** → 不是改业务代码、走另一套：见 `artifact-writer` skill（建议第一次写 artifact 前 read 一次）。
 
 每个 task 改完后、在 02-build.md 里追加该 task 的实施记录。
 
