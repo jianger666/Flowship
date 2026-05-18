@@ -26,11 +26,14 @@
  * - Agent.resume 失败（agentId 已过期 / Cursor backend 拒绝）→ 让 plan-runner 内部抛错、写 error 事件
  */
 
+import fs from "node:fs/promises";
+
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
-import { getTask } from "@/lib/server/task-fs";
+import { getPhaseArtifactPath, getTask } from "@/lib/server/task-fs";
 import { isPlanRunning, runPlanWorkflow } from "@/lib/server/plan-runner";
-import type { Task } from "@/lib/types";
+import type { PhaseId, Task } from "@/lib/types";
+import { WORKFLOWS } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -113,20 +116,71 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // 拼一条简短 RESUME prompt 给 agent、告诉它「上次 wait-ack 断了、请重新调 wait_for_user 续接」
-  // 不重发 super-prompt（Agent.resume 自动恢复上下文）、只补一句操作指令
-  const currentPhase = task.currentPhase ?? "plan";
-  const resumePrompt = [
-    `[RESUME_WAITING]`,
-    ``,
-    `上一段 wait-ack 长连接异常断开（curl 失败 / 服务重启 / 网络断）、用户在 fe-ai-flow 看板上点了「继续监听」、由本路由用 Agent.resume 把你叫醒。`,
-    ``,
-    `当前 task=${task.id}、phase=${currentPhase}、task 状态：${task.status}。`,
-    ``,
-    `**你接下来只做一件事**：再次调用 \`wait_for_user(task_id="${task.id}", phase="${currentPhase}", artifact="<刚才写过的 artifact 路径>")\` 重新拿一个 [SHELL_WAIT_GUIDE]、然后按引导调 shell + curl 续接 wait-ack 长连接。`,
-    ``,
-    `**不要**重新执行已经做过的工作（artifact 已经在硬盘上、不要重写）、**不要**重新走 super-prompt 流程、**不要** emit 任何元叙述 assistant_message——直接调 wait_for_user 续接即可。`,
-  ].join("\n");
+  // 拼 RESUME prompt 给 agent
+  // V0.5.1：先**实际检查** currentPhase 对应的 artifact 是否在硬盘上、根据存在性分两条路：
+  //   - artifact 在 → wait-ack 长连接断了、agent 重新调 wait_for_user 续接 ack 即可
+  //   - artifact 不在 → 之前 run error 中途退出（如网络断在写 artifact 之前）、
+  //                     agent 必须**继续/重做**当前 phase 的工作、写完 artifact 再调 wait_for_user
+  //
+  // 老版本（V0.3.5）resume 不检查、一律告诉 agent「artifact 已经在硬盘上、直接 wait_for_user」、
+  // 结果 agent 信以为真、跑去 wait_for_user 阻塞 + 告诉用户「已产出」、用户硬盘上空着。
+  const currentPhase = (task.currentPhase ?? "plan") as PhaseId;
+  const workflowDef = WORKFLOWS[task.workflowId ?? "feishu-story-impl"];
+  const phaseIdx = workflowDef?.phases.indexOf(currentPhase) ?? -1;
+  const artifactPath =
+    phaseIdx >= 0 ? getPhaseArtifactPath(task.id, currentPhase, phaseIdx) : "";
+
+  let artifactExists = false;
+  if (artifactPath) {
+    try {
+      const stat = await fs.stat(artifactPath);
+      artifactExists = stat.isFile() && stat.size > 0;
+    } catch {
+      // 文件不存在 / stat 失败 → artifactExists = false
+    }
+  }
+
+  const resumePromptLines = artifactExists
+    ? [
+        `[RESUME_WAITING]`,
+        ``,
+        `上一段 wait-ack 长连接异常断开（curl 失败 / 服务重启 / 网络断）、用户在 fe-ai-flow 看板上点了「继续监听」、由本路由用 Agent.resume 把你叫醒。`,
+        ``,
+        `当前 task=${task.id}、phase=${currentPhase}、task 状态：${task.status}。`,
+        `服务端**已确认 artifact 在硬盘上**：\`${artifactPath}\``,
+        ``,
+        `**你接下来只做一件事**：再次调用 \`wait_for_user(task_id="${task.id}", phase="${currentPhase}", artifact="${artifactPath}")\` 重新拿一个 [SHELL_WAIT_GUIDE]、然后按引导调 shell + curl 续接 wait-ack 长连接。`,
+        ``,
+        `**不要**重新执行已经做过的工作（artifact 已经在硬盘上、不要重写）、**不要**重新走 super-prompt 流程、**不要** emit 任何元叙述 assistant_message——直接调 wait_for_user 续接即可。`,
+      ]
+    : [
+        `[RESUME_INCOMPLETE]`,
+        ``,
+        `上一轮 agent run 提前 error 退出（典型：网络断 / SDK retry 用完 / 工具调用失败）、用户在 fe-ai-flow 看板上点了「继续监听」、由本路由用 Agent.resume 把你叫醒。`,
+        ``,
+        `当前 task=${task.id}、phase=${currentPhase}、task 状态：${task.status}。`,
+        `服务端检查后**没找到** ${currentPhase} phase 的 artifact 文件（路径：\`${artifactPath}\`）——说明上一轮你**还没写完当前 phase**就退出了。`,
+        ``,
+        `**你接下来必须做的事**：`,
+        ``,
+        `1. **继续执行 ${currentPhase} phase 的工作**——按 super-prompt 里对应 phase 的指令做完该 phase 的产出动作（读 contextDocs / 扫仓库 / 改代码 / ……）`,
+        `2. **用 \`write\` 工具把 artifact 写到**：\`${artifactPath}\``,
+        `   args 形如 \`{ path: "${artifactPath}", fileText: "<完整 markdown>" }\``,
+        `   **不是 \`edit\`**——artifact 文件目前不存在、edit 会失败`,
+        `3. 写完 artifact **再**调 \`wait_for_user(task_id="${task.id}", phase="${currentPhase}", artifact="${artifactPath}")\` 拿 [SHELL_WAIT_GUIDE]、按引导调 shell + curl 等 ack`,
+        ``,
+        `**绝对不要**：`,
+        `- 跳过实际工作直接调 wait_for_user 喊「已完成」（artifact 没写 = 没完成）`,
+        `- emit assistant_message 说「我已经把 ${currentPhase} 做完了」之类的总结——用户看的是硬盘上的 artifact、不是你的话`,
+        `- 编造工作完成状态——服务端会比对硬盘 artifact 文件大小、骗不过去`,
+        ``,
+        `上一轮你做到哪里了、上下文应该在你的会话历史里、按历史接着做即可。如果历史信息不够、就重新做一遍 ${currentPhase} phase。`,
+      ];
+  const resumePrompt = resumePromptLines.join("\n");
+
+  console.log(
+    `[resume-waiting] task=${task.id} phase=${currentPhase} artifactExists=${artifactExists} path=${artifactPath}`,
+  );
 
   // fire-and-forget：runPlanWorkflow 在 isResume=true 时跳过 phase_start、走 Agent.resume + send
   void runPlanWorkflow({
