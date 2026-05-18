@@ -119,10 +119,8 @@ const loadPhasePrompt = async (
   const fname = PHASE_PROMPT_FILE[phaseId];
   const fpath = path.join(PROMPTS_DIR, fname);
   const tpl = await fs.readFile(fpath, "utf-8");
-  const attachedDocs =
-    (task.attachedDocs ?? []).length > 0
-      ? task.attachedDocs!.map((p, i) => `  ${i + 1}. ${p}`).join("\n")
-      : "（无）";
+  // V0.5.3：原先注入的 attachedDocs / swaggerUrl 模板变量已废弃（字段被 contextDocs 完全取代）
+  // 当前 phase-*.md 模板没有引用这两个 {{}} 占位、删了不会触发「(未提供)」fallback
   // phase 自身的 artifact 绝对路径（agent 写入用、避免相对路径 cwd 歧义）
   const artifactPath = getPhaseArtifactPath(task.id, phaseId, phaseIdx);
   // 上一 phase 的 artifact（给 Phase 2/3 读上游）
@@ -154,9 +152,7 @@ const loadPhasePrompt = async (
     title: task.title,
     repoPath: task.repoPath,
     feishuStoryUrl: task.feishuStoryUrl,
-    swaggerUrl: task.swaggerUrl,
     description: task.description,
-    attachedDocs,
     artifactPath,
     artifactsDir: getArtifactsDir(task.id),
     prevArtifactPath,

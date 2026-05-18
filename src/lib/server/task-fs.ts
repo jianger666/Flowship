@@ -44,6 +44,7 @@ import {
   type TaskMode,
   type TaskRole,
   type TaskStatus,
+  type TaskSummary,
   type WorkflowId,
 } from "@/lib/types";
 
@@ -332,10 +333,10 @@ interface TaskMeta {
   // V0.2 主要入口（飞书 story / 项目链接）
   // V0.4 起 chat 模式建任务也复用这个字段、统一以 feishuStoryUrl 为起点
   feishuStoryUrl?: string;
-  swaggerUrl?: string;
   description?: string;
-  // 创建时附的额外文档 / 路径（绝对路径）
-  attachedDocs?: string[];
+  // V0.5.3 删 swaggerUrl / attachedDocs（已被 contextDocs 取代）——
+  // 老 meta.json 残留这两字段时直接忽略：readMeta 返出来的 TaskMeta 没这俩
+  // key、hydrateTask 也不再读、UI / agent 看不到、相当于「字段静默吞掉」
   // V0.3：任务级上下文文档清单（详情页面板里增删）
   // - 飞书 story URL 在 createTask 时自动作为第一条（title="飞书 story"）
   // - 老数据没此字段、hydrate 时按 [] 兜底
@@ -567,6 +568,37 @@ const resolveWorkflowPhases = (meta: TaskMeta): PhaseId[] => {
   return PHASE_ORDER;
 };
 
+/**
+ * 把 meta 转成 TaskSummary（V0.5.3：列表场景专用、不读 events.jsonl / artifact）
+ *
+ * 跟 hydrateTask 比少做两件事：
+ *   - 不 await readEvents（events.jsonl 可能几千行、parse 开销大）
+ *   - 不 await readArtifact（3 个 phase × 文件 IO）
+ *
+ * listTasks 走这个、fetchTasks 走它的返回值；详情页 / 单 task API 仍走 hydrateTask 拿全量
+ */
+const hydrateTaskSummary = (meta: TaskMeta): TaskSummary => ({
+  id: meta.id,
+  title: meta.title,
+  // 老数据没 mode 字段、按 plan 兜底（V1 之前的数据都是 plan 模式）
+  mode: meta.mode ?? "plan",
+  workflowId: meta.workflowId,
+  // V0.4：老数据没 role 字段、按 "fe" 兜底（V0.4 之前只支持前端、安全推断）
+  role: meta.role ?? "fe",
+  repoPath: meta.repoPath,
+  feishuStoryUrl: meta.feishuStoryUrl,
+  description: meta.description,
+  contextDocs: meta.contextDocs ?? [],
+  disabledMcpServers: meta.disabledMcpServers,
+  status: meta.status,
+  currentPhase: sanitizeCurrentPhase(meta.currentPhase),
+  archived: meta.archived ?? false,
+  createdAt: meta.createdAt,
+  updatedAt: meta.updatedAt,
+  lastAgentId: meta.lastAgentId,
+  model: meta.model,
+});
+
 const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
   const events = await readEvents(meta.id);
   const phases = {} as Record<PhaseId, PhaseState>;
@@ -578,30 +610,11 @@ const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
     const metaPhase = meta.phases[pid] ?? { id: pid, status: "pending" };
     phases[pid] = { ...metaPhase, artifact };
   }
+  // 复用 hydrateTaskSummary 拼非 events / phases 字段、避免重复维护两套
   return {
-    id: meta.id,
-    title: meta.title,
-    // 老数据没 mode 字段、按 plan 兜底（V1 之前的数据都是 plan 模式）
-    mode: meta.mode ?? "plan",
-    workflowId: meta.workflowId,
-    // V0.4：老数据没 role 字段、按 "fe" 兜底（V0.4 之前只支持前端、安全推断）
-    role: meta.role ?? "fe",
-    repoPath: meta.repoPath,
-    feishuStoryUrl: meta.feishuStoryUrl,
-    swaggerUrl: meta.swaggerUrl,
-    description: meta.description,
-    attachedDocs: meta.attachedDocs,
-    contextDocs: meta.contextDocs ?? [],
-    disabledMcpServers: meta.disabledMcpServers,
-    status: meta.status,
-    currentPhase: sanitizeCurrentPhase(meta.currentPhase),
+    ...hydrateTaskSummary(meta),
     phases,
     events,
-    archived: meta.archived ?? false,
-    createdAt: meta.createdAt,
-    updatedAt: meta.updatedAt,
-    lastAgentId: meta.lastAgentId,
-    model: meta.model,
   };
 };
 
@@ -717,13 +730,22 @@ export const ensureBootRecovery = async (): Promise<void> => {
 
 // ----------------- 公开 API -----------------
 
-export const listTasks = async (): Promise<Task[]> => {
+/**
+ * 列表场景：返回每条任务的摘要（不含 events / phases.artifact 内容）
+ *
+ * V0.5.3 改造：原先返 `Task[]` 全量、每条都 readEvents + 3 readArtifact，
+ * 拉一次列表 = N × 5 IO（events.jsonl 几千行还得 JSON.parse）。
+ * 改成 TaskSummary 后只读 meta.json、N × 1 IO、首页加载明显提速。
+ *
+ * 详情场景（点开某条任务）仍走 `getTask` 返完整 Task。
+ */
+export const listTasks = async (): Promise<TaskSummary[]> => {
   await ensureBootRecovery();
   await ensureDataDir();
   const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
   const ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
 
-  const tasks: Task[] = [];
+  const summaries: TaskSummary[] = [];
   for (const id of ids) {
     // readMeta 现在自身会对空 / 损坏文件 throw、这里 try/catch 兜底
     // 让单个坏 task 不拖垮整个列表（前端体验：坏的 task 就是不显示、其他正常）
@@ -748,13 +770,13 @@ export const listTasks = async (): Promise<Task[]> => {
           await writeMeta(fresh);
         }
       });
-      // 这次循环里的 meta.archived 也同步、不然 hydrateTask 出来还是 false
+      // 这次循环里的 meta.archived 也同步、不然 hydrateTaskSummary 出来还是 false
       meta.archived = true;
     }
 
-    tasks.push(await hydrateTask(meta));
+    summaries.push(hydrateTaskSummary(meta));
   }
-  return tasks;
+  return summaries;
 };
 
 export const getTask = async (id: string): Promise<Task | null> => {
@@ -837,9 +859,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     role: input.role ?? "fe",
     repoPath: finalRepoPath,
     feishuStoryUrl: input.feishuStoryUrl,
-    swaggerUrl: input.swaggerUrl,
     description: input.description,
-    attachedDocs: input.attachedDocs,
     contextDocs: initialContextDocs,
     // 黑名单空数组当 undefined 存、保持 hydrate 出来「全开 = falsy」语义一致
     disabledMcpServers:

@@ -28,11 +28,12 @@ import { Button } from "@/components/ui/button";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { deleteTask, fetchTasks, setTaskArchived } from "@/lib/task-store";
-import type { Task } from "@/lib/types";
+import type { Task, TaskSummary } from "@/lib/types";
 
 const HomePage = () => {
   const router = useRouter();
-  const [tasks, setTasks] = useState<Task[]>([]);
+  // V0.5.3：列表只持 TaskSummary（不带 events / phases.artifact）、首页加载从 N×5 IO 降到 N×1
+  const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
 
@@ -57,7 +58,7 @@ const HomePage = () => {
   }, []);
 
   // 删除任务：乐观从列表移除、失败重新拉一遍兜底
-  const handleDelete = async (task: Task) => {
+  const handleDelete = async (task: TaskSummary) => {
     const prev = tasks;
     setTasks((p) => p.filter((t) => t.id !== task.id));
     try {
@@ -72,7 +73,8 @@ const HomePage = () => {
   };
 
   // 切归档状态：乐观更新、失败回滚
-  const handleArchiveToggle = async (task: Task) => {
+  // setTaskArchived 返完整 Task、塞回 TaskSummary[] state 自动收窄（Task 是 Summary 的超集）
+  const handleArchiveToggle = async (task: TaskSummary) => {
     const target = !task.archived;
     setTasks((prev) =>
       prev.map((t) => (t.id === task.id ? { ...t, archived: target } : t)),

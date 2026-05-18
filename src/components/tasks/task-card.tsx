@@ -39,16 +39,18 @@ import {
   STATUS_VARIANT,
   formatRelative,
 } from "@/lib/task-display";
-import type { Task } from "@/lib/types";
+import type { TaskSummary } from "@/lib/types";
 
 interface Props {
-  task: Task;
+  // V0.5.3：卡片只渲染概要字段（title / status / currentPhase / updatedAt 等）、
+  // 不需要 events / phases.artifact 详细产物、类型上明确收窄到 TaskSummary
+  task: TaskSummary;
   onArchiveToggle?: () => void;
   onDelete?: () => void;
 }
 
 // 哪些状态值得显示「归档」按钮（draft / running / awaiting_user 显示意义不大）
-const canArchive = (task: Task): boolean =>
+const canArchive = (task: TaskSummary): boolean =>
   task.archived ||
   task.status === "completed" ||
   task.status === "failed";

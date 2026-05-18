@@ -69,17 +69,10 @@ export const POST = async (req: Request) => {
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
         : undefined,
-      swaggerUrl: isNonEmptyString(body.swaggerUrl)
-        ? body.swaggerUrl.trim()
-        : undefined,
       description: isNonEmptyString(body.description)
         ? body.description.trim()
         : undefined,
-      attachedDocs:
-        Array.isArray(body.attachedDocs) &&
-        body.attachedDocs.every((s) => isNonEmptyString(s))
-          ? (body.attachedDocs as string[]).map((s) => s.trim())
-          : undefined,
+      // V0.5.3：swaggerUrl / attachedDocs 字段已删（被 contextDocs 取代）、不再接收
       // V0.3.3：任务级 MCP 黑名单（创建时指定）
       // 只接受 string[] 类型、其它值丢弃（后端 createTask 兜底处理空数组）
       disabledMcpServers:

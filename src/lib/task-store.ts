@@ -19,6 +19,7 @@ import type {
   PhaseId,
   Task,
   TaskEvent,
+  TaskSummary,
 } from "./types";
 
 // V0.5.3：原来的 `FEISHU_WORKFLOW_NEXT_PHASE` 静态表已删——
@@ -79,9 +80,11 @@ const handleJson = async <T>(res: Response): Promise<T> => {
 
 // ----------------- 列表 / 详情 -----------------
 
-export const fetchTasks = async (): Promise<Task[]> => {
+// V0.5.3：列表返 TaskSummary[]（不含 events / phases.artifact 内容）、首页提速核心
+// 详情页用 fetchTask 拿完整 Task
+export const fetchTasks = async (): Promise<TaskSummary[]> => {
   const res = await fetch("/api/tasks", { cache: "no-store" });
-  const data = await handleJson<{ tasks: Task[] }>(res);
+  const data = await handleJson<{ tasks: TaskSummary[] }>(res);
   return data.tasks;
 };
 

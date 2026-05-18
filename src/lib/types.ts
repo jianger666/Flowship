@@ -265,7 +265,8 @@ export interface WorkflowDef {
   description: string;
   phases: PhaseId[];
   // 创建任务时必须填的字段（前端表单据此校验）
-  requiredFields: Array<"feishuStoryUrl" | "swaggerUrl">;
+  // V0.5.3 起只保留 feishuStoryUrl（swaggerUrl 字段已废弃、详见 Task 注释）
+  requiredFields: Array<"feishuStoryUrl">;
 }
 
 export interface Task {
@@ -285,11 +286,10 @@ export interface Task {
   // V0.2 workflow 用 feishuStoryUrl（指向飞书项目 story 详情页）
   // V0.4 起 chat 模式建任务的「飞书相关链接」也复用这个字段、不分 feishuUrl
   feishuStoryUrl?: string;
-  swaggerUrl?: string;
   description?: string;
-  // 创建时附的额外文档 / 路径（后端校验过的绝对路径）
-  // V0.3 起被 contextDocs 取代、保留字段做兼容（已有任务能读）、新任务走 contextDocs
-  attachedDocs?: string[];
+  // V0.3 起的旧字段 `swaggerUrl` / `attachedDocs` 已在 V0.5.3 删除——
+  // contextDocs 完全覆盖「后端文档 URL / 附加文件路径 / 自由文本」三种语义、UI 表单不再单列、
+  // 老 task.meta.json 里残留的这两个字段在 hydrateTask 时被忽略、不再出现在 Task / API 上
   // V0.3 引入：任务级上下文文档清单、可在详情页随时增删
   // - 飞书 story URL 在建任务时自动作为第一条 contextDoc（title="飞书 story"）
   // - 后续用户在详情页面板里加更多（如后端技术方案 / 设计稿 / 开发补充）
@@ -326,19 +326,35 @@ export interface Task {
   model?: ModelSelection;
 }
 
+/**
+ * 任务摘要：列表场景专用、不含 events / phases 详细产物（V0.5.3 引入）
+ *
+ * 设计动机：原来 listTasks / GET /api/tasks 直接返完整 Task[]、每条都 hydrate 全部
+ * events.jsonl（可能几千行）+ 3 个 artifact 文件——首页列表根本不需要这些内容、
+ * 只是为了渲染卡片白白付了 N × (1 readMeta + 1 readEvents + 3 readArtifact) 的 IO。
+ *
+ * TaskSummary 只保留卡片渲染必须的字段（title / status / currentPhase / updatedAt / mode 等）、
+ * server-side `listTasks` 用 hydrateTaskSummary 跳过 readEvents / readArtifact、O(N) → 单读 meta.json。
+ *
+ * Task 本身是 TaskSummary 的超集——结构上向下兼容、setTaskArchived 等返 Task 的 API 可以直接塞进
+ * `TaskSummary[]` state 而无需转换（TS structural typing 自动接受）。
+ *
+ * 详情页 / 单 task API 走 `Task`（带 events + phases.artifact 全量），不受影响。
+ */
+export type TaskSummary = Omit<Task, "events" | "phases">;
+
 // 新建任务表单的入参（不含运行期字段）
 // V0.2：默认 mode = "workflow"、workflowId = "feishu-story-impl"
 // V0.3：contextDocs 在后端 createTask 时自动初始化（飞书 story 作为第一条）
 // V0.3.3：可在创建时直接指定任务级 MCP 黑名单
 // V0.4：role 可选、后端 createTask 默认 "fe"
+// V0.5.3：删 swaggerUrl / attachedDocs（已被 contextDocs 取代）
 export type NewTaskInput = Pick<
   Task,
   | "title"
   | "repoPath"
   | "feishuStoryUrl"
-  | "swaggerUrl"
   | "description"
-  | "attachedDocs"
   | "disabledMcpServers"
   | "model"
 > & {
