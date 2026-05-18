@@ -7,7 +7,7 @@
  *
  * - **plan 模式**（V0.2 主流程、feishu-story-impl workflow）：
  *   - 整段任务跑在一次 SDK Run 里、按 phase 顺序执行（plan → build → review、V0.5 起）
- *   - 每个 phase 完成后 agent 调 wait_for_user 阻塞、用户在右侧底部点「通过」/「跟 AI 再聊聊」
+ *   - 每个 phase 完成后 agent 调 wait_for_user 阻塞、用户在右侧底部点「通过」/「补意见」
  *   - 启动按钮：draft / failed / completed 时显示、点击调 /start-workflow
  *   - 自动 watch SSE：进页面立即订阅、agent 输出 → 事件流、phase 边界 → PhaseProgress
  *
@@ -83,7 +83,7 @@ const TaskDetailPage = () => {
   const [activePhase, setActivePhase] = useState<PhaseId>("plan");
   // 启动按钮 loading 态、提交期间 disable
   const [starting, setStarting] = useState(false);
-  // 「跟 AI 再聊聊」对话框开关（用户对当前 phase 产物有疑问 / 需要澄清时打开）
+  // 「补意见」对话框开关（用户对当前 phase 产物有疑问 / 需要澄清时打开）
   const [reviseOpen, setReviseOpen] = useState(false);
   // 跟 AI 的留言草稿
   const [reviseDraft, setReviseDraft] = useState("");
@@ -312,7 +312,7 @@ const TaskDetailPage = () => {
     }
   };
 
-  // ---- Phase ack：跟 AI 再聊聊（补充澄清、提改进意见、追问） ----
+  // ---- Phase ack：补意见（补充澄清、提改进意见、追问） ----
   const handleSubmitRevise = async () => {
     const fb = reviseDraft.trim();
     if (!fb) {
@@ -446,10 +446,10 @@ const TaskDetailPage = () => {
                     size="sm"
                     onClick={() => setReviseOpen(true)}
                     disabled={ackSubmitting}
-                    title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？跟 AI 留个言、它会根据你的意见调整产物`}
+                    title={`对 ${PHASE_LABEL[cur]} 的产物有疑问 / 想补充澄清？AI 会先弹窗复述确认、再调整产物`}
                   >
                     <MessageCircleQuestion />
-                    跟 AI 再聊聊
+                    补意见
                   </Button>
                 </>
               )}
@@ -539,16 +539,17 @@ const TaskDetailPage = () => {
         submitting={ackSubmitting}
       />
 
-      {/* 跟 AI 聊聊 Dialog（plan 模式专用、用户对当前 phase 产物有疑问 / 想补充澄清时打开） */}
+      {/* 补意见 Dialog（plan 模式专用、用户对当前 phase 产物有疑问 / 想补充澄清时打开） */}
       <Dialog open={reviseOpen} onOpenChange={setReviseOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>跟 AI 聊聊 {PHASE_LABEL[cur]}</DialogTitle>
+            <DialogTitle>对 {PHASE_LABEL[cur]} 补意见</DialogTitle>
           </DialogHeader>
           <div className="flex flex-col gap-2">
             <p className="text-xs text-muted-foreground">
-              发现 artifact 有信息缺失 / 理解偏差 / 想补充说明？给 AI 留个言、
-              它会按你的意见调整产物、再交给你确认。不会重启 workflow、phase 保持「等你确认」状态。
+              发现 artifact 有信息缺失 / 理解偏差 / 想补充说明？写下你的意见、
+              AI 收到后会**先弹窗复述它的理解**、你确认后再动产物——避免它瞎猜瞎改。
+              整个过程不会重启 workflow、phase 保持「等你确认」状态。
             </p>
             <Textarea
               value={reviseDraft}

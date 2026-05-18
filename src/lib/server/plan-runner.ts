@@ -25,7 +25,7 @@
  *      → 本文件**不需要主动 patch**：agent 下一次调 wait_for_user(phase=build) 时
  *        notifier 自动 patch 上一 phase=ack + 当前 phase=awaiting_ack
  *        （但实际上 "上一 phase=ack" 需要本文件在 ack 时单独处理、见 markPhaseAcked）
- *   4. 用户点「跟 AI 再聊聊」→ submitPhaseAck(revise, feedback)
+ *   4. 用户点「补意见」→ submitPhaseAck(revise, feedback)
  *      → agent 拿 [PHASE_ACK revise]、修 artifact、再调 wait_for_user
  *      → 任务状态保持 awaiting_user（按用户拍板：不抖屏）、artifact 内容更新即可
  *
@@ -345,7 +345,7 @@ const buildSuperPrompt = async (
     "       **绝对禁止**在拿到 approve 后 emit 任何「我做了什么 / 你看板上通过了 / approve 已收到」之类的总结——用户在看板 UI 上看到 phase 进度推进就够、不需要你 narrate。",
     "       **唯一允许结束 run 的 approve**：最后一个 phase（见下面 §7「全部 phase 完成」）的 approve 拿到后才能自然退 run。中间 phase 的 approve = 必须接着干。",
     "   - **`[PHASE_ACK revise]` + feedback**：用户要求修改、但**先别动 artifact**——",
-    "     ⚠️ **V0.5.1 修复（用户体验、用户拍板）**：用户在「跟 AI 再聊聊」输入的 feedback 可能很短 / 表达不清楚 / 含混（极端例子：用户打了「111」/「test」/「随便」）。",
+    "     ⚠️ **V0.5.1 修复（用户体验、用户拍板）**：用户在「补意见」输入的 feedback 可能很短 / 表达不清楚 / 含混（极端例子：用户打了「111」/「test」/「随便」）。",
     "     **用户拍板的产品规则**：拿到 [PHASE_ACK revise] + feedback 后、**无论 feedback 是什么内容、永远先弹 ask_user 跟用户复述/澄清、绝不允许跳过弹窗直接改 artifact**。",
     "     ",
     "     **执行步骤（3 步、按顺序）**：",
