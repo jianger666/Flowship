@@ -39,55 +39,10 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
+import { useImageAttach } from "@/hooks/use-image-attach";
 import { PHASE_LABEL_SHORT } from "@/lib/task-display";
 import type { ChatReplyImage } from "@/lib/task-store";
 import type { EventKind, Task, TaskEvent } from "@/lib/types";
-
-// 支持的图片 mime 白名单（跟后端 task-fs.ts 的 ALLOWED_IMAGE_MIME 保持一致）
-// 用户粘 / 拖 / 选了别的 mime 直接 toast 拒、避免后端 400
-const ALLOWED_IMAGE_MIMES = new Set([
-  "image/png",
-  "image/jpeg",
-  "image/jpg",
-  "image/webp",
-  "image/gif",
-]);
-
-// 单图上限 10 MB（跟后端 task-fs.ts 保持一致、前端先拦防止白白上传）
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_IMAGES_PER_REPLY = 6;
-
-/**
- * 输入框待发送的图片附件、UI 内部状态、发送后清空。
- * - id: React key、本地随机
- * - dataUrl: 完整 data: URL（含 mime 前缀）、给 <img> src 预览用
- * - data:    纯 base64（不带前缀）、发送时塞 POST body
- */
-interface PendingImage {
-  id: string;
-  file: File;
-  dataUrl: string;
-  data: string;
-  mimeType: string;
-}
-
-// FileReader.readAsDataURL Promise 化、解出 dataUrl + 纯 base64
-const readFileAsDataUrl = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error ?? new Error("读文件失败"));
-    reader.readAsDataURL(file);
-  });
-
-// 从 dataUrl 切出纯 base64（"data:image/png;base64,xxx" → "xxx"）
-const stripDataUrlPrefix = (dataUrl: string): string => {
-  const idx = dataUrl.indexOf("base64,");
-  return idx >= 0 ? dataUrl.slice(idx + "base64,".length) : dataUrl;
-};
-
-const newPendingId = (): string =>
-  `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
 // 中文 + 英文学名（团队沟通时英文锚点）
 const EVENT_LABEL: Record<EventKind, string> = {
@@ -227,16 +182,9 @@ const EventStreamImpl = ({
 }: Props) => {
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
-  // 待发送的图片附件列表（粘贴 / 拖拽 / 选文件三种途径添进来）
-  // 发送成功后清空；发送中保留、失败可重试
-  const [attachedImages, setAttachedImages] = useState<PendingImage[]>([]);
-  // 拖拽状态：drag over 时整片输入区高亮、给用户视觉反馈
-  const [isDragging, setIsDragging] = useState(false);
-  // 隐藏 <input type="file">、点击附图按钮触发它
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // 文件 / 目录路径选择器开关（点「附文件」按钮触发）
   const [pathPickerOpen, setPathPickerOpen] = useState(false);
-  // 待发送的文件 / 目录绝对路径列表、跟 attachedImages 平行的 state
+  // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
   // 滚动容器：智能置底用
@@ -284,6 +232,24 @@ const EventStreamImpl = ({
   //   → canCompose 变 true 触发 focus
   const isAwaitingUser = canCompose;
 
+  // V0.5.4 图附件管理统一走 hook、跟 revise-dialog 共用（同款约束、同款交互）
+  // disabled=!isAwaitingUser 时所有 handler 短路、防止 agent 没等待时也能添图
+  const {
+    images: attachedImages,
+    isDragging,
+    fileInputRef,
+    maxImages: MAX_IMAGES_PER_REPLY,
+    removeImage: handleRemoveImage,
+    triggerFilePicker: handleAttachClick,
+    onPaste: handlePaste,
+    onDragOver: handleDragOver,
+    onDragLeave: handleDragLeave,
+    onDrop: handleDrop,
+    onFileInputChange: handleFilePicked,
+    reset: resetAttachedImages,
+    toUploadPayload: imagesToUploadPayload,
+  } = useImageAttach({ disabled: !isAwaitingUser });
+
   // 自动聚焦：进入「可输入」时把光标放进输入框、用户立刻可以打字
   // - 解决以前的痛点：agent 回完话、用户得鼠标点输入框才能输入
   // - 仅在 status「变成」awaiting_user 的边缘触发、避免用户主动点别处后被强抢焦点
@@ -295,111 +261,6 @@ const EventStreamImpl = ({
       return () => clearTimeout(timer);
     }
   }, [isAwaitingUser]);
-
-  /**
-   * 把 File[] 转成 PendingImage[] 加进 attachedImages
-   * 校验：mimeType 白名单 / 单图 size / 总张数上限（任何一项失败 → toast + 跳过该图）
-   */
-  const addFiles = async (files: File[]) => {
-    if (files.length === 0) return;
-    const remainingSlots = MAX_IMAGES_PER_REPLY - attachedImages.length;
-    if (remainingSlots <= 0) {
-      toast.error(`最多附 ${MAX_IMAGES_PER_REPLY} 张图、先发送 / 移除几张再加`);
-      return;
-    }
-    const toProcess = files.slice(0, remainingSlots);
-    if (files.length > remainingSlots) {
-      toast.warning(
-        `图太多、超出上限 ${MAX_IMAGES_PER_REPLY} 张、已截断到 ${remainingSlots} 张`,
-      );
-    }
-    const additions: PendingImage[] = [];
-    for (const file of toProcess) {
-      if (!ALLOWED_IMAGE_MIMES.has(file.type)) {
-        toast.error(`${file.name || "(未命名)"} 不是支持的图片格式（${file.type || "未知"}）`);
-        continue;
-      }
-      if (file.size > MAX_IMAGE_BYTES) {
-        toast.error(
-          `${file.name || "(未命名)"} 太大（${(file.size / 1024 / 1024).toFixed(2)} MB > ${MAX_IMAGE_BYTES / 1024 / 1024} MB）`,
-        );
-        continue;
-      }
-      try {
-        const dataUrl = await readFileAsDataUrl(file);
-        additions.push({
-          id: newPendingId(),
-          file,
-          dataUrl,
-          data: stripDataUrlPrefix(dataUrl),
-          mimeType: file.type,
-        });
-      } catch (err) {
-        toast.error(`读 ${file.name || "(未命名)"} 失败：${(err as Error).message}`);
-      }
-    }
-    if (additions.length > 0) {
-      setAttachedImages((prev) => [...prev, ...additions]);
-    }
-  };
-
-  // 粘贴：clipboardData.items 里可能含 image（截图工具粘贴 / 浏览器右键复制图片）
-  // 有 image → 阻止默认 + addFiles。纯文本粘贴不拦、走 Textarea 默认行为
-  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    if (!isAwaitingUser) return;
-    const items = e.clipboardData?.items;
-    if (!items || items.length === 0) return;
-    const files: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (!item) continue;
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const f = item.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-    if (files.length > 0) {
-      e.preventDefault();
-      void addFiles(files);
-    }
-  };
-
-  // 拖拽：dragenter / dragover 标 isDragging + preventDefault（不然 drop 不触发）
-  // drop 时 dataTransfer.files 拿到 file 列表
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    if (!isAwaitingUser) return;
-    if (e.dataTransfer.types.includes("Files")) {
-      e.preventDefault();
-      setIsDragging(true);
-    }
-  };
-  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
-    // 子元素 dragleave 会冒泡、用 relatedTarget 判断「真离开了输入区」才置 false
-    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-    setIsDragging(false);
-  };
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    if (!isAwaitingUser) return;
-    e.preventDefault();
-    setIsDragging(false);
-    const files = Array.from(e.dataTransfer.files ?? []).filter((f) =>
-      f.type.startsWith("image/"),
-    );
-    if (files.length > 0) void addFiles(files);
-  };
-
-  // 附图按钮：点击触发隐藏 input file 的 click、选完文件回调 onChange
-  const handleAttachClick = () => fileInputRef.current?.click();
-  const handleFilePicked = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    void addFiles(files);
-    // 清掉 input value、不然连选同一张图不触发 onChange
-    e.target.value = "";
-  };
-
-  const handleRemoveImage = (id: string) => {
-    setAttachedImages((prev) => prev.filter((p) => p.id !== id));
-  };
 
   // 文件 / 目录选完回调：去重 + 上限校验、加进 attachedPaths
   const handlePathsPicked = (paths: string[]) => {
@@ -435,18 +296,11 @@ const EventStreamImpl = ({
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
     if (!text && attachedImages.length === 0 && attachedPaths.length === 0) return;
-    const images: ChatReplyImage[] | undefined =
-      attachedImages.length > 0
-        ? attachedImages.map((p) => ({
-            data: p.data,
-            mimeType: p.mimeType,
-            filename: p.file.name,
-          }))
-        : undefined;
+    const images: ChatReplyImage[] | undefined = imagesToUploadPayload();
     const attachments = attachedPaths.length > 0 ? attachedPaths : undefined;
     onUserReply?.(text, images, attachments);
     setDraft("");
-    setAttachedImages([]);
+    resetAttachedImages();
     setAttachedPaths([]);
   };
 

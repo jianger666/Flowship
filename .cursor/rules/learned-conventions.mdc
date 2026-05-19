@@ -76,15 +76,36 @@ alwaysApply: true
 - 例外：「故意只在 X 变化时重连」类场景、把 callback 做 ref 化（`callbackRef.current = callback`）后再放进 effect、然后依赖就只剩 X 一个、不需要 disable。`use-task-watch.ts` 里就是这么做的。
 - 写完 effect 后跑 `pnpm lint`、warning 不能留。
 
-## 减少 state / 优先用成熟库（用户拍板）
+## 减少手戳代码 / 优先复用 + 用成熟库（用户拍板）
 
-- **每个组件的 `useState` 数量是代码复杂度指标**——一个组件超过 5-6 个 useState 就该警惕：
+**核心思想**：能复用就别复制粘贴、能调库就别手撸、能下沉就别上抛。任何看起来「state / handler / 工具函数 / 类型 / 逻辑 / UI 块」在两处以上长得很像、或者你正在写第 50+ 行手工状态机——立刻停、想想能不能抽 / 调库。
+
+### 减少 state
+
+- **`useState` 数量是复杂度指标**——一个组件超过 5-6 个 useState 就该警惕：
   - **多个相关 state 合并**：用 `useReducer` 或对象 state（如 `useState<{ open: boolean; draft: string; submitting: boolean }>`）
   - **派生 state 不要存**：能 `useMemo` / 直接计算的就别 `setState`、避免「state 漂移 + 多次 effect 同步」
   - **state 下沉**：父组件不需要的 state（如 dialog 内部 draft）下沉到子组件、父只持开关、参考 `revise-dialog.tsx` 的拆法
-- **表单 / 弹窗输入 → 用 `react-hook-form`**——别手动 `useState(draft) + onChange + validate + submit` 拼。已经引入了就用、没引入但场景合适就先讨论再引入。
-- **服务端状态 → 用 `@tanstack/react-query`**——别手动 `useState(data) + useEffect(fetch) + useState(loading) + useState(error)` 这套 5 个 state 的笨办法（目前项目还在裸 fetch、新功能可考虑引入）。
-- **不可变更新 → `immer` / `use-immer`**——嵌套对象 state 的 `setState(prev => ({...prev, foo: {...prev.foo, bar: x}}))` 这种链式展开、用 immer 一行 `draft.foo.bar = x`。
-- **拖拽 / 手势 → `@use-gesture/react` + `framer-motion`**——别手撸 `onDragStart / onDragOver / onDrop + isDragging useState`。
-- **判断标准**：在引入新库前问自己——「**复用次数 >= 2 且能省至少 30 行手工代码**」就值、否则先不引入。
-- **写之前先扫一眼现有 deps**——`package.json` 里已经有的库优先用、别绕开。
+
+### 减少重复代码 / 减少手戳方法
+
+- **同样的 handler 写两遍 → 抽 hook 或 lib**——「贴图处理」「SSE 订阅」「fetch + 错误归一」这种、第二次写就该抽。本仓库现成例子：`use-task-watch.ts`（SSE 订阅）/`use-image-attach.ts`（图附件）/`task-store.ts` 的 `handleJson`/`run-args.ts` 的 `prepareRunArgs`。
+- **同样的 UI 块写两遍 → 抽组件**——参考 LoadingState / EmptyHint / ChoiceButton 一节。
+- **业务工具函数（formatXxx / parseXxx / extractXxx）→ 抽到 `src/lib/*.ts`**——别在组件里 inline、别在多个组件各自实现一份（典型反例：以前 STATUS_LABEL 在 task-card 和 artifact-panel 各定义一份）。
+- **方法体超过 30 行 / 嵌套 > 3 层 / 单函数 setState > 3 次** → 拆。要么拆成更小的 helper、要么进 useReducer / 进 hook。
+- **避免手撸状态机**——例如「拖拽：dragenter / dragover / dragleave / drop + 4 个边界 case + isDragging state」、「图片上传：file input ref + paste handler + drop handler + size 校验 + base64 编码 + 缩略图 state」——这些都该是一个 hook 包住、调用方一行。
+
+### 优先用成熟库
+
+- **表单 / 弹窗输入** → `react-hook-form`、别手动 `useState(draft) + onChange + validate + submit` 拼。
+- **服务端状态** → `@tanstack/react-query`、别手动 `useState(data) + useEffect(fetch) + useState(loading) + useState(error)` 那套 5-state 笨办法（项目目前还在裸 fetch、新功能优先考虑引入）。
+- **不可变更新** → `immer` / `use-immer`、嵌套对象的 `setState(prev => ({...prev, foo: {...prev.foo, bar: x}}))` 链式展开换成 `draft.foo.bar = x`。
+- **拖拽 / 手势** → `@use-gesture/react` + `framer-motion`、别手撸事件处理。
+- **日期 / 时间** → 已经在用的 `dayjs` 优先复用、别 `new Date()` + 手拼。
+- **写之前先扫一眼 `package.json`**——已经有的库直接用、别绕开。
+
+### 抽象门槛
+
+- **复用次数 >= 2 且能省至少 30 行手工代码** → 值得抽 hook / 组件 / lib。
+- **临时性 / 一次性 / 项目特定 < 30 行** → 内嵌、不抽（强行抽反而增加跳转成本）。
+- **修了同一类 bug 三次** → 一定要抽出来集中处理（典型反例：早期每个 fetch 都自己拼 4xx 错误 toast、最终抽 `handleJson<T>` 统一）。
