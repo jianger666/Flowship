@@ -623,12 +623,31 @@ D-1 + D-2 一起在 `cb70090`。
 - `prompts` 一线：`plan-runner.ts` revise 那段加 V0.5.4 段：**「带图时先 `read` 全部图、再 `ask_user` 复述」**、明确禁止「忽略图直接 ask_user」
 - 前端：`ReviseDialog` 内嵌贴图 UI（粘贴 / 拖拽 / 选文件 / 缩略图 / 移除）
 
-#### 3. 新建任务弹窗 MCP 多时被挤出屏幕
+#### 3. 新建任务弹窗 MCP 多时被挤出屏幕 → 全局 mask 滚动改造（最终态）
 
 **坑**：MCP 服务多、展开后弹窗高度超屏、底部「创建 / 取消」按钮被推出 viewport 看不到。
-**修法**：`NewTaskDialog` 的 `DialogContent` 加 `max-h-[90vh] overflow-y-auto`、顺手去掉 MCP 列表内部 `max-h-48`、让「整个弹窗一起滚」语义生效。仅改 NewTaskDialog 一处、不动 `DialogContent` 默认实现（避免影响其它 dialog）。
 
-**注**：用户后续提出「能不能改成对 mask 滚动而不是弹窗内滚」（视觉差异：mask 滚 = 弹窗本身长在文档流里、超长时整页连同 mask 一起滚；弹窗内滚 = 弹窗固定居中、内部出滚动条）。当前实现是后者、改前者需要改 `DialogContent` 默认布局 + 加 `scrollBehavior` prop、约 30-60 分钟工作量。**未做、待用户拍板**。
+**演进**：
+- 第一版：`NewTaskDialog` 单点修 `max-h-[90vh] overflow-y-auto`（弹窗内部出滚动条）
+- 用户拍板：要 **mask 滚（弹窗长在文档流里、超长时整页连同 mask 一起滚）**、不要弹窗内滚
+- 最终落地（commit `d413f9b`）：**改全局 `DialogContent` 默认布局**——所有 Dialog 自动获得 mask 滚动、不再需要单独加 max-h / overflow
+
+**关键改动 `src/components/ui/dialog.tsx`**：
+- 旧实现：Popup `fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 grid gap-4`、超长内容超屏看不到
+- 新实现：
+  - `DialogOverlay`（base-ui Backdrop）保留 `fixed inset-0`、只负责视觉遮罩 + click-close
+  - **新增 scroll wrapper**：`fixed inset-0 z-50 overflow-y-auto grid place-items-center p-4`（短内容居中、长内容自然撑长 + 整页滚）
+  - Popup 改 `relative` + 保留原 `grid gap-4`、随内容高度自然撑
+- 注意 base-ui 限制：Backdrop / Popup 是 Portal 内的兄弟节点（不能 Backdrop 套 Popup）、scroll wrapper 必须跟 Backdrop 同层、跟 Popup 是父子
+
+**已知回归 + 修复**（commit `8c4f4d9`）：第一次改造漏带 `grid` className、导致 Popup 内部子项 `gap-4` 失效（block 容器上 gap 是无效 CSS）、子项贴在一起。补回 `relative grid` 共存——`display: grid` + `position: relative` 合法。
+
+**影响范围**：
+- 所有 Dialog 自动获得 mask 滚动：`NewTaskDialog` / Settings / `ContextDocsPanel` / `TaskMcpPanel` / `ConfirmDialog` / `PromptDialog` / `FsPickerDialog` / `ApprovePhaseDialog` / `ReviseDialog`
+- **`AskUserDialog` 自管布局不受影响**——它显式用 `flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0` 三段布局（sticky header / scroll body / sticky footer）、className 后写 override 掉默认 `grid gap-4 p-4`、新 mask 滚 wrapper 只是把整窗居中、`max-h-[80vh]` 仍然兜住、Q 列表内部滚动行为完全保留
+- `DialogFooter` 的 `-mx-4 -mb-4` 依赖父 `DialogContent` 有 `p-4`——新版仍然 `p-4`、不破
+
+**调用方旧的 `max-h-[xx] overflow-y-auto` 应该删掉**（NewTaskDialog 已删）、否则会双层 scroll 体验差。
 
 #### 4. 抽 `useImageAttach` hook（event-stream + revise-dialog 共用）
 
@@ -654,6 +673,9 @@ D-1 + D-2 一起在 `cb70090`。
 #### 7. V0.5.3 + V0.5.4 commit 全景
 
 ```
+8c4f4d9 fix(v0.5.4): DialogContent 补回 grid className（gap-4 间距）
+d413f9b feat(v0.5.4): DialogContent 改 mask 滚动（用户拍板方案 A、全局生效）
+8b1a167 docs(handoff): 补 V0.5.3 + V0.5.4 演进段
 69f709a refactor(v0.5.4): 抽 useImageAttach hook、event-stream + revise-dialog 共用
 e451e73 feat(v0.5.4): 再聊聊抽组件 + 加贴图 + 新建任务弹窗整窗滚
 cb70090 refactor(v0.5.3): D-1 首页提速 + D-2 删死字段
@@ -662,9 +684,59 @@ a15db37 refactor(v0.5.3): 抽 getNextPhase helper + 删死代码 + 注释对齐 
 
 #### 8. 接力 AI 待办
 
-- **真任务联测**（V0.5.2 §11 那些场景）+ **V0.5.4 贴图闭环**：贴一张图 + 写一句、看 agent 是不是先 `read` 图再 `ask_user`、还是偷懒跳过
-- **mask 滚动改造**（如果用户拍板要做）：参考 §3 注解
+- **真任务联测**（V0.5.2 §11 那些场景）+ **V0.5.4 贴图闭环**：
+  - 「再聊聊」贴图（粘贴 / 拖拽 / 选文件）→ 看 agent 是不是**先 `read` 图再 `ask_user`**、还是偷懒跳过
+  - mask 滚动跨所有 Dialog 验证：NewTask（MCP 多时）/ Settings / Context Docs / MCP Panel / Confirm/Prompt / FS Picker / Approve / Revise——确认子项间距正常、整窗能滚、不双层 scroll
+  - AskUserDialog 自管布局回归测：sticky header / 中间 Q 列表滚 / sticky footer 三段保留
 - **首页提速验证**：D-1 改完后用户没明确反馈「快了」、需要联测时确认
+- **ask_user「其他答案」框贴图**（用户提议、设计待办、详见 §9）
+
+#### 9. V0.5.5 设计预案：ask_user「其他答案」框支持贴图
+
+> **状态**：用户提议 + 拍板「**每个 question 独立贴图**——做不到就宁可不做」、设计已对齐、未实施、等当前轮测稳再开 V0.5.5。
+
+**为什么要做**：HITL 通道统一行为——`revise` / `chat-reply` 都允许贴图、唯独 `ask_user` 不允许、语义割裂。典型场景：AI 问「这个组件做 A/B/C/D 哪种」、用户想说「都不是、看截图我要 E」——贴图比文字直接得多。
+
+**用户硬约束**（拒绝简化方案）：
+
+| 方案 | 用户态度 | 理由 |
+|---|---|---|
+| 整批 ask 共用一组图（max 6） | ❌ **拒绝** | 「语义模糊、不知道图是给哪个问题的、宁可不做、走 ack 后再聊聊补图」 |
+| 每 question 独立图集（max 6 / question） | ✅ **要做** | 「图绑特定 question、agent 不用猜归属」 |
+
+**技术难点 + 解法**：
+
+React Hooks 规则禁止在 map / 循环里动态调用 hook、所以「每 question 一个 `useImageAttach` instance」走不通。解法是**升级 `useImageAttach` 成多 key 图集**：
+
+```ts
+// 现状（V0.5.4、单 key）：
+const { images, onPaste, removeImage, ... } = useImageAttach();
+
+// V0.5.5（多 key、向后兼容）：
+const attach = useImageAttach();
+attach.getImages('q1');                    // 取 q1 的图
+attach.onPaste(e, 'q1');                   // q1 贴图
+attach.removeImage(0, 'q1');               // 删 q1 第 0 张
+// 老调用方（ReviseDialog / EventStream）不传 key → 走 'default' → API 不变
+```
+
+**改动量预估**（≈ 235-255 行、跨 6 文件）：
+
+| 文件 | 改动 |
+|---|---|
+| `src/hooks/use-image-attach.ts` | 内部 state 改 `Record<key, PendingImage[]>`、API 加 `key?` 默认 `'default'` ≈ 60-80 行重写 |
+| `src/components/tasks/ask-user-dialog.tsx` | 每 question「其他答案」展开时附 attach 按钮 + 缩略图条 ≈ 60 行 |
+| `src/lib/task-store.ts` | `submitAskReply` 加 `imagesByQuestion?: Record<string, ChatReplyImage[]>` ≈ 5 行 |
+| `src/app/api/tasks/[id]/ask-reply/route.ts` | 按 questionId 分组校验 / 保存 + meta 分组 ≈ 70 行 |
+| `src/lib/server/chat-mcp.ts` | `imagePathsByQuestion?` 参数 + 每 question reply 拼 `[ATTACHED_IMAGES for Qx]` ≈ 25 行 |
+| `src/lib/server/plan-runner.ts` | prompt 增加「ask_user reply 按 Q 号各自 read 图、综合判断意图」≈ 15 行 |
+
+**风险**：
+1. **`useImageAttach` 是 V0.5.4 刚抽的 hook**——升级要确保 ReviseDialog / EventStream 两个老用户不退化、上 + 手测两条路径
+2. **AskUserDialog 布局变长**——「其他答案」展开 + 缩略图条 + 多 question 场景、`max-h-[80vh]` 内部 scroll body 要兜得住
+3. **agent prompt 复杂度**——「N 个 question 各带图集」对 agent 读图调度要求更高、要给清楚示例（建议给一段「3 个 question、Q1/Q3 带图」的标准处理流）
+
+**节奏拍板**：等 V0.5.4 + V0.5.3 测稳再开 V0.5.5、避免叠改难定位 bug。
 
 ---
 
