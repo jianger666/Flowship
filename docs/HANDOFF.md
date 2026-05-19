@@ -573,6 +573,101 @@ b85cfe5 fix(prompts): SDK 1.0.13 工具名修正 edit_file → write / read_file
 
 ---
 
+### V0.5.3：refactor / 性能 / 死代码清理（2026-05-18 晚 ~ 2026-05-19 早、不破功能）
+
+> V0.5.2 联测过程中扫了一遍代码、发现几处过期注释 / 死字段 / 重复逻辑 / 首页慢、批量清掉。
+
+#### 1. `getNextPhase(workflowDef, current)` helper（去重 `indexOf + idx+1` 三处）
+
+`plan-runner.ts` / `phase-ack/route.ts` / `approve-phase-dialog.tsx` 各自 inline 一段 `workflowDef.phases.indexOf(current) + 1` → 抽到 `src/lib/types.ts` 一个 helper、三处都改用。同时删 `task-store.ts` 里 `FEISHU_WORKFLOW_NEXT_PHASE` 死表（漏网常量、没人 import）。
+关键 commit：`a15db37`。
+
+#### 2. D-1：首页加载慢——`listTasks` 不再 hydrate 全量 `events` / `artifact`
+
+**坑**：首页任务列表慢、用户实测「确实慢」。原因：`listTasks` 对每个任务都 `hydrateTask`、跑 `readEvents`（jsonl 全文 parse）+ `readArtifact` × N phases 的 IO + JSON.parse。N 个任务 → N×5 文件 IO + N 次 jsonl 全解析。
+**修法**：
+- `src/lib/types.ts` 加 `TaskSummary = Omit<Task, "events" | "phases">`、首页只需要这部分字段
+- `src/lib/server/task-fs.ts` 加 `hydrateTaskSummary`、`listTasks` 改返 `Promise<TaskSummary[]>`、跳过 events / artifact 读
+- `src/lib/task-store.ts` `fetchTasks` 改返 `TaskSummary[]`
+- `src/app/page.tsx` + `src/components/tasks/task-card.tsx`：state 改 `TaskSummary`、`canArchive` 入参改 `TaskSummary`
+
+#### 3. D-2：删死字段 `attachedDocs` / `swaggerUrl`
+
+V0.3 上下文文档机制已统一走 `contextDocs`、`attachedDocs` / `swaggerUrl` 仅在 schema / API 留着、UI / agent prompt 都没用。直接删：
+- `src/lib/types.ts`：`Task` / `NewTaskInput` / `WorkflowDef.requiredFields` 去掉
+- `src/lib/server/task-fs.ts` `TaskMeta` 去掉、`hydrateTask` / `createTask` 不再写
+- `src/app/api/tasks/route.ts` POST 不再解析
+- `src/lib/server/plan-runner.ts` 模板渲染去掉对应变量
+
+D-1 + D-2 一起在 `cb70090`。
+
+---
+
+### V0.5.4：再聊聊抽组件 + 加贴图 + 弹窗滚动 + hook 复用（2026-05-19 上午）
+
+> 用户上午联测发现 3 个体验问题、顺手抽公共 hook + 加规则。
+
+#### 1. 「再聊聊」输入卡顿（核心修复）
+
+**坑**：用户在「再聊聊」弹窗里打字、明显卡顿。
+**根因**：`reviseDraft` state 放在 `TaskDetailPage` 顶层、每次按键触发整页 re-render。`EventStream` 虽然 `memo` 过、但 SSE 持续 `setTask({...prev, events: [...prev.events, ev]})` 让 task 引用持续变化、`memo` 浅比较失效、几百条事件子树参与 reconcile、单次 keystroke > 16ms。
+**修法**：抽 `src/components/tasks/revise-dialog.tsx`、`draft` state 下沉到子组件内部、父组件只持 `reviseOpen` + `onSubmit(feedback, images?)`。`memo(ReviseDialogImpl)` 作第二道防线（父 re-render 时 props ref 没变就跳过本组件）。
+关键 commit：`e451e73`。
+
+#### 2. 「再聊聊」加贴图（端到端打通）
+
+跟 chat 的贴图链路完全同款：
+- 协议层：`ToolReturn.phase_revise` 多 `imagePaths?: string[]`、`formatToolReturnAsText` 在 feedback 后拼 `[ATTACHED_IMAGES]` 段（与 chat 的 user_reply 同款格式、agent 用 `read` 工具看图）
+- 后端 API：`phase-ack/route.ts` body 多 `images?: []`、复用 `saveImageAttachments` 落盘、`user_reply.meta.images` 写跟 chat-reply 同款形状（UI 缩略图复用 `extractUserReplyImages`）
+- `chat-mcp.ts` `submitPhaseAck(... imagePaths?)` 透传
+- `prompts` 一线：`plan-runner.ts` revise 那段加 V0.5.4 段：**「带图时先 `read` 全部图、再 `ask_user` 复述」**、明确禁止「忽略图直接 ask_user」
+- 前端：`ReviseDialog` 内嵌贴图 UI（粘贴 / 拖拽 / 选文件 / 缩略图 / 移除）
+
+#### 3. 新建任务弹窗 MCP 多时被挤出屏幕
+
+**坑**：MCP 服务多、展开后弹窗高度超屏、底部「创建 / 取消」按钮被推出 viewport 看不到。
+**修法**：`NewTaskDialog` 的 `DialogContent` 加 `max-h-[90vh] overflow-y-auto`、顺手去掉 MCP 列表内部 `max-h-48`、让「整个弹窗一起滚」语义生效。仅改 NewTaskDialog 一处、不动 `DialogContent` 默认实现（避免影响其它 dialog）。
+
+**注**：用户后续提出「能不能改成对 mask 滚动而不是弹窗内滚」（视觉差异：mask 滚 = 弹窗本身长在文档流里、超长时整页连同 mask 一起滚；弹窗内滚 = 弹窗固定居中、内部出滚动条）。当前实现是后者、改前者需要改 `DialogContent` 默认布局 + 加 `scrollBehavior` prop、约 30-60 分钟工作量。**未做、待用户拍板**。
+
+#### 4. 抽 `useImageAttach` hook（event-stream + revise-dialog 共用）
+
+两处贴图逻辑长得一样、各写一遍 200 行——按用户拍板的新规则（复用 >= 2 且省 30+ 行手工代码 → 抽）抽出。
+- `src/hooks/use-image-attach.ts` 新增：state（attachedImages / isDragging / fileInputRef）+ 所有 handler（粘贴 / 拖拽 / 选 / 移除）+ 校验 + `toUploadPayload()`
+- `disabled` 选项：调用方未到可输入态时所有 handler 短路
+- `ReviseDialog` -130 行 / `EventStream` -155 行 / 净减 60 行手工重复 / bug 以后修一次到位
+
+关键 commit：`69f709a`。
+
+#### 5. ApprovePhaseDialog 不再每次 page re-render 都读 localStorage
+
+`defaultModel` / `apiKey` 之前是 IIFE 每次 page render 都 `getSettings()` 从 localStorage 读 + JSON.parse、SSE 频繁 setTask 时一秒打好几次。改 `useMemo(..., [approveDialogOpen])`、只在 dialog 打开瞬间读一次、关闭后忽略变化。
+
+#### 6. 编码规则补强：减少手戳代码 / 优先复用 + 用成熟库（用户拍板）
+
+`.cursor/rules/learned-conventions.mdc` 「减少 state / 优先用成熟库」段重写、扩三个子节：
+- **减少 state**：useState 多 / 派生 state / 不下沉
+- **减少重复代码 / 减少手戳方法**（V0.5.4 新加）：同样 handler / UI / 工具函数写两遍就抽；方法体 > 30 行 / 嵌套 > 3 / 单函数 setState > 3 → 拆；避免手撸状态机
+- **优先用成熟库**：react-hook-form / @tanstack/react-query / immer / @use-gesture/react / dayjs（已引就直接用、没引但场景合适讨论引入）
+- **抽象门槛**：复用 >= 2 且省 30+ 行 → 抽；< 30 行内嵌不抽；修同一类 bug 三次必抽
+
+#### 7. V0.5.3 + V0.5.4 commit 全景
+
+```
+69f709a refactor(v0.5.4): 抽 useImageAttach hook、event-stream + revise-dialog 共用
+e451e73 feat(v0.5.4): 再聊聊抽组件 + 加贴图 + 新建任务弹窗整窗滚
+cb70090 refactor(v0.5.3): D-1 首页提速 + D-2 删死字段
+a15db37 refactor(v0.5.3): 抽 getNextPhase helper + 删死代码 + 注释对齐 V0.5
+```
+
+#### 8. 接力 AI 待办
+
+- **真任务联测**（V0.5.2 §11 那些场景）+ **V0.5.4 贴图闭环**：贴一张图 + 写一句、看 agent 是不是先 `read` 图再 `ask_user`、还是偷懒跳过
+- **mask 滚动改造**（如果用户拍板要做）：参考 §3 注解
+- **首页提速验证**：D-1 改完后用户没明确反馈「快了」、需要联测时确认
+
+---
+
 |---|---|
 | Plan workflow 整体逻辑 + super-prompt | `src/lib/server/plan-runner.ts` |
 | Chat workflow 整体逻辑 + V0.4 firstMessage 注入 | `src/lib/server/chat-runner.ts` |
