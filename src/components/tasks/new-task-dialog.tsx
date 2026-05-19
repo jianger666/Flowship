@@ -214,9 +214,9 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           </Button>
         }
       />
-      {/* max-h-[90vh] + overflow-y-auto：MCP 多 / 仓库多时整个弹窗一起滚、
-          不会被挤出屏幕。原本内部 MCP 列表有 max-h-48 单独滚、跟"整窗滚"语义冲突、一并去掉 */}
-      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
+      {/* V0.5.4：DialogContent 默认 mask 滚动（dialog.tsx 改造）、内容过高时整个 mask + 弹窗一起滚、
+          不需要单独加 max-h / overflow-y-auto。内部 MCP 列表也不限高、一起跟着滚 */}
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>新建任务</DialogTitle>
         </DialogHeader>

@@ -39,6 +39,23 @@ function DialogOverlay({
   )
 }
 
+// V0.5.4 改造：DialogContent 改为「mask 滚动」模式（用户拍板）。
+//
+// 旧实现：Popup `fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2`、超长内容超屏看不到。
+// 老兜底：调用方在 Popup className 加 `max-h-[90vh] overflow-y-auto`、弹窗内部出滚动条。
+//
+// 新实现（用户期望）：弹窗本身不固定居中、放在一个 viewport 满铺的 scrollable wrapper 里、
+// 超长内容时整个 mask + 弹窗一起滚动（页面级滚动条、不在弹窗内部出条）。
+//   - DialogOverlay（base-ui Backdrop）保留为 fixed inset-0、只负责视觉遮罩 + click-close
+//   - 新增 scroll wrapper：fixed inset-0 z-50 overflow-y-auto + grid place-items-center
+//     （`place-items-center` 让内容短时居中、长时贴顶 + 自然撑长）
+//   - DialogPrimitive.Popup 改为 relative + my-8 自然布局、随内容高度自然撑
+//
+// 注意：base-ui Backdrop / Popup 是 Portal 内的兄弟节点（不能 Backdrop 套 Popup）、
+// scroll wrapper 必须跟 Backdrop 同层、跟 Popup 是父子。
+//
+// 影响范围：所有 Dialog 自动获得 mask 滚动、不需要单独加 max-h-[xx] / overflow-y-auto。
+// 调用方如果在 Popup 上还塞了 max-h / overflow（如 NewTaskDialog V0.5.4 加的）、应该去掉。
 function DialogContent({
   className,
   children,
@@ -50,32 +67,35 @@ function DialogContent({
   return (
     <DialogPortal>
       <DialogOverlay />
-      <DialogPrimitive.Popup
-        data-slot="dialog-content"
-        className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
-          className
-        )}
-        {...props}
-      >
-        {children}
-        {showCloseButton && (
-          <DialogPrimitive.Close
-            data-slot="dialog-close"
-            render={
-              <Button
-                variant="ghost"
-                className="absolute top-2 right-2"
-                size="icon-sm"
-              />
-            }
-          >
-            <XIcon
-            />
-            <span className="sr-only">Close</span>
-          </DialogPrimitive.Close>
-        )}
-      </DialogPrimitive.Popup>
+      <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto p-4">
+        <DialogPrimitive.Popup
+          data-slot="dialog-content"
+          className={cn(
+            "relative w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+            // grid 默认隐式 grid 内 popup 不能 grid 子项 gap、原生 gap 走 flex/grid 自身
+            // 保留原 gap-4 给 Popup 内部 stack（header / body / footer 自然间距）
+            className
+          )}
+          {...props}
+        >
+          {children}
+          {showCloseButton && (
+            <DialogPrimitive.Close
+              data-slot="dialog-close"
+              render={
+                <Button
+                  variant="ghost"
+                  className="absolute top-2 right-2"
+                  size="icon-sm"
+                />
+              }
+            >
+              <XIcon />
+              <span className="sr-only">Close</span>
+            </DialogPrimitive.Close>
+          )}
+        </DialogPrimitive.Popup>
+      </div>
     </DialogPortal>
   )
 }
