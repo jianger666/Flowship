@@ -71,9 +71,9 @@ function DialogContent({
         <DialogPrimitive.Popup
           data-slot="dialog-content"
           className={cn(
-            "relative w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
-            // grid 默认隐式 grid 内 popup 不能 grid 子项 gap、原生 gap 走 flex/grid 自身
-            // 保留原 gap-4 给 Popup 内部 stack（header / body / footer 自然间距）
+            // grid 是为了让 gap-4 在 Popup 内部 stack（header / body / footer）生效——原版同款
+            // relative 替代原 fixed top/left/transform、配合外层 wrapper 实现 mask 滚动
+            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
             className
           )}
           {...props}
