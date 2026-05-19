@@ -75,3 +75,16 @@ alwaysApply: true
 - 不要随便加 `// eslint-disable-next-line react-hooks/exhaustive-deps`——大概率是真依赖漏了、会 stale closure。
 - 例外：「故意只在 X 变化时重连」类场景、把 callback 做 ref 化（`callbackRef.current = callback`）后再放进 effect、然后依赖就只剩 X 一个、不需要 disable。`use-task-watch.ts` 里就是这么做的。
 - 写完 effect 后跑 `pnpm lint`、warning 不能留。
+
+## 减少 state / 优先用成熟库（用户拍板）
+
+- **每个组件的 `useState` 数量是代码复杂度指标**——一个组件超过 5-6 个 useState 就该警惕：
+  - **多个相关 state 合并**：用 `useReducer` 或对象 state（如 `useState<{ open: boolean; draft: string; submitting: boolean }>`）
+  - **派生 state 不要存**：能 `useMemo` / 直接计算的就别 `setState`、避免「state 漂移 + 多次 effect 同步」
+  - **state 下沉**：父组件不需要的 state（如 dialog 内部 draft）下沉到子组件、父只持开关、参考 `revise-dialog.tsx` 的拆法
+- **表单 / 弹窗输入 → 用 `react-hook-form`**——别手动 `useState(draft) + onChange + validate + submit` 拼。已经引入了就用、没引入但场景合适就先讨论再引入。
+- **服务端状态 → 用 `@tanstack/react-query`**——别手动 `useState(data) + useEffect(fetch) + useState(loading) + useState(error)` 这套 5 个 state 的笨办法（目前项目还在裸 fetch、新功能可考虑引入）。
+- **不可变更新 → `immer` / `use-immer`**——嵌套对象 state 的 `setState(prev => ({...prev, foo: {...prev.foo, bar: x}}))` 这种链式展开、用 immer 一行 `draft.foo.bar = x`。
+- **拖拽 / 手势 → `@use-gesture/react` + `framer-motion`**——别手撸 `onDragStart / onDragOver / onDrop + isDragging useState`。
+- **判断标准**：在引入新库前问自己——「**复用次数 >= 2 且能省至少 30 行手工代码**」就值、否则先不引入。
+- **写之前先扫一眼现有 deps**——`package.json` 里已经有的库优先用、别绕开。

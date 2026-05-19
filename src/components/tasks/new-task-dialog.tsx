@@ -214,7 +214,9 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           </Button>
         }
       />
-      <DialogContent className="sm:max-w-lg">
+      {/* max-h-[90vh] + overflow-y-auto：MCP 多 / 仓库多时整个弹窗一起滚、
+          不会被挤出屏幕。原本内部 MCP 列表有 max-h-48 单独滚、跟"整窗滚"语义冲突、一并去掉 */}
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>新建任务</DialogTitle>
         </DialogHeader>
@@ -459,13 +461,12 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               </Button>
               {mcpExpanded && (
                 <div className="border-t p-3">
-                  <div className="max-h-48 overflow-y-auto">
-                    <McpToggleList
-                      availableServers={availableMcp}
-                      disabled={disabledMcp}
-                      onChange={setDisabledMcp}
-                    />
-                  </div>
+                  {/* 不再单独限高 / 滚动——交给外层 DialogContent 整窗滚 */}
+                  <McpToggleList
+                    availableServers={availableMcp}
+                    disabled={disabledMcp}
+                    onChange={setDisabledMcp}
+                  />
                 </div>
               )}
             </div>

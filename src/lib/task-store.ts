@@ -482,9 +482,10 @@ export interface PhaseAckForkOptions {
  * 用户在 plan 任务详情页点「通过」或「再聊聊」、把动作 ack 给阻塞中的 workflow agent
  *
  * @param action   approve / revise
- * @param feedback revise 必填（用户的修改意见）、approve 可空
+ * @param feedback revise 文本（带 images 时可空、即「就改成这样」+ 截图）、approve 可空
  * @param phase    可选、防 race 用 currentPhase 兜底
  * @param fork     V0.5：approve 时可选「换新 agent / 切模型」、详见 PhaseAckForkOptions
+ * @param images   V0.5.4：revise 可携带图片附件（用户截图说改这里）、approve 时忽略
  */
 export const submitPhaseAck = async (
   taskId: string,
@@ -492,6 +493,7 @@ export const submitPhaseAck = async (
   feedback?: string,
   phase?: PhaseId,
   fork?: PhaseAckForkOptions,
+  images?: ChatReplyImage[],
 ): Promise<Task> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/phase-ack`,
@@ -505,6 +507,7 @@ export const submitPhaseAck = async (
         forkAgent: fork?.forkAgent,
         nextModel: fork?.nextModel,
         bootArgs: fork?.bootArgs,
+        images,
       }),
     },
   );

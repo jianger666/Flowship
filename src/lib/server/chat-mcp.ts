@@ -242,6 +242,14 @@ export const formatToolReturnAsText = (result: ToolReturn): string => {
     const lines = ["[PHASE_ACK revise]"];
     const fb = (result.feedback ?? result.text ?? "").trim();
     if (fb) lines.push("", fb);
+    // V0.5.4：「再聊聊」也支持贴图——用户截图 + 说改这里、agent 先 read 图再 ask_user 复述
+    if (result.imagePaths && result.imagePaths.length > 0) {
+      lines.push(
+        "",
+        "[ATTACHED_IMAGES] 用户附了以下图片说明本次反馈、请用 `read` 工具逐一读取（SDK 内置 `read` 会把图片转成 vision、你能直接看到图像内容）：",
+        ...result.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
+      );
+    }
     return lines.join("\n");
   }
   if (result.kind === "user_reply") {
@@ -1035,6 +1043,9 @@ export const submitPhaseAck = (
   taskId: string,
   action: "approve" | "revise",
   feedback?: string,
+  // V0.5.4：revise 可携带图片附件、agent 先 read 图再 ask_user 复述
+  // approve 不接受 imagePaths（语义上没必要、强校验交给路由层）
+  imagePaths?: string[],
 ): boolean => {
   const entry = pendingMap.get(taskId);
   if (!entry) {
@@ -1047,9 +1058,10 @@ export const submitPhaseAck = (
     kind: action === "approve" ? "phase_approve" : "phase_revise",
     text: feedback ?? "",
     feedback: feedback,
+    imagePaths: action === "revise" ? imagePaths : undefined,
   });
   console.log(
-    `[chat-mcp] submitPhaseAck 成功 task=${taskId} action=${action} feedback=${(feedback ?? "").slice(0, 60)}`,
+    `[chat-mcp] submitPhaseAck 成功 task=${taskId} action=${action} feedback=${(feedback ?? "").slice(0, 60)} imagePaths=${imagePaths?.length ?? 0}`,
   );
   return true;
 };

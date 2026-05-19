@@ -42,19 +42,12 @@ import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EventStream } from "@/components/tasks/event-stream";
 import { PhaseProgress } from "@/components/tasks/phase-progress";
+import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { getSettings } from "@/lib/local-store";
 import { prepareRunArgs } from "@/lib/run-args";
@@ -65,6 +58,7 @@ import {
   resumeWaiting,
   startWorkflow,
   submitPhaseAck,
+  type ChatReplyImage,
 } from "@/lib/task-store";
 import { PHASE_LABEL, STATUS_LABEL, STATUS_VARIANT } from "@/lib/task-display";
 import { WORKFLOWS, type PhaseId, type Task, type TaskEvent } from "@/lib/types";
@@ -82,9 +76,8 @@ const TaskDetailPage = () => {
   const [starting, setStarting] = useState(false);
   // 「再聊聊」对话框开关
   // 用户可能是想改 artifact、可能只是有疑问想问、AI 会先弹 ask_user 复述、再自己判断
+  // draft 状态已下沉到 ReviseDialog 内部、page 不持、避免打字触发整页 re-render
   const [reviseOpen, setReviseOpen] = useState(false);
-  // 跟 AI 的留言草稿
-  const [reviseDraft, setReviseDraft] = useState("");
   // 「通过 / 再聊聊」按钮提交锁、防连点
   const [ackSubmitting, setAckSubmitting] = useState(false);
   // 流式打字态（assistant chunk 累加、收到正式 assistant_message 事件清空）
@@ -174,6 +167,19 @@ const TaskDetailPage = () => {
     () => task?.phases[activePhase],
     [task, activePhase],
   );
+
+  // V0.5.4：ApprovePhaseDialog 的 defaultModel / apiKey 之前是 IIFE 每次 page re-render
+  // 都重读 localStorage。SSE 频繁 setTask → 一秒读好几次 localStorage + JSON.parse、
+  // 浪费 + 加重主线程开销。改成只在 dialog 打开瞬间读一次、关闭后忽略变化。
+  // 用户在设置页改完模型、关掉 ApprovePhaseDialog 重开就能拿到最新值、足够。
+  const approveDialogSettings = useMemo(() => {
+    if (typeof window === "undefined" || !approveDialogOpen) return null;
+    const s = getSettings();
+    return {
+      defaultModel: s.defaultModel?.id ? s.defaultModel : null,
+      apiKey: s.apiKey ?? "",
+    };
+  }, [approveDialogOpen]);
 
   if (!loaded) {
     return <LoadingState variant="block" />;
@@ -311,20 +317,31 @@ const TaskDetailPage = () => {
   // ---- Phase ack：再聊聊（补充澄清、提改进意见、追问、纯答疑都走这条）
   // V0.5.2：协议层还是 [PHASE_ACK revise]、但 agent 拿到后会先 ask_user 复述、
   // 然后自己判断「用户是要改」还是「用户只是想问问」、改 → 动 artifact、问 → 仅答疑后回 wait_for_user
+  // V0.5.4：draft state 下沉到 ReviseDialog 内部、本函数接收 feedback 文本 + 可选 images
+  // 不 useCallback：本函数在 early return 之后定义、useCallback 会破坏 hooks order；
+  // ReviseDialog 的 onSubmit 引用每次 re-render 都变没关系——子组件 draft state 内置、
+  // 打字时本 page 根本不 re-render、不存在「ref 变 → 子重渲染」的卡顿路径
   // ----
-  const handleSubmitRevise = async () => {
-    const fb = reviseDraft.trim();
-    if (!fb) {
-      toast.error("留言不能为空");
-      return;
-    }
+  const handleSubmitRevise = async (
+    feedback: string,
+    images?: ChatReplyImage[],
+  ) => {
     setAckSubmitting(true);
     try {
-      const updated = await submitPhaseAck(task.id, "revise", fb, cur);
+      const updated = await submitPhaseAck(
+        task.id,
+        "revise",
+        feedback,
+        cur,
+        undefined,
+        images,
+      );
       setTask(updated);
       setReviseOpen(false);
-      setReviseDraft("");
-      toast.success(`已发给 AI、它会按你的意见调整 ${PHASE_LABEL[cur]} 的产物`);
+      const suffix = images && images.length > 0 ? `（含 ${images.length} 张图）` : "";
+      toast.success(
+        `已发给 AI${suffix}、它会按你的意见调整 ${PHASE_LABEL[cur]} 的产物`,
+      );
     } catch (err) {
       toast.error(`提交失败：${(err as Error).message}`);
     } finally {
@@ -518,54 +535,27 @@ const TaskDetailPage = () => {
       {/* AskUserDialog：agent 调 ask_user 时弹窗、统一渲染（chat + plan 两个模式都用、用户拍板） */}
       <AskUserDialog task={task} />
 
-      {/* V0.5：phase ack 配置 dialog（点「通过 PHASE」按钮打开、配下一 phase 模型 / 换 agent） */}
+      {/* V0.5：phase ack 配置 dialog（点「通过 PHASE」按钮打开、配下一 phase 模型 / 换 agent）
+          defaultModel / apiKey 走 approveDialogSettings useMemo、只在 dialog 打开瞬间读一次 */}
       <ApprovePhaseDialog
         open={approveDialogOpen}
         onOpenChange={setApproveDialogOpen}
         phaseId={cur}
-        defaultModel={(() => {
-          if (typeof window === "undefined") return null;
-          const s = getSettings();
-          return s.defaultModel?.id ? s.defaultModel : null;
-        })()}
-        apiKey={typeof window !== "undefined" ? getSettings().apiKey : ""}
+        defaultModel={approveDialogSettings?.defaultModel ?? null}
+        apiKey={approveDialogSettings?.apiKey ?? ""}
         onSubmit={handleApproveWithFork}
         submitting={ackSubmitting}
       />
 
-      {/* 再聊聊 Dialog（plan 模式专用、想改 artifact 或想答疑都走这里） */}
-      <Dialog open={reviseOpen} onOpenChange={setReviseOpen}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>跟 AI 再聊聊 · {PHASE_LABEL[cur]}</DialogTitle>
-          </DialogHeader>
-          <div className="flex flex-col gap-2">
-            <Textarea
-              value={reviseDraft}
-              onChange={(e) => setReviseDraft(e.target.value)}
-              rows={6}
-              placeholder="想改的地方、有疑问、想问问 AI——都行。AI 会先弹窗复述、再判断要不要动 artifact"
-              autoFocus
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setReviseOpen(false)}
-              disabled={ackSubmitting}
-            >
-              取消
-            </Button>
-            <Button
-              onClick={handleSubmitRevise}
-              disabled={ackSubmitting || !reviseDraft.trim()}
-            >
-              {ackSubmitting && <Loader2 className="animate-spin" />}
-              发给 AI
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 再聊聊 Dialog（plan 模式专用、想改 artifact 或想答疑都走这里）
+          draft state 在子组件内部、打字不触发本 page re-render、输入流畅 */}
+      <ReviseDialog
+        open={reviseOpen}
+        onOpenChange={setReviseOpen}
+        phaseLabel={PHASE_LABEL[cur]}
+        submitting={ackSubmitting}
+        onSubmit={handleSubmitRevise}
+      />
     </div>
   );
 };

@@ -39,6 +39,8 @@ import {
   appendEvent,
   getTask,
   patchPhase,
+  saveImageAttachments,
+  type ImageAttachmentInput,
 } from "@/lib/server/task-fs";
 import {
   hasPending,
@@ -61,6 +63,13 @@ interface Ctx {
 interface PostBody {
   action?: "approve" | "revise";
   feedback?: string;
+  // V0.5.4：revise 可携带图片附件（用户截图 + 说改这里）、approve 时忽略
+  // 跟 chat-reply 的 images 同款入参：纯 base64 + mimeType + filename
+  images?: Array<{
+    data?: string;
+    mimeType?: string;
+    filename?: string;
+  }>;
   // 可选：用户期望 ack 的 phase id（防止 race 导致 ack 到错的 phase）
   // 不传时按 task.currentPhase 兜底
   phase?: PhaseId;
@@ -72,6 +81,11 @@ interface PostBody {
     mcpServers?: Record<string, McpServerConfig>;
   };
 }
+
+// 整批上传 size 上限（跟 chat-reply 同款、防一次发 N 张超大图把服务端 / agent context 撑爆）
+const MAX_TOTAL_UPLOAD_BYTES = 30 * 1024 * 1024;
+// 单次最多附图数（跟 chat-reply 同款）
+const MAX_IMAGES_PER_REVISE = 6;
 
 const isValidModel = (m: unknown): m is ModelSelection => {
   if (!m || typeof m !== "object") return false;
@@ -118,8 +132,47 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("action 必须是 'approve' / 'revise'");
   }
   const feedback = (body.feedback ?? "").trim();
-  if (action === "revise" && feedback.length === 0) {
-    return errorResponse("revise 必须带 feedback 文本");
+  // V0.5.4：revise 可只发图片不带文本（如「就改成这样」+ 截图）
+  // 但 approve 不接受 images（语义上没必要）
+  const rawImages =
+    action === "revise" && Array.isArray(body.images) ? body.images : [];
+  if (rawImages.length > MAX_IMAGES_PER_REVISE) {
+    return errorResponse(
+      `单次最多附 ${MAX_IMAGES_PER_REVISE} 张图（你传了 ${rawImages.length}）`,
+    );
+  }
+  if (action === "revise" && feedback.length === 0 && rawImages.length === 0) {
+    return errorResponse("revise 必须带 feedback 文本或图片");
+  }
+  if (action === "approve" && rawImages.length > 0) {
+    return errorResponse("approve 不接受 images（如要带图请改用 revise）");
+  }
+
+  // V0.5.4：校验 images 入参格式（不校验内容、内容校验放 saveImageAttachments 里抛错）
+  const images: ImageAttachmentInput[] = [];
+  let totalBytes = 0;
+  for (const img of rawImages) {
+    if (typeof img?.data !== "string" || !img.data.trim()) {
+      return errorResponse("images[].data 必须是非空 base64 字符串");
+    }
+    if (typeof img.mimeType !== "string" || !img.mimeType.trim()) {
+      return errorResponse("images[].mimeType 必填");
+    }
+    // 粗略估算 base64 → bytes（实际字节数 ≈ b64长度 * 3 / 4 - padding）
+    totalBytes += Math.floor((img.data.length * 3) / 4);
+    images.push({
+      data: img.data,
+      mimeType: img.mimeType,
+      filename:
+        typeof img.filename === "string" && img.filename.trim()
+          ? img.filename.trim()
+          : undefined,
+    });
+  }
+  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
+    return errorResponse(
+      `本次上传图片总大小约 ${(totalBytes / 1024 / 1024).toFixed(2)} MB、超过上限 ${MAX_TOTAL_UPLOAD_BYTES / 1024 / 1024} MB`,
+    );
   }
 
   // V0.5：approve 时检测 fork 意图（forkAgent=true 或 nextModel 提供时都视为 fork）
@@ -195,28 +248,57 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   console.log(
-    `[phase-ack] task=${task.id} action=${action} phase=${ackPhase} wantsFork=${wantsFork} feedback=${feedback.slice(0, 60)}`,
+    `[phase-ack] task=${task.id} action=${action} phase=${ackPhase} wantsFork=${wantsFork} feedback=${feedback.slice(0, 60)} images=${images.length}`,
   );
+
+  // 0) revise 带图：先落盘、拿到绝对路径数组（meta 写事件 + 传给 agent）
+  // 失败：mimeType 不白名单 / size 超 / base64 损坏 → 400
+  let savedImages: Awaited<ReturnType<typeof saveImageAttachments>> = [];
+  if (images.length > 0) {
+    try {
+      savedImages = await saveImageAttachments(task.id, images);
+    } catch (err) {
+      return errorResponse(
+        `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   // 1) 先写一条事件、让用户视角立刻看到自己点了什么
   if (action === "approve") {
     // approve 事件由 markPhaseAcked 写（kind=phase_ack）、这里不重复写
   } else {
     // revise：写一条 user_reply 事件、meta 里标 kind=revise + 关联 phase
+    // 带图时 meta.images 形状跟 chat-reply 同款、UI 复用 extractUserReplyImages
+    const meta: Record<string, unknown> = { kind: "revise", phase: ackPhase };
+    if (savedImages.length > 0) {
+      meta.images = savedImages.map((s) => ({
+        absPath: s.absPath,
+        relPath: s.relPath,
+        mimeType: s.mimeType,
+        bytes: s.bytes,
+        filename: s.filename,
+      }));
+    }
+    // 纯图无文本场景给个 fallback、让事件流摘要不空
+    const fallbackText = savedImages.length > 0 ? "(用户附了图片)" : "";
     await appendEvent(task.id, {
       kind: "user_reply",
       phase: ackPhase,
-      text: feedback,
-      meta: { kind: "revise", phase: ackPhase },
+      text: feedback || fallbackText,
+      meta,
     });
   }
 
   // 2a) 非 fork 路径：把动作塞给阻塞中的 wait_for_user、旧 agent 继续跑
   if (!wantsFork) {
+    const imagePathsArg =
+      savedImages.length > 0 ? savedImages.map((s) => s.absPath) : undefined;
     const ok = submitPhaseAck(
       task.id,
       action,
       action === "revise" ? feedback : undefined,
+      imagePathsArg,
     );
     if (!ok) {
       return errorResponse(
