@@ -691,9 +691,9 @@ a15db37 refactor(v0.5.3): 抽 getNextPhase helper + 删死代码 + 注释对齐 
 - **首页提速验证**：D-1 改完后用户没明确反馈「快了」、需要联测时确认
 - **ask_user「其他答案」框贴图**（用户提议、设计待办、详见 §9）
 
-#### 9. V0.5.6 设计预案：ask_user「其他答案」框支持贴图
+#### 9. V0.5.7 设计预案：ask_user「其他答案」框支持贴图
 
-> **状态**：用户提议 + 拍板「**每个 question 独立贴图**——做不到就宁可不做」、设计已对齐、**未实施**、延后到 V0.5.6（V0.5.5 号让给了下面真正落地的优化批次、本预案等 V0.5.5 测稳再开）。
+> **状态**：用户提议 + 拍板「**每个 question 独立贴图**——做不到就宁可不做」、设计已对齐、**未实施**、延后到 V0.5.7（原本规划在 V0.5.6 号、但 V0.5.5 测完后用户先拍了「ask_user 无次数上限 + 稍后自行补充」、那批落到了 V0.5.6、贴图顺延到 V0.5.7、等 V0.5.6 测稳再开）。
 
 **为什么要做**：HITL 通道统一行为——`revise` / `chat-reply` 都允许贴图、唯独 `ask_user` 不允许、语义割裂。典型场景：AI 问「这个组件做 A/B/C/D 哪种」、用户想说「都不是、看截图我要 E」——贴图比文字直接得多。
 
@@ -712,7 +712,7 @@ React Hooks 规则禁止在 map / 循环里动态调用 hook、所以「每 ques
 // 现状（V0.5.4、单 key）：
 const { images, onPaste, removeImage, ... } = useImageAttach();
 
-// V0.5.6（多 key、向后兼容）：
+// V0.5.7（多 key、向后兼容）：
 const attach = useImageAttach();
 attach.getImages('q1');                    // 取 q1 的图
 attach.onPaste(e, 'q1');                   // q1 贴图
@@ -736,7 +736,7 @@ attach.removeImage(0, 'q1');               // 删 q1 第 0 张
 2. **AskUserDialog 布局变长**——「其他答案」展开 + 缩略图条 + 多 question 场景、`max-h-[80vh]` 内部 scroll body 要兜得住
 3. **agent prompt 复杂度**——「N 个 question 各带图集」对 agent 读图调度要求更高、要给清楚示例（建议给一段「3 个 question、Q1/Q3 带图」的标准处理流）
 
-**节奏拍板**：等 V0.5.5 + V0.5.4 + V0.5.3 测稳再开 V0.5.6、避免叠改难定位 bug。
+**节奏拍板**：等 V0.5.6 + V0.5.5 + V0.5.4 测稳再开 V0.5.7、避免叠改难定位 bug。
 
 ---
 
@@ -899,18 +899,139 @@ context_docs: [...]
 
 **结论**：纯冗余、artifact panel 顶部一大块视觉噪音、删。删完直接从 `# 方案：xxx` 起头。
 
-#### 9. V0.5.5 commit 全景（pending、未 commit）
+#### 9. V0.5.5 commit 全景
 
 ```
-（待 commit、本会话改动跨 18+ 文件、净减 100+ 行手工代码）
+da6e788 feat(v0.5.5): A+B 优化 + SDK 诊断 + SSE 重连 + prompt 瘦身 + revise 分级 + 重启加强
 ```
+
+> 23 文件 / +899 -540（HANDOFF +182 占大头、代码净减 70 行）。包含 V0.5.5 全部 8 大块改动。
 
 #### 10. V0.5.5 待办（接力 AI / 用户测试）
 
 - **核心待测**：跑完整 plan → build → review、看 V0.5.5 改动是否在用户操作路径上都生效
-- **ask_user 问两轮就停的问题**（§6 末尾遗留）需要下轮跟用户单独聊：是改成「全 A 路径才 wait_for_user / 无次数上限」、还是「软上限 5 轮」
+- ✅ **ask_user 问两轮就停的问题**（§6 末尾遗留）→ **已在 V0.5.6 解决**（用户拍板「无上限 + 加稍后自行补充按钮」、见下方 V0.5.6 段）
 - **SDK status=ERROR message=(none) 复现**：等下一次 status=error、看 dev server 终端 `[plan-runner] SDK status message: ...` 日志能否拿到 message——拿不到就是 SDK bug、可以反馈 Cursor 团队
 - **诊断口扩**：如果下一轮还频发 status=error、考虑在 `case "status"` 同步 publish 一条 `info` 事件（而不只是 console.log）、让用户在前端事件流里也能看到所有 status 跳变
+
+---
+
+### V0.5.6：ask_user 无次数上限 + 弹窗加「稍后自行补充」（2026-05-20 上午）
+
+> 用户对 V0.5.5 §6 遗留「ask_user 问两轮就停」的拍板——**取消所有「最多 1 次」上限、让 AI 按内容判断要不要继续问；同时弹窗加「稍后自行补充」按钮、给用户一个退出循环的口子。**
+
+#### 1. 设计动机（用户拍板）
+
+V0.5.5 联测发现：用户第一轮 ask_user 答模糊（「你定」/「不清楚」）、agent 应该 read/grep 形成判断 → 二轮 ask_user 给具体选项让用户拍板。但实测下来 agent 问完一轮就**自我加戏「问够了」**、直接写 artifact 跳过 wait_for_user 之前的二轮 ask_user。
+
+根因：旧 prompt 写「**写 artifact 初稿阶段最多调用 1 次 ask_user**」——这是 V0.3.2 给 modal 弹窗一次性打包问的设计、但被 agent 理解成了「整个 phase 都只能问一次」、用「问够了」自我说服跳过收敛。
+
+**修法（用户拍板）**：
+- ❌ 之前提议过的 B 方案「软上限 5 轮」——用户直接否决（「让 AI 根据内容判断要不要问」、不要预设次数）
+- ✅ 用户拍的方向：**完全去掉上限、按内容收敛；UI 加「稍后自行补充」按钮给用户退出循环的口子**
+
+#### 2. 协议层 / API 层改造
+
+**`task-store.ts.submitAskReply` 加 `options?: { deferred?: boolean }` 参数**：
+
+```ts
+submitAskReply(taskId, askId, answers, { deferred: true });
+```
+
+`deferred=true` 表示用户选「稍后自行补充」、`answers` 可以为空、body 多带 `deferred:true` 字段。
+
+**`/api/tasks/[id]/ask-reply/route.ts` 改造**：
+- body 接 `deferred?: boolean` 字段
+- 校验：`deferred=true` 时跳过「answers 必填非空」+「answers 覆盖所有 question」校验
+- `buildReplyText(questions, answers, deferred)` 第三参数 deferred、按头分两种格式：
+  - `deferred=false` → `[ASK_USER_REPLY]\nQ1: ...\nA: ...\n\nQ2: ...\nA: ...`（旧格式不变）
+  - `deferred=true` → `[ASK_USER_REPLY deferred]\n\n用户选择**稍后自行补充**、未提供任何答案。\n请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§7 待澄清 / 不确定项」段...\n\n未答问题清单：\n\nQ1: ...\nQ2: ...`
+- `ask_user_reply` 事件 meta 加 `deferred: true`（便于前端事件回放识别）
+
+#### 3. UI 层改造（`ask-user-dialog.tsx`）
+
+DialogFooter 加「稍后自行补充」按钮、ghost variant 让位主操作「提交全部回答」：
+
+```tsx
+<Button size="sm" variant="ghost" disabled={submitting} onClick={() => void handleDefer()}>
+  稍后自行补充
+</Button>
+<Button size="sm" disabled={submitting || !allAnswered} onClick={() => void handleSubmit()}>
+  {submitting ? "提交中…" : "提交全部回答"}
+</Button>
+```
+
+`handleDefer` 用 `useDialog().confirm` 二次确认（统一走项目里的 confirm Promise API、不用 window.confirm）：
+
+```ts
+const ok = await confirm({
+  title: "稍后自行补充这些问题？",
+  description: "AI 会跳过这一组问题、按 default 推进、并把它们列进方案文档「待澄清 / 不确定项」段。你可以稍后在「再聊聊」或上下文文档里补充。",
+  confirmLabel: "确认稍后补",
+  cancelLabel: "回去答题",
+});
+if (!ok) return;
+await submitAskReply(task.id, askId, [], { deferred: true });
+```
+
+#### 4. Prompt 层重写（去掉「最多 1 次」+ 教 agent 处理 deferred）
+
+**`src/lib/server/chat-mcp.ts` ask_user 工具描述**：
+- 标题从「phase 内打包提问（一次问完所有不确定项）」改成「phase 内打包提问（按需多次调、单次内一次问完）」
+- 「关键约束」段彻底重写：
+  - **单次调用内**：当前轮想问的全部打包进 questions[]、不要同一时刻调多次
+  - **整个 phase 内无次数上限**：按内容判断、按需多次调
+  - **收敛标准**：所有问题都得到「明确的业务决策」（A 路径）才能 wait_for_user；判不准就再问
+- 「返回值」段加 deferred 处理：拿到 `[ASK_USER_REPLY deferred]` 时必须 1) 不再就这组 Q 重新调 ask_user 2) 把这些 Q 列进 §7 待澄清 3) 按 default 推进继续 wait_for_user
+
+**`src/lib/server/plan-runner.ts` super-prompt ask_user 段**：
+- 标题改成「V0.5.6 无次数上限、按内容收敛」
+- 核心约束段重写、加 V0.5.6 设计动机说明（agent 自我加戏问题）
+- 删了 V0.5.1 修复段（「1 次限额仅针对初稿阶段」整段过时）
+- 「返回值」段加 deferred 处理
+- 「何时不该问」段加「拿到 deferred 头的那组 Q——用户已明示稍后补、不准重问」
+- 「调用礼仪」段把「最多调一次 ask_user / 撤销」改成「按需多次调、不要自我加戏问够了」
+
+**`prompts/phase-1-plan.md` §5 / §5.1 / §5.2 重写**：
+- §5 标题改 V0.5.6、关键约束段重写（无次数上限 + 按需多次调 + 用户可点稍后自行补充）
+- §5.1 加 **D 路径**（deferred 头处理：不重问 + 列进 §7 + 按 default 走继续 wait_for_user）、护栏改成「只有 D 才用 default、其他场景一律问到 A」
+- §5.2 改写收敛标准：「**全部收敛到 A 或拿到 deferred** 才 wait_for_user」、明示 agent 不预设次数上限不自我加戏
+
+#### 5. 关键决策记录
+
+| 决策点 | 用户拍板 | 备选 / 否决理由 |
+|---|---|---|
+| 上限策略 | **完全无上限**、AI 按内容判断 | ❌ 软上限 5 轮（用户否决：不要预设次数） |
+| 退出循环的口子给谁 | **给用户**（弹窗按钮） | 不给 agent（之前给 agent 就会被自我加戏） |
+| 「稍后补」UI 形态 | **全局 1 个 ghost 按钮**、跟「提交全部回答」并列 | 不做 per-question 跳过（复杂度高、用户「单数」表述含义） |
+| 二次确认 | `useDialog().confirm` Promise API | 不用 window.confirm（项目规则） |
+| 协议头 | `[ASK_USER_REPLY deferred]` | 保留旧 `[ASK_USER_REPLY]`、兼容回放、加后缀区分 |
+| Q 的归宿 | agent 列进 artifact §7 待澄清 + 按 default 走 | 不跳过、要让用户在 ack 弹窗看到「哪些没答、走的什么 default」 |
+
+#### 6. 改动文件清单（6 文件、净 +180/-50 行）
+
+| 文件 | 改动 |
+|---|---|
+| `src/lib/task-store.ts` | `submitAskReply` 加 `options?.deferred` 参数、body 条件携带 |
+| `src/app/api/tasks/[id]/ask-reply/route.ts` | body 接 deferred、跳过校验、`buildReplyText` 加 deferred 分支、meta 写 deferred |
+| `src/components/tasks/ask-user-dialog.tsx` | 加「稍后自行补充」ghost 按钮 + `useDialog().confirm` + `handleDefer` |
+| `src/lib/server/chat-mcp.ts` | ask_user 工具 description 整段重写、加 deferred 处理、phase 描述加 review |
+| `src/lib/server/plan-runner.ts` | super-prompt ask_user 段重写、删 V0.5.1 1 次限额段、顶部工具列表简介更新 |
+| `prompts/phase-1-plan.md` | §5 标题改 V0.5.6、约束重写、§5.1 加 D 路径、§5.2 改收敛标准 |
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓ 双绿。
+
+#### 7. V0.5.6 待办（接力 AI / 用户测试）
+
+- **核心待测**：用户在 ask_user 弹窗答模糊（「你定」/「不清楚」）、看 agent 是否真 read/grep + 二轮 ask_user 给具体选项（不再「问够了」跳过）
+- **deferred 闭环测**：用户点「稍后自行补充」→ 二次 confirm 确认 → 看 agent
+  1. 是否真的不再就这组 Q 重新调 ask_user
+  2. 是否把所有未答 Q 完整列进 artifact §7
+  3. 是否按合理 default 推进、artifact 各位置加 `> （ack 待澄清：xxx）` 标记
+  4. 是否继续 wait_for_user 不退 run
+- **revise 闭环也无上限测**：用户在「再聊聊」打模糊话（「test」/「111」）连发 3-4 次、agent 应该每次都 ask_user 复述、不闷头改、不自我加戏
+- **没必要场景测**：用户答案明确时 agent 不应该重复多调 ask_user（无上限 ≠ 必须多调、要按内容判断）
+- **极端场景**：用户连续点 5+ 次「稍后自行补充」（理论上不会、但测一下幂等）
 
 ---
 

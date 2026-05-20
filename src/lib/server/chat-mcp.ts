@@ -664,46 +664,46 @@ const buildMcpServer = (): McpServer => {
     },
   );
 
-  // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态）-----------------
+  // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态、V0.5.6 无上限）-----------------
   //
   // 设计动机（用户拍板）：
-  //   - 一次 phase 内只调一次 ask_user、把不确定项**全部打包**成 questions[] 数组
-  //     一个一个调会让用户体验破碎（弹窗不断弹、答得累、对话节奏拖长）
-  //   - UI 用 modal dialog 弹窗一次性展示所有问题、ABCD 字母前缀（对标 Cursor）
-  //   - 答完所有问题再提交、batch 落到 contextDocs
+  //   - 单次调用：把当前 turn 想得到的不确定项**一次性打包**成 questions[]、UI modal 一次问完
+  //     一个一个调会让用户体验破碎（弹窗不断弹、答得累）
+  //   - V0.5.6 改：**没有「一个 phase 最多 1 次」上限**——agent 按内容判断、按需多次调
+  //     比如初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项
+  //     直到所有问题都收敛到明确决策（A 路径）才 wait_for_user
+  //   - V0.5.6 加 defer：用户可在 UI 弹窗点「稍后自行补充」、agent 拿 [ASK_USER_REPLY deferred]
+  //     跳过这组 Q、按 default 推进、列进 artifact §7 待澄清——给用户一个退出循环的口子
   //
-  // 返回值：拼接成 markdown 的 Q&A 文本、agent 直接读、不需要解析 JSON
-  //   格式示例：
-  //     [ASK_USER_REPLY]
-  //     Q1: <问题1>
-  //     A: <用户答1>
-  //
-  //     Q2: <问题2>
-  //     A: <用户答2>
+  // 返回值：拼接成 markdown 的文本、agent 直接读、按头部协议分两种走法：
+  //   - 用户答了：`[ASK_USER_REPLY]\nQ1: ...\nA: ...\n\nQ2: ...\nA: ...`
+  //   - 用户点稍后自行补充：`[ASK_USER_REPLY deferred]\n...\n未答问题清单：\nQ1: ...\nQ2: ...`
   //
   // V0.3.5 保活语义同 wait_for_user：立即返回 [SHELL_WAIT_GUIDE token=xxx]、
-// agent 调 shell 工具跑 curl 长连接 /api/tasks/:id/wait-ack、stdout 一行解析结果。
-// 复用 pendingMap：同一时刻一个 task 只能有一个 pending
+  // agent 调 shell 工具跑 curl 长连接 /api/tasks/:id/wait-ack、stdout 一行解析结果。
+  // 复用 pendingMap：同一时刻一个 task 只能有一个 pending
   srv.registerTool(
     "ask_user",
     {
       title: "phase 内打包提问（一次问完所有不确定项）",
       description: [
-        "phase 内 agent 遇到不确定项时、**一次性把所有问题打包**调用 ask_user、阻塞等用户在 UI 弹窗里答完所有问题。",
+        "phase 内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、阻塞等用户在 UI 弹窗里答完整组。",
         "对标 Cursor `askFollowUpQuestion`：UI 出选项按钮 + 可选自由文本输入。",
         "",
-        "## 关键约束（用户拍板）",
+        "## 关键约束（V0.5.6 重写：无次数上限、按内容收敛）",
         "",
-        "- **一次 phase 内最多调用 1 次 ask_user**——把所有问题打包进 questions[]、不要一个一个调",
-        "- 同时调多次会让用户体验破碎（弹窗不断弹、要分多次答）",
+        "- **单次调用内**：把当前轮想问的问题**全部打包**到 questions[]、UI modal 一次答完——不要同一时刻调多次（一时刻只能有一个 pending、第二次会顶替第一次）",
+        "- **整个 phase 内无次数上限**：agent 按内容判断——比如「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项」是正常流程、不要因为「已经问过一轮」就跳过",
+        "- **收敛标准**：所有问题都得到「明确的业务决策」（即 A 路径——能直接落进 artifact 的）才能 wait_for_user。判不准就再问、不要打 default 跳过",
         "- **只在确实有不确定项时调用**——没问题就跳过、直接 wait_for_user",
         "- **options 里不要手动塞「Other / 其他 / 其它 / 以上都不是 / 自定义」类的兜底选项**——`allow_text=true` 时 UI 会自动渲染「以上都不是 / 自定义回答…」按钮、你再加会重复",
         "",
         "## 何时调用",
         "",
         "- artifact 初稿写完、扫一遍发现有不确定 / 多选 / 歧义点：上下文冲突、口径不清、接口字段不明、技术路线 A/B",
-        "- 把所有这些点收集成 questions[]、**一次性调** ask_user",
-        "- 用户在弹窗里**所有问题答完才能继续**、答完 agent 拿到 Q&A 文本回到工作",
+        "- 用户上一轮答案模糊 /「你定 / 看代码再说」——read/grep 形成判断后、再调一次给具体业务选项让用户拍板",
+        "- revise 闭环里用户 feedback 含混（C 路径）——调一次复述意图",
+        "- 把当前轮所有问题打包进 questions[]、一次问完",
         "",
         "## 入参",
         "",
@@ -716,16 +716,18 @@ const buildMcpServer = (): McpServer => {
         "      - **严禁** 在 options[] 里塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项——UI 已经在选项列表底下统一渲染「以上都不是 / 自定义回答…」按钮、点了切到自由文本输入框、你只要列具体业务选项就行（重复塞了 UI 也不会触发文本框、只会变成「点了不能填」的死按钮）",
         "    - `allow_text`：保留默认 true。它只是控制 UI 是否渲染那个「以上都不是 / 自定义回答…」按钮、不要把它理解成「我要在 options 里加一个 Other 选项」",
         "",
-        "## 返回值（V0.3.5 起：shell + curl long-poll）",
+        "## 返回值（V0.3.5 起：shell + curl long-poll、V0.5.6 加 deferred）",
         "",
         "- 立即返回 `[SHELL_WAIT_GUIDE token=xxx]`、文本里附完整 curl 命令——调一次 `shell` 工具跑这条命令、长连接挂在 /api/tasks/:id/wait-ack",
-        "- 用户在弹窗答完后、shell stdout 收到 `[ASK_USER_REPLY] ...` 开头的 markdown Q&A 文本、agent 解析答案接着工作",
+        "- 用户在弹窗答完后、shell stdout 可能拿到两类头：",
+        "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按 A/B/C/D 分级处理（A 直接落 artifact；C 模糊 → 再调一次 ask_user 给具体选项）",
+        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后自行补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§7 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
         "- 其他可能 stdout 行：`[CANCELLED]`（用户取消任务）/ `[STALE]`（旧 token 被新 wait_for_user 顶替）/ `[INVALID_TOKEN]`",
         "- **不**要再调 keep_alive_a/b/c（V0.3.5 已删）、调一次 ask_user 即结束本工具调用、剩下全交给 shell long-poll",
         "",
         "## 调用礼仪",
         "",
-        "- 调用前 / 后不要 assistant_message 解释「我先问几个问题」之类、UI modal 会自动弹出来",
+        "- 调用前 / 后不要 assistant_message 解释「我先问几个问题」「我再问一次」之类、UI modal 会自动弹出来",
         "- 答完后不要复述「你刚才选了 X」、直接按答案推进、写到 artifact 的「上下文冲突已通过 ask_user 澄清」段",
         "- 答案**只**写到 artifact（01-plan.md）、**不再**自动落 contextDocs——单一数据源、避免重复",
       ].join("\n"),
@@ -734,7 +736,7 @@ const buildMcpServer = (): McpServer => {
         phase: z
           .string()
           .optional()
-          .describe("当前 phase id（plan / build）"),
+          .describe("当前 phase id（plan / build / review）"),
         questions: z
           .array(
             z.object({
@@ -762,7 +764,7 @@ const buildMcpServer = (): McpServer => {
             }),
           )
           .min(1)
-          .describe("问题数组、一次打包所有不确定项、至少 1 条"),
+          .describe("问题数组、当前轮所有不确定项打包进来、至少 1 条"),
       },
     },
     async ({ task_id, phase, questions }) => {

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态）
+ * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态、V0.5.6 加「稍后自行补充」）
  *
  * 跟 V0.3 inline 卡片的差异：
  *   - **弹窗**：在 task 详情页顶层挂、不在 event stream 里、不会被 thinking / tool_call 等过程事件淹没
@@ -10,10 +10,16 @@
  *   - **一次提交**：所有 question 都答完才能点提交、批量送给 agent
  *   - **强制 action**：不允许 dismiss（点 backdrop / Esc）、避免用户关掉后 agent 永远等
  *
+ * V0.5.6 加「稍后自行补充」按钮（用户拍板）：
+ *   - 配合「ask_user 无次数上限」、给用户一个退出循环的口子
+ *   - 点 → useDialog().confirm 二次确认 → POST 时 body 带 deferred:true
+ *   - agent 拿到 [ASK_USER_REPLY deferred] 头、跳过这组 Q、按 default 推进、列进 artifact §7 待澄清
+ *
  * 数据流：
  *   1. 监听 task.events、找最新一条 ask_user_request 且没对应 ask_user_reply 的 → 弹窗
  *   2. 用户选 option / 写 Other 文本 → 内部 answers state 累积
  *   3. 全答完点提交 → POST /api/tasks/[id]/ask-reply、body 带 answers[]
+ *      或点「稍后自行补充」→ confirm 后 POST 带 deferred:true、answers 可空
  *   4. 服务端 resolve agent、写 ask_user_reply 事件、SSE 推回来、UI 自动关弹窗
  *
  * 设计原则：
@@ -37,6 +43,7 @@ import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { useDialog } from "@/hooks/use-dialog";
 import { submitAskReply } from "@/lib/task-store";
 import type {
   AskUserAnswer,
@@ -97,6 +104,9 @@ const extractQuestions = (
 const LETTER_PREFIX = ["A", "B", "C", "D", "E", "F"];
 
 export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
+  // useDialog 提供 confirm Promise API、用户点「稍后自行补充」时弹二次确认
+  const { confirm } = useDialog();
+
   // 找最新一条待答的 ask_user_request
   // - 倒序扫、第一条没对应 reply 的就是「当前要弹的」
   // - 一次只弹一个 ask（用户答完才会有下一个 ask、串行）
@@ -232,6 +242,29 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
     }
   };
 
+  // V0.5.6 「稍后自行补充」：用户点 → confirm → POST deferred:true
+  // 配合 ask_user 无次数上限设计——给用户一个退出循环的口子、agent 跳过这组 Q
+  // 走 default 推进、把问题列进 artifact §7 待澄清
+  const handleDefer = async () => {
+    if (!askId || submitting) return;
+    const ok = await confirm({
+      title: "稍后自行补充这些问题？",
+      description:
+        "AI 会跳过这一组问题、按 default 推进、并把它们列进方案文档「待澄清 / 不确定项」段。你可以稍后在「再聊聊」或上下文文档里补充。",
+      confirmLabel: "确认稍后补",
+      cancelLabel: "回去答题",
+    });
+    if (!ok) return;
+    setSubmitting(true);
+    try {
+      await submitAskReply(task.id, askId, [], { deferred: true });
+      onAnswered?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+      setSubmitting(false);
+    }
+  };
+
   return (
     <Dialog
       open={open}
@@ -344,8 +377,8 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
               那两条是 shadcn 给「父 DialogContent 有 p-4」的场景设计的全宽 footer 效果。
               这里 DialogContent 用了 p-0（让中间滚动区铺满）、负 margin 会把 footer
               拉到 content 边界外、被 overflow-hidden 裁掉、视觉上「贴底没间距」。 */}
-          <div className="flex w-full items-center justify-between text-xs text-muted-foreground">
-            <span>
+          <div className="flex w-full items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span className="shrink-0">
               已答 {Object.values(drafts).filter(
                 (d) =>
                   d.optionId ||
@@ -353,13 +386,26 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
               ).length}{" "}
               / {questions.length}
             </span>
-            <Button
-              size="sm"
-              disabled={submitting || !allAnswered}
-              onClick={() => void handleSubmit()}
-            >
-              {submitting ? "提交中…" : "提交全部回答"}
-            </Button>
+            <div className="flex items-center gap-2">
+              {/* V0.5.6 「稍后自行补充」：让位主操作用 ghost
+                  点 → useDialog.confirm → 后端拼 [ASK_USER_REPLY deferred] 给 agent
+                  agent 跳过这组 Q、按 default 推进、列进 artifact §7 待澄清 */}
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={submitting}
+                onClick={() => void handleDefer()}
+              >
+                稍后自行补充
+              </Button>
+              <Button
+                size="sm"
+                disabled={submitting || !allAnswered}
+                onClick={() => void handleSubmit()}
+              >
+                {submitting ? "提交中…" : "提交全部回答"}
+              </Button>
+            </div>
           </div>
         </DialogFooter>
       </DialogContent>

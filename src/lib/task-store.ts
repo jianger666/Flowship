@@ -557,7 +557,7 @@ export const removeContextDoc = async (
   return data.task;
 };
 
-// ----------------- ask_user 回复（V0.3.2） -----------------
+// ----------------- ask_user 回复（V0.3.2 + V0.5.6 deferred） -----------------
 
 /**
  * 用户在 AskUserDialog 答完所有问题后提交答案
@@ -565,18 +565,29 @@ export const removeContextDoc = async (
  * 服务端：POST /api/tasks/[id]/ask-reply
  *   - 写 ask_user_reply 事件、resolve agent
  * 抽到 task-store 是为了让 ask-user-dialog 不直接裸 fetch、错误归一走 handleJson
+ *
+ * V0.5.6 deferred 模式（用户拍板）：
+ *   - 用户点弹窗里「稍后自行补充」→ 不答任何问题、传 deferred=true、answers 可以为空
+ *   - 服务端把 reply 包装成 `[ASK_USER_REPLY deferred] ...` 头给 agent
+ *   - agent 看到 deferred 头时跳过这一组 Q、按 default 推进、把问题写进 artifact §7 待澄清
+ *   - 用户后续可以在「再聊聊」或上下文文档里补
  */
 export const submitAskReply = async (
   taskId: string,
   askId: string,
   answers: AskUserAnswer[],
+  options?: { deferred?: boolean },
 ): Promise<{ ok: true }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/ask-reply`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ askId, answers }),
+      body: JSON.stringify({
+        askId,
+        answers,
+        ...(options?.deferred ? { deferred: true } : {}),
+      }),
     },
   );
   return await handleJson<{ ok: true }>(res);

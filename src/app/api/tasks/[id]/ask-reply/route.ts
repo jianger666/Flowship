@@ -1,20 +1,27 @@
 /**
- * POST /api/tasks/[id]/ask-reply（V0.3.2 一次打包问题、modal 形态）
+ * POST /api/tasks/[id]/ask-reply（V0.3.2 一次打包问题、modal 形态、V0.5.6 加 deferred）
  *
  * V0.3.2 改造（用户拍板）：
  *   - 一次 ask_user 调用 = 一组问题 questions[]
  *   - UI modal 弹窗一次性答完所有问题、提交时 body 携带 answers[]
  *   - 拼接成 markdown Q&A 文本传给 agent、batch 落 contextDocs
  *
- * Body: { askId: string; answers: Array<{ questionId, answer, optionId? }> }
+ * V0.5.6 改造（用户拍板：ask_user 无次数上限 + 加「稍后自行补充」）：
+ *   - 用户点弹窗「稍后自行补充」时、body 多带 deferred:true、answers 可以为空
+ *   - 服务端拼成 `[ASK_USER_REPLY deferred] ...` 头给 agent、agent 跳过这组 Q
+ *   - 没了「初稿阶段最多 1 次 ask_user」上限——agent 按内容收敛、可多次调
+ *
+ * Body: { askId: string; answers: Array<{ questionId, answer, optionId? }>; deferred?: boolean }
  *   - askId：对应 ask_user_request 事件的 askId
  *   - answers：每条问题的回答、跟 ask_user_request meta.questions 一一对应
+ *     deferred=true 时 answers 可以为空（用户选择不答）
+ *   - deferred：true 表示用户选择稍后自行补充、agent 走 default、不重复问
  *
  * 行为：
  *   1. 校验 task / askId / 没被答过 / pending 状态
- *   2. 拼接 [ASK_USER_REPLY] markdown Q&A 文本
+ *   2. 拼接 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] markdown 文本
  *   3. submitAskReply(taskId, replyText) resolve agent
- *   4. 写 ask_user_reply 事件、meta 带 askId + answers + text 是拼接结果
+ *   4. 写 ask_user_reply 事件、meta 带 askId + answers + deferred + text 是拼接结果
  *
  * V0.3.3 改造（用户拍板：砍数据冗余）：
  *   - Q&A 不再单独 addContextDoc——之前每条 Q&A 写一条 contextDoc title=`Q: 问题`
@@ -48,6 +55,8 @@ interface AnswerPayload {
 interface PostBody {
   askId?: string;
   answers?: AnswerPayload[];
+  // V0.5.6：用户点「稍后自行补充」时为 true、answers 可以为空、服务端拼 deferred 头
+  deferred?: boolean;
 }
 
 const errorResponse = (message: string, status = 400) =>
@@ -97,11 +106,30 @@ const extractQuestionsFromMeta = (
 };
 
 // 把每条 Q&A 拼成 markdown 给 agent
-// 加 [ASK_USER_REPLY] 头部、agent prompt 教它认这个头
+// 加 [ASK_USER_REPLY] 头部（或 V0.5.6 deferred 模式的 [ASK_USER_REPLY deferred]）
+// agent prompt 教它认这两个头、按头切不同处理路径
 const buildReplyText = (
   questions: AskUserQuestion[],
   answers: AskUserAnswer[],
+  deferred: boolean,
 ): string => {
+  if (deferred) {
+    // 用户选「稍后自行补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §7 待澄清
+    // 把全部 Q 列出来让 agent 知道要写进 artifact 哪些「待澄清」项
+    const sections: string[] = [
+      "[ASK_USER_REPLY deferred]",
+      "",
+      "用户选择**稍后自行补充**、未提供任何答案。",
+      "请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§7 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补充。",
+      "**不要**再就这同一组问题重新调 ask_user——用户已明示稍后补、再问就是冒犯。",
+      "",
+      "未答问题清单：",
+    ];
+    questions.forEach((q, idx) => {
+      sections.push("", `Q${idx + 1}: ${q.question}`);
+    });
+    return sections.join("\n");
+  }
   const answerMap = new Map(answers.map((a) => [a.questionId, a]));
   const sections: string[] = ["[ASK_USER_REPLY]"];
   questions.forEach((q, idx) => {
@@ -124,25 +152,34 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const askId = (body.askId ?? "").trim();
   const rawAnswers = body.answers;
+  // V0.5.6：deferred=true 表示用户选「稍后自行补充」、answers 可以为空
+  const deferred = body.deferred === true;
 
   if (!askId) return errorResponse("askId 必填");
-  if (!Array.isArray(rawAnswers) || rawAnswers.length === 0) {
-    return errorResponse("answers 必填、至少一条");
+  if (!deferred) {
+    // 正常答题模式才校验 answers 非空 + 每条内容非空
+    if (!Array.isArray(rawAnswers) || rawAnswers.length === 0) {
+      return errorResponse("answers 必填、至少一条");
+    }
   }
   const answers: AskUserAnswer[] = [];
-  for (const a of rawAnswers) {
-    if (!a || typeof a.questionId !== "string" || typeof a.answer !== "string") {
-      return errorResponse("answers[].questionId / answer 类型不对");
+  if (Array.isArray(rawAnswers)) {
+    for (const a of rawAnswers) {
+      if (!a || typeof a.questionId !== "string" || typeof a.answer !== "string") {
+        if (deferred) continue;
+        return errorResponse("answers[].questionId / answer 类型不对");
+      }
+      const ans = a.answer.trim();
+      if (ans.length === 0) {
+        if (deferred) continue;
+        return errorResponse(`questionId=${a.questionId} 的 answer 为空`);
+      }
+      answers.push({
+        questionId: a.questionId,
+        answer: ans,
+        ...(a.optionId ? { optionId: a.optionId } : {}),
+      });
     }
-    const ans = a.answer.trim();
-    if (ans.length === 0) {
-      return errorResponse(`questionId=${a.questionId} 的 answer 为空`);
-    }
-    answers.push({
-      questionId: a.questionId,
-      answer: ans,
-      ...(a.optionId ? { optionId: a.optionId } : {}),
-    });
   }
 
   const task = await getTask(id);
@@ -177,10 +214,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 校验 answers 覆盖所有 question（每条都得有）
   // 用户在 modal 里答完才提交、缺哪条说明前端 bug、拒
-  const questionIds = new Set(questions.map((q) => q.id));
-  for (const qid of questionIds) {
-    if (!answers.some((a) => a.questionId === qid)) {
-      return errorResponse(`questionId=${qid} 缺答案、所有问题都必须答`);
+  // V0.5.6：deferred 模式跳过覆盖校验、用户明示不答
+  if (!deferred) {
+    const questionIds = new Set(questions.map((q) => q.id));
+    for (const qid of questionIds) {
+      if (!answers.some((a) => a.questionId === qid)) {
+        return errorResponse(`questionId=${qid} 缺答案、所有问题都必须答`);
+      }
     }
   }
 
@@ -224,11 +264,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   console.log(
-    `[ask-reply] task=${task.id} askId=${askId} answers=${answers.length}/${questions.length}`,
+    `[ask-reply] task=${task.id} askId=${askId} answers=${answers.length}/${questions.length} deferred=${deferred}`,
   );
 
-  // 拼好 reply text、agent 看到 [ASK_USER_REPLY] 头解析
-  const replyText = buildReplyText(questions, answers);
+  // 拼好 reply text、agent 看到 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] 头解析
+  const replyText = buildReplyText(questions, answers, deferred);
 
   // 1) 写 ask_user_reply 事件（用户视角先看到自己的答案落事件流）
   // text 用拼好的 replyText（也可以只放精简版、但拼好的能直接当回放看）
@@ -240,6 +280,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     meta: {
       askId,
       answers,
+      ...(deferred ? { deferred: true } : {}),
     },
   });
   if (replyTask) {
