@@ -567,7 +567,7 @@ export const removeContextDoc = async (
  * 抽到 task-store 是为了让 ask-user-dialog 不直接裸 fetch、错误归一走 handleJson
  *
  * V0.5.6 deferred 模式（用户拍板）：
- *   - 用户点弹窗里「稍后自行补充」→ 不答任何问题、传 deferred=true、answers 可以为空
+ *   - 用户点弹窗里「稍后再补充」→ 不答任何问题、传 deferred=true、answers 可以为空
  *   - 服务端把 reply 包装成 `[ASK_USER_REPLY deferred] ...` 头给 agent
  *   - agent 看到 deferred 头时跳过这一组 Q、按 default 推进、把问题写进 artifact §7 待澄清
  *   - 用户后续可以在「再聊聊」或上下文文档里补

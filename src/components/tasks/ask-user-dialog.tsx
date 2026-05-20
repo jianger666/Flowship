@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态、V0.5.6 加「稍后自行补充」）
+ * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态、V0.5.6 加「稍后再补充」）
  *
  * 跟 V0.3 inline 卡片的差异：
  *   - **弹窗**：在 task 详情页顶层挂、不在 event stream 里、不会被 thinking / tool_call 等过程事件淹没
@@ -10,7 +10,7 @@
  *   - **一次提交**：所有 question 都答完才能点提交、批量送给 agent
  *   - **强制 action**：不允许 dismiss（点 backdrop / Esc）、避免用户关掉后 agent 永远等
  *
- * V0.5.6 加「稍后自行补充」按钮（用户拍板）：
+ * V0.5.6 加「稍后再补充」按钮（用户拍板）：
  *   - 配合「ask_user 无次数上限」、给用户一个退出循环的口子
  *   - 点 → useDialog().confirm 二次确认 → POST 时 body 带 deferred:true
  *   - agent 拿到 [ASK_USER_REPLY deferred] 头、跳过这组 Q、按 default 推进、列进 artifact §7 待澄清
@@ -19,7 +19,7 @@
  *   1. 监听 task.events、找最新一条 ask_user_request 且没对应 ask_user_reply 的 → 弹窗
  *   2. 用户选 option / 写 Other 文本 → 内部 answers state 累积
  *   3. 全答完点提交 → POST /api/tasks/[id]/ask-reply、body 带 answers[]
- *      或点「稍后自行补充」→ confirm 后 POST 带 deferred:true、answers 可空
+ *      或点「稍后再补充」→ confirm 后 POST 带 deferred:true、answers 可空
  *   4. 服务端 resolve agent、写 ask_user_reply 事件、SSE 推回来、UI 自动关弹窗
  *
  * 设计原则：
@@ -104,7 +104,7 @@ const extractQuestions = (
 const LETTER_PREFIX = ["A", "B", "C", "D", "E", "F"];
 
 export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
-  // useDialog 提供 confirm Promise API、用户点「稍后自行补充」时弹二次确认
+  // useDialog 提供 confirm Promise API、用户点「稍后再补充」时弹二次确认
   const { confirm } = useDialog();
 
   // 找最新一条待答的 ask_user_request
@@ -242,13 +242,13 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
     }
   };
 
-  // V0.5.6 「稍后自行补充」：用户点 → confirm → POST deferred:true
+  // V0.5.6 「稍后再补充」：用户点 → confirm → POST deferred:true
   // 配合 ask_user 无次数上限设计——给用户一个退出循环的口子、agent 跳过这组 Q
   // 走 default 推进、把问题列进 artifact §7 待澄清
   const handleDefer = async () => {
     if (!askId || submitting) return;
     const ok = await confirm({
-      title: "稍后自行补充这些问题？",
+      title: "稍后再补充这些问题？",
       description:
         "AI 会跳过这一组问题、按 default 推进、并把它们列进方案文档「待澄清 / 不确定项」段。你可以稍后在「再聊聊」或上下文文档里补充。",
       confirmLabel: "确认稍后补",
@@ -387,7 +387,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
               / {questions.length}
             </span>
             <div className="flex items-center gap-2">
-              {/* V0.5.6 「稍后自行补充」：让位主操作用 ghost
+              {/* V0.5.6 「稍后再补充」：让位主操作用 ghost
                   点 → useDialog.confirm → 后端拼 [ASK_USER_REPLY deferred] 给 agent
                   agent 跳过这组 Q、按 default 推进、列进 artifact §7 待澄清 */}
               <Button
@@ -396,7 +396,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                 disabled={submitting}
                 onClick={() => void handleDefer()}
               >
-                稍后自行补充
+                稍后再补充
               </Button>
               <Button
                 size="sm"

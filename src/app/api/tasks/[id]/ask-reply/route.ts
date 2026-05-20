@@ -6,8 +6,8 @@
  *   - UI modal 弹窗一次性答完所有问题、提交时 body 携带 answers[]
  *   - 拼接成 markdown Q&A 文本传给 agent、batch 落 contextDocs
  *
- * V0.5.6 改造（用户拍板：ask_user 无次数上限 + 加「稍后自行补充」）：
- *   - 用户点弹窗「稍后自行补充」时、body 多带 deferred:true、answers 可以为空
+ * V0.5.6 改造（用户拍板：ask_user 无次数上限 + 加「稍后再补充」）：
+ *   - 用户点弹窗「稍后再补充」时、body 多带 deferred:true、answers 可以为空
  *   - 服务端拼成 `[ASK_USER_REPLY deferred] ...` 头给 agent、agent 跳过这组 Q
  *   - 没了「初稿阶段最多 1 次 ask_user」上限——agent 按内容收敛、可多次调
  *
@@ -15,7 +15,7 @@
  *   - askId：对应 ask_user_request 事件的 askId
  *   - answers：每条问题的回答、跟 ask_user_request meta.questions 一一对应
  *     deferred=true 时 answers 可以为空（用户选择不答）
- *   - deferred：true 表示用户选择稍后自行补充、agent 走 default、不重复问
+ *   - deferred：true 表示用户选择稍后再补充、agent 走 default、不重复问
  *
  * 行为：
  *   1. 校验 task / askId / 没被答过 / pending 状态
@@ -55,7 +55,7 @@ interface AnswerPayload {
 interface PostBody {
   askId?: string;
   answers?: AnswerPayload[];
-  // V0.5.6：用户点「稍后自行补充」时为 true、answers 可以为空、服务端拼 deferred 头
+  // V0.5.6：用户点「稍后再补充」时为 true、answers 可以为空、服务端拼 deferred 头
   deferred?: boolean;
 }
 
@@ -114,12 +114,12 @@ const buildReplyText = (
   deferred: boolean,
 ): string => {
   if (deferred) {
-    // 用户选「稍后自行补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §7 待澄清
+    // 用户选「稍后再补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §7 待澄清
     // 把全部 Q 列出来让 agent 知道要写进 artifact 哪些「待澄清」项
     const sections: string[] = [
       "[ASK_USER_REPLY deferred]",
       "",
-      "用户选择**稍后自行补充**、未提供任何答案。",
+      "用户选择**稍后再补充**、未提供任何答案。",
       "请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§7 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补充。",
       "**不要**再就这同一组问题重新调 ask_user——用户已明示稍后补、再问就是冒犯。",
       "",
@@ -152,7 +152,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const askId = (body.askId ?? "").trim();
   const rawAnswers = body.answers;
-  // V0.5.6：deferred=true 表示用户选「稍后自行补充」、answers 可以为空
+  // V0.5.6：deferred=true 表示用户选「稍后再补充」、answers 可以为空
   const deferred = body.deferred === true;
 
   if (!askId) return errorResponse("askId 必填");

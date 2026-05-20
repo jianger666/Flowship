@@ -672,12 +672,12 @@ const buildMcpServer = (): McpServer => {
   //   - V0.5.6 改：**没有「一个 phase 最多 1 次」上限**——agent 按内容判断、按需多次调
   //     比如初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项
   //     直到所有问题都收敛到明确决策（A 路径）才 wait_for_user
-  //   - V0.5.6 加 defer：用户可在 UI 弹窗点「稍后自行补充」、agent 拿 [ASK_USER_REPLY deferred]
+  //   - V0.5.6 加 defer：用户可在 UI 弹窗点「稍后再补充」、agent 拿 [ASK_USER_REPLY deferred]
   //     跳过这组 Q、按 default 推进、列进 artifact §7 待澄清——给用户一个退出循环的口子
   //
   // 返回值：拼接成 markdown 的文本、agent 直接读、按头部协议分两种走法：
   //   - 用户答了：`[ASK_USER_REPLY]\nQ1: ...\nA: ...\n\nQ2: ...\nA: ...`
-  //   - 用户点稍后自行补充：`[ASK_USER_REPLY deferred]\n...\n未答问题清单：\nQ1: ...\nQ2: ...`
+  //   - 用户点稍后再补充：`[ASK_USER_REPLY deferred]\n...\n未答问题清单：\nQ1: ...\nQ2: ...`
   //
   // V0.3.5 保活语义同 wait_for_user：立即返回 [SHELL_WAIT_GUIDE token=xxx]、
   // agent 调 shell 工具跑 curl 长连接 /api/tasks/:id/wait-ack、stdout 一行解析结果。
@@ -721,7 +721,7 @@ const buildMcpServer = (): McpServer => {
         "- 立即返回 `[SHELL_WAIT_GUIDE token=xxx]`、文本里附完整 curl 命令——调一次 `shell` 工具跑这条命令、长连接挂在 /api/tasks/:id/wait-ack",
         "- 用户在弹窗答完后、shell stdout 可能拿到两类头：",
         "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按 A/B/C/D 分级处理（A 直接落 artifact；C 模糊 → 再调一次 ask_user 给具体选项）",
-        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后自行补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§7 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
+        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§7 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
         "- 其他可能 stdout 行：`[CANCELLED]`（用户取消任务）/ `[STALE]`（旧 token 被新 wait_for_user 顶替）/ `[INVALID_TOKEN]`",
         "- **不**要再调 keep_alive_a/b/c（V0.3.5 已删）、调一次 ask_user 即结束本工具调用、剩下全交给 shell long-poll",
         "",
