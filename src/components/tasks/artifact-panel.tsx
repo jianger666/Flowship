@@ -18,6 +18,7 @@ import remarkGfm from "remark-gfm";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { buildCursorLink, looksLikePath } from "@/lib/path-utils";
 import { PHASE_LABEL, PHASE_LABEL_EN } from "@/lib/task-display";
 import type { PhaseState } from "@/lib/types";
 
@@ -25,50 +26,6 @@ import type { PhaseState } from "@/lib/types";
 // 不在 task-display 里直接 export 这个变种、避免污染单一职责
 const formatPhaseTitle = (id: PhaseState["id"]) =>
   `${PHASE_LABEL[id]} (${PHASE_LABEL_EN[id]})`;
-
-/**
- * 判断 inline code 内容像不像「文件路径」
- *
- * 启发式规则（求覆盖、不求精确）：
- *   - 含 `/`、且最后一段含 `.`（扩展名）
- *   - 不能含空格 / 反引号 / 引号（这些通常是表达式不是路径）
- *   - 长度合理（< 200、避免误判超长字符串）
- *
- * 不动 markdown 原文、只在视图层把长路径里的目录置灰、文件名加粗、且包成 deep link。
- * 用户切「原文」视图能看到原始 path、复制粘贴也是 plain string、下游兼容。
- */
-const looksLikePath = (s: string): boolean => {
-  if (!s || s.length > 200) return false;
-  if (/\s|"|'|`/.test(s)) return false;
-  if (!s.includes("/")) return false;
-  const lastSeg = s.slice(s.lastIndexOf("/") + 1);
-  return lastSeg.length > 0 && lastSeg.includes(".");
-};
-
-/**
- * 把相对仓库路径转成 cursor:// deep link
- *
- * - 已经是绝对路径就直接用
- * - 否则跟仓库根拼起来
- * - Cursor 支持 cursor://file/<absolute>、点开就跳到 IDE 对应文件
- */
-const buildCursorLink = (
-  pathLike: string,
-  repoPath: string | undefined,
-): string | null => {
-  if (!pathLike) return null;
-  // 已经是 url / 协议、不动
-  if (/^[a-z]+:\/\//i.test(pathLike)) return null;
-  let absolute = pathLike;
-  if (!pathLike.startsWith("/")) {
-    if (!repoPath) return null;
-    const base = repoPath.replace(/\/+$/, "");
-    absolute = `${base}/${pathLike.replace(/^\.?\/+/, "")}`;
-  }
-  // cursor:// 协议第一段是 host、然后是 path、所以 file 后面再带绝对路径
-  // encode 防中文路径炸
-  return `cursor://file${absolute.split("/").map(encodeURIComponent).join("/")}`;
-};
 
 const buildMarkdownComponents = (
   repoPath: string | undefined,

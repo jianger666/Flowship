@@ -28,16 +28,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { useDialog } from "@/hooks/use-dialog";
+import { pathBasename } from "@/lib/path-utils";
 
 import type { RepoConfig } from "@/lib/types";
 import { SaveButton } from "./save-button";
-
-// 取绝对路径最后一段做仓库 name 默认值（处理末尾斜杠）
-const basename = (p: string): string => {
-  const cleaned = p.replace(/\/+$/, "");
-  const idx = cleaned.lastIndexOf("/");
-  return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
-};
 
 interface RepoCardProps {
   repos: RepoConfig[];
@@ -59,7 +53,7 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
       toast.error("这个目录已经在列表里");
       return;
     }
-    onChange([...repos, { name: basename(path), path }]);
+    onChange([...repos, { name: pathBasename(path), path }]);
   };
 
   // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
@@ -89,7 +83,7 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
   const onRenameBlur = (path: string, name: string) => {
     if (name.trim()) return;
     onChange(
-      repos.map((r) => (r.path === path ? { ...r, name: basename(path) } : r))
+      repos.map((r) => (r.path === path ? { ...r, name: pathBasename(path) } : r))
     );
   };
 

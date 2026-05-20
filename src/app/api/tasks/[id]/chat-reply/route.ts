@@ -48,13 +48,20 @@ import {
   getTask,
   patchPhase,
   saveImageAttachments,
-  type ImageAttachmentInput,
 } from "@/lib/server/task-fs";
 import {
   hasPending,
   submitUserMessage,
 } from "@/lib/server/chat-mcp";
 import { isChatRunning, publishChatStreamEvent, runChatSession } from "@/lib/server/chat-runner";
+import {
+  errorResponse,
+  isValidMcpServers,
+  isValidModel,
+  KEEPALIVE_RACE_RETRY_MS,
+  parseAndValidateImages,
+  sleep,
+} from "@/lib/server/route-helpers";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -84,53 +91,13 @@ interface PostBody {
   };
 }
 
-// 整批上传 size 上限（防一次发 N 张超大图把服务端 / agent context 撑爆）
-// 单图 ≤ 10MB 由 task-fs.ts 内部强制
-const MAX_TOTAL_UPLOAD_BYTES = 30 * 1024 * 1024;
-// 单次最多附图数（防滥用）
+// 单次最多附图数（防滥用、chat-reply 跟 phase-ack 都是 6、保留各自字段方便单独调）
 const MAX_IMAGES_PER_REPLY = 6;
 // 单次最多附路径数（防 agent context 被路径列表刷爆）
 // 跟前端 event-stream.tsx 的 MAX_ATTACHMENTS_PER_REPLY 保持一致
 const MAX_ATTACHMENTS_PER_REPLY = 10;
 
-const errorResponse = (message: string, status = 400) =>
-  new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-
-// V0.4 自动启动：终态发消息时需要 bootArgs（apiKey + model + 可选 mcpServers）
-// 校验 helper 直接搬自原 start-chat 路由（已删）
-const isValidModel = (m: unknown): m is ModelSelection => {
-  if (!m || typeof m !== "object") return false;
-  const x = m as Partial<ModelSelection>;
-  return typeof x.id === "string" && x.id.length > 0;
-};
-
-const isValidMcpServers = (
-  v: unknown,
-): v is Record<string, McpServerConfig> => {
-  if (v == null) return true;
-  if (typeof v !== "object" || Array.isArray(v)) return false;
-  return Object.values(v).every(
-    (cfg) => cfg != null && typeof cfg === "object",
-  );
-};
-
 export const runtime = "nodejs";
-
-// "几十毫秒空窗"兜底：hasPending 第一次为 false 时、稍等再查一次
-//
-// V0.3.5 起保活机制改成 shell + curl long-poll、entry 一旦 registerPendingEntry
-// 就一直在 pendingMap 里（直到 finalizeEntry resolve）。理论上没有 V0.3.5 之前
-// 的「50s timer fire → resolve → 重新调 wait_for_user」中间空窗。
-//
-// 仍保留 retry 作防御：极少数 race 场景下（用户连答两次 / agent 主动顶替旧 wait
-// → grace cleanup 期 + 新 wait_for_user 还没到达）hasPending 可能瞬时 false。
-// 200ms 给的余量足够、命中代价仅 200ms 延迟、保留更稳。
-const KEEPALIVE_RACE_RETRY_MS = 200;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 export const POST = async (req: Request, { params }: Ctx) => {
   const { id } = await params;
@@ -144,38 +111,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const text = body.text?.trim() ?? "";
   // 校验 images 入参格式（不校验内容、内容校验放 saveImageAttachments 里抛错）
-  const rawImages = Array.isArray(body.images) ? body.images : [];
-  if (rawImages.length > MAX_IMAGES_PER_REPLY) {
-    return errorResponse(
-      `单次最多附 ${MAX_IMAGES_PER_REPLY} 张图（你传了 ${rawImages.length}）`,
-    );
-  }
-  const images: ImageAttachmentInput[] = [];
-  let totalBytes = 0;
-  for (const img of rawImages) {
-    if (typeof img?.data !== "string" || !img.data.trim()) {
-      return errorResponse("images[].data 必须是非空 base64 字符串");
-    }
-    if (typeof img.mimeType !== "string" || !img.mimeType.trim()) {
-      return errorResponse("images[].mimeType 必填");
-    }
-    // 粗略估算 base64 → bytes（实际字节数 ≈ b64长度 * 3 / 4 - padding）
-    // 校验在这里只为快速过滤超大、最终 size check 在 saveImageAttachments 里走真字节
-    totalBytes += Math.floor((img.data.length * 3) / 4);
-    images.push({
-      data: img.data,
-      mimeType: img.mimeType,
-      filename:
-        typeof img.filename === "string" && img.filename.trim()
-          ? img.filename.trim()
-          : undefined,
-    });
-  }
-  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
-    return errorResponse(
-      `本次上传图片总大小约 ${(totalBytes / 1024 / 1024).toFixed(2)} MB、超过上限 ${MAX_TOTAL_UPLOAD_BYTES / 1024 / 1024} MB`,
-    );
-  }
+  // helper 内部检查：数量上限、字段非空、累计字节上限、形状转 ImageAttachmentInput
+  const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES_PER_REPLY);
+  if (!imagesResult.ok) return imagesResult.errorResponse;
+  const images = imagesResult.images;
 
   // 校验 attachments：必须绝对路径、必须存在
   // 不校验类型（文件 / 目录都能附）、不读内容、只 stat 一下

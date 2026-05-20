@@ -30,19 +30,22 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 - **代码改完跑 `pnpm typecheck`**——用户对低级错误零容忍
 - **开发期不写向后兼容代码**：改 schema / 字段名 / EventKind 枚举 / 接口签名时、直接删旧的、不写双兼容
 
-## V0.3.4 phase 模型（当前）
+## V0.5 phase 模型（当前）
 
 ```
-plan → build
+plan → build → review
 ```
 
 - **plan**：读 contextDocs（飞书 story + 用户补充文档）+ 扫本地仓库 + 出技术方案 → `artifacts/01-plan.md`
 - **build**：SDK Agent 按 plan 写代码 + 跑 hooks → `artifacts/02-build.md`
+- **review**：跑 git diff、对照 plan / 飞书需求、出 4 类差异报告 → `artifacts/03-review.md`
 
 历史演进：
 - V0.2 是 `context → plan → build → ship`（4 phase）
 - V0.3.3 砍了 ship（注意力管理、先把 plan / build 做扎实、不是因为效果不稳）
 - V0.3.4 把 context 合进 plan（实操中分离价值未兑现、用户审 context 跟审 plan 判断点重合、合并后 plan 一气呵成 1 次 ack）
+- V0.5 重新加 review phase（形态变成「review、不是 ship」、专注代码层校验、不动 PR / 飞书）
+- V0.5.5（2026-05-19）：plan / build / review 三 phase 骨架 frontmatter 全删、artifact 直接从 `# 方案：xxx` 起头
 
 V1 legacy 模式（chat-only）的代码保留、新功能不再往那边加。
 

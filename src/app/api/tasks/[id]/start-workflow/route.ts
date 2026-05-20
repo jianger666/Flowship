@@ -15,8 +15,14 @@
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
-import { getTask } from "@/lib/server/task-fs";
-import { isPlanRunning, runPlanWorkflow } from "@/lib/server/plan-runner";
+import { getTask, patchPhase } from "@/lib/server/task-fs";
+import {
+  cancelPlan,
+  isPlanRunning,
+  markPlanForFork,
+  runPlanWorkflow,
+  waitForPlanToStop,
+} from "@/lib/server/plan-runner";
 import type { Task } from "@/lib/types";
 
 interface Ctx {
@@ -88,14 +94,39 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // 已在跑 → 幂等
+  // 已在跑 + 不是 awaiting_user 状态 → 幂等返回
+  // V0.5.5：awaiting_user 状态（agent 等 ack 中）虽然 isPlanRunning=true、但用户点重启的意图明确——
+  //   想 cancel 旧 agent + 起新 agent 从 plan 重头跑（测试新 prompt / 切模型场景）、不能简单返 already=true
+  //   走 fork 路径：markPlanForFork + cancelPlan + waitForPlanToStop、然后从 firstPhase 起新 run
   if (isPlanRunning(task.id)) {
-    return okResponse({ task, already: true });
+    if (task.status !== "awaiting_user") {
+      return okResponse({ task, already: true });
+    }
+    console.log(
+      `[start-workflow] task=${task.id} awaiting_user + isPlanRunning、走 cancel-and-restart`,
+    );
+    markPlanForFork(task.id);
+    cancelPlan(task.id);
+    const stopped = await waitForPlanToStop(task.id, 10000);
+    if (!stopped) {
+      console.warn(
+        `[start-workflow] task=${task.id} waitForPlanToStop timeout 10s、旧 agent 没干净退出`,
+      );
+      return errorResponse(
+        "旧 agent 收尾超时、未能重启、请稍后重试",
+        503,
+      );
+    }
   }
 
-  // fire-and-forget：后台跑、事件 publish 给 SSE 订阅者
+  // V0.5.5：先同步把 task.status 切到 running、再 fire-and-forget——
+  // 之前任务终态（failed/completed）后点重启、route 立刻返 still-failed 的 task、
+  // 前端 SSE 重连 watch-chat 时服务端看到 failed 直接 bootstrap+close、
+  // 用户体感「页面没反应、必须刷新」(plan-runner 自己 patchPhase 在异步流程里太晚)
+  const running = (await patchPhase(task.id, { taskStatus: "running" })) ?? task;
+
   void runPlanWorkflow({
-    task,
+    task: running,
     apiKey,
     model,
     userMcpServers,
@@ -106,5 +137,5 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   });
 
-  return okResponse({ task, already: false });
+  return okResponse({ task: running, already: false });
 };

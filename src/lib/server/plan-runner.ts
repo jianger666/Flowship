@@ -280,7 +280,7 @@ const buildSuperPrompt = async (
     "服务端 chunked stream 输出可能行：",
     "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳行、绝对忽略**。它的唯一意义是「连接还活着、用户还没操作」、看到再多 KEEPALIVE 都是正常的、shell **没卡**、绝对不要 summarize / 调 read 查 terminal / 重启 shell / 重新调 wait_for_user",
     "  - `[PHASE_ACK approve]` (workflow 模式)：用户点了「通过」、shell 命令 exit 0、继续下一 phase",
-    "  - `[PHASE_ACK revise]` + 后续 feedback：用户点了「再聊聊」（按钮文案、协议名沿用）——可能想改、也可能只想问、先 ask_user 复述意图、按 Path A/B/C 处理后再调一次 wait_for_user",
+    "  - `[PHASE_ACK revise]` + 后续 feedback：用户点了「再聊聊」（按钮文案、协议名沿用）——按 §3 revise 解读分级（A 明确改 / B 明确问 / C 含混 / D 带图）、清晰直接干、含混才 ask_user 复述、处理完再调一次 wait_for_user",
     "  - `[USER_REPLY]` + 文本：chat 模式用户回复 / ask_user 答案、按内容推进",
     "  - `[CANCELLED]`：任务被取消、收尾结束 run",
     "  - `[STALE]` / `[INVALID_TOKEN]`：忽略本次返回",
@@ -352,54 +352,56 @@ const buildSuperPrompt = async (
     "     ",
     "     **执行步骤（3 步、按顺序）**：",
     "     ",
-    "     1. **永远先调 ask_user**（强制、无分支、无例外、带图时先 read 再 ask_user）：",
+    "     1. **先按 feedback 清晰度分 4 类**（清晰直接干、模糊才 ask_user 复述）：",
     "        ",
-    "        ask_user 的 `question` **根据 feedback 内容动态写**、并且**主动给「想问」「想改」两类选项**让用户自己选：",
+    "        **A. 明确改动指令**（含具体位置 + 动词 + 改前/后内容）",
+    "          例：「§5 把 useState 改成 useReducer」「Task 3 删掉单测那条」「§3 加一行：promoteTask 走 axios 拦截」",
+    "          → **跳过 ask_user 复述、直接走 3a 改 artifact**（用户写得清清楚楚、再问就是冒犯）",
     "        ",
-    "        - **feedback 像「想改」的指令**（如「字段 X 改只读」「删掉 §6.3」「补一句业务规则 Y」）：",
-    "          question：「我理解你想改：<把 feedback 翻译成具体改动、含位置 + 改前 + 改后>、对吗？还是你只是想问问、不一定要改？」",
-    "        - **feedback 像「想问」的问题**（如「这里为什么这么写？」「X 跟 Y 有冲突吧？」「这块怎么处理？」）：",
-    "          question：「你是想问『<原文>』我来答一下、还是发现哪里要改？我先答完再看要不要动 artifact。」",
-    "        - **feedback 不清楚 / 含混**（如「test」「111」「这块不对」「再加点细节」）：",
-    "          question：「你的留言『<原文>』我没看明白——你是想让我改本 phase 的 artifact、还是想问问 / 让我解释一下？或者你重新说一下？」",
+    "        **B. 明确询问**（纯疑问、没改动指令）",
+    "          例：「这里为什么这么写？」「§5.2 跟后端冲突吧？」「能解释一下 X 怎么走拦截？」",
+    "          → **跳过 ask_user 复述、直接走 3b 答疑**",
     "        ",
-    "        ask_user options 模板（**两类意图都给、让用户选**）：",
-    "          * `id=改`、`label=「我想改：<复述的改动>」`（feedback 像改动指令时给）",
-    "          * `id=问`、`label=「我想问、AI 答完就行、不用改」`（任何场景都给）",
-    "          * `id=改+问`、`label=「先答疑、再决定要不要改」`（含混 / 复杂场景给）",
+    "        **C. 含混 / 不确定 / 过短**（看不懂用户想干嘛）",
+    "          例：「这块不对」「这里怎么处理」「test」「111」「再加点细节」「你看着办」",
+    "          → 走 1.1 调 ask_user 复述意图",
+    "        ",
+    "        **D. 带图**（feedback 含 [ATTACHED_IMAGES]）",
+    "          → **先用 `read` 工具逐一读图**（SDK 内置 read 会转 vision、能直接看到图像）、把图像内容跟 feedback 文本合起来再分 A/B/C",
+    "        ",
+    "        **护栏**：判断不准就当 C、宁多问一次也不要把模糊的判成 A 闷头改。",
+    "     ",
+    "     1.1 **C 路径专用：调 ask_user 复述意图**",
+    "        ask_user 的 question 直接对用户说话、问意图：",
+    "        - 「你的留言『<feedback 原文>』我没看明白——是想让我改本 phase 的 artifact、还是想问问 / 解释一下？」",
+    "        ",
+    "        ask_user options 模板：",
+    "          * `id=改`、`label=「我想改：<你猜的具体改动>」`",
+    "          * `id=问`、`label=「我想问、AI 答完就行、不用改」`",
+    "          * `id=改+问`、`label=「先答疑、再决定要不要改」`",
     "          * `id=重新说`、`label=「我重新说」`",
     "        `allow_text: true` 永远开（默认值）。",
     "        ",
-    "        ⚠️ **重要**：这次 ask_user 调用**不计入「一次 phase 内最多 1 次 ask_user」限额**——那条限额仅针对写 artifact 初稿阶段。**每次** revise feedback 来都该调一次 ask_user 复述、即使本 phase 已经用过 ask_user 写过初稿、也必须再调。",
-    "        ",
-    "        ⚠️ **说人话**：ask_user 的 question 必须直接对用户说人话、**禁止出现「[PHASE_ACK revise]」「反馈过短」「无具体改进意图」「请告知具体说明」这类协议名 / 报错措辞 / 公文体**——这是给真人看的、不是给监控系统看的。",
+    "        ⚠️ **说人话**：question **禁止出现「[PHASE_ACK revise]」「反馈过短」「无具体改进意图」这类协议名 / 公文体**——给真人看的、不是给监控系统看的。",
     "     ",
-    "     2. **拿 ask_user 答案后判断意图**（[USER_REPLY] 解析、**这是关键判断点**）：",
-    "        ",
-    "        **Path A：用户要改 artifact**（选了 `改` / 自由文本明确说要改 / 给了具体改法）",
-    "          → 走步骤 3a：动 artifact",
-    "        ",
-    "        **Path B：用户只是问问 / 答疑就够**（选了 `问` / 自由文本是疑问句 / 用户说「不用改、只是问问」）",
-    "          → 走步骤 3b：仅答疑、不动 artifact",
-    "        ",
-    "        **Path C：先答疑再决定**（选了 `改+问` / 自由文本要先看你怎么解释）",
-    "          → 先按 Path B 答疑、答完后**再调一次 ask_user** 问「这样解释下来、还需要改 artifact 吗？」、根据回答走 A 或 B",
-    "        ",
-    "        **判断不确定时**：再调一次 ask_user 复述自己理解的「意图」、不要瞎猜动手。",
+    "     2. **C 路径拿 ask_user 答案后、再过一遍分级**：",
+    "        - 用户答 `改` 或自由文本含具体改动 → A → 走 3a",
+    "        - 用户答 `问` 或自由文本是纯疑问 → B → 走 3b",
+    "        - 用户答 `改+问` → 先 3b 答疑、答完再调一次 ask_user 问「这样解释下来、还需要改吗？」、再分级",
+    "        - 用户答仍模糊 / 「你定 / 看代码再说 / 不知道」 → **read / grep 相关代码形成判断 → 再调一次 ask_user 给具体选项**（不要瞎默认）",
     "     ",
-    "     3a. **改 artifact**（Path A 专用）：按确认过的改法改 artifact（用 `edit` 工具改已有内容、不是 `write` 整文件覆盖）、改完**立刻再调一次 wait_for_user**（同 phase 同 artifact）",
+    "     3a. **改 artifact**（A 路径）：用 `edit` 工具改已有内容（不是 `write` 整文件覆盖）、改完**立刻再调一次 wait_for_user**（同 phase 同 artifact）",
     "     ",
-    "     3b. **仅答疑、不动 artifact**（Path B / Path C 答疑部分专用、**V0.5.2 新增**）：",
-    "        - **绝对不调 `edit` / `write` 动 artifact 文件**——用户没让你改、你改了 = 越权",
-    "        - **emit 一条 assistant_message** 答疑：直接对用户说话、内容是问题的答案 / 解释 / 你的判断 + 理由。**禁止公文体 / 协议泄露**、口吻像跟同事聊天",
-    "        - 如果回答涉及代码 / artifact 引用、可以**只读地**用 `read` / `grep` / `glob` 查仓库或自己 phase 的 artifact——但**严禁 `edit` / `write` / `delete`**",
-    "        - 答完**立刻再调一次 wait_for_user**（同 phase 同 artifact、状态不变）、让用户接着 ack 或继续聊",
+    "     3b. **仅答疑、不动 artifact**（B / C-答疑部分）：",
+    "        - **绝对不调 `edit` / `write` 动 artifact**——用户没让改你改了 = 越权",
+    "        - **emit 一条 assistant_message** 答疑：直接对用户说话、内容是问题的答案 + 你的判断 + 理由。**禁止公文体 / 协议泄露**、像跟同事聊天",
+    "        - 答疑涉及代码 / artifact 时可**只读地**用 `read` / `grep` / `glob` 查、**严禁 `edit` / `write` / `delete`**",
+    "        - 答完**立刻再调一次 wait_for_user**（同 phase 同 artifact、状态不变）",
     "     ",
     "     **绝对禁止**：",
-    "     - 拿到 [PHASE_ACK revise] 后**第一个 tool_use 直接是 `edit` / `write` 改 artifact**——这是模型最容易踩的坑、用户会被「闷头改」气死",
-    "     - 拿到 [PHASE_ACK revise] 后**直接 emit assistant_message + 再 wait_for_user**（V0.5.1 上一版本的弱设计、已废弃）——任何 revise 都必须先经过 ask_user 弹窗、不能用 emit 跳过弹窗",
-    "     - 在 ask_user 拿到「改」意图之前就开始改——用户没拍板让你改、你改了就是越权",
-    "     - **走 Path B 答疑时偷偷动 artifact**——用户问问题不等于让你改、严禁趁机「优化」",
+    "     - 把 C 判成 A 闷头改 artifact——看不准就走 C 路径调 ask_user",
+    "     - 在 ask_user 拿到「改」意图之前动 artifact——用户没拍板就是越权",
+    "     - 走 B 路径答疑时偷偷动 artifact——用户问问题不等于让你改、严禁趁机「优化」",
     "   - **`[USER_REPLY]` + 文本**：chat 模式用户消息 / ask_user 答案、按内容推进",
     "   - **`[CANCELLED]`**：任务被取消、收尾结束 run",
     "   - **`[STALE]` / `[INVALID_TOKEN]`**：忽略本次返回、自然结束 run（这种情况罕见、只在 race 时出现）",
@@ -422,7 +424,7 @@ const buildSuperPrompt = async (
     "",
     "**核心原则**：用户看不到 wait_for_user / shell / curl 这些协议细节、协议层全在 fe-ai-flow 内部、对用户透明就像 TCP socket recv()——你不会在聊天里说「我现在调用 recv 等你输入」、对 wait_for_user / shell / curl 也一样。你只需要：phase 写完 artifact → 直接调 wait_for_user → 拿到引导 → 直接调 shell + curl → 拿到 [PHASE_ACK] 继续。中间不解释、不预告、不汇报。",
     "",
-    "6. **revise 闭环**（V0.5.2 起「想改 / 想问」二分）：shell 返回 [PHASE_ACK revise] + feedback → **永远先 ask_user 复述确认意图**（见上 §3 revise 解读、3 步流程）→ 用户拍板 Path A（改）/ Path B（仅答疑）/ Path C（先答再决定）→ A 走 edit + 再 wait_for_user、B/C 走 emit answer + 再 wait_for_user → 再调一次 shell + curl",
+    "6. **revise 闭环**（V0.5.5 起按 feedback 清晰度分流、清晰直接干、模糊才 ask_user）：shell 返回 [PHASE_ACK revise] + feedback → 按 §3 revise 解读分 A（明确改）/ B（明确问）/ C（含混）/ D（带图）→ A 直接 edit、B 直接 emit answer、C 调 ask_user 复述再分级、D 先 read 图再分 A/B/C → 处理完都**再调一次 wait_for_user**（同 phase 同 artifact）→ 接着调 shell + curl 拿下一轮 ack",
     "",
     "7. **「全部 phase 完成」的唯一定义**：整段 workflow 跑完最后一个 phase 的 wait_for_user、shell curl 拿到 [PHASE_ACK approve]、之后才是「自然结束 run」。",
     `   - 你**没拿到**最后一个 phase 的 approve 之前、绝对不许结束 run`,
@@ -1092,8 +1094,13 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       const extrasDump = Object.keys(runExtras).length > 0
         ? `\n--- run object extras ---\n${JSON.stringify(runExtras, null, 2).slice(0, 800)}`
         : "";
+      // 把 stream 里最近一条 SDK status=ERROR/EXPIRED 的 message 拼上（如果有的话）——
+      // 这是排查 SDK 端致命错误最关键的诊断信息、不能丢
+      const sdkErr = assistantCtx.sdkErrorMessage
+        ? `\n--- SDK stream error message ---\n${assistantCtx.sdkErrorMessage}`
+        : "";
       throw new Error(
-        `agent run status=${result.status}\n--- SDK result dump ---\n${resultDump}${extrasDump}`,
+        `agent run status=${result.status}${sdkErr}\n--- SDK result dump ---\n${resultDump}${extrasDump}`,
       );
     }
 
@@ -1278,6 +1285,10 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
 interface AssistantBufferCtx {
   buffer: string;
   flush: () => Promise<void>;
+  // SDK 推过来的最近一条 status=ERROR/EXPIRED 的 message——
+  // RunResult 类型没 error message 字段、只有这条 stream 消息能拿到具体原因、
+  // 后续 throw 时把它拼到 Error 文案上方便诊断
+  sdkErrorMessage?: string;
 }
 
 const handlePlanSdkMessage = async (
@@ -1402,7 +1413,33 @@ const handlePlanSdkMessage = async (
       break;
     }
 
-    case "status":
+    case "status": {
+      // SDK 把服务端致命错误的具体描述放在 status 消息的 message 字段里、
+      // 而 RunResult 类型只有 status / model / durationMs、不带 message——
+      // 不在这里把 ERROR / EXPIRED 推出来、最后 throw 出去的报错就是空的、只能猜原因
+      //
+      // V0.5.5 增强：先 console.log 一份 raw status 消息（运维 / 用户排查用）
+      // 实测 SDK 1.0.13 status=error 时偶尔不发 status 流消息、run.wait() 拿到 error 就直接退、
+      // 这条 log 能让用户在 dev server 终端看到「SDK 到底有没有给详细错误描述」
+      console.log(
+        `[plan-runner] SDK status message: status=${msg.status} message=${
+          (msg as { message?: string }).message ?? "(none)"
+        }`,
+      );
+      if (
+        (msg.status === "ERROR" || msg.status === "EXPIRED") &&
+        msg.message
+      ) {
+        assistantCtx.sdkErrorMessage = msg.message;
+        await writeEventAndPublish(taskId, {
+          kind: "error",
+          text: `SDK ${msg.status}：${msg.message}`,
+          meta: { sdkStatus: msg.status, sdkMessage: msg.message },
+        });
+      }
+      break;
+    }
+
     case "system":
     case "user":
     case "request":

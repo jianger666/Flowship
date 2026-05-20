@@ -30,7 +30,7 @@ import fs from "node:fs/promises";
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
-import { getPhaseArtifactPath, getTask } from "@/lib/server/task-fs";
+import { getPhaseArtifactPath, getTask, patchPhase } from "@/lib/server/task-fs";
 import { isPlanRunning, runPlanWorkflow } from "@/lib/server/plan-runner";
 import type { PhaseId, Task } from "@/lib/types";
 import { WORKFLOWS } from "@/lib/types";
@@ -182,9 +182,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
     `[resume-waiting] task=${task.id} phase=${currentPhase} artifactExists=${artifactExists} path=${artifactPath}`,
   );
 
-  // fire-and-forget：runPlanWorkflow 在 isResume=true 时跳过 phase_start、走 Agent.resume + send
+  // V0.5.5：先同步把 task.status 切回 running、再 fire-and-forget runPlanWorkflow——
+  // 不然客户端拿到的还是 failed、马上发起的 watch-chat 请求会被服务端 bootstrap 完直接 close、
+  // 用户体感就是「点了继续监听但页面没动、必须刷新才能看到」(plan-runner 内部第二步 patchPhase 太晚)
+  const running = (await patchPhase(task.id, { taskStatus: "running" })) ?? task;
+
   void runPlanWorkflow({
-    task,
+    task: running,
     apiKey,
     model,
     userMcpServers,
@@ -199,5 +203,5 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   });
 
-  return okResponse({ task, already: false });
+  return okResponse({ task: running, already: false });
 };

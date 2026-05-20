@@ -40,7 +40,6 @@ import {
   getTask,
   patchPhase,
   saveImageAttachments,
-  type ImageAttachmentInput,
 } from "@/lib/server/task-fs";
 import {
   hasPending,
@@ -54,6 +53,14 @@ import {
   waitForPlanToStop,
 } from "@/lib/server/plan-runner";
 import { publishChatStreamEvent } from "@/lib/server/chat-runner";
+import {
+  errorResponse,
+  isValidMcpServers,
+  isValidModel,
+  KEEPALIVE_RACE_RETRY_MS,
+  parseAndValidateImages,
+  sleep,
+} from "@/lib/server/route-helpers";
 import { getNextPhase, WORKFLOWS, type PhaseId } from "@/lib/types";
 
 interface Ctx {
@@ -82,40 +89,10 @@ interface PostBody {
   };
 }
 
-// 整批上传 size 上限（跟 chat-reply 同款、防一次发 N 张超大图把服务端 / agent context 撑爆）
-const MAX_TOTAL_UPLOAD_BYTES = 30 * 1024 * 1024;
-// 单次最多附图数（跟 chat-reply 同款）
+// 单次最多附图数（跟 chat-reply 同款 6 张、保留独立常量以便单独调）
 const MAX_IMAGES_PER_REVISE = 6;
 
-const isValidModel = (m: unknown): m is ModelSelection => {
-  if (!m || typeof m !== "object") return false;
-  const x = m as Partial<ModelSelection>;
-  return typeof x.id === "string" && x.id.length > 0;
-};
-
-const isValidMcpServers = (
-  v: unknown,
-): v is Record<string, McpServerConfig> | undefined => {
-  if (v == null) return true;
-  if (typeof v !== "object" || Array.isArray(v)) return false;
-  return Object.values(v).every(
-    (cfg) => cfg != null && typeof cfg === "object",
-  );
-};
-
-const errorResponse = (message: string, status = 400) =>
-  new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-
 export const runtime = "nodejs";
-
-// hasPending 瞬时 false 时 200ms 后再查一次（细节见 chat-reply/route.ts 同名常量注释）
-// V0.3.5 shell + curl long-poll 下 race 窗口已大幅缩小、仍保留作防御
-const KEEPALIVE_RACE_RETRY_MS = 200;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 export const POST = async (req: Request, { params }: Ctx) => {
   const { id } = await params;
@@ -134,45 +111,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const feedback = (body.feedback ?? "").trim();
   // V0.5.4：revise 可只发图片不带文本（如「就改成这样」+ 截图）
   // 但 approve 不接受 images（语义上没必要）
-  const rawImages =
-    action === "revise" && Array.isArray(body.images) ? body.images : [];
-  if (rawImages.length > MAX_IMAGES_PER_REVISE) {
-    return errorResponse(
-      `单次最多附 ${MAX_IMAGES_PER_REVISE} 张图（你传了 ${rawImages.length}）`,
-    );
-  }
-  if (action === "revise" && feedback.length === 0 && rawImages.length === 0) {
-    return errorResponse("revise 必须带 feedback 文本或图片");
-  }
-  if (action === "approve" && rawImages.length > 0) {
+  const hasImages = Array.isArray(body.images) && body.images.length > 0;
+  if (action === "approve" && hasImages) {
     return errorResponse("approve 不接受 images（如要带图请改用 revise）");
   }
 
-  // V0.5.4：校验 images 入参格式（不校验内容、内容校验放 saveImageAttachments 里抛错）
-  const images: ImageAttachmentInput[] = [];
-  let totalBytes = 0;
-  for (const img of rawImages) {
-    if (typeof img?.data !== "string" || !img.data.trim()) {
-      return errorResponse("images[].data 必须是非空 base64 字符串");
-    }
-    if (typeof img.mimeType !== "string" || !img.mimeType.trim()) {
-      return errorResponse("images[].mimeType 必填");
-    }
-    // 粗略估算 base64 → bytes（实际字节数 ≈ b64长度 * 3 / 4 - padding）
-    totalBytes += Math.floor((img.data.length * 3) / 4);
-    images.push({
-      data: img.data,
-      mimeType: img.mimeType,
-      filename:
-        typeof img.filename === "string" && img.filename.trim()
-          ? img.filename.trim()
-          : undefined,
-    });
-  }
-  if (totalBytes > MAX_TOTAL_UPLOAD_BYTES) {
-    return errorResponse(
-      `本次上传图片总大小约 ${(totalBytes / 1024 / 1024).toFixed(2)} MB、超过上限 ${MAX_TOTAL_UPLOAD_BYTES / 1024 / 1024} MB`,
-    );
+  // V0.5.4：校验 images 入参格式、内容校验放 saveImageAttachments 里抛错
+  // helper 内部检查：数量上限、字段非空、累计字节上限、形状转 ImageAttachmentInput
+  // approve 时传空数组、let parseAndValidateImages 处理（空数组永远 ok）
+  const imagesResult = parseAndValidateImages(
+    action === "revise" ? body.images : [],
+    MAX_IMAGES_PER_REVISE,
+  );
+  if (!imagesResult.ok) return imagesResult.errorResponse;
+  const images = imagesResult.images;
+
+  if (action === "revise" && feedback.length === 0 && images.length === 0) {
+    return errorResponse("revise 必须带 feedback 文本或图片");
   }
 
   // V0.5：approve 时检测 fork 意图（forkAgent=true 或 nextModel 提供时都视为 fork）

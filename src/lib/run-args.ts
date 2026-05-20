@@ -43,16 +43,12 @@ export const prepareRunArgs = (
   task: Task,
   options: PrepareRunArgsOptions = {},
 ): RunArgs | null => {
-  const { mcpErrorPrefix = "修好再启动" } = options;
-  const settings = getSettings();
-
-  if (!settings.apiKey?.trim()) {
-    toast.error("缺少 API Key、请先在设置页填好");
-    return null;
-  }
+  const boot = prepareBootArgs(task, options);
+  if (!boot) return null;
 
   // V0.5.1：优先用任务级 model（new-task-dialog 创建时表单挑的）、回退到 settings.defaultModel
   // 老数据没 task.model 字段、走 settings.defaultModel 兜底
+  const settings = getSettings();
   const taskModel = task.model;
   const fallbackModel = settings.defaultModel;
   const model: ModelSelection | null =
@@ -64,6 +60,32 @@ export const prepareRunArgs = (
 
   if (!model) {
     toast.error("缺少模型、请在任务表单或设置页选好");
+    return null;
+  }
+
+  return { ...boot, model };
+};
+
+/**
+ * 准备「只要 apiKey + mcpServers」的启动参数（不校验 model）
+ *
+ * 用在 fork 路径：用户在 ApprovePhaseDialog 里挑了 model、page.tsx 调时不需要再校验
+ * 任务级 / settings 级 model、只要从 settings 读出 apiKey + 解析 mcpServers 即可。
+ *
+ * 跟 prepareRunArgs 的关系：prepareRunArgs 内部就调它再补 model 校验；
+ * 调用方需要 model 时用 prepareRunArgs、不需要 model 时用 prepareBootArgs。
+ *
+ * 失败时 toast + 返 null（语义跟 prepareRunArgs 一致）。
+ */
+export const prepareBootArgs = (
+  task: Task,
+  options: PrepareRunArgsOptions = {},
+): Omit<RunArgs, "model"> | null => {
+  const { mcpErrorPrefix = "修好再启动" } = options;
+  const settings = getSettings();
+
+  if (!settings.apiKey?.trim()) {
+    toast.error("缺少 API Key、请先在设置页填好");
     return null;
   }
 
@@ -79,7 +101,6 @@ export const prepareRunArgs = (
 
   return {
     apiKey: settings.apiKey,
-    model,
     mcpServers,
   };
 };

@@ -101,7 +101,7 @@ alwaysApply: true
 - **服务端状态** → `@tanstack/react-query`、别手动 `useState(data) + useEffect(fetch) + useState(loading) + useState(error)` 那套 5-state 笨办法（项目目前还在裸 fetch、新功能优先考虑引入）。
 - **不可变更新** → `immer` / `use-immer`、嵌套对象的 `setState(prev => ({...prev, foo: {...prev.foo, bar: x}}))` 链式展开换成 `draft.foo.bar = x`。
 - **拖拽 / 手势** → `@use-gesture/react` + `framer-motion`、别手撸事件处理。
-- **日期 / 时间** → 已经在用的 `dayjs` 优先复用、别 `new Date()` + 手拼。
+- **日期 / 时间** → 简单格式化（「N 分钟前」/「MM-DD HH:mm」这种）直接 `new Date()` + `padStart` 拼即可、参考 `src/lib/task-display.ts` 的 `formatRelative` / `buildDefaultChatTitle`。如果出现复杂时区 / 跨地区 / 多 locale 需求再按需引 `dayjs` / `date-fns`、目前 package.json 里没装、不要凭空 import。
 - **写之前先扫一眼 `package.json`**——已经有的库直接用、别绕开。
 
 ### 抽象门槛

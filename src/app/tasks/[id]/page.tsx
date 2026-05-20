@@ -49,12 +49,12 @@ import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Separator } from "@/components/ui/separator";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import { useDialog } from "@/hooks/use-dialog";
+
 import { getSettings } from "@/lib/local-store";
-import { prepareRunArgs } from "@/lib/run-args";
+import { prepareBootArgs, prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
-  parseMcpServers,
-  filterMcpServersByTask,
   resumeWaiting,
   startWorkflow,
   submitPhaseAck,
@@ -66,6 +66,7 @@ import { WORKFLOWS, type PhaseId, type Task, type TaskEvent } from "@/lib/types"
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
   const id = params.id;
+  const { confirm } = useDialog();
   // 任务对象（含 events / phases / status 等）
   const [task, setTask] = useState<Task | null>(null);
   // loaded：首次 fetchTask 完成；为 false 时显示「加载中」、避免闪 not-found
@@ -85,6 +86,10 @@ const TaskDetailPage = () => {
   const [streamingText, setStreamingText] = useState("");
   // V0.5：phase ack 高级选项 dialog 开关（点「通过 PHASE」按钮打开、内部配模型/换 agent）
   const [approveDialogOpen, setApproveDialogOpen] = useState(false);
+  // SSE 重连 epoch：上次任务终态后服务端会关流、客户端 useTaskWatch 不会自动重连——
+  // 任何让 agent 重新跑起来的成功路径（继续监听 / 重启 workflow / fork）++ 一下、让 useTaskWatch 重连
+  // 不然得手动刷新页面才能看到 agent 新事件
+  const [watchEpoch, setWatchEpoch] = useState(0);
 
   // ---- 拉一次任务详情 ----
   const refresh = useCallback(async () => {
@@ -143,6 +148,7 @@ const TaskDetailPage = () => {
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
     },
     !!task && task.mode === "plan",
+    watchEpoch,
   );
 
   // chat 模式给 ChatView 用的 setter（避免 ChatView 内部 setState 跟父组件 fight）
@@ -194,12 +200,27 @@ const TaskDetailPage = () => {
   const isChatMode = task.mode === "chat";
 
   // ---- 启动 workflow run（plan 模式专用） ----
+  // V0.5.5：awaiting_user 状态下也允许重启（agent 还在等 ack、用户想换 agent 重跑测试用）
+  // 这种状态需要先 confirm + 服务端会 cancel 旧 agent 再启新 run、消耗 +1 配额
   const handleStart = async () => {
     const args = prepareRunArgs(task);
     if (!args) return;
     if (!task.feishuStoryUrl) {
       // 软警告：plan 模式没飞书 story 链接、agent Phase 1 没东西拉
       toast.warning("没填飞书 story 链接、Phase 1 上下文收集会跑空");
+    }
+
+    // awaiting_user 状态下点重启 = cancel 当前 agent + 从 plan 重头跑
+    // 容易误操作（用户可能想点「通过」）、先 confirm 告知后果
+    if (task.status === "awaiting_user") {
+      const ok = await confirm({
+        title: "重启 workflow？",
+        description: `当前 agent 正在等你 ack ${PHASE_LABEL[cur]}。重启会 cancel 旧 agent、起新 agent 从 plan 重头跑。\n\n消耗：+1 次 Agent.create 配额。已有 ${PHASE_LABEL[cur]} 产物会被覆盖。\n\n确定继续？`,
+        confirmLabel: "重启",
+        cancelLabel: "算了",
+        destructive: true,
+      });
+      if (!ok) return;
     }
 
     setStarting(true);
@@ -211,6 +232,9 @@ const TaskDetailPage = () => {
         args.mcpServers,
       );
       setTask(latest);
+      // 上次任务终态 watch-chat 服务端 bootstrap 完直接 close、客户端 SSE 已断、
+      // ++ 这下让 useTaskWatch 重连、否则新 agent 推的事件没人收
+      setWatchEpoch((n) => n + 1);
       if (already) {
         toast.info("workflow 已在跑、已为你接上事件流");
       } else {
@@ -243,10 +267,13 @@ const TaskDetailPage = () => {
         args.mcpServers,
       );
       setTask(latest);
+      // 上次任务终态 watch-chat 服务端 bootstrap 完直接 close、客户端 SSE 已断、
+      // ++ 这下让 useTaskWatch 重连、否则新 agent 推的事件没人收（旧版本会卡在「要刷新页面」）
+      setWatchEpoch((n) => n + 1);
       if (already) {
         toast.info("agent 已经在跑、无需重复续接");
       } else {
-        toast.success("已请求 agent 续接监听、刷新会看到 agent 正在重新等待你 ack");
+        toast.success("已请求 agent 续接监听、马上能看到新事件");
       }
     } catch (err) {
       toast.error(`续接失败：${(err as Error).message}`);
@@ -281,29 +308,24 @@ const TaskDetailPage = () => {
       await handleApprove();
       return;
     }
+    // 复用 prepareBootArgs：跟 prepareRunArgs 共享「读 settings → 校验 apiKey →
+    // parseMcpServers → filterMcpServersByTask」逻辑、唯一差别是不校验 model（dialog 里挑过了）
+    // 失败已 toast、直接 return
+    const boot = prepareBootArgs(task);
+    if (!boot) return;
+
     setAckSubmitting(true);
     try {
-      const settings = getSettings();
-      if (!settings.apiKey?.trim()) {
-        toast.error("缺少 API Key、请先在设置页填好");
-        return;
-      }
-      let mcpServers;
-      try {
-        mcpServers = parseMcpServers(settings.mcpServersJson);
-      } catch (err) {
-        toast.error(`MCP 配置有问题：${(err as Error).message}`);
-        return;
-      }
-      mcpServers = filterMcpServersByTask(mcpServers, task.disabledMcpServers);
-
       const updated = await submitPhaseAck(task.id, "approve", undefined, cur, {
         forkAgent: true,
         nextModel: opts.nextModel,
-        bootArgs: { apiKey: settings.apiKey, mcpServers },
+        bootArgs: { apiKey: boot.apiKey, mcpServers: boot.mcpServers },
       });
       setTask(updated);
       setApproveDialogOpen(false);
+      // fork 启了新 agent、旧 SSE 连接可能在旧 run 结束时已收 done 关流、
+      // ++ 让 useTaskWatch 重连接新 agent 的事件流
+      setWatchEpoch((n) => n + 1);
       toast.success(
         `${PHASE_LABEL[cur]} 已通过、新 agent 已启动接管下一 phase`,
       );
@@ -350,11 +372,14 @@ const TaskDetailPage = () => {
   };
 
   // ---- 按钮渲染条件（plan 模式） ----
-  // 启动按钮：草稿 / 失败 / 完成（再战）三种状态显示
+  // 启动按钮：draft / failed / completed / awaiting_user 四种状态显示
+  // V0.5.5：awaiting_user（agent 等 ack 中）也允许重启、方便测试新 prompt / 切模型重跑
+  // 点了会走 confirm 弹窗确认、避免误操作
   const canStart =
     task.status === "draft" ||
     task.status === "failed" ||
-    task.status === "completed";
+    task.status === "completed" ||
+    task.status === "awaiting_user";
 
   // V0.3.5：「继续监听」按钮显示条件
   //   - task.status === "failed"：agent 已退、需要叫醒（包括 wait-ack 断连场景）
@@ -375,6 +400,7 @@ const TaskDetailPage = () => {
     if (starting) return "启动中...";
     if (task.status === "failed") return "重启 workflow";
     if (task.status === "completed") return "再跑一次（计费再算）";
+    if (task.status === "awaiting_user") return "重启 workflow";
     return "启动 workflow";
   })();
 
@@ -426,11 +452,23 @@ const TaskDetailPage = () => {
               )}
               {canStart && (
                 <Button
-                  variant={canResume ? "secondary" : "default"}
+                  // awaiting_user 状态下、用 ghost 让位给「通过 PHASE」（主操作）
+                  // 其它状态下、保持 default / secondary（无主操作竞争）
+                  variant={
+                    task.status === "awaiting_user"
+                      ? "ghost"
+                      : canResume
+                        ? "secondary"
+                        : "default"
+                  }
                   size="sm"
                   onClick={handleStart}
                   disabled={starting}
-                  title="启动 workflow run、agent 自动跑 plan → build → review、phase 间会停下来等你 ack"
+                  title={
+                    task.status === "awaiting_user"
+                      ? "改了 prompt / 想测试新模型？cancel 当前 agent、起新 agent 从 plan 重头跑（+1 配额）"
+                      : "启动 workflow run、agent 自动跑 plan → build → review、phase 间会停下来等你 ack"
+                  }
                 >
                   {starting ? <Loader2 className="animate-spin" /> : <Zap />}
                   {startLabel}

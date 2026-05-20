@@ -40,6 +40,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import { useImageAttach } from "@/hooks/use-image-attach";
+import { buildCursorLink, pathBasename } from "@/lib/path-utils";
 import { PHASE_LABEL_SHORT } from "@/lib/task-display";
 import type { ChatReplyImage } from "@/lib/task-store";
 import type { EventKind, Task, TaskEvent } from "@/lib/types";
@@ -161,13 +162,6 @@ interface Props {
 // chat 单次最多附几条路径（防滥用 / context 爆）
 // 跟图片上限保持一致：6 个、但路径不算大、其实可以高点；先 10 平衡
 const MAX_ATTACHMENTS_PER_REPLY = 10;
-
-// 取绝对路径末尾段做显示用
-const pathBasename = (p: string): string => {
-  const cleaned = p.replace(/\/+$/, "");
-  const idx = cleaned.lastIndexOf("/");
-  return idx >= 0 ? cleaned.slice(idx + 1) || cleaned : cleaned;
-};
 
 // 用 React.memo 包裹：详情页输入交互（如「再聊聊」对话框输入）触发 page 重渲染时、
 // 只要 task / streamingText 引用没变就跳过本组件、避免几百条 events 的子树参与 reconcile
@@ -616,12 +610,6 @@ interface UserReplyAttachmentMeta {
   bytes?: number;
 }
 
-// 从 absPath / relPath 末尾取 filename（前端不能用 node:path、手切就行）
-const basename = (p: string): string => {
-  const idx = p.lastIndexOf("/");
-  return idx >= 0 ? p.slice(idx + 1) : p;
-};
-
 // 把 meta.images 解成强类型数组、形状不对的丢掉、不抛错
 // 现实场景：旧事件可能没 images / 字段缺失、不应该让 UI 炸
 const extractUserReplyImages = (
@@ -661,14 +649,6 @@ const extractUserReplyAttachments = (
     });
   }
   return out;
-};
-
-// 构造 cursor:// deep link（点击在 IDE 打开）
-// 复用思路：跟 artifact-panel.tsx 中 buildCursorLink 等价、为避免跨模块循环依赖、就地实现
-const buildCursorLinkForPath = (absPath: string): string => {
-  // 已经是 url 协议则 noop（理论不应出现）
-  if (/^[a-z]+:\/\//i.test(absPath)) return absPath;
-  return `cursor://file${absPath.split("/").map(encodeURIComponent).join("/")}`;
 };
 
 const EventRow = ({ ev, taskId }: { ev: TaskEvent; taskId: string }) => {
@@ -762,7 +742,7 @@ const EventRow = ({ ev, taskId }: { ev: TaskEvent; taskId: string }) => {
         {isUser && images.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
             {images.map((img) => {
-              const url = `/api/tasks/${taskId}/uploads/${basename(img.absPath)}`;
+              const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;
               const sizeKb = img.bytes > 0 ? (img.bytes / 1024).toFixed(1) : "?";
               return (
                 <a
@@ -771,7 +751,7 @@ const EventRow = ({ ev, taskId }: { ev: TaskEvent; taskId: string }) => {
                   target="_blank"
                   rel="noopener noreferrer"
                   className="group block size-16 overflow-hidden rounded-md border bg-card transition-opacity hover:opacity-80"
-                  title={`${img.filename ?? basename(img.absPath)} · ${sizeKb} KB`}
+                  title={`${img.filename ?? pathBasename(img.absPath)} · ${sizeKb} KB`}
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
@@ -798,10 +778,13 @@ const EventRow = ({ ev, taskId }: { ev: TaskEvent; taskId: string }) => {
                       ? `${(att.bytes / 1024).toFixed(1)} KB`
                       : `${(att.bytes / 1024 / 1024).toFixed(1)} MB`
                   : "";
+              // att.absPath 一定是绝对路径（FsPickerDialog 选出来的）、
+              // buildCursorLink 在绝对路径下永远不会返 null；?? "" 兜底纯为满足 href 类型
+              const href = buildCursorLink(att.absPath) ?? "";
               return (
                 <a
                   key={att.absPath}
-                  href={buildCursorLinkForPath(att.absPath)}
+                  href={href}
                   className="flex max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs no-underline hover:bg-muted"
                   title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 Cursor 中打开`}
                 >
@@ -811,7 +794,7 @@ const EventRow = ({ ev, taskId }: { ev: TaskEvent; taskId: string }) => {
                     <FileIcon className="size-3 shrink-0 text-muted-foreground" />
                   )}
                   <span className="min-w-0 truncate font-mono text-[11px] text-sky-600 dark:text-sky-400">
-                    {basename(att.absPath)}
+                    {pathBasename(att.absPath)}
                   </span>
                 </a>
               );

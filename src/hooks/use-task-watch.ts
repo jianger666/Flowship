@@ -19,12 +19,17 @@
  *
  * 设计取舍：
  * - callback 走 ref：避免父组件 re-render 触发 callback 引用变化、effect 反复 abort/重连
- * - 仅在 taskId 变化时重连（dep 故意只有 taskId）
+ * - 仅在 taskId / enabled / reconnectKey 变化时重连
  * - errorChannel 区分两类错误：
  *   - SSE 协议层错误（onError envelope）→ onErrorMessage
  *   - watchChatStream 自己 throw（HTTP 4xx / 网络断）→ onWatchException
  *   两类 toast 文案不同（前者「watch 出错」、后者「watch 异常」）、保留原代码语义
  * - enabled 开关：plan 任务详情页里 chat 模式不要订阅（ChatView 自己订）、传 false 跳过
+ * - reconnectKey：调用方需要主动让 SSE 重连的场景下使用——
+ *   服务端在 task 终态（failed/completed）时收到 watch-chat 请求会 bootstrap 完直接 close、
+ *   后续用户点「继续监听」/ 「重启 workflow」/ fork 等让 agent 重新跑起来的入口、
+ *   光 setTask(latest) 不会触发 effect 重跑、客户端 SSE 已断 → 收不到新事件 → 必须刷页面、
+ *   解法是调用方维护一个 epoch 计数、每次「让 agent 又活了」的成功路径 ++、effect dep 加它自然重连
  */
 
 import { useEffect, useRef } from "react";
@@ -48,8 +53,9 @@ export const useTaskWatch = (
   taskId: string | null | undefined,
   callbacks: UseTaskWatchCallbacks,
   enabled: boolean = true,
+  reconnectKey: number | string = 0,
 ): void => {
-  // 把所有 callback ref 化、effect 依赖只放 taskId / enabled
+  // 把所有 callback ref 化、effect 依赖只放 taskId / enabled / reconnectKey
   // 父组件随便 re-render 都不会重连
   const callbacksRef = useRef(callbacks);
   callbacksRef.current = callbacks;
@@ -93,5 +99,5 @@ export const useTaskWatch = (
       cancelled = true;
       ctrl.abort();
     };
-  }, [taskId, enabled]);
+  }, [taskId, enabled, reconnectKey]);
 };

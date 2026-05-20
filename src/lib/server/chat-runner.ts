@@ -678,10 +678,14 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     }
 
     if (result.status !== "finished") {
+      // SDK status=ERROR/EXPIRED 的 message 通过 stream 推、被 ctx 接住、这里拼上方便诊断
+      const sdkErr = assistantCtx.sdkErrorMessage
+        ? `\n--- SDK stream error message ---\n${assistantCtx.sdkErrorMessage}`
+        : "";
       throw new Error(
         `agent run status=${result.status}${
           result.result ? `: ${result.result.slice(0, 200)}` : ""
-        }`,
+        }${sdkErr}`,
       );
     }
 
@@ -734,6 +738,10 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 interface AssistantBufferCtx {
   buffer: string;
   flush: () => Promise<void>;
+  // SDK 推过来的最近一条 status=ERROR/EXPIRED 的 message——
+  // RunResult 类型没 error message 字段、只有这条 stream 消息能拿到具体原因、
+  // 后续 throw 时把它拼到 Error 文案上方便诊断
+  sdkErrorMessage?: string;
 }
 
 const handleChatSdkMessage = async (
@@ -830,13 +838,29 @@ const handleChatSdkMessage = async (
       break;
     }
 
-    case "status":
+    case "status": {
+      // SDK 把服务端致命错误的具体描述放在 status 消息的 message 字段里、
+      // 而 RunResult 类型只有 status / model / durationMs、不带 message——
+      // 不在这里把 ERROR / EXPIRED 推出来、最后 throw 出去的报错就是空的、只能猜原因
+      if (
+        (msg.status === "ERROR" || msg.status === "EXPIRED") &&
+        msg.message
+      ) {
+        assistantCtx.sdkErrorMessage = msg.message;
+        await writeEventAndPublish(taskId, {
+          kind: "error",
+          text: `SDK ${msg.status}：${msg.message}`,
+          meta: { sdkStatus: msg.status, sdkMessage: msg.message },
+        });
+      }
+      break;
+    }
+
     case "system":
     case "user":
     case "request":
     case "task":
     default:
-      // 不入 events、UI 不展示
       break;
   }
 };

@@ -691,9 +691,9 @@ a15db37 refactor(v0.5.3): 抽 getNextPhase helper + 删死代码 + 注释对齐 
 - **首页提速验证**：D-1 改完后用户没明确反馈「快了」、需要联测时确认
 - **ask_user「其他答案」框贴图**（用户提议、设计待办、详见 §9）
 
-#### 9. V0.5.5 设计预案：ask_user「其他答案」框支持贴图
+#### 9. V0.5.6 设计预案：ask_user「其他答案」框支持贴图
 
-> **状态**：用户提议 + 拍板「**每个 question 独立贴图**——做不到就宁可不做」、设计已对齐、未实施、等当前轮测稳再开 V0.5.5。
+> **状态**：用户提议 + 拍板「**每个 question 独立贴图**——做不到就宁可不做」、设计已对齐、**未实施**、延后到 V0.5.6（V0.5.5 号让给了下面真正落地的优化批次、本预案等 V0.5.5 测稳再开）。
 
 **为什么要做**：HITL 通道统一行为——`revise` / `chat-reply` 都允许贴图、唯独 `ask_user` 不允许、语义割裂。典型场景：AI 问「这个组件做 A/B/C/D 哪种」、用户想说「都不是、看截图我要 E」——贴图比文字直接得多。
 
@@ -712,7 +712,7 @@ React Hooks 规则禁止在 map / 循环里动态调用 hook、所以「每 ques
 // 现状（V0.5.4、单 key）：
 const { images, onPaste, removeImage, ... } = useImageAttach();
 
-// V0.5.5（多 key、向后兼容）：
+// V0.5.6（多 key、向后兼容）：
 const attach = useImageAttach();
 attach.getImages('q1');                    // 取 q1 的图
 attach.onPaste(e, 'q1');                   // q1 贴图
@@ -736,7 +736,181 @@ attach.removeImage(0, 'q1');               // 删 q1 第 0 张
 2. **AskUserDialog 布局变长**——「其他答案」展开 + 缩略图条 + 多 question 场景、`max-h-[80vh]` 内部 scroll body 要兜得住
 3. **agent prompt 复杂度**——「N 个 question 各带图集」对 agent 读图调度要求更高、要给清楚示例（建议给一段「3 个 question、Q1/Q3 带图」的标准处理流）
 
-**节奏拍板**：等 V0.5.4 + V0.5.3 测稳再开 V0.5.5、避免叠改难定位 bug。
+**节奏拍板**：等 V0.5.5 + V0.5.4 + V0.5.3 测稳再开 V0.5.6、避免叠改难定位 bug。
+
+---
+
+### V0.5.5：A+B 优化 + SDK 诊断 + SSE 重连 + plan 瘦身 + feedback 分级 + 重启加强（2026-05-19 下午 ~ 晚）
+
+> 用户下午联测时遇到一堆细节问题、顺手抽公共代码 / 加诊断口 / 简化 plan 模板 / 重写 revise 解读逻辑 / 让 awaiting_user 也能重启。一晚改完 18 + 文件、净减 100+ 行手工代码。
+
+#### 1. A 类（瘦身）+ B 类（诊断 / SSE）优化六件套
+
+**A1. `task-card.tsx` 删 `AlertDialog` 三件套、改 `useDialog().confirm`**
+
+`AlertDialog` + `useState(deleteOpen)` + 整段 JSX 一共 ~50 行手工状态机、换成 `const { confirm } = useDialog(); const ok = await confirm({...}); if (ok) ...` 一行。
+
+跟 `task-detail/page.tsx` 已经在用的 `confirm` API 对齐、project rule `learned-conventions.mdc` 也明示不用 `window.confirm` 走 `useDialog`。
+
+**A2. 修 `learned-conventions.mdc` 的 dayjs 描述**
+
+之前写「new Date 是 OK 的、不强求 dayjs」、但实际项目里 dayjs 已经引、对齐到「已经在用的 dayjs 优先复用」。
+
+**B3. 抽 `src/lib/server/route-helpers.ts`**
+
+`chat-reply/route.ts` 跟 `phase-ack/route.ts` 各有一份 `errorResponse / isValidModel / isValidMcpServers / parseAndValidateImages / KEEPALIVE_RACE_RETRY_MS / sleep`、复制粘贴。V0.5.5 ask-reply 加贴图时本来又要复制第四份——直接抽 helper、未来加新 route 复用。
+
+helper 内部加了 `MAX_TOTAL_UPLOAD_BYTES`（30MB 全局上限、跟 chat / phase-ack 同款）+ 详细 jsdoc。
+
+**B4. `run-args.ts` 加 `prepareBootArgs` + page.tsx 复用**
+
+`handleApproveWithFork` 之前内联了一段「读 settings → 校验 apiKey → parseMcpServers → filterMcpServersByTask」、跟 `prepareRunArgs` 几乎重复、唯一差是不校验 model（dialog 里挑过）。抽 `prepareBootArgs(task)` 共享前置逻辑、`prepareRunArgs` 内部也调它。
+
+**B5. 抽 `src/lib/path-utils.ts`**
+
+`pathBasename` / `looksLikePath` / `buildCursorLink` 之前散落在 `event-stream.tsx` / `repo-card.tsx` 等组件里、各自 inline 一份。挪到 `lib/path-utils.ts`、跟「`lib/task-display.ts` 是文案唯一源」一个套路。
+
+**B6. `artifact-panel.tsx` 瘦身**
+
+`artifact-panel.tsx` 之前自己实现了 `extractFenchedLanguage` + 一堆 path 兼容代码、复杂度顶到天花板。借 path-utils 抽出顺势精简、单文件 -45 行。
+
+#### 2. SDK status=ERROR/EXPIRED 诊断口（实测见效）
+
+**坑**：`run.wait()` 返 `RunResult { status: "error", durationMs: ... }`、但 RunResult 类型上**没有** `errorCode` / `errorMessage` 字段。throw 出去的报错是干瘪的 `agent run status=error`、完全无法诊断。
+
+但 SDK stream 里其实有一种叫 `SDKStatusMessage` 的消息、`type: "status"` + `status: "CREATING" | "RUNNING" | "FINISHED" | "ERROR" | "CANCELLED" | "EXPIRED"` + `message?: string`——服务端致命错误的具体描述放在这个流消息里、被我们 `handlePlanSdkMessage` 的 `case "status"` 默 ignore 掉了。
+
+**改造**（`plan-runner.ts` + `chat-runner.ts` 双 runner）：
+
+- `AssistantBufferCtx` 加 `sdkErrorMessage` 字段
+- `case "status"`：`status === "ERROR" || status === "EXPIRED"` && `message` 非空时、写一条 `error` 事件 + 把 message 存进 `assistantCtx.sdkErrorMessage`
+- 最后 throw 时把 `sdkErrorMessage` 拼进 message：`agent run status=error\n--- SDK stream error message ---\n<message>\n--- SDK result dump ---\n...`
+
+**V0.5.5 实测发现**（用户复现一次）：SDK 1.0.13 **偶尔**走到 `case "status"` 时 `message` 字段是空的——
+
+```
+[plan-runner] SDK status message: status=ERROR message=(none)
+```
+
+这是 SDK 自己的局限、不是我们漏了。加了**无条件 `console.log`** 把 raw status 消息打到 dev server 终端、下次复现能立刻看到「SDK 是真没传 message、还是被我们漏处理了」。
+
+#### 3. SSE 重连修复（用户体感「点继续监听后必须刷新页面」）
+
+**坑**：用户点「继续监听」/「重启 workflow」/「fork 新 agent」后、服务端确实重新跑了 agent、但客户端**不会看到新事件**、必须 F5 刷新。
+
+**根因**：
+
+1. 上一轮 agent 退出后客户端 SSE 已经 close
+2. `useTaskWatch` 的 `useEffect` deps 没变化（taskId 不变、callbacks 不变）、不会重连
+3. `start-workflow` / `resume-waiting` 路由 `void runPlanWorkflow(...)` 是 fire-and-forget、立刻返回 task 给客户端、`task.status` 还是 `failed`、客户端发起的新 `watch-chat` 请求服务端看到 failed 直接 bootstrap+close
+
+**修法**（三处协同）：
+
+- `use-task-watch.ts` 加 `reconnectKey: number | string = 0` 参数、纳入 `useEffect` deps
+- `page.tsx` 加 `watchEpoch` state、`handleStart` / `handleResumeWaiting` / `handleApproveWithFork` 成功后 `++`、强制 `useTaskWatch` 重连
+- `start-workflow/route.ts` + `resume-waiting/route.ts`：fire-and-forget 之前**同步**调 `patchPhase(taskStatus: "running")`、把 task.status 切到 running 再返回、客户端 SSE 看到 running 不会立刻 close
+
+#### 4. plan / build / review prompt 模板瘦身
+
+用户实操后觉得 `01-plan.md` 太冗余、「方案规划的内容过于冗余了」。删掉低价值字段：
+
+- **删 plan §2「验收标准」**：跟 §1「需求理解」+ §3「业务规则」重叠、价值低
+- **删 plan §7「验收对照」**：跟 review phase 的「跟飞书需求对照」重叠
+- **删 plan §8「自动化校验计划」**：build phase 模板里有更具体的
+- **删 plan §9「关联文档」**：context_docs 已经在 UI 上显示
+- **压缩 plan §3「业务规则」**：原来是「逐字搬 PRD」、改成「只列关键表 / 枚举、不复述 PRD 全文」
+- **压缩 plan §1.1「我的理解 vs 飞书原文」**：只列差异（补全 / 偏离 / 缺源）、不复述一致项
+
+**phase-2-build.md / phase-3-review.md 同步更新**：
+
+- 内部所有 `§X` 引用按新编号刷新（旧 §4 → 新 §3、旧 §6 → 新 §5、删了 §7/§8 的引用）
+- review 「跟飞书需求对照」从「读 plan §2 验收标准」改成「读 plan §5 task 列表 + contextDocs 原文」、对齐 plan 瘦身后的产出
+- build 「Task 完成情况」表替换之前的「验收对照」表（per-task 校验、对齐 plan 新结构）
+
+#### 5. super-prompt `[PHASE_ACK revise]` 重写：feedback 清晰度 4 级分流
+
+**用户反馈**：
+
+> 我感觉这两点的提示词应该是可以共用的是不？AI 要么过度确认（明明用户说得很清楚还要 ask_user 复述）、要么模糊场景就闷头改（用户说「你看着办」就真的随便选了）
+
+**重写后的规则**（`plan-runner.ts` §3 revise 解读、`chat-mcp.ts` shell 引导文案、phase-2 / phase-3 prompt 同步）：
+
+```
+A. 明确改动指令（含具体位置 + 动词 + 改前/后）
+   → 跳过 ask_user 复述、直接走 3a 改 artifact
+B. 明确询问（纯疑问、没改动指令）
+   → 跳过 ask_user 复述、直接走 3b 答疑 + emit assistant_message
+C. 含混 / 不确定 / 过短（看不懂用户想干嘛）
+   → 走 1.1 调 ask_user 复述意图、给具体选项让用户拍板
+D. 带图（feedback 含 [ATTACHED_IMAGES]）
+   → 先用 read 工具逐一读图、合起来再分 A/B/C
+
+护栏：判不准就当 C、宁多问一次也不要把模糊的判成 A 闷头改
+```
+
+**C 路径专用细则**：
+- ask_user 的 `question` 直接对用户说话、问意图（不准出现「[PHASE_ACK revise]」「反馈过短」这种协议名 / 公文体）
+- 用户答仍模糊 / 「你定 / 看代码再说 / 不知道」 → **read / grep 相关代码形成判断 → 再调一次 ask_user 给具体选项**（不要瞎默认）
+
+#### 6. phase-1-plan.md §5.1 / §5.2：初稿 ask_user 答完后按 §5 同款分级处理
+
+跟 super-prompt §3 用同一套 A/B/C/D 分级（plan 初稿 ask_user 是「主动问」、revise 是「被动收 feedback」、但答案解读规则同步）：
+
+- A. 答案明确 → 直接把结论写进 01-plan.md 对应位置
+- B. 答案是反问 → 在 01-plan.md 旁注里答疑、把答疑后结论一并写进去
+- C. 答案模糊 → **必须** read / grep 相关代码形成判断 → **再调一次 ask_user** 给具体选项让用户拍板（**不能直接打 default 跳到 wait_for_user**）
+- D. 部分清晰 + 部分模糊 → 清晰按 A 落、模糊按 C 二轮
+
+> ⚠️ **已知遗留**（**等下一轮跟用户单独聊**）：用户实测发现「ask_user 问两轮后就直接写 artifact」。根因可能是 §5.2 写的「所有 Q 都按 A/B/C/D 处理完、ask_user 不再有可问的、再 wait_for_user」语义太软、agent 自己判断「问够了」就推进。修法已对齐方向（要么换成「Q 全部收敛到 A 才 wait_for_user、ask_user 没次数上限」、要么加软上限 5 轮）、未实施。
+
+#### 7. awaiting_user 状态下也能「重启 workflow」
+
+**痛点**：用户改了 prompt 想看新 prompt 效果、但 agent 卡在 awaiting_ack、「重启 workflow」按钮不显示——非要等 30 分钟 wait-ack 超时后才能点。
+
+**改造**：
+
+- `page.tsx` `canStart` 加 `awaiting_user` 状态、awaiting_ack 状态下三按钮并存 `[重启 workflow]` + `[再聊聊]` + `[通过 PHASE]`
+- 「重启 workflow」在 awaiting_user 下用 `ghost` variant、让位主操作给「通过 PHASE」
+- 点击先弹 `useDialog().confirm`（`destructive`）、告知「会 cancel 旧 agent + 从 plan 重头跑 + 已有产物被覆盖 + +1 配额」
+- `start-workflow/route.ts` 加分支：`isPlanRunning && task.status === awaiting_user` 时走 fork 路径（`markPlanForFork → cancelPlan → waitForPlanToStop`）再起新 run、其他状态保持 already=true 幂等
+
+中途用户曾要求加单独的「重跑 agent」按钮（保留 phase 状态、只重跑当前 phase）、加完后用户说「就用重启 workflow 就行」、撤销新按钮 + 路由 / helper、合并到 start-workflow。
+
+#### 8. 三个 phase 骨架 YAML frontmatter 全删
+
+`01-plan.md` / `02-build.md` / `03-review.md` 骨架开头之前都有：
+
+```yaml
+---
+phase: 1-plan
+status: ready_for_ack
+upstream: raw_input
+downstream: 02-build.md
+task_id: <taskId>
+context_docs: [...]
+---
+```
+
+用户反馈：「这一块有什么意义吗？」——回看：
+- `phase / status`：UI 顶部 PhaseProgress 徽章已经显示
+- `task_id`：URL 里有
+- `context_docs`：UI 顶部 ContextDocsPanel 完整列出
+- `upstream / downstream`：纯架构 metadata、**没有任何代码消费**
+
+**结论**：纯冗余、artifact panel 顶部一大块视觉噪音、删。删完直接从 `# 方案：xxx` 起头。
+
+#### 9. V0.5.5 commit 全景（pending、未 commit）
+
+```
+（待 commit、本会话改动跨 18+ 文件、净减 100+ 行手工代码）
+```
+
+#### 10. V0.5.5 待办（接力 AI / 用户测试）
+
+- **核心待测**：跑完整 plan → build → review、看 V0.5.5 改动是否在用户操作路径上都生效
+- **ask_user 问两轮就停的问题**（§6 末尾遗留）需要下轮跟用户单独聊：是改成「全 A 路径才 wait_for_user / 无次数上限」、还是「软上限 5 轮」
+- **SDK status=ERROR message=(none) 复现**：等下一次 status=error、看 dev server 终端 `[plan-runner] SDK status message: ...` 日志能否拿到 message——拿不到就是 SDK bug、可以反馈 Cursor 团队
+- **诊断口扩**：如果下一轮还频发 status=error、考虑在 `case "status"` 同步 publish 一条 `info` 事件（而不只是 console.log）、让用户在前端事件流里也能看到所有 status 跳变
 
 ---
 
