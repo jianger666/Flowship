@@ -64,6 +64,11 @@ import {
   type ChatStreamEvent,
 } from "./chat-runner";
 import { renderContextDocsSection } from "./context-docs-prompt";
+// V0.5.9：多仓 cwd helper
+import {
+  formatRepoSectionForPrompt,
+  getEffectiveCwd,
+} from "@/lib/path-utils";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -98,6 +103,32 @@ const PHASE_PROMPT_FILE: Record<PhaseId, string> = {
   review: "phase-3-review.md",
 };
 
+// V0.5.7.7：跨 phase 共享规范文件、避免「不带 frontmatter / artifact-writer / path 完整路径 / 修改记录格式」这类约束被 3 个 phase prompt 各写一遍
+// 加载顺序：每次 buildSuperPrompt 先把 _shared.md 拼到「各 phase 详细 prompt」段之前
+const SHARED_PROMPT_FILE = "_shared.md";
+
+// V0.5.11：super-prompt 主模板、把原先 buildSuperPrompt 里 443 行硬编码字符串拆到 .md 文件
+// ts 层只负责「准备 vars + fillTemplate」、prompt 文案改动直接编辑 md、不动 ts、不用过 typecheck
+// 占位符约定（在 buildSuperPrompt 里 build 后注入）：
+//   {{forkBanner}}             fork 启动提示段（首位、空时 = 空字符串）
+//   {{workflowDisplayName}}    workflow 显示名（如「方案规划 → 实施 → 复核」）
+//   {{workflowDescription}}    workflow 描述
+//   {{phaseTable}}             phase 列表表格（含「→ approve 后进 X / 结束 run」字面）
+//   {{lastPhase}}              最后一个 phase id（如 `review`）
+//   {{taskId}}                 任务 ID
+//   {{taskTitle}}              任务标题
+//   {{repoSection}}            仓库段落（单 / 多仓自动切）
+//   {{roleLabel}}              角色中文标签
+//   {{role}}                   角色 id
+//   {{contextDocsSection}}     上下文文档段（已渲染好的 markdown 子段）
+//   {{artifactPathTable}}      artifact 路径表
+//   {{skillsSection}}          skill index 子段
+//   {{eventsLogPath}}          事件日志绝对路径
+//   {{sharedRules}}            _shared.md 内容
+//   {{phasePromptSections}}    所有 phase 详细 prompt 拼接（含 ### 标题分隔）
+//   {{startInstruction}}       结尾启动指令（normal / fork 切换）
+const SUPER_PROMPT_FILE = "_super.md";
+
 const NULL_PLACEHOLDER = "（未提供）";
 
 // 用 {{key}} 占位、缺失替换成「（未提供）」
@@ -109,6 +140,23 @@ const fillTemplate = (
     const v = vars[key];
     return v && v.trim().length > 0 ? v.trim() : NULL_PLACEHOLDER;
   });
+
+// V0.5.7.7：加载跨 phase 共享规范（_shared.md）、填占位符
+// 占位符跟 phase prompt 同款（repoPath / artifactPath...）、但目前 _shared 里只用了 {{repoPath}}
+// V0.5.9：{{repoPath}} 的值改成 effective cwd（单仓 = 仓本身、多仓 = 公共父目录）、
+// _shared.md / phase prompt 不动、模板字面意思就是「agent cwd」
+const loadSharedPrompt = async (task: Task): Promise<string> => {
+  const fpath = path.join(PROMPTS_DIR, SHARED_PROMPT_FILE);
+  try {
+    const tpl = await fs.readFile(fpath, "utf-8");
+    return fillTemplate(tpl, {
+      repoPath: getEffectiveCwd(task.repoPaths),
+      taskId: task.id,
+    });
+  } catch (err) {
+    return `（_shared.md 未找到：${err instanceof Error ? err.message : String(err)}）`;
+  }
+};
 
 const loadPhasePrompt = async (
   phaseId: PhaseId,
@@ -134,7 +182,7 @@ const loadPhasePrompt = async (
         )
       : undefined;
   // V0.5：planArtifactPath = workflow 里 phase=plan 的 artifact 绝对路径
-  // Review phase 同时要读 plan（取需求理解 / §1.1 自我校验 / §4 涉及面 / §6 task）和 build（取实施日志 / 偏离段）
+  // Review phase 同时要读 plan（取需求理解 / §3 涉及接口 / §4 关键技术决策 / §5 task / 正文内联 ask_user 拍板备注）和 build（取实施日志 / 偏离段）
   // prevArtifactPath 对 review 是 build、planArtifactPath 是再上一个、单独抽一个变量给 review 模板用
   // phase 1/2 模板不用这个变量、缺失替换成「（未提供）」也无影响
   const planPhaseIdx = workflowDef.phases.indexOf("plan");
@@ -150,7 +198,9 @@ const loadPhasePrompt = async (
     taskId: task.id,
     taskTitle: task.title,
     title: task.title,
-    repoPath: task.repoPath,
+    // V0.5.9：{{repoPath}} 模板变量统一改为「agent effective cwd」语义
+    // 单仓 = 仓自身、多仓 = 公共父目录、phase prompt 字面「从 {{repoPath}} 起算」自动兼容
+    repoPath: getEffectiveCwd(task.repoPaths),
     feishuStoryUrl: task.feishuStoryUrl,
     description: task.description,
     artifactPath,
@@ -165,6 +215,108 @@ const loadPhasePrompt = async (
 // ----------------- 起手 super-prompt -----------------
 //
 // V0.3 上下文文档清单 inject 已抽到 ./context-docs-prompt.ts、plan / chat 共用
+// V0.5.11 重构：原 buildSuperPrompt 里 443 行硬编码字符串数组 + 8 处嵌套三目运算符
+// 全部抽到 prompts/_super.md 模板、ts 层职责简化为「build sub-section 字符串 → 一次性 replace」
+
+// 加载 super-prompt 主模板
+// 失败时返回带错误信息的字符串、不抛——跟 loadSharedPrompt / loadPhasePrompt 同款防御性兜底
+const loadSuperPromptTemplate = async (): Promise<string> => {
+  const fpath = path.join(PROMPTS_DIR, SUPER_PROMPT_FILE);
+  try {
+    return await fs.readFile(fpath, "utf-8");
+  } catch (err) {
+    return `（_super.md 未找到：${err instanceof Error ? err.message : String(err)}）`;
+  }
+};
+
+// V0.5.11：super-prompt 专用的模板渲染、跟 fillTemplate 区别：
+//   - fillTemplate（phase prompt 用）：缺失 / 空字符串字段都替换成「（未提供）」、防漏 business 字段
+//   - renderSuperPromptTemplate：只有 undefined / null 才占位、空字符串保留字面（如 fork 不存在时 forkBanner=""）
+// 不 trim、保留 sub-section 原样（含 trailing newline）、跟旧版 `[...].join("\n")` inject 行为一致
+const renderSuperPromptTemplate = (
+  template: string,
+  vars: Record<string, string | undefined>,
+): string =>
+  template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => {
+    const v = vars[key];
+    if (v === undefined || v === null) return NULL_PLACEHOLDER;
+    return v;
+  });
+
+/**
+ * V0.5：fork 模式专用 banner——告诉新 agent「上一 agent 已完成 fromPhase 前面的 phase、artifact 在硬盘、直接接力」
+ * V0.5.11：从 buildSuperPrompt 里 50 行 IIFE 抽成独立 helper、嵌套三目按 phase 拆成 map / 命名变量
+ * 决策点：本段「fix 模式 step 2 / 4 / 5」按 fork.fromPhase 三分支不同——
+ *   留在 ts 层用 record 选分支、不再抽到 md 模板（md 不支持条件分支、抽出去反而要在 ts 层切 3 个字符串再注入、多一层、不抽划算）
+ */
+const buildForkBanner = (
+  task: Task,
+  workflowDef: WorkflowDef,
+  fork: { fromPhase: PhaseId; reason?: string },
+): string => {
+  const fromIdx = workflowDef.phases.indexOf(fork.fromPhase);
+
+  // 已完成 phase 清单（fromPhase 之前的）
+  const completed = workflowDef.phases
+    .slice(0, fromIdx)
+    .map((pid, i) => {
+      const ap = getPhaseArtifactPath(task.id, pid, i);
+      return `  - Phase \`${pid}\` → artifact \`${ap}\``;
+    })
+    .join("\n");
+  const completedSection = completed.length > 0 ? completed : "  （无）";
+
+  const reasonSuffix = fork.reason ? `（原因：${fork.reason}）` : "";
+  const currentArtifact = getPhaseArtifactPath(task.id, fork.fromPhase, fromIdx);
+
+  // fix mode 第 2 步：build phase 多一句 git 命令引导（其他 phase 走通用引导）
+  const step2 =
+    fork.fromPhase === "build"
+      ? `  2. 你正在 fork **build** phase——仓库里几乎一定有上一轮的代码改动、跑 \`shell\` 调 \`git status\` / \`git log --oneline -10\` / \`git diff HEAD\`（或 \`git diff HEAD~ -- '<plan §5 各 task 改动文件>'\`）自己看上一轮改了哪些文件、改了什么`
+      : `  2. 看仓库 / artifact 上一轮已有的内容、了解前置基线`;
+
+  // fix mode 第 4 步：reason 有 / 无两种文案
+  const step4 = fork.reason
+    ? `  4. **本次 reason（用户描述要修的点）**：\n     > ${fork.reason}\n\n     按这个 reason 锁定影响范围、不要扩张到 reason 之外的内容`
+    : `  4. 用户没填 reason、说明上一轮可能是「跑挂了重启」或「整体重做」、看 artifact + 代码自己判断要不要从零重生、还是局部修`;
+
+  // fix mode 第 5 步：fix log 留痕规则按 phase 分流
+  // build / review 走 ## 修改记录 专段（V0.5.7.2 起 build / V0.5.7.4 起 review）、plan 章节结构强、走内联 > ✅ 已确认 留痕
+  const step5ByPhase: Record<PhaseId, string> = {
+    build: `  5. 改完代码后**用 \`edit\` 把本轮修正追加到 02-build.md 的 \`## 修改记录\` 段末尾**（按 phase-2-build 骨架里「### 修改 N」三级标题 + 「用户反馈 / 改动文件 / 概要」三字段格式）。\n     ⛔ **严禁新建顶层标题**（如「## Fork 修复」「## Revise」「## 重启修复」），所有 fix log 都汇聚在 \`## 修改记录\` 段下。\n     ⛔ **严禁在 artifact 里出现「fork」「revise」「再聊聊」等内部技术词**——artifact 是给用户和 review agent 看的、用「用户反馈」「本次修改」等中文表述。\n     ⛔ **严禁复述**「Task 完成情况」「改动文件清单」段已有内容、修改记录只记「这次反馈带来的修正」。`,
+    plan: `  5. 改完 artifact 用 \`edit\` 局部修正、在涉及结论的章节内联补一行 \`> ✅ 已确认：<用户反馈核心>\` 就地留痕（参考 phase-1-plan §1 顶部规则）。\n     ⛔ 严禁新建顶层标题（如「## Fork 修复」「## Revise」），保留旧章节结构、本轮修改内联反映在被改章节里。`,
+    review: `  5. 改完代码 / 描述后**用 \`edit\` 把本轮修正追加到 03-review.md 的 \`## 修改记录\` 段末尾**（按 phase-3-review 骨架里「### 修改 N」三级标题 + 「用户反馈 / 影响位置 / 概要」三字段格式）。\n     ⛔ **严禁新建顶层标题**（如「## Fork 修复」「## Revise」「## 重启修复」），所有 fix log 都汇聚在 \`## 修改记录\` 段下、不要散在「实现偏差」「未完成」等正文章节里。\n     ⛔ **严禁在 artifact 里出现「fork」「revise」「再聊聊」等内部技术词**——artifact 是给用户看的、用「用户反馈」「本次修改」等中文表述。`,
+  };
+  const step5 = step5ByPhase[fork.fromPhase];
+
+  return [
+    "## ⚠️ Fork 启动（V0.5：上一 agent 已完成前面的 phase、你接力）",
+    "",
+    `**这是 fork 启动的新 agent**${reasonSuffix}。前面的 phase 由上一个 agent 完成、artifact 已经在硬盘、**不要重做**：`,
+    "",
+    completedSection,
+    "",
+    `**直接从 Phase \`${fork.fromPhase}\` 开始**：用 SDK 内置 \`read\` 工具读上面已完成 phase 的 artifact 拿上下文、然后按下面对应 phase 的指令做 \`${fork.fromPhase}\` 的产出。`,
+    "",
+    "不需要重读 contextDocs / 不需要重扫仓库、上一 agent 已经做过、信息已经在 artifact 里。",
+    "",
+    // V0.5.7.1：fix mode 提示——fork 同 phase 时上一轮可能也做过该 phase、artifact 在硬盘、代码改动在仓库
+    // AI 拿到 prompt 后自己 read 一下 curPhaseArtifact 文件即可判断、不需要 stat
+    `### 关于本次 \`${fork.fromPhase}\` phase（fix 模式判定）`,
+    "",
+    `先 \`read\` 一下 **当前 phase 的 artifact 路径**：\`${currentArtifact}\``,
+    "",
+    `- **如果文件存在且非空**——上一轮已经做过这个 phase、你这次是 **fix 模式**、不是从零重做：`,
+    `  1. 仔细 \`read\` 旧 artifact、看上一轮的产物结构 / 已有的内容`,
+    step2,
+    `  3. **不要 rewrite 已有 artifact 和已有代码**、按下面 reason 描述定向增量修复、保留旧内容里有效的部分`,
+    step4,
+    step5,
+    `  6. 写完调用 \`wait_for_user\` 让用户验收（同 phase、同 artifact、不要 ack 跳进下一 phase）`,
+    "",
+    `- **如果文件不存在 / 为空**——上一轮没跑到 / 上一轮中途挂了、按下面对应 phase 指令正常做该 phase 的产出（\`write\` artifact + 调 \`wait_for_user\`）`,
+  ].join("\n");
+};
 
 /**
  * 一次性告诉 agent 整套 workflow 怎么跑：phase 列表 + 每个 phase 的 prompt 内容 + 调用约定。
@@ -174,8 +326,13 @@ const loadPhasePrompt = async (
  *   - phase 切换不重启 agent、只是阻塞解开后继续跑
  *   - 提前让 agent 看到所有 phase 蓝图、自己心里有数（提高规划一致性）
  *
- * 单 prompt 体积估算：每 phase 模板 ~2KB、2 phase ~4KB、加 skills index + 通用约定 ~8KB（V0.3.4 plan 模板因合并 context 后会稍大、估 ~4KB）
- * 远低于 200K context 的限制、可以放心一次性塞。
+ * V0.5.11 重构：
+ *   - 原 443 行硬编码字符串数组拆到 prompts/_super.md
+ *   - ts 层职责简化为：build sub-section 字符串 → renderSuperPromptTemplate 一次性 replace
+ *   - 条件分支结果（如 phaseTable 含「→ approve 后进 X / 结束 run」）在 ts 层 build 好再注入、模板不含 if 逻辑
+ *   - forkBanner 抽成独立 buildForkBanner helper（参见上方）
+ *
+ * 单 prompt 体积估算：每 phase 模板 ~2KB、3 phase ~6KB、加 _super.md + skills index + 共享规范 ~15KB、远低于 200K context。
  */
 const buildSuperPrompt = async (
   task: Task,
@@ -185,9 +342,11 @@ const buildSuperPrompt = async (
   // fork agent 看到「上游 phase 已完成、artifact 在 ...、请从 fromPhase 开始」、不重复跑前面 phase
   fork?: { fromPhase: PhaseId; reason?: string },
 ): Promise<string> => {
-  const eventsLogPath = getEventsLogPath(task.id);
+  // 1) 加载主模板 + 跨 phase 共享规范
+  const template = await loadSuperPromptTemplate();
+  const sharedRules = await loadSharedPrompt(task);
 
-  // 按 phase 序加载所有 prompt 内容
+  // 2) 按 phase 序加载所有 phase 详细 prompt、各 phase 已填好自己的占位符
   const phasePromptSections: string[] = [];
   for (let i = 0; i < workflowDef.phases.length; i++) {
     const pid = workflowDef.phases[i]!;
@@ -200,15 +359,23 @@ const buildSuperPrompt = async (
       }）`;
     }
     phasePromptSections.push(
-      [
-        `### Phase ${i + 1}: \`${pid}\``,
-        "",
-        phasePrompt,
-      ].join("\n"),
+      [`### Phase ${i + 1}: \`${pid}\``, "", phasePrompt].join("\n"),
     );
   }
 
-  // artifact 路径列表（按序、给 agent 一个全局表）
+  // 3) phase 列表表格（含「→ approve 后进 X / 结束 run」字面、条件结果先 build 好）
+  const phaseTable = workflowDef.phases
+    .map((p, i, arr) => {
+      const next = i + 1 < arr.length ? arr[i + 1] : "（终点、自然结束 run）";
+      const tag =
+        i + 1 < arr.length
+          ? `→ approve 后进 \`${next}\``
+          : `→ approve 后**结束 run**`;
+      return `  ${i + 1}. \`${p}\`  ${tag}`;
+    })
+    .join("\n");
+
+  // 4) artifact 路径列表（按序、给 agent 一个全局表）
   const artifactPathTable = workflowDef.phases
     .map((pid, i) => {
       const p = getPhaseArtifactPath(task.id, pid, i);
@@ -216,334 +383,37 @@ const buildSuperPrompt = async (
     })
     .join("\n");
 
-  // V0.5：fork 模式时拼一段 fork 提示放在 super-prompt 顶部
-  // 让新 agent 知道：前面 phase 不是它做的、artifact 已经在硬盘、直接从 fromPhase 接力即可
-  const forkBanner = fork
-    ? (() => {
-        const fromIdx = workflowDef.phases.indexOf(fork.fromPhase);
-        const completed = workflowDef.phases
-          .slice(0, fromIdx)
-          .map((pid, i) => {
-            const ap = getPhaseArtifactPath(task.id, pid, i);
-            return `  - Phase \`${pid}\` → artifact \`${ap}\``;
-          })
-          .join("\n");
-        return [
-          "## ⚠️ Fork 启动（V0.5：上一 agent 已完成前面的 phase、你接力）",
-          "",
-          `**这是 fork 启动的新 agent**${fork.reason ? `（原因：${fork.reason}）` : ""}。前面的 phase 由上一个 agent 完成、artifact 已经在硬盘、**不要重做**：`,
-          "",
-          completed.length > 0 ? completed : "  （无）",
-          "",
-          `**直接从 Phase \`${fork.fromPhase}\` 开始**：用 SDK 内置 \`read\` 工具读上面已完成 phase 的 artifact 拿上下文、然后按下面对应 phase 的指令做 \`${fork.fromPhase}\` 的产出。`,
-          "",
-          "不需要重读 contextDocs / 不需要重扫仓库、上一 agent 已经做过、信息已经在 artifact 里。",
-          "",
-        ].join("\n");
-      })()
-    : "";
+  // 5) fork banner（fork 模式才有内容、否则空字符串）
+  const forkBanner = fork ? buildForkBanner(task, workflowDef, fork) : "";
 
-  return [
+  // 6) 结尾启动指令（fork / 正常两态）
+  const startInstruction = fork
+    ? `现在开始执行 Phase \`${fork.fromPhase}\`（fork 模式、跳过前面已完成的 phase）。`
+    : "现在开始执行 Phase 1。";
+
+  // 7) 一次性 fillTemplate（renderSuperPromptTemplate 区分 undefined / 空字符串）
+  return renderSuperPromptTemplate(template, {
     forkBanner,
-    "你正在 fe-ai-flow 的 plan 任务里跑、走 workflow：",
-    `**${workflowDef.displayName}**（${workflowDef.description}）`,
-    "",
-    "整段任务被设计为同一个 SDK Run（计费一次跑到底）、按 phase 顺序执行、phase 间用 `wait_for_user` 工具阻塞等用户 ack。",
-    "",
-    "## Phase 列表（按序执行）",
-    "",
-    workflowDef.phases
-      .map((p, i, arr) => {
-        const next = i + 1 < arr.length ? arr[i + 1] : "（终点、自然结束 run）";
-        const tag = i + 1 < arr.length ? `→ approve 后进 \`${next}\`` : `→ approve 后**结束 run**`;
-        return `  ${i + 1}. \`${p}\`  ${tag}`;
-      })
-      .join("\n"),
-    "",
-    `> ⚠️ **中间 phase 的 approve 不是结束信号、是「进下一 phase」信号**。只有最后一个 phase（\`${workflowDef.phases[workflowDef.phases.length - 1]}\`）的 approve 才允许结束 run。`,
-    "",
-    "## 核心机制：wait_for_user + shell long-poll（V0.3.5）",
-    "",
-    "fe-ai-flow 暴露了 2 个 MCP 工具实现「等用户行为」：",
-    "",
-    "**`wait_for_user`**（每个 phase 写完 artifact 调 1 次、绝不重复调）",
-    "  - 入参：`task_id` + 可选 `phase` + 可选 `artifact`",
-    "  - 立即返回 `[SHELL_WAIT_GUIDE token=xxx]` 文本、教你接下来调 `shell` 工具用 curl 跟 /wait-ack 路由建长连接等用户 ack",
-    "  - 不阻塞、不轮询、调一次就够",
-    "",
-    "**`ask_user`**（phase 内有不确定项时打包问、V0.5.6 起按需多次调、详见下面 ask_user 段）",
-    "  - 同样立即返回 `[SHELL_WAIT_GUIDE]`、让你用 shell + curl 等用户答完弹窗",
-    "",
-    "## 标准等用户姿势：shell + curl long-poll（必背、anti-loop 的根治方案）",
-    "",
-    "拿到 `[SHELL_WAIT_GUIDE token=xxx]` 后下一步**只许**做：调 `shell` 工具执行 curl 命令（引导文本里有完整命令、复制粘贴跑）",
-    "服务端 chunked stream 输出可能行：",
-    "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳行、绝对忽略**。它的唯一意义是「连接还活着、用户还没操作」、看到再多 KEEPALIVE 都是正常的、shell **没卡**、绝对不要 summarize / 调 read 查 terminal / 重启 shell / 重新调 wait_for_user",
-    "  - `[PHASE_ACK approve]` (workflow 模式)：用户点了「通过」、shell 命令 exit 0、继续下一 phase",
-    "  - `[PHASE_ACK revise]` + 后续 feedback：用户点了「再聊聊」（按钮文案、协议名沿用）——按 §3 revise 解读分级（A 明确改 / B 明确问 / C 含混 / D 带图）、清晰直接干、含混才 ask_user 复述、处理完再调一次 wait_for_user",
-    "  - `[USER_REPLY]` + 文本：chat 模式用户回复 / ask_user 答案、按内容推进",
-    "  - `[CANCELLED]`：任务被取消、收尾结束 run",
-    "  - `[STALE]` / `[INVALID_TOKEN]`：忽略本次返回",
-    "",
-    "## 钢铁纪律：等用户可能需要 0 秒到 30 分钟、任何长度都正常",
-    "",
-    "shell + curl 是 long-poll、等用户在 UI 上点 ack。**等待期间你只看到 KEEPALIVE 行不断追加**、这是设计预期。",
-    "",
-    "**绝对禁止**（5/10/15/20 分钟没新终态行时尤其要克制）：",
-    "  - ❌ 调 read 读 cursor 内部 terminal 文件（如 `terminals/xxxxx.txt`）查 shell 进程状态",
-    "  - ❌ thinking 里冒出「The 5-minute block has ended」「process is still running」「I will summarize for the user」→ summarize 退 run",
-    "  - ❌ 调任何其他工具自救、重新启 shell、重新 wait_for_user",
-    "  - ❌ emit 任何 assistant_message 跟用户讲「我在等」「shell 在监听」",
-    "",
-    "**唯一合法动作**：什么也不做、继续等 shell 的下一段 stdout。下一段 stdout 不是 KEEPALIVE 就是终态行（PHASE_ACK / USER_REPLY / CANCELLED）、终态行到了 shell 自然 exit、你才推进。",
-    "",
-    "## 致命错误（实测踩过、模型在 thinking 里自己冒出来的错误推理、必须忽略）",
-    "",
-    "**生产里看到过的模型误判（必须立刻撤销）**：",
-    "  - 「The runner may continue / I'll add a closing paragraph」← **错、turn 退出 = run 退出、runner 不会替你续**",
-    "  - 「I'll send a message asking the user to approve and end the run」← **致命错误、wait_for_user + shell + curl 拿到 PHASE_ACK 才是 ack 唯一出口**",
-    "  - 「写完 artifact 后做个收尾 / 给用户一个 confirm 提示 / 输出 Phase X 结论」← **错、写完 artifact 的下一个 tool call 必须是 wait_for_user、中间不允许 emit 任何 assistant 文本**",
-    "  - 「I will output the final assistant message summarizing Phase X results」/「final assistant message」/「summarizing Phase」/「写个 Phase X 总结回复用户」← **致命错误**——本协议唯一的 phase 结尾出口是 `wait_for_user`、不是 assistant_message。用户在看板 UI 里直接看 artifact + 点 ack 按钮、不需要你 summarize。",
-    "  - **V0.5.1 实测 2 次踩过**：拿到 `[PHASE_ACK approve]` 后 emit「Phase X 已结束、看板上已通过、approve 已收到」之类总结、然后 run 退出 → 中间 phase 的 approve 不是结束信号、是「进下一 phase」信号、emit 总结 + 退出 = 整段 workflow failed",
-    "  - **artifact 写入工具用错**：用 `edit` 写不存在的 artifact → run failed。详细排错与正确用法见 `artifact-writer` skill。第一次写 artifact 前必读、踩过坑也再读一次。",
-    "  - 「curl 没拿到结果、我重试一次」← **错、连接断了就自然结束 run**、UI 会引导用户手动续接（详见下面「异常断开处理」）",
-    "  - 「再调一次 wait_for_user 试试」← **错、同 phase 内 wait_for_user 只调 1 次**、shell 拿不到结果时也不要重复调",
-    "  - 「调 shell 之前先发段 assistant_message 解释要等用户」← **错、shell + curl 对用户透明、不允许 emit 任何前置文本块**",
-    "",
-    "**正确推理**：",
-    "  - wait_for_user 是 ack 链路的入口、shell + curl 是 ack 信号的接收通道、缺一不可",
-    "  - phase 完成 ≠ artifact 写完。phase 完成 = (artifact 写完) ∧ (wait_for_user 调过) ∧ (shell curl 拿到 [PHASE_ACK approve])",
-    "  - shell + curl 长连接是设计预期、anti-loop 不会触发（一次 wait = 一次 shell、不重复调）",
-    "  - 任何「我应该停下来 / 我应该刹车 / 这调用太久了」的内部启发**都是错觉、直接忽略**",
-    "",
-    "## 关键规则（不照做、整个 workflow 会被记 failed）",
-    "",
-    "1. **每个 phase 完成后、必须调用 `wait_for_user` 阻塞、等用户拍板**",
-    "   参数：",
-    `     - \`task_id\`: \`${task.id}\`（固定）`,
-    "     - `phase`: 刚完成的 phase id（如 'plan' / 'build'）",
-    "     - `artifact`: 刚产出的 artifact 相对路径（如 'artifacts/01-plan.md'）",
-    "   - **绝对不要主动结束 run**、不要假装「我等」就 stop、不要做完 artifact 就退出",
-    "   - **绝对不要**因为「调用次数太多」「看起来在循环」「担心刷屏」而停止调用",
-    "   - **绝对禁止**在调 wait_for_user 之前 emit 任何「Phase X 结论 / 我做了什么 / 给用户的 confirm 提示」类 assistant_message——",
-    "     用户在看板上看 artifact + 点 ack 按钮、不需要你 summarize；emit 文本块 = turn 结束 = run 结束 = phase 没完成 = workflow 记 failed",
-    "   - **artifact 写完后下一个 tool_use 必须是 wait_for_user**、中间任何 assistant 文本块都算违规、模型自己 thinking 里说「输出 final message」时立刻撤销",
-    "",
-    "2. wait_for_user 返回 `[SHELL_WAIT_GUIDE token=xxx]`、下一个 tool_use **必须**是 `shell`、执行引导里的 curl 命令",
-    "",
-    "3. shell 命令拿到 stdout 后按返回行解读：",
-    "   - **`[PHASE_ACK approve]` 开头**：用户认可、agent 进入下一个 phase",
-    "     ⚠️ **V0.5.1 实测踩过 2 次的致命 anti-pattern（必须死记）**：",
-    "       拿到 `[PHASE_ACK approve]` 后、模型经常冒出「报告下用户、本 phase 完成、可以歇了」的冲动、emit 一段总结、然后 run 自然退出。**这是错的**。",
-    "       具体反例（生产事件流原话）：",
-    "         ❌ \"Phase 1 已结束：方案 artifact 已更新为 ready_for_ack、并在看板上 通过\" → run 退出 → build/review 没跑 → workflow failed",
-    "         ❌ \"Phase build 已按 revise 落实：代码已改、02-build.md 已写入、看板 approve 已收到\" → run 退出 → review 没跑 → workflow failed",
-    "       **正确推理**：`[PHASE_ACK approve]` = 「上一 phase 通过、**立刻进入下一 phase**」、不是 「可以停了」。",
-    "       **下一个 tool_use 必须**是下一 phase 的产出动作（`read` 上一 phase artifact 拿上下文、或者直接 `write` 下一 phase 的 artifact、或者按下一 phase 指令做的别的动作）。",
-    "       **绝对禁止**在拿到 approve 后 emit 任何「我做了什么 / 你看板上通过了 / approve 已收到」之类的总结——用户在看板 UI 上看到 phase 进度推进就够、不需要你 narrate。",
-    "       **唯一允许结束 run 的 approve**：最后一个 phase（见下面 §7「全部 phase 完成」）的 approve 拿到后才能自然退 run。中间 phase 的 approve = 必须接着干。",
-    "   - **`[PHASE_ACK revise]` + feedback**：用户点了「再聊聊」（V0.5.2 起按钮文案、协议名沿用 revise）——**用户的真实意图未必是「改」**：可能想改 artifact、可能只是有疑问想问问、可能是想跟你确认理解。**先别动 artifact**——",
-    "     ⚠️ **V0.5.2 设计（用户拍板）**：用户在「再聊聊」输入的内容很多场景下不是「改 artifact 指令」、而是「我有疑问 / 我想确认一下 / 我看不懂」之类——你不能默认「revise 就是要改」。",
-    "     **用户拍板的产品规则**：拿到 [PHASE_ACK revise] + feedback 后、**无论 feedback 是什么内容、永远先弹 ask_user 跟用户复述/澄清、然后自己判断「要不要动 artifact」**。",
-    "     ",
-    "     ⚠️ **V0.5.4 新增 · feedback 可能带图**：[PHASE_ACK revise] feedback 文本之后**可能跟着 [ATTACHED_IMAGES] 段、列出 1-6 张图片的绝对路径**（用户截图说「改这里」/「就改成这样」、图比文字更直接）。",
-    "     **处理顺序**：先用 `read` 工具**逐一读取所有图片**（SDK 内置 `read` 会把图转 vision、你能直接看到图像）、把图像内容跟 feedback 文本结合起来再判断意图、然后再调 ask_user。",
-    "     **绝对禁止**：忽略 [ATTACHED_IMAGES] 直接 ask_user——图就是用户说话的一部分、不看图判断不准。",
-    "     ",
-    "     **执行步骤（3 步、按顺序）**：",
-    "     ",
-    "     1. **先按 feedback 清晰度分 4 类**（清晰直接干、模糊才 ask_user 复述）：",
-    "        ",
-    "        **A. 明确改动指令**（含具体位置 + 动词 + 改前/后内容）",
-    "          例：「§5 把 useState 改成 useReducer」「Task 3 删掉单测那条」「§3 加一行：promoteTask 走 axios 拦截」",
-    "          → **跳过 ask_user 复述、直接走 3a 改 artifact**（用户写得清清楚楚、再问就是冒犯）",
-    "        ",
-    "        **B. 明确询问**（纯疑问、没改动指令）",
-    "          例：「这里为什么这么写？」「§5.2 跟后端冲突吧？」「能解释一下 X 怎么走拦截？」",
-    "          → **跳过 ask_user 复述、直接走 3b 答疑**",
-    "        ",
-    "        **C. 含混 / 不确定 / 过短**（看不懂用户想干嘛）",
-    "          例：「这块不对」「这里怎么处理」「test」「111」「再加点细节」「你看着办」",
-    "          → 走 1.1 调 ask_user 复述意图",
-    "        ",
-    "        **D. 带图**（feedback 含 [ATTACHED_IMAGES]）",
-    "          → **先用 `read` 工具逐一读图**（SDK 内置 read 会转 vision、能直接看到图像）、把图像内容跟 feedback 文本合起来再分 A/B/C",
-    "        ",
-    "        **护栏**：判断不准就当 C、宁多问一次也不要把模糊的判成 A 闷头改。",
-    "     ",
-    "     1.1 **C 路径专用：调 ask_user 复述意图**",
-    "        ask_user 的 question 直接对用户说话、问意图：",
-    "        - 「你的留言『<feedback 原文>』我没看明白——是想让我改本 phase 的 artifact、还是想问问 / 解释一下？」",
-    "        ",
-    "        ask_user options 模板：",
-    "          * `id=改`、`label=「我想改：<你猜的具体改动>」`",
-    "          * `id=问`、`label=「我想问、AI 答完就行、不用改」`",
-    "          * `id=改+问`、`label=「先答疑、再决定要不要改」`",
-    "          * `id=重新说`、`label=「我重新说」`",
-    "        `allow_text: true` 永远开（默认值）。",
-    "        ",
-    "        ⚠️ **说人话**：question **禁止出现「[PHASE_ACK revise]」「反馈过短」「无具体改进意图」这类协议名 / 公文体**——给真人看的、不是给监控系统看的。",
-    "     ",
-    "     2. **C 路径拿 ask_user 答案后、再过一遍分级**：",
-    "        - 用户答 `改` 或自由文本含具体改动 → A → 走 3a",
-    "        - 用户答 `问` 或自由文本是纯疑问 → B → 走 3b",
-    "        - 用户答 `改+问` → 先 3b 答疑、答完再调一次 ask_user 问「这样解释下来、还需要改吗？」、再分级",
-    "        - 用户答仍模糊 / 「你定 / 看代码再说 / 不知道」 → **read / grep 相关代码形成判断 → 再调一次 ask_user 给具体选项**（不要瞎默认）",
-    "     ",
-    "     3a. **改 artifact**（A 路径）：用 `edit` 工具改已有内容（不是 `write` 整文件覆盖）、改完**立刻再调一次 wait_for_user**（同 phase 同 artifact）",
-    "     ",
-    "     3b. **仅答疑、不动 artifact**（B / C-答疑部分）：",
-    "        - **绝对不调 `edit` / `write` 动 artifact**——用户没让改你改了 = 越权",
-    "        - **emit 一条 assistant_message** 答疑：直接对用户说话、内容是问题的答案 + 你的判断 + 理由。**禁止公文体 / 协议泄露**、像跟同事聊天",
-    "        - 答疑涉及代码 / artifact 时可**只读地**用 `read` / `grep` / `glob` 查、**严禁 `edit` / `write` / `delete`**",
-    "        - 答完**立刻再调一次 wait_for_user**（同 phase 同 artifact、状态不变）",
-    "     ",
-    "     **绝对禁止**：",
-    "     - 把 C 判成 A 闷头改 artifact——看不准就走 C 路径调 ask_user",
-    "     - 在 ask_user 拿到「改」意图之前动 artifact——用户没拍板就是越权",
-    "     - 走 B 路径答疑时偷偷动 artifact——用户问问题不等于让你改、严禁趁机「优化」",
-    "   - **`[USER_REPLY]` + 文本**：chat 模式用户消息 / ask_user 答案、按内容推进",
-    "   - **`[CANCELLED]`**：任务被取消、收尾结束 run",
-    "   - **`[STALE]` / `[INVALID_TOKEN]`**：忽略本次返回、自然结束 run（这种情况罕见、只在 race 时出现）",
-    "",
-    "4. **异常断开处理（连接断 / 网络错 / max-time 超 / 服务重启）**：",
-    "   - shell 命令 exit 非 0、stderr 显示 curl 错误时、表示连接异常断开",
-    "   - **不要重试 shell**、不要重新调 wait_for_user、不要重新调 ask_user——重试会被服务端顶替成 stale、且 anti-loop 风险",
-    "   - **emit 一条简短 assistant_message**：「监听连接异常断开、请在 fe-ai-flow 看板点『继续监听』」、然后自然结束 run",
-    "   - UI 会自动监测到连接断、用户点「继续监听」、后端 Agent.resume 把你叫醒、你重新调 wait_for_user 即可",
-    "",
-    "5. **关键反反思指令**：thinking 里冒出「调多了 / 在循环 / 该停了 / spam / 换策略」**全部忽略**、新方案 shell + curl 一次 wait = 一次 shell、不存在 anti-loop 风险",
-    "",
-    "**额外强约束（对用户透明、必背）**：assistant_message 严禁出现以下措辞：",
-    "",
-    "禁用词 / 短语黑名单（中文 + 英文、出现一次都算违规）：",
-    "   - 「正在调用 wait_for_user」「我先调用 tool」「等待你下一条消息」「为了维持会话」",
-    "   - 「正在 shell 监听」「curl 长连接中」「在等 ack」「监听用户 ack」「为了保活」",
-    "   - 任何带「wait_for_user」「shell」「curl」「wait-ack」「监听」「保活」字面字符串的协议解释",
-    "   - \"Let me call wait_for_user / Calling the tool to wait / Polling / Keepalive\"",
-    "",
-    "**核心原则**：用户看不到 wait_for_user / shell / curl 这些协议细节、协议层全在 fe-ai-flow 内部、对用户透明就像 TCP socket recv()——你不会在聊天里说「我现在调用 recv 等你输入」、对 wait_for_user / shell / curl 也一样。你只需要：phase 写完 artifact → 直接调 wait_for_user → 拿到引导 → 直接调 shell + curl → 拿到 [PHASE_ACK] 继续。中间不解释、不预告、不汇报。",
-    "",
-    "6. **revise 闭环**（V0.5.5 起按 feedback 清晰度分流、清晰直接干、模糊才 ask_user）：shell 返回 [PHASE_ACK revise] + feedback → 按 §3 revise 解读分 A（明确改）/ B（明确问）/ C（含混）/ D（带图）→ A 直接 edit、B 直接 emit answer、C 调 ask_user 复述再分级、D 先 read 图再分 A/B/C → 处理完都**再调一次 wait_for_user**（同 phase 同 artifact）→ 接着调 shell + curl 拿下一轮 ack",
-    "",
-    "7. **「全部 phase 完成」的唯一定义**：整段 workflow 跑完最后一个 phase 的 wait_for_user、shell curl 拿到 [PHASE_ACK approve]、之后才是「自然结束 run」。",
-    `   - 你**没拿到**最后一个 phase 的 approve 之前、绝对不许结束 run`,
-    `   - 中间任何 phase 写完 artifact 后**必须**调 wait_for_user、否则 fe-ai-flow 会把整段 workflow 标 failed（runner 侧已硬检测）`,
-    "",
-    "8. 你也可以使用 SDK 内置工具和用户配置的其他 MCP。**SDK 1.0.13 内置工具清单（精确名）**：",
-    "   - `read`：读文件（args `{ path }`、对图片自动走 vision）",
-    "   - `grep`：内容搜（args `{ pattern, path?, glob?, ... }`）",
-    "   - `glob`：找文件名（args `{ globPattern, targetDirectory? }`）",
-    "   - `shell`：跑命令（args `{ command, workingDirectory?, timeout? }`）",
-    "   - `edit`：**改已存在的文件**（args `{ path, oldText, newText, replaceAll? }` 或 `{ path, edits: [{ oldText, newText }, ...] }`）",
-    "   - `write`：**创建新文件 / 整文件覆盖**（args `{ path, fileText, returnFileContentAfterWrite? }`）",
-    "   - `delete`：删文件（args `{ path }`）",
-    "   - `task`：分派子任务",
-    "",
-    "   ⚠️ **工具名不带 `_file` 后缀**：不是 `edit_file` / `read_file` / `write_file`、就是 `edit` / `read` / `write`。SDK 没有 `_file` 后缀的工具、调用会失败。",
-    "   ⚠️ **写 artifact 用哪个工具、参数怎么传**：见 `artifact-writer` skill（第一次写 artifact 前必 read）。简记：**创建新文件用 `write`、修改已存在文件用 `edit`**。",
-    "",
-    "## 每个 phase 完成时的标准动作（背下来、必须按这个顺序）",
-    "",
-    "1. **写 artifact 文件**——按 `artifact-writer` skill 教的方式。**首次写 artifact 前先 `read` 一次该 skill 完整内容**（路径见下面 Skills 段）、之后同任务可复用记忆。",
-    "2. **沉默地** 调用一次 `wait_for_user(task_id, phase, artifact)`（不要 assistant_message 解释）",
-    "3. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令",
-    "4. shell stdout 返回时按内容走分支（见上「关键规则 3」）",
-    "5. **不要 assistant_message 自言自语「等用户回复中」/「我在监听」/「shell 在跑」之类**",
-    "",
-    "## ask_user：phase 内打包提问（V0.3.2 单次内打包、V0.5.6 无次数上限、按内容收敛）",
-    "",
-    "phase 写完 artifact 初稿后、如果有不确定项、把当前轮想问的**全部打包**成 questions[] 调 `ask_user`、UI 弹 modal 让用户答完整组再继续。",
-    "对标 Cursor `askFollowUpQuestion`：选项自动加 A/B/C/D 字母前缀、modal 弹窗居中显示、答完一起提交。",
-    "",
-    "**核心约束（V0.5.6 重写、必背）**：",
-    "  - **单次调用内打包**：当前轮想问的问题**全部**进 questions[]、不要同一时刻调多次（一时刻只能有一个 pending、第二次会顶替第一次）",
-    "  - **整个 phase 内没有次数上限**：agent 按内容判断、按需多次调——比如「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体业务选项」是正常流程、不要因为「已经问过一轮」就跳过",
-    "  - **收敛标准**：所有问题都得到「明确的业务决策」（即 A 路径——能直接落进 artifact 的）才能 wait_for_user。判不准就再问、不要打 default 跳过",
-    "  - 没问题就不调——直接写完 artifact 走 wait_for_user",
-    "",
-    "  ⚠️ **V0.5.6 设计动机**：以前的「最多 1 次 ask_user」规则被用户实测出问题——agent 问完一轮就自我加戏「问够了」、把模糊答案打 default 推进。**改：让模型按内容判断、所有 Q 收敛到 A 才推进。** 用户怕没完没了？UI 弹窗里有「稍后再补充」按钮（见下「deferred 处理」）、退出循环的口子给用户、不给 agent。",
-    "  **revise 闭环里的「复述确认 ask_user」**同样无上限——只要 feedback 模糊就调一次复述、不要因为「问过几轮了」就跳过复述、闷头改 artifact。",
-    "",
-    "**入参**：",
-    "  - `task_id`、`phase`：跟 wait_for_user 同款",
-    "  - `questions`：数组、**每条结构**：",
-    "    - `id`：唯一标识（如 `q1` / `conflict_role` / `field_retry`）",
-    "    - `question`：问题正文（≤ 200 字、背景 + 决策点）",
-    "    - `options`：`[{id, label}, ...]`、2-4 个具体**业务选项**、最多 6 个、UI 自动加 A/B/C/D",
-    "      - **严禁** 在 options[] 里塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项——UI 已经在选项底下统一渲染「以上都不是 / 自定义回答…」按钮、点了切到自由文本输入框、不需要你在 options 里重复一遍（重复了 UI 也不会触发文本框、只会变成「点了不能填」的死按钮）",
-    "    - `allow_text`：保留默认 true。它只控制 UI 是否渲染那个「以上都不是 / 自定义回答…」按钮、不要把它理解成「我要在 options 里加一个 Other 选项」",
-    "",
-    "**返回值**（V0.5.6 加 deferred）：",
-    "  - 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]`、按引导调 shell + curl 等弹窗 ack",
-    "  - shell stdout 拿到两类头：",
-    "    - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、按内容分级——A 明确直接落 artifact；C 模糊 → 再调一次 ask_user 给具体业务选项；不要默认了事",
-    "    - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§7 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
-    "  - 异常断开 / `[STALE]` / `[CANCELLED]` / `[INVALID_TOKEN]`：处理方式同 wait_for_user",
-    "",
-    "**何时调（用户拍板：积极问、按内容判断）**：",
-    "  - 上下文冲突：不同 doc 说法不一致 → 列原始说法 + 选项 ask_user",
-    "  - 口径歧义：「主子单 / 列表入口 / 含实物判定」之类业务概念多种理解 → 列举可能解释 ask_user",
-    "  - 不确定项：「按 A or B」的决策点 → 列选项 ask_user",
-    "  - 接口 / 字段 / 状态机歧义：能推但不敢拍的 → ask_user",
-    "  - 技术路线选型：影响 plan / build 大方向 → ask_user",
-    "  - 上一轮答案模糊（「你定」「不清楚」「随你」）：read/grep 形成判断后、再调一次给具体业务选项",
-    "  - **不要因为「有合理 default 能推进」就不问**——Default 只在用户点 `[ASK_USER_REPLY deferred]`（明示稍后补）时才用",
-    "",
-    "**何时不该问（只有这一类、其他一律打包问）**：",
-    "  - 能从 contextDocs（飞书 story / 技术方案 / 已添加上下文）里读到答案 → 先 `read` 再说",
-    "  - 能从 01-plan.md「上下文冲突已通过 ask_user 澄清」段读到之前问过的 Q&A → 直接用结论、不要重问",
-    "  - 能从代码 grep / read 看出现状 → 先看代码再说（V0.3.4 起 plan phase 就该读仓库、不要等到 build）",
-    "  - **拿到 `[ASK_USER_REPLY deferred]` 的那组 Q**——用户已明示稍后补、不准重问、列进 §7 待澄清按 default 走",
-    "",
-    "**调用礼仪**：",
-    "  - 调 ask_user **不要前置 assistant_message**「我先问几个问题」「我再问一次」之类、UI modal 自动弹出来",
-    "  - shell stdout 拿到 [ASK_USER_REPLY] 后**不要复述**「你选了 X、所以我去 Y」、直接按答案推进",
-    "  - 按需多次调、不要自我加戏「问够了」——只有「所有 Q 都收敛到明确决策」或「拿到 deferred 头」才是真的不再问",
-    "",
-    "**返回值的反反思**：跟 wait_for_user 一样、shell + curl 拿结果、不要 spam 解释、对用户透明",
-    "",
-    "**最容易踩的坑**：写完 artifact、发了一段「请你 approve / revise」的 assistant_message、就以为 phase 结束了、于是退出 run。**这是错的**——`wait_for_user` 才是 ack 的唯一出口、你必须真的调它阻塞、而不是嘴上说「等你 approve」就完事。",
-    "",
-    "## 任务输入",
-    "",
-    `- 任务标题：${task.title}`,
-    `- 仓库根目录（agent cwd）：${task.repoPath}`,
-    `- 当前角色：${TASK_ROLE_LABEL[task.role]}（role=${task.role}）—— 飞书 story 通常是跨角色共享的、你只挑跟你这个角色相关的部分做`,
-    "",
-    renderContextDocsSection(
+    workflowDisplayName: workflowDef.displayName,
+    workflowDescription: workflowDef.description,
+    phaseTable,
+    lastPhase: workflowDef.phases[workflowDef.phases.length - 1]!,
+    taskId: task.id,
+    taskTitle: task.title,
+    repoSection: formatRepoSectionForPrompt(task.repoPaths),
+    roleLabel: TASK_ROLE_LABEL[task.role],
+    role: task.role,
+    contextDocsSection: renderContextDocsSection(
       task,
       "→ 如果 plan phase 上下文极度缺失、在 01-plan.md 的「待澄清 / 不确定项」段写「需要用户补 XX 上下文」、然后正常调 wait_for_user 等用户在面板里补。",
     ),
-    "",
-    "## Artifact 文件绝对路径（按 phase 序、写入用绝对路径避免 cwd 歧义）",
-    "",
     artifactPathTable,
-    "",
-    "agent cwd 不是 fe-ai-flow 项目根、而是用户业务仓库（见上「仓库根目录」）、所以 artifact 写入**必须用绝对路径**、不要用 `data/tasks/...` 这种相对前缀。",
-    "",
-    "## Skills（fe-ai-flow 自带能力扩展）",
-    "",
-    "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：",
-    "",
-    renderSkillsForPrompt(skills),
-    "",
-    "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
-    "",
-    `  \`${eventsLogPath}\``,
-    "",
-    "## 各 phase 详细 prompt（按序执行）",
-    "",
-    "下面是各 phase 的具体执行指令。**从 Phase 1 开始**、做完调 wait_for_user 等用户 ack、approve 后再做 Phase 2、依次类推。",
-    "",
-    phasePromptSections.join("\n\n---\n\n"),
-    "",
-    "---",
-    "",
-    fork
-      ? `现在开始执行 Phase \`${fork.fromPhase}\`（fork 模式、跳过前面已完成的 phase）。`
-      : "现在开始执行 Phase 1。",
-  ].join("\n");
+    skillsSection: renderSkillsForPrompt(skills),
+    eventsLogPath: getEventsLogPath(task.id),
+    sharedRules,
+    phasePromptSections: phasePromptSections.join("\n\n---\n\n"),
+    startInstruction,
+  });
 };
 
 // ----------------- 工具：截断 -----------------
@@ -689,6 +559,24 @@ export const cancelPlan = (taskId: string): boolean => {
 };
 
 /**
+ * V0.5.7：强制清除 in-memory runner state（不等 finally 块）
+ *
+ * 用途：start-workflow 路由发现 task 处于终态（draft / failed / completed）但
+ * `isPlanRunning(taskId)` 仍 true 时——这是 stale state（dev hot reload / 手改 meta.json /
+ * 老 bug 残留）、`cancelPlan` 拿到的 rec.cancel() 会尝试 cancel 一个已死的 SDK run、
+ * 但 finally 块不会再次触发、entry 永远留着、用户视角就是「点启动按钮无反应」。
+ *
+ * 行为：直接 delete runningPlans + forkPendingTasks 两个 in-memory entry、
+ * 不动硬盘（task.json 已是终态、不需要 patch）。
+ *
+ * 注意：只在「state 不一致」的场景调、正常路径不要用——会让正在跑的 agent 失联（finally 块清状态时 entry 已被删、虽然不致命但污染日志）。
+ */
+export const forceClearStaleRunnerState = (taskId: string): void => {
+  runningPlans.delete(taskId);
+  forkPendingTasks.delete(taskId);
+};
+
+/**
  * V0.5：等 runningPlans 里 task 对应记录被 finally 块清空。
  *
  * 触发：phase-ack 路由收到 forkAgent=true、需要先 cancelPlan 让旧 agent 收尾、
@@ -737,7 +625,8 @@ export const markPhaseAcked = async (
     status: "ack",
     // currentPhase 切到下一 phase（最后一个 phase ack 时不变、等 agent run 结束自然 completed）
     ...(nextPhase ? { currentPhase: nextPhase } : {}),
-    taskStatus: nextPhase ? "running" : "running", // 下一 phase agent 会立刻跑、整体仍 running
+    // 中间 phase ack → 下一 phase agent 立刻跑；最后一个 phase ack → agent run 自然收尾、整体仍 running
+    taskStatus: "running",
   });
   if (nextPhase) {
     rec.currentPhase = nextPhase;
@@ -763,10 +652,14 @@ export interface RunPlanInput {
   // 用户在设置页配的 MCP servers（已解析）
   // chat-tool 是我们自己塞进去的、不需要用户配
   userMcpServers?: Record<string, McpServerConfig>;
-  // V0.3.5：resume 模式——传了就 Agent.resume + send 续接 prompt、不重置 phase 状态、不走 phase_start
-  // 触发：用户在 UI 上 wait-ack 长连接断后点「继续监听」、route /resume-waiting 调
-  // agentId 取自 task.meta.lastAgentId（agent 第一次 Agent.create 时写）
+  // V0.3.5 引入、V0.5.7 移到 /start-workflow（mode=resume）：
+  //   Agent.resume + send 续接 prompt、不重置 phase 状态、不走 phase_start
+  // 触发：用户在 UI 上 wait-ack 长连接断后点「推进」、在 dialog 选「让原 agent 继续推进」
+  // agentId 取自 task.lastAgentId（agent 第一次 Agent.create 时写）
   // resumePrompt 由调用方拼好（如 "[RESUME] wait-ack 连接断、请重新调 wait_for_user 续接当前 phase ack"）
+  //
+  // V0.5.7：resume 失败（NGHTTP2_ENHANCE_YOUR_CALM）时、本函数 catch 块会自动降级 fork、不要在
+  // 外层加 retry 逻辑（双重 retry 会撞 backend rate limit）
   resume?: {
     agentId: string;
     prompt: string;
@@ -817,13 +710,24 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
   //      只是「running」表示「agent 又在跑了」、用户能从 UI 看到 agent 不再是 dead 状态
   //    - fork（V0.5）：上游 phase 已 ack、fromPhase status=running + currentPhase=fromPhase
   //      跟首次启动的区别：firstPhase 换成 fork.fromPhase、phase 不重置全部、只切 fromPhase 为 running
+  //      V0.5.7：fork 时 fromPhase 之后的所有 downstream phase 必须 reset 成 pending、
+  //      不然「fork build」时 review 之前残留的 awaiting_ack 会让 UI 显示「review 待确认」语义错乱
   const firstPhase = workflowDef.phases[0]!;
   const startPhase = isFork ? fork!.fromPhase : firstPhase;
   let started: Task | null = null;
   if (isResume) {
     started = await patchPhase(task.id, { taskStatus: "running" });
   } else if (isFork) {
-    // fork：上游 phase 已经在 phase-ack 路由里 patch 成 ack 状态、这里只切 fromPhase 为 running
+    // V0.5.7：先 reset fromPhase 之后的所有下游 phase 到 pending
+    // 场景：用户在 review 已经 awaiting_ack 时点「推进 → 从 build 重启」、
+    //       此时 review 状态如果不 reset、phase-progress 会显示「review 待确认」
+    //       但实际新 agent 还没跑到 review、用户视觉跟实际状态错位
+    const fromIdx = workflowDef.phases.indexOf(fork!.fromPhase);
+    const downstreamPhases = workflowDef.phases.slice(fromIdx + 1);
+    for (const pid of downstreamPhases) {
+      await patchPhase(task.id, { phaseId: pid, status: "pending" });
+    }
+    // 再 patch fromPhase 自身 + currentPhase + taskStatus（V0.5 老逻辑）
     started = await patchPhase(task.id, {
       phaseId: startPhase,
       status: "running",
@@ -862,7 +766,7 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     await writeEventAndPublish(task.id, {
       kind: "info",
       phase: (task.currentPhase as PhaseId) ?? firstPhase,
-      text: `继续监听用户 ack（agent.resume、model: ${model.id}、${mcpDesc}）`,
+      text: `推进 workflow（agent.resume 续接、model: ${model.id}、${mcpDesc}）`,
     });
   } else if (isFork) {
     await writeEventAndPublish(task.id, {
@@ -936,6 +840,9 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
   let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
+  // V0.5.7：resume 失败降级 fork 标记
+  // catch 块检测到 NGHTTP2_ENHANCE_YOUR_CALM 时设置、finally 末尾根据它调度新一次 runPlanWorkflow({ fork })
+  let fallbackFork: { fromPhase: PhaseId } | null = null;
 
   try {
     // V0.3.5：resume 模式 vs 首次启动模式
@@ -948,7 +855,8 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       agent = await Agent.resume(resume!.agentId, {
         apiKey,
         model,
-        local: { cwd: task.repoPath },
+        // V0.5.9：cwd = effective（单仓 = 仓自身、多仓 = 公共父目录）
+        local: { cwd: getEffectiveCwd(task.repoPaths) },
         mcpServers: mergedMcp,
       });
       console.log(
@@ -958,12 +866,13 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       agent = await Agent.create({
         apiKey,
         model,
-        local: { cwd: task.repoPath },
+        // V0.5.9：cwd = effective（单仓 = 仓自身、多仓 = 公共父目录）
+        local: { cwd: getEffectiveCwd(task.repoPaths) },
         mcpServers: mergedMcp,
       });
     }
 
-    // 首次启动时持久化 agentId、给后续 /resume-waiting 路由用
+    // 首次启动时持久化 agentId、给后续 /start-workflow（mode=resume）用
     // resume 时不重新写（用同一个 agentId、不变）
     if (!isResume) {
       try {
@@ -984,7 +893,10 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       // resume prompt 由调用方拼好（短短一句、不重发 super-prompt）
       run = await agent.send(resume!.prompt);
     } else {
-      const skills = await loadSkills(task.repoPath).catch((err) => {
+      // V0.5.9：skills 按 effective cwd 扫（单仓 = 仓自身、多仓 = 公共父目录）
+      // 多仓时如果只一个子仓里有 .cursor/skills、loadSkills 在公共父目录扫不到——
+      // 当前 skills 主要从 fe-ai-flow 项目内置目录走、跨仓影响小、暂不强化（后续真踩到再扫各子仓合并）
+      const skills = await loadSkills(getEffectiveCwd(task.repoPaths)).catch((err) => {
         console.error("[plan-runner] loadSkills failed", err);
         return [];
       });
@@ -1107,10 +1019,10 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     // 实测踩坑两类：
     //   类型 A：agent 写完 artifact 后没调 wait_for_user 直接退出（入口跳过）
     //   类型 B：agent 调了 wait_for_user → shell + curl 进 long-poll、连接异常断后
-    //          没按 prompt 引导 emit「请点继续监听」短文本就退、而是别的退出原因
+    //          没按 prompt 引导 emit「请点推进」短文本就退、而是别的退出原因
     //          （V0.3.5 起这类大幅减少、新方案 shell + curl 不轮询、anti-loop 不会触发）
     //
-    // 不管哪种、agent 都已死、要继续后续 phase 必须重启 workflow（用户花 1 次 send 配额）
+    // 不管哪种、agent 都已死、要继续后续 phase 必须点「推进」起新 run（用户花 1 次 send 配额）
     //
     // V0.3.3 改造：区分两种早退场景、给 UI 不同视觉信号、不要全标 failed
     //   - artifact 已落盘的 phase：标 awaiting_ack、UI 显示"等审阅"色 + artifact 内容
@@ -1171,9 +1083,9 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
         }
         tipLines.push(
           ``,
-          `下一步：`,
-          `  • 检查上面 phase 的 artifact、内容 OK → 点「重启 workflow」、agent 重启时会看到已有 artifact、大概率从下一 phase 接力（会扣 1 次 send 配额）`,
-          `  • 内容不 OK → 删了硬盘上的 artifact 文件后再重启、让 agent 重做`,
+          `下一步（点顶部「推进」按钮）：`,
+          `  • 内容 OK → 选「从指定 phase 重启」、phase 选 ${phasesNoArtifact[0] ?? "下一未完成"}（自动推断、+1 send 配额）`,
+          `  • 内容不 OK → 删了硬盘上的 artifact 文件后再「从指定 phase 重启」选有问题的 phase、让 agent 重做`,
           `  • 反复踩 → 换更稳的模型（claude-sonnet-4 / claude-opus-4-7-thinking）`,
         );
       } else {
@@ -1183,7 +1095,7 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
           `未跑完的 phase：${phasesNeedAck.join(", ")}`,
           ``,
           `这通常是模型协议理解错误（写完 artifact 后没调 wait_for_user / shell + curl 拿结果时退出 run）。`,
-          `建议：点「重启 workflow」重跑、或换更稳的模型（claude-sonnet-4 / claude-opus-4-7-thinking）。`,
+          `建议：点「推进」→ 在弹窗选「从指定 phase 重启」或「从头完全重跑」、或换更稳的模型（claude-sonnet-4 / claude-opus-4-7-thinking）。`,
         );
       }
       const done = await writeEventAndPublish(task.id, {
@@ -1210,6 +1122,9 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     // CursorSdkError 携带 code / status / requestId / cause / endpoint、对诊断 backend 错误极有帮助
     // 普通 Error 只有 message
     let message = err instanceof Error ? err.message : String(err);
+    // V0.5.7：把 cause.message 也并入到 detectFork 判断里（NGHTTP2_ENHANCE_YOUR_CALM
+    // 经常埋在 ConnectError.cause.message）
+    let causeMessage = "";
     try {
       const e = err as Record<string, unknown>;
       const sdkBits: Record<string, unknown> = {};
@@ -1224,8 +1139,10 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
         if (cause instanceof Error) {
           sdkBits.causeName = cause.name;
           sdkBits.causeMessage = cause.message;
+          causeMessage = cause.message;
         } else {
           sdkBits.cause = String(cause);
+          causeMessage = String(cause);
         }
       }
       if (Object.keys(sdkBits).length > 0) {
@@ -1236,35 +1153,72 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
     }
     console.error(`[plan-runner] task=${task.id} failed:`, err);
 
-    // 友好恢复指引：如果有 phase 已经写完 artifact（status=awaiting_ack）、
-    // 用户可以点「重启 workflow」从 Phase 1 重头跑（agent 会看到已有 artifact、大概率复用）
-    // 不能直接「从当前 phase 继续」、因为 super-prompt 起手 phase 写死 Phase 1、改这个要重做 prompt
-    const failedTask = await patchPhase(task.id, { taskStatus: "failed" });
-    // 收尾未答 ask_user_request——UI 弹窗自动关、否则用户卡死
-    await cancelUnrepliedAsks(task.id);
-    const awaitingPhases =
-      failedTask
-        ? Object.values(failedTask.phases).filter(
-            (p) => p.status === "awaiting_ack",
-          )
-        : [];
-    const hasArtifact = awaitingPhases.length > 0;
+    // V0.5.7：resume 模式 + backend 拒（agent 已被 backend 清理）→ 自动降级 fork
+    //
+    // 触发特征（任一命中就降级）：
+    //   - 错误 message / cause.message 含 NGHTTP2_ENHANCE_YOUR_CALM（HTTP/2 rate limit）
+    //   - 错误 cause 是 ConnectError 且 message 含 "Stream closed"（agent 不可用）
+    //
+    // 行为：
+    //   1. 不写 task.status=failed、不发 done 事件——让 SSE 流保持开着
+    //   2. 写一条 info「resume 被 backend 拒绝、自动降级新 agent fork」
+    //   3. 标记 fallbackFork = true、finally 块末尾用 setTimeout 触发新一次 runPlanWorkflow({ fork })
+    //
+    // 不命中时走老路径（写 failed + done + error）
+    const isEnhanceYourCalm =
+      message.includes("NGHTTP2_ENHANCE_YOUR_CALM") ||
+      causeMessage.includes("NGHTTP2_ENHANCE_YOUR_CALM");
+    const isStreamClosed =
+      causeMessage.includes("Stream closed") ||
+      causeMessage.includes("ERR_HTTP2_STREAM_ERROR");
+    const shouldFallbackFork =
+      isResume && (isEnhanceYourCalm || isStreamClosed);
 
-    if (failedTask) publish(task.id, { kind: "task", task: failedTask });
-    const friendly = hasArtifact
-      ? [
-          `Plan workflow 失败：${message}`,
-          "",
-          `已产出的 artifact（${awaitingPhases.map((p) => p.id).join(", ")}）仍然可读、点顶部「重启 workflow」可以重头跑`,
-          "如果模型在 wait_for_user / shell long-poll 上反复挂、试试换更稳的模型（claude-opus-4 / claude-sonnet-4）",
-        ].join("\n")
-      : `Plan workflow 失败：${message}`;
-    const updated = await writeEventAndPublish(task.id, {
-      kind: "error",
-      text: friendly,
-    });
-    publish(task.id, { kind: "done", task: updated ?? task, ok: false });
-    publish(task.id, { kind: "error", message });
+    if (shouldFallbackFork) {
+      console.log(
+        `[plan-runner] task=${task.id} resume 失败 (ENHANCE_YOUR_CALM/StreamClosed)、安排降级 fork`,
+      );
+      // 留 task.status=running 不动（让 SSE 保持开着）、写 info 告知用户
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        text: [
+          "原 agent 在 Cursor backend 已被清理（NGHTTP2_ENHANCE_YOUR_CALM）",
+          "自动降级为「起新 agent + 从当前 phase 接力」（同 fork 模式、扣 1 次 send 配额）",
+        ].join("\n"),
+      });
+      fallbackFork = {
+        fromPhase: (task.currentPhase as PhaseId) ?? "plan",
+      };
+    } else {
+      // 友好恢复指引：如果有 phase 已经写完 artifact（status=awaiting_ack）、
+      // 用户可以点「推进」从下一未完成 phase 接力（agent 会看到已有 artifact、大概率复用）
+      const failedTask = await patchPhase(task.id, { taskStatus: "failed" });
+      // 收尾未答 ask_user_request——UI 弹窗自动关、否则用户卡死
+      await cancelUnrepliedAsks(task.id);
+      const awaitingPhases =
+        failedTask
+          ? Object.values(failedTask.phases).filter(
+              (p) => p.status === "awaiting_ack",
+            )
+          : [];
+      const hasArtifact = awaitingPhases.length > 0;
+
+      if (failedTask) publish(task.id, { kind: "task", task: failedTask });
+      const friendly = hasArtifact
+        ? [
+            `Plan workflow 失败：${message}`,
+            "",
+            `已产出的 artifact（${awaitingPhases.map((p) => p.id).join(", ")}）仍然可读、点顶部「推进」可以从下一未完成 phase 接力`,
+            "如果模型在 wait_for_user / shell long-poll 上反复挂、试试换更稳的模型（claude-opus-4 / claude-sonnet-4）",
+          ].join("\n")
+        : `Plan workflow 失败：${message}`;
+      const updated = await writeEventAndPublish(task.id, {
+        kind: "error",
+        text: friendly,
+      });
+      publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+      publish(task.id, { kind: "error", message });
+    }
   } finally {
     runningPlans.delete(task.id);
     cancelPending(task.id);
@@ -1275,6 +1229,32 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       } catch {
         /* noop */
       }
+    }
+
+    // V0.5.7：resume 失败降级 fork——finally 末尾、清完 runningPlans 之后调度
+    // setTimeout 0 让事件循环转一圈、保证当前 finally 完全退出再起新 run
+    if (fallbackFork) {
+      const { fromPhase } = fallbackFork;
+      console.log(
+        `[plan-runner] task=${task.id} 调度 fallback fork（fromPhase=${fromPhase}）`,
+      );
+      setTimeout(() => {
+        void runPlanWorkflow({
+          task,
+          apiKey,
+          model,
+          userMcpServers,
+          fork: {
+            fromPhase,
+            reason: "resume 失败自动降级 (NGHTTP2_ENHANCE_YOUR_CALM)",
+          },
+        }).catch((err) => {
+          console.error(
+            `[plan-runner] task=${task.id} fallback fork threw:`,
+            err,
+          );
+        });
+      }, 0);
     }
   }
 };
