@@ -38,7 +38,13 @@
 >   5. 路径 + 行号支持 `cursor://file/path:line:column` 跳转（`src/lib/path-utils.ts` 加 `parsePathWithLine` / `buildCursorLink`）
 >   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.6.x」段。
 > - **V0.5.7（统一推进入口、2026-05-20 中午）**：合并历史的「继续监听」+ 「重启 workflow」为单一「推进」按钮 + `AdvanceDialog` 三选一（resume / fork / restart）。`resume` 失败（NGHTTP2_ENHANCE_YOUR_CALM）plan-runner 内部自动降级 fork。`/api/tasks/[id]/resume-waiting` 删、所有路径走 `/start-workflow`。fork 时 reset 所有下游 phase 为 pending（避免 UI 残留「待确认」）。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.7」段。
-> - **V0.5.7.1（fork reason + fix mode、2026-05-20 下午）**：fork 时 AdvanceDialog 加 textarea 让用户填「想修什么 bug」、plan-runner 的 forkBanner 加「fix 模式判定」段——让 AI 先 read 当前 phase 的 artifact、文件存在 → 进 fix 模式（read 旧 artifact + git diff、不 rewrite、按 reason 增量改、用 `edit` 不用 `write`），文件不存在 → 按 phase 指令正常做。解决「fork build 时 AI 可能 rewrite 上一轮代码」的不可控性。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.7」段下「补丁 V0.5.7.1」子节。
+> - **V0.5.7.1（fork reason + fix mode、2026-05-20 下午）**：fork 时 AdvanceDialog 加 textarea 让用户填「想修什么 bug」、plan-runner 的 forkBanner 加「fix 模式判定」段——让 AI 先 read 当前 phase 的 artifact、文件存在 → 进 fix 模式（read 旧 artifact + git diff、不 rewrite、按 reason 增量改、用 `edit` 不用 `write`），文件不存在 → 按 phase 指令正常做。解决「fork build 时 AI 可能 rewrite 上一轮代码」的不可控性。详见 [CHANGELOG.md](./CHANGELOG.md) V0.5.7 段。
+> - **V0.5.7.7（`_shared.md` 抽出、2026-05-22）**：三 phase 通用 artifact 写法 + 跨 phase 规则抽到一份 md、改约束改一处即同步。详见 [CHANGELOG.md](./CHANGELOG.md)。
+> - **V0.5.8（artifact 间引用走前端 tab、2026-05-22）**：`looksLikeArtifactRef` 识别裸文件名引用（如 `01-plan.md`）、artifact-panel 渲染为可点 button、点击切 tab、不跳浏览器。详见 [CHANGELOG.md](./CHANGELOG.md)。
+> - **V0.5.9（任务仓库多选 + 公共父目录 cwd、2026-05-22）**：`Task.repoPath: string` → `Task.repoPaths: string[]`、SDK Run cwd = `getEffectiveCwd(repoPaths)`（公共父目录）、AI 视角下挂 N 个 git 子仓、多仓 git 命令必须 `cd <repo>` 再跑。详见 [CHANGELOG.md](./CHANGELOG.md)。
+> - **V0.5.10（revise 二分类铁则 + Resizable 分栏、2026-05-23）**：用户写 feedback 后 AI 行为完全可预测、按「问类（纯疑问句、emit assistant_message）/ 改类（其他所有、先 ask_user 复述、再 edit）」铁则二分、判不准当改类。artifact / event-stream 双栏可拖动、持久化在 `task.uiLayout.artifactPanelSize`。装 `react-resizable-panels@4.11.1`。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.10」段。
+> - **V0.5.11（系统瘦身 + 提示词模板化 + 文档拆分、2026-05-23 ~ 25）**：`plan-runner.ts` 1651 → 1432 行（buildSuperPrompt 442 → 100 行）、抽 `prompts/_super.md` 主模板（变量注入式）、event-stream 890 → 427 行（拆 utils.tsx + rows.tsx）、HANDOFF 2018 → 289 行（拆 CHANGELOG.md）、artifact-panel 删「渲染 / 原文」切换。改 prompt 文案现在改 `_super.md` 一处、不用碰 .ts。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.11」段。
+> - **V0.5.12（待启动）**：artifact diff 视图（snapshot + 内嵌 diff）、用户拍板「第一版先简单」、规划已对齐、本轮 0 代码。详见 [ROADMAP.md](./ROADMAP.md)「V0.5.12」段。
 >
 > **本文档下游各节的有效性**：
 >

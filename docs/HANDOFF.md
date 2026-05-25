@@ -205,7 +205,16 @@ buildSuperPrompt
 - 新建 `docs/CHANGELOG.md`：1954 行、V0.2 ~ V0.5.9 全部演进档案、时间倒序（新在上）
 - 写入规则化：新子版本先写 HANDOFF「最近演进」、再老一轮时迁到 CHANGELOG.md 顶部
 
+**Hot-fix 4：artifact-panel 删「渲染 / 原文」切换（2026-05-25）**
+
+- 用户反馈实际无看 raw markdown 的场景、保留切换徒增心智
+- `artifact-panel.tsx`：删 `mode` useState / 「渲染 / 原文」两个 Button / `Code2`/`Eye` 图标 import / source 分支渲染
+- toolbar 顶部只剩文件名、永远走 ReactMarkdown
+- 净减 32 行
+
 **验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（21 routes 全编译成功、10/10 static pages）
+
+**下个迭代标记**：V0.5.12「artifact diff 视图」规划已对齐（见 `docs/ROADMAP.md`）、本轮代码 0 改动。
 
 ### V0.5.10：revise 交互二分类铁则 + Resizable 分栏（2026-05-23）
 

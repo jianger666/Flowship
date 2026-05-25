@@ -212,25 +212,60 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 
 ---
 
-## V0.5.3 ~ V0.5.7.1：持续打磨期（2026-05-18 ~ 20、已落地）
+## V0.5.3 ~ V0.5.11：持续打磨期（2026-05-18 ~ 25、已落地）
 
-V0.5 大动后用户密集联测、连续 5 天小迭代、每一档都跟 HANDOFF.md 同步。本节只列里程碑、细节看 HANDOFF。
+V0.5 大动后用户密集联测、超过一周小迭代、每一档都先落 HANDOFF.md「最近演进」段、再老的迁到 CHANGELOG.md。本节只列里程碑指引、细节请去 HANDOFF / CHANGELOG。
 
-- ✅ **V0.5.3 ~ V0.5.4 图片附件**：revise / chat 支持贴图（用户截图说改这里）、`use-image-attach` hook 统一处理 paste / drop / file
-- ✅ **V0.5.5 plan / build / review 骨架精简**：三 phase artifact frontmatter 全删、直接从 `# 方案：xxx` 起头、减重复 + token 省
-- ✅ **V0.5.6.x ask_user 无限 + 稍后再补充 + plan 模板大改 + prompt 加严**：
-  - `ask_user` 去掉次数上限、AI 自判、加「稍后再补充」deferred 选项
-  - plan 模板大改：删 §1.1 对照、§3 接口表、§4 只放 3 类全局决策、§6 待澄清
-  - 自由 chat 模式禁用 ask_user（chat = talk、不弹问卷）
-  - plan-runner 写完 artifact 强制自检（黑名单 grep / ack 位置 / 路径完整性）
-  - 路径行号支持 `cursor://file/path:line:column` 跳转
-- ✅ **V0.5.7 统一推进入口**：合并「继续监听 + 重启 workflow」为「推进」按钮 + AdvanceDialog 三选一（resume / fork / restart）、resume 失败（NGHTTP2_ENHANCE_YOUR_CALM）后端自动降级 fork、删 `/resume-waiting` 路由、fork 时下游 phase 全 reset pending
-- ✅ **V0.5.7.1 fork reason + fix mode**：fork dialog 加 textarea 让用户填「想修什么 bug」、forkBanner 加 fix 模式判定段、AI 看到已有 artifact → fix 模式（read 旧 + git diff + 不 rewrite + 用 `edit`）、看不到 → 正常做
+- ✅ **V0.5.3 ~ V0.5.4 图片附件**：revise / chat 支持贴图、`use-image-attach` hook 统一处理 paste / drop / file
+- ✅ **V0.5.5 plan / build / review 骨架精简**：三 phase artifact frontmatter 全删、直接从 `# 方案：xxx` 起头
+- ✅ **V0.5.6.x ask_user 无限 + 稍后再补充 + plan 模板大改 + prompt 加严**：见 CHANGELOG
+- ✅ **V0.5.7 统一推进入口**：合并历史 N 个续接按钮为单一「推进」+ `AdvanceDialog` 三选一（resume / fork / restart）、resume 失败 NGHTTP2_ENHANCE_YOUR_CALM 自动降级 fork、删 `/resume-waiting` 路由
+- ✅ **V0.5.7.1 ~ V0.5.7.6 fork reason + 修改记录 + 内部技术词禁项**：fork 走 fix mode、不 rewrite 已有产物、增量 edit、修改记录段约束
+- ✅ **V0.5.7.7 `_shared.md` 抽出**：三 phase 通用 artifact 写法 + 跨 phase 规则抽到一份 md、改约束改一处即同步
+- ✅ **V0.5.8 artifact 间引用走前端 tab**：`looksLikeArtifactRef` 识别裸文件名 → artifact-panel 渲染为可点 button、点击切 tab
+- ✅ **V0.5.9 任务仓库多选 + 公共父目录 cwd**：`Task.repoPaths: string[]`、`getEffectiveCwd` 算公共父目录、多仓 git 命令必须 `cd <repo>` 再跑
+- ✅ **V0.5.10 revise 交互二分类铁则 + Resizable 分栏**：feedback 按「问类 / 改类」铁则二分、AI 行为完全可预测；artifact / event-stream 双栏可拖动、持久化 `task.uiLayout`
+- ✅ **V0.5.11 系统瘦身 + 提示词模板化 + 文档拆分**：plan-runner 1651 → 1432 行、抽 `prompts/_super.md` 模板（buildSuperPrompt 442 → 100 行）、event-stream 890 → 427 行（拆 utils.tsx + rows.tsx）、HANDOFF 2018 → 289 行（拆 CHANGELOG.md）、artifact-panel 删「渲染 / 原文」切换
 
 **待联测**：
 
-- 🚧 **fix mode 真任务测**：跑一遍跑出 bug → fork build + textarea 填 bug → AI 是否真的只 edit 不 rewrite
-- 🚧 **fork downstream phase reset 验证**：fork build 后 UI 上 review 应该回 pending（不再是「待确认」）
+- 🚧 **fix mode 真任务测**：fork build + textarea 填 bug → AI 真的只 edit 不 rewrite
+- 🚧 **V0.5.11 提示词模板化运行时验证**：跑一道真任务、看 `_super.md` 渲染输出与之前硬编码版的行为一致
+
+---
+
+## V0.5.12 / W5.12：artifact diff 视图（snapshot + 内嵌 diff、待启动）
+
+**背景**（用户痛点）：每次「再聊聊」让 AI 改 md 后、用户不知道 AI 改了哪些地方、需要重读长 artifact。
+
+**方案**（用户拍板「第一版先简单」、本轮 0 代码、规划已对齐）：
+
+- 后端每次 revise 前 snapshot 旧版到 `tasks/<id>/artifacts/.revisions/01-plan.<ISO>.md`、保留近 5~10 个、超了 GC
+- `task.json` 加 `revisions: { [phaseId]: Array<{ timestamp, path }> }`
+- artifact-panel 顶部 toolbar 加「正文 / diff」切换 + 黄色 banner「✨ 刚刚修订了 N 处 [查看修改]」
+- 默认正文模式、有未看修订时 banner 提示、点击切 diff 模式
+- diff 视图用 `react-diff-viewer-continued`、monospace raw text 对比、可切 inline / side-by-side
+- dropdown 选「对比上次 / 初版 / 任意快照」、默认上次
+- ack 或手动关 banner 后状态清零、下次刷新默认正文
+
+**不做**（评估后 ROI 低、用户已拍）：
+
+- ❌ 渲染 markdown + 段级高亮（手写段对齐算法易错、ROI 不高）
+- ❌ 双视图 split-view（artifact-panel 本就不大、拆栏挤）
+- ❌ SDK toolCall 事件流 diff 卡片（事件流已拥挤、bash sed 拿不到 diff 不可靠）
+
+**预计成本**：5~7h
+
+**前置依赖**：无、V0.5.11 已经把 artifact-panel 极简到只剩文件名 toolbar、扩 diff toolbar 空间充裕
+
+---
+
+## V0.5.X 历史里程碑细节
+
+详见：
+
+- `docs/HANDOFF.md`「最近演进」段（V0.5.10 + V0.5.11、滚动 2 个子版本）
+- `docs/CHANGELOG.md`（V0.2 ~ V0.5.9、全部历史档案、时间倒序）
 
 ---
 
