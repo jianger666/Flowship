@@ -5,18 +5,18 @@
  * - 显示当前 active phase 的产物（spec.md / plan.md / build diff）
  * - V1 用 react-markdown + remark-gfm + @tailwindcss/typography prose 类、
  *   表格 / 代码块 / 列表 / 任务清单都能渲染
- * - 顶部 toggle：渲染视图 / 原始 markdown
- *   - 渲染视图：默认、给人看
- *   - 原始：给开发者校验 frontmatter / 调试 prompt 输出格式
  * - 没产物时显示占位（"该 phase 还没产物"）
+ *
+ * V0.5.11 hot-fix（2026-05-25）：去掉「渲染 / 原文」切换
+ * - 实际无看 raw markdown 的场景、保留切换徒增心智
+ * - artifact-panel 永远走渲染视图、顶部 toolbar 只剩文件名
  */
 
-import { useMemo, useState } from "react";
-import { Code2, Eye, FileText } from "lucide-react";
+import { useMemo } from "react";
+import { FileText } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   buildCursorLink,
@@ -118,8 +118,6 @@ export const ArtifactPanel = ({
   onArtifactRefClick,
 }: Props) => {
   const phaseLabel = formatPhaseTitle(phase.id);
-  // 视图模式：preview = 渲染、source = 原始 markdown
-  const [mode, setMode] = useState<"preview" | "source">("preview");
   // 包过 baseDir / onArtifactRefClick 的 markdown components、避免每次 render 重建
   const markdownComponents = useMemo(
     () => buildMarkdownComponents(baseDir, onArtifactRefClick),
@@ -144,49 +142,19 @@ export const ArtifactPanel = ({
   }
   return (
     <div className="flex h-full flex-col">
-      <div className="flex h-10 shrink-0 items-center justify-between border-b px-4 text-xs text-muted-foreground">
-        <div className="flex items-center gap-2">
-          <FileText className="size-3.5" />
-          {phase.artifact.filename}
-        </div>
-        <div className="flex items-center gap-1">
-          <Button
-            variant={mode === "preview" ? "secondary" : "ghost"}
-            size="sm"
-            className="h-7 px-2 text-xs"
-            onClick={() => setMode("preview")}
-            title="渲染视图"
-          >
-            <Eye className="size-3.5" />
-            渲染
-          </Button>
-          <Button
-            variant={mode === "source" ? "secondary" : "ghost"}
-            size="sm"
-            className="h-7 px-2 text-xs"
-            onClick={() => setMode("source")}
-            title="原始 markdown"
-          >
-            <Code2 className="size-3.5" />
-            原文
-          </Button>
-        </div>
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
+        <FileText className="size-3.5" />
+        {phase.artifact.filename}
       </div>
       <div className="flex-1 overflow-y-auto">
-        {mode === "preview" ? (
-          <div className="prose prose-sm dark:prose-invert max-w-none px-6 py-4 prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={markdownComponents}
-            >
-              {phase.artifact.content}
-            </ReactMarkdown>
-          </div>
-        ) : (
-          <pre className="p-4 text-xs leading-relaxed whitespace-pre-wrap font-mono">
+        <div className="prose prose-sm dark:prose-invert max-w-none px-6 py-4 prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+          >
             {phase.artifact.content}
-          </pre>
-        )}
+          </ReactMarkdown>
+        </div>
       </div>
     </div>
   );
