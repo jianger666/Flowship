@@ -212,6 +212,28 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 
 ---
 
+## V0.5.3 ~ V0.5.7.1：持续打磨期（2026-05-18 ~ 20、已落地）
+
+V0.5 大动后用户密集联测、连续 5 天小迭代、每一档都跟 HANDOFF.md 同步。本节只列里程碑、细节看 HANDOFF。
+
+- ✅ **V0.5.3 ~ V0.5.4 图片附件**：revise / chat 支持贴图（用户截图说改这里）、`use-image-attach` hook 统一处理 paste / drop / file
+- ✅ **V0.5.5 plan / build / review 骨架精简**：三 phase artifact frontmatter 全删、直接从 `# 方案：xxx` 起头、减重复 + token 省
+- ✅ **V0.5.6.x ask_user 无限 + 稍后再补充 + plan 模板大改 + prompt 加严**：
+  - `ask_user` 去掉次数上限、AI 自判、加「稍后再补充」deferred 选项
+  - plan 模板大改：删 §1.1 对照、§3 接口表、§4 只放 3 类全局决策、§6 待澄清
+  - 自由 chat 模式禁用 ask_user（chat = talk、不弹问卷）
+  - plan-runner 写完 artifact 强制自检（黑名单 grep / ack 位置 / 路径完整性）
+  - 路径行号支持 `cursor://file/path:line:column` 跳转
+- ✅ **V0.5.7 统一推进入口**：合并「继续监听 + 重启 workflow」为「推进」按钮 + AdvanceDialog 三选一（resume / fork / restart）、resume 失败（NGHTTP2_ENHANCE_YOUR_CALM）后端自动降级 fork、删 `/resume-waiting` 路由、fork 时下游 phase 全 reset pending
+- ✅ **V0.5.7.1 fork reason + fix mode**：fork dialog 加 textarea 让用户填「想修什么 bug」、forkBanner 加 fix 模式判定段、AI 看到已有 artifact → fix 模式（read 旧 + git diff + 不 rewrite + 用 `edit`）、看不到 → 正常做
+
+**待联测**：
+
+- 🚧 **fix mode 真任务测**：跑一遍跑出 bug → fork build + textarea 填 bug → AI 是否真的只 edit 不 rewrite
+- 🚧 **fork downstream phase reset 验证**：fork build 后 UI 上 review 应该回 pending（不再是「待确认」）
+
+---
+
 ## V0.6 / W6：飞书 MCP 自动拉文档（未启动、V0.5 跑稳后再开）
 
 **目标**：用户只输入 storyId、自动拉飞书需求 + swagger

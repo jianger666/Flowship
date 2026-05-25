@@ -17,12 +17,25 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 
 ## 设计权威源
 
-**代码 + `docs/HANDOFF.md`**——其余 docs/*.md（DESIGN / ROADMAP / MULTI-ROLE / PRODUCT-COMPARISON 等）为辅助、有冲突以代码 + HANDOFF 为准。设计层面变动直接落代码 + 同步更新 HANDOFF V0.x 演进段。
+**代码 + `docs/HANDOFF.md`**——其余 docs/*.md（DESIGN / ROADMAP / MULTI-ROLE / PRODUCT-COMPARISON 等）为辅助、有冲突以代码 + HANDOFF 为准。
+
+### 文档分工（V0.5.11 起、避免 HANDOFF 越撑越大）
+
+- **`docs/HANDOFF.md`**（接力第一文件、~300 行）：项目定位 + 最小上下文 + 代码层面要点 + **当前架构快照**（V0.5 系列稳定描述、不带版本号）+ **最近演进**（窗口式、保留最近 2 个子版本）+ 关键文件索引
+- **`docs/CHANGELOG.md`**（历史档案、~2000 行）：V0.2 ~ 最新前两版的全部演进细节、时间倒序（新在上）
+
+### 设计层面变动「下次记账规则」
+
+1. **当前架构变动**（如 phase 模型改、保活机制改、新增大组件）→ 改代码 + 同步更新 `HANDOFF.md`「当前架构快照」段
+2. **小步迭代**（同主题连续 .1 / .2 / .3 微调）→ 改代码 + 写到 `HANDOFF.md`「最近演进」段顶部
+3. **再老一轮时**（「最近演进」积压超过 2 个子版本）→ 把最老那段迁到 `docs/CHANGELOG.md` 顶部、HANDOFF.md 始终保持 2 个子版本窗口
+4. ⛔ **不要**散落到其它 md 写一份新的演进段
+5. ⛔ **不要**往 HANDOFF.md 中间段插新版本（中间段是「当前架构快照」、不带版本号、改了一定是架构级变动、追加到段尾或刷新对应字段、不是「插一个 V0.5.X」）
 
 ## 关键约束（不要踩雷）
 
 - **HITL 是底线**——别提"全自动"、所有 phase 之间必须人 ack
-- **单 SDK Run**：整条 workflow（plan → build）跑在一个 Cursor SDK Run 里、phase 间阻塞等用户 ack（不每 phase 起新 Run、省 Cursor 计费）
+- **单 SDK Run**：整条 workflow（plan → build → review）跑在一个 Cursor SDK Run 里、phase 间阻塞等用户 ack（不每 phase 起新 Run、省 Cursor 计费）
 - **保活走 shell + curl long-poll**（V0.3.5）：`wait_for_user` / `ask_user` MCP 工具立即返回 shell 引导、agent 调 `shell` curl 一条长 HTTP 连接到 `/api/tasks/[id]/wait-ack`、服务端阻塞、用户 ack 时 resolve promise → 写一行结果 → 关流 → agent 推进。**不**用 keep_alive_a/b/c 那套（已删）。
 - **不接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
 - **思考和回复永远用中文**
@@ -40,12 +53,8 @@ plan → build → review
 - **build**：SDK Agent 按 plan 写代码 + 跑 hooks → `artifacts/02-build.md`
 - **review**：跑 git diff、对照 plan / 飞书需求、出 4 类差异报告 → `artifacts/03-review.md`
 
-历史演进：
-- V0.2 是 `context → plan → build → ship`（4 phase）
-- V0.3.3 砍了 ship（注意力管理、先把 plan / build 做扎实、不是因为效果不稳）
-- V0.3.4 把 context 合进 plan（实操中分离价值未兑现、用户审 context 跟审 plan 判断点重合、合并后 plan 一气呵成 1 次 ack）
-- V0.5 重新加 review phase（形态变成「review、不是 ship」、专注代码层校验、不动 PR / 飞书）
-- V0.5.5（2026-05-19）：plan / build / review 三 phase 骨架 frontmatter 全删、artifact 直接从 `# 方案：xxx` 起头
+历史演进细节看 `docs/CHANGELOG.md`、关键转折点：
+- V0.2 4 phase `context → plan → build → ship` → V0.3.3 砍 ship → V0.3.4 context 合进 plan → V0.5 重新加 review（不是 ship、专注代码层校验、不动 PR / 飞书）
 
 V1 legacy 模式（chat-only）的代码保留、新功能不再往那边加。
 

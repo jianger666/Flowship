@@ -28,6 +28,17 @@
 >   8. 弹窗文案统一极简化
 >   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.1」段（含全 commit 清单 + 用户拍板理由）。
 > - **V0.5.2（「再聊聊」意图二分、2026-05-18 收尾）**：把「补意见」按钮改名「再聊聊」、agent 在 ask_user 复述时让用户选「我想改 / 我想问 / 先答再决定」、Path A 改 artifact、Path B 仅答疑（严禁 `edit` / `write`、只读 `read`/`grep`/`glob` OK）、Path C 先答疑再决定。**协议层不动**——复用 `[PHASE_ACK revise]` 通道、不新加 API。原 V0.5.1 §10 方向 A（新加「问 AI」按钮 + 新协议）的简化版、UI 改一个文案 + prompt 改 D-scheme 即可。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.2」段。
+> - **V0.5.3 ~ V0.5.4（图片附件、2026-05-18 ~ 19）**：revise feedback / chat 都支持携带图片（用户截图说改这里）、`use-image-attach` hook 统一处理 paste / drop / file input、大小限制 + base64 编码。详见 [HANDOFF.md](./HANDOFF.md) 对应段。
+> - **V0.5.5（plan / build / review 骨架精简、2026-05-19）**：三 phase 骨架 frontmatter 全删、artifact 直接从 `# 方案：xxx` 起头、避免 plan / build 重复 review 已有内容、减少 token。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.5」段。
+> - **V0.5.6.x（ask_user 无限 + 稍后再补充 + plan 模板大改 + prompt 加严、2026-05-19 ~ 20）**：
+>   1. `ask_user` 去掉次数上限、AI 自判要不要问、新增「稍后再补充」deferred 选项
+>   2. plan 模板大改：删 §1.1「我的理解 vs 飞书原文」、§3 改成纯接口表、§4 只放 3 类全局决策（实施细节挪 §5 task）、§6 收纳「待澄清 / 不确定项」（含 deferred）
+>   3. 自由 chat 模式禁用 ask_user（chat 是 talk、不弹问卷）
+>   4. plan-runner 写完 artifact 强制自检（黑名单 grep 「或 / 约 / 节选」、ack 位置、路径完整性）
+>   5. 路径 + 行号支持 `cursor://file/path:line:column` 跳转（`src/lib/path-utils.ts` 加 `parsePathWithLine` / `buildCursorLink`）
+>   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.6.x」段。
+> - **V0.5.7（统一推进入口、2026-05-20 中午）**：合并历史的「继续监听」+ 「重启 workflow」为单一「推进」按钮 + `AdvanceDialog` 三选一（resume / fork / restart）。`resume` 失败（NGHTTP2_ENHANCE_YOUR_CALM）plan-runner 内部自动降级 fork。`/api/tasks/[id]/resume-waiting` 删、所有路径走 `/start-workflow`。fork 时 reset 所有下游 phase 为 pending（避免 UI 残留「待确认」）。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.7」段。
+> - **V0.5.7.1（fork reason + fix mode、2026-05-20 下午）**：fork 时 AdvanceDialog 加 textarea 让用户填「想修什么 bug」、plan-runner 的 forkBanner 加「fix 模式判定」段——让 AI 先 read 当前 phase 的 artifact、文件存在 → 进 fix 模式（read 旧 artifact + git diff、不 rewrite、按 reason 增量改、用 `edit` 不用 `write`），文件不存在 → 按 phase 指令正常做。解决「fork build 时 AI 可能 rewrite 上一轮代码」的不可控性。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.7」段下「补丁 V0.5.7.1」子节。
 >
 > **本文档下游各节的有效性**：
 >
