@@ -46,6 +46,11 @@ import {
   setChatAwaitingNotifier,
 } from "./chat-mcp";
 import { renderContextDocsSection } from "./context-docs-prompt";
+// V0.5.9：多仓 cwd helper
+import {
+  formatRepoSectionForPrompt,
+  getEffectiveCwd,
+} from "@/lib/path-utils";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -202,31 +207,22 @@ const buildInitialPrompt = (
     "5. shell stdout 返回时按内容走分支（见上「关键规则 3」）",
     "6. **不要 assistant_message 自言自语「等你回复中」/「我在监听」/「shell 在跑」之类**",
     "",
-    "## ask_user：对话中需要用户拍板时打包提问（V0.3.2、用户拍板：一次问完、ABCD 选项）",
+    "## ask_user：chat 模式禁用（V0.5.6.1 用户拍板）",
     "",
-    "如果回答用户时遇到不确定项（业务多种解读 / 技术多种选项 / 字段歧义）、可以调 `ask_user` MCP 工具打包提问。",
-    "对标 Cursor `askFollowUpQuestion`：选项自动加 A/B/C/D 字母前缀、modal 弹窗居中显示、答完一起提交。",
+    "**chat（自由聊天）任务里不要调 `ask_user` 工具**——chat 本质就是 talk、",
+    "有不确定项 / 想跟用户确认时**直接发一段 assistant_message 问就行**、用户在输入框答你。",
     "",
-    "**核心约束**：",
-    "  - **同一时刻只能调 1 次 ask_user**：把所有不确定项打包成 questions[]、不要一个一个问",
-    "  - 没问题就不调——直接 wait_for_user 等下一条消息",
+    "为什么 chat 禁用 ask_user（背景给你、避免想偏）：",
+    "  - chat 模式没有 artifact、ask_user 弹窗的「内联留痕到产物里」这个核心价值兑现不了",
+    "  - chat 已经是同步逐句对话、再拆出弹窗 + A/B/C/D 选项是过度结构化、对用户是干扰",
+    "  - 用户原话拍板：「自由 chat 模式下不用提问、直接回答、自由模式就是 talk 而已」",
     "",
-    "**入参**：",
-    `  - \`task_id=${task.id}\`、不传 phase（chat 模式没有 phase 概念）`,
-    "  - `questions`：数组、每条 `{ id, question, options, allow_text }`",
-    "    - `id`：唯一标识",
-    "    - `question`：问题正文 + 必要背景（≤ 200 字）",
-    "    - `options`：2-4 个具体选项、最多 6 个、UI 自动加 A/B/C/D",
-    "      - **严禁** 在 options[] 里塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项——UI 已经在选项底下统一渲染「以上都不是 / 自定义回答…」按钮",
-    "    - `allow_text`：保留默认 true",
+    "**chat 模式里 agent 想确认时的标准动作**：",
+    "  1. 直接 emit 一段 assistant_message、把多个不确定点用 markdown 自然语言列清楚（带具体 A/B/C 选项也行、但走文本不走弹窗）",
+    "  2. 调 wait_for_user 等用户在输入框回",
+    "  3. shell stdout 拿到 `[USER_REPLY]` 后按用户答案推进",
     "",
-    "**返回值**：",
-    "  - 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]`、按引导调 shell + curl 等弹窗 ack",
-    "  - shell stdout 拿到 `[ASK_USER_REPLY]` + markdown Q&A 文本：解析每条 A: 拿用户最终答案、按答案接着处理",
-    "",
-    "**调用礼仪**：",
-    "  - 调 ask_user **不要前置 assistant_message**「我先问几个问题」之类、UI modal 自动弹出来",
-    "  - shell stdout 拿到 [ASK_USER_REPLY] 后**不要复述**「你选了 X、所以我去 Y」、直接按答案推进",
+    "`ask_user` 工具仅用于 plan / build / review 这种有 artifact 的结构化产物——chat 任务里碰到它直接当不存在。",
     "",
     "## Skills（fe-ai-flow 自带能力扩展）",
     "",
@@ -239,7 +235,8 @@ const buildInitialPrompt = (
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "   - skill 文件可能引用其他文件（如 events.jsonl 绝对路径）、跟着读即可",
     "",
-    `## 任务 cwd（agent shell / read 默认基准目录）：${task.repoPath}`,
+    // V0.5.9：多仓时 cwd 是公共父目录、不是单 repoPath
+    `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths)}`,
     "",
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
     "",
@@ -595,7 +592,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     agent = await Agent.create({
       apiKey,
       model,
-      local: { cwd: task.repoPath },
+      // V0.5.9：cwd = effective（单仓 = 仓自身、多仓 = 公共父目录）
+      local: { cwd: getEffectiveCwd(task.repoPaths) },
       mcpServers: mergedMcp,
     });
 
@@ -603,7 +601,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     //
     // 为什么不在 buildInitialPrompt 里直接加载：那是个同步函数、loadSkills 要读文件系统、
     // 拆开能避免 buildInitialPrompt 整体变 async（保持 prompt 构造的纯粹性、方便测试）。
-    const skills = await loadSkills(task.repoPath).catch((err) => {
+    // V0.5.9：skills 按 effective cwd 扫（单仓 / 多仓父目录、跨仓 skill 后续真踩到再细化）
+    const skills = await loadSkills(getEffectiveCwd(task.repoPaths)).catch((err) => {
       console.error("[chat-runner] loadSkills failed", err);
       return [];
     });

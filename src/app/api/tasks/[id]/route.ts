@@ -15,6 +15,7 @@ import {
   getTask,
   setTaskArchived,
   setTaskDisabledMcpServers,
+  setTaskUiLayout,
 } from "@/lib/server/task-fs";
 import { cancelChat } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
@@ -36,16 +37,18 @@ export const GET = async (_req: Request, { params }: Ctx) => {
   }
 };
 
-// PATCH 支持的字段：
-//   - archived: boolean —— 软删除归档（旧逻辑）
+// PATCH 支持的字段（当次只改一个、保持 API 简单）：
+//   - archived: boolean —— 软删除归档
 //   - disabledMcpServers: string[] | null —— 任务级 MCP 黑名单、null/空 = 全开
-// 两者互斥校验、当次只改一个字段（保持 API 简单）
+//   - uiLayout: { artifactPanelSize?: number } | null —— V0.5.10 加、resizable 分栏比例持久化
+//     不返完整 task（拖动期间高频 PATCH、前端有自己的 state、不需要 round-trip 拿全量）
 export const PATCH = async (req: Request, { params }: Ctx) => {
   try {
     const { id } = await params;
     const body = (await req.json()) as {
       archived?: boolean;
       disabledMcpServers?: string[] | null;
+      uiLayout?: { artifactPanelSize?: number } | null;
     };
 
     if (typeof body.archived === "boolean") {
@@ -76,8 +79,30 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ task });
     }
 
+    if ("uiLayout" in body) {
+      // null = 清空回默认；object 时校验 artifactPanelSize 是数字
+      const value = body.uiLayout;
+      if (value === null) {
+        await setTaskUiLayout(id, undefined);
+        return NextResponse.json({ ok: true });
+      }
+      if (
+        typeof value !== "object" ||
+        (value.artifactPanelSize !== undefined &&
+          typeof value.artifactPanelSize !== "number")
+      ) {
+        return NextResponse.json(
+          { error: "uiLayout.artifactPanelSize 必须是数字或 undefined" },
+          { status: 400 },
+        );
+      }
+      await setTaskUiLayout(id, value);
+      // 不返完整 task：高频拖动期间 round-trip 全量没必要、前端 state 已经是源头
+      return NextResponse.json({ ok: true });
+    }
+
     return NextResponse.json(
-      { error: "需要 archived 或 disabledMcpServers 字段" },
+      { error: "需要 archived / disabledMcpServers / uiLayout 中的一个字段" },
       { status: 400 },
     );
   } catch (err) {

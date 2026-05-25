@@ -65,6 +65,27 @@ export const PHASE_LABEL_SHORT: Record<PhaseId, string> = {
 };
 
 /**
+ * 任务关联仓库的展示文案（V0.5.9 加、多仓适配）
+ *
+ * - 0 个 → "(未配置仓库)"
+ * - 1 个 → 完整路径
+ * - 多个 → 各仓 basename 用 " + " 拼接（视觉紧凑、给 task-card / page header 用）
+ *
+ * 完整路径展开版本在 hover tooltip 里给（调用方自己加 title 属性）。
+ */
+export const formatRepoPathsForDisplay = (paths: string[]): string => {
+  if (paths.length === 0) return "(未配置仓库)";
+  if (paths.length === 1) return paths[0];
+  return paths
+    .map((p) => {
+      const clean = p.replace(/\/+$/, "");
+      const idx = clean.lastIndexOf("/");
+      return idx >= 0 ? clean.slice(idx + 1) || clean : clean;
+    })
+    .join(" + ");
+};
+
+/**
  * 相对时间文案（任务卡片 / 事件流时间戳用）
  * 粒度足够：刚刚 / N 分钟前 / N 小时前 / N 天前
  * 不引第三方时间库（项目目前没用 dayjs / date-fns）、保持依赖轻

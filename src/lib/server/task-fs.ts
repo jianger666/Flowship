@@ -82,7 +82,7 @@ const taskDir = (id: string): string =>
 /**
  * 给 agent prompt 用的 events.jsonl 绝对路径。
  *
- * 为啥要绝对路径：agent 的 cwd 是 task.repoPath（用户的业务仓库）、
+ * 为啥要绝对路径：agent 的 cwd 是 task 的 effective cwd（V0.5.9 起：单仓 = 仓本身、多仓 = 公共父目录）、
  * 而 events.jsonl 在 fe-ai-flow 项目自己的 data/ 下、跨 cwd 必须用绝对路径
  * 否则 agent 调 `read` 工具时按 cwd 解析直接 ENOENT。
  *
@@ -327,9 +327,14 @@ interface TaskMeta {
   title: string;
   // 任务模式（V1 加、老数据没 → hydrate 时按 plan 兜底）
   mode?: TaskMode;
-  // V0.2 plan 模式下的 workflow 标识（feishu-story-impl 等）
+  // V0.2 plan 模式下的 workflow 标识(feishu-story-impl 等)
   workflowId?: WorkflowId;
-  repoPath: string;
+  // V0.5.9：仓库路径数组、支持单仓 / 多仓
+  // - 新数据只写这个、不写下面的 legacy `repoPath`
+  // - 老数据（V0.5.9 前）只有 `repoPath` 单值、`hydrateTaskSummary` 兼容兜底（包成 [repoPath]）
+  repoPaths?: string[];
+  /** @deprecated V0.5.9 起改用 repoPaths、读老 meta.json 时 hydrate 层 fallback、新数据不再写 */
+  repoPath?: string;
   // V0.2 主要入口（飞书 story / 项目链接）
   // V0.4 起 chat 模式建任务也复用这个字段、统一以 feishuStoryUrl 为起点
   feishuStoryUrl?: string;
@@ -354,16 +359,24 @@ interface TaskMeta {
   archived?: boolean;
   createdAt: number;
   updatedAt: number;
-  // V0.3.5 加：上一个 SDK Agent 的 id、给 /resume-waiting 路由用
+  // V0.3.5：上一个 SDK Agent 的 id、给 /start-workflow（V0.5.7 mode=resume）路由用
   //   - 跑 plan workflow 时 plan-runner 持久化、agent 创建后立刻写
-  //   - shell long-poll 连接断 / anti-loop 踩了 / agent 退出 run、UI 上「继续监听」按钮调
-  //     /resume-waiting 路由用这个 id 走 Agent.resume + send 继续等用户 ack
+  //   - shell long-poll 连接断 / anti-loop 踩了 / agent 退出 run、UI 上「推进 → 让原 agent 继续」调
+  //     /start-workflow（mode=resume）用这个 id 走 Agent.resume + send 继续等用户 ack
   //   - +1 send 配额、但只在异常路径才付出、绝大多数顺路 ack 不花
   lastAgentId?: string;
   // V0.5.1：任务级模型选择（创建时表单里挑、可跟 settings.defaultModel 不同）
   // - 启动 workflow / chat 时优先用 task.model、回退 settings.defaultModel
   // - 老数据没此字段、hydrate 时按 undefined（调用方再 fallback）
   model?: ModelSelection;
+
+  // V0.5.10：任务级 UI 布局偏好（持久化用户拖拽的分栏比例）
+  // - 详情页左右双栏（artifact + event-stream）resizable handle 拖完 → debounce 500ms 写
+  // - artifactPanelSize：artifact 栏宽度百分比、ResizablePanel onLayout(sizes) 拿到的 sizes[0]
+  // - 老数据没此字段、UI 默认 70/30、不写 meta.json 不污染（保持 undefined）
+  uiLayout?: {
+    artifactPanelSize?: number;
+  };
 }
 
 // 自动归档：completed / failed 且 7 天没动 → archived=true
@@ -585,7 +598,14 @@ const hydrateTaskSummary = (meta: TaskMeta): TaskSummary => ({
   workflowId: meta.workflowId,
   // V0.4：老数据没 role 字段、按 "fe" 兜底（V0.4 之前只支持前端、安全推断）
   role: meta.role ?? "fe",
-  repoPath: meta.repoPath,
+  // V0.5.9：老 meta 用 `repoPath` 单值、新 meta 写 `repoPaths` 数组
+  // hydrate 层做双向兼容：优先用 repoPaths、退化到 [repoPath]、最差给 []
+  repoPaths:
+    meta.repoPaths && meta.repoPaths.length > 0
+      ? meta.repoPaths
+      : meta.repoPath
+        ? [meta.repoPath]
+        : [],
   feishuStoryUrl: meta.feishuStoryUrl,
   description: meta.description,
   contextDocs: meta.contextDocs ?? [],
@@ -597,6 +617,7 @@ const hydrateTaskSummary = (meta: TaskMeta): TaskSummary => ({
   updatedAt: meta.updatedAt,
   lastAgentId: meta.lastAgentId,
   model: meta.model,
+  uiLayout: meta.uiLayout,
 });
 
 const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
@@ -834,20 +855,24 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
 
   // V0.4：chat 模式所有字段选填
   // - title 不填：用「未命名对话 MM-DD HH:mm」占位
-  // - repoPath 不填：用 os.homedir()（agent 默认 cwd 在用户 home、不绑特定项目）
-  // plan 模式保持原约束（title + repoPath + feishuStoryUrl 必填、上层 API 路由校验）
+  // - repoPaths 不填：用 [os.homedir()]（agent 默认 cwd 在用户 home、不绑特定项目）
+  // plan 模式保持原约束（title + repoPaths + feishuStoryUrl 必填、上层 API 路由校验）
   const finalTitle =
     input.title && input.title.trim()
       ? input.title.trim()
       : mode === "chat"
         ? buildDefaultChatTitle(now)
         : input.title;
-  const finalRepoPath =
-    input.repoPath && input.repoPath.trim()
-      ? input.repoPath.trim()
+  // V0.5.9：repoPaths 数组化、空数组 / undefined 时按 mode 兜底
+  const trimmedRepoPaths = (input.repoPaths ?? [])
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  const finalRepoPaths =
+    trimmedRepoPaths.length > 0
+      ? trimmedRepoPaths
       : mode === "chat"
-        ? os.homedir()
-        : input.repoPath;
+        ? [os.homedir()]
+        : trimmedRepoPaths;
 
   const meta: TaskMeta = {
     id: newTaskId(),
@@ -857,7 +882,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     // V0.4：role 默认 "fe"（当前 enum 只这一个值、UI 可选但实际只有这个选项）
     // 未来扩枚举（be / data / mobile / qa）时、UI 选择器会暴露多个值、这里也按 input 取
     role: input.role ?? "fe",
-    repoPath: finalRepoPath,
+    // V0.5.9：写 repoPaths、不再写 legacy repoPath
+    repoPaths: finalRepoPaths,
     feishuStoryUrl: input.feishuStoryUrl,
     description: input.description,
     contextDocs: initialContextDocs,
@@ -904,7 +930,7 @@ export const setTaskDisabledMcpServers = async (
     return await hydrateTask(meta);
   });
 
-// V0.3.5: 持久化最近一次 SDK Agent 的 id、给 /resume-waiting 用
+// V0.3.5: 持久化最近一次 SDK Agent 的 id、给 /start-workflow（V0.5.7 mode=resume）用
 // 在 plan-runner Agent.create 成功后立刻调一次写下去、不动 updatedAt（避免污染时间线）。
 export const setTaskLastAgentId = async (
   id: string,
@@ -928,6 +954,36 @@ export const setTaskArchived = async (
     meta.archived = archived;
     await writeMeta(meta);
     return await hydrateTask(meta);
+  });
+
+/**
+ * V0.5.10：持久化任务级 UI 布局偏好（resizable 分栏拖完 → debounce 500ms 写）
+ *
+ * - artifactPanelSize：artifact 栏百分比（前端 onLayout(sizes) 的 sizes[0]、ResizablePanel 单位约定）
+ * - 不写事件、不动 updatedAt（UI 偏好不算业务进展、避免污染时间线 / 自动归档计时）
+ * - undefined / null 时清除偏好回到默认（极少用、保留口子）
+ *
+ * 返 void 不返 Task：前端有完整 task state、不需要刷新（拖动期间频繁 PATCH 也不该再去拼 task 回包）
+ */
+export const setTaskUiLayout = async (
+  id: string,
+  uiLayout: { artifactPanelSize?: number } | undefined,
+): Promise<void> =>
+  withTaskLock(id, async () => {
+    const meta = await readMeta(id);
+    if (!meta) return;
+    // 防呆：artifactPanelSize 必须落在 [10, 90]、超出按 clamp 处理（防前端 bug 写出 -1 / 200）
+    if (uiLayout?.artifactPanelSize != null) {
+      const v = uiLayout.artifactPanelSize;
+      if (!Number.isFinite(v)) {
+        return; // 非数字直接拒、不写
+      }
+      const clamped = Math.max(10, Math.min(90, v));
+      meta.uiLayout = { artifactPanelSize: clamped };
+    } else {
+      meta.uiLayout = undefined;
+    }
+    await writeMeta(meta);
   });
 
 export const deleteTask = async (id: string): Promise<boolean> => {

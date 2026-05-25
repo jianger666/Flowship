@@ -173,7 +173,9 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 {docs.map((doc) => (
                   <li
                     key={doc.id}
-                    className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/30 group"
+                    // min-w-0 是给嵌套 flex item 的兜底（虽然 li 本身是 flex container 不是 item、
+                    // 但内层 truncate span 的 min-w-0 单独够、这里加是防御性 + 跟新组件库一致）
+                    className="flex min-w-0 items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/30 group"
                   >
                     <span className="text-muted-foreground">
                       {renderTypeIcon(doc.type)}
@@ -181,8 +183,10 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                     <span className="font-medium text-foreground/90 shrink-0">
                       {doc.title}
                     </span>
+                    {/* truncate 在 flex item 上必须配 min-w-0、否则 flex item 默认 min-width:auto
+                        = 内容的 intrinsic min-width、长字符串撑破容器、ellipsis 不生效 */}
                     <span
-                      className="text-muted-foreground truncate flex-1"
+                      className="text-muted-foreground truncate flex-1 min-w-0"
                       title={doc.content}
                     >
                       {renderPreview(doc)}

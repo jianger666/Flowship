@@ -29,7 +29,7 @@
  *
  * - **token 不合法**：写一行 `[INVALID_TOKEN]\n` + end、curl exit 0、agent 看到 INVALID_TOKEN 自然结束 run
  * - **客户端断开（curl exit / max-time / 网络断）**：abort signal 触发、清 keepalive timer + close stream
- *   - **不清 pendingMap entry**：entry 留着、用户在 UI 点「继续监听」走 /resume-waiting 复用
+ *   - **不清 pendingMap entry**：entry 留着、用户在 UI 点「推进 → 让原 agent 继续」走 /start-workflow（mode=resume）复用
  * - **服务端进程重启**：pendingMap 内存丢、cold-start recovery 标 failed、UI 引导用户重新启动 task
  */
 
@@ -141,7 +141,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
         });
 
       // 客户端主动断（curl exit / max-time / 网络断）→ abort signal
-      // 注意：**不清 pendingMap entry**、留着给「继续监听」按钮复用
+      // 注意：**不清 pendingMap entry**、留着给「推进 → 让原 agent 继续」按钮复用
       req.signal?.addEventListener("abort", () => {
         if (closed) return;
         console.log(

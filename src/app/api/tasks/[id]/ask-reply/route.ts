@@ -25,7 +25,7 @@
  *
  * V0.3.3 改造（用户拍板：砍数据冗余）：
  *   - Q&A 不再单独 addContextDoc——之前每条 Q&A 写一条 contextDoc title=`Q: 问题`
- *     导致 ContextDocsPanel 被撑爆、且和 phase 1 artifact 的「上下文冲突已通过 ask_user 澄清」段重复
+ *     导致 ContextDocsPanel 被撑爆、且和 phase 1 artifact 正文内联的 `> ✅ ask_user 已确认：xxx` 备注（V0.5.6.1）重复
  *   - 现在单一数据源 = 01-plan.md artifact（agent 在 phase 1 prompt 教导下整理 Q&A 进 artifact）
  *   - 后续 phase 查重不再看 contextDocs、改 read 01-plan.md（V0.3.4 起 context 合进 plan）
  */
@@ -114,13 +114,13 @@ const buildReplyText = (
   deferred: boolean,
 ): string => {
   if (deferred) {
-    // 用户选「稍后再补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §7 待澄清
+    // 用户选「稍后再补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §6 待澄清
     // 把全部 Q 列出来让 agent 知道要写进 artifact 哪些「待澄清」项
     const sections: string[] = [
       "[ASK_USER_REPLY deferred]",
       "",
       "用户选择**稍后再补充**、未提供任何答案。",
-      "请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§7 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补充。",
+      "请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§6 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补充。",
       "**不要**再就这同一组问题重新调 ask_user——用户已明示稍后补、再问就是冒犯。",
       "",
       "未答问题清单：",
@@ -304,7 +304,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (updated) publishChatStreamEvent(task.id, { kind: "task", task: updated });
 
   // V0.3.3：Q&A 不再单独 addContextDoc——agent 在 phase 1 prompt 教导下会把答案整理进
-  // 01-plan.md 的「上下文冲突已通过 ask_user 澄清」段、单一数据源、UI 面板不再被 Q 撑爆
+  // 01-plan.md 正文内联的 `> ✅ ask_user 已确认：xxx` 备注（V0.5.6.1）、单一数据源、UI 面板不再被 Q 撑爆
 
   return new Response(
     JSON.stringify({ ok: true, task: updated ?? task }),

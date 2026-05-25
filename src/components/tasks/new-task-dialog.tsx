@@ -48,6 +48,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MultiSelect } from "@/components/ui/multi-select";
 import {
   Select,
   SelectContent,
@@ -80,8 +81,11 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [role, setRole] = useState<TaskRole>("fe");
   // 任务标题（chat 模式下也作为首条消息）
   const [title, setTitle] = useState("");
-  // 目标仓库绝对路径
-  const [repoPath, setRepoPath] = useState("");
+  // V0.5.9：目标仓库（数组、支持单选 / 多选）
+  // - plan 模式必填至少 1 个
+  // - chat 模式选填、空数组时后端兜底用 home 目录
+  // - 多仓时 effective cwd = getCommonParentDir(repoPaths)、AI 路径首段是仓名
+  const [repoPaths, setRepoPaths] = useState<string[]>([]);
   // 飞书项目链接（V0.4 起 plan/chat 共用同一字段、不再分 feishuUrl）
   // plan 模式：必填、agent 用来拉 story 详情页
   // chat 模式：选填、agent 当作上下文文档之一
@@ -133,7 +137,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     setMode("plan");
     setRole("fe");
     setTitle("");
-    setRepoPath("");
+    setRepoPaths([]);
     setFeishuStoryUrl("");
     setDescription("");
     setDisabledMcp([]);
@@ -147,16 +151,16 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
   // 可提交判定
   // V0.4：chat 模式全选填、任何输入都能直接提交（后端 task-fs.createTask 给默认值）
-  // plan 模式保留原约束：title + repoPath + feishuStoryUrl 必填
+  // V0.5.9：plan 模式保留原约束、把单 repoPath 校验改成 repoPaths.length > 0
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (mode === "plan") {
-      if (!title.trim() || !repoPath.trim() || !feishuStoryUrl.trim()) {
+      if (!title.trim() || repoPaths.length === 0 || !feishuStoryUrl.trim()) {
         return false;
       }
     }
     return true;
-  }, [submitting, title, repoPath, mode, feishuStoryUrl]);
+  }, [submitting, title, repoPaths, mode, feishuStoryUrl]);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -186,7 +190,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         // V0.4：角色（当前 enum 只有 fe、UI 显式选了再传）
         role,
         title: title.trim(),
-        repoPath: repoPath.trim(),
+        // V0.5.9：repoPaths 数组、空数组时后端按 mode 兜底
+        repoPaths,
         // V0.4：plan/chat 共用 feishuStoryUrl 字段、统一以飞书项目链接为起点
         feishuStoryUrl: feishuStoryUrl.trim() || undefined,
         description:
@@ -265,47 +270,52 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           </div>
 
           <div className="grid gap-1.5">
-            <Label htmlFor="t-repo">
+            <Label>
               {mode === "chat" ? "目标仓库（选填）" : "目标仓库 *"}
             </Label>
             {repos.length > 0 ? (
-              <Select
-                value={repoPath}
-                onValueChange={(v) => v && setRepoPath(v)}
-              >
-                <SelectTrigger id="t-repo" className="w-full min-w-0">
-                  <SelectValue
-                    placeholder="选择仓库"
-                    className="min-w-0 overflow-hidden"
-                  >
-                    {(value: unknown) => {
-                      if (typeof value !== "string" || !value) return "选择仓库";
-                      const r = repos.find((x) => x.path === value);
-                      if (!r) return value;
-                      return (
-                        <span className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
-                          <span className="shrink-0 font-medium">{r.name}</span>
-                          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                            {r.path}
-                          </span>
-                        </span>
-                      );
-                    }}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {repos.map((r) => (
-                    <SelectItem key={r.path} value={r.path}>
-                      <div className="flex flex-col items-start">
-                        <span className="font-medium">{r.name}</span>
-                        <span className="text-xs text-muted-foreground">
+              <MultiSelect<RepoConfig>
+                options={repos}
+                value={repoPaths}
+                onChange={setRepoPaths}
+                getKey={(r) => r.path}
+                placeholder="选择仓库（可多选）"
+                // 列表项：上 name 下 path、两行展示
+                renderOption={(r) => (
+                  <>
+                    <span className="block w-full truncate font-medium">
+                      {r.name}
+                    </span>
+                    <span className="block w-full truncate text-xs text-muted-foreground">
+                      {r.path}
+                    </span>
+                  </>
+                )}
+                // trigger 自定义：1 个 → name + path 一行；多个 → 「已选 N 个 + projA + projB」
+                renderTrigger={(selected) => {
+                  if (selected.length === 1) {
+                    const r = selected[0]!;
+                    return (
+                      <>
+                        <span className="shrink-0 font-medium">{r.name}</span>
+                        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                           {r.path}
                         </span>
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                      </>
+                    );
+                  }
+                  return (
+                    <>
+                      <span className="shrink-0 font-medium">
+                        已选 {selected.length} 个
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                        {selected.map((r) => r.name).join(" + ")}
+                      </span>
+                    </>
+                  );
+                }}
+              />
             ) : mode === "chat" ? (
               <EmptyHint size="sm">
                 还没配置仓库——自由对话默认在你 home 目录跑、不绑特定项目也没关系。需要绑仓库就先去 <strong>设置</strong> 加一个
@@ -315,11 +325,15 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 还没配置仓库、先去 <strong>设置</strong> 加一个、回来再建任务
               </EmptyHint>
             )}
-            {mode === "chat" && (
+            {mode === "chat" ? (
               <p className="text-xs text-muted-foreground">
-                选填、不填 agent 默认 cwd 在你 home 目录（适合纯聊天 / 查资料 / 写脚本）
+                选填、不选 agent 默认 cwd 在你 home 目录（适合纯聊天 / 查资料 / 写脚本）
               </p>
-            )}
+            ) : repoPaths.length > 1 ? (
+              <p className="text-xs text-muted-foreground">
+                多仓场景：agent cwd = 公共父目录、AI 视角下面挂这 {repoPaths.length} 个 git 仓子目录、写路径首段是仓名
+              </p>
+            ) : null}
           </div>
 
           {mode === "plan" ? (
@@ -510,3 +524,4 @@ const ModeCard = ({ active, onClick, icon, title, desc }: ModeCardProps) => (
     </div>
   </ChoiceButton>
 );
+

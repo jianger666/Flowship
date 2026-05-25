@@ -146,7 +146,7 @@ const ReviseDialogImpl = ({
             onChange={(e) => setDraft(e.target.value)}
             onPaste={onPaste}
             rows={6}
-            placeholder="想改的地方、有疑问、想问问 AI——都行。可粘贴 / 拖拽 / 附图。AI 会先弹窗复述、再判断要不要动 artifact"
+            placeholder="想改、想问、或者贴图说明（支持粘贴 / 拖拽）"
             autoFocus
           />
           {/* 隐藏 input：附图按钮触发它 */}

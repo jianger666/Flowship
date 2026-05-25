@@ -150,6 +150,26 @@ export const setTaskDisabledMcpServers = async (
 };
 
 /**
+ * V0.5.10：更新任务级 UI 布局偏好（resizable 分栏拖完 → debounce 500ms 写）
+ *
+ * @param uiLayout 布局偏好；null = 清空回默认（极少用、保留口子）
+ *
+ * - 不返完整 task：拖动期间高频 PATCH、前端 state 已是源头、不需要 round-trip 全量
+ * - 服务端约束 artifactPanelSize ∈ [10, 90]、超出会被 clamp（防前端 bug 写出 -1 / 200）
+ */
+export const setTaskUiLayout = async (
+  id: string,
+  uiLayout: { artifactPanelSize?: number } | null,
+): Promise<void> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uiLayout }),
+  });
+  await handleJson<{ ok: true }>(res);
+};
+
+/**
  * 按 task.disabledMcpServers 过滤全量 mcpServers
  *
  * 用在 sendChatReply / startWorkflow 调用前：UI 拿全量 mcpServers（从 settings 解析）、
@@ -409,49 +429,54 @@ export const sendChatReply = async (
 // ----------------- Plan workflow（V0.2） -----------------
 
 /**
- * 启动 plan workflow agent run（一次 SDK Run 跑全程 3 phase：plan → build → review、V0.5）
+ * V0.5.7：plan workflow 统一推进入口（一次 SDK Run 跑全程 3 phase：plan → build → review）
+ *
+ * 三种推进模式（mode）：
+ *   - resume  : Agent.resume(lastAgentId) 续接旧 agent、保留对话历史
+ *               backend 拒（NGHTTP2_ENHANCE_YOUR_CALM）时 plan-runner 内部自动降级 fork
+ *   - fork    : Agent.create 新 agent + super-prompt 顶部 fork banner、从 fromPhase 起跑
+ *               fromPhase 必填、上游 artifact 复用
+ *   - restart : Agent.create 新 agent 从 plan 重头跑（覆盖所有 artifact）
+ *
+ * 缺省 mode = "restart"（向后兼容）。
  *
  * 行为：幂等、立即返回 task；已 spawn 则返 already=true。SSE 订阅走 watchChatStream（路由复用）。
+ *
+ * 历史：V0.5.7 之前分两个函数 startWorkflow（restart）+ resumeWaiting（resume）、UI 上呈现为
+ * 两个按钮「重启 workflow」+ 「继续监听」、用户视角混乱。V0.5.7 合并为单一入口、UI 上由
+ * AdvanceDialog 让用户在 resume / fork / restart 之间选。
  */
+export type StartWorkflowMode = "resume" | "fork" | "restart";
+
+export interface StartWorkflowOptions {
+  mode?: StartWorkflowMode;
+  fromPhase?: PhaseId;
+  // V0.5.7.1：fork 时用户填的「想修什么 / 重启原因」、透传到 plan-runner 的 forkBanner、
+  // 让 AI fork 同 phase 时知道这次是 fix 模式、读 git diff + reason 增量改、不 rewrite。
+  // 留空 = 用户没明说（多见于「上次跑挂了重启」场景）、AI 自己看 git diff 决定
+  reason?: string;
+}
+
 export const startWorkflow = async (
   taskId: string,
   apiKey: string,
   model: ModelSelection,
   mcpServers: Record<string, McpServerConfig> | undefined,
+  options?: StartWorkflowOptions,
 ): Promise<{ task: Task; already: boolean }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/start-workflow`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey, model, mcpServers }),
-    },
-  );
-  return await handleJson<{ ok: true; task: Task; already: boolean }>(res);
-};
-
-/**
- * V0.3.5：续接 wait-ack 长连接（用户在 UI 点「继续监听」）
- *
- * 触发：wait_for_user → shell + curl 长连接异常断开后、agent 自然结束 run、task status=failed
- * 但 task.lastAgentId 还在、用户可以选择「继续监听」用 Agent.resume 把 agent 叫醒续接
- *
- * 服务端：POST /api/tasks/[id]/resume-waiting
- *   - Agent.resume(lastAgentId) + send 一条 RESUME prompt
- *   - runPlanWorkflow 在 isResume=true 时跳过 phase_start、保留 phase 状态、taskStatus 切 running
- */
-export const resumeWaiting = async (
-  taskId: string,
-  apiKey: string,
-  model: ModelSelection,
-  mcpServers: Record<string, McpServerConfig> | undefined,
-): Promise<{ task: Task; already: boolean }> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/resume-waiting`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey, model, mcpServers }),
+      body: JSON.stringify({
+        apiKey,
+        model,
+        mcpServers,
+        mode: options?.mode,
+        fromPhase: options?.fromPhase,
+        reason: options?.reason,
+      }),
     },
   );
   return await handleJson<{ ok: true; task: Task; already: boolean }>(res);
@@ -569,7 +594,7 @@ export const removeContextDoc = async (
  * V0.5.6 deferred 模式（用户拍板）：
  *   - 用户点弹窗里「稍后再补充」→ 不答任何问题、传 deferred=true、answers 可以为空
  *   - 服务端把 reply 包装成 `[ASK_USER_REPLY deferred] ...` 头给 agent
- *   - agent 看到 deferred 头时跳过这一组 Q、按 default 推进、把问题写进 artifact §7 待澄清
+ *   - agent 看到 deferred 头时跳过这一组 Q、按 default 推进、把问题写进 artifact §6 待澄清
  *   - 用户后续可以在「再聊聊」或上下文文档里补
  */
 export const submitAskReply = async (

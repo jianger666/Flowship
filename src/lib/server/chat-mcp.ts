@@ -49,8 +49,8 @@
  * - 不做 MCP session id：stateless 就好、我们靠 task_id 自己管状态
  * - 不做并发去重：同一个 task 同时只允许一个 pending entry、新 wait_for_user 顶旧的
  * - 不做 dev hot reload 状态恢复：开发时模块重载会丢 pendingMap、能接受
- * - **不做断线自动重试**：连接断了 agent 自然退 run、用户在 UI 上点「继续监听」
- *   走 /resume-waiting：Agent.resume + send 引导 agent 重新调 wait_for_user
+ * - **不做断线自动重试**：连接断了 agent 自然退 run、用户在 UI 上点「推进」、
+ *   走 /start-workflow（mode=resume）：Agent.resume + send 引导 agent 重新调 wait_for_user
  *   （避免 agent 反复重试踩 anti-loop、且老套餐 resume 也要 +1 send 配额）
  */
 
@@ -81,7 +81,7 @@ export type ToolReturn = {
   // user_reply：chat 模式、真正的用户消息文本（agent 该接着处理）
   // phase_approve：workflow 模式、用户点了「通过」、agent 该进下一 phase
   // phase_revise：workflow 模式、用户点了「再聊聊」（V0.5.2 文案、协议名沿用 revise）
-  // V0.5.5 起按 feedback 清晰度分流：A 明确改 / B 明确问 / C 含混 / D 带图、详见 super-prompt §3 revise 解读
+  // V0.5.10 起按 feedback 是否纯疑问句分 2 类：问类 → event-stream 答疑、改类 → 先弹 ask_user 复述再 edit、详见 super-prompt §3 revise 解读
   // stale：被新一轮 wait_for_user 顶掉、agent 直接放弃这次返回即可
   // cancelled：任务被取消、agent 该结束 run
   kind:
@@ -540,7 +540,7 @@ const buildShellWaitGuidance = (
     "",
     "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳、忽略它**。它的唯一意义是告诉你「连接还活着、用户还没操作」。看到再多 KEEPALIVE 都是正常的、**绝对不要**因此 summarize 退出 / 调 read 检查 terminal / 重新调 wait_for_user / 调其他工具自救。",
     "  - `[PHASE_ACK approve]`：用户在 UI 点了「通过」、shell 命令立刻 exit 0、按 prompt 推进下一 phase",
-    "  - `[PHASE_ACK revise] <feedback 文本>`：用户点了「再聊聊」（V0.5.5 起按清晰度分流）——A 明确改 → 直接 edit；B 明确问 → 直接 emit answer；C 含混 → 调 ask_user 复述；D 带图 → 先 read 图。完事都再调一次 wait_for_user（详见 super-prompt §3 revise 解读）",
+    "  - `[PHASE_ACK revise] <feedback 文本>`：用户点了「再聊聊」（V0.5.10 起 2 分类铁则）——问类（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗；改类（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗?」、用户 ✅ 才 edit；带图先 read 图再分类。完事都再调一次 wait_for_user（详见 super-prompt §3 revise 解读）",
     "  - `[USER_REPLY] <markdown Q&A 文本>`：chat 模式用户回复 / ask_user 答完、按内容推进",
     "  - `[CANCELLED]`：任务被取消、收尾结束 run",
     "  - `[STALE]` / `[INVALID_TOKEN]`：本 token 已失效、不要重试、自然结束 run",
@@ -566,8 +566,8 @@ const buildShellWaitGuidance = (
     "",
     "  - **不要重新调 shell 重试** —— anti-loop 风险、且重试不能恢复连接",
     "  - **不要重新调 wait_for_user / ask_user** —— 会被服务端顶替成 stale",
-    "  - **直接 emit 一条简短 assistant_message** 说「监听连接异常断开、请在 fe-ai-flow 看板点『继续监听』」，然后自然结束 run",
-    "  - UI 已经监测到连接断、用户会手动点「继续监听」、后端会用 `Agent.resume()` 把你叫醒、你重新调 wait_for_user 即可",
+    "  - **直接 emit 一条简短 assistant_message** 说「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」，然后自然结束 run",
+    "  - UI 已经监测到连接断、用户会手动点「推进」→ 在弹窗里选「让原 agent 继续推进」、后端会用 `Agent.resume()` 把你叫醒、你重新调 wait_for_user 即可",
     "",
     "## 调用礼仪",
     "",
@@ -673,7 +673,7 @@ const buildMcpServer = (): McpServer => {
   //     比如初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项
   //     直到所有问题都收敛到明确决策（A 路径）才 wait_for_user
   //   - V0.5.6 加 defer：用户可在 UI 弹窗点「稍后再补充」、agent 拿 [ASK_USER_REPLY deferred]
-  //     跳过这组 Q、按 default 推进、列进 artifact §7 待澄清——给用户一个退出循环的口子
+  //     跳过这组 Q、按 default 推进、列进 artifact §6 待澄清——给用户一个退出循环的口子
   //
   // 返回值：拼接成 markdown 的文本、agent 直接读、按头部协议分两种走法：
   //   - 用户答了：`[ASK_USER_REPLY]\nQ1: ...\nA: ...\n\nQ2: ...\nA: ...`
@@ -689,6 +689,12 @@ const buildMcpServer = (): McpServer => {
       description: [
         "phase 内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、阻塞等用户在 UI 弹窗里答完整组。",
         "对标 Cursor `askFollowUpQuestion`：UI 出选项按钮 + 可选自由文本输入。",
+        "",
+        "## ⚠️ chat 任务禁用（V0.5.6.1 用户拍板）",
+        "",
+        "**本工具只用于 plan / build / review 这种有 artifact 的结构化产物**。chat（自由聊天）任务里**不要调本工具**——",
+        "chat 模式有问题想跟用户确认时、**直接 emit 一段 assistant_message 问**就行（用 markdown 列清楚 A/B/C 选项也可以、但走文本不走弹窗）、然后正常 wait_for_user 等用户回。",
+        "用户原话：「自由 chat 模式下不用提问、直接回答、自由模式就是 talk 而已」。",
         "",
         "## 关键约束（V0.5.6 重写：无次数上限、按内容收敛）",
         "",
@@ -721,14 +727,14 @@ const buildMcpServer = (): McpServer => {
         "- 立即返回 `[SHELL_WAIT_GUIDE token=xxx]`、文本里附完整 curl 命令——调一次 `shell` 工具跑这条命令、长连接挂在 /api/tasks/:id/wait-ack",
         "- 用户在弹窗答完后、shell stdout 可能拿到两类头：",
         "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按 A/B/C/D 分级处理（A 直接落 artifact；C 模糊 → 再调一次 ask_user 给具体选项）",
-        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§7 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
+        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§6 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续 wait_for_user",
         "- 其他可能 stdout 行：`[CANCELLED]`（用户取消任务）/ `[STALE]`（旧 token 被新 wait_for_user 顶替）/ `[INVALID_TOKEN]`",
         "- **不**要再调 keep_alive_a/b/c（V0.3.5 已删）、调一次 ask_user 即结束本工具调用、剩下全交给 shell long-poll",
         "",
         "## 调用礼仪",
         "",
         "- 调用前 / 后不要 assistant_message 解释「我先问几个问题」「我再问一次」之类、UI modal 会自动弹出来",
-        "- 答完后不要复述「你刚才选了 X」、直接按答案推进、写到 artifact 的「上下文冲突已通过 ask_user 澄清」段",
+        "- 答完后不要复述「你刚才选了 X」、直接按答案推进、在 artifact 正文（§1 / §3 / §4 等结论引用处）就地加 `> ✅ ask_user 已确认：用户选 X` 内联备注（V0.5.6.1 起取消单独「上下文冲突」段、留痕走内联备注）",
         "- 答案**只**写到 artifact（01-plan.md）、**不再**自动落 contextDocs——单一数据源、避免重复",
       ].join("\n"),
       inputSchema: {

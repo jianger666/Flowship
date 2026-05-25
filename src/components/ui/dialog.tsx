@@ -73,7 +73,14 @@ function DialogContent({
           className={cn(
             // grid 是为了让 gap-4 在 Popup 内部 stack（header / body / footer）生效——原版同款
             // relative 替代原 fixed top/left/transform、配合外层 wrapper 实现 mask 滚动
-            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+            //
+            // V0.5.9 hot-fix：`*:min-w-0` 防止 grid item 撑破 max-w 限制（用户实测踩到）
+            //   - dialog 内贴超长无空格字符串（日志 / URL / 序列化 JSON）时、grid item 默认 min-width:auto
+            //     = max-content of 内容、撑大 grid item 边界、超出 dialog max-w
+            //   - 加 `*:min-w-0`（Tailwind 4 短写、等价 `[&>*]:min-w-0`）让所有直接 children 可以收缩到 0、
+            //     内部 truncate / 自动折行才真正生效
+            //   - 如果你后面真有一个 dialog 想让内容撑大（罕见）、再单独 override
+            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 *:min-w-0",
             className
           )}
           {...props}

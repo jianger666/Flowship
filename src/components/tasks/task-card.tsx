@@ -28,6 +28,7 @@ import {
   STATUS_LABEL,
   STATUS_VARIANT,
   formatRelative,
+  formatRepoPathsForDisplay,
 } from "@/lib/task-display";
 import type { TaskSummary } from "@/lib/types";
 
@@ -104,9 +105,12 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
             </Badge>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1">
+            <span
+              className="flex items-center gap-1"
+              title={task.repoPaths.join("\n")}
+            >
               <FolderGit2 className="size-3.5" />
-              {task.repoPath || "(未配置仓库)"}
+              {formatRepoPathsForDisplay(task.repoPaths)}
             </span>
             {/* chat 模式没有 phase 概念、不展示「当前阶段」 */}
             {task.mode === "plan" && (

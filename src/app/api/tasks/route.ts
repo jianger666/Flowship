@@ -20,6 +20,14 @@ import {
 const isNonEmptyString = (v: unknown): v is string =>
   typeof v === "string" && v.trim().length > 0;
 
+// V0.5.9：repoPaths 必须是非空 string 数组、否则视为无效
+const sanitizeRepoPaths = (v: unknown): string[] => {
+  if (!Array.isArray(v)) return [];
+  return v
+    .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+    .map((p) => p.trim());
+};
+
 // 把 body.workflowId 转成强类型 WorkflowId、不在白名单的丢弃
 const sanitizeWorkflowId = (v: unknown): WorkflowId | undefined => {
   if (typeof v !== "string") return undefined;
@@ -48,12 +56,12 @@ export const POST = async (req: Request) => {
     // mode 校验：只接受 chat / plan、其他值都拒；不传时 createTask 会默认 plan（V0.2 起）
     const mode =
       body.mode === "chat" || body.mode === "plan" ? body.mode : undefined;
-    // V0.4：chat 模式所有字段选填、plan 模式仍要 title + repoPath（前端表单已校验、这里再兜一道）
-    // chat 模式 title / repoPath 缺省由 task-fs.createTask 兜底
+    // V0.5.9：repoPaths 数组替代 repoPath、plan 模式至少 1 个、chat 模式可空（task-fs 兜底 home）
+    const repoPaths = sanitizeRepoPaths(body.repoPaths);
     if (mode !== "chat") {
-      if (!isNonEmptyString(body.title) || !isNonEmptyString(body.repoPath)) {
+      if (!isNonEmptyString(body.title) || repoPaths.length === 0) {
         return NextResponse.json(
-          { error: "plan 模式 title 和 repoPath 必填" },
+          { error: "plan 模式 title 和 repoPaths 必填（至少 1 个仓库）" },
           { status: 400 },
         );
       }
@@ -62,7 +70,7 @@ export const POST = async (req: Request) => {
     const task = await createTask({
       // 不强行 trim：task-fs.createTask 内部会判空并按 mode 兜底（chat 给占位标题、用户 home）
       title: isNonEmptyString(body.title) ? body.title.trim() : "",
-      repoPath: isNonEmptyString(body.repoPath) ? body.repoPath.trim() : "",
+      repoPaths,
       mode,
       workflowId,
       role: sanitizeRole(body.role),

@@ -27,7 +27,7 @@
  * - enabled 开关：plan 任务详情页里 chat 模式不要订阅（ChatView 自己订）、传 false 跳过
  * - reconnectKey：调用方需要主动让 SSE 重连的场景下使用——
  *   服务端在 task 终态（failed/completed）时收到 watch-chat 请求会 bootstrap 完直接 close、
- *   后续用户点「继续监听」/ 「重启 workflow」/ fork 等让 agent 重新跑起来的入口、
+ *   后续用户点「推进」（V0.5.7、resume / fork / restart 三选一）等让 agent 重新跑起来的入口、
  *   光 setTask(latest) 不会触发 effect 重跑、客户端 SSE 已断 → 收不到新事件 → 必须刷页面、
  *   解法是调用方维护一个 epoch 计数、每次「让 agent 又活了」的成功路径 ++、effect dep 加它自然重连
  */

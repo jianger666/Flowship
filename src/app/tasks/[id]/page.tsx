@@ -22,7 +22,7 @@
  *   └──────────────────────────┴───────────────────────┘
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { notFound, useParams } from "next/navigation";
 import {
@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { AdvanceDialog } from "@/components/tasks/advance-dialog";
 import { ApprovePhaseDialog } from "@/components/tasks/approve-phase-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
@@ -47,26 +48,36 @@ import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
 import { Separator } from "@/components/ui/separator";
 import { useTaskWatch } from "@/hooks/use-task-watch";
-import { useDialog } from "@/hooks/use-dialog";
 
 import { getSettings } from "@/lib/local-store";
 import { prepareBootArgs, prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
-  resumeWaiting,
+  setTaskUiLayout,
   startWorkflow,
   submitPhaseAck,
   type ChatReplyImage,
+  type StartWorkflowMode,
 } from "@/lib/task-store";
-import { PHASE_LABEL, STATUS_LABEL, STATUS_VARIANT } from "@/lib/task-display";
+import {
+  PHASE_LABEL,
+  STATUS_LABEL,
+  STATUS_VARIANT,
+  formatRepoPathsForDisplay,
+} from "@/lib/task-display";
+import { getEffectiveCwd } from "@/lib/path-utils";
 import { WORKFLOWS, type PhaseId, type Task, type TaskEvent } from "@/lib/types";
 
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
   const id = params.id;
-  const { confirm } = useDialog();
   // 任务对象（含 events / phases / status 等）
   const [task, setTask] = useState<Task | null>(null);
   // loaded：首次 fetchTask 完成；为 false 时显示「加载中」、避免闪 not-found
@@ -86,8 +97,11 @@ const TaskDetailPage = () => {
   const [streamingText, setStreamingText] = useState("");
   // V0.5：phase ack 高级选项 dialog 开关（点「通过 PHASE」按钮打开、内部配模型/换 agent）
   const [approveDialogOpen, setApproveDialogOpen] = useState(false);
+  // V0.5.7：「推进」dialog 开关——合并历史的「继续监听」 + 「重启 workflow」按钮入口
+  // dialog 内部让用户选 resume / fork / restart 三种推进模式
+  const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
   // SSE 重连 epoch：上次任务终态后服务端会关流、客户端 useTaskWatch 不会自动重连——
-  // 任何让 agent 重新跑起来的成功路径（继续监听 / 重启 workflow / fork）++ 一下、让 useTaskWatch 重连
+  // 任何让 agent 重新跑起来的成功路径（推进 / fork）++ 一下、让 useTaskWatch 重连
   // 不然得手动刷新页面才能看到 agent 新事件
   const [watchEpoch, setWatchEpoch] = useState(0);
 
@@ -187,6 +201,46 @@ const TaskDetailPage = () => {
     };
   }, [approveDialogOpen]);
 
+  // V0.5.10：Resizable 分栏初始 size（artifact 栏百分比）
+  // - 从 task.uiLayout.artifactPanelSize 读、没就默认 70（artifact 大、event-stream 小）
+  // - ⚠️ react-resizable-panels 4.x 的 Panel.defaultSize/minSize/maxSize：
+  //     数字 → px（lib.js:19-21 case "number": return [e, "px"]）
+  //     字符串无单位 → %、`70%` 也 → %（lib.js:23 endsWith "%"）
+  //   V0.5.10 hot-fix（实测踩坑）：之前传数字 70、库当成 70px、用户拖动看不出变化（minSize=20px / maxSize=80px 范围只有 60px、相对 1200px 视口几乎没动）
+  //   正解：传字符串 "70%" 显式百分比
+  const artifactSizePercent = useMemo(() => {
+    const v = task?.uiLayout?.artifactPanelSize;
+    if (typeof v === "number" && v >= 10 && v <= 90) return v;
+    return 70;
+  }, [task?.uiLayout?.artifactPanelSize]);
+
+  // V0.5.10：debounce 写 task.uiLayout
+  // - onLayoutChanged 是「释放鼠标后」触发（区别于 onLayoutChange 在拖动中高频触发）
+  //   理论上释放后只触发一次、debounce 是双保险（用户连续点 reset / 拖动也只发最后一次）
+  // - 500ms 窗口：用户体感不延迟、又避免高频 PATCH（拖动期间多次释放也只写最后一次）
+  // - taskId 变化时清掉 pending timer、避免给新 task 写错布局
+  const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const writeLayoutDebounced = useCallback(
+    (taskId: string, artifactSize: number) => {
+      if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
+      writeTimerRef.current = setTimeout(() => {
+        // 失败不 toast 不抛、布局偏好属于「锦上添花」、写挂了下次拖动还能重写
+        void setTaskUiLayout(taskId, { artifactPanelSize: artifactSize }).catch(
+          (err) => {
+            console.warn("[uiLayout] PATCH 失败", err);
+          },
+        );
+      }, 500);
+    },
+    [],
+  );
+  useEffect(
+    () => () => {
+      if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
+    },
+    [],
+  );
+
   if (!loaded) {
     return <LoadingState variant="block" />;
   }
@@ -199,28 +253,28 @@ const TaskDetailPage = () => {
   const curStatus = task.phases[cur]?.status ?? "pending";
   const isChatMode = task.mode === "chat";
 
-  // ---- 启动 workflow run（plan 模式专用） ----
-  // V0.5.5：awaiting_user 状态下也允许重启（agent 还在等 ack、用户想换 agent 重跑测试用）
-  // 这种状态需要先 confirm + 服务端会 cancel 旧 agent 再启新 run、消耗 +1 配额
-  const handleStart = async () => {
+  // ---- V0.5.7：统一推进入口（合并历史的「启动 / 重启 workflow / 继续监听」）----
+  //
+  // mode 三选一、由 AdvanceDialog 让用户显式选：
+  //   - resume  : 复用旧 agentId、保留对话历史。backend 拒（NGHTTP2_ENHANCE_YOUR_CALM）时
+  //               plan-runner 内部自动降级 fork、用户视角一次推进就能续走
+  //   - fork    : 起新 agent 从 fromPhase 接力（上游 artifact 复用）
+  //   - restart : 起新 agent 从 Plan 完全重跑（覆盖现有 artifact）
+  //
+  // draft 状态（任务刚建、还没启动过）的特殊处理：
+  //   - 不弹 AdvanceDialog（resume/fork 都不可用、唯一选项 restart 等同于「启动 workflow」）
+  //   - 直接以 mode=restart 调 startWorkflow
+  const handleAdvance = async (
+    mode: StartWorkflowMode,
+    fromPhase?: PhaseId,
+    // V0.5.7.1：fork 时用户填的「想修什么 bug / 重启原因」、可空
+    reason?: string,
+  ) => {
     const args = prepareRunArgs(task);
     if (!args) return;
-    if (!task.feishuStoryUrl) {
-      // 软警告：plan 模式没飞书 story 链接、agent Phase 1 没东西拉
+    if (!task.feishuStoryUrl && mode === "restart") {
+      // 软警告：从头跑 + plan 模式没飞书 story 链接、agent Phase 1 没东西拉
       toast.warning("没填飞书 story 链接、Phase 1 上下文收集会跑空");
-    }
-
-    // awaiting_user 状态下点重启 = cancel 当前 agent + 从 plan 重头跑
-    // 容易误操作（用户可能想点「通过」）、先 confirm 告知后果
-    if (task.status === "awaiting_user") {
-      const ok = await confirm({
-        title: "重启 workflow？",
-        description: `当前 agent 正在等你 ack ${PHASE_LABEL[cur]}。重启会 cancel 旧 agent、起新 agent 从 plan 重头跑。\n\n消耗：+1 次 Agent.create 配额。已有 ${PHASE_LABEL[cur]} 产物会被覆盖。\n\n确定继续？`,
-        confirmLabel: "重启",
-        cancelLabel: "算了",
-        destructive: true,
-      });
-      if (!ok) return;
     }
 
     setStarting(true);
@@ -230,53 +284,26 @@ const TaskDetailPage = () => {
         args.apiKey,
         args.model,
         args.mcpServers,
+        { mode, fromPhase, reason },
       );
       setTask(latest);
+      setAdvanceDialogOpen(false);
       // 上次任务终态 watch-chat 服务端 bootstrap 完直接 close、客户端 SSE 已断、
       // ++ 这下让 useTaskWatch 重连、否则新 agent 推的事件没人收
       setWatchEpoch((n) => n + 1);
       if (already) {
         toast.info("workflow 已在跑、已为你接上事件流");
-      } else {
+      } else if (mode === "resume") {
+        toast.success("已叫醒原 agent 续接监听、马上能看到新事件");
+      } else if (mode === "fork") {
         toast.success(
-          "workflow 已启动、Phase 1（上下文收集）马上跑、整段计费一次跑到底",
+          `已起新 agent、从 ${PHASE_LABEL[fromPhase!]} 开始（上游 artifact 复用）`,
         );
-      }
-    } catch (err) {
-      toast.error(`启动失败：${(err as Error).message}`);
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  // ---- 继续监听：V0.3.5 wait-ack 连接断后 Agent.resume 续接 ----
-  // 触发场景：agent 调 wait_for_user → 调 shell + curl 长连接、连接异常断（网络断 / 服务重启 / max-time）
-  //   → agent 退 run、task status=failed、但 lastAgentId 还在
-  //   → 用户点这个按钮、走 Agent.resume + send RESUME prompt 把 agent 叫醒、重新调 wait_for_user
-  // 成本：+1 send 配额（用户老套餐 500 次月、不频繁断不痛）
-  const handleResumeWaiting = async () => {
-    const args = prepareRunArgs(task, { mcpErrorPrefix: "修好再续接" });
-    if (!args) return;
-
-    setStarting(true);
-    try {
-      const { task: latest, already } = await resumeWaiting(
-        task.id,
-        args.apiKey,
-        args.model,
-        args.mcpServers,
-      );
-      setTask(latest);
-      // 上次任务终态 watch-chat 服务端 bootstrap 完直接 close、客户端 SSE 已断、
-      // ++ 这下让 useTaskWatch 重连、否则新 agent 推的事件没人收（旧版本会卡在「要刷新页面」）
-      setWatchEpoch((n) => n + 1);
-      if (already) {
-        toast.info("agent 已经在跑、无需重复续接");
       } else {
-        toast.success("已请求 agent 续接监听、马上能看到新事件");
+        toast.success("workflow 已启动、agent 从 Plan 开始一气跑到底");
       }
     } catch (err) {
-      toast.error(`续接失败：${(err as Error).message}`);
+      toast.error(`推进失败：${(err as Error).message}`);
     } finally {
       setStarting(false);
     }
@@ -372,37 +399,39 @@ const TaskDetailPage = () => {
   };
 
   // ---- 按钮渲染条件（plan 模式） ----
-  // 启动按钮：draft / failed / completed / awaiting_user 四种状态显示
-  // V0.5.5：awaiting_user（agent 等 ack 中）也允许重启、方便测试新 prompt / 切模型重跑
-  // 点了会走 confirm 弹窗确认、避免误操作
-  const canStart =
+  // 「推进」按钮：draft / failed / completed / awaiting_user 四种状态显示
+  // V0.5.7：合并历史的「启动 workflow / 重启 workflow / 继续监听」三个按钮
+  //   - draft：唯一选项 restart、点了直接启动、不弹 dialog
+  //   - 其它状态：弹 AdvanceDialog 让用户选 resume / fork / restart
+  const canAdvance =
     task.status === "draft" ||
     task.status === "failed" ||
     task.status === "completed" ||
     task.status === "awaiting_user";
 
-  // V0.3.5：「继续监听」按钮显示条件
-  //   - task.status === "failed"：agent 已退、需要叫醒（包括 wait-ack 断连场景）
-  //   - task.lastAgentId 存在：agent 至少跑过一次、能 resume
-  //   - 跟「重启 workflow」按钮并列、用户根据情况选其中之一（连接断了点续接、真错误点重启）
-  const canResume =
-    task.status === "failed" && !!task.lastAgentId && task.mode === "plan";
-
   // ack 按钮：当前 phase 处于 awaiting_ack（agent 等用户拍板）
   // V0.3.3：必须 task 也在 awaiting_user 状态、agent 才可能还活着
   //   - 早退场景下、phase=awaiting_ack 但 task=failed（agent 已死）、点 ack 会被 410 拒
-  //   - 这种情况只显示「重启 workflow」按钮、不显示通过 / 修改
+  //   - 这种情况只显示「推进」按钮、不显示通过 / 修改
   const canAck =
     curStatus === "awaiting_ack" && task.status === "awaiting_user";
 
-  // 启动按钮文案
-  const startLabel = (() => {
-    if (starting) return "启动中...";
-    if (task.status === "failed") return "重启 workflow";
-    if (task.status === "completed") return "再跑一次（计费再算）";
-    if (task.status === "awaiting_user") return "重启 workflow";
-    return "启动 workflow";
+  // 「推进」按钮文案：draft 状态显示「启动 workflow」、其它显示「推进」
+  const advanceLabel = (() => {
+    if (starting) return "推进中…";
+    if (task.status === "draft") return "启动 workflow";
+    if (task.status === "completed") return "再跑一次";
+    return "推进";
   })();
+
+  // 「推进」按钮的入口逻辑：draft 直接启动、其它弹 dialog
+  const handleAdvanceClick = () => {
+    if (task.status === "draft") {
+      void handleAdvance("restart");
+    } else {
+      setAdvanceDialogOpen(true);
+    }
+  };
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col">
@@ -429,8 +458,11 @@ const TaskDetailPage = () => {
                   {STATUS_LABEL[task.status]}
                 </Badge>
               </div>
-              <div className="text-xs text-muted-foreground">
-                {task.repoPath}
+              <div
+                className="text-xs text-muted-foreground"
+                title={task.repoPaths.join("\n")}
+              >
+                {formatRepoPathsForDisplay(task.repoPaths)}
               </div>
             </div>
           </div>
@@ -438,40 +470,24 @@ const TaskDetailPage = () => {
           {/* 主操作区：plan 模式才显示、chat 模式启动在 ChatView 头部 */}
           {!isChatMode && (
             <div className="flex items-center gap-2">
-              {canResume && (
+              {canAdvance && (
                 <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleResumeWaiting}
-                  disabled={starting}
-                  title="agent 之前断了、用 Agent.resume 续接（成本：+1 send 配额、agent 会记得之前的对话）"
-                >
-                  {starting ? <Loader2 className="animate-spin" /> : <Zap />}
-                  继续监听
-                </Button>
-              )}
-              {canStart && (
-                <Button
-                  // awaiting_user 状态下、用 ghost 让位给「通过 PHASE」（主操作）
-                  // 其它状态下、保持 default / secondary（无主操作竞争）
+                  // awaiting_user 状态下用 ghost 让位给「通过 PHASE」（主操作）
+                  // 其它状态下保持 default（无主操作竞争）
                   variant={
-                    task.status === "awaiting_user"
-                      ? "ghost"
-                      : canResume
-                        ? "secondary"
-                        : "default"
+                    task.status === "awaiting_user" ? "ghost" : "default"
                   }
                   size="sm"
-                  onClick={handleStart}
+                  onClick={handleAdvanceClick}
                   disabled={starting}
                   title={
-                    task.status === "awaiting_user"
-                      ? "改了 prompt / 想测试新模型？cancel 当前 agent、起新 agent 从 plan 重头跑（+1 配额）"
-                      : "启动 workflow run、agent 自动跑 plan → build → review、phase 间会停下来等你 ack"
+                    task.status === "draft"
+                      ? "启动 workflow run、agent 自动跑 plan → build → review、phase 间会停下来等你 ack"
+                      : "推进 workflow：让原 agent 续接 / 起新 agent 接力 / 从头重跑、由你选"
                   }
                 >
                   {starting ? <Loader2 className="animate-spin" /> : <Zap />}
-                  {startLabel}
+                  {advanceLabel}
                 </Button>
               )}
               {canAck && (
@@ -505,7 +521,7 @@ const TaskDetailPage = () => {
                 </>
               )}
               {/* running 状态显示一个静默的 loading 状态条、不挂按钮 */}
-              {task.status === "running" && !canStart && !canAck && (
+              {task.status === "running" && !canAdvance && !canAck && (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Loader2 className="size-3.5 animate-spin" />
                   agent 正在跑 {PHASE_LABEL[cur]}
@@ -548,25 +564,66 @@ const TaskDetailPage = () => {
         </div>
       ) : (
         <div className="flex flex-1 min-h-0">
-          <div className="flex flex-1 min-w-0 flex-col">
-            {activePhaseState ? (
-              <ArtifactPanel phase={activePhaseState} repoPath={task.repoPath} />
-            ) : (
-              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                <Sparkles className="mr-2 size-4" />
-                该阶段数据缺失
+          {/*
+            V0.5.10：左右双栏支持拖拽调宽
+            - key={task.id}：切 task 时整个 Group 重建、initialArtifactSize 重新生效
+              （react-resizable-panels 4.x 的 defaultSize 只在 mount 时读、改 prop 不会同步）
+            - id="task-layout-{task.id}"：给 group 一个稳定 id、防 React Strict mode 警告
+            - onLayoutChanged 释放鼠标后触发（区别于 onLayoutChange 在拖动中高频触发）、debounce 写 task.uiLayout
+            - 左 artifact：minSize=20（保留可读宽度）/ maxSize=80
+            - 右 event-stream：minSize=20 / maxSize=80（两边都用 20 让用户能极限调）
+          */}
+          <ResizablePanelGroup
+            key={task.id}
+            id={`task-layout-${task.id}`}
+            orientation="horizontal"
+            onLayoutChanged={(layout) => {
+              // layout[panelId] = 百分比（0..100）、d.ts L43-45 注释明确
+              const artifact = layout["artifact"];
+              if (typeof artifact === "number" && Number.isFinite(artifact)) {
+                writeLayoutDebounced(task.id, artifact);
+              }
+            }}
+          >
+            <ResizablePanel
+              id="artifact"
+              defaultSize={`${artifactSizePercent}%`}
+              minSize="20%"
+              maxSize="80%"
+            >
+              <div className="flex h-full flex-col">
+                {activePhaseState ? (
+                  <ArtifactPanel
+                    phase={activePhaseState}
+                    // V0.5.9：单仓 = 仓本身、多仓 = 公共父目录、buildCursorLink 用这个拼相对路径
+                    baseDir={getEffectiveCwd(task.repoPaths)}
+                    onArtifactRefClick={setActivePhase}
+                  />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    <Sparkles className="mr-2 size-4" />
+                    该阶段数据缺失
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-          <Separator orientation="vertical" />
-          <aside className="flex w-[400px] shrink-0 flex-col">
-            {/* hideReplyComposer=true：plan 模式不要 free-form 输入框、HITL 走顶部 ack 按钮 */}
-            <EventStream
-              task={task}
-              streamingText={streamingText}
-              hideReplyComposer
-            />
-          </aside>
+            </ResizablePanel>
+            <ResizableHandle withHandle />
+            <ResizablePanel
+              id="event-stream"
+              defaultSize={`${100 - artifactSizePercent}%`}
+              minSize="20%"
+              maxSize="80%"
+            >
+              <aside className="flex h-full flex-col">
+                {/* hideReplyComposer=true：plan 模式不要 free-form 输入框、HITL 走顶部 ack 按钮 */}
+                <EventStream
+                  task={task}
+                  streamingText={streamingText}
+                  hideReplyComposer
+                />
+              </aside>
+            </ResizablePanel>
+          </ResizablePanelGroup>
         </div>
       )}
 
@@ -593,6 +650,16 @@ const TaskDetailPage = () => {
         phaseLabel={PHASE_LABEL[cur]}
         submitting={ackSubmitting}
         onSubmit={handleSubmitRevise}
+      />
+
+      {/* V0.5.7：推进 dialog（合并历史的「继续监听 / 重启 workflow」按钮入口）
+          用户选 resume / fork / restart 三种推进模式之一、详情见 advance-dialog.tsx */}
+      <AdvanceDialog
+        open={advanceDialogOpen}
+        onOpenChange={setAdvanceDialogOpen}
+        task={task}
+        onSubmit={handleAdvance}
+        submitting={starting}
       />
     </div>
   );

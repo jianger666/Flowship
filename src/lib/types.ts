@@ -93,6 +93,10 @@ export interface ModelOption {
 //   - 不做 ship 那种「自动 git push / 自动改飞书状态」、只输出信息让用户复制
 export type PhaseId = "plan" | "build" | "review";
 
+// V0.5.7：phase id 字面量数组、用于运行时校验（如 /start-workflow body.fromPhase）
+// 跟 PhaseId 类型保持同步、改一个动另一个
+export const PHASE_IDS = ["plan", "build", "review"] as const;
+
 // ===========================================
 // 上下文文档（V0.3、跟 Skill 同理：清单 inject + 按需拉取）
 // ===========================================
@@ -280,8 +284,13 @@ export interface Task {
   // 创建时定死、跟仓库强相关（同一仓库的任务通常同 role、但允许例外）
   // 老数据没此字段、hydrate 时按 "fe" 兜底（V0.4 之前只支持前端）
   role: TaskRole;
-  // 关联的本地仓库路径（必填、agent cwd）
-  repoPath: string;
+  // V0.5.9：关联的本地仓库路径（必填非空、至少 1 个）
+  // - 单仓 case：repoPaths = [`/Users/foo/projA`]、SDK Run cwd 直接用这个
+  // - 多仓 case：repoPaths = [`/Users/foo/work/A`, `/Users/foo/work/B`]、SDK Run cwd
+  //   走「公共父目录」（这里 `/Users/foo/work`）、AI 视角下面是 N 个 git 仓子目录
+  // - 单仓 / 多仓的 effective cwd 算法见 `getEffectiveCwd`、不要直接用 `repoPaths[0]`
+  // 老数据（V0.5.9 前 `repoPath: string`）hydrate 时自动包成 `[repoPath]`
+  repoPaths: string[];
   // 可选输入源
   // V0.2 workflow 用 feishuStoryUrl（指向飞书项目 story 详情页）
   // V0.4 起 chat 模式建任务的「飞书相关链接」也复用这个字段、不分 feishuUrl
@@ -314,9 +323,9 @@ export interface Task {
   updatedAt: number;
 
   // V0.3.5：上一个 SDK Agent 的 id
-  // - plan-runner 起 Agent.create 后立刻持久化、用户走 /resume-waiting 续监听时
-  //   服务端 Agent.resume(this.id) + send "[RESUME] 继续监听用户 ack" 推进
-  // - 没有 lastAgentId（如老数据、或 chat 模式）→ /resume-waiting 路由降级走 new agent
+  // - plan-runner 起 Agent.create 后立刻持久化、用户在 UI 点「推进 → 让原 agent 继续」时
+  //   服务端 POST /start-workflow（V0.5.7 mode=resume）→ Agent.resume(this.id) + send 续接 prompt
+  // - 没有 lastAgentId（如老数据、或 chat 模式 / agent 从未启动）→ start-workflow 路由自动降级 fork
   lastAgentId?: string;
 
   // V0.5.1：任务级模型选择（新建任务时表单里挑、可跟 settings.defaultModel 不同）
@@ -324,6 +333,16 @@ export interface Task {
   // - ack 时切了模型 = 隐含 fork（旧 agent 已经在用旧 model、不可热切）
   // - 老数据没此字段、prepareRunArgs 兜底走 settings.defaultModel
   model?: ModelSelection;
+
+  // V0.5.10：任务级 UI 布局偏好（持久化用户拖拽的左右分栏比例）
+  // - 详情页左右双栏（artifact + event-stream）拖拽手柄 → 写本字段
+  // - artifactPanelSize：artifact 栏宽度百分比（0-100、实际 minSize=20 / maxSize=75 约束）
+  // - 老数据没此字段：UI 用默认 70/30、不写 task（保留 undefined、不污染 meta.json）
+  // - 持久化在 task 维度（不是 localStorage）：不同任务的偏好可不同——
+  //   调研类 task 用户喜欢 event-stream 大、改代码类 task 喜欢 artifact 大
+  uiLayout?: {
+    artifactPanelSize?: number;
+  };
 }
 
 /**
@@ -352,7 +371,7 @@ export type TaskSummary = Omit<Task, "events" | "phases">;
 export type NewTaskInput = Pick<
   Task,
   | "title"
-  | "repoPath"
+  | "repoPaths"
   | "feishuStoryUrl"
   | "description"
   | "disabledMcpServers"

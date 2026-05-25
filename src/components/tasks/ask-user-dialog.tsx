@@ -13,7 +13,7 @@
  * V0.5.6 加「稍后再补充」按钮（用户拍板）：
  *   - 配合「ask_user 无次数上限」、给用户一个退出循环的口子
  *   - 点 → useDialog().confirm 二次确认 → POST 时 body 带 deferred:true
- *   - agent 拿到 [ASK_USER_REPLY deferred] 头、跳过这组 Q、按 default 推进、列进 artifact §7 待澄清
+ *   - agent 拿到 [ASK_USER_REPLY deferred] 头、跳过这组 Q、按 default 推进、列进 artifact §6 待澄清
  *
  * 数据流：
  *   1. 监听 task.events、找最新一条 ask_user_request 且没对应 ask_user_reply 的 → 弹窗
@@ -244,7 +244,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
 
   // V0.5.6 「稍后再补充」：用户点 → confirm → POST deferred:true
   // 配合 ask_user 无次数上限设计——给用户一个退出循环的口子、agent 跳过这组 Q
-  // 走 default 推进、把问题列进 artifact §7 待澄清
+  // 走 default 推进、把问题列进 artifact §6 待澄清
   const handleDefer = async () => {
     if (!askId || submitting) return;
     const ok = await confirm({
@@ -333,7 +333,8 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                           </ChoiceButton>
                         );
                       })}
-                      {/* 「以上都不是 / 自定义回答…」入口：进 Other 模式后高亮、提示当前在用 textarea */}
+                      {/* 「自定义回答」入口：进 Other 模式后高亮、提示当前在用 textarea
+                          V0.5.10 拍板：文案精简到「自定义回答」、不要「以上都不是」赘述 */}
                       {q.allowText && (
                         <ChoiceButton
                           shape="tab"
@@ -342,9 +343,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                           onClick={() => handleEnterOther(q.id)}
                           className="self-start text-xs"
                         >
-                          {inOther
-                            ? "已选：自定义回答（下方输入）"
-                            : "以上都不是 / 自定义回答…"}
+                          {inOther ? "已选：自定义回答（下方输入）" : "自定义回答"}
                         </ChoiceButton>
                       )}
                     </div>
@@ -389,7 +388,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
             <div className="flex items-center gap-2">
               {/* V0.5.6 「稍后再补充」：让位主操作用 ghost
                   点 → useDialog.confirm → 后端拼 [ASK_USER_REPLY deferred] 给 agent
-                  agent 跳过这组 Q、按 default 推进、列进 artifact §7 待澄清 */}
+                  agent 跳过这组 Q、按 default 推进、列进 artifact §6 待澄清 */}
               <Button
                 size="sm"
                 variant="ghost"
