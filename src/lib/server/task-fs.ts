@@ -1,5 +1,5 @@
 /**
- * Server-side 任务持久化层（V1）
+ * Server-side 任务持久化层
  *
  * 数据布局（落 fe-ai-flow 项目自身的 data/ 下、跟着 git ignore 走）：
  *
@@ -8,17 +8,19 @@
  *       <taskId>/
  *         meta.json        ← 任务元信息（不含 events / artifacts）
  *         events.jsonl     ← 事件流、每行一条 JSON、追加写
- *         spec.md          ← phase 产物（生成后才有）
- *         plan.md
- *         build.md
+ *         artifacts/
+ *           01-plan.md     ← phase 产物（按 workflow phases 序号命名、生成后才有）
+ *           02-build.md
+ *           03-review.md
+ *           .revisions/    ← V0.5.12 用户 revise 前的旧版本 snapshot
  *
  * 设计要点：
- * - meta.json + events.jsonl + *.md 三种文件分工明确、各自的写入特性不同：
+ * - meta.json + events.jsonl + artifacts/*.md 三种文件分工明确、各自的写入特性不同：
  *   - meta.json 整体覆盖（次数低、读多写少）
  *   - events.jsonl 追加写（高频、不能整体重写否则丢日志）
- *   - *.md 整体覆盖（一次 phase 一个 artifact）
+ *   - artifacts/*.md 整体覆盖（一次 phase 一个 artifact）
  * - 这个布局好处是：人能 cat / 编辑器开 / git diff、未来要看历史也清楚
- * - V1 不再 seed mock 任务、首次空列表就是空（避免用户清掉 data/ 后又凭空冒出 mock）
+ * - 不 seed mock 任务、首次空列表就是空（避免用户清掉 data/ 后又凭空冒出 mock）
  *
  * 文件名使用安全：
  * - taskId 由 newTaskId() 生成、只用 [a-z0-9_]、不存在路径穿越风险
@@ -33,6 +35,7 @@ import type { ModelSelection } from "@cursor/sdk";
 
 import {
   WORKFLOWS,
+  type ArtifactRevision,
   type NewTaskInput,
   type PhaseId,
   type PhaseState,
@@ -54,6 +57,12 @@ const DATA_DIR = path.join(process.cwd(), "data", "tasks");
 const META_FILE = "meta.json";
 const EVENTS_FILE = "events.jsonl";
 const ARTIFACTS_DIR = "artifacts";
+// V0.5.12：artifact 修订快照存放子目录、跟 artifacts/ 平级好让用户 ls 一眼看出哪是当前哪是历史
+// 用「.」前缀让常见 ls 默认不展示（artifacts/01-plan.md 跟 artifacts/.revisions/ 不混）
+const REVISIONS_SUBDIR = ".revisions";
+// 单 phase 最多保留 10 个 revision、超了 GC 删最早——ROADMAP 拍 5~10、上限取大方便用户翻久一点
+// 实际单 task 走完全程 plan+build+review 各几次 revise、撑死 30 个 markdown × 几十 KB = MB 级、毛毛雨
+const MAX_REVISIONS_PER_PHASE = 10;
 
 // V0.2 全 phase 序、UI / hydrate 时用
 // （workflow 自己也定义了 phases、但 hydrateTask 不知道是哪条 workflow、就用全集兜底）
@@ -109,10 +118,14 @@ export const getArtifactsDir = (taskId: string): string =>
  * 给 phase 算 artifact 文件相对名（`01-plan.md`、不含目录前缀）。
  *
  * idx 是 phase 在 workflow phases 数组里的位置（0-based）、+1 后 padStart(2,"0")。
- * 如果 idx<0（phase 不在当前 workflow、或者老数据没 workflowId）、不带前缀、退回到 legacy 命名 `<phase>.md`。
+ * idx<0 视为非法（phase 不在当前 workflow）、抛错——调用方先用 `getCurrentPhaseIndex` 校验。
  */
 const phaseArtifactFilename = (phaseId: PhaseId, idx: number): string => {
-  if (idx < 0) return `${phaseId}.md`;
+  if (idx < 0) {
+    throw new Error(
+      `phaseArtifactFilename: phase=${phaseId} 不在当前 workflow 里（idx=${idx}）`,
+    );
+  }
   const padded = String(idx + 1).padStart(2, "0");
   return `${padded}-${phaseId}.md`;
 };
@@ -330,11 +343,7 @@ interface TaskMeta {
   // V0.2 plan 模式下的 workflow 标识(feishu-story-impl 等)
   workflowId?: WorkflowId;
   // V0.5.9：仓库路径数组、支持单仓 / 多仓
-  // - 新数据只写这个、不写下面的 legacy `repoPath`
-  // - 老数据（V0.5.9 前）只有 `repoPath` 单值、`hydrateTaskSummary` 兼容兜底（包成 [repoPath]）
   repoPaths?: string[];
-  /** @deprecated V0.5.9 起改用 repoPaths、读老 meta.json 时 hydrate 层 fallback、新数据不再写 */
-  repoPath?: string;
   // V0.2 主要入口（飞书 story / 项目链接）
   // V0.4 起 chat 模式建任务也复用这个字段、统一以 feishuStoryUrl 为起点
   feishuStoryUrl?: string;
@@ -377,6 +386,12 @@ interface TaskMeta {
   uiLayout?: {
     artifactPanelSize?: number;
   };
+
+  // V0.5.12：每 phase artifact 修订快照清单（跟 Task.revisions 同 shape）
+  // - 写入时机：phase-ack revise 分支调 snapshotArtifact 在 submitPhaseAck 前 trigger
+  // - hydrate 时复制到 Task.revisions、前端 fetch artifact-revisions 路由按 phase 取
+  // - 老数据没此字段、按 undefined 兜底、首次 snapshot 时初始化为 {}
+  revisions?: Partial<Record<PhaseId, ArtifactRevision[]>>;
 }
 
 // 自动归档：completed / failed 且 7 天没动 → archived=true
@@ -501,40 +516,21 @@ const appendEventLine = async (
 
 // ----------------- 产物 -----------------
 
-// 读 artifact：先按 V0.2 约定的 `artifacts/<NN>-<phase>.md`、退回到 V1 的 `<phase>.md`
+// 读 artifact：按 `artifacts/<NN>-<phase>.md` 约定读
 //
-// 为什么允许 fallback：
-//   - V0.2 之前的 plan task 写的就是 `plan.md` / `build.md` 在 task 根
-//   - 这些老数据还想保留可读、不强制迁移
-//
-// idx 是 phase 在当前 workflow phases 数组里的位置（0-based、-1 表示不在）
+// idx 是 phase 在当前 workflow phases 数组里的位置（0-based、负值视为非法）
 const readArtifact = async (
   taskId: string,
   phaseId: PhaseId,
   idx: number,
 ): Promise<{ filename: string; content: string } | undefined> => {
+  if (idx < 0) return undefined;
   const dir = taskDir(taskId);
-  const candidates: Array<{ filename: string; absPath: string }> = [];
-  // V0.2 路径优先
-  if (idx >= 0) {
-    const newName = phaseArtifactFilename(phaseId, idx);
-    candidates.push({
-      filename: `${ARTIFACTS_DIR}/${newName}`,
-      absPath: path.join(dir, ARTIFACTS_DIR, newName),
-    });
-  }
-  // V1 legacy 路径兜底
-  candidates.push({
-    filename: `${phaseId}.md`,
-    absPath: path.join(dir, `${phaseId}.md`),
-  });
-  for (const c of candidates) {
-    if (await exists(c.absPath)) {
-      const content = await fs.readFile(c.absPath, "utf-8");
-      return { filename: c.filename, content };
-    }
-  }
-  return undefined;
+  const filename = phaseArtifactFilename(phaseId, idx);
+  const absPath = path.join(dir, ARTIFACTS_DIR, filename);
+  if (!(await exists(absPath))) return undefined;
+  const content = await fs.readFile(absPath, "utf-8");
+  return { filename: `${ARTIFACTS_DIR}/${filename}`, content };
 };
 
 export const writeArtifact = async (
@@ -544,11 +540,9 @@ export const writeArtifact = async (
   content: string,
 ): Promise<void> => {
   if (idx < 0) {
-    // 不在当前 workflow 里：写 legacy 位置
-    const dir = taskDir(taskId);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, `${phaseId}.md`), content, "utf-8");
-    return;
+    throw new Error(
+      `writeArtifact: phase=${phaseId} 不在当前 workflow 里（idx=${idx}）`,
+    );
   }
   const dir = path.join(taskDir(taskId), ARTIFACTS_DIR);
   await fs.mkdir(dir, { recursive: true });
@@ -559,21 +553,181 @@ export const writeArtifact = async (
   );
 };
 
+// ----------------- 产物快照（V0.5.12 artifact diff 视图） -----------------
+//
+// 设计：用户点「再聊聊」(revise) 即将让 AI 改 artifact 之前、后端 snapshot 当前正文到
+// `data/tasks/<id>/artifacts/.revisions/<NN>-<phase>.<ISO>.md`、把元数据追加到 meta.revisions[phaseId]。
+// 切换 toolbar「Diff」时前端拉这些 snapshot + 当前正文做 diff、用户直观看 AI 改了哪。
+//
+// 为什么不在 writeArtifact 里 trigger：
+//   - AI 改 artifact 走 SDK 内置 `edit` 工具、直接 fs.writeFile / fs.rename、不走 writeArtifact、拦不住
+//   - 即使能拦、初版第一次 write 也算「修订」会很怪、ROADMAP V0.5.12 拍只覆盖「用户主动 revise」单一时机
+//
+// 文件名「.」前缀让 `ls artifacts/` 默认看不到 .revisions、避免人为误读「咦怎么这么多 plan.md」
+
+// ISO 时间戳转 filename-safe（: 和 . 在 macOS 上能用、但 Windows 不行；保守换成 -）
+const isoForFilename = (ts: number): string =>
+  new Date(ts).toISOString().replace(/[:.]/g, "-");
+
+// snapshot 文件名：跟当前 artifact 同名前缀、加 .<ISO>.md 后缀
+// 例 `01-plan.md` 的 2026-05-25T05:44:39.123Z snapshot = `01-plan.2026-05-25T05-44-39-123Z.md`
+const revisionFilename = (
+  phaseId: PhaseId,
+  idx: number,
+  ts: number,
+): string => {
+  const base = phaseArtifactFilename(phaseId, idx).replace(/\.md$/, "");
+  return `${base}.${isoForFilename(ts)}.md`;
+};
+
+// 相对路径（meta 里存这个、不存绝对路径——任务目录搬迁时无需迁移）
+const revisionRelPath = (
+  phaseId: PhaseId,
+  idx: number,
+  ts: number,
+): string =>
+  path.join(ARTIFACTS_DIR, REVISIONS_SUBDIR, revisionFilename(phaseId, idx, ts));
+
+/**
+ * V0.5.12：snapshot 当前 phase artifact、追加到 meta.revisions[phaseId]
+ *
+ * 触发时机：phase-ack 路由 revise 分支、在 submitPhaseAck 调用前调一次。
+ *
+ * 行为：
+ *   - 当前 artifact 不存在 / 内容为空 → 返 null、不写、不污染 meta
+ *   - 否则复制到 .revisions/<NN>-<phase>.<ISO>.md、追加到 meta.revisions[phaseId] 末尾（升序）
+ *   - 超过 MAX_REVISIONS_PER_PHASE → GC 删最早（fs 文件 + meta 记录）
+ *
+ * 失败不抛：snapshot 是辅助 / 锦上添花、出错不能挡 revise 主流程。
+ * 调用方建议：`snapshotArtifact(...).catch(err => console.warn(...))`
+ *
+ * 包 withTaskLock：跟 appendEvent / patchPhase / addContextDoc 等任意 mutate meta 的逻辑串行
+ */
+export const snapshotArtifact = async (
+  taskId: string,
+  phaseId: PhaseId,
+): Promise<ArtifactRevision | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMeta(taskId);
+    if (!meta) return null;
+
+    const workflowPhases = resolveWorkflowPhases(meta);
+    const idx = workflowPhases.indexOf(phaseId);
+    if (idx < 0) {
+      // phase 不在当前 workflow（如老数据切了 workflow 或 chat 模式误调）、跳过
+      return null;
+    }
+
+    const currentAbsPath = path.join(
+      taskDir(taskId),
+      ARTIFACTS_DIR,
+      phaseArtifactFilename(phaseId, idx),
+    );
+    let content: string;
+    try {
+      content = await fs.readFile(currentAbsPath, "utf-8");
+    } catch {
+      // artifact 还没生成（plan agent 没跑 / 跑挂了）、跳过
+      return null;
+    }
+    if (content.trim().length === 0) return null;
+
+    const now = Date.now();
+    const relPath = revisionRelPath(phaseId, idx, now);
+    const absPath = path.join(taskDir(taskId), relPath);
+    await fs.mkdir(path.dirname(absPath), { recursive: true });
+    // snapshot 不走 tmp+rename 原子写：写一半挂了下次 revise 重写即可、容错性强、省一次 fs 调用
+    await fs.writeFile(absPath, content, "utf-8");
+
+    const rev: ArtifactRevision = {
+      timestamp: now,
+      path: relPath,
+      size: Buffer.byteLength(content, "utf-8"),
+    };
+
+    if (!meta.revisions) meta.revisions = {};
+    const list = meta.revisions[phaseId] ?? [];
+    const next = [...list, rev];
+
+    // GC：list 按 timestamp 升序、超出上限把最早的删掉
+    while (next.length > MAX_REVISIONS_PER_PHASE) {
+      const oldest = next.shift();
+      if (oldest) {
+        // 删 fs 文件不抛、删失败也只是留个孤儿文件、下次 GC 再补
+        await fs
+          .unlink(path.join(taskDir(taskId), oldest.path))
+          .catch(() => {});
+      }
+    }
+    meta.revisions[phaseId] = next;
+    meta.updatedAt = now;
+    await writeMeta(meta);
+    return rev;
+  });
+
+/**
+ * V0.5.12：列出某 phase 的 revision 元数据（升序、最老在前）
+ *
+ * 给 GET /api/tasks/[id]/artifact-revisions 用。
+ * 不走 hydrateTask 的全量拼装、单读 meta.json 足够、IO 轻。
+ */
+export const listArtifactRevisions = async (
+  taskId: string,
+  phaseId: PhaseId,
+): Promise<ArtifactRevision[]> => {
+  const meta = await readMeta(taskId);
+  if (!meta?.revisions) return [];
+  const list = meta.revisions[phaseId] ?? [];
+  // 兜底排序（理论上 snapshotArtifact 写入时已升序、防御一下）
+  return [...list].sort((a, b) => a.timestamp - b.timestamp);
+};
+
+/**
+ * V0.5.12：读某条 revision 的正文（给 GET /api/tasks/[id]/artifact-diff 用）
+ *
+ * 安全：通过 timestamp 查 meta.revisions 拿 path（不接前端入参 path、防路径穿越）。
+ * 找不到 timestamp / 文件被人手动删了 → 返 null、由调用方决定 404 还是兜底。
+ */
+export const readArtifactRevisionContent = async (
+  taskId: string,
+  phaseId: PhaseId,
+  timestamp: number,
+): Promise<{ content: string; revision: ArtifactRevision } | null> => {
+  const meta = await readMeta(taskId);
+  if (!meta?.revisions) return null;
+  const list = meta.revisions[phaseId] ?? [];
+  const rev = list.find((r) => r.timestamp === timestamp);
+  if (!rev) return null;
+  const absPath = path.join(taskDir(taskId), rev.path);
+  try {
+    const content = await fs.readFile(absPath, "utf-8");
+    return { content, revision: rev };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * V0.5.12：读当前 phase artifact 正文 + filename（给 artifact-revisions / artifact-diff 路由用）
+ *
+ * 跟 hydrateTask 拼出来的 phases[id].artifact 取值一致——但提供独立 helper 便于 API 路由不读完整 task。
+ */
+export const readCurrentArtifact = async (
+  taskId: string,
+  phaseId: PhaseId,
+): Promise<{ content: string; filename: string } | null> => {
+  const meta = await readMeta(taskId);
+  if (!meta) return null;
+  const workflowPhases = resolveWorkflowPhases(meta);
+  const idx = workflowPhases.indexOf(phaseId);
+  if (idx < 0) return null;
+  return (await readArtifact(taskId, phaseId, idx)) ?? null;
+};
+
 // ----------------- 高阶接口（拼装 Task） -----------------
 
-// 兼容老数据：V0 时代的 task 可能 currentPhase="spec" / phases.spec.* 都还在
-// V1 砍掉 spec 后、这些数据如果原样吐给 UI、phases[currentPhase] 会拿 undefined 崩
-// 兜底策略：currentPhase 不在 PHASE_ORDER 里就强制改 plan、phases 用 PHASE_ORDER 里的项 + meta.phases 同名项
-// 旧的 spec phase 状态会丢、但任务本身能继续走 plan→build
-//
-// V0.3.4 PHASE_ORDER 只剩 [plan, build]、老任务里 currentPhase="context"/"ship" 都会被强制改 plan
-// 老 artifact 文件名（01-context.md / 02-plan.md / 03-build.md）跟新结构对不上、
-// 读不到老 artifact——用户偏好"不写兼容代码、老任务作废重跑"、所以这里不做迁移
-const sanitizeCurrentPhase = (p: string): PhaseId =>
-  PHASE_ORDER.includes(p as PhaseId) ? (p as PhaseId) : "plan";
-
 // 把 meta.workflowId 转成实际 workflow.phases 数组
-// 老数据没 workflowId、或者 chat 模式：返回 PHASE_ORDER 全集兜底（hydrateTask 读 artifact 时也不会漏）
+// chat 模式 meta 不带 workflowId：返回 PHASE_ORDER 全集兜底（hydrateTask 读 artifact 时也不会漏）
 const resolveWorkflowPhases = (meta: TaskMeta): PhaseId[] => {
   if (meta.workflowId && WORKFLOWS[meta.workflowId]) {
     return WORKFLOWS[meta.workflowId].phases;
@@ -598,26 +752,22 @@ const hydrateTaskSummary = (meta: TaskMeta): TaskSummary => ({
   workflowId: meta.workflowId,
   // V0.4：老数据没 role 字段、按 "fe" 兜底（V0.4 之前只支持前端、安全推断）
   role: meta.role ?? "fe",
-  // V0.5.9：老 meta 用 `repoPath` 单值、新 meta 写 `repoPaths` 数组
-  // hydrate 层做双向兼容：优先用 repoPaths、退化到 [repoPath]、最差给 []
-  repoPaths:
-    meta.repoPaths && meta.repoPaths.length > 0
-      ? meta.repoPaths
-      : meta.repoPath
-        ? [meta.repoPath]
-        : [],
+  repoPaths: meta.repoPaths ?? [],
   feishuStoryUrl: meta.feishuStoryUrl,
   description: meta.description,
   contextDocs: meta.contextDocs ?? [],
   disabledMcpServers: meta.disabledMcpServers,
   status: meta.status,
-  currentPhase: sanitizeCurrentPhase(meta.currentPhase),
+  currentPhase: meta.currentPhase,
   archived: meta.archived ?? false,
   createdAt: meta.createdAt,
   updatedAt: meta.updatedAt,
   lastAgentId: meta.lastAgentId,
   model: meta.model,
   uiLayout: meta.uiLayout,
+  // V0.5.12：复制 revision 元数据、UI 可直接读 task.revisions 判断「有没有 / 多少条」
+  // 内容仍懒加载、走 GET /api/tasks/[id]/artifact-diff 路由取
+  revisions: meta.revisions,
 });
 
 const hydrateTask = async (meta: TaskMeta): Promise<Task> => {
@@ -882,7 +1032,6 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     // V0.4：role 默认 "fe"（当前 enum 只这一个值、UI 可选但实际只有这个选项）
     // 未来扩枚举（be / data / mobile / qa）时、UI 选择器会暴露多个值、这里也按 input 取
     role: input.role ?? "fe",
-    // V0.5.9：写 repoPaths、不再写 legacy repoPath
     repoPaths: finalRepoPaths,
     feishuStoryUrl: input.feishuStoryUrl,
     description: input.description,
@@ -893,7 +1042,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
         ? input.disabledMcpServers
         : undefined,
     // V0.5.1：任务级模型选择（new-task-dialog 表单里挑、可跟 settings.defaultModel 不同）
-    // 不传 → undefined、prepareRunArgs 兜底走 settings.defaultModel（保兼容老数据）
+    // 不传 → undefined、prepareRunArgs 兜底走 settings.defaultModel
     model: input.model,
     status: "draft",
     currentPhase: firstPhase,
@@ -1016,13 +1165,13 @@ export const appendEvent = async (
   });
 
 // 状态推进 helper：把 phase / task 状态打到指定值
-// 真状态机会更复杂（spec 完成 → plan 自动 pending → user ack → 进 plan running...）
-// V1 这里支持「按需修改」：
+// 真状态机会更复杂（phase 完成 → next phase 自动 pending → user ack → 进 next phase running...）
+// 这里支持「按需修改」：
 //   - 同时给 phaseId + status：改对应 phase 状态
 //   - 给 taskStatus：改 task 顶层状态
 //   - 给 currentPhase：换当前 phase
 //   - 三个字段都可选、调用方按需要传
-// 主要是给"用户回复后 task 回 running"这种「只动 task 不动 phase」的语义留口子
+// 主要是给「用户回复后 task 回 running」这种「只动 task 不动 phase」的语义留口子
 interface PatchPhaseInput {
   phaseId?: PhaseId;
   status?: PhaseStatus;

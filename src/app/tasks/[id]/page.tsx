@@ -595,6 +595,8 @@ const TaskDetailPage = () => {
                 {activePhaseState ? (
                   <ArtifactPanel
                     phase={activePhaseState}
+                    // V0.5.12：artifact-panel 内部要 fetch revisions / diff、需要 task id
+                    taskId={task.id}
                     // V0.5.9：单仓 = 仓本身、多仓 = 公共父目录、buildCursorLink 用这个拼相对路径
                     baseDir={getEffectiveCwd(task.repoPaths)}
                     onArtifactRefClick={setActivePhase}

@@ -718,11 +718,35 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
   if (isResume) {
     started = await patchPhase(task.id, { taskStatus: "running" });
   } else if (isFork) {
-    // V0.5.7：先 reset fromPhase 之后的所有下游 phase 到 pending
+    const fromIdx = workflowDef.phases.indexOf(fork!.fromPhase);
+
+    // V0.5.12.3：fork 模式自动 ack fromPhase 之前的所有 phase
+    // 场景：用户在 build awaiting_ack 时直接点「推进 → fromPhase=review」
+    //       从 start-workflow 路由走（不是 phase-ack 路由的 fork 分支）、
+    //       此时 build phase 状态如果不 ack、phase-progress 会一直显示「build 待确认」
+    //       但 review 已经基于 build 跑完了、状态机和实际进度脱节、用户视角懵
+    // 语义：「fork from X」= 「用户认可 X 之前所有 phase 的产出」、自动 ack 符合直觉
+    //       用户想 fix 上游 phase 应该 fork from 那个上游 phase、不是从更后的 phase 重跑
+    // 区分：phase-ack 路由的 fork 已经在自己路径里 markPhaseAcked(ackPhase)、走到这里上游已 ack
+    //       本逻辑覆盖的是 start-workflow 路由直接 fork 的场景、避免漏 ack 上游
+    const upstreamPhases = workflowDef.phases.slice(0, fromIdx);
+    for (const pid of upstreamPhases) {
+      const currentMeta = await getTask(task.id);
+      if (currentMeta && currentMeta.phases[pid]?.status !== "ack") {
+        await patchPhase(task.id, { phaseId: pid, status: "ack" });
+        await writeEventAndPublish(task.id, {
+          kind: "phase_ack",
+          phase: pid,
+          text: `Phase ${pid} 由 fork 自动 ack（用户从 ${fork!.fromPhase} 重跑、隐式认可上游产出）`,
+          meta: { autoAck: true, fromPhase: fork!.fromPhase },
+        });
+      }
+    }
+
+    // V0.5.7：reset fromPhase 之后的所有下游 phase 到 pending
     // 场景：用户在 review 已经 awaiting_ack 时点「推进 → 从 build 重启」、
     //       此时 review 状态如果不 reset、phase-progress 会显示「review 待确认」
     //       但实际新 agent 还没跑到 review、用户视觉跟实际状态错位
-    const fromIdx = workflowDef.phases.indexOf(fork!.fromPhase);
     const downstreamPhases = workflowDef.phases.slice(fromIdx + 1);
     for (const pid of downstreamPhases) {
       await patchPhase(task.id, { phaseId: pid, status: "pending" });

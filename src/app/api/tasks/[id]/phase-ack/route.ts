@@ -40,6 +40,7 @@ import {
   getTask,
   patchPhase,
   saveImageAttachments,
+  snapshotArtifact,
 } from "@/lib/server/task-fs";
 import {
   hasPending,
@@ -242,6 +243,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
       phase: ackPhase,
       text: feedback || fallbackText,
       meta,
+    });
+  }
+
+  // V0.5.12：revise 即将让 agent 改 artifact、先 snapshot 当前正文到 .revisions/
+  // - 只在 revise 路径触发、approve 不触发（approve 不会改当前 phase artifact）
+  // - 失败不抛、不挡主流程（snapshot 是辅助、artifact 还在、AI 改完也能直接看正文）
+  // - artifact 还没生成（draft phase 早 revise）→ snapshotArtifact 内部返 null、不写
+  if (action === "revise") {
+    await snapshotArtifact(task.id, ackPhase).catch((err) => {
+      console.warn(
+        `[phase-ack] task=${task.id} phase=${ackPhase} snapshotArtifact 失败（不挡主流程）:`,
+        err,
+      );
     });
   }
 

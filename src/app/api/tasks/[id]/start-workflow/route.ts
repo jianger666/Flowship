@@ -20,15 +20,13 @@
  *   mode = "restart": Agent.create 新 agent + 从 plan 重头跑（老路径、覆盖所有 artifact）
  *                     用户视角：「完全重头跑」、不希望复用任何旧产物
  *
- *   缺省 mode       : "restart"（向后兼容；老 UI / 老调用 → 行为不变）
- *
  * # Body
  *
  * {
  *   apiKey: string;
  *   model: ModelSelection;
  *   mcpServers?: Record<string, McpServerConfig>;
- *   mode?: "resume" | "fork" | "restart";  // V0.5.7
+ *   mode: "resume" | "fork" | "restart";   // V0.5.7、必填
  *   fromPhase?: PhaseId;                    // V0.5.7、mode=fork 必填
  * }
  *
@@ -76,6 +74,7 @@ interface PostBody {
   apiKey?: string;
   model?: ModelSelection;
   mcpServers?: Record<string, McpServerConfig>;
+  // V0.5.7：必传、resume / fork / restart 三选一、表达「怎么推进 task」语义
   mode?: StartMode;
   fromPhase?: PhaseId;
   // V0.5.7.1：fork 时用户填的「想修什么 / 重启原因」（自由文本、可空）
@@ -172,13 +171,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("mcpServers 必须是对象（key=server名、value=配置）");
   }
 
-  // V0.5.7：mode 校验 + 缺省回 restart（向后兼容老 UI）
-  if (body.mode !== undefined && !isValidMode(body.mode)) {
+  // V0.5.7：mode 必传、走 resume / fork / restart 三选一
+  if (!isValidMode(body.mode)) {
     return errorResponse(
-      `mode 非法（只能是 resume / fork / restart、传了 ${JSON.stringify(body.mode)}）`,
+      `mode 非法（必传 resume / fork / restart、传了 ${JSON.stringify(body.mode)}）`,
     );
   }
-  const mode: StartMode = body.mode ?? "restart";
+  const mode: StartMode = body.mode;
   if (body.fromPhase !== undefined && !isValidPhase(body.fromPhase)) {
     return errorResponse(
       `fromPhase 非法（只能是 ${PHASE_IDS.join(" / ")}、传了 ${JSON.stringify(body.fromPhase)}）`,

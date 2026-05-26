@@ -234,29 +234,57 @@ V0.5 大动后用户密集联测、超过一周小迭代、每一档都先落 HA
 
 ---
 
-## V0.5.12 / W5.12：artifact diff 视图（snapshot + 内嵌 diff、待启动）
+## V0.5.12 / W5.12：artifact diff 视图 + review 闭环 + 全局清理（代码已落地、待联测 review 闭环）
 
-**背景**（用户痛点）：每次「再聊聊」让 AI 改 md 后、用户不知道 AI 改了哪些地方、需要重读长 artifact。
+V0.5.12 实际跑下来分了三轮迭代、详细内容看 `docs/HANDOFF.md` 三段、本节只列里程碑。
 
-**方案**（用户拍板「第一版先简单」、本轮 0 代码、规划已对齐）：
+### 迭代一：artifact diff 视图（已落地）
 
-- 后端每次 revise 前 snapshot 旧版到 `tasks/<id>/artifacts/.revisions/01-plan.<ISO>.md`、保留近 5~10 个、超了 GC
-- `task.json` 加 `revisions: { [phaseId]: Array<{ timestamp, path }> }`
-- artifact-panel 顶部 toolbar 加「正文 / diff」切换 + 黄色 banner「✨ 刚刚修订了 N 处 [查看修改]」
-- 默认正文模式、有未看修订时 banner 提示、点击切 diff 模式
-- diff 视图用 `react-diff-viewer-continued`、monospace raw text 对比、可切 inline / side-by-side
-- dropdown 选「对比上次 / 初版 / 任意快照」、默认上次
-- ack 或手动关 banner 后状态清零、下次刷新默认正文
+**痛点**：每次「再聊聊」让 AI 改 md 后、用户不知道 AI 改了哪些地方、需要重读长 artifact。
+
+**落地**：
+
+- 后端 `phase-ack` revise 分支 → `snapshotArtifact` 复制旧版到 `data/tasks/<id>/artifacts/.revisions/<NN>-<phase>.<ISO>.md`、每 phase 上限 10 个 GC
+- `Task.revisions[phaseId]` 加元数据数组、新增两条 API（`artifact-revisions` / `artifact-diff`）
+- `ArtifactPanel` toolbar 加「正文 / Diff」切换 + Diff 模式 dropdown（对比上次 / 初版 / 任意快照）+ 「行内 / 并排」切换 + 未看 revision 红点指示器（first 版用过黄 banner、用户拍板「简单点」改成红点）
+- `react-diff-viewer-continued` + `prismjs` markdown 语法高亮（用户「太代码风格」反馈后补的、走 `prismjs/themes/prism-tomorrow.css`）
+- `next/dynamic` 懒加载、不切到 Diff 不拉、First Load JS 270KB 持平 V0.5.11
+
+### 迭代二：review phase 闭环（已落地、待联测）
+
+**痛点**：review phase 列「实现偏差 / 未完成 task」段建议「接受偏差并更新 plan」、但用户不知怎么落地——review 不能动 plan、build 已结束、「再聊聊」也不一定 trigger 改对 plan。流程**没闭环**。
+
+**落地**：
+
+- `prompts/phase-3-review.md` 重写 §7：review agent 写完初稿后必须调一次 ask_user 把所有偏差 / 未完成 task 一次性问完
+- ask_user 答 b（接受偏差）→ agent edit `01-plan.md` 对应段落、用 `~~strikethrough~~` 划掉旧描述 + 加 review ack 补录标记
+- ask_user 答 c（未完成 task 接受不做）→ agent edit `01-plan.md` §5 task 加注解
+- 每条决策追加到 `03-review.md`「§ 用户决策」段
+- 约束扩展：review phase **允许** edit `01-plan.md`（破例、只在 §7 ask_user 答完 b/c 后、不动 §5 task 拆分骨架）
+- ⚠️ limitation：review edit 01-plan.md 时**不自动 snapshot 旧 plan**（snapshot 钩子只挂在用户 revise 路径上）、diff 视图看不到这次改动、V0.5.13 再补
+
+### 迭代三：全局遗留清理（已落地、2026-05-26）
+
+走过的弯路：一度在 ask_user 加 `recommended` 字段 + 弹窗「一键接受推荐」按钮、用户实测后拍板砍掉「HITL 是底线、AI 不预判倾向」、顺势扫整个项目执行「开发期不写向后兼容代码」原则、清掉一堆历史兼容：
+
+- 删 V0/V1 老 artifact path 兜底（`<phase>.md` 在 task 根）、`phaseArtifactFilename` idx<0 改抛错
+- 删 `sanitizeCurrentPhase`（V0 时代 `spec` phase 兜底）
+- 删 `TaskMeta.repoPath` 单值字段 + hydrate `[repoPath]` 兼容
+- 删 `start-workflow` mode 缺省 = restart 兼容、改成必传
+- 删 `local-store` 老 schema 迁移（`migrateDefaultModel` / `migrateMcpJson`）、改成纯校验
+
+**副作用**（用户拍板接受）：V0.5.9 之前的 task 打不开 / V0 spec task 崩 / 老 schema localStorage 需重配 settings / 外部脚本调 start-workflow 不带 mode 返 400（项目内 UI 无影响）。
 
 **不做**（评估后 ROI 低、用户已拍）：
 
 - ❌ 渲染 markdown + 段级高亮（手写段对齐算法易错、ROI 不高）
 - ❌ 双视图 split-view（artifact-panel 本就不大、拆栏挤）
 - ❌ SDK toolCall 事件流 diff 卡片（事件流已拥挤、bash sed 拿不到 diff 不可靠）
+- ❌ ask_user 推荐机制（一度加过、用户拍板砍）
 
-**预计成本**：5~7h
+**实际成本**：~10h（含两次反复 + 一次 cleanup）、超原估 5-7h
 
-**前置依赖**：无、V0.5.11 已经把 artifact-panel 极简到只剩文件名 toolbar、扩 diff toolbar 空间充裕
+**待联测**：迭代二的 review phase ask_user 闭环（迭代一 diff 视图用户已基本验证）
 
 ---
 

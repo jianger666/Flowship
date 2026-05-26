@@ -14,6 +14,7 @@
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import type {
+  ArtifactRevision,
   AskUserAnswer,
   NewTaskInput,
   PhaseId,
@@ -438,7 +439,7 @@ export const sendChatReply = async (
  *               fromPhase 必填、上游 artifact 复用
  *   - restart : Agent.create 新 agent 从 plan 重头跑（覆盖所有 artifact）
  *
- * 缺省 mode = "restart"（向后兼容）。
+ * mode 必填（V0.5.12.2 起、删了之前的「缺省 = restart」兼容）。
  *
  * 行为：幂等、立即返回 task；已 spawn 则返 already=true。SSE 订阅走 watchChatStream（路由复用）。
  *
@@ -449,7 +450,7 @@ export const sendChatReply = async (
 export type StartWorkflowMode = "resume" | "fork" | "restart";
 
 export interface StartWorkflowOptions {
-  mode?: StartWorkflowMode;
+  mode: StartWorkflowMode;
   fromPhase?: PhaseId;
   // V0.5.7.1：fork 时用户填的「想修什么 / 重启原因」、透传到 plan-runner 的 forkBanner、
   // 让 AI fork 同 phase 时知道这次是 fix 模式、读 git diff + reason 增量改、不 rewrite。
@@ -462,7 +463,7 @@ export const startWorkflow = async (
   apiKey: string,
   model: ModelSelection,
   mcpServers: Record<string, McpServerConfig> | undefined,
-  options?: StartWorkflowOptions,
+  options: StartWorkflowOptions,
 ): Promise<{ task: Task; already: boolean }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/start-workflow`,
@@ -473,9 +474,9 @@ export const startWorkflow = async (
         apiKey,
         model,
         mcpServers,
-        mode: options?.mode,
-        fromPhase: options?.fromPhase,
-        reason: options?.reason,
+        mode: options.mode,
+        fromPhase: options.fromPhase,
+        reason: options.reason,
       }),
     },
   );
@@ -616,4 +617,60 @@ export const submitAskReply = async (
     },
   );
   return await handleJson<{ ok: true }>(res);
+};
+
+// ----------------- Artifact Revisions（V0.5.12） -----------------
+
+/**
+ * V0.5.12：拉某 phase 的修订历史 + 当前正文
+ *
+ * 用法：前端 artifact-panel 切 phase 时 fetch 一次、拿到 revisions 数组填 dropdown options、
+ * 配 current.content 作为 diff 的 "to"。
+ */
+export const fetchArtifactRevisions = async (
+  taskId: string,
+  phase: PhaseId,
+): Promise<{
+  revisions: ArtifactRevision[];
+  current: { content: string; filename: string } | null;
+}> =>
+  await handleJson<{
+    revisions: ArtifactRevision[];
+    current: { content: string; filename: string } | null;
+  }>(
+    await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/artifact-revisions?phase=${encodeURIComponent(phase)}`,
+      { cache: "no-store" },
+    ),
+  );
+
+/**
+ * V0.5.12：拉两个时刻的 artifact 正文做对比
+ *
+ * @param from  必填、revision timestamp（来自 fetchArtifactRevisions 返的 revisions[i].timestamp）
+ * @param to    可选、revision timestamp 或 "current"、默认 "current"
+ */
+export const fetchArtifactDiff = async (
+  taskId: string,
+  phase: PhaseId,
+  from: number,
+  to: number | "current" = "current",
+): Promise<{
+  from: { content: string; timestamp: number };
+  to: { content: string; timestamp: number | null };
+}> => {
+  const params = new URLSearchParams({
+    phase,
+    from: String(from),
+    to: to === "current" ? "current" : String(to),
+  });
+  return await handleJson<{
+    from: { content: string; timestamp: number };
+    to: { content: string; timestamp: number | null };
+  }>(
+    await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/artifact-diff?${params.toString()}`,
+      { cache: "no-store" },
+    ),
+  );
 };

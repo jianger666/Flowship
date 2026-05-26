@@ -11,7 +11,7 @@
  * const args = prepareRunArgs(task);
  * if (!args) return;          // 校验失败已经 toast 了、直接 return
  * const { apiKey, model, mcpServers } = args;
- * await startWorkflow(task.id, apiKey, model, mcpServers);
+ * await startWorkflow(task.id, apiKey, model, mcpServers, { mode: "restart" });
  * ```
  *
  * 设计取舍：

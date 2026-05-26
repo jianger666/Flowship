@@ -343,6 +343,28 @@ export interface Task {
   uiLayout?: {
     artifactPanelSize?: number;
   };
+
+  // V0.5.12：每个 phase 的 artifact 修订快照清单
+  // - 用户点「再聊聊」（revise）即将让 AI 改 artifact 之前、后端先 snapshotArtifact 把当前
+  //   产物复制到 data/tasks/<id>/artifacts/.revisions/<NN>-<phase>.<ISO>.md、把记录追加这里
+  // - 不记录「agent 首次 write 初版」——那个不算 revision、ROADMAP V0.5.12 拍只覆盖 revise 路径
+  // - 每个 phase 上限 10 个、写满后 GC 删最老（snapshotArtifact 内联做、调用方无感）
+  // - 老数据没此字段、hydrate 时按 undefined 兜底、前端 fetch artifact-revisions 路由时按空数组处理
+  revisions?: Partial<Record<PhaseId, ArtifactRevision[]>>;
+}
+
+/**
+ * V0.5.12：单条 artifact 快照元数据
+ *
+ * - timestamp：snapshot 时刻（ms epoch、跟 createdAt / updatedAt 风格统一）
+ * - path：相对 `data/tasks/<id>/` 的路径、如 `artifacts/.revisions/01-plan.2026-05-25T05-44-39-123Z.md`
+ *   完整路径在服务端拼回 `path.join(taskDir(id), rev.path)`、防路径穿越（rev.path 由后端生成、不接前端入参）
+ * - size：字节数、UI dropdown 展示「这条快照大小」无需拉文件
+ */
+export interface ArtifactRevision {
+  timestamp: number;
+  path: string;
+  size: number;
 }
 
 /**
