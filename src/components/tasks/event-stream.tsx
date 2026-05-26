@@ -38,7 +38,10 @@ import { getEffectiveCwd, pathBasename } from "@/lib/path-utils";
 import type { ChatReplyImage } from "@/lib/task-store";
 import type { Task } from "@/lib/types";
 
-import { mergeAdjacentThinking } from "./event-stream/utils";
+import {
+  mergeAdjacentThinking,
+  mergeAdjacentToolCall,
+} from "./event-stream/utils";
 import {
   AskUserRequestRow,
   EventRow,
@@ -112,9 +115,12 @@ const EventStreamImpl = ({
     stickToBottomRef.current = distanceFromBottom < 50;
   };
 
-  // 渲染前合并连续 thinking、避免「思考被切碎」的视觉断裂
+  // 渲染前两道合并 pass：
+  // 1) thinking 合并：连续相邻 thinking 拼成一条、避免「思考被切碎」
+  // 2) tool_call 合并：同 phase + 同 tool name 连续 ≥2 条合一、降密度
+  //    （review 阶段一连十几条 edit artifact 一连串视觉很重、合并后变一行 ×N）
   const renderEvents = useMemo(
-    () => mergeAdjacentThinking(task.events),
+    () => mergeAdjacentToolCall(mergeAdjacentThinking(task.events)),
     [task.events],
   );
 

@@ -118,12 +118,97 @@ export const DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set([
   "user_reply",
 ]);
 
-// 折叠态摘要：取首行（按 \n 切）、再截到 max 字符
-// 思考 / tool_call 这种动辄几百字的、折叠后只看一眼一行就够
-export const summarize = (text: string, max = 80): string => {
-  const firstLine = text.split("\n")[0]?.trim() ?? "";
-  if (firstLine.length <= max) return firstLine;
-  return `${firstLine.slice(0, max)}…`;
+// 折叠态摘要：把所有换行 / 多空白压成单空格、再 200 字截
+// 历史方案：取首行 + 80 字。问题：thinking / tool_call 首行常常很短
+// （像「The user wants to」这种 setup 句）、80 字以内不加省略号、用户看不到
+// 「下面还有内容」的暗示——视觉上就一句短话、像内容只有这点
+// 现方案：合并所有行、给 truncate class 一段足够长的预览、容器宽度截到哪
+// 算哪、超出自动 `...`、最后一道 200 字兜底（防极端 case 全 string 都进 DOM）
+export const summarize = (text: string, max = 200): string => {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max)}…`;
+};
+
+// ===========================================
+// tool_call 合并（V0.5.13 事件流密度优化）
+// ===========================================
+
+// tool_call 合并后、保留每条子条信息、展开时一行一条
+// id / ts 给 React key + 时间显示用、text 是原 ev.text、name 给展开时显示 tool 类型前缀
+export interface ToolCallBatchItem {
+  id: string;
+  ts: number;
+  text: string;
+  name: string;
+}
+
+// 从 ev.meta 里安全取出 tool name（chat-runner / plan-runner 写入时塞了 meta.name）
+const getToolName = (ev: TaskEvent): string =>
+  typeof ev.meta?.name === "string" ? ev.meta.name : "";
+
+/**
+ * 合并相邻 tool_call（同 phase、不分 tool 名）
+ *
+ * V0.5.13 初版要求「同 tool name」连续才合并、但实测 AI 探索式调用经常 read /
+ * grep / edit 交错（『read 1.tsx → grep "useMemo" → read 2.tsx → edit ...』）、
+ * 严格相邻不触发、压不了几条。
+ *
+ * 用户拍板放宽到「同 phase 连续 tool_call」、不分 tool 名（Cursor IDE 风格）：
+ *   - 折叠态：「工具调用 ×N」+ 最后一条 ev.text 摘要、给用户看「收尾在干嘛」
+ *   - 展开态：每条子条带 `[tool name]` prefix、看得清谁是谁
+ *   - meta.batch 保留所有子条 + 每条的 tool name、UI 展开时列表展示
+ *   - meta.count 给折叠态显示「×N」
+ *
+ * 不动 events.jsonl 落盘内容（原貌保留、便于复盘）、只在 UI 渲染前合并。
+ */
+export const mergeAdjacentToolCall = (events: TaskEvent[]): TaskEvent[] => {
+  const out: TaskEvent[] = [];
+  for (const ev of events) {
+    const last = out[out.length - 1];
+    if (
+      ev.kind === "tool_call" &&
+      last &&
+      last.kind === "tool_call" &&
+      last.phase === ev.phase
+    ) {
+      const prevBatch = Array.isArray(last.meta?.batch)
+        ? (last.meta.batch as ToolCallBatchItem[])
+        : null;
+      const curItem: ToolCallBatchItem = {
+        id: ev.id,
+        ts: ev.ts,
+        text: ev.text,
+        name: getToolName(ev),
+      };
+      const newBatch: ToolCallBatchItem[] = prevBatch
+        ? [...prevBatch, curItem]
+        : [
+            {
+              id: last.id,
+              ts: last.ts,
+              text: last.text,
+              name: getToolName(last),
+            },
+            curItem,
+          ];
+      out[out.length - 1] = {
+        ...last,
+        // 显示最后一条作为代表文本（reflect 最新状态）
+        text: ev.text,
+        // ts 用最后一条、不然「时间」显示成第一条很奇怪
+        ts: ev.ts,
+        meta: {
+          ...(last.meta ?? {}),
+          batch: newBatch,
+          count: newBatch.length,
+        },
+      };
+    } else {
+      out.push(ev);
+    }
+  }
+  return out;
 };
 
 /**

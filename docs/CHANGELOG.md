@@ -15,6 +15,54 @@
 
 ---
 
+### V0.5.11：系统瘦身 + 提示词重构 + 文档拆分（2026-05-23）
+
+**背景**：用户拍板「整理 + 瘦身系统」三件事：①清死代码 ②重构 plan-runner 提示词拼接的三目运算地狱 ③扫不合理可优化的代码。
+
+**Tier 1：死代码清理（5 处）**
+
+- 删 `prompts/test-checklist-v0.3.5.md`（自标记 V0.3.6 该删、孤儿文件）
+- 删 `src/app/api/tasks/[id]/run-plan/` / `start-chat/` / `rerun-phase/` 三个空路由目录（V0.2/V0.4 已迁走、目录留壳）
+- 修 `plan-runner.ts` L847 死三目 `nextPhase ? "running" : "running"` → `"running"`
+
+**Tier 2：plan-runner 提示词模板化**
+
+- 新建 `prompts/_super.md`（~340 行、super-prompt 全模板化）
+- `plan-runner.ts`：1651 → 1432 行（-219、-13%）
+- `buildSuperPrompt()`：~443 → ~100 行（仅变量拼装）
+- 抽 `buildForkBanner()` helper、`renderSuperPromptTemplate()`（空字符串保留字面、区别于 `fillTemplate`）
+- 收益：以后改 prompt 文案改 `_super.md` 一处、不用碰 .ts
+
+**Tier 3：event-stream.tsx 模块拆分**
+
+- 原 890 行单文件 → 主文件 427 + `event-stream/utils.tsx` 188 + `event-stream/rows.tsx` 343
+- utils：EVENT_LABEL / renderEventIcon / formatTs / mergeAdjacentThinking / summarize / meta 解析等纯函数
+- rows：MarkdownText / StreamingAssistantRow / EventRow / AskUserRequestRow
+
+**Tier 3 评估后不拆**（ROI 低）：
+
+- `task-fs.ts`（1067 行）：结构已按功能段清晰分块、拆开需要 export 内部 helper 污染 public API
+- `chat-mcp.ts`（1160 行）：核心是 stateful module（pendingMap / sessionTransports / awaitingNotifier 全 module-level）、拆需要把 state 提到 store class、改动面大风险高
+
+**文档瘦身**：
+
+- HANDOFF.md：2018 → ~300 行、拆出「当前架构快照」+「最近演进」窗口
+- 新建 `docs/CHANGELOG.md`：1954 行、V0.2 ~ V0.5.9 全部演进档案、时间倒序（新在上）
+- 写入规则化：新子版本先写 HANDOFF「最近演进」、再老一轮时迁到 CHANGELOG.md 顶部
+
+**Hot-fix 4：artifact-panel 删「渲染 / 原文」切换（2026-05-25）**
+
+- 用户反馈实际无看 raw markdown 的场景、保留切换徒增心智
+- `artifact-panel.tsx`：删 `mode` useState / 「渲染 / 原文」两个 Button / `Code2`/`Eye` 图标 import / source 分支渲染
+- toolbar 顶部只剩文件名、永远走 ReactMarkdown
+- 净减 32 行
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（21 routes 全编译成功、10/10 static pages）
+
+**下个迭代标记**：V0.5.12「artifact diff 视图」规划已对齐（见 `docs/ROADMAP.md`）、本轮代码 0 改动。
+
+---
+
 ##### 补 V0.5.10：revise 交互二分类铁则 + Resizable 分栏（2026-05-23、用户拍板）
 
 **背景**（用户原话）：「再聊聊的结果不可控、有时候 AI 是弹窗过来问问题、有时候是在事件流回答我、有时候甚至都不回答我就直接开始改 md、总之什么情况都有。这个交互需要统一」

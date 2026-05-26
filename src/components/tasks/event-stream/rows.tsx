@@ -35,6 +35,7 @@ import {
   formatTs,
   renderEventIcon,
   summarize,
+  type ToolCallBatchItem,
 } from "./utils";
 
 /**
@@ -113,6 +114,14 @@ export const EventRow = ({
   // thinking / tool_call / info / error 一律纯文本（结构化输出 / 错误消息、markdown 反而碍事）
   const useMarkdown = isAssistant || isUser;
 
+  // tool_call 合并卡判定（V0.5.13）：mergeAdjacentToolCall 给同 phase + 同 tool name
+  // 连续 ≥2 条合一时塞 meta.batch + meta.count、UI 折叠 / 展开走 batch 分支
+  const batch = useMemo<ToolCallBatchItem[] | null>(
+    () => (Array.isArray(ev.meta?.batch) ? (ev.meta.batch as ToolCallBatchItem[]) : null),
+    [ev.meta],
+  );
+  const batchCount = batch?.length ?? 0;
+
   // user_reply 才解 meta.images / meta.attachments、其他 kind 一律空
   // 避免每行都跑一遍 extract
   const images = useMemo(
@@ -134,8 +143,9 @@ export const EventRow = ({
   const handleToggle = () => setCollapsed((c) => !c);
 
   // 折叠态文本：摘要、不让超长
-  // 展开态：原样 ev.text
-  const summary = summarize(ev.text);
+  // 展开态：原样 ev.text；batch 模式下展开走 batch 列表
+  // batch 模式 summary 追加「×N」后缀、用户一眼看到「这 N 条都是同种工具调用」
+  const summary = batch ? `${summarize(ev.text)} ×${batchCount}` : summarize(ev.text);
 
   return (
     <div
@@ -177,19 +187,42 @@ export const EventRow = ({
           )}
         </button>
         {/* 展开态才渲染 body */}
-        {!collapsed && (
-          <div
-            className={cn(
-              "mt-1 leading-relaxed wrap-break-word",
-              // tool_call 文本里常含长 JSON 路径、break-all 比 break-words 更强（任意字符断行）
-              isToolCall && "break-all font-mono text-[11px] text-foreground/80",
-              isThinking && "italic text-muted-foreground",
-              !isToolCall && !isThinking && !useMarkdown && "text-foreground",
-            )}
-          >
-            {useMarkdown ? <MarkdownText text={ev.text} /> : ev.text}
-          </div>
-        )}
+        {!collapsed &&
+          (batch ? (
+            // tool_call 合并卡展开：列表展示每条子 tool_call 的时间 + tool 名 + 文案
+            // 一行一条、紧凑、所有路径 break-all 防溢出
+            // V0.5.13.1 合并放宽到「不分 tool 名」、给每条加 `[name]` prefix 看得清谁是谁
+            <ul className="mt-1 space-y-1">
+              {batch.map((item) => (
+                <li
+                  key={item.id}
+                  className="flex gap-2 break-all font-mono text-[11px] text-foreground/80"
+                >
+                  <span className="shrink-0 text-muted-foreground">
+                    {formatTs(item.ts)}
+                  </span>
+                  {item.name && (
+                    <span className="shrink-0 rounded bg-blue-500/10 px-1 text-blue-600 dark:text-blue-400">
+                      {item.name}
+                    </span>
+                  )}
+                  <span className="min-w-0 flex-1">{item.text}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div
+              className={cn(
+                "mt-1 leading-relaxed wrap-break-word",
+                // tool_call 文本里常含长 JSON 路径、break-all 比 break-words 更强（任意字符断行）
+                isToolCall && "break-all font-mono text-[11px] text-foreground/80",
+                isThinking && "italic text-muted-foreground",
+                !isToolCall && !isThinking && !useMarkdown && "text-foreground",
+              )}
+            >
+              {useMarkdown ? <MarkdownText text={ev.text} /> : ev.text}
+            </div>
+          ))}
         {/* user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
             点缩略图新 tab 打开看大图、不内嵌 lightbox（保持轻量、浏览器自带的图片查看够用）*/}
         {isUser && images.length > 0 && (

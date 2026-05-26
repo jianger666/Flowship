@@ -14,7 +14,7 @@
 
 1. `.cursor/rules/project-context.mdc` —— 强制约束
 2. `.cursor/rules/learned-conventions.mdc` —— 编码风格
-3. 本文件的「当前架构快照」段（V0.5 系列、稳定架构）+「最近演进」段（V0.5.11 + V0.5.12 四轮迭代：diff 视图 / review 闭环 / 全局遗留清理 / review prompt 5 点精修）
+3. 本文件的「当前架构快照」段（V0.5 系列、稳定架构）+「最近演进」段（V0.5.13 事件流密度优化 + V0.5.12 四轮迭代：diff 视图 / review 闭环 / 全局遗留清理 / review prompt 5 点精修）
 4. `prompts/_super.md` —— **super-prompt 主模板**（V0.5.11 抽出、占位符注入式、改模板优先在这里改、不再回 .ts 改硬编码）
 5. `prompts/_shared.md` —— **三 phase 通用 artifact 写法 + 跨 phase 规则**（V0.5.7.7 抽出、改 phase prompt 前必读、避免漏改一处导致跨 phase 不一致）
 6. `prompts/phase-1-plan.md` / `prompts/phase-2-build.md` / `prompts/phase-3-review.md` —— phase 特有约束
@@ -204,6 +204,38 @@ ask_user 答完后 agent 落地：
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.5.13：事件流密度优化（summarize 全文压缩 + tool_call 合并）（2026-05-26）
+
+**背景**（用户跑完 V0.5.12 第三轮联测后即时反馈）：
+
+1. 思考块折叠态文本「没占满一排就省略 + 没省略号」、用户看到一句短话不知道下面还有几行
+2. review 阶段 agent 频繁 edit `01-plan.md` / `03-review.md`、tool_call 一连十几条卡片刷屏（review 闭环的副作用）
+
+**改动**（全在 `src/components/tasks/event-stream/`）：
+
+1. **`summarize` 改全文空白压缩 + 200 字截**
+   - 原本：取 `text.split("\n")[0]` 首行、80 字截、首行短不加省略号
+   - 现在：`text.replace(/\s+/g, " ").trim()` 拍平、200 字兜底
+   - 配合 truncate class：容器宽度截到哪算哪、自动 `…`、用户看到尽量满的预览
+2. **`mergeAdjacentToolCall` 新增（V0.5.13.1 hot-fix 后）**
+   - **初版**：同 phase + 同 `meta.name`（tool 名）连续 ≥2 条 tool_call 合一卡
+   - **hot-fix 放宽**（用户实测拍板）：去掉「同 tool name」约束、改成「同 phase 连续 tool_call」就合并
+     - 原因：AI 探索式调用经常 `read → grep → read → edit` 交错、严格相邻不触发、压不了几条
+     - 折叠态：「工具调用 ×N」+ 最后一条 `summarize(ev.text)` 摘要（给用户看「收尾在干嘛」）
+     - 展开态：每条子条带 `[tool name]` prefix（蓝色 badge）、看得清谁是谁
+   - `meta.batch = [{ id, ts, text, name }]` 保留所有子条
+   - `meta.count` 给折叠态显示「×N」后缀
+   - 类似 `mergeAdjacentThinking` 不动 events.jsonl 落盘内容、只在 UI 渲染前合并
+   - `event-stream.tsx` 的 `renderEvents` useMemo 两道 pass：thinking 合并 → tool_call 合并
+3. **`EventRow` batch 折叠态展示**
+   - 折叠态文本：`${summarize(ev.text)} ×N` 后缀
+   - 展开态：列表展示每条 `[name] {text} {ts}`、字号 [11px] 紧凑 mono
+   - 不可展开的 single tool_call 走原逻辑
+
+**用户拍板未选**：C 方案「显示工具调用 / 思考 / phase 边界」过滤器 toggle——每次都要用户操作太烦。B 方案被动降密度、跟 Cursor IDE 行为一致。
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
 ### V0.5.12.3：review prompt 5 点精修 + 第二轮联测 hot-fix（2026-05-26）
 
 **背景**：用户实测 V0.5.12.2 闭环后跑了一道任务 `t_1779688487844_9kzpdc`、闭环 work（agent 调 ask_user / 用户选 b / agent edit plan / 追加用户决策段）、但发现 5 个不完美点。本轮先做 prompt 精修、再跑一轮联测、发现 2 个新边界 case 一并修。
@@ -355,53 +387,7 @@ Diff 视图实现：
 
 **待联测**：跑一道真任务、plan 出方案 → 「再聊聊」改一处 → 等 AI 改完、看 banner 是否浮现、切 Diff 是否清晰看到红绿对比
 
-### V0.5.11：系统瘦身 + 提示词重构 + 文档拆分（2026-05-23）
-
-**背景**：用户拍板「整理 + 瘦身系统」三件事：①清死代码 ②重构 plan-runner 提示词拼接的三目运算地狱 ③扫不合理可优化的代码。
-
-**Tier 1：死代码清理（5 处）**
-
-- 删 `prompts/test-checklist-v0.3.5.md`（自标记 V0.3.6 该删、孤儿文件）
-- 删 `src/app/api/tasks/[id]/run-plan/` / `start-chat/` / `rerun-phase/` 三个空路由目录（V0.2/V0.4 已迁走、目录留壳）
-- 修 `plan-runner.ts` L847 死三目 `nextPhase ? "running" : "running"` → `"running"`
-
-**Tier 2：plan-runner 提示词模板化**
-
-- 新建 `prompts/_super.md`（~340 行、super-prompt 全模板化）
-- `plan-runner.ts`：1651 → 1432 行（-219、-13%）
-- `buildSuperPrompt()`：~443 → ~100 行（仅变量拼装）
-- 抽 `buildForkBanner()` helper、`renderSuperPromptTemplate()`（空字符串保留字面、区别于 `fillTemplate`）
-- 收益：以后改 prompt 文案改 `_super.md` 一处、不用碰 .ts
-
-**Tier 3：event-stream.tsx 模块拆分**
-
-- 原 890 行单文件 → 主文件 427 + `event-stream/utils.tsx` 188 + `event-stream/rows.tsx` 343
-- utils：EVENT_LABEL / renderEventIcon / formatTs / mergeAdjacentThinking / summarize / meta 解析等纯函数
-- rows：MarkdownText / StreamingAssistantRow / EventRow / AskUserRequestRow
-
-**Tier 3 评估后不拆**（ROI 低）：
-
-- `task-fs.ts`（1067 行）：结构已按功能段清晰分块、拆开需要 export 内部 helper 污染 public API
-- `chat-mcp.ts`（1160 行）：核心是 stateful module（pendingMap / sessionTransports / awaitingNotifier 全 module-level）、拆需要把 state 提到 store class、改动面大风险高
-
-**文档瘦身**：
-
-- HANDOFF.md：2018 → ~300 行、拆出「当前架构快照」+「最近演进」窗口
-- 新建 `docs/CHANGELOG.md`：1954 行、V0.2 ~ V0.5.9 全部演进档案、时间倒序（新在上）
-- 写入规则化：新子版本先写 HANDOFF「最近演进」、再老一轮时迁到 CHANGELOG.md 顶部
-
-**Hot-fix 4：artifact-panel 删「渲染 / 原文」切换（2026-05-25）**
-
-- 用户反馈实际无看 raw markdown 的场景、保留切换徒增心智
-- `artifact-panel.tsx`：删 `mode` useState / 「渲染 / 原文」两个 Button / `Code2`/`Eye` 图标 import / source 分支渲染
-- toolbar 顶部只剩文件名、永远走 ReactMarkdown
-- 净减 32 行
-
-**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（21 routes 全编译成功、10/10 static pages）
-
-**下个迭代标记**：V0.5.12「artifact diff 视图」规划已对齐（见 `docs/ROADMAP.md`）、本轮代码 0 改动。
-
-> V0.5.10「revise 二分类铁则 + Resizable 分栏」细节已迁到 `docs/CHANGELOG.md`「补 V0.5.10」段。本窗口当前留：V0.5.12 四轮迭代（diff 视图 / review 闭环 / 全局清理 / review prompt 5 点精修）+ V0.5.11。下次再做 V0.5.13 时把 V0.5.11 整体迁到 CHANGELOG.md。
+> V0.5.10「revise 二分类铁则 + Resizable 分栏」+ V0.5.11「系统瘦身 + 提示词重构 + 文档拆分」细节已迁到 `docs/CHANGELOG.md` 同名段。本窗口当前留：V0.5.13（事件流密度优化）+ V0.5.12 四轮迭代（diff 视图 / review 闭环 / 全局清理 / review prompt 5 点精修）。下次再做 V0.5.14 时把 V0.5.12 整体迁到 CHANGELOG.md。
 
 ---
 
