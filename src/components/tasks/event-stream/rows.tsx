@@ -10,7 +10,7 @@
  *   - AskUserRequestRow：ask_user 事件历史回放卡（V0.3.2 起交互移到 modal、这里只放历史）
  */
 
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
@@ -78,7 +78,7 @@ export const MarkdownText = ({ text }: { text: string }) => (
  *
  * 视觉提示：左侧图标 + 标签「AI 回复中...」+ 末尾闪烁光标、明显区分「流式中」vs「已完成」
  */
-export const StreamingAssistantRow = ({ text }: { text: string }) => (
+const StreamingAssistantRowImpl = ({ text }: { text: string }) => (
   <div className="flex gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2">
     <div className="mt-0.5 shrink-0">
       <Sparkles className="size-4 animate-pulse text-emerald-500" />
@@ -99,7 +99,11 @@ export const StreamingAssistantRow = ({ text }: { text: string }) => (
   </div>
 );
 
-export const EventRow = ({
+// React.memo（V0.5.14）：text 频繁因 chunk 追加而变化、其他时候稳定
+// memo 让 SSE 推 chunk 时只有 text 真的变了才重渲染、Virtuoso 内部 item 不无意义 reconcile
+export const StreamingAssistantRow = memo(StreamingAssistantRowImpl);
+
+const EventRowImpl = ({
   ev,
   taskId,
 }: {
@@ -292,6 +296,10 @@ export const EventRow = ({
   );
 };
 
+// React.memo（V0.5.14）：props 是 ev / taskId 这种引用稳定值、Virtuoso 滚动时
+// 已渲染 item 不重渲染、SSE 推新 chunk 时其他 item props 不变也跳过 reconcile
+export const EventRow = memo(EventRowImpl);
+
 // ===========================================
 // AskUserRequestRow（V0.3.2 简化版：纯回放卡片）
 // ===========================================
@@ -312,7 +320,7 @@ interface AskUserRequestRowProps {
   task: Task;
 }
 
-export const AskUserRequestRow = ({ ev, task }: AskUserRequestRowProps) => {
+const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
   const askId =
     ev.meta && typeof ev.meta.askId === "string" ? ev.meta.askId : "";
 
@@ -374,3 +382,7 @@ export const AskUserRequestRow = ({ ev, task }: AskUserRequestRowProps) => {
     </div>
   );
 };
+
+// React.memo（V0.5.14）：props 是 ev / task、ev 稳定 + task 父组件 memo 过的引用
+// 跟 EventRow 同理、SSE 频繁推 chunk 时 ask 卡片不无意义重渲染
+export const AskUserRequestRow = memo(AskUserRequestRowImpl);

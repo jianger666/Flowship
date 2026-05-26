@@ -18,6 +18,7 @@
  */
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
   File as FileIcon,
   Folder,
@@ -36,7 +37,7 @@ import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { getEffectiveCwd, pathBasename } from "@/lib/path-utils";
 import type { ChatReplyImage } from "@/lib/task-store";
-import type { Task } from "@/lib/types";
+import type { Task, TaskEvent } from "@/lib/types";
 
 import {
   mergeAdjacentThinking,
@@ -47,6 +48,21 @@ import {
   EventRow,
   StreamingAssistantRow,
 } from "./event-stream/rows";
+
+// streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
+// kind 用未出现在 EventKind 里的字面量、做 discriminated union 区分
+// 这样 streamingText 不再走 Footer / Component slot、而是直接进 data 数组、
+// followOutput 跟着它的追加触发滚动、不用单独 ref 控制
+interface StreamingItem {
+  kind: "__streaming__";
+  id: string;
+  text: string;
+}
+
+type RenderItem = TaskEvent | StreamingItem;
+
+const isStreamingItem = (it: RenderItem): it is StreamingItem =>
+  it.kind === "__streaming__";
 
 interface Props {
   task: Task;
@@ -97,47 +113,25 @@ const EventStreamImpl = ({
   // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
-  // 滚动容器：智能置底用
-  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Virtuoso 句柄：必要时用于手动 scrollToIndex（目前没用上、留着兜底）
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // 智能置底：仅当用户「贴在底部」时新事件才把视图滚到底
-  // 用户主动往上滚就不再强制下拉、滚回底部时自动重新激活
-  // 用 ref 而不是 state、避免每次滚动都触发 re-render
-  const stickToBottomRef = useRef(true);
-
-  // 滚动事件：判断是否贴底（< 50px 就视为贴底、宽容滚动条像素差）
-  const handleScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distanceFromBottom < 50;
-  };
-
-  // 渲染前两道合并 pass：
+  // 渲染前两道合并 pass + 拼 streaming placeholder：
   // 1) thinking 合并：连续相邻 thinking 拼成一条、避免「思考被切碎」
-  // 2) tool_call 合并：同 phase + 同 tool name 连续 ≥2 条合一、降密度
-  //    （review 阶段一连十几条 edit artifact 一连串视觉很重、合并后变一行 ×N）
-  const renderEvents = useMemo(
-    () => mergeAdjacentToolCall(mergeAdjacentThinking(task.events)),
-    [task.events],
-  );
-
-  // 新事件 / artifact 触发的 events.length 变化：贴底时才滚到底
-  // V0.5.13.4 bug fix：dep 从 renderEvents.length 换回 task.events.length
-  //   合并算法（mergeAdjacentThinking / mergeAdjacentToolCall）把多条事件合一条、
-  //   连续 tool_call / thinking 来时 renderEvents.length 不变、useEffect 不触发滚动——
-  //   现象：用户反馈「自动滚动经常失效」。改成原始 events.length（单调递增）就稳。
-  //   合并卡 batch 内容变化导致 DOM 高度增加、贴底滚动跟着触发、视觉正确。
-  // streamingText.length 也加入 dep：流式打字时贴底跟随、不然字一直加但视图不动
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    if (stickToBottomRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [task.events.length, streamingText?.length]);
+  // 2) tool_call 合并：同 phase 连续 ≥2 条合一、降密度（review 阶段一连
+  //    十几条 edit artifact 视觉重、合并后变一行 ×N）
+  // 3) streamingText 非空时追加为末尾 `__streaming__` 虚拟 item、跟普通 event
+  //    一起参与虚拟滚动 + followOutput 贴底跟随
+  const items: RenderItem[] = useMemo(() => {
+    const merged = mergeAdjacentToolCall(mergeAdjacentThinking(task.events));
+    if (!streamingText) return merged;
+    return [
+      ...merged,
+      { kind: "__streaming__", id: "__streaming__", text: streamingText },
+    ];
+  }, [task.events, streamingText]);
 
   // V0.4：输入框可用 = 父组件传 canReply（chat-view 自由化用）
   // 父组件没传时回退老行为 status === "awaiting_user"（plan 模式用、不影响）
@@ -234,39 +228,45 @@ const EventStreamImpl = ({
       <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
         事件流
       </div>
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto"
-      >
-        <div className="flex flex-col gap-3 p-4">
-          {renderEvents.length === 0 && !streamingText ? (
-            <div className="text-xs text-muted-foreground">
-              任务还没开始、暂无事件
-            </div>
-          ) : (
-            <>
-              {renderEvents.map((ev) => {
-                if (ev.kind === "ask_user_request") {
-                  // 单独走 AskUserRequestRow、内含选项按钮 + Other textarea + 提交逻辑
-                  // 已经回答过的、显示 disabled 状态（看 task.events 里 ask_user_reply 是否存在）
-                  return (
-                    <AskUserRequestRow
-                      key={ev.id}
-                      ev={ev}
-                      task={task}
-                    />
-                  );
-                }
-                return <EventRow key={ev.id} ev={ev} taskId={task.id} />;
-              })}
-              {/* 流式 placeholder：仅当后端在推 chunk 时显示、收到正式 assistant_message 事件后清空 */}
-              {streamingText && (
-                <StreamingAssistantRow text={streamingText} />
-              )}
-            </>
-          )}
-        </div>
+      {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll */}
+      <div className="min-h-0 flex-1">
+        {items.length === 0 ? (
+          <div className="p-4 text-xs text-muted-foreground">
+            任务还没开始、暂无事件
+          </div>
+        ) : (
+          <Virtuoso
+            ref={virtuosoRef}
+            className="h-full"
+            data={items}
+            // 贴底跟随语义：用户贴在底部时新 item 来自动滚（smooth）；
+            // 用户主动滚走看历史时不打扰；滚回底部恢复跟随
+            // 这一行替代了老的 stickToBottomRef + handleScroll + autoScroll useEffect、
+            // 库自己维护「是否贴底」、不需要外部 ref 状态
+            followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
+            // 初始定位到末尾（任务详情首次进来直接看最新事件、不用手动滚）
+            initialTopMostItemIndex={items.length - 1}
+            // 每条 item 自带 padding、模拟原 gap-3 + p-4 间距
+            // pt 用 idx 0 给 4 / 其他给 3、pb 给末尾 4 / 其他无（让 pt 接力）
+            itemContent={(idx, item) => (
+              <div
+                className={cn(
+                  "px-4",
+                  idx === 0 ? "pt-4" : "pt-3",
+                  idx === items.length - 1 && "pb-4",
+                )}
+              >
+                {isStreamingItem(item) ? (
+                  <StreamingAssistantRow text={item.text} />
+                ) : item.kind === "ask_user_request" ? (
+                  <AskUserRequestRow ev={item} task={task} />
+                ) : (
+                  <EventRow ev={item} taskId={task.id} />
+                )}
+              </div>
+            )}
+          />
+        )}
       </div>
       {/* hideReplyComposer=true 时（plan workflow 模式）只展示事件流、底部输入区由父组件用 phase ack 区替代
           这里 early-return 避免下面整大段 JSX 进 DOM、也避免 FsPickerDialog 多挂一个 */}

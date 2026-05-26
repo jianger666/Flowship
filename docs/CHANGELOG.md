@@ -15,6 +15,159 @@
 
 ---
 
+### V0.5.12.3：review prompt 5 点精修 + 第二轮联测 hot-fix（2026-05-26）
+
+**背景**：用户实测 V0.5.12.2 闭环后跑了一道任务 `t_1779688487844_9kzpdc`、闭环 work（agent 调 ask_user / 用户选 b / agent edit plan / 追加用户决策段）、但发现 5 个不完美点。本轮先做 prompt 精修、再跑一轮联测、发现 2 个新边界 case 一并修。
+
+#### 第一轮：5 个 prompt 改动（全在 `prompts/phase-3-review.md`）
+
+1. **P0 strikethrough 分场景规则**（§7.2）：表格 cell 里加 `~~xxx~~` 会破坏列对齐 + markdown 不渲染、agent 会偷偷绕过。改成分场景规则：
+   - 段落 / 单层 list item → strikethrough 划掉旧描述、新值跟在后面、末尾加补录标记
+   - 表格 cell → 表格直接改新值、用 blockquote 留痕「⚠️ review ack 补录：<字段> 原 X、改为 Y（用户在 ask_user 答 b 接受偏差）」
+   - 嵌套 list item → 上层是字符串用 strikethrough、整体清单变更用 blockquote
+   - 反例明确禁掉「`| field | ~~old~~ new | ... |`」
+2. **P1 飞书未覆盖项纳入闭环**（§7 触发条件 + §7.1 第 3 个 question 模板 + §7.2 落地路径）：之前只闭「实现偏差 + 未完成 task」、漏了「跟飞书需求对照」表里 ❌ 未覆盖 项（飞书原文有、plan 漏列了、build 也没做的）。加 question 模板 `options = [a 加进 plan 作 follow-up / b 接受不做（plan §6 留痕）/ c 跨角色跨仓库不留痕]` + 三条落地路径
+3. **P2「§ 用户决策」段位置固定**（骨架加 HTML 注释 + §7.4 第 1 条）：明确放在「未完成 task」段后、「跟飞书需求对照」段前、不要追加到 artifact 末尾。打破阅读流的 anti-pattern 列出来
+4. **P3「§ 修改记录」段语义严格**（§7.4 第 2 条）：明确「§7 闭环动作（ask_user 问 / edit plan / 追加决策段）**不属于** §修改记录、§修改记录段只在用户 ack=revise 后按 feedback 改时才追加」。防止双写
+5. **P4 plan 拍板口径显性复核**（§1 表格备注 + 骨架加 ## plan 拍板口径复核 段 + §6 提醒）：plan agent 内联的 `> ✅ ask_user 已确认 X` 备注、每条都得列到这个新段、给「✅ 一致 / ⚠️ 跑偏 / N/A 没用到」三选一结论
+
+#### 第二轮：联测发现的 hot-fix（同日跑下来的边界 case）
+
+跑了第二轮真任务（`t_1779688487844_9kzpdc` 回滚 plan + 重跑 review）、5 点行为全部按新规则执行——但发现 2 个新边界 case：
+
+6. **P0.1 blockquote 位置铁则**（§7.2 新增第 4 条）：agent 把 blockquote 插到表格行之间 / list 项之间、破坏 markdown 结构。实测：
+   - §2.1 表格被改的 `questionData` 那行紧下方插 blockquote、后面 `mathLevelV2` / `studyPurpose` 两行被切到 blockquote 后面、render 时表格断、那两行变成普通文本
+   - §5 Task 1 子列表「`- 改动:`」和「`- 依赖:`」之间插 blockquote、`- 依赖` 起头一个新 list、不再是 task 子项
+   - 修：明确「blockquote 必须放在**整个表格 / 整个 list 块结束之后**、不能插中间」、加正确做法 + 反例
+7. **P4.1 拍板口径复核段职责严格**：agent 把 review ack 补录的项也列到「plan 拍板口径复核」段（混淆「plan 阶段拍板」和「review 阶段拍板」）。修：明确「本段只列 plan 阶段 `> ✅ ask_user 已确认` 备注、review ack 补录（`> ⚠️ review ack 补录`）归『§ 用户决策』段、不重复列」
+
+#### 第三轮：start-workflow fork 模式漏 ack 上游 phase（代码修复）
+
+8. **`plan-runner.ts` fork 路径自动 ack 上游 phase**（V0.5.12.3 hot-fix）：实测发现 `start-workflow` 路由的 fork 模式（用户在 AdvanceDialog 选「推进 → fork → fromPhase=review」）**只 reset 下游 phase 到 pending、不 markPhaseAcked 上游 phase**——build 状态永远卡在 `awaiting_ack`、UI 显示「BUILD 待确认」、但 review 已经基于 build 跑完了、状态机和实际进度脱节、用户视角懵。
+   - 修：fork 路径加循环、对 fromPhase 之前的所有 phase 调 `patchPhase status=ack` + 写 `phase_ack` 事件（meta.autoAck=true）
+   - 语义：「fork from X」= 「用户认可 X 之前所有 phase 的产出」、自动 ack 符合直觉
+   - 区分 `phase-ack` 路由 fork：那条路径已经在自己路径里调 markPhaseAcked(ackPhase)、走到 plan-runner 时上游已 ack；本修复覆盖的是 `start-workflow` 路由直接 fork 的场景
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
+**待联测**：跑新任务（或 fork 老任务再来一轮）、看 review agent 在新 prompt 下是否避开 blockquote 中插问题；fork 从 review 时上游 build phase 状态自动变 ack。
+
+### V0.5.12.2：全局遗留清理（开发期不写兼容代码原则的一次集中执行）（2026-05-26）
+
+**背景**：上一轮做 review phase ask_user 闭环时一度加了 `recommended` 字段、用户实测后拍板「都删、删赶紧、我不希望代码有各种遗留」、顺势让我扫整个项目把其它「向后兼容代码」也清一遍。项目规则原话「开发期不写向后兼容代码、改 schema 直接删旧」、这次集中兑现。
+
+**删的四块**：
+
+1. **`recommended` 推荐机制全链路**（`AskUserQuestion` 字段 + chat-mcp zod schema + ask-user-dialog 一键接受按钮 + 推荐徽章 + prompts/phase-3-review.md 推荐文案）
+2. **`task-fs.ts` V0/V1 老 artifact 兜底**：
+   - `readArtifact` / `writeArtifact` 不再回退到 task 根的 `<phase>.md`、只走 `artifacts/<NN>-<phase>.md`
+   - `phaseArtifactFilename` idx<0 改成抛错（不再返 legacy `<phase>.md`）
+   - 删 `sanitizeCurrentPhase`（V0 时代 `spec` phase 兜底）、`currentPhase` 直接读 meta
+   - 文件头注释从「spec.md / plan.md / build.md 平铺在 task 根」改成 V0.5 的 `artifacts/01-plan.md` 子目录布局
+3. **`repoPath` 单值字段**（V0.5.9 改 `repoPaths: string[]` 数组、当时留了 hydrate `[repoPath]` 兜底）：删 TaskMeta `repoPath?` 字段 + 删 hydrate 双向兼容、`repoPaths: meta.repoPaths ?? []` 一行搞定
+4. **`start-workflow` mode 缺省 = restart**（V0.5.7 加的「老 UI 不传 mode 时默认 restart」）：mode 改成必传、不传返 400；`StartWorkflowOptions.mode` 改非可选；`task-store.startWorkflow` 签名 options 改非可选
+5. **`local-store.ts` 老 schema 兼容**：删 `migrateDefaultModel`（早期 string → ModelSelection）+ `migrateMcpJson`（早期裸 server map → 带 wrapper）的迁移逻辑、改成纯校验「字段形态不对就回默认值」
+
+**副作用** （用户拍板接受）：
+
+- V0.5.9 之前的 task 打不开（meta.json 里只有 `repoPath` 单值的）——本地 data/tasks/ 老任务作废
+- V0 时代 currentPhase=`spec` 的 task 打开会崩——更老的、应该已经没了
+- localStorage 里存的老 schema settings 读不出来、用户需重配 API key + 模型 + MCP（5 分钟）
+- 外部脚本不带 mode 调 `/start-workflow` API 会 400（项目内 UI 全部走 AdvanceDialog 显式传 mode、无影响）
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓
+
+### V0.5.12（迭代二）：review phase 闭环（ask_user + 直改 plan）（2026-05-25）
+
+**背景**（用户实测 V0.5.12 迭代一 diff 视图后提的问题）：跑了一道任务、review phase 列出「实现偏差」段建议「接受偏差并更新 plan」、但用户在 ack 时不知道怎么落地——「更新 plan」这个动作没人做、review 不能动 plan、build 已结束、用户「再聊聊」也不一定能 trigger 改对 plan。流程**没闭环**。
+
+用户拍板路径：「让 AI 通过 ask_user 主动问、像 plan phase 一样」、避免不熟悉的用户面对 artifact 里的 a/b/c 选项盲选。
+
+**核心改动**（`prompts/phase-3-review.md` 重写流程）：
+
+```
+§6  写 03-review.md 初稿（不含「§ 用户决策」段）
+§7  ⭐新增：如果有「实现偏差」or「未完成 task」段、必须调 ask_user 把所有条目一次性问完
+     - 实现偏差 question：options=[a 改回 plan / b 接受偏差并更新 plan]
+     - 未完成 task question：options=[a 现在补做 / b 建 follow-up / c 接受不做]
+     - ⚠️ AI 不在 prompt / question 文本里偷偷暗示「建议 X」「推荐 Y」、HITL 是底线
+§7.2 ask_user 答完后落地：
+     - 答 b（接受偏差）→ edit 01-plan.md 对应段落、用 ~~strikethrough~~ 划掉旧描述 + 加 review ack 补录标记
+     - 答 c（未完成 task 接受不做）→ edit 01-plan.md §5 task 加注解
+     - 答 a → 不动 plan、用户 ack=revise 时回 build / 再走改回 plan 路径
+     - 自定义文本 → 不落地、记到决策段、必要时 assistant_message 提示用户再回弹窗选
+§7.3 把每条决策追加到 03-review.md「§ 用户决策」段（agent 自己 edit、不在初稿里）
+§8  调 wait_for_user 等用户最终 ack
+
+约束扩展：
+  - review phase 允许写入 01-plan.md（破例、只在 §7 ask_user 答完 b/c 后、只动描述 / 注解）
+  - 其它一切只读不变
+  - V0.5.12 limitation：edit 01-plan.md 时**不自动 snapshot 旧 plan**、所以这次 review ack 改动不进 diff 历史、V0.5.13 再补
+```
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
+**待联测**：跑一道有「实现偏差」段的真任务、看 review agent 是否调 ask_user 弹偏差选项 / 用户选 b 后 01-plan.md 是否被改 + 留下 strikethrough 痕迹 / 03-review.md「§ 用户决策」段是否追加。
+
+### V0.5.12（迭代一）：artifact diff 视图（snapshot + 内嵌 diff）（2026-05-25）
+
+**背景**（用户痛点）：每次「再聊聊」让 AI 改 md 后、不知道哪些地方动了、需要重读长 artifact 找差异。
+
+**核心设计**（用户拍板「第一版先简单」）：
+
+```
+后端 snapshot 机制：
+  - phase-ack revise 分支、submitPhaseAck 前先 snapshotArtifact(taskId, phaseId)
+  - 复制当前 artifact → data/tasks/<id>/artifacts/.revisions/<NN>-<phase>.<ISO>.md
+  - meta.revisions[phaseId] 末尾追加 { timestamp, path, size }
+  - 每 phase 上限 10 个、超出 GC 删最老（fs 文件 + meta 记录）
+  - 仅覆盖「用户主动 revise」单一路径、agent 内部 edit 不触发——第一版聚焦最高频场景
+
+前端 artifact-panel toolbar：
+  - 加「正文 / Diff」切换（mode state、默认 content、保持 V0.5.11 hot-fix 简洁感）
+  - Diff 模式下显示快照 dropdown（对比上次 / 初版 / 任意快照）+「行内 / 并排」切换
+  - 顶部黄色 banner「✨ AI 刚修订了 N 处 [查看修改] [×]」在「有未看 revision」时浮现
+  - banner「已看」状态走 localStorage（key: fe-ai-flow:artifact-revisions-seen:<taskId>:<phaseId>）
+    不污染 task meta、不同浏览器各自独立（V0.5.12 第一版可接受妥协）
+
+Diff 视图实现：
+  - react-diff-viewer-continued 4.2.2、useDarkTheme=true（项目 next-themes forcedTheme="dark"）
+  - compareMethod=WORDS_WITH_SPACE（词级 diff、对 markdown 段落级修改友好）
+  - showDiffOnly=true 折叠未变行、hideSummary=true 隐藏 lib 自带顶部 bar
+  - next/dynamic 懒加载（~36KB 库体积）、用户不切到 Diff 就不拉、First Load JS 270KB（V0.5.11 持平）
+```
+
+**新增 API**：
+
+- `GET /api/tasks/[id]/artifact-revisions?phase=plan` → `{ revisions: ArtifactRevision[], current: { content, filename } | null }`
+- `GET /api/tasks/[id]/artifact-diff?phase=plan&from=<ts>&to=<ts|current>` → `{ from: { content, timestamp }, to: { content, timestamp | null } }`
+  - from / to 都用 timestamp 索引、不接 path 入参、防路径穿越
+
+**新增组件 / 文件**：
+
+- `src/components/tasks/artifact-diff.tsx` —— react-diff-viewer-continued 包装、props: oldText/newText/leftTitle/rightTitle/splitView
+- `src/lib/server/task-fs.ts` 新增 `snapshotArtifact` / `listArtifactRevisions` / `readArtifactRevisionContent` / `readCurrentArtifact`
+- `src/lib/task-store.ts` 加 `fetchArtifactRevisions` / `fetchArtifactDiff` client helper
+
+**schema 扩展**：
+
+- `Task.revisions?: Partial<Record<PhaseId, ArtifactRevision[]>>`
+- `ArtifactRevision = { timestamp: number; path: string; size: number }`
+- 老 task 没此字段、hydrate 时按 undefined 兜底、API 路由按 [] 兜底
+
+**不做**（评估后 ROI 低、用户已拍）：
+
+- ❌ rendered markdown + 段级高亮（手写段对齐算法易错、ROI 低）
+- ❌ 双视图 split-view（artifact-panel 本就不大、拆栏挤）
+- ❌ SDK toolCall 事件流 diff 卡片（事件流已拥挤、bash sed 拿不到 diff 不可靠）
+- ❌ 覆盖「agent 自主 edit」（一版只覆盖用户主动 revise、最高频场景搞定就行）
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（23 routes 全编译、`/tasks/[id]` First Load 270 KB 跟 V0.5.11 持平）
+
+**待联测**：跑一道真任务、plan 出方案 → 「再聊聊」改一处 → 等 AI 改完、看 banner 是否浮现、切 Diff 是否清晰看到红绿对比
+
+---
+
 ### V0.5.11：系统瘦身 + 提示词重构 + 文档拆分（2026-05-23）
 
 **背景**：用户拍板「整理 + 瘦身系统」三件事：①清死代码 ②重构 plan-runner 提示词拼接的三目运算地狱 ③扫不合理可优化的代码。
