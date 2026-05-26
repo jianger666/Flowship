@@ -125,7 +125,11 @@ const EventStreamImpl = ({
   );
 
   // 新事件 / artifact 触发的 events.length 变化：贴底时才滚到底
-  // 注意 dep 用 renderEvents.length 而不是 task.events.length、合并后才是 UI 真实卡片数
+  // V0.5.13.4 bug fix：dep 从 renderEvents.length 换回 task.events.length
+  //   合并算法（mergeAdjacentThinking / mergeAdjacentToolCall）把多条事件合一条、
+  //   连续 tool_call / thinking 来时 renderEvents.length 不变、useEffect 不触发滚动——
+  //   现象：用户反馈「自动滚动经常失效」。改成原始 events.length（单调递增）就稳。
+  //   合并卡 batch 内容变化导致 DOM 高度增加、贴底滚动跟着触发、视觉正确。
   // streamingText.length 也加入 dep：流式打字时贴底跟随、不然字一直加但视图不动
   useEffect(() => {
     const el = scrollRef.current;
@@ -133,7 +137,7 @@ const EventStreamImpl = ({
     if (stickToBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [renderEvents.length, streamingText?.length]);
+  }, [task.events.length, streamingText?.length]);
 
   // V0.4：输入框可用 = 父组件传 canReply（chat-view 自由化用）
   // 父组件没传时回退老行为 status === "awaiting_user"（plan 模式用、不影响）
