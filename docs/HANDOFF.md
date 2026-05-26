@@ -204,6 +204,18 @@ ask_user 答完后 agent 落地：
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.5.13.2：revise-dialog 加 Cmd+Enter 提交快捷键（2026-05-26）
+
+跟 event-stream 输入框 / chat 应用通用习惯（Slack/Cursor/ChatGPT）对齐：
+
+- `revise-dialog.tsx` Textarea 加 `onKeyDown` handler：`Cmd/Ctrl + Enter` 阻止默认 + 调 `handleSubmit`
+- placeholder 改：「想改、想问、或者贴图说明（Cmd+Enter 发送）」
+- 单 `Enter` 仍保持换行、避免误发
+
+**未扩散**：new-task-dialog 多 field 表单 / ask-user-dialog 多 Q 选项 / advance-dialog 复合 mode 选择——Cmd+Enter 不直观或误触风险大、暂不动。
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
 ### V0.5.13：事件流密度优化（summarize 全文压缩 + tool_call 合并）（2026-05-26）
 
 **背景**（用户跑完 V0.5.12 第三轮联测后即时反馈）：

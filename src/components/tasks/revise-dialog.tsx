@@ -98,6 +98,15 @@ const ReviseDialogImpl = ({
     void onSubmit(draft.trim(), toUploadPayload());
   };
 
+  // Cmd/Ctrl + Enter 提交、单 Enter 换行
+  // 跟 event-stream 输入框一致、chat 应用通用习惯（Slack/Cursor 等）
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
@@ -145,8 +154,9 @@ const ReviseDialogImpl = ({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onPaste={onPaste}
+            onKeyDown={handleKeyDown}
             rows={6}
-            placeholder="想改、想问、或者贴图说明（支持粘贴 / 拖拽）"
+            placeholder="想改、想问、或者贴图说明（Cmd+Enter 发送）"
             autoFocus
           />
           {/* 隐藏 input：附图按钮触发它 */}
