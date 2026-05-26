@@ -231,6 +231,12 @@ export const AdvanceDialog = ({
                     id="advance-fork-reason"
                     value={reason}
                     onChange={(e) => setReason(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault();
+                        void handleSubmit();
+                      }
+                    }}
                     placeholder="例：A 上拉加载第二页空白；B 学情详情冷启动 500；C 跳转 query 漏了 NEW_C"
                     disabled={submitting}
                     rows={3}

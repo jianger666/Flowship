@@ -204,15 +204,22 @@ ask_user 答完后 agent 落地：
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.5.13.2：revise-dialog 加 Cmd+Enter 提交快捷键（2026-05-26）
+### V0.5.13.2：所有 dialog 加 Cmd+Enter 提交（默认快捷键）（2026-05-26）
 
-跟 event-stream 输入框 / chat 应用通用习惯（Slack/Cursor/ChatGPT）对齐：
+用户拍板「Cmd+Enter 成为所有 dialog 的默认提交快捷键」、跟 event-stream 输入框 / chat 应用通用习惯（Slack/Cursor/ChatGPT）对齐。
 
-- `revise-dialog.tsx` Textarea 加 `onKeyDown` handler：`Cmd/Ctrl + Enter` 阻止默认 + 调 `handleSubmit`
-- placeholder 改：「想改、想问、或者贴图说明（Cmd+Enter 发送）」
-- 单 `Enter` 仍保持换行、避免误发
+**4 个 dialog 一锅都加**（Textarea onKeyDown handler 模板：`Cmd/Ctrl+Enter` 阻止默认 + 调 `handleSubmit`）：
 
-**未扩散**：new-task-dialog 多 field 表单 / ask-user-dialog 多 Q 选项 / advance-dialog 复合 mode 选择——Cmd+Enter 不直观或误触风险大、暂不动。
+| Dialog | 改动 |
+|---|---|
+| `revise-dialog.tsx` | Textarea + onKeyDown、placeholder 加「（Cmd+Enter 发送）」 |
+| `ask-user-dialog.tsx` | Other 模式 Textarea + onKeyDown（placeholder 不动、原本就很长） |
+| `new-task-dialog.tsx` | description Textarea + onKeyDown |
+| `advance-dialog.tsx` | fork reason Textarea + onKeyDown |
+
+**安全保证**：每个 `handleSubmit` 内部已有 `!canSubmit` / `!allAnswered` 短路保护、未填完时 Cmd+Enter 无副作用（按钮 disable 也走同样校验）。
+
+**单 `Enter` 保持换行**、避免误发。
 
 **验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
 

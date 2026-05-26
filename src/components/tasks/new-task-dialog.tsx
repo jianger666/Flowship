@@ -385,6 +385,12 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                   rows={2}
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void handleSubmit();
+                    }
+                  }}
                   placeholder="飞书 story 没写清楚的点、想强调的约束、想避开的地方……"
                   className="resize-none"
                 />

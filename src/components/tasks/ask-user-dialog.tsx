@@ -358,6 +358,14 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                         onChange={(e) =>
                           handleOtherChange(q.id, e.target.value)
                         }
+                        onKeyDown={(e) => {
+                          // Cmd/Ctrl + Enter 提交全部回答（默认快捷键、跟 revise-dialog 一致）
+                          // 未答完时 handleSubmit 自己短路 + toast 提示、不重复校验
+                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                            e.preventDefault();
+                            void handleSubmit();
+                          }
+                        }}
                         placeholder="输入你的回答…（或写「不清楚 / 你定」让 AI 按 default 走）"
                         rows={3}
                         className="resize-none text-sm"
