@@ -8,13 +8,26 @@
 
 站在 Cursor SDK 肩膀上的**项目级 AI Harness 平台 · 飞书 story → PR 自动化**。核心是 Harness（缰绳）：每个 phase 边界用确定性工具（typecheck / lint / hooks / Skills / MCP / HITL ack）压住 LLM 非确定性、保证产出可观测、可回退、可复用。
 
+## ⚡ 即将到来：V0.6 重构（设计阶段、代码未动）
+
+> 2026-05-27 拍板、跟用户的真实工作流对齐后发现 V0.5 phase chain 模型存在系统性错配、决定重构为 **task 容器 + action 历史** 模型。**设计文档已落 `docs/V0.6-REFACTOR.md`**、新接力 AI 拿那份文档 + 本文件即可完整理解 V0.6 设计意图。
+
+核心变化：
+- **phase chain → action history**：`plan → build → review` 顺序拆掉、6 + 1 种 action（plan / build / review / ship / test / learn / chat）任意触发
+- **单 task = 单生命周期**：MR 提了不结束、可继续 build → ship v2 v3 …、最终用户标完成才跑 learn 归档
+- **chat 模式吸收**：删 chat-runner、chat 变成 `action=chat`、统一架构
+- **6 个 harness 门槛补回顺序约束的隐性保证**：准入条件 / 后置 deterministic 检查 / 推荐 default / anti-patterns prompt / cross-action 一致性 / textarea placeholder
+- **保留**：单 SDK Run 永生、shell + curl long-poll 保活、HITL 是底线
+
+未拍板项见 `V0.6-REFACTOR.md` 第 13 节、动手前需跟用户确认 7 个问题。
+
 ## 给 AI 接力的最小上下文
 
 接力的 AI 进来后按顺序读：
 
 1. `.cursor/rules/project-context.mdc` —— 强制约束
 2. `.cursor/rules/learned-conventions.mdc` —— 编码风格
-3. 本文件的「当前架构快照」段（V0.5 系列、稳定架构）+「最近演进」段（V0.5.14 事件流虚拟滚动 + V0.5.13 系列事件流密度优化 + 4 dialog 默认快捷键）
+3. 本文件的「当前架构快照」段（V0.5 系列、稳定架构）+「最近演进」段（V0.5.15 chat-runner 跟 plan-runner 对齐 + V0.5.14 事件流虚拟滚动）
 4. `prompts/_super.md` —— **super-prompt 主模板**（V0.5.11 抽出、占位符注入式、改模板优先在这里改、不再回 .ts 改硬编码）
 5. `prompts/_shared.md` —— **三 phase 通用 artifact 写法 + 跨 phase 规则**（V0.5.7.7 抽出、改 phase prompt 前必读、避免漏改一处导致跨 phase 不一致）
 6. `prompts/phase-1-plan.md` / `prompts/phase-2-build.md` / `prompts/phase-3-review.md` —— phase 特有约束
@@ -204,98 +217,98 @@ ask_user 答完后 agent 落地：
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.5.14：事件流虚拟滚动 + memo（彻底解决「事件流多了卡」）（2026-05-26）
+### V0.5.16-design：V0.6 重构设计纪要（2026-05-27、代码未动）
 
-**背景**：用户实测发现事件流多了之后明显卡顿、滚动 / 输入 / 折叠展开都有延迟感。分析根因：
+**整体**：跟用户深入对齐工作流（飞书需求 → 多个 MR → 测试反馈 → 改代码再提 → 最终合入）后、确认 V0.5 phase chain 模型存在系统性错配。决定重构为 task 容器 + action history 模型、设计文档落 `docs/V0.6-REFACTOR.md`。**本子版本只产文档、不动代码**。
 
-- 几百条 events 一起 render、每条一个 EventRow（card div + memo state + 可能的 markdown 渲染）
-- SSE 一推 chunk → `task.events` 引用变 → 整个事件流子树 reconcile
-- `react-markdown` parser 不便宜、几百条 assistant_message 一起 re-render 一下就堵 main thread
+#### 产出
 
-**方案 A+B 落地**（用户拍板「彻底解决」）：
+- **`docs/V0.6-REFACTOR.md`**（新文件、~900 行）：V0.6 完整设计文档、14 节 + 3 附录、包含：
+  - 0-1 节：接力上下文 + 重构背景（用户工作流复述 + 4 个错配）
+  - 2-3 节：V0.5 核心问题 + V0.6 新架构总览（task 容器 + action history + 单 SDK Run 永生）
+  - 4 节：task schema 新旧对比 + 文件系统改造（actions/ 目录、N-<type>.md）
+  - 5 节：6 + 1 种 action 详细规格（plan / build / review / ship / test / learn / chat）、每种含触发条件 / 行为 / artifact 骨架 / 后置检查 / 反例
+  - 6 节：6 个 harness 门槛设计（P0：准入 + 后置检查 + anti-patterns prompt；P1：推荐 default + placeholder；P2：cross-action 一致性）
+  - 7 节：prompt 文件重组方案（phase-N → action-<type>、_super.md 大改）
+  - 8 节：UI 改造点（任务详情页 + 推进 dialog + ack dialog）
+  - 9 节：「再聊聊」/ revise / chat 在新架构下的语义
+  - 10 节：单 SDK Run 永生策略 + wait_for_user 协议改动
+  - 11 节：老 task 兼容（只读 / 归档、不写 migration）
+  - 12 节：分版本路径（V0.6.0 核心重构 → V0.6.1 ship → V0.6.2 test → V0.6.3 learn → V0.6.4+ 高级）
+  - 13 节：未拍板项（7 个动手前必须澄清的）
+  - 14 节：新 AI 接力 checklist
+- **`docs/HANDOFF.md`**：顶部加「即将到来：V0.6 重构」段（5-10 行）、关键文件索引加 V0.6-REFACTOR.md 行
+- **`docs/ROADMAP.md`** 顶部「下一阶段」段重写、原 V0.5.16 learn-phase-only 描述替换为 V0.6 重构概览、指向新设计文档
 
-1. **`react-virtuoso` 虚拟滚动接管主体**
-   - 装 `react-virtuoso@4.18.7`
-   - `<Virtuoso data={items} itemContent={...} />` 替代原 `<div onScroll>` + 手动 scroll ref
-   - DOM 节点封顶 ~30 个（viewport + buffer）、几百条 events 性能持平
-   - `followOutput={(isAtBottom) => isAtBottom ? "smooth" : false}` 一行替代老的「贴底跟随」逻辑：
-     - 库自己维护「是否贴底」、不需要 `stickToBottomRef` + `handleScroll` + `useEffect`
-     - 删了原本 ~25 行的滚动控制代码
-   - `initialTopMostItemIndex={items.length - 1}` 初始定位末尾
-2. **`streamingText` 拼成虚拟末尾 item 参与虚拟化**
-   - 之前是「特殊渲染在事件列表之后」、需要单独 Footer 组件 + scrollIntoView
-   - 现在：`__streaming__` 假事件 push 到 data 数组末尾、跟其他 event 一起 virtualize
-   - `followOutput` 自动跟着追加滚动、不需要额外触发
-3. **`React.memo` 包裹 row 组件**（`rows.tsx`）
-   - `EventRow` / `AskUserRequestRow` / `StreamingAssistantRow` 全部 memo
-   - SSE 频繁 setTask 时已渲染 item 跳过 reconcile、ID 稳定的 row props 不变就不重渲染
-   - 配合 Virtuoso 的 item 复用、整体 reconcile 工作量降一个数量级
+#### 关键设计决策（不要回头）
 
-**bundle 影响**：`/tasks/[id]` First Load JS 270 KB → 290 KB（+20 KB / +7%）、`react-virtuoso` ~15 KB gzipped、可接受。
+1. **phase 顺序拆掉**：plan / build / review / ship / test / learn / chat 是 action 类型、不是顺序约束
+2. **单 task 多 MR**：MR 提了 task 不结束、可继续推进、`Task.mrs` 列表追踪
+3. **chat 吸收**：删 chat-runner.ts、chat = `action=chat`、统一架构
+4. **单 SDK Run 永生**：跟 V0.5 一致、Run 不退（除非 task 标完成 / abandon）
+5. **6 harness 门槛补回**：准入 + 后置 + prompt + placeholder + 推荐 default、保证拆顺序后能力不降
+6. **老 task 只读**：不写 migration、按 project-context.mdc「不写向后兼容」原则
 
-**V0.5.13.4 自动滚动 bug**（顺带修）：
+#### 工作量预估
 
-之前 `useEffect` 依赖 `renderEvents.length`、但合并算法（thinking + tool_call）把多条合一条、length 不变、贴底也不滚——用户反馈「自动滚动经常失效」。
+V0.6.0 核心重构 3-5 天密集开发、不是「加 phase」而是换核心模型。详见 V0.6-REFACTOR.md 第 12 节。
 
-修法：dep 换回原始 `task.events.length`（单调递增）。**V0.5.14 接 Virtuoso 后该 useEffect 被整体删除**、bug 自然消失（库自己管贴底）、不需要单独 fix。
+#### 没做的事
 
-**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（23 routes 全编译、`/tasks/[id]` First Load 290 KB）
+实际代码改动**全部留给下一个 AI**——用户拍板「设计这么大量级、单 agent 长对话上下文必塞爆、新 agent 拿设计文档接力更稳」、跟 harness 思想「不依赖单 LLM 连贯性、用结构化文档约束」自洽。
 
-**待联测**：跑一个事件多的真任务（几百条 events）、看滚动 / 切折叠 / 推 chunk 是否丝滑、贴底跟随是否正常。
+### V0.5.15：chat-runner 对齐 + V0.5.6.2 plan 重构后遗症清理（2026-05-26）
 
-### V0.5.13.2：所有 dialog 加 Cmd+Enter 提交（默认快捷键）（2026-05-26）
+**整体**：接力时一锅做的两类清理。一类是「plan 有、chat 还没」的对齐性 bug（console.log 兜底）；一类是 V0.5.6.2 plan 重构（砍 §3.1 文件清单 + 验收点直接挂 task）只动了 plan、build / review prompt 没跟上的后遗症。无新功能、纯清理 + 对齐。
 
-用户拍板「Cmd+Enter 成为所有 dialog 的默认提交快捷键」、跟 event-stream 输入框 / chat 应用通用习惯（Slack/Cursor/ChatGPT）对齐。
+#### 1. chat-runner `case "status"` 加 console.log 兜底（对齐 plan-runner V0.5.5 增强）
 
-**4 个 dialog 一锅都加**（Textarea onKeyDown handler 模板：`Cmd/Ctrl+Enter` 阻止默认 + 调 `handleSubmit`）：
+**背景**：SDK 1.0.13 `status=error` 时偶尔不发详细 message、`run.wait()` 拿到的 RunResult 也不带具体描述、chat 模式只能 throw 一个空错误、用户 / dev 看不到任何诊断信息。plan-runner 早就在 case `status` 顶部加了一行无条件 `console.log` 兜底——chat-runner 漏了。
 
-| Dialog | 改动 |
-|---|---|
-| `revise-dialog.tsx` | Textarea + onKeyDown、placeholder 加「（Cmd+Enter 发送）」 |
-| `ask-user-dialog.tsx` | Other 模式 Textarea + onKeyDown（placeholder 不动、原本就很长） |
-| `new-task-dialog.tsx` | description Textarea + onKeyDown |
-| `advance-dialog.tsx` | fork reason Textarea + onKeyDown |
+**修法**：`src/lib/server/chat-runner.ts` 的 `case "status"` 头部补一份同款 log：
 
-**安全保证**：每个 `handleSubmit` 内部已有 `!canSubmit` / `!allAnswered` 短路保护、未填完时 Cmd+Enter 无副作用（按钮 disable 也走同样校验）。
+```
+console.log(
+  `[chat-runner] SDK status message: status=${msg.status} message=${
+    (msg as { message?: string }).message ?? "(none)"
+  }`,
+);
+```
 
-**单 `Enter` 保持换行**、避免误发。
+#### 2. phase-2-build.md 骨架跟 V0.5.6.2 plan 重构对齐
 
-**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+V0.5.6.2 把 plan §3.1 文件清单砍掉、验收点直接挂在每个 task 上、但 build 骨架那时没跟上、留了「## 改动文件清单」+「## 验收对照」两个独立段、跟 task 自带字段重复 100%。同时 V0.5 加 review phase 后由 review 出 commit msg、build 还在出一份、也重复。本轮一次性清掉：
 
-### V0.5.13：事件流密度优化（summarize 全文压缩 + tool_call 合并）（2026-05-26）
+- **task 子条加「验收处理」字段**（4 → 5 字段：改动文件 / 关键实现 / 偏离 plan / 验收处理 / 局部校验）——逐条对应 plan §5 该 task 的「验收点」、说明每条是否满足 + 如何验证、解决「review 找不到 task 自带验收点处理结果」的问题
+- **删独立的「## 验收对照」段**——跟 task「验收处理」字段重复
+- **删独立的「## 改动文件清单」段**——跟 task「改动文件」字段重复、跟 §1 总览「改动文件数」也重复
+- **删「## 给用户的交接」段**（commit msg 等）——由 review phase §5.1 统一出
+- 同步更新顶部「⚠️ 路径写法」警告（不再引用「## 改动文件清单」/「## 验收对照」表）
 
-**背景**（用户跑完 V0.5.12 第三轮联测后即时反馈）：
+#### 3. plan-runner.ts loadPhasePrompt 删 4 个 unused 占位符
 
-1. 思考块折叠态文本「没占满一排就省略 + 没省略号」、用户看到一句短话不知道下面还有几行
-2. review 阶段 agent 频繁 edit `01-plan.md` / `03-review.md`、tool_call 一连十几条卡片刷屏（review 闭环的副作用）
+历史残留：`title` / `feishuStoryUrl` / `description` / `artifactsDir` 注入了但 phase prompt 没一处引用、按「开发期不写兼容代码」原则清掉。顺便删 `getArtifactsDir` import（dead）。
 
-**改动**（全在 `src/components/tasks/event-stream/`）：
+#### 4. phase-1 artifact 写入工具引用表述统一为 phase-2/3 同款（去括号注解）
 
-1. **`summarize` 改全文空白压缩 + 200 字截**
-   - 原本：取 `text.split("\n")[0]` 首行、80 字截、首行短不加省略号
-   - 现在：`text.replace(/\s+/g, " ").trim()` 拍平、200 字兜底
-   - 配合 truncate class：容器宽度截到哪算哪、自动 `…`、用户看到尽量满的预览
-2. **`mergeAdjacentToolCall` 新增（V0.5.13.1 hot-fix 后）**
-   - **初版**：同 phase + 同 `meta.name`（tool 名）连续 ≥2 条 tool_call 合一卡
-   - **hot-fix 放宽**（用户实测拍板）：去掉「同 tool name」约束、改成「同 phase 连续 tool_call」就合并
-     - 原因：AI 探索式调用经常 `read → grep → read → edit` 交错、严格相邻不触发、压不了几条
-     - 折叠态：「工具调用 ×N」+ 最后一条 `summarize(ev.text)` 摘要（给用户看「收尾在干嘛」）
-     - 展开态：每条子条带 `[tool name]` prefix（蓝色 badge）、看得清谁是谁
-   - `meta.batch = [{ id, ts, text, name }]` 保留所有子条
-   - `meta.count` 给折叠态显示「×N」后缀
-   - 类似 `mergeAdjacentThinking` 不动 events.jsonl 落盘内容、只在 UI 渲染前合并
-   - `event-stream.tsx` 的 `renderEvents` useMemo 两道 pass：thinking 合并 → tool_call 合并
-3. **`EventRow` batch 折叠态展示**
-   - 折叠态文本：`${summarize(ev.text)} ×N` 后缀
-   - 展开态：列表展示每条 `[name] {text} {ts}`、字号 [11px] 紧凑 mono
-   - 不可展开的 single tool_call 走原逻辑
+`prompts/phase-1-plan.md` 的引用比 phase-2/3 多带括号注解「（创建用 write、改已有用 edit、首次写前 read 一遍 artifact-writer skill）」、详细信息 `_super.md`「跨 phase 共享规范 §1」里已经说清楚、不需要每个 phase 都重复。三 phase 现在表述一致：`artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifact 写入工具」。`
 
-**用户拍板未选**：C 方案「显示工具调用 / 思考 / phase 边界」过滤器 toggle——每次都要用户操作太烦。B 方案被动降密度、跟 Cursor IDE 行为一致。
+#### 5. ROADMAP.md V0.5 段「plan phase 校验前移」描述跟 V0.5.6.1 同步
 
-**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+ROADMAP 还写「plan agent 在 01-plan.md 里写『我的理解 vs 飞书原文』对照」、V0.5.6.1 已经撤了这个段、改成「跟原文有差异一律 ask_user 闭环」、ROADMAP 没跟。本轮顺手改成真实实现。
 
+#### 验证
 
-> V0.5.10 ~ V0.5.12 系列细节已全部迁到 `docs/CHANGELOG.md` 同名段（包括 V0.5.12 四轮迭代：diff 视图 / review 闭环 / 全局清理 / review prompt 5 点精修）。本窗口当前留：V0.5.14（事件流虚拟滚动 + memo）+ V0.5.13 系列（事件流密度优化 + 4 dialog Cmd+Enter 默认快捷键）。下次再做 V0.5.15 时把 V0.5.13 整体迁到 CHANGELOG.md。
+`pnpm typecheck` ✓ / `pnpm lint` ✓（包括清掉的 `getArtifactsDir` import warning）
+
+#### 没做的事（用户拍板「保持手动重启」）
+
+接力文案里另一个小 bug「chat 模式加 `NGHTTP2_ENHANCE_YOUR_CALM` 自动降级（plan 已有、chat 还没）」**暂不做**——尝试实现时跟用户对齐产品设计、用户拍板「就还是用户手动重启」、保留 chat 模式现状：撞 NGHTTP2 → task 标 failed → 用户重新发消息触发自动启动新 agent（走 chat-reply 的「terminal status 自动启动」分支）。
+
+- plan 的「自动降级」是把 resume 失败拉回 fork、用户视角一次推进就够；
+- chat 的「自动降级」语义没拍板（要不要 agent 主动读历史 / 要不要断路器 / 要不要 info 提示）、留待真有用户痛点时再单独评估。
+
+> V0.5.10 ~ V0.5.14 系列细节已全部迁到 `docs/CHANGELOG.md` 同名段（包括 V0.5.12 四轮迭代：diff 视图 / review 闭环 / 全局清理 / review prompt 5 点精修；V0.5.13 事件流密度优化 + 4 dialog Cmd+Enter 默认快捷键；V0.5.14 事件流虚拟滚动 + memo）。本窗口当前留：V0.5.16-design（V0.6 重构设计纪要、详见 docs/V0.6-REFACTOR.md）+ V0.5.15（chat-runner 跟 plan-runner 对齐）。V0.6.0 收口时把 V0.5.15 迁到 CHANGELOG.md、V0.5.16-design 也整段迁过去（设计先行、代码落地后形成新一轮稳定快照）。
 
 ---
 
@@ -303,6 +316,7 @@ ask_user 答完后 agent 落地：
 
 | 内容 | 位置 |
 |---|---|
+| **V0.6 重构设计文档（2026-05-27 设计阶段、代码未动）** | `docs/V0.6-REFACTOR.md` |
 | Plan workflow 整体逻辑 + super-prompt（V0.5.11 重构后） | `src/lib/server/plan-runner.ts` |
 | **super-prompt 主模板（V0.5.11 抽出、占位符注入）** | `prompts/_super.md` |
 | **跨 phase 共享规范（V0.5.7.7 抽出）** | `prompts/_shared.md` |

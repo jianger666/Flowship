@@ -6,6 +6,76 @@
 
 ---
 
+## ⚡ 下一阶段：V0.6 重构（2026-05-27 拍板、详见 `docs/V0.6-REFACTOR.md`）
+
+> 2026-05-26 一度拍板「V0.5.16 加 ship + learn phase」、但 2026-05-27 跟用户深入对齐工作流后发现 V0.5 phase chain 模型存在系统性错配（单 task 多 MR / 测试后回流 / chat 跟 plan 两套架构）、决定升级为 **task 容器 + action 历史** 模型。**完整设计文档：`docs/V0.6-REFACTOR.md`**（~900 行、14 节 + 3 附录）。
+
+### 核心变化
+
+```
+旧：plan → build → review                  顺序固定、单 task 单 MR
+新：task 容器 + action[] + MR[]            6 + 1 种 action 自由触发
+```
+
+7 种 action：
+
+- `plan`：出方案
+- `build`：改代码（最高频）
+- `review`：代码复核
+- `ship`：提 MR + 飞书回写（新）
+- `test`：AI 手测飞书测试用例（新）
+- `learn`：task 完成后跑一次、propose 沉淀约定 → HITL 落 `<repoPath>/AGENTS.md` / `.cursor/rules/*.mdc` / `prompts/_super.md`（新）
+- `chat`：自由聊（吸收原 chat 模式）
+
+每个 action 自由触发、有前置准入条件（硬门槛）+ 后置 deterministic 检查（硬门槛）。
+
+### 6 个 harness 门槛（拆顺序后补回保证）
+
+| 门槛 | 优先级 | 类型 |
+|---|---|---|
+| 1. action 前置准入条件 | P0 | 硬 / 软 |
+| 2. action 后置 deterministic 检查（typecheck/lint/grep/git diff hash）| P0 | 硬 |
+| 3. 默认 action = 推荐项（按当前状态智能推荐）| P1 | 软 |
+| 4. action 级 anti-patterns prompt | P0 | 软 |
+| 5. cross-action 一致性自检 | P2、V0.6.4+ | 硬 |
+| 6. textarea placeholder 动态 | P1 | 软 |
+
+详见 `V0.6-REFACTOR.md` 第 6 节。
+
+### 实施分版本
+
+| 版本 | 内容 | 工时 |
+|---|---|---|
+| **V0.6.0**（核心重构）| schema + runner + prompt + UI + 6 门槛、不含 ship/test/learn 跑通 | 3-5 天 |
+| **V0.6.1**（ship action）| gh CLI + 飞书 MCP + MR 追踪字段 | 1-2 天 |
+| **V0.6.2**（test action）| 飞书测试用例 + AI 手测能力 | 1-2 天 |
+| **V0.6.3**（learn action）| HITL 落库 dialog + super-prompt 自动注入 AGENTS.md | 1-2 天 |
+| **V0.6.4+**（高级）| cross-action 一致性 / MR 状态 polling / worktree 隔离 | TBD |
+
+### 老 task 处理
+
+V0.6 启动时、V0.5 老 task UI 上标「Legacy V0.5 task」、只读 / 归档、推进按钮灰掉。**不写 migration 脚本**（按 project-context.mdc「开发期不写向后兼容代码」原则）。
+
+### 未拍板项（动手前必须跟用户确认 7 个、详见 V0.6-REFACTOR.md 第 13 节）
+
+1. action 命名 / 中文 label（learn / 沉淀 vs 别的）
+2. git 平台（GitHub / GitLab / 自建）+ 提 MR 命令
+3. branch 命名规则
+4. 默认目标分支
+5. 飞书评论 MCP 工具名 + 入参 schema
+6. 飞书项目里「测试用例」具体位置 / 怎么从 MCP 拉
+7. ship 字段（PR title/body/branch）是 plan 时拍板还是 ship 时再问
+
+### 业界调研结论（2026-05-26）
+
+5 类 harness memory pattern：静态规则文件（Cursor/CLAUDE.md/AGENTS.md）✅、auto-memory（Claude Code MEMORY.md）⚠️、自动生成规则（RepoScaffold/mirrorai）⚠️、Reflexion 自学习（evolve-loop/Homunculus）✅、Memory infra runtime（Mem0/Letta/Zep/Cognee）❌
+
+最终方案 = **Reflexion-lite + AGENTS.md 落库**（取业界 1 + 4 类组合）
+
+跟现有机制呼应：super-prompt V0.5.6.5「黑名单 grep 自检」本质是 deterministic predicate 雏形——沉淀出来能写成 grep 模式的约定可以升级进这一段、变下次强制自检、达成真闭环（跟 evolve-loop ACS predicate 思路同源）
+
+---
+
 ## 当前阶段（2026-05-15 同步）
 
 | 阶段 | 状态 | 备注 |
@@ -158,7 +228,7 @@ chat 模式（单 SDK Run、HITL 走 wait_for_user 阻塞）：
 - **Phase 拓扑**：`plan → build` → `plan → build → review`、review 完成 = `completed`
 - **review phase 职责**：拿 `git diff` × `01-plan.md` × `02-build.md` × contextDocs 做结构化差值、产出 `artifacts/03-review.md`
 - **4 类差异分流**：范围扩张 / 范围收缩 / 实现偏差 / 未完成、不同性质不同处理路径（详见 HANDOFF V0.5 段）
-- **plan phase 校验前移**：plan agent 在 `01-plan.md` 里写「我的理解 vs 飞书原文」对照、避免 review 阶段才发现差异
+- **plan phase 校验前移**：plan agent 跟飞书原文有差异（推断 / 偏离 / 找不到来源）一律 `ask_user` 闭环、用户拍板后再落 `01-plan.md`（V0.5.6.1 起取代了早期「我的理解 vs 飞书原文」对照表）、避免 review 阶段才发现差异
 - **agent 复用**：默认整条 workflow 同一个 agent（节省 500 次套餐配额）、用户在 ack 时可手动切「换新 agent」（reviewer ≠ author）
 - **模型选择**：settings 默认模型 + 每 phase ack 时可切（切了不同模型 → 暗示起新 agent run、SDK 限制同 run 不能换模型）
 

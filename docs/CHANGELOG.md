@@ -15,6 +15,98 @@
 
 ---
 
+### V0.5.14：事件流虚拟滚动 + memo（彻底解决「事件流多了卡」）（2026-05-26）
+
+**背景**：用户实测发现事件流多了之后明显卡顿、滚动 / 输入 / 折叠展开都有延迟感。分析根因：
+
+- 几百条 events 一起 render、每条一个 EventRow（card div + memo state + 可能的 markdown 渲染）
+- SSE 一推 chunk → `task.events` 引用变 → 整个事件流子树 reconcile
+- `react-markdown` parser 不便宜、几百条 assistant_message 一起 re-render 一下就堵 main thread
+
+**方案 A+B 落地**（用户拍板「彻底解决」）：
+
+1. **`react-virtuoso` 虚拟滚动接管主体**
+   - 装 `react-virtuoso@4.18.7`
+   - `<Virtuoso data={items} itemContent={...} />` 替代原 `<div onScroll>` + 手动 scroll ref
+   - DOM 节点封顶 ~30 个（viewport + buffer）、几百条 events 性能持平
+   - `followOutput={(isAtBottom) => isAtBottom ? "smooth" : false}` 一行替代老的「贴底跟随」逻辑：
+     - 库自己维护「是否贴底」、不需要 `stickToBottomRef` + `handleScroll` + `useEffect`
+     - 删了原本 ~25 行的滚动控制代码
+   - `initialTopMostItemIndex={items.length - 1}` 初始定位末尾
+2. **`streamingText` 拼成虚拟末尾 item 参与虚拟化**
+   - 之前是「特殊渲染在事件列表之后」、需要单独 Footer 组件 + scrollIntoView
+   - 现在：`__streaming__` 假事件 push 到 data 数组末尾、跟其他 event 一起 virtualize
+   - `followOutput` 自动跟着追加滚动、不需要额外触发
+3. **`React.memo` 包裹 row 组件**（`rows.tsx`）
+   - `EventRow` / `AskUserRequestRow` / `StreamingAssistantRow` 全部 memo
+   - SSE 频繁 setTask 时已渲染 item 跳过 reconcile、ID 稳定的 row props 不变就不重渲染
+   - 配合 Virtuoso 的 item 复用、整体 reconcile 工作量降一个数量级
+
+**bundle 影响**：`/tasks/[id]` First Load JS 270 KB → 290 KB（+20 KB / +7%）、`react-virtuoso` ~15 KB gzipped、可接受。
+
+**V0.5.13.4 自动滚动 bug**（顺带修）：
+
+之前 `useEffect` 依赖 `renderEvents.length`、但合并算法（thinking + tool_call）把多条合一条、length 不变、贴底也不滚——用户反馈「自动滚动经常失效」。
+
+修法：dep 换回原始 `task.events.length`（单调递增）。**V0.5.14 接 Virtuoso 后该 useEffect 被整体删除**、bug 自然消失（库自己管贴底）、不需要单独 fix。
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓ / `pnpm build` ✓（23 routes 全编译、`/tasks/[id]` First Load 290 KB）
+
+**待联测**：跑一个事件多的真任务（几百条 events）、看滚动 / 切折叠 / 推 chunk 是否丝滑、贴底跟随是否正常。
+
+### V0.5.13.2：所有 dialog 加 Cmd+Enter 提交（默认快捷键）（2026-05-26）
+
+用户拍板「Cmd+Enter 成为所有 dialog 的默认提交快捷键」、跟 event-stream 输入框 / chat 应用通用习惯（Slack/Cursor/ChatGPT）对齐。
+
+**4 个 dialog 一锅都加**（Textarea onKeyDown handler 模板：`Cmd/Ctrl+Enter` 阻止默认 + 调 `handleSubmit`）：
+
+| Dialog | 改动 |
+|---|---|
+| `revise-dialog.tsx` | Textarea + onKeyDown、placeholder 加「（Cmd+Enter 发送）」 |
+| `ask-user-dialog.tsx` | Other 模式 Textarea + onKeyDown（placeholder 不动、原本就很长） |
+| `new-task-dialog.tsx` | description Textarea + onKeyDown |
+| `advance-dialog.tsx` | fork reason Textarea + onKeyDown |
+
+**安全保证**：每个 `handleSubmit` 内部已有 `!canSubmit` / `!allAnswered` 短路保护、未填完时 Cmd+Enter 无副作用（按钮 disable 也走同样校验）。
+
+**单 `Enter` 保持换行**、避免误发。
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
+### V0.5.13：事件流密度优化（summarize 全文压缩 + tool_call 合并）（2026-05-26）
+
+**背景**（用户跑完 V0.5.12 第三轮联测后即时反馈）：
+
+1. 思考块折叠态文本「没占满一排就省略 + 没省略号」、用户看到一句短话不知道下面还有几行
+2. review 阶段 agent 频繁 edit `01-plan.md` / `03-review.md`、tool_call 一连十几条卡片刷屏（review 闭环的副作用）
+
+**改动**（全在 `src/components/tasks/event-stream/`）：
+
+1. **`summarize` 改全文空白压缩 + 200 字截**
+   - 原本：取 `text.split("\n")[0]` 首行、80 字截、首行短不加省略号
+   - 现在：`text.replace(/\s+/g, " ").trim()` 拍平、200 字兜底
+   - 配合 truncate class：容器宽度截到哪算哪、自动 `…`、用户看到尽量满的预览
+2. **`mergeAdjacentToolCall` 新增（V0.5.13.1 hot-fix 后）**
+   - **初版**：同 phase + 同 `meta.name`（tool 名）连续 ≥2 条 tool_call 合一卡
+   - **hot-fix 放宽**（用户实测拍板）：去掉「同 tool name」约束、改成「同 phase 连续 tool_call」就合并
+     - 原因：AI 探索式调用经常 `read → grep → read → edit` 交错、严格相邻不触发、压不了几条
+     - 折叠态：「工具调用 ×N」+ 最后一条 `summarize(ev.text)` 摘要（给用户看「收尾在干嘛」）
+     - 展开态：每条子条带 `[tool name]` prefix（蓝色 badge）、看得清谁是谁
+   - `meta.batch = [{ id, ts, text, name }]` 保留所有子条
+   - `meta.count` 给折叠态显示「×N」后缀
+   - 类似 `mergeAdjacentThinking` 不动 events.jsonl 落盘内容、只在 UI 渲染前合并
+   - `event-stream.tsx` 的 `renderEvents` useMemo 两道 pass：thinking 合并 → tool_call 合并
+3. **`EventRow` batch 折叠态展示**
+   - 折叠态文本：`${summarize(ev.text)} ×N` 后缀
+   - 展开态：列表展示每条 `[name] {text} {ts}`、字号 [11px] 紧凑 mono
+   - 不可展开的 single tool_call 走原逻辑
+
+**用户拍板未选**：C 方案「显示工具调用 / 思考 / phase 边界」过滤器 toggle——每次都要用户操作太烦。B 方案被动降密度、跟 Cursor IDE 行为一致。
+
+**验证**：`pnpm typecheck` ✓ / `pnpm lint` ✓
+
+---
+
 ### V0.5.12.3：review prompt 5 点精修 + 第二轮联测 hot-fix（2026-05-26）
 
 **背景**：用户实测 V0.5.12.2 闭环后跑了一道任务 `t_1779688487844_9kzpdc`、闭环 work（agent 调 ask_user / 用户选 b / agent edit plan / 追加用户决策段）、但发现 5 个不完美点。本轮先做 prompt 精修、再跑一轮联测、发现 2 个新边界 case 一并修。
