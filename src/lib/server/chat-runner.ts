@@ -841,6 +841,16 @@ const handleChatSdkMessage = async (
       // SDK 把服务端致命错误的具体描述放在 status 消息的 message 字段里、
       // 而 RunResult 类型只有 status / model / durationMs、不带 message——
       // 不在这里把 ERROR / EXPIRED 推出来、最后 throw 出去的报错就是空的、只能猜原因
+      //
+      // V0.5.15 增强（对齐 plan-runner V0.5.5 增强）：
+      // 先 console.log 一份 raw status 消息（运维 / 用户排查用）、
+      // 实测 SDK 1.0.13 status=error 时偶尔不发 status 流消息、run.wait() 拿到 error 就直接退、
+      // 这条 log 能让用户在 dev server 终端看到「SDK 到底有没有给详细错误描述」
+      console.log(
+        `[chat-runner] SDK status message: status=${msg.status} message=${
+          (msg as { message?: string }).message ?? "(none)"
+        }`,
+      );
       if (
         (msg.status === "ERROR" || msg.status === "EXPIRED") &&
         msg.message

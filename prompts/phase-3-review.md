@@ -61,7 +61,7 @@
 | 01 §5「Task 拆分」 | 对照 02-build.md「Task 完成情况」看完成率 + 复核每个 task 自带的「验收点」 |
 | 01 §6「待澄清 / 不确定项」 | plan 阶段 deferred 的 Q、看是否 build 时实际命中、需要在 review 里提醒用户 |
 | 02 「Task 完成情况」+「偏离 plan」 | 用 build agent 自己记的偏差点作为差异候选 |
-| 02 「全量校验」 | typecheck / lint / build 结果是否 pass、不 pass 的话 review 直接标 ❌ |
+| 02 「全量校验」 | typecheck / lint 结果是否 pass、不 pass 的话 review 直接标 ❌ |
 
 ### 2. 拿 git diff 看实际改动
 
@@ -331,7 +331,7 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 - **plan 实施完整度**：<完成的 task 数> / <计划的 task 数>（百分比）
 - **代码改动跟 plan 范围匹配度**：高 / 中 / 低（附理由）
 - **跟飞书 story 原始需求一致性**：高 / 中 / 低（附理由）
-- **build 校验状态**：lint=<pass/fail>、typecheck=<pass/fail>、build=<pass/fail>（搬 02-build.md「全量校验」）
+- **build 校验状态**：lint=<pass/fail>、typecheck=<pass/fail>（搬 02-build.md「全量校验」）
 - **建议结论**：
   - ✅ 可交付（所有三类差异都是低风险 / 用户口径明确）
   - ⚠️ 有偏差需用户决策（有「实现偏差」/「未完成 task」段）

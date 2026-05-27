@@ -123,13 +123,7 @@ export const AdvanceDialog = ({
     }
   };
 
-  // 「推进」按钮文案根据选项变化、给用户预期
-  const submitLabel = (() => {
-    if (submitting) return "推进中…";
-    if (mode === "resume") return "让原 agent 继续";
-    if (mode === "fork") return `从 ${PHASE_LABEL[fromPhase]} 起跑`;
-    return "从头重跑";
-  })();
+  const submitLabel = submitting ? "推进中…" : "推进";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -149,20 +143,18 @@ export const AdvanceDialog = ({
             title={
               resumeAvailable
                 ? "复用原 agent、保留对话历史"
-                : "本任务没有 lastAgentId（如 agent 从未启动）"
+                : "本任务没有 agent 记录"
             }
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">让原 agent 继续推进</span>
+              <span className="font-medium">让原 agent 继续</span>
               <span className="text-[10px] text-muted-foreground">推荐</span>
             </div>
             <p className="text-xs text-muted-foreground leading-relaxed">
-              复用旧 agent ID 续接、保留对话历史、agent 重新调 wait_for_user。
-              如果 Cursor backend 已清掉旧 agent（NGHTTP2_ENHANCE_YOUR_CALM）、
-              会自动降级为「起新 agent 从当前 phase 接力」。
+              复用上一个 agent 接着跑、不耗额外配额。
               {!resumeAvailable && (
                 <span className="block mt-1 text-amber-500">
-                  此任务无 lastAgentId、不可用
+                  本任务没有 agent 记录、不可用
                 </span>
               )}
             </p>
@@ -177,14 +169,11 @@ export const AdvanceDialog = ({
             className="flex flex-col gap-2"
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">从指定 phase 重启</span>
-              <span className="text-[10px] text-muted-foreground">
-                +1 send 配额
-              </span>
+              <span className="font-medium">从指定阶段重启</span>
+              <span className="text-[10px] text-muted-foreground">耗 1 次</span>
             </div>
             <p className="text-xs text-muted-foreground leading-relaxed">
-              起一个新 agent、读取上游 artifact 拿上下文、从你选的 phase 开始跑。
-              上游 phase 的 artifact 会被复用（不会重写）。
+              起新 agent、从你选的阶段接着跑。上游不变、下游会重做。
             </p>
             {mode === "fork" && (
               <>
@@ -208,11 +197,6 @@ export const AdvanceDialog = ({
                   </div>
                   <ArrowRight className="size-3 text-muted-foreground" />
                   <span className="text-xs text-muted-foreground">开始</span>
-                  {fromPhase === inferredFromPhase && (
-                    <span className="ml-1 text-[10px] text-primary/80">
-                      （推断的下一未完成 phase）
-                    </span>
-                  )}
                 </div>
                 {/* V0.5.7.1：bug 描述 textarea、可留空 */}
                 {/* 之所以放 fork 选项内：reason 只在 fork 模式下有意义、resume / restart 不需要 */}
@@ -224,8 +208,7 @@ export const AdvanceDialog = ({
                     htmlFor="advance-fork-reason"
                     className="text-xs text-muted-foreground"
                   >
-                    这次主要想修什么？
-                    <span className="ml-1 text-[10px]">（可留空、AI 会自己看 git diff）</span>
+                    想修什么（可留空）
                   </label>
                   <Textarea
                     id="advance-fork-reason"
@@ -237,7 +220,7 @@ export const AdvanceDialog = ({
                         void handleSubmit();
                       }
                     }}
-                    placeholder="例：A 上拉加载第二页空白；B 学情详情冷启动 500；C 跳转 query 漏了 NEW_C"
+                    placeholder="例：修字段名 promoteStatus → isMakeUp"
                     disabled={submitting}
                     rows={3}
                     className="text-xs"
@@ -256,17 +239,11 @@ export const AdvanceDialog = ({
             className="flex flex-col gap-1"
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">从头完全重跑</span>
-              <span className="text-[10px] text-destructive">
-                覆盖现有 artifact
-              </span>
+              <span className="font-medium">从头重跑</span>
+              <span className="text-[10px] text-destructive">覆盖产出</span>
             </div>
             <p className="text-xs text-muted-foreground leading-relaxed">
-              起一个新 agent、从 Plan 完全重头跑。
-              <span className="text-destructive">
-                现有的 plan / build / review artifact 会被新 agent 重新生成覆盖
-              </span>
-              、适合改了 prompt / 想完整看一遍重跑结果。
+              起新 agent 从 plan 重做、原有产出会被覆盖。
             </p>
           </ChoiceButton>
         </div>

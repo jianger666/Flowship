@@ -47,7 +47,6 @@ import type { McpServerConfig, ModelSelection, SDKMessage } from "@cursor/sdk";
 
 import {
   appendEvent,
-  getArtifactsDir,
   getEventsLogPath,
   getPhaseArtifactPath,
   getTask,
@@ -197,14 +196,10 @@ const loadPhasePrompt = async (
   return fillTemplate(tpl, {
     taskId: task.id,
     taskTitle: task.title,
-    title: task.title,
     // V0.5.9：{{repoPath}} 模板变量统一改为「agent effective cwd」语义
     // 单仓 = 仓自身、多仓 = 公共父目录、phase prompt 字面「从 {{repoPath}} 起算」自动兼容
     repoPath: getEffectiveCwd(task.repoPaths),
-    feishuStoryUrl: task.feishuStoryUrl,
-    description: task.description,
     artifactPath,
-    artifactsDir: getArtifactsDir(task.id),
     prevArtifactPath,
     planArtifactPath,
     role: task.role,
@@ -1197,6 +1192,12 @@ export const runPlanWorkflow = async (input: RunPlanInput): Promise<void> => {
       causeMessage.includes("ERR_HTTP2_STREAM_ERROR");
     const shouldFallbackFork =
       isResume && (isEnhanceYourCalm || isStreamClosed);
+
+    // V0.5.15：fallbackFork 决策诊断 log——便于排查「resume 失败但没自动降级」的 case
+    // 关键 flags：isResume / isEnhanceYourCalm / isStreamClosed 任一不命中都不降级
+    console.log(
+      `[plan-runner] task=${task.id} catch decision: isResume=${isResume} isEnhanceYourCalm=${isEnhanceYourCalm} isStreamClosed=${isStreamClosed} → shouldFallbackFork=${shouldFallbackFork}`,
+    );
 
     if (shouldFallbackFork) {
       console.log(

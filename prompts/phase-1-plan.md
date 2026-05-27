@@ -103,7 +103,7 @@
 
   `{{artifactPath}}`
 
-artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifact 写入工具」（创建新 artifact 用 `write`、改已有用 `edit`、首次写前 `read` 一遍 `artifact-writer` skill）。格式按下面骨架。
+artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifact 写入工具」。格式按下面骨架。
 
 > **跟飞书原文有差异（推断 / 偏离 / 找不到来源）一律走 ask_user 闭环**——V0.5.6.1 起取消了「§1.1 我的理解 vs 飞书原文」对照段、对 plan 没价值（agent 大概率全列「一致」、对用户没信息量）。差异本质是「AI 不确定的点」、应该 ask_user 让用户拍板、用户答完再落 artifact、而不是先列表再让用户审。
 > 这也是 V0.5.6 给 ask_user 加「无次数上限」+「稍后再补充」的核心动机——能用 ask_user 闭环的、不要让用户去 plan 里审表格。

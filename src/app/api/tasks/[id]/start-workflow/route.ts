@@ -200,6 +200,18 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
+  // V0.5.15：路由入口诊断 log——记录每次 start-workflow 调用时的关键状态
+  // 用途：调试「点推进没反应 / 反复起不起来」类问题、看走了哪条分支
+  console.log(
+    `[start-workflow] task=${task.id} mode=${mode} fromPhase=${
+      body.fromPhase ?? "(none)"
+    } taskStatus=${task.status} currentPhase=${
+      task.currentPhase ?? "(none)"
+    } isPlanRunning=${isPlanRunning(task.id)} lastAgentId=${
+      task.lastAgentId ?? "(none)"
+    }`,
+  );
+
   // 已在跑 → 幂等返回（不区分 mode、所有模式都遵循「一次只跑一个 run」）
   // 三类情况：
   //   1. task.status=running：真正有 agent 在跑、直接返 already=true（幂等）
@@ -209,6 +221,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
   //      `cancelPlan + waitForPlanToStop` 等不到 finally 清 entry、得暴力 forceClear 自愈
   if (isPlanRunning(task.id)) {
     if (task.status === "running") {
+      // V0.5.15：此分支历史无 log、用户视角是「点推进没反应」、加一行
+      // 实际场景：agent 真的在跑（如 wait_for_user shell long-poll 中）、idempotent 跳过新 run
+      // 如果用户感觉「卡死」、需要走 cancel-and-restart 路径（task.status 切到 awaiting_user 才能进 case 2）
+      console.log(
+        `[start-workflow] task=${task.id} 已 running + isPlanRunning、idempotent 返回 already=true`,
+      );
       return okResponse({ task, already: true });
     }
     if (task.status === "awaiting_user") {
