@@ -1,37 +1,41 @@
 "use client";
 
 /**
- * 推进 workflow Dialog（V0.5.7）
+ * 推进 Action Dialog（V0.6 重写、V0.6.0.1 任务模式去 chat、末段砍 retry 入口 + 加换模型 + 删推荐标签）
  *
- * 触发：plan 任务在 draft / failed / completed / awaiting_user 状态下、顶部「推进」按钮打开。
+ * V0.6 任务容器模型下：用户从「上一个 action ack 完 / 任务刚创建 / 任务跑挂了」状态进推进 dialog、
+ * 选下一个 action 类型 + 写指令。
  *
- * 替代历史上的两个独立按钮 ——「继续监听」（Agent.resume）和「重启 workflow」（Agent.create 从 plan）。
- * V0.5.7 起合并为单一「推进」入口、由用户在 dialog 里显式选「推进方式」：
+ * 字段：
+ *   - action 类型（plan / build / review / ship / test / learn）
+ *     - V0.6.0 stub：ship / test / learn 灰掉、不让选
+ *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
+ *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
+ *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
+ *   - forceNewAgent（高级开关、默认 false）：老 agent 跑挂了 / 想跑新 prompt 时打开
+ *     - 打开后冒出「本次起新 agent 用的模型」一段 ModelPicker、默认 = settings.defaultModel、
+ *       可以临时换 base + 调 thinking/effort 等 params；不开关时本段隐藏、续接走 task.model
  *
- * 1. **让原 agent 继续推进**（resume）
- *    - 用 `Agent.resume(lastAgentId)` 复用旧 agent、保留对话历史、新 agent 醒过来调 wait_for_user 续接
- *    - 适用：刚才 wait-ack 长连接突然断了、原 agent 在 Cursor backend 仍然活着
- *    - 不可用条件：task 没有 lastAgentId（如老任务 / agent 从未启动过）
- *    - 后端兜底：如果 Cursor backend 已经清掉旧 agent（NGHTTP2_ENHANCE_YOUR_CALM）、
- *      plan-runner 内部会自动降级 fork（fromPhase=currentPhase）、用户视角一次就能推下去
+ * 行为：
+ *   - 提交后父组件调 advanceTask(taskId, { actionType, userInstruction, forceNewAgent, model? })
+ *   - 成功后父组件自行关 dialog、新 ActionRecord 通过 SSE 推回来
  *
- * 2. **从某个 phase 重启**（fork from X）
- *    - 用 `Agent.create` 新 agent + super-prompt 顶部 fork banner、从 fromPhase 起跑
- *    - 默认 fromPhase = 下一个未 ack 的 phase（按硬盘 artifact + phase status 推断）
- *    - 适用：原 agent 已经死透、但 plan / build artifact 还想复用；测试新模型 / 新 prompt
- *    - 上游 artifact 会被 agent 直接 read 复用、不会重写
- *
- * 3. **从 Plan 完全重头**（restart）
- *    - 用 `Agent.create` 新 agent + 老 super-prompt 从 plan 起跑
- *    - 适用：测试 prompt 大改动、想看一个 task 从头到尾的纯净跑一遍
- *    - **会覆盖现有 artifact**——agent 重新跑 plan / build / review、之前的内容会被新内容替换
- *
- * 三个选项都会**+1 send 配额**（resume 视情况、其它必然 +1）。
+ * 历史决策：
+ *   - V0.6.0.1 中段试过给 ActionTimeline 失败 chip 加 retry 快捷入口（带 `initialActionType` / `retryHint` props）、
+ *     用户实测发现「点旧 error chip retry」语义混乱（实际是打断当前 running + 起一个全新 action）、retry chip
+ *     整套砍了、本 dialog 入口唯一、不接外部 prefill；同步把 `inferRecommended` 里「last action error → 同 type」
+ *     那一条删了、错误后默认仍走流程顺推（plan→build→review）、用户手动改、跟「没有自动重试」语义一致
+ *   - V0.6.0.1 末段把右上角「推荐」微标签删了：那条逻辑（has_bug→build / plan→build / build→review）本身
+ *     只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导；改成「打开 dialog 时
+ *     默认选中一个、用户每次自己拍」、函数也重命名为 inferDefaultActionType
+ *   - 同时加换模型是为了「task 在不同阶段配不同模型」更自然——比如 plan 用 opus、build 切 sonnet 省 token；
+ *     之前 agent 挂掉重启时也没法换模型、只能去 settings 改全局再回来
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, Loader2 } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
@@ -40,39 +44,124 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { ModelPicker } from "@/components/ui/model-picker";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { PHASE_LABEL } from "@/lib/task-display";
-import type { StartWorkflowMode } from "@/lib/task-store";
-import { PHASE_IDS, type PhaseId, type Task } from "@/lib/types";
+import { useModels } from "@/hooks/use-models";
+import { getSettings } from "@/lib/local-store";
+import { ACTION_LABEL } from "@/lib/task-display";
+import type { ActionType, ModelSelection, Task } from "@/lib/types";
+
+// V0.6.0 已实装的 action 类型；ship/test/learn 灰掉
+// V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
+const IMPLEMENTED_ACTIONS: ActionType[] = ["plan", "build", "review"];
+const STUB_ACTIONS: ActionType[] = ["ship", "test", "learn"];
+const STUB_VERSION: Record<ActionType, string | undefined> = {
+  plan: undefined,
+  build: undefined,
+  review: undefined,
+  ship: "V0.6.1",
+  test: "V0.6.2",
+  learn: "V0.6.3",
+};
+
+// 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
+// 服务端会双重校验、UI 仅为提示用户「为什么这个 action 不能选」
+const inferDisabledReason = (
+  task: Task,
+  type: ActionType,
+): string | null => {
+  const hasCompleted = (t: ActionType) =>
+    task.actions.some((a) => a.type === t && a.status === "completed");
+  switch (type) {
+    case "plan":
+      return null;
+    case "build":
+      return hasCompleted("plan") ? null : "需要先有一个已通过的 plan";
+    case "review":
+      return hasCompleted("build") ? null : "需要先有一个已通过的 build";
+    case "ship":
+    case "test":
+    case "learn":
+      return `${STUB_VERSION[type]} 上线`;
+    default: {
+      const _: never = type;
+      return _;
+    }
+  }
+};
+
+// 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
+// 简单情况下用固定文案；首次 plan / 修 bug 等场景由 buildPlaceholder() 进一步细化
+const ACTION_PLACEHOLDER: Record<ActionType, string> = {
+  plan: "需求是什么？要解决什么问题？",
+  build: "具体改什么、指向哪个文件 / 函数 / bug",
+  review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
+  ship: "（V0.6.1 上线）PR 标题 / 描述补充",
+  test: "（V0.6.2 上线）跑哪些 case？默认全跑",
+  learn: "（V0.6.3 上线）learn 不需要 textarea、看 propose 列表",
+};
+
+// 根据 task 当前状态 + 选中 action 类型动态调整 placeholder
+// - has_bug + build → 「修哪个 bug、症状 / 复现路径」
+// - 没 plan + plan → 「需求是什么？要解决什么问题？」（首次）
+// - 有 plan + plan → 「方案要怎么调整？」（再次 plan）
+const buildPlaceholder = (task: Task, type: ActionType): string => {
+  if (type === "build" && task.repoStatus === "has_bug") {
+    return "修哪个 bug、症状 / 复现路径";
+  }
+  if (type === "plan") {
+    const hasPlan = task.actions.some(
+      (a) => a.type === "plan" && a.status === "completed",
+    );
+    return hasPlan ? "方案要怎么调整？" : "需求是什么？要解决什么问题？";
+  }
+  return ACTION_PLACEHOLDER[type];
+};
+
+// 算 dialog 打开时默认选中哪个 action chip（V0.6.0.1 起改名、原 inferRecommended）：
+// - repoStatus = has_bug → build（业务状态映射：有 bug 就是要回 build）
+// - repoStatus = merged → plan（V0.6.3 起改 learn）
+// - repoStatus = abandoned → plan（task 已关闭、用户也不会走推进 dialog）
+// - 无 action → plan
+// - 最近一条 completed action：plan → build / build → review / review → plan（V0.6.1 起改 ship）
+// V0.6.0.1 删的：「最后一条 error → 同 type」——之前是 retry 入口的兜底、retry 砍掉后保留它跟「没有自动重试」
+// 语义冲突、不如让默认值仍按流程顺推（error 后用户手动选要不要换 type 走、跟没失败时一样）
+// 注意：这个函数算的是「默认值」、不是「推荐」——UI 上不会标「推荐」二字、避免暗示「我跟你说要走这个」
+const inferDefaultActionType = (task: Task): ActionType => {
+  if (task.repoStatus === "has_bug") return "build";
+  if (task.repoStatus === "merged") return "plan"; // V0.6.3 起改 learn
+  if (task.repoStatus === "abandoned") return "plan";
+
+  if (task.actions.length === 0) return "plan";
+
+  const last = [...task.actions]
+    .reverse()
+    .find(
+      (a) =>
+        a.status === "completed" &&
+        (a.type === "plan" || a.type === "build" || a.type === "review"),
+    );
+  if (!last) return "plan";
+  if (last.type === "plan") return "build";
+  if (last.type === "build") return "review";
+  return "plan"; // V0.6.1 起改 ship
+};
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   task: Task;
-  // V0.5.7.1：fork 时支持带 reason（用户填的「想修什么 bug / 重启原因」）、可空
-  onSubmit: (
-    mode: StartWorkflowMode,
-    fromPhase?: PhaseId,
-    reason?: string,
-  ) => Promise<void>;
+  onSubmit: (input: {
+    actionType: ActionType;
+    userInstruction: string;
+    forceNewAgent: boolean;
+    // 用户在 dialog 里临时挑的模型；只在 forceNewAgent=true 时传、其他场景父组件用默认
+    model?: ModelSelection;
+  }) => Promise<void>;
   submitting: boolean;
 }
-
-// 根据 task.phases 推断「下一个未 ack 的 phase」、给 fork 模式选 fromPhase 时做默认值
-// 规则：第一个 status !== "ack" 的 phase（PHASE_IDS 顺序：plan → build → review）
-// 全部 ack（completed 任务）→ 兜底选 review、用户可以再改
-const inferNextUnackedPhase = (task: Task): PhaseId => {
-  for (const pid of PHASE_IDS) {
-    const status = task.phases[pid]?.status;
-    if (status !== "ack") return pid;
-  }
-  return "review";
-};
-
-// resume 模式可用条件：task 有 lastAgentId
-// 没 lastAgentId（如老任务 / agent 从未启动过）→ resume option 显示为 disabled
-const canUseResume = (task: Task): boolean => !!task.lastAgentId;
 
 export const AdvanceDialog = ({
   open,
@@ -81,49 +170,58 @@ export const AdvanceDialog = ({
   onSubmit,
   submitting,
 }: Props) => {
-  // 用户当前选的 mode；dialog 打开时根据 task 状态智能给默认值
-  const [mode, setMode] = useState<StartWorkflowMode>("resume");
-  // fork 模式下用户选的 fromPhase；默认 = 下一未 ack
-  const [fromPhase, setFromPhase] = useState<PhaseId>(() =>
-    inferNextUnackedPhase(task),
-  );
-  // V0.5.7.1：fork 模式下用户填的「想修什么 bug / 重启原因」、可空
-  // 留空场景：上一轮 agent 跑挂了 / 用户只想换 phase 起跑、没具体 bug
-  // 填了场景：用户自己跑过代码、发现 N 个 bug、按 bug 说明定向修复
-  const [reason, setReason] = useState<string>("");
+  // dialog 打开时默认选中哪个 chip（不叫推荐、纯减少首次点击）
+  const defaultActionType = useMemo(() => inferDefaultActionType(task), [task]);
 
-  // 推断的默认 fromPhase（每次 task 变化重算）
-  const inferredFromPhase = useMemo(
-    () => inferNextUnackedPhase(task),
-    [task],
-  );
-  const resumeAvailable = useMemo(() => canUseResume(task), [task]);
+  // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
+  const [actionType, setActionType] = useState<ActionType>(defaultActionType);
+  // 用户指令、选填——飞书/上下文都已带上、空也能跑
+  const [instruction, setInstruction] = useState("");
+  // 高级：强制起新 agent（默认 false、复用旧 agent；老 agent 跑挂了 / 想跑新 prompt 时打开）
+  const [forceNewAgent, setForceNewAgent] = useState(false);
+  // 强制起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
+  // 仅 forceNewAgent=true 时透传给父组件、否则 ignore（续接 Run 不能换模型）
+  const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
+  // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
+  const { models: availableModels, fetchModels } = useModels();
 
-  // dialog 打开时重置选项：
-  //   - resume 可用 + task 非 draft → 默认 resume（最低成本路径）
-  //   - 其它情况 → 默认 fork（从推断的 fromPhase 起跑、复用 artifact）
   useEffect(() => {
     if (!open) return;
-    if (resumeAvailable && task.status !== "draft") {
-      setMode("resume");
-    } else {
-      setMode("fork");
+    setActionType(defaultActionType);
+    setInstruction("");
+    setForceNewAgent(false);
+    // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
+    const s = getSettings();
+    setPickedModel(
+      s.defaultModel ?? { id: "" },
+    );
+    // 第一次打开 / 切 task 时按需拉模型列表（settings page 已拉过、内存里有就跳过）
+    if (s.apiKey?.trim() && availableModels.length === 0) {
+      void fetchModels(s.apiKey);
     }
-    setFromPhase(inferredFromPhase);
-    // V0.5.7.1：每次打开 dialog 都清空 reason、避免上次填的串到本次
-    setReason("");
-  }, [open, resumeAvailable, task.status, inferredFromPhase]);
+  }, [open, defaultActionType, availableModels.length, fetchModels]);
+
+  // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
+  const disabledReason = useMemo(
+    () => inferDisabledReason(task, actionType),
+    [task, actionType],
+  );
+  const canSubmit = useMemo(() => {
+    if (submitting) return false;
+    if (disabledReason) return false;
+    return true;
+  }, [submitting, disabledReason]);
 
   const handleSubmit = async () => {
-    if (mode === "fork") {
-      // V0.5.7.1：fork 时把 reason（trim 后）传给上层、空字符串过滤掉
-      await onSubmit(mode, fromPhase, reason.trim() || undefined);
-    } else {
-      await onSubmit(mode);
-    }
+    if (!canSubmit) return;
+    await onSubmit({
+      actionType,
+      userInstruction: instruction.trim(),
+      forceNewAgent,
+      // 只在「强制起新 agent」时透传模型选择、续接走 task.model
+      model: forceNewAgent && pickedModel.id ? pickedModel : undefined,
+    });
   };
-
-  const submitLabel = submitting ? "推进中…" : "推进";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -133,119 +231,126 @@ export const AdvanceDialog = ({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-2">
-          {/* Option 1: resume */}
-          <ChoiceButton
-            shape="card"
-            selected={mode === "resume"}
-            onClick={() => setMode("resume")}
-            disabled={!resumeAvailable || submitting}
-            className="flex flex-col gap-1"
-            title={
-              resumeAvailable
-                ? "复用原 agent、保留对话历史"
-                : "本任务没有 agent 记录"
-            }
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">让原 agent 继续</span>
-              <span className="text-[10px] text-muted-foreground">推荐</span>
-            </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              复用上一个 agent 接着跑、不耗额外配额。
-              {!resumeAvailable && (
-                <span className="block mt-1 text-amber-500">
-                  本任务没有 agent 记录、不可用
-                </span>
-              )}
-            </p>
-          </ChoiceButton>
-
-          {/* Option 2: fork from X */}
-          <ChoiceButton
-            shape="card"
-            selected={mode === "fork"}
-            onClick={() => setMode("fork")}
-            disabled={submitting}
-            className="flex flex-col gap-2"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">从指定阶段重启</span>
-              <span className="text-[10px] text-muted-foreground">耗 1 次</span>
-            </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              起新 agent、从你选的阶段接着跑。上游不变、下游会重做。
-            </p>
-            {mode === "fork" && (
-              <>
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="text-xs text-muted-foreground">从</span>
-                  <div className="flex gap-1">
-                    {PHASE_IDS.map((pid) => (
-                      <ChoiceButton
-                        key={pid}
-                        shape="chip"
-                        selected={fromPhase === pid}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setFromPhase(pid);
-                        }}
-                        disabled={submitting}
-                      >
-                        {PHASE_LABEL[pid]}
-                      </ChoiceButton>
-                    ))}
-                  </div>
-                  <ArrowRight className="size-3 text-muted-foreground" />
-                  <span className="text-xs text-muted-foreground">开始</span>
-                </div>
-                {/* V0.5.7.1：bug 描述 textarea、可留空 */}
-                {/* 之所以放 fork 选项内：reason 只在 fork 模式下有意义、resume / restart 不需要 */}
-                <div
-                  className="flex flex-col gap-1 pt-1"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <label
-                    htmlFor="advance-fork-reason"
-                    className="text-xs text-muted-foreground"
+          {/* action 类型选择：grid 卡片 */}
+          <div className="grid gap-1.5">
+            <Label>下一步</Label>
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+              {IMPLEMENTED_ACTIONS.map((type) => {
+                const reason = inferDisabledReason(task, type);
+                return (
+                  <ChoiceButton
+                    key={type}
+                    shape="card"
+                    selected={actionType === type}
+                    onClick={() => setActionType(type)}
+                    disabled={submitting || !!reason}
+                    className="flex flex-col items-start gap-0.5"
+                    title={reason ?? `选「${ACTION_LABEL[type]}」推进`}
                   >
-                    想修什么（可留空）
-                  </label>
-                  <Textarea
-                    id="advance-fork-reason"
-                    value={reason}
-                    onChange={(e) => setReason(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                        e.preventDefault();
-                        void handleSubmit();
-                      }
-                    }}
-                    placeholder="例：修字段名 promoteStatus → isMakeUp"
-                    disabled={submitting}
-                    rows={3}
-                    className="text-xs"
-                  />
-                </div>
-              </>
-            )}
-          </ChoiceButton>
-
-          {/* Option 3: restart from plan */}
-          <ChoiceButton
-            shape="card"
-            selected={mode === "restart"}
-            onClick={() => setMode("restart")}
-            disabled={submitting}
-            className="flex flex-col gap-1"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium">从头重跑</span>
-              <span className="text-[10px] text-destructive">覆盖产出</span>
+                    <div className="flex w-full items-center justify-between gap-1">
+                      <span className="font-medium">{ACTION_LABEL[type]}</span>
+                    </div>
+                    <span className="text-[10px] text-muted-foreground">
+                      {reason
+                        ? reason
+                        : type === "plan"
+                          ? "出方案"
+                          : type === "build"
+                            ? "写代码"
+                            : "复核差异"}
+                    </span>
+                  </ChoiceButton>
+                );
+              })}
+              {STUB_ACTIONS.map((type) => (
+                <ChoiceButton
+                  key={type}
+                  shape="card"
+                  selected={false}
+                  onClick={() => {}}
+                  disabled
+                  className="flex flex-col items-start gap-0.5 opacity-50"
+                  title={`${STUB_VERSION[type]} 上线`}
+                >
+                  <div className="flex w-full items-center justify-between gap-1">
+                    <span className="font-medium">{ACTION_LABEL[type]}</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {STUB_VERSION[type]}
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-muted-foreground">
+                    未实装
+                  </span>
+                </ChoiceButton>
+              ))}
             </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              起新 agent 从 plan 重做、原有产出会被覆盖。
-            </p>
-          </ChoiceButton>
+          </div>
+
+          {/* 用户指令、选填——飞书/上下文 doc 已经在 super-prompt 里带上、空提交也能跑 */}
+          <div className="grid gap-1.5">
+            <Label htmlFor="advance-instruction">
+              指令 <span className="text-xs text-muted-foreground">（选填）</span>
+            </Label>
+            <Textarea
+              id="advance-instruction"
+              value={instruction}
+              onChange={(e) => setInstruction(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  void handleSubmit();
+                }
+              }}
+              placeholder={buildPlaceholder(task, actionType)}
+              disabled={submitting}
+              rows={4}
+              autoFocus
+              className="resize-none"
+            />
+          </div>
+
+          {/* 高级：强制起新 agent */}
+          <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2">
+            <div className="flex items-center justify-between gap-2">
+              <label
+                htmlFor="advance-force-new"
+                className="flex-1 cursor-pointer text-xs leading-relaxed text-muted-foreground"
+              >
+                <span className="block font-medium text-foreground/80">
+                  强制起新 agent
+                </span>
+                <span className="block">
+                  老 agent 跑挂了 / 想跑新 prompt 时打开（耗 1 次 send 配额）
+                </span>
+              </label>
+              <Switch
+                id="advance-force-new"
+                checked={forceNewAgent}
+                onCheckedChange={setForceNewAgent}
+                disabled={submitting}
+              />
+            </div>
+
+            {/* 模型选择：只在开关打开后显示、续接 Run 不能换模型 */}
+            {forceNewAgent && (
+              <div className="grid gap-1.5 border-t border-border/60 pt-2">
+                <Label className="text-xs text-foreground/80">
+                  本次起新 agent 用的模型
+                </Label>
+                <ModelPicker
+                  models={availableModels}
+                  selection={pickedModel}
+                  onChange={setPickedModel}
+                  disabled={submitting}
+                  variant="compact"
+                  emptyPlaceholder="（请先在设置页拉取模型列表）"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  默认 = 设置页选的模型；本次推进后不会改设置页全局默认
+                </p>
+              </div>
+            )}
+          </div>
         </div>
 
         <DialogFooter className="gap-2">
@@ -256,9 +361,10 @@ export const AdvanceDialog = ({
           >
             取消
           </Button>
-          <Button onClick={handleSubmit} disabled={submitting}>
+          <Button onClick={handleSubmit} disabled={!canSubmit}>
             {submitting && <Loader2 className="animate-spin" />}
-            {submitLabel}
+            {submitting ? "推进中…" : "推进"}
+            <ArrowRight />
           </Button>
         </DialogFooter>
       </DialogContent>

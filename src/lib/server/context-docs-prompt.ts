@@ -4,8 +4,7 @@
  * 抽出来给 plan-runner + chat-runner 共用、保证两边对 contextDocs 的呈现方式一致：
  *   - URL / path：只列出元信息、让 agent 按需拉（feishu-mcp / fetch / `read` 工具）
  *   - text：≤ 1000 字默认全 inject、> 1000 字截断（信息保真要求）
- *
- * 跟 plan-runner 早期版本一致、只是搬了位置、没改语义。
+ *   - image（V0.6.0.1）：列绝对路径、agent 用 `read` 工具读、SDK 自动转 vision
  */
 
 import type { Task, TaskContextDoc } from "@/lib/types";
@@ -15,21 +14,27 @@ import type { Task, TaskContextDoc } from "@/lib/types";
 const TEXT_INLINE_INJECT_MAX = 1000;
 
 const renderContextDocBody = (doc: TaskContextDoc): string => {
-  if (doc.type !== "text") {
-    return `   ${doc.content.trim()}`;
+  if (doc.type === "text") {
+    const t = doc.content.trim();
+    if (t.length <= TEXT_INLINE_INJECT_MAX) {
+      return t
+        .split("\n")
+        .map((line) => `   ${line}`)
+        .join("\n");
+    }
+    const head = t.slice(0, TEXT_INLINE_INJECT_MAX);
+    return [
+      ...head.split("\n").map((line) => `   ${line}`),
+      `   …（**已截断、原文共 ${t.length} 字、超过 ${TEXT_INLINE_INJECT_MAX} 字上限**）`,
+    ].join("\n");
   }
-  const t = doc.content.trim();
-  if (t.length <= TEXT_INLINE_INJECT_MAX) {
-    return t
-      .split("\n")
-      .map((line) => `   ${line}`)
-      .join("\n");
+  if (doc.type === "image") {
+    return [
+      `   ${doc.content.trim()}`,
+      "   → 用 `read` 工具读这个路径、SDK 会自动转 vision（用户截图说明、比文字直接）",
+    ].join("\n");
   }
-  const head = t.slice(0, TEXT_INLINE_INJECT_MAX);
-  return [
-    ...head.split("\n").map((line) => `   ${line}`),
-    `   …（**已截断、原文共 ${t.length} 字、超过 ${TEXT_INLINE_INJECT_MAX} 字上限**）`,
-  ].join("\n");
+  return `   ${doc.content.trim()}`;
 };
 
 /**
@@ -53,10 +58,15 @@ export const renderContextDocsSection = (
   }
   const items = docs.map((doc, i) => {
     const idx = i + 1;
-    const titleLine =
-      doc.type === "text"
-        ? `${idx}. **【${doc.title}】**（text、${doc.content.trim().length} 字）`
-        : `${idx}. **【${doc.title}】**（${doc.type}）`;
+    let typeLabel: string;
+    if (doc.type === "text") {
+      typeLabel = `text、${doc.content.trim().length} 字`;
+    } else if (doc.type === "image") {
+      typeLabel = "image、用户截图";
+    } else {
+      typeLabel = doc.type;
+    }
+    const titleLine = `${idx}. **【${doc.title}】**（${typeLabel}）`;
     return [titleLine, renderContextDocBody(doc)].join("\n");
   });
   return [

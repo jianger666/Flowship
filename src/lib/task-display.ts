@@ -1,75 +1,137 @@
 /**
- * 任务展示层公共文案 / 工具
+ * 任务展示层公共文案 / 工具（V0.6 改造）
  *
- * 抽出来的动机：
- * - PHASE_LABEL 在 task-card / phase-progress / task page / artifact-panel 4 处独立定义、
- *   其中 artifact-panel 还多了「规划」二字、文案漂移
- * - STATUS_LABEL / STATUS_VARIANT 在 task-card 跟 task page 完全复制
- * - formatRelative 是「N 分钟前」之类相对时间、目前只 task-card 用、但放这统一收口未来好复用
+ * V0.6 概念变化：phase chain 拆掉、action history 取代——
+ *  - 原 PHASE_LABEL / PHASE_LABEL_EN / PHASE_LABEL_SHORT → ACTION_LABEL_*
+ *  - 原 STATUS_LABEL（TaskStatus 单维度）→ REPO_STATUS_LABEL（业务）+ RUN_STATUS_LABEL（运行时）
+ *  - 加 ACTION_STATUS_LABEL（单条 action 的状态）
  *
- * 命名约定：
- * - PHASE_LABEL: 默认中文长版本（「上下文 + 方案」）、用在卡片 / phase-progress 主标
- * - PHASE_LABEL_EN: 短英文（「Plan」/「Build」）、用在 phase-progress 副标
- * - PHASE_LABEL_SHORT: 中文短版本（「方案」/「实现」）、用在事件流 inline 标签
- *
- * 改 phase 文案 → 只改这一个文件。
+ * 改 action / status 文案 → 只改这一个文件。
  */
 
-import type { PhaseId, TaskStatus } from "./types";
+import type {
+  ActionStatus,
+  ActionType,
+  RepoStatus,
+  RunStatus,
+} from "./types";
 
-// 任务状态中文标签
-export const STATUS_LABEL: Record<TaskStatus, string> = {
-  draft: "草稿",
-  running: "运行中",
-  awaiting_user: "等待回复",
-  completed: "已完成",
-  failed: "失败",
+// ===========================================
+// Action 标签（V0.6 替代原 PHASE_LABEL）
+// ===========================================
+
+/**
+ * Action 中文长版本（主要展示用：advance dialog 选项 / action timeline 卡片）
+ *
+ * 注意：types.ts 已经 export `ACTION_LABEL`（types 层最小集合）、本文件这版**复用同名**
+ * 但放在 display 层、跟其他 display label 一起统一来源。如有偏差以本文件为准。
+ */
+export const ACTION_LABEL: Record<ActionType, string> = {
+  plan: "出方案",
+  build: "改代码",
+  review: "代码复核",
+  ship: "提 MR",
+  test: "AI 手测",
+  learn: "沉淀",
 };
 
-// 任务状态对应的 Badge variant
-// outline = 草稿（中性）/ default = 运行中（主色）/ secondary = 等待 / 已完成（弱）/ destructive = 失败
-export const STATUS_VARIANT: Record<
-  TaskStatus,
-  "default" | "secondary" | "destructive" | "outline"
-> = {
-  draft: "outline",
-  running: "default",
-  awaiting_user: "secondary",
-  completed: "secondary",
-  failed: "destructive",
-};
-
-// Phase 标签（中文长版本、主要展示）
-// V0.3.4 合并原 context 进 plan 后、plan 涵盖「读上下文 + 扫仓库 + 出方案」
-// 文案上不再强调「上下文」（用户对「上下文 + 方案」的复合标签接受度一般、改成更短的「方案规划」、
-//   语义上「规划」自然包含「读上下文 → 出方案」、不需要并列两个词）
-// V0.5：加 review phase（拿 git diff × plan × 飞书原文做差值 + 产出交付信息）
-export const PHASE_LABEL: Record<PhaseId, string> = {
-  plan: "方案规划",
-  build: "编码实现",
-  review: "复核交付",
-};
-
-// Phase 英文短标（团队沟通锚点、用在 phase-progress 副标）
-export const PHASE_LABEL_EN: Record<PhaseId, string> = {
+/** 英文短标、用在 timeline 副标 / event stream inline */
+export const ACTION_LABEL_EN: Record<ActionType, string> = {
   plan: "Plan",
   build: "Build",
   review: "Review",
+  ship: "Ship",
+  test: "Test",
+  learn: "Learn",
 };
 
-// Phase 中文短标（用在 event-stream 等空间紧凑的地方）
-export const PHASE_LABEL_SHORT: Record<PhaseId, string> = {
+/** 中文 2 字短标、用在事件流 inline tag 等紧凑场景 */
+export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
   plan: "方案",
   build: "实现",
   review: "复核",
+  ship: "提 MR",
+  test: "手测",
+  learn: "沉淀",
 };
 
+// ===========================================
+// Action 状态标签
+// ===========================================
+
+export const ACTION_STATUS_LABEL: Record<ActionStatus, string> = {
+  running: "运行中",
+  awaiting_ack: "等待确认",
+  completed: "已通过",
+  error: "失败",
+  cancelled: "已取消",
+};
+
+export const ACTION_STATUS_VARIANT: Record<
+  ActionStatus,
+  "default" | "secondary" | "destructive" | "outline"
+> = {
+  running: "default",
+  awaiting_ack: "secondary",
+  completed: "secondary",
+  error: "destructive",
+  cancelled: "outline",
+};
+
+// ===========================================
+// Task 级仓库状态（V0.6 新维度、跟 MR 生命周期对齐）
+// ===========================================
+
+export const REPO_STATUS_LABEL: Record<RepoStatus, string> = {
+  developing: "开发中",
+  awaiting_test: "待测",
+  has_bug: "有 bug",
+  merged: "已合入",
+  abandoned: "已放弃",
+};
+
+export const REPO_STATUS_VARIANT: Record<
+  RepoStatus,
+  "default" | "secondary" | "destructive" | "outline"
+> = {
+  developing: "default",
+  awaiting_test: "secondary",
+  has_bug: "destructive",
+  merged: "secondary",
+  abandoned: "outline",
+};
+
+// ===========================================
+// Task 级运行时状态（V0.6 新维度、独立于 repoStatus）
+// ===========================================
+
+export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
+  idle: "空闲",
+  running: "运行中",
+  awaiting_user: "等待回复",
+  error: "失败",
+};
+
+export const RUN_STATUS_VARIANT: Record<
+  RunStatus,
+  "default" | "secondary" | "destructive" | "outline"
+> = {
+  idle: "outline",
+  running: "default",
+  awaiting_user: "secondary",
+  error: "destructive",
+};
+
+// ===========================================
+// 仓库路径展示
+// ===========================================
+
 /**
- * 任务关联仓库的展示文案（V0.5.9 加、多仓适配）
+ * 任务关联仓库的展示文案（V0.5.9 加、V0.6 不变）
  *
  * - 0 个 → "(未配置仓库)"
  * - 1 个 → 完整路径
- * - 多个 → 各仓 basename 用 " + " 拼接（视觉紧凑、给 task-card / page header 用）
+ * - 多个 → 各仓 basename 用 " + " 拼接
  *
  * 完整路径展开版本在 hover tooltip 里给（调用方自己加 title 属性）。
  */
@@ -85,11 +147,11 @@ export const formatRepoPathsForDisplay = (paths: string[]): string => {
     .join(" + ");
 };
 
-/**
- * 相对时间文案（任务卡片 / 事件流时间戳用）
- * 粒度足够：刚刚 / N 分钟前 / N 小时前 / N 天前
- * 不引第三方时间库（项目目前没用 dayjs / date-fns）、保持依赖轻
- */
+// ===========================================
+// 相对时间文案
+// ===========================================
+
+/** 相对时间文案：刚刚 / N 分钟前 / N 小时前 / N 天前 */
 export const formatRelative = (ts: number): string => {
   const diff = Date.now() - ts;
   const min = Math.floor(diff / 60000);

@@ -1,3 +1,14 @@
+// ===========================================
+// 基础配置类型：仓库 / 模型 / Settings
+// ===========================================
+
+/**
+ * 仓库配置（V0.5.9 多仓引入）
+ *
+ * V0.6 设计取舍：不再手动配 mainBranch、build/ship action 跑时 agent 自己
+ *   `git symbolic-ref refs/remotes/origin/HEAD` 或 `git remote show origin | grep "HEAD branch"`
+ *   探测。不同仓主分支名（master / main / develop）不一样、让 agent 现场探不让用户填。
+ */
 export interface RepoConfig {
   name: string;
   path: string;
@@ -5,28 +16,28 @@ export interface RepoConfig {
 
 /**
  * 用户最终选定的模型（含参数）
- * - id：基础模型（如 "claude-opus-4-7"）
- * - params：可选参数组合（如 [{ id: "thinking", value: "true" }]）
- *
- * 跟 SDK ModelSelection 同 schema、agent 启动时直接传过去。
+ * Schema 跟 SDK ModelSelection 同步、agent 启动时直接传过去。
  */
 export interface ModelSelection {
   id: string;
   params?: Array<{ id: string; value: string }>;
 }
 
+/**
+ * settings：localStorage 持久化的用户配置
+ * V0.6 新增 username：用于 ship action 的 branch prefix
+ *   （branch 模板 = `feature/<username>/<飞书id>-<task.title>`、多人用 fe-ai-flow 不互踩）
+ */
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
+  username?: string;
   repos: RepoConfig[];
   mcpServersJson: string;
 }
 
 /**
  * 单个模型可调参数定义（如 "thinking"）
- * - id：参数标识（thinking / effort 等）
- * - values：可选枚举值（each value 包含真实值和展示名）
- *
  * Schema 来自 SDK ModelParameterDefinition、不要随意改。
  */
 export interface ModelParameter {
@@ -58,125 +69,243 @@ export interface ModelOption {
 }
 
 // ===========================================
-// V1 任务模型（Task / Phase / Event / Artifact）
+// V0.6 任务模型：task 容器 + action 历史
 // ===========================================
 //
-// 设计原则（详见 docs/HANDOFF.md「V1 流程设计」）：
-// 1. phase 不写死、用枚举但留 PhaseId 这个 string union 做扩展（V2 加 verify
-//    只需扩这个 union + 注册新 phase）
-// 2. 产物（artifact）走 markdown + frontmatter、UI 直接渲染、未来落盘统一格式
-// 3. 事件流（events）= 可观测性的载体、agent 每个动作 / phase 边界 / HITL
-//    feedback 都进 events、UI 右侧据此渲染时间线
-// 4. HITL ack 不走单独字段、走 `phases[id].status === "ack"`
-//    → "完成" = 最后一个 phase 是 ack（不写死 build 完成 = 任务完成）
+// 设计原则（详见 docs/V0.6-REFACTOR.md、已 archived）：
+// 1. task = 一个需求的完整生命周期容器（飞书 story 进来 → 合入 main / abandon）
+// 2. action = task 内的单次动作（plan / build / review / ship / test / learn；chat 走独立 mode）
+//    - 自由触发顺序（不强制 plan→build→review、靠 6 个 harness 门槛兜底质量）
+//    - N 累计序号、文件名 actions/N-<type>.md（cancelled 也占 N、不释放）
+// 3. 单 SDK Run 永生（task 不终态 Run 不退、wait_for_user 阻塞等下一 action 指令）
+// 4. 不写 V0.5 → V0.6 migration 脚本、V0.5 老 task 数据靠 listTasks 自动跳过（schema 不匹配的 meta.json 在 hydrate 时被 skip）
 
-// V1 砍掉 spec 阶段：实测下来 spec 写出来对开发参考价值有限、
-// 反而拉长链路；现在直接 plan→build 两步走、plan agent 自己进仓库扫一遍
-// 再产出 Task List（含简述 + 影响面 + 不做的）
-//
-// V0.2 扩展（feishu-story-impl workflow 引入）：
-//   - "plan"：phase 1、拉飞书 story + 后端文档 + 扫本地仓库代码、出技术方案、产出 01-plan.md
-//   - "build"：phase 2、SDK Agent 按 plan 写代码 + 跑 hooks
-// V0.3.3 拆掉 ship phase（原 phase 4 提 PR + 同步飞书、效果不稳）、保留前 3 phase
-// V0.3.4 把原 context phase（独立的上下文收集）合进 plan phase——
-//   实操中分离 context / plan 价值未兑现：用户审 context 时的判断点跟审 plan 时重合、
-//   反而多审一次、多 ack 一次、agent 也多写一份 artifact。合并后 plan 阶段一气呵成：
-//   读上下文 → 扫仓库 → 出方案、用户只审 1 次、效率高。
-// V0.2 workflow phase 序列 = [plan, build]、单 SDK Run 跨 2 phase
-// 通过 wait_for_user MCP 在 phase 间阻塞等用户 ack（不是每 phase 起新 Run、省 Cursor 计费)
-//
-// V0.5 引入 review phase（详见 docs/HANDOFF.md「V0.5：review phase + 多 phase 模型选择 + plan 校验前移」段）：
-//   - "review"：build 之后、拿 `git diff × 01-plan.md × 02-build.md × contextDocs` 做结构化差值
-//     按 4 类分流（范围扩张 / 范围收缩 / 实现偏差 / 未完成）、产出 03-review.md
-//     含整体一致性总评 + 4 类差异表 + 飞书需求对照 + 交付信息（commit msg / PR body / 飞书评论草稿 / 自测 checklist）
-//   - HITL 边界：用户「整体通过」一次性 ack、或对单项 revise（agent 按指示动 build 或 plan 后再 review）
-//   - 不做 ship 那种「自动 git push / 自动改飞书状态」、只输出信息让用户复制
-export type PhaseId = "plan" | "build" | "review";
+/**
+ * 6 种 action 类型（V0.6.0.1 起 chat 从 action 里剥离、走独立 mode=chat 通路）
+ * - `plan`     出方案
+ * - `build`    改代码
+ * - `review`   代码复核
+ * - `ship`     提 MR
+ * - `test`     AI 手测
+ * - `learn`    沉淀
+ */
+export type ActionType =
+  | "plan"
+  | "build"
+  | "review"
+  | "ship"
+  | "test"
+  | "learn";
 
-// V0.5.7：phase id 字面量数组、用于运行时校验（如 /start-workflow body.fromPhase）
-// 跟 PhaseId 类型保持同步、改一个动另一个
-export const PHASE_IDS = ["plan", "build", "review"] as const;
+export const ACTION_TYPES = [
+  "plan",
+  "build",
+  "review",
+  "ship",
+  "test",
+  "learn",
+] as const;
 
-// ===========================================
-// 上下文文档（V0.3、跟 Skill 同理：清单 inject + 按需拉取）
-// ===========================================
-//
-// 用户在任务详情页随时加 / 删上下文（飞书文档 URL / 本地路径 / 自由文本）、
-// agent 在 super-prompt 里看到清单、但内容不全量 inject——
-//  - URL 类型：agent 用 feishu-mcp / fetch 工具按需拉
-//  - path 类型：agent 用 SDK 内置 `read` 工具按需读
-//  - text 类型：内容 ≤ 1000 字默认直接 inject（短文本反正不占 token）、> 1000 字截断
-//
-// 跟 Skill 类比：title + type = SKILL.md frontmatter；content = SKILL.md 正文
-export type TaskContextDocType = "url" | "path" | "text";
+/**
+ * action 中文 label（UI 选 action / timeline 展示用、统一来源）
+ */
+export const ACTION_LABEL: Record<ActionType, string> = {
+  plan: "出方案",
+  build: "改代码",
+  review: "代码复核",
+  ship: "提 MR",
+  test: "AI 手测",
+  learn: "沉淀",
+};
 
-export interface TaskContextDoc {
-  id: string; // ctx_<ts>_<rand>
-  title: string; // 用户取的标题、如「后端技术方案」「补充说明」
-  content: string; // url / 路径 / 自由文本
-  type: TaskContextDocType; // 后端保存时按 content 自动推断
+/**
+ * action 状态机
+ * - running：agent 正在跑该 action
+ * - awaiting_ack：跑完 artifact 已落、等用户 ack
+ * - completed：用户 approve、后续 action 可基于本 action artifact 推进
+ * - error：后置检查失败 / agent 报错
+ * - cancelled：用户中途取消（N 不释放、避免 race）
+ */
+export type ActionStatus =
+  | "running"
+  | "awaiting_ack"
+  | "completed"
+  | "error"
+  | "cancelled";
+
+/**
+ * 单条 action 记录
+ *
+ * - id：任务内唯一（如 act_1 / act_2、生成时单调递增不复用）
+ * - n：累计序号、对应文件名 actions/N-<type>.md（不释放、cancelled 也占）
+ * - userInstruction：用户在推进 dialog textarea 写的指令（首次 plan 可能为空）
+ * - artifactPath：相对 data/tasks/<id>/、如 "actions/1-plan.md"；action 没产物时为 null
+ */
+export interface ActionRecord {
+  id: string;
+  n: number;
+  type: ActionType;
+  status: ActionStatus;
+  userInstruction: string;
+  artifactPath: string | null;
+  startedAt: number;
+  endedAt: number | null;
+
+  /**
+   * 后置 deterministic 检查（V0.6 门槛 2）
+   * - plan: artifact 文件存在 + 内容长度 >= 100（V0.6.0.1 拍板删黑名单 grep、详见 action-checks.ts）
+   * - build: typecheck/lint exit 0 + git status 有改动
+   * - review: git diff hash 一致 + 4 类差异段非空
+   * - ship: git push + glab mr create exit 0、URL 非空
+   * - test: pass 率 ≥ 阈值
+   * - learn: propose 段有内容 + evidence 路径都能 read 到
+   */
+  postCheck?: {
+    passed: boolean;
+    details: string;
+  };
+
+  /**
+   * 副作用记录（对外部世界的影响）
+   * - ship: { mrUrl, mrVersion, branch, commitHash, feishuCommentId }
+   * - test: agent 起服务 / 用例结果摘要（V0.6.2 上线时再细化字段）
+   */
+  sideEffects?: {
+    mrUrl?: string;
+    mrVersion?: number;
+    branch?: string;
+    commitHash?: string;
+    feishuCommentId?: string;
+  };
+
+  /**
+   * 模型选择（V0.6 推进 dialog 高级选项支持切模型）
+   * - 不存 = 沿用 task.model / settings.defaultModel
+   */
+  agentModel?: ModelSelection;
+
+  /**
+   * artifact 修订快照清单（V0.5.12 沿用、V0.6 由 phase 维度改 action 维度）
+   * - 用户「再聊聊」前后端先 snapshot 当前 artifact、复制到 actions/.revisions/<actionId>/<ISO>.md
+   * - 每条 action 上限 10、GC 删最老
+   */
+  revisions?: ArtifactRevision[];
+}
+
+/**
+ * MR 记录（ship action 跑完落、polling 状态更新——V0.6.4+）
+ * - V0.6.0 ship 不实做、字段先定好
+ */
+export interface MRRecord {
+  version: number;
+  url: string;
+  branch: string;
+  status: "open" | "closed" | "merged";
+  createdAt: number;
+  createdByActionId: string;
+  lastChecked?: number;
+}
+
+/**
+ * Git branch 状态（build 第一次跑前生成、不可改写）
+ *
+ * 时机（V0.6 拍板）：
+ * - plan action 不建 branch（plan 不写代码）
+ * - build action 第一次跑前、runner 检测 `task.gitBranch?.checkedOut` 为 false
+ *   → prompt inject「先 `git checkout -b <name> origin/<baseBranch>`、再写代码」
+ *   → agent shell 跑、跑完 patch checkedOut=true
+ * - 后续 build / build / ship 都在同一条 branch（V0.6 拍板：全 task 一条 branch、累计 commit）
+ *
+ * 命名规则（V0.6 拍板）：
+ *   name = `feature/<username>/<飞书 story id>-<task.title>`
+ *   - username 取自 settings.username
+ *   - 飞书 story id 从 task.feishuStoryUrl 抠（URL 末段数字）
+ *   - task.title 保留中文、非法字符（\s / : * ? " < > | 【 】 ( ) 等）换成 -
+ *   baseBranch 由 agent 启动 build 时自己探测（origin/HEAD 或 git remote show）、不在 settings 里配
+ */
+export interface GitBranchInfo {
+  name: string;
+  baseBranch: string;
+  checkedOut: boolean;
   createdAt: number;
 }
 
-export type PhaseStatus =
-  | "pending" // 还没轮到
-  | "running" // agent 正在跑
-  | "awaiting_ack" // agent 跑完产物已落、等用户 ack
-  | "ack" // 用户已 ack、可以进下一 phase
-  | "failed"; // agent 报错、需要用户介入
+/**
+ * task 级仓库状态机（跟 MR 生命周期对齐）
+ *
+ * 状态转移（用户 ack dialog 拍板）：
+ *   developing → ship → awaiting_test → (has_bug → build → ship)* → merged
+ *   任何状态可转 abandoned
+ */
+export type RepoStatus =
+  | "developing"
+  | "awaiting_test"
+  | "has_bug"
+  | "merged"
+  | "abandoned";
 
-export interface PhaseState {
-  id: PhaseId;
-  status: PhaseStatus;
-  startedAt?: number;
-  endedAt?: number;
-  // V1 直接把产物内容存内联、避免文件系统读写；V2 改成 path 引用
-  artifact?: {
-    filename: string;
-    content: string;
-  };
+/**
+ * task 级 runtime 状态（独立于 repoStatus）
+ *
+ * - idle：当前没 action 在跑、等用户推进
+ * - running：有 action 在跑
+ * - awaiting_user：action 跑完 artifact 已落、等 ack（或在 ask_user）
+ * - error：action 报错、用户可推进重试 / abandon
+ */
+export type RunStatus = "idle" | "running" | "awaiting_user" | "error";
+
+// ===========================================
+// 上下文文档（V0.3、V0.6.0.1 加 image 类型）
+// ===========================================
+//
+// 用户在任务详情页随时加 / 删上下文（飞书文档 URL / 本地路径 / 自由文本 / 截图）、
+// agent 在 super-prompt 里看到清单、但内容不全量 inject：
+//  - url 类型：agent 用 feishu-mcp / fetch 工具按需拉
+//  - path 类型：agent 用 SDK 内置 `read` 工具按需读
+//  - text 类型：内容 ≤ 1000 字默认直接 inject、> 1000 字截断
+//  - image 类型（V0.6.0.1）：content 是图片绝对路径、agent 用 `read` 工具读、SDK 自动转 vision
+
+export type TaskContextDocType = "url" | "path" | "text" | "image";
+
+export interface TaskContextDoc {
+  id: string;
+  title: string;
+  content: string;
+  type: TaskContextDocType;
+  createdAt: number;
 }
 
-export type TaskStatus =
-  | "draft" // 已建未启动
-  | "running" // 某个 phase 在跑
-  | "awaiting_user" // 等用户 ack 或 feedback 回复
-  | "completed" // 全部 phase ack
-  | "failed"; // 某 phase 报错且没恢复
+// ===========================================
+// 任务角色（V0.4、保留）
+// ===========================================
+//
+// 飞书 story 是「跨角色共享」的、每个研发只关心 story 里跟自己角色相关的部分。
+// 当前枚举仅 `fe`、未来扩 be / data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
+
+export type TaskRole = "fe";
+
+export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
+  fe: "前端",
+};
+
+// ===========================================
+// 事件流（V0.6：phase_* → action_*）
+// ===========================================
 
 export type EventKind =
-  | "info" // agent 普通文本（非流式 / 系统消息）
-  | "thinking" // agent 思考过程（来自 SDKThinkingMessage）
-  | "phase_start"
-  | "phase_ack"
-  | "phase_failed"
-  | "tool_call" // agent 调工具（read / grep / shell / write / edit 等）
-  | "user_reply" // chat 模式：用户的消息
-  | "assistant_message" // chat 模式 agent 完整一轮回复（不像 plan 那样累积成 artifact）
-  // V0.3 ask_user 机制（phase 内细粒度问答、跟 wait_for_user 是不同语义）
-  //
-  // 设计（V0.3.2 改造、用户拍板）：
-  //   - 一次 ask_user 调用 = 一组问题 questions[]（不再一次一问、避免反复弹窗 + 拉长对话节奏）
-  //   - UI 用 modal dialog 弹窗展示、不在 event stream inline（inline 卡片留个简化「已答 Q&A」回放）
-  //   - 每个 option 自动加 A/B/C/D 字母前缀（像 Cursor askFollowUpQuestion）
-  //
-  // 事件结构：
-  // - ask_user_request：agent 调 ask_user 时服务端写入
-  //   meta：{ askId, token, questions: AskUserQuestion[] }
-  //   text：所有 question 拼接的预览文本（供 inline 卡片快速浏览）
-  // - ask_user_reply：用户答完所有问题后服务端写入
-  //   meta：{ askId, answers: AskUserAnswer[] }
-  //   text：拼接好的 Q&A markdown（供 inline 卡片回放显示）
+  | "info"
+  | "thinking"
+  | "action_start"
+  | "action_ack"
+  | "action_failed"
+  | "tool_call"
+  | "user_reply"
+  | "assistant_message"
   | "ask_user_request"
   | "ask_user_reply"
   | "error";
 
 // ask_user 单条问题
-//
-// - id：问题唯一标识、用户提交 answers 时携带回去（用来关联）
-// - question：问题正文、UI 顶部显示
-// - options：可选项数组（≤ 6 个、UI 自动加 A/B/C/D 前缀）
-// - allowText：是否允许 Other 自由文本输入（默认 true）
 export interface AskUserQuestion {
   id: string;
   question: string;
@@ -185,265 +314,152 @@ export interface AskUserQuestion {
 }
 
 // 用户对单条问题的回答
-//
-// - questionId：对应 AskUserQuestion.id
-// - answer：最终答案文本（option label / Other 输入）
-// - optionId：可选、用户选了哪个 option（meta 用）
 export interface AskUserAnswer {
   questionId: string;
   answer: string;
   optionId?: string;
 }
 
+/**
+ * 事件流单条事件
+ *
+ * V0.6 改：原 `phase?: PhaseId` 改为 `actionId?: string`、指向 ActionRecord.id。
+ */
 export interface TaskEvent {
   id: string;
   ts: number;
   kind: EventKind;
-  phase?: PhaseId;
+  actionId?: string;
   text: string;
   meta?: Record<string, unknown>;
 }
 
-/**
- * 任务模式：决定整个任务的交互形态
- *
- * - `plan`：方案规划任务、走多 phase workflow（V0.5 起 plan → build → review）
- *   - V0.2 起：整段任务跑在一次 SDK Run、phase 间用 wait_for_user 阻塞等 ack
- *   - V0.3.3 起：移除原 phase 4（ship、提 PR + 同步飞书）
- *   - V0.3.4 起：把 context phase 合进 plan phase（合并理由见 PhaseId 注释）
- *   - V0.5 起：build 之后加 review phase（拿 git diff × plan × build × 飞书 做差值对照）
- *   - 配合 `workflowId` 决定具体走哪条 phase 序列（目前只有 feishu-story-impl）
- * - `chat`：自由对话、agent 长存活、调 wait_for_user MCP 等用户输入
- *
- * 创建时定死、不能切换。两种模式共用 events.jsonl + MCP 配置 + 模型配置 + wait_for_user 机制。
- */
-export type TaskMode = "plan" | "chat";
-
-/**
- * Plan 模式下的 workflow 标识：决定 phase 序列 / prompt 模板 / 必填字段
- *
- * - `feishu-story-impl`：从飞书 story 出发、走 3 phase 方案 + 实现 + 复核
- *   - phase 序列：[plan, build, review]
- *     （V0.3.3 移除原 ship phase、V0.3.4 合并原 context 进 plan、V0.5 加 review）
- *   - 必填：feishuStoryUrl
- *
- * V0.2 只有这一种。后面会加 `pr-review` / `interface-binding` 等。
- */
-export type WorkflowId = "feishu-story-impl";
-
-/**
- * 任务角色（V0.4 引入）
- *
- * 飞书 story 是「跨角色共享」的——同一条 story 可能涉及前端 / 后端 / 数仓 / 测试 / 移动端…
- * 每个研发只关心 story 里跟自己角色相关的部分、并在各自本地仓库建对应 task。
- *
- * 当前枚举（V0.4 阶段、单值）：
- *   - `fe`：前端（暂不分 B 端 / C 端、实操中差异主要在视觉规范、prompt 层不区分）
- *
- * 路线图（详见 `docs/MULTI-ROLE.md`）：
- *   - `be` 后端、`data` 数仓、`mobile-ios` / `mobile-android` 移动端、`qa` 测试
- *   - 每个角色对应 `prompts/roles/<role>.md` 片段、plan-runner 注入
- *   - 选 enum 而不是 string union 留扩展、便于 UI 选择器和 prompt 模板按角色分叉
- *
- * 设计原则：harness 工具链（typecheck / lint / build）由 agent 自己根据 repo 探测、
- * 不存 task 上。task.role 只负责告诉 agent「以哪种视角读 story / 出方案」。
- */
-export type TaskRole = "fe";
-
-/**
- * 角色展示文案（中文）、UI / prompt 注入用、统一来源
- */
-export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
-  fe: "前端",
-};
-
-/**
- * Workflow 注册项（运行时表）
- *
- * plan-runner 启动时按 task.workflowId 查出对应 phase 序列、再按序跑。
- * 各 phase prompt 模板在 prompts/phase-<id>.md。
- */
-export interface WorkflowDef {
-  id: WorkflowId;
-  displayName: string;
-  description: string;
-  phases: PhaseId[];
-  // 创建任务时必须填的字段（前端表单据此校验）
-  // V0.5.3 起只保留 feishuStoryUrl（swaggerUrl 字段已废弃、详见 Task 注释）
-  requiredFields: Array<"feishuStoryUrl">;
-}
-
-export interface Task {
-  id: string;
-  title: string;
-  // 任务模式（V1 创建时定死、不能切）
-  mode: TaskMode;
-  // workflow 模式必填、其他模式不用
-  workflowId?: WorkflowId;
-  // V0.4 引入：任务角色、决定 agent 以哪种视角读 story / 出方案
-  // 创建时定死、跟仓库强相关（同一仓库的任务通常同 role、但允许例外）
-  // 老数据没此字段、hydrate 时按 "fe" 兜底（V0.4 之前只支持前端）
-  role: TaskRole;
-  // V0.5.9：关联的本地仓库路径（必填非空、至少 1 个）
-  // - 单仓 case：repoPaths = [`/Users/foo/projA`]、SDK Run cwd 直接用这个
-  // - 多仓 case：repoPaths = [`/Users/foo/work/A`, `/Users/foo/work/B`]、SDK Run cwd
-  //   走「公共父目录」（这里 `/Users/foo/work`）、AI 视角下面是 N 个 git 仓子目录
-  // - 单仓 / 多仓的 effective cwd 算法见 `getEffectiveCwd`、不要直接用 `repoPaths[0]`
-  // 老数据（V0.5.9 前 `repoPath: string`）hydrate 时自动包成 `[repoPath]`
-  repoPaths: string[];
-  // 可选输入源
-  // V0.2 workflow 用 feishuStoryUrl（指向飞书项目 story 详情页）
-  // V0.4 起 chat 模式建任务的「飞书相关链接」也复用这个字段、不分 feishuUrl
-  feishuStoryUrl?: string;
-  description?: string;
-  // V0.3 起的旧字段 `swaggerUrl` / `attachedDocs` 已在 V0.5.3 删除——
-  // contextDocs 完全覆盖「后端文档 URL / 附加文件路径 / 自由文本」三种语义、UI 表单不再单列、
-  // 老 task.meta.json 里残留的这两个字段在 hydrateTask 时被忽略、不再出现在 Task / API 上
-  // V0.3 引入：任务级上下文文档清单、可在详情页随时增删
-  // - 飞书 story URL 在建任务时自动作为第一条 contextDoc（title="飞书 story"）
-  // - 后续用户在详情页面板里加更多（如后端技术方案 / 设计稿 / 开发补充）
-  // - agent 看清单决定是否拉取（不全量塞 super-prompt、防 token 爆）
-  contextDocs?: TaskContextDoc[];
-  // 任务级 MCP 黑名单（按 server 名）
-  // - undefined / 空数组：本任务用 settings 里全部 MCP（默认全开）
-  // - 有值：列出的 server 在本任务里被禁用、其它仍生效
-  // 黑名单语义的好处：用户在 settings 加新 MCP、自动对所有任务生效、不用每个任务都去 enable
-  disabledMcpServers?: string[];
-
-  status: TaskStatus;
-  currentPhase: PhaseId;
-  phases: Record<PhaseId, PhaseState>;
-  events: TaskEvent[];
-
-  // V1 仅做「软隐藏」：列表默认筛掉 archived=true 的、不删数据
-  // 自动归档规则：completed / failed 且 updatedAt 超过 7 天、listTasks 时 lazy 改写
-  archived: boolean;
-
-  createdAt: number;
-  updatedAt: number;
-
-  // V0.3.5：上一个 SDK Agent 的 id
-  // - plan-runner 起 Agent.create 后立刻持久化、用户在 UI 点「推进 → 让原 agent 继续」时
-  //   服务端 POST /start-workflow（V0.5.7 mode=resume）→ Agent.resume(this.id) + send 续接 prompt
-  // - 没有 lastAgentId（如老数据、或 chat 模式 / agent 从未启动）→ start-workflow 路由自动降级 fork
-  lastAgentId?: string;
-
-  // V0.5.1：任务级模型选择（新建任务时表单里挑、可跟 settings.defaultModel 不同）
-  // - 启动 workflow / chat 时优先用 task.model、回退到 settings.defaultModel
-  // - ack 时切了模型 = 隐含 fork（旧 agent 已经在用旧 model、不可热切）
-  // - 老数据没此字段、prepareRunArgs 兜底走 settings.defaultModel
-  model?: ModelSelection;
-
-  // V0.5.10：任务级 UI 布局偏好（持久化用户拖拽的左右分栏比例）
-  // - 详情页左右双栏（artifact + event-stream）拖拽手柄 → 写本字段
-  // - artifactPanelSize：artifact 栏宽度百分比（0-100、实际 minSize=20 / maxSize=75 约束）
-  // - 老数据没此字段：UI 用默认 70/30、不写 task（保留 undefined、不污染 meta.json）
-  // - 持久化在 task 维度（不是 localStorage）：不同任务的偏好可不同——
-  //   调研类 task 用户喜欢 event-stream 大、改代码类 task 喜欢 artifact 大
-  uiLayout?: {
-    artifactPanelSize?: number;
-  };
-
-  // V0.5.12：每个 phase 的 artifact 修订快照清单
-  // - 用户点「再聊聊」（revise）即将让 AI 改 artifact 之前、后端先 snapshotArtifact 把当前
-  //   产物复制到 data/tasks/<id>/artifacts/.revisions/<NN>-<phase>.<ISO>.md、把记录追加这里
-  // - 不记录「agent 首次 write 初版」——那个不算 revision、ROADMAP V0.5.12 拍只覆盖 revise 路径
-  // - 每个 phase 上限 10 个、写满后 GC 删最老（snapshotArtifact 内联做、调用方无感）
-  // - 老数据没此字段、hydrate 时按 undefined 兜底、前端 fetch artifact-revisions 路由时按空数组处理
-  revisions?: Partial<Record<PhaseId, ArtifactRevision[]>>;
-}
-
-/**
- * V0.5.12：单条 artifact 快照元数据
- *
- * - timestamp：snapshot 时刻（ms epoch、跟 createdAt / updatedAt 风格统一）
- * - path：相对 `data/tasks/<id>/` 的路径、如 `artifacts/.revisions/01-plan.2026-05-25T05-44-39-123Z.md`
- *   完整路径在服务端拼回 `path.join(taskDir(id), rev.path)`、防路径穿越（rev.path 由后端生成、不接前端入参）
- * - size：字节数、UI dropdown 展示「这条快照大小」无需拉文件
- */
+// ===========================================
+// Artifact 修订快照（V0.5.12 沿用）
+// ===========================================
+//
+// - timestamp：snapshot 时刻（ms epoch）
+// - path：相对 `data/tasks/<id>/` 的路径、如 `actions/.revisions/act_3/2026-05-25T05-44-39-123Z.md`
+//   完整路径在服务端拼回 `path.join(taskDir(id), rev.path)`、防路径穿越
+// - size：字节数、UI dropdown 展示「这条快照大小」无需拉文件
 export interface ArtifactRevision {
   timestamp: number;
   path: string;
   size: number;
 }
 
+// ===========================================
+// V0.6 Task：核心
+// ===========================================
+
 /**
- * 任务摘要：列表场景专用、不含 events / phases 详细产物（V0.5.3 引入）
+ * V0.6.0.1：task 模式（重新引入 V0.5 概念、用户拍板「自由模式跟以前一样」）
  *
- * 设计动机：原来 listTasks / GET /api/tasks 直接返完整 Task[]、每条都 hydrate 全部
- * events.jsonl（可能几千行）+ 3 个 artifact 文件——首页列表根本不需要这些内容、
- * 只是为了渲染卡片白白付了 N × (1 readMeta + 1 readEvents + 3 readArtifact) 的 IO。
+ * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / test / learn）
+ *   UI = ActionTimeline + ArtifactPanel + EventStream 三栏布局
+ * - `chat`：自由对话、不走 action 体系、跑独立 chat-runner + chat-reply 通路
+ *   UI = ChatView 单栏（事件流 + 输入框）、用户消息立刻显示、agent 长存活靠 wait_for_user 阻塞
  *
- * TaskSummary 只保留卡片渲染必须的字段（title / status / currentPhase / updatedAt / mode 等）、
- * server-side `listTasks` 用 hydrateTaskSummary 跳过 readEvents / readArtifact、O(N) → 单读 meta.json。
- *
- * Task 本身是 TaskSummary 的超集——结构上向下兼容、setTaskArchived 等返 Task 的 API 可以直接塞进
- * `TaskSummary[]` state 而无需转换（TS structural typing 自动接受）。
- *
- * 详情页 / 单 task API 走 `Task`（带 events + phases.artifact 全量），不受影响。
+ * 两套通路完全独立、不共享 runner / prompt / API、避免 chat 场景被 V0.6 task 容器协议夹胀。
  */
-export type TaskSummary = Omit<Task, "events" | "phases">;
+export type TaskMode = "task" | "chat";
 
-// 新建任务表单的入参（不含运行期字段）
-// V0.2：默认 mode = "workflow"、workflowId = "feishu-story-impl"
-// V0.3：contextDocs 在后端 createTask 时自动初始化（飞书 story 作为第一条）
-// V0.3.3：可在创建时直接指定任务级 MCP 黑名单
-// V0.4：role 可选、后端 createTask 默认 "fe"
-// V0.5.3：删 swaggerUrl / attachedDocs（已被 contextDocs 取代）
-export type NewTaskInput = Pick<
-  Task,
-  | "title"
-  | "repoPaths"
-  | "feishuStoryUrl"
-  | "description"
-  | "disabledMcpServers"
-  | "model"
-> & {
-  mode?: TaskMode;
-  workflowId?: WorkflowId;
-  // 不传时后端默认 "fe"（V0.4 阶段 enum 只有一个值、UI 上选了也只能选这个）
-  role?: TaskRole;
-};
-
-// V0.3 加 / 删上下文文档的入参（API 接收）
-export interface AddContextDocInput {
+export interface Task {
+  id: string;
   title: string;
-  content: string;
+
+  /**
+   * V0.6.0.1：task 模式（"task" / "chat"）
+   * 默认 "task"、决定 runner / API / 详情页 UI 走哪套。详见 TaskMode 定义。
+   */
+  mode?: TaskMode;
+
+  /**
+   * V0.6：任务级仓库状态机（跟 MR 生命周期对齐）
+   */
+  repoStatus: RepoStatus;
+
+  /**
+   * V0.6：runtime 状态（独立于 repoStatus）
+   */
+  runStatus: RunStatus;
+
+  /**
+   * V0.6：当前正在跑 / 等 ack 的 action id（null = idle）
+   */
+  currentActionId: string | null;
+
+  /**
+   * V0.6：action 历史（按时间正序、N 单调递增）
+   */
+  actions: ActionRecord[];
+
+  /**
+   * V0.6：MR 列表（V0.6.1 ship action 上线后才会有内容）
+   */
+  mrs: MRRecord[];
+
+  /**
+   * V0.6：git branch 状态（build 第一次跑前由 runner 生成、不可改写）
+   */
+  gitBranch?: GitBranchInfo;
+
+  // ===== 保留字段（V0.5 → V0.6 不变）=====
+
+  role: TaskRole;
+  repoPaths: string[];
+  feishuStoryUrl?: string;
+  contextDocs?: TaskContextDoc[];
+  disabledMcpServers?: string[];
+  archived: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastAgentId?: string;
+  model?: ModelSelection;
+  uiLayout?: { artifactPanelSize?: number };
+  events: TaskEvent[];
 }
 
-// V0.2 workflow 注册表（顶层导出、前后端共享）
-// 现阶段只有一个；以后扩 workflow 时往这里加
-// V0.5：phases 加 review、整条 workflow = plan → build → review
-export const WORKFLOWS: Record<WorkflowId, WorkflowDef> = {
-  "feishu-story-impl": {
-    id: "feishu-story-impl",
-    displayName: "飞书 story 实现",
-    description:
-      "从飞书 story 链接出发、agent 读上下文 / 扫仓库 / 出方案（plan）→ SDK Agent 按 plan 写代码（build）→ 拿 git diff × plan × 飞书原文做差值对照 + 产出交付信息（review）",
-    phases: ["plan", "build", "review"],
-    requiredFields: ["feishuStoryUrl"],
-  },
+/**
+ * 新建任务表单的入参
+ *
+ * V0.6.0.1 重新加 mode（task / chat、对应 dialog 顶部 tab 切换）
+ */
+export type NewTaskInput = Pick<
+  Task,
+  "title" | "repoPaths" | "feishuStoryUrl" | "disabledMcpServers" | "model"
+> & {
+  role?: TaskRole;
+  mode?: TaskMode;
 };
 
 /**
- * 取「下一 phase」的统一入口（V0.5.3 抽出、消除多处重复算法）
+ * 加上下文文档 input
  *
- * 之前 plan-runner / phase-ack route / approve-phase-dialog 三处都自己写
- * `phases.indexOf(cur) + 1 < length ? phases[idx+1] : null`、容易漂移。
+ * V0.6.0.1 加 images：用户可以贴图（粘贴 / 拖拽 / 选文件）、
+ * 每张图作为独立的 type=image doc 落到清单、agent 用 read 工具按需读、SDK 自动转 vision。
  *
- * 入参用 `WorkflowDef`（不是 `WorkflowId`）：避免 client-side 反查 WORKFLOWS、
- * 也方便单测；调用方通常已经拿到 workflowDef、直接传过去。
- *
- * - 返 `null` = 当前是最后一个 phase（approve 后 workflow 结束）
- * - 返 PhaseId = 下一 phase 的 id
- * - `current` 不在 workflowDef.phases 里（异常）也返 null、由调用方决定怎么 fallback
+ * 至少一个非空：要么 title+content（主文本 doc）、要么 images（一张或多张图）、要么都有。
  */
-export const getNextPhase = (
-  workflowDef: WorkflowDef,
-  current: PhaseId,
-): PhaseId | null => {
-  const idx = workflowDef.phases.indexOf(current);
-  if (idx < 0) return null;
-  return workflowDef.phases[idx + 1] ?? null;
-};
+export interface AddContextDocInput {
+  title?: string;
+  content?: string;
+  images?: Array<{
+    data: string;
+    mimeType: string;
+    filename?: string;
+  }>;
+}
 
+/**
+ * 任务摘要：列表场景专用（V0.5.3 引入、V0.6 调整字段）
+ *
+ * 跟 Task 比少 events（events.jsonl 可能几千行、parse 开销大）+ actions 详细内容
+ * 仍保留 actionCount 让 UI 卡片显示「N 个 action」徽章
+ */
+export type TaskSummary = Omit<Task, "events" | "actions"> & {
+  actionCount: number;
+  // V0.6：列表卡片需要展示「最近一个 action」简略信息
+  lastActionType?: ActionType;
+  lastActionStatus?: ActionStatus;
+};

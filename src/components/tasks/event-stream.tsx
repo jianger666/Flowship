@@ -36,7 +36,7 @@ import { Separator } from "@/components/ui/separator";
 import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { getEffectiveCwd, pathBasename } from "@/lib/path-utils";
-import type { ChatReplyImage } from "@/lib/task-store";
+import type { ImagePayload } from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
 import {
@@ -74,7 +74,7 @@ interface Props {
   // [ATTACHED_PATHS] 段给 agent、agent 用 `read` 工具自己读
   onUserReply?: (
     text: string,
-    images?: ChatReplyImage[],
+    images?: ImagePayload[],
     attachments?: string[],
   ) => void;
   // V0.2 plan workflow 模式下传 true、不渲染底部「自由回复」输入框
@@ -133,10 +133,9 @@ const EventStreamImpl = ({
     ];
   }, [task.events, streamingText]);
 
-  // V0.4：输入框可用 = 父组件传 canReply（chat-view 自由化用）
-  // 父组件没传时回退老行为 status === "awaiting_user"（plan 模式用、不影响）
-  // 重命名内部变量为 canCompose、避免「awaiting_user」语义跟可用判定耦合
-  const canCompose = canReply ?? task.status === "awaiting_user";
+  // V0.6：输入框可用 = 父组件传 canReply
+  // 父组件没传时回退 task.runStatus === "awaiting_user"
+  const canCompose = canReply ?? task.runStatus === "awaiting_user";
 
   // 输入框自动聚焦判定：跟 canCompose 同款（之前用 isAwaitingUser、现在统一走 canCompose）
   // - chat 自由化下、agent 起手就 wait_for_user、进 ChatView 时 status 大概率立刻变 awaiting_user
@@ -207,7 +206,7 @@ const EventStreamImpl = ({
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
     if (!text && attachedImages.length === 0 && attachedPaths.length === 0) return;
-    const images: ChatReplyImage[] | undefined = imagesToUploadPayload();
+    const images: ImagePayload[] | undefined = imagesToUploadPayload();
     const attachments = attachedPaths.length > 0 ? attachedPaths : undefined;
     onUserReply?.(text, images, attachments);
     setDraft("");
@@ -261,7 +260,7 @@ const EventStreamImpl = ({
                 ) : item.kind === "ask_user_request" ? (
                   <AskUserRequestRow ev={item} task={task} />
                 ) : (
-                  <EventRow ev={item} taskId={task.id} />
+                  <EventRow ev={item} taskId={task.id} task={task} />
                 )}
               </div>
             )}

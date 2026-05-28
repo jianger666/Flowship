@@ -21,6 +21,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   defaultModel: { id: "" },
   repos: [],
   mcpServersJson: DEFAULT_MCP_JSON,
+  username: "",
 };
 
 const isBrowser = (): boolean =>
@@ -79,6 +80,8 @@ export const getSettings = (): FeAiFlowSettings => {
       defaultModel: readDefaultModel(parsed.defaultModel),
       mcpServersJson: readMcpJson(parsed.mcpServersJson),
       repos: Array.isArray(parsed.repos) ? parsed.repos : [],
+      // V0.6 加：username 串行存档可能丢、强转 string 兜底
+      username: typeof parsed.username === "string" ? parsed.username : "",
     };
   } catch (err) {
     console.warn(

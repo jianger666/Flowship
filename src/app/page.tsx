@@ -80,8 +80,12 @@ const HomePage = () => {
       prev.map((t) => (t.id === task.id ? { ...t, archived: target } : t)),
     );
     try {
-      const updated = await setTaskArchived(task.id, target);
-      setTasks((prev) => prev.map((t) => (t.id === task.id ? updated : t)));
+      await setTaskArchived(task.id, target);
+      // setTaskArchived 返完整 Task、但列表只持 TaskSummary、把 archived 翻转即可、不替换整对象
+      // （actions / events 等 Task 独有字段在列表里用不到、避免类型不匹配）
+      setTasks((prev) =>
+        prev.map((t) => (t.id === task.id ? { ...t, archived: target } : t)),
+      );
       toast.success(target ? "已归档" : "已取消归档");
     } catch (err) {
       // 回滚
@@ -107,6 +111,8 @@ const HomePage = () => {
   );
 
   // 创建后直接跳详情页、不刷列表（详情页自己拉）
+  // task 模式 → /tasks/[id] 走 ResizablePanelGroup 三栏布局
+  // chat 模式 → /tasks/[id] 走 ChatView 单栏聊天页（详情页内部按 task.mode 分支）
   const handleCreated = (task: Task) => {
     router.push(`/tasks/${task.id}`);
   };

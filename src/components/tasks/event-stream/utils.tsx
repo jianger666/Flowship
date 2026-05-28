@@ -24,12 +24,13 @@ import {
 import type { EventKind, TaskEvent } from "@/lib/types";
 
 // 中文 + 英文学名（团队沟通时英文锚点）
+// V0.6：phase_* → action_*
 export const EVENT_LABEL: Record<EventKind, string> = {
   info: "信息",
   thinking: "思考",
-  phase_start: "阶段启动",
-  phase_ack: "阶段确认",
-  phase_failed: "阶段失败",
+  action_start: "Action 启动",
+  action_ack: "Action 确认",
+  action_failed: "Action 失败",
   tool_call: "工具调用",
   user_reply: "用户回复",
   assistant_message: "AI 回复",
@@ -40,11 +41,11 @@ export const EVENT_LABEL: Record<EventKind, string> = {
 
 export const renderEventIcon = (kind: EventKind) => {
   switch (kind) {
-    case "phase_start":
+    case "action_start":
       return <Sparkles className="size-4 text-primary" />;
-    case "phase_ack":
+    case "action_ack":
       return <CheckCircle2 className="size-4 text-emerald-500" />;
-    case "phase_failed":
+    case "action_failed":
       return <CircleAlert className="size-4 text-destructive" />;
     case "tool_call":
       return <ArrowUpRight className="size-4 text-blue-500" />;
@@ -91,7 +92,7 @@ export const mergeAdjacentThinking = (events: TaskEvent[]): TaskEvent[] => {
       ev.kind === "thinking" &&
       last &&
       last.kind === "thinking" &&
-      last.phase === ev.phase
+      last.actionId === ev.actionId
     ) {
       const lastDur = Number(last.meta?.durationMs) || 0;
       const curDur = Number(ev.meta?.durationMs) || 0;
@@ -170,7 +171,7 @@ export const mergeAdjacentToolCall = (events: TaskEvent[]): TaskEvent[] => {
       ev.kind === "tool_call" &&
       last &&
       last.kind === "tool_call" &&
-      last.phase === ev.phase
+      last.actionId === ev.actionId
     ) {
       const prevBatch = Array.isArray(last.meta?.batch)
         ? (last.meta.batch as ToolCallBatchItem[])

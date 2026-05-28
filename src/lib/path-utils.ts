@@ -15,7 +15,7 @@
  * 注意：前端组件不能用 `node:path` / `node:url`、手写就行、量很小。
  */
 
-import { PHASE_IDS, type PhaseId } from "./types";
+import { ACTION_TYPES, type ActionType } from "./types";
 
 /**
  * 取绝对 / 相对路径末尾段
@@ -77,33 +77,44 @@ export const looksLikePath = (s: string): boolean => {
 };
 
 /**
- * 判断 inline code 是不是「同 task 内 artifact 引用」
+ * 判断 inline code 是不是「同 task 内 action artifact 引用」
  *
- * 命名约定（task-fs.ts 的 phaseArtifactFilename）：`<NN>-<phaseId>.md`、NN 是 phase 在
- * workflow 里的位置（2 位补零）、phaseId 是 PhaseId 枚举值。
+ * V0.6 命名约定（task-fs.ts 的 actionArtifactFilename）：`<N>-<actionType>.md`、N 是
+ * ActionRecord.n 累计序号（不前导 0）、actionType 是 ActionType 枚举值。
  *
- * 命中返 PhaseId（让调用方切到对应 phase tab）、不命中返 null。
+ * 命中返 `{ n, type }`、让调用方切到对应 action tab；不命中返 null。
  *
- * 返 phaseId 而不返序号——序号会随 workflow 增删 phase 漂移、phaseId 是稳态锚点。
- * AI prompt 里写 `02-build.md` 引用 build artifact、用户切 tab 时按 phaseId 找就好、
- * 序号 02 只参与正则匹配、不暴露给调用方。
+ * V0.6.0.1 加：允许可选的 `actions/` 前缀——因为 prompt 强约束 review / build agent 写
+ * 「actions/<N>-<type>.md」相对路径形式（_super.md「Artifact 文件路径」段）、review artifact
+ * 的「plan 拍板口径复核」表格列「plan 位置」普遍写成 `actions/5-plan.md`、不带前缀的也得支持
+ * 兼容老用法。前缀只允许 `actions/`、其它前缀（如 `data/tasks/.../actions/...`）一律不命中、
+ * 走 `looksLikePath`（fs 绝对路径场景）。
  *
  * 例：
- *   - `01-plan.md` → "plan"
- *   - `02-build.md` → "build"
- *   - `03-review.md` → "review"
- *   - `apps/foo/bar.vue` → null（含 / 是文件路径、走 looksLikePath）
- *   - `report.md` → null（无 NN- 前缀）
- *   - `99-unknown.md` → null（phaseId 不在 PHASE_IDS 里）
+ *   - `1-plan.md` → { n: 1, type: "plan" }
+ *   - `actions/5-plan.md` → { n: 5, type: "plan" }（V0.6.0.1 新支持）
+ *   - `2-build.md` → { n: 2, type: "build" }
+ *   - `5-build.md` → { n: 5, type: "build" }（同 task 内多次 build）
+ *   - `actions/4-ship.md` → { n: 4, type: "ship" }
+ *   - `apps/foo/bar.vue` → null（业务仓库文件路径、走 looksLikePath）
+ *   - `data/tasks/xxx/actions/5-plan.md` → null（fs 绝对路径形式、走 looksLikePath）
+ *   - `report.md` → null（无 N- 前缀）
+ *   - `99-unknown.md` → null（type 不在 ACTION_TYPES）
  */
-export const looksLikeArtifactRef = (s: string): PhaseId | null => {
-  if (!s || s.length > 50) return null;
-  const m = s.match(/^\d{2}-([a-z]+)\.md$/);
+export interface ActionArtifactRef {
+  n: number;
+  type: ActionType;
+}
+
+export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
+  if (!s || s.length > 60) return null;
+  const m = s.match(/^(?:actions\/)?(\d+)-([a-z]+)\.md$/);
   if (!m) return null;
-  const phaseId = m[1];
-  return (PHASE_IDS as readonly string[]).includes(phaseId)
-    ? (phaseId as PhaseId)
-    : null;
+  const n = Number(m[1]);
+  const type = m[2];
+  if (!Number.isFinite(n) || n < 1) return null;
+  if (!(ACTION_TYPES as readonly string[]).includes(type)) return null;
+  return { n, type: type as ActionType };
 };
 
 /**
@@ -190,7 +201,11 @@ export const getCommonParentDir = (paths: string[]): string => {
  * 空数组 fallback 返 `""`、调用方应该在更上层校验非空（API schema / UI 必填）。
  */
 export const getEffectiveCwd = (repoPaths: string[]): string => {
-  if (repoPaths.length === 0) return "";
+  // V0.6：repoPaths 空（自由聊 / 调研类 task）→ fallback process.cwd()
+  //   server 端 process.cwd() = fe-ai-flow 项目自己、agent 起在这里至少有合法 cwd
+  if (repoPaths.length === 0) {
+    return typeof process !== "undefined" ? process.cwd() : "";
+  }
   if (repoPaths.length === 1) return repoPaths[0].replace(/\/+$/, "");
   return getCommonParentDir(repoPaths);
 };

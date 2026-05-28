@@ -1,20 +1,18 @@
 "use client";
 
 /**
- * 「再聊聊」对话框（V0.5.4 抽出、解决输入卡顿；V0.5.4 加贴图）
+ * 「再聊聊」对话框（V0.5.4 抽出、解决输入卡顿；V0.5.4 加贴图；V0.6 适配 action）
  *
  * 历史动机：原本 `draft` state 放在 `TaskDetailPage` 顶层、每次按键都触发整个 page
- * 重渲染、连带 ArtifactPanel / ApprovePhaseDialog / ContextDocsPanel / TaskMcpPanel
- * / PhaseProgress 一堆子组件都参与 reconcile。EventStream 虽然 memo 过、但 SSE 持续
- * setTask(events) 会让 task 引用持续变化、memo 浅比较失效。打字时单次 keystroke
- * reconcile 时长 > 16ms、用户实测明显卡顿。
+ * 重渲染、连带各子组件都参与 reconcile。EventStream 虽然 memo 过、但 SSE 持续
+ * setTask(events) 会让 task 引用持续变化、memo 浅比较失效。
  *
- * 修法：把 draft + 提交逻辑下沉到本组件内部、父组件只持 open / onSubmit、
- * 打字不会上抛触发父 re-render。memo 包裹本组件、open 没变时父 re-render 也不重渲染本组件。
+ * 修法：把 draft + 提交逻辑下沉到本组件内部、父组件只持 open / onSubmit。
  *
- * V0.5.4 加贴图：图附件管理统一走 `useImageAttach` hook（同 event-stream 共用、避免重复）。
- * 用户可粘贴 / 拖拽 / 点附图按钮挂图、随 feedback 一起发给 agent。
- * agent 拿到 [PHASE_ACK revise] + [ATTACHED_IMAGES] 后先 `read` 图、再 ask_user 复述意图。
+ * V0.6 变更：
+ *   - phaseLabel → actionLabel（action 模型）
+ *   - submit 后父组件调用 submitActionAck("revise", feedback, ...)
+ *   - ChatReplyImage → ImagePayload
  */
 
 import { memo, useEffect, useState } from "react";
@@ -32,24 +30,23 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { useImageAttach } from "@/hooks/use-image-attach";
-import type { ChatReplyImage } from "@/lib/task-store";
+import type { ImagePayload } from "@/lib/task-store";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  // 当前 phase 的中文展示文案（用于标题 / placeholder 中拼接）
-  phaseLabel: string;
+  // 当前 action 的中文展示文案（用于标题 / placeholder 中拼接）
+  actionLabel: string;
   // 提交锁（父组件持、防连点）、submitting 时按钮 disable
   submitting: boolean;
-  // 提交回调：父组件实际调用 submitPhaseAck("revise", feedback, ..., images)
-  // 父侧成功后自行 setReviseOpen(false)；失败保持 dialog 开、用户能调整重发
-  onSubmit: (feedback: string, images?: ChatReplyImage[]) => void | Promise<void>;
+  // 提交回调：父组件实际调用 submitActionAck("revise", feedback, ..., images)
+  onSubmit: (feedback: string, images?: ImagePayload[]) => void | Promise<void>;
 }
 
 const ReviseDialogImpl = ({
   open,
   onOpenChange,
-  phaseLabel,
+  actionLabel,
   submitting,
   onSubmit,
 }: Props) => {
@@ -111,7 +108,7 @@ const ReviseDialogImpl = ({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>跟 AI 再聊聊 · {phaseLabel}</DialogTitle>
+          <DialogTitle>跟 AI 再聊聊 · {actionLabel}</DialogTitle>
         </DialogHeader>
         {/* 整片输入区支持拖拽：drag over 时整片轮廓变虚线提示 */}
         <div

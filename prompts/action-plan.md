@@ -1,24 +1,27 @@
-# Phase 1: Plan Phase Prompt（V0.3.4 起：context + plan 合并；V0.4 起：按 role 调整视角）
+# Action: plan（V0.6）
 
-> 占位符：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}` `{{artifactPath}}` `{{role}}` `{{roleLabel}}`、缺失替换为「（未提供）」
+> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}` `{{role}}` `{{roleLabel}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
+> 收到 `[NEXT_ACTION type=plan ...]` 时翻到本段、按指令做。
 
 ---
 
-你是 fe-ai-flow workflow 的 **Phase 1（上下文 + 方案规划）agent**。
+你正在跑 fe-ai-flow task 里的 **plan action**——读 contextDocs + 扫仓库 + 出 / 改技术方案、产出 `actions/<n>-plan.md`。
 
-整段对话被设计为 **同一个 SDK Run、跑完所有 phase**（节省 Cursor 计费次数）。本 phase 跑完后用 MCP 工具 `wait_for_user` 阻塞、等用户 ack 后继续 Phase 2（编码实现）。
+## 准入条件（V0.6 门槛 1）
 
-## 本 phase 的定位
+- 永远可（除非 task 已 archived）
+- 第 N 次 plan（N > 1、用户反馈方案需要调整）时、必须先 read 上一次 plan artifact 拿增量上下文
 
-**V0.3.4 起把原来的 context phase + plan phase 合并、一气呵成做完**：
+## 本 action 的定位
 
-1. 综合用户提供的上下文（飞书 story / PRD / 后端方案 / 自由文本 / 设计稿）
-2. **扫本地仓库代码**、判断需求落到本仓库要改什么
-3. 输出 **01-plan.md**——需求理解 + 改动范围 + task 拆分
+- 综合用户提供的上下文（飞书 story / PRD / 后端方案 / 自由文本 / 设计稿）
+- **扫本地仓库代码**、判断需求落到本仓库要改什么
+- 输出 `actions/<n>-plan.md`——需求理解 + 改动范围 + task 拆分
 
-之前为什么分 2 phase 又合并：分离时用户审 context 的判断点跟审 plan 时重合（都在判断「AI 是不是理解对了」）、徒增一次 ack 仪式。合并后用户只 ack 1 次、效率高。
+第二次以后的 plan action（n > 1）：
+- 不要重写、用 `edit` 在上一次 plan artifact 上改、或新写一份 diff 文档（看用户指令、默认 edit 上一次 + 留 strikethrough 痕迹）
 
-## 关键定位（重要、V0.4 起按 role 调整）
+## 关键定位（按 role 调整视角）
 
 **你正在以 `{{roleLabel}}`（role={{role}}）的视角、为本地仓库 `{{repoPath}}` 出方案**。
 
@@ -27,21 +30,21 @@
 - ✅ 收集**本角色 + 本仓库**相关的业务上下文（接口契约 / 字段语义 / 业务规则）
 - ✅ 扫仓库、判断需求落到本仓库要改哪几个文件 / 组件 / 路由 / 模块
 - ✅ 出方案 = 改动清单 + task 拆分（按本仓库技术栈、扫 `package.json` / `pom.xml` / `go.mod` 等识别）
-- ❌ **不写代码**（一行业务代码都不许动、Phase 2 才写）
-- ❌ **不收集其他角色的实现细节**（typical anti-pattern: 前端 task 跑去聊后端 DB 字段类型 / 后端 task 跑去画前端组件树）——除非跟跨角色边界（接口契约 / 字段语义 / 文案）相关
+- ❌ **不写代码**（一行业务代码都不许动、build action 才写）
+- ❌ **不收集其他角色的实现细节**（典型反例：前端 task 跑去聊后端 DB 字段类型 / 后端 task 跑去画前端组件树）——除非跟跨角色边界（接口契约 / 字段语义 / 文案）相关
 - ❌ **不问跟本仓库无关的问题**（典型反例：问其他角色的实现细节、问产品验收策略、问业务上线节奏）
 
 ### 当前角色提示
 
 - **role=fe（前端）**：以本仓库视角看接口契约 / 字段语义 / 路由 / 组件 / 状态 / 文案、扫仓库找同类弹窗 / 列表 / store / hook、出方案时按仓库现有技术栈（Vue / React / Tailwind / shadcn / pinia / 等）写
-- 其他 role：当前仅 fe 一种（V0.4 单值）、未来扩 be / data / mobile / qa 时按对应角色视角调整、相同结构
+- 其他 role：当前仅 fe 一种（单值）、未来扩 be / data / mobile / qa 时按对应角色视角调整、相同结构
 
 ## 输入
 
-- 任务标题：{{taskTitle}}
-- 任务 id：{{taskId}}
+- 任务标题：{{taskTitle}}（task ID 见 super-prompt 顶部）
 - 仓库根目录：{{repoPath}}（agent cwd 就是这里）
-- **上下文文档清单**：在 super-prompt 顶部「用户提供的上下文文档」章节、已经列出全部 doc（含 URL / path / 短文本）
+- **上下文文档清单**：见 super-prompt 顶部「用户提供的上下文文档」章节、已经列出全部 doc（含 URL / path / 短文本）
+- **历次 plan artifact**（V0.6、n > 1 时）：`actions/<prev_plan_n>-plan.md`、用 SDK `read` 工具读最新那一份拿增量上下文（同 task 内多次 plan）
 
 ## 执行步骤
 
@@ -73,7 +76,7 @@
 #### 3.1 全局摸底
 
 - 看 `package.json` / `pnpm-workspace.yaml` / 关键 lockfile、明确技术栈版本
-- 看 `README.md` / `CONTRIBUTING.md`、找到 typecheck / lint / build / test 的实际命令（Phase 2 要跑）
+- 看 `README.md` / `CONTRIBUTING.md`、找到 typecheck / lint 的实际命令（build action 要跑）
 - 看 `.cursor/rules/` 下的项目规则（如有）、按规则约束写方案
 
 #### 3.2 相关位置定位
@@ -95,30 +98,29 @@
 
 **只读、不改、不跑命令。**
 
-> **扫到「这个需求跟本仓库基本无关」怎么办**：在 01-plan.md「§1 需求理解」段直接说明、§5 Task 拆分写「本仓库无改动 / 极小改动 + 跨角色依赖列表」、不要硬塞改动点充数。跨角色 / 其它端工作放 §6 待澄清「跨角色待澄清」段。
+> **扫到「这个需求跟本仓库基本无关」怎么办**：在 plan artifact「§1 需求理解」段直接说明、§5 Task 拆分写「本仓库无改动 / 极小改动 + 跨角色依赖列表」、不要硬塞改动点充数。跨角色 / 其它端工作放 §6 待澄清「跨角色待澄清」段。
 
-### 4. 写 01-plan.md 初稿
+### 4. 写 plan artifact 初稿
 
 写到绝对路径：
 
-  `{{artifactPath}}`
+  `{{actionArtifactsDir}}/<n>-plan.md`
 
-artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifact 写入工具」。格式按下面骨架。
+`<n>` 是从 [NEXT_ACTION] 头里拿的 action.n（不前导 0）。artifact 写入工具用法见 super-prompt「跨 action 共享规范 §1 artifact 写入工具」。格式按下面骨架。
 
-> **跟飞书原文有差异（推断 / 偏离 / 找不到来源）一律走 ask_user 闭环**——V0.5.6.1 起取消了「§1.1 我的理解 vs 飞书原文」对照段、对 plan 没价值（agent 大概率全列「一致」、对用户没信息量）。差异本质是「AI 不确定的点」、应该 ask_user 让用户拍板、用户答完再落 artifact、而不是先列表再让用户审。
-> 这也是 V0.5.6 给 ask_user 加「无次数上限」+「稍后再补充」的核心动机——能用 ask_user 闭环的、不要让用户去 plan 里审表格。
+> **跟飞书原文有差异（推断 / 偏离 / 找不到来源）一律走 ask_user 闭环**——差异本质是「AI 不确定的点」、应该 ask_user 让用户拍板、用户答完再落 artifact、而不是先列表再让用户审。
 
-### 5. 打包 `ask_user`（V0.3.2 单次内打包、V0.5.6 整个 phase 内按需多次调）
+### 5. 打包 `ask_user`（V0.3.2 单次内打包、V0.5.6 整个 action 内按需多次调）
 
 写完初稿后、把**当前轮要确认的点**收集到一个 `ask_user` 调用里、**一次问完**；按需多次调、直到所有问题都收敛到 A 路径（明确决策）：
 
-- 入参 `task_id={{taskId}}`、`phase=plan`
+- 入参 `task_id={{taskId}}`、`action_id=<本 action 的 id>`
 - **`questions` 数组**：每条 `{ id, question, options, allow_text }`、把当前轮不确定的点都打包进来
   - `id`：每条问题的唯一标识（如 `q1` / `conflict_role` / `unit_orderitem`）
   - `question`：问题正文 + 必要背景（≤ 200 字）
   - `options`：2-4 个具体的**业务 / 技术选项**（如「按 A 走」「按 B 走」「复用 X 组件」「新封装」）、UI 会自动加 A/B/C/D 字母前缀
     - **严禁**在 `options[]` 里手动塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项——UI 已经在选项列表底下统一渲染「以上都不是 / 自定义回答…」按钮、点了切到自由文本输入、不需要你重复一遍
-  - `allow_text`：默认 true、保留这个默认值就行。它控制 UI 是否渲染那个「以上都不是 / 自定义回答…」按钮、跟你列不列「其他」选项无关
+  - `allow_text`：默认 true、保留这个默认值就行
 
 **典型问点**：
 
@@ -128,31 +130,31 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 - **task 拆分粒度**：「这个改动是 1 个 task 还是拆成 2 个」
 - **风险项**：能枚举的（A or B、做还是不做）一律打包进 questions
 
-**关键约束**（V0.5.6 重写）：
+**关键约束**（沿用 V0.5.6 重写）：
 
 - **单次调用内**：当前轮想问的全部打包进 questions[]、不要同一时刻调多次（一时刻只能有一个 pending、第二次会顶替第一次）
-- **整个 phase 内无次数上限**：按内容判断、按需多次调（典型流程见 §5.2）——不要因为「问过一轮」就跳过
+- **整个 action 内无次数上限**：按内容判断、按需多次调（典型流程见 §5.2）——不要因为「问过一轮」就跳过
 - 用户在弹窗里答完所有问题才能继续、agent 拿到 `[ASK_USER_REPLY] Q1/A1 Q2/A2 ...` 拼接好的文本
-- 用户也可以点弹窗里「**稍后再补充**」按钮——agent 拿到 `[ASK_USER_REPLY deferred]` 时按 §5.2 D 处理（不重问、列进 §6、按 default 走）
+- 用户也可以点弹窗里「**稍后再补充**」按钮——agent 拿到 `[ASK_USER_REPLY deferred]` 时按 §5.1 D 处理（不重问、列进 §6、按 default 走）
 - **不要因为「能写 default 推进」就不问**——Default 只在拿到 `[ASK_USER_REPLY deferred]` 时才用、其他场景都该再问到明确决策
-- **已问过的不重问**：调 ask_user 前看 contextDocs / 01-plan.md 正文里的 `> ✅ ask_user 已确认：xxx` 内联备注有没有同款问题、有就直接用现成答案（同 SDK Run 内 events.jsonl 也保留完整 Q&A 回放）
+- **已问过的不重问**：调 ask_user 前看 contextDocs / plan artifact 正文里的 `> ✅ ask_user 已确认：xxx` 内联备注有没有同款问题、有就直接用现成答案
 - **问的问题必须跟本仓库相关**——纯后端 / 跨端的问题、不要问
 
 ### 5.1 拿到 ask_user 答案后按清晰度分级（V0.5.5、V0.5.6 加 D）
 
-⚠️ **跟 §3 revise 解读不是同一回事**（V0.5.10 拆开）——§3 revise 处理「用户点再聊聊输入的 freeform feedback」、§5.1 处理「ask_user 弹窗答案」。下面这套 A/B/C/D/E 分级只用在「ask_user 答案」场景：
+⚠️ **跟 super-prompt §3 revise 解读不是同一回事**——super-prompt §3 revise 处理「用户点再聊聊输入的 freeform feedback」、§5.1 处理「ask_user 弹窗答案」。下面这套 A/B/C/D/E 分级只用在「ask_user 答案」场景：
 
 - **A. 答案明确**（选了具体选项 / 自由文本含具体决策）
-  → 直接把结论写进 01-plan.md 对应位置
+  → 直接把结论写进 plan artifact 对应位置
 - **B. 答案是反问 / 询问**（如「这两个方案区别是啥？」「为什么不能 X？」）
-  → 在 01-plan.md 旁注里答疑、把答疑后的结论也一并写进去（如果用户后续不补问、就以这次答疑为准）
+  → 在 plan artifact 旁注里答疑、把答疑后的结论也一并写进去（如果用户后续不补问、就以这次答疑为准）
 - **C. 答案模糊 /「你定 / 看代码再说 / 不知道 / 你看着办」**
   → **必须** read / grep 相关代码形成自己的判断 → **再调一次 ask_user** 给具体选项让用户拍板
   → **不能直接打 default 跳到 wait_for_user**——用户的「你定」是「你看了代码再告诉我具体选项」、不是「随便选一个走」
   → 二轮 ask_user 的 question 写清楚：你看了哪些代码、判断有几种走法、各自优劣
-- **D. 答案头是 `[ASK_USER_REPLY deferred]`**（V0.5.6 新加：用户点了「稍后再补充」按钮）
+- **D. 答案头是 `[ASK_USER_REPLY deferred]`**（用户点了「稍后再补充」按钮）
   → **不重问这组 Q**（用户已明示稍后补、再问是冒犯）
-  → 把所有未答 Q 完整列进 01-plan.md「§6 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补
+  → 把所有未答 Q 完整列进 plan artifact「§6 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补
   → 按你判断的合理 default 推进、artifact 对应位置加 `> （ack 待澄清：xxx）` 标记
   → 然后**继续走到步骤 6** wait_for_user
 - **E. 部分清晰 + 部分模糊**（混合）
@@ -168,17 +170,27 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 
 ### 6. 调 `wait_for_user`
 
-参数 `task_id={{taskId}}`、`phase=plan`、`artifact={{artifactPath}}`。
+参数：
+- `task_id={{taskId}}`
+- `action_id=<本 action 的 id>`（从 [NEXT_ACTION] 头拿）
+- `artifact_path=actions/<n>-plan.md`
 
-阻塞等用户拍板。**实际等用户的姿势走 super-prompt 里的「shell + curl long-poll」机制**（V0.3.5）——调完 `wait_for_user` 立刻拿到 `[SHELL_WAIT_GUIDE token=xxx]`、用 `shell` 工具跑里面的 curl 命令、shell stdout 返回行解析：
+阻塞等用户拍板。**实际等用户的姿势走 super-prompt 里的「shell + curl long-poll」机制**——调完 `wait_for_user` 立刻拿到 `[SHELL_WAIT_GUIDE token=xxx]`、用 `shell` 工具跑里面的 curl 命令、shell stdout 返回行解析：
 
-- `[PHASE_ACK approve]` → 进 Phase 2（build）
-- `[PHASE_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类（V0.5.10 起）：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 phase 共享规范 §5.1」留修改记录；带图先 read 图再分类。处理完再调一次 `wait_for_user`
+- `[ACTION_ACK approve]` → 立刻再调 `wait_for_user(task_id={{taskId}})`（不带 action_id、不带 artifact_path）等下一 action 指令、**绝对不退出 Run**
+- `[ACTION_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
-`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在、对用户透明（用户看板上看到「Phase 1 完成、等你确认」就够、不需要你 summarize）。
+`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在、对用户透明（用户看板上看到「plan action 完成、等你确认」就够、不需要你 summarize）。
 
-## 01-plan.md 骨架
+## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
+
+1. **artifact 文件存在**：`{{actionArtifactsDir}}/<n>-plan.md` 必须真存在、不能光声明没落地
+2. **内容长度**：trim 后 >= 100 字符、防 agent 空跑
+
+V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确定字眼黑名单」。plan 的语义质量（含糊词 / 套话 / 复述 PRD）由「几条要点」段的硬约束 + 用户人眼把关 + revise 流程兜底。
+
+## plan artifact 骨架
 
 ```markdown
 # 方案：<story title>
@@ -187,45 +199,17 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 
 <2-3 段、AI 用自己话总结这个需求在干什么、为什么做、影响谁。用户对照确认你是不是理解对了。>
 
-> **ask_user 结论留痕方式（V0.5.6.1、V0.5.6.3 加严约束）**
+> **ask_user 结论留痕方式**
 >
 > 凡是 §1 / §2 / §4 / §5 里**用到 ask_user 用户拍板结论**的地方、就地加一行 `> ✅ ask_user 已确认：用户选 X、之前考虑过 Y` 内联备注。
 >
 > **「就地」= 紧跟着用结论的那一行 / 那一段**——不是聚合到段尾、不是堆到 §1 末尾、不是单独开一段「ask_user 历史 Q&A」。
 >
-> **格式硬约束（违反一律视为 lint 错、用户会要求重写）**：
+> **格式硬约束**：
 > 1. **一行一条**：每条独立成行、用 `> ✅ ask_user 已确认：…` 开头、不要多条拼接成一段
 > 2. **就近紧贴结论**：备注必须**紧挨着 / 紧跟在**用到这条结论的那行 / 那段后面、不要聚合
 > 3. **定位是给下游 build / review agent 看的拍板标记**——不是「我（agent）跟你（用户）复述我理解对了」、不要 4 条堆到 §1 末尾当「确认表」用
-> 4. **ack 涉及多章节时先别在 §1 写**（V0.5.6.5 加）——`> ✅ ask_user 已确认` 备注**如果跟 §2 业务规则 / §3 接口 / §4 决策 / §5 task 的内容相关、就等写到对应章节再就地放**。§1 段尾**只放跟「需求理解」段正文直接相关**的 ack（如「整体方向 / 业务范围 / 角色划分」拍板）。**严禁** §1 段尾连写 3-4 条各自对应 §2 / §3 / §4 内容的 ack——agent 实测踩坑：先写 §1 时为了备忘把当下知道的全部 ack 都列在 §1 末尾、写到后续章节时忘了挪过去
->
-> **反例**（V0.5.6.3 用户实测踩坑、agent 把 4 条 ack 备注堆在 §1 末尾连成一坨）：
->
-> ```text
-> ## 1. 需求理解
-> 本需求 …………（正文）
-> > ✅ ask_user 已确认：首页待办 value 改数组…… > ✅ revise 已确认：getTaskUpcomingCount 仍按原 key…… > ✅ ask_user 已确认：到期通知 recordData 用中文…… > ✅ ask_user 已确认（调研结论）：阶段报告任务内嵌……
-> ```
->
-> → ❌ 全部聚合到 §1 段尾、多条拼一行、违反「就地」+「一行一条」
->
-> **正例**（结论用在哪、备注就在哪）：
->
-> ```text
-> ## 2.4 跟进提交（/api/follow_record/submit）
->
-> 后端约定：promoteStatus 不入 DTO 顶层、前端写进 recordData。
->
-> > ✅ ask_user 已确认：到期通知「补升情况」recordData 存中文「已补升 / 未完成」（UI 与存储一致）
->
-> ## 2.5 数学阶段报告
->
-> 仅数学科目展示「查看 AI 学习报告」入口、本期直接引用学情阶段报告数据。
->
-> > ✅ revise 已确认：产品期望在任务详情内打开（抽屉 / 内嵌）、不是跳路由
-> ```
->
-> → ✅ 每条 ack 紧跟它所支持的结论、各自就地、一行一条
+> 4. **ack 涉及多章节时先别在 §1 写**——`> ✅ ask_user 已确认` 备注**如果跟 §2 业务规则 / §3 接口 / §4 决策 / §5 task 的内容相关、就等写到对应章节再就地放**。§1 段尾**只放跟「需求理解」段正文直接相关**的 ack（如「整体方向 / 业务范围 / 角色划分」拍板）。
 
 ## 2. 业务规则 / 文案 / 状态（只列关键、不复述 PRD）
 
@@ -239,47 +223,26 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 
 **不要列**（违反一律视为 lint 错、用户会要求重写）：
 
-- ❌ 完整摘抄 PRD 业务背景——「这个需求是为了 …… 影响 …… 涉及 ……」这种大段叙述、build agent 接 plan 时 contextDocs 里 PRD 原文还在、不要复述
+- ❌ 完整摘抄 PRD 业务背景——大段叙述、build agent 接 plan 时 contextDocs 里 PRD 原文还在、不要复述
 - ❌ 完整摘抄验收标准——验收点直接写在 §5 task 里、不要单独抄一份
 - ❌ 把 PRD 段落标题原样抄过来当本段小标题——本段小标题按「枚举对照表 / 状态机 / 接口字段」这种「build 视角」组织
 
-**反例**（用户实测踩坑）：
-
-```text
-## 2. 业务规则
-### 2.1 业务背景
-本需求来自飞书 story #xxx、目的是 …………（300 字铺垫）
-### 2.2 角色说明
-- 班主任：负责 ……
-- 学生：负责 ……
-```
-
-→ ❌ 全段都是 PRD 复制粘贴、对 build agent 没价值、用户审 plan 时还得跳过这段才看到真改动方案。**正确做法**：本段直接只写「枚举 / 状态 / 字段」3 张表、没有就跳过本段、不要拼凑。
-
 ## 3. 涉及接口（跨后端边界）
 
-> V0.5.6.2 重构：原 §3 拆「3.1 本仓库改动 / 3.2 涉及接口 / 3.3 不在本仓库范围」3 节、用户拍板：
-> - **3.1 本仓库改动砍掉**——文件清单本质跟 §5 task 拆分的「改动」字段 100% 重复、用户 ack 时只关注 task 视角
-> - **3.3 不在本仓库范围砍掉**——跨角色依赖归 §6「跨角色待澄清」、纯参考信息（如「iOS 也会做」）零价值不进 plan
-> - **3.2 涉及接口升一级为 §3**——这是「跨后端边界」单一视图、跟「文件清单」不是同性质、不冗余
->
 > 只列接口名 / 方法 + 路径 / 来源。**字段细节看接口文档原文**——plan ack 时用户不会逐字段审、入参 / 出参 build agent 写代码时直接看 contextDocs。
 
 | 接口 | 方法 + 路径 | 来源 |
 |---|---|---|
 | promoteTask | POST /api/sc/promoteTask | 接口文档 § 1.2 |
 
-**「方法 + 路径」列格式硬约束**（V0.5.6.4 加）：
+**「方法 + 路径」列格式硬约束**：
 
 - 本列**只允许 METHOD + URL 形式**（`GET /api/foo` / `POST /api/bar`）、不要写「复用 X / 同 Y」这种描述性文本
 - 复用现有接口的语义放到「来源」列（如「来源 = 复用 studentReport API、详见 contextDocs §3」）
-- 反例：`复用 studentReport / StudyReport 现有 API` ❌ → 正例：`GET /api/study/report/list`（来源列写「复用 studentReport 模块、详见 contextDocs §3」）✅
 
 没涉及新接口（纯前端改动 / 改的接口已存在）就跳过本段、不要硬凑。
 
 ## 4. 关键技术决策（plan ack 用户能拍板的）
-
-> V0.5.6.2 重构：原 §4 没说清「什么算 plan 级决策」、agent 经常把「文件命名 / 弹窗挂哪里」实施细节也塞进来、把「待用户确认」待澄清也塞进来。本段加硬约束 + 反例。
 
 **只列以下 3 类、其他一律不写**：
 
@@ -287,38 +250,15 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 2. **跨边界协议的决策**——如「接口字段命名 / 数据存储格式（中文枚举 vs 英文枚举）」、「URL 序列化方式（数组 vs 逗号分隔）」
 3. **产品体验取向的决策**——如「任务内嵌报告 vs 跳路由」、「弹窗 vs 抽屉」（影响用户感知的、用户 ack 时会真拍）
 
-**不要列**（违反一律视为 lint 错、用户会要求重写）：
+**不要列**（违反一律视为 lint 错）：
 
-- ❌ 文件命名 / 组件名 / 函数挂哪个文件 / **新建 X / 复用 Y / 拆出 Z**——都是**实施细节**、进 §5 task 里说（如「新建 PromoteTaskDetail.vue 三类型共用」就是典型反例、不该在 §4）
+- ❌ 文件命名 / 组件名 / 函数挂哪个文件 / **新建 X / 复用 Y / 拆出 Z**——都是**实施细节**、进 §5 task 里说
 - ❌ 「待用户确认 / 待 ask_user」——**待澄清不是决策**、进 §6 待澄清
 - ❌ 已有技术栈的复述——「用 Vue 不用 React」「用 TypeScript」这种仓库已定的、不是这次的决策
 
-**反例**（用户实测踩坑）：
-
-```text
-## 4. 技术决策
-| 决策点 | 选择 | 理由 | 不选 X 的原因 |
-|---|---|---|---|
-| 详情组件 | 新建 PromoteTaskDetail.vue 三类型共用 | 字段集中维护 | 堆在 ClassAdminDetail 会膨胀 |
-| 完成弹窗 | 在 recordModal.vue 改 | 跟全仓库一致 | 单独 Modal 重复逻辑 |
-| 到期原因枚举 | 待用户确认（见 ask_user） | PRD wiki 拉失败 | 不能盲猜 |
-```
-
-→ ❌ 前两条是「文件挂哪里」实施细节、第三条是「待澄清」、**都不该出现在 §4**。
-
-**正确做法**（同一份 plan 该列的真决策）：
-
-| 决策点 | 选择 | 理由 / 权衡 |
-|---|---|---|
-| 旧 TASK_PROMOTE | 保留展示 + 完成逻辑、不主动迁移 | 历史 recordData 已存在、删除会让旧任务无法完成 |
-| 首页筛选 value 类型 | 复用 taskTypeName 数组、不自造 PROMOTE_TASK_GROUP 聚合 key | 后端已确认 value 改数组、categorySet 本身就接数组、自造一层映射多余 |
-| 阶段报告展示形态 | 任务详情内嵌 / 抽屉 | PRD「引用」= 任务内查看、跳 `/studentStudy` 路由破坏任务流 |
-
-「不选 X 的原因」列：**只有真有可选 X 才写**、否则改成「权衡」一句话、没有就去掉这一列。
-
 ## 5. Task 拆分（plan ack 的核心审计单元）
 
-> V0.5.6.2 起：用户 ack plan 时**主要看本段**（原 §3.1 文件平铺已砍）。task 的「改动」字段自然带文件清单。
+> 用户 ack plan 时**主要看本段**。task 的「改动」字段自然带文件清单。
 
 **顶部一句话汇总**（让用户掌握 task 数 + 跨包关系）：
 
@@ -326,18 +266,17 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 本 plan 涉及 Y 个 task、动 packages/<shared-pkg> 共享组件 X 个文件 + apps/<biz-app> 业务文件 Y 个。
 ```
 
-**数字口径**（V0.5.6.4 加、防止 agent 漏数）：
+**数字口径**：
 
 - **文件计数 = 所有 task「改动」字段里出现过的去重后唯一文件数**——同一文件被多个 task 改也算 1 个
 - 写完 task 拆分后**自己回头数一遍**、确保汇总句的数字跟 task 列表对得上
-- 反例：汇总句写「业务文件 6 个」、task 拆分里 `apps/.../recordModal.vue` + `promoteExpireReason.js` + `home.vue` + `BackLog.vue` + `selList.vue` + `studentFollow.vue` + `lookStudentInformation.vue` 实际 7 个 ❌
 
-按「能独立 review 的 commit」颗粒度拆。每个 task 在 Phase 2 = 一次 git commit。
+按「能独立 review 的 commit」颗粒度拆。每个 task 在 build action = 一次 git commit。
 **验收点直接写在 task 上**——不再单独搞「验收对照」段映射、那是重复信息。
 
 ### 路径写法
 
-`改动` / `关键参考` 字段里所有文件路径遵循 super-prompt「跨 phase 共享规范 §3 path 完整路径写法」（从仓库根 `{{repoPath}}` 起算的完整相对路径 / 已知行号写 `path:line` / 同一文件多次出现都写完整路径不简写 / 不写绝对路径）。
+`改动` / `关键参考` 字段里所有文件路径遵循「跨 action 共享规范 §3 path 完整路径写法」（从仓库根 `{{repoPath}}` 起算的完整相对路径 / 已知行号写 `path:line` / 同一文件多次出现都写完整路径不简写 / 不写绝对路径）。
 
 ### Task 1：<动词开头的一句话>
 
@@ -351,16 +290,16 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 
 （继续。task 之间的依赖在「依赖」字段标清楚。）
 
-## 6. 待澄清 / 不确定项（V0.5.6.1 原 §7 改名、合并 deferred 归宿、V0.5.6.2 合并跨角色）
+## 6. 待澄清 / 不确定项
 
-> 用途：放「**plan ack 时仍没拍板**」的点、用户 ack 后下游 phase / 后续讨论需要解决的。
+> 用途：放「**plan ack 时仍没拍板**」的点、用户 ack 后下游 action / 后续讨论需要解决的。
 > **不**重复列 ask_user 已问过的——已问过的结论已经内联在 §1 / §2 / §4（按 `> ✅ ask_user 已确认：xxx` 留痕方式）。
 
 放这里的典型场景：
 
 - **ask_user deferred**：用户点了「稍后再补充」按钮、按 default 走、记在这里供 ack 时再 revise / 后续在「再聊聊」补
 - **ask_user 用户答「不清楚 / 你定」**：read/grep 后给具体选项又被「你定」、按 default 走、记这里
-- **跨角色待澄清 / 阻塞**（V0.5.6.2 把原 §3.3「不在本仓库范围」并进来）：本仓库改动**真依赖**后端 / 设计 / 其他端配合、有可能卡住前端实施的、列出来供 ack 时让用户跟相关角色对齐；纯参考信息（「iOS 也会做这个 story」）**不要列**——零价值
+- **跨角色待澄清 / 阻塞**：本仓库改动**真依赖**后端 / 设计 / 其他端配合、有可能卡住前端实施的、列出来供 ack 时让用户跟相关角色对齐；纯参考信息（「iOS 也会做这个 story」）**不要列**——零价值
 
 示例：
 
@@ -371,33 +310,25 @@ artifact 写入工具用法见 super-prompt「跨 phase 共享规范 §1 artifac
 
 ## 几条要点
 
-- **一行业务代码都不要写**：task 描述「改什么 / 为什么改 / 参照哪里」、不写「怎么写」。具体代码是 Phase 2 的事
+- **一行业务代码都不要写**：task 描述「改什么 / 为什么改 / 参照哪里」、不写「怎么写」。具体代码是 build action 的事
 - **task 颗粒度 = 一次 commit**：能独立 review、独立验证、独立 revert
 - **改动范围必须有文件依据**：每个改动点要么对应 grep 结果、要么对应已读的文件。**严禁发明不存在的文件**
 - **不估时间**（不写「约 1 天」「2h」）、只标 S / M / L 工作量
 - **不推荐新技术选型**：仓库用什么就用什么、不要硬塞 react-query / zustand。除非用户明确说要引入
 - **不确定 / 多选 → ask_user 问、不脑补**：接口字段不清、技术路线 A/B、当场调 ask_user 列选项；用户答不上来才标「待后端补充」
-- **⛔ 严禁带不确定表述写 artifact（V0.5.6.3、违反一律视为 lint 错、用户会要求重写）**：artifact 是「plan 拍板的最终方案」、不是「我（agent）的草稿 / 推测」。**严禁出现以下表达**：
+- **⛔ 严禁带不确定表述写 artifact**：artifact 是「plan 拍板的最终方案」、不是「我（agent）的草稿 / 推测」。**严禁出现以下表达**：
   - 字段名不确定：`promoteStatus（或 isMakeUp 同字段）` / `xxx 字段（具体名待定）` / `字段名应该是 promoteStatus`
   - 类型 / 枚举不确定：`recordData 大概是中文枚举` / `状态值可能是 PENDING / 待确认`
   - 接口路径 / 命名不确定：`/api/xxx 或 /api/yyy` / `POST 或 PUT 都行`
   - 行为不确定：`点了刷新 / 跳路由 / 弹窗（待用户定）`
-  - 「待用户确认」「待后端拍板」「待 ask_user」放在正文里
-  - 黑名单字眼：「**或**」「**待定**」「**TBD**」「**可能**」「**应该是**」「**大概**」「**约**」「**大约**」「**暂定**」「**节选**」「**示例**」「**部分**」「**完整按 X 录入**」「**后续补全**」（在表达「我不确定 / 偷懒省略」的语义下出现一次都算违规）
-  - 行号区间也算违规：「**约 `4869-5250` 段**」❌——`约` 是「我不确定」信号、行号都打不准就别写区间；要写就 grep 准确给（`recordModal.vue:4869-4881`）、不知道精确范围就**只写文件路径不带行号**
+  - 「待用户确认」「待后端拍板」「待 ask_user」放在正文里（写到 §6 待澄清段 OK）
+  - 模糊行号：「**约 `4869-5250` 段**」❌——`约` 是「我不确定」信号、行号都打不准就别写区间；要写就 grep 准确给（`recordModal.vue:4869-4881`）、不知道精确范围就**只写文件路径不带行号**
   - **特别注意「节选 / 示例」类偷懒**：用户已经在 contextDocs 里粘贴了完整内容（如完整三级原因枚举表）、agent 自己在 plan 里只写「节选」「示例」「完整按 wiki 录入」——这是把活推给 build agent / 用户、**不算 plan 拍板**。正确做法：要么**全列**（即使 30 行表也照列、plan 拍板就要保真）、要么**完全不列**只指向 contextDocs 原文「详见 contextDocs §X」、不准中间态
   - **正确做法**：发现不确定 → **立刻调 ask_user 列具体选项**给用户拍 → 用户答完再写 artifact、写到 artifact 时**只写拍板结果 + 紧跟 `> ✅ ask_user 已确认：xxx` 留痕**、不要把过程中的不确定也带进来
   - **如果用户答「你定」/ deferred**：按 default 走 + **在 artifact 写明确的 default 选择**（不是写「或」）+ 在 §6 待澄清列原 Q
-  - **反例**（V0.5.6.3 用户实测踩坑）：
-    ```text
-    ❌ | promoteStatus（或 isMakeUp 同字段）| 已补升 / 未补升 | 用户拍板用中文；展示在跟进记录 |
-    ❌ | promoteReason + 一/二/三级原因字段 | 与原因枚举一致 | 仅「未补升」时必填；枚举来源见 §6 |
-    ```
-    → agent 自己知道有歧义（「或」是信号）、却没 ask_user 拍板、把不确定推给用户 ack——本职失职
-  - **正确做法**：先 ask_user 「字段叫 promoteStatus（新增独立字段）还是复用 isMakeUp？枚举值是中文还是英文？」、用户答完才写 artifact
 - **「§6 待澄清 / 不确定项」段**：只放 ask_user 用户没答（deferred）/ 答了「你定」按 default 走的、不是「待 ack 拍」的清单（ack 时该拍的已经在 §1/§2/§4/§5 内联 `✅ ask_user 已确认` 留痕）
 - **不复述 PRD**：plan 不是 PRD 的副本——业务背景 / 验收标准 / 大段叙述性原文**不要从 PRD 复制粘贴**到 plan 里。build agent 接 plan 时 SDK Run 上下文里 PRD 原文还在、用得到就现查。plan 只放「AI 的判断 / 用户的拍板 / 改动清单 / task 拆分」这种独有信息
 - **保真但精简**：枚举对照表 / 状态机 / 接口字段语义这类「具体到几行表格的关键信息」要保真列出来；纯背景叙述别搬
-- **⛔ 不省略业务名词 / task name**（V0.5.6.4 加）——表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写。用户审 plan 时第一次看到「学情 / 关单」根本反应不过来是哪两个 task、需要回去对照前文。反例：「学情 / 关单可不展示」❌ → 正例：「补升学情反馈 / 补升冲刺关单可不展示」✅；反例：「关单弹窗仅跟进方式+备注」❌ → 正例：「补升冲刺关单弹窗仅跟进方式+备注」✅
-- **角色视角**（V0.4）：你是 `{{roleLabel}}`、本 phase 只服务于「本角色 + 本仓库（{{repoPath}}）要改什么」、其他角色的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨角色边界相关时才碰
-- **写完 artifact + ask_user → 直接调 wait_for_user**：不要在 assistant_message 里说「我写完了你看下」之类的废话、用户在看板 UI 上看到「Phase 1 完成、等你确认」就够
+- **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
+- **角色视角**：你是 `{{roleLabel}}`、本 action 只服务于「本角色 + 本仓库（{{repoPath}}）要改什么」、其他角色的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨角色边界相关时才碰
+- **写完 artifact + ask_user → 直接调 wait_for_user**：不要在 assistant_message 里说「我写完了你看下」之类的废话

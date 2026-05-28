@@ -1,46 +1,38 @@
 /**
- * POST /api/tasks/[id]/ask-reply（V0.3.2 一次打包问题、modal 形态、V0.5.6 加 deferred）
+ * POST /api/tasks/[id]/ask-reply（V0.6：phase → actionId、走 task-runner）
  *
- * V0.3.2 改造（用户拍板）：
- *   - 一次 ask_user 调用 = 一组问题 questions[]
- *   - UI modal 弹窗一次性答完所有问题、提交时 body 携带 answers[]
- *   - 拼接成 markdown Q&A 文本传给 agent、batch 落 contextDocs
+ * V0.3.2 引入：一次 ask_user 调用 = 一组问题 questions[]、UI modal 一次性答完所有问题
+ * V0.5.6 引入：deferred、用户可点「稍后再补充」、答案数组可空
+ * V0.6 改造：所有 phase 字段改 actionId、publishChatStreamEvent → publishTaskStreamEvent
  *
- * V0.5.6 改造（用户拍板：ask_user 无次数上限 + 加「稍后再补充」）：
- *   - 用户点弹窗「稍后再补充」时、body 多带 deferred:true、answers 可以为空
- *   - 服务端拼成 `[ASK_USER_REPLY deferred] ...` 头给 agent、agent 跳过这组 Q
- *   - 没了「初稿阶段最多 1 次 ask_user」上限——agent 按内容收敛、可多次调
+ * # Body
  *
- * Body: { askId: string; answers: Array<{ questionId, answer, optionId? }>; deferred?: boolean }
- *   - askId：对应 ask_user_request 事件的 askId
- *   - answers：每条问题的回答、跟 ask_user_request meta.questions 一一对应
- *     deferred=true 时 answers 可以为空（用户选择不答）
- *   - deferred：true 表示用户选择稍后再补充、agent 走 default、不重复问
+ * ```
+ * {
+ *   askId: string;
+ *   answers: Array<{ questionId, answer, optionId? }>;
+ *   deferred?: boolean;
+ * }
+ * ```
  *
- * 行为：
- *   1. 校验 task / askId / 没被答过 / pending 状态
- *   2. 拼接 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] markdown 文本
- *   3. submitAskReply(taskId, replyText) resolve agent
- *   4. 写 ask_user_reply 事件、meta 带 askId + answers + deferred + text 是拼接结果
+ * # 行为
  *
- * V0.3.3 改造（用户拍板：砍数据冗余）：
- *   - Q&A 不再单独 addContextDoc——之前每条 Q&A 写一条 contextDoc title=`Q: 问题`
- *     导致 ContextDocsPanel 被撑爆、且和 phase 1 artifact 正文内联的 `> ✅ ask_user 已确认：xxx` 备注（V0.5.6.1）重复
- *   - 现在单一数据源 = 01-plan.md artifact（agent 在 phase 1 prompt 教导下整理 Q&A 进 artifact）
- *   - 后续 phase 查重不再看 contextDocs、改 read 01-plan.md（V0.3.4 起 context 合进 plan）
+ * 1. 校验 task / askId / 没被答过 / pending 状态
+ * 2. 拼接 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] markdown 文本
+ * 3. submitAskReply 解 agent 的 ask_user
+ * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred）+ publish SSE
+ * 5. 切 runStatus = running
  */
 
 import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
+import { appendEvent, getTask, setTaskRunStatus } from "@/lib/server/task-fs";
+import { hasPending, submitAskReply } from "@/lib/server/chat-mcp";
+import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import {
-  appendEvent,
-  getTask,
-  patchPhase,
-} from "@/lib/server/task-fs";
-import {
-  hasPending,
-  submitAskReply,
-} from "@/lib/server/chat-mcp";
-import { publishChatStreamEvent } from "@/lib/server/chat-runner";
+  errorResponse,
+  KEEPALIVE_RACE_RETRY_MS,
+  sleep,
+} from "@/lib/server/route-helpers";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -55,26 +47,11 @@ interface AnswerPayload {
 interface PostBody {
   askId?: string;
   answers?: AnswerPayload[];
-  // V0.5.6：用户点「稍后再补充」时为 true、answers 可以为空、服务端拼 deferred 头
   deferred?: boolean;
 }
 
-const errorResponse = (message: string, status = 400) =>
-  new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-
 export const runtime = "nodejs";
 
-// hasPending 瞬时 false 时 200ms 后再查一次（细节见 chat-reply/route.ts 同名常量注释）
-// V0.3.5 shell + curl long-poll 下 race 窗口已大幅缩小、仍保留作防御
-const KEEPALIVE_RACE_RETRY_MS = 200;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-// 解析 ask_user_request 事件 meta、抠出 questions 数组
-// meta 不规整时返 []、上层会拒错
 const extractQuestionsFromMeta = (
   meta: Record<string, unknown> | undefined,
 ): AskUserQuestion[] => {
@@ -98,24 +75,18 @@ const extractQuestionsFromMeta = (
       id: m.id,
       question: m.question,
       options: options.length > 0 ? options : undefined,
-      allowText:
-        typeof m.allowText === "boolean" ? m.allowText : true,
+      allowText: typeof m.allowText === "boolean" ? m.allowText : true,
     });
   }
   return out;
 };
 
-// 把每条 Q&A 拼成 markdown 给 agent
-// 加 [ASK_USER_REPLY] 头部（或 V0.5.6 deferred 模式的 [ASK_USER_REPLY deferred]）
-// agent prompt 教它认这两个头、按头切不同处理路径
 const buildReplyText = (
   questions: AskUserQuestion[],
   answers: AskUserAnswer[],
   deferred: boolean,
 ): string => {
   if (deferred) {
-    // 用户选「稍后再补充」——agent 跳过这组 Q、走 default、把问题列进 artifact §6 待澄清
-    // 把全部 Q 列出来让 agent 知道要写进 artifact 哪些「待澄清」项
     const sections: string[] = [
       "[ASK_USER_REPLY deferred]",
       "",
@@ -152,12 +123,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const askId = (body.askId ?? "").trim();
   const rawAnswers = body.answers;
-  // V0.5.6：deferred=true 表示用户选「稍后再补充」、answers 可以为空
   const deferred = body.deferred === true;
 
   if (!askId) return errorResponse("askId 必填");
   if (!deferred) {
-    // 正常答题模式才校验 answers 非空 + 每条内容非空
     if (!Array.isArray(rawAnswers) || rawAnswers.length === 0) {
       return errorResponse("answers 必填、至少一条");
     }
@@ -185,7 +154,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // 找 askId 对应的 ask_user_request 事件
   const reqEvent = [...task.events]
     .reverse()
     .find(
@@ -212,9 +180,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse(`askId=${askId} 的 questions 元信息丢失、无法处理`, 500);
   }
 
-  // 校验 answers 覆盖所有 question（每条都得有）
-  // 用户在 modal 里答完才提交、缺哪条说明前端 bug、拒
-  // V0.5.6：deferred 模式跳过覆盖校验、用户明示不答
   if (!deferred) {
     const questionIds = new Set(questions.map((q) => q.id));
     for (const qid of questionIds) {
@@ -224,7 +189,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // hasPending 检测 + race 兜底
   let pending = hasPending(task.id);
   if (!pending) {
     await sleep(KEEPALIVE_RACE_RETRY_MS);
@@ -232,33 +196,34 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   if (!pending) {
-    if (task.status === "awaiting_user" || task.status === "running") {
+    if (task.runStatus === "awaiting_user" || task.runStatus === "running") {
       console.warn(
-        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 status=${task.status}、当场标 failed`,
+        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
       );
       const errorTask = await appendEvent(task.id, {
         kind: "error",
-        text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。请重启该任务。",
+        actionId: reqEvent.actionId,
+        text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。请点「推进」起新 agent。",
       });
       if (errorTask) {
         const lastEvent = errorTask.events[errorTask.events.length - 1];
         if (lastEvent) {
-          publishChatStreamEvent(task.id, { kind: "event", event: lastEvent });
+          publishTaskStreamEvent(task.id, { kind: "event", event: lastEvent });
         }
       }
-      const failedTask = await patchPhase(task.id, { taskStatus: "failed" });
+      const failedTask = await setTaskRunStatus(task.id, "error");
       if (failedTask) {
-        publishChatStreamEvent(task.id, { kind: "task", task: failedTask });
-        publishChatStreamEvent(task.id, {
+        publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
+        publishTaskStreamEvent(task.id, {
           kind: "done",
           task: failedTask,
           ok: false,
         });
       }
-      return errorResponse("agent 已断开、请重启任务", 410);
+      return errorResponse("agent 已断开、请点「推进」起新 agent", 410);
     }
     return errorResponse(
-      `agent 当前没在等问答（task.status=${task.status}）`,
+      `agent 当前没在等问答（task.runStatus=${task.runStatus}）`,
       409,
     );
   }
@@ -267,15 +232,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
     `[ask-reply] task=${task.id} askId=${askId} answers=${answers.length}/${questions.length} deferred=${deferred}`,
   );
 
-  // 拼好 reply text、agent 看到 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] 头解析
   const replyText = buildReplyText(questions, answers, deferred);
 
-  // 1) 写 ask_user_reply 事件（用户视角先看到自己的答案落事件流）
-  // text 用拼好的 replyText（也可以只放精简版、但拼好的能直接当回放看）
-  const phase = reqEvent.phase;
+  const actionId = reqEvent.actionId;
   const replyTask = await appendEvent(task.id, {
     kind: "ask_user_reply",
-    phase,
+    actionId,
     text: replyText,
     meta: {
       askId,
@@ -286,11 +248,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (replyTask) {
     const lastEvent = replyTask.events[replyTask.events.length - 1];
     if (lastEvent) {
-      publishChatStreamEvent(task.id, { kind: "event", event: lastEvent });
+      publishTaskStreamEvent(task.id, { kind: "event", event: lastEvent });
     }
   }
 
-  // 2) resolve agent 的 ask_user
   const ok = submitAskReply(task.id, replyText);
   if (!ok) {
     return errorResponse(
@@ -299,12 +260,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // 3) 切 running
-  const updated = await patchPhase(task.id, { taskStatus: "running" });
-  if (updated) publishChatStreamEvent(task.id, { kind: "task", task: updated });
-
-  // V0.3.3：Q&A 不再单独 addContextDoc——agent 在 phase 1 prompt 教导下会把答案整理进
-  // 01-plan.md 正文内联的 `> ✅ ask_user 已确认：xxx` 备注（V0.5.6.1）、单一数据源、UI 面板不再被 Q 撑爆
+  const updated = await setTaskRunStatus(task.id, "running");
+  if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 
   return new Response(
     JSON.stringify({ ok: true, task: updated ?? task }),

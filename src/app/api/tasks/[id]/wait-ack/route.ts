@@ -29,7 +29,7 @@
  *
  * - **token 不合法**：写一行 `[INVALID_TOKEN]\n` + end、curl exit 0、agent 看到 INVALID_TOKEN 自然结束 run
  * - **客户端断开（curl exit / max-time / 网络断）**：abort signal 触发、清 keepalive timer + close stream
- *   - **不清 pendingMap entry**：entry 留着、用户在 UI 点「推进 → 让原 agent 继续」走 /start-workflow（mode=resume）复用
+ *   - **不清 pendingMap entry**：entry 留着、用户在 UI 点「推进 → 让原 agent 继续」走 /api/tasks/[id]/advance（mode=resume）复用
  * - **服务端进程重启**：pendingMap 内存丢、cold-start recovery 标 failed、UI 引导用户重新启动 task
  */
 

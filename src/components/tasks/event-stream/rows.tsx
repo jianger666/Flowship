@@ -24,8 +24,8 @@ import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
 import { buildCursorLink, pathBasename } from "@/lib/path-utils";
-import { PHASE_LABEL_SHORT } from "@/lib/task-display";
-import type { Task, TaskEvent } from "@/lib/types";
+import { ACTION_LABEL_SHORT } from "@/lib/task-display";
+import type { ActionType, Task, TaskEvent } from "@/lib/types";
 
 import {
   DEFAULT_EXPANDED_KINDS,
@@ -106,10 +106,17 @@ export const StreamingAssistantRow = memo(StreamingAssistantRowImpl);
 const EventRowImpl = ({
   ev,
   taskId,
+  task,
 }: {
   ev: TaskEvent;
   taskId: string;
+  task: Task;
 }) => {
+  // V0.6：用 actionId 查 action 类型、渲染 tag
+  const action = ev.actionId
+    ? task.actions.find((a) => a.id === ev.actionId)
+    : undefined;
+  const actionType: ActionType | undefined = action?.type;
   const isUser = ev.kind === "user_reply";
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
@@ -174,9 +181,9 @@ const EventRowImpl = ({
           ) : (
             <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
           )}
-          {ev.phase && (
+          {actionType && (
             <span className="rounded bg-muted/60 px-1 py-0.5 text-[10px] tracking-wide text-muted-foreground">
-              {PHASE_LABEL_SHORT[ev.phase]}
+              {ACTION_LABEL_SHORT[actionType]}
             </span>
           )}
           <span className="text-muted-foreground/70 text-[10px]">

@@ -112,15 +112,16 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
             {repos.map((r) => (
               <div
                 key={r.path}
-                className="flex items-center gap-3 rounded-lg border bg-card/50 px-3 py-2"
+                className="flex flex-wrap items-center gap-2 rounded-lg border bg-card/50 px-3 py-2"
               >
                 <Input
                   value={r.name}
                   onChange={(e) => renameRepo(r.path, e.target.value)}
                   onBlur={(e) => onRenameBlur(r.path, e.target.value)}
-                  className="w-40"
+                  className="w-40 shrink-0"
+                  placeholder="仓库名"
                 />
-                <code className="flex-1 min-w-0 text-xs text-muted-foreground font-mono truncate">
+                <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
                   {r.path}
                 </code>
                 <Button

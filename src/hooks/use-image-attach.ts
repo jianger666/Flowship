@@ -27,7 +27,7 @@
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 
-import type { ChatReplyImage } from "@/lib/task-store";
+import type { ImagePayload } from "@/lib/task-store";
 
 // 图片白名单（跟后端 task-fs.ts 的 ALLOWED_IMAGE_MIME 保持一致）
 const DEFAULT_ALLOWED_MIMES = new Set([
@@ -91,7 +91,7 @@ export interface UseImageAttachReturn {
   onFileInputChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
 
   // 序列化成上传协议、给 fetch body 用、空列表返 undefined
-  toUploadPayload: () => ChatReplyImage[] | undefined;
+  toUploadPayload: () => ImagePayload[] | undefined;
 }
 
 // FileReader.readAsDataURL Promise 化、解出 dataUrl
@@ -241,7 +241,7 @@ export const useImageAttach = (
     e.target.value = "";
   };
 
-  const toUploadPayload = (): ChatReplyImage[] | undefined => {
+  const toUploadPayload = (): ImagePayload[] | undefined => {
     if (images.length === 0) return undefined;
     return images.map((p) => ({
       data: p.data,

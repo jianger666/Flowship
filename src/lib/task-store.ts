@@ -1,31 +1,29 @@
 /**
- * 客户端任务存取（V1·走 /api/tasks/* + 服务端 fs）
+ * 客户端任务存取（V0.6 重构）
  *
- * 历史包袱：早期版本走 localStorage、为了零依赖 / 调试方便。
- * 切到 fs 是因为：
- *  - localStorage 单 key 5MB 上限
- *  - 跨标签页 / 重启浏览器都不丢
- *  - 文件可以人 cat / git diff / 编辑器开
+ * 这层只做 fetch + 错误归一、不带状态机逻辑（那归 task-fs.ts / task-runner.ts）。
  *
- * 这层只做 fetch + 错误归一、不带任何状态机逻辑（那归 task-fs.ts）。
- *
- * 接口设计：所有函数返回 Promise；调用方负责 try/catch + toast。
+ * V0.5 → V0.6 主要变化：
+ * - `startWorkflow` / `sendChatReply` 合并为 `advanceTask`（按 actionType 切分支）
+ * - `submitPhaseAck` → `submitActionAck`（参数 phase → actionId）
+ * - `fetchArtifactRevisions` / `fetchArtifactDiff` → `fetchActionRevisions` / `fetchActionDiff`
+ * - `watchChatStream` → `watchTaskStream`（路由 watch-chat → watch-task）
+ * - `appendEvent` 入参 phase → actionId
+ * - 新增 `finalizeTask`（用户标 task 终态）
  */
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import type {
+  ActionRecord,
+  ActionType,
   ArtifactRevision,
   AskUserAnswer,
+  EventKind,
   NewTaskInput,
-  PhaseId,
   Task,
   TaskEvent,
   TaskSummary,
 } from "./types";
-
-// V0.5.3：原来的 `FEISHU_WORKFLOW_NEXT_PHASE` 静态表已删——
-// 它只有定义、没人 import（漏网死代码）；下一 phase 计算改走 `getNextPhase(workflowDef, current)`
-// helper（在 types.ts、跟 WORKFLOWS 同源、扩 phase 时只需改 workflow.phases）
 
 /**
  * 从设置页存的 mcpServersJson 字符串解析出 SDK 能直接用的 mcpServers 对象
@@ -34,8 +32,6 @@ import type {
  *   - 空串 / undefined → undefined（agent 不接 MCP）
  *   - 必须带外层 `mcpServers` wrapper（与 Cursor IDE ~/.cursor/mcp.json 一致）
  *   - 不深校验单 server schema、留给 SDK 报错（更准）
- *
- * 失败场景统一抛 Error、由调用方 toast 出去
  */
 export const parseMcpServers = (
   json: string | undefined,
@@ -81,8 +77,6 @@ const handleJson = async <T>(res: Response): Promise<T> => {
 
 // ----------------- 列表 / 详情 -----------------
 
-// V0.5.3：列表返 TaskSummary[]（不含 events / phases.artifact 内容）、首页提速核心
-// 详情页用 fetchTask 拿完整 Task
 export const fetchTasks = async (): Promise<TaskSummary[]> => {
   const res = await fetch("/api/tasks", { cache: "no-store" });
   const data = await handleJson<{ tasks: TaskSummary[] }>(res);
@@ -98,7 +92,7 @@ export const fetchTask = async (id: string): Promise<Task | null> => {
   return data.task;
 };
 
-// ----------------- 创建 / 删除 -----------------
+// ----------------- 创建 / 删除 / 配置 patch -----------------
 
 export const createTask = async (input: NewTaskInput): Promise<Task> => {
   const res = await fetch("/api/tasks", {
@@ -132,11 +126,6 @@ export const setTaskArchived = async (
   return data.task;
 };
 
-/**
- * 更新任务级 MCP 黑名单
- *
- * @param disabled 禁用的 server 名列表；null 或空数组 = 全开
- */
 export const setTaskDisabledMcpServers = async (
   id: string,
   disabled: string[] | null,
@@ -150,14 +139,6 @@ export const setTaskDisabledMcpServers = async (
   return data.task;
 };
 
-/**
- * V0.5.10：更新任务级 UI 布局偏好（resizable 分栏拖完 → debounce 500ms 写）
- *
- * @param uiLayout 布局偏好；null = 清空回默认（极少用、保留口子）
- *
- * - 不返完整 task：拖动期间高频 PATCH、前端 state 已是源头、不需要 round-trip 全量
- * - 服务端约束 artifactPanelSize ∈ [10, 90]、超出会被 clamp（防前端 bug 写出 -1 / 200）
- */
 export const setTaskUiLayout = async (
   id: string,
   uiLayout: { artifactPanelSize?: number } | null,
@@ -172,9 +153,6 @@ export const setTaskUiLayout = async (
 
 /**
  * 按 task.disabledMcpServers 过滤全量 mcpServers
- *
- * 用在 sendChatReply / startWorkflow 调用前：UI 拿全量 mcpServers（从 settings 解析）、
- * 这里按任务黑名单过掉、再传给后端 SDK。
  *
  * - servers undefined：返 undefined（无 MCP 走）
  * - disabled undefined / 空：返原 servers
@@ -196,21 +174,10 @@ export const filterMcpServersByTask = (
 // ----------------- 事件 / 状态推进 -----------------
 
 interface AppendEventInput {
-  kind: TaskEvent["kind"];
-  phase?: PhaseId;
+  kind: EventKind;
+  actionId?: string;
   text: string;
   meta?: Record<string, unknown>;
-  // 可选：在追加事件的同时推进 phase / task 状态（atomic）
-  // - phaseId + status 成对出现：改对应 phase 状态
-  // - taskStatus：改顶层任务状态
-  // - currentPhase：切当前 phase
-  // 三组按需组合、不传就只追加事件
-  patch?: {
-    phaseId?: PhaseId;
-    status?: "pending" | "running" | "awaiting_ack" | "ack" | "failed";
-    taskStatus?: "draft" | "running" | "awaiting_user" | "completed" | "failed";
-    currentPhase?: PhaseId;
-  };
 }
 
 export const appendEvent = async (
@@ -229,22 +196,26 @@ export const appendEvent = async (
   return data.task;
 };
 
-// ----------------- SSE 工具（plan / chat 共用） -----------------
+// ----------------- SSE 工具（V0.6 统一任务事件流） -----------------
 
 interface SSEEnvelope {
-  type: "event" | "artifact" | "task" | "done" | "error" | "assistant_delta";
+  type:
+    | "event"
+    | "artifact"
+    | "task"
+    | "action"
+    | "done"
+    | "error"
+    | "assistant_delta";
   event?: TaskEvent;
   content?: string;
   task?: Task;
+  action?: ActionRecord;
   ok?: boolean;
   message?: string;
-  // assistant_delta 帧带的字段：流式 chunk 文本
-  // 前端拼到 streamingText、收到 event(assistant_message) 时清空
   text?: string;
 }
 
-// SSE 解析：每条消息以 \n\n 结尾、消息内 data: 行的 payload 是 JSON
-// 一条消息可以有多行 data: ... 我们走单行简化（后端也只发单行）
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
   const dataLines = frame
     .split("\n")
@@ -259,39 +230,38 @@ const parseSseEvent = (frame: string): SSEEnvelope | null => {
   }
 };
 
-// ----------------- Chat / Workflow 共享 SSE 订阅 -----------------
-
 /**
- * 订阅 chat 任务的事件流（GET SSE）
+ * 订阅 task 事件流（GET SSE）
  *
- * 协议：
+ * 协议（V0.6）：
  *   - 进来先收一帧 task + 全部历史 events（bootstrap）
- *   - 然后实时推增量事件 / task 变化
+ *   - 然后实时推增量事件 / task 变化 / action 状态变化
  *   - 任务终止 → 收一帧 done、流自动关闭
  *
- * 任意时刻可调（任务还没启动也行、就只 push 当前 task 然后挂着）。
+ * 任意时刻可调（task idle 也行、就只 push 当前 task 然后挂着）。
  * 多个 tab 同时 watch 都行、互不干扰。
- *
- * 返回 Promise 在「流结束」时 resolve（agent 终止 / 客户端 abort）。
  */
-export interface ChatStreamCallbacks {
+export interface TaskStreamCallbacks {
   onEvent?: (ev: TaskEvent) => void;
   onTaskUpdate?: (task: Task) => void;
+  onActionUpdate?: (action: ActionRecord) => void;
   onDone?: (task: Task, ok: boolean) => void;
   onError?: (message: string) => void;
-  // 流式 chunk 推送、UI 拼接展示打字效果
-  // 服务端在每个 SDK assistant chunk 到达时 publish 一次、内容是「新增」chunk（非全量）
-  // 上层维护「当前 streaming text」、收到本回调时累加、收到 onEvent(assistant_message) 时清空
+  /**
+   * 流式 chunk 推送、UI 拼接展示打字效果
+   * 服务端在每个 SDK assistant chunk 到达时 publish 一次、内容是「新增」chunk
+   * 上层维护「当前 streaming text」、收到本回调时累加、收到 onEvent(assistant_message) 时清空
+   */
   onAssistantDelta?: (text: string) => void;
 }
 
-export const watchChatStream = async (
+export const watchTaskStream = async (
   taskId: string,
-  callbacks: ChatStreamCallbacks = {},
+  callbacks: TaskStreamCallbacks = {},
   signal?: AbortSignal,
 ): Promise<void> => {
   const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/watch-chat`,
+    `/api/tasks/${encodeURIComponent(taskId)}/watch-task`,
     {
       method: "GET",
       headers: { Accept: "text/event-stream" },
@@ -327,16 +297,20 @@ export const watchChatStream = async (
         buffer = buffer.slice(sepIdx + 2);
         const env = parseSseEvent(frame);
         if (env) {
-          // chat 协议不发 artifact、复用 dispatch 时忽略它
           if (env.type === "event" && env.event) {
             callbacks.onEvent?.(env.event);
           } else if (env.type === "task" && env.task) {
             callbacks.onTaskUpdate?.(env.task);
+          } else if (env.type === "action" && env.action) {
+            callbacks.onActionUpdate?.(env.action);
           } else if (env.type === "done" && env.task) {
             callbacks.onDone?.(env.task, !!env.ok);
           } else if (env.type === "error") {
             callbacks.onError?.(env.message ?? "未知错误");
-          } else if (env.type === "assistant_delta" && typeof env.text === "string") {
+          } else if (
+            env.type === "assistant_delta" &&
+            typeof env.text === "string"
+          ) {
             callbacks.onAssistantDelta?.(env.text);
           }
         }
@@ -352,58 +326,86 @@ export const watchChatStream = async (
   }
 };
 
-// 附图入参：前端通过 FileReader 读出 base64、跟 mimeType / filename 一起 POST
-export interface ChatReplyImage {
-  // 纯 base64 字符串（不带 data: 前缀、调用方自己 strip）
-  data: string;
+// ----------------- 图片附件入参 -----------------
+
+export interface ImagePayload {
+  data: string; // 纯 base64
   mimeType: string;
-  // 原始文件名（UI 显示用、可选）
   filename?: string;
 }
 
+// ----------------- V0.6 推进 / ack / 终态 -----------------
+
 /**
- * V0.4 chat 自由化：发消息时给后端的「自动启动 agent」配置
+ * V0.6 task 启动 / 续接 时所需的「最小启动参数」
  *
- * task.status ∈ {draft, completed, failed} 时、chat-reply 路由会：
- *   1. 写 user_reply 事件
- *   2. 用 bootArgs 启 agent
- *   3. 把这条消息塞进 agent 第一次 wait_for_user
+ * - task.runStatus 是 idle/error 时、advance 路由用这套参数启 / 重启 SDK Agent
+ * - task.runStatus 是 awaiting_user 时（已有活 agent）、agent 内部直接吃 [NEXT_ACTION ...]、不重启
  *
- * task.status === awaiting_user 时这个字段可省（agent 在跑、不需要重新启动）。
- * 调用方为简化逻辑、可以**永远传 bootArgs**、后端按需取用。
+ * UI 调用方一律传 bootArgs、后端按需取用。
  */
-export interface ChatReplyBootArgs {
+export interface TaskBootArgs {
   apiKey: string;
   model: ModelSelection;
   mcpServers?: Record<string, McpServerConfig>;
 }
 
 /**
- * 给 chat agent 发一条用户消息（V0.4 起兼具「自动启动」职责）
+ * V0.6 推进 task：用户选 action + 写指令 + 点推进
  *
- * @param text         用户消息文本（可为空、但 images / attachments 至少有一个）
- * @param images       可选附图、由后端校验白名单 / size、落盘 + 把绝对路径塞给 wait_for_user
- * @param attachments  可选附路径（文件 / 目录绝对路径数组、来自 FsPickerDialog）、由后端校验存在 +
- *                     拼成 `[ATTACHED_PATHS]` 段塞给 wait_for_user、agent 用 `read` 工具自己读
- * @param bootArgs     V0.4：终态发消息时用来启 agent（apiKey/model/mcpServers）
- *                     调用方建议无脑传、后端自己判断要不要启动
+ * 行为：
+ * 1. 后端 appendAction、`runStatus → running` / `currentActionId → 新 action.id`
+ * 2. 准入条件检查（V0.6 门槛 1）
+ * 3. branch checkout（build 第一次跑前）
+ * 4. 启 / resume / fork SDK Agent（由 task-runner 决定）
+ * 5. 返回新建的 action
  *
- * 后端语义（详见 chat-reply route 顶部注释）：
- *   - awaiting_user → 走 submitUserMessage（正常对话回合）
- *   - draft/completed/failed → 走自动启动 + 投递首条（V0.4 自由化）
+ * @param actionType   选的 action 类型（plan / build / review / ship / test / learn）
+ * @param userInstruction 用户在 textarea 写的指令（首次 plan 可空）
+ * @param bootArgs     启 agent 用的参数（必传）
+ * @param forceNewAgent UI 高级选项「换新 agent」勾选时为 true
+ * @param agentModel   推进 dialog 高级选项里切的模型（不传沿用 task.model）
+ */
+export interface AdvanceTaskInput {
+  actionType: ActionType;
+  userInstruction: string;
+  bootArgs: TaskBootArgs;
+  forceNewAgent?: boolean;
+  agentModel?: ModelSelection;
+}
+
+export const advanceTask = async (
+  taskId: string,
+  input: AdvanceTaskInput,
+): Promise<{ task: Task; action: ActionRecord }> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/advance`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    },
+  );
+  return await handleJson<{ ok: true; task: Task; action: ActionRecord }>(res);
+};
+
+/**
+ * V0.6.0.1 chat 模式：用户在 ChatView 输入框发一条消息
  *
- * 失败语义：
- *   - HTTP 4xx：参数错 / 终态发消息但没传 bootArgs / 图片或路径校验失败
- *   - HTTP 409：状态冲突（如终态但 agent run 还残留）
- *   - HTTP 410：僵尸态、agent 已断开
- *   - 调用方 catch 后用 toast 提示
+ * 后端语义（详见 /chat-reply route 顶部注释）：
+ *   - awaiting_user + hasPending → submitUserMessage（正常对话循环）
+ *   - idle / error / 上一轮 completed → bootArgs 启 chat agent + 投递首条
+ *
+ * 调用方简化：无脑传 bootArgs、后端按需取用。
+ *
+ * images / bootArgs 类型直接复用 ImagePayload / TaskBootArgs、避免重复定义。
  */
 export const sendChatReply = async (
   taskId: string,
   text: string,
-  images?: ChatReplyImage[],
+  images?: ImagePayload[],
   attachments?: string[],
-  bootArgs?: ChatReplyBootArgs,
+  bootArgs?: TaskBootArgs,
 ): Promise<{ task: Task; autoStarted: boolean }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
@@ -427,114 +429,44 @@ export const sendChatReply = async (
   return { task: data.task, autoStarted: !!data.autoStarted };
 };
 
-// ----------------- Plan workflow（V0.2） -----------------
-
 /**
- * V0.5.7：plan workflow 统一推进入口（一次 SDK Run 跑全程 3 phase：plan → build → review）
+ * V0.6 ack 当前 action（approve / revise）
  *
- * 三种推进模式（mode）：
- *   - resume  : Agent.resume(lastAgentId) 续接旧 agent、保留对话历史
- *               backend 拒（NGHTTP2_ENHANCE_YOUR_CALM）时 plan-runner 内部自动降级 fork
- *   - fork    : Agent.create 新 agent + super-prompt 顶部 fork banner、从 fromPhase 起跑
- *               fromPhase 必填、上游 artifact 复用
- *   - restart : Agent.create 新 agent 从 plan 重头跑（覆盖所有 artifact）
- *
- * mode 必填（V0.5.12.2 起、删了之前的「缺省 = restart」兼容）。
- *
- * 行为：幂等、立即返回 task；已 spawn 则返 already=true。SSE 订阅走 watchChatStream（路由复用）。
- *
- * 历史：V0.5.7 之前分两个函数 startWorkflow（restart）+ resumeWaiting（resume）、UI 上呈现为
- * 两个按钮「重启 workflow」+ 「继续监听」、用户视角混乱。V0.5.7 合并为单一入口、UI 上由
- * AdvanceDialog 让用户在 resume / fork / restart 之间选。
+ * @param decision approve：用户「通过」、agent 推进等下一 action 指令
+ *                 revise：用户「再聊聊」、agent 按 V0.5.10 二分类铁则处理
+ * @param feedback revise 时的反馈文本（带 images 时可空）、approve 时忽略
+ * @param images   revise 时携带图片附件（用户截图说改这里）
+ * @param forceNewAgent approve 时勾选「换新 agent」、起新 Agent 走下一 action
+ * @param agentModel    approve 时切模型（隐含 forceNewAgent=true）
+ * @param bootArgs      forceNewAgent / agentModel 提供时必填
  */
-export type StartWorkflowMode = "resume" | "fork" | "restart";
-
-export interface StartWorkflowOptions {
-  mode: StartWorkflowMode;
-  fromPhase?: PhaseId;
-  // V0.5.7.1：fork 时用户填的「想修什么 / 重启原因」、透传到 plan-runner 的 forkBanner、
-  // 让 AI fork 同 phase 时知道这次是 fix 模式、读 git diff + reason 增量改、不 rewrite。
-  // 留空 = 用户没明说（多见于「上次跑挂了重启」场景）、AI 自己看 git diff 决定
-  reason?: string;
+export interface ActionAckOptions {
+  feedback?: string;
+  images?: ImagePayload[];
+  forceNewAgent?: boolean;
+  agentModel?: ModelSelection;
+  bootArgs?: TaskBootArgs;
 }
 
-export const startWorkflow = async (
+export const submitActionAck = async (
   taskId: string,
-  apiKey: string,
-  model: ModelSelection,
-  mcpServers: Record<string, McpServerConfig> | undefined,
-  options: StartWorkflowOptions,
-): Promise<{ task: Task; already: boolean }> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/start-workflow`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        apiKey,
-        model,
-        mcpServers,
-        mode: options.mode,
-        fromPhase: options.fromPhase,
-        reason: options.reason,
-      }),
-    },
-  );
-  return await handleJson<{ ok: true; task: Task; already: boolean }>(res);
-};
-
-
-/**
- * V0.5 phase-ack 选项（approve 时可选用）
- *
- * 默认：旧 agent 继续跑下一 phase（同一 SDK Run、不再计费）。
- *
- * 用户主动选「换新 agent」/「切模型」时：
- *   - forkAgent=true：cancel 旧 agent + 起一个新 Agent.create run（消耗 1 次新 send 配额）
- *   - nextModel 提供时隐含 forkAgent=true（旧 agent 已经用旧模型跑、模型不可中途切）
- *   - bootArgs 必填（apiKey + mcpServers 用于 Agent.create 新 agent）
- *
- * 默认值约定：UI 默认 forkAgent=false 且 nextModel 未传、即「同 agent 继续」
- */
-export interface PhaseAckForkOptions {
-  forkAgent?: boolean;
-  nextModel?: ModelSelection;
-  bootArgs?: {
-    apiKey: string;
-    mcpServers?: Record<string, McpServerConfig>;
-  };
-}
-
-/**
- * 用户在 plan 任务详情页点「通过」或「再聊聊」、把动作 ack 给阻塞中的 workflow agent
- *
- * @param action   approve / revise
- * @param feedback revise 文本（带 images 时可空、即「就改成这样」+ 截图）、approve 可空
- * @param phase    可选、防 race 用 currentPhase 兜底
- * @param fork     V0.5：approve 时可选「换新 agent / 切模型」、详见 PhaseAckForkOptions
- * @param images   V0.5.4：revise 可携带图片附件（用户截图说改这里）、approve 时忽略
- */
-export const submitPhaseAck = async (
-  taskId: string,
-  action: "approve" | "revise",
-  feedback?: string,
-  phase?: PhaseId,
-  fork?: PhaseAckForkOptions,
-  images?: ChatReplyImage[],
+  actionId: string,
+  decision: "approve" | "revise",
+  options?: ActionAckOptions,
 ): Promise<Task> => {
   const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/phase-ack`,
+    `/api/tasks/${encodeURIComponent(taskId)}/action-ack`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action,
-        feedback,
-        phase,
-        forkAgent: fork?.forkAgent,
-        nextModel: fork?.nextModel,
-        bootArgs: fork?.bootArgs,
-        images,
+        actionId,
+        decision,
+        feedback: options?.feedback,
+        images: options?.images,
+        forceNewAgent: options?.forceNewAgent,
+        agentModel: options?.agentModel,
+        bootArgs: options?.bootArgs,
       }),
     },
   );
@@ -542,35 +474,63 @@ export const submitPhaseAck = async (
   return data.task;
 };
 
-// ----------------- Context Docs（V0.3） -----------------
+/**
+ * V0.6 任务终态控制（用户在 ack dialog 选「合入」/「abandon」）
+ *
+ * - merged: 标 repoStatus=merged + write [TASK_DONE] + Agent 退出 + 可触发 learn
+ * - abandoned: write [TASK_ABANDONED] + Agent 自然退出 + cleanup
+ */
+export const finalizeTask = async (
+  taskId: string,
+  finalStatus: "merged" | "abandoned",
+): Promise<Task> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/finalize`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ finalStatus }),
+    },
+  );
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return data.task;
+};
+
+// ----------------- Context Docs（V0.3、V0.6.0.1 加 images）-----------------
 
 /**
- * 给任务加一条上下文文档（详情页面板里点「添加」时调）
+ * 加上下文文档
  *
- * 后端会按内容自动推断 type（url / path / text）、UI 不用手动选。
- * 成功返回最新 task、调用方刷新面板列表即可。
+ * 参数语义（后端校验同步、详见 /context-docs route）：
+ *   - title + content：主条目（type 由后端按内容推断）
+ *   - images：贴图（每张图作为独立 type=image doc 落盘）
+ *   - 至少一个非空、title 和 content 必须一起填或一起省略
  */
 export const addContextDoc = async (
   taskId: string,
-  input: { title: string; content: string },
+  input: {
+    title?: string;
+    content?: string;
+    images?: ImagePayload[];
+  },
 ): Promise<Task> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/context-docs`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
+      body: JSON.stringify({
+        title: input.title,
+        content: input.content,
+        images:
+          input.images && input.images.length > 0 ? input.images : undefined,
+      }),
     },
   );
   const data = await handleJson<{ ok: true; task: Task }>(res);
   return data.task;
 };
 
-/**
- * 删一条上下文文档
- *
- * idempotent：删一个不存在的 docId 也不报错、返回当前 task。
- */
 export const removeContextDoc = async (
   taskId: string,
   docId: string,
@@ -583,21 +543,8 @@ export const removeContextDoc = async (
   return data.task;
 };
 
-// ----------------- ask_user 回复（V0.3.2 + V0.5.6 deferred） -----------------
+// ----------------- ask_user 回复（V0.3.2 + V0.5.6 deferred、V0.6 不变） -----------------
 
-/**
- * 用户在 AskUserDialog 答完所有问题后提交答案
- *
- * 服务端：POST /api/tasks/[id]/ask-reply
- *   - 写 ask_user_reply 事件、resolve agent
- * 抽到 task-store 是为了让 ask-user-dialog 不直接裸 fetch、错误归一走 handleJson
- *
- * V0.5.6 deferred 模式（用户拍板）：
- *   - 用户点弹窗里「稍后再补充」→ 不答任何问题、传 deferred=true、answers 可以为空
- *   - 服务端把 reply 包装成 `[ASK_USER_REPLY deferred] ...` 头给 agent
- *   - agent 看到 deferred 头时跳过这一组 Q、按 default 推进、把问题写进 artifact §6 待澄清
- *   - 用户后续可以在「再聊聊」或上下文文档里补
- */
 export const submitAskReply = async (
   taskId: string,
   askId: string,
@@ -619,17 +566,14 @@ export const submitAskReply = async (
   return await handleJson<{ ok: true }>(res);
 };
 
-// ----------------- Artifact Revisions（V0.5.12） -----------------
+// ----------------- Action Revisions（V0.5.12 → V0.6 action 维度） -----------------
 
 /**
- * V0.5.12：拉某 phase 的修订历史 + 当前正文
- *
- * 用法：前端 artifact-panel 切 phase 时 fetch 一次、拿到 revisions 数组填 dropdown options、
- * 配 current.content 作为 diff 的 "to"。
+ * V0.6：拉某 action 的修订历史 + 当前正文
  */
-export const fetchArtifactRevisions = async (
+export const fetchActionRevisions = async (
   taskId: string,
-  phase: PhaseId,
+  actionId: string,
 ): Promise<{
   revisions: ArtifactRevision[];
   current: { content: string; filename: string } | null;
@@ -639,20 +583,20 @@ export const fetchArtifactRevisions = async (
     current: { content: string; filename: string } | null;
   }>(
     await fetch(
-      `/api/tasks/${encodeURIComponent(taskId)}/artifact-revisions?phase=${encodeURIComponent(phase)}`,
+      `/api/tasks/${encodeURIComponent(taskId)}/action-revisions?actionId=${encodeURIComponent(actionId)}`,
       { cache: "no-store" },
     ),
   );
 
 /**
- * V0.5.12：拉两个时刻的 artifact 正文做对比
+ * V0.6：拉两个时刻的 action artifact 正文做对比
  *
- * @param from  必填、revision timestamp（来自 fetchArtifactRevisions 返的 revisions[i].timestamp）
+ * @param from  必填、revision timestamp
  * @param to    可选、revision timestamp 或 "current"、默认 "current"
  */
-export const fetchArtifactDiff = async (
+export const fetchActionDiff = async (
   taskId: string,
-  phase: PhaseId,
+  actionId: string,
   from: number,
   to: number | "current" = "current",
 ): Promise<{
@@ -660,7 +604,7 @@ export const fetchArtifactDiff = async (
   to: { content: string; timestamp: number | null };
 }> => {
   const params = new URLSearchParams({
-    phase,
+    actionId,
     from: String(from),
     to: to === "current" ? "current" : String(to),
   });
@@ -669,7 +613,7 @@ export const fetchArtifactDiff = async (
     to: { content: string; timestamp: number | null };
   }>(
     await fetch(
-      `/api/tasks/${encodeURIComponent(taskId)}/artifact-diff?${params.toString()}`,
+      `/api/tasks/${encodeURIComponent(taskId)}/action-diff?${params.toString()}`,
       { cache: "no-store" },
     ),
   );

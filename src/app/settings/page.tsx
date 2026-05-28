@@ -34,6 +34,7 @@ import { ApiKeyCard } from "@/components/settings/api-key-card";
 import { ModelCard } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
+import { UserProfileCard } from "@/components/settings/user-profile-card";
 
 const SettingsPage = () => {
   const { settings, loaded, dirty, update, saveField } = useSettings();
@@ -70,6 +71,13 @@ const SettingsPage = () => {
         onSave={() => saveField("apiKey")}
         onValidate={fetchModels}
         validating={modelsLoading}
+      />
+
+      <UserProfileCard
+        username={settings.username ?? ""}
+        onChange={(v) => update("username", v)}
+        dirty={dirty.username}
+        onSave={() => saveField("username")}
       />
 
       <ModelCard

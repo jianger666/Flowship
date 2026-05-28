@@ -1,11 +1,13 @@
 "use client";
 
 /**
- * 首页 task 卡片
- * - 标题 + 仓库路径 + 当前阶段 + 状态徽章 + 时间
- * - 整张卡可点、跳详情页（用 div + onClick 包裹、避免 Link 套 Button 的 hydration 警告）
- * - 完成/失败的卡片右上显示「归档」按钮、归档视图里显示「取消归档」按钮
- * - 永远显示「删除」按钮、点击走全局 useDialog().confirm 二次确认（统一弹窗风格）
+ * 首页 task 卡片（V0.6 重写）
+ *
+ * 展示：
+ *   - 标题 + 仓库路径 + 角色徽章
+ *   - V0.6 双状态：repoStatus（业务态）+ runStatus（运行态、跑动中才显示）
+ *   - 最近一次 action（类型 + 状态）
+ *   - 时间
  */
 
 import { useRouter } from "next/navigation";
@@ -13,10 +15,9 @@ import {
   Archive,
   ArchiveRestore,
   ArrowRight,
+  Clock,
   FolderGit2,
-  MessageCircle,
   Trash2,
-  Workflow,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -24,35 +25,34 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useDialog } from "@/hooks/use-dialog";
 import {
-  PHASE_LABEL,
-  STATUS_LABEL,
-  STATUS_VARIANT,
+  ACTION_LABEL,
+  ACTION_STATUS_LABEL,
+  ACTION_STATUS_VARIANT,
+  REPO_STATUS_LABEL,
+  REPO_STATUS_VARIANT,
+  RUN_STATUS_LABEL,
+  RUN_STATUS_VARIANT,
   formatRelative,
   formatRepoPathsForDisplay,
 } from "@/lib/task-display";
-import type { TaskSummary } from "@/lib/types";
+import { TASK_ROLE_LABEL, type TaskSummary } from "@/lib/types";
 
 interface Props {
-  // V0.5.3：卡片只渲染概要字段（title / status / currentPhase / updatedAt 等）、
-  // 不需要 events / phases.artifact 详细产物、类型上明确收窄到 TaskSummary
   task: TaskSummary;
   onArchiveToggle?: () => void;
   onDelete?: () => void;
 }
 
-// 哪些状态值得显示「归档」按钮（draft / running / awaiting_user 显示意义不大）
+// 哪些状态值得显示「归档」按钮——merged / abandoned 是 task 的终态
 const canArchive = (task: TaskSummary): boolean =>
   task.archived ||
-  task.status === "completed" ||
-  task.status === "failed";
+  task.repoStatus === "merged" ||
+  task.repoStatus === "abandoned";
 
 export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
   const router = useRouter();
-  // 全局 confirm hook：替代以前手写的 AlertDialog 三件套（state + handlers + JSX）
-  // 跟其他「删除 / 覆盖」类操作走同款 modal、风格一致 + 零 state
   const { confirm } = useDialog();
 
-  // 卡片点击跳详情；归档 / 删除按钮的点击 stopPropagation 避免冒泡
   const handleCardClick = () => {
     router.push(`/tasks/${task.id}`);
   };
@@ -62,8 +62,6 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
     onArchiveToggle?.();
   };
 
-  // 删除：弹 destructive 确认、用户点确认才调 onDelete
-  // useDialog 内部封了 Promise、await 串行最自然
   const handleDeleteClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
     const ok = await confirm({
@@ -75,6 +73,9 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
     if (ok) onDelete?.();
   };
 
+  // runStatus = idle 时不显示（避免视觉噪音）、其他状态都显示
+  const showRunStatus = task.runStatus !== "idle";
+
   return (
     <Card
       className="group cursor-pointer transition-colors hover:bg-muted/30"
@@ -82,27 +83,34 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
     >
       <div className="flex items-start justify-between gap-4 p-4">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {/* mode badge：chat / plan 一眼可分 */}
-            <Badge variant="outline" className="shrink-0 gap-1">
-              {task.mode === "chat" ? (
-                <>
-                  <MessageCircle className="size-3" />
-                  自由对话
-                </>
-              ) : (
-                <>
-                  <Workflow className="size-3" />
-                  方案规划
-                </>
-              )}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* 角色徽章：当前只 fe、未来扩 be/data/mobile/qa 时一眼可分 */}
+            <Badge variant="outline" className="shrink-0">
+              {TASK_ROLE_LABEL[task.role]}
             </Badge>
-            <h3 className="truncate text-base font-medium text-foreground">
+            {/* chat 模式 task 单独打标、跟正经 task 模式一眼区分 */}
+            {task.mode === "chat" && (
+              <Badge variant="secondary" className="shrink-0 text-[10px]">
+                对话
+              </Badge>
+            )}
+            <h3 className="min-w-0 flex-1 truncate text-base font-medium text-foreground">
               {task.title}
             </h3>
-            <Badge variant={STATUS_VARIANT[task.status]} className="shrink-0">
-              {STATUS_LABEL[task.status]}
+            <Badge
+              variant={REPO_STATUS_VARIANT[task.repoStatus]}
+              className="shrink-0"
+            >
+              {REPO_STATUS_LABEL[task.repoStatus]}
             </Badge>
+            {showRunStatus && (
+              <Badge
+                variant={RUN_STATUS_VARIANT[task.runStatus]}
+                className="shrink-0"
+              >
+                {RUN_STATUS_LABEL[task.runStatus]}
+              </Badge>
+            )}
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <span
@@ -110,13 +118,26 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
               title={task.repoPaths.join("\n")}
             >
               <FolderGit2 className="size-3.5" />
-              {formatRepoPathsForDisplay(task.repoPaths)}
+              {task.repoPaths.length > 0
+                ? formatRepoPathsForDisplay(task.repoPaths)
+                : "(未绑仓库)"}
             </span>
-            {/* chat 模式没有 phase 概念、不展示「当前阶段」 */}
-            {task.mode === "plan" && (
-              <span>当前阶段：{PHASE_LABEL[task.currentPhase]}</span>
+            {/* 最近一次 action：类型 + 状态、null = 任务还没跑过 */}
+            {task.lastActionType && task.lastActionStatus && (
+              <span className="flex items-center gap-1">
+                <span>最近 action：{ACTION_LABEL[task.lastActionType]}</span>
+                <Badge
+                  variant={ACTION_STATUS_VARIANT[task.lastActionStatus]}
+                  className="shrink-0 text-[10px]"
+                >
+                  {ACTION_STATUS_LABEL[task.lastActionStatus]}
+                </Badge>
+              </span>
             )}
-            <span>{formatRelative(task.updatedAt)}</span>
+            <span className="flex items-center gap-1">
+              <Clock className="size-3.5" />
+              {formatRelative(task.updatedAt)}
+            </span>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">

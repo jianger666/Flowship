@@ -1,34 +1,25 @@
 /**
- * GET /api/tasks/[id]/artifact-diff?phase=plan&from=<timestamp>&to=<timestamp|current>
+ * GET /api/tasks/[id]/action-diff?actionId=act_1&from=<timestamp>&to=<timestamp|current>
  *
- * V0.5.12：拉两个时刻的 artifact 正文做对比（前端拿到 raw、用 react-diff-viewer-continued 渲染）
+ * V0.6 改 action 维度（替代 V0.5 artifact-diff、phase → actionId）
  *
  * Query：
- *   - phase（必填）：phase id（"plan" | "build" | "review"）
- *   - from（必填）：revision timestamp（ms epoch、来自 artifact-revisions 返的 revisions[i].timestamp）
+ *   - actionId（必填）：ActionRecord.id
+ *   - from（必填）：revision timestamp（ms epoch）
  *   - to（可选）：revision timestamp 或 "current"、默认 "current"
  *
  * 返：
  *   {
  *     from: { content: string; timestamp: number },
- *     to:   { content: string; timestamp: number | null },  // current 时 timestamp=null
+ *     to:   { content: string; timestamp: number | null },
  *   }
- *
- * 失败语义：
- *   - phase / from / to 格式错 → 400
- *   - from 找不到对应 revision（被 GC 删了 / 人工删了）→ 404
- *   - to=current 但 artifact 不存在 → 404
- *   - to 是 timestamp 但找不到对应 revision → 404
- *
- * 不接受前端传 raw path：from / to 都用 timestamp 索引、由服务端查 meta.revisions 拿 path、防穿越
  */
 
 import { NextResponse } from "next/server";
 import {
-  readArtifactRevisionContent,
-  readCurrentArtifact,
+  readActionRevisionContent,
+  readCurrentActionArtifact,
 } from "@/lib/server/task-fs";
-import { PHASE_IDS, type PhaseId } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -40,15 +31,12 @@ export const GET = async (req: Request, { params }: Ctx) => {
   try {
     const { id } = await params;
     const url = new URL(req.url);
-    const phase = url.searchParams.get("phase");
+    const actionId = url.searchParams.get("actionId");
     const fromRaw = url.searchParams.get("from");
     const toRaw = url.searchParams.get("to") ?? "current";
 
-    if (!phase || !PHASE_IDS.includes(phase as PhaseId)) {
-      return NextResponse.json(
-        { error: `phase 必填、且必须是 ${PHASE_IDS.join(" / ")} 之一` },
-        { status: 400 },
-      );
+    if (!actionId || !/^[a-zA-Z0-9_-]+$/.test(actionId)) {
+      return NextResponse.json({ error: "actionId 必填且只允许字母数字下划线" }, { status: 400 });
     }
     if (!fromRaw) {
       return NextResponse.json({ error: "from 必填" }, { status: 400 });
@@ -60,10 +48,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
         { status: 400 },
       );
     }
-    const phaseId = phase as PhaseId;
 
-    // from：必须是历史 revision
-    const fromRev = await readArtifactRevisionContent(id, phaseId, fromTs);
+    const fromRev = await readActionRevisionContent(id, actionId, fromTs);
     if (!fromRev) {
       return NextResponse.json(
         { error: `from=${fromTs} 对应的 revision 不存在（可能被 GC 清理）` },
@@ -71,10 +57,9 @@ export const GET = async (req: Request, { params }: Ctx) => {
       );
     }
 
-    // to：current 或历史 revision
     let toResult: { content: string; timestamp: number | null };
     if (toRaw === "current") {
-      const current = await readCurrentArtifact(id, phaseId);
+      const current = await readCurrentActionArtifact(id, actionId);
       if (!current) {
         return NextResponse.json(
           { error: "to=current 但当前 artifact 不存在" },
@@ -90,7 +75,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
           { status: 400 },
         );
       }
-      const toRev = await readArtifactRevisionContent(id, phaseId, toTs);
+      const toRev = await readActionRevisionContent(id, actionId, toTs);
       if (!toRev) {
         return NextResponse.json(
           { error: `to=${toTs} 对应的 revision 不存在（可能被 GC 清理）` },
@@ -105,7 +90,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
       to: toResult,
     });
   } catch (err) {
-    console.error("[GET /api/tasks/[id]/artifact-diff] failed", err);
+    console.error("[GET /api/tasks/[id]/action-diff] failed", err);
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
 };
