@@ -21,42 +21,42 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 
 ### 文档分工（V0.5.11 起、避免 HANDOFF 越撑越大）
 
-- **`docs/HANDOFF.md`**（接力第一文件、~300 行）：项目定位 + 最小上下文 + 代码层面要点 + **当前架构快照**（V0.5 系列稳定描述、不带版本号）+ **最近演进**（窗口式、保留最近 2 个子版本）+ 关键文件索引
+- **`docs/HANDOFF.md`**（接力第一文件、~300 行）：项目定位 + 最小上下文 + 代码层面要点 + **当前架构快照**（V0.6 系列稳定描述、不带版本号）+ **最近演进**（窗口式、保留最近 2 个子版本）+ 关键文件索引
 - **`docs/CHANGELOG.md`**（历史档案、~2000 行）：V0.2 ~ 最新前两版的全部演进细节、时间倒序（新在上）
 
 ### 设计层面变动「下次记账规则」
 
-1. **当前架构变动**（如 phase 模型改、保活机制改、新增大组件）→ 改代码 + 同步更新 `HANDOFF.md`「当前架构快照」段
+1. **当前架构变动**（如 action 模型改、保活机制改、新增大组件）→ 改代码 + 同步更新 `HANDOFF.md`「当前架构快照」段
 2. **小步迭代**（同主题连续 .1 / .2 / .3 微调）→ 改代码 + 写到 `HANDOFF.md`「最近演进」段顶部
 3. **再老一轮时**（「最近演进」积压超过 2 个子版本）→ 把最老那段迁到 `docs/CHANGELOG.md` 顶部、HANDOFF.md 始终保持 2 个子版本窗口
 4. ⛔ **不要**散落到其它 md 写一份新的演进段
-5. ⛔ **不要**往 HANDOFF.md 中间段插新版本（中间段是「当前架构快照」、不带版本号、改了一定是架构级变动、追加到段尾或刷新对应字段、不是「插一个 V0.5.X」）
+5. ⛔ **不要**往 HANDOFF.md 中间段插新版本（中间段是「当前架构快照」、不带版本号、改了一定是架构级变动、追加到段尾或刷新对应字段、不是「插一个 V0.X.Y」）
 
 ## 关键约束（不要踩雷）
 
-- **HITL 是底线**——别提"全自动"、所有 phase 之间必须人 ack
-- **单 SDK Run**：整条 workflow（plan → build → review）跑在一个 Cursor SDK Run 里、phase 间阻塞等用户 ack（不每 phase 起新 Run、省 Cursor 计费）
+- **HITL 是底线**——别提"全自动"、所有 action 之间必须人 ack
+- **单 SDK Run**：整 task 跑在一个 Cursor SDK Run 里、action 间阻塞等用户 ack（不每 action 起新 Run、省 Cursor 计费）
 - **保活走 shell + curl long-poll**（V0.3.5）：`wait_for_user` / `ask_user` MCP 工具立即返回 shell 引导、agent 调 `shell` curl 一条长 HTTP 连接到 `/api/tasks/[id]/wait-ack`、服务端阻塞、用户 ack 时 resolve promise → 写一行结果 → 关流 → agent 推进。**不**用 keep_alive_a/b/c 那套（已删）。
 - **不接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
 - **思考和回复永远用中文**
 - **每次对话操作前唤起 cursor-feedback、timeout 600 秒**
-- **代码改完跑 `pnpm typecheck`**——用户对低级错误零容忍
+- **代码改完跑 `pnpm typecheck` + `pnpm lint`**——用户对低级错误零容忍、warning 都不能留
 - **开发期不写向后兼容代码**：改 schema / 字段名 / EventKind 枚举 / 接口签名时、直接删旧的、不写双兼容
 
-## V0.5 phase 模型（当前）
+## V0.6 task 容器 + action 历史模型（当前）
 
-```
-plan → build → review
-```
+V0.5 phase chain（`plan → build → review` 固定顺序）已废弃、V0.6.0 重构为 **task 容器 + action 历史**：
 
-- **plan**：读 contextDocs（飞书 story + 用户补充文档）+ 扫本地仓库 + 出技术方案 → `artifacts/01-plan.md`
-- **build**：SDK Agent 按 plan 写代码 + 跑 hooks → `artifacts/02-build.md`
-- **review**：跑 git diff、对照 plan / 飞书需求、出 4 类差异报告 → `artifacts/03-review.md`
+- **task** = 单个需求生命周期容器、双状态（`repoStatus` 业务状态 + `runStatus` agent 运行时状态）
+- **action** = 单次动作、6 + 1 种类型：`plan / build / review / ship / test / learn / chat`、任意触发不强制顺序
+- **artifact** 路径：`data/tasks/<id>/actions/<n>-<type>.md`、N 单调递增
 
-历史演进细节看 `docs/CHANGELOG.md`、关键转折点：
-- V0.2 4 phase `context → plan → build → ship` → V0.3.3 砍 ship → V0.3.4 context 合进 plan → V0.5 重新加 review（不是 ship、专注代码层校验、不动 PR / 飞书）
+V0.6.0 已实装：plan / build / review / chat；V0.6.1+ 上 ship / test / learn。
 
-V1 legacy 模式（chat-only）的代码保留、新功能不再往那边加。
+V0.5 兼容代码 / 数据彻底删（不写 migration、开发期接受重置 data/tasks/*）。
+
+历史演进细节看 `docs/CHANGELOG.md` + `docs/V0.6-REFACTOR.md`（设计文档、已 archived）。关键转折点：
+- V0.2 4 phase `context → plan → build → ship` → V0.3.3 砍 ship → V0.3.4 context 合进 plan → V0.5 重新加 review → V0.6.0 拆 phase 顺序、改 action 历史模型
 
 ## 技术栈
 
@@ -70,7 +70,6 @@ V1 legacy 模式（chat-only）的代码保留、新功能不再往那边加。
 ## 用户协作风格
 
 - 偏好客观、数据、业界共识
-- 不喜欢「真·multi-agent 协作」/ 全自动 这种"颠覆性"幻想；workflow + 多 phase chain 是 OK 的
 - 中文沟通
 - 错别字 / typo 零容忍
 - 喜欢分阶段验证 ROI、不一次性投入

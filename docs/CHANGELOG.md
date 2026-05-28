@@ -15,6 +15,84 @@
 
 ---
 
+### V0.5.16-design：V0.6 重构设计纪要（2026-05-27、代码未动）
+
+**整体**：跟用户深入对齐工作流（飞书需求 → 多个 MR → 测试反馈 → 改代码再提 → 最终合入）后、确认 V0.5 phase chain 模型存在系统性错配。决定重构为 task 容器 + action history 模型、设计文档落 `docs/V0.6-REFACTOR.md`。**本子版本只产文档、不动代码**——后续 V0.6.0 实际落地代码。
+
+#### 产出
+
+- **`docs/V0.6-REFACTOR.md`**（新文件、~900 行）：V0.6 完整设计文档、14 节 + 3 附录、包含：
+  - 0-1 节：接力上下文 + 重构背景（用户工作流复述 + 4 个错配）
+  - 2-3 节：V0.5 核心问题 + V0.6 新架构总览（task 容器 + action history + 单 SDK Run 永生）
+  - 4 节：task schema 新旧对比 + 文件系统改造（actions/ 目录、N-<type>.md）
+  - 5 节：6 + 1 种 action 详细规格（plan / build / review / ship / test / learn / chat）
+  - 6 节：6 个 harness 门槛设计
+  - 7 节：prompt 文件重组方案
+  - 8 节：UI 改造点
+  - 9 节：「再聊聊」/ revise / chat 在新架构下的语义
+  - 10 节：单 SDK Run 永生策略 + wait_for_user 协议改动
+  - 11 节：老 task 兼容（只读 / 归档、不写 migration）
+  - 12 节：分版本路径
+  - 13 节：未拍板项（7 个动手前必须澄清的）
+  - 14 节：新 AI 接力 checklist
+- **`docs/HANDOFF.md`** 顶部加「即将到来：V0.6 重构」段、关键文件索引加 V0.6-REFACTOR.md 行
+- **`docs/ROADMAP.md`** 顶部「下一阶段」段重写、原 V0.5.16 learn-phase-only 描述替换为 V0.6 重构概览
+
+#### 关键设计决策（不要回头）
+
+1. **phase 顺序拆掉**：plan / build / review / ship / test / learn / chat 是 action 类型、不是顺序约束
+2. **单 task 多 MR**：MR 提了 task 不结束、可继续推进、`Task.mrs` 列表追踪
+3. **chat 吸收**：删 chat-runner.ts、chat = `action=chat`、统一架构
+4. **单 SDK Run 永生**：跟 V0.5 一致、Run 不退（除非 task 标完成 / abandon）
+5. **6 harness 门槛补回**：准入 + 后置 + prompt + placeholder + 推荐 default
+6. **老 task 只读**：不写 migration、按 project-context.mdc「不写向后兼容」原则
+
+#### 没做的事
+
+实际代码改动**全部留给下一个 AI**——用户拍板「设计这么大量级、单 agent 长对话上下文必塞爆、新 agent 拿设计文档接力更稳」、跟 harness 思想「不依赖单 LLM 连贯性、用结构化文档约束」自洽。
+
+### V0.5.15：chat-runner 对齐 + V0.5.6.2 plan 重构后遗症清理（2026-05-26）
+
+**整体**：接力时一锅做的两类清理。一类是「plan 有、chat 还没」的对齐性 bug（console.log 兜底）；一类是 V0.5.6.2 plan 重构（砍 §3.1 文件清单 + 验收点直接挂 task）只动了 plan、build / review prompt 没跟上的后遗症。无新功能、纯清理 + 对齐。
+
+#### 1. chat-runner `case "status"` 加 console.log 兜底（对齐 plan-runner V0.5.5 增强）
+
+**背景**：SDK 1.0.13 `status=error` 时偶尔不发详细 message、`run.wait()` 拿到的 RunResult 也不带具体描述、chat 模式只能 throw 一个空错误、用户 / dev 看不到任何诊断信息。plan-runner 早就在 case `status` 顶部加了一行无条件 `console.log` 兜底——chat-runner 漏了。
+
+**修法**：`src/lib/server/chat-runner.ts` 的 `case "status"` 头部补一份同款 log。
+
+#### 2. phase-2-build.md 骨架跟 V0.5.6.2 plan 重构对齐
+
+V0.5.6.2 把 plan §3.1 文件清单砍掉、验收点直接挂在每个 task 上、但 build 骨架那时没跟上、留了「## 改动文件清单」+「## 验收对照」两个独立段、跟 task 自带字段重复 100%。同时 V0.5 加 review phase 后由 review 出 commit msg、build 还在出一份、也重复。本轮一次性清掉：
+
+- **task 子条加「验收处理」字段**（4 → 5 字段）
+- **删独立的「## 验收对照」段**
+- **删独立的「## 改动文件清单」段**
+- **删「## 给用户的交接」段**
+- 同步更新顶部「⚠️ 路径写法」警告
+
+#### 3. plan-runner.ts loadPhasePrompt 删 4 个 unused 占位符
+
+历史残留：`title` / `feishuStoryUrl` / `description` / `artifactsDir` 注入了但 phase prompt 没一处引用、按「开发期不写兼容代码」原则清掉。
+
+#### 4. phase-1 artifact 写入工具引用表述统一为 phase-2/3 同款（去括号注解）
+
+`prompts/phase-1-plan.md` 的引用比 phase-2/3 多带括号注解、详细信息 `_super.md`「跨 phase 共享规范 §1」里已经说清楚、不需要每个 phase 都重复。
+
+#### 5. ROADMAP.md V0.5 段「plan phase 校验前移」描述跟 V0.5.6.1 同步
+
+ROADMAP 还写「plan agent 在 01-plan.md 里写『我的理解 vs 飞书原文』对照」、V0.5.6.1 已经撤了这个段、改成「跟原文有差异一律 ask_user 闭环」、ROADMAP 没跟。
+
+#### 验证
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓
+
+#### 没做的事（用户拍板「保持手动重启」）
+
+接力文案里另一个小 bug「chat 模式加 `NGHTTP2_ENHANCE_YOUR_CALM` 自动降级（plan 已有、chat 还没）」**暂不做**——用户拍板「就还是用户手动重启」、保留 chat 模式现状。
+
+---
+
 ### V0.5.14：事件流虚拟滚动 + memo（彻底解决「事件流多了卡」）（2026-05-26）
 
 **背景**：用户实测发现事件流多了之后明显卡顿、滚动 / 输入 / 折叠展开都有延迟感。分析根因：

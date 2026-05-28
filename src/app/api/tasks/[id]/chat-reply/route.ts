@@ -1,42 +1,39 @@
 /**
  * POST /api/tasks/[id]/chat-reply
  *
- * Body: {
- *   text?: string;
- *   images?: Array<{...}>;
- *   attachments?: string[];
- *   // V0.4 chat 自由化：task 处于 draft / completed / failed 时
- *   // 用户发消息会同时触发「自动启 agent」、需要 SDK 启动参数
- *   bootArgs?: { apiKey, model, mcpServers }
- * }
+ * V0.6.0.1 重新引入、对齐 V0.5 自由对话体验。仅 chat 模式 task（task.mode === "chat"）走本路由。
  *
- * 路由职责（两种模式）：
+ * # Body
+ *
+ * ```
+ * {
+ *   text?: string;                    // 用户消息文本（可空、但 images / attachments 至少一个）
+ *   images?: Array<{ data, mimeType, filename }>;
+ *   attachments?: string[];           // 文件 / 目录绝对路径（FsPickerDialog 选的）
+ *   // task 处于 idle / completed / error 时、用户发消息会同时触发「自动启 agent」、需要 SDK 启动参数
+ *   bootArgs?: { apiKey, model, mcpServers };
+ * }
+ * ```
+ *
+ * # 路由职责（两种模式）
  *
  * 1. **awaiting_user + hasPending=true**（正常对话循环）：
  *    - 写 user_reply 事件
  *    - submitUserMessage（resolve wait_for_user）
- *    - patch task.status=running
+ *    - patch task.runStatus=running
  *
- * 2. **chat 模式 + draft/completed/failed + 无 pending**（V0.4 自动启动）：
+ * 2. **idle / error / 上一轮 completed + 无 pending**（自动启动）：
  *    - 写 user_reply 事件（用户立刻看到自己的话）
- *    - patch task.status=running
- *    - fire-and-forget runChatSession（带 firstMessage）启 agent
- *    - agent 起手 prompt 已包含用户首条、直接回答、回答完调 wait_for_user 进等待
- *    - 用户感觉「发一条 = 启动 + 回答一气呵成」、无需手动启动按钮
- *    - 不走 pendingFirstMessage 队列：避免 agent 起手 wait_for_user 时短暂切 awaiting_user
- *      误导 UI、也避免 agent emit「正在调用 wait_for_user 等你」之类协议元叙述
+ *    - patch task.runStatus=running
+ *    - fire-and-forget runChatSession(firstMessage=text) 启 agent
+ *    - agent 起手 prompt 已含用户首条、直接回答、答完调 wait_for_user 进等待
  *
- * 失败情况：
- *   - task 不存在 → 404
- *   - task.mode !== "chat" → 409
- *   - 模式 2 但缺 bootArgs → 400
- *   - hasPending=false 且 task.status 还在 awaiting_user/running → 410（僵尸态、当场标 failed）
+ * # 失败情况
  *
- * 进程重启 / agent 崩溃后的体验：
- *   - getTask 顶部已 await ensureBootRecovery、绝大多数僵尸任务在用户首次访问时就被标 failed
- *   - 但极小概率：用户访问页面 → SSE 连上 → 发消息全在 boot recovery 完成之前
- *     兜底：本路由检测 hasPending=false 且 status=awaiting_user/running → 当场补一次「僵尸标记」
- *   - status=draft/completed/failed 在 V0.4 起不再 409、改为「自动启动」逻辑（如果 bootArgs 齐）
+ * - task 不存在 → 404
+ * - task.mode !== "chat" → 409（任务模式不走本路由、应走 advance）
+ * - 模式 2 但缺 bootArgs → 400
+ * - hasPending=false 且 runStatus=awaiting_user/running → 410（僵尸态、当场标 error）
  */
 
 import { promises as fs } from "node:fs";
@@ -46,14 +43,18 @@ import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import {
   appendEvent,
   getTask,
-  patchPhase,
   saveImageAttachments,
+  setTaskRunStatus,
 } from "@/lib/server/task-fs";
 import {
   hasPending,
   submitUserMessage,
 } from "@/lib/server/chat-mcp";
-import { isChatRunning, publishChatStreamEvent, runChatSession } from "@/lib/server/chat-runner";
+import {
+  isChatRunning,
+  runChatSession,
+} from "@/lib/server/chat-runner";
+import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import {
   errorResponse,
   isValidMcpServers,
@@ -69,21 +70,12 @@ interface Ctx {
 
 interface PostBody {
   text?: string;
-  // 用户上传的图片附件、纯 base64（不带 data: 前缀）
-  // 后端会 1. 校验 mimeType 白名单 + 单图 size 上限 2. 落盘到 data/tasks/<id>/uploads/<uuid>.<ext>
-  // 3. 把绝对路径塞给 wait_for_user return、agent 用 SDK 内置 `read` 工具读看图
   images?: Array<{
     data?: string;
     mimeType?: string;
     filename?: string;
   }>;
-  // 用户附加的文件 / 目录绝对路径（FsPickerDialog 选的、纯路径不传内容）
-  // 后端会 1. 校验路径必须绝对 + 存在 2. 写 user_reply.meta.attachments
-  // 3. 把路径塞给 wait_for_user return（[ATTACHED_PATHS] 段）、agent 用 read / grep / glob 自己读
   attachments?: string[];
-  // V0.4 chat 自由化：当 task 处于 draft / completed / failed 状态时
-  // 用户发消息要同时启动 agent、需要 SDK 启动参数
-  // 状态 = awaiting_user 时这个字段可以省略（agent 已在跑、不需要启动）
   bootArgs?: {
     apiKey?: string;
     model?: ModelSelection;
@@ -91,10 +83,7 @@ interface PostBody {
   };
 }
 
-// 单次最多附图数（防滥用、chat-reply 跟 phase-ack 都是 6、保留各自字段方便单独调）
 const MAX_IMAGES_PER_REPLY = 6;
-// 单次最多附路径数（防 agent context 被路径列表刷爆）
-// 跟前端 event-stream.tsx 的 MAX_ATTACHMENTS_PER_REPLY 保持一致
 const MAX_ATTACHMENTS_PER_REPLY = 10;
 
 export const runtime = "nodejs";
@@ -110,21 +99,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   const text = body.text?.trim() ?? "";
-  // 校验 images 入参格式（不校验内容、内容校验放 saveImageAttachments 里抛错）
-  // helper 内部检查：数量上限、字段非空、累计字节上限、形状转 ImageAttachmentInput
-  const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES_PER_REPLY);
+
+  // 校验 images
+  const imagesResult = parseAndValidateImages(
+    body.images,
+    MAX_IMAGES_PER_REPLY,
+  );
   if (!imagesResult.ok) return imagesResult.errorResponse;
   const images = imagesResult.images;
 
   // 校验 attachments：必须绝对路径、必须存在
-  // 不校验类型（文件 / 目录都能附）、不读内容、只 stat 一下
   const rawAttachments = Array.isArray(body.attachments) ? body.attachments : [];
   if (rawAttachments.length > MAX_ATTACHMENTS_PER_REPLY) {
     return errorResponse(
       `单次最多附 ${MAX_ATTACHMENTS_PER_REPLY} 条路径（你传了 ${rawAttachments.length}）`,
     );
   }
-  const attachments: Array<{ absPath: string; isDir: boolean; bytes?: number }> = [];
+  const attachmentAbsPaths: string[] = [];
   for (const raw of rawAttachments) {
     if (typeof raw !== "string" || !raw.trim()) {
       return errorResponse("attachments 必须是非空字符串数组");
@@ -134,12 +125,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       return errorResponse(`attachments 必须是绝对路径：${raw}`);
     }
     try {
-      const stat = await fs.stat(abs);
-      attachments.push({
-        absPath: abs,
-        isDir: stat.isDirectory(),
-        bytes: stat.isDirectory() ? undefined : stat.size,
-      });
+      await fs.stat(abs);
+      attachmentAbsPaths.push(abs);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
@@ -148,115 +135,37 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (code === "EACCES") {
         return errorResponse(`attachments 无权限读取：${raw}`);
       }
-      return errorResponse(`attachments stat 失败：${(err as Error).message}`);
+      return errorResponse(
+        `attachments stat 失败：${(err as Error).message}`,
+      );
     }
   }
 
-  // 文本 / 图 / 路径至少有一个、纯空消息不让发
-  if (!text && images.length === 0 && attachments.length === 0) {
-    return errorResponse("text / images / attachments 至少给一个");
+  // 必须 text / images / attachments 至少一项
+  if (
+    text.length === 0 &&
+    images.length === 0 &&
+    attachmentAbsPaths.length === 0
+  ) {
+    return errorResponse("text / images / attachments 至少一项非空");
   }
 
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
+
   if (task.mode !== "chat") {
-    return errorResponse(`任务 mode=${task.mode}、chat-reply 不适用`, 409);
+    return errorResponse(
+      `task.mode=${task.mode ?? "task"} 不是 chat、本路由仅服务 chat 模式、任务模式请走 /advance`,
+      409,
+    );
   }
 
-  // V0.4 chat 自由化：根据 task.status 判断走哪条链路
-  // - awaiting_user / running：原 hasPending 链路（正常对话回合 / 僵尸态兜底）
-  // - draft / completed / failed：自动启动链路（启 agent + 投递首条）
-  // - 其他（不应出现）：报错
-  const shouldAutoStart =
-    task.status === "draft" ||
-    task.status === "completed" ||
-    task.status === "failed";
-
-  // 自动启动分支：先校验 bootArgs、其他错都先 fail-fast、避免后面落盘了又退
-  let autoStartConfig:
-    | { apiKey: string; model: ModelSelection; userMcpServers?: Record<string, McpServerConfig> }
-    | null = null;
-  if (shouldAutoStart) {
-    const apiKey = body.bootArgs?.apiKey?.trim();
-    if (!apiKey) {
-      return errorResponse(
-        `task.status=${task.status}、自动启动需要 bootArgs.apiKey`,
-        400,
-      );
-    }
-    if (!isValidModel(body.bootArgs?.model)) {
-      return errorResponse("bootArgs.model 非法（缺少 id 字段）");
-    }
-    if (!isValidMcpServers(body.bootArgs?.mcpServers)) {
-      return errorResponse(
-        "bootArgs.mcpServers 必须是对象（key=server名、value=配置）",
-      );
-    }
-    if (isChatRunning(task.id)) {
-      // 终态但还有残留 run：通常不会发生（chat-runner finally 块会把 running 清掉）
-      // 兜底防止重复 spawn agent
-      console.warn(
-        `[chat-reply] task=${task.id} status=${task.status} 但 isChatRunning=true、忽略本次自动启动请求`,
-      );
-      return errorResponse(
-        "agent 启动状态异常（status 是终态但 run 在跑）、稍后重试",
-        409,
-      );
-    }
-    autoStartConfig = {
-      apiKey,
-      model: body.bootArgs.model,
-      userMcpServers: body.bootArgs.mcpServers,
-    };
-  } else {
-    // 非自动启动分支：走 hasPending 检测 + 200ms race retry（详见上方常量注释）
-    let pending = hasPending(task.id);
-    if (!pending) {
-      await sleep(KEEPALIVE_RACE_RETRY_MS);
-      pending = hasPending(task.id);
-    }
-    if (!pending) {
-      // 真没 pending、又不在终态 → 一定是僵尸态
-      // 当场补一次"僵尸标记"、UI 拿到 failed 会展示「重新启动 Chat」按钮
-      console.warn(
-        `[chat-reply] task=${task.id} 僵尸态 status=${task.status} hasPending=false、当场标 failed`,
-      );
-      const errorTask = await appendEvent(task.id, {
-        kind: "error",
-        text: "Chat agent 已断开（进程重启或异常退出）、本段对话不能继续。再发一条消息会自动开启新一段会话。",
-      });
-      if (errorTask) {
-        const lastEvent = errorTask.events[errorTask.events.length - 1];
-        if (lastEvent) {
-          publishChatStreamEvent(task.id, { kind: "event", event: lastEvent });
-        }
-      }
-      const failedTask = await patchPhase(task.id, { taskStatus: "failed" });
-      if (failedTask) {
-        publishChatStreamEvent(task.id, { kind: "task", task: failedTask });
-        publishChatStreamEvent(task.id, {
-          kind: "done",
-          task: failedTask,
-          ok: false,
-        });
-      }
-      return errorResponse(
-        "agent 已断开、再发一条消息会自动开启新一段会话",
-        410,
-      );
-    }
-  }
-
-  console.log(
-    `[chat-reply] task=${task.id} status=${task.status} autoStart=${shouldAutoStart} text=${text.slice(0, 60)} images=${images.length} attachments=${attachments.length}`,
-  );
-
-  // 0) 落盘图片（如果有）、拿绝对路径数组
-  // 失败：mimeType 不白名单 / size 超 / base64 损坏 → 400
-  let savedImages: Awaited<ReturnType<typeof saveImageAttachments>> = [];
+  // 落盘图片（拿绝对路径）
+  let imageAbsPaths: string[] | undefined;
   if (images.length > 0) {
     try {
-      savedImages = await saveImageAttachments(task.id, images);
+      const saved = await saveImageAttachments(task.id, images);
+      imageAbsPaths = saved.map((s) => s.absPath);
     } catch (err) {
       return errorResponse(
         `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
@@ -264,108 +173,110 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // 1) 先写 user_reply 事件（用户视角先看到自己的话进了事件流）
-  // meta.images 存图片元信息：absPath（agent 用）/ relPath / mimeType / bytes / filename
-  // meta.attachments 存文件 / 目录元信息：absPath（agent 读用）/ isDir / bytes
-  // UI 读 meta.images / meta.attachments 渲染气泡下方的缩略图 / 路径 chip
-  const metaParts: Record<string, unknown> = {};
-  if (savedImages.length > 0) {
-    metaParts.images = savedImages.map((s) => ({
-      absPath: s.absPath,
-      relPath: s.relPath,
-      mimeType: s.mimeType,
-      bytes: s.bytes,
-      filename: s.filename,
-    }));
+  // 写 user_reply 事件（用户立刻在 event-stream 看到自己的话）
+  const userReplyMeta: Record<string, unknown> = {};
+  if (imageAbsPaths && imageAbsPaths.length > 0) {
+    userReplyMeta.imagePaths = imageAbsPaths;
   }
-  if (attachments.length > 0) {
-    metaParts.attachments = attachments;
+  if (attachmentAbsPaths.length > 0) {
+    userReplyMeta.attachmentPaths = attachmentAbsPaths;
   }
-  // 文本回退优先级：text > 「(用户附了文件)」 > 「(用户附了图片)」
-  // 让事件流摘要更精确
   const fallbackText =
-    attachments.length > 0
-      ? "(用户附了文件)"
-      : savedImages.length > 0
-        ? "(用户附了图片)"
-        : "";
+    text.length === 0 && (imageAbsPaths || attachmentAbsPaths.length > 0)
+      ? "(用户附了图片 / 文件)"
+      : "";
   const updatedAfterEvent = await appendEvent(task.id, {
     kind: "user_reply",
     text: text || fallbackText,
-    meta: Object.keys(metaParts).length > 0 ? metaParts : undefined,
+    meta:
+      Object.keys(userReplyMeta).length > 0 ? userReplyMeta : undefined,
   });
-  // 主动 publish user_reply：让 SSE 订阅者立刻看到用户消息
-  // （chat-reply 路由跟 chat-runner 不在一条调用链上、必须显式 publish）
   if (updatedAfterEvent) {
-    const lastEvent =
-      updatedAfterEvent.events[updatedAfterEvent.events.length - 1];
-    if (lastEvent) {
-      publishChatStreamEvent(task.id, { kind: "event", event: lastEvent });
-    }
+    const last = updatedAfterEvent.events[updatedAfterEvent.events.length - 1];
+    if (last) publishTaskStreamEvent(task.id, { kind: "event", event: last });
   }
 
-  // 2) 切到 running（agent 拿到消息后会继续跑、UI 立刻把输入框 disable）
-  const updated = await patchPhase(task.id, { taskStatus: "running" });
-  if (updated) publishChatStreamEvent(task.id, { kind: "task", task: updated });
+  // 决定模式：awaiting_user + hasPending → 正常推进；否则 → 自动启 agent
+  // race 兜底：刚切到 awaiting_user 但 hasPending 还没注册、KEEPALIVE_RACE_RETRY_MS 内 retry 一次
+  let pending = hasPending(task.id);
+  if (!pending && task.runStatus === "awaiting_user") {
+    await sleep(KEEPALIVE_RACE_RETRY_MS);
+    pending = hasPending(task.id);
+  }
 
-  // 3) 分两条链路投递消息给 agent
-  const imagePathsArg =
-    savedImages.length > 0 ? savedImages.map((s) => s.absPath) : undefined;
-  const attachmentPathsArg =
-    attachments.length > 0 ? attachments.map((a) => a.absPath) : undefined;
-
-  if (autoStartConfig) {
-    // V0.4 自动启动链路：首条消息直接塞进 initialPrompt
-    // 不走 pendingFirstMessage 队列：
-    //   - 旧方案：agent 起手 wait_for_user → 后端 race 消费队列 → agent 走 shell long-poll → 拿消息
-    //     副作用：wait_for_user 工具进来时会触发 task.status = awaiting_user、UI 输入框短暂可用
-    //     而且 agent 偏偏喜欢 emit「正在调用 wait_for_user 等你」之类废话（prompt 压不住）
-    //   - 新方案：firstMessage 拼进 prompt、agent 第一次 turn 就回答、答完才调 wait_for_user 进等待
-    //     UI 状态：running → 回答中 → awaiting_user、流转干净、agent 也不需要绕一圈
-    void runChatSession({
-      task: updated ?? task,
-      apiKey: autoStartConfig.apiKey,
-      model: autoStartConfig.model,
-      userMcpServers: autoStartConfig.userMcpServers,
-      firstMessage: {
-        text,
-        imagePaths: imagePathsArg,
-        attachmentPaths: attachmentPathsArg,
-      },
-    }).catch((err) => {
-      console.error(
-        `[chat-reply] task=${task.id} auto runChatSession threw:`,
-        err,
-      );
-    });
+  if (pending && task.runStatus === "awaiting_user") {
+    // 模式 1：正常对话循环
+    submitUserMessage(task.id, text, imageAbsPaths, attachmentAbsPaths);
+    const runningTask = await setTaskRunStatus(task.id, "running");
+    if (runningTask)
+      publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
+    const fresh = await getTask(task.id);
     return new Response(
-      JSON.stringify({ ok: true, task: updated, autoStarted: true }),
+      JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
   }
 
-  // 正常对话回合：resolve 阻塞中的 wait_for_user
-  // wait-ack 路由会把附件路径拼到 text 里：
-  //   - [ATTACHED_IMAGES]：图片专用、agent 调 `read` 工具 → SDK 自动 vision 处理
-  //   - [ATTACHED_PATHS]：任意文件 / 目录、agent 按需 read / grep / glob
-  const ok = submitUserMessage(
-    task.id,
-    text,
-    imagePathsArg,
-    attachmentPathsArg,
-  );
-  if (!ok) {
-    // 极小概率：从 hasPending 校验到这里之间被别的请求抢先 resolve 了 / pending 又消失了
-    // 这种情况不标 failed（agent 还活着、可能下一次 wait_for_user 就进来）、
-    // 让用户重发即可
+  // 模式 2：自动启 agent（终态发消息）
+  // hasPending=false 但 runStatus=awaiting_user/running → 僵尸态、当场标 error
+  if (
+    !pending &&
+    (task.runStatus === "awaiting_user" || task.runStatus === "running")
+  ) {
+    console.warn(
+      `[chat-reply] task=${task.id} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
+    );
+    const errorTask = await setTaskRunStatus(task.id, "error");
+    if (errorTask)
+      publishTaskStreamEvent(task.id, { kind: "task", task: errorTask });
     return errorResponse(
-      "agent 已不在等用户输入（可能并发处理 / keepalive 切换）、稍后重试",
-      409,
+      "Chat agent 已断开（进程重启或异常退出）、请刷新页面重新发消息以重启",
+      410,
     );
   }
 
+  // 校验 bootArgs
+  const bootArgs = body.bootArgs;
+  if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
+    return errorResponse("缺 bootArgs.apiKey、终态发消息触发自动启动必传");
+  }
+  if (!isValidModel(bootArgs.model)) {
+    return errorResponse("bootArgs.model 非法");
+  }
+  if (!isValidMcpServers(bootArgs.mcpServers)) {
+    return errorResponse(
+      "bootArgs.mcpServers 必须是对象（key=server名、value=配置）",
+    );
+  }
+
+  // 防重复启动：agent 还在跑（理论不该走到这、防御性）
+  if (isChatRunning(task.id)) {
+    return errorResponse("Chat agent 已经在跑、不需要重启", 409);
+  }
+
+  // 切 task.runStatus=running、fire-and-forget runChatSession
+  const runningTask = await setTaskRunStatus(task.id, "running");
+  if (runningTask)
+    publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
+
+  void runChatSession({
+    task: runningTask ?? task,
+    apiKey: bootArgs.apiKey,
+    model: bootArgs.model,
+    userMcpServers: bootArgs.mcpServers,
+    firstMessage: {
+      text,
+      imagePaths: imageAbsPaths,
+      attachmentPaths:
+        attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+    },
+  }).catch((err) => {
+    console.error(`[chat-reply] runChatSession task=${task.id} failed:`, err);
+  });
+
+  const fresh = await getTask(task.id);
   return new Response(
-    JSON.stringify({ ok: true, task: updated }),
+    JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: true }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

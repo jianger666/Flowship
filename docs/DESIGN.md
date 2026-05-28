@@ -2,7 +2,18 @@
 
 > 这份文档解释**为什么这么做**——不写就忘的细节、给后续维护和扩展用。
 >
-> ⚠️ **2026-05-18 V0.5 + V0.5.1 同步**：phase 拓扑扩到 3 phase、review 落地、prompt / UI 联测中持续打磨。新写代码前对齐到当前实际、不要被本文档下面 V0.2 时期的描述误导。
+> ⚠️ **2026-05-28 大同步 · 整篇 archived**：V0.6.0 核心重构（phase chain → task 容器 + action 历史）已落地、V0.6.0.1 持续打磨。**本文档主体是 V0.2 ~ V0.5 时代的设计权衡、跟 V0.6 当前架构已严重错配**——新写代码 / 新接力 AI 请按以下顺序读、不要被本文档下面 V0.2 ~ V0.5.12 描述误导：
+>
+> 1. `.cursor/rules/project-context.mdc`（V0.6 视角）
+> 2. `docs/HANDOFF.md`「当前架构快照」段（V0.6 系列稳定描述）
+> 3. `docs/HANDOFF.md`「最近演进」段（V0.6.0 + V0.6.0.1 子版本演进）
+> 4. `prompts/_super.md` + `prompts/_shared.md` + `prompts/action-{plan,build,review}.md`（V0.6 prompt 主模板）
+> 5. `src/lib/server/task-runner.ts`（V0.6 统一 runner、V0.5 plan-runner + chat-runner 合一、chat 模式在 V0.6.0.1 又拆出独立 chat-runner）
+> 6. `src/lib/types.ts`（V0.6 schema：Task / ActionRecord / RepoStatus / RunStatus 等）
+>
+> **本文档保留作历史回溯**——下面节内涉及的「phase chain」「3 phase plan/build/review」「fork agent」「revise feedback 二分」等概念在 V0.6 已被 task + action 模型替换、ack 路径简化为 approve / revise 二选一、不再有 ApprovePhaseDialog 这种切模型 / 换 agent 的复合面板（功能拆到 advance dialog 的 forceNewAgent 高级开关里）。
+>
+> **如果要回顾 V0.5 phase chain 时代的设计意图**：本文档原内容（V0.2 4 phase → V0.3.4 双 phase → V0.5 3 phase）保留在下方各节、可作为「为什么 V0.6 要拆 phase」的反例参考。具体每个子版本演进细节看 `docs/CHANGELOG.md`。
 >
 > **当前 phase 模型（V0.5 起）**：`plan → build → review`（3 phase、不是早期 4 phase 也不是 V0.3.4 ~ V0.4 的 2 phase）
 >
@@ -34,7 +45,7 @@
 >   1. `ask_user` 去掉次数上限、AI 自判要不要问、新增「稍后再补充」deferred 选项
 >   2. plan 模板大改：删 §1.1「我的理解 vs 飞书原文」、§3 改成纯接口表、§4 只放 3 类全局决策（实施细节挪 §5 task）、§6 收纳「待澄清 / 不确定项」（含 deferred）
 >   3. 自由 chat 模式禁用 ask_user（chat 是 talk、不弹问卷）
->   4. plan-runner 写完 artifact 强制自检（黑名单 grep 「或 / 约 / 节选」、ack 位置、路径完整性）
+>   4. plan-runner 写完 artifact 强制自检（黑名单 grep 「或 / 约 / 节选」、ack 位置、路径完整性）—— **黑名单 grep 那条 V0.6.0.1 已删、详见 HANDOFF.md V0.6.0.1 段**
 >   5. 路径 + 行号支持 `cursor://file/path:line:column` 跳转（`src/lib/path-utils.ts` 加 `parsePathWithLine` / `buildCursorLink`）
 >   详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.6.x」段。
 > - **V0.5.7（统一推进入口、2026-05-20 中午）**：合并历史的「继续监听」+ 「重启 workflow」为单一「推进」按钮 + `AdvanceDialog` 三选一（resume / fork / restart）。`resume` 失败（NGHTTP2_ENHANCE_YOUR_CALM）plan-runner 内部自动降级 fork。`/api/tasks/[id]/resume-waiting` 删、所有路径走 `/start-workflow`。fork 时 reset 所有下游 phase 为 pending（避免 UI 残留「待确认」）。详见 [HANDOFF.md](./HANDOFF.md) 「V0.5.7」段。

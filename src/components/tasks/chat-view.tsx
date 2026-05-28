@@ -1,71 +1,63 @@
 "use client";
 
 /**
- * Chat 模式整页视图（V0.4 自由化版）
+ * ChatView：chat 模式 task 详情布局（V0.6.0.1 重新引入、对齐 V0.5 体验）
  *
- * 跟 plan 模式的「3 区布局（产物左 / 事件流右）」不同：
- * chat 模式没有产物概念、整段对话就是事件流本身、所以整页都给事件流。
+ * 跟正经 task 模式（page.tsx 的 ResizablePanelGroup）的区别：
+ *   - 不展示 ActionTimeline / ArtifactPanel / ContextDocs / MCP 面板 / repo / branch / role
+ *   - 不展示推进 / 再聊聊 / 通过 / 终结 / 删除按钮（chat 就是临时聊、删除走首页卡片入口）
+ *   - 只有 EventStream + 底部输入框、用户随时发消息
  *
- * 复用 EventStream 组件、它已经处理好：
- *   - 智能置底（用户往上滚就不强制）
- *   - 思考事件合并
- *   - 各类事件的 icon / 颜色
- *   - HITL 输入框（chat 模式 canReply 由父组件传、不限定 awaiting_user）
+ * 跟 V0.5 ChatView 的区别：
+ *   - 字段对齐 V0.6：task.runStatus 取代 task.status、不再依赖 phases
+ *   - SSE 走 watchTaskStream（统一通道、复用 task-runner publish）
+ *   - 客户端用 sendChatReply、后端 chat-reply 路由
  *
- * V0.4 自由化（用户拍板 2026-05-15）：
- *   - 删「启动 Chat」按钮 + /api/tasks/:id/start-chat 路由：合并到 /chat-reply
- *   - 任意状态下用户发消息都走 sendChatReply、后端按 status 决定要不要自动启 agent：
- *     - awaiting_user：正常对话回合（submitUserMessage 解 wait_for_user）
- *     - draft/completed/failed：自动启 agent + 把首条消息直接拼进 initialPrompt
- *       agent 第一次 turn 就回答用户首条、答完调 wait_for_user 进等待
- *   - 建任务时不强制填首条 / 仓库、整流程「建任务 → 输入 → 回复」三步搞定
- *
- * 状态机（前端视角）：
- *   - draft：输入框开、用户发消息 → 后端切 status=running + 启 agent → SSE 推回 awaiting_user
- *   - awaiting_user：输入框开、用户发消息 → 后端切 status=running → SSE 推回 awaiting_user
- *   - running：agent 正在说话、输入框 disable
- *   - completed / failed：输入框开、用户发消息 = 自动重启新一轮 SDK Run
- *
- * 架构：
- *   - 进入页面立即 watchChatStream（GET SSE）、无论任务什么状态、都先订阅
- *   - 输入框可用状态完全由 task.status 决定（+ isSubmitting 防双击）
- *   - 刷新页面 / 多 tab / 关浏览器再回来都能正确恢复 UI 状态
+ * 组件高度自治：
+ *   - 内部订阅 SSE、内部管 streamingText / isSubmitting
+ *   - 父组件只负责 task state 同步（onTaskUpdate / onEventAppend）
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
+import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { prepareRunArgs } from "@/lib/run-args";
-import {
-  sendChatReply,
-  type ChatReplyImage,
-} from "@/lib/task-store";
-import type { Task } from "@/lib/types";
+import { RUN_STATUS_LABEL, RUN_STATUS_VARIANT } from "@/lib/task-display";
+import { sendChatReply, type ImagePayload } from "@/lib/task-store";
+import type { Task, TaskEvent } from "@/lib/types";
 
 interface Props {
   task: Task;
-  // 由父组件传进来、ChatView 通过它把最新 task / event 推回去
+  // 父组件持 task state、ChatView 把最新 task / event 推回去（SSE 增量驱动）
   onTaskUpdate: (next: Task) => void;
-  onEventAppend: (ev: Task["events"][number]) => void;
+  onEventAppend: (ev: TaskEvent) => void;
 }
 
-export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
-  // 流式打字态：SDK 推 assistant chunk → 累加到这；收到 assistant_message 事件 → 清空（被正式事件取代）
+export const ChatView = ({
+  task,
+  onTaskUpdate,
+  onEventAppend,
+}: Props) => {
+  // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
   const [streamingText, setStreamingText] = useState("");
-  // 本地「提交中」标记：sendChatReply 网络调用期间 disable 输入框、防双击 + 视觉反馈
-  // 区别于 task.status="running"（后者是 agent 在说话）、这个是「请求飞行中」、通常 < 1s
+  // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
+  // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // 把 callback ref 化、避免 watch effect 因为父组件 re-render 反复重连
+
+  // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
   const onEventAppendRef = useRef(onEventAppend);
   onTaskUpdateRef.current = onTaskUpdate;
   onEventAppendRef.current = onEventAppend;
 
-  // 切 task 时把 streaming / submitting 重置（避免旧 buffer 串到新任务）
+  // 切 task 时把 streaming / submitting 重置
   useEffect(() => {
     setStreamingText("");
     setIsSubmitting(false);
@@ -73,8 +65,7 @@ export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
 
   useTaskWatch(task.id, {
     onEvent: (ev) => {
-      // 当 flush 后的正式 assistant_message 事件到达：清掉 streaming placeholder
-      // 避免「placeholder + 正式卡片」两段同时出现的重影
+      // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
       onEventAppendRef.current(ev);
     },
@@ -88,25 +79,18 @@ export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
   });
 
-  // 用户回复：无论 task.status 是什么、统一走 sendChatReply
-  // 后端 chat-reply 路由根据 status 自己决定：
+  // 用户回复：无论 task.runStatus 是什么、统一走 sendChatReply
+  // 后端 chat-reply 路由按 runStatus + hasPending 自己决定：
   //   - awaiting_user：解 wait_for_user（正常回合）
-  //   - draft/completed/failed：bootArgs 启 agent + 队列首条（自动启动）
+  //   - idle / error / completed：bootArgs 启 agent + 投递首条
   // 前端为最简化、永远附 bootArgs（后端用得上就用、用不上就忽略）
   const handleUserReply = useCallback(
-    async (
-      text: string,
-      images?: ChatReplyImage[],
-      attachments?: string[],
-    ) => {
-      // running 状态不应该走到这（UI 已 disable 输入）、防御性兜底
-      if (task.status === "running") {
-        toast.warning("agent 正在说话、等它先说完一段");
+    async (text: string, images?: ImagePayload[], attachments?: string[]) => {
+      if (task.runStatus === "running") {
+        toast.warning("agent 正在回、等它先说完一段");
         return;
       }
 
-      // prepareRunArgs 从 settings 拿 apiKey/model + 按 task 黑名单过滤 mcpServers
-      // 失败（缺 apiKey/model）会自己 toast、这里直接 return
       const args = prepareRunArgs(task);
       if (!args) return;
 
@@ -117,7 +101,6 @@ export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
           text,
           images,
           attachments,
-          // 永远传 bootArgs：后端在 awaiting_user 时不看、终态时才用
           {
             apiKey: args.apiKey,
             model: args.model,
@@ -126,8 +109,6 @@ export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
         );
         onTaskUpdateRef.current(latest);
         if (autoStarted) {
-          // 终态发消息触发了自动启动：提示用户「在启动 agent」
-          // task.status 已经从后端切到 running、UI 自动 disable 输入框
           toast.info("正在启动 agent、首条消息会在它就位后自动回复");
         }
       } catch (err) {
@@ -139,57 +120,84 @@ export const ChatView = ({ task, onTaskUpdate, onEventAppend }: Props) => {
     [task],
   );
 
-  // V0.4：输入框可用条件
+  // 输入框可用条件
   // - running：agent 在说话、disable
-  // - isSubmitting：网络请求飞行中、disable 防双击
-  // - 其它（draft / awaiting_user / completed / failed）：开放
-  const canReply = task.status !== "running" && !isSubmitting;
+  // - isSubmitting：请求飞行中、disable 防双击
+  // - 其它（idle / awaiting_user / error）：开放
+  const canReply = task.runStatus !== "running" && !isSubmitting;
 
-  // disabled 时输入框 placeholder + 底部状态文案
+  // disabled 时输入框 placeholder
   const disabledHint = (() => {
     if (isSubmitting) return "正在发送、稍候";
-    if (task.status === "running") return "agent 正在思考、稍候";
+    if (task.runStatus === "running") return "agent 正在思考、稍候";
     return undefined;
   })();
 
-  // 顶部状态条文案（V0.4 删启动按钮、纯文案告知当前状态）
+  // 顶部状态条文案
   const statusHint = (() => {
     if (isSubmitting) return "正在发送消息...";
-    if (task.status === "draft") {
-      return "直接在底部输入框开始对话、agent 会自动启动（整段对话 SDK 计费一次跑到底）";
+    if (task.runStatus === "running") {
+      return "agent 正在回、等它先说完一段";
     }
-    if (task.status === "running") {
-      return "agent 正在思考、等它先说完一段";
-    }
-    if (task.status === "awaiting_user") {
+    if (task.runStatus === "awaiting_user") {
       return "agent 在等你回复、随时输入";
     }
-    if (task.status === "completed") {
-      return "对话已结束。再发一条消息可继续聊、SDK 会按新一次 run 计费";
+    if (task.runStatus === "error") {
+      return "上一轮 agent 异常退出、再发一条可重启新一轮 run";
     }
-    if (task.status === "failed") {
-      return "Chat agent 异常退出。再发一条消息可自动重启新一轮 run";
-    }
-    return null;
+    return "直接在底部输入框开始对话、agent 会自动启动（整段对话 SDK 计费一次跑到底）";
   })();
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
-      {/* chat 顶部状态条：V0.4 删启动按钮、纯文案提示 */}
-      <div className="flex shrink-0 items-center gap-3 px-4 py-2">
-        <div className="text-xs text-muted-foreground">{statusHint}</div>
+      {/* 顶部 bar：title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片） */}
+      <div className="border-b bg-card/40 px-6 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h1 className="truncate text-base font-semibold tracking-tight">
+                {task.title}
+              </h1>
+              <Badge variant="outline" className="text-[10px]">
+                对话
+              </Badge>
+              {task.runStatus !== "idle" && (
+                <Badge
+                  variant={RUN_STATUS_VARIANT[task.runStatus]}
+                  className="text-[10px]"
+                >
+                  {RUN_STATUS_LABEL[task.runStatus]}
+                </Badge>
+              )}
+            </div>
+          </div>
+
+          {task.runStatus === "running" && (
+            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" />
+              AI 正在回
+            </div>
+          )}
+        </div>
+        {/* 状态条文案：始终展示、用户能看到当前阶段 */}
+        <div className="mt-1 text-xs text-muted-foreground">{statusHint}</div>
       </div>
+
       <Separator />
-      {/* 整段事件流撑满主区 */}
+
+      {/* 中间区：EventStream + 底部输入框 */}
       <div className="min-h-0 flex-1">
         <EventStream
           task={task}
           streamingText={streamingText}
+          onUserReply={handleUserReply}
           canReply={canReply}
           disabledHint={disabledHint}
-          onUserReply={handleUserReply}
         />
       </div>
+
+      {/* agent 误调 ask_user 时兜底（chat 模式 prompt 已禁、走这里基本不该发生） */}
+      <AskUserDialog task={task} />
     </div>
   );
 };
