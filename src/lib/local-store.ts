@@ -22,6 +22,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   repos: [],
   mcpServersJson: DEFAULT_MCP_JSON,
   username: "",
+  gitHost: "",
+  gitToken: "",
 };
 
 const isBrowser = (): boolean =>
@@ -82,6 +84,9 @@ export const getSettings = (): FeAiFlowSettings => {
       repos: Array.isArray(parsed.repos) ? parsed.repos : [],
       // V0.6 加：username 串行存档可能丢、强转 string 兜底
       username: typeof parsed.username === "string" ? parsed.username : "",
+      // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
+      gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
+      gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
     };
   } catch (err) {
     console.warn(

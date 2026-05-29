@@ -30,7 +30,7 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   plan: "出方案",
   build: "改代码",
   review: "代码复核",
-  ship: "提 MR",
+  ship: "提测",
   test: "AI 手测",
   learn: "沉淀",
 };
@@ -50,7 +50,7 @@ export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
   plan: "方案",
   build: "实现",
   review: "复核",
-  ship: "提 MR",
+  ship: "提测",
   test: "手测",
   learn: "沉淀",
 };

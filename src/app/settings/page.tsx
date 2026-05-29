@@ -35,6 +35,7 @@ import { ModelCard } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
+import { GitCard } from "@/components/settings/git-card";
 
 const SettingsPage = () => {
   const { settings, loaded, dirty, update, saveField } = useSettings();
@@ -78,6 +79,17 @@ const SettingsPage = () => {
         onChange={(v) => update("username", v)}
         dirty={dirty.username}
         onSave={() => saveField("username")}
+      />
+
+      <GitCard
+        gitHost={settings.gitHost ?? ""}
+        gitToken={settings.gitToken ?? ""}
+        onHostChange={(v) => update("gitHost", v)}
+        onTokenChange={(v) => update("gitToken", v)}
+        hostDirty={dirty.gitHost}
+        tokenDirty={dirty.gitToken}
+        onSaveHost={() => saveField("gitHost")}
+        onSaveToken={() => saveField("gitToken")}
       />
 
       <ModelCard

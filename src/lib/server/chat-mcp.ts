@@ -177,25 +177,72 @@ export type AwaitingSignal =
       actionId?: string;
     };
 
-type AwaitingNotifier = (signal: AwaitingSignal) => Promise<void> | void;
+export type AwaitingNotifier = (signal: AwaitingSignal) => Promise<void> | void;
+
+// ----------------- V0.6.1 ship action 用：task-scoped action handler -----------------
+//
+// 跟 awaitingNotifier 同款模式：runner 在启动 task 时按 taskId 注册一个 handler、
+// chat-mcp 里 submit_mr / set_feishu_testers MCP 工具拿到调用时、查表找到 handler 执行。
+//
+// 为什么不让 chat-mcp 直接 import gitlab-client / task-fs：
+//   - 维持模块依赖方向 task-runner → chat-mcp（反过来会形成循环）
+//   - 让 runner 全权决定 handler 内部行为（读 settings、调 gitlab-client、写 task.mrs[]）
+//   - chat-mcp 只负责 MCP transport + 工具路由、不知道 GitLab / 飞书 / task-fs 怎么工作
+//
+// 这套 handler 跟 awaitingNotifier 的本质区别：
+//   - awaitingNotifier 是「单向事件通知」（runner 用来更新 task 状态）、没返回值
+//   - taskActionHandler 是「同步 RPC」（agent 调 MCP 工具拿结果）、有结构化返回值
+
+export type ChatTaskAction =
+  | {
+      kind: "submit_mr";
+      actionId: string;
+      /** 本地仓库绝对路径、agent 从 shell `pwd` 取（用于 server 端 sideEffects 落档时区分仓） */
+      repoPath: string;
+      /** GitLab project path（如 `wkid/crm-web`、从 remote.origin.url 解析） */
+      projectPath: string;
+      sourceBranch: string;
+      targetBranch: string;
+      title: string;
+      description: string;
+      lastCommitHash: string;
+    }
+  | {
+      kind: "set_feishu_testers";
+      /** 当前 ship action 的 id（让「已记忆测试人员」info 事件挂到该 action、跟 submit_mr 对齐） */
+      actionId: string;
+      /** 飞书 user_id 列表（空数组 = 显式记忆「没测试人 / 跳过 @」） */
+      userIds: string[];
+    };
+
+export type ChatTaskActionResult =
+  | { ok: true; data?: Record<string, unknown> }
+  | { ok: false; error: string };
+
+export type ChatTaskActionHandler = (
+  action: ChatTaskAction,
+) => Promise<ChatTaskActionResult>;
 
 interface ChatMcpGlobalState {
   pendingMap: Map<string, PendingEntry>;
   waitingTasks: Set<string>;
   awaitingNotifiers: Map<string, AwaitingNotifier>;
+  // V0.6.1：runner 注册的 task-scoped action handler（submit_mr / set_feishu_testers）
+  taskActionHandlers: Map<string, ChatTaskActionHandler>;
   sessionTransports: Map<string, WebStandardStreamableHTTPServerTransport>;
   // V0.3.5 仍保留：token → taskId 映射、wait-ack 路由验 token 合法性用
   // 生命周期：wait_for_user/ask_user MCP 工具调用时写、submitXxx/cancelPending 清
   tokenToTask: Map<string, string>;
 }
 
+// V8：2026-05-28 V0.6.1 加 taskActionHandlers（submit_mr / set_feishu_testers）
 // V7：2026-05-27 V0.6 字段重命名（phase → actionId / artifact → artifactPath / 新增 next_action kind）
 // V6：2026-05-15 删 pendingFirstMessage（chat 自由化首条改进 prompt 注入、不走队列）
 // V5：2026-05-15 加 pendingFirstMessage（已撤销）
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
 // → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV7__";
+const GLOBAL_KEY = "__feAiFlowChatStateV8__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -205,6 +252,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       pendingMap: new Map(),
       waitingTasks: new Set(),
       awaitingNotifiers: new Map(),
+      taskActionHandlers: new Map(),
       sessionTransports: new Map(),
       tokenToTask: new Map(),
     };
@@ -439,6 +487,7 @@ export const getWaitAckKeepaliveMs = (): number => WAIT_ACK_KEEPALIVE_MS;
 // 各自 wait_for_user 调用按 task_id 路由到自己的 notifier、互不干扰。
 
 const awaitingNotifiers = getGlobalState().awaitingNotifiers;
+const taskActionHandlers = getGlobalState().taskActionHandlers;
 
 /**
  * 给某个 task 注册（或取消注册）"等待用户"通知器。
@@ -463,6 +512,92 @@ export const setChatAwaitingNotifier = (
     console.log(
       `[chat-mcp] setChatAwaitingNotifier 注销 task=${taskId} 剩余 ${awaitingNotifiers.size} 个`,
     );
+  }
+};
+
+/**
+ * V0.6.1：给 task 注册（或注销）task-scoped action handler（submit_mr / set_feishu_testers）
+ *
+ * 调用时机：task-runner 启动 task 时注册一次、task 结束（cleanupChatTaskState）时注销
+ *
+ * @param taskId 目标 task id
+ * @param handler 传 null 表示注销
+ */
+export const setChatTaskActionHandler = (
+  taskId: string,
+  handler: ChatTaskActionHandler | null,
+): void => {
+  if (handler) {
+    taskActionHandlers.set(taskId, handler);
+    console.log(
+      `[chat-mcp] setChatTaskActionHandler 注册 task=${taskId} 当前 ${taskActionHandlers.size} 个`,
+    );
+  } else {
+    taskActionHandlers.delete(taskId);
+    console.log(
+      `[chat-mcp] setChatTaskActionHandler 注销 task=${taskId} 剩余 ${taskActionHandlers.size} 个`,
+    );
+  }
+};
+
+/**
+ * V0.6.1 race fix：conditional unset——只在「当前注册的就是 expected 这个实例」时才注销。
+ *
+ * 为什么需要：force-new-agent 时若旧 SDK Run cancel 卡 >5s、forceClearStaleRunnerState 先清
+ * runningTasks、新 agent 接着 setChatTaskActionHandler(newHandler) 注册、旧 agent 迟到的 finally
+ * 若无条件 delete(taskId) 会把 newHandler 误清、导致新 agent 调 submit_mr 拿不到 handler、ship 挂住。
+ * 改成「比对实例引用」：旧 finally 发现表里已是 newHandler（!== oldHandler）就不动、保住新 handler。
+ */
+export const unsetChatTaskActionHandlerIf = (
+  taskId: string,
+  expected: ChatTaskActionHandler,
+): void => {
+  if (taskActionHandlers.get(taskId) === expected) {
+    taskActionHandlers.delete(taskId);
+    console.log(
+      `[chat-mcp] unsetChatTaskActionHandlerIf 注销 task=${taskId}（命中自身实例）剩余 ${taskActionHandlers.size} 个`,
+    );
+  } else {
+    console.log(
+      `[chat-mcp] unsetChatTaskActionHandlerIf 跳过 task=${taskId}（已被新实例覆盖、保留新 handler）`,
+    );
+  }
+};
+
+/** 同 unsetChatTaskActionHandlerIf、对 awaitingNotifier 做 conditional unset（V0.5 沿用的同款 race 一并修） */
+export const unsetChatAwaitingNotifierIf = (
+  taskId: string,
+  expected: AwaitingNotifier,
+): void => {
+  if (awaitingNotifiers.get(taskId) === expected) {
+    awaitingNotifiers.delete(taskId);
+    console.log(
+      `[chat-mcp] unsetChatAwaitingNotifierIf 注销 task=${taskId}（命中自身实例）剩余 ${awaitingNotifiers.size} 个`,
+    );
+  } else {
+    console.log(
+      `[chat-mcp] unsetChatAwaitingNotifierIf 跳过 task=${taskId}（已被新实例覆盖、保留新 notifier）`,
+    );
+  }
+};
+
+// 跑 task-scoped action handler、序列化结果给 MCP 工具返
+const runTaskAction = async (
+  taskId: string,
+  action: ChatTaskAction,
+): Promise<ChatTaskActionResult> => {
+  const handler = taskActionHandlers.get(taskId);
+  if (!handler) {
+    return {
+      ok: false,
+      error: `task=${taskId} 没注册 handler（task 没在跑 / 已结束、不应该调本工具）`,
+    };
+  }
+  try {
+    return await handler(action);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `handler 抛错：${msg}` };
   }
 };
 
@@ -849,6 +984,169 @@ const buildMcpServer = (): McpServer => {
     },
   );
 
+  // ----------------- submit_mr 工具（V0.6.1、ship action 专用、同步调 GitLab API）-----------------
+  //
+  // 这是「同步 RPC 工具」、跟 wait_for_user / ask_user 的「长阻塞 + shell long-poll」完全不同：
+  //   - 不需要等用户操作、纯 server-side 调 GitLab REST API、立即返回结果
+  //   - 不需要写 shell + curl 引导、agent 拿到 MCP 结果就接着推进
+  //   - 不需要 token / pendingMap：每次调用 server 自己访问 GitLab 即可
+  //
+  // 调用前置条件（agent 自己保证、server 不校验）：
+  //   - branch 已 push 到 origin（不然 GitLab 创 MR 会报 source_branch 不存在）
+  //   - last_commit_hash 是 push 后的最新 commit hash（用 `git rev-parse HEAD` 拿）
+  srv.registerTool(
+    "submit_mr",
+    {
+      title: "提交 GitLab MR（ship action 专用、server 同步调 REST API）",
+      description: [
+        "ship action 跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
+        "",
+        "## 调用前置（agent 自己保证）",
+        "",
+        "1. `git push origin <branch>` 已成功（不然 GitLab 创 MR 会报 source_branch 不存在）",
+        "2. 用 `git rev-parse HEAD` 拿当前最新 commit hash、作为 `last_commit_hash` 入参",
+        "3. 用 `git config --get remote.origin.url` 拿 GitLab project path（如 `wkid/crm-web`）",
+        "",
+        "## 多仓 task：每仓调一次本工具",
+        "",
+        "ship action 内部如果 task 涉及多个仓、对每个仓独立 `cd` + `git push` + 本工具调用、每仓拿一条 MR。",
+        "如果某仓没改动（`git diff` 为空）、跳过该仓不调本工具、在 artifact 里说明「<仓名> 本次无改动、跳过 push + MR」。",
+        "",
+        "## 返回值",
+        "",
+        "成功：`{ ok: true, data: { mr_url: \"https://gitlab.../merge_requests/123\", mr_iid: 123, mr_version: 2 } }`",
+        "  - `mr_url`：MR 网页 URL、直接给用户点开",
+        "  - `mr_iid`：GitLab project 内 MR 编号（用户看到的 !N、不是全局 ID）",
+        "  - `mr_version`：本仓累计 push 次数（首次=1、之后每次 ship ++、用于在 MR description 里标 `v2 / v3` 等）",
+        "",
+        "失败：`{ ok: false, error: \"<人类可读错误>\" }`",
+        "  - 常见错误：token 失效 / project 不存在 / branch 不存在 / 已有同 source MR、agent 把错误内容简短告诉用户即可、不要自己重试",
+        "",
+        "## 调用礼仪",
+        "",
+        "- 调用前不发 assistant_message「我要提测了」之类、对用户透明",
+        "- 调用后拿到 `mr_url` 直接落到 artifact、ack 时用户能看到 MR 链接",
+      ].join("\n"),
+      inputSchema: {
+        task_id: z.string().describe("任务 id"),
+        action_id: z.string().describe("当前 ship action 的 id"),
+        repo_path: z
+          .string()
+          .describe(
+            "本地仓库绝对路径（如 `/Users/clj/Documents/crm-web`、agent 从 `pwd` 取、用于 server 端区分多仓的 sideEffects）",
+          ),
+        project_path: z
+          .string()
+          .describe(
+            "GitLab project path（如 `wkid/crm-web`、从 `git config --get remote.origin.url` 解析、不含 host）",
+          ),
+        source_branch: z
+          .string()
+          .describe("MR 源分支（task.gitBranches 里这仓对应的 branch name）"),
+        target_branch: z
+          .string()
+          .describe("MR 目标分支（公司提测工作流写死 `test`、不要探 origin/HEAD 拿 master/main）"),
+        title: z.string().describe("MR 标题（建议格式：`[role] <task.title>`）"),
+        description: z
+          .string()
+          .describe(
+            "MR 描述（建议含飞书 story 链接 / plan artifact 摘要 / 多次 ship 时标注 v2 / v3）",
+          ),
+        last_commit_hash: z
+          .string()
+          .describe("当前 branch 最新 commit hash（`git rev-parse HEAD`）"),
+      },
+    },
+    async ({
+      task_id,
+      action_id,
+      repo_path,
+      project_path,
+      source_branch,
+      target_branch,
+      title,
+      description,
+      last_commit_hash,
+    }) => {
+      console.log(
+        `[chat-mcp] submit_mr task=${task_id} action=${action_id} repo=${repo_path} project=${project_path} src=${source_branch}→${target_branch}`,
+      );
+      const result = await runTaskAction(task_id, {
+        kind: "submit_mr",
+        actionId: action_id,
+        repoPath: repo_path,
+        projectPath: project_path,
+        sourceBranch: source_branch,
+        targetBranch: target_branch,
+        title,
+        description,
+        lastCommitHash: last_commit_hash,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
+  // ----------------- set_feishu_testers 工具（V0.6.1、ship action 用）-----------------
+  //
+  // 把探测 / 用户填的飞书测试人员 lark_user_id 列表持久化到 task.feishuTesterUserIds。
+  // 同 task 后续 ship 不再探测 / 不再问用户、agent 直接读 task 里的字段拼飞书评论。
+  //
+  // 空数组 = 显式记忆「没测试人 / 用户选了跳过 @」、跟 undefined 区分。
+  srv.registerTool(
+    "set_feishu_testers",
+    {
+      title: "持久化飞书 story 测试人员 user_id 列表（ship action 用）",
+      description: [
+        "把当前 task 关联的飞书 story 测试人员 lark_user_id 列表写到 task.feishuTesterUserIds。",
+        "",
+        "## 什么时候调",
+        "",
+        "首次 ship action 内、按以下顺序探测：",
+        "  1. 调飞书 MCP 的 `list_workitem_role_config` + `get_workitem_brief` 抓「测试」角色字段",
+        "  2. 调 `search_user_info` 把 username / email 转 lark_user_id",
+        "  3. 探到任意人 → 调本工具持久化 / 探不到 → 调 ask_user 让用户填用户名 + 用本工具落库",
+        "",
+        "同 task 后续 ship action 直接读 `task.feishuTesterUserIds`、**不再调本工具 / 不再探测 / 不再问用户**。",
+        "",
+        "## 入参",
+        "",
+        "- `action_id`：当前 ship action 的 id",
+        "- `user_ids`：lark_user_id 数组、可以空（= 显式记忆「这个 task 没测试人 / 跳过 @」）",
+        "",
+        "## 返回值",
+        "",
+        "- 成功：`{ ok: true }`",
+        "- 失败：`{ ok: false, error: \"...\" }`（一般是 task 没在跑了）",
+      ].join("\n"),
+      inputSchema: {
+        task_id: z.string().describe("任务 id"),
+        action_id: z
+          .string()
+          .describe("当前 ship action 的 id（让「已记忆测试人员」事件挂到该 action、跟 submit_mr 对齐）"),
+        user_ids: z
+          .array(z.string())
+          .describe(
+            "飞书 lark_user_id 数组、可以为空数组（= 记忆「跳过 @ 测试人员」）",
+          ),
+      },
+    },
+    async ({ task_id, action_id, user_ids }) => {
+      console.log(
+        `[chat-mcp] set_feishu_testers task=${task_id} action=${action_id} userIds=${user_ids.length}`,
+      );
+      const result = await runTaskAction(task_id, {
+        kind: "set_feishu_testers",
+        actionId: action_id,
+        userIds: user_ids,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
   return srv;
 };
 
@@ -1203,8 +1501,9 @@ export const cancelPending = (taskId: string): boolean => {
 export const cleanupChatTaskState = (taskId: string): void => {
   // 1) 如果还有 pending、先 resolve cancelled 让 agent 退出（finalizeEntry 已清 token / waitingTasks）
   cancelPending(taskId);
-  // 2) 清 notifier（waitingTasks 已在 cancelPending 里清）
+  // 2) 清 notifier / task action handler（waitingTasks 已在 cancelPending 里清）
   awaitingNotifiers.delete(taskId);
+  taskActionHandlers.delete(taskId);
 };
 
 /**

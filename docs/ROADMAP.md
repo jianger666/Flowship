@@ -2,30 +2,30 @@
 
 > 渐进式、不一次性做完。每个阶段验证 ROI 后再投资源。
 
-> ⚠️ **2026-05-28 同步**：V0.6.0 核心重构（phase chain → task 容器 + action 历史）已落地、V0.6.0.1 持续打磨期收尾、用户准备切下一手 AI 开发后端能力。**当前架构**看 `docs/HANDOFF.md`「当前架构快照」段；V0.5 及之前的历史看 `docs/CHANGELOG.md`（时间倒序、新在上）；V0.6 重构设计文档 `docs/V0.6-REFACTOR.md` 已 archived。
+> ⚠️ **2026-05-28 同步**：V0.6.0 核心重构（phase chain → task 容器 + action 历史）已落地、V0.6.0.1 持续打磨期收尾、V0.6.1 ship action 上线（server-side GitLab REST + 多仓 MR + 飞书 @ 测试人员）。**当前架构**看 `docs/HANDOFF.md`「当前架构快照」段；V0.5 及之前的历史看 `docs/CHANGELOG.md`（时间倒序、新在上）；V0.6 重构设计文档 `docs/V0.6-REFACTOR.md` 已 archived。
 
 ---
 
-## V0.6.0 + V0.6.0.1 已落地（2026-05-27 ~ 2026-05-28）
+## V0.6.0 + V0.6.0.1 + V0.6.1 已落地（2026-05-27 ~ 2026-05-28）
 
 V0.5 phase chain 模型废弃、改为 **task 容器 + action 历史** 模型：
 
 - **task 容器**：单个需求生命周期、双状态（`repoStatus` 业务状态 + `runStatus` agent 运行时状态）
-- **action 历史**：6 + 1 种 action（`plan / build / review / ship / test / learn / chat`）、任意触发不强制顺序、N 单调递增
+- **action 历史**：6 种 action（`plan / build / review / ship / test / learn`）、任意触发不强制顺序、N 单调递增（chat 不是 action、走独立 mode、见下条）
 - **mode 区分**：`task` 模式走 action 体系、`chat` 模式走独立 chat-runner（V0.6.0.1 重新剥离）
 - **6 个 harness 门槛**：action 前置准入 / 后置 deterministic check / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（P2 留 V0.6.4+）/ placeholder 动态
 - **单 SDK Run 永生**：整 task 跑在一个 Run、不一个 action 一个 Run、shell + curl long-poll 保活
 - **V0.5 兼容代码 / 数据全删**（不写 migration、开发期重置 `data/tasks/*`）
 
-V0.6.0.1 体验断点 10 条修完（详见 HANDOFF V0.6.0.1 段）、`pnpm typecheck` + `pnpm lint` 双绿。
+V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓 MR / 飞书 @ 测试人员）。`pnpm typecheck` + `pnpm lint` 三版本都双绿。详细演进看 HANDOFF V0.6.1 + V0.6.0.1 段（V0.6.0 已迁 `docs/CHANGELOG.md`）。
 
 ---
 
-## V0.6.1+ 待办（不一次性做完、按 ROI 排）
+## V0.6.2+ 待办（不一次性做完、按 ROI 排）
 
 | 版本 | 内容 | 工时 | 关键依赖 |
 |---|---|---|---|
-| **V0.6.1**（ship action）| gh CLI / glab CLI + 飞书 MCP + MR 追踪字段 + git branch checkout 自动化 | 1-2 天 | git branch 已 V0.6.0 实装、ship 走通后才能解锁多 MR |
+| ~~V0.6.1（ship action）~~ | ✅ V0.6.1 已上线、server-side GitLab REST + 多仓 MR + A+C 飞书 @ 测试人员 | done | done |
 | **V0.6.2**（test action）| 飞书测试用例 + AI 手测能力 | 1-2 天 | 飞书 MCP 已接入 |
 | **V0.6.3**（learn action）| HITL 落库 dialog + super-prompt 自动注入 AGENTS.md | 1-2 天 | merged 后触发、需先有真实合入 task 验证 |
 | **V0.6.4+**（高级）| cross-action 一致性自检（门槛 5）/ MR 状态 polling / learn 自动 cleanup / worktree 隔离 | TBD | 需要前 3 个版本积累足够 task 数据再决定 |
@@ -55,7 +55,7 @@ V0.6.0.1 体验断点 10 条修完（详见 HANDOFF V0.6.0.1 段）、`pnpm type
 - [ ] 比较同一 task 多次执行的 plan 差异（actions/ 时间序差值可视化）
 - [ ] 多语言 prompt 模板（B / C 端分开）
 - [ ] 团队共享 prompt 库（git submodule？）
-- [ ] task 卡片右键菜单（快速 archive / mark merged / 改 mainBranch）
+- [ ] task 卡片右键菜单（快速 archive / mark merged）
 
 ---
 

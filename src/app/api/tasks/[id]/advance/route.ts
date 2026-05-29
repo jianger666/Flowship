@@ -61,6 +61,10 @@ interface PostBody {
   mcpServers?: Record<string, McpServerConfig>;
   forceNewAgent?: boolean;
   username?: string;
+  // V0.6.1 ship action 用：GitLab host + PAT、ship 准入校验 + agent 调 submit_mr 时用
+  // 非 ship action 时为空字符串也 OK、不参与校验
+  gitHost?: string;
+  gitToken?: string;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -180,6 +184,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       userMcpServers,
       forceNewAgent: body.forceNewAgent === true,
       username: body.username?.trim() || undefined,
+      gitHost: body.gitHost?.trim() || undefined,
+      gitToken: body.gitToken?.trim() || undefined,
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

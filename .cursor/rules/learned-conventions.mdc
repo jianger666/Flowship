@@ -140,3 +140,21 @@ alwaysApply: true
   <span className="truncate flex-1 min-w-0" title={...}>{longText}</span>
   ```
 - **`wrap-anywhere`**（Tailwind 4 = `overflow-wrap: anywhere`）让无空格长字符串能折断、配合 `<pre>` / 自定义 mono 文本块用
+
+## review / bug 排查：先验证事实再下结论（V0.6.1 review 踩过、用户拍板）
+
+- **不要凭推理 / 凭记忆下 bug 结论**——读真实代码 / 配置 / 数据确认后再说。典型反例：V0.6.1 review 判定 `checkShip` 正则会漏检、却没读 `action-ship.md` 的格式约束、其实 prompt 强制了表格（repoTail 在前 / 跳过在后）、forward 正则能命中、bug 不成立。
+- **构造的假想例子必须明标「构造」、不当证据**——举例说 bug 场景（如「agent 写『跳过 crm-web』会漏检」）要讲清是假想、不是从真实 artifact 读到的。把假想例子当证据 = 高估 bug。
+- **被 challenge 后第一反应是回头核实、不是辩解**——用户质疑某条结论时、先读真实代码 / 数据验证、错了就明确更正 + 降级优先级。
+- **方法论（蓝军 + RCA）**：读真实代码确认行号逻辑 → 主动证伪「这是 bug」→ 攻不破才是真 bug → 标注触发条件 + 概率。
+
+## MCP 工具 schema 的 describe 要和 prompt 指令一致（V0.6.1 踩过）
+
+- **工具 `inputSchema` 的 `.describe()` 是 agent 会读的「第二指令源」**——跟 prompt 冲突会把 agent 带偏。典型反例：`submit_mr` 的 `target_branch` describe 写「探 `origin/HEAD` 拿 master」、但 `action-ship.md` 写「写死 `test`」、两个矛盾指令可能让 agent 提 MR 到错误分支。
+- 改 prompt 里某工具的用法约定时、**一并核对该工具在 `chat-mcp.ts` 注册处的 describe**、别让两边漂移。
+
+## task-scoped handler / notifier 注销用 conditional unset（V0.6.1 踩过）
+
+- chat-mcp 的 `taskActionHandler` / `awaitingNotifier` 按 taskId 存单例 Map、force-new-agent 时新旧 agent 共享同一 key。
+- 旧 agent finally **注销前比对实例引用**（`if (map.get(taskId) === expected) map.delete(taskId)`）、只清「自己注册的那个」——否则旧 agent 迟到的 finally 会误清新 agent 刚注册的 handler、submit_mr 就拿不到 handler。
+- 用 `unsetChatTaskActionHandlerIf(taskId, expected)` / `unsetChatAwaitingNotifierIf`、不要无条件 `set(taskId, null)`。

@@ -8,11 +8,12 @@
  *     UI 上挂红条「后置检查未过」、用户可以选 revise 让 agent 改
  *   - 检查通过：postCheck.passed=true、UI 上挂绿条
  *
- * 检查内容（V0.6.0.1 范围、用户拍板删 plan 黑名单 grep 后简化）：
+ * 检查内容（V0.6.1 范围、用户拍板删 plan 黑名单 grep 后简化）：
  *   - plan: artifact 文件存在 + 内容长度 >= 100
  *   - build: pnpm typecheck exit 0 + pnpm lint exit 0 + git status 有改动
  *   - review: git diff hash 跟 artifact 写的一致（防 agent 编造 diff）
- *   - ship/test/learn: V0.6.0 stub、暂不实现
+ *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
+ *   - test/learn: V0.6.2+ stub、暂不实现
  *   - chat 不走本机制（chat 是独立 mode、不复用 action 体系、详见 chat-runner.ts）
  *
  * 关于 plan「黑名单 grep」的历史决策（2026-05-28 用户拍板删）：
@@ -54,11 +55,12 @@ export const runActionCheck = async (
         return await checkBuild(task, action);
       case "review":
         return await checkReview(task, action);
-      // V0.6.0 stub：ship / test / learn 暂不实现、走兜底通过
       case "ship":
+        return await checkShip(task, action);
+      // V0.6.2+ stub：test / learn 暂不实现、走兜底通过
       case "test":
       case "learn":
-        return { passed: true, details: `${action.type} action V0.6.0 未实现、跳过检查` };
+        return { passed: true, details: `${action.type} action V0.6.2+ 未实现、跳过检查` };
       default: {
         const _: never = action.type;
         return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
@@ -267,6 +269,99 @@ const checkReview = async (
   return {
     passed: true,
     details: "review artifact 4 类差异段齐全、git hash 一致",
+  };
+};
+
+// ----------------- ship（V0.6.1）-----------------
+//
+// 检查目标：agent 没漏报 MR、没编造 URL、跳过的仓有原因
+// 跳过场景（合法）：某仓 git diff 为空 / 用户指定单仓 ship 等、agent 在 artifact §X「跳过原因」段说明
+//
+// 检查算法：
+//   1. 收集 action.sideEffects.mrs[] 里所有 repoPath
+//   2. 跟 task.repoPaths[] 对比、缺失的仓必须在 artifact 里出现「跳过 / skip」关键词
+//   3. 所有 MR 记录的 mrUrl 非空（防编造）
+const checkShip = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult> => {
+  if (!action.artifactPath) {
+    return { passed: false, details: "ship 没产出 artifact" };
+  }
+  const absPath = getActionArtifactPath(task.id, action.n, action.type);
+  let content: string;
+  try {
+    content = await fs.readFile(absPath, "utf-8");
+  } catch (err) {
+    return {
+      passed: false,
+      details: `ship artifact 读取失败：${absPath}（${err instanceof Error ? err.message : String(err)}）`,
+    };
+  }
+
+  const mrRecords = action.sideEffects?.mrs ?? [];
+  const reportedRepoPaths = new Set(mrRecords.map((m) => m.repoPath));
+  const targetRepoPaths = task.repoPaths;
+
+  const sections: string[] = [];
+  let allPassed = true;
+
+  // 1) 每条 MR 记录必须 URL 非空
+  const missingUrl = mrRecords.filter((m) => !m.mrUrl || m.mrUrl.trim().length === 0);
+  if (missingUrl.length > 0) {
+    allPassed = false;
+    sections.push(
+      `❌ ${missingUrl.length} 条 MR 记录 URL 为空（${missingUrl.map((m) => m.repoPath).join(", ")}）`,
+    );
+  } else if (mrRecords.length > 0) {
+    sections.push(
+      `✅ ${mrRecords.length} 条 MR 记录、URL 都非空：\n${mrRecords
+        .map((m) => `   - ${m.repoPath}（v${m.mrVersion}）: ${m.mrUrl}`)
+        .join("\n")}`,
+    );
+  }
+
+  // 2) 没提测（没创建 MR）的仓必须有跳过说明
+  const skippedRepos = targetRepoPaths.filter((p) => !reportedRepoPaths.has(p));
+  if (skippedRepos.length > 0) {
+    const skipMissingReason: string[] = [];
+    // 跳过说明关键词：agent 在 artifact §3 备注列写的「跳过 / 无改动」等
+    const SKIP_KEYWORDS = "跳过|skip|无改动|无需|未改";
+    for (const repo of skippedRepos) {
+      // 粗匹配兜底：repo 末段名（如 crm-web）与 skip 关键词在 200 字窗口内相邻即算「写了原因」
+      // 双向都判（仓名在前 / 关键词在前都算）——agent 自然语序两种都可能、单向会漏检（V0.6.1 review 修）
+      // 已知局限：同名末段多仓（/a/client + /b/client）仍可能互相借用说明、公司场景不出现、留 V0.6.4 严格化
+      const repoTail = repo.split("/").filter(Boolean).pop() ?? repo;
+      const tailEsc = repoTail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const forward = new RegExp(`${tailEsc}[\\s\\S]{0,200}(${SKIP_KEYWORDS})`, "i");
+      const backward = new RegExp(`(${SKIP_KEYWORDS})[\\s\\S]{0,200}${tailEsc}`, "i");
+      if (!forward.test(content) && !backward.test(content)) {
+        skipMissingReason.push(repo);
+      }
+    }
+    if (skipMissingReason.length > 0) {
+      allPassed = false;
+      sections.push(
+        `❌ 以下仓没创建 MR、artifact 里也找不到跳过说明：${skipMissingReason.join(", ")}（agent 漏报）`,
+      );
+    } else {
+      sections.push(
+        `✅ ${skippedRepos.length} 个仓被跳过、artifact 里都写了原因：${skippedRepos.join(", ")}`,
+      );
+    }
+  }
+
+  // 3) 必须至少提 1 个 MR 或跳过所有仓——都没的话 ship 没产出
+  if (mrRecords.length === 0 && skippedRepos.length === 0) {
+    allPassed = false;
+    sections.push(
+      "❌ ship 没产出任何 MR、也没声明跳过所有仓（agent 可能空跑）",
+    );
+  }
+
+  return {
+    passed: allPassed,
+    details: sections.length > 0 ? sections.join("\n\n") : "ship 检查通过",
   };
 };
 

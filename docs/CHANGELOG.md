@@ -15,6 +15,63 @@
 
 ---
 
+### V0.6.0：核心重构（2026-05-27）
+
+**整体**：按 `docs/V0.6-REFACTOR.md` 落地核心模型重构。从 phase chain 切到 task 容器 + action 历史、动了 30+ 文件、删 4 个旧路由 + 4 个旧组件、新增 ActionTimeline 等组件。V0.5 兼容代码 / 数据彻底删（不写 migration、开发期清空 data/tasks/*）。`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+#### Day 1：Schema + Runner 骨架
+
+- `src/lib/types.ts` 大改:ActionType / ActionStatus / RepoStatus / RunStatus / ActionRecord / MRRecord / GitBranchInfo 加入；V0.5 LegacyPhaseId / LegacyTaskData / task.legacy 等类型彻底删
+- `src/lib/server/task-fs.ts` 大改:appendAction / patchAction / setTaskRepoStatus / setTaskRunStatus / snapshotActionArtifact 等 V0.6 API；isValidMetaShape 取代 isLegacyMeta（不匹配的 meta.json 直接 skip、不再 hydrate 老 task）
+- `src/lib/server/task-runner.ts` 新增:整合 plan-runner + chat-runner、统一 advanceTask / acknowledgeAction / finalizeTask
+- `src/lib/server/chat-mcp.ts` 大改:phase_* → action_*、submitNextAction / submitTaskTerminate 新增
+
+#### Day 2：Prompt 重组
+
+- `prompts/_super.md` 大改:一次性注入 7 种 action prompt + action history + first NEXT_ACTION 指令
+- `prompts/_shared.md` 中改:phase → action 字眼、跨 action 一致性约束
+- `phase-1-plan.md` → `action-plan.md`、`phase-2-build.md` → `action-build.md`、`phase-3-review.md` → `action-review.md`、骨架沿用 V0.5.15 改完版本、加准入 / 后置 / anti-patterns 段
+- `action-ship.md` / `action-test.md` / `action-learn.md` / `action-chat.md` 新建（前 3 个是 V0.6.1+ 设计草稿、stub）
+
+#### Day 3：UI 改造
+
+- 删 `chat-view.tsx` / `phase-progress.tsx` / `approve-phase-dialog.tsx`（V0.6 不需要）
+- 删旧路由:`start-workflow` / `phase-ack` / `chat-reply` / `watch-chat` / `artifact-revisions` / `artifact-diff`
+- 新增路由:`advance` / `action-ack` / `finalize` / `watch-task` / `action-revisions` / `action-diff`
+- `task-card.tsx` 重写:双状态 badge + 最近 action 简略
+- `new-task-dialog.tsx` 重写:删 mode、全字段选填
+- `advance-dialog.tsx` 重写:选 action 类型 + 用户指令 + forceNewAgent
+- `action-timeline.tsx` 新增:横向 chip + 状态点
+- `artifact-panel.tsx` 重写:接收 ActionRecord + 异步加载 content
+- `task page` 重写:删 chat-view 分支、单一布局
+- V0.5 兼容代码彻底删（LegacyTaskView 没保留、hydrateTaskLegacy 删、各路由 task.legacy 守卫删）
+- `revise-dialog.tsx` 适配:phaseLabel → actionLabel
+- `event-stream` 系列适配:phase → actionId
+- `settings/repo-card.tsx` 加 `mainBranch` 字段输入（注：V0.6.1 重新废弃、base branch 由 agent 自探）
+- `settings/user-profile-card.tsx` 新增:`username` 字段
+
+#### Day 4：6 个 Harness 门槛 P0+P1
+
+- `src/lib/server/action-checks.ts` 新增:plan 黑名单 grep / build typecheck+lint+git status / review 4 类段 + hash 一致（plan 黑名单 V0.6.0.1 已删、详见上方）
+- `task-runner.ts` 在切 awaiting_ack 前调 `runActionCheck`、写 `action.postCheck`
+- `advance-dialog.tsx` 加 `inferDisabledReason` + `inferRecommended` + `buildPlaceholder`、推荐 / 灰掉 / 动态 placeholder 三件套
+
+#### 关键设计决策（不要回头）
+
+1. phase 顺序拆掉、action 任意触发
+2. 单 task 多 MR、`Task.mrs` 列表追踪（V0.6.1 ship 上线时填）
+3. chat 吸收为 `action=chat`、删 chat-runner（V0.6.0.1 又拉回 chat 模式 / 独立 runner）
+4. 单 SDK Run 永生（同 V0.5）
+5. V0.6.0 实装 plan/build/review/chat、ship/test/learn 是 V0.6.1+ stub
+6. 老 V0.5 task 只读、不写 migration
+
+#### 没做的事
+
+- ship / test / learn action 实际跑通（V0.6.1+ 分版本上）
+- 门槛 5 cross-action 一致性自检（V0.6.4+）
+- MR 状态 polling（V0.6.4+）
+- learn 自动 cleanup（V0.6.4+）
+
 ### V0.5.16-design：V0.6 重构设计纪要（2026-05-27、代码未动）
 
 **整体**：跟用户深入对齐工作流（飞书需求 → 多个 MR → 测试反馈 → 改代码再提 → 最终合入）后、确认 V0.5 phase chain 模型存在系统性错配。决定重构为 task 容器 + action history 模型、设计文档落 `docs/V0.6-REFACTOR.md`。**本子版本只产文档、不动代码**——后续 V0.6.0 实际落地代码。

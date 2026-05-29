@@ -35,16 +35,22 @@ export interface UseSettingsResult {
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
-// - apiKey / mcpServersJson / username：字符串直接 ===
-// - defaultModel：嵌套对象、JSON.stringify 简单粗暴但够用（量很小）
+// - apiKey / mcpServersJson / username / gitHost / gitToken：字符串直接 ===
+// - defaultModel：嵌套对象、id + params 数组按位比较
 // - repos：数组、长度 + 每项 path/name 比较
 const isFieldEqual = (
   key: SettingsField,
   a: FeAiFlowSettings,
   b: FeAiFlowSettings
 ): boolean => {
-  if (key === "apiKey" || key === "mcpServersJson" || key === "username") {
-    return a[key] === b[key];
+  if (
+    key === "apiKey" ||
+    key === "mcpServersJson" ||
+    key === "username" ||
+    key === "gitHost" ||
+    key === "gitToken"
+  ) {
+    return (a[key] ?? "") === (b[key] ?? "");
   }
   if (key === "repos") {
     if (a.repos.length !== b.repos.length) return false;
@@ -90,6 +96,8 @@ export const useSettings = (): UseSettingsResult => {
       repos: !isFieldEqual("repos", settings, savedSettings),
       mcpServersJson: !isFieldEqual("mcpServersJson", settings, savedSettings),
       username: !isFieldEqual("username", settings, savedSettings),
+      gitHost: !isFieldEqual("gitHost", settings, savedSettings),
+      gitToken: !isFieldEqual("gitToken", settings, savedSettings),
     }),
     [settings, savedSettings]
   );

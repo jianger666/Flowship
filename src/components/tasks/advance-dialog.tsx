@@ -53,15 +53,15 @@ import { getSettings } from "@/lib/local-store";
 import { ACTION_LABEL } from "@/lib/task-display";
 import type { ActionType, ModelSelection, Task } from "@/lib/types";
 
-// V0.6.0 已实装的 action 类型；ship/test/learn 灰掉
+// V0.6.1 已实装的 action 类型；test/learn 灰掉
 // V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
-const IMPLEMENTED_ACTIONS: ActionType[] = ["plan", "build", "review"];
-const STUB_ACTIONS: ActionType[] = ["ship", "test", "learn"];
+const IMPLEMENTED_ACTIONS: ActionType[] = ["plan", "build", "review", "ship"];
+const STUB_ACTIONS: ActionType[] = ["test", "learn"];
 const STUB_VERSION: Record<ActionType, string | undefined> = {
   plan: undefined,
   build: undefined,
   review: undefined,
-  ship: "V0.6.1",
+  ship: undefined,
   test: "V0.6.2",
   learn: "V0.6.3",
 };
@@ -71,6 +71,7 @@ const STUB_VERSION: Record<ActionType, string | undefined> = {
 const inferDisabledReason = (
   task: Task,
   type: ActionType,
+  ctx: { host?: string; token?: string } = {},
 ): string | null => {
   const hasCompleted = (t: ActionType) =>
     task.actions.some((a) => a.type === t && a.status === "completed");
@@ -82,6 +83,11 @@ const inferDisabledReason = (
     case "review":
       return hasCompleted("build") ? null : "需要先有一个已通过的 build";
     case "ship":
+      // V0.6.1：ship 准入 = 至少 1 个 build 已 approve + settings 配齐 gitHost/gitToken
+      if (!hasCompleted("build")) return "需要先有一个已通过的 build";
+      if (!ctx.host) return "需要先在「设置 → GitLab 配置」填 host";
+      if (!ctx.token) return "需要先在「设置 → GitLab 配置」填 PAT";
+      return null;
     case "test":
     case "learn":
       return `${STUB_VERSION[type]} 上线`;
@@ -98,7 +104,7 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
   plan: "需求是什么？要解决什么问题？",
   build: "具体改什么、指向哪个文件 / 函数 / bug",
   review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
-  ship: "（V0.6.1 上线）PR 标题 / 描述补充",
+  ship: "（可选）MR 标题 / 描述要点、不填自动生成",
   test: "（V0.6.2 上线）跑哪些 case？默认全跑",
   learn: "（V0.6.3 上线）learn 不需要 textarea、看 propose 列表",
 };
@@ -107,6 +113,7 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
 // - has_bug + build → 「修哪个 bug、症状 / 复现路径」
 // - 没 plan + plan → 「需求是什么？要解决什么问题？」（首次）
 // - 有 plan + plan → 「方案要怎么调整？」（再次 plan）
+// - 已有 MR + ship → 「已有 v<N> MR、本次继续推、可选填要点」
 const buildPlaceholder = (task: Task, type: ActionType): string => {
   if (type === "build" && task.repoStatus === "has_bug") {
     return "修哪个 bug、症状 / 复现路径";
@@ -117,20 +124,26 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
     );
     return hasPlan ? "方案要怎么调整？" : "需求是什么？要解决什么问题？";
   }
+  if (type === "ship" && task.mrs.length > 0) {
+    const maxVersion = Math.max(...task.mrs.map((m) => m.version));
+    return `已有 v${maxVersion} MR、本次继续推、可选填要点`;
+  }
   return ACTION_PLACEHOLDER[type];
 };
 
 // 算 dialog 打开时默认选中哪个 action chip（V0.6.0.1 起改名、原 inferRecommended）：
 // - repoStatus = has_bug → build（业务状态映射：有 bug 就是要回 build）
+// - repoStatus = awaiting_test → ship（V0.6.1 起：还能再推一次 / fix 后再 ship）
 // - repoStatus = merged → plan（V0.6.3 起改 learn）
 // - repoStatus = abandoned → plan（task 已关闭、用户也不会走推进 dialog）
 // - 无 action → plan
-// - 最近一条 completed action：plan → build / build → review / review → plan（V0.6.1 起改 ship）
+// - 最近一条 completed action：plan → build / build → review / review → ship（V0.6.1 起解锁）
 // V0.6.0.1 删的：「最后一条 error → 同 type」——之前是 retry 入口的兜底、retry 砍掉后保留它跟「没有自动重试」
 // 语义冲突、不如让默认值仍按流程顺推（error 后用户手动选要不要换 type 走、跟没失败时一样）
 // 注意：这个函数算的是「默认值」、不是「推荐」——UI 上不会标「推荐」二字、避免暗示「我跟你说要走这个」
 const inferDefaultActionType = (task: Task): ActionType => {
   if (task.repoStatus === "has_bug") return "build";
+  if (task.repoStatus === "awaiting_test") return "ship"; // 测试反馈后 fix 完仍走 ship
   if (task.repoStatus === "merged") return "plan"; // V0.6.3 起改 learn
   if (task.repoStatus === "abandoned") return "plan";
 
@@ -141,12 +154,16 @@ const inferDefaultActionType = (task: Task): ActionType => {
     .find(
       (a) =>
         a.status === "completed" &&
-        (a.type === "plan" || a.type === "build" || a.type === "review"),
+        (a.type === "plan" ||
+          a.type === "build" ||
+          a.type === "review" ||
+          a.type === "ship"),
     );
   if (!last) return "plan";
   if (last.type === "plan") return "build";
   if (last.type === "build") return "review";
-  return "plan"; // V0.6.1 起改 ship
+  if (last.type === "review") return "ship";
+  return "plan"; // ship 后流程结束、默认回 plan、用户实际场景多半点终结 dialog
 };
 
 interface Props {
@@ -182,6 +199,10 @@ export const AdvanceDialog = ({
   // 强制起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅 forceNewAgent=true 时透传给父组件、否则 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
+  // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照、不实时同步（用户开 dialog 中途换 host/token 极少）
+  const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
+    {},
+  );
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
 
@@ -195,6 +216,10 @@ export const AdvanceDialog = ({
     setPickedModel(
       s.defaultModel ?? { id: "" },
     );
+    setGitConfig({
+      host: s.gitHost?.trim() || undefined,
+      token: s.gitToken?.trim() || undefined,
+    });
     // 第一次打开 / 切 task 时按需拉模型列表（settings page 已拉过、内存里有就跳过）
     if (s.apiKey?.trim() && availableModels.length === 0) {
       void fetchModels(s.apiKey);
@@ -203,8 +228,8 @@ export const AdvanceDialog = ({
 
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
   const disabledReason = useMemo(
-    () => inferDisabledReason(task, actionType),
-    [task, actionType],
+    () => inferDisabledReason(task, actionType, gitConfig),
+    [task, actionType, gitConfig],
   );
   const canSubmit = useMemo(() => {
     if (submitting) return false;
@@ -236,7 +261,7 @@ export const AdvanceDialog = ({
             <Label>下一步</Label>
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
               {IMPLEMENTED_ACTIONS.map((type) => {
-                const reason = inferDisabledReason(task, type);
+                const reason = inferDisabledReason(task, type, gitConfig);
                 return (
                   <ChoiceButton
                     key={type}
@@ -257,7 +282,9 @@ export const AdvanceDialog = ({
                           ? "出方案"
                           : type === "build"
                             ? "写代码"
-                            : "复核差异"}
+                            : type === "review"
+                              ? "复核差异"
+                              : "提 MR 到 test"}
                     </span>
                   </ChoiceButton>
                 );

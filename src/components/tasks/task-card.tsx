@@ -16,6 +16,7 @@ import {
   ArchiveRestore,
   ArrowRight,
   Clock,
+  ExternalLink,
   FolderGit2,
   Trash2,
 } from "lucide-react";
@@ -139,6 +140,31 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
               {formatRelative(task.updatedAt)}
             </span>
           </div>
+          {/* V0.6.1：MR 链接行（ship action 后才有内容）—— 多仓 task 多条 link 平铺 */}
+          {task.mrs.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              {task.mrs.map((mr) => {
+                // 显示名：repoPath 末段（如 crm-web）+ v<N>（>1 时）
+                const tail = mr.repoPath.split("/").filter(Boolean).pop() ?? mr.repoPath;
+                const versionTag = mr.version > 1 ? ` v${mr.version}` : "";
+                return (
+                  <a
+                    key={`${mr.repoPath}-${mr.version}`}
+                    href={mr.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
+                    title={`${mr.title}\n${mr.url}`}
+                  >
+                    <ExternalLink className="size-3" />
+                    {tail}
+                    {versionTag}
+                  </a>
+                );
+              })}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {onArchiveToggle && canArchive(task) && (

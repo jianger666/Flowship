@@ -1,52 +1,252 @@
-# Action: ship（V0.6.1 完整实现、V0.6.0 stub）
+# Action: ship（V0.6.1 正式版、多仓 + GitLab MCP 工具 + 飞书 @ 测试人员）
 
-> 当前 V0.6.0 阶段 ship action **未实现、UI 推进 dialog 灰掉**、runner 准入检查会拒绝。这份 prompt 是 V0.6.1 的设计参考、收到 `[NEXT_ACTION type=ship]` 时你应该不会实际拿到（runner 已拦）。
+ship action 的目标：把当前 task 所有仓的代码改动 push 到 origin、调 `submit_mr` MCP 工具创 GitLab MR **到 `test` 分支（提测、不是合 master）**、调飞书 MCP 在 story 评论 @ 测试人员告知 MR 链接、写 ship artifact 记录全过程。
+
+## 工作流约定（公司内部场景、不要绕开）
+
+- 所有仓 MR 一律 **`feature/...` → `test`**（提测）、`test` 通过测试后才人工合 master / main
+- `submit_mr` 的 `target_branch` 入参 **写死 `test`**、不要探测 `origin/HEAD`（那个拿到的是默认主分支 master / main、跟提测工作流不对）
+- 跨仓共用同一个 `feature/<username>/<story>-<title>` 分支名、`test` 也跨仓同名
+
+## 单仓 vs 多仓
+
+- 单仓 task（task.repoPaths 长度 = 1）：一次 push + 一次 submit_mr
+- 多仓 task（task.repoPaths 长度 > 1）：对每个仓独立 `cd` + push + submit_mr——每个仓产出 1 条 MR、共用同名 source branch、target 都是 `test`
+- 某仓本次无改动（`git diff origin/test...HEAD` 为空）：跳过该仓、不 push 也不调 submit_mr、在 artifact «§3 push + MR» 表里写「跳过、原因：本仓无改动」
+
+## 准入条件（runner 已校验、agent 不用重复检查）
+
+- 至少 1 个已通过的 build action
+- settings 已配 GitLab Host + Personal Access Token（不然 runner 准入直接拒）
+
+## 执行步骤（按顺序）
+
+### 1. 读上下文
+
+- 读最新 build artifact（必读、commit message 的依据）
+- 读最新 review artifact（如有、写进 MR description）
+- 读 task.mrs[]（判断是首次 ship 还是再次 push、`task.mrs[].version` 决定本次 v2/v3）
+
+### 2. 飞书 @ 测试人员探测（A+C 策略、首次 ship 用）
+
+> 同 task 后续 ship **不再**走本步——直接从 `task.feishuTesterUserIds` 读上一次记忆的列表。
+>
+> 不管走 A / 走 C / 用户选「跳过」、**最终都必须调一次 `set_feishu_testers`**（拿到 user_id 调一次、跳过 / 没拿到也调一次 `set_feishu_testers({ task_id, action_id, user_ids: [] })`、空数组 = 显式记忆「跳过」）。**漏调** = 下一轮 ship 还要重新走 A+C、用户体验差、artifact 后置检查会挂。
+
+**A. 自动探测**（task.feishuStoryUrl 非空时优先走、单次 MCP 调用就够）
+
+1. 调一次 `user-feishu-project-mcp.get_workitem_brief({ url: task.feishuStoryUrl })`、拿到 `work_item_attribute.role_members[]`
+2. **过滤所有 role.name 含「测试」二字的 role**（公司项目空间至少有「测试」/「测试负责人」/「QA」三种命名习惯、不要写死单一 role.name）、把每个匹配 role 的 `members[]` 拍平到一个列表
+3. 列表里 `member.key` 就是 lark_user_id、`member.name` 是中文名、`member.email` 用于备注（**不要**再调 `search_user_info`——`member.key` 已经是要的 user_id）
+4. 列表非空 → 调 `set_feishu_testers({ task_id, action_id, user_ids: [member.key, ...] })`、artifact §2 记下名单（含中文名）
+5. 列表为空 → 飞书 story 这边的「测试 / 测试负责人」角色都没人挂 → 走 **C** 兜底
+
+**C. 探不到时 ask_user 兜底**（包括：task.feishuStoryUrl 为空 / `get_workitem_brief` 失败 / A 过滤完列表为空）
+
+```
+ask_user({
+  task_id,
+  action_id,
+  questions: [
+    {
+      id: "tester_user_ids",
+      question: "需要 @ 哪些测试人员？请填工号 / 用户名、逗号分隔；不需要 @ 选「跳过」。",
+      options: [
+        { id: "skip", label: "跳过 @ 测试人员（飞书评论只发 MR 链接）" }
+      ],
+      allow_text: true,
+    },
+  ],
+})
+```
+
+- 用户填工号 / 用户名 → 调 `user-feishu-project-mcp.search_user_info` 转 user_id（这里**才**用 search_user_info、因为没 story role 信息）→ `set_feishu_testers({ task_id, action_id, user_ids })`
+- 用户选「跳过」→ **仍要调** `set_feishu_testers({ task_id, action_id, user_ids: [] })`（空数组 = 显式记忆「跳过」、下次 ship 不再重问）
+
+### 3. 逐仓 push + submit_mr
+
+> 多仓时**每个仓各用一次独立 shell 调用**（每次从该仓根目录重新 `cd`）、不要在一个 shell 里连续 `cd` 多个仓——上个仓没 `cd` 回、cwd 会残留串到下个仓。
+
+对 `task.repoPaths` 里每个仓：
+
+```bash
+cd <repoPath>
+
+# 目标分支固定 test（公司提测工作流、不要探 origin/HEAD）
+TARGET=test
+
+# 探当前 branch（task.gitBranches 里该仓对应的 source branch、build 时已 checkout 好）
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# 拉一下 test 看本仓相对 test 有没有改动
+# fail-fast：fetch 失败（远程没 test 分支 / 网络异常）必须报错退出、
+#   否则下面 git diff 会因 origin/$TARGET ref 不存在拿到空结果、被误判成「无改动跳过」、本仓提测漏做却显示已跳过
+if ! git fetch origin "$TARGET" 2>&1; then
+  echo "[error] git fetch origin/$TARGET 失败、停止本仓 ship（远程 test 分支不存在或网络异常、不要当成无改动跳过）"
+  exit 1
+fi
+CHANGES=$(git diff "origin/$TARGET...$BRANCH" --name-only)
+if [ -z "$CHANGES" ]; then
+  echo "[skip] 本仓相对 origin/$TARGET 无改动、跳过 push + MR"
+  exit 0
+fi
+
+# 没 commit 的工作区改动先 commit（agent 自己写 commit message、conventional commit 风格）
+if [ -n "$(git status --porcelain)" ]; then
+  git add -A
+  git commit -m "<commit msg>"
+fi
+
+# push 到 origin、source branch 跟本地同名
+git push -u origin "$BRANCH"
+
+# 拿当前 commit hash + GitLab project path
+HEAD_SHA=$(git rev-parse HEAD)
+REMOTE_URL=$(git config --get remote.origin.url)
+# REMOTE_URL 形如 git@gitlab.wukongedu.net:wkid/crm-web.git 或 https://.../wkid/crm-web.git
+# 解析出 wkid/crm-web、给 submit_mr 用
+PROJECT_PATH=$(echo "$REMOTE_URL" | sed -E 's#^[^@]+@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')
+
+echo "[ok] TARGET=$TARGET BRANCH=$BRANCH HEAD=$HEAD_SHA PROJECT=$PROJECT_PATH"
+```
+
+push 成功后、对每仓调 `submit_mr` MCP 工具：
+
+```typescript
+submit_mr({
+  task_id,
+  action_id,
+  repo_path: "<本仓本地绝对路径>",
+  project_path: "<解析出的 wkid/crm-web>",
+  source_branch: "<BRANCH>",
+  target_branch: "test",                       // 永远填 test、不要填别的
+  title: "[<role>] <task.title>",            // role = task.role 中文 label、title 加上版本号 if v>1
+  description: "<MR description>",            // 见下方模板
+  last_commit_hash: "<HEAD_SHA>",
+})
+```
+
+- 工具返 `{ ok: true, data: { mr_url, mr_iid, mr_version } }`、记下 `mr_url` 给 artifact + 飞书评论用
+- 失败返 `{ ok: false, error: "..." }`、artifact 里记错误、继续下一个仓（不要重试、不要 force push、不要降级到 git push -o）
+
+### 4. 飞书 story 评论（V0.6.1 拍板：评论 + @ 测试人员、不动 story 状态）
+
+调用 `user-feishu-project-mcp.add_comment`：
+
+```typescript
+add_comment({
+  workitem_id: <从 task.feishuStoryUrl 抠出的 story id>,
+  content: `MR 已提交、请测试人员 review：
+
+<对每条 MR 一行：URL 必须放行尾、不要在 URL 后追加任何字符（飞书 IM 会把括号、空格后的字符一起 link 化导致 404）>
+- [\${repoTailName}]\${mrVersion > 1 ? ` v\${mrVersion}` : ""} <mr_url>
+
+@<测试人员中文名>（@ 拼法见下方「@ 的正确姿势」）
+`,
+})
+```
+
+- **@ 的正确姿势**：`task.feishuTesterUserIds` 是 lark_user_id（形如 `ou_xxx`）、**不能**直接拼成 `@ou_xxx` 塞进 content 文本（飞书 IM 不识别、显示成乱码）。优先用 `add_comment` 工具自带的 @ / mention 能力（核对工具入参有没有 `user_ids` / `mention` 之类字段、把 lark_user_id 传进去）；工具不支持时退而在 content 里用 `@<中文名>` 软提示（中文名从 §2 探测时一并记下）
+- 多仓 task：一条评论里平铺所有 MR 链接、按 repoPath 末段名（如 `crm-web`）标注
+- `feishuTesterUserIds` 为空数组（用户选了跳过）：评论不加 @、只贴链接
+- 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
+
+### 5. 写 ship artifact + wait_for_user
+
+artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `wait_for_user({ task_id, action_id, artifact_path: "actions/<N>-ship.md" })` 等用户 ack。
+
+## MR description 模板
+
+> 多次 ship 时、保留旧版的 description、在末尾加新版段。
+
+```markdown
+## 任务
+
+<task.title>（飞书 story: <task.feishuStoryUrl>）
+
+## 方案
+
+<最新 plan artifact 的摘要 / 直接链接到 fe-ai-flow 详情页>
+
+## 改动概览
+
+<最新 build artifact 的「Task 完成情况」段、按 plan 对照>
+
+## 复核
+
+<如有 review artifact、贴 4 类差异段；没 review 写「未做 review、由代码评审人把关」>
+
+## 自检
+
+- typecheck: ✅ / ❌
+- lint: ✅ / ❌
+- review hash: ✅ / ❌（如做了 review）
 
 ---
 
-> 以下是 V0.6.1 设计、当前 V0.6.0 不要按这套跑、收到 [NEXT_ACTION type=ship] 时立刻 emit 一条 assistant_message：「ship action 在 V0.6.1 上线、当前未实现」、然后 wait_for_user(task_id={{taskId}})（不带 action_id）等下一 action 指令。
+<如果是 v2+、加：## v\${mrVersion} 更新（\${ISO 日期}）>
+<本次相对上一版的改动摘要、引用本轮 build artifact>
+```
 
-## V0.6.1 设计草稿
+## artifact 骨架
 
-ship action 的目标：把最新 build artifact 的改动提成 MR（GitLab `glab mr create`）+ 飞书工作项评论回写 + 写 ship artifact 记录 commit hash / MR URL / 飞书回写状态。
+```markdown
+# Ship #<N>
 
-### 准入条件（V0.6 门槛 1、硬门槛）
+## §1 基本信息
 
-- 至少 1 个已通过的 build action
-- `git status` 当前分支有改动 / 至少有 1 个未推送 commit
-- `task.gitBranch.checkedOut = true`（build 第一次跑前已 checkout 分支）
+- task: <task.id> <task.title>
+- 飞书 story: <task.feishuStoryUrl>
+- branch（共用）: <branch name>
+- 仓数: <repoPaths.length>
 
-### 执行步骤（草稿）
+## §2 飞书测试人员
 
-1. read 最新 build artifact + 最新 review artifact（如有）
-2. 生成 commit message（基于最新 build artifact 的「Task 完成情况」段、按 conventional commit）
-3. 生成 MR title + body（基于飞书 story + 最新 build + 最新 review）
-4. ask_user 让用户最终确认 commit msg / MR title / MR body（一次性问完）
-5. 调 `shell` 跑：
-   - `git add` / `git commit`
-   - `git push -u origin <branch>`
-   - `glab mr create --title ... --description ... --target-branch <主分支名（agent 自探）> --source-branch <branch>`
-6. 拿到 MR URL 后、调 `user-feishu-project-mcp.add_comment` 把 URL 评论回飞书项目工作项
-7. 写 `actions/<n>-ship.md`：commit hash / MR URL / branch / 飞书回写状态
-8. wait_for_user(task_id, action_id, artifact_path)
+- 探测策略: <A 自动探测成功 | A 失败 + C ask_user 兜底 | 用户选跳过 | 沿用上轮记忆>
+- 持久化结果（lark_user_id）: <task.feishuTesterUserIds 写完后的列表、或 []>
 
-### 后置检查（V0.6.1）
+## §3 push + MR 详情
 
-- `git push` exit 0
-- `glab mr create` exit 0、拿到的 URL 非空
-- 飞书评论调用 exit 0（失败也不阻塞 ship、artifact 标 ❌、用户后续补）
+| 仓 | target | source | HEAD commit | MR | version | 备注 |
+|---|--------|--------|-------------|----|---------|------|
+| <repoPath 1> | test | feature/clj/xxx-yyy | abc1234 | <mr_url> | v1 | 首次提测 |
+| <repoPath 2> | test | feature/clj/xxx-yyy | def5678 | <mr_url> | v1 | 首次提测 |
+| <repoPath 3> | test | - | - | - | - | 跳过、原因：本仓无改动 |
 
-### 同 task 多次 ship
+## §4 飞书评论
 
-V0.6 拍板：**同 branch、累计 commit**——修 MR review 反馈直接接着 push、不重开 MR。第 N 次 ship 时 runner 检测到 task 已有 MR、跳过 `glab mr create`、只做 commit + push。
+- 评论 id: <add_comment 返的 comment id>
+- 内容预览: <前 200 字>
+- @ 的测试人员: <user_id 列表、或「跳过」>
+- 状态: ✅ 成功 / ❌ 失败 + 错误信息
 
-### artifact 骨架（V0.6.1）
+## §5 自检结果
 
-详见 V0.6-REFACTOR.md §5.4。
+- typecheck: ✅ / ❌
+- lint: ✅ / ❌
+- git status 干净: ✅ / ❌
 
-### 反例
+## §6 待澄清 / 已知风险
 
-- 强推到 main（硬门槛禁）
-- commit message 跟 build artifact 不一致
-- 不更新 `Task.mrs` 列表（runner 侧必须写入）
-- 自动跑下一 action（绝对不、ship approve 后等用户选下一 action）
+<如果 ask_user 时用户「稍后再补充」过 / 有跳仓 / 有 MR 失败的、列在这里>
+```
+
+## 反例
+
+- ❌ target_branch 探 origin/HEAD 拿 master / main（公司工作流 = 提测、`target_branch` 永远 `test`）
+- ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不会落库、详情页看不到）
+- ❌ 自己用 SDK `shell` curl GitLab REST API / `glab` / `gh`（PAT 在 server、agent 拿不到、必然失败）
+- ❌ 拿到测试人员 user_id 但漏调 set_feishu_testers（下次 ship 还要重新探、artifact 后置检查会发现）
+- ❌ 强推到 master / main（GitLab 禁、且违反工作流）
+- ❌ commit message 跟 build artifact 实际改动不一致
+- ❌ 拿到 `submit_mr` 失败结果时自动重试 / force push（**绝对不**、artifact 记错、让用户手动处理）
+- ❌ 跳过的仓没在 artifact §3 写原因（后置检查会挡）
+- ❌ artifact 没写 `task.feishuTesterUserIds` 来源（A / C / 沿用、需可审计）
+- ❌ ship approve 后自动跑下一 action（绝对不、wait_for_user 待命态等用户推进）
+- ❌ 飞书评论里 URL 后面追加 `(v1)` / `（v1）` / 任何字符（飞书 IM 会一起 link 化导致 404）
+
+## 调用礼仪
+
+- 整个流程不在 assistant_message 里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）
+- 调 submit_mr / add_comment 前**不要**先用 assistant_message 复述参数（agent 倾向于「写出来让用户确认」、但这里入参全在 artifact 里、用户 ack 时一并看）
+- 拿到 MR url 后**不要**复述「MR 已创建：<url>」、直接落 artifact 即可

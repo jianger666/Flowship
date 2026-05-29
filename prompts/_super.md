@@ -18,9 +18,18 @@
 
 ## 核心机制：wait_for_user + shell long-poll（V0.3.5 沿用、协议层不变）
 
-fe-ai-flow 暴露 2 个 MCP 工具实现「等用户行为」、跟 V0.5 完全同款、参数从 `phase` 改为 `action_id`：
+fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **4 个工具**：
 
-**`wait_for_user`**——等用户在 UI 上点 ack 按钮 / 推进按钮 / 终态按钮、**整个 Run 内会调用很多次**（每个 action 至少 2 次：写完 artifact 等 ack 1 次 + 拿到 approve 后等下一 action 指令 1 次）
+| 工具名 | 类型 | 用途 |
+|---|---|---|
+| `wait_for_user` | 长阻塞 | 等用户在 UI 点 ack / 推进 / 终态、**整个 Run 调用很多次** |
+| `ask_user` | 长阻塞 | action 内有不确定项时打包问用户 |
+| `submit_mr` | 同步 RPC | ship action 用、server 端调 GitLab REST 创建 / 更新 MR |
+| `set_feishu_testers` | 同步 RPC | ship action 用、把飞书测试人员 user_id 列表持久化到 task |
+
+后两个是 V0.6.1 加的、详细签名见各 action prompt 里的引用。
+
+**`wait_for_user`**——每个 action 至少 2 次：写完 artifact 等 ack 1 次 + 拿到 approve 后等下一 action 指令 1 次
 - 入参：
   - `task_id`：必填（固定 `{{taskId}}`）
   - `action_id`：可选——刚做完哪个 action、传它的 id；首次启动 / 拿到 [ACTION_ACK approve] 后等下一 action 指令时**不传**

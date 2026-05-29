@@ -28,6 +28,7 @@ import { notFound, useParams } from "next/navigation";
 import {
   ArrowLeft,
   CheckCircle2,
+  ExternalLink,
   Flag,
   Loader2,
   MessageCircleQuestion,
@@ -58,6 +59,8 @@ import { Separator } from "@/components/ui/separator";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 
+import { getSettings } from "@/lib/local-store";
+import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
   finalizeTask,
@@ -264,44 +267,14 @@ const TaskDetailPage = () => {
   }) => {
     setStarting(true);
     try {
-      const settings = (() => {
-        try {
-          return JSON.parse(localStorage.getItem("fe-ai-flow:settings") ?? "{}");
-        } catch {
-          return {};
-        }
-      })();
-      const apiKey = settings.apiKey ?? "";
-      if (!apiKey.trim()) {
-        toast.error("请先在设置页填 API Key");
-        return;
-      }
-      // 优先级：dialog 里临时挑的（仅 forceNewAgent=true 时） > task.model（创建时挑的） > settings.defaultModel
-      const model =
-        input.model ?? task.model ?? settings.defaultModel ?? undefined;
-      if (!model?.id) {
-        toast.error("请先在设置页或新建任务时选默认模型");
-        return;
-      }
-      // MCP 配置：从 settings.mcpServersJson 解析、按 task.disabledMcpServers 过滤
-      let mcpServers: Record<string, unknown> | undefined;
-      try {
-        const raw = settings.mcpServersJson?.trim();
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const filtered: Record<string, unknown> = {};
-          for (const [name, cfg] of Object.entries(parsed)) {
-            if (!task.disabledMcpServers?.includes(name)) {
-              filtered[name] = cfg;
-            }
-          }
-          if (Object.keys(filtered).length > 0) {
-            mcpServers = filtered;
-          }
-        }
-      } catch (err) {
-        console.warn("[advance] MCP 解析失败", err);
-      }
+      // 统一走 prepareRunArgs：apiKey + model（task.model || settings.defaultModel） + mcpServers
+      // 校验失败 helper 内部 toast.error、返 null、调用方直接 return
+      const args = prepareRunArgs(task, { mcpErrorPrefix: "修好再推进" });
+      if (!args) return;
+      // input.model 仅 forceNewAgent=true 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
+      const model = input.model?.id ? input.model : args.model;
+      // gitHost / gitToken / username 不在 prepareRunArgs 暴露字段里、单独读 settings
+      const settings = getSettings();
 
       const res = await fetch(`/api/tasks/${task.id}/advance`, {
         method: "POST",
@@ -309,11 +282,15 @@ const TaskDetailPage = () => {
         body: JSON.stringify({
           actionType: input.actionType,
           userInstruction: input.userInstruction,
-          apiKey,
+          apiKey: args.apiKey,
           model,
-          mcpServers,
+          mcpServers: args.mcpServers,
           forceNewAgent: input.forceNewAgent,
           username: settings.username?.trim() || undefined,
+          // V0.6.1 ship action 用：每次推进都带上 settings 里最新的 gitHost/gitToken
+          // task-runner 闭包到 internalStartAgent 里、续接路径只在 ship 准入校验时用
+          gitHost: settings.gitHost?.trim() || undefined,
+          gitToken: settings.gitToken?.trim() || undefined,
         }),
       });
       if (!res.ok) {
@@ -460,15 +437,48 @@ const TaskDetailPage = () => {
                 {task.repoPaths.length > 0
                   ? formatRepoPathsForDisplay(task.repoPaths)
                   : "(未绑仓库、agent 在 home 跑)"}
-                {task.gitBranch?.name && (
+                {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name && (
                   <span
                     className="ml-2 font-mono"
-                    title={`based on ${task.gitBranch.baseBranch}${task.gitBranch.checkedOut ? " (checked out)" : ""}`}
+                    title={task.gitBranches
+                      .map((b) =>
+                        `${b.repoPath.split("/").pop()}: based on ${b.baseBranch || "?"}`,
+                      )
+                      .join("\n")}
                   >
-                    @ {task.gitBranch.name}
+                    @ {task.gitBranches[0].name}
+                    {task.gitBranches.length > 1 && (
+                      <span className="ml-1 text-muted-foreground">
+                        ({task.gitBranches.length} 仓)
+                      </span>
+                    )}
                   </span>
                 )}
               </div>
+              {/* V0.6.1：MR 链接（ship action 落档后展示、多仓 task 平铺多条） */}
+              {task.mrs.length > 0 && (
+                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                  {task.mrs.map((mr) => {
+                    const tail =
+                      mr.repoPath.split("/").filter(Boolean).pop() ?? mr.repoPath;
+                    const versionTag = mr.version > 1 ? ` v${mr.version}` : "";
+                    return (
+                      <a
+                        key={`${mr.repoPath}-${mr.version}`}
+                        href={mr.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
+                        title={`${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
+                      >
+                        <ExternalLink className="size-3" />
+                        {tail}
+                        {versionTag}
+                      </a>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 

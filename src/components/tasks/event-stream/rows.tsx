@@ -146,9 +146,11 @@ const EventRowImpl = ({
 
   // 折叠状态：所有事件都可折叠、默认值由 DEFAULT_EXPANDED_KINDS 决定
   // - assistant_message / user_reply：默认展开（用户主要看的就是这俩）
+  // - info 里带 meta.awaitingAck 的「Action 产出完成、等待 ack」里程碑事件也默认展开（用户要 ack）
   // - 其他：默认折叠（避免 thinking / tool_call 刷屏）
   // 组件内 state、用户手动切换后保持（不会被新事件刷掉）
-  const defaultCollapsed = !DEFAULT_EXPANDED_KINDS.has(ev.kind);
+  const isAwaitingAck = ev.meta?.awaitingAck === true;
+  const defaultCollapsed = !DEFAULT_EXPANDED_KINDS.has(ev.kind) && !isAwaitingAck;
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
 
   const handleToggle = () => setCollapsed((c) => !c);

@@ -6,7 +6,7 @@
  *   data/
  *     tasks/
  *       <taskId>/
- *         meta.json          ← 任务元信息、含 actions[] / mrs[] / gitBranch
+ *         meta.json          ← 任务元信息、含 actions[] / mrs[] / gitBranches[]
  *         events.jsonl       ← 事件流、每行一条 JSON、追加写
  *         actions/           ← 每条 action 一个 artifact
  *           1-plan.md
@@ -246,7 +246,15 @@ interface TaskMetaV06 {
   currentActionId: string | null;
   actions: ActionRecord[];
   mrs: MRRecord[];
-  gitBranch?: GitBranchInfo;
+  /**
+   * V0.6.1：每仓 1 条、build 第一次跑前按仓数初始化
+   * （V0.6.0 时是单数 `gitBranch?: GitBranchInfo`、为支持多仓 task 改为数组）
+   */
+  gitBranches?: GitBranchInfo[];
+  /**
+   * V0.6.1：飞书测试人员记忆（A+C 兜底后落库、同 task 后续 ship 直接复用）
+   */
+  feishuTesterUserIds?: string[];
   role: TaskRole;
   repoPaths: string[];
   feishuStoryUrl?: string;
@@ -530,7 +538,8 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     currentActionId: meta.currentActionId,
     actions: meta.actions,
     mrs: meta.mrs,
-    gitBranch: meta.gitBranch,
+    gitBranches: meta.gitBranches,
+    feishuTesterUserIds: meta.feishuTesterUserIds,
     role: meta.role,
     repoPaths: meta.repoPaths,
     feishuStoryUrl: meta.feishuStoryUrl,
@@ -560,7 +569,8 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     runStatus: meta.runStatus,
     currentActionId: meta.currentActionId,
     mrs: meta.mrs,
-    gitBranch: meta.gitBranch,
+    gitBranches: meta.gitBranches,
+    feishuTesterUserIds: meta.feishuTesterUserIds,
     role: meta.role,
     repoPaths: meta.repoPaths,
     feishuStoryUrl: meta.feishuStoryUrl,
@@ -966,7 +976,7 @@ export const setTaskUiLayout = async (
     await writeMeta(meta);
   });
 
-// ----------------- 公开 API（V0.6 新）：action / repoStatus / runStatus / gitBranch / mr -----------------
+// ----------------- 公开 API（V0.6 新）：action / repoStatus / runStatus / gitBranches / mr -----------------
 
 /**
  * 创建一条新 action 记录、追加到 actions[] 末尾
@@ -1056,6 +1066,53 @@ export const patchAction = async (
   });
 
 /**
+ * 原子地往 action.sideEffects.mrs[] 追加一条 MR 记录（V0.6.1 ship、防并发 submit_mr 丢更新）
+ *
+ * 按 repoPath 去重（同仓重试覆盖最新一条）、保留 sideEffects 其他字段（如 feishuCommentId）。
+ * read-modify-write 整段在 withTaskLock 内完成——替代 task-runner 里「getTask → filter → patchAction」
+ *   两段非原子写法（agent 串行不出问题、但接口被并行调时会丢 MR）。
+ *
+ * 跟 upsertMR 的区别：upsertMR 写 task.mrs[]（task 维度「当前最新 MR」）、本函数写
+ *   action.sideEffects.mrs[]（action 维度「本次 ship 产出」、审计用）。
+ */
+export const appendActionSideEffectMR = async (
+  taskId: string,
+  actionId: string,
+  mr: {
+    repoPath: string;
+    mrUrl: string;
+    mrVersion: number;
+    branch: string;
+    commitHash: string;
+  },
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const idx = meta.actions.findIndex((a) => a.id === actionId);
+    if (idx < 0) return null;
+    const action = meta.actions[idx]!;
+    const existingMrs = action.sideEffects?.mrs ?? [];
+    // 同 repoPath 已记录（重试 / 重复 ship）则去重、用最新这条覆盖
+    const filtered = existingMrs.filter((m) => m.repoPath !== mr.repoPath);
+    const nextAction: ActionRecord = {
+      ...action,
+      sideEffects: {
+        ...(action.sideEffects ?? {}),
+        mrs: [...filtered, mr],
+      },
+    };
+    meta.actions = [
+      ...meta.actions.slice(0, idx),
+      nextAction,
+      ...meta.actions.slice(idx + 1),
+    ];
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
  * 直接设置 task 级 runStatus / currentActionId（runner 用）
  * - currentActionId = null 表示 idle
  */
@@ -1093,51 +1150,128 @@ export const setTaskRepoStatus = async (
   });
 
 /**
- * 写入 / 更新 task.gitBranch
- * - build action 第一次跑前由 runner 拼好 branch 名 + base、调本 helper 落库
- * - 跑完 git checkout 成功后 callers 再调一次把 checkedOut=true
+ * 单条仓库的 git branch upsert（V0.6.1 多仓适配）
+ *
+ * - 按 `repoPath` 匹配：已有同 repoPath 则替换、否则 append
+ * - build action 第一次跑前、runner 为每个 repoPath 逐仓初始化一条（baseBranch 暂空、agent 探完再 patch）
+ * - agent 跑完 git checkout 后、callers 再调一次把对应仓的 checkedOut=true / baseBranch 填好
  */
-export const setGitBranch = async (
+export const upsertGitBranch = async (
   taskId: string,
   gitBranch: GitBranchInfo,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    meta.gitBranch = gitBranch;
+    const existing = meta.gitBranches ?? [];
+    const idx = existing.findIndex((b) => b.repoPath === gitBranch.repoPath);
+    meta.gitBranches =
+      idx >= 0
+        ? existing.map((b, i) => (i === idx ? gitBranch : b))
+        : [...existing, gitBranch];
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
   });
 
 /**
- * 追加 MR 记录（ship action 拿到 URL 后调）
+ * 写 task.feishuTesterUserIds（V0.6.1 飞书 @ 测试人员记忆）
+ *
+ * - 首次 ship 时探到 / 用户填完后调一次、同 task 后续 ship 直接复用
+ * - 空数组 = 显式记忆「没测试人 / 用户选了跳过 @」、跟 undefined 区分
  */
-export const appendMR = async (
+export const setFeishuTesterUserIds = async (
   taskId: string,
-  mr: MRRecord,
+  userIds: string[],
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    meta.mrs = [...meta.mrs, mr];
+    meta.feishuTesterUserIds = userIds;
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
   });
 
 /**
- * patch MR 状态（V0.6.4+ polling 用、V0.6.0 留接口）
+ * Upsert MR 记录（V0.6.1 ship action 多仓适配）
+ *
+ * 按 `repoPath` 匹配：
+ *   - 已有：version++、更新 url/title/branch/status/lastCommitHash、保留 createdAt + createdByActionId（首次创建的）
+ *   - 没有：插入新 record、version=1、createdAt=now
+ *
+ * 注意：本表 `task.mrs[]` 是 task 维度的「当前最新 MR」、跟 `action.sideEffects.mrs[]` 是 action 维度的「本次 ship 产出」不同——
+ *   - task.mrs：每仓 1 条、查最新状态用
+ *   - action.sideEffects.mrs：每次 ship action 落几条、审计用
+ */
+export const upsertMR = async (
+  taskId: string,
+  repoPath: string,
+  input: {
+    url: string;
+    title: string;
+    branch: string;
+    status: MRRecord["status"];
+    createdByActionId: string;
+    lastCommitHash?: string;
+  },
+): Promise<{ task: Task; mr: MRRecord } | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const now = Date.now();
+    const idx = meta.mrs.findIndex((m) => m.repoPath === repoPath);
+    let nextMR: MRRecord;
+    if (idx >= 0) {
+      const old = meta.mrs[idx]!;
+      nextMR = {
+        ...old,
+        url: input.url,
+        title: input.title,
+        branch: input.branch,
+        status: input.status,
+        lastCommitHash: input.lastCommitHash ?? old.lastCommitHash,
+        version: old.version + 1,
+      };
+      meta.mrs = [
+        ...meta.mrs.slice(0, idx),
+        nextMR,
+        ...meta.mrs.slice(idx + 1),
+      ];
+    } else {
+      nextMR = {
+        repoPath,
+        url: input.url,
+        title: input.title,
+        branch: input.branch,
+        status: input.status,
+        lastCommitHash: input.lastCommitHash,
+        createdByActionId: input.createdByActionId,
+        version: 1,
+        createdAt: now,
+      };
+      meta.mrs = [...meta.mrs, nextMR];
+    }
+    meta.updatedAt = now;
+    await writeMeta(meta);
+    const task = await hydrateTask(meta);
+    return { task, mr: nextMR };
+  });
+
+/**
+ * patch MR 状态（V0.6.4+ polling 用、V0.6.1 留接口暂不调）
+ *
+ * 按 repoPath 匹配（单仓 1 条记录、不需要 version 联合 key）
  */
 export const patchMR = async (
   taskId: string,
-  version: number,
-  patch: Partial<Pick<MRRecord, "status" | "lastChecked">>,
+  repoPath: string,
+  patch: Partial<Pick<MRRecord, "status" | "lastChecked" | "mergedAt">>,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    const idx = meta.mrs.findIndex((m) => m.version === version);
+    const idx = meta.mrs.findIndex((m) => m.repoPath === repoPath);
     if (idx < 0) return null;
     meta.mrs = [
       ...meta.mrs.slice(0, idx),

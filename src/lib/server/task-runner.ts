@@ -36,13 +36,16 @@ import type { McpServerConfig, ModelSelection, SDKMessage } from "@cursor/sdk";
 
 import {
   appendAction,
+  appendActionSideEffectMR,
   appendEvent,
   getActionArtifactPath,
   getActionsDir,
   getEventsLogPath,
   getTask,
   patchAction,
-  setGitBranch,
+  setFeishuTesterUserIds,
+  upsertGitBranch,
+  upsertMR,
   setTaskLastAgentId,
   setTaskRepoStatus,
   setTaskRunStatus,
@@ -53,10 +56,16 @@ import {
   cancelPending,
   getChatMcpUrl,
   setChatAwaitingNotifier,
+  setChatTaskActionHandler,
   submitActionAck,
   submitNextAction,
   submitTaskTerminate,
+  unsetChatAwaitingNotifierIf,
+  unsetChatTaskActionHandlerIf,
+  type AwaitingNotifier,
+  type ChatTaskActionHandler,
 } from "./chat-mcp";
+import { createMR } from "./gitlab-client";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -102,12 +111,13 @@ const ACTION_PROMPT_FILE: Record<ActionType, string> = {
   learn: "action-learn.md",
 };
 
-// V0.6.0 范围内允许的 action 类型（advanceTask 准入门槛 1）
-// ship / test / learn 在 V0.6.1+ 上线、当前拒绝
-const ACTION_AVAILABLE_IN_V060: ReadonlySet<ActionType> = new Set([
+// V0.6.1 范围内允许的 action 类型（advanceTask 准入门槛 1）
+// test / learn 在 V0.6.2+ 上线、当前拒绝
+const ACTION_AVAILABLE_IN_V061: ReadonlySet<ActionType> = new Set([
   "plan",
   "build",
   "review",
+  "ship",
 ]);
 
 const NULL_PLACEHOLDER = "（未提供）";
@@ -474,14 +484,20 @@ export const forceClearStaleRunnerState = (taskId: string): void => {
 
 // ----------------- 准入门槛 1：action 类型 + 上游 action 依赖 -----------------
 
+interface PrerequisiteContext {
+  gitHost?: string;
+  gitToken?: string;
+}
+
 const checkActionPrerequisites = (
   task: Task,
   actionType: ActionType,
+  ctx: PrerequisiteContext = {},
 ): { ok: true } | { ok: false; reason: string } => {
-  if (!ACTION_AVAILABLE_IN_V060.has(actionType)) {
+  if (!ACTION_AVAILABLE_IN_V061.has(actionType)) {
     return {
       ok: false,
-      reason: `action 类型「${ACTION_LABEL[actionType]}」在 V0.6.0 阶段未实现、当前仅支持 plan / build / review。等 V0.6.1+ 上线后再用。`,
+      reason: `action 类型「${ACTION_LABEL[actionType]}」在 V0.6.1 阶段未实现、当前仅支持 plan / build / review / ship。等 V0.6.2+ 上线后再用。`,
     };
   }
 
@@ -510,6 +526,30 @@ const checkActionPrerequisites = (
         };
       }
       return { ok: true };
+    case "ship": {
+      // V0.6.1 准入：
+      //   1. 至少 1 个 build 已 approve（不强求 review、用户可跳过 review 直接 ship）
+      //   2. settings 配了 gitHost + gitToken（不然 server 没法调 GitLab API）
+      if (!lastCompletedOfType("build")) {
+        return {
+          ok: false,
+          reason: "ship 前需要至少 1 个已 approve 的 build action。先推进 build、再进 ship。",
+        };
+      }
+      if (!ctx.gitHost || ctx.gitHost.trim().length === 0) {
+        return {
+          ok: false,
+          reason: "ship 需要配 GitLab Host、请去「设置 → GitLab 配置」填上（如 gitlab.wukongedu.net）。",
+        };
+      }
+      if (!ctx.gitToken || ctx.gitToken.trim().length === 0) {
+        return {
+          ok: false,
+          reason: "ship 需要配 GitLab Personal Access Token、请去「设置 → GitLab 配置」填上（需要 api scope）。",
+        };
+      }
+      return { ok: true };
+    }
     case "learn":
       if (task.repoStatus !== "merged") {
         return {
@@ -524,10 +564,9 @@ const checkActionPrerequisites = (
         };
       }
       return { ok: true };
-    case "ship":
     case "test":
-      // V0.6.0 已被上面 ACTION_AVAILABLE_IN_V060 拦掉、走不到这里
-      return { ok: false, reason: "V0.6.0 未实现" };
+      // V0.6.1 已被上面 ACTION_AVAILABLE_IN_V061 拦掉、走不到这里
+      return { ok: false, reason: "V0.6.1 未实现" };
     default: {
       const _: never = actionType;
       return { ok: false, reason: `未知 action 类型：${_}` };
@@ -538,28 +577,34 @@ const checkActionPrerequisites = (
 // ----------------- branch checkout 挂接（build action 第一次跑前）-----------------
 
 /**
- * V0.6：build action 第一次跑前、拼 GitBranchInfo + 引导 agent checkout
+ * V0.6.1：build action 第一动作前、拼每仓 GitBranchInfo + 引导 agent 逐仓 idempotent checkout
  *
- * branch 命名规则（V0.6 拍板）：
+ * branch 命名规则（V0.6 拍板、多仓共用同一 name）：
  *   `feature/<username>/<飞书 story id>-<task.title 转换后>`
  *   - username 取自 settings.username
  *   - 飞书 story id 从 task.feishuStoryUrl 抠 URL 末段数字（如 detail/6956910305）
  *   - task.title 转换：保留中文、空白/特殊字符替换为 -
  *
- * base branch 探测交给 agent：runner 不再要用户填 mainBranch、agent shell 现场跑
- *   `git symbolic-ref refs/remotes/origin/HEAD`（克隆时自动设的）或
- *   `git remote show origin | grep "HEAD branch"`（远端权威值、兼容补救）
+ * base branch 探测交给 agent：每仓自探（不同仓可能 master / main / develop）
  *
- * 返回 null：缺 username 或 feishuStoryUrl、不建 branch
+ * V0.6.1 简化：**每次 build 都 inject hint、agent 跑 idempotent shell**
+ *   （branch 存在 → checkout、不存在 → 基于探到的主分支建）、不再维护 checkedOut 状态。
+ *   gitBranches 数组只在首次建条目时落库、之后保留 createdAt 历史值。
+ *
+ * 返回 null：缺 username / feishuStoryUrl / repoPaths 为空、不建 branch
  */
-const planBranchForBuild = (
+const planBranchesForBuild = (
   task: Task,
   username: string | undefined,
-): { info: GitBranchInfo; promptHint: string } | null => {
+): { infos: GitBranchInfo[]; promptHint: string } | null => {
   if (!username || username.trim().length === 0) {
     return null;
   }
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
+    return null;
+  }
+  const repoPaths = task.repoPaths ?? [];
+  if (repoPaths.length === 0) {
     return null;
   }
 
@@ -571,50 +616,93 @@ const planBranchForBuild = (
     return null;
   }
 
-  // title 转 branch-safe：保留中文 + 字母数字、其他换 -
+  // title 转 branch-safe（git check-ref-format 约束）：
+  // 保留中文 + 字母数字；空格 / 各种括号 / git 非法字符（~ ^ @ : ? * [ \ / < > | "）统一换 -；
+  // 连续点折成 -（git 禁 ..）；首尾的 - 和 . 去掉（git 禁 ref 以 . 结尾）。中间单点保留（如 v1.0）
   const titleSafe = task.title
     .trim()
-    .replace(/[\s\\/:*?"<>|【】（）()\[\]{}]+/g, "-")
+    .replace(/[\s\\/:*?"<>|~^@【】（）()\[\]{}]+/g, "-")
+    .replace(/\.{2,}/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/^[-.]+|[-.]+$/g, "");
 
   const branchName = `feature/${username.trim()}/${storyId}-${titleSafe}`;
+  const now = Date.now();
 
-  const info: GitBranchInfo = {
-    name: branchName,
-    baseBranch: "",
-    checkedOut: false,
-    createdAt: Date.now(),
-  };
+  // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch / createdAt）
+  const existing = task.gitBranches ?? [];
+  const infos: GitBranchInfo[] = repoPaths.map((repoPath) => {
+    const old = existing.find((b) => b.repoPath === repoPath);
+    if (old) return old;
+    return {
+      repoPath,
+      name: branchName,
+      baseBranch: "",
+      checkedOut: false,
+      createdAt: now,
+    };
+  });
 
-  const promptHint = [
-    "## 准入：build 第一次跑、先建 + checkout 分支",
-    "",
-    `本 task 没建过分支、runner 拼好的 branch name：\`${branchName}\``,
-    "",
-    "**第一动作**：调 `shell` 工具、按下面 2 步跑（探主分支 → 基于它建 feature 分支）：",
-    "",
-    "```bash",
-    "# 1) 探主分支名（master / main / develop 都可能、用户不再手动配）",
-    "BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')",
-    'if [ -z "$BASE" ]; then',
-    "  # origin/HEAD 没设、用 git remote show 拿远端权威值",
-    "  BASE=$(git remote show origin 2>/dev/null | sed -n '/HEAD branch:/s/.*: //p')",
-    "fi",
-    'if [ -z "$BASE" ]; then',
-    '  echo "[error] 探不到主分支、放弃 checkout、稍后回报用户"',
-    "  exit 1",
-    "fi",
-    "",
-    "# 2) 基于主分支建 feature 分支",
-    `git fetch origin "$BASE" && git checkout -b "${branchName}" "origin/$BASE"`,
-    "```",
-    "",
-    "checkout 成功后、再按下面 build action 标准流程做实施。",
-    "checkout 失败（如分支已存在 / 工作区脏 / 不是 git 仓库 / 探不到主分支）→ emit 一段简短 assistant_message 告知用户问题、然后调 wait_for_user 等用户处理（**不要**自己 force / reset 操作硬盘）。",
-  ].join("\n");
+  // 多仓 hint：逐仓 idempotent checkout（branch 存在则 checkout、不存在则建）
+  const isMultiRepo = repoPaths.length > 1;
+  const lines: string[] = [];
+  lines.push("## 准入：build 第一动作、逐仓 idempotent checkout 分支");
+  lines.push("");
+  if (isMultiRepo) {
+    lines.push(
+      `本 task 涉及 ${repoPaths.length} 个仓、共用同一 branch name：\`${branchName}\``,
+    );
+  } else {
+    lines.push(`本 task 的 branch name：\`${branchName}\``);
+  }
+  lines.push("");
+  lines.push(
+    "**第一动作**：调 `shell` 工具、对每个仓跑下面 idempotent 命令（branch 存在则 checkout、不存在则基于主分支建）：",
+  );
+  lines.push("");
 
-  return { info, promptHint };
+  for (const repoPath of repoPaths) {
+    if (isMultiRepo) {
+      lines.push(`### 仓 \`${repoPath}\``);
+      lines.push("");
+    }
+    lines.push("```bash");
+    if (isMultiRepo) {
+      lines.push(`cd ${repoPath}`);
+    }
+    lines.push("# 探主分支名（master / main / develop 都可能、用户不再手动配）");
+    lines.push(
+      "BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')",
+    );
+    lines.push('if [ -z "$BASE" ]; then');
+    lines.push(
+      "  BASE=$(git remote show origin 2>/dev/null | sed -n '/HEAD branch:/s/.*: //p')",
+    );
+    lines.push("fi");
+    lines.push('if [ -z "$BASE" ]; then');
+    lines.push('  echo "[error] 探不到主分支、放弃 checkout、稍后回报用户"');
+    lines.push("  exit 1");
+    lines.push("fi");
+    lines.push("# Idempotent：branch 已存在则 checkout、否则基于主分支建");
+    lines.push(`if git show-ref --verify --quiet refs/heads/${branchName}; then`);
+    lines.push(`  git checkout ${branchName}`);
+    lines.push("else");
+    lines.push(
+      `  git fetch origin "$BASE" && git checkout -b ${branchName} "origin/$BASE"`,
+    );
+    lines.push("fi");
+    lines.push("```");
+    lines.push("");
+  }
+
+  lines.push(
+    "checkout 成功后、按下面 build action 标准流程做实施（多仓 task：所有仓都得 checkout 成功才开始改代码）。",
+  );
+  lines.push(
+    "checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓库）→ emit 一段简短 assistant_message 告知问题、调 wait_for_user 等用户处理（**不要**自己 force / reset 操作硬盘）。",
+  );
+
+  return { infos, promptHint: lines.join("\n") };
 };
 
 // ----------------- 公开 mutation API -----------------
@@ -646,6 +734,10 @@ export interface AdvanceTaskInput {
   forceNewAgent?: boolean;
   // 设置页 username（拼 build branch 名用、缺省时不建 branch）
   username?: string;
+  // V0.6.1 ship action 用：GitLab host（不带协议）+ Personal Access Token
+  // 来自 settings.gitHost / gitToken、agent 启动时快照、改 token 需 forceNewAgent
+  gitHost?: string;
+  gitToken?: string;
 }
 
 export const advanceTask = async (
@@ -662,10 +754,12 @@ export const advanceTask = async (
     userMcpServers,
     forceNewAgent,
     username,
+    gitHost,
+    gitToken,
   } = input;
 
   // 1) 准入条件（V0.6 门槛 1）
-  const pre = checkActionPrerequisites(task, actionType);
+  const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
   }
@@ -691,13 +785,20 @@ export const advanceTask = async (
     meta: { type: actionType, n: action.n, artifactPath: action.artifactPath },
   });
 
-  // 3) branch checkout 挂接（仅 build action、且 task 还没建过 branch）
+  // 3) branch checkout 挂接（仅 build action、V0.6.1 每次都 inject 多仓 idempotent hint）
   let branchCheckoutHint: string | undefined;
-  if (actionType === "build" && !taskAfterAppend.gitBranch?.checkedOut) {
-    const planned = planBranchForBuild(taskAfterAppend, username);
+  if (actionType === "build") {
+    const planned = planBranchesForBuild(taskAfterAppend, username);
     if (planned) {
-      // 落库 GitBranchInfo（checkedOut=false、agent 跑完 git checkout 后由路由层标 checkedOut=true）
-      await setGitBranch(task.id, planned.info);
+      // 仅新仓 upsert（已存在的保留 createdAt / baseBranch 历史值、不覆盖）
+      const existingRepos = new Set(
+        (taskAfterAppend.gitBranches ?? []).map((b) => b.repoPath),
+      );
+      for (const info of planned.infos) {
+        if (!existingRepos.has(info.repoPath)) {
+          await upsertGitBranch(task.id, info);
+        }
+      }
       branchCheckoutHint = planned.promptHint;
     }
   }
@@ -741,6 +842,8 @@ export const advanceTask = async (
         model,
         userMcpServers,
         forceNewAgent: true,
+        gitHost,
+        gitToken,
       });
     }
     return { action };
@@ -769,6 +872,8 @@ export const advanceTask = async (
     model,
     userMcpServers,
     forceNewAgent: !!forceNewAgent,
+    gitHost,
+    gitToken,
   });
 
   return { action };
@@ -892,6 +997,9 @@ interface StartAgentInput {
   model: ModelSelection;
   userMcpServers?: Record<string, McpServerConfig>;
   forceNewAgent: boolean;
+  // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包
+  gitHost?: string;
+  gitToken?: string;
 }
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
@@ -905,6 +1013,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     apiKey,
     model,
     userMcpServers,
+    gitHost,
+    gitToken,
   } = input;
 
   // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
@@ -936,8 +1046,107 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
   });
 
-  // 2) 注册 awaiting notifier（chat-mcp → runner 的回调）
-  setChatAwaitingNotifier(task.id, async (signal) => {
+  // 2) 注册 task-scoped action handler（V0.6.1 submit_mr / set_feishu_testers）
+  // 闭包里持 gitHost / gitToken 快照——task 运行期间不可变、要换 token 需 force-new-agent
+  // 具名化：finally 注销走 conditional unset（只清自己这个实例、防 force-new-agent race 误清新 handler）
+  const taskActionHandler: ChatTaskActionHandler = async (taskAction) => {
+    if (taskAction.kind === "submit_mr") {
+      if (!gitHost || !gitToken) {
+        return {
+          ok: false,
+          error: "task 启动时没拿到 GitLab Host / Token、ship 准入应该已被拦、不应该走到这里",
+        };
+      }
+      const result = await createMR({
+        config: { host: gitHost, token: gitToken },
+        projectPath: taskAction.projectPath,
+        sourceBranch: taskAction.sourceBranch,
+        targetBranch: taskAction.targetBranch,
+        title: taskAction.title,
+        description: taskAction.description,
+      });
+      if (!result.ok) {
+        await writeEventAndPublish(task.id, {
+          kind: "error",
+          actionId: taskAction.actionId,
+          text: `提测失败（${taskAction.repoPath}）：${result.error}`,
+          meta: { repoPath: taskAction.repoPath, projectPath: taskAction.projectPath },
+        });
+        return { ok: false, error: result.error };
+      }
+
+      // upsert task.mrs[]（按 repoPath、同仓多次 ship 累计 version++）
+      const upserted = await upsertMR(task.id, taskAction.repoPath, {
+        url: result.url,
+        title: taskAction.title,
+        branch: taskAction.sourceBranch,
+        status: "open",
+        createdByActionId: taskAction.actionId,
+        lastCommitHash: taskAction.lastCommitHash,
+      });
+      const mrVersion = upserted?.mr.version ?? 1;
+      if (upserted) {
+        publish(task.id, { kind: "task", task: upserted.task });
+      }
+
+      // 把本次 MR 原子追加到 action.sideEffects.mrs[]（多仓 task 一次 ship 可能落 N 条）
+      // 走 task-fs 原子函数（withTaskLock 包 read-modify-write）、不在这里 getTask→patchAction 两段非原子
+      const patched = await appendActionSideEffectMR(task.id, taskAction.actionId, {
+        repoPath: taskAction.repoPath,
+        mrUrl: result.url,
+        mrVersion,
+        branch: taskAction.sourceBranch,
+        commitHash: taskAction.lastCommitHash,
+      });
+      if (patched) {
+        publish(task.id, { kind: "task", task: patched });
+        const a = patched.actions.find((x) => x.id === taskAction.actionId);
+        if (a) publish(task.id, { kind: "action", action: a });
+      }
+
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        actionId: taskAction.actionId,
+        text: `MR 已${mrVersion > 1 ? `推送（v${mrVersion}）` : "创建"}：${result.url}`,
+        meta: {
+          repoPath: taskAction.repoPath,
+          projectPath: taskAction.projectPath,
+          mrUrl: result.url,
+          mrIid: result.iid,
+          mrVersion,
+        },
+      });
+      return {
+        ok: true,
+        data: {
+          mr_url: result.url,
+          mr_iid: result.iid,
+          mr_version: mrVersion,
+        },
+      };
+    }
+
+    if (taskAction.kind === "set_feishu_testers") {
+      const patched = await setFeishuTesterUserIds(task.id, taskAction.userIds);
+      if (patched) {
+        publish(task.id, { kind: "task", task: patched });
+      }
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        actionId: taskAction.actionId,
+        text: `已记忆飞书测试人员（${taskAction.userIds.length} 人、同 task 后续 ship 直接复用）`,
+        meta: { userIds: taskAction.userIds },
+      });
+      return { ok: true };
+    }
+
+    return { ok: false, error: "未知 task action kind" };
+  };
+  setChatTaskActionHandler(task.id, taskActionHandler);
+
+  // 3) 注册 awaiting notifier（chat-mcp → runner 的回调）
+  // 具名化：同 taskActionHandler、finally 走 conditional unset 防 force-new-agent race 误清
+  const awaitingNotifier: AwaitingNotifier = async (signal) => {
     if (signal.kind === "ask_user_request") {
       const previewText = signal.questions
         .map((q, idx) => `Q${idx + 1}: ${q.question}`)
@@ -1011,6 +1220,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           artifactPath: signal.artifactPath,
           // 留个标志位给将来 UI 调试面板用、文本里不展示
           postCheckPassed: postCheck?.passed,
+          // 里程碑标记：UI 事件流默认展开（action 产出完成等 ack、用户要看 artifact 决定 approve / revise）
+          awaitingAck: true,
         },
       });
     } else {
@@ -1018,9 +1229,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const updated = await setTaskRunStatus(task.id, "awaiting_user", null);
       if (updated) publish(task.id, { kind: "task", task: updated });
     }
-  });
+  };
+  setChatAwaitingNotifier(task.id, awaitingNotifier);
 
-  // 3) 启动 Agent + 消息循环（在独立 Promise 里跑、advanceTask 立即返回）
+  // 4) 启动 Agent + 消息循环（在独立 Promise 里跑、advanceTask 立即返回）
   let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -1203,7 +1415,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     } finally {
       runningTasks.delete(task.id);
       cancelPending(task.id);
-      setChatAwaitingNotifier(task.id, null);
+      // conditional unset：只清「自己注册的那个实例」、force-new-agent race 下新 handler/notifier 不被误清
+      unsetChatAwaitingNotifierIf(task.id, awaitingNotifier);
+      unsetChatTaskActionHandlerIf(task.id, taskActionHandler);
       if (agent) {
         try {
           agent.close();

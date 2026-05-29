@@ -10,11 +10,10 @@
 ## 准入条件（V0.6 门槛 1、硬门槛）
 
 - 至少 1 个已通过的 plan action（runner 会拦、违反时 advance 路由 4xx）
-- 第一次跑 build 前、`task.gitBranch.checkedOut = false` 时、**先 checkout 分支**：
-  - 分支名见 super-prompt 顶部「任务输入」段的 `gitBranchHint`
-  - 基底分支由 agent 自己探（`git symbolic-ref refs/remotes/origin/HEAD` 或 `git remote show origin`）、不要让用户手动配
-  - 跑 `git checkout -b <branch> origin/<探到的主分支名>`
-  - 写完后跟 runner 报告（runner 把 task.gitBranch.checkedOut 置 true）
+- runner 在 [NEXT_ACTION ...] 头后会注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
+  - 多仓 task：每仓共用同一 branch name、base 分支各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
+  - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
+  - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 wait_for_user 等用户处理、**不要**自己 force / reset
 
 ## 本 action 的目标
 
@@ -38,9 +37,9 @@
 
 1. **改动范围必须在最新 plan artifact §5 task 拆分的「改动」字段里**——超出范围的文件一行都不许动
    - 如果发现 plan 漏了某个必须改的文件、**不要自己加**、把它写进 build artifact 的「偏离 plan」、让用户在 ack 时拍板
-2. **不动 .git**——不 commit、不 push、不创建分支、不 rebase、不 reset、不 stash
-   - **例外**：build action 第一次跑、`task.gitBranch.checkedOut = false` 时、必须 `git checkout -b <branch>`（见上面准入条件）
-   - 之后**绝对不再动 git**——commit / push / pr 都是 ship action 的职责、不归 build
+2. **不动 .git**——不 commit、不 push、不 rebase、不 reset、不 stash
+   - **例外**：build action 开头 runner 注入的 idempotent checkout hint、按那段 shell 命令跑（详见上面准入条件）
+   - 跑完 checkout 后**绝对不再动 git**——commit / push / pr 都是 ship action 的职责、不归 build
 3. **不删测试 / 配置文件**——除非最新 plan artifact 明确指定
 4. **不动用户业务仓库根的 README / package.json**——除非最新 plan artifact 明确说要改
 5. **不上 npm install / pnpm add 新依赖**——除非最新 plan artifact 明确批准了某个依赖

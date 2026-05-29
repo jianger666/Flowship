@@ -27,11 +27,23 @@ export interface ModelSelection {
  * settings：localStorage 持久化的用户配置
  * V0.6 新增 username：用于 ship action 的 branch prefix
  *   （branch 模板 = `feature/<username>/<飞书id>-<task.title>`、多人用 fe-ai-flow 不互踩）
+ * V0.6.1 新增 gitHost + gitToken：ship action 走 server 内置 GitLab REST API、
+ *   不依赖外部 glab CLI；当前公司场景所有仓共用同一个 GitLab 实例、所以是全局字段。
  */
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
   username?: string;
+  /**
+   * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
+   * 空时 ship action 准入会拦、提示用户先配
+   */
+  gitHost?: string;
+  /**
+   * V0.6.1 ship：GitLab Personal Access Token（`glpat-` 开头）
+   * 明文 localStorage、跟 apiKey 同安全级别——别在共用机器配
+   */
+  gitToken?: string;
   repos: RepoConfig[];
   mcpServersJson: string;
 }
@@ -85,7 +97,7 @@ export interface ModelOption {
  * - `plan`     出方案
  * - `build`    改代码
  * - `review`   代码复核
- * - `ship`     提 MR
+ * - `ship`     提测（push 改动 + 提 MR 到 test 分支 + 飞书 story 评论 @ 测试人员）
  * - `test`     AI 手测
  * - `learn`    沉淀
  */
@@ -113,7 +125,7 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   plan: "出方案",
   build: "改代码",
   review: "代码复核",
-  ship: "提 MR",
+  ship: "提测",
   test: "AI 手测",
   learn: "沉淀",
 };
@@ -156,7 +168,7 @@ export interface ActionRecord {
    * - plan: artifact 文件存在 + 内容长度 >= 100（V0.6.0.1 拍板删黑名单 grep、详见 action-checks.ts）
    * - build: typecheck/lint exit 0 + git status 有改动
    * - review: git diff hash 一致 + 4 类差异段非空
-   * - ship: git push + glab mr create exit 0、URL 非空
+   * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
    * - test: pass 率 ≥ 阈值
    * - learn: propose 段有内容 + evidence 路径都能 read 到
    */
@@ -167,14 +179,23 @@ export interface ActionRecord {
 
   /**
    * 副作用记录（对外部世界的影响）
-   * - ship: { mrUrl, mrVersion, branch, commitHash, feishuCommentId }
+   *
+   * V0.6.1：ship 改成多仓数组——同一 ship action 多仓场景产出 N 条 MR、
+   *   一仓 1 条记录；feishuCommentId 仍是 1 个（1 条评论拼多仓 MR 链接）
    * - test: agent 起服务 / 用例结果摘要（V0.6.2 上线时再细化字段）
    */
   sideEffects?: {
-    mrUrl?: string;
-    mrVersion?: number;
-    branch?: string;
-    commitHash?: string;
+    mrs?: Array<{
+      repoPath: string;
+      mrUrl: string;
+      mrVersion: number;
+      branch: string;
+      commitHash: string;
+    }>;
+    /**
+     * 飞书 story 评论 id。V0.6.1 暂不落库（agent 把 comment id 记在 ship artifact §4 文本里）、
+     * 字段预留给 V0.6.4 MR 状态 polling——届时回写评论需要 comment id 定位、不要当死字段删。
+     */
     feishuCommentId?: string;
   };
 
@@ -193,37 +214,73 @@ export interface ActionRecord {
 }
 
 /**
- * MR 记录（ship action 跑完落、polling 状态更新——V0.6.4+）
- * - V0.6.0 ship 不实做、字段先定好
+ * MR 记录（ship action 跑完落、polling 状态更新留 V0.6.4+）
+ *
+ * V0.6.1 拍板：
+ * - 多仓 task → 每仓 1 条记录、按 repoPath 区分（一个 task.mrs[] 数组可能 N 条）
+ * - 同 repoPath 多次 ship → 同名 branch 累计 commit、跳过 createMR、
+ *   只更新 version / lastCommitHash、`createdAt` 保持首次值
+ * - title 落到字段里是为了列表 / 详情页直接展示、不用每次拉 GitLab API
  */
 export interface MRRecord {
+  /**
+   * V0.6.1：关联到 task.repoPaths 里的某个仓、单仓 task 时 = task.repoPaths[0]
+   */
+  repoPath: string;
+  /**
+   * 本仓累计 push 次数（首次 createMR 时 = 1、之后每次 ship 都 ++）
+   * 跟 GitLab MR ID（iid）没关系、只是 fe-ai-flow 内部计数
+   */
   version: number;
   url: string;
+  /**
+   * V0.6.1：MR 标题（task 卡片 / 详情页直接显示、不用每次拉 GitLab API）
+   */
+  title: string;
   branch: string;
   status: "open" | "closed" | "merged";
   createdAt: number;
+  /**
+   * V0.6.1：status 转 merged 时记 timestamp、统计「ship → merge 耗时」用
+   * 当前 V0.6.1 不实现 polling、只在用户手动 mark-merged 时更新
+   */
+  mergedAt?: number;
+  /**
+   * V0.6.1：当前最新 commit hash（每次 ship push 后更新）
+   * version 是「push 次数」、lastCommitHash 是「当前最新 commit」、互补
+   */
+  lastCommitHash?: string;
   createdByActionId: string;
+  /**
+   * V0.6.4+ polling MR 状态时记最后一次查询的 timestamp
+   */
   lastChecked?: number;
 }
 
 /**
  * Git branch 状态（build 第一次跑前生成、不可改写）
  *
- * 时机（V0.6 拍板）：
+ * 时机（V0.6.1 起为每仓 1 条）：
  * - plan action 不建 branch（plan 不写代码）
- * - build action 第一次跑前、runner 检测 `task.gitBranch?.checkedOut` 为 false
- *   → prompt inject「先 `git checkout -b <name> origin/<baseBranch>`、再写代码」
- *   → agent shell 跑、跑完 patch checkedOut=true
- * - 后续 build / build / ship 都在同一条 branch（V0.6 拍板：全 task 一条 branch、累计 commit）
+ * - build action 第一次跑前、runner 检测 task.gitBranches 是否覆盖所有 repoPath
+ *   → prompt inject「逐仓先 `git checkout -b <name> origin/<baseBranch>`、再写代码」
+ *   → agent shell 跑、跑完 patch 对应仓的 checkedOut=true
+ * - 多仓 task：每仓 1 条 GitBranchInfo、name 同名、base branch 各仓自探
+ * - 后续 build / ship 都复用同一条 branch（V0.6.1：每仓同名 branch、累计 commit、单仓 1 MR）
  *
- * 命名规则（V0.6 拍板）：
- *   name = `feature/<username>/<飞书 story id>-<task.title>`
+ * 命名规则（V0.6 拍板、V0.6.1 沿用）：
+ *   name = `feature/<username>/<飞书 story id>-<task.title>`（多仓共用同一 name）
  *   - username 取自 settings.username
  *   - 飞书 story id 从 task.feishuStoryUrl 抠（URL 末段数字）
  *   - task.title 保留中文、非法字符（\s / : * ? " < > | 【 】 ( ) 等）换成 -
  *   baseBranch 由 agent 启动 build 时自己探测（origin/HEAD 或 git remote show）、不在 settings 里配
  */
 export interface GitBranchInfo {
+  /**
+   * V0.6.1：关联到 task.repoPaths 里的某个仓、多仓 task 时区分用
+   * 单仓 task 时 = task.repoPaths[0]
+   */
+  repoPath: string;
   name: string;
   baseBranch: string;
   checkedOut: boolean;
@@ -400,9 +457,20 @@ export interface Task {
   mrs: MRRecord[];
 
   /**
-   * V0.6：git branch 状态（build 第一次跑前由 runner 生成、不可改写）
+   * V0.6.1：每仓 1 条 GitBranchInfo、build 第一次跑前由 runner 按仓数生成
+   * 多仓 task 各仓 name 同名、base branch 不同；单仓 task 数组长度 1
+   * （V0.6.0 单数字段 `gitBranch` 在 V0.6.1 改为数组）
    */
-  gitBranch?: GitBranchInfo;
+  gitBranches?: GitBranchInfo[];
+
+  /**
+   * V0.6.1：飞书 story 测试人员 lark_user_id 列表
+   * - 首次 ship 时 agent 自动探测（list_workitem_field_config + get_workitem_brief
+   *   + search_user_info）、探到的人写回这里
+   * - 探不到时 ask_user 让用户填、记忆到这里
+   * - 同 task 后续 ship 直接复用、不再探测 / 不再问用户
+   */
+  feishuTesterUserIds?: string[];
 
   // ===== 保留字段（V0.5 → V0.6 不变）=====
 
