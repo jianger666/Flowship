@@ -104,7 +104,6 @@ export const ChatView = ({
           {
             apiKey: args.apiKey,
             model: args.model,
-            mcpServers: args.mcpServers,
           },
         );
         onTaskUpdateRef.current(latest);

@@ -3,7 +3,7 @@
  *
  * 抽出来的动机：`chat-reply/route.ts` 和 `phase-ack/route.ts` 都各自实现了：
  *   - `errorResponse(msg, status)`
- *   - `isValidModel(m)` / `isValidMcpServers(v)`
+ *   - `isValidModel(m)`
  *   - `images[]` 入参 parse + 单图字段校验 + 累计字节上限校验
  *   - `KEEPALIVE_RACE_RETRY_MS` + `sleep`
  *
@@ -17,7 +17,7 @@
  *     这些是业务参数、由 route 自己定、helper 只校验「不超传入的 max」
  */
 
-import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+import type { ModelSelection } from "@cursor/sdk";
 
 import type { ImageAttachmentInput } from "@/lib/server/task-fs";
 
@@ -46,21 +46,6 @@ export const isValidModel = (m: unknown): m is ModelSelection => {
   if (!m || typeof m !== "object") return false;
   const x = m as Partial<ModelSelection>;
   return typeof x.id === "string" && x.id.length > 0;
-};
-
-/**
- * 校验 mcpServers 对象：null/undefined 算合法（= 不接 MCP）、否则必须是对象 + value 是对象
- *
- * 不深校验 server cfg schema、留给 SDK 报错（更准）
- */
-export const isValidMcpServers = (
-  v: unknown,
-): v is Record<string, McpServerConfig> | undefined => {
-  if (v == null) return true;
-  if (typeof v !== "object" || Array.isArray(v)) return false;
-  return Object.values(v).every(
-    (cfg) => cfg != null && typeof cfg === "object",
-  );
 };
 
 // ----------------- Image 入参校验 -----------------

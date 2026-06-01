@@ -3,7 +3,7 @@
 /**
  * 任务级 MCP 开关列表
  *
- * - 列出 settings 里配置的所有 MCP server、每条一个 switch
+ * - 列出 Cursor 配的所有 MCP server、每条一个 switch
  * - 默认全开、关掉的进 disabledMcpServers 黑名单
  * - 同时支持新建任务（受控 disabled state）和详情页（每改一次 PATCH 到后端）
  *
@@ -12,7 +12,7 @@
  * 2. 自管模式：传 taskId + initial、组件自己 PATCH 后端 + toast（用于详情页面板）
  *    （为了避免组件状态分裂、自管模式只 hold 「乐观更新」一份 state、失败回滚）
  *
- * 设计依赖：调用方负责传入「当前 settings 里所有 MCP 名」、组件不读 localStorage（保持纯展示）。
+ * 设计依赖：调用方负责传入「当前 Cursor 配的所有 MCP 名」、组件不读配置（保持纯展示）。
  */
 
 import { useState } from "react";
@@ -25,7 +25,7 @@ import { cn } from "@/lib/utils";
 import { setTaskDisabledMcpServers } from "@/lib/task-store";
 
 interface McpToggleListProps {
-  // 当前可选的 MCP server 名（来自 settings.mcpServersJson 解析）
+  // 当前可选的 MCP server 名（来自 Cursor ~/.cursor/mcp.json）
   availableServers: string[];
   // 当前禁用的 server 名（受控）
   disabled: string[];
@@ -44,7 +44,7 @@ export const McpToggleList = ({
   disabled,
   onChange,
   taskId,
-  emptyHint = "settings 里没配置 MCP server",
+  emptyHint = "Cursor 里没配 MCP server",
   className,
 }: McpToggleListProps) => {
   // 自管模式下、PATCH 进行中的 server 名集合（按 server 名锁、避免重复点）

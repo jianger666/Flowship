@@ -10,7 +10,7 @@
  * 返回值约定：
  * - settings：当前编辑中的草稿、UI 双向绑定
  * - savedSettings：已写到 localStorage 的版本、只读
- * - dirty：4 个字段的 dirty map（缓存计算结果、不要每次 render 重算）
+ * - dirty：各字段的 dirty map（缓存计算结果、不要每次 render 重算）
  * - hasUnsaved：dirty 任一为 true（用于离页提示）
  * - update / saveField：分别更新草稿 / 把单字段刷盘
  * - loaded：是否完成首次 localStorage 加载（避免 SSR/hydrate 闪空）
@@ -35,7 +35,7 @@ export interface UseSettingsResult {
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
-// - apiKey / mcpServersJson / username / gitHost / gitToken：字符串直接 ===
+// - apiKey / username / gitHost / gitToken：字符串直接 ===
 // - defaultModel：嵌套对象、id + params 数组按位比较
 // - repos：数组、长度 + 每项 path/name 比较
 const isFieldEqual = (
@@ -45,7 +45,6 @@ const isFieldEqual = (
 ): boolean => {
   if (
     key === "apiKey" ||
-    key === "mcpServersJson" ||
     key === "username" ||
     key === "gitHost" ||
     key === "gitToken"
@@ -87,14 +86,13 @@ export const useSettings = (): UseSettingsResult => {
     setLoaded(true);
   }, []);
 
-  // dirty 状态按字段缓存：4 个字段在 settings/savedSettings 任意变化时才重算
-  // 避免之前每次 render 8 次 JSON.stringify 的浪费
+  // dirty 状态按字段缓存：各字段在 settings/savedSettings 任意变化时才重算
+  // 避免之前每次 render 多次 JSON.stringify 的浪费
   const dirty = useMemo<Record<SettingsField, boolean>>(
     () => ({
       apiKey: !isFieldEqual("apiKey", settings, savedSettings),
       defaultModel: !isFieldEqual("defaultModel", settings, savedSettings),
       repos: !isFieldEqual("repos", settings, savedSettings),
-      mcpServersJson: !isFieldEqual("mcpServersJson", settings, savedSettings),
       username: !isFieldEqual("username", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),

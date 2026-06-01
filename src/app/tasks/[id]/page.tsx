@@ -27,6 +27,7 @@ import Link from "next/link";
 import { notFound, useParams } from "next/navigation";
 import {
   ArrowLeft,
+  Ban,
   CheckCircle2,
   ExternalLink,
   Flag,
@@ -64,7 +65,9 @@ import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
   finalizeTask,
+  setActionExcluded,
   setTaskUiLayout,
+  stopTask,
   submitActionAck,
   type ImagePayload,
 } from "@/lib/task-store";
@@ -105,7 +108,9 @@ const TaskDetailPage = () => {
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
   // SSE 重连 epoch：任意「让 agent 又活起来」的路径 ++、useTaskWatch 重连
   const [watchEpoch, setWatchEpoch] = useState(0);
-  // 全局 confirm hook（终结任务用）
+  // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
+  const [stopping, setStopping] = useState(false);
+  // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
 
   // ---- 拉一次任务详情 ----
@@ -267,9 +272,9 @@ const TaskDetailPage = () => {
   }) => {
     setStarting(true);
     try {
-      // 统一走 prepareRunArgs：apiKey + model（task.model || settings.defaultModel） + mcpServers
-      // 校验失败 helper 内部 toast.error、返 null、调用方直接 return
-      const args = prepareRunArgs(task, { mcpErrorPrefix: "修好再推进" });
+      // 统一走 prepareRunArgs：apiKey + model（task.model || settings.defaultModel）
+      // MCP 由 server 端读 cursor 配置、不在此传。校验失败 helper 内部 toast.error、返 null
+      const args = prepareRunArgs(task);
       if (!args) return;
       // input.model 仅 forceNewAgent=true 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
@@ -284,7 +289,6 @@ const TaskDetailPage = () => {
           userInstruction: input.userInstruction,
           apiKey: args.apiKey,
           model,
-          mcpServers: args.mcpServers,
           forceNewAgent: input.forceNewAgent,
           username: settings.username?.trim() || undefined,
           // V0.6.1 ship action 用：每次推进都带上 settings 里最新的 gitHost/gitToken
@@ -351,6 +355,55 @@ const TaskDetailPage = () => {
       toast.error(`提交失败：${(err as Error).message}`);
     } finally {
       setAckSubmitting(false);
+    }
+  };
+
+  // ---- 停止：中断当前正在跑 / 等 ack 的 action ----
+  const handleStop = async () => {
+    if (!task) return;
+    const ok = await confirm({
+      title: "停止当前 action？",
+      description:
+        "会中断正在跑的 agent（如果它正在改代码、可能留下半成品）。停止后可重新「推进」。",
+      confirmLabel: "停止",
+      destructive: true,
+    });
+    if (!ok) return;
+    setStopping(true);
+    try {
+      const updated = await stopTask(task.id);
+      setTask(updated);
+      toast.success("已停止、agent 已中断");
+    } catch (err) {
+      toast.error(`停止失败：${(err as Error).message}`);
+    } finally {
+      setStopping(false);
+    }
+  };
+
+  // ---- 划除 / 恢复某个 action（软删）----
+  // 划除会把 action 排出 agent 上下文、要二次确认；恢复无害、直接做
+  const handleToggleExclude = async (action: ActionRecord) => {
+    if (!task) return;
+    if (!action.excluded) {
+      const ok = await confirm({
+        title: `划除 #${action.n} ${ACTION_LABEL[action.type]}？`,
+        description:
+          "把这个 action 从 agent 上下文里排除（后续推进 / 接力不再参考它）。不删数据、随时可恢复。",
+        confirmLabel: "划除",
+      });
+      if (!ok) return;
+    }
+    try {
+      const updated = await setActionExcluded(
+        task.id,
+        action.id,
+        !action.excluded,
+      );
+      setTask(updated);
+      toast.success(action.excluded ? "已恢复" : "已划除");
+    } catch (err) {
+      toast.error(`操作失败：${(err as Error).message}`);
     }
   };
 
@@ -550,11 +603,24 @@ const TaskDetailPage = () => {
               </>
             )}
             {task.runStatus === "running" && !canAck && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin" />
-                agent 正在跑
-                {currentAction && ` ${ACTION_LABEL[currentAction.type]}`}
-              </div>
+              <>
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  agent 正在跑
+                  {currentAction && ` ${ACTION_LABEL[currentAction.type]}`}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleStop}
+                  disabled={stopping}
+                  title="停止当前 action（中断 agent、可重新推进）"
+                  className="text-muted-foreground hover:text-destructive"
+                >
+                  {stopping ? <Loader2 className="animate-spin" /> : <Ban />}
+                  停止
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -572,6 +638,7 @@ const TaskDetailPage = () => {
             currentActionId={task.currentActionId}
             selectedActionId={selectedActionId}
             onSelectAction={setSelectedActionId}
+            onToggleExclude={handleToggleExclude}
           />
         </div>
       </div>

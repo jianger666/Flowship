@@ -1,0 +1,83 @@
+/**
+ * POST /api/tasks/[id]/action-exclude
+ *
+ * V0.6.x「划除 / 恢复」单条 action（软删）。
+ *
+ * # Body
+ *
+ * ```
+ * {
+ *   actionId: string,    // 必填：要划除 / 恢复的 action id
+ *   excluded: boolean,   // true=划除（排出 agent 上下文）/ false=恢复
+ * }
+ * ```
+ *
+ * # 设计
+ *
+ * - 软删：只翻 ActionRecord.excluded 标记、不删 artifact / events / 不动 N——可逆。
+ * - renderActionHistorySection（task-runner）会跳过 excluded=true 的 action、
+ *   下次起 Run / 接力时它就不进 agent 上下文了（治本「冗余 action 污染后续推进」）。
+ * - **正在跑 / 等 ack 的 action 不能直接划除**：得先走「停止」(/stop) 把它中断、
+ *   否则会留个活 agent 指着一个被排除的 action、状态打架。
+ *
+ * # 错误语义
+ *
+ * - task / action 不存在 → 404
+ * - 划除一个还在进行中的 action → 409（提示先停止）
+ */
+
+import { getTask, patchAction } from "@/lib/server/task-fs";
+import { publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { errorResponse } from "@/lib/server/route-helpers";
+
+interface Ctx {
+  params: Promise<{ id: string }>;
+}
+
+interface PostBody {
+  actionId?: string;
+  excluded?: boolean;
+}
+
+export const runtime = "nodejs";
+
+export const POST = async (req: Request, { params }: Ctx) => {
+  const { id } = await params;
+
+  let body: PostBody;
+  try {
+    body = (await req.json()) as PostBody;
+  } catch {
+    return errorResponse("body 不是合法 JSON");
+  }
+
+  const actionId = (body.actionId ?? "").trim();
+  if (!actionId) return errorResponse("actionId 必填");
+  if (typeof body.excluded !== "boolean") {
+    return errorResponse("excluded 必须是 boolean");
+  }
+
+  const task = await getTask(id);
+  if (!task) return errorResponse("not_found", 404);
+
+  const action = task.actions.find((a) => a.id === actionId);
+  if (!action) return errorResponse("action 不存在", 404);
+
+  // 进行中的 action 不能直接划除——先停止再划
+  if (
+    body.excluded &&
+    (action.status === "running" || action.status === "awaiting_ack")
+  ) {
+    return errorResponse("这个 action 还在进行中、请先「停止」再划除", 409);
+  }
+
+  const updated = await patchAction(id, actionId, { excluded: body.excluded });
+  if (!updated) return errorResponse("not_found", 404);
+
+  publishTaskStreamEvent(id, { kind: "task", task: updated });
+
+  return new Response(JSON.stringify({ ok: true, task: updated }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};

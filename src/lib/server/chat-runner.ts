@@ -61,6 +61,11 @@ import {
   type SkillEntry,
 } from "./skills-loader";
 import {
+  filterDisabledMcp,
+  readGlobalCursorMcpServers,
+  readGlobalCursorRulesForPrompt,
+} from "./cursor-config";
+import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
 } from "./task-runner";
@@ -153,6 +158,7 @@ interface InitialUserMessage {
 const buildInitialPrompt = (
   task: Task,
   skills: SkillEntry[],
+  rulesSection: string,
   firstMessage?: InitialUserMessage,
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
@@ -256,6 +262,12 @@ const buildInitialPrompt = (
     "  1. 直接 emit 一段 assistant_message、把多个不确定点用 markdown 自然语言列清楚",
     "  2. 调 wait_for_user 等用户在输入框回",
     "  3. shell stdout 拿到 `[USER_REPLY]` 后按用户答案推进",
+    "",
+    "## 全局规则（用户在 Cursor 配的偏好、必遵守）",
+    "",
+    "下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。alwaysApply 的已全文展开、必遵守；其余按场景用 `read` 读全文：",
+    "",
+    rulesSection,
     "",
     "## Skills（fe-ai-flow 自带能力扩展）",
     "",
@@ -465,8 +477,6 @@ export interface RunChatInput {
   task: Task;
   apiKey: string;
   model: ModelSelection;
-  // 用户在设置页配的 MCP servers（已解析）、chat-tool 我们自己塞进去
-  userMcpServers?: Record<string, McpServerConfig>;
   // 用户首条消息（绝大多数 chat 启动场景都有）、直接拼进 prompt
   firstMessage?: InitialUserMessage;
 }
@@ -479,7 +489,7 @@ export interface RunChatInput {
  * 让 agent 后台跑、HTTP 立即返回。
  */
 export const runChatSession = async (input: RunChatInput): Promise<void> => {
-  const { task, apiKey, model, userMcpServers, firstMessage } = input;
+  const { task, apiKey, model, firstMessage } = input;
 
   if (runningChats.has(task.id)) {
     return;
@@ -489,21 +499,26 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
   const startedTask = await setTaskRunStatus(task.id, "running");
   if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
-  // 2) 拼 mcpServers：用户的 + 我们自己的 chat-tool
-  // 用户配置里万一也叫 feAiFlowChat、按我们的为准（直接覆盖）
+  // 2) 拼 mcpServers：全局 cursor mcp（按 task 黑名单过滤）+ 我们自己的 chat-tool
+  // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
+  // 配置里万一也叫 feAiFlowChat、按我们的为准（直接覆盖）
+  const cursorMcp = filterDisabledMcp(
+    await readGlobalCursorMcpServers(),
+    task.disabledMcpServers,
+  );
   const mergedMcp: Record<string, McpServerConfig> = {
-    ...(userMcpServers ?? {}),
+    ...cursorMcp,
     [CHAT_TOOL_MCP_NAME]: {
       type: "http",
       url: getChatMcpUrl(),
     },
   };
 
-  const userMcpNames = Object.keys(userMcpServers ?? {}).filter(
+  const cursorMcpNames = Object.keys(cursorMcp).filter(
     (n) => n !== CHAT_TOOL_MCP_NAME,
   );
   const mcpDesc = `Chat MCP: ${CHAT_TOOL_MCP_NAME}${
-    userMcpNames.length > 0 ? ` + 用户 MCP: ${userMcpNames.join(", ")}` : ""
+    cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
   }`;
 
   await writeEventAndPublish(task.id, {
@@ -540,20 +555,22 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     agent = await Agent.create({
       apiKey,
       model,
-      // settingSources:["project"] = 加载目标仓库 + 全局 .cursor/ 的 rules/skills/mcp/hooks
-      //（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加生效、
-      // chat-tool 安全（同名 inline 优先、不同名共存、已探针实测、见 ROADMAP）
+      // settingSources:["project"] = 加载目标仓库 .cursor/ 的 rules/skills/mcp/hooks（project 层）
+      //（跟 Cursor IDE 一致、配置双向绑定）；全局 ~/.cursor/（user 层）SDK 够不着、
+      // 由 fe 读了注入（rules/skills 进 prompt、mcp 进 inline mergedMcp）、详见 cursor-config.ts
       local: { cwd: getEffectiveCwd(task.repoPaths), settingSources: ["project"] },
       mcpServers: mergedMcp,
     });
 
-    // 加载平台自带 skills（repo + 全局 skills 由 settingSources 交给 SDK 加载、不在此读、避免重复进 prompt）
+    // 加载 skills：平台自带 + 全局 ~/.cursor/skills/（repo 层 skills 由 settingSources 交给 SDK）
     const skills = await loadSkills().catch((err) => {
       console.error("[chat-runner] loadSkills failed", err);
       return [];
     });
 
-    const initialPrompt = buildInitialPrompt(task, skills, firstMessage);
+    // 全局 rules（~/.cursor/rules/、settingSources["project"] 够不着、fe 读了注入）
+    const rulesSection = await readGlobalCursorRulesForPrompt();
+    const initialPrompt = buildInitialPrompt(task, skills, rulesSection, firstMessage);
     const run = await agent.send(initialPrompt);
 
     // 注册 cancel 控制

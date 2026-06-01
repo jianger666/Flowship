@@ -15,6 +15,278 @@
 
 ---
 
+### V0.6.1：ship action 上线（2026-05-28）
+
+**整体**：从 V0.6.0 收尾的 stub 状态、ship 升级成可用的「build 完成 → 自动 push → 提 MR → 飞书评论」端到端流程。设计期 5 个未拍板项跟用户对齐后落地：(1) CLI 选 server-side GitLab REST API、不依赖 glab CLI / 不写新的 MCP server、PAT 通过 settings 配；(2) 多仓 task 每仓 1 条 MR、共用 branch 名、各仓单独 push 单独提；(3) 用户 ack ship 后不再二次 ask_user、直接 push + 提 MR；(4) 同 branch 累计 commit、同仓多次 ship 累加 version、不开新 MR；(5) 自动评论飞书 story（带 PR 链接 + @ 测试人员）、**不**自动改 story 状态。`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+#### Schema 改造（types.ts）
+
+- `Task.gitBranch?: GitBranchInfo` → `Task.gitBranches?: GitBranchInfo[]`（每仓 1 条同名 branch、base 各仓自探）
+- `MRRecord` 加 `repoPath` / `title` / `mergedAt` / `lastCommitHash`、status 字面量 `open / closed / merged`（V0.6.1 ship 时写 `open`、merged / closed 状态待 V0.6.4+ polling）
+- `ActionRecord.sideEffects` 改成 `{ mrs?: Array<{ repoPath, mrUrl, mrVersion, branch, commitHash }>; feishuCommentId?: string }`
+- `Task.feishuTesterUserIds?: string[]`：飞书测试人员 open_id 列表、首次 ship 自动探测 / fallback ask_user、之后 ship 复用
+- `FeAiFlowSettings` 加 `gitHost` / `gitToken`（明文 localStorage、跟 apiKey 同安全级别）
+
+#### Server 改造
+
+- 新增 `src/lib/server/gitlab-client.ts`：`createMR` / `getMR` / `addMRNote` 三个函数走 GitLab REST API（`PRIVATE-TOKEN` header）、内部用 `formatGitLabError` 把 4xx/5xx 拼回 Chinese 错误段、`parseGitLabRemoteUrl` 解析 `git@host:group/repo.git` / `https://host/group/repo.git` 两种 remote 格式
+- `task-fs.ts`：`appendMR` 改为 `upsertMR(taskId, repoPath, ...)`、同 repoPath 已存在则 version + 1 且 createdAt 保留首次值、首次创建则 version = 1；`patchMR` 按 `repoPath` 定位（不再按 `version`）；`setFeishuTesterUserIds` 持久化测试人员
+- `chat-mcp.ts`：注册两个新 MCP 工具 `submit_mr` / `set_feishu_testers`、它们不直接动 task-fs、而是走 task-runner 通过 `setChatTaskActionHandler` 注册的 `ChatTaskActionHandler` 闭包；这样 chat-mcp 保持「纯协议适配层」、不耦合 GitLab / business 逻辑
+- `task-runner.ts`：`internalStartAgent` 启动前注册 `taskActionHandler`、闭包捕获 `gitHost / gitToken`、`submit_mr` 走 `gitlab-client.createMR` + `task-fs.upsertMR` + `task-fs.appendActionSideEffectMR`（原子写 sideEffects.mrs）；`set_feishu_testers` 走 `task-fs.setFeishuTesterUserIds`；agent 退出 / 任务结束在 `finally` 走 conditional unset 注销 handler / notifier
+- `action-checks.ts` 加 `checkShip`：①`sideEffects.mrs[]` 每条 mrUrl 非空 ②`task.repoPaths` 里没出现在 `mrs[]` 的、必须在 artifact 内出现「跳过」/「无改动」说明 ③至少 1 个 MR 或全部 repos 显式跳过
+
+#### Prompt 改造
+
+- `prompts/action-ship.md` 从 stub 全量改写：多仓 loop 模板（cd → git diff 检查 → commit if 有改动 → git push → git rev-parse HEAD → parseGitLabRemoteUrl → `submit_mr` MCP）、A+C 飞书 @ 流程（agent 先调 `list_workitem_role_config` + `search_user_info` 探测测试人员、探不到 ask_user 让用户填、结果 `set_feishu_testers` 持久化）、飞书评论模板（PR 链接 + 可选 @ 行）、artifact 骨架
+- `prompts/action-build.md`：删 `task.gitBranch.checkedOut` 引用、改成「runner 每次 inject 多仓 idempotent checkout 命令、直接执行不要跳过」
+
+#### UI 改造
+
+- 新增 `src/components/settings/git-card.tsx`：GitLab Host + PAT 两个输入、跟 user-profile-card 同形态、明文 localStorage 注解放在 token 下面
+- `src/app/settings/page.tsx`：引入 GitCard、跟其他 card 并列
+- `use-settings.ts`：`isFieldEqual` 加 gitHost / gitToken 分支、dirty 计算覆盖
+- `advance-dialog.tsx`：解锁 ship 卡片（从 `STUB_ACTIONS` 挪到 `IMPLEMENTED_ACTIONS`）、`inferDisabledReason` 加 ship 分支（缺 gitHost / gitToken 拒绝）、`inferDefaultActionType` review 完默认推 ship、`buildPlaceholder` ship 分支提示「多仓累计 commit 直接提同分支」/「飞书 @ 测试用户首次 ask_user」、`gitConfig` snapshot from settings 给 UI-side 校验用
+- `src/app/tasks/[id]/page.tsx`：`handleAdvance` 从 localStorage 取 gitHost / gitToken 塞到 `/api/tasks/[id]/advance` body；详情页 repoPaths 下面加 MR 链接列表（按 repoPath tail + version tag、点击新窗打开、hover 看 title / status）
+- `src/components/tasks/task-card.tsx`：首页卡片也展示 `task.mrs[]` 列表（同形态）
+
+#### 关键设计决策
+
+1. **不引外部 CLI / 外部 MCP server**：直接 fetch GitLab REST、PAT 闭包在 server 端、agent 永远拿不到 token
+2. **多仓共用 branch、各仓独立 MR**：用户工作流就是「需求改两仓、两仓各发各的 PR」
+3. **同仓多次 ship 累计 commit / 同 MR version + 1**：不开新 MR、跟 GitHub PR rebase 习惯一致
+4. **A+C 飞书 @ 测试人员**：agent 优先自动探（A）、探不到 ask_user fallback（C）、不抽 helper、纯走 MCP + prompt
+5. **不自动改飞书 story 状态**：只 add_comment 带 PR 链接 + @ 测试、用户 vibe 后人工流转状态（避免「自动一改、卡 PR 被拒了反悔很麻烦」）
+
+#### 没做的事
+
+- MR 状态 polling（`mr.status` 当前只在 ship 时写一次 `opened`、merged / closed 状态待 V0.6.4+ webhook / 手动 refresh）
+- learn action 拿 MR 反馈做事后清单（V0.6.3）
+- test action 走自动化（V0.6.2）
+
+#### review 修复 + 加固（2026-05-29、bug fix）
+
+V0.6.1 交付后一轮 review、修了 5 个真 bug + 5 项加固、`pnpm typecheck` ✓ / `pnpm lint` ✓：
+
+- **bug：force-new-agent race 误清 handler**——旧 SDK Run cancel 卡 >5s 时 `forceClearStaleRunnerState` 只清 runningTasks、新 agent 注册的 `taskActionHandler` / `awaitingNotifier` 会被旧 agent 迟到的 finally 无条件 `set(null)` 误清、submit_mr 拿不到 handler。chat-mcp 加 `unsetChatTaskActionHandlerIf(taskId, expected)` / `unsetChatAwaitingNotifierIf`（conditional unset、比对实例引用）、task-runner 把 inline handler / notifier 具名化、finally 改调 conditional unset
+- **bug：submit_mr 工具 schema 的 `target_branch` describe 跟 prompt 冲突**——describe 写「探 origin/HEAD 拿 master」、prompt 写「写死 test」、改 describe 跟 prompt 对齐
+- **bug：set_feishu_testers 不带 actionId**——info 事件挂不到 ship action、补 `action_id`（ChatTaskAction type / MCP schema / handler writeEvent / prompt 样例 4 处）
+- **bug：action-ship.md git fetch 静默吞**——`git fetch origin test` 失败时 `git diff` 拿空被误判「无改动跳过」、改 fail-fast（fetch 失败 exit 1）
+- **bug：checkShip skip 关键词单向扫**——只看「仓名后 200 字」、agent 把关键词写仓名前会漏检、改双向扫
+- **加固**：sideEffects.mrs 拼装从 task-runner「getTask→filter→patchAction」三段非原子、下沉成 task-fs `appendActionSideEffectMR`（withTaskLock 原子）；`titleSafe` 补 git ref 非法字符（~ ^ @ / 连续点 / 首尾点）；action-ship.md 补「多仓各用独立 shell」+「飞书 @ 用 lark_user_id 不能直拼文本、走工具 mention 能力」；`feishuCommentId` 注释标注「预留 V0.6.4 polling、勿删」；ROADMAP「6+1 种 action」笔误改「6 种」
+
+#### ship 冲突检测 + test→feature 铁律（2026-05-29、V0.6.1.1）
+
+用户实测发现「提测遇 MR 冲突时 agent 不管、照发飞书评论」。补一条端到端冲突门禁、保守策略（AI 不自己解冲突、`ask_user` 交用户决定）、`pnpm typecheck` ✓ / `pnpm lint` ✓：
+
+- **gitlab-client.ts 新增 `getMRMergeStatus`**：MR 建好后 poll GitLab `detailed_merge_status`（GitLab 异步算 mergeability、最多 5 次 / 1.5s 间隔）、返回 `hasConflicts / mergeable / undetermined`、老实例退回 `merge_status`（can_be_merged / cannot_be_merged）；冲突判定命中 `conflict` / `cannot_be_merged` / `has_conflicts=true` 任一
+- **createMR 幂等化**（自查发现的死锁修复）：撞 409/422「已有同分支 open MR」时降级新增的 `findOpenMR`（list MR API 按 source+target+opened 查）复用现有 MR、不再当失败（409/422 都兜、GitLab 版本差异；查不到退回原始错误不掩盖真因）。否则「解冲突后重跑 ship」/「同仓多次 ship」必撞 → `getMRMergeStatus` 不执行 → fe 侧 `hasConflicts` 永远停在 true → 飞书评论永远发不出 → 死锁。chat-mcp submit_mr 说明同步加「再次 ship 幂等」段
+- **schema**：`MRRecord` 加 `hasConflicts / mergeStatus`、`sideEffects.mrs[]` 加 `hasConflicts`；task-fs `upsertMR` / `appendActionSideEffectMR` 入参带上（每次 ship 重新检测、解完冲突再 ship 会翻回无冲突）
+- **task-runner submit_mr handler**：createMR 后调 poll、有冲突走 **error 事件**（红、醒目）/ 无冲突走 info、返回 JSON 加 `has_conflicts / merge_status / merge_undetermined`
+- **chat-mcp submit_mr 工具说明**：写清返回值 +「has_conflicts=true 铁律」（不 merge/rebase/force、不评论、走 ask_user）
+- **prompt（action-ship.md）**：push 改 fail-fast（拒推不 force）；工作流加 🔒 铁律「绝不 merge/rebase/pull test 进 feature、绝不 force push、冲突是用户的活」；新增 §3.5 冲突门禁（任一仓冲突 → 跳过飞书评论 + `ask_user` 抛给用户、解完重跑 ship）；§4 飞书评论加前置门禁（所有仓无冲突才发）；artifact §3 表加「冲突」列、反例补 3 条
+- **checkShip**：任一 MR `hasConflicts=true` → ship 判不干净（逼用户解完重跑）
+- **设计点**：冲突 ≠ 失败（MR 照建、用户才能在 GitLab 上解）、只是不评论 + 不算完成；`undetermined`（GitLab 还在算）保守当无冲突放行、artifact §6 注明待人工复核
+
+#### settingSources 双向绑定实装 + 死代码清理（2026-05-29）
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓ / `knip` 仅剩 shadcn 标准件。
+
+- **settingSources 实装**：task-runner / chat-runner 两处 `Agent.create` 开 `settingSources:["project"]`——加载目标仓库 repo `.cursor/` 的 rules/skills/mcp/hooks（跟 Cursor IDE 一致）；inline mcpServers 仍叠加（同名 inline 优先、不同名共存、脚本探针实测、详见 ROADMAP）。配套 `skills-loader`：只读平台自带 `skills/`、不再扫 repo `.cursor/skills/`（交给 settingSources）、`loadSkills()` 改无参、去掉 `source` 维度。
+  - ⚠️ **本条「+ 全局 `.cursor/`」「skills 只读平台自带」已被上方 V0.6.2 段纠正**：`["project"]` 只加载 project 层、够不着全局 `~/.cursor/`；全局 rules/skills/mcp 改由 fe 后端自己读注入（skills-loader 改为读平台自带 + 全局 `~/.cursor/skills/`）。详见 V0.6.2 段 / ROADMAP。
+- **删 `lastAgentId` 全链路**：写而不读的死链（Task/Meta 字段 + 2 处 hydrate 映射 + `setTaskLastAgentId` + 2 处调用 + import）；复活一律 `Agent.create` 新建、不依赖此字段。
+- **删 V0.6.4 预留**（用户拍板「不预留、用时再写」）：`gitlab-client` 的 `getMR` / `addMRNote` / `parseGitLabRemoteUrl`、`task-fs` 的 `patchMR`、`MRRecord.lastChecked`、`sideEffects.feishuCommentId`（⚠️ 上文 ship 上线段描述的这几个「预留 / 勿删」已删、勿再找）。
+- **删 client 死封装 / 无引用 export**：task-store `advanceTask` / `appendEvent`、chat-runner `cancelChat`、task-runner `isTaskRunning` / `markTaskForFork`、local-store 4 个 getter。
+- **删未用文件**：3 个一次性探针脚本（probe-mcp-*.mjs）+ 3 个未引用 shadcn 组件（progress / tabs / scroll-area）。
+- **收窄 21 个**内部用的多余 export（去 `export` 不删实现）；**保留** `src/components/ui/*` unused export（shadcn 标准件完整 API 面）+ shadcn/eslint 依赖（活工具链、knip 盲区）。
+
+### V0.6.0.1：自由对话模式剥离 + 后置检查体验整改 + 推进时换模型（2026-05-27 / 2026-05-28）
+
+**整体**：用户实测 V0.6.0 发现十个体验断点、本子版本修：(1) action=chat 跟 task 容器混用导致 agent 行为漂（用户问「你好啊」、agent 当成 plan 流程闷头思考调工具）、(2) action 完成后事件流把 deterministic 后置检查的 details 一坨贴出来（用户原话「这更像是调试内容」）、(3) plan 后置检查 V0.5.6.5 黑名单 grep 把「示例 / 或」等业务高频词误报、用户拍板「方案太粗暴、不是有效约束、直接删」、(4) 中途加过 ActionTimeline 失败 chip 的 retry 快捷入口、实测语义混乱（点旧 error chip 反而打断当前 running、起一个全新 action）、用户拍板砍掉、(5) 强制起新 agent 时没法临时换模型、只能去 settings 改全局、本版加 ModelPicker、(6) 多次推 plan / build 后时间线所有 chip 同等显著、看不出哪个是「当前生效版本」、stale 版本视觉降权、(7) review 发现偏差后 edit plan 的 strikethrough 留痕方案 prompt 高摩擦（5 子点 + 位置铁则、agent 经常踩坑）、简化为「原描述不动 + 章节末尾追加 blockquote」唯一姿势、(8) advance dialog 卡片上的「推荐」微标签语义草率（has_bug→build / plan→build 这种「流程顺推」也叫推荐显得 AI 在 narrate）、删微标签 + 删「error→同 type」那条 retry 残留 + 函数重命名为 `inferDefaultActionType`、保留默认选中作为「减少首次点击」的 UX 工具、(9) review artifact 里写「`actions/5-plan.md` §1」点击被当业务仓库路径跳 Cursor、报「找不到文件」、修 `looksLikeArtifactRef` 让它能识别 `actions/N-type.md` 这种带前缀的形式、命中后走 task 内 tab 跳转、(10) review 表格备注「同上：244-248」省略文件名导致整列点不开、`_shared.md §3` prompt 加严禁用「同上 / ↑ / ditto」类简写、表格 row 同一文件多个引用强制合并到一行用顿号分隔。`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+#### chat 从 action 体系剥离 → 独立 mode
+
+V0.6.0 把 V0.5 的 chat-runner 砍了、chat 吸收为 `action=chat`、用户反馈「自由聊全是问题」（agent 不回 / 走任务式公文体 / 暴露协议细节）。本版本 revert 这个决定、回到 V0.5 心智、但用 V0.6 schema 字段：
+
+- `Task.kind` → `Task.mode`（`"task" | "chat"`、入口在新建任务 dialog 顶部 tab）
+- `ActionType` 删 `"chat"`、改回 6 种：`plan / build / review / ship / test / learn`
+- 新增 `src/lib/server/chat-runner.ts`：独立 runner、独立极简 prompt（只装 `wait_for_user` + shell long-poll 引导、没有 [NEXT_ACTION] / [ACTION_ACK] / [TASK_DONE] 概念）、agent 启动后第一句直接回应用户、然后 `wait_for_user` 等下一条
+- 新增 `src/components/tasks/chat-view.tsx`：单栏 UI（顶部 bar + event stream + 输入框）、内部自己订阅 `useTaskWatch`、task page 按 `task.mode === "chat"` 分支渲染
+- 新增 `/api/tasks/[id]/chat-reply`：处理用户消息、`runStatus === awaiting_user` 时 `submitUserMessage` 续接、idle / error / completed 时 `runChatSession` 重启 Run、收到消息立刻写 `user_reply` 事件（避免「我的你好啊没在聊天上」的体验问题）
+- 新建任务 dialog：顶部 ChoiceButton tab 切换 task / chat、chat 模式 title / repoPaths / feishuStoryUrl 全选填、空 title 自动补「未命名对话 MM-DD HH:mm」
+- 删 `prompts/action-chat.md`、`_super.md` 移除 chat action 段 / 例外规则 / placeholder
+- 首页删「快速聊」按钮、统一从「新建任务」入
+
+agent 永远不在 chat 模式 prompt 里看到 [NEXT_ACTION] / [ACTION_ACK] 这些概念、自然不会公文体；`ask_user` 在 chat-runner prompt 显式禁用、agent 想确认就直接 `assistant_message` 问。
+
+#### action 失败后 retry 入口：加过、用户实测后砍掉
+
+V0.6.0.1 中段试过给 `ActionTimeline` 的失败 chip 挂 🔄 retry 按钮、点了打开 advance-dialog、预填 actionType + `forceNewAgent=true`。意图是让 agent 从「Run 挂了 / 错误状态」状态更顺地恢复。
+
+用户实测后反馈语义混乱：
+
+- ActionRecord 是不可变历史、`appendAction` 永远追加新 `n`、不会改老条目
+- 所以点旧 `error` chip retry、实际效果 = 「打断当前正在跑的 action」+「起一个新 action（n+1）」、跟用户直觉「修复那条历史」差太远
+- task.runStatus = error 时、顶部「推进」按钮本身就是亮的、用户走标准推进 + 勾「强制起新 agent」开关即可恢复、retry chip 是冗余入口
+- 多条 error chip 都长得能点、用户在「当前还在跑」时手抖点旧 chip 会把跑得好好的 agent 撞死
+
+最终砍掉：
+
+- `ActionTimeline` 去掉 retry icon + `onRetryAction` prop
+- `page.tsx` 去掉 `advancePrefill` state + retry 触发回调
+- `AdvanceDialog` 去掉 `initialActionType` / `retryHint` props + 顶部红条提示
+- 「强制起新 agent」开关在 advance-dialog 保留、这才是真正从错误恢复的官方路径
+
+教训：**UI 上额外的「快捷入口」不一定省事**——如果背后语义跟入口看起来要做的事不一致、用户会被绕进去。retry icon 看着像「修复这条」、实际是「再起一条」、两层语义冲突、宁可砍。
+
+#### 强制起新 agent 时支持换模型 + 抽 ModelPicker 共享组件
+
+V0.6.0 推进只能用 `task.model` / `settings.defaultModel`、想给某个 task 在不同阶段配不同模型（plan 用 opus 想得清、build 切 sonnet 省 token）只能去 settings 改全局再回来、麻烦且会影响别的 task。
+
+本子版本末段在 `AdvanceDialog` 顶部「强制起新 agent」开关下面加了一段 `ModelPicker`：
+
+- 开关 off：保持原行为、续接 Run、走 `task.model`
+- 开关 on：露出 ModelPicker、默认值 = `settings.defaultModel`、用户可以临时换 base + 调 `thinking` / `effort` 等 params
+- 提交时把 selection 透传给 `handleAdvance`、`/api/tasks/[id]/advance` body 的 `model` 字段用这个、不改 `task.model`（一次性、不污染 task 级 / 设置页全局）
+- 续接 Run 时 SDK 不支持中途换模型、所以 dialog 里这段在 off 时直接隐藏、避免误以为「不开关也能改」
+
+配套抽出 `src/components/ui/model-picker.tsx` 作为 base + parameters 双层 select 的纯 UI（不带 Card / SaveButton 包裹）、`settings/model-card.tsx` 和 `advance-dialog.tsx` 都 wrap 一层用、保证设置页和推进 dialog 行为一致——切 base 自动填默认 params、`thinking` 这种 false/true 参数显示成「关 / 开」等。符合编码约定「典型 UI 组件即使当前只有 1 个 caller 也应该抽到 `src/components/ui/`」、虽然 new-task-dialog 目前只用了 base id 没用 params、本次没急着改它、未来若想让新建任务也调 params、直接换 ModelPicker 即可。
+
+#### 后置检查 details 不再 publish 到事件流
+
+V0.5 / V0.6.0 在 action 切 `awaiting_ack` 时、把 `runActionCheck` 的 `details` 整段拼成一条 `info` / `error` 事件写进事件流。这套对开发期调试有用、但用户视角下：
+
+- plan 这种「策略层」检查容易误报、用户看到一坨「artifact 出现 2 处不确定字眼」会困惑
+- 真出问题（typecheck 红、lint 红）的细节也不应该塞在事件流里、agent 自己在下次 revise 时会读 `action.postCheck` 字段去修
+
+本子版本改为：
+
+- `task-runner.ts` 不再把 `postCheck.details` 拼进事件 text、只写一句简版「Action 产出完成、等待用户 ack（artifact=...）」
+- `kind` 永远 `info`（不因 postCheck 失败标 `error`、避免红色卡片）
+- `action.postCheck` 字段照样落到 `meta.json`（数据完整、想 debug 直接看文件、或后续 UI 加「调试信息」折叠面板）
+- console.log 加上 `details` 截断 200 字符的输出、本地开发能从 server log 看到
+
+#### plan 黑名单 grep 彻底删（2026-05-28）
+
+V0.5.6.5 加过一组 13 字眼黑名单（或 / 约 / 大约 / 大概 / 可能 / 应该是 / 待定 / TBD / 暂定 / 节选 / 示例 / 部分 / 后续补全）、artifact substring 命中即 ❌、配套 `_super.md` 强制自检让 agent 自己 grep 一遍。**意图**：防 agent 写 plan 时用含糊词糊弄、build 阶段按模糊 plan 写代码会飘。**问题**：substring 不看语境、对「示例」（表格列名）、「或」（业务规则明确 or）等高频业务词误伤率高、V0.6.0.1 实测 2 条命中全是误报。**用户拍板**「方案太干脆简单了、不是个有效的方案、直接删掉、后面再考虑长远的」。
+
+本子版本删 4 处：
+
+- `src/lib/server/action-checks.ts`：删 `PLAN_BLACKLIST_TOKENS` 常量 + `checkPlan` 第 2 步黑名单 grep 逻辑、plan postCheck 退化为「artifact 文件存在 + 内容长度 >= 100」最低门槛
+- `prompts/action-plan.md`：「后置检查」段 1. 黑名单 grep 那条删、「⛔ 严禁带不确定表述写 artifact」段的「黑名单字眼」子条删（语义引导整段保留——「不确定 → ask_user 拍板」「节选 / 示例类偷懒」反例都还在）
+- `prompts/_super.md`：「写完 artifact 强制自检」段从 4 步缩成 3 步（黑名单 grep 那步删、保留业务名词全称扫 / ack 留痕位置 / 路径完整性）
+- `src/lib/types.ts`：`ActionRecord.postCheck` 注释 plan 行改成「artifact 文件存在 + 内容长度 >= 100」
+
+后续替代方案（**未做、留给将来**）：语义层质量靠 ⛔ artifact 段硬约束 + 用户人眼把关 + revise 兜底。如果以后还想做 deterministic、考虑「语义 diff（plan 跟 contextDocs 信息差）」「agent 自检 ask-LLM」等更靠谱方向、别再凑字符串。
+
+#### `actions/N-type.md` 路径识别 hot-fix（review artifact 引用别的 action）
+
+用户实测发现 review artifact 里写 `actions/5-plan.md §1` / `actions/5-plan.md §2.2` 这种 plan 位置引用、点击后跳 Cursor IDE 报「找不到文件」。
+
+根因：`src/lib/path-utils.ts:looksLikeArtifactRef` 的 regex 是 `^(\d+)-([a-z]+)\.md$`、只能识别**不带任何前缀**的 `5-plan.md`。review agent 按 prompt 强约束写「actions/N-type.md」相对路径形式（_super.md「Artifact 文件路径」段、所有 artifact 互引都这么写）、不命中 `looksLikeArtifactRef`、退化到 `looksLikePath` 命中（含 `/`、最后一段 `plan.md` 有扩展名）、被当业务仓库路径走 `cursor://file/<repoPath>/actions/5-plan.md`、Cursor 找不到自然报错。
+
+修：regex 改成 `^(?:actions\/)?(\d+)-([a-z]+)\.md$`、加可选 `actions/` 前缀；长度上限同步从 50 提到 60（多 8 个字符的前缀）。命中后渲染 / 跳转链路不变（蓝色按钮 → onArtifactRefClick → 切到目标 action panel）。
+
+**仅识别 `actions/N-type.md` 这种相对前缀**——`data/tasks/xxx/actions/5-plan.md` 这种 fs 绝对路径不命中、保留走 `looksLikePath` + cursor:// 跳转兜底（不知道是不是 agent 写错路径、不该 task 内跳）。
+
+#### prompt 加严：表格里不准用「同上 / ditto / ↑」类简写
+
+紧挨上面 hot-fix——review artifact「plan 拍板口径复核」表格 row 1 写了完整 `tch-service-center/src/views/.../DetailDrawer.vue:93-95`、row 2-N 全写「同上：90」「同上：244-248」省略文件名。表格列空间有限、agent 偷懒挤一行、但用户拿这些 path 是要点击跳转的——「同上」不是 inline code、前端的 `looksLikePath` 自然识别不出来、整列全失效。
+
+`prompts/_shared.md §3` 加严：
+
+- **规则段加第 6 条**：明确「严禁同上 / 同前 / ↑ / 上同 / ditto 类省略词」、给出 fallback（同一文件多个引用合并成一行用顿号分隔多个 `path:line`）
+- **反例段加一条 V0.6.0.1 实测的真实截图原文**：`review 表格备注：「同上：90」/「同上：244-248」/「↑ 同前」 ← V0.6.0.1 实测、表格 row 用「同上」指代上一行的文件名、用户没法点击跳转`
+- 原反例里 `← 同上` 这种 inline 标注同步改成「← 没目录前缀」、避免「反例里也写同上」的歧义
+
+reviewer agent 跑 V0.6.0.1 之后的下一份 review 时观察是否还会偷懒——如果继续踩、再考虑 review prompt 单独加显式说明。
+
+#### 删 advance dialog「推荐」微标签 + 清掉 retry 在推断逻辑里的残留
+
+V0.6.0 advance dialog 卡片右上角挂了一个「推荐」微标签（`type === recommended && !reason && <span>推荐</span>`）、底层逻辑 `inferRecommended(task)`：
+
+- repoStatus = has_bug → build
+- repoStatus = merged → plan（V0.6.3 起改 learn）
+- 无 action → plan
+- 最近 completed action：plan → build / build → review / review → plan
+- **last action 是 error → 同 type**（V0.6.0.1 中段加的 retry 兜底）
+
+用户实测后嫌「推荐」二字过重——「这个推荐逻辑太草率了太简单了、没什么意义」。逻辑本身其实是「业务状态映射 + 流程顺推」、谈不上智能：
+
+- has_bug → build 是「业务状态决定」、不是推荐
+- plan → build 是「下一步常识」、不是推荐
+- 标了「推荐」反而暗示「我跟你说要走这个」、自抬身价、误导用户「这条路有什么特别理由」
+
+V0.6.0.1 末段拍板：
+
+- **删 UI 微标签**：`<span>推荐</span>` 整段渲染逻辑去掉、卡片右上角空着
+- **删 last error → 同 type 那条**：跟「砍 retry 入口」的精神冲突（错误后不该让 dialog 默认走「再来一次」、用户应该手动决策要不要换 type）、删掉之后 error 状态默认仍走流程顺推
+- **重命名 `inferRecommended` → `inferDefaultActionType`**：消除「推荐」二字的语义、明确这是「dialog 打开时默认选哪个 chip」、纯 UX 工具
+- **保留默认选中本身**：dialog 打开时仍有一个 chip 是 selected、按上面 5 条逻辑算、用户每次省一次点击；这跟「推荐」不是一回事、是「初始焦点」
+
+`new-task-dialog.tsx` 顶部注释里「任务（推荐）」也顺手清成「任务」、跟「不站队」语义一致。`action-timeline.tsx` 注释里提到「智能推荐」也改成「按 task 状态选默认 chip」。
+
+涉及文件：`src/components/tasks/advance-dialog.tsx`（删 UI span + 改函数名 + 改 useState 变量名 + 改注释 + useEffect 依赖跟着改）、`src/components/tasks/new-task-dialog.tsx`（注释字面）、`src/components/tasks/action-timeline.tsx`（注释字面）。
+
+#### review 改 latest plan 留痕策略简化（strikethrough → 末尾 blockquote）
+
+V0.5.12 起 review action 走 §6 ask_user 闭环时、用户答 b（接受偏差并更新 plan）→ review agent 用 `edit` 改最新 plan artifact、`prompts/action-review.md` §6.2 b 写了 5 个子点 + blockquote 位置铁则：
+
+- 段落 / 单层 list item 改 → `~~strikethrough~~ 新描述（review ack 补录、原计划 X）`
+- 表格 cell 改 → 直接改新值 + 表末加 blockquote
+- 嵌套 list item 改 → 上层字符串用 strikethrough、子 list 整体变更用 blockquote
+- 反例若干 + blockquote 位置铁则（不能插表格行间 / list 项间 / 要留空行）
+
+实测踩坑率高：
+
+- agent 把 strikethrough 塞表格 cell 里破坏列对齐 + markdown 不渲染
+- blockquote 插表格行之间、表格断成两段
+- 嵌套 list 改时上下层位置拿不准、prompt 5 个子点反而越看越乱
+
+V0.6.0.1 用户拍板「我们走敏捷开发、后面发现问题再说」+ 视觉焦点心智（latest plan = 用户在关注的、review 改它合理）下、prompt 简化为**统一一种姿势**：
+
+- **原描述绝对不动**（保持 stale 之前那一刻的字面原文不变）
+- 在**被改章节末尾**追加 ⚠️ blockquote、格式固定 2 行：
+
+  ```
+  > ⚠️ review #N 补录：原「<原描述 ≤ 25 字>」、build 跳 plan 上、改为「<新描述 ≤ 25 字>」。
+  >    原因：<build agent 原因 / N/A>。详见 actions/N-review.md §用户决策 → 偏差 X。
+  ```
+
+- 位置铁则简化为 3 条：紧贴下一级标题前、留一空行；绝不插表格行间 / list 项间 / 被改字段那一行后面；多条按时序往末尾叠加、不合并
+
+骨架「§ 用户决策」段例子同步重写、**强制要求贴「改前 / 改后片段」**（包含被改章节原文 25 字摘录 + 完整 blockquote 原文）、用户在 review artifact 一个文件能看清楚 plan 改了什么、不用切 tab 对照 plan diff。
+
+未做（敏捷迭代留观察）：
+
+- 同一 latest plan 被 review 修订 N 次的阈值提醒
+- ArtifactPanel 加「快看 latest plan」按钮（ArtifactPanel 已支持选 chip 切 artifact、加专用按钮过度设计）
+- `_shared.md §8`「review 例外可 edit plan」那条保留不动、与 Z' 思路一致
+
+#### Action timeline stale 视觉降权
+
+V0.6.0 时间线上所有 action chip 同等显著、只有 `currentActionId` 加一圈 ring。多次推进同 type（plan #1 → plan #3 / build #2 → build #4）后、用户看不出哪个 chip 是「当前生效版本」、哪些是「已被新版本取代的历史快照」、artifact 切回历史版本只能凭 n 大小硬记。
+
+`src/components/tasks/action-timeline.tsx` 加 `computeLatestByType` helper、按「同 type n 最大的算 latest、其他都 stale」算 isStale：
+
+- **stale chip**：`opacity-50 + text-muted-foreground`、状态点本身也淡化（不再用 `bg-emerald-500` 这种饱和色撞眼）
+- **latest chip**：正常颜色、有 `currentActionId` 加 ring 高亮
+- **hover title**：stale chip 后缀「（已被 #N type 取代）」、用户能确认是被哪个新版本顶掉
+- **可点性不变**：stale chip 仍可点选中、ArtifactPanel 切到历史版本读 artifact 不受影响
+
+跟 status 解耦——error / cancelled chip 在 stale 时同样淡化、不再用 status 跟 stale 双重打架。视觉表达原则：「opacity 表达时间维度（旧版本被取代）、status 点颜色表达本次执行结果」。
+
+注意没引入「latest 但 status === error」的特殊外圈、跟原有视觉一致：状态点的红色已经能把 error 顶到顶层注意力、不需要再叠 ring。
+
+**hot-fix（V0.6.0.1 末段、用户反馈 ring 视觉读不出意图）**：`isCurrent && !isSelected` 那圈 ring 用户 hover 完才反应过来是「当前 action」、看着像 hover 残留态。chip 的 title 由「单一信息」改成「多状态拼装」、把 isCurrent / isStale 各自的语义都拼进圆括号——例如「#8 复核 · 等用户确认（当前 action、点可跳回、已被 #9 取代）」——hover 一眼看清楚多个修饰来源、不用猜。
+
+#### 不做的事
+
+- chat 模式 task 不写 `actions/` 目录（没有 artifact 概念）
+- chat 模式 task 不能走「推进」dialog、`advance` route 防御性 reject `task.mode === "chat"`
+- 不写 V0.6.0 → V0.6.0.1 migration（开发期 / 本机清 `data/tasks/*` 即可）
+
+---
+
 ### V0.6.0：核心重构（2026-05-27）
 
 **整体**：按 `docs/V0.6-REFACTOR.md` 落地核心模型重构。从 phase chain 切到 task 容器 + action 历史、动了 30+ 文件、删 4 个旧路由 + 4 个旧组件、新增 ActionTimeline 等组件。V0.5 兼容代码 / 数据彻底删（不写 migration、开发期清空 data/tasks/*）。`pnpm typecheck` ✓ / `pnpm lint` ✓。

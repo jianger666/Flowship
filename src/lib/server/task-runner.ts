@@ -65,6 +65,7 @@ import {
   type ChatTaskActionHandler,
 } from "./chat-mcp";
 import { createMR, getMRMergeStatus } from "./gitlab-client";
+import { ensureStopHookInstalled } from "./stop-hook-inject";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -75,6 +76,11 @@ import {
   renderSkillsForPrompt,
   type SkillEntry,
 } from "./skills-loader";
+import {
+  filterDisabledMcp,
+  readGlobalCursorMcpServers,
+  readGlobalCursorRulesForPrompt,
+} from "./cursor-config";
 import type {
   ActionRecord,
   ActionType,
@@ -209,6 +215,8 @@ const buildSuperPrompt = async (
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
+  // 全局 rules（~/.cursor/rules/、user 层、settingSources["project"] 够不着、fe 读了注入）
+  const rulesSection = await readGlobalCursorRulesForPrompt();
 
   // 加载 6 种 action 的 prompt（plan / build / review / ship / test / learn）
   const actionPromptVars: Record<string, string> = {};
@@ -233,6 +241,7 @@ const buildSuperPrompt = async (
       task,
       "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
     ),
+    rulesSection,
     skillsSection: renderSkillsForPrompt(skills),
     eventsLogPath: getEventsLogPath(task.id),
     actionArtifactsDir: getActionsDir(task.id),
@@ -246,11 +255,14 @@ const buildSuperPrompt = async (
 // 起 Run 时把已有 action history 一并 inject、agent 知道之前做过啥
 // 首次启动 task（actions 只有刚 append 的那一条）时返回「无历史」段
 const renderActionHistorySection = (task: Task): string => {
-  if (task.actions.length <= 1) {
+  // 软删核心：excluded（用户划除）的 action 不进 agent 上下文——不列摘要、不引导 read artifact。
+  // 这个函数是 agent 上下文的主来源、过滤掉就治本了「冗余/跑歪 action 污染后续推进」。
+  const visible = task.actions.filter((a) => !a.excluded);
+  if (visible.length <= 1) {
     return "（这是 task 的第一个 action、无历史）";
   }
   const lines: string[] = ["以下是已完成 / 进行中的历史 action（按时间正序）："];
-  for (const a of task.actions) {
+  for (const a of visible) {
     const artifactBit = a.artifactPath ? ` artifact=\`${a.artifactPath}\`` : "";
     lines.push(`  - \`${a.id}\` n=${a.n} type=${a.type} status=${a.status}${artifactBit}`);
     if (a.userInstruction && a.userInstruction.trim().length > 0) {
@@ -261,7 +273,7 @@ const renderActionHistorySection = (task: Task): string => {
     "",
     "需要参考时用 SDK 内置 `read` 工具读 artifactPath（路径相对 task 根、agent cwd 是仓库、不能直接 cd 到 task 根、用绝对路径如下表）：",
   );
-  for (const a of task.actions) {
+  for (const a of visible) {
     if (!a.artifactPath) continue;
     lines.push(`  - \`${getActionArtifactPath(task.id, a.n, a.type)}\``);
   }
@@ -449,6 +461,19 @@ export const cancelTaskRun = (taskId: string): boolean => {
   if (!rec) return false;
   rec.cancel();
   return true;
+};
+
+/**
+ * V0.6.3：agent_id 反查 task_id（stop hook 认领用）
+ *
+ * runningTasks 是 task_id → { agentId, ... }、这里遍历找 agentId 匹配的（活着的 task 数量很小、
+ * 遍历开销可忽略）。找不到 = 不是当前活着的 fe task（IDE agent / 已死 task）、stop hook 应放行。
+ */
+export const findTaskIdByAgentId = (agentId: string): string | null => {
+  for (const [taskId, rec] of runningTasks) {
+    if (rec.agentId === agentId) return taskId;
+  }
+  return null;
 };
 
 const waitForTaskToStop = async (
@@ -662,19 +687,36 @@ const planBranchesForBuild = (
     if (isMultiRepo) {
       lines.push(`cd ${repoPath}`);
     }
-    lines.push("# 探主分支名（master / main / develop 都可能、用户不再手动配）");
-    lines.push(
-      "BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')",
-    );
-    lines.push('if [ -z "$BASE" ]; then');
-    lines.push(
-      "  BASE=$(git remote show origin 2>/dev/null | sed -n '/HEAD branch:/s/.*: //p')",
-    );
-    lines.push("fi");
-    lines.push('if [ -z "$BASE" ]; then');
-    lines.push('  echo "[error] 探不到主分支、放弃 checkout、稍后回报用户"');
-    lines.push("  exit 1");
-    lines.push("fi");
+    // V0.6.3：该仓的线上分支（建 task 时从 settings 快照、per-repo）。配了就用、没配回退探测
+    const repoBase = task.repoBaseBranches?.[repoPath]?.trim();
+    if (repoBase) {
+      // 用户在设置页给这个仓配了线上分支 → 直接用、不探测（后端 develop 默认分支会误判）
+      lines.push("# 线上分支由用户在设置页指定（per-repo）、不探测");
+      lines.push(`BASE=${JSON.stringify(repoBase)}`);
+      lines.push("# 校验该分支在远程存在（防设置里填错名）");
+      lines.push(
+        'if ! git ls-remote --exit-code --heads origin "$BASE" >/dev/null 2>&1; then',
+      );
+      lines.push(
+        '  echo "[error] 远程不存在分支 $BASE（设置页填的线上分支名、请核对）、放弃 checkout"',
+      );
+      lines.push("  exit 1");
+      lines.push("fi");
+    } else {
+      lines.push("# 探主分支名（master / main / develop 都可能、用户没手填线上分支）");
+      lines.push(
+        "BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')",
+      );
+      lines.push('if [ -z "$BASE" ]; then');
+      lines.push(
+        "  BASE=$(git remote show origin 2>/dev/null | sed -n '/HEAD branch:/s/.*: //p')",
+      );
+      lines.push("fi");
+      lines.push('if [ -z "$BASE" ]; then');
+      lines.push('  echo "[error] 探不到主分支、放弃 checkout、稍后回报用户"');
+      lines.push("  exit 1");
+      lines.push("fi");
+    }
     lines.push("# Idempotent：branch 已存在则 checkout、否则基于主分支建");
     lines.push(`if git show-ref --verify --quiet refs/heads/${branchName}; then`);
     lines.push(`  git checkout ${branchName}`);
@@ -709,7 +751,7 @@ const planBranchesForBuild = (
  * 调用方应保证：
  *  - task 已 hydrate（getTask 拿到非 null）
  *  - settings.apiKey / model 已校验
- *  - userMcpServers 已按 task.disabledMcpServers 过滤
+ *（MCP 不再由调用方传：runner 自己读全局 ~/.cursor/mcp.json + 按 task.disabledMcpServers 过滤）
  */
 export interface AdvanceTaskInput {
   task: Task;
@@ -719,9 +761,6 @@ export interface AdvanceTaskInput {
   attachedFilePaths?: string[];
   apiKey: string;
   model: ModelSelection;
-  // 用户配置的 MCP servers（已解析 + 过滤）
-  // chat-tool 是 runner 自己塞、不需要调用方传
-  userMcpServers?: Record<string, McpServerConfig>;
   // 强制起新 Agent（即使有活 agent 待命也不续接、直接 Agent.create 新建）；UI「换新 agent」时为 true
   // 注：非强制时「复用」的是内存里活着的 agent entry（续接 [NEXT_ACTION]）
   forceNewAgent?: boolean;
@@ -744,7 +783,6 @@ export const advanceTask = async (
     attachedFilePaths,
     apiKey,
     model,
-    userMcpServers,
     forceNewAgent,
     username,
     gitHost,
@@ -833,7 +871,6 @@ export const advanceTask = async (
         branchCheckoutHint,
         apiKey,
         model,
-        userMcpServers,
         forceNewAgent: true,
         gitHost,
         gitToken,
@@ -863,7 +900,6 @@ export const advanceTask = async (
     branchCheckoutHint,
     apiKey,
     model,
-    userMcpServers,
     forceNewAgent: !!forceNewAgent,
     gitHost,
     gitToken,
@@ -988,7 +1024,6 @@ interface StartAgentInput {
   branchCheckoutHint?: string;
   apiKey: string;
   model: ModelSelection;
-  userMcpServers?: Record<string, McpServerConfig>;
   forceNewAgent: boolean;
   // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包
   gitHost?: string;
@@ -1005,7 +1040,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     branchCheckoutHint,
     apiKey,
     model,
-    userMcpServers,
     gitHost,
     gitToken,
   } = input;
@@ -1018,19 +1052,25 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     return;
   }
 
-  // 1) merge MCP：用户的 + chat-tool（我们自己的 wait_for_user / ask_user）
+  // 1) merge MCP：全局 cursor mcp（按 task 黑名单过滤）+ chat-tool（我们的 wait_for_user / ask_user）
+  //    全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、
+  //    per-task 用 task.disabledMcpServers 精简、详见 cursor-config.ts
+  const cursorMcp = filterDisabledMcp(
+    await readGlobalCursorMcpServers(),
+    task.disabledMcpServers,
+  );
   const mergedMcp: Record<string, McpServerConfig> = {
-    ...(userMcpServers ?? {}),
+    ...cursorMcp,
     [TASK_TOOL_MCP_NAME]: {
       type: "http",
       url: getChatMcpUrl(),
     },
   };
-  const userMcpNames = Object.keys(userMcpServers ?? {}).filter(
+  const cursorMcpNames = Object.keys(cursorMcp).filter(
     (n) => n !== TASK_TOOL_MCP_NAME,
   );
   const mcpDesc = `Task MCP: ${TASK_TOOL_MCP_NAME}${
-    userMcpNames.length > 0 ? ` + 用户 MCP: ${userMcpNames.join(", ")}` : ""
+    cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
   }`;
 
   await writeEventAndPublish(task.id, {
@@ -1271,13 +1311,17 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
   const completion = (async () => {
     try {
+      // V0.6.3：起 agent 前给业务仓库装 stop hook（保证 agent 交卷后才放行结束 Run、失败不阻断启动）
+      const effectiveCwd = getEffectiveCwd(task.repoPaths);
+      await ensureStopHookInstalled(effectiveCwd);
+
       agent = await Agent.create({
         apiKey,
         model,
         // settingSources:["project"] = 加载目标仓库 + 全局 .cursor/ 的 rules/skills/mcp/hooks
         //（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加生效、
         // chat-tool 安全（同名 inline 优先、不同名共存、已探针实测、见 ROADMAP）
-        local: { cwd: getEffectiveCwd(task.repoPaths), settingSources: ["project"] },
+        local: { cwd: effectiveCwd, settingSources: ["project"] },
         mcpServers: mergedMcp,
       });
       console.log(

@@ -27,12 +27,24 @@ const sanitizeRepoPaths = (v: unknown): string[] => {
 };
 
 const sanitizeRole = (v: unknown): TaskRole | undefined => {
-  if (v === "fe") return "fe";
+  if (v === "fe" || v === "be") return v;
   return undefined;
 };
 
 const sanitizeMode = (v: unknown): TaskMode => {
   return v === "chat" ? "chat" : "task";
+};
+
+// V0.6.3：per-repo 线上分支快照（client 从 settings 算好提交）。只收 plain object + string value、去空
+const sanitizeRepoBaseBranches = (
+  v: unknown,
+): Record<string, string> | undefined => {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === "string" && val.trim()) out[k] = val.trim();
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 };
 
 export const GET = async () => {
@@ -85,6 +97,7 @@ export const POST = async (req: Request) => {
       repoPaths,
       role: sanitizeRole(body.role),
       mode,
+      repoBaseBranches: sanitizeRepoBaseBranches(body.repoBaseBranches),
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
         : undefined,

@@ -32,18 +32,26 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 ---
 
-## 配置双向绑定 Cursor（settingSources 方案、2026-05-29 验证 + 部分实装）
+## 配置双向绑定 Cursor（跟 Cursor 共用工具、2026-06-01 完成）
 
-> 调研结论已落地大半：task-runner / chat-runner 两处 `Agent.create` 已开 `settingSources:["project"]`、skills-loader 已去重（只读平台自带）。**剩余待办**：禁用 fe 端 MCP 编辑 UI（待办 4）+ 核查 Next.js 环境 ripgrep（待办 5）。
+> ✅ 已完成。fe-ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
 
-**决策方向**：fe-ai-flow 定位「锦上添花」、配置不自己维护、直接消费 Cursor 的全局 + 项目配置（`~/.cursor/` + repo `.cursor/`）。
-- 手段：`Agent.create({ local: { cwd, settingSources: ["project"] } })`（task-runner + chat-runner 两处）→ **✅ 已实装（2026-05-29）**
-- 配套：**禁用 fe 端 MCP 编辑 UI**、MCP / rules / skills 的增减统一回 Cursor 改、fe 只读不写（回避「写坏用户 IDE 配置」风险）→ ⏳ 待办（待办 4）
+### 最终分工（关键：repo 层 vs 全局层分开处理）
 
-**实测已确认**（2026-05-29、用 `@cursor/sdk` 探针 + fixture 仓库跑两组对照、agent 全程无工具、纯凭上下文命中暗号）：
-- `settingSources: []`（默认）→ rules / skills 全不加载（inline only）
-- `settingSources: ["project"]` → 加载 repo + 全局 `.cursor/rules/`（实测 ruleCount）+ repo + 全局 `.cursor/skills/`（实测 skillCount、含 `~/.cursor/skills/` 那一堆全局 skill）
-- 即 settingSources 是**层级粗开关**：一开 project = repo rules + 全局 rules + repo skills + 全局 skills +（同理）repo/全局 mcp + hooks 全家桶。定位「和 Cursor 一致」后、这些连带大多是 feature 不是 bug。
+`settingSources` 是**分层**枚举（SDK `options.d.ts`：`SettingSource = "project" | "user" | "team" | "mdm" | "plugins" | "all"`、project 跟 user 是不同层）：
+
+| 配置层 | 来源 | 谁加载 |
+|---|---|---|
+| **项目层** repo `.cursor/`（rules/skills/mcp/hooks）| 目标仓库 | `Agent.create({ local: { settingSources: ["project"] } })`、SDK 读 |
+| **全局层** `~/.cursor/`（rules/skills/mcp）| 用户机器 | **fe 后端自己读**（`cursor-config.ts` + `skills-loader.ts`）注入 |
+
+**为什么全局层 fe 自己读、不靠 settingSources**：`["project"]` **只加载 project 层、够不着 user 层**（全局要 settingSources 含 `"user"`）。但 `"user"` 是粗开关、一开把全局 20-30 个 MCP 全塞进 context、没法 per-task 精简。fe 自己读：可控、可用 `task.disabledMcpServers` per-task 过滤。
+
+### ⚠️ 纠正 2026-05-29 旧探针的误读
+
+旧结论写「`["project"]` 连带加载**全局** skills（skillCount 13 来自 `~/.cursor/skills`）」——**错**：
+- 依据 1：SDK 类型 `SettingSource` 把 `project` / `user` 明确分层（注释「project/team 在 cloud always on、user/mdm 无 VM equivalent」）、`["project"]` 只 project 层。
+- 依据 2：本地 `~/.cursor/skills/` 实测仅 **3 个**（learn-and-persist-rules / pua / quarterly-review-generator）、跟「13」对不上。那 13 大概率是 fixture cwd 自身的**项目层** skills（恰好印证 `["project"]` 读 project 层）。
 
 **✅ 头号风险已验证（2026-05-29 探针实测、`scripts/probe-mcp-*.mjs`）· chat-tool MCP 共存安全**（两组对照探针）：
 - 探针手法：开 `settingSources:["project"]` + inline `mcpServers` 注入零依赖手写 stdio MCP（spawn / 工具调用各落 `/tmp/probe-mcp-<role>.log`、读日志判定、不靠 agent 自我报告）。
@@ -52,14 +60,21 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 - 副产品：日志 `skillCount: 13` 来自全局 `~/.cursor/skills`（fixture 自己没 skills）、印证 settingSources 连带加载全局 skills、对应下方「skills 别重复」待办。
 - ⚠️ 实测脚本对 stdio MCP 用「server spawn cwd 可能是目标仓库 /tmp」这点踩过坑：探针 server 必须零 npm 依赖（手写 JSON-RPC）、否则 import 阶段崩、日志写不出会误判成「没加载」。
 
-**✅ 已清理 · skills 不重复（2026-05-29 实装）**：
-- `skills-loader.ts` 现在**只读平台自带** `<fe-ai-flow>/skills/`（去掉了 repo `.cursor/skills/` 扫描 + `source` 维度 + 同名去重逻辑、`loadSkills()` 改无参）。
-- repo + 全局 skills 交给 settingSources（SDK 按 Cursor 标准加载）、不再由 loader 二次注入 → 同一 skill 不会进 prompt 两次。
+### skills 加载（2026-06-01 修订）
+- `loadSkills()` 读**平台自带** `<fe-ai-flow>/skills/` + **全局** `~/.cursor/skills/`（同名平台优先）。
+- 不读 repo `.cursor/skills/`（project 层、交 settingSources、避免同一 skill 进 prompt 两次）。
+- ⚠️ 修正 0529「只读平台自带」：那样全局 `~/.cursor/skills` 会丢（`["project"]` 够不着 user 层）、必须 fe 读。
 
-**留心 / 副产品发现**：
-- hooks 会被 settingSources 连带加载、留意副作用。
-- **ripgrep 配置**：独立 SDK 进程（非 Next.js）跑 local agent 会报 `Ripgrep path not configured`、需把 `@cursor/sdk-darwin-arm64/bin` 加进 PATH（让内部 `resolveRipgrepFromPath` 命中）或调内部 `configureRipgrepPath`。**待核查 task-runner 在 Next.js 环境下 agent 的 grep 能力是否也受影响**（若受影响、agent 搜代码能力打折、属独立 bug）。
-- `~/.cursor/mcp.json` 里 token 是明文、若 fe 读取展示务必脱敏。
+### 实装清单（2026-06-01）
+- **新 `cursor-config.ts`**：`readGlobalCursorMcpServers` / `readGlobalCursorRulesForPrompt`（alwaysApply 全文 / 其余列 index）/ `getGlobalCursorDirs`（跨平台、win 加 `%APPDATA%` fallback）/ `filterDisabledMcp`。
+- **MCP 注入移 server 端**：runner `mergedMcp` = 全局 mcp（按 task 黑名单过滤）+ chat-tool；删 client→server 传 mcpServers 全链路（run-args / route body / runner input）。
+- **rules 注入 prompt**：`_super.md` 加 `{{rulesSection}}`、chat `buildInitialPrompt` 加 rules 段。
+- **fe 端 MCP 只读**：`GET /api/cursor-mcp` 原样返回 `~/.cursor/mcp.json`（**不脱敏**、用户拍板：本地单机、跟 Cursor 一致）；`mcp-card` 编辑器→只读展示；黑名单候选源走 `useCursorMcp` hook；localStorage `mcpServersJson` 整套废弃。
+
+### 留心
+- repo `.cursor/mcp.json`（settingSources 加载）的 server **不进 fe task 黑名单候选**（fe 只读全局 mcp.json）——用户 mcp 通常都在全局、repo 级罕见、可接受。
+- **hooks（V0.6.3 起用于 stop hook 兜底）**：`["project"]` 加载 repo `.cursor/hooks.json`（已探针实测、auto + gemini 两模型都验过 stop hook follow-up 同会话拉回成立）。fe 用它做「保证 agent 交卷」的 stop hook 兜底——没 hooks.json 就建 / 有就不注入 / 留存复用 / hook fail-open 向 fe 认领、不误伤 IDE agent。详见 HANDOFF V0.6.3 段。
+- **ripgrep 配置**：独立 SDK 进程（非 Next.js）跑 local agent 会报 `Ripgrep path not configured`、需把 `@cursor/sdk-darwin-arm64/bin` 加进 PATH（让内部 `resolveRipgrepFromPath` 命中）。V0.6.3 stop hook 探针复现了这个警告、但**不影响 agent 正常 finished**（只是 ignore 文件映射降级、agent 照常跑完）。**仍待核查 task-runner 在 Next.js 环境下 agent 的 grep 能力是否受影响**。
 
 ---
 

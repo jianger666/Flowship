@@ -5,13 +5,17 @@
 /**
  * 仓库配置（V0.5.9 多仓引入）
  *
- * V0.6 设计取舍：不再手动配 mainBranch、build/ship action 跑时 agent 自己
- *   `git symbolic-ref refs/remotes/origin/HEAD` 或 `git remote show origin | grep "HEAD branch"`
- *   探测。不同仓主分支名（master / main / develop）不一样、让 agent 现场探不让用户填。
+ * V0.6.3 重新引入「线上分支」（曾在 V0.6 删过、当时叫 mainBranch 让 agent 探）：
+ *   - mainBranch（默认分支）≠ 线上分支：后端默认分支常是 develop、但 feature 要从
+ *     master / release（线上）拉、探 origin/HEAD 拿到的是 develop（错）、故让用户按仓手填
+ *   - 前端常见 master = 默认 = 线上、留空即可、build 时 agent 探 origin/HEAD 兜底
+ *   - 这份配置在 settings（localStorage）、建 task 时快照进 task.repoBaseBranches 给 server 用
  */
 export interface RepoConfig {
   name: string;
   path: string;
+  /** V0.6.3：feature 拉取基线 = 线上分支（如 master / release）、留空则 build 时 agent 探 origin/HEAD */
+  onlineBranch?: string;
 }
 
 /**
@@ -45,7 +49,6 @@ export interface FeAiFlowSettings {
    */
   gitToken?: string;
   repos: RepoConfig[];
-  mcpServersJson: string;
 }
 
 /**
@@ -162,6 +165,15 @@ export interface ActionRecord {
   artifactPath: string | null;
   startedAt: number;
   endedAt: number | null;
+
+  /**
+   * 软删标记（V0.6.x「划除」）——用户主动把这个 action 从 agent 上下文里排除
+   * - 区别于 status=cancelled（中途停了没跑完）：excluded 是「不管跑没跑完、用户判定它冗余/跑歪、别再进上下文」
+   *   （所以是独立 flag、不是 status 的一个值——一个 completed 的 action 也能被 excluded）
+   * - renderActionHistorySection 跳过它（不进 prompt、不引导 read artifact）→ 治本上下文污染
+   * - 数据 / artifact / events 全部物理保留、UI 划线展示、可一键恢复（可逆、比真删安全）
+   */
+  excluded?: boolean;
 
   /**
    * 后置 deterministic 检查（V0.6 门槛 2）
@@ -343,12 +355,13 @@ export interface TaskContextDoc {
 // ===========================================
 //
 // 飞书 story 是「跨角色共享」的、每个研发只关心 story 里跟自己角色相关的部分。
-// 当前枚举仅 `fe`、未来扩 be / data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
+// 当前枚举 `fe` / `be`、未来扩 data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
 
-export type TaskRole = "fe";
+export type TaskRole = "fe" | "be";
 
 export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
   fe: "前端",
+  be: "后端",
 };
 
 // ===========================================
@@ -482,6 +495,15 @@ export interface Task {
 
   role: TaskRole;
   repoPaths: string[];
+  /**
+   * V0.6.3：每个仓的「线上分支」= feature 拉取基线（per-repo、key=repoPath、value=分支名）
+   * - 来源：建 task 时从 settings.repos[].onlineBranch 快照固化（settings 在 localStorage、
+   *   server 端读不到、所以建 task 时 client 快照进 task、之后 build 用这份）
+   * - why：feature 必须从「线上分支」拉、否则把 test/dev 未上线 commit 带进 feature 污染线上；
+   *   后端默认分支常是 develop（探 origin/HEAD 会误拿）、故让用户在设置页按仓配
+   * - 某仓没配（key 不存在 / 空）→ build 时该仓回退 agent 探 origin/HEAD（前端 master 场景够用）
+   */
+  repoBaseBranches?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -500,7 +522,12 @@ export interface Task {
  */
 export type NewTaskInput = Pick<
   Task,
-  "title" | "repoPaths" | "feishuStoryUrl" | "disabledMcpServers" | "model"
+  | "title"
+  | "repoPaths"
+  | "feishuStoryUrl"
+  | "disabledMcpServers"
+  | "model"
+  | "repoBaseBranches"
 > & {
   role?: TaskRole;
   mode?: TaskMode;

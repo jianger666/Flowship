@@ -257,6 +257,8 @@ interface TaskMetaV06 {
   feishuTesterUserIds?: string[];
   role: TaskRole;
   repoPaths: string[];
+  /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
+  repoBaseBranches?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -541,6 +543,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     feishuTesterUserIds: meta.feishuTesterUserIds,
     role: meta.role,
     repoPaths: meta.repoPaths,
+    repoBaseBranches: meta.repoBaseBranches,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
@@ -772,6 +775,15 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
 
+  // V0.6.3：清洗 per-repo 线上分支——key 限定在本 task 的 repoPaths 内、value 去空 trim
+  //   （client 从 settings 快照来、这里再兜一道：删已不在列表的仓 + 空分支）
+  const allowedRepos = new Set(trimmedRepoPaths);
+  const repoBaseBranches: Record<string, string> = {};
+  for (const [repo, branch] of Object.entries(input.repoBaseBranches ?? {})) {
+    const b = branch?.trim();
+    if (allowedRepos.has(repo) && b) repoBaseBranches[repo] = b;
+  }
+
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -783,6 +795,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     mrs: [],
     role: input.role ?? "fe",
     repoPaths: trimmedRepoPaths,
+    repoBaseBranches:
+      Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
     feishuStoryUrl: input.feishuStoryUrl,
     contextDocs: initialContextDocs,
     disabledMcpServers:
@@ -1020,7 +1034,10 @@ export const patchAction = async (
   taskId: string,
   actionId: string,
   patch: Partial<
-    Pick<ActionRecord, "status" | "postCheck" | "sideEffects" | "agentModel">
+    Pick<
+      ActionRecord,
+      "status" | "postCheck" | "sideEffects" | "agentModel" | "excluded"
+    >
   >,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {

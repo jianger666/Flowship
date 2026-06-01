@@ -44,9 +44,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
-import { createTask, parseMcpServers } from "@/lib/task-store";
+import { createTask } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import {
   TASK_ROLE_LABEL,
@@ -56,7 +57,7 @@ import {
   type TaskRole,
 } from "@/lib/types";
 
-const ROLE_OPTIONS: TaskRole[] = ["fe"];
+const ROLE_OPTIONS: TaskRole[] = ["fe", "be"];
 
 interface Props {
   onCreated: (task: Task) => void;
@@ -77,8 +78,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [feishuStoryUrl, setFeishuStoryUrl] = useState("");
   // 仓库下拉源、open 时从 settings 同步过来
   const [repos, setRepos] = useState<RepoConfig[]>([]);
-  // 用户配置的 MCP server 列表（open 时刷新）
-  const [availableMcp, setAvailableMcp] = useState<string[]>([]);
+  // 用户配置的 MCP server 列表（从 Cursor ~/.cursor/mcp.json 读、open 时拉）
+  const { names: availableMcp } = useCursorMcp(open);
   // 用户在弹窗里勾掉的 MCP（黑名单）、默认空 = 全开
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起
@@ -94,17 +95,11 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     fetchModels,
   } = useModels();
 
-  // 打开时读 settings.repos + 解析 mcpServersJson + 拉模型
+  // 打开时读 settings.repos + 拉模型（MCP 候选源走 useCursorMcp）
   useEffect(() => {
     if (!open) return;
     const s = getSettings();
     setRepos(s.repos);
-    try {
-      const parsed = parseMcpServers(s.mcpServersJson);
-      setAvailableMcp(parsed ? Object.keys(parsed) : []);
-    } catch {
-      setAvailableMcp([]);
-    }
     const defaultId = s.defaultModel?.id ?? "";
     setDefaultModelId(defaultId);
     setPickedModelId(defaultId);
@@ -157,12 +152,26 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         }
       }
 
+      // V0.6.3：从 settings 查选中仓的「线上分支」、快照进 task
+      //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build 用这份）
+      const repoBaseBranches: Record<string, string> = {};
+      for (const p of repoPaths) {
+        const branch = settings.repos
+          .find((r) => r.path === p)
+          ?.onlineBranch?.trim();
+        if (branch) repoBaseBranches[p] = branch;
+      }
+
       const task = await createTask({
         mode,
         role,
         title: title.trim(),
         repoPaths,
         feishuStoryUrl: feishuStoryUrl.trim() || undefined,
+        repoBaseBranches:
+          Object.keys(repoBaseBranches).length > 0
+            ? repoBaseBranches
+            : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,
       });

@@ -329,6 +329,12 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
 
 `n` 跟 `artifact_path` 都从 [NEXT_ACTION] 头里拿、不要自己猜。
 
+## 全局规则（用户在 Cursor 配的偏好、必遵守）
+
+下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。标了 `alwaysApply` 的已全文展开、必须始终遵守；其余按场景描述、命中时用 `read` 工具读全文：
+
+{{rulesSection}}
+
 ## Skills（fe-ai-flow 自带能力扩展）
 
 下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：
@@ -344,6 +350,8 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
 ---
 
 ## 当前 action 历史（task 内已发生的 action、按时间正序）
+
+> 被用户「划除」的 action 不出现在下面列表里——它们已被判定为冗余 / 跑歪、**不要再参考或 read 它们的 artifact**（即使你在别处见过路径）。下面列出的就是全部有效历史。
 
 {{actionHistorySection}}
 

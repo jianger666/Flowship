@@ -10,7 +10,8 @@
  *
  * 检查内容（V0.6.1 范围、用户拍板删 plan 黑名单 grep 后简化）：
  *   - plan: artifact 文件存在 + 内容长度 >= 100
- *   - build: pnpm typecheck exit 0 + pnpm lint exit 0 + git status 有改动
+ *   - build: V0.6.3 用户拍板暂时撤掉（原 pnpm typecheck/lint/git status；写死 pnpm 对多技术栈
+ *     如 Java 会误报失败、先撤掉、后面重做成技术栈自适应 / 独立 check）
  *   - review: git diff hash 跟 artifact 写的一致（防 agent 编造 diff）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
  *   - test/learn: V0.6.2+ stub、暂不实现
@@ -51,16 +52,21 @@ export const runActionCheck = async (
     switch (action.type) {
       case "plan":
         return await checkPlan(task, action);
+      // build：V0.6.3 用户拍板暂时撤掉 typecheck/lint/git 检查
+      //   直接原因：写死 pnpm 对多技术栈（Java 等）会误报失败、先撤掉避免误伤、
+      //   后面再加（可能把 check build 独立成单独的 check action / 模块、做技术栈自适应）
+      // test / learn：V0.6.2+ 还没实现
       case "build":
-        return await checkBuild(task, action);
+      case "test":
+      case "learn":
+        return {
+          passed: true,
+          details: `${action.type} action 暂未实现 deterministic 检查、跳过`,
+        };
       case "review":
         return await checkReview(task, action);
       case "ship":
         return await checkShip(task, action);
-      // V0.6.2+ stub：test / learn 暂不实现、走兜底通过
-      case "test":
-      case "learn":
-        return { passed: true, details: `${action.type} action V0.6.2+ 未实现、跳过检查` };
       default: {
         const _: never = action.type;
         return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
@@ -107,89 +113,6 @@ const checkPlan = async (
     };
   }
   return { passed: true, details: "plan artifact 已落盘、内容长度通过" };
-};
-
-// ----------------- build -----------------
-
-const checkBuild = async (
-  task: Task,
-  action: ActionRecord,
-): Promise<ActionCheckResult> => {
-  // build action 准入门槛 1 已经保证至少 1 个 plan、这里不再校验
-  // 1) artifact 文件存在（可选 - build artifact 是「实施记录」、不像 plan 那样强必要）
-  if (action.artifactPath) {
-    const absPath = getActionArtifactPath(task.id, action.n, action.type);
-    try {
-      await fs.access(absPath);
-    } catch {
-      return { passed: false, details: `build artifact 文件不存在：${absPath}` };
-    }
-  }
-
-  // 2) 跑仓库根的 typecheck + lint + git status
-  const cwd = getEffectiveCwd(task.repoPaths);
-  // 仓库不存在 / 不是 git 仓 → 跳过（用户场景可能是纯探索任务）
-  try {
-    await fs.access(path.join(cwd, ".git"));
-  } catch {
-    return {
-      passed: true,
-      details: "仓库不是 git 仓、跳过 typecheck/lint/git status 检查（仅探索场景适用）",
-    };
-  }
-
-  const sections: string[] = [];
-  let allPassed = true;
-
-  // typecheck
-  const tc = await runShell("pnpm", ["typecheck"], cwd);
-  if (tc.exitCode === 0) {
-    sections.push("✅ pnpm typecheck 通过");
-  } else if (tc.notFound) {
-    sections.push("⚠️ pnpm typecheck 命令找不到（package.json 可能没配 typecheck script、跳过）");
-  } else {
-    allPassed = false;
-    sections.push(
-      [
-        `❌ pnpm typecheck exit=${tc.exitCode}`,
-        ...tc.stderr.trim().split(/\r?\n/).slice(-15).map((l) => `   ${l}`),
-      ].join("\n"),
-    );
-  }
-
-  // lint
-  const lt = await runShell("pnpm", ["lint"], cwd);
-  if (lt.exitCode === 0) {
-    sections.push("✅ pnpm lint 通过");
-  } else if (lt.notFound) {
-    sections.push("⚠️ pnpm lint 命令找不到（package.json 可能没配 lint script、跳过）");
-  } else {
-    allPassed = false;
-    sections.push(
-      [
-        `❌ pnpm lint exit=${lt.exitCode}`,
-        ...lt.stderr.trim().split(/\r?\n/).slice(-15).map((l) => `   ${l}`),
-      ].join("\n"),
-    );
-  }
-
-  // git status 有改动
-  const gs = await runShell("git", ["status", "--porcelain"], cwd);
-  if (gs.exitCode === 0) {
-    if (gs.stdout.trim().length > 0) {
-      sections.push("✅ git status 有改动");
-    } else {
-      allPassed = false;
-      sections.push("❌ git status 干净、build 看起来没真改文件（agent 可能空跑）");
-    }
-  } else {
-    sections.push(`⚠️ git status 跑失败 exit=${gs.exitCode}（跳过此检查）`);
-  }
-
-  return {
-    passed: allPassed,
-    details: sections.join("\n\n"),
-  };
 };
 
 // ----------------- review -----------------

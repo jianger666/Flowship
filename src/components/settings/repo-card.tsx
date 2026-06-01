@@ -87,6 +87,11 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
     );
   };
 
+  // V0.6.3：设置仓库的「线上分支」（= feature 拉取基线、留空则 build 时 agent 探 origin/HEAD）
+  const setOnlineBranch = (path: string, onlineBranch: string) => {
+    onChange(repos.map((r) => (r.path === path ? { ...r, onlineBranch } : r)));
+  };
+
   const removeRepo = (path: string) => {
     onChange(repos.filter((r) => r.path !== path));
   };
@@ -96,7 +101,7 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」会弹出服务端文件浏览器、跨平台都能用
+          点「选择文件夹」会弹出服务端文件浏览器、跨平台都能用；线上分支选填、feature 从它拉、留空自动探测
         </CardDescription>
         <CardAction>
           <SaveButton dirty={dirty} onSave={onSave} />
@@ -124,6 +129,13 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
                 <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
                   {r.path}
                 </code>
+                <Input
+                  value={r.onlineBranch ?? ""}
+                  onChange={(e) => setOnlineBranch(r.path, e.target.value)}
+                  className="w-36 shrink-0"
+                  placeholder="线上分支（选填）"
+                  title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
+                />
                 <Button
                   type="button"
                   variant="ghost"

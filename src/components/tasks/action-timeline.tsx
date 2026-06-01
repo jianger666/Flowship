@@ -22,6 +22,8 @@
  * 空态：task.actions.length === 0 时显示一行 EmptyHint「还没推进过任何 action」
  */
 
+import { RotateCcw, X } from "lucide-react";
+
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { cn } from "@/lib/utils";
@@ -36,6 +38,11 @@ interface Props {
   currentActionId: string | null;
   selectedActionId: string | null;
   onSelectAction: (actionId: string) => void;
+  /**
+   * 划除 / 恢复某个 action（软删）——父组件实现二次确认 + 调 API。
+   * 不传则不渲染划除按钮。
+   */
+  onToggleExclude?: (action: ActionRecord) => void;
 }
 
 // 同 type 内 n 最大的 action 是「最新生效版本」、其他都是 stale
@@ -54,6 +61,7 @@ export const ActionTimeline = ({
   currentActionId,
   selectedActionId,
   onSelectAction,
+  onToggleExclude,
 }: Props) => {
   if (actions.length === 0) {
     return (
@@ -70,11 +78,13 @@ export const ActionTimeline = ({
       {actions.map((action) => {
         const isCurrent = action.id === currentActionId;
         const isSelected = action.id === selectedActionId;
+        const isExcluded = action.excluded === true;
         const latest = latestByType.get(action.type);
         const isStale = latest !== undefined && latest.id !== action.id;
         // 多个状态修饰拼一起、用户 hover 看到能直接判断 chip 此刻意味着什么
         // 当前 = 还在跑 / 等 ack 的 action（ring 高亮）
         // stale = 已被同 type 更新一次取代（淡化）
+        // excluded = 用户划除、line-through、不进 agent 上下文
         const titleParts = [
           `#${action.n} ${ACTION_LABEL_SHORT[action.type]} · ${ACTION_STATUS_LABEL[action.status]}`,
         ];
@@ -86,38 +96,73 @@ export const ActionTimeline = ({
             `已被 #${latest!.n} ${ACTION_LABEL_SHORT[latest!.type]} 取代`,
           );
         }
-        const title = titleParts.length > 1
-          ? `${titleParts[0]}（${titleParts.slice(1).join("、")}）`
-          : titleParts[0];
+        if (isExcluded) {
+          titleParts.push("已划除、不进 agent 上下文");
+        }
+        const title =
+          titleParts.length > 1
+            ? `${titleParts[0]}（${titleParts.slice(1).join("、")}）`
+            : titleParts[0];
         return (
-          <ChoiceButton
+          <div
             key={action.id}
-            shape="tab"
-            selected={isSelected}
-            onClick={() => onSelectAction(action.id)}
-            className={cn(
-              "relative",
-              isCurrent && !isSelected && "ring-1 ring-primary/40",
-              isStale && !isSelected && "opacity-50 text-muted-foreground",
-            )}
-            title={title}
+            className="group/chip relative inline-flex items-center"
           >
-            <span className="mr-1 text-[10px] text-muted-foreground">
-              #{action.n}
-            </span>
-            <span>{ACTION_LABEL_SHORT[action.type]}</span>
-            <span
+            <ChoiceButton
+              shape="tab"
+              selected={isSelected}
+              onClick={() => onSelectAction(action.id)}
               className={cn(
-                "ml-1 inline-block size-1.5 shrink-0 rounded-full",
-                action.status === "completed" && "bg-emerald-500",
-                action.status === "running" && "bg-amber-500 animate-pulse",
-                action.status === "awaiting_ack" && "bg-blue-500",
-                action.status === "error" && "bg-destructive",
-                action.status === "cancelled" && "bg-muted-foreground/40",
+                "relative",
+                isCurrent && !isSelected && "ring-1 ring-primary/40",
+                isStale && !isSelected && "opacity-50 text-muted-foreground",
+                isExcluded && "line-through opacity-40",
               )}
-              aria-hidden
-            />
-          </ChoiceButton>
+              title={title}
+            >
+              <span className="mr-1 text-[10px] text-muted-foreground">
+                #{action.n}
+              </span>
+              <span>{ACTION_LABEL_SHORT[action.type]}</span>
+              <span
+                className={cn(
+                  "ml-1 inline-block size-1.5 shrink-0 rounded-full",
+                  action.status === "completed" && "bg-emerald-500",
+                  action.status === "running" && "bg-amber-500 animate-pulse",
+                  action.status === "awaiting_ack" && "bg-blue-500",
+                  action.status === "error" && "bg-destructive",
+                  action.status === "cancelled" && "bg-muted-foreground/40",
+                )}
+                aria-hidden
+              />
+            </ChoiceButton>
+            {onToggleExclude && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleExclude(action);
+                }}
+                className={cn(
+                  "ml-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors",
+                  isExcluded
+                    ? "opacity-100 hover:text-primary"
+                    : "opacity-0 group-hover/chip:opacity-100 hover:text-destructive",
+                )}
+                title={
+                  isExcluded
+                    ? "恢复这个 action（重新纳入 agent 上下文）"
+                    : "划除（把这个 action 排出 agent 上下文、可恢复）"
+                }
+              >
+                {isExcluded ? (
+                  <RotateCcw className="size-3" />
+                ) : (
+                  <X className="size-3" />
+                )}
+              </button>
+            )}
+          </div>
         );
       })}
     </div>

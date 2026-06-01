@@ -23,41 +23,6 @@ import type {
   TaskSummary,
 } from "./types";
 
-/**
- * 从设置页存的 mcpServersJson 字符串解析出 SDK 能直接用的 mcpServers 对象
- *
- * 输入约定：
- *   - 空串 / undefined → undefined（agent 不接 MCP）
- *   - 必须带外层 `mcpServers` wrapper（与 Cursor IDE ~/.cursor/mcp.json 一致）
- *   - 不深校验单 server schema、留给 SDK 报错（更准）
- */
-export const parseMcpServers = (
-  json: string | undefined,
-): Record<string, McpServerConfig> | undefined => {
-  if (!json || !json.trim()) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch (err) {
-    throw new Error(
-      `MCP 配置 JSON 解析失败：${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("MCP 配置必须是 JSON 对象");
-  }
-  const inner = (parsed as { mcpServers?: unknown }).mcpServers;
-  if (inner == null) {
-    throw new Error('MCP 配置缺少外层 "mcpServers" 键');
-  }
-  if (typeof inner !== "object" || Array.isArray(inner)) {
-    throw new Error('"mcpServers" 必须是对象');
-  }
-  const obj = inner as Record<string, unknown>;
-  if (Object.keys(obj).length === 0) return undefined;
-  return obj as Record<string, McpServerConfig>;
-};
-
 const handleJson = async <T>(res: Response): Promise<T> => {
   const data = await res.json();
   if (!res.ok) {
@@ -149,24 +114,30 @@ export const setTaskUiLayout = async (
   await handleJson<{ ok: true }>(res);
 };
 
+// ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------
+
+export interface CursorMcpInfo {
+  // ~/.cursor/mcp.json 里的 mcpServers 原样（含 type/url/command/env...）
+  servers: Record<string, McpServerConfig>;
+  // 读取候选目录（展示「配置读自哪个 ~/.cursor/」）
+  dirs: string[];
+}
+
 /**
- * 按 task.disabledMcpServers 过滤全量 mcpServers
+ * 读 Cursor 全局 MCP 配置（GET /api/cursor-mcp）
  *
- * - servers undefined：返 undefined（无 MCP 走）
- * - disabled undefined / 空：返原 servers
- * - disabled 列表：删掉这些 server、其它保留
+ * V0.6.2「跟 Cursor 共用工具」：fe 不再让用户编辑 MCP、统一展示 Cursor 的配置（单一源）。
+ * 用在：设置页 mcp-card 只读展示 + new-task / task-mcp-panel 的「黑名单候选源」。
+ * MCP 真正注入 agent 在 server 端做（cursor-config.ts）、client 只拿来展示 / 选黑名单。
  */
-export const filterMcpServersByTask = (
-  servers: Record<string, McpServerConfig> | undefined,
-  disabled: string[] | undefined,
-): Record<string, McpServerConfig> | undefined => {
-  if (!servers) return undefined;
-  if (!disabled || disabled.length === 0) return servers;
-  const next: Record<string, McpServerConfig> = {};
-  for (const [name, cfg] of Object.entries(servers)) {
-    if (!disabled.includes(name)) next[name] = cfg;
-  }
-  return Object.keys(next).length > 0 ? next : undefined;
+export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
+  const res = await fetch("/api/cursor-mcp", { cache: "no-store" });
+  const data = await handleJson<{
+    ok: true;
+    servers: Record<string, McpServerConfig>;
+    dirs: string[];
+  }>(res);
+  return { servers: data.servers, dirs: data.dirs };
 };
 
 // ----------------- SSE 工具（V0.6 统一任务事件流） -----------------
@@ -320,7 +291,6 @@ export interface ImagePayload {
 export interface TaskBootArgs {
   apiKey: string;
   model: ModelSelection;
-  mcpServers?: Record<string, McpServerConfig>;
 }
 
 /**
@@ -424,6 +394,46 @@ export const finalizeTask = async (
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ finalStatus }),
+    },
+  );
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return data.task;
+};
+
+// ----------------- V0.6.x 停止 / 划除（软删） -----------------
+
+/**
+ * 「停止」当前正在跑 / 等 ack 的 action
+ * - abort SDK Run + 当前 action 标 cancelled + runStatus 回 idle
+ * - 幂等：没有活 agent 也照常归位（返回的 task.runStatus = idle）
+ */
+export const stopTask = async (taskId: string): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/stop`, {
+    method: "POST",
+  });
+  const data = await handleJson<{ ok: true; hadAgent: boolean; task: Task }>(
+    res,
+  );
+  return data.task;
+};
+
+/**
+ * 「划除 / 恢复」单条 action（软删、可逆）
+ * - excluded=true：排出 agent 上下文（renderActionHistorySection 跳过、不进 prompt）
+ * - excluded=false：恢复
+ * - 进行中的 action 不能直接划除（后端返 409）、需先 stopTask
+ */
+export const setActionExcluded = async (
+  taskId: string,
+  actionId: string,
+  excluded: boolean,
+): Promise<Task> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/action-exclude`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actionId, excluded }),
     },
   );
   const data = await handleJson<{ ok: true; task: Task }>(res);

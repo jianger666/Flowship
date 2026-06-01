@@ -15,7 +15,6 @@
  *   attachments?: string[],            // 文件 / 目录绝对路径（FsPickerDialog 选的）
  *   apiKey: string,
  *   model: ModelSelection,
- *   mcpServers?: Record<string, McpServerConfig>,
  *   forceNewAgent?: boolean,           // UI「换新 agent」勾选时为 true
  *   username?: string,                 // settings.username、拼 build branch 名用
  * }
@@ -35,11 +34,10 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+import type { ModelSelection } from "@cursor/sdk";
 
 import {
   errorResponse,
-  isValidMcpServers,
   isValidModel,
   parseAndValidateImages,
 } from "@/lib/server/route-helpers";
@@ -58,7 +56,6 @@ interface PostBody {
   attachments?: string[];
   apiKey?: string;
   model?: ModelSelection;
-  mcpServers?: Record<string, McpServerConfig>;
   forceNewAgent?: boolean;
   username?: string;
   // V0.6.1 ship action 用：GitLab host + PAT、ship 准入校验 + agent 调 submit_mr 时用
@@ -96,11 +93,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const apiKey = body.apiKey?.trim();
   if (!apiKey) return errorResponse("缺少 apiKey");
   if (!isValidModel(body.model)) return errorResponse("model 非法");
-  if (!isValidMcpServers(body.mcpServers)) {
-    return errorResponse("mcpServers 必须是对象（key=server名、value=配置）");
-  }
   const model = body.model;
-  const userMcpServers = body.mcpServers;
 
   // 校验 images
   const imagesResult = parseAndValidateImages(
@@ -181,7 +174,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
       apiKey,
       model,
-      userMcpServers,
       forceNewAgent: body.forceNewAgent === true,
       username: body.username?.trim() || undefined,
       gitHost: body.gitHost?.trim() || undefined,

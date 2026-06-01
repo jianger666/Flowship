@@ -11,7 +11,7 @@
  *   images?: Array<{ data, mimeType, filename }>;
  *   attachments?: string[];           // 文件 / 目录绝对路径（FsPickerDialog 选的）
  *   // task 处于 idle / completed / error 时、用户发消息会同时触发「自动启 agent」、需要 SDK 启动参数
- *   bootArgs?: { apiKey, model, mcpServers };
+ *   bootArgs?: { apiKey, model };
  * }
  * ```
  *
@@ -38,7 +38,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+import type { ModelSelection } from "@cursor/sdk";
 
 import {
   appendEvent,
@@ -57,7 +57,6 @@ import {
 import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import {
   errorResponse,
-  isValidMcpServers,
   isValidModel,
   KEEPALIVE_RACE_RETRY_MS,
   parseAndValidateImages,
@@ -79,7 +78,6 @@ interface PostBody {
   bootArgs?: {
     apiKey?: string;
     model?: ModelSelection;
-    mcpServers?: Record<string, McpServerConfig>;
   };
 }
 
@@ -217,20 +215,28 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
+  // agent 进程其实还活着（runningChats 有）但没 pending = 它正在说话（running 态本来就没 pending）
+  // → 不是僵尸、绝不标 error、让用户等它这段说完。前端正常会拦 running、这里兜 SSE 滞后导致
+  //   前端拿过期 runStatus 发消息的 race（否则会把正在跑的 agent 误杀成 error）
+  if (!pending && isChatRunning(task.id)) {
+    return errorResponse("agent 正在回、等它说完一段再发", 409);
+  }
+
   // 模式 2：自动启 agent（终态发消息）
-  // hasPending=false 但 runStatus=awaiting_user/running → 僵尸态、当场标 error
+  // 进程已经没了（runningChats 无）但 meta 状态停在 awaiting_user/running
+  //   = agent 异常退出 / 服务重启、状态没收尾 → 真僵尸、当场标 error、引导用户再发一条重启
   if (
     !pending &&
     (task.runStatus === "awaiting_user" || task.runStatus === "running")
   ) {
     console.warn(
-      `[chat-reply] task=${task.id} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
+      `[chat-reply] task=${task.id} 僵尸态 runStatus=${task.runStatus}（进程已不在）、当场标 error`,
     );
     const errorTask = await setTaskRunStatus(task.id, "error");
     if (errorTask)
       publishTaskStreamEvent(task.id, { kind: "task", task: errorTask });
     return errorResponse(
-      "Chat agent 已断开（进程重启或异常退出）、请刷新页面重新发消息以重启",
+      "Chat agent 已断开（进程重启或异常退出）、再发一条消息即可重启新一轮对话",
       410,
     );
   }
@@ -242,11 +248,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
   if (!isValidModel(bootArgs.model)) {
     return errorResponse("bootArgs.model 非法");
-  }
-  if (!isValidMcpServers(bootArgs.mcpServers)) {
-    return errorResponse(
-      "bootArgs.mcpServers 必须是对象（key=server名、value=配置）",
-    );
   }
 
   // 防重复启动：agent 还在跑（理论不该走到这、防御性）
@@ -263,7 +264,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
     task: runningTask ?? task,
     apiKey: bootArgs.apiKey,
     model: bootArgs.model,
-    userMcpServers: bootArgs.mcpServers,
     firstMessage: {
       text,
       imagePaths: imageAbsPaths,

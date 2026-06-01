@@ -11,7 +11,7 @@
 
 - 至少 1 个已通过的 plan action（runner 会拦、违反时 advance 路由 4xx）
 - runner 在 [NEXT_ACTION ...] 头后会注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
-  - 多仓 task：每仓共用同一 branch name、base 分支各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
+  - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
   - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
   - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 wait_for_user 等用户处理、**不要**自己 force / reset
 
@@ -66,16 +66,16 @@
 
 > **PRD / 飞书原文需要现查时**：plan 不复述 PRD、所以业务背景细节直接看 SDK Run 上下文里 plan agent 已经读过的 contextDocs；找不到时用 `feishu-mcp` / `feishu-project-mcp` 再拉一次（少量 token、可接受）。
 
-### 2. 验证仓库脚本（typecheck / lint）
+### 2. 验证仓库脚本（编译 / 类型检查 / lint）
 
-读 `{{repoPath}}/package.json`、确认实际可用的：
+先按仓库技术栈找到实际可用的「编译 / 类型检查」和「lint」命令、以仓库实际配置为准（plan 不再推测命令清单、build 自己查准）：
 
-- Typecheck 命令（如 `pnpm tsc --noEmit` / `pnpm typecheck` / `npm run type-check`）
-- Lint 命令（如 `pnpm lint` / `pnpm eslint`）
+- **JS / TS 仓**（有 `package.json`）：读 scripts，typecheck 如 `pnpm typecheck` / `pnpm tsc --noEmit` / `npm run type-check`、lint 如 `pnpm lint` / `pnpm eslint`
+- **Java（Maven）仓**（有 `pom.xml`）：编译如 `mvn -q compile`、检查如 `mvn -q checkstyle:check`（若配了）
+- **Java（Gradle）仓**（有 `build.gradle`）：编译如 `./gradlew compileJava`、检查如 `./gradlew check`
+- **其他技术栈**：看 README / CONTRIBUTING / Makefile 找编译 + 静态检查命令
 
-以 package.json 实际命令为准（plan 不再推测命令清单、build 自己查准）。
-
-> ⚠️ **不要跑 `pnpm build` / `vite build`** —— 前端项目的 build 命令通常耗时几十秒到几分钟、typecheck 已经覆盖 90% 类型错误、build 额外能查到的部分边际收益低、ROI 不值。除非用户在 plan / 反馈里**明确要求**跑 build、否则跳过。
+> ⚠️ **不要跑全量 build / 打包命令**（如 `pnpm build` / `vite build` / `mvn package` / `gradle build`）—— 这类通常耗时几十秒到几分钟、上面的类型检查 / 编译已覆盖大部分错误、全量打包边际收益低、ROI 不值。除非用户在 plan / 反馈里**明确要求**、否则跳过。
 
 ### 3. 按 task 顺序执行
 
@@ -101,16 +101,16 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 ### 4. 全量校验
 
-所有 task 完成后、用 SDK 内置 `shell` 工具跑：
+所有 task 完成后、用 SDK 内置 `shell` 工具跑 §2 查到的命令（全量）：
 
-- Lint（全量）
-- Typecheck（全量）
+- 类型检查 / 编译（如 typecheck / `mvn compile` / `gradlew compileJava`）
+- Lint / 静态检查（若仓库配了）
 
 每条命令的退出码、关键 stdout/stderr 摘要、记到 build artifact。
 
-**有 lint 错或 typecheck 错 = 必须修**。这是用户对低级错误零容忍的硬约束。
+**有编译错 / 类型错 / lint 错 = 必须修**。这是用户对低级错误零容忍的硬约束。
 
-> ⚠️ **不跑 build 命令**——见 §2 段尾说明。除非用户在 plan / 反馈里明确要求、不要跑 `pnpm build` / `vite build`。
+> ⚠️ **不跑全量 build / 打包命令**——见 §2 段尾说明。除非用户在 plan / 反馈里明确要求、不跑 `pnpm build` / `vite build` / `mvn package` 等。
 
 ### 5. 写 build artifact
 
@@ -133,15 +133,19 @@ shell stdout 返回行解析：
 - `[ACTION_ACK revise]` + 后续 feedback → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
-## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
+## 自检（V0.6.3 起：runner 不再自动跑后置检查、build 质量靠你自检 + 用户人眼把关）
 
-1. **`pnpm typecheck` exit 0**——typecheck 不过 = 强制 revise
-2. **`pnpm lint` exit 0**——lint 不过 = 强制 revise
-3. **`git status --porcelain` 真有改动**——防 agent 假装写了代码（artifact 写满但 git status 空白）
+> V0.6.3 撤掉了 runner 的自动后置检查（原来写死 `pnpm typecheck` / `pnpm lint`、对多技术栈如 Java 会误报、后面会重做成技术栈自适应 / 独立 check）。现在 build 的质量门槛**由你自己保证**：
 
-后置检查失败时、runner 把 action 标 ❌、提示用户「跑 build 没真改东西 / typecheck / lint 不过、需 revise」。
+1. **§4 的类型检查 / 编译必须 exit 0**——不过就当场修、修到过为止（用户对低级错误零容忍）
+2. **lint / 静态检查（若仓库配了）exit 0**——同上
+3. **`git status --porcelain` 真有改动**——确认你真写了代码（不是 artifact 写满但 git 没动）
+
+把每条结果如实记进 build artifact、让用户 ack 时能核对。
 
 ## build artifact 骨架
+
+> 下面骨架里的命令 / 文件名是 JS/TS 仓示例（`pnpm` / `.ts`）、**按你仓库实际技术栈替换**（Java：`mvn` / `gradle` / `.java`、Go：`go` / `.go`）。
 
 ```markdown
 # 编码实现：<story title>

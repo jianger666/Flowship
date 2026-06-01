@@ -3,19 +3,18 @@
  *
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
- * 设计要点（用户已拍板、2026-05-29 起单一来源、配合 settingSources 双向绑定）：
- *   - **只加载 fe-ai-flow 平台自带** `<fe-ai-flow>/skills/`（跟 git 仓库一起发布、所有用户共享）
- *   - **repo + 全局 skills 不在这里读**：task-runner / chat-runner 的 Agent.create 开了
- *     `settingSources: ["project"]`、Cursor SDK 会按 Cursor 标准自动加载目标仓库 `.cursor/skills/`
- *     + 全局 `~/.cursor/skills/`（跟 Cursor IDE 行为一致）。fe 这里再读一遍 = 同一份 SKILL.md
- *     进 prompt 两次、故只管「SDK 盖不到的平台自带」——settingSources 的 cwd=目标仓库、
- *     够不着 fe-ai-flow 自己的 `skills/`、那一份必须靠本 loader 注入。
+ * 设计要点（2026-06「跟 Cursor 共用工具」定案、详见 ROADMAP）：
+ *   - **平台自带 + 全局两类都读**：`<fe-ai-flow>/skills/`（git 发布、所有用户共享）
+ *     + 全局 `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）。
+ *   - **repo `.cursor/skills/` 不在这里读**：project 层、由 Agent.create 的
+ *     `settingSources:["project"]` 交给 SDK 加载、fe 再读 = 同一份 SKILL.md 进 prompt 两次。
+ *     （为什么全局要 fe 读、repo 不用：`["project"]` 只读 project 层、够不着 user 层的全局 skills。）
  *   - **progressive loading**：启动 agent 时只把每个 skill 的 name + description + absPath 拼进 prompt、
  *     agent 看到场景匹配时**主动用 `read` 工具读** 完整 SKILL.md 拿到详情。
  *     节省 prompt token、跟 Cursor IDE 加载行为一致。
  *
  * 不做的事（V1）：
- *   - 读 `<repo>/.cursor/rules/` 注入 prompt（rules 由 settingSources 交给 SDK 加载）
+ *   - 读 `<repo>/.cursor/rules/` 注入（repo rules 由 settingSources 加载；全局 rules 在 cursor-config 读）
  *   - `paths` 字段的 file-scope 过滤（V2 再做、需要知道当前 agent 在动哪些文件）
  *   - `disable-model-invocation`（slash-command 触发、SDK chat 模式用不上）
  *   - 远程 skill 拉取（飞书 / GitHub link、V2 再加）
@@ -26,6 +25,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
+
+import { getGlobalCursorDirs } from "./cursor-config";
 
 // fe-ai-flow 平台自身 skills 目录的相对路径
 // V0.3 起：从 `.fe-ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
@@ -150,19 +151,33 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
 };
 
 /**
- * 加载本次 agent 可用的「平台自带」skills（只此一类）
+ * 加载本次 agent 可用的 skills：平台自带 + 全局 `~/.cursor/skills/`
  *
- * 只扫 fe-ai-flow 平台自身 `process.cwd()/skills/`。
- * repo `.cursor/skills/` + 全局 `~/.cursor/skills/` 由 Agent.create 的
- * `settingSources: ["project"]` 交给 Cursor SDK 加载（跟 Cursor IDE 一致）、这里不重复读、
- * 否则同一份 SKILL.md 会进 prompt 两次。
+ * 两类来源（都由 fe 注入 prompt、不靠 settingSources）：
+ *   1. **平台自带** `<fe-ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
+ *   2. **全局** `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）——
+ *      `settingSources:["project"]` 只读 project 层、够不着 user 层、必须 fe 自己读
+ *
+ * 不读 repo `.cursor/skills/`（project 层、由 `settingSources:["project"]` 交给 SDK 加载、
+ * 避免同一份 SKILL.md 进 prompt 两次）。
+ *
+ * 同名去重：平台自带优先（own 覆盖 global、平台 skill 是 fe 特定行为、不该被全局同名顶掉）。
  */
 export const loadSkills = async (): Promise<SkillEntry[]> => {
-  const feAiFlowOwnRoot = path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR);
-  const ownSkills = await scanSkillsDir(feAiFlowOwnRoot);
-
+  const own = await scanSkillsDir(
+    path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
+  );
+  // 全局 ~/.cursor/skills/（user 层、settingSources["project"] 够不着、fe 自己读）
+  const global: SkillEntry[] = [];
+  for (const dir of getGlobalCursorDirs()) {
+    global.push(...(await scanSkillsDir(path.join(dir, "skills"))));
+  }
+  // 合并去重（同名平台自带优先：先放 global、再放 own 覆盖同名）
+  const byName = new Map<string, SkillEntry>();
+  for (const s of global) byName.set(s.name, s);
+  for (const s of own) byName.set(s.name, s);
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
-  return ownSkills.sort((a, b) => a.name.localeCompare(b.name));
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 };
 
 /**
@@ -177,7 +192,7 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有平台自带 skill。平台 skill 放在 fe-ai-flow `skills/<name>/SKILL.md`；仓库 / 全局 skill 走 Cursor `.cursor/skills/`、已由 settingSources 自动加载、不在此列。）";
+    return "（当前没有可用 skill。平台 skill 放在 fe-ai-flow `skills/<name>/SKILL.md`、全局 skill 走 `~/.cursor/skills/`；仓库级 skill 由 settingSources 自动加载、不在此列。）";
   }
   const lines: string[] = [];
   for (const s of skills) {

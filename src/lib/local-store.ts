@@ -9,18 +9,10 @@ import type { FeAiFlowSettings, ModelSelection } from "./types";
 
 const KEY = "fe-ai-flow:settings";
 
-// MCP 配置默认值：与 Cursor IDE 的 ~/.cursor/mcp.json 同 schema
-// 用 mcpServers 外层 wrapper 是为了让用户能直接从 IDE 配置粘贴过来
-// export 出去给 use-settings / mcp-card 等复用、避免多处独立定义漂移
-export const DEFAULT_MCP_JSON = `{
-  "mcpServers": {}
-}`;
-
 export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
   defaultModel: { id: "" },
   repos: [],
-  mcpServersJson: DEFAULT_MCP_JSON,
   username: "",
   gitHost: "",
   gitToken: "",
@@ -43,30 +35,6 @@ const readDefaultModel = (raw: unknown): ModelSelection => {
   return { id: "" };
 };
 
-// 判断 mcpServers 内层是否合法（必须是非数组的 plain object）
-const isPlainObject = (v: unknown): v is Record<string, unknown> =>
-  typeof v === "object" && v !== null && !Array.isArray(v);
-
-// mcpServersJson 字段读出来校验：必须是 `{ "mcpServers": <object> }` 形态、不然回 default
-// 老 schema 兼容（V0.5.12.2 删）：以前是裸 server map、用户 localStorage 里如果还残留就重配
-const readMcpJson = (raw: unknown): string => {
-  if (typeof raw !== "string" || !raw.trim()) return DEFAULT_MCP_JSON;
-  try {
-    const parsed = JSON.parse(raw);
-    if (
-      isPlainObject(parsed) &&
-      "mcpServers" in parsed &&
-      isPlainObject(parsed.mcpServers)
-    ) {
-      return raw;
-    }
-  } catch {
-    // 解析失败保留原文、让用户自己看到错误（settings 页会校验提示）
-    return raw;
-  }
-  return DEFAULT_MCP_JSON;
-};
-
 export const getSettings = (): FeAiFlowSettings => {
   if (!isBrowser()) return DEFAULT_SETTINGS;
   try {
@@ -74,13 +42,11 @@ export const getSettings = (): FeAiFlowSettings => {
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<FeAiFlowSettings> & {
       defaultModel?: unknown;
-      mcpServersJson?: unknown;
     };
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
       defaultModel: readDefaultModel(parsed.defaultModel),
-      mcpServersJson: readMcpJson(parsed.mcpServersJson),
       repos: Array.isArray(parsed.repos) ? parsed.repos : [],
       // V0.6 加：username 串行存档可能丢、强转 string 兜底
       username: typeof parsed.username === "string" ? parsed.username : "",

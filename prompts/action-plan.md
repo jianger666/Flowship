@@ -36,8 +36,9 @@
 
 ### 当前角色提示
 
-- **role=fe（前端）**：以本仓库视角看接口契约 / 字段语义 / 路由 / 组件 / 状态 / 文案、扫仓库找同类弹窗 / 列表 / store / hook、出方案时按仓库现有技术栈（Vue / React / Tailwind / shadcn / pinia / 等）写
-- 其他 role：当前仅 fe 一种（单值）、未来扩 be / data / mobile / qa 时按对应角色视角调整、相同结构
+- **role=fe（前端）**：看接口契约 / 字段语义 / 路由 / 组件 / 状态 / 文案、扫仓库找同类弹窗 / 列表 / store / hook、按仓库现有前端技术栈（Vue / React / Tailwind / shadcn / pinia 等）写
+- **role=be（后端）**：看接口契约 / DB schema / 领域模型 / 分层（controller-service-dao）/ 中间件 / 定时任务、扫仓库找同类 controller / service / mapper / DTO、按仓库现有后端技术栈（Spring Boot / MyBatis / Go 等）写
+- 其他 role：未来扩 data / mobile / qa 时按对应角色视角调整、相同结构
 
 ## 输入
 
@@ -75,7 +76,7 @@
 
 #### 3.1 全局摸底
 
-- 看 `package.json` / `pnpm-workspace.yaml` / 关键 lockfile、明确技术栈版本
+- 看技术栈清单文件（JS/TS: `package.json` / `pnpm-workspace.yaml`；Java: `pom.xml` / `build.gradle`；Go: `go.mod`）、明确技术栈版本
 - 看 `README.md` / `CONTRIBUTING.md`、找到 typecheck / lint 的实际命令（build action 要跑）
 - 看 `.cursor/rules/` 下的项目规则（如有）、按规则约束写方案
 
@@ -276,7 +277,7 @@ V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确
 
 ### 路径写法
 
-`改动` / `关键参考` 字段里所有文件路径遵循「跨 action 共享规范 §3 path 完整路径写法」（从仓库根 `{{repoPath}}` 起算的完整相对路径 / 已知行号写 `path:line` / 同一文件多次出现都写完整路径不简写 / 不写绝对路径）。
+`改动` / `关键参考` 字段里所有文件路径遵循「跨 action 共享规范 §3 path 完整路径写法」（从仓库根 `{{repoPath}}` 起算的完整相对路径 / 已知行号写 `path:line` / 同一文件多次出现都写完整路径不简写 / 不写绝对路径）。下面 Task 示例用前端 Vue 仓举例、后端 / 其他技术栈把文件名换成对应的（`.java` / `.go` 等）即可。
 
 ### Task 1：<动词开头的一句话>
 

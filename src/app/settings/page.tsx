@@ -3,12 +3,12 @@
 /**
  * 设置页（壳子）
  *
- * 当前 V0.1 包含 4 块配置（全部存 localStorage、不上服务器）：
+ * 配置块（除 MCP 外都存 localStorage、不上服务器）：
  *   1. Cursor API Key —— 后续所有 SDK 调用要用、可点「验证」拉模型列表
  *   2. 默认模型 —— 不预设默认值、列表通过 /api/models 动态拉
  *   3. 仓库列表 —— agent 启动时作为 cwd 用、暂时只支持本地绝对路径
  *      通过 /api/fs/pick-folder 调原生 dialog（非 macOS 走「手填路径」备份入口）
- *   4. MCP servers —— JSON 编辑器、schema 与 Cursor IDE 的 ~/.cursor/mcp.json 一致
+ *   4. MCP servers —— 只读展示 Cursor 的 ~/.cursor/mcp.json（V0.6.2 起、不再 fe 自存）
  *
  * 拆分约定：
  * - 状态管理 → src/hooks/use-settings.ts、use-models.ts
@@ -16,7 +16,6 @@
  * - 这个文件只组合：拿 hook 出来的值、传给 Card
  *
  * 不做的事（已与用户对齐）：
- * - 不一键导入 ~/.cursor/mcp.json：未来要支持远程部署、本地文件读不到
  * - 不做按 phase 配模型：留给 V0.2 之后
  * - 不预选默认模型：避免误用
  */
@@ -111,12 +110,7 @@ const SettingsPage = () => {
         onSave={() => saveField("repos")}
       />
 
-      <McpCard
-        value={settings.mcpServersJson}
-        onChange={(v) => update("mcpServersJson", v)}
-        dirty={dirty.mcpServersJson}
-        onSave={() => saveField("mcpServersJson")}
-      />
+      <McpCard />
     </div>
   );
 };
