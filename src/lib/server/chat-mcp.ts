@@ -37,9 +37,10 @@
  * - 不做 MCP session id 跨进程：本来 stateless 就够、但 wait_for_user 长阻塞必须 stateful 复用 transport
  * - 不做并发去重：同一个 task 同时只允许一个 pending entry、新 wait_for_user 顶旧的
  * - 不做 dev hot reload 状态恢复：开发时模块重载会丢 pendingMap、能接受
- * - **不做断线自动重试**：连接断了 agent 自然退 run、用户在 UI 上点「推进」、
- *   走 /advance（mode=resume）：Agent.resume + send 引导 agent 重新调 wait_for_user
- *   （避免 agent 反复重试踩 anti-loop、且老套餐 resume 也要 +1 send 配额）
+ * - **不做断线自动重试**：连接断了 agent 自然退 run、用户在 UI 上重新发起、
+ *   后端起一个新 agent 接力（task 走 /advance→advanceTask、chat 走 /chat-reply→runChatSession、
+ *   都是 Agent.create + send、靠任务事件日志恢复上下文、不是 resume 原会话）
+ *   （避免 agent 反复重试踩 anti-loop、且每次起 agent +1 send 配额）
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -152,15 +153,15 @@ interface PendingEntry {
 //   - 一次 ask_user 调用 = 一组问题 questions[]（不再一次一问、避免反复弹窗 + 拉长对话节奏）
 //   - UI 用 modal dialog 而不是 inline 卡片、ABCD 字母前缀
 //   - 跟 AskUserQuestion / AskUserAnswer 类型定义保持一致（types.ts）
-export type AskUserOption = { id: string; label: string };
-export type AskUserQuestion = {
+type AskUserOption = { id: string; label: string };
+type AskUserQuestion = {
   id: string;
   question: string;
   options?: AskUserOption[];
   allowText: boolean;
 };
 
-export type AwaitingSignal =
+type AwaitingSignal =
   | {
       kind: "awaiting_start";
       // V0.6：传 action_id（agent 正在 ack 该 action）或不传（agent 在等下一 action 指令）
@@ -193,7 +194,7 @@ export type AwaitingNotifier = (signal: AwaitingSignal) => Promise<void> | void;
 //   - awaitingNotifier 是「单向事件通知」（runner 用来更新 task 状态）、没返回值
 //   - taskActionHandler 是「同步 RPC」（agent 调 MCP 工具拿结果）、有结构化返回值
 
-export type ChatTaskAction =
+type ChatTaskAction =
   | {
       kind: "submit_mr";
       actionId: string;
@@ -215,7 +216,7 @@ export type ChatTaskAction =
       userIds: string[];
     };
 
-export type ChatTaskActionResult =
+type ChatTaskActionResult =
   | { ok: true; data?: Record<string, unknown> }
   | { ok: false; error: string };
 
@@ -735,7 +736,7 @@ const buildShellWaitGuidance = (
     "  - **不要重新调 shell 重试** —— anti-loop 风险、且重试不能恢复连接",
     "  - **不要重新调 wait_for_user / ask_user** —— 会被服务端顶替成 stale",
     "  - **直接 emit 一条简短 assistant_message** 说「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、然后自然结束 run",
-    "  - UI 已经监测到连接断、用户会手动点「推进」→ 在弹窗里选「让原 agent 继续推进」、后端会用 `Agent.resume()` 把你叫醒、你重新调 wait_for_user 即可",
+    "  - UI 已经监测到连接断、用户会手动点「推进」复活——后端会起一个 agent 接着推进（带任务事件日志恢复上下文）、你这个 run 自然退出即可、不用自救",
     "",
     "## 调用礼仪",
     "",
@@ -1007,6 +1008,10 @@ const buildMcpServer = (): McpServer => {
         "2. 用 `git rev-parse HEAD` 拿当前最新 commit hash、作为 `last_commit_hash` 入参",
         "3. 用 `git config --get remote.origin.url` 拿 GitLab project path（如 `wkid/crm-web`）",
         "",
+        "## 再次 ship 幂等（重要）",
+        "",
+        "同一仓再次 ship（累计 commit / 解冲突后重跑）直接再调本工具即可、server 会自动复用现有 open MR（不会重复建、不会报「已存在」）——你只管 push 新 commit + 调本工具、MR 自动跟踪。",
+        "",
         "## 多仓 task：每仓调一次本工具",
         "",
         "ship action 内部如果 task 涉及多个仓、对每个仓独立 `cd` + `git push` + 本工具调用、每仓拿一条 MR。",
@@ -1014,13 +1019,22 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 返回值",
         "",
-        "成功：`{ ok: true, data: { mr_url: \"https://gitlab.../merge_requests/123\", mr_iid: 123, mr_version: 2 } }`",
+        "成功：`{ ok: true, data: { mr_url, mr_iid, mr_version, has_conflicts, merge_status, merge_undetermined } }`",
         "  - `mr_url`：MR 网页 URL、直接给用户点开",
         "  - `mr_iid`：GitLab project 内 MR 编号（用户看到的 !N、不是全局 ID）",
         "  - `mr_version`：本仓累计 push 次数（首次=1、之后每次 ship ++、用于在 MR description 里标 `v2 / v3` 等）",
+        "  - `has_conflicts`：**重点**——本 MR 跟 `test` 有没有冲突、`true` = 合不了、按下方铁律处理",
+        "  - `merge_status`：GitLab detailed_merge_status 原值（mergeable / conflict / checking ...）、审计用",
+        "  - `merge_undetermined`：GitLab 还在异步算可合性、本次没查准（保守当无冲突、可在 artifact 注明待人工复核）",
+        "",
+        "## ⚠️ has_conflicts=true 时（铁律、不许违反）",
+        "",
+        "1. **绝不**自己 `git merge` / `rebase` / `pull` 把 `test` 的内容合进 feature 分支去解冲突——保持 feature 干净、解冲突是用户的事",
+        "2. **不**发飞书评论——飞书 @ 评论只在「所有仓 MR 都无冲突」时才发、不能把合不了的 MR 甩给测试人员",
+        "3. 调 `ask_user` 把「<仓名> MR 跟 test 有冲突、链接 <mr_url>、请你手动解决后回复继续」抛给用户、等用户解完再重跑 ship",
         "",
         "失败：`{ ok: false, error: \"<人类可读错误>\" }`",
-        "  - 常见错误：token 失效 / project 不存在 / branch 不存在 / 已有同 source MR、agent 把错误内容简短告诉用户即可、不要自己重试",
+        "  - 常见错误：token 失效 / project 不存在 / branch 不存在（push 没成功）、agent 把错误内容简短告诉用户即可、不要自己重试",
         "",
         "## 调用礼仪",
         "",
@@ -1550,7 +1564,7 @@ export const getChatMcpUrl = (): string => {
  * 注意：必须 agent 本机能访问到的 URL。本机跑 dev 一般 127.0.0.1:8876、
  * agent 跑在 cloud / 容器时要靠 FE_AI_FLOW_BASE_URL 显式注入。
  */
-export const getServerBaseUrl = (): string => {
+const getServerBaseUrl = (): string => {
   const base = process.env.FE_AI_FLOW_BASE_URL;
   if (base && base.trim().length > 0) {
     return base.replace(/\/+$/, "");

@@ -170,7 +170,7 @@ export const buildCursorLink = (
  *
  * 注意：返值不带尾 slash（除非就是根目录 `/`）。
  */
-export const getCommonParentDir = (paths: string[]): string => {
+const getCommonParentDir = (paths: string[]): string => {
   if (paths.length === 0) return "";
   if (paths.length === 1) return paths[0].replace(/\/+$/, "");
   const segArrays = paths.map((p) =>
@@ -220,7 +220,7 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
  *
  * 单仓不调这个（cwd 就是仓库自身、短名等于 "."、prompt 也不用列）。
  */
-export const getRepoShortNames = (
+const getRepoShortNames = (
   repoPaths: string[],
   cwd: string,
 ): string[] => {

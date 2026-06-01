@@ -56,41 +56,30 @@ export type CreateMRResult =
     };
 
 /**
- * 查询 MR 状态入参（V0.6.4+ polling 用、V0.6.1 先实现不调用）
+ * 查 MR 可合性（冲突检测）入参（V0.6.1.1 ship 冲突检测用）
  */
-export interface GetMRInput {
+export interface GetMRMergeStatusInput {
   config: GitLabConfig;
   projectPath: string;
   iid: number;
 }
-
-export type GetMRResult =
-  | {
-      ok: true;
-      state: "opened" | "closed" | "merged" | "locked";
-      mergedAt: number | null;
-      lastCommitHash: string;
-    }
-  | {
-      ok: false;
-      error: string;
-    };
 
 /**
- * MR 上加 note（评论）入参
+ * MR 可合性结果
  *
- * 当前 V0.6.1 不强求用——飞书 story 评论已经覆盖测试人员通知场景、MR 评论暂不用
- * 留接口给 V0.6.2+「ship 时同时在 MR 留 fe-ai-flow 链接」用
+ * - detailedStatus：GitLab `detailed_merge_status` 原值（mergeable / conflict / ci_must_pass / checking ...）
+ * - hasConflicts：feature 跟 target(test) 有冲突（detailed=conflict / 老字段 cannot_be_merged / has_conflicts=true）
+ * - mergeable：可干净合入
+ * - undetermined：poll 到超时 GitLab 仍在 checking（算不准、调用方当「未知」别误判成「无冲突」）
  */
-export interface AddMRNoteInput {
-  config: GitLabConfig;
-  projectPath: string;
-  iid: number;
-  body: string;
-}
-
-export type AddMRNoteResult =
-  | { ok: true; noteId: number }
+export type MRMergeStatusResult =
+  | {
+      ok: true;
+      detailedStatus: string;
+      hasConflicts: boolean;
+      mergeable: boolean;
+      undetermined: boolean;
+    }
   | { ok: false; error: string };
 
 const buildBaseUrl = (host: string): string => {
@@ -149,12 +138,56 @@ const formatGitLabError = async (res: Response): Promise<string> => {
 };
 
 /**
- * 创建 MR
+ * 查指定 source→target 的 open MR（createMR 撞 409「已有同分支 MR」时复用现有 MR 用）
+ *
+ * GitLab list MR API、按 source_branch + target_branch + state=opened 过滤、取第一条。
+ * 复用 CreateMRResult 类型（拿到的也是 url + iid、跟新建语义对调用方透明）。
+ */
+const findOpenMR = async (input: CreateMRInput): Promise<CreateMRResult> => {
+  let base: string;
+  let headers: HeadersInit;
+  try {
+    base = buildBaseUrl(input.config.host);
+    headers = buildHeaders(input.config.token);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const q = new URLSearchParams({
+    source_branch: input.sourceBranch,
+    target_branch: input.targetBranch,
+    state: "opened",
+  });
+  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests?${q.toString()}`;
+  try {
+    const res = await fetch(url, { method: "GET", headers });
+    if (!res.ok) {
+      return { ok: false, error: await formatGitLabError(res) };
+    }
+    const body = await res.json();
+    const first = Array.isArray(body) ? body[0] : undefined;
+    if (
+      !first ||
+      typeof first.web_url !== "string" ||
+      typeof first.iid !== "number"
+    ) {
+      return { ok: false, error: "未查到同 source/target 的 open MR" };
+    }
+    return { ok: true, url: first.web_url, iid: first.iid };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+};
+
+/**
+ * 创建 MR（V0.6.1.1 起幂等：撞 409「已有同分支 open MR」时自动复用现有 MR、不当失败）
  *
  * 失败常见原因：
  *   - 401：token 失效 / 权限不足
  *   - 404：project 不存在 / token 没有该 project 访问权限
- *   - 409：同 source/target branch 已存在 open MR（GitLab 错误信息会包含「Another open merge request already exists」）
+ *   - 409：同 source/target branch 已存在 open MR → 降级 findOpenMR 复用（多次 ship / 解冲突后重跑必经）
  *   - 400：source branch 不存在（push 没成功就提 MR 时常见）
  */
 export const createMR = async (
@@ -185,6 +218,14 @@ export const createMR = async (
       }),
     });
     if (!res.ok) {
+      // 409 / 422 可能是「已有同分支 open MR」（多次 ship / 解冲突后重跑必经、GitLab 版本差异两种码都出现过）
+      // 也可能是别的验证错误（如 source branch 不存在）——先试 findOpenMR 复用、
+      //   查到就视同建好、查不到退回原始错误（不拿「复用失败」掩盖真因）
+      if (res.status === 409 || res.status === 422) {
+        const existing = await findOpenMR(input);
+        if (existing.ok) return existing;
+        return { ok: false, error: await formatGitLabError(res) };
+      }
       return { ok: false, error: await formatGitLabError(res) };
     }
     const body = await res.json();
@@ -204,9 +245,27 @@ export const createMR = async (
 };
 
 /**
- * 查询 MR 状态（V0.6.4+ polling 用、V0.6.1 先 export 不调用）
+ * 查 MR 可合性（V0.6.1.1 ship 冲突检测）
+ *
+ * 为什么单独一个函数而不复用 getMR：
+ *   - getMR 给 V0.6.4 polling 用、读 state（opened/merged）
+ *   - 这里要的是 mergeability（能不能干净合 / 有没有冲突）、字段是 detailed_merge_status / has_conflicts
+ *
+ * ⚠️ GitLab 算 mergeability 是异步的：MR 刚建出来 detailed_merge_status 往往是
+ *   checking / unchecked / preparing、要 poll 几次才稳定。本函数内部 poll
+ *   （最多 maxPolls 次、间隔 intervalMs）：
+ *   - 命中稳定态（mergeable / conflict / ci_must_pass ...）→ 立刻返回
+ *   - poll 到超时仍在算 → undetermined=true（调用方当「算不准、别误判成无冲突」）
+ *
+ * 老 GitLab 实例没 detailed_merge_status 字段时、退回读 merge_status（can_be_merged / cannot_be_merged）。
  */
-export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
+export const getMRMergeStatus = async (
+  input: GetMRMergeStatusInput,
+  opts?: { maxPolls?: number; intervalMs?: number },
+): Promise<MRMergeStatusResult> => {
+  const maxPolls = opts?.maxPolls ?? 5;
+  const intervalMs = opts?.intervalMs ?? 1500;
+
   let base: string;
   let headers: HeadersInit;
   try {
@@ -217,100 +276,56 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
   }
 
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
-  try {
-    const res = await fetch(url, { method: "GET", headers });
+  // GitLab 仍在算 mergeability 的中间态、命中要继续 poll
+  const PENDING = new Set(["checking", "unchecked", "preparing"]);
+
+  let lastDetailed = "unchecked";
+  for (let attempt = 0; attempt < maxPolls; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(url, { method: "GET", headers });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
     const body = await res.json();
-    if (typeof body?.state !== "string") {
-      return {
-        ok: false,
-        error: `GitLab getMR 返回缺字段 state: ${JSON.stringify(body).slice(0, 200)}`,
-      };
-    }
-    return {
-      ok: true,
-      state: body.state as "opened" | "closed" | "merged" | "locked",
-      mergedAt:
-        typeof body.merged_at === "string" && body.merged_at
-          ? new Date(body.merged_at).getTime()
-          : null,
-      lastCommitHash: typeof body?.sha === "string" ? body.sha : "",
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-};
+    // detailed_merge_status 优先（GitLab 15.6+）、老实例退回 merge_status
+    const detailed: string =
+      typeof body?.detailed_merge_status === "string"
+        ? body.detailed_merge_status
+        : typeof body?.merge_status === "string"
+          ? body.merge_status
+          : "unchecked";
+    lastDetailed = detailed;
+    const hasConflictsField = body?.has_conflicts === true;
 
-/**
- * MR 上加 note（V0.6.2+ 用、V0.6.1 先 export 不调用）
- */
-export const addMRNote = async (
-  input: AddMRNoteInput,
-): Promise<AddMRNoteResult> => {
-  let base: string;
-  let headers: HeadersInit;
-  try {
-    base = buildBaseUrl(input.config.host);
-    headers = buildHeaders(input.config.token);
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    // 还在算 + 不是最后一次 → 等一下再 poll
+    if (PENDING.has(detailed) && attempt < maxPolls - 1) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
+
+    const undetermined = PENDING.has(detailed);
+    // 冲突判定：detailed=conflict / 老字段 cannot_be_merged / has_conflicts=true 任一命中
+    const hasConflicts =
+      detailed === "conflict" ||
+      detailed === "cannot_be_merged" ||
+      hasConflictsField;
+    const mergeable = detailed === "mergeable" || detailed === "can_be_merged";
+    return { ok: true, detailedStatus: detailed, hasConflicts, mergeable, undetermined };
   }
 
-  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}/notes`;
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ body: input.body }),
-    });
-    if (!res.ok) {
-      return { ok: false, error: await formatGitLabError(res) };
-    }
-    const body = await res.json();
-    if (typeof body?.id !== "number") {
-      return {
-        ok: false,
-        error: `GitLab addMRNote 返回缺字段 id: ${JSON.stringify(body).slice(0, 200)}`,
-      };
-    }
-    return { ok: true, noteId: body.id };
-  } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-};
-
-/**
- * 从 remote.origin.url 解析 GitLab projectPath
- *
- * 支持 ssh / https 两种格式：
- *   - git@gitlab.wukongedu.net:wkid/crm-web.git → { host: "gitlab.wukongedu.net", projectPath: "wkid/crm-web" }
- *   - https://gitlab.wukongedu.net/wkid/crm-web.git → 同上
- *   - https://gitlab.wukongedu.net/wkid/sub/crm-web → { host, projectPath: "wkid/sub/crm-web" }
- *
- * 工具函数 export 给 task-runner 使用、agent 也能在 prompt 里调（虽然 prompt 里直接让 agent shell 处理更清晰）
- */
-export const parseGitLabRemoteUrl = (
-  remoteUrl: string,
-): { host: string; projectPath: string } | null => {
-  const trimmed = remoteUrl.trim();
-  if (!trimmed) return null;
-  // ssh 格式：git@host:group/repo.git
-  const sshMatch = /^[^@]+@([^:]+):(.+?)(?:\.git)?$/.exec(trimmed);
-  if (sshMatch) {
-    return { host: sshMatch[1], projectPath: sshMatch[2] };
-  }
-  // https 格式：https://host/group/repo(.git)?
-  const httpsMatch = /^https?:\/\/([^/]+)\/(.+?)(?:\.git)?$/.exec(trimmed);
-  if (httpsMatch) {
-    return { host: httpsMatch[1], projectPath: httpsMatch[2] };
-  }
-  return null;
+  // 兜底（循环里最后一次必 return、正常到不了这）
+  return {
+    ok: true,
+    detailedStatus: lastDetailed,
+    hasConflicts: false,
+    mergeable: false,
+    undetermined: true,
+  };
 };

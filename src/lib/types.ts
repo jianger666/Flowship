@@ -65,7 +65,7 @@ export interface ModelParameter {
  * 模型预设组合（如 "Opus 4.7 thinking xhigh"）
  * SDK 直接返、用户选 variant 时可以直接拿到完整 params 数组。
  */
-export interface ModelVariant {
+interface ModelVariant {
   params: Array<{ id: string; value: string }>;
   displayName: string;
   description?: string;
@@ -180,8 +180,7 @@ export interface ActionRecord {
   /**
    * 副作用记录（对外部世界的影响）
    *
-   * V0.6.1：ship 改成多仓数组——同一 ship action 多仓场景产出 N 条 MR、
-   *   一仓 1 条记录；feishuCommentId 仍是 1 个（1 条评论拼多仓 MR 链接）
+   * V0.6.1：ship 改成多仓数组——同一 ship action 多仓场景产出 N 条 MR、一仓 1 条记录
    * - test: agent 起服务 / 用例结果摘要（V0.6.2 上线时再细化字段）
    */
   sideEffects?: {
@@ -191,12 +190,9 @@ export interface ActionRecord {
       mrVersion: number;
       branch: string;
       commitHash: string;
+      /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突（true 时 ship 不发飞书评论、checkShip 判不干净） */
+      hasConflicts?: boolean;
     }>;
-    /**
-     * 飞书 story 评论 id。V0.6.1 暂不落库（agent 把 comment id 记在 ship artifact §4 文本里）、
-     * 字段预留给 V0.6.4 MR 状态 polling——届时回写评论需要 comment id 定位、不要当死字段删。
-     */
-    feishuCommentId?: string;
   };
 
   /**
@@ -250,11 +246,21 @@ export interface MRRecord {
    * version 是「push 次数」、lastCommitHash 是「当前最新 commit」、互补
    */
   lastCommitHash?: string;
-  createdByActionId: string;
   /**
-   * V0.6.4+ polling MR 状态时记最后一次查询的 timestamp
+   * V0.6.1.1：本仓 MR 跟 target(test) 是否有冲突
+   * 每次 ship push 后 server poll GitLab detailed_merge_status 写入：
+   * - true：feature 跟 test 冲突、待用户手动解决（AI 绝不 merge/rebase test→feature）；
+   *   有冲突时 ship 不发飞书评论（不能让测试人员收到合不了的 MR）、checkShip 也判 ship 不干净
+   * - false：可干净合 / 无冲突
+   * - undefined：还没检测 / GitLab 还在异步算（undetermined）
    */
-  lastChecked?: number;
+  hasConflicts?: boolean;
+  /**
+   * V0.6.1.1：GitLab detailed_merge_status 原值（mergeable / conflict / ci_must_pass / checking ...）
+   * 留作审计 + UI 展示「为什么没法合」
+   */
+  mergeStatus?: string;
+  createdByActionId: string;
 }
 
 /**
@@ -482,7 +488,6 @@ export interface Task {
   archived: boolean;
   createdAt: number;
   updatedAt: number;
-  lastAgentId?: string;
   model?: ModelSelection;
   uiLayout?: { artifactPanelSize?: number };
   events: TaskEvent[];

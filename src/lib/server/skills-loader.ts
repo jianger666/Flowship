@@ -3,18 +3,19 @@
  *
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
- * 设计要点（用户已拍板）：
- *   - **两类来源**：
- *     1. `<fe-ai-flow>/skills/`：fe-ai-flow 平台自带（跟 git 仓库一起发布、所有用户共享）
- *     2. `<repo>/.cursor/skills/`：工作仓库自己的（直接复用 Cursor 标准约定、跟 rules 共用 .cursor/ 根）
- *        → 用户的项目仓库本来就有 `.cursor/` 目录（rules / 配置）、skills 跟着进 .cursor/skills/ 即可
- *        → 同一份 SKILL.md 既能给 fe-ai-flow chat 用、又能直接给 Cursor IDE 加载
+ * 设计要点（用户已拍板、2026-05-29 起单一来源、配合 settingSources 双向绑定）：
+ *   - **只加载 fe-ai-flow 平台自带** `<fe-ai-flow>/skills/`（跟 git 仓库一起发布、所有用户共享）
+ *   - **repo + 全局 skills 不在这里读**：task-runner / chat-runner 的 Agent.create 开了
+ *     `settingSources: ["project"]`、Cursor SDK 会按 Cursor 标准自动加载目标仓库 `.cursor/skills/`
+ *     + 全局 `~/.cursor/skills/`（跟 Cursor IDE 行为一致）。fe 这里再读一遍 = 同一份 SKILL.md
+ *     进 prompt 两次、故只管「SDK 盖不到的平台自带」——settingSources 的 cwd=目标仓库、
+ *     够不着 fe-ai-flow 自己的 `skills/`、那一份必须靠本 loader 注入。
  *   - **progressive loading**：启动 agent 时只把每个 skill 的 name + description + absPath 拼进 prompt、
  *     agent 看到场景匹配时**主动用 `read` 工具读** 完整 SKILL.md 拿到详情。
  *     节省 prompt token、跟 Cursor IDE 加载行为一致。
  *
  * 不做的事（V1）：
- *   - 读 `<repo>/.cursor/rules/` 注入 prompt（rules 是另一层机制、下一轮再讨论）
+ *   - 读 `<repo>/.cursor/rules/` 注入 prompt（rules 由 settingSources 交给 SDK 加载）
  *   - `paths` 字段的 file-scope 过滤（V2 再做、需要知道当前 agent 在动哪些文件）
  *   - `disable-model-invocation`（slash-command 触发、SDK chat 模式用不上）
  *   - 远程 skill 拉取（飞书 / GitHub link、V2 再加）
@@ -31,10 +32,6 @@ import matter from "gray-matter";
 // 命名直白、避免「fe-ai-flow inside fe-ai-flow」的冗余目录层
 const FE_AI_FLOW_OWN_SKILLS_DIR = "skills";
 
-// 工作仓库的 skills 目录：直接复用 Cursor IDE 约定的 .cursor/skills/
-// 用户的项目仓库已经有 .cursor/（rules + 配置）、skills 跟进同目录、双向共用
-const REPO_SKILLS_DIR = ".cursor/skills";
-
 // 递归深度上限：防止 skills 嵌套过深、扫描爆栈 / 卡 IO
 // 实际 SKILL.md 一般 2~3 层（category/skill-name/SKILL.md）、5 层够用
 const MAX_SCAN_DEPTH = 5;
@@ -48,22 +45,15 @@ export interface SkillEntry {
   paths?: string[];
   // SKILL.md 绝对路径、agent 用这个调 `read` 工具读
   absPath: string;
-  // 来源：fe-ai-flow 自带 / 工作仓库专属
-  // UI 可能展示标签、prompt 里 agent 也能区分「项目通用」vs「这个仓库特化」
-  source: "fe-ai-flow" | "repo";
 }
 
 /**
  * 递归扫描某个目录下所有 SKILL.md
  *
  * @param rootDir   要扫的根目录绝对路径
- * @param source    来源标签
  * @returns         所有解析出的 SkillEntry（解析失败的 silent skip）
  */
-const scanSkillsDir = async (
-  rootDir: string,
-  source: "fe-ai-flow" | "repo",
-): Promise<SkillEntry[]> => {
+const scanSkillsDir = async (rootDir: string): Promise<SkillEntry[]> => {
   // 目录不存在 / 不可读、直接当作 0 个 skill、不抛错
   // skill 是「可选能力」、没装就是没装、不该让 chat 启动失败
   try {
@@ -96,7 +86,7 @@ const scanSkillsDir = async (
       // 只要文件名是 SKILL.md（大小写不敏感、避免 macOS HFS+ 大小写差异）
       if (ent.name.toUpperCase() !== "SKILL.MD") continue;
       try {
-        const parsed = await parseSkillFile(abs, source);
+        const parsed = await parseSkillFile(abs);
         if (parsed) found.push(parsed);
       } catch (err) {
         console.warn(
@@ -120,10 +110,7 @@ const scanSkillsDir = async (
  *
  * 缺失 name / description 视为非法 skill、return null
  */
-const parseSkillFile = async (
-  absPath: string,
-  source: "fe-ai-flow" | "repo",
-): Promise<SkillEntry | null> => {
+const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
   const raw = await fs.readFile(absPath, "utf-8");
   const parsed = matter(raw);
   const data = parsed.data as Record<string, unknown>;
@@ -159,54 +146,30 @@ const parseSkillFile = async (
     description,
     paths,
     absPath,
-    source,
   };
 };
 
 /**
- * 加载本次 agent 可用的所有 skills
+ * 加载本次 agent 可用的「平台自带」skills（只此一类）
  *
- * @param repoPath 当前任务工作仓库的绝对路径（agent cwd）；可为空（设置页未配仓库时）
- *
- * 加载顺序：
- *   1. fe-ai-flow 平台自身（process.cwd()/skills/）
- *   2. 工作仓库（repoPath/.cursor/skills/、repoPath 非空时）— 跟 Cursor IDE 共用同一份 SKILL.md
- *
- * 同名 skill 的处理：**仓库自带覆盖 fe-ai-flow 平台自带**（按 skill name 去重、后写胜出）
- *   - 用户希望某个仓库定制某个 skill 时、直接在仓库 .cursor/skills/ 加同名 skill 即可
- *   - 同一份 SKILL.md 在 Cursor IDE 和 fe-ai-flow chat 里都生效
+ * 只扫 fe-ai-flow 平台自身 `process.cwd()/skills/`。
+ * repo `.cursor/skills/` + 全局 `~/.cursor/skills/` 由 Agent.create 的
+ * `settingSources: ["project"]` 交给 Cursor SDK 加载（跟 Cursor IDE 一致）、这里不重复读、
+ * 否则同一份 SKILL.md 会进 prompt 两次。
  */
-export const loadSkills = async (
-  repoPath?: string,
-): Promise<SkillEntry[]> => {
+export const loadSkills = async (): Promise<SkillEntry[]> => {
   const feAiFlowOwnRoot = path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR);
-  const repoRoot =
-    repoPath && repoPath.trim()
-      ? path.join(repoPath.trim(), REPO_SKILLS_DIR)
-      : null;
-
-  // 并行扫两处、节省 IO 等待
-  const [ownSkills, repoSkills] = await Promise.all([
-    scanSkillsDir(feAiFlowOwnRoot, "fe-ai-flow"),
-    repoRoot ? scanSkillsDir(repoRoot, "repo") : Promise.resolve([]),
-  ]);
-
-  // 合并：repo 优先级高、同名覆盖 fe-ai-flow 自带
-  const byName = new Map<string, SkillEntry>();
-  for (const s of ownSkills) byName.set(s.name, s);
-  for (const s of repoSkills) byName.set(s.name, s);
+  const ownSkills = await scanSkillsDir(feAiFlowOwnRoot);
 
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
-  return Array.from(byName.values()).sort((a, b) =>
-    a.name.localeCompare(b.name),
-  );
+  return ownSkills.sort((a, b) => a.name.localeCompare(b.name));
 };
 
 /**
  * 把 skills 渲染成 prompt 末尾的 [AVAILABLE_SKILLS] 段
  *
  * 每个 skill 占 3 行：
- *   - skill_name (source)
+ *   - skill_name
  *   - desc: 单行简介
  *   - path: 绝对路径（agent 调 `read` 工具用）
  *
@@ -214,11 +177,11 @@ export const loadSkills = async (
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有可用 skill。skill 放在 fe-ai-flow 平台 `skills/<name>/SKILL.md`、或工作仓库 `.cursor/skills/<name>/SKILL.md`。）";
+    return "（当前没有平台自带 skill。平台 skill 放在 fe-ai-flow `skills/<name>/SKILL.md`；仓库 / 全局 skill 走 Cursor `.cursor/skills/`、已由 settingSources 自动加载、不在此列。）";
   }
   const lines: string[] = [];
   for (const s of skills) {
-    lines.push(`- **${s.name}** (${s.source})`);
+    lines.push(`- **${s.name}**`);
     lines.push(`  desc: ${s.description.replace(/\n/g, " ")}`);
     lines.push(`  path: ${s.absPath}`);
     if (s.paths && s.paths.length > 0) {

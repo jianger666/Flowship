@@ -77,7 +77,7 @@ export const prepareRunArgs = (
  *
  * 失败时 toast + 返 null（语义跟 prepareRunArgs 一致）。
  */
-export const prepareBootArgs = (
+const prepareBootArgs = (
   task: Task,
   options: PrepareRunArgsOptions = {},
 ): Omit<RunArgs, "model"> | null => {

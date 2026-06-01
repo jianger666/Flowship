@@ -32,6 +32,37 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 ---
 
+## 配置双向绑定 Cursor（settingSources 方案、2026-05-29 验证 + 部分实装）
+
+> 调研结论已落地大半：task-runner / chat-runner 两处 `Agent.create` 已开 `settingSources:["project"]`、skills-loader 已去重（只读平台自带）。**剩余待办**：禁用 fe 端 MCP 编辑 UI（待办 4）+ 核查 Next.js 环境 ripgrep（待办 5）。
+
+**决策方向**：fe-ai-flow 定位「锦上添花」、配置不自己维护、直接消费 Cursor 的全局 + 项目配置（`~/.cursor/` + repo `.cursor/`）。
+- 手段：`Agent.create({ local: { cwd, settingSources: ["project"] } })`（task-runner + chat-runner 两处）→ **✅ 已实装（2026-05-29）**
+- 配套：**禁用 fe 端 MCP 编辑 UI**、MCP / rules / skills 的增减统一回 Cursor 改、fe 只读不写（回避「写坏用户 IDE 配置」风险）→ ⏳ 待办（待办 4）
+
+**实测已确认**（2026-05-29、用 `@cursor/sdk` 探针 + fixture 仓库跑两组对照、agent 全程无工具、纯凭上下文命中暗号）：
+- `settingSources: []`（默认）→ rules / skills 全不加载（inline only）
+- `settingSources: ["project"]` → 加载 repo + 全局 `.cursor/rules/`（实测 ruleCount）+ repo + 全局 `.cursor/skills/`（实测 skillCount、含 `~/.cursor/skills/` 那一堆全局 skill）
+- 即 settingSources 是**层级粗开关**：一开 project = repo rules + 全局 rules + repo skills + 全局 skills +（同理）repo/全局 mcp + hooks 全家桶。定位「和 Cursor 一致」后、这些连带大多是 feature 不是 bug。
+
+**✅ 头号风险已验证（2026-05-29 探针实测、`scripts/probe-mcp-*.mjs`）· chat-tool MCP 共存安全**（两组对照探针）：
+- 探针手法：开 `settingSources:["project"]` + inline `mcpServers` 注入零依赖手写 stdio MCP（spawn / 工具调用各落 `/tmp/probe-mcp-<role>.log`、读日志判定、不靠 agent 自我报告）。
+- **结论 1（不同名来源、`probe-mcp-coexist.mjs`）：叠加、不覆盖。** inline=probeInline + repo `.cursor/mcp.json`=probeProject（两个不同 key）→ 两个 server 都被 spawn、两个工具 agent 都调通（`PROBE-INLINE-OK` + `PROBE-PROJECT-OK`）。即 **chat-tool（inline 的 feAiFlowChat）开 settingSources 后不会丢、安全**；且 settingSources 确实加载 repo `.cursor/mcp.json`（Q1=是、MCP 双向绑定可行）。
+- **结论 2（同名 key 冲突、`probe-mcp-conflict.mjs`）：inline 赢、双保险。** inline 跟 repo `.cursor/mcp.json` 用**同一个 server key**（probeShared）时——两进程**都被 spawn**（SDK 进程层不去重、project 进程也 initialize + tools/list 了），但**工具层 inline 覆盖 project**：agent 工具列表里只有 inline 的工具、project 的工具根本不暴露（agent 原话「probeShared 上只有 probe_inline_tool」）。即 **chat-tool 哪怕撞了用户 Cursor 配置的同名 key、agent 用的也是 fe 的 inline 版**（inline 优先级 > settingSources）。小代价：同名时多 spawn 一个没用的 project 进程（无害、且 chat-tool 用独特 key 根本不会撞）。
+- 副产品：日志 `skillCount: 13` 来自全局 `~/.cursor/skills`（fixture 自己没 skills）、印证 settingSources 连带加载全局 skills、对应下方「skills 别重复」待办。
+- ⚠️ 实测脚本对 stdio MCP 用「server spawn cwd 可能是目标仓库 /tmp」这点踩过坑：探针 server 必须零 npm 依赖（手写 JSON-RPC）、否则 import 阶段崩、日志写不出会误判成「没加载」。
+
+**✅ 已清理 · skills 不重复（2026-05-29 实装）**：
+- `skills-loader.ts` 现在**只读平台自带** `<fe-ai-flow>/skills/`（去掉了 repo `.cursor/skills/` 扫描 + `source` 维度 + 同名去重逻辑、`loadSkills()` 改无参）。
+- repo + 全局 skills 交给 settingSources（SDK 按 Cursor 标准加载）、不再由 loader 二次注入 → 同一 skill 不会进 prompt 两次。
+
+**留心 / 副产品发现**：
+- hooks 会被 settingSources 连带加载、留意副作用。
+- **ripgrep 配置**：独立 SDK 进程（非 Next.js）跑 local agent 会报 `Ripgrep path not configured`、需把 `@cursor/sdk-darwin-arm64/bin` 加进 PATH（让内部 `resolveRipgrepFromPath` 命中）或调内部 `configureRipgrepPath`。**待核查 task-runner 在 Next.js 环境下 agent 的 grep 能力是否也受影响**（若受影响、agent 搜代码能力打折、属独立 bug）。
+- `~/.cursor/mcp.json` 里 token 是明文、若 fe 读取展示务必脱敏。
+
+---
+
 ## V0.7+ 候选（V0.6 系列稳定后再启动）
 
 ### V0.7 · Cost / Token Dashboard

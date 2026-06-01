@@ -114,7 +114,7 @@ const actionArtifactFilename = (n: number, type: ActionType): string =>
  * 给单条 action 算 artifact 相对路径（meta 里 `ActionRecord.artifactPath` 存这个）
  * 例：`actions/1-plan.md`
  */
-export const actionArtifactRelPath = (n: number, type: ActionType): string =>
+const actionArtifactRelPath = (n: number, type: ActionType): string =>
   `${ACTIONS_DIR}/${actionArtifactFilename(n, type)}`;
 
 /**
@@ -263,7 +263,6 @@ interface TaskMetaV06 {
   archived: boolean;
   createdAt: number;
   updatedAt: number;
-  lastAgentId?: string;
   model?: ModelSelection;
   uiLayout?: { artifactPanelSize?: number };
 }
@@ -548,7 +547,6 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
-    lastAgentId: meta.lastAgentId,
     model: meta.model,
     uiLayout: meta.uiLayout,
     events,
@@ -579,7 +577,6 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
-    lastAgentId: meta.lastAgentId,
     model: meta.model,
     uiLayout: meta.uiLayout,
     actionCount: meta.actions.length,
@@ -683,7 +680,7 @@ const runBootRecovery = async (): Promise<void> => {
   }
 };
 
-export const ensureBootRecovery = async (): Promise<void> => {
+const ensureBootRecovery = async (): Promise<void> => {
   const g = globalThis as unknown as Record<string, Promise<void> | undefined>;
   if (g[RECOVERY_FLAG]) {
     await g[RECOVERY_FLAG];
@@ -935,17 +932,6 @@ export const setTaskDisabledMcpServers = async (
     return await hydrateTask(meta);
   });
 
-export const setTaskLastAgentId = async (
-  id: string,
-  agentId: string | undefined,
-): Promise<void> =>
-  withTaskLock(id, async () => {
-    const meta = await readMetaV06(id);
-    if (!meta) return;
-    meta.lastAgentId = agentId;
-    await writeMeta(meta);
-  });
-
 export const setTaskArchived = async (
   id: string,
   archived: boolean,
@@ -1084,6 +1070,8 @@ export const appendActionSideEffectMR = async (
     mrVersion: number;
     branch: string;
     commitHash: string;
+    /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突 */
+    hasConflicts?: boolean;
   },
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
@@ -1214,6 +1202,10 @@ export const upsertMR = async (
     status: MRRecord["status"];
     createdByActionId: string;
     lastCommitHash?: string;
+    /** V0.6.1.1：本仓 MR 跟 test 是否有冲突（每次 ship push 后 poll GitLab 写） */
+    hasConflicts?: boolean;
+    /** V0.6.1.1：GitLab detailed_merge_status 原值 */
+    mergeStatus?: string;
   },
 ): Promise<{ task: Task; mr: MRRecord } | null> =>
   withTaskLock(taskId, async () => {
@@ -1231,6 +1223,9 @@ export const upsertMR = async (
         branch: input.branch,
         status: input.status,
         lastCommitHash: input.lastCommitHash ?? old.lastCommitHash,
+        // 每次 ship 重新检测冲突、用新值覆盖（解决冲突后再 ship 应翻回无冲突）
+        hasConflicts: input.hasConflicts ?? old.hasConflicts,
+        mergeStatus: input.mergeStatus ?? old.mergeStatus,
         version: old.version + 1,
       };
       meta.mrs = [
@@ -1246,6 +1241,8 @@ export const upsertMR = async (
         branch: input.branch,
         status: input.status,
         lastCommitHash: input.lastCommitHash,
+        hasConflicts: input.hasConflicts,
+        mergeStatus: input.mergeStatus,
         createdByActionId: input.createdByActionId,
         version: 1,
         createdAt: now,
@@ -1256,29 +1253,4 @@ export const upsertMR = async (
     await writeMeta(meta);
     const task = await hydrateTask(meta);
     return { task, mr: nextMR };
-  });
-
-/**
- * patch MR 状态（V0.6.4+ polling 用、V0.6.1 留接口暂不调）
- *
- * 按 repoPath 匹配（单仓 1 条记录、不需要 version 联合 key）
- */
-export const patchMR = async (
-  taskId: string,
-  repoPath: string,
-  patch: Partial<Pick<MRRecord, "status" | "lastChecked" | "mergedAt">>,
-): Promise<Task | null> =>
-  withTaskLock(taskId, async () => {
-    const meta = await readMetaV06(taskId);
-    if (!meta) return null;
-    const idx = meta.mrs.findIndex((m) => m.repoPath === repoPath);
-    if (idx < 0) return null;
-    meta.mrs = [
-      ...meta.mrs.slice(0, idx),
-      { ...meta.mrs[idx]!, ...patch },
-      ...meta.mrs.slice(idx + 1),
-    ];
-    meta.updatedAt = Date.now();
-    await writeMeta(meta);
-    return await hydrateTask(meta);
   });

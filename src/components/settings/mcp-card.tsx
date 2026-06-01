@@ -29,7 +29,7 @@ import { SaveButton } from "./save-button";
 
 // MCP 配置示例：包含 stdio（npx 启动）和 http 远端两种 server 写法
 // 用户点「填入示例」会写到 textarea、可以直接编辑成自己的配置
-export const MCP_EXAMPLE_JSON = `{
+const MCP_EXAMPLE_JSON = `{
   "mcpServers": {
     "filesystem": {
       "command": "npx",
@@ -56,7 +56,7 @@ export const MCP_EXAMPLE_JSON = `{
 // 校验 MCP JSON：必须有 mcpServers 这层 wrapper、且为对象
 // 与 Cursor IDE ~/.cursor/mcp.json schema 对齐、便于直接复制粘贴
 // 不深入校单个 server 的 schema、留给 SDK 自己报错
-export const validateMcpJson = (text: string): string => {
+const validateMcpJson = (text: string): string => {
   if (!text.trim()) return "";
   try {
     const parsed = JSON.parse(text);

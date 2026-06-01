@@ -281,6 +281,7 @@ const checkReview = async (
 //   1. 收集 action.sideEffects.mrs[] 里所有 repoPath
 //   2. 跟 task.repoPaths[] 对比、缺失的仓必须在 artifact 里出现「跳过 / skip」关键词
 //   3. 所有 MR 记录的 mrUrl 非空（防编造）
+//   4. 任一 MR hasConflicts=true → ship 不算干净完成（V0.6.1.1、需用户解冲突后重跑）
 const checkShip = async (
   task: Task,
   action: ActionRecord,
@@ -316,6 +317,18 @@ const checkShip = async (
   } else if (mrRecords.length > 0) {
     sections.push(
       `✅ ${mrRecords.length} 条 MR 记录、URL 都非空：\n${mrRecords
+        .map((m) => `   - ${m.repoPath}（v${m.mrVersion}）: ${m.mrUrl}`)
+        .join("\n")}`,
+    );
+  }
+
+  // 1.5) 有冲突的 MR → ship 不算干净完成（V0.6.1.1）
+  // 冲突时 agent 应走 §3.5 ask_user、不该发飞书评论；用户解完冲突重跑 ship、冲突翻成无冲突才判干净
+  const conflictMrs = mrRecords.filter((m) => m.hasConflicts === true);
+  if (conflictMrs.length > 0) {
+    allPassed = false;
+    sections.push(
+      `❌ ${conflictMrs.length} 条 MR 跟 test 有冲突、需用户手动解决后重跑 ship：\n${conflictMrs
         .map((m) => `   - ${m.repoPath}（v${m.mrVersion}）: ${m.mrUrl}`)
         .join("\n")}`,
     );

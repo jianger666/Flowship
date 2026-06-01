@@ -46,7 +46,6 @@ import {
   setFeishuTesterUserIds,
   upsertGitBranch,
   upsertMR,
-  setTaskLastAgentId,
   setTaskRepoStatus,
   setTaskRunStatus,
   snapshotActionArtifact,
@@ -65,7 +64,7 @@ import {
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-mcp";
-import { createMR } from "./gitlab-client";
+import { createMR, getMRMergeStatus } from "./gitlab-client";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -445,13 +444,6 @@ const writeEventAndPublish = async (
 
 // ----------------- 公开 query API -----------------
 
-export const isTaskRunning = (taskId: string): boolean =>
-  runningTasks.has(taskId);
-
-export const markTaskForFork = (taskId: string): void => {
-  forkPendingTasks.add(taskId);
-};
-
 export const cancelTaskRun = (taskId: string): boolean => {
   const rec = runningTasks.get(taskId);
   if (!rec) return false;
@@ -459,7 +451,7 @@ export const cancelTaskRun = (taskId: string): boolean => {
   return true;
 };
 
-export const waitForTaskToStop = async (
+const waitForTaskToStop = async (
   taskId: string,
   timeoutMs = 8000,
 ): Promise<boolean> => {
@@ -477,7 +469,7 @@ export const waitForTaskToStop = async (
  * V0.5.7 沿用：强制清除 in-memory runner state（dev hot reload / 手改 meta.json 后用）
  * 调用方负责对 task 当前是否真的活做判断、本函数不验证
  */
-export const forceClearStaleRunnerState = (taskId: string): void => {
+const forceClearStaleRunnerState = (taskId: string): void => {
   runningTasks.delete(taskId);
   forkPendingTasks.delete(taskId);
 };
@@ -730,7 +722,8 @@ export interface AdvanceTaskInput {
   // 用户配置的 MCP servers（已解析 + 过滤）
   // chat-tool 是 runner 自己塞、不需要调用方传
   userMcpServers?: Record<string, McpServerConfig>;
-  // 强制起新 Agent（不复用 lastAgentId）；UI「换新 agent」时为 true
+  // 强制起新 Agent（即使有活 agent 待命也不续接、直接 Agent.create 新建）；UI「换新 agent」时为 true
+  // 注：非强制时「复用」的是内存里活着的 agent entry（续接 [NEXT_ACTION]）
   forceNewAgent?: boolean;
   // 设置页 username（拼 build branch 名用、缺省时不建 branch）
   username?: string;
@@ -1075,6 +1068,19 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         return { ok: false, error: result.error };
       }
 
+      // V0.6.1.1：MR 建好后 poll GitLab 可合性、检测 feature↔test 冲突
+      // GitLab 建 MR 不管有没有冲突都返回成功、冲突要单独查 detailed_merge_status；
+      // 且 GitLab 异步算 mergeability、刚建完可能还在 checking、getMRMergeStatus 内部 poll 到稳定
+      const mergeStatus = await getMRMergeStatus({
+        config: { host: gitHost, token: gitToken },
+        projectPath: taskAction.projectPath,
+        iid: result.iid,
+      });
+      // poll 失败 / 超时未定时、保守按「无冲突」处理（不误拦 ship、detailed 记 unknown 供审计）
+      const hasConflicts = mergeStatus.ok ? mergeStatus.hasConflicts : false;
+      const detailedStatus = mergeStatus.ok ? mergeStatus.detailedStatus : "unknown";
+      const mergeUndetermined = mergeStatus.ok ? mergeStatus.undetermined : true;
+
       // upsert task.mrs[]（按 repoPath、同仓多次 ship 累计 version++）
       const upserted = await upsertMR(task.id, taskAction.repoPath, {
         url: result.url,
@@ -1083,6 +1089,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         status: "open",
         createdByActionId: taskAction.actionId,
         lastCommitHash: taskAction.lastCommitHash,
+        hasConflicts,
+        mergeStatus: detailedStatus,
       });
       const mrVersion = upserted?.mr.version ?? 1;
       if (upserted) {
@@ -1097,6 +1105,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         mrVersion,
         branch: taskAction.sourceBranch,
         commitHash: taskAction.lastCommitHash,
+        hasConflicts,
       });
       if (patched) {
         publish(task.id, { kind: "task", task: patched });
@@ -1104,24 +1113,47 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         if (a) publish(task.id, { kind: "action", action: a });
       }
 
-      await writeEventAndPublish(task.id, {
-        kind: "info",
-        actionId: taskAction.actionId,
-        text: `MR 已${mrVersion > 1 ? `推送（v${mrVersion}）` : "创建"}：${result.url}`,
-        meta: {
-          repoPath: taskAction.repoPath,
-          projectPath: taskAction.projectPath,
-          mrUrl: result.url,
-          mrIid: result.iid,
-          mrVersion,
-        },
-      });
+      // 有冲突走 error 事件（红、醒目）、无冲突走 info——用户在事件流一眼看到「这条 MR 合不了」
+      const mrVerb = mrVersion > 1 ? `推送（v${mrVersion}）` : "创建";
+      if (hasConflicts) {
+        await writeEventAndPublish(task.id, {
+          kind: "error",
+          actionId: taskAction.actionId,
+          text: `MR 已${mrVerb}、但跟 ${taskAction.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
+          meta: {
+            repoPath: taskAction.repoPath,
+            projectPath: taskAction.projectPath,
+            mrUrl: result.url,
+            mrIid: result.iid,
+            mrVersion,
+            mergeStatus: detailedStatus,
+          },
+        });
+      } else {
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          actionId: taskAction.actionId,
+          text: `MR 已${mrVerb}：${result.url}`,
+          meta: {
+            repoPath: taskAction.repoPath,
+            projectPath: taskAction.projectPath,
+            mrUrl: result.url,
+            mrIid: result.iid,
+            mrVersion,
+            mergeStatus: detailedStatus,
+          },
+        });
+      }
       return {
         ok: true,
         data: {
           mr_url: result.url,
           mr_iid: result.iid,
           mr_version: mrVersion,
+          // agent 据此决策：true → ask_user 让用户解冲突、且本仓「不」发飞书评论
+          has_conflicts: hasConflicts,
+          merge_status: detailedStatus,
+          merge_undetermined: mergeUndetermined,
         },
       };
     }
@@ -1242,25 +1274,21 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       agent = await Agent.create({
         apiKey,
         model,
-        local: { cwd: getEffectiveCwd(task.repoPaths) },
+        // settingSources:["project"] = 加载目标仓库 + 全局 .cursor/ 的 rules/skills/mcp/hooks
+        //（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加生效、
+        // chat-tool 安全（同名 inline 优先、不同名共存、已探针实测、见 ROADMAP）
+        local: { cwd: getEffectiveCwd(task.repoPaths), settingSources: ["project"] },
         mcpServers: mergedMcp,
       });
       console.log(
         `[task-runner] task=${task.id} Agent.create OK agentId=${agent.agentId}`,
       );
-      try {
-        await setTaskLastAgentId(task.id, agent.agentId);
-      } catch (err) {
-        console.warn(`[task-runner] setTaskLastAgentId failed task=${task.id}`, err);
-      }
 
-      // 加载 skills + 拼 super-prompt + send
-      const skills = await loadSkills(getEffectiveCwd(task.repoPaths)).catch(
-        (err) => {
-          console.error("[task-runner] loadSkills failed", err);
-          return [] as SkillEntry[];
-        },
-      );
+      // 加载平台自带 skills（repo + 全局 skills 由 settingSources 交给 SDK 加载、不在此读、避免重复进 prompt）
+      const skills = await loadSkills().catch((err) => {
+        console.error("[task-runner] loadSkills failed", err);
+        return [] as SkillEntry[];
+      });
       const superPrompt = await buildSuperPrompt(task, skills, {
         action,
         userInstruction,

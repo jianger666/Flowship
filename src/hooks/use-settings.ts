@@ -22,7 +22,7 @@ import { toast } from "sonner";
 import { DEFAULT_SETTINGS, getSettings, saveSettings } from "@/lib/local-store";
 import type { FeAiFlowSettings } from "@/lib/types";
 
-export type SettingsField = keyof FeAiFlowSettings;
+type SettingsField = keyof FeAiFlowSettings;
 
 export interface UseSettingsResult {
   settings: FeAiFlowSettings;

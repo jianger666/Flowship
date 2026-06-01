@@ -52,7 +52,7 @@ import {
  *   - remark-gfm：支持表格 / 删除线 / 任务清单等扩展语法
  *   - 流式拼接的 markdown 可能不完整（比如开头有 ** 但还没闭合）、react-markdown 容错够好、不会炸
  */
-export const MarkdownText = ({ text }: { text: string }) => (
+const MarkdownText = ({ text }: { text: string }) => (
   <div
     className={cn(
       "prose prose-sm dark:prose-invert max-w-none wrap-break-word",

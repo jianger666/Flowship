@@ -15,10 +15,8 @@
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 import type {
   ActionRecord,
-  ActionType,
   ArtifactRevision,
   AskUserAnswer,
-  EventKind,
   NewTaskInput,
   Task,
   TaskEvent,
@@ -169,31 +167,6 @@ export const filterMcpServersByTask = (
     if (!disabled.includes(name)) next[name] = cfg;
   }
   return Object.keys(next).length > 0 ? next : undefined;
-};
-
-// ----------------- 事件 / 状态推进 -----------------
-
-interface AppendEventInput {
-  kind: EventKind;
-  actionId?: string;
-  text: string;
-  meta?: Record<string, unknown>;
-}
-
-export const appendEvent = async (
-  taskId: string,
-  ev: AppendEventInput,
-): Promise<Task> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/events`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ev),
-    },
-  );
-  const data = await handleJson<{ task: Task }>(res);
-  return data.task;
 };
 
 // ----------------- SSE 工具（V0.6 统一任务事件流） -----------------
@@ -349,45 +322,6 @@ export interface TaskBootArgs {
   model: ModelSelection;
   mcpServers?: Record<string, McpServerConfig>;
 }
-
-/**
- * V0.6 推进 task：用户选 action + 写指令 + 点推进
- *
- * 行为：
- * 1. 后端 appendAction、`runStatus → running` / `currentActionId → 新 action.id`
- * 2. 准入条件检查（V0.6 门槛 1）
- * 3. branch checkout（build 第一次跑前）
- * 4. 启 / resume / fork SDK Agent（由 task-runner 决定）
- * 5. 返回新建的 action
- *
- * @param actionType   选的 action 类型（plan / build / review / ship / test / learn）
- * @param userInstruction 用户在 textarea 写的指令（首次 plan 可空）
- * @param bootArgs     启 agent 用的参数（必传）
- * @param forceNewAgent UI 高级选项「换新 agent」勾选时为 true
- * @param agentModel   推进 dialog 高级选项里切的模型（不传沿用 task.model）
- */
-export interface AdvanceTaskInput {
-  actionType: ActionType;
-  userInstruction: string;
-  bootArgs: TaskBootArgs;
-  forceNewAgent?: boolean;
-  agentModel?: ModelSelection;
-}
-
-export const advanceTask = async (
-  taskId: string,
-  input: AdvanceTaskInput,
-): Promise<{ task: Task; action: ActionRecord }> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/advance`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
-    },
-  );
-  return await handleJson<{ ok: true; task: Task; action: ActionRecord }>(res);
-};
 
 /**
  * V0.6.0.1 chat 模式：用户在 ChatView 输入框发一条消息

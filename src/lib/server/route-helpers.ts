@@ -69,7 +69,7 @@ export const isValidMcpServers = (
  * 整批上传 size 上限（chat-reply / phase-ack 共享、防一次发 N 张超大图把服务端 + agent context 撑爆）
  * 单图 ≤ 10MB 由 task-fs.ts 内部强制
  */
-export const MAX_TOTAL_UPLOAD_BYTES = 30 * 1024 * 1024;
+const MAX_TOTAL_UPLOAD_BYTES = 30 * 1024 * 1024;
 
 interface RawImage {
   data?: string;

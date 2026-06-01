@@ -5,7 +5,7 @@
  * - 数据 schema 看 src/lib/types.ts
  */
 
-import type { FeAiFlowSettings, ModelSelection, RepoConfig } from "./types";
+import type { FeAiFlowSettings, ModelSelection } from "./types";
 
 const KEY = "fe-ai-flow:settings";
 
@@ -114,7 +114,3 @@ export const saveSettings = (next: FeAiFlowSettings): boolean => {
   }
 };
 
-export const getApiKey = (): string => getSettings().apiKey;
-export const getDefaultModel = (): ModelSelection => getSettings().defaultModel;
-export const getRepos = (): RepoConfig[] => getSettings().repos;
-export const getMcpServersJson = (): string => getSettings().mcpServersJson;

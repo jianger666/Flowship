@@ -43,7 +43,6 @@ import {
   appendEvent,
   getEventsLogPath,
   getTask,
-  setTaskLastAgentId,
   setTaskRunStatus,
 } from "./task-fs";
 import {
@@ -109,13 +108,6 @@ const runningChats = getRunnerState().runningChats;
 
 export const isChatRunning = (taskId: string): boolean =>
   runningChats.has(taskId);
-
-export const cancelChat = (taskId: string): boolean => {
-  const rec = runningChats.get(taskId);
-  if (!rec) return false;
-  rec.cancel();
-  return true;
-};
 
 // ----------------- publish 帮手（复用 task-runner SSE 通道） -----------------
 
@@ -548,20 +540,18 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     agent = await Agent.create({
       apiKey,
       model,
-      local: { cwd: getEffectiveCwd(task.repoPaths) },
+      // settingSources:["project"] = 加载目标仓库 + 全局 .cursor/ 的 rules/skills/mcp/hooks
+      //（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加生效、
+      // chat-tool 安全（同名 inline 优先、不同名共存、已探针实测、见 ROADMAP）
+      local: { cwd: getEffectiveCwd(task.repoPaths), settingSources: ["project"] },
       mcpServers: mergedMcp,
     });
 
-    // 落 lastAgentId、resume 时能拿到
-    await setTaskLastAgentId(task.id, agent.agentId).catch(() => {});
-
-    // 加载 skills（fe-ai-flow 自带 + 仓库自定义）
-    const skills = await loadSkills(getEffectiveCwd(task.repoPaths)).catch(
-      (err) => {
-        console.error("[chat-runner] loadSkills failed", err);
-        return [];
-      },
-    );
+    // 加载平台自带 skills（repo + 全局 skills 由 settingSources 交给 SDK 加载、不在此读、避免重复进 prompt）
+    const skills = await loadSkills().catch((err) => {
+      console.error("[chat-runner] loadSkills failed", err);
+      return [];
+    });
 
     const initialPrompt = buildInitialPrompt(task, skills, firstMessage);
     const run = await agent.send(initialPrompt);

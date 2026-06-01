@@ -294,6 +294,30 @@ V0.6.1 交付后一轮 review、修了 5 个真 bug + 5 项加固、`pnpm typech
 - **bug：checkShip skip 关键词单向扫**——只看「仓名后 200 字」、agent 把关键词写仓名前会漏检、改双向扫
 - **加固**：sideEffects.mrs 拼装从 task-runner「getTask→filter→patchAction」三段非原子、下沉成 task-fs `appendActionSideEffectMR`（withTaskLock 原子）；`titleSafe` 补 git ref 非法字符（~ ^ @ / 连续点 / 首尾点）；action-ship.md 补「多仓各用独立 shell」+「飞书 @ 用 lark_user_id 不能直拼文本、走工具 mention 能力」；`feishuCommentId` 注释标注「预留 V0.6.4 polling、勿删」；ROADMAP「6+1 种 action」笔误改「6 种」
 
+#### ship 冲突检测 + test→feature 铁律（2026-05-29、V0.6.1.1）
+
+用户实测发现「提测遇 MR 冲突时 agent 不管、照发飞书评论」。补一条端到端冲突门禁、保守策略（AI 不自己解冲突、`ask_user` 交用户决定）、`pnpm typecheck` ✓ / `pnpm lint` ✓：
+
+- **gitlab-client.ts 新增 `getMRMergeStatus`**：MR 建好后 poll GitLab `detailed_merge_status`（GitLab 异步算 mergeability、最多 5 次 / 1.5s 间隔）、返回 `hasConflicts / mergeable / undetermined`、老实例退回 `merge_status`（can_be_merged / cannot_be_merged）；冲突判定命中 `conflict` / `cannot_be_merged` / `has_conflicts=true` 任一
+- **createMR 幂等化**（自查发现的死锁修复）：撞 409/422「已有同分支 open MR」时降级新增的 `findOpenMR`（list MR API 按 source+target+opened 查）复用现有 MR、不再当失败（409/422 都兜、GitLab 版本差异；查不到退回原始错误不掩盖真因）。否则「解冲突后重跑 ship」/「同仓多次 ship」必撞 → `getMRMergeStatus` 不执行 → fe 侧 `hasConflicts` 永远停在 true → 飞书评论永远发不出 → 死锁。chat-mcp submit_mr 说明同步加「再次 ship 幂等」段
+- **schema**：`MRRecord` 加 `hasConflicts / mergeStatus`、`sideEffects.mrs[]` 加 `hasConflicts`；task-fs `upsertMR` / `appendActionSideEffectMR` 入参带上（每次 ship 重新检测、解完冲突再 ship 会翻回无冲突）
+- **task-runner submit_mr handler**：createMR 后调 poll、有冲突走 **error 事件**（红、醒目）/ 无冲突走 info、返回 JSON 加 `has_conflicts / merge_status / merge_undetermined`
+- **chat-mcp submit_mr 工具说明**：写清返回值 +「has_conflicts=true 铁律」（不 merge/rebase/force、不评论、走 ask_user）
+- **prompt（action-ship.md）**：push 改 fail-fast（拒推不 force）；工作流加 🔒 铁律「绝不 merge/rebase/pull test 进 feature、绝不 force push、冲突是用户的活」；新增 §3.5 冲突门禁（任一仓冲突 → 跳过飞书评论 + `ask_user` 抛给用户、解完重跑 ship）；§4 飞书评论加前置门禁（所有仓无冲突才发）；artifact §3 表加「冲突」列、反例补 3 条
+- **checkShip**：任一 MR `hasConflicts=true` → ship 判不干净（逼用户解完重跑）
+- **设计点**：冲突 ≠ 失败（MR 照建、用户才能在 GitLab 上解）、只是不评论 + 不算完成；`undetermined`（GitLab 还在算）保守当无冲突放行、artifact §6 注明待人工复核
+
+#### settingSources 双向绑定实装 + 死代码清理（2026-05-29）
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓ / `knip` 仅剩 shadcn 标准件。
+
+- **settingSources 实装**：task-runner / chat-runner 两处 `Agent.create` 开 `settingSources:["project"]`——加载目标仓库 + 全局 `.cursor/` 的 rules/skills/mcp/hooks（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加（同名 inline 优先、不同名共存、脚本探针实测、详见 ROADMAP）。配套 `skills-loader` 去重：只读平台自带 `skills/`、不再扫 repo `.cursor/skills/`（交给 settingSources）、`loadSkills()` 改无参、去掉 `source` 维度。
+- **删 `lastAgentId` 全链路**：写而不读的死链（Task/Meta 字段 + 2 处 hydrate 映射 + `setTaskLastAgentId` + 2 处调用 + import）；复活一律 `Agent.create` 新建、不依赖此字段。
+- **删 V0.6.4 预留**（用户拍板「不预留、用时再写」）：`gitlab-client` 的 `getMR` / `addMRNote` / `parseGitLabRemoteUrl`、`task-fs` 的 `patchMR`、`MRRecord.lastChecked`、`sideEffects.feishuCommentId`（⚠️ 上文 ship 上线段描述的这几个「预留 / 勿删」已删、勿再找）。
+- **删 client 死封装 / 无引用 export**：task-store `advanceTask` / `appendEvent`、chat-runner `cancelChat`、task-runner `isTaskRunning` / `markTaskForFork`、local-store 4 个 getter。
+- **删未用文件**：3 个一次性探针脚本（probe-mcp-*.mjs）+ 3 个未引用 shadcn 组件（progress / tabs / scroll-area）。
+- **收窄 21 个**内部用的多余 export（去 `export` 不删实现）；**保留** `src/components/ui/*` unused export（shadcn 标准件完整 API 面）+ shadcn/eslint 依赖（活工具链、knip 盲区）。
+
 ### V0.6.0.1：自由对话模式剥离 + 后置检查体验整改 + 推进时换模型（2026-05-27 / 2026-05-28）
 
 **整体**：用户实测 V0.6.0 发现十个体验断点、本子版本修：(1) action=chat 跟 task 容器混用导致 agent 行为漂（用户问「你好啊」、agent 当成 plan 流程闷头思考调工具）、(2) action 完成后事件流把 deterministic 后置检查的 details 一坨贴出来（用户原话「这更像是调试内容」）、(3) plan 后置检查 V0.5.6.5 黑名单 grep 把「示例 / 或」等业务高频词误报、用户拍板「方案太粗暴、不是有效约束、直接删」、(4) 中途加过 ActionTimeline 失败 chip 的 retry 快捷入口、实测语义混乱（点旧 error chip 反而打断当前 running、起一个全新 action）、用户拍板砍掉、(5) 强制起新 agent 时没法临时换模型、只能去 settings 改全局、本版加 ModelPicker、(6) 多次推 plan / build 后时间线所有 chip 同等显著、看不出哪个是「当前生效版本」、stale 版本视觉降权、(7) review 发现偏差后 edit plan 的 strikethrough 留痕方案 prompt 高摩擦（5 子点 + 位置铁则、agent 经常踩坑）、简化为「原描述不动 + 章节末尾追加 blockquote」唯一姿势、(8) advance dialog 卡片上的「推荐」微标签语义草率（has_bug→build / plan→build 这种「流程顺推」也叫推荐显得 AI 在 narrate）、删微标签 + 删「error→同 type」那条 retry 残留 + 函数重命名为 `inferDefaultActionType`、保留默认选中作为「减少首次点击」的 UX 工具、(9) review artifact 里写「`actions/5-plan.md` §1」点击被当业务仓库路径跳 Cursor、报「找不到文件」、修 `looksLikeArtifactRef` 让它能识别 `actions/N-type.md` 这种带前缀的形式、命中后走 task 内 tab 跳转、(10) review 表格备注「同上：244-248」省略文件名导致整列点不开、`_shared.md §3` prompt 加严禁用「同上 / ↑ / ditto」类简写、表格 row 同一文件多个引用强制合并到一行用顿号分隔。`pnpm typecheck` ✓ / `pnpm lint` ✓。

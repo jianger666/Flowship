@@ -49,7 +49,7 @@ const DEFAULT_MAX_IMAGES = 6;
  * - dataUrl: 完整 data: URL（含 mime 前缀）、给 <img> src 预览用
  * - data: 纯 base64（不带前缀）、发送时塞 POST body
  */
-export interface PendingImage {
+interface PendingImage {
   id: string;
   file: File;
   dataUrl: string;
