@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.32.0",
   "engines": {
     "node": ">=22"
   },
@@ -39,6 +40,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
     "@tailwindcss/postcss": "^4.2.4",
     "@tailwindcss/typography": "^0.5.19",
     "@types/node": "^22.10.0",
@@ -58,6 +60,12 @@
   "pnpm": {
     "overrides": {
       "sqlite3": "^6.0.1"
-    }
+    },
+    "onlyBuiltDependencies": [
+      "sqlite3",
+      "sharp",
+      "unrs-resolver",
+      "msw"
+    ]
   }
 }
