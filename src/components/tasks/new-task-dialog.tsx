@@ -76,6 +76,10 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
   // 飞书项目链接（仅 task 模式必填、chat 模式不展示）
   const [feishuStoryUrl, setFeishuStoryUrl] = useState("");
+  // V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、用户已自己建分支做了一部分时填、build 复用不另建）
+  const [featureBranches, setFeatureBranches] = useState<
+    Record<string, string>
+  >({});
   // 仓库下拉源、open 时从 settings 同步过来
   const [repos, setRepos] = useState<RepoConfig[]>([]);
   // 用户配置的 MCP server 列表（从 Cursor ~/.cursor/mcp.json 读、open 时拉）
@@ -116,6 +120,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     setTitle("");
     setRepoPaths([]);
     setFeishuStoryUrl("");
+    setFeatureBranches({});
     setDisabledMcp([]);
     setMcpExpanded(false);
     setPickedModelId("");
@@ -162,6 +167,14 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         if (branch) repoBaseBranches[p] = branch;
       }
 
+      // V0.6.3：per-repo「已有工作分支」覆盖（用户填了才带、key 限定已选仓、去空）
+      //   填了 build 复用这个分支（他的代码都在）、不另建算法名分支
+      const repoFeatureBranches: Record<string, string> = {};
+      for (const p of repoPaths) {
+        const b = featureBranches[p]?.trim();
+        if (b) repoFeatureBranches[p] = b;
+      }
+
       const task = await createTask({
         mode,
         role,
@@ -171,6 +184,10 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         repoBaseBranches:
           Object.keys(repoBaseBranches).length > 0
             ? repoBaseBranches
+            : undefined,
+        repoFeatureBranches:
+          Object.keys(repoFeatureBranches).length > 0
+            ? repoFeatureBranches
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,
@@ -363,6 +380,42 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                   agent 跑 plan / build / ship 时拉它作上下文 + 抠 storyId 做 branch 名
                 </p>
               </div>
+
+              {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建 */}
+              {repoPaths.length > 0 && (
+                <div className="grid gap-1.5">
+                  <Label>已有工作分支（选填）</Label>
+                  <div className="grid gap-2">
+                    {repoPaths.map((p) => {
+                      const repo = repos.find((r) => r.path === p);
+                      return (
+                        <div key={p} className="flex items-center gap-2">
+                          <span
+                            className="w-28 shrink-0 truncate text-sm text-muted-foreground"
+                            title={repo?.name ?? p}
+                          >
+                            {repo?.name ?? p}
+                          </span>
+                          <Input
+                            value={featureBranches[p] ?? ""}
+                            onChange={(e) =>
+                              setFeatureBranches((prev) => ({
+                                ...prev,
+                                [p]: e.target.value,
+                              }))
+                            }
+                            placeholder="留空自动建 feature/…"
+                            className="min-w-0 flex-1"
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    已自己建分支做了一部分？填进来、build 直接复用、不另建
+                  </p>
+                </div>
+              )}
             </>
           )}
 

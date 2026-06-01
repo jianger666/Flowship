@@ -259,6 +259,8 @@ interface TaskMetaV06 {
   repoPaths: string[];
   /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
   repoBaseBranches?: Record<string, string>;
+  /** V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、建 task 时用户填、空则 build 用算法名） */
+  repoFeatureBranches?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -544,6 +546,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     role: meta.role,
     repoPaths: meta.repoPaths,
     repoBaseBranches: meta.repoBaseBranches,
+    repoFeatureBranches: meta.repoFeatureBranches,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
@@ -784,6 +787,13 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && b) repoBaseBranches[repo] = b;
   }
 
+  // V0.6.3：同样清洗 per-repo「已有工作分支」覆盖（用户建 task 时填、key 限定 repoPaths、value trim）
+  const repoFeatureBranches: Record<string, string> = {};
+  for (const [repo, branch] of Object.entries(input.repoFeatureBranches ?? {})) {
+    const b = branch?.trim();
+    if (allowedRepos.has(repo) && b) repoFeatureBranches[repo] = b;
+  }
+
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -797,6 +807,10 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoPaths: trimmedRepoPaths,
     repoBaseBranches:
       Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
+    repoFeatureBranches:
+      Object.keys(repoFeatureBranches).length > 0
+        ? repoFeatureBranches
+        : undefined,
     feishuStoryUrl: input.feishuStoryUrl,
     contextDocs: initialContextDocs,
     disabledMcpServers:

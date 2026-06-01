@@ -35,8 +35,8 @@ const sanitizeMode = (v: unknown): TaskMode => {
   return v === "chat" ? "chat" : "task";
 };
 
-// V0.6.3：per-repo 线上分支快照（client 从 settings 算好提交）。只收 plain object + string value、去空
-const sanitizeRepoBaseBranches = (
+// V0.6.3：per-repo 分支映射清洗（线上分支 / 已有工作分支共用）。只收 plain object + string value、去空
+const sanitizeRepoBranchMap = (
   v: unknown,
 ): Record<string, string> | undefined => {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
@@ -97,7 +97,8 @@ export const POST = async (req: Request) => {
       repoPaths,
       role: sanitizeRole(body.role),
       mode,
-      repoBaseBranches: sanitizeRepoBaseBranches(body.repoBaseBranches),
+      repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
+      repoFeatureBranches: sanitizeRepoBranchMap(body.repoFeatureBranches),
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
         : undefined,

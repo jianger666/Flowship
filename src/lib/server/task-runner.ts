@@ -647,13 +647,16 @@ const planBranchesForBuild = (
   const now = Date.now();
 
   // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch / createdAt）
+  // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建算法名分支）、否则用算法名。
+  //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个、自动用对。
   const existing = task.gitBranches ?? [];
   const infos: GitBranchInfo[] = repoPaths.map((repoPath) => {
     const old = existing.find((b) => b.repoPath === repoPath);
     if (old) return old;
+    const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
     return {
       repoPath,
-      name: branchName,
+      name: explicitName || branchName,
       baseBranch: "",
       checkedOut: false,
       createdAt: now,
@@ -662,15 +665,23 @@ const planBranchesForBuild = (
 
   // 多仓 hint：逐仓 idempotent checkout（branch 存在则 checkout、不存在则建）
   const isMultiRepo = repoPaths.length > 1;
+  // V0.6.3：每仓实际分支名取自 infos（可能因用户指定「已有工作分支」而各仓不同名）
+  const uniqueNames = [...new Set(infos.map((i) => i.name))];
   const lines: string[] = [];
   lines.push("## 准入：build 第一动作、逐仓 idempotent checkout 分支");
   lines.push("");
   if (isMultiRepo) {
-    lines.push(
-      `本 task 涉及 ${repoPaths.length} 个仓、共用同一 branch name：\`${branchName}\``,
-    );
+    if (uniqueNames.length === 1) {
+      lines.push(
+        `本 task 涉及 ${repoPaths.length} 个仓、共用同一 branch name：\`${uniqueNames[0]}\``,
+      );
+    } else {
+      lines.push(
+        `本 task 涉及 ${repoPaths.length} 个仓、各仓 branch name 见下（部分仓指定了已有分支）`,
+      );
+    }
   } else {
-    lines.push(`本 task 的 branch name：\`${branchName}\``);
+    lines.push(`本 task 的 branch name：\`${infos[0]?.name ?? branchName}\``);
   }
   lines.push("");
   lines.push(
@@ -679,6 +690,8 @@ const planBranchesForBuild = (
   lines.push("");
 
   for (const repoPath of repoPaths) {
+    // V0.6.3：该仓实际分支名（用户指定的已有分支 or 算法名）、下面 checkout 用它
+    const name = infos.find((i) => i.repoPath === repoPath)?.name ?? branchName;
     if (isMultiRepo) {
       lines.push(`### 仓 \`${repoPath}\``);
       lines.push("");
@@ -718,11 +731,11 @@ const planBranchesForBuild = (
       lines.push("fi");
     }
     lines.push("# Idempotent：branch 已存在则 checkout、否则基于主分支建");
-    lines.push(`if git show-ref --verify --quiet refs/heads/${branchName}; then`);
-    lines.push(`  git checkout ${branchName}`);
+    lines.push(`if git show-ref --verify --quiet refs/heads/${name}; then`);
+    lines.push(`  git checkout ${name}`);
     lines.push("else");
     lines.push(
-      `  git fetch origin "$BASE" && git checkout -b ${branchName} "origin/$BASE"`,
+      `  git fetch origin "$BASE" && git checkout -b ${name} "origin/$BASE"`,
     );
     lines.push("fi");
     lines.push("```");

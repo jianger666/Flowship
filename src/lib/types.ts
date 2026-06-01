@@ -504,6 +504,15 @@ export interface Task {
    * - 某仓没配（key 不存在 / 空）→ build 时该仓回退 agent 探 origin/HEAD（前端 master 场景够用）
    */
   repoBaseBranches?: Record<string, string>;
+  /**
+   * V0.6.3：每个仓的「已有工作分支」覆盖（per-repo、key=repoPath、value=分支名、选填）
+   * - 场景：用户（尤其后端）建 task 前已自己 checkout 了分支、做了一部分 → 建 task 时填进来、
+   *   build 不再按算法名建新分支、而是复用这个已有分支（git show-ref 命中 → checkout、他的代码都在）
+   * - 来源：建 task 弹窗 per-repo 现填（每个需求不一样、不是仓库级固定属性、故不放设置页）
+   * - 没填（key 不存在 / 空）→ build 用算法名 `feature/<username>/<storyId>-<title>`（现状默认）
+   * - 落到 gitBranches[].name = 这个名、ship 提测自动用对（MR 源分支取自 gitBranches[].name）
+   */
+  repoFeatureBranches?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -528,6 +537,7 @@ export type NewTaskInput = Pick<
   | "disabledMcpServers"
   | "model"
   | "repoBaseBranches"
+  | "repoFeatureBranches"
 > & {
   role?: TaskRole;
   mode?: TaskMode;
