@@ -144,6 +144,8 @@ export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
 
 /** 单个 MCP server 的 OAuth 授权状态（跟 server 端 mcp-oauth.ts 对齐） */
 export interface McpOAuthStatus {
+  // 探测出该 server 要求 OAuth（本地 / url 自带 token / 公开 MCP 为 false）
+  needsOAuth: boolean;
   authorized: boolean;
   // access token 过期绝对时间（ms）；有 refresh 时过期也会自动续
   expiresAt?: number;

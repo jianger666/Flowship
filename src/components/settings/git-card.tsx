@@ -14,24 +14,20 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 
-import { SaveButton } from "./save-button";
-
 interface GitCardProps {
   gitHost: string;
   gitToken: string;
+  // 输入时改草稿、失焦（onBlur）落盘
   onHostChange: (next: string) => void;
   onTokenChange: (next: string) => void;
-  hostDirty: boolean;
-  tokenDirty: boolean;
-  onSaveHost: () => void;
-  onSaveToken: () => void;
+  onHostCommit: (value: string) => void;
+  onTokenCommit: (value: string) => void;
 }
 
 export const GitCard = ({
@@ -39,28 +35,14 @@ export const GitCard = ({
   gitToken,
   onHostChange,
   onTokenChange,
-  hostDirty,
-  tokenDirty,
-  onSaveHost,
-  onSaveToken,
+  onHostCommit,
+  onTokenCommit,
 }: GitCardProps) => {
-  // 卡片整体 dirty = 任意字段 dirty
-  const cardDirty = hostDirty || tokenDirty;
-
-  // 卡片级保存：哪个字段 dirty 就保存哪个；都 dirty 就一起保存
-  const onSaveAll = () => {
-    if (hostDirty) onSaveHost();
-    if (tokenDirty) onSaveToken();
-  };
-
   return (
     <Card>
       <CardHeader>
         <CardTitle>GitLab 配置</CardTitle>
         <CardDescription>提测时走 REST API 创建 MR（目标分支固定 test）、不依赖 glab CLI</CardDescription>
-        <CardAction>
-          <SaveButton dirty={cardDirty} onSave={onSaveAll} />
-        </CardAction>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-1.5">
@@ -69,6 +51,7 @@ export const GitCard = ({
             id="settings-git-host"
             value={gitHost}
             onChange={(e) => onHostChange(e.target.value)}
+            onBlur={() => onHostCommit(gitHost)}
             placeholder="如 gitlab.wukongedu.net（不带 https://）"
           />
         </div>
@@ -79,6 +62,7 @@ export const GitCard = ({
             type="password"
             value={gitToken}
             onChange={(e) => onTokenChange(e.target.value)}
+            onBlur={() => onTokenCommit(gitToken)}
             placeholder="glpat-xxx（需要 api scope）"
           />
           <p className="text-xs text-muted-foreground">

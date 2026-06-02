@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   username: "",
   gitHost: "",
   gitToken: "",
+  disabledMcpServers: [],
 };
 
 const isBrowser = (): boolean =>
@@ -53,6 +54,10 @@ export const getSettings = (): FeAiFlowSettings => {
       // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
       gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
       gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
+      // V0.6.5：建任务默认 MCP 黑名单快照源
+      disabledMcpServers: Array.isArray(parsed.disabledMcpServers)
+        ? parsed.disabledMcpServers
+        : [],
     };
   } catch (err) {
     console.warn(

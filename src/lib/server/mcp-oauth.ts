@@ -298,8 +298,8 @@ export const completeMcpOAuth = async (
   });
 };
 
-/** 单个 server 的授权状态（给前端展示） */
-export interface McpOAuthStatus {
+/** 落盘 token 状态（不含探测结果） */
+interface TokenStatus {
   /** 已拿到 access token */
   authorized: boolean;
   /** access token 过期绝对时间（ms）；有 refresh 时过期也会自动续 */
@@ -308,9 +308,14 @@ export interface McpOAuthStatus {
   hasRefresh: boolean;
 }
 
-export const getMcpOAuthStatus = async (
-  serverName: string,
-): Promise<McpOAuthStatus> => {
+/** 单个 server 的授权状态（给前端展示） */
+export interface McpOAuthStatus extends TokenStatus {
+  /** 探测出该 server 要求 OAuth（连接返回 401）；本地 / url 自带 token / 公开 MCP 均为 false */
+  needsOAuth: boolean;
+}
+
+// 读落盘 token 状态（已授权 / 过期时间 / 有无 refresh）
+const getTokenStatus = async (serverName: string): Promise<TokenStatus> => {
   const rec = await readRecord(serverName);
   if (!rec?.tokens?.access_token) {
     return { authorized: false, hasRefresh: false };
@@ -326,31 +331,88 @@ export const getMcpOAuthStatus = async (
   };
 };
 
-/** 列所有已落盘 server 的授权状态（前端 MCP 卡片用、key=原始 serverName） */
-export const listMcpOAuthStatuses = async (): Promise<
-  Record<string, McpOAuthStatus>
-> => {
-  let files: string[];
+// 本地 / 内网地址：本地 MCP 服务（如 figma desktop 的 127.0.0.1）不走 OAuth、不探测
+const isLocalUrl = (url: string): boolean => {
   try {
-    const entries = await fs.readdir(OAUTH_DIR, { withFileTypes: true });
-    files = entries
-      .filter((e) => e.isFile() && e.name.endsWith(".json"))
-      .map((e) => e.name);
+    const h = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    return (
+      h === "localhost" ||
+      h === "127.0.0.1" ||
+      h === "0.0.0.0" ||
+      h === "::1" ||
+      h.endsWith(".local")
+    );
   } catch {
-    return {};
+    return false;
   }
-  const out: Record<string, McpOAuthStatus> = {};
-  for (const file of files) {
-    try {
-      const raw = await fs.readFile(path.join(OAUTH_DIR, file), "utf-8");
-      const rec = JSON.parse(raw) as OAuthRecord;
-      if (!rec.serverName) continue;
-      out[rec.serverName] = await getMcpOAuthStatus(rec.serverName);
-    } catch {
-      // 单文件坏、跳过
-    }
+};
+
+/**
+ * 探测 server 是否要求 OAuth：发一个 MCP initialize、看是否 401（OAuth challenge）。
+ * 跟 Cursor 一个机制——不靠猜「有 url 没 auth header 就当要授权」、而是连一下看 server 怎么回。
+ * - 401 → 要 OAuth（设置页显示「授权」）
+ * - 其余 / 连不上 → 不要（本地服务、url 自带 token、公开 MCP 都走这、不再误显示）
+ */
+const probeOAuthRequired = async (
+  serverUrl: string,
+  headers?: Record<string, string>,
+): Promise<boolean> => {
+  try {
+    const res = await fetch(serverUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...(headers ?? {}),
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "fe-oauth-probe",
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "fe-ai-flow", version: "0" },
+        },
+      }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.status === 401;
+  } catch {
+    return false;
   }
-  return out;
+};
+
+/**
+ * 评估 mcp.json 各 server 的 OAuth 状态（设置页卡片用、key=原始 serverName）。
+ * 只收录「探测出要授权」或「已经授权过」的 server——
+ * stdio 本地进程 / 本地地址 http / url 自带 token / 已手配 Authorization / 公开 MCP 都不会进来。
+ */
+export const evaluateMcpOAuthStatuses = async (
+  servers: Record<string, McpServerConfig>,
+): Promise<Record<string, McpOAuthStatus>> => {
+  const entries = await Promise.all(
+    Object.entries(servers).map(async ([name, cfg]) => {
+      if (!("url" in cfg)) return null; // stdio 本地进程、不走 http oauth
+      const token = await getTokenStatus(name);
+      const headers = cfg.headers as Record<string, string> | undefined;
+      const hasAuthHeader =
+        headers &&
+        Object.keys(headers).some((k) => k.toLowerCase() === "authorization");
+      // 本地地址 / 已手配 Authorization 的不探测（前者不走 oauth、后者已有认证）
+      const needsOAuth =
+        hasAuthHeader || isLocalUrl(cfg.url)
+          ? false
+          : await probeOAuthRequired(cfg.url, headers);
+      // 既不要授权、也没授权过 → 不展示
+      if (!needsOAuth && !token.authorized) return null;
+      return [name, { ...token, needsOAuth }] as const;
+    }),
+  );
+  return Object.fromEntries(
+    entries.filter((e): e is readonly [string, McpOAuthStatus] => e !== null),
+  );
 };
 
 /** 撤销授权：删凭证文件（下次起 agent 不再注入、需重新授权） */

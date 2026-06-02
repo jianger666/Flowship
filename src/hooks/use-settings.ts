@@ -12,7 +12,7 @@
  * - savedSettings：已写到 localStorage 的版本、只读
  * - dirty：各字段的 dirty map（缓存计算结果、不要每次 render 重算）
  * - hasUnsaved：dirty 任一为 true（用于离页提示）
- * - update / saveField：分别更新草稿 / 把单字段刷盘
+ * - update / saveFieldValue：更新草稿（文本框输入用）/ 落盘某字段（编辑即保存）
  * - loaded：是否完成首次 localStorage 加载（避免 SSR/hydrate 闪空）
  */
 
@@ -31,7 +31,11 @@ export interface UseSettingsResult {
   dirty: Record<SettingsField, boolean>;
   hasUnsaved: boolean;
   update: <K extends SettingsField>(key: K, value: FeAiFlowSettings[K]) => void;
-  saveField: (key: SettingsField) => boolean;
+  // 即时存某字段的指定值（编辑即保存：选择 / 开关 onChange、文本框 onBlur 调）
+  saveFieldValue: <K extends SettingsField>(
+    key: K,
+    value: FeAiFlowSettings[K],
+  ) => boolean;
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
@@ -57,6 +61,13 @@ const isFieldEqual = (
       (r, i) =>
         r.path === b.repos[i].path && r.name === b.repos[i].name,
     );
+  }
+  if (key === "disabledMcpServers") {
+    // 黑名单是集合、顺序无关——排序后逐项比
+    const x = [...(a.disabledMcpServers ?? [])].sort();
+    const y = [...(b.disabledMcpServers ?? [])].sort();
+    if (x.length !== y.length) return false;
+    return x.every((s, i) => s === y[i]);
   }
   // defaultModel：浅比较 id + params 数组
   const x = a.defaultModel;
@@ -96,6 +107,11 @@ export const useSettings = (): UseSettingsResult => {
       username: !isFieldEqual("username", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),
+      disabledMcpServers: !isFieldEqual(
+        "disabledMcpServers",
+        settings,
+        savedSettings,
+      ),
     }),
     [settings, savedSettings]
   );
@@ -113,14 +129,21 @@ export const useSettings = (): UseSettingsResult => {
     setSettings((prev) => ({ ...prev, [key]: value }));
   };
 
-  // 单字段保存：只把当前 Card 对应的字段写到 localStorage、其他字段保留
-  // 4 张 Card 互不干扰、谁改谁存。返回 boolean 让调用方知道是否真存进去了
-  const saveField = (key: SettingsField): boolean => {
-    const next: FeAiFlowSettings = { ...savedSettings, [key]: settings[key] };
+  // 即时存某字段的指定值（编辑即保存的唯一落盘入口）：
+  // - 选择 / 开关 / 增删等离散操作：onChange 里直接调（传新值）
+  // - 文本框：onChange 只改草稿（update）、onBlur 时调本方法落盘（传当前值）
+  // base 取 getSettings() 读「落盘最新」而非 savedSettings 闭包——连续存不同字段不会互相覆盖；
+  // state 只更新该字段（不整体替换）——避免把其它正在输入、尚未 blur 的草稿字段冲掉。
+  // 不弹 success toast：编辑即存高频、刷屏没意义、仅失败时提示
+  const saveFieldValue = <K extends SettingsField>(
+    key: K,
+    value: FeAiFlowSettings[K],
+  ): boolean => {
+    const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
     const ok = saveSettings(next);
     if (ok) {
-      setSavedSettings(next);
-      toast.success("已保存");
+      setSavedSettings((prev) => ({ ...prev, [key]: value }));
+      setSettings((prev) => ({ ...prev, [key]: value }));
     } else {
       toast.error("保存失败、可能 localStorage 配额已满或处于隐私模式");
     }
@@ -151,6 +174,6 @@ export const useSettings = (): UseSettingsResult => {
     dirty,
     hasUnsaved,
     update,
-    saveField,
+    saveFieldValue,
   };
 };

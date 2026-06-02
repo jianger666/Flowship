@@ -17,36 +17,29 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 
-import { SaveButton } from "./save-button";
-
 interface UserProfileCardProps {
   username: string;
+  // 输入时改草稿、失焦（onBlur）落盘
   onChange: (next: string) => void;
-  dirty: boolean;
-  onSave: () => void;
+  onCommit: (value: string) => void;
 }
 
 export const UserProfileCard = ({
   username,
   onChange,
-  dirty,
-  onSave,
+  onCommit,
 }: UserProfileCardProps) => {
   return (
     <Card>
       <CardHeader>
         <CardTitle>个人信息</CardTitle>
         <CardDescription>用户名用于拼 git branch 前缀</CardDescription>
-        <CardAction>
-          <SaveButton dirty={dirty} onSave={onSave} />
-        </CardAction>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-1.5">
@@ -55,6 +48,7 @@ export const UserProfileCard = ({
             id="settings-username"
             value={username}
             onChange={(e) => onChange(e.target.value)}
+            onBlur={() => onCommit(username)}
             placeholder="如 clj"
           />
           <p className="text-xs text-muted-foreground">

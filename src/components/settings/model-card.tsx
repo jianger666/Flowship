@@ -21,15 +21,13 @@ import {
 import { ModelPicker } from "@/components/ui/model-picker";
 
 import type { ModelOption, ModelSelection } from "@/lib/types";
-import { SaveButton } from "./save-button";
 
 interface ModelCardProps {
   models: ModelOption[];
   modelsError: string;
   selection: ModelSelection;
+  // 选择即存
   onChange: (next: ModelSelection) => void;
-  dirty: boolean;
-  onSave: () => void;
   apiKey: string;
   refreshing: boolean;
   onRefresh: (apiKey: string) => void;
@@ -40,8 +38,6 @@ export const ModelCard = ({
   modelsError,
   selection,
   onChange,
-  dirty,
-  onSave,
   apiKey,
   refreshing,
   onRefresh,
@@ -51,7 +47,7 @@ export const ModelCard = ({
       <CardTitle>默认模型</CardTitle>
       <CardDescription>
         {models.length === 0
-          ? "点右侧「获取列表」按钮拉取可用模型（需先保存 API key）"
+          ? "点右侧「获取列表」按钮拉取可用模型（需先填好 API key）"
           : `共 ${models.length} 个可用模型`}
       </CardDescription>
       <CardAction className="flex items-center gap-2">
@@ -70,7 +66,6 @@ export const ModelCard = ({
           )}
           获取列表
         </Button>
-        <SaveButton dirty={dirty} onSave={onSave} />
       </CardAction>
     </CardHeader>
     <CardContent className="space-y-3">

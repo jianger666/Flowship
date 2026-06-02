@@ -13,14 +13,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 
-import { SaveButton } from "./save-button";
 import { useState } from "react";
 
 // 太短就不要脱敏了、否则 6+4 切片会重叠出现 "crsr_t...test" 这种残影
@@ -37,9 +35,9 @@ const maskKey = (key: string): string => {
 
 interface ApiKeyCardProps {
   apiKey: string;
+  // 输入时改草稿、失焦（onBlur）落盘
   onChange: (next: string) => void;
-  dirty: boolean;
-  onSave: () => void;
+  onCommit: (value: string) => void;
   onValidate: (apiKey: string) => void;
   validating: boolean;
 }
@@ -47,8 +45,7 @@ interface ApiKeyCardProps {
 export const ApiKeyCard = ({
   apiKey,
   onChange,
-  dirty,
-  onSave,
+  onCommit,
   onValidate,
   validating,
 }: ApiKeyCardProps) => {
@@ -64,9 +61,6 @@ export const ApiKeyCard = ({
         <CardDescription>
           从 cursor.com/dashboard/integrations 创建、以 crsr_ 开头
         </CardDescription>
-        <CardAction>
-          <SaveButton dirty={dirty} onSave={onSave} />
-        </CardAction>
       </CardHeader>
       <CardContent className="space-y-2">
         <div className="flex gap-2">
@@ -74,6 +68,7 @@ export const ApiKeyCard = ({
             type={showKey ? "text" : "password"}
             value={apiKey}
             onChange={(e) => onChange(e.target.value)}
+            onBlur={() => onCommit(apiKey)}
             placeholder="crsr_..."
             className="font-mono"
           />

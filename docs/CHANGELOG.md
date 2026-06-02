@@ -15,6 +15,45 @@
 
 ---
 
+### V0.6.3：stop hook 兜底「保证 agent 交卷」+ 多技术栈兼容（2026-06-01、已落地）
+
+**背景**：质疑链「怎么保证 agent 干完一个 action 一定调 `wait_for_user` 交卷」。这不是小事——fe 所有后置 deterministic check 都挂在 `wait_for_user → runActionCheck` 上、**agent 不交卷、整条检查链（L1-L4）全部落空**。所以「保证交卷」= 保证质量门禁一定被触发。
+
+**探针结论**（`/tmp/fe-hook-probe`、SDK local agent + `settingSources:["project"]` 实测、auto + gemini 两模型都验过）：
+
+- SDK 官方声明 + 实测都确认 **SDK 会执行 repo `.cursor/hooks.json` 的 hook**（SDK skill 文档原文「Both SDKs respect them」）
+- **stop hook 的 follow-up loop 成立**（行为 B）：agent 想结束 Run → stop hook 触发（还没真结束）→ 脚本返 `{"followup_message":...}` → agent **同会话**被拉回、带 followup 继续干 → 再次 stop → 放行。loop 上限由 hooks.json `loop_limit` 控制、`loop_count` 由 SDK 维护（stdin 给）
+- **成本模型**（实测「2 次 AI 调用」核算）：hook 触发本身是本地 bash、**0 配额**；只有 followup「拉回」逼 agent 多生成一轮 LLM 才 +1 次。所以**正常交卷 = 0 额外、忘交卷才 +1 次把它救回来**、远比「整个 action 失败重跑」省
+
+**落地方案 A（动态注入业务仓库、用户拍板）**：
+
+- hooks.json 必须在 agent cwd（= 业务仓库）的 `.cursor/` 才被加载（`["project"]` 只够 project 层、够不着全局）
+- **没 `.cursor/hooks.json` 就建 fe 的、有就不注入**（尊重业务仓库已有的、那种情况 stop hook 不生效、回退「事后标 error」兜底）；建了**留存复用** + 加 `.git/info/exclude` 防误 commit
+- **hook 脚本 fail-open + 向 fe 认领**：因为 hooks.json 留在 repo、将来用 Cursor IDE 打开该 repo 时 IDE agent 也会触发它——所以脚本只把 stdin 的 `conversation_id`（= agent_id）curl 给 fe（如 `POST /api/hooks/stop-check`）、**fe 没开 / 不认领这个 agent → 立即放行**、绝不误伤 IDE agent
+- **判断「交卷没」**：fe 后端 `agent_id → task_id`（`runningTasks` 已有映射）→ 读 `data/tasks/<id>/meta.json` 最后一个 action 的 `status`（`running` = 没交卷 → 返 followup 拉回 / `awaiting_ack` / task 终态 = 放行）。判断逻辑留 TS、bash 只转发
+
+**双保险**：stop hook（事前强制拉回）+ 现有「Run 结束发现 action 没 ack 标 error」（事后兜底）。
+
+**多层防御 L1-L5 战略**（stop hook 是「触发保证层」、保证下面 L1-L4 一定被跑到）：
+
+| 层 | 防什么 | 实现 | 状态 |
+|---|---|---|---|
+| L1 静态确定性检查 | 编译 / 风格 / 无改动 | typecheck + lint + git status（门槛 2） | ✅ 已有 |
+| L2 测试门禁 | 逻辑错（跑挂测试） | test action 跑真实测试 + 技术栈适配 | 🚧 待 |
+| L3 AI review | 偏离需求 | review action 拿 diff × plan 结构化差值 | ✅ 已有、可增强（独立 reviewer） |
+| L4 实时 QA | 跑起来才暴露 | 起服务 / 浏览器交互验证 | 🚧 待 |
+| L5 HITL ack | 人最终把关 | wait_for_user + 用户 ack | ✅ 已有、**stop hook 加固「保证交卷」** |
+
+**实装落地**（2026-06-01 第二批、随「给 Java 同事用」的多技术栈兼容一起）：
+
+- **stop hook 三件套**：`scripts/stop-hook.sh`（bash 转发 `conversation_id`）+ `src/lib/server/stop-hook-inject.ts`（`ensureStopHookInstalled`：业务仓 `.cursor/hooks.json` 缺则注入 + 加 `.git/info/exclude`）+ `src/app/api/hooks/stop-check/route.ts`（`agent_id→task_id`、末 action `running`=没交卷返 followup 拉回、否则放行）。task-runner `Agent.create` 前调注入。诊断日志已埋、首跑真任务时确认 `agent_id == conversation_id` 映射
+- **去 checkBuild（多技术栈兼容）**：`action-checks.ts` 撤掉写死 `pnpm` 的 typecheck/lint/git 检查（对 Java/Go 误报失败）、build action 直接 `passed:true` 跳过；后续把 check build 独立成技术栈自适应模块再加。质量暂靠 agent 自检 + 用户人眼 + stop hook 保证交卷
+- **role 加 `be`（后端）**：`TaskRole = "fe" | "be"`、`new-task-dialog` 角色下拉加后端；prompt 去前端化（`action-plan`/`build`/`review` 把写死「前端」改成 role 分支 + 技术栈自适应：JS/TS `package.json`、Java `pom.xml`/`build.gradle`、Go `go.mod`）
+- **「线上分支」per-repo 配置（选填、放设置页）**：feature 拉取基线。**why**：feature 必须从「线上分支」拉、后端默认分支常是 `develop`（探 `origin/HEAD` 会误拿）、从 dev/test 拉会把未上线 commit 带进 feature 污染线上。**设计**：线上分支是仓库级固定属性 → 放设置页 `RepoCard` 每仓配一次（`RepoConfig.onlineBranch`）、建 task 选仓时 client 从 settings 快照进 `task.repoBaseBranches`（`Record<repoPath,branch>`、因 settings 在 localStorage、server 读不到、故建 task 时固化）。build 时 `planBranchesForBuild` 按 repoPath 查：配了 → `BASE=<配的>` + 校验远程存在（防 typo）、没配 → 回退探 `origin/HEAD`。多仓不同线上分支天然支持。链路：`types` + `task-fs` + `route` + `repo-card` + `new-task-dialog` + `task-runner`
+- **「已有工作分支」per-repo 覆盖（选填、放建 task 弹窗）**：解决「中途接入」——用户（尤其后端）建 task 前已自己 `checkout` 了分支、做了一部分。**问题**：build 的 branchName 是固定算法名 `feature/<username>/<storyId>-<title>`、checkout 只看「这个算法名存不存在」、**不看当前在哪个分支** → 后端手动建的不同名分支会触发重建（基于线上基线另起一个 fe 命名分支）、他已 commit 的代码不在新分支。**设计**：选 B2 显式 > 隐式（b1「自动检测当前分支」在 SDK Run 独立跑 + 多仓下不可控、分支错了代价大）。「已有分支」是 task 级（每需求不同、非仓库级固定属性）→ 放建 task 弹窗 per-repo 现填、快照进 `task.repoFeatureBranches`（`Record<repoPath,branch>`、跟 `repoBaseBranches` 对称）。`planBranchesForBuild` 每仓实际名 = 指定 || 算法、落 `gitBranches[].name`、checkout 命中 → 复用（代码都在）；ship 提测的 MR 源分支也取 `gitBranches[].name` 故自动用对、**不用改 ship**。顺手修了 hint 用顶层 branchName 而非 per-repo name 的潜在 bug。链路：`types` + `task-fs` + `route` + `new-task-dialog` + `task-runner`
+- **chat 僵尸态误判修复**：`chat-reply` route 原来「`running` 且无 pending」一律当僵尸标 error、会把「正在说话的活 agent」误杀（前端 SSE 滞后发消息的 race）。改用 `isChatRunning(taskId)` 区分：进程活着=正在说话、返 409 让用户等；进程已死才标 error（410 引导重发重启）
+- **prompts 技术栈中立化（给后端用）**：`_shared.md`(§3 路径示例) / `action-build.md`(骨架) / `action-plan.md`(task 示例) 的 `.vue` / `pnpm` 示例加「示例为前端、Java/Go 等同理」说明（规则与语言无关）；角色提示已分 fe/be、build 命令已技术栈自适应
+
 ### V0.6.2：跟 Cursor 共用工具（全局配置 fe 读 + MCP 只读化）（2026-06-01）
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。承接 V0.6.1 的 settingSources、补完「全局层」配置读取 + fe 端 MCP 改只读。fe-ai-flow 不再自己维护 MCP、统一消费 Cursor 配置（单一源在 Cursor、fe 只读不写）。

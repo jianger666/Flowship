@@ -14,8 +14,7 @@
  * 不脱敏（用户拍板）：本地单机工具、原样展示完整 JSON（含 token / env）、跟 Cursor 一致。
  */
 
-import { useMemo } from "react";
-import { FileCode, ShieldCheck } from "lucide-react";
+import { FileCode, Plug, ShieldCheck } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,10 +28,18 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpOAuth } from "@/hooks/use-mcp-oauth";
 
-export const McpCard = () => {
+interface McpCardProps {
+  // 设置页配的「常用 MCP」默认黑名单（建任务时取这份快照、关掉的进黑名单）
+  disabledServers: string[];
+  // toggle 改即存（无需保存按钮）
+  onChange: (next: string[]) => void;
+}
+
+export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
   const { servers, names, dirs, loading, error } = useCursorMcp();
   const { statuses, busy, authorize, revoke } = useMcpOAuth();
 
@@ -41,30 +48,18 @@ export const McpCard = () => {
   // 读取来源（展示「配置读自哪个文件」、让用户知道去哪改）
   const sourceFile = dirs[0] ? `${dirs[0]}/mcp.json` : "~/.cursor/mcp.json";
 
-  // 可走 OAuth 的 server：http/sse 类（有 url）、且没在 mcp.json 手配 Authorization header
-  const oauthCandidates = useMemo(
-    () =>
-      Object.entries(servers)
-        .filter(([, cfg]) => {
-          if (!("url" in cfg)) return false;
-          const hasAuth =
-            cfg.headers &&
-            Object.keys(cfg.headers).some(
-              (k) => k.toLowerCase() === "authorization",
-            );
-          return !hasAuth;
-        })
-        .map(([name]) => name),
-    [servers],
-  );
+  // 走 OAuth 的 server 由后端探测决定（连 server 看是否 401）、statuses 只含「要授权 / 已授权」的、
+  // 本地服务 / url 自带 token / 公开 MCP 不会进来。详见 mcp-oauth.ts evaluateMcpOAuthStatuses
+  const oauthServers = Object.keys(statuses);
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>MCP servers</CardTitle>
         <CardDescription>
-          只读、读自 Cursor 的 <code className="text-xs">{sourceFile}</code>
-          。要改去 Cursor 改、这里跟它保持同步
+          配置只读、读自 Cursor 的{" "}
+          <code className="text-xs">{sourceFile}</code>
+          。下面「常用」开关改即生效、建任务时取它作默认
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -77,14 +72,14 @@ export const McpCard = () => {
         ) : (
           <>
             {/* OAuth 授权区：走 OAuth 的 MCP 在这点授权、token 自动续期 */}
-            {oauthCandidates.length > 0 && (
+            {oauthServers.length > 0 && (
               <div className="space-y-2 rounded-md border border-border/60 p-3">
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <ShieldCheck className="size-3.5 shrink-0" />
                   OAuth 授权——走 OAuth 的 MCP（如飞书项目）在这授权、token 自动续期
                 </div>
                 <div className="space-y-1.5">
-                  {oauthCandidates.map((name) => {
+                  {oauthServers.map((name) => {
                     const authorized = statuses[name]?.authorized;
                     return (
                       <div key={name} className="flex items-center gap-2">
@@ -123,6 +118,19 @@ export const McpCard = () => {
                 </div>
               </div>
             )}
+
+            {/* 常用 MCP 开关：勾选的建任务默认带、关掉的进默认黑名单、改即生效（无需保存按钮） */}
+            <div className="space-y-2 rounded-md border border-border/60 p-3">
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Plug className="size-3.5 shrink-0" />
+                常用 MCP——建任务默认带勾选的这些、可在建任务时临时增减
+              </div>
+              <McpToggleList
+                availableServers={names}
+                disabled={disabledServers}
+                onChange={onChange}
+              />
+            </div>
 
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <FileCode className="size-3.5 shrink-0" />共 {names.length} 个

@@ -37,7 +37,7 @@ import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 
 const SettingsPage = () => {
-  const { settings, loaded, dirty, update, saveField } = useSettings();
+  const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
 
   if (!loaded) {
@@ -60,15 +60,14 @@ const SettingsPage = () => {
         </Button>
         <h1 className="text-lg font-semibold">设置</h1>
         <p className="text-xs text-muted-foreground mt-1">
-          每张卡片单独保存、所有数据仅存浏览器 localStorage、不上传服务器
+          编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器
         </p>
       </div>
 
       <ApiKeyCard
         apiKey={settings.apiKey}
         onChange={(v) => update("apiKey", v)}
-        dirty={dirty.apiKey}
-        onSave={() => saveField("apiKey")}
+        onCommit={(v) => saveFieldValue("apiKey", v)}
         onValidate={fetchModels}
         validating={modelsLoading}
       />
@@ -76,8 +75,7 @@ const SettingsPage = () => {
       <UserProfileCard
         username={settings.username ?? ""}
         onChange={(v) => update("username", v)}
-        dirty={dirty.username}
-        onSave={() => saveField("username")}
+        onCommit={(v) => saveFieldValue("username", v)}
       />
 
       <GitCard
@@ -85,19 +83,15 @@ const SettingsPage = () => {
         gitToken={settings.gitToken ?? ""}
         onHostChange={(v) => update("gitHost", v)}
         onTokenChange={(v) => update("gitToken", v)}
-        hostDirty={dirty.gitHost}
-        tokenDirty={dirty.gitToken}
-        onSaveHost={() => saveField("gitHost")}
-        onSaveToken={() => saveField("gitToken")}
+        onHostCommit={(v) => saveFieldValue("gitHost", v)}
+        onTokenCommit={(v) => saveFieldValue("gitToken", v)}
       />
 
       <ModelCard
         models={models}
         modelsError={modelsError}
         selection={settings.defaultModel}
-        onChange={(next) => update("defaultModel", next)}
-        dirty={dirty.defaultModel}
-        onSave={() => saveField("defaultModel")}
+        onChange={(next) => saveFieldValue("defaultModel", next)}
         apiKey={settings.apiKey}
         refreshing={modelsLoading}
         onRefresh={fetchModels}
@@ -106,11 +100,13 @@ const SettingsPage = () => {
       <RepoCard
         repos={settings.repos}
         onChange={(next) => update("repos", next)}
-        dirty={dirty.repos}
-        onSave={() => saveField("repos")}
+        onCommit={(next) => saveFieldValue("repos", next)}
       />
 
-      <McpCard />
+      <McpCard
+        disabledServers={settings.disabledMcpServers ?? []}
+        onChange={(next) => saveFieldValue("disabledMcpServers", next)}
+      />
     </div>
   );
 };

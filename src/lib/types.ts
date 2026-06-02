@@ -49,6 +49,11 @@ export interface FeAiFlowSettings {
    */
   gitToken?: string;
   repos: RepoConfig[];
+  /**
+   * V0.6.5：设置页配的「常用 MCP」默认黑名单——建任务时取这份快照作默认禁用、
+   * 省得每次新建都手动关一堆不常用的。新增 server 不在黑名单 = 默认开。
+   */
+  disabledMcpServers?: string[];
 }
 
 /**

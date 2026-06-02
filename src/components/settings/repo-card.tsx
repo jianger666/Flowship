@@ -21,7 +21,6 @@ import { Input } from "@/components/ui/input";
 import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -31,16 +30,15 @@ import { useDialog } from "@/hooks/use-dialog";
 import { pathBasename } from "@/lib/path-utils";
 
 import type { RepoConfig } from "@/lib/types";
-import { SaveButton } from "./save-button";
 
 interface RepoCardProps {
   repos: RepoConfig[];
+  // onChange 改草稿（文本框输入用）、onCommit 落盘（增删 / 失焦时调）
   onChange: (next: RepoConfig[]) => void;
-  dirty: boolean;
-  onSave: () => void;
+  onCommit: (next: RepoConfig[]) => void;
 }
 
-export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
+export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   const { prompt } = useDialog();
 
   // FsPickerDialog 的打开状态
@@ -53,7 +51,8 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
       toast.error("这个目录已经在列表里");
       return;
     }
-    onChange([...repos, { name: pathBasename(path), path }]);
+    // 增删是离散操作、直接落盘
+    onCommit([...repos, { name: pathBasename(path), path }]);
   };
 
   // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
@@ -75,25 +74,27 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
     addRepo(input.replace(/\/+$/, ""));
   };
 
-  // 仓库重命名：受控输入、空串 fallback 回 basename
-  // 用 onBlur 触发 fallback、避免输入过程中误清回退
+  // 仓库重命名：输入时改草稿、blur 落盘（空串 fallback 回 basename）
   const renameRepo = (path: string, name: string) => {
     onChange(repos.map((r) => (r.path === path ? { ...r, name } : r)));
   };
   const onRenameBlur = (path: string, name: string) => {
-    if (name.trim()) return;
-    onChange(
-      repos.map((r) => (r.path === path ? { ...r, name: pathBasename(path) } : r))
-    );
+    const finalName = name.trim() || pathBasename(path);
+    onCommit(repos.map((r) => (r.path === path ? { ...r, name: finalName } : r)));
   };
 
-  // V0.6.3：设置仓库的「线上分支」（= feature 拉取基线、留空则 build 时 agent 探 origin/HEAD）
+  // V0.6.3：仓库「线上分支」（= feature 拉取基线、留空则 build 时 agent 探 origin/HEAD）
+  // 输入时改草稿、blur 落盘
   const setOnlineBranch = (path: string, onlineBranch: string) => {
     onChange(repos.map((r) => (r.path === path ? { ...r, onlineBranch } : r)));
   };
+  const onOnlineBranchBlur = () => {
+    onCommit(repos);
+  };
 
+  // 删除是离散操作、直接落盘
   const removeRepo = (path: string) => {
-    onChange(repos.filter((r) => r.path !== path));
+    onCommit(repos.filter((r) => r.path !== path));
   };
 
   return (
@@ -103,9 +104,6 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
         <CardDescription>
           点「选择文件夹」会弹出服务端文件浏览器、跨平台都能用；线上分支选填、feature 从它拉、留空自动探测
         </CardDescription>
-        <CardAction>
-          <SaveButton dirty={dirty} onSave={onSave} />
-        </CardAction>
       </CardHeader>
       <CardContent className="space-y-3">
         {repos.length === 0 ? (
@@ -132,6 +130,7 @@ export const RepoCard = ({ repos, onChange, dirty, onSave }: RepoCardProps) => {
                 <Input
                   value={r.onlineBranch ?? ""}
                   onChange={(e) => setOnlineBranch(r.path, e.target.value)}
+                  onBlur={onOnlineBranchBlur}
                   className="w-36 shrink-0"
                   placeholder="线上分支（选填）"
                   title="feature 从这个分支拉、留空则 build 时自动探测默认分支"

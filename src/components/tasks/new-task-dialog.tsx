@@ -84,7 +84,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   const [repos, setRepos] = useState<RepoConfig[]>([]);
   // 用户配置的 MCP server 列表（从 Cursor ~/.cursor/mcp.json 读、open 时拉）
   const { names: availableMcp } = useCursorMcp(open);
-  // 用户在弹窗里勾掉的 MCP（黑名单）、默认空 = 全开
+  // 用户在弹窗里勾掉的 MCP（黑名单）、open 时初始化为设置页「常用」快照、可临时增减
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起
   const [mcpExpanded, setMcpExpanded] = useState(false);
@@ -104,6 +104,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     if (!open) return;
     const s = getSettings();
     setRepos(s.repos);
+    // V0.6.5：默认带上设置页配的「常用 MCP」黑名单快照、用户可在下面临时增减
+    setDisabledMcp(s.disabledMcpServers ?? []);
     const defaultId = s.defaultModel?.id ?? "";
     setDefaultModelId(defaultId);
     setPickedModelId(defaultId);
