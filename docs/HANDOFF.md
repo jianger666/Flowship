@@ -102,6 +102,8 @@ stub action 的 prompt 文件存在（V0.6.2+ 设计草稿）、UI 推进 dialog
 - 用户 ack → wait-ack 写 `[ACTION_ACK approve|revise]` → agent 接着调 `wait_for_user(待命态)` 等下一指令
 - 终结 task → finalize 路由写 `[TASK_DONE]` / `[TASK_ABANDONED]` → agent 自然退出 Run
 
+**字段热更（V0.6.6）**：super prompt 只在 Run 启动时构造一次、reused agent 推进时用户在详情页编辑的 `title/role/feishuStoryUrl` 会 stale。runner 在 `runningTasks` record 存 agent 启动快照（内存、不落盘）、reused 推进时 diff 出变更、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（注入后推进快照防重复告知）。`model` 是 Run 启动时绑定改不了、`repoFeatureBranches` build 前本就读盘、二者都不走此机制。
+
 agent 永远不会主动 emit assistant_message + exit Run、只通过 wait_for_user 把控制权交回用户。
 
 ### 保活机制：shell + curl long-poll（V0.3.5 沿用）
@@ -274,20 +276,26 @@ settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-### V0.6.6：详情页编辑任务（2026-06-02）
+### V0.6.6：详情页编辑任务 + 字段热更（2026-06-02）
 
-**需求**：建完任务后能在详情页改「建任务时填的软配置」——以前填错只能删了重建。
+**需求**：建完任务后能在详情页改「建任务时填的软配置」——以前填错只能删了重建。后续追加：编辑后若不换新 agent、长生 agent 读不到新值的问题。
 
-**可改字段**（`EditTaskDialog`、详情页标题旁「编辑」按钮、`runStatus === "running"` 时隐藏避免跟正在跑的不一致）：角色 / 标题 / 飞书链接 / 模型 / per-repo 已有工作分支。
+**可改字段**（`EditTaskDialog`、详情页标题旁「编辑」按钮、`runStatus === "running"` 时隐藏避免跟正在跑的不一致）：角色 / 标题 / 飞书链接 / per-repo 已有工作分支。
 
-**刻意不可改**：`mode`（task/chat 两套通路、切了等于换任务）；`repoPaths`（副作用大：变 agent cwd、已建分支/MR 对不上）——只读展示；MCP 开关 / 上下文 doc——详情页已有各自面板。
+**刻意不可改**：`model`（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）；`mode`（task/chat 两套通路、切了等于换任务）；`repoPaths`（副作用大：变 agent cwd、已建分支/MR 对不上）——只读展示；MCP 开关 / 上下文 doc——详情页已有各自面板。
 
-**副作用约定**：角色改完下次推进 action 立即生效；标题 / 飞书链接不改已建的 git 分支名（建时已固化）、只影响之后新建的。
+**字段热更（关键、解决「长生 agent 读不到编辑」）**：单 SDK Run 永生 → super prompt 启动时构造一次、reused agent 推进不重建、编辑的 title/role/feishuStoryUrl 会 stale。解法：
+- runner 在 `runningTasks` record 存 agent 启动快照 `startSnapshot = {title, role, feishuStoryUrl}`（内存、不落盘）
+- reused 推进时 `buildTaskUpdateHint(最新 task, 启动快照)` diff、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（角色变会说「从 X 改为 Y、忽略开头旧角色」）、注入后推进快照避免下次重复告知
+- 机制本质：磁盘 meta = 最新真值、内存快照 = agent 已知值、推进时一 diff、差异 = 要告诉 agent 的变更
+- `repoFeatureBranches` 不走此机制——build 前 runner 本就读盘拿最新、已 fresh
 
 **落地**：
-- `src/components/tasks/edit-task-dialog.tsx`（新）：表单初始化只依赖 `[open]` + `task` ref 化——避免 dialog 开着时 task 因 SSE 更新（引用变）重跑 effect 把草稿重置（advance-dialog 同款教训）
-- `task-fs.ts: updateTaskFields`（新）：`withTaskLock` 包 read-modify-write；改飞书链接时**同步「建任务自动生成的 url 上下文文档」**（否则 agent 读 contextDocs 仍是旧链接、两处漂移）；model `null`=清空回退 settings 默认；repoFeatureBranches 同 createTask 清洗（key 限定 repoPaths + trim）
-- `api/tasks/[id]/route.ts` PATCH：加编辑字段分支（title/role/feishuStoryUrl/model/repoFeatureBranches、可一次传多个、role 限 fe/be、title 非空校验）
+- `src/components/tasks/edit-task-dialog.tsx`（新）：表单初始化只依赖 `[open]` + `task` ref 化——避免 dialog 开着时 task 因 SSE 更新（引用变）重跑 effect 把草稿重置（advance-dialog 同款教训）；后续移除 model 字段（连带清理 task-store / route / task-fs 的 model 编辑链路、不留死代码）
+- `task-runner.ts`：`TaskFieldsSnapshot` + `captureTaskFieldsSnapshot` + `buildTaskUpdateHint`（纯函数 diff）；`RunningTaskRecord.startSnapshot`（启动拍 + reused 注入后推进）；`buildNextActionDirective` 加 `taskUpdateHint` 入参（放 directive 最前、让 agent 先校准再读指令）
+- `prompts/_super.md`：任务基本信息段加「以 `[TASK_UPDATED]` 最新值为准」兜底 + `[NEXT_ACTION]` 处理步骤加识别 `[TASK_UPDATED]` 段（角色变立刻切视角）
+- `task-fs.ts: updateTaskFields`（新）：`withTaskLock` 包 read-modify-write；改飞书链接时**同步「建任务自动生成的 url 上下文文档」**（否则 agent 读 contextDocs 仍是旧链接、两处漂移）；repoFeatureBranches 同 createTask 清洗（key 限定 repoPaths + trim）
+- `api/tasks/[id]/route.ts` PATCH：编辑字段分支（title/role/feishuStoryUrl/repoFeatureBranches、可一次传多个、role 限 fe/be、title 非空校验）
 - `task-store.ts: updateTaskFields`（新 client helper、走 `handleJson`、传 `null` 显式清空）
 - `tasks/[id]/page.tsx`：接入「编辑」按钮 + `EditTaskDialog`
 
@@ -330,7 +338,7 @@ settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
 | 推进 dialog（V0.6 重写、选 action） | `src/components/tasks/advance-dialog.tsx` |
 | 再聊聊 dialog（V0.6 适配 actionLabel） | `src/components/tasks/revise-dialog.tsx` |
 | 新建任务 dialog（V0.6.0.1 重新加 mode tab） | `src/components/tasks/new-task-dialog.tsx` |
-| 编辑任务 dialog（V0.6.6、详情页改软配置字段） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` |
+| 编辑任务 dialog + 字段热更（V0.6.6、详情页改软配置字段、reused agent diff 注入 `[TASK_UPDATED]`） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` + `task-runner.ts: buildTaskUpdateHint` |
 | 任务卡片（V0.6 双状态） | `src/components/tasks/task-card.tsx` |
 | 任务详情页（V0.6 重写） | `src/app/tasks/[id]/page.tsx` |
 | 任务角色 schema + 展示文案 | `src/lib/types.ts: TaskRole / TASK_ROLE_LABEL` |
