@@ -72,6 +72,10 @@ import {
   getEffectiveCwd,
 } from "@/lib/path-utils";
 import {
+  DEFAULT_BRANCH_TEMPLATE,
+  renderBranchName,
+} from "@/lib/branch-template";
+import {
   loadSkills,
   renderSkillsForPrompt,
   type SkillEntry,
@@ -235,6 +239,7 @@ const buildSuperPrompt = async (
     taskId: task.id,
     taskTitle: task.title,
     repoSection: formatRepoSectionForPrompt(task.repoPaths),
+    repoBranchSection: renderRepoBranchSection(task),
     repoPath: getEffectiveCwd(task.repoPaths),
     roleLabel: TASK_ROLE_LABEL[task.role],
     role: task.role,
@@ -277,6 +282,28 @@ const renderActionHistorySection = (task: Task): string => {
   for (const a of visible) {
     if (!a.artifactPath) continue;
     lines.push(`  - \`${getActionArtifactPath(task.id, a.n, a.type)}\``);
+  }
+  return lines.join("\n");
+};
+
+// V0.6.7：渲染「仓库分支配置」段注入 super prompt——ship 读测试分支、各 action 兜底参考
+// 每仓列：线上分支（feature 拉取基线）/ 测试分支（ship 提测 MR 目标）/ dev 分支
+const renderRepoBranchSection = (task: Task): string => {
+  const repoPaths = task.repoPaths ?? [];
+  if (repoPaths.length === 0) return "（无绑定仓库）";
+  const lines: string[] = [
+    "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
+    "",
+  ];
+  for (const p of repoPaths) {
+    const online = task.repoBaseBranches?.[p]?.trim();
+    const test = task.repoTestBranches?.[p]?.trim();
+    const dev = task.repoDevBranches?.[p]?.trim();
+    const tail = p.split("/").filter(Boolean).pop() ?? p;
+    lines.push(
+      `- \`${tail}\`（${p}）：线上分支=${online || "（未配、自动探测）"}、` +
+        `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}`,
+    );
   }
   return lines.join("\n");
 };
@@ -615,9 +642,8 @@ const planBranchesForBuild = (
   task: Task,
   username: string | undefined,
 ): { infos: GitBranchInfo[]; promptHint: string } | null => {
-  if (!username || username.trim().length === 0) {
-    return null;
-  }
+  // V0.6.7：username 不再硬性必需（后端模板可能用 {date} 段替代 {username} 段）；
+  //   storyId 仍需要（默认 + 后端模板都含 {storyId}）、feishuStoryUrl 空则不建分支
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
     return null;
   }
@@ -634,21 +660,17 @@ const planBranchesForBuild = (
     return null;
   }
 
-  // title 转 branch-safe（git check-ref-format 约束）：
-  // 保留中文 + 字母数字；空格 / 各种括号 / git 非法字符（~ ^ @ : ? * [ \ / < > | "）统一换 -；
-  // 连续点折成 -（git 禁 ..）；首尾的 - 和 . 去掉（git 禁 ref 以 . 结尾）。中间单点保留（如 v1.0）
-  const titleSafe = task.title
-    .trim()
-    .replace(/[\s\\/:*?"<>|~^@【】（）()\[\]{}]+/g, "-")
-    .replace(/\.{2,}/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^[-.]+|[-.]+$/g, "");
-
-  const branchName = `feature/${username.trim()}/${storyId}-${titleSafe}`;
   const now = Date.now();
+  // V0.6.7：分支名按 per-repo 有效模板渲染（task.repoBranchTemplates 建 task 时固化、缺省回退内置默认）。
+  //   占位符 {username}/{storyId}/{taskTitle}/{date:fmt}、值各自 branch-safe 化、详见 branch-template.ts
+  const renderForRepo = (repoPath: string): string =>
+    renderBranchName(
+      task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
+      { username, storyId, taskTitle: task.title },
+    );
 
   // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch / createdAt）
-  // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建算法名分支）、否则用算法名。
+  // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建）；否则按模板渲染。
   //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个、自动用对。
   const existing = task.gitBranches ?? [];
   const infos: GitBranchInfo[] = repoPaths.map((repoPath) => {
@@ -657,7 +679,7 @@ const planBranchesForBuild = (
     const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
     return {
       repoPath,
-      name: explicitName || branchName,
+      name: explicitName || renderForRepo(repoPath),
       baseBranch: "",
       checkedOut: false,
       createdAt: now,
@@ -682,7 +704,7 @@ const planBranchesForBuild = (
       );
     }
   } else {
-    lines.push(`本 task 的 branch name：\`${infos[0]?.name ?? branchName}\``);
+    lines.push(`本 task 的 branch name：\`${infos[0]?.name ?? ""}\``);
   }
   lines.push("");
   lines.push(
@@ -691,8 +713,10 @@ const planBranchesForBuild = (
   lines.push("");
 
   for (const repoPath of repoPaths) {
-    // V0.6.3：该仓实际分支名（用户指定的已有分支 or 算法名）、下面 checkout 用它
-    const name = infos.find((i) => i.repoPath === repoPath)?.name ?? branchName;
+    // V0.6.3：该仓实际分支名（用户指定的已有分支 or 模板渲染名）、下面 checkout 用它
+    const name =
+      infos.find((i) => i.repoPath === repoPath)?.name ??
+      renderForRepo(repoPath);
     if (isMultiRepo) {
       lines.push(`### 仓 \`${repoPath}\``);
       lines.push("");

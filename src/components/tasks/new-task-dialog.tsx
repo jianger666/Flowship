@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/select";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
+import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { createTask } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
@@ -177,6 +178,24 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         if (b) repoFeatureBranches[p] = b;
       }
 
+      // V0.6.7：从 settings.repos 快照每仓的测试分支 / dev 分支 / 有效命名模板
+      //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build / ship 用这份）
+      const repoTestBranches: Record<string, string> = {};
+      const repoDevBranches: Record<string, string> = {};
+      const repoBranchTemplates: Record<string, string> = {};
+      for (const p of repoPaths) {
+        const repo = settings.repos.find((r) => r.path === p);
+        const tb = repo?.testBranch?.trim();
+        if (tb) repoTestBranches[p] = tb;
+        const db = repo?.devBranch?.trim();
+        if (db) repoDevBranches[p] = db;
+        // 有效模板 = 仓覆盖 ?? 全局 ?? 内置默认（总有值、固化进 task、build 直接用不再回退 settings）
+        repoBranchTemplates[p] = resolveBranchTemplate(
+          repo?.branchTemplate,
+          settings.branchTemplate,
+        );
+      }
+
       const task = await createTask({
         mode,
         role,
@@ -190,6 +209,16 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         repoFeatureBranches:
           Object.keys(repoFeatureBranches).length > 0
             ? repoFeatureBranches
+            : undefined,
+        repoTestBranches:
+          Object.keys(repoTestBranches).length > 0
+            ? repoTestBranches
+            : undefined,
+        repoDevBranches:
+          Object.keys(repoDevBranches).length > 0 ? repoDevBranches : undefined,
+        repoBranchTemplates:
+          Object.keys(repoBranchTemplates).length > 0
+            ? repoBranchTemplates
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,

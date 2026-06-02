@@ -16,6 +16,21 @@ export interface RepoConfig {
   path: string;
   /** V0.6.3：feature 拉取基线 = 线上分支（如 master / release）、留空则 build 时 agent 探 origin/HEAD */
   onlineBranch?: string;
+  /**
+   * V0.6.7：测试分支 = ship 提测 MR 的目标分支（如 test / testing / qa）
+   * - 留空则 ship 回退默认 `test`（兼容老工作流）
+   * - per-repo：不同仓测试分支名可能不同（后端 ≠ 前端）
+   */
+  testBranch?: string;
+  /**
+   * V0.6.7：dev 分支（如 develop）——当前仅存配置、暂无固定用途（联调场景预留）
+   */
+  devBranch?: string;
+  /**
+   * V0.6.7：feature 分支命名模板覆盖（per-repo、留空则用 settings.branchTemplate 全局默认）
+   * 占位符见 branch-template.ts：{username} / {storyId} / {taskTitle} / {date:MM-dd}
+   */
+  branchTemplate?: string;
 }
 
 /**
@@ -49,6 +64,11 @@ export interface FeAiFlowSettings {
    */
   gitToken?: string;
   repos: RepoConfig[];
+  /**
+   * V0.6.7：全局默认 feature 分支命名模板（per-repo 没配 branchTemplate 时用这份）
+   * 默认 `feature/{username}/{storyId}-{taskTitle}`、占位符见 branch-template.ts
+   */
+  branchTemplate?: string;
   /**
    * V0.6.5：设置页配的「常用 MCP」默认黑名单——建任务时取这份快照作默认禁用、
    * 省得每次新建都手动关一堆不常用的。新增 server 不在黑名单 = 默认开。
@@ -518,6 +538,23 @@ export interface Task {
    * - 落到 gitBranches[].name = 这个名、ship 提测自动用对（MR 源分支取自 gitBranches[].name）
    */
   repoFeatureBranches?: Record<string, string>;
+  /**
+   * V0.6.7：per-repo 测试分支快照（key=repoPath、建 task 时从 settings.repos[].testBranch 固化）
+   * - ship 提测 MR 的目标分支取这份；某仓没配 → ship 回退默认 `test`
+   * - 快照原因同 repoBaseBranches：settings 在 localStorage、server 读不到
+   */
+  repoTestBranches?: Record<string, string>;
+  /**
+   * V0.6.7：per-repo dev 分支快照（key=repoPath、建 task 时从 settings.repos[].devBranch 固化）
+   * 当前仅存、暂无固定用途
+   */
+  repoDevBranches?: Record<string, string>;
+  /**
+   * V0.6.7：per-repo「有效」feature 命名模板快照（key=repoPath）
+   * = repos[].branchTemplate ?? settings.branchTemplate ?? 内置默认、建 task 时算好固化
+   * build 时按这份渲染分支名（占位符见 branch-template.ts）
+   */
+  repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -543,6 +580,9 @@ export type NewTaskInput = Pick<
   | "model"
   | "repoBaseBranches"
   | "repoFeatureBranches"
+  | "repoTestBranches"
+  | "repoDevBranches"
+  | "repoBranchTemplates"
 > & {
   role?: TaskRole;
   mode?: TaskMode;

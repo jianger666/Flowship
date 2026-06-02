@@ -1,13 +1,15 @@
 # Action: ship（V0.6.1 正式版、多仓 + GitLab MCP 工具 + 飞书 @ 测试人员）
 
-ship action 的目标：把当前 task 所有仓的代码改动 push 到 origin、调 `submit_mr` MCP 工具创 GitLab MR **到 `test` 分支（提测、不是合 master）**、调飞书 MCP 在 story 评论 @ 测试人员告知 MR 链接、写 ship artifact 记录全过程。
+ship action 的目标：把当前 task 所有仓的代码改动 push 到 origin、调 `submit_mr` MCP 工具创 GitLab MR **到该仓的「测试分支」（提测、不是合 master）**、调飞书 MCP 在 story 评论 @ 测试人员告知 MR 链接、写 ship artifact 记录全过程。
+
+> **测试分支从哪来**：每仓的测试分支见 super prompt 顶部「## 仓库分支配置」段（建 task 时从设置页快照）。某仓没配 → 回退默认 `test`。下文凡是 `<测试分支>` / 写死的 `test` 都指「该仓配置的测试分支、没配则 test」。
 
 ## 工作流约定（公司内部场景、不要绕开）
 
-- **🔒 铁律：绝不把 `test` 的内容弄到 feature 分支上**——不许 `git merge test` / `git rebase test` / `git pull origin test` 到 feature、也不许 force push。feature 只能单向往 `test` 提测；test↔feature 冲突是**用户的活**、agent 遇冲突只 `ask_user` 抛出来（详见 §3.5）、绝不自己动手解
-- 所有仓 MR 一律 **`feature/...` → `test`**（提测）、`test` 通过测试后才人工合 master / main
-- `submit_mr` 的 `target_branch` 入参 **写死 `test`**、不要探测 `origin/HEAD`（那个拿到的是默认主分支 master / main、跟提测工作流不对）
-- 跨仓共用同一个 `feature/<username>/<story>-<title>` 分支名、`test` 也跨仓同名
+- **🔒 铁律：绝不把测试分支的内容弄到 feature 分支上**——不许 `git merge <测试分支>` / `git rebase <测试分支>` / `git pull origin <测试分支>` 到 feature、也不许 force push。feature 只能单向往测试分支提测；测试分支↔feature 冲突是**用户的活**、agent 遇冲突只 `ask_user` 抛出来（详见 §3.5）、绝不自己动手解
+- 所有仓 MR 一律 **`feature/...` → 该仓测试分支**（提测）、测试分支通过测试后才人工合 master / main
+- `submit_mr` 的 `target_branch` 入参 **填该仓的测试分支**（见「## 仓库分支配置」段、没配则 `test`）、不要探测 `origin/HEAD`（那个拿到的是默认主分支 master / main、跟提测工作流不对）
+- feature 分支名见「## 仓库分支配置」/ task.gitBranches（build 时已 checkout）、各仓可能同名也可能不同名（取决于命名模板）
 
 ## 单仓 vs 多仓
 
@@ -73,8 +75,8 @@ ask_user({
 ```bash
 cd <repoPath>
 
-# 目标分支固定 test（公司提测工作流、不要探 origin/HEAD）
-TARGET=test
+# 目标分支 = 该仓的测试分支（见「## 仓库分支配置」段、没配则 test）、不要探 origin/HEAD
+TARGET=<该仓测试分支、默认 test>
 
 # 探当前 branch（task.gitBranches 里该仓对应的 source branch、build 时已 checkout 好）
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -125,7 +127,7 @@ submit_mr({
   repo_path: "<本仓本地绝对路径>",
   project_path: "<解析出的 wkid/crm-web>",
   source_branch: "<BRANCH>",
-  target_branch: "test",                       // 永远填 test、不要填别的
+  target_branch: "<该仓测试分支、默认 test>",                       // 见「## 仓库分支配置」段、没配才用 test
   title: "[<role>] <task.title>",            // role = task.role 中文 label、title 加上版本号 if v>1
   description: "<MR description>",            // 见下方模板
   last_commit_hash: "<HEAD_SHA>",
@@ -268,7 +270,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `wait_f
 - ❌ 提测遇冲突时自己 `git merge test` / `rebase test` / `pull origin test` 到 feature 解冲突（**绝对不**、保持 feature 干净、ask_user 让用户解、见 §3.5）
 - ❌ push 被拒（non-fast-forward）时 force push 覆盖远程（**绝对不**、报用户处理）
 - ❌ MR 有冲突还照发飞书评论 @ 测试人员（合不了的 MR 不能甩给测试、§3.5 门禁拦）
-- ❌ target_branch 探 origin/HEAD 拿 master / main（公司工作流 = 提测、`target_branch` 永远 `test`）
+- ❌ target_branch 探 origin/HEAD 拿 master / main（公司工作流 = 提测、填该仓配置的测试分支、没配才用 test）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不会落库、详情页看不到）
 - ❌ 自己用 SDK `shell` curl GitLab REST API / `glab` / `gh`（PAT 在 server、agent 拿不到、必然失败）
 - ❌ 拿到测试人员 user_id 但漏调 set_feishu_testers（下次 ship 还要重新探、artifact 后置检查会发现）

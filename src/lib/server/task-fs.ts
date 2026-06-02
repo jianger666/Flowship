@@ -261,6 +261,12 @@ interface TaskMetaV06 {
   repoBaseBranches?: Record<string, string>;
   /** V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、建 task 时用户填、空则 build 用算法名） */
   repoFeatureBranches?: Record<string, string>;
+  /** V0.6.7：per-repo 测试分支快照（ship 提测目标、空则回退默认 test） */
+  repoTestBranches?: Record<string, string>;
+  /** V0.6.7：per-repo dev 分支快照（暂存、无固定用途） */
+  repoDevBranches?: Record<string, string>;
+  /** V0.6.7：per-repo 有效命名模板快照（build 渲染分支名用） */
+  repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -547,6 +553,9 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     repoPaths: meta.repoPaths,
     repoBaseBranches: meta.repoBaseBranches,
     repoFeatureBranches: meta.repoFeatureBranches,
+    repoTestBranches: meta.repoTestBranches,
+    repoDevBranches: meta.repoDevBranches,
+    repoBranchTemplates: meta.repoBranchTemplates,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
@@ -794,6 +803,23 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && b) repoFeatureBranches[repo] = b;
   }
 
+  // V0.6.7：清洗测试分支 / dev 分支 / 命名模板快照（同款：key 限定 repoPaths、value trim 去空）
+  const repoTestBranches: Record<string, string> = {};
+  for (const [repo, branch] of Object.entries(input.repoTestBranches ?? {})) {
+    const b = branch?.trim();
+    if (allowedRepos.has(repo) && b) repoTestBranches[repo] = b;
+  }
+  const repoDevBranches: Record<string, string> = {};
+  for (const [repo, branch] of Object.entries(input.repoDevBranches ?? {})) {
+    const b = branch?.trim();
+    if (allowedRepos.has(repo) && b) repoDevBranches[repo] = b;
+  }
+  const repoBranchTemplates: Record<string, string> = {};
+  for (const [repo, tpl] of Object.entries(input.repoBranchTemplates ?? {})) {
+    const t = tpl?.trim();
+    if (allowedRepos.has(repo) && t) repoBranchTemplates[repo] = t;
+  }
+
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -810,6 +836,14 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoFeatureBranches:
       Object.keys(repoFeatureBranches).length > 0
         ? repoFeatureBranches
+        : undefined,
+    repoTestBranches:
+      Object.keys(repoTestBranches).length > 0 ? repoTestBranches : undefined,
+    repoDevBranches:
+      Object.keys(repoDevBranches).length > 0 ? repoDevBranches : undefined,
+    repoBranchTemplates:
+      Object.keys(repoBranchTemplates).length > 0
+        ? repoBranchTemplates
         : undefined,
     feishuStoryUrl: input.feishuStoryUrl,
     contextDocs: initialContextDocs,
@@ -988,6 +1022,81 @@ export const setTaskUiLayout = async (
       meta.uiLayout = undefined;
     }
     await writeMeta(meta);
+  });
+
+/**
+ * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
+ *
+ * 只放可安全后改的软配置：title / role / feishuStoryUrl / model / repoFeatureBranches。
+ * 不在此改 mode（切通路）/ repoPaths（副作用大、影响 cwd + 已建分支）/ repoStatus / runStatus / actions。
+ *
+ * 入参语义：字段为 undefined = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
+ */
+export interface UpdateTaskFieldsInput {
+  title?: string;
+  role?: TaskRole;
+  feishuStoryUrl?: string | null;
+  model?: ModelSelection | null;
+  repoFeatureBranches?: Record<string, string> | null;
+}
+
+export const updateTaskFields = async (
+  id: string,
+  input: UpdateTaskFieldsInput,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+
+    // 标题：空忽略、保持原值（前端已校验非空、这里兜底防误清）
+    if (input.title !== undefined) {
+      const t = input.title.trim();
+      if (t) meta.title = t;
+    }
+
+    if (input.role !== undefined) {
+      meta.role = input.role;
+    }
+
+    // 飞书链接：改动时同步「建任务自动生成的那条 url 上下文文档」、否则 agent 读 contextDocs 仍是旧链接、两处漂移
+    if (input.feishuStoryUrl !== undefined) {
+      const oldUrl = meta.feishuStoryUrl;
+      const newUrl = input.feishuStoryUrl?.trim() || undefined;
+      meta.feishuStoryUrl = newUrl;
+      if (oldUrl && oldUrl !== newUrl && newUrl && meta.contextDocs) {
+        const doc = meta.contextDocs.find(
+          (d) => d.type === "url" && d.content === oldUrl,
+        );
+        if (doc) doc.content = newUrl;
+      }
+    }
+
+    // 模型：null = 清空（回退用 settings 默认）
+    if (input.model !== undefined) {
+      meta.model = input.model ?? undefined;
+    }
+
+    // 已有工作分支：跟 createTask 同款清洗——key 限定在本 task 的 repoPaths 内、value trim 去空
+    if (input.repoFeatureBranches !== undefined) {
+      if (input.repoFeatureBranches === null) {
+        meta.repoFeatureBranches = undefined;
+      } else {
+        const allowed = new Set(meta.repoPaths);
+        const cleaned: Record<string, string> = {};
+        for (const [repo, branch] of Object.entries(
+          input.repoFeatureBranches,
+        )) {
+          const b = branch?.trim();
+          if (allowed.has(repo) && b) cleaned[repo] = b;
+        }
+        meta.repoFeatureBranches =
+          Object.keys(cleaned).length > 0 ? cleaned : undefined;
+      }
+    }
+
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
   });
 
 // ----------------- 公开 API（V0.6 新）：action / repoStatus / runStatus / gitBranches / mr -----------------

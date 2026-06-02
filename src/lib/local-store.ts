@@ -5,6 +5,7 @@
  * - 数据 schema 看 src/lib/types.ts
  */
 
+import { DEFAULT_BRANCH_TEMPLATE } from "./branch-template";
 import type { FeAiFlowSettings, ModelSelection } from "./types";
 
 const KEY = "fe-ai-flow:settings";
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   username: "",
   gitHost: "",
   gitToken: "",
+  branchTemplate: DEFAULT_BRANCH_TEMPLATE,
   disabledMcpServers: [],
 };
 
@@ -54,6 +56,11 @@ export const getSettings = (): FeAiFlowSettings => {
       // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
       gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
       gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
+      // V0.6.7：全局默认分支命名模板、缺省 / 非串回退内置默认
+      branchTemplate:
+        typeof parsed.branchTemplate === "string" && parsed.branchTemplate.trim()
+          ? parsed.branchTemplate
+          : DEFAULT_BRANCH_TEMPLATE,
       // V0.6.5：建任务默认 MCP 黑名单快照源
       disabledMcpServers: Array.isArray(parsed.disabledMcpServers)
         ? parsed.disabledMcpServers

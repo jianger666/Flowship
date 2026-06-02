@@ -20,6 +20,7 @@ import type {
   NewTaskInput,
   Task,
   TaskEvent,
+  TaskRole,
   TaskSummary,
 } from "./types";
 
@@ -112,6 +113,31 @@ export const setTaskUiLayout = async (
     body: JSON.stringify({ uiLayout }),
   });
   await handleJson<{ ok: true }>(res);
+};
+
+/**
+ * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
+ *
+ * 走 PATCH /api/tasks/[id]、字段语义：不传 = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
+ * 可改：title / role / feishuStoryUrl / model / repoFeatureBranches；mode / repoPaths 不在此改。
+ */
+export const updateTaskFields = async (
+  id: string,
+  patch: {
+    title?: string;
+    role?: TaskRole;
+    feishuStoryUrl?: string | null;
+    model?: ModelSelection | null;
+    repoFeatureBranches?: Record<string, string> | null;
+  },
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
 };
 
 // ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------

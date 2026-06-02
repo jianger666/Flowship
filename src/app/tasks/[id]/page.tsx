@@ -33,6 +33,7 @@ import {
   Flag,
   Loader2,
   MessageCircleQuestion,
+  Pencil,
   Sparkles,
   XCircle,
   Zap,
@@ -45,6 +46,7 @@ import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
+import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
 import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
@@ -110,6 +112,8 @@ const TaskDetailPage = () => {
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+  // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
 
@@ -482,6 +486,18 @@ const TaskDetailPage = () => {
                     {RUN_STATUS_LABEL[task.runStatus]}
                   </Badge>
                 )}
+                {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
+                {task.runStatus !== "running" && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setEditDialogOpen(true)}
+                    title="编辑任务：角色 / 标题 / 飞书链接 / 模型 / 工作分支"
+                    className="size-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                  >
+                    <Pencil className="size-3.5" />
+                  </Button>
+                )}
               </div>
               <div
                 className="text-xs text-muted-foreground"
@@ -728,6 +744,14 @@ const TaskDetailPage = () => {
         task={task}
         onSubmit={handleAdvance}
         submitting={starting}
+      />
+
+      {/* V0.6.6 编辑任务 dialog */}
+      <EditTaskDialog
+        open={editDialogOpen}
+        onOpenChange={setEditDialogOpen}
+        task={task}
+        onSaved={setTask}
       />
     </div>
   );

@@ -51,7 +51,8 @@ const isFieldEqual = (
     key === "apiKey" ||
     key === "username" ||
     key === "gitHost" ||
-    key === "gitToken"
+    key === "gitToken" ||
+    key === "branchTemplate"
   ) {
     return (a[key] ?? "") === (b[key] ?? "");
   }
@@ -105,6 +106,7 @@ export const useSettings = (): UseSettingsResult => {
       defaultModel: !isFieldEqual("defaultModel", settings, savedSettings),
       repos: !isFieldEqual("repos", settings, savedSettings),
       username: !isFieldEqual("username", settings, savedSettings),
+      branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),
       disabledMcpServers: !isFieldEqual(

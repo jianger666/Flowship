@@ -2,7 +2,7 @@
  * /api/tasks/[id]
  *
  *   GET    → 单任务详情（含 events + 各 action artifact）
- *   PATCH  → 元数据修改（archived / disabledMcpServers / uiLayout）
+ *   PATCH  → 元数据修改（archived / disabledMcpServers / uiLayout / V0.6.6 建任务字段）
  *   DELETE → 删除任务（连带 data/tasks/<id>/ 整个文件夹）
  *
  * V0.6 改造：cancelChat → cancelTaskRun（task-runner）
@@ -17,9 +17,11 @@ import {
   setTaskArchived,
   setTaskDisabledMcpServers,
   setTaskUiLayout,
+  updateTaskFields,
 } from "@/lib/server/task-fs";
 import { cancelTaskRun } from "@/lib/server/task-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
+import type { ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -44,6 +46,12 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       archived?: boolean;
       disabledMcpServers?: string[] | null;
       uiLayout?: { artifactPanelSize?: number } | null;
+      // V0.6.6：编辑任务字段（详情页编辑弹窗、可一次传多个）
+      title?: string;
+      role?: TaskRole;
+      feishuStoryUrl?: string | null;
+      model?: ModelSelection | null;
+      repoFeatureBranches?: Record<string, string> | null;
     };
 
     if (typeof body.archived === "boolean") {
@@ -94,8 +102,43 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ ok: true });
     }
 
+    // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / model / repoFeatureBranches、可一次传多个）
+    const editKeys = [
+      "title",
+      "role",
+      "feishuStoryUrl",
+      "model",
+      "repoFeatureBranches",
+    ] as const;
+    if (editKeys.some((k) => k in body)) {
+      if ("role" in body && body.role !== "fe" && body.role !== "be") {
+        return NextResponse.json(
+          { error: "role 必须是 fe / be" },
+          { status: 400 },
+        );
+      }
+      if ("title" in body && typeof body.title !== "string") {
+        return NextResponse.json(
+          { error: "title 必须是字符串" },
+          { status: 400 },
+        );
+      }
+      const task = await updateTaskFields(id, {
+        title: body.title,
+        role: body.role,
+        feishuStoryUrl: body.feishuStoryUrl,
+        model: body.model,
+        repoFeatureBranches: body.repoFeatureBranches,
+      });
+      if (!task)
+        return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
+    }
+
     return NextResponse.json(
-      { error: "需要 archived / disabledMcpServers / uiLayout 中的一个字段" },
+      {
+        error: "需要 archived / disabledMcpServers / uiLayout / 编辑字段 之一",
+      },
       { status: 400 },
     );
   } catch (err) {

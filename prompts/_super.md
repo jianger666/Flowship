@@ -14,6 +14,10 @@
 - 当前角色：{{roleLabel}}（role={{role}}）—— 飞书 story 通常是跨角色共享的、你只挑跟你这个角色相关的部分做
 - {{repoSection}}
 
+## 仓库分支配置
+
+{{repoBranchSection}}
+
 {{contextDocsSection}}
 
 ## 核心机制：wait_for_user + shell long-poll（V0.3.5 沿用、协议层不变）

@@ -1059,7 +1059,9 @@ const buildMcpServer = (): McpServer => {
           .describe("MR 源分支（task.gitBranches 里这仓对应的 branch name）"),
         target_branch: z
           .string()
-          .describe("MR 目标分支（公司提测工作流写死 `test`、不要探 origin/HEAD 拿 master/main）"),
+          .describe(
+            "MR 目标分支 = 该仓的测试分支（见 super prompt「## 仓库分支配置」段、没配则 `test`）、不要探 origin/HEAD 拿 master/main",
+          ),
         title: z.string().describe("MR 标题（建议格式：`[role] <task.title>`）"),
         description: z
           .string()

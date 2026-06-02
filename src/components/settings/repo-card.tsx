@@ -83,12 +83,16 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onCommit(repos.map((r) => (r.path === path ? { ...r, name: finalName } : r)));
   };
 
-  // V0.6.3：仓库「线上分支」（= feature 拉取基线、留空则 build 时 agent 探 origin/HEAD）
-  // 输入时改草稿、blur 落盘
-  const setOnlineBranch = (path: string, onlineBranch: string) => {
-    onChange(repos.map((r) => (r.path === path ? { ...r, onlineBranch } : r)));
+  // V0.6.3/V0.6.7：仓库分支字段（线上 / 测试 / dev 分支 + 分支模板覆盖、都 per-repo 选填）
+  // 通用 setter：输入改草稿、blur 落盘——按 field 改对应字段、省得每个字段写一对
+  const setRepoField = (
+    path: string,
+    field: "onlineBranch" | "testBranch" | "devBranch" | "branchTemplate",
+    value: string,
+  ) => {
+    onChange(repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)));
   };
-  const onOnlineBranchBlur = () => {
+  const onRepoFieldBlur = () => {
     onCommit(repos);
   };
 
@@ -102,7 +106,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」会弹出服务端文件浏览器、跨平台都能用；线上分支选填、feature 从它拉、留空自动探测
+          点「选择文件夹」弹服务端文件浏览器；每仓可配线上 / 测试 / dev 分支 + 分支模板覆盖、都选填
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -115,35 +119,73 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
             {repos.map((r) => (
               <div
                 key={r.path}
-                className="flex flex-wrap items-center gap-2 rounded-lg border bg-card/50 px-3 py-2"
+                className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
               >
+                {/* 第一行：仓名 + 路径 + 删除 */}
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={r.name}
+                    onChange={(e) => renameRepo(r.path, e.target.value)}
+                    onBlur={(e) => onRenameBlur(r.path, e.target.value)}
+                    className="w-40 shrink-0"
+                    placeholder="仓库名"
+                  />
+                  <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
+                    {r.path}
+                  </code>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => removeRepo(r.path)}
+                    title="删除"
+                  >
+                    <Trash2 />
+                  </Button>
+                </div>
+
+                {/* 第二行：线上 / 测试 / dev 分支（都选填） */}
+                <div className="grid grid-cols-3 gap-2">
+                  <Input
+                    value={r.onlineBranch ?? ""}
+                    onChange={(e) =>
+                      setRepoField(r.path, "onlineBranch", e.target.value)
+                    }
+                    onBlur={onRepoFieldBlur}
+                    placeholder="线上分支"
+                    title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
+                  />
+                  <Input
+                    value={r.testBranch ?? ""}
+                    onChange={(e) =>
+                      setRepoField(r.path, "testBranch", e.target.value)
+                    }
+                    onBlur={onRepoFieldBlur}
+                    placeholder="测试分支"
+                    title="ship 提测 MR 的目标分支、留空则默认 test"
+                  />
+                  <Input
+                    value={r.devBranch ?? ""}
+                    onChange={(e) =>
+                      setRepoField(r.path, "devBranch", e.target.value)
+                    }
+                    onBlur={onRepoFieldBlur}
+                    placeholder="dev 分支"
+                    title="dev / 联调分支（当前仅存配置）"
+                  />
+                </div>
+
+                {/* 第三行：分支模板覆盖（留空用设置页全局默认） */}
                 <Input
-                  value={r.name}
-                  onChange={(e) => renameRepo(r.path, e.target.value)}
-                  onBlur={(e) => onRenameBlur(r.path, e.target.value)}
-                  className="w-40 shrink-0"
-                  placeholder="仓库名"
+                  value={r.branchTemplate ?? ""}
+                  onChange={(e) =>
+                    setRepoField(r.path, "branchTemplate", e.target.value)
+                  }
+                  onBlur={onRepoFieldBlur}
+                  placeholder="分支模板覆盖（留空用全局默认）"
+                  title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
+                  className="font-mono text-xs"
                 />
-                <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
-                  {r.path}
-                </code>
-                <Input
-                  value={r.onlineBranch ?? ""}
-                  onChange={(e) => setOnlineBranch(r.path, e.target.value)}
-                  onBlur={onOnlineBranchBlur}
-                  className="w-36 shrink-0"
-                  placeholder="线上分支（选填）"
-                  title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  onClick={() => removeRepo(r.path)}
-                  title="删除"
-                >
-                  <Trash2 />
-                </Button>
               </div>
             ))}
           </div>

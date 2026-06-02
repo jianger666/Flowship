@@ -15,6 +15,45 @@
 
 ---
 
+### V0.6.5：设置页编辑即保存 + 「常用 MCP」开关（建任务取快照）（2026-06-02）
+
+**需求**：设置页给每个 MCP 加「常用」开关、建任务时取这份快照作默认黑名单——常用的默认带、不常用的默认关、建 task 弹窗里仍可临时增减。
+
+**数据**：`FeAiFlowSettings.disabledMcpServers`（全局默认黑名单、跟 task 级 `task.disabledMcpServers` 同形）。`local-store` 的 `DEFAULT_SETTINGS` 补空数组、`getSettings` 读时兜 `Array.isArray`。`use-settings` 的 `isFieldEqual` 给它单独走「排序后逐项比」（数组无序）、`dirty` 纳入。
+
+**建任务取快照**：`new-task-dialog` open 时 `setDisabledMcp(settings.disabledMcpServers ?? [])` 作默认。因为 settings 在 localStorage、server 读不到 → 必须建 task 时由 client 固化进 `task.disabledMcpServers`。
+
+**改即存 → 全设置页（用户拍板「所有保存按钮都去掉、编辑即保存」）**：业界共识（macOS 系统设置 / VS Code / Notion 都改即存）。`use-settings` 加 `saveFieldValue(key, value)` 作**唯一落盘入口**、删 `saveField`：base 取 `getSettings()` 读「落盘最新」（**连续存不同字段不互相覆盖**）、state 只更新该字段（**不冲掉其它正在输入未 blur 的草稿**）、不弹 success toast（仅失败弹）。控件分两类落盘时机——**选择 / 开关 / 增删等离散操作**：`onChange` 直接 `saveFieldValue`；**文本框**（apiKey / username / gitHost / gitToken / repo 名 + 线上分支）：`onChange` 只改草稿（`update`）、`onBlur` 才落盘（避免每敲一字符就写 + 存进半成品）。6 张卡片全去 `SaveButton`、`save-button.tsx` 删。`dirty` / `hasUnsaved` / beforeunload 保留作「文本框输入中途未 blur 就关页」的兜底提醒。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+**另（hot-fix：修同事试用反馈的两个 UI bug、2026-06-02）**：
+
+1. **Select 受控/非受控切换 console 警告**（`A component is changing the uncontrolled value state of Select to be controlled`）——Base UI Select 以「`value` 是否 `undefined`」判定受控/非受控、`value={x || undefined}` 在初次渲染（空 → undefined、非受控）与有值后（string、受控）之间切换触发警告。修：空值统一传 `null`（Base UI 类型 `value?: Value | null | undefined` 明确支持 null 作受控空值、trigger 照常显示 placeholder）。扫全项目 5 个 `<Select>`、改其中 4 处（`model-picker` base + param select / `artifact-panel` diff 版本选择器 / `new-task-dialog` 换模型）；`new-task-dialog` 的 role select 因 `useState<TaskRole>("fe")` 恒有值、本就受控、不动。
+2. **推进弹窗「打开后选中跳一下」**——`advance-dialog` 把「表单初始化」和「按需拉模型列表」塞进同一 `useEffect` 且依赖 `availableModels.length`、模型列表异步加载完成（length 0 → N）触发 effect 重跑、把用户已改的 action 选中打回默认（实测：选「提测」跳回「方案」）。修：拆成两个 effect——表单初始化只依赖 `[open, defaultActionType]`、拉模型单独一个 effect（只 fetch、不碰任何表单 state、即便重跑也无副作用）。
+
+### V0.6.4：MCP OAuth（fe 自己跑标准 OAuth、让走 OAuth 的远程 MCP 在 fe 可用）（2026-06-01）
+
+**背景**：飞书项目 MCP（`project.feishu.cn/mcp_server/v1`）走标准 OAuth——Cursor 里点浏览器授权、token 存 Cursor 内部、连接时注入。但 fe 读 `~/.cursor/mcp.json` 只拿到裸 url（OAuth token 不写文件）、SDK 起的 agent 是 headless 弹不了浏览器 → 连 server 直接 401、用不了。
+
+**实锤**（curl 探测飞书项目）：教科书级 OAuth 2.1——401 带标准 `WWW-Authenticate`、Protected Resource Metadata（RFC 9728）+ Authorization Server Metadata（RFC 8414）齐全、DCR 动态注册（**接受 localhost 回调**）、PKCE S256、refresh_token。
+
+**方案**：fe 自己跑标准 OAuth flow（复用 `@modelcontextprotocol/sdk` 自带 OAuth client：`auth()` 一站式做发现 / DCR / PKCE / 换 token / refresh）、token 落服务端文件、起 agent 前注入 `mcpServers[name].headers.Authorization`。一次授权、refresh_token 长期自动续——跟 Cursor 体验一致。**通用**：任何标准 OAuth 2.1 的 MCP 都能用、不止飞书项目。
+
+**落地**：
+- `src/lib/server/mcp-oauth.ts`：`FileOAuthClientProvider`（OAuthClientProvider 实现、状态全部落 `data/mcp-oauth/<server>.json`、靠 serverName 跨请求串）+ `startMcpOAuth` / `completeMcpOAuth`（CSRF state 校验）/ `enrichMcpServersWithOAuth`（注入、access 过期先 refresh、提前 60s 续）/ status / revoke。认证方式取舍：飞书 auth metadata 没声明 `token_endpoint_auth_methods_supported`、SDK 在 client 有 secret（DCR 颁发）时默认 `client_secret_basic`、实测 OK
+- 4 个 API：`/api/mcp-oauth/{start,callback,status,revoke}`。callback 返回结果 HTML（成功自动关窗 + postMessage 通知 opener 刷新）
+- 注入点：`chat-runner` / `task-runner` 的 `filterDisabledMcp` 外包一层 `enrichMcpServersWithOAuth`
+- UI：`mcp-card` 加 OAuth 授权区（http/sse 类且没手配 Authorization header 的 server 显示「授权 / 已授权 / 重新授权 / 撤销」）+ `use-mcp-oauth` hook（点击同步开窗规避弹窗拦截、focus/postMessage 刷新状态）+ `task-store` 3 个 helper
+- 端口：回调 `http://localhost:8876/api/mcp-oauth/callback`（dev/prod 都 8876、可 env `FE_AI_FLOW_BASE_URL` 覆盖、必须跟 DCR 注册一致）
+- **实测**：发起链路（读配置→发现→DCR→PKCE→生成授权 URL）curl 验证通过（返回合法 authorizationUrl、client_id / S256 / redirect_uri / state / resource 全对）；换 token + 注入连通待用户飞书授权后验
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+**另（工程：依赖安装跨平台兜底、2026-06-02）**：`@cursor/sdk` 间接依赖 `sqlite3`、`install` 走 `prebuild-install` 默认拉 GitHub releases——国内 / Windows + 新 Node 常踩坑（下载超时 → 退回 node-gyp 源码编译 → 要装 VS C++ 工具链）。三处协同、新人 `pnpm install` 开箱即用：① `package.json` `overrides` 锁 `sqlite3@^6.0.1`（5.x 无 Node24 prebuild）+ `pnpm.onlyBuiltDependencies` 放行 build 脚本（pnpm10 默认拦截）+ `packageManager` 锁 pnpm 版本；② `.npmrc` `sqlite3_binary_host_mirror=…npmmirror…/sqlite3` 把预编译包指向淘宝（win/mac/linux 全平台 napi 包齐、免本机编译）。**坑**：prebuild-install 7.x 按 **package name** 读 env（`sqlite3_binary_host_mirror`）、不是老 node-pre-gyp 的 `node_sqlite3_` 前缀（网上教程多数过时）。实测 pnpm lifecycle 透传该 .npmrc key、URL 精准命中淘宝、win napi-v6 包完整可下（含 `build/Release/node_sqlite3.node`）。
+
+**另（hot-fix：探测式判断哪些 MCP 真要 OAuth、2026-06-02）**：V0.6.4 初版用静态启发式判 OAuth 候选（凡有 `url` 且没手配 `Authorization` header 一律算「要授权」）、把 `figma-desktop`（本地 http）、`feishu-mcp`（url 自带 token）误判成要授权。改后端**探测**：`mcp-oauth.ts` 加 `evaluateMcpOAuthStatuses`——对每个**远程**（排除 localhost/127.0.0.1 本地地址 + 已手配 Authorization 的）server 发 MCP `initialize`、**只有真返 401（OAuth challenge）才算 `needsOAuth`**；探测非 401（公开 MCP / token 在 url）一律不进授权区。`McpOAuthStatus` 加 `needsOAuth`、`mcp-card` 去掉前端静态 `oauthCandidates`、直接用后端 `statuses`、`status` API 改调 `evaluateMcpOAuthStatuses`。
+
 ### V0.6.3：stop hook 兜底「保证 agent 交卷」+ 多技术栈兼容（2026-06-01、已落地）
 
 **背景**：质疑链「怎么保证 agent 干完一个 action 一定调 `wait_for_user` 交卷」。这不是小事——fe 所有后置 deterministic check 都挂在 `wait_for_user → runActionCheck` 上、**agent 不交卷、整条检查链（L1-L4）全部落空**。所以「保证交卷」= 保证质量门禁一定被触发。

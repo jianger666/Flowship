@@ -1,17 +1,18 @@
 "use client";
 
 /**
- * 用户基本信息卡片（V0.6 新增）
+ * 用户基本信息卡片（V0.6 新增、V0.6.7 加分支命名模板）
  *
- * V0.6 加 username：
- *   - 用于 ship action 拼 branch 前缀：`feature/<username>/<feishu-id>-<task.title>`
- *   - 多人共用 fe-ai-flow 时、branch 不互踩
- *   - 不填的话 ship action 准入条件会拒（V0.6.1 上线 ship 时强校验）
+ * V0.6 username：用于拼 feature 分支前缀、多人共用 fe-ai-flow 不互踩。
+ * V0.6.7 branchTemplate：全局默认 feature 分支命名模板、支持占位符、
+ *   per-repo 可在「仓库列表」卡覆盖（如后端用 {date:MM-dd} 段替代 {username} 段）。
  *
  * 设计取舍：
- *   - 不限制字符（数字 / 英文 / 拼音 缩写都行）、agent 写 branch 时再做防御性处理
- *   - 长度建议 ≤ 20、UI 只 placeholder 提示、不硬校验
+ *   - 文本框走 onChange 改草稿、onBlur 落盘（跟其它设置卡一致、避免每字符写 localStorage）
+ *   - 模板预览用示例变量实时渲染、让用户直观看到分支名长啥样
  */
+
+import { useMemo } from "react";
 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -22,24 +23,45 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { renderBranchName } from "@/lib/branch-template";
 
 interface UserProfileCardProps {
   username: string;
-  // 输入时改草稿、失焦（onBlur）落盘
+  branchTemplate: string;
+  // 用户名：输入改草稿、失焦落盘
   onChange: (next: string) => void;
   onCommit: (value: string) => void;
+  // 分支模板：输入改草稿、失焦落盘
+  onBranchTemplateChange: (next: string) => void;
+  onBranchTemplateCommit: (value: string) => void;
 }
 
 export const UserProfileCard = ({
   username,
+  branchTemplate,
   onChange,
   onCommit,
+  onBranchTemplateChange,
+  onBranchTemplateCommit,
 }: UserProfileCardProps) => {
+  // 模板预览：用一组示例变量渲染当前模板、用户改模板时实时看到效果
+  const preview = useMemo(
+    () =>
+      renderBranchName(branchTemplate, {
+        username: username || "clj",
+        storyId: "6956910305",
+        taskTitle: "用户列表批量导出",
+      }),
+    [branchTemplate, username],
+  );
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>个人信息</CardTitle>
-        <CardDescription>用户名用于拼 git branch 前缀</CardDescription>
+        <CardDescription>
+          用户名 + feature 分支命名模板（建任务时按此生成分支名）
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-1.5">
@@ -51,11 +73,27 @@ export const UserProfileCard = ({
             onBlur={() => onCommit(username)}
             placeholder="如 clj"
           />
+        </div>
+
+        <div className="grid gap-1.5">
+          <Label htmlFor="settings-branch-template">默认分支命名模板</Label>
+          <Input
+            id="settings-branch-template"
+            value={branchTemplate}
+            onChange={(e) => onBranchTemplateChange(e.target.value)}
+            onBlur={() => onBranchTemplateCommit(branchTemplate)}
+            placeholder="feature/{username}/{storyId}-{taskTitle}"
+            className="font-mono"
+          />
           <p className="text-xs text-muted-foreground">
-            branch 模板 ={" "}
-            <code className="font-mono">
-              feature/{username || "<username>"}/&lt;id&gt;-&lt;任务名&gt;
-            </code>
+            占位符 <code className="font-mono">{"{username}"}</code>{" "}
+            <code className="font-mono">{"{storyId}"}</code>{" "}
+            <code className="font-mono">{"{taskTitle}"}</code>{" "}
+            <code className="font-mono">{"{date:MM-dd}"}</code>；可在仓库列表为单仓覆盖
+          </p>
+          <p className="text-xs text-muted-foreground">
+            预览：
+            <code className="font-mono text-foreground/80">{preview}</code>
           </p>
         </div>
       </CardContent>

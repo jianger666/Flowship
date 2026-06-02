@@ -148,15 +148,17 @@ V0.5 phase 顺序拆掉后、用 6 个显性门槛补回保证：
 | 5. cross-action 一致性自检 | V0.6.4+ 再做 | - |
 | 6. placeholder 动态 | UI 按 action + task 状态变 | `advance-dialog.tsx: buildPlaceholder` |
 
-### Git Branch 自动建（V0.6.1 重构、多仓适配）
+### Git Branch 自动建（V0.6.1 多仓、V0.6.7 命名模板化）
 
-build action 每次跑前、runner 拼 `GitBranchInfo[]`（每仓 1 条同名 branch）、prompt 头部追加**多仓 idempotent** checkout 引导：
+build action 每次跑前、runner 拼 `GitBranchInfo[]`（每仓 1 条 branch）、prompt 头部追加**多仓 idempotent** checkout 引导。
 
-```
-feature/<settings.username>/<飞书 story id>-<task.title 转换后>
-```
+**分支名按模板渲染**（V0.6.7、`src/lib/branch-template.ts`、内置默认 `feature/{username}/{storyId}-{taskTitle}`）：
 
-agent 用 SDK shell 对每个仓跑一段 idempotent 命令：
+- 占位符：`{username}` / `{storyId}`（从 feishuStoryUrl 抠）/ `{taskTitle}` / `{date:FORMAT}`、每个值各自 branch-safe 化（含路径分隔 `/`、模板字面的 `/` 才是层级）
+- 模板层级：per-repo 覆盖 > 全局默认 > 内置默认；建 task 时由 client `resolveBranchTemplate` 算「有效模板」固化进 `task.repoBranchTemplates`、build 直接渲染——**不同仓可用不同模板**（如后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）
+- 用户在新建 / 编辑 dialog 给某仓填了「已有工作分支」(`repoFeatureBranches`) → 用它当 name（build 复用、不另建）
+
+agent 用 SDK shell 对每个仓跑一段 idempotent 命令（base 分支：配了线上分支用配的、没配则自探 master/main/develop）：
 
 ```bash
 BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
@@ -167,15 +169,16 @@ else
 fi
 ```
 
-每次 build 都重新 inject 这段 hint、不再维护 `checkedOut` 状态。多仓 task 各仓 base 分支自探（不同仓可能 master / main / develop）、共用同一 branch name。
+每次 build 都重新 inject 这段 hint、不再维护 `checkedOut` 状态。多仓各仓 branch name 取决于模板（同模板=同名、不同模板=各异）。
 
-没填 username / feishuStoryUrl 时不建 branch、走 fallback。
+没填 feishuStoryUrl / 没绑仓时不建 branch、走 fallback（V0.6.7 起 username 不再硬性必需、后端模板可能不含 `{username}`）。
 
 ### Ship action + GitLab REST 集成（V0.6.1）
 
 ship 实现要点：
 
 - **server-side GitLab REST API**：`src/lib/server/gitlab-client.ts` 直接 fetch `/api/v4/projects/:id/merge_requests`、走 PAT (`PRIVATE-TOKEN` header)；**不**依赖 glab CLI / 外部 MCP server
+- **提测目标分支 per-repo（V0.6.7）**：MR target = 该仓的测试分支（`task.repoTestBranches[repoPath]`、建 task 时从设置页快照）、没配回退 `test`；agent 从 super prompt「仓库分支配置」段读、不探 `origin/HEAD`（那是默认主分支、跟提测工作流不符）
 - **PAT 不暴露给 agent**：agent 通过 MCP 工具 `submit_mr` 间接调、server 端凭 settings 闭包的 token 访问 GitLab；MCP 工具返结构化 JSON（`{ ok, mr_url, mr_iid, mr_version }`）
 - **多仓 task 每仓 1 条 MR**：`Task.gitBranches[]` / `Task.mrs[]` / `ActionRecord.sideEffects.mrs[]` 都按 `repoPath` 区分；某仓 `git diff` 为空时 agent 跳过、在 artifact 写跳过原因
 - **同分支累计 commit**：同 `repoPath` 多次 ship 不开新 MR、`task.mrs[repoPath]` 的 `version` 累加、保留 `createdAt` 首次值——`upsertMR(taskId, repoPath, ...)`
@@ -235,44 +238,60 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.6.5：设置页编辑即保存 + 「常用 MCP」开关（建任务取快照）（2026-06-02）
+### V0.6.7：ship 提测 / dev 分支 per-repo 配置 + feature 分支命名模板化（2026-06-02）
 
-**需求**：设置页给每个 MCP 加「常用」开关、建任务时取这份快照作默认黑名单——常用的默认带、不常用的默认关、建 task 弹窗里仍可临时增减。
+**需求**：① 给「ship 提测分支」「dev 分支」做 per-repo 配置（之前 ship 写死提测到 `test`）；② feature 分支命名从写死算法（`feature/<username>/<storyId>-<title>`）改成用户可配模板、支持前后端不同规范（前端 `feature/{username}/{storyId}-{taskTitle}`、后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）。
 
-**数据**：`FeAiFlowSettings.disabledMcpServers`（全局默认黑名单、跟 task 级 `task.disabledMcpServers` 同形）。`local-store` 的 `DEFAULT_SETTINGS` 补空数组、`getSettings` 读时兜 `Array.isArray`。`use-settings` 的 `isFieldEqual` 给它单独走「排序后逐项比」（数组无序）、`dirty` 纳入。
+**模板引擎**（`src/lib/branch-template.ts`、client + server 共用、不依赖 node）：
+- 占位符 4 个：`{username}` / `{storyId}`（从 feishuStoryUrl 抠 `detail/<digits>`）/ `{taskTitle}`（原算法的 title 改名）/ `{date:FORMAT}`（FORMAT 支持 yyyy/yy/MM/dd/HH/mm/ss）。`{storyTitle}` 用户明确先不加（server 端没有飞书调用通道）
+- `renderBranchName(template, vars, now?)`：每个变量值各自 `sanitizeBranchSegment`（git 非法字符 + 路径分隔 `/` 都换 `-`、模板字面的 `/` 保留 → 层级由模板控制、变量值不撑层级）、渲染后清连续 `//` + 去首尾 `/`
+- `resolveBranchTemplate(repoTpl, globalTpl)`：算「有效模板」= per-repo 覆盖 > 全局默认 > 内置默认 `DEFAULT_BRANCH_TEMPLATE`
 
-**建任务取快照**：`new-task-dialog` open 时 `setDisabledMcp(settings.disabledMcpServers ?? [])` 作默认。因为 settings 在 localStorage、server 读不到 → 必须建 task 时由 client 固化进 `task.disabledMcpServers`。
+**配置层级**（用户选方案 1）：全局默认 `settings.branchTemplate` + per-repo 覆盖 `settings.repos[].branchTemplate`。测试 / dev 分支是「仓库属性」per-repo（`settings.repos[].testBranch / devBranch`）、放设置页不放任务编辑弹窗。devBranch 暂无用途、只存配置。
 
-**改即存 → 全设置页（用户拍板「所有保存按钮都去掉、编辑即保存」）**：业界共识（macOS 系统设置 / VS Code / Notion 都改即存）。`use-settings` 加 `saveFieldValue(key, value)` 作**唯一落盘入口**、删 `saveField`：base 取 `getSettings()` 读「落盘最新」（**连续存不同字段不互相覆盖**）、state 只更新该字段（**不冲掉其它正在输入未 blur 的草稿**）、不弹 success toast（仅失败弹）。控件分两类落盘时机——**选择 / 开关 / 增删等离散操作**：`onChange` 直接 `saveFieldValue`；**文本框**（apiKey / username / gitHost / gitToken / repo 名 + 线上分支）：`onChange` 只改草稿（`update`）、`onBlur` 才落盘（避免每敲一字符就写 + 存进半成品）。6 张卡片全去 `SaveButton`、`save-button.tsx` 删。`dirty` / `hasUnsaved` / beforeunload 保留作「文本框输入中途未 blur 就关页」的兜底提醒。
+**数据流**（同 `repoBaseBranches` 模式、因 settings 在 localStorage、server 读不到、必须建 task 时固化）：
 
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
-**另（hot-fix：修同事试用反馈的两个 UI bug、2026-06-02）**：
-
-1. **Select 受控/非受控切换 console 警告**（`A component is changing the uncontrolled value state of Select to be controlled`）——Base UI Select 以「`value` 是否 `undefined`」判定受控/非受控、`value={x || undefined}` 在初次渲染（空 → undefined、非受控）与有值后（string、受控）之间切换触发警告。修：空值统一传 `null`（Base UI 类型 `value?: Value | null | undefined` 明确支持 null 作受控空值、trigger 照常显示 placeholder）。扫全项目 5 个 `<Select>`、改其中 4 处（`model-picker` base + param select / `artifact-panel` diff 版本选择器 / `new-task-dialog` 换模型）；`new-task-dialog` 的 role select 因 `useState<TaskRole>("fe")` 恒有值、本就受控、不动。
-2. **推进弹窗「打开后选中跳一下」**——`advance-dialog` 把「表单初始化」和「按需拉模型列表」塞进同一 `useEffect` 且依赖 `availableModels.length`、模型列表异步加载完成（length 0 → N）触发 effect 重跑、把用户已改的 action 选中打回默认（实测：选「提测」跳回「方案」）。修：拆成两个 effect——表单初始化只依赖 `[open, defaultActionType]`、拉模型单独一个 effect（只 fetch、不碰任何表单 state、即便重跑也无副作用）。
-
-### V0.6.4：MCP OAuth（fe 自己跑标准 OAuth、让走 OAuth 的远程 MCP 在 fe 可用）（2026-06-01）
-
-**背景**：飞书项目 MCP（`project.feishu.cn/mcp_server/v1`）走标准 OAuth——Cursor 里点浏览器授权、token 存 Cursor 内部、连接时注入。但 fe 读 `~/.cursor/mcp.json` 只拿到裸 url（OAuth token 不写文件）、SDK 起的 agent 是 headless 弹不了浏览器 → 连 server 直接 401、用不了。
-
-**实锤**（curl 探测飞书项目）：教科书级 OAuth 2.1——401 带标准 `WWW-Authenticate`、Protected Resource Metadata（RFC 9728）+ Authorization Server Metadata（RFC 8414）齐全、DCR 动态注册（**接受 localhost 回调**）、PKCE S256、refresh_token。
-
-**方案**：fe 自己跑标准 OAuth flow（复用 `@modelcontextprotocol/sdk` 自带 OAuth client：`auth()` 一站式做发现 / DCR / PKCE / 换 token / refresh）、token 落服务端文件、起 agent 前注入 `mcpServers[name].headers.Authorization`。一次授权、refresh_token 长期自动续——跟 Cursor 体验一致。**通用**：任何标准 OAuth 2.1 的 MCP 都能用、不止飞书项目。
+```
+settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
+  → 建 task：new-task-dialog 快照（resolveBranchTemplate 算有效模板）
+  → task.{repoTestBranches,repoDevBranches,repoBranchTemplates}（meta 落盘）
+  → build：planBranchesForBuild 用 repoBranchTemplates 渲染分支名
+  → ship：agent 从 super prompt「仓库分支配置」段读测试分支（没配回退 test）
+```
 
 **落地**：
-- `src/lib/server/mcp-oauth.ts`：`FileOAuthClientProvider`（OAuthClientProvider 实现、状态全部落 `data/mcp-oauth/<server>.json`、靠 serverName 跨请求串）+ `startMcpOAuth` / `completeMcpOAuth`（CSRF state 校验）/ `enrichMcpServersWithOAuth`（注入、access 过期先 refresh、提前 60s 续）/ status / revoke。认证方式取舍：飞书 auth metadata 没声明 `token_endpoint_auth_methods_supported`、SDK 在 client 有 secret（DCR 颁发）时默认 `client_secret_basic`、实测 OK
-- 4 个 API：`/api/mcp-oauth/{start,callback,status,revoke}`。callback 返回结果 HTML（成功自动关窗 + postMessage 通知 opener 刷新）
-- 注入点：`chat-runner` / `task-runner` 的 `filterDisabledMcp` 外包一层 `enrichMcpServersWithOAuth`
-- UI：`mcp-card` 加 OAuth 授权区（http/sse 类且没手配 Authorization header 的 server 显示「授权 / 已授权 / 重新授权 / 撤销」）+ `use-mcp-oauth` hook（点击同步开窗规避弹窗拦截、focus/postMessage 刷新状态）+ `task-store` 3 个 helper
-- 端口：回调 `http://localhost:8876/api/mcp-oauth/callback`（dev/prod 都 8876、可 env `FE_AI_FLOW_BASE_URL` 覆盖、必须跟 DCR 注册一致）
-- **实测**：发起链路（读配置→发现→DCR→PKCE→生成授权 URL）curl 验证通过（返回合法 authorizationUrl、client_id / S256 / redirect_uri / state / resource 全对）；换 token + 注入连通待用户飞书授权后验
+- `types.ts`：`RepoConfig` +`testBranch?`/`devBranch?`/`branchTemplate?`；`FeAiFlowSettings` +`branchTemplate?`（全局默认）；`Task` +`repoTestBranches?`/`repoDevBranches?`/`repoBranchTemplates?`；`NewTaskInput` Pick 加这三个
+- `local-store.ts`：`DEFAULT_SETTINGS.branchTemplate = DEFAULT_BRANCH_TEMPLATE` + `getSettings` 兜底
+- `user-profile-card.tsx`：加「默认分支命名模板」输入框 + 占位符说明 + `useMemo` 实时预览
+- `repo-card.tsx`：每仓单行改三行网格、加 test/dev/模板覆盖输入框、通用 `setRepoField(path, field, value)` + `onRepoFieldBlur` 替代原 `setOnlineBranch`
+- `new-task-dialog.tsx`：handleSubmit 快照三字段进 createTask
+- `task-fs.ts`：meta 加 3 字段 + createTask 清洗（key 限定 repoPaths + trim）+ hydrateTask 映射
+- `task-runner.ts`：`planBranchesForBuild` 去 username 硬检查、改 `renderBranchName`(per-repo 模板)；新增 `renderRepoBranchSection(task)` 注入 super prompt
+- `prompts/_super.md`：任务基本信息段后加「仓库分支配置」段 + `{{repoBranchSection}}`
+- `prompts/action-ship.md`：测试分支不再写死 `test`（6 处）、改「读 super prompt 仓库分支配置段、没配回退 test」
+- `chat-mcp.ts`：`submit_mr` 的 `target_branch` describe 同步改（跟 ship prompt 一致、避免第二指令源冲突）
+- **hot-fix（接手补跑 typecheck 发现）**：`use-settings.ts` 的 `dirty`（`Record<keyof FeAiFlowSettings, boolean>`）+ `isFieldEqual` 字符串分支补 `branchTemplate`（不补报 TS2741、上一会话工具崩溃没跑成 typecheck 漏的）
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-**另（工程：依赖安装跨平台兜底、2026-06-02）**：`@cursor/sdk` 间接依赖 `sqlite3`、`install` 走 `prebuild-install` 默认拉 GitHub releases——国内 / Windows + 新 Node 常踩坑（下载超时 → 退回 node-gyp 源码编译 → 要装 VS C++ 工具链）。三处协同、新人 `pnpm install` 开箱即用：① `package.json` `overrides` 锁 `sqlite3@^6.0.1`（5.x 无 Node24 prebuild）+ `pnpm.onlyBuiltDependencies` 放行 build 脚本（pnpm10 默认拦截）+ `packageManager` 锁 pnpm 版本；② `.npmrc` `sqlite3_binary_host_mirror=…npmmirror…/sqlite3` 把预编译包指向淘宝（win/mac/linux 全平台 napi 包齐、免本机编译）。**坑**：prebuild-install 7.x 按 **package name** 读 env（`sqlite3_binary_host_mirror`）、不是老 node-pre-gyp 的 `node_sqlite3_` 前缀（网上教程多数过时）。实测 pnpm lifecycle 透传该 .npmrc key、URL 精准命中淘宝、win napi-v6 包完整可下（含 `build/Release/node_sqlite3.node`）。
+### V0.6.6：详情页编辑任务（2026-06-02）
 
-**另（hot-fix：探测式判断哪些 MCP 真要 OAuth、2026-06-02）**：V0.6.4 初版用静态启发式判 OAuth 候选（凡有 `url` 且没手配 `Authorization` header 一律算「要授权」）、把 `figma-desktop`（本地 http）、`feishu-mcp`（url 自带 token）误判成要授权。改后端**探测**：`mcp-oauth.ts` 加 `evaluateMcpOAuthStatuses`——对每个**远程**（排除 localhost/127.0.0.1 本地地址 + 已手配 Authorization 的）server 发 MCP `initialize`、**只有真返 401（OAuth challenge）才算 `needsOAuth`**；探测非 401（公开 MCP / token 在 url）一律不进授权区。`McpOAuthStatus` 加 `needsOAuth`、`mcp-card` 去掉前端静态 `oauthCandidates`、直接用后端 `statuses`、`status` API 改调 `evaluateMcpOAuthStatuses`。
+**需求**：建完任务后能在详情页改「建任务时填的软配置」——以前填错只能删了重建。
+
+**可改字段**（`EditTaskDialog`、详情页标题旁「编辑」按钮、`runStatus === "running"` 时隐藏避免跟正在跑的不一致）：角色 / 标题 / 飞书链接 / 模型 / per-repo 已有工作分支。
+
+**刻意不可改**：`mode`（task/chat 两套通路、切了等于换任务）；`repoPaths`（副作用大：变 agent cwd、已建分支/MR 对不上）——只读展示；MCP 开关 / 上下文 doc——详情页已有各自面板。
+
+**副作用约定**：角色改完下次推进 action 立即生效；标题 / 飞书链接不改已建的 git 分支名（建时已固化）、只影响之后新建的。
+
+**落地**：
+- `src/components/tasks/edit-task-dialog.tsx`（新）：表单初始化只依赖 `[open]` + `task` ref 化——避免 dialog 开着时 task 因 SSE 更新（引用变）重跑 effect 把草稿重置（advance-dialog 同款教训）
+- `task-fs.ts: updateTaskFields`（新）：`withTaskLock` 包 read-modify-write；改飞书链接时**同步「建任务自动生成的 url 上下文文档」**（否则 agent 读 contextDocs 仍是旧链接、两处漂移）；model `null`=清空回退 settings 默认；repoFeatureBranches 同 createTask 清洗（key 限定 repoPaths + trim）
+- `api/tasks/[id]/route.ts` PATCH：加编辑字段分支（title/role/feishuStoryUrl/model/repoFeatureBranches、可一次传多个、role 限 fe/be、title 非空校验）
+- `task-store.ts: updateTaskFields`（新 client helper、走 `handleJson`、传 `null` 显式清空）
+- `tasks/[id]/page.tsx`：接入「编辑」按钮 + `EditTaskDialog`
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
 
 ---
 
@@ -311,13 +330,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | 推进 dialog（V0.6 重写、选 action） | `src/components/tasks/advance-dialog.tsx` |
 | 再聊聊 dialog（V0.6 适配 actionLabel） | `src/components/tasks/revise-dialog.tsx` |
 | 新建任务 dialog（V0.6.0.1 重新加 mode tab） | `src/components/tasks/new-task-dialog.tsx` |
+| 编辑任务 dialog（V0.6.6、详情页改软配置字段） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` |
 | 任务卡片（V0.6 双状态） | `src/components/tasks/task-card.tsx` |
 | 任务详情页（V0.6 重写） | `src/app/tasks/[id]/page.tsx` |
 | 任务角色 schema + 展示文案 | `src/lib/types.ts: TaskRole / TASK_ROLE_LABEL` |
 | 多仓 cwd / repoPaths 工具 | `src/lib/path-utils.ts: getEffectiveCwd / formatRepoSectionForPrompt` |
 | Artifact ref / 文件路径渲染（V0.6.0.1 加 `actions/` 前缀支持） | `src/lib/path-utils.ts: looksLikeArtifactRef / looksLikePath / buildCursorLink` |
-| 设置：username（V0.6 新增） | `src/components/settings/user-profile-card.tsx` |
+| 设置：username + 默认分支命名模板（V0.6.7 加模板） | `src/components/settings/user-profile-card.tsx` |
+| 设置：仓库列表 + per-repo 线上/测试/dev 分支 + 模板覆盖（V0.6.7） | `src/components/settings/repo-card.tsx` |
 | 设置：GitLab Host + PAT（V0.6.1 新增） | `src/components/settings/git-card.tsx` |
+| **feature 分支命名模板引擎（V0.6.7、client+server 共用）** | `src/lib/branch-template.ts` |
 | 模型选择器共享组件（V0.6.0.1 抽出、settings + advance dialog 共用） | `src/components/ui/model-picker.tsx` |
 | Skills loader | `src/lib/server/skills-loader.ts` |
 
