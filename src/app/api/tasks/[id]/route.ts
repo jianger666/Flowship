@@ -21,7 +21,7 @@ import {
 } from "@/lib/server/task-fs";
 import { cancelTaskRun } from "@/lib/server/task-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
-import type { ModelSelection, TaskRole } from "@/lib/types";
+import type { TaskRole } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -50,7 +50,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       title?: string;
       role?: TaskRole;
       feishuStoryUrl?: string | null;
-      model?: ModelSelection | null;
       repoFeatureBranches?: Record<string, string> | null;
     };
 
@@ -102,12 +101,11 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ ok: true });
     }
 
-    // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / model / repoFeatureBranches、可一次传多个）
+    // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / repoFeatureBranches、可一次传多个）
     const editKeys = [
       "title",
       "role",
       "feishuStoryUrl",
-      "model",
       "repoFeatureBranches",
     ] as const;
     if (editKeys.some((k) => k in body)) {
@@ -127,7 +125,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
         title: body.title,
         role: body.role,
         feishuStoryUrl: body.feishuStoryUrl,
-        model: body.model,
         repoFeatureBranches: body.repoFeatureBranches,
       });
       if (!task)

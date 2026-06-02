@@ -119,7 +119,8 @@ export const setTaskUiLayout = async (
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
  * 走 PATCH /api/tasks/[id]、字段语义：不传 = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
- * 可改：title / role / feishuStoryUrl / model / repoFeatureBranches；mode / repoPaths 不在此改。
+ * 可改：title / role / feishuStoryUrl / repoFeatureBranches；mode / repoPaths / model 不在此改
+ *（model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、走推进 dialog 的模型选择）。
  */
 export const updateTaskFields = async (
   id: string,
@@ -127,7 +128,6 @@ export const updateTaskFields = async (
     title?: string;
     role?: TaskRole;
     feishuStoryUrl?: string | null;
-    model?: ModelSelection | null;
     repoFeatureBranches?: Record<string, string> | null;
   },
 ): Promise<Task> => {

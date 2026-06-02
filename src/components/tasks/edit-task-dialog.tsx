@@ -4,15 +4,16 @@
  * 编辑任务 Dialog（V0.6.6）
  *
  * 详情页「编辑」按钮打开、改建任务时填的软配置字段：
- *   角色 / 标题 / 飞书链接 / 模型 / 已有工作分支（per-repo）
+ *   角色 / 标题 / 飞书链接 / 已有工作分支（per-repo）
  *
  * 刻意不在此改：
+ *   - 模型 model（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）
  *   - mode（task/chat 是两套通路、切了等于换任务）
  *   - 仓库 repoPaths（副作用大：变 agent cwd、已建 git 分支/MR 对不上）——只读展示
  *   - MCP 开关（走 TaskMcpPanel）、上下文 doc（走 ContextDocsPanel）——详情页已有各自面板
  *
- * 副作用约定：
- *   - 角色：改完下次推进 action 时 AI 按新角色视角跑（立即生效）
+ * 副作用约定（V0.6.6 热更）：
+ *   - 角色 / 标题 / 飞书链接：长生 agent reused 推进时 task-runner 会 diff 启动快照、有变拼 [TASK_UPDATED] 注入告知（立即生效）
  *   - 标题 / 飞书链接：已建的 git 分支名不会改（建时已固化）、只影响之后新建的
  *   - running 时不让编辑（详情页入口禁用）、避免改了跟正在跑的不一致
  */
@@ -32,7 +33,6 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ModelPicker } from "@/components/ui/model-picker";
 import {
   Select,
   SelectContent,
@@ -40,15 +40,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
-import {
-  TASK_ROLE_LABEL,
-  type ModelSelection,
-  type Task,
-  type TaskRole,
-} from "@/lib/types";
+import { TASK_ROLE_LABEL, type Task, type TaskRole } from "@/lib/types";
 
 const ROLE_OPTIONS: TaskRole[] = ["fe", "be"];
 
@@ -67,16 +61,12 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   const [title, setTitle] = useState(task.title);
   // 飞书项目链接（选填、空=清空）
   const [feishuStoryUrl, setFeishuStoryUrl] = useState(task.feishuStoryUrl ?? "");
-  // 任务级模型 selection；id 为空 = 用 settings 默认（提交时传 null 清空）
-  const [model, setModel] = useState<ModelSelection>(task.model ?? { id: "" });
   // per-repo「已有工作分支」草稿（key=repoPath）
   const [featureBranches, setFeatureBranches] = useState<
     Record<string, string>
   >(task.repoFeatureBranches ?? {});
   // 提交锁、防连点
   const [submitting, setSubmitting] = useState(false);
-  // 模型列表（给 ModelPicker、按需拉一次）
-  const { models: availableModels, fetchModels } = useModels();
 
   // task ref 化：让「打开时初始化」effect 只依赖 open、不依赖 task——
   // 否则 dialog 开着时 task 因 SSE 更新（引用变）会重跑 effect、把用户正在编辑的草稿重置（advance-dialog 同款教训）
@@ -90,19 +80,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     setRole(t.role);
     setTitle(t.title);
     setFeishuStoryUrl(t.feishuStoryUrl ?? "");
-    setModel(t.model ?? { id: "" });
     setFeatureBranches(t.repoFeatureBranches ?? {});
     setSubmitting(false);
   }, [open]);
-
-  // 按需拉模型列表（跟初始化解耦、只 fetch 不碰表单）
-  useEffect(() => {
-    if (!open) return;
-    const s = getSettings();
-    if (s.apiKey?.trim() && availableModels.length === 0) {
-      void fetchModels(s.apiKey);
-    }
-  }, [open, availableModels.length, fetchModels]);
 
   // 仓库名展示（featureBranches / 只读列表用）：settings.repos 查、查不到用路径尾段
   // mount 时读一次 settings.repos 即可（编辑 task 期间不会同时改设置页仓库名）
@@ -130,8 +110,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
         title: title.trim(),
         role,
         feishuStoryUrl: feishuStoryUrl.trim() || null,
-        // id 为空 = 清空、回退用 settings 默认模型
-        model: model.id ? model : null,
         repoFeatureBranches:
           Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
       });
@@ -260,23 +238,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               </div>
             </div>
           )}
-
-          {/* 模型 */}
-          <div className="grid gap-1.5">
-            <Label>模型</Label>
-            <ModelPicker
-              models={availableModels}
-              selection={model}
-              onChange={setModel}
-              disabled={submitting}
-              variant="compact"
-              emptyPlaceholder="（请先在设置页拉取模型列表）"
-              placeholder="用设置页默认模型"
-            />
-            <p className="text-xs text-muted-foreground">
-              留空用设置页默认；可为本任务单独挑
-            </p>
-          </div>
         </div>
 
         <DialogFooter className="gap-2">

@@ -308,21 +308,73 @@ const renderRepoBranchSection = (task: Task): string => {
   return lines.join("\n");
 };
 
-// 构造一个 [NEXT_ACTION ...] 头部 + 用户指令 + 附件段 + branch checkout hint
+// V0.6.6 热更：agent 长生期间用户可能在详情页编辑 role / title / feishuStoryUrl、
+// 用 agent 启动时的快照 diff 出「变了哪几项」、reused 推进时注入告知。
+// 注：model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、不在热更之列。
+interface TaskFieldsSnapshot {
+  title: string;
+  role: Task["role"];
+  feishuStoryUrl?: string;
+}
+
+const captureTaskFieldsSnapshot = (task: Task): TaskFieldsSnapshot => ({
+  title: task.title,
+  role: task.role,
+  feishuStoryUrl: task.feishuStoryUrl,
+});
+
+// diff 当前 task vs 启动快照、只把变了的字段拼成一段 [TASK_UPDATED]；无变化返 undefined（不注入）
+const buildTaskUpdateHint = (
+  task: Task,
+  snapshot: TaskFieldsSnapshot,
+): string | undefined => {
+  const lines: string[] = [];
+  if (task.role !== snapshot.role) {
+    lines.push(
+      `- ⚠️ 角色已从「${TASK_ROLE_LABEL[snapshot.role]}」改为「${TASK_ROLE_LABEL[task.role]}」、后续所有 action 以此角色视角为准、忽略开头 super prompt 里的旧角色`,
+    );
+  }
+  if (task.title !== snapshot.title) {
+    lines.push(`- 任务标题已更新为「${task.title}」`);
+  }
+  const oldUrl = snapshot.feishuStoryUrl ?? "";
+  const newUrl = task.feishuStoryUrl ?? "";
+  if (oldUrl !== newUrl) {
+    lines.push(newUrl ? `- 飞书链接已更新为 ${newUrl}` : "- 飞书链接已清空");
+  }
+  if (lines.length === 0) return undefined;
+  return [
+    "[TASK_UPDATED] 用户在详情页编辑了任务字段、以下为最新值：",
+    ...lines,
+  ].join("\n");
+};
+
+// 构造一个 [NEXT_ACTION ...] 头部 + 任务字段热更 + 用户指令 + 附件段 + branch checkout hint
 const buildNextActionDirective = (input: {
   action: ActionRecord;
   userInstruction: string;
   attachedImagePaths?: string[];
   attachedFilePaths?: string[];
   branchCheckoutHint?: string;
+  taskUpdateHint?: string;
 }): string => {
-  const { action, userInstruction, attachedImagePaths, attachedFilePaths, branchCheckoutHint } =
-    input;
+  const {
+    action,
+    userInstruction,
+    attachedImagePaths,
+    attachedFilePaths,
+    branchCheckoutHint,
+    taskUpdateHint,
+  } = input;
   const head =
     `[NEXT_ACTION action_id=${action.id} type=${action.type} n=${action.n}` +
     (action.artifactPath ? ` artifact_path=${action.artifactPath}` : "") +
     "]";
   const lines: string[] = [head, ""];
+  // 任务字段热更（仅 reused 路径会传、有变化才有值）放最前、让 agent 先校准上下文再读指令
+  if (taskUpdateHint && taskUpdateHint.trim().length > 0) {
+    lines.push(taskUpdateHint.trim(), "");
+  }
   if (userInstruction.trim().length > 0) {
     lines.push(userInstruction.trim(), "");
   } else {
@@ -388,6 +440,8 @@ export type TaskStreamListener = (ev: TaskStreamEvent) => void;
 interface RunningTaskRecord {
   agentId: string;
   startedAt: number;
+  // V0.6.6 热更：agent 启动时的 {title,role,feishuStoryUrl} 快照、reused 推进时 diff 出变更注入 directive
+  startSnapshot: TaskFieldsSnapshot;
   cancel: () => void;
   completion: Promise<void>;
 }
@@ -875,6 +929,13 @@ export const advanceTask = async (
   // 4) 决定路由
   const existingRecord = runningTasks.get(task.id);
   if (existingRecord && !forceNewAgent) {
+    // V0.6.6 热更：agent 长生期间用户可能在详情页改了 role / title / feishuStoryUrl
+    // diff 启动快照、有变才拼一段 [TASK_UPDATED] 注入；注入后把快照推进到当前值、避免下次重复告知同一变更
+    const taskUpdateHint = buildTaskUpdateHint(
+      taskAfterAppend,
+      existingRecord.startSnapshot,
+    );
+    existingRecord.startSnapshot = captureTaskFieldsSnapshot(taskAfterAppend);
     // agent 在「待命态」（等下一 action 指令）、submitNextAction 直接续接
     const ok = submitNextAction(
       task.id,
@@ -890,6 +951,7 @@ export const advanceTask = async (
         attachedImagePaths,
         attachedFilePaths,
         branchCheckoutHint,
+        taskUpdateHint,
       }),
       attachedImagePaths,
       attachedFilePaths,
@@ -1388,6 +1450,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       runningTasks.set(task.id, {
         agentId: agent.agentId,
         startedAt: Date.now(),
+        startSnapshot: captureTaskFieldsSnapshot(task),
         cancel: () => {
           cancelled = true;
           cancelPending(task.id);

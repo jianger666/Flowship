@@ -1027,8 +1027,9 @@ export const setTaskUiLayout = async (
 /**
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
- * 只放可安全后改的软配置：title / role / feishuStoryUrl / model / repoFeatureBranches。
- * 不在此改 mode（切通路）/ repoPaths（副作用大、影响 cwd + 已建分支）/ repoStatus / runStatus / actions。
+ * 只放可安全后改的软配置：title / role / feishuStoryUrl / repoFeatureBranches。
+ * 不在此改 model（SDK Run 启动时绑定、改了只能换新 agent）/ mode（切通路）/
+ * repoPaths（副作用大、影响 cwd + 已建分支）/ repoStatus / runStatus / actions。
  *
  * 入参语义：字段为 undefined = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
  */
@@ -1036,7 +1037,6 @@ export interface UpdateTaskFieldsInput {
   title?: string;
   role?: TaskRole;
   feishuStoryUrl?: string | null;
-  model?: ModelSelection | null;
   repoFeatureBranches?: Record<string, string> | null;
 }
 
@@ -1069,11 +1069,6 @@ export const updateTaskFields = async (
         );
         if (doc) doc.content = newUrl;
       }
-    }
-
-    // 模型：null = 清空（回退用 settings 默认）
-    if (input.model !== undefined) {
-      meta.model = input.model ?? undefined;
     }
 
     // 已有工作分支：跟 createTask 同款清洗——key 限定在本 task 的 repoPaths 内、value trim 去空
