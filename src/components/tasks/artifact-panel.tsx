@@ -373,8 +373,9 @@ export const ArtifactPanel = ({
                 {splitView ? "并排" : "行内"}
               </ChoiceButton>
               <Select
-                value={compareFromTs == null ? undefined : String(compareFromTs)}
-                onValueChange={(v) => setCompareFromTs(Number(v))}
+                // 未选对比版本时用 null 保持受控（undefined 会被判为非受控、选版本后切换会报警告）
+                value={compareFromTs == null ? null : String(compareFromTs)}
+                onValueChange={(v) => v != null && setCompareFromTs(Number(v))}
               >
                 <SelectTrigger size="sm" className="ml-1 max-w-[160px]">
                   <SelectValue>

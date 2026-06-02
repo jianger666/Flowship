@@ -206,6 +206,10 @@ export const AdvanceDialog = ({
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
 
+  // dialog 打开时初始化表单 state。
+  // 关键：依赖只放 open / defaultActionType，绝不放 availableModels.length——
+  // 否则模型列表异步加载完成（length 0→N）会重跑本 effect，把用户已经改过的 action 选中
+  //（如「提测」）、指令、开关全部打回默认值（「方案」），这就是「打开弹窗选中会跳一下」的根因。
   useEffect(() => {
     if (!open) return;
     setActionType(defaultActionType);
@@ -213,18 +217,22 @@ export const AdvanceDialog = ({
     setForceNewAgent(false);
     // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
     const s = getSettings();
-    setPickedModel(
-      s.defaultModel ?? { id: "" },
-    );
+    setPickedModel(s.defaultModel ?? { id: "" });
     setGitConfig({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
-    // 第一次打开 / 切 task 时按需拉模型列表（settings page 已拉过、内存里有就跳过）
+  }, [open, defaultActionType]);
+
+  // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
+  // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
+  useEffect(() => {
+    if (!open) return;
+    const s = getSettings();
     if (s.apiKey?.trim() && availableModels.length === 0) {
       void fetchModels(s.apiKey);
     }
-  }, [open, defaultActionType, availableModels.length, fetchModels]);
+  }, [open, availableModels.length, fetchModels]);
 
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
   const disabledReason = useMemo(

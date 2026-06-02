@@ -108,7 +108,9 @@ export const ModelPicker = ({
   return (
     <div className="space-y-2">
       <Select
-        value={selection.id || undefined}
+        // 空值传 null 而非 undefined：Base UI Select 以「value 是否 undefined」判定受控/非受控，
+        // settings 加载前 selection.id 为空 → undefined（非受控）、加载后 → string（受控）会触发切换警告
+        value={selection.id || null}
         onValueChange={(v) => v && onPickModel(v)}
         disabled={disabled || models.length === 0}
       >
@@ -146,7 +148,8 @@ export const ModelPicker = ({
                   {renderParamLabel(p)}
                 </Label>
                 <Select
-                  value={current}
+                  // 同上：参数未选中时 current 为 undefined，用 null 兜底保持受控
+                  value={current ?? null}
                   onValueChange={(v) => v && onPickParam(p.id, v)}
                   disabled={disabled}
                 >

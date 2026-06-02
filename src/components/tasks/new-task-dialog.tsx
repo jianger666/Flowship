@@ -425,7 +425,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           <div className="grid gap-1.5">
             <Label htmlFor="t-model">模型</Label>
             <Select
-              value={pickedModelId || undefined}
+              // 空值用 null 保持受控（避免 Base UI Select 非受控转受控警告）
+              value={pickedModelId || null}
               onValueChange={(v) => v && setPickedModelId(v)}
               disabled={availableModels.length === 0}
             >
