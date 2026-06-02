@@ -247,6 +247,11 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
+**另（hot-fix：修同事试用反馈的两个 UI bug、2026-06-02）**：
+
+1. **Select 受控/非受控切换 console 警告**（`A component is changing the uncontrolled value state of Select to be controlled`）——Base UI Select 以「`value` 是否 `undefined`」判定受控/非受控、`value={x || undefined}` 在初次渲染（空 → undefined、非受控）与有值后（string、受控）之间切换触发警告。修：空值统一传 `null`（Base UI 类型 `value?: Value | null | undefined` 明确支持 null 作受控空值、trigger 照常显示 placeholder）。扫全项目 5 个 `<Select>`、改其中 4 处（`model-picker` base + param select / `artifact-panel` diff 版本选择器 / `new-task-dialog` 换模型）；`new-task-dialog` 的 role select 因 `useState<TaskRole>("fe")` 恒有值、本就受控、不动。
+2. **推进弹窗「打开后选中跳一下」**——`advance-dialog` 把「表单初始化」和「按需拉模型列表」塞进同一 `useEffect` 且依赖 `availableModels.length`、模型列表异步加载完成（length 0 → N）触发 effect 重跑、把用户已改的 action 选中打回默认（实测：选「提测」跳回「方案」）。修：拆成两个 effect——表单初始化只依赖 `[open, defaultActionType]`、拉模型单独一个 effect（只 fetch、不碰任何表单 state、即便重跑也无副作用）。
+
 ### V0.6.4：MCP OAuth（fe 自己跑标准 OAuth、让走 OAuth 的远程 MCP 在 fe 可用）（2026-06-01）
 
 **背景**：飞书项目 MCP（`project.feishu.cn/mcp_server/v1`）走标准 OAuth——Cursor 里点浏览器授权、token 存 Cursor 内部、连接时注入。但 fe 读 `~/.cursor/mcp.json` 只拿到裸 url（OAuth token 不写文件）、SDK 起的 agent 是 headless 弹不了浏览器 → 连 server 直接 401、用不了。
