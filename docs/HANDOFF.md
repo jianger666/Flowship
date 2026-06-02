@@ -235,6 +235,26 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.4：MCP OAuth（fe 自己跑标准 OAuth、让走 OAuth 的远程 MCP 在 fe 可用）（2026-06-01）
+
+**背景**：飞书项目 MCP（`project.feishu.cn/mcp_server/v1`）走标准 OAuth——Cursor 里点浏览器授权、token 存 Cursor 内部、连接时注入。但 fe 读 `~/.cursor/mcp.json` 只拿到裸 url（OAuth token 不写文件）、SDK 起的 agent 是 headless 弹不了浏览器 → 连 server 直接 401、用不了。
+
+**实锤**（curl 探测飞书项目）：教科书级 OAuth 2.1——401 带标准 `WWW-Authenticate`、Protected Resource Metadata（RFC 9728）+ Authorization Server Metadata（RFC 8414）齐全、DCR 动态注册（**接受 localhost 回调**）、PKCE S256、refresh_token。
+
+**方案**：fe 自己跑标准 OAuth flow（复用 `@modelcontextprotocol/sdk` 自带 OAuth client：`auth()` 一站式做发现 / DCR / PKCE / 换 token / refresh）、token 落服务端文件、起 agent 前注入 `mcpServers[name].headers.Authorization`。一次授权、refresh_token 长期自动续——跟 Cursor 体验一致。**通用**：任何标准 OAuth 2.1 的 MCP 都能用、不止飞书项目。
+
+**落地**：
+- `src/lib/server/mcp-oauth.ts`：`FileOAuthClientProvider`（OAuthClientProvider 实现、状态全部落 `data/mcp-oauth/<server>.json`、靠 serverName 跨请求串）+ `startMcpOAuth` / `completeMcpOAuth`（CSRF state 校验）/ `enrichMcpServersWithOAuth`（注入、access 过期先 refresh、提前 60s 续）/ status / revoke。认证方式取舍：飞书 auth metadata 没声明 `token_endpoint_auth_methods_supported`、SDK 在 client 有 secret（DCR 颁发）时默认 `client_secret_basic`、实测 OK
+- 4 个 API：`/api/mcp-oauth/{start,callback,status,revoke}`。callback 返回结果 HTML（成功自动关窗 + postMessage 通知 opener 刷新）
+- 注入点：`chat-runner` / `task-runner` 的 `filterDisabledMcp` 外包一层 `enrichMcpServersWithOAuth`
+- UI：`mcp-card` 加 OAuth 授权区（http/sse 类且没手配 Authorization header 的 server 显示「授权 / 已授权 / 重新授权 / 撤销」）+ `use-mcp-oauth` hook（点击同步开窗规避弹窗拦截、focus/postMessage 刷新状态）+ `task-store` 3 个 helper
+- 端口：回调 `http://localhost:8876/api/mcp-oauth/callback`（dev/prod 都 8876、可 env `FE_AI_FLOW_BASE_URL` 覆盖、必须跟 DCR 注册一致）
+- **实测**：发起链路（读配置→发现→DCR→PKCE→生成授权 URL）curl 验证通过（返回合法 authorizationUrl、client_id / S256 / redirect_uri / state / resource 全对）；换 token + 注入连通待用户飞书授权后验
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+**另（工程：依赖安装跨平台兜底、2026-06-02）**：`@cursor/sdk` 间接依赖 `sqlite3`、`install` 走 `prebuild-install` 默认拉 GitHub releases——国内 / Windows + 新 Node 常踩坑（下载超时 → 退回 node-gyp 源码编译 → 要装 VS C++ 工具链）。三处协同、新人 `pnpm install` 开箱即用：① `package.json` `overrides` 锁 `sqlite3@^6.0.1`（5.x 无 Node24 prebuild）+ `pnpm.onlyBuiltDependencies` 放行 build 脚本（pnpm10 默认拦截）+ `packageManager` 锁 pnpm 版本；② `.npmrc` `sqlite3_binary_host_mirror=…npmmirror…/sqlite3` 把预编译包指向淘宝（win/mac/linux 全平台 napi 包齐、免本机编译）。**坑**：prebuild-install 7.x 按 **package name** 读 env（`sqlite3_binary_host_mirror`）、不是老 node-pre-gyp 的 `node_sqlite3_` 前缀（网上教程多数过时）。实测 pnpm lifecycle 透传该 .npmrc key、URL 精准命中淘宝、win napi-v6 包完整可下（含 `build/Release/node_sqlite3.node`）。
+
 ### V0.6.3：stop hook 兜底「保证 agent 交卷」+ 多技术栈兼容（2026-06-01、已落地）
 
 **背景**：质疑链「怎么保证 agent 干完一个 action 一定调 `wait_for_user` 交卷」。这不是小事——fe 所有后置 deterministic check 都挂在 `wait_for_user → runActionCheck` 上、**agent 不交卷、整条检查链（L1-L4）全部落空**。所以「保证交卷」= 保证质量门禁一定被触发。
@@ -274,30 +294,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **chat 僵尸态误判修复**：`chat-reply` route 原来「`running` 且无 pending」一律当僵尸标 error、会把「正在说话的活 agent」误杀（前端 SSE 滞后发消息的 race）。改用 `isChatRunning(taskId)` 区分：进程活着=正在说话、返 409 让用户等；进程已死才标 error（410 引导重发重启）
 - **prompts 技术栈中立化（给后端用）**：`_shared.md`(§3 路径示例) / `action-build.md`(骨架) / `action-plan.md`(task 示例) 的 `.vue` / `pnpm` 示例加「示例为前端、Java/Go 等同理」说明（规则与语言无关）；角色提示已分 fe/be、build 命令已技术栈自适应
 
-### V0.6.2：跟 Cursor 共用工具（全局配置 fe 读 + MCP 只读化）（2026-06-01）
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。承接 V0.6.1 的 settingSources、补完「全局层」配置读取 + fe 端 MCP 改只读。fe-ai-flow 不再自己维护 MCP、统一消费 Cursor 配置（单一源在 Cursor、fe 只读不写）。
-
-⚠️ **纠正 V0.6.1 settingSources 子段的误读**：原写「`settingSources:["project"]` 加载目标仓库 **+ 全局** `.cursor/`」——**错**。`SettingSource` 是分层枚举（SDK `options.d.ts`：`"project" | "user" | "team" | "mdm" | "plugins" | "all"`）、`["project"]` **只加载 project 层（repo `.cursor/`）、够不着全局 `~/.cursor/`**（全局要含 `"user"`）。旧探针「skillCount 13 来自全局」是误读：本地 `~/.cursor/skills/` 实测仅 3 个、那 13 大概率是 fixture cwd 自身的项目层 skills。
-
-**最终分工**：repo 层 `.cursor/`（rules/skills/mcp/hooks）→ settingSources["project"] 由 SDK 读；全局层 `~/.cursor/`（rules/skills/mcp）→ **fe 后端自己读注入**。不用 `"user"` 层的原因：它是粗开关、把全局 20-30 个 MCP 全塞进 context、没法 per-task 精简；fe 自己读可控、可按 `task.disabledMcpServers` per-task 过滤。
-
-- **新 `src/lib/server/cursor-config.ts`**（全局配置读取单一源）：
-  - `readGlobalCursorMcpServers()` 读 `~/.cursor/mcp.json` 的 `mcpServers`
-  - `readGlobalCursorRulesForPrompt()` 读 `~/.cursor/rules/*.mdc`（`alwaysApply: true` 全文注入、其余只列 index 让 agent 按需 read）
-  - `getGlobalCursorDirs()` 跨平台候选目录（mac/linux/win 都 `home/.cursor/`、win 额外加 `%APPDATA%/.cursor/` fallback）
-  - `filterDisabledMcp(servers, disabled)` per-task 黑名单过滤
-- **MCP 注入移到 server 端**：task-runner / chat-runner 的 `mergedMcp` = 全局 mcp（按 `task.disabledMcpServers` 过滤）+ chat-tool；**删 client→server 传 mcpServers 全链路**——`run-args.ts` 不再 parse/filter（只剩 apiKey+model）、`advance` / `chat-reply` route body 去 `mcpServers`、runner input 去 `userMcpServers`。
-- **rules 注入 prompt**：`prompts/_super.md` 加 `{{rulesSection}}`（Skills 段前）、`buildSuperPrompt` / chat `buildInitialPrompt` 填全局 rules 段。
-- **skills 修订**：`loadSkills()` 改为读平台自带 `skills/` + 全局 `~/.cursor/skills/`（同名平台优先去重）——修正 V0.6.1「只读平台自带」（那样全局 skills 会丢、因 `["project"]` 够不着 user 层）。
-- **fe 端 MCP 只读化**：
-  - 新 `GET /api/cursor-mcp` 原样返回 `~/.cursor/mcp.json`（**不脱敏**、用户拍板：本地单机工具、跟 Cursor 展示一致）+ `dirs`（读自哪）
-  - 新 `src/hooks/use-cursor-mcp.ts`：fetch + window focus 自动刷新（同步用户在 Cursor 改的 mcp.json）
-  - `settings/mcp-card.tsx` 从可编辑 CodeEditor 改只读展示（disabled、显示来源路径 + server 数）
-  - `new-task-dialog` / `task-mcp-panel` 的 MCP 黑名单候选源从 localStorage 换成 `useCursorMcp` hook
-  - **localStorage `mcpServersJson` 整套废弃**：删 `local-store.ts`（DEFAULT_MCP_JSON / readMcpJson / isPlainObject / 字段）、`types.ts`（FeAiFlowSettings.mcpServersJson）、`use-settings.ts`（比较 / dirty 逻辑）、`route-helpers.ts`（isValidMcpServers）
-- **后续（用户提过、很后面）**：MCP 来源可配置化——用户自选「用 Cursor 的 / fe 独立的」。
-
 ---
 
 ## 关键文件索引
@@ -311,6 +307,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **GitLab REST client（V0.6.1 新）** | `src/lib/server/gitlab-client.ts` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |
 | **Cursor MCP 只读 API + hook（V0.6.2 新）** | `src/app/api/cursor-mcp/route.ts` + `src/hooks/use-cursor-mcp.ts` |
+| **MCP OAuth（V0.6.4 新、走 OAuth 的远程 MCP 授权 + 注入）** | `src/lib/server/mcp-oauth.ts` + `src/app/api/mcp-oauth/{start,callback,status,revoke}` + `src/hooks/use-mcp-oauth.ts` |
 | **super-prompt 主模板（V0.6 改造、注入 7 action）** | `prompts/_super.md` |
 | **跨 action 共享规范** | `prompts/_shared.md` |
 | **plan / build / review / ship action prompt** | `prompts/action-{plan,build,review,ship}.md` |

@@ -140,6 +140,58 @@ export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
   return { servers: data.servers, dirs: data.dirs };
 };
 
+// ----------------- MCP OAuth（V0.6.4 走 OAuth 授权的远程 MCP） -----------------
+
+/** 单个 MCP server 的 OAuth 授权状态（跟 server 端 mcp-oauth.ts 对齐） */
+export interface McpOAuthStatus {
+  authorized: boolean;
+  // access token 过期绝对时间（ms）；有 refresh 时过期也会自动续
+  expiresAt?: number;
+  // 有 refresh_token（过期能自动续、无需用户再授权）
+  hasRefresh: boolean;
+}
+
+/**
+ * 发起某 server 的 OAuth 授权（POST /api/mcp-oauth/start）
+ * 返回授权 URL（前端开浏览器让用户登录授权）、或 alreadyAuthorized
+ */
+export const startMcpOAuth = async (
+  serverName: string,
+): Promise<{ authorizationUrl?: string; alreadyAuthorized?: boolean }> => {
+  const res = await fetch("/api/mcp-oauth/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serverName }),
+  });
+  return handleJson<{
+    ok: true;
+    authorizationUrl?: string;
+    alreadyAuthorized?: boolean;
+  }>(res);
+};
+
+/** 拉所有 server 的 OAuth 授权状态（GET /api/mcp-oauth/status） */
+export const fetchMcpOAuthStatuses = async (): Promise<
+  Record<string, McpOAuthStatus>
+> => {
+  const res = await fetch("/api/mcp-oauth/status", { cache: "no-store" });
+  const data = await handleJson<{
+    ok: true;
+    statuses: Record<string, McpOAuthStatus>;
+  }>(res);
+  return data.statuses;
+};
+
+/** 撤销某 server 的 OAuth 授权（POST /api/mcp-oauth/revoke） */
+export const revokeMcpOAuth = async (serverName: string): Promise<void> => {
+  const res = await fetch("/api/mcp-oauth/revoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serverName }),
+  });
+  await handleJson<{ ok: true }>(res);
+};
+
 // ----------------- SSE 工具（V0.6 统一任务事件流） -----------------
 
 interface SSEEnvelope {

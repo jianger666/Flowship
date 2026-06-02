@@ -81,6 +81,7 @@ import {
   readGlobalCursorMcpServers,
   readGlobalCursorRulesForPrompt,
 } from "./cursor-config";
+import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import type {
   ActionRecord,
   ActionType,
@@ -1068,9 +1069,13 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   // 1) merge MCP：全局 cursor mcp（按 task 黑名单过滤）+ chat-tool（我们的 wait_for_user / ask_user）
   //    全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、
   //    per-task 用 task.disabledMcpServers 精简、详见 cursor-config.ts
-  const cursorMcp = filterDisabledMcp(
-    await readGlobalCursorMcpServers(),
-    task.disabledMcpServers,
+  // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
+  // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
+  const cursorMcp = await enrichMcpServersWithOAuth(
+    filterDisabledMcp(
+      await readGlobalCursorMcpServers(),
+      task.disabledMcpServers,
+    ),
   );
   const mergedMcp: Record<string, McpServerConfig> = {
     ...cursorMcp,

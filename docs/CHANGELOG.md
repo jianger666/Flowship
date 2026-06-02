@@ -15,6 +15,30 @@
 
 ---
 
+### V0.6.2：跟 Cursor 共用工具（全局配置 fe 读 + MCP 只读化）（2026-06-01）
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。承接 V0.6.1 的 settingSources、补完「全局层」配置读取 + fe 端 MCP 改只读。fe-ai-flow 不再自己维护 MCP、统一消费 Cursor 配置（单一源在 Cursor、fe 只读不写）。
+
+⚠️ **纠正 V0.6.1 settingSources 子段的误读**：原写「`settingSources:["project"]` 加载目标仓库 **+ 全局** `.cursor/`」——**错**。`SettingSource` 是分层枚举（SDK `options.d.ts`：`"project" | "user" | "team" | "mdm" | "plugins" | "all"`）、`["project"]` **只加载 project 层（repo `.cursor/`）、够不着全局 `~/.cursor/`**（全局要含 `"user"`）。旧探针「skillCount 13 来自全局」是误读：本地 `~/.cursor/skills/` 实测仅 3 个、那 13 大概率是 fixture cwd 自身的项目层 skills。
+
+**最终分工**：repo 层 `.cursor/`（rules/skills/mcp/hooks）→ settingSources["project"] 由 SDK 读；全局层 `~/.cursor/`（rules/skills/mcp）→ **fe 后端自己读注入**。不用 `"user"` 层的原因：它是粗开关、把全局 20-30 个 MCP 全塞进 context、没法 per-task 精简；fe 自己读可控、可按 `task.disabledMcpServers` per-task 过滤。
+
+- **新 `src/lib/server/cursor-config.ts`**（全局配置读取单一源）：
+  - `readGlobalCursorMcpServers()` 读 `~/.cursor/mcp.json` 的 `mcpServers`
+  - `readGlobalCursorRulesForPrompt()` 读 `~/.cursor/rules/*.mdc`（`alwaysApply: true` 全文注入、其余只列 index 让 agent 按需 read）
+  - `getGlobalCursorDirs()` 跨平台候选目录（mac/linux/win 都 `home/.cursor/`、win 额外加 `%APPDATA%/.cursor/` fallback）
+  - `filterDisabledMcp(servers, disabled)` per-task 黑名单过滤
+- **MCP 注入移到 server 端**：task-runner / chat-runner 的 `mergedMcp` = 全局 mcp（按 `task.disabledMcpServers` 过滤）+ chat-tool；**删 client→server 传 mcpServers 全链路**——`run-args.ts` 不再 parse/filter（只剩 apiKey+model）、`advance` / `chat-reply` route body 去 `mcpServers`、runner input 去 `userMcpServers`。
+- **rules 注入 prompt**：`prompts/_super.md` 加 `{{rulesSection}}`（Skills 段前）、`buildSuperPrompt` / chat `buildInitialPrompt` 填全局 rules 段。
+- **skills 修订**：`loadSkills()` 改为读平台自带 `skills/` + 全局 `~/.cursor/skills/`（同名平台优先去重）——修正 V0.6.1「只读平台自带」（那样全局 skills 会丢、因 `["project"]` 够不着 user 层）。
+- **fe 端 MCP 只读化**：
+  - 新 `GET /api/cursor-mcp` 原样返回 `~/.cursor/mcp.json`（**不脱敏**、用户拍板：本地单机工具、跟 Cursor 展示一致）+ `dirs`（读自哪）
+  - 新 `src/hooks/use-cursor-mcp.ts`：fetch + window focus 自动刷新（同步用户在 Cursor 改的 mcp.json）
+  - `settings/mcp-card.tsx` 从可编辑 CodeEditor 改只读展示（disabled、显示来源路径 + server 数）
+  - `new-task-dialog` / `task-mcp-panel` 的 MCP 黑名单候选源从 localStorage 换成 `useCursorMcp` hook
+  - **localStorage `mcpServersJson` 整套废弃**：删 `local-store.ts`（DEFAULT_MCP_JSON / readMcpJson / isPlainObject / 字段）、`types.ts`（FeAiFlowSettings.mcpServersJson）、`use-settings.ts`（比较 / dirty 逻辑）、`route-helpers.ts`（isValidMcpServers）
+- **后续（用户提过、很后面）**：MCP 来源可配置化——用户自选「用 Cursor 的 / fe 独立的」。
+
 ### V0.6.1：ship action 上线（2026-05-28）
 
 **整体**：从 V0.6.0 收尾的 stub 状态、ship 升级成可用的「build 完成 → 自动 push → 提 MR → 飞书评论」端到端流程。设计期 5 个未拍板项跟用户对齐后落地：(1) CLI 选 server-side GitLab REST API、不依赖 glab CLI / 不写新的 MCP server、PAT 通过 settings 配；(2) 多仓 task 每仓 1 条 MR、共用 branch 名、各仓单独 push 单独提；(3) 用户 ack ship 后不再二次 ask_user、直接 push + 提 MR；(4) 同 branch 累计 commit、同仓多次 ship 累加 version、不开新 MR；(5) 自动评论飞书 story（带 PR 链接 + @ 测试人员）、**不**自动改 story 状态。`pnpm typecheck` ✓ / `pnpm lint` ✓。
