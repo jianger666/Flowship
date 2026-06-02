@@ -294,7 +294,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               placeholder={
                 mode === "chat"
                   ? "不填用「未命名对话 MM-DD HH:mm」占位"
-                  : "如：用户列表批量导出"
+                  : "如：需求标题"
               }
               autoFocus
             />

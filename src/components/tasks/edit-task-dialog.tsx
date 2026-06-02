@@ -185,7 +185,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               id="edit-title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="如：用户列表批量导出"
+              placeholder="如：需求标题"
             />
           </div>
 
