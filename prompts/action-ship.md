@@ -165,24 +165,32 @@ ask_user({
 
 > **前置门禁**：仅当 §3.5 判定「所有仓 MR 无冲突」才执行本步。有任一仓冲突时整步跳过、等用户解完冲突重跑 ship。
 
-调用 `user-feishu-project-mcp.add_comment`：
+调用 `user-feishu-project-mcp.add_comment`。**@ 测试人员要真正触发飞书通知、必须两件事配套**（修：之前只在 content 写软提示 `@中文名`、不是真 @、也没传通知参数、导致「@ 出来了但测试人员收不到飞书消息」）：
+
+1. `content` 里用**正式 mention 块**写 @（不是纯文本 `@中文名`）
+2. 传 `notify_user_type` + `notify_user_list` 两个**通知参数**（漏传 = 飞书项目 UI 里「@ 了但没勾通知」、人收不到）
 
 ```typescript
 add_comment({
-  workitem_id: <从 task.feishuStoryUrl 抠出的 story id>,
+  work_item_id: "<从 task.feishuStoryUrl 抠出的 story id>",          // 注意带下划线、不是 workitem_id
   content: `MR 已提交、请测试人员 review：
 
 <对每条 MR 一行：URL 必须放行尾、不要在 URL 后追加任何字符（飞书 IM 会把括号、空格后的字符一起 link 化导致 404）>
 - [\${repoTailName}]\${mrVersion > 1 ? ` v\${mrVersion}` : ""} <mr_url>
 
-@<测试人员中文名>（@ 拼法见下方「@ 的正确姿势」）
+@张三<!-- mention:{"id":"<张三的 lark_user_id>","cn_name":"张三","blockType":"AT_USER_BLOCK"} --> @李四<!-- mention:{"id":"<李四的 lark_user_id>","cn_name":"李四","blockType":"AT_USER_BLOCK"} -->
 `,
+  notify_user_type: "lark_user_id",                               // 我们存的是 lark_user_id、固定填这个
+  notify_user_list: ["<张三 lark_user_id>", "<李四 lark_user_id>"],  // = task.feishuTesterUserIds 全部、跳过场景省略或传 []
 })
 ```
 
-- **@ 的正确姿势**：`task.feishuTesterUserIds` 是 lark_user_id（形如 `ou_xxx`）、**不能**直接拼成 `@ou_xxx` 塞进 content 文本（飞书 IM 不识别、显示成乱码）。优先用 `add_comment` 工具自带的 @ / mention 能力（核对工具入参有没有 `user_ids` / `mention` 之类字段、把 lark_user_id 传进去）；工具不支持时退而在 content 里用 `@<中文名>` 软提示（中文名从 §2 探测时一并记下）
+- **@ 的正确姿势（关键、必背）**：`task.feishuTesterUserIds` 是 lark_user_id（形如 `ou_xxx`、§2 探测时存的）。两步缺一不可：
+  - **content 里每个 @ 用 mention 块**：`@<中文名><!-- mention:{"id":"<lark_user_id>","cn_name":"<中文名>","blockType":"AT_USER_BLOCK"} -->`（中文名从 §2 一并记下、多人就拼多段空格隔开）。**不要**只写纯文本 `@中文名`（不是真 @、不发通知）、也**不要**直接拼 `@ou_xxx`（显示乱码）
+  - **同时传 `notify_user_type: "lark_user_id"` + `notify_user_list: [所有 tester 的 lark_user_id]`**：这俩才是真正发通知的开关、漏传 = @ 出来了但没人收到
+  - 格式以 `add_comment` 工具的**真实 schema 描述为准**（content 字段的 mention 示例 + notify 两参数的说明）微调、别凭记忆硬拼
 - 多仓 task：一条评论里平铺所有 MR 链接、按 repoPath 末段名（如 `crm-web`）标注
-- `feishuTesterUserIds` 为空数组（用户选了跳过）：评论不加 @、只贴链接
+- `feishuTesterUserIds` 为空数组（用户选了跳过）：评论不加 @ mention 块、只贴链接、notify 两参数省略（或传空）
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
 
 ### 5. 写 ship artifact + wait_for_user
