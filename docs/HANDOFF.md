@@ -240,6 +240,31 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.8：ship 智能解冲突 + 孤儿进程清理 + SSE 自动重连（2026-06-03）
+
+**① ship 提测冲突「AI 智能解决」（不松「feature 保持干净」铁律）**
+
+- 背景：feature→测试分支 提测遇冲突、以前只能 `ask_user` 让用户手动解。需求：像 IDEA 那样让 AI 智能解。
+- **铁律不松**：绝不把测试分支合进 feature（test 是整合分支、塞满别人没测完的功能、合进 feature 会污染、还可能把未测功能带上线）。
+- 方案：遇冲突 `ask_user` 给两选项「AI 智能解 / 自己解」。选 AI 解 → §3.6：
+  - 另建**一次性** `<feature>__conflict` 分支（基于 `origin/<测试分支>`）、`git merge <feature>` 把 feature 合进去（方向 feature→__conflict、**不是** test→feature）、AI 逐个解冲突标记、`git push -f` 这条 __conflict、`submit_mr` 用 __conflict 当 source。
+  - feature 分支全程不 checkout / 不改 / 不 push、本体干净——**这是铁律唯一豁免口**（只在一次性 __conflict 分支上 merge + force push）。解完 `git checkout <feature>` 恢复 HEAD（防 re-ship 误把 __conflict 当 feature）。
+- **双 MR 自动清理**：`submit_mr` 检测到 source 分支跟该仓上次不同（feature→__conflict）、新 MR 建好后**自动关掉**被取代的旧 `feature→测试分支` MR（`gitlab-client.ts: closeOpenMR` 复用 `findOpenMR` 拿 iid + `closeMR` PUT state_event=close）。测试人员只看到一个干净 MR。`remove_source_branch:true` 早就默认、__conflict 合并后自动删。
+- 落地：`gitlab-client.ts` +`closeMR`(内部)/`closeOpenMR`(导出)；`task-runner.ts` submit_mr handler 先读 fresh task 拿该仓上次 source、新 MR 建好后 `closeOpenMR` 旧分支（失败只 warn、不阻塞）；`prompts/action-ship.md` §3.5 改两选项 + 新增 §3.6 智能解冲突流程 + 反例 + artifact 表 + 顶部铁律豁免说明；`chat-mcp.ts` submit_mr describe 同步（第二指令源一致）。
+
+**② 停 task 清理 agent 孤儿子进程（重大 bug）**
+
+- bug：task 已停止、代码仓库还在被疯狂改。根因：agent 经 `npm run lint` 起的 `ng lint --fix` 子进程、agent 停了它没死、reparent 到 init（PPID=1）继续改文件。
+- 层2（cure）：`src/lib/server/kill-orphans.ts`——`reapTaskOrphans(repoPaths)` 扫进程、命中「Cursor agent shell 签名」**或**「孤儿(PPID=1) + build/脚本工具名 + cwd 在本 task 仓内」的、SIGKILL 整棵子树（立即 + 2.5s 后各扫一次、抓延迟 reparent）。接进 stop 路由（即时清）+ task `finally`（force-new-agent restart 不清、防误杀新 agent）。
+- 层1（prevent）：`_shared.md` §9 + `action-build.md`——禁自动改写命令（`lint --fix` / `prettier --write`）、禁长驻命令（dev server / `--watch`）、跑 lint script 前先 read 看清内部。
+
+**③ SSE 被动断开自动重连（artifact 产出不刷新）**
+
+- bug：artifact 产出了、详情页面板不自动刷新、要手动刷新 / 切阶段。根因：`useTaskWatch` SSE 流被动断开（maxDuration 超时 / 网络）后不重连、漏后续 action/artifact 更新。
+- 修：`use-task-watch.ts` 加自动重连循环——被动断开（非 `done` 信号）按指数退避重试、收到 `done` / `reconnectKey` 变（主动断开 / 切流）则不重连。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.7：ship 提测 / dev 分支 per-repo 配置 + feature 分支命名模板化（2026-06-02）
 
 **需求**：① 给「ship 提测分支」「dev 分支」做 per-repo 配置（之前 ship 写死提测到 `test`）；② feature 分支命名从写死算法（`feature/<username>/<storyId>-<title>`）改成用户可配模板、支持前后端不同规范（前端 `feature/{username}/{storyId}-{taskTitle}`、后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）。
@@ -276,31 +301,6 @@ settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-### V0.6.6：详情页编辑任务 + 字段热更（2026-06-02）
-
-**需求**：建完任务后能在详情页改「建任务时填的软配置」——以前填错只能删了重建。后续追加：编辑后若不换新 agent、长生 agent 读不到新值的问题。
-
-**可改字段**（`EditTaskDialog`、详情页标题旁「编辑」按钮、`runStatus === "running"` 时隐藏避免跟正在跑的不一致）：角色 / 标题 / 飞书链接 / per-repo 已有工作分支。
-
-**刻意不可改**：`model`（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）；`mode`（task/chat 两套通路、切了等于换任务）；`repoPaths`（副作用大：变 agent cwd、已建分支/MR 对不上）——只读展示；MCP 开关 / 上下文 doc——详情页已有各自面板。
-
-**字段热更（关键、解决「长生 agent 读不到编辑」）**：单 SDK Run 永生 → super prompt 启动时构造一次、reused agent 推进不重建、编辑的 title/role/feishuStoryUrl 会 stale。解法：
-- runner 在 `runningTasks` record 存 agent 启动快照 `startSnapshot = {title, role, feishuStoryUrl}`（内存、不落盘）
-- reused 推进时 `buildTaskUpdateHint(最新 task, 启动快照)` diff、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（角色变会说「从 X 改为 Y、忽略开头旧角色」）、注入后推进快照避免下次重复告知
-- 机制本质：磁盘 meta = 最新真值、内存快照 = agent 已知值、推进时一 diff、差异 = 要告诉 agent 的变更
-- `repoFeatureBranches` 不走此机制——build 前 runner 本就读盘拿最新、已 fresh
-
-**落地**：
-- `src/components/tasks/edit-task-dialog.tsx`（新）：表单初始化只依赖 `[open]` + `task` ref 化——避免 dialog 开着时 task 因 SSE 更新（引用变）重跑 effect 把草稿重置（advance-dialog 同款教训）；后续移除 model 字段（连带清理 task-store / route / task-fs 的 model 编辑链路、不留死代码）
-- `task-runner.ts`：`TaskFieldsSnapshot` + `captureTaskFieldsSnapshot` + `buildTaskUpdateHint`（纯函数 diff）；`RunningTaskRecord.startSnapshot`（启动拍 + reused 注入后推进）；`buildNextActionDirective` 加 `taskUpdateHint` 入参（放 directive 最前、让 agent 先校准再读指令）
-- `prompts/_super.md`：任务基本信息段加「以 `[TASK_UPDATED]` 最新值为准」兜底 + `[NEXT_ACTION]` 处理步骤加识别 `[TASK_UPDATED]` 段（角色变立刻切视角）
-- `task-fs.ts: updateTaskFields`（新）：`withTaskLock` 包 read-modify-write；改飞书链接时**同步「建任务自动生成的 url 上下文文档」**（否则 agent 读 contextDocs 仍是旧链接、两处漂移）；repoFeatureBranches 同 createTask 清洗（key 限定 repoPaths + trim）
-- `api/tasks/[id]/route.ts` PATCH：编辑字段分支（title/role/feishuStoryUrl/repoFeatureBranches、可一次传多个、role 限 fe/be、title 非空校验）
-- `task-store.ts: updateTaskFields`（新 client helper、走 `handleJson`、传 `null` 显式清空）
-- `tasks/[id]/page.tsx`：接入「编辑」按钮 + `EditTaskDialog`
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
 ---
 
 ## 关键文件索引
@@ -311,7 +311,8 @@ settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
 | **V0.6 统一 runner（task 容器 + action history）** | `src/lib/server/task-runner.ts` |
 | **V0.6 action 后置 deterministic check** | `src/lib/server/action-checks.ts` |
 | **V0.6 task schema + 文件系统** | `src/lib/types.ts` + `src/lib/server/task-fs.ts` |
-| **GitLab REST client（V0.6.1 新）** | `src/lib/server/gitlab-client.ts` |
+| **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |
+| **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |
 | **Cursor MCP 只读 API + hook（V0.6.2 新）** | `src/app/api/cursor-mcp/route.ts` + `src/hooks/use-cursor-mcp.ts` |
 | **MCP OAuth（V0.6.4 新、走 OAuth 的远程 MCP 授权 + 注入）** | `src/lib/server/mcp-oauth.ts` + `src/app/api/mcp-oauth/{start,callback,status,revoke}` + `src/hooks/use-mcp-oauth.ts` |

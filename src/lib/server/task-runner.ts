@@ -64,7 +64,7 @@ import {
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-mcp";
-import { createMR, getMRMergeStatus } from "./gitlab-client";
+import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { ensureStopHookInstalled } from "./stop-hook-inject";
 import { reapTaskOrphans } from "./kill-orphans";
 import { renderContextDocsSection } from "./context-docs-prompt";
@@ -1195,6 +1195,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           error: "task 启动时没拿到 GitLab Host / Token、ship 准入应该已被拦、不应该走到这里",
         };
       }
+      // V0.6.8：AI 智能解冲突会换 source 分支（feature → feature__conflict）、
+      // 先读出该仓「上一次 ship 用的 source 分支」、待新 MR 建好后把旧 MR 关掉（防双 MR 垃圾）。
+      // 读 fresh task（闭包 task 是 task 启动时快照、不含本轮 ship 刚 upsert 的 MR）。
+      const freshForPrevMr = await getTask(task.id);
+      const prevMrBranch = freshForPrevMr?.mrs?.find(
+        (m) => m.repoPath === taskAction.repoPath,
+      )?.branch;
+
       const result = await createMR({
         config: { host: gitHost, token: gitToken },
         projectPath: taskAction.projectPath,
@@ -1211,6 +1219,29 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           meta: { repoPath: taskAction.repoPath, projectPath: taskAction.projectPath },
         });
         return { ok: false, error: result.error };
+      }
+
+      // 新 MR 建好后、若 source 分支跟上一次不同（= 走了 __conflict 智能解冲突流程）、
+      // 把被取代的旧 `<旧分支>→test` MR 关掉。失败只记日志、不阻塞 ship（新 MR 已建好、旧的留着也只是脏）。
+      if (prevMrBranch && prevMrBranch !== taskAction.sourceBranch) {
+        const closed = await closeOpenMR({
+          config: { host: gitHost, token: gitToken },
+          projectPath: taskAction.projectPath,
+          sourceBranch: prevMrBranch,
+          targetBranch: taskAction.targetBranch,
+        });
+        if (!closed.ok) {
+          console.warn(
+            `[task-runner] 关旧 MR 失败（${taskAction.projectPath} ${prevMrBranch}→${taskAction.targetBranch}）：${closed.error}`,
+          );
+        } else if (closed.closed) {
+          await writeEventAndPublish(task.id, {
+            kind: "info",
+            actionId: taskAction.actionId,
+            text: `已关闭被取代的旧 MR（${prevMrBranch} → ${taskAction.targetBranch}、冲突废弃）`,
+            meta: { repoPath: taskAction.repoPath, projectPath: taskAction.projectPath },
+          });
+        }
       }
 
       // V0.6.1.1：MR 建好后 poll GitLab 可合性、检测 feature↔test 冲突

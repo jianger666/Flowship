@@ -245,6 +245,80 @@ export const createMR = async (
 };
 
 /**
+ * 关闭单个 MR（PUT state_event=close）
+ *
+ * 注意：close（非 merge）**不**触发 remove_source_branch、源分支保留——
+ * 这正是我们要的：被取代的旧 feature→test MR 关掉、但 feature 工作分支不能删。
+ */
+const closeMR = async (input: {
+  config: GitLabConfig;
+  projectPath: string;
+  iid: number;
+}): Promise<{ ok: true } | { ok: false; error: string }> => {
+  let base: string;
+  let headers: HeadersInit;
+  try {
+    base = buildBaseUrl(input.config.host);
+    headers = buildHeaders(input.config.token);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ state_event: "close" }),
+    });
+    if (!res.ok) {
+      return { ok: false, error: await formatGitLabError(res) };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+};
+
+/**
+ * 关掉指定 source→target 的 open MR（如果存在）。
+ *
+ * V0.6.8：AI 智能解冲突时、原 `feature→test` MR 被 `__conflict→test` 新 MR 取代、
+ * 调本函数把旧的关掉、避免 GitLab 上留一个废弃的冲突 MR（双 MR 垃圾）。
+ *
+ * 找不到旧 open MR（已被关 / 从没建）当成功——本函数语义是「确保它不开着」、不是「必须关到一个」。
+ */
+export const closeOpenMR = async (input: {
+  config: GitLabConfig;
+  projectPath: string;
+  sourceBranch: string;
+  targetBranch: string;
+}): Promise<{ ok: true; closed: boolean } | { ok: false; error: string }> => {
+  // 复用 findOpenMR 按 source+target 拿到旧 MR 的 iid（title/description 不参与查询、传空即可）
+  const found = await findOpenMR({
+    config: input.config,
+    projectPath: input.projectPath,
+    sourceBranch: input.sourceBranch,
+    targetBranch: input.targetBranch,
+    title: "",
+    description: "",
+  });
+  if (!found.ok) {
+    // 没查到 open MR → 目标已达成（它本来就没开着）
+    return { ok: true, closed: false };
+  }
+  const closed = await closeMR({
+    config: input.config,
+    projectPath: input.projectPath,
+    iid: found.iid,
+  });
+  if (!closed.ok) return { ok: false, error: closed.error };
+  return { ok: true, closed: true };
+};
+
+/**
  * 查 MR 可合性（V0.6.1.1 ship 冲突检测）
  *
  * 为什么单独一个函数而不复用 getMR：
