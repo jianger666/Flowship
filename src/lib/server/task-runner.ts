@@ -66,6 +66,7 @@ import {
 } from "./chat-mcp";
 import { createMR, getMRMergeStatus } from "./gitlab-client";
 import { ensureStopHookInstalled } from "./stop-hook-inject";
+import { reapTaskOrphans } from "./kill-orphans";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -1411,6 +1412,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   // 4) 启动 Agent + 消息循环（在独立 Promise 里跑、advanceTask 立即返回）
   let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
   let cancelled = false;
+  // V0.6.8：标记本次结束是「换新 agent」（force-new-agent）——是的话 finally 不清孤儿进程、
+  // 否则会误杀新 agent 刚在同仓拉起的 shell（带同样签名、cwd 也在 repoPaths）
+  let isForkRestart = false;
   let hardTimer: NodeJS.Timeout | null = null;
 
   const completion = (async () => {
@@ -1500,6 +1504,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         const isForkPending = forkPendingTasks.has(task.id);
         if (isForkPending) {
           forkPendingTasks.delete(task.id);
+          isForkRestart = true; // 换新 agent：finally 不清孤儿（新 agent 同仓 shell 会被误杀）
           await writeEventAndPublish(task.id, {
             kind: "info",
             text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -1595,6 +1600,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // conditional unset：只清「自己注册的那个实例」、force-new-agent race 下新 handler/notifier 不被误清
       unsetChatAwaitingNotifierIf(task.id, awaitingNotifier);
       unsetChatTaskActionHandlerIf(task.id, taskActionHandler);
+      // V0.6.8：真正结束（停止 / 自然退出 / 报错）才清孤儿进程；换新 agent 不清（见 isForkRestart 注释）
+      if (!isForkRestart) reapTaskOrphans(task.repoPaths);
       if (agent) {
         try {
           agent.close();

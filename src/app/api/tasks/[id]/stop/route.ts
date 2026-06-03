@@ -24,6 +24,7 @@ import {
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
 import { cancelTaskRun, publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { reapTaskOrphans } from "@/lib/server/kill-orphans";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
 import { errorResponse } from "@/lib/server/route-helpers";
 
@@ -42,6 +43,10 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   // 1) abort SDK Run + 清 pending wait-ack（先断 agent 再清 pending）
   const hadAgent = cancelTaskRun(id);
   cleanupChatTaskState(id);
+
+  // V0.6.8：run.cancel() 杀不到 agent 用 shell 拉起的孙子进程（如 `npm run lint`=`ng lint --fix`、
+  // 会 orphan 后继续改写整个仓库）。这里主动清理落在本 task repoPaths 里的孤儿 / agent-shell 进程树。
+  reapTaskOrphans(task.repoPaths);
 
   // 2) 当前 action 若在跑 / 等 ack → 标 cancelled（endedAt 自动落）
   const current = task.currentActionId
