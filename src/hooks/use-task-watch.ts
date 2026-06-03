@@ -31,12 +31,24 @@
  *   后续用户点「推进」让 agent 重新跑起来的入口、
  *   光 setTask(latest) 不会触发 effect 重跑、客户端 SSE 已断 → 收不到新事件 → 必须刷页面、
  *   解法是调用方维护一个 epoch 计数、每次「让 agent 又活了」的成功路径 ++、effect dep 加它自然重连
+ *
+ * - **被动断开自动重连（V0.6.8）**：SSE 流可能被动断开（route 的 maxDuration=300s 到点、
+ *   网络抖动、服务端重启），此时 watchTaskStream 正常返回 / 抛错、但 effect 不会自己重跑、
+ *   客户端就**静默停在断连那一刻的状态**——典型表现：agent 产出了 artifact 但页面不刷新、
+ *   必须手动刷新 / 切 action tab 才看到。解法是 hook 内部用 loop 自动重连：
+ *   收到 `done`（agent run 主动结束）= 不重连（靠 reconnectKey 再订阅）；
+ *   没收到 done 的被动断流 = 退避后重连（重连时服务端重发 task 快照、对齐漏掉的更新）。
  */
 
 import { useEffect, useRef } from "react";
 
 import { watchTaskStream, type TaskStreamCallbacks } from "@/lib/task-store";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
+
+// 被动断流后重连退避：干净结束（maxDuration 到点）等这么久再连
+const RECONNECT_DELAY_MS = 1000;
+// 连续报错（网络断 / 服务端没起来）最多重试几次、超了才弹 onWatchException、避免无限刷
+const MAX_CONSECUTIVE_FAILURES = 6;
 
 export interface UseTaskWatchCallbacks {
   onEvent?: (ev: TaskEvent) => void;
@@ -68,34 +80,58 @@ export const useTaskWatch = (
     const ctrl = new AbortController();
     let cancelled = false;
 
-    const sseCallbacks: TaskStreamCallbacks = {
-      onEvent: (ev) => callbacksRef.current.onEvent?.(ev),
-      onTaskUpdate: (t) => callbacksRef.current.onTaskUpdate?.(t),
-      onActionUpdate: (a) => callbacksRef.current.onActionUpdate?.(a),
-      onAssistantDelta: (text) =>
-        callbacksRef.current.onAssistantDelta?.(text),
-      onDone: (t, ok) => callbacksRef.current.onDone?.(t, ok),
-      onError: (msg) => {
-        if (!cancelled) callbacksRef.current.onErrorMessage?.(msg);
-      },
-    };
+    // 自动重连循环：被动断流（没收到 done）就退避后重连、收到 done 就停
+    const loop = async () => {
+      let failures = 0; // 连续报错次数、用于退避 + 兜底放弃
+      while (!cancelled) {
+        let gotDone = false; // 本次连接是否收到 done（agent run 主动结束）
+        const sseCallbacks: TaskStreamCallbacks = {
+          onEvent: (ev) => callbacksRef.current.onEvent?.(ev),
+          onTaskUpdate: (t) => callbacksRef.current.onTaskUpdate?.(t),
+          onActionUpdate: (a) => callbacksRef.current.onActionUpdate?.(a),
+          onAssistantDelta: (text) =>
+            callbacksRef.current.onAssistantDelta?.(text),
+          onDone: (t, ok) => {
+            gotDone = true;
+            callbacksRef.current.onDone?.(t, ok);
+          },
+          onError: (msg) => {
+            if (!cancelled) callbacksRef.current.onErrorMessage?.(msg);
+          },
+        };
 
-    const run = async () => {
-      try {
-        await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
-      } catch (err) {
-        if (
-          (err as { name?: string }).name === "AbortError" ||
-          ctrl.signal.aborted
-        ) {
-          return;
+        try {
+          await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
+          failures = 0; // 成功连过一次、清零退避
+        } catch (err) {
+          if (
+            (err as { name?: string }).name === "AbortError" ||
+            ctrl.signal.aborted
+          ) {
+            return;
+          }
+          failures += 1;
+          if (failures >= MAX_CONSECUTIVE_FAILURES) {
+            if (!cancelled) callbacksRef.current.onWatchException?.(err as Error);
+            return;
+          }
+          // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
         }
-        if (!cancelled) {
-          callbacksRef.current.onWatchException?.(err as Error);
-        }
+
+        // 收到 done = agent run 主动结束 → 不重连（靠 reconnectKey 再订阅）；
+        // 卸载 / 切 task 也停
+        if (cancelled || gotDone) return;
+
+        // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连
+        // 重连时服务端 bootstrap 会重发当前 task 快照、把断连期间漏掉的更新对齐回来
+        const backoff =
+          failures > 0
+            ? Math.min(failures * 1500, 8000)
+            : RECONNECT_DELAY_MS;
+        await new Promise((r) => setTimeout(r, backoff));
       }
     };
-    void run();
+    void loop();
 
     return () => {
       cancelled = true;
