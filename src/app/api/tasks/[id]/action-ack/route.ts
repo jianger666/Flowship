@@ -129,12 +129,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // revise 带图：先落盘、拿绝对路径
+  // revise 带图：先落盘
+  // - imageAbsPaths：给 agent（绝对路径）
+  // - savedImages：完整 meta、写进 user_reply 事件给前端渲染缩略图
   let imageAbsPaths: string[] | undefined;
+  let savedImages:
+    | Awaited<ReturnType<typeof saveImageAttachments>>
+    | undefined;
   if (images.length > 0) {
     try {
-      const saved = await saveImageAttachments(task.id, images);
-      imageAbsPaths = saved.map((s) => s.absPath);
+      savedImages = await saveImageAttachments(task.id, images);
+      imageAbsPaths = savedImages.map((s) => s.absPath);
     } catch (err) {
       return errorResponse(
         `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
@@ -149,8 +154,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // revise 时先写一条 user_reply 事件（让用户视角立刻看到自己的反馈）
   if (decision === "revise") {
     const meta: Record<string, unknown> = { kind: "revise" };
-    if (imageAbsPaths && imageAbsPaths.length > 0) {
-      meta.imagePaths = imageAbsPaths;
+    // 图存 meta.images（完整对象）——前端读 meta.images 渲染缩略图、不是 imagePaths（V0.6.12 修）
+    if (savedImages && savedImages.length > 0) {
+      meta.images = savedImages;
     }
     const fallbackText = imageAbsPaths && imageAbsPaths.length > 0 ? "(用户附了图片)" : "";
     const updatedAfterEvent = await appendEvent(task.id, {

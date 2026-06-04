@@ -158,12 +158,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // 落盘图片（拿绝对路径）
+  // 落盘图片：
+  // - imageAbsPaths：给 agent prompt / submitUserMessage 用（只要绝对路径）
+  // - savedImages：完整 meta（absPath/relPath/mimeType/bytes/filename）、写进事件给前端渲染缩略图
   let imageAbsPaths: string[] | undefined;
+  let savedImages:
+    | Awaited<ReturnType<typeof saveImageAttachments>>
+    | undefined;
   if (images.length > 0) {
     try {
-      const saved = await saveImageAttachments(task.id, images);
-      imageAbsPaths = saved.map((s) => s.absPath);
+      savedImages = await saveImageAttachments(task.id, images);
+      imageAbsPaths = savedImages.map((s) => s.absPath);
     } catch (err) {
       return errorResponse(
         `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
@@ -172,9 +177,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   // 写 user_reply 事件（用户立刻在 event-stream 看到自己的话）
+  // 图片存 meta.images（完整对象数组）——前端 extractUserReplyImages 读的是 meta.images、
+  // 不是 imagePaths（string[]）；写错字段会导致附图在事件流里不显示（V0.6.12 修）。
   const userReplyMeta: Record<string, unknown> = {};
-  if (imageAbsPaths && imageAbsPaths.length > 0) {
-    userReplyMeta.imagePaths = imageAbsPaths;
+  if (savedImages && savedImages.length > 0) {
+    userReplyMeta.images = savedImages;
   }
   if (attachmentAbsPaths.length > 0) {
     userReplyMeta.attachmentPaths = attachmentAbsPaths;

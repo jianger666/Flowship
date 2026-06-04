@@ -50,6 +50,9 @@ export const ChatView = ({
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // SSE 重连 epoch：agent 上一轮 done 后 SSE 会 close、自动重连不处理 done（靠这个 key）；
+  // 用户再发消息自动启新 agent 时 ++、触发 useTaskWatch 重连、否则收不到新一轮事件（V0.6.12 修）
+  const [watchEpoch, setWatchEpoch] = useState(0);
 
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
@@ -77,7 +80,8 @@ export const ChatView = ({
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
-  });
+    // enabled=true 恒开；reconnectKey=watchEpoch 让「自动启新 agent」后能重连 SSE
+  }, true, watchEpoch);
 
   // 用户回复：无论 task.runStatus 是什么、统一走 sendChatReply
   // 后端 chat-reply 路由按 runStatus + hasPending 自己决定：
@@ -109,6 +113,8 @@ export const ChatView = ({
         onTaskUpdateRef.current(latest);
         if (autoStarted) {
           toast.info("正在启动 agent、首条消息会在它就位后自动回复");
+          // 上一轮 agent done 后 SSE 已断、++ 触发重连、才能收到新一轮 agent 的事件流
+          setWatchEpoch((n) => n + 1);
         }
       } catch (err) {
         toast.error(`回复失败：${(err as Error).message}`);
