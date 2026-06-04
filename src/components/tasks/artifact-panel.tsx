@@ -71,8 +71,14 @@ const formatShortTime = (ts: number): string => {
 // 修「agent 产出了 artifact、但页面停在『没有产物』、要手动刷新 / 切 tab 才看到」：
 // 产出那一刻文件刚落盘 / agent 调 wait_for_user 与写文件有时序差、一次性拉可能读到 null、
 // 之后 action.status 不再变 effect 就不会重拉 → 退避重试几次自愈。
-const ARTIFACT_LOAD_MAX_RETRIES = 5;
-const ARTIFACT_LOAD_RETRY_MS = 800;
+//
+// V0.6.12 实测加码：agent 第一次 edit 新 artifact 因工具参数名（contents/content）写失败、
+// 却抢跑调 wait_for_user 标了 awaiting_ack（meta 已写 artifactPath、文件却还不存在）、
+// 2~3s 后才 thinking「写入失败」并重写落盘——原 5×800ms=4s 固定退避刚好差 ~2s 没等到、
+// 停在「没有产物」要切 tab 才出。改指数退避、总时长拉到 ~28s 覆盖 agent 重写落盘的延迟。
+const ARTIFACT_LOAD_MAX_RETRIES = 8;
+const ARTIFACT_LOAD_BASE_MS = 800; // 首次退避间隔（之后 ×1.7 指数增长）
+const ARTIFACT_LOAD_MAX_MS = 5000; // 单次退避上限（指数增长封顶、避免越等越久）
 
 // localStorage key：分 task × actionId 维度
 const seenStorageKey = (taskId: string, actionId: string) =>
@@ -249,22 +255,31 @@ export const ArtifactPanel = ({
           }
           return data.revisions[data.revisions.length - 1]!.timestamp;
         });
+        // 读到空但理应有产物（agent 抢跑标 awaiting_ack / 重写未落盘）→ 指数退避重试
         if (
           !data.current &&
           shouldHaveArtifact &&
           tries < ARTIFACT_LOAD_MAX_RETRIES
         ) {
+          const delay = Math.min(
+            ARTIFACT_LOAD_BASE_MS * 1.7 ** tries,
+            ARTIFACT_LOAD_MAX_MS,
+          );
           tries += 1;
           willRetry = true;
-          retryTimer = setTimeout(() => void load(), ARTIFACT_LOAD_RETRY_MS);
+          retryTimer = setTimeout(() => void load(), delay);
         }
       } catch (err) {
         if (cancelled) return;
         console.warn("[artifact-panel] fetch revisions 失败", err);
         if (shouldHaveArtifact && tries < ARTIFACT_LOAD_MAX_RETRIES) {
+          const delay = Math.min(
+            ARTIFACT_LOAD_BASE_MS * 1.7 ** tries,
+            ARTIFACT_LOAD_MAX_MS,
+          );
           tries += 1;
           willRetry = true;
-          retryTimer = setTimeout(() => void load(), ARTIFACT_LOAD_RETRY_MS);
+          retryTimer = setTimeout(() => void load(), delay);
         }
       } finally {
         if (!cancelled && !willRetry) setContentLoading(false);
@@ -275,7 +290,16 @@ export const ArtifactPanel = ({
       cancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [taskId, action.id, action.endedAt, action.status, action.artifactPath]);
+    // V0.6.12：依赖里加 action.artifactUpdatedAt——agent 每次写成功后端会刷新它、
+    // 这里据此事件驱动重拉（不再只靠退避猜落盘时刻、根治「产出后停在『没有产物』」）
+  }, [
+    taskId,
+    action.id,
+    action.endedAt,
+    action.status,
+    action.artifactPath,
+    action.artifactUpdatedAt,
+  ]);
 
   // diff 模式下拉对比数据
   useEffect(() => {

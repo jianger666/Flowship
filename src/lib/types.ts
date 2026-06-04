@@ -216,6 +216,14 @@ export interface ActionRecord {
   endedAt: number | null;
 
   /**
+   * artifact 文件最后一次成功写入的时间戳（V0.6.12）
+   * - agent 每次 write/edit 写成功（SDK tool done = 文件已落盘）后端就刷新这个字段并推 action 帧
+   * - 前端 artifact 面板 effect 依赖它 → 事件驱动重拉、不再靠固定退避猜「文件啥时候落盘」
+   * - 根治「artifact 产出后页面停在『没有产物』、要切 tab / 刷新」（前 3 次靠 SSE 重连 / 退避都治标）
+   */
+  artifactUpdatedAt?: number;
+
+  /**
    * 软删标记（V0.6.x「划除」）——用户主动把这个 action 从 agent 上下文里排除
    * - 区别于 status=cancelled（中途停了没跑完）：excluded 是「不管跑没跑完、用户判定它冗余/跑歪、别再进上下文」
    *   （所以是独立 flag、不是 status 的一个值——一个 completed 的 action 也能被 excluded）

@@ -1798,6 +1798,26 @@ const handleSdkMessage = async (
           });
           break;
         }
+        // 写成功（status 非 running 非 error = SDK tool 执行完、文件已落盘）
+        // 事件驱动根治「artifact 落盘后页面不刷新」：从路径解析 n、刷新对应 action 的
+        // artifactUpdatedAt + 推 action 帧 → 前端面板 effect 依赖它立即重拉、不靠退避猜落盘时刻。
+        // （artifactPath 在 appendAction 建 action 时已预设成 actions/<n>-<type>.md、文件在即可读、
+        //   这里只需触发一次「文件变了、来重读」的信号）
+        {
+          const m = possibleTarget.match(/actions\/(\d+)-[a-z]+\.md$/);
+          if (m) {
+            const n = Number(m[1]);
+            const fresh = await getTask(taskId);
+            const target = fresh?.actions.find((a) => a.n === n);
+            if (target) {
+              const patched = await patchAction(taskId, target.id, {
+                artifactUpdatedAt: Date.now(),
+              });
+              const a = patched?.actions.find((x) => x.id === target.id);
+              if (a) publish(taskId, { kind: "action", action: a });
+            }
+          }
+        }
         break;
       }
 

@@ -1154,7 +1154,12 @@ export const patchAction = async (
   patch: Partial<
     Pick<
       ActionRecord,
-      "status" | "postCheck" | "sideEffects" | "agentModel" | "excluded"
+      | "status"
+      | "postCheck"
+      | "sideEffects"
+      | "agentModel"
+      | "excluded"
+      | "artifactUpdatedAt"
     >
   >,
 ): Promise<Task | null> =>
