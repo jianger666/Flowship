@@ -70,7 +70,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   // V0.6.0.1：任务模式（"task" / "chat"、对应顶部 ModeCard 切换）
   const [mode, setMode] = useState<TaskMode>("task");
   // V0.4 任务角色：决定 agent 以哪种视角读 story / 出方案（仅 task 模式显示）
-  const [role, setRole] = useState<TaskRole>("fe");
+  // V0.6.12：不默认前端、初始空——强制用户主动选、避免后端同学顺手提交成前端
+  const [role, setRole] = useState<TaskRole | "">("");
   // 任务标题（task 模式必填；chat 模式选填、空时后端自动补「未命名对话 MM-DD HH:mm」）
   const [title, setTitle] = useState("");
   // 目标仓库（task 模式必填至少 1 个；chat 模式选填、空时 agent cwd = home）
@@ -119,7 +120,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   useEffect(() => {
     if (open) return;
     setMode("task");
-    setRole("fe");
+    setRole("");
     setTitle("");
     setRepoPaths([]);
     setFeishuStoryUrl("");
@@ -132,16 +133,17 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // task 模式三必填；chat 模式全选填、随便点都能提交
+  // task 模式必填 title/repos/feishu/role；chat 模式全选填、随便点都能提交
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (mode === "task") {
       if (!title.trim()) return false;
       if (repoPaths.length === 0) return false;
       if (!feishuStoryUrl.trim()) return false;
+      if (!role) return false; // V0.6.12：角色必选、不再默认前端
     }
     return true;
-  }, [submitting, mode, title, repoPaths, feishuStoryUrl]);
+  }, [submitting, mode, title, repoPaths, feishuStoryUrl, role]);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -198,7 +200,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
       const task = await createTask({
         mode,
-        role,
+        // task 模式 canSubmit 已保证 role 非空；chat 模式无角色、"" → undefined
+        role: role || undefined,
         title: title.trim(),
         repoPaths,
         feishuStoryUrl: feishuStoryUrl.trim() || undefined,
@@ -381,7 +384,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 >
                   <SelectTrigger id="t-role" className="w-full">
                     <SelectValue placeholder="选择角色">
-                      {TASK_ROLE_LABEL[role]}
+                      {role ? TASK_ROLE_LABEL[role] : null}
                     </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
