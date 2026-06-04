@@ -248,9 +248,10 @@ submit_mr({
 1. `content` 里用**正式 mention 块**写 @（不是纯文本 `@中文名`）
 2. 传 `notify_user_type` + `notify_user_list` 两个**通知参数**（漏传 = 飞书项目 UI 里「@ 了但没勾通知」、人收不到）
 
-> ⚠️ **两处 id 格式不一样、别搞混**（实测：`lark_user_id` 是**纯数字**、如 `7227652003395092508`、不是 `ou_xxx`——`ou_/on_` 那种是 `out_id`、不要用）：
-> - content 的 mention 块 `id` 要**加前缀** → `lark_user_id_7227652003395092508`
-> - `notify_user_list` 用**原始数字** → `7227652003395092508`（不加前缀）
+> ⚠️ **两处 id 都用纯数字 lark_user_id、都不加前缀**（实测：`lark_user_id` 是**纯数字**、如 `7227652003395092508`、不是 `ou_xxx`——`ou_/on_` 那种是 `out_id`、不要用）：
+> - content 的 mention 块 `id`：**纯数字、不加前缀** → `7227652003395092508`
+> - `notify_user_list`：**纯数字、不加前缀** → `7227652003395092508`
+> 🛑 **绝对不要给 mention 块 id 加 `lark_user_id_` 前缀**——add_comment 的 schema describe 举例写的是 `lark_user_id_xxx`、**那是坑**：实测带前缀飞书直接返回 `no permission`（误导性报错、看着像没权限、其实是 mention id 格式非法）、纯数字才能成功（2026-06-04 对照实验确诊）。
 
 ```typescript
 add_comment({
@@ -260,7 +261,7 @@ add_comment({
 <对每条 MR 一行：URL 必须放行尾、不要在 URL 后追加任何字符（飞书 IM 会把括号、空格后的字符一起 link 化导致 404）>
 - [\${repoTailName}]\${mrVersion > 1 ? ` v\${mrVersion}` : ""} <mr_url>
 
-@张三<!-- mention:{"id":"lark_user_id_7227652003395092508","cn_name":"张三","blockType":"AT_USER_BLOCK"} --> @李四<!-- mention:{"id":"lark_user_id_7483212744695627804","cn_name":"李四","blockType":"AT_USER_BLOCK"} -->
+@张三<!-- mention:{"id":"7227652003395092508","cn_name":"张三","blockType":"AT_USER_BLOCK"} --> @李四<!-- mention:{"id":"7483212744695627804","cn_name":"李四","blockType":"AT_USER_BLOCK"} -->
 `,
   notify_user_type: "lark_user_id",                               // 我们存的是 lark_user_id、固定填这个
   notify_user_list: ["7227652003395092508", "7483212744695627804"],  // = task.feishuTesterUserIds 原始数字、不加前缀；跳过场景省略或传 []
@@ -268,9 +269,9 @@ add_comment({
 ```
 
 - **@ 的正确姿势（关键、必背）**：`task.feishuTesterUserIds` 是纯数字 lark_user_id（§2 探测时存的）。两步缺一不可：
-  - **content 里每个 @ 用 mention 块**：`@<中文名><!-- mention:{"id":"lark_user_id_<数字 lark_user_id>","cn_name":"<中文名>","blockType":"AT_USER_BLOCK"} -->`（id **带 `lark_user_id_` 前缀**；中文名从 §2 一并记下、多人就拼多段空格隔开）。**不要**只写纯文本 `@中文名`（不是真 @、不发通知）
+  - **content 里每个 @ 用 mention 块**：`@<中文名><!-- mention:{"id":"<纯数字 lark_user_id>","cn_name":"<中文名>","blockType":"AT_USER_BLOCK"} -->`（id **纯数字、不加 `lark_user_id_` 前缀**；中文名从 §2 一并记下、多人就拼多段空格隔开）。**不要**只写纯文本 `@中文名`（不是真 @、不发通知）
   - **同时传 `notify_user_type: "lark_user_id"` + `notify_user_list: [所有 tester 的原始数字 lark_user_id]`**（这里**不加**前缀）：这俩才是真正发通知的开关、漏传 = @ 出来了但没人收到
-  - 格式以 `add_comment` 工具的**真实 schema 描述为准**（content 字段的 mention 示例 + notify 两参数的说明）微调、别凭记忆硬拼
+  - ⚠️ `add_comment` schema 的 mention 示例带 `lark_user_id_` 前缀、**别照抄**（实测 `no permission`）——mention id 一律纯数字；notify 两参数说明可参考 schema
 - 多仓 task：一条评论里平铺所有 MR 链接、按 repoPath 末段名（如 `crm-web`）标注
 - `feishuTesterUserIds` 为空数组（用户选了跳过）：评论不加 @ mention 块、只贴链接、notify 两参数省略（或传空）
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
