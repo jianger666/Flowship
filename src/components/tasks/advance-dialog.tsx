@@ -33,7 +33,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight, Loader2, Paperclip, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
@@ -48,9 +48,12 @@ import { Label } from "@/components/ui/label";
 import { ModelPicker } from "@/components/ui/model-picker";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
 import { ACTION_LABEL } from "@/lib/task-display";
+import type { ImagePayload } from "@/lib/task-store";
+import { cn } from "@/lib/utils";
 import type { ActionType, ModelSelection, Task } from "@/lib/types";
 
 // V0.6.1 已实装的 action 类型；test/learn 灰掉
@@ -176,6 +179,8 @@ interface Props {
     forceNewAgent: boolean;
     // 用户在 dialog 里临时挑的模型；只在 forceNewAgent=true 时传、其他场景父组件用默认
     model?: ModelSelection;
+    // 指令配的截图附件（选填、贴图说明改哪）
+    images?: ImagePayload[];
   }) => Promise<void>;
   submitting: boolean;
 }
@@ -206,6 +211,23 @@ export const AdvanceDialog = ({
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
 
+  // 指令输入框的图附件（粘贴 / 拖拽 / 选文件）、跟 revise-dialog 共用 hook
+  const {
+    images,
+    isDragging,
+    fileInputRef,
+    maxImages,
+    removeImage,
+    reset: resetImages,
+    triggerFilePicker,
+    onPaste,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+    onFileInputChange,
+    toUploadPayload,
+  } = useImageAttach();
+
   // dialog 打开时初始化表单 state。
   // 关键：依赖只放 open / defaultActionType，绝不放 availableModels.length——
   // 否则模型列表异步加载完成（length 0→N）会重跑本 effect，把用户已经改过的 action 选中
@@ -234,6 +256,13 @@ export const AdvanceDialog = ({
     }
   }, [open, availableModels.length, fetchModels]);
 
+  // dialog 关闭时清空附图、下次打开不残留上次的图
+  //（resetImages 每次 render 新引用、故意只在 open 变化时跑、不进 deps）
+  useEffect(() => {
+    if (!open) resetImages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
   const disabledReason = useMemo(
     () => inferDisabledReason(task, actionType, gitConfig),
@@ -253,6 +282,8 @@ export const AdvanceDialog = ({
       forceNewAgent,
       // 只在「强制起新 agent」时透传模型选择、续接走 task.model
       model: forceNewAgent && pickedModel.id ? pickedModel : undefined,
+      // 截图附件（选填）、后端落盘后把路径注入 agent prompt
+      images: toUploadPayload(),
     });
   };
 
@@ -291,7 +322,7 @@ export const AdvanceDialog = ({
                           : type === "build"
                             ? "写代码"
                             : type === "review"
-                              ? "复核差异"
+                              ? "复核差异 + 找 bug"
                               : "提 MR 到 test"}
                     </span>
                   </ChoiceButton>
@@ -326,22 +357,90 @@ export const AdvanceDialog = ({
             <Label htmlFor="advance-instruction">
               指令 <span className="text-xs text-muted-foreground">（选填）</span>
             </Label>
-            <Textarea
-              id="advance-instruction"
-              value={instruction}
-              onChange={(e) => setInstruction(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                  e.preventDefault();
-                  void handleSubmit();
-                }
-              }}
-              placeholder={buildPlaceholder(task, actionType)}
-              disabled={submitting}
-              rows={4}
-              autoFocus
-              className="resize-none"
-            />
+            {/* 整片输入区支持拖拽贴图：drag over 时轮廓高亮（跟 revise-dialog 一致） */}
+            <div
+              className={cn(
+                "flex flex-col gap-2 rounded-md transition-colors",
+                isDragging &&
+                  "bg-primary/5 p-1 ring-1 ring-primary/30 ring-inset",
+              )}
+              onDragOver={onDragOver}
+              onDragLeave={onDragLeave}
+              onDrop={onDrop}
+            >
+              {/* 缩略图区：提交前可移除单张 */}
+              {images.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {images.map((img) => (
+                    <div
+                      key={img.id}
+                      className="group relative size-16 overflow-hidden rounded-md border bg-card"
+                      title={img.file.name}
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={img.dataUrl}
+                        alt={img.file.name}
+                        className="size-full object-cover"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeImage(img.id)}
+                        className="absolute top-0.5 right-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                        aria-label="移除"
+                      >
+                        <X className="size-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <Textarea
+                id="advance-instruction"
+                value={instruction}
+                onChange={(e) => setInstruction(e.target.value)}
+                onPaste={onPaste}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    void handleSubmit();
+                  }
+                }}
+                placeholder={buildPlaceholder(task, actionType)}
+                disabled={submitting}
+                rows={4}
+                autoFocus
+                className="resize-none"
+              />
+              {/* 隐藏 input：附图按钮触发 */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={onFileInputChange}
+              />
+              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  {images.length > 0
+                    ? `图 ${images.length}/${maxImages}`
+                    : "可粘贴 / 拖拽截图、或点附图"}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={triggerFilePicker}
+                  disabled={submitting}
+                  className="h-7 gap-1 px-2 text-xs"
+                  title="附图（也支持粘贴 / 拖拽）"
+                >
+                  <Paperclip className="size-3.5" />
+                  附图
+                </Button>
+              </div>
+            </div>
           </div>
 
           {/* 高级：强制起新 agent */}

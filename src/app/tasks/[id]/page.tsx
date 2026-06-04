@@ -273,6 +273,8 @@ const TaskDetailPage = () => {
     forceNewAgent: boolean;
     // 用户在 advance-dialog 里临时挑的模型；仅 forceNewAgent=true 时透传、续接 Run 不能换
     model?: ModelSelection;
+    // 指令配的截图附件（选填）
+    images?: ImagePayload[];
   }) => {
     setStarting(true);
     try {
@@ -291,6 +293,9 @@ const TaskDetailPage = () => {
         body: JSON.stringify({
           actionType: input.actionType,
           userInstruction: input.userInstruction,
+          // 截图附件（选填）、后端落盘后把路径注入 agent prompt
+          images:
+            input.images && input.images.length > 0 ? input.images : undefined,
           apiKey: args.apiKey,
           model,
           forceNewAgent: input.forceNewAgent,
