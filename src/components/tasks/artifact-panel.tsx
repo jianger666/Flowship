@@ -67,6 +67,13 @@ const formatShortTime = (ts: number): string => {
   return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
 
+// artifact 读到空、但 action 已是「该有产物」态时的退避重试参数
+// 修「agent 产出了 artifact、但页面停在『没有产物』、要手动刷新 / 切 tab 才看到」：
+// 产出那一刻文件刚落盘 / agent 调 wait_for_user 与写文件有时序差、一次性拉可能读到 null、
+// 之后 action.status 不再变 effect 就不会重拉 → 退避重试几次自愈。
+const ARTIFACT_LOAD_MAX_RETRIES = 5;
+const ARTIFACT_LOAD_RETRY_MS = 800;
+
 // localStorage key：分 task × actionId 维度
 const seenStorageKey = (taskId: string, actionId: string) =>
   `fe-ai-flow:artifact-revisions-seen:${taskId}:${actionId}`;
@@ -216,10 +223,20 @@ export const ArtifactPanel = ({
   // artifact 内容 + revision 列表一起拉
   // 依赖：action.id + action.endedAt（agent 写完 artifact 会 patchAction(endedAt) ）+ action.status
   // status / endedAt 变化时正文应该刷新
+  //
+  // 兜底重试：action 已进入「该有产物」态（awaiting_ack / completed）却读到空、
+  // 大概率是产出那一刻文件刚落盘 / SSE 事件时序、退避重试几次直到读到（见顶部常量注释）。
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let tries = 0;
+    // 这些状态下 agent 已交卷、artifact 文件理应存在；读到空 = 时序、值得重试
+    const shouldHaveArtifact =
+      action.status === "awaiting_ack" || action.status === "completed";
     const load = async () => {
       setContentLoading(true);
+      // 本次是否安排了重试：是的话保持 loading 态、避免重试间隙闪「没有产物」
+      let willRetry = false;
       try {
         const data = await fetchActionRevisions(taskId, action.id);
         if (cancelled) return;
@@ -232,16 +249,31 @@ export const ArtifactPanel = ({
           }
           return data.revisions[data.revisions.length - 1]!.timestamp;
         });
+        if (
+          !data.current &&
+          shouldHaveArtifact &&
+          tries < ARTIFACT_LOAD_MAX_RETRIES
+        ) {
+          tries += 1;
+          willRetry = true;
+          retryTimer = setTimeout(() => void load(), ARTIFACT_LOAD_RETRY_MS);
+        }
       } catch (err) {
         if (cancelled) return;
         console.warn("[artifact-panel] fetch revisions 失败", err);
+        if (shouldHaveArtifact && tries < ARTIFACT_LOAD_MAX_RETRIES) {
+          tries += 1;
+          willRetry = true;
+          retryTimer = setTimeout(() => void load(), ARTIFACT_LOAD_RETRY_MS);
+        }
       } finally {
-        if (!cancelled) setContentLoading(false);
+        if (!cancelled && !willRetry) setContentLoading(false);
       }
     };
     void load();
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, [taskId, action.id, action.endedAt, action.status, action.artifactPath]);
 
