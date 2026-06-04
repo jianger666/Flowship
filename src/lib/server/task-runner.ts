@@ -87,6 +87,7 @@ import {
   readGlobalCursorRulesForPrompt,
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
+import { filterHealthyMcp } from "./mcp-probe";
 import type {
   ActionRecord,
   ActionType,
@@ -96,7 +97,9 @@ import type {
   TaskEvent,
 } from "@/lib/types";
 import {
+  ACTION_FRESH_AGENT_DEFAULT,
   ACTION_LABEL,
+  MCP_HEALTH_LABEL,
   TASK_ROLE_LABEL,
 } from "@/lib/types";
 
@@ -882,6 +885,12 @@ export const advanceTask = async (
     gitToken,
   } = input;
 
+  // V0.6.9 per-action fresh 默认：用户没手动勾「换新 agent」时、按 action 作用决定是否强起 fresh。
+  // review 默认 fresh（= 换人复审、绕开「自己审自己」的共识盲点）；其余 action 默认复用上一个 agent。
+  // 「换新 agent」开关（forceNewAgent）是附加覆盖、永远能手动强起、不会被默认值压回去。
+  const effectiveForceNewAgent =
+    forceNewAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
+
   // 1) 准入条件（V0.6 门槛 1）
   const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
   if (!pre.ok) {
@@ -929,7 +938,7 @@ export const advanceTask = async (
 
   // 4) 决定路由
   const existingRecord = runningTasks.get(task.id);
-  if (existingRecord && !forceNewAgent) {
+  if (existingRecord && !effectiveForceNewAgent) {
     // V0.6.6 热更：agent 长生期间用户可能在详情页改了 role / title / feishuStoryUrl
     // diff 启动快照、有变才拼一段 [TASK_UPDATED] 注入；注入后把快照推进到当前值、避免下次重复告知同一变更
     const taskUpdateHint = buildTaskUpdateHint(
@@ -981,7 +990,7 @@ export const advanceTask = async (
   }
 
   // 5) 没活 agent / forceNewAgent：起新 Run
-  if (existingRecord && forceNewAgent) {
+  if (existingRecord && effectiveForceNewAgent) {
     forkPendingTasks.add(task.id);
     existingRecord.cancel();
     const stopped = await waitForTaskToStop(task.id, 5000);
@@ -1001,7 +1010,7 @@ export const advanceTask = async (
     branchCheckoutHint,
     apiKey,
     model,
-    forceNewAgent: !!forceNewAgent,
+    forceNewAgent: effectiveForceNewAgent,
     gitHost,
     gitToken,
   });
@@ -1158,12 +1167,15 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   //    per-task 用 task.disabledMcpServers 精简、详见 cursor-config.ts
   // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
   // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
-  const cursorMcp = await enrichMcpServersWithOAuth(
+  const enrichedMcp = await enrichMcpServersWithOAuth(
     filterDisabledMcp(
       await readGlobalCursorMcpServers(),
       task.disabledMcpServers,
     ),
   );
+  // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
+  const { servers: cursorMcp, dropped: droppedMcp } =
+    await filterHealthyMcp(enrichedMcp);
   const mergedMcp: Record<string, McpServerConfig> = {
     ...cursorMcp,
     [TASK_TOOL_MCP_NAME]: {
@@ -1183,6 +1195,17 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     actionId: action.id,
     text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
   });
+
+  // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
+  if (droppedMcp.length > 0) {
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      actionId: action.id,
+      text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
+        .map((d) => `${d.name}（${MCP_HEALTH_LABEL[d.status]}）`)
+        .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
+    });
+  }
 
   // 2) 注册 task-scoped action handler（V0.6.1 submit_mr / set_feishu_testers）
   // 闭包里持 gitHost / gitToken 快照——task 运行期间不可变、要换 token 需 force-new-agent

@@ -29,7 +29,7 @@ import type {
 export const ACTION_LABEL: Record<ActionType, string> = {
   plan: "出方案",
   build: "改代码",
-  review: "代码复核",
+  review: "复核",
   ship: "提测",
   test: "AI 手测",
   learn: "沉淀",

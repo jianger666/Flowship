@@ -14,7 +14,7 @@
  * 不脱敏（用户拍板）：本地单机工具、原样展示完整 JSON（含 token / env）、跟 Cursor 一致。
  */
 
-import { FileCode, Plug, ShieldCheck } from "lucide-react";
+import { FileCode, Plug, RefreshCw, ShieldCheck } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,7 +30,9 @@ import {
 } from "@/components/ui/card";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
+import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { useMcpOAuth } from "@/hooks/use-mcp-oauth";
+import { cn } from "@/lib/utils";
 
 interface McpCardProps {
   // 设置页配的「常用 MCP」默认黑名单（建任务时取这份快照、关掉的进黑名单）
@@ -42,6 +44,12 @@ interface McpCardProps {
 export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
   const { servers, names, dirs, loading, error } = useCursorMcp();
   const { statuses, busy, authorize, revoke } = useMcpOAuth();
+  // 各 server 连通性（进设置页探测一次、可手动重测）
+  const {
+    health,
+    loading: healthLoading,
+    refresh: recheckHealth,
+  } = useMcpHealth();
 
   // 原样拼回 { mcpServers: {...} }（跟 ~/.cursor/mcp.json 文件结构一致）、只读展示
   const json = JSON.stringify({ mcpServers: servers }, null, 2);
@@ -121,14 +129,30 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
 
             {/* 常用 MCP 开关：勾选的建任务默认带、关掉的进默认黑名单、改即生效（无需保存按钮） */}
             <div className="space-y-2 rounded-md border border-border/60 p-3">
-              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Plug className="size-3.5 shrink-0" />
-                常用 MCP——建任务默认带勾选的这些、可在建任务时临时增减
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                  <Plug className="size-3.5 shrink-0" />
+                  常用 MCP——勾选的建任务默认带；右侧点是连通状态
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={recheckHealth}
+                  disabled={healthLoading}
+                >
+                  <RefreshCw
+                    className={cn("size-3", healthLoading && "animate-spin")}
+                  />
+                  重新检测
+                </Button>
               </div>
               <McpToggleList
                 availableServers={names}
                 disabled={disabledServers}
                 onChange={onChange}
+                health={health}
+                healthLoading={healthLoading}
               />
             </div>
 

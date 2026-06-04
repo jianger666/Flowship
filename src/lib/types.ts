@@ -124,7 +124,7 @@ export interface ModelOption {
  * 6 种 action 类型（V0.6.0.1 起 chat 从 action 里剥离、走独立 mode=chat 通路）
  * - `plan`     出方案
  * - `build`    改代码
- * - `review`   代码复核
+ * - `review`   复核（plan/build 差异核对 + fresh peer bug 复审）
  * - `ship`     提测（push 改动 + 提 MR 到 test 分支 + 飞书 story 评论 @ 测试人员）
  * - `test`     AI 手测
  * - `learn`    沉淀
@@ -152,10 +152,34 @@ export const ACTION_TYPES = [
 export const ACTION_LABEL: Record<ActionType, string> = {
   plan: "出方案",
   build: "改代码",
-  review: "代码复核",
+  review: "复核",
   ship: "提测",
   test: "AI 手测",
   learn: "沉淀",
+};
+
+/**
+ * 每个 action 推进时「是否默认强起一个全新 agent（fresh）」的默认值（V0.6.9）
+ *
+ * 背景：task 默认复用同一个 agent 跑完所有 action（省 Cursor 计费）。但因为每一步都落
+ * artifact（md），「聊天记忆」其实不重要，所以每个 action 可以按它自己的作用，独立决定
+ * 「复用上一个 agent」还是「强起 fresh agent」。
+ *
+ * - review = true（fresh）：核心。复审必须由一个「没写过这段代码、不知道作者怎么想」的
+ *   全新 agent 做——这才是「换人复审」、绕开「自己审自己」的共识盲点（Cognition anti-pattern）。
+ * - 其余 = false（复用）：plan/build 要上下文连续性 + 写代码最贵；ship/test/learn 读
+ *   artifact 干活、复用便宜（复用到的是 fresh review agent、本身就无盲点）。
+ *
+ * 生效逻辑见 task-runner.advanceTask：`effective = forceNewAgent || ACTION_FRESH_AGENT_DEFAULT[type]`
+ * ——UI「换新 agent」开关是附加覆盖（永远能手动强起）、这张表只决定「不手动时」的默认。
+ */
+export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
+  plan: false,
+  build: false,
+  review: true,
+  ship: false,
+  test: false,
+  learn: false,
 };
 
 /**
@@ -204,7 +228,7 @@ export interface ActionRecord {
    * 后置 deterministic 检查（V0.6 门槛 2）
    * - plan: artifact 文件存在 + 内容长度 >= 100（V0.6.0.1 拍板删黑名单 grep、详见 action-checks.ts）
    * - build: typecheck/lint exit 0 + git status 有改动
-   * - review: git diff hash 一致 + 4 类差异段非空
+   * - review: git diff hash 一致 + 4 类差异段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
    * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
    * - test: pass 率 ≥ 阈值
    * - learn: propose 段有内容 + evidence 路径都能 read 到
@@ -617,4 +641,32 @@ export type TaskSummary = Omit<Task, "events" | "actions"> & {
   // V0.6：列表卡片需要展示「最近一个 action」简略信息
   lastActionType?: ActionType;
   lastActionStatus?: ActionStatus;
+};
+
+// ---- MCP 连通性健康（V0.6.11） ----
+
+/**
+ * MCP server 连通性状态（起 agent 前探测 + 设置页 / 任务面板展示共用）
+ * - ok           initialize 探测 2xx、可用
+ * - unauthorized 401/403、需要授权（远程 OAuth MCP 没授权 / token 失效）
+ * - unreachable  连不上（超时 / DNS / 连接拒绝 / 非鉴权类 4xx5xx）
+ * - local        stdio 本地进程、没法 HTTP 探测、启动时由 SDK 拉起
+ */
+export type McpHealthStatus = "ok" | "unauthorized" | "unreachable" | "local";
+
+export interface McpHealth {
+  name: string;
+  status: McpHealthStatus;
+  // HTTP 状态码（探测到响应时有）
+  httpCode?: number;
+  // 状态详情（错误简述 / 说明、给 tooltip 用）
+  detail?: string;
+}
+
+/** MCP 健康状态中文标签（前后端共享、单一源） */
+export const MCP_HEALTH_LABEL: Record<McpHealthStatus, string> = {
+  ok: "正常",
+  unauthorized: "未授权",
+  unreachable: "连不上",
+  local: "本地",
 };

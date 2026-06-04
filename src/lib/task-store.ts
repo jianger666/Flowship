@@ -17,6 +17,7 @@ import type {
   ActionRecord,
   ArtifactRevision,
   AskUserAnswer,
+  McpHealth,
   NewTaskInput,
   Task,
   TaskEvent,
@@ -164,6 +165,16 @@ export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
     dirs: string[];
   }>(res);
   return { servers: data.servers, dirs: data.dirs };
+};
+
+/** 探测各 MCP server 连通性（设置页 / 任务面板状态展示用、V0.6.11） */
+export const fetchMcpHealth = async (): Promise<Record<string, McpHealth>> => {
+  const res = await fetch("/api/cursor-mcp/health", { cache: "no-store" });
+  const data = await handleJson<{
+    ok: true;
+    health: Record<string, McpHealth>;
+  }>(res);
+  return data.health;
 };
 
 // ----------------- MCP OAuth（V0.6.4 走 OAuth 授权的远程 MCP） -----------------

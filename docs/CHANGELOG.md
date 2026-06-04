@@ -15,6 +15,100 @@
 
 ---
 
+### V0.6.9：review 改 fresh peer 两阶段复审 + per-action 复用/强起 agent 默认（2026-06-03）
+
+**背景**：用户反馈 review「鸡肋」——找不到 bug、只会做「plan vs diff 差值」。根因：当年 review prompt 明确写「不做 AI 自审代码对错」（怕「写代码的 agent 自己审自己」= Cognition 警告的共识盲点 anti-pattern）。调研 Spec Kit / OpenSpec / Superpowers / GStack 后定方向：借 Superpowers 的 **fresh subagent 复审**——复审交给一个没写过这代码的全新 agent、绕开盲点。
+
+**① per-action「复用 / 强起 agent」默认表（机制层、泛化）**
+
+- 因为每步都落 artifact（md）、「聊天记忆」不重要 → 每个 action 可按作用独立决定「复用上一个 agent」还是「强起 fresh agent」。
+- `types.ts: ACTION_FRESH_AGENT_DEFAULT`（单一来源）：**review = true（fresh）**、其余（plan/build/ship/test/learn）= false（复用）。
+- `task-runner.ts advanceTask`：`effective = forceNewAgent || ACTION_FRESH_AGENT_DEFAULT[type]`——UI「换新 agent」开关是附加覆盖（永远能手动强起）、这表只管「不手动时」的默认。复用现有 forceNewAgent 路由（cancel 旧 agent + 等停 + 兜底强清 + fork 不清孤儿）、零新机制、UI/API 不动。
+- 注：**单 SDK run 不再是硬约束**——用户拍板「默认复用一次 run、但 review 这种该换人的就强起 fresh」。
+
+**② review = fresh peer 两阶段复审（价值层）**
+
+- **解锁逻辑**：复审现在是 fresh agent（没参与 build、没写过这代码）→ 是「换人复审 peer review」、不是「作者自审」→ 共识盲点不适用 → **可以也应该判代码对错、找 bug**。当年只禁自审、不禁 peer review。
+- **阶段一·差值**（保留）：plan vs diff + 飞书逐条对照（确定性、零误判、基本盘）。
+- **阶段二·bug 复审**（新增 §3.5）：需求层 bug（漏实现 / 跑偏需求 / 边界没覆盖、对照飞书验收基准——这是通用 AI review 没有的弹药）+ 代码层 bug（空指针 / 边界 / 错误处理等）、分级 🔴 阻塞 / 🟡 建议、带 file:line。
+- **诚实边界写死 prompt（防鸡肋 v2）**：高置信才报 🔴、拿不准归 🟡、找不到就如实写「未发现高置信 bug」、绝不编假阳性、运行时 bug 不强求（那是后续浏览器 QA 的活）、不自己修（只报告、用户拍板回 build）。
+- **门禁**：MVP 软门禁——🔴 写进 artifact、用户 ack 时看到、HITL 兜底（不带病 ship）；显式 ship 硬门禁后续再说。
+
+**落地**：
+- `types.ts`：+`ACTION_FRESH_AGENT_DEFAULT` map；postCheck 注释补 review bug 段。
+- `task-runner.ts`：advanceTask 算 `effectiveForceNewAgent`、三处路由用它。
+- `prompts/action-review.md`：重写定位（fresh peer 双阶段）+ step 3 改两阶段总纲（3.1–3.4 阶段一 / 3.5 阶段二 bug 复审）+ 飞书对照降级为 3.4 + artifact 骨架加「## bug 复审」段 + 总评加 bug 结论 + 后置检查加 bug 段非空 + 顺手修历史遗留「§7 ask_user」误写（ask_user 实为 §6）。
+- `action-checks.ts: checkReview`：加「## bug 复审」段非空检查（防 fresh agent 跳过阶段二）。
+
+**待办（后续）**：真实浏览器 QA（前端运行时 bug、用户暂缓、价值最大、Cursor 结构上做不了）；显式 ship 硬门禁。
+
+**hotfix（同会话实测发现）**：首条 fresh review 实测产出很好（找到 2 个真 🟡 bug、诚实边界守住），但 postCheck 误判红条「缺少 2 类差异段」。根因：旧 `checkReview` 用松散 grep 强求全文出现「未实现 / 额外」等词、只容忍缺 1；但 review 骨架明确「无内容的差异段整段省略」、一份干净 review（无范围偏离 / 无未完成 / 无超范围）天然不含这些词 → 误判（prompt 自相矛盾、V0.6.9 前就埋着、干净 review 才触发、误判红条直接打击用户信任）。修：`checkReview` 改成只验骨架里「无省略豁免」的两段（总评 + 跟飞书需求对照）+ bug 复审段；`action-review.md` 后置检查 §2 + 骨架引言改成跟骨架一致（条件段无内容可整段省略）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+---
+
+### V0.6.8：ship 智能解冲突 + 孤儿进程清理 + SSE 自动重连（2026-06-03）
+
+**① ship 提测冲突「AI 智能解决」（不松「feature 保持干净」铁律）**
+
+- 背景：feature→测试分支 提测遇冲突、以前只能 `ask_user` 让用户手动解。需求：像 IDEA 那样让 AI 智能解。
+- **铁律不松**：绝不把测试分支合进 feature（test 是整合分支、塞满别人没测完的功能、合进 feature 会污染、还可能把未测功能带上线）。
+- 方案：遇冲突 `ask_user` 给两选项「AI 智能解 / 自己解」。选 AI 解 → §3.6：
+  - 另建**一次性** `<feature>__conflict` 分支（基于 `origin/<测试分支>`）、`git merge <feature>` 把 feature 合进去（方向 feature→__conflict、**不是** test→feature）、AI 逐个解冲突标记、`git push -f` 这条 __conflict、`submit_mr` 用 __conflict 当 source。
+  - feature 分支全程不 checkout / 不改 / 不 push、本体干净——**这是铁律唯一豁免口**（只在一次性 __conflict 分支上 merge + force push）。解完 `git checkout <feature>` 恢复 HEAD（防 re-ship 误把 __conflict 当 feature）。
+- **双 MR 自动清理**：`submit_mr` 检测到 source 分支跟该仓上次不同（feature→__conflict）、新 MR 建好后**自动关掉**被取代的旧 `feature→测试分支` MR（`gitlab-client.ts: closeOpenMR` 复用 `findOpenMR` 拿 iid + `closeMR` PUT state_event=close）。测试人员只看到一个干净 MR。`remove_source_branch:true` 早就默认、__conflict 合并后自动删。
+- 落地：`gitlab-client.ts` +`closeMR`(内部)/`closeOpenMR`(导出)；`task-runner.ts` submit_mr handler 先读 fresh task 拿该仓上次 source、新 MR 建好后 `closeOpenMR` 旧分支（失败只 warn、不阻塞）；`prompts/action-ship.md` §3.5 改两选项 + 新增 §3.6 智能解冲突流程 + 反例 + artifact 表 + 顶部铁律豁免说明；`chat-mcp.ts` submit_mr describe 同步（第二指令源一致）。
+
+**② 停 task 清理 agent 孤儿子进程（重大 bug）**
+
+- bug：task 已停止、代码仓库还在被疯狂改。根因：agent 经 `npm run lint` 起的 `ng lint --fix` 子进程、agent 停了它没死、reparent 到 init（PPID=1）继续改文件。
+- 层2（cure）：`src/lib/server/kill-orphans.ts`——`reapTaskOrphans(repoPaths)` 扫进程、命中「Cursor agent shell 签名」**或**「孤儿(PPID=1) + build/脚本工具名 + cwd 在本 task 仓内」的、SIGKILL 整棵子树（立即 + 2.5s 后各扫一次、抓延迟 reparent）。接进 stop 路由（即时清）+ task `finally`（force-new-agent restart 不清、防误杀新 agent）。
+- 层1（prevent）：`_shared.md` §9 + `action-build.md`——禁自动改写命令（`lint --fix` / `prettier --write`）、禁长驻命令（dev server / `--watch`）、跑 lint script 前先 read 看清内部。
+
+**③ SSE 被动断开自动重连（artifact 产出不刷新）**
+
+- bug：artifact 产出了、详情页面板不自动刷新、要手动刷新 / 切阶段。根因：`useTaskWatch` SSE 流被动断开（maxDuration 超时 / 网络）后不重连、漏后续 action/artifact 更新。
+- 修：`use-task-watch.ts` 加自动重连循环——被动断开（非 `done` 信号）按指数退避重试、收到 `done` / `reconnectKey` 变（主动断开 / 切流）则不重连。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+### V0.6.7：ship 提测 / dev 分支 per-repo 配置 + feature 分支命名模板化（2026-06-02）
+
+**需求**：① 给「ship 提测分支」「dev 分支」做 per-repo 配置（之前 ship 写死提测到 `test`）；② feature 分支命名从写死算法（`feature/<username>/<storyId>-<title>`）改成用户可配模板、支持前后端不同规范（前端 `feature/{username}/{storyId}-{taskTitle}`、后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）。
+
+**模板引擎**（`src/lib/branch-template.ts`、client + server 共用、不依赖 node）：
+- 占位符 4 个：`{username}` / `{storyId}`（从 feishuStoryUrl 抠 `detail/<digits>`）/ `{taskTitle}`（原算法的 title 改名）/ `{date:FORMAT}`（FORMAT 支持 yyyy/yy/MM/dd/HH/mm/ss）。`{storyTitle}` 用户明确先不加（server 端没有飞书调用通道）
+- `renderBranchName(template, vars, now?)`：每个变量值各自 `sanitizeBranchSegment`（git 非法字符 + 路径分隔 `/` 都换 `-`、模板字面的 `/` 保留 → 层级由模板控制、变量值不撑层级）、渲染后清连续 `//` + 去首尾 `/`
+- `resolveBranchTemplate(repoTpl, globalTpl)`：算「有效模板」= per-repo 覆盖 > 全局默认 > 内置默认 `DEFAULT_BRANCH_TEMPLATE`
+
+**配置层级**（用户选方案 1）：全局默认 `settings.branchTemplate` + per-repo 覆盖 `settings.repos[].branchTemplate`。测试 / dev 分支是「仓库属性」per-repo（`settings.repos[].testBranch / devBranch`）、放设置页不放任务编辑弹窗。devBranch 暂无用途、只存配置。
+
+**数据流**（同 `repoBaseBranches` 模式、因 settings 在 localStorage、server 读不到、必须建 task 时固化）：
+
+```
+settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
+  → 建 task：new-task-dialog 快照（resolveBranchTemplate 算有效模板）
+  → task.{repoTestBranches,repoDevBranches,repoBranchTemplates}（meta 落盘）
+  → build：planBranchesForBuild 用 repoBranchTemplates 渲染分支名
+  → ship：agent 从 super prompt「仓库分支配置」段读测试分支（没配回退 test）
+```
+
+**落地**：
+- `types.ts`：`RepoConfig` +`testBranch?`/`devBranch?`/`branchTemplate?`；`FeAiFlowSettings` +`branchTemplate?`（全局默认）；`Task` +`repoTestBranches?`/`repoDevBranches?`/`repoBranchTemplates?`；`NewTaskInput` Pick 加这三个
+- `local-store.ts`：`DEFAULT_SETTINGS.branchTemplate = DEFAULT_BRANCH_TEMPLATE` + `getSettings` 兜底
+- `user-profile-card.tsx`：加「默认分支命名模板」输入框 + 占位符说明 + `useMemo` 实时预览
+- `repo-card.tsx`：每仓单行改三行网格、加 test/dev/模板覆盖输入框、通用 `setRepoField(path, field, value)` + `onRepoFieldBlur` 替代原 `setOnlineBranch`
+- `new-task-dialog.tsx`：handleSubmit 快照三字段进 createTask
+- `task-fs.ts`：meta 加 3 字段 + createTask 清洗（key 限定 repoPaths + trim）+ hydrateTask 映射
+- `task-runner.ts`：`planBranchesForBuild` 去 username 硬检查、改 `renderBranchName`(per-repo 模板)；新增 `renderRepoBranchSection(task)` 注入 super prompt
+- `prompts/_super.md`：任务基本信息段后加「仓库分支配置」段 + `{{repoBranchSection}}`
+- `prompts/action-ship.md`：测试分支不再写死 `test`（6 处）、改「读 super prompt 仓库分支配置段、没配回退 test」
+- `chat-mcp.ts`：`submit_mr` 的 `target_branch` describe 同步改（跟 ship prompt 一致、避免第二指令源冲突）
+- **hot-fix（接手补跑 typecheck 发现）**：`use-settings.ts` 的 `dirty`（`Record<keyof FeAiFlowSettings, boolean>`）+ `isFieldEqual` 字符串分支补 `branchTemplate`（不补报 TS2741、上一会话工具崩溃没跑成 typecheck 漏的）
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.6：详情页编辑任务 + 字段热更（2026-06-02）
 
 **需求**：建完任务后能在详情页改「建任务时填的软配置」——以前填错只能删了重建。后续追加：编辑后若不换新 agent、长生 agent 读不到新值的问题。

@@ -23,6 +23,50 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { setTaskDisabledMcpServers } from "@/lib/task-store";
+import { MCP_HEALTH_LABEL } from "@/lib/types";
+import type { McpHealth, McpHealthStatus } from "@/lib/types";
+
+// 连通性状态点 / 文字配色（V0.6.11）
+const HEALTH_DOT: Record<McpHealthStatus, string> = {
+  ok: "bg-emerald-500",
+  unauthorized: "bg-amber-500",
+  unreachable: "bg-red-500",
+  local: "bg-muted-foreground/40",
+};
+const HEALTH_TEXT: Record<McpHealthStatus, string> = {
+  ok: "text-emerald-600 dark:text-emerald-500",
+  unauthorized: "text-amber-600 dark:text-amber-500",
+  unreachable: "text-red-600 dark:text-red-500",
+  local: "text-muted-foreground",
+};
+
+// 单个 server 的连通性徽标（点 + 中文 + hover 详情）。h 没探到 + loading → spinner
+const HealthBadge = ({ h, loading }: { h?: McpHealth; loading?: boolean }) => {
+  if (h) {
+    return (
+      <span
+        className={cn(
+          "flex shrink-0 items-center gap-1 text-[11px]",
+          HEALTH_TEXT[h.status],
+        )}
+        title={
+          h.detail
+            ? `${MCP_HEALTH_LABEL[h.status]}：${h.detail}`
+            : MCP_HEALTH_LABEL[h.status]
+        }
+      >
+        <span className={cn("size-1.5 rounded-full", HEALTH_DOT[h.status])} />
+        {MCP_HEALTH_LABEL[h.status]}
+      </span>
+    );
+  }
+  if (loading) {
+    return (
+      <Loader2 className="size-3 shrink-0 animate-spin text-muted-foreground/50" />
+    );
+  }
+  return null;
+};
 
 interface McpToggleListProps {
   // 当前可选的 MCP server 名（来自 Cursor ~/.cursor/mcp.json）
@@ -37,6 +81,10 @@ interface McpToggleListProps {
   emptyHint?: string;
   // 容器额外 className
   className?: string;
+  // 各 server 连通性状态（V0.6.11、传了才展示状态点）
+  health?: Record<string, McpHealth>;
+  // 连通性探测进行中（首拉 / 重新检测时每行显示 spinner）
+  healthLoading?: boolean;
 }
 
 export const McpToggleList = ({
@@ -46,6 +94,8 @@ export const McpToggleList = ({
   taskId,
   emptyHint = "Cursor 里没配 MCP server",
   className,
+  health,
+  healthLoading,
 }: McpToggleListProps) => {
   // 自管模式下、PATCH 进行中的 server 名集合（按 server 名锁、避免重复点）
   const [pending, setPending] = useState<Set<string>>(new Set());
@@ -112,6 +162,7 @@ export const McpToggleList = ({
                 {name}
               </span>
             </div>
+            <HealthBadge h={health?.[name]} loading={healthLoading} />
             {isPending ? (
               <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
             ) : (

@@ -66,10 +66,12 @@ import {
   readGlobalCursorRulesForPrompt,
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
+import { filterHealthyMcp } from "./mcp-probe";
 import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
 } from "./task-runner";
+import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { Task, TaskEvent } from "@/lib/types";
 
 // ----------------- 配置 -----------------
@@ -505,12 +507,15 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
   // 配置里万一也叫 feAiFlowChat、按我们的为准（直接覆盖）
   // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
   // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
-  const cursorMcp = await enrichMcpServersWithOAuth(
+  const enrichedMcp = await enrichMcpServersWithOAuth(
     filterDisabledMcp(
       await readGlobalCursorMcpServers(),
       task.disabledMcpServers,
     ),
   );
+  // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
+  const { servers: cursorMcp, dropped: droppedMcp } =
+    await filterHealthyMcp(enrichedMcp);
   const mergedMcp: Record<string, McpServerConfig> = {
     ...cursorMcp,
     [CHAT_TOOL_MCP_NAME]: {
@@ -530,6 +535,16 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     kind: "info",
     text: `Chat 任务启动（model: ${model.id}、${mcpDesc}）`,
   });
+
+  // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
+  if (droppedMcp.length > 0) {
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
+        .map((d) => `${d.name}（${MCP_HEALTH_LABEL[d.status]}）`)
+        .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
+    });
+  }
 
   // 3) 注入 awaiting notifier：agent 调 wait_for_user → 切 task.runStatus=awaiting_user
   // chat 模式不会调 ask_user（prompt 已禁）、所以只处理 awaiting_start

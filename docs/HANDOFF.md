@@ -240,66 +240,29 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.6.8：ship 智能解冲突 + 孤儿进程清理 + SSE 自动重连（2026-06-03）
+### V0.6.11：MCP 容错（连不上不拖垮 run）+ 连通状态可视 + 飞书 @ mention 修复（2026-06-04）
 
-**① ship 提测冲突「AI 智能解决」（不松「feature 保持干净」铁律）**
+**背景**：用户实测 chat agent「老是启动不起来」、报错只有 `SDK status=error message=(none)`、无从定位。RCA：起 agent 注入的远程 MCP 里飞书项目（`project.feishu.cn/mcp_server/v1`）走 OAuth、fe 这侧没授权（`data/mcp-oauth/` 空）→ enrich 注入不到 token → SDK 连它 401 → **整个 run error**、且 SDK 没透传错误。用户两条诉求：① MCP 异常别影响发问；② 能看到 MCP 启动状态、不能只有开关。
 
-- 背景：feature→测试分支 提测遇冲突、以前只能 `ask_user` 让用户手动解。需求：像 IDEA 那样让 AI 智能解。
-- **铁律不松**：绝不把测试分支合进 feature（test 是整合分支、塞满别人没测完的功能、合进 feature 会污染、还可能把未测功能带上线）。
-- 方案：遇冲突 `ask_user` 给两选项「AI 智能解 / 自己解」。选 AI 解 → §3.6：
-  - 另建**一次性** `<feature>__conflict` 分支（基于 `origin/<测试分支>`）、`git merge <feature>` 把 feature 合进去（方向 feature→__conflict、**不是** test→feature）、AI 逐个解冲突标记、`git push -f` 这条 __conflict、`submit_mr` 用 __conflict 当 source。
-  - feature 分支全程不 checkout / 不改 / 不 push、本体干净——**这是铁律唯一豁免口**（只在一次性 __conflict 分支上 merge + force push）。解完 `git checkout <feature>` 恢复 HEAD（防 re-ship 误把 __conflict 当 feature）。
-- **双 MR 自动清理**：`submit_mr` 检测到 source 分支跟该仓上次不同（feature→__conflict）、新 MR 建好后**自动关掉**被取代的旧 `feature→测试分支` MR（`gitlab-client.ts: closeOpenMR` 复用 `findOpenMR` 拿 iid + `closeMR` PUT state_event=close）。测试人员只看到一个干净 MR。`remove_source_branch:true` 早就默认、__conflict 合并后自动删。
-- 落地：`gitlab-client.ts` +`closeMR`(内部)/`closeOpenMR`(导出)；`task-runner.ts` submit_mr handler 先读 fresh task 拿该仓上次 source、新 MR 建好后 `closeOpenMR` 旧分支（失败只 warn、不阻塞）；`prompts/action-ship.md` §3.5 改两选项 + 新增 §3.6 智能解冲突流程 + 反例 + artifact 表 + 顶部铁律豁免说明；`chat-mcp.ts` submit_mr describe 同步（第二指令源一致）。
-
-**② 停 task 清理 agent 孤儿子进程（重大 bug）**
-
-- bug：task 已停止、代码仓库还在被疯狂改。根因：agent 经 `npm run lint` 起的 `ng lint --fix` 子进程、agent 停了它没死、reparent 到 init（PPID=1）继续改文件。
-- 层2（cure）：`src/lib/server/kill-orphans.ts`——`reapTaskOrphans(repoPaths)` 扫进程、命中「Cursor agent shell 签名」**或**「孤儿(PPID=1) + build/脚本工具名 + cwd 在本 task 仓内」的、SIGKILL 整棵子树（立即 + 2.5s 后各扫一次、抓延迟 reparent）。接进 stop 路由（即时清）+ task `finally`（force-new-agent restart 不清、防误杀新 agent）。
-- 层1（prevent）：`_shared.md` §9 + `action-build.md`——禁自动改写命令（`lint --fix` / `prettier --write`）、禁长驻命令（dev server / `--watch`）、跑 lint script 前先 read 看清内部。
-
-**③ SSE 被动断开自动重连（artifact 产出不刷新）**
-
-- bug：artifact 产出了、详情页面板不自动刷新、要手动刷新 / 切阶段。根因：`useTaskWatch` SSE 流被动断开（maxDuration 超时 / 网络）后不重连、漏后续 action/artifact 更新。
-- 修：`use-task-watch.ts` 加自动重连循环——被动断开（非 `done` 信号）按指数退避重试、收到 `done` / `reconnectKey` 变（主动断开 / 切流）则不重连。
+- **MCP 连通性探测**（`src/lib/server/mcp-probe.ts`、新）：`probeMcpHealth` 发 initialize 看 HTTP——2xx=ok / 401·403=unauthorized / 其它·连不上=unreachable；stdio 无 url=local（不探、交 SDK 起进程）。`probeMcpHealthAll` 并发。类型 `McpHealth` + `MCP_HEALTH_LABEL` 落 `types.ts`（前后端共享）。**探测前先 enrich 注入 OAuth token**、否则飞书项目永远 401。
+- **容错（需求1）**：chat-runner / task-runner 起 agent 前 enrich → `filterHealthyMcp` 剔除 unauthorized/unreachable 的远程 MCP、agent 照常启动；被剔的写一条 info event「⚠️ 已跳过 N 个不可用的 MCP：xxx（未授权）…」、不再「莫名其妙报错」。复用 agent 不重探（MCP 已在跑）。
+- **状态可视（需求2）**：`GET /api/cursor-mcp/health`（enrich 后探）+ `useMcpHealth` hook（enabled 控制、dialog 才探、省无谓请求）。`McpToggleList` 每行加状态点（绿正常/黄未授权/红连不上/灰本地 + hover 详情）；task MCP 面板 + 设置页 mcp-card 都接、带「重新检测」。
+- **飞书 @ mention 修复**（接 V0.6.6 飞书通知链）：`action-ship.md` 之前要求 mention 块 id 加 `lark_user_id_` 前缀（照抄 add_comment schema 的坑爹举例）。对照实验确诊（同 story、只改前缀这一个变量）：**带前缀飞书返回 `no permission`（误导、看着像没权限、其实是 mention id 非法）、纯数字才成功**。4 处改纯数字 + 标注 schema 举例是坑（`notify_user_list` 本就纯数字、不动）。
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-### V0.6.7：ship 提测 / dev 分支 per-repo 配置 + feature 分支命名模板化（2026-06-02）
+### V0.6.10：review 阶段一对比基准改「累积意图」+ 已授权变更去双重确认（2026-06-03）
 
-**需求**：① 给「ship 提测分支」「dev 分支」做 per-repo 配置（之前 ship 写死提测到 `test`）；② feature 分支命名从写死算法（`feature/<username>/<storyId>-<title>`）改成用户可配模板、支持前后端不同规范（前端 `feature/{username}/{storyId}-{taskTitle}`、后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）。
+**背景**：用户洞察——「第二 / 三轮改 bug 的 build 其实也是合法『方案』、review 不该把所有 diff 都拿去跟初版 plan 对比」。实测 V0.6.9 的 review #17：两条标红的「实现偏差」（组合包名展示、主商品加粗）**其实都来自 build #13 / #15 的用户指令 / 产品反馈**——review 又把它们当偏差 `ask_user` 确认一遍 = **双重确认、是噪音**（用户在 build 轮已经拍过了）。
 
-**模板引擎**（`src/lib/branch-template.ts`、client + server 共用、不依赖 node）：
-- 占位符 4 个：`{username}` / `{storyId}`（从 feishuStoryUrl 抠 `detail/<digits>`）/ `{taskTitle}`（原算法的 title 改名）/ `{date:FORMAT}`（FORMAT 支持 yyyy/yy/MM/dd/HH/mm/ss）。`{storyTitle}` 用户明确先不加（server 端没有飞书调用通道）
-- `renderBranchName(template, vars, now?)`：每个变量值各自 `sanitizeBranchSegment`（git 非法字符 + 路径分隔 `/` 都换 `-`、模板字面的 `/` 保留 → 层级由模板控制、变量值不撑层级）、渲染后清连续 `//` + 去首尾 `/`
-- `resolveBranchTemplate(repoTpl, globalTpl)`：算「有效模板」= per-repo 覆盖 > 全局默认 > 内置默认 `DEFAULT_BRANCH_TEMPLATE`
+**机制**：review 阶段一的对比基准从「初版 plan」→「**累积意图** = 最新 plan + 各轮 build artifact 记录的用户指令 / 产品反馈 / ack 决策」。判定规则：
 
-**配置层级**（用户选方案 1）：全局默认 `settings.branchTemplate` + per-repo 覆盖 `settings.repos[].branchTemplate`。测试 / dev 分支是「仓库属性」per-repo（`settings.repos[].testBranch / devBranch`）、放设置页不放任务编辑弹窗。devBranch 暂无用途、只存配置。
+- diff 改动能**追溯到某轮 build 记录的用户指令 / 产品反馈** → **已授权变更**（列进新「## 已授权变更」段供用户知晓、**不重复 ask_user**）。
+- diff 改动**无据可依**（plan 没写、任何 build artifact 也没记用户说过）→ **真·实现偏差 / 真·范围扩张** → 标红、走 §6 ask_user。
 
-**数据流**（同 `repoBaseBranches` 模式、因 settings 在 localStorage、server 读不到、必须建 task 时固化）：
+**关键**：不是「review 不对比 plan」、是「换对比基准」——仍然抓「build 偷偷跑偏、plan 和用户都没说」的未声明漂移（review 阶段一核心价值），只去掉「对已授权改动的双重确认」噪音。对齐 OpenSpec 的 living-spec 理念、但我们的 spec 自动累积、不用人维护。
 
-```
-settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
-  → 建 task：new-task-dialog 快照（resolveBranchTemplate 算有效模板）
-  → task.{repoTestBranches,repoDevBranches,repoBranchTemplates}（meta 落盘）
-  → build：planBranchesForBuild 用 repoBranchTemplates 渲染分支名
-  → ship：agent 从 super prompt「仓库分支配置」段读测试分支（没配回退 test）
-```
-
-**落地**：
-- `types.ts`：`RepoConfig` +`testBranch?`/`devBranch?`/`branchTemplate?`；`FeAiFlowSettings` +`branchTemplate?`（全局默认）；`Task` +`repoTestBranches?`/`repoDevBranches?`/`repoBranchTemplates?`；`NewTaskInput` Pick 加这三个
-- `local-store.ts`：`DEFAULT_SETTINGS.branchTemplate = DEFAULT_BRANCH_TEMPLATE` + `getSettings` 兜底
-- `user-profile-card.tsx`：加「默认分支命名模板」输入框 + 占位符说明 + `useMemo` 实时预览
-- `repo-card.tsx`：每仓单行改三行网格、加 test/dev/模板覆盖输入框、通用 `setRepoField(path, field, value)` + `onRepoFieldBlur` 替代原 `setOnlineBranch`
-- `new-task-dialog.tsx`：handleSubmit 快照三字段进 createTask
-- `task-fs.ts`：meta 加 3 字段 + createTask 清洗（key 限定 repoPaths + trim）+ hydrateTask 映射
-- `task-runner.ts`：`planBranchesForBuild` 去 username 硬检查、改 `renderBranchName`(per-repo 模板)；新增 `renderRepoBranchSection(task)` 注入 super prompt
-- `prompts/_super.md`：任务基本信息段后加「仓库分支配置」段 + `{{repoBranchSection}}`
-- `prompts/action-ship.md`：测试分支不再写死 `test`（6 处）、改「读 super prompt 仓库分支配置段、没配回退 test」
-- `chat-mcp.ts`：`submit_mr` 的 `target_branch` describe 同步改（跟 ship prompt 一致、避免第二指令源冲突）
-- **hot-fix（接手补跑 typecheck 发现）**：`use-settings.ts` 的 `dirty`（`Record<keyof FeAiFlowSettings, boolean>`）+ `isFieldEqual` 字符串分支补 `branchTemplate`（不补报 TS2741、上一会话工具崩溃没跑成 typecheck 漏的）
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
+**落地**（纯 prompt、无代码）：`prompts/action-review.md`——step 1 读取强调拉「各轮 build 记录的用户指令」拼累积意图；step 3 总纲 + 3.1 扩张 / 3.2 实现偏差 加「可追溯分流」；artifact 骨架加「## 已授权变更」段（放 plan 拍板口径复核 后）；总评「建议结论」+ §6 ask_user 触发条件改为「只真偏差 / 未完成 / 飞书未覆盖才触发」。
 
 ---
 

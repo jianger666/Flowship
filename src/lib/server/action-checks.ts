@@ -135,23 +135,33 @@ const checkReview = async (
     };
   }
 
-  // 4 类差异段非空（简单检查：artifact 内是否提到「与方案的偏差」「与需求的偏差」「未实现」「额外做」之类锚点）
-  // V0.5 时期 review prompt 要求这 4 类、V0.6 沿用
-  const requiredSections = [
-    /偏差|与.*方案|plan.*差/,
-    /需求|story|story.*差/,
-    /未实现|缺少|遗漏/,
-    /额外|超出|out of scope/i,
+  // 必备段检查（V0.6.9 重校准）
+  // 旧版用松散 grep 找「偏差/需求/未实现/额外」4 个词、容忍缺 1——但 review 骨架明确「无内容的差异段
+  // 整段省略（不写空标题、不写「无」）」、一份干净 review（无范围偏离 / 无未完成 task / 无超范围）天然
+  // 不含这些词、却被误判 ❌（V0.6.9 实测踩到、误判红条会直接打击用户对 review 的信任）。
+  // 改为只验骨架里「无省略豁免」的两段：总评 + 跟飞书需求对照（review 的基本盘、任何 review 都该有）。
+  // 条件段（范围偏离 / 实现偏差 / 未完成 task）无内容时按骨架省略、不参与本检查。
+  const requiredSections: { name: string; re: RegExp }[] = [
+    { name: "总评", re: /总评/ },
+    { name: "跟飞书需求对照", re: /需求对照|飞书需求|需求项|story/i },
   ];
-  const missingIdx: number[] = [];
-  for (let i = 0; i < requiredSections.length; i++) {
-    if (!requiredSections[i].test(content)) missingIdx.push(i);
-  }
-  if (missingIdx.length > 1) {
-    // 4 类至少要写 3 类、允许 1 类「无偏差」隐含
+  const missing = requiredSections.filter((s) => !s.re.test(content));
+  if (missing.length > 0) {
     return {
       passed: false,
-      details: `review artifact 缺少 ${missingIdx.length} 类差异段（plan 偏差 / 需求偏差 / 未实现 / 额外做）`,
+      details: `review artifact 缺少必备段：${missing
+        .map((s) => s.name)
+        .join(" / ")}（总评 + 飞书需求对照是 review 基本盘、无省略豁免）`,
+    };
+  }
+
+  // V0.6.9：阶段二「bug 复审」段必须存在——防 fresh agent 跳过 peer bug 复审、退回「只做差值」的鸡肋老路。
+  // 锚点是 artifact 里的「## bug 复审」标题（骨架里恒带、找不到 bug 也写「未发现高置信 bug」）。
+  if (!/bug\s*复审/i.test(content) && !/未发现.{0,12}bug/i.test(content)) {
+    return {
+      passed: false,
+      details:
+        "review artifact 缺少「bug 复审」段（V0.6.9 阶段二必做、没找到 bug 也要写「未发现高置信 bug」）",
     };
   }
 
@@ -162,7 +172,7 @@ const checkReview = async (
   } catch {
     return {
       passed: true,
-      details: "review artifact 4 类差异段齐全（非 git 仓、跳过 diff hash 检查）",
+      details: "review artifact 必备段 + bug 复审段齐全（非 git 仓、跳过 diff hash 检查）",
     };
   }
 
@@ -170,7 +180,7 @@ const checkReview = async (
   if (!hashMatch) {
     return {
       passed: true,
-      details: "review artifact 4 类差异段齐全（artifact 未声明 diff hash、跳过 hash 一致性检查）",
+      details: "review artifact 必备段 + bug 复审段齐全（artifact 未声明 diff hash、跳过 hash 一致性检查）",
     };
   }
   const declaredHash = hashMatch[2];
@@ -178,7 +188,7 @@ const checkReview = async (
   if (gs.exitCode !== 0) {
     return {
       passed: true,
-      details: "review 4 类差异段齐全（git rev-parse HEAD 跑失败、跳过 hash 一致性）",
+      details: "review 必备段 + bug 复审段齐全（git rev-parse HEAD 跑失败、跳过 hash 一致性）",
     };
   }
   const realHash = gs.stdout.trim();
@@ -191,7 +201,7 @@ const checkReview = async (
 
   return {
     passed: true,
-    details: "review artifact 4 类差异段齐全、git hash 一致",
+    details: "review artifact 必备段 + bug 复审段齐全、git hash 一致",
   };
 };
 

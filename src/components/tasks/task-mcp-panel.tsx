@@ -10,7 +10,7 @@
  */
 
 import { useMemo, useState } from "react";
-import { Plug } from "lucide-react";
+import { Plug, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,6 +23,8 @@ import {
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
+import { useMcpHealth } from "@/hooks/use-mcp-health";
+import { cn } from "@/lib/utils";
 import type { Task } from "@/lib/types";
 
 interface TaskMcpPanelProps {
@@ -34,6 +36,12 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
   const [open, setOpen] = useState(false);
   // 当前 Cursor 配的所有 MCP server 名（hook 内置首拉 + focus 刷新）
   const { names: availableServers } = useCursorMcp();
+  // 各 server 连通性（只在 dialog 打开时探测、探测要发网络请求）
+  const {
+    health,
+    loading: healthLoading,
+    refresh: recheckHealth,
+  } = useMcpHealth(open);
 
   // 当前禁用的 server 列表（来自 task）、用 useMemo 避免无谓 re-render
   const disabled = useMemo(
@@ -76,12 +84,33 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
               Cursor 里没配 MCP server（~/.cursor/mcp.json）
             </EmptyHint>
           ) : (
-            <div className="max-h-72 overflow-y-auto">
-              <McpToggleList
-                availableServers={availableServers}
-                disabled={disabled}
-                taskId={task.id}
-              />
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">
+                  绿=正常 / 黄=未授权 / 红=连不上 / 灰=本地
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={recheckHealth}
+                  disabled={healthLoading}
+                >
+                  <RefreshCw
+                    className={cn("size-3", healthLoading && "animate-spin")}
+                  />
+                  重新检测
+                </Button>
+              </div>
+              <div className="max-h-72 overflow-y-auto">
+                <McpToggleList
+                  availableServers={availableServers}
+                  disabled={disabled}
+                  taskId={task.id}
+                  health={health}
+                  healthLoading={healthLoading}
+                />
+              </div>
             </div>
           )}
         </DialogContent>
