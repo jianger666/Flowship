@@ -491,6 +491,19 @@ export const finalizeTask = async (
   return data.task;
 };
 
+/**
+ * V0.6.12 恢复终态 task（merged / abandoned → developing）、重新可推进
+ * 给「误 abandon」/「想把终结的 task 重新捡起来继续」留出路
+ */
+export const reopenTask = async (taskId: string): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/reopen`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return data.task;
+};
+
 // ----------------- V0.6.x 停止 / 划除（软删） -----------------
 
 /**

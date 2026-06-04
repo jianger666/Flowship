@@ -63,9 +63,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const action = task.actions.find((a) => a.id === actionId);
   if (!action) return errorResponse("action 不存在", 404);
 
-  // 进行中的 action 不能直接划除——先停止再划
+  // 进行中的 action 不能直接划除——先停止再划。
+  // 但仅当 task 还有活 agent 在跑（runStatus running / awaiting_user）时才拦：
+  // task 已 idle / error（agent 早退 / abandon 等）时、遗留的非终态 action 没有活 agent 指着它、
+  // 直接允许划除——否则「划除 409 → 让你先停止 → 停止又因 currentActionId=null 收不到它」死循环。
+  const taskHasLiveAgent =
+    task.runStatus === "running" || task.runStatus === "awaiting_user";
   if (
     body.excluded &&
+    taskHasLiveAgent &&
     (action.status === "running" || action.status === "awaiting_ack")
   ) {
     return errorResponse("这个 action 还在进行中、请先「停止」再划除", 409);

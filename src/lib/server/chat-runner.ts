@@ -67,6 +67,7 @@ import {
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
+import { buildSdkErrorMessage } from "./sdk-error";
 import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
@@ -683,9 +684,11 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     if (hardTimer) clearTimeout(hardTimer);
     const message = err instanceof Error ? err.message : String(err);
     console.error("[chat-runner] task", task.id, "failed:", err);
+    // SDK 错误详情（code/cause/...）一并落到 event、跟 task-runner 对齐、下次能从 events 看根因
+    const fullMessage = buildSdkErrorMessage(message, err);
     await writeEventAndPublish(task.id, {
       kind: "error",
-      text: `Chat agent 异常：${message}`,
+      text: `Chat agent 异常：${fullMessage}`,
     });
     const errorTask = await setTaskRunStatus(task.id, "error");
     if (errorTask) publish(task.id, { kind: "task", task: errorTask });

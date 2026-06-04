@@ -51,6 +51,7 @@ import {
   snapshotActionArtifact,
 } from "./task-fs";
 import { runActionCheck } from "./action-checks";
+import { buildSdkErrorMessage } from "./sdk-error";
 import {
   cancelPending,
   getChatMcpUrl,
@@ -868,6 +869,35 @@ export interface AdvanceTaskInput {
   gitToken?: string;
 }
 
+/**
+ * 收尾 task 里所有「卡在非终态」（running / awaiting_ack）的 action（V0.6.12）
+ *
+ * 单 Run 多 action 模型下、Run 结束有多条路径（finished / error / cancel / fork / finalize）、
+ * 早期各自只收尾「闭包起的那个 action」或「currentActionId 指的那个」、会漏掉 Run 期间推进出来的新 action
+ * （典型踩坑：agent 推进到 act_N awaiting_ack 后 run error、catch 却去收尾「起 agent 时的旧 action」）
+ * → 遗留 action 永久卡 awaiting_ack、既划不掉（action-exclude 409）又停不掉（currentActionId 已被清 null）。
+ * 这个 helper 统一把所有非终态 action 收掉、各路径调它即可、不再各写一份。
+ *
+ * @param status         收尾成的终态：agent 异常退出 → error；用户主动停 / 换 agent / abandon → cancelled
+ * @param exceptActionId 排除某个 action（force-new-agent 时刚 appendAction 的新 action 还要继续跑、别误伤）
+ */
+const finalizeStaleActions = async (
+  taskId: string,
+  status: "error" | "cancelled",
+  exceptActionId?: string,
+): Promise<void> => {
+  const fresh = await getTask(taskId);
+  if (!fresh) return;
+  const stale = fresh.actions.filter(
+    (a) =>
+      a.id !== exceptActionId &&
+      (a.status === "running" || a.status === "awaiting_ack"),
+  );
+  for (const a of stale) {
+    await patchAction(taskId, a.id, { status });
+  }
+};
+
 export const advanceTask = async (
   input: AdvanceTaskInput,
 ): Promise<{ action: ActionRecord }> => {
@@ -1000,6 +1030,8 @@ export const advanceTask = async (
       );
       forceClearStaleRunnerState(task.id);
     }
+    // 收尾被新 agent 取代的旧非终态 action（排除本次刚 appendAction 的新 action、否则误伤）
+    await finalizeStaleActions(task.id, "cancelled", action.id);
   }
   await internalStartAgent({
     task: taskAfterAppend,
@@ -1108,6 +1140,9 @@ export const finalizeTask = async (
     );
   }
 
+  // 兜底收尾遗留的非终态 action（防 abandon / merge 后 action 卡 awaiting_ack、永久划不掉）
+  await finalizeStaleActions(taskId, "cancelled");
+
   // 业务状态 patch
   const patched = await setTaskRepoStatus(taskId, finalStatus);
   if (patched) publish(taskId, { kind: "task", task: patched });
@@ -1120,6 +1155,26 @@ export const finalizeTask = async (
         ? `Task 已标合入 main、收尾结束${reason ? `（${reason}）` : ""}`
         : `Task 已被 abandon${reason ? `（${reason}）` : ""}`,
     meta: { finalStatus, reason },
+  });
+};
+
+/**
+ * 恢复终态 task（merged / abandoned → developing）、让它能重新推进（V0.6.12）
+ *
+ * 误 abandon、或想把已终结的 task 重新捡起来继续时用。只翻 repoStatus、
+ * runStatus 保持 idle（没有活 agent、用户后续点「推进」才起新 Run）。
+ */
+export const reopenTask = async (taskId: string): Promise<void> => {
+  const task = await getTask(taskId);
+  if (!task) throw new Error("task 不存在、无法恢复");
+  if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
+    throw new Error("只有已合入 / 已放弃的任务才能恢复");
+  }
+  const patched = await setTaskRepoStatus(taskId, "developing");
+  if (patched) publish(taskId, { kind: "task", task: patched });
+  await writeEventAndPublish(taskId, {
+    kind: "info",
+    text: "任务已恢复（→ 开发中）、可继续推进",
   });
 };
 
@@ -1565,8 +1620,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           });
           return;
         }
-        // 正常 cancel（用户在 ack dialog 选 abandon / merged）→ 业务状态由 finalizeTask 处理
-        // 这里只关闭运行时状态、不动 repoStatus
+        // 正常 cancel（stop / 硬超时触发）→ 收尾卡住的 action + 关运行时状态
+        // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
+        await finalizeStaleActions(task.id, "cancelled");
         const updated = await setTaskRunStatus(task.id, "idle", null);
         if (updated) publish(task.id, { kind: "task", task: updated });
         publish(task.id, { kind: "done", task: updated ?? task, ok: true });
@@ -1616,30 +1672,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[task-runner] task=${task.id} failed:`, err);
 
-      const sdkBits: Record<string, unknown> = {};
-      try {
-        const e = err as Record<string, unknown>;
-        if (typeof e.code === "string") sdkBits.code = e.code;
-        if (typeof e.status === "number") sdkBits.status = e.status;
-        if (typeof e.requestId === "string") sdkBits.requestId = e.requestId;
-        if (e.cause instanceof Error) {
-          sdkBits.causeName = e.cause.name;
-          sdkBits.causeMessage = e.cause.message;
-        }
-      } catch {
-        /* noop */
-      }
-      const fullMessage =
-        Object.keys(sdkBits).length > 0
-          ? `${message}\n--- SDK error fields ---\n${JSON.stringify(sdkBits, null, 2)}`
-          : message;
+      // SDK 错误详情（code/cause/...）抠出来一并落到 event、方便从 events 直接定位根因
+      const fullMessage = buildSdkErrorMessage(message, err);
 
-      // 当前 action 标 error
-      const fresh = await getTask(task.id);
-      const curAction = fresh?.actions.find((a) => a.id === action.id);
-      if (curAction && (curAction.status === "running" || curAction.status === "awaiting_ack")) {
-        await patchAction(task.id, action.id, { status: "error" });
-      }
+      // 收尾所有卡在非终态的 action（单 Run 多 action：卡住的可能 ≠ 闭包起的 action、见 finalizeStaleActions）
+      await finalizeStaleActions(task.id, "error");
       await setTaskRunStatus(task.id, "error", action.id);
       const updated = await writeEventAndPublish(task.id, {
         kind: "error",
@@ -1682,6 +1719,21 @@ interface AssistantBufferCtx {
   sdkErrorMessage?: string;
 }
 
+// 「写文件」类工具名白名单——只有这些工具命中 actions/ 路径才算「在写 artifact」。
+// SDK 的 read（读）和 edit（写）都用 path 参数、无法靠 args 区分读写、只能靠工具名。
+// 宁可漏标（某写工具不在表里 → 降级成「调用 X」、无害）、不可错标（read 标成「在写」= 误导）。
+const WRITE_TOOL_NAMES = new Set([
+  "write",
+  "edit",
+  "create",
+  "create_file",
+  "search_replace",
+  "str_replace",
+  "multi_edit",
+  "MultiEdit",
+  "apply_patch",
+]);
+
 const handleSdkMessage = async (
   taskId: string,
   msg: SDKMessage,
@@ -1711,15 +1763,19 @@ const handleSdkMessage = async (
         innerToolName === "wait_for_user" ||
         innerToolName === "Wait For User";
 
-      // V0.6：write / edit 写 actions/N-<type>.md 时推一份 tool_call 事件给 UI（同 V0.5 artifacts/ 同款套路）
-      const possibleTarget =
-        (argsAny.target_file as string | undefined) ??
-        (argsAny.file_path as string | undefined) ??
-        (argsAny.path as string | undefined);
+      // V0.6：write / edit 写 actions/N-<type>.md 时推一份「在写 artifact」事件给 UI（同 V0.5 artifacts/ 同款套路）
+      // ⚠️ 必须先用 WRITE_TOOL_NAMES 卡是不是「写」工具——read 跟 edit 都用 path 参数、
+      //    早期漏判直接看 path、导致 read artifact 被误标成「在写 artifact」
+      //    （V0.6.12 实测单 task：89 条 read 被误标、比 55 条真 edit 还多、看着像 agent 狂写文件）
+      const possibleTarget = WRITE_TOOL_NAMES.has(msg.name)
+        ? ((argsAny.target_file as string | undefined) ??
+          (argsAny.file_path as string | undefined) ??
+          (argsAny.path as string | undefined))
+        : undefined;
       if (
         possibleTarget &&
-        typeof possibleTarget === "string" &&
-        (possibleTarget.includes("/actions/") || possibleTarget.startsWith("actions/"))
+        (possibleTarget.includes("/actions/") ||
+          possibleTarget.startsWith("actions/"))
       ) {
         if (msg.status === "running") {
           const argsStr = stringifyMeta(msg.args);

@@ -34,6 +34,7 @@ import {
   Loader2,
   MessageCircleQuestion,
   Pencil,
+  RotateCcw,
   Sparkles,
   XCircle,
   Zap,
@@ -67,6 +68,7 @@ import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
   finalizeTask,
+  reopenTask,
   setActionExcluded,
   setTaskUiLayout,
   stopTask,
@@ -266,6 +268,11 @@ const TaskDetailPage = () => {
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
 
+  // 恢复按钮：终态（merged / abandoned）才显示——给误 abandon / 想重新捡起的 task 留出路
+  // 终态时 canAdvance / canFinalize 都 false、其它操作按钮全隐藏、恢复是唯一入口
+  const canReopen =
+    task.repoStatus === "merged" || task.repoStatus === "abandoned";
+
   // ---- 推进 ----
   const handleAdvance = async (input: {
     actionType: ActionType;
@@ -437,6 +444,28 @@ const TaskDetailPage = () => {
       toast.success(finalStatus === "merged" ? "任务已标记合入" : "任务已放弃");
     } catch (err) {
       toast.error(`终结失败：${(err as Error).message}`);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  // ---- 恢复：merged / abandoned → developing ----
+  // 给误 abandon / 想重新捡起的终态 task 留出路（否则终态后操作按钮全隐藏、锁死只读）
+  const handleReopen = async () => {
+    if (!task) return;
+    const ok = await confirm({
+      title: "恢复任务？",
+      description: "把已终结的任务拉回「开发中」、可重新推进 action。",
+      confirmLabel: "恢复",
+    });
+    if (!ok) return;
+    setStarting(true);
+    try {
+      const updated = await reopenTask(task.id);
+      setTask(updated);
+      toast.success("任务已恢复、可继续推进");
+    } catch (err) {
+      toast.error(`恢复失败：${(err as Error).message}`);
     } finally {
       setStarting(false);
     }
@@ -642,6 +671,18 @@ const TaskDetailPage = () => {
                   停止
                 </Button>
               </>
+            )}
+            {canReopen && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleReopen}
+                disabled={starting}
+                title="恢复任务：拉回开发中、可重新推进"
+              >
+                {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+                恢复
+              </Button>
             )}
           </div>
         </div>

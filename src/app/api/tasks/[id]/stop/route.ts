@@ -48,16 +48,21 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   // 会 orphan 后继续改写整个仓库）。这里主动清理落在本 task repoPaths 里的孤儿 / agent-shell 进程树。
   reapTaskOrphans(task.repoPaths);
 
-  // 2) 当前 action 若在跑 / 等 ack → 标 cancelled（endedAt 自动落）
-  const current = task.currentActionId
-    ? task.actions.find((a) => a.id === task.currentActionId) ?? null
-    : null;
-  if (
-    current &&
-    (current.status === "running" || current.status === "awaiting_ack")
-  ) {
-    await patchAction(id, current.id, { status: "cancelled" });
+  // 2) 所有卡在非终态（running / awaiting_ack）的 action → 标 cancelled（endedAt 自动落）
+  //    不只看 currentActionId——它可能已被清成 null（agent error / abandon 后）、导致漏收尾
+  const stale = task.actions.filter(
+    (a) => a.status === "running" || a.status === "awaiting_ack",
+  );
+  for (const a of stale) {
+    await patchAction(id, a.id, { status: "cancelled" });
   }
+  // 事件文案用「当前 / 最近一个」非终态 action
+  const current =
+    (task.currentActionId
+      ? task.actions.find((a) => a.id === task.currentActionId)
+      : null) ??
+    stale[stale.length - 1] ??
+    null;
 
   // 3) runStatus 回 idle
   await setTaskRunStatus(id, "idle");
