@@ -15,6 +15,17 @@
 
 ---
 
+### V0.6.13：MCP 探测增量化 + 连通状态收敛两态 + 首探竞态修复 + 失败可看日志（2026-06-05）
+
+**背景**：接 V0.6.11 的 MCP 连通可视——先把探测改增量（只探开启的、打开某个时单独探、对齐 Cursor 不浪费那 6s 超时），但留了 bug：进设置页开启的 MCP 不默认探测、一直不出状态。用户顺带提状态太杂（绿黄红灰四态）+ 失败看不到原因。
+
+- **探测增量化**（前半、已落代码）：`useMcpHealth` 只探 `enabledServers`（关闭的不连）；`probeOne` 把某 server 关→开时单独探这一个、per-server `loadingServers` 哪行探哪行转圈；`GET /api/cursor-mcp/health?servers=a,b` 支持子集；`McpToggleList` 加 `onEnableProbe`。ref 存最新开启列表、effect 不依赖它（避免 toggle 触发全量重探）。
+- **首探竞态修复**（本轮 bug）：根因——首探 effect 只在 mount 跑一次、但那一刻 `useCursorMcp` 异步还没回来、`enabledServers=[]`、探了空集合；之后 names 到位、ref 模式 + effect 不依赖列表 → 永不重探（设置页 100% 复现、详情页因 dialog 打开晚侥幸正常、本质同源）。修法：调用方保证 `active` 在「列表 ready 后」才置 true——设置页传 `!loading`、详情页传 `open && !mcpLoading`、复用现有 ref 模式不引入重复探测。
+- **状态收敛两态**：`McpHealthStatus` 从 `ok/unauthorized/unreachable/local` 四态 → `ok/fail`（用户「不需要连不上、本地什么的」）。401/连不上/非 2xx 全归 `fail`；本地 stdio 没法 HTTP 探、乐观标 `ok`（由 SDK 启动时拉起、`filterHealthyMcp` 随 ok 一起保留）。失败原因不再靠 status 区分、全塞进 `detail`。
+- **失败可看日志**：失败徽标渲染成可点 button → 弹 Dialog 展示 `detail`（连接错误原文 / HTTP 码 / URL）。复用现有 dialog、不引抽屉新依赖。两个 runner 的「跳过 MCP」info 提示也改成展示 `detail` 第一行（具体原因、不再只「失败」）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.12：artifact 产出不刷新事件驱动根治 + 终态任务恢复 + 角色必选 + chat 贴图修复（2026-06-04）
 
 **背景**：用户实测连撞几个体验 bug——① artifact 产出后页面停在「没有产物」、要切 tab / 刷新才出（这是第 3 次修）；② 任务 abandon / merged 后右上角操作按钮全没、想回炉没入口；③ 新建任务角色默认「前端」、后端同学顺手提交错角色；④ chat 贴图不显示 + 回完一轮事件流不更新。

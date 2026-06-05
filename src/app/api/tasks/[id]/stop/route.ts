@@ -24,6 +24,7 @@ import {
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
 import { cancelTaskRun, publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { cancelChatRun } from "@/lib/server/chat-runner";
 import { reapTaskOrphans } from "@/lib/server/kill-orphans";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
 import { errorResponse } from "@/lib/server/route-helpers";
@@ -41,7 +42,9 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   if (!task) return errorResponse("not_found", 404);
 
   // 1) abort SDK Run + 清 pending wait-ack（先断 agent 再清 pending）
-  const hadAgent = cancelTaskRun(id);
+  // chat task 的 run 在 chat-runner 的 runningChats、正经 task 在 task-runner 的 runningTasks、
+  // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
+  const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
   cleanupChatTaskState(id);
 
   // V0.6.8：run.cancel() 杀不到 agent 用 shell 拉起的孙子进程（如 `npm run lint`=`ng lint --fix`、
@@ -68,11 +71,17 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   await setTaskRunStatus(id, "idle");
 
   // 4) 落事件让用户在事件流看到这次停止
-  const labelBit = current ? ` ${ACTION_LABEL[current.type]} action` : "";
+  // chat task 无 action、文案走「对话」语境（「再发消息」不是「推进」）
+  const stopText =
+    task.mode === "chat"
+      ? "用户停止了对话（agent 已中断、可继续发消息）"
+      : `用户停止了${
+          current ? ` ${ACTION_LABEL[current.type]} action` : ""
+        }（agent 已中断、可重新「推进」）`;
   const evented = await appendEvent(id, {
     kind: "info",
     actionId: current?.id,
-    text: `用户停止了${labelBit}（agent 已中断、可重新「推进」）`,
+    text: stopText,
   });
 
   const fresh = evented ?? (await getTask(id)) ?? task;

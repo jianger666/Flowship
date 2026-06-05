@@ -118,6 +118,20 @@ const runningChats = getRunnerState().runningChats;
 export const isChatRunning = (taskId: string): boolean =>
   runningChats.has(taskId);
 
+/**
+ * 中断正在跑的 chat agent（按 taskId）、返回是否真有活 agent 被停。
+ *
+ * 为什么单独需要：chat agent 注册在本模块的 runningChats、不在 task-runner 的
+ * runningTasks（见文件顶部说明）、所以 /stop route 的 cancelTaskRun 停不到它、
+ * 必须额外调本函数。一个 task 只会落两个 map 之一、调用方两个都试即可。
+ */
+export const cancelChatRun = (taskId: string): boolean => {
+  const rec = runningChats.get(taskId);
+  if (!rec) return false;
+  rec.cancel();
+  return true;
+};
+
 // ----------------- publish 帮手（复用 task-runner SSE 通道） -----------------
 
 const publish = (taskId: string, ev: TaskStreamEvent): void => {
@@ -647,18 +661,11 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const result = await run.wait();
 
     if (cancelled || result.status === "cancelled") {
+      // cancel 收尾只归位 runStatus + publish done、不落 info——
+      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复（跟 task-runner cancel 分支对齐）
       const cancelledTask = await setTaskRunStatus(task.id, "idle");
-      if (cancelledTask)
-        publish(task.id, { kind: "task", task: cancelledTask });
-      const done = await writeEventAndPublish(task.id, {
-        kind: "info",
-        text: "Chat 任务已被取消、对话结束",
-      });
-      publish(task.id, {
-        kind: "done",
-        task: done ?? task,
-        ok: true,
-      });
+      if (cancelledTask) publish(task.id, { kind: "task", task: cancelledTask });
+      publish(task.id, { kind: "done", task: cancelledTask ?? task, ok: true });
       return;
     }
 

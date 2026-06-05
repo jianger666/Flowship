@@ -240,6 +240,17 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.15：自由对话（chat）加「停止」按钮（2026-06-05）
+
+**背景**：chat 模式详情页 agent 回复中只有「AI 正在回」转圈、没法打断——长篇生成 / 跑偏时只能干等。正经 task 模式早有「停止」、chat 一直缺。
+
+- **根因**：chat agent 注册在 chat-runner 自己的 `runningChats`、不在 task-runner 的 `runningTasks`（两套 runtime state 刻意不混）；而 `/stop` route 只调 `cancelTaskRun`（查 runningTasks）→ 压根停不到 chat。
+- **后端**：chat-runner 加 `cancelChatRun(taskId)`（停 runningChats）；`/stop` route 改 `cancelTaskRun(id) || cancelChatRun(id)`（一个 task 只落其一、两个都试、命中即停）；停止 info 文案按 `task.mode` 分「对话」/「action」语境。
+- **前端**：`ChatView` 顶部 running 时「AI 正在回」旁加「停止」按钮 → `stopTask` → 清 streaming + onTaskUpdate。chat 打断是高频低风险（不改代码）、不弹二次确认、即点即停（区别于 task 模式 confirm）。
+- **复用既有 cancel 收尾**：`run.cancel()` 让 stream 正常结束、`run.wait()` 返回 cancelled → 走 chat-runner cancelled 分支提前 return（不进 catch、不误报 error、跟实战验证过的 task-runner 同构）；该分支顺手去掉原「已被取消」info（和 /stop 的「用户停止了对话」重复）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.14：ship 提测「合并后删源分支」改可选（默认保留）（2026-06-05）
 
 **背景**：ship 建 MR 写死 `remove_source_branch: true`、合并后源分支必删。用户痛点：合并后常要回看 / 续推该分支、删了得本地重新 push 一遍很麻烦——要求提测推进时能选、且默认保留（用户拍板）。
@@ -250,17 +261,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **dialog 防抖**：开关初值用 `defaultRemoveSourceBranch` memo（依赖 primitive 字段、非整个 task）、避免 SSE 推 task 引用变时把表单打回默认（同既有 actionType 的处理）。
 - **`findOpenMR` 入参精确化**：原图省事直接复用 `CreateMRInput`、加 required `removeSourceBranch` 后被波及 → 改 `Pick<CreateMRInput, config|projectPath|sourceBranch|targetBranch>`、`closeOpenMR` 去掉 title/description 占位。
 - **附带 UI 文案精简**（用户「系统里很多文案太啰嗦」）：`forceNewAgent` 开关「强制起新 agent」→「新启 Agent」+ 删副标题；全局删一批自解释控件下的废话 help text（推进 / 新建 / 编辑弹窗的模型 / 角色 / 飞书 / 多仓说明、上下文输入规则——跟 placeholder 重复）；规则固化「控件标题能自解释就别加 help text」（`learned-conventions.mdc`）。
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
-### V0.6.13：MCP 探测增量化 + 连通状态收敛两态 + 首探竞态修复 + 失败可看日志（2026-06-05）
-
-**背景**：接 V0.6.11 的 MCP 连通可视——先把探测改增量（只探开启的、打开某个时单独探、对齐 Cursor 不浪费那 6s 超时），但留了 bug：进设置页开启的 MCP 不默认探测、一直不出状态。用户顺带提状态太杂（绿黄红灰四态）+ 失败看不到原因。
-
-- **探测增量化**（前半、已落代码）：`useMcpHealth` 只探 `enabledServers`（关闭的不连）；`probeOne` 把某 server 关→开时单独探这一个、per-server `loadingServers` 哪行探哪行转圈；`GET /api/cursor-mcp/health?servers=a,b` 支持子集；`McpToggleList` 加 `onEnableProbe`。ref 存最新开启列表、effect 不依赖它（避免 toggle 触发全量重探）。
-- **首探竞态修复**（本轮 bug）：根因——首探 effect 只在 mount 跑一次、但那一刻 `useCursorMcp` 异步还没回来、`enabledServers=[]`、探了空集合；之后 names 到位、ref 模式 + effect 不依赖列表 → 永不重探（设置页 100% 复现、详情页因 dialog 打开晚侥幸正常、本质同源）。修法：调用方保证 `active` 在「列表 ready 后」才置 true——设置页传 `!loading`、详情页传 `open && !mcpLoading`、复用现有 ref 模式不引入重复探测。
-- **状态收敛两态**：`McpHealthStatus` 从 `ok/unauthorized/unreachable/local` 四态 → `ok/fail`（用户「不需要连不上、本地什么的」）。401/连不上/非 2xx 全归 `fail`；本地 stdio 没法 HTTP 探、乐观标 `ok`（由 SDK 启动时拉起、`filterHealthyMcp` 随 ok 一起保留）。失败原因不再靠 status 区分、全塞进 `detail`。
-- **失败可看日志**：失败徽标渲染成可点 button → 弹 Dialog 展示 `detail`（连接错误原文 / HTTP 码 / URL）。复用现有 dialog、不引抽屉新依赖。两个 runner 的「跳过 MCP」info 提示也改成展示 `detail` 第一行（具体原因、不再只「失败」）。
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 

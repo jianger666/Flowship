@@ -19,17 +19,18 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { Ban, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { prepareRunArgs } from "@/lib/run-args";
 import { RUN_STATUS_LABEL, RUN_STATUS_VARIANT } from "@/lib/task-display";
-import { sendChatReply, type ImagePayload } from "@/lib/task-store";
+import { sendChatReply, stopTask, type ImagePayload } from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
 interface Props {
@@ -53,6 +54,8 @@ export const ChatView = ({
   // SSE 重连 epoch：agent 上一轮 done 后 SSE 会 close、自动重连不处理 done（靠这个 key）；
   // 用户再发消息自动启新 agent 时 ++、触发 useTaskWatch 重连、否则收不到新一轮事件（V0.6.12 修）
   const [watchEpoch, setWatchEpoch] = useState(0);
+  // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
+  const [stopping, setStopping] = useState(false);
 
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
@@ -60,10 +63,11 @@ export const ChatView = ({
   onTaskUpdateRef.current = onTaskUpdate;
   onEventAppendRef.current = onEventAppend;
 
-  // 切 task 时把 streaming / submitting 重置
+  // 切 task 时把 streaming / submitting / stopping 重置
   useEffect(() => {
     setStreamingText("");
     setIsSubmitting(false);
+    setStopping(false);
   }, [task.id]);
 
   useTaskWatch(task.id, {
@@ -125,6 +129,23 @@ export const ChatView = ({
     [task],
   );
 
+  // 停止当前正在跑的 chat agent
+  // chat 打断生成是高频低风险操作（chat 不改代码、只聊 / 答疑）、不弹二次确认、即点即停
+  // 走通用 /stop：后端 cancelChatRun 停 runningChats + runStatus 回 idle
+  const handleStop = useCallback(async () => {
+    setStopping(true);
+    try {
+      const latest = await stopTask(task.id);
+      setStreamingText(""); // 清掉打字机 placeholder、避免半截 streaming 残留
+      onTaskUpdateRef.current(latest);
+      toast.success("已停止");
+    } catch (err) {
+      toast.error(`停止失败：${(err as Error).message}`);
+    } finally {
+      setStopping(false);
+    }
+  }, [task.id]);
+
   // 输入框可用条件
   // - running：agent 在说话、disable
   // - isSubmitting：请求飞行中、disable 防双击
@@ -178,9 +199,26 @@ export const ChatView = ({
           </div>
 
           {task.runStatus === "running" && (
-            <div className="flex items-center gap-1 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" />
-              AI 正在回
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                AI 正在回
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleStop}
+                disabled={stopping}
+                title="停止当前回答（中断 agent）"
+                className="h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-destructive"
+              >
+                {stopping ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Ban className="size-3.5" />
+                )}
+                停止
+              </Button>
             </div>
           )}
         </div>
