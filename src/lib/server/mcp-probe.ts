@@ -7,10 +7,12 @@
  * 2. 设置页 / 任务面板可视（probeMcpHealthAll）：给每个 MCP 标连通状态、不再只有开关。
  *
  * 探测方式跟 mcp-oauth.probeOAuthRequired 一致——发一个 MCP initialize、看 HTTP 响应：
- * - 2xx       → ok
- * - 401/403   → unauthorized（要授权）
- * - 其它/连不上 → unreachable
- * stdio（无 url）本地进程没法 HTTP 探测、一律标 local（保留注入、交给 SDK 起进程）。
+ * - 2xx                 → ok（正常）
+ * - 401/403/其它/连不上 → fail（失败、原因落 detail、前端失败可点开看日志）
+ * stdio（无 url）本地进程没法 HTTP 探测、乐观标 ok（保留注入、交给 SDK 起进程）。
+ *
+ * V0.6.13：状态从 4 态（ok/unauthorized/unreachable/local）收敛为 2 态（ok/fail）、
+ * 降低噪音（用户拍板）。失败原因不再靠 status 区分、改全部塞进 detail 给日志弹窗看。
  *
  * 注意：探测应在 enrichMcpServersWithOAuth 之后做、这样带上 OAuth token 的 server
  * 才能正确探出 ok / unauthorized（否则飞书项目永远 401）。
@@ -60,36 +62,43 @@ export const probeMcpHealth = async (
   name: string,
   cfg: McpServerConfig,
 ): Promise<McpHealth> => {
-  // stdio 本地进程：没 url、没法 HTTP 探测、交给 SDK 启动时拉起
+  // stdio 本地进程：没 url、没法 HTTP 探测、乐观标 ok（交给 SDK 启动时拉起）
   if (!("url" in cfg)) {
     return {
       name,
-      status: "local",
-      detail: "本地 stdio 进程、由 SDK 启动时拉起",
+      status: "ok",
+      detail: "本地 stdio 进程、由 SDK 启动时拉起（未做 HTTP 探测）",
     };
   }
   const headers = cfg.headers as Record<string, string> | undefined;
   const r = await sendInitialize(cfg.url, headers);
+  // 连不上（超时 / DNS / 连接拒绝）：detail 带 url + 错误原文、点开看日志能直接排查
   if ("error" in r) {
-    return { name, status: "unreachable", detail: r.error };
-  }
-  if (r.httpCode === 401 || r.httpCode === 403) {
     return {
       name,
-      status: "unauthorized",
-      httpCode: r.httpCode,
-      detail: "需要授权（去设置页授权）",
+      status: "fail",
+      detail: `连接失败：${r.error}\nURL：${cfg.url}`,
     };
   }
+  // 2xx：正常
   if (r.httpCode >= 200 && r.httpCode < 300) {
     return { name, status: "ok", httpCode: r.httpCode };
   }
-  // 非鉴权类异常状态码（404 / 405 / 5xx 等）
+  // 401/403：需要授权（远程 OAuth MCP 没授权 / token 失效）
+  if (r.httpCode === 401 || r.httpCode === 403) {
+    return {
+      name,
+      status: "fail",
+      httpCode: r.httpCode,
+      detail: `需要授权（HTTP ${r.httpCode}）——去设置页给「${name}」授权\nURL：${cfg.url}`,
+    };
+  }
+  // 其它非 2xx 异常状态码（404 / 405 / 5xx 等）
   return {
     name,
-    status: "unreachable",
+    status: "fail",
     httpCode: r.httpCode,
-    detail: `HTTP ${r.httpCode}`,
+    detail: `服务异常 HTTP ${r.httpCode}\nURL：${cfg.url}`,
   };
 };
 
@@ -106,15 +115,15 @@ export const probeMcpHealthAll = async (
 };
 
 export interface FilteredMcp {
-  // 健康（ok / local）可注入给 agent 的 server
+  // 健康（ok、含本地 stdio）可注入给 agent 的 server
   servers: Record<string, McpServerConfig>;
-  // 被剔除的（unauthorized / unreachable）、调用方据此写一条 info event 提示用户
+  // 被剔除的（探测失败：连不上 / 未授权 / 非 2xx）、调用方据此写一条 info event 提示用户
   dropped: McpHealth[];
 }
 
 /**
- * 起 agent 前过滤：剔除连不上 / 未授权的远程 MCP。
- * 本地 stdio（local）一律保留——没法 HTTP 探测、交给 SDK 起进程自己处理。
+ * 起 agent 前过滤：剔除探测失败（连不上 / 未授权 / 非 2xx）的远程 MCP。
+ * 本地 stdio 探测时已乐观标 ok、随 ok 一起保留——交给 SDK 起进程自己处理。
  *
  * 入参应是 enrich（注入 OAuth token）之后的 servers。
  */
@@ -126,7 +135,7 @@ export const filterHealthyMcp = async (
   const dropped: McpHealth[] = [];
   for (const [name, cfg] of Object.entries(servers)) {
     const h = health[name];
-    if (h.status === "ok" || h.status === "local") {
+    if (h.status === "ok") {
       kept[name] = cfg;
     } else {
       dropped.push(h);

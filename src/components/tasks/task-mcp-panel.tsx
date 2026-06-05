@@ -35,25 +35,30 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
   // 主 Dialog 开关、默认关
   const [open, setOpen] = useState(false);
   // 当前 Cursor 配的所有 MCP server 名（hook 内置首拉 + focus 刷新）
-  const { names: availableServers } = useCursorMcp();
-  // 各 server 连通性（只在 dialog 打开时探测、探测要发网络请求）
-  const {
-    health,
-    loading: healthLoading,
-    refresh: recheckHealth,
-  } = useMcpHealth(open);
-
+  const { names: availableServers, loading: mcpLoading } = useCursorMcp();
   // 当前禁用的 server 列表（来自 task）、用 useMemo 避免无谓 re-render
   const disabled = useMemo(
     () => task.disabledMcpServers ?? [],
     [task.disabledMcpServers],
   );
 
-  // 启用计数（用于按钮上的数字提示）
-  const enabledCount = useMemo(
-    () => availableServers.filter((s) => !disabled.includes(s)).length,
+  // 已开启的 server（不在黑名单里的）——只探这些（关闭的不连、对齐 Cursor）
+  const enabledServers = useMemo(
+    () => availableServers.filter((s) => !disabled.includes(s)),
     [availableServers, disabled],
   );
+
+  // 各 server 连通性（dialog 打开时探开启的那批、打开某个关闭项时单独探）
+  // active 传 open && !mcpLoading：dialog 打开且 names 已 ready 才首探（V0.6.13 修首探竞态）
+  const {
+    health,
+    loadingServers,
+    refresh: recheckHealth,
+    probeOne,
+  } = useMcpHealth(enabledServers, open && !mcpLoading);
+
+  // 启用计数（用于按钮上的数字提示）
+  const enabledCount = enabledServers.length;
 
   return (
     <>
@@ -87,17 +92,20 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">
-                  绿=正常 / 黄=未授权 / 红=连不上 / 灰=本地
+                  绿=正常 / 红=失败（点击看日志）
                 </span>
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
                   onClick={recheckHealth}
-                  disabled={healthLoading}
+                  disabled={loadingServers.size > 0}
                 >
                   <RefreshCw
-                    className={cn("size-3", healthLoading && "animate-spin")}
+                    className={cn(
+                      "size-3",
+                      loadingServers.size > 0 && "animate-spin",
+                    )}
                   />
                   重新检测
                 </Button>
@@ -108,7 +116,8 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
                   disabled={disabled}
                   taskId={task.id}
                   health={health}
-                  healthLoading={healthLoading}
+                  loadingServers={loadingServers}
+                  onEnableProbe={probeOne}
                 />
               </div>
             </div>

@@ -167,9 +167,20 @@ export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
   return { servers: data.servers, dirs: data.dirs };
 };
 
-/** 探测各 MCP server 连通性（设置页 / 任务面板状态展示用、V0.6.11） */
-export const fetchMcpHealth = async (): Promise<Record<string, McpHealth>> => {
-  const res = await fetch("/api/cursor-mcp/health", { cache: "no-store" });
+/**
+ * 探测 MCP server 连通性（设置页 / 任务面板状态展示用、V0.6.11；V0.6.13 加 servers 子集）
+ * @param servers 只探这几个（前端传「已开启」的 / 单个）；不传探全部
+ */
+export const fetchMcpHealth = async (
+  servers?: string[],
+): Promise<Record<string, McpHealth>> => {
+  const query =
+    servers && servers.length > 0
+      ? `?servers=${encodeURIComponent(servers.join(","))}`
+      : "";
+  const res = await fetch(`/api/cursor-mcp/health${query}`, {
+    cache: "no-store",
+  });
   const data = await handleJson<{
     ok: true;
     health: Record<string, McpHealth>;

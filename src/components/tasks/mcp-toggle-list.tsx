@@ -19,6 +19,13 @@ import { useState } from "react";
 import { Loader2, Plug } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -26,23 +33,47 @@ import { setTaskDisabledMcpServers } from "@/lib/task-store";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { McpHealth, McpHealthStatus } from "@/lib/types";
 
-// 连通性状态点 / 文字配色（V0.6.11）
+// 连通性状态点 / 文字配色（V0.6.13 收敛为 ok 绿 / fail 红两态）
 const HEALTH_DOT: Record<McpHealthStatus, string> = {
   ok: "bg-emerald-500",
-  unauthorized: "bg-amber-500",
-  unreachable: "bg-red-500",
-  local: "bg-muted-foreground/40",
+  fail: "bg-red-500",
 };
 const HEALTH_TEXT: Record<McpHealthStatus, string> = {
   ok: "text-emerald-600 dark:text-emerald-500",
-  unauthorized: "text-amber-600 dark:text-amber-500",
-  unreachable: "text-red-600 dark:text-red-500",
-  local: "text-muted-foreground",
+  fail: "text-red-600 dark:text-red-500",
 };
 
-// 单个 server 的连通性徽标（点 + 中文 + hover 详情）。h 没探到 + loading → spinner
-const HealthBadge = ({ h, loading }: { h?: McpHealth; loading?: boolean }) => {
+// 单个 server 的连通性徽标：点 + 中文。h 没探到 + loading → spinner。
+// 失败（fail）渲染成可点 button、点 onShowLog 弹报错日志；正常（ok）是普通 span（hover 看详情）。
+const HealthBadge = ({
+  h,
+  loading,
+  onShowLog,
+}: {
+  h?: McpHealth;
+  loading?: boolean;
+  onShowLog?: () => void;
+}) => {
   if (h) {
+    const dot = (
+      <span className={cn("size-1.5 rounded-full", HEALTH_DOT[h.status])} />
+    );
+    if (h.status === "fail") {
+      return (
+        <button
+          type="button"
+          onClick={onShowLog}
+          className={cn(
+            "flex shrink-0 cursor-pointer items-center gap-1 text-[11px] underline-offset-2 hover:underline",
+            HEALTH_TEXT[h.status],
+          )}
+          title="点击看报错日志"
+        >
+          {dot}
+          {MCP_HEALTH_LABEL[h.status]}
+        </button>
+      );
+    }
     return (
       <span
         className={cn(
@@ -55,7 +86,7 @@ const HealthBadge = ({ h, loading }: { h?: McpHealth; loading?: boolean }) => {
             : MCP_HEALTH_LABEL[h.status]
         }
       >
-        <span className={cn("size-1.5 rounded-full", HEALTH_DOT[h.status])} />
+        {dot}
         {MCP_HEALTH_LABEL[h.status]}
       </span>
     );
@@ -81,10 +112,12 @@ interface McpToggleListProps {
   emptyHint?: string;
   // 容器额外 className
   className?: string;
-  // 各 server 连通性状态（V0.6.11、传了才展示状态点）
+  // 各 server 连通性状态（V0.6.11、传了才展示状态点；只展示「已开启」的）
   health?: Record<string, McpHealth>;
-  // 连通性探测进行中（首拉 / 重新检测时每行显示 spinner）
-  healthLoading?: boolean;
+  // 正在探测的 server 集合（V0.6.13、per-server spinner、哪行探哪行转圈）
+  loadingServers?: Set<string>;
+  // 把某 server 关→开时回调（V0.6.13、调用方据此单独探这一个的连通性、对齐 Cursor）
+  onEnableProbe?: (server: string) => void;
 }
 
 export const McpToggleList = ({
@@ -95,10 +128,13 @@ export const McpToggleList = ({
   emptyHint = "Cursor 里没配 MCP server",
   className,
   health,
-  healthLoading,
+  loadingServers,
+  onEnableProbe,
 }: McpToggleListProps) => {
   // 自管模式下、PATCH 进行中的 server 名集合（按 server 名锁、避免重复点）
   const [pending, setPending] = useState<Set<string>>(new Set());
+  // 失败日志弹窗：当前查看的失败 server 的 health（null=不开）
+  const [logHealth, setLogHealth] = useState<McpHealth | null>(null);
 
   const isAutoMode = !onChange && !!taskId;
 
@@ -109,6 +145,9 @@ export const McpToggleList = ({
     const next = enable
       ? disabled.filter((s) => s !== server)
       : [...new Set([...disabled, server])];
+
+    // 关→开：单独探这一个的连通性（对齐 Cursor、打开才连、不触发全量重探）
+    if (enable) onEnableProbe?.(server);
 
     if (!isAutoMode) {
       onChange?.(next);
@@ -137,43 +176,80 @@ export const McpToggleList = ({
   }
 
   return (
-    <ul className={cn("divide-y rounded-md border", className)}>
-      {availableServers.map((name) => {
-        const isDisabled = disabled.includes(name);
-        const isPending = pending.has(name);
-        return (
-          <li
-            key={name}
-            className="flex items-center justify-between gap-3 px-3 py-2"
-          >
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <Plug
-                className={cn(
-                  "size-3.5 shrink-0",
-                  isDisabled ? "text-muted-foreground/40" : "text-emerald-500",
-                )}
-              />
-              <span
-                className={cn(
-                  "truncate font-mono text-xs",
-                  isDisabled && "text-muted-foreground/60 line-through",
-                )}
-              >
-                {name}
-              </span>
-            </div>
-            <HealthBadge h={health?.[name]} loading={healthLoading} />
-            {isPending ? (
-              <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-            ) : (
-              <Switch
-                checked={!isDisabled}
-                onCheckedChange={(checked) => void toggle(name, checked)}
-              />
-            )}
-          </li>
-        );
-      })}
-    </ul>
+    <>
+      <ul className={cn("divide-y rounded-md border", className)}>
+        {availableServers.map((name) => {
+          const isDisabled = disabled.includes(name);
+          const isPending = pending.has(name);
+          return (
+            <li
+              key={name}
+              className="flex items-center justify-between gap-3 px-3 py-2"
+            >
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <Plug
+                  className={cn(
+                    "size-3.5 shrink-0",
+                    isDisabled
+                      ? "text-muted-foreground/40"
+                      : "text-emerald-500",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "truncate font-mono text-xs",
+                    isDisabled && "text-muted-foreground/60 line-through",
+                  )}
+                >
+                  {name}
+                </span>
+              </div>
+              {!isDisabled && (
+                <HealthBadge
+                  h={health?.[name]}
+                  loading={loadingServers?.has(name)}
+                  onShowLog={() => {
+                    const h = health?.[name];
+                    if (h) setLogHealth(h);
+                  }}
+                />
+              )}
+              {isPending ? (
+                <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+              ) : (
+                <Switch
+                  checked={!isDisabled}
+                  onCheckedChange={(checked) => void toggle(name, checked)}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+
+      {/* 失败日志弹窗：点失败徽标弹出、展示探测时的报错详情（detail） */}
+      <Dialog
+        open={!!logHealth}
+        onOpenChange={(o) => {
+          if (!o) setLogHealth(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <span className="size-2 shrink-0 rounded-full bg-red-500" />
+              <span className="truncate font-mono">{logHealth?.name}</span>
+              <span className="text-muted-foreground">连接失败</span>
+            </DialogTitle>
+            <DialogDescription>
+              探测这个 MCP 时的报错详情；排查或去设置页授权后点「重新检测」
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="max-h-80 overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap wrap-anywhere">
+            {logHealth?.detail ?? "（无详情、可能是未知错误）"}
+          </pre>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };

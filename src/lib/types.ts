@@ -655,26 +655,24 @@ export type TaskSummary = Omit<Task, "events" | "actions"> & {
 
 /**
  * MCP server 连通性状态（起 agent 前探测 + 设置页 / 任务面板展示共用）
- * - ok           initialize 探测 2xx、可用
- * - unauthorized 401/403、需要授权（远程 OAuth MCP 没授权 / token 失效）
- * - unreachable  连不上（超时 / DNS / 连接拒绝 / 非鉴权类 4xx5xx）
- * - local        stdio 本地进程、没法 HTTP 探测、启动时由 SDK 拉起
+ *
+ * V0.6.13 起只分两态（用户拍板「不需要连不上 / 本地什么的」、降低噪音）：
+ * - ok   探测 2xx 可用 / 或本地 stdio（没 url 没法 HTTP 探、由 SDK 启动时拉起、乐观当可用）
+ * - fail 探测失败：连不上 / 超时 / 401 未授权 / 非 2xx——具体原因落在 detail、失败可点开看日志
  */
-export type McpHealthStatus = "ok" | "unauthorized" | "unreachable" | "local";
+export type McpHealthStatus = "ok" | "fail";
 
 export interface McpHealth {
   name: string;
   status: McpHealthStatus;
   // HTTP 状态码（探测到响应时有）
   httpCode?: number;
-  // 状态详情（错误简述 / 说明、给 tooltip 用）
+  // 状态详情（失败原因 / 说明、给 tooltip + 失败日志弹窗展示）
   detail?: string;
 }
 
 /** MCP 健康状态中文标签（前后端共享、单一源） */
 export const MCP_HEALTH_LABEL: Record<McpHealthStatus, string> = {
   ok: "正常",
-  unauthorized: "未授权",
-  unreachable: "连不上",
-  local: "本地",
+  fail: "失败",
 };

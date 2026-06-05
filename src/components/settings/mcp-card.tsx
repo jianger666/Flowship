@@ -14,6 +14,7 @@
  * 不脱敏（用户拍板）：本地单机工具、原样展示完整 JSON（含 token / env）、跟 Cursor 一致。
  */
 
+import { useMemo } from "react";
 import { FileCode, Plug, RefreshCw, ShieldCheck } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -44,12 +45,20 @@ interface McpCardProps {
 export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
   const { servers, names, dirs, loading, error } = useCursorMcp();
   const { statuses, busy, authorize, revoke } = useMcpOAuth();
-  // 各 server 连通性（进设置页探测一次、可手动重测）
+  // 已开启的 server（不在黑名单里的）——只探这些（关闭的不连、对齐 Cursor）
+  const enabledServers = useMemo(
+    () => names.filter((n) => !disabledServers.includes(n)),
+    [names, disabledServers],
+  );
+  // 各 server 连通性（进设置页探一次开启的、可手动重测、打开某个时单独探）
+  // active 传 !loading：等 useCursorMcp 把 names 拉回来（enabledServers ready）再首探、
+  // 否则 mount 时探到空集合就再不重探（V0.6.13 修的首探竞态）
   const {
     health,
-    loading: healthLoading,
+    loadingServers,
     refresh: recheckHealth,
-  } = useMcpHealth();
+    probeOne,
+  } = useMcpHealth(enabledServers, !loading);
 
   // 原样拼回 { mcpServers: {...} }（跟 ~/.cursor/mcp.json 文件结构一致）、只读展示
   const json = JSON.stringify({ mcpServers: servers }, null, 2);
@@ -132,17 +141,20 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
                   <Plug className="size-3.5 shrink-0" />
-                  常用 MCP——勾选的建任务默认带；右侧点是连通状态
+                  常用 MCP——勾选的建任务默认带；右侧绿=正常 / 红=失败（点击看日志）
                 </div>
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
                   onClick={recheckHealth}
-                  disabled={healthLoading}
+                  disabled={loadingServers.size > 0}
                 >
                   <RefreshCw
-                    className={cn("size-3", healthLoading && "animate-spin")}
+                    className={cn(
+                      "size-3",
+                      loadingServers.size > 0 && "animate-spin",
+                    )}
                   />
                   重新检测
                 </Button>
@@ -152,7 +164,8 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
                 disabled={disabledServers}
                 onChange={onChange}
                 health={health}
-                healthLoading={healthLoading}
+                loadingServers={loadingServers}
+                onEnableProbe={probeOne}
               />
             </div>
 

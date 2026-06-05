@@ -1257,7 +1257,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       kind: "info",
       actionId: action.id,
       text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
-        .map((d) => `${d.name}（${MCP_HEALTH_LABEL[d.status]}）`)
+        .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
         .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
     });
   }
