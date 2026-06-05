@@ -27,7 +27,7 @@ const sanitizeRepoPaths = (v: unknown): string[] => {
 };
 
 const sanitizeRole = (v: unknown): TaskRole | undefined => {
-  if (v === "fe" || v === "be") return v;
+  if (v === "fe" || v === "be" || v === "adaptive") return v;
   return undefined;
 };
 

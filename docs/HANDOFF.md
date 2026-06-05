@@ -240,6 +240,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.18：角色加「自适应」+ Label 必填星号封装（2026-06-05）
+
+**背景**：① 角色硬二选一（fe/be）、全栈仓 / 不确定时不好归类；② 角色虽必填但 UI 漏星号、必填逻辑跟星号 UI 脱节（用户指出角色 select 没星号）。
+
+- **角色加 `adaptive`（自适应）**：`TaskRole = "fe" | "be" | "adaptive"`、label「自适应」。选它 = 不锁端、agent 按仓库技术栈（`package.json`=前端 / `pom.xml`=Java 后端 / `go.mod`=Go 后端）+ story 自己定位视角、判不准 `ask_user`。改 `types` + new/edit dialog `ROLE_OPTIONS` + `route.sanitizeRole` 白名单 + `_super.md`/`action-plan.md` 加 role=adaptive 分支引导。**不做默认选中**（保持三选一主动选）。
+- **Label 必填星号封装**：`label.tsx` 加 `required` prop、必填字段末尾统一渲染红星号——「必填校验」和「星号 UI」单一来源、调用方只传 `required` 不再各自手写 `<span>*</span>`。清原不一致：角色漏星号→补、类型纯文本 `*`→红星号、标题/仓库/飞书各自手写 span→统一走 required；task 必填有星号、chat 选填无（`required={mode==="task"}`）。new + edit dialog 都规范。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.17：放开 build 必须先 plan + build 读 review「决定链」（2026-06-05）
 
 **背景**：用户问流程灵活性——① 小改 / 修 bug 想跳过 plan 直接 build（当前被硬拦）；② review 提的 bug、build 要**知道**但解不解决归用户、且用户已否决的别重复问。
@@ -249,18 +258,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **review 配套（放开 build 的冰山连带）**：`action-review.md` 准入 plan 改可选、§1 加「无 plan 时差值基准退化为累积意图 + git diff + 飞书、跳过 plan 侧对照」+ revise 加「用户对 bug 表态 → 落『### 用户裁决』段、bug 本体保留」。否则无 plan build 后 review 找不到 plan 会懵。
 - **自查闭环（/pua 蓝军）**：放开后 runner branch checkout 不依赖 plan（`planBranchesForBuild` 只吃 task 字段）；`checkBuild` 本就不存在（V0.6.3 撤）；`checkReview` 必备段只验总评 + 飞书对照 + bug 复审（不验 plan 段、无 plan review 不误判）。
 - 改动面：1 ts 函数 + 1 UI 函数 + 2 prompt（build / review）。`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
-### V0.6.16：创建 task 强校验飞书两个 MCP（按 url 域名认）（2026-06-05）
-
-**背景**：飞书 MCP + 飞书项目 MCP 是「需求 → PR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）。以前漏配也能建 task、agent 跑起来才发现没工具、白跑一趟。用户要求建 task 必须先配齐。
-
-- **只卡 task 模式**：chat（自由对话）不依赖飞书、放行。
-- **按 url 域名认、不认 key 名**（用户拍板）：校验「启用的 server 有没有 url 命中 `mcp.feishu.cn`（飞书 MCP）/ `project.feishu.cn`（飞书项目）」——别人把 key 叫 `lark-mcp` / `my-feishu` 也认、只要连的是飞书。初版按 key 名精确匹配（`feishu-mcp` / `feishu-project-mcp`）、用户指出团队 key 命名不可控、换名即失效 → 改域名判定。
-- **「缺失」两种都拦**：① mcp.json 没配；② 配了但本次创建在 MCP 区关了（进黑名单）。
-- **交互**：缺失 → 创建按钮置灰 + 底部红字「创建任务需先启用 飞书 MCP、飞书项目 MCP」。`mcpLoading`（首拉中）先按「不缺」、避免没拉回来闪红。
-- **实现**：`new-task-dialog` 加 `REQUIRED_FEISHU_MCP`（host→label）+ `missingFeishuMcp` memo（读 `useCursorMcp().servers`、`"url" in cfg` 守卫取 url、滤黑名单后匹域名）、`canSubmit` 接入。复用既有 `"url" in cfg` 访问模式（mcp-probe / mcp-oauth）。
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
 
 ---
 

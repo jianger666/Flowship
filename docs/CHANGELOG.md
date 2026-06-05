@@ -15,6 +15,18 @@
 
 ---
 
+### V0.6.16：创建 task 强校验飞书两个 MCP（按 url 域名认）（2026-06-05）
+
+**背景**：飞书 MCP + 飞书项目 MCP 是「需求 → PR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）。以前漏配也能建 task、agent 跑起来才发现没工具、白跑一趟。用户要求建 task 必须先配齐。
+
+- **只卡 task 模式**：chat（自由对话）不依赖飞书、放行。
+- **按 url 域名认、不认 key 名**（用户拍板）：校验「启用的 server 有没有 url 命中 `mcp.feishu.cn`（飞书 MCP）/ `project.feishu.cn`（飞书项目）」——别人把 key 叫 `lark-mcp` / `my-feishu` 也认、只要连的是飞书。初版按 key 名精确匹配（`feishu-mcp` / `feishu-project-mcp`）、用户指出团队 key 命名不可控、换名即失效 → 改域名判定。
+- **「缺失」两种都拦**：① mcp.json 没配；② 配了但本次创建在 MCP 区关了（进黑名单）。
+- **交互**：缺失 → 创建按钮置灰 + 底部红字「创建任务需先启用 飞书 MCP、飞书项目 MCP」。`mcpLoading`（首拉中）先按「不缺」、避免没拉回来闪红。
+- **实现**：`new-task-dialog` 加 `REQUIRED_FEISHU_MCP`（host→label）+ `missingFeishuMcp` memo（读 `useCursorMcp().servers`、`"url" in cfg` 守卫取 url、滤黑名单后匹域名）、`canSubmit` 接入。复用既有 `"url" in cfg` 访问模式（mcp-probe / mcp-oauth）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.15：自由对话（chat）加「停止」按钮（2026-06-05）
 
 **背景**：chat 模式详情页 agent 回复中只有「AI 正在回」转圈、没法打断——长篇生成 / 跑偏时只能干等。正经 task 模式早有「停止」、chat 一直缺。

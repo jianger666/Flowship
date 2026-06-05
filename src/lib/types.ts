@@ -412,13 +412,15 @@ export interface TaskContextDoc {
 // ===========================================
 //
 // 飞书 story 是「跨角色共享」的、每个研发只关心 story 里跟自己角色相关的部分。
-// 当前枚举 `fe` / `be`、未来扩 data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
+// 当前枚举 `fe` / `be` / `adaptive`、未来扩 data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
+// adaptive（自适应）：不锁端、agent 按仓库技术栈（package.json=前端 / pom.xml=Java 后端 / go.mod=Go 后端 等）+ story 自己定位本仓库该用什么视角、再按那个视角做（给「全栈仓 / 不确定 / 懒得纠结」用）。
 
-export type TaskRole = "fe" | "be";
+export type TaskRole = "fe" | "be" | "adaptive";
 
 export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
   fe: "前端",
   be: "后端",
+  adaptive: "自适应",
 };
 
 // ===========================================

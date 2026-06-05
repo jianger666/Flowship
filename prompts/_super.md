@@ -12,6 +12,7 @@
 - task ID：`{{taskId}}`
 - 任务标题：{{taskTitle}}
 - 当前角色：{{roleLabel}}（role={{role}}）—— 飞书 story 通常是跨角色共享的、你只挑跟你这个角色相关的部分做
+  - **role=adaptive（自适应）时你没被锁定端**：先探测本仓库技术栈（`package.json`=前端 / `pom.xml`·`build.gradle`=Java 后端 / `go.mod`=Go 后端 等）+ 看 story、自己定位「本仓库该用哪种角色视角」、再按那个视角做——**别什么端都做、失焦**
 - {{repoSection}}
 
 > ⚠️ 以上「任务标题 / 当前角色 / 飞书链接」是 **task 启动那一刻的快照**。用户中途可能在详情页改这几项——一旦后续某条 `[NEXT_ACTION]` 头下面跟了 `[TASK_UPDATED]` 段、**以那里列的最新值为准**（尤其角色变了要立刻切视角）、忽略本段旧值。

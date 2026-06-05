@@ -44,7 +44,7 @@ import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
 import { TASK_ROLE_LABEL, type Task, type TaskRole } from "@/lib/types";
 
-const ROLE_OPTIONS: TaskRole[] = ["fe", "be"];
+const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
 
 interface Props {
   open: boolean;
@@ -133,7 +133,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
         <div className="flex flex-col gap-3 py-1">
           {/* 角色 */}
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-role">角色</Label>
+            <Label htmlFor="edit-role" required>
+              角色
+            </Label>
             <Select
               value={role}
               onValueChange={(v) => v && setRole(v as TaskRole)}
@@ -153,8 +155,8 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
 
           {/* 标题 */}
           <div className="grid gap-1.5">
-            <Label htmlFor="edit-title">
-              任务标题 <span className="text-destructive">*</span>
+            <Label htmlFor="edit-title" required>
+              任务标题
             </Label>
             <Input
               id="edit-title"

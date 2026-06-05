@@ -58,7 +58,7 @@ import {
   type TaskRole,
 } from "@/lib/types";
 
-const ROLE_OPTIONS: TaskRole[] = ["fe", "be"];
+const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
 
 // task 模式创建强制依赖的飞书 MCP——按 url 域名认、不认 key 名（别人把 key 叫 lark-mcp、
 // my-feishu 也能识别、只要它连的是飞书）。整个「需求 → PR」流程的命脉：plan 拉 story /
@@ -293,7 +293,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         <div className="flex flex-col gap-3">
           {/* 顶部模式切换：task / chat */}
           <div className="grid gap-1.5">
-            <Label>类型 *</Label>
+            <Label required>类型</Label>
             <div className="grid grid-cols-2 gap-2">
               <ChoiceButton
                 shape="card"
@@ -320,14 +320,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
           {/* 标题：task 必填、chat 选填 */}
           <div className="grid gap-1.5">
-            <Label htmlFor="t-title">
-              {mode === "chat" ? (
-                "标题（选填）"
-              ) : (
-                <>
-                  任务标题 <span className="text-destructive">*</span>
-                </>
-              )}
+            <Label htmlFor="t-title" required={mode === "task"}>
+              {mode === "chat" ? "标题（选填）" : "任务标题"}
             </Label>
             <Input
               id="t-title"
@@ -344,14 +338,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
           {/* 仓库：task 必填、chat 选填 */}
           <div className="grid gap-1.5">
-            <Label>
-              {mode === "chat" ? (
-                "目标仓库（选填）"
-              ) : (
-                <>
-                  目标仓库 <span className="text-destructive">*</span>
-                </>
-              )}
+            <Label required={mode === "task"}>
+              {mode === "chat" ? "目标仓库（选填）" : "目标仓库"}
             </Label>
             {repos.length > 0 ? (
               <MultiSelect<RepoConfig>
@@ -410,7 +398,9 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           {mode === "task" && (
             <>
               <div className="grid gap-1.5">
-                <Label htmlFor="t-role">角色</Label>
+                <Label htmlFor="t-role" required>
+                  角色
+                </Label>
                 <Select
                   value={role}
                   onValueChange={(v) => v && setRole(v as TaskRole)}
@@ -431,8 +421,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               </div>
 
               <div className="grid gap-1.5">
-                <Label htmlFor="t-story">
-                  飞书项目链接 <span className="text-destructive">*</span>
+                <Label htmlFor="t-story" required>
+                  飞书项目链接
                 </Label>
                 <Input
                   id="t-story"
