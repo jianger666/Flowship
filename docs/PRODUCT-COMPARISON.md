@@ -46,6 +46,7 @@ fe-ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harnes
 - **「spec 演进」维度**：OpenSpec 的 living-spec 理念跟我们一致、但我们的 spec 是**自动累积**的（plan + 各轮 build/review artifact）、不用人维护。
 - **最大空白 = 测试验证**：Superpowers 的 TDD + GStack 的真实浏览器 QA 我们都没有。review 阶段二诚实地把「运行时 bug（交互 / 渲染 / 时序）」划给了「后续真实浏览器 QA」、但那个能力还没建。**这是下一个高 ROI 方向、也是 review 当前最大短板**（静态读代码读不出运行时 bug）。
 - **结论**：质量纪律的「需求层 + 静态代码层」我们已到位甚至超越同类；「跑起来验证」是真空白。
+- **补法蓝图（2026-06-05）**：各库借鉴点（Superpowers TDD / GStack 浏览器 QA / Spec Kit `/analyze` / OpenSpec archive）+ 端到端效果 + **一个待拍板矛盾**（test ① TDD vs ROADMAP「公司没单测」止损条款）见 `docs/ROADMAP.md`「质量保证体系蓝图」段。
 
 ## V0.4 当前能力 vs Cursor IDE / Claude Code
 

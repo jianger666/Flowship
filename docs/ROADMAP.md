@@ -32,6 +32,40 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 ---
 
+## 质量保证体系蓝图：博采四大库 + 飞书差异化（2026-06-05 讨论沉淀、待拍板）
+
+> 用户问「质量保证对齐四大库（Spec Kit / OpenSpec / Superpowers / GStack）后、各借鉴哪些点、做出来啥效果」。这里沉淀讨论结论 + 一个**待拍板的关键矛盾**。**还没动代码、方向待用户回头敲定。**
+
+### 定位回顾
+
+质量保证对标四大库（详见 `PRODUCT-COMPARISON.md`）：我们「需求层 + 静态代码层」已到位 / 超越（飞书需求 × git diff + fresh peer 两阶段 review + 确定性后置检查），**唯一真空白 = 测试验证（跑起来验证）** = Superpowers 的 TDD + GStack 的浏览器 QA。test action 就是补这格。review（静态、读代码）vs test（动态、跑起来）**不重叠、是两层防线**（四大库也都把 code-review 和 TDD/qa 拆成两件事）。
+
+### 各库借鉴点
+
+| 来源 | 借鉴点 | 落到哪 |
+|---|---|---|
+| Superpowers | TDD 红绿闭环（Red-Green-Refactor、失败回修；不抄 test-first 硬律、改「build 后补测」） | test ①（自动化测试） |
+| GStack | `/qa` 真浏览器 QA（Playwright 真人式点击）+ **diff-aware**（只测 git diff 改动）+ **失败自动生成回归测试** + 三档深度 + qa-only gate | test ②（浏览器 / 运行时） |
+| Spec Kit | `/analyze` 跨 artifact 一致性 → 补**门槛 5 cross-action 自检**（plan ↔ build ↔ test 漂移核查） | 门槛 5 |
+| OpenSpec | archive 合并 delta → living spec → **注入 AGENTS.md / rules** | learn action |
+| 我们独有 | 飞书验收用例作 test 基准（测「满足需求没」、四大库只有 diff 没需求基准） | test 护城河 |
+
+### 端到端效果
+
+`plan → build → review（静态）→ ✨test（动态：diff-aware 拉飞书用例 → 跑测试 / 浏览器 QA → 失败推 build 修 + 生成回归）→ ship → ✨learn（沉淀注入 AGENTS.md）`、每箭头 HITL ack、每步落 md artifact。出来的 PR = 「静态复核过 + 运行时验证过 + 回归沉淀」。比四大库强在多回答「满足飞书需求吗」（需求层验收）。
+
+### ⚠️ 待拍板的关键矛盾（回头必须先解）
+
+**蓝图的 test ①（Superpowers TDD = 跑单测 / e2e）跟本文「不打算做」里的「自动跑测试用例：公司没单测 / e2e、强行做没意义」直接冲突。**
+
+- 校准后判断：对 crm-web 这种**没单测基础**的项目、① TDD 落不了地（没测可跑、补测又被判无意义）；反而 **② GStack 式浏览器黑盒 QA 不依赖项目有单测**（从 UI 外部跑、真人式点）、+ 飞书验收用例、才是适配「没单测公司项目」的质量保证主线。
+- 即：一期主线应是 **②（浏览器 QA + 飞书用例）而非 ①（TDD）**——但 ② 需先接 playwright / puppeteer MCP。
+- 连带要做：把「不打算做」的「自动跑测试用例」条款**精确化**为「自动跑单测 / e2e（公司无基础设施）」、并澄清「浏览器黑盒 QA」不在此列、是可做项。
+
+**结论：方向（① vs ②、是否接浏览器 MCP、是否修订止损条款）待用户回头敲定、再动代码 / 改上面的 V0.6.2+ 待办表。**
+
+---
+
 ## 配置双向绑定 Cursor（跟 Cursor 共用工具、2026-06-01 完成）
 
 > ✅ 已完成。fe-ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
