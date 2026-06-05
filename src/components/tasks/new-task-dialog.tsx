@@ -60,6 +60,14 @@ import {
 
 const ROLE_OPTIONS: TaskRole[] = ["fe", "be"];
 
+// task 模式创建强制依赖的飞书 MCP——按 url 域名认、不认 key 名（别人把 key 叫 lark-mcp、
+// my-feishu 也能识别、只要它连的是飞书）。整个「需求 → PR」流程的命脉：plan 拉 story /
+// build 摸需求 / ship @ 测试人员全靠它。chat 模式不强制（自由对话不依赖飞书）。
+const REQUIRED_FEISHU_MCP: { host: string; label: string }[] = [
+  { host: "mcp.feishu.cn", label: "飞书 MCP" },
+  { host: "project.feishu.cn", label: "飞书项目 MCP" },
+];
+
 interface Props {
   onCreated: (task: Task) => void;
 }
@@ -85,7 +93,13 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   // 仓库下拉源、open 时从 settings 同步过来
   const [repos, setRepos] = useState<RepoConfig[]>([]);
   // 用户配置的 MCP server 列表（从 Cursor ~/.cursor/mcp.json 读、open 时拉）
-  const { names: availableMcp } = useCursorMcp(open);
+  // servers：完整配置（含 url）、飞书 MCP 校验靠它读域名；mcpLoading：首拉中、
+  // 用来避免「列表还没回来就误判飞书 MCP 缺失」闪一下红
+  const {
+    names: availableMcp,
+    servers: mcpServers,
+    loading: mcpLoading,
+  } = useCursorMcp(open);
   // 用户在弹窗里勾掉的 MCP（黑名单）、open 时初始化为设置页「常用」快照、可临时增减
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起
@@ -133,7 +147,21 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // task 模式必填 title/repos/feishu/role；chat 模式全选填、随便点都能提交
+  // task 模式下「未配置 or 本次被关掉」的飞书 MCP——非空则禁止创建（飞书是 task 命脉）。
+  // 判定：启用的 server（key 不在本次黑名单）里、有没有 url 命中飞书域名；没命中 = 缺。
+  // mcpLoading 时先按「不缺」处理、避免列表没拉回来就误报缺失闪一下红。
+  const missingFeishuMcp = useMemo(() => {
+    if (mode !== "task" || mcpLoading) return [];
+    const enabledUrls = Object.entries(mcpServers)
+      .filter(([key]) => !disabledMcp.includes(key))
+      .map(([, cfg]) => ("url" in cfg ? cfg.url : ""))
+      .filter(Boolean);
+    return REQUIRED_FEISHU_MCP.filter(
+      (m) => !enabledUrls.some((u) => u.includes(m.host)),
+    );
+  }, [mode, mcpLoading, mcpServers, disabledMcp]);
+
+  // task 模式必填 title/repos/feishu/role + 飞书 MCP 齐全；chat 模式全选填、随便点都能提交
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (mode === "task") {
@@ -141,9 +169,20 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
       if (repoPaths.length === 0) return false;
       if (!feishuStoryUrl.trim()) return false;
       if (!role) return false; // V0.6.12：角色必选、不再默认前端
+      if (mcpLoading) return false; // MCP 列表还没拉回来、等确认飞书依赖再放行
+      if (missingFeishuMcp.length > 0) return false; // 飞书 MCP 缺失、不让建
     }
     return true;
-  }, [submitting, mode, title, repoPaths, feishuStoryUrl, role]);
+  }, [
+    submitting,
+    mode,
+    title,
+    repoPaths,
+    feishuStoryUrl,
+    role,
+    mcpLoading,
+    missingFeishuMcp,
+  ]);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -513,6 +552,15 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
             </div>
           )}
         </div>
+
+        {/* task 模式缺飞书 MCP 时的硬提示——飞书是「需求 → PR」命脉、缺了按钮置灰不让建 */}
+        {mode === "task" && missingFeishuMcp.length > 0 && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            创建任务需先启用{" "}
+            <strong>{missingFeishuMcp.map((m) => m.label).join("、")}</strong>
+            （在 Cursor 配置、或在上方 MCP 区打开）
+          </div>
+        )}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)}>

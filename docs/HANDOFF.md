@@ -240,6 +240,18 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.16：创建 task 强校验飞书两个 MCP（按 url 域名认）（2026-06-05）
+
+**背景**：飞书 MCP + 飞书项目 MCP 是「需求 → PR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）。以前漏配也能建 task、agent 跑起来才发现没工具、白跑一趟。用户要求建 task 必须先配齐。
+
+- **只卡 task 模式**：chat（自由对话）不依赖飞书、放行。
+- **按 url 域名认、不认 key 名**（用户拍板）：校验「启用的 server 有没有 url 命中 `mcp.feishu.cn`（飞书 MCP）/ `project.feishu.cn`（飞书项目）」——别人把 key 叫 `lark-mcp` / `my-feishu` 也认、只要连的是飞书。初版按 key 名精确匹配（`feishu-mcp` / `feishu-project-mcp`）、用户指出团队 key 命名不可控、换名即失效 → 改域名判定。
+- **「缺失」两种都拦**：① mcp.json 没配；② 配了但本次创建在 MCP 区关了（进黑名单）。
+- **交互**：缺失 → 创建按钮置灰 + 底部红字「创建任务需先启用 飞书 MCP、飞书项目 MCP」。`mcpLoading`（首拉中）先按「不缺」、避免没拉回来闪红。
+- **实现**：`new-task-dialog` 加 `REQUIRED_FEISHU_MCP`（host→label）+ `missingFeishuMcp` memo（读 `useCursorMcp().servers`、`"url" in cfg` 守卫取 url、滤黑名单后匹域名）、`canSubmit` 接入。复用既有 `"url" in cfg` 访问模式（mcp-probe / mcp-oauth）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.15：自由对话（chat）加「停止」按钮（2026-06-05）
 
 **背景**：chat 模式详情页 agent 回复中只有「AI 正在回」转圈、没法打断——长篇生成 / 跑偏时只能干等。正经 task 模式早有「停止」、chat 一直缺。
@@ -248,19 +260,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **后端**：chat-runner 加 `cancelChatRun(taskId)`（停 runningChats）；`/stop` route 改 `cancelTaskRun(id) || cancelChatRun(id)`（一个 task 只落其一、两个都试、命中即停）；停止 info 文案按 `task.mode` 分「对话」/「action」语境。
 - **前端**：`ChatView` 顶部 running 时「AI 正在回」旁加「停止」按钮 → `stopTask` → 清 streaming + onTaskUpdate。chat 打断是高频低风险（不改代码）、不弹二次确认、即点即停（区别于 task 模式 confirm）。
 - **复用既有 cancel 收尾**：`run.cancel()` 让 stream 正常结束、`run.wait()` 返回 cancelled → 走 chat-runner cancelled 分支提前 return（不进 catch、不误报 error、跟实战验证过的 task-runner 同构）；该分支顺手去掉原「已被取消」info（和 /stop 的「用户停止了对话」重复）。
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
-### V0.6.14：ship 提测「合并后删源分支」改可选（默认保留）（2026-06-05）
-
-**背景**：ship 建 MR 写死 `remove_source_branch: true`、合并后源分支必删。用户痛点：合并后常要回看 / 续推该分支、删了得本地重新 push 一遍很麻烦——要求提测推进时能选、且默认保留（用户拍板）。
-
-- **字段**：`Task.removeSourceBranchOnMerge`（缺省 / undefined = 保留、true = 删）。`gitlab-client.ts` 原写死的 `remove_source_branch:true` 改读 `CreateMRInput.removeSourceBranch`。
-- **链路**：推进 dialog 选「提测」时冒出开关「合并后删除源分支」（默认按 task 上次选择、缺省不勾 = 保留）→ onSubmit 带 `removeSourceBranch` → `advance` route 起 agent 前 `setTaskRemoveSourceBranchOnMerge` 落 task 字段 → agent 调 `submit_mr` 时 handler 读 fresh task 传 createMR（不碰复杂的 advanceTask、也不单独 PATCH、走 advance 一条请求）。
-- **`__conflict` 例外**：一次性解冲突分支由 handler `endsWith("__conflict")` 强制 `true`（必删、不留垃圾分支、不受用户开关影响）。
-- **dialog 防抖**：开关初值用 `defaultRemoveSourceBranch` memo（依赖 primitive 字段、非整个 task）、避免 SSE 推 task 引用变时把表单打回默认（同既有 actionType 的处理）。
-- **`findOpenMR` 入参精确化**：原图省事直接复用 `CreateMRInput`、加 required `removeSourceBranch` 后被波及 → 改 `Pick<CreateMRInput, config|projectPath|sourceBranch|targetBranch>`、`closeOpenMR` 去掉 title/description 占位。
-- **附带 UI 文案精简**（用户「系统里很多文案太啰嗦」）：`forceNewAgent` 开关「强制起新 agent」→「新启 Agent」+ 删副标题；全局删一批自解释控件下的废话 help text（推进 / 新建 / 编辑弹窗的模型 / 角色 / 飞书 / 多仓说明、上下文输入规则——跟 placeholder 重复）；规则固化「控件标题能自解释就别加 help text」（`learned-conventions.mdc`）。
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 

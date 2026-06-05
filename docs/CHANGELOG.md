@@ -15,6 +15,19 @@
 
 ---
 
+### V0.6.14：ship 提测「合并后删源分支」改可选（默认保留）（2026-06-05）
+
+**背景**：ship 建 MR 写死 `remove_source_branch: true`、合并后源分支必删。用户痛点：合并后常要回看 / 续推该分支、删了得本地重新 push 一遍很麻烦——要求提测推进时能选、且默认保留（用户拍板）。
+
+- **字段**：`Task.removeSourceBranchOnMerge`（缺省 / undefined = 保留、true = 删）。`gitlab-client.ts` 原写死的 `remove_source_branch:true` 改读 `CreateMRInput.removeSourceBranch`。
+- **链路**：推进 dialog 选「提测」时冒出开关「合并后删除源分支」（默认按 task 上次选择、缺省不勾 = 保留）→ onSubmit 带 `removeSourceBranch` → `advance` route 起 agent 前 `setTaskRemoveSourceBranchOnMerge` 落 task 字段 → agent 调 `submit_mr` 时 handler 读 fresh task 传 createMR（不碰复杂的 advanceTask、也不单独 PATCH、走 advance 一条请求）。
+- **`__conflict` 例外**：一次性解冲突分支由 handler `endsWith("__conflict")` 强制 `true`（必删、不留垃圾分支、不受用户开关影响）。
+- **dialog 防抖**：开关初值用 `defaultRemoveSourceBranch` memo（依赖 primitive 字段、非整个 task）、避免 SSE 推 task 引用变时把表单打回默认（同既有 actionType 的处理）。
+- **`findOpenMR` 入参精确化**：原图省事直接复用 `CreateMRInput`、加 required `removeSourceBranch` 后被波及 → 改 `Pick<CreateMRInput, config|projectPath|sourceBranch|targetBranch>`、`closeOpenMR` 去掉 title/description 占位。
+- **附带 UI 文案精简**（用户「系统里很多文案太啰嗦」）：`forceNewAgent` 开关「强制起新 agent」→「新启 Agent」+ 删副标题；全局删一批自解释控件下的废话 help text（推进 / 新建 / 编辑弹窗的模型 / 角色 / 飞书 / 多仓说明、上下文输入规则——跟 placeholder 重复）；规则固化「控件标题能自解释就别加 help text」（`learned-conventions.mdc`）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.13：MCP 探测增量化 + 连通状态收敛两态 + 首探竞态修复 + 失败可看日志（2026-06-05）
 
 **背景**：接 V0.6.11 的 MCP 连通可视——先把探测改增量（只探开启的、打开某个时单独探、对齐 Cursor 不浪费那 6s 超时），但留了 bug：进设置页开启的 MCP 不默认探测、一直不出状态。用户顺带提状态太杂（绿黄红灰四态）+ 失败看不到原因。
