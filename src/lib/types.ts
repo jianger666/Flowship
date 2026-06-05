@@ -590,6 +590,14 @@ export interface Task {
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
+  /**
+   * V0.6.14：ship 提测建 MR 时「合并后是否删源分支」。
+   * - 缺省 / undefined → 保留源分支（用户拍板默认保留：合并后常要看 / 续推、删了得去 GitLab 重推很麻烦）
+   * - true → 合并后删源分支（GitLab remove_source_branch）
+   * - 推进 dialog 选「提测」时可改、走 advance 落盘；submit_mr handler 读这字段传给 createMR
+   * - 注意：`<feature>__conflict` 一次性解冲突分支由 handler 强制删（不受本字段影响、否则留垃圾分支）
+   */
+  removeSourceBranchOnMerge?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;

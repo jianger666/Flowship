@@ -181,6 +181,8 @@ interface Props {
     model?: ModelSelection;
     // 指令配的截图附件（选填、贴图说明改哪）
     images?: ImagePayload[];
+    // V0.6.14：合并后是否删源分支（仅 actionType==="ship" 时传、其它为 undefined）
+    removeSourceBranch?: boolean;
   }) => Promise<void>;
   submitting: boolean;
 }
@@ -194,6 +196,12 @@ export const AdvanceDialog = ({
 }: Props) => {
   // dialog 打开时默认选中哪个 chip（不叫推荐、纯减少首次点击）
   const defaultActionType = useMemo(() => inferDefaultActionType(task), [task]);
+  // V0.6.14：ship「合并后删源分支」开关初始值（取 task 上次选择、缺省 false=保留）。
+  // 提成 memo 依赖 primitive 字段、effect 据它初始化而非整个 task（防 SSE 推 task 引用变打回表单）
+  const defaultRemoveSourceBranch = useMemo(
+    () => task.removeSourceBranchOnMerge ?? false,
+    [task.removeSourceBranchOnMerge],
+  );
 
   // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
@@ -201,6 +209,8 @@ export const AdvanceDialog = ({
   const [instruction, setInstruction] = useState("");
   // 高级：强制起新 agent（默认 false、复用旧 agent；老 agent 跑挂了 / 想跑新 prompt 时打开）
   const [forceNewAgent, setForceNewAgent] = useState(false);
+  // V0.6.14：ship 提测「合并后删除源分支」开关（默认保留、用户拍板；dialog 打开时按 task 上次选择初始化）
+  const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
   // 强制起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅 forceNewAgent=true 时透传给父组件、否则 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
@@ -237,6 +247,7 @@ export const AdvanceDialog = ({
     setActionType(defaultActionType);
     setInstruction("");
     setForceNewAgent(false);
+    setRemoveSourceBranch(defaultRemoveSourceBranch);
     // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
     const s = getSettings();
     setPickedModel(s.defaultModel ?? { id: "" });
@@ -244,7 +255,7 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
-  }, [open, defaultActionType]);
+  }, [open, defaultActionType, defaultRemoveSourceBranch]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -284,6 +295,8 @@ export const AdvanceDialog = ({
       model: forceNewAgent && pickedModel.id ? pickedModel : undefined,
       // 截图附件（选填）、后端落盘后把路径注入 agent prompt
       images: toUploadPayload(),
+      // 仅 ship 时传「合并后删源分支」、其它 action 无意义（advance route 据此决定是否落字段）
+      removeSourceBranch: actionType === "ship" ? removeSourceBranch : undefined,
     });
   };
 
@@ -443,19 +456,32 @@ export const AdvanceDialog = ({
             </div>
           </div>
 
-          {/* 高级：强制起新 agent */}
+          {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
+          {actionType === "ship" && (
+            <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
+              <label
+                htmlFor="advance-remove-source"
+                className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
+              >
+                合并后删除源分支
+              </label>
+              <Switch
+                id="advance-remove-source"
+                checked={removeSourceBranch}
+                onCheckedChange={setRemoveSourceBranch}
+                disabled={submitting}
+              />
+            </div>
+          )}
+
+          {/* 高级：新启 Agent */}
           <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2">
             <div className="flex items-center justify-between gap-2">
               <label
                 htmlFor="advance-force-new"
-                className="flex-1 cursor-pointer text-xs leading-relaxed text-muted-foreground"
+                className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
               >
-                <span className="block font-medium text-foreground/80">
-                  强制起新 agent
-                </span>
-                <span className="block">
-                  老 agent 跑挂了 / 想跑新 prompt 时打开（耗 1 次 send 配额）
-                </span>
+                新启 Agent
               </label>
               <Switch
                 id="advance-force-new"
@@ -479,9 +505,6 @@ export const AdvanceDialog = ({
                   variant="compact"
                   emptyPlaceholder="（请先在设置页拉取模型列表）"
                 />
-                <p className="text-[10px] text-muted-foreground">
-                  默认 = 设置页选的模型；本次推进后不会改设置页全局默认
-                </p>
               </div>
             )}
           </div>

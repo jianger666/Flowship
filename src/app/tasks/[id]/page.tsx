@@ -282,6 +282,8 @@ const TaskDetailPage = () => {
     model?: ModelSelection;
     // 指令配的截图附件（选填）
     images?: ImagePayload[];
+    // V0.6.14：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
+    removeSourceBranch?: boolean;
   }) => {
     setStarting(true);
     try {
@@ -311,6 +313,8 @@ const TaskDetailPage = () => {
           // task-runner 闭包到 internalStartAgent 里、续接路径只在 ship 准入校验时用
           gitHost: settings.gitHost?.trim() || undefined,
           gitToken: settings.gitToken?.trim() || undefined,
+          // V0.6.14 ship action：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
+          removeSourceBranch: input.removeSourceBranch,
         }),
       });
       if (!res.ok) {

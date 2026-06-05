@@ -40,6 +40,8 @@ export interface CreateMRInput {
   targetBranch: string;
   title: string;
   description: string;
+  /** 合并后是否删源分支（V0.6.14、可配；调用方按 task.removeSourceBranchOnMerge 传、默认保留） */
+  removeSourceBranch: boolean;
 }
 
 export type CreateMRResult =
@@ -143,7 +145,12 @@ const formatGitLabError = async (res: Response): Promise<string> => {
  * GitLab list MR API、按 source_branch + target_branch + state=opened 过滤、取第一条。
  * 复用 CreateMRResult 类型（拿到的也是 url + iid、跟新建语义对调用方透明）。
  */
-const findOpenMR = async (input: CreateMRInput): Promise<CreateMRResult> => {
+const findOpenMR = async (
+  input: Pick<
+    CreateMRInput,
+    "config" | "projectPath" | "sourceBranch" | "targetBranch"
+  >,
+): Promise<CreateMRResult> => {
   let base: string;
   let headers: HeadersInit;
   try {
@@ -213,8 +220,10 @@ export const createMR = async (
         title: input.title,
         description: input.description,
         // V0.6.1 暂不指派 reviewer/assignee——公司流程是研发自己 cc 测试到飞书 story 评论里
-        // remove_source_branch=true：merge 后自动删 source branch、避免分支膨胀
-        remove_source_branch: true,
+        // V0.6.14：remove_source_branch 改可配（task.removeSourceBranchOnMerge、默认保留）——
+        // 用户常需保留源分支（合并后还要看 / 续推、删了得去 GitLab 重推很麻烦）。
+        // `<feature>__conflict` 一次性分支由 submit_mr handler 强制传 true。
+        remove_source_branch: input.removeSourceBranch,
       }),
     });
     if (!res.ok) {
@@ -302,8 +311,6 @@ export const closeOpenMR = async (input: {
     projectPath: input.projectPath,
     sourceBranch: input.sourceBranch,
     targetBranch: input.targetBranch,
-    title: "",
-    description: "",
   });
   if (!found.ok) {
     // 没查到 open MR → 目标已达成（它本来就没开着）

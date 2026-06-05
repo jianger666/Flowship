@@ -331,10 +331,6 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 rows={4}
                 className="resize-none"
               />
-              <p className="text-[11px] text-muted-foreground">
-                URL → 自动拉取；/ 起手 → 当文件路径；其他 → 当文本；图片 →
-                每张独立 doc、agent 用 read 看
-              </p>
             </div>
 
             {/* 贴图区：缩略图 + 添加按钮 */}

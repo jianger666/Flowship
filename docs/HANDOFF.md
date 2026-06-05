@@ -240,29 +240,29 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.6.11：MCP 容错（连不上不拖垮 run）+ 连通状态可视 + 飞书 @ mention 修复（2026-06-04）
+### V0.6.14：ship 提测「合并后删源分支」改可选（默认保留）（2026-06-05）
 
-**背景**：用户实测 chat agent「老是启动不起来」、报错只有 `SDK status=error message=(none)`、无从定位。RCA：起 agent 注入的远程 MCP 里飞书项目（`project.feishu.cn/mcp_server/v1`）走 OAuth、fe 这侧没授权（`data/mcp-oauth/` 空）→ enrich 注入不到 token → SDK 连它 401 → **整个 run error**、且 SDK 没透传错误。用户两条诉求：① MCP 异常别影响发问；② 能看到 MCP 启动状态、不能只有开关。
+**背景**：ship 建 MR 写死 `remove_source_branch: true`、合并后源分支必删。用户痛点：合并后常要回看 / 续推该分支、删了得本地重新 push 一遍很麻烦——要求提测推进时能选、且默认保留（用户拍板）。
 
-- **MCP 连通性探测**（`src/lib/server/mcp-probe.ts`、新）：`probeMcpHealth` 发 initialize 看 HTTP——2xx=ok / 401·403=unauthorized / 其它·连不上=unreachable；stdio 无 url=local（不探、交 SDK 起进程）。`probeMcpHealthAll` 并发。类型 `McpHealth` + `MCP_HEALTH_LABEL` 落 `types.ts`（前后端共享）。**探测前先 enrich 注入 OAuth token**、否则飞书项目永远 401。
-- **容错（需求1）**：chat-runner / task-runner 起 agent 前 enrich → `filterHealthyMcp` 剔除 unauthorized/unreachable 的远程 MCP、agent 照常启动；被剔的写一条 info event「⚠️ 已跳过 N 个不可用的 MCP：xxx（未授权）…」、不再「莫名其妙报错」。复用 agent 不重探（MCP 已在跑）。
-- **状态可视（需求2）**：`GET /api/cursor-mcp/health`（enrich 后探）+ `useMcpHealth` hook（enabled 控制、dialog 才探、省无谓请求）。`McpToggleList` 每行加状态点（绿正常/黄未授权/红连不上/灰本地 + hover 详情）；task MCP 面板 + 设置页 mcp-card 都接、带「重新检测」。
-- **飞书 @ mention 修复**（接 V0.6.6 飞书通知链）：`action-ship.md` 之前要求 mention 块 id 加 `lark_user_id_` 前缀（照抄 add_comment schema 的坑爹举例）。对照实验确诊（同 story、只改前缀这一个变量）：**带前缀飞书返回 `no permission`（误导、看着像没权限、其实是 mention id 非法）、纯数字才成功**。4 处改纯数字 + 标注 schema 举例是坑（`notify_user_list` 本就纯数字、不动）。
+- **字段**：`Task.removeSourceBranchOnMerge`（缺省 / undefined = 保留、true = 删）。`gitlab-client.ts` 原写死的 `remove_source_branch:true` 改读 `CreateMRInput.removeSourceBranch`。
+- **链路**：推进 dialog 选「提测」时冒出开关「合并后删除源分支」（默认按 task 上次选择、缺省不勾 = 保留）→ onSubmit 带 `removeSourceBranch` → `advance` route 起 agent 前 `setTaskRemoveSourceBranchOnMerge` 落 task 字段 → agent 调 `submit_mr` 时 handler 读 fresh task 传 createMR（不碰复杂的 advanceTask、也不单独 PATCH、走 advance 一条请求）。
+- **`__conflict` 例外**：一次性解冲突分支由 handler `endsWith("__conflict")` 强制 `true`（必删、不留垃圾分支、不受用户开关影响）。
+- **dialog 防抖**：开关初值用 `defaultRemoveSourceBranch` memo（依赖 primitive 字段、非整个 task）、避免 SSE 推 task 引用变时把表单打回默认（同既有 actionType 的处理）。
+- **`findOpenMR` 入参精确化**：原图省事直接复用 `CreateMRInput`、加 required `removeSourceBranch` 后被波及 → 改 `Pick<CreateMRInput, config|projectPath|sourceBranch|targetBranch>`、`closeOpenMR` 去掉 title/description 占位。
+- **附带 UI 文案精简**（用户「系统里很多文案太啰嗦」）：`forceNewAgent` 开关「强制起新 agent」→「新启 Agent」+ 删副标题；全局删一批自解释控件下的废话 help text（推进 / 新建 / 编辑弹窗的模型 / 角色 / 飞书 / 多仓说明、上下文输入规则——跟 placeholder 重复）；规则固化「控件标题能自解释就别加 help text」（`learned-conventions.mdc`）。
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-### V0.6.10：review 阶段一对比基准改「累积意图」+ 已授权变更去双重确认（2026-06-03）
+### V0.6.13：MCP 探测增量化 + 连通状态收敛两态 + 首探竞态修复 + 失败可看日志（2026-06-05）
 
-**背景**：用户洞察——「第二 / 三轮改 bug 的 build 其实也是合法『方案』、review 不该把所有 diff 都拿去跟初版 plan 对比」。实测 V0.6.9 的 review #17：两条标红的「实现偏差」（组合包名展示、主商品加粗）**其实都来自 build #13 / #15 的用户指令 / 产品反馈**——review 又把它们当偏差 `ask_user` 确认一遍 = **双重确认、是噪音**（用户在 build 轮已经拍过了）。
+**背景**：接 V0.6.11 的 MCP 连通可视——先把探测改增量（只探开启的、打开某个时单独探、对齐 Cursor 不浪费那 6s 超时），但留了 bug：进设置页开启的 MCP 不默认探测、一直不出状态。用户顺带提状态太杂（绿黄红灰四态）+ 失败看不到原因。
 
-**机制**：review 阶段一的对比基准从「初版 plan」→「**累积意图** = 最新 plan + 各轮 build artifact 记录的用户指令 / 产品反馈 / ack 决策」。判定规则：
+- **探测增量化**（前半、已落代码）：`useMcpHealth` 只探 `enabledServers`（关闭的不连）；`probeOne` 把某 server 关→开时单独探这一个、per-server `loadingServers` 哪行探哪行转圈；`GET /api/cursor-mcp/health?servers=a,b` 支持子集；`McpToggleList` 加 `onEnableProbe`。ref 存最新开启列表、effect 不依赖它（避免 toggle 触发全量重探）。
+- **首探竞态修复**（本轮 bug）：根因——首探 effect 只在 mount 跑一次、但那一刻 `useCursorMcp` 异步还没回来、`enabledServers=[]`、探了空集合；之后 names 到位、ref 模式 + effect 不依赖列表 → 永不重探（设置页 100% 复现、详情页因 dialog 打开晚侥幸正常、本质同源）。修法：调用方保证 `active` 在「列表 ready 后」才置 true——设置页传 `!loading`、详情页传 `open && !mcpLoading`、复用现有 ref 模式不引入重复探测。
+- **状态收敛两态**：`McpHealthStatus` 从 `ok/unauthorized/unreachable/local` 四态 → `ok/fail`（用户「不需要连不上、本地什么的」）。401/连不上/非 2xx 全归 `fail`；本地 stdio 没法 HTTP 探、乐观标 `ok`（由 SDK 启动时拉起、`filterHealthyMcp` 随 ok 一起保留）。失败原因不再靠 status 区分、全塞进 `detail`。
+- **失败可看日志**：失败徽标渲染成可点 button → 弹 Dialog 展示 `detail`（连接错误原文 / HTTP 码 / URL）。复用现有 dialog、不引抽屉新依赖。两个 runner 的「跳过 MCP」info 提示也改成展示 `detail` 第一行（具体原因、不再只「失败」）。
 
-- diff 改动能**追溯到某轮 build 记录的用户指令 / 产品反馈** → **已授权变更**（列进新「## 已授权变更」段供用户知晓、**不重复 ask_user**）。
-- diff 改动**无据可依**（plan 没写、任何 build artifact 也没记用户说过）→ **真·实现偏差 / 真·范围扩张** → 标红、走 §6 ask_user。
-
-**关键**：不是「review 不对比 plan」、是「换对比基准」——仍然抓「build 偷偷跑偏、plan 和用户都没说」的未声明漂移（review 阶段一核心价值），只去掉「对已授权改动的双重确认」噪音。对齐 OpenSpec 的 living-spec 理念、但我们的 spec 自动累积、不用人维护。
-
-**落地**（纯 prompt、无代码）：`prompts/action-review.md`——step 1 读取强调拉「各轮 build 记录的用户指令」拼累积意图；step 3 总纲 + 3.1 扩张 / 3.2 实现偏差 加「可追溯分流」；artifact 骨架加「## 已授权变更」段（放 plan 拍板口径复核 后）；总评「建议结论」+ §6 ask_user 触发条件改为「只真偏差 / 未完成 / 飞书未覆盖才触发」。
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
 
 ---
 

@@ -41,7 +41,11 @@ import {
   isValidModel,
   parseAndValidateImages,
 } from "@/lib/server/route-helpers";
-import { getTask, saveImageAttachments } from "@/lib/server/task-fs";
+import {
+  getTask,
+  saveImageAttachments,
+  setTaskRemoveSourceBranchOnMerge,
+} from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
 import { ACTION_TYPES, type ActionType } from "@/lib/types";
 
@@ -62,6 +66,8 @@ interface PostBody {
   // 非 ship action 时为空字符串也 OK、不参与校验
   gitHost?: string;
   gitToken?: string;
+  // V0.6.14 ship action 用：合并后是否删源分支（用户在推进 dialog 选、落 task 字段、submit_mr handler 读）
+  removeSourceBranch?: boolean;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -143,6 +149,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
       "本任务是 chat 模式、应该用 /chat-reply、不要调 /advance",
       409,
     );
+  }
+
+  // V0.6.14：ship 推进带「合并后是否删源分支」选择 → 先落 task 字段、
+  // 之后 agent 调 submit_mr 时 handler 读 fresh task 拿到（advanceTask 内部不需要这字段）
+  if (typeof body.removeSourceBranch === "boolean") {
+    await setTaskRemoveSourceBranchOnMerge(task.id, body.removeSourceBranch);
   }
 
   // 落盘图片（落任务目录 uploads/、拿绝对路径）

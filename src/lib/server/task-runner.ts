@@ -1281,6 +1281,13 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         (m) => m.repoPath === taskAction.repoPath,
       )?.branch;
 
+      // V0.6.14：合并后是否删源分支——读 task 配置（缺省保留、用户拍板）。
+      // 但 `<feature>__conflict` 一次性解冲突分支必删（不留垃圾分支、不受用户开关影响）。
+      const isConflictBranch = taskAction.sourceBranch.endsWith("__conflict");
+      const removeSourceBranch = isConflictBranch
+        ? true
+        : (freshForPrevMr?.removeSourceBranchOnMerge ?? false);
+
       const result = await createMR({
         config: { host: gitHost, token: gitToken },
         projectPath: taskAction.projectPath,
@@ -1288,6 +1295,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         targetBranch: taskAction.targetBranch,
         title: taskAction.title,
         description: taskAction.description,
+        removeSourceBranch,
       });
       if (!result.ok) {
         await writeEventAndPublish(task.id, {

@@ -149,9 +149,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-xs text-muted-foreground">
-              改完下次推进 action 时 AI 按新角色视角跑
-            </p>
           </div>
 
           {/* 标题 */}
@@ -176,9 +173,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               onChange={(e) => setFeishuStoryUrl(e.target.value)}
               placeholder="https://project.feishu.cn/<space>/story/detail/..."
             />
-            <p className="text-xs text-muted-foreground">
-              已建的 git 分支名不会改（建时已固化）、只影响之后新建的
-            </p>
           </div>
 
           {/* 仓库：只读展示（不可改） */}

@@ -270,6 +270,8 @@ interface TaskMetaV06 {
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
+  /** V0.6.14：ship 合并后是否删源分支（缺省保留、详见 types.ts Task.removeSourceBranchOnMerge） */
+  removeSourceBranchOnMerge?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;
@@ -559,6 +561,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
+    removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
     archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
@@ -990,6 +993,20 @@ export const setTaskDisabledMcpServers = async (
     if (!meta) return null;
     meta.disabledMcpServers =
       servers && servers.length > 0 ? servers : undefined;
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+// V0.6.14：ship 提测「合并后是否删源分支」开关落盘（推进 dialog 选「提测」时改、advance route 调）
+export const setTaskRemoveSourceBranchOnMerge = async (
+  id: string,
+  value: boolean,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    meta.removeSourceBranchOnMerge = value;
+    meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
   });

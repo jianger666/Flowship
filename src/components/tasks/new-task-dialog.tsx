@@ -365,12 +365,6 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 {mode === "chat" && "、或者不选直接聊"}
               </EmptyHint>
             )}
-            {repoPaths.length > 1 && (
-              <p className="text-xs text-muted-foreground">
-                多仓场景：agent cwd = 公共父目录、AI 视角下面挂这{" "}
-                {repoPaths.length} 个 git 仓子目录、写路径首段是仓名
-              </p>
-            )}
           </div>
 
           {/* 角色、飞书：仅 task 模式展示 */}
@@ -395,9 +389,6 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                     ))}
                   </SelectContent>
                 </Select>
-                <p className="text-xs text-muted-foreground">
-                  飞书 story 跨角色共享、agent 会按你的角色挑相关部分
-                </p>
               </div>
 
               <div className="grid gap-1.5">
@@ -410,9 +401,6 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                   onChange={(e) => setFeishuStoryUrl(e.target.value)}
                   placeholder="https://project.feishu.cn/<space>/story/detail/..."
                 />
-                <p className="text-xs text-muted-foreground">
-                  agent 跑 plan / build / ship 时拉它作上下文 + 抠 storyId 做 branch 名
-                </p>
               </div>
 
               {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建 */}
@@ -486,16 +474,11 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-xs text-muted-foreground">
-              默认 = 设置页的模型；可以为本任务单独挑别的
-              {pickedModelId &&
-                defaultModelId &&
-                pickedModelId !== defaultModelId && (
-                  <span className="ml-1 text-amber-500">
-                    （已切到非默认模型）
-                  </span>
-                )}
-            </p>
+            {pickedModelId &&
+              defaultModelId &&
+              pickedModelId !== defaultModelId && (
+                <p className="text-xs text-amber-500">已切到非默认模型</p>
+              )}
           </div>
 
           {/* MCP 开关：默认全开 + 默认折叠 */}

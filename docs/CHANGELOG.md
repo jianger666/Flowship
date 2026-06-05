@@ -15,6 +15,60 @@
 
 ---
 
+### V0.6.12：artifact 产出不刷新事件驱动根治 + 终态任务恢复 + 角色必选 + chat 贴图修复（2026-06-04）
+
+**背景**：用户实测连撞几个体验 bug——① artifact 产出后页面停在「没有产物」、要切 tab / 刷新才出（这是第 3 次修）；② 任务 abandon / merged 后右上角操作按钮全没、想回炉没入口；③ 新建任务角色默认「前端」、后端同学顺手提交错角色；④ chat 贴图不显示 + 回完一轮事件流不更新。
+
+**① artifact 产出不刷新——事件驱动根治（第 3 次、前两次治标）**
+
+- 现象：action 跑完、artifact 文件已落盘、前端面板仍停在「没有产物」。RCA：agent 可能写失败重写、文件落盘晚于它调 `wait_for_user`（signaling 完成）几秒、前端固定退避窗口刚好错过。
+- 前两次治标：V0.6.8 SSE 被动断开自动重连；本轮先上「读到空退避重试 800ms×5」——都没根治、因为前端在「猜」文件啥时候落盘。
+- 根治：`ActionRecord` 加 `artifactUpdatedAt`；`task-runner.handleSdkMessage` 检测到「写工具命中 `actions/<n>-<type>.md` 且 SDK tool done」→ patch 该字段 + 推 action 帧；`artifact-panel` effect 依赖 `artifactUpdatedAt` → 事件驱动重拉（不再靠退避猜落盘时刻）。退避升级成指数退避（800ms×1.7、单次封顶 5s、8 次）留作 SSE 极端断连兜底。
+
+**② 终态任务一键恢复（reopen）+ 运行时收尾健壮性**
+
+- reopen：`merged` / `abandoned` 任务一键回 `developing`（`reopen` API + task-store helper + 详情页「恢复」按钮）、修「终态任务无任何操作入口」。
+- action 收尾一致性：force-new / finalize / cancel / error 统一走 `finalizeStaleActions`、修「提测卡 `awaiting_ack` 划不掉」。
+- 事件流：`read` 不再误标「在写 artifact」（`WRITE_TOOL_NAMES` 白名单、只有写工具命中 `actions/` 才算产出）。
+- SDK 错误详情：抽 `sdk-error.ts` 补全 code / cause（修 `ConnectError` 的 number code 丢失）、`chat-runner` 对齐。
+- 全局兜底：`instrumentation` 注册 `unhandledRejection`、SDK 内部 reject 不再让 Web 进程退出。
+
+**③ 新建任务角色改必选**：默认「前端」→ 初始置空 + task 模式角色纳入必填校验、强制主动选（防后端同学顺手提交错角色）。
+
+**④ chat 体验**：chat 贴图不显示 + 回完一轮事件流不更新修复；推进任务弹窗指令框支持贴图（粘贴 / 拖拽 / 附图、复用 `useImageAttach`）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+---
+
+### V0.6.11：MCP 容错（连不上不拖垮 run）+ 连通状态可视 + 飞书 @ mention 修复（2026-06-04）
+
+**背景**：用户实测 chat agent「老是启动不起来」、报错只有 `SDK status=error message=(none)`、无从定位。RCA：起 agent 注入的远程 MCP 里飞书项目（`project.feishu.cn/mcp_server/v1`）走 OAuth、fe 这侧没授权（`data/mcp-oauth/` 空）→ enrich 注入不到 token → SDK 连它 401 → **整个 run error**、且 SDK 没透传错误。用户两条诉求：① MCP 异常别影响发问；② 能看到 MCP 启动状态、不能只有开关。
+
+- **MCP 连通性探测**（`src/lib/server/mcp-probe.ts`、新）：`probeMcpHealth` 发 initialize 看 HTTP——2xx=ok / 401·403=unauthorized / 其它·连不上=unreachable；stdio 无 url=local（不探、交 SDK 起进程）。`probeMcpHealthAll` 并发。类型 `McpHealth` + `MCP_HEALTH_LABEL` 落 `types.ts`（前后端共享）。**探测前先 enrich 注入 OAuth token**、否则飞书项目永远 401。
+- **容错（需求1）**：chat-runner / task-runner 起 agent 前 enrich → `filterHealthyMcp` 剔除 unauthorized/unreachable 的远程 MCP、agent 照常启动；被剔的写一条 info event「⚠️ 已跳过 N 个不可用的 MCP：xxx（未授权）…」、不再「莫名其妙报错」。复用 agent 不重探（MCP 已在跑）。
+- **状态可视（需求2）**：`GET /api/cursor-mcp/health`（enrich 后探）+ `useMcpHealth` hook（enabled 控制、dialog 才探、省无谓请求）。`McpToggleList` 每行加状态点（绿正常/黄未授权/红连不上/灰本地 + hover 详情）；task MCP 面板 + 设置页 mcp-card 都接、带「重新检测」。
+- **飞书 @ mention 修复**（接 V0.6.6 飞书通知链）：`action-ship.md` 之前要求 mention 块 id 加 `lark_user_id_` 前缀（照抄 add_comment schema 的坑爹举例）。对照实验确诊（同 story、只改前缀这一个变量）：**带前缀飞书返回 `no permission`（误导、看着像没权限、其实是 mention id 非法）、纯数字才成功**。4 处改纯数字 + 标注 schema 举例是坑（`notify_user_list` 本就纯数字、不动）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
+---
+
+### V0.6.10：review 阶段一对比基准改「累积意图」+ 已授权变更去双重确认（2026-06-03）
+
+**背景**：用户洞察——「第二 / 三轮改 bug 的 build 其实也是合法『方案』、review 不该把所有 diff 都拿去跟初版 plan 对比」。实测 V0.6.9 的 review #17：两条标红的「实现偏差」（组合包名展示、主商品加粗）**其实都来自 build #13 / #15 的用户指令 / 产品反馈**——review 又把它们当偏差 `ask_user` 确认一遍 = **双重确认、是噪音**（用户在 build 轮已经拍过了）。
+
+**机制**：review 阶段一的对比基准从「初版 plan」→「**累积意图** = 最新 plan + 各轮 build artifact 记录的用户指令 / 产品反馈 / ack 决策」。判定规则：
+
+- diff 改动能**追溯到某轮 build 记录的用户指令 / 产品反馈** → **已授权变更**（列进新「## 已授权变更」段供用户知晓、**不重复 ask_user**）。
+- diff 改动**无据可依**（plan 没写、任何 build artifact 也没记用户说过）→ **真·实现偏差 / 真·范围扩张** → 标红、走 §6 ask_user。
+
+**关键**：不是「review 不对比 plan」、是「换对比基准」——仍然抓「build 偷偷跑偏、plan 和用户都没说」的未声明漂移（review 阶段一核心价值），只去掉「对已授权改动的双重确认」噪音。对齐 OpenSpec 的 living-spec 理念、但我们的 spec 自动累积、不用人维护。
+
+**落地**（纯 prompt、无代码）：`prompts/action-review.md`——step 1 读取强调拉「各轮 build 记录的用户指令」拼累积意图；step 3 总纲 + 3.1 扩张 / 3.2 实现偏差 加「可追溯分流」；artifact 骨架加「## 已授权变更」段（放 plan 拍板口径复核 后）；总评「建议结论」+ §6 ask_user 触发条件改为「只真偏差 / 未完成 / 飞书未覆盖才触发」。
+
+---
+
 ### V0.6.9：review 改 fresh peer 两阶段复审 + per-action 复用/强起 agent 默认（2026-06-03）
 
 **背景**：用户反馈 review「鸡肋」——找不到 bug、只会做「plan vs diff 差值」。根因：当年 review prompt 明确写「不做 AI 自审代码对错」（怕「写代码的 agent 自己审自己」= Cognition 警告的共识盲点 anti-pattern）。调研 Spec Kit / OpenSpec / Superpowers / GStack 后定方向：借 Superpowers 的 **fresh subagent 复审**——复审交给一个没写过这代码的全新 agent、绕开盲点。
