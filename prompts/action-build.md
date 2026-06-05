@@ -5,11 +5,11 @@
 
 ---
 
-你正在跑 fe-ai-flow task 里的 **build action**——按最新 plan 写代码 + 跑 typecheck/lint、产出 `actions/<n>-build.md`。这是整段 task 里**最关键、也最危险**的 action——你要**真的改代码**。
+你正在跑 fe-ai-flow task 里的 **build action**——按 plan（有则）或用户指令写代码 + 跑 typecheck/lint、产出 `actions/<n>-build.md`。这是整段 task 里**最关键、也最危险**的 action——你要**真的改代码**。
 
-## 准入条件（V0.6 门槛 1、硬门槛）
+## 准入条件（V0.6.17 起：plan 可选）
 
-- 至少 1 个已通过的 plan action（runner 会拦、违反时 advance 路由 4xx）
+- **plan 不再是硬前置**（V0.6.17 放开）——有 plan 按 plan 工单走、无 plan 按用户指令直接改（改文案 / 修小 bug 不必先出方案）。两种模式差异见「本 action 的目标」+「执行步骤 1」。
 - runner 在 [NEXT_ACTION ...] 头后会注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
   - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
   - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
@@ -17,26 +17,30 @@
 
 ## 本 action 的目标
 
-输入：
-- 最新 plan artifact（`actions/<plan_n>-plan.md`）—— 需求理解 + task 清单 + 改动范围 + 业务上下文
+输入（按存在与否取舍）：
+- **最新 plan artifact**（`actions/<plan_n>-plan.md`、**有则必读**）—— 需求理解 + task 清单 + 改动范围 + 业务上下文
+- **最近 review artifact**（`actions/<review_n>-review.md`、**有则必读**、V0.6.17）—— 上一轮复核发现的 bug / 差异、build 要知道它提了啥（解不解决见执行步骤 1.2）
 - 上一个 build artifact（如果有、`actions/<prev_build_n>-build.md`）—— 增量改动参考
 
 输出：
 1. 用户仓库（`{{repoPath}}`）里**真实的代码改动**
 2. `actions/<n>-build.md`（实施日志 + 校验结果）
 
-**严格按最新 plan artifact 的 task 顺序和改动范围执行**——不在 plan 范围内的文件一行都不许动。
+**改动范围**：有 plan 时**严格按最新 plan artifact 的 task 顺序和改动范围**（不在 plan 范围内的文件一行都不许动）；无 plan 时**以用户指令圈定的范围为准**（指令没点到的文件别乱动、拿不准就 ask_user）。
 
 ## 输入文件
 
-- **最新 plan artifact**（必读、本 action 的工单 + 业务上下文）：先 list `{{actionArtifactsDir}}/` 找最大 n 的 `<n>-plan.md`、用 `read` 读
+- **plan artifact**（`<n>-plan.md` 取最大 n、**有则必读**、本 action 工单 + 业务上下文）：list `{{actionArtifactsDir}}/` 找；无 plan 时按用户指令走
+- **最近 review artifact**（`<n>-review.md`、**有则必读**、V0.6.17）：上一轮复核的 bug、读取 + 「问用户修哪些」见执行步骤 1.2
 - **上一个 build artifact**（如有、V0.6 同 task 多次 build 时存在）：read 拿增量上下文、避免覆盖别人改的
 - 仓库根目录（实际改这里）：`{{repoPath}}`
 
 ## 严格约束（违反 = 本 action 直接 revise）
 
-1. **改动范围必须在最新 plan artifact §5 task 拆分的「改动」字段里**——超出范围的文件一行都不许动
-   - 如果发现 plan 漏了某个必须改的文件、**不要自己加**、把它写进 build artifact 的「偏离 plan」、让用户在 ack 时拍板
+1. **改动范围受控**——超出范围的文件一行都不许动
+   - **有 plan**：范围 = 最新 plan artifact §5 task 拆分的「改动」字段。发现 plan 漏了某个必须改的文件、**不要自己加**、写进 build artifact 的「偏离 plan」、让用户 ack 时拍板
+   - **无 plan**（V0.6.17 直接 build）：范围 = 用户指令圈定的文件 / 模块。指令没点到的别顺手改、拿不准是否该动就 ask_user
+   - **review 授权的修复**：执行步骤 1.2 里用户答应本次修的 review bug、属于已授权范围、可以改
 2. **不动 .git**——不 commit、不 push、不 rebase、不 reset、不 stash
    - **例外**：build action 开头 runner 注入的 idempotent checkout hint、按那段 shell 命令跑（详见上面准入条件）
    - 跑完 checkout 后**绝对不再动 git**——commit / push / pr 都是 ship action 的职责、不归 build
@@ -50,13 +54,24 @@
 
 ### 1. 读上游 artifact
 
-用 SDK 内置 `read`：
+用 SDK 内置 `read`、先 `glob` 或 `shell ls` 看 `{{actionArtifactsDir}}/` 里有哪些 artifact、再按下面取舍：
 
-1. 先 `glob` 或 `shell ls` 看 `{{actionArtifactsDir}}/` 里所有 plan / build artifact、找出**最新 plan** 的文件名（n 最大的 `<n>-plan.md`）
-2. read 最新 plan artifact
-3. 如果有上一个 build artifact（V0.6 多次 build 场景）、也 read 一下
+**1.1 plan artifact**
+- 有 `<n>-plan.md`（取 n 最大）→ **read**、当工单（吸收点见下）
+- 没有 plan（V0.6.17 直接 build）→ 跳过、改动范围以「用户指令」为准；指令含糊到圈不出范围就先 `ask_user` 问清楚再动手、别瞎改
 
-关键吸收点（来自 plan artifact）：
+**1.2 最近 review artifact（V0.6.17）**
+- 有 `<n>-review.md`（n 最大、且比上一个 build 新）→ **read**、看它列的 🔴 阻塞 / 🟡 建议
+- review 的 bug **不一定本次都要解决**——解不解决是**用户**的决定。流程：
+  - **先排除已有定论的**（两个来源）：① review artifact 的「### 用户裁决」段——用户在 review ack 时已表态「不改 / 延后」的；② 历史 build artifact 留痕——之前 build 弹窗里选「跳过」的。这两处已否决的 bug **不要再问**（否决过一次就是否决了、重复问 = 骚扰）
+  - 剩下**还没决定过**的未解决 🔴/🟡 → 用 `ask_user` 问「本次 build 修哪些？」（options：全修 / 只修 🔴 / 本次跳过 / 我挑几条）
+  - 按答案纳入本次范围、没让修的别动、并在 build artifact 留痕「review 的某 🟡：用户选跳过」（给下一次 build 看、形成「决定链」、避免重复问）
+- 没 review、或 review 比上一个 build 旧（已被消化）→ 跳过本步
+
+**1.3 上一个 build artifact**
+- 有（V0.6 多次 build）→ read 拿增量、避免覆盖别人改的
+
+关键吸收点（来自 plan artifact、无 plan 时跳过本段）：
 
 - §1「需求理解」+ §2「业务规则 / 文案 / 状态」：业务上下文（含 plan agent 内联的 `> ✅ ask_user 已确认：xxx` 用户拍板点、按这个口径走、不要回退到原文）
 - §3「涉及接口（跨后端边界）」：本 action 调用的接口清单
@@ -79,9 +94,12 @@
 
 > ⚠️ **不要跑全量 build / 打包命令**（如 `pnpm build` / `vite build` / `mvn package` / `gradle build`）—— 这类通常耗时几十秒到几分钟、上面的类型检查 / 编译已覆盖大部分错误、全量打包边际收益低、ROI 不值。除非用户在 plan / 反馈里**明确要求**、否则跳过。
 
-### 3. 按 task 顺序执行
+### 3. 按计划执行（有 plan 按 task 顺序、无 plan 按指令拆步）
 
-每个 task 的循环：
+- **有 plan**：按 plan §5 的 task 顺序逐个做
+- **无 plan**：把用户指令拆成几个小改动步骤、逐步做（每步同样「改一处 → 局部校验」、别一把梭）
+
+每个 task / 步骤的循环：
 
 ```
 read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →

@@ -1,48 +1,62 @@
 # fe-ai-flow
 
-**项目级 AI Harness 平台 · 飞书 story → PR 自动化**——站在 Cursor SDK 肩膀上、把「读飞书 / 拉接口文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验」这 80% 的手工活自动化、用户只在每个 phase 边界 ack 一次。
+**项目级 AI Harness 平台 · 飞书 story → MR 自动化**——站在 Cursor SDK 肩膀上、把「读飞书 / 拉接口文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验 / 提 MR」这 80% 的手工活自动化、用户只在每个 action 边界 ack 一次。
 
-**核心是 Harness（缰绳）**：每个 phase 边界都用确定性工具（typecheck / lint / hooks / Skills / MCP / HITL ack）加固质量、用 12 步 harness 方法论压住 LLM 的非确定性、保证产出可观测、可回退、可复用。UI 上的「开发流水线」是产品形态、底下是「AI 写代码 + harness 保质量」这套工程哲学。
+**核心是 Harness（缰绳）**：每个 action 边界都用确定性工具（typecheck / lint / git diff hash / MCP / HITL ack）加固质量、压住 LLM 的非确定性、保证产出可观测、可回退、可复用。UI 上的「任务看板 + action 时间线」是产品形态、底下是「AI 写代码 + harness 保质量」这套工程哲学。
 
-**V0.5 / V0.5.1 当前能力**：
+---
 
-- **plan 模式（推荐）**：粘飞书 story 链接 + 选角色（当前仅前端、未来扩后端 / 数仓 / 测试…）+ 选模型（默认 = 设置页默认模型）→ `plan → build → review` 3 phase workflow 自动跑、每个 phase 边界你 ack 才推进、ack 时可切模型 / 换新 agent
-- **chat 模式（V0.4 起自由化）**：表单全选填、进任务后底部输入框直接发消息自动启 agent；长会话、一次 SDK Run 跑到底、agent 用 `wait_for_user` MCP 反复阻塞等用户下一句、维持单次扣费
+## 核心模型：task 容器 + action 历史
 
-**主流程**：
+V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构为 **task 容器 + action 历史**：
+
+- **task** = 单个需求的生命周期容器、可多次推进 / 多个 MR、双状态（`repoStatus` 业务状态 + `runStatus` 运行时状态）、终态 `merged` / `abandoned`
+- **action** = 单次动作（`plan` / `build` / `review` / `ship` / `test` / `learn`）、任意触发、**不强制顺序**——小改 / 修 bug 可跳过 plan 直接 build
 
 ```
-[飞书 story URL + 仓库 + 角色 + 模型]
-       ▼
-  ┌─────────────────┐
-  │ Phase 1: plan   │ 拉 story / 关联文档 + 扫仓库 + 出技术方案 + 拆 task + 校验前移段
-  └─────────────────┘ → artifacts/01-plan.md（决策表 + 改动范围 + Task 拆分 + 我的理解 vs 飞书原文）
-       ▼ 用户 ack（可切模型 / 换新 agent）
-  ┌─────────────────┐
-  │ Phase 2: build  │ 按 task 顺序真改代码 + 跑 lint/typecheck/build
-  └─────────────────┘ → artifacts/02-build.md（实施日志 + 校验结果）
-       ▼ 用户 ack（可切模型 / 换新 agent）
-  ┌─────────────────┐
-  │ Phase 3: review │ git diff × 01-plan.md × 02-build.md × 飞书原文做结构化差值、产出交付信息
-  └─────────────────┘ → artifacts/03-review.md（4 类差异 + commit msg / PR body / 飞书评论草稿）
-       ▼ 用户 ack
-  [completed]（PR 提交 + 飞书状态回写仍由用户手动复制 review artifact 走、V0.3.3 砍了 ship phase）
+新建 task → plan (#1) → ack → build (#2) → ack → review (#3) → ack
+        → build (#4) 修 bug → ack → ship (#5) 提 MR → ack → ... → merged
 ```
 
-详细架构 / 决策见 [docs/HANDOFF.md](./docs/HANDOFF.md)（V0.5 / V0.5.1 段最新）+ [docs/DESIGN.md](./docs/DESIGN.md) + [docs/MULTI-ROLE.md](./docs/MULTI-ROLE.md)（V0.4 多角色路线图）。
+每条 action 落一个 artifact：`data/tasks/<id>/actions/<n>-<type>.md`、N 单调递增不复用、按时间正序。
+
+### 6 种 action
+
+| action | 干什么 | 准入条件 | 后置确定性检查 |
+|---|---|---|---|
+| `plan` ✅ | 拉 story / 关联文档 + 扫仓库 + 出技术方案 + 拆 task | 永远可 | artifact 存在 + 长度 |
+| `build` ✅ | 真改代码 + 跑 typecheck/lint；有 plan 按工单走、无 plan 按指令改 | 永远可（plan 可选） | 无（靠 review 兜底） |
+| `review` ✅ | git diff × plan × 飞书需求做结构化差值 + fresh peer bug 复审 | 至少 1 个 build | 必备段非空 + git hash 一致 |
+| `ship` ✅ | server-side GitLab REST 提 MR（多仓）+ 飞书 @ 测试人员 | 至少 1 个 build + 配 GitLab Host/PAT | MR 覆盖所有仓 + 跳仓有原因 |
+| `test` 🚧 | 飞书验收用例 + 运行时验证（蓝图见 ROADMAP） | 至少 1 个 build | 待实现 |
+| `learn` 🚧 | merged 后沉淀经验注入 AGENTS.md | `merged` + 整 task 一次 | 待实现 |
+
+---
+
+## 两套 mode：task / chat
+
+新建任务 dialog 顶部 tab 二选一、两套通路完全独立（不共享 runner / prompt / 推进入口）：
+
+| mode | 用途 | UI | 必填 |
+|---|---|---|---|
+| **task** | 正经需求、走 action 容器 | 三栏（左 action 时间线 + 中 artifact 预览 + 右事件流） | 标题、仓库（多仓）、飞书 story URL；**强制配齐飞书 MCP + 飞书项目 MCP** |
+| **chat** | 跟 AI 临时聊（答疑 / 探索 / 思路碰撞、不走完整流程） | 单栏对话（顶部 bar + 事件流 + 输入框、随时可「停止」） | 全选填、空标题自动补「未命名对话 MM-DD HH:mm」 |
+
+> 飞书两个 MCP 是「需求 → MR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）、**task 模式按 url 域名强校验**（`mcp.feishu.cn` + `project.feishu.cn`、不认 key 名）、漏配不让建。chat 模式不依赖、放行。
 
 ---
 
 ## 关键属性
 
-- **一次 SDK Run 跑完全程**：3 phase 默认共享一个 agent / 一个 SDK Run、计费一次（用户在 ack 时可手动 fork 起新 agent、+1 send 配额）
-- **HITL 是底线**：每个 phase 边界都要用户 ack、不会偷偷往下走
-- **「再聊聊」意图二分**（V0.5.2、想改 / 想问都走这里）：用户点「再聊聊」→ agent **永远先弹 `ask_user`** 让你选「我想改 / 我想问 / 先答再决定」→ 想改就改 artifact、想问就只答疑（**严禁偷偷动 artifact**）、含混就再问一轮
-- **per-phase 模型选择 + agent fork（V0.5）**：新建任务表单挑模型、每 phase ack 时还能再切；切了模型 → 自动隐含起新 agent run（SDK 限制：同 run 不能换模型）
-- **artifact-writer skill 渐进式披露（V0.5.1）**：写 artifact 用 `write` / 修 artifact 用 `edit`、规则集中放在 `skills/artifact-writer/SKILL.md`、agent 自己 read 查阅、prompt 不再反复教
-- **shell + curl long-poll 保活（V0.3.5）**：agent 拿到 wait_for_user 返回的 shell 引导后调 `shell` 工具 curl 跟服务端长连接、根治旧版 5-6 分钟必踩 anti-loop 的问题
-- **断线手动续接**：长连接断了、UI 显示「继续监听」按钮、用户决定何时花 1 次 send 配额重连（`Agent.resume`）；resume 时 `fs.stat` 真实检查 artifact、防 agent 撒谎说「已产出」
-- **失败可恢复**：artifact 保留、点「重启 workflow」可从头跑（agent 会看到已有 artifact、大概率跳过已 ack 的 phase）
+- **单 SDK Run 永生**：整 task 跑在一个 SDK Run、不一个 action 一个 Run、计费一次。action 间用 `wait_for_user` MCP 阻塞等用户 ack；终结 task 才退出 Run（实测比每 action 起新 Run 省大量扣费）
+- **HITL 是底线**：每个 action 边界都要用户 ack（**通过** / **再聊聊**）、不会偷偷往下走
+- **双状态**：`repoStatus`（developing / awaiting_test / has_bug / merged / abandoned）+ `runStatus`（idle / running / awaiting_user / error）分两个 badge 显示
+- **6 个 Harness 门槛**：action 前置准入 / 后置确定性检查 / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（V0.6.4+）/ placeholder 动态
+- **「再聊聊」（revise）**：对 artifact 有意见 / 疑问 → agent 先复述意图再决定（想改就改 artifact、想问就只答疑、严禁偷偷动 artifact）
+- **新启 Agent（forceNewAgent）**：推进 dialog 高级选项、默认 false；勾上 cancel 旧 Run + 起新 Agent（换模型 / reviewer ≠ author 场景、耗 +1 send 配额）
+- **shell + curl long-poll 保活**：agent 拿到 `wait_for_user` 返回的 shell 引导后调 `shell` 工具 curl 跟服务端长连接、根治旧版 anti-loop
+- **Git 分支自动建（多仓 + 模板化）**：build 前 runner 按模板（默认 `feature/{username}/{storyId}-{taskTitle}`、可 per-repo 覆盖）拼分支名、prompt 注入 idempotent checkout 引导；填了「已有工作分支」则复用
+- **决定链落 md**：review 提的 bug、用户裁决（改 / 不改 / 延后）写进 review artifact、后续 build 不重复问（换 agent 也读得到）
 
 ---
 
@@ -55,92 +69,74 @@ pnpm dev
 
 打开 http://localhost:8876、按以下顺序操作：
 
-1. **设置页 `/settings`**：四张 Card（每张独立保存）
+1. **设置页 `/settings`**：
    - **API Key**：粘贴 Cursor API Key（[这里办一个](https://cursor.com/dashboard/integrations)、`crsr_` 开头）
    - **默认模型**：从 SDK 拉的可用模型列表选 + SDK 参数（thinking / context / effort 等）
-   - **仓库**：点「选择文件夹」弹原生 dialog 选目录、自动填仓库名
-   - **MCP servers**：JSON 编辑器、自由配（建议至少配 `feishu-project-mcp` + `feishu-mcp`、plan 模式拉 story / wiki 要用）
-2. **主页 `/`**：任务卡片看板、点「新建任务」开始
-3. 新建任务时选 **mode**：
-   - **plan**（默认、推荐）：粘飞书 story + 选角色 + 选仓库 + 选模型（默认 = 设置页默认模型）、自动跑 `plan → build → review`
-   - **chat**（V0.4 起全选填）：可只输入飞书项目链接 / 仓库 / 标题、不绑仓库默认 `~`、进任务后底部输入框发首条消息自动启 agent；`completed` / `failed` 状态再发消息自动重启新一段 SDK Run
-4. plan 任务详情页：左侧 artifact 预览（按 phase 切换）、右侧事件流、顶部「再聊聊 / 通过 PHASE」按钮；点「再聊聊」弹 dialog 输入意见 / 疑问（agent 会先复述意图、想改就改、想问就只答）；点「通过 PHASE」弹 dialog、可挑下一 phase 用的模型 / 勾「换新 agent」
-5. 不想要的任务可手动归档 / 删除；completed/failed 7 天没动会自动归档
+   - **仓库**：点「选择文件夹」弹原生 dialog 选目录、可多仓
+   - **MCP servers**：**只读展示** `~/.cursor/mcp.json`（跟 Cursor 共用配置、fe 不自己维护）、可按任务关掉某些 MCP（黑名单）、失败的可点开看报错日志
+2. **主页 `/`**：任务卡片看板、点「新建任务」开始；选 mode（task / chat）
+3. **task 详情页**：左 action 时间线 + 中 artifact 预览 + 右事件流；顶部「再聊聊 / 通过」按钮；「推进」按钮开 dialog 选下一个 action + 写指令（可勾「新启 Agent」/ 切模型）
+4. **chat 详情页**：底部输入框发消息自动启 agent；running 时可「停止」
+5. 不想要的任务可手动归档 / 删除；终态 7 天没动自动归档
 
 ---
 
-## 项目结构（V0.5.1）
+## 项目结构
 
 ```
 fe-ai-flow/
 ├── src/
 │   ├── app/
-│   │   ├── layout.tsx                       # 强制 dark + Providers + Toaster + 顶部导航
-│   │   ├── page.tsx                         # 主页：任务卡片看板（plan / chat 共用）
-│   │   ├── globals.css                      # Tailwind 4 + shadcn oklch 变量
-│   │   ├── settings/page.tsx                # 4 张 Card：API key / 默认模型 / 仓库 / MCP servers
-│   │   ├── tasks/[id]/page.tsx              # 任务详情、按 task.mode 渲染（plan workflow / chat 整页）
+│   │   ├── page.tsx                         # 主页：任务卡片看板（task / chat 共用）
+│   │   ├── settings/page.tsx                # 设置：API key / 默认模型 / 仓库 / MCP（只读 Cursor 全局）
+│   │   ├── tasks/[id]/page.tsx              # 任务详情、按 task.mode 渲染（task 三栏 / chat 单栏）
 │   │   └── api/
-│   │       ├── models/route.ts              # POST：代理 Cursor.models.list
-│   │       ├── fs/*                          # GET：列目录 / 拿用户 home（FsPickerDialog 用）
-│   │       ├── tasks/route.ts               # GET 列表 / POST 新建（mode + workflowId + role + feishuStoryUrl）
-│   │       ├── tasks/[id]/route.ts          # GET / PATCH / DELETE
-│   │       ├── tasks/[id]/events/           # GET：events SSE 增量
-│   │       ├── tasks/[id]/start-workflow/   # POST：spawn plan workflow agent
-│   │       ├── tasks/[id]/watch-chat/       # GET：SSE 订阅（chat / plan 共用、replay + 增量）
-│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（V0.4 起兼具自动启 agent 职责）
-│   │       ├── tasks/[id]/phase-ack/        # POST：plan 用户 phase ack（approve / revise）
-│   │       ├── tasks/[id]/ask-reply/        # POST：ask_user 弹窗答复
-│   │       ├── tasks/[id]/wait-ack/         # GET：V0.3.5 shell long-poll 长连接、保活核心
-│   │       ├── tasks/[id]/resume-waiting/   # POST：手动「继续监听」走 Agent.resume
-│   │       ├── tasks/[id]/context-docs/     # POST / DELETE：任务上下文文档面板
-│   │       └── mcp/chat-tool/route.ts       # 本地 HTTP MCP server、暴露 wait_for_user / ask_user
+│   │       ├── tasks/route.ts               # GET 列表 / POST 新建
+│   │       ├── tasks/[id]/advance/          # POST：task 模式推进下一个 action
+│   │       ├── tasks/[id]/action-ack/       # POST：action ack（approve / revise）
+│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（兼自动启 agent）
+│   │       ├── tasks/[id]/wait-ack/         # GET：shell long-poll 长连接、保活核心
+│   │       ├── tasks/[id]/stop/             # POST：停止当前 Run（task / chat 通用）
+│   │       └── cursor-mcp/                  # GET：原样读 ~/.cursor/mcp.json + health 探测
 │   ├── components/
-│   │   ├── providers.tsx                    # next-themes 强制 dark + DialogProvider
-│   │   ├── ui/                              # shadcn/ui base-nova 组件 + LoadingState / EmptyHint / ChoiceButton
-│   │   ├── settings/                        # 4 张设置 Card
-│   │   └── tasks/                           # 任务卡片 / 新建对话框 / 事件流 / artifact 面板 / phase 进度 / chat 视图 / ask_user 弹窗 / context-docs 面板 / approve-phase-dialog（V0.5：phase ack 高级选项、含模型 / fork toggle）
-│   ├── hooks/
-│   │   ├── use-dialog.tsx                   # 全局 confirm / prompt（取代 window.alert 等）
-│   │   ├── use-settings.ts                  # localStorage 设置读写
-│   │   └── use-task-watch.ts                # SSE 订阅 hook（plan / chat 共用）
+│   │   ├── ui/                              # shadcn/ui base-nova + LoadingState / EmptyHint / ChoiceButton / MultiSelect
+│   │   ├── settings/                        # 设置 Card（含 mcp-card 只读展示 + 健康探测）
+│   │   └── tasks/                           # 任务卡片 / 新建对话框 / 事件流 / artifact 面板 / action 时间线 / chat 视图 / 推进 dialog / 再聊聊 dialog
+│   ├── hooks/                               # use-dialog / use-settings / use-task-watch（SSE）/ use-mcp-health / use-image-attach
 │   └── lib/
-│       ├── types.ts                         # Task / TaskMode / TaskRole / PhaseId / WorkflowId / WORKFLOWS 注册表（V0.5：PhaseId 加 review、V0.5.1：Task 加 model 字段）
-│       ├── local-store.ts                   # localStorage 读写 + 默认值（DEFAULT_SETTINGS / DEFAULT_MCP_JSON 单一来源）
-│       ├── task-store.ts                    # 客户端：fetchTasks / createTask / startWorkflow / submitPhaseAck / submitAskReply / watchChatStream
-│       ├── task-display.ts                  # 任务展示常量（PHASE_LABEL / STATUS_LABEL / STATUS_VARIANT / formatRelative）单一来源
-│       ├── run-args.ts                      # 客户端启动 SDK run 参数准备（V0.5.1：优先 task.model、回退 settings.defaultModel）
+│       ├── types.ts                         # V0.6 schema（Task / ActionRecord / RepoStatus / RunStatus / TaskRole）
+│       ├── task-store.ts                    # 客户端 fetch + 错误归一（handleJson）
+│       ├── task-display.ts                  # 展示常量单一来源（STATUS_LABEL / formatRelative 等）
+│       ├── run-args.ts                      # 客户端 SDK run 参数准备（prepareRunArgs）
+│       ├── branch-template.ts               # 分支名模板渲染
 │       └── server/
-│           ├── task-fs.ts                   # 服务端：data/tasks/ 持久化（meta.json + events.jsonl + artifacts/、含原子写 + 任务级互斥锁 + V0.5.1 持久化 task.model）
-│           ├── plan-runner.ts               # plan workflow runner：单 SDK Run 跑 3 phase + super-prompt 注入 task.role + V0.5 fork 模式
-│           ├── chat-runner.ts               # chat 模式 agent 生命周期 + V0.4 firstMessage 注入 + publish/subscribe（plan 共用）
-│           ├── chat-mcp.ts                  # 本地 HTTP MCP（wait_for_user / ask_user、V0.3.5 race fix + grace 60s）
-│           ├── context-docs-prompt.ts      # contextDocs prompt 渲染 helper（V0.4 抽出、plan / chat 共用）
-│           └── skills-loader.ts             # 自定义 SKILL.md 加载器
+│           ├── task-runner.ts               # V0.6 统一 runner（task 模式、单 SDK Run + action 推进）
+│           ├── chat-runner.ts               # chat 模式 agent 生命周期
+│           ├── chat-mcp.ts                  # 本地 HTTP MCP（wait_for_user / ask_user）
+│           ├── action-checks.ts             # action 后置确定性检查
+│           ├── gitlab-client.ts             # ship：server-side GitLab REST
+│           ├── cursor-config.ts             # 读 ~/.cursor 全局 MCP / rules 注入
+│           └── task-fs.ts                   # data/tasks/ 持久化（meta + events + actions/）
 ├── prompts/
-│   ├── phase-1-plan.md                      # Phase 1 prompt 模板（V0.3.4 起：context + plan 合并、V0.5 加「我的理解 vs 飞书原文」校验前移段）
-│   ├── phase-2-build.md                     # Phase 2 prompt 模板（编码实现 + 校验）
-│   └── phase-3-review.md                    # Phase 3 prompt 模板（V0.5 新增：git diff 结构化差值 + 4 类差异 + 交付信息）
-├── skills/                                  # fe-ai-flow 自带 skills（agent 按需 read、Anthropic Agent Skills 标准）
-│   ├── artifact-writer/SKILL.md             # V0.5.1：写 artifact 渐进式披露（write vs edit / 路径规则 / 排错）
-│   ├── chat-attachments/SKILL.md
-│   ├── chat-history-recovery/SKILL.md
-│   └── context-docs-handler/SKILL.md
+│   ├── _super.md                           # super-prompt 主模板（注入 7 种 action prompt + action history）
+│   ├── _shared.md                          # 跨 action 通用 artifact 写法 + 规则
+│   └── action-{plan,build,review,ship,test,learn}.md   # 各 action 特有约束（test/learn 是 V0.6.2+ 草稿）
+├── skills/                                  # 平台自带 skills（agent 按需 read）
+│   └── {artifact-writer,chat-attachments,chat-history-recovery,context-docs-handler}/SKILL.md
 ├── data/                                    # 任务持久化（git ignore）
 │   └── tasks/<taskId>/
-│       ├── meta.json                        # 任务元信息（mode / workflowId / role / model / phases 状态 / lastAgentId / ...）
+│       ├── meta.json                        # 元信息（mode / role / model / repoStatus / runStatus / actions[] / ...）
 │       ├── events.jsonl                     # 事件流（追加写、原子写防 race）
-│       ├── artifacts/                       # phase artifact
-│       │   ├── 01-plan.md
-│       │   ├── 02-build.md
-│       │   └── 03-review.md                 # V0.5 新增
-│       └── uploads/                         # chat 用户上传的图片附件
+│       ├── actions/<n>-<type>.md            # 每条 action 的 artifact
+│       └── uploads/                         # chat 上传的图片附件
 └── docs/
-    ├── HANDOFF.md                           # 给新对话 AI 的 onboarding 文档（必读）
-    ├── DESIGN.md                            # 关键设计决策
-    ├── ROADMAP.md                           # 路线图 + 已完成里程碑
-    ├── MULTI-ROLE.md                        # V0.4 多角色机制 + 扩 enum checklist
-    └── PRODUCT-COMPARISON.md                # 跟 Cursor IDE / Claude Code 横向对比
+    ├── HANDOFF.md                           # 接力第一文件（项目定位 + 当前架构快照 + 最近演进）
+    ├── CHANGELOG.md                         # 历史演进档案（时间倒序）
+    ├── ROADMAP.md                           # 路线图 + 质量保证蓝图
+    ├── MULTI-ROLE.md                        # 多角色机制 + 扩 role checklist
+    ├── PRODUCT-COMPARISON.md                # 跟 Cursor IDE / Claude Code / 四大质量库横向对比
+    ├── DESIGN.md                            # V0.2~V0.5 设计权衡（已 archived）
+    └── V0.6-REFACTOR.md                     # V0.6 重构设计意图（已 archived）
 ```
 
 ---
@@ -150,51 +146,40 @@ fe-ai-flow/
 | 类型 | 位置 | 说明 |
 |---|---|---|
 | Cursor API Key | localStorage | 不上传服务器、每用户自配 |
-| 默认模型 + 参数 | localStorage | `ModelSelection`（id + 参数数组）、跟 SDK schema 一致 |
-| 仓库列表 | localStorage | 默认空、走 `/api/fs/*` + `FsPickerDialog` 选目录 |
-| MCP servers | localStorage | JSON 编辑器、自由配；runtime 自动追加内置 `feAiFlowChat`（提供 `wait_for_user` / `ask_user` 工具） |
-| 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP（不需要 figma-mcp 的任务可关） |
-| Prompt 模板 | `prompts/phase-*.md` | 3 个 phase 各一份（plan / build / review）、用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |
-| 任务数据 | `data/tasks/<id>/` | meta.json + events.jsonl + artifacts/ 目录 |
+| 默认模型 + 参数 | localStorage | `ModelSelection`、跟 SDK schema 一致 |
+| 仓库列表 | localStorage | 走 `/api/fs/*` + `FsPickerDialog` 选目录、可多仓 |
+| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `feAiFlowChat`（提供 `wait_for_user` / `ask_user`） |
+| 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP |
+| Prompt 模板 | `prompts/action-*.md` + `_super.md` / `_shared.md` | 用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |
+| 任务数据 | `data/tasks/<id>/` | meta.json + events.jsonl + actions/ 目录 |
 
-### MCP 推荐配置（plan 模式效果取决于此）
+### 飞书 MCP（task 模式命脉、强校验）
 
-```json
-{
-  "mcpServers": {
-    "feishu-project-mcp": { "command": "...", "args": ["..."] },
-    "feishu-mcp": { "command": "...", "args": ["..."] }
-  }
-}
-```
+task 模式按 url 域名强校验这两个、漏配不让建：
 
-- `feishu-project-mcp`：plan phase 拉 story 详情 / 工作项字段 / 关联文档
-- `feishu-mcp`：拉飞书 wiki / docx 关联 PRD（story 通常只指向 wiki、详细需求正文在 wiki 里）
-
-没配也能跑、agent 会自己降级（如让用户手工补充上下文）。
+- `mcp.feishu.cn`：拉飞书 wiki / docx 关联 PRD（story 通常只指向 wiki、详细需求正文在 wiki 里）
+- `project.feishu.cn`：拉 story 详情 / 工作项字段 / 关联文档
 
 ---
 
 ## 设计哲学
 
-参见 [docs/DESIGN.md](./docs/DESIGN.md)：
-
-- **HITL 是底线**——所有真生产产品都没敢全自动、phase 边界强制人 ack
-- **一次 SDK Run 跑完全程**——3 phase 默认共享上下文、计费一次（实测比每 phase 起新 Run 省 ~75% 扣费）；ack 时可手动 fork 起新 agent（reviewer ≠ author 这种场景）
+- **HITL 是底线**——所有真生产产品都没敢全自动、action 边界强制人 ack
+- **单 SDK Run 跑完全程**——整 task 共享上下文、计费一次；ack 时可手动起新 Agent（reviewer ≠ author 这种场景）
 - **所有 LLM 调用打日志 + 产物落盘**——可观测、可回退、`data/tasks/` 全部可 diff
-- **能用确定性工具兜的、就不让 LLM 自己判断**——eslint / typecheck / JSON Schema 优先
-- **不是 multi-agent**——单 agent 跑全程（不是 Cognition 反对的「角色协作」、是 Anthropic 推荐的 prompt chaining）
-- **shell + curl 取代 MCP 轮转保活**——V0.3.5 实测根治 anti-loop（详见 `docs/HANDOFF.md` V0.3.5 段）
-- **角色驱动而非端驱动**——V0.4 引入 `task.role` 字段、同一 story 多端建多 task、agent 按角色挑相关部分（详见 `docs/MULTI-ROLE.md`）
+- **能用确定性工具兜的、就不让 LLM 自己判断**——eslint / typecheck / git hash / JSON Schema 优先（客观可证伪 predicate、不走字符串黑名单）
+- **不是 multi-agent**——单 agent 跑全程（不是 Cognition 反对的「角色协作」、是 Anthropic 推荐的 prompt chaining）；单 task 多 action 链合法
+- **角色驱动而非端驱动**——`task.role` 字段、同一 story 多端建多 task、agent 按角色挑相关部分（详见 `docs/MULTI-ROLE.md`）
+- **跟 Cursor 共用配置**——MCP / rules / skills 统一消费 Cursor 全局（`~/.cursor/`）+ 项目（repo `.cursor/`）、fe 只读不写
 
 ---
 
 ## 下一步
 
-- 优先：跑通真飞书 story → plan → build → review 全流程的端到端 demo（V0.5 / V0.5.1 / V0.5.2 联测）
-- 待启动：扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）
-- 待启动：phase 内部部分失败恢复（从某个 phase 续跑、不要从头）
-- 待启动：用户自定义 workflow（V0.2 写死 `feishu-story-impl`、未来支持多 workflow 注册）
-- 待启动：token / cost dashboard
+- 优先：跑通真飞书 story → plan → build → review → ship 全流程端到端 demo
+- `test` action：运行时验证（飞书验收用例 + 浏览器 QA、蓝图 + 待拍板矛盾见 `docs/ROADMAP.md`）
+- `learn` action：merged 后沉淀经验注入 AGENTS.md
+- 扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）
+- cross-action 一致性自检（门槛 5）/ token-cost dashboard
 
-详见 [docs/ROADMAP.md](./docs/ROADMAP.md)。
+详见 [docs/ROADMAP.md](./docs/ROADMAP.md) + [docs/HANDOFF.md](./docs/HANDOFF.md)（接力第一文件、必读）。

@@ -615,12 +615,8 @@ const checkActionPrerequisites = (
     case "plan":
       return { ok: true }; // 永远可
     case "build":
-      if (!lastCompletedOfType("plan")) {
-        return {
-          ok: false,
-          reason: "build 前需要至少 1 个已 approve 的 plan action。先推进 plan、再进 build。",
-        };
-      }
+      // V0.6.17：放开「build 必须先 plan」——小改 / 修 bug 直接 build、plan 是过度流程。
+      // 有 plan 时按 plan 工单走、无 plan 时按用户指令直接改（范围以指令为准、靠 review 兜底）。
       return { ok: true };
     case "review":
       if (!lastCompletedOfType("build")) {

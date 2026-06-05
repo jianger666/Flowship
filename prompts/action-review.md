@@ -14,9 +14,10 @@
 
 你**只产出信息**：不写新代码、不改业务文件、不调任何会改变仓库 / 飞书 / Git 状态的工具。发现 bug 也**不自己修**——分级写进 artifact、让用户拍板（回 build 修 / 接受 / 记 follow-up）。
 
-## 准入条件（V0.6 门槛 1、硬门槛）
+## 准入条件（V0.6.17：plan 可选）
 
-- 至少 1 个已通过的 plan action + 1 个已通过的 build action
+- 至少 1 个已通过的 build action（plan 不再是硬前置、V0.6.17 起 build 可无 plan 直接跑、review 也得能复核无 plan 的 build）
+- 有 plan → 当差值基准；无 plan → 基准退化为「累积意图（各轮 build 记录的用户指令 / 产品反馈）+ git diff + 飞书需求」、跳过「plan 范围 / 决策」那一侧的对照
 
 ## 本 action 的定位
 
@@ -64,6 +65,8 @@
 ### 1. 读 plan + 各轮 build artifact（拼「累积意图」基准）
 
 V0.6 多次 plan / build 场景下、用 `glob` 或 `shell ls` 看 `{{actionArtifactsDir}}/`、找出**最新 plan**（n 最大的 `<n>-plan.md`）和**所有 build 轮次**（每个 `<n>-build.md`、不只最新一份）、用 SDK 内置 `read` 读。
+
+> ⚠️ **无 plan 的 task（V0.6.17 直接 build）**：找不到 `<n>-plan.md` 时**不报错、不卡住**——差值基准退化为「累积意图（各轮 build 记录的用户指令 / 产品反馈）+ git diff + 飞书需求」。下面所有「对照 plan §X」的步骤**自动跳过 plan 那一侧**（plan 拍板口径复核 / 范围偏离 / 实现偏差 / 未完成 task 这几段无 plan 可比即整段省略）、只做「git diff × 飞书需求 × build 意图」对照 + §4 bug 复审（bug 复审不依赖 plan、照常做）。
 
 > ⚠️ **累积意图基准（V0.6.10）**：review 阶段一的对比基准**不是「初版 plan」、是「累积意图」= 最新 plan + 各轮 build artifact 记录的「用户指令 / 产品反馈 / ack 决策」**。
 > 原因：第二 / 三轮改 bug 的 build 本身就是合法「方案」——能追溯到用户在某轮 build 拍过的改动 = **已授权变更**（列出供知晓、不重复 ask_user）；只有「无据可依的跑偏」（plan 没写、哪轮 build 也没记用户说过）才是**真偏差**。
@@ -330,6 +333,7 @@ shell stdout 返回行解析：
 
 - `[ACTION_ACK approve]` → **立刻再调 `wait_for_user(task_id={{taskId}})`** 等下一 action 指令、**绝对不退出 Run、绝对不自动进入 ship**——下一个 action 类型由用户在 UI 选（典型路径是 review 通过后用户选 ship 提 MR、但 agent 不许预判）
 - `[ACTION_ACK revise]` + 后续 feedback → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句、如「为什么 §2 标红了？」「这处差异严重吗？」）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含「改回 plan」「修改 plan 描述」「补做 task N」「这条不算差异、删掉」等、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才动文件、动完后**用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核；带图先 read 图再分类。处理完再调一次 `wait_for_user`
+  - **特例·用户对 bug 表态（V0.6.17）**：若 feedback 是对「## bug 复审」里某条 🔴/🟡 的处理决定（「这个不用改」「二期再说」「这个本次修」）→ 复述确认后、把裁决追加到「## bug 复审 → ### 用户裁决」子段（**bug 本体保留**、别从表里删——bug 是事实、裁决是决定）、review 本身**不改代码**。后续 build 读 review 就知道哪些 bug 用户已否决、**不重复问**（决定链落 md）。
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
@@ -483,6 +487,14 @@ shell stdout 返回行解析：
 | `src/lib/export.ts:31` | `res.data.list` 未判空、接口返 null 会抛 | 加 `?? []` 兜底 |
 
 > 无 🟡 时写「无」。
+
+### 用户裁决（V0.6.17、ack 时用户对 bug 的处理决定、build 据此不重复问）
+
+> 初稿**不写本段**（用户还没表态）。用户 ack=revise 对某条 bug 表态「改 / 不改 / 延后」后、agent 复述确认、把裁决追加到这里（上面两张表里的 bug 本体**保留**、本段只记用户的决定）。
+> build 执行步骤 1.2 会扫本段、用户判「不改 / 延后」的 bug **不再重复问**——这就是「决定链落 md」。
+
+- 🔴 #1（`src/pages/users/list.tsx:64`）：用户判 **本次不改**（原因：先上线、二期再处理）
+- 🟡 #2（`src/lib/export.ts:31`）：用户判 **本次修**
 
 ## 修改记录
 

@@ -85,7 +85,7 @@ UI 卡片 / 详情页头部分两个 badge 显示。
 | Action | 状态 | 准入条件 | 后置 deterministic check |
 |---|---|---|---|
 | plan | ✅ 已实装 | 永远可 | artifact 存在 + 内容长度 >= 100 |
-| build | ✅ 已实装 | 至少 1 个 plan completed | `pnpm typecheck` + `pnpm lint` + git status 有改动 |
+| build | ✅ 已实装 | 永远可（V0.6.17 放开 plan 前置）| 无（V0.6.3 撤 build 后置检查、靠 review 兜底）|
 | review | ✅ 已实装 | 至少 1 个 build completed | 4 类差异段非空 + git hash 一致 |
 | ship | ✅ 已实装 | 至少 1 个 build + settings 配 GitLab Host + PAT | `task.mrs[]` 覆盖所有 repoPath（URL 非空） + 跳仓有原因 |
 | test | 🚧 V0.6.2 | 至少 1 个 build | （未实现） |
@@ -240,6 +240,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.17：放开 build 必须先 plan + build 读 review「决定链」（2026-06-05）
+
+**背景**：用户问流程灵活性——① 小改 / 修 bug 想跳过 plan 直接 build（当前被硬拦）；② review 提的 bug、build 要**知道**但解不解决归用户、且用户已否决的别重复问。
+
+- **Q3 放开 build gate**：`checkActionPrerequisites` + `inferDisabledReason` 去掉「build 必须先 completed plan」。`action-build.md` 加无 plan 分支：有 plan 按 plan 工单 / 无 plan 按用户指令圈范围（含糊先 ask_user）——准入 / 目标 / 输入文件 / 改动范围约束 / 执行步骤全分两路。
+- **Q2 build 读 review + 决定链落 md**：build 步骤 1.2 read 最近 review、把未解决 🔴/🟡 用 `ask_user` 问用户「本次修哪些」（**知道 ≠ 必须解决、归用户**）。**不重复问已否决**：扫两个来源——review artifact 新增「### 用户裁决」段（review ack 时用户对 bug 表态落这）+ 历史 build artifact 留痕（build 弹窗选跳过落这）、已否决的不再问、形成「决定链落 md」（换 agent 也读得到）。
+- **review 配套（放开 build 的冰山连带）**：`action-review.md` 准入 plan 改可选、§1 加「无 plan 时差值基准退化为累积意图 + git diff + 飞书、跳过 plan 侧对照」+ revise 加「用户对 bug 表态 → 落『### 用户裁决』段、bug 本体保留」。否则无 plan build 后 review 找不到 plan 会懵。
+- **自查闭环（/pua 蓝军）**：放开后 runner branch checkout 不依赖 plan（`planBranchesForBuild` 只吃 task 字段）；`checkBuild` 本就不存在（V0.6.3 撤）；`checkReview` 必备段只验总评 + 飞书对照 + bug 复审（不验 plan 段、无 plan review 不误判）。
+- 改动面：1 ts 函数 + 1 UI 函数 + 2 prompt（build / review）。`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.16：创建 task 强校验飞书两个 MCP（按 url 域名认）（2026-06-05）
 
 **背景**：飞书 MCP + 飞书项目 MCP 是「需求 → PR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）。以前漏配也能建 task、agent 跑起来才发现没工具、白跑一趟。用户要求建 task 必须先配齐。
@@ -249,17 +259,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **「缺失」两种都拦**：① mcp.json 没配；② 配了但本次创建在 MCP 区关了（进黑名单）。
 - **交互**：缺失 → 创建按钮置灰 + 底部红字「创建任务需先启用 飞书 MCP、飞书项目 MCP」。`mcpLoading`（首拉中）先按「不缺」、避免没拉回来闪红。
 - **实现**：`new-task-dialog` 加 `REQUIRED_FEISHU_MCP`（host→label）+ `missingFeishuMcp` memo（读 `useCursorMcp().servers`、`"url" in cfg` 守卫取 url、滤黑名单后匹域名）、`canSubmit` 接入。复用既有 `"url" in cfg` 访问模式（mcp-probe / mcp-oauth）。
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
-
-### V0.6.15：自由对话（chat）加「停止」按钮（2026-06-05）
-
-**背景**：chat 模式详情页 agent 回复中只有「AI 正在回」转圈、没法打断——长篇生成 / 跑偏时只能干等。正经 task 模式早有「停止」、chat 一直缺。
-
-- **根因**：chat agent 注册在 chat-runner 自己的 `runningChats`、不在 task-runner 的 `runningTasks`（两套 runtime state 刻意不混）；而 `/stop` route 只调 `cancelTaskRun`（查 runningTasks）→ 压根停不到 chat。
-- **后端**：chat-runner 加 `cancelChatRun(taskId)`（停 runningChats）；`/stop` route 改 `cancelTaskRun(id) || cancelChatRun(id)`（一个 task 只落其一、两个都试、命中即停）；停止 info 文案按 `task.mode` 分「对话」/「action」语境。
-- **前端**：`ChatView` 顶部 running 时「AI 正在回」旁加「停止」按钮 → `stopTask` → 清 streaming + onTaskUpdate。chat 打断是高频低风险（不改代码）、不弹二次确认、即点即停（区别于 task 模式 confirm）。
-- **复用既有 cancel 收尾**：`run.cancel()` 让 stream 正常结束、`run.wait()` 返回 cancelled → 走 chat-runner cancelled 分支提前 return（不进 catch、不误报 error、跟实战验证过的 task-runner 同构）；该分支顺手去掉原「已被取消」info（和 /stop 的「用户停止了对话」重复）。
 
 `pnpm typecheck` ✓ / `pnpm lint` ✓。
 

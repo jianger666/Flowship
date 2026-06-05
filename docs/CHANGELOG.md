@@ -15,6 +15,17 @@
 
 ---
 
+### V0.6.15：自由对话（chat）加「停止」按钮（2026-06-05）
+
+**背景**：chat 模式详情页 agent 回复中只有「AI 正在回」转圈、没法打断——长篇生成 / 跑偏时只能干等。正经 task 模式早有「停止」、chat 一直缺。
+
+- **根因**：chat agent 注册在 chat-runner 自己的 `runningChats`、不在 task-runner 的 `runningTasks`（两套 runtime state 刻意不混）；而 `/stop` route 只调 `cancelTaskRun`（查 runningTasks）→ 压根停不到 chat。
+- **后端**：chat-runner 加 `cancelChatRun(taskId)`（停 runningChats）；`/stop` route 改 `cancelTaskRun(id) || cancelChatRun(id)`（一个 task 只落其一、两个都试、命中即停）；停止 info 文案按 `task.mode` 分「对话」/「action」语境。
+- **前端**：`ChatView` 顶部 running 时「AI 正在回」旁加「停止」按钮 → `stopTask` → 清 streaming + onTaskUpdate。chat 打断是高频低风险（不改代码）、不弹二次确认、即点即停（区别于 task 模式 confirm）。
+- **复用既有 cancel 收尾**：`run.cancel()` 让 stream 正常结束、`run.wait()` 返回 cancelled → 走 chat-runner cancelled 分支提前 return（不进 catch、不误报 error、跟实战验证过的 task-runner 同构）；该分支顺手去掉原「已被取消」info（和 /stop 的「用户停止了对话」重复）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.14：ship 提测「合并后删源分支」改可选（默认保留）（2026-06-05）
 
 **背景**：ship 建 MR 写死 `remove_source_branch: true`、合并后源分支必删。用户痛点：合并后常要回看 / 续推该分支、删了得本地重新 push 一遍很麻烦——要求提测推进时能选、且默认保留（用户拍板）。

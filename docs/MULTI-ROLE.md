@@ -2,6 +2,8 @@
 
 > 沉淀 V0.4「按角色读 story」设计的来龙去脉、以及未来扩 enum 时的操作指南。
 
+> ⚠️ **部分实现细节已随 V0.6 演进**（以 `docs/HANDOFF.md` 为准）：① phase chain → task 容器 + action 历史（不再有「phase 序列」）；② `prompts/phase-*.md` → `prompts/action-*.md`；③ 单仓 `Task.repoPath` → 多仓 `Task.repoPaths`（V0.6.1）。下面的 **role 机制 / 扩 role checklist 仍有效**、只是文件名 / 字段名按上述映射读。
+
 ## 起因
 
 fe-ai-flow 一开始是前端项目（crm-web）的专属工具、整套 prompt 都是「前端 Vue / React 项目」假设。
@@ -36,7 +38,7 @@ story 6993079032（产品需求）
 - 同一条 story URL 填到前端 task 和后端 task（同事各自在本地建）
 - 前端同事 task：`role = "fe"`、`repoPath = crm-web`、agent 以前端视角扫仓库 / 出方案
 - 后端同事 task：未来 `role = "be"`、`repoPath = crm-server`、agent 以后端视角扫
-- workflow 仍是同一个 `feishu-story-impl`、phase 序列 `[plan, build]` 不变
+- workflow 仍是同一个 `feishu-story-impl`（V0.6 起 action 任意触发、不再有固定 phase 序列）
 
 **关键工程决定**：
 
@@ -47,7 +49,7 @@ story 6993079032（产品需求）
 | UI 暴露方式 | Select 显式选（即便只 fe 一个 option） | 用户预期「以后会有更多角色」、不藏掉 |
 | 角色文案 | `TASK_ROLE_LABEL` 单一来源 | 避免组件各自维护中文映射、漂移风险 |
 | harness 工具链 | 不存 task、agent 自己探测 | 看 `package.json` / `pom.xml` / `go.mod` 等识别 |
-| prompt 模板 | 单 `phase-1-plan.md`、内嵌 role 段 | 不拆 `prompts/roles/*.md` 子目录、只一个 role 时过度设计 |
+| prompt 模板 | 单 `action-plan.md`、内嵌 role 段 | 不拆 `prompts/roles/*.md` 子目录、只一个 role 时过度设计 |
 | MCP 装配 | 不按 role 区分、用现有任务级黑名单 | 角色多了再说 |
 
 ## 完整 role 枚举（未来扩展）
@@ -78,11 +80,11 @@ story 6993079032（产品需求）
 2. **`src/components/tasks/new-task-dialog.tsx`**
    - `ROLE_OPTIONS` 数组加 `"be"`（UI Select 自动出新 option）
 
-3. **`prompts/phase-1-plan.md`**
+3. **`prompts/action-plan.md`**
    - 「当前角色提示」段加 `role=be` 的描述块、说明后端视角是什么（关心接口设计 / DB / 业务规则）
    - 不需要拆新文件——同一 prompt 内按 role 分支即可（agent 看到 `{{role}}` 注入值后自己取对应段）
 
-4. **`prompts/phase-2-build.md`**
+4. **`prompts/action-build.md`**
    - 「严格约束」段补充：「按 role 选 build / typecheck / test 命令」（其实当前已经让 agent 自己 detect、可能不用改）
 
 5. **测试**
@@ -96,7 +98,7 @@ story 6993079032（产品需求）
 
 明确不做、避免过度设计：
 
-- ❌ **一个 task 多 repo**：`Task.repoPath` 保留 `string`、不改 `string[]`。「想跨 repo」= 拆多个 task
+- ⚠️ **一个 task 多 repo**：V0.4 设计是单仓（`Task.repoPath: string`）、**V0.6.1 已改多仓**（`Task.repoPaths: string[]`、ship 支持多仓 MR）。「一个 task 锁一个 role」仍成立、但仓库不再限单个
 - ❌ **一个 task 多 role**：同上
 - ❌ **role + repoType 校验**：前端 role 选了 Java 仓库不报错——大概率是用户配错、agent 自己扫 repo 也能识别异常、不挡用户路
 - ❌ **自动从 story 识别角色**：agent 看 story 自己挑 ferd / berd 节点细节、不要 fe-ai-flow 帮用户拆 task
@@ -111,4 +113,4 @@ story 6993079032（产品需求）
 ## 关联文档
 
 - 项目核心约束：`.cursor/rules/project-context.mdc`
-- V0.3.4 phase 合并 / V0.4 演进：`docs/HANDOFF.md`
+- 当前架构（task + action）：`docs/HANDOFF.md`「当前架构快照」段

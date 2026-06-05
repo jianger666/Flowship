@@ -82,7 +82,8 @@ const inferDisabledReason = (
     case "plan":
       return null;
     case "build":
-      return hasCompleted("plan") ? null : "需要先有一个已通过的 plan";
+      // V0.6.17：放开 plan 前置——无 plan 也能直接 build（按指令改、范围以指令为准）
+      return null;
     case "review":
       return hasCompleted("build") ? null : "需要先有一个已通过的 build";
     case "ship":
