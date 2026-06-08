@@ -15,6 +15,17 @@
 
 ---
 
+### V0.6.20：build 切错分支加固——checkout verify + 写代码前自检铁律（2026-06-05）
+
+**背景**：实战踩坑——某 task 的 build 因 race + dev 热重载（改 chat-mcp bump GLOBAL_KEY）打断、agent 异常路径下没收到「含 checkout 引导的 NEXT_ACTION」就开干、直接在 crm-web 当时停留的**别的需求 feature 分支**上改了代码（本 task 的分支根本没建）、污染了那个分支。events 全程零 checkout 痕迹。
+
+- **两层加固**：
+  1. **runner checkout shell 加 verify**（`task-runner.ts: planBranchesForBuild`）：idempotent checkout 后追加 `CURRENT=$(git rev-parse --abbrev-ref HEAD)` 比对目标分支名、不符 `exit 1` + 报错——防 checkout 静默失败 / 仍停旧分支。
+  2. **`action-build.md` 加独立硬铁律**：动任何代码前必须 `git rev-parse` 确认当前在本 task feature 分支、不符立刻停 `ask_user`——**即使 checkout 引导没注入 / 没跑成功也要自检**（覆盖异常路径、这是「代码改到别人分支」的最后一道闸）。
+- 根因属异常路径（race + 热重载）次生、非常规 build bug；但 agent「不在正确分支也不自我保护就开干」是真实隐患、值得这道确定性闸。
+- 数据修复（手动）：被污染 task 的 act_2 build 删除（meta.json + 2-build.md）、用户丢 crm-web 脏改动后重跑。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.19：修 build 阶段「NEXT_ACTION 静默丢失」race（挂起队列）（2026-06-05）
 
 **背景**：用户 approve plan 后很快推 build、build 阶段没执行就结束。根因：approve ack 刚 resolve 的 pendingMap entry 还在 60s grace window 里、advanceTask 调 `submitNextAction` 发 build 的 NEXT_ACTION 时命中这个**已 resolved 的旧 entry**、试图二次 resolve 失败但仍返 true → advanceTask 把 build 标 running、agent 却从没收到指令。

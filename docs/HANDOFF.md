@@ -240,6 +240,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.22：无限重连实测修复（errexit 坑）+ chat 回答截断兜底（2026-06-08）
+
+**背景**：V0.6.21 上线后真机测「离开 >30 分钟」——shell 在 30 分钟时退出码 28 断开、while **没重连**。实测推翻 V0.6.21「本地验证 ✓」结论（本地 mock ≠ 真机）。
+
+- **根因（实测锁定、非推测）**：terminal 显示单轮 KEEPALIVE 连续 30 个（30 分钟）零重连、`exit_code=28`（curl 超时码、**不是**强杀 137/143）、elapsed 正好 1800s。→ **SDK 跑 shell 默认带 `set -e` + `pipefail`**：首轮 `curl --max-time 1800` 超时（28）→ pipefail 让管道返回 28 → errexit 直接终止整个脚本 → while 永远进不了第二轮。**不是 SDK 有 30 分钟硬上限**（那会是 137）、idle-timeout 也没看错（KEEPALIVE 撑满 30 分钟没被空闲杀）。
+- **修复（`chat-mcp.ts: buildShellWaitGuidance`）**：脚本开头加 `set +e +o pipefail`、curl 行加 `|| true`——curl 首轮超时不再终止脚本、while 真正进下一轮重连。+ AI 兜底：异常 exit 段从「直接报告退出」改「先再调一次本 shell 兜底、连 2 次才报告」。
+- **⚠️ 待验证**：本次只证明 errexit 是 bug、**没测到「修了能跨 30 分钟」**（脚本第一轮就崩、没机会进第二轮）。退出码 28（非 137）强烈暗示能、但得改完再实测一轮 >30min 才算数。
+- **附带：chat 回答截断兜底**：另一个 chat task 踩坑——AI 把「一句概述」误当完整答案、提前调 wait_for_user、完整接口说明没发出去（用户「发我」才补全）。两层防：① `buildShellWaitGuidance` 给 chat 场景加「跑 shell 前自检：完整答案发了吗？没发现在补、跑 shell 前仍可 emit」近提示（纠正「调了 wait 本轮发不出」的错误认知）；② `chat-runner.ts` 标准动作强化「emit 完整答案、不是一句概述就停」+ 反模式警告。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.21：wait-ack 长连接「无限重连」——离开多久都不断（2026-06-05）
 
 **背景**：用户离开 >30 分钟（午饭 / 开会）、`curl --max-time 1800` 单轮到点断、agent 按引导 emit「连接断开请手动推进」退 run、回来发现 agent 死了得手动点「推进」。
@@ -252,17 +262,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **为什么不被 SDK 杀**（关键验证）：SDK shell 工具是 **idle-timeout（空闲/无输出超时）、不是总时长超时**（bundle 里 shell exec 类带 `idleTimeoutSeconds` 字段 + 现网单 curl 靠 60s KEEPALIVE 已能跑满 30 分钟为证）。while 每轮 curl 经 `tee` 持续透传 KEEPALIVE → 永不空闲 → 不被杀；最终 task 级 24h 硬超时（`TASK_HARD_TIMEOUT_MS`）兜底、即「无限」实际上限 24h。
 - 改动：`chat-mcp.ts: buildShellWaitGuidance`（curl→while）+ 文件头注释「不做断线重试」改「断线自动重连」；`_super.md` / `chat-runner.ts` 异常段同步；`wait-ack/route.ts` 连接建立即发首个 KEEPALIVE（把 while 每轮切换的无输出间隙从 ~60s 降到秒级、idle-timeout 额外保险）。
 - `pnpm typecheck` ✓ / `pnpm lint` ✓ / 本地循环逻辑验证 ✓（round1 KEEPALIVE 重连 → round2 ACTION_ACK 退出）。
-
-### V0.6.20：build 切错分支加固——checkout verify + 写代码前自检铁律（2026-06-05）
-
-**背景**：实战踩坑——某 task 的 build 因 race + dev 热重载（改 chat-mcp bump GLOBAL_KEY）打断、agent 异常路径下没收到「含 checkout 引导的 NEXT_ACTION」就开干、直接在 crm-web 当时停留的**别的需求 feature 分支**上改了代码（本 task 的分支根本没建）、污染了那个分支。events 全程零 checkout 痕迹。
-
-- **两层加固**：
-  1. **runner checkout shell 加 verify**（`task-runner.ts: planBranchesForBuild`）：idempotent checkout 后追加 `CURRENT=$(git rev-parse --abbrev-ref HEAD)` 比对目标分支名、不符 `exit 1` + 报错——防 checkout 静默失败 / 仍停旧分支。
-  2. **`action-build.md` 加独立硬铁律**：动任何代码前必须 `git rev-parse` 确认当前在本 task feature 分支、不符立刻停 `ask_user`——**即使 checkout 引导没注入 / 没跑成功也要自检**（覆盖异常路径、这是「代码改到别人分支」的最后一道闸）。
-- 根因属异常路径（race + 热重载）次生、非常规 build bug；但 agent「不在正确分支也不自我保护就开干」是真实隐患、值得这道确定性闸。
-- 数据修复（手动）：被污染 task 的 act_2 build 删除（meta.json + 2-build.md）、用户丢 crm-web 脏改动后重跑。
-- `pnpm typecheck` ✓ / `pnpm lint` ✓。
+- ⚠️ **V0.6.22 真机实测推翻**：本地 mock 验证 ≠ 真机。真机 30 分钟时 while **没重连**、退出码 28 断开——SDK 跑 shell 默认 `set -e`+`pipefail`、首轮 curl 超时（28）触发 errexit 直接终止整个脚本、while 从未进第二轮。上面「idle-timeout 不被杀」判断对（KEEPALIVE 撑满 30 分钟没被空闲杀）、但漏了 errexit 这道坎。修复见 V0.6.22。
 
 ---
 
