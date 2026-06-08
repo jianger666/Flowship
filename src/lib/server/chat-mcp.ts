@@ -37,10 +37,13 @@
  * - 不做 MCP session id 跨进程：本来 stateless 就够、但 wait_for_user 长阻塞必须 stateful 复用 transport
  * - 不做并发去重：同一个 task 同时只允许一个 pending entry、新 wait_for_user 顶旧的
  * - 不做 dev hot reload 状态恢复：开发时模块重载会丢 pendingMap、能接受
- * - **不做断线自动重试**：连接断了 agent 自然退 run、用户在 UI 上重新发起、
- *   后端起一个新 agent 接力（task 走 /advance→advanceTask、chat 走 /chat-reply→runChatSession、
- *   都是 Agent.create + send、靠任务事件日志恢复上下文、不是 resume 原会话）
- *   （避免 agent 反复重试踩 anti-loop、且每次起 agent +1 send 配额）
+ * - **断线自动重连（V0.6.21 起、实现「无限长连」）**：wait-ack 引导给的不是单条 curl、是 `while` 循环——
+ *   单轮 `--max-time 1800`（30 分钟）到点 / 网络抖断开 → 命令内自动同 token 重连下一轮（subscribeWaitAck
+ *   不消费 token、route abort 不清 pendingMap entry、所以同 token 能反复接上同一个 entry）、agent 不退 run、
+ *   用户离开多久都不会断。重连在 shell 命令内部（不是 agent 反复调 shell / wait_for_user）、不踩 anti-loop、不额外吃 send 配额。
+ * - **只有真失效才退 run**：[STALE]/[INVALID_TOKEN]（多为 dev hot reload / 服务重启丢 pendingMap）或整条命令异常 exit、
+ *   agent 退 run、用户在 UI 手动「推进」起新 agent 接力（task 走 /advance→advanceTask、chat 走 /chat-reply→runChatSession、
+ *   Agent.create + send、靠任务事件日志恢复上下文、不是 resume 原会话）
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -234,8 +237,12 @@ interface ChatMcpGlobalState {
   // V0.3.5 仍保留：token → taskId 映射、wait-ack 路由验 token 合法性用
   // 生命周期：wait_for_user/ask_user MCP 工具调用时写、submitXxx/cancelPending 清
   tokenToTask: Map<string, string>;
+  // V0.6.19：approve 后秒推下一 action 撞 grace 窗口时、NEXT_ACTION 暂存这里、
+  // 等 agent 重新进「待命态」(registerPendingEntry actionId 空) 再兑现、防 race 丢指令
+  pendingNextActions: Map<string, ToolReturn>;
 }
 
+// V9：2026-06-05 V0.6.19 加 pendingNextActions（approve 后秒推 action 的 grace race 修复、挂起队列）
 // V8：2026-05-28 V0.6.1 加 taskActionHandlers（submit_mr / set_feishu_testers）
 // V7：2026-05-27 V0.6 字段重命名（phase → actionId / artifact → artifactPath / 新增 next_action kind）
 // V6：2026-05-15 删 pendingFirstMessage（chat 自由化首条改进 prompt 注入、不走队列）
@@ -243,7 +250,7 @@ interface ChatMcpGlobalState {
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
 // → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV8__";
+const GLOBAL_KEY = "__feAiFlowChatStateV9__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -256,6 +263,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       taskActionHandlers: new Map(),
       sessionTransports: new Map(),
       tokenToTask: new Map(),
+      pendingNextActions: new Map(),
     };
   }
   return g[GLOBAL_KEY];
@@ -264,6 +272,9 @@ const getGlobalState = (): ChatMcpGlobalState => {
 // 进程级 pending 表：任务 id → pending entry
 // 同一个 task 同时只允许一个 entry（新来的顶旧的）
 const pendingMap = getGlobalState().pendingMap;
+
+// V0.6.19：挂起的 NEXT_ACTION 队列（approve 后秒推 action 撞 grace race 的暂存、见 submitNextAction / registerPendingEntry）
+const pendingNextActions = getGlobalState().pendingNextActions;
 
 // 「这个 task 当前是否处在等待用户的状态」
 // wait_for_user / ask_user MCP 工具进来时标 true、submitXxx / cancelPending 清
@@ -440,6 +451,20 @@ const registerPendingEntry = (
     resolved: false,
   };
   pendingMap.set(taskId, entry);
+  // V0.6.19：兑现挂起的 NEXT_ACTION。
+  // 仅「待命态」(actionId 空、即 agent ack 完正等下一 action 指令) 才兑现——等某 action ack 态
+  // (actionId 有值) 不该被 NEXT_ACTION 顶。
+  // 场景：用户 ack 后秒推下一 action 时 NEXT_ACTION 撞 grace 入了队、现在 agent 真正进待命态、立即交付。
+  if (!opts.actionId) {
+    const queued = pendingNextActions.get(taskId);
+    if (queued) {
+      pendingNextActions.delete(taskId);
+      console.log(
+        `[chat-mcp] registerPendingEntry: task=${taskId} 兑现挂起的 NEXT_ACTION（type=${queued.nextActionType} n=${queued.nextN}）`,
+      );
+      finalizeEntry(taskId, entry, queued);
+    }
+  }
   return entry;
 };
 
@@ -691,16 +716,24 @@ const buildShellWaitGuidance = (
   return [
     `[SHELL_WAIT_GUIDE token=${token}]`,
     "",
-    "## 下一步只许做一件事：调 `shell` 工具跑这条 curl",
+    "## 下一步只许做一件事：调 `shell` 工具跑这条命令（内置无限重连、调一次就够）",
     "",
     "```",
-    `curl -sN --max-time 1800 "${url}"`,
+    "WAIT_ACK_FILE=$(mktemp 2>/dev/null || echo \"/tmp/fe_ai_waitack_$$\")",
+    "while true; do",
+    `  curl -sN --max-time 1800 "${url}" | tee "$WAIT_ACK_FILE"`,
+    "  # 拿到任一终态行就退出；否则（30 分钟到点 / 只有 KEEPALIVE / 网络抖）自动重连",
+    "  grep -qE '\\[(NEXT_ACTION|ACTION_ACK|USER_REPLY|ASK_USER_REPLY|CANCELLED|STALE|INVALID_TOKEN|TASK_DONE|TASK_ABANDONED|INTERNAL_ERROR)' \"$WAIT_ACK_FILE\" && break",
+    "  sleep 1",
+    "done",
+    "rm -f \"$WAIT_ACK_FILE\"",
     "```",
     "",
     "参数说明：",
-    "  - `-s`：静默、不出进度条",
-    "  - `-N`：不缓冲、服务端 chunked write 一来就立刻出 stdout",
-    "  - `--max-time 1800`：单次最长 30 分钟（实际服务端每 60 秒发一次 `[KEEPALIVE ts=...]` 心跳行维持连接、用户操作时立刻给结果并断开）",
+    "  - `-s` 静默、`-N` 不缓冲（服务端 chunked 一来就出 stdout）",
+    "  - `--max-time 1800`：**单轮** curl 最长 30 分钟；到点没结果 while 循环自动重连下一轮、**所以用户离开多久都不会断**",
+    "  - `tee`：curl 输出实时透传到 stdout（你持续看到 `[KEEPALIVE ts=...]` 心跳）、同时存文件给 grep 判断有没有终态行",
+    "  - **这条命令内置无限重连**：只管调一次 `shell` 跑它、它会一直挂到拿终态行才退出——**绝不要**自己写循环 / 重复调 shell / 调 wait_for_user 重试",
     "",
     "## stdout 解读规则（**必背、决定你下一步动作**）",
     "",
@@ -716,7 +749,7 @@ const buildShellWaitGuidance = (
     "",
     "## 钢铁纪律（5 分钟 / 10 分钟 / 20 分钟没新行 ≠ shell 卡住）",
     "",
-    "shell + curl 可能要等用户 0 秒到 30 分钟、任何长度都正常。**等待期间你只看到 KEEPALIVE 行不断追加**、这是设计预期、不是 bug。",
+    "shell + curl 可能要等用户 0 秒到**几小时**（命令内置无限重连、单轮 30 分钟到点自动换下一轮）、任何长度都正常。**等待期间你只看到 KEEPALIVE 行不断追加**（重连时新一轮 KEEPALIVE 从头开始、也正常）、这是设计预期、不是 bug。",
     "",
     "**绝对禁止的动作**（看到 KEEPALIVE 累积时尤其要克制）：",
     "  - ❌ 调 read 读 cursor 内部 terminal 文件、查 shell 进程状态",
@@ -729,14 +762,12 @@ const buildShellWaitGuidance = (
     `## 这次 wait 的目的`,
     contextLine,
     "",
-    "## 异常处理（重要！）",
+    "## 异常处理（命令已内置无限重连、几乎不用你管）",
     "",
-    "如果 curl exit code 非 0（连接断 / 网络错 / 服务重启 / `--max-time` 到点）：",
-    "",
-    "  - **不要重新调 shell 重试** —— anti-loop 风险、且重试不能恢复连接",
-    "  - **不要重新调 wait_for_user / ask_user** —— 会被服务端顶替成 stale",
-    "  - **直接 emit 一条简短 assistant_message** 说「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、然后自然结束 run",
-    "  - UI 已经监测到连接断、用户会手动点「推进」复活——后端会起一个 agent 接着推进（带任务事件日志恢复上下文）、你这个 run 自然退出即可、不用自救",
+    "  - 单轮 curl 30 分钟到点断开、while 循环会自动发起下一轮——**这是设计预期**、stdout 上 KEEPALIVE 会重新开始、什么都不用做",
+    "  - **唯一的正常退出**：grep 命中终态行后整条命令 exit、按上面「stdout 解读规则」对最后那行行动",
+    "  - **绝不要**自己重复调 shell / 重新调 wait_for_user / ask_user —— 重连已经在命令里了、你再插手只会被服务端顶替成 stale",
+    "  - **极罕见**：整条命令异常 exit（如 mktemp 不可用）→ emit 一条简短 assistant_message「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、然后自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
     "",
     "## 调用礼仪",
     "",
@@ -816,7 +847,10 @@ const buildMcpServer = (): McpServer => {
 
       // 仅当「之前不在等待」时才通知 runner 切 task.runStatus = awaiting_user
       // （registerPendingEntry 顶替旧 entry 时 finalizeEntry 会清 waitingTasks、所以这里能再 add）
-      if (!waitingTasks.has(task_id)) {
+      // V0.6.19：若 registerPendingEntry 刚兑现了挂起的 NEXT_ACTION（entry 已 resolved）、
+      // agent 马上要跑下一 action、不是真在等用户 → 跳过 awaiting_user notify、
+      // 否则会把 advanceTask 刚设的 running 错切回 awaiting_user（build 全程显示成「等待用户」）。
+      if (!entry.resolved && !waitingTasks.has(task_id)) {
         waitingTasks.add(task_id);
         await safeNotifyAwaiting(task_id, {
           actionId: action_id,
@@ -1430,14 +1464,7 @@ export const submitNextAction = (
   imagePaths?: string[],
   attachmentPaths?: string[],
 ): boolean => {
-  const entry = pendingMap.get(taskId);
-  if (!entry) {
-    console.warn(
-      `[chat-mcp] submitNextAction 没找到 pending task=${taskId} type=${nextAction.type}`,
-    );
-    return false;
-  }
-  finalizeEntry(taskId, entry, {
+  const payload: ToolReturn = {
     kind: "next_action",
     text: userPrompt,
     nextActionId: nextAction.actionId,
@@ -1447,11 +1474,32 @@ export const submitNextAction = (
     imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
     attachmentPaths:
       attachmentPaths && attachmentPaths.length > 0 ? attachmentPaths : undefined,
-  });
-  console.log(
-    `[chat-mcp] submitNextAction 成功 task=${taskId} actionId=${nextAction.actionId} type=${nextAction.type} n=${nextAction.n}`,
+  };
+  const entry = pendingMap.get(taskId);
+  // 1) fresh 待命态 entry（存在且未 resolved）→ 直接交付
+  if (entry && !entry.resolved) {
+    finalizeEntry(taskId, entry, payload);
+    console.log(
+      `[chat-mcp] submitNextAction 直达 task=${taskId} actionId=${nextAction.actionId} type=${nextAction.type} n=${nextAction.n}`,
+    );
+    return true;
+  }
+  // 2) entry 存在但已 resolved = 上一个 ack 后的 60s grace 残留：agent 还活着、刚 ack 完正要重新
+  //    进待命态（race：用户 ack 后秒推下一 action）→ 入队、等 registerPendingEntry 进待命态时兑现。
+  //    直接 finalizeEntry 会撞 `if(entry.resolved) return` 被静默吞掉（这就是 V0.6.19 修的 race）。
+  if (entry && entry.resolved) {
+    pendingNextActions.set(taskId, payload);
+    console.log(
+      `[chat-mcp] submitNextAction 入队 task=${taskId} actionId=${nextAction.actionId} type=${nextAction.type} n=${nextAction.n}（entry 处于 grace 期已 resolved、等 agent 进待命态兑现）`,
+    );
+    return true;
+  }
+  // 3) entry 完全不存在 = agent 不在（已死 / 未启动）→ 返回 false、让 advanceTask 降级 force-new-agent。
+  //    **不能入队**：没有活 agent 会来兑现、入队 = 永久卡住（保留原降级自愈逻辑）。
+  console.warn(
+    `[chat-mcp] submitNextAction 没找到 pending task=${taskId} type=${nextAction.type}、agent 不在、返回 false 让上层降级 force-new`,
   );
-  return true;
+  return false;
 };
 
 /**
@@ -1501,6 +1549,8 @@ export const submitTaskTerminate = (
 export const cancelPending = (taskId: string): boolean => {
   // 任务取消时也清等待标记、避免下一次启动 task 时第一次调用被误判为旧 entry race
   waitingTasks.delete(taskId);
+  // V0.6.19：连同清挂起的 NEXT_ACTION、避免 task 取消后队列残留泄漏 / 下次复用串味
+  pendingNextActions.delete(taskId);
   const entry = pendingMap.get(taskId);
   if (!entry) return false;
   finalizeEntry(taskId, entry, {

@@ -818,6 +818,18 @@ const planBranchesForBuild = (
       `  git fetch origin "$BASE" && git checkout -b ${name} "origin/$BASE"`,
     );
     lines.push("fi");
+    // V0.6.20 防御：checkout 后强制 verify 当前分支 == 目标分支。
+    //   防 checkout 静默失败 / 仍停在别的 task 分支上、agent 继续在错分支改代码（曾踩坑：
+    //   agent 没切分支直接在别的需求 feature 分支上改、污染了那个分支）。
+    lines.push("# 防御：确认确实切到目标分支（不对就停、绝不在错分支改代码）");
+    lines.push("CURRENT=$(git rev-parse --abbrev-ref HEAD)");
+    lines.push(`if [ "$CURRENT" != ${JSON.stringify(name)} ]; then`);
+    lines.push(
+      `  echo "[error] 当前分支 $CURRENT != 目标分支 ${name}、停止 build（不要在错分支改代码、调 wait_for_user 报告用户）"`,
+    );
+    lines.push("  exit 1");
+    lines.push("fi");
+    lines.push(`echo "[ok] 已在目标分支 ${name}"`);
     lines.push("```");
     lines.push("");
   }

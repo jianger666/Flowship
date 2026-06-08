@@ -240,24 +240,29 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.6.18：角色加「自适应」+ Label 必填星号封装（2026-06-05）
+### V0.6.21：wait-ack 长连接「无限重连」——离开多久都不断（2026-06-05）
 
-**背景**：① 角色硬二选一（fe/be）、全栈仓 / 不确定时不好归类；② 角色虽必填但 UI 漏星号、必填逻辑跟星号 UI 脱节（用户指出角色 select 没星号）。
+**背景**：用户离开 >30 分钟（午饭 / 开会）、`curl --max-time 1800` 单轮到点断、agent 按引导 emit「连接断开请手动推进」退 run、回来发现 agent 死了得手动点「推进」。
 
-- **角色加 `adaptive`（自适应）**：`TaskRole = "fe" | "be" | "adaptive"`、label「自适应」。选它 = 不锁端、agent 按仓库技术栈（`package.json`=前端 / `pom.xml`=Java 后端 / `go.mod`=Go 后端）+ story 自己定位视角、判不准 `ask_user`。改 `types` + new/edit dialog `ROLE_OPTIONS` + `route.sanitizeRole` 白名单 + `_super.md`/`action-plan.md` 加 role=adaptive 分支引导。**不做默认选中**（保持三选一主动选）。
-- **Label 必填星号封装**：`label.tsx` 加 `required` prop、必填字段末尾统一渲染红星号——「必填校验」和「星号 UI」单一来源、调用方只传 `required` 不再各自手写 `<span>*</span>`。清原不一致：角色漏星号→补、类型纯文本 `*`→红星号、标题/仓库/飞书各自手写 span→统一走 required；task 必填有星号、chat 选填无（`required={mode==="task"}`）。new + edit dialog 都规范。
+- **方案**：wait_for_user/ask_user 引导给的「单条 curl」改「`while` 循环」——单轮 30 分钟到点 / 网络抖断 → 命令内自动**同 token 重连**下一轮、拿到终态行才退出。用户离开多久都不会断。
+- **零记忆依赖**（关键）：重连写进 guide 每次返回的命令本身（最近的提示词）、不是教 agent「记得超时后重连」（放 system prompt 离得远会忘）——agent 只做它一直做的「拿 guide → 跑命令」、循环在 shell 内部。
+- **代码基础本就支持**：`subscribeWaitAck` 不消费 token、route abort 不清 pendingMap entry → 同 token 能反复接上同一个 entry（只要没 ack / 没停 / 服务没重启）。
+- **keepalive 可见性**：用 `tee` 实时透传 curl 输出到 stdout（agent 持续看到 KEEPALIVE）+ 存文件给 grep 判终态行——避免 `OUT=$(curl)` 全捕获让 agent 30 分钟看不到 stdout 触发「shell 卡了」bias。
+- **退出**：`grep -qE` 命中终态行（NEXT_ACTION/ACTION_ACK/USER_REPLY/.../INVALID_TOKEN）才 break；只有 [STALE]/[INVALID_TOKEN]（dev 热重载 / 服务重启丢 pendingMap）或命令异常 exit 才退 run。
+- **为什么不被 SDK 杀**（关键验证）：SDK shell 工具是 **idle-timeout（空闲/无输出超时）、不是总时长超时**（bundle 里 shell exec 类带 `idleTimeoutSeconds` 字段 + 现网单 curl 靠 60s KEEPALIVE 已能跑满 30 分钟为证）。while 每轮 curl 经 `tee` 持续透传 KEEPALIVE → 永不空闲 → 不被杀；最终 task 级 24h 硬超时（`TASK_HARD_TIMEOUT_MS`）兜底、即「无限」实际上限 24h。
+- 改动：`chat-mcp.ts: buildShellWaitGuidance`（curl→while）+ 文件头注释「不做断线重试」改「断线自动重连」；`_super.md` / `chat-runner.ts` 异常段同步；`wait-ack/route.ts` 连接建立即发首个 KEEPALIVE（把 while 每轮切换的无输出间隙从 ~60s 降到秒级、idle-timeout 额外保险）。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓ / 本地循环逻辑验证 ✓（round1 KEEPALIVE 重连 → round2 ACTION_ACK 退出）。
 
-`pnpm typecheck` ✓ / `pnpm lint` ✓。
+### V0.6.20：build 切错分支加固——checkout verify + 写代码前自检铁律（2026-06-05）
 
-### V0.6.17：放开 build 必须先 plan + build 读 review「决定链」（2026-06-05）
+**背景**：实战踩坑——某 task 的 build 因 race + dev 热重载（改 chat-mcp bump GLOBAL_KEY）打断、agent 异常路径下没收到「含 checkout 引导的 NEXT_ACTION」就开干、直接在 crm-web 当时停留的**别的需求 feature 分支**上改了代码（本 task 的分支根本没建）、污染了那个分支。events 全程零 checkout 痕迹。
 
-**背景**：用户问流程灵活性——① 小改 / 修 bug 想跳过 plan 直接 build（当前被硬拦）；② review 提的 bug、build 要**知道**但解不解决归用户、且用户已否决的别重复问。
-
-- **Q3 放开 build gate**：`checkActionPrerequisites` + `inferDisabledReason` 去掉「build 必须先 completed plan」。`action-build.md` 加无 plan 分支：有 plan 按 plan 工单 / 无 plan 按用户指令圈范围（含糊先 ask_user）——准入 / 目标 / 输入文件 / 改动范围约束 / 执行步骤全分两路。
-- **Q2 build 读 review + 决定链落 md**：build 步骤 1.2 read 最近 review、把未解决 🔴/🟡 用 `ask_user` 问用户「本次修哪些」（**知道 ≠ 必须解决、归用户**）。**不重复问已否决**：扫两个来源——review artifact 新增「### 用户裁决」段（review ack 时用户对 bug 表态落这）+ 历史 build artifact 留痕（build 弹窗选跳过落这）、已否决的不再问、形成「决定链落 md」（换 agent 也读得到）。
-- **review 配套（放开 build 的冰山连带）**：`action-review.md` 准入 plan 改可选、§1 加「无 plan 时差值基准退化为累积意图 + git diff + 飞书、跳过 plan 侧对照」+ revise 加「用户对 bug 表态 → 落『### 用户裁决』段、bug 本体保留」。否则无 plan build 后 review 找不到 plan 会懵。
-- **自查闭环（/pua 蓝军）**：放开后 runner branch checkout 不依赖 plan（`planBranchesForBuild` 只吃 task 字段）；`checkBuild` 本就不存在（V0.6.3 撤）；`checkReview` 必备段只验总评 + 飞书对照 + bug 复审（不验 plan 段、无 plan review 不误判）。
-- 改动面：1 ts 函数 + 1 UI 函数 + 2 prompt（build / review）。`pnpm typecheck` ✓ / `pnpm lint` ✓。
+- **两层加固**：
+  1. **runner checkout shell 加 verify**（`task-runner.ts: planBranchesForBuild`）：idempotent checkout 后追加 `CURRENT=$(git rev-parse --abbrev-ref HEAD)` 比对目标分支名、不符 `exit 1` + 报错——防 checkout 静默失败 / 仍停旧分支。
+  2. **`action-build.md` 加独立硬铁律**：动任何代码前必须 `git rev-parse` 确认当前在本 task feature 分支、不符立刻停 `ask_user`——**即使 checkout 引导没注入 / 没跑成功也要自检**（覆盖异常路径、这是「代码改到别人分支」的最后一道闸）。
+- 根因属异常路径（race + 热重载）次生、非常规 build bug；但 agent「不在正确分支也不自我保护就开干」是真实隐患、值得这道确定性闸。
+- 数据修复（手动）：被污染 task 的 act_2 build 删除（meta.json + 2-build.md）、用户丢 crm-web 脏改动后重跑。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
 ---
 

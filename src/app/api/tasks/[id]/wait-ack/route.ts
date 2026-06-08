@@ -90,6 +90,16 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
         }
       };
 
+      // V0.6.21：连接建立立即发一个 keepalive——配合 agent 端 while-loop 重连：
+      // 下一轮 curl 一连上就有 stdout、把每轮切换的「无输出」间隙从 ~60s 降到秒级。
+      // SDK shell 是 idle-timeout（多久没输出才杀、非总时长）、持续输出才不被杀；
+      // 60s 间隔已实测够撑 30 分钟、但 while 多轮切换叠加 sleep、这一行是额外保险。
+      try {
+        controller.enqueue(encoder.encode(`[KEEPALIVE ts=${Date.now()}]\n`));
+      } catch {
+        // 已被 abort、忽略
+      }
+
       // chunked keepalive 心跳：每 60 秒一次普通文本行
       // 双重作用：
       //   1. 维持中间链路（nginx / ELB / 浏览器 proxy）connection、不被 idle 砍
