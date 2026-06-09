@@ -304,6 +304,14 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
       <DialogContent
         className="flex max-h-[80vh] w-full max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
         showCloseButton={false}
+        onKeyDown={(e) => {
+          // 弹窗级提交快捷键：Mac Cmd+Enter，Windows/Linux Ctrl+Enter。
+          // 不只绑 textarea，避免焦点在选项按钮上时快捷键失效。
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault();
+            void handleSubmit();
+          }
+        }}
       >
         <DialogHeader className="flex flex-row items-center gap-2 border-b px-5 py-4">
           <Sparkles className="size-4 text-amber-500" />
@@ -385,14 +393,6 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                         onChange={(e) =>
                           handleOtherChange(q.id, e.target.value)
                         }
-                        onKeyDown={(e) => {
-                          // Cmd/Ctrl + Enter 提交全部回答（默认快捷键、跟 revise-dialog 一致）
-                          // 未答完时 handleSubmit 自己短路 + toast 提示、不重复校验
-                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                            e.preventDefault();
-                            void handleSubmit();
-                          }
-                        }}
                         placeholder="输入你的回答…（或写「不清楚 / 你定」让 AI 按 default 走）"
                         rows={3}
                         className="resize-none text-sm"

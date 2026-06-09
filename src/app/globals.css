@@ -9,6 +9,10 @@
 @import "tw-animate-css";
 @plugin "@tailwindcss/typography";
 
+/* Tailwind 4 默认 dark variant 跟随系统 media。项目强制在 <html> 挂 .dark，
+ * 所以这里显式改成 class-based dark，避免浅色系统下出现黑底深字。 */
+@custom-variant dark (&:is(.dark *));
+
 /* shadcn 主题颜色 token、详见 https://ui.shadcn.com/docs/theming */
 @layer base {
   :root {

@@ -216,18 +216,9 @@ export const AdvanceDialog = ({
     () => task.removeSourceBranchOnMerge ?? false,
     [task.removeSourceBranchOnMerge],
   );
-  // V0.6.23：批次进度（最新 plan 拆的批次 + 已 build 哪些）——build 选批 UI + 默认勾选都基于它
+  // V0.6.23：批次进度（最新 plan 拆的批次 + 已 build 哪些）——build 选批 UI 基于它
   const batchProgress = useMemo(() => computeBatchProgress(task), [task]);
   const hasBatches = batchProgress.total > 0;
-  // build 选批默认值（id 串）：默认只勾「下一个未完成批次」(remaining[0]、用户拍板别全勾)、
-  // 全做完了(remaining 空)默认全勾允许整体返工。memo 成稳定字符串、内容不变时 SSE 推 task
-  // 引用变也不会重置用户已改的勾选（同 model list 那个坑）
-  const defaultBatchIdsKey = useMemo(() => {
-    if (batchProgress.remaining.length > 0) {
-      return batchProgress.remaining[0].id;
-    }
-    return batchProgress.batches.map((b) => b.id).join(",");
-  }, [batchProgress]);
 
   // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
@@ -283,8 +274,9 @@ export const AdvanceDialog = ({
     setInstruction("");
     setForceNewAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
-    // V0.6.23：build 选批默认勾选（未做批次优先 / 全做完则全勾）
-    setSelectedBatchIds(defaultBatchIdsKey ? defaultBatchIdsKey.split(",") : []);
+    // V0.6.23：build 批次默认不勾选，避免用户回头修 bug 时误提交到下一个未完成批次。
+    // 需要 build 哪些批次必须显式选择；canSubmit 会拦空选择。
+    setSelectedBatchIds([]);
     // V0.6.25：每次打开重置 ship override（默认不绕过、需用户主动勾）
     setShipOverrideOn(false);
     setShipOverrideReason("");
@@ -295,7 +287,7 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
-  }, [open, defaultActionType, defaultRemoveSourceBranch, defaultBatchIdsKey]);
+  }, [open, defaultActionType, defaultRemoveSourceBranch]);
 
   // V0.6.25 review：ship 时拉 server precheck（含工作区指纹比对）决定 override 区。
   // actionType 可能在 dialog 里被切到 ship、所以依赖它；非 ship 清空。
@@ -540,7 +532,7 @@ export const AdvanceDialog = ({
                 })}
               </div>
               <p className="text-[10px] text-muted-foreground">
-                默认勾下一个未完成批次、可手动多选 / 全选；每批以新 agent 上下文执行
+                默认不选中任何批次，请手动选择本次要做 / 返工的范围；每批以新 agent 上下文执行
               </p>
             </div>
           )}
