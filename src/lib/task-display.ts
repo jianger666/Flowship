@@ -81,6 +81,37 @@ export const ACTION_STATUS_VARIANT: Record<
 };
 
 // ===========================================
+// V0.6.25 CheckRun：校验状态文案（repo-card 配置提示 / artifact-panel check 结果共享单一源）
+// ===========================================
+//
+// command（passed/failed/timed_out/skipped）、repo（+not_configured）、run（passed/failed/not_configured）
+// 三级 status 值域语义一致、并集复用一张表、避免三处各写一份漂移。
+
+/** check 各级状态中文标签（三级 status 值域并集） */
+export const CHECK_STATUS_LABEL: Record<
+  "passed" | "failed" | "timed_out" | "skipped" | "not_configured",
+  string
+> = {
+  passed: "通过",
+  failed: "未通过",
+  timed_out: "超时",
+  skipped: "跳过",
+  not_configured: "未配置",
+};
+
+/** check 状态 → Badge 变体（通过用低调 secondary、不喧宾夺主；失败 / 超时红） */
+export const CHECK_STATUS_VARIANT: Record<
+  "passed" | "failed" | "timed_out" | "skipped" | "not_configured",
+  "default" | "secondary" | "destructive" | "outline"
+> = {
+  passed: "secondary",
+  failed: "destructive",
+  timed_out: "destructive",
+  skipped: "outline",
+  not_configured: "outline",
+};
+
+// ===========================================
 // Task 级仓库状态（V0.6 新维度、跟 MR 生命周期对齐）
 // ===========================================
 

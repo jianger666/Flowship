@@ -28,6 +28,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
+import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
@@ -472,6 +473,12 @@ export const ArtifactPanel = ({
       <div className="flex-1 overflow-y-auto">
         {mode === "content" ? (
           <div className="px-6 py-4">
+            {/* V0.6.25：build 的确定性检查结果（CheckRun 跑完的明细、正文上方先给红绿摘要） */}
+            {action.type === "build" && action.checkRun && (
+              <div className="mb-3">
+                <CheckRunSummaryCard checkRun={action.checkRun} />
+              </div>
+            )}
             {/* V0.6.24 (A')：plan 没拆批次时显式提示 + 兜底入口——防 AI 漏调 set_plan_batches、用户却不知情 */}
             {action.type === "plan" &&
               (!action.planBatches || action.planBatches.length === 0) && (

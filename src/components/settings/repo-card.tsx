@@ -26,10 +26,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { RepoCheckCommands } from "@/components/settings/repo-check-commands";
 import { useDialog } from "@/hooks/use-dialog";
 import { pathBasename } from "@/lib/path-utils";
 
-import type { RepoConfig } from "@/lib/types";
+import type { CheckCommand, RepoConfig } from "@/lib/types";
 
 interface RepoCardProps {
   repos: RepoConfig[];
@@ -96,6 +97,19 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onCommit(repos);
   };
 
+  // V0.6.25：改某仓 checkCommands（编辑器内部维护完整数组、这里只塞回对应 repo）
+  // commit 语义同上：文本输入中改草稿（false）、增删 / select / switch / 失焦落盘（true）
+  const setRepoCheckCommands = (
+    path: string,
+    next: CheckCommand[],
+    commit: boolean,
+  ) => {
+    const updated = repos.map((r) =>
+      r.path === path ? { ...r, checkCommands: next } : r,
+    );
+    (commit ? onCommit : onChange)(updated);
+  };
+
   // 删除是离散操作、直接落盘
   const removeRepo = (path: string) => {
     onCommit(repos.filter((r) => r.path !== path));
@@ -106,7 +120,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」弹服务端文件浏览器；每仓可配线上 / 测试 / dev 分支 + 分支模板覆盖、都选填
+          点「选择文件夹」添加仓库；每仓可配分支 + 检查命令（build 后自动跑）、均选填
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -186,6 +200,20 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                   title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
                   className="font-mono text-xs"
                 />
+
+                {/* 第四行：检查命令（build 后 runner 自动跑、per-repo 配、失败可挡提测） */}
+                <div className="grid gap-1.5">
+                  <span className="text-xs text-muted-foreground">
+                    检查命令（build 后自动跑）
+                  </span>
+                  <RepoCheckCommands
+                    commands={r.checkCommands ?? []}
+                    onChange={(next) =>
+                      setRepoCheckCommands(r.path, next, false)
+                    }
+                    onCommit={(next) => setRepoCheckCommands(r.path, next, true)}
+                  />
+                </div>
               </div>
             ))}
           </div>

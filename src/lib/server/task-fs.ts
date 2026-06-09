@@ -37,6 +37,8 @@ import type {
   ActionRecord,
   ActionType,
   ArtifactRevision,
+  CheckCommand,
+  CheckCommandKind,
   GitBranchInfo,
   MRRecord,
   ModelSelection,
@@ -51,6 +53,7 @@ import type {
   TaskRole,
   TaskSummary,
 } from "@/lib/types";
+import { CHECK_COMMAND_KIND_LABEL } from "@/lib/types";
 
 // ----------------- 路径常量 -----------------
 
@@ -125,6 +128,23 @@ export const getActionArtifactPath = (
   n: number,
   type: ActionType,
 ): string => path.join(getActionsDir(taskId), actionArtifactFilename(n, type));
+
+/**
+ * V0.6.25 CheckRun：单仓 check 完整日志的文件路径
+ * - 落 actions/.checks/<actionId>/<slug>.log（.checks 隐藏目录、不混进 artifact 列表）
+ * - 返绝对路径（写文件用）+ 相对路径（存进 CheckRepoResult.logPath、UI 按需读、防路径穿越）
+ * - slug 由调用方保证唯一（如 `<idx>-<repo 末段>`、防多仓末段同名互相覆盖）
+ */
+export const getCheckLogPaths = (
+  taskId: string,
+  actionId: string,
+  slug: string,
+): { absPath: string; relPath: string } => {
+  const safeAction = actionId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeSlug = slug.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const relPath = `${ACTIONS_DIR}/.checks/${safeAction}/${safeSlug}.log`;
+  return { absPath: path.join(taskDir(taskId), relPath), relPath };
+};
 
 // ----------------- 用户上传图片（V0.5.4、V0.6 不变）-----------------
 
@@ -267,6 +287,8 @@ interface TaskMetaV06 {
   repoDevBranches?: Record<string, string>;
   /** V0.6.7：per-repo 有效命名模板快照（build 渲染分支名用） */
   repoBranchTemplates?: Record<string, string>;
+  /** V0.6.25：per-repo check 命令快照（build 后 runner 跑、详见 types.ts Task.repoCheckCommands） */
+  repoCheckCommands?: Record<string, CheckCommand[]>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -558,6 +580,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     repoTestBranches: meta.repoTestBranches,
     repoDevBranches: meta.repoDevBranches,
     repoBranchTemplates: meta.repoBranchTemplates,
+    repoCheckCommands: meta.repoCheckCommands,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
@@ -823,6 +846,44 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && t) repoBranchTemplates[repo] = t;
   }
 
+  // V0.6.25：清洗 per-repo check 命令快照——key 限定 repoPaths、丢无效命令（name / cmd 空）、加长度/数量/超时硬上限
+  const repoCheckCommands: Record<string, CheckCommand[]> = {};
+  for (const [repo, cmds] of Object.entries(input.repoCheckCommands ?? {})) {
+    if (!allowedRepos.has(repo) || !Array.isArray(cmds)) continue;
+    const cleaned = cmds
+      .filter(
+        (c) =>
+          c &&
+          typeof c.name === "string" &&
+          c.name.trim() &&
+          typeof c.cmd === "string" &&
+          c.cmd.trim(),
+      )
+      .map((c) => ({
+        // 长度硬上限——这些命令会被 server 自动执行、防配置错误塞超长串（V0.6.25 review）
+        name: c.name.trim().slice(0, 80),
+        cmd: c.cmd.trim().slice(0, 2000),
+        // kind 归一：client 可能传非法值、落库前兜回 custom
+        // （否则 runner 取 CHECK_KIND_DEFAULT_TIMEOUT_MS[kind]=undefined → setTimeout(0) 秒杀命令）
+        kind:
+          typeof c.kind === "string" && c.kind in CHECK_COMMAND_KIND_LABEL
+            ? (c.kind as CheckCommandKind)
+            : "custom",
+        required: c.required !== false, // 缺省视为 required（阻塞 ship gate）
+        // timeoutMs clamp 到 [5s, 30min]——防配 0/负数秒杀命令、或超大值卡死 harness（V0.6.25 review）
+        ...(c.timeoutMs && c.timeoutMs > 0
+          ? {
+              timeoutMs: Math.min(
+                Math.max(Math.round(c.timeoutMs), 5_000),
+                1_800_000,
+              ),
+            }
+          : {}),
+      }))
+      .slice(0, 10); // 每仓最多 10 条命令、防刷爆 harness
+    if (cleaned.length > 0) repoCheckCommands[repo] = cleaned;
+  }
+
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -847,6 +908,10 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoBranchTemplates:
       Object.keys(repoBranchTemplates).length > 0
         ? repoBranchTemplates
+        : undefined,
+    repoCheckCommands:
+      Object.keys(repoCheckCommands).length > 0
+        ? repoCheckCommands
         : undefined,
     feishuStoryUrl: input.feishuStoryUrl,
     contextDocs: initialContextDocs,
@@ -1200,6 +1265,8 @@ export const patchAction = async (
       ActionRecord,
       | "status"
       | "postCheck"
+      | "checkRun"
+      | "checkOverride"
       | "sideEffects"
       | "agentModel"
       | "excluded"
@@ -1225,6 +1292,9 @@ export const patchAction = async (
       action.status === "running"
     ) {
       next.endedAt = now;
+    }
+    if (patch.status === "running") {
+      next.endedAt = null;
     }
     meta.actions = [
       ...meta.actions.slice(0, idx),

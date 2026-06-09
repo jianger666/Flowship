@@ -52,7 +52,7 @@ import {
   setTaskRunStatus,
   snapshotActionArtifact,
 } from "./task-fs";
-import { runActionCheck } from "./action-checks";
+import { runActionCheck, computeWorktreeFingerprint } from "./action-checks";
 import { buildSdkErrorMessage } from "./sdk-error";
 import {
   cancelPending,
@@ -95,8 +95,10 @@ import { filterHealthyMcp } from "./mcp-probe";
 import type {
   ActionRecord,
   ActionType,
+  CheckOverride,
   GitBranchInfo,
   RepoStatus,
+  ShipPrecheck,
   Task,
   TaskEvent,
 } from "@/lib/types";
@@ -485,6 +487,31 @@ const buildNextActionDirective = (input: {
   return lines.join("\n");
 };
 
+const buildRestartActionInstruction = (task: Task, action: ActionRecord): string => {
+  const lines: string[] = [
+    "[RESTART_ACTION]",
+    "当前 action 因 SDK/agent 断开或用户手动重启而重新拉起。不要追加新 action、不要从零重做，继续完成同一个 action。",
+    "",
+    "重启后的第一步：",
+    `- 先读取事件日志，确认断点和用户最近反馈：\`${getEventsLogPath(task.id)}\``,
+    "- 再检查相关仓库当前工作区，基于已存在的半成品继续推进。",
+  ];
+
+  if (action.artifactPath) {
+    lines.push(
+      `- 如果已有 artifact，请先读取并在同一路径继续覆盖更新：\`${getActionArtifactPath(task.id, action.n, action.type)}\``,
+    );
+  }
+  if (action.userInstruction.trim().length > 0) {
+    lines.push("", "原始用户指令：", action.userInstruction.trim());
+  }
+  lines.push(
+    "",
+    "完成后仍然调用 `wait_for_user({ task_id, action_id, artifact_path })`，等待用户对这个同一个 action approve / revise。",
+  );
+  return lines.join("\n");
+};
+
 // ----------------- 工具截断 -----------------
 
 const truncate = (s: string, max = 500): string =>
@@ -754,6 +781,106 @@ const checkActionPrerequisites = (
   }
 };
 
+/**
+ * V0.6.25 ship gate：最新 build 的 CheckRun 没过 / 没配 / 没运行时、要求 per-ship override（风险接受、不是偏好）
+ *
+ * - 只看「最新一个 completed build」的 checkRun（ship 提的就是它的产出）
+ * - checkRun.status === passed **且各仓工作区指纹没变** → 直接放行
+ * - 工作区指纹比对（V0.6.25 review）：check 后又改工作区 → 指纹不一致、即使 passed 也要 override（防「曾经检查过」≠「当前要 ship 的内容检查过」）
+ * - failed / not_configured / 没 checkRun（老 build / 异常）→ 必须带 override、且：
+ *   · override.buildActionId 等于这个 build（重 build = 新 build action id、旧 override 自动失效）
+ *   · checkRun 存在时 override.checkRunId 也要等于它（双保险：同 build 重跑过 check 也失效）
+ *   · override.reason 非空（审计：为什么明知没过还提测）
+ * - HITL 底线：这道门永远能被 override 越过、但必须留痕。
+ */
+const checkShipCheckGate = async (
+  task: Task,
+  override?: CheckOverride,
+): Promise<{ ok: true } | { ok: false; reason: string }> => {
+  const lastBuild = task.actions
+    .slice()
+    .reverse()
+    .find((a) => a.type === "build" && a.status === "completed");
+  // 没 completed build 的情况由 checkActionPrerequisites 先拦、这里兜底放行
+  if (!lastBuild) return { ok: true };
+
+  const cr = lastBuild.checkRun;
+  let worktreeChanged = false;
+  if (cr) {
+    for (const repo of cr.repos) {
+      if (!repo.worktreeFingerprint) continue;
+      const current = await computeWorktreeFingerprint(repo.repoPath);
+      if (current && current !== repo.worktreeFingerprint) {
+        worktreeChanged = true;
+        break;
+      }
+    }
+  }
+  if (cr && cr.status === "passed" && !worktreeChanged) return { ok: true };
+
+  const why = worktreeChanged
+    ? "检查通过后工作区又被改动（建议重新 build 检查、或确认风险后强制提测）"
+    : !cr
+      ? "未运行检查"
+      : cr.status === "failed"
+        ? "检查未通过"
+        : cr.status === "not_configured"
+          ? "有改动的仓没配检查命令"
+          : "检查未通过";
+  if (!override) {
+    return {
+      ok: false,
+      reason: `最新 build 的${why}、ship 被拦。如确认无碍、请在提测 dialog 勾「仍继续提测」并填写原因。`,
+    };
+  }
+  if (override.buildActionId !== lastBuild.id) {
+    return {
+      ok: false,
+      reason:
+        "提测确认已失效（绑定的不是最新 build、可能你又 build 过）、请重新勾选确认。",
+    };
+  }
+  if (cr && override.checkRunId !== cr.id) {
+    return {
+      ok: false,
+      reason: "提测确认已失效（检查已重跑）、请重新勾选确认。",
+    };
+  }
+  if (!override.reason.trim()) {
+    return { ok: false, reason: "提测确认必须填写原因。" };
+  }
+  return { ok: true };
+};
+
+/**
+ * V0.6.25 review：ship 前置预检（GET /api/tasks/[id]/ship-precheck 调）
+ *
+ * 复用 checkShipCheckGate（不带 override）跑一遍、把结论给 client 展示 override 区。
+ * gate 逻辑单一源在此、client 不自己用 checkRun.status 猜。⚠ 仅展示、/advance 仍会重算 gate。
+ */
+export const getShipPrecheck = async (task: Task): Promise<ShipPrecheck> => {
+  const lastBuild = task.actions
+    .slice()
+    .reverse()
+    .find((a) => a.type === "build" && a.status === "completed");
+  // 没 completed build：ship 准入会被 checkActionPrerequisites 拦、这里不涉及 override
+  if (!lastBuild) {
+    return {
+      needsOverride: false,
+      reason: "",
+      buildActionId: null,
+      checkRunId: null,
+    };
+  }
+  const gate = await checkShipCheckGate(task);
+  return {
+    needsOverride: !gate.ok,
+    reason: gate.ok ? "" : gate.reason,
+    buildActionId: lastBuild.id,
+    checkRunId: lastBuild.checkRun?.id ?? null,
+  };
+};
+
 // ----------------- branch checkout 挂接（build action 第一次跑前）-----------------
 
 /**
@@ -957,6 +1084,19 @@ export interface AdvanceTaskInput {
   gitToken?: string;
   // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=全做）
   requestedBatchIds?: string[];
+  // V0.6.25 CheckRun：ship 时的 gate override（最新 build 的 check 没过 / 没配、用户勾「仍继续」+ reason）
+  //   server 端校验它绑的是最新 build 的 checkRun（防重 build 后失效的 override 蒙混过关）、仅 ship 用
+  checkOverride?: CheckOverride;
+}
+
+export interface RestartCurrentActionInput {
+  task: Task;
+  actionId?: string;
+  apiKey: string;
+  model: ModelSelection;
+  username?: string;
+  gitHost?: string;
+  gitToken?: string;
 }
 
 /**
@@ -1043,6 +1183,7 @@ const advanceTaskInner = async (
     gitHost,
     gitToken,
     requestedBatchIds,
+    checkOverride,
   } = input;
 
   // V0.6.9 per-action fresh 默认：用户没手动勾「换新 agent」时、按 action 作用决定是否强起 fresh。
@@ -1055,6 +1196,15 @@ const advanceTaskInner = async (
   const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
+  }
+
+  // V0.6.25 ship gate：最新 build 的 CheckRun 没过 / 没配 / 工作区指纹变了时、要求 per-ship override（绑当前 checkRunId）
+  // async：要重算 git 指纹比对（防 check 后又改工作区）
+  if (actionType === "ship") {
+    const gate = await checkShipCheckGate(task, checkOverride);
+    if (!gate.ok) {
+      throw new Error(`准入条件不满足：${gate.reason}`);
+    }
   }
 
   // 2) appendAction：写一条新 ActionRecord、task.runStatus 自动转 running
@@ -1071,11 +1221,22 @@ const advanceTaskInner = async (
   const { task: taskAfterAppend, action } = created;
   publish(task.id, { kind: "task", task: taskAfterAppend });
   publish(task.id, { kind: "action", action });
+  // V0.6.25：ship gate override 落到本 ship action（审计：明知 check 没过仍提测的原因 + 绑定指纹）
+  if (actionType === "ship" && checkOverride) {
+    await patchAction(task.id, action.id, {
+      checkOverride: { ...checkOverride, createdAt: Date.now() },
+    });
+  }
   await writeEventAndPublish(task.id, {
     kind: "action_start",
     actionId: action.id,
+    // V0.6.25：ship override reason 拼进事件流——审计「明知 check 没过仍提测」的可见留痕（reviewer 要求至少进 task event）
     text: `开始 ${ACTION_LABEL[actionType]}（${action.type}）n=${action.n}${
       userInstruction.trim().length > 0 ? `\n用户指令：${truncate(userInstruction, 200)}` : ""
+    }${
+      actionType === "ship" && checkOverride
+        ? `\n⚠ 绕过检查提测、原因：${truncate(checkOverride.reason, 200)}`
+        : ""
     }`,
     meta: { type: actionType, n: action.n, artifactPath: action.artifactPath },
   });
@@ -1195,6 +1356,114 @@ const advanceTaskInner = async (
   return { action };
 };
 
+export const restartCurrentAction = async (
+  input: RestartCurrentActionInput,
+): Promise<{ action: ActionRecord }> =>
+  runAdvanceExclusive(input.task.id, () => restartCurrentActionInner(input));
+
+const restartCurrentActionInner = async (
+  input: RestartCurrentActionInput,
+): Promise<{ action: ActionRecord }> => {
+  const fresh = await getTask(input.task.id);
+  if (!fresh) throw new Error("task 不存在、无法重启当前 action");
+  if (fresh.mode === "chat") {
+    throw new Error("chat 模式不支持 action 重启，请继续发消息");
+  }
+  if (fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
+    throw new Error("任务已终结，不能重启当前 action");
+  }
+
+  const actionId = input.actionId ?? fresh.currentActionId;
+  if (!actionId) {
+    throw new Error("当前没有可重启的 action");
+  }
+  const action = fresh.actions.find((a) => a.id === actionId);
+  if (!action) {
+    throw new Error(`action ${actionId} 不存在、无法重启`);
+  }
+  if (action.status === "awaiting_ack") {
+    throw new Error("当前 action 已在等待确认，请用「再聊聊」继续修改");
+  }
+  if (action.status === "completed") {
+    throw new Error("已通过的 action 不能重启，请推进新的 action");
+  }
+
+  const existingRecord = runningTasks.get(fresh.id);
+  if (existingRecord) {
+    forkPendingTasks.add(fresh.id);
+    existingRecord.cancel();
+    const stopped = await waitForTaskToStop(fresh.id, 5000);
+    if (!stopped) {
+      console.warn(
+        `[task-runner] restartCurrentAction: task=${fresh.id} 旧 agent 没在 5s 内停、强清 runner state 继续`,
+      );
+      forceClearStaleRunnerState(fresh.id);
+    }
+  }
+  cancelPending(fresh.id);
+  reapTaskOrphans(fresh.repoPaths);
+
+  const patchedTask = await patchAction(fresh.id, action.id, { status: "running" });
+  const patchedAction =
+    patchedTask?.actions.find((a) => a.id === action.id) ?? action;
+  if (patchedTask) {
+    publish(fresh.id, { kind: "task", task: patchedTask });
+    publish(fresh.id, { kind: "action", action: patchedAction });
+  }
+  let startTask =
+    (await setTaskRunStatus(fresh.id, "running", action.id)) ??
+    patchedTask ??
+    fresh;
+  publish(fresh.id, { kind: "task", task: startTask });
+
+  await writeEventAndPublish(fresh.id, {
+    kind: "info",
+    actionId: action.id,
+    text: `用户重启了当前 ${ACTION_LABEL[action.type]} action（n=${action.n}），沿用原 action 继续执行`,
+    meta: { restartedActionId: action.id, actionType: action.type, n: action.n },
+  });
+
+  let branchCheckoutHint: string | undefined;
+  if (action.type === "build") {
+    const planned = planBranchesForBuild(startTask, input.username);
+    if (planned) {
+      const existingRepos = new Set(
+        (startTask.gitBranches ?? []).map((b) => b.repoPath),
+      );
+      for (const info of planned.infos) {
+        if (!existingRepos.has(info.repoPath)) {
+          await upsertGitBranch(fresh.id, info);
+        }
+      }
+      branchCheckoutHint = planned.promptHint;
+      startTask = (await getTask(fresh.id)) ?? startTask;
+    }
+  }
+  const startAction =
+    startTask.actions.find((a) => a.id === action.id) ?? patchedAction;
+  const batchDirective =
+    startAction.type === "build"
+      ? buildBatchDirective(startTask, startAction.requestedBatchIds)
+      : startAction.type === "review"
+        ? buildReviewScopeDirective(startTask)
+        : undefined;
+
+  await internalStartAgent({
+    task: startTask,
+    action: startAction,
+    userInstruction: buildRestartActionInstruction(startTask, startAction),
+    branchCheckoutHint,
+    apiKey: input.apiKey,
+    model: input.model,
+    forceNewAgent: true,
+    gitHost: input.gitHost,
+    gitToken: input.gitToken,
+    batchDirective,
+  });
+
+  return { action: startAction };
+};
+
 /**
  * V0.6 ack：approve / revise 当前 action
  *
@@ -1243,7 +1512,8 @@ export const acknowledgeAction = async (
     );
   }
 
-  // V0.6：approve 时 action 标 completed、revise 时保持 running
+  // V0.6：approve 时 action 标 completed；revise 时 agent 已重新开跑，同步把 task.runStatus 拉回 running。
+  // 之前只把 action 改回 running、task 仍停在 awaiting_user，会出现「当前 action=running 但顶部显示推进」的僵尸组合。
   const patched = await patchAction(taskId, actionId, {
     status: decision === "approve" ? "completed" : "running",
   });
@@ -1251,6 +1521,10 @@ export const acknowledgeAction = async (
     publish(taskId, { kind: "task", task: patched });
     const newAction = patched.actions.find((a) => a.id === actionId);
     if (newAction) publish(taskId, { kind: "action", action: newAction });
+  }
+  if (decision === "revise") {
+    const running = await setTaskRunStatus(taskId, "running", actionId);
+    if (running) publish(taskId, { kind: "task", task: running });
   }
   await writeEventAndPublish(taskId, {
     kind: "action_ack",
@@ -1752,6 +2026,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // 用户原话：「这个检查不应该给用户看吧、我理解这更像是调试内容」
       // 想 debug 时直接看 data/tasks/<id>/meta.json 里对应 action 的 postCheck 字段、或者后续 UI 加「调试信息」折叠面板
       let postCheck: ActionRecord["postCheck"] | undefined;
+      // V0.6.25 CheckRun：build 的结构化校验摘要单独落 checkRun 字段（postCheck 只留 passed/details）
+      let checkRun: ActionRecord["checkRun"] | undefined;
       const fresh = await getTask(task.id);
       const targetAction = fresh?.actions.find(
         (a) => a.id === signal.actionId,
@@ -1759,7 +2035,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       if (fresh && targetAction) {
         try {
           const result = await runActionCheck(fresh, targetAction);
-          postCheck = result;
+          // postCheck 只存 passed/details（复用红绿条）；checkRun 是 build 专属结构化明细、分开落
+          postCheck = { passed: result.passed, details: result.details };
+          checkRun = result.checkRun;
           console.log(
             `[task-runner] runActionCheck task=${task.id} action=${signal.actionId} passed=${result.passed} details=${result.details.slice(0, 200)}`,
           );
@@ -1774,6 +2052,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const patched = await patchAction(task.id, signal.actionId, {
         status: "awaiting_ack",
         ...(postCheck ? { postCheck } : {}),
+        ...(checkRun ? { checkRun } : {}),
       });
       if (patched) {
         publish(task.id, { kind: "task", task: patched });

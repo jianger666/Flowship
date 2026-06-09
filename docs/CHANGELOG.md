@@ -15,6 +15,36 @@
 
 ---
 
+### V0.6.23：大需求「批次 + 分批 build」（已实装、2026-06-08）
+
+**动机**：一个大飞书需求、`plan + 单次 build` 跑完不保险——上下文越跑越长、agent 改着改着就乱了、质量滑。
+
+**对齐四大库调研**（详见 `docs/PRODUCT-COMPARISON.md`）：
+- **Superpowers / GSD = 真分批 + 多 Agent**：每批换 fresh subagent + 每批自动复查（防上下文污染）。Superpowers 还强制 TDD + 两阶段 review；GSD 波次 gate + 目标倒推 verify。
+- **Spec Kit / OpenSpec = 单 Agent 顺序跑清单**：靠「实现前把 plan/spec 拆够细 + 人审到位」保证质量、不靠多 Agent。
+- **我们的位置**：无 subagent 原语（`@cursor/sdk` 不支持）、用 **「新启 Agent」**（`forceNewAgent`、换全新上下文 + 读前序 artifact）当等价物。**清单结构化我们已做了一大半**（plan §5 task 已带 精确文件路径 + 依赖 + 验收点 + 关键参考、约等于 Spec Kit）。
+
+**方案**：全程**一个 task**（不拆多任务、满足用户硬要求）、plan 多产出「批次」层、build 可选「全做 / 挑批」、每批可新启 Agent、review 两层。
+
+**数据模型**（`types.ts`、最小化、**进度纯推导不存计数器**）：
+- `TestStrategy = "tdd" | "after" | "none"`——自适应 TDD：逻辑批 TDD / UI 批实现后测试 / 纯样式免测（**不强制**、对齐 Spec Kit「TDD 可选」、契合我们前端为主的现实）
+- `PlanBatch { id; title; testStrategy; taskRefs: string[] }`——批次 = 可独立交付功能块、下挂 plan §5 的 task
+- `ActionRecord.planBatches?: PlanBatch[]`——plan action 落；plan agent 写完 artifact 调 **MCP `set_plan_batches`** 上报（跟 `submit_mr` / `set_feishu_testers` 同套路、**不靠解析 markdown**）
+- `ActionRecord.requestedBatchIds?: string[]`——推进 build 时**用户在 dialog 勾的批次、后端 advance 时直接存**（不靠 agent 上报、省掉第 2 个 MCP 工具）
+- **进度 = 派生**：已做批 = ∪(completed build 的 `requestedBatchIds`)、总批 = 最新 plan 的 `planBatches`——不存「已完成 N 批」、避免漂移
+
+**四块改动**：
+1. **plan**（`action-plan.md`）：§5 task 拆分上加一层「批次」分组、每批标 `testStrategy` + 一句话目标 + independent test；写完调 `set_plan_batches` 上报
+2. **build**（`action-build.md`）：开头从 `[NEXT_ACTION]` 指令读「本次做哪批」（用户 dialog 选的）；只做选中批次的 task；**TDD 批先写测试看失败再实现**；build artifact 记「本次完成批次 X」（给人看）
+3. **review**（`action-review.md`）：两层——**增量**（只审本批 build 的 diff）/ **集成**（所有 planBatches 都 built 后、审批次间是否打架、借 GSD「目标倒推」）；判用哪层 = 看 `requestedBatchIds` 并集是否已覆盖全部 `planBatches`
+4. **UI**（`advance-dialog.tsx` + `batch-progress.tsx`）：推进 build 时若最新 plan 有 `planBatches`、用 ChoiceButton 卡片列批次让用户勾（**默认勾未完成批次**、已做的带角标）+ 显示「X/Y 批」进度；详情页 timeline 下常驻 `BatchProgress` 进度条（M/N + 每批 chip、纯派生、没批次不渲染）
+
+**关键决策**：批次结构走 MCP 上报（不解析 markdown）· 进度纯派生不存状态 · TDD 自适应不强制 · 批次不是独立 task（全程一个 task）· review 增量 / 集成由后端派生进度注入 `[REVIEW_SCOPE]`（agent 不自己猜）。
+
+**数据流闭环**（实装）：plan agent 调 MCP `set_plan_batches`（chat-mcp 第 5 工具）→ runner `taskActionHandler` patchAction 落 `planBatches`；build 推进时 advance-dialog 勾批 → `/advance` 透传 `requestedBatchIds` → 落 build action → runner `buildBatchDirective` 拼 `[BUILD_BATCHES]`；review 推进时 `buildReviewScopeDirective` 注入 `[REVIEW_SCOPE]`；进度全程走 `task-display.computeBatchProgress` 派生（前后端共用）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓（0 warning）。⚠️ 真机大需求实测待用户验。
+
 ### V0.6.22：无限重连实测修复（errexit 坑）+ chat 回答截断兜底（2026-06-08）
 
 **背景**：V0.6.21 上线后真机测「离开 >30 分钟」——shell 在 30 分钟时退出码 28 断开、while **没重连**。实测推翻 V0.6.21「本地验证 ✓」结论（本地 mock ≠ 真机）。

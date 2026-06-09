@@ -31,7 +31,58 @@ export interface RepoConfig {
    * 占位符见 branch-template.ts：{username} / {storyId} / {taskTitle} / {date:MM-dd}
    */
   branchTemplate?: string;
+  /**
+   * V0.6.25 CheckRun：本仓「确定性校验命令」清单（per-repo、build 后 runner 自动跑）
+   * - 建 task 时快照进 task.repoCheckCommands（settings 在 localStorage、server 读不到）
+   * - 留空 / 不配 → 该仓 build 后 check 记 not_configured、不阻塞 ship（不是 failed）
+   */
+  checkCommands?: CheckCommand[];
 }
+
+/**
+ * V0.6.25 CheckRun：一条「确定性校验命令」配置（per-repo、build 后由 runner 自动跑）
+ *
+ * 设计背景（对齐 V0.6.3 撤掉 build 写死 check 的教训）：
+ * - 当年 runner 写死 `pnpm typecheck/lint` 对多技术栈（Java / Go）误报、被撤掉。
+ * - 现在改成「用户 per-repo 配命令」：前端配 pnpm、Java 配 mvn、没配就跳过、绕开「写死搞死多栈」。
+ *
+ * - kind：仅用于 UI 分组 + 给默认 timeout（不影响执行逻辑、custom 给最大自由度）
+ * - required：失败是否阻塞 ship gate（false = 仅展示、不挡提测、给「可选 check」用）
+ * - timeoutMs：留空按 kind 给默认（typecheck/lint 短、unit-test/build 长）、超时算 failed
+ * - cmd：走 `sh -c` 执行、支持 `pnpm typecheck && pnpm lint`、`cd sub && pnpm test` 这种组合
+ */
+export type CheckCommandKind =
+  | "typecheck"
+  | "lint"
+  | "unit-test"
+  | "build"
+  | "custom";
+
+export interface CheckCommand {
+  name: string;
+  cmd: string;
+  kind: CheckCommandKind;
+  required: boolean;
+  timeoutMs?: number;
+}
+
+/** CheckCommand kind 中文标签（repo-card 配置 + check 结果展示共享单一源） */
+export const CHECK_COMMAND_KIND_LABEL: Record<CheckCommandKind, string> = {
+  typecheck: "类型检查",
+  lint: "Lint",
+  "unit-test": "单元测试",
+  build: "构建",
+  custom: "自定义",
+};
+
+/** 各 kind 的默认超时（ms）——typecheck/lint 短、测试 / 构建给长、custom 居中 */
+export const CHECK_KIND_DEFAULT_TIMEOUT_MS: Record<CheckCommandKind, number> = {
+  typecheck: 120_000,
+  lint: 120_000,
+  "unit-test": 600_000,
+  build: 600_000,
+  custom: 300_000,
+};
 
 /**
  * 用户最终选定的模型（含参数）
@@ -236,6 +287,93 @@ export interface PlanBatch {
 }
 
 /**
+ * V0.6.25 CheckRun：单条 check 命令的执行结果
+ * - status：passed（exit 0）/ failed（exit≠0）/ timed_out（超时强杀）/ skipped（预留、暂不用）
+ * - mutatedWorktree：跑完该仓 tracked 文件被改了（命令偷改源码、如手滑配了 --fix）→ 视为不可信、判 failed
+ * - logTail：末尾若干行（UI 摘要直接看）、完整输出在 CheckRepoResult.logPath 文件里
+ */
+export interface CheckCommandResult {
+  name: string;
+  cmd: string;
+  kind: CheckCommandKind;
+  required: boolean;
+  status: "passed" | "failed" | "timed_out" | "skipped";
+  exitCode: number;
+  durationMs: number;
+  mutatedWorktree: boolean;
+  logTail: string;
+}
+
+/**
+ * V0.6.25 CheckRun：单仓 check 结果
+ * - status：
+ *   · passed —— 所有 required 命令过、且没有命令污染工作区
+ *   · failed —— 有 required 命令挂、或任一命令污染了工作区（mutated 无视 required、独立安全语义）
+ *   · not_configured —— 没配 check 命令、但本仓**被本次 build 改过（dirty）**（= 改了没检查、ship 要 override）
+ *   · skipped —— 没配 check 命令、且本仓**没被改过（clean）**（= 没碰不用检查、不拉低整体）
+ * - headCommit：跑 check 时该仓 `git rev-parse HEAD`（非 git 仓为 null）
+ * - worktreeFingerprint：跑 check 时该仓「工作区内容指纹」= sha256(headCommit + tracked diff + untracked 文件内容 hash)
+ *   ship gate 前重算比对——不一致 = check 后工作区又变了、旧 checkRun 不能代表当前要 ship 的内容（非 git 仓 null）
+ * - logPath：相对 data/tasks/<id>/ 的完整日志文件路径（所有命令输出拼一起、null = 没产出日志）
+ */
+export interface CheckRepoResult {
+  repoPath: string;
+  status: "passed" | "failed" | "not_configured" | "skipped";
+  headCommit: string | null;
+  worktreeFingerprint: string | null;
+  logPath: string | null;
+  commands: CheckCommandResult[];
+}
+
+/**
+ * V0.6.25 CheckRun：一次 build 后置 check 的整体摘要（挂 ActionRecord.checkRun）
+ * - id：本次 checkRun 唯一 id——ship override 绑这个、重 build 换新 id 后旧 override 自动失效
+ * - status 聚合：任一 repo failed → failed；任一 repo not_configured（没配 check 但被本次 build 改过）→ not_configured；否则 passed（含没改的 skipped 仓）
+ * - 完整命令日志落 data/tasks/<id>/actions/.checks/<actionId>/<repo>.log、这里只存摘要（meta.json 不撑大）
+ */
+export interface CheckRunSummary {
+  id: string;
+  status: "passed" | "failed" | "not_configured";
+  startedAt: number;
+  endedAt: number;
+  repos: CheckRepoResult[];
+}
+
+/**
+ * V0.6.25 CheckRun：ship gate override（per-ship、风险接受记录、不是偏好设置）
+ *
+ * 背景：build 的 check failed / not_configured 时 ship gate 默认拦。但 HITL 底线 = 用户永远能强推。
+ * override 让用户「知情后仍 ship」、但必须留痕：
+ * - 绑 checkRunId + buildActionId：重 build（换新 checkRun）后这条自动失效、要重填
+ * - 工作区是否仍是 check 过的内容由 server 重算 worktreeFingerprint 判定、不信 client 上报
+ * - reason：必填、进 ship action 审计（为什么明知 check 没过还提测）
+ */
+export interface CheckOverride {
+  checkRunId: string;
+  buildActionId: string;
+  reason: string;
+  createdAt: number;
+}
+
+/**
+ * V0.6.25 review：ship 前置预检结果（GET /api/tasks/[id]/ship-precheck 返回）
+ *
+ * 纯 UI 展示用——advance-dialog 据此决定是否显示 override 区、不再自己用 checkRun.status 猜。
+ * gate 逻辑单一源在 server（checkShipCheckGate）、client 拉结论。
+ * ⚠ 不是最终授权：/advance 的 ship 分支会再跑一次 gate（防 precheck 到 submit 之间又改工作区）。
+ *
+ * - needsOverride：最新 build 的 check 没过 / 没配 / 工作区指纹变了 → ship 需勾 override
+ * - reason：需要 override 的原因（needsOverride=false 时为空）
+ * - buildActionId / checkRunId：给 client 构造 CheckOverride 绑定用（没 build 时 null）
+ */
+export interface ShipPrecheck {
+  needsOverride: boolean;
+  reason: string;
+  buildActionId: string | null;
+  checkRunId: string | null;
+}
+
+/**
  * 单条 action 记录
  *
  * - id：任务内唯一（如 act_1 / act_2、生成时单调递增不复用）
@@ -273,8 +411,8 @@ export interface ActionRecord {
   /**
    * 后置 deterministic 检查（V0.6 门槛 2）
    * - plan: artifact 文件存在 + 内容长度 >= 100（V0.6.0.1 拍板删黑名单 grep、详见 action-checks.ts）
-   * - build: typecheck/lint exit 0 + git status 有改动
-   * - review: git diff hash 一致 + 4 类差异段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
+   * - build: V0.6.25 CheckRun——per-repo 跑 checkCommands、passed/details 是聚合摘要、明细看 checkRun 字段
+   * - review: 基底 commit 一致 + 必备段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
    * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
    * - test: pass 率 ≥ 阈值
    * - learn: propose 段有内容 + evidence 路径都能 read 到
@@ -283,6 +421,21 @@ export interface ActionRecord {
     passed: boolean;
     details: string;
   };
+
+  /**
+   * V0.6.25 CheckRun：build action 的确定性校验结果摘要（只 build action 有）
+   * - runner 在 build agent 调 wait_for_user 时自动跑（复用 postCheck 钩子、见 action-checks.checkBuild）
+   * - 完整命令日志落文件、这里只存结构化摘要（per-repo per-command pass/fail + 日志路径）
+   * - ship gate 读「最新 completed build 的 checkRun.status」决定是否拦
+   */
+  checkRun?: CheckRunSummary;
+
+  /**
+   * V0.6.25 CheckRun：ship action 的 gate override（只 ship action 有、用户强推时记）
+   * - build 的 check failed / not_configured 时、用户在 ship dialog 勾「仍继续」+ 填 reason → 落这里
+   * - 绑 checkRunId、重 build 后失效（见 CheckOverride）
+   */
+  checkOverride?: CheckOverride;
 
   /**
    * 副作用记录（对外部世界的影响）
@@ -642,6 +795,12 @@ export interface Task {
    * build 时按这份渲染分支名（占位符见 branch-template.ts）
    */
   repoBranchTemplates?: Record<string, string>;
+  /**
+   * V0.6.25 CheckRun：per-repo 校验命令快照（key=repoPath、建 task 时从 settings.repos[].checkCommands 固化）
+   * - build 后 runner 按这份跑 check；某仓没配 → 该仓 check 记 not_configured（不阻塞 ship）
+   * - 快照原因同 repoBaseBranches：settings 在 localStorage、server 读不到
+   */
+  repoCheckCommands?: Record<string, CheckCommand[]>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -678,6 +837,7 @@ export type NewTaskInput = Pick<
   | "repoTestBranches"
   | "repoDevBranches"
   | "repoBranchTemplates"
+  | "repoCheckCommands"
 > & {
   role?: TaskRole;
   mode?: TaskMode;

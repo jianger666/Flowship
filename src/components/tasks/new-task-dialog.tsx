@@ -53,6 +53,7 @@ import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import {
   TASK_ROLE_LABEL,
   type RepoConfig,
+  type CheckCommand,
   type Task,
   type TaskMode,
   type TaskRole,
@@ -221,9 +222,11 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
 
       // V0.6.7：从 settings.repos 快照每仓的测试分支 / dev 分支 / 有效命名模板
       //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build / ship 用这份）
+      // V0.6.25：同款快照每仓的 check 命令（build 后 runner 跑、详见 types.ts CheckCommand）
       const repoTestBranches: Record<string, string> = {};
       const repoDevBranches: Record<string, string> = {};
       const repoBranchTemplates: Record<string, string> = {};
+      const repoCheckCommands: Record<string, CheckCommand[]> = {};
       for (const p of repoPaths) {
         const repo = settings.repos.find((r) => r.path === p);
         const tb = repo?.testBranch?.trim();
@@ -235,6 +238,8 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
           repo?.branchTemplate,
           settings.branchTemplate,
         );
+        const cmds = repo?.checkCommands;
+        if (cmds && cmds.length > 0) repoCheckCommands[p] = cmds;
       }
 
       const task = await createTask({
@@ -261,6 +266,10 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
         repoBranchTemplates:
           Object.keys(repoBranchTemplates).length > 0
             ? repoBranchTemplates
+            : undefined,
+        repoCheckCommands:
+          Object.keys(repoCheckCommands).length > 0
+            ? repoCheckCommands
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,

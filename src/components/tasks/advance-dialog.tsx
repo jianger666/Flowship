@@ -54,9 +54,16 @@ import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
 import { ACTION_LABEL, computeBatchProgress } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
+import { fetchShipPrecheck } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
-import type { ActionType, ModelSelection, Task } from "@/lib/types";
+import type {
+  ActionType,
+  CheckOverride,
+  ModelSelection,
+  ShipPrecheck,
+  Task,
+} from "@/lib/types";
 
 // V0.6.1 已实装的 action 类型；test/learn 灰掉
 // V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
@@ -188,6 +195,8 @@ interface Props {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（仅 build 且 plan 拆批时传、其它 undefined=全做）
     requestedBatchIds?: string[];
+    // V0.6.25：ship gate override（仅 ship 且最新 build 的 check 没过、用户勾「仍继续」时传）
+    checkOverride?: CheckOverride;
   }) => Promise<void>;
   submitting: boolean;
 }
@@ -237,6 +246,13 @@ export const AdvanceDialog = ({
   const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
     {},
   );
+  // V0.6.25：ship override——最新 build 的 check 没过时、勾「仍继续提测」+ 填原因才放行
+  const [shipOverrideOn, setShipOverrideOn] = useState(false);
+  const [shipOverrideReason, setShipOverrideReason] = useState("");
+  // V0.6.25 review：ship 前置预检（server 算 gate 结论、含工作区指纹比对）——决定是否显示 override 区
+  // client 算不了 git 指纹、不再自己用 checkRun.status 猜、gate 单一源在 server
+  const [shipPrecheck, setShipPrecheck] = useState<ShipPrecheck | null>(null);
+  const [shipPrecheckLoading, setShipPrecheckLoading] = useState(false);
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
 
@@ -269,6 +285,9 @@ export const AdvanceDialog = ({
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.6.23：build 选批默认勾选（未做批次优先 / 全做完则全勾）
     setSelectedBatchIds(defaultBatchIdsKey ? defaultBatchIdsKey.split(",") : []);
+    // V0.6.25：每次打开重置 ship override（默认不绕过、需用户主动勾）
+    setShipOverrideOn(false);
+    setShipOverrideReason("");
     // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
     const s = getSettings();
     setPickedModel(s.defaultModel ?? { id: "" });
@@ -277,6 +296,31 @@ export const AdvanceDialog = ({
       token: s.gitToken?.trim() || undefined,
     });
   }, [open, defaultActionType, defaultRemoveSourceBranch, defaultBatchIdsKey]);
+
+  // V0.6.25 review：ship 时拉 server precheck（含工作区指纹比对）决定 override 区。
+  // actionType 可能在 dialog 里被切到 ship、所以依赖它；非 ship 清空。
+  useEffect(() => {
+    if (!open || actionType !== "ship") {
+      setShipPrecheck(null);
+      return;
+    }
+    let cancelled = false;
+    setShipPrecheckLoading(true);
+    fetchShipPrecheck(task.id)
+      .then((pc) => {
+        if (!cancelled) setShipPrecheck(pc);
+      })
+      .catch(() => {
+        // 拉失败不挡提交、server /advance 会再跑同一套 gate 兜底
+        if (!cancelled) setShipPrecheck(null);
+      })
+      .finally(() => {
+        if (!cancelled) setShipPrecheckLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, actionType, task.id]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -300,11 +344,20 @@ export const AdvanceDialog = ({
     () => inferDisabledReason(task, actionType, gitConfig),
     [task, actionType, gitConfig],
   );
+  // V0.6.25：ship 且 server precheck 判定需 override → 必须勾「仍继续」+ 填原因才能提测
+  const shipNeedsOverride =
+    actionType === "ship" && !!shipPrecheck?.needsOverride;
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (disabledReason) return false;
+    // V0.6.25 review：ship 时等 precheck 拉完再判断（没拿到 gate 结论就放行会被 server 拒）
+    if (actionType === "ship" && shipPrecheckLoading) return false;
     // build 分批时至少选一批（清空全部勾选语义不明、不让提交）
     if (actionType === "build" && hasBatches && selectedBatchIds.length === 0) {
+      return false;
+    }
+    // V0.6.25：ship 需 override 时、必须勾「仍继续」+ 填原因
+    if (shipNeedsOverride && (!shipOverrideOn || !shipOverrideReason.trim())) {
       return false;
     }
     return true;
@@ -312,8 +365,12 @@ export const AdvanceDialog = ({
     submitting,
     disabledReason,
     actionType,
+    shipPrecheckLoading,
     hasBatches,
     selectedBatchIds.length,
+    shipNeedsOverride,
+    shipOverrideOn,
+    shipOverrideReason,
   ]);
 
   // V0.6.23：批次卡片点选 toggle（含已做批次、允许返工重选）
@@ -347,6 +404,16 @@ export const AdvanceDialog = ({
       // 仅 build 且 plan 拆了批次时传选中批次；否则 undefined（无批次 / 全做、退化老流程）
       requestedBatchIds:
         actionType === "build" && hasBatches ? selectedBatchIds : undefined,
+      // V0.6.25：ship 绕过 check 的 override（仅 ship 且 check 没过 + 勾「仍继续」时传、server 再校验绑定）
+      checkOverride:
+        shipNeedsOverride && shipOverrideOn
+          ? {
+              checkRunId: shipPrecheck?.checkRunId ?? "",
+              buildActionId: shipPrecheck?.buildActionId ?? "",
+              reason: shipOverrideReason.trim(),
+              createdAt: Date.now(),
+            }
+          : undefined,
     });
   };
 
@@ -568,6 +635,39 @@ export const AdvanceDialog = ({
               </div>
             </div>
           </div>
+
+          {/* V0.6.25：ship override——最新 build 的 check 没过时、必须确认才放行（HITL 底线、留痕） */}
+          {shipNeedsOverride && (
+            <div className="grid gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
+              <div className="text-xs font-medium text-destructive">
+                {shipPrecheck?.reason || "最新 build 的检查没通过、确认仍要提测？"}
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="ship-override"
+                  className="flex-1 cursor-pointer text-xs text-foreground/80"
+                >
+                  仍继续提测（绕过检查）
+                </label>
+                <Switch
+                  id="ship-override"
+                  checked={shipOverrideOn}
+                  onCheckedChange={setShipOverrideOn}
+                  disabled={submitting}
+                />
+              </div>
+              {shipOverrideOn && (
+                <Textarea
+                  value={shipOverrideReason}
+                  onChange={(e) => setShipOverrideReason(e.target.value)}
+                  placeholder="为什么检查没过还提测？（必填、进审计）"
+                  rows={2}
+                  disabled={submitting}
+                  className="resize-none text-xs"
+                />
+              )}
+            </div>
+          )}
 
           {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
           {actionType === "ship" && (

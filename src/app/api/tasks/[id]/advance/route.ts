@@ -47,7 +47,7 @@ import {
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
-import { ACTION_TYPES, type ActionType } from "@/lib/types";
+import { ACTION_TYPES, type ActionType, type CheckOverride } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -70,6 +70,9 @@ interface PostBody {
   removeSourceBranch?: boolean;
   // V0.6.23 build action 用：本次做哪些批次（advance-dialog 勾选、透传给 advanceTask）
   requestedBatchIds?: string[];
+  // V0.6.25 ship action 用：CheckRun gate override（最新 build check 没过/没配时、用户勾「仍继续」+ reason）
+  // 结构由 parseCheckOverride narrow、server 端 checkShipCheckGate 再校验绑定有效性
+  checkOverride?: unknown;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -77,6 +80,25 @@ const MAX_ATTACHMENTS_PER_REQUEST = 10;
 
 const isValidActionType = (v: unknown): v is ActionType =>
   typeof v === "string" && (ACTION_TYPES as readonly string[]).includes(v);
+
+// V0.6.25：把 client 传的 checkOverride narrow 成 CheckOverride（语义有效性交给 server gate 校验）
+const parseCheckOverride = (raw: unknown): CheckOverride | undefined => {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  if (
+    typeof o.buildActionId !== "string" ||
+    typeof o.checkRunId !== "string" ||
+    typeof o.reason !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    checkRunId: o.checkRunId,
+    buildActionId: o.buildActionId,
+    reason: o.reason,
+    createdAt: typeof o.createdAt === "number" ? o.createdAt : Date.now(),
+  };
+};
 
 export const runtime = "nodejs";
 
@@ -196,6 +218,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       requestedBatchIds: Array.isArray(body.requestedBatchIds)
         ? body.requestedBatchIds.filter((x) => typeof x === "string")
         : undefined,
+      // V0.6.25：ship gate override（仅 ship 有意义、server checkShipCheckGate 校验绑定有效性）
+      checkOverride: parseCheckOverride(body.checkOverride),
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

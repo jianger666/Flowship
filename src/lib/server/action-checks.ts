@@ -10,8 +10,10 @@
  *
  * 检查内容（V0.6.1 范围、用户拍板删 plan 黑名单 grep 后简化）：
  *   - plan: artifact 文件存在 + 内容长度 >= 100
- *   - build: V0.6.3 用户拍板暂时撤掉（原 pnpm typecheck/lint/git status；写死 pnpm 对多技术栈
- *     如 Java 会误报失败、先撤掉、后面重做成技术栈自适应 / 独立 check）
+ *   - build（V0.6.25 CheckRun 复活）：per-repo 跑用户配的 checkCommands（typecheck/lint/test/...）、
+ *     执行前后比对 tracked 工作区检测「命令偷改源码」、并记录每仓工作区指纹给 ship gate 比对。
+ *     历史：V0.6.3 曾撤掉写死的 pnpm（多技术栈如 Java 误报）、V0.6.25 改「用户 per-repo 配命令、
+ *     没配的仓按是否被本次 build 改过分 not_configured/skipped」复活、详见 checkBuild / runRepoChecks
  *   - review: artifact「总评」段声明的「基底 commit」跟实际 `git rev-parse HEAD` 一致（防 agent 拿错 / 编造基底）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
  *   - test/learn: V0.6.2+ stub、暂不实现
@@ -24,23 +26,37 @@
  *   误伤率高（V0.6.0.1 实测两条都是误报）。用户拍板「方案太简单粗暴、不是有效约束、先彻底删、
  *   后面再考虑长远的（语义 diff / agent 自检 etc.）」、本文件不再 ship 这套 grep。
  *
- * 检查脚本本身的依赖：node:child_process / node:fs / node:path
+ * 检查脚本本身的依赖：node:child_process / node:crypto / node:fs / node:path
  * 失败时（如仓库不是 git 仓 / 找不到 pnpm）兜底返「passed=true、details=「检查不可用、自动跳过」」、
  * 避免环境问题挡用户主流程（这是软兜底、最终质量靠用户人眼把关）。
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import type { ActionRecord, Task } from "@/lib/types";
+import type {
+  ActionRecord,
+  CheckCommand,
+  CheckCommandResult,
+  CheckRepoResult,
+  CheckRunSummary,
+  Task,
+} from "@/lib/types";
+import { CHECK_KIND_DEFAULT_TIMEOUT_MS } from "@/lib/types";
 
-import { getActionArtifactPath } from "./task-fs";
+import { getActionArtifactPath, getCheckLogPaths } from "./task-fs";
 import { getEffectiveCwd } from "@/lib/path-utils";
 
 export interface ActionCheckResult {
   passed: boolean;
   details: string;
+  /**
+   * V0.6.25 CheckRun：build action 专属——结构化校验摘要（per-repo per-command）
+   * runner 把它落到 ActionRecord.checkRun（passed/details 仍落 postCheck、复用现成红绿条 UI）。
+   */
+  checkRun?: CheckRunSummary;
 }
 
 // 主入口：跑给定 action 的 deterministic 检查
@@ -52,11 +68,11 @@ export const runActionCheck = async (
     switch (action.type) {
       case "plan":
         return await checkPlan(task, action);
-      // build：V0.6.3 用户拍板暂时撤掉 typecheck/lint/git 检查
-      //   直接原因：写死 pnpm 对多技术栈（Java 等）会误报失败、先撤掉避免误伤、
-      //   后面再加（可能把 check build 独立成单独的 check action / 模块、做技术栈自适应）
-      // test / learn：V0.6.2+ 还没实现
+      // build（V0.6.25 CheckRun）：per-repo 跑用户配的 checkCommands、不再写死 pnpm
+      //   （绕开 V0.6.3 撤掉的「写死 pnpm 搞死多栈」：没配命令的仓记 not_configured、不误报）
       case "build":
+        return await checkBuild(task, action);
+      // test / learn：V0.6.2+ 还没实现
       case "test":
       case "learn":
         return {
@@ -315,6 +331,337 @@ const checkShip = async (
   return {
     passed: allPassed,
     details: sections.length > 0 ? sections.join("\n\n") : "ship 检查通过",
+  };
+};
+
+// ----------------- build（V0.6.25 CheckRun）-----------------
+//
+// 设计见 types.ts CheckCommand 注释。核心：
+//   - 遍历 task.repoPaths、按 task.repoCheckCommands?.[repoPath] 跑 per-repo 校验命令
+//   - 命令走 `sh -c`（支持 && / cd / 管道）、PATH 继承 runner 环境 + 补常见 bin（兜 nvm/volta/mvn）
+//   - 每条命令跑前后比对 git tracked 状态——命令偷改源码（如手滑 --fix）判 mutated = failed（结果不可信）
+//   - 完整输出落 actions/.checks/<actionId>/<slug>.log、摘要（per-command logTail）进 ActionRecord.checkRun
+//   - build 改动停在工作区（未 commit）、check 校验的正是这批工作区改动（符合 build「不碰 .git」铁律）
+//
+// 聚合：任一 required 命令 failed/timed_out/mutated → repo failed；全 repo not_configured → 整体 not_configured
+// postCheck.passed = checkRun.status !== "failed"（not_configured 不算失败、UI 灰条、但 ship gate 仍会拦）
+
+// check 命令执行环境：继承 runner（next dev）PATH + 补常见 bin 目录
+// 局限：nvm 按版本的 node 路径不固定、第一版只兜静态常见路径；找不到工具时命令 exit 127、记 failed
+const buildCheckEnv = (): NodeJS.ProcessEnv => {
+  const home = process.env.HOME ?? "";
+  const extraBins = [
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    home ? `${home}/.volta/bin` : "",
+    home ? `${home}/.local/bin` : "",
+  ].filter(Boolean);
+  const basePath = process.env.PATH ?? "";
+  return {
+    ...process.env,
+    PATH: [...extraBins, basePath].filter(Boolean).join(":"),
+  };
+};
+
+interface CheckShellResult {
+  exitCode: number;
+  // stdout + stderr 合并（check 日志不区分两路、按时间穿插即可）
+  output: string;
+  timedOut: boolean;
+}
+
+// 超时强杀：优先按进程组杀（-pid、连 sh 起的 pnpm/jest 等子进程一起杀、防孤儿泄漏）、退回单进程杀
+// 背景：`sh -c "pnpm test"` 超时只 kill sh 时、真正干活的子进程会脱离成孤儿继续占资源（V0.6.25 蓝军）
+const killProcessTree = (proc: ReturnType<typeof spawn>) => {
+  try {
+    if (proc.pid) {
+      process.kill(-proc.pid, "SIGKILL");
+      return;
+    }
+  } catch {
+    // 进程组不存在 / 平台不支持 negative pid → 退回单杀
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    /* 已退出、noop */
+  }
+};
+
+// 跑一条 shell 命令（sh -c、支持组合命令）、带超时强杀
+// 单命令 output 累积上限——超了截断、防巨大测试输出打爆 Next server 内存（V0.6.25 review）
+const CHECK_OUTPUT_CAP = 512 * 1024;
+
+const runCheckShell = (
+  cmd: string,
+  cwd: string,
+  timeoutMs: number,
+  maxOutputBytes = CHECK_OUTPUT_CAP,
+): Promise<CheckShellResult> =>
+  new Promise((resolve) => {
+    let output = "";
+    // 已达上限、之后输出直接丢弃（进程仍跑、只是不再收集、防内存爆）
+    let truncated = false;
+    let timedOut = false;
+    // detached：子进程独立成新进程组、超时时按 -pid 杀整组（见 killProcessTree）；
+    // 不 unref（仍要等 close 事件收尾）、stdio 默认 pipe 不受影响
+    const proc = spawn("sh", ["-c", cmd], {
+      cwd,
+      env: buildCheckEnv(),
+      detached: true,
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(proc);
+    }, timeoutMs);
+    // 累积 output、到上限就截断并打明显标记（否则用户看尾部以为命令自然结束）
+    const append = (d: unknown) => {
+      if (truncated) return;
+      output += String(d);
+      if (output.length > maxOutputBytes) {
+        output =
+          output.slice(0, maxOutputBytes) +
+          `\n[output truncated at ${Math.round(maxOutputBytes / 1024)}KB]`;
+        truncated = true;
+      }
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({
+        exitCode: -1,
+        output: output + `\n[spawn error] ${err.message}`,
+        timedOut,
+      });
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ exitCode: code ?? -1, output, timedOut });
+    });
+  });
+
+// 取该仓 tracked 文件改动状态（污染检测基线）
+// untracked 不算（coverage / .turbo / 报告目录是临时产物、通常 gitignored）；非 git 仓 / git 失败 → null（不判 mutated）
+const trackedWorktreeStatus = async (cwd: string): Promise<string | null> => {
+  const r = await runCheckShell(
+    "git status --porcelain --untracked-files=no",
+    cwd,
+    15_000,
+  );
+  return r.exitCode === 0 ? r.output.trim() : null;
+};
+
+// 取末尾 maxLines 行（logTail 摘要、完整在日志文件）
+const tailLines = (text: string, maxLines = 15): string => {
+  const trimmed = text.replace(/\s+$/, "");
+  const lines = trimmed.split("\n");
+  return lines.length <= maxLines ? trimmed : lines.slice(-maxLines).join("\n");
+};
+
+// repo 末段名（日志 slug + UI 展示用）
+const repoTailName = (repoPath: string): string =>
+  repoPath.split("/").filter(Boolean).pop() ?? repoPath;
+
+// 跑单仓所有 check 命令、返结构化结果 + 把完整日志写文件
+// 工作区指纹脚本（V0.6.25 review）——覆盖：tracked 改 / staged / 删除 / 新增 untracked 文件 / untracked 内容变化
+// 关键：`git diff HEAD` 不含 untracked 文件内容、`git status` 只含路径不含内容、所以单独对 untracked 逐文件 hash。
+// 用 `git hash-object --stdin-paths`（git 原生、空输入安全不 hang、不依赖 bash `read -d` 跨 mac/linux dash 都行）。
+// `--exclude-standard` 排除 gitignore（coverage/cache/node_modules 不算进指纹）。
+const FINGERPRINT_SCRIPT = [
+  "git rev-parse HEAD 2>/dev/null || echo __NOGIT__",
+  "echo __DIFF__",
+  "git diff --no-ext-diff --binary HEAD -- 2>/dev/null",
+  "echo __UPATHS__",
+  "git ls-files --others --exclude-standard 2>/dev/null",
+  "echo __UHASHES__",
+  "git ls-files --others --exclude-standard 2>/dev/null | git hash-object --stdin-paths 2>/dev/null",
+].join("\n");
+
+// 该仓「工作区内容指纹」= sha256(headCommit + tracked diff + untracked 路径 + untracked 内容 hash)
+// check 结束记录、ship gate 前重算比对——不一致 = check 后工作区又被改、旧 checkRun 不代表当前要 ship 的内容。
+// 给 20MB cap（指纹要完整 diff、不能被默认 512KB 截断）；非 git 仓 / 异常 → null（gate 端视为「无法比对、不拦」）。
+// ⚠ 边界：tracked diff 全文 + untracked hash 列表累积 >20MB 会被截断、理论上漏掉 20MB 之后的 tracked 改动
+//   （实际罕见、20MB 纯文本 diff 极大）。要严格无上限、可把 tracked 部分也改成逐文件 hash-object（untracked 已是）。
+export const computeWorktreeFingerprint = async (
+  repoPath: string,
+): Promise<string | null> => {
+  const r = await runCheckShell(
+    FINGERPRINT_SCRIPT,
+    repoPath,
+    30_000,
+    20 * 1024 * 1024,
+  );
+  if (r.exitCode !== 0) return null;
+  if (r.output.split("\n", 1)[0]?.trim() === "__NOGIT__") return null;
+  return createHash("sha256").update(r.output).digest("hex");
+};
+
+// 本仓是否被改动过——tracked 改 + staged + 删除 + 新增 untracked（--untracked-files=all）全算。
+// 决定「没配 check 命令的仓」是 not_configured（改了没检查、要关注）还是 skipped（没碰、不影响整体）。
+// 跟 trackedWorktreeStatus 的区别：那个 untracked=no（污染检测、untracked 是命令产物不算）；这个要含新增文件。
+const isRepoDirty = async (repoPath: string): Promise<boolean> => {
+  const r = await runCheckShell(
+    "git status --porcelain --untracked-files=all",
+    repoPath,
+    15_000,
+  );
+  return r.exitCode === 0 && r.output.trim().length > 0;
+};
+
+const runRepoChecks = async (
+  taskId: string,
+  actionId: string,
+  repoPath: string,
+  slug: string,
+  commands: CheckCommand[],
+): Promise<CheckRepoResult> => {
+  // 该仓基底 commit
+  const headRes = await runCheckShell("git rev-parse HEAD", repoPath, 15_000);
+  const headCommit =
+    headRes.exitCode === 0 ? headRes.output.trim() || null : null;
+  // 工作区指纹：check 这一刻的工作区内容快照（ship gate 重算比对、防 check 后又被改）
+  const worktreeFingerprint = await computeWorktreeFingerprint(repoPath);
+
+  // 没配 check 命令——按本仓是否被本次 build 改过区分：
+  //   dirty（改了没检查）→ not_configured（拉低整体、ship 要 override）；clean（没碰）→ skipped（不影响 passed）
+  if (commands.length === 0) {
+    const dirty = await isRepoDirty(repoPath);
+    return {
+      repoPath,
+      status: dirty ? "not_configured" : "skipped",
+      headCommit,
+      worktreeFingerprint,
+      logPath: null,
+      commands: [],
+    };
+  }
+
+  const results: CheckCommandResult[] = [];
+  const logBlocks: string[] = [];
+
+  for (const c of commands) {
+    const timeoutMs =
+      c.timeoutMs && c.timeoutMs > 0
+        ? c.timeoutMs
+        : CHECK_KIND_DEFAULT_TIMEOUT_MS[c.kind];
+    // 跑前后各取一次 tracked 状态、变了 = 命令偷改了源码
+    const before = await trackedWorktreeStatus(repoPath);
+    const started = Date.now();
+    const r = await runCheckShell(c.cmd, repoPath, timeoutMs);
+    const durationMs = Date.now() - started;
+    const after = await trackedWorktreeStatus(repoPath);
+    const mutatedWorktree =
+      before !== null && after !== null && before !== after;
+
+    let status: CheckCommandResult["status"];
+    if (r.timedOut) status = "timed_out";
+    else if (r.exitCode !== 0) status = "failed";
+    else if (mutatedWorktree) status = "failed";
+    else status = "passed";
+
+    results.push({
+      name: c.name,
+      cmd: c.cmd,
+      kind: c.kind,
+      required: c.required,
+      status,
+      exitCode: r.exitCode,
+      durationMs,
+      mutatedWorktree,
+      logTail: tailLines(r.output),
+    });
+    logBlocks.push(
+      `=== ${c.name}（${c.cmd}）exit=${r.exitCode}${
+        r.timedOut ? " [超时]" : ""
+      }${mutatedWorktree ? " [工作区被改]" : ""} ${durationMs}ms ===\n${r.output}`,
+    );
+  }
+
+  // 写完整日志（best-effort、写失败不影响判定、logPath 退回 null）
+  let logPath: string | null = null;
+  try {
+    const { absPath, relPath } = getCheckLogPaths(taskId, actionId, slug);
+    await fs.mkdir(path.dirname(absPath), { recursive: true });
+    await fs.writeFile(absPath, logBlocks.join("\n\n"), "utf-8");
+    logPath = relPath;
+  } catch (err) {
+    console.warn(
+      `[action-check] checkBuild 写日志失败 task=${taskId} repo=${repoPath}：`,
+      err,
+    );
+  }
+
+  // repo 聚合（V0.6.25 review）：
+  //   - required 命令非 passed → failed
+  //   - 任一命令污染工作区（mutated）→ failed：污染是独立安全语义、无视 required
+  //     （否则误配 eslint --fix 之类、required=false 时改了源码还能绿灯、ship 就会带上偷改的代码）
+  const mutated = results.some((x) => x.mutatedWorktree);
+  const requiredFailed = results.some(
+    (x) => x.required && x.status !== "passed",
+  );
+  return {
+    repoPath,
+    status: mutated || requiredFailed ? "failed" : "passed",
+    headCommit,
+    worktreeFingerprint,
+    logPath,
+    commands: results,
+  };
+};
+
+const checkBuild = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult> => {
+  const startedAt = Date.now();
+  const repoResults: CheckRepoResult[] = [];
+
+  // 遍历所有 repo——配了命令的跑、没配的按是否被本次 build 改过记 not_configured（改了）/ skipped（没改）
+  // slug 用 idx 前缀防多仓末段同名（/a/client + /b/client）日志互相覆盖
+  for (let i = 0; i < task.repoPaths.length; i++) {
+    const repoPath = task.repoPaths[i]!;
+    const commands = task.repoCheckCommands?.[repoPath] ?? [];
+    const slug = `${i}-${repoTailName(repoPath)}`;
+    repoResults.push(
+      await runRepoChecks(task.id, action.id, repoPath, slug, commands),
+    );
+  }
+
+  // 整体聚合：任一 repo failed → failed；全 not_configured → not_configured；否则 passed
+  const anyFailed = repoResults.some((r) => r.status === "failed");
+  const anyNotConfigured = repoResults.some(
+    (r) => r.status === "not_configured",
+  );
+  const status: CheckRunSummary["status"] = anyFailed
+    ? "failed"
+    : anyNotConfigured
+      ? "not_configured"
+      : "passed";
+
+  const checkRun: CheckRunSummary = {
+    id: `cr_${action.id}_${startedAt}`,
+    status,
+    startedAt,
+    endedAt: Date.now(),
+    repos: repoResults,
+  };
+
+  // postCheck 文本摘要（复用 action 红绿条 UI）
+  const detailLines = repoResults.map((r) => {
+    const tail = repoTailName(r.repoPath);
+    if (r.status === "not_configured")
+      return `  - ${tail}：有改动但没配检查命令（ship 需确认）`;
+    if (r.status === "skipped") return `  - ${tail}：本次没改动、跳过`;
+    const cmdSummary = r.commands.map((c) => `${c.name}=${c.status}`).join(" / ");
+    return `  - ${tail}：${r.status}（${cmdSummary}）`;
+  });
+  const details = `build CheckRun ${status}：\n${detailLines.join("\n")}`;
+
+  return {
+    passed: status !== "failed",
+    details,
+    checkRun,
   };
 };
 

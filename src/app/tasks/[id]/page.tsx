@@ -70,6 +70,7 @@ import {
   fetchTask,
   finalizeTask,
   reopenTask,
+  restartCurrentAction as restartCurrentActionRequest,
   setActionExcluded,
   setTaskUiLayout,
   stopTask,
@@ -88,6 +89,7 @@ import { getEffectiveCwd } from "@/lib/path-utils";
 import type {
   ActionRecord,
   ActionType,
+  CheckOverride,
   ModelSelection,
   Task,
 } from "@/lib/types";
@@ -291,6 +293,17 @@ const TaskDetailPage = () => {
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
 
+  // 重启当前阶段：SDK / agent 断掉但 action 还没做完时，原地重启当前 action，不追加新 action。
+  const canRestartCurrentAction =
+    !!currentAction &&
+    task.runStatus !== "running" &&
+    (currentAction.status === "running" ||
+      currentAction.status === "error" ||
+      currentAction.status === "cancelled") &&
+    !canAck &&
+    task.repoStatus !== "merged" &&
+    task.repoStatus !== "abandoned";
+
   // 终结按钮：任务有 action（不是空壳）且没在跑（不是 running）、并且没被终结过
   const canFinalize =
     task.actions.length > 0 &&
@@ -316,6 +329,8 @@ const TaskDetailPage = () => {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（advance-dialog 仅 build 且 plan 拆批时给值）
     requestedBatchIds?: string[];
+    // V0.6.25：ship gate override（advance-dialog 仅 ship 且最新 build 的 check 没过时给值）
+    checkOverride?: CheckOverride;
   }) => {
     setStarting(true);
     try {
@@ -349,6 +364,8 @@ const TaskDetailPage = () => {
           removeSourceBranch: input.removeSourceBranch,
           // V0.6.23 build action：本次做哪些批次（仅 build 且 plan 拆批时有值、否则 undefined=全做）
           requestedBatchIds: input.requestedBatchIds,
+          // V0.6.25 ship action：CheckRun gate override（仅 ship 且最新 build 的 check 没过时有值）
+          checkOverride: input.checkOverride,
         }),
       });
       if (!res.ok) {
@@ -432,6 +449,40 @@ const TaskDetailPage = () => {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
       setStopping(false);
+    }
+  };
+
+  // ---- 重启当前 action：不追加 action，只把当前 action 原地拉起 ----
+  const handleRestartCurrentAction = async () => {
+    if (!task || !currentAction) return;
+    const ok = await confirm({
+      title: `重启当前 ${ACTION_LABEL[currentAction.type]} 阶段？`,
+      description:
+        "不会新建 action，也不会删除已有产物；会起一个新 agent，先读事件和现有 artifact，再继续这个阶段。",
+      confirmLabel: "重启当前阶段",
+    });
+    if (!ok) return;
+    setStarting(true);
+    try {
+      const args = prepareRunArgs(task);
+      if (!args) return;
+      const settings = getSettings();
+      const { task: updated, action } = await restartCurrentActionRequest(task.id, {
+        actionId: currentAction.id,
+        apiKey: args.apiKey,
+        model: args.model,
+        username: settings.username?.trim() || undefined,
+        gitHost: settings.gitHost?.trim() || undefined,
+        gitToken: settings.gitToken?.trim() || undefined,
+      });
+      setTask(updated);
+      setSelectedActionId(action.id);
+      setWatchEpoch((n) => n + 1);
+      toast.success(`已重启当前 ${ACTION_LABEL[action.type]} 阶段`);
+    } catch (err) {
+      toast.error(`重启失败：${(err as Error).message}`);
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -652,6 +703,18 @@ const TaskDetailPage = () => {
                   通过 {currentAction && ACTION_LABEL[currentAction.type]}
                 </Button>
               </>
+            )}
+            {canRestartCurrentAction && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRestartCurrentAction}
+                disabled={starting}
+                title="SDK / agent 断掉但当前阶段没做完时，原地重启这个 action"
+              >
+                {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+                重启当前阶段
+              </Button>
             )}
             {canAdvance && (
               <Button
