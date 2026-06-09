@@ -23,6 +23,7 @@ import { Ban, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
+import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -236,6 +237,9 @@ export const ChatView = ({
           onUserReply={handleUserReply}
           canReply={canReply}
           disabledHint={disabledHint}
+          composerLeading={
+            <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
+          }
         />
       </div>
 

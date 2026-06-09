@@ -52,7 +52,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
-import type { ActionType } from "../types";
+import type { ActionType, PlanBatch } from "../types";
 
 // ----------------- 配置 -----------------
 
@@ -217,6 +217,13 @@ type ChatTaskAction =
       actionId: string;
       /** 飞书 user_id 列表（空数组 = 显式记忆「没测试人 / 跳过 @」） */
       userIds: string[];
+    }
+  | {
+      kind: "set_plan_batches";
+      /** 当前 plan action 的 id（批次落到这个 action 的 planBatches 字段） */
+      actionId: string;
+      /** plan 拆出的批次清单（数组顺序 = 建议 build 顺序） */
+      batches: PlanBatch[];
     };
 
 type ChatTaskActionResult =
@@ -1201,6 +1208,91 @@ const buildMcpServer = (): McpServer => {
         kind: "set_feishu_testers",
         actionId: action_id,
         userIds: user_ids,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
+  // ----------------- set_plan_batches 工具（V0.6.23、plan action 用）-----------------
+  //
+  // plan agent 把大需求拆成「批次」（可独立 build/review 的功能块）后调本工具上报、
+  // 落到该 plan action 的 planBatches。build 推进时用户按批次勾选、进度从 action 历史推导。
+  //
+  // 不靠解析 markdown：跟 submit_mr / set_feishu_testers 同套路、结构化上报最可靠。
+  srv.registerTool(
+    "set_plan_batches",
+    {
+      title: "上报 plan 拆出的批次（大需求分批 build 用）",
+      description: [
+        "把当前 plan 拆出的「批次」结构化上报、落到该 plan action。",
+        "调本工具即可——批次表由系统自动渲染在 plan 下方、**不用在 artifact 里写批次表**。",
+        "",
+        "## 什么时候调",
+        "",
+        "plan action 内、写完方案 artifact 后——**仅当本需求够大、一次 build 跑不稳妥时**才调：",
+        "  - 把 plan §5 的 task 归并成若干「可独立交付的功能块」= 批次",
+        "  - 每批标一个测试策略（见下）、列出含哪些 task",
+        "  - 小需求（一次 build 能稳妥做完）**不要调本工具**、保持单批老流程",
+        "",
+        "## 批次怎么分",
+        "",
+        "  - 按「可独立验证」切：接口层 / 数据转换 / 列表页 / 表单页 / 联调 等",
+        "  - 有依赖的排前面（数组顺序 = 建议 build 顺序）",
+        "  - 单批控制在「一个新 agent 一口气能稳妥做完」的量级（别太大、违背分批初衷）",
+        "",
+        "## 测试策略（test_strategy、自适应不强制）",
+        "",
+        "  - `tdd`：逻辑密集批（数据转换 / 工具函数 / 接口逻辑）→ 先写测试看红、再实现到绿",
+        "  - `after`：一般业务批 → 实现完补关键路径测试",
+        "  - `none`：纯样式 / 文案 / 配置批 → 免测",
+        "",
+        "## 入参",
+        "",
+        "  - `action_id`：当前 plan action 的 id",
+        "  - `batches`：批次数组、每项 { id, title, test_strategy, task_refs }",
+        "",
+        "## 返回值",
+        "",
+        "  - 成功：`{ ok: true }` / 失败：`{ ok: false, error: \"...\" }`（一般是 task 没在跑了）",
+      ].join("\n"),
+      inputSchema: {
+        task_id: z.string().describe("任务 id"),
+        action_id: z.string().describe("当前 plan action 的 id"),
+        batches: z
+          .array(
+            z.object({
+              id: z.string().describe("批次 id、plan 内唯一、建议 b1 / b2 / b3"),
+              title: z
+                .string()
+                .describe("一句话功能块标题、如「接口层 + 数据转换」"),
+              test_strategy: z
+                .enum(["tdd", "after", "none"])
+                .describe(
+                  "测试策略：tdd=先写测试 / after=实现后测试 / none=免测",
+                ),
+              task_refs: z
+                .array(z.string())
+                .describe('这批含 plan §5 哪些 task、如 ["Task 1","Task 2"]'),
+            }),
+          )
+          .describe("批次清单、数组顺序 = 建议 build 顺序（有依赖的排前面）"),
+      },
+    },
+    async ({ task_id, action_id, batches }) => {
+      console.log(
+        `[chat-mcp] set_plan_batches task=${task_id} action=${action_id} batches=${batches.length}`,
+      );
+      const result = await runTaskAction(task_id, {
+        kind: "set_plan_batches",
+        actionId: action_id,
+        batches: batches.map((b) => ({
+          id: b.id,
+          title: b.title,
+          testStrategy: b.test_strategy,
+          taskRefs: b.task_refs,
+        })),
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],

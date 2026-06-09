@@ -93,6 +93,17 @@ UI 卡片 / 详情页头部分两个 badge 显示。
 
 stub action 的 prompt 文件存在（V0.6.2+ 设计草稿）、UI 推进 dialog 灰掉、runner 准入拒绝。
 
+### 大需求分批 build（V0.6.23 起、V0.6.24 打磨、可选）
+
+plan 可把大需求在 §5 task 之上再分「批次」（`PlanBatch`、plan agent 调 MCP `set_plan_batches` 上报、落 `ActionRecord.planBatches`）。之后：
+
+- **build 选批**：推进 build 时 advance-dialog 列批次让用户勾（**默认只勾「下一个未完成批次」**remaining[0] + 一键「全选」、已做的带角标）、`requestedBatchIds` 落到该 build action；runner `buildBatchDirective` 把「本次做哪批 + 测试策略 + 进度」拼进 `[NEXT_ACTION]` 的 `[BUILD_BATCHES]` 段；每批可「新启 Agent」换干净上下文（无 subagent 原语、用这个当等价物）
+- **测试策略**：每批标 `TestStrategy`（tdd / after / none、自适应不强制、label「先写测试(TDD) / 实现后测试 / 免测」走 `TEST_STRATEGY_LABEL` 单一源）、build agent 按策略走（TDD 批用 `shell` 实跑仓库现有测试框架、先写测试看红 → 实现到绿；无测试设施则退化「正常实现 + artifact 写明该测什么」）
+- **review 两层**：runner `buildReviewScopeDirective` 按派生进度注入 `[REVIEW_SCOPE]`——还有批没做 = 增量（聚焦新批 + 衔接）、全做完 = 集成（查批次间接口 / 数据流 / 重复实现 / 冲突）
+- **进度纯派生**：`task-display.computeBatchProgress` 从 action 历史算「已做批 / 总批」、不存计数器（前后端共用单一源）；`getLatestPlanBatches` 倒序取「最新一个有批次的 plan」**不限 status**（批次是 agent 主动落库的有效数据、plan 重跑被标 error / 接续没重拆都能回退到拆好那版、避免分批失效）
+- **展示（V0.6.24 chip 化）**：详情页头部「上下文文档 / MCP」chip 行里加 `BatchProgress` chip（`batch-progress.tsx`）——拆了批次=实色「批次进度 N/M」、点开 Dialog 看进度条 + 每批详情；没拆=灰色「未分批」chip 占位；plan 产物（`artifact-panel.tsx`）无批次时顶部「未分批」提示条（防 AI 漏调 set_plan_batches 用户不知情）、有批次时底部 `BatchPlanTable` 渲染批次表（从 planBatches、不解析 markdown）
+- 小需求 plan 不分批（不调 set_plan_batches）→ build 退化单次做全部、老流程不变
+
 ### 单 SDK Run 永生
 
 整 task 跑在**同一个 SDK Run** 里、不一个 action 一个 Run：
@@ -240,29 +251,47 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.6.22：无限重连实测修复（errexit 坑）+ chat 回答截断兜底（2026-06-08）
+### V0.6.24：分批 build 打磨——批次显示 bug 修复 + 进度条 chip 化 + 文案（2026-06-09）
 
-**背景**：V0.6.21 上线后真机测「离开 >30 分钟」——shell 在 30 分钟时退出码 28 断开、while **没重连**。实测推翻 V0.6.21「本地验证 ✓」结论（本地 mock ≠ 真机）。
+V0.6.23 批次功能上线后的真机打磨（用户拿大需求边跑边修）：
 
-- **根因（实测锁定、非推测）**：terminal 显示单轮 KEEPALIVE 连续 30 个（30 分钟）零重连、`exit_code=28`（curl 超时码、**不是**强杀 137/143）、elapsed 正好 1800s。→ **SDK 跑 shell 默认带 `set -e` + `pipefail`**：首轮 `curl --max-time 1800` 超时（28）→ pipefail 让管道返回 28 → errexit 直接终止整个脚本 → while 永远进不了第二轮。**不是 SDK 有 30 分钟硬上限**（那会是 137）、idle-timeout 也没看错（KEEPALIVE 撑满 30 分钟没被空闲杀）。
-- **修复（`chat-mcp.ts: buildShellWaitGuidance`）**：脚本开头加 `set +e +o pipefail`、curl 行加 `|| true`——curl 首轮超时不再终止脚本、while 真正进下一轮重连。+ AI 兜底：异常 exit 段从「直接报告退出」改「先再调一次本 shell 兜底、连 2 次才报告」。
-- **⚠️ 待验证**：本次只证明 errexit 是 bug、**没测到「修了能跨 30 分钟」**（脚本第一轮就崩、没机会进第二轮）。退出码 28（非 137）强烈暗示能、但得改完再实测一轮 >30min 才算数。
-- **附带：chat 回答截断兜底**：另一个 chat task 踩坑——AI 把「一句概述」误当完整答案、提前调 wait_for_user、完整接口说明没发出去（用户「发我」才补全）。两层防：① `buildShellWaitGuidance` 给 chat 场景加「跑 shell 前自检：完整答案发了吗？没发现在补、跑 shell 前仍可 emit」近提示（纠正「调了 wait 本轮发不出」的错误认知）；② `chat-runner.ts` 标准动作强化「emit 完整答案、不是一句概述就停」+ 反模式警告。
+- **批次不显示 bug（RCA 锁定）**：`getLatestPlanBatches` 原要求 plan `completed` 才认其批次。但 plan 重跑场景——act_1 拆了批次却因 serve 重启被标 `error`、act_2 接续 `completed` 却没重调 `set_plan_batches`——两个都被跳过、批次读不到（advance-dialog 选批没选项）。**读取侧**去掉 `completed` 限制（planBatches 是 agent 主动落库的有效数据、run 中断不影响）；**写入侧** `action-plan.md` 加 ⚠️「重跑 / 接续 plan 必须重调 set_plan_batches」（批次绑当前 action、不从上一版继承、系统兜底回退但别依赖）。
+- **进度条 chip 化（UI）**：原 timeline 下常驻进度条用户嫌占高度 + 挡。改成详情页头部「上下文文档 / MCP」chip 行里的 chip + 点开 Dialog（对齐那两个的 chip+dialog 模式）——拆了批次=实色「批次进度 N/M」、没拆=灰色「未分批」chip 占位（点开也有引导）。`batch-progress.tsx` 重写。
+- **选批默认值 + 全选**：advance-dialog 默认勾从「全部未完成」改「只勾下一个未完成」（remaining[0]、用户拍板）+ 加「全选 / 全不选」按钮。
+- **A' plan 无批次提示条**：plan 产物顶部、该 plan 无 planBatches 时显示「本方案未分批 · 大需求可再聊聊让 AI 拆批次」（`artifact-panel.tsx`）——给「AI 漏调 set_plan_batches」一个可见信号 + 兜底入口。
+- **测试策略文案**：`after`「事后测」（用户反馈费解）→「实现后测试」、`tdd`「TDD(先写测试)」→「先写测试(TDD)」对仗；全局 5 处统一 + `batch-plan-table.tsx` 脚注改走 `TEST_STRATEGY_LABEL` 单一源（修之前硬编码漂移）。
+- **加固决策**：讨论过给 build 加「测试必须真跑且绿才算完成」硬 gate、结论**暂不加**（前端多 after/none 会误伤 / 跨框架检测复杂 / 跟 review 重叠 / 符合分阶段验证 ROI）——靠 prompt 引导 + review 把关。
 - `pnpm typecheck` ✓ / `pnpm lint` ✓。
 
-### V0.6.21：wait-ack 长连接「无限重连」——离开多久都不断（2026-06-05）
+### V0.6.23：大需求「批次 + 分批 build」（已实装、2026-06-08）
 
-**背景**：用户离开 >30 分钟（午饭 / 开会）、`curl --max-time 1800` 单轮到点断、agent 按引导 emit「连接断开请手动推进」退 run、回来发现 agent 死了得手动点「推进」。
+**动机**：一个大飞书需求、`plan + 单次 build` 跑完不保险——上下文越跑越长、agent 改着改着就乱了、质量滑。
 
-- **方案**：wait_for_user/ask_user 引导给的「单条 curl」改「`while` 循环」——单轮 30 分钟到点 / 网络抖断 → 命令内自动**同 token 重连**下一轮、拿到终态行才退出。用户离开多久都不会断。
-- **零记忆依赖**（关键）：重连写进 guide 每次返回的命令本身（最近的提示词）、不是教 agent「记得超时后重连」（放 system prompt 离得远会忘）——agent 只做它一直做的「拿 guide → 跑命令」、循环在 shell 内部。
-- **代码基础本就支持**：`subscribeWaitAck` 不消费 token、route abort 不清 pendingMap entry → 同 token 能反复接上同一个 entry（只要没 ack / 没停 / 服务没重启）。
-- **keepalive 可见性**：用 `tee` 实时透传 curl 输出到 stdout（agent 持续看到 KEEPALIVE）+ 存文件给 grep 判终态行——避免 `OUT=$(curl)` 全捕获让 agent 30 分钟看不到 stdout 触发「shell 卡了」bias。
-- **退出**：`grep -qE` 命中终态行（NEXT_ACTION/ACTION_ACK/USER_REPLY/.../INVALID_TOKEN）才 break；只有 [STALE]/[INVALID_TOKEN]（dev 热重载 / 服务重启丢 pendingMap）或命令异常 exit 才退 run。
-- **为什么不被 SDK 杀**（关键验证）：SDK shell 工具是 **idle-timeout（空闲/无输出超时）、不是总时长超时**（bundle 里 shell exec 类带 `idleTimeoutSeconds` 字段 + 现网单 curl 靠 60s KEEPALIVE 已能跑满 30 分钟为证）。while 每轮 curl 经 `tee` 持续透传 KEEPALIVE → 永不空闲 → 不被杀；最终 task 级 24h 硬超时（`TASK_HARD_TIMEOUT_MS`）兜底、即「无限」实际上限 24h。
-- 改动：`chat-mcp.ts: buildShellWaitGuidance`（curl→while）+ 文件头注释「不做断线重试」改「断线自动重连」；`_super.md` / `chat-runner.ts` 异常段同步；`wait-ack/route.ts` 连接建立即发首个 KEEPALIVE（把 while 每轮切换的无输出间隙从 ~60s 降到秒级、idle-timeout 额外保险）。
-- `pnpm typecheck` ✓ / `pnpm lint` ✓ / 本地循环逻辑验证 ✓（round1 KEEPALIVE 重连 → round2 ACTION_ACK 退出）。
-- ⚠️ **V0.6.22 真机实测推翻**：本地 mock 验证 ≠ 真机。真机 30 分钟时 while **没重连**、退出码 28 断开——SDK 跑 shell 默认 `set -e`+`pipefail`、首轮 curl 超时（28）触发 errexit 直接终止整个脚本、while 从未进第二轮。上面「idle-timeout 不被杀」判断对（KEEPALIVE 撑满 30 分钟没被空闲杀）、但漏了 errexit 这道坎。修复见 V0.6.22。
+**对齐四大库调研**（详见本轮对话 + `docs/PRODUCT-COMPARISON.md`）：
+- **Superpowers / GSD = 真分批 + 多 Agent**：每批换 fresh subagent + 每批自动复查（防上下文污染）。Superpowers 还强制 TDD + 两阶段 review；GSD 波次 gate + 目标倒推 verify。
+- **Spec Kit / OpenSpec = 单 Agent 顺序跑清单**：靠「实现前把 plan/spec 拆够细 + 人审到位」保证质量、不靠多 Agent。
+- **我们的位置**：无 subagent 原语（`@cursor/sdk` 不支持）、用 **「新启 Agent」**（`forceNewAgent`、换全新上下文 + 读前序 artifact）当等价物。**清单结构化我们已做了一大半**（plan §5 task 已带 精确文件路径 + 依赖 + 验收点 + 关键参考、约等于 Spec Kit）。
+
+**方案**：全程**一个 task**（不拆多任务、满足用户硬要求）、plan 多产出「批次」层、build 可选「全做 / 挑批」、每批可新启 Agent、review 两层。
+
+**数据模型**（`types.ts`、最小化、**进度纯推导不存计数器**）：
+- `TestStrategy = "tdd" | "after" | "none"`——自适应 TDD：逻辑批 TDD / UI 批实现后测试 / 纯样式免测（**不强制**、对齐 Spec Kit「TDD 可选」、契合我们前端为主的现实）
+- `PlanBatch { id; title; testStrategy; taskRefs: string[] }`——批次 = 可独立交付功能块、下挂 plan §5 的 task
+- `ActionRecord.planBatches?: PlanBatch[]`——plan action 落；plan agent 写完 artifact 调 **MCP `set_plan_batches`** 上报（跟 `submit_mr` / `set_feishu_testers` 同套路、**不靠解析 markdown**）
+- `ActionRecord.requestedBatchIds?: string[]`——推进 build 时**用户在 dialog 勾的批次、后端 advance 时直接存**（不靠 agent 上报、省掉第 2 个 MCP 工具）
+- **进度 = 派生**：已做批 = ∪(completed build 的 `requestedBatchIds`)、总批 = 最新 plan 的 `planBatches`——不存「已完成 N 批」、避免漂移
+
+**四块改动**：
+1. **plan**（`action-plan.md`）：§5 task 拆分上加一层「批次」分组、每批标 `testStrategy` + 一句话目标 + independent test；写完调 `set_plan_batches` 上报
+2. **build**（`action-build.md`）：开头从 `[NEXT_ACTION]` 指令读「本次做哪批」（用户 dialog 选的）；只做选中批次的 task；**TDD 批先写测试看失败再实现**；build artifact 记「本次完成批次 X」（给人看）
+3. **review**（`action-review.md`）：两层——**增量**（只审本批 build 的 diff）/ **集成**（所有 planBatches 都 built 后、审批次间是否打架、借 GSD「目标倒推」）；判用哪层 = 看 `requestedBatchIds` 并集是否已覆盖全部 `planBatches`
+4. **UI**（`advance-dialog.tsx` + `batch-progress.tsx`）：推进 build 时若最新 plan 有 `planBatches`、用 ChoiceButton 卡片列批次让用户勾（**默认勾未完成批次**、已做的带角标）+ 显示「X/Y 批」进度；详情页 timeline 下常驻 `BatchProgress` 进度条（M/N + 每批 chip、纯派生、没批次不渲染）
+
+**关键决策**：批次结构走 MCP 上报（不解析 markdown）· 进度纯派生不存状态 · TDD 自适应不强制 · 批次不是独立 task（全程一个 task）· review 增量 / 集成由后端派生进度注入 `[REVIEW_SCOPE]`（agent 不自己猜）。
+
+**数据流闭环**（实装）：plan agent 调 MCP `set_plan_batches`（chat-mcp 第 5 工具）→ runner `taskActionHandler` patchAction 落 `planBatches`；build 推进时 advance-dialog 勾批 → `/advance` 透传 `requestedBatchIds` → 落 build action → runner `buildBatchDirective` 拼 `[BUILD_BATCHES]`；review 推进时 `buildReviewScopeDirective` 注入 `[REVIEW_SCOPE]`；进度全程走 `task-display.computeBatchProgress` 派生（前后端共用）。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓（0 warning）。⚠️ 真机大需求实测待用户验。
 
 ---
 
@@ -274,6 +303,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **V0.6 统一 runner（task 容器 + action history）** | `src/lib/server/task-runner.ts` |
 | **V0.6 action 后置 deterministic check** | `src/lib/server/action-checks.ts` |
 | **V0.6 task schema + 文件系统** | `src/lib/types.ts` + `src/lib/server/task-fs.ts` |
+| **批次推导 + 展示（V0.6.23 起、computeBatchProgress 前后端共用 / 进度 chip / 批次表 / 选批 / 测试策略 label）** | `src/lib/task-display.ts` + `src/lib/types.ts: PlanBatch / TestStrategy / TEST_STRATEGY_LABEL` + `src/components/tasks/{batch-progress,batch-plan-table}.tsx` + `advance-dialog.tsx` 选批 |
 | **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |
 | **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |

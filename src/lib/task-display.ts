@@ -12,8 +12,10 @@
 import type {
   ActionStatus,
   ActionType,
+  PlanBatch,
   RepoStatus,
   RunStatus,
+  Task,
 } from "./types";
 
 // ===========================================
@@ -161,4 +163,77 @@ export const formatRelative = (ts: number): string => {
   if (hour < 24) return `${hour} 小时前`;
   const day = Math.floor(hour / 24);
   return `${day} 天前`;
+};
+
+// ===========================================
+// V0.6.23 build 分批：批次推导（前后端共用单一源）
+// ===========================================
+//
+// 为什么放这里：UI（advance-dialog 选批、timeline 进度条）跟后端（task-runner 拼 build
+// 指令）都要「最新 plan 的批次 + 已 build 哪些」这套推导、放一处避免两边算法漂移。
+// 进度全部**派生自 action 历史**、不存计数器字段——plan 重拆 / build 返工都能自然反映。
+
+/**
+ * 取最新一个「有批次」的 plan action 的 planBatches。
+ *
+ * - build 分批选择 + 进度推导都以它为基准
+ * - 返空数组 = 这个 task 没拆批次（小需求 / 老 task）、build 退化成「做全部」老流程
+ * - 倒序找：plan 可能被重跑多次、只认最新一版拆分
+ * - 不限 status：planBatches 是 agent 调 set_plan_batches 主动落库的有效数据、
+ *   run 中断（error）/ 还在 awaiting_ack 都不影响数据本身。
+ *   典型坑：plan 拆了批次但 serve 重启被标 error、之后接续的 plan 没重拆批次——
+ *   仍要能回退到那次拆好的批次、否则分批 build 整个失效。
+ */
+export const getLatestPlanBatches = (task: Task): PlanBatch[] => {
+  for (let i = task.actions.length - 1; i >= 0; i--) {
+    const a = task.actions[i];
+    if (
+      a.type === "plan" &&
+      !a.excluded &&
+      a.planBatches &&
+      a.planBatches.length > 0
+    ) {
+      return a.planBatches;
+    }
+  }
+  return [];
+};
+
+/**
+ * 已 build 过的批次 id 集合（纯派生、不存计数器避免漂移）。
+ * = 所有 completed 且未划除的 build action 的 requestedBatchIds 之并集。
+ */
+export const collectBuiltBatchIds = (task: Task): Set<string> => {
+  const ids = new Set<string>();
+  for (const a of task.actions) {
+    if (a.type === "build" && a.status === "completed" && !a.excluded) {
+      for (const id of a.requestedBatchIds ?? []) ids.add(id);
+    }
+  }
+  return ids;
+};
+
+/** 批次进度快照（UI 进度条 + 后端 prompt 进度提示共用） */
+export interface BatchProgress {
+  /** 最新 plan 拆出的全部批次（顺序 = 建议 build 顺序） */
+  batches: PlanBatch[];
+  /** 总批次数 */
+  total: number;
+  /** 已完成批次数（限当前 plan 批次内、防 plan 重拆后旧 id 残留误计） */
+  done: number;
+  /** 已 build 过的批次 id（含可能不在当前 plan 的历史 id） */
+  doneIds: Set<string>;
+  /** 还没 build 的批次（= 推进 build 时默认勾选项） */
+  remaining: PlanBatch[];
+}
+
+/**
+ * 算批次进度——给 UI 进度条 / 默认勾选 + 后端 build 指令的「累计 X/Y 批」共用。
+ */
+export const computeBatchProgress = (task: Task): BatchProgress => {
+  const batches = getLatestPlanBatches(task);
+  const doneIds = collectBuiltBatchIds(task);
+  const remaining = batches.filter((b) => !doneIds.has(b.id));
+  const done = batches.length - remaining.length;
+  return { batches, total: batches.length, done, doneIds, remaining };
 };

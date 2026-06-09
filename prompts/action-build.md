@@ -34,6 +34,8 @@
 
 **改动范围**：有 plan 时**严格按最新 plan artifact 的 task 顺序和改动范围**（不在 plan 范围内的文件一行都不许动）；无 plan 时**以用户指令圈定的范围为准**（指令没点到的文件别乱动、拿不准就 ask_user）。
 
+> **分批 build（V0.6.23）**：如果 [NEXT_ACTION] 里带了 `[BUILD_BATCHES]` 段（大需求 plan 拆了批次、用户只让你做其中几批）、则**本次范围进一步收窄到那几批对应的 task**——`[BUILD_BATCHES]` 没列的批次、即使在 plan §5 里、这次也一行都不要动。详见执行步骤 §3.0。
+
 ## 输入文件
 
 - **plan artifact**（`<n>-plan.md` 取最大 n、**有则必读**、本 action 工单 + 业务上下文）：list `{{actionArtifactsDir}}/` 找；无 plan 时按用户指令走
@@ -104,6 +106,20 @@
 
 - **有 plan**：按 plan §5 的 task 顺序逐个做
 - **无 plan**：把用户指令拆成几个小改动步骤、逐步做（每步同样「改一处 → 局部校验」、别一把梭）
+
+**3.0 分批 build（V0.6.23、仅当 [NEXT_ACTION] 带 `[BUILD_BATCHES]` 段时）**：
+
+大需求 plan 会拆「批次」、用户在推进 build 时只勾本次要做的几批。这时 [NEXT_ACTION] 里有一段 `[BUILD_BATCHES]`、列了本次该做哪些批次（含每批的标题 / 测试策略 / 含哪些 task）：
+
+- **只做 `[BUILD_BATCHES]` 列出的批次对应的 task**——plan §5 里属于其它批次的 task、这次一行都不要碰（下次推进别的批次时再做）
+- **按每批的「测试策略」走**：
+  - `tdd`（先写测试）→ 对这批的核心逻辑：**先写测试、跑一遍看它失败（红）→ 再写实现让测试通过（绿）**。测试放仓库现有测试目录 / 同级 `__tests__`、用仓库现有测试框架（jest / vitest / junit 等、先 `read` 配置确认）
+  - `after`（实现后测试）→ 先实现、再对关键路径补测试
+  - `none`（免测）→ 跳过测试、正常实现即可
+  - 仓库**没有任何测试设施**（没装测试框架 / 没测试目录）→ `tdd`/`after` 退化成「正常实现 + 在 build artifact 写明该测什么 / 为什么没法自动测」、**别为了凑测试硬装框架 / 改仓库测试配置**
+- build artifact 总览里**写明「本次完成批次：<id 列表>」**——给人 / review 交叉核对用（整体进度 + review 增量 / 集成范围是系统按你勾选的批次自动推导的、**不解析这行文本**、但写清楚便于人工对账）
+
+> 没有 `[BUILD_BATCHES]` 段（小需求 / plan 没分批）→ 跳过本步、按下面的常规流程做全部。
 
 每个 task / 步骤的循环：
 
@@ -178,10 +194,11 @@ shell stdout 返回行解析：
 
 ## 总览
 
+- 本次完成批次：<如 b1 / b2；未分批时写「全部（未分批）」>
 - 计划 task 数：<N>
 - 完成 task 数：<N>
 - 改动文件数：<N>
-- 全量校验：lint=<pass/fail>、typecheck=<pass/fail>
+- 全量校验：lint=<pass/fail>、typecheck=<pass/fail>、测试=<pass/fail/skip>
 - 偏离 plan：<有 / 无、详见下文>
 
 ## Task 完成情况
@@ -251,3 +268,4 @@ shell stdout 返回行解析：
 - **跑 shell 慢的命令**：`pnpm install` / 全量 build 可能耗时几分钟、agent 不要因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
 - **写完 → 直接调 wait_for_user**：不要在 assistant_message 里说「我改完了你看下」之类的话
 - **绝对不自动进入下一 action**：build 拿到 [ACTION_ACK approve] 后立刻 wait_for_user 等下一 action 指令、不要自己跑 review / ship——下一 action 类型由用户在 UI 选
+- **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

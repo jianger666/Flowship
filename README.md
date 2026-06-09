@@ -57,6 +57,7 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 - **shell + curl long-poll 保活**：agent 拿到 `wait_for_user` 返回的 shell 引导后调 `shell` 工具 curl 跟服务端长连接、根治旧版 anti-loop
 - **Git 分支自动建（多仓 + 模板化）**：build 前 runner 按模板（默认 `feature/{username}/{storyId}-{taskTitle}`、可 per-repo 覆盖）拼分支名、prompt 注入 idempotent checkout 引导；填了「已有工作分支」则复用
 - **决定链落 md**：review 提的 bug、用户裁决（改 / 不改 / 延后）写进 review artifact、后续 build 不重复问（换 agent 也读得到）
+- **大需求分批 build（可选）**：plan 可把大需求在 task 之上再拆「批次」（每批标测试策略 tdd / after / none）、build 时勾本次做哪批、每批可新启 Agent 换干净上下文、review 按进度自动切「增量 / 集成」两层；全程一个 task、进度纯派生、详情页头部 chip 看批次进度
 
 ---
 

@@ -35,6 +35,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, Loader2, Paperclip, X } from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
@@ -51,9 +52,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
-import { ACTION_LABEL } from "@/lib/task-display";
+import { ACTION_LABEL, computeBatchProgress } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
+import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import type { ActionType, ModelSelection, Task } from "@/lib/types";
 
 // V0.6.1 已实装的 action 类型；test/learn 灰掉
@@ -184,6 +186,8 @@ interface Props {
     images?: ImagePayload[];
     // V0.6.14：合并后是否删源分支（仅 actionType==="ship" 时传、其它为 undefined）
     removeSourceBranch?: boolean;
+    // V0.6.23：build 分批——本次做哪些批次（仅 build 且 plan 拆批时传、其它 undefined=全做）
+    requestedBatchIds?: string[];
   }) => Promise<void>;
   submitting: boolean;
 }
@@ -203,6 +207,18 @@ export const AdvanceDialog = ({
     () => task.removeSourceBranchOnMerge ?? false,
     [task.removeSourceBranchOnMerge],
   );
+  // V0.6.23：批次进度（最新 plan 拆的批次 + 已 build 哪些）——build 选批 UI + 默认勾选都基于它
+  const batchProgress = useMemo(() => computeBatchProgress(task), [task]);
+  const hasBatches = batchProgress.total > 0;
+  // build 选批默认值（id 串）：默认只勾「下一个未完成批次」(remaining[0]、用户拍板别全勾)、
+  // 全做完了(remaining 空)默认全勾允许整体返工。memo 成稳定字符串、内容不变时 SSE 推 task
+  // 引用变也不会重置用户已改的勾选（同 model list 那个坑）
+  const defaultBatchIdsKey = useMemo(() => {
+    if (batchProgress.remaining.length > 0) {
+      return batchProgress.remaining[0].id;
+    }
+    return batchProgress.batches.map((b) => b.id).join(",");
+  }, [batchProgress]);
 
   // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
@@ -212,6 +228,8 @@ export const AdvanceDialog = ({
   const [forceNewAgent, setForceNewAgent] = useState(false);
   // V0.6.14：ship 提测「合并后删除源分支」开关（默认保留、用户拍板；dialog 打开时按 task 上次选择初始化）
   const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
+  // V0.6.23：build 分批——本次勾选的批次 id（仅 build 且 plan 拆了批次时用、空=未拆/全做）
+  const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([]);
   // 强制起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅 forceNewAgent=true 时透传给父组件、否则 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
@@ -249,6 +267,8 @@ export const AdvanceDialog = ({
     setInstruction("");
     setForceNewAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
+    // V0.6.23：build 选批默认勾选（未做批次优先 / 全做完则全勾）
+    setSelectedBatchIds(defaultBatchIdsKey ? defaultBatchIdsKey.split(",") : []);
     // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
     const s = getSettings();
     setPickedModel(s.defaultModel ?? { id: "" });
@@ -256,7 +276,7 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
-  }, [open, defaultActionType, defaultRemoveSourceBranch]);
+  }, [open, defaultActionType, defaultRemoveSourceBranch, defaultBatchIdsKey]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -283,8 +303,34 @@ export const AdvanceDialog = ({
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (disabledReason) return false;
+    // build 分批时至少选一批（清空全部勾选语义不明、不让提交）
+    if (actionType === "build" && hasBatches && selectedBatchIds.length === 0) {
+      return false;
+    }
     return true;
-  }, [submitting, disabledReason]);
+  }, [
+    submitting,
+    disabledReason,
+    actionType,
+    hasBatches,
+    selectedBatchIds.length,
+  ]);
+
+  // V0.6.23：批次卡片点选 toggle（含已做批次、允许返工重选）
+  const toggleBatch = (id: string) => {
+    setSelectedBatchIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  };
+
+  // V0.6.24：全选 / 全不选切换（批次多时省得一个个点；已全选则点成全不选）
+  const allBatchesSelected =
+    batchProgress.total > 0 && selectedBatchIds.length === batchProgress.total;
+  const toggleAllBatches = () => {
+    setSelectedBatchIds(
+      allBatchesSelected ? [] : batchProgress.batches.map((b) => b.id),
+    );
+  };
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -298,6 +344,9 @@ export const AdvanceDialog = ({
       images: toUploadPayload(),
       // 仅 ship 时传「合并后删源分支」、其它 action 无意义（advance route 据此决定是否落字段）
       removeSourceBranch: actionType === "ship" ? removeSourceBranch : undefined,
+      // 仅 build 且 plan 拆了批次时传选中批次；否则 undefined（无批次 / 全做、退化老流程）
+      requestedBatchIds:
+        actionType === "build" && hasBatches ? selectedBatchIds : undefined,
     });
   };
 
@@ -365,6 +414,69 @@ export const AdvanceDialog = ({
               ))}
             </div>
           </div>
+
+          {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动） */}
+          {actionType === "build" && hasBatches && (
+            <div className="grid gap-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <Label>
+                  本次做哪些批次{" "}
+                  <span className="text-xs font-normal text-muted-foreground">
+                    （共 {batchProgress.total} 批 · 已完成 {batchProgress.done}{" "}
+                    批）
+                  </span>
+                </Label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={toggleAllBatches}
+                  disabled={submitting}
+                  className="h-6 shrink-0 px-2 text-xs text-muted-foreground"
+                >
+                  {allBatchesSelected ? "全不选" : "全选"}
+                </Button>
+              </div>
+              <div className="grid gap-2">
+                {batchProgress.batches.map((b) => {
+                  const done = batchProgress.doneIds.has(b.id);
+                  return (
+                    <ChoiceButton
+                      key={b.id}
+                      shape="card"
+                      selected={selectedBatchIds.includes(b.id)}
+                      onClick={() => toggleBatch(b.id)}
+                      disabled={submitting}
+                      className="flex flex-col items-start gap-0.5"
+                    >
+                      <div className="flex w-full items-center gap-1.5">
+                        <span className="min-w-0 truncate text-xs font-medium">
+                          {b.title}
+                        </span>
+                        {done && (
+                          <Badge
+                            variant="secondary"
+                            className="ml-auto shrink-0 px-1 py-0 text-[10px]"
+                          >
+                            已做
+                          </Badge>
+                        )}
+                      </div>
+                      <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+                        {TEST_STRATEGY_LABEL[b.testStrategy]}
+                        {b.taskRefs.length > 0
+                          ? ` · ${b.taskRefs.join(" / ")}`
+                          : ""}
+                      </span>
+                    </ChoiceButton>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                默认勾下一个未完成批次、可手动多选 / 全选；每批以新 agent 上下文执行
+              </p>
+            </div>
+          )}
 
           {/* 用户指令、选填——飞书/上下文 doc 已经在 super-prompt 里带上、空提交也能跑 */}
           <div className="grid gap-1.5">

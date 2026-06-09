@@ -198,6 +198,44 @@ export type ActionStatus =
   | "cancelled";
 
 /**
+ * V0.6.23：批次测试策略（自适应 TDD、不强制）
+ * - tdd：先写测试看失败再实现（逻辑密集批：数据转换 / 工具函数 / 接口逻辑）
+ * - after：实现完补测试（一般业务批）
+ * - none：免测（纯样式 / 文案 / 配置批）
+ * plan 给每批标一个、build 跑该批时按策略走（tdd 批引导「先写测试看红 → 实现到绿」）。
+ * why 自适应不强制：我们前端为主、UI/交互很难先写测试、强制 = 为凑测试而写测试（对齐 Spec Kit「TDD 可选」）。
+ */
+export type TestStrategy = "tdd" | "after" | "none";
+
+/** 测试策略中文标签（plan artifact / UI 展示共享单一源） */
+export const TEST_STRATEGY_LABEL: Record<TestStrategy, string> = {
+  tdd: "先写测试（TDD）",
+  after: "实现后测试",
+  none: "免测",
+};
+
+/**
+ * V0.6.23：plan 产出的「批次」——大需求在 task 拆分之上再加一层「可独立交付的功能块」。
+ *
+ * 背景：一个大飞书需求 plan + 单次 build 跑完不保险（上下文越长 agent 越容易跑乱、质量滑）。
+ * 对齐 Superpowers/GSD「分批 + 每批换新 Agent」思路、但全程留在**一个 task** 里（不拆多任务、用户硬要求）。
+ *
+ * - id：plan 内唯一（如 "b1" / "b2"）——build 推进时用户勾选 + 进度推导都靠它
+ * - title：一句话功能块标题（如「接口层 + 数据转换」）
+ * - testStrategy：这批的测试策略（自适应 TDD、见 TestStrategy）
+ * - taskRefs：这批包含 plan §5 的哪些 task（如 ["Task 1", "Task 2"]、给人看 + build 定位范围）
+ *
+ * 存储：plan agent 写完 artifact 调 MCP `set_plan_batches` 上报、落到该 plan ActionRecord.planBatches
+ *（跟 submit_mr / set_feishu_testers 同套路、不靠解析 markdown）。
+ */
+export interface PlanBatch {
+  id: string;
+  title: string;
+  testStrategy: TestStrategy;
+  taskRefs: string[];
+}
+
+/**
  * 单条 action 记录
  *
  * - id：任务内唯一（如 act_1 / act_2、生成时单调递增不复用）
@@ -263,6 +301,21 @@ export interface ActionRecord {
       hasConflicts?: boolean;
     }>;
   };
+
+  /**
+   * V0.6.23：plan action 产出的批次清单（plan agent 调 set_plan_batches 上报、只 plan action 有）
+   * - build 选批 + 进度推导都基于「最新 completed plan 的 planBatches」
+   * - 空 / 不存 = 这次 plan 没拆批次（小需求、build 默认全做、退化成老流程）
+   */
+  planBatches?: PlanBatch[];
+
+  /**
+   * V0.6.23：build action 本次「做哪些批次」——推进 build 时用户在 dialog 勾选、advance 时后端直接存
+   * - 不靠 agent 上报（省一个 MCP 工具）：build agent 从 NEXT_ACTION 指令读做哪批、老实做完
+   * - 进度推导：已做批 = ∪(completed build 的 requestedBatchIds)、总批 = 最新 plan.planBatches
+   * - 空 / 不存 = 全做（无批次的 plan、或用户没挑批直接全做）
+   */
+  requestedBatchIds?: string[];
 
   /**
    * 模型选择（V0.6 推进 dialog 高级选项支持切模型）

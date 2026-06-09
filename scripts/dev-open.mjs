@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * 起 next dev、并在 server ready 后自动开浏览器
+ * 起 next（dev 或 start）、并在 server ready 后自动开浏览器
  *
- * 使用方法：pnpm start （别名 dev:open）
+ * 使用方法：
+ *   - `pnpm start`：起 next dev（热更、改 fe-ai-flow 代码时用、但按需编译会抖 chat-mcp globalThis 状态）
+ *   - `pnpm serve`：先 next build 再起 next start（生产、跑真实大需求用、单一模块树、状态稳）
+ *
+ * 参数：argv[2] = "start" → 生产模式（next start）；其它 / 缺省 → dev 模式（next dev）
  *
  * 设计：
- *   - 用 spawn 起 `next dev`、stdio 直接继承（保留 Next 全部 dev 输出）
+ *   - 用 spawn 起 `next <mode>`、stdio 直接继承（保留 Next 全部输出）
  *   - 监听 stdout 第一次出现 "Ready in" 或类似 ready 信号、就触发 open（避免 hardcoded sleep）
  *   - 兜底：10s 内还没等到 ready 也强制 open（极端情况下用户能自己手动打开）
  *   - signal 透传（SIGINT/SIGTERM）、ctrl+c 能正常停子进程
@@ -21,7 +25,9 @@ const URL = `http://localhost:${PORT}`;
 const READY_RE = /Ready in|started server|local:.*localhost/i;
 const FALLBACK_DELAY_MS = 10_000;
 
-const child = spawn("next", ["dev", "-p", PORT], {
+// argv[2]：start → 生产模式（需先 next build、由 package.json serve 串好）；缺省 → dev 热更
+const MODE = process.argv[2] === "start" ? "start" : "dev";
+const child = spawn("next", [MODE, "-p", PORT], {
   stdio: ["inherit", "pipe", "pipe"],
 });
 

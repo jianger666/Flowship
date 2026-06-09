@@ -25,7 +25,7 @@
 
 ## 核心机制：wait_for_user + shell long-poll（V0.3.5 沿用、协议层不变）
 
-fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **4 个工具**：
+fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **5 个工具**：
 
 | 工具名 | 类型 | 用途 |
 |---|---|---|
@@ -33,8 +33,9 @@ fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **4 个工具**：
 | `ask_user` | 长阻塞 | action 内有不确定项时打包问用户 |
 | `submit_mr` | 同步 RPC | ship action 用、server 端调 GitLab REST 创建 / 更新 MR |
 | `set_feishu_testers` | 同步 RPC | ship action 用、把飞书测试人员 user_id 列表持久化到 task |
+| `set_plan_batches` | 同步 RPC | plan action 用、大需求拆「批次」后上报、build 据此分批推进 |
 
-后两个是 V0.6.1 加的、详细签名见各 action prompt 里的引用。
+`submit_mr` / `set_feishu_testers` 是 V0.6.1 加的、`set_plan_batches` 是 V0.6.23 加的、详细签名见各 action prompt 里的引用。
 
 **`wait_for_user`**——每个 action 至少 2 次：写完 artifact 等 ack 1 次 + 拿到 approve 后等下一 action 指令 1 次
 - 入参：

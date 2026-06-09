@@ -29,7 +29,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { Sparkles } from "lucide-react";
+import { AlertTriangle, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -146,6 +146,11 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   // 自定义文本模式：哪个 question 切到了 textarea
   // Set<questionId>
   const [otherMode, setOtherMode] = useState<Set<string>>(new Set());
+  // V0.6.24：agent 已断（task.runStatus=error）时这组 ask 不可能再被响应、
+  // dialog 转「失效态」可关、解除「不可 dismiss + 提交 409」的死锁、引导用户去推进重启
+  const isStale = task.runStatus === "error";
+  // 失效态下「我知道了」关闭弹窗的本地开关（正常态无关闭入口、恒 false、不影响原有强制答题）
+  const [dismissed, setDismissed] = useState(false);
 
   // askId 切换时清状态（保证每次新弹窗都是干净的）
   // 失败重试也走这里——之后再讨论体验是否要保留草稿
@@ -153,6 +158,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
     setDrafts({});
     setOtherMode(new Set());
     setSubmitting(false);
+    setDismissed(false);
   }, [askId]);
 
   // 判断是否所有 question 都已答
@@ -169,7 +175,8 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
     return true;
   }, [questions, drafts]);
 
-  const open = pendingEvent !== null;
+  // 正常态 dismissed 恒 false（无关闭入口）、open 跟着 pendingEvent；失效态可被「我知道了」关
+  const open = pendingEvent !== null && !dismissed;
 
   // 点选项按钮：写 optionId、清 text（确保只用一种答案）
   // 退出 other 模式（如果之前切过）
@@ -268,12 +275,32 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   return (
     <Dialog
       open={open}
-      // 不允许用户 dismiss——只有提交才关
-      // 用户半路关掉、agent 永远卡在等答案、体验更糟
-      onOpenChange={() => {
-        /* noop */
+      onOpenChange={(o) => {
+        // 正常态：不允许 dismiss（点 backdrop / Esc 关掉、agent 会永远等答案）
+        // 失效态（agent 已断、task.runStatus=error）：允许关、好让用户去「推进」重启
+        if (!o && isStale) setDismissed(true);
       }}
     >
+      {isStale ? (
+        // V0.6.24 失效态：agent 已断、这组 ask 送不达了、解除死锁让用户关掉去重启
+        <DialogContent
+          className="flex w-full max-w-md flex-col gap-0 overflow-hidden p-0"
+          showCloseButton={false}
+        >
+          <DialogHeader className="flex flex-row items-center gap-2 border-b px-5 py-4">
+            <AlertTriangle className="size-4 text-destructive" />
+            <DialogTitle className="text-sm">问询已失效</DialogTitle>
+          </DialogHeader>
+          <div className="px-5 py-4 text-sm leading-relaxed text-muted-foreground">
+            Agent 已断开（进程重启 / 异常退出）、这组问题没送达、你刚填的答案也没保存。关闭后点右上角「推进」（建议勾「新启 Agent」）重新启动、AI 会接着读历史继续。
+          </div>
+          <DialogFooter className="mx-0 mb-0 border-t px-5 py-3">
+            <Button size="sm" onClick={() => setDismissed(true)}>
+              我知道了
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      ) : (
       <DialogContent
         className="flex max-h-[80vh] w-full max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
         showCloseButton={false}
@@ -416,6 +443,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
           </div>
         </DialogFooter>
       </DialogContent>
+      )}
     </Dialog>
   );
 };

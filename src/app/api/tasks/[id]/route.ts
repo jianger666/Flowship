@@ -16,12 +16,13 @@ import {
   getTask,
   setTaskArchived,
   setTaskDisabledMcpServers,
+  setTaskModel,
   setTaskUiLayout,
   updateTaskFields,
 } from "@/lib/server/task-fs";
 import { cancelTaskRun } from "@/lib/server/task-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
-import type { TaskRole } from "@/lib/types";
+import type { ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -46,6 +47,8 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       archived?: boolean;
       disabledMcpServers?: string[] | null;
       uiLayout?: { artifactPanelSize?: number } | null;
+      // V0.6.24：chat 模式切模型（持久化 task.model、下一个 run 生效）
+      model?: ModelSelection;
       // V0.6.6：编辑任务字段（详情页编辑弹窗、可一次传多个）
       title?: string;
       role?: TaskRole;
@@ -99,6 +102,26 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       await setTaskUiLayout(id, value);
       // 不返完整 task：高频拖动期间 round-trip 全量没必要、前端 state 已经是源头
       return NextResponse.json({ ok: true });
+    }
+
+    // V0.6.24：chat 切模型——只认 { id: 非空字符串 }、params 可选
+    if ("model" in body) {
+      const m = body.model;
+      if (
+        !m ||
+        typeof m !== "object" ||
+        typeof m.id !== "string" ||
+        !m.id.trim()
+      ) {
+        return NextResponse.json(
+          { error: "model 必须是 { id: 非空字符串 }" },
+          { status: 400 },
+        );
+      }
+      const task = await setTaskModel(id, m);
+      if (!task)
+        return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
     }
 
     // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / repoFeatureBranches、可一次传多个）

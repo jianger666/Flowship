@@ -45,6 +45,7 @@ import { ActionTimeline } from "@/components/tasks/action-timeline";
 import { AdvanceDialog } from "@/components/tasks/advance-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
+import { BatchProgress } from "@/components/tasks/batch-progress";
 import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
@@ -236,6 +237,32 @@ const TaskDetailPage = () => {
     [],
   );
 
+  // V0.6.24：Cmd/Ctrl+J 快捷打开「再聊聊」
+  // 能否打开的条件在下方 canAck 算出后写进 ref（hooks 必须在早返回前、canAck 在早返回后、故用 ref 中转）；
+  // effect 只绑一次 listener、内部读 ref.current 拿最新值、避免 task SSE 高频 setState 反复重绑。
+  const canOpenReviseRef = useRef(false);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // 只认 Cmd(mac) / Ctrl(其它) + J
+      if (e.key.toLowerCase() !== "j" || !(e.metaKey || e.ctrlKey)) return;
+      if (!canOpenReviseRef.current) return;
+      // 焦点在输入框 / 可编辑区时让行、不抢用户打字
+      const el = document.activeElement as HTMLElement | null;
+      if (
+        el &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setReviseOpen(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   if (!loaded) {
     return <LoadingState variant="block" />;
   }
@@ -250,6 +277,9 @@ const TaskDetailPage = () => {
     !!currentAction &&
     currentAction.status === "awaiting_ack" &&
     task.runStatus === "awaiting_user";
+
+  // 上方 Cmd/Ctrl+J 快捷键用：能否打开「再聊聊」= 跟「再聊聊」按钮同条件（canAck 且没在提交 / 没开）
+  canOpenReviseRef.current = canAck && !ackSubmitting && !reviseOpen;
 
   // 推进按钮：任务非终结态 + agent 不在跑代码 + 当前没有待 ack 的 action
   //   - idle / error：没活 agent、推进会起新 Run
@@ -284,6 +314,8 @@ const TaskDetailPage = () => {
     images?: ImagePayload[];
     // V0.6.14：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
     removeSourceBranch?: boolean;
+    // V0.6.23：build 分批——本次做哪些批次（advance-dialog 仅 build 且 plan 拆批时给值）
+    requestedBatchIds?: string[];
   }) => {
     setStarting(true);
     try {
@@ -315,6 +347,8 @@ const TaskDetailPage = () => {
           gitToken: settings.gitToken?.trim() || undefined,
           // V0.6.14 ship action：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
           removeSourceBranch: input.removeSourceBranch,
+          // V0.6.23 build action：本次做哪些批次（仅 build 且 plan 拆批时有值、否则 undefined=全做）
+          requestedBatchIds: input.requestedBatchIds,
         }),
       });
       if (!res.ok) {
@@ -598,7 +632,7 @@ const TaskDetailPage = () => {
                   size="sm"
                   onClick={() => setReviseOpen(true)}
                   disabled={ackSubmitting}
-                  title={`想改 ${currentAction ? ACTION_LABEL[currentAction.type] : ""} 产物 / 有疑问、走这里`}
+                  title={`想改 ${currentAction ? ACTION_LABEL[currentAction.type] : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
                 >
                   <MessageCircleQuestion />
                   再聊聊
@@ -691,10 +725,12 @@ const TaskDetailPage = () => {
           </div>
         </div>
 
-        {/* 上下文文档 + MCP */}
+        {/* 上下文文档 + MCP + 批次：都是 chip + 点开 dialog、同一行、不各占一行 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <ContextDocsPanel task={task} onTaskUpdate={setTask} />
           <TaskMcpPanel task={task} />
+          {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
+          <BatchProgress task={task} />
         </div>
 
         {/* Action timeline */}

@@ -23,10 +23,11 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import { FileText } from "lucide-react";
+import { FileText, Info } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
@@ -470,13 +471,31 @@ export const ArtifactPanel = ({
       {/* content area */}
       <div className="flex-1 overflow-y-auto">
         {mode === "content" ? (
-          <div className="prose prose-sm dark:prose-invert max-w-none px-6 py-4 prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={markdownComponents}
-            >
-              {currentArtifact.content}
-            </ReactMarkdown>
+          <div className="px-6 py-4">
+            {/* V0.6.24 (A')：plan 没拆批次时显式提示 + 兜底入口——防 AI 漏调 set_plan_batches、用户却不知情 */}
+            {action.type === "plan" &&
+              (!action.planBatches || action.planBatches.length === 0) && (
+                <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
+                  <Info className="size-3.5 shrink-0" />
+                  <span>
+                    本方案未分批（单次 build）· 大需求可「再聊聊」让 AI 拆批次
+                  </span>
+                </div>
+              )}
+            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={markdownComponents}
+              >
+                {currentArtifact.content}
+              </ReactMarkdown>
+            </div>
+            {/* V0.6.24：plan 批次表从 planBatches 渲染（单一真相源、不再写进 artifact md） */}
+            {action.type === "plan" &&
+              action.planBatches &&
+              action.planBatches.length > 0 && (
+                <BatchPlanTable batches={action.planBatches} />
+              )}
           </div>
         ) : diffLoading || !diffData ? (
           <LoadingState variant="block" label="加载 diff…" />

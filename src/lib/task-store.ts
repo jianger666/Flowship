@@ -141,6 +141,25 @@ export const updateTaskFields = async (
   return data.task;
 };
 
+/**
+ * V0.6.24：chat 模式「切模型」——持久化 task.model（PATCH /api/tasks/[id]）
+ *
+ * 只改落盘字段、下一个 run 启动时生效、不影响正在跑的 run（SDK 把模型锁死在 run 上）。
+ * 调用方在 runStatus=running 时应禁用入口、避免误导用户以为当前轮会换。
+ */
+export const setTaskModel = async (
+  id: string,
+  model: ModelSelection,
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
+};
+
 // ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------
 
 export interface CursorMcpInfo {

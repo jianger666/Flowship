@@ -17,7 +17,7 @@
  *   - event-stream/rows.tsx  MarkdownText / StreamingAssistantRow / EventRow / AskUserRequestRow
  */
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
   File as FileIcon,
@@ -89,6 +89,8 @@ interface Props {
   // V0.4：禁用时底部的状态文案（chat 自由化下、文案需要随 task.status / starting 动态变）
   // 不传：用旧 plan 文案「agent 在等待你回复时输入框才会激活」
   disabledHint?: string;
+  // V0.6.24：footer 左侧 slot（chat 模式注入模型选择器、plan / task 模式不传）
+  composerLeading?: ReactNode;
 }
 
 // chat 单次最多附几条路径（防滥用 / context 爆）
@@ -105,6 +107,7 @@ const EventStreamImpl = ({
   hideReplyComposer,
   canReply,
   disabledHint,
+  composerLeading,
 }: Props) => {
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
@@ -368,14 +371,17 @@ const EventStreamImpl = ({
           onChange={handleFilePicked}
         />
         <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
-          {/* 左边只放状态文案、附件计数 */}
-          <span className="min-w-0 truncate">
-            {isAwaitingUser
-              ? attachedImages.length > 0 || attachedPaths.length > 0
-                ? `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`
-                : "agent 在等你回复"
-              : (disabledHint ?? "agent 在等待你回复时输入框才会激活")}
-          </span>
+          {/* 左边：模型选择器 slot（chat 注入、其它模式不传）+ 状态文案、附件计数 */}
+          <div className="flex min-w-0 items-center gap-2">
+            {composerLeading}
+            <span className="min-w-0 truncate">
+              {isAwaitingUser
+                ? attachedImages.length > 0 || attachedPaths.length > 0
+                  ? `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`
+                  : "agent 在等你回复"
+                : (disabledHint ?? "agent 在等待你回复时输入框才会激活")}
+            </span>
+          </div>
           {/* 右边一行：附图 / 附文件 / 发送（聊一起、对齐发送动作）*/}
           <div className="flex shrink-0 items-center gap-1">
             <Button

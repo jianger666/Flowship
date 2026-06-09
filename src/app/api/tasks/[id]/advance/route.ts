@@ -68,6 +68,8 @@ interface PostBody {
   gitToken?: string;
   // V0.6.14 ship action 用：合并后是否删源分支（用户在推进 dialog 选、落 task 字段、submit_mr handler 读）
   removeSourceBranch?: boolean;
+  // V0.6.23 build action 用：本次做哪些批次（advance-dialog 勾选、透传给 advanceTask）
+  requestedBatchIds?: string[];
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -190,6 +192,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
       username: body.username?.trim() || undefined,
       gitHost: body.gitHost?.trim() || undefined,
       gitToken: body.gitToken?.trim() || undefined,
+      // V0.6.23：build 分批选择（仅 build 有意义、advanceTask 内部按 actionType 取用）
+      requestedBatchIds: Array.isArray(body.requestedBatchIds)
+        ? body.requestedBatchIds.filter((x) => typeof x === "string")
+        : undefined,
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

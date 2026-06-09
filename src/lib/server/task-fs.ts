@@ -1111,6 +1111,26 @@ export const updateTaskFields = async (
     return await hydrateTask(meta);
   });
 
+/**
+ * V0.6.24：chat 模式「切模型」——持久化到 meta.model
+ *
+ * 单独拎出来、不并进 updateTaskFields：model 不是软配置、是「下一个 SDK run 启动时用谁」的
+ * 硬约束。改了不影响正在跑的 run（SDK 把模型绑死在 run 上）、下一轮 agent 启动时才生效。
+ * 「running 时禁用切换」由调用方（chat-view 模型选择器）负责、这里只管落盘。
+ */
+export const setTaskModel = async (
+  id: string,
+  model: ModelSelection,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    meta.model = model;
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
 // ----------------- 公开 API（V0.6 新）：action / repoStatus / runStatus / gitBranches / mr -----------------
 
 /**
@@ -1129,6 +1149,8 @@ export const appendAction = async (
     type: ActionType;
     userInstruction: string;
     agentModel?: ModelSelection;
+    /** V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build 传、空=全做） */
+    requestedBatchIds?: string[];
   },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
   withTaskLock(taskId, async () => {
@@ -1149,6 +1171,11 @@ export const appendAction = async (
       startedAt: now,
       endedAt: null,
       agentModel: input.agentModel,
+      // V0.6.23：仅 build 带值（其它 action 为 undefined、JSON.stringify 自动忽略）
+      requestedBatchIds:
+        input.requestedBatchIds && input.requestedBatchIds.length > 0
+          ? input.requestedBatchIds
+          : undefined,
     };
 
     meta.actions = [...meta.actions, action];
@@ -1177,6 +1204,7 @@ export const patchAction = async (
       | "agentModel"
       | "excluded"
       | "artifactUpdatedAt"
+      | "planBatches"
     >
   >,
 ): Promise<Task | null> =>

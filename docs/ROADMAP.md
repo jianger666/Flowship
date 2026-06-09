@@ -36,6 +36,8 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 > 用户问「质量保证对齐四大库（Spec Kit / OpenSpec / Superpowers / GStack）后、各借鉴哪些点、做出来啥效果」。这里沉淀讨论结论 + 一个**待拍板的关键矛盾**。**还没动代码、方向待用户回头敲定。**
 
+> **V0.6.23 现状补注**：本段讨论的是 **test action（动态运行时验证）** 方向、仍待拍板。但 **build 阶段**已先用「自适应 TDD 批次策略」部分落地 Superpowers TDD 借鉴点——大需求分批时每批标 `tdd`/`after`/`none`、build agent 按策略用 shell 实跑、**无测试设施自动退化**（正好化解下面「没单测 TDD 落不了地」的矛盾、不强求）。即：TDD 在 build 侧以「自适应可选」形态存在；浏览器 QA / 飞书验收用例（test action）仍空白、方向不变。
+
 ### 定位回顾
 
 质量保证对标四大库（详见 `PRODUCT-COMPARISON.md`）：我们「需求层 + 静态代码层」已到位 / 超越（飞书需求 × git diff + fresh peer 两阶段 review + 确定性后置检查），**唯一真空白 = 测试验证（跑起来验证）** = Superpowers 的 TDD + GStack 的浏览器 QA。test action 就是补这格。review（静态、读代码）vs test（动态、跑起来）**不重叠、是两层防线**（四大库也都把 code-review 和 TDD/qa 拆成两件事）。

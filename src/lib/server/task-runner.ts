@@ -102,7 +102,9 @@ import {
   ACTION_LABEL,
   MCP_HEALTH_LABEL,
   TASK_ROLE_LABEL,
+  TEST_STRATEGY_LABEL,
 } from "@/lib/types";
+import { computeBatchProgress } from "@/lib/task-display";
 
 // ----------------- 配置 -----------------
 
@@ -221,6 +223,7 @@ const buildSuperPrompt = async (
     attachedImagePaths?: string[];
     attachedFilePaths?: string[];
     branchCheckoutHint?: string;
+    batchDirective?: string;
   },
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
@@ -354,7 +357,75 @@ const buildTaskUpdateHint = (
   ].join("\n");
 };
 
-// 构造一个 [NEXT_ACTION ...] 头部 + 任务字段热更 + 用户指令 + 附件段 + branch checkout hint
+// 构造 build 的「本次做哪批」指令段（注入 NEXT_ACTION、放用户指令之后）
+//
+// - 无批次（plan 没拆 / 没 plan）→ undefined、不注入本段、build 退化「做全部」老流程
+// - requestedBatchIds 空 → 全做（用户没挑批 / 兜底）
+// - 进度（累计 X/Y 批）派生自 computeBatchProgress、纯算不存计数器
+const buildBatchDirective = (
+  task: Task,
+  requestedBatchIds?: string[],
+): string | undefined => {
+  const { batches, doneIds, total } = computeBatchProgress(task);
+  if (batches.length === 0) return undefined;
+
+  const selected =
+    requestedBatchIds && requestedBatchIds.length > 0
+      ? batches.filter((b) => requestedBatchIds.includes(b.id))
+      : batches;
+  if (selected.length === 0) return undefined;
+
+  const isAll = selected.length === batches.length;
+  const afterIds = new Set([...doneIds, ...selected.map((b) => b.id)]);
+  const afterDone = batches.filter((b) => afterIds.has(b.id)).length;
+
+  const lines: string[] = [
+    `[BUILD_BATCHES] 本需求 plan 共拆 ${total} 个批次、本次 build 只做下面 ${selected.length} 个${
+      isAll ? "（= 全部批次）" : "（挑批：其它批次的 task 这次一行都不要碰）"
+    }：`,
+  ];
+  for (const b of selected) {
+    const redo = doneIds.has(b.id) ? "　⚠️ 这批之前 build 过、本次是返工" : "";
+    lines.push(
+      `  - [${b.id}] ${b.title}　测试策略=${TEST_STRATEGY_LABEL[b.testStrategy]}　含：${
+        b.taskRefs.length > 0 ? b.taskRefs.join(" / ") : "见 plan §5"
+      }${redo}`,
+    );
+  }
+  lines.push(
+    "",
+    "分批 build 规则：",
+    "- **范围**：只做上面列出批次对应的 plan §5 task、属于其它批次的 task 这次不要碰",
+    "- **测试策略**：TDD 批先写测试看红 → 实现到绿；实现后测试批先实现再补关键路径；免测批跳过测试",
+    "- **留痕**：build artifact 总览写明「本次完成批次：<id 列表>」、给 review / 进度核对用",
+    `- **进度**：做完本次累计 ${afterDone}/${total} 批${
+      afterDone >= total
+        ? "（全部批次做完、后续可推整体 review 看批次之间是否打架）"
+        : ""
+    }`,
+  );
+  return lines.join("\n");
+};
+
+// 构造 review 的「本次复核范围」指令段（注入 NEXT_ACTION、放用户指令之后）
+//
+// 大需求分批 build 时、review 分两层：增量（还有批次没做完、聚焦新批 + 衔接）vs
+// 集成（全部批次做完、重点查批次之间打不打架）。这里纯派生进度、给 agent 明确信号、
+// 省得它自己猜「这次该增量还是全量」（对应用户原始疑问）。
+// - 无批次 → undefined、常规单次 review、不注入本段
+const buildReviewScopeDirective = (task: Task): string | undefined => {
+  const { total, done } = computeBatchProgress(task);
+  if (total === 0) return undefined;
+  const allDone = done >= total;
+  return [
+    `[REVIEW_SCOPE] 本需求 plan 分了 ${total} 批 build、目前已完成 ${done}/${total} 批。`,
+    allDone
+      ? "→ 本次按**集成 review**：常规差值 + bug 复审之外、重点查「批次之间是否打架」（接口对接 / 数据流 / 重复实现 / 类型冲突）。详见 review prompt §4.5。"
+      : `→ 本次按**增量 review**：聚焦最近 build 的批次改动、并检查它跟已完成批次的衔接（还剩 ${total - done} 批没 build、别把「没做的批次」误判成漏实现 / 未完成 task）。详见 review prompt §4.5。`,
+  ].join("\n");
+};
+
+// 构造一个 [NEXT_ACTION ...] 头部 + 任务字段热更 + 用户指令 + 批次指令 + 附件段 + branch checkout hint
 const buildNextActionDirective = (input: {
   action: ActionRecord;
   userInstruction: string;
@@ -362,6 +433,7 @@ const buildNextActionDirective = (input: {
   attachedFilePaths?: string[];
   branchCheckoutHint?: string;
   taskUpdateHint?: string;
+  batchDirective?: string;
 }): string => {
   const {
     action,
@@ -370,6 +442,7 @@ const buildNextActionDirective = (input: {
     attachedFilePaths,
     branchCheckoutHint,
     taskUpdateHint,
+    batchDirective,
   } = input;
   const head =
     `[NEXT_ACTION action_id=${action.id} type=${action.type} n=${action.n}` +
@@ -384,6 +457,10 @@ const buildNextActionDirective = (input: {
     lines.push(userInstruction.trim(), "");
   } else {
     lines.push("（用户没填具体指令、按本 action 标准流程执行）", "");
+  }
+  // V0.6.23：build 分批指令（仅 build 且 plan 有批次时有值）放用户指令后、让 agent 先框定本次范围
+  if (batchDirective && batchDirective.trim().length > 0) {
+    lines.push(batchDirective.trim(), "");
   }
   if (attachedImagePaths && attachedImagePaths.length > 0) {
     lines.push(
@@ -875,6 +952,8 @@ export interface AdvanceTaskInput {
   // 来自 settings.gitHost / gitToken、agent 启动时快照、改 token 需 forceNewAgent
   gitHost?: string;
   gitToken?: string;
+  // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=全做）
+  requestedBatchIds?: string[];
 }
 
 /**
@@ -921,6 +1000,7 @@ export const advanceTask = async (
     username,
     gitHost,
     gitToken,
+    requestedBatchIds,
   } = input;
 
   // V0.6.9 per-action fresh 默认：用户没手动勾「换新 agent」时、按 action 作用决定是否强起 fresh。
@@ -940,6 +1020,8 @@ export const advanceTask = async (
     type: actionType,
     userInstruction,
     agentModel: model,
+    // V0.6.23：仅 build 带批次选择（其它 action 不传、appendAction 内部空数组也归 undefined）
+    requestedBatchIds: actionType === "build" ? requestedBatchIds : undefined,
   });
   if (!created) {
     throw new Error(`appendAction 失败 task=${task.id}（task 不存在）`);
@@ -974,6 +1056,16 @@ export const advanceTask = async (
     }
   }
 
+  // V0.6.23：分批指令——plan 拆了批次时注入 NEXT_ACTION（taskAfterAppend 含最新 plan 的 planBatches）
+  // - build：拼「本次做哪批」（含本 build 的 requestedBatchIds）
+  // - review：拼「当前进度 + 增量 / 集成建议」（纯派生、不需选批）
+  const batchDirective =
+    actionType === "build"
+      ? buildBatchDirective(taskAfterAppend, requestedBatchIds)
+      : actionType === "review"
+        ? buildReviewScopeDirective(taskAfterAppend)
+        : undefined;
+
   // 4) 决定路由
   const existingRecord = runningTasks.get(task.id);
   if (existingRecord && !effectiveForceNewAgent) {
@@ -1000,6 +1092,7 @@ export const advanceTask = async (
         attachedFilePaths,
         branchCheckoutHint,
         taskUpdateHint,
+        batchDirective,
       }),
       attachedImagePaths,
       attachedFilePaths,
@@ -1022,6 +1115,7 @@ export const advanceTask = async (
         forceNewAgent: true,
         gitHost,
         gitToken,
+        batchDirective,
       });
     }
     return { action };
@@ -1053,6 +1147,7 @@ export const advanceTask = async (
     forceNewAgent: effectiveForceNewAgent,
     gitHost,
     gitToken,
+    batchDirective,
   });
 
   return { action };
@@ -1201,6 +1296,8 @@ interface StartAgentInput {
   // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包
   gitHost?: string;
   gitToken?: string;
+  // V0.6.23：build 分批指令（仅 build 有值、拼进首个 NEXT_ACTION）
+  batchDirective?: string;
 }
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
@@ -1215,6 +1312,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     model,
     gitHost,
     gitToken,
+    batchDirective,
   } = input;
 
   // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
@@ -1442,6 +1540,26 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       return { ok: true };
     }
 
+    if (taskAction.kind === "set_plan_batches") {
+      // V0.6.23：plan agent 上报拆好的批次 → 落到该 plan action 的 planBatches 字段
+      // build 选批 + 进度推导都读「最新 completed plan 的 planBatches」（见 task-display.computeBatchProgress）
+      const patched = await patchAction(task.id, taskAction.actionId, {
+        planBatches: taskAction.batches,
+      });
+      if (patched) {
+        publish(task.id, { kind: "task", task: patched });
+        const a = patched.actions.find((x) => x.id === taskAction.actionId);
+        if (a) publish(task.id, { kind: "action", action: a });
+      }
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        actionId: taskAction.actionId,
+        text: `已记录 ${taskAction.batches.length} 个批次（build 可分批推进、其余批次先不动）`,
+        meta: { batchCount: taskAction.batches.length },
+      });
+      return { ok: true };
+    }
+
     return { ok: false, error: "未知 task action kind" };
   };
   setChatTaskActionHandler(task.id, taskActionHandler);
@@ -1572,6 +1690,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         attachedImagePaths,
         attachedFilePaths,
         branchCheckoutHint,
+        batchDirective,
       });
 
       const run = await agent.send(superPrompt);

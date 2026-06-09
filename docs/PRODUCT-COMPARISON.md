@@ -47,6 +47,7 @@ fe-ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harnes
 - **最大空白 = 测试验证**：Superpowers 的 TDD + GStack 的真实浏览器 QA 我们都没有。review 阶段二诚实地把「运行时 bug（交互 / 渲染 / 时序）」划给了「后续真实浏览器 QA」、但那个能力还没建。**这是下一个高 ROI 方向、也是 review 当前最大短板**（静态读代码读不出运行时 bug）。
 - **结论**：质量纪律的「需求层 + 静态代码层」我们已到位甚至超越同类；「跑起来验证」是真空白。
 - **补法蓝图（2026-06-05）**：各库借鉴点（Superpowers TDD / GStack 浏览器 QA / Spec Kit `/analyze` / OpenSpec archive）+ 端到端效果 + **一个待拍板矛盾**（test ① TDD vs ROADMAP「公司没单测」止损条款）见 `docs/ROADMAP.md`「质量保证体系蓝图」段。
+- **V0.6.23 现状补注**：上表「测试验证」格对照 V0.6.9（当时空白）。V0.6.23 起 **build 侧已加「自适应 TDD」批次策略**（大需求分批时每批标 `tdd`/`after`/`none`、build agent shell 实跑、无测试设施退化）——Superpowers TDD 借鉴点在 build 阶段以「可选自适应」形态部分落地；**动态运行时验证（浏览器 QA = test action）仍空白**、是下一个高 ROI 方向。
 
 ## 当前能力 vs Cursor IDE / Claude Code
 
