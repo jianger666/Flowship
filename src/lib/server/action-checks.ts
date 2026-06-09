@@ -12,7 +12,7 @@
  *   - plan: artifact 文件存在 + 内容长度 >= 100
  *   - build: V0.6.3 用户拍板暂时撤掉（原 pnpm typecheck/lint/git status；写死 pnpm 对多技术栈
  *     如 Java 会误报失败、先撤掉、后面重做成技术栈自适应 / 独立 check）
- *   - review: git diff hash 跟 artifact 写的一致（防 agent 编造 diff）
+ *   - review: artifact「总评」段声明的「基底 commit」跟实际 `git rev-parse HEAD` 一致（防 agent 拿错 / 编造基底）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
  *   - test/learn: V0.6.2+ stub、暂不实现
  *   - chat 不走本机制（chat 是独立 mode、不复用 action 体系、详见 chat-runner.ts）
@@ -165,43 +165,50 @@ const checkReview = async (
     };
   }
 
-  // git diff hash 检查（可选、artifact 没声明 hash 时跳过）
+  // 基底 commit 一致性检查（V0.6 门槛 2、P1-2 修复）
   const cwd = getEffectiveCwd(task.repoPaths);
   try {
     await fs.access(path.join(cwd, ".git"));
   } catch {
     return {
       passed: true,
-      details: "review artifact 必备段 + bug 复审段齐全（非 git 仓、跳过 diff hash 检查）",
+      details: "review artifact 必备段 + bug 复审段齐全（非 git 仓、跳过基底 commit 检查）",
     };
   }
 
-  const hashMatch = content.match(/git\s+(diff|rev-parse)\s+(?:HEAD\s+)?hash[:：]?\s*([0-9a-f]{6,40})/i);
-  if (!hashMatch) {
+  // review 骨架「总评」段要求 agent 写「- **基底 commit**：`<git rev-parse HEAD 真值>`」、
+  // runner 在此 re-run git rev-parse HEAD、跟 artifact 声明的基底比对（防 agent 拿错 checkout / 编造基底）。
+  // ⚠️ 旧正则找的是「git rev-parse hash: <x>」这种字面、跟骨架「基底 commit：`<x>`」对不上 = 死代码、从不命中（P1-2）。
+  // 注：review 不动工作树、不做 `git diff | sha256sum`（骨架无 diff hash 字段、强加 = prompt↔code 漂移）。
+  const baseMatch = content.match(/基底\s*commit[^\n]*?([0-9a-f]{7,40})/i);
+  if (!baseMatch) {
     return {
       passed: true,
-      details: "review artifact 必备段 + bug 复审段齐全（artifact 未声明 diff hash、跳过 hash 一致性检查）",
+      details:
+        "review artifact 必备段 + bug 复审段齐全（artifact 未声明基底 commit、跳过一致性检查）",
     };
   }
-  const declaredHash = hashMatch[2];
+  const declaredBase = baseMatch[1];
   const gs = await runShell("git", ["rev-parse", "HEAD"], cwd);
   if (gs.exitCode !== 0) {
     return {
       passed: true,
-      details: "review 必备段 + bug 复审段齐全（git rev-parse HEAD 跑失败、跳过 hash 一致性）",
+      details:
+        "review 必备段 + bug 复审段齐全（git rev-parse HEAD 跑失败、跳过基底 commit 一致性）",
     };
   }
-  const realHash = gs.stdout.trim();
-  if (!realHash.startsWith(declaredHash) && !declaredHash.startsWith(realHash)) {
+  const realBase = gs.stdout.trim();
+  // 容忍短 hash：声明值是真值前缀、或反之（agent 可能写 7-12 位短 hash）
+  if (!realBase.startsWith(declaredBase) && !declaredBase.startsWith(realBase)) {
     return {
       passed: false,
-      details: `review artifact 声明的 git hash ${declaredHash} 与实际 HEAD ${realHash} 不一致（agent 可能编造 diff）`,
+      details: `review artifact 声明的基底 commit ${declaredBase} 跟实际 HEAD ${realBase} 不一致（agent 可能拿错 checkout / 编造基底）`,
     };
   }
 
   return {
     passed: true,
-    details: "review artifact 必备段 + bug 复审段齐全、git hash 一致",
+    details: "review artifact 必备段 + bug 复审段齐全、基底 commit 跟 HEAD 一致",
   };
 };
 

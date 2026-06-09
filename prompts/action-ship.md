@@ -90,16 +90,20 @@ if ! git fetch origin "$TARGET" 2>&1; then
   echo "[error] git fetch origin/$TARGET 失败、停止本仓 ship（远程 test 分支不存在或网络异常、不要当成无改动跳过）"
   exit 1
 fi
+# ⚠️ 顺序铁则：先 commit 工作区改动、再判「相对 test 有无改动」。
+#   build 铁律是不碰 .git（不 commit / 不 push）、改动全停在工作区——必须先 commit 才看得见、才推得动。
+#   若反过来先 `git diff origin/$TARGET...$BRANCH`（只看 committed 状态）判跳过、会漏掉工作区未提交的 build 改动；
+#   feature 又是从 master 切的（没新 commit）时 committed diff 为空 → 被误判「无改动」直接 exit 0、本仓提测静默漏做。
+if [ -n "$(git status --porcelain)" ]; then
+  git add -A
+  git commit -m "<commit msg>"   # agent 自己写 commit message、conventional commit 风格
+fi
+
+# commit 完再判断「本仓相对 test 有没有要提测的改动」（此时已含刚 commit 的 build 产出）
 CHANGES=$(git diff "origin/$TARGET...$BRANCH" --name-only)
 if [ -z "$CHANGES" ]; then
   echo "[skip] 本仓相对 origin/$TARGET 无改动、跳过 push + MR"
   exit 0
-fi
-
-# 没 commit 的工作区改动先 commit（agent 自己写 commit message、conventional commit 风格）
-if [ -n "$(git status --porcelain)" ]; then
-  git add -A
-  git commit -m "<commit msg>"
 fi
 
 # push 到 origin、source branch 跟本地同名

@@ -197,7 +197,7 @@ export type AwaitingNotifier = (signal: AwaitingSignal) => Promise<void> | void;
 //   - awaitingNotifier 是「单向事件通知」（runner 用来更新 task 状态）、没返回值
 //   - taskActionHandler 是「同步 RPC」（agent 调 MCP 工具拿结果）、有结构化返回值
 
-type ChatTaskAction =
+export type ChatTaskAction =
   | {
       kind: "submit_mr";
       actionId: string;
@@ -1508,28 +1508,51 @@ export const submitAskReply = (
 /**
  * V0.6 action ack：用户在 UI 点了「通过」或「再聊聊」、API 路由调这个 ack 阻塞中的 agent。
  *
+ * @param actionId 要 ack 的 action id——**必须**等于 agent 当前 wait_for_user 时传的 action_id
+ *                 （pending.actionId）。P0-1 修复：以前只按 taskId 取 pending、不比对 actionId、
+ *                 旧 tab / 并发推进 / ask_user 进行中时会把 ack 信号发给错误的 pending。
  * @param action   "approve" → agent 拿到 [ACTION_ACK approve]、立刻再 wait_for_user(待命态) 等下一 action
  *                 "revise"  → agent 拿到 [ACTION_ACK revise] + feedback、改 artifact 再调一次 wait_for_user
  * @param feedback "revise" 时的用户意见文本、"approve" 时可空（也能传补充说明）
  * @param imagePaths revise 可携带图片附件、agent 先 read 图再 ask_user 复述
  *                   approve 不接受 imagePaths（语义上没必要、强校验交给路由层）
  *
- * 返回值同 submitUserMessage：
- *   - true：成功 resolve
- *   - false：当前没有 agent 在等待 ack
+ * 返回值：
+ *   - { ok: true }：成功 resolve
+ *   - { ok: false, reason }：pending 不存在 / 是待命态 / 在等别的 action / 已被消费、reason 给上层报错
  */
 export const submitActionAck = (
   taskId: string,
+  actionId: string,
   action: "approve" | "revise",
   feedback?: string,
   imagePaths?: string[],
-): boolean => {
+): { ok: true } | { ok: false; reason: string } => {
   const entry = pendingMap.get(taskId);
   if (!entry) {
     console.warn(
       `[chat-mcp] submitActionAck 没找到 pending task=${taskId} action=${action}`,
     );
-    return false;
+    return { ok: false, reason: "当前没有 agent 在等 ack（pending 不存在）" };
+  }
+  // P0-1 绑定校验：ack 只能落到「agent 正在等 ack 的那个 action」上、否则一律拒——
+  //   - entry.actionId 空 = 待命态（等 NEXT_ACTION 推进）、根本不是在等 action ack
+  //   - entry.actionId !== actionId = agent 在等别的 action 的 ack（旧标签页 / 并发推进）
+  //   - entry.resolved = grace 残留、agent 已消费这次结果、不该再 ack
+  if (!entry.actionId) {
+    return {
+      ok: false,
+      reason: "agent 当前在待命态（等推进下一 action）、不是在等某个 action 的 ack",
+    };
+  }
+  if (entry.actionId !== actionId) {
+    return {
+      ok: false,
+      reason: `agent 正在等 action ${entry.actionId} 的 ack、不是 ${actionId}（可能旧标签页 / 并发推进、请刷新后重试）`,
+    };
+  }
+  if (entry.resolved) {
+    return { ok: false, reason: "本次 ack 已被处理（重复提交 / grace 残留）" };
   }
   finalizeEntry(taskId, entry, {
     kind: action === "approve" ? "action_approve" : "action_revise",
@@ -1538,9 +1561,9 @@ export const submitActionAck = (
     imagePaths: action === "revise" ? imagePaths : undefined,
   });
   console.log(
-    `[chat-mcp] submitActionAck 成功 task=${taskId} action=${action} feedback=${(feedback ?? "").slice(0, 60)} imagePaths=${imagePaths?.length ?? 0}`,
+    `[chat-mcp] submitActionAck 成功 task=${taskId} actionId=${actionId} action=${action} feedback=${(feedback ?? "").slice(0, 60)} imagePaths=${imagePaths?.length ?? 0}`,
   );
-  return true;
+  return { ok: true };
 };
 
 /**

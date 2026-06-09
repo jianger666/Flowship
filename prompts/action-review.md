@@ -356,7 +356,7 @@ shell stdout 返回行解析：
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
-1. **git diff hash 一致**：runner 跑 `git rev-parse HEAD` + `git diff HEAD | sha256sum`、跟 review artifact 里写的「总评」段的 build commit hash / diff hash 字段对比（防 agent 编造 diff）
+1. **基底 commit 一致**：runner 跑 `git rev-parse HEAD`、跟 review artifact「总评」段写的「基底 commit」字段比对（防 agent 拿错 checkout / 编造基底；review 不动工作树、不做 diff hash 比对）
 2. **必备段非空**：「总评」+「跟飞书需求对照」两段恒在（骨架无省略豁免、是 review 基本盘）；范围偏离 / 实现偏差 / 未完成 task 这类「有内容才写」的段、无内容时按骨架整段省略即可、不参与检查
 3. **「## bug 复审」段非空（V0.6.9）**：阶段二必做、没找到也要明确写「未发现高置信 bug」、不能整段省略（防 agent 跳过 fresh peer bug 复审）
 4. **如果 §6 ask_user 被触发了**：runner 校验「§ 用户决策」段存在、且条目数 ≥ ask_user 拼的 question 数（防 agent 跳 §6）
