@@ -1,0 +1,97 @@
+# fe-ai-flow portable launcher (Windows)
+# NOTE: ASCII-only on purpose -- Windows PowerShell 5.1 mis-decodes BOM-less UTF-8,
+#       Chinese comments here could corrupt parsing on colleague machines.
+#
+# What it does, in order:
+#   1. If server already running on the port -> just open browser.
+#   2. Self-update: compare local VERSION with the latest GitHub release tag;
+#      if newer, download zip and overwrite package files (data/ is preserved).
+#      Any network failure is silently ignored (fail-open, never blocks startup).
+#   3. Start the bundled node + standalone server (hidden window, logs to logs/).
+#   4. Wait until the port is up, open browser, ensure a desktop shortcut exists.
+
+$ErrorActionPreference = "SilentlyContinue"
+$Root = Split-Path -Parent $PSScriptRoot   # launcher/.. = package root
+$Port = 8876
+$Url = "http://localhost:$Port"
+$Repo = "jianger666/fe-ai-flow"
+$AssetName = "fe-ai-flow-win-x64.zip"
+
+function Test-PortUp {
+  try {
+    $client = New-Object Net.Sockets.TcpClient
+    $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    $ok = $async.AsyncWaitHandle.WaitOne(500)
+    $up = $ok -and $client.Connected
+    $client.Close()
+    return $up
+  } catch { return $false }
+}
+
+function Ensure-Shortcut {
+  $desktop = [Environment]::GetFolderPath("Desktop")
+  $lnk = Join-Path $desktop "fe-ai-flow.lnk"
+  if (Test-Path $lnk) { return }
+  $ws = New-Object -ComObject WScript.Shell
+  $sc = $ws.CreateShortcut($lnk)
+  $sc.TargetPath = Join-Path $env:WINDIR "System32\wscript.exe"
+  $sc.Arguments = "`"$Root\launcher\launch.vbs`""
+  $sc.WorkingDirectory = $Root
+  $sc.IconLocation = (Join-Path $env:WINDIR "System32\shell32.dll") + ",220"
+  $sc.Description = "fe-ai-flow"
+  $sc.Save()
+}
+
+# --- 1. already running? ---
+if (Test-PortUp) {
+  Start-Process $Url
+  Ensure-Shortcut
+  exit
+}
+
+# --- 2. self-update (fail-open) ---
+try {
+  $localVersion = (Get-Content (Join-Path $Root "VERSION") -ErrorAction Stop | Select-Object -First 1).Trim()
+  $latest = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 5
+  if ($latest.tag_name -and $latest.tag_name -ne $localVersion) {
+    $asset = $latest.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+    if ($asset) {
+      $zipPath = Join-Path $env:TEMP "fe-ai-flow-update.zip"
+      $tmpDir = Join-Path $env:TEMP "fe-ai-flow-update"
+      Invoke-WebRequest $asset.browser_download_url -OutFile $zipPath -TimeoutSec 600 -UseBasicParsing
+      if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+      Expand-Archive $zipPath -DestinationPath $tmpDir -Force
+      # zip has a top-level fe-ai-flow/ folder; tolerate flat layout too
+      $srcDir = Join-Path $tmpDir "fe-ai-flow"
+      if (-not (Test-Path $srcDir)) { $srcDir = $tmpDir }
+      # overwrite package files; keep data/ (tasks, oauth) and logs/
+      robocopy $srcDir $Root /E /XD data logs /NFL /NDL /NJH /NJS /NP | Out-Null
+      Remove-Item $zipPath -Force
+      Remove-Item $tmpDir -Recurse -Force
+    }
+  }
+} catch { }
+
+# --- 3. start server ---
+$logsDir = Join-Path $Root "logs"
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+$env:PORT = "$Port"
+$env:HOSTNAME = "127.0.0.1"
+$env:NODE_ENV = "production"
+$startArgs = @{
+  FilePath = Join-Path $Root "node\node.exe"
+  ArgumentList = "server.js"
+  WorkingDirectory = $Root
+  WindowStyle = "Hidden"
+  RedirectStandardOutput = Join-Path $logsDir "server.log"
+  RedirectStandardError = Join-Path $logsDir "server.err.log"
+}
+Start-Process @startArgs
+
+# --- 4. wait ready -> open browser + shortcut ---
+for ($i = 0; $i -lt 60; $i++) {
+  if (Test-PortUp) { break }
+  Start-Sleep -Milliseconds 500
+}
+Start-Process $Url
+Ensure-Shortcut

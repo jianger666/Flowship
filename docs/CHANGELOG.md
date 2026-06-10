@@ -15,6 +15,24 @@
 
 ---
 
+### V0.6.28：cursor 链接多段行号宽容解析 + task 中途追加仓库（2026-06-10）
+
+**A. cursor:// 链接多段行号（同事 + 用户双实测踩坑）**：
+
+- agent 在 artifact 里写 `index.tsx:54,81-84,99` / `SendOrderDetail.vue:20-88, 189-210` / `TaskInfo.vue:147-154、1350-1363` 这类**逗号 / 顿号多段行号**——违反 `_shared.md` 路径硬约束第 4 条（每段补完整 path）、但 prompt 防不住、前端接管：
+  - `path-utils.ts`：`parsePathWithLine` 正则放宽（逗号 / 顿号 / 分隔符后空格都认）；`looksLikePath` 空格校验只查路径部分（原来整条含空格直接拒、多段写法整条丢链接）；新增 `parsePathSegments` 把每段完整拆解（text / 起始行 / 前置分隔符）
+  - `artifact-panel.tsx`：多段行号渲染成**每段独立 cursor:// 链接**、点哪段跳哪段（原来只能跳首段）、分隔符原样保留视觉跟原文一致
+  - 新增 `tests/path-utils.test.ts`（16 用例、两次实测踩坑 case 全覆盖）
+- 旧症状备查：多段后缀被当文件名 encode 进链接 → Cursor 弹「路径不存在」（前台）或静默无反应（Cursor 在后台、用户感知「点了没反应」）
+
+**B. task 详情可中途追加仓库（同事需求「做着做着发现依赖另一个仓」）**：
+
+- **只增不删**（用户拍板：删仓涉及已建分支 / MR 残留引用、边界多收益低）
+- `edit-task-dialog`：已绑仓只读、下方新增「追加仓库」MultiSelect（候选 = settings.repos 减已绑）、提交时从 settings 现取新仓 per-repo 快照（线上 / 测试 / dev 分支、命名模板、check 命令）随行传——跟建 task 同款逻辑、server 读不到 localStorage
+- `task-fs.updateTaskFields` 加 `addRepoPaths` + 5 个 `addRepoXxx` 快照字段：并集语义、快照只 merge 新增仓 key 不覆盖老仓固化值；PATCH route / task-store 同步
+- **关键配套：`ActionRecord.cwd` 快照**——追加仓库会让 `getEffectiveCwd` 从单仓自身变公共父目录、artifact 相对路径基准漂移；`appendAction` 现在快照创建时 cwd、详情页 `baseDir` 优先用快照（老数据回退实时计算）、改仓后老 artifact 链接不失效
+- 生效语义跟切模型同款：正在跑的 run 不受影响（cwd 启动时绑死）、下一个 action 生效；新仓下次 build 自动建分支（`planBranchesForBuild` 对无条目仓新建、零额外处理）
+
 ### V0.6.27：全面 review 落地——3 bug 修复 + harness 硬化 + 测试基建（2026-06-10）
 
 外部 review AI 全面审计（代码健壮性 / 流程设计 / prompt 闭环性）后用户拍板「全部都改」、一次性落地：

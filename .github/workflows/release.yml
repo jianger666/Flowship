@@ -1,0 +1,39 @@
+# 发版流水线（V0.6.30）：push 一个 v* tag → 自动 build 绿色包 → 传 GitHub Release
+# 同事侧 launcher 启动时查 releases/latest、有新版自动下载覆盖——发版 = 打 tag 一步
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本从 package.json 的 packageManager 字段读、不在这双写
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+        env:
+          BUILD_STANDALONE: "1"
+
+      - run: node scripts/package-release.mjs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/fe-ai-flow-win-x64.zip
+          generate_release_notes: true

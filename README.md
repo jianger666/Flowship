@@ -29,7 +29,7 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 | `review` ✅ | git diff × plan × 飞书需求做结构化差值 + fresh peer bug 复审 | 至少 1 个 build | 必备段非空 + git hash 一致 |
 | `ship` ✅ | server-side GitLab REST 提 MR（多仓）+ 飞书 @ 测试人员 | 至少 1 个 build + 配 GitLab Host/PAT | MR 覆盖所有仓 + 跳仓有原因 |
 | `test` 🚧 | 飞书验收用例 + 运行时验证（蓝图见 ROADMAP） | 至少 1 个 build | 待实现 |
-| `learn` 🚧 | merged 后沉淀经验注入 AGENTS.md | `merged` + 整 task 一次 | 待实现 |
+| `learn` ✅ | 沉淀经验进业务仓（`.cursor/rules` / skills / 名词表、三层架构 + 防臃肿 4 闸） | 至少 1 个 completed action | 必备段 + 证据路径验真 + 落地记录闭环 |
 
 ---
 
@@ -63,10 +63,20 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 
 ## 快速开始
 
+### 方式一：源码跑（开发者）
+
 ```bash
 pnpm install
 pnpm dev
 ```
+
+### 方式二：Windows 绿色包（同事零环境上手、不需要 node / pnpm / git）
+
+1. 从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载 `fe-ai-flow-win-x64.zip`、解压到任意目录
+2. 双击 `启动fe-ai-flow.bat`——浏览器自动打开、桌面自动出现「fe-ai-flow」快捷方式
+3. 以后都点桌面快捷方式；每次启动自动检查新版、有就静默更新（任务数据 `data/` 保留）
+
+> 发版（维护者）：`git tag v0.6.X && git push origin v0.6.X`、CI 自动 build 绿色包传 Release。
 
 打开 http://localhost:8876、按以下顺序操作：
 
@@ -179,7 +189,6 @@ task 模式按 url 域名强校验这两个、漏配不让建：
 
 - 优先：跑通真飞书 story → plan → build → review → ship 全流程端到端 demo
 - `test` action：运行时验证（飞书验收用例 + 浏览器 QA、蓝图 + 待拍板矛盾见 `docs/ROADMAP.md`）
-- `learn` action：merged 后沉淀经验注入 AGENTS.md
 - 扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）
 - cross-action 一致性自检（门槛 5）/ token-cost dashboard
 

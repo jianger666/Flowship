@@ -289,6 +289,18 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.30：Windows 绿色包发版链——零 node 环境同事解压即用（2026-06-10）
+
+背景：后端同事机器没 node / pnpm、源码跑门槛太高。方案 = 绿色 zip（standalone + 便携 node + 静默 launcher）+ GitHub Release 自动发版自动更新。用户拍板不做 Docker（本地优先架构：agent 改本地仓 / cursor:// 跳本地 IDE / hooks 注绝对路径、容器全断）。
+
+- **standalone 构建**：next.config 按 `BUILD_STANDALONE=1` 开 `output: "standalone"`（日常 dev / `pnpm serve` 的 next start 不受影响、env 隔离）；`outputFileTracingRoot` 固定项目根——home 下有杂散 lockfile 时 Next 把 workspace root 推断到 `~`、standalone 产物嵌套整段 `Documents/my/...` 路径（实测踩到）
+- **组包脚本 `scripts/package-release.mjs`**：standalone 平铺为包根（server.js 启动自带 `process.chdir(__dirname)`、prompts / scripts / data 等 `process.cwd()` 路径全命中）+ 显式拷 prompts / skills / hook 脚本 + 便携 node（latest v22.x、只抽 node.exe 一个文件）+ launcher + VERSION。**隐私剔除**：file tracing 会把本机 `data/`（任务数据 + mcp-oauth 凭证）拖进 standalone、组包无条件删
+- **launcher（`packaging/`）**：`start.bat` → `launch.vbs`（wscript 零闪窗）→ `launch.ps1` 四步：已跑则直开浏览器；启动前查 GitHub releases/latest、有新版下载 robocopy 覆盖（`data/` `logs/` 排除保留、网络失败 fail-open 不挡启动）；起包内 node 跑 server（隐藏窗、日志落 `logs/`）；等端口 → 开浏览器 + 首次自动建桌面快捷方式。⚠️ ps1 / vbs / bat 故意纯 ASCII 注释——Windows PowerShell 5.1 对无 BOM UTF-8 中文会乱码、可能破坏解析
+- **hook 注入 node 改 `process.execPath`**（stop-hook-inject）：绿色包机器 PATH 可能没 node、裸 `node` 命令两道闸必挂；execPath 正好指向包内便携 node.exe、源码跑 = 系统 node、行为不变
+- **CI 发版 `.github/workflows/release.yml`**：push `v*` tag → build + 组包 + 传 GitHub Release（仓库 public、匿名可下）。发版 = 打 tag 一步、同事侧 launcher 下次启动自动更新
+
+验证：mac 本地 standalone 组包后实际起包（首页 / API / 静态资源 200、data/ 运行时自建）✓；typecheck / lint / 55 测试 ✓。⚠️ Windows 实机（bat / vbs / ps1 / 快捷方式 / 自动更新）待同事验。
+
 ### V0.6.29：learn action 实装——三层知识架构 + 防臃肿铁律（2026-06-10）
 
 learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution / OpenSpec living docs / superpowers skills 理念）：
@@ -323,24 +335,6 @@ learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution
 
 typecheck ✓ / lint ✓ / 55 测试 ✓。
 
-### V0.6.28：cursor 链接多段行号宽容解析 + task 中途追加仓库（2026-06-10）
-
-**A. cursor:// 链接多段行号（同事 + 用户双实测踩坑）**：
-
-- agent 在 artifact 里写 `index.tsx:54,81-84,99` / `SendOrderDetail.vue:20-88, 189-210` / `TaskInfo.vue:147-154、1350-1363` 这类**逗号 / 顿号多段行号**——违反 `_shared.md` 路径硬约束第 4 条（每段补完整 path）、但 prompt 防不住、前端接管：
-  - `path-utils.ts`：`parsePathWithLine` 正则放宽（逗号 / 顿号 / 分隔符后空格都认）；`looksLikePath` 空格校验只查路径部分（原来整条含空格直接拒、多段写法整条丢链接）；新增 `parsePathSegments` 把每段完整拆解（text / 起始行 / 前置分隔符）
-  - `artifact-panel.tsx`：多段行号渲染成**每段独立 cursor:// 链接**、点哪段跳哪段（原来只能跳首段）、分隔符原样保留视觉跟原文一致
-  - 新增 `tests/path-utils.test.ts`（16 用例、两次实测踩坑 case 全覆盖）
-- 旧症状备查：多段后缀被当文件名 encode 进链接 → Cursor 弹「路径不存在」（前台）或静默无反应（Cursor 在后台、用户感知「点了没反应」）
-
-**B. task 详情可中途追加仓库（同事需求「做着做着发现依赖另一个仓」）**：
-
-- **只增不删**（用户拍板：删仓涉及已建分支 / MR 残留引用、边界多收益低）
-- `edit-task-dialog`：已绑仓只读、下方新增「追加仓库」MultiSelect（候选 = settings.repos 减已绑）、提交时从 settings 现取新仓 per-repo 快照（线上 / 测试 / dev 分支、命名模板、check 命令）随行传——跟建 task 同款逻辑、server 读不到 localStorage
-- `task-fs.updateTaskFields` 加 `addRepoPaths` + 5 个 `addRepoXxx` 快照字段：并集语义、快照只 merge 新增仓 key 不覆盖老仓固化值；PATCH route / task-store 同步
-- **关键配套：`ActionRecord.cwd` 快照**——追加仓库会让 `getEffectiveCwd` 从单仓自身变公共父目录、artifact 相对路径基准漂移；`appendAction` 现在快照创建时 cwd、详情页 `baseDir` 优先用快照（老数据回退实时计算）、改仓后老 artifact 链接不失效
-- 生效语义跟切模型同款：正在跑的 run 不受影响（cwd 启动时绑死）、下一个 action 生效；新仓下次 build 自动建分支（`planBranchesForBuild` 对无条目仓新建、零额外处理）
-
 ---
 
 ## 关键文件索引
@@ -370,6 +364,7 @@ typecheck ✓ / lint ✓ / 55 测试 ✓。
 | **跨 action 共享规范** | `prompts/_shared.md` |
 | **plan / build / review / ship / learn action prompt** | `prompts/action-{plan,build,review,ship,learn}.md` |
 | **learn 知识沉淀（V0.6.29、三层架构 + 防臃肿 4 闸 + checkLearn 证据验真）** | `prompts/action-learn.md` + `action-checks.ts: checkLearn` |
+| **Windows 绿色包发版链（V0.6.30、standalone 组包 + 便携 node + 静默 launcher + tag 自动发版自动更新）** | `scripts/package-release.mjs` + `packaging/{start.bat,launch.vbs,launch.ps1}` + `.github/workflows/release.yml` |
 | **test stub（设计草稿）** | `prompts/action-test.md` |
 | **chat 模式独立 runner（V0.6.0.1 新）** | `src/lib/server/chat-runner.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |

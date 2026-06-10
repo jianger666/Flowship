@@ -30,11 +30,14 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 // fe 固定 hook 脚本绝对路径（process.cwd() = fe 项目根、Next.js 运行时）
-// V0.6.29：command 包一层 `node "..."`——路径可能含空格、引号兜住；sh -c / cmd 都认这个写法
+// V0.6.29：command 包一层 node 调用——路径可能含空格、引号兜住；sh -c / cmd 都认这个写法
+// V0.6.30：node 用 process.execPath（跑本服务的那个 node 的绝对路径）、不裸写 `node`——
+//   绿色包同事机器上系统 PATH 可能根本没有 node、只有包里自带的便携 node.exe、
+//   execPath 正好指向它；源码跑的场景 execPath = 系统 node、行为不变。
 const stopHookCommand = (): string =>
-  `node "${path.join(process.cwd(), "scripts", "stop-hook.mjs")}"`;
+  `"${process.execPath}" "${path.join(process.cwd(), "scripts", "stop-hook.mjs")}"`;
 const shellGuardCommand = (): string =>
-  `node "${path.join(process.cwd(), "scripts", "shell-guard.mjs")}"`;
+  `"${process.execPath}" "${path.join(process.cwd(), "scripts", "shell-guard.mjs")}"`;
 
 // fe scripts 目录路径——判断已有 hooks.json 是不是 fe 自己建的（是才允许升级重写）
 // 老形式 command = ".../scripts/xxx.sh"（startsWith）、新形式 = `node ".../scripts/xxx.mjs"`（includes）
