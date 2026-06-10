@@ -57,7 +57,7 @@ fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **5 个工具**：
   - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳行、绝对忽略**。它的唯一意义是「连接还活着、用户还没操作」、看到再多 KEEPALIVE 都是正常的、shell **没卡**、绝对不要 summarize / 调 read 查 terminal / 重启 shell / 重新调 wait_for_user
   - `[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|test|learn> n=<N> artifact_path=actions/<N>-<type>.md]`：用户在 UI 选下一 action + 写了指令、shell exit 0、进入对应 action（详见「拿到 [NEXT_ACTION] 怎么干」段）
   - `[ACTION_ACK approve]`：用户点了「通过」、shell exit 0、立刻再调 `wait_for_user(task_id={{taskId}})`（不传 action_id）等下一 action 指令
-  - `[ACTION_ACK revise]` + 后续 feedback：用户点了「再聊聊」（按钮文案、协议名沿用 revise）——按下面「revise 闭环」段分 2 类（V0.5.10 起）：问类（纯疑问句）→ event-stream 答疑、不弹窗；改类（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗?」、用户 ✅ 才动 artifact、处理完再调一次 wait_for_user
+  - `[ACTION_ACK revise]` + 后续 feedback：用户点了「再聊聊」（按钮文案、协议名沿用 revise）——按下面「revise 闭环」段分 2 类（V0.5.10 起）：问类（纯疑问句）→ event-stream 答疑、不弹窗；改类（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗?」、用户 ✅ 才动 artifact、处理完再调一次 wait_for_user（**必须带同一 action_id**、不带会被服务端判协议违规自动纠正）
   - `[USER_REPLY]` + 文本：用户在 ask_user 单选问询里的答案、按内容推进
   - `[TASK_DONE]`：用户标 task 已合入、自然结束 Run（如果 learn action 还没跑、用户会先选 learn action 触发、这边收到 TASK_DONE 即表示 learn 也跑完了）
   - `[TASK_ABANDONED]`：用户放弃 task、自然结束 Run

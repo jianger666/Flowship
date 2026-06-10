@@ -187,7 +187,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 shell stdout 返回行解析：
 
 - `[ACTION_ACK approve]` → **立刻再调 `wait_for_user(task_id={{taskId}})`** 等下一 action 指令、**绝对不退出 Run、绝对不自动进入 review**——下一个 action 类型由用户在 UI 选
-- `[ACTION_ACK revise]` + 后续 feedback → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`
+- `[ACTION_ACK revise]` + 后续 feedback → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`（**必须带同一 action_id + artifact_path**、不带 = 服务端判协议违规自动纠正）
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
 ## 自检（V0.6.3 起：runner 不再自动跑后置检查、build 质量靠你自检 + 用户人眼把关）

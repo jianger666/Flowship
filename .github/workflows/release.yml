@@ -29,11 +29,14 @@ jobs:
         env:
           BUILD_STANDALONE: "1"
 
-      - run: node scripts/package-release.mjs
+      - run: node scripts/package-release.mjs win-x64 darwin-arm64 darwin-x64
         env:
           RELEASE_TAG: ${{ github.ref_name }}
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/fe-ai-flow-win-x64.zip
+          files: |
+            dist/fe-ai-flow-win-x64.zip
+            dist/fe-ai-flow-darwin-arm64.zip
+            dist/fe-ai-flow-darwin-x64.zip
           generate_release_notes: true

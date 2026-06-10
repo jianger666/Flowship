@@ -15,6 +15,40 @@
 
 ---
 
+### V0.6.29：learn action 实装——三层知识架构 + 防臃肿铁律（2026-06-10）
+
+learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution / OpenSpec living docs / superpowers skills 理念）：
+
+**三层知识架构（learn agent = 知识路由器 + 园丁）**：
+
+| 层 | 载体 | 加载方式 |
+|---|---|---|
+| L1 约定 / 习惯（短判断式） | 业务仓 `.cursor/rules/<主题>.mdc` | 通用 `alwaysApply`、专题 `globs` 定向（碰到匹配文件才注入） |
+| L2 过程知识（step-by-step 手册） | 业务仓 `.cursor/skills/<name>/SKILL.md` | 按需唤起、复利最高 |
+| L3 业务域知识（名词表 / 模块地图） | `business-glossary.mdc` | 常驻、条目极简 |
+
+第 4 类 harness 建议（fe-ai-flow prompt 缺陷）**只 propose 不落地**（agent 自改自己 prompt 有自污染风险）。
+
+**核心机制**：
+- **证据驱动**：挖全部 artifact + 事件日志的四类高价值信号（用户 revise 原话 / ask_user 拍板 / review bug + 用户裁决 / check 失败）——凭印象编造被后置检查 fail
+- **两段式 HITL**：propose 表 → ask_user 逐条筛（落地 / 否决、复用 review §6 模式、零新 UI）→ 批准的才写知识载体 → wait_for_user
+- **防臃肿铁律（用户拍板的一等约束）**：4 道准入闸（跨任务复用 / 证据强度 / 代码自明 / 预算 ≤7 条）+ 园丁义务（写前 read 目标文件、重复 merge 不新增、过时条目出修订、文件超 150 行提拆分）+ 0 条是合格结果
+- **写入边界**：只许 `.cursor/rules/**` / `.cursor/skills/**` / `AGENTS.md`、不碰业务代码、不碰 .git（改动停工作区、用户顺手带进下次提交）
+
+**准入放宽**（对老草稿）：merged-only + 一次性 → 「≥1 个 completed action 即可、可多次跑」（沉淀点在 review 阶段就暴露、第二轮先读上一轮不重复提炼）；merged 后推进 dialog 默认选 learn。
+
+**改动面**：`action-learn.md` 全量重写；task-runner 准入解禁（`AVAILABLE_ACTIONS` + learn 前置条件）+ `loadActionPrompt` 补 `{{eventsLogPath}}` 供值（占位符对账测试当场抓到漏供）；`checkLearn` 后置检查（必备段 + 证据路径逐条验真 + 落地记录闭环）；advance-dialog 解禁 learn。⚠️ 真机跑一轮 learn 待用户验。
+
+**同日实测追加（用户连续反馈）**：
+- **ask_user 弹窗问题 markdown 渲染**：`MarkdownText` 从 event-stream/rows export、ask-user-dialog 问题文本从裸 `<p>` 换 markdown（原来 `` `code` `` / 列表全是字面量）
+- **MCP 开关弹回 bug**：mcp-toggle-list 自管模式 PATCH 成功后丢弃返回 task、干等 SSE——而改黑名单只写 meta 不产生事件、SSE 永不推、开关「闪一下弹回」。修法对齐 ContextDocsPanel：PATCH 返回 task 经 `onUpdated → onTaskUpdate → setTask` 回传
+- **learn 卡片副标题残留**：advance-dialog 副标题原是嵌套三元、fallthrough 把「沉淀」也显示成「提 MR 到 test」——抽 `ACTION_SUBTITLE` 常量表；顺带清掉 chat-mcp / page / finalize route 里「V0.6.3 起 / V0.6.0 不实现」的过期 learn 文案
+- **批次选择加「自由改动」选项卡**（用户提议的形态）：批次列表末尾加显式选项卡「自由改动（不绑定批次）」、跟批次勾选互斥——三态全显式：选批（按批做计进度）/ 自由改动（`buildBatchDirective` 注入「不绑定批次」指令：范围以指令为准、不顺手开做未完成批次、不计批次进度）/ 都没选（拦提交、语义不明）。老语义「空=全做」废弃、想全做点「全选」
+- **增量 build artifact 布局**：本轮动过的 task 置顶详写、沿用项收拢成段尾「### 沿用 / 未触及」一行清单（原来按 plan 顺序穿插、增量被夹在沿用中间）；沿用引用写行内代码 `` `build #18` ``、`looksLikeArtifactRef` 扩展识别 `<type> #<n>` 形态 → 点击跳转对应 action
+- **hook 脚本 .sh → Node .mjs**（同事 Windows 实测踩坑）：hooks.json command 指 .sh 时 Windows 没 shebang 机制、按文件关联把脚本「打开」到 IDE（每次 hook 触发弹一次）、且两道闸（stop 交卷 / shell-guard）在 Windows 从未生效。改写 `stop-hook.mjs` / `shell-guard.mjs`（node 内置 fetch、去 bash/curl 依赖）、注入 command 改 `node "<绝对路径>"`；`upgradeFeHooksJson` 改「全量重写」——fe 自建的 hooks.json 跟期望（buildHooksJson 单一源）不一致直接覆盖、老 .sh 形式拉代码重跑任务即自动迁移；.sh 删除不留兼容
+
+typecheck ✓ / lint ✓ / 55 测试 ✓。
+
 ### V0.6.28：cursor 链接多段行号宽容解析 + task 中途追加仓库（2026-06-10）
 
 **A. cursor:// 链接多段行号（同事 + 用户双实测踩坑）**：

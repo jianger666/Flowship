@@ -212,7 +212,7 @@
 阻塞等用户拍板。**实际等用户的姿势走 super-prompt 里的「shell + curl long-poll」机制**——调完 `wait_for_user` 立刻拿到 `[SHELL_WAIT_GUIDE token=xxx]`、用 `shell` 工具跑里面的 curl 命令、shell stdout 返回行解析：
 
 - `[ACTION_ACK approve]` → 立刻再调 `wait_for_user(task_id={{taskId}})`（不带 action_id、不带 artifact_path）等下一 action 指令、**绝对不退出 Run**
-- `[ACTION_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`
+- `[ACTION_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`（**必须带同一 action_id + artifact_path**、不带 = 服务端判协议违规自动纠正）
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
 `wait_for_user` 调用前后不要在 assistant_message 里讲它的存在、对用户透明（用户看板上看到「plan action 完成、等你确认」就够、不需要你 summarize）。

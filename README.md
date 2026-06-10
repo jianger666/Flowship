@@ -70,13 +70,19 @@ pnpm install
 pnpm dev
 ```
 
-### 方式二：Windows 绿色包（同事零环境上手、不需要 node / pnpm / git）
+### 方式二：绿色包（同事零环境上手、不需要 node / pnpm / git）
 
-1. 从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载 `fe-ai-flow-win-x64.zip`、解压到任意目录
-2. 双击 `启动fe-ai-flow.bat`——浏览器自动打开、桌面自动出现「fe-ai-flow」快捷方式
-3. 以后都点桌面快捷方式；每次启动自动检查新版、有就静默更新（任务数据 `data/` 保留）
+从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台的 zip、解压到任意目录：
 
-> 发版（维护者）：`git tag v0.6.X && git push origin v0.6.X`、CI 自动 build 绿色包传 Release。
+| 平台 | 包 | 启动 |
+|---|---|---|
+| Windows | `fe-ai-flow-win-x64.zip` | 双击 `启动fe-ai-flow.bat` |
+| mac（M 芯片） | `fe-ai-flow-darwin-arm64.zip` | **首次右键** `启动fe-ai-flow.command` →「打开」（过 Gatekeeper）、之后直接双击 |
+| mac（Intel） | `fe-ai-flow-darwin-x64.zip` | 同上 |
+
+启动后浏览器自动打开、桌面自动出现快捷方式；每次启动自动检查新版、有就静默更新（任务数据 `data/` 保留）。
+
+> 发版（维护者）：`git tag v0.6.X && git push origin v0.6.X`、CI 自动 build 三平台绿色包传 Release。
 
 打开 http://localhost:8876、按以下顺序操作：
 

@@ -253,8 +253,14 @@ interface ChatMcpGlobalState {
   // V0.6.19：approve 后秒推下一 action 撞 grace 窗口时、NEXT_ACTION 暂存这里、
   // 等 agent 重新进「待命态」(registerPendingEntry actionId 空) 再兑现、防 race 丢指令
   pendingNextActions: Map<string, ToolReturn>;
+  // V0.6.31：「未处理 revise」标记——用户点「再聊聊」后 agent 还欠一次处理（问类答疑 / 改类弹窗）
+  // 实测踩坑：agent 收到 [ACTION_ACK revise] 后什么都不干、直接调 wait_for_user 不带 action_id
+  // → 服务端误入待命态、pendingAck 被清、UI 只剩「推进」、用户没法再聊聊。
+  // 有此标记时 wait_for_user 不带 action_id → 自动纠正回原 action 的 ack 态 + 返回文本责令补处理。
+  unansweredRevises: Map<string, { actionId: string; artifactPath?: string }>;
 }
 
+// V10：2026-06-10 V0.6.31 加 unansweredRevises（revise 后 agent 跳过处理直入待命态的自动纠正）
 // V9：2026-06-05 V0.6.19 加 pendingNextActions（approve 后秒推 action 的 grace race 修复、挂起队列）
 // V8：2026-05-28 V0.6.1 加 taskActionHandlers（submit_mr / set_feishu_testers）
 // V7：2026-05-27 V0.6 字段重命名（phase → actionId / artifact → artifactPath / 新增 next_action kind）
@@ -263,7 +269,7 @@ interface ChatMcpGlobalState {
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
 // → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV9__";
+const GLOBAL_KEY = "__feAiFlowChatStateV10__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -277,6 +283,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       sessionTransports: new Map(),
       tokenToTask: new Map(),
       pendingNextActions: new Map(),
+      unansweredRevises: new Map(),
     };
   }
   return g[GLOBAL_KEY];
@@ -288,6 +295,9 @@ const pendingMap = getGlobalState().pendingMap;
 
 // V0.6.19：挂起的 NEXT_ACTION 队列（approve 后秒推 action 撞 grace race 的暂存、见 submitNextAction / registerPendingEntry）
 const pendingNextActions = getGlobalState().pendingNextActions;
+
+// V0.6.31：未处理 revise 标记（见 ChatMcpGlobalState 注释、wait_for_user handler 消费）
+const unansweredRevises = getGlobalState().unansweredRevises;
 
 // 「这个 task 当前是否处在等待用户的状态」
 // wait_for_user / ask_user MCP 工具进来时标 true、submitXxx / cancelPending 清
@@ -716,6 +726,8 @@ const buildShellWaitGuidance = (
     actionId?: string;
     artifactPath?: string;
     mode: "wait_for_user" | "ask_user";
+    // V0.6.31：未处理 revise 自动纠正命中时 true、引导文本头部加责令段
+    reviseCorrection?: boolean;
   },
 ): string => {
   const baseUrl = getServerBaseUrl();
@@ -726,8 +738,21 @@ const buildShellWaitGuidance = (
       : opts.actionId
         ? `等用户对 action=${opts.actionId}（artifact=${opts.artifactPath ?? "<未指定>"}）点 approve / revise、curl 拿到 \`[ACTION_ACK approve]\` 或 \`[ACTION_ACK revise] <feedback>\` 接着推进。`
         : "等用户在 UI 点「推进」选下一 action。curl 可能拿到：\n    - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]\\n\\n<用户指令>` → 解析头部 + 按对应 action prompt 执行";
+  const correctionBlock = opts.reviseCorrection
+    ? [
+        "",
+        "## 🚨 协议违规、已被服务端纠正（先读这段再跑 shell）",
+        "",
+        `你刚收到 action=${opts.actionId} 的 [ACTION_ACK revise] feedback、但**没做任何处理**就调了 wait_for_user 且没带 action_id。`,
+        "服务端已强制把本次等待绑回该 action。**在跑下面的 shell 之前、你必须先补上欠用户的处理**（super-prompt §3 revise 二分类）：",
+        "  - feedback 是纯疑问句（问类）→ 立刻 emit 一条 assistant_message 完整答疑、不动 artifact",
+        "  - 其他（改类、含模糊兜底）→ 立刻调 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动手",
+        "处理完再跑 shell 等这个 action 的下一次 ack。下次记住：revise 处理完重新调 wait_for_user 时**必须带同一 action_id**。",
+      ]
+    : [];
   return [
     shellWaitGuideHead(token),
+    ...correctionBlock,
     "",
     "## ⚠️ 跑 shell 前自检（仅 chat 自由对话场景；task 写 artifact 场景跳过本段）",
     "如果你这一轮是在 chat 里回答用户：先确认**完整答案**已经 emit 给用户了吗？",
@@ -860,11 +885,33 @@ const buildMcpServer = (): McpServer => {
         `[chat-mcp] wait_for_user 入参 task_id=${task_id} action_id=${action_id ?? "<待命>"} artifact_path=${artifact_path ?? "<none>"}`,
       );
 
+      // V0.6.31 自动纠正：上一次 ack 是 revise 且 agent 还没闭环（没带原 action_id 回来）时——
+      //   - 不带 action_id（实测踩坑姿势：agent 收到 revise 什么都不干直接退待命）→ 强制按原 action
+      //     注册 ack 态：UI 的 通过/再聊聊 按钮不丢、用户还能继续对话；返回文本责令 agent 补处理
+      //   - 带原 action_id 回来（协议正确、答疑 / 弹窗已做）→ 标记闭环、正常放行
+      let effectiveActionId = action_id;
+      let effectiveArtifactPath = artifact_path;
+      let reviseCorrection = false;
+      const owed = unansweredRevises.get(task_id);
+      if (owed) {
+        if (!action_id) {
+          effectiveActionId = owed.actionId;
+          effectiveArtifactPath = owed.artifactPath;
+          reviseCorrection = true;
+          console.warn(
+            `[chat-mcp] wait_for_user 自动纠正：task=${task_id} 有未处理 revise（action=${owed.actionId}）、agent 没带 action_id、强制回 ack 态`,
+          );
+        } else {
+          // 带了 action_id（原 action 或新 action）都视为 agent 已在正轨、标记闭环
+          unansweredRevises.delete(task_id);
+        }
+      }
+
       // V0.3.5：注册 pending entry（建 promise、写 pendingMap、生成 token）、立即返回 shell 引导
       // 旧 entry 由 registerPendingEntry 自动 stale 顶替（极少见、agent 通常一次 wait 走完）
       const entry = registerPendingEntry(task_id, {
-        actionId: action_id,
-        artifactPath: artifact_path,
+        actionId: effectiveActionId,
+        artifactPath: effectiveArtifactPath,
       });
 
       // 仅当「之前不在等待」时才通知 runner 切 task.runStatus = awaiting_user
@@ -875,8 +922,8 @@ const buildMcpServer = (): McpServer => {
       if (!entry.resolved && !waitingTasks.has(task_id)) {
         waitingTasks.add(task_id);
         await safeNotifyAwaiting(task_id, {
-          actionId: action_id,
-          artifactPath: artifact_path,
+          actionId: effectiveActionId,
+          artifactPath: effectiveArtifactPath,
         });
       }
 
@@ -885,9 +932,10 @@ const buildMcpServer = (): McpServer => {
           {
             type: "text" as const,
             text: buildShellWaitGuidance(task_id, entry.token, {
-              actionId: action_id,
-              artifactPath: artifact_path,
+              actionId: effectiveActionId,
+              artifactPath: effectiveArtifactPath,
               mode: "wait_for_user",
+              reviseCorrection,
             }),
           },
         ],
@@ -1560,6 +1608,15 @@ export const submitActionAck = (
   if (entry.resolved) {
     return { ok: false, reason: "本次 ack 已被处理（重复提交 / grace 残留）" };
   }
+  // V0.6.31 未处理 revise 标记：revise 置位（agent 欠一次处理）、approve 清除（用户翻篇）
+  if (action === "revise") {
+    unansweredRevises.set(taskId, {
+      actionId,
+      artifactPath: entry.artifactPath,
+    });
+  } else {
+    unansweredRevises.delete(taskId);
+  }
   finalizeEntry(taskId, entry, {
     kind: action === "approve" ? "action_approve" : "action_revise",
     text: feedback ?? "",
@@ -1605,6 +1662,8 @@ export const submitNextAction = (
     attachmentPaths:
       attachmentPaths && attachmentPaths.length > 0 ? attachmentPaths : undefined,
   };
+  // V0.6.31：用户主动推进新 action = 对旧 action 的 revise 已翻篇、清未处理标记
+  unansweredRevises.delete(taskId);
   const entry = pendingMap.get(taskId);
   // 1) fresh 待命态 entry（存在且未 resolved）→ 直接交付
   if (entry && !entry.resolved) {
@@ -1681,6 +1740,8 @@ export const cancelPending = (taskId: string): boolean => {
   waitingTasks.delete(taskId);
   // V0.6.19：连同清挂起的 NEXT_ACTION、避免 task 取消后队列残留泄漏 / 下次复用串味
   pendingNextActions.delete(taskId);
+  // V0.6.31：连同清未处理 revise 标记（task 取消 / 重启 action 后旧标记不该影响新 run）
+  unansweredRevises.delete(taskId);
   const entry = pendingMap.get(taskId);
   if (!entry) return false;
   finalizeEntry(taskId, entry, {
