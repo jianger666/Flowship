@@ -51,8 +51,10 @@ import {
  *   - prose-p:my-1 等：把 prose 默认的大段 margin 拉小、贴近聊天气泡密度
  *   - remark-gfm：支持表格 / 删除线 / 任务清单等扩展语法
  *   - 流式拼接的 markdown 可能不完整（比如开头有 ** 但还没闭合）、react-markdown 容错够好、不会炸
+ *
+ * export 给 ask-user-dialog 复用（V0.6.29）：agent 问的问题常带 inline code / 列表、弹窗里也要渲染
  */
-const MarkdownText = ({ text }: { text: string }) => (
+export const MarkdownText = ({ text }: { text: string }) => (
   <div
     className={cn(
       "prose prose-sm dark:prose-invert max-w-none wrap-break-word",

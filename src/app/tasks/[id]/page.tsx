@@ -521,7 +521,7 @@ const TaskDetailPage = () => {
       title: finalStatus === "merged" ? "确认任务已合入" : "确认放弃任务",
       description:
         finalStatus === "merged"
-          ? "标记本任务对应 MR 已合入 main、agent 收尾结束 run（V0.6.3 起这里会跳 learn action 沉淀经验）"
+          ? "标记本任务对应 MR 已合入 main、agent 收尾结束 run；之后可在「推进」里跑沉淀（learn）提炼经验"
           : "标记本任务已放弃、agent 收尾结束 run、产物保留只读",
       destructive: finalStatus === "abandoned",
       confirmLabel: finalStatus === "merged" ? "已合入" : "放弃任务",
@@ -792,7 +792,7 @@ const TaskDetailPage = () => {
         {/* 上下文文档 + MCP + 批次：都是 chip + 点开 dialog、同一行、不各占一行 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <ContextDocsPanel task={task} onTaskUpdate={setTask} />
-          <TaskMcpPanel task={task} />
+          <TaskMcpPanel task={task} onTaskUpdate={setTask} />
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
         </div>

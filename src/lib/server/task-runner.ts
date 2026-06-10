@@ -136,13 +136,14 @@ const ACTION_PROMPT_FILE: Record<ActionType, string> = {
   learn: "action-learn.md",
 };
 
-// V0.6.1 范围内允许的 action 类型（advanceTask 准入门槛 1）
-// test / learn 在 V0.6.2+ 上线、当前拒绝
-const ACTION_AVAILABLE_IN_V061: ReadonlySet<ActionType> = new Set([
+// 已实装的 action 类型（advanceTask 准入门槛 1）
+// learn V0.6.29 实装；test 待上线、当前拒绝
+const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
   "plan",
   "build",
   "review",
   "ship",
+  "learn",
 ]);
 
 const NULL_PLACEHOLDER = "（未提供）";
@@ -192,6 +193,8 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
 //   {{taskId}} / {{taskTitle}} / {{repoPath}}（effective cwd）
 //   {{role}} / {{roleLabel}}
 //   {{actionArtifactsDir}}（绝对路径、给 agent write 用）
+//   {{eventsLogPath}}（V0.6.29、learn action 挖事件日志用）
+// ⚠️ 加占位符记得同步 tests/protocol-signals.test.ts 的供值表对账
 const loadActionPrompt = async (
   type: ActionType,
   task: Task,
@@ -205,6 +208,7 @@ const loadActionPrompt = async (
     role: task.role,
     roleLabel: TASK_ROLE_LABEL[task.role],
     actionArtifactsDir: getActionsDir(task.id),
+    eventsLogPath: getEventsLogPath(task.id),
   });
 };
 
@@ -371,7 +375,8 @@ const buildTaskUpdateHint = (
 // 构造 build 的「本次做哪批」指令段（注入 NEXT_ACTION、放用户指令之后）
 //
 // - 无批次（plan 没拆 / 没 plan）→ undefined、不注入本段、build 退化「做全部」老流程
-// - requestedBatchIds 空 → 全做（用户没挑批 / 兜底）
+// - requestedBatchIds 空（V0.6.29 批次选填）→「自由改动」指令——修 bug / 跨批次散改、
+//   只做用户指令里的事、不开做未完成批次、不计批次进度（老语义「空=全做」已废、想全做点全选）
 // - 进度（累计 X/Y 批）派生自 computeBatchProgress、纯算不存计数器
 const buildBatchDirective = (
   task: Task,
@@ -380,10 +385,18 @@ const buildBatchDirective = (
   const { batches, doneIds, total } = computeBatchProgress(task);
   if (batches.length === 0) return undefined;
 
-  const selected =
-    requestedBatchIds && requestedBatchIds.length > 0
-      ? batches.filter((b) => requestedBatchIds.includes(b.id))
-      : batches;
+  // V0.6.29：用户没勾批次 = 自由改动（多见于多轮之后回头修 bug、忘了 / 不属于哪个批次）
+  if (!requestedBatchIds || requestedBatchIds.length === 0) {
+    const doneCount = batches.filter((b) => doneIds.has(b.id)).length;
+    return [
+      `[BUILD_BATCHES] 本需求 plan 共拆 ${total} 个批次（已完成 ${doneCount}/${total}）、但**本次 build 不绑定批次**——用户没有勾选批次、这是一次自由改动（修 bug / 跨批次散改）：`,
+      "- **范围**：只做用户指令里点到的事、范围以指令为准",
+      "- **不要顺手开做未完成批次**——批次推进要用户在推进 dialog 里显式勾选、不归这次",
+      "- **进度**：本次不计入批次进度、artifact 总览「本次完成批次」写「无（自由改动）」",
+    ].join("\n");
+  }
+
+  const selected = batches.filter((b) => requestedBatchIds.includes(b.id));
   if (selected.length === 0) return undefined;
 
   const isAll = selected.length === batches.length;
@@ -726,10 +739,10 @@ const checkActionPrerequisites = (
   actionType: ActionType,
   ctx: PrerequisiteContext = {},
 ): { ok: true } | { ok: false; reason: string } => {
-  if (!ACTION_AVAILABLE_IN_V061.has(actionType)) {
+  if (!AVAILABLE_ACTIONS.has(actionType)) {
     return {
       ok: false,
-      reason: `action 类型「${ACTION_LABEL[actionType]}」在 V0.6.1 阶段未实现、当前仅支持 plan / build / review / ship。等 V0.6.2+ 上线后再用。`,
+      reason: `action 类型「${ACTION_LABEL[actionType]}」尚未实现、当前支持 plan / build / review / ship / learn。`,
     };
   }
 
@@ -778,23 +791,25 @@ const checkActionPrerequisites = (
       }
       return { ok: true };
     }
-    case "learn":
-      if (task.repoStatus !== "merged") {
+    case "learn": {
+      // V0.6.29 放宽（原草稿要求 merged 后 + 整 task 一次）：
+      //   - 很多沉淀点在 review / ship 阶段就暴露了、且用户不一定及时标 merged
+      //   - 多次跑无危害（prompt 要求第二轮先读上一轮 learn artifact、不重复提炼）
+      const hasCompleted = task.actions.some(
+        (a) => a.type !== "learn" && a.status === "completed",
+      );
+      if (!hasCompleted) {
         return {
           ok: false,
-          reason: "learn 只在 task 已 merged 后跳一次。当前 task 还没 merged。",
-        };
-      }
-      if (task.actions.some((a) => a.type === "learn")) {
-        return {
-          ok: false,
-          reason: "本 task 已经跑过 learn action、整 task 内只能跑一次。",
+          reason:
+            "learn 需要至少 1 个已完成的 action（plan / build / review / ship）——有了过程才有可沉淀的经验。",
         };
       }
       return { ok: true };
+    }
     case "test":
-      // V0.6.1 已被上面 ACTION_AVAILABLE_IN_V061 拦掉、走不到这里
-      return { ok: false, reason: "V0.6.1 未实现" };
+      // 已被上面 AVAILABLE_ACTIONS 拦掉、走不到这里
+      return { ok: false, reason: "test action 未实现" };
     default: {
       const _: never = actionType;
       return { ok: false, reason: `未知 action 类型：${_}` };
@@ -1115,7 +1130,7 @@ export interface AdvanceTaskInput {
   // 来自 settings.gitHost / gitToken、agent 启动时快照、改 token 需 forceNewAgent
   gitHost?: string;
   gitToken?: string;
-  // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=全做）
+  // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=自由改动不计进度）
   requestedBatchIds?: string[];
   // V0.6.25 CheckRun：ship 时的 gate override（最新 build 的 check 没过 / 没配、用户勾「仍继续」+ reason）
   //   server 端校验它绑的是最新 build 的 checkRun（防重 build 后失效的 override 蒙混过关）、仅 ship 用
@@ -1596,7 +1611,7 @@ export const acknowledgeAction = async (
  * V0.6 终态：task 合入 / abandon
  *
  * - merged：write [TASK_DONE]、agent 收尾退出、setTaskRepoStatus=merged + runStatus=idle
- *   V0.6.3+ 此时会推荐 learn action（runner 准入仍允许）；V0.6.0 不实现 learn
+ *   V0.6.29 起 merged 后推进 dialog 默认选 learn（沉淀时机、runner 准入允许）
  * - abandoned：write [TASK_ABANDONED]、agent 立刻退、setTaskRepoStatus=abandoned + runStatus=idle
  */
 export const finalizeTask = async (

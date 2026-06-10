@@ -10,11 +10,16 @@
  *
  * 为什么注入到业务仓库：agent cwd = 业务仓库、settingSources:["project"] 只加载 cwd 的
  * .cursor/hooks.json（够不着全局 ~/.cursor/）、所以 fe 的 hook 必须写进业务仓库
- * .cursor/hooks.json（command 指向 fe 固定脚本绝对路径）。
+ * .cursor/hooks.json。
  *
- * 策略（用户拍板方案 A、V0.6.27 微调）：
- * - **没 .cursor/hooks.json 就建 fe 的**；有且是 fe 自己建的（command 指向 fe scripts/）
- *   → 增量补缺新 hook 条目（旧版只有 stop、自动升级补 shell-guard）；
+ * command 形式（V0.6.29 改 `node "<mjs 绝对路径>"`、原来是 .sh 绝对路径）：
+ * - 同事 Windows 实测踩坑：.sh 没 shebang 机制、系统按文件关联处理、关联应用是 IDE →
+ *   hook 每触发一次 IDE 就「打开」脚本一次、且两道闸在 Windows 从未真正生效
+ * - fe-ai-flow 跑在 Node 上、`node` 必在 PATH、跨平台必可执行、顺带去掉 bash/curl 依赖
+ *
+ * 策略（用户拍板方案 A、V0.6.27 微调、V0.6.29 升级逻辑改全量重写）：
+ * - **没 .cursor/hooks.json 就建 fe 的**；有且是 fe 自己建的（command 引用 fe scripts/）
+ *   → 跟期望内容比对、不一致就整体重写（旧版 .sh 形式 / 缺 hook 条目都走这条自动升级）；
  *   有且是业务仓库自己的 → 不动（该情况 fe hook 不生效、回退事后兜底）
  * - 建了**留存复用**（不删、下次直接用）+ 加 .git/info/exclude 防 agent 误 commit（仅 cwd 本身
  *   是 git 仓时；多仓公共父目录非 git 仓、文件不归任何仓管、无需 exclude）
@@ -25,13 +30,17 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 // fe 固定 hook 脚本绝对路径（process.cwd() = fe 项目根、Next.js 运行时）
-const stopHookScriptPath = (): string =>
-  path.join(process.cwd(), "scripts", "stop-hook.sh");
-const shellGuardScriptPath = (): string =>
-  path.join(process.cwd(), "scripts", "shell-guard.sh");
+// V0.6.29：command 包一层 `node "..."`——路径可能含空格、引号兜住；sh -c / cmd 都认这个写法
+const stopHookCommand = (): string =>
+  `node "${path.join(process.cwd(), "scripts", "stop-hook.mjs")}"`;
+const shellGuardCommand = (): string =>
+  `node "${path.join(process.cwd(), "scripts", "shell-guard.mjs")}"`;
 
-// fe scripts 目录前缀——判断已有 hooks.json 是不是 fe 自己建的（是才允许增量升级）
-const feScriptsPrefix = (): string => path.join(process.cwd(), "scripts") + path.sep;
+// fe scripts 目录路径——判断已有 hooks.json 是不是 fe 自己建的（是才允许升级重写）
+// 老形式 command = ".../scripts/xxx.sh"（startsWith）、新形式 = `node ".../scripts/xxx.mjs"`（includes）
+// 统一用 includes 兼容两代
+const feScriptsDir = (): string => path.join(process.cwd(), "scripts") + path.sep;
+const isFeCommand = (cmd: string): boolean => cmd.includes(feScriptsDir());
 
 interface HookEntry {
   command?: string;
@@ -44,14 +53,14 @@ interface HooksJsonShape {
   [k: string]: unknown;
 }
 
-// 业务仓库 hooks.json 全量内容（首次注入用）
+// 业务仓库 hooks.json 全量内容（首次注入 + 升级重写共用、单一期望源）
 const buildHooksJson = (): string =>
   `${JSON.stringify(
     {
       version: 1,
       hooks: {
-        stop: [{ command: stopHookScriptPath(), loop_limit: 3 }],
-        beforeShellExecution: [{ command: shellGuardScriptPath() }],
+        stop: [{ command: stopHookCommand(), loop_limit: 3 }],
+        beforeShellExecution: [{ command: shellGuardCommand() }],
       },
     },
     null,
@@ -88,10 +97,14 @@ export const ensureStopHookInstalled = async (cwd: string): Promise<void> => {
 };
 
 /**
- * 旧版 fe hooks.json 增量升级（V0.6.27：旧文件只有 stop、补 beforeShellExecution）
+ * 旧版 fe hooks.json 升级（V0.6.29 起改「全量重写」、原 V0.6.27 是增量补条目）
  *
- * 只动「fe 自己建的」文件：所有已有 hook command 都指向 fe scripts/ 目录才算
+ * 只动「fe 自己建的」文件：所有已有 hook command 都引用 fe scripts/ 目录才算
  * （业务仓库自己的 hooks.json 一律不碰、哪怕里面恰好也有 stop）。
+ *
+ * 全量重写的理由：文件内容完全归 fe 所有（buildHooksJson 是单一期望源）、
+ * 跟期望不一致（老 .sh command / 缺条目）直接覆盖、不再逐条 diff 补——
+ * Windows .sh → node 迁移、用户拉代码重跑一次任务即自动修复。
  */
 const upgradeFeHooksJson = async (hooksJsonPath: string): Promise<void> => {
   try {
@@ -102,21 +115,15 @@ const upgradeFeHooksJson = async (hooksJsonPath: string): Promise<void> => {
     const allEntries = Object.values(parsed.hooks).flat();
     if (allEntries.length === 0) return;
     const allOurs = allEntries.every(
-      (e) => typeof e?.command === "string" && e.command.startsWith(feScriptsPrefix()),
+      (e) => typeof e?.command === "string" && isFeCommand(e.command),
     );
     if (!allOurs) return; // 业务仓库自己的 hooks、不动
 
-    const shellGuard = shellGuardScriptPath();
-    const existing = parsed.hooks.beforeShellExecution ?? [];
-    if (existing.some((e) => e?.command === shellGuard)) return; // 已是新版
+    const desired = buildHooksJson();
+    if (raw === desired) return; // 已是最新
 
-    parsed.hooks.beforeShellExecution = [...existing, { command: shellGuard }];
-    await fs.writeFile(
-      hooksJsonPath,
-      `${JSON.stringify(parsed, null, 2)}\n`,
-      "utf8",
-    );
-    console.log(`[stop-hook] 已升级 ${hooksJsonPath}（补 beforeShellExecution shell-guard）`);
+    await fs.writeFile(hooksJsonPath, desired, "utf8");
+    console.log(`[stop-hook] 已升级 ${hooksJsonPath}（重写为最新 node hook 形式）`);
   } catch (err) {
     console.error("[stop-hook] 升级已有 hooks.json 失败（忽略）", err);
   }

@@ -16,7 +16,8 @@
  *     没配的仓按是否被本次 build 改过分 not_configured/skipped」复活、详见 checkBuild / runRepoChecks
  *   - review: artifact「总评」段声明的「基底 commit」跟实际 `git rev-parse HEAD` 一致（防 agent 拿错 / 编造基底）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
- *   - test/learn: V0.6.2+ stub、暂不实现
+ *   - learn（V0.6.29）：必备段（提炼条目 / 本次无可沉淀）+ 证据路径真实 + 落地记录闭环
+ *   - test: stub、暂不实现
  *   - chat 不走本机制（chat 是独立 mode、不复用 action 体系、详见 chat-runner.ts）
  *
  * 关于 plan「黑名单 grep」的历史决策（2026-05-28 用户拍板删）：
@@ -72,13 +73,14 @@ export const runActionCheck = async (
       //   （绕开 V0.6.3 撤掉的「写死 pnpm 搞死多栈」：没配命令的仓记 not_configured、不误报）
       case "build":
         return await checkBuild(task, action);
-      // test / learn：V0.6.2+ 还没实现
+      // test：还没实现
       case "test":
-      case "learn":
         return {
           passed: true,
-          details: `${action.type} action 暂未实现 deterministic 检查、跳过`,
+          details: "test action 暂未实现 deterministic 检查、跳过",
         };
+      case "learn":
+        return await checkLearn(task, action);
       case "review":
         return await checkReview(task, action);
       case "ship":
@@ -264,6 +266,88 @@ const checkReview = async (
     passed: true,
     details:
       "review artifact 必备段 + bug 复审段齐全、基底 commit 跟 HEAD 一致、工作区未被改动",
+  };
+};
+
+// ----------------- learn（V0.6.29）-----------------
+//
+// 检查目标：防 agent 凭印象编造沉淀 / 跳过 HITL 闭环
+//   1. artifact 落盘 + 内容 ≥ 100 字
+//   2. 「提炼条目」段存在、或明确写「本次无可沉淀」（0 条是合格结果、但要写明）
+//   3. 证据路径真实：artifact 引用的所有 actions/N-<type>.md 必须存在于本 task（防编造）
+//   4. 提炼条目非空时「落地记录」段必须存在（证明 ask_user 筛选闭环走完、全否决也要记）
+const checkLearn = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult> => {
+  if (!action.artifactPath) {
+    return { passed: false, details: "learn 没产出 artifact" };
+  }
+  const absPath = getActionArtifactPath(task.id, action.n, action.type);
+  let content: string;
+  try {
+    content = await fs.readFile(absPath, "utf-8");
+  } catch (err) {
+    return {
+      passed: false,
+      details: `learn artifact 读取失败：${absPath}（${err instanceof Error ? err.message : String(err)}）`,
+    };
+  }
+  if (content.trim().length < 100) {
+    return {
+      passed: false,
+      details: `artifact 内容过短（${content.trim().length} chars）、不像完整 learn 复盘`,
+    };
+  }
+
+  const hasEntries = /提炼条目/.test(content);
+  const declaredNone = /本次无可沉淀/.test(content);
+  if (!hasEntries && !declaredNone) {
+    return {
+      passed: false,
+      details:
+        "learn artifact 缺「提炼条目」段、也没写「本次无可沉淀条目」——0 条是合格结果、但必须明示 + 理由",
+    };
+  }
+
+  // 证据路径真实性：扫所有 actions/N-<type>.md 引用、逐个验证存在
+  // （路径拼接复用 getActionArtifactPath、跟 artifact 实际落盘规则同源）
+  const refs = [...content.matchAll(/actions\/(\d+)-([a-z]+)\.md/g)];
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const m of refs) {
+    const ref = m[0]!;
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    // 本 action 自己的 artifact 不算证据引用、跳过
+    if (Number(m[1]) === action.n) continue;
+    try {
+      await fs.access(
+        getActionArtifactPath(task.id, Number(m[1]), m[2] as ActionRecord["type"]),
+      );
+    } catch {
+      missing.push(ref);
+    }
+  }
+  if (missing.length > 0) {
+    return {
+      passed: false,
+      details: `learn artifact 引用了不存在的证据路径：${missing.join(", ")}（疑似凭印象编造、证据必须指向真实 artifact）`,
+    };
+  }
+
+  // 闭环检查：有提炼条目（且不是声明 0 条）→ 必须有落地记录段
+  if (hasEntries && !declaredNone && !/落地记录/.test(content)) {
+    return {
+      passed: false,
+      details:
+        "learn artifact 有「提炼条目」但缺「落地记录」段——ask_user 筛选闭环没走完（全否决也要记「用户全部否决」）",
+    };
+  }
+
+  return {
+    passed: true,
+    details: `learn artifact 完整：提炼条目 / 证据路径（${seen.size} 处引用全部真实）/ 落地记录闭环通过`,
   };
 };
 

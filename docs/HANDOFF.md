@@ -189,7 +189,7 @@ V0.6.3 撤掉 build 写死的 `pnpm typecheck/lint`（多技术栈误报）后 b
 ```
 agent 要跑 shell 命令
   → Cursor 触发 beforeShellExecution hook（业务仓 .cursor/hooks.json、起 agent 时注入）
-  → scripts/shell-guard.sh 把 {agent_id, command} POST 到 /api/hooks/shell-check
+  → scripts/shell-guard.mjs 把 {agent_id, command} POST 到 /api/hooks/shell-check
   → server 用 findTaskIdByAgentId 认出是不是 fe 的 agent（不是 → 放行、不干扰用户自己的 Cursor）
   → evaluateShellCommand（shell-guard-rules.ts 黑名单）判定 → allow / deny
   → deny 时 agent 收到 agent_message 解释 + task 事件流记 error 事件（可观测）
@@ -289,6 +289,40 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.29：learn action 实装——三层知识架构 + 防臃肿铁律（2026-06-10）
+
+learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution / OpenSpec living docs / superpowers skills 理念）：
+
+**三层知识架构（learn agent = 知识路由器 + 园丁）**：
+
+| 层 | 载体 | 加载方式 |
+|---|---|---|
+| L1 约定 / 习惯（短判断式） | 业务仓 `.cursor/rules/<主题>.mdc` | 通用 `alwaysApply`、专题 `globs` 定向（碰到匹配文件才注入） |
+| L2 过程知识（step-by-step 手册） | 业务仓 `.cursor/skills/<name>/SKILL.md` | 按需唤起、复利最高 |
+| L3 业务域知识（名词表 / 模块地图） | `business-glossary.mdc` | 常驻、条目极简 |
+
+第 4 类 harness 建议（fe-ai-flow prompt 缺陷）**只 propose 不落地**（agent 自改自己 prompt 有自污染风险）。
+
+**核心机制**：
+- **证据驱动**：挖全部 artifact + 事件日志的四类高价值信号（用户 revise 原话 / ask_user 拍板 / review bug + 用户裁决 / check 失败）——凭印象编造被后置检查 fail
+- **两段式 HITL**：propose 表 → ask_user 逐条筛（落地 / 否决、复用 review §6 模式、零新 UI）→ 批准的才写知识载体 → wait_for_user
+- **防臃肿铁律（用户拍板的一等约束）**：4 道准入闸（跨任务复用 / 证据强度 / 代码自明 / 预算 ≤7 条）+ 园丁义务（写前 read 目标文件、重复 merge 不新增、过时条目出修订、文件超 150 行提拆分）+ 0 条是合格结果
+- **写入边界**：只许 `.cursor/rules/**` / `.cursor/skills/**` / `AGENTS.md`、不碰业务代码、不碰 .git（改动停工作区、用户顺手带进下次提交）
+
+**准入放宽**（对老草稿）：merged-only + 一次性 → 「≥1 个 completed action 即可、可多次跑」（沉淀点在 review 阶段就暴露、第二轮先读上一轮不重复提炼）；merged 后推进 dialog 默认选 learn。
+
+**改动面**：`action-learn.md` 全量重写；task-runner 准入解禁（`AVAILABLE_ACTIONS` + learn 前置条件）+ `loadActionPrompt` 补 `{{eventsLogPath}}` 供值（占位符对账测试当场抓到漏供）；`checkLearn` 后置检查（必备段 + 证据路径逐条验真 + 落地记录闭环）；advance-dialog 解禁 learn。⚠️ 真机跑一轮 learn 待用户验。
+
+**同日实测追加（用户连续反馈）**：
+- **ask_user 弹窗问题 markdown 渲染**：`MarkdownText` 从 event-stream/rows export、ask-user-dialog 问题文本从裸 `<p>` 换 markdown（原来 `` `code` `` / 列表全是字面量）
+- **MCP 开关弹回 bug**：mcp-toggle-list 自管模式 PATCH 成功后丢弃返回 task、干等 SSE——而改黑名单只写 meta 不产生事件、SSE 永不推、开关「闪一下弹回」。修法对齐 ContextDocsPanel：PATCH 返回 task 经 `onUpdated → onTaskUpdate → setTask` 回传
+- **learn 卡片副标题残留**：advance-dialog 副标题原是嵌套三元、fallthrough 把「沉淀」也显示成「提 MR 到 test」——抽 `ACTION_SUBTITLE` 常量表；顺带清掉 chat-mcp / page / finalize route 里「V0.6.3 起 / V0.6.0 不实现」的过期 learn 文案
+- **批次选择加「自由改动」选项卡**（用户提议的形态）：批次列表末尾加显式选项卡「自由改动（不绑定批次）」、跟批次勾选互斥——三态全显式：选批（按批做计进度）/ 自由改动（`buildBatchDirective` 注入「不绑定批次」指令：范围以指令为准、不顺手开做未完成批次、不计批次进度）/ 都没选（拦提交、语义不明）。老语义「空=全做」废弃、想全做点「全选」
+- **增量 build artifact 布局**：本轮动过的 task 置顶详写、沿用项收拢成段尾「### 沿用 / 未触及」一行清单（原来按 plan 顺序穿插、增量被夹在沿用中间）；沿用引用写行内代码 `` `build #18` ``、`looksLikeArtifactRef` 扩展识别 `<type> #<n>` 形态 → 点击跳转对应 action
+- **hook 脚本 .sh → Node .mjs**（同事 Windows 实测踩坑）：hooks.json command 指 .sh 时 Windows 没 shebang 机制、按文件关联把脚本「打开」到 IDE（每次 hook 触发弹一次）、且两道闸（stop 交卷 / shell-guard）在 Windows 从未生效。改写 `stop-hook.mjs` / `shell-guard.mjs`（node 内置 fetch、去 bash/curl 依赖）、注入 command 改 `node "<绝对路径>"`；`upgradeFeHooksJson` 改「全量重写」——fe 自建的 hooks.json 跟期望（buildHooksJson 单一源）不一致直接覆盖、老 .sh 形式拉代码重跑任务即自动迁移；.sh 删除不留兼容
+
+typecheck ✓ / lint ✓ / 55 测试 ✓。
+
 ### V0.6.28：cursor 链接多段行号宽容解析 + task 中途追加仓库（2026-06-10）
 
 **A. cursor:// 链接多段行号（同事 + 用户双实测踩坑）**：
@@ -307,35 +341,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **关键配套：`ActionRecord.cwd` 快照**——追加仓库会让 `getEffectiveCwd` 从单仓自身变公共父目录、artifact 相对路径基准漂移；`appendAction` 现在快照创建时 cwd、详情页 `baseDir` 优先用快照（老数据回退实时计算）、改仓后老 artifact 链接不失效
 - 生效语义跟切模型同款：正在跑的 run 不受影响（cwd 启动时绑死）、下一个 action 生效；新仓下次 build 自动建分支（`planBranchesForBuild` 对无条目仓新建、零额外处理）
 
-### V0.6.27：全面 review 落地——3 bug 修复 + harness 硬化 + 测试基建（2026-06-10）
-
-外部 review AI 全面审计（代码健壮性 / 流程设计 / prompt 闭环性）后用户拍板「全部都改」、一次性落地：
-
-**A. 确认 bug 修复（3 条）**：
-- **B1 跨 chunk 锁失效**：`task-fs.taskLocks` / `task-runner.advanceChains` 是 module-level Map、没挂 `globalThis`——跟 chat-mcp（V9）/ runningTasks（V4）的既有策略矛盾、Next.js dev 下不同 route chunk 各持一份锁、`withTaskLock` / `runAdvanceExclusive` 跨 route 不互斥。两个都改挂 `globalThis`（`__feAiFlowTaskFsLocksV1__` / `__feAiFlowAdvanceChainsV1__`）。
-- **B2 DELETE 漏停 chat agent**：`DELETE /api/tasks/[id]` 只调 `cancelTaskRun`、漏 `cancelChatRun`（stop route 两个都调）——删运行中的 chat task 泄漏 agent。补上。
-- **B3 finalize 不停运行中 agent**：`finalizeTask` 在 agent running 中（无 pending）时 `submitTaskTerminate` 返 false 只 log——abandon 后 agent 继续改代码、之后长挂到超时。改成 terminate 失败且有活 run → `cancelTaskRun` 硬停。
-- 顺带：`appendEvent` 去 O(N²)——原来每条事件 `readMeta + writeMeta + hydrateTask(全量重读 events.jsonl)`、事件高频时是平方级写放大。改成轻量路径：追加事件行 + meta.updatedAt 节流写（>5s 才落盘）、不再 hydrate 返回 Task（调用方只用 event 本身）。
-
-**B. harness 硬化（prompt 软约束 → 确定性约束）**：
-- **shell 命令策略引擎**：`beforeShellExecution` hook（`scripts/shell-guard.sh` + `src/lib/server/shell-guard-rules.ts` 单一规则源）拦高危命令——`--fix` / `git push -f` / `git reset --hard` / dev server / 全局安装等、`_shared.md` 同款规则从「祈祷」升级「硬拦」。hooks.json 注入扩展为 stop + beforeShellExecution 两条（`stop-hook-inject.ts` 改名义保留、内容升级、已存在的旧 hooks.json 自动升级补缺）。
-- **review 只读硬校验**：review action 启动时 `captureActionStartBaseline` 记录各仓 `worktreeFingerprint` 到 `action.startBaseline`、`checkReview` 重算比对——agent 在 review 期间改了任何仓即 check fail（原来纯 prompt 约束）。
-- **plan / build artifact 小节 lint**：`checkPlan`（需求理解 / Task 拆分）/ `checkBuild`（全量校验 / 修改记录）加必需小节 regex 检查（抄 `checkReview` 现成做法）。
-- **协议信号常量化**：新增 `src/lib/protocol-signals.ts`——`[NEXT_ACTION]` / `[ACTION_ACK ...]` / `[KEEPALIVE]` 等全部信号的单一常量源、`chat-mcp.ts` / `wait-ack route` / task-runner 全部引用它、防三处手写漂移。
-- **多仓兄弟仓污染检测**：build action 启动时对 effective cwd 下「非本 task 的兄弟 git 仓」记 `git status` hash 基线、checkBuild 重算比对、变了在 details 记 warning 不拦（agent 越权改兄弟仓可见）。
-
-**C. 流程演进**：
-- **F1 每 action 新 agent 默认化**：原默认「单 SDK Run 跑全 task、forceNewAgent 是例外」反转为「**每 action 默认新 agent**、续用是例外」——context 膨胀是跑偏的物理根源、artifact 本来就是 action 间唯一通信媒介（review forceNewAgent 已验证可行）。连带 super prompt 不再全量注入 7 个 action playbook、只注入当前 action 的（体积 -60%+）；同 agent 续接收到 `[NEXT_ACTION]` 时由 server 在载荷里附带新 action 的完整 playbook。UI「换新 agent」勾选改为「续用当前 agent」（语义反转、默认不勾）。
-- **F3 ship 未 review 提示**：ship-precheck 返回「最新 build 之后没有 review 记录」信号、推进 dialog 非阻断展示。
-
-**D. 测试基建（0 → 1）**：
-- 引入 vitest、`pnpm test`（37 用例、4 文件、tests/ 目录）。只测安全关键纯函数（不追覆盖率）：`shell-guard-rules` 拦截矩阵（每规则必拦 + 必放）、`validateSubmitMr` 越权矩阵 + remote URL 解析、`sanitizeCheckCommands` 清洗约束、`protocol-signals` ↔ `_super.md` 信号一致性 + 全部 prompt 模板占位符 ⊆ 渲染端供值表（防 placeholder 漏渲染 / 信号漂移）。历史上 checkShip 正则漏检 / review diff hash 死代码两个 bug 都是这类 5 行单测能当天抓住的。
-- 一致性测试当场抓到真问题：`INTERNAL_ERROR` 在 grep 终态表里、`_super.md` 却从没教过 agent 这个头（review 发现的漂移）——prompt 补「重调一次 wait_for_user、连续 2 次才退 Run」。
-- `validateSubmitMr` 从 task-runner 挪到独立 `src/lib/server/submit-mr-guard.ts`（task-runner 瘦身第一步、顺带抽 `parseProjectPathFromRemoteUrl` 纯函数）。
-- `TaskMetaV06` 校验从手写 4 字段升级 zod schema（zod 已在依赖、chat-mcp 工具早在用）、含 actions[] 逐条 ActionRecord 校验、失败打前 5 条 issue 路径。
-
-`pnpm typecheck` ✓ / `pnpm lint` ✓（0 warning）/ `pnpm test` 37/37 ✓。⚠️ 真机实测待用户验（重点：F1 默认新 agent 的推进体验、shell-guard 误伤率、review 指纹校验）。
-
 ---
 
 ## 关键文件索引
@@ -347,7 +352,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **V0.6 action 后置 deterministic check（含 V0.6.25 build CheckRun：checkBuild / runCheckShell / 工作区污染 + V0.6.25.1 指纹检测 / computeWorktreeFingerprint）** | `src/lib/server/action-checks.ts` |
 | **CheckRun 检查命令自动检测（V0.6.26、建 task 没手配则按 repo 文件结构识别 Node/Maven/Gradle；manual override > auto detect）** | `src/lib/server/repo-check-detect.ts` + `task-fs.sanitizeCheckCommands` |
 | **协议信号单一常量源（V0.6.27、信号 ↔ prompt 一致性由测试守护）** | `src/lib/protocol-signals.ts` + `tests/protocol-signals.test.ts` |
-| **shell 命令硬拦截（V0.6.27、beforeShellExecution hook 策略引擎）** | `src/lib/server/shell-guard-rules.ts` + `scripts/shell-guard.sh` + `src/app/api/hooks/shell-check/route.ts` |
+| **shell 命令硬拦截（V0.6.27、beforeShellExecution hook 策略引擎）** | `src/lib/server/shell-guard-rules.ts` + `scripts/shell-guard.mjs` + `src/app/api/hooks/shell-check/route.ts` |
 | **submit_mr 范围校验（V0.6.27 从 task-runner 拆出、防 agent 越权提 MR）** | `src/lib/server/submit-mr-guard.ts` |
 | **vitest 测试（V0.6.27、安全关键纯函数 + prompt 一致性）** | `vitest.config.ts` + `tests/*.test.ts` |
 | **Build CheckRun 结果展示卡（V0.6.25、每仓 / 每命令红绿 + 失败日志末尾 + 完整日志路径）** | `src/components/tasks/check-run-summary.tsx` |
@@ -363,8 +368,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **「常用 MCP」全局开关（V0.6.5、设置页配 + 建 task 取快照）** | `FeAiFlowSettings.disabledMcpServers` + `src/components/settings/mcp-card.tsx` |
 | **super-prompt 主模板（V0.6.27 起只注入当前 action playbook）** | `prompts/_super.md` |
 | **跨 action 共享规范** | `prompts/_shared.md` |
-| **plan / build / review / ship action prompt** | `prompts/action-{plan,build,review,ship}.md` |
-| **test / learn stub（V0.6.2+ 设计草稿）** | `prompts/action-{test,learn}.md` |
+| **plan / build / review / ship / learn action prompt** | `prompts/action-{plan,build,review,ship,learn}.md` |
+| **learn 知识沉淀（V0.6.29、三层架构 + 防臃肿 4 闸 + checkLearn 证据验真）** | `prompts/action-learn.md` + `action-checks.ts: checkLearn` |
+| **test stub（设计草稿）** | `prompts/action-test.md` |
 | **chat 模式独立 runner（V0.6.0.1 新）** | `src/lib/server/chat-runner.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |
 | **chat 模式 API** | `src/app/api/tasks/[id]/chat-reply/route.ts` |

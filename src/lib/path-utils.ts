@@ -148,6 +148,7 @@ export const looksLikePath = (s: string): boolean => {
  *   - `2-build.md` → { n: 2, type: "build" }
  *   - `5-build.md` → { n: 5, type: "build" }（同 task 内多次 build）
  *   - `actions/4-ship.md` → { n: 4, type: "ship" }
+ *   - `build #18` / `build#18` → { n: 18, type: "build" }（V0.6.29、「沿用 build #18」场景可点击跳转）
  *   - `apps/foo/bar.vue` → null（业务仓库文件路径、走 looksLikePath）
  *   - `data/tasks/xxx/actions/5-plan.md` → null（fs 绝对路径形式、走 looksLikePath）
  *   - `report.md` → null（无 N- 前缀）
@@ -160,10 +161,20 @@ export interface ActionArtifactRef {
 
 export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
   if (!s || s.length > 60) return null;
-  const m = s.match(/^(?:actions\/)?(\d+)-([a-z]+)\.md$/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  const type = m[2];
+  // 形态 1：artifact 文件名（`5-plan.md` / `actions/5-plan.md`）
+  // 形态 2（V0.6.29）：`<type> #<n>` 口语引用（`build #18`、增量 build「沿用」清单用）
+  let n: number;
+  let type: string;
+  const fileForm = s.match(/^(?:actions\/)?(\d+)-([a-z]+)\.md$/);
+  if (fileForm) {
+    n = Number(fileForm[1]);
+    type = fileForm[2]!;
+  } else {
+    const refForm = s.match(/^([a-z]+) ?#(\d+)$/);
+    if (!refForm) return null;
+    type = refForm[1]!;
+    n = Number(refForm[2]);
+  }
   if (!Number.isFinite(n) || n < 1) return null;
   if (!(ACTION_TYPES as readonly string[]).includes(type)) return null;
   return { n, type: type as ActionType };

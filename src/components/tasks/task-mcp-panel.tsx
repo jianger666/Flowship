@@ -29,9 +29,11 @@ import type { Task } from "@/lib/types";
 
 interface TaskMcpPanelProps {
   task: Task;
+  // 开关 PATCH 成功后回传最新 task（页面 setTask）——黑名单变更不走 SSE、必须主动刷
+  onTaskUpdate: (task: Task) => void;
 }
 
-export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
+export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
   // 主 Dialog 开关、默认关
   const [open, setOpen] = useState(false);
   // 当前 Cursor 配的所有 MCP server 名（hook 内置首拉 + focus 刷新）
@@ -115,6 +117,7 @@ export const TaskMcpPanel = ({ task }: TaskMcpPanelProps) => {
                   availableServers={availableServers}
                   disabled={disabled}
                   taskId={task.id}
+                  onUpdated={onTaskUpdate}
                   health={health}
                   loadingServers={loadingServers}
                   onEnableProbe={probeOne}

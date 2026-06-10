@@ -15,6 +15,37 @@
 
 ---
 
+### V0.6.27：全面 review 落地——3 bug 修复 + harness 硬化 + 测试基建（2026-06-10）
+
+外部 review AI 全面审计（代码健壮性 / 流程设计 / prompt 闭环性）后用户拍板「全部都改」、一次性落地：
+
+**A. 确认 bug 修复（3 条）**：
+- **B1 跨 chunk 锁失效**：`task-fs.taskLocks` / `task-runner.advanceChains` 是 module-level Map、没挂 `globalThis`——跟 chat-mcp（V9）/ runningTasks（V4）的既有策略矛盾、Next.js dev 下不同 route chunk 各持一份锁、`withTaskLock` / `runAdvanceExclusive` 跨 route 不互斥。两个都改挂 `globalThis`（`__feAiFlowTaskFsLocksV1__` / `__feAiFlowAdvanceChainsV1__`）。
+- **B2 DELETE 漏停 chat agent**：`DELETE /api/tasks/[id]` 只调 `cancelTaskRun`、漏 `cancelChatRun`（stop route 两个都调）——删运行中的 chat task 泄漏 agent。补上。
+- **B3 finalize 不停运行中 agent**：`finalizeTask` 在 agent running 中（无 pending）时 `submitTaskTerminate` 返 false 只 log——abandon 后 agent 继续改代码、之后长挂到超时。改成 terminate 失败且有活 run → `cancelTaskRun` 硬停。
+- 顺带：`appendEvent` 去 O(N²)——原来每条事件 `readMeta + writeMeta + hydrateTask(全量重读 events.jsonl)`、事件高频时是平方级写放大。改成轻量路径：追加事件行 + meta.updatedAt 节流写（>5s 才落盘）、不再 hydrate 返回 Task（调用方只用 event 本身）。
+
+**B. harness 硬化（prompt 软约束 → 确定性约束）**：
+- **shell 命令策略引擎**：`beforeShellExecution` hook（`scripts/shell-guard.sh` + `src/lib/server/shell-guard-rules.ts` 单一规则源）拦高危命令——`--fix` / `git push -f` / `git reset --hard` / dev server / 全局安装等、`_shared.md` 同款规则从「祈祷」升级「硬拦」。hooks.json 注入扩展为 stop + beforeShellExecution 两条（`stop-hook-inject.ts` 改名义保留、内容升级、已存在的旧 hooks.json 自动升级补缺）。
+- **review 只读硬校验**：review action 启动时 `captureActionStartBaseline` 记录各仓 `worktreeFingerprint` 到 `action.startBaseline`、`checkReview` 重算比对——agent 在 review 期间改了任何仓即 check fail（原来纯 prompt 约束）。
+- **plan / build artifact 小节 lint**：`checkPlan`（需求理解 / Task 拆分）/ `checkBuild`（全量校验 / 修改记录）加必需小节 regex 检查（抄 `checkReview` 现成做法）。
+- **协议信号常量化**：新增 `src/lib/protocol-signals.ts`——`[NEXT_ACTION]` / `[ACTION_ACK ...]` / `[KEEPALIVE]` 等全部信号的单一常量源、`chat-mcp.ts` / `wait-ack route` / task-runner 全部引用它、防三处手写漂移。
+- **多仓兄弟仓污染检测**：build action 启动时对 effective cwd 下「非本 task 的兄弟 git 仓」记 `git status` hash 基线、checkBuild 重算比对、变了在 details 记 warning 不拦（agent 越权改兄弟仓可见）。
+
+**C. 流程演进**：
+- **F1 每 action 新 agent 默认化**：原默认「单 SDK Run 跑全 task、forceNewAgent 是例外」反转为「**每 action 默认新 agent**、续用是例外」——context 膨胀是跑偏的物理根源、artifact 本来就是 action 间唯一通信媒介（review forceNewAgent 已验证可行）。连带 super prompt 不再全量注入 7 个 action playbook、只注入当前 action 的（体积 -60%+）；同 agent 续接收到 `[NEXT_ACTION]` 时由 server 在载荷里附带新 action 的完整 playbook。UI「换新 agent」勾选改为「续用当前 agent」（语义反转、默认不勾）。
+- **F3 ship 未 review 提示**：ship-precheck 返回「最新 build 之后没有 review 记录」信号、推进 dialog 非阻断展示。
+
+**D. 测试基建（0 → 1）**：
+- 引入 vitest、`pnpm test`（37 用例、4 文件、tests/ 目录）。只测安全关键纯函数（不追覆盖率）：`shell-guard-rules` 拦截矩阵（每规则必拦 + 必放）、`validateSubmitMr` 越权矩阵 + remote URL 解析、`sanitizeCheckCommands` 清洗约束、`protocol-signals` ↔ `_super.md` 信号一致性 + 全部 prompt 模板占位符 ⊆ 渲染端供值表（防 placeholder 漏渲染 / 信号漂移）。历史上 checkShip 正则漏检 / review diff hash 死代码两个 bug 都是这类 5 行单测能当天抓住的。
+- 一致性测试当场抓到真问题：`INTERNAL_ERROR` 在 grep 终态表里、`_super.md` 却从没教过 agent 这个头（review 发现的漂移）——prompt 补「重调一次 wait_for_user、连续 2 次才退 Run」。
+- `validateSubmitMr` 从 task-runner 挪到独立 `src/lib/server/submit-mr-guard.ts`（task-runner 瘦身第一步、顺带抽 `parseProjectPathFromRemoteUrl` 纯函数）。
+- `TaskMetaV06` 校验从手写 4 字段升级 zod schema（zod 已在依赖、chat-mcp 工具早在用）、含 actions[] 逐条 ActionRecord 校验、失败打前 5 条 issue 路径。
+
+`pnpm typecheck` ✓ / `pnpm lint` ✓（0 warning）/ `pnpm test` 37/37 ✓。⚠️ 真机实测待用户验（重点：F1 默认新 agent 的推进体验、shell-guard 误伤率、review 指纹校验）。
+
+---
+
 ### V0.6.26：CheckRun 自动检测常见检查命令（默认免配置、2026-06-09）
 
 V0.6.25 CheckRun 上线后 check 命令全靠用户 per-repo 手填、没填的仓 build 后记 not_configured（如 crm-web 明明有 lint/tsc 却显示「未配置」）、手填心智负担高、不符合 harness「降低流程负担」。本版改成**自动检测为主、手动配置为 override**：

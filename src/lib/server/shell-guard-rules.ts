@@ -4,7 +4,7 @@
  * 背景：_shared.md「shell 安全」段的三类禁令（自动改写文件 / 长驻进程 / 危险 git）
  * 原来是纯 prompt 软约束——agent 漂了照跑不误、真实事故见 _shared.md（某 Angular 仓
  * `npm run lint` = `ng lint --fix=true` 把整仓改花）。本模块把这批禁令升级为
- * beforeShellExecution hook 的硬拦截：业务仓库 hooks.json → scripts/shell-guard.sh
+ * beforeShellExecution hook 的硬拦截：业务仓库 hooks.json → scripts/shell-guard.mjs
  * → POST /api/hooks/shell-check → 本引擎判定。
  *
  * 设计原则：

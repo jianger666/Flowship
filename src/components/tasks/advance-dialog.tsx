@@ -8,7 +8,7 @@
  *
  * 字段：
  *   - action 类型（plan / build / review / ship / test / learn）
- *     - V0.6.0 stub：ship / test / learn 灰掉、不让选
+ *     - 已实装：plan / build / review / ship / learn（V0.6.29）；test 仍 stub 灰掉
  *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
@@ -65,17 +65,23 @@ import type {
   Task,
 } from "@/lib/types";
 
-// V0.6.1 已实装的 action 类型；test/learn 灰掉
+// 已实装的 action 类型；test 灰掉（learn V0.6.29 实装）
 // V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
-const IMPLEMENTED_ACTIONS: ActionType[] = ["plan", "build", "review", "ship"];
-const STUB_ACTIONS: ActionType[] = ["test", "learn"];
+const IMPLEMENTED_ACTIONS: ActionType[] = [
+  "plan",
+  "build",
+  "review",
+  "ship",
+  "learn",
+];
+const STUB_ACTIONS: ActionType[] = ["test"];
 const STUB_VERSION: Record<ActionType, string | undefined> = {
   plan: undefined,
   build: undefined,
   review: undefined,
   ship: undefined,
-  test: "V0.6.2",
-  learn: "V0.6.3",
+  test: "待上线",
+  learn: undefined,
 };
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
@@ -101,14 +107,31 @@ const inferDisabledReason = (
       if (!ctx.host) return "需要先在「设置 → GitLab 配置」填 host";
       if (!ctx.token) return "需要先在「设置 → GitLab 配置」填 PAT";
       return null;
-    case "test":
     case "learn":
-      return `${STUB_VERSION[type]} 上线`;
+      // V0.6.29：跟 runner 准入对齐——至少 1 个已完成的 action 才有可沉淀的经验
+      return task.actions.some(
+        (a) => a.type !== "learn" && a.status === "completed",
+      )
+        ? null
+        : "需要至少 1 个已完成的 action";
+    case "test":
+      return `${STUB_VERSION[type]}`;
     default: {
       const _: never = type;
       return _;
     }
   }
+};
+
+// action 卡片副标题（V0.6.29 抽常量表——原来是嵌套三元、新增 learn 时漏改、
+// fallthrough 兜底把「沉淀」卡也显示成「提 MR 到 test」、用户实测抓到）
+const ACTION_SUBTITLE: Record<ActionType, string> = {
+  plan: "出方案",
+  build: "写代码",
+  review: "复核差异 + 找 bug",
+  ship: "提 MR 到 test",
+  test: "AI 手测",
+  learn: "沉淀经验进仓库",
 };
 
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
@@ -118,8 +141,8 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
   build: "具体改什么、指向哪个文件 / 函数 / bug",
   review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
   ship: "（可选）MR 标题 / 描述要点、不填自动生成",
-  test: "（V0.6.2 上线）跑哪些 case？默认全跑",
-  learn: "（V0.6.3 上线）learn 不需要 textarea、看 propose 列表",
+  test: "（待上线）跑哪些 case？默认全跑",
+  learn: "（可选）想重点沉淀什么？默认全量复盘提炼",
 };
 
 // 根据 task 当前状态 + 选中 action 类型动态调整 placeholder
@@ -147,7 +170,7 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
 // 算 dialog 打开时默认选中哪个 action chip（V0.6.0.1 起改名、原 inferRecommended）：
 // - repoStatus = has_bug → build（业务状态映射：有 bug 就是要回 build）
 // - repoStatus = awaiting_test → ship（V0.6.1 起：还能再推一次 / fix 后再 ship）
-// - repoStatus = merged → plan（V0.6.3 起改 learn）
+// - repoStatus = merged → learn（V0.6.29 起、task 收尾沉淀时机）
 // - repoStatus = abandoned → plan（task 已关闭、用户也不会走推进 dialog）
 // - 无 action → plan
 // - 最近一条 completed action：plan → build / build → review / review → ship（V0.6.1 起解锁）
@@ -157,7 +180,8 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
 const inferDefaultActionType = (task: Task): ActionType => {
   if (task.repoStatus === "has_bug") return "build";
   if (task.repoStatus === "awaiting_test") return "ship"; // 测试反馈后 fix 完仍走 ship
-  if (task.repoStatus === "merged") return "plan"; // V0.6.3 起改 learn
+  // merged 后默认 learn（V0.6.29 实装）：task 收尾、经验最完整的沉淀时机
+  if (task.repoStatus === "merged") return "learn";
   if (task.repoStatus === "abandoned") return "plan";
 
   if (task.actions.length === 0) return "plan";
@@ -231,6 +255,9 @@ export const AdvanceDialog = ({
   const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
   // V0.6.23：build 分批——本次勾选的批次 id（仅 build 且 plan 拆了批次时用、空=未拆/全做）
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([]);
+  // V0.6.29：「自由改动（不绑定批次）」显式选项卡——修 bug / 跨批次散改、跟批次勾选互斥
+  // 三态全显式：选批（按批做）/ 自由改动（指令为准、不计进度）/ 都没选（拦提交、语义不明）
+  const [freeFormBuild, setFreeFormBuild] = useState(false);
   // 起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅起新 agent（默认）时透传给父组件、勾续用时 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
@@ -276,8 +303,9 @@ export const AdvanceDialog = ({
     setReuseAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.6.23：build 批次默认不勾选，避免用户回头修 bug 时误提交到下一个未完成批次。
-    // 需要 build 哪些批次必须显式选择；canSubmit 会拦空选择。
+    // V0.6.29：批次 / 自由改动二选一、都不选拦提交（语义不明）——每次打开都回到「未表态」。
     setSelectedBatchIds([]);
+    setFreeFormBuild(false);
     // V0.6.25：每次打开重置 ship override（默认不绕过、需用户主动勾）
     setShipOverrideOn(false);
     setShipOverrideReason("");
@@ -345,8 +373,13 @@ export const AdvanceDialog = ({
     if (disabledReason) return false;
     // V0.6.25 review：ship 时等 precheck 拉完再判断（没拿到 gate 结论就放行会被 server 拒）
     if (actionType === "ship" && shipPrecheckLoading) return false;
-    // build 分批时至少选一批（清空全部勾选语义不明、不让提交）
-    if (actionType === "build" && hasBatches && selectedBatchIds.length === 0) {
+    // V0.6.29：分批 build 必须显式表态——选批 or「自由改动」选项卡、都没选语义不明拦提交
+    if (
+      actionType === "build" &&
+      hasBatches &&
+      selectedBatchIds.length === 0 &&
+      !freeFormBuild
+    ) {
       return false;
     }
     // V0.6.25：ship 需 override 时、必须勾「仍继续」+ 填原因
@@ -361,22 +394,34 @@ export const AdvanceDialog = ({
     shipPrecheckLoading,
     hasBatches,
     selectedBatchIds.length,
+    freeFormBuild,
     shipNeedsOverride,
     shipOverrideOn,
     shipOverrideReason,
   ]);
 
   // V0.6.23：批次卡片点选 toggle（含已做批次、允许返工重选）
+  // V0.6.29：选批跟「自由改动」互斥、点批次自动退出自由改动
   const toggleBatch = (id: string) => {
+    setFreeFormBuild(false);
     setSelectedBatchIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
     );
+  };
+
+  // V0.6.29：「自由改动」选项卡 toggle——选中清空批次勾选（互斥）
+  const toggleFreeForm = () => {
+    setFreeFormBuild((prev) => {
+      if (!prev) setSelectedBatchIds([]);
+      return !prev;
+    });
   };
 
   // V0.6.24：全选 / 全不选切换（批次多时省得一个个点；已全选则点成全不选）
   const allBatchesSelected =
     batchProgress.total > 0 && selectedBatchIds.length === batchProgress.total;
   const toggleAllBatches = () => {
+    setFreeFormBuild(false);
     setSelectedBatchIds(
       allBatchesSelected ? [] : batchProgress.batches.map((b) => b.id),
     );
@@ -394,9 +439,11 @@ export const AdvanceDialog = ({
       images: toUploadPayload(),
       // 仅 ship 时传「合并后删源分支」、其它 action 无意义（advance route 据此决定是否落字段）
       removeSourceBranch: actionType === "ship" ? removeSourceBranch : undefined,
-      // 仅 build 且 plan 拆了批次时传选中批次；否则 undefined（无批次 / 全做、退化老流程）
+      // 仅 build 且 plan 拆批且选了批次时传；空选不传（V0.6.29 = 自由改动、server 注入「不绑定批次」指令）
       requestedBatchIds:
-        actionType === "build" && hasBatches ? selectedBatchIds : undefined,
+        actionType === "build" && hasBatches && selectedBatchIds.length > 0
+          ? selectedBatchIds
+          : undefined,
       // V0.6.25：ship 绕过 check 的 override（仅 ship 且 check 没过 + 勾「仍继续」时传、server 再校验绑定）
       checkOverride:
         shipNeedsOverride && shipOverrideOn
@@ -438,15 +485,7 @@ export const AdvanceDialog = ({
                       <span className="font-medium">{ACTION_LABEL[type]}</span>
                     </div>
                     <span className="text-[10px] text-muted-foreground">
-                      {reason
-                        ? reason
-                        : type === "plan"
-                          ? "出方案"
-                          : type === "build"
-                            ? "写代码"
-                            : type === "review"
-                              ? "复核差异 + 找 bug"
-                              : "提 MR 到 test"}
+                      {reason ?? ACTION_SUBTITLE[type]}
                     </span>
                   </ChoiceButton>
                 );
@@ -531,10 +570,22 @@ export const AdvanceDialog = ({
                     </ChoiceButton>
                   );
                 })}
+                {/* V0.6.29：自由改动选项卡——多轮后回头修 bug 时忘了哪批 / 跨批次、不绑定批次 */}
+                <ChoiceButton
+                  shape="card"
+                  selected={freeFormBuild}
+                  onClick={toggleFreeForm}
+                  disabled={submitting}
+                  className="flex flex-col items-start gap-0.5"
+                >
+                  <span className="text-xs font-medium">
+                    自由改动（不绑定批次）
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    修 bug / 跨批次散改、范围以指令为准、不计批次进度
+                  </span>
+                </ChoiceButton>
               </div>
-              <p className="text-[10px] text-muted-foreground">
-                默认不选中任何批次，请手动选择本次要做 / 返工的范围；每批以新 agent 上下文执行
-              </p>
             </div>
           )}
 

@@ -1376,7 +1376,7 @@ export const appendAction = async (
     type: ActionType;
     userInstruction: string;
     agentModel?: ModelSelection;
-    /** V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build 传、空=全做） */
+    /** V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build 传、空=自由改动不计进度） */
     requestedBatchIds?: string[];
   },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>

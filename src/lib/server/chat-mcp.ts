@@ -1658,7 +1658,7 @@ export const submitTaskTerminate = (
   }
   const defaultMessage =
     kind === "done"
-      ? "Task 已合入 main、整个 task 结束、请收尾并结束 run（V0.6.3 起这里可能跳 learn action、当前 V0.6.0 不实现）。"
+      ? "Task 已合入 main、整个 task 结束、请收尾并结束 run（用户之后可能另起 learn action 沉淀经验、那会是新指令、现在直接收尾）。"
       : "Task 已被用户 abandon、整个 task 结束、请收尾并结束 run。";
   finalizeEntry(taskId, entry, {
     kind: "task_terminate",

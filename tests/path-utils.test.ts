@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCursorLink,
+  looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
 } from "@/lib/path-utils";
@@ -149,5 +150,29 @@ describe("looksLikePath", () => {
     expect(looksLikePath("src/foo")).toBe(false);
     // 空格在路径部分（不是行号后缀）→ 仍然拒绝
     expect(looksLikePath("const x = foo/bar.map()")).toBe(false);
+  });
+});
+
+describe("looksLikeArtifactRef", () => {
+  it("artifact 文件名形态（带 / 不带 actions/ 前缀）", () => {
+    expect(looksLikeArtifactRef("5-plan.md")).toEqual({ n: 5, type: "plan" });
+    expect(looksLikeArtifactRef("actions/18-build.md")).toEqual({
+      n: 18,
+      type: "build",
+    });
+  });
+
+  it("`<type> #<n>` 口语引用形态（V0.6.29、增量 build「沿用」清单可点击跳转）", () => {
+    expect(looksLikeArtifactRef("build #18")).toEqual({ n: 18, type: "build" });
+    expect(looksLikeArtifactRef("build#18")).toEqual({ n: 18, type: "build" });
+    expect(looksLikeArtifactRef("review #3")).toEqual({ n: 3, type: "review" });
+  });
+
+  it("不命中：未知 type / 无 n / 业务文件路径", () => {
+    expect(looksLikeArtifactRef("foobar #18")).toBeNull();
+    expect(looksLikeArtifactRef("build #")).toBeNull();
+    expect(looksLikeArtifactRef("build")).toBeNull();
+    expect(looksLikeArtifactRef("apps/foo/bar.vue")).toBeNull();
+    expect(looksLikeArtifactRef("99-unknown.md")).toBeNull();
   });
 });

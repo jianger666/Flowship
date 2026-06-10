@@ -2,7 +2,7 @@
  * POST /api/hooks/shell-check（V0.6.27）
  *
  * fe 起的 SDK agent 每次跑 shell 命令前、业务仓库 .cursor/hooks.json 的
- * beforeShellExecution hook（scripts/shell-guard.sh）会 curl 本路由。
+ * beforeShellExecution hook（scripts/shell-guard.mjs）会 POST 本路由。
  * 本路由用 shell-guard-rules 判定命令是否踩了硬禁令（--fix / force push / dev server 等）。
  *
  * 请求：{ agent_id: string, command: string }

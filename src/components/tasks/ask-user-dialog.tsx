@@ -43,6 +43,7 @@ import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { useDialog } from "@/hooks/use-dialog";
 import { submitAskReply } from "@/lib/task-store";
 import type {
@@ -332,9 +333,11 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
                     <span className="shrink-0 rounded-md bg-muted px-2 py-0.5 font-mono text-xs">
                       Q{qIdx + 1}
                     </span>
-                    <p className="text-sm leading-relaxed wrap-break-word">
-                      {q.question}
-                    </p>
+                    {/* agent 的问题常带 inline code / 编号列表、按 markdown 渲染（V0.6.29、原来是裸 <p> 出现 `xx` 字面量）
+                        min-w-0：flex item 防长 inline code 撑破 dialog（参考 Dialog 溢出沉淀） */}
+                    <div className="min-w-0 flex-1 text-sm leading-relaxed">
+                      <MarkdownText text={q.question} />
+                    </div>
                   </div>
 
                   {/* 选项区：始终显示（如果该 question 有 options）

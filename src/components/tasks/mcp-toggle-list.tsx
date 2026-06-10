@@ -9,8 +9,9 @@
  *
  * 提供两种用法：
  * 1. 受控模式：传 value + onChange、组件内部不发请求（用于新建任务弹窗、还没 taskId）
- * 2. 自管模式：传 taskId + initial、组件自己 PATCH 后端 + toast（用于详情页面板）
- *    （为了避免组件状态分裂、自管模式只 hold 「乐观更新」一份 state、失败回滚）
+ * 2. 自管模式：传 taskId + onUpdated、组件自己 PATCH 后端 + toast（用于详情页面板）
+ *    PATCH 成功后把返回的最新 task 经 onUpdated 回传给页面 setTask——
+ *    改黑名单只写 meta 不产生事件、SSE 不会推、不回传开关就永远弹回
  *
  * 设计依赖：调用方负责传入「当前 Cursor 配的所有 MCP 名」、组件不读配置（保持纯展示）。
  */
@@ -31,7 +32,7 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { setTaskDisabledMcpServers } from "@/lib/task-store";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
-import type { McpHealth, McpHealthStatus } from "@/lib/types";
+import type { McpHealth, McpHealthStatus, Task } from "@/lib/types";
 
 // 连通性状态点 / 文字配色（V0.6.13 收敛为 ok 绿 / fail 红两态）
 const HEALTH_DOT: Record<McpHealthStatus, string> = {
@@ -108,6 +109,9 @@ interface McpToggleListProps {
   onChange?: (nextDisabled: string[]) => void;
   // 自管模式必填、用于发 PATCH 请求
   taskId?: string;
+  // 自管模式：PATCH 成功后把服务端返回的最新 task 回传（调用方 setTask 刷新页面 state）
+  // ⚠️ 必传——改 MCP 黑名单只写 meta 不产生事件、SSE 不会推、不回传 disabled prop 永远不更新
+  onUpdated?: (task: Task) => void;
   // 空状态文案
   emptyHint?: string;
   // 容器额外 className
@@ -125,6 +129,7 @@ export const McpToggleList = ({
   disabled,
   onChange,
   taskId,
+  onUpdated,
   emptyHint = "Cursor 里没配 MCP server",
   className,
   health,
@@ -156,8 +161,13 @@ export const McpToggleList = ({
 
     setPending((prev) => new Set(prev).add(server));
     try {
-      await setTaskDisabledMcpServers(taskId!, next.length > 0 ? next : null);
-      // SSE / 父组件 fetchTask 会拿到最新 task、disabled 自然同步、这里不主动 setState
+      const updated = await setTaskDisabledMcpServers(
+        taskId!,
+        next.length > 0 ? next : null,
+      );
+      // 改黑名单只写 meta、不产生事件、SSE 不会推——必须用 PATCH 返回的 task 回传刷新
+      // （V0.6.29 修「开关点了闪一下弹回」：原来这里丢弃返回值干等 SSE、prop 永远不变）
+      onUpdated?.(updated);
     } catch (err) {
       toast.error(
         `切换失败：${err instanceof Error ? err.message : String(err)}`,

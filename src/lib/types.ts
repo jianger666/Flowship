@@ -499,7 +499,7 @@ export interface ActionRecord {
    * V0.6.23：build action 本次「做哪些批次」——推进 build 时用户在 dialog 勾选、advance 时后端直接存
    * - 不靠 agent 上报（省一个 MCP 工具）：build agent 从 NEXT_ACTION 指令读做哪批、老实做完
    * - 进度推导：已做批 = ∪(completed build 的 requestedBatchIds)、总批 = 最新 plan.planBatches
-   * - 空 / 不存 = 全做（无批次的 plan、或用户没挑批直接全做）
+   * - 空 / 不存 = 无批次的 plan、或自由改动（V0.6.29 批次选填：不勾批 = 修 bug / 跨批散改、不计进度）
    */
   requestedBatchIds?: string[];
 

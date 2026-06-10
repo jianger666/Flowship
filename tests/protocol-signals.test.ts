@@ -161,6 +161,8 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "role",
       "roleLabel",
       "actionArtifactsDir",
+      // V0.6.29：learn action 挖事件日志
+      "eventsLogPath",
     ]);
     for (const type of ["plan", "build", "review", "ship", "test", "learn"]) {
       const md = readFileSync(
