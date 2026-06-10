@@ -38,6 +38,7 @@ import {
   formatToolReturnAsText,
   getWaitAckKeepaliveMs,
 } from "@/lib/server/chat-mcp";
+import { SIGNALS, keepaliveLine } from "@/lib/protocol-signals";
 
 // 强制走 Node runtime（不要 edge、edge 不支持长连接 + 我们的 globalState）
 export const runtime = "nodejs";
@@ -65,7 +66,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
   if (!entry) {
     // token 无效（已被消费 / 从未存在 / taskId 不匹配）
     // 给 agent 一个可识别的退出信号、不要让它陷在 retry loop
-    return new Response("[INVALID_TOKEN]\n本 token 已被前置事件消费或无效、agent 应自然结束 run。\n", {
+    return new Response(`${SIGNALS.INVALID_TOKEN}\n本 token 已被前置事件消费或无效、agent 应自然结束 run。\n`, {
       status: 200,
       headers: {
         "content-type": "text/plain; charset=utf-8",
@@ -95,7 +96,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
       // SDK shell 是 idle-timeout（多久没输出才杀、非总时长）、持续输出才不被杀；
       // 60s 间隔已实测够撑 30 分钟、但 while 多轮切换叠加 sleep、这一行是额外保险。
       try {
-        controller.enqueue(encoder.encode(`[KEEPALIVE ts=${Date.now()}]\n`));
+        controller.enqueue(encoder.encode(keepaliveLine()));
       } catch {
         // 已被 abort、忽略
       }
@@ -107,9 +108,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
       const keepaliveTimer = setInterval(() => {
         if (closed) return;
         try {
-          controller.enqueue(
-            encoder.encode(`[KEEPALIVE ts=${Date.now()}]\n`),
-          );
+          controller.enqueue(encoder.encode(keepaliveLine()));
         } catch {
           clearInterval(keepaliveTimer);
           close();
@@ -140,7 +139,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
           try {
             controller.enqueue(
               encoder.encode(
-                `[INTERNAL_ERROR]\nwait-ack promise rejected: ${err instanceof Error ? err.message : String(err)}\n`,
+                `${SIGNALS.INTERNAL_ERROR}\nwait-ack promise rejected: ${err instanceof Error ? err.message : String(err)}\n`,
               ),
             );
           } catch {

@@ -15,6 +15,69 @@
 
 ---
 
+### V0.6.26：CheckRun 自动检测常见检查命令（默认免配置、2026-06-09）
+
+V0.6.25 CheckRun 上线后 check 命令全靠用户 per-repo 手填、没填的仓 build 后记 not_configured（如 crm-web 明明有 lint/tsc 却显示「未配置」）、手填心智负担高、不符合 harness「降低流程负担」。本版改成**自动检测为主、手动配置为 override**：
+
+- **新增 `src/lib/server/repo-check-detect.ts`**：`detectRepoCheckCommands(repoPath)` 按 repo 文件结构识别常见检查命令、**只读不执行**、任何异常兜底返 `[]`（绝不挡建 task）。第一版保守覆盖：
+  - **Node/前端**：读 `package.json.scripts`，`scripts.lint` → `<pm> run lint`、`scripts.typecheck`(优先)/`scripts.tsc` → `<pm> run <script>`、均 required=true + 120s。包管理器按 lockfile 判（pnpm-lock/yarn.lock/bun.lock(b)/package-lock、无则 npm）。**故意不输出 test/build**（test 慢 / 依赖 DB·Redis / CheckRun 期间卡用户；build 太重）——保留识别能力 + placeholder（`no test specified`/`exit 1`）过滤逻辑写在注释里、后续放开。
+  - **Maven**：有 `pom.xml` → `mvn -DskipTests compile`（required=true + 10min；后端单测常依赖 DB/profile、默认跑 compile 最稳；kind 复用 typecheck、不为文案扩 enum）。
+  - **Gradle**：有 `build.gradle(.kts)`/`settings.gradle(.kts)` → `<wrapper|gradle> compileTestJava`（**required=false** + 10min；reviewer 拍板——compileTestJava 在 Android[无此 task→报错]/纯 Kotlin[不编译 .kt→假绿] 不通用、不当自动 required gate、不自动挡 ship、用户可手动覆盖；选它而非 compileJava[多模块漏检]/`build -x test`[重型打包]——gradle 自动传播全子模块、覆盖完整且轻；优先 `./gradlew`、没有才退系统 `gradle`）。
+- **合并优先级 `manual override > auto detect`**（`task-fs.createTask`）：抽 `sanitizeCheckCommands(cmds, source)` helper 让手动 + 自动两条来源走**同一道约束**；建 task 遍历 `repoPaths`——input 显式给了该仓命令数组 → 用手动(source=manual)、否则 `await detectRepoCheckCommands`(source=auto)。
+- **数据语义**：`CheckCommand` 加 `source?: "manual" | "auto"`（不影响执行、审计 + 未来 UI 徽章、由 sanitize 统一打标不信 client）。
+- **边界（第一版保守）**：只影响**新 task**（老 task 快照不动、后续可加「重新识别」按钮）；只看 **repo root**（不做 monorepo workspace 粒度）；**「空数组 = 禁用检测」暂不从 UI 暴露**——现状 settings→dialog→route→createTask 四环节都 `length>0` 过滤、空数组跟未配无法区分、语义就是「有手动用手动、没手动则检测」（createTask 层 `Array.isArray(manual)` 已为将来 route 放开空数组留好路）。
+- **UI**：设置页 repo-card 文案改「检查命令（留空自动识别、可手填覆盖）」；不做「自动识别结果预览」复杂 UI（数据先落、build 后 `CheckRunSummaryCard` 已能看实际跑了啥）。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓。detect 模块 9 用例 smoke test 全过（Node 三 pm / Maven / Gradle wrapper·无 wrapper / 空仓 / placeholder 不输出 / 幽灵路径不抛错）。⚠️ 真机建 task 实测待用户验。
+
+---
+
+### V0.6.25.1：CheckRun review 二轮加固（ship gate 严密化、2026-06-09）
+
+第二个 review AI 审 CheckRun 后提的 5 条 gate 语义问题、全部成立全修（typecheck + lint 全绿）：
+
+- **工作区指纹绑定**：原 ship gate 只看 `checkRun.status === passed`、证明不了「ship 时工作区还是 check 过的内容」（build 改动停在工作区、HEAD 不变）。每仓加 `worktreeFingerprint = sha256(headCommit + git diff HEAD + untracked 逐文件 hash-object)`、check 结束记录、`checkShipCheckGate`（改 async）ship 前重算比对、不一致即使 passed 也要 override。新增 `GET /api/tasks/[id]/ship-precheck` 让 client 拿 server gate 结论展示 override 区（client 算不了 git 指纹、不自己猜）、`/advance` 仍重算 gate（precheck 仅 UI 不授权）。
+- **多仓 not_configured 不再误判 passed**：原「全仓 not_configured 才算 not_configured」会让「A 仓过 + B 仓没配（但被改）」整体算 passed、掩盖 B 没检查。改成识别每仓是否被本次 build 改过（dirty）：没配但 dirty → not_configured（拉低整体、ship 要 override）、没配且 clean → skipped（不影响）；run 级**任一** not_configured 即整体 not_configured。
+- **mutated 无视 required**：工作区污染是独立安全语义、`required=false` 可表「失败不挡 ship」但不能「改了源码还绿灯」。聚合改 `mutated || requiredFailed → failed`。
+- **checkCommands 硬上限**：命令被 server 自动执行、加防呆——每仓≤10 条 / name≤80 / cmd≤2000 / timeoutMs clamp[5s,30min]；`runCheckShell` output 累积 >512KB 截断打 `[output truncated]`。
+- **修注释漂移**：`action-checks.ts` 顶部「build V0.6.3 撤掉」旧注释更新为 V0.6.25 CheckRun 复活。
+- **契约收口**：删除 `CheckOverride.headCommit` 字段（server 已不信 client 传 headCommit），override 只绑 `buildActionId + checkRunId + reason`；工作区内容是否仍有效统一由 server 重算 `worktreeFingerprint` 判定。
+
+**踩坑记**：本轮改大文件（task-runner.ts 2200+ 行）时 StrReplace 多次「幻影成功」（报 updated 但没落盘）、Read/Grep 偶发返回错乱内容。最终靠 `pnpm typecheck` 当唯一可信 oracle 逐项验证 + 小块改 + 改完即 Grep 复核才收敛。教训：大文件改动必须 typecheck 验证、别信工具的「成功」回执。
+
+### V0.6.25：review 5 连修复 + Build CheckRun（确定性校验、2026-06-09）
+
+本轮两件事：先修另一个 review AI 审出的 5 条问题、再落地讨论收敛的 **Build CheckRun**（build 后置确定性校验、补 V0.6.3 撤掉的 build check 空白）。
+
+**A. review 5 连修复**（验证事实后修、2 条「跟设计冲突」不修）：
+- **P0-1 action ack 不绑 pending**：`chat-mcp.submitActionAck` 校验 `actionId` 命中 pendingMap 当前条目且未 resolved；`acknowledgeAction` 强制 `action.status === "awaiting_ack"`——防 agent 拿旧 / 错 actionId ack 蒙混。
+- **P0-2 submit_mr 全信 agent 入参**：`task-runner` 加 `validateSubmitMr`——`repo_path` / `actionId` / `target_branch` / `source_branch` / `project_path` 全部跟权威 task 数据 + git remote 派生值核对、不信 agent 自报。
+- **P1-1 ship 漏未提交改动**：`action-ship.md` 把 `git add -A && commit` 提到 `git diff` 判断**之前**——否则未提交改动会被「diff 为空 → 跳过 push」误跳。
+- **P1-2 review diff hash 死代码**：旧正则找「git rev-parse hash: <x>」字面、跟骨架「基底 commit：`<x>`」对不上、从不命中。改正则抠「基底 commit」真值跟 `git rev-parse HEAD` 比对、prompt 同步澄清（review 不动工作树、无 diff hash 字段）。
+- **P1-3 agent 启动并发竞态**：`advanceTask` 包一层 per-task 串行锁 `runAdvanceExclusive`——同 task 并发推进请求排队执行、防两个 agent 抢起。
+- **不修**：P0-3（build 确定性 check 缺失——本轮用 CheckRun 正式补）、P1-4（fs / 附件任意绝对路径——HANDOFF 明确「server 同机、绝对路径是 feature 不是 bug」）。
+
+**B. Build CheckRun**（门槛 2 的 build 实现、设计见 HANDOFF「当前架构快照 · Build 后置 CheckRun」段）：
+- **复用现有钩子不新建机制**：CheckRun 是 build 的 side effect、走现成 `runActionCheck` → `action.postCheck`（红绿条）+ 新增 `action.checkRun`（结构化明细）、**不**新增用户可见 action 步骤。
+- **per-repo 配命令 + 快照链**：`RepoConfig.checkCommands`（设置页 repo-card 配）→ 建 task 时快照进 `Task.repoCheckCommands`（server 读不到 localStorage）→ runner 按快照跑。绕开 V0.6.3「写死 pnpm 搞死多栈」：没配命令的仓按 dirty/clean 分 `not_configured` / `skipped`、不把未改仓误报失败。
+- **执行健壮性**：`sh -c` 跑（支持 `&&` / `cd` / 管道）· `detached` + 进程组 kill（超时连 `pnpm test` 起的子进程一起杀、防孤儿）· PATH 继承 runner + 补常见 bin · 每条命令**跑前后比 git tracked 状态**、命令偷改源码（如手滑 `--fix`）判 `mutatedWorktree = failed` · 完整日志落 `actions/.checks/<actionId>/<slug>.log`、摘要进 meta。
+- **ship gate + per-ship override**：ship 读最新 completed build 的 `checkRun`、没过 / 没配 / 没跑时拦、要求用户在提测 dialog 勾「仍继续」+ 填原因（`CheckOverride` 绑 `buildActionId` + `checkRunId`、重 build 自动失效）；reason 进事件流 + ship action 审计字段（HITL 底线：永远能 override、但留痕）。
+- **顺手修 pre-existing bug**：`tasks/route.ts` POST 漏接 V0.6.7 的 `repoTestBranches` / `repoDevBranches` / `repoBranchTemplates`（new-task-dialog 快照了但 route 没透传 → 提测目标分支一直回退默认 test）、一并补上。
+- **展示**：build 产物面板正文上方挂 `CheckRunSummaryCard`（每仓 / 每命令红绿 + 失败日志末尾 + 完整日志路径）；设置页 repo-card 每仓加 `RepoCheckCommands` 编辑器（name / cmd / kind / 失败是否挡提测 / 超时）。
+- **暂不做**（阶段二+）：全量 artifact graph schema · LLM 判定类 analyze gate · 自动 lens 选择 · 自动跑重型 test · task 级永久忽略 check。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓（0 warning）。⚠️ 真机实测待用户验。
+
+### V0.6.24：分批 build 打磨——批次显示 bug 修复 + 进度条 chip 化 + 文案（2026-06-09）
+
+V0.6.23 批次功能上线后的真机打磨（用户拿大需求边跑边修）：
+
+- **批次不显示 bug（RCA 锁定）**：`getLatestPlanBatches` 原要求 plan `completed` 才认其批次。但 plan 重跑场景——act_1 拆了批次却因 serve 重启被标 `error`、act_2 接续 `completed` 却没重调 `set_plan_batches`——两个都被跳过、批次读不到（advance-dialog 选批没选项）。**读取侧**去掉 `completed` 限制（planBatches 是 agent 主动落库的有效数据、run 中断不影响）；**写入侧** `action-plan.md` 加 ⚠️「重跑 / 接续 plan 必须重调 set_plan_batches」（批次绑当前 action、不从上一版继承、系统兜底回退但别依赖）。
+- **进度条 chip 化（UI）**：原 timeline 下常驻进度条用户嫌占高度 + 挡。改成详情页头部「上下文文档 / MCP」chip 行里的 chip + 点开 Dialog（对齐那两个的 chip+dialog 模式）——拆了批次=实色「批次进度 N/M」、没拆=灰色「未分批」chip 占位（点开也有引导）。`batch-progress.tsx` 重写。
+- **选批默认值 + 全选**：advance-dialog 默认勾从「全部未完成」改「只勾下一个未完成」（remaining[0]、用户拍板）+ 加「全选 / 全不选」按钮。
+- **A' plan 无批次提示条**：plan 产物顶部、该 plan 无 planBatches 时显示「本方案未分批 · 大需求可再聊聊让 AI 拆批次」（`artifact-panel.tsx`）——给「AI 漏调 set_plan_batches」一个可见信号 + 兜底入口。
+- **测试策略文案**：`after`「事后测」（用户反馈费解）→「实现后测试」、`tdd`「TDD(先写测试)」→「先写测试(TDD)」对仗；全局 5 处统一 + `batch-plan-table.tsx` 脚注改走 `TEST_STRATEGY_LABEL` 单一源（修之前硬编码漂移）。
+- **加固决策**：讨论过给 build 加「测试必须真跑且绿才算完成」硬 gate、结论**暂不加**（前端多 after/none 会误伤 / 跨框架检测复杂 / 跟 review 重叠 / 符合分阶段验证 ROI）——靠 prompt 引导 + review 把关。
+- `pnpm typecheck` ✓ / `pnpm lint` ✓。
+
 ### V0.6.23：大需求「批次 + 分批 build」（已实装、2026-06-08）
 
 **动机**：一个大飞书需求、`plan + 单次 build` 跑完不保险——上下文越跑越长、agent 改着改着就乱了、质量滑。

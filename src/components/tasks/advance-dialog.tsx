@@ -12,12 +12,12 @@
  *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
- *   - forceNewAgent（高级开关、默认 false）：老 agent 跑挂了 / 想跑新 prompt 时打开
- *     - 打开后冒出「本次起新 agent 用的模型」一段 ModelPicker、默认 = settings.defaultModel、
- *       可以临时换 base + 调 thinking/effort 等 params；不开关时本段隐藏、续接走 task.model
+ *   - reuseAgent（开关、默认 false = 起新 agent、V0.6.27 语义反转）：想省 send 配额 / 要连续上下文时打开续用
+ *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认 = settings.defaultModel、
+ *       可以临时换 base + 调 thinking/effort 等 params；勾续用后本段隐藏、续接走 task.model
  *
  * 行为：
- *   - 提交后父组件调 advanceTask(taskId, { actionType, userInstruction, forceNewAgent, model? })
+ *   - 提交后父组件调 advanceTask(taskId, { actionType, userInstruction, reuseAgent, model? })
  *   - 成功后父组件自行关 dialog、新 ActionRecord 通过 SSE 推回来
  *
  * 历史决策：
@@ -186,8 +186,9 @@ interface Props {
   onSubmit: (input: {
     actionType: ActionType;
     userInstruction: string;
-    forceNewAgent: boolean;
-    // 用户在 dialog 里临时挑的模型；只在 forceNewAgent=true 时传、其他场景父组件用默认
+    // V0.6.27：默认每 action 新 agent、勾「续用当前 agent」时为 true
+    reuseAgent: boolean;
+    // 用户在 dialog 里临时挑的模型；只在起新 agent 时传、续接场景父组件用默认
     model?: ModelSelection;
     // 指令配的截图附件（选填、贴图说明改哪）
     images?: ImagePayload[];
@@ -224,14 +225,14 @@ export const AdvanceDialog = ({
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
   // 用户指令、选填——飞书/上下文都已带上、空也能跑
   const [instruction, setInstruction] = useState("");
-  // 高级：强制起新 agent（默认 false、复用旧 agent；老 agent 跑挂了 / 想跑新 prompt 时打开）
-  const [forceNewAgent, setForceNewAgent] = useState(false);
+  // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接
+  const [reuseAgent, setReuseAgent] = useState(false);
   // V0.6.14：ship 提测「合并后删除源分支」开关（默认保留、用户拍板；dialog 打开时按 task 上次选择初始化）
   const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
   // V0.6.23：build 分批——本次勾选的批次 id（仅 build 且 plan 拆了批次时用、空=未拆/全做）
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([]);
-  // 强制起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
-  // 仅 forceNewAgent=true 时透传给父组件、否则 ignore（续接 Run 不能换模型）
+  // 起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
+  // 仅起新 agent（默认）时透传给父组件、勾续用时 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照、不实时同步（用户开 dialog 中途换 host/token 极少）
   const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
@@ -272,7 +273,7 @@ export const AdvanceDialog = ({
     if (!open) return;
     setActionType(defaultActionType);
     setInstruction("");
-    setForceNewAgent(false);
+    setReuseAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.6.23：build 批次默认不勾选，避免用户回头修 bug 时误提交到下一个未完成批次。
     // 需要 build 哪些批次必须显式选择；canSubmit 会拦空选择。
@@ -386,9 +387,9 @@ export const AdvanceDialog = ({
     await onSubmit({
       actionType,
       userInstruction: instruction.trim(),
-      forceNewAgent,
-      // 只在「强制起新 agent」时透传模型选择、续接走 task.model
-      model: forceNewAgent && pickedModel.id ? pickedModel : undefined,
+      reuseAgent,
+      // 只在起新 agent（默认）时透传模型选择、续接走 task.model
+      model: !reuseAgent && pickedModel.id ? pickedModel : undefined,
       // 截图附件（选填）、后端落盘后把路径注入 agent prompt
       images: toUploadPayload(),
       // 仅 ship 时传「合并后删源分支」、其它 action 无意义（advance route 据此决定是否落字段）
@@ -628,6 +629,13 @@ export const AdvanceDialog = ({
             </div>
           </div>
 
+          {/* V0.6.27 F3：最新 build 后没 review 过——非阻断提醒（用户有权跳过、但要知情） */}
+          {actionType === "ship" && shipPrecheck?.reviewMissing && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+              最新 build 之后还没跑过 review——建议先复核再提测（不拦、可直接继续）。
+            </div>
+          )}
+
           {/* V0.6.25：ship override——最新 build 的 check 没过时、必须确认才放行（HITL 底线、留痕） */}
           {shipNeedsOverride && (
             <div className="grid gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
@@ -679,25 +687,25 @@ export const AdvanceDialog = ({
             </div>
           )}
 
-          {/* 高级：新启 Agent */}
+          {/* V0.6.27 语义反转：默认每 action 新 agent、勾「续用」才接老 agent（review 勾了也强起新） */}
           <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2">
             <div className="flex items-center justify-between gap-2">
               <label
-                htmlFor="advance-force-new"
+                htmlFor="advance-reuse-agent"
                 className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
               >
-                新启 Agent
+                续用当前 Agent
               </label>
               <Switch
-                id="advance-force-new"
-                checked={forceNewAgent}
-                onCheckedChange={setForceNewAgent}
+                id="advance-reuse-agent"
+                checked={reuseAgent}
+                onCheckedChange={setReuseAgent}
                 disabled={submitting}
               />
             </div>
 
-            {/* 模型选择：只在开关打开后显示、续接 Run 不能换模型 */}
-            {forceNewAgent && (
+            {/* 模型选择：起新 agent（默认）时显示、续接 Run 不能换模型 */}
+            {!reuseAgent && (
               <div className="grid gap-1.5 border-t border-border/60 pt-2">
                 <Label className="text-xs text-foreground/80">
                   本次起新 agent 用的模型

@@ -200,16 +200,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
       console.warn(
         `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
       );
-      const errorTask = await appendEvent(task.id, {
+      const errorEvent = await appendEvent(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
         text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。请点「推进」起新 agent。",
       });
-      if (errorTask) {
-        const lastEvent = errorTask.events[errorTask.events.length - 1];
-        if (lastEvent) {
-          publishTaskStreamEvent(task.id, { kind: "event", event: lastEvent });
-        }
+      if (errorEvent) {
+        publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
       }
       const failedTask = await setTaskRunStatus(task.id, "error");
       if (failedTask) {
@@ -235,7 +232,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const replyText = buildReplyText(questions, answers, deferred);
 
   const actionId = reqEvent.actionId;
-  const replyTask = await appendEvent(task.id, {
+  const replyEvent = await appendEvent(task.id, {
     kind: "ask_user_reply",
     actionId,
     text: replyText,
@@ -245,11 +242,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       ...(deferred ? { deferred: true } : {}),
     },
   });
-  if (replyTask) {
-    const lastEvent = replyTask.events[replyTask.events.length - 1];
-    if (lastEvent) {
-      publishTaskStreamEvent(task.id, { kind: "event", event: lastEvent });
-    }
+  if (replyEvent) {
+    publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
   }
 
   const ok = submitAskReply(task.id, replyText);

@@ -120,7 +120,8 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」添加仓库；每仓可配分支 + 检查命令（build 后自动跑）、均选填
+          点「选择文件夹」添加仓库；每仓可配分支、检查命令（build
+          后自动跑、留空自动识别）、均选填
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -204,7 +205,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                 {/* 第四行：检查命令（build 后 runner 自动跑、per-repo 配、失败可挡提测） */}
                 <div className="grid gap-1.5">
                   <span className="text-xs text-muted-foreground">
-                    检查命令（build 后自动跑）
+                    检查命令（留空自动识别、可手填覆盖）
                   </span>
                   <RepoCheckCommands
                     commands={r.checkCommands ?? []}

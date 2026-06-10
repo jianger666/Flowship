@@ -17,6 +17,7 @@ import type {
   ActionRecord,
   ArtifactRevision,
   AskUserAnswer,
+  CheckCommand,
   McpHealth,
   NewTaskInput,
   ShipPrecheck,
@@ -131,8 +132,10 @@ export const setTaskUiLayout = async (
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
  * 走 PATCH /api/tasks/[id]、字段语义：不传 = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
- * 可改：title / role / feishuStoryUrl / repoFeatureBranches；mode / repoPaths / model 不在此改
+ * 可改：title / role / feishuStoryUrl / repoFeatureBranches；mode / model 不在此改
  *（model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、走推进 dialog 的模型选择）。
+ * V0.6.28：+ addRepoPaths 追加仓库（只增不删、生效于下一个 action）、新仓的
+ * per-repo 快照（分支 / 模板 / check 命令）由调用方从 settings 取好随行传。
  */
 export const updateTaskFields = async (
   id: string,
@@ -141,6 +144,12 @@ export const updateTaskFields = async (
     role?: TaskRole;
     feishuStoryUrl?: string | null;
     repoFeatureBranches?: Record<string, string> | null;
+    addRepoPaths?: string[];
+    addRepoBaseBranches?: Record<string, string>;
+    addRepoTestBranches?: Record<string, string>;
+    addRepoDevBranches?: Record<string, string>;
+    addRepoBranchTemplates?: Record<string, string>;
+    addRepoCheckCommands?: Record<string, CheckCommand[]>;
   },
 ): Promise<Task> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
@@ -472,16 +481,10 @@ export const sendChatReply = async (
  *                 revise：用户「再聊聊」、agent 按 V0.5.10 二分类铁则处理
  * @param feedback revise 时的反馈文本（带 images 时可空）、approve 时忽略
  * @param images   revise 时携带图片附件（用户截图说改这里）
- * @param forceNewAgent approve 时勾选「换新 agent」、起新 Agent 走下一 action
- * @param agentModel    approve 时切模型（隐含 forceNewAgent=true）
- * @param bootArgs      forceNewAgent / agentModel 提供时必填
  */
 export interface ActionAckOptions {
   feedback?: string;
   images?: ImagePayload[];
-  forceNewAgent?: boolean;
-  agentModel?: ModelSelection;
-  bootArgs?: TaskBootArgs;
 }
 
 export const submitActionAck = async (
@@ -500,9 +503,6 @@ export const submitActionAck = async (
         decision,
         feedback: options?.feedback,
         images: options?.images,
-        forceNewAgent: options?.forceNewAgent,
-        agentModel: options?.agentModel,
-        bootArgs: options?.bootArgs,
       }),
     },
   );

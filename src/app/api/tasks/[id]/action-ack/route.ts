@@ -110,14 +110,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
       console.warn(
         `[action-ack] task=${task.id} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
       );
-      const errorTask = await appendEvent(task.id, {
+      const errorEvent = await appendEvent(task.id, {
         kind: "error",
         actionId,
         text: "Agent 已断开（进程重启或异常退出）、本次 ack 没送到。请点「推进」起新 agent。",
       });
-      if (errorTask) {
-        const last = errorTask.events[errorTask.events.length - 1];
-        if (last) publishTaskStreamEvent(task.id, { kind: "event", event: last });
+      if (errorEvent) {
+        publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
       }
       const updated = await setTaskRunStatus(task.id, "error");
       if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
@@ -159,15 +158,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
       meta.images = savedImages;
     }
     const fallbackText = imageAbsPaths && imageAbsPaths.length > 0 ? "(用户附了图片)" : "";
-    const updatedAfterEvent = await appendEvent(task.id, {
+    const replyEvent = await appendEvent(task.id, {
       kind: "user_reply",
       actionId,
       text: feedback || fallbackText,
       meta,
     });
-    if (updatedAfterEvent) {
-      const last = updatedAfterEvent.events[updatedAfterEvent.events.length - 1];
-      if (last) publishTaskStreamEvent(task.id, { kind: "event", event: last });
+    if (replyEvent) {
+      publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
     }
   }
 

@@ -190,15 +190,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
     text.length === 0 && (imageAbsPaths || attachmentAbsPaths.length > 0)
       ? "(用户附了图片 / 文件)"
       : "";
-  const updatedAfterEvent = await appendEvent(task.id, {
+  const replyEvent = await appendEvent(task.id, {
     kind: "user_reply",
     text: text || fallbackText,
     meta:
       Object.keys(userReplyMeta).length > 0 ? userReplyMeta : undefined,
   });
-  if (updatedAfterEvent) {
-    const last = updatedAfterEvent.events[updatedAfterEvent.events.length - 1];
-    if (last) publishTaskStreamEvent(task.id, { kind: "event", event: last });
+  if (replyEvent) {
+    publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
   }
 
   // 决定模式：awaiting_user + hasPending → 正常推进；否则 → 自动启 agent

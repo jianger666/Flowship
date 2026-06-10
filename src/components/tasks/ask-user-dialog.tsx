@@ -292,7 +292,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
             <DialogTitle className="text-sm">问询已失效</DialogTitle>
           </DialogHeader>
           <div className="px-5 py-4 text-sm leading-relaxed text-muted-foreground">
-            Agent 已断开（进程重启 / 异常退出）、这组问题没送达、你刚填的答案也没保存。关闭后点右上角「推进」（建议勾「新启 Agent」）重新启动、AI 会接着读历史继续。
+            Agent 已断开（进程重启 / 异常退出）、这组问题没送达、你刚填的答案也没保存。关闭后点右上角「推进」重新启动（默认起新 agent）、AI 会接着读历史继续。
           </div>
           <DialogFooter className="mx-0 mb-0 border-t px-5 py-3">
             <Button size="sm" onClick={() => setDismissed(true)}>

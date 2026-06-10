@@ -63,16 +63,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
     const actionId = typeof body.actionId === "string" ? body.actionId : undefined;
 
-    const updated = await appendEvent(id, {
+    const event = await appendEvent(id, {
       kind: body.kind,
       actionId,
       text: body.text,
       meta: body.meta,
     });
-    if (!updated) {
+    if (!event) {
       return NextResponse.json({ error: "not_found" }, { status: 404 });
     }
-    return NextResponse.json({ task: updated });
+    return NextResponse.json({ ok: true, event });
   } catch (err) {
     console.error("[POST /api/tasks/[id]/events] failed", err);
     return NextResponse.json({ error: "bad_request" }, { status: 400 });

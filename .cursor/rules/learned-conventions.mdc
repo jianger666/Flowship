@@ -161,3 +161,9 @@ alwaysApply: true
 - chat-mcp 的 `taskActionHandler` / `awaitingNotifier` 按 taskId 存单例 Map、force-new-agent 时新旧 agent 共享同一 key。
 - 旧 agent finally **注销前比对实例引用**（`if (map.get(taskId) === expected) map.delete(taskId)`）、只清「自己注册的那个」——否则旧 agent 迟到的 finally 会误清新 agent 刚注册的 handler、submit_mr 就拿不到 handler。
 - 用 `unsetChatTaskActionHandlerIf(taskId, expected)` / `unsetChatAwaitingNotifierIf`、不要无条件 `set(taskId, null)`。
+
+## 改代码前先 feedback 确认方案（2026-06-10 用户拍板）
+
+- **任何代码改动动手前、先把「准备怎么改」（改哪些文件 / 思路 / 影响面）通过 cursor-feedback 发给用户确认**、用户点头后再写代码。
+- 例外：用户已经在反馈里明确说「可以、动手」的当次改动、不用再确认一遍。
+- 排查 / 只读分析不受限——读代码、跑测试、复现问题都可以直接做、只有「写改动」要先过确认。

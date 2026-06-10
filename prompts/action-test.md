@@ -17,7 +17,7 @@ test action 的目标：AI 手测——读飞书项目里的测试用例（用 `
 
 ### 执行步骤（草稿）
 
-1. read 最新 build artifact
+1. read 最新 build artifact；如果它写了「本轮无代码改动 / 有效实现来源：沿用 build #N（`actions/N-build.md`）」、继续递归读取有效来源，直到找到真正有代码改动的 build，把它作为本次测试对象
 2. 用 `user-feishu-project-mcp.list_workitem_comments` + `get_workitem_brief` + 飞书项目子工作项 API 自己翻、按内容识别测试用例
 3. 按 case 逐条手测：
    - case 描述「点 X 按钮、应该弹 Y」→ agent 调 `shell` curl / 调 puppeteer MCP 模拟、看返回 / DOM、判断 pass/fail

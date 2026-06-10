@@ -53,7 +53,10 @@ import type {
   TaskRole,
   TaskSummary,
 } from "@/lib/types";
-import { CHECK_COMMAND_KIND_LABEL } from "@/lib/types";
+import { CHECK_COMMAND_KIND_LABEL, ACTION_TYPES } from "@/lib/types";
+import { getEffectiveCwd } from "@/lib/path-utils";
+import { detectRepoCheckCommands } from "./repo-check-detect";
+import { z } from "zod";
 
 // ----------------- 路径常量 -----------------
 
@@ -302,23 +305,77 @@ interface TaskMetaV06 {
 }
 
 /**
- * V0.6 meta schema 快速校验：必须有 `actions` 数组、`repoStatus`、`runStatus`
- * - 不符合 = 文件破损 / V0.5 残留、listTasks 静默跳过、不抛错
+ * V0.6 meta schema 校验（V0.6.27 从手写 4 字段检查升级 zod）
+ *
+ * 分层策略：顶层关键字段 + actions 元素关键字段严格（枚举 / 类型）、
+ * 其余嵌套对象宽松（passthrough、不逐字段建模——schema 跟着 types.ts 全量双写会漂移）。
+ * 半损坏 meta（手改出错 / schema 演进漏字段）在这里被拦、不再带病传播到 UI / prompt 渲染。
  */
+const ActionRecordLooseSchema = z
+  .looseObject({
+    id: z.string().min(1),
+    n: z.number().int().nonnegative(),
+    type: z.enum(ACTION_TYPES),
+    status: z.enum(["running", "awaiting_ack", "completed", "error", "cancelled"]),
+    userInstruction: z.string(),
+    artifactPath: z.string().nullable(),
+    startedAt: z.number(),
+    endedAt: z.number().nullable(),
+  });
+
+const TaskMetaV06Schema = z
+  .looseObject({
+    id: z.string().min(1),
+    title: z.string(),
+    mode: z.enum(["task", "chat"]).optional(),
+    repoStatus: z.enum([
+      "developing",
+      "awaiting_test",
+      "has_bug",
+      "merged",
+      "abandoned",
+    ]),
+    runStatus: z.enum(["idle", "running", "awaiting_user", "error"]),
+    currentActionId: z.string().nullable(),
+    actions: z.array(ActionRecordLooseSchema),
+    mrs: z.array(z.looseObject({})),
+    role: z.enum(["fe", "be", "adaptive"]),
+    repoPaths: z.array(z.string()),
+    archived: z.boolean(),
+    createdAt: z.number(),
+    updatedAt: z.number(),
+  });
+
 const isValidMetaShape = (raw: unknown): raw is TaskMetaV06 => {
-  if (!raw || typeof raw !== "object") return false;
-  const obj = raw as Record<string, unknown>;
-  return (
-    typeof obj.id === "string" &&
-    typeof obj.title === "string" &&
-    Array.isArray(obj.actions) &&
-    typeof obj.repoStatus === "string" &&
-    typeof obj.runStatus === "string"
-  );
+  const parsed = TaskMetaV06Schema.safeParse(raw);
+  if (!parsed.success) {
+    // 校验失败打出具体哪个字段坏了（手写检查时代只能知道「不合法」、定位要人肉 diff）
+    console.warn(
+      `[task-fs] meta schema 校验失败：${parsed.error.issues
+        .slice(0, 5)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")}`,
+    );
+    return false;
+  }
+  return true;
 };
 
 // per-task mutex（防 read-modify-write race、沿用 V0.5）
-const taskLocks = new Map<string, Promise<unknown>>();
+//
+// V0.6.27 改挂 globalThis：本模块被十几个 route import、Next.js dev 下不同 route
+// 是不同 webpack chunk、module-level Map 会各持一份（chat-mcp V0.3.3 实测踩过）——
+// 锁不共享 = withTaskLock 跨 route 不互斥、并发 patch meta.json 可能丢更新。
+const TASK_LOCKS_KEY = "__feAiFlowTaskFsLocksV1__";
+const getTaskLocks = (): Map<string, Promise<unknown>> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, Promise<unknown>> | undefined
+  >;
+  if (!g[TASK_LOCKS_KEY]) g[TASK_LOCKS_KEY] = new Map();
+  return g[TASK_LOCKS_KEY]!;
+};
+const taskLocks = getTaskLocks();
 
 const withTaskLock = async <T>(
   taskId: string,
@@ -787,6 +844,55 @@ export const getTask = async (id: string): Promise<Task | null> => {
 };
 
 /**
+ * V0.6.26：清洗单个 repo 的 check 命令数组（手动配置 + 自动检测共用、统一约束）
+ *
+ * 抽出来的动机：手动配置（createTask input）和自动检测（detectRepoCheckCommands）两条来源
+ * 都要走同一道清洗、约束必须完全一致（否则自动检测的命令绕过了防呆上限）。
+ *
+ * - 丢无效命令（name / cmd 空）
+ * - name / cmd 长度硬上限——命令会被 server 自动执行、防配置错误塞超长串
+ * - kind 归一：非法值兜回 custom（否则 runner 取 CHECK_KIND_DEFAULT_TIMEOUT_MS[kind]=undefined → setTimeout(0) 秒杀命令）
+ * - required 缺省视为 true（阻塞 ship gate）
+ * - timeoutMs clamp 到 [5s, 30min]（防 0/负数秒杀命令、或超大值卡死 harness）
+ * - source 由调用方统一打标（手动→manual、检测→auto）、不信入参里的 source（防伪造来源）
+ * - 每仓最多 10 条命令、防刷爆 harness
+ *
+ * export 仅供单测（tests/sanitize-check-commands.test.ts）、业务方不要直接调。
+ */
+export const sanitizeCheckCommands = (
+  cmds: CheckCommand[],
+  source: "manual" | "auto",
+): CheckCommand[] =>
+  cmds
+    .filter(
+      (c) =>
+        c &&
+        typeof c.name === "string" &&
+        c.name.trim() &&
+        typeof c.cmd === "string" &&
+        c.cmd.trim(),
+    )
+    .map((c) => ({
+      name: c.name.trim().slice(0, 80),
+      cmd: c.cmd.trim().slice(0, 2000),
+      kind:
+        typeof c.kind === "string" && c.kind in CHECK_COMMAND_KIND_LABEL
+          ? (c.kind as CheckCommandKind)
+          : "custom",
+      required: c.required !== false,
+      source,
+      ...(c.timeoutMs && c.timeoutMs > 0
+        ? {
+            timeoutMs: Math.min(
+              Math.max(Math.round(c.timeoutMs), 5_000),
+              1_800_000,
+            ),
+          }
+        : {}),
+    }))
+    .slice(0, 10);
+
+/**
  * 创建新 task（V0.6）
  * - V0.6 不分 mode / workflowId、统一走 action 流
  * - 初始状态：repoStatus=developing / runStatus=idle / actions=[] / mrs=[]
@@ -846,41 +952,18 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && t) repoBranchTemplates[repo] = t;
   }
 
-  // V0.6.25：清洗 per-repo check 命令快照——key 限定 repoPaths、丢无效命令（name / cmd 空）、加长度/数量/超时硬上限
+  // V0.6.26 CheckRun 自动检测——每仓走「manual override > auto detect」：
+  //   - input 显式给了该仓命令数组（含空数组、= 调用方明确意图）→ 用手动配置（标 source=manual）
+  //   - 没给（key 不存在）→ 调 detectRepoCheckCommands 按 repo 文件结构自动识别（标 source=auto）
+  // 两条来源统一过 sanitizeCheckCommands、约束一致（长度 / kind 归一 / required 缺省 / 超时 clamp / 每仓≤10）。
+  // 注：正常 UI 路径下 route 层已把空数组过滤、所以「空数组 = 禁用检测」当前只在直接调 createTask 时生效；
+  //   第一版不从 UI 暴露「禁用」（详见 HANDOFF V0.6.26）。遍历 trimmedRepoPaths 本身就把 key 限定在本 task 仓内。
   const repoCheckCommands: Record<string, CheckCommand[]> = {};
-  for (const [repo, cmds] of Object.entries(input.repoCheckCommands ?? {})) {
-    if (!allowedRepos.has(repo) || !Array.isArray(cmds)) continue;
-    const cleaned = cmds
-      .filter(
-        (c) =>
-          c &&
-          typeof c.name === "string" &&
-          c.name.trim() &&
-          typeof c.cmd === "string" &&
-          c.cmd.trim(),
-      )
-      .map((c) => ({
-        // 长度硬上限——这些命令会被 server 自动执行、防配置错误塞超长串（V0.6.25 review）
-        name: c.name.trim().slice(0, 80),
-        cmd: c.cmd.trim().slice(0, 2000),
-        // kind 归一：client 可能传非法值、落库前兜回 custom
-        // （否则 runner 取 CHECK_KIND_DEFAULT_TIMEOUT_MS[kind]=undefined → setTimeout(0) 秒杀命令）
-        kind:
-          typeof c.kind === "string" && c.kind in CHECK_COMMAND_KIND_LABEL
-            ? (c.kind as CheckCommandKind)
-            : "custom",
-        required: c.required !== false, // 缺省视为 required（阻塞 ship gate）
-        // timeoutMs clamp 到 [5s, 30min]——防配 0/负数秒杀命令、或超大值卡死 harness（V0.6.25 review）
-        ...(c.timeoutMs && c.timeoutMs > 0
-          ? {
-              timeoutMs: Math.min(
-                Math.max(Math.round(c.timeoutMs), 5_000),
-                1_800_000,
-              ),
-            }
-          : {}),
-      }))
-      .slice(0, 10); // 每仓最多 10 条命令、防刷爆 harness
+  for (const repo of trimmedRepoPaths) {
+    const manual = input.repoCheckCommands?.[repo];
+    const cleaned = Array.isArray(manual)
+      ? sanitizeCheckCommands(manual, "manual")
+      : sanitizeCheckCommands(await detectRepoCheckCommands(repo), "auto");
     if (cleaned.length > 0) repoCheckCommands[repo] = cleaned;
   }
 
@@ -937,23 +1020,44 @@ export const deleteTask = async (id: string): Promise<boolean> => {
 
 // ----------------- 公开 API：appendEvent / context docs / settings 类 patch -----------------
 
+// updatedAt 落盘节流间隔——事件是高频流（每个 tool_call / thinking 一条）、原来每条
+// 都整写 meta.json + hydrateTask（全量重读 events.jsonl）是 O(N²) 写放大。updatedAt
+// 只影响列表排序 / 自动归档判断、5s 粒度足够。
+const META_TOUCH_INTERVAL_MS = 5_000;
+const lastMetaTouchAt = new Map<string, number>();
+
+/**
+ * 追加一条事件（V0.6.27 重写：轻量路径、返回写入的 event 而不是整个 Task）
+ *
+ * - task 不存在（已删、agent 残留写入）→ 返 null、不写、不复活目录
+ * - 事件行直接 append（O_APPEND 单次 write 原子、无需拿 task 锁）
+ * - meta.updatedAt 节流落盘（≥5s 才写一次、写时拿锁跟其它 read-modify-write 串行）
+ * - 调用方需要完整 Task 的（低频 route 场景）自己再 getTask
+ */
 export const appendEvent = async (
   taskId: string,
   ev: Omit<TaskEvent, "id" | "ts">,
-): Promise<Task | null> =>
-  withTaskLock(taskId, async () => {
-    const meta = await readMetaV06(taskId);
-    if (!meta) return null;
-    const event: TaskEvent = {
-      id: newEventId(),
-      ts: Date.now(),
-      ...ev,
-    };
-    await appendEventLine(taskId, event);
-    meta.updatedAt = event.ts;
-    await writeMeta(meta);
-    return await hydrateTask(meta);
-  });
+): Promise<TaskEvent | null> => {
+  if (!(await exists(path.join(taskDir(taskId), META_FILE)))) return null;
+  const event: TaskEvent = {
+    id: newEventId(),
+    ts: Date.now(),
+    ...ev,
+  };
+  await appendEventLine(taskId, event);
+
+  const last = lastMetaTouchAt.get(taskId) ?? 0;
+  if (event.ts - last >= META_TOUCH_INTERVAL_MS) {
+    lastMetaTouchAt.set(taskId, event.ts);
+    await withTaskLock(taskId, async () => {
+      const meta = await readMetaV06(taskId).catch(() => null);
+      if (!meta) return;
+      meta.updatedAt = event.ts;
+      await writeMeta(meta);
+    });
+  }
+  return event;
+};
 
 /**
  * 批量加上下文文档（V0.6.0.1 重写、支持图片）
@@ -1120,6 +1224,19 @@ export interface UpdateTaskFieldsInput {
   role?: TaskRole;
   feishuStoryUrl?: string | null;
   repoFeatureBranches?: Record<string, string> | null;
+  /**
+   * V0.6.28：中途**追加**仓库（只增不删、删仓涉及已建分支 / MR 残留引用、边界多收益低）
+   * - 语义：跟现有 repoPaths 做并集、已存在的忽略；生效于下一个 action（正在跑的 run cwd 已绑死）
+   * - 新仓的 per-repo 快照（线上 / 测试 / dev 分支、命名模板、check 命令）由前端从
+   *   settings 取好随本字段一起传（settings 在 localStorage、server 读不到、跟建 task 同因）
+   */
+  addRepoPaths?: string[];
+  /** 仅新增仓的快照、merge 进现有 map（已有仓的 key 忽略、不覆盖建 task 时的固化值） */
+  addRepoBaseBranches?: Record<string, string>;
+  addRepoTestBranches?: Record<string, string>;
+  addRepoDevBranches?: Record<string, string>;
+  addRepoBranchTemplates?: Record<string, string>;
+  addRepoCheckCommands?: Record<string, CheckCommand[]>;
 }
 
 export const updateTaskFields = async (
@@ -1150,6 +1267,51 @@ export const updateTaskFields = async (
           (d) => d.type === "url" && d.content === oldUrl,
         );
         if (doc) doc.content = newUrl;
+      }
+    }
+
+    // V0.6.28：追加仓库（只增不删、并集语义）——必须在 repoFeatureBranches 清洗之前处理、
+    // 否则同一次请求里「新仓 + 新仓的已有工作分支」会被旧 repoPaths 集合误清掉
+    if (input.addRepoPaths !== undefined) {
+      const existing = new Set(meta.repoPaths);
+      const added = input.addRepoPaths
+        .map((p) => p.trim().replace(/\/+$/, ""))
+        .filter((p) => p && !existing.has(p));
+      if (added.length > 0) {
+        meta.repoPaths = [...meta.repoPaths, ...added];
+        // 新仓的 per-repo 快照 merge 进现有 map：只收新增仓的 key、不覆盖老仓固化值
+        const addedSet = new Set(added);
+        const mergeSnapshot = <V,>(
+          current: Record<string, V> | undefined,
+          incoming: Record<string, V> | undefined,
+        ): Record<string, V> | undefined => {
+          if (!incoming) return current;
+          const merged: Record<string, V> = { ...current };
+          for (const [repo, v] of Object.entries(incoming)) {
+            if (addedSet.has(repo) && v) merged[repo] = v;
+          }
+          return Object.keys(merged).length > 0 ? merged : undefined;
+        };
+        meta.repoBaseBranches = mergeSnapshot(
+          meta.repoBaseBranches,
+          input.addRepoBaseBranches,
+        );
+        meta.repoTestBranches = mergeSnapshot(
+          meta.repoTestBranches,
+          input.addRepoTestBranches,
+        );
+        meta.repoDevBranches = mergeSnapshot(
+          meta.repoDevBranches,
+          input.addRepoDevBranches,
+        );
+        meta.repoBranchTemplates = mergeSnapshot(
+          meta.repoBranchTemplates,
+          input.addRepoBranchTemplates,
+        );
+        meta.repoCheckCommands = mergeSnapshot(
+          meta.repoCheckCommands,
+          input.addRepoCheckCommands,
+        );
       }
     }
 
@@ -1235,6 +1397,9 @@ export const appendAction = async (
       artifactPath,
       startedAt: now,
       endedAt: null,
+      // V0.6.28：快照创建时的 effective cwd——task 中途追加仓库后 cwd 会变、
+      // artifact 链接渲染必须按写入时基准解析（详见 types.ts ActionRecord.cwd）
+      cwd: getEffectiveCwd(meta.repoPaths),
       agentModel: input.agentModel,
       // V0.6.23：仅 build 带值（其它 action 为 undefined、JSON.stringify 自动忽略）
       requestedBatchIds:
@@ -1272,6 +1437,7 @@ export const patchAction = async (
       | "excluded"
       | "artifactUpdatedAt"
       | "planBatches"
+      | "startBaseline"
     >
   >,
 ): Promise<Task | null> =>

@@ -139,17 +139,15 @@ const publish = (taskId: string, ev: TaskStreamEvent): void => {
 };
 
 // 持久化 event + publish 给 SSE 订阅者（防御性吞错、IO 抖动不能挡 SDK 主流）
+// V0.6.27：appendEvent 改返回 event 本身（轻量路径、不再 hydrate 全量 Task）
 const writeEventAndPublish = async (
   taskId: string,
   ev: Omit<TaskEvent, "id" | "ts">,
-): Promise<Task | null> => {
+): Promise<TaskEvent | null> => {
   try {
-    const updated = await appendEvent(taskId, ev);
-    if (updated) {
-      const last = updated.events[updated.events.length - 1];
-      if (last) publish(taskId, { kind: "event", event: last });
-    }
-    return updated;
+    const event = await appendEvent(taskId, ev);
+    if (event) publish(taskId, { kind: "event", event });
+    return event;
   } catch (err) {
     console.error("[chat-runner] writeEventAndPublish failed:", err);
     return null;
@@ -685,11 +683,11 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
     const completedTask = await setTaskRunStatus(task.id, "idle");
     if (completedTask) publish(task.id, { kind: "task", task: completedTask });
-    const done = await writeEventAndPublish(task.id, {
+    await writeEventAndPublish(task.id, {
       kind: "info",
       text: "Chat 任务结束、agent 正常退出（再发一句可重启对话）",
     });
-    publish(task.id, { kind: "done", task: done ?? task, ok: true });
+    publish(task.id, { kind: "done", task: completedTask ?? task, ok: true });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     const message = err instanceof Error ? err.message : String(err);

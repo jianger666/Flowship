@@ -33,7 +33,7 @@ export const pathBasename = (p: string): string => {
 };
 
 /**
- * 把「path[:line[-endLine]]」拆成 { path, line }
+ * 把「path:行号后缀」拆成 { path, line }
  *
  * AI 写 plan 时常用 `apps/foo/bar.vue:271-279` 表达「这段在 271-279 行」、Cursor 协议
  * 只支持 `:line` / `:line:column`、不支持范围、所以这里取**起始行**作为 cursor 跳转目标、
@@ -43,16 +43,67 @@ export const pathBasename = (p: string): string => {
  * - `bar.vue:271` → { path: "bar.vue", line: 271 }
  * - `bar.vue:271-279` → { path: "bar.vue", line: 271 }
  * - `bar.vue:271:5`（line:col）→ { path: "bar.vue", line: 271 }（暂时忽略 col、Cursor 跳行就够）
+ * - `bar.vue:54,81-84,99`（逗号分隔多段、agent 实际会写出来）→ { path: "bar.vue", line: 54 }
+ * - `bar.vue:20-88, 189-210, 830-878`（逗号 + 空格、agent 也会写）→ { path: "bar.vue", line: 20 }
+ * - `bar.vue:147-154、1350-1363`（中文顿号）→ { path: "bar.vue", line: 147 }
  * - 非数字后缀（如 `foo.vue:next`）→ 不拆、保留原样：{ path: "foo.vue:next", line: undefined }
  *
- * 只匹配最后一个冒号段、避免误伤路径中间的冒号（Windows `C:` 之类、虽然这套 codebase 走 unix）
+ * 多段行号必须能解析——否则整个后缀被当成文件名、生成的 cursor:// 链接指向
+ * `index.tsx:54,81-84,99` 这种不存在的文件、用户点了 Cursor 报「路径不存在」（实测踩过、
+ * prompt 约束了「每段补完整 path」（_shared.md 路径硬约束第 4 条）但 agent 写多段引用时
+ * 仍会用逗号 / 顿号裸续接、防不住、前端宽容解析才稳）。
+ * 分隔符宽容支持：半角逗号 / 中文顿号 / 连字符范围 / 冒号列号、分隔符后可带空格。
  */
 const parsePathWithLine = (
   s: string,
 ): { path: string; line: number | undefined } => {
-  const m = s.match(/^(.+?):(\d+)(?:[-:]\d+)?$/);
-  if (!m) return { path: s, line: undefined };
-  return { path: m[1], line: Number(m[2]) };
+  const parsed = parsePathSegments(s);
+  if (!parsed) return { path: s, line: undefined };
+  return { path: parsed.path, line: parsed.segments[0].line };
+};
+
+/**
+ * 单段行号引用：`text` 是原文段（如 `147-175`）、`line` 是该段起始行（147）、
+ * `sep` 是该段**前面**的分隔符原文（首段为 `""`、后续段如 `、` / `, `）——
+ * 渲染层按 sep + text 原样拼回、保证视觉跟 artifact 原文逐字一致。
+ */
+export interface PathLineSegment {
+  text: string;
+  line: number;
+  sep: string;
+}
+
+export interface ParsedPathSegments {
+  path: string;
+  segments: PathLineSegment[];
+}
+
+/**
+ * 把「path:多段行号」完整拆解（V0.6.28 加、配合 artifact-panel 多段分链接渲染）
+ *
+ * 跟 `parsePathWithLine` 的区别：那个只取首段起始行（buildCursorLink 用）、
+ * 这个把**每一段**都拆出来——`studentSituation.vue:147-175、341-370、485-508`
+ * 渲染成 3 个独立 cursor:// 链接、用户点哪段跳哪段（只能跳首段是用户实测痛点）。
+ *
+ * - `bar.vue:147-175、341-370` → { path: "bar.vue", segments: [{147-175 / 147 / ""}, {341-370 / 341 / "、"}] }
+ * - `bar.vue:271` → { path: "bar.vue", segments: [{271 / 271 / ""}] }（单段、调用方走原单链接渲染）
+ * - `bar.vue` / `bar.vue:next` → null（无行号后缀）
+ */
+export const parsePathSegments = (s: string): ParsedPathSegments | null => {
+  // 首段允许 `271` / `271-279` / `271:5`（列号）、后续段用逗号 / 顿号分隔（后可带空格）
+  const m = s.match(/^(.+?):(\d+(?:[-:]\d+)?(?:[,、]\s*\d+(?:[-:]\d+)?)*)$/);
+  if (!m) return null;
+  // split 保留分隔符捕获组：["147-175", "、", "341-370", ", ", "485-508"]
+  const parts = m[2].split(/([,、]\s*)/);
+  const segments: PathLineSegment[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    segments.push({
+      text: parts[i],
+      line: Number.parseInt(parts[i], 10),
+      sep: i === 0 ? "" : parts[i - 1],
+    });
+  }
+  return { path: m[1], segments };
 };
 
 /**
@@ -60,18 +111,19 @@ const parsePathWithLine = (
  *
  * 启发式规则（求覆盖、不求精确）：
  *   - 含 `/`、且最后一段含 `.`（扩展名）
- *   - 不能含空格 / 反引号 / 引号（这些通常是表达式不是路径）
+ *   - 路径部分不能含空格 / 反引号 / 引号（这些通常是表达式不是路径）
  *   - 长度合理（< 200、避免误判超长字符串）
- *   - 末尾的 `:line` / `:line-line` 行号后缀**不影响**识别——先剥掉再判断
+ *   - 末尾的行号后缀（含 `:20-88, 189-210` 这种逗号 + 空格多段）**不影响**识别——
+ *     先剥掉再判断、空格校验只作用于剥完后的路径部分（否则多段行号引用整条丢失链接）
  *
  * 不动 markdown 原文、只在视图层把长路径里的目录置灰、文件名加粗、且包成 deep link。
  * 用户切「原文」视图能看到原始 path、复制粘贴也是 plain string、下游兼容。
  */
 export const looksLikePath = (s: string): boolean => {
   if (!s || s.length > 200) return false;
-  if (/\s|"|'|`/.test(s)) return false;
-  if (!s.includes("/")) return false;
   const { path } = parsePathWithLine(s);
+  if (/\s|"|'|`/.test(path)) return false;
+  if (!path.includes("/")) return false;
   const lastSeg = path.slice(path.lastIndexOf("/") + 1);
   return lastSeg.length > 0 && lastSeg.includes(".");
 };

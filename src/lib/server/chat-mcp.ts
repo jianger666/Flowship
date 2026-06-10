@@ -53,6 +53,12 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import type { ActionType, PlanBatch } from "../types";
+import {
+  SIGNALS,
+  buildNextActionHead,
+  shellWaitGuideHead,
+  terminalSignalGrepPattern,
+} from "../protocol-signals";
 
 // ----------------- 配置 -----------------
 
@@ -303,18 +309,18 @@ const newWaitToken = (): string =>
 // 历史：旧版返 MCP `{content: [{type:text, text}]}`、shell long-poll 后直接写文本到 stdout
 export const formatToolReturnAsText = (result: ToolReturn): string => {
   if (result.kind === "action_approve") {
-    const lines = ["[ACTION_ACK approve]"];
+    const lines: string[] = [SIGNALS.ACTION_ACK_APPROVE];
     if (result.text && result.text.trim()) lines.push("", result.text);
     return lines.join("\n");
   }
   if (result.kind === "action_revise") {
-    const lines = ["[ACTION_ACK revise]"];
+    const lines: string[] = [SIGNALS.ACTION_ACK_REVISE];
     const fb = (result.feedback ?? result.text ?? "").trim();
     if (fb) lines.push("", fb);
     if (result.imagePaths && result.imagePaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_IMAGES] 用户附了以下图片说明本次反馈、请用 `read` 工具逐一读取（SDK 内置 `read` 会把图片转成 vision、你能直接看到图像内容）：",
+        `${SIGNALS.ATTACHED_IMAGES} 用户附了以下图片说明本次反馈、请用 \`read\` 工具逐一读取（SDK 内置 \`read\` 会把图片转成 vision、你能直接看到图像内容）：`,
         ...result.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
@@ -323,60 +329,60 @@ export const formatToolReturnAsText = (result: ToolReturn): string => {
   if (result.kind === "next_action") {
     // V0.6 新增信号：用户在 UI 推进新 action
     // 头部参数齐全、agent 可解析后调用对应 action prompt
-    const head = [
-      "[NEXT_ACTION",
-      result.nextActionId ? `action_id=${result.nextActionId}` : null,
-      result.nextActionType ? `type=${result.nextActionType}` : null,
-      typeof result.nextN === "number" ? `n=${result.nextN}` : null,
-      result.nextArtifactPath ? `artifact_path=${result.nextArtifactPath}` : null,
-    ]
-      .filter(Boolean)
-      .join(" ") + "]";
-    const lines = [head];
+    const head = buildNextActionHead({
+      actionId: result.nextActionId,
+      actionType: result.nextActionType,
+      n: result.nextN,
+      artifactPath: result.nextArtifactPath,
+    });
+    const lines: string[] = [head];
     if (result.text && result.text.trim()) lines.push("", result.text);
     if (result.imagePaths && result.imagePaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_IMAGES] 用户附了以下图片说明本次推进、请用 `read` 工具逐一读取：",
+        `${SIGNALS.ATTACHED_IMAGES} 用户附了以下图片说明本次推进、请用 \`read\` 工具逐一读取：`,
         ...result.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
     if (result.attachmentPaths && result.attachmentPaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取：",
+        `${SIGNALS.ATTACHED_PATHS} 用户附了以下文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取：`,
         ...result.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
     return lines.join("\n");
   }
   if (result.kind === "user_reply") {
-    const lines: string[] = ["[USER_REPLY]", "", result.text];
+    const lines: string[] = [SIGNALS.USER_REPLY, "", result.text];
     if (result.imagePaths && result.imagePaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read` 工具逐一读取（SDK 内置 `read` 会把图片转成 vision、你能直接看到图像内容）：",
+        `${SIGNALS.ATTACHED_IMAGES} 用户附了以下图片、请用 \`read\` 工具逐一读取（SDK 内置 \`read\` 会把图片转成 vision、你能直接看到图像内容）：`,
         ...result.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
     if (result.attachmentPaths && result.attachmentPaths.length > 0) {
       lines.push(
         "",
-        "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取（路径已是绝对路径、直接用）：",
+        `${SIGNALS.ATTACHED_PATHS} 用户附了以下文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取（路径已是绝对路径、直接用）：`,
         ...result.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
     }
     return lines.join("\n");
   }
   if (result.kind === "task_terminate") {
-    const head = result.terminateKind === "done" ? "[TASK_DONE]" : "[TASK_ABANDONED]";
+    const head =
+      result.terminateKind === "done"
+        ? SIGNALS.TASK_DONE
+        : SIGNALS.TASK_ABANDONED;
     return [head, "", result.text].join("\n");
   }
   if (result.kind === "cancelled") {
-    return ["[CANCELLED]", "", result.text].join("\n");
+    return [SIGNALS.CANCELLED, "", result.text].join("\n");
   }
   // stale
-  return ["[STALE]", "", result.text].join("\n");
+  return [SIGNALS.STALE, "", result.text].join("\n");
 };
 
 // 解算一个 entry 的 result promise、保留 grace 60 秒后才清 pendingMap / tokenToTask
@@ -721,7 +727,7 @@ const buildShellWaitGuidance = (
         ? `等用户对 action=${opts.actionId}（artifact=${opts.artifactPath ?? "<未指定>"}）点 approve / revise、curl 拿到 \`[ACTION_ACK approve]\` 或 \`[ACTION_ACK revise] <feedback>\` 接着推进。`
         : "等用户在 UI 点「推进」选下一 action。curl 可能拿到：\n    - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]\\n\\n<用户指令>` → 解析头部 + 按对应 action prompt 执行";
   return [
-    `[SHELL_WAIT_GUIDE token=${token}]`,
+    shellWaitGuideHead(token),
     "",
     "## ⚠️ 跑 shell 前自检（仅 chat 自由对话场景；task 写 artifact 场景跳过本段）",
     "如果你这一轮是在 chat 里回答用户：先确认**完整答案**已经 emit 给用户了吗？",
@@ -738,7 +744,7 @@ const buildShellWaitGuidance = (
     "while true; do",
     `  curl -sN --max-time 1800 "${url}" | tee "$WAIT_ACK_FILE" || true`,
     "  # 拿到任一终态行就退出；否则（30 分钟到点 / 只有 KEEPALIVE / 网络抖）自动重连",
-    "  grep -qE '\\[(NEXT_ACTION|ACTION_ACK|USER_REPLY|ASK_USER_REPLY|CANCELLED|STALE|INVALID_TOKEN|TASK_DONE|TASK_ABANDONED|INTERNAL_ERROR)' \"$WAIT_ACK_FILE\" && break",
+    `  grep -qE '${terminalSignalGrepPattern()}' "$WAIT_ACK_FILE" && break`,
     "  sleep 1",
     "done",
     "rm -f \"$WAIT_ACK_FILE\"",

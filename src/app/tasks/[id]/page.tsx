@@ -320,8 +320,9 @@ const TaskDetailPage = () => {
   const handleAdvance = async (input: {
     actionType: ActionType;
     userInstruction: string;
-    forceNewAgent: boolean;
-    // 用户在 advance-dialog 里临时挑的模型；仅 forceNewAgent=true 时透传、续接 Run 不能换
+    // V0.6.27：默认每 action 新 agent、勾「续用当前 agent」才续接
+    reuseAgent: boolean;
+    // 用户在 advance-dialog 里临时挑的模型；仅起新 agent 时透传、续接 Run 不能换
     model?: ModelSelection;
     // 指令配的截图附件（选填）
     images?: ImagePayload[];
@@ -338,7 +339,7 @@ const TaskDetailPage = () => {
       // MCP 由 server 端读 cursor 配置、不在此传。校验失败 helper 内部 toast.error、返 null
       const args = prepareRunArgs(task);
       if (!args) return;
-      // input.model 仅 forceNewAgent=true 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
+      // input.model 仅起新 agent 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
       // gitHost / gitToken / username 不在 prepareRunArgs 暴露字段里、单独读 settings
       const settings = getSettings();
@@ -354,7 +355,7 @@ const TaskDetailPage = () => {
             input.images && input.images.length > 0 ? input.images : undefined,
           apiKey: args.apiKey,
           model,
-          forceNewAgent: input.forceNewAgent,
+          reuseAgent: input.reuseAgent,
           username: settings.username?.trim() || undefined,
           // V0.6.1 ship action 用：每次推进都带上 settings 里最新的 gitHost/gitToken
           // task-runner 闭包到 internalStartAgent 里、续接路径只在 ship 准入校验时用
@@ -834,7 +835,10 @@ const TaskDetailPage = () => {
                 <ArtifactPanel
                   action={selectedAction}
                   taskId={task.id}
-                  baseDir={getEffectiveCwd(task.repoPaths)}
+                  // V0.6.28：优先用 action 创建时的 cwd 快照——task 中途追加仓库后
+                  // effectiveCwd 会变、老 artifact 的相对路径必须按写入时基准解析；
+                  // 老数据没快照（V0.6.28 前的 action）回退实时计算
+                  baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
                   onArtifactRefClick={(ref) => {
                     // 找最近匹配 (n, type) 的 action、切过去
                     const target = task.actions.find(

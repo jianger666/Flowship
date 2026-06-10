@@ -21,8 +21,9 @@ import {
   updateTaskFields,
 } from "@/lib/server/task-fs";
 import { cancelTaskRun } from "@/lib/server/task-runner";
+import { cancelChatRun } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
-import type { ModelSelection, TaskRole } from "@/lib/types";
+import type { CheckCommand, ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -54,6 +55,13 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       role?: TaskRole;
       feishuStoryUrl?: string | null;
       repoFeatureBranches?: Record<string, string> | null;
+      // V0.6.28：中途追加仓库（只增不删）+ 新仓的 per-repo 快照（前端从 settings 取好传来）
+      addRepoPaths?: string[];
+      addRepoBaseBranches?: Record<string, string>;
+      addRepoTestBranches?: Record<string, string>;
+      addRepoDevBranches?: Record<string, string>;
+      addRepoBranchTemplates?: Record<string, string>;
+      addRepoCheckCommands?: Record<string, CheckCommand[]>;
     };
 
     if (typeof body.archived === "boolean") {
@@ -125,11 +133,13 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     }
 
     // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / repoFeatureBranches、可一次传多个）
+    // V0.6.28：+ addRepoPaths 追加仓库（只增不删、新仓快照随行）
     const editKeys = [
       "title",
       "role",
       "feishuStoryUrl",
       "repoFeatureBranches",
+      "addRepoPaths",
     ] as const;
     if (editKeys.some((k) => k in body)) {
       if ("role" in body && body.role !== "fe" && body.role !== "be") {
@@ -144,11 +154,29 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { status: 400 },
         );
       }
+      if (
+        "addRepoPaths" in body &&
+        !(
+          Array.isArray(body.addRepoPaths) &&
+          body.addRepoPaths.every((p) => typeof p === "string" && p.trim())
+        )
+      ) {
+        return NextResponse.json(
+          { error: "addRepoPaths 必须是非空字符串数组" },
+          { status: 400 },
+        );
+      }
       const task = await updateTaskFields(id, {
         title: body.title,
         role: body.role,
         feishuStoryUrl: body.feishuStoryUrl,
         repoFeatureBranches: body.repoFeatureBranches,
+        addRepoPaths: body.addRepoPaths,
+        addRepoBaseBranches: body.addRepoBaseBranches,
+        addRepoTestBranches: body.addRepoTestBranches,
+        addRepoDevBranches: body.addRepoDevBranches,
+        addRepoBranchTemplates: body.addRepoBranchTemplates,
+        addRepoCheckCommands: body.addRepoCheckCommands,
       });
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });
@@ -172,7 +200,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     const { id } = await params;
     // 先停 task agent + 清 pending、再删文件
     // 顺序很关键：删了文件 agent 还在跑会写不到 events.jsonl 报错
-    cancelTaskRun(id);
+    // chat task 的 run 在 chat-runner 的 runningChats、cancelTaskRun 停不到、两个都试（同 stop route）
+    if (!cancelTaskRun(id)) cancelChatRun(id);
     cleanupChatTaskState(id);
     const ok = await deleteTask(id);
     if (!ok) return NextResponse.json({ error: "not_found" }, { status: 404 });

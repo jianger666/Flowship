@@ -43,6 +43,7 @@ import {
   buildCursorLink,
   looksLikeArtifactRef,
   looksLikePath,
+  parsePathSegments,
   type ActionArtifactRef,
 } from "@/lib/path-utils";
 import { ACTION_LABEL, ACTION_LABEL_EN } from "@/lib/task-display";
@@ -138,6 +139,37 @@ const buildMarkdownComponents = (
     }
     if (looksLikePath(text)) {
       const href = buildCursorLink(text, baseDir);
+      // 多段行号（`path:147-175、341-370、485-508`）→ 每段独立链接、点哪段跳哪段
+      //   首段渲染 `path:147-175`、后续段渲染 `、341-370`（sep 原样保留、视觉跟原文一致）
+      //   单段 / 无行号 / 拼不出链接（href null）→ 走下面原有的整条单链接 / 纯文本分支
+      const parsed = parsePathSegments(text);
+      if (href && parsed && parsed.segments.length > 1) {
+        return (
+          <span className="font-mono text-[0.85em]">
+            {parsed.segments.map((seg, i) => {
+              // 每段单独拼 `path:起始行` 生成各自的跳转目标
+              const segHref = buildCursorLink(
+                `${parsed.path}:${seg.line}`,
+                baseDir,
+              );
+              return (
+                <span key={`${seg.line}-${i}`}>
+                  {seg.sep}
+                  <a
+                    href={segHref ?? undefined}
+                    className="no-underline"
+                    title={`点击在 Cursor 中打开：${parsed.path}:${seg.line}`}
+                  >
+                    <span className="text-sky-600 dark:text-sky-400 underline-offset-2 hover:underline">
+                      {i === 0 ? `${parsed.path}:${seg.text}` : seg.text}
+                    </span>
+                  </a>
+                </span>
+              );
+            })}
+          </span>
+        );
+      }
       const inner = (
         <span
           className={cn(

@@ -78,16 +78,15 @@ export const POST = async (_req: Request, { params }: Ctx) => {
       : `用户停止了${
           current ? ` ${ACTION_LABEL[current.type]} action` : ""
         }（agent 已中断、可重新「推进」）`;
-  const evented = await appendEvent(id, {
+  const stopEvent = await appendEvent(id, {
     kind: "info",
     actionId: current?.id,
     text: stopText,
   });
 
-  const fresh = evented ?? (await getTask(id)) ?? task;
+  const fresh = (await getTask(id)) ?? task;
   publishTaskStreamEvent(id, { kind: "task", task: fresh });
-  const last = evented?.events[evented.events.length - 1];
-  if (last) publishTaskStreamEvent(id, { kind: "event", event: last });
+  if (stopEvent) publishTaskStreamEvent(id, { kind: "event", event: stopEvent });
 
   return new Response(JSON.stringify({ ok: true, hadAgent, task: fresh }), {
     status: 200,

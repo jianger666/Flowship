@@ -128,7 +128,24 @@ const checkPlan = async (
       details: `artifact 内容过短（${content.trim().length} chars）、不像完整 plan`,
     };
   }
-  return { passed: true, details: "plan artifact 已落盘、内容长度通过" };
+
+  // V0.6.27 小节 lint：只验骨架里无省略豁免的两个核心段（需求理解 + Task 拆分）。
+  // 跟被拍板删掉的「内容黑名单 grep」不同：标题匹配误伤面小、且缺这两段的 plan 确实没法 ack。
+  const requiredSections: { name: string; re: RegExp }[] = [
+    { name: "需求理解", re: /需求理解/ },
+    { name: "Task 拆分", re: /task\s*拆分/i },
+  ];
+  const missing = requiredSections.filter((s) => !s.re.test(content));
+  if (missing.length > 0) {
+    return {
+      passed: false,
+      details: `plan artifact 缺少必备段：${missing
+        .map((s) => s.name)
+        .join(" / ")}（骨架核心段、无省略豁免）`,
+    };
+  }
+
+  return { passed: true, details: "plan artifact 已落盘、长度 + 必备段通过" };
 };
 
 // ----------------- review -----------------
@@ -222,9 +239,31 @@ const checkReview = async (
     };
   }
 
+  // V0.6.27：review 只读硬校验——action 启动时记录的工作区指纹、此刻重算比对。
+  // 不一致 = agent 在 review 期间改了代码（review 禁改代码原来纯 prompt 约束、漂了没人知道）。
+  // startBaseline 缺失（老 action / 启动时记录失败）→ 跳过比对、fail-open。
+  if (action.startBaseline) {
+    const touched: string[] = [];
+    for (const repoPath of task.repoPaths) {
+      const baseline = action.startBaseline[repoPath];
+      if (!baseline) continue;
+      const current = await computeWorktreeFingerprint(repoPath);
+      if (current !== null && current !== baseline) {
+        touched.push(repoPath);
+      }
+    }
+    if (touched.length > 0) {
+      return {
+        passed: false,
+        details: `review 期间工作区被改动：${touched.join(", ")}（review 是只读 action、agent 不许改代码——指纹比对失败、改动可能来自 agent 越权或外部干扰、请检查 git status）`,
+      };
+    }
+  }
+
   return {
     passed: true,
-    details: "review artifact 必备段 + bug 复审段齐全、基底 commit 跟 HEAD 一致",
+    details:
+      "review artifact 必备段 + bug 复审段齐全、基底 commit 跟 HEAD 一致、工作区未被改动",
   };
 };
 
@@ -656,13 +695,159 @@ const checkBuild = async (
     const cmdSummary = r.commands.map((c) => `${c.name}=${c.status}`).join(" / ");
     return `  - ${tail}：${r.status}（${cmdSummary}）`;
   });
-  const details = `build CheckRun ${status}：\n${detailLines.join("\n")}`;
+  const sections: string[] = [
+    `build CheckRun ${status}：\n${detailLines.join("\n")}`,
+  ];
+  let artifactLintPassed = true;
+
+  // V0.6.27 artifact 小节 lint：「全量校验」「修改记录」是 build 骨架铁段
+  // （有无 plan / 分不分批都必须有、_shared.md「修改记录」段是跨 action 强制规范）
+  if (action.artifactPath) {
+    try {
+      const artifactContent = await fs.readFile(
+        getActionArtifactPath(task.id, action.n, action.type),
+        "utf-8",
+      );
+      const requiredSections: { name: string; re: RegExp }[] = [
+        { name: "全量校验", re: /全量校验/ },
+        { name: "修改记录", re: /修改记录/ },
+      ];
+      const missing = requiredSections.filter(
+        (s) => !s.re.test(artifactContent),
+      );
+      if (missing.length > 0) {
+        artifactLintPassed = false;
+        sections.push(
+          `❌ build artifact 缺少必备段：${missing.map((s) => s.name).join(" / ")}（骨架铁段、无省略豁免）`,
+        );
+      }
+    } catch {
+      artifactLintPassed = false;
+      sections.push("❌ build artifact 读取失败（agent 声明了路径但文件不在）");
+    }
+  } else {
+    artifactLintPassed = false;
+    sections.push("❌ build 没产出 artifact（artifactPath 为空）");
+  }
+
+  // V0.6.27 兄弟仓越权检测：startBaseline 里 task 仓之外的 key = 启动时记录的兄弟仓状态 hash、
+  // 此刻重算比对。变了 = build 期间有人动了兄弟仓（多半是 agent 写错仓）。
+  // 只 warning 不拉 failed：无法 100% 排除外部干扰（用户编辑器自动保存等）、误杀比放过代价大。
+  if (action.startBaseline) {
+    const taskRepoSet = new Set(task.repoPaths);
+    const touchedSiblings: string[] = [];
+    for (const [p, baseline] of Object.entries(action.startBaseline)) {
+      if (taskRepoSet.has(p)) continue;
+      const current = await computeRepoStatusHash(p);
+      if (current !== null && current !== baseline) touchedSiblings.push(p);
+    }
+    if (touchedSiblings.length > 0) {
+      sections.push(
+        `⚠️ build 期间检测到「非本 task 的兄弟仓库」工作区有变化：${touchedSiblings.join(", ")}——agent 可能把改动写错了仓库、请人工确认（git status）`,
+      );
+    }
+  }
 
   return {
-    passed: status !== "failed",
-    details,
+    passed: status !== "failed" && artifactLintPassed,
+    details: sections.join("\n\n"),
     checkRun,
   };
+};
+
+// ----------------- action 启动基线（V0.6.27）-----------------
+
+// 该仓 git status hash（轻量基线、兄弟仓越权检测用）
+// 跟 worktreeFingerprint 的取舍：status 只含「路径 + 状态码」不含内容、快（<1s）但检测不到
+// 「同一批脏文件内容又变了」——兄弟仓场景基本是「从 clean 变脏」、status hash 足够；
+// review 场景 build 改动本来就停在工作区（路径集不变、内容会变）、必须用内容指纹。
+const computeRepoStatusHash = async (
+  repoPath: string,
+): Promise<string | null> => {
+  const r = await runCheckShell(
+    "git status --porcelain --untracked-files=all",
+    repoPath,
+    15_000,
+  );
+  if (r.exitCode !== 0) return null;
+  return createHash("sha256").update(r.output).digest("hex");
+};
+
+// 发现 effective cwd 下「非本 task 的兄弟 git 仓」（多仓 cwd = 公共父目录时才有）
+const discoverSiblingRepos = async (task: Task): Promise<string[]> => {
+  const cwd = getEffectiveCwd(task.repoPaths);
+  const taskRepoSet = new Set(task.repoPaths.map((p) => path.resolve(p)));
+  // 单仓：cwd = 仓本身、没有兄弟仓概念
+  if (taskRepoSet.has(path.resolve(cwd))) return [];
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(cwd, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    const abs = path.join(cwd, e.name);
+    if (taskRepoSet.has(path.resolve(abs))) continue;
+    try {
+      await fs.access(path.join(abs, ".git"));
+      out.push(abs);
+    } catch {
+      // 非 git 仓、跳过
+    }
+  }
+  return out;
+};
+
+/**
+ * action 启动时采集工作区基线（task-runner 在 appendAction 后调、存 ActionRecord.startBaseline）
+ *
+ * - review：task 各仓的 worktreeFingerprint（内容指纹）——checkReview 比对、review 只读硬校验
+ * - build：cwd 下兄弟 git 仓的 status hash——checkBuild 比对、越权写错仓检测
+ * - 其他 action 类型：undefined（不采集）
+ *
+ * 失败 fail-open：单仓采集失败就跳过该仓（不进 map）、整体异常返 undefined、绝不挡 action 启动。
+ */
+export const captureActionStartBaseline = async (
+  task: Task,
+  actionType: ActionRecord["type"],
+): Promise<Record<string, string> | undefined> => {
+  try {
+    if (actionType === "review") {
+      const entries = await Promise.all(
+        task.repoPaths.map(async (p) => {
+          const fp = await computeWorktreeFingerprint(p);
+          return [p, fp] as const;
+        }),
+      );
+      const map = Object.fromEntries(
+        entries.filter((e): e is [string, string] => e[1] !== null),
+      );
+      return Object.keys(map).length > 0 ? map : undefined;
+    }
+    if (actionType === "build") {
+      const siblings = await discoverSiblingRepos(task);
+      if (siblings.length === 0) return undefined;
+      const entries = await Promise.all(
+        siblings.map(async (p) => {
+          const h = await computeRepoStatusHash(p);
+          return [p, h] as const;
+        }),
+      );
+      const map = Object.fromEntries(
+        entries.filter((e): e is [string, string] => e[1] !== null),
+      );
+      return Object.keys(map).length > 0 ? map : undefined;
+    }
+    return undefined;
+  } catch (err) {
+    console.warn(
+      `[action-check] captureActionStartBaseline 异常（跳过基线）task=${task.id}：`,
+      err,
+    );
+    return undefined;
+  }
 };
 
 // ----------------- shell 工具 -----------------

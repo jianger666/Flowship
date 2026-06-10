@@ -15,15 +15,15 @@
  *   attachments?: string[],            // 文件 / 目录绝对路径（FsPickerDialog 选的）
  *   apiKey: string,
  *   model: ModelSelection,
- *   forceNewAgent?: boolean,           // UI「换新 agent」勾选时为 true
+ *   reuseAgent?: boolean,              // UI「续用当前 agent」勾选时为 true（V0.6.27 默认每 action 新 agent）
  *   username?: string,                 // settings.username、拼 build branch 名用
  * }
  * ```
  *
  * # 行为分支（由 task-runner.advanceTask 内部决定）
  *
- * - 已有活 agent 在「待命态」 → submitNextAction 推 [NEXT_ACTION] 接力（不消耗 send 配额）
- * - 没活 agent / forceNewAgent → Agent.create + send superPrompt（消耗 1 次 send 配额）
+ * - reuseAgent 且有活 agent 在「待命态」 → submitNextAction 推 [NEXT_ACTION] 接力（不消耗 send 配额）
+ * - 默认 / 没活 agent → Agent.create + send superPrompt（消耗 1 次 send 配额）
  *
  * # 错误语义
  *
@@ -60,7 +60,7 @@ interface PostBody {
   attachments?: string[];
   apiKey?: string;
   model?: ModelSelection;
-  forceNewAgent?: boolean;
+  reuseAgent?: boolean;
   username?: string;
   // V0.6.1 ship action 用：GitLab host + PAT、ship 准入校验 + agent 调 submit_mr 时用
   // 非 ship action 时为空字符串也 OK、不参与校验
@@ -195,8 +195,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   console.log(
-    `[advance] task=${task.id} actionType=${actionType} forceNewAgent=${
-      body.forceNewAgent ?? false
+    `[advance] task=${task.id} actionType=${actionType} reuseAgent=${
+      body.reuseAgent ?? false
     } images=${imageAbsPaths?.length ?? 0} attachments=${attachmentAbsPaths.length}`,
   );
 
@@ -210,7 +210,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
       apiKey,
       model,
-      forceNewAgent: body.forceNewAgent === true,
+      reuseAgent: body.reuseAgent === true,
       username: body.username?.trim() || undefined,
       gitHost: body.gitHost?.trim() || undefined,
       gitToken: body.gitToken?.trim() || undefined,

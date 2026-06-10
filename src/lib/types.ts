@@ -64,6 +64,12 @@ export interface CheckCommand {
   kind: CheckCommandKind;
   required: boolean;
   timeoutMs?: number;
+  /**
+   * V0.6.26：命令来源——manual（设置页手动配、建 task 快照）/ auto（建 task 时按 repo 文件结构自动识别）
+   * - 不影响执行、纯审计 + 未来 UI 区分「自动识别 / 手动配置」徽章用
+   * - 落库时由 task-fs.sanitizeCheckCommands 统一打标（手动→manual、检测→auto）、不信 client 传值
+   */
+  source?: "manual" | "auto";
 }
 
 /** CheckCommand kind 中文标签（repo-card 配置 + check 结果展示共享单一源） */
@@ -216,13 +222,17 @@ export const ACTION_LABEL: Record<ActionType, string> = {
  * artifact（md），「聊天记忆」其实不重要，所以每个 action 可以按它自己的作用，独立决定
  * 「复用上一个 agent」还是「强起 fresh agent」。
  *
- * - review = true（fresh）：核心。复审必须由一个「没写过这段代码、不知道作者怎么想」的
- *   全新 agent 做——这才是「换人复审」、绕开「自己审自己」的共识盲点（Cognition anti-pattern）。
- * - 其余 = false（复用）：plan/build 要上下文连续性 + 写代码最贵；ship/test/learn 读
- *   artifact 干活、复用便宜（复用到的是 fresh review agent、本身就无盲点）。
+ * V0.6.27 默认反转：**全部 action 默认 fresh**（原来只有 review fresh、其余复用）。理由：
+ * - context 膨胀是「跑偏」的物理根源（lost in the middle）——单 Run 跑全 task 几十轮工具调用后、
+ *   super prompt 开头的规则遵循率必然下降、改 prompt 措辞治不了、截断 context 才能
+ * - artifact 本来就是 action 间唯一合法通信媒介、新 agent 冷启动所需上下文全量可重建
+ *   （review forceNewAgent 自 V0.6.9 已验证这条路可行且效果更好）
+ * - 连带收益：super prompt 不再全量注入 6 个 playbook、只注入当前 action 的（体积 -60%+）
+ * - review = true 是铁律（「换人复审」绕开自己审自己、UI 勾「续用」也压不掉）
  *
- * 生效逻辑见 task-runner.advanceTask：`effective = forceNewAgent || ACTION_FRESH_AGENT_DEFAULT[type]`
- * ——UI「换新 agent」开关是附加覆盖（永远能手动强起）、这张表只决定「不手动时」的默认。
+ * 生效逻辑见 task-runner.advanceTask：`effective = !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[type]`
+ * ——UI「续用当前 agent」开关是例外逃生口（省 send 配额 / 需要连续上下文时手动勾）、
+ * 这张表里 true 的 action 即使勾了续用也强起 fresh。
  */
 export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   plan: false,
@@ -365,12 +375,15 @@ export interface CheckOverride {
  * - needsOverride：最新 build 的 check 没过 / 没配 / 工作区指纹变了 → ship 需勾 override
  * - reason：需要 override 的原因（needsOverride=false 时为空）
  * - buildActionId / checkRunId：给 client 构造 CheckOverride 绑定用（没 build 时 null）
+ * - reviewMissing：最新 build 之后没有 completed review（V0.6.27 F3）——**非阻断**、
+ *   只在 dialog 展示一行提醒（HITL：用户有权跳过 review 直接提测、但要知情）
  */
 export interface ShipPrecheck {
   needsOverride: boolean;
   reason: string;
   buildActionId: string | null;
   checkRunId: string | null;
+  reviewMissing: boolean;
 }
 
 /**
@@ -392,6 +405,15 @@ export interface ActionRecord {
   endedAt: number | null;
 
   /**
+   * V0.6.28：action 创建时的 effective cwd 快照（= 当时 getEffectiveCwd(task.repoPaths)）
+   * - why：task 支持中途追加仓库后、effectiveCwd 会从单仓自身变成公共父目录、
+   *   artifact 里 agent 写的相对路径基准随之漂移；前端渲染 cursor:// 链接必须用
+   *   「artifact 写入时」的基准而不是实时计算值、否则改仓后老 artifact 链接集体失效
+   * - 老数据没这字段 → 前端回退实时 getEffectiveCwd（改过仓的老 task 接受历史链接漂移）
+   */
+  cwd?: string;
+
+  /**
    * artifact 文件最后一次成功写入的时间戳（V0.6.12）
    * - agent 每次 write/edit 写成功（SDK tool done = 文件已落盘）后端就刷新这个字段并推 action 帧
    * - 前端 artifact 面板 effect 依赖它 → 事件驱动重拉、不再靠固定退避猜「文件啥时候落盘」
@@ -410,9 +432,10 @@ export interface ActionRecord {
 
   /**
    * 后置 deterministic 检查（V0.6 门槛 2）
-   * - plan: artifact 文件存在 + 内容长度 >= 100（V0.6.0.1 拍板删黑名单 grep、详见 action-checks.ts）
+   * - plan: artifact 文件存在 + 内容长度 >= 100 + 必备段（需求理解 / Task 拆分、V0.6.27）
    * - build: V0.6.25 CheckRun——per-repo 跑 checkCommands、passed/details 是聚合摘要、明细看 checkRun 字段
    * - review: 基底 commit 一致 + 必备段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
+   *   + 工作区指纹未变（V0.6.27、review 只读硬校验）
    * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
    * - test: pass 率 ≥ 阈值
    * - learn: propose 段有内容 + evidence 路径都能 read 到
@@ -421,6 +444,16 @@ export interface ActionRecord {
     passed: boolean;
     details: string;
   };
+
+  /**
+   * V0.6.27：action 启动时记录的工作区基线（path → 指纹 / 状态 hash）、后置检查比对用
+   * - review action：key = task 各仓 path、value = worktreeFingerprint——checkReview 重算比对、
+   *   不一致 = agent 在 review 期间改了代码（review 只读铁律从 prompt 软约束升级硬校验）
+   * - build action：key = effective cwd 下「非本 task 的兄弟 git 仓」path、value = git status hash——
+   *   checkBuild 重算比对、变了 = agent 越权改了兄弟仓（多仓 cwd=公共父目录的 harness 缺口）
+   * - 记录失败（非 git 仓 / 命令失败）的仓不进 map、检查端对缺 key 跳过比对（fail-open）
+   */
+  startBaseline?: Record<string, string>;
 
   /**
    * V0.6.25 CheckRun：build action 的确定性校验结果摘要（只 build action 有）

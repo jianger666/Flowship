@@ -1,7 +1,6 @@
 # 跨 action 共享规范（任何 action 都遵守、必读）
 
-> 占位符：`{{repoPath}}` `{{artifactPath}}`、缺失替换成「（未提供）」。
-> `{{repoPath}}` = **agent effective cwd**（单仓 = 仓库根、多仓 = 公共父目录、详见 super-prompt 顶部「任务输入」段的仓库列表）。
+> 下文出现的具体路径 = **agent effective cwd**（单仓 = 仓库根、多仓 = 公共父目录、详见 super-prompt 顶部「任务输入」段的仓库列表）。
 > 本文件是所有 action 共用的「artifact 写法 + 跨 action 约束」、是各 action 详细 prompt 的**前置约束**。各 action prompt 不再重复这些规则。
 
 ## 1. artifact 写入工具

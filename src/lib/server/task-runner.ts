@@ -29,10 +29,8 @@
  * 跨进程状态挂 globalThis（避免 Next.js dev hot reload 拆 chunk 时分裂）。
  */
 
-import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection, SDKMessage } from "@cursor/sdk";
 
@@ -52,7 +50,11 @@ import {
   setTaskRunStatus,
   snapshotActionArtifact,
 } from "./task-fs";
-import { runActionCheck, computeWorktreeFingerprint } from "./action-checks";
+import {
+  runActionCheck,
+  computeWorktreeFingerprint,
+  captureActionStartBaseline,
+} from "./action-checks";
 import { buildSdkErrorMessage } from "./sdk-error";
 import {
   cancelPending,
@@ -65,10 +67,10 @@ import {
   unsetChatAwaitingNotifierIf,
   unsetChatTaskActionHandlerIf,
   type AwaitingNotifier,
-  type ChatTaskAction,
   type ChatTaskActionHandler,
 } from "./chat-mcp";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
+import { validateSubmitMr } from "./submit-mr-guard";
 import { ensureStopHookInstalled } from "./stop-hook-inject";
 import { reapTaskOrphans } from "./kill-orphans";
 import { renderContextDocsSection } from "./context-docs-prompt";
@@ -110,6 +112,7 @@ import {
   TEST_STRATEGY_LABEL,
 } from "@/lib/types";
 import { computeBatchProgress } from "@/lib/task-display";
+import { buildNextActionHead } from "@/lib/protocol-signals";
 
 // ----------------- 配置 -----------------
 
@@ -208,13 +211,14 @@ const loadActionPrompt = async (
 // ----------------- super-prompt 拼装 -----------------
 
 /**
- * V0.6：一次性把 6 种 action 的 prompt 全部注入到 _super.md、
- * agent 在 [NEXT_ACTION type=X] 时翻到对应段执行。
+ * V0.6.27：只注入**当前 action** 的 playbook（原 V0.6 全量注入 6 种、已废）。
  *
- * 不动态注入是因为：
- *   - SDK Run 永生、agent 起 Run 时一次性拿全部蓝图、不需要中途扩 context
- *   - 全量 prompt ≈ 15-20K tokens、远小于 200K 模型上下文
- *   - 中途新增 prompt 段会产生「context 不一致」风险（同一 Run 内规则换了一次）
+ * 改单注入的原因：
+ *   - V0.6.27 起每 action 默认新 agent（见 ACTION_FRESH_AGENT_DEFAULT 注释）、
+ *     一个 Run 大概率只跑一种 action、其余 5 个 playbook 是纯指令稀释
+ *   - 全量注入还有「串台」风险——plan agent 看得见 ship 的 git push 指令
+ *   - 例外路径（用户勾「续用当前 agent」）收到 [NEXT_ACTION] 时、载荷里会附带
+ *     新 action 的完整 playbook（见 buildNextActionDirective）、指令不会缺
  *
  * @param firstNextAction 首次启动时、把第一个 [NEXT_ACTION ...] 指令也拼到 prompt 末尾
  *                        让 agent 起 Run 第一动作就是执行用户选的 action
@@ -236,11 +240,13 @@ const buildSuperPrompt = async (
   // 全局 rules（~/.cursor/rules/、user 层、settingSources["project"] 够不着、fe 读了注入）
   const rulesSection = await readGlobalCursorRulesForPrompt();
 
-  // 加载 6 种 action 的 prompt（plan / build / review / ship / test / learn）
-  const actionPromptVars: Record<string, string> = {};
-  for (const t of Object.keys(ACTION_PROMPT_FILE) as ActionType[]) {
-    actionPromptVars[`action_${t}_prompt`] = await loadActionPrompt(t, task);
-  }
+  // 只加载当前 action 的 playbook（后续 action 的指令随 [NEXT_ACTION] 载荷下发）
+  const currentType = firstNextAction.action.type;
+  const currentActionPlaybook = [
+    `### Action: ${currentType}`,
+    "",
+    await loadActionPrompt(currentType, task),
+  ].join("\n");
 
   // 当前已存在的 action history（agent 起 Run 时能看到之前的工作）
   const actionHistorySection = renderActionHistorySection(task);
@@ -267,7 +273,7 @@ const buildSuperPrompt = async (
     sharedRules,
     actionHistorySection,
     firstActionDirective,
-    ...actionPromptVars,
+    currentActionPlaybook,
   });
 };
 
@@ -431,6 +437,8 @@ const buildReviewScopeDirective = (task: Task): string | undefined => {
 };
 
 // 构造一个 [NEXT_ACTION ...] 头部 + 任务字段热更 + 用户指令 + 批次指令 + 附件段 + branch checkout hint
+// V0.6.27：续接路径（用户勾「续用当前 agent」）可传 actionPlaybook——super prompt 只注入了启动时
+// 那个 action 的 playbook、续接的新 action 指令必须随载荷下发（同类型也附、利用新近性强化遵循）
 const buildNextActionDirective = (input: {
   action: ActionRecord;
   userInstruction: string;
@@ -439,6 +447,7 @@ const buildNextActionDirective = (input: {
   branchCheckoutHint?: string;
   taskUpdateHint?: string;
   batchDirective?: string;
+  actionPlaybook?: string;
 }): string => {
   const {
     action,
@@ -448,11 +457,14 @@ const buildNextActionDirective = (input: {
     branchCheckoutHint,
     taskUpdateHint,
     batchDirective,
+    actionPlaybook,
   } = input;
-  const head =
-    `[NEXT_ACTION action_id=${action.id} type=${action.type} n=${action.n}` +
-    (action.artifactPath ? ` artifact_path=${action.artifactPath}` : "") +
-    "]";
+  const head = buildNextActionHead({
+    actionId: action.id,
+    actionType: action.type,
+    n: action.n,
+    artifactPath: action.artifactPath ?? undefined,
+  });
   const lines: string[] = [head, ""];
   // 任务字段热更（仅 reused 路径会传、有变化才有值）放最前、让 agent 先校准上下文再读指令
   if (taskUpdateHint && taskUpdateHint.trim().length > 0) {
@@ -483,6 +495,17 @@ const buildNextActionDirective = (input: {
   }
   if (branchCheckoutHint && branchCheckoutHint.trim().length > 0) {
     lines.push("---", "", branchCheckoutHint.trim(), "");
+  }
+  // 续接路径：附本 action 的完整 playbook（你启动时注入的是别的 action 的指令、以这份为准）
+  if (actionPlaybook && actionPlaybook.trim().length > 0) {
+    lines.push(
+      "---",
+      "",
+      `## 本 action（${action.type}）的执行指令（以这份为准、覆盖你 context 里其它 action 的指令段）`,
+      "",
+      actionPlaybook.trim(),
+      "",
+    );
   }
   return lines.join("\n");
 };
@@ -628,17 +651,15 @@ export const subscribeTaskStream = (
 };
 
 // 持久化 + publish 一体（防御性吞错、不让 IO 抖动挡 SDK 主流程）
+// V0.6.27：appendEvent 改返回 event 本身（轻量路径、不再 hydrate 全量 Task）
 const writeEventAndPublish = async (
   taskId: string,
   ev: Omit<TaskEvent, "id" | "ts">,
-): Promise<Task | null> => {
+): Promise<TaskEvent | null> => {
   try {
-    const updated = await appendEvent(taskId, ev);
-    if (updated) {
-      const last = updated.events[updated.events.length - 1];
-      if (last) publish(taskId, { kind: "event", event: last });
-    }
-    return updated;
+    const event = await appendEvent(taskId, ev);
+    if (event) publish(taskId, { kind: "event", event });
+    return event;
   } catch (err) {
     console.warn(
       `[task-runner] writeEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
@@ -870,14 +891,25 @@ export const getShipPrecheck = async (task: Task): Promise<ShipPrecheck> => {
       reason: "",
       buildActionId: null,
       checkRunId: null,
+      reviewMissing: false,
     };
   }
   const gate = await checkShipCheckGate(task);
+  // V0.6.27 F3：最新 build 之后有没有 completed review——没有就提醒（非阻断、HITL 用户可跳过）。
+  // 按 startedAt 比：action 串行、review 启动晚于 build 启动即必然 review 的是这轮 build 后的代码。
+  const reviewMissing = !task.actions.some(
+    (a) =>
+      a.type === "review" &&
+      a.status === "completed" &&
+      !a.excluded &&
+      a.startedAt > lastBuild.startedAt,
+  );
   return {
     needsOverride: !gate.ok,
     reason: gate.ok ? "" : gate.reason,
     buildActionId: lastBuild.id,
     checkRunId: lastBuild.checkRun?.id ?? null,
+    reviewMissing,
   };
 };
 
@@ -1073,9 +1105,10 @@ export interface AdvanceTaskInput {
   attachedFilePaths?: string[];
   apiKey: string;
   model: ModelSelection;
-  // 强制起新 Agent（即使有活 agent 待命也不续接、直接 Agent.create 新建）；UI「换新 agent」时为 true
-  // 注：非强制时「复用」的是内存里活着的 agent entry（续接 [NEXT_ACTION]）
-  forceNewAgent?: boolean;
+  // V0.6.27 语义反转：默认每 action 起新 Agent（context 截断治跑偏）、勾「续用当前 agent」才续接。
+  // true = 续用内存里活着的 agent entry（续接 [NEXT_ACTION]、省 send 配额）；
+  // 注：ACTION_FRESH_AGENT_DEFAULT 里 true 的 action（review）勾了续用也强起 fresh。
+  reuseAgent?: boolean;
   // 设置页 username（拼 build branch 名用、缺省时不建 branch）
   username?: string;
   // V0.6.1 ship action 用：GitLab host（不带协议）+ Personal Access Token
@@ -1135,7 +1168,19 @@ const finalizeStaleActions = async (
 //   ① appendAction 各追加一条 action（凭空多出一条）；
 //   ② 决策时都读到「runningTasks 无 entry」→ 各起一个 agent、后 set 的把前一个覆盖 → 旧 agent 泄漏。
 // 解法：按 taskId 把 advanceTask 串起来——同 task 排队执行、不同 task 互不阻塞。
-const advanceChains = new Map<string, Promise<void>>();
+//
+// V0.6.27 改挂 globalThis：advance route 和 restart-action route 是不同 chunk、
+// module-level Map 各持一份会让这道串行化跨 route 失效（同 runningTasks 的老坑）。
+const ADVANCE_CHAINS_KEY = "__feAiFlowAdvanceChainsV1__";
+const getAdvanceChains = (): Map<string, Promise<void>> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, Promise<void>> | undefined
+  >;
+  if (!g[ADVANCE_CHAINS_KEY]) g[ADVANCE_CHAINS_KEY] = new Map();
+  return g[ADVANCE_CHAINS_KEY]!;
+};
+const advanceChains = getAdvanceChains();
 
 const runAdvanceExclusive = async <T>(
   taskId: string,
@@ -1178,7 +1223,7 @@ const advanceTaskInner = async (
     attachedFilePaths,
     apiKey,
     model,
-    forceNewAgent,
+    reuseAgent,
     username,
     gitHost,
     gitToken,
@@ -1186,11 +1231,11 @@ const advanceTaskInner = async (
     checkOverride,
   } = input;
 
-  // V0.6.9 per-action fresh 默认：用户没手动勾「换新 agent」时、按 action 作用决定是否强起 fresh。
-  // review 默认 fresh（= 换人复审、绕开「自己审自己」的共识盲点）；其余 action 默认复用上一个 agent。
-  // 「换新 agent」开关（forceNewAgent）是附加覆盖、永远能手动强起、不会被默认值压回去。
+  // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
+  // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
+  // action（review = 换人复审铁律）、勾了也压不掉。
   const effectiveForceNewAgent =
-    forceNewAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
+    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
 
   // 1) 准入条件（V0.6 门槛 1）
   const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
@@ -1226,6 +1271,15 @@ const advanceTaskInner = async (
     await patchAction(task.id, action.id, {
       checkOverride: { ...checkOverride, createdAt: Date.now() },
     });
+  }
+  // V0.6.27：review / build 启动基线（review=各仓内容指纹、build=兄弟仓状态 hash）
+  // 后置检查比对用（review 只读硬校验 / 兄弟仓越权检测）、采集失败 fail-open 不挡启动
+  if (actionType === "review" || actionType === "build") {
+    const baseline = await captureActionStartBaseline(task, actionType);
+    if (baseline) {
+      await patchAction(task.id, action.id, { startBaseline: baseline });
+      action.startBaseline = baseline;
+    }
   }
   await writeEventAndPublish(task.id, {
     kind: "action_start",
@@ -1279,6 +1333,9 @@ const advanceTaskInner = async (
       existingRecord.startSnapshot,
     );
     existingRecord.startSnapshot = captureTaskFieldsSnapshot(taskAfterAppend);
+    // V0.6.27：续接载荷附本 action 的完整 playbook——super prompt 只注入了启动时那个
+    // action 的指令、续接的新 action（哪怕同类型）以载荷这份为准
+    const actionPlaybook = await loadActionPrompt(action.type, taskAfterAppend);
     // agent 在「待命态」（等下一 action 指令）、submitNextAction 直接续接
     const ok = submitNextAction(
       task.id,
@@ -1296,6 +1353,7 @@ const advanceTaskInner = async (
         branchCheckoutHint,
         taskUpdateHint,
         batchDirective,
+        actionPlaybook,
       }),
       attachedImagePaths,
       attachedFilePaths,
@@ -1315,7 +1373,6 @@ const advanceTaskInner = async (
         branchCheckoutHint,
         apiKey,
         model,
-        forceNewAgent: true,
         gitHost,
         gitToken,
         batchDirective,
@@ -1347,7 +1404,6 @@ const advanceTaskInner = async (
     branchCheckoutHint,
     apiKey,
     model,
-    forceNewAgent: effectiveForceNewAgent,
     gitHost,
     gitToken,
     batchDirective,
@@ -1455,7 +1511,6 @@ const restartCurrentActionInner = async (
     branchCheckoutHint,
     apiKey: input.apiKey,
     model: input.model,
-    forceNewAgent: true,
     gitHost: input.gitHost,
     gitToken: input.gitToken,
     batchDirective,
@@ -1558,9 +1613,16 @@ export const finalizeTask = async (
   const kind = finalStatus === "merged" ? "done" : "abandoned";
   const ok = submitTaskTerminate(taskId, kind, reason);
   if (!ok) {
-    // agent 已经退出 / 没在等、不算错——直接 patch 业务状态收尾
+    // 信号发不出去 = agent 不在 wait 挂起。两种情况：
+    //   a) agent 已退出 → runningTasks 无 entry、什么都不用做
+    //   b) agent 正在跑（如 build 中途）→ 不硬停的话它会继续改代码、之后挂在
+    //      wait_for_user 上没人再发终态信号、长挂到超时——而 task 在 UI 已显示终态。
+    //      finalize 语义就是「关掉这个 task」、直接 cancel 掉 SDK Run。
+    const hadLiveRun = cancelTaskRun(taskId);
     console.log(
-      `[task-runner] finalizeTask: task=${taskId} 没活 agent pending、直接 patch repoStatus=${finalStatus}`,
+      `[task-runner] finalizeTask: task=${taskId} 没活 pending、${
+        hadLiveRun ? "硬停了运行中的 agent" : "agent 已退出"
+      }、patch repoStatus=${finalStatus}`,
     );
   }
 
@@ -1602,96 +1664,6 @@ export const reopenTask = async (taskId: string): Promise<void> => {
   });
 };
 
-// ----------------- P0-2：submit_mr server 端范围校验 -----------------
-//
-// 背景：submit_mr 的 repo_path / project_path / source / target 都由 agent 传入、
-//   早期 handler 直接拿去 createMR()。agent 幻觉 / prompt 被污染 / remote 解析出错时、
-//   可能用 server 端 PAT 给任意有权限的 GitLab project 创建 MR。
-// 解法：server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报、越权直接拒。
-
-const execFileAsync = promisify(execFile);
-
-// 从仓库本地 git remote 反解 GitLab project path（如 wkid/crm-web）、跟 agent 上报对账。
-// 解析规则跟 action-ship.md 里 agent 用的 sed 对齐（git@host:group/proj.git / https://host/group/proj.git）。
-// 拿不到（非 git 仓 / 无 origin / 命令失败）返 null、调用方对 null 放行（best-effort、不因临时读不到挡 ship）。
-const deriveProjectPathFromRepo = async (
-  repoPath: string,
-): Promise<string | null> => {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["config", "--get", "remote.origin.url"],
-      { cwd: repoPath, timeout: 10_000 },
-    );
-    const url = stdout.trim();
-    if (!url) return null;
-    const projectPath = url
-      .replace(/^[^@]+@[^:]+:/, "") // git@host:
-      .replace(/^https?:\/\/[^/]+\//, "") // https://host/
-      .replace(/\.git$/, "")
-      .trim();
-    return projectPath.length > 0 ? projectPath : null;
-  } catch {
-    return null;
-  }
-};
-
-// 校验 agent 上报的 submit_mr 参数是否在本 task 的授权范围内。
-// 不通过 = 越权 / agent 上报错、handler 直接拒、不调 GitLab。
-const validateSubmitMr = async (
-  task: Task,
-  a: Extract<ChatTaskAction, { kind: "submit_mr" }>,
-): Promise<{ ok: true } | { ok: false; error: string }> => {
-  // 1) repo_path 必须属于本 task（核心：agent 不能对 task 范围外的仓提 MR）
-  if (!task.repoPaths.includes(a.repoPath)) {
-    return {
-      ok: false,
-      error: `repo_path ${a.repoPath} 不属于本 task（合法仓：${task.repoPaths.join(", ") || "无"}）`,
-    };
-  }
-  // 2) action_id 必须是本 task 的 ship action（防把 MR 挂到错 action / 非 ship 阶段）
-  const action = task.actions.find((x) => x.id === a.actionId);
-  if (!action || action.type !== "ship") {
-    return {
-      ok: false,
-      error: `action_id ${a.actionId} 不是本 task 的 ship action`,
-    };
-  }
-  // 3) target_branch 必须是该仓「测试分支」（提测工作流、不许提到 master / 任意分支）
-  const expectedTarget = task.repoTestBranches?.[a.repoPath]?.trim() || "test";
-  if (a.targetBranch !== expectedTarget) {
-    return {
-      ok: false,
-      error: `target_branch 必须是该仓测试分支「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
-    };
-  }
-  // 4) source_branch 必须是该仓 feature 分支、或一次性 <feature>__conflict 解冲突分支
-  const known = task.gitBranches?.find((b) => b.repoPath === a.repoPath)?.name;
-  if (known) {
-    if (a.sourceBranch !== known && a.sourceBranch !== `${known}__conflict`) {
-      return {
-        ok: false,
-        error: `source_branch 必须是「${known}」或「${known}__conflict」、收到「${a.sourceBranch}」`,
-      };
-    }
-  } else if (!a.sourceBranch.trim() || a.sourceBranch === expectedTarget) {
-    // gitBranches 没记这仓（如没 feishuStoryUrl 没建 branch）→ 退化兜底：至少非空且不等于目标分支
-    return {
-      ok: false,
-      error: `source_branch 非法（空 / 等于目标分支）：「${a.sourceBranch}」`,
-    };
-  }
-  // 5) project_path 必须 == server 从该仓真实 git remote 反解出的（防越权提到任意 project）
-  const derived = await deriveProjectPathFromRepo(a.repoPath);
-  if (derived && a.projectPath !== derived) {
-    return {
-      ok: false,
-      error: `project_path「${a.projectPath}」跟该仓真实 remote 反解「${derived}」不一致、拒绝（防越权提到其它 GitLab project）`,
-    };
-  }
-  return { ok: true };
-};
-
 // ----------------- 内部：起新 Agent + 消息循环 -----------------
 
 interface StartAgentInput {
@@ -1703,7 +1675,6 @@ interface StartAgentInput {
   branchCheckoutHint?: string;
   apiKey: string;
   model: ModelSelection;
-  forceNewAgent: boolean;
   // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包
   gitHost?: string;
   gitToken?: string;
@@ -2248,12 +2219,13 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // 收尾所有卡在非终态的 action（单 Run 多 action：卡住的可能 ≠ 闭包起的 action、见 finalizeStaleActions）
       await finalizeStaleActions(task.id, "error");
       await setTaskRunStatus(task.id, "error", action.id);
-      const updated = await writeEventAndPublish(task.id, {
+      await writeEventAndPublish(task.id, {
         kind: "error",
         actionId: action.id,
         text: `Task agent 失败：${fullMessage}`,
       });
-      publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+      const errored = await getTask(task.id);
+      publish(task.id, { kind: "done", task: errored ?? task, ok: false });
       publish(task.id, { kind: "error", message: fullMessage });
     } finally {
       runningTasks.delete(task.id);

@@ -9,8 +9,12 @@
  * 刻意不在此改：
  *   - 模型 model（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）
  *   - mode（task/chat 是两套通路、切了等于换任务）
- *   - 仓库 repoPaths（副作用大：变 agent cwd、已建 git 分支/MR 对不上）——只读展示
  *   - MCP 开关（走 TaskMcpPanel）、上下文 doc（走 ContextDocsPanel）——详情页已有各自面板
+ *
+ * 仓库（V0.6.28）：**只允许追加、不允许移除**——同事实测场景「做着做着发现还依赖另一个仓」；
+ *   删仓涉及已建分支 / MR 残留引用、边界多收益低、不做。已绑仓只读展示、新仓走下方 MultiSelect、
+ *   生效于下一个 action（正在跑的 run cwd 已绑死）；新仓的 per-repo 快照（线上 / 测试 / dev 分支、
+ *   命名模板、check 命令）提交时从 settings 现取随行传（跟建 task 同款逻辑）。
  *
  * 副作用约定（V0.6.6 热更）：
  *   - 角色 / 标题 / 飞书链接：长生 agent reused 推进时 task-runner 会 diff 启动快照、有变拼 [TASK_UPDATED] 注入告知（立即生效）
@@ -33,6 +37,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MultiSelect } from "@/components/ui/multi-select";
 import {
   Select,
   SelectContent,
@@ -40,9 +45,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
-import { TASK_ROLE_LABEL, type Task, type TaskRole } from "@/lib/types";
+import {
+  TASK_ROLE_LABEL,
+  type CheckCommand,
+  type RepoConfig,
+  type Task,
+  type TaskRole,
+} from "@/lib/types";
 
 const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
 
@@ -65,6 +77,8 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   const [featureBranches, setFeatureBranches] = useState<
     Record<string, string>
   >(task.repoFeatureBranches ?? {});
+  // V0.6.28：本次要追加的仓库路径（只增不删、已绑仓不在此列表）
+  const [addRepos, setAddRepos] = useState<string[]>([]);
   // 提交锁、防连点
   const [submitting, setSubmitting] = useState(false);
 
@@ -81,18 +95,28 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     setTitle(t.title);
     setFeishuStoryUrl(t.feishuStoryUrl ?? "");
     setFeatureBranches(t.repoFeatureBranches ?? {});
+    setAddRepos([]);
     setSubmitting(false);
   }, [open]);
 
+  // settings 快照（追加候选 / 仓名展示 / 提交时取新仓分支快照都用它）
+  // mount 时读一次即可（编辑 task 期间不会同时改设置页仓库配置）
+  const settings = useMemo(() => getSettings(), []);
+  const settingsRepos = settings.repos;
+
   // 仓库名展示（featureBranches / 只读列表用）：settings.repos 查、查不到用路径尾段
-  // mount 时读一次 settings.repos 即可（编辑 task 期间不会同时改设置页仓库名）
   const repoNameOf = useMemo(() => {
-    const repos = getSettings().repos;
     return (p: string) =>
-      repos.find((r) => r.path === p)?.name ??
+      settingsRepos.find((r) => r.path === p)?.name ??
       p.split("/").filter(Boolean).pop() ??
       p;
-  }, []);
+  }, [settingsRepos]);
+
+  // 追加候选 = settings 里配过、且还没绑进本 task 的仓
+  const addableRepos = useMemo(
+    () => settingsRepos.filter((r) => !task.repoPaths.includes(r.path)),
+    [settingsRepos, task.repoPaths],
+  );
 
   const canSubmit = title.trim().length > 0 && !submitting;
 
@@ -100,18 +124,52 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      // 收集 per-repo 已有工作分支（限定当前 repoPaths、去空）；后端还会再清洗一道
+      // 收集 per-repo 已有工作分支（已绑仓 + 本次追加仓、去空）；后端还会再清洗一道
       const cleanedBranches: Record<string, string> = {};
-      for (const p of task.repoPaths) {
+      for (const p of [...task.repoPaths, ...addRepos]) {
         const b = featureBranches[p]?.trim();
         if (b) cleanedBranches[p] = b;
       }
+
+      // V0.6.28：新追加仓的 per-repo 快照（跟 new-task-dialog 建 task 时同款逻辑）——
+      // settings 在 localStorage、server 读不到、必须 client 取好随行传
+      const addRepoBaseBranches: Record<string, string> = {};
+      const addRepoTestBranches: Record<string, string> = {};
+      const addRepoDevBranches: Record<string, string> = {};
+      const addRepoBranchTemplates: Record<string, string> = {};
+      const addRepoCheckCommands: Record<string, CheckCommand[]> = {};
+      for (const p of addRepos) {
+        const repo = settingsRepos.find((r) => r.path === p);
+        const online = repo?.onlineBranch?.trim();
+        if (online) addRepoBaseBranches[p] = online;
+        const tb = repo?.testBranch?.trim();
+        if (tb) addRepoTestBranches[p] = tb;
+        const db = repo?.devBranch?.trim();
+        if (db) addRepoDevBranches[p] = db;
+        addRepoBranchTemplates[p] = resolveBranchTemplate(
+          repo?.branchTemplate,
+          settings.branchTemplate,
+        );
+        const cmds = repo?.checkCommands;
+        if (cmds && cmds.length > 0) addRepoCheckCommands[p] = cmds;
+      }
+
       const updated = await updateTaskFields(task.id, {
         title: title.trim(),
         role,
         feishuStoryUrl: feishuStoryUrl.trim() || null,
         repoFeatureBranches:
           Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
+        ...(addRepos.length > 0
+          ? {
+              addRepoPaths: addRepos,
+              addRepoBaseBranches,
+              addRepoTestBranches,
+              addRepoDevBranches,
+              addRepoBranchTemplates,
+              addRepoCheckCommands,
+            }
+          : {}),
       });
       onSaved(updated);
       onOpenChange(false);
@@ -177,11 +235,13 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             />
           </div>
 
-          {/* 仓库：只读展示（不可改） */}
+          {/* 仓库：已绑只读（不可移除）、下方可追加 */}
           <div className="grid gap-1.5">
             <Label>
               目标仓库{" "}
-              <span className="text-xs text-muted-foreground">（不可改）</span>
+              <span className="text-xs text-muted-foreground">
+                （已绑不可移除）
+              </span>
             </Label>
             {task.repoPaths.length > 0 ? (
               <div className="grid gap-1 rounded-md border bg-muted/30 px-3 py-2">
@@ -205,12 +265,36 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             )}
           </div>
 
-          {/* 已有工作分支：per-repo（仅有仓时展示） */}
-          {task.repoPaths.length > 0 && (
+          {/* V0.6.28：追加仓库（只增不删、下一个 action 生效） */}
+          {addableRepos.length > 0 && (
+            <div className="grid gap-1.5">
+              <Label>追加仓库</Label>
+              <MultiSelect<RepoConfig>
+                options={addableRepos}
+                value={addRepos}
+                onChange={setAddRepos}
+                getKey={(r) => r.path}
+                placeholder="选填、下一个 action 生效"
+                renderOption={(r) => (
+                  <>
+                    <span className="block w-full truncate font-medium">
+                      {r.name}
+                    </span>
+                    <span className="block w-full truncate text-xs text-muted-foreground">
+                      {r.path}
+                    </span>
+                  </>
+                )}
+              />
+            </div>
+          )}
+
+          {/* 已有工作分支：per-repo（已绑仓 + 本次追加仓） */}
+          {task.repoPaths.length + addRepos.length > 0 && (
             <div className="grid gap-1.5">
               <Label>已有工作分支（选填）</Label>
               <div className="grid gap-2">
-                {task.repoPaths.map((p) => (
+                {[...task.repoPaths, ...addRepos].map((p) => (
                   <div key={p} className="flex items-center gap-2">
                     <span
                       className="w-28 shrink-0 truncate text-sm text-muted-foreground"
