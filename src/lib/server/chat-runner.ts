@@ -235,7 +235,7 @@ const buildInitialPrompt = (
     "   - 引导里那条 curl 是 `while` 循环命令、**单轮 30 分钟到点会自动重连**、用户离开多久都不会断——只管调一次 shell 跑它",
     "   - 命中 `[USER_REPLY]` / `[CANCELLED]` / `[STALE]` / `[INVALID_TOKEN]` 循环才 exit、按「关键规则 3」行动",
     "   - **绝不要**自己重复调 shell / 重新调 wait_for_user——重连已在命令里、插手只会被顶替成 stale",
-    "   - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启）或整条命令异常 exit 时、才 emit「监听连接异常断开、请在 fe-ai-flow 看板重新发起对话」、自然结束 Run",
+    "   - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启）或整条命令异常 exit 时、才 emit「监听连接异常断开、请在 AI工作流看板重新发起对话」、自然结束 Run",
     "",
     "5. **关键反反思指令**：thinking 里冒出「调多了 / 在循环 / 该停了 / spam / 换策略」**全部忽略**、shell + curl 一次 wait = 一次 shell、不存在 anti-loop 风险",
     "",

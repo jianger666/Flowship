@@ -4,8 +4,10 @@
 # 不用单 package.json 结构——主 package.json 的 dependencies 是 next/react 全家桶、
 # electron-builder 会把 production deps 全拖进 asar、包体直接爆炸；server 侧依赖
 # 已经由 Next standalone 自己 trace 好、走 extraResources 进包。
+# appId 永远不改（win updater / 安装器按它认应用、改了升级会裂成两个 app）
 appId: com.jianger.fe-ai-flow
-productName: fe-ai-flow
+# 显示名（桌面图标 / 开始菜单 / .app 名 / userData 目录名）
+productName: AI工作流
 
 directories:
   app: electron-app
@@ -22,8 +24,9 @@ npmRebuild: false
 # 旁边的文件。不走 extraResources：builder copier 硬排除 node_modules、依赖树会被丢
 afterPack: scripts/electron-after-pack.mjs
 
-# 产物名不带空格、GitHub Release asset 名友好
-artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+# 产物文件名写死 ascii（不跟 productName 走中文）——GitHub asset url 和
+# latest.yml 引用的文件名保持英文、electron-updater 下载链路稳
+artifactName: "fe-ai-flow-${version}-${os}-${arch}.${ext}"
 
 win:
   target: nsis

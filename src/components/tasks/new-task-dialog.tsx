@@ -358,7 +358,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
                 getKey={(r) => r.path}
                 placeholder={
                   mode === "chat"
-                    ? "选填、不选时 agent 起在 fe-ai-flow 项目本身"
+                    ? "选填、不选时 agent 起在 AI工作流项目本身"
                     : "选择仓库（可多选）"
                 }
                 renderOption={(r) => (

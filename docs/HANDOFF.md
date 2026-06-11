@@ -293,6 +293,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 背景：绿色 zip 的「bat→vbs→隐藏 powershell→node」四级启动链静默、易被企业 EDR 拦、挂了零反馈（同事实测「双击闪一下啥都没发生」）。用户拍板换 Electron：同事双击图标 → 独立窗口 → 关窗服务跟着退 → win 自动更新、接受体积代价（约 260MB vs 绿色包 170MB）。
 
+- **产品显示名「AI工作流」（v0.7.2 用户拍板）**：`productName` + 页面 title + header + 用户可见提示语全改；**内部标识一律不动**——localStorage key（`fe-ai-flow:settings`、改了用户配置全丢）、MCP client name、appId（`com.jianger.fe-ai-flow`、改了 win 升级裂成两个 app）、release 产物文件名（artifactName 写死 ascii、latest.yml 下载链路稳）；壳里 `app.setPath("userData", appData/fe-ai-flow)` 钉死数据目录、显示名以后随便改数据不漂移
+- **壳落盘日志（v0.7.2）**：打包后没终端、`main.js` 全部 console 输出 + server stdout/stderr + 生命周期事件（启动 / server spawn / 退出 / 端口清理）双写 `userData/logs/main.log`——同事那边「双击没反应」之类问题直接要日志文件、不再盲猜
+
 - **server 数据目录可注入**：新增 `src/lib/server/data-root.ts`（`FE_AI_FLOW_DATA_DIR` env 优先、回落 `process.cwd()/data`）、task-fs / mcp-oauth / uploads route 三处硬编码全部改走它——Electron 下 data 落系统 userData、dev / 绿色包行为不变
 - **Electron 壳 `electron/main.js`**（纯 JS、不过 tsc）：单实例锁；`spawn(process.execPath, [server.js])` + env 三件套（`ELECTRON_RUN_AS_NODE=1` 让 execPath 表现为 node 且被 hooks 孙进程继承 / `PORT=8876` + `HOSTNAME=127.0.0.1` / `FE_AI_FLOW_DATA_DIR=userData/data`）；起 server 前探 8876 端口、被占（旧绿色包还在跑）弹 dialog 确认后杀占用进程；轮询就绪后开 1280x800 窗口（记忆上次尺寸）；关窗杀 server 子进程；win `autoUpdater.checkForUpdatesAndNotify()`（mac 未签名跳过）
 - **electron-builder**：壳进 asar、组好的 server 布局（standalone + prompts/skills/scripts、**删 data/ 防隐私泄漏**）走 `extraResources` 进 `resources/app-server/` 不进 asar；**不再打便携 node**（Electron 自带运行时）；win `nsis`（oneClick、装用户目录免管理员）+ mac `dmg`（arm64）；`publish: github` 自动产 `latest.yml` 喂 electron-updater；图标 `packaging/icon.png`（buildResources 指 packaging、builder 自动转 ico/icns）

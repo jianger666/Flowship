@@ -814,7 +814,7 @@ const buildShellWaitGuidance = (
     "  - **唯一的正常退出**：grep 命中终态行后整条命令 exit、按上面「stdout 解读规则」对最后那行行动",
     "  - **绝不要**自己重复调 shell / 重新调 wait_for_user / ask_user —— 重连已经在命令里了、你再插手只会被服务端顶替成 stale",
     "  - **命令异常 exit（exit code 非 0、且 stdout 没有终态行）→ 先再调一次本 shell 跑同一条命令兜底**：while 内置 set +e 后理应不会异常退出、但万一被环境打断、再调一次能用同 token 接上原 entry（subscribeWaitAck 不消费 token、entry 还在）",
-    "  - **连调 2 次都立刻异常 exit**（如 mktemp 不可用、环境坏了）→ 才 emit 一条简短 assistant_message「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
+    "  - **连调 2 次都立刻异常 exit**（如 mktemp 不可用、环境坏了）→ 才 emit 一条简短 assistant_message「监听连接异常断开、请在 AI工作流看板点『推进』」、自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
     "",
     "## 调用礼仪",
     "",

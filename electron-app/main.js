@@ -16,7 +16,7 @@
  */
 import { app, BrowserWindow, dialog, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, mkdirSync, createWriteStream } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,10 @@ import { fileURLToPath } from "node:url";
 const PORT = 8876;
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
+
+// userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名改成中文「AI工作流」
+// 或以后再改名、数据目录都不漂移、用户任务数据不丢
+app.setPath("userData", path.join(app.getPath("appData"), "fe-ai-flow"));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +45,25 @@ let mainWindow = null;
 let quitting = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- 落盘日志 ----------
+// 打包后的 app 没有终端、server stdout / 生命周期事件全落 userData/logs/main.log、
+// 出问题（启动失败 / server 崩 / 数据目录异常）有据可查
+let logStream = null;
+const log = (...args) => {
+  const line = `[${new Date().toISOString()}] ${args.join(" ")}`;
+  console.log(line);
+  try {
+    if (!logStream) {
+      const file = path.join(app.getPath("userData"), "logs", "main.log");
+      mkdirSync(path.dirname(file), { recursive: true });
+      logStream = createWriteStream(file, { flags: "a" });
+    }
+    logStream.write(`${line}\n`);
+  } catch {
+    // 日志写不进去不影响主流程
+  }
+};
 
 // execFile 的 promise 包装、出错返空串（探测类调用都 fail-open）
 const execFileP = (cmd, args) =>
@@ -110,7 +133,7 @@ const ensurePortFree = async () => {
   const { response } = await dialog.showMessageBox({
     type: "warning",
     title: "端口被占用",
-    message: "检测到旧版 fe-ai-flow 服务占用了 8876 端口",
+    message: "检测到旧版服务占用了 8876 端口",
     detail: "点「确定」自动关闭旧服务并继续启动；点「退出」放弃本次启动。",
     buttons: ["确定", "退出"],
     defaultId: 0,
@@ -118,7 +141,9 @@ const ensurePortFree = async () => {
   });
   if (response !== 0) return false;
 
-  await killPids(await findPortPids());
+  const pids = await findPortPids();
+  log(`[main] 端口 ${PORT} 被占、用户确认清理 pids=${pids.join(",")}`);
+  await killPids(pids);
   // 等端口释放（最多 10s、TIME_WAIT 一般秒级）
   for (let i = 0; i < 20; i++) {
     if (!(await isPortBusy())) return true;
@@ -148,15 +173,17 @@ const startServer = () => {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  serverProc.stdout.on("data", (d) => console.log(`[server] ${d}`.trimEnd()));
-  serverProc.stderr.on("data", (d) => console.error(`[server] ${d}`.trimEnd()));
+  log(`[main] server 启动 pid=${serverProc.pid} dataDir=${path.join(app.getPath("userData"), "data")}`);
+  serverProc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
+  serverProc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
   serverProc.on("exit", (code) => {
     serverProc = null;
+    log(`[main] server 退出 code=${code ?? "?"} quitting=${quitting}`);
     // 不是用户主动退出、说明 server 崩了——提示后整个 app 退出（窗口留着也没意义）
     if (!quitting) {
       dialog.showErrorBox(
         "服务异常退出",
-        `fe-ai-flow 内部服务意外退出（code=${code ?? "?"}）、请重新打开应用。`,
+        `内部服务意外退出（code=${code ?? "?"}）、请重新打开应用。`,
       );
       app.quit();
     }
@@ -231,7 +258,7 @@ const saveWindowState = async () => {
 
 // 等 server 期间先显示的极简 loading 页（避免白屏 / 无反馈）
 const LOADING_URL = `data:text/html;charset=utf-8,${encodeURIComponent(
-  `<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:#0a0a0a;color:#a1a1aa;font:14px system-ui">fe-ai-flow 启动中…</body></html>`,
+  `<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:#0a0a0a;color:#a1a1aa;font:14px system-ui">AI工作流 启动中…</body></html>`,
 )}`;
 
 const createWindow = async () => {
@@ -286,7 +313,7 @@ const setupAutoUpdate = async () => {
     await updater.autoUpdater.checkForUpdatesAndNotify();
   } catch (err) {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
-    console.error("[updater] 检查更新失败（忽略）", err);
+    log(`[updater] 检查更新失败（忽略）${err?.message || err}`);
   }
 };
 
@@ -303,6 +330,7 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
+    log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")}`);
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默
     try {
       await fs.access(path.join(serverDir, "server.js"));
@@ -340,6 +368,7 @@ if (!app.requestSingleInstanceLock()) {
 
   // 关窗即退（mac 也不留 dock 常驻——服务跟窗口同生共死、行为跨平台一致）
   app.on("window-all-closed", async () => {
+    log("[main] 所有窗口关闭、停 server 并退出");
     quitting = true;
     await stopServer();
     app.quit();

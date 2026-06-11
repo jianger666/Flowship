@@ -8,7 +8,7 @@ import { Separator } from "@/components/ui/separator";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "fe-ai-flow",
+  title: "AI工作流",
   description: "开发流水线",
 };
 
@@ -31,7 +31,7 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
                 href="/"
                 className="flex items-center gap-2 font-semibold tracking-tight no-underline text-foreground hover:opacity-80"
               >
-                fe-ai-flow
+                AI工作流
                 <span className="text-xs text-muted-foreground font-normal">
                   开发流水线
                 </span>

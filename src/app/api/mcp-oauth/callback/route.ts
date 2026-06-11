@@ -88,7 +88,7 @@ export const GET = async (req: Request) => {
       renderHtml(
         true,
         "授权成功",
-        `「${parsed.serverName}」已授权、可关闭此页面回到 fe-ai-flow`,
+        `「${parsed.serverName}」已授权、可关闭此页面回到 AI工作流`,
       ),
     );
   } catch (err) {
