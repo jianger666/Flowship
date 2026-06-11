@@ -295,9 +295,10 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 - **server 数据目录可注入**：新增 `src/lib/server/data-root.ts`（`FE_AI_FLOW_DATA_DIR` env 优先、回落 `process.cwd()/data`）、task-fs / mcp-oauth / uploads route 三处硬编码全部改走它——Electron 下 data 落系统 userData、dev / 绿色包行为不变
 - **Electron 壳 `electron/main.js`**（纯 JS、不过 tsc）：单实例锁；`spawn(process.execPath, [server.js])` + env 三件套（`ELECTRON_RUN_AS_NODE=1` 让 execPath 表现为 node 且被 hooks 孙进程继承 / `PORT=8876` + `HOSTNAME=127.0.0.1` / `FE_AI_FLOW_DATA_DIR=userData/data`）；起 server 前探 8876 端口、被占（旧绿色包还在跑）弹 dialog 确认后杀占用进程；轮询就绪后开 1280x800 窗口（记忆上次尺寸）；关窗杀 server 子进程；win `autoUpdater.checkForUpdatesAndNotify()`（mac 未签名跳过）
-- **electron-builder**：壳进 asar、组好的 server 布局（standalone + prompts/skills/scripts、**删 data/ 防隐私泄漏**）走 `extraResources` 进 `resources/app-server/` 不进 asar；**不再打便携 node**（Electron 自带运行时）；win `nsis`（oneClick、装用户目录免管理员）+ mac `dmg`（arm64）；`publish: github` 自动产 `latest.yml` 喂 electron-updater
-- **CI**：绿色 zip job 保留（兜底）；新增 `windows-latest` job 跑 `electron-builder --win --publish always`、mac dmg job 同理；组 server 布局逻辑从 `package-release.mjs` 抽公共函数 `scripts/lib/assemble-server.mjs` 复用
-- 已知风险（用户已确认）：未签名 exe 首次装 SmartScreen 要点「仍要运行」；mac 无公证 autoUpdate 不可用
+- **electron-builder**：壳进 asar、组好的 server 布局（standalone + prompts/skills/scripts、**删 data/ 防隐私泄漏**）走 `extraResources` 进 `resources/app-server/` 不进 asar；**不再打便携 node**（Electron 自带运行时）；win `nsis`（oneClick、装用户目录免管理员）+ mac `dmg`（arm64）；`publish: github` 自动产 `latest.yml` 喂 electron-updater；图标 `packaging/icon.png`（buildResources 指 packaging、builder 自动转 ico/icns）
+- ⚠️ **electron-app 依赖必须用 pnpm 装**：electron-builder 按根 lockfile 判定 pm=pnpm、npm 装的 node_modules 收集不到、会 fallback 把主项目 production 全家桶打进 asar（实测 271M → 修后 2M）
+- **CI**：绿色 zip job 保留（兜底）；electron win/mac 矩阵 job **复用 ubuntu job build 的 standalone**（tar artifact 传递——纯 JS 跨平台、且 win runner 上 next build 撞 `EPERM scandir "Application Data"` junction 必须绕开）；组 server 布局逻辑从 `package-release.mjs` 抽公共函数 `scripts/lib/assemble-server.mjs` 复用；v0.7.0 tag CI win 失败、v0.7.1 修复重发
+- 已知风险（用户已确认）：未签名 exe 首次装 SmartScreen 要点「仍要运行」；mac 无公证 autoUpdate 不可用；桌面端 localStorage 独立于浏览器、设置要重配；旧 data 迁移 = 手动拷 `data/` 到 userData（mac `~/Library/Application Support/fe-ai-flow/` / win `%APPDATA%\fe-ai-flow\`）
 
 ### V0.6.34：win launcher 一键自动更新——有新版自动停旧进程（2026-06-11）
 

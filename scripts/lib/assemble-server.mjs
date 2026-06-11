@@ -17,9 +17,15 @@ import path from "node:path";
 
 const exists = async (p) => fs.access(p).then(() => true, () => false);
 
+// verbatimSymlinks: true——standalone 的 node_modules 是 pnpm symlink 拓扑
+// （顶层 next -> .pnpm/.../next、require 靠 .pnpm 内兄弟链接解析）、必须原样保留：
+// - fs.cp 默认（verbatim:false）会把相对链接改写成「构建机绝对路径」死链
+// - dereference:true 物化又会破坏 pnpm 兄弟解析（next 副本找不到 styled-jsx、踩过）
+// Windows 产物的 symlink 兼容问题在 CI 侧解决：build job 用 node-linker=hoisted
+// 装依赖、standalone 直接产实体平铺、根本没有 symlink（见 release.yml）
 const cp = async (src, dest) => {
   await fs.mkdir(path.dirname(dest), { recursive: true });
-  await fs.cp(src, dest, { recursive: true });
+  await fs.cp(src, dest, { recursive: true, verbatimSymlinks: true });
 };
 
 export const assembleServerLayout = async (rootDir, destDir) => {

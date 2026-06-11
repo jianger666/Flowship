@@ -24,7 +24,10 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      # node-linker=hoisted：node_modules 平铺实体（npm 风格、无 pnpm symlink 拓扑）、
+      # standalone trace 产物随之全实体——zip / tar / nsis 跨 Windows 不再有 symlink
+      # 兼容雷（pnpm isolated 布局的相对链接在 win 解压器上是死链）
+      - run: pnpm install --frozen-lockfile --config.node-linker=hoisted
 
       - run: pnpm build
         env:
@@ -42,9 +45,20 @@ jobs:
             dist/fe-ai-flow-darwin-x64.zip
           generate_release_notes: true
 
+      # 给 electron job 复用的 server 布局（tar 保留权限 / 防 artifact zip 丢元数据）。
+      # standalone 纯 JS 跨平台、ubuntu build 一份三平台用——绿色包同款思路；
+      # 且 win runner 上 next build 会撞 EPERM scandir "Application Data" junction、必须绕开
+      - run: node scripts/assemble-electron-server.mjs && tar -czf app-server.tar.gz -C dist app-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-server
+          path: app-server.tar.gz
+          retention-days: 1
+
   # Electron 安装包（win + mac 同构、矩阵跑）。
-  # needs 绿色包 job：让它先把 release 建好、electron-builder 往同 tag release 追加
-  # asset（exe / dmg / latest.yml）、避免两个 job 竞态各建一个 release
+  # needs 绿色包 job：复用它 build 的 server 布局；也让它先建好 release、
+  # electron-builder 往同 tag release 追加 asset（exe / dmg / latest.yml）不竞态
   electron:
     needs: build-release
     strategy:
@@ -67,23 +81,25 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # 只为装 electron + electron-builder（devDeps）、不在本机 build Next
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm build
-        env:
-          BUILD_STANDALONE: "1"
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-server
 
-      # 组 server 布局（standalone + prompts/skills/scripts、删 data/）→ dist/app-server、
-      # 被 electron-builder.yml 的 extraResources 拷进安装包
-      - run: node scripts/assemble-electron-server.mjs
+      - run: mkdir -p dist && tar -xzf app-server.tar.gz -C dist
+        shell: bash
+
+      # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar。
+      # 必须用 pnpm（跟根项目一致）：electron-builder 按根 lockfile 判定 pm=pnpm、
+      # npm 风格的 node_modules 收集不到、会 fallback 把主项目全家桶打进 asar（271M 事故）
+      - run: pnpm install --frozen-lockfile
+        working-directory: electron-app
 
       # 壳版本号 = tag 版本（electron-updater 按它比对新旧版、必须每次发版递增）
       - run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
         shell: bash
-        working-directory: electron-app
-
-      # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar
-      - run: npm install --omit=dev
         working-directory: electron-app
 
       - run: npx electron-builder ${{ matrix.args }} --publish always
