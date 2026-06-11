@@ -15,6 +15,15 @@
 
 ---
 
+### V0.6.32：path-utils Windows 路径适配（2026-06-11）
+
+背景：Windows 同事（V0.6.30 绿色包用户）反馈 artifact 里的文件路径不可点击跳转。根因：agent 在 Windows 业务仓写的路径是 `D:\IdeaProjects\...\Api.java` 盘符 + 反斜杠形态、`src/lib/path-utils.ts` 整套只认 `/`。
+
+- **`looksLikePath` / `buildCursorLink` / `pathBasename`**：计算前把 `\` 归一化成 `/`；盘符绝对路径（`D:\` / `D:/` 起手）视作绝对路径不拼 baseDir；cursor 链接拼成 `cursor://file/D:/...`（同 VS Code `vscode://file/c:/...` 约定、**盘符段 `:` 不 encode**、encode 了 Cursor 不认）
+- **`getCommonParentDir` / `getEffectiveCwd` / `getRepoShortNames`**：同样归一化、Windows 多仓（`D:\IdeaProjects\` 下三仓）能算出 `D:/IdeaProjects` 公共父目录（原来算出空串、SDK run cwd 直接坏）；跨盘符返 `""` 走 fallback；裸盘符公共段补 `/`（`D:` 是盘相对语义）
+- 输出统一正斜杠：Node spawn cwd / Cursor 协议在 Windows 都接受 `/`、下游字符串比对单一化
+- 单测 +9（盘符链接 / 带行号 / 反斜杠相对路径拼 baseDir / basename / Windows 多仓 cwd）、全量 64 测试过
+
 ### V0.6.31：revise 跳处理自动纠正 + mac 绿色包（2026-06-10）
 
 **A. 「未处理 revise」服务端自动纠正（用户实测踩坑、harness 硬化）**：

@@ -289,6 +289,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.6.34：win launcher 一键自动更新——有新版自动停旧进程（2026-06-11）
+
+背景：原 launcher 流程「端口在跑 → 直开浏览器退出」、更新永远轮不到——同事得先去任务管理器杀 node.exe 才能吃到新版、对非前端复杂度太高。
+
+- **`packaging/launch.ps1` 流程重排**：先查 GitHub latest（fail-open）→ 端口在跑且**无新版** = 直开浏览器（日常零感知）；在跑且**有新版** = `Stop-ServerOnPort`（`Get-NetTCPConnection -LocalPort` 拿 PID + `Stop-Process`、老系统 fallback netstat 解析；只杀监听本端口的进程、不误伤其它 node）→ 等端口释放 → 走原更新 + 重启
+- 同事体验：发新版后**只需再双击一次桌面图标**、停进程 / 更新 / 重启全自动
+- ⚠️ 鸡生蛋：这个新 launcher 本身要随包分发——**同事吃 v0.6.34 这一次仍需手动停一次服务（或重启电脑后点图标）**、从下一版起才是真·一键
+- 取舍：点图标时 agent 正在跑任务会被中断——主动行为、可接受；mac launcher 未同步改（主要用户是自己、需要时再说）
+
 ### V0.6.33：「再聊聊」改非模态停靠弹窗（2026-06-11）
 
 背景：Windows 同事反馈——plan tab 点「再聊聊」、模态弹窗遮罩把方案文档整个挡住、写 revise 反馈时没法对照文档「摸瞎写」。所有 action 的再聊聊共用同一个 `revise-dialog.tsx`、一处改全生效。
@@ -298,15 +307,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - ⚠️ base-ui 1.4.1 的 prop 名是 `disablePointerDismissal`、不是新文档里的 `dismissible`（typecheck 踩过）
 - 输入框 / 贴图 / Cmd+Enter / memo 防抖那套全不动；AskUserDialog（AI 选择题）保持模态不动——选项在弹窗内自洽、不需要对照文档
 - **.1 补丁（用户实测指出）**：非模态后弹窗开着「通过」等按钮仍可点、ack 走掉后弹窗悬空指向已结束的 action——task page 把 canAck 提为 useMemo + effect「canAck 一丢自动收弹窗」、任何路径（通过 / 停止 / agent 推进 / 重启）都兜住
-
-### V0.6.32：path-utils Windows 路径适配（2026-06-11）
-
-背景：Windows 同事（V0.6.30 绿色包用户）反馈 artifact 里的文件路径不可点击跳转。根因：agent 在 Windows 业务仓写的路径是 `D:\IdeaProjects\...\Api.java` 盘符 + 反斜杠形态、`src/lib/path-utils.ts` 整套只认 `/`。
-
-- **`looksLikePath` / `buildCursorLink` / `pathBasename`**：计算前把 `\` 归一化成 `/`；盘符绝对路径（`D:\` / `D:/` 起手）视作绝对路径不拼 baseDir；cursor 链接拼成 `cursor://file/D:/...`（同 VS Code `vscode://file/c:/...` 约定、**盘符段 `:` 不 encode**、encode 了 Cursor 不认）
-- **`getCommonParentDir` / `getEffectiveCwd` / `getRepoShortNames`**：同样归一化、Windows 多仓（`D:\IdeaProjects\` 下三仓）能算出 `D:/IdeaProjects` 公共父目录（原来算出空串、SDK run cwd 直接坏）；跨盘符返 `""` 走 fallback；裸盘符公共段补 `/`（`D:` 是盘相对语义）
-- 输出统一正斜杠：Node spawn cwd / Cursor 协议在 Windows 都接受 `/`、下游字符串比对单一化
-- 单测 +9（盘符链接 / 带行号 / 反斜杠相对路径拼 baseDir / basename / Windows 多仓 cwd）、全量 64 测试过
 
 ---
 
