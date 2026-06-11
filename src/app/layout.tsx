@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Settings } from "lucide-react";
 import { Providers } from "@/components/providers";
+import { UpdateBadge } from "@/components/update-badge";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -36,18 +37,22 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
                   开发流水线
                 </span>
               </Link>
-              {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild
-                  nativeButton={false} 是因为 render 出来的是 <a>、不是 <button>、
-                  不传会被 Base UI runtime warn */}
-              <Button
-                variant="ghost"
-                size="sm"
-                nativeButton={false}
-                render={<Link href="/settings" className="no-underline" />}
-              >
-                <Settings />
-                设置
-              </Button>
+              <div className="flex items-center gap-2">
+                {/* 桌面端有新版本就绪时亮起（壳注入、浏览器环境恒不显示） */}
+                <UpdateBadge />
+                {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild
+                    nativeButton={false} 是因为 render 出来的是 <a>、不是 <button>、
+                    不传会被 Base UI runtime warn */}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  nativeButton={false}
+                  render={<Link href="/settings" className="no-underline" />}
+                >
+                  <Settings />
+                  设置
+                </Button>
+              </div>
             </header>
             <Separator />
             <main className="flex-1">{children}</main>

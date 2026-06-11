@@ -293,24 +293,93 @@ const createWindow = async () => {
   });
   // 同 frame 导航离开本应用（cursor:// deep link 跳 IDE、或意外的外部 http 链接）
   // → 拦下来交系统处理、窗口永远停在 fe-ai-flow 页面上
+  // 特例：app-update://install 是页面「新版本」标识发起的装更新指令、壳自己消费
   mainWindow.webContents.on("will-navigate", (e, url) => {
+    if (url.startsWith("app-update://")) {
+      e.preventDefault();
+      void installUpdateNow();
+      return;
+    }
     if (url.startsWith(BASE_URL) || url.startsWith("data:")) return;
     e.preventDefault();
     void shell.openExternal(url);
   });
+
+  // 页面每次加载完成（含刷新 / loading 页换正式页）重注入更新标识、不丢状态
+  mainWindow.webContents.on("did-finish-load", notifyPageUpdateReady);
 
   await mainWindow.loadURL(LOADING_URL);
 };
 
 // ---------- 自动更新（仅 win、mac 未签名跑不了） ----------
 
+// 已下载就绪的新版本号（null = 无更新待装）
+let updateReadyVersion = null;
+
+// 「该版本是否已弹过对话框」持久化——同一个新版本只弹一次原生弹窗、
+// 之后（含重启 app 再查到同版本）只靠页面右上角「新版本」标识安静提醒
+const promptedFile = () => path.join(app.getPath("userData"), "update-prompted.json");
+
+const wasPrompted = async (version) => {
+  try {
+    return JSON.parse(await fs.readFile(promptedFile(), "utf8")).version === version;
+  } catch {
+    return false;
+  }
+};
+
+const markPrompted = async (version) => {
+  try {
+    await fs.writeFile(promptedFile(), JSON.stringify({ version }), "utf8");
+  } catch {
+    // 写不进去顶多多弹一次、不影响主流程
+  }
+};
+
+// 通知页面「新版本就绪」：全局变量 + CustomEvent 双通道
+// （变量给 mount 晚于注入的组件读、事件给已 mount 的组件实时响应；
+//  did-finish-load 时重注入、页面刷新也不丢标识）
+const notifyPageUpdateReady = () => {
+  if (!mainWindow || !updateReadyVersion) return;
+  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.dispatchEvent(new Event("app-update-ready"));`;
+  mainWindow.webContents.executeJavaScript(js).catch(() => {});
+};
+
+// 立即装更新（页面点「新版本」标识、或对话框点「立即重启」走到这）
+// before-quit 兜底会杀 server 子进程、不会留孤儿
+const installUpdateNow = async () => {
+  if (!updateReadyVersion) return;
+  log(`[updater] 用户确认、重启安装 v${updateReadyVersion}`);
+  const { default: updater } = await import("electron-updater");
+  updater.autoUpdater.quitAndInstall();
+};
+
 const setupAutoUpdate = async () => {
   if (!app.isPackaged || process.platform !== "win32") return;
   try {
     // electron-updater 是 CJS、ESM 下走 default 再解构最稳
     const { default: updater } = await import("electron-updater");
-    // 查更新 + 后台下载 + 下载完系统通知、用户重启 app 时装新版
-    await updater.autoUpdater.checkForUpdatesAndNotify();
+    const au = updater.autoUpdater;
+    au.on("update-downloaded", async (info) => {
+      updateReadyVersion = info?.version || "";
+      log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
+      notifyPageUpdateReady();
+      if (await wasPrompted(updateReadyVersion)) return;
+      await markPrompted(updateReadyVersion);
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: "info",
+        title: "发现新版本",
+        message: `新版本 v${updateReadyVersion} 已下载完成`,
+        detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
+        buttons: ["立即重启更新", "稍后"],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (response === 0) await installUpdateNow();
+    });
+    au.on("error", (err) => log(`[updater] ${err?.message || err}`));
+    // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走上面的事件
+    await au.checkForUpdates();
   } catch (err) {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
     log(`[updater] 检查更新失败（忽略）${err?.message || err}`);
