@@ -158,9 +158,27 @@ const ensurePortFree = async () => {
 
 // ---------- server 子进程 ----------
 
+// server 用哪个二进制跑（as node）：
+// - mac 打包后用 bundle 内 Helper（Info.plist 带 LSUIElement=1）——主二进制 as node
+//   会被 LaunchServices 当成前台 GUI 应用、Dock 多一个绿色 exec 通用图标（v0.7.5 修）
+// - 其它平台 / dev 直接用主二进制、行为不变
+const serverNodeBin = () => {
+  if (!app.isPackaged || process.platform !== "darwin") return process.execPath;
+  const helperName = `${app.getName()} Helper`;
+  return path.join(
+    path.dirname(process.execPath),
+    "..",
+    "Frameworks",
+    `${helperName}.app`,
+    "Contents",
+    "MacOS",
+    helperName,
+  );
+};
+
 const startServer = () => {
   const serverJs = path.join(serverDir, "server.js");
-  serverProc = spawn(process.execPath, [serverJs], {
+  serverProc = spawn(serverNodeBin(), [serverJs], {
     env: {
       ...process.env,
       // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录

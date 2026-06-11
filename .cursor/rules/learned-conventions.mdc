@@ -5,6 +5,12 @@ alwaysApply: true
 
 # 编码约定
 
+## ⛔ 不要在本地启动打包 app / 占用 8876 端口（2026-06-11 用户拍板）
+
+- **用户本机日常运行着「AI工作流」桌面 app（8876 端口）当生产环境用**——agent 任何「open 打包 app / curl 8876 / osascript 关窗 / 杀 8876 进程」都会把用户正在用的实例顶掉或关掉（单实例锁 + 端口独占）。
+- 桌面端改动的验证方式：代码 review + 打包产物静态检查（ls / plutil / asar list）+ 不占端口的最小烟测（如 Helper 二进制 `-e "console.log(1)"`）；端到端体验交给用户自己更新后验证。
+- 实在需要跑整个 app 验证、先通过 feedback 征得用户同意再动。
+
 ## UI 组件库
 
 - **统一用 shadcn/ui**——所有交互元素（button / input / select / textarea / card / dialog / toast 等）走 shadcn、不要手写原生 element 拼 className。
