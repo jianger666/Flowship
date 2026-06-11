@@ -23,6 +23,7 @@
 import { promises as fs } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { assembleServerLayout } from "./lib/assemble-server.mjs";
 
 const ROOT = process.cwd();
 const DIST = path.join(ROOT, "dist");
@@ -100,25 +101,10 @@ for (const platform of platforms) {
   const PKG = path.join(DIST, "pkg", platform, "fe-ai-flow");
   console.log(`\n=== 组包 ${platform} ===`);
 
-  // ---------- 1. standalone 产物 ----------
+  // ---------- 1~2. server 布局（standalone + prompts/skills/scripts、删 data/） ----------
+  // V0.7.0 抽到 lib/assemble-server.mjs、跟 Electron extraResources 组包共用
   await fs.rm(path.join(DIST, "pkg", platform), { recursive: true, force: true });
-  await cp(standaloneDir, PKG);
-  // standalone 不带静态资源、官方要求手动拷（没 public/ 目录就只拷 .next/static）
-  await cp(path.join(ROOT, ".next", "static"), path.join(PKG, ".next", "static"));
-  if (await exists(path.join(ROOT, "public"))) {
-    await cp(path.join(ROOT, "public"), path.join(PKG, "public"));
-  }
-
-  // 隐私剔除：file tracing 会把本机 data/（任务数据 + mcp-oauth 凭证）一并拖进
-  // standalone、绝对不能随包分发——无条件删掉、同事侧首次运行自动重建空目录
-  await fs.rm(path.join(PKG, "data"), { recursive: true, force: true });
-
-  // ---------- 2. 运行时按 cwd 读的目录（tracing 对动态 fs 读不保证、显式拷一遍兜底） ----------
-  await cp(path.join(ROOT, "prompts"), path.join(PKG, "prompts"));
-  await cp(path.join(ROOT, "skills"), path.join(PKG, "skills"));
-  for (const f of ["stop-hook.mjs", "shell-guard.mjs"]) {
-    await cp(path.join(ROOT, "scripts", f), path.join(PKG, "scripts", f));
-  }
+  await assembleServerLayout(ROOT, PKG);
 
   // ---------- 3. launcher（按平台分） ----------
   if (platform === "win-x64") {

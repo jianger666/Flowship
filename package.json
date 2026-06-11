@@ -15,7 +15,10 @@
     "start:prod": "next start -p 8876",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "electron:server": "node scripts/assemble-electron-server.mjs",
+    "electron:dev": "electron electron-app",
+    "electron:dist": "electron-builder"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",
@@ -49,6 +52,8 @@
     "@types/prismjs": "^1.26.6",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.2",
     "eslint": "^9.16.0",
     "eslint-config-next": "^15.0.3",
     "open": "^11.0.0",
@@ -68,7 +73,8 @@
       "sqlite3",
       "sharp",
       "unrs-resolver",
-      "msw"
+      "msw",
+      "electron"
     ]
   }
 }

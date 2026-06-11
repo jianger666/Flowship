@@ -1,0 +1,12 @@
+{
+  "name": "fe-ai-flow",
+  "productName": "fe-ai-flow",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "fe-ai-flow 桌面端（Electron 壳、CI 发版时 version 会被改写成 tag 版本）",
+  "main": "main.js",
+  "type": "module",
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  }
+}

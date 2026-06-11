@@ -15,6 +15,16 @@
 
 ---
 
+### V0.6.33：「再聊聊」改非模态停靠弹窗（2026-06-11）
+
+背景：Windows 同事反馈——plan tab 点「再聊聊」、模态弹窗遮罩把方案文档整个挡住、写 revise 反馈时没法对照文档「摸瞎写」。所有 action 的再聊聊共用同一个 `revise-dialog.tsx`、一处改全生效。
+
+- **`ui/dialog.tsx` 新增 `DialogDockedContent`**：非模态「角落停靠」变体——无 Backdrop 遮罩、固定视口右下角（`w-[min(28rem,100vw-2rem)]` + max-h 内部滚动）、典型 UI 组件下沉 ui/ 单一来源
+- **`revise-dialog.tsx`**：Root 加 `modal={false}`（不锁滚动 / 不拦点击 / 不 focus trap——弹窗开着可滚动、选中左侧 artifact 文本）+ `disablePointerDismissal`（点外部不关、草稿不丢；Esc / X / 取消仍可关）、Content 换 `DialogDockedContent`
+- ⚠️ base-ui 1.4.1 的 prop 名是 `disablePointerDismissal`、不是新文档里的 `dismissible`（typecheck 踩过）
+- 输入框 / 贴图 / Cmd+Enter / memo 防抖那套全不动；AskUserDialog（AI 选择题）保持模态不动——选项在弹窗内自洽、不需要对照文档
+- **.1 补丁（用户实测指出）**：非模态后弹窗开着「通过」等按钮仍可点、ack 走掉后弹窗悬空指向已结束的 action——task page 把 canAck 提为 useMemo + effect「canAck 一丢自动收弹窗」、任何路径（通过 / 停止 / agent 推进 / 重启）都兜住
+
 ### V0.6.32：path-utils Windows 路径适配（2026-06-11）
 
 背景：Windows 同事（V0.6.30 绿色包用户）反馈 artifact 里的文件路径不可点击跳转。根因：agent 在 Windows 业务仓写的路径是 `D:\IdeaProjects\...\Api.java` 盘符 + 反斜杠形态、`src/lib/path-utils.ts` 整套只认 `/`。

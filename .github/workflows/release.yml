@@ -1,5 +1,6 @@
-# 发版流水线（V0.6.30）：push 一个 v* tag → 自动 build 绿色包 → 传 GitHub Release
-# 同事侧 launcher 启动时查 releases/latest、有新版自动下载覆盖——发版 = 打 tag 一步
+# 发版流水线：push 一个 v* tag → 自动 build → 传 GitHub Release
+# - 绿色 zip（V0.6.30）：兜底 + 旧 launcher 自更新通道、保留不动
+# - Electron 安装包（V0.7.0）：win nsis（exe + latest.yml、electron-updater 自动更新）+ mac dmg
 name: release
 
 on:
@@ -40,3 +41,53 @@ jobs:
             dist/fe-ai-flow-darwin-arm64.zip
             dist/fe-ai-flow-darwin-x64.zip
           generate_release_notes: true
+
+  # Electron 安装包（win + mac 同构、矩阵跑）。
+  # needs 绿色包 job：让它先把 release 建好、electron-builder 往同 tag release 追加
+  # asset（exe / dmg / latest.yml）、避免两个 job 竞态各建一个 release
+  electron:
+    needs: build-release
+    strategy:
+      # mac 未签名、dmg 只是顺手产物——失败不连坐 win
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win
+          - os: macos-latest
+            args: --mac
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+        env:
+          BUILD_STANDALONE: "1"
+
+      # 组 server 布局（standalone + prompts/skills/scripts、删 data/）→ dist/app-server、
+      # 被 electron-builder.yml 的 extraResources 拷进安装包
+      - run: node scripts/assemble-electron-server.mjs
+
+      # 壳版本号 = tag 版本（electron-updater 按它比对新旧版、必须每次发版递增）
+      - run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+        shell: bash
+        working-directory: electron-app
+
+      # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar
+      - run: npm install --omit=dev
+        working-directory: electron-app
+
+      - run: npx electron-builder ${{ matrix.args }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"

@@ -55,12 +55,13 @@ import type {
 } from "@/lib/types";
 import { CHECK_COMMAND_KIND_LABEL, ACTION_TYPES } from "@/lib/types";
 import { getEffectiveCwd } from "@/lib/path-utils";
+import { dataRoot } from "./data-root";
 import { detectRepoCheckCommands } from "./repo-check-detect";
 import { z } from "zod";
 
 // ----------------- 路径常量 -----------------
 
-const DATA_DIR = path.join(process.cwd(), "data", "tasks");
+const DATA_DIR = path.join(dataRoot(), "tasks");
 const META_FILE = "meta.json";
 const EVENTS_FILE = "events.jsonl";
 const ACTIONS_DIR = "actions";
@@ -218,7 +219,7 @@ export const saveImageAttachments = async (
     const id = newAttachmentId();
     const filename = `${id}.${ext}`;
     const absPath = path.join(uploadsDir, filename);
-    const relPath = path.relative(path.join(process.cwd(), "data"), absPath);
+    const relPath = path.relative(dataRoot(), absPath);
     await fs.writeFile(absPath, buf);
     saved.push({
       absPath,

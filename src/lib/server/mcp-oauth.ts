@@ -31,11 +31,12 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { McpServerConfig } from "@cursor/sdk";
+import { dataRoot } from "./data-root";
 
 // ---- 路径 / 常量 ----
 
 // OAuth 凭证落盘目录（每个 server 一个 json）
-const OAUTH_DIR = path.join(process.cwd(), "data", "mcp-oauth");
+const OAUTH_DIR = path.join(dataRoot(), "mcp-oauth");
 
 // fe 自身的 base url（dev/prod 都 8876、可被 env 覆盖）；OAuth 回调地址必须跟 DCR 注册时一致
 const getBaseUrl = (): string =>

@@ -289,6 +289,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.7.0：Electron 桌面端——双击图标即用、win 自动更新（2026-06-11）
+
+背景：绿色 zip 的「bat→vbs→隐藏 powershell→node」四级启动链静默、易被企业 EDR 拦、挂了零反馈（同事实测「双击闪一下啥都没发生」）。用户拍板换 Electron：同事双击图标 → 独立窗口 → 关窗服务跟着退 → win 自动更新、接受体积代价（约 260MB vs 绿色包 170MB）。
+
+- **server 数据目录可注入**：新增 `src/lib/server/data-root.ts`（`FE_AI_FLOW_DATA_DIR` env 优先、回落 `process.cwd()/data`）、task-fs / mcp-oauth / uploads route 三处硬编码全部改走它——Electron 下 data 落系统 userData、dev / 绿色包行为不变
+- **Electron 壳 `electron/main.js`**（纯 JS、不过 tsc）：单实例锁；`spawn(process.execPath, [server.js])` + env 三件套（`ELECTRON_RUN_AS_NODE=1` 让 execPath 表现为 node 且被 hooks 孙进程继承 / `PORT=8876` + `HOSTNAME=127.0.0.1` / `FE_AI_FLOW_DATA_DIR=userData/data`）；起 server 前探 8876 端口、被占（旧绿色包还在跑）弹 dialog 确认后杀占用进程；轮询就绪后开 1280x800 窗口（记忆上次尺寸）；关窗杀 server 子进程；win `autoUpdater.checkForUpdatesAndNotify()`（mac 未签名跳过）
+- **electron-builder**：壳进 asar、组好的 server 布局（standalone + prompts/skills/scripts、**删 data/ 防隐私泄漏**）走 `extraResources` 进 `resources/app-server/` 不进 asar；**不再打便携 node**（Electron 自带运行时）；win `nsis`（oneClick、装用户目录免管理员）+ mac `dmg`（arm64）；`publish: github` 自动产 `latest.yml` 喂 electron-updater
+- **CI**：绿色 zip job 保留（兜底）；新增 `windows-latest` job 跑 `electron-builder --win --publish always`、mac dmg job 同理；组 server 布局逻辑从 `package-release.mjs` 抽公共函数 `scripts/lib/assemble-server.mjs` 复用
+- 已知风险（用户已确认）：未签名 exe 首次装 SmartScreen 要点「仍要运行」；mac 无公证 autoUpdate 不可用
+
 ### V0.6.34：win launcher 一键自动更新——有新版自动停旧进程（2026-06-11）
 
 背景：原 launcher 流程「端口在跑 → 直开浏览器退出」、更新永远轮不到——同事得先去任务管理器杀 node.exe 才能吃到新版、对非前端复杂度太高。
@@ -297,16 +307,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - 同事体验：发新版后**只需再双击一次桌面图标**、停进程 / 更新 / 重启全自动
 - ⚠️ 鸡生蛋：这个新 launcher 本身要随包分发——**同事吃 v0.6.34 这一次仍需手动停一次服务（或重启电脑后点图标）**、从下一版起才是真·一键
 - 取舍：点图标时 agent 正在跑任务会被中断——主动行为、可接受；mac launcher 未同步改（主要用户是自己、需要时再说）
-
-### V0.6.33：「再聊聊」改非模态停靠弹窗（2026-06-11）
-
-背景：Windows 同事反馈——plan tab 点「再聊聊」、模态弹窗遮罩把方案文档整个挡住、写 revise 反馈时没法对照文档「摸瞎写」。所有 action 的再聊聊共用同一个 `revise-dialog.tsx`、一处改全生效。
-
-- **`ui/dialog.tsx` 新增 `DialogDockedContent`**：非模态「角落停靠」变体——无 Backdrop 遮罩、固定视口右下角（`w-[min(28rem,100vw-2rem)]` + max-h 内部滚动）、典型 UI 组件下沉 ui/ 单一来源
-- **`revise-dialog.tsx`**：Root 加 `modal={false}`（不锁滚动 / 不拦点击 / 不 focus trap——弹窗开着可滚动、选中左侧 artifact 文本）+ `disablePointerDismissal`（点外部不关、草稿不丢；Esc / X / 取消仍可关）、Content 换 `DialogDockedContent`
-- ⚠️ base-ui 1.4.1 的 prop 名是 `disablePointerDismissal`、不是新文档里的 `dismissible`（typecheck 踩过）
-- 输入框 / 贴图 / Cmd+Enter / memo 防抖那套全不动；AskUserDialog（AI 选择题）保持模态不动——选项在弹窗内自洽、不需要对照文档
-- **.1 补丁（用户实测指出）**：非模态后弹窗开着「通过」等按钮仍可点、ack 走掉后弹窗悬空指向已结束的 action——task page 把 canAck 提为 useMemo + effect「canAck 一丢自动收弹窗」、任何路径（通过 / 停止 / agent 推进 / 重启）都兜住
 
 ---
 
@@ -338,6 +338,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **plan / build / review / ship / learn action prompt** | `prompts/action-{plan,build,review,ship,learn}.md` |
 | **learn 知识沉淀（V0.6.29、三层架构 + 防臃肿 4 闸 + checkLearn 证据验真）** | `prompts/action-learn.md` + `action-checks.ts: checkLearn` |
 | **绿色包发版链（V0.6.30 win、V0.6.31 加 mac：standalone 组包 + 便携 node + 静默 launcher + tag 自动发版自动更新）** | `scripts/package-release.mjs` + `packaging/{start.bat,launch.vbs,launch.ps1,launch-mac.command}` + `.github/workflows/release.yml` |
+| **Electron 桌面端（V0.7.0：薄壳 + 打包 + win 自动更新；server 布局组包公共函数两条发版链共用）** | `electron-app/main.js` + `electron-builder.yml` + `scripts/assemble-electron-server.mjs` + `scripts/lib/assemble-server.mjs` + `src/lib/server/data-root.ts` |
 | **test stub（设计草稿）** | `prompts/action-test.md` |
 | **chat 模式独立 runner（V0.6.0.1 新）** | `src/lib/server/chat-runner.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |

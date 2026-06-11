@@ -1,0 +1,49 @@
+# fe-ai-flow Electron 打包配置（V0.7.0）
+#
+# 结构说明：壳代码在 electron-app/（独立 package.json、runtime 依赖只有 electron-updater）。
+# 不用单 package.json 结构——主 package.json 的 dependencies 是 next/react 全家桶、
+# electron-builder 会把 production deps 全拖进 asar、包体直接爆炸；server 侧依赖
+# 已经由 Next standalone 自己 trace 好、走 extraResources 进包。
+appId: com.jianger.fe-ai-flow
+productName: fe-ai-flow
+
+directories:
+  app: electron-app
+  output: dist/electron
+
+# electron-updater 没有 native 依赖、跳过 rebuild 省时间
+npmRebuild: false
+
+# 组好的 server 布局（standalone + prompts/skills/scripts、已删 data/ 防隐私泄漏）
+# 放 resources/app-server、不进 asar——server 运行时要 fs 读自己旁边的文件
+extraResources:
+  - from: dist/app-server
+    to: app-server
+
+# 产物名不带空格、GitHub Release asset 名友好
+artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+
+win:
+  target: nsis
+
+nsis:
+  # 一键装到用户目录（%LOCALAPPDATA%\Programs）、免管理员权限
+  oneClick: true
+  perMachine: false
+  deleteAppDataOnUninstall: false
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  # 不签名（内部分发、首次打开需右键 →「打开」过 Gatekeeper）
+  identity: null
+
+# electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
+# releaseType: release——CI 里绿色包 job 先建好正式 release、这里往同 tag release 追加 asset
+publish:
+  provider: github
+  owner: jianger666
+  repo: fe-ai-flow
+  releaseType: release

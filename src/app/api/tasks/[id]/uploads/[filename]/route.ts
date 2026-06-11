@@ -14,6 +14,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { dataRoot } from "@/lib/server/data-root";
 
 interface Ctx {
   params: Promise<{ id: string; filename: string }>;
@@ -48,14 +49,7 @@ export const GET = async (_req: Request, { params }: Ctx) => {
   const mime = EXT_TO_MIME[ext];
   if (!mime) return errorJson("不支持的图片扩展名");
 
-  const absPath = path.join(
-    process.cwd(),
-    "data",
-    "tasks",
-    id,
-    "uploads",
-    filename,
-  );
+  const absPath = path.join(dataRoot(), "tasks", id, "uploads", filename);
   try {
     const buf = await fs.readFile(absPath);
     // 一律以 Uint8Array 形式返回（避免 Node Buffer → Web Response 的类型差异）
