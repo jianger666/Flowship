@@ -54,16 +54,18 @@ export const useMcpOAuth = () => {
   }, [refresh]);
 
   /**
-   * 发起授权：先同步开一个空白窗口（保住用户手势、避免 await 后 open 被浏览器拦截）、
-   * 再请求授权 URL 并把窗口跳过去。DCR 首次注册可能要几秒、空白窗口先显示「准备中」。
+   * 发起授权：
+   * - 浏览器：先同步开一个空白窗口（保住用户手势、避免 await 后 open 被拦截）、
+   *   再请求授权 URL 并把窗口跳过去。DCR 首次注册可能要几秒、空白窗口先显示「准备中」。
+   * - Electron 桌面端：不预开窗、拿到 URL 后 window.open → 壳 setWindowOpenHandler
+   *   拦截转系统默认浏览器（v0.7.4 用户拍板）；授权完切回应用窗口靠 focus 刷新状态
    */
   const authorize = useCallback(
     async (serverName: string) => {
-      const win = window.open(
-        "about:blank",
-        "_blank",
-        "width=540,height=720",
-      );
+      const isElectron = navigator.userAgent.includes("Electron");
+      const win = isElectron
+        ? null
+        : window.open("about:blank", "_blank", "width=540,height=720");
       if (win) {
         win.document.write(
           "<p style='font:14px sans-serif;color:#888;padding:24px'>正在准备授权…</p>",
@@ -79,6 +81,7 @@ export const useMcpOAuth = () => {
           return;
         }
         if (res.authorizationUrl) {
+          // win=null（Electron）时 window.open 被壳 deny + shell.openExternal 接管
           if (win) win.location.href = res.authorizationUrl;
           else window.open(res.authorizationUrl, "_blank");
         } else {

@@ -280,14 +280,11 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  // 浏览器 tab 行为对齐：
-  // - MCP OAuth 弹窗（about:blank 起手再跳授权页）→ 允许开 Electron 子窗、
-  //   保住 window.opener.postMessage 回传链路（callback 页靠它通知主窗刷新）
-  // - 其它 target=_blank 外链（飞书 story / MR / GitHub…）→ 系统默认浏览器
+  // window.open 一律转系统默认浏览器（v0.7.4：含 MCP OAuth 授权页、用户拍板不开应用内子窗）：
+  // - OAuth 授权完成后用户切回应用窗口、页面 focus 事件刷新授权状态（use-mcp-oauth.ts）
+  // - 其它 target=_blank 外链（飞书 story / MR / GitHub…）同样走系统浏览器
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url === "about:blank" || url.startsWith(BASE_URL)) {
-      return { action: "allow" };
-    }
+    if (url.startsWith(BASE_URL)) return { action: "allow" };
     void shell.openExternal(url);
     return { action: "deny" };
   });
