@@ -99,8 +99,12 @@ jobs:
       #    动态拼名加载、构建追踪追不到、整包缺失
       # 在目标平台 runner 上重装对应平台版本（npm 单包安装、不动树里其它东西）
       - run: |
-          SDK_VERSION=$(node -p "require('../../package.json').dependencies['@cursor/sdk']")
+          # 版本读已装包的真实版本（不带 ^、跟 ubuntu 解析结果钉死一致）
+          SDK_VERSION=$(node -p "require('./node_modules/@cursor/sdk/package.json').version")
           SQLITE_VERSION=$(node -p "require('./node_modules/sqlite3/package.json').version")
+          # standalone 的 package.json 是根拷贝、带 overrides 字段、
+          # 跟命令行直装的 sqlite3 撞 npm EOVERRIDE——删掉（运行时不读这些字段）
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.overrides;delete p.pnpm;fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
           npm install --no-save --no-package-lock --omit=dev "@cursor/sdk-${{ matrix.sdk_platform }}@${SDK_VERSION}" "sqlite3@${SQLITE_VERSION}"
           # 实加载验真：错架构的 .node 在这里当场炸、不带病发版
           node -e "require('sqlite3'); console.log('sqlite3 native ok')"
