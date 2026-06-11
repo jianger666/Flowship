@@ -107,6 +107,54 @@ function DialogContent({
   )
 }
 
+// V0.6.33：非模态「角落停靠」内容——「再聊聊」这类**边看文档边写**的输入场景用。
+//
+// 跟 DialogContent 的差异：
+//   - 无 Backdrop 遮罩、不满屏居中——固定在视口右下角、页面主内容完全可见
+//   - 必须配合 Root 上 `modal={false}`（不锁滚动 / 不拦外部点击 / 不 focus trap）+
+//     `disablePointerDismissal`（点外部不关——用户去左侧滚方案 / 选文本不会误关、草稿不丢）用
+//   - Esc / X / 取消按钮仍可关（Esc 是 base-ui Popup 自带、不受 disablePointerDismissal 影响）
+//
+// 超长内容：max-h + 内部滚动（停靠场景没有「mask 滚动」可言）。
+function DialogDockedContent({
+  className,
+  children,
+  showCloseButton = true,
+  ...props
+}: DialogPrimitive.Popup.Props & {
+  showCloseButton?: boolean
+}) {
+  return (
+    <DialogPortal>
+      <DialogPrimitive.Popup
+        data-slot="dialog-docked-content"
+        className={cn(
+          "fixed right-4 bottom-4 z-50 grid max-h-[min(80vh,40rem)] w-[min(28rem,calc(100vw-2rem))] gap-4 overflow-y-auto rounded-xl bg-popover p-4 text-sm text-popover-foreground shadow-2xl ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:slide-in-from-bottom-4 data-closed:animate-out data-closed:fade-out-0 data-closed:slide-out-to-bottom-4 *:min-w-0",
+          className
+        )}
+        {...props}
+      >
+        {children}
+        {showCloseButton && (
+          <DialogPrimitive.Close
+            data-slot="dialog-close"
+            render={
+              <Button
+                variant="ghost"
+                className="absolute top-2 right-2"
+                size="icon-sm"
+              />
+            }
+          >
+            <XIcon />
+            <span className="sr-only">Close</span>
+          </DialogPrimitive.Close>
+        )}
+      </DialogPrimitive.Popup>
+    </DialogPortal>
+  )
+}
+
 function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
@@ -183,6 +231,7 @@ export {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogDockedContent,
   DialogFooter,
   DialogHeader,
   DialogOverlay,

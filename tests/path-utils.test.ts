@@ -8,9 +8,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCursorLink,
+  getEffectiveCwd,
   looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
+  pathBasename,
 } from "@/lib/path-utils";
 
 const BASE = "/Users/me/work";
@@ -85,6 +87,39 @@ describe("buildCursorLink", () => {
       `cursor://file/a/${encodeURIComponent("中 文")}/b.ts:12`,
     );
   });
+
+  // ---- Windows 适配（2026-06-11、同事 Windows 上路径不可跳转）----
+
+  it("Windows 盘符绝对路径 → 反斜杠转正斜杠、盘符 `:` 不 encode、忽略 baseDir", () => {
+    // 实测踩坑 case：artifact 里 `D:\IdeaProjects\...\ScheduleRefuseApi.java` 完全不生成链接
+    expect(
+      buildCursorLink(
+        "D:\\IdeaProjects\\cp-scheduling\\src\\main\\java\\ScheduleRefuseApi.java",
+        BASE,
+      ),
+    ).toBe(
+      "cursor://file/D:/IdeaProjects/cp-scheduling/src/main/java/ScheduleRefuseApi.java",
+    );
+    // 正斜杠盘符形态（agent 也可能这么写）同样命中
+    expect(buildCursorLink("D:/IdeaProjects/foo/Bar.java")).toBe(
+      "cursor://file/D:/IdeaProjects/foo/Bar.java",
+    );
+  });
+
+  it("Windows 绝对路径 + 行号后缀 → 行号正常拆、拼 :line", () => {
+    expect(buildCursorLink("D:\\IdeaProjects\\foo\\Bar.java:120")).toBe(
+      "cursor://file/D:/IdeaProjects/foo/Bar.java:120",
+    );
+    expect(buildCursorLink("D:\\IdeaProjects\\foo\\Bar.java:120-140, 200-210")).toBe(
+      "cursor://file/D:/IdeaProjects/foo/Bar.java:120",
+    );
+  });
+
+  it("反斜杠相对路径 + Windows baseDir → 归一化后拼接", () => {
+    expect(
+      buildCursorLink("src\\main\\Api.java", "D:\\IdeaProjects\\cp-scheduling"),
+    ).toBe("cursor://file/D:/IdeaProjects/cp-scheduling/src/main/Api.java");
+  });
 });
 
 describe("parsePathSegments", () => {
@@ -150,6 +185,52 @@ describe("looksLikePath", () => {
     expect(looksLikePath("src/foo")).toBe(false);
     // 空格在路径部分（不是行号后缀）→ 仍然拒绝
     expect(looksLikePath("const x = foo/bar.map()")).toBe(false);
+  });
+
+  it("Windows 路径命中：盘符绝对 / 反斜杠相对 / 带行号", () => {
+    expect(
+      looksLikePath("D:\\IdeaProjects\\cp-scheduling\\src\\Api.java"),
+    ).toBe(true);
+    expect(looksLikePath("src\\main\\Api.java")).toBe(true);
+    expect(looksLikePath("D:\\IdeaProjects\\foo\\Bar.java:120-140")).toBe(true);
+    // 最后一段无扩展名仍拒绝
+    expect(looksLikePath("D:\\IdeaProjects\\foo")).toBe(false);
+  });
+});
+
+describe("pathBasename", () => {
+  it("POSIX / Windows 路径都取末段、目录尾 slash 剥掉", () => {
+    expect(pathBasename("/a/b/c.ts")).toBe("c.ts");
+    expect(pathBasename("/a/b/")).toBe("b");
+    expect(pathBasename("abc.txt")).toBe("abc.txt");
+    expect(pathBasename("D:\\IdeaProjects\\foo\\Bar.java")).toBe("Bar.java");
+  });
+});
+
+describe("getEffectiveCwd（Windows 多仓）", () => {
+  it("Windows 多仓 → 公共父目录、输出统一正斜杠", () => {
+    // 实测场景：同事 Windows 上 cp-scheduling + tch-studio + wk-flowable 三仓
+    expect(
+      getEffectiveCwd([
+        "D:\\IdeaProjects\\cp-scheduling",
+        "D:\\IdeaProjects\\tch-studio",
+        "D:\\IdeaProjects\\wk-flowable",
+      ]),
+    ).toBe("D:/IdeaProjects");
+  });
+
+  it("Windows 单仓 → 仓库自身、反斜杠归一化", () => {
+    expect(getEffectiveCwd(["D:\\IdeaProjects\\cp-scheduling\\"])).toBe(
+      "D:/IdeaProjects/cp-scheduling",
+    );
+  });
+
+  it("跨盘符 → 空串（无公共目录、调用方 fallback）", () => {
+    expect(getEffectiveCwd(["C:\\work\\a", "D:\\work\\b"])).toBe("");
+  });
+
+  it("POSIX 多仓行为不变", () => {
+    expect(getEffectiveCwd(["/a/b/c", "/a/b/d"])).toBe("/a/b");
   });
 });
 

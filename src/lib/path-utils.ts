@@ -13,9 +13,22 @@
  *   走 task 内 tab 切换、不走 cursor:// 跳转。
  *
  * 注意：前端组件不能用 `node:path` / `node:url`、手写就行、量很小。
+ *
+ * Windows 适配（2026-06-11、用户同事 Windows 上路径不可点击跳转）：
+ * - 业务仓库跑在 Windows 时、agent 写进 artifact 的路径是 `D:\IdeaProjects\...\Api.java`
+ *   反斜杠 + 盘符形态、原实现全套只认 `/`、识别 / 链接 / basename / cwd 计算全部失效。
+ * - 统一策略：**计算前把 `\` 归一化成 `/`**（Node / Cursor 协议在 Windows 都接受正斜杠）、
+ *   盘符绝对路径（`D:/...`）视作绝对路径、cursor 链接拼成 `cursor://file/D:/...`
+ *   （同 VS Code `vscode://file/c:/myfile.txt` 约定、盘符段的 `:` 不 encode）。
  */
 
 import { ACTION_TYPES, type ActionType } from "./types";
+
+/** Windows 盘符绝对路径（`D:\...` / `D:/...`）。归一化前后都能判。 */
+const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
+
+/** 把 Windows 反斜杠分隔符归一化成 `/`（POSIX 路径原样返回） */
+const normalizeSeparators = (p: string): string => p.replace(/\\/g, "/");
 
 /**
  * 取绝对 / 相对路径末尾段
@@ -23,10 +36,11 @@ import { ACTION_TYPES, type ActionType } from "./types";
  * - 自动剥掉尾随 `/`（目录场景：`/foo/bar/` → `bar`）
  * - 没有 `/` 时返回原值（`abc.txt` → `abc.txt`）
  * - 全是 `/` 时返回 `/`（极端边界）
+ * - Windows 路径（`D:\a\b.java`）→ 反斜杠当分隔符、返 `b.java`
  */
 export const pathBasename = (p: string): string => {
   if (!p) return p;
-  const cleaned = p.replace(/\/+$/, "");
+  const cleaned = normalizeSeparators(p).replace(/\/+$/, "");
   if (cleaned.length === 0) return "/";
   const idx = cleaned.lastIndexOf("/");
   return idx >= 0 ? cleaned.slice(idx + 1) || cleaned : cleaned;
@@ -123,8 +137,10 @@ export const looksLikePath = (s: string): boolean => {
   if (!s || s.length > 200) return false;
   const { path } = parsePathWithLine(s);
   if (/\s|"|'|`/.test(path)) return false;
-  if (!path.includes("/")) return false;
-  const lastSeg = path.slice(path.lastIndexOf("/") + 1);
+  // Windows 反斜杠路径（`D:\a\b.java` / `src\foo.ts`）归一化后按同一套规则判
+  const normalized = normalizeSeparators(path);
+  if (!normalized.includes("/")) return false;
+  const lastSeg = normalized.slice(normalized.lastIndexOf("/") + 1);
   return lastSeg.length > 0 && lastSeg.includes(".");
 };
 
@@ -185,15 +201,17 @@ export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
  *
  * - 已经是 url（http:// / cursor:// 等）→ 返 null（不动）
  * - 末尾带 `:line` / `:line-line` 行号后缀 → 拆出来、cursor 协议拼 `:line`（起始行）
- * - 绝对路径（`/` 起手）→ 直接走、忽略 baseDir
+ * - 绝对路径（`/` 起手、或 Windows 盘符 `D:\` / `D:/` 起手）→ 直接走、忽略 baseDir
  * - 相对路径 + 没传 baseDir → 返 null（拼不出绝对路径）
- * - 相对路径 + 有 baseDir → 跟 baseDir 拼绝对路径
+ * - 相对路径 + 有 baseDir → 跟 baseDir 拼绝对路径（baseDir 也可以是 Windows 路径）
  *
  * baseDir 语义（V0.5.9 改名、原叫 repoPath）：单仓 = 仓库路径、多仓 = 公共父目录（cwd）。
  * 多仓时 AI 写的路径首段是仓名（`projA/apps/foo/bar.vue`）、拼到 cwd 后就是绝对路径、跟单仓走同一套逻辑。
  *
  * encode 防中文 / 空格炸：split + map(encodeURIComponent) + join
  * 协议格式：`cursor://file/<encoded-abs-path>[:line]`
+ * Windows：`cursor://file/D:/IdeaProjects/...`（同 VS Code `vscode://file/c:/...` 约定、
+ *   盘符段的 `:` 必须保留不 encode、否则 Cursor 不认）
  *
  * 注意：`:line` 后缀不参与 encodeURIComponent、否则 `:` 会被 encode 成 `%3A`、Cursor 不认。
  */
@@ -204,19 +222,25 @@ export const buildCursorLink = (
   if (!pathLike) return null;
   if (/^[a-z]+:\/\//i.test(pathLike)) return null;
   const { path, line } = parsePathWithLine(pathLike);
-  let absolute = path;
-  if (!path.startsWith("/")) {
+  const normalized = normalizeSeparators(path);
+  let absolute = normalized;
+  if (!normalized.startsWith("/") && !isWindowsAbsPath(normalized)) {
     if (!baseDir) return null;
-    const base = baseDir.replace(/\/+$/, "");
-    absolute = `${base}/${path.replace(/^\.?\/+/, "")}`;
+    const base = normalizeSeparators(baseDir).replace(/\/+$/, "");
+    absolute = `${base}/${normalized.replace(/^\.?\/+/, "")}`;
   }
   const encodedPath = absolute
     .split("/")
-    .map(encodeURIComponent)
+    // 首段是盘符（`D:`）时保留原样、`:` encode 了 Cursor 不认
+    .map((seg, i) =>
+      i === 0 && /^[a-zA-Z]:$/.test(seg) ? seg : encodeURIComponent(seg),
+    )
     .join("/");
+  // POSIX 绝对路径自带前导 `/`、Windows 盘符路径要手动补一个（`cursor://file/D:/...`）
+  const prefix = encodedPath.startsWith("/") ? "" : "/";
   return line !== undefined
-    ? `cursor://file${encodedPath}:${line}`
-    : `cursor://file${encodedPath}`;
+    ? `cursor://file${prefix}${encodedPath}:${line}`
+    : `cursor://file${prefix}${encodedPath}`;
 };
 
 /**
@@ -230,15 +254,18 @@ export const buildCursorLink = (
  *   - `['/a/b/c', '/a/b/d']` → `/a/b`
  *   - `['/a/b', '/a/b/c']` → `/a/b`
  *   - `['/a/x', '/b/y']` → `/`（极端、跨 home 的 case、宽松不报错）
+ *   - `['D:\\a\\x', 'D:\\a\\y']` → `D:/a`（Windows、输出统一正斜杠）
+ *   - `['C:\\x', 'D:\\y']` → `""`（跨盘符无公共目录、调用方 fallback）
  *
- * 注意：返值不带尾 slash（除非就是根目录 `/`）。
+ * 注意：返值不带尾 slash（除非就是根目录 `/`、或裸盘符 `D:/`）。
  */
 const getCommonParentDir = (paths: string[]): string => {
   if (paths.length === 0) return "";
-  if (paths.length === 1) return paths[0].replace(/\/+$/, "");
-  const segArrays = paths.map((p) =>
-    p.replace(/\/+$/, "").split("/"),
+  const norm = paths.map((p) =>
+    normalizeSeparators(p).replace(/\/+$/, ""),
   );
+  if (norm.length === 1) return norm[0];
+  const segArrays = norm.map((p) => p.split("/"));
   const minLen = Math.min(...segArrays.map((arr) => arr.length));
   const common: string[] = [];
   for (let i = 0; i < minLen; i++) {
@@ -252,6 +279,10 @@ const getCommonParentDir = (paths: string[]): string => {
   // 形如 ['', 'a', 'b'] → '/a/b'；['', ''] → '/'；[] → ''
   if (common.length === 0) return "";
   if (common.length === 1 && common[0] === "") return "/";
+  // Windows 极端：只剩裸盘符（['D:']）→ 补 `/`、`D:` 是盘相对路径语义、当 cwd 会出错
+  if (common.length === 1 && /^[a-zA-Z]:$/.test(common[0])) {
+    return `${common[0]}/`;
+  }
   return common.join("/");
 };
 
@@ -269,7 +300,11 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
   if (repoPaths.length === 0) {
     return typeof process !== "undefined" ? process.cwd() : "";
   }
-  if (repoPaths.length === 1) return repoPaths[0].replace(/\/+$/, "");
+  // Windows 路径归一化成正斜杠（Node spawn cwd / prompt 展示都接受、且下游
+  // getRepoShortNames / buildCursorLink 的字符串比对全按 `/` 走、必须统一）
+  if (repoPaths.length === 1) {
+    return normalizeSeparators(repoPaths[0]).replace(/\/+$/, "");
+  }
   return getCommonParentDir(repoPaths);
 };
 
@@ -287,9 +322,9 @@ const getRepoShortNames = (
   repoPaths: string[],
   cwd: string,
 ): string[] => {
-  const base = cwd.replace(/\/+$/, "");
+  const base = normalizeSeparators(cwd).replace(/\/+$/, "");
   return repoPaths.map((p) => {
-    const clean = p.replace(/\/+$/, "");
+    const clean = normalizeSeparators(p).replace(/\/+$/, "");
     if (clean === base) return ".";
     if (clean.startsWith(`${base}/`)) return clean.slice(base.length + 1);
     // 极端：repoPath 不在 cwd 之下（跨父目录场景）、直接给绝对路径、让 AI 自己适配

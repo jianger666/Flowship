@@ -13,6 +13,12 @@
  *   - phaseLabel → actionLabel（action 模型）
  *   - submit 后父组件调用 submitActionAck("revise", feedback, ...)
  *   - ChatReplyImage → ImagePayload
+ *
+ * V0.6.33 变更（Windows 同事实测反馈）：模态弹窗 + 遮罩把方案文档整个挡住、
+ * 用户写 revise 反馈时没法对照文档「摸瞎写」。改成**非模态右下角停靠**：
+ *   - `modal={false}`：不锁滚动 / 不拦点击——弹窗开着可以滚动、选中左侧 artifact 文本
+ *   - `disablePointerDismissal`：点外部不关、草稿不丢；Esc / X / 取消仍可关
+ *   - `DialogDockedContent`：无遮罩、固定 bottom-right（见 ui/dialog.tsx）
  */
 
 import { memo, useEffect, useState } from "react";
@@ -22,7 +28,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
-  DialogContent,
+  DialogDockedContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -105,8 +111,13 @@ const ReviseDialogImpl = ({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      modal={false}
+      disablePointerDismissal
+    >
+      <DialogDockedContent>
         <DialogHeader>
           <DialogTitle>跟 AI 再聊聊 · {actionLabel}</DialogTitle>
         </DialogHeader>
@@ -197,7 +208,7 @@ const ReviseDialogImpl = ({
             发给 AI
           </Button>
         </DialogFooter>
-      </DialogContent>
+      </DialogDockedContent>
     </Dialog>
   );
 };

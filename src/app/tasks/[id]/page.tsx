@@ -210,6 +210,24 @@ const TaskDetailPage = () => {
     return task.actions.find((a) => a.id === task.currentActionId) ?? null;
   }, [task]);
 
+  // ack 按钮可用态：current action 处于 awaiting_ack 且 runStatus = awaiting_user
+  // （hooks 必须在早返回前、所以在这里 useMemo 算、下方渲染区直接用）
+  const canAck = useMemo(
+    () =>
+      !!task &&
+      !!currentAction &&
+      currentAction.status === "awaiting_ack" &&
+      task.runStatus === "awaiting_user",
+    [task, currentAction],
+  );
+
+  // V0.6.33.1：「再聊聊」改非模态后、弹窗开着页面其它按钮（通过 / 停止等）仍可点——
+  // 任何路径丢掉 ack 态（通过 / 停止 / agent 推进 / 重启）都自动收掉弹窗、
+  // 防止把 revise 草稿提交到已经不在等 ack 的 action 上（服务端会拒、UI 也错乱）
+  useEffect(() => {
+    if (!canAck) setReviseOpen(false);
+  }, [canAck]);
+
   // V0.5.10：Resizable 分栏初始 size
   const artifactSizePercent = useMemo(() => {
     const v = task?.uiLayout?.artifactPanelSize;
@@ -274,11 +292,7 @@ const TaskDetailPage = () => {
   }
 
   // ---- 按钮渲染条件 ----
-  // ack 按钮：current action 处于 awaiting_ack 且 runStatus = awaiting_user
-  const canAck =
-    !!currentAction &&
-    currentAction.status === "awaiting_ack" &&
-    task.runStatus === "awaiting_user";
+  // canAck 在上方 hooks 区 useMemo 算好（auto-close effect 也要用）
 
   // 上方 Cmd/Ctrl+J 快捷键用：能否打开「再聊聊」= 跟「再聊聊」按钮同条件（canAck 且没在提交 / 没开）
   canOpenReviseRef.current = canAck && !ackSubmitting && !reviseOpen;

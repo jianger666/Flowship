@@ -15,6 +15,34 @@
 
 ---
 
+### V0.6.31：revise 跳处理自动纠正 + mac 绿色包（2026-06-10）
+
+**A. 「未处理 revise」服务端自动纠正（用户实测踩坑、harness 硬化）**：
+
+- 实测事故：用户对 review #23 点「再聊聊」问了个问题、agent 收到 [ACTION_ACK revise] 后**什么都不干**（没答疑没弹窗）、直接重调 wait_for_user 且不带 action_id → 服务端入待命态、pendingAck 被清、UI 只剩「推进」、用户没法再对该 action 说话。prompt 协议写了「处理完带同一 action_id 重新等」、但纯软约束、模型这次没遵守
+- 修法（chat-mcp、GLOBAL_KEY bump V10）：`unansweredRevises` Map（taskId → {actionId, artifactPath}）——revise ack 时置位；agent 重调 wait_for_user **不带 action_id 且标记在** → 服务端**强制按原 action 注册 ack 态**（UI 的 通过/再聊聊 不丢、用户可继续追问）+ 引导文本头部加「🚨 协议违规已被纠正」段责令先补处理（问类 emit 答疑 / 改类弹窗）再跑 shell
+- 标记清除：带 action_id 重新等（正轨闭环）/ approve / 用户推进新 action（submitNextAction）/ cancelPending（取消、重启 action）。内存态、服务重启丢——重启本来就断 run、合理取舍
+- 配套 prompt 收紧：_super.md / action-{plan,build,review}.md 的「处理完再调一次 wait_for_user」补「**必须带同一 action_id**、不带 = 服务端判协议违规自动纠正」
+- 状态一致性由服务端兑付：agent 听不听劝只影响答复质量、UI 不再被带坏
+
+**B. mac 绿色包（darwin-arm64 / darwin-x64）**：
+
+- `package-release.mjs` 加平台位置参数、CI 一次出 3 包；darwin 便携 node 从官方 tar.gz 只抽 `bin/node`、zip `-y` 保留可执行权限
+- `packaging/launch-mac.command`：双击即跑、逻辑同 win 版（已跑直开 / releases 自动更新 rsync 覆盖留 data / nohup 起 server / 等端口开浏览器 / 桌面软链快捷方式）；启动时 `xattr -rd com.apple.quarantine` 自解包内 node 的 Gatekeeper 标记、**首次需右键 →「打开」过门**（README 已写）；更新下载按 `uname -m` 选对应架构 asset
+- mac 实机验证：解 zip → launcher 语法 ✓ → 便携 node 起 standalone server（首页 / API 200）✓
+
+### V0.6.30：Windows 绿色包发版链——零 node 环境同事解压即用（2026-06-10）
+
+背景：后端同事机器没 node / pnpm、源码跑门槛太高。方案 = 绿色 zip（standalone + 便携 node + 静默 launcher）+ GitHub Release 自动发版自动更新。用户拍板不做 Docker（本地优先架构：agent 改本地仓 / cursor:// 跳本地 IDE / hooks 注绝对路径、容器全断）。
+
+- **standalone 构建**：next.config 按 `BUILD_STANDALONE=1` 开 `output: "standalone"`（日常 dev / `pnpm serve` 的 next start 不受影响、env 隔离）；`outputFileTracingRoot` 固定项目根——home 下有杂散 lockfile 时 Next 把 workspace root 推断到 `~`、standalone 产物嵌套整段 `Documents/my/...` 路径（实测踩到）
+- **组包脚本 `scripts/package-release.mjs`**：standalone 平铺为包根（server.js 启动自带 `process.chdir(__dirname)`、prompts / scripts / data 等 `process.cwd()` 路径全命中）+ 显式拷 prompts / skills / hook 脚本 + 便携 node（latest v22.x、只抽 node.exe 一个文件）+ launcher + VERSION。**隐私剔除**：file tracing 会把本机 `data/`（任务数据 + mcp-oauth 凭证）拖进 standalone、组包无条件删
+- **launcher（`packaging/`）**：`start.bat` → `launch.vbs`（wscript 零闪窗）→ `launch.ps1` 四步：已跑则直开浏览器；启动前查 GitHub releases/latest、有新版下载 robocopy 覆盖（`data/` `logs/` 排除保留、网络失败 fail-open 不挡启动）；起包内 node 跑 server（隐藏窗、日志落 `logs/`）；等端口 → 开浏览器 + 首次自动建桌面快捷方式。⚠️ ps1 / vbs / bat 故意纯 ASCII 注释——Windows PowerShell 5.1 对无 BOM UTF-8 中文会乱码、可能破坏解析
+- **hook 注入 node 改 `process.execPath`**（stop-hook-inject）：绿色包机器 PATH 可能没 node、裸 `node` 命令两道闸必挂；execPath 正好指向包内便携 node.exe、源码跑 = 系统 node、行为不变
+- **CI 发版 `.github/workflows/release.yml`**：push `v*` tag → build + 组包 + 传 GitHub Release（仓库 public、匿名可下）。发版 = 打 tag 一步、同事侧 launcher 下次启动自动更新
+
+验证：mac 本地 standalone 组包后实际起包（首页 / API / 静态资源 200、data/ 运行时自建）✓；typecheck / lint / 55 测试 ✓。⚠️ Windows 实机（bat / vbs / ps1 / 快捷方式 / 自动更新）待同事验。
+
 ### V0.6.29：learn action 实装——三层知识架构 + 防臃肿铁律（2026-06-10）
 
 learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution / OpenSpec living docs / superpowers skills 理念）：
