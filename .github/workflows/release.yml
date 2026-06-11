@@ -68,8 +68,10 @@ jobs:
         include:
           - os: windows-latest
             args: --win
+            sdk_platform: win32-x64
           - os: macos-latest
             args: --mac
+            sdk_platform: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +92,21 @@ jobs:
 
       - run: mkdir -p dist && tar -xzf app-server.tar.gz -C dist
         shell: bash
+
+      # 修平台依赖（v0.7.6）：server 布局是 ubuntu 组的——
+      # 1. sqlite3 的 .node 是 linux 二进制、win/mac 上加载直接炸（ERR_DLOPEN_FAILED）
+      # 2. SDK 平台工具包（@cursor/sdk-<platform>、含 ripgrep / 沙箱 helper）是运行时
+      #    动态拼名加载、构建追踪追不到、整包缺失
+      # 在目标平台 runner 上重装对应平台版本（npm 单包安装、不动树里其它东西）
+      - run: |
+          SDK_VERSION=$(node -p "require('../../package.json').dependencies['@cursor/sdk']")
+          SQLITE_VERSION=$(node -p "require('./node_modules/sqlite3/package.json').version")
+          npm install --no-save --no-package-lock --omit=dev "@cursor/sdk-${{ matrix.sdk_platform }}@${SDK_VERSION}" "sqlite3@${SQLITE_VERSION}"
+          # 实加载验真：错架构的 .node 在这里当场炸、不带病发版
+          node -e "require('sqlite3'); console.log('sqlite3 native ok')"
+          node -p "require('@cursor/sdk-${{ matrix.sdk_platform }}/package.json').version + ' platform pkg ok'"
+        shell: bash
+        working-directory: dist/app-server
 
       # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar。
       # 必须用 pnpm（跟根项目一致）：electron-builder 按根 lockfile 判定 pm=pnpm、
