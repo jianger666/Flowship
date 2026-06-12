@@ -40,16 +40,27 @@ const isIconToken = (s?: string) => !s || /:icon-/.test(s);
 const renderParamLabel = (p: ModelParameter): string =>
   isIconToken(p.displayName) ? p.id : (p.displayName as string);
 
-const renderParamValue = (v: {
-  value: string;
-  displayName?: string;
-}): string => {
-  if (isIconToken(v.displayName)) {
-    if (v.value === "true") return "开";
-    if (v.value === "false") return "关";
-    return v.value;
+const renderParamValue = (
+  p: ModelParameter,
+  v: {
+    value: string;
+    displayName?: string;
+  },
+): string => {
+  const base = isIconToken(v.displayName)
+    ? v.value === "true"
+      ? "开"
+      : v.value === "false"
+        ? "关"
+        : v.value
+    : (v.displayName as string);
+  // MAX mode 警示（V0.7.14、用户是次数计费）：context 选 1m = Cursor MAX mode、
+  // 整个 run 按 token 折算请求数（agentic 任务能烧几千次）；300k 以下 = 固定 1 次。
+  // 官方文档：1M context requires Max Mode、request-based plan 下 MAX 走 token 计费
+  if (p.id.toLowerCase() === "context" && /^1m$/i.test(v.value)) {
+    return `${base}（MAX、按量计费）`;
   }
-  return v.displayName as string;
+  return base;
 };
 
 // 选 base 模型时给个合理的初始 params：优先取 variants 里 isDefault 那个的 params
@@ -159,7 +170,7 @@ export const ModelPicker = ({
                   <SelectContent>
                     {p.values.map((v) => (
                       <SelectItem key={v.value} value={v.value}>
-                        {renderParamValue(v)}
+                        {renderParamValue(p, v)}
                       </SelectItem>
                     ))}
                   </SelectContent>
