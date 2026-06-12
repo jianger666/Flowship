@@ -152,3 +152,27 @@
     color: oklch(0.78 0.02 240); /* 标点用浅灰、降低视觉噪音 */
   }
 }
+
+/* ---------- 全局滚动条（V0.7.13、用户实测「默认滚动条在 dark 下格格不入」） ----------
+   薄轨 + 半透明拇指、hover 提亮；Firefox 走 scrollbar-width/color 等价配置 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(0.4 0.01 240 / 0.5) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: oklch(0.4 0.01 240 / 0.45);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.5 0.01 240 / 0.65);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

@@ -11,6 +11,12 @@ interface RequestBody {
 // SDK 卡死时不能让 route 一直挂着、超过这个就当失败处理
 const SDK_TIMEOUT_MS = 15_000;
 
+// server 内存缓存（V0.7.13）：SDK models.list 实测 5-15s、各入口（设置 / 新建任务 /
+// 切模型）反复拉很折磨——按 apiKey 缓存 10 分钟、命中毫秒级返回。
+// 配合客户端 localStorage SWR（use-models.ts）、后台刷新也基本秒回
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const modelsCache = new Map<string, { models: ModelOption[]; ts: number }>();
+
 // SDK 返回的 ModelListItem schema 比较杂、只挑前端实际要用的字段透传
 // 这样 SDK 升级加新字段不会立刻影响到前端 type / 攻击面也小
 const pickModelFields = (
@@ -67,6 +73,12 @@ export const POST = async (req: Request) => {
     return NextResponse.json({ error: "缺少 apiKey" }, { status: 400 });
   }
 
+  // 命中且未过期：直接返回（不打 SDK）
+  const hit = modelsCache.get(apiKey);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
+    return NextResponse.json({ models: hit.models });
+  }
+
   try {
     const models = await withTimeout(
       Cursor.models.list({ apiKey }),
@@ -79,6 +91,7 @@ export const POST = async (req: Request) => {
       .sort((a, b) =>
         a.displayName.localeCompare(b.displayName, "en", { sensitivity: "base" })
       );
+    modelsCache.set(apiKey, { models: options, ts: Date.now() });
     return NextResponse.json({ models: options });
   } catch (err) {
     // SDK 经常抛 Error("Error")、message 没信息量、所以连 stack 一起打到 server log

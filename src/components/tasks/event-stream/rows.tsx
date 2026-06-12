@@ -25,6 +25,7 @@ import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 import { MarkdownLink } from "@/components/markdown-link";
 import { buildCursorLink, pathBasename } from "@/lib/path-utils";
+import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
 import type { ActionType, Task, TaskEvent } from "@/lib/types";
 
@@ -70,7 +71,8 @@ export const MarkdownText = ({ text }: { text: string }) => (
     )}
   >
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      // keepTrailingUnderscore：裸链接尾部 _ 被 GFM 剥掉的修正（V0.7.13、用户实测 404）
+      remarkPlugins={[remarkGfm, remarkKeepTrailingUnderscore]}
       components={{
         // 链接统一新窗口 / 系统浏览器打开、相对路径降级纯文本（V0.7.7）
         a: MarkdownLink,

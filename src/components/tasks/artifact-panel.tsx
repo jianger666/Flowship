@@ -47,6 +47,7 @@ import {
   parsePathSegments,
   type ActionArtifactRef,
 } from "@/lib/path-utils";
+import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { ACTION_LABEL, ACTION_LABEL_EN } from "@/lib/task-display";
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import type { ActionRecord, ActionType, ArtifactRevision } from "@/lib/types";
@@ -527,7 +528,7 @@ export const ArtifactPanel = ({
               )}
             <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
+                remarkPlugins={[remarkGfm, remarkKeepTrailingUnderscore]}
                 components={markdownComponents}
               >
                 {currentArtifact.content}

@@ -34,9 +34,9 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
-import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import { useImageAttach } from "@/hooks/use-image-attach";
-import { getEffectiveCwd, pathBasename } from "@/lib/path-utils";
+import { pickNativePaths } from "@/lib/native-picker";
+import { pathBasename } from "@/lib/path-utils";
 import type { ImagePayload } from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
@@ -119,8 +119,8 @@ const EventStreamImpl = ({
   const isChat = variant === "chat";
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
-  // 文件 / 目录路径选择器开关（点「附文件」按钮触发）
-  const [pathPickerOpen, setPathPickerOpen] = useState(false);
+  // 原生 picker 调用中（防双击连开系统对话框）
+  const [picking, setPicking] = useState(false);
   // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
@@ -207,6 +207,21 @@ const EventStreamImpl = ({
       }
       return merged;
     });
+  };
+
+  // 原生 picker（V0.7.13）：附文件 / 附目录各自一键、server 同机弹系统对话框
+  const pickPaths = async (mode: "file" | "folder") => {
+    setPicking(true);
+    try {
+      const paths = await pickNativePaths({
+        mode,
+        multiple: true,
+        prompt: mode === "folder" ? "附加目录（agent 用 read 工具看）" : "附加文件（agent 用 read 工具看）",
+      });
+      if (paths) handlePathsPicked(paths);
+    } finally {
+      setPicking(false);
+    }
   };
 
   const handleRemovePath = (p: string) => {
@@ -403,10 +418,21 @@ const EventStreamImpl = ({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={!isAwaitingUser}
-                  onClick={() => setPathPickerOpen(true)}
+                  disabled={!isAwaitingUser || picking}
+                  onClick={() => void pickPaths("file")}
                   className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                  title="附文件 / 目录路径（agent 会用 `read` 工具看）"
+                  title="附文件（agent 会用 `read` 工具看）"
+                >
+                  <FileIcon className="size-3.5" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={!isAwaitingUser || picking}
+                  onClick={() => void pickPaths("folder")}
+                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                  title="附目录（agent 会用 `read` 工具看）"
                 >
                   <FolderOpen className="size-3.5" />
                 </Button>
@@ -571,13 +597,25 @@ const EventStreamImpl = ({
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!isAwaitingUser}
-              onClick={() => setPathPickerOpen(true)}
+              disabled={!isAwaitingUser || picking}
+              onClick={() => void pickPaths("file")}
               className="h-7 gap-1 px-2 text-xs"
-              title="附文件 / 目录路径（agent 会用 `read` 工具看）"
+              title="附文件（agent 会用 `read` 工具看）"
+            >
+              <FileIcon className="size-3.5" />
+              附文件
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={!isAwaitingUser || picking}
+              onClick={() => void pickPaths("folder")}
+              className="h-7 gap-1 px-2 text-xs"
+              title="附目录（agent 会用 `read` 工具看）"
             >
               <FolderOpen className="size-3.5" />
-              附文件
+              附目录
             </Button>
             <Button
               size="sm"
@@ -594,20 +632,6 @@ const EventStreamImpl = ({
         </div>
       </div>
         </>
-      )}
-      {/* 文件 / 目录选择对话框（log / chat 两形态共用）：mode=any、多选、
-          agent 拿到这些路径后自己用 `read` 工具读 */}
-      {!hideReplyComposer && (
-        <FsPickerDialog
-          open={pathPickerOpen}
-          onOpenChange={setPathPickerOpen}
-          mode="any"
-          multiple
-          title="附加文件 / 目录"
-          description="选完点确认、绝对路径会跟你的消息一起发给 agent、由它用 `read` 工具自己读"
-          initialPath={getEffectiveCwd(task.repoPaths)}
-          onConfirm={handlePathsPicked}
-        />
       )}
     </div>
   );

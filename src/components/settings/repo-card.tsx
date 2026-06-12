@@ -3,8 +3,8 @@
 /**
  * 仓库列表卡片
  *
- * 选目录走 FsPickerDialog（服务端文件浏览器、跨平台、能拿绝对路径）。
- * 之前用 macOS osascript 限制了 Linux / Windows 同事用、已下线（保留路由文件做归档参考）。
+ * 选目录走系统原生 picker（V0.7.13 用户拍板、/api/fs/pick-native：mac osascript /
+ * win powershell、server 同机弹窗）；网页版自绘文件浏览器 FsPickerDialog 已删。
  *
  * 仓库名规则：
  * - 默认取目录 basename
@@ -18,7 +18,6 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
-import { FsPickerDialog } from "@/components/ui/fs-picker-dialog";
 import {
   Card,
   CardContent,
@@ -28,6 +27,7 @@ import {
 } from "@/components/ui/card";
 import { RepoCheckCommands } from "@/components/settings/repo-check-commands";
 import { useDialog } from "@/hooks/use-dialog";
+import { pickNativePaths } from "@/lib/native-picker";
 import { pathBasename } from "@/lib/path-utils";
 
 import type { CheckCommand, RepoConfig } from "@/lib/types";
@@ -42,18 +42,33 @@ interface RepoCardProps {
 export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   const { prompt } = useDialog();
 
-  // FsPickerDialog 的打开状态
-  const [pickerOpen, setPickerOpen] = useState(false);
+  // 原生 picker 调用中（防双击连开两个系统对话框）
+  const [picking, setPicking] = useState(false);
 
-  // 添加一条仓库（路径已确定的情况）、name 默认 basename、重复路径直接拒绝
-  const addRepo = (path: string) => {
-    if (!path) return;
-    if (repos.some((r) => r.path === path)) {
-      toast.error("这个目录已经在列表里");
+  // 添加若干仓库、name 默认 basename、重复路径跳过
+  const addRepos = (paths: string[]) => {
+    const fresh = paths.filter((p) => p && !repos.some((r) => r.path === p));
+    if (fresh.length === 0) {
+      toast.error("选的目录已经在列表里");
       return;
     }
     // 增删是离散操作、直接落盘
-    onCommit([...repos, { name: pathBasename(path), path }]);
+    onCommit([...repos, ...fresh.map((p) => ({ name: pathBasename(p), path: p }))]);
+  };
+
+  // 原生选目录（mac 支持多选、win 单选）
+  const pickFolders = async () => {
+    setPicking(true);
+    try {
+      const paths = await pickNativePaths({
+        mode: "folder",
+        multiple: true,
+        prompt: "选择仓库目录",
+      });
+      if (paths) addRepos(paths);
+    } finally {
+      setPicking(false);
+    }
   };
 
   // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
@@ -72,7 +87,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       },
     });
     if (input === null) return;
-    addRepo(input.replace(/\/+$/, ""));
+    addRepos([input.replace(/\/+$/, "")]);
   };
 
   // 仓库重命名：输入时改草稿、blur 落盘（空串 fallback 回 basename）
@@ -224,7 +239,8 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
           <Button
             type="button"
             variant="outline"
-            onClick={() => setPickerOpen(true)}
+            disabled={picking}
+            onClick={pickFolders}
           >
             <FolderOpen />
             选择文件夹
@@ -239,19 +255,6 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
           </Button>
         </div>
       </CardContent>
-
-      {/* 文件夹选择器：仅目录、单选 */}
-      <FsPickerDialog
-        open={pickerOpen}
-        onOpenChange={setPickerOpen}
-        mode="dir"
-        title="选择仓库目录"
-        description="选一个目录作为仓库根、agent 启动时会以此为 cwd"
-        onConfirm={(paths) => {
-          const p = paths[0];
-          if (p) addRepo(p);
-        }}
-      />
     </Card>
   );
 };
