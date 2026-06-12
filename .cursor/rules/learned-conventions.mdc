@@ -14,6 +14,7 @@ alwaysApply: true
   - 测完杀的是「AI工作流test」进程、用户一看名字也不会误删正式应用
 - 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`、收尾 osascript 关「AI工作流test」窗口。
 - 盲写直接发版（不本地验证）也不可取——能 test 实例验的就验一轮再 tag。
+- **测完即删**（用户拍板）：验证完 `rm -rf dist/electron` + `~/Library/Application Support/fe-ai-flow-test`、不留 test 包和测试数据残留。
 
 ## UI 组件库
 
