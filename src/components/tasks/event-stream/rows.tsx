@@ -24,10 +24,16 @@ import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
 import { MarkdownLink } from "@/components/markdown-link";
-import { buildCursorLink, pathBasename } from "@/lib/path-utils";
+import { buildIdeLink, pathBasename } from "@/lib/path-utils";
+import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
-import type { ActionType, Task, TaskEvent } from "@/lib/types";
+import {
+  JUMP_IDE_LABEL,
+  type ActionType,
+  type Task,
+  type TaskEvent,
+} from "@/lib/types";
 
 import {
   DEFAULT_EXPANDED_KINDS,
@@ -151,6 +157,8 @@ const EventRowImpl = ({
     ? task.actions.find((a) => a.id === ev.actionId)
     : undefined;
   const actionType: ActionType | undefined = action?.type;
+  // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
+  const jumpIde = useJumpIde();
   const isUser = ev.kind === "user_reply";
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
@@ -241,9 +249,9 @@ const EventRowImpl = ({
               {attachments.map((att) => (
                 <a
                   key={att.absPath}
-                  href={buildCursorLink(att.absPath) ?? ""}
+                  href={buildIdeLink(att.absPath, undefined, jumpIde) ?? ""}
                   className="flex max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
-                  title={`${att.absPath}\n点击在 Cursor 中打开`}
+                  title={`${att.absPath}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
                   {att.isDir ? (
                     <Folder className="size-3 shrink-0 text-amber-500" />
@@ -426,15 +434,15 @@ const EventRowImpl = ({
                       ? `${(att.bytes / 1024).toFixed(1)} KB`
                       : `${(att.bytes / 1024 / 1024).toFixed(1)} MB`
                   : "";
-              // att.absPath 一定是绝对路径（FsPickerDialog 选出来的）、
-              // buildCursorLink 在绝对路径下永远不会返 null；?? "" 兜底纯为满足 href 类型
-              const href = buildCursorLink(att.absPath) ?? "";
+              // att.absPath 一定是绝对路径（原生 picker 选出来的）、
+              // buildIdeLink 在绝对路径下永远不会返 null；?? "" 兜底纯为满足 href 类型
+              const href = buildIdeLink(att.absPath, undefined, jumpIde) ?? "";
               return (
                 <a
                   key={att.absPath}
                   href={href}
                   className="flex max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs no-underline hover:bg-muted"
-                  title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 Cursor 中打开`}
+                  title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
                   {att.isDir ? (
                     <Folder className="size-3 shrink-0 text-amber-500" />

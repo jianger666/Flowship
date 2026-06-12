@@ -15,6 +15,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   defaultModel: { id: "" },
   repos: [],
   username: "",
+  jumpIde: "cursor",
   gitHost: "",
   gitToken: "",
   branchTemplate: DEFAULT_BRANCH_TEMPLATE,
@@ -53,6 +54,8 @@ export const getSettings = (): FeAiFlowSettings => {
       repos: Array.isArray(parsed.repos) ? parsed.repos : [],
       // V0.6 加：username 串行存档可能丢、强转 string 兜底
       username: typeof parsed.username === "string" ? parsed.username : "",
+      // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
+      jumpIde: parsed.jumpIde === "idea" ? "idea" : "cursor",
       // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
       gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
       gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",

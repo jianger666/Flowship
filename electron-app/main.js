@@ -14,7 +14,7 @@
  * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
  *   更新 / 卸载重装都不丢
  */
-import { app, BrowserWindow, dialog, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promises as fs, mkdirSync, createWriteStream, readdirSync } from "node:fs";
 import net from "node:net";
@@ -40,6 +40,13 @@ app.setPath(
   "userData",
   path.join(app.getPath("appData"), IS_TEST ? "fe-ai-flow-test" : "fe-ai-flow"),
 );
+
+// 不碰 mac 钥匙串（v0.7.14、用户同事实测痛点「一直弹钥匙串密码框」）：
+// Chromium 启动时要拿 Safe Storage 加密 key（加密 cookies / localStorage 用）、
+// ad-hoc 签名每个版本 cdhash 都变、钥匙串把每个新版当陌生 app → 每次装新版都弹
+// 「想要使用钥匙串中的机密信息」。本应用是本机工具、页面数据本来就明文落 userData、
+// 磁盘加密无意义——用 mock keychain 彻底绕开（Chromium 标准开关、内部工具常规做法）。
+app.commandLine.appendSwitch("use-mock-keychain");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -320,6 +327,11 @@ const createWindow = async () => {
     autoHideMenuBar: true,
     // 接近应用 dark 背景、加载期不白闪
     backgroundColor: "#0a0a0a",
+    webPreferences: {
+      // 原生文件选择器 IPC 通道（v0.7.14）——页面附文件 / 附目录走主进程
+      // dialog.showOpenDialog、秒弹 + 自动聚焦、替代 osascript ~1s 冷启动
+      preload: path.join(__dirname, "preload.cjs"),
+    },
   });
   if (st?.maximized) mainWindow.maximize();
   mainWindow.once("ready-to-show", () => mainWindow?.show());
@@ -361,6 +373,26 @@ const createWindow = async () => {
 
   await mainWindow.loadURL(LOADING_URL);
 };
+
+// ---------- 原生文件选择器 IPC（v0.7.14） ----------
+//
+// 页面（preload 暴露的 window.__nativePicker.pick）→ 这里 → dialog.showOpenDialog。
+// 大方针（用户拍板）：桌面端文件 / 目录选择全部走原生、不再绕 HTTP + osascript
+// （那条链路保留给浏览器 dev 场景兜底、见 src/lib/native-picker.ts）。
+ipcMain.handle("native-pick", async (_e, opts) => {
+  const mode = opts?.mode === "folder" ? "folder" : "file";
+  const multiple = opts?.multiple === true;
+  const properties = [
+    mode === "folder" ? "openDirectory" : "openFile",
+    ...(multiple ? ["multiSelections"] : []),
+  ];
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    title: typeof opts?.prompt === "string" ? opts.prompt.slice(0, 100) : undefined,
+    properties,
+  });
+  if (canceled || filePaths.length === 0) return { canceled: true };
+  return { paths: filePaths };
+});
 
 // ---------- 自动更新（win 全自动装、mac 提醒去下载页） ----------
 

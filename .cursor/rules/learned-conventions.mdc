@@ -162,6 +162,12 @@ alwaysApply: true
 - **被 challenge 后第一反应是回头核实、不是辩解**——用户质疑某条结论时、先读真实代码 / 数据验证、错了就明确更正 + 降级优先级。
 - **方法论（蓝军 + RCA）**：读真实代码确认行号逻辑 → 主动证伪「这是 bug」→ 攻不破才是真 bug → 标注触发条件 + 概率。
 
+## 飞书项目官方 MCP：远程服务、行为会无预警变更（2026-06-12 踩过）
+
+- `project.feishu.cn/mcp_server/v1` 是官方远程服务、无版本锁定——**同样参数 06-09 成功、06-12 报错**（add_comment mention 从 lark_user_id 体系切到 user_key 体系、报 `userKey cross tenant`）是真实发生过的。遇到「之前 OK 的飞书项目 MCP 调用突然挂」、先对照历史成功调用的参数（task events.jsonl 里有完整记录）、参数没变 = 服务端变了、做对照实验确诊、别先怀疑自己代码。
+- **@ 通知实验不要拿自己当被 @ 对象**——飞书项目全系「降噪不通知操作人自己」（官方 FAQ 明文）、MCP 走你本人 OAuth、@ 自己永远收不到通知、实验结果无效。要找第二个人验证送达。
+- 两套 id 体系别混：`user_key`（飞书项目体系、role_members 的 member.key、search_user_info 的 user_key 字段）vs `lark_user_id`（飞书 IM 体系）、都是 19 位纯数字、肉眼分不出来、写 artifact / 存字段时必须标清是哪种。
+
 ## MCP 工具 schema 的 describe 要和 prompt 指令一致（V0.6.1 踩过）
 
 - **工具 `inputSchema` 的 `.describe()` 是 agent 会读的「第二指令源」**——跟 prompt 冲突会把 agent 带偏。典型反例：`submit_mr` 的 `target_branch` describe 写「探 `origin/HEAD` 拿 master」、但 `action-ship.md` 写「写死 `test`」、两个矛盾指令可能让 agent 提 MR 到错误分支。

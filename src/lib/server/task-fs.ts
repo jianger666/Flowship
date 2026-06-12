@@ -277,8 +277,9 @@ interface TaskMetaV06 {
   gitBranches?: GitBranchInfo[];
   /**
    * V0.6.1：飞书测试人员记忆（A+C 兜底后落库、同 task 后续 ship 直接复用）
+   * 2026-06-12 起存 user_key（原 lark_user_id 体系被官方 MCP 封死、详见 types.ts）
    */
-  feishuTesterUserIds?: string[];
+  feishuTesterUserKeys?: string[];
   role: TaskRole;
   repoPaths: string[];
   /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
@@ -630,7 +631,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     actions: meta.actions,
     mrs: meta.mrs,
     gitBranches: meta.gitBranches,
-    feishuTesterUserIds: meta.feishuTesterUserIds,
+    feishuTesterUserKeys: meta.feishuTesterUserKeys,
     role: meta.role,
     repoPaths: meta.repoPaths,
     repoBaseBranches: meta.repoBaseBranches,
@@ -667,7 +668,7 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     currentActionId: meta.currentActionId,
     mrs: meta.mrs,
     gitBranches: meta.gitBranches,
-    feishuTesterUserIds: meta.feishuTesterUserIds,
+    feishuTesterUserKeys: meta.feishuTesterUserKeys,
     role: meta.role,
     repoPaths: meta.repoPaths,
     feishuStoryUrl: meta.feishuStoryUrl,
@@ -1585,19 +1586,19 @@ export const upsertGitBranch = async (
   });
 
 /**
- * 写 task.feishuTesterUserIds（V0.6.1 飞书 @ 测试人员记忆）
+ * 写 task.feishuTesterUserKeys（V0.6.1 飞书 @ 测试人员记忆、2026-06-12 起存 user_key）
  *
  * - 首次 ship 时探到 / 用户填完后调一次、同 task 后续 ship 直接复用
  * - 空数组 = 显式记忆「没测试人 / 用户选了跳过 @」、跟 undefined 区分
  */
-export const setFeishuTesterUserIds = async (
+export const setFeishuTesterUserKeys = async (
   taskId: string,
-  userIds: string[],
+  userKeys: string[],
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    meta.feishuTesterUserIds = userIds;
+    meta.feishuTesterUserKeys = userKeys;
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

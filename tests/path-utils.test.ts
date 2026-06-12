@@ -7,8 +7,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  buildCursorLink,
+  buildIdeLink,
   getEffectiveCwd,
+  hasValidRepoPrefix,
   looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
@@ -17,7 +18,11 @@ import {
 
 const BASE = "/Users/me/work";
 
-describe("buildCursorLink", () => {
+// 默认 ide=cursor、跟改名前 buildCursorLink 行为完全一致
+const buildCursorLink = (pathLike: string, baseDir?: string) =>
+  buildIdeLink(pathLike, baseDir);
+
+describe("buildIdeLink（cursor 协议、默认）", () => {
   it("绝对路径直接走、忽略 baseDir", () => {
     expect(buildCursorLink("/a/b/c.ts")).toBe("cursor://file/a/b/c.ts");
     expect(buildCursorLink("/a/b/c.ts", BASE)).toBe("cursor://file/a/b/c.ts");
@@ -119,6 +124,54 @@ describe("buildCursorLink", () => {
     expect(
       buildCursorLink("src\\main\\Api.java", "D:\\IdeaProjects\\cp-scheduling"),
     ).toBe("cursor://file/D:/IdeaProjects/cp-scheduling/src/main/Api.java");
+  });
+});
+
+describe("buildIdeLink（idea 协议、2026-06-12 加）", () => {
+  it("idea://open?file=...&line=... 形态、行号拆解跟 cursor 同款", () => {
+    expect(buildIdeLink("src/foo.ts:271-279", BASE, "idea")).toBe(
+      `idea://open?file=${BASE}/src/foo.ts&line=271`,
+    );
+    expect(buildIdeLink("/a/b/c.ts", undefined, "idea")).toBe(
+      "idea://open?file=/a/b/c.ts",
+    );
+  });
+
+  it("Windows 盘符路径：盘符 `:` 不 encode、手动补前导 /", () => {
+    expect(
+      buildIdeLink("D:\\IdeaProjects\\foo\\Bar.java:120", undefined, "idea"),
+    ).toBe("idea://open?file=/D:/IdeaProjects/foo/Bar.java&line=120");
+  });
+});
+
+describe("hasValidRepoPrefix（多仓漏仓名前缀检测、2026-06-12 加）", () => {
+  const repos = ["crm-web", "tch-service-center", "cp-admin"];
+
+  it("首段是仓名 → 合法", () => {
+    expect(hasValidRepoPrefix("crm-web/src/a.ts", repos)).toBe(true);
+    expect(
+      hasValidRepoPrefix("tch-service-center/apps/foo/b.vue:12-30", repos),
+    ).toBe(true);
+  });
+
+  it("漏仓名前缀（实测 36-ship 踩坑 case）→ 不合法", () => {
+    expect(
+      hasValidRepoPrefix(
+        "apps/cp-class-advisor-center/src/views/schedule/classList.vue",
+        repos,
+      ),
+    ).toBe(false);
+  });
+
+  it("绝对路径 / 单仓（不传清单）→ 不校验、一律放行", () => {
+    expect(hasValidRepoPrefix("/abs/path/a.ts", repos)).toBe(true);
+    expect(hasValidRepoPrefix("D:\\IdeaProjects\\foo\\Bar.java", repos)).toBe(true);
+    expect(hasValidRepoPrefix("apps/foo/b.vue", undefined)).toBe(true);
+    expect(hasValidRepoPrefix("apps/foo/b.vue", [])).toBe(true);
+  });
+
+  it("多层短名（repoPath 嵌套在子目录）也按前缀匹配", () => {
+    expect(hasValidRepoPrefix("group/projA/src/a.ts", ["group/projA"])).toBe(true);
   });
 });
 

@@ -85,7 +85,7 @@ import {
   RUN_STATUS_VARIANT,
   formatRepoPathsForDisplay,
 } from "@/lib/task-display";
-import { getEffectiveCwd } from "@/lib/path-utils";
+import { getEffectiveCwd, getRepoShortNames } from "@/lib/path-utils";
 import type {
   ActionRecord,
   ActionType,
@@ -853,6 +853,16 @@ const TaskDetailPage = () => {
                   // effectiveCwd 会变、老 artifact 的相对路径必须按写入时基准解析；
                   // 老数据没快照（V0.6.28 前的 action）回退实时计算
                   baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
+                  // 多仓 task：仓短名清单给路径前缀校验用（agent 漏写仓名前缀的
+                  // 路径不渲染链接、点了必 404）；单仓不传 = 不校验
+                  repoShortNames={
+                    task.repoPaths.length > 1
+                      ? getRepoShortNames(
+                          task.repoPaths,
+                          selectedAction.cwd ?? getEffectiveCwd(task.repoPaths),
+                        )
+                      : undefined
+                  }
                   onArtifactRefClick={(ref) => {
                     // 找最近匹配 (n, type) 的 action、切过去
                     const target = task.actions.find(

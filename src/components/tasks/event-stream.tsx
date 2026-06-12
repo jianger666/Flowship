@@ -24,6 +24,7 @@ import {
   File as FileIcon,
   Folder,
   FolderOpen,
+  Loader2,
   Paperclip,
   Send,
   X,
@@ -119,8 +120,9 @@ const EventStreamImpl = ({
   const isChat = variant === "chat";
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
-  // 原生 picker 调用中（防双击连开系统对话框）
-  const [picking, setPicking] = useState(false);
+  // 原生 picker 调用中（防双击连开系统对话框）；存 mode 让被点的那颗按钮转 spinner
+  // ——mac osascript 弹窗有 ~1s 冷启动延迟、用户反馈「点了没反应」、需要即时视觉反馈
+  const [picking, setPicking] = useState<false | "file" | "folder">(false);
   // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
@@ -211,7 +213,7 @@ const EventStreamImpl = ({
 
   // 原生 picker（V0.7.13）：附文件 / 附目录各自一键、server 同机弹系统对话框
   const pickPaths = async (mode: "file" | "folder") => {
-    setPicking(true);
+    setPicking(mode);
     try {
       const paths = await pickNativePaths({
         mode,
@@ -418,23 +420,31 @@ const EventStreamImpl = ({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={!isAwaitingUser || picking}
+                  disabled={!isAwaitingUser || picking !== false}
                   onClick={() => void pickPaths("file")}
                   className="size-7 p-0 text-muted-foreground hover:text-foreground"
                   title="附文件（agent 会用 `read` 工具看）"
                 >
-                  <FileIcon className="size-3.5" />
+                  {picking === "file" ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <FileIcon className="size-3.5" />
+                  )}
                 </Button>
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={!isAwaitingUser || picking}
+                  disabled={!isAwaitingUser || picking !== false}
                   onClick={() => void pickPaths("folder")}
                   className="size-7 p-0 text-muted-foreground hover:text-foreground"
                   title="附目录（agent 会用 `read` 工具看）"
                 >
-                  <FolderOpen className="size-3.5" />
+                  {picking === "folder" ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <FolderOpen className="size-3.5" />
+                  )}
                 </Button>
                 <Button
                   size="sm"
@@ -597,24 +607,32 @@ const EventStreamImpl = ({
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!isAwaitingUser || picking}
+              disabled={!isAwaitingUser || picking !== false}
               onClick={() => void pickPaths("file")}
               className="h-7 gap-1 px-2 text-xs"
               title="附文件（agent 会用 `read` 工具看）"
             >
-              <FileIcon className="size-3.5" />
+              {picking === "file" ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <FileIcon className="size-3.5" />
+              )}
               附文件
             </Button>
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!isAwaitingUser || picking}
+              disabled={!isAwaitingUser || picking !== false}
               onClick={() => void pickPaths("folder")}
               className="h-7 gap-1 px-2 text-xs"
               title="附目录（agent 会用 `read` 工具看）"
             >
-              <FolderOpen className="size-3.5" />
+              {picking === "folder" ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <FolderOpen className="size-3.5" />
+              )}
               附目录
             </Button>
             <Button

@@ -221,8 +221,8 @@ export type ChatTaskAction =
       kind: "set_feishu_testers";
       /** 当前 ship action 的 id（让「已记忆测试人员」info 事件挂到该 action、跟 submit_mr 对齐） */
       actionId: string;
-      /** 飞书 user_id 列表（空数组 = 显式记忆「没测试人 / 跳过 @」） */
-      userIds: string[];
+      /** 飞书项目 user_key 列表（空数组 = 显式记忆「没测试人 / 跳过 @」） */
+      userKeys: string[];
     }
   | {
       kind: "set_plan_batches";
@@ -1212,30 +1212,32 @@ const buildMcpServer = (): McpServer => {
 
   // ----------------- set_feishu_testers 工具（V0.6.1、ship action 用）-----------------
   //
-  // 把探测 / 用户填的飞书测试人员 lark_user_id 列表持久化到 task.feishuTesterUserIds。
+  // 把探测 / 用户填的飞书测试人员 user_key 列表持久化到 task.feishuTesterUserKeys。
   // 同 task 后续 ship 不再探测 / 不再问用户、agent 直接读 task 里的字段拼飞书评论。
+  //
+  // 2026-06-12 起从 lark_user_id 切到 user_key（官方 MCP add_comment 改按 user_key 校验、
+  // lark_user_id 报 cross tenant）、describe 必须跟 action-ship.md §2/§4 保持一致。
   //
   // 空数组 = 显式记忆「没测试人 / 用户选了跳过 @」、跟 undefined 区分。
   srv.registerTool(
     "set_feishu_testers",
     {
-      title: "持久化飞书 story 测试人员 user_id 列表（ship action 用）",
+      title: "持久化飞书 story 测试人员 user_key 列表（ship action 用）",
       description: [
-        "把当前 task 关联的飞书 story 测试人员 lark_user_id 列表写到 task.feishuTesterUserIds。",
+        "把当前 task 关联的飞书 story 测试人员 user_key 列表写到 task.feishuTesterUserKeys。",
         "",
         "## 什么时候调",
         "",
         "首次 ship action 内、按以下顺序探测：",
-        "  1. 调飞书 MCP 的 `list_workitem_role_config` + `get_workitem_brief` 抓「测试」角色字段",
-        "  2. 调 `search_user_info` 把 username / email 转 lark_user_id",
-        "  3. 探到任意人 → 调本工具持久化 / 探不到 → 调 ask_user 让用户填用户名 + 用本工具落库",
+        "  1. 调飞书 MCP 的 `get_workitem_brief` 抓「测试」角色的 role_members、`member.key` 就是 user_key（纯数字、直接用）",
+        "  2. 探到任意人 → 调本工具持久化 / 探不到 → 调 ask_user 让用户填用户名 + `search_user_info` 取 user_key 字段后用本工具落库",
         "",
-        "同 task 后续 ship action 直接读 `task.feishuTesterUserIds`、**不再调本工具 / 不再探测 / 不再问用户**。",
+        "同 task 后续 ship action 直接读 `task.feishuTesterUserKeys`、**不再调本工具 / 不再探测 / 不再问用户**。",
         "",
         "## 入参",
         "",
         "- `action_id`：当前 ship action 的 id",
-        "- `user_ids`：lark_user_id 数组、可以空（= 显式记忆「这个 task 没测试人 / 跳过 @」）",
+        "- `user_keys`：飞书项目 user_key 数组（纯数字、**不是** lark_user_id）、可以空（= 显式记忆「这个 task 没测试人 / 跳过 @」）",
         "",
         "## 返回值",
         "",
@@ -1247,21 +1249,21 @@ const buildMcpServer = (): McpServer => {
         action_id: z
           .string()
           .describe("当前 ship action 的 id（让「已记忆测试人员」事件挂到该 action、跟 submit_mr 对齐）"),
-        user_ids: z
+        user_keys: z
           .array(z.string())
           .describe(
-            "飞书 lark_user_id 数组、可以为空数组（= 记忆「跳过 @ 测试人员」）",
+            "飞书项目 user_key 数组（纯数字、不是 lark_user_id）、可以为空数组（= 记忆「跳过 @ 测试人员」）",
           ),
       },
     },
-    async ({ task_id, action_id, user_ids }) => {
+    async ({ task_id, action_id, user_keys }) => {
       console.log(
-        `[chat-mcp] set_feishu_testers task=${task_id} action=${action_id} userIds=${user_ids.length}`,
+        `[chat-mcp] set_feishu_testers task=${task_id} action=${action_id} userKeys=${user_keys.length}`,
       );
       const result = await runTaskAction(task_id, {
         kind: "set_feishu_testers",
         actionId: action_id,
-        userIds: user_ids,
+        userKeys: user_keys,
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],

@@ -20,7 +20,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { DEFAULT_SETTINGS, getSettings, saveSettings } from "@/lib/local-store";
-import type { FeAiFlowSettings } from "@/lib/types";
+import type { FeAiFlowSettings, JumpIde } from "@/lib/types";
+
+/**
+ * 轻量读「代码跳转 IDE」配置（artifact-panel / 事件流附件 chip 等展示组件用）
+ *
+ * 跟 useSettings 的区别：那个是设置页专用重 hook（带 dirty 计算 + beforeunload 拦截）、
+ * 展示组件只要一个值、不该背那些副作用。SSR 首渲返默认 cursor、挂载后读真实配置
+ * （getSettings 在 render 里直接调会 hydration mismatch、必须走 effect）。
+ */
+export const useJumpIde = (): JumpIde => {
+  const [ide, setIde] = useState<JumpIde>("cursor");
+  useEffect(() => {
+    setIde(getSettings().jumpIde ?? "cursor");
+  }, []);
+  return ide;
+};
 
 type SettingsField = keyof FeAiFlowSettings;
 
@@ -52,7 +67,8 @@ const isFieldEqual = (
     key === "username" ||
     key === "gitHost" ||
     key === "gitToken" ||
-    key === "branchTemplate"
+    key === "branchTemplate" ||
+    key === "jumpIde"
   ) {
     return (a[key] ?? "") === (b[key] ?? "");
   }
@@ -106,6 +122,7 @@ export const useSettings = (): UseSettingsResult => {
       defaultModel: !isFieldEqual("defaultModel", settings, savedSettings),
       repos: !isFieldEqual("repos", settings, savedSettings),
       username: !isFieldEqual("username", settings, savedSettings),
+      jumpIde: !isFieldEqual("jumpIde", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),

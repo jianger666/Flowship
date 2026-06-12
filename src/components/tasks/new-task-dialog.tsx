@@ -285,7 +285,9 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    // disablePointerDismissal：点弹窗外不关（用户实测：关「目标仓库」下拉要点空白、
+    // 一点把整个弹窗带没了、表单草稿全丢）；Esc / X / 取消仍可关
+    <Dialog open={open} onOpenChange={setOpen} disablePointerDismissal>
       <DialogTrigger
         render={
           <Button>

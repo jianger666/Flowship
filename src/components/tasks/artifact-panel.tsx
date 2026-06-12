@@ -41,16 +41,24 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
-  buildCursorLink,
+  buildIdeLink,
+  hasValidRepoPrefix,
   looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
   type ActionArtifactRef,
 } from "@/lib/path-utils";
+import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { ACTION_LABEL, ACTION_LABEL_EN } from "@/lib/task-display";
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
-import type { ActionRecord, ActionType, ArtifactRevision } from "@/lib/types";
+import {
+  JUMP_IDE_LABEL,
+  type ActionRecord,
+  type ActionType,
+  type ArtifactRevision,
+  type JumpIde,
+} from "@/lib/types";
 
 // V0.5.12 perf：react-diff-viewer-continued 体积大、懒加载
 const ArtifactDiff = dynamic(
@@ -112,6 +120,8 @@ const writeSeenTs = (taskId: string, actionId: string, ts: number) => {
 
 const buildMarkdownComponents = (
   baseDir: string | undefined,
+  repoShortNames: string[] | undefined,
+  ide: JumpIde,
   onArtifactRefClick: ((ref: ActionArtifactRef) => void) | undefined,
 ): Components => ({
   // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
@@ -143,7 +153,10 @@ const buildMarkdownComponents = (
       );
     }
     if (looksLikePath(text)) {
-      const href = buildCursorLink(text, baseDir);
+      // 多仓 task：相对路径首段不是任务里的仓名 = agent 漏写仓名前缀、
+      // 拼出来的链接必 404（实测弹「路径不存在」）——降级纯文本、不给误导性链接
+      const prefixOk = hasValidRepoPrefix(text, repoShortNames);
+      const href = prefixOk ? buildIdeLink(text, baseDir, ide) : null;
       // 多段行号（`path:147-175、341-370、485-508`）→ 每段独立链接、点哪段跳哪段
       //   首段渲染 `path:147-175`、后续段渲染 `、341-370`（sep 原样保留、视觉跟原文一致）
       //   单段 / 无行号 / 拼不出链接（href null）→ 走下面原有的整条单链接 / 纯文本分支
@@ -153,9 +166,10 @@ const buildMarkdownComponents = (
           <span className="font-mono text-[0.85em]">
             {parsed.segments.map((seg, i) => {
               // 每段单独拼 `path:起始行` 生成各自的跳转目标
-              const segHref = buildCursorLink(
+              const segHref = buildIdeLink(
                 `${parsed.path}:${seg.line}`,
                 baseDir,
+                ide,
               );
               return (
                 <span key={`${seg.line}-${i}`}>
@@ -163,7 +177,7 @@ const buildMarkdownComponents = (
                   <a
                     href={segHref ?? undefined}
                     className="no-underline"
-                    title={`点击在 Cursor 中打开：${parsed.path}:${seg.line}`}
+                    title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${parsed.path}:${seg.line}`}
                   >
                     <span className="text-sky-600 dark:text-sky-400 underline-offset-2 hover:underline">
                       {i === 0 ? `${parsed.path}:${seg.text}` : seg.text}
@@ -189,7 +203,14 @@ const buildMarkdownComponents = (
       );
       if (!href) {
         return (
-          <span title={text} {...rest}>
+          <span
+            title={
+              prefixOk
+                ? text
+                : `${text}\n（路径缺少仓名前缀、定位不到文件、无法跳转）`
+            }
+            {...rest}
+          >
             {inner}
           </span>
         );
@@ -198,7 +219,7 @@ const buildMarkdownComponents = (
         <a
           href={href}
           className="group no-underline"
-          title={`点击在 Cursor 中打开：${text}`}
+          title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${text}`}
         >
           {inner}
         </a>
@@ -212,6 +233,8 @@ interface Props {
   action: ActionRecord;
   taskId: string;
   baseDir?: string;
+  /** 多仓 task 的仓短名清单（相对 baseDir）、用于路径前缀校验；单仓不传 = 不校验 */
+  repoShortNames?: string[];
   onArtifactRefClick?: (ref: ActionArtifactRef) => void;
 }
 
@@ -232,12 +255,16 @@ export const ArtifactPanel = ({
   action,
   taskId,
   baseDir,
+  repoShortNames,
   onArtifactRefClick,
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
+  // 代码跳转 IDE 配置（设置页可切 Cursor / IDEA）
+  const jumpIde = useJumpIde();
   const markdownComponents = useMemo(
-    () => buildMarkdownComponents(baseDir, onArtifactRefClick),
-    [baseDir, onArtifactRefClick],
+    () =>
+      buildMarkdownComponents(baseDir, repoShortNames, jumpIde, onArtifactRefClick),
+    [baseDir, repoShortNames, jumpIde, onArtifactRefClick],
   );
 
   const [mode, setMode] = useState<ViewMode>("content");

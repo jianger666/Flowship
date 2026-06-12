@@ -106,10 +106,24 @@ export interface ModelSelection {
  * V0.6.1 新增 gitHost + gitToken：ship action 走 server 内置 GitLab REST API、
  *   不依赖外部 glab CLI；当前公司场景所有仓共用同一个 GitLab 实例、所以是全局字段。
  */
+/**
+ * 代码跳转目标 IDE（2026-06-12 加、用户要求支持 IDEA）
+ * - cursor：`cursor://file/<path>:<line>`
+ * - idea：`idea://open?file=<path>&line=<line>`（需装 JetBrains Toolbox 或 IDE 自带协议）
+ */
+export type JumpIde = "cursor" | "idea";
+
+export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
+  cursor: "Cursor",
+  idea: "IDEA",
+};
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
   username?: string;
+  /** 代码路径点击跳转的 IDE、默认 cursor */
+  jumpIde?: JumpIde;
   /**
    * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
    * 空时 ship action 准入会拦、提示用户先配
@@ -781,13 +795,14 @@ export interface Task {
   gitBranches?: GitBranchInfo[];
 
   /**
-   * V0.6.1：飞书 story 测试人员 lark_user_id 列表
-   * - 首次 ship 时 agent 自动探测（list_workitem_field_config + get_workitem_brief
-   *   + search_user_info）、探到的人写回这里
-   * - 探不到时 ask_user 让用户填、记忆到这里
+   * V0.6.1：飞书 story 测试人员 user_key 列表（纯数字、飞书项目体系的用户标识）
+   * - 首次 ship 时 agent 自动探测（get_workitem_brief 的 role_members[].key 就是 user_key）
+   * - 探不到时 ask_user 让用户填、search_user_info 转 user_key 后记忆到这里
    * - 同 task 后续 ship 直接复用、不再探测 / 不再问用户
+   * - 2026-06-12 起从 lark_user_id 切到 user_key：官方 MCP add_comment 改按 user_key
+   *   校验 mention/notify、lark_user_id 直接报 cross tenant（详见 action-ship.md §4）
    */
-  feishuTesterUserIds?: string[];
+  feishuTesterUserKeys?: string[];
 
   // ===== 保留字段（V0.5 → V0.6 不变）=====
 

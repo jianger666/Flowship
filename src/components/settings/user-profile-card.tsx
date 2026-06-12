@@ -23,11 +23,22 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { renderBranchName } from "@/lib/branch-template";
+import { JUMP_IDE_LABEL, type JumpIde } from "@/lib/types";
 
 interface UserProfileCardProps {
   username: string;
   branchTemplate: string;
+  // 代码跳转 IDE（artifact / 事件流里路径链接的打开目标）、选择即保存
+  jumpIde: JumpIde;
+  onJumpIdeChange: (next: JumpIde) => void;
   // 用户名：输入改草稿、失焦落盘
   onChange: (next: string) => void;
   onCommit: (value: string) => void;
@@ -39,6 +50,8 @@ interface UserProfileCardProps {
 export const UserProfileCard = ({
   username,
   branchTemplate,
+  jumpIde,
+  onJumpIdeChange,
   onChange,
   onCommit,
   onBranchTemplateChange,
@@ -73,6 +86,22 @@ export const UserProfileCard = ({
             onBlur={() => onCommit(username)}
             placeholder="如 clj"
           />
+        </div>
+
+        <div className="grid gap-1.5">
+          <Label htmlFor="settings-jump-ide">代码跳转 IDE</Label>
+          <Select
+            value={jumpIde}
+            onValueChange={(v) => onJumpIdeChange(v === "idea" ? "idea" : "cursor")}
+          >
+            <SelectTrigger id="settings-jump-ide" className="w-44">
+              <SelectValue>{JUMP_IDE_LABEL[jumpIde]}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="cursor">{JUMP_IDE_LABEL.cursor}</SelectItem>
+              <SelectItem value="idea">{JUMP_IDE_LABEL.idea}</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
 
         <div className="grid gap-1.5">

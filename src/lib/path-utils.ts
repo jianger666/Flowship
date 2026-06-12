@@ -4,8 +4,9 @@
  * 抽出来的动机：
  * - `pathBasename` / `basename` 在 event-stream / artifact-panel 多个组件里各自定义、
  *   实现细节漂移（带不带「去尾 slash」逻辑）。一处抽完所有点都走它。
- * - `buildCursorLink` 在 artifact-panel 有完整版（拼 repoPath）、event-stream 有简化版
- *   （只接绝对路径）。合并成一个、repoPath 缺省时按已经是绝对路径走。
+ * - `buildIdeLink`（原 buildCursorLink、2026-06-12 支持 IDEA 后改名）在 artifact-panel
+ *   有完整版（拼 repoPath）、event-stream 有简化版（只接绝对路径）。合并成一个、
+ *   repoPath 缺省时按已经是绝对路径走。
  * - `looksLikePath` 是 markdown 渲染时「这个 inline code 像不像文件路径」的启发式判断、
  *   未来文件 / 路径渲染逻辑可能复用、放这里收口。
  * - `looksLikeArtifactRef`（V0.5.8 加）跟 `looksLikePath` 互斥：识别「inline code 是不是
@@ -22,7 +23,7 @@
  *   （同 VS Code `vscode://file/c:/myfile.txt` 约定、盘符段的 `:` 不 encode）。
  */
 
-import { ACTION_TYPES, type ActionType } from "./types";
+import { ACTION_TYPES, type ActionType, type JumpIde } from "./types";
 
 /** Windows 盘符绝对路径（`D:\...` / `D:/...`）。归一化前后都能判。 */
 const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
@@ -95,7 +96,7 @@ export interface ParsedPathSegments {
 /**
  * 把「path:多段行号」完整拆解（V0.6.28 加、配合 artifact-panel 多段分链接渲染）
  *
- * 跟 `parsePathWithLine` 的区别：那个只取首段起始行（buildCursorLink 用）、
+ * 跟 `parsePathWithLine` 的区别：那个只取首段起始行（buildIdeLink 用）、
  * 这个把**每一段**都拆出来——`studentSituation.vue:147-175、341-370、485-508`
  * 渲染成 3 个独立 cursor:// 链接、用户点哪段跳哪段（只能跳首段是用户实测痛点）。
  *
@@ -197,10 +198,10 @@ export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
 };
 
 /**
- * 把路径转成 cursor:// deep link（点击在 IDE 打开）
+ * 把路径转成 IDE deep link（点击在 IDE 打开、2026-06-12 起支持 Cursor / IDEA 双协议）
  *
  * - 已经是 url（http:// / cursor:// 等）→ 返 null（不动）
- * - 末尾带 `:line` / `:line-line` 行号后缀 → 拆出来、cursor 协议拼 `:line`（起始行）
+ * - 末尾带 `:line` / `:line-line` 行号后缀 → 拆出来、拼进协议（起始行）
  * - 绝对路径（`/` 起手、或 Windows 盘符 `D:\` / `D:/` 起手）→ 直接走、忽略 baseDir
  * - 相对路径 + 没传 baseDir → 返 null（拼不出绝对路径）
  * - 相对路径 + 有 baseDir → 跟 baseDir 拼绝对路径（baseDir 也可以是 Windows 路径）
@@ -209,15 +210,16 @@ export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
  * 多仓时 AI 写的路径首段是仓名（`projA/apps/foo/bar.vue`）、拼到 cwd 后就是绝对路径、跟单仓走同一套逻辑。
  *
  * encode 防中文 / 空格炸：split + map(encodeURIComponent) + join
- * 协议格式：`cursor://file/<encoded-abs-path>[:line]`
+ * 协议格式（ide 参数切换、默认 cursor）：
+ * - cursor：`cursor://file/<encoded-abs-path>[:line]`（`:line` 不 encode、`%3A` Cursor 不认）
+ * - idea：`idea://open?file=<encoded-abs-path>[&line=<line>]`（JetBrains Toolbox / IDE 内建协议）
  * Windows：`cursor://file/D:/IdeaProjects/...`（同 VS Code `vscode://file/c:/...` 约定、
- *   盘符段的 `:` 必须保留不 encode、否则 Cursor 不认）
- *
- * 注意：`:line` 后缀不参与 encodeURIComponent、否则 `:` 会被 encode 成 `%3A`、Cursor 不认。
+ *   盘符段的 `:` 必须保留不 encode、否则 IDE 不认）
  */
-export const buildCursorLink = (
+export const buildIdeLink = (
   pathLike: string,
   baseDir?: string,
+  ide: JumpIde = "cursor",
 ): string | null => {
   if (!pathLike) return null;
   if (/^[a-z]+:\/\//i.test(pathLike)) return null;
@@ -231,16 +233,47 @@ export const buildCursorLink = (
   }
   const encodedPath = absolute
     .split("/")
-    // 首段是盘符（`D:`）时保留原样、`:` encode 了 Cursor 不认
+    // 首段是盘符（`D:`）时保留原样、`:` encode 了 IDE 不认
     .map((seg, i) =>
       i === 0 && /^[a-zA-Z]:$/.test(seg) ? seg : encodeURIComponent(seg),
     )
     .join("/");
   // POSIX 绝对路径自带前导 `/`、Windows 盘符路径要手动补一个（`cursor://file/D:/...`）
   const prefix = encodedPath.startsWith("/") ? "" : "/";
+  if (ide === "idea") {
+    return line !== undefined
+      ? `idea://open?file=${prefix}${encodedPath}&line=${line}`
+      : `idea://open?file=${prefix}${encodedPath}`;
+  }
   return line !== undefined
     ? `cursor://file${prefix}${encodedPath}:${line}`
     : `cursor://file${prefix}${encodedPath}`;
+};
+
+/**
+ * 多仓 task：判断「相对路径首段是不是任务里的某个仓」（2026-06-12 加）
+ *
+ * 背景：多仓 task 的 cursor 链接 = cwd（公共父目录）+ 相对路径、约定首段是仓名。
+ * agent 偶发漏写仓名前缀（实测：ship artifact 写 `apps/...`、拼出 `wukong/apps/...`、
+ * 点击弹「路径不存在」）——必 404 的链接比没有链接更误导（同 markdown-link 对幻觉链接的处理）、
+ * 渲染层命中该情况时降级纯文本。
+ *
+ * - 绝对路径（POSIX / Windows 盘符）→ true（不参与本校验、baseDir 不参与拼接）
+ * - repoShortNames 空 / undefined（单仓、调用方不传）→ true（不校验）
+ * - 相对路径以任一 `<shortName>/` 开头（shortName 可多层、如 `group/projA`）→ true
+ * - 其余 → false（视作漏了仓名前缀、调用方不渲染链接）
+ */
+export const hasValidRepoPrefix = (
+  pathLike: string,
+  repoShortNames: string[] | undefined,
+): boolean => {
+  if (!repoShortNames || repoShortNames.length === 0) return true;
+  const { path } = parsePathWithLine(pathLike);
+  const normalized = normalizeSeparators(path).replace(/^\.\/+/, "");
+  if (normalized.startsWith("/") || isWindowsAbsPath(normalized)) return true;
+  return repoShortNames.some(
+    (name) => name !== "." && normalized.startsWith(`${name}/`),
+  );
 };
 
 /**
@@ -301,7 +334,7 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
     return typeof process !== "undefined" ? process.cwd() : "";
   }
   // Windows 路径归一化成正斜杠（Node spawn cwd / prompt 展示都接受、且下游
-  // getRepoShortNames / buildCursorLink 的字符串比对全按 `/` 走、必须统一）
+  // getRepoShortNames / buildIdeLink 的字符串比对全按 `/` 走、必须统一）
   if (repoPaths.length === 1) {
     return normalizeSeparators(repoPaths[0]).replace(/\/+$/, "");
   }
@@ -317,8 +350,9 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
  *   → ['projA', 'projB']
  *
  * 单仓不调这个（cwd 就是仓库自身、短名等于 "."、prompt 也不用列）。
+ * export 给 task 详情页算 ArtifactPanel 的 repoShortNames（多仓路径前缀校验）用。
  */
-const getRepoShortNames = (
+export const getRepoShortNames = (
   repoPaths: string[],
   cwd: string,
 ): string[] => {

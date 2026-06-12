@@ -43,7 +43,7 @@ import {
   getEventsLogPath,
   getTask,
   patchAction,
-  setFeishuTesterUserIds,
+  setFeishuTesterUserKeys,
   upsertGitBranch,
   upsertMR,
   setTaskRepoStatus,
@@ -1943,15 +1943,18 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     }
 
     if (taskAction.kind === "set_feishu_testers") {
-      const patched = await setFeishuTesterUserIds(task.id, taskAction.userIds);
+      const patched = await setFeishuTesterUserKeys(
+        task.id,
+        taskAction.userKeys,
+      );
       if (patched) {
         publish(task.id, { kind: "task", task: patched });
       }
       await writeEventAndPublish(task.id, {
         kind: "info",
         actionId: taskAction.actionId,
-        text: `已记忆飞书测试人员（${taskAction.userIds.length} 人、同 task 后续 ship 直接复用）`,
-        meta: { userIds: taskAction.userIds },
+        text: `已记忆飞书测试人员（${taskAction.userKeys.length} 人、同 task 后续 ship 直接复用）`,
+        meta: { userKeys: taskAction.userKeys },
       });
       return { ok: true };
     }
