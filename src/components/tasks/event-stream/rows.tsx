@@ -23,6 +23,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
+import { MarkdownLink } from "@/components/markdown-link";
 import { buildCursorLink, pathBasename } from "@/lib/path-utils";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
 import type { ActionType, Task, TaskEvent } from "@/lib/types";
@@ -68,7 +69,15 @@ export const MarkdownText = ({ text }: { text: string }) => (
       "prose-pre:bg-muted prose-pre:text-foreground prose-pre:my-2",
     )}
   >
-    <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        // 链接统一新窗口 / 系统浏览器打开、相对路径降级纯文本（V0.7.7）
+        a: MarkdownLink,
+      }}
+    >
+      {text}
+    </ReactMarkdown>
   </div>
 );
 

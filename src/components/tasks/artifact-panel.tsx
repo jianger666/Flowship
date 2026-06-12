@@ -27,6 +27,7 @@ import { FileText, Info } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
 import { ChoiceButton } from "@/components/ui/choice-button";
@@ -112,6 +113,9 @@ const buildMarkdownComponents = (
   baseDir: string | undefined,
   onArtifactRefClick: ((ref: ActionArtifactRef) => void) | undefined,
 ): Components => ({
+  // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
+  // （inline code 路径的 cursor:// 跳转在下面 code 组件、不受影响）
+  a: MarkdownLink,
   // 只覆盖 inline code、fenced code block 走默认渲染
   code: ({ className, children, ...rest }) => {
     if (className) {

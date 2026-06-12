@@ -326,10 +326,15 @@ const createWindow = async () => {
   await mainWindow.loadURL(LOADING_URL);
 };
 
-// ---------- 自动更新（仅 win、mac 未签名跑不了） ----------
+// ---------- 自动更新（win 全自动装、mac 提醒去下载页） ----------
 
-// 已下载就绪的新版本号（null = 无更新待装）
+// 已就绪的新版本号（null = 无更新待装）
 let updateReadyVersion = null;
+
+// 更新动作模式：win 用 electron-updater 下载完「重启即装」；
+// mac 未签名跑不了 Squirrel.Mac、只做「发现新版 → 打开下载页」（v0.7.7）
+const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
+const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 
 // 「该版本是否已弹过对话框」持久化——同一个新版本只弹一次原生弹窗、
 // 之后（含重启 app 再查到同版本）只靠页面右上角「新版本」标识安静提醒
@@ -356,45 +361,93 @@ const markPrompted = async (version) => {
 //  did-finish-load 时重注入、页面刷新也不丢标识）
 const notifyPageUpdateReady = () => {
   if (!mainWindow || !updateReadyVersion) return;
-  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.dispatchEvent(new Event("app-update-ready"));`;
+  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.__appUpdateMode=${JSON.stringify(UPDATE_MODE)};window.dispatchEvent(new Event("app-update-ready"));`;
   mainWindow.webContents.executeJavaScript(js).catch(() => {});
 };
 
-// 立即装更新（页面点「新版本」标识、或对话框点「立即重启」走到这）
-// before-quit 兜底会杀 server 子进程、不会留孤儿
+// 应用更新（页面点「新版本」标识、或对话框确认走到这）：
+// win 重启即装（before-quit 兜底杀 server、不留孤儿）；mac 打开 release 下载页
 const installUpdateNow = async () => {
   if (!updateReadyVersion) return;
+  if (UPDATE_MODE === "download") {
+    log(`[updater] 打开下载页（v${updateReadyVersion}）`);
+    void shell.openExternal(RELEASE_LATEST_URL);
+    return;
+  }
   log(`[updater] 用户确认、重启安装 v${updateReadyVersion}`);
   const { default: updater } = await import("electron-updater");
   updater.autoUpdater.quitAndInstall();
 };
 
+// 「发现新版本」对话框（win / mac 文案、按钮行为不同、弹一次的记账共用）
+const promptUpdateOnce = async (version, { message, detail, confirmLabel }) => {
+  if (await wasPrompted(version)) return;
+  await markPrompted(version);
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: "发现新版本",
+    message,
+    detail,
+    buttons: [confirmLabel, "稍后"],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (response === 0) await installUpdateNow();
+};
+
+// mac：查 GitHub latest release 的版本号——请求 /releases/latest 拿 302 的
+// location（…/releases/tag/vX.Y.Z）抠版本、不走 API 不吃 rate limit
+const fetchLatestVersion = async () => {
+  const res = await fetch(RELEASE_LATEST_URL, { redirect: "manual" });
+  const loc = res.headers.get("location") || "";
+  const m = loc.match(/\/tag\/v(\d+\.\d+\.\d+)/);
+  return m ? m[1] : null;
+};
+
+// 三段式版本比较：a 比 b 新返回 true
+const isNewer = (a, b) => {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+};
+
 const setupAutoUpdate = async () => {
-  if (!app.isPackaged || process.platform !== "win32") return;
+  if (!app.isPackaged) return;
   try {
-    // electron-updater 是 CJS、ESM 下走 default 再解构最稳
-    const { default: updater } = await import("electron-updater");
-    const au = updater.autoUpdater;
-    au.on("update-downloaded", async (info) => {
-      updateReadyVersion = info?.version || "";
-      log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
-      notifyPageUpdateReady();
-      if (await wasPrompted(updateReadyVersion)) return;
-      await markPrompted(updateReadyVersion);
-      const { response } = await dialog.showMessageBox(mainWindow, {
-        type: "info",
-        title: "发现新版本",
-        message: `新版本 v${updateReadyVersion} 已下载完成`,
-        detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
-        buttons: ["立即重启更新", "稍后"],
-        defaultId: 0,
-        cancelId: 1,
+    if (process.platform === "win32") {
+      // electron-updater 是 CJS、ESM 下走 default 再解构最稳
+      const { default: updater } = await import("electron-updater");
+      const au = updater.autoUpdater;
+      au.on("update-downloaded", async (info) => {
+        updateReadyVersion = info?.version || "";
+        log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
+        notifyPageUpdateReady();
+        await promptUpdateOnce(updateReadyVersion, {
+          message: `新版本 v${updateReadyVersion} 已下载完成`,
+          detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
+          confirmLabel: "立即重启更新",
+        });
       });
-      if (response === 0) await installUpdateNow();
+      au.on("error", (err) => log(`[updater] ${err?.message || err}`));
+      // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走上面的事件
+      await au.checkForUpdates();
+      return;
+    }
+    // mac：只查版本号、有新版提醒去下载页（dmg 覆盖安装、数据在 userData 不丢）
+    const latest = await fetchLatestVersion();
+    const current = app.getVersion();
+    if (!latest || !isNewer(latest, current)) return;
+    updateReadyVersion = latest;
+    log(`[updater] 发现新版本 v${latest}（当前 v${current}）`);
+    notifyPageUpdateReady();
+    await promptUpdateOnce(latest, {
+      message: `新版本 v${latest} 已发布`,
+      detail: "mac 版需手动更新：下载 dmg 覆盖安装即可、数据不会丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
+      confirmLabel: "打开下载页",
     });
-    au.on("error", (err) => log(`[updater] ${err?.message || err}`));
-    // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走上面的事件
-    await au.checkForUpdates();
   } catch (err) {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
     log(`[updater] 检查更新失败（忽略）${err?.message || err}`);
