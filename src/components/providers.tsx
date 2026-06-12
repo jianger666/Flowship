@@ -8,13 +8,27 @@
  */
 
 import { ThemeProvider } from "next-themes";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
+import { getSettings } from "@/lib/local-store";
+import { useModels } from "@/hooks/use-models";
 
 interface ProvidersProps {
   children: ReactNode;
 }
+
+// 模型列表预热（V0.7.13 用户拍板「打开软件就拉一次」）：
+// app 加载后台静默拉一遍 → 写进 localStorage 缓存 + server 内存缓存、
+// 之后所有用到模型列表的入口（新建任务 / 设置 / 切模型）全是秒出
+const ModelsPrefetch = () => {
+  const { fetchModels } = useModels();
+  useEffect(() => {
+    const key = getSettings().apiKey?.trim();
+    if (key) void fetchModels(key);
+  }, [fetchModels]);
+  return null;
+};
 
 export const Providers = ({ children }: ProvidersProps) => {
   return (
@@ -27,7 +41,10 @@ export const Providers = ({ children }: ProvidersProps) => {
     >
       {/* DialogProvider 提供全局 confirm/prompt——禁用 window.{alert,confirm,prompt}、
           统一走 shadcn 风格弹窗。组件内用 useDialog() 拿到 confirm / prompt */}
-      <DialogProvider>{children}</DialogProvider>
+      <DialogProvider>
+        <ModelsPrefetch />
+        {children}
+      </DialogProvider>
     </ThemeProvider>
   );
 };
