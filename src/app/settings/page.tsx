@@ -20,7 +20,8 @@
  * - 不预选默认模型：避免误用
  */
 
-import Link from "next/link";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -37,12 +38,25 @@ import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 
 const SettingsPage = () => {
+  const router = useRouter();
   const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
+
+  // 桌面端壳注入的版本号（web 版没有、不显示）；useEffect 读防 hydration mismatch
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  useEffect(() => {
+    setAppVersion(window.__appVersion ?? null);
+  }, []);
 
   if (!loaded) {
     return <LoadingState variant="block" />;
   }
+
+  // 返回 = 回来路（任务详情 / 首页都可能）、无历史（直开 /settings）兜底回首页
+  const handleBack = () => {
+    if (window.history.length > 1) router.back();
+    else router.push("/");
+  };
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-6">
@@ -52,13 +66,19 @@ const SettingsPage = () => {
           variant="ghost"
           size="sm"
           className="px-2 -ml-2 mb-2"
-          nativeButton={false}
-          render={<Link href="/" className="no-underline" />}
+          onClick={handleBack}
         >
           <ArrowLeft />
           返回
         </Button>
-        <h1 className="text-lg font-semibold">设置</h1>
+        <div className="flex items-baseline gap-2">
+          <h1 className="text-lg font-semibold">设置</h1>
+          {appVersion && (
+            <span className="text-xs text-muted-foreground" title="桌面端版本号">
+              v{appVersion}
+            </span>
+          )}
+        </div>
         <p className="text-xs text-muted-foreground mt-1">
           编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器
         </p>

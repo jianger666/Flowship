@@ -298,11 +298,11 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  // window.open 一律转系统默认浏览器（v0.7.4：含 MCP OAuth 授权页、用户拍板不开应用内子窗）：
-  // - OAuth 授权完成后用户切回应用窗口、页面 focus 事件刷新授权状态（use-mcp-oauth.ts）
-  // - 其它 target=_blank 外链（飞书 story / MR / GitHub…）同样走系统浏览器
+  // window.open 一律转系统默认浏览器、零白名单（v0.7.8 用户实测拍板）：
+  // - 外链（飞书 story / MR / GitHub…）、OAuth 授权页 → 系统浏览器（v0.7.4 起）
+  // - 站内 URL（AI 给的 127.0.0.1:8876/... 绝对链接、图片预览）原来 allow 开
+  //   Electron 子窗——用户实测「应用内闪一下」体验差、同样转系统浏览器
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith(BASE_URL)) return { action: "allow" };
     void shell.openExternal(url);
     return { action: "deny" };
   });
@@ -320,8 +320,14 @@ const createWindow = async () => {
     void shell.openExternal(url);
   });
 
-  // 页面每次加载完成（含刷新 / loading 页换正式页）重注入更新标识、不丢状态
-  mainWindow.webContents.on("did-finish-load", notifyPageUpdateReady);
+  // 页面每次加载完成（含刷新 / loading 页换正式页）重注入版本号 + 更新标识、不丢状态
+  mainWindow.webContents.on("did-finish-load", () => {
+    // 版本号给设置页显示（用户要能确认「装的是不是最新版」）；web 版没壳、不显示
+    mainWindow?.webContents
+      .executeJavaScript(`window.__appVersion=${JSON.stringify(app.getVersion())};`)
+      .catch(() => {});
+    notifyPageUpdateReady();
+  });
 
   await mainWindow.loadURL(LOADING_URL);
 };

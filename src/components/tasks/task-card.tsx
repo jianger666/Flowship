@@ -10,6 +10,7 @@
  *   - 时间
  */
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   Archive,
@@ -95,8 +96,15 @@ export const TaskCard = ({ task, onArchiveToggle, onDelete }: Props) => {
                 对话
               </Badge>
             )}
-            <h3 className="min-w-0 flex-1 truncate text-base font-medium text-foreground">
-              {task.title}
+            {/* 标题真 Link：键盘 tab 可达（Enter 进详情）、鼠标用户整卡点击仍可用（外层 onClick） */}
+            <h3 className="min-w-0 flex-1 truncate text-base font-medium">
+              <Link
+                href={`/tasks/${task.id}`}
+                className="text-foreground no-underline outline-offset-2 hover:underline"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {task.title}
+              </Link>
             </h3>
             <Badge
               variant={REPO_STATUS_VARIANT[task.repoStatus]}

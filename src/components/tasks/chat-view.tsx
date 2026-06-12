@@ -19,7 +19,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Ban, Loader2 } from "lucide-react";
+import Link from "next/link";
+import { ArrowLeft, Ban, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
@@ -177,11 +178,22 @@ export const ChatView = ({
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
-      {/* 顶部 bar：title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片） */}
+      {/* 顶部 bar：返回 + title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片） */}
       <div className="border-b bg-card/40 px-6 py-3">
         <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            {/* 返回列表：跟 task 模式顶部条同款（V0.7.8 补、此前 chat 模式只能点 logo 回首页） */}
+            <Button
+              variant="ghost"
+              size="sm"
+              nativeButton={false}
+              render={<Link href="/" className="no-underline" />}
+            >
+              <ArrowLeft />
+              返回
+            </Button>
+            <Separator orientation="vertical" className="h-6" />
+            <div className="flex min-w-0 items-center gap-2">
               <h1 className="truncate text-base font-semibold tracking-tight">
                 {task.title}
               </h1>

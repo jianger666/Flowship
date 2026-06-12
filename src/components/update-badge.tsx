@@ -19,6 +19,8 @@ import { useDialog } from "@/hooks/use-dialog";
 
 declare global {
   interface Window {
+    /** Electron 壳注入：当前 app 版本号（设置页展示用、web 版无） */
+    __appVersion?: string;
     /** Electron 壳注入：已就绪的新版本号 */
     __appUpdateVersion?: string;
     /** Electron 壳注入：更新方式（win 重启即装 / mac 打开下载页） */

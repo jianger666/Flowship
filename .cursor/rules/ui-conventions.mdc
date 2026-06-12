@@ -1,0 +1,44 @@
+---
+description: UI / UX 交互规范（导航、链接、反馈、设计 skill 用法）
+alwaysApply: true
+---
+
+# UI / UX 交互规范
+
+> V0.7.8 全站 UX review 后立规。改 UI / 加页面 / 加交互前先过一遍本文件；新增规范追加到对应小节、不要另开文件。
+
+## 导航 / 返回（2026-06-12 用户拍板）
+
+- **每个二级页面 / 全屏视图必须有显式「返回」**——不能让用户只能点 logo 回首页。已覆盖：task 详情（task + chat 两种模式）、设置页。新加页面照办。
+- **返回语义 = 回来路**：
+  - 入口固定的页面（task 详情只从首页进）→ 返回写死父级（`href="/"`）
+  - 入口多样的页面（设置页从首页 / 任务详情都能进）→ `router.back()`、无历史（直开 URL）兜底 `router.push("/")`、参考 `settings/page.tsx` 的 `handleBack`
+- 同形态的页面顶部条保持同款结构（返回按钮 + Separator + 标题 + badge）、别一个页面一个样。
+
+## 链接行为（V0.7.7/V0.7.8 定型）
+
+- **markdown 正文里的链接**（AI 回复 / artifact）一律走 `src/components/markdown-link.tsx`：
+  - http(s) → `target="_blank"`（浏览器开新 tab、Electron 壳拦 window.open 转系统默认浏览器）
+  - 相对路径 / file:// 等 AI 幻觉链接 → 等宽纯文本不可点（点了必 404、误导用户）
+  - 新增 ReactMarkdown 实例必须配 `components={{ a: MarkdownLink }}`
+- **JSX 里手写的外链** → `target="_blank" rel="noopener noreferrer"`（MR 链接、飞书链接等）
+- **cursor:// 跳 IDE** → 同 frame 裸 `<a>`（壳 will-navigate 拦截转系统、浏览器原生唤起协议、页面都不动）
+- **Electron 壳 `setWindowOpenHandler` 零白名单**：所有 window.open 一律 deny + `shell.openExternal`——不要再加「站内 URL 开子窗」之类的 allow 分支（用户实测「应用内闪一下」体验差、v0.7.8 拍板全走系统浏览器）
+
+## 操作反馈（已有约定、汇总）
+
+- 加载中 → `LoadingState`；空态 → `EmptyHint`；选中卡片 → `ChoiceButton`（见 learned-conventions）
+- 不可逆操作（删除 / 放弃）→ `useDialog().confirm` + `destructive: true`
+- 异步动作期间按钮 disabled + spinner（参考 chat-view 「停止」按钮）、防双击连点
+- 结果反馈 → `toast.success` / `toast.error`、错误信息带上下文（`操作失败：${message}`）
+
+## 键盘可达性
+
+- 可点击卡片不要只挂 div onClick——主要动作给真 `<Link>`（参考 task-card 标题）、键盘 tab 可达
+- 弹窗内表单 Enter 提交、Esc 行为遵循 use-dialog 既定约定（不允许 Esc 误关 confirm）
+
+## 设计 skill（V0.7.8 引入、两个都在 .cursor/skills/）
+
+- **新页面 / 新视觉块 / 改版**：先读 `frontend-design`（防 AI 模板脸、定调性）+ 用 `ui-ux-pro-max` 检索具体建议（`python3 .cursor/skills/ui-ux-pro-max/scripts/search.py "<query>" --domain style|color|typography|ux`）
+- 日常小改（加按钮 / 调间距）不必过 skill、遵守本文件 + learned-conventions 即可
+- 用户对 UI 的每次纠偏反馈 → 沉淀到本文件或 learned-conventions（用户拍板「期望 AI 慢慢沉淀」）
