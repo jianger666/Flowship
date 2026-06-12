@@ -5,11 +5,15 @@ alwaysApply: true
 
 # 编码约定
 
-## ⛔ 不要在本地启动打包 app / 占用 8876 端口（2026-06-11 用户拍板）
+## 本地测试桌面 app：用 test 实例、别碰 8876（2026-06-12 用户修订）
 
-- **用户本机日常运行着「AI工作流」桌面 app（8876 端口）当生产环境用**——agent 任何「open 打包 app / curl 8876 / osascript 关窗 / 杀 8876 进程」都会把用户正在用的实例顶掉或关掉（单实例锁 + 端口独占）。
-- 桌面端改动的验证方式：代码 review + 打包产物静态检查（ls / plutil / asar list）+ 不占端口的最小烟测（如 Helper 二进制 `-e "console.log(1)"`）；端到端体验交给用户自己更新后验证。
-- 实在需要跑整个 app 验证、先通过 feedback 征得用户同意再动。
+- **用户本机日常运行着「AI工作流」桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关「AI工作流」窗口。
+- **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
+  - 打包：`pnpm electron:dist:test` → 产出「AI工作流test.app」（productName 带 test）
+  - 壳探测到名字带 test（或 env `FE_AI_FLOW_TEST=1`）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**、单实例锁天然独立（按 userData 算）
+  - 测完杀的是「AI工作流test」进程、用户一看名字也不会误删正式应用
+- 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`、收尾 osascript 关「AI工作流test」窗口。
+- 盲写直接发版（不本地验证）也不可取——能 test 实例验的就验一轮再 tag。
 
 ## UI 组件库
 

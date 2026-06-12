@@ -16,18 +16,30 @@
  */
 import { app, BrowserWindow, dialog, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
-import { promises as fs, mkdirSync, createWriteStream } from "node:fs";
+import { promises as fs, mkdirSync, createWriteStream, readdirSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PORT = 8876;
+// 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
+// 产出「AI工作流test」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
+// （8876 + fe-ai-flow）互不干扰、也不会被单实例锁互踢（锁按 userData 算）
+// ⚠️ 探测不能用 app.getName()：-c.productName 只改包名 / Info.plist、不改 asar 内
+// package.json、getName() 拿到的还是正式名（实测踩坑）——看可执行文件名最可靠
+const IS_TEST =
+  process.env.FE_AI_FLOW_TEST === "1" ||
+  path.basename(process.execPath).toLowerCase().includes("test");
+
+const PORT = Number(process.env.FE_AI_FLOW_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
 
 // userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名改成中文「AI工作流」
-// 或以后再改名、数据目录都不漂移、用户任务数据不丢
-app.setPath("userData", path.join(app.getPath("appData"), "fe-ai-flow"));
+// 或以后再改名、数据目录都不漂移、用户任务数据不丢；测试实例独立目录防污染
+app.setPath(
+  "userData",
+  path.join(app.getPath("appData"), IS_TEST ? "fe-ai-flow-test" : "fe-ai-flow"),
+);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -162,18 +174,26 @@ const ensurePortFree = async () => {
 // - mac 打包后用 bundle 内 Helper（Info.plist 带 LSUIElement=1）——主二进制 as node
 //   会被 LaunchServices 当成前台 GUI 应用、Dock 多一个绿色 exec 通用图标（v0.7.5 修）
 // - 其它平台 / dev 直接用主二进制、行为不变
+// ⚠️ Helper 名不能用 app.getName() 拼（test 包 productName 被 CLI 覆盖、getName 对不上、
+//   v0.7.9 实测 spawn ENOENT pid=undefined）——直接扫 Frameworks 目录找「* Helper.app」
 const serverNodeBin = () => {
   if (!app.isPackaged || process.platform !== "darwin") return process.execPath;
-  const helperName = `${app.getName()} Helper`;
-  return path.join(
-    path.dirname(process.execPath),
-    "..",
-    "Frameworks",
-    `${helperName}.app`,
-    "Contents",
-    "MacOS",
-    helperName,
-  );
+  const frameworksDir = path.join(path.dirname(process.execPath), "..", "Frameworks");
+  try {
+    // 主 Helper 形如「<productName> Helper.app」；GPU / Plugin / Renderer 变体
+    // 结尾是「Helper (GPU).app」等、endsWith 天然排除
+    const helperApp = readdirSync(frameworksDir).find((n) =>
+      n.endsWith(" Helper.app"),
+    );
+    if (helperApp) {
+      const helperName = helperApp.replace(/\.app$/, "");
+      return path.join(frameworksDir, helperApp, "Contents", "MacOS", helperName);
+    }
+  } catch {
+    // 读不到 Frameworks（异常布局）走主二进制兜底
+  }
+  log("[main] 没找到 Helper.app、回落主二进制跑 server（Dock 会多 exec 图标）");
+  return process.execPath;
 };
 
 const startServer = () => {
@@ -192,6 +212,16 @@ const startServer = () => {
     windowsHide: true,
   });
   log(`[main] server 启动 pid=${serverProc.pid} dataDir=${path.join(app.getPath("userData"), "data")}`);
+  // spawn 本身失败（如二进制路径不存在 ENOENT）不会触发 exit、必须挂 error——
+  // v0.7.9 实测 Helper 路径拼错时 pid=undefined 静默挂死、靠这里明错
+  serverProc.on("error", (err) => {
+    serverProc = null;
+    log(`[main] server spawn 失败：${err?.message || err}`);
+    if (!quitting) {
+      dialog.showErrorBox("服务启动失败", `内部服务进程拉不起来：${err?.message || err}`);
+      app.quit();
+    }
+  });
   serverProc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
   serverProc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
   serverProc.on("exit", (code) => {
@@ -421,7 +451,8 @@ const isNewer = (a, b) => {
 };
 
 const setupAutoUpdate = async () => {
-  if (!app.isPackaged) return;
+  // 测试实例版本号永远是 0.0.0-dev、查更新必弹「发现新版本」、纯骚扰——跳过
+  if (!app.isPackaged || IS_TEST) return;
   try {
     if (process.platform === "win32") {
       // electron-updater 是 CJS、ESM 下走 default 再解构最稳

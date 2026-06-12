@@ -18,7 +18,8 @@
     "test": "vitest run",
     "electron:server": "node scripts/assemble-electron-server.mjs",
     "electron:dev": "electron electron-app",
-    "electron:dist": "electron-builder"
+    "electron:dist": "electron-builder",
+    "electron:dist:test": "electron-builder --mac --dir -c.productName=AI工作流test"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",
