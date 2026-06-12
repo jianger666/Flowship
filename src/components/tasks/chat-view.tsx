@@ -161,26 +161,25 @@ export const ChatView = ({
     return undefined;
   })();
 
-  // 顶部状态条文案
+  // 顶部状态条文案——只在「有事要说」时显示（V0.7.11 简化：等待输入 / 空闲
+  // 是常态、不值得常驻一行字、输入岛 placeholder 已表达；异常 / 进行中才提示）
   const statusHint = (() => {
     if (isSubmitting) return "正在发送消息...";
     if (task.runStatus === "running") {
       return "agent 正在回、等它先说完一段";
     }
-    if (task.runStatus === "awaiting_user") {
-      return "agent 在等你回复、随时输入";
-    }
     if (task.runStatus === "error") {
       return "上一轮 agent 异常退出、再发一条可重启新一轮 run";
     }
-    return "直接在底部输入框开始对话、agent 会自动启动（整段对话 SDK 计费一次跑到底）";
+    return null;
   })();
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col">
-      {/* 顶部 bar：返回 + title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片） */}
-      <div className="border-b bg-card/40 px-6 py-3">
-        <div className="flex items-center justify-between gap-3">
+      {/* 顶部 bar：返回 + title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片）
+          V0.7.11：轻量化——无底色、状态文案只在异常 / 进行中出现（不常驻占行） */}
+      <div className="border-b px-6 py-2.5">
+        <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             {/* 返回列表：跟 task 模式顶部条同款（V0.7.8 补、此前 chat 模式只能点 logo 回首页） */}
             <Button
@@ -188,19 +187,20 @@ export const ChatView = ({
               size="sm"
               nativeButton={false}
               render={<Link href="/" className="no-underline" />}
+              className="text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft />
               返回
             </Button>
-            <Separator orientation="vertical" className="h-6" />
+            <Separator orientation="vertical" className="h-5" />
             <div className="flex min-w-0 items-center gap-2">
-              <h1 className="truncate text-base font-semibold tracking-tight">
+              <h1 className="truncate text-sm font-medium tracking-tight">
                 {task.title}
               </h1>
               <Badge variant="outline" className="text-[10px]">
                 对话
               </Badge>
-              {task.runStatus !== "idle" && (
+              {task.runStatus !== "idle" && task.runStatus !== "awaiting_user" && (
                 <Badge
                   variant={RUN_STATUS_VARIANT[task.runStatus]}
                   className="text-[10px]"
@@ -235,16 +235,19 @@ export const ChatView = ({
             </div>
           )}
         </div>
-        {/* 状态条文案：始终展示、用户能看到当前阶段 */}
-        <div className="mt-1 text-xs text-muted-foreground">{statusHint}</div>
+        {/* 状态条文案：仅异常 / 发送中显示 */}
+        {statusHint && (
+          <div className="mx-auto mt-1 w-full max-w-3xl text-xs text-muted-foreground">
+            {statusHint}
+          </div>
+        )}
       </div>
 
-      <Separator />
-
-      {/* 中间区：EventStream + 底部输入框 */}
+      {/* 中间区：EventStream（chat 形态：窄列对话流 + 圆角输入岛）+ 底部输入框 */}
       <div className="min-h-0 flex-1">
         <EventStream
           task={task}
+          variant="chat"
           streamingText={streamingText}
           onUserReply={handleUserReply}
           canReply={canReply}

@@ -20,6 +20,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
+  ArrowUp,
   File as FileIcon,
   Folder,
   FolderOpen,
@@ -91,6 +92,11 @@ interface Props {
   disabledHint?: string;
   // V0.6.24：footer 左侧 slot（chat 模式注入模型选择器、plan / task 模式不传）
   composerLeading?: ReactNode;
+  // V0.7.11：渲染形态
+  // log（默认）：task 模式事件流——卡片行 + header 折叠、信息密度优先
+  // chat：自由模式对话——Cursor agent window 风格（窄列居中 / AI 平铺 /
+  //       用户浅色块 / 过程细行 / 圆角输入岛）
+  variant?: "log" | "chat";
 }
 
 // chat 单次最多附几条路径（防滥用 / context 爆）
@@ -108,7 +114,9 @@ const EventStreamImpl = ({
   canReply,
   disabledHint,
   composerLeading,
+  variant = "log",
 }: Props) => {
+  const isChat = variant === "chat";
   // 输入草稿、发送后清空
   const [draft, setDraft] = useState("");
   // 文件 / 目录路径选择器开关（点「附文件」按钮触发）
@@ -225,16 +233,32 @@ const EventStreamImpl = ({
     }
   };
 
+  // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
+  // 连续过程行（thinking / tool_call / info…）紧凑堆叠成一组
+  const isConversational = (it: RenderItem) =>
+    isStreamingItem(it) ||
+    it.kind === "assistant_message" ||
+    it.kind === "user_reply" ||
+    it.kind === "ask_user_request";
+
   return (
     <div className="flex h-full flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
-        事件流
-      </div>
+      {/* chat 形态不渲染「事件流」标签条（ChatView 自有顶部 bar、少一层视觉框） */}
+      {!isChat && (
+        <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
+          事件流
+        </div>
+      )}
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll */}
       <div className="min-h-0 flex-1">
         {items.length === 0 ? (
-          <div className="p-4 text-xs text-muted-foreground">
-            任务还没开始、暂无事件
+          <div
+            className={cn(
+              "p-4 text-xs text-muted-foreground",
+              isChat && "flex h-full items-center justify-center text-sm",
+            )}
+          >
+            {isChat ? "说点什么、agent 会自动启动" : "任务还没开始、暂无事件"}
           </div>
         ) : (
           <Virtuoso
@@ -248,22 +272,32 @@ const EventStreamImpl = ({
             followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
             // 初始定位到末尾（任务详情首次进来直接看最新事件、不用手动滚）
             initialTopMostItemIndex={items.length - 1}
-            // 每条 item 自带 padding、模拟原 gap-3 + p-4 间距
-            // pt 用 idx 0 给 4 / 其他给 3、pb 给末尾 4 / 其他无（让 pt 接力）
+            // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距
             itemContent={(idx, item) => (
               <div
                 className={cn(
                   "px-4",
-                  idx === 0 ? "pt-4" : "pt-3",
-                  idx === items.length - 1 && "pb-4",
+                  isChat && "mx-auto w-full max-w-3xl px-6",
+                  isChat
+                    ? idx === 0
+                      ? "pt-6"
+                      : isConversational(item)
+                        ? "pt-6"
+                        : isConversational(items[idx - 1])
+                          ? "pt-4"
+                          : "pt-0.5"
+                    : idx === 0
+                      ? "pt-4"
+                      : "pt-3",
+                  idx === items.length - 1 && (isChat ? "pb-6" : "pb-4"),
                 )}
               >
                 {isStreamingItem(item) ? (
-                  <StreamingAssistantRow text={item.text} />
+                  <StreamingAssistantRow text={item.text} variant={variant} />
                 ) : item.kind === "ask_user_request" ? (
                   <AskUserRequestRow ev={item} task={task} />
                 ) : (
-                  <EventRow ev={item} taskId={task.id} task={task} />
+                  <EventRow ev={item} taskId={task.id} task={task} variant={variant} />
                 )}
               </div>
             )}
@@ -272,7 +306,144 @@ const EventStreamImpl = ({
       </div>
       {/* hideReplyComposer=true 时（plan workflow 模式）只展示事件流、底部输入区由父组件用 phase ack 区替代
           这里 early-return 避免下面整大段 JSX 进 DOM、也避免 FsPickerDialog 多挂一个 */}
-      {hideReplyComposer ? null : (
+      {hideReplyComposer ? null : isChat ? (
+        /* ---------- chat 形态：圆角输入岛（V0.7.11、Cursor agent window 风格） ---------- */
+        <div className="shrink-0 px-6 pb-5 pt-1">
+          <div
+            className={cn(
+              "mx-auto w-full max-w-3xl rounded-xl border bg-card/70 shadow-sm transition-all",
+              "focus-within:border-ring/60 focus-within:shadow-md",
+              isDragging && "border-primary/50 bg-primary/5",
+              !isAwaitingUser && "opacity-70",
+            )}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
+            {/* 附件预览：岛内顶部（图缩略 + 路径 chips） */}
+            {(attachedImages.length > 0 || attachedPaths.length > 0) && (
+              <div className="flex flex-wrap gap-2 px-3 pt-3">
+                {attachedImages.map((img) => (
+                  <div
+                    key={img.id}
+                    className="group relative size-14 overflow-hidden rounded-md border bg-card"
+                    title={img.file.name}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={img.dataUrl} alt={img.file.name} className="size-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveImage(img.id)}
+                      className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                      aria-label="移除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                ))}
+                {attachedPaths.map((p) => {
+                  const looksLikeDir = !pathBasename(p).includes(".");
+                  return (
+                    <div
+                      key={p}
+                      className="group flex max-w-full items-center gap-1.5 rounded-md border bg-background/60 px-2 py-1 text-xs"
+                      title={p}
+                    >
+                      {looksLikeDir ? (
+                        <Folder className="size-3 shrink-0 text-amber-500" />
+                      ) : (
+                        <FileIcon className="size-3 shrink-0 text-muted-foreground" />
+                      )}
+                      <span className="min-w-0 truncate font-mono text-[11px]">{pathBasename(p)}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemovePath(p)}
+                        className="flex size-3.5 shrink-0 items-center justify-center rounded-full opacity-60 hover:bg-muted hover:opacity-100"
+                        aria-label="移除"
+                      >
+                        <X className="size-2.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {/* 输入框：去边框嵌入岛内、岛本身的 focus-within 提供聚焦反馈 */}
+            <Textarea
+              ref={inputRef}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              rows={2}
+              placeholder={
+                isAwaitingUser
+                  ? "随便聊、贴图、拖文件（Cmd+Enter 发送）"
+                  : (disabledHint ?? "agent 当前没有等待你回复")
+              }
+              disabled={!isAwaitingUser}
+              className="min-h-[3.25rem] resize-none border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+            />
+            {/* 底部操作行：左模型选择、右附件 + 发送 */}
+            <div className="flex items-center justify-between gap-2 px-2.5 pb-2">
+              <div className="flex min-w-0 items-center gap-1.5">{composerLeading}</div>
+              <div className="flex shrink-0 items-center gap-0.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={!isAwaitingUser}
+                  onClick={handleAttachClick}
+                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                  title="附图（也支持粘贴 / 拖拽）"
+                >
+                  <Paperclip className="size-3.5" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={!isAwaitingUser}
+                  onClick={() => setPathPickerOpen(true)}
+                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                  title="附文件 / 目录路径（agent 会用 `read` 工具看）"
+                >
+                  <FolderOpen className="size-3.5" />
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={
+                    !isAwaitingUser ||
+                    (!draft.trim() && attachedImages.length === 0 && attachedPaths.length === 0)
+                  }
+                  onClick={handleSend}
+                  className="ml-1 size-7 rounded-lg p-0"
+                  title="发送（Cmd+Enter）"
+                >
+                  <ArrowUp className="size-4" />
+                </Button>
+              </div>
+            </div>
+          </div>
+          {/* 岛下方状态行：禁用原因 / 附件计数、没内容时不占高 */}
+          {(!isAwaitingUser || attachedImages.length > 0 || attachedPaths.length > 0) && (
+            <div className="mx-auto mt-1.5 w-full max-w-3xl px-1 text-center text-[11px] text-muted-foreground/70">
+              {!isAwaitingUser
+                ? (disabledHint ?? "agent 当前没有等待你回复")
+                : `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`}
+            </div>
+          )}
+          {/* 隐藏 input：附图按钮触发它 */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            onChange={handleFilePicked}
+          />
+        </div>
+      ) : (
         <>
       <Separator />
       {/* 输入区整片支持拖拽：drag over 时整片轮廓变虚线提示 */}
@@ -422,18 +593,21 @@ const EventStreamImpl = ({
           </div>
         </div>
       </div>
-      {/* 文件 / 目录选择对话框：mode=any、多选、agent 拿到这些路径后自己用 `read` 工具读 */}
-      <FsPickerDialog
-        open={pathPickerOpen}
-        onOpenChange={setPathPickerOpen}
-        mode="any"
-        multiple
-        title="附加文件 / 目录"
-        description="选完点确认、绝对路径会跟你的消息一起发给 agent、由它用 `read` 工具自己读"
-        initialPath={getEffectiveCwd(task.repoPaths)}
-        onConfirm={handlePathsPicked}
-      />
         </>
+      )}
+      {/* 文件 / 目录选择对话框（log / chat 两形态共用）：mode=any、多选、
+          agent 拿到这些路径后自己用 `read` 工具读 */}
+      {!hideReplyComposer && (
+        <FsPickerDialog
+          open={pathPickerOpen}
+          onOpenChange={setPathPickerOpen}
+          mode="any"
+          multiple
+          title="附加文件 / 目录"
+          description="选完点确认、绝对路径会跟你的消息一起发给 agent、由它用 `read` 工具自己读"
+          initialPath={getEffectiveCwd(task.repoPaths)}
+          onConfirm={handlePathsPicked}
+        />
       )}
     </div>
   );

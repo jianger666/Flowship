@@ -89,26 +89,43 @@ export const MarkdownText = ({ text }: { text: string }) => (
  *
  * 视觉提示：左侧图标 + 标签「AI 回复中...」+ 末尾闪烁光标、明显区分「流式中」vs「已完成」
  */
-const StreamingAssistantRowImpl = ({ text }: { text: string }) => (
-  <div className="flex gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2">
-    <div className="mt-0.5 shrink-0">
-      <Sparkles className="size-4 animate-pulse text-emerald-500" />
-    </div>
-    <div className="min-w-0 flex-1 text-xs">
-      <div className="flex items-center gap-2">
-        <span className="text-muted-foreground/70 text-[10px]">
-          AI 回复中…
-        </span>
-      </div>
-      <div className="mt-1 leading-relaxed wrap-break-word text-foreground">
-        {/* 流式过程中也按 markdown 渲染、用户看到的就是最终样式、不会出现 **xx** 字面量 */}
+const StreamingAssistantRowImpl = ({
+  text,
+  variant = "log",
+}: {
+  text: string;
+  variant?: "log" | "chat";
+}) => {
+  // chat 形态：跟正式 AI 回复同样平铺、只多一个末尾闪烁光标（Cursor 风格、流式无容器）
+  if (variant === "chat") {
+    return (
+      <div className="text-sm leading-relaxed">
         <MarkdownText text={text} />
-        {/* 末尾闪烁光标、强提示「正在打字」 */}
-        <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-emerald-500/70 align-middle" />
+        <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-foreground/60 align-middle" />
+      </div>
+    );
+  }
+  return (
+    <div className="flex gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2">
+      <div className="mt-0.5 shrink-0">
+        <Sparkles className="size-4 animate-pulse text-emerald-500" />
+      </div>
+      <div className="min-w-0 flex-1 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="text-muted-foreground/70 text-[10px]">
+            AI 回复中…
+          </span>
+        </div>
+        <div className="mt-1 leading-relaxed wrap-break-word text-foreground">
+          {/* 流式过程中也按 markdown 渲染、用户看到的就是最终样式、不会出现 **xx** 字面量 */}
+          <MarkdownText text={text} />
+          {/* 末尾闪烁光标、强提示「正在打字」 */}
+          <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-emerald-500/70 align-middle" />
+        </div>
       </div>
     </div>
-  </div>
-);
+  );
+};
 
 // React.memo（V0.5.14）：text 频繁因 chunk 追加而变化、其他时候稳定
 // memo 让 SSE 推 chunk 时只有 text 真的变了才重渲染、Virtuoso 内部 item 不无意义 reconcile
@@ -118,10 +135,14 @@ const EventRowImpl = ({
   ev,
   taskId,
   task,
+  variant = "log",
 }: {
   ev: TaskEvent;
   taskId: string;
   task: Task;
+  // log：task 模式事件流（卡片 + header + 折叠、信息密度优先）
+  // chat：自由模式对话（V0.7.11、Cursor agent window 风格——AI 平铺 / 用户浅色块 / 过程细行）
+  variant?: "log" | "chat";
 }) => {
   // V0.6：用 actionId 查 action 类型、渲染 tag
   const action = ev.actionId
@@ -170,6 +191,121 @@ const EventRowImpl = ({
   // 展开态：原样 ev.text；batch 模式下展开走 batch 列表
   // batch 模式 summary 追加「×N」后缀、用户一眼看到「这 N 条都是同种工具调用」
   const summary = batch ? `${summarize(ev.text)} ×${batchCount}` : summarize(ev.text);
+
+  // ---------- chat 形态（V0.7.11）----------
+  // 设计参照 Cursor agent window：
+  //   - AI 回复：无容器平铺、prose 直接落在页面底色上（对话主体、最大可读性）
+  //   - 用户消息：浅色圆角块（带左侧细线、视觉「引用」感）、附件随块内显示
+  //   - thinking / tool_call / info：单行细条目（小图标 + 摘要 + 时间）、点击展开、
+  //     视觉权重压到最低——过程可查但不抢戏
+  if (variant === "chat") {
+    // AI 回复：平铺 prose、不进卡片
+    if (isAssistant) {
+      return (
+        <div className="text-sm leading-relaxed">
+          <MarkdownText text={ev.text} />
+        </div>
+      );
+    }
+    // 用户消息：浅色圆角块 + 附件
+    if (isUser) {
+      return (
+        <div className="rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
+          <div className="text-sm leading-relaxed">
+            <MarkdownText text={ev.text} />
+          </div>
+          {images.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {images.map((img) => {
+                const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;
+                return (
+                  <a
+                    key={img.absPath}
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block size-14 overflow-hidden rounded-md border transition-opacity hover:opacity-80"
+                    title={img.filename ?? pathBasename(img.absPath)}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={url} alt={img.filename ?? "附图"} className="size-full object-cover" loading="lazy" />
+                  </a>
+                );
+              })}
+            </div>
+          )}
+          {attachments.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {attachments.map((att) => (
+                <a
+                  key={att.absPath}
+                  href={buildCursorLink(att.absPath) ?? ""}
+                  className="flex max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
+                  title={`${att.absPath}\n点击在 Cursor 中打开`}
+                >
+                  {att.isDir ? (
+                    <Folder className="size-3 shrink-0 text-amber-500" />
+                  ) : (
+                    <FileIcon className="size-3 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="min-w-0 truncate font-mono">{pathBasename(att.absPath)}</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+    // 过程行（thinking / tool_call / info / error…）：单行细条目、可展开
+    return (
+      <div className="group/proc">
+        <button
+          type="button"
+          onClick={handleToggle}
+          className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
+        >
+          {collapsed ? (
+            <ChevronRight className="size-3 shrink-0 opacity-50" />
+          ) : (
+            <ChevronDown className="size-3 shrink-0 opacity-50" />
+          )}
+          <span className="shrink-0 [&_svg]:size-3">{renderEventIcon(ev.kind)}</span>
+          <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
+          {collapsed && summary && (
+            <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">{summary}</span>
+          )}
+          <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/proc:opacity-60">
+            {formatTs(ev.ts)}
+          </span>
+        </button>
+        {!collapsed && (
+          <div className="ml-5 mt-1 border-l border-border/50 pl-3">
+            {batch ? (
+              <ul className="space-y-1">
+                {batch.map((item) => (
+                  <li key={item.id} className="flex gap-2 break-all font-mono text-[11px] text-muted-foreground">
+                    <span className="shrink-0 opacity-60">{formatTs(item.ts)}</span>
+                    {item.name && <span className="shrink-0 text-blue-500/80">{item.name}</span>}
+                    <span className="min-w-0 flex-1">{item.text}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div
+                className={cn(
+                  "wrap-break-word text-xs leading-relaxed text-muted-foreground",
+                  isToolCall && "break-all font-mono text-[11px]",
+                  isThinking && "italic",
+                )}
+              >
+                {ev.text}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
