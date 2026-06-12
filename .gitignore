@@ -8,8 +8,11 @@ dist
 .env.local
 .env.*.local
 
-# Persisted task data (per-user)
-data/
+# Persisted task data (per-user)——根锚定、别误伤子目录里叫 data 的（如 .cursor/skills/*/data）
+/data/
+
+# Python 编译缓存（skill 脚本会产生）
+__pycache__/
 
 # TS incremental cache
 *.tsbuildinfo
