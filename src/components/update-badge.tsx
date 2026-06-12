@@ -60,11 +60,11 @@ export const UpdateBadge = () => {
     const ok = await confirm({
       title: `更新到 v${version}？`,
       description: download
-        ? "将打开下载页、下载 dmg 覆盖安装即可、数据不会丢。"
+        ? "自动下载安装（Dock 图标显示进度）、完成后重启生效、数据不丢。"
         : "应用会重启、正在运行的任务会被中断。",
-      confirmLabel: download ? "打开下载页" : "重启更新",
+      confirmLabel: download ? "立即更新" : "重启更新",
     });
-    // 壳的 will-navigate 拦截这个伪协议——win quitAndInstall、mac openExternal
+    // 壳的 will-navigate 拦截这个伪协议——win quitAndInstall、mac 壳内下载替换自身
     if (ok) window.location.href = "app-update://install";
   };
 

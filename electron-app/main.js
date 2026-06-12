@@ -401,13 +401,105 @@ const notifyPageUpdateReady = () => {
   mainWindow.webContents.executeJavaScript(js).catch(() => {});
 };
 
+// execFile 的「失败要 throw」版（自更新链路用、跟 fail-open 的 execFileP 区分）
+const execFileStrict = (cmd, args) =>
+  new Promise((resolve, reject) => {
+    execFile(cmd, args, { windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) =>
+      err ? reject(err) : resolve(String(stdout)),
+    );
+  });
+
+// mac 应用内自更新（v0.7.12）：壳自己下载 dmg → 替换 /Applications 里的自己 → 重启生效。
+// 关键原理：quarantine 隔离标记只有浏览器等下载器会打、壳进程 fetch 落盘的文件没有
+// → Gatekeeper 不评估 → 免开发者证书实现「类自动更新」、解决用户实测痛点
+// 「每版都要去 系统设置→隐私与安全性 放行 + 输密码」。
+const macSelfUpdate = async (version) => {
+  const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/fe-ai-flow-${version}-mac-arm64.dmg`;
+  // 当前 .app 包路径：execPath = <app>.app/Contents/MacOS/<bin>、往上三层
+  const appPath = path.resolve(process.execPath, "..", "..", "..");
+  if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
+    // 非常规安装位置（如直接在 dmg 里跑）、替换无意义 → 降级开下载页
+    void shell.openExternal(RELEASE_LATEST_URL);
+    return;
+  }
+  const updatesDir = path.join(app.getPath("userData"), "updates");
+  const dmgPath = path.join(updatesDir, `v${version}.dmg`);
+  const mountPoint = path.join(updatesDir, `mnt-${Date.now()}`);
+  try {
+    mkdirSync(updatesDir, { recursive: true });
+    log(`[updater] 下载 ${dmgUrl}`);
+    const res = await fetch(dmgUrl);
+    if (!res.ok || !res.body) throw new Error(`下载失败 HTTP ${res.status}`);
+    // 流式落盘 + Dock 图标进度条（dialog 没法动态刷、原生进度条够用）
+    const total = Number(res.headers.get("content-length")) || 0;
+    const ws = createWriteStream(dmgPath);
+    let got = 0;
+    for await (const chunk of res.body) {
+      if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
+      got += chunk.length;
+      if (total && mainWindow) mainWindow.setProgressBar(got / total);
+    }
+    await new Promise((resolve, reject) =>
+      ws.end((err) => (err ? reject(err) : resolve(undefined))),
+    );
+    mainWindow?.setProgressBar(-1);
+
+    await execFileStrict("hdiutil", [
+      "attach", dmgPath, "-nobrowse", "-quiet", "-mountpoint", mountPoint,
+    ]);
+    const newApp = readdirSync(mountPoint).find((n) => n.endsWith(".app"));
+    if (!newApp) throw new Error("dmg 里没找到 .app");
+
+    // 替换：旧 app 先挪到暂存（userData 跟 /Applications 同卷、rename 原子）、
+    // ditto 新 app 就位（保留签名 / 权限 / xattr）、失败回滚旧的
+    const stagedOld = path.join(updatesDir, `old-${Date.now()}.app`);
+    log(`[updater] 替换 ${appPath}`);
+    await fs.rename(appPath, stagedOld);
+    try {
+      await execFileStrict("ditto", [path.join(mountPoint, newApp), appPath]);
+    } catch (err) {
+      await fs.rename(stagedOld, appPath).catch(() => {});
+      throw err;
+    }
+    await fs.rm(stagedOld, { recursive: true, force: true }).catch(() => {});
+
+    log(`[updater] v${version} 已就位、等用户重启`);
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "更新完成",
+      message: `已更新到 v${version}`,
+      detail: "重启应用后生效。",
+      buttons: ["立即重启", "稍后"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) {
+      quitting = true;
+      app.relaunch();
+      app.quit();
+    }
+  } catch (err) {
+    log(`[updater] 自更新失败：${err?.message || err}、降级开下载页`);
+    dialog.showErrorBox(
+      "自动更新失败",
+      `${err?.message || err}\n\n将打开下载页、请手动下载安装。`,
+    );
+    void shell.openExternal(RELEASE_LATEST_URL);
+  } finally {
+    mainWindow?.setProgressBar(-1);
+    // detach / 清 dmg 都 fail-open（没挂上 / 已弹出都无所谓）
+    await execFileP("hdiutil", ["detach", mountPoint, "-quiet"]);
+    await fs.rm(dmgPath, { force: true }).catch(() => {});
+  }
+};
+
 // 应用更新（页面点「新版本」标识、或对话框确认走到这）：
-// win 重启即装（before-quit 兜底杀 server、不留孤儿）；mac 打开 release 下载页
+// win 重启即装（before-quit 兜底杀 server、不留孤儿）；mac 壳内下载替换自身
 const installUpdateNow = async () => {
   if (!updateReadyVersion) return;
   if (UPDATE_MODE === "download") {
-    log(`[updater] 打开下载页（v${updateReadyVersion}）`);
-    void shell.openExternal(RELEASE_LATEST_URL);
+    log(`[updater] mac 自更新开始（v${updateReadyVersion}）`);
+    await macSelfUpdate(updateReadyVersion);
     return;
   }
   log(`[updater] 用户确认、重启安装 v${updateReadyVersion}`);
@@ -473,7 +565,7 @@ const setupAutoUpdate = async () => {
       await au.checkForUpdates();
       return;
     }
-    // mac：只查版本号、有新版提醒去下载页（dmg 覆盖安装、数据在 userData 不丢）
+    // mac：查版本号、有新版提醒「应用内自更新」（壳下载 dmg 替换自身、v0.7.12）
     const latest = await fetchLatestVersion();
     const current = app.getVersion();
     if (!latest || !isNewer(latest, current)) return;
@@ -482,8 +574,8 @@ const setupAutoUpdate = async () => {
     notifyPageUpdateReady();
     await promptUpdateOnce(latest, {
       message: `新版本 v${latest} 已发布`,
-      detail: "mac 版需手动更新：下载 dmg 覆盖安装即可、数据不会丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
-      confirmLabel: "打开下载页",
+      detail: "点「立即更新」自动下载安装（Dock 图标显示进度）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
+      confirmLabel: "立即更新",
     });
   } catch (err) {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
