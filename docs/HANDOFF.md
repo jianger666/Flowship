@@ -42,6 +42,10 @@
 
 > 本段只描述「现在的代码是这样组织的」、不带版本号迭代细节。版本演进史看 `docs/CHANGELOG.md`。
 
+### 交付形态：Electron 桌面 app 唯一（2026-06-12 用户拍板）
+
+后续**不用考虑网页版、绿色版**——新功能按桌面端设计（原生 picker / 壳 IPC / 自更新随便用）、不为浏览器做适配；浏览器直访 8876 仅剩本地 dev 调试用途；绿色 zip 包不再维护、CI 绿色包 job 待清理。
+
 ### Task 容器 + Action 历史模型
 
 V0.5 phase chain（`plan → build → review`、固定顺序）已废弃、改为 **task 容器 + action 历史**：
