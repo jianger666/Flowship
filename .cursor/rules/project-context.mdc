@@ -36,8 +36,7 @@ description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
 
 - **后续不用考虑网页版、绿色版**——桌面 Electron app 是唯一交付形态。
 - 新功能一律按桌面端设计（原生 picker / 壳 IPC / 自更新等能力随便用）、**不为浏览器场景做适配或兼容优化**。
-- 浏览器直访 `127.0.0.1:8876` 仅剩本地 dev 调试用途——兜底代码（如 native-picker 的 HTTP 链路）保留但不投入。
-- 绿色 zip 包不再维护、v0.7.6 留的「绿色包 win sqlite3 平台修复」欠账作废；CI 绿色包 job 待清理（删之前跟用户确认一声即可）。
+- 绿色 zip 包 + 便携 node + launcher + CI 绿色包 job 已彻底清理——唯一发版链 = Electron 安装包（`packaging/` 仅留 `icon.png` 做图标源）。
 
 ## 关键约束（不要踩雷）
 

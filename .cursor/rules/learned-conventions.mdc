@@ -14,7 +14,10 @@ alwaysApply: true
   - 测完杀的是「AI工作流test」进程、用户一看名字也不会误删正式应用
 - 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`、收尾 osascript 关「AI工作流test」窗口。
 - 盲写直接发版（不本地验证）也不可取——能 test 实例验的就验一轮再 tag。
-- **测完即删**（用户拍板）：验证完 `rm -rf dist/electron` + `~/Library/Application Support/fe-ai-flow-test`、不留 test 包和测试数据残留。
+- **测完删包、保留配置数据**（2026-06-13 用户修订）：验证完 `rm -rf dist/electron`（删 test 包）、但**保留** `~/Library/Application Support/fe-ai-flow-test`——里面有同步过来的配置（API Key / 模型 / 仓库 / 飞书登录态）、删了每次都要重新同步、留着下次直接复用。
+- **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：起 test 验证前确认不会和用户正在用的正式实例并发跑对话、验完**立即关 test**（osascript 关「AI工作流test」、别后台挂着）。正式被挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。
+- **test 包自动补 SDK 平台包（v0.7.17、assemble-server.addSdkPlatformPackage）**：`electron:dist:test` 走 standalone、Next nft 追不到 `@cursor/sdk-<platform>` 运行时动态加载的平台子包（native cursorsandbox + rg）→ 缺了 SDK 直接 `fetch failed`、对话全挂。组包公共函数已自动补（本地 pnpm 拓扑拷平台包 + symlink、CI hoisted 跳过）——打完可 `ls .../app-server/node_modules/.pnpm/@cursor+sdk@*/node_modules/@cursor/` 确认有 `sdk-darwin-arm64` symlink。
+- **同步正式配置到 test**：`scripts/sync-test-config.mjs`（需 `classic-level`、按需 `pnpm add -D classic-level`）。配置存 Chromium localStorage（`Local Storage/leveldb`）、按 origin（含端口）隔离、正式 8876 ≠ test 8776 直接拷读不到。流程：cp 正式 `Local Storage/leveldb` → `/tmp/fe-prod-ls`（正式 app 在跑、有 LOCK、只能读副本）→ test app 先退出（leveldb 单写锁）→ 脚本读副本、把 key 里 origin 端口 `8876→8776` 转换写入 test（`--probe` 只读看 / `--verify` 读回校验 / 无参正式同步）。
 
 ## UI 组件库
 
@@ -161,6 +164,7 @@ alwaysApply: true
 - **构造的假想例子必须明标「构造」、不当证据**——举例说 bug 场景（如「agent 写『跳过 crm-web』会漏检」）要讲清是假想、不是从真实 artifact 读到的。把假想例子当证据 = 高估 bug。
 - **被 challenge 后第一反应是回头核实、不是辩解**——用户质疑某条结论时、先读真实代码 / 数据验证、错了就明确更正 + 降级优先级。
 - **方法论（蓝军 + RCA）**：读真实代码确认行号逻辑 → 主动证伪「这是 bug」→ 攻不破才是真 bug → 标注触发条件 + 概率。
+- **grep 本仓库没命中 ≠ 现象不存在**（V0.7.19 连踩两次、用户实证纠正）——外部依赖 / IDE / SDK 层的现象（如 Cursor 内置 anti-loop 提示「flagged as looping」、composer 2.5 运行时把长 shell 自动转后台），本仓 grep 必然找不到、但真实存在。别把「自己代码里没搜到」当「是 agent 编的 / 不存在」（踩坑：把 SDK 自动转后台渲染出的第 2 条 curl 臆断成「引导诱导重发」、把 Cursor 真 anti-loop 提示误判成 agent hallucinate）。下结论前先问「这现象可能来自哪一层」、验证范围别只圈自己代码库。
 
 ## 飞书项目官方 MCP：远程服务、行为会无预警变更（2026-06-12 踩过）
 
@@ -184,3 +188,11 @@ alwaysApply: true
 - **任何代码改动动手前、先把「准备怎么改」（改哪些文件 / 思路 / 影响面）通过 cursor-feedback 发给用户确认**、用户点头后再写代码。
 - 例外：用户已经在反馈里明确说「可以、动手」的当次改动、不用再确认一遍。
 - 排查 / 只读分析不受限——读代码、跑测试、复现问题都可以直接做、只有「写改动」要先过确认。
+
+## shell 工具调用避坑（2026-06-13 屡次空返回 exit 1 踩过）
+
+本仓库验证桌面 app 常跑含中文 app 名「AI工作流test」的 shell——两个 zsh / pkill 特性会让命令静默空返回 exit 1、后续 `;` 命令全不执行、看起来像「工具调用失败 / 不长记性」、其实是命令本身被中断：
+
+- **zsh nomatch**：命令里的 glob（如 `ls ~/Library/Logs/*工作流*`）**不匹配时 zsh 直接报错中断整条命令**（不像 bash 把字面量传下去）、`;` 后的命令一个都不跑。规避：别用裸 glob 探路径、用 `ls 目录/ 2>/dev/null` 再人眼找、或 `setopt null_glob`。
+- **pkill -f 自匹配杀自己**：`pkill -f "AI工作流test"` 的 `-f` 匹配**完整命令行**、而执行这条命令的 shell 自身命令行就含「AI工作流test」→ 把自己 SIGKILL 了（空返回 exit 1）。规避：① 杀进程优先 `osascript ... quit`（既有约定）；② 非要 pkill 用经典字符类技巧 `pkill -f "[A]I工作流test"`（正则 `[A]` 匹配 A、但命令行字面是 `[A]I…` 不含连续「AI工作流test」、不自杀）、且 pkill 单独成命令、别和含「AI工作流test」字面的 ls / 路径混在一条。
+- 通用：合并命令空返回时、先 `echo hello` 基线确认 shell 本身正常、再隔离定位是哪段（glob / pkill / 中文）触发——别盲目重试同一条。

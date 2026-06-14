@@ -32,8 +32,8 @@ alwaysApply: true
 
 ## 文件 / 目录选择（2026-06-12 用户拍板「全部用原生、这是大方针」）
 
-- **一律走 `pickNativePaths`**（`src/lib/native-picker.ts`）：桌面端 Electron IPC 秒弹原生对话框、浏览器 dev 场景自动兜底 HTTP + osascript。不要再写自绘文件浏览器、也不要直接 fetch `/api/fs/pick-native`。
-- 调用期间给按钮 spinner（osascript 兜底链路有 ~1s 冷启动、参考 event-stream 附文件按钮）。
+- **一律走 `pickNativePaths`**（`src/lib/native-picker.ts`）：桌面端 Electron 壳走主进程 `dialog.showOpenDialog`（秒弹 + 自动前台聚焦）。项目只交付桌面端、非桌面环境直接 toast 提示、不再写自绘文件浏览器或 HTTP 兜底。
+- 调用期间给按钮 spinner（防双击连开两个对话框、参考 event-stream 附文件按钮）。
 
 ## 操作反馈（已有约定、汇总）
 

@@ -67,24 +67,23 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 
 ```bash
 pnpm install
-pnpm dev
+pnpm dev    # 浏览器开 http://localhost:8876
 ```
 
-### 方式二：绿色包（同事零环境上手、不需要 node / pnpm / git）
+### 方式二：桌面安装包（同事零环境上手、不需要 node / pnpm / git）
 
-从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台的 zip、解压到任意目录：
+从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台的安装包：
 
-| 平台 | 包 | 启动 |
+| 平台 | 包 | 安装 |
 |---|---|---|
-| Windows | `fe-ai-flow-win-x64.zip` | 双击 `启动fe-ai-flow.bat` |
-| mac（M 芯片） | `fe-ai-flow-darwin-arm64.zip` | **首次右键** `启动fe-ai-flow.command` →「打开」（过 Gatekeeper）、之后直接双击 |
-| mac（Intel） | `fe-ai-flow-darwin-x64.zip` | 同上 |
+| Windows | `fe-ai-flow-<版本>-win-x64.exe` | 双击安装（一键装到用户目录、免管理员）、之后自动更新 |
+| mac（M 芯片） | `fe-ai-flow-<版本>-mac-arm64.dmg` | 拖进「应用程序」、**首次右键 →「打开」** 过 Gatekeeper |
 
-启动后浏览器自动打开、桌面自动出现快捷方式；每次启动自动检查新版、有就静默更新（任务数据 `data/` 保留）。
+桌面端 app 自带运行时、装完即用；win 启动自动检查新版静默更新、mac 应用内自更新（任务数据保留）。
 
-> 发版（维护者）：`git tag v0.6.X && git push origin v0.6.X`、CI 自动 build 三平台绿色包传 Release。
+> 发版（维护者）：`git tag v0.7.X && git push origin v0.7.X`、CI 自动 build win/mac 安装包传 Release。
 
-打开 http://localhost:8876、按以下顺序操作：
+按以下顺序操作：
 
 1. **设置页 `/settings`**：
    - **API Key**：粘贴 Cursor API Key（[这里办一个](https://cursor.com/dashboard/integrations)、`crsr_` 开头）
@@ -164,7 +163,7 @@ fe-ai-flow/
 |---|---|---|
 | Cursor API Key | localStorage | 不上传服务器、每用户自配 |
 | 默认模型 + 参数 | localStorage | `ModelSelection`、跟 SDK schema 一致 |
-| 仓库列表 | localStorage | 走 `/api/fs/*` + `FsPickerDialog` 选目录、可多仓 |
+| 仓库列表 | localStorage | 桌面端原生 picker（`pickNativePaths`）选目录、可多仓 |
 | MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `feAiFlowChat`（提供 `wait_for_user` / `ask_user`） |
 | 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP |
 | Prompt 模板 | `prompts/action-*.md` + `_super.md` / `_shared.md` | 用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |

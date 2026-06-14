@@ -28,7 +28,7 @@
  * ## 异常路径
  *
  * - **token 不合法**：写一行 `[INVALID_TOKEN]\n` + end、curl exit 0、agent 看到 INVALID_TOKEN 自然结束 run
- * - **客户端断开（curl exit / max-time / 网络断）**：abort signal 触发、清 keepalive timer + close stream
+ * - **客户端断开（curl exit / 网络断）**：abort signal 触发、清 keepalive timer + close stream
  *   - **不清 pendingMap entry**：entry 留着、用户在 UI 点「推进 → 让原 agent 继续」走 /api/tasks/[id]/advance（mode=resume）复用
  * - **服务端进程重启**：pendingMap 内存丢、cold-start recovery 标 failed、UI 引导用户重新启动 task
  */
@@ -44,7 +44,8 @@ import { SIGNALS, keepaliveLine } from "@/lib/protocol-signals";
 export const runtime = "nodejs";
 // 禁止 Next.js 缓存这条响应
 export const dynamic = "force-dynamic";
-// Next.js 单次响应最大时长（秒）。Node runtime 实际无硬限、shell curl 自己用 --max-time 卡 30 分钟
+// Next.js 单次响应最大时长（秒）声明。Node standalone（electron / 本地）实际不强制、
+// V0.7.18 砍掉 agent 端 while 重连后、单条 curl 靠服务端 KEEPALIVE 撑、能前台挂几小时等用户
 export const maxDuration = 3600;
 
 interface Ctx {
@@ -91,10 +92,9 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
         }
       };
 
-      // V0.6.21：连接建立立即发一个 keepalive——配合 agent 端 while-loop 重连：
-      // 下一轮 curl 一连上就有 stdout、把每轮切换的「无输出」间隙从 ~60s 降到秒级。
-      // SDK shell 是 idle-timeout（多久没输出才杀、非总时长）、持续输出才不被杀；
-      // 60s 间隔已实测够撑 30 分钟、但 while 多轮切换叠加 sleep、这一行是额外保险。
+      // 连接建立立即发一个 keepalive：curl 一连上就有 stdout、agent 立刻确认连上、不必干等首个 60s 心跳。
+      // SDK shell 是 idle-timeout（多久没输出才杀、非总时长）、持续输出才不被杀——
+      // 所以下面 60s 一次的 KEEPALIVE 是维持长链接的命脉（V0.7.18 砍掉 agent 端 while 重连后、全靠它撑住单条 curl）。
       try {
         controller.enqueue(encoder.encode(keepaliveLine()));
       } catch {
@@ -149,7 +149,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
           close();
         });
 
-      // 客户端主动断（curl exit / max-time / 网络断）→ abort signal
+      // 客户端主动断（curl exit / 网络断）→ abort signal
       // 注意：**不清 pendingMap entry**、留着给「推进 → 让原 agent 继续」按钮复用
       req.signal?.addEventListener("abort", () => {
         if (closed) return;

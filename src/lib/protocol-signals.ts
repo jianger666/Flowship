@@ -64,9 +64,10 @@ export const buildNextActionHead = (args: {
     .filter(Boolean)
     .join(" ") + "]";
 
-// shell long-poll 的「终态行」token 列表——curl 输出命中任一 token 即退出重连循环。
+// shell long-poll 的「终态行」token 列表——agent 读 curl stdout 时据此识别哪些行该结束等待、推进下一步。
 // 必须覆盖 formatToolReturnAsText 所有可能的头 + wait-ack 路由直写的错误头、
-// 少一个 = agent 拿到结果却继续空转重连。
+// 少一个 = agent 拿到结果却不认识、继续干等。
+// （V0.7.18 前还用它生成 grep 正则给 while 重连判断退出、引导简化成单条 curl 后不再 grep、仅留作协议清单 + 一致性测试源。）
 export const TERMINAL_SIGNAL_TOKENS = [
   "NEXT_ACTION",
   "ACTION_ACK",
@@ -78,7 +79,3 @@ export const TERMINAL_SIGNAL_TOKENS = [
   "TASK_ABANDONED",
   "INTERNAL_ERROR",
 ] as const;
-
-// 给 shell guidance 内嵌的 grep -qE 模式（单引号包裹使用、注意 shell 转义已含 \\[）
-export const terminalSignalGrepPattern = (): string =>
-  `\\[(${TERMINAL_SIGNAL_TOKENS.join("|")})`;

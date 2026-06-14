@@ -211,7 +211,7 @@ const EventStreamImpl = ({
     });
   };
 
-  // 原生 picker（V0.7.13）：附文件 / 附目录各自一键、server 同机弹系统对话框
+  // 原生 picker（V0.7.13）：附文件 / 附目录各自一键、桌面端走主进程系统对话框
   const pickPaths = async (mode: "file" | "folder") => {
     setPicking(mode);
     try {
@@ -322,7 +322,7 @@ const EventStreamImpl = ({
         )}
       </div>
       {/* hideReplyComposer=true 时（plan workflow 模式）只展示事件流、底部输入区由父组件用 phase ack 区替代
-          这里 early-return 避免下面整大段 JSX 进 DOM、也避免 FsPickerDialog 多挂一个 */}
+          这里 early-return 避免下面整大段输入区 JSX 进 DOM */}
       {hideReplyComposer ? null : isChat ? (
         /* ---------- chat 形态：圆角输入岛（V0.7.11、Cursor agent window 风格） ---------- */
         <div className="shrink-0 px-6 pb-5 pt-1">

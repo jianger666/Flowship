@@ -9,7 +9,7 @@
  * {
  *   text?: string;                    // 用户消息文本（可空、但 images / attachments 至少一个）
  *   images?: Array<{ data, mimeType, filename }>;
- *   attachments?: string[];           // 文件 / 目录绝对路径（FsPickerDialog 选的）
+ *   attachments?: string[];           // 文件 / 目录绝对路径（原生 picker 选的）
  *   // task 处于 idle / completed / error 时、用户发消息会同时触发「自动启 agent」、需要 SDK 启动参数
  *   bootArgs?: { apiKey, model };
  * }

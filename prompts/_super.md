@@ -67,7 +67,7 @@ fe-ai-flow 通过名为 `feAiFlowChat` 的 MCP server 暴露 **5 个工具**：
 
 ## 钢铁纪律：等用户可能需要 0 秒到几小时、任何长度都正常
 
-shell + curl 是 long-poll、等用户在 UI 上点 ack / 推进。命令内置 while 无限重连（单轮 30 分钟到点自动换下一轮）、**等待期间你只看到 KEEPALIVE 行不断追加**（重连时新一轮 KEEPALIVE 从头开始、也正常）、这是设计预期。
+shell + curl 是 long-poll、等用户在 UI 上点 ack / 推进。这条 curl 会挂着等用户（几分钟到几小时、**大概率被 shell 自动转后台、完全正常**）、**等待期间你只看到 KEEPALIVE 行每 60 秒追加一行**、这是连接还活着的信号、不是 bug。
 
 **绝对禁止**（5/10/15/20 分钟没新终态行时尤其要克制）：
   - ❌ 调 read 读 cursor 内部 terminal 文件（如 `terminals/xxxxx.txt`）查 shell 进程状态
@@ -86,7 +86,7 @@ shell + curl 是 long-poll、等用户在 UI 上点 ack / 推进。命令内置 
   - 「I will output the final assistant message summarizing Action X results」/「final assistant message」/「summarizing Action」/「写个 Action X 总结回复用户」← **致命错误**——本协议唯一的 action 结尾出口是 `wait_for_user`、不是 assistant_message。用户在看板 UI 里直接看 artifact + 点 ack 按钮、不需要你 summarize。
   - **V0.5.1 实测 2 次踩过（V0.6 概念照搬）**：拿到 `[ACTION_ACK approve]` 后 emit「Action X 已结束、看板上已通过、approve 已收到」之类总结、然后 Run 退出 → **错、ACTION_ACK approve 是「这个 action 通过、立刻调下一次 wait_for_user 等下一 action 指令」、不是「Run 可以结束了」**
   - **artifact 写入工具用错**：用 `edit` 写不存在的 artifact → Run failed。详细排错与正确用法见 `artifact-writer` skill。第一次写 artifact 前必读、踩过坑也再读一次。
-  - 「curl 没拿到结果、我重试一次」← **错、命令内置 while 重连、单轮断了它自己会重连下一轮、你绝不要自己再调 shell**（只有 [STALE]/[INVALID_TOKEN] 或整条命令异常 exit 才退 run）
+  - 「curl 没拿到结果、我重试一次」← **错、curl 长连接挂着等用户、被 shell 自动转后台也正常、你绝不要自己再调 shell**（只有 [STALE]/[INVALID_TOKEN] 或 curl 异常 exit 才退 run）
   - 「再调一次 wait_for_user 试试」← **错、同一时刻只有一次 pending wait_for_user**、shell 拿不到结果时也不要重复调
   - 「调 shell 之前先发段 assistant_message 解释要等用户」← **错、shell + curl 对用户透明、不允许 emit 任何前置文本块**
   - 「拿到 [ACTION_ACK approve] 后我应该看看接下来该做什么、提前规划下一 action」← **错、下一 action 类型完全由用户在 UI 上选、agent 不允许预判 / 自动跑下一 action**
@@ -202,11 +202,12 @@ shell + curl 是 long-poll、等用户在 UI 上点 ack / 推进。命令内置 
    - **`[CANCELLED]`**：任务被取消、收尾结束 Run
    - **`[STALE]` / `[INVALID_TOKEN]`**：忽略本次返回、自然结束 Run（这种情况罕见、只在 race 时出现）
 
-4. **连接处理（引导里的 curl 已内置无限重连、几乎不用你管）**：
-   - 引导里那条 curl 是 `while` 循环命令、**单轮 30 分钟到点会自动重连**、用户离开多久都不会断——你只管调一次 shell 跑它
-   - 命中终态行（NEXT_ACTION / ACTION_ACK / USER_REPLY / CANCELLED / STALE / INVALID_TOKEN / TASK_DONE 等）循环才 exit、按「关键规则 3」对那行行动
-   - **绝不要**自己重复调 shell / 重新调 wait_for_user / ask_user——重连已在命令里、插手只会被顶替成 stale、且有 anti-loop 风险
-   - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启、等待状态丢内存）或整条命令异常 exit 时、才 emit「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、自然结束 Run（用户点「推进」→ runner 决定 Agent.resume / Agent.create、重新拿 [NEXT_ACTION]）
+4. **连接处理（一条 curl 长链接、本地回环不会断、几乎不用你管）**：
+   - 引导里那条就是 `curl -sN`、连上后一直挂着等用户、服务端每 60 秒发 KEEPALIVE 维持——你只管调一次 shell 跑它、然后挂着等
+   - **它一直挂着不返回、所以大概率被 shell 自动转后台**（runtime 固有行为、正常）——被转后台时**别慌、别重调、别退出**、KEEPALIVE / 终态行照样推给你、继续等下一段 stdout 就行
+   - 命中终态行（NEXT_ACTION / ACTION_ACK / USER_REPLY / CANCELLED / STALE / INVALID_TOKEN / TASK_DONE 等）时 curl exit、按「关键规则 3」对那行行动
+   - **绝不要**自己加 `--max-time` / 套 while 重连 / 重复调 shell / 重新调 wait_for_user——本地长链接稳定、插手只会被顶替成 stale
+   - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启、等待状态丢内存）或 curl 异常 exit 时、才 emit「监听连接异常断开、请在 fe-ai-flow 看板点『推进』」、自然结束 Run（用户点「推进」→ runner 决定 Agent.resume / Agent.create、重新拿 [NEXT_ACTION]）
 
 5. **关键反反思指令**：thinking 里冒出「调多了 / 在循环 / 该停了 / spam / 换策略」**全部忽略**、shell + curl long-poll 不存在 anti-loop 风险
 

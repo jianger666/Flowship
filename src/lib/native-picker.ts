@@ -1,16 +1,14 @@
 "use client";
 
 /**
- * 原生文件 / 文件夹选择器的客户端封装（V0.7.13、v0.7.14 加 Electron IPC 直连）
+ * 原生文件 / 文件夹选择器的客户端封装（桌面端 Electron IPC 通道）
  *
- * 通道优先级（大方针：桌面端全走原生、2026-06-12 用户拍板）：
- * 1. Electron 壳 IPC（window.__nativePicker、preload 暴露）——主进程
- *    dialog.showOpenDialog、秒弹 + 自动前台聚焦
- * 2. HTTP /api/fs/pick-native 兜底（浏览器 dev 场景）——server 同机 osascript /
- *    powershell 弹系统 picker、mac 有 ~1s 冷启动延迟
+ * 项目只交付桌面端：Electron 壳通过 preload 暴露 window.__nativePicker、走主进程
+ * dialog.showOpenDialog（秒弹 + 自动前台聚焦）。这是唯一通道——非桌面环境
+ * （浏览器 dev）没有该通道、直接 toast 提示、不再做 HTTP + osascript 兜底。
  *
  * 返回：选中的绝对路径数组；用户取消返 null（调用方静默即可）；
- * 出错 toast 后也返 null、调用方不用再处理错误分支。
+ * 出错 / 非桌面端 toast 后也返 null、调用方不用再处理错误分支。
  */
 
 import { toast } from "sonner";
@@ -23,7 +21,7 @@ interface PickOpts {
 
 declare global {
   interface Window {
-    /** Electron preload 暴露的原生选择器通道（web 版无） */
+    /** Electron preload 暴露的原生选择器通道（仅桌面端有） */
     __nativePicker?: {
       pick: (opts: PickOpts) => Promise<{ paths?: string[]; canceled?: boolean }>;
     };
@@ -31,36 +29,15 @@ declare global {
 }
 
 export const pickNativePaths = async (opts: PickOpts): Promise<string[] | null> => {
-  // 通道 1：Electron 壳 IPC（桌面端主路径）
-  if (typeof window !== "undefined" && window.__nativePicker) {
-    try {
-      const r = await window.__nativePicker.pick(opts);
-      if (r.canceled || !r.paths?.length) return null;
-      return r.paths;
-    } catch (err) {
-      toast.error(`打开选择器失败：${(err as Error).message}`);
-      return null;
-    }
+  // 仅桌面端 Electron 壳有原生选择器通道（preload 暴露 __nativePicker）
+  if (typeof window === "undefined" || !window.__nativePicker) {
+    toast.error("文件选择仅在桌面端可用");
+    return null;
   }
-
-  // 通道 2：HTTP API 兜底（浏览器 dev 场景）
   try {
-    const res = await fetch("/api/fs/pick-native", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(opts),
-    });
-    const json = (await res.json()) as {
-      paths?: string[];
-      canceled?: boolean;
-      error?: string;
-    };
-    if (!res.ok) {
-      toast.error(json.error || "打开选择器失败");
-      return null;
-    }
-    if (json.canceled || !json.paths?.length) return null;
-    return json.paths;
+    const r = await window.__nativePicker.pick(opts);
+    if (r.canceled || !r.paths?.length) return null;
+    return r.paths;
   } catch (err) {
     toast.error(`打开选择器失败：${(err as Error).message}`);
     return null;

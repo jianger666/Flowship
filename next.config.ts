@@ -10,9 +10,9 @@ const nextConfig: NextConfig = {
   // 运行时直接 require；同时回避 webpack 解析 SDK 自带的 .d.ts.map
   // 时报 "Module parse failed: Unexpected token" 的问题。
   serverExternalPackages: ["@cursor/sdk"],
-  // V0.6.30 绿色包发版：CI 设 BUILD_STANDALONE=1 时产出自包含 server.js + 最小 node_modules、
-  // 给零 node 环境的同事解压即用。日常 dev / `pnpm serve`（next start）不开——
-  // standalone 模式下 next start 不可用、两条路用 env 隔开互不影响。
+  // Electron 桌面端打包：CI 设 BUILD_STANDALONE=1 产出自包含 server.js + 最小 node_modules、
+  // 由 assemble-electron-server.mjs 组进安装包 resources。日常 dev / `pnpm serve`（next start）
+  // 不开——standalone 模式下 next start 不可用、两条路用 env 隔开互不影响。
   output: process.env.BUILD_STANDALONE ? "standalone" : undefined,
 };
 

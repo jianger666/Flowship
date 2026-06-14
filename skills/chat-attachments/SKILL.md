@@ -29,7 +29,7 @@ description: >-
    - 读完你就**真的看到了图片像素内容**
 3. 然后基于图 + 用户的文字消息一起回复
 
-## B. `[ATTACHED_PATHS]`：任意文件 / 目录路径（用户用 FsPickerDialog 选的）
+## B. `[ATTACHED_PATHS]`：任意文件 / 目录路径（用户用原生 picker 选的）
 
 当 `wait_for_user` return text 末尾出现 `[ATTACHED_PATHS]` 段：
 

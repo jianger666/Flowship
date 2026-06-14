@@ -1,5 +1,5 @@
 /**
- * 组「可运行的 server 布局」公共函数（V0.7.0 从 package-release.mjs 抽出）
+ * 组「可运行的 server 布局」公共函数（V0.7.0 抽出、给 Electron 发版链复用）
  *
  * 产出布局（destDir/）：
  *   server.js + .next/ + node_modules/   ← Next standalone 自包含产物（纯 JS、跨平台）
@@ -8,8 +8,7 @@
  * 为什么 standalone 能直接当布局根：server.js 启动时 process.chdir(__dirname)、
  * 所以 prompts/scripts 平铺在 server.js 旁、运行时 process.cwd() 全部命中。
  *
- * 两个消费方：
- * - 绿色 zip 包：scripts/package-release.mjs（在此之上再加便携 node + launcher）
+ * 消费方：
  * - Electron：scripts/assemble-electron-server.mjs（产物走 extraResources 进安装包）
  */
 import { promises as fs } from "node:fs";
@@ -26,6 +25,74 @@ const exists = async (p) => fs.access(p).then(() => true, () => false);
 const cp = async (src, dest) => {
   await fs.mkdir(path.dirname(dest), { recursive: true });
   await fs.cp(src, dest, { recursive: true, verbatimSymlinks: true });
+};
+
+// 补 SDK 平台二进制包（nft 追不到、必须显式补）
+// @cursor/sdk 运行时按 `@cursor/sdk-${platform}-${arch}` 动态拼名 require 平台包
+// （含 Connect RPC native / ripgrep / 沙箱 helper）、Next file-tracing 静态分析追不到、
+// 不进 standalone node_modules → 缺包时 SDK 连 API key exchange 直接 fetch failed
+// （本地 electron:dist:test 打的包踩过、chat 全 status=error）。
+// CI 在目标平台 job 用 npm install 补（release.yml）；本地打包走这里补「当前平台」包。
+// 仅处理 pnpm symlink 拓扑（本地 isolated）；hoisted 平铺（CI ubuntu build）无 .pnpm、
+// 跳过交 CI 补——对 CI 零影响。
+const addSdkPlatformPackage = async (rootDir, destDir) => {
+  const destPnpm = path.join(destDir, "node_modules", ".pnpm");
+  if (!(await exists(destPnpm))) return; // hoisted 布局（CI）、交 CI npm install 补
+
+  const platformPkg = `sdk-${process.platform}-${process.arch}`; // 如 sdk-darwin-arm64
+  // 版本从已进包的 @cursor/sdk 主包读（平台包跟主包钉死同版本）
+  let version;
+  try {
+    const raw = await fs.readFile(
+      path.join(rootDir, "node_modules", "@cursor", "sdk", "package.json"),
+      "utf8",
+    );
+    version = JSON.parse(raw).version;
+  } catch {
+    console.warn("[assemble] 读不到 @cursor/sdk 版本、跳过补平台包");
+    return;
+  }
+
+  const srcEntity = path.join(
+    rootDir,
+    "node_modules",
+    ".pnpm",
+    `@cursor+${platformPkg}@${version}`,
+  );
+  if (!(await exists(srcEntity))) {
+    console.warn(
+      `[assemble] 本机缺 @cursor/${platformPkg}@${version}、跳过补包` +
+        "（运行时 SDK 会 fetch failed、需 pnpm install 装上当前平台 SDK）",
+    );
+    return;
+  }
+
+  // 1. 拷平台包实体进 .pnpm
+  await cp(srcEntity, path.join(destPnpm, `@cursor+${platformPkg}@${version}`));
+  // 2. 在 @cursor/sdk 包的 node_modules/@cursor 下建 symlink 指向实体（复刻 pnpm 拓扑）
+  const linkDir = path.join(
+    destPnpm,
+    `@cursor+sdk@${version}`,
+    "node_modules",
+    "@cursor",
+  );
+  if (await exists(linkDir)) {
+    const linkPath = path.join(linkDir, platformPkg);
+    await fs.rm(linkPath, { force: true, recursive: true }).catch(() => {});
+    await fs.symlink(
+      path.join(
+        "..",
+        "..",
+        "..",
+        `@cursor+${platformPkg}@${version}`,
+        "node_modules",
+        "@cursor",
+        platformPkg,
+      ),
+      linkPath,
+    );
+  }
+  console.log(`[assemble] 已补 SDK 平台包 @cursor/${platformPkg}@${version}`);
 };
 
 export const assembleServerLayout = async (rootDir, destDir) => {
@@ -56,4 +123,7 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   for (const f of ["stop-hook.mjs", "shell-guard.mjs"]) {
     await cp(path.join(rootDir, "scripts", f), path.join(destDir, "scripts", f));
   }
+
+  // ---------- 3. SDK 平台二进制包（standalone trace 漏的 optional 平台包）----------
+  await addSdkPlatformPackage(rootDir, destDir);
 };

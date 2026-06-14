@@ -37,11 +37,12 @@
  * - 不做 MCP session id 跨进程：本来 stateless 就够、但 wait_for_user 长阻塞必须 stateful 复用 transport
  * - 不做并发去重：同一个 task 同时只允许一个 pending entry、新 wait_for_user 顶旧的
  * - 不做 dev hot reload 状态恢复：开发时模块重载会丢 pendingMap、能接受
- * - **断线自动重连（V0.6.21 起、实现「无限长连」）**：wait-ack 引导给的不是单条 curl、是 `while` 循环——
- *   单轮 `--max-time 1800`（30 分钟）到点 / 网络抖断开 → 命令内自动同 token 重连下一轮（subscribeWaitAck
- *   不消费 token、route abort 不清 pendingMap entry、所以同 token 能反复接上同一个 entry）、agent 不退 run、
- *   用户离开多久都不会断。重连在 shell 命令内部（不是 agent 反复调 shell / wait_for_user）、不踩 anti-loop、不额外吃 send 配额。
- * - **只有真失效才退 run**：[STALE]/[INVALID_TOKEN]（多为 dev hot reload / 服务重启丢 pendingMap）或整条命令异常 exit、
+ * - **单条 curl 长链接（V0.7.18 起、简化自旧 while 重连）**：wait-ack 引导给的就是一条 `curl -sN`——本地回环连接稳定、
+ *   不加 `--max-time`、不套 while 重连。服务端每 60 秒发 `[KEEPALIVE]` 维持（防 SDK shell idle-timeout 杀连接）、
+ *   用户 ack 时 resolve → 写终态行 + 关流 → curl 自然 exit、agent 推进。旧 while/max-time 是早期对「连接会断」的过度防御、
+ *   实测本地长连不会断、反而徒增 agent 把 curl 放后台 / 自己重连的误操作面（V0.7.17 踩过 composer 放后台导致 run 提前退）、故 V0.7.18 砍掉。
+ *   （subscribeWaitAck 不消费 token、route abort 不清 pendingMap entry、所以 curl 万一意外断、同 token 再调一次能接上同一 entry。）
+ * - **只有真失效才退 run**：[STALE]/[INVALID_TOKEN]（多为 dev hot reload / 服务重启丢 pendingMap）或 curl 异常 exit、
  *   agent 退 run、用户在 UI 手动「推进」起新 agent 接力（task 走 /advance→advanceTask、chat 走 /chat-reply→runChatSession、
  *   Agent.create + send、靠任务事件日志恢复上下文、不是 resume 原会话）
  */
@@ -57,7 +58,6 @@ import {
   SIGNALS,
   buildNextActionHead,
   shellWaitGuideHead,
-  terminalSignalGrepPattern,
 } from "../protocol-signals";
 
 // ----------------- 配置 -----------------
@@ -759,27 +759,24 @@ const buildShellWaitGuidance = (
     "  - 只发了一句概述 / 还没把关键信息（接口、代码、数据、结论）给全 → **现在立刻补一条完整 assistant_message**、再跑下面的 shell",
     "  - **认知纠正**：你拿到本引导、跑 shell **之前**仍然可以 emit assistant_message——不是「调了 wait_for_user 本轮就发不出文字」（实测踩过：只发半句概述就跑 shell、用户得催一句才补全）",
     "",
-    "## 下一步只许做一件事：调 `shell` 工具跑这条命令（内置无限重连、调一次就够）",
+    "## 下一步只许做一件事：调 `shell` 工具跑这一条 curl 长链接（调一次就够、然后挂着等）",
+    "",
+    "正常前台调用即可、**不要自己加 `&` / `nohup` / `disown`、不要主动把 shell 标成 background / is_background**。",
+    "",
+    "**⚠️ 关于「后台」必看（不看准纠结）**：这条 curl 要一直挂着等用户（几分钟到几小时）、所以 **shell 工具大概率会自动把它转入后台运行**——这是 runtime 对「迟迟不返回的命令」的固有行为（超过它的前台等待时长没返回就自动转）、不是你的错、你也拦不住、**完全正常**。",
+    "  - ✅ 被自动转后台后：curl 进程还在后台跑、连接还活着、KEEPALIVE / 终态行照样通过 shell 输出推给你——你**什么都不用做、继续等下一段 stdout 就行**",
+    "  - ❌ 别因为「看到被转后台」就慌：**不要重新调 shell、不要纠结「规范要前台我却被后台」、不要 summarize 退出**——那才会真把等待打断、Run 提前退出、对话「自己结束」",
+    "  - ❌ 你**主动**放后台（加 `&` / nohup / 标 is_background）才是错的：curl 还没连上就脱离 = 等于没等",
+    "  - 终态行（USER_REPLY / ACTION_ACK / NEXT_ACTION / CANCELLED）出现时、服务端关流、你才接着处理",
     "",
     "```",
-    "# set +e +o pipefail：关掉 SDK 默认注入的 errexit/pipefail——否则首轮 curl --max-time 到点退出码 28、",
-    "#   pipefail 让管道返回 28、errexit 直接终止整个脚本、while 永远进不了第二轮（V0.6.22 实测踩坑、必须保留这行）",
-    "set +e +o pipefail",
-    "WAIT_ACK_FILE=$(mktemp 2>/dev/null || echo \"/tmp/fe_ai_waitack_$$\")",
-    "while true; do",
-    `  curl -sN --max-time 1800 "${url}" | tee "$WAIT_ACK_FILE" || true`,
-    "  # 拿到任一终态行就退出；否则（30 分钟到点 / 只有 KEEPALIVE / 网络抖）自动重连",
-    `  grep -qE '${terminalSignalGrepPattern()}' "$WAIT_ACK_FILE" && break`,
-    "  sleep 1",
-    "done",
-    "rm -f \"$WAIT_ACK_FILE\"",
+    `curl -sN "${url}"`,
     "```",
     "",
     "参数说明：",
-    "  - `-s` 静默、`-N` 不缓冲（服务端 chunked 一来就出 stdout）",
-    "  - `--max-time 1800`：**单轮** curl 最长 30 分钟；到点没结果 while 循环自动重连下一轮、**所以用户离开多久都不会断**",
-    "  - `tee`：curl 输出实时透传到 stdout（你持续看到 `[KEEPALIVE ts=...]` 心跳）、同时存文件给 grep 判断有没有终态行",
-    "  - **这条命令内置无限重连**：只管调一次 `shell` 跑它、它会一直挂到拿终态行才退出——**绝不要**自己写循环 / 重复调 shell / 调 wait_for_user 重试",
+    "  - `-s` 静默、`-N` 不缓冲（服务端 chunked 一来就出 stdout、KEEPALIVE / 终态行实时可见）",
+    "  - **这是一条前台长链接**：连上后一直挂着、服务端每 60 秒发一行 `[KEEPALIVE ts=...]` 维持（防 shell idle 被杀）、用户在 UI 回复时服务端写终态行 + 关流、curl 自然 exit 0",
+    "  - **本地回环连接、不会断**：别加 `--max-time`、别套 while 重连、别自己写循环——加了纯属画蛇添足、还可能把你带偏",
     "",
     "## stdout 解读规则（**必背、决定你下一步动作**）",
     "",
@@ -795,9 +792,10 @@ const buildShellWaitGuidance = (
     "",
     "## 钢铁纪律（5 分钟 / 10 分钟 / 20 分钟没新行 ≠ shell 卡住）",
     "",
-    "shell + curl 可能要等用户 0 秒到**几小时**（命令内置无限重连、单轮 30 分钟到点自动换下一轮）、任何长度都正常。**等待期间你只看到 KEEPALIVE 行不断追加**（重连时新一轮 KEEPALIVE 从头开始、也正常）、这是设计预期、不是 bug。",
+    "这条 curl 会挂着等用户 0 秒到**几小时**（大概率被 shell 自动转后台、正常）、任何长度都正常。**等待期间你只看到 `[KEEPALIVE ts=...]` 每 60 秒追加一行**、这是连接还活着的信号、不是 bug。",
     "",
     "**绝对禁止的动作**（看到 KEEPALIVE 累积时尤其要克制）：",
+    "  - ❌ **主动**给命令加 `&` / nohup / 标 is_background（被 shell 自动转后台是正常的、但你别自己放）",
     "  - ❌ 调 read 读 cursor 内部 terminal 文件、查 shell 进程状态",
     "  - ❌ thinking 里冒「process is still running, I will summarize」/「the 5-minute block has ended」→ summarize 退 run",
     "  - ❌ 调任何其他工具自救、重新启 shell、重新 wait_for_user",
@@ -808,13 +806,12 @@ const buildShellWaitGuidance = (
     `## 这次 wait 的目的`,
     contextLine,
     "",
-    "## 异常处理（命令已内置无限重连、几乎不用你管）",
+    "## 异常处理",
     "",
-    "  - 单轮 curl 30 分钟到点断开、while 循环会自动发起下一轮——**这是设计预期**、stdout 上 KEEPALIVE 会重新开始、什么都不用做",
-    "  - **唯一的正常退出**：grep 命中终态行后整条命令 exit、按上面「stdout 解读规则」对最后那行行动",
-    "  - **绝不要**自己重复调 shell / 重新调 wait_for_user / ask_user —— 重连已经在命令里了、你再插手只会被服务端顶替成 stale",
-    "  - **命令异常 exit（exit code 非 0、且 stdout 没有终态行）→ 先再调一次本 shell 跑同一条命令兜底**：while 内置 set +e 后理应不会异常退出、但万一被环境打断、再调一次能用同 token 接上原 entry（subscribeWaitAck 不消费 token、entry 还在）",
-    "  - **连调 2 次都立刻异常 exit**（如 mktemp 不可用、环境坏了）→ 才 emit 一条简短 assistant_message「监听连接异常断开、请在 AI工作流看板点『推进』」、自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
+    "  - **唯一的正常退出**：stdout 出现终态行（USER_REPLY / ACTION_ACK / NEXT_ACTION / CANCELLED）、服务端关流、curl exit——按上面「stdout 解读规则」对最后那行行动",
+    "  - **「被 shell 自动转后台」≠「curl exit」**：转后台后 curl 进程还活着、stdout 会继续推 KEEPALIVE / 终态行——这种情况**绝不重发**、什么都不做继续等就行（重发只多一条没用的连接、还可能把你带进自救循环）",
+    "  - **只有「真 exit」（shell 明确给出 exit code 非 0、且 stdout 一行都没有、如服务端重启 / 连接异常）→ 才再调一次本 shell 跑同一条命令兜底**：同 token 还能接上原 entry（subscribeWaitAck 不消费 token、entry 还在）",
+    "  - **连调 2 次都立刻异常 exit** → emit 一条简短 assistant_message「监听连接异常断开、请在 AI工作流看板点『推进』」、自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
     "",
     "## 调用礼仪",
     "",
@@ -1487,7 +1484,7 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
  * 触发条件：task.mode === "chat" 且 agent 在 wait_for_user(task_id) 上等
  *
  * @param imagePaths      用户消息附带的图片绝对路径（已落盘）、可空
- * @param attachmentPaths 用户消息附带的文件 / 目录绝对路径（FsPickerDialog 选的）、可空
+ * @param attachmentPaths 用户消息附带的文件 / 目录绝对路径（原生 picker 选的）、可空
  *
  * 返回值：
  *   - true：成功 resolve、agent 会拿到这段文本

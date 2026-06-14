@@ -32,7 +32,7 @@ import path from "node:path";
 // fe 固定 hook 脚本绝对路径（process.cwd() = fe 项目根、Next.js 运行时）
 // V0.6.29：command 包一层 node 调用——路径可能含空格、引号兜住；sh -c / cmd 都认这个写法
 // V0.6.30：node 用 process.execPath（跑本服务的那个 node 的绝对路径）、不裸写 `node`——
-//   绿色包同事机器上系统 PATH 可能根本没有 node、只有包里自带的便携 node.exe、
+//   Electron 安装包用户机器上系统 PATH 可能根本没有 node、只有包内 Electron（as node）、
 //   execPath 正好指向它；源码跑的场景 execPath = 系统 node、行为不变。
 const stopHookCommand = (): string =>
   `"${process.execPath}" "${path.join(process.cwd(), "scripts", "stop-hook.mjs")}"`;

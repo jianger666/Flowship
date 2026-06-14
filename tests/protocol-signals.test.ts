@@ -19,7 +19,6 @@ import {
   buildNextActionHead,
   keepaliveLine,
   shellWaitGuideHead,
-  terminalSignalGrepPattern,
 } from "@/lib/protocol-signals";
 
 const promptsDir = path.resolve(import.meta.dirname, "..", "prompts");
@@ -70,14 +69,6 @@ describe("信号常量 ↔ _super.md 一致性", () => {
         TERMINAL_SIGNAL_TOKENS as readonly string[],
         `TERMINAL_SIGNAL_TOKENS 缺 ${t}`,
       ).toContain(t);
-    }
-  });
-
-  it("grep 模式包含全部终态 token 且正确转义", () => {
-    const pattern = terminalSignalGrepPattern();
-    expect(pattern.startsWith("\\[(")).toBe(true);
-    for (const t of TERMINAL_SIGNAL_TOKENS) {
-      expect(pattern).toContain(t);
     }
   });
 });

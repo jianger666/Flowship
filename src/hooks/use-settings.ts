@@ -19,7 +19,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { DEFAULT_SETTINGS, getSettings, saveSettings } from "@/lib/local-store";
+import {
+  DEFAULT_SETTINGS,
+  getSettings,
+  initSettings,
+  saveSettings,
+} from "@/lib/local-store";
 import type { FeAiFlowSettings, JumpIde } from "@/lib/types";
 
 /**
@@ -32,7 +37,8 @@ import type { FeAiFlowSettings, JumpIde } from "@/lib/types";
 export const useJumpIde = (): JumpIde => {
   const [ide, setIde] = useState<JumpIde>("cursor");
   useEffect(() => {
-    setIde(getSettings().jumpIde ?? "cursor");
+    // 先 await 配置初始化（读 config.json / 首次迁移）、再读；缓存有 localStorage 兜底、init 慢也不空
+    void initSettings().then(() => setIde(getSettings().jumpIde ?? "cursor"));
   }, []);
   return ide;
 };
@@ -106,12 +112,19 @@ export const useSettings = (): UseSettingsResult => {
   // 是否已从 localStorage 读到初值；防止 SSR 渲染时闪现空表单
   const [loaded, setLoaded] = useState(false);
 
-  // 首次挂载读 localStorage、settings 和 savedSettings 都用同一份初值
+  // 首次挂载：先 await 配置初始化（读 config.json / 首次从 localStorage 迁移）、再灌进草稿态
   useEffect(() => {
-    const s = getSettings();
-    setSettings(s);
-    setSavedSettings(s);
-    setLoaded(true);
+    let alive = true;
+    void initSettings().then(() => {
+      if (!alive) return;
+      const s = getSettings();
+      setSettings(s);
+      setSavedSettings(s);
+      setLoaded(true);
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // dirty 状态按字段缓存：各字段在 settings/savedSettings 任意变化时才重算

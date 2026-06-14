@@ -46,7 +46,7 @@ mac:
   identity: null
 
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
-# releaseType: release——CI 里绿色包 job 先建好正式 release、这里往同 tag release 追加 asset
+# releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset
 publish:
   provider: github
   owner: jianger666

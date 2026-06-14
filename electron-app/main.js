@@ -94,7 +94,7 @@ const execFileP = (cmd, args) =>
 
 // ---------- 端口冲突处理 ----------
 
-// 探 8876 是否被占（能建立 TCP 连接 = 有进程在听）
+// 探端口（PORT、test=8776 / 正式=8876）是否被占（能建立 TCP 连接 = 有进程在听）
 const isPortBusy = () =>
   new Promise((resolve) => {
     const socket = net.connect({ port: PORT, host: HOST });
@@ -109,7 +109,7 @@ const isPortBusy = () =>
     });
   });
 
-// 找出监听 8876 的进程 PID（win 解析 netstat、mac/linux 用 lsof）
+// 找出监听该端口（PORT）的进程 PID（win 解析 netstat、mac/linux 用 lsof）
 const findPortPids = async () => {
   if (process.platform === "win32") {
     const out = await execFileP("netstat", ["-ano", "-p", "tcp"]);
@@ -144,7 +144,7 @@ const killPids = async (pids) => {
 };
 
 /**
- * 确保 8876 可用。被占说明旧绿色包服务（或上次未退干净的实例）还在跑——
+ * 确保端口（PORT）可用。被占说明上次未退干净的服务实例还在跑——
  * 弹 dialog 让用户确认后自动杀掉、拒绝则退出 app。
  */
 const ensurePortFree = async () => {
@@ -152,7 +152,7 @@ const ensurePortFree = async () => {
   const { response } = await dialog.showMessageBox({
     type: "warning",
     title: "端口被占用",
-    message: "检测到旧版服务占用了 8876 端口",
+    message: `检测到旧版服务占用了 ${PORT} 端口`,
     detail: "点「确定」自动关闭旧服务并继续启动；点「退出」放弃本次启动。",
     buttons: ["确定", "退出"],
     defaultId: 0,
@@ -170,7 +170,7 @@ const ensurePortFree = async () => {
   }
   dialog.showErrorBox(
     "端口仍被占用",
-    "8876 端口没能释放、请手动关闭占用它的程序后重新打开应用。",
+    `${PORT} 端口没能释放、请手动关闭占用它的程序后重新打开应用。`,
   );
   return false;
 };
@@ -377,8 +377,8 @@ const createWindow = async () => {
 // ---------- 原生文件选择器 IPC（v0.7.14） ----------
 //
 // 页面（preload 暴露的 window.__nativePicker.pick）→ 这里 → dialog.showOpenDialog。
-// 大方针（用户拍板）：桌面端文件 / 目录选择全部走原生、不再绕 HTTP + osascript
-// （那条链路保留给浏览器 dev 场景兜底、见 src/lib/native-picker.ts）。
+// 大方针（用户拍板）：桌面端文件 / 目录选择全部走原生 dialog.showOpenDialog；
+// 原 HTTP + osascript 兜底链路（浏览器 dev 用）已随网页版遗留一并删除。
 ipcMain.handle("native-pick", async (_e, opts) => {
   const mode = opts?.mode === "folder" ? "folder" : "file";
   const multiple = opts?.multiple === true;

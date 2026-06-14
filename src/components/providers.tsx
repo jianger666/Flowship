@@ -11,7 +11,7 @@ import { ThemeProvider } from "next-themes";
 import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, initSettings } from "@/lib/local-store";
 import { useModels } from "@/hooks/use-models";
 
 interface ProvidersProps {
@@ -24,8 +24,11 @@ interface ProvidersProps {
 const ModelsPrefetch = () => {
   const { fetchModels } = useModels();
   useEffect(() => {
-    const key = getSettings().apiKey?.trim();
-    if (key) void fetchModels(key);
+    // await 配置初始化后再读 apiKey（清理版删掉 localStorage 后、缓存只有 init 后才有值）
+    void initSettings().then(() => {
+      const key = getSettings().apiKey?.trim();
+      if (key) void fetchModels(key);
+    });
   }, [fetchModels]);
   return null;
 };

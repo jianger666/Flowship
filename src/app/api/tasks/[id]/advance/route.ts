@@ -12,7 +12,7 @@
  *   actionType: ActionType,            // plan / build / review / ship / test / learn
  *   userInstruction: string,           // 用户在推进 dialog 写的指令（可空）
  *   images?: [{data, mimeType, filename}],
- *   attachments?: string[],            // 文件 / 目录绝对路径（FsPickerDialog 选的）
+ *   attachments?: string[],            // 文件 / 目录绝对路径（原生 picker 选的）
  *   apiKey: string,
  *   model: ModelSelection,
  *   reuseAgent?: boolean,              // UI「续用当前 agent」勾选时为 true（V0.6.27 默认每 action 新 agent）
