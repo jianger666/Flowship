@@ -304,6 +304,14 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.1：自更新防残缺包 + 发版改 draft 流程（修 v0.8.0 自更新事故）（2026-06-15）
+
+v0.8.0 发版当场踩了自更新事故：旧 `release.yml` 先建 **published** 占位 release → 用户 app 在 dmg/yml 还没传完时就 `fetchLatestVersion` 查到新版 → mac 自更新下到残缺 dmg（只 1.78MB）→ `ditto` 拷残缺文件报 `Unknown error 1000`、且残缺 dmg 被 `hdiutil attach` 挂成坏卷没卸干净 → Finder 扫描坏卷 I/O 卡死。并发 publish 还撞出 **0 字节 `latest.yml`**（win electron-updater 全靠它、win 同事自更新挂）。
+
+- **mac 自更新加 dmg 完整性校验（`main.js` `macSelfUpdate`）**：下载后比对 `content-length`、`got !== total` 直接 throw——在 `hdiutil attach` / `rename appPath` **之前**拦掉、残缺包根本不碰 app（旧逻辑下完直接 ditto、拷到一半才炸、那时旧 app 已被挪走）。
+- **发版改 draft 流程（`release.yml`）**：① build-release 占位建 **draft**（electron-builder `getOrCreateRelease` 优先复用匹配 tag 的 draft、源码 `if(release.draft) return release`）② matrix `max-parallel: 1` 串行打包（防并发 overwrite asset 撞出 0KB yml）③ 新增 **finalize job**（win/mac 全传完才把 draft→published）。draft 期间 `/releases/latest` 不指向它、自更新查不到 → 杜绝「asset 没传完就被下到残缺」；任一平台挂就留 draft、不对外发半成品。
+- 功能同 v0.8.0（侧栏导航）、纯发版链路 + 自更新加固的 hot-fix。
+
 ### v0.8.0：侧栏任务导航（列表搬进常驻侧栏、多任务秒切）（2026-06-15）
 
 痛点：首页是任务大列表、切任务必须「详情 → 返回 `/` → 进另一个」、多任务并行来回切累。改成 ChatGPT / Cursor 式常驻左侧栏：点侧栏即切任务、可展开 / 收起（收起宽度归零、复杂详情页不被遮挡）。用 `ui-ux-pro-max` + `frontend-design` skill 辅助（落实当前项高亮 / 键盘可达 / push 不遮挡 / 视觉克制）。

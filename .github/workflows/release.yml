@@ -35,9 +35,14 @@ jobs:
           BUILD_STANDALONE: "1"
 
       # 先建 release 占位（generate_release_notes）——让下游 win/mac electron job 的
-      # electron-builder --publish 往同 tag release 追加 asset、不竞态创建
+      # electron-builder --publish 往同 tag release 追加 asset、不竞态创建。
+      # 关键：建成 draft（不可见）——electron-builder getOrCreateRelease 会优先复用匹配
+      # tag 的 draft（源码 if(release.draft) return release）、asset 全传完再由 finalize
+      # 转正 published。draft 期间 /releases/latest 不指向它、自更新查不到 → 杜绝
+      # 「用户在 dmg/yml 传完前就查到新版、下到残缺包」（v0.8.0 mac 自更新踩过、ditto 拷残缺炸）。
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           generate_release_notes: true
 
       # 给 electron job 复用的 server 布局（tar 保留权限 / 防 artifact zip 丢元数据）。
@@ -59,6 +64,10 @@ jobs:
     strategy:
       # mac 未签名、dmg 只是顺手产物——失败不连坐 win
       fail-fast: false
+      # 串行：win / mac 各自往同一个 draft release overwrite asset、并发会撞出
+      # 0 字节的 latest.yml（v0.8.0 踩过、win electron-updater 全靠它、空了 win 自更新挂）——
+      # 串行彻底避免 release asset 列表的并发 race
+      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
@@ -123,3 +132,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+  # 所有平台包（exe / dmg / latest.yml / latest-mac.yml）都传完后、把 draft release 转正 published。
+  # needs electron = win/mac 都成功才转正：有平台挂就留 draft、不对外发半成品（手动看日志重跑即可）。
+  # 转正后 /releases/latest 才指向它、mac fetchLatestVersion / win electron-updater 这才查得到、
+  # 且此刻 asset 已齐全——根治 v0.8.0「asset 没传完就被自更新下到残缺」的事故。
+  finalize:
+    needs: electron
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = process.env.GITHUB_REF_NAME;
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const draft = releases.find((r) => r.tag_name === tag && r.draft);
+            if (!draft) {
+              core.info(`没找到 tag=${tag} 的 draft release、跳过`);
+              return;
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: draft.id,
+              draft: false,
+            });
+            core.info(`已发布 release ${tag}`);

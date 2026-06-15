@@ -536,6 +536,14 @@ const macSelfUpdate = async (version) => {
     );
     mainWindow?.setProgressBar(-1);
 
+    // 完整性校验：下到残缺包就直接中止、绝不拿残缺 dmg 去 attach + ditto 替换 app。
+    // v0.8.0 自更新踩过：重复触发时 GitHub asset 还在传、只下到 1.78MB 残缺包、
+    // ditto 拷到一半报 Unknown error 1000、还把已挪走的旧 app 搞成半新半旧。
+    // 这里在 attach / rename 之前拦掉、残缺直接 throw → 走 catch 降级下载页、app 完全不动。
+    if (total && got !== total) {
+      throw new Error(`dmg 下载不完整（${got}/${total} 字节）、已中止替换`);
+    }
+
     await execFileStrict("hdiutil", [
       "attach", dmgPath, "-nobrowse", "-quiet", "-mountpoint", mountPoint,
     ]);
