@@ -1,12 +1,12 @@
 ---
 name: artifact-writer
 description: >-
-  当你需要写或修改 fe-ai-flow phase artifact 文件（01-plan.md / 02-build.md /
+  当你需要写或修改 ai-flow phase artifact 文件（01-plan.md / 02-build.md /
   03-review.md）、不确定该用什么 SDK 工具、参数怎么传、路径写哪、如何跟 wait_for_user
   衔接、或之前写失败过想看排查清单时——请 `read` 本 skill。任何「写 artifact」场景必读一次。
 ---
 
-# fe-ai-flow Artifact 写入协议
+# ai-flow Artifact 写入协议
 
 ## 一句话核心
 
@@ -30,12 +30,12 @@ description: >-
 artifact 路径在 super-prompt 顶部的「artifact 表」里、形如：
 
 ```
-/Users/<user>/Documents/my/fe-ai-flow/data/tasks/<task_id>/artifacts/01-plan.md
+/Users/<user>/Documents/my/ai-flow/data/tasks/<task_id>/artifacts/01-plan.md
 ```
 
 注意：
 
-- **artifact 不在 agent cwd 下**——agent cwd 是用户业务仓库（如 `/Users/.../tch-service-center`）、artifact 在 fe-ai-flow 项目 `data/` 目录下、两者不在同一棵目录树
+- **artifact 不在 agent cwd 下**——agent cwd 是用户业务仓库（如 `/Users/.../tch-service-center`）、artifact 在 ai-flow 项目 `data/` 目录下、两者不在同一棵目录树
 - **必须用绝对路径**——相对路径会写到 agent cwd 下、artifact 永远找不到、UI 也加载不出
 - 路径直接抄 super-prompt 里的「artifact 表」、不要自己拼
 
@@ -48,7 +48,7 @@ artifact 路径在 super-prompt 顶部的「artifact 表」里、形如：
 ```
 tool_use: write
 args: {
-  path: "/Users/.../fe-ai-flow/data/tasks/<task_id>/artifacts/0X-<phase>.md",
+  path: "/Users/.../ai-flow/data/tasks/<task_id>/artifacts/0X-<phase>.md",
   fileText: "<完整 markdown 内容、从 # 标题开始>"
 }
 ```
@@ -108,7 +108,7 @@ args: {
 
 ### 错误：写完了 UI 看不到 artifact
 
-**原因**：路径写错地方了（写到 agent cwd 下而不是 fe-ai-flow 项目 data/ 下）。
+**原因**：路径写错地方了（写到 agent cwd 下而不是 ai-flow 项目 data/ 下）。
 
 **修法**：
 

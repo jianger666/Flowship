@@ -14,7 +14,7 @@ import {
 import type { Task } from "@/lib/types";
 
 // 不存在的路径：跳过 git remote 对账、聚焦前 4 步纯逻辑
-const REPO = "/nonexistent/fe-ai-flow-test-repo";
+const REPO = "/nonexistent/ai-flow-test-repo";
 
 const baseTask = (over: Partial<Task> = {}): Task =>
   ({

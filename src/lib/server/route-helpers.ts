@@ -40,7 +40,7 @@ export const errorResponse = (message: string, status = 400): Response =>
 /**
  * 校验 ModelSelection：id 必须是非空字符串
  *
- * SDK 还有 params 等字段、但 fe-ai-flow 这层只关心 id 是否填了、params 由调用方自己保证
+ * SDK 还有 params 等字段、但 ai-flow 这层只关心 id 是否填了、params 由调用方自己保证
  */
 export const isValidModel = (m: unknown): m is ModelSelection => {
   if (!m || typeof m !== "object") return false;

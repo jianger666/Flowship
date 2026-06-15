@@ -1,4 +1,4 @@
-# fe-ai-flow Electron 打包配置（V0.7.0）
+# ai-flow Electron 打包配置（V0.7.0）
 #
 # 结构说明：壳代码在 electron-app/（独立 package.json、runtime 依赖只有 electron-updater）。
 # 不用单 package.json 结构——主 package.json 的 dependencies 是 next/react 全家桶、
@@ -32,8 +32,12 @@ win:
   target: nsis
 
 nsis:
-  # 一键装到用户目录（%LOCALAPPDATA%\Programs）、免管理员权限
-  oneClick: true
+  # 助手式向导（V0.7.21）：关一键、让用户能在向导里选安装路径。
+  # oneClick:false 后首次手动安装走向导（许可 / 选路径 / 快捷方式 / 装）、
+  # 但 electron-updater 自更新仍走静默（/S）、升级体验不变。
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # 仍 per-user 装到用户目录、不强制管理员权限 / UAC
   perMachine: false
   deleteAppDataOnUninstall: false
 

@@ -1,5 +1,5 @@
 /**
- * fe-ai-flow Electron 壳（V0.7.0）
+ * ai-flow Electron 壳（V0.7.0）
  *
  * 职责（保持薄壳、业务全在 Next server 里）：
  * 1. 起内置 Next standalone server（spawn 自带 node 运行时、ELECTRON_RUN_AS_NODE）
@@ -349,7 +349,7 @@ const createWindow = async () => {
     return { action: "deny" };
   });
   // 同 frame 导航离开本应用（cursor:// deep link 跳 IDE、或意外的外部 http 链接）
-  // → 拦下来交系统处理、窗口永远停在 fe-ai-flow 页面上
+  // → 拦下来交系统处理、窗口永远停在 ai-flow 页面上
   // 特例：app-update://install 是页面「新版本」标识发起的装更新指令、壳自己消费
   mainWindow.webContents.on("will-navigate", (e, url) => {
     if (url.startsWith("app-update://")) {
@@ -362,7 +362,18 @@ const createWindow = async () => {
     void shell.openExternal(url);
   });
 
-  // 页面每次加载完成（含刷新 / loading 页换正式页）重注入版本号 + 更新标识、不丢状态
+  // 禁用浏览器默认「刷新页面」快捷键（cmd/ctrl+R、cmd+shift+R 强刷、F5）——
+  // 桌面 app 不该暴露整页刷新（v0.7.21 用户拍板、dev 也禁）：误触丢输入草稿 / UI 临时态、
+  // 持久化状态（task/action/chat）走 server + SSE replay 本就不受影响。精准拦这几个键、
+  // 不碰 cmd+C/V/A 编辑键 / cmd+W 关窗 / cmd+Q 退出 / devtools。
+  mainWindow.webContents.on("before-input-event", (e, input) => {
+    if (input.type !== "keyDown") return;
+    const key = input.key?.toLowerCase();
+    const isReload = key === "f5" || ((input.meta || input.control) && key === "r");
+    if (isReload) e.preventDefault();
+  });
+
+  // 页面每次加载完成（loading 页换正式页 / 首次加载）重注入版本号 + 更新标识、不丢状态
   mainWindow.webContents.on("did-finish-load", () => {
     // 版本号给设置页显示（用户要能确认「装的是不是最新版」）；web 版没壳、不显示
     mainWindow?.webContents
@@ -394,13 +405,15 @@ ipcMain.handle("native-pick", async (_e, opts) => {
   return { paths: filePaths };
 });
 
-// ---------- 自动更新（win 全自动装、mac 提醒去下载页） ----------
+// ---------- 自动更新（win electron-updater 重启即装、mac v0.7.12 起壳内自更新） ----------
 
 // 已就绪的新版本号（null = 无更新待装）
 let updateReadyVersion = null;
 
 // 更新动作模式：win 用 electron-updater 下载完「重启即装」；
-// mac 未签名跑不了 Squirrel.Mac、只做「发现新版 → 打开下载页」（v0.7.7）
+// mac 未签名跑不了 Squirrel.Mac——v0.7.7 曾退化为「开系统浏览器下载页」、
+// v0.7.12 起改壳内自更新（fetch dmg 无 quarantine + ditto 替换自身、见 macSelfUpdate）、
+// 故此处 "download" 现指「壳内下载替换自身」、不再是「跳下载页」
 const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 

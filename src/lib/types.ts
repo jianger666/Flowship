@@ -102,7 +102,7 @@ export interface ModelSelection {
 /**
  * settings：localStorage 持久化的用户配置
  * V0.6 新增 username：用于 ship action 的 branch prefix
- *   （branch 模板 = `feature/<username>/<飞书id>-<task.title>`、多人用 fe-ai-flow 不互踩）
+ *   （branch 模板 = `feature/<username>/<飞书id>-<task.title>`、多人用 ai-flow 不互踩）
  * V0.6.1 新增 gitHost + gitToken：ship action 走 server 内置 GitLab REST API、
  *   不依赖外部 glab CLI；当前公司场景所有仓共用同一个 GitLab 实例、所以是全局字段。
  */
@@ -547,7 +547,7 @@ export interface MRRecord {
   repoPath: string;
   /**
    * 本仓累计 push 次数（首次 createMR 时 = 1、之后每次 ship 都 ++）
-   * 跟 GitLab MR ID（iid）没关系、只是 fe-ai-flow 内部计数
+   * 跟 GitLab MR ID（iid）没关系、只是 ai-flow 内部计数
    */
   version: number;
   url: string;

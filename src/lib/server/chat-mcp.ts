@@ -59,6 +59,11 @@ import {
   buildNextActionHead,
   shellWaitGuideHead,
 } from "../protocol-signals";
+import {
+  chatShellWaitGuideBody,
+  shellCurlRunSection,
+  waitDisciplineSection,
+} from "./wait-protocol-prompt";
 
 // ----------------- 配置 -----------------
 
@@ -258,8 +263,13 @@ interface ChatMcpGlobalState {
   // → 服务端误入待命态、pendingAck 被清、UI 只剩「推进」、用户没法再聊聊。
   // 有此标记时 wait_for_user 不带 action_id → 自动纠正回原 action 的 ack 态 + 返回文本责令补处理。
   unansweredRevises: Map<string, { actionId: string; artifactPath?: string }>;
+  // V0.7.20：chat 模式 task 集合。chat-runner 启动时 mark、结束时 unmark。
+  // buildShellWaitGuidance 据此给 chat 一份「USER_REPLY 语境」的精简引导、
+  // 不让 chat agent 看到一堆 task 专属信号（ACTION_ACK / NEXT_ACTION）而困惑。
+  chatModeTasks: Set<string>;
 }
 
+// V11：2026-06-14 V0.7.20 加 chatModeTasks（chat 模式 task 集合、buildShellWaitGuidance 据此给 chat 专属精简引导）
 // V10：2026-06-10 V0.6.31 加 unansweredRevises（revise 后 agent 跳过处理直入待命态的自动纠正）
 // V9：2026-06-05 V0.6.19 加 pendingNextActions（approve 后秒推 action 的 grace race 修复、挂起队列）
 // V8：2026-05-28 V0.6.1 加 taskActionHandlers（submit_mr / set_feishu_testers）
@@ -269,7 +279,7 @@ interface ChatMcpGlobalState {
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
 // → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV10__";
+const GLOBAL_KEY = "__feAiFlowChatStateV11__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -284,6 +294,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       tokenToTask: new Map(),
       pendingNextActions: new Map(),
       unansweredRevises: new Map(),
+      chatModeTasks: new Set(),
     };
   }
   return g[GLOBAL_KEY];
@@ -299,6 +310,19 @@ const pendingNextActions = getGlobalState().pendingNextActions;
 // V0.6.31：未处理 revise 标记（见 ChatMcpGlobalState 注释、wait_for_user handler 消费）
 const unansweredRevises = getGlobalState().unansweredRevises;
 
+// V0.7.20：chat 模式 task 集合（见 ChatMcpGlobalState 注释）
+const chatModeTasks = getGlobalState().chatModeTasks;
+
+/** chat-runner 启动 chat session 时调：标记此 task 走 chat 等待引导（精简、USER_REPLY 语境）。 */
+export const markTaskAsChat = (taskId: string): void => {
+  chatModeTasks.add(taskId);
+};
+
+/** chat session 结束 / task 清理时调：取消 chat 标记。 */
+export const unmarkTaskAsChat = (taskId: string): void => {
+  chatModeTasks.delete(taskId);
+};
+
 // 「这个 task 当前是否处在等待用户的状态」
 // wait_for_user / ask_user MCP 工具进来时标 true、submitXxx / cancelPending 清
 // 用途：UI 拉状态、runner 切 task.runStatus = awaiting_user 时去重
@@ -313,11 +337,24 @@ const tokenToTask = getGlobalState().tokenToTask;
 const newWaitToken = (): string =>
   Math.random().toString(36).slice(2, 10);
 
+// chat 模式每轮用户消息尾部固定拼的「recency 提醒」（V0.7.20）。
+// 为什么放这里而不是只在起手 prompt 讲：起手注入一次、长对话里会被后面几十轮淹掉、composer-2.5
+// 实测「理解协议但漏执行」——它自己都能准确诊断「回复完该挂等」、却在长上下文里忘了做。
+// 把这条贴在**每一条用户回复的尾部**（agent 下一步就是回复用户、这是它最近读到的文本）、
+// 用命令式 do-this 而非长篇 why（它不缺理解、缺的是「就在眼前的执行提醒」）。
+// 用户在 UI 看不到 curl stdout、所以这句只给 agent、不污染用户视野。
+const CHAT_REPLY_REMINDER =
+  "（系统提醒，非用户所说）回答完上面这条后，立刻再调一次 `wait_for_user` 挂等下一条——这是本轮必须做的收尾动作，漏掉对话就断了。";
+
 // 把 ToolReturn 序列化成 wait-ack 路由写出 curl 的文本（多行）
 // 第一行是 `[KIND ...]` 标记（必）、后续是 body。agent 在 shell 输出里 grep 标记拿语义、按需读 body
 //
 // 历史：旧版返 MCP `{content: [{type:text, text}]}`、shell long-poll 后直接写文本到 stdout
-export const formatToolReturnAsText = (result: ToolReturn): string => {
+// taskId（可选）：传了且该 task 处于 chat 模式时、在 user_reply 尾部拼 CHAT_REPLY_REMINDER。
+export const formatToolReturnAsText = (
+  result: ToolReturn,
+  taskId?: string,
+): string => {
   if (result.kind === "action_approve") {
     const lines: string[] = [SIGNALS.ACTION_ACK_APPROVE];
     if (result.text && result.text.trim()) lines.push("", result.text);
@@ -378,6 +415,11 @@ export const formatToolReturnAsText = (result: ToolReturn): string => {
         `${SIGNALS.ATTACHED_PATHS} 用户附了以下文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取（路径已是绝对路径、直接用）：`,
         ...result.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
       );
+    }
+    // chat 模式：每轮用户回复尾部固定补一句「回完记得再挂等」（recency 兜底、防长上下文漏执行）。
+    // task 模式不掺（它的 wait_for_user / ask_user 是 action 内确认、语义不同）。
+    if (taskId && chatModeTasks.has(taskId)) {
+      lines.push("", CHAT_REPLY_REMINDER);
     }
     return lines.join("\n");
   }
@@ -732,6 +774,11 @@ const buildShellWaitGuidance = (
 ): string => {
   const baseUrl = getServerBaseUrl();
   const url = `${baseUrl}/api/tasks/${encodeURIComponent(taskId)}/wait-ack?token=${encodeURIComponent(token)}`;
+  // V0.7.20：chat 模式走精简引导（USER_REPLY 语境、不夹 task 专属的 ACTION_ACK / NEXT_ACTION 信号）。
+  // 完整等待纪律已在 chat 起手 prompt（chatWaitProtocolSection）讲过一次、这里只给 curl + 怎么读输出。
+  if (chatModeTasks.has(taskId)) {
+    return [shellWaitGuideHead(token), "", chatShellWaitGuideBody(url)].join("\n");
+  }
   const contextLine =
     opts.mode === "ask_user"
       ? "等用户在 UI 弹窗里答完 ask_user 问题、curl 拿到 `[USER_REPLY]` 行带 markdown Q&A、解析每条答案接着工作。"
@@ -754,70 +801,25 @@ const buildShellWaitGuidance = (
     shellWaitGuideHead(token),
     ...correctionBlock,
     "",
-    "## ⚠️ 跑 shell 前自检（仅 chat 自由对话场景；task 写 artifact 场景跳过本段）",
-    "如果你这一轮是在 chat 里回答用户：先确认**完整答案**已经 emit 给用户了吗？",
-    "  - 只发了一句概述 / 还没把关键信息（接口、代码、数据、结论）给全 → **现在立刻补一条完整 assistant_message**、再跑下面的 shell",
-    "  - **认知纠正**：你拿到本引导、跑 shell **之前**仍然可以 emit assistant_message——不是「调了 wait_for_user 本轮就发不出文字」（实测踩过：只发半句概述就跑 shell、用户得催一句才补全）",
+    shellCurlRunSection(url),
     "",
-    "## 下一步只许做一件事：调 `shell` 工具跑这一条 curl 长链接（调一次就够、然后挂着等）",
+    "## stdout 解读规则（决定你下一步动作、必背）",
     "",
-    "正常前台调用即可、**不要自己加 `&` / `nohup` / `disown`、不要主动把 shell 标成 background / is_background**。",
+    "shell stdout 按时序输出这些行、看到哪个按哪个走：",
     "",
-    "**⚠️ 关于「后台」必看（不看准纠结）**：这条 curl 要一直挂着等用户（几分钟到几小时）、所以 **shell 工具大概率会自动把它转入后台运行**——这是 runtime 对「迟迟不返回的命令」的固有行为（超过它的前台等待时长没返回就自动转）、不是你的错、你也拦不住、**完全正常**。",
-    "  - ✅ 被自动转后台后：curl 进程还在后台跑、连接还活着、KEEPALIVE / 终态行照样通过 shell 输出推给你——你**什么都不用做、继续等下一段 stdout 就行**",
-    "  - ❌ 别因为「看到被转后台」就慌：**不要重新调 shell、不要纠结「规范要前台我却被后台」、不要 summarize 退出**——那才会真把等待打断、Run 提前退出、对话「自己结束」",
-    "  - ❌ 你**主动**放后台（加 `&` / nohup / 标 is_background）才是错的：curl 还没连上就脱离 = 等于没等",
-    "  - 终态行（USER_REPLY / ACTION_ACK / NEXT_ACTION / CANCELLED）出现时、服务端关流、你才接着处理",
+    "  - `[KEEPALIVE ts=...]`：60 秒一次心跳、忽略它。",
+    `  - \`[ACTION_ACK approve]\`：用户点了「通过」、curl exit。**不要结束 Run**、立刻再调 \`wait_for_user(task_id=${taskId})\`（不带 action_id）等下一 action 指令。**别 emit 总结**——用户在看板看 timeline 推进就够。`,
+    "  - `[ACTION_ACK revise] <feedback>`：用户点了「再聊聊」、按 super-prompt §3 revise 二分类处理（问类 emit 答疑 / 改类 ask_user 复述后 edit）、完事再调 `wait_for_user(task_id, action_id, artifact_path)` 等同 action 下一次 ack。",
+    "  - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]` + 空行 + `<用户指令>`：用户推进新 action、解析头部 + 指令、跳对应 action 执行。",
+    "  - `[USER_REPLY] <markdown Q&A>`：ask_user 答完、按内容推进（chat 自由对话不走本工具）。",
+    "  - `[TASK_DONE]` / `[TASK_ABANDONED]` / `[CANCELLED]`：收尾结束 Run。",
+    "  - `[STALE]` / `[INVALID_TOKEN]`：本 token 失效、别重试、自然结束 Run。",
+    "  - `[INTERNAL_ERROR]`：服务端内部错误、重调一次 `wait_for_user`（同参数）重建、连续 2 次仍 INTERNAL_ERROR 才结束 Run。",
     "",
-    "```",
-    `curl -sN "${url}"`,
-    "```",
+    waitDisciplineSection(),
     "",
-    "参数说明：",
-    "  - `-s` 静默、`-N` 不缓冲（服务端 chunked 一来就出 stdout、KEEPALIVE / 终态行实时可见）",
-    "  - **这是一条前台长链接**：连上后一直挂着、服务端每 60 秒发一行 `[KEEPALIVE ts=...]` 维持（防 shell idle 被杀）、用户在 UI 回复时服务端写终态行 + 关流、curl 自然 exit 0",
-    "  - **本地回环连接、不会断**：别加 `--max-time`、别套 while 重连、别自己写循环——加了纯属画蛇添足、还可能把你带偏",
-    "",
-    "## stdout 解读规则（**必背、决定你下一步动作**）",
-    "",
-    "shell stdout 会按时序持续输出几种行：",
-    "",
-    "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳、忽略它**。它的唯一意义是告诉你「连接还活着、用户还没操作」。看到再多 KEEPALIVE 都是正常的、**绝对不要**因此 summarize 退出 / 调 read 检查 terminal / 重新调 wait_for_user / 调其他工具自救。",
-    "  - `[ACTION_ACK approve]`：用户在 UI 点了「通过」、shell 命令立刻 exit 0。**不要结束 Run**、立刻再调一次 wait_for_user(task_id={{taskId}})（不带 action_id）等下一 action 指令",
-    "  - `[ACTION_ACK revise] <feedback 文本>`：用户点了「再聊聊」——按 super-prompt §3 revise 解读两类处理（问类 emit answer / 改类 ask_user 复述后 edit）、完事再调 wait_for_user(task_id, action_id, artifact_path) 等同 action 的下一次 ack",
-    "  - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]\\n\\n<用户指令>`：用户在 UI 推进新 action、解析头部 + 用户指令、跳到对应 action prompt 段执行",
-    "  - `[USER_REPLY] <markdown Q&A 文本>`：ask_user 答完、按内容推进（task 容器模式里只有 ask_user 单选问答会出 USER_REPLY；chat 自由对话不走本工具）",
-    "  - `[CANCELLED]`：任务被取消、收尾结束 run",
-    "  - `[STALE]` / `[INVALID_TOKEN]`：本 token 已失效、不要重试、自然结束 run",
-    "",
-    "## 钢铁纪律（5 分钟 / 10 分钟 / 20 分钟没新行 ≠ shell 卡住）",
-    "",
-    "这条 curl 会挂着等用户 0 秒到**几小时**（大概率被 shell 自动转后台、正常）、任何长度都正常。**等待期间你只看到 `[KEEPALIVE ts=...]` 每 60 秒追加一行**、这是连接还活着的信号、不是 bug。",
-    "",
-    "**绝对禁止的动作**（看到 KEEPALIVE 累积时尤其要克制）：",
-    "  - ❌ **主动**给命令加 `&` / nohup / 标 is_background（被 shell 自动转后台是正常的、但你别自己放）",
-    "  - ❌ 调 read 读 cursor 内部 terminal 文件、查 shell 进程状态",
-    "  - ❌ thinking 里冒「process is still running, I will summarize」/「the 5-minute block has ended」→ summarize 退 run",
-    "  - ❌ 调任何其他工具自救、重新启 shell、重新 wait_for_user",
-    "  - ❌ emit assistant_message 跟用户讲「我在等」「shell 在跑」之类",
-    "",
-    "**唯一合法动作**：什么也不做、继续等 shell 的下一段 stdout（要么 KEEPALIVE 要么 ACTION_ACK / NEXT_ACTION / USER_REPLY 等终态行）。",
-    "",
-    `## 这次 wait 的目的`,
+    "## 这次 wait 的目的",
     contextLine,
-    "",
-    "## 异常处理",
-    "",
-    "  - **唯一的正常退出**：stdout 出现终态行（USER_REPLY / ACTION_ACK / NEXT_ACTION / CANCELLED）、服务端关流、curl exit——按上面「stdout 解读规则」对最后那行行动",
-    "  - **「被 shell 自动转后台」≠「curl exit」**：转后台后 curl 进程还活着、stdout 会继续推 KEEPALIVE / 终态行——这种情况**绝不重发**、什么都不做继续等就行（重发只多一条没用的连接、还可能把你带进自救循环）",
-    "  - **只有「真 exit」（shell 明确给出 exit code 非 0、且 stdout 一行都没有、如服务端重启 / 连接异常）→ 才再调一次本 shell 跑同一条命令兜底**：同 token 还能接上原 entry（subscribeWaitAck 不消费 token、entry 还在）",
-    "  - **连调 2 次都立刻异常 exit** → emit 一条简短 assistant_message「监听连接异常断开、请在 AI工作流看板点『推进』」、自然结束 run（用户点「推进」→ 后端起 agent 接着推进、带任务事件日志恢复上下文）",
-    "",
-    "## 调用礼仪",
-    "",
-    "  - 调 shell 前 / 中 / 后**不要** assistant_message 解释「我在等用户」「我在轮询」「协议细节」之类",
-    "  - shell 拿到结果后**直接按结果行动**、不要复述「你刚才点了 approve」",
-    "  - 对用户透明：他在 UI 上看 artifact + 点 ack、不需要看你描述协议",
   ].join("\n");
 };
 
@@ -825,7 +827,7 @@ const buildShellWaitGuidance = (
 
 const buildMcpServer = (): McpServer => {
   const srv = new McpServer({
-    name: "fe-ai-flow-task",
+    name: "ai-flow-task",
     version: "1.0.0",
   });
 
@@ -834,10 +836,10 @@ const buildMcpServer = (): McpServer => {
     {
       title: "发起一次等用户 ack 请求（立即返回 shell 引导）",
       description: [
-        "fe-ai-flow 用这个工具发起一次「等用户」请求、本工具**立即返回一段 [SHELL_WAIT_GUIDE] 引导文本**、",
+        "ai-flow 用这个工具发起一次「等用户」请求、本工具**立即返回一段 [SHELL_WAIT_GUIDE] 引导文本**、",
         "教你调 `shell` 工具用 curl 跟服务端 /api/tasks/:id/wait-ack 路由建长连接等结果。",
         "",
-        "## 硬性规则（不遵守、fe-ai-flow runner 会把任务标 failed）",
+        "## 硬性规则（不遵守、ai-flow runner 会把任务标 failed）",
         "",
         "- **完成一个 action（写完 artifact）后必须调一次本工具**、shell 拿到 `[ACTION_ACK approve]` / `[ACTION_ACK revise]` 才能继续",
         "- **不调本工具 = action 没完成**、runner 在 run 结束时硬检测、有 action 状态不是 ack 一律标 failed",
@@ -1376,7 +1378,7 @@ const buildSessionTransport =
       // 背景：MCP StreamableHTTP transport 默认 client 启 transport 后会建一条 GET SSE
       // 长连接接 server push notification。但我们业务上：
       //   - wait_for_user / ask_user 都是立即返回 SHELL_WAIT_GUIDE、不走 SSE stream
-      //   - UI 事件流推送走 fe-ai-flow 自己的 /api/tasks/[id]/events 端点、不走 MCP push
+      //   - UI 事件流推送走 ai-flow 自己的 /api/tasks/[id]/events 端点、不走 MCP push
       //
       // 空挂着的 GET 在 Next.js dev / 中间层会被 idle 5 分钟超时砍、
       // SDK MCP client 检测到 transport 不健康 → 7-8 分钟后整个 run 标 error。
@@ -1762,6 +1764,8 @@ export const cleanupChatTaskState = (taskId: string): void => {
   // 2) 清 notifier / task action handler（waitingTasks 已在 cancelPending 里清）
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
+  // 3) 清 chat 模式标记（V0.7.20）
+  chatModeTasks.delete(taskId);
 };
 
 /**

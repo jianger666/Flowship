@@ -329,7 +329,7 @@ const getCommonParentDir = (paths: string[]): string => {
  */
 export const getEffectiveCwd = (repoPaths: string[]): string => {
   // V0.6：repoPaths 空（自由聊 / 调研类 task）→ fallback process.cwd()
-  //   server 端 process.cwd() = fe-ai-flow 项目自己、agent 起在这里至少有合法 cwd
+  //   server 端 process.cwd() = ai-flow 项目自己、agent 起在这里至少有合法 cwd
   if (repoPaths.length === 0) {
     return typeof process !== "undefined" ? process.cwd() : "";
   }

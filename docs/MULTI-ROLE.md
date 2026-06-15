@@ -1,4 +1,4 @@
-# fe-ai-flow 多角色通用化路线图
+# ai-flow 多角色通用化路线图
 
 > 沉淀 V0.4「按角色读 story」设计的来龙去脉、以及未来扩 enum 时的操作指南。
 
@@ -6,7 +6,7 @@
 
 ## 起因
 
-fe-ai-flow 一开始是前端项目（crm-web）的专属工具、整套 prompt 都是「前端 Vue / React 项目」假设。
+ai-flow 一开始是前端项目（crm-web）的专属工具、整套 prompt 都是「前端 Vue / React 项目」假设。
 
 但实际飞书项目（wukongedu / wk-dm）的 story 不是「前端 story」或「后端 story」、而是**「跨角色共享的产品需求」**：
 
@@ -101,12 +101,12 @@ story 6993079032（产品需求）
 - ⚠️ **一个 task 多 repo**：V0.4 设计是单仓（`Task.repoPath: string`）、**V0.6.1 已改多仓**（`Task.repoPaths: string[]`、ship 支持多仓 MR）。「一个 task 锁一个 role」仍成立、但仓库不再限单个
 - ❌ **一个 task 多 role**：同上
 - ❌ **role + repoType 校验**：前端 role 选了 Java 仓库不报错——大概率是用户配错、agent 自己扫 repo 也能识别异常、不挡用户路
-- ❌ **自动从 story 识别角色**：agent 看 story 自己挑 ferd / berd 节点细节、不要 fe-ai-flow 帮用户拆 task
+- ❌ **自动从 story 识别角色**：agent 看 story 自己挑 ferd / berd 节点细节、不要 ai-flow 帮用户拆 task
 - ❌ **「角色市场」/「角色 marketplace」**：role 数量是有限的、不做插件式扩展
 
 ## 未来探索（不在路线图）
 
-- **跨 repo 协同**：前端 task 跑完、自动建一个后端 task 让后端同事跑（需要全员都用 fe-ai-flow、目前用户基数不够）
+- **跨 repo 协同**：前端 task 跑完、自动建一个后端 task 让后端同事跑（需要全员都用 ai-flow、目前用户基数不够）
 - **story 自动状态同步**：phase ack 后自动改飞书 story 的「前端完成度 / 后端完成度」字段（V0.3.3 已砍 ship phase——出于注意力管理、先把 plan/build 做扎实）
 - **角色协作仪表盘**：在 story 维度看「前端 task=plan ack、后端 task=build running」之类的全局视图
 

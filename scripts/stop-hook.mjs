@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// fe-ai-flow stop hook（V0.6.3 .sh 版、V0.6.29 改写 Node）：保证 agent 交卷（调 wait_for_user）后才放行结束 Run。
+// ai-flow stop hook（V0.6.3 .sh 版、V0.6.29 改写 Node）：保证 agent 交卷（调 wait_for_user）后才放行结束 Run。
 //
 // 行为：agent 想结束 Run → Cursor 触发本 hook（stdin 给事件 JSON）→ 提取 conversation_id
 //   （= agent_id）→ POST fe /api/hooks/stop-check 问「这个 agent 的 action 交卷没」→
@@ -8,7 +8,7 @@
 // 为什么是 Node 不是 bash（V0.6.29、同事 Windows 实测踩坑）：
 //   hooks.json command 指 .sh 时、Windows 没有 shebang 机制、系统按文件关联处理、
 //   .sh 的关联应用恰好是 IDE → hook 每触发一次 IDE 就「打开」脚本一次、且拦截从未生效。
-//   fe-ai-flow 本身跑在 Node 上、`node <本文件>` 跨平台必可执行、还顺带去掉 curl 依赖。
+//   ai-flow 本身跑在 Node 上、`node <本文件>` 跨平台必可执行、还顺带去掉 curl 依赖。
 //
 // fail-open 铁律：拿不到 agent_id / fe 没开 / 超时 / 任何异常 → 输出 {} 放行。
 //   绝不 block agent——尤其用户用 Cursor IDE 打开该 repo 时 IDE agent 也会触发本 hook、

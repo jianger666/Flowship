@@ -15,7 +15,7 @@
  * command 形式（V0.6.29 改 `node "<mjs 绝对路径>"`、原来是 .sh 绝对路径）：
  * - 同事 Windows 实测踩坑：.sh 没 shebang 机制、系统按文件关联处理、关联应用是 IDE →
  *   hook 每触发一次 IDE 就「打开」脚本一次、且两道闸在 Windows 从未真正生效
- * - fe-ai-flow 跑在 Node 上、`node` 必在 PATH、跨平台必可执行、顺带去掉 bash/curl 依赖
+ * - ai-flow 跑在 Node 上、`node` 必在 PATH、跨平台必可执行、顺带去掉 bash/curl 依赖
  *
  * 策略（用户拍板方案 A、V0.6.27 微调、V0.6.29 升级逻辑改全量重写）：
  * - **没 .cursor/hooks.json 就建 fe 的**；有且是 fe 自己建的（command 引用 fe scripts/）

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// fe-ai-flow beforeShellExecution hook（V0.6.27 .sh 版、V0.6.29 改写 Node）：
+// ai-flow beforeShellExecution hook（V0.6.27 .sh 版、V0.6.29 改写 Node）：
 // agent 跑 shell 命令前问 fe 是否放行。
 //
 // 行为：Cursor 触发本 hook（stdin 给事件 JSON、含 conversation_id + command）→

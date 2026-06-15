@@ -130,6 +130,8 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "actionHistorySection",
       "firstActionDirective",
       "currentActionPlaybook",
+      // V0.7.20：等待纪律共用片段（chat / task 单一源、wait-protocol-prompt.waitDisciplineSection）
+      "waitDiscipline",
     ]);
     for (const ph of extractPlaceholders(superMd)) {
       expect(supplied, `_super.md 用了未供值占位符 {{${ph}}}`).toContain(ph);

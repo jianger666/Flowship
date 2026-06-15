@@ -74,6 +74,7 @@ import { validateSubmitMr } from "./submit-mr-guard";
 import { ensureStopHookInstalled } from "./stop-hook-inject";
 import { reapTaskOrphans } from "./kill-orphans";
 import { renderContextDocsSection } from "./context-docs-prompt";
+import { waitDisciplineSection } from "./wait-protocol-prompt";
 import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
@@ -120,7 +121,7 @@ import { buildNextActionHead } from "@/lib/protocol-signals";
 const TASK_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 // chat-mcp 在 Agent.mcpServers 里的注册名（agent prompt 里得点明、跟 V0.5 沿用）
-const TASK_TOOL_MCP_NAME = "feAiFlowChat";
+const TASK_TOOL_MCP_NAME = "aiFlowChat";
 
 const PROMPTS_DIR = path.join(process.cwd(), "prompts");
 const SUPER_PROMPT_FILE = "_super.md";
@@ -278,6 +279,8 @@ const buildSuperPrompt = async (
     actionHistorySection,
     firstActionDirective,
     currentActionPlaybook,
+    // V0.7.20：等待纪律共用片段（chat / task 单一源、见 wait-protocol-prompt.ts）
+    waitDiscipline: waitDisciplineSection(),
   });
 };
 

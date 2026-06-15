@@ -1,10 +1,10 @@
 /**
- * fe-ai-flow Skills Loader
+ * ai-flow Skills Loader
  *
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
  * 设计要点（2026-06「跟 Cursor 共用工具」定案、详见 ROADMAP）：
- *   - **平台自带 + 全局两类都读**：`<fe-ai-flow>/skills/`（git 发布、所有用户共享）
+ *   - **平台自带 + 全局两类都读**：`<ai-flow>/skills/`（git 发布、所有用户共享）
  *     + 全局 `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）。
  *   - **repo `.cursor/skills/` 不在这里读**：project 层、由 Agent.create 的
  *     `settingSources:["project"]` 交给 SDK 加载、fe 再读 = 同一份 SKILL.md 进 prompt 两次。
@@ -28,9 +28,9 @@ import matter from "gray-matter";
 
 import { getGlobalCursorDirs } from "./cursor-config";
 
-// fe-ai-flow 平台自身 skills 目录的相对路径
-// V0.3 起：从 `.fe-ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
-// 命名直白、避免「fe-ai-flow inside fe-ai-flow」的冗余目录层
+// ai-flow 平台自身 skills 目录的相对路径
+// V0.3 起：从 `.ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
+// 命名直白、避免「ai-flow inside ai-flow」的冗余目录层
 const FE_AI_FLOW_OWN_SKILLS_DIR = "skills";
 
 // 递归深度上限：防止 skills 嵌套过深、扫描爆栈 / 卡 IO
@@ -154,7 +154,7 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
  * 加载本次 agent 可用的 skills：平台自带 + 全局 `~/.cursor/skills/`
  *
  * 两类来源（都由 fe 注入 prompt、不靠 settingSources）：
- *   1. **平台自带** `<fe-ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
+ *   1. **平台自带** `<ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
  *   2. **全局** `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）——
  *      `settingSources:["project"]` 只读 project 层、够不着 user 层、必须 fe 自己读
  *
@@ -192,7 +192,7 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有可用 skill。平台 skill 放在 fe-ai-flow `skills/<name>/SKILL.md`、全局 skill 走 `~/.cursor/skills/`；仓库级 skill 由 settingSources 自动加载、不在此列。）";
+    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、全局 skill 走 `~/.cursor/skills/`；仓库级 skill 由 settingSources 自动加载、不在此列。）";
   }
   const lines: string[] = [];
   for (const s of skills) {

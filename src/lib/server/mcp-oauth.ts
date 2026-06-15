@@ -127,7 +127,7 @@ class FileOAuthClientProvider implements OAuthClientProvider {
 
   get clientMetadata(): OAuthClientMetadata {
     return {
-      client_name: "fe-ai-flow",
+      client_name: "ai-flow",
       redirect_uris: [getRedirectUri()],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -373,7 +373,7 @@ const probeOAuthRequired = async (
         params: {
           protocolVersion: "2025-06-18",
           capabilities: {},
-          clientInfo: { name: "fe-ai-flow", version: "0" },
+          clientInfo: { name: "ai-flow", version: "0" },
         },
       }),
       redirect: "manual",

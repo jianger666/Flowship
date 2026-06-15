@@ -1,13 +1,13 @@
 ---
 alwaysApply: true
-description: fe-ai-flow 项目核心上下文、新对话第 1 步必读
+description: ai-flow 项目核心上下文、新对话第 1 步必读
 ---
 
-# fe-ai-flow 项目核心上下文
+# ai-flow 项目核心上下文
 
 ## 项目定位（V0.2 重定、V0.3 持续打磨）
 
-**fe-ai-flow = 站在 Cursor 肩膀上的「企业 / 项目级 AI Harness 平台」。**
+**ai-flow = 站在 Cursor 肩膀上的「企业 / 项目级 AI Harness 平台」。**
 
 不是再造一个 Cursor / Claude Code、是给前端项目（一开始针对 crm-web 这种业务仓库）做一层「需求 → PR」的任务自动化壳：
 

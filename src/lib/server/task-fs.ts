@@ -99,7 +99,7 @@ const taskDir = (id: string): string => path.join(DATA_DIR, sanitizeId(id));
 
 /**
  * events.jsonl 的绝对路径
- * agent cwd 是用户业务仓库、不是 fe-ai-flow 本身、所以必须用绝对路径
+ * agent cwd 是用户业务仓库、不是 ai-flow 本身、所以必须用绝对路径
  */
 export const getEventsLogPath = (taskId: string): string =>
   path.join(taskDir(taskId), EVENTS_FILE);

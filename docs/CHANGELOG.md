@@ -1,6 +1,6 @@
-# fe-ai-flow CHANGELOG
+# ai-flow CHANGELOG
 
-本文件记录 fe-ai-flow 所有 V0.x 版本的演进细节、按时间倒序（最新在最上面）。
+本文件记录 ai-flow 所有 V0.x 版本的演进细节、按时间倒序（最新在最上面）。
 
 ## 这文件为什么存在
 
@@ -74,7 +74,7 @@ learn 从 V0.6.0 stub 转正、用户拍板设计（对标 Spec Kit constitution
 | L2 过程知识（step-by-step 手册） | 业务仓 `.cursor/skills/<name>/SKILL.md` | 按需唤起、复利最高 |
 | L3 业务域知识（名词表 / 模块地图） | `business-glossary.mdc` | 常驻、条目极简 |
 
-第 4 类 harness 建议（fe-ai-flow prompt 缺陷）**只 propose 不落地**（agent 自改自己 prompt 有自污染风险）。
+第 4 类 harness 建议（ai-flow prompt 缺陷）**只 propose 不落地**（agent 自改自己 prompt 有自污染风险）。
 
 **核心机制**：
 - **证据驱动**：挖全部 artifact + 事件日志的四类高价值信号（用户 revise 原话 / ask_user 拍板 / review bug + 用户裁决 / check 失败）——凭印象编造被后置检查 fail
@@ -604,7 +604,7 @@ settings.repos[].{testBranch,devBranch,branchTemplate} + settings.branchTemplate
 
 ### V0.6.2：跟 Cursor 共用工具（全局配置 fe 读 + MCP 只读化）（2026-06-01）
 
-`pnpm typecheck` ✓ / `pnpm lint` ✓。承接 V0.6.1 的 settingSources、补完「全局层」配置读取 + fe 端 MCP 改只读。fe-ai-flow 不再自己维护 MCP、统一消费 Cursor 配置（单一源在 Cursor、fe 只读不写）。
+`pnpm typecheck` ✓ / `pnpm lint` ✓。承接 V0.6.1 的 settingSources、补完「全局层」配置读取 + fe 端 MCP 改只读。ai-flow 不再自己维护 MCP、统一消费 Cursor 配置（单一源在 Cursor、fe 只读不写）。
 
 ⚠️ **纠正 V0.6.1 settingSources 子段的误读**：原写「`settingSources:["project"]` 加载目标仓库 **+ 全局** `.cursor/`」——**错**。`SettingSource` 是分层枚举（SDK `options.d.ts`：`"project" | "user" | "team" | "mdm" | "plugins" | "all"`）、`["project"]` **只加载 project 层（repo `.cursor/`）、够不着全局 `~/.cursor/`**（全局要含 `"user"`）。旧探针「skillCount 13 来自全局」是误读：本地 `~/.cursor/skills/` 实测仅 3 个、那 13 大概率是 fixture cwd 自身的项目层 skills。
 
@@ -1613,7 +1613,7 @@ Settings 配多个 repo（已有）→ 新建 task UI 多选 → task.repoPaths:
 
 - **跨父目录多仓**（如 `~/Documents/A` + `~/Other/B`）：commonParent 算到 `~` 或更上、SDK cwd 设到这种宽目录、AI 多 read 几层才能看到仓——按用户拍板**走宽松**、不报错（V0.5.9 不做边界检查）
 - **多仓 git 命令**：`{{repoPath}}` 是父目录、不在 git 仓库里、AI 跑 `git diff` 必报错——prompt 里 super-prompt 顶部「任务输入」段明确说「git 命令必须 cd 到对应子仓」、AI 看到这段自然遵守
-- **多仓 skill**：当前 `loadSkills(cwd)` 只扫一个目录、多仓时只看公共父目录的 `.cursor/skills`——子仓里的 skill 暂时看不到、不阻塞使用（fe-ai-flow 内置 skill 走绝对路径加载、不依赖 cwd）
+- **多仓 skill**：当前 `loadSkills(cwd)` 只扫一个目录、多仓时只看公共父目录的 `.cursor/skills`——子仓里的 skill 暂时看不到、不阻塞使用（ai-flow 内置 skill 走绝对路径加载、不依赖 cwd）
 
 **总改动**：
 

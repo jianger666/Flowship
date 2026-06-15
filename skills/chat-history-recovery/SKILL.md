@@ -6,13 +6,13 @@ description: >-
   把所需的历史事件找回来。
 ---
 
-# fe-ai-flow Chat 历史上下文恢复
+# ai-flow Chat 历史上下文恢复
 
 本任务的所有历史事件（之前你的回复、用户的消息、你调过的工具、思考过程等）都按时间序追加在 `events.jsonl` 里、JSONL 格式（每行一条 JSON 事件）。
 
 ## 文件位置
 
-文件绝对路径由 fe-ai-flow 启动时的初始 prompt 已经告诉你（变量 `eventsLogPath`、形如 `/Users/.../data/tasks/<task_id>/events.jsonl`）。
+文件绝对路径由 ai-flow 启动时的初始 prompt 已经告诉你（变量 `eventsLogPath`、形如 `/Users/.../data/tasks/<task_id>/events.jsonl`）。
 
 ## 事件 schema
 

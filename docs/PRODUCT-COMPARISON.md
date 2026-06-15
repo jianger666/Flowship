@@ -1,8 +1,8 @@
-# fe-ai-flow vs Cursor IDE vs Claude Code
+# ai-flow vs Cursor IDE vs Claude Code
 
 ## 一句话差异化
 
-fe-ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harness 工程化层**。核心价值是让 AI 写代码这件事「自动化 + 流程规范化」、最终保障产出质量。代码具体怎么写 / hunk 怎么改是 Cursor / CC 的事、不是本项目要打的战场。
+ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harness 工程化层**。核心价值是让 AI 写代码这件事「自动化 + 流程规范化」、最终保障产出质量。代码具体怎么写 / hunk 怎么改是 Cursor / CC 的事、不是本项目要打的战场。
 
 ## 入口形态
 
@@ -10,16 +10,16 @@ fe-ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harnes
 |---|---|---|
 | Cursor IDE | 用户在编辑器里手动唤起 chat / agent | 交互式、用户全程在 IDE |
 | Claude Code | CLI 命令行 / IDE 插件 | 交互式、agent 在用户 supervise 下跑 |
-| fe-ai-flow | 网页看板、每个任务一张卡 | 半自动、用户只在 action 边界 ack |
+| ai-flow | 网页看板、每个任务一张卡 | 半自动、用户只在 action 边界 ack |
 
 ## 核心差异
 
-- **自动化粒度**：Cursor / CC 是「按需 turn」、fe-ai-flow 是「按 action 整段（plan / build / review / ship）」
-- **HITL 节奏**：Cursor / CC 是每条 message 都 HITL、fe-ai-flow 是只在 action 边界 HITL
-- **数据可审计**：Cursor / CC chat 历史在 IDE 本地、fe-ai-flow 全程 `events.jsonl` + `artifacts/*.md` 可 diff / 可回放
-- **适合场景**：Cursor / CC 适合编辑器内即时辅助、fe-ai-flow 适合「半结构化需求 → PR」流程化交付
+- **自动化粒度**：Cursor / CC 是「按需 turn」、ai-flow 是「按 action 整段（plan / build / review / ship）」
+- **HITL 节奏**：Cursor / CC 是每条 message 都 HITL、ai-flow 是只在 action 边界 HITL
+- **数据可审计**：Cursor / CC chat 历史在 IDE 本地、ai-flow 全程 `events.jsonl` + `artifacts/*.md` 可 diff / 可回放
+- **适合场景**：Cursor / CC 适合编辑器内即时辅助、ai-flow 适合「半结构化需求 → PR」流程化交付
 
-## Harness 保障质量的 7 件事（fe-ai-flow 核心能力）
+## Harness 保障质量的 7 件事（ai-flow 核心能力）
 
 1. **每个 action 输入 / 输出有 schema**：artifact 锁结构、后置确定性检查校验必备段
 2. **每个 action 边界用户 ack**：HITL 是底线、不允许偷偷往下走
@@ -33,7 +33,7 @@ fe-ai-flow 不是另一个 Cursor / Claude Code、是在它们之上的 **harnes
 
 上面是「IDE vs harness」的横轴；这里是另一条轴——**代码质量纪律方法论**。用户调研过 GitHub Spec Kit / OpenSpec / Superpowers / GStack、问我们对比这几家怎么样。
 
-| 维度 | Spec Kit | OpenSpec | Superpowers | GStack | **fe-ai-flow V0.6.9** |
+| 维度 | Spec Kit | OpenSpec | Superpowers | GStack | **ai-flow V0.6.9** |
 |---|---|---|---|---|---|
 | spec 来源 | 人写前置契约（greenfield） | 人维护 living spec（brownfield delta） | 人写 markdown skill 包 | 角色命令 | **飞书 story/PRD 自动直连 + plan/build/review 每步落 md** |
 | 找 bug 方式 | 弱（重前置 spec） | 弱 | fresh subagent 复审 | 真实浏览器 QA | **fresh peer 两阶段 + 飞书需求×git diff 对撞** |

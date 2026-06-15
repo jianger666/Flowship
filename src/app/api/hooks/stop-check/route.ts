@@ -65,7 +65,7 @@ export const POST = async (req: Request): Promise<Response> => {
       `[stop-check] task=${taskId} action#${last.n}(${last.type}) 未交卷 → followup 拉回`,
     );
     const followup = [
-      "[fe-ai-flow] 检测到你还没对当前 action 交卷、不要结束本次运行。",
+      "[ai-flow] 检测到你还没对当前 action 交卷、不要结束本次运行。",
       `当前 action：id=${last.id}、type=${last.type}、n=${last.n}。`,
       last.artifactPath ? `artifact 路径：${last.artifactPath}。` : "",
       "请先调用 wait_for_user 工具（传 task_id / action_id / artifact_path）把控制权交回用户、收到 ACTION_ACK 后再继续。",

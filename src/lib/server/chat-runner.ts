@@ -48,8 +48,11 @@ import {
 import {
   cancelPending,
   getChatMcpUrl,
+  markTaskAsChat,
   setChatAwaitingNotifier,
+  unmarkTaskAsChat,
 } from "./chat-mcp";
+import { chatWaitProtocolSection } from "./wait-protocol-prompt";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -81,7 +84,7 @@ import type { Task, TaskEvent } from "@/lib/types";
 const CHAT_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 // chat-mcp 在 Agent.mcpServers 里的注册名（跟 task-runner 同款、agent prompt 里得点明）
-const CHAT_TOOL_MCP_NAME = "feAiFlowChat";
+const CHAT_TOOL_MCP_NAME = "aiFlowChat";
 
 // ----------------- 运行时状态（独立于 task-runner）-----------------
 
@@ -180,117 +183,21 @@ const buildInitialPrompt = (
   const eventsLogPath = getEventsLogPath(task.id);
 
   const lines: string[] = [
-    "你正在 fe-ai-flow 的 **Chat 任务**里跑。这是「自由对话」模式、agent 长存活、",
-    "靠 `wait_for_user` MCP 工具阻塞等用户下一条消息、收到后接着说、再 wait、**无限循环、永不自行结束**。",
-    "",
-    "## 🚨 第一铁律：你没有「结束对话」的权力（最高频 bug、先读死这段）",
-    "",
-    "判断对话是否结束**不是你的职责**。在本系统里、对话的生命线 = 你这条 Run、而 **Run 全靠你每轮结尾的 `wait_for_user` 续命**：你 emit 完 assistant_message 后、若**不接一个 tool call**、你的 turn 立刻结束、**turn 结束 = 整个 Run 永久终止 = 用户下次发消息时你已经死了、收不到、必须冷启动重开一个 Run**——这正是本系统最忌讳、用户反复强调要避免的。",
-    "",
-    "所以：**每一轮、无论用户说什么、你回应完都必须调 `wait_for_user` 把 Run 续住。** 唯一能让 Run 结束的是服务端写来的 `[CANCELLED]` 信号（用户点了取消）——除此之外、你**永远**在「回一句 → wait_for_user → 等下一句」的循环里。",
-    "",
-    "⚠️ **最容易翻车的场景（必须记死）**：用户回「好的 / 谢谢 / 收到 / 没事了 / 嗯 / ok / 行 / 再见」这类**收尾语气**时、你会本能地以为「对话结束了」而省掉 wait_for_user——**这是错的、是目前唯一会导致对话莫名中断的 bug**。这些都只是**普通的一轮消息**、你回一句（哪怕只是「好的，有需要再聊」）之后**照样必须**调 wait_for_user 继续等。结束与否**只取决于用户关不关页面 / 点不点取消、跟消息语气无关**。",
+    "你正在 ai-flow 的 **Chat 任务**里跑——一个长期在线的自由对话助手。和用户来回聊、答疑、查资料、读写代码都行。",
     "",
     `任务 ID：\`${task.id}\``,
     `任务标题：${task.title}`,
     "",
-    "## 核心机制：wait_for_user + shell long-poll",
+    // 等待协议（回答 → wait_for_user → shell curl 挂着等下一条）单一源、见 chat-wait-prompt.ts
+    chatWaitProtocolSection(task.id),
     "",
-    "fe-ai-flow 暴露 1 个核心 MCP 工具实现「等用户消息」：",
+    "## 你能用的工具",
     "",
-    "**`wait_for_user`**（每轮对话说完话后调 1 次、绝不重复调）",
-    `  - 唯一入参：\`task_id\` 字符串、固定值 \`${task.id}\`、不传别的参数`,
-    "  - 立即返回 `[SHELL_WAIT_GUIDE token=xxx]` 文本、教你接下来调 `shell` 工具用 curl 跟 /wait-ack 路由建长连接等用户消息",
-    "  - 不阻塞、不轮询、调一次就够",
+    "SDK 内置工具（**名字不带 `_file` 后缀**、就是 `read` / `edit` / `write`、不是 `read_file` 之类）：",
+    "  - `read` 读文件（图片自动走 vision）　`grep` 搜内容　`glob` 找文件名",
+    "  - `shell` 跑命令　`edit` 改已有文件　`write` 建新文件 / 整文件覆盖　`delete` 删文件　`task` 分派子任务",
     "",
-    "## 标准等用户姿势：shell + curl long-poll（必背、anti-loop 的根治方案）",
-    "",
-    "拿到 `[SHELL_WAIT_GUIDE token=xxx]` 后下一步**只许**做：调 `shell` 工具执行 curl 命令（引导文本里有完整命令、复制粘贴跑）",
-    "",
-    "**⚠️ 关于「后台」**：这条 curl 要挂着等用户、shell 工具**大概率自动把它转后台**（runtime 对长命令的固有行为、正常）。被转后台时**别慌、别重调、别 summarize 退出**——KEEPALIVE / 终态行照样推给你、继续等下一段 stdout 就行。你只是**不要自己主动**加 `&` / nohup / 标 is_background（那会让 curl 没连上就脱离）。",
-    "",
-    "服务端 chunked stream 输出可能行：",
-    "  - `[KEEPALIVE ts=<时间戳>]`：**60 秒一次的服务端心跳行、绝对忽略**。看到再多 KEEPALIVE 都正常、shell **没卡**、绝对不要 summarize / 查 terminal / 重启 shell / 重新调 wait_for_user",
-    "  - `[USER_REPLY]` + 文本：用户发了下一条消息（可能含附件路径）、shell 命令 exit 0、接着处理",
-    "  - `[CANCELLED]`：任务被取消、收尾结束 Run",
-    "  - `[STALE]` / `[INVALID_TOKEN]`：忽略本次返回、自然结束 Run",
-    "",
-    "## 钢铁纪律：等用户可能需要 0 秒到几小时、任何长度都正常",
-    "",
-    "shell + curl 是 long-poll、等用户在 UI 上发下一条消息。**等待期间你只看到 KEEPALIVE 行不断追加**、这是设计预期。",
-    "",
-    "**绝对禁止**（5/10/15/20 分钟没新终态行时尤其要克制）：",
-    "  - ❌ 调 read 读 cursor 内部 terminal 文件查 shell 进程状态",
-    "  - ❌ thinking 里冒出「The 5-minute block has ended」「process is still running」「I will summarize for the user」",
-    "  - ❌ 调任何其他工具自救、重新启 shell、重新 wait_for_user",
-    "  - ❌ emit 任何 assistant_message 跟用户讲「我在等」「shell 在监听」",
-    "",
-    "**唯一合法动作**：什么也不做、继续等 shell 的下一段 stdout。下一段 stdout 不是 KEEPALIVE 就是终态行（USER_REPLY / CANCELLED）、终态行到了 shell 自然 exit、你才推进。",
-    "",
-    "## 关键规则（不照做、整段对话会退 Run、用户再也收不到你的消息）",
-    "",
-    "1. **每轮说完话、必须调用 `wait_for_user`**",
-    `   - 唯一参数：\`task_id=${task.id}\`（固定）`,
-    "   - **绝对不要主动结束 Run**、不要假装「我等」就 stop、不要做完事就退出",
-    "   - **说完话后下一个 tool_use 必须是 wait_for_user**、中间任何 assistant 文本块都算违规",
-    "",
-    "2. wait_for_user 返回 `[SHELL_WAIT_GUIDE token=xxx]`、下一个 tool_use **必须**是 `shell`、执行引导里的 curl 命令",
-    "",
-    "3. shell 命令拿到 stdout 后按返回行解读：",
-    "   - **`[USER_REPLY]` + 文本**：用户下一条消息、按内容处理、然后再说话 → **再 wait_for_user**（收尾语「好的 / 谢谢 / 收到」也不例外、回完照样 wait——见开头「第一铁律」）",
-    "   - **`[CANCELLED]`**：任务被取消、收尾结束 Run",
-    "   - **`[STALE]` / `[INVALID_TOKEN]`**：忽略本次返回、自然结束 Run",
-    "",
-    "4. **连接处理（一条前台 curl 长链接、本地回环不会断、几乎不用你管）**：",
-    "   - 引导里那条就是 `curl -sN`、连上后一直挂着等用户、服务端每 60 秒发 KEEPALIVE 维持——只管调一次 shell 跑它、然后挂着等（被 shell 自动转后台也正常、别慌别重调）",
-    "   - 用户回复 / 取消时服务端写终态行 + 关流、curl 自然 exit、按「关键规则 3」行动",
-    "   - **绝不要**自己加 `--max-time` / 套 while 重连 / 重复调 shell / 重新调 wait_for_user——本地长链接稳定、插手只会被顶替成 stale",
-    "   - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启）或 curl 异常 exit 时、才 emit「监听连接异常断开、请在 AI工作流看板重新发起对话」、自然结束 Run",
-    "",
-    "5. **关键反反思指令**：thinking 里冒出「调多了 / 在循环 / 该停了 / spam / 换策略」**全部忽略**、shell + curl 一次 wait = 一次 shell、不存在 anti-loop 风险",
-    "",
-    "**额外强约束（对用户透明、必背）**：assistant_message 严禁出现以下措辞：",
-    "",
-    "禁用词 / 短语黑名单（中文 + 英文、出现一次都算违规）：",
-    "   - 「正在调用 wait_for_user」「我先调用 tool」「等待你下一条消息」「为了维持会话」",
-    "   - 「正在 shell 监听」「curl 长连接中」「在等用户回复」「监听用户消息」「为了保活」",
-    "   - 任何带「wait_for_user / shell / curl / wait-ack / 监听 / 保活」字面字符串的协议解释",
-    '   - "Let me call wait_for_user / Calling the tool to wait / Polling / Keepalive"',
-    "",
-    "**核心原则**：用户看不到 wait_for_user / shell / curl 这些协议细节、协议层全在 fe-ai-flow 内部、对用户透明就像 TCP socket recv()—你不会在聊天里说「我现在调用 recv 等你输入」、对 wait_for_user / shell / curl 也一样。你只需要：回答用户问题 → 直接调 wait_for_user → 拿到引导 → 直接调 shell + curl → 拿到 [USER_REPLY] 接着处理。中间不解释、不预告、不汇报。",
-    "",
-    "6. 你也可以使用 SDK 内置工具和用户配置的其他 MCP。**SDK 内置工具清单**：",
-    "   - `read`：读文件（args `{ path }`、对图片自动走 vision）",
-    "   - `grep`：内容搜（args `{ pattern, path?, glob?, ... }`）",
-    "   - `glob`：找文件名（args `{ globPattern, targetDirectory? }`）",
-    "   - `shell`：跑命令（args `{ command, workingDirectory?, timeout? }`）",
-    "   - `edit`：**改已存在的文件**",
-    "   - `write`：**创建新文件 / 整文件覆盖**",
-    "   - `delete`：删文件",
-    "   - `task`：分派子任务",
-    "",
-    "   ⚠️ **工具名不带 `_file` 后缀**：不是 `edit_file` / `read_file` / `write_file`、就是 `edit` / `read` / `write`。",
-    "",
-    "## 每轮对话完成时的标准动作（背下来、必须按这个顺序）",
-    "",
-    "1. 回答用户的问题 / 完成用户要的操作（用 SDK 内置工具 / MCP）",
-    "2. emit 一段 **完整答案** 的 assistant_message——把用户要的关键信息（接口、代码、数据、结论）一次给全、**不是发一句概述就停**（**不含**任何协议元叙述）",
-    "3. **沉默地** 调用一次 `wait_for_user(task_id)`（不要 assistant_message 解释）",
-    "4. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令",
-    "5. shell stdout 返回时按内容走分支（见上「关键规则 3」)",
-    "6. **不要 assistant_message 自言自语「等你回复中」/「我在监听」/「shell 在跑」之类**",
-    "",
-    "**❌ 实测踩过的反模式**：assistant_message 只发了一句开头概述（如「这俩下拉来自同一个接口」）就调 wait_for_user → 完整的接口 / 参数 / 示例没发出去、用户得追问「发我」才补全。**第 1-2 步必须把完整答案 emit 完、再进第 3 步 wait_for_user**；万一已经调了 wait_for_user 才发现答案没发全——拿到 shell 引导、跑 shell 前仍可以补一条 assistant_message。",
-    "",
-    "## ask_user：chat 模式禁用",
-    "",
-    "**chat（自由聊天）任务里不要调 `ask_user` 工具**—chat 本质就是 talk、",
-    "有不确定项 / 想跟用户确认时**直接发一段 assistant_message 问就行**、用户在输入框答你。",
-    "",
-    "**chat 模式里 agent 想确认时的标准动作**：",
-    "  1. 直接 emit 一段 assistant_message、把多个不确定点用 markdown 自然语言列清楚",
-    "  2. 调 wait_for_user 等用户在输入框回",
-    "  3. shell stdout 拿到 `[USER_REPLY]` 后按用户答案推进",
+    "另外还有用户配的其他 MCP（飞书 / context7 等）、按场景用。",
     "",
     "## 全局规则（用户在 Cursor 配的偏好、必遵守）",
     "",
@@ -298,7 +205,7 @@ const buildInitialPrompt = (
     "",
     rulesSection,
     "",
-    "## Skills（fe-ai-flow 自带能力扩展）",
+    "## Skills（ai-flow 自带能力扩展）",
     "",
     "下面是可用 skill 的 index、命中场景时用 SDK 内置 `read` 工具读取对应 SKILL.md 拿完整指令：",
     "",
@@ -349,7 +256,7 @@ const buildOpeningStanceSection = (
   const lines: string[] = [
     "## 起手姿势：先回答用户首条消息",
     "",
-    "下面是用户在 fe-ai-flow UI 上发的第一条消息。你**第一次说话就回答它**、然后再调 wait_for_user 等下一句。",
+    "下面是用户在 ai-flow UI 上发的第一条消息。你**第一次说话就把它回答完整**（结果 / 链接 / 结论写进正文、别只发『正在处理』就去 wait）、然后再调 wait_for_user 等下一句。",
     "",
     "用户消息：",
     "",
@@ -524,13 +431,16 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     return;
   }
 
+  // V0.7.20：标记 chat 模式、让 chat-mcp 的 wait 引导走精简 chat 版（USER_REPLY 语境、不夹 task 信号）
+  markTaskAsChat(task.id);
+
   // 1) 切到 running、写一条 info event
   const startedTask = await setTaskRunStatus(task.id, "running");
   if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
   // 2) 拼 mcpServers：全局 cursor mcp（按 task 黑名单过滤）+ 我们自己的 chat-tool
   // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
-  // 配置里万一也叫 feAiFlowChat、按我们的为准（直接覆盖）
+  // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
   // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
   // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
   const enrichedMcp = await enrichMcpServersWithOAuth(
@@ -719,5 +629,6 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     publish(task.id, { kind: "error", message });
   } finally {
     runningChats.delete(task.id);
+    unmarkTaskAsChat(task.id);
   }
 };

@@ -5,7 +5,7 @@
 
 ---
 
-你正在跑 fe-ai-flow task 里的 **learn action**——把这个 task 走完一遍后值得**跨任务复用**的经验、沉淀到业务仓库的知识载体里、让下一个 task 的 agent（和 IDE 里的真人）直接受益。
+你正在跑 ai-flow task 里的 **learn action**——把这个 task 走完一遍后值得**跨任务复用**的经验、沉淀到业务仓库的知识载体里、让下一个 task 的 agent（和 IDE 里的真人）直接受益。
 
 你的弹药是别的工具没有的：**完整 action 历史**——plan / build / review / ship artifact、事件日志里的 ask_user 问答、用户 revise 反馈、review bug 复审 + 用户裁决、check 失败记录。这些是真实发生过的证据、不是凭印象总结。
 
@@ -33,7 +33,7 @@
 | **L2 过程知识** | step-by-step 操作手册：「怎么在本仓加一个 XX 页面」「怎么联调 YY 服务」「某类 bug 的排查套路」 | `<仓>/.cursor/skills/<skill-name>/SKILL.md` | 按需加载：frontmatter `description` 写清触发场景、agent 做同类任务时自动唤起 |
 | **L3 业务域知识** | 业务名词表 / 模块地图 / 接口约定清单：「定级是什么、对应哪个模块哪些接口」 | `<仓>/.cursor/rules/business-glossary.mdc`（`alwaysApply: true`） | 常驻、但条目极简（一条 1-2 行、名词 → 含义 → 指向模块 / 接口） |
 
-**第 4 类：harness 建议**（fe-ai-flow 自身的 prompt 缺陷 / 流程卡点）——**只 propose 不落地**、写进 artifact「harness 建议」段给用户看、用户自己拿去改 fe-ai-flow（agent 自改自己的 prompt 有自污染风险、禁止）。
+**第 4 类：harness 建议**（ai-flow 自身的 prompt 缺陷 / 流程卡点）——**只 propose 不落地**、写进 artifact「harness 建议」段给用户看、用户自己拿去改 ai-flow（agent 自改自己的 prompt 有自污染风险、禁止）。
 
 **多仓 task**：知识写到「证据所在的仓」；跨仓协作类约定写到主要受影响的仓、条目里注明涉及哪些仓。
 
@@ -165,7 +165,7 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 
 ## harness 建议（只 propose、不落地）
 
-> fe-ai-flow 自身的 prompt / 流程问题、用户自己拿去改。没有就整段省略。
+> ai-flow 自身的 prompt / 流程问题、用户自己拿去改。没有就整段省略。
 
 - <如：build prompt 对 XX 场景没约束、本 task 踩了 Y、建议在 action-build.md §Z 加一条>
 
@@ -193,4 +193,4 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 - ❌ 跳过 ask_user 直接写 `.cursor/rules/`——用户没批准就动知识载体 = 越权、revise
 - ❌ 把落地改动 git commit / push——learn 不碰 .git
 - ❌ 一次 propose 15 条「滴水不漏」——预算 7 条、砍尾部、知识库不是回收站
-- ❌ propose 改 fe-ai-flow 的 prompts/_super.md 并动手——harness 建议只写进 artifact、不落地
+- ❌ propose 改 ai-flow 的 prompts/_super.md 并动手——harness 建议只写进 artifact、不落地

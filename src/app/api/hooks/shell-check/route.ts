@@ -67,7 +67,7 @@ export const POST = async (req: Request): Promise<Response> => {
   return new Response(
     JSON.stringify({
       permission: "deny",
-      agent_message: `${verdict.reason}\n（fe-ai-flow shell-guard 硬拦截、这条规则在 prompt「shell 安全」段也有写。请换合规命令继续、不要重试原命令。）`,
+      agent_message: `${verdict.reason}\n（ai-flow shell-guard 硬拦截、这条规则在 prompt「shell 安全」段也有写。请换合规命令继续、不要重试原命令。）`,
     }),
     { headers: { "Content-Type": "application/json" } },
   );

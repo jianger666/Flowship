@@ -1,4 +1,4 @@
-# fe-ai-flow
+# ai-flow
 
 **项目级 AI Harness 平台 · 飞书 story → MR 自动化**——站在 Cursor SDK 肩膀上、把「读飞书 / 拉接口文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验 / 提 MR」这 80% 的手工活自动化、用户只在每个 action 边界 ack 一次。
 
@@ -100,7 +100,7 @@ pnpm dev    # 浏览器开 http://localhost:8876
 ## 项目结构
 
 ```
-fe-ai-flow/
+ai-flow/
 ├── src/
 │   ├── app/
 │   │   ├── page.tsx                         # 主页：任务卡片看板（task / chat 共用）
@@ -164,7 +164,7 @@ fe-ai-flow/
 | Cursor API Key | localStorage | 不上传服务器、每用户自配 |
 | 默认模型 + 参数 | localStorage | `ModelSelection`、跟 SDK schema 一致 |
 | 仓库列表 | localStorage | 桌面端原生 picker（`pickNativePaths`）选目录、可多仓 |
-| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `feAiFlowChat`（提供 `wait_for_user` / `ask_user`） |
+| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `aiFlowChat`（提供 `wait_for_user` / `ask_user`） |
 | 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP |
 | Prompt 模板 | `prompts/action-*.md` + `_super.md` / `_shared.md` | 用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |
 | 任务数据 | `data/tasks/<id>/` | meta.json + events.jsonl + actions/ 目录 |

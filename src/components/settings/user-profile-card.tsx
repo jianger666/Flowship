@@ -3,7 +3,7 @@
 /**
  * 用户基本信息卡片（V0.6 新增、V0.6.7 加分支命名模板）
  *
- * V0.6 username：用于拼 feature 分支前缀、多人共用 fe-ai-flow 不互踩。
+ * V0.6 username：用于拼 feature 分支前缀、多人共用 ai-flow 不互踩。
  * V0.6.7 branchTemplate：全局默认 feature 分支命名模板、支持占位符、
  *   per-repo 可在「仓库列表」卡覆盖（如后端用 {date:MM-dd} 段替代 {username} 段）。
  *

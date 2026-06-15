@@ -45,7 +45,7 @@ const sendInitialize = async (
         params: {
           protocolVersion: "2025-06-18",
           capabilities: {},
-          clientInfo: { name: "fe-ai-flow", version: "0" },
+          clientInfo: { name: "ai-flow", version: "0" },
         },
       }),
       redirect: "manual",

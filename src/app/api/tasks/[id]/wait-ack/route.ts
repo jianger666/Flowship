@@ -45,8 +45,9 @@ export const runtime = "nodejs";
 // 禁止 Next.js 缓存这条响应
 export const dynamic = "force-dynamic";
 // Next.js 单次响应最大时长（秒）声明。Node standalone（electron / 本地）实际不强制、
-// V0.7.18 砍掉 agent 端 while 重连后、单条 curl 靠服务端 KEEPALIVE 撑、能前台挂几小时等用户
-export const maxDuration = 3600;
+// V0.7.18 砍掉 agent 端 while 重连后、单条 curl 靠服务端 KEEPALIVE 撑、能前台挂几小时等用户。
+// V0.7.20：agent 侧前台阻塞参数（timeout / block_until_ms）设 24h、服务端 maxDuration 同步对齐 24h
+export const maxDuration = 86400;
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -119,7 +120,7 @@ export const GET = async (req: Request, { params }: Ctx): Promise<Response> => {
       entry.result
         .then((value) => {
           if (closed) return;
-          const text = formatToolReturnAsText(value);
+          const text = formatToolReturnAsText(value, taskId);
           console.log(
             `[wait-ack] task=${taskId} token=${token} resolved kind=${value.kind}、写 ${text.length} 字节后关流`,
           );

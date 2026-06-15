@@ -1,16 +1,16 @@
 ---
 name: context-docs-handler
 description: >-
-  处理 fe-ai-flow plan 任务 super-prompt 顶部「用户提供的上下文文档清单」一节。
+  处理 ai-flow plan 任务 super-prompt 顶部「用户提供的上下文文档清单」一节。
   看到这节后、不确定怎么拉取 / 怎么处理 doc 之间的冲突 / text 截断标记是什么意思 / 什么时候不该拉、
   请 read 本 skill。适用于 plan 模式所有 phase（V0.3.4 起为 plan / build 两个 phase）。
 ---
 
-# fe-ai-flow 上下文文档清单处理协议
+# ai-flow 上下文文档清单处理协议
 
 ## 什么是「上下文文档清单」
 
-super-prompt 顶部会出现一节「用户提供的上下文文档」、列出用户在 fe-ai-flow 任务详情页面板里加的所有上下文。每条 doc 有 3 个字段：
+super-prompt 顶部会出现一节「用户提供的上下文文档」、列出用户在 ai-flow 任务详情页面板里加的所有上下文。每条 doc 有 3 个字段：
 
 - **title**：用户取的名（如「飞书 story」「后端技术方案」「补充说明」）
 - **type**：后端推断、取值 `url` / `path` / `text`

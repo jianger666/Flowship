@@ -70,7 +70,7 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 ## 配置双向绑定 Cursor（跟 Cursor 共用工具、2026-06-01 完成）
 
-> ✅ 已完成。fe-ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
+> ✅ 已完成。ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
 
 ### 最终分工（关键：repo 层 vs 全局层分开处理）
 
@@ -91,13 +91,13 @@ V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓
 
 **✅ 头号风险已验证（2026-05-29 探针实测、`scripts/probe-mcp-*.mjs`）· chat-tool MCP 共存安全**（两组对照探针）：
 - 探针手法：开 `settingSources:["project"]` + inline `mcpServers` 注入零依赖手写 stdio MCP（spawn / 工具调用各落 `/tmp/probe-mcp-<role>.log`、读日志判定、不靠 agent 自我报告）。
-- **结论 1（不同名来源、`probe-mcp-coexist.mjs`）：叠加、不覆盖。** inline=probeInline + repo `.cursor/mcp.json`=probeProject（两个不同 key）→ 两个 server 都被 spawn、两个工具 agent 都调通（`PROBE-INLINE-OK` + `PROBE-PROJECT-OK`）。即 **chat-tool（inline 的 feAiFlowChat）开 settingSources 后不会丢、安全**；且 settingSources 确实加载 repo `.cursor/mcp.json`（Q1=是、MCP 双向绑定可行）。
+- **结论 1（不同名来源、`probe-mcp-coexist.mjs`）：叠加、不覆盖。** inline=probeInline + repo `.cursor/mcp.json`=probeProject（两个不同 key）→ 两个 server 都被 spawn、两个工具 agent 都调通（`PROBE-INLINE-OK` + `PROBE-PROJECT-OK`）。即 **chat-tool（inline 的 aiFlowChat）开 settingSources 后不会丢、安全**；且 settingSources 确实加载 repo `.cursor/mcp.json`（Q1=是、MCP 双向绑定可行）。
 - **结论 2（同名 key 冲突、`probe-mcp-conflict.mjs`）：inline 赢、双保险。** inline 跟 repo `.cursor/mcp.json` 用**同一个 server key**（probeShared）时——两进程**都被 spawn**（SDK 进程层不去重、project 进程也 initialize + tools/list 了），但**工具层 inline 覆盖 project**：agent 工具列表里只有 inline 的工具、project 的工具根本不暴露（agent 原话「probeShared 上只有 probe_inline_tool」）。即 **chat-tool 哪怕撞了用户 Cursor 配置的同名 key、agent 用的也是 fe 的 inline 版**（inline 优先级 > settingSources）。小代价：同名时多 spawn 一个没用的 project 进程（无害、且 chat-tool 用独特 key 根本不会撞）。
 - 副产品：日志 `skillCount: 13` 来自全局 `~/.cursor/skills`（fixture 自己没 skills）、印证 settingSources 连带加载全局 skills、对应下方「skills 别重复」待办。
 - ⚠️ 实测脚本对 stdio MCP 用「server spawn cwd 可能是目标仓库 /tmp」这点踩过坑：探针 server 必须零 npm 依赖（手写 JSON-RPC）、否则 import 阶段崩、日志写不出会误判成「没加载」。
 
 ### skills 加载（2026-06-01 修订）
-- `loadSkills()` 读**平台自带** `<fe-ai-flow>/skills/` + **全局** `~/.cursor/skills/`（同名平台优先）。
+- `loadSkills()` 读**平台自带** `<ai-flow>/skills/` + **全局** `~/.cursor/skills/`（同名平台优先）。
 - 不读 repo `.cursor/skills/`（project 层、交 settingSources、避免同一 skill 进 prompt 两次）。
 - ⚠️ 修正 0529「只读平台自带」：那样全局 `~/.cursor/skills` 会丢（`["project"]` 够不着 user 层）、必须 fe 读。
 
