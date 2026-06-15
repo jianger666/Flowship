@@ -103,6 +103,20 @@ export const setTaskArchived = async (
   return data.task;
 };
 
+// V0.8 侧栏：置顶 / 取消置顶（PATCH /api/tasks/[id]）
+export const setTaskPinned = async (
+  id: string,
+  pinned: boolean,
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pinned }),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
+};
+
 export const setTaskDisabledMcpServers = async (
   id: string,
   disabled: string[] | null,

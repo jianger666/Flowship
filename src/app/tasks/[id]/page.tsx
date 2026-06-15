@@ -23,10 +23,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import { notFound, useParams } from "next/navigation";
 import {
-  ArrowLeft,
   Ban,
   CheckCircle2,
   ExternalLink,
@@ -579,7 +577,7 @@ const TaskDetailPage = () => {
   // 父组件只把 onTaskUpdate / onEventAppend 传下去、不传任何动作按钮 callback
   if (task.mode === "chat") {
     return (
-      <div className="flex h-[calc(100vh-3.5rem)] flex-col">
+      <div className="flex h-full flex-col">
         <ChatView
           task={task}
           onTaskUpdate={setTask}
@@ -596,21 +594,11 @@ const TaskDetailPage = () => {
   }
 
   return (
-    <div className="flex h-[calc(100vh-3.5rem)] flex-col">
+    <div className="flex h-full flex-col">
       {/* 顶部条 */}
       <div className="shrink-0 px-6 py-3">
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
-            <Button
-              variant="ghost"
-              size="sm"
-              nativeButton={false}
-              render={<Link href="/" className="no-underline" />}
-            >
-              <ArrowLeft />
-              返回
-            </Button>
-            <Separator orientation="vertical" className="h-6" />
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <h1 className="truncate text-base font-semibold">

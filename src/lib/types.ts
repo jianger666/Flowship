@@ -860,6 +860,8 @@ export interface Task {
    * - 注意：`<feature>__conflict` 一次性解冲突分支由 handler 强制删（不受本字段影响、否则留垃圾分支）
    */
   removeSourceBranchOnMerge?: boolean;
+  /** V0.8 侧栏：用户手动置顶（排到任务列表最上）。缺省 / undefined = 未置顶。 */
+  pinned?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;

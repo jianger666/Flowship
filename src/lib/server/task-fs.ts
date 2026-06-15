@@ -299,6 +299,8 @@ interface TaskMetaV06 {
   disabledMcpServers?: string[];
   /** V0.6.14：ship 合并后是否删源分支（缺省保留、详见 types.ts Task.removeSourceBranchOnMerge） */
   removeSourceBranchOnMerge?: boolean;
+  /** V0.8 侧栏：用户置顶（缺省 false） */
+  pinned?: boolean;
   archived: boolean;
   createdAt: number;
   updatedAt: number;
@@ -344,6 +346,7 @@ const TaskMetaV06Schema = z
     role: z.enum(["fe", "be", "adaptive"]),
     repoPaths: z.array(z.string()),
     archived: z.boolean(),
+    pinned: z.boolean().optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
   });
@@ -644,6 +647,7 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
     removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
+    pinned: meta.pinned,
     archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
@@ -674,6 +678,7 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
+    pinned: meta.pinned,
     archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
@@ -1005,6 +1010,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
         ? input.disabledMcpServers
         : undefined,
     model: input.model,
+    pinned: false,
     archived: false,
     createdAt: now,
     updatedAt: now,
@@ -1190,6 +1196,19 @@ export const setTaskArchived = async (
     const meta = await readMetaV06(id);
     if (!meta) return null;
     meta.archived = archived;
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+// V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。不动 updatedAt（置顶与活跃度无关）。
+export const setTaskPinned = async (
+  id: string,
+  pinned: boolean,
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    meta.pinned = pinned;
     await writeMeta(meta);
     return await hydrateTask(meta);
   });

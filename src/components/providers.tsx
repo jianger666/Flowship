@@ -4,6 +4,8 @@
  * 客户端 Providers 集合
  * - next-themes：三态主题（浅色 / 深色 / 跟随系统）、默认跟随系统、顶栏 ThemeToggle 切换
  *   attribute="class" → 在 <html> 挂 .light/.dark；disableTransitionOnChange 防切换瞬间闪色
+ * - DialogProvider：全局 confirm / prompt（禁用 window.{alert,confirm,prompt}）
+ * - TaskListProvider：全局任务列表（侧栏 + 各页面共享、统一刷新 / 同步）
  * - 后续如果接 react-query / jotai 等也都加在这里
  */
 
@@ -11,6 +13,7 @@ import { ThemeProvider } from "next-themes";
 import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
+import { TaskListProvider } from "@/hooks/use-task-list";
 import { getSettings, initSettings } from "@/lib/local-store";
 import { useModels } from "@/hooks/use-models";
 
@@ -45,7 +48,8 @@ export const Providers = ({ children }: ProvidersProps) => {
           统一走 shadcn 风格弹窗。组件内用 useDialog() 拿到 confirm / prompt */}
       <DialogProvider>
         <ModelsPrefetch />
-        {children}
+        {/* TaskListProvider：侧栏 + 各页面共享同一份任务列表、新建 / 删除 / 状态变化统一同步 */}
+        <TaskListProvider>{children}</TaskListProvider>
       </DialogProvider>
     </ThemeProvider>
   );

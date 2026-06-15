@@ -17,6 +17,7 @@ import {
   setTaskArchived,
   setTaskDisabledMcpServers,
   setTaskModel,
+  setTaskPinned,
   setTaskUiLayout,
   updateTaskFields,
 } from "@/lib/server/task-fs";
@@ -46,6 +47,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     const { id } = await params;
     const body = (await req.json()) as {
       archived?: boolean;
+      pinned?: boolean;
       disabledMcpServers?: string[] | null;
       uiLayout?: { artifactPanelSize?: number } | null;
       // V0.6.24：chat 模式切模型（持久化 task.model、下一个 run 生效）
@@ -66,6 +68,13 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
 
     if (typeof body.archived === "boolean") {
       const task = await setTaskArchived(id, body.archived);
+      if (!task)
+        return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
+    }
+
+    if (typeof body.pinned === "boolean") {
+      const task = await setTaskPinned(id, body.pinned);
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });
       return NextResponse.json({ task });
@@ -185,7 +194,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
 
     return NextResponse.json(
       {
-        error: "需要 archived / disabledMcpServers / uiLayout / 编辑字段 之一",
+        error: "需要 archived / pinned / disabledMcpServers / uiLayout / 编辑字段 之一",
       },
       { status: 400 },
     );

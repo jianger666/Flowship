@@ -9,7 +9,11 @@ alwaysApply: true
 
 - **用户本机日常运行着「AI工作流」桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关「AI工作流」窗口。
 - **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
-  - 打包：`pnpm electron:dist:test` → 产出「AI工作流test.app」（productName 带 test）
+  - 打包（**完整 3 步、缺一不可**、2026-06-15 踩过：只跑 dist:test 会把旧代码打进包、验证时 curl 到旧 UI 排查半天）：
+    1. `BUILD_STANDALONE=1 pnpm build`——产新 `.next/standalone`（不带 BUILD_STANDALONE 不会出 standalone、见 next.config.ts）
+    2. `node scripts/assemble-electron-server.mjs`——从 standalone 重组 `dist/app-server`（内部先 rm 再 cp + 补 SDK 平台包）
+    3. `pnpm electron:dist:test`——afterPack（`scripts/electron-after-pack.mjs`）把 `dist/app-server` 拷进「AI工作流test.app」（productName 带 test）+ ad-hoc 签名
+    ⚠️ `electron:dist:test` **只拷不组**：afterPack 源固定是 `dist/app-server`、自己不 build / 不 assemble。漏掉第 1、2 步 → 打进包的是上一次的旧 `dist/app-server`（产物 mtime 会骗你说是新的、但内容是旧的）。核验：`grep -c <本次新增/删除的文案> "dist/electron/mac-arm64/AI工作流test.app/Contents/Resources/app-server/.next/server/app/index.html"`。
   - 壳探测到名字带 test（或 env `FE_AI_FLOW_TEST=1`）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**、单实例锁天然独立（按 userData 算）
   - 要关 / 删的话（用户主动说时）动的也是「AI工作流test」（名字带 test）、不会误伤正式应用
 - 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`。**验完默认不关窗、不删包**（见下条）。
@@ -18,6 +22,11 @@ alwaysApply: true
 - **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：**起 test 跑对话前、确认正式实例此刻没在跑对话**（idle 挂着不跑 SDK 不会撞、所以 test 默认留着即可、不必为规避并发去关它）。真把正式挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。
 - **test 包自动补 SDK 平台包（v0.7.17、assemble-server.addSdkPlatformPackage）**：`electron:dist:test` 走 standalone、Next nft 追不到 `@cursor/sdk-<platform>` 运行时动态加载的平台子包（native cursorsandbox + rg）→ 缺了 SDK 直接 `fetch failed`、对话全挂。组包公共函数已自动补（本地 pnpm 拓扑拷平台包 + symlink、CI hoisted 跳过）——打完可 `ls .../app-server/node_modules/.pnpm/@cursor+sdk@*/node_modules/@cursor/` 确认有 `sdk-darwin-arm64` symlink。
 - **同步正式配置到 test**：`scripts/sync-test-config.mjs`（需 `classic-level`、按需 `pnpm add -D classic-level`）。配置存 Chromium localStorage（`Local Storage/leveldb`）、按 origin（含端口）隔离、正式 8876 ≠ test 8776 直接拷读不到。流程：cp 正式 `Local Storage/leveldb` → `/tmp/fe-prod-ls`（正式 app 在跑、有 LOCK、只能读副本）→ test app 先退出（leveldb 单写锁）→ 脚本读副本、把 key 里 origin 端口 `8876→8776` 转换写入 test（`--probe` 只读看 / `--verify` 读回校验 / 无参正式同步）。
+
+## 验证不主动截图给用户（2026-06-15 用户拍板）
+
+- **验证时别把截图塞进 feedback summary 给用户看**——用户日常自己盯着运行的 test / 正式 app、效果他自己看得到、不需要我贴图。
+- 截图只用于「我自己确认改动生效」（自查），不是给用户的交付物；验证靠自己跑通即可（typecheck / lint / curl、必要时自己截图自检）。
 
 ## UI 组件库
 
@@ -195,4 +204,5 @@ alwaysApply: true
 
 - **zsh nomatch**：命令里的 glob（如 `ls ~/Library/Logs/*工作流*`）**不匹配时 zsh 直接报错中断整条命令**（不像 bash 把字面量传下去）、`;` 后的命令一个都不跑。规避：别用裸 glob 探路径、用 `ls 目录/ 2>/dev/null` 再人眼找、或 `setopt null_glob`。
 - **pkill -f 自匹配杀自己**：`pkill -f "AI工作流test"` 的 `-f` 匹配**完整命令行**、而执行这条命令的 shell 自身命令行就含「AI工作流test」→ 把自己 SIGKILL 了（空返回 exit 1）。规避：① 杀进程优先 `osascript ... quit`（既有约定）；② 非要 pkill 用经典字符类技巧 `pkill -f "[A]I工作流test"`（正则 `[A]` 匹配 A、但命令行字面是 `[A]I…` 不含连续「AI工作流test」、不自杀）、且 pkill 单独成命令、别和含「AI工作流test」字面的 ls / 路径混在一条。
-- 通用：合并命令空返回时、先 `echo hello` 基线确认 shell 本身正常、再隔离定位是哪段（glob / pkill / 中文）触发——别盲目重试同一条。
+- **工具 shell 跑在 errexit + pipefail 下（2026-06-15 连踩、空返回 exit 1）**：任何**独立**命令 / 管道返回非 0 就**中断整条**、后续行全不执行（看着像「卡住」）。最常见肇事者是「无匹配即退 1」的命令：`grep`/`grep -c`（0 命中退 1）、`lsof`（端口空退 1）、`pgrep`（无进程退 1）。规避：这类命令一律 `… || true` 兜底、或用 `if`/`$( … || echo 默认)` 包住；放在 `&&`/`||` 链里的非末命令不受 errexit 影响（这是 set -e 的豁免、可利用）。
+- **`rg` 不在工具 shell 的 PATH（2026-06-15 踩过、假阴性最坑）**：shell 里 `rg` 直接 `command not found` 退 127——而我若写 `rg … || echo "未找到"` 会把「rg 没装」误读成「没搜到」、得出错误结论。仓库内搜一律用 **Grep 工具**（基于 ripgrep、已优化）；非要在 shell 里搜用 `grep`（系统自带、可靠）。别在 shell 里调 `rg`。

@@ -71,9 +71,11 @@ const REQUIRED_FEISHU_MCP: { host: string; label: string }[] = [
 
 interface Props {
   onCreated: (task: Task) => void;
+  // 自定义触发元素（侧栏要全宽「+ 新建任务」按钮）；不传用默认「新建」按钮
+  trigger?: React.ReactElement;
 }
 
-export const NewTaskDialog = ({ onCreated }: Props) => {
+export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   // dialog 开关
   const [open, setOpen] = useState(false);
   // V0.6.0.1：任务模式（"task" / "chat"、对应顶部 ModeCard 切换）
@@ -290,10 +292,12 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
     <Dialog open={open} onOpenChange={setOpen} disablePointerDismissal>
       <DialogTrigger
         render={
-          <Button>
-            <Plus />
-            新建
-          </Button>
+          trigger ?? (
+            <Button>
+              <Plus />
+              新建
+            </Button>
+          )
         }
       />
       <DialogContent className="sm:max-w-lg">
@@ -340,7 +344,7 @@ export const NewTaskDialog = ({ onCreated }: Props) => {
               onChange={(e) => setTitle(e.target.value)}
               placeholder={
                 mode === "chat"
-                  ? "不填用「未命名对话 MM-DD HH:mm」占位"
+                  ? "不填用「对话 · MM-DD HH:mm」占位"
                   : "如：需求标题"
               }
               autoFocus

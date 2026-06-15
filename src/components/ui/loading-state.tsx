@@ -46,7 +46,8 @@ export const LoadingState = ({
   return (
     <div
       className={cn(
-        "flex h-[calc(100vh-3.5rem)] items-center justify-center text-sm text-muted-foreground",
+        // h-full 填满父容器（外壳 main 已是「视口 - 顶栏」定高）、不再写死 calc
+        "flex h-full min-h-[60vh] items-center justify-center text-sm text-muted-foreground",
         className,
       )}
     >

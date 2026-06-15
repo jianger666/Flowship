@@ -19,16 +19,12 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { prepareRunArgs } from "@/lib/run-args";
 import { RUN_STATUS_LABEL, RUN_STATUS_VARIANT } from "@/lib/task-display";
@@ -177,18 +173,6 @@ export const ChatView = ({
       <div className="border-b px-6 py-2.5">
         <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2">
-            {/* 返回列表：跟 task 模式顶部条同款（V0.7.8 补、此前 chat 模式只能点 logo 回首页） */}
-            <Button
-              variant="ghost"
-              size="sm"
-              nativeButton={false}
-              render={<Link href="/" className="no-underline" />}
-              className="text-muted-foreground hover:text-foreground"
-            >
-              <ArrowLeft />
-              返回
-            </Button>
-            <Separator orientation="vertical" className="h-5" />
             <div className="flex min-w-0 items-center gap-2">
               <h1 className="truncate text-sm font-medium tracking-tight">
                 {task.title}

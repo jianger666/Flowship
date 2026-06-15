@@ -111,11 +111,11 @@ export const POST = async (req: Request) => {
       );
     }
 
-    // chat 模式未填 title 时自动生成「未命名对话 MM-DD HH:mm」
+    // chat 模式未填 title 时自动生成「对话 · MM-DD HH:mm」（侧栏窄、标题尽量短）
     const title = isNonEmptyString(body.title)
       ? body.title.trim()
       : isChat
-        ? `未命名对话 ${new Date().toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}`
+        ? `对话 · ${new Date().toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}`
         : "";
 
     const task = await createTask({

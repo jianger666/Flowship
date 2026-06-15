@@ -15,6 +15,10 @@
 
 ---
 
+### v0.7.22：自更新加 2h 定时轮询（2026-06-15）
+
+`main.js` 自更新原本只在 app 启动时查一次（`whenReady` → `setupAutoUpdate` 一次性）——同事习惯长期开着不关 app 就一直收不到新版提醒。本版加定时轮询：抽 `runUpdateCheck()`（启动 + `setInterval` 每 2h 各跑一次）、win 的 `update-downloaded` / `error` 事件监听器挪进 `setupAutoUpdate` **只注册一次**（`winAutoUpdater` 模块级单例、轮询只调 `checkForUpdates()`、防重复注册 = 监听器泄漏 + 多次弹窗）、mac 轮询走 `fetchLatestVersion()` 比对版本号。**去重靠既有 `promptUpdateOnce` 的 `wasPrompted`**（同版本只弹一次原生弹窗、跨重启持久化）——轮询查到同版本只刷新页面右上角「新版本」标识、不重复骚扰；app 退出进程自然清 interval。纯 main.js 自更新段改动、不碰其他。
+
 ### V0.7.0：Electron 桌面端——双击图标即用、win 自动更新（2026-06-11）
 
 背景：绿色 zip 的「bat→vbs→隐藏 powershell→node」四级启动链静默、易被企业 EDR 拦、挂了零反馈（同事实测「双击闪一下啥都没发生」）。用户拍板换 Electron：同事双击图标 → 独立窗口 → 关窗服务跟着退 → win 自动更新、接受体积代价（约 260MB vs 绿色包 170MB）。
