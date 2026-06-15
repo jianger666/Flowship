@@ -2,60 +2,65 @@
  * 全局样式
  * - Tailwind 4 走 CSS-first 配置、不需要 tailwind.config.ts
  * - shadcn 的颜色变量统一用 oklch、light/dark 两套
- * - 项目默认 dark 主题（在 layout.tsx 的 <html> 上挂 .dark class）
+ * - 三态主题（浅色 / 深色 / 跟随系统）、next-themes 在 <html> 挂 .light/.dark class
+ * - light 走 codex 风「浅灰底 + 白卡」中性灰阶（不用刺眼纯白）；dark 深灰带极微冷调
  */
 
 @import "tailwindcss";
 @import "tw-animate-css";
 @plugin "@tailwindcss/typography";
 
-/* Tailwind 4 默认 dark variant 跟随系统 media。项目强制在 <html> 挂 .dark，
- * 所以这里显式改成 class-based dark，避免浅色系统下出现黑底深字。 */
+/* Tailwind 4 默认 dark variant 跟随系统 media。本项目由 next-themes 在 <html>
+ * 挂 .light/.dark class 控制、所以显式改成 class-based dark variant。 */
 @custom-variant dark (&:is(.dark *));
 
 /* shadcn 主题颜色 token、详见 https://ui.shadcn.com/docs/theming */
 @layer base {
   :root {
-    --background: oklch(1 0 0);
-    --foreground: oklch(0.145 0 0);
+    /* codex 风：页面用浅灰打底（不刺眼纯白）、card/popover 用纯白浮起拉层次。
+     * 全部带极微冷调（hue 264、chroma ~0.005）、避免「死灰」、更接近 codex/GitHub 灰阶。 */
+    --background: oklch(0.967 0.002 247);
+    --foreground: oklch(0.205 0.008 264);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0.145 0 0);
+    --card-foreground: oklch(0.205 0.008 264);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.205 0.008 264);
+    --primary: oklch(0.28 0.008 264);
     --primary-foreground: oklch(0.985 0 0);
-    --secondary: oklch(0.97 0 0);
-    --secondary-foreground: oklch(0.205 0 0);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.93 0.003 247);
+    --secondary-foreground: oklch(0.28 0.008 264);
+    --muted: oklch(0.946 0.002 247);
+    --muted-foreground: oklch(0.46 0.01 264);
+    --accent: oklch(0.928 0.004 247);
+    --accent-foreground: oklch(0.3 0.006 264);
     --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.922 0 0);
-    --input: oklch(0.922 0 0);
-    --ring: oklch(0.708 0 0);
+    --border: oklch(0.9 0.004 264);
+    --input: oklch(0.9 0.004 264);
+    --ring: oklch(0.6 0.01 264);
     --radius: 0.625rem;
   }
 
   .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
+    /* 深灰带极微冷调（hue 264）：比 shadcn 默认纯黑(0.145)略提到 0.17、更柔和不压抑；
+     * card 比 background 亮一档(0.215)拉出层次；border 从 10%→12% 让卡片边界更清晰。 */
+    --background: oklch(0.17 0.005 264);
+    --foreground: oklch(0.96 0.003 247);
+    --card: oklch(0.215 0.006 264);
+    --card-foreground: oklch(0.96 0.003 247);
+    --popover: oklch(0.215 0.006 264);
+    --popover-foreground: oklch(0.96 0.003 247);
+    --primary: oklch(0.922 0.003 247);
+    --primary-foreground: oklch(0.215 0.006 264);
+    --secondary: oklch(0.27 0.006 264);
+    --secondary-foreground: oklch(0.96 0.003 247);
+    --muted: oklch(0.27 0.006 264);
+    --muted-foreground: oklch(0.712 0.008 264);
+    --accent: oklch(0.3 0.007 264);
+    --accent-foreground: oklch(0.96 0.003 247);
     --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
+    --border: oklch(1 0 0 / 12%);
     --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
+    --ring: oklch(0.556 0.01 264);
   }
 }
 
@@ -112,10 +117,26 @@
 
 /* Prism 语法高亮 token 颜色
  * - 不引 prism 自带 theme css、避免它强行覆盖 font-family / background 等
- * - 颜色挑了一组在 dark/light 都能看清的常用方案（VS Code dark+ 风格简化版）
+ * - 颜色按主题切换：dark 用亮色系（VS Code dark+ 简化版）、light 压暗保证白底可读
  * - 仅作用在带 .token 的元素上、不影响其它代码块（如 react-markdown 自带的 pre）
  */
 @layer base {
+  :root {
+    --tok-key: oklch(0.5 0.14 245); /* 青蓝：key / number / bool */
+    --tok-string: oklch(0.52 0.13 145); /* 绿：字符串 */
+    --tok-keyword: oklch(0.52 0.2 318); /* 紫：关键字 */
+    --tok-operator: oklch(0.5 0.05 260);
+    --tok-comment: oklch(0.58 0.02 260); /* 注释：中灰偏淡 */
+    --tok-punct: oklch(0.55 0.015 260); /* 标点：低饱和灰 */
+  }
+  .dark {
+    --tok-key: oklch(0.78 0.13 200);
+    --tok-string: oklch(0.82 0.16 130);
+    --tok-keyword: oklch(0.75 0.18 320);
+    --tok-operator: oklch(0.85 0.05 240);
+    --tok-comment: oklch(0.6 0.02 240);
+    --tok-punct: oklch(0.78 0.02 240);
+  }
   .token.property,
   .token.tag,
   .token.boolean,
@@ -123,41 +144,50 @@
   .token.constant,
   .token.symbol,
   .token.deleted {
-    color: oklch(0.78 0.13 200); /* 青蓝：key / number / bool */
+    color: var(--tok-key);
   }
   .token.string,
   .token.char,
   .token.attr-value,
   .token.builtin,
   .token.inserted {
-    color: oklch(0.82 0.16 130); /* 浅绿：字符串 */
+    color: var(--tok-string);
   }
   .token.atrule,
   .token.keyword {
-    color: oklch(0.75 0.18 320); /* 紫：关键字 */
+    color: var(--tok-keyword);
   }
   .token.operator,
   .token.entity,
   .token.url {
-    color: oklch(0.85 0.05 240);
+    color: var(--tok-operator);
   }
   .token.comment,
   .token.prolog,
   .token.doctype,
   .token.cdata {
-    color: oklch(0.6 0.02 240);
+    color: var(--tok-comment);
     font-style: italic;
   }
   .token.punctuation {
-    color: oklch(0.78 0.02 240); /* 标点用浅灰、降低视觉噪音 */
+    color: var(--tok-punct);
   }
 }
 
 /* ---------- 全局滚动条（V0.7.13、用户实测「默认滚动条在 dark 下格格不入」） ----------
-   薄轨 + 半透明拇指、hover 提亮；Firefox 走 scrollbar-width/color 等价配置 */
+   薄轨 + 半透明拇指、hover 提亮；按主题切换拇指色（dark 用浅灰、light 用深灰半透明、
+   类 macOS overlay）；Firefox 走 scrollbar-width/color 等价配置 */
+:root {
+  --sb-thumb: oklch(0.45 0.006 264 / 0.32);
+  --sb-thumb-hover: oklch(0.4 0.006 264 / 0.5);
+}
+.dark {
+  --sb-thumb: oklch(0.45 0.008 264 / 0.45);
+  --sb-thumb-hover: oklch(0.55 0.008 264 / 0.65);
+}
 * {
   scrollbar-width: thin;
-  scrollbar-color: oklch(0.4 0.01 240 / 0.5) transparent;
+  scrollbar-color: var(--sb-thumb) transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
@@ -167,11 +197,11 @@
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: oklch(0.4 0.01 240 / 0.45);
+  background: var(--sb-thumb);
   border-radius: 4px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.5 0.01 240 / 0.65);
+  background: var(--sb-thumb-hover);
 }
 *::-webkit-scrollbar-corner {
   background: transparent;

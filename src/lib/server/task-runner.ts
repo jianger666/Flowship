@@ -594,7 +594,6 @@ interface RunningTaskRecord {
   // V0.6.6 热更：agent 启动时的 {title,role,feishuStoryUrl} 快照、reused 推进时 diff 出变更注入 directive
   startSnapshot: TaskFieldsSnapshot;
   cancel: () => void;
-  completion: Promise<void>;
 }
 
 interface TaskRunnerGlobalState {
@@ -2087,7 +2086,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   let isForkRestart = false;
   let hardTimer: NodeJS.Timeout | null = null;
 
-  const completion = (async () => {
+  // fire-and-forget：advanceTask 立即返回、外部 waitForTaskToStop 靠 poll runningTasks.has 收敛、不依赖此 promise
+  void (async () => {
     try {
       // V0.6.3：起 agent 前给业务仓库装 stop hook（保证 agent 交卷后才放行结束 Run、失败不阻断启动）
       const effectiveCwd = getEffectiveCwd(task.repoPaths);
@@ -2133,7 +2133,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             /* noop */
           });
         },
-        completion: Promise.resolve(), // 占位、外部 await 走的是当前函数返回的 Promise
       });
 
       hardTimer = setTimeout(() => {
@@ -2265,13 +2264,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       }
     }
   })();
-
-  // 把 completion 落到 entry（advanceTask 已 return、外部 waitForTaskToStop 用）
-  // 注意：runningTasks.set 在 try 里 Agent.create 之后才做、所以这里要等 entry 出现
-  // 但 advanceTask 不 await 这个 promise、它 fire-and-forget、所以 entry 出现时机晚于这里
-  // → completion 字段的赋值靠 try 里 runningTasks.set 时塞 Promise.resolve()、本函数返回的
-  //   completion promise 本身才是「真活」、外部 waitForTaskToStop 仅 poll runningTasks.has 不依赖此字段
-  void completion;
 };
 
 // ----------------- SDKMessage 翻译器（沿用 V0.5 plan-runner 同款分支）-----------------

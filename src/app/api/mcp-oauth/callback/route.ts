@@ -18,7 +18,7 @@ const esc = (s: string): string =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
-// 渲染结果页：dark 主题、成功 1.2s 后自动关窗、并 postMessage 通知 opener 刷新
+// 渲染结果页：跟随系统深浅色、成功 1.2s 后自动关窗、并 postMessage 通知 opener 刷新
 const renderHtml = (ok: boolean, title: string, detail: string): string => `<!doctype html>
 <html lang="zh">
 <head>
@@ -26,16 +26,18 @@ const renderHtml = (ok: boolean, title: string, detail: string): string => `<!do
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>${ok ? "授权成功" : "授权失败"}</title>
 <style>
-  :root { color-scheme: dark; }
+  /* 默认 dark、浅色系统下用 prefers-color-scheme 覆盖、跟应用主题观感一致 */
+  :root { color-scheme: light dark; --bg:#0a0a0a; --fg:#ededed; --sub:#a1a1aa; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f5f6f8; --fg:#23242a; --sub:#6b7280; } }
   body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-    background:#0a0a0a; color:#ededed; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    background:var(--bg); color:var(--fg); font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
   .card { max-width:420px; padding:32px; text-align:center; }
   .icon { width:56px; height:56px; border-radius:50%; margin:0 auto 20px;
     display:flex; align-items:center; justify-content:center; font-size:28px;
     background:${ok ? "rgba(34,197,94,.12)" : "rgba(239,68,68,.12)"};
     color:${ok ? "#22c55e" : "#ef4444"}; }
   h1 { font-size:18px; margin:0 0 8px; }
-  p { margin:0; color:#a1a1aa; word-break:break-word; }
+  p { margin:0; color:var(--sub); word-break:break-word; }
 </style>
 </head>
 <body>

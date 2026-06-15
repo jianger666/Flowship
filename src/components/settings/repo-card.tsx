@@ -3,8 +3,7 @@
 /**
  * 仓库列表卡片
  *
- * 选目录走系统原生 picker（V0.7.13 用户拍板）——桌面端 Electron 壳走主进程
- * dialog.showOpenDialog；网页版自绘文件浏览器 FsPickerDialog 已删。
+ * 选目录走系统原生 picker（V0.7.13 用户拍板）——Electron 壳走主进程 dialog.showOpenDialog。
  *
  * 仓库名规则：
  * - 默认取目录 basename

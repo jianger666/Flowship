@@ -11,11 +11,11 @@ alwaysApply: true
 - **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
   - 打包：`pnpm electron:dist:test` → 产出「AI工作流test.app」（productName 带 test）
   - 壳探测到名字带 test（或 env `FE_AI_FLOW_TEST=1`）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**、单实例锁天然独立（按 userData 算）
-  - 测完杀的是「AI工作流test」进程、用户一看名字也不会误删正式应用
-- 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`、收尾 osascript 关「AI工作流test」窗口。
+  - 要关 / 删的话（用户主动说时）动的也是「AI工作流test」（名字带 test）、不会误伤正式应用
+- 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`。**验完默认不关窗、不删包**（见下条）。
 - 盲写直接发版（不本地验证）也不可取——能 test 实例验的就验一轮再 tag。
-- **测完删包、保留配置数据**（2026-06-13 用户修订）：验证完 `rm -rf dist/electron`（删 test 包）、但**保留** `~/Library/Application Support/fe-ai-flow-test`——里面有同步过来的配置（API Key / 模型 / 仓库 / 飞书登录态）、删了每次都要重新同步、留着下次直接复用。
-- **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：起 test 验证前确认不会和用户正在用的正式实例并发跑对话、验完**立即关 test**（osascript 关「AI工作流test」、别后台挂着）。正式被挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。
+- **test 实例 + test 包默认都不关不删（2026-06-15 用户修订、覆盖旧「测完删包 / 立即关 test」约定）**：验完 test 实例**留着跑、test 包（`dist/electron`）也留着**、下次要再测直接 open 复用、不用重打。**只有用户主动说「关」「删」时才动手**。配置数据目录 `~/Library/Application Support/fe-ai-flow-test`（API Key / 模型 / 仓库 / 飞书登录态）一直保留、不要删。
+- **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：**起 test 跑对话前、确认正式实例此刻没在跑对话**（idle 挂着不跑 SDK 不会撞、所以 test 默认留着即可、不必为规避并发去关它）。真把正式挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。
 - **test 包自动补 SDK 平台包（v0.7.17、assemble-server.addSdkPlatformPackage）**：`electron:dist:test` 走 standalone、Next nft 追不到 `@cursor/sdk-<platform>` 运行时动态加载的平台子包（native cursorsandbox + rg）→ 缺了 SDK 直接 `fetch failed`、对话全挂。组包公共函数已自动补（本地 pnpm 拓扑拷平台包 + symlink、CI hoisted 跳过）——打完可 `ls .../app-server/node_modules/.pnpm/@cursor+sdk@*/node_modules/@cursor/` 确认有 `sdk-darwin-arm64` symlink。
 - **同步正式配置到 test**：`scripts/sync-test-config.mjs`（需 `classic-level`、按需 `pnpm add -D classic-level`）。配置存 Chromium localStorage（`Local Storage/leveldb`）、按 origin（含端口）隔离、正式 8876 ≠ test 8776 直接拷读不到。流程：cp 正式 `Local Storage/leveldb` → `/tmp/fe-prod-ls`（正式 app 在跑、有 LOCK、只能读副本）→ test app 先退出（leveldb 单写锁）→ 脚本读副本、把 key 里 origin 端口 `8876→8776` 转换写入 test（`--probe` 只读看 / `--verify` 读回校验 / 无参正式同步）。
 

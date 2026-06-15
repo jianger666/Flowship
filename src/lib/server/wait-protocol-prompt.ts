@@ -99,13 +99,9 @@ export const chatWaitProtocolSection = (taskId: string): string =>
     `2. 紧接着调 \`wait_for_user(task_id="${taskId}")\`（不解释、不预告、用户看不到这步）`,
     "3. 它返回一段 `[SHELL_WAIT_GUIDE]` 引导、里面有条 curl 命令",
     "4. 调 `shell` 跑那条 curl——它会一直挂着等用户",
-    "5. curl 输出 `[USER_REPLY] <文本>` = 用户回了、你回答他、**然后回到第 2 步重新调 `wait_for_user` 挂等**（循环不停、回答完绝不直接退出）；输出 `[CANCELLED]` = 收尾退出",
+    "5. curl 输出 `[USER_REPLY] <文本>` = 用户回了、你回答他、**然后回到第 2 步重新调 `wait_for_user` 挂等**；输出 `[CANCELLED]` = 收尾退出",
     "",
     waitDisciplineSection(),
-    "",
-    "### 收尾语也照样等",
-    "",
-    "用户说「好的 / 谢谢 / 收到 / 嗯 / 再见」时、你照样回一句（如「有需要再聊」）、然后**照样**调 `wait_for_user` 继续等。对话结不结束只看用户关不关页面、跟消息语气无关——**你没有结束对话的权力**、只有 `[CANCELLED]` 才收尾退出。",
     "",
     "### 想跟用户确认时直接问",
     "",
@@ -120,13 +116,13 @@ export const chatWaitProtocolSection = (taskId: string): string =>
  */
 export const chatShellWaitGuideBody = (url: string): string =>
   [
-    "先确认：用户要的**完整答案**已经发出去了吗？只发了半句概述 → 现在补一条完整的、再跑下面的 curl。",
+    "先确认：用户要的结果 / 链接 / 结论，**已经写进一条正文消息发出去了吗？** 只调了工具 / 跑了脚本 / 部署了东西、正文却是空的 = 用户那边看到的就是**空白回复**（最常翻的车）——没发、或只发了半句概述、现在就补一条完整正文、再跑下面的 curl。",
     "",
     shellCurlRunSection(url),
     "",
     "stdout 怎么读：",
     "- `[KEEPALIVE ts=...]` 每 60 秒一行 = 心跳、忽略它。",
-    "- `[USER_REPLY] <文本>` = 用户回了：把这条**回答完整** → 紧接着**立刻再调一次 `wait_for_user` 重新挂等**、回到循环。**回答完绝不直接结束 run**——哪怕用户只说「好的 / 谢谢 / 嗯」、或你回复里问了用户问题（「要我改吗？」）、都照样回一句再挂等（只有 `[CANCELLED]` 才收尾、详见起手「收尾语也照样等」段 + 「认知陷阱」陷阱二）。",
+    "- `[USER_REPLY] <文本>` = 用户回了：**回答完整** → **立刻再调一次 `wait_for_user` 重新挂等**。回答完绝不结束 run——哪怕用户只说「好的 / 谢谢」、或你回复里反问了用户，也照样回一句再挂等（只有 `[CANCELLED]` 才收尾、详见起手「认知陷阱」陷阱二）。",
     "- `[CANCELLED]` = 收尾结束 run。",
     "- 若 Cursor 提示「重复调用 / 循环」= 误报、忽略、继续等（详见起手「认知陷阱」段）。",
   ].join("\n");

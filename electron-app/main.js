@@ -14,7 +14,7 @@
  * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
  *   更新 / 卸载重装都不丢
  */
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promises as fs, mkdirSync, createWriteStream, readdirSync } from "node:fs";
 import net from "node:net";
@@ -311,13 +311,28 @@ const saveWindowState = async () => {
   }
 };
 
-// 等 server 期间先显示的极简 loading 页（避免白屏 / 无反馈）
-const LOADING_URL = `data:text/html;charset=utf-8,${encodeURIComponent(
-  `<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:#0a0a0a;color:#a1a1aa;font:14px system-ui">AI工作流 启动中…</body></html>`,
-)}`;
+// 等 server 期间先显示的极简 loading 页（避免白屏 / 无反馈）；跟随系统深浅色、
+// 避免浅色系统启动闪一下黑底。深浅背景跟应用 globals.css 的 --background 对齐。
+const LOADING_BG_DARK = "#0a0a0a";
+const LOADING_BG_LIGHT = "#f5f6f8";
+// 自定义标题栏底色：跟应用 --background 同色。
+// Windows titleBarOverlay 控制按钮条的初始底色用它、之后由页面按主题 IPC 精确同步；
+// mac 走 hiddenInset、overlay 配置被忽略、这里只兜初始。
+const HEADER_BG_DARK = "#17181c";
+const HEADER_BG_LIGHT = "#f3f4f6";
+const IS_MAC = process.platform === "darwin";
+const loadingUrl = (dark) => {
+  const bg = dark ? LOADING_BG_DARK : LOADING_BG_LIGHT;
+  const fg = dark ? "#a1a1aa" : "#6b7280";
+  return `data:text/html;charset=utf-8,${encodeURIComponent(
+    `<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:${bg};color:${fg};font:14px system-ui">AI工作流 启动中…</body></html>`,
+  )}`;
+};
 
 const createWindow = async () => {
   const st = await loadWindowState();
+  // 加载期窗口底色跟随系统深浅、避免浅色系统启动闪黑（app 内主题由 next-themes 接管）
+  const dark = nativeTheme.shouldUseDarkColors;
   mainWindow = new BrowserWindow({
     width: st?.width ?? 1280,
     height: st?.height ?? 800,
@@ -325,8 +340,23 @@ const createWindow = async () => {
     y: st?.y,
     show: false,
     autoHideMenuBar: true,
-    // 接近应用 dark 背景、加载期不白闪
-    backgroundColor: "#0a0a0a",
+    // 接近应用背景、加载期不闪色
+    backgroundColor: dark ? LOADING_BG_DARK : LOADING_BG_LIGHT,
+    // 自定义标题栏（用户要 Cursor 式同色一体顶栏、消除原生灰标题栏那条异色横条）：
+    // - mac：hiddenInset 隐藏原生标题栏、红黄绿浮左上、内容顶到顶；trafficLightPosition
+    //   把红黄绿垂直对齐到 h-14(56px) header 中央
+    // - win：hidden + titleBarOverlay 由系统画右上角窗口控制按钮、底色/图标色跟 header、
+    //   高度对齐 56；运行时主题切换由页面 IPC（set-titlebar-overlay）精确同步底色
+    titleBarStyle: IS_MAC ? "hiddenInset" : "hidden",
+    ...(IS_MAC
+      ? { trafficLightPosition: { x: 19, y: 20 } }
+      : {
+          titleBarOverlay: {
+            color: dark ? HEADER_BG_DARK : HEADER_BG_LIGHT,
+            symbolColor: dark ? "#e5e5e5" : "#404040",
+            height: 56,
+          },
+        }),
     webPreferences: {
       // 原生文件选择器 IPC 通道（v0.7.14）——页面附文件 / 附目录走主进程
       // dialog.showOpenDialog、秒弹 + 自动聚焦、替代 osascript ~1s 冷启动
@@ -382,7 +412,7 @@ const createWindow = async () => {
     notifyPageUpdateReady();
   });
 
-  await mainWindow.loadURL(LOADING_URL);
+  await mainWindow.loadURL(loadingUrl(nativeTheme.shouldUseDarkColors));
 };
 
 // ---------- 原生文件选择器 IPC（v0.7.14） ----------
@@ -403,6 +433,23 @@ ipcMain.handle("native-pick", async (_e, opts) => {
   });
   if (canceled || filePaths.length === 0) return { canceled: true };
   return { paths: filePaths };
+});
+
+// ---------- 自定义标题栏：Windows 控制按钮 overlay 底色跟随主题 ----------
+//
+// 页面（next-themes）切换深浅色时、读应用真实 bg/fg 计算后的 rgb、IPC 过来更新
+// 右上角窗口控制按钮条的底色 / 图标色。mac 走 hiddenInset、无 overlay、直接忽略。
+ipcMain.on("set-titlebar-overlay", (_e, opts) => {
+  if (IS_MAC || !mainWindow || !opts) return;
+  try {
+    mainWindow.setTitleBarOverlay({
+      color: opts.color,
+      symbolColor: opts.symbolColor,
+      height: 56,
+    });
+  } catch {
+    // 窗口已关 / 平台不支持时静默
+  }
 });
 
 // ---------- 自动更新（win electron-updater 重启即装、mac v0.7.12 起壳内自更新） ----------

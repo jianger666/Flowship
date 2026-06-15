@@ -86,13 +86,16 @@ const CHAT_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 // chat-mcp 在 Agent.mcpServers 里的注册名（跟 task-runner 同款、agent prompt 里得点明）
 const CHAT_TOOL_MCP_NAME = "aiFlowChat";
 
+// chat agent / run 句柄类型（从 SDK Agent.create / agent.send 推导、给 runningChats 占位注册 + cancel 用）
+type ChatAgent = Awaited<ReturnType<typeof Agent.create>>;
+type ChatRun = Awaited<ReturnType<ChatAgent["send"]>>;
+
 // ----------------- 运行时状态（独立于 task-runner）-----------------
 
 interface RunningChatRecord {
   agentId: string;
   startedAt: number;
   cancel: () => void;
-  completion: Promise<void>;
 }
 
 interface ChatRunnerGlobalState {
@@ -431,83 +434,118 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     return;
   }
 
-  // V0.7.20：标记 chat 模式、让 chat-mcp 的 wait 引导走精简 chat 版（USER_REPLY 语境、不夹 task 信号）
-  markTaskAsChat(task.id);
-
-  // 1) 切到 running、写一条 info event
-  const startedTask = await setTaskRunStatus(task.id, "running");
-  if (startedTask) publish(task.id, { kind: "task", task: startedTask });
-
-  // 2) 拼 mcpServers：全局 cursor mcp（按 task 黑名单过滤）+ 我们自己的 chat-tool
-  // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
-  // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
-  // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
-  // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
-  const enrichedMcp = await enrichMcpServersWithOAuth(
-    filterDisabledMcp(
-      await readGlobalCursorMcpServers(),
-      task.disabledMcpServers,
-    ),
-  );
-  // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
-  const { servers: cursorMcp, dropped: droppedMcp } =
-    await filterHealthyMcp(enrichedMcp);
-  const mergedMcp: Record<string, McpServerConfig> = {
-    ...cursorMcp,
-    [CHAT_TOOL_MCP_NAME]: {
-      type: "http",
-      url: getChatMcpUrl(),
-    },
-  };
-
-  const cursorMcpNames = Object.keys(cursorMcp).filter(
-    (n) => n !== CHAT_TOOL_MCP_NAME,
-  );
-  const mcpDesc = `Chat MCP: ${CHAT_TOOL_MCP_NAME}${
-    cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
-  }`;
-
-  await writeEventAndPublish(task.id, {
-    kind: "info",
-    text: `Chat 任务启动（model: ${model.id}、${mcpDesc}）`,
-  });
-
-  // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
-  if (droppedMcp.length > 0) {
-    await writeEventAndPublish(task.id, {
-      kind: "info",
-      text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
-        .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
-        .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
-    });
-  }
-
-  // 3) 注入 awaiting notifier：agent 调 wait_for_user → 切 task.runStatus=awaiting_user
-  // chat 模式不会调 ask_user（prompt 已禁）、所以只处理 awaiting_start
-  setChatAwaitingNotifier(task.id, async (signal) => {
-    if (signal.kind === "ask_user_request") {
-      // 防御性：agent 即使无视 prompt 调了 ask_user、也别让它挂死、转 assistant_message 提示用户
-      const previewText = signal.questions
-        .map((q, idx) => `Q${idx + 1}: ${q.question}`)
-        .join("\n");
-      await writeEventAndPublish(task.id, {
-        kind: "assistant_message",
-        text: `[agent 误调 ask_user、chat 模式不支持]\n${previewText}`,
-      });
-      const updated = await setTaskRunStatus(task.id, "awaiting_user");
-      if (updated) publish(task.id, { kind: "task", task: updated });
-      return;
-    }
-    const updated = await setTaskRunStatus(task.id, "awaiting_user");
-    if (updated) publish(task.id, { kind: "task", task: updated });
-  });
-
-  // 4) 启动 agent + 流式消费
-  let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
+  // 句柄 + 取消标志提到最前：配合下面「进入即占位注册」消除冷启动竞态——
+  // Agent.create / agent.send / MCP 健康探测都要数秒、旧版到 send 之后才注册进 runningChats、
+  // 这几秒窗口里点停止 cancelChatRun 会 get 不到、扑空（连 cancelled 都来不及设）、
+  // run 照常启动复述 + 回复（用户实测「已停止但 AI 还回了」就是这窗口、V0.7.23 修）。
+  let agent: ChatAgent | null = null;
+  let run: ChatRun | null = null;
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
 
+  // cancel 收尾：归位 idle + publish done（不落 info——主动停时 /stop route 已落「用户停止了对话」、避免重复）
+  const finishCancelled = async (): Promise<void> => {
+    if (hardTimer) {
+      clearTimeout(hardTimer);
+      hardTimer = null;
+    }
+    const t = await setTaskRunStatus(task.id, "idle");
+    if (t) publish(task.id, { kind: "task", task: t });
+    publish(task.id, { kind: "done", task: t ?? task, ok: true });
+  };
+
+  // 进入即占位注册：任何时刻（含 create/send/MCP 探测冷启动期）点停止、cancelChatRun 都能命中、
+  // 置 cancelled（有 run 时一并真取消 SDK run）；agentId 先空、send 出来再回填。
+  // 注册后所有逻辑全纳入下面 try/finally、保证占位 record 必被清理（否则 has=true 永真、卡死后续启动）。
+  runningChats.set(task.id, {
+    agentId: "",
+    startedAt: Date.now(),
+    cancel: () => {
+      cancelled = true;
+      cancelPending(task.id);
+      if (run) void run.cancel().catch(() => {});
+    },
+  });
+
   try {
+    // V0.7.20：标记 chat 模式、让 chat-mcp 的 wait 引导走精简 chat 版（USER_REPLY 语境、不夹 task 信号）
+    markTaskAsChat(task.id);
+
+    // 1) 切到 running、写一条 info event
+    const startedTask = await setTaskRunStatus(task.id, "running");
+    if (startedTask) publish(task.id, { kind: "task", task: startedTask });
+
+    // 2) 拼 mcpServers：全局 cursor mcp（按 task 黑名单过滤）+ 我们自己的 chat-tool
+    // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
+    // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
+    // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
+    // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
+    const enrichedMcp = await enrichMcpServersWithOAuth(
+      filterDisabledMcp(
+        await readGlobalCursorMcpServers(),
+        task.disabledMcpServers,
+      ),
+    );
+    // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
+    const { servers: cursorMcp, dropped: droppedMcp } =
+      await filterHealthyMcp(enrichedMcp);
+    const mergedMcp: Record<string, McpServerConfig> = {
+      ...cursorMcp,
+      [CHAT_TOOL_MCP_NAME]: {
+        type: "http",
+        url: getChatMcpUrl(),
+      },
+    };
+
+    const cursorMcpNames = Object.keys(cursorMcp).filter(
+      (n) => n !== CHAT_TOOL_MCP_NAME,
+    );
+    const mcpDesc = `Chat MCP: ${CHAT_TOOL_MCP_NAME}${
+      cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
+    }`;
+
+    // MCP 健康探测也要数秒、探测期间被停 → 别再写「Chat 任务启动」往下跑、直接收尾
+    if (cancelled) {
+      await finishCancelled();
+      return;
+    }
+
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: `Chat 任务启动（model: ${model.id}、${mcpDesc}）`,
+    });
+
+    // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
+    if (droppedMcp.length > 0) {
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
+          .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
+          .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
+      });
+    }
+
+    // 3) 注入 awaiting notifier：agent 调 wait_for_user → 切 task.runStatus=awaiting_user
+    // chat 模式不会调 ask_user（prompt 已禁）、所以只处理 awaiting_start
+    setChatAwaitingNotifier(task.id, async (signal) => {
+      if (signal.kind === "ask_user_request") {
+        // 防御性：agent 即使无视 prompt 调了 ask_user、也别让它挂死、转 assistant_message 提示用户
+        const previewText = signal.questions
+          .map((q, idx) => `Q${idx + 1}: ${q.question}`)
+          .join("\n");
+        await writeEventAndPublish(task.id, {
+          kind: "assistant_message",
+          text: `[agent 误调 ask_user、chat 模式不支持]\n${previewText}`,
+        });
+        const updated = await setTaskRunStatus(task.id, "awaiting_user");
+        if (updated) publish(task.id, { kind: "task", task: updated });
+        return;
+      }
+      const updated = await setTaskRunStatus(task.id, "awaiting_user");
+      if (updated) publish(task.id, { kind: "task", task: updated });
+    });
+
+    // 4) 启动 agent + 流式消费
     agent = await Agent.create({
       apiKey,
       model,
@@ -518,6 +556,12 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       mcpServers: mergedMcp,
     });
 
+    // Agent.create 冷启动也要数秒、create 期间被停 → 别 send、直接收尾
+    if (cancelled) {
+      await finishCancelled();
+      return;
+    }
+
     // 加载 skills：平台自带 + 全局 ~/.cursor/skills/（repo 层 skills 由 settingSources 交给 SDK）
     const skills = await loadSkills().catch((err) => {
       console.error("[chat-runner] loadSkills failed", err);
@@ -527,26 +571,28 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     // 全局 rules（~/.cursor/rules/、settingSources["project"] 够不着、fe 读了注入）
     const rulesSection = await readGlobalCursorRulesForPrompt();
     const initialPrompt = buildInitialPrompt(task, skills, rulesSection, firstMessage);
-    const run = await agent.send(initialPrompt);
+    run = await agent.send(initialPrompt);
 
-    // 注册 cancel 控制
-    runningChats.set(task.id, {
-      agentId: agent.agentId,
-      startedAt: Date.now(),
-      cancel: () => {
-        cancelled = true;
-        cancelPending(task.id);
-        void run.cancel().catch(() => {});
-      },
-      // 占位、真正的 completion promise 在 try/catch 外面赋值
-      completion: Promise.resolve(),
-    });
+    // 回填真实 agentId（占位注册时是空串）
+    const rec = runningChats.get(task.id);
+    if (rec) rec.agentId = agent.agentId;
+
+    // send 期间被停 → run 已就位、真取消它再收尾
+    if (cancelled) {
+      void run.cancel().catch(() => {});
+      await finishCancelled();
+      return;
+    }
+
+    // run 此刻必非 null（send 成功 + 未取消）、用局部 const 给后续 stream/wait/hardTimer、
+    // 免「let + 闭包捕获」让 TS 把 narrow 丢回 null
+    const activeRun = run;
 
     // 兜底硬超时：24h
     hardTimer = setTimeout(() => {
       cancelled = true;
       cancelPending(task.id);
-      void run.cancel().catch(() => {});
+      void activeRun.cancel().catch(() => {});
     }, CHAT_HARD_TIMEOUT_MS);
 
     // 流式消费 + buffer flush
@@ -565,7 +611,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       },
     };
 
-    for await (const msg of run.stream()) {
+    for await (const msg of activeRun.stream()) {
       // handleSdkMessage 内部已在 thinking / tool_call case 自己 flush buffer
       // 这里不重复 flush、否则 IO 抖动
       await handleSdkMessage(task.id, msg, ctx);
@@ -579,7 +625,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       hardTimer = null;
     }
 
-    const result = await run.wait();
+    const result = await activeRun.wait();
 
     if (cancelled || result.status === "cancelled") {
       // cancel 收尾只归位 runStatus + publish done、不落 info——

@@ -4,7 +4,7 @@
  * V0.5.12：artifact diff 视图（react-diff-viewer-continued 包装）
  *
  * 设计：
- * - 项目 next-themes forcedTheme="dark"、直接写 useDarkTheme=true、不做动态探测
+ * - useDarkTheme 跟随 next-themes 的 resolvedTheme（V0.7.20 主题化前是写死 dark）
  * - splitView=false → inline 模式（行内、增删合并展示）、splitView=true → side-by-side
  * - compareMethod=WORDS_WITH_SPACE：词级 diff、对 markdown 段落级修改友好
  * - showDiffOnly=true：折叠未变行（artifact 长、不折叠刷屏；用户点折叠条可展开）
@@ -13,19 +13,19 @@
  *
  * V0.5.12.1（用户反馈「raw text 太代码风」、拍板 C 方案：raw text + 语法高亮）：
  * - 接 prismjs + prism-markdown 语言定义、给 markdown 语法标记（# 标题、* 强调、` 代码、> 引用、列表等）
- * - 主题用 prism-tomorrow（dark 友好、token 颜色明显）
  * - 通过 renderContent prop 注入 Prism 高亮器、给词级 diff 也叠加 syntax 颜色
  * - 不是「rendered markdown」、是「VSCode 打开 .md 的视感」、性价比方案
  *
- * 为啥不抽 useDarkTheme prop：项目 hard force dark、`light` 视觉根本不会出现、扛标志位徒增 surface
+ * V0.7.20 主题化：不再 import prism-tomorrow.css（dark-only 全局主题）——token 颜色统一走
+ * globals.css 的 `.token.*` 主题变量（light 压暗 / dark 提亮）、和全站主题一致、light 下也可读。
  */
 
+import { useEffect, useState } from "react";
+import { useTheme } from "next-themes";
 import ReactDiffViewer, { DiffMethod } from "react-diff-viewer-continued";
 import Prism from "prismjs";
 // 顺序敏感：prism core 先 import、再 import markdown 语言定义（注册到 Prism.languages.markdown）
 import "prismjs/components/prism-markdown";
-// dark theme：tomorrow 紫红绿色 token、跟 react-diff-viewer dark 灰背景兼容
-import "prismjs/themes/prism-tomorrow.css";
 
 interface Props {
   // 旧版本正文（如「上次 revision」/「初版」）
@@ -57,18 +57,26 @@ export const ArtifactDiff = ({
   leftTitle,
   rightTitle,
   splitView = false,
-}: Props) => (
-  <ReactDiffViewer
-    oldValue={oldText}
-    newValue={newText}
-    splitView={splitView}
-    useDarkTheme
-    compareMethod={DiffMethod.WORDS_WITH_SPACE}
-    showDiffOnly
-    hideSummary
-    extraLinesSurroundingDiff={3}
-    leftTitle={leftTitle}
-    rightTitle={rightTitle}
-    renderContent={highlightMarkdown}
-  />
-);
+}: Props) => {
+  // diff viewer 的明暗跟随全站主题；mounted 前默认 dark、避免水合首帧闪色
+  const { resolvedTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const isDark = !mounted || resolvedTheme === "dark";
+
+  return (
+    <ReactDiffViewer
+      oldValue={oldText}
+      newValue={newText}
+      splitView={splitView}
+      useDarkTheme={isDark}
+      compareMethod={DiffMethod.WORDS_WITH_SPACE}
+      showDiffOnly
+      hideSummary
+      extraLinesSurroundingDiff={3}
+      leftTitle={leftTitle}
+      rightTitle={rightTitle}
+      renderContent={highlightMarkdown}
+    />
+  );
+};

@@ -8,7 +8,7 @@
  * （见 electron-app/main.js）；本组件读到版本号就亮起、点击 confirm 后导航
  * app-update://install、壳在 will-navigate 拦截——win 重启即装、mac 打开下载页。
  *
- * 浏览器环境壳不会注入变量、组件恒 null、零成本。
+ * 壳未注入版本号时（首帧 / 注入前）组件恒 null、零成本。
  */
 
 import { useEffect, useState } from "react";
@@ -19,7 +19,7 @@ import { useDialog } from "@/hooks/use-dialog";
 
 declare global {
   interface Window {
-    /** Electron 壳注入：当前 app 版本号（设置页展示用、web 版无） */
+    /** Electron 壳注入：当前 app 版本号（设置页展示用） */
     __appVersion?: string;
     /** Electron 壳注入：已就绪的新版本号 */
     __appUpdateVersion?: string;

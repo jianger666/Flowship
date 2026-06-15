@@ -20,7 +20,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Ban, Loader2 } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
@@ -161,13 +161,9 @@ export const ChatView = ({
     return undefined;
   })();
 
-  // 顶部状态条文案——只在「有事要说」时显示（V0.7.11 简化：等待输入 / 空闲
-  // 是常态、不值得常驻一行字、输入岛 placeholder 已表达；异常 / 进行中才提示）
+  // 顶部状态条文案——只在「异常」时常驻一行（V0.7.21：运行态已收进输入岛的 loading + 红停止键、
+  // 发送态 < 1s、空闲 / 等待是常态、都不值得在标题下常驻占行）
   const statusHint = (() => {
-    if (isSubmitting) return "正在发送消息...";
-    if (task.runStatus === "running") {
-      return "agent 正在回、等它先说完一段";
-    }
     if (task.runStatus === "error") {
       return "上一轮 agent 异常退出、再发一条可重启新一轮 run";
     }
@@ -210,30 +206,6 @@ export const ChatView = ({
               )}
             </div>
           </div>
-
-          {task.runStatus === "running" && (
-            <div className="flex shrink-0 items-center gap-2">
-              <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin" />
-                AI 正在回
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleStop}
-                disabled={stopping}
-                title="停止当前回答（中断 agent）"
-                className="h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-destructive"
-              >
-                {stopping ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <Ban className="size-3.5" />
-                )}
-                停止
-              </Button>
-            </div>
-          )}
         </div>
         {/* 状态条文案：仅异常 / 发送中显示 */}
         {statusHint && (
@@ -252,6 +224,9 @@ export const ChatView = ({
           onUserReply={handleUserReply}
           canReply={canReply}
           disabledHint={disabledHint}
+          isRunning={task.runStatus === "running"}
+          onStop={handleStop}
+          stopping={stopping}
           composerLeading={
             <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
           }

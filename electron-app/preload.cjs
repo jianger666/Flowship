@@ -17,3 +17,12 @@ contextBridge.exposeInMainWorld("__nativePicker", {
    */
   pick: (opts) => ipcRenderer.invoke("native-pick", opts),
 });
+
+// 壳能力 / 平台信息（自定义标题栏用）
+contextBridge.exposeInMainWorld("__shell", {
+  // "darwin" | "win32" | "linux"——页面据此给右侧控件让出 Windows 控制按钮位
+  platform: process.platform,
+  // Windows：主题切换时同步右上角窗口控制按钮条的底色 / 图标色（mac 忽略）
+  /** @param {{ color: string, symbolColor: string }} opts */
+  setTitleBarOverlay: (opts) => ipcRenderer.send("set-titlebar-overlay", opts),
+});

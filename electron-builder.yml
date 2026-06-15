@@ -19,6 +19,17 @@ directories:
 # electron-updater 没有 native 依赖、跳过 rebuild 省时间
 npmRebuild: false
 
+# 语言包瘦身：Electron/Chromium 默认塞 ~220 国 locale（mac .lproj / win .pak、~47M 死重）。
+# 只留中英——本应用 UI 全自绘中文、仅 Chromium 原生右键菜单/表单提示会用到 locale、中英足够。
+# 不影响 icudtl.dat（中文显示/排序/日期格式照常）。
+# mac 文件名用下划线(zh_CN.lproj)、win 用连字符(zh-CN.pak)、两种都列以兼容双平台；
+# electron-builder 按小写 exact/prefix 匹配、匹配不到的值无害跳过（需 >=26.12.0、已 ^26.15.2）。
+electronLanguages:
+  - en
+  - en-US
+  - zh-CN
+  - zh_CN
+
 # 组好的 server 布局（standalone + prompts/skills/scripts、已删 data/ 防隐私泄漏）
 # 由 afterPack hook 拷进 resources/app-server、不进 asar——server 运行时要 fs 读自己
 # 旁边的文件。不走 extraResources：builder copier 硬排除 node_modules、依赖树会被丢
@@ -30,6 +41,10 @@ artifactName: "fe-ai-flow-${version}-${os}-${arch}.${ext}"
 
 win:
   target: nsis
+  # Windows 不像 macOS Tahoe 会自动给图标加圆角遮罩——给 win 单独一个预圆角 squircle
+  # （透明角 = 任务栏/桌面显示成圆角）。mac 继续用 packaging/icon.png 满幅方块（自动检测）、
+  # Tahoe 自己加圆角且不垫白底；若 mac 也共用透明角图标会被 Tahoe 垫成白底方块（v0.7.x 踩过）。
+  icon: icon-win.png
 
 nsis:
   # 助手式向导（V0.7.21）：关一键、让用户能在向导里选安装路径。

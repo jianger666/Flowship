@@ -27,6 +27,7 @@ import {
   Loader2,
   Paperclip,
   Send,
+  Square,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -93,6 +94,11 @@ interface Props {
   disabledHint?: string;
   // V0.6.24：footer 左侧 slot（chat 模式注入模型选择器、plan / task 模式不传）
   composerLeading?: ReactNode;
+  // V0.7.21：chat 运行态——agent 正在生成时、底部操作行把发送键换成红色停止键 + loading 转圈
+  // （取代顶栏旧的「AI 正在回 + 停止」、统一收进输入岛、靠原地替换不顶布局）
+  isRunning?: boolean;
+  onStop?: () => void;
+  stopping?: boolean;
   // V0.7.11：渲染形态
   // log（默认）：task 模式事件流——卡片行 + header 折叠、信息密度优先
   // chat：自由模式对话——Cursor agent window 风格（窄列居中 / AI 平铺 /
@@ -115,6 +121,9 @@ const EventStreamImpl = ({
   canReply,
   disabledHint,
   composerLeading,
+  isRunning,
+  onStop,
+  stopping,
   variant = "log",
 }: Props) => {
   const isChat = variant === "chat";
@@ -399,74 +408,98 @@ const EventStreamImpl = ({
                   : (disabledHint ?? "agent 当前没有等待你回复")
               }
               disabled={!isAwaitingUser}
-              className="min-h-[3.25rem] resize-none border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+              className="min-h-13 resize-none border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
             />
-            {/* 底部操作行：左模型选择、右附件 + 发送 */}
-            <div className="flex items-center justify-between gap-2 px-2.5 pb-2">
+            {/* 底部操作行：左模型选择、右附件 + 发送
+                pt-1.5：跟上方文本框留一道间距（否则模型选择器贴着输入区、挤在一起）
+                运行态：右侧整组换成 loading 转圈 + 红色停止键——原地替换、不新增行、不顶布局 */}
+            <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-1.5">
               <div className="flex min-w-0 items-center gap-1.5">{composerLeading}</div>
               <div className="flex shrink-0 items-center gap-0.5">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={!isAwaitingUser}
-                  onClick={handleAttachClick}
-                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                  title="附图（也支持粘贴 / 拖拽）"
-                >
-                  <Paperclip className="size-3.5" />
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={!isAwaitingUser || picking !== false}
-                  onClick={() => void pickPaths("file")}
-                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                  title="附文件（agent 会用 `read` 工具看）"
-                >
-                  {picking === "file" ? (
-                    <Loader2 className="size-3.5 animate-spin" />
-                  ) : (
-                    <FileIcon className="size-3.5" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={!isAwaitingUser || picking !== false}
-                  onClick={() => void pickPaths("folder")}
-                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                  title="附目录（agent 会用 `read` 工具看）"
-                >
-                  {picking === "folder" ? (
-                    <Loader2 className="size-3.5 animate-spin" />
-                  ) : (
-                    <FolderOpen className="size-3.5" />
-                  )}
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={
-                    !isAwaitingUser ||
-                    (!draft.trim() && attachedImages.length === 0 && attachedPaths.length === 0)
-                  }
-                  onClick={handleSend}
-                  className="ml-1 size-7 rounded-lg p-0"
-                  title="发送（Cmd+Enter）"
-                >
-                  <ArrowUp className="size-4" />
-                </Button>
+                {isRunning ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={onStop}
+                      disabled={stopping}
+                      title="停止生成（中断 agent）"
+                      className="ml-1 size-7 rounded-lg bg-destructive p-0 text-white hover:bg-destructive/90"
+                    >
+                      {stopping ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Square className="size-3 fill-current" />
+                      )}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={!isAwaitingUser}
+                      onClick={handleAttachClick}
+                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                      title="附图（也支持粘贴 / 拖拽）"
+                    >
+                      <Paperclip className="size-3.5" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={!isAwaitingUser || picking !== false}
+                      onClick={() => void pickPaths("file")}
+                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                      title="附文件（agent 会用 `read` 工具看）"
+                    >
+                      {picking === "file" ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <FileIcon className="size-3.5" />
+                      )}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={!isAwaitingUser || picking !== false}
+                      onClick={() => void pickPaths("folder")}
+                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                      title="附目录（agent 会用 `read` 工具看）"
+                    >
+                      {picking === "folder" ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <FolderOpen className="size-3.5" />
+                      )}
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={
+                        !isAwaitingUser ||
+                        (!draft.trim() && attachedImages.length === 0 && attachedPaths.length === 0)
+                      }
+                      onClick={handleSend}
+                      className="ml-1 size-7 rounded-lg p-0"
+                      title="发送（Cmd+Enter）"
+                    >
+                      <ArrowUp className="size-4" />
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </div>
-          {/* 岛下方状态行：禁用原因 / 附件计数、没内容时不占高 */}
-          {(!isAwaitingUser || attachedImages.length > 0 || attachedPaths.length > 0) && (
+          {/* 岛下方状态行：仅在用户主动加了附件时显示计数。
+              运行 / 禁用提示不再放这——它会在 agent 每次跑起来时多撑一行、把输入岛顶上去
+              （V0.7.21 移除、运行态改用操作行内 loading + 红停止键、零布局抖动） */}
+          {(attachedImages.length > 0 || attachedPaths.length > 0) && (
             <div className="mx-auto mt-1.5 w-full max-w-3xl px-1 text-center text-[11px] text-muted-foreground/70">
-              {!isAwaitingUser
-                ? (disabledHint ?? "agent 当前没有等待你回复")
-                : `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`}
+              {`图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`}
             </div>
           )}
           {/* 隐藏 input：附图按钮触发它 */}

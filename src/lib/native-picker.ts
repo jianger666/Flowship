@@ -4,8 +4,7 @@
  * 原生文件 / 文件夹选择器的客户端封装（桌面端 Electron IPC 通道）
  *
  * 项目只交付桌面端：Electron 壳通过 preload 暴露 window.__nativePicker、走主进程
- * dialog.showOpenDialog（秒弹 + 自动前台聚焦）。这是唯一通道——非桌面环境
- * （浏览器 dev）没有该通道、直接 toast 提示、不再做 HTTP + osascript 兜底。
+ * dialog.showOpenDialog（秒弹 + 自动前台聚焦）。这是唯一通道、不做任何非桌面兜底。
  *
  * 返回：选中的绝对路径数组；用户取消返 null（调用方静默即可）；
  * 出错 / 非桌面端 toast 后也返 null、调用方不用再处理错误分支。

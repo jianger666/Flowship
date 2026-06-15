@@ -1,11 +1,7 @@
 import type { Metadata } from "next";
-import Link from "next/link";
-import { Settings } from "lucide-react";
 import { Providers } from "@/components/providers";
-import { UpdateBadge } from "@/components/update-badge";
+import { AppHeader } from "@/components/app-header";
 import { Toaster } from "@/components/ui/sonner";
-import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -15,46 +11,20 @@ export const metadata: Metadata = {
 
 /**
  * Root layout
- * - <html> 上加 className="dark"、立即生效 dark 主题、避免 SSR 闪白
- *   （suppressHydrationWarning 是 next-themes 推荐配置）
- * - 顶部 header 全站固定、左 logo / 右设置入口
+ * - 主题由 next-themes 控制（三态：浅色 / 深色 / 跟随系统）、不再硬编码 .dark
+ *   next-themes 注入的 beforeInteractive 脚本会在首帧前定好主题、避免 SSR 闪色
+ *   （suppressHydrationWarning 是 next-themes 推荐配置、抑制 <html> class 水合差异）
+ * - 顶部条 = AppHeader（自定义标题栏、与应用同色一体、品牌靠左、详见组件注释）
  * - Next.js App Router 要求 layout 必须 default export 一个组件、所以这里
  *   保留 default export，但函数体本身用箭头声明
  */
 const RootLayout = ({ children }: { children: React.ReactNode }) => {
   return (
-    <html lang="zh-CN" className="dark" suppressHydrationWarning>
+    <html lang="zh-CN" suppressHydrationWarning>
       <body className="min-h-screen bg-background text-foreground antialiased">
         <Providers>
-          <div className="min-h-screen flex flex-col">
-            <header className="h-14 px-6 flex items-center justify-between">
-              <Link
-                href="/"
-                className="flex items-center gap-2 font-semibold tracking-tight no-underline text-foreground hover:opacity-80"
-              >
-                AI工作流
-                <span className="text-xs text-muted-foreground font-normal">
-                  开发流水线
-                </span>
-              </Link>
-              <div className="flex items-center gap-2">
-                {/* 桌面端有新版本就绪时亮起（壳注入、浏览器环境恒不显示） */}
-                <UpdateBadge />
-                {/* Base UI 的 Button 通过 render prop 实现 polymorphic、不再用 asChild
-                    nativeButton={false} 是因为 render 出来的是 <a>、不是 <button>、
-                    不传会被 Base UI runtime warn */}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  nativeButton={false}
-                  render={<Link href="/settings" className="no-underline" />}
-                >
-                  <Settings />
-                  设置
-                </Button>
-              </div>
-            </header>
-            <Separator />
+          <div className="flex min-h-screen flex-col">
+            <AppHeader />
             <main className="flex-1">{children}</main>
           </div>
           <Toaster position="top-right" />
