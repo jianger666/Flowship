@@ -293,13 +293,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.7.22：自更新加 2h 定时轮询（2026-06-15）
+
+`main.js` 自更新原本只在 app 启动时查一次（`whenReady` → `setupAutoUpdate` 一次性）——同事习惯长期开着不关 app 就一直收不到新版提醒。本版加定时轮询：抽 `runUpdateCheck()`（启动 + `setInterval` 每 2h 各跑一次）、win 的 `update-downloaded` / `error` 事件监听器挪进 `setupAutoUpdate` **只注册一次**（`winAutoUpdater` 模块级单例、轮询只调 `checkForUpdates()`、防重复注册 = 监听器泄漏 + 多次弹窗）、mac 轮询走 `fetchLatestVersion()` 比对版本号。**去重靠既有 `promptUpdateOnce` 的 `wasPrompted`**（同版本只弹一次原生弹窗、跨重启持久化）——轮询查到同版本只刷新页面右上角「新版本」标识、不重复骚扰；app 退出进程自然清 interval。纯 main.js 自更新段改动、不碰其他。
+
 ### v0.7.21：改名 ai-flow + 等待协议单一源 + Win 装路径可选 + 禁整页刷新（2026-06-15）
 
 ① **全局 `fe-ai-flow` → `ai-flow`**（用户拍板「已不局限于 fe」）：agent 上下文（prompts / skills / `.cursor/rules`）+ 项目名 + docs + MCP id（`feAiFlowChat` → `aiFlowChat`、`chat-mcp` 定义 + chat-runner / task-runner / `_super.md` 引用全链一致）全去 fe；**雷区一律不动**（改了裂 app / 丢数据 / 断自更新）——userData 目录（`fe-ai-flow` / `fe-ai-flow-test`）、appId（`com.jianger.fe-ai-flow`）、GitHub repo（`jianger666/fe-ai-flow`）、artifactName（`fe-ai-flow-${version}` exe/dmg）、env（`FE_AI_FLOW_*`）、globalThis key（`__feAiFlow*__`）、localStorage key（`fe-ai-flow:*`）。② **等待协议 prompt 收口单一源**（新建 `src/lib/server/wait-protocol-prompt.ts`、chat + task 四处引用同一份、删三处漂移）：抽共用「写完 → wait_for_user → shell curl 挂等」的纯机制纪律 + 三认知陷阱（turn 矛盾 / 回复完≠收尾、所谓「结束」其实是「断开」/ anti-loop 误报）；chat 侧补「每轮 `[USER_REPLY]` 尾部拼一句 wait 提醒」（recency 注入、抗长上下文把协议冲淡导致漏调）+「工具跑完 ≠ 回答、结果 / 链接 / 结论必须写进回复正文」、`wait-ack` maxDuration 提到 24h。③ **Windows nsis 可选安装路径**：`electron-builder.yml` `oneClick:false` + `allowToChangeInstallationDirectory`、首次手装走向导能选目录（自更新仍静默、per-user 不强制 UAC）。④ **禁整页刷新快捷键**：`main.js` `before-input-event` 拦 `cmd/ctrl+R` / `cmd+shift+R` 强刷 / `F5`（dev+prod 都禁）——桌面 app 不该暴露浏览器整页刷新、误触丢输入草稿 / UI 临时态（持久化态走 server + SSE replay 不受影响）；只拦这几个键、不碰 cmd+C/V/A / cmd+W / cmd+Q / devtools。⑤ **mac/win 自更新故意不统一（已评估、别复用重构）**：共享层已抽好（弹窗去重 `wasPrompted`/`markPrompted`、页面「新版本」标识 `notifyPageUpdateReady`、对话框 `promptUpdateOnce` 文案参数化、入口分流 `installUpdateNow`、版本比较 `isNewer`——改一处两端生效）；真正分两套的只有「下载+安装」核心（win `electron-updater` 一把梭 ≈18 行 / mac 无证书跑不了 Squirrel.Mac、自实现 `fetch dmg + hdiutil + ditto` ≈97 行）——底层是两个不兼容方案、连「查更新」都难统一（win 是查+下载一体的事件回调），强行抽接口反增耦合。**下个 AI 别再尝试复用重构自更新。**
-
-### v0.7.20：chat 漏调 prompt 第一铁律加固 + anti-loop 软提示定调（2026-06-14）
-
-用户挂超长连接实测（main.log task vn2ckn）出两个结论。① **anti-loop = 软提示、非硬强制**（闭环 v0.7.19 ③ 待验证）：第 1 轮 long-poll 挂 67 分钟（10:28→11:35）curl 不断、run 不退——Cursor「flagged as looping / 处于循环状态」是能无视的软提示、不逼退出、KEEPALIVE 策略不用动。② **wait_for_user 漏调真实存在、概率性、纯 prompt 没根治**（修正 v0.7.17~18「漏调已修」的乐观结论）：12:07:52 用户回「好的」→ 12:07:57 SDK FINISHED、中间 0 次 wait_for_user（和最初 acmri2 同款）；对比 fxjb3s 的「好的」「ok」没漏 = 同输入不同结果、composer 软约束 hold 不住、**收尾语境（好的 / 谢谢 / 收到 / 没事了 / ok）最易触发误判「对话结束」而省 wait**。**用户否决「服务端 resume 兜底」**（原话「我就是不想冷启动、不多启动才搞这套 shell long-poll」——resume 起新 run 正撞「单 run 省计费」硬约束）、定调走 **prompt 加固**：`chat-runner.ts buildInitialPrompt` 改 2 处（精简后单一源、避免冗余）——① 总纲把原『循环往复直到用户主动结束』（给 agent『可自判结束』的错误锚点）换成『无限循环、永不自行结束』+ 新增「🚨 第一铁律：你没有结束对话的权力」整段讲透 turn 机制（emit 后不接 tool call → turn 结束 → Run 永久死 → 冷启动；唯一结束信号 [CANCELLED]；收尾语「好的 / 谢谢 / 收到 / ok」是普通消息、回完照样 wait）；② USER_REPLY 分支补一句指针「收尾语也不例外、见开头第一铁律」。（初版在关键规则 1 / 标准动作也各加过同款警告、后精简掉重复、只留总纲单一源 + USER_REPLY 指针）⚠️ 仍是软约束、composer 可能偶发不听、但决策路径上的错误锚点已清。③ 附带：几个 task long-poll 中途 SDK ERROR（fxjb3s 9.5min / mygeom 24min、message 空）但 vn2ckn 挂 67min 没事 = 非「挂久必挂」、根因待查（疑 test/正式 race 或 SDK 偶发、非 anti-loop）、和漏调两回事。
 
 ---
 

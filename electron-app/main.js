@@ -587,27 +587,20 @@ const isNewer = (a, b) => {
   return false;
 };
 
-const setupAutoUpdate = async () => {
-  // 测试实例版本号永远是 0.0.0-dev、查更新必弹「发现新版本」、纯骚扰——跳过
-  if (!app.isPackaged || IS_TEST) return;
+// 每 2 小时轮询一次更新——app 长期开着不关（同事习惯）也能收到新版提醒、
+// 不止在启动时查一次（v0.7.22）。同版本只弹一次靠 promptUpdateOnce 的 wasPrompted 去重。
+const UPDATE_POLL_MS = 2 * 60 * 60 * 1000;
+
+// win electron-updater 单例：首次 setup 时初始化 + 注册事件、轮询复用、不重复注册监听器
+let winAutoUpdater = null;
+
+// 查一次更新（启动 + 每 2h 轮询都走这）。win 触发后台下载、下载完走 update-downloaded 事件；
+// mac 查版本号比对、有新版直接提醒。同版本重复查只刷新页面标识、不重复弹窗（wasPrompted 去重）。
+const runUpdateCheck = async () => {
   try {
     if (process.platform === "win32") {
-      // electron-updater 是 CJS、ESM 下走 default 再解构最稳
-      const { default: updater } = await import("electron-updater");
-      const au = updater.autoUpdater;
-      au.on("update-downloaded", async (info) => {
-        updateReadyVersion = info?.version || "";
-        log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
-        notifyPageUpdateReady();
-        await promptUpdateOnce(updateReadyVersion, {
-          message: `新版本 v${updateReadyVersion} 已下载完成`,
-          detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
-          confirmLabel: "立即重启更新",
-        });
-      });
-      au.on("error", (err) => log(`[updater] ${err?.message || err}`));
-      // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走上面的事件
-      await au.checkForUpdates();
+      // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走 update-downloaded 事件
+      if (winAutoUpdater) await winAutoUpdater.checkForUpdates();
       return;
     }
     // mac：查版本号、有新版提醒「应用内自更新」（壳下载 dmg 替换自身、v0.7.12）
@@ -626,6 +619,35 @@ const setupAutoUpdate = async () => {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
     log(`[updater] 检查更新失败（忽略）${err?.message || err}`);
   }
+};
+
+const setupAutoUpdate = async () => {
+  // 测试实例版本号永远是 0.0.0-dev、查更新必弹「发现新版本」、纯骚扰——跳过
+  if (!app.isPackaged || IS_TEST) return;
+  // win：初始化 electron-updater + 注册「下载就绪 / 出错」事件（仅一次、轮询不重注册、防监听器泄漏）
+  if (process.platform === "win32") {
+    try {
+      // electron-updater 是 CJS、ESM 下走 default 再解构最稳
+      const { default: updater } = await import("electron-updater");
+      winAutoUpdater = updater.autoUpdater;
+      winAutoUpdater.on("update-downloaded", async (info) => {
+        updateReadyVersion = info?.version || "";
+        log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
+        notifyPageUpdateReady();
+        await promptUpdateOnce(updateReadyVersion, {
+          message: `新版本 v${updateReadyVersion} 已下载完成`,
+          detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
+          confirmLabel: "立即重启更新",
+        });
+      });
+      winAutoUpdater.on("error", (err) => log(`[updater] ${err?.message || err}`));
+    } catch (err) {
+      log(`[updater] electron-updater 初始化失败（忽略）${err?.message || err}`);
+    }
+  }
+  // 启动先查一次、之后每 2h 轮询一次（app 长期不关也能收到新版提醒）
+  await runUpdateCheck();
+  setInterval(() => void runUpdateCheck(), UPDATE_POLL_MS);
 };
 
 // ---------- 生命周期 ----------
