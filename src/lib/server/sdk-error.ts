@@ -41,3 +41,93 @@ export const buildSdkErrorMessage = (message: string, err: unknown): string => {
     ? `${message}\n--- SDK error fields ---\n${JSON.stringify(bits, null, 2)}`
     : message;
 };
+
+/**
+ * 「长连接被断」类裸 run 失败的识别 + 用户友好文案（V0.8.x）
+ *
+ * 单 SDK Run 模型下、run 跨 action 挂在 shell curl 长连接上等用户 ack（可挂数小时）。
+ * 这条长连接最常见的死法就是「被断」：等太久 / 本地网抖 / 代理·LB 砍 idle 连接 /
+ * 笔记本休眠 / Cursor 后端回收久挂的 run。此时 SDK 给的是 status=error|expired、
+ * 且 message 全空、错误对象也无 code/cause——拿不到任何诊断、只剩一坨 run 元数据 dump。
+ *
+ * 这类对用户没有信息量、还吓人（原文「agent run status=error --- SDK result dump --- {...}」）。
+ * 识别出来后事件流里换成一句「长连接已断开」友好提示；真·有诊断的错
+ * （认证 / 限流 / MCP / agent 协议错）照旧展示详情、方便定位根因。
+ */
+
+// 裸 status=error/expired：status 后面只跟 result dump（run 元数据）或直接到串尾、
+// 不带任何人类可读诊断段（--- SDK stream error message --- / inline `: 详情`）。
+// 命中即「无诊断」、配合「错误对象也无 code/cause」一起判、才算长连接被断。
+const BARE_RUN_DROP_RE =
+  /^agent run status=(?:error|expired)(?:\s*\n--- SDK result dump|\s*$)/;
+
+const DUMP_MARKER = "--- SDK result dump ---";
+
+/**
+ * run dump（RunResult JSON）里除了 run 元数据（id/status/model/durationMs/...）、
+ * 若还带诊断字段（result/message/error/reason 非空）说明 SDK 给了线索、
+ * 不能当「无诊断的连接断」吞掉（reviewAI P1：把「dump 仅元数据」这个 RCA 前提写进代码边界）。
+ *
+ * dump 被 slice(1500) 截断 / 非法 JSON 时 parse 失败 → 解析不出诊断、返回 false
+ * 不据此 demote（BARE_RUN_DROP_RE + bits 仍是主闸、且 task-runner 已把 result.result inline、
+ * 最常见的诊断字段在进 dump 前就已让正则失配）。
+ */
+const dumpHasDiagnostic = (rawMessage: string): boolean => {
+  const idx = rawMessage.indexOf(DUMP_MARKER);
+  if (idx < 0) return false;
+  const jsonStr = rawMessage.slice(idx + DUMP_MARKER.length).trim();
+  if (!jsonStr) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null) return false;
+  const d = parsed as Record<string, unknown>;
+  for (const k of ["result", "message", "error", "reason"]) {
+    const v = d[k];
+    if (typeof v === "string" && v.trim()) return true;
+    // 非空对象（如 error:{code:...}）才算诊断；空对象 {} 不算、避免无信息量却误 demote
+    if (v && typeof v === "object" && Object.keys(v).length > 0) return true;
+  }
+  return false;
+};
+
+export interface RunFailureSummary {
+  // 落事件流的文案：连接断时是友好提示、否则是带详情的原始错误串
+  text: string;
+  // 是否「长连接被断」类——调用方据此决定要不要加「失败 / 异常」前缀
+  isConnectionDrop: boolean;
+}
+
+/**
+ * 把 run 失败归一成「给用户看的事件文案」。
+ * - 长连接被断（裸 status=error/expired + 无任何诊断）→ 友好一句话、不加吓人前缀
+ * - 其它（有诊断）→ 复用 buildSdkErrorMessage 的详情串、调用方自行加「失败 / 异常」前缀
+ */
+export const summarizeRunFailure = (
+  rawMessage: string,
+  err: unknown,
+): RunFailureSummary => {
+  const bits = extractSdkErrorBits(err);
+  // 三道闸全过才算长连接被断：①裸 status 形态 ②err 无 code/cause（保守：有 code 先当真错留详情、
+  // 含 14 UNAVAILABLE / 4 DEADLINE 这类「其实也是连接断」会走详情分支、属可接受 false-negative）
+  // ③dump 里没塞诊断字段。误吞比漏报更伤、所以宁可少判连接断、不可吞掉 RCA 线索。
+  const isConnectionDrop =
+    BARE_RUN_DROP_RE.test(rawMessage) &&
+    Object.keys(bits).length === 0 &&
+    !dumpHasDiagnostic(rawMessage);
+  if (isConnectionDrop) {
+    return {
+      isConnectionDrop: true,
+      // 文案简洁原则：是什么 + 大概为啥 + 怎么恢复、一行说清、不展开技术细节（dump 仍进 console）。
+      // 「通常可恢复」不写死「即可恢复」——resume 可能因后端已清 run 失败、不过度承诺（reviewAI P2）。
+      text: "长连接已断开——通常是等待太久、网络/代理中断或电脑休眠导致，不是任务本身出错，重新发起本轮通常可恢复。",
+    };
+  }
+  return {
+    isConnectionDrop: false,
+    text: buildSdkErrorMessage(rawMessage, err),
+  };
+};

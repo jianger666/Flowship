@@ -23,6 +23,12 @@
 
 {{contextDocsSection}}
 
+## 全局规则（用户在 Cursor 配的偏好、必遵守）
+
+下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。标了 `alwaysApply` 的已全文展开、必须始终遵守；其余按场景描述、命中时用 `read` 工具读全文：
+
+{{rulesSection}}
+
 ## 核心机制：wait_for_user + shell long-poll（V0.3.5 沿用、协议层不变）
 
 ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
@@ -315,12 +321,6 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
 写 artifact **必须用绝对路径** `{{actionArtifactsDir}}/<n>-<type>.md`——agent cwd 不是 ai-flow 项目根、而是用户业务仓库（见上「仓库根目录」）、相对前缀会写错位置。
 
 `n` 跟 `artifact_path` 都从 [NEXT_ACTION] 头里拿、不要自己猜。
-
-## 全局规则（用户在 Cursor 配的偏好、必遵守）
-
-下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。标了 `alwaysApply` 的已全文展开、必须始终遵守；其余按场景描述、命中时用 `read` 工具读全文：
-
-{{rulesSection}}
 
 ## Skills（ai-flow 自带能力扩展）
 

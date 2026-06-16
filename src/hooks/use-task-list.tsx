@@ -14,7 +14,9 @@
  *  - removeTask(id)：单条移除（删除任务乐观更新）
  *
  * 刷新时机：mount 一次 + 窗口重新聚焦（focus）时——多任务并行，切回 app 拿最新态。
- * 不做高频轮询（重）：当前在看的任务靠详情页 SSE 实时、其余靠 focus 刷新够用。
+ * 外加「条件轮询」：仅当列表里存在 running 任务时、每 POLL_INTERVAL_MS 刷一次、全跑完即停。
+ * 这样切到 B 时、后台还在跑的 A 跑完几秒内侧栏就更新（停转圈 / 变成等你回复点）。
+ * 没有任务在跑时不轮询、不浪费。
  */
 
 import {
@@ -22,6 +24,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -38,6 +41,9 @@ interface TaskListContextValue {
 }
 
 const TaskListContext = createContext<TaskListContextValue | null>(null);
+
+// 条件轮询间隔：仅当有任务在跑时生效（本地读 meta.json 很轻、2s 兼顾实时与开销）
+const POLL_INTERVAL_MS = 2000;
 
 // Task（完整）→ TaskSummary：派生 actionCount / lastAction*，剔除 events / actions
 // （避免把可能很大的 events 数组带进侧栏列表）。本身已是 Summary 则原样返回。
@@ -82,6 +88,19 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [refresh]);
+
+  // 有没有任务在跑——条件轮询的开关（值只在 false↔true 切换时才重启 interval）
+  const hasRunning = useMemo(
+    () => tasks.some((t) => t.runStatus === "running"),
+    [tasks],
+  );
+
+  // 条件轮询：仅当存在 running 任务时定时刷新、抓后台任务的状态变化（跑完 / 转等你回复）
+  useEffect(() => {
+    if (!hasRunning) return;
+    const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [hasRunning, refresh]);
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);

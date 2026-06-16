@@ -55,7 +55,7 @@ import {
   computeWorktreeFingerprint,
   captureActionStartBaseline,
 } from "./action-checks";
-import { buildSdkErrorMessage } from "./sdk-error";
+import { summarizeRunFailure } from "./sdk-error";
 import {
   cancelPending,
   getChatMcpUrl,
@@ -1521,19 +1521,49 @@ const restartCurrentActionInner = async (
         ? buildReviewScopeDirective(startTask)
         : undefined;
 
+  // 重启 = 用「这个 action 当初实际跑的模型」重跑：advance 起新 agent 时一次性挑的模型存在
+  // action.agentModel 上（不回写 task.model、避免污染任务级 / 设置页全局）。所以重启要优先它、
+  // 没存（老数据）才回退 body 传来的 model（task.model / settings.defaultModel）。
+  // 否则重启会掉回创建时的默认模型（踩过：plan 选了 opus-4.8、断线重启变 composer-2.5）。
+  const restartModel = startAction.agentModel?.id?.trim()
+    ? startAction.agentModel
+    : input.model;
+
+  // 老数据 action 没存 agentModel：把本次回退用的模型补写回库、让「卡片显示模型 = 实际重跑模型」、
+  // 不再出现显示 / 实跑不一致（本次 RCA 本质就是这三者漂移、顺手堵掉老数据这条缝）。
+  // patch 后 task / action 一并取最新值（effectiveStartTask / effectiveStartAction）、
+  // 让启动 prompt、SSE publish、最终 return 三处口径一致（避免 response.action 缺刚回填的 agentModel）。
+  let effectiveStartTask = startTask;
+  let effectiveStartAction = startAction;
+  if (!startAction.agentModel?.id?.trim()) {
+    const patched = await patchAction(fresh.id, startAction.id, {
+      agentModel: restartModel,
+    });
+    if (patched) {
+      effectiveStartTask = patched;
+      effectiveStartAction =
+        patched.actions.find((a) => a.id === startAction.id) ?? startAction;
+      publish(fresh.id, { kind: "task", task: patched });
+    }
+    publish(fresh.id, { kind: "action", action: effectiveStartAction });
+  }
+
   await internalStartAgent({
-    task: startTask,
-    action: startAction,
-    userInstruction: buildRestartActionInstruction(startTask, startAction),
+    task: effectiveStartTask,
+    action: effectiveStartAction,
+    userInstruction: buildRestartActionInstruction(
+      effectiveStartTask,
+      effectiveStartAction,
+    ),
     branchCheckoutHint,
     apiKey: input.apiKey,
-    model: input.model,
+    model: restartModel,
     gitHost: input.gitHost,
     gitToken: input.gitToken,
     batchDirective,
   });
 
-  return { action: startAction };
+  return { action: effectiveStartAction };
 };
 
 /**
@@ -2195,8 +2225,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         const sdkErr = assistantCtx.sdkErrorMessage
           ? `\n--- SDK stream error message ---\n${assistantCtx.sdkErrorMessage}`
           : "";
+        // result.result 是 SDK 给的最终文本/诊断（mirror chat-runner）：非空就 inline 到 status 后、
+        // 这样 summarizeRunFailure 的「裸 error」正则自然不命中、诊断不会被当连接断吞掉
+        const inlineResult =
+          typeof result.result === "string" && result.result.trim()
+            ? `: ${result.result.slice(0, 200)}`
+            : "";
         throw new Error(
-          `agent run status=${result.status}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
+          `agent run status=${result.status}${inlineResult}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
         );
       }
 
@@ -2233,8 +2269,12 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[task-runner] task=${task.id} failed:`, err);
 
-      // SDK 错误详情（code/cause/...）抠出来一并落到 event、方便从 events 直接定位根因
-      const fullMessage = buildSdkErrorMessage(message, err);
+      // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
+      // 其它有诊断的错（认证 / 限流 / MCP / 协议）→ 带详情、加「失败」前缀。原始 err 已 console.error。
+      const failure = summarizeRunFailure(message, err);
+      const eventText = failure.isConnectionDrop
+        ? failure.text
+        : `Task agent 失败：${failure.text}`;
 
       // 收尾所有卡在非终态的 action（单 Run 多 action：卡住的可能 ≠ 闭包起的 action、见 finalizeStaleActions）
       await finalizeStaleActions(task.id, "error");
@@ -2242,11 +2282,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       await writeEventAndPublish(task.id, {
         kind: "error",
         actionId: action.id,
-        text: `Task agent 失败：${fullMessage}`,
+        text: eventText,
       });
       const errored = await getTask(task.id);
       publish(task.id, { kind: "done", task: errored ?? task, ok: false });
-      publish(task.id, { kind: "error", message: fullMessage });
+      publish(task.id, { kind: "error", message: eventText });
     } finally {
       runningTasks.delete(task.id);
       cancelPending(task.id);

@@ -13,7 +13,8 @@
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
  *   - reuseAgent（开关、默认 false = 起新 agent、V0.6.27 语义反转）：想省 send 配额 / 要连续上下文时打开续用
- *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认 = settings.defaultModel、
+ *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认值 = 本 task 最近 action 实际
+ *       用的模型 → task.model → settings.defaultModel（沿用我在这个任务一直用的模型、不必每次重挑）、
  *       可以临时换 base + 调 thinking/effort 等 params；勾续用后本段隐藏、续接走 task.model
  *
  * 行为：
@@ -32,7 +33,7 @@
  *     之前 agent 挂掉重启时也没法换模型、只能去 settings 改全局再回来
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Loader2, Paperclip, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -245,6 +246,24 @@ export const AdvanceDialog = ({
   const batchProgress = useMemo(() => computeBatchProgress(task), [task]);
   const hasBatches = batchProgress.total > 0;
 
+  // dialog 打开时模型默认值的「task 派生部分」：优先本 task 最近一个 action 实际用的模型
+  //（沿用我在这个任务一直用的模型、不必每次推进都重挑 opus）、再回退 task.model；都没有返 undefined、
+  // 由 open-effect 当次再读最新 settings.defaultModel 兜底。只是 UI 默认值、不回写任何持久字段。
+  // settings 兜底放 effect 不放这里：getSettings 不是响应式、塞进 memo([task]) 会用到 stale settings
+  //（开 dialog 只触发 render、task 引用不一定变 → 拿不到刚改的设置页默认模型）（reviewAI P2）。
+  const defaultPickedModel = useMemo<ModelSelection | undefined>(() => {
+    const lastWithModel = [...task.actions]
+      .reverse()
+      .find((a) => a.agentModel?.id?.trim());
+    if (lastWithModel?.agentModel?.id?.trim()) return lastWithModel.agentModel;
+    if (task.model?.id?.trim()) return task.model;
+    return undefined;
+  }, [task]);
+  // 用 ref 持最新默认值：open-effect 只在「打开瞬间」读它、不进 effect 依赖——
+  // 否则 SSE 推 task（每次新引用）会让这个 memo 变、连带打回用户已改的表单（reviewAI 提醒）。
+  const defaultPickedModelRef = useRef(defaultPickedModel);
+  defaultPickedModelRef.current = defaultPickedModel;
+
   // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
   // 用户指令、选填——飞书/上下文都已带上、空也能跑
@@ -309,9 +328,10 @@ export const AdvanceDialog = ({
     // V0.6.25：每次打开重置 ship override（默认不绕过、需用户主动勾）
     setShipOverrideOn(false);
     setShipOverrideReason("");
-    // 默认 = settings.defaultModel（已经包含 params）、用户切别的 base 时 ModelPicker 会自动填默认 params
+    // 默认模型 = 本 task 最近 action 用的 → task.model（ref.current、打开瞬间最新、不进 deps 防 SSE 重置）
+    // → 当次 getSettings().defaultModel 兜底（含 params）。settings 在这里读、保证拿到最新设置页默认模型。
     const s = getSettings();
-    setPickedModel(s.defaultModel ?? { id: "" });
+    setPickedModel(defaultPickedModelRef.current ?? s.defaultModel ?? { id: "" });
     setGitConfig({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,

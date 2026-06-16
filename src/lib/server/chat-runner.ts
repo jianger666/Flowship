@@ -70,7 +70,7 @@ import {
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
-import { buildSdkErrorMessage } from "./sdk-error";
+import { summarizeRunFailure } from "./sdk-error";
 import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
@@ -259,7 +259,7 @@ const buildOpeningStanceSection = (
   const lines: string[] = [
     "## 起手姿势：先回答用户首条消息",
     "",
-    "下面是用户在 ai-flow UI 上发的第一条消息。你**第一次说话就把它回答完整**（结果 / 链接 / 结论写进正文、别只发『正在处理』就去 wait）、然后再调 wait_for_user 等下一句。",
+    "下面是用户在 ai-flow UI 上发的第一条消息。**要查代码 / 查资料才能答的、先查清楚再答**；查完把结果 / 链接 / 结论写成一条正文发出去（别只发『正在检索 / 正在处理』的预告就去 wait——那不是答案），然后才调 wait_for_user 等下一句。",
     "",
     "用户消息：",
     "",
@@ -338,9 +338,18 @@ const handleSdkMessage = async (
     case "tool_call": {
       await ctx.flush();
       const argsStr = stringifyMeta(msg.args);
-      // 区分 wait_for_user / 其他工具：wait_for_user 的成功调用不需要刷事件（notifier 已经处理 awaiting）
+      // SDK 把 MCP 工具包成 msg.name="mcp" + msg.args.toolName=真实工具名（mirror task-runner）
+      const argsAny = (msg.args ?? {}) as Record<string, unknown>;
+      const innerToolName =
+        typeof argsAny.toolName === "string" ? argsAny.toolName : "";
+      // 区分 wait_for_user / 其他工具：wait_for_user 的成功调用不刷事件（notifier 已处理 awaiting）。
+      // 必须连 MCP wrapper 一起认——漏认会把 wait_for_user 写成普通 tool_call、
+      // 被兜底 A 误当「答后又干活」拦下（2026-06-16 线上事故根因）。
       const isWaitForUser =
-        msg.name === "wait_for_user" || msg.name === "Wait For User";
+        msg.name === "wait_for_user" ||
+        msg.name === "Wait For User" ||
+        innerToolName === "wait_for_user" ||
+        innerToolName === "Wait For User";
       if (isWaitForUser) {
         if (msg.status === "error") {
           await writeEventAndPublish(taskId, {
@@ -354,7 +363,13 @@ const handleSdkMessage = async (
         await writeEventAndPublish(taskId, {
           kind: "tool_call",
           text: `调用 ${msg.name}${argsStr ? `: ${truncate(argsStr, 120)}` : ""}`,
-          meta: { name: msg.name, args: argsStr ? truncate(argsStr) : undefined },
+          // innerToolName 结构化落库：下游（兜底 A）据此精确识别 MCP 工具、
+          // 不再解析被 truncate 的展示文本（text.includes 太脆、会误伤 dogfood grep）
+          meta: {
+            name: msg.name,
+            innerToolName: innerToolName || undefined,
+            args: argsStr ? truncate(argsStr) : undefined,
+          },
         });
       } else if (msg.status === "error") {
         const resStr = stringifyMeta(msg.result);
@@ -418,6 +433,10 @@ export interface RunChatInput {
   model: ModelSelection;
   // 用户首条消息（绝大多数 chat 启动场景都有）、直接拼进 prompt
   firstMessage?: InitialUserMessage;
+  // 首条消息对应的 user_reply 事件 id（chat-reply 启 run 前已写、传进来）。
+  // 写进「Chat 任务启动」info 的 meta，让兜底 A 显式定位「本轮该回答的问题」、
+  // 不靠「user_reply 紧贴 chat_start 前一格」这种位置巧合（见 chat-mcp.classifyPrematureChatWait）。
+  firstMessageEventId?: string;
 }
 
 /**
@@ -428,7 +447,7 @@ export interface RunChatInput {
  * 让 agent 后台跑、HTTP 立即返回。
  */
 export const runChatSession = async (input: RunChatInput): Promise<void> => {
-  const { task, apiKey, model, firstMessage } = input;
+  const { task, apiKey, model, firstMessage, firstMessageEventId } = input;
 
   if (runningChats.has(task.id)) {
     return;
@@ -513,6 +532,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     await writeEventAndPublish(task.id, {
       kind: "info",
       text: `Chat 任务启动（model: ${model.id}、${mcpDesc}）`,
+      // 显式记下「触发本轮的首条消息事件」、供兜底 A 精确定位本轮回答义务（见 chat-mcp）
+      meta: firstMessageEventId ? { firstMessageEventId } : undefined,
     });
 
     // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
@@ -658,11 +679,15 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     if (hardTimer) clearTimeout(hardTimer);
     const message = err instanceof Error ? err.message : String(err);
     console.error("[chat-runner] task", task.id, "failed:", err);
-    // SDK 错误详情（code/cause/...）一并落到 event、跟 task-runner 对齐、下次能从 events 看根因
-    const fullMessage = buildSdkErrorMessage(message, err);
+    // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
+    // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
+    const failure = summarizeRunFailure(message, err);
+    const eventText = failure.isConnectionDrop
+      ? failure.text
+      : `Chat agent 异常：${failure.text}`;
     await writeEventAndPublish(task.id, {
       kind: "error",
-      text: `Chat agent 异常：${fullMessage}`,
+      text: eventText,
     });
     const errorTask = await setTaskRunStatus(task.id, "error");
     if (errorTask) publish(task.id, { kind: "task", task: errorTask });
@@ -672,7 +697,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       task: finalTask ?? task,
       ok: false,
     });
-    publish(task.id, { kind: "error", message });
+    publish(task.id, { kind: "error", message: eventText });
   } finally {
     runningChats.delete(task.id);
     unmarkTaskAsChat(task.id);

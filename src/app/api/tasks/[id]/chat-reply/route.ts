@@ -276,6 +276,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
       attachmentPaths:
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
     },
+    // 首条消息的 user_reply 事件 id（上面刚写）传给 runner、写进「Chat 任务启动」meta、
+    // 兜底 A 据此精确定位本轮回答义务、不靠位置巧合
+    firstMessageEventId: replyEvent?.id,
   }).catch((err) => {
     console.error(`[chat-reply] runChatSession task=${task.id} failed:`, err);
   });

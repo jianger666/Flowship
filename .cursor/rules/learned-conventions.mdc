@@ -186,6 +186,15 @@ alwaysApply: true
 - **工具 `inputSchema` 的 `.describe()` 是 agent 会读的「第二指令源」**——跟 prompt 冲突会把 agent 带偏。典型反例：`submit_mr` 的 `target_branch` describe 写「探 `origin/HEAD` 拿 master」、但 `action-ship.md` 写「写死 `test`」、两个矛盾指令可能让 agent 提 MR 到错误分支。
 - 改 prompt 里某工具的用法约定时、**一并核对该工具在 `chat-mcp.ts` 注册处的 describe**、别让两边漂移。
 
+## 不要把「用户偏好级」规则写死进产品 prompt（2026-06-16 用户拍板）
+
+- **语言（中文 / 英文）、语气、个人风格这类「用户偏好」不该硬编码进 `_super.md` / `_shared.md` / chat prompt**——用户的 Cursor 全局 user rule（`~/.cursor/rules/`）已经由 `skills-loader` / rulesSection 注入进 prompt 了（如「思考和回复永远用中文」就是从这来的）。写死 = 剥夺灵活性（万一有用户偏好英文呢）。
+- **判断闸门：「这是我们代码的 bug、还是用户偏好没传到 / 模型没遵守？」**
+  - 是**我们代码的 bug**（如全局规则压根没注入、注入顺序错、被截断）→ 修我们的代码。
+  - 是**用户偏好**（语言 / 风格）→ 不在产品 prompt 里写死、交给注入的 user rule 承载；模型在英文基座上下文里偶尔不遵守是模型层问题、不靠我们硬塞偏好来「治」。
+- 反例（2026-06-16 差点踩）：线上 task agent 旁白掉英文、本想往 `_super.md` 顶层加一条「所有 narration 永远中文」硬规则——被用户拦下：语言是偏好、全局 rule 已注入、不写死。
+- 推论：要提升注入的 user rule 的「权重 / 位置」（如 front-load）是**语言无关的中性改进**、可单独评估；但别把改进做成「专门写死某个具体偏好」。
+
 ## task-scoped handler / notifier 注销用 conditional unset（V0.6.1 踩过）
 
 - chat-mcp 的 `taskActionHandler` / `awaitingNotifier` 按 taskId 存单例 Map、force-new-agent 时新旧 agent 共享同一 key。

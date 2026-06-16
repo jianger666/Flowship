@@ -53,7 +53,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
-import type { ActionType, PlanBatch } from "../types";
+import type { ActionType, PlanBatch, TaskEvent } from "../types";
 import {
   SIGNALS,
   buildNextActionHead,
@@ -64,6 +64,11 @@ import {
   shellCurlRunSection,
   waitDisciplineSection,
 } from "./wait-protocol-prompt";
+import { readRecentEvents } from "./task-fs";
+import {
+  PREMATURE_CHAT_WAIT_EVENT_LIMIT,
+  classifyPrematureChatWait,
+} from "./premature-chat-wait";
 
 // ----------------- 配置 -----------------
 
@@ -267,8 +272,13 @@ interface ChatMcpGlobalState {
   // buildShellWaitGuidance 据此给 chat 一份「USER_REPLY 语境」的精简引导、
   // 不让 chat agent 看到一堆 task 专属信号（ACTION_ACK / NEXT_ACTION）而困惑。
   chatModeTasks: Set<string>;
+  // V0.8.x：chat「没发正文就想挂等」的连续拒绝计数（兜底 A、防死循环）。
+  // wait_for_user handler 检测到 premature wait（这一轮做了工具调用但没把答案写成正文）时 ++、
+  // 正常放行 / finalize 时清 0；达到上限就放行（宁可让对话继续、不死循环烧 token）。
+  prematureWaitRejects: Map<string, number>;
 }
 
+// V12：2026-06-16 加 prematureWaitRejects（chat「没发正文就挂等」兜底拦截的连续拒绝计数、防死循环）
 // V11：2026-06-14 V0.7.20 加 chatModeTasks（chat 模式 task 集合、buildShellWaitGuidance 据此给 chat 专属精简引导）
 // V10：2026-06-10 V0.6.31 加 unansweredRevises（revise 后 agent 跳过处理直入待命态的自动纠正）
 // V9：2026-06-05 V0.6.19 加 pendingNextActions（approve 后秒推 action 的 grace race 修复、挂起队列）
@@ -279,7 +289,7 @@ interface ChatMcpGlobalState {
 // V4：2026-05-14 删 keepaliveCounters（旧 keep_alive_a/b/c 序号轮转、shell long-poll 后不需要）
 // dev hot reload 不会清 globalThis、旧版字段名残留会让新代码拿到 undefined → TypeError
 // → bump 版本后缀强制让 dev 重启时拿到全新 state（旧版 state 留在内存等 GC）
-const GLOBAL_KEY = "__feAiFlowChatStateV11__";
+const GLOBAL_KEY = "__feAiFlowChatStateV12__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -295,6 +305,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       pendingNextActions: new Map(),
       unansweredRevises: new Map(),
       chatModeTasks: new Set(),
+      prematureWaitRejects: new Map(),
     };
   }
   return g[GLOBAL_KEY];
@@ -313,9 +324,55 @@ const unansweredRevises = getGlobalState().unansweredRevises;
 // V0.7.20：chat 模式 task 集合（见 ChatMcpGlobalState 注释）
 const chatModeTasks = getGlobalState().chatModeTasks;
 
+// V0.8.x 兜底 A：chat「没发正文就挂等」连续拒绝计数（见 ChatMcpGlobalState 注释 + detectPrematureChatWait）
+const prematureWaitRejects = getGlobalState().prematureWaitRejects;
+
+// 连续拒绝上限：超过就放行（宁可让对话继续、也不让模型死循环烧 token）。
+// 2 = 给模型「拒一次→补正文」的机会、第二次还不补就别拦了（极少数模型真不配合）。
+const PREMATURE_WAIT_REJECT_CAP = 2;
+
+// 兜底 A 拒绝时返回给 agent 的纠正文本（不给 curl / 不注册 pending entry——
+// 没有可挂等的 token、模型唯一出路就是先把答案写成正文、再重调 wait_for_user）。
+const PREMATURE_WAIT_REJECT_TEXT = [
+  "[ANSWER_FIRST] 还没把回答发给用户就想挂等——本次 wait_for_user 不予受理。",
+  "",
+  "你这一轮还没把回复作为一条**正文消息**发出去——用户那边现在看到的是**空白回复**。",
+  "（用户看不到你的 thinking、也看不到工具调用，只看得到你发出的正文。）",
+  "如果刚才做了检索 / 工具调用，更要先把结果 / 结论写出来。",
+  "",
+  "现在：先把这一问的完整答案（结果 / 代码 / 链接 / 结论）写成一条正文消息发出去，然后再调 `wait_for_user`。",
+].join("\n");
+
+/**
+ * 兜底 A 检测的 IO 包装：读最近事件喂给纯判定 classifyPrematureChatWait（见同名独立模块）。
+ * limit=0 读全量事件：chat 每轮 wait_for_user 才跑一次、events.jsonl 通常也就几百到几千行，
+ * 不值得为这点 IO 冒「长首轮把 runStart / firstMessage 挤出窗口」导致 fail-open 的风险。
+ * 读不到 / 解析异常一律 fail-open（返 false 不拦）——兜底逻辑不能反过来卡死正常对话。
+ */
+const isPrematureChatWaitOnce = async (taskId: string): Promise<boolean> => {
+  let events: TaskEvent[];
+  try {
+    events = await readRecentEvents(taskId, PREMATURE_CHAT_WAIT_EVENT_LIMIT);
+  } catch {
+    return false;
+  }
+  return classifyPrematureChatWait(events);
+};
+
+const detectPrematureChatWait = async (taskId: string): Promise<boolean> => {
+  // 第一次判不 premature → 直接放行
+  if (!(await isPrematureChatWaitOnce(taskId))) return false;
+  // 判 premature 时再给 250ms 复核：防「正文刚发出、flush 的 assistant_message 事件还没落盘」
+  // 的竞态把合法回答误判成 premature（wait_for_user 的 MCP 调用和事件落盘是并发的）。
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  return await isPrematureChatWaitOnce(taskId);
+};
+
 /** chat-runner 启动 chat session 时调：标记此 task 走 chat 等待引导（精简、USER_REPLY 语境）。 */
 export const markTaskAsChat = (taskId: string): void => {
   chatModeTasks.add(taskId);
+  // 新 session 起手清掉上次残留的 premature 拒绝计数（防上次 run 留下的计数误伤本轮）
+  prematureWaitRejects.delete(taskId);
 };
 
 /** chat session 结束 / task 清理时调：取消 chat 标记。 */
@@ -841,7 +898,14 @@ const buildMcpServer = (): McpServer => {
         "ai-flow 用这个工具发起一次「等用户」请求、本工具**立即返回一段 [SHELL_WAIT_GUIDE] 引导文本**、",
         "教你调 `shell` 工具用 curl 跟服务端 /api/tasks/:id/wait-ack 路由建长连接等结果。",
         "",
-        "## 硬性规则（不遵守、ai-flow runner 会把任务标 failed）",
+        "## 调用前提（按你所处模式自检、最常翻的车）",
+        "",
+        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id })`）**：本轮**已收到用户消息**时、调本工具前必须先把这一问的答案 / 结论写成**一条正文消息**发出去——只发『正在处理 / 正在检索』的预告、或只调了工具 / 跑了脚本却没写正文 = 用户看到的是**空白回复** = 还没回答。（chat 尤其常踩：查完代码直接挂等、忘了把结论写成正文。）本轮**无用户消息**（起手等第一句）时、可直接调。",
+        "- **Task 模式（action 容器）**：写完 artifact 就是交付、按下方 A / B 用法调本工具等 ack——**不必**再额外发一条总结正文（见下方「调用礼仪」）。",
+        "",
+        "> 下方「硬性规则 / 两种用法 / 调用礼仪」只适用于 **Task 模式**；**Chat 模式**只需守住上面那条「答完正文再 wait」、与 action / artifact / approve / runner failed 无关、别把 task 待命态规则套到 chat 上。",
+        "",
+        "## 硬性规则（task 模式、不遵守 ai-flow runner 会把任务标 failed）",
         "",
         "- **完成一个 action（写完 artifact）后必须调一次本工具**、shell 拿到 `[ACTION_ACK approve]` / `[ACTION_ACK revise]` 才能继续",
         "- **不调本工具 = action 没完成**、runner 在 run 结束时硬检测、有 action 状态不是 ack 一律标 failed",
@@ -885,6 +949,30 @@ const buildMcpServer = (): McpServer => {
       console.log(
         `[chat-mcp] wait_for_user 入参 task_id=${task_id} action_id=${action_id ?? "<待命>"} artifact_path=${artifact_path ?? "<none>"}`,
       );
+
+      // V0.8.x 兜底 A：仅 chat 模式 + 待命态（不带 action_id）才检测 premature wait。
+      // task 模式的 wait_for_user 是 action 内 ack（artifact 已落 = 已交付）、语义不同、不掺。
+      // premature = 这一轮做了工具调用但没把答案写成正文就想挂等 → 不给 curl、责令先发正文。
+      // 不注册 pending entry / 不通知 awaiting：模型没有可挂等的 token、唯一出路就是补正文再重调。
+      if (chatModeTasks.has(task_id) && !action_id) {
+        const rejected = prematureWaitRejects.get(task_id) ?? 0;
+        if (
+          rejected < PREMATURE_WAIT_REJECT_CAP &&
+          (await detectPrematureChatWait(task_id))
+        ) {
+          prematureWaitRejects.set(task_id, rejected + 1);
+          console.warn(
+            `[chat-mcp] wait_for_user 兜底拦截 premature wait：task=${task_id} 第 ${rejected + 1} 次（上限 ${PREMATURE_WAIT_REJECT_CAP}）`,
+          );
+          return {
+            content: [
+              { type: "text" as const, text: PREMATURE_WAIT_REJECT_TEXT },
+            ],
+          };
+        }
+        // 正常放行（或已达上限放弃拦截）→ 清计数、下一轮从头算
+        if (rejected > 0) prematureWaitRejects.delete(task_id);
+      }
 
       // V0.6.31 自动纠正：上一次 ack 是 revise 且 agent 还没闭环（没带原 action_id 回来）时——
       //   - 不带 action_id（实测踩坑姿势：agent 收到 revise 什么都不干直接退待命）→ 强制按原 action

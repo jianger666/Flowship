@@ -60,6 +60,7 @@ import {
 } from "@/components/ui/resizable";
 import { Separator } from "@/components/ui/separator";
 import { useDialog } from "@/hooks/use-dialog";
+import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 
 import { getSettings } from "@/lib/local-store";
@@ -119,6 +120,8 @@ const TaskDetailPage = () => {
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
+  // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
+  const { upsertTask } = useTaskList();
 
   // ---- 拉一次任务详情 ----
   const refresh = useCallback(async () => {
@@ -136,6 +139,24 @@ const TaskDetailPage = () => {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 把当前任务的关键状态同步进侧栏全局列表（任务 + 对话模式都经过这里）：
+  //  1) 你正在看的这个任务、侧栏的转圈 / 等你回复点实时准（不等轮询）
+  //  2) 让 useTaskList「知道」有任务在跑 → 触发它的条件轮询去刷后台其它任务
+  // 仅依赖影响侧栏展示 / 轮询触发的关键字段、不随 events 高频 setState 全列表重渲染
+  useEffect(() => {
+    if (task) upsertTask(task);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    task?.id,
+    task?.runStatus,
+    task?.repoStatus,
+    task?.currentActionId,
+    task?.title,
+    task?.pinned,
+    task?.archived,
+    task?.actions.length,
+  ]);
 
   // task.id 变化时清下 streamingText（防切 task 残留）
   useEffect(() => {

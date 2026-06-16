@@ -473,6 +473,21 @@ const readEvents = async (id: string): Promise<TaskEvent[]> => {
     .filter((x): x is TaskEvent => x !== null);
 };
 
+/**
+ * 读任务事件流的「最近 N 条」（chat-mcp 的 premature-wait 兜底检测用）
+ *
+ * 直接复用 readEvents 读全量再 slice 末尾——chat 的 wait_for_user 每轮才调一次（非热点）、
+ * events.jsonl 也就几百到几千行、解析成本可忽略。limit 限制返回条数、避免上层处理过多。
+ * limit <= 0 表示直接返回全量事件（用于需要完整轮次边界的协议兜底）。
+ */
+export const readRecentEvents = async (
+  id: string,
+  limit = 100,
+): Promise<TaskEvent[]> => {
+  const all = await readEvents(id);
+  return limit > 0 ? all.slice(-limit) : all;
+};
+
 const appendEventLine = async (
   id: string,
   ev: TaskEvent,
@@ -748,7 +763,8 @@ const runBootRecovery = async (): Promise<void> => {
       id: newEventId(),
       ts: Date.now(),
       kind: "error",
-      text: "[boot-recovery] Web 进程已重启、agent 上下文已丢失。点「推进」可重新启动 agent。",
+      // task / chat 共用：chat 没有「推进」按钮、用通用措辞（任务点推进 / 对话发消息都算「重新发起」）
+      text: "[boot-recovery] Web 进程已重启、agent 上下文已丢失。重新发起即可恢复。",
     };
     try {
       await appendEventLine(id, event);

@@ -3,25 +3,50 @@
 /**
  * 侧栏 / 欢迎页共用的「任务行」（V0.8 侧栏导航）
  *
- * 精简一行：状态色点 + 标题（truncate + hover tooltip 补全）+ 对话标记。
+ * 精简一行：行首指示 + 标题（truncate + hover tooltip 补全）。
  * 当前任务高亮（左侧强调竖条 + 底色）。行尾 hover 出「置顶 / 删除」操作；
  * 已置顶时置顶按钮常显高亮（既是状态标记、又是取消入口）。
- * 状态点语义来自 task-display.getTaskStatusDot（单一源）、这里只做 tone → 颜色 class 映射。
+ *
+ * 行首指示按 runStatus 三态切换（复用同一个槽位、不回到「满屏色点」）：
+ *  - running       → 转圈（多任务并行时一眼看出哪个 AI 在跑）
+ *  - awaiting_user → 琥珀色脉冲点（哪个在等我回复）
+ *  - idle / error  → 类型图标（对话气泡 / 任务清单）
+ * （error 不特殊标：shell long-poll 超时几乎必 error、标了反而噪声。）
  */
 
 import Link from "next/link";
-import { ListTodo, MessageCircle, Pin, Trash2 } from "lucide-react";
+import { ListTodo, Loader2, MessageCircle, Pin, Trash2 } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { TaskSummary } from "@/lib/types";
 
-// 行首类型图标（替代原状态色点、2026-06-15 用户反馈：满屏点是噪声）：
-// 对话 = 气泡、任务 = 清单。统一放行首、所有行左缘对齐。状态（运行 / 等你 ack 等）
-// 不再用侧栏色点表达、靠任务详情页 + 列表排序体现。
-const TaskTypeIcon = ({ mode }: { mode?: TaskSummary["mode"] }) => {
-  const Icon = mode === "chat" ? MessageCircle : ListTodo;
+// 行首指示：runStatus 优先（运行 / 等你回复）、否则回退类型图标。
+// 所有形态统一 size-3.5 占位、保证各行标题左缘对齐。
+const LeadingIndicator = ({ task }: { task: TaskSummary }) => {
+  // AI 正在跑：转圈
+  if (task.runStatus === "running") {
+    return (
+      <Loader2
+        className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+        aria-label="AI 运行中"
+      />
+    );
+  }
+  // 跑完等你 ack / 回复：琥珀脉冲点（注意力信号、跟运行中区分开）
+  if (task.runStatus === "awaiting_user") {
+    return (
+      <span
+        className="flex size-3.5 shrink-0 items-center justify-center"
+        aria-label="等待你回复"
+      >
+        <span className="size-2 animate-pulse rounded-full bg-amber-500" />
+      </span>
+    );
+  }
+  // 空闲 / 失败：类型图标（对话 = 气泡、任务 = 清单）
+  const Icon = task.mode === "chat" ? MessageCircle : ListTodo;
   return (
     <Icon className="size-3.5 shrink-0 text-muted-foreground/60" aria-hidden />
   );
@@ -64,8 +89,8 @@ export const TaskListItem = ({
             : "text-foreground/75 hover:bg-muted/50 hover:text-foreground",
         )}
       >
-        {/* 行首类型图标（对话 / 任务）——所有行左缘对齐 */}
-        <TaskTypeIcon mode={task.mode} />
+        {/* 行首指示：runStatus（运行中 / 等你回复）优先、否则类型图标——所有行左缘对齐 */}
+        <LeadingIndicator task={task} />
         {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
         <Tooltip content={task.title}>
           <span className="min-w-0 flex-1 truncate">{task.title}</span>
