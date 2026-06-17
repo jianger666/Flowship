@@ -30,6 +30,7 @@ import remarkGfm from "remark-gfm";
 import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
+import { Badge } from "@/components/ui/badge";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
@@ -50,7 +51,12 @@ import {
 } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
-import { ACTION_LABEL, ACTION_LABEL_EN } from "@/lib/task-display";
+import {
+  ACTION_LABEL,
+  ACTION_LABEL_EN,
+  ACTION_STATUS_LABEL,
+  ACTION_STATUS_VARIANT,
+} from "@/lib/task-display";
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
   JUMP_IDE_LABEL,
@@ -450,8 +456,20 @@ export const ArtifactPanel = ({
       {/* toolbar */}
       <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-4 text-xs">
         <div className="flex min-w-0 items-center gap-2 text-muted-foreground">
+          <Badge
+            variant={ACTION_STATUS_VARIANT[action.status]}
+            className="h-5 max-w-[150px] shrink-0 gap-1 px-1.5 text-[11px] font-normal"
+            title={`#${action.n} ${ACTION_LABEL[action.type]} · ${ACTION_STATUS_LABEL[action.status]}`}
+          >
+            <span className="font-mono text-[10px]">#{action.n}</span>
+            <span className="truncate">{ACTION_LABEL[action.type]}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="truncate">{ACTION_STATUS_LABEL[action.status]}</span>
+          </Badge>
           <FileText className="size-3.5 shrink-0" />
-          <span className="truncate">{currentArtifact.filename}</span>
+          <span className="truncate" title={currentArtifact.filename}>
+            {currentArtifact.filename}
+          </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <ChoiceButton
@@ -553,7 +571,7 @@ export const ArtifactPanel = ({
                   </span>
                 </div>
               )}
-            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
+            <div className="prose prose-sm dark:prose-invert max-w-[80ch] prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm, remarkKeepTrailingUnderscore]}
                 components={markdownComponents}
