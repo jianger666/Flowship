@@ -173,7 +173,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
       });
       onSaved(updated);
       onOpenChange(false);
-      toast.success("任务已更新");
     } catch (err) {
       toast.error(`更新失败：${(err as Error).message}`);
     } finally {

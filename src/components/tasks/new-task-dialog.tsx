@@ -276,7 +276,6 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,
       });
-      toast.success(mode === "chat" ? "已创建对话" : "任务已创建");
       setOpen(false);
       onCreated(task);
     } catch (err) {

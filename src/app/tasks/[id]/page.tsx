@@ -427,7 +427,6 @@ const TaskDetailPage = () => {
       setSelectedActionId(data.action.id);
       setAdvanceDialogOpen(false);
       setWatchEpoch((n) => n + 1);
-      toast.success(`已推进、agent 跑 ${ACTION_LABEL[input.actionType]} action`);
     } catch (err) {
       toast.error(`推进失败：${(err as Error).message}`);
     } finally {
@@ -442,9 +441,6 @@ const TaskDetailPage = () => {
     try {
       const updated = await submitActionAck(task.id, currentAction.id, "approve");
       setTask(updated);
-      toast.success(
-        `${ACTION_LABEL[currentAction.type]} 已通过、agent 在等下一指令`,
-      );
     } catch (err) {
       toast.error(`通过失败：${(err as Error).message}`);
     } finally {
@@ -468,10 +464,6 @@ const TaskDetailPage = () => {
       );
       setTask(updated);
       setReviseOpen(false);
-      const suffix = images && images.length > 0 ? `（含 ${images.length} 张图）` : "";
-      toast.success(
-        `已发给 AI${suffix}、它会调整 ${ACTION_LABEL[currentAction.type]} 的产出`,
-      );
     } catch (err) {
       toast.error(`提交失败：${(err as Error).message}`);
     } finally {
@@ -494,7 +486,6 @@ const TaskDetailPage = () => {
     try {
       const updated = await stopTask(task.id);
       setTask(updated);
-      toast.success("已停止、agent 已中断");
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
@@ -528,7 +519,6 @@ const TaskDetailPage = () => {
       setTask(updated);
       setSelectedActionId(action.id);
       setWatchEpoch((n) => n + 1);
-      toast.success(`已重启当前 ${ACTION_LABEL[action.type]} 阶段`);
     } catch (err) {
       toast.error(`重启失败：${(err as Error).message}`);
     } finally {
@@ -556,7 +546,6 @@ const TaskDetailPage = () => {
         !action.excluded,
       );
       setTask(updated);
-      toast.success(action.excluded ? "已恢复" : "已划除");
     } catch (err) {
       toast.error(`操作失败：${(err as Error).message}`);
     }
@@ -580,7 +569,7 @@ const TaskDetailPage = () => {
     try {
       const updated = await finalizeTask(task.id, finalStatus);
       setTask(updated);
-      toast.success(finalStatus === "merged" ? "任务已标记合入" : "任务已放弃");
+      if (finalStatus === "abandoned") toast.success("任务已放弃");
     } catch (err) {
       toast.error(`终结失败：${(err as Error).message}`);
     } finally {
@@ -602,7 +591,6 @@ const TaskDetailPage = () => {
     try {
       const updated = await reopenTask(task.id);
       setTask(updated);
-      toast.success("任务已恢复、可继续推进");
     } catch (err) {
       toast.error(`恢复失败：${(err as Error).message}`);
     } finally {

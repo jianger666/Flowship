@@ -25,7 +25,8 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => {
       <body className="h-screen overflow-hidden bg-background text-foreground antialiased">
         <Providers>
           <AppShell>{children}</AppShell>
-          <Toaster position="top-right" />
+          {/* Windows 右上角是系统窗口按钮区域，toast 放 top-center 并下移到 56px 标题栏下方。 */}
+          <Toaster position="top-center" offset={64} />
         </Providers>
       </body>
     </html>

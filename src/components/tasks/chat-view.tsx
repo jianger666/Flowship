@@ -136,7 +136,6 @@ export const ChatView = ({
       const latest = await stopTask(task.id);
       setStreamingText(""); // 清掉打字机 placeholder、避免半截 streaming 残留
       onTaskUpdateRef.current(latest);
-      toast.success("已停止");
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
