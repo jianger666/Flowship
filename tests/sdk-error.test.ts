@@ -13,8 +13,9 @@ import { describe, expect, it } from "vitest";
 
 import { summarizeRunFailure } from "@/lib/server/sdk-error";
 
+// 「裸 status=error 无诊断」友好文案（连接断 / 额度用完无法区分、兼列两种原因）
 const DROP_TEXT =
-  "长连接已断开——通常是等待太久、网络/代理中断或电脑休眠导致，不是任务本身出错，重新发起本轮通常可恢复。";
+  "本轮异常结束——可能是长连接断开（等待太久 / 网络·代理中断 / 电脑休眠），也可能是 Cursor 额度·用量已用完。请先确认账号额度；额度正常多为连接断开、重新发起本轮通常可恢复。";
 
 // task-runner 抛的裸 error：status=error + run 元数据 dump、无任何诊断段
 const taskBareDrop =
@@ -25,6 +26,16 @@ describe("summarizeRunFailure", () => {
     const r = summarizeRunFailure(taskBareDrop, new Error(taskBareDrop));
     expect(r.isConnectionDrop).toBe(true);
     expect(r.text).toBe(DROP_TEXT);
+    // detail 始终保留原始诊断（连接断 / 额度时 text 是友好文案、但原始 dump 不丢、落 meta 供排查）
+    expect(r.detail).toContain("status=error");
+    expect(r.detail).toContain("SDK result dump");
+  });
+
+  it("1b. detail：非连接断（有诊断）时 detail 等于 text", () => {
+    const msg = "agent run status=error: model overloaded";
+    const r = summarizeRunFailure(msg, new Error(msg));
+    expect(r.isConnectionDrop).toBe(false);
+    expect(r.detail).toBe(r.text);
   });
 
   it("2. status=expired 同样算长连接被断（后端回收久挂 run）", () => {

@@ -2283,6 +2283,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         kind: "error",
         actionId: action.id,
         text: eventText,
+        // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
+        meta: { detail: failure.detail },
       });
       const errored = await getTask(task.id);
       publish(task.id, { kind: "done", task: errored ?? task, ok: false });

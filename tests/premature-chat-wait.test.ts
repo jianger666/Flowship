@@ -210,4 +210,95 @@ describe("classifyPrematureChatWait", () => {
     );
     expect(classifyPrematureChatWait([um, start, ...tools])).toBe(true);
   });
+
+  // ---- 「纯宣告 / 预告」回归（2026-06-16 线上事故 + reviewAI 拍板的 case 表）----
+  it("15. 事故原句：生成型任务发了「我先写…写完后进入等待」就挂等 → 拦(true)", () => {
+    const um = ev("user_reply", "来个1000字文章");
+    const start = chatStartWithFirstMsg(um.id);
+    const announce = ev(
+      "assistant_message",
+      "主题未指定，我先写一篇约千字、与 AI 时代思考相关的文章；写完后进入等待你的下一条消息。",
+    );
+    expect(classifyPrematureChatWait([um, start, announce])).toBe(true);
+  });
+
+  it("15a. 反例：「我先给你结论：可以」缺延后语义、是已交付的答案 → 放行(false)", () => {
+    const um = ev("user_reply", "这个方案行不行？");
+    const start = chatStartWithFirstMsg(um.id);
+    const ans = ev("assistant_message", "我先给你结论：可以。");
+    expect(classifyPrematureChatWait([um, start, ans])).toBe(false);
+  });
+
+  it("15b. 反例：真把长文写出来了（超长度阈值）→ 放行(false)", () => {
+    const um = ev("user_reply", "来个1000字文章");
+    const start = chatStartWithFirstMsg(um.id);
+    // 真·成品：远超 120 字、不命中任何宣告档
+    const article = ev(
+      "assistant_message",
+      "在答案唾手可得的时代，我们还需要自己思考吗？".repeat(20),
+    );
+    expect(classifyPrematureChatWait([um, start, article])).toBe(false);
+  });
+
+  it("15c. 反例：澄清式提问（无计划词）→ 放行(false)", () => {
+    const um = ev("user_reply", "来个1000字文章");
+    const start = chatStartWithFirstMsg(um.id);
+    const ask = ev("assistant_message", "主题想写什么？科幻 / 职场 / AI 都可以。");
+    expect(classifyPrematureChatWait([um, start, ask])).toBe(false);
+  });
+
+  it("15d. 「我马上查一下」（计划+交付动词+未完成）→ 拦(true)", () => {
+    const um = ev("user_reply", "这个 bug 在哪？");
+    const start = chatStartWithFirstMsg(um.id);
+    const announce = ev("assistant_message", "我马上查一下。");
+    expect(classifyPrematureChatWait([um, start, announce])).toBe(true);
+  });
+
+  it("15e. 反例：「我在这等你」不含内部机制词 → 放行(false)", () => {
+    const um = ev("user_reply", "你先等我一下");
+    const start = chatStartWithFirstMsg(um.id);
+    const ans = ev("assistant_message", "好的，我在这等你。");
+    expect(classifyPrematureChatWait([um, start, ans])).toBe(false);
+  });
+
+  it("15e2. 对照：「我在这挂等」命中内部机制强信号 → 拦(true)", () => {
+    const um = ev("user_reply", "你先等我一下");
+    const start = chatStartWithFirstMsg(um.id);
+    const ans = ev("assistant_message", "好的，我在这挂等你的下一条。");
+    expect(classifyPrematureChatWait([um, start, ans])).toBe(true);
+  });
+
+  it("15f. 关键护栏：先交付长文、末尾再附一句礼貌等待句 → 放行(false)", () => {
+    const um = ev("user_reply", "来个1000字文章");
+    const start = chatStartWithFirstMsg(um.id);
+    const article = ev(
+      "assistant_message",
+      "这是一篇完整文章的正文内容，洋洋洒洒讲清楚了主题。".repeat(10),
+    );
+    // 末尾礼貌句即便单看像宣告、也因为本轮已有实质正文而不该拦
+    const polite = ev("assistant_message", "你可以继续发下一条。");
+    expect(classifyPrematureChatWait([um, start, article, polite])).toBe(false);
+  });
+
+  it("15g. 反例(P1)：chat 里答 curl 接口示例、裸 curl 不算内部机制信号 → 放行(false)", () => {
+    const um = ev("user_reply", "给我一个 curl 调接口示例");
+    const start = chatStartWithFirstMsg(um.id);
+    const ans = ev(
+      "assistant_message",
+      '可以用 curl -H "Authorization: Bearer TOKEN" https://api.example.com 调接口。',
+    );
+    expect(classifyPrematureChatWait([um, start, ans])).toBe(false);
+  });
+
+  it("15h. P1：答→查→查完只发一句纯宣告（没补实质成品）→ 拦(true)", () => {
+    const um = ev("user_reply", "这块逻辑怎么实现的？");
+    const start = chatStartWithFirstMsg(um.id);
+    const ans = ev("assistant_message", "初步看是走了 A 分支。");
+    const grep = shellEvent("rg A分支 src");
+    // 纯宣告不能刷新「有效回答」位置、否则会绕过「答后又查没回报」
+    const announce = ev("assistant_message", "我再整理一下、稍后给你完整结论。");
+    expect(classifyPrematureChatWait([um, start, ans, grep, announce])).toBe(
+      true,
+    );
+  });
 });

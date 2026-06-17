@@ -21,6 +21,10 @@ export const extractSdkErrorBits = (err: unknown): Record<string, unknown> => {
     }
     if (typeof e.status === "number") bits.status = e.status;
     if (typeof e.requestId === "string") bits.requestId = e.requestId;
+    // CursorSdkError 还挂了 endpoint / operation / isRetryable——一并收、便于区分认证 / 限流 / 网络
+    if (typeof e.endpoint === "string") bits.endpoint = e.endpoint;
+    if (typeof e.operation === "string") bits.operation = e.operation;
+    if (typeof e.isRetryable === "boolean") bits.isRetryable = e.isRetryable;
     if (e.cause instanceof Error) {
       bits.causeName = e.cause.name;
       bits.causeMessage = e.cause.message;
@@ -95,15 +99,28 @@ const dumpHasDiagnostic = (rawMessage: string): boolean => {
 };
 
 export interface RunFailureSummary {
-  // 落事件流的文案：连接断时是友好提示、否则是带详情的原始错误串
+  // 落事件流的文案：连接断 / 额度时是友好提示、否则是带详情的原始错误串
   text: string;
-  // 是否「长连接被断」类——调用方据此决定要不要加「失败 / 异常」前缀
+  // 是否「裸 status=error 无诊断」类（连接断 or 额度用完、二者 SDK 层无法区分）——
+  // 调用方据此决定要不要加「失败 / 异常」前缀
   isConnectionDrop: boolean;
+  // 完整原始诊断串（message + SDK 字段、始终算出）。连接断 / 额度时 text 是友好文案、
+  // 但 detail 仍保留原始——调用方落进 error event 的 meta、事后可从 events.jsonl 直接定位、
+  // 不必翻 app console。这也是排查「额度 vs 连接断」唯一能留下的线索（SDK 公开 API 不暴露 errorCode）。
+  detail: string;
 }
 
+// 「裸 status=error 无诊断」的友好文案。
+// 关键事实（2026-06-16 实测 + 调研 @cursor/sdk 1.0.17）：run.wait() 的 RunResult / stream 的
+// SDKStatusMessage / 公开 getRun 返回的 Run 都**不暴露 errorCode**——额度用完和长连接断在 SDK 公开层
+// 返回完全一样（裸 status=error、message/result 空）、服务端无法区分。所以文案兼列两种最常见原因、
+// 引导用户自行确认额度、不把额度用完误导成纯网络问题。
+const BARE_RUN_DROP_TEXT =
+  "本轮异常结束——可能是长连接断开（等待太久 / 网络·代理中断 / 电脑休眠），也可能是 Cursor 额度·用量已用完。请先确认账号额度；额度正常多为连接断开、重新发起本轮通常可恢复。";
+
 /**
- * 把 run 失败归一成「给用户看的事件文案」。
- * - 长连接被断（裸 status=error/expired + 无任何诊断）→ 友好一句话、不加吓人前缀
+ * 把 run 失败归一成「给用户看的事件文案」+ 始终算出的原始 detail。
+ * - 裸 status=error 无诊断（连接断 / 额度用完、SDK 层无法区分）→ 友好一句话、不加吓人前缀
  * - 其它（有诊断）→ 复用 buildSdkErrorMessage 的详情串、调用方自行加「失败 / 异常」前缀
  */
 export const summarizeRunFailure = (
@@ -111,23 +128,18 @@ export const summarizeRunFailure = (
   err: unknown,
 ): RunFailureSummary => {
   const bits = extractSdkErrorBits(err);
-  // 三道闸全过才算长连接被断：①裸 status 形态 ②err 无 code/cause（保守：有 code 先当真错留详情、
-  // 含 14 UNAVAILABLE / 4 DEADLINE 这类「其实也是连接断」会走详情分支、属可接受 false-negative）
-  // ③dump 里没塞诊断字段。误吞比漏报更伤、所以宁可少判连接断、不可吞掉 RCA 线索。
+  // 始终算原始诊断、落 meta（连接断 / 额度时 UI 显示友好文案、但原始细节不丢）
+  const detail = buildSdkErrorMessage(rawMessage, err);
+  // 三道闸全过才算「裸 status=error 无诊断」：①裸 status 形态 ②err 无 code/cause（保守：有 code
+  // 先当真错留详情、含 14 UNAVAILABLE / 4 DEADLINE 这类会走详情分支、属可接受 false-negative）
+  // ③dump 里没塞诊断字段。误吞比漏报更伤、所以宁可少判、不可吞掉 RCA 线索。
   const isConnectionDrop =
     BARE_RUN_DROP_RE.test(rawMessage) &&
     Object.keys(bits).length === 0 &&
     !dumpHasDiagnostic(rawMessage);
   if (isConnectionDrop) {
-    return {
-      isConnectionDrop: true,
-      // 文案简洁原则：是什么 + 大概为啥 + 怎么恢复、一行说清、不展开技术细节（dump 仍进 console）。
-      // 「通常可恢复」不写死「即可恢复」——resume 可能因后端已清 run 失败、不过度承诺（reviewAI P2）。
-      text: "长连接已断开——通常是等待太久、网络/代理中断或电脑休眠导致，不是任务本身出错，重新发起本轮通常可恢复。",
-    };
+    // 「通常可恢复」不写死「即可恢复」——resume 可能因后端已清 run 失败、不过度承诺（reviewAI P2）。
+    return { isConnectionDrop: true, text: BARE_RUN_DROP_TEXT, detail };
   }
-  return {
-    isConnectionDrop: false,
-    text: buildSdkErrorMessage(rawMessage, err),
-  };
+  return { isConnectionDrop: false, text: detail, detail };
 };

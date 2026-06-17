@@ -304,29 +304,23 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### v0.8.1：自更新防残缺包 + 发版改 draft 流程（修 v0.8.0 自更新事故）（2026-06-15）
+### v0.8.3：ask_user 逐题贴图 + chat 流式自动滑底 + announce-then-wait 防漏 + ask-reply race 加固（2026-06-16）
 
-v0.8.0 发版当场踩了自更新事故：旧 `release.yml` 先建 **published** 占位 release → 用户 app 在 dmg/yml 还没传完时就 `fetchLatestVersion` 查到新版 → mac 自更新下到残缺 dmg（只 1.78MB）→ `ditto` 拷残缺文件报 `Unknown error 1000`、且残缺 dmg 被 `hdiutil attach` 挂成坏卷没卸干净 → Finder 扫描坏卷 I/O 卡死。并发 publish 还撞出 **0 字节 `latest.yml`**（win electron-updater 全靠它、win 同事自更新挂）。
+- **ask_user 弹窗逐题贴图（仅自定义回答能带图、用户拍板）**：每道题抽 `AskQuestionItem` 子组件、各 call 一次 `useImageAttach`（hook 不能在 `questions.map` 里循环调、故按子组件拆）、各绑各的图。附图按钮 / 缩略图 / 粘贴 / 拖拽整体收进「自定义回答」区——选固定选项（A/B/C）就隐藏且上报空图（图 state 不清、再切回自定义会重现、不丢用户已贴的图）。后端 `ask-reply/route.ts` 收 `imagesByQuestion`、按 questionId 白名单过滤（防客户端塞无关 key）、单题 ≤6 / 合计 ≤12、**先校验后落盘**（确认 agent 还在等才写、避免僵尸态留孤儿文件）、`buildReplyText` 每题 A 行下内联「本题附图：<basename>」做归属、`meta.images` 扁平给前端 `extractUserReplyImages` 渲缩略图、`allAbsPaths` 透传 agent（文末 `[ATTACHED_IMAGES]`）。图-only（只贴图不填字）也算已答。
+- **chat 流式回复自动滑底（修）**：根因——react-virtuoso `followOutput` 只在 data **条数**变化触发、流式是往同一个 `__streaming__` 虚拟 item 追加 text、条数不变（始终 merged.length+1）→ 增长期间不滚。修：`atBottomRef`（Virtuoso `atBottomStateChange` 维护「用户是否贴底」）+ `useEffect([streamingText, items.length])` 贴底时 `scrollToIndex(last, align:"end", behavior:"auto")` + `atBottomThreshold={120}`（默认仅 4px、太敏感、单 chunk 增高就被判离底自废）。EventStream 是 chat / task 共用组件、两边都受益。
+- **chat「宣告计划当正文」announce-then-wait 防漏（7 处文案、task 协议 + 硬闸逻辑不动）**：composer-2.5 实测把「我先写一篇 X、写完后再等」这种**计划宣告**当成回答、文章一字没写就直接挂等。把「预告」从「只举查询型（正在检索 / 让我看看）」**泛化**成「任何只宣告要做、不含成品的话都是预告」；交付用「**本轮成品 / 可用分段**」措辞（不逼一条写完整任务、不压制合理分多轮）。同步 7 处（含离每轮最近的 `CHAT_REPLY_REMINDER`、wait_for_user 工具 description、硬闸拒绝文案）。经 reviewAI 多轮确认范围限 chat。
+- **chat 纯宣告硬闸（announce-then-wait 第二刀、reviewAI 拍板极窄启发式）**：上一刀（7 处文案）实测对 composer-2.5 仍漏——它「知道规则却执行时跳步」、发一句「我先写…进入等待你的下一条」当正文就直接 curl 挂等、命中硬闸「有正文就放行」分支没拦住（原判定只看「有没有正文」、不看是「宣告」还是「成品」）。纯 prompt 兜不住执行层、在 `premature-chat-wait.ts` 加 `isPureAnnouncement` 窄判定（两档：**强信号**=短正文含内部等待机制词「进入等待 / 挂等 / wait_for_user / 监听你下一」、**不收裸 curl** 防误伤「curl 调接口示例」类技术问答；**组合信号**=短正文同时命中「将来式计划 + 交付动词 + 延后/未完成语义」三件套缺一不算、区分「我先给你结论：可以」（已交付不拦）vs「我先写…写完后再发」（未交付拦））。判定拆 `lastSubstantiveAnswerIdx`：纯宣告不刷新「有效回答」位置、防「答→查→只发个宣告」绕过「答后又查没回报」。误拦靠既有 `CAP=2` 兜底。chat 起手顶部加一句 blockquote 铁律（计划 / 预告 / 等待说明都不是交付物）、waitDiscipline 核心段不动。+10 回归单测。经 reviewAI 两轮 review（揪出裸 curl 误拦 + 纯宣告刷新位置 2 个 P1、已修）终审通过。
+- **ask-reply 后端 race 加固（2 个 P1、reviewAI 提）**：① **重排**「先 `submitAskReply` 成功、再写 ask_user_reply 事件 + publish + 切 running」——旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时用户已看到「已答」但 agent 没收到（假已答）；② pending 校验**从 task 级升到 token 级**：`submitAskReply` 加 `expectedToken`、新增 `hasPendingToken(taskId, token)`、route 从 ask_user_request 事件 `meta.token` 取——防旧弹窗答案串进被 force-new-agent / 顶替换掉的新 pending。
+- 验证：typecheck + lint 全绿、vitest 118 全过、3 步打包 + test（8776）端到端验证。
 
-- **mac 自更新加 dmg 完整性校验（`main.js` `macSelfUpdate`）**：下载后比对 `content-length`、`got !== total` 直接 throw——在 `hdiutil attach` / `rename appPath` **之前**拦掉、残缺包根本不碰 app（旧逻辑下完直接 ditto、拷到一半才炸、那时旧 app 已被挪走）。
-- **发版改 draft 流程（`release.yml`）**：① build-release 占位建 **draft**（electron-builder `getOrCreateRelease` 优先复用匹配 tag 的 draft、源码 `if(release.draft) return release`）② matrix `max-parallel: 1` 串行打包（防并发 overwrite asset 撞出 0KB yml）③ 新增 **finalize job**（win/mac 全传完才把 draft→published）。draft 期间 `/releases/latest` 不指向它、自更新查不到 → 杜绝「asset 没传完就被下到残缺」；任一平台挂就留 draft、不对外发半成品。
-- 功能同 v0.8.0（侧栏导航）、纯发版链路 + 自更新加固的 hot-fix。
+### v0.8.2：侧栏任务状态 + wait_for_user 误拦修复 + 长连接友好文案 + 重启模型保持（2026-06-16）
 
-### v0.8.0：侧栏任务导航（列表搬进常驻侧栏、多任务秒切）（2026-06-15）
-
-痛点：首页是任务大列表、切任务必须「详情 → 返回 `/` → 进另一个」、多任务并行来回切累。改成 ChatGPT / Cursor 式常驻左侧栏：点侧栏即切任务、可展开 / 收起（收起宽度归零、复杂详情页不被遮挡）。用 `ui-ux-pro-max` + `frontend-design` skill 辅助（落实当前项高亮 / 键盘可达 / push 不遮挡 / 视觉克制）。
-
-- **应用外壳 `AppShell`（新 `app-shell.tsx`）**：包「顶栏 + 侧栏 + 主区」、持侧栏开合态（localStorage `fe-ai-flow:sidebar-open` 记忆）+ `⌘/Ctrl+B` 切换（焦点在输入框时让行）+ 路由切换主区归顶。`layout.tsx` 用它取代旧「header + main」、body `h-screen overflow-hidden`（整体不滚、滚动交给主区）。
-- **侧栏 `AppSidebar`（新 `app-sidebar.tsx`）**：顶部「新建任务」实色按钮 + 类型筛选（`ListFilter` 图标点开 Popover 选「全部 / 任务 / 对话」、localStorage 记忆）；列表分「置顶（pin）/ 活跃（updatedAt 倒序）/ 更早（archived 折叠、默认收起）」；行尾 hover「置顶 / 删除」（删除二次确认 + 乐观移除 + 删当前任务回首页）。`open ? w-64 : w-0` 过渡 push 主区。
-- **共享列表 `useTaskList`（新 `use-task-list.tsx`）**：侧栏 + 各页面共享 `TaskSummary[]`、`refresh`（mount + window focus）/ `upsertTask`（新建即时插入 / 状态同步、Task 自动收窄 Summary 剔除 events）/ `removeTask`（乐观）。挂 `providers.tsx`。
-- **任务行 `TaskListItem`（新）**：侧栏 / 欢迎页共用、一行 = 行首**类型图标**（对话 = 气泡 `MessageCircle` / 任务 = 清单 `ListTodo`、所有行左缘对齐）+ 标题 truncate（hover `Tooltip` 补全长标题）+ 行尾 hover 操作（置顶 `Pin` / 删除）、当前任务高亮（左 primary 竖条 + 底色）。**状态不再用色点表达**（2026-06-15 用户反馈：开发中是常态、满屏色点是噪声、且 shell 保活超时几乎每个任务最终落 error 标红误导）——`getTaskStatusDot` / `TaskStatusDot` 已删。
-- **置顶 pinned（全栈）**：`Task.pinned`（types + `task-fs` schema/hydrate + PATCH `/api/tasks/[id]` + `setTaskPinned` client），侧栏置顶组排最前。
-- **类型筛选**：侧栏顶部 `ListFilter` 图标点开 `Popover` 下拉选「全部 / 任务 / 对话」（状态 localStorage 记忆、非「全部」时图标高亮 + 列表顶部显示当前类型标题 +「清除筛选」），避免用户以为任务丢了。
-- **新增 `Tooltip` 组件**（`ui/tooltip.tsx`、base-ui、长标题 hover 补全）。
-- **首页 `/` → 欢迎页**：删大列表（在侧栏）、改 hero（一句定位 + 新建 CTA + 继续最近、logo 柔和光晕 `/8`）+ 最近任务入口。
-- **去手动归档**：首页「已归档」视图 + `TaskCard` 整个组件删、归档退化为侧栏「更早」折叠（沿用后端 7 天 auto-archive、不再让用户手动操心）。
-- **顶栏 / 详情页适配**：侧栏展开 / 收起 toggle 常驻**顶栏红绿灯右侧**（`app-header.tsx`、位置固定不随开合跳）+ scrolled 改外壳传入；详情页 task + chat 两模式去 `h-[calc(100vh-3.5rem)]` 改 `h-full`、去冗余「返回」按钮（侧栏常驻 + logo 已能回首页、对标 ChatGPT/Cursor）；`LoadingState` block 同步去 calc。
-- 验证：typecheck + lint 全绿 + 3 步打包（`BUILD_STANDALONE=1 pnpm build` → `assemble-electron-server.mjs` → `electron:dist:test`）+ test 包（8776）端到端验证。
+- **侧栏任务运行态指示**：任务列表显示 running 转圈 / awaiting_user 脉冲点（`task-list-item.tsx`）+ 条件轮询实时更新（`use-task-list.tsx`、切到 B 也能看到 A 的状态）。
+- **wait_for_user 误拦两层修复**：chat-runner 认 MCP wrapper 包的 wait_for_user（从 `msg.args` 提 innerToolName、mirror task-runner）、`premature-chat-wait.ts` 结构化识别握手工具（不再靠展示文本子串、wait-ack 用 `curl` + `/api/tasks/` + `/wait-ack` 三条件）+ 全量读事件（limit=0 防长首轮 fail-open）+ 22 单测。
+- **长连接断开友好文案**：长连接被断（status=error / expired 无诊断）→ 事件流换「长连接已断开」友好提示、有诊断的错照旧展详情、dump 仍进 console（`sdk-error.ts` `summarizeRunFailure` + 13 单测）。
+- **boot-recovery 文案通用化**：task / chat 共用「重新发起即可恢复」（不再提「推进」、自由模式不合理）。
+- **prompt 全局规则 front-load**：`_super.md` 把注入的用户全局规则段前移、提升权重（修「task 模式回英文」、语言无关、不写死永远中文）。
+- **重启 action 用实跑模型**：`restartCurrentActionInner` 用 `action.agentModel`（不再掉回创建默认 composer）+ 老数据回填 agentModel（effectiveStartTask/Action 一致返回）；`advance-dialog` 默认沿用本 task 最近 action 实跑模型（settings fallback 移回 open-effect 当次读、不 stale）。
 
 ---
 

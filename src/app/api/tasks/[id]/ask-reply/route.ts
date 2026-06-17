@@ -12,25 +12,39 @@
  *   askId: string;
  *   answers: Array<{ questionId, answer, optionId? }>;
  *   deferred?: boolean;
+ *   // V0.8.3：每道题各自绑各自的图（key=questionId）。图-only（不填文字只贴图）也算已答。
+ *   imagesByQuestion?: Record<string, Array<{ data, mimeType, filename }>>;
  * }
  * ```
  *
  * # 行为
  *
  * 1. 校验 task / askId / 没被答过 / pending 状态
- * 2. 拼接 [ASK_USER_REPLY] 或 [ASK_USER_REPLY deferred] markdown 文本
- * 3. submitAskReply 解 agent 的 ask_user
- * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred）+ publish SSE
+ * 2. 逐题落盘各自的图、拼接 [ASK_USER_REPLY] 文本（每题答案下内联「本题附图：<basename>」做归属）
+ * 3. submitAskReply 解 agent 的 ask_user、把全部图绝对路径汇总透传（文末自动拼 [ATTACHED_IMAGES]）
+ * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred + images 扁平数组给前端渲缩略图）+ publish SSE
  * 5. 切 runStatus = running
  */
 
+import path from "node:path";
+
 import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
-import { appendEvent, getTask, setTaskRunStatus } from "@/lib/server/task-fs";
-import { hasPending, submitAskReply } from "@/lib/server/chat-mcp";
+import {
+  appendEvent,
+  getTask,
+  saveImageAttachments,
+  setTaskRunStatus,
+} from "@/lib/server/task-fs";
+import type {
+  ImageAttachmentInput,
+  ImageAttachmentSaved,
+} from "@/lib/server/task-fs";
+import { hasPending, hasPendingToken, submitAskReply } from "@/lib/server/chat-mcp";
 import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import {
   errorResponse,
   KEEPALIVE_RACE_RETRY_MS,
+  parseAndValidateImages,
   sleep,
 } from "@/lib/server/route-helpers";
 
@@ -44,11 +58,22 @@ interface AnswerPayload {
   optionId?: string;
 }
 
+interface RawImagePayload {
+  data?: string;
+  mimeType?: string;
+  filename?: string;
+}
+
 interface PostBody {
   askId?: string;
   answers?: AnswerPayload[];
   deferred?: boolean;
+  imagesByQuestion?: Record<string, RawImagePayload[]>;
 }
+
+// 单题最多附 6 张图；全部题加起来最多 12 张（防一次答超多题各塞满图把 agent context 撑爆）
+const MAX_IMAGES_PER_QUESTION = 6;
+const MAX_IMAGES_TOTAL = 12;
 
 export const runtime = "nodejs";
 
@@ -85,6 +110,9 @@ const buildReplyText = (
   questions: AskUserQuestion[],
   answers: AskUserAnswer[],
   deferred: boolean,
+  // 每题落盘后的图（key=questionId）。某题有图就在它的 A 行下内联「本题附图：<basename>」、
+  // 让 agent 把文末 [ATTACHED_IMAGES] 里的图按 basename 对回具体问题、不用猜归属。
+  savedByQuestion: Record<string, ImageAttachmentSaved[]>,
 ): string => {
   if (deferred) {
     const sections: string[] = [
@@ -105,8 +133,16 @@ const buildReplyText = (
   const sections: string[] = ["[ASK_USER_REPLY]"];
   questions.forEach((q, idx) => {
     const a = answerMap.get(q.id);
-    const ansText = a ? a.answer : "（未回答）";
+    const imgs = savedByQuestion[q.id] ?? [];
+    const rawText = a ? a.answer.trim() : "";
+    // 图-only（只贴图没填字）兜底成「见本题附图」、纯没答兜「未回答」
+    const ansText =
+      rawText.length > 0 ? rawText : imgs.length > 0 ? "（见本题附图）" : "（未回答）";
     sections.push("", `Q${idx + 1}: ${q.question}`, `A: ${ansText}`);
+    if (imgs.length > 0) {
+      const names = imgs.map((s) => path.basename(s.absPath)).join("、");
+      sections.push(`   本题附图：${names}`);
+    }
   });
   return sections.join("\n");
 };
@@ -131,6 +167,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
       return errorResponse("answers 必填、至少一条");
     }
   }
+
+  // 每题的原始图（key=questionId）。deferred 不带图；这里先做形状归一、真正的内容校验 / 落盘在拿到
+  // questions 之后做（要按 questionId 白名单过滤、防客户端塞无关 key）。
+  const rawImagesByQuestion: Record<string, RawImagePayload[]> =
+    !deferred && body.imagesByQuestion && typeof body.imagesByQuestion === "object"
+      ? body.imagesByQuestion
+      : {};
+  const hasRawImages = (qid: string): boolean =>
+    Array.isArray(rawImagesByQuestion[qid]) &&
+    rawImagesByQuestion[qid].length > 0;
+
   const answers: AskUserAnswer[] = [];
   if (Array.isArray(rawAnswers)) {
     for (const a of rawAnswers) {
@@ -139,7 +186,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
         return errorResponse("answers[].questionId / answer 类型不对");
       }
       const ans = a.answer.trim();
-      if (ans.length === 0) {
+      // 图-only（只贴图不填字）也算已答：空文字 + 本题有图 → 放行、answer 存 ""、replyText 兜底成「见本题附图」
+      if (ans.length === 0 && !hasRawImages(a.questionId)) {
         if (deferred) continue;
         return errorResponse(`questionId=${a.questionId} 的 answer 为空`);
       }
@@ -180,8 +228,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse(`askId=${askId} 的 questions 元信息丢失、无法处理`, 500);
   }
 
+  // 本组 ask 的 token（runner 写 ask_user_request 时落进 meta）。用它把「agent 是否还在等」
+  // 收窄到「还在等这组 ask」——防旧弹窗答案串进被顶替的新 pending（force-new-agent / 顶替 race）。
+  // 极旧数据可能没 token：退回 task 级判定（与旧行为一致、不写兼容分支）。
+  const expectedToken =
+    typeof reqEvent.meta?.token === "string" ? reqEvent.meta.token : undefined;
+  const checkPending = (): boolean =>
+    expectedToken ? hasPendingToken(task.id, expectedToken) : hasPending(task.id);
+
+  const questionIds = new Set(questions.map((q) => q.id));
+
   if (!deferred) {
-    const questionIds = new Set(questions.map((q) => q.id));
     for (const qid of questionIds) {
       if (!answers.some((a) => a.questionId === qid)) {
         return errorResponse(`questionId=${qid} 缺答案、所有问题都必须答`);
@@ -189,10 +246,31 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  let pending = hasPending(task.id);
+  // 逐题校验图（先不落盘）：只认属于本组 question 的 key、单题 ≤6、全部题合计 ≤12。
+  // 校验过的内容暂存 validatedByQuestion、等确认 agent 还在等（pending）后再真写盘、避免僵尸态留孤儿文件。
+  const validatedByQuestion: Record<string, ImageAttachmentInput[]> = {};
+  let totalImages = 0;
+  for (const qid of Object.keys(rawImagesByQuestion)) {
+    if (!questionIds.has(qid)) continue; // 忽略不属于本组问题的 key
+    const result = parseAndValidateImages(
+      rawImagesByQuestion[qid],
+      MAX_IMAGES_PER_QUESTION,
+    );
+    if (!result.ok) return result.errorResponse;
+    if (result.images.length === 0) continue;
+    totalImages += result.images.length;
+    if (totalImages > MAX_IMAGES_TOTAL) {
+      return errorResponse(
+        `本次附图合计超过上限 ${MAX_IMAGES_TOTAL} 张、请精简`,
+      );
+    }
+    validatedByQuestion[qid] = result.images;
+  }
+
+  let pending = checkPending();
   if (!pending) {
     await sleep(KEEPALIVE_RACE_RETRY_MS);
-    pending = hasPending(task.id);
+    pending = checkPending();
   }
 
   if (!pending) {
@@ -226,10 +304,39 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   console.log(
-    `[ask-reply] task=${task.id} askId=${askId} answers=${answers.length}/${questions.length} deferred=${deferred}`,
+    `[ask-reply] task=${task.id} askId=${askId} answers=${answers.length}/${questions.length} deferred=${deferred} imgQuestions=${Object.keys(validatedByQuestion).length}`,
   );
 
-  const replyText = buildReplyText(questions, answers, deferred);
+  // 确认 agent 还在等了、现在才真把图写盘（逐题落、按 questionId 归档）。
+  // savedByQuestion 用于 replyText 内联标注归属；allSaved 扁平给前端缩略图；allAbsPaths 给 agent read。
+  const savedByQuestion: Record<string, ImageAttachmentSaved[]> = {};
+  const allSaved: ImageAttachmentSaved[] = [];
+  for (const qid of Object.keys(validatedByQuestion)) {
+    try {
+      const saved = await saveImageAttachments(task.id, validatedByQuestion[qid]);
+      savedByQuestion[qid] = saved;
+      allSaved.push(...saved);
+    } catch (err) {
+      return errorResponse(
+        `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  const allAbsPaths = allSaved.map((s) => s.absPath);
+
+  const replyText = buildReplyText(questions, answers, deferred, savedByQuestion);
+
+  // 先 resolve 阻塞中的 agent（带 token 校验）——成功了才写「已答」事件 + publish。
+  // 顺序很关键：旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时
+  // 用户已经在事件流看到「已答」、agent 却没收到 → 假已答。现在 submit 成功才落「已答」、
+  // 失败直接 409、不写事件（此时图已落盘成孤儿、暂无清理 helper、概率低可接受）。
+  const ok = submitAskReply(task.id, replyText, allAbsPaths, expectedToken);
+  if (!ok) {
+    return errorResponse(
+      "agent 已不在等问答（可能并发处理 / keepalive 切换 / 等待已被顶替）、稍后重试",
+      409,
+    );
+  }
 
   const actionId = reqEvent.actionId;
   const replyEvent = await appendEvent(task.id, {
@@ -240,18 +347,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
       askId,
       answers,
       ...(deferred ? { deferred: true } : {}),
+      // 扁平图数组、前端 extractUserReplyImages 读 meta.images 渲缩略图（同 user_reply 通道）
+      ...(allSaved.length > 0 ? { images: allSaved } : {}),
     },
   });
   if (replyEvent) {
     publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
-  }
-
-  const ok = submitAskReply(task.id, replyText);
-  if (!ok) {
-    return errorResponse(
-      "agent 已不在等问答（可能并发处理 / keepalive 切换）、稍后重试",
-      409,
-    );
   }
 
   const updated = await setTaskRunStatus(task.id, "running");

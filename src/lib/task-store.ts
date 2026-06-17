@@ -678,8 +678,20 @@ export const submitAskReply = async (
   taskId: string,
   askId: string,
   answers: AskUserAnswer[],
-  options?: { deferred?: boolean },
+  // V0.8.3：imagesByQuestion key=questionId、每题各自绑各自的图（图-only 也算已答）
+  options?: {
+    deferred?: boolean;
+    imagesByQuestion?: Record<string, ImagePayload[]>;
+  },
 ): Promise<{ ok: true }> => {
+  // 只发非空的题图、避免 body 里塞一堆空数组
+  const imagesByQuestion = options?.imagesByQuestion
+    ? Object.fromEntries(
+        Object.entries(options.imagesByQuestion).filter(
+          ([, imgs]) => imgs.length > 0,
+        ),
+      )
+    : undefined;
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/ask-reply`,
     {
@@ -689,6 +701,9 @@ export const submitAskReply = async (
         askId,
         answers,
         ...(options?.deferred ? { deferred: true } : {}),
+        ...(imagesByQuestion && Object.keys(imagesByQuestion).length > 0
+          ? { imagesByQuestion }
+          : {}),
       }),
     },
   );

@@ -135,8 +135,12 @@ const EventStreamImpl = ({
   // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
-  // Virtuoso 句柄：必要时用于手动 scrollToIndex（目前没用上、留着兜底）
+  // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方 streaming 自动滚 effect）
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  // 用户当前是否贴在底部（由 Virtuoso atBottomStateChange 维护）。
+  // 初始 true：进来 initialTopMostItemIndex 定位到末尾、就是贴底态。
+  // 关键作用：流式回复时只有「用户本来就在底部」才自动跟随、用户主动往上翻看历史就不打扰。
+  const atBottomRef = useRef(true);
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -154,6 +158,25 @@ const EventStreamImpl = ({
       { kind: "__streaming__", id: "__streaming__", text: streamingText },
     ];
   }, [task.events, streamingText]);
+
+  // 流式回复自动贴底（V0.8.3 修）：
+  // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
+  // merged.length + 1）。react-virtuoso 的 followOutput 只在 data 条数变化时触发滚动、对「最后一项
+  // 内容增高」无感、所以流式增长期间不会自动滚（用户实测：滚到底聊天、AI 回复过程不跟随）。
+  // 修法——streamingText 每变一次（每个 chunk）、若用户本来贴在底部、就手动把最后一项滚到视口底。
+  // 用 behavior:"auto"（瞬时）避免每个 chunk smooth 动画互相打架卡顿。atBottomRef 由下方
+  // atBottomStateChange 维护、配合 Virtuoso 的 atBottomThreshold（给足余量、防单 chunk 增高把
+  // atBottom 误判成 false 导致自废）。useEffect（非 layout）跑在 Virtuoso 测完新高度之后、scrollToIndex
+  // 才能命中真正的新底部。
+  useEffect(() => {
+    if (!streamingText) return;
+    if (!atBottomRef.current) return;
+    virtuosoRef.current?.scrollToIndex({
+      index: items.length - 1,
+      align: "end",
+      behavior: "auto",
+    });
+  }, [streamingText, items.length]);
 
   // V0.6：输入框可用 = 父组件传 canReply
   // 父组件没传时回退 task.runStatus === "awaiting_user"
@@ -296,6 +319,14 @@ const EventStreamImpl = ({
             // 这一行替代了老的 stickToBottomRef + handleScroll + autoScroll useEffect、
             // 库自己维护「是否贴底」、不需要外部 ref 状态
             followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
+            // 维护「用户是否贴底」给上面的流式自动滚 effect 用。
+            atBottomStateChange={(atBottom) => {
+              atBottomRef.current = atBottom;
+            }}
+            // 贴底判定余量调大（默认仅 4px）：流式时最后一项每来一个 chunk 会增高若干像素、
+            // 余量太小会立刻被判成「离开底部」→ effect 自废不再跟随。120px 覆盖常见 chunk 增量、
+            // 让「滚到底跟随」稳定；用户真往上翻 >120px 才停跟随。
+            atBottomThreshold={120}
             // 初始定位到末尾（任务详情首次进来直接看最新事件、不用手动滚）
             initialTopMostItemIndex={items.length - 1}
             // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距

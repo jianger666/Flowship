@@ -338,9 +338,9 @@ const PREMATURE_WAIT_REJECT_TEXT = [
   "",
   "你这一轮还没把回复作为一条**正文消息**发出去——用户那边现在看到的是**空白回复**。",
   "（用户看不到你的 thinking、也看不到工具调用，只看得到你发出的正文。）",
-  "如果刚才做了检索 / 工具调用，更要先把结果 / 结论写出来。",
+  "如果刚才做了检索 / 工具调用，或用户要你写文章 / 代码 / 方案，更要先把本轮成品写出来。",
   "",
-  "现在：先把这一问的完整答案（结果 / 代码 / 链接 / 结论）写成一条正文消息发出去，然后再调 `wait_for_user`。",
+  "现在：先把这一问的本轮成品 / 可用分段（结果 / 代码 / 文章 / 方案 / 链接 / 结论）写成一条正文消息发出去，然后再调 `wait_for_user`。",
 ].join("\n");
 
 /**
@@ -402,8 +402,11 @@ const newWaitToken = (): string =>
 // V0.7.21：旧版只提醒「调 wait_for_user」、把模型往「机制」上带、它干完活直接挂等、正文全空
 // （线上 money看板 翻车：连追 4 次才吐链接）。改成两步且**正文在前**——先写结果、再挂等。
 // 用户在 UI 看不到 curl stdout、所以这句只给 agent、不污染用户视野。
+// V0.8.3：泛化「预告」——旧版只点「调工具/跑脚本不算回答」、漏了生成型的「我先写一篇 X、写完再发」
+//（composer-2.5 实测把这种计划宣告误当正文、文章一字没写就挂等）。这是离每轮用户消息最近的提醒、
+// 是治这病的最高优先抓手。措辞用「本轮成品 / 可用分段」而非「一次写完整任务」、不压制合理分多轮。
 const CHAT_REPLY_REMINDER =
-  "（系统提醒，非用户所说）本轮两步、顺序别反：① 先把结果 / 链接 / 结论**写进一条正文消息发出去**——只调工具 / 跑脚本 / 部署不算回答、正文空 = 用户看到的是空白回复；② 再调 `wait_for_user` 挂等下一条。两步都做才算一轮完整、漏第 ② 步对话就断了。";
+  "（系统提醒，非用户所说）本轮两步、顺序别反：① 先把本轮成品 / 可用分段（结果 / 代码 / 文章 / 方案 / 链接 / 结论）**写进一条正文消息发出去**——只调工具 / 跑脚本 / 部署、或只『宣告要做』（如「我先写一篇…、写完再发」）都不算回答、正文空 = 用户看到的是空白回复；② 再调 `wait_for_user` 挂等下一条。两步都做才算一轮完整、漏第 ② 步对话就断了。";
 
 // 把 ToolReturn 序列化成 wait-ack 路由写出 curl 的文本（多行）
 // 第一行是 `[KIND ...]` 标记（必）、后续是 body。agent 在 shell 输出里 grep 标记拿语义、按需读 body
@@ -900,7 +903,7 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 调用前提（按你所处模式自检、最常翻的车）",
         "",
-        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id })`）**：本轮**已收到用户消息**时、调本工具前必须先把这一问的答案 / 结论写成**一条正文消息**发出去——只发『正在处理 / 正在检索』的预告、或只调了工具 / 跑了脚本却没写正文 = 用户看到的是**空白回复** = 还没回答。（chat 尤其常踩：查完代码直接挂等、忘了把结论写成正文。）本轮**无用户消息**（起手等第一句）时、可直接调。",
+        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id })`）**：本轮**已收到用户消息**时、调本工具前必须先把本轮成品 / 可用分段（结果 / 代码 / 文章 / 方案 / 链接 / 结论）写成**一条正文消息**发出去。只发预告不算回答：包括查询型『正在处理 / 正在检索』、也包括生成型『我先写一篇 X、写完再发 / 再等』；只调工具 / 跑脚本 / 部署、或只宣告计划却没摆出成品 = 用户看到的是**空白回复** = 还没回答。（chat 尤其常踩：查完代码直接挂等、或只宣告「我先写」就挂等、忘了把成品写成正文。）本轮**无用户消息**（起手等第一句）时、可直接调。",
         "- **Task 模式（action 容器）**：写完 artifact 就是交付、按下方 A / B 用法调本工具等 ack——**不必**再额外发一条总结正文（见下方「调用礼仪」）。",
         "",
         "> 下方「硬性规则 / 两种用法 / 调用礼仪」只适用于 **Task 模式**；**Chat 模式**只需守住上面那条「答完正文再 wait」、与 action / artifact / approve / runner failed 无关、别把 task 待命态规则套到 chat 上。",
@@ -1627,11 +1630,22 @@ export const submitUserMessage = (
  *   Q1: 问题1
  *   A: 答案1
  *
- * 返回：true=成功 resolve、false=当前没有 pending（race / 任务已退出）
+ * @param imagePaths V0.8.3：用户在某些 question 的回答里附了图、这里传全部图的绝对路径
+ *                   （扁平、跨所有 question 汇总）。走 user_reply kind、formatToolReturnAsText
+ *                   会在文末拼标准 [ATTACHED_IMAGES] 段、agent 用 read 看图。哪张图属哪个
+ *                   question 由 replyText 里每题内联的「本题附图：<basename>」标注（route 拼）兜住。
+ * @param expectedToken V0.8.3：本组 ask 在 ask_user_request 事件 meta 里记的 token。传了就做
+ *                   token 级校验——必须等于当前 pending entry 的 token、否则拒掉（返 false）。
+ *                   防「旧 ask 弹窗答案串进被顶替的新 pending」race（pending 只到 task 级、
+ *                   force-new-agent / 顶替时新 entry 换了 token、旧弹窗答案不该送进新等待）。
+ *
+ * 返回：true=成功 resolve、false=当前没有 pending、或 token 不匹配（race / 任务已退出 / 被顶替）
  */
 export const submitAskReply = (
   taskId: string,
   replyText: string,
+  imagePaths?: string[],
+  expectedToken?: string,
 ): boolean => {
   const entry = pendingMap.get(taskId);
   if (!entry) {
@@ -1640,12 +1654,21 @@ export const submitAskReply = (
     );
     return false;
   }
+  if (expectedToken && entry.token !== expectedToken) {
+    console.warn(
+      `[chat-mcp] submitAskReply token 不匹配 task=${taskId} expected=${expectedToken} actual=${entry.token}、拒绝（当前等待已不是这组 ask、被顶替 / force-new-agent）`,
+    );
+    return false;
+  }
   finalizeEntry(taskId, entry, {
     kind: "user_reply",
     text: replyText,
+    imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
   });
   console.log(
-    `[chat-mcp] submitAskReply 成功 task=${taskId} reply=${replyText.slice(0, 80)}`,
+    `[chat-mcp] submitAskReply 成功 task=${taskId} reply=${replyText.slice(0, 80)}${
+      imagePaths && imagePaths.length > 0 ? ` images=${imagePaths.length}` : ""
+    }`,
   );
   return true;
 };
@@ -1862,6 +1885,16 @@ export const cleanupChatTaskState = (taskId: string): void => {
  * UI 拉状态时用：当前是否有 agent 在等用户输入。
  */
 export const hasPending = (taskId: string): boolean => pendingMap.has(taskId);
+
+/**
+ * 比 hasPending 更精确：当前 pending 是否正好是 token 对应的那一段等待。
+ * ask-reply route 预检用——把「agent 是否还在等」从 task 级收窄到「还在等这组 ask」、
+ * 防旧弹窗对着被顶替的新 pending 误判 still-waiting（与 submitAskReply 的 token 校验配套）。
+ */
+export const hasPendingToken = (taskId: string, token: string): boolean => {
+  const entry = pendingMap.get(taskId);
+  return !!entry && entry.token === token;
+};
 
 // ----------------- task-runner 用的 endpoint URL helper -----------------
 

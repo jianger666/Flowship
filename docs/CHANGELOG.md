@@ -15,6 +15,30 @@
 
 ---
 
+### v0.8.1：自更新防残缺包 + 发版改 draft 流程（修 v0.8.0 自更新事故）（2026-06-15）
+
+v0.8.0 发版当场踩了自更新事故：旧 `release.yml` 先建 **published** 占位 release → 用户 app 在 dmg/yml 还没传完时就 `fetchLatestVersion` 查到新版 → mac 自更新下到残缺 dmg（只 1.78MB）→ `ditto` 拷残缺文件报 `Unknown error 1000`、且残缺 dmg 被 `hdiutil attach` 挂成坏卷没卸干净 → Finder 扫描坏卷 I/O 卡死。并发 publish 还撞出 **0 字节 `latest.yml`**（win electron-updater 全靠它、win 同事自更新挂）。
+
+- **mac 自更新加 dmg 完整性校验（`main.js` `macSelfUpdate`）**：下载后比对 `content-length`、`got !== total` 直接 throw——在 `hdiutil attach` / `rename appPath` **之前**拦掉、残缺包根本不碰 app（旧逻辑下完直接 ditto、拷到一半才炸、那时旧 app 已被挪走）。
+- **发版改 draft 流程（`release.yml`）**：① build-release 占位建 **draft**（electron-builder `getOrCreateRelease` 优先复用匹配 tag 的 draft、源码 `if(release.draft) return release`）② matrix `max-parallel: 1` 串行打包（防并发 overwrite asset 撞出 0KB yml）③ 新增 **finalize job**（win/mac 全传完才把 draft→published）。draft 期间 `/releases/latest` 不指向它、自更新查不到 → 杜绝「asset 没传完就被下到残缺」；任一平台挂就留 draft、不对外发半成品。
+- 功能同 v0.8.0（侧栏导航）、纯发版链路 + 自更新加固的 hot-fix。
+
+### v0.8.0：侧栏任务导航（列表搬进常驻侧栏、多任务秒切）（2026-06-15）
+
+痛点：首页是任务大列表、切任务必须「详情 → 返回 `/` → 进另一个」、多任务并行来回切累。改成 ChatGPT / Cursor 式常驻左侧栏：点侧栏即切任务、可展开 / 收起（收起宽度归零、复杂详情页不被遮挡）。用 `ui-ux-pro-max` + `frontend-design` skill 辅助（落实当前项高亮 / 键盘可达 / push 不遮挡 / 视觉克制）。
+
+- **应用外壳 `AppShell`（新 `app-shell.tsx`）**：包「顶栏 + 侧栏 + 主区」、持侧栏开合态（localStorage `fe-ai-flow:sidebar-open` 记忆）+ `⌘/Ctrl+B` 切换（焦点在输入框时让行）+ 路由切换主区归顶。`layout.tsx` 用它取代旧「header + main」、body `h-screen overflow-hidden`（整体不滚、滚动交给主区）。
+- **侧栏 `AppSidebar`（新 `app-sidebar.tsx`）**：顶部「新建任务」实色按钮 + 类型筛选（`ListFilter` 图标点开 Popover 选「全部 / 任务 / 对话」、localStorage 记忆）；列表分「置顶（pin）/ 活跃（updatedAt 倒序）/ 更早（archived 折叠、默认收起）」；行尾 hover「置顶 / 删除」（删除二次确认 + 乐观移除 + 删当前任务回首页）。`open ? w-64 : w-0` 过渡 push 主区。
+- **共享列表 `useTaskList`（新 `use-task-list.tsx`）**：侧栏 + 各页面共享 `TaskSummary[]`、`refresh`（mount + window focus）/ `upsertTask`（新建即时插入 / 状态同步、Task 自动收窄 Summary 剔除 events）/ `removeTask`（乐观）。挂 `providers.tsx`。
+- **任务行 `TaskListItem`（新）**：侧栏 / 欢迎页共用、一行 = 行首**类型图标**（对话 = 气泡 `MessageCircle` / 任务 = 清单 `ListTodo`、所有行左缘对齐）+ 标题 truncate（hover `Tooltip` 补全长标题）+ 行尾 hover 操作（置顶 `Pin` / 删除）、当前任务高亮（左 primary 竖条 + 底色）。**状态不再用色点表达**（2026-06-15 用户反馈：开发中是常态、满屏色点是噪声、且 shell 保活超时几乎每个任务最终落 error 标红误导）——`getTaskStatusDot` / `TaskStatusDot` 已删。
+- **置顶 pinned（全栈）**：`Task.pinned`（types + `task-fs` schema/hydrate + PATCH `/api/tasks/[id]` + `setTaskPinned` client），侧栏置顶组排最前。
+- **类型筛选**：侧栏顶部 `ListFilter` 图标点开 `Popover` 下拉选「全部 / 任务 / 对话」（状态 localStorage 记忆、非「全部」时图标高亮 + 列表顶部显示当前类型标题 +「清除筛选」），避免用户以为任务丢了。
+- **新增 `Tooltip` 组件**（`ui/tooltip.tsx`、base-ui、长标题 hover 补全）。
+- **首页 `/` → 欢迎页**：删大列表（在侧栏）、改 hero（一句定位 + 新建 CTA + 继续最近、logo 柔和光晕 `/8`）+ 最近任务入口。
+- **去手动归档**：首页「已归档」视图 + `TaskCard` 整个组件删、归档退化为侧栏「更早」折叠（沿用后端 7 天 auto-archive、不再让用户手动操心）。
+- **顶栏 / 详情页适配**：侧栏展开 / 收起 toggle 常驻**顶栏红绿灯右侧**（`app-header.tsx`、位置固定不随开合跳）+ scrolled 改外壳传入；详情页 task + chat 两模式去 `h-[calc(100vh-3.5rem)]` 改 `h-full`、去冗余「返回」按钮（侧栏常驻 + logo 已能回首页、对标 ChatGPT/Cursor）；`LoadingState` block 同步去 calc。
+- 验证：typecheck + lint 全绿 + 3 步打包（`BUILD_STANDALONE=1 pnpm build` → `assemble-electron-server.mjs` → `electron:dist:test`）+ test 包（8776）端到端验证。
+
 ### v0.7.23：light/dark 主题 + 自定义同色标题栏 + 包瘦身 + chat 运行态重构（2026-06-15）
 
 本轮一次会话堆了 7 块改动（均已 test 实例验证、未单独 tag）：① **Electron 包瘦身（~600M 起步）**：`next.config.ts` `outputFileTracingExcludes` 显式剔除 file-tracing 误拖进 standalone 的死重（`sharp`/`@img` libvips、`typescript` devDep、`caniuse-lite` 构建期专用、合计 ~26M、grep 实证运行时零 require）+ `electron-builder.yml` `electronLanguages` 只留中英 locale（Chromium 默认塞 ~220 国 ~47M、本应用 UI 全自绘中文、只 Chromium 原生右键菜单用 locale；不影响 icudtl.dat）。② **light/dark 三态主题（一步到位、默认跟随系统、codex 灰调）**：`providers.tsx` next-themes 从 `forcedTheme=dark` 改 `defaultTheme=system + enableSystem`；`globals.css` 补 light 色板（codex 风浅灰底 oklch(0.967) + 白卡浮起、全局极微冷调 hue264 避免死灰）+ dark 提亮柔化（纯黑 0.145→0.17、card 拉层次、border 10%→12%）+ prism token / 滚动条色全主题变量化（light 压暗保白底可读）；新增 `theme-toggle.tsx`（顶栏三态 popover：浅色 / 深色 / 跟随系统）；`artifact-diff.tsx` diff viewer 跟 `resolvedTheme`（删 dark-only prism-tomorrow.css）；`mcp-oauth/callback` 结果页 + `main.js` 加载页/窗口底色都跟 `nativeTheme` 系统深浅、消除浅色系统启动闪黑。③ **自定义同色标题栏（Cursor 式一体顶栏、mac+win）**：新增 `app-header.tsx` 替换 `layout.tsx` 旧 header——品牌（logo+「AI工作流」）居中、整条 `-webkit-app-region:drag` 可拖窗 + 交互元素 no-drag、滚动 >0 才浮现 border-b；`main.js` mac `titleBarStyle=hiddenInset` + `trafficLightPosition` 对齐 h-14、win `hidden` + `titleBarOverlay`（height 56、运行时主题切换走 IPC `set-titlebar-overlay` 同步控制按钮条底色/图标色）；`preload.cjs` 暴露 `window.__shell`（platform + setTitleBarOverlay）。④ **app icon 圆角平台分治**：win 用预圆角透明角 squircle `packaging/icon-win.png`（`electron-builder.yml` `win.icon`、任务栏显圆角）、mac 继续满幅方块 `packaging/icon.png`（Tahoe 自己加圆角且不垫白底、共用透明角图会被 Tahoe 垫成白底方块、踩过）；header `public/logo.png` 用透明角 squircle、`<img>` 不再叠 ring/CSS 圆角。⑤ **prompt 修订：先回复再 wait_for_user（线上 money看板 翻车驱动）**：composer-2.5 干完工具/部署直接挂等、正文全空（用户连追 4 次才吐链接）——`chat-mcp.ts` `CHAT_REPLY_REMINDER` 重排成两步且**正文在前**（① 先把结果/链接/结论写进正文 ② 再 wait_for_user）、`wait-protocol-prompt.ts` `chatShellWaitGuideBody` 自检改「正文是否已发出、只调工具≠回答=用户看到空白」；顺手精简该文件冗余（删「收尾语也照样等」整段、step5 去括号、消歧义交叉引用）。⑥ **chat 运行态指示器重构（ui-pro-max、零布局抖动）**：`chat-view.tsx` 删顶栏「AI 正在回 + 停止」簇、`statusHint` 瘦身 error-only；`event-stream.tsx` 运行态收进输入框操作行（loading 转圈 + 红方块停止键替代发送键、点即停）、删输入框下方那条会顶高布局的「agent 正在思考」状态行（content-jumping severity high）、模型选择器与输入加 pt-1.5 间距。⑦ **修 chat「停止后 AI 还回复」冷启动竞态**：`runChatSession` 旧版到 `agent.send` 之后才把 run 注册进 `runningChats`、而 `cancelChatRun` 靠 `runningChats.get` 命中——`Agent.create` / `send` / MCP 健康探测的数秒冷启动窗口里点停止会扑空（连 cancelled 标志都来不及设）、run 照常启动复述 + 回复（用户线上实测、事件流「用户停止了对话」落在「Chat 任务启动」之前为证）；改为**进入即占位注册**（cancel 置 cancelled + 有 run 时真 `run.cancel`、agentId 先空 send 出来回填）、`try/finally` 扩到覆盖全程保证占位 record 必清理（不泄漏 `has=true` 卡死后续启动）、MCP 探测 / create / send 三个 await 后各加 cancelled 检查点提前收尾（idle + done、不重复落停止事件）。附带清理网页版残留（`use-mcp-oauth` 删浏览器预开窗分支、`native-picker`/`update-badge`/`repo-card` 去 web 版兜底注释）+ `learned-conventions` test 实例/包默认不关不删（2026-06-15 用户修订、覆盖旧「测完删包 / 立即关 test」）。

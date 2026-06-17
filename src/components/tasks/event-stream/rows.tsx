@@ -160,6 +160,9 @@ const EventRowImpl = ({
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
   const isUser = ev.kind === "user_reply";
+  // ask_user_reply（弹窗答题）也可能带每题贴的图、meta.images 形状跟 user_reply 一致、
+  // 共用同一套缩略图渲染（V0.8.3）。attachments 仍只 user_reply 有、不放宽。
+  const hasImageMeta = isUser || ev.kind === "ask_user_reply";
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
   const isToolCall = ev.kind === "tool_call";
@@ -178,8 +181,8 @@ const EventRowImpl = ({
   // user_reply 才解 meta.images / meta.attachments、其他 kind 一律空
   // 避免每行都跑一遍 extract
   const images = useMemo(
-    () => (isUser ? extractUserReplyImages(ev.meta) : []),
-    [isUser, ev.meta],
+    () => (hasImageMeta ? extractUserReplyImages(ev.meta) : []),
+    [hasImageMeta, ev.meta],
   );
   const attachments = useMemo(
     () => (isUser ? extractUserReplyAttachments(ev.meta) : []),
@@ -393,9 +396,9 @@ const EventRowImpl = ({
               {useMarkdown ? <MarkdownText text={ev.text} /> : ev.text}
             </div>
           ))}
-        {/* user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
+        {/* user_reply / ask_user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
             点缩略图新 tab 打开看大图、不内嵌 lightbox（保持轻量、浏览器自带的图片查看够用）*/}
-        {isUser && images.length > 0 && (
+        {hasImageMeta && images.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
             {images.map((img) => {
               const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;

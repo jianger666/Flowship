@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态、V0.5.6 加「稍后再补充」）
+ * AskUserDialog（V0.3.2 ask_user 弹窗、用户拍板的形态、V0.5.6 加「稍后再补充」、V0.8.3 每题支持贴图）
  *
  * 跟 V0.3 inline 卡片的差异：
  *   - **弹窗**：在 task 详情页顶层挂、不在 event stream 里、不会被 thinking / tool_call 等过程事件淹没
@@ -15,10 +15,18 @@
  *   - 点 → useDialog().confirm 二次确认 → POST 时 body 带 deferred:true
  *   - agent 拿到 [ASK_USER_REPLY deferred] 头、跳过这组 Q、按 default 推进、列进 artifact §6 待澄清
  *
+ * V0.8.3 每题贴图（用户拍板「每个题各自绑各自的」）：
+ *   - 每道题抽成 `AskQuestionItem` 子组件、各自 call 一次 useImageAttach（hook 规则不能在 map 里调、
+ *     故必须按子组件拆）、互不影响、零碰 ReviseDialog / EventStream 等老调用方。
+ *   - 子组件把「本题回答态 + 图」上报父组件、父汇总成 answers[] + imagesByQuestion 提交。
+ *   - **仅「自定义回答」模式能贴图**（用户拍板）：附图按钮 / 缩略图 / 粘贴 / 拖拽整体收在自定义回答区、
+ *     选了固定选项就隐藏且上报空图（图状态保留、再切回自定义会重现、不丢用户已贴的图）。
+ *   - 自定义回答里图-only（只贴图不填字）也算已答；归属靠后端 replyText 每题内联「本题附图：<basename>」兜住。
+ *
  * 数据流：
  *   1. 监听 task.events、找最新一条 ask_user_request 且没对应 ask_user_reply 的 → 弹窗
- *   2. 用户选 option / 写 Other 文本 → 内部 answers state 累积
- *   3. 全答完点提交 → POST /api/tasks/[id]/ask-reply、body 带 answers[]
+ *   2. 用户选 option / 写自定义文本 / 贴图 → 子组件上报、父 drafts state 累积
+ *   3. 全答完点提交 → POST /api/tasks/[id]/ask-reply、body 带 answers[] + imagesByQuestion
  *      或点「稍后再补充」→ confirm 后 POST 带 deferred:true、answers 可空
  *   4. 服务端 resolve agent、写 ask_user_reply 事件、SSE 推回来、UI 自动关弹窗
  *
@@ -28,8 +36,8 @@
  *   - 已答的 askId 不再弹（看 task.events 里有没有 reply）
  */
 
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Sparkles } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, Paperclip, Sparkles, X } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -45,7 +53,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { useDialog } from "@/hooks/use-dialog";
+import { useImageAttach } from "@/hooks/use-image-attach";
 import { submitAskReply } from "@/lib/task-store";
+import type { ImagePayload } from "@/lib/task-store";
 import type {
   AskUserAnswer,
   AskUserQuestion,
@@ -53,13 +63,16 @@ import type {
   TaskEvent,
 } from "@/lib/types";
 
-// 单条问题在 dialog 里的回答态
-// - optionId：选了哪个 option（undefined = 还没选 / 走 Other）
-// - text：Other 模式下的自由文本
-// 提交时按 optionId 优先、没选才用 text
+// 单条问题在 dialog 里的回答态（子组件上报、父汇总）
+// - optionId：选了哪个 option（undefined = 还没选 / 走自定义）
+// - text：自定义模式下的自由文本
+// - images：本题各自绑的图。**仅自定义回答模式才带**——选了固定选项（A/B/C）上报空数组
+//   （用户拍板：没选自定义回答不该能附图、附了图再切回选项也不带）
+// 提交时按 optionId 优先、没选才用 text；图单独走 imagesByQuestion
 interface AnswerDraft {
   optionId?: string;
   text: string;
+  images: ImagePayload[];
 }
 
 interface AskUserDialogProps {
@@ -104,6 +117,228 @@ const extractQuestions = (
 // 跟 Cursor askFollowUpQuestion 一样、option 自动加字母
 const LETTER_PREFIX = ["A", "B", "C", "D", "E", "F"];
 
+// 判断一道题是否已答：选了 option / 填了文字 / 贴了图、任一即算
+const isDraftAnswered = (d?: AnswerDraft): boolean =>
+  !!d &&
+  (!!d.optionId || d.text.trim().length > 0 || d.images.length > 0);
+
+// ----------------- 单题子组件 -----------------
+
+interface AskQuestionItemProps {
+  question: AskUserQuestion;
+  // 题号（从 1 开始展示）
+  index: number;
+  // 提交锁：提交中禁所有交互
+  submitting: boolean;
+  // 上报本题回答态（含图）给父组件
+  onChange: (qid: string, draft: AnswerDraft) => void;
+}
+
+/**
+ * 一道题的完整渲染 + 本题图附件管理。
+ *
+ * 为什么拆子组件：useImageAttach 是 hook、不能在父组件的 questions.map 里循环调用
+ * （违反 hooks 规则）。每道题各自一个子组件实例 = 各自合法地 call 一次 hook、
+ * 各绑各的图。父组件只负责汇总上报上来的 draft。
+ */
+const AskQuestionItem = ({
+  question,
+  index,
+  submitting,
+  onChange,
+}: AskQuestionItemProps) => {
+  // 本题选了哪个 option（undefined = 没选 / 走自定义文本）
+  const [optionId, setOptionId] = useState<string | undefined>(undefined);
+  // 自定义文本草稿
+  const [text, setText] = useState("");
+  const hasOptions = !!question.options && question.options.length > 0;
+  // 自定义输入模式：没 options 的纯文本题天然常显 textarea、有 options 的点「自定义回答」才切
+  const [otherMode, setOtherMode] = useState(!hasOptions);
+
+  // 本题图附件：各题独立一套（粘贴 / 拖拽 / 选文件 / 缩略图 / 移除）
+  const {
+    images,
+    isDragging,
+    fileInputRef,
+    maxImages,
+    removeImage,
+    triggerFilePicker,
+    onPaste,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+    onFileInputChange,
+  } = useImageAttach({ disabled: submitting });
+
+  // 仅「自定义回答」模式能带图：选了固定选项（A/B/C）就不带图——即使之前在自定义模式附过、
+  // 切到选项后也不提交（用户拍板）。纯文本题（无 options）天然算自定义模式。
+  const inCustomMode = otherMode || !hasOptions;
+
+  // 上报本题回答态（含图）给父组件。
+  // 依赖含 otherMode：切自定义 / 选项时图要不要带会变。images 是 hook 内 useState、
+  // 未变时引用稳定、父 re-render 不会触发本 effect、故无死循环。payload 直接由 images map 出、
+  // 不依赖 hook 的 toUploadPayload（那是每次 render 新建的函数、放 deps 会死循环）。
+  useEffect(() => {
+    const imgPayload: ImagePayload[] = inCustomMode
+      ? images.map((p) => ({
+          data: p.data,
+          mimeType: p.mimeType,
+          filename: p.file.name,
+        }))
+      : [];
+    onChange(question.id, { optionId, text, images: imgPayload });
+  }, [optionId, text, images, inCustomMode, onChange, question.id]);
+
+  // 点选项：写 optionId、清文本、退出自定义模式（图保留、与答案模式无关）
+  const handlePickOption = (optId: string) => {
+    setOptionId(optId);
+    setText("");
+    if (hasOptions) setOtherMode(false);
+  };
+
+  // 切到自定义模式：清 optionId、文本框出现（图保留）
+  const handleEnterOther = () => {
+    setOtherMode(true);
+    setOptionId(undefined);
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-start gap-2">
+        <span className="shrink-0 rounded-md bg-muted px-2 py-0.5 font-mono text-xs">
+          Q{index}
+        </span>
+        {/* agent 的问题常带 inline code / 编号列表、按 markdown 渲染
+            min-w-0：flex item 防长 inline code 撑破 dialog（参考 Dialog 溢出沉淀） */}
+        <div className="min-w-0 flex-1 text-sm leading-relaxed">
+          <MarkdownText text={question.question} />
+        </div>
+      </div>
+
+      {/* 选项区：始终显示（如果该 question 有 options）
+          切到自定义模式后也保留、用户随时能从 textarea 跳回点选项 */}
+      {hasOptions && (
+        <div className="flex flex-col gap-1.5 pl-9">
+          {question.options!.map((opt, optIdx) => {
+            const letter = LETTER_PREFIX[optIdx] ?? String(optIdx + 1);
+            const selected = optionId === opt.id;
+            return (
+              <ChoiceButton
+                key={opt.id}
+                shape="card"
+                selected={selected}
+                disabled={submitting}
+                onClick={() => handlePickOption(opt.id)}
+                className="flex items-start gap-3 px-3 py-2 text-xs hover:bg-primary/5"
+              >
+                <span
+                  className={cn(
+                    "shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[10px]",
+                    selected
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {letter}
+                </span>
+                <span className="wrap-break-word">{opt.label}</span>
+              </ChoiceButton>
+            );
+          })}
+          {/* 「自定义回答」入口：进自定义模式后高亮 */}
+          {question.allowText && (
+            <ChoiceButton
+              shape="tab"
+              selected={otherMode}
+              disabled={submitting}
+              onClick={handleEnterOther}
+              className="self-start text-xs"
+            >
+              {otherMode ? "已选：自定义回答（下方输入）" : "自定义回答"}
+            </ChoiceButton>
+          )}
+        </div>
+      )}
+
+      {/* 自定义回答区：有 options 时点「自定义回答」才出现、纯文本题常显。
+          图附件（附图按钮 / 缩略图 / 粘贴 / 拖拽）整体收在这里——只有自定义回答能带图（用户拍板）。
+          切回固定选项时本区整体隐藏、上报的图也会被置空（见 inCustomMode）。 */}
+      {inCustomMode && (
+        <div
+          className={cn(
+            "flex flex-col gap-2 rounded-md pl-9 transition-colors",
+            // 拖拽贴图：drag over 时虚线高亮（仅自定义回答区）
+            isDragging && "bg-primary/5 p-1 ring-1 ring-primary/30 ring-inset",
+          )}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+        >
+          <Textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onPaste={onPaste}
+            placeholder="输入你的回答…（可粘贴 / 拖拽贴图、或写「不清楚 / 你定」让 AI 按 default 走）"
+            rows={3}
+            className="resize-none text-sm"
+            disabled={submitting}
+          />
+
+          {/* 缩略图：发送前可移除单张 */}
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {images.map((img) => (
+                <div
+                  key={img.id}
+                  className="group relative size-14 overflow-hidden rounded-md border bg-card"
+                  title={img.file.name}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={img.dataUrl}
+                    alt={img.file.name}
+                    className="size-full object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeImage(img.id)}
+                    className="absolute top-0.5 right-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                    aria-label="移除"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            onChange={onFileInputChange}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={triggerFilePicker}
+            disabled={submitting}
+            className="h-7 gap-1 self-start px-2 text-xs text-muted-foreground"
+            title="给本题附图（也支持粘贴 / 拖拽）"
+          >
+            <Paperclip className="size-3.5" />
+            {images.length > 0 ? `本题附图 ${images.length}/${maxImages}` : "附图"}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ----------------- 主弹窗 -----------------
+
 export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   // useDialog 提供 confirm Promise API、用户点「稍后再补充」时弹二次确认
   const { confirm } = useDialog();
@@ -139,14 +374,11 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
     [pendingEvent],
   );
 
-  // 每个 question 的草稿答案、由 question.id 索引
+  // 每个 question 的草稿答案（含图）、由子组件上报、按 question.id 索引
   // askId 变了就重置（换了一组问题）
   const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
   // 提交中：防双击 / 网络重发
   const [submitting, setSubmitting] = useState(false);
-  // 自定义文本模式：哪个 question 切到了 textarea
-  // Set<questionId>
-  const [otherMode, setOtherMode] = useState<Set<string>>(new Set());
   // V0.6.24：agent 已断（task.runStatus=error）时这组 ask 不可能再被响应、
   // dialog 转「失效态」可关、解除「不可 dismiss + 提交 409」的死锁、引导用户去推进重启
   const isStale = task.runStatus === "error";
@@ -154,68 +386,29 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   const [dismissed, setDismissed] = useState(false);
 
   // askId 切换时清状态（保证每次新弹窗都是干净的）
-  // 失败重试也走这里——之后再讨论体验是否要保留草稿
+  // 子组件靠 key=`${askId}:${q.id}` 强制 remount、各自重置内部 state
   useEffect(() => {
     setDrafts({});
-    setOtherMode(new Set());
     setSubmitting(false);
     setDismissed(false);
   }, [askId]);
 
-  // 判断是否所有 question 都已答
-  // - 选了 optionId、或者 Other 文本非空、都算答了
-  const allAnswered = useMemo(() => {
-    if (questions.length === 0) return false;
-    for (const q of questions) {
-      const d = drafts[q.id];
-      if (!d) return false;
-      if (d.optionId) continue;
-      if (d.text && d.text.trim().length > 0) continue;
-      return false;
-    }
-    return true;
-  }, [questions, drafts]);
+  // 子组件上报回调：稳定引用（setDrafts 函数式更新）、避免子 effect 抖动
+  const handleDraftChange = useCallback((qid: string, draft: AnswerDraft) => {
+    setDrafts((prev) => ({ ...prev, [qid]: draft }));
+  }, []);
+
+  // 已答题数 + 是否全答完（只看当前这组 question、忽略残留旧 qid）
+  const answeredCount = useMemo(
+    () => questions.filter((q) => isDraftAnswered(drafts[q.id])).length,
+    [questions, drafts],
+  );
+  const allAnswered = questions.length > 0 && answeredCount === questions.length;
 
   // 正常态 dismissed 恒 false（无关闭入口）、open 跟着 pendingEvent；失效态可被「我知道了」关
   const open = pendingEvent !== null && !dismissed;
 
-  // 点选项按钮：写 optionId、清 text（确保只用一种答案）
-  // 退出 other 模式（如果之前切过）
-  const handlePickOption = (qid: string, optionId: string) => {
-    setDrafts((prev) => ({
-      ...prev,
-      [qid]: { optionId, text: "" },
-    }));
-    setOtherMode((prev) => {
-      if (!prev.has(qid)) return prev;
-      const next = new Set(prev);
-      next.delete(qid);
-      return next;
-    });
-  };
-
-  // 切到 Other 模式：清 optionId、文本框出现
-  const handleEnterOther = (qid: string) => {
-    setOtherMode((prev) => {
-      const next = new Set(prev);
-      next.add(qid);
-      return next;
-    });
-    setDrafts((prev) => ({
-      ...prev,
-      [qid]: { text: prev[qid]?.text ?? "" },
-    }));
-  };
-
-  // 改 Other 文本
-  const handleOtherChange = (qid: string, text: string) => {
-    setDrafts((prev) => ({
-      ...prev,
-      [qid]: { ...prev[qid], text },
-    }));
-  };
-
-  // 提交：拼 answers[]、POST
+  // 提交：拼 answers[] + imagesByQuestion、POST
   const handleSubmit = async () => {
     if (!askId || submitting) return;
     if (!allAnswered) {
@@ -223,8 +416,8 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
       return;
     }
     const answers: AskUserAnswer[] = questions.map((q) => {
-      const d = drafts[q.id]!;
-      if (d.optionId) {
+      const d = drafts[q.id];
+      if (d?.optionId) {
         const opt = q.options?.find((o) => o.id === d.optionId);
         return {
           questionId: q.id,
@@ -232,14 +425,21 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
           optionId: d.optionId,
         };
       }
+      // 自定义文本、或图-only（answer 留空、后端 replyText 兜底成「见本题附图」）
       return {
         questionId: q.id,
-        answer: d.text.trim(),
+        answer: d?.text.trim() ?? "",
       };
     });
+    // 每题各自的图汇总成 imagesByQuestion（key=questionId、空的不带）
+    const imagesByQuestion: Record<string, ImagePayload[]> = {};
+    for (const q of questions) {
+      const imgs = drafts[q.id]?.images;
+      if (imgs && imgs.length > 0) imagesByQuestion[q.id] = imgs;
+    }
     setSubmitting(true);
     try {
-      await submitAskReply(task.id, askId, answers);
+      await submitAskReply(task.id, askId, answers, { imagesByQuestion });
       onAnswered?.();
       // 提交成功：等 SSE 推 ask_user_reply 事件、pendingEvent 自动变 null、dialog 关闭
       // 这里不主动 setOpen(false)、避免 race
@@ -323,89 +523,15 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
 
         <div className="flex-1 overflow-y-auto px-5 py-4">
           <div className="flex flex-col gap-6">
-            {questions.map((q, qIdx) => {
-              const d = drafts[q.id];
-              const inOther = otherMode.has(q.id);
-              const selectedOptId = d?.optionId;
-              return (
-                <div key={q.id} className="flex flex-col gap-3">
-                  <div className="flex items-start gap-2">
-                    <span className="shrink-0 rounded-md bg-muted px-2 py-0.5 font-mono text-xs">
-                      Q{qIdx + 1}
-                    </span>
-                    {/* agent 的问题常带 inline code / 编号列表、按 markdown 渲染（V0.6.29、原来是裸 <p> 出现 `xx` 字面量）
-                        min-w-0：flex item 防长 inline code 撑破 dialog（参考 Dialog 溢出沉淀） */}
-                    <div className="min-w-0 flex-1 text-sm leading-relaxed">
-                      <MarkdownText text={q.question} />
-                    </div>
-                  </div>
-
-                  {/* 选项区：始终显示（如果该 question 有 options）
-                      切到 Other 模式后也保留、用户随时能从 textarea 跳回点选项 */}
-                  {q.options && q.options.length > 0 && (
-                    <div className="flex flex-col gap-1.5 pl-9">
-                      {q.options.map((opt, optIdx) => {
-                        const letter =
-                          LETTER_PREFIX[optIdx] ?? String(optIdx + 1);
-                        const selected = selectedOptId === opt.id;
-                        return (
-                          <ChoiceButton
-                            key={opt.id}
-                            shape="card"
-                            selected={selected}
-                            disabled={submitting}
-                            onClick={() => handlePickOption(q.id, opt.id)}
-                            className="flex items-start gap-3 px-3 py-2 text-xs hover:bg-primary/5"
-                          >
-                            <span
-                              className={cn(
-                                "shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[10px]",
-                                selected
-                                  ? "bg-primary text-primary-foreground"
-                                  : "bg-muted text-muted-foreground",
-                              )}
-                            >
-                              {letter}
-                            </span>
-                            <span className="wrap-break-word">{opt.label}</span>
-                          </ChoiceButton>
-                        );
-                      })}
-                      {/* 「自定义回答」入口：进 Other 模式后高亮、提示当前在用 textarea
-                          V0.5.10 拍板：文案精简到「自定义回答」、不要「以上都不是」赘述 */}
-                      {q.allowText && (
-                        <ChoiceButton
-                          shape="tab"
-                          selected={inOther}
-                          disabled={submitting}
-                          onClick={() => handleEnterOther(q.id)}
-                          className="self-start text-xs"
-                        >
-                          {inOther ? "已选：自定义回答（下方输入）" : "自定义回答"}
-                        </ChoiceButton>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Other 模式 textarea：选项区不动、出现在下方
-                      没有 options 时也显示（纯文本问题） */}
-                  {(inOther || !q.options || q.options.length === 0) && (
-                    <div className="flex flex-col gap-2 pl-9">
-                      <Textarea
-                        value={d?.text ?? ""}
-                        onChange={(e) =>
-                          handleOtherChange(q.id, e.target.value)
-                        }
-                        placeholder="输入你的回答…（或写「不清楚 / 你定」让 AI 按 default 走）"
-                        rows={3}
-                        className="resize-none text-sm"
-                        disabled={submitting}
-                      />
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {questions.map((q, qIdx) => (
+              <AskQuestionItem
+                key={`${askId}:${q.id}`}
+                question={q}
+                index={qIdx + 1}
+                submitting={submitting}
+                onChange={handleDraftChange}
+              />
+            ))}
           </div>
         </div>
 
@@ -416,12 +542,7 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
               拉到 content 边界外、被 overflow-hidden 裁掉、视觉上「贴底没间距」。 */}
           <div className="flex w-full items-center justify-between gap-2 text-xs text-muted-foreground">
             <span className="shrink-0">
-              已答 {Object.values(drafts).filter(
-                (d) =>
-                  d.optionId ||
-                  (d.text && d.text.trim().length > 0),
-              ).length}{" "}
-              / {questions.length}
+              已答 {answeredCount} / {questions.length}
             </span>
             <div className="flex items-center gap-2">
               {/* V0.5.6 「稍后再补充」：让位主操作用 ghost

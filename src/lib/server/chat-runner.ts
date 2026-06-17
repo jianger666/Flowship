@@ -259,7 +259,7 @@ const buildOpeningStanceSection = (
   const lines: string[] = [
     "## 起手姿势：先回答用户首条消息",
     "",
-    "下面是用户在 ai-flow UI 上发的第一条消息。**要查代码 / 查资料才能答的、先查清楚再答**；查完把结果 / 链接 / 结论写成一条正文发出去（别只发『正在检索 / 正在处理』的预告就去 wait——那不是答案），然后才调 wait_for_user 等下一句。",
+    "下面是用户在 ai-flow UI 上发的第一条消息。**要查代码 / 资料才能答的、先查清楚再答；要写 / 做的、就在这条正文里直接做出来**（或先交付本轮一个可用分段）；把成品（结果 / 代码 / 文章 / 方案 / 链接 / 结论）写成一条正文发出去——只『宣告要做』而没成品都是预告、不算回答（不管是『正在检索 / 正在处理』还是『我先写 X、写完后再等』），然后才调 wait_for_user 等下一句。",
     "",
     "用户消息：",
     "",
@@ -661,10 +661,13 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       const sdkErr = ctx.sdkErrorMessage
         ? `\n--- SDK stream error message ---\n${ctx.sdkErrorMessage}`
         : "";
+      // dump 完整 result（对齐 task-runner）：RunResult 类型没声明 errorCode、但运行时可能藏未声明字段、
+      // 落进 dump → 事后从 events.meta.detail 看 SDK 到底给了啥（区分额度 vs 连接断的唯一线索）。
+      const resultDump = stringifyMeta(result).slice(0, 1500);
       throw new Error(
         `agent run status=${result.status}${
           result.result ? `: ${result.result.slice(0, 200)}` : ""
-        }${sdkErr}`,
+        }${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
       );
     }
 
@@ -688,6 +691,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     await writeEventAndPublish(task.id, {
       kind: "error",
       text: eventText,
+      // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
+      meta: { detail: failure.detail },
     });
     const errorTask = await setTaskRunStatus(task.id, "error");
     if (errorTask) publish(task.id, { kind: "task", task: errorTask });

@@ -180,6 +180,7 @@ alwaysApply: true
 - `project.feishu.cn/mcp_server/v1` 是官方远程服务、无版本锁定——**同样参数 06-09 成功、06-12 报错**（add_comment mention 从 lark_user_id 体系切到 user_key 体系、报 `userKey cross tenant`）是真实发生过的。遇到「之前 OK 的飞书项目 MCP 调用突然挂」、先对照历史成功调用的参数（task events.jsonl 里有完整记录）、参数没变 = 服务端变了、做对照实验确诊、别先怀疑自己代码。
 - **@ 通知实验不要拿自己当被 @ 对象**——飞书项目全系「降噪不通知操作人自己」（官方 FAQ 明文）、MCP 走你本人 OAuth、@ 自己永远收不到通知、实验结果无效。要找第二个人验证送达。
 - 两套 id 体系别混：`user_key`（飞书项目体系、role_members 的 member.key、search_user_info 的 user_key 字段）vs `lark_user_id`（飞书 IM 体系）、都是 19 位纯数字、肉眼分不出来、写 artifact / 存字段时必须标清是哪种。
+- **add_comment 的 @ 推送是「回归 bug」、不是 by-design（2026-06-16 第二人复测确认仍坏）**：早先误判成「API 写不推送是设计如此」、收回。官方文档 [飞书项目需求详情页](https://www.feishu.cn/content/4ppsquwn) 明文「评论中@人（邮箱前缀）、被@的人将收到私信通知」——即评论 @ **本该**发私信。用户实证「上周（~06-09）还能用、评论改版后（~06-12）坏」。复现：`add_comment` 分别用 lark_user_id 体系（mention id=`lark_user_id_*` + notify_user_type=lark_user_id）和 user_key 体系（mention id=`user_key_*` + notify_user_type=user_key）发评论、**第二人肖康两条都没收到私信**；连 `update_field`/`update_node` 改角色 / 改活跃节点 owner（注：「测试排期」节点 owner 实际绑 QA 角色、update_node 的 node_owners 是 **add 增量语义**、移除要用 update_field role_operate remove）也没推送。手动 UI（走邮箱前缀、前端识别）不受影响。**公开渠道暂无该回归的官方公告 / 社区吐槽 / workaround、用户决定等官方修**。要立刻能通知只能 app 侧绕：接飞书自建机器人 `/open-apis/im/v1/messages` 直发 IM（需自建应用 + 消息权限 + 被通知人在可见范围）。下次别再从头排查、直接看这条；想确认是否已修、按上面复现法拿第二人验一次即可。
 
 ## MCP 工具 schema 的 describe 要和 prompt 指令一致（V0.6.1 踩过）
 
