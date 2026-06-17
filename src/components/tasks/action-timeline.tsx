@@ -116,7 +116,11 @@ const ActionChip = ({
         onClick={() => onSelectAction(action.id)}
         className={cn(
           "relative",
-          isCurrent && !isSelected && "ring-1 ring-primary/40",
+          isSelected &&
+            "bg-primary/10 text-primary ring-1 ring-primary/60 hover:bg-primary/15",
+          isCurrent &&
+            !isSelected &&
+            "bg-amber-500/5 text-foreground ring-1 ring-amber-500/50 hover:bg-amber-500/10",
           isStale && !isSelected && "opacity-50 text-muted-foreground",
           isExcluded && "line-through opacity-40",
         )}
@@ -208,6 +212,38 @@ export const ActionTimeline = ({
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
+      {needsCollapse && (
+        <Popover open={allOpen} onOpenChange={setAllOpen}>
+          <PopoverTrigger
+            aria-label={`查看全部 ${actions.length} 个 action`}
+            className="inline-flex h-7 cursor-pointer items-center rounded px-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+            title="查看全部 action"
+          >
+            全部 ({actions.length})
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-96 max-w-[80vw] p-2">
+            <div className="mb-2 px-1 text-xs text-muted-foreground">
+              全部 action
+            </div>
+            <div className="flex max-h-72 flex-wrap gap-1.5 overflow-y-auto pr-1">
+              {actions.map((action) => (
+                <ActionChip
+                  key={action.id}
+                  action={action}
+                  currentActionId={currentActionId}
+                  selectedActionId={selectedActionId}
+                  latestByType={latestByType}
+                  onSelectAction={(actionId) => {
+                    onSelectAction(actionId);
+                    setAllOpen(false);
+                  }}
+                  onToggleExclude={onToggleExclude}
+                />
+              ))}
+            </div>
+          </PopoverContent>
+        </Popover>
+      )}
       {needsCollapse && selectedAction && !selectedInRecent && selectedIndex > 0 && (
         <EllipsisChip title="已折叠 selected 之前的 action" />
       )}
@@ -241,38 +277,6 @@ export const ActionTimeline = ({
           onToggleExclude={onToggleExclude}
         />
       ))}
-      {needsCollapse && (
-        <Popover open={allOpen} onOpenChange={setAllOpen}>
-          <PopoverTrigger
-            aria-label={`查看全部 ${actions.length} 个 action`}
-            className="inline-flex h-7 cursor-pointer items-center rounded px-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-            title="查看全部 action"
-          >
-            查看全部 ({actions.length})
-          </PopoverTrigger>
-          <PopoverContent align="start" className="w-96 max-w-[80vw] p-2">
-            <div className="mb-2 px-1 text-xs text-muted-foreground">
-              全部 action
-            </div>
-            <div className="flex max-h-72 flex-wrap gap-1.5 overflow-y-auto pr-1">
-              {actions.map((action) => (
-                <ActionChip
-                  key={action.id}
-                  action={action}
-                  currentActionId={currentActionId}
-                  selectedActionId={selectedActionId}
-                  latestByType={latestByType}
-                  onSelectAction={(actionId) => {
-                    onSelectAction(actionId);
-                    setAllOpen(false);
-                  }}
-                  onToggleExclude={onToggleExclude}
-                />
-              ))}
-            </div>
-          </PopoverContent>
-        </Popover>
-      )}
     </div>
   );
 };

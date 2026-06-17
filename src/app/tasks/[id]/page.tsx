@@ -102,6 +102,8 @@ const TaskDetailPage = () => {
   const [loaded, setLoaded] = useState(false);
   // 用户当前在产物面板上看的 action（null = 没选、默认走 task.currentActionId）
   const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
+  // selectedActionId 属于哪个 task；切 task 时必须重置，避免不同 task 复用 act_1/act_2 造成误定位
+  const selectedActionTaskIdRef = useRef<string | null>(null);
   // 推进按钮 loading 态
   const [starting, setStarting] = useState(false);
   // 「再聊聊」对话框开关
@@ -168,6 +170,11 @@ const TaskDetailPage = () => {
   // 但「当前没选 / 选的 action 已被 GC」时回到 currentActionId
   useEffect(() => {
     if (!task) return;
+    if (selectedActionTaskIdRef.current !== task.id) {
+      selectedActionTaskIdRef.current = task.id;
+      setSelectedActionId(task.currentActionId ?? null);
+      return;
+    }
     if (!selectedActionId) {
       setSelectedActionId(task.currentActionId ?? null);
       return;
