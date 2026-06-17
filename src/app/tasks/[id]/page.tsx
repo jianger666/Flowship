@@ -831,7 +831,6 @@ const TaskDetailPage = () => {
         <div className="mt-3">
           <ActionTimeline
             actions={task.actions}
-            currentActionId={task.currentActionId}
             selectedActionId={selectedActionId}
             onSelectAction={setSelectedActionId}
             onToggleExclude={handleToggleExclude}

@@ -5,14 +5,10 @@
  *
  * 渲染任务的 action 历史、按时间从左到右展示。每个 chip：
  *   - 文案：`N <ACTION_LABEL>`、如 `1 plan`
- *   - 状态色：用 ACTION_STATUS_VARIANT
  *   - 点击切换 selected 状态、父组件控制 selectedActionId
- *   - 「当前」action（task.currentActionId）多一个外圈高亮
- *   - **stale chip**（V0.6.0.1 加、用户拍板）：同 type 有更晚一次（n 更大）的 action 时、
- *     旧那一次淡化展示（opacity-50 + text-muted-foreground）、视觉表达「已被取代的旧版本」
- *     - 仅视觉降权、点击仍可下发选中、ArtifactPanel 看历史版本不受影响
- *     - 跟 status 解耦：error / cancelled 的 chip 在 stale 时同样淡化、不再用 status 单独区分
- *     - hover title 后缀「已被 #N type 取代」、用户能确认是被哪个新版本取代
+ *   - 只高亮 selected（当前正在看的产物）和 excluded（已划除、不进 agent 上下文）
+ *   - 不展示 action status / latest / stale 视觉：长 shell 等用户导致历史状态容易误导，
+ *     timeline 在这里退回纯导航条
  *
  * 不渲染（V0.5 phase-progress 有但 V0.6 砍）：
  *   - 「下一步推荐」chip：V0.6.0.1 起 AdvanceDialog 仅按 task 状态选默认 chip、UI 不再标推荐二字、time-line 自然也不挂这个 chip
@@ -35,13 +31,11 @@ import {
 import { cn } from "@/lib/utils";
 import {
   ACTION_LABEL_SHORT,
-  ACTION_STATUS_LABEL,
 } from "@/lib/task-display";
-import type { ActionRecord, ActionType } from "@/lib/types";
+import type { ActionRecord } from "@/lib/types";
 
 interface Props {
   actions: ActionRecord[];
-  currentActionId: string | null;
   selectedActionId: string | null;
   onSelectAction: (actionId: string) => void;
   /**
@@ -53,53 +47,28 @@ interface Props {
 
 const RECENT_ACTION_LIMIT = 6;
 
-// 同 type 内 n 最大的 action 是「最新生效版本」、其他都是 stale
-// 返回：actionId -> 取代它的那个 latest action（仅 stale 的 action 才有值、用于 hover title）
-const computeLatestByType = (actions: ActionRecord[]): Map<ActionType, ActionRecord> => {
-  const latest = new Map<ActionType, ActionRecord>();
-  for (const a of actions) {
-    const cur = latest.get(a.type);
-    if (!cur || a.n > cur.n) latest.set(a.type, a);
-  }
-  return latest;
-};
-
 interface ActionChipProps {
   action: ActionRecord;
-  currentActionId: string | null;
   selectedActionId: string | null;
-  latestByType: Map<ActionType, ActionRecord>;
   onSelectAction: (actionId: string) => void;
   onToggleExclude?: (action: ActionRecord) => void;
 }
 
 const ActionChip = ({
   action,
-  currentActionId,
   selectedActionId,
-  latestByType,
   onSelectAction,
   onToggleExclude,
 }: ActionChipProps) => {
-  const isCurrent = action.id === currentActionId;
   const isSelected = action.id === selectedActionId;
   const isExcluded = action.excluded === true;
-  const latest = latestByType.get(action.type);
-  const isStale = latest !== undefined && latest.id !== action.id;
-  // 多个状态修饰拼一起、用户 hover 看到能直接判断 chip 此刻意味着什么
-  // 当前 = 还在跑 / 等 ack 的 action（ring 高亮）
-  // stale = 已被同 type 更新一次取代（淡化）
-  // excluded = 用户划除、line-through、不进 agent 上下文
+  // timeline 只表达「正在查看」和「是否划除」：
+  // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
   const titleParts = [
-    `#${action.n} ${ACTION_LABEL_SHORT[action.type]} · ${ACTION_STATUS_LABEL[action.status]}`,
+    `#${action.n} ${ACTION_LABEL_SHORT[action.type]}`,
   ];
-  if (isCurrent && !isSelected) {
-    titleParts.push("当前 action、点可跳回");
-  }
-  if (isStale) {
-    titleParts.push(
-      `已被 #${latest!.n} ${ACTION_LABEL_SHORT[latest!.type]} 取代`,
-    );
+  if (isSelected) {
+    titleParts.push("当前正在查看");
   }
   if (isExcluded) {
     titleParts.push("已划除、不进 agent 上下文");
@@ -118,10 +87,6 @@ const ActionChip = ({
           "relative",
           isSelected &&
             "bg-primary/10 text-primary ring-1 ring-primary/60 hover:bg-primary/15",
-          isCurrent &&
-            !isSelected &&
-            "bg-amber-500/5 text-foreground ring-1 ring-amber-500/50 hover:bg-amber-500/10",
-          isStale && !isSelected && "opacity-50 text-muted-foreground",
           isExcluded && "line-through opacity-40",
         )}
         title={title}
@@ -130,17 +95,6 @@ const ActionChip = ({
           #{action.n}
         </span>
         <span>{ACTION_LABEL_SHORT[action.type]}</span>
-        <span
-          className={cn(
-            "ml-1 inline-block size-1.5 shrink-0 rounded-full",
-            action.status === "completed" && "bg-emerald-500",
-            action.status === "running" && "bg-amber-500 animate-pulse",
-            action.status === "awaiting_ack" && "bg-blue-500",
-            action.status === "error" && "bg-destructive",
-            action.status === "cancelled" && "bg-muted-foreground/40",
-          )}
-          aria-hidden
-        />
       </ChoiceButton>
       {onToggleExclude && (
         <button
@@ -183,7 +137,6 @@ const EllipsisChip = ({ title }: { title: string }) => (
 
 export const ActionTimeline = ({
   actions,
-  currentActionId,
   selectedActionId,
   onSelectAction,
   onToggleExclude,
@@ -199,7 +152,6 @@ export const ActionTimeline = ({
     );
   }
 
-  const latestByType = computeLatestByType(actions);
   const recentStart = Math.max(0, actions.length - RECENT_ACTION_LIMIT);
   const recentActions = actions.slice(recentStart);
   const selectedIndex = selectedActionId
@@ -230,9 +182,7 @@ export const ActionTimeline = ({
                 <ActionChip
                   key={action.id}
                   action={action}
-                  currentActionId={currentActionId}
                   selectedActionId={selectedActionId}
-                  latestByType={latestByType}
                   onSelectAction={(actionId) => {
                     onSelectAction(actionId);
                     setAllOpen(false);
@@ -250,9 +200,7 @@ export const ActionTimeline = ({
       {needsCollapse && selectedAction && !selectedInRecent && (
         <ActionChip
           action={selectedAction}
-          currentActionId={currentActionId}
           selectedActionId={selectedActionId}
-          latestByType={latestByType}
           onSelectAction={onSelectAction}
           onToggleExclude={onToggleExclude}
         />
@@ -270,9 +218,7 @@ export const ActionTimeline = ({
         <ActionChip
           key={action.id}
           action={action}
-          currentActionId={currentActionId}
           selectedActionId={selectedActionId}
-          latestByType={latestByType}
           onSelectAction={onSelectAction}
           onToggleExclude={onToggleExclude}
         />
