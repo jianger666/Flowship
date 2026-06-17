@@ -464,7 +464,7 @@ export const ArtifactPanel = ({
             <span className="font-mono text-[10px]">#{action.n}</span>
             <span className="truncate">{ACTION_LABEL[action.type]}</span>
             <span className="text-muted-foreground">·</span>
-            <span className="truncate">{ACTION_STATUS_LABEL[action.status]}</span>
+            <span className="shrink-0">{ACTION_STATUS_LABEL[action.status]}</span>
           </Badge>
           <FileText className="size-3.5 shrink-0" />
           <span className="truncate" title={currentArtifact.filename}>

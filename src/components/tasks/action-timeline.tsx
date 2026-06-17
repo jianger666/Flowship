@@ -209,7 +209,7 @@ export const ActionTimeline = ({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {needsCollapse && selectedAction && !selectedInRecent && selectedIndex > 0 && (
-        <EllipsisChip title={`已折叠 #1-#${selectedAction.n - 1} action`} />
+        <EllipsisChip title="已折叠 selected 之前的 action" />
       )}
       {needsCollapse && selectedAction && !selectedInRecent && (
         <ActionChip

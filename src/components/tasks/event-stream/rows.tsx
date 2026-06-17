@@ -330,8 +330,6 @@ const EventRowImpl = ({
           ? "border bg-card/40 p-2"
           : "border border-transparent bg-transparent px-1.5 py-1 text-muted-foreground/80 hover:bg-muted/20",
         isDefaultVisible && isUser && "border-primary/30 bg-primary/5",
-        isDefaultVisible && isThinking && "border-violet-500/20 bg-violet-500/5",
-        isDefaultVisible && isToolCall && "border-blue-500/20 bg-blue-500/5",
       )}
     >
       <div
@@ -416,12 +414,7 @@ const EventRowImpl = ({
                 "mt-1 leading-relaxed wrap-break-word",
                 // tool_call 文本里常含长 JSON 路径、break-all 比 break-words 更强（任意字符断行）
                 isToolCall &&
-                  cn(
-                    "break-all font-mono text-[11px]",
-                    isDefaultVisible
-                      ? "text-foreground/80"
-                      : "text-muted-foreground/75",
-                  ),
+                  "break-all font-mono text-[11px] text-muted-foreground/75",
                 isThinking && "italic text-muted-foreground",
                 !isToolCall &&
                   !isThinking &&
