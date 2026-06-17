@@ -64,6 +64,10 @@ mac:
   # 不签名（内部分发、首次打开需右键 →「打开」过 Gatekeeper）
   identity: null
 
+dmg:
+  # 大包挂载 / 自更新 attach 时优先要解压速度；ULFO=LZFSE，macOS 10.11+ 支持。
+  format: ULFO
+
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
 # releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset
 publish:
