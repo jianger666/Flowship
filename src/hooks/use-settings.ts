@@ -25,7 +25,7 @@ import {
   initSettings,
   saveSettings,
 } from "@/lib/local-store";
-import type { FeAiFlowSettings, JumpIde } from "@/lib/types";
+import type { FeAiFlowSettings, JumpIde, SubmitShortcut } from "@/lib/types";
 
 /**
  * 轻量读「代码跳转 IDE」配置（artifact-panel / 事件流附件 chip 等展示组件用）
@@ -41,6 +41,17 @@ export const useJumpIde = (): JumpIde => {
     void initSettings().then(() => setIde(getSettings().jumpIde ?? "cursor"));
   }, []);
   return ide;
+};
+
+export const useSubmitShortcut = (): SubmitShortcut => {
+  const [shortcut, setShortcut] = useState<SubmitShortcut>("mod-enter");
+  useEffect(() => {
+    // 轻量读取个人输入偏好；默认保持旧行为，避免配置初始化前误改 Enter 语义。
+    void initSettings().then(() =>
+      setShortcut(getSettings().submitShortcut ?? "mod-enter"),
+    );
+  }, []);
+  return shortcut;
 };
 
 type SettingsField = keyof FeAiFlowSettings;
@@ -74,7 +85,8 @@ const isFieldEqual = (
     key === "gitHost" ||
     key === "gitToken" ||
     key === "branchTemplate" ||
-    key === "jumpIde"
+    key === "jumpIde" ||
+    key === "submitShortcut"
   ) {
     return (a[key] ?? "") === (b[key] ?? "");
   }
@@ -136,6 +148,7 @@ export const useSettings = (): UseSettingsResult => {
       repos: !isFieldEqual("repos", settings, savedSettings),
       username: !isFieldEqual("username", settings, savedSettings),
       jumpIde: !isFieldEqual("jumpIde", settings, savedSettings),
+      submitShortcut: !isFieldEqual("submitShortcut", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),

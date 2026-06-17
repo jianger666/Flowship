@@ -36,6 +36,7 @@ import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
+import { ShortcutCard } from "@/components/settings/shortcut-card";
 
 const SettingsPage = () => {
   const router = useRouter();
@@ -101,6 +102,11 @@ const SettingsPage = () => {
         onCommit={(v) => saveFieldValue("username", v)}
         onBranchTemplateChange={(v) => update("branchTemplate", v)}
         onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
+      />
+
+      <ShortcutCard
+        submitShortcut={settings.submitShortcut ?? "mod-enter"}
+        onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
       />
 
       <GitCard

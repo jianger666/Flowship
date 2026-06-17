@@ -34,6 +34,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   repos: [],
   username: "",
   jumpIde: "cursor",
+  submitShortcut: "mod-enter",
   gitHost: "",
   gitToken: "",
   branchTemplate: DEFAULT_BRANCH_TEMPLATE,
@@ -74,6 +75,9 @@ const normalizeSettings = (
     username: typeof parsed.username === "string" ? parsed.username : "",
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
     jumpIde: parsed.jumpIde === "idea" ? "idea" : "cursor",
+    // 提交快捷键：旧配置没有 / 手改坏时回退当前默认行为
+    submitShortcut:
+      parsed.submitShortcut === "enter" ? "enter" : "mod-enter",
     // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
     gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
     gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",

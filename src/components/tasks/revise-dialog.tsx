@@ -36,6 +36,11 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { useImageAttach } from "@/hooks/use-image-attach";
+import { useSubmitShortcut } from "@/hooks/use-settings";
+import {
+  getSubmitShortcutHint,
+  shouldSubmitOnKeyDown,
+} from "@/lib/submit-shortcut";
 import type { ImagePayload } from "@/lib/task-store";
 
 interface Props {
@@ -59,6 +64,9 @@ const ReviseDialogImpl = ({
   // 留言草稿：抽到本组件内部、不上抛父组件
   // 打字时只触发本 dialog re-render、不会拖累整个详情页
   const [draft, setDraft] = useState("");
+  // 跟聊天输入框共享同一提交偏好，避免用户在不同输入区切换心智。
+  const submitShortcut = useSubmitShortcut();
+  const submitShortcutHint = getSubmitShortcutHint(submitShortcut);
 
   // 图附件管理统一走 hook、跟 event-stream 共用
   const {
@@ -101,10 +109,9 @@ const ReviseDialogImpl = ({
     void onSubmit(draft.trim(), toUploadPayload());
   };
 
-  // Cmd/Ctrl + Enter 提交、单 Enter 换行
-  // 跟 event-stream 输入框一致、chat 应用通用习惯（Slack/Cursor 等）
+  // 跟 event-stream 输入框一致，按设置页个人偏好决定 Enter 语义。
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    if (shouldSubmitOnKeyDown(e, submitShortcut)) {
       e.preventDefault();
       handleSubmit();
     }
@@ -164,7 +171,7 @@ const ReviseDialogImpl = ({
             onPaste={onPaste}
             onKeyDown={handleKeyDown}
             rows={6}
-            placeholder="想改、想问、或者贴图说明（Cmd+Enter 发送）"
+            placeholder={`想改、想问、或者贴图说明（${submitShortcutHint}）`}
             autoFocus
           />
           {/* 隐藏 input：附图按钮触发它 */}

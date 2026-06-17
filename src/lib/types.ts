@@ -118,12 +118,16 @@ export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
   idea: "IDEA",
 };
 
+export type SubmitShortcut = "mod-enter" | "enter";
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
   username?: string;
   /** 代码路径点击跳转的 IDE、默认 cursor */
   jumpIde?: JumpIde;
+  /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */
+  submitShortcut?: SubmitShortcut;
   /**
    * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
    * 空时 ship action 准入会拦、提示用户先配

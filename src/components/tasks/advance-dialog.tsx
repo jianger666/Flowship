@@ -52,7 +52,9 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
+import { useSubmitShortcut } from "@/hooks/use-settings";
 import { getSettings } from "@/lib/local-store";
+import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { ACTION_LABEL, computeBatchProgress } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
 import { fetchShipPrecheck } from "@/lib/task-store";
@@ -293,6 +295,8 @@ export const AdvanceDialog = ({
   const [shipPrecheckLoading, setShipPrecheckLoading] = useState(false);
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
+  // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
+  const submitShortcut = useSubmitShortcut();
 
   // 指令输入框的图附件（粘贴 / 拖拽 / 选文件）、跟 revise-dialog 共用 hook
   const {
@@ -659,7 +663,7 @@ export const AdvanceDialog = ({
                 onChange={(e) => setInstruction(e.target.value)}
                 onPaste={onPaste}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  if (shouldSubmitOnKeyDown(e, submitShortcut)) {
                     e.preventDefault();
                     void handleSubmit();
                   }

@@ -37,8 +37,14 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { useImageAttach } from "@/hooks/use-image-attach";
+import { useSubmitShortcut } from "@/hooks/use-settings";
 import { pickNativePaths } from "@/lib/native-picker";
 import { pathBasename } from "@/lib/path-utils";
+import {
+  getSubmitShortcutHint,
+  getSubmitShortcutTitle,
+  shouldSubmitOnKeyDown,
+} from "@/lib/submit-shortcut";
 import type { ImagePayload } from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
@@ -135,6 +141,10 @@ const EventStreamImpl = ({
   // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
   // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
   const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
+  // 个人偏好的提交快捷键：默认 Cmd/Ctrl+Enter，设置页可切 Enter 提交。
+  const submitShortcut = useSubmitShortcut();
+  const submitShortcutHint = getSubmitShortcutHint(submitShortcut);
+  const submitShortcutTitle = getSubmitShortcutTitle(submitShortcut);
   // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方 streaming 自动滚 effect）
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   // 用户当前是否贴在底部（由 Virtuoso atBottomStateChange 维护）。
@@ -275,8 +285,7 @@ const EventStreamImpl = ({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Cmd/Ctrl + Enter 发送、单 Enter 换行、避免误发
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    if (shouldSubmitOnKeyDown(e, submitShortcut)) {
       e.preventDefault();
       handleSend();
     }
@@ -435,7 +444,7 @@ const EventStreamImpl = ({
               rows={2}
               placeholder={
                 isAwaitingUser
-                  ? "随便聊、贴图、拖文件（Cmd+Enter 发送）"
+                  ? `随便聊、贴图、拖文件（${submitShortcutHint}）`
                   : (disabledHint ?? "agent 当前没有等待你回复")
               }
               disabled={!isAwaitingUser}
@@ -516,7 +525,7 @@ const EventStreamImpl = ({
                       }
                       onClick={handleSend}
                       className="ml-1 size-7 rounded-lg p-0"
-                      title="发送（Cmd+Enter）"
+                      title={`发送（${submitShortcutTitle}）`}
                     >
                       <ArrowUp className="size-4" />
                     </Button>
@@ -626,7 +635,7 @@ const EventStreamImpl = ({
           rows={3}
           placeholder={
             isAwaitingUser
-              ? "回复 / 粘贴或拖拽图片 / 点附图按钮（Cmd+Enter 发送）"
+              ? `回复 / 粘贴或拖拽图片 / 点附图按钮（${submitShortcutHint}）`
               : (disabledHint ?? "agent 当前没有等待你回复")
           }
           disabled={!isAwaitingUser}
