@@ -84,14 +84,19 @@ const ActionChip = ({
         selected={isSelected}
         onClick={() => onSelectAction(action.id)}
         className={cn(
-          "relative",
+          "relative text-foreground/85 hover:bg-muted/50 hover:text-foreground",
           isSelected &&
-            "bg-primary/10 text-primary ring-1 ring-primary/60 hover:bg-primary/15",
-          isExcluded && "line-through opacity-40",
+            "bg-primary/15 text-primary ring-1 ring-primary/70 hover:bg-primary/20",
+          isExcluded && "line-through opacity-60",
         )}
         title={title}
       >
-        <span className="mr-1 text-[10px] text-muted-foreground">
+        <span
+          className={cn(
+            "mr-1 text-[10px] text-muted-foreground/85",
+            isSelected && "text-primary/80",
+          )}
+        >
           #{action.n}
         </span>
         <span>{ACTION_LABEL_SHORT[action.type]}</span>
@@ -168,7 +173,7 @@ export const ActionTimeline = ({
         <Popover open={allOpen} onOpenChange={setAllOpen}>
           <PopoverTrigger
             aria-label={`查看全部 ${actions.length} 个 action`}
-            className="inline-flex h-7 cursor-pointer items-center rounded px-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+            className="inline-flex h-7 cursor-pointer items-center rounded-md border border-border/60 bg-muted/20 px-2 text-xs text-muted-foreground/90 transition-colors hover:bg-muted/50 hover:text-foreground"
             title="查看全部 action"
           >
             全部 ({actions.length})

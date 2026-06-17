@@ -139,6 +139,93 @@ const StreamingAssistantRowImpl = ({
 // memo 让 SSE 推 chunk 时只有 text 真的变了才重渲染、Virtuoso 内部 item 不无意义 reconcile
 export const StreamingAssistantRow = memo(StreamingAssistantRowImpl);
 
+interface ProcessEventRowProps {
+  ev: TaskEvent;
+  collapsed: boolean;
+  summary: string;
+  batch: ToolCallBatchItem[] | null;
+  actionTag?: string;
+  isToolCall: boolean;
+  isThinking: boolean;
+  onToggle: () => void;
+}
+
+/**
+ * 过程事件行：thinking / tool_call / 普通 info 等低权重事件统一用 chat 的细行样式。
+ * task(log) 会额外传 actionTag 保留归属，chat 不传，避免两种场景丢上下文。
+ */
+const ProcessEventRow = ({
+  ev,
+  collapsed,
+  summary,
+  batch,
+  actionTag,
+  isToolCall,
+  isThinking,
+  onToggle,
+}: ProcessEventRowProps) => (
+  <div className="group/proc">
+    <button
+      type="button"
+      onClick={onToggle}
+      className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
+    >
+      {collapsed ? (
+        <ChevronRight className="size-3 shrink-0 opacity-50" />
+      ) : (
+        <ChevronDown className="size-3 shrink-0 opacity-50" />
+      )}
+      <span className="shrink-0 [&_svg]:size-3">
+        {renderEventIcon(ev.kind)}
+      </span>
+      <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
+      {actionTag && (
+        <span className="shrink-0 rounded bg-muted/35 px-1 py-0.5 text-[10px] text-muted-foreground/80">
+          {actionTag}
+        </span>
+      )}
+      {collapsed && summary && (
+        <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
+          {summary}
+        </span>
+      )}
+      <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/proc:opacity-60">
+        {formatTs(ev.ts)}
+      </span>
+    </button>
+    {!collapsed && (
+      <div className="ml-5 mt-1 border-l border-border/50 pl-3">
+        {batch ? (
+          <ul className="space-y-1">
+            {batch.map((item) => (
+              <li
+                key={item.id}
+                className="flex gap-2 break-all font-mono text-[11px] text-muted-foreground"
+              >
+                <span className="shrink-0 opacity-60">{formatTs(item.ts)}</span>
+                {item.name && (
+                  <span className="shrink-0 text-blue-500/80">{item.name}</span>
+                )}
+                <span className="min-w-0 flex-1">{item.text}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div
+            className={cn(
+              "wrap-break-word text-xs leading-relaxed text-muted-foreground",
+              isToolCall && "break-all font-mono text-[11px]",
+              isThinking && "italic",
+            )}
+          >
+            {ev.text}
+          </div>
+        )}
+      </div>
+    )}
+  </div>
+);
+
 const EventRowImpl = ({
   ev,
   taskId,
@@ -206,6 +293,18 @@ const EventRowImpl = ({
   // 展开态：原样 ev.text；batch 模式下展开走 batch 列表
   // batch 模式 summary 追加「×N」后缀、用户一眼看到「这 N 条都是同种工具调用」
   const summary = batch ? `${summarize(ev.text)} ×${batchCount}` : summarize(ev.text);
+  const processRow = (
+    <ProcessEventRow
+      ev={ev}
+      collapsed={collapsed}
+      summary={summary}
+      batch={batch}
+      actionTag={variant === "log" && actionType ? ACTION_LABEL_SHORT[actionType] : undefined}
+      isToolCall={isToolCall}
+      isThinking={isThinking}
+      onToggle={handleToggle}
+    />
+  );
 
   // ---------- chat 形态（V0.7.11）----------
   // 设计参照 Cursor agent window：
@@ -272,54 +371,11 @@ const EventRowImpl = ({
       );
     }
     // 过程行（thinking / tool_call / info / error…）：单行细条目、可展开
-    return (
-      <div className="group/proc">
-        <button
-          type="button"
-          onClick={handleToggle}
-          className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
-        >
-          {collapsed ? (
-            <ChevronRight className="size-3 shrink-0 opacity-50" />
-          ) : (
-            <ChevronDown className="size-3 shrink-0 opacity-50" />
-          )}
-          <span className="shrink-0 [&_svg]:size-3">{renderEventIcon(ev.kind)}</span>
-          <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
-          {collapsed && summary && (
-            <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">{summary}</span>
-          )}
-          <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/proc:opacity-60">
-            {formatTs(ev.ts)}
-          </span>
-        </button>
-        {!collapsed && (
-          <div className="ml-5 mt-1 border-l border-border/50 pl-3">
-            {batch ? (
-              <ul className="space-y-1">
-                {batch.map((item) => (
-                  <li key={item.id} className="flex gap-2 break-all font-mono text-[11px] text-muted-foreground">
-                    <span className="shrink-0 opacity-60">{formatTs(item.ts)}</span>
-                    {item.name && <span className="shrink-0 text-blue-500/80">{item.name}</span>}
-                    <span className="min-w-0 flex-1">{item.text}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <div
-                className={cn(
-                  "wrap-break-word text-xs leading-relaxed text-muted-foreground",
-                  isToolCall && "break-all font-mono text-[11px]",
-                  isThinking && "italic",
-                )}
-              >
-                {ev.text}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
+    return processRow;
+  }
+
+  if (!isDefaultVisible) {
+    return processRow;
   }
 
   return (

@@ -38,17 +38,9 @@ declare global {
   }
 }
 
-// "rgb(r, g, b)" / "rgba(...)" → "#rrggbb"
-const rgbToHex = (rgb: string): string => {
-  const m = rgb.match(/\d+/g);
-  if (!m || m.length < 3) return "#000000";
-  return (
-    "#" +
-    m
-      .slice(0, 3)
-      .map((v) => Number(v).toString(16).padStart(2, "0"))
-      .join("")
-  );
+const TITLEBAR_OVERLAY_COLOR = {
+  dark: { color: "#17181c", symbolColor: "#e5e5e5" },
+  light: { color: "#f3f4f6", symbolColor: "#404040" },
 };
 
 interface AppHeaderProps {
@@ -78,13 +70,12 @@ export const AppHeader = ({
   useEffect(() => {
     const shell = window.__shell;
     if (!shell || shell.platform === "darwin") return;
-    // 等主题 class 切到 <html> 后再读 computed 色、避免读到旧主题
+    // 不读 computed color：主题 token 是 OKLCH，Chromium 可能原样返回 oklch(...)
+    // 让 rgb parser 失效，Windows overlay 留在启动期黑色。这里用壳侧同款 hex。
     const id = requestAnimationFrame(() => {
-      const cs = getComputedStyle(document.body);
-      shell.setTitleBarOverlay({
-        color: rgbToHex(cs.backgroundColor),
-        symbolColor: rgbToHex(cs.color),
-      });
+      shell.setTitleBarOverlay(
+        TITLEBAR_OVERLAY_COLOR[resolvedTheme === "dark" ? "dark" : "light"],
+      );
     });
     return () => cancelAnimationFrame(id);
   }, [resolvedTheme]);

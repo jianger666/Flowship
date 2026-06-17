@@ -636,11 +636,16 @@ const TaskDetailPage = () => {
                 <Badge variant={REPO_STATUS_VARIANT[task.repoStatus]}>
                   {REPO_STATUS_LABEL[task.repoStatus]}
                 </Badge>
-                {task.runStatus !== "idle" && (
+                {task.runStatus === "error" ? (
+                  <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground">
+                    <span className="size-1.5 rounded-full bg-destructive/80" />
+                    {RUN_STATUS_LABEL[task.runStatus]}
+                  </span>
+                ) : task.runStatus !== "idle" ? (
                   <Badge variant={RUN_STATUS_VARIANT[task.runStatus]}>
                     {RUN_STATUS_LABEL[task.runStatus]}
                   </Badge>
-                )}
+                ) : null}
                 {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
                 {task.runStatus !== "running" && (
                   <Button

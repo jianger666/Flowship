@@ -10,7 +10,7 @@
  *   - Header = 「选哪个 + 是什么 + 什么状态」
  *       · timeline 纯导航（选 action → 切 artifact）
  *       · selected 身份由 timeline 高亮 chip 表达
- *       · 这一步 status 由 badge 表达（单一源 ACTION_STATUS_*、不自写状态色）
+ *       · 这一步 status 轻量表达；error 降权成小红点，避免历史失败抢走主视线
  *       · filename 由 ArtifactPanel 上报、在这里显示（口径：filename 归 Header）
  *   - ArtifactPanel = 「内容长啥 + 怎么看这份内容」（正文 / Diff / revision，仍在 Panel 内）
  *
@@ -60,12 +60,19 @@ export const ActionWorkbenchHeader = ({
         </div>
         {selectedAction && (
           <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-            <Badge
-              variant={ACTION_STATUS_VARIANT[selectedAction.status]}
-              className="h-5 shrink-0 px-1.5 text-xs font-normal"
-            >
-              {ACTION_STATUS_LABEL[selectedAction.status]}
-            </Badge>
+            {selectedAction.status === "error" ? (
+              <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground">
+                <span className="size-1.5 rounded-full bg-destructive/80" />
+                {ACTION_STATUS_LABEL[selectedAction.status]}
+              </span>
+            ) : (
+              <Badge
+                variant={ACTION_STATUS_VARIANT[selectedAction.status]}
+                className="h-5 shrink-0 px-1.5 text-xs font-normal"
+              >
+                {ACTION_STATUS_LABEL[selectedAction.status]}
+              </Badge>
+            )}
             {artifactFilename && (
               <span className="flex items-center gap-1">
                 <FileText className="size-3.5 shrink-0" />
