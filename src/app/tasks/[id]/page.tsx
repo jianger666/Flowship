@@ -10,14 +10,15 @@
  *   - 删 chat-view / phase-progress / approve-phase-dialog（旧 phase 模型遗物）
  *   - 加 ActionTimeline、action 切换、推进 dialog 选 action 类型
  *
- * 布局：
+ * 布局（V0.7：ActionTimeline 从顶部条归位到 artifact 工作区顶部）：
  *   ┌──────────────────────────────────────────────────┐
  *   │ 顶部条：标题 + 状态徽章 + 推进 / ack 按钮         │
- *   │ ContextDocs + MCP 按钮                          │
- *   │ ActionTimeline（chip）                          │
+ *   │ ContextDocs + MCP + 批次 chip                   │
  *   ├──────────────────────────┬───────────────────────┤
- *   │ 左：ArtifactPanel       │ 右：EventStream      │
- *   │  当前 selected action    │  全任务事件流        │
+ *   │ ActionWorkbenchHeader     │ 右：EventStream      │
+ *   │  (timeline+status+file)   │  全任务事件流        │
+ *   │ 左：ArtifactPanel         │                      │
+ *   │  当前 selected action     │                      │
  *   └──────────────────────────┴───────────────────────┘
  *
  */
@@ -39,7 +40,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ActionTimeline } from "@/components/tasks/action-timeline";
+import { ActionWorkbenchHeader } from "@/components/tasks/action-workbench-header";
 import { AdvanceDialog } from "@/components/tasks/advance-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
@@ -120,6 +121,14 @@ const TaskDetailPage = () => {
   const [stopping, setStopping] = useState(false);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
+  // 当前 artifact 文件名：ArtifactPanel 上报、透传给工作区 Header 显示（filename 归 Header）
+  const [artifactFilename, setArtifactFilename] = useState<string | null>(null);
+  const handleArtifactMeta = useCallback(
+    (meta: { filename: string } | null) => {
+      setArtifactFilename(meta?.filename ?? null);
+    },
+    [],
+  );
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
@@ -826,16 +835,6 @@ const TaskDetailPage = () => {
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
         </div>
-
-        {/* Action timeline */}
-        <div className="mt-3">
-          <ActionTimeline
-            actions={task.actions}
-            selectedActionId={selectedActionId}
-            onSelectAction={setSelectedActionId}
-            onToggleExclude={handleToggleExclude}
-          />
-        </div>
       </div>
 
       <Separator />
@@ -860,40 +859,56 @@ const TaskDetailPage = () => {
             maxSize="80%"
           >
             <div className="flex h-full flex-col">
-              {selectedAction ? (
-                <ArtifactPanel
-                  action={selectedAction}
-                  taskId={task.id}
-                  // V0.6.28：优先用 action 创建时的 cwd 快照——task 中途追加仓库后
-                  // effectiveCwd 会变、老 artifact 的相对路径必须按写入时基准解析；
-                  // 老数据没快照（V0.6.28 前的 action）回退实时计算
-                  baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
-                  // 多仓 task：仓短名清单给路径前缀校验用（agent 漏写仓名前缀的
-                  // 路径不渲染链接、点了必 404）；单仓不传 = 不校验
-                  repoShortNames={
-                    task.repoPaths.length > 1
-                      ? getRepoShortNames(
-                          task.repoPaths,
-                          selectedAction.cwd ?? getEffectiveCwd(task.repoPaths),
-                        )
-                      : undefined
-                  }
-                  onArtifactRefClick={(ref) => {
-                    // 找最近匹配 (n, type) 的 action、切过去
-                    const target = task.actions.find(
-                      (a) => a.n === ref.n && a.type === ref.type,
-                    );
-                    if (target) setSelectedActionId(target.id);
-                  }}
-                />
-              ) : (
-                <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                  <Sparkles className="mr-2 size-4" />
-                  {task.actions.length === 0
-                    ? "还没推进过任何 action、点上方「推进」按钮开始"
-                    : "选一个 action 查看其产物"}
-                </div>
-              )}
+              <ActionWorkbenchHeader
+                actions={task.actions}
+                selectedAction={selectedAction}
+                selectedActionId={selectedActionId}
+                onSelectAction={setSelectedActionId}
+                onToggleExclude={handleToggleExclude}
+                artifactFilename={artifactFilename}
+              />
+              <div className="min-h-0 flex-1">
+                {selectedAction ? (
+                  <ArtifactPanel
+                    // P1：按 action.id remount——切 action 时彻底重置内部产物状态
+                    // （content/revisions/diff/filename），避免「Header 身份已切到新
+                    // action、正文/filename 还停在旧 action」的错误配对；卸载时回调
+                    // 上报 filename=null、Header 同步进入过渡态。
+                    key={selectedAction.id}
+                    action={selectedAction}
+                    taskId={task.id}
+                    // V0.6.28：优先用 action 创建时的 cwd 快照——task 中途追加仓库后
+                    // effectiveCwd 会变、老 artifact 的相对路径必须按写入时基准解析；
+                    // 老数据没快照（V0.6.28 前的 action）回退实时计算
+                    baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
+                    // 多仓 task：仓短名清单给路径前缀校验用（agent 漏写仓名前缀的
+                    // 路径不渲染链接、点了必 404）；单仓不传 = 不校验
+                    repoShortNames={
+                      task.repoPaths.length > 1
+                        ? getRepoShortNames(
+                            task.repoPaths,
+                            selectedAction.cwd ?? getEffectiveCwd(task.repoPaths),
+                          )
+                        : undefined
+                    }
+                    onArtifactRefClick={(ref) => {
+                      // 找最近匹配 (n, type) 的 action、切过去
+                      const target = task.actions.find(
+                        (a) => a.n === ref.n && a.type === ref.type,
+                      );
+                      if (target) setSelectedActionId(target.id);
+                    }}
+                    onArtifactMetaChange={handleArtifactMeta}
+                  />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    <Sparkles className="mr-2 size-4" />
+                    {task.actions.length === 0
+                      ? "推进后、action 产物显示在这里"
+                      : "选一个 action 查看其产物"}
+                  </div>
+                )}
+              </div>
             </div>
           </ResizablePanel>
           <ResizableHandle withHandle />

@@ -30,7 +30,6 @@ import remarkGfm from "remark-gfm";
 import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
-import { Badge } from "@/components/ui/badge";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
@@ -52,10 +51,8 @@ import {
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import {
-  ACTION_LABEL,
   ACTION_LABEL_EN,
-  ACTION_STATUS_LABEL,
-  ACTION_STATUS_VARIANT,
+  ACTION_LABEL_SHORT,
 } from "@/lib/task-display";
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
@@ -76,8 +73,9 @@ const ArtifactDiff = dynamic(
 );
 
 // artifact-panel 的标题用「中文（英文）」复合形式
+// V0.7：中文部分用 SHORT、跟 timeline 同口径——build 全工作区统一叫「实现」、不再「改代码」
 const formatActionTitle = (type: ActionType) =>
-  `${ACTION_LABEL[type]} (${ACTION_LABEL_EN[type]})`;
+  `${ACTION_LABEL_SHORT[type]} (${ACTION_LABEL_EN[type]})`;
 
 // 短时间格式（dropdown 选项用）：MM-DD HH:mm
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -150,7 +148,7 @@ const buildMarkdownComponents = (
           type="button"
           className="group cursor-pointer bg-transparent p-0 align-baseline"
           onClick={() => onArtifactRefClick(ref)}
-          title={`跳到 ${ACTION_LABEL[ref.type]} action #${ref.n}`}
+          title={`跳到 ${ACTION_LABEL_SHORT[ref.type]} action #${ref.n}`}
         >
           <span className="font-mono text-[0.85em] text-sky-600 dark:text-sky-400 underline-offset-2 group-hover:underline">
             {text}
@@ -242,6 +240,11 @@ interface Props {
   /** 多仓 task 的仓短名清单（相对 baseDir）、用于路径前缀校验；单仓不传 = 不校验 */
   repoShortNames?: string[];
   onArtifactRefClick?: (ref: ActionArtifactRef) => void;
+  /**
+   * 当前 artifact 文件名上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
+   * null = 没有产物 / 加载中尚无内容。父组件需用 useCallback 稳定引用、否则 effect 反复触发。
+   */
+  onArtifactMetaChange?: (meta: { filename: string } | null) => void;
 }
 
 type ViewMode = "content" | "diff";
@@ -263,6 +266,7 @@ export const ArtifactPanel = ({
   baseDir,
   repoShortNames,
   onArtifactRefClick,
+  onArtifactMetaChange,
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
   // 代码跳转 IDE 配置（设置页可切 Cursor / IDEA）
@@ -279,7 +283,9 @@ export const ArtifactPanel = ({
     content: string;
     filename: string;
   } | null>(null);
-  const [contentLoading, setContentLoading] = useState(false);
+  // 初始 true：组件（含按 action.id remount）一挂载就要拉产物、
+  // 首帧直接走「加载产物…」、不闪上一个 action 的内容、也不误显「没有产物」。
+  const [contentLoading, setContentLoading] = useState(true);
   // revision 列表
   const [revisions, setRevisions] = useState<ArtifactRevision[]>([]);
   const [compareFromTs, setCompareFromTs] = useState<number | null>(null);
@@ -297,6 +303,15 @@ export const ArtifactPanel = ({
     setMode("content");
     setDiffData(null);
   }, [taskId, action.id]);
+
+  // filename 上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
+  // 卸载（selected 切到空态）时报 null、避免 Header 残留上一个产物的文件名。
+  useEffect(() => {
+    onArtifactMetaChange?.(
+      currentArtifact ? { filename: currentArtifact.filename } : null,
+    );
+  }, [currentArtifact, onArtifactMetaChange]);
+  useEffect(() => () => onArtifactMetaChange?.(null), [onArtifactMetaChange]);
 
   // artifact 内容 + revision 列表一起拉
   // 依赖：action.id + action.endedAt（agent 写完 artifact 会 patchAction(endedAt) ）+ action.status
@@ -454,23 +469,7 @@ export const ArtifactPanel = ({
   return (
     <div className="flex h-full flex-col">
       {/* toolbar */}
-      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-4 text-xs">
-        <div className="flex min-w-0 items-center gap-2 text-muted-foreground">
-          <Badge
-            variant={ACTION_STATUS_VARIANT[action.status]}
-            className="h-5 max-w-[150px] shrink-0 gap-1 px-1.5 text-[11px] font-normal"
-            title={`#${action.n} ${ACTION_LABEL[action.type]} · ${ACTION_STATUS_LABEL[action.status]}`}
-          >
-            <span className="font-mono text-[10px]">#{action.n}</span>
-            <span className="truncate">{ACTION_LABEL[action.type]}</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="shrink-0">{ACTION_STATUS_LABEL[action.status]}</span>
-          </Badge>
-          <FileText className="size-3.5 shrink-0" />
-          <span className="truncate" title={currentArtifact.filename}>
-            {currentArtifact.filename}
-          </span>
-        </div>
+      <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-b px-4 text-xs">
         <div className="flex shrink-0 items-center gap-1">
           <ChoiceButton
             shape="tab"
