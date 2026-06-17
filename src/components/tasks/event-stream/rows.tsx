@@ -166,6 +166,9 @@ const EventRowImpl = ({
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
   const isToolCall = ev.kind === "tool_call";
+  const isAwaitingAck = ev.meta?.awaitingAck === true;
+  // log 形态降权只看默认折叠规则：过程类降噪，HITL / 失败 / 核心对话保持可见。
+  const isDefaultVisible = DEFAULT_EXPANDED_KINDS.has(ev.kind) || isAwaitingAck;
   // 是否用 markdown 渲染：AI 回复 / 用户回复（用户也可能贴 markdown 进来）
   // thinking / tool_call / info / error 一律纯文本（结构化输出 / 错误消息、markdown 反而碍事）
   const useMarkdown = isAssistant || isUser;
@@ -194,8 +197,7 @@ const EventRowImpl = ({
   // - info 里带 meta.awaitingAck 的「Action 产出完成、等待 ack」里程碑事件也默认展开（用户要 ack）
   // - 其他：默认折叠（避免 thinking / tool_call 刷屏）
   // 组件内 state、用户手动切换后保持（不会被新事件刷掉）
-  const isAwaitingAck = ev.meta?.awaitingAck === true;
-  const defaultCollapsed = !DEFAULT_EXPANDED_KINDS.has(ev.kind) && !isAwaitingAck;
+  const defaultCollapsed = !isDefaultVisible;
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
 
   const handleToggle = () => setCollapsed((c) => !c);
@@ -323,20 +325,33 @@ const EventRowImpl = ({
   return (
     <div
       className={cn(
-        "flex gap-2 rounded-md border bg-card/40 p-2",
-        isUser && "border-primary/30 bg-primary/5",
-        isThinking && "border-violet-500/20 bg-violet-500/5",
-        isToolCall && "border-blue-500/20 bg-blue-500/5",
+        "flex gap-2 rounded-md transition-colors",
+        isDefaultVisible
+          ? "border bg-card/40 p-2"
+          : "border border-transparent bg-transparent px-1.5 py-1 text-muted-foreground/80 hover:bg-muted/20",
+        isDefaultVisible && isUser && "border-primary/30 bg-primary/5",
+        isDefaultVisible && isThinking && "border-violet-500/20 bg-violet-500/5",
+        isDefaultVisible && isToolCall && "border-blue-500/20 bg-blue-500/5",
       )}
     >
-      <div className="mt-0.5 shrink-0">{renderEventIcon(ev.kind)}</div>
+      <div
+        className={cn(
+          "mt-0.5 shrink-0",
+          !isDefaultVisible && "opacity-60 [&_svg]:text-muted-foreground",
+        )}
+      >
+        {renderEventIcon(ev.kind)}
+      </div>
       {/* min-w-0 防止 flex 子项把容器撑爆、配合下面的 break-all / break-words 让长文本自动换行 */}
       <div className="min-w-0 flex-1 text-xs">
         {/* header：整行 hover、点击切换折叠 */}
         <button
           type="button"
           onClick={handleToggle}
-          className="flex w-full cursor-pointer items-center gap-2 text-left hover:opacity-80"
+          className={cn(
+            "flex w-full cursor-pointer items-center text-left hover:opacity-80",
+            isDefaultVisible ? "gap-2" : "gap-1.5",
+          )}
         >
           {collapsed ? (
             <ChevronRight className="size-3 shrink-0 text-muted-foreground" />
@@ -344,7 +359,12 @@ const EventRowImpl = ({
             <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
           )}
           {actionType && (
-            <span className="rounded bg-muted/60 px-1 py-0.5 text-[10px] tracking-wide text-muted-foreground">
+            <span
+              className={cn(
+                "rounded px-1 py-0.5 text-[10px] tracking-wide text-muted-foreground",
+                isDefaultVisible ? "bg-muted/60" : "bg-muted/30",
+              )}
+            >
               {ACTION_LABEL_SHORT[actionType]}
             </span>
           )}
@@ -354,7 +374,14 @@ const EventRowImpl = ({
           <span className="text-muted-foreground">{formatTs(ev.ts)}</span>
           {/* 折叠态把摘要也放 header 里、用户一眼看到这是啥事件、不用展开 */}
           {collapsed && summary && (
-            <span className="min-w-0 flex-1 truncate text-muted-foreground/80">
+            <span
+              className={cn(
+                "min-w-0 flex-1 truncate",
+                isDefaultVisible
+                  ? "text-muted-foreground/80"
+                  : "text-muted-foreground/65",
+              )}
+            >
               {summary}
             </span>
           )}
@@ -388,9 +415,18 @@ const EventRowImpl = ({
               className={cn(
                 "mt-1 leading-relaxed wrap-break-word",
                 // tool_call 文本里常含长 JSON 路径、break-all 比 break-words 更强（任意字符断行）
-                isToolCall && "break-all font-mono text-[11px] text-foreground/80",
+                isToolCall &&
+                  cn(
+                    "break-all font-mono text-[11px]",
+                    isDefaultVisible
+                      ? "text-foreground/80"
+                      : "text-muted-foreground/75",
+                  ),
                 isThinking && "italic text-muted-foreground",
-                !isToolCall && !isThinking && !useMarkdown && "text-foreground",
+                !isToolCall &&
+                  !isThinking &&
+                  !useMarkdown &&
+                  (isDefaultVisible ? "text-foreground" : "text-muted-foreground/75"),
               )}
             >
               {useMarkdown ? <MarkdownText text={ev.text} /> : ev.text}

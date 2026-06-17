@@ -111,11 +111,15 @@ export const mergeAdjacentThinking = (events: TaskEvent[]): TaskEvent[] => {
   return out;
 };
 
-// 默认展开的事件类型：核心对话两端（AI 回复 + 用户回复）
-// 其他都默认折叠（thinking / tool_call / info / error / phase_*）
+// 默认展开的事件类型：核心对话、HITL 里程碑和失败信号。
+// 这个集合也是 log 形态视觉降权的单一判断源：默认折叠的过程类才降权，信号事件必须保可见。
 // **注意**：这只决定「初始 collapsed state」、不决定可不可折叠——所有事件都可手动折叠 / 展开
 export const DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set([
+  "action_ack",
+  "action_failed",
   "assistant_message",
+  "ask_user_reply",
+  "error",
   "user_reply",
 ]);
 
