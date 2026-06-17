@@ -379,6 +379,8 @@ const TaskDetailPage = () => {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（advance-dialog 仅 build 且 plan 拆批时给值）
     requestedBatchIds?: string[];
+    // V0.8.x：plan 重跑时的批次合并语义（追加补充 / 重建后续）
+    replanMode?: "append" | "rebuild";
     // V0.6.25：ship gate override（advance-dialog 仅 ship 且最新 build 的 check 没过时给值）
     checkOverride?: CheckOverride;
   }) => {
@@ -414,6 +416,8 @@ const TaskDetailPage = () => {
           removeSourceBranch: input.removeSourceBranch,
           // V0.6.23 build action：本次做哪些批次（仅 build 且 plan 拆批时有值、否则 undefined=全做）
           requestedBatchIds: input.requestedBatchIds,
+          // V0.8.x plan action：重跑方案时的批次合并语义
+          replanMode: input.replanMode,
           // V0.6.25 ship action：CheckRun gate override（仅 ship 且最新 build 的 check 没过时有值）
           checkOverride: input.checkOverride,
         }),

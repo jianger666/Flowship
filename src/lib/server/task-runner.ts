@@ -101,6 +101,7 @@ import type {
   CheckOverride,
   GitBranchInfo,
   RepoStatus,
+  ReplanMode,
   ShipPrecheck,
   Task,
   TaskEvent,
@@ -390,7 +391,7 @@ const buildBatchDirective = (
 
   // V0.6.29：用户没勾批次 = 自由改动（多见于多轮之后回头修 bug、忘了 / 不属于哪个批次）
   if (!requestedBatchIds || requestedBatchIds.length === 0) {
-    const doneCount = batches.filter((b) => doneIds.has(b.id)).length;
+    const doneCount = batches.filter((b) => doneIds.has(b.effectiveId)).length;
     return [
       `[BUILD_BATCHES] 本需求 plan 共拆 ${total} 个批次（已完成 ${doneCount}/${total}）、但**本次 build 不绑定批次**——用户没有勾选批次、这是一次自由改动（修 bug / 跨批次散改）：`,
       "- **范围**：只做用户指令里点到的事、范围以指令为准",
@@ -399,12 +400,12 @@ const buildBatchDirective = (
     ].join("\n");
   }
 
-  const selected = batches.filter((b) => requestedBatchIds.includes(b.id));
+  const selected = batches.filter((b) => requestedBatchIds.includes(b.effectiveId));
   if (selected.length === 0) return undefined;
 
   const isAll = selected.length === batches.length;
-  const afterIds = new Set([...doneIds, ...selected.map((b) => b.id)]);
-  const afterDone = batches.filter((b) => afterIds.has(b.id)).length;
+  const afterIds = new Set([...doneIds, ...selected.map((b) => b.effectiveId)]);
+  const afterDone = batches.filter((b) => afterIds.has(b.effectiveId)).length;
 
   const lines: string[] = [
     `[BUILD_BATCHES] 本需求 plan 共拆 ${total} 个批次、本次 build 只做下面 ${selected.length} 个${
@@ -412,9 +413,11 @@ const buildBatchDirective = (
     }：`,
   ];
   for (const b of selected) {
-    const redo = doneIds.has(b.id) ? "　⚠️ 这批之前 build 过、本次是返工" : "";
+    const redo = doneIds.has(b.effectiveId)
+      ? "　⚠️ 这批之前 build 过、本次是返工"
+      : "";
     lines.push(
-      `  - [${b.id}] ${b.title}　测试策略=${TEST_STRATEGY_LABEL[b.testStrategy]}　含：${
+      `  - [${b.rawId} / 来源方案 #${b.sourceActionN}] ${b.title}　测试策略=${TEST_STRATEGY_LABEL[b.testStrategy]}　含：${
         b.taskRefs.length > 0 ? b.taskRefs.join(" / ") : "见 plan §5"
       }${redo}`,
     );
@@ -449,6 +452,23 @@ const buildReviewScopeDirective = (task: Task): string | undefined => {
     allDone
       ? "→ 本次按**集成 review**：常规差值 + bug 复审之外、重点查「批次之间是否打架」（接口对接 / 数据流 / 重复实现 / 类型冲突）。详见 review prompt §4.5。"
       : `→ 本次按**增量 review**：聚焦最近 build 的批次改动、并检查它跟已完成批次的衔接（还剩 ${total - done} 批没 build、别把「没做的批次」误判成漏实现 / 未完成 task）。详见 review prompt §4.5。`,
+  ].join("\n");
+};
+
+const buildPlanReplanDirective = (action: ActionRecord): string | undefined => {
+  if (action.type !== "plan" || !action.replanMode) return undefined;
+  if (action.replanMode === "append") {
+    return [
+      "[REPLAN_MODE append] 本次 plan 是在已有方案 / 批次基础上追加补充需求。",
+      "- 如果需要继续分批：`set_plan_batches` 只上报新增 / 补充批次 delta，不要重复旧 plan 已有批次。",
+      "- 旧批次和已完成进度由系统从历史 action 自动派生，你只负责新增范围。",
+      "- 如果你认为用户其实要求完整重拆，请先在方案里说明风险，并按用户指令优先；不要把旧批次重复上报。",
+    ].join("\n");
+  }
+  return [
+    "[REPLAN_MODE rebuild] 本次 plan 是重建后续方案。",
+    "- 可以重新上报完整的后续批次；系统会把此前仍 pending 的旧批次派生为已被替代，已完成批次作为历史保留。",
+    "- artifact 里说明哪些旧范围被新方案替代，方便用户核对。",
   ].join("\n");
 };
 
@@ -490,6 +510,10 @@ const buildNextActionDirective = (input: {
     lines.push(userInstruction.trim(), "");
   } else {
     lines.push("（用户没填具体指令、按本 action 标准流程执行）", "");
+  }
+  const replanDirective = buildPlanReplanDirective(action);
+  if (replanDirective) {
+    lines.push(replanDirective, "");
   }
   // V0.6.23：build 分批指令（仅 build 且 plan 有批次时有值）放用户指令后、让 agent 先框定本次范围
   if (batchDirective && batchDirective.trim().length > 0) {
@@ -1134,6 +1158,8 @@ export interface AdvanceTaskInput {
   gitToken?: string;
   // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=自由改动不计进度）
   requestedBatchIds?: string[];
+  // V0.8.x：plan 重跑时如何合并批次（append=补充需求、rebuild=重建后续）
+  replanMode?: ReplanMode;
   // V0.6.25 CheckRun：ship 时的 gate override（最新 build 的 check 没过 / 没配、用户勾「仍继续」+ reason）
   //   server 端校验它绑的是最新 build 的 checkRun（防重 build 后失效的 override 蒙混过关）、仅 ship 用
   checkOverride?: CheckOverride;
@@ -1245,6 +1271,7 @@ const advanceTaskInner = async (
     gitHost,
     gitToken,
     requestedBatchIds,
+    replanMode,
     checkOverride,
   } = input;
 
@@ -1276,6 +1303,7 @@ const advanceTaskInner = async (
     agentModel: model,
     // V0.6.23：仅 build 带批次选择（其它 action 不传、appendAction 内部空数组也归 undefined）
     requestedBatchIds: actionType === "build" ? requestedBatchIds : undefined,
+    replanMode: actionType === "plan" ? replanMode : undefined,
   });
   if (!created) {
     throw new Error(`appendAction 失败 task=${task.id}（task 不存在）`);
@@ -1997,15 +2025,22 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const patched = await patchAction(task.id, taskAction.actionId, {
         planBatches: taskAction.batches,
       });
+      let replanMode: ReplanMode | undefined;
       if (patched) {
         publish(task.id, { kind: "task", task: patched });
         const a = patched.actions.find((x) => x.id === taskAction.actionId);
-        if (a) publish(task.id, { kind: "action", action: a });
+        if (a) {
+          replanMode = a.replanMode;
+          publish(task.id, { kind: "action", action: a });
+        }
       }
       await writeEventAndPublish(task.id, {
         kind: "info",
         actionId: taskAction.actionId,
-        text: `已记录 ${taskAction.batches.length} 个批次（build 可分批推进、其余批次先不动）`,
+        text:
+          replanMode === "append"
+            ? `本次新增 ${taskAction.batches.length} 个批次，已并入方案（可在「改代码」里选择）`
+            : `已记录 ${taskAction.batches.length} 个批次（build 可分批推进、其余批次先不动）`,
         meta: { batchCount: taskAction.batches.length },
       });
       return { ok: true };

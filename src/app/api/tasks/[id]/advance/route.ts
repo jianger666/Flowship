@@ -47,7 +47,12 @@ import {
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
-import { ACTION_TYPES, type ActionType, type CheckOverride } from "@/lib/types";
+import {
+  ACTION_TYPES,
+  type ActionType,
+  type CheckOverride,
+  type ReplanMode,
+} from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -70,6 +75,8 @@ interface PostBody {
   removeSourceBranch?: boolean;
   // V0.6.23 build action 用：本次做哪些批次（advance-dialog 勾选、透传给 advanceTask）
   requestedBatchIds?: string[];
+  // V0.8.x plan action 用：重跑方案时的批次合并语义
+  replanMode?: string;
   // V0.6.25 ship action 用：CheckRun gate override（最新 build check 没过/没配时、用户勾「仍继续」+ reason）
   // 结构由 parseCheckOverride narrow、server 端 checkShipCheckGate 再校验绑定有效性
   checkOverride?: unknown;
@@ -80,6 +87,9 @@ const MAX_ATTACHMENTS_PER_REQUEST = 10;
 
 const isValidActionType = (v: unknown): v is ActionType =>
   typeof v === "string" && (ACTION_TYPES as readonly string[]).includes(v);
+
+const parseReplanMode = (v: unknown): ReplanMode | undefined =>
+  v === "append" || v === "rebuild" ? v : undefined;
 
 // V0.6.25：把 client 传的 checkOverride narrow 成 CheckOverride（语义有效性交给 server gate 校验）
 const parseCheckOverride = (raw: unknown): CheckOverride | undefined => {
@@ -218,6 +228,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       requestedBatchIds: Array.isArray(body.requestedBatchIds)
         ? body.requestedBatchIds.filter((x) => typeof x === "string")
         : undefined,
+      replanMode: actionType === "plan" ? parseReplanMode(body.replanMode) : undefined,
       // V0.6.25：ship gate override（仅 ship 有意义、server checkShipCheckGate 校验绑定有效性）
       checkOverride: parseCheckOverride(body.checkOverride),
     });

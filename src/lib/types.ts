@@ -314,6 +314,8 @@ export interface PlanBatch {
   taskRefs: string[];
 }
 
+export type ReplanMode = "append" | "rebuild";
+
 /**
  * V0.6.25 CheckRun：单条 check 命令的执行结果
  * - status：passed（exit 0）/ failed（exit≠0）/ timed_out（超时强杀）/ skipped（预留、暂不用）
@@ -508,15 +510,23 @@ export interface ActionRecord {
 
   /**
    * V0.6.23：plan action 产出的批次清单（plan agent 调 set_plan_batches 上报、只 plan action 有）
-   * - build 选批 + 进度推导都基于「最新 completed plan 的 planBatches」
+   * - build 选批 + 进度推导基于 task-display.deriveEffectiveBatches 派生出的当前有效批次
    * - 空 / 不存 = 这次 plan 没拆批次（小需求、build 默认全做、退化成老流程）
    */
   planBatches?: PlanBatch[];
 
   /**
+   * V0.8.x：多次 plan 时，本 plan 的批次如何进入当前有效批次集。
+   * - append：只上报新增/补充批次 delta，旧批次继续由旧 plan 派生
+   * - rebuild：重建后续批次，之前仍 pending 的批次派生为 superseded（已 built 历史保留）
+   * - 旧 action 缺省：保持 legacy latest-only 语义，避免历史 task 批次突然被合并
+   */
+  replanMode?: ReplanMode;
+
+  /**
    * V0.6.23：build action 本次「做哪些批次」——推进 build 时用户在 dialog 勾选、advance 时后端直接存
    * - 不靠 agent 上报（省一个 MCP 工具）：build agent 从 NEXT_ACTION 指令读做哪批、老实做完
-   * - 进度推导：已做批 = ∪(completed build 的 requestedBatchIds)、总批 = 最新 plan.planBatches
+   * - 新数据存 effectiveId（planActionId:batchId）；旧数据裸 b1/b2 由派生层按 legacy 单 plan 兼容映射
    * - 空 / 不存 = 无批次的 plan、或自由改动（V0.6.29 批次选填：不勾批 = 修 bug / 跨批散改、不计进度）
    */
   requestedBatchIds?: string[];

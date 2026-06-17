@@ -34,7 +34,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, Loader2, Paperclip, X } from "lucide-react";
+import { AlertTriangle, ArrowRight, Info, Loader2, Paperclip, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -55,7 +55,11 @@ import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { getSettings } from "@/lib/local-store";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
-import { ACTION_LABEL, computeBatchProgress } from "@/lib/task-display";
+import {
+  ACTION_LABEL,
+  computeBatchProgress,
+  type EffectivePlanBatch,
+} from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
 import { fetchShipPrecheck } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
@@ -223,6 +227,8 @@ interface Props {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（仅 build 且 plan 拆批时传、其它 undefined=全做）
     requestedBatchIds?: string[];
+    // V0.8.x：重跑 plan 时如何处理历史批次；仅 plan action 有意义
+    replanMode?: "append";
     // V0.6.25：ship gate override（仅 ship 且最新 build 的 check 没过、用户勾「仍继续」时传）
     checkOverride?: CheckOverride;
   }) => Promise<void>;
@@ -297,6 +303,11 @@ export const AdvanceDialog = ({
   const { models: availableModels, fetchModels } = useModels();
   // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
   const submitShortcut = useSubmitShortcut();
+  const hasPlanHistory = task.actions.some(
+    (a) =>
+      a.type === "plan" ||
+      (a.type === "build" && (a.requestedBatchIds?.length ?? 0) > 0),
+  );
 
   // 指令输入框的图附件（粘贴 / 拖拽 / 选文件）、跟 revise-dialog 共用 hook
   const {
@@ -441,13 +452,64 @@ export const AdvanceDialog = ({
     });
   };
 
-  // V0.6.24：全选 / 全不选切换（批次多时省得一个个点；已全选则点成全不选）
+  const normalBatches = batchProgress.batches.filter(
+    (b) => !b.duplicateOfEffectiveId,
+  );
+  const duplicateBatches = batchProgress.batches.filter(
+    (b) => !!b.duplicateOfEffectiveId,
+  );
+  const normalBatchIds = normalBatches.map((b) => b.effectiveId);
+  const normalBatchIdSet = new Set(normalBatchIds);
+
+  // V0.6.24：全选 / 取消全选切换；疑似重复批次需要用户单独核对，不跟随全选。
   const allBatchesSelected =
-    batchProgress.total > 0 && selectedBatchIds.length === batchProgress.total;
+    normalBatchIds.length > 0 &&
+    normalBatchIds.every((id) => selectedBatchIds.includes(id));
   const toggleAllBatches = () => {
     setFreeFormBuild(false);
-    setSelectedBatchIds(
-      allBatchesSelected ? [] : batchProgress.batches.map((b) => b.id),
+    setSelectedBatchIds((prev) => {
+      if (allBatchesSelected) {
+        return prev.filter((id) => !normalBatchIdSet.has(id));
+      }
+
+      return Array.from(new Set([...prev, ...normalBatchIds]));
+    });
+  };
+  const renderBatchChoice = (b: EffectivePlanBatch) => {
+    const done = batchProgress.doneIds.has(b.effectiveId);
+    return (
+      <ChoiceButton
+        key={b.effectiveId}
+        shape="card"
+        selected={selectedBatchIds.includes(b.effectiveId)}
+        onClick={() => toggleBatch(b.effectiveId)}
+        disabled={submitting}
+        className="flex flex-col items-start gap-0.5"
+      >
+        <div className="flex w-full items-center gap-1.5">
+          <span className="min-w-0 truncate text-xs font-medium">{b.title}</span>
+          <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px]">
+            #{b.sourceActionN}
+          </Badge>
+          {b.duplicateOfEffectiveId && (
+            <Badge variant="secondary" className="shrink-0 px-1 py-0 text-[10px]">
+              疑似重复
+            </Badge>
+          )}
+          {done && (
+            <Badge
+              variant="secondary"
+              className="ml-auto shrink-0 px-1 py-0 text-[10px]"
+            >
+              已做
+            </Badge>
+          )}
+        </div>
+        <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+          {b.rawId} · {TEST_STRATEGY_LABEL[b.testStrategy]}
+          {b.taskRefs.length > 0 ? ` · ${b.taskRefs.join(" / ")}` : ""}
+        </span>
+      </ChoiceButton>
     );
   };
 
@@ -468,6 +530,8 @@ export const AdvanceDialog = ({
         actionType === "build" && hasBatches && selectedBatchIds.length > 0
           ? selectedBatchIds
           : undefined,
+      replanMode:
+        actionType === "plan" && hasPlanHistory ? "append" : undefined,
       // V0.6.25：ship 绕过 check 的 override（仅 ship 且 check 没过 + 勾「仍继续」时传、server 再校验绑定）
       checkOverride:
         shipNeedsOverride && shipOverrideOn
@@ -542,6 +606,14 @@ export const AdvanceDialog = ({
           {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动） */}
           {actionType === "build" && hasBatches && (
             <div className="grid gap-1.5">
+              {batchProgress.latestPlanMissingBatches && (
+                <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    #{batchProgress.latestPlanMissingBatches.n} 方案没有结构化批次，未纳入本次选择。
+                  </span>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-2">
                 <Label>
                   本次做哪些批次{" "}
@@ -558,43 +630,19 @@ export const AdvanceDialog = ({
                   disabled={submitting}
                   className="h-6 shrink-0 px-2 text-xs text-muted-foreground"
                 >
-                  {allBatchesSelected ? "全不选" : "全选"}
+                  {allBatchesSelected ? "取消全选" : "全选"}
                 </Button>
               </div>
               <div className="grid gap-2">
-                {batchProgress.batches.map((b) => {
-                  const done = batchProgress.doneIds.has(b.id);
-                  return (
-                    <ChoiceButton
-                      key={b.id}
-                      shape="card"
-                      selected={selectedBatchIds.includes(b.id)}
-                      onClick={() => toggleBatch(b.id)}
-                      disabled={submitting}
-                      className="flex flex-col items-start gap-0.5"
-                    >
-                      <div className="flex w-full items-center gap-1.5">
-                        <span className="min-w-0 truncate text-xs font-medium">
-                          {b.title}
-                        </span>
-                        {done && (
-                          <Badge
-                            variant="secondary"
-                            className="ml-auto shrink-0 px-1 py-0 text-[10px]"
-                          >
-                            已做
-                          </Badge>
-                        )}
-                      </div>
-                      <span className="min-w-0 truncate text-[10px] text-muted-foreground">
-                        {TEST_STRATEGY_LABEL[b.testStrategy]}
-                        {b.taskRefs.length > 0
-                          ? ` · ${b.taskRefs.join(" / ")}`
-                          : ""}
-                      </span>
-                    </ChoiceButton>
-                  );
-                })}
+                {normalBatches.map(renderBatchChoice)}
+                {duplicateBatches.length > 0 && (
+                  <div className="grid gap-1.5 rounded-md border border-dashed bg-muted/20 p-2">
+                    <div className="text-[10px] text-muted-foreground">
+                      疑似重复批次（请核对后再选）
+                    </div>
+                    {duplicateBatches.map(renderBatchChoice)}
+                  </div>
+                )}
                 {/* V0.6.29：自由改动选项卡——多轮后回头修 bug 时忘了哪批 / 跨批次、不绑定批次 */}
                 <ChoiceButton
                   shape="card"
@@ -611,6 +659,13 @@ export const AdvanceDialog = ({
                   </span>
                 </ChoiceButton>
               </div>
+            </div>
+          )}
+
+          {actionType === "plan" && hasPlanHistory && (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Info className="size-3.5 shrink-0 text-primary/80" />
+              <span>本次会追加到现有方案，新增批次会进入「改代码」选择。</span>
             </div>
           )}
 

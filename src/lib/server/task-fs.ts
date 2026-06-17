@@ -44,6 +44,7 @@ import type {
   ModelSelection,
   NewTaskInput,
   RepoStatus,
+  ReplanMode,
   RunStatus,
   Task,
   TaskContextDoc,
@@ -1415,6 +1416,8 @@ export const appendAction = async (
     agentModel?: ModelSelection;
     /** V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build 传、空=自由改动不计进度） */
     requestedBatchIds?: string[];
+    /** V0.8.x：plan 重跑时如何合并批次 */
+    replanMode?: ReplanMode;
   },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
   withTaskLock(taskId, async () => {
@@ -1443,6 +1446,7 @@ export const appendAction = async (
         input.requestedBatchIds && input.requestedBatchIds.length > 0
           ? input.requestedBatchIds
           : undefined,
+      replanMode: input.type === "plan" ? input.replanMode : undefined,
     };
 
     meta.actions = [...meta.actions, action];

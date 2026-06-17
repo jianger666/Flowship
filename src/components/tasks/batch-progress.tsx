@@ -83,10 +83,10 @@ export const BatchProgress = ({ task }: Props) => {
               {/* 批次列表：已做绿勾 / 待做序号 + 标题 + 测试策略 + 关联 task */}
               <ul className="flex flex-col gap-1.5">
                 {batches.map((b, i) => {
-                  const isDone = doneIds.has(b.id);
+                  const isDone = doneIds.has(b.effectiveId);
                   return (
                     <li
-                      key={b.id}
+                      key={b.effectiveId}
                       className="flex items-start gap-2 rounded-md border px-3 py-2"
                     >
                       {/* 序号 / 绿勾 */}
@@ -106,6 +106,20 @@ export const BatchProgress = ({ task }: Props) => {
                           <span className="min-w-0 flex-1 truncate text-sm font-medium">
                             {b.title}
                           </span>
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 px-1 py-0 text-[10px]"
+                          >
+                            #{b.sourceActionN}
+                          </Badge>
+                          {b.duplicateOfEffectiveId && (
+                            <Badge
+                              variant="secondary"
+                              className="shrink-0 px-1 py-0 text-[10px]"
+                            >
+                              疑似重复
+                            </Badge>
+                          )}
                           {isDone && (
                             <Badge
                               variant="secondary"
@@ -116,7 +130,7 @@ export const BatchProgress = ({ task }: Props) => {
                           )}
                         </div>
                         <span className="text-xs text-muted-foreground">
-                          {TEST_STRATEGY_LABEL[b.testStrategy]}
+                          {b.rawId} · {TEST_STRATEGY_LABEL[b.testStrategy]}
                           {b.taskRefs.length > 0
                             ? ` · ${b.taskRefs.join(" / ")}`
                             : ""}

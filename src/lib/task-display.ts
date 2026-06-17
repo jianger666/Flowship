@@ -10,9 +10,11 @@
  */
 
 import type {
+  ActionRecord,
   ActionStatus,
   ActionType,
   PlanBatch,
+  ReplanMode,
   RepoStatus,
   RunStatus,
   Task,
@@ -204,67 +206,247 @@ export const formatRelative = (ts: number): string => {
 // 指令）都要「最新 plan 的批次 + 已 build 哪些」这套推导、放一处避免两边算法漂移。
 // 进度全部**派生自 action 历史**、不存计数器字段——plan 重拆 / build 返工都能自然反映。
 
+export type EffectiveBatchStatus = "pending" | "built" | "superseded";
+
+export interface EffectivePlanBatch extends PlanBatch {
+  /** 真正写进 build.requestedBatchIds 的稳定 key，避免不同 plan 里的 b1/b2 撞车 */
+  effectiveId: string;
+  /** plan 内原始 id（如 b1/b2），只用于展示和旧数据兼容 */
+  rawId: string;
+  /** 这个批次来自哪次 plan action */
+  sourcePlanActionId: string;
+  /** 展示用序号（#7 方案） */
+  sourceActionN: number;
+  /** 纯派生状态，不落库，避免第二真相源 */
+  status: EffectiveBatchStatus;
+  /** append 模式下疑似重复旧批次时只提示，不自动合并 */
+  duplicateOfEffectiveId?: string;
+}
+
+const isPlanWithBatches = (
+  action: ActionRecord,
+): action is ActionRecord & { planBatches: PlanBatch[] } =>
+  action.type === "plan" &&
+  !action.excluded &&
+  !!action.planBatches &&
+  action.planBatches.length > 0;
+
+export const getBatchEffectiveId = (
+  planActionId: string,
+  batchId: string,
+): string => `${planActionId}:${batchId}`;
+
+const normalizeBatchTitle = (title: string): string =>
+  title.replace(/\s+/g, "").toLowerCase();
+
+const findDuplicate = (
+  active: EffectivePlanBatch[],
+  batch: PlanBatch,
+): string | undefined => {
+  const title = normalizeBatchTitle(batch.title);
+  const candidate = active.find((prev) => {
+    if (prev.status === "superseded") return false;
+    if (prev.rawId === batch.id) return true;
+    if (!title) return false;
+    const prevTitle = normalizeBatchTitle(prev.title);
+    return !!prevTitle && (prevTitle.includes(title) || title.includes(prevTitle));
+  });
+  return candidate?.effectiveId;
+};
+
+const makeEffectiveBatch = (
+  action: ActionRecord,
+  batch: PlanBatch,
+  duplicateOfEffectiveId?: string,
+): EffectivePlanBatch => ({
+  ...batch,
+  // id 保持等于 effectiveId，尽量兼容旧调用方用 b.id 做 key / selected value 的写法。
+  id: getBatchEffectiveId(action.id, batch.id),
+  effectiveId: getBatchEffectiveId(action.id, batch.id),
+  rawId: batch.id,
+  sourcePlanActionId: action.id,
+  sourceActionN: action.n,
+  status: "pending",
+  duplicateOfEffectiveId,
+});
+
+const findLegacySeedPlanId = (
+  plans: Array<ActionRecord & { planBatches: PlanBatch[] }>,
+): string | null => {
+  const firstExplicit = plans.findIndex((a) => !!a.replanMode);
+  if (firstExplicit === -1) return plans[plans.length - 1]?.id ?? null;
+  for (let i = firstExplicit - 1; i >= 0; i--) {
+    if (!plans[i].replanMode) return plans[i].id;
+  }
+  return null;
+};
+
+const resolveRequestedBatchId = (
+  id: string,
+  active: EffectivePlanBatch[],
+): string | null => {
+  if (id.includes(":")) return id;
+  const matches = active.filter(
+    (b) => b.status !== "superseded" && b.rawId === id,
+  );
+  // 旧数据裸 b1/b2 只在唯一匹配时映射；多 plan 撞车时不猜。
+  return matches.length === 1 ? matches[0].effectiveId : null;
+};
+
+export interface EffectiveBatchesResult {
+  batches: EffectivePlanBatch[];
+  superseded: EffectivePlanBatch[];
+  builtIds: Set<string>;
+}
+
 /**
- * 取最新一个「有批次」的 plan action 的 planBatches。
+ * 派生当前 task 的有效批次集。
  *
- * - build 分批选择 + 进度推导都以它为基准
- * - 返空数组 = 这个 task 没拆批次（小需求 / 老 task）、build 退化成「做全部」老流程
- * - 倒序找：plan 可能被重跑多次、只认最新一版拆分
- * - 不限 status：planBatches 是 agent 调 set_plan_batches 主动落库的有效数据、
- *   run 中断（error）/ 还在 awaiting_ack 都不影响数据本身。
- *   典型坑：plan 拆了批次但 serve 重启被标 error、之后接续的 plan 没重拆批次——
- *   仍要能回退到那次拆好的批次、否则分批 build 整个失效。
+ * 关键约束：
+ * - 不落 task 级 batch 状态，所有状态从 action history 现场推导；
+ * - 旧 task 缺 replanMode 时保持 legacy latest-only；
+ * - 新 replan 通过 action.replanMode 决定 append / rebuild；
+ * - build.requestedBatchIds 新写 effectiveId，旧裸 id 在唯一匹配时兼容。
  */
-export const getLatestPlanBatches = (task: Task): PlanBatch[] => {
-  for (let i = task.actions.length - 1; i >= 0; i--) {
-    const a = task.actions[i];
-    if (
-      a.type === "plan" &&
-      !a.excluded &&
-      a.planBatches &&
-      a.planBatches.length > 0
-    ) {
-      return a.planBatches;
+export const deriveEffectiveBatches = (task: Task): EffectiveBatchesResult => {
+  const plans = task.actions.filter(isPlanWithBatches);
+  if (plans.length === 0) {
+    return { batches: [], superseded: [], builtIds: new Set() };
+  }
+
+  const hasExplicitReplan = plans.some((a) => !!a.replanMode);
+  if (!hasExplicitReplan) {
+    // 旧任务保持 V0.6.23 语义：只认最新一个有批次的 plan，但所有历史 build 的裸 id
+    // 仍按 rawId 计入进度，避免升级后旧 task 进度回退。
+    const latest = plans[plans.length - 1]!;
+    const batches = latest.planBatches.map((batch) =>
+      makeEffectiveBatch(latest, batch),
+    );
+    const builtIds = new Set<string>();
+    for (const action of task.actions) {
+      if (action.type !== "build" || action.status !== "completed" || action.excluded) {
+        continue;
+      }
+      for (const requestedId of action.requestedBatchIds ?? []) {
+        if (requestedId.includes(":")) {
+          builtIds.add(requestedId);
+          continue;
+        }
+        const match = batches.find((b) => b.rawId === requestedId);
+        if (match) builtIds.add(match.effectiveId);
+      }
+    }
+    for (const b of batches) {
+      if (builtIds.has(b.effectiveId)) b.status = "built";
+    }
+    return { batches, superseded: [], builtIds };
+  }
+
+  const legacySeedPlanId = findLegacySeedPlanId(plans);
+  const active: EffectivePlanBatch[] = [];
+  const builtIds = new Set<string>();
+
+  for (const action of task.actions) {
+    if (isPlanWithBatches(action)) {
+      const include = action.id === legacySeedPlanId || !!action.replanMode;
+      if (!include) continue;
+
+      const mode: ReplanMode = action.replanMode ?? "append";
+      if (mode === "rebuild") {
+        for (const b of active) {
+          if (!builtIds.has(b.effectiveId)) b.status = "superseded";
+        }
+      }
+
+      for (const batch of action.planBatches) {
+        const duplicateOfEffectiveId =
+          mode === "append" ? findDuplicate(active, batch) : undefined;
+        active.push(makeEffectiveBatch(action, batch, duplicateOfEffectiveId));
+      }
+      continue;
+    }
+
+    if (action.type === "build" && action.status === "completed" && !action.excluded) {
+      for (const requestedId of action.requestedBatchIds ?? []) {
+        const effectiveId = resolveRequestedBatchId(requestedId, active);
+        if (effectiveId) builtIds.add(effectiveId);
+      }
     }
   }
-  return [];
+
+  for (const b of active) {
+    if (builtIds.has(b.effectiveId)) b.status = "built";
+  }
+
+  return {
+    batches: active.filter((b) => b.status !== "superseded"),
+    superseded: active.filter((b) => b.status === "superseded"),
+    builtIds,
+  };
 };
 
 /**
- * 已 build 过的批次 id 集合（纯派生、不存计数器避免漂移）。
- * = 所有 completed 且未划除的 build action 的 requestedBatchIds 之并集。
+ * 兼容旧调用名：返回当前有效批次（不是“最新单个 plan”）。
+ * 新代码优先直接用 deriveEffectiveBatches / computeBatchProgress。
  */
-export const collectBuiltBatchIds = (task: Task): Set<string> => {
-  const ids = new Set<string>();
-  for (const a of task.actions) {
-    if (a.type === "build" && a.status === "completed" && !a.excluded) {
-      for (const id of a.requestedBatchIds ?? []) ids.add(id);
-    }
-  }
-  return ids;
-};
+export const getLatestPlanBatches = (task: Task): EffectivePlanBatch[] =>
+  deriveEffectiveBatches(task).batches;
+
+/** 已 build 过的批次 effective id 集合（纯派生、不存计数器避免漂移）。 */
+export const collectBuiltBatchIds = (task: Task): Set<string> =>
+  deriveEffectiveBatches(task).builtIds;
 
 /** 批次进度快照（UI 进度条 + 后端 prompt 进度提示共用） */
 export interface BatchProgress {
-  /** 最新 plan 拆出的全部批次（顺序 = 建议 build 顺序） */
-  batches: PlanBatch[];
+  /** 当前有效批次（顺序 = 建议 build 顺序，不含 superseded） */
+  batches: EffectivePlanBatch[];
+  /** 被 rebuild 替代的旧 pending 批次（默认只折叠展示 / 审计用） */
+  superseded: EffectivePlanBatch[];
   /** 总批次数 */
   total: number;
   /** 已完成批次数（限当前 plan 批次内、防 plan 重拆后旧 id 残留误计） */
   done: number;
-  /** 已 build 过的批次 id（含可能不在当前 plan 的历史 id） */
+  /** 已 build 过的批次 effective id */
   doneIds: Set<string>;
   /** 还没 build 的批次（= 推进 build 时默认勾选项） */
-  remaining: PlanBatch[];
+  remaining: EffectivePlanBatch[];
+  /** 最新 plan 没有结构化批次时，用于 UI 提示“未纳入 build 选择” */
+  latestPlanMissingBatches?: { id: string; n: number };
 }
 
 /**
  * 算批次进度——给 UI 进度条 / 默认勾选 + 后端 build 指令的「累计 X/Y 批」共用。
  */
 export const computeBatchProgress = (task: Task): BatchProgress => {
-  const batches = getLatestPlanBatches(task);
-  const doneIds = collectBuiltBatchIds(task);
-  const remaining = batches.filter((b) => !doneIds.has(b.id));
+  const { batches, superseded, builtIds } = deriveEffectiveBatches(task);
+  const remaining = batches.filter((b) => !builtIds.has(b.effectiveId));
   const done = batches.length - remaining.length;
-  return { batches, total: batches.length, done, doneIds, remaining };
+  const latestPlan = [...task.actions]
+    .reverse()
+    .find((a) => a.type === "plan" && !a.excluded);
+  const hasSplitHistory =
+    batches.length > 0 ||
+    superseded.length > 0 ||
+    task.actions.some(
+      (a) =>
+        a.type === "build" &&
+        !a.excluded &&
+        (a.requestedBatchIds?.length ?? 0) > 0,
+    );
+  const latestPlanMissingBatches =
+    hasSplitHistory &&
+    latestPlan &&
+    (!latestPlan.planBatches || latestPlan.planBatches.length === 0)
+      ? { id: latestPlan.id, n: latestPlan.n }
+      : undefined;
+
+  return {
+    batches,
+    superseded,
+    total: batches.length,
+    done,
+    doneIds: builtIds,
+    remaining,
+    latestPlanMissingBatches,
+  };
 };
