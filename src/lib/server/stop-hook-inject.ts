@@ -34,10 +34,23 @@ import path from "node:path";
 // V0.6.30：node 用 process.execPath（跑本服务的那个 node 的绝对路径）、不裸写 `node`——
 //   Electron 安装包用户机器上系统 PATH 可能根本没有 node、只有包内 Electron（as node）、
 //   execPath 正好指向它；源码跑的场景 execPath = 系统 node、行为不变。
+// V0.8.x：command 自己显式带 ELECTRON_RUN_AS_NODE=1，不再依赖触发 hook 的进程继承环境。
+//   hooks.json 留在业务仓库里，Cursor IDE agent 也会触发；IDE 进程没有这个 env 时，Windows
+//   会把 AI工作流.exe 当 GUI app 拉起，用户看到“stop hook 终端/窗口”。显式前缀后统一静默按
+//   Node 脚本执行，fe 不认领的 IDE agent 仍由脚本 fail-open 放行。
+const quoteArg = (value: string): string => `"${value.replaceAll('"', '\\"')}"`;
+const withElectronNodeEnv = (script: string): string => {
+  const command = `${quoteArg(process.execPath)} ${quoteArg(script)}`;
+  if (process.platform === "win32") {
+    return `set ELECTRON_RUN_AS_NODE=1&& ${command}`;
+  }
+  return `ELECTRON_RUN_AS_NODE=1 ${command}`;
+};
+
 const stopHookCommand = (): string =>
-  `"${process.execPath}" "${path.join(process.cwd(), "scripts", "stop-hook.mjs")}"`;
+  withElectronNodeEnv(path.join(process.cwd(), "scripts", "stop-hook.mjs"));
 const shellGuardCommand = (): string =>
-  `"${process.execPath}" "${path.join(process.cwd(), "scripts", "shell-guard.mjs")}"`;
+  withElectronNodeEnv(path.join(process.cwd(), "scripts", "shell-guard.mjs"));
 
 // fe scripts 目录路径——判断已有 hooks.json 是不是 fe 自己建的（是才允许升级重写）
 // 老形式 command = ".../scripts/xxx.sh"（startsWith）、新形式 = `node ".../scripts/xxx.mjs"`（includes）
