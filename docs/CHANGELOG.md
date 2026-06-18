@@ -15,6 +15,15 @@
 
 ---
 
+### v0.8.10：API Key 进页面自动验证 + 展示账号信息（2026-06-18）
+
+- **进设置页自动验证**：以前 providers 已有 app 级模型预热、但设置页是另一个 `useModels` 实例不读缓存 → 用户进来要手动点「验证」才出模型。改成：配置加载完、有 apiKey 就自动拉一次（模型 + 账号信息、走 SWR 缓存秒出、`didInitValidate` ref 保证只跑一次）；apiKey 改完失焦（`onCommit`）也自动重验。
+- **展示账号信息**：新增 `/api/me`（`Cursor.me`、同 `/api/models` 的 10min 内存缓存 + 超时兜底）+ `src/hooks/use-api-key-info.ts`（SWR：localStorage 先返 + 后台刷）；`ApiKeyCard` 在密钥下方显示「姓名 · 邮箱 / 密钥『name』· 创建于 YYYY-MM-DD」（团队 / service key 无邮箱时退回只显示有的字段）。`src/lib/types.ts` 加 `ApiKeyInfo`。
+- **删过时文案**：设置页顶「编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器」整句删——桌面端唯一交付、文案误导。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；产物旧文案 0 命中、`/api/me` route 已进包、`/settings` 200、`/api/me` 空 body 返 400「缺少 apiKey」（路由挂载正常）。
+
+---
+
 ### v0.8.9：桌面端「检查更新」按钮（2026-06-18）
 
 - **手动检查更新**：壳本就有自动自更新（启动 + 每 2h 轮询 GitHub releases/latest、发现新版亮右上角「新版本」标识 + 弹一次原生框、mac 壳内下载替换 / win 重启即装），但「没更新就静默」、用户没法主动确认自己是不是最新。补一个按需通道：

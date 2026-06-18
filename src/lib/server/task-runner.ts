@@ -239,6 +239,8 @@ const buildSuperPrompt = async (
     attachedFilePaths?: string[];
     branchCheckoutHint?: string;
     batchDirective?: string;
+    // V0.8.12 A：plan append 硬指令（已分批 task 追加需求时拼进首个 NEXT_ACTION）
+    replanDirective?: string;
   },
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
@@ -455,15 +457,37 @@ const buildReviewScopeDirective = (task: Task): string | undefined => {
   ].join("\n");
 };
 
-const buildPlanReplanDirective = (action: ActionRecord): string | undefined => {
+// V0.8.12 A（治本、动态硬指令）：append 模式下、若该 task 此前已分过批次、
+// 基于真实批次状态注入「必须出 ≥1 新批次」硬要求——不给 agent「补充小就不分批」的口子
+// （对应 plan prompt §5.3 例外）。这是 A 能否真生效的关键：静态 prompt 规则容易被
+// agent 自判「这次小」绕过、动态指令贴着真实状态（已拆 N 批）下硬命令、绕不过去。
+const buildPlanReplanDirective = (
+  action: ActionRecord,
+  task: Task,
+): string | undefined => {
   if (action.type !== "plan" || !action.replanMode) return undefined;
   if (action.replanMode === "append") {
-    return [
+    const { total } = computeBatchProgress(task);
+    const lines = [
       "[REPLAN_MODE append] 本次 plan 是在已有方案 / 批次基础上追加补充需求。",
-      "- 如果需要继续分批：`set_plan_batches` 只上报新增 / 补充批次 delta，不要重复旧 plan 已有批次。",
-      "- 旧批次和已完成进度由系统从历史 action 自动派生，你只负责新增范围。",
+    ];
+    if (total > 0) {
+      // 已分批 task：硬要求出新批次（不留「小可跳过」余地）
+      lines.push(
+        `- ⚠️ **本 task 已拆 ${total} 批、追加需求必须调 set_plan_batches 出 ≥1 新批次**（即使补充很小）——已分批的 task 追加范围不进批次会让进度断裂（看着像全完成）、用户无法按批推进。这是硬要求、见 plan prompt §5.3 例外。`,
+        "- set_plan_batches 只上报新增 / 补充批次 delta、不要重复旧 plan 已有批次；旧批次和进度由系统从历史 action 自动派生。",
+      );
+    } else {
+      // 没分批历史的 append（少见）：维持原弹性、按规模自判
+      lines.push(
+        "- 如果需要继续分批：`set_plan_batches` 只上报新增 / 补充批次 delta，不要重复旧 plan 已有批次。",
+        "- 旧批次和已完成进度由系统从历史 action 自动派生，你只负责新增范围。",
+      );
+    }
+    lines.push(
       "- 如果你认为用户其实要求完整重拆，请先在方案里说明风险，并按用户指令优先；不要把旧批次重复上报。",
-    ].join("\n");
+    );
+    return lines.join("\n");
   }
   return [
     "[REPLAN_MODE rebuild] 本次 plan 是重建后续方案。",
@@ -483,6 +507,8 @@ const buildNextActionDirective = (input: {
   branchCheckoutHint?: string;
   taskUpdateHint?: string;
   batchDirective?: string;
+  // V0.8.12 A：plan append 硬指令（由调用方外部算好传入、拿得到 task 判断已分批）
+  replanDirective?: string;
   actionPlaybook?: string;
 }): string => {
   const {
@@ -493,6 +519,7 @@ const buildNextActionDirective = (input: {
     branchCheckoutHint,
     taskUpdateHint,
     batchDirective,
+    replanDirective,
     actionPlaybook,
   } = input;
   const head = buildNextActionHead({
@@ -511,9 +538,8 @@ const buildNextActionDirective = (input: {
   } else {
     lines.push("（用户没填具体指令、按本 action 标准流程执行）", "");
   }
-  const replanDirective = buildPlanReplanDirective(action);
-  if (replanDirective) {
-    lines.push(replanDirective, "");
+  if (replanDirective && replanDirective.trim().length > 0) {
+    lines.push(replanDirective.trim(), "");
   }
   // V0.6.23：build 分批指令（仅 build 且 plan 有批次时有值）放用户指令后、让 agent 先框定本次范围
   if (batchDirective && batchDirective.trim().length > 0) {
@@ -1381,6 +1407,9 @@ const advanceTaskInner = async (
       : actionType === "review"
         ? buildReviewScopeDirective(taskAfterAppend)
         : undefined;
+  // V0.8.12 A：plan append 硬指令——已分批 task 追加需求时强制出新批次（基于真实批次状态）。
+  // buildPlanReplanDirective 内部自己判 plan + replanMode、非 plan / 无 replanMode 返 undefined
+  const replanDirective = buildPlanReplanDirective(action, taskAfterAppend);
 
   // 4) 决定路由
   const existingRecord = runningTasks.get(task.id);
@@ -1412,6 +1441,7 @@ const advanceTaskInner = async (
         branchCheckoutHint,
         taskUpdateHint,
         batchDirective,
+        replanDirective,
         actionPlaybook,
       }),
       attachedImagePaths,
@@ -1435,6 +1465,7 @@ const advanceTaskInner = async (
         gitHost,
         gitToken,
         batchDirective,
+        replanDirective,
       });
     }
     return { action };
@@ -1466,6 +1497,7 @@ const advanceTaskInner = async (
     gitHost,
     gitToken,
     batchDirective,
+    replanDirective,
   });
 
   return { action };
@@ -1585,6 +1617,12 @@ const restartCurrentActionInner = async (
     publish(fresh.id, { kind: "action", action: effectiveStartAction });
   }
 
+  // V0.8.12 A：重启 plan append 同样要硬约束出新批次（基于 patch 后最新 task / action 口径）
+  const replanDirective = buildPlanReplanDirective(
+    effectiveStartAction,
+    effectiveStartTask,
+  );
+
   await internalStartAgent({
     task: effectiveStartTask,
     action: effectiveStartAction,
@@ -1598,6 +1636,7 @@ const restartCurrentActionInner = async (
     gitHost: input.gitHost,
     gitToken: input.gitToken,
     batchDirective,
+    replanDirective,
   });
 
   return { action: effectiveStartAction };
@@ -1764,6 +1803,8 @@ interface StartAgentInput {
   gitToken?: string;
   // V0.6.23：build 分批指令（仅 build 有值、拼进首个 NEXT_ACTION）
   batchDirective?: string;
+  // V0.8.12 A：plan append 硬指令（仅 plan append 有值、透传给 buildSuperPrompt 的首个 NEXT_ACTION）
+  replanDirective?: string;
 }
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
@@ -1779,6 +1820,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     gitHost,
     gitToken,
     batchDirective,
+    replanDirective,
   } = input;
 
   // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
@@ -2192,6 +2234,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         attachedFilePaths,
         branchCheckoutHint,
         batchDirective,
+        replanDirective,
       });
 
       const run = await agent.send(superPrompt);

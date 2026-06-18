@@ -304,18 +304,19 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.12：append 已分批的 task 强制出新批次（2026-06-18）
+
+- **问题（实测线上 task t_…is2xsd #15 踩到）**：已分批（b1/b2、2/2 完成）的 task 追加需求时、plan agent 在 artifact 自判「补充小、不分批」没调 `set_plan_batches`（符合旧 §5.3「小可跳过」）→ 追加的 Task 8-10 不进任何批次 → 主页批次进度仍显示 2/2（看着像全完成）、追加需求游离、用户无法按批推进。根因：§5.3「小需求可不分批」对首次 plan 合理、但对「已分批 task 的 append」造成不一致。
+- **两层硬约束（治本、保证生效）**：① `prompts/action-plan.md` §5.3 / [REPLAN_MODE append] 段加硬约束「**已分过批次的 task、append 追加需求一律调 `set_plan_batches` 出 ≥1 新批次、不适用『小可跳过』**」、引导 agent 从 NEXT_ACTION 里的「本 task 已拆 N 批」字样判断；② `task-runner.ts` `buildPlanReplanDirective` 加 `task` 参数、注入 NEXT_ACTION 时按 `computeBatchProgress(task).total > 0`（已分批）→ 注入「⚠️ 本 task 已拆 N 批、追加需求必须出 ≥1 新批次」**动态硬指令**（带真实批次数、不给 agent「因小跳过」口子）；没分批历史的 append 维持原弹性按规模自判。`replanDirective` 由 advanceTask / restart 两处算好（都拿得到 task）、透传 `buildNextActionDirective` + `internalStartAgent`、覆盖续接 / 降级 / 新 Run / 重启**全部启动路径**。
+- **附带**：task 详情页标题行 `h1` + 容器加 `min-w-0`、修长标题把状态 badge 挤换行。
+- 暂缓：系统侧「隐式批次派生」兜底（agent 真违抗时自动把漏报范围归批）评估后暂不做——A 已治本、等观察到 A 不生效再补这层防御性冗余。
+- 验证：typecheck + lint 全绿。
+
 ### v0.8.11：action timeline 重做 + 修 CI sqlite3 死依赖打包失败（2026-06-18）
 
 - **修 CI 打包失败（v0.8.7~v0.8.10 连挂 4 版的根因）**：`release.yml` electron job 的「修平台依赖」步还 hardcode 探测 + 装 + 验证 `sqlite3`，但 sqlite3 早已是死依赖（源码 0 引用、`pnpm-lock.yaml` 仅剩 overrides 声明、零实际包条目、standalone 产物根本不含它、test 包一直能正常 boot 证明运行时不需要）。standalone 里没有 sqlite3 → `node -p require('./node_modules/sqlite3/package.json')` 第一行直接炸 → win/mac 两个打包 job 全挂、release 卡在 draft。修：① step 8 删 sqlite3 三处（版本探测 / npm install / require 验证）、只留 `@cursor/sdk-<platform>` 平台包处理；② `package.json` 删 `overrides` + `pnpm.overrides` + `onlyBuiltDependencies` 里的 sqlite3；③ `pnpm install` 同步 lockfile（CI `--frozen-lockfile` 要求一致、本地已校验通过）。v0.8.6 之前 standalone 还含 sqlite3（那时有间接依赖引它）所以成功、v0.8.7 起依赖链断了但 CI / package.json 没同步清。
 - **action timeline 重做（UX）**：原一排灰字 chip 太素 + 点击抖动。改：① 去类型图标 / 连接段（之前加过、太宽 + 把整行撑到换行临界、点击时右侧文件名变宽触发换行抖动）；② **timeline 独占整行拿满宽度**、文件名从右侧同行挪到**下方单独一行 + 固定行高占位**（根治「文件名挤压 timeline 宽度 → 换行重排 → 抖动」、加载中文件名暂空也不塌行）；③ 选中态 = **靛蓝描边 + 靛蓝字、无填充底 / 无背景色**（ring 是 box-shadow 不占盒模型、不加 border / 不改 padding / 不改字重 ⇒ 选中前后几何零变化、点击不闪不抖）；④ 去掉 workbench header 右侧 action 单步状态指示（运行中 / 失败…用户拍板：历史态意义不大、还抢视线 + 变宽加剧抖动）；⑤ 切换 task 默认选中**最后一个（最近）action**（直接看最新产物、不再跟 `currentActionId`）。涉及 `action-timeline.tsx` / `action-workbench-header.tsx` / `tasks/[id]/page.tsx`。
 - 验证：typecheck + lint 全绿、lockfile `--frozen-lockfile` 通过、3 步打包 + test（8776）boot；产物确认无 sqlite3。
-
-### v0.8.10：API Key 进页面自动验证 + 展示账号信息（2026-06-18）
-
-- **进设置页自动验证**：以前 providers 已有 app 级模型预热、但设置页是另一个 `useModels` 实例不读缓存 → 用户进来要手动点「验证」才出模型。改成：配置加载完、有 apiKey 就自动拉一次（模型 + 账号信息、走 SWR 缓存秒出、`didInitValidate` ref 保证只跑一次）；apiKey 改完失焦（`onCommit`）也自动重验。
-- **展示账号信息**：新增 `/api/me`（`Cursor.me`、同 `/api/models` 的 10min 内存缓存 + 超时兜底）+ `src/hooks/use-api-key-info.ts`（SWR：localStorage 先返 + 后台刷）；`ApiKeyCard` 在密钥下方显示「姓名 · 邮箱 / 密钥『name』· 创建于 YYYY-MM-DD」（团队 / service key 无邮箱时退回只显示有的字段）。`src/lib/types.ts` 加 `ApiKeyInfo`。
-- **删过时文案**：设置页顶「编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器」整句删——桌面端唯一交付、文案误导。
-- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；产物旧文案 0 命中、`/api/me` route 已进包、`/settings` 200、`/api/me` 空 body 返 400「缺少 apiKey」（路由挂载正常）。
 
 ---
 

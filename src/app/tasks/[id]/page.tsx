@@ -651,8 +651,10 @@ const TaskDetailPage = () => {
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h1 className="truncate text-base font-semibold">
+              {/* min-w-0：让 h1 的 truncate 真正生效——否则长标题撑满、把后面的状态
+                  badge（已带 shrink-0）挤到溢出 / 换行。标题省略、状态 badge 始终同一行。 */}
+              <div className="flex min-w-0 items-center gap-2">
+                <h1 className="min-w-0 truncate text-base font-semibold">
                   {task.title}
                 </h1>
                 <Badge variant={REPO_STATUS_VARIANT[task.repoStatus]}>
