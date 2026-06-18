@@ -308,7 +308,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 - **问题（实测线上 task t_…is2xsd #15 踩到）**：已分批（b1/b2、2/2 完成）的 task 追加需求时、plan agent 在 artifact 自判「补充小、不分批」没调 `set_plan_batches`（符合旧 §5.3「小可跳过」）→ 追加的 Task 8-10 不进任何批次 → 主页批次进度仍显示 2/2（看着像全完成）、追加需求游离、用户无法按批推进。根因：§5.3「小需求可不分批」对首次 plan 合理、但对「已分批 task 的 append」造成不一致。
 - **两层硬约束（治本、保证生效）**：① `prompts/action-plan.md` §5.3 / [REPLAN_MODE append] 段加硬约束「**已分过批次的 task、append 追加需求一律调 `set_plan_batches` 出 ≥1 新批次、不适用『小可跳过』**」、引导 agent 从 NEXT_ACTION 里的「本 task 已拆 N 批」字样判断；② `task-runner.ts` `buildPlanReplanDirective` 加 `task` 参数、注入 NEXT_ACTION 时按 `computeBatchProgress(task).total > 0`（已分批）→ 注入「⚠️ 本 task 已拆 N 批、追加需求必须出 ≥1 新批次」**动态硬指令**（带真实批次数、不给 agent「因小跳过」口子）；没分批历史的 append 维持原弹性按规模自判。`replanDirective` 由 advanceTask / restart 两处算好（都拿得到 task）、透传 `buildNextActionDirective` + `internalStartAgent`、覆盖续接 / 降级 / 新 Run / 重启**全部启动路径**。
-- **附带**：task 详情页标题行 `h1` + 容器加 `min-w-0`、修长标题把状态 badge 挤换行。
+- **附带（修中文换行）**：① task 详情页标题行 `h1` + 容器加 `min-w-0`、修长标题把状态 badge 挤换行；② 批次表（`batch-plan-table`）状态列「待实现」被挤成「待实 / 现」——根因 shadcn `TableCell`(td) 默认无 `whitespace-nowrap`（只 `TableHead`(th) 有）、给状态 / 测试策略两窄列 td 补 nowrap + 图标 `shrink-0` + 状态列 `w-20`→`w-24`（v0.8.13 补）。
 - 暂缓：系统侧「隐式批次派生」兜底（agent 真违抗时自动把漏报范围归批）评估后暂不做——A 已治本、等观察到 A 不生效再补这层防御性冗余。
 - 验证：typecheck + lint 全绿。
 

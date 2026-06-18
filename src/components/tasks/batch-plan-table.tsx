@@ -64,7 +64,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
             <TableHead>标题</TableHead>
             <TableHead>含 task</TableHead>
             <TableHead className="w-24">测试策略</TableHead>
-            <TableHead className="w-20">状态</TableHead>
+            <TableHead className="w-24">状态</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -97,18 +97,20 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                 <TableCell className="align-top text-muted-foreground">
                   {b.taskRefs.join(" / ")}
                 </TableCell>
-                <TableCell className="align-top">
+                <TableCell className="align-top whitespace-nowrap">
                   {TEST_STRATEGY_LABEL[b.testStrategy]}
                 </TableCell>
-                <TableCell className="align-top">
+                {/* 状态列窄、shadcn td 默认无 whitespace-nowrap（只有 th 有）、
+                    不加会把「待实现」挤换行成「待实/现」。span nowrap + icon shrink-0 锁一行 */}
+                <TableCell className="align-top whitespace-nowrap">
                   {built ? (
                     <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                      <CheckCircle2 className="size-3.5" />
+                      <CheckCircle2 className="size-3.5 shrink-0" />
                       已实现
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 text-muted-foreground">
-                      <Circle className="size-3.5" />
+                      <Circle className="size-3.5 shrink-0" />
                       待实现
                     </span>
                   )}
