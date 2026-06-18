@@ -26,7 +26,7 @@
  * - 划除一个还在进行中的 action → 409（提示先停止）
  */
 
-import { getTask, patchAction } from "@/lib/server/task-fs";
+import { getTask, setActionArtifactExcluded } from "@/lib/server/task-fs";
 import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import { errorResponse } from "@/lib/server/route-helpers";
 
@@ -77,7 +77,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("这个 action 还在进行中、请先「停止」再划除", 409);
   }
 
-  const updated = await patchAction(id, actionId, { excluded: body.excluded });
+  // V0.8.16：不只翻 excluded flag、连 artifact 文件一起挪进 / 挪出隐藏子目录
+  // （治本「划除的旧 plan 被 agent ls / 按编号拼路径翻出来读」、见 setActionArtifactExcluded）
+  const updated = await setActionArtifactExcluded(id, actionId, body.excluded);
   if (!updated) return errorResponse("not_found", 404);
 
   publishTaskStreamEvent(id, { kind: "task", task: updated });

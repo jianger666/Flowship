@@ -67,6 +67,9 @@ const META_FILE = "meta.json";
 const EVENTS_FILE = "events.jsonl";
 const ACTIONS_DIR = "actions";
 const REVISIONS_SUBDIR = ".revisions";
+// 划除（软删）的 artifact 挪进这个隐藏子目录——跟 .revisions / .checks 同风格、
+// agent 的 ls / rg 默认都扫不到、防被按编号拼路径翻出来读（V0.8.16、见 setActionArtifactExcluded）
+const EXCLUDED_SUBDIR = ".excluded";
 // 单 action 最多保留 10 个 revision、超出 GC 删最早（沿用 V0.5.12 的上限策略）
 const MAX_REVISIONS_PER_ACTION = 10;
 
@@ -1509,6 +1512,60 @@ export const patchAction = async (
       ...meta.actions.slice(idx + 1),
     ];
     meta.updatedAt = now;
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * 划除 / 恢复单条 action 的 artifact（软删的「物理落地」、V0.8.16）
+ *
+ * 背景：光翻 ActionRecord.excluded 这个 flag 挡不住 agent——renderActionHistorySection 虽然
+ * 不再把划除的 action 列进 prompt、但 artifact 文件还物理躺在 actions/ 目录里。plan prompt 明确
+ * 引导 agent「第 N 次 plan 先 read 上一次 plan artifact」、agent 自己 ls actions / 按编号拼
+ * `actions/<n>-plan.md` 就能把划除的旧方案翻出来读（用户实测：划掉 #2 后跑 #3、agent 旁白
+ * 「已有 2-plan.md 初稿」——划除根本没挡住它）。
+ *
+ * 治本：划除时把 artifact 物理挪进 actions/.excluded/ 隐藏子目录（agent ls / rg 默认扫不到）、
+ * 恢复时移回。同步把 ActionRecord.artifactPath 改成新位置——UI 读 artifact 走 artifactPath 字段
+ *（readActionArtifactRaw）、跟着隐藏路径仍能正常查看 / 恢复。文件不存在（agent 没写成）只翻 flag。
+ */
+export const setActionArtifactExcluded = async (
+  taskId: string,
+  actionId: string,
+  excluded: boolean,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const idx = meta.actions.findIndex((a) => a.id === actionId);
+    if (idx < 0) return null;
+    const action = meta.actions[idx]!;
+
+    let nextArtifactPath = action.artifactPath;
+    // 有 artifact 记录就同步挪文件 + 改字段；目标位置 = 隐藏子目录（划除）或正常目录（恢复）
+    if (action.artifactPath) {
+      const filename = actionArtifactFilename(action.n, action.type);
+      const targetRel = excluded
+        ? `${ACTIONS_DIR}/${EXCLUDED_SUBDIR}/${filename}`
+        : `${ACTIONS_DIR}/${filename}`;
+      if (action.artifactPath !== targetRel) {
+        const fromAbs = path.join(taskDir(taskId), action.artifactPath);
+        const toAbs = path.join(taskDir(taskId), targetRel);
+        // 文件可能不存在（agent 没写成功）——只改字段、不报错
+        if (await exists(fromAbs)) {
+          await fs.mkdir(path.dirname(toAbs), { recursive: true });
+          await fs.rename(fromAbs, toAbs);
+        }
+        nextArtifactPath = targetRel;
+      }
+    }
+
+    meta.actions = [
+      ...meta.actions.slice(0, idx),
+      { ...action, excluded, artifactPath: nextArtifactPath },
+      ...meta.actions.slice(idx + 1),
+    ];
+    meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
   });

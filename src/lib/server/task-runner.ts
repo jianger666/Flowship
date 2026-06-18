@@ -2301,7 +2301,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         // 正常 cancel（stop / 硬超时触发）→ 收尾卡住的 action + 关运行时状态
         // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
         await finalizeStaleActions(task.id, "cancelled");
-        const updated = await setTaskRunStatus(task.id, "idle", null);
+        // 保留 currentActionId（不传第三参）：被停的 action 此刻已被 finalizeStaleActions 标 cancelled、
+        // 让它仍是「当前 action」、前端 canRestartCurrentAction 命中 cancelled → 用户能「重启当前阶段」、
+        // 不必只能推新 action（修：手动停止后重启按钮消失——之前这里传 null 把 currentActionId 清了）。
+        const updated = await setTaskRunStatus(task.id, "idle");
         if (updated) publish(task.id, { kind: "task", task: updated });
         publish(task.id, { kind: "done", task: updated ?? task, ok: true });
         return;
