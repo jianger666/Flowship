@@ -618,7 +618,10 @@ export const ArtifactPanel = ({
                   </span>
                 </div>
               )}
-            <div className="prose prose-sm dark:prose-invert max-w-[80ch] prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
+            {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
+                让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
+                （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
+            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
               <ReactMarkdown
                 remarkPlugins={[
                   remarkGfm,
