@@ -76,18 +76,26 @@ export const ImagePreviewProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   // 键盘 Esc 关 / ←→ 切换；open 期间锁 body 滚动（关了还原）
+  // ⚠️ capture 阶段监听 + ESC 时 stopImmediatePropagation：lightbox 永远在最上层
+  // （z-200、常常从 base-ui Dialog 里点图唤起）、ESC 必须抢在底层 Dialog 的 dismiss
+  // 处理之前关掉自己、并拦住事件别让它继续传到 Dialog——否则会出现用户实测的反向顺序
+  // 「第一次 ESC 关了底层再聊聊弹窗、第二次 ESC 才关图片预览」。capture 让本监听最先拿到
+  // 事件、stopImmediatePropagation 切断后续所有 keydown 监听（含 base-ui 挂 document 上的）。
   useEffect(() => {
     if (!state) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-      else if (e.key === "ArrowLeft") go(-1);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        close();
+      } else if (e.key === "ArrowLeft") go(-1);
       else if (e.key === "ArrowRight") go(1);
     };
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
       document.body.style.overflow = prevOverflow;
     };
   }, [state, close, go]);

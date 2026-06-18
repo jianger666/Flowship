@@ -51,6 +51,7 @@ import {
 } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
+import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 import {
   ACTION_LABEL_EN,
   ACTION_LABEL_SHORT,
@@ -619,7 +620,11 @@ export const ArtifactPanel = ({
               )}
             <div className="prose prose-sm dark:prose-invert max-w-[80ch] prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkKeepTrailingUnderscore]}
+                remarkPlugins={[
+                  remarkGfm,
+                  remarkKeepTrailingUnderscore,
+                  remarkTrimAutolinkCjk,
+                ]}
                 components={markdownComponents}
               >
                 {currentArtifact.content}

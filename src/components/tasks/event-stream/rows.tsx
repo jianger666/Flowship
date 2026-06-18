@@ -32,6 +32,7 @@ import {
 import { buildIdeLink, pathBasename } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
+import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
 import {
   JUMP_IDE_LABEL,
@@ -83,7 +84,11 @@ export const MarkdownText = ({ text }: { text: string }) => (
   >
     <ReactMarkdown
       // keepTrailingUnderscore：裸链接尾部 _ 被 GFM 剥掉的修正（V0.7.13、用户实测 404）
-      remarkPlugins={[remarkGfm, remarkKeepTrailingUnderscore]}
+      remarkPlugins={[
+        remarkGfm,
+        remarkKeepTrailingUnderscore,
+        remarkTrimAutolinkCjk,
+      ]}
       components={{
         // 链接统一新窗口 / 系统浏览器打开、相对路径降级纯文本（V0.7.7）
         a: MarkdownLink,
