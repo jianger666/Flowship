@@ -183,6 +183,20 @@ export interface ModelOption {
   variants?: ModelVariant[];
 }
 
+/**
+ * API Key 归属信息（来自 SDK `Cursor.me`、设置页展示用）
+ * - 团队 / service-account key 没有 userId / 邮箱 / 姓名、相应字段缺省
+ * - apiKeyName / createdAt 任何 key 都有
+ */
+export interface ApiKeyInfo {
+  apiKeyName: string;
+  userId?: number;
+  userEmail?: string;
+  userFirstName?: string;
+  userLastName?: string;
+  createdAt: string;
+}
+
 // ===========================================
 // V0.6 任务模型：task 容器 + action 历史
 // ===========================================

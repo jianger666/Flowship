@@ -7,7 +7,7 @@
  * - 「验证」按钮触发模型列表拉取（由父组件传入）、显示 spinner
  */
 
-import { Eye, EyeOff, Loader2, RefreshCw } from "lucide-react";
+import { Eye, EyeOff, Loader2, RefreshCw, User } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,6 +20,8 @@ import {
 } from "@/components/ui/card";
 
 import { useState } from "react";
+
+import type { ApiKeyInfo } from "@/lib/types";
 
 // 太短就不要脱敏了、否则 6+4 切片会重叠出现 "crsr_t...test" 这种残影
 const MASK_THRESHOLD = 10;
@@ -35,6 +37,8 @@ const maskKey = (key: string): string => {
 
 interface ApiKeyCardProps {
   apiKey: string;
+  // 验证通过后的 API Key 归属信息（Cursor.me）、null = 未验证 / 团队 key
+  info: ApiKeyInfo | null;
   // 输入时改草稿、失焦（onBlur）落盘
   onChange: (next: string) => void;
   onCommit: (value: string) => void;
@@ -42,8 +46,21 @@ interface ApiKeyCardProps {
   validating: boolean;
 }
 
+// createdAt 是 ISO 串、展示成「YYYY-MM-DD」即可
+const formatCreatedAt = (iso: string): string => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+// 拼用户全名（姓 / 名可能缺、按有的拼）
+const fullName = (info: ApiKeyInfo): string =>
+  [info.userFirstName, info.userLastName].filter(Boolean).join(" ").trim();
+
 export const ApiKeyCard = ({
   apiKey,
+  info,
   onChange,
   onCommit,
   onValidate,
@@ -53,6 +70,7 @@ export const ApiKeyCard = ({
   const [showKey, setShowKey] = useState(false);
 
   const masked = !showKey && apiKey ? maskKey(apiKey) : "";
+  const name = info ? fullName(info) : "";
 
   return (
     <Card>
@@ -93,6 +111,26 @@ export const ApiKeyCard = ({
         </div>
         {masked && (
           <div className="text-xs text-muted-foreground font-mono">{masked}</div>
+        )}
+        {info && (
+          <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+            <User className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 space-y-0.5">
+              {/* 第一行：姓名 + 邮箱（团队 / service key 可能都没有、退回只显示密钥名） */}
+              <div className="font-medium">
+                {name || info.userEmail || info.apiKeyName}
+                {name && info.userEmail && (
+                  <span className="ml-1.5 font-normal text-muted-foreground">
+                    {info.userEmail}
+                  </span>
+                )}
+              </div>
+              {/* 第二行：密钥名 · 创建时间 */}
+              <div className="text-muted-foreground">
+                密钥「{info.apiKeyName}」· 创建于 {formatCreatedAt(info.createdAt)}
+              </div>
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

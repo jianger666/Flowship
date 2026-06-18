@@ -20,7 +20,7 @@
  * - 不预选默认模型：避免误用
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
@@ -29,6 +29,8 @@ import { LoadingState } from "@/components/ui/loading-state";
 
 import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
+import { useApiKeyInfo } from "@/hooks/use-api-key-info";
+import { getSettings } from "@/lib/local-store";
 
 import { ApiKeyCard } from "@/components/settings/api-key-card";
 import { ModelCard } from "@/components/settings/model-card";
@@ -43,12 +45,42 @@ const SettingsPage = () => {
   const router = useRouter();
   const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
+  // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在 ApiKeyCard
+  const { info: apiKeyInfo, loading: infoLoading, fetchInfo } = useApiKeyInfo();
+
+  // 一次「验证」同时拉模型列表 + 账号信息（两者都吃 SWR 缓存、重复调很便宜）
+  const validateApiKey = useCallback(
+    (key: string) => {
+      const trimmed = key.trim();
+      if (!trimmed) return;
+      void fetchModels(trimmed);
+      void fetchInfo(trimmed);
+    },
+    [fetchModels, fetchInfo],
+  );
+
+  // apiKey 失焦落盘：顺带自动验证（省得用户手动点「验证」才出模型 / 账号信息）
+  const handleApiKeyCommit = (value: string) => {
+    saveFieldValue("apiKey", value);
+    validateApiKey(value);
+  };
 
   // 桌面端壳注入的版本号（web 版没有、不显示）；useEffect 读防 hydration mismatch
   const [appVersion, setAppVersion] = useState<string | null>(null);
   useEffect(() => {
     setAppVersion(window.__appVersion ?? null);
   }, []);
+
+  // 进设置页（配置加载完成）若已有 apiKey 就自动验证一次——读 SWR 缓存秒出模型 + 账号信息、
+  // 不用用户手动点「验证」。用 ref 保证只跑一次（读 getSettings 的落盘值、不依赖输入草稿、
+  // 避免把 apiKey 放进 deps 导致每次敲键都重拉）
+  const didInitValidate = useRef(false);
+  useEffect(() => {
+    if (!loaded || didInitValidate.current) return;
+    didInitValidate.current = true;
+    const key = getSettings().apiKey?.trim();
+    if (key) validateApiKey(key);
+  }, [loaded, validateApiKey]);
 
   if (!loaded) {
     return <LoadingState variant="block" />;
@@ -82,17 +114,15 @@ const SettingsPage = () => {
           )}
           <CheckUpdateButton />
         </div>
-        <p className="text-xs text-muted-foreground mt-1">
-          编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器
-        </p>
       </div>
 
       <ApiKeyCard
         apiKey={settings.apiKey}
+        info={apiKeyInfo}
         onChange={(v) => update("apiKey", v)}
-        onCommit={(v) => saveFieldValue("apiKey", v)}
-        onValidate={fetchModels}
-        validating={modelsLoading}
+        onCommit={handleApiKeyCommit}
+        onValidate={validateApiKey}
+        validating={modelsLoading || infoLoading}
       />
 
       <UserProfileCard

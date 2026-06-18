@@ -15,6 +15,15 @@
 
 ---
 
+### v0.8.8：图片统一组件 + 站内预览 + 提交快捷键全站统一（2026-06-18）
+
+- **图片统一组件 + 站内 lightbox（`src/components/ui/image-preview.tsx`）**：全站「用户内容图」收敛到 `ImageThumb`（缩略图）+ `MarkdownImage`（markdown 内嵌图）、`ImagePreviewProvider` / `useImagePreview` 提供全局 lightbox（挂 `providers.tsx`）。点击站内看大图（点背景 / Esc / X 关、多图 ←→ + 键盘 + N/total 计数、锁 body 滚动、**不跳出 app**）。替换 7+ 处：事件流已发送图（rows chat+log、**去掉 `target=_blank` 跳系统浏览器**）、5 处输入预览（event-stream 岛内 + 独立 / advance / revise / ask-user / context-docs、保留移除 X）、context-docs image doc 行内小图；两个 ReactMarkdown 实例（MarkdownText + artifact-panel）都配 `img: MarkdownImage`、markdown 内嵌图也可预览。痛点根源：原生 img 不能预览 + 新 tab 在 Electron 壳跳出 app 体验差。
+- **提交快捷键全站统一**：`ask_user` 弹窗从写死 Cmd+Enter 改成跟设置页偏好走（`useSubmitShortcut` + `shouldSubmitOnKeyDown`）——mod-enter 任意焦点提交 / enter 只在 textarea 内提交（guard `tagName`、避免焦点在选项按钮上裸 Enter 误提交整表）；`shouldSubmitOnKeyDown` 入参放宽 `HTMLTextAreaElement` → `HTMLElement`（能绑 textarea 也能绑 DialogContent 容器）。单行 `prompt` 框保持 Enter 提交（无换行歧义、不套设置）。
+- 规则沉淀：`learned-conventions`（图片走 ImageThumb / MarkdownImage、新 ReactMarkdown 必配 img）+ `ui-conventions`（提交快捷键走 useSubmitShortcut、不写死）。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot + 组件进包核验。
+
+---
+
 ### v0.8.7：模型选择器全站统一 + 重启选模型 + 追加方案批次总览 + SDK 1.0.19 补 connect-node（2026-06-18）
 
 - **模型选择器统一成 `ModelSelect`（`src/components/ui/model-select.tsx`）**：全站 5 处（设置页 / 新建任务 / 推进 dialog / 重启 dialog / chat footer）收敛到一个组件、删旧 `model-picker.tsx`。一个「trigger + 可搜索 popover + chips 参数」一体：① 顶部搜索框按 displayName/id 实时过滤（几十个模型不再纯下拉翻）；② **popover 内零嵌套弹层**（模型列表是普通 button、params 用 ChoiceButton chips 原地切）——根治旧版「Popover 套 Select / Select 套 Select」导致的「选完点空白要点两次才关」。

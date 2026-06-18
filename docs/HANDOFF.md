@@ -304,6 +304,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.10：API Key 进页面自动验证 + 展示账号信息（2026-06-18）
+
+- **进设置页自动验证**：以前 providers 已有 app 级模型预热、但设置页是另一个 `useModels` 实例不读缓存 → 用户进来要手动点「验证」才出模型。改成：配置加载完、有 apiKey 就自动拉一次（模型 + 账号信息、走 SWR 缓存秒出、`didInitValidate` ref 保证只跑一次）；apiKey 改完失焦（`onCommit`）也自动重验。
+- **展示账号信息**：新增 `/api/me`（`Cursor.me`、同 `/api/models` 的 10min 内存缓存 + 超时兜底）+ `src/hooks/use-api-key-info.ts`（SWR：localStorage 先返 + 后台刷）；`ApiKeyCard` 在密钥下方显示「姓名 · 邮箱 / 密钥『name』· 创建于 YYYY-MM-DD」（团队 / service key 无邮箱时退回只显示有的字段）。`src/lib/types.ts` 加 `ApiKeyInfo`。
+- **删过时文案**：设置页顶「编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器」整句删——桌面端唯一交付、文案误导。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；产物旧文案 0 命中、`/api/me` route 已进包、`/settings` 200、`/api/me` 空 body 返 400「缺少 apiKey」（路由挂载正常）。
+
 ### v0.8.9：桌面端「检查更新」按钮（2026-06-18）
 
 - **手动检查更新**：壳本就有自动自更新（启动 + 每 2h 轮询 GitHub releases/latest、发现新版亮右上角「新版本」标识 + 弹一次原生框、mac 壳内下载替换 / win 重启即装），但「没更新就静默」、用户没法主动确认自己是不是最新。补一个按需通道：
@@ -311,13 +318,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - `electron-app/preload.cjs`：暴露 `window.__appUpdater.check()`。
   - `src/components/settings/check-update-button.tsx`：设置页版本号旁「检查更新」按钮（仅桌面壳显示、disabled+spinner 防双击）——已最新 → toast「已是最新版本 vX」、发现新版 → toast「发现新版本 vX、点右上角更新」+ 标识亮起、失败 → toast.error。
 - 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；asar 含新 IPC/preload 字符串、设置页文案进 chunk、`/settings` 200；用户在 test 实例点按钮端到端验通（test 版恒低于线上 → 走 available 分支、标识亮起）。
-
-### v0.8.8：图片统一组件 + 站内预览 + 提交快捷键全站统一（2026-06-18）
-
-- **图片统一组件 + 站内 lightbox（`src/components/ui/image-preview.tsx`）**：全站「用户内容图」收敛到 `ImageThumb`（缩略图）+ `MarkdownImage`（markdown 内嵌图）、`ImagePreviewProvider` / `useImagePreview` 提供全局 lightbox（挂 `providers.tsx`）。点击站内看大图（点背景 / Esc / X 关、多图 ←→ + 键盘 + N/total 计数、锁 body 滚动、**不跳出 app**）。替换 7+ 处：事件流已发送图（rows chat+log、**去掉 `target=_blank` 跳系统浏览器**）、5 处输入预览（event-stream 岛内 + 独立 / advance / revise / ask-user / context-docs、保留移除 X）、context-docs image doc 行内小图；两个 ReactMarkdown 实例（MarkdownText + artifact-panel）都配 `img: MarkdownImage`、markdown 内嵌图也可预览。痛点根源：原生 img 不能预览 + 新 tab 在 Electron 壳跳出 app 体验差。
-- **提交快捷键全站统一**：`ask_user` 弹窗从写死 Cmd+Enter 改成跟设置页偏好走（`useSubmitShortcut` + `shouldSubmitOnKeyDown`）——mod-enter 任意焦点提交 / enter 只在 textarea 内提交（guard `tagName`、避免焦点在选项按钮上裸 Enter 误提交整表）；`shouldSubmitOnKeyDown` 入参放宽 `HTMLTextAreaElement` → `HTMLElement`（能绑 textarea 也能绑 DialogContent 容器）。单行 `prompt` 框保持 Enter 提交（无换行歧义、不套设置）。
-- 规则沉淀：`learned-conventions`（图片走 ImageThumb / MarkdownImage、新 ReactMarkdown 必配 img）+ `ui-conventions`（提交快捷键走 useSubmitShortcut、不写死）。
-- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot + 组件进包核验。
 
 ---
 
