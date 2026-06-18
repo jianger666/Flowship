@@ -304,6 +304,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.8：图片统一组件 + 站内预览 + 提交快捷键全站统一（2026-06-18）
+
+- **图片统一组件 + 站内 lightbox（`src/components/ui/image-preview.tsx`）**：全站「用户内容图」收敛到 `ImageThumb`（缩略图）+ `MarkdownImage`（markdown 内嵌图）、`ImagePreviewProvider` / `useImagePreview` 提供全局 lightbox（挂 `providers.tsx`）。点击站内看大图（点背景 / Esc / X 关、多图 ←→ + 键盘 + N/total 计数、锁 body 滚动、**不跳出 app**）。替换 7+ 处：事件流已发送图（rows chat+log、**去掉 `target=_blank` 跳系统浏览器**）、5 处输入预览（event-stream 岛内 + 独立 / advance / revise / ask-user / context-docs、保留移除 X）、context-docs image doc 行内小图；两个 ReactMarkdown 实例（MarkdownText + artifact-panel）都配 `img: MarkdownImage`、markdown 内嵌图也可预览。痛点根源：原生 img 不能预览 + 新 tab 在 Electron 壳跳出 app 体验差。
+- **提交快捷键全站统一**：`ask_user` 弹窗从写死 Cmd+Enter 改成跟设置页偏好走（`useSubmitShortcut` + `shouldSubmitOnKeyDown`）——mod-enter 任意焦点提交 / enter 只在 textarea 内提交（guard `tagName`、避免焦点在选项按钮上裸 Enter 误提交整表）；`shouldSubmitOnKeyDown` 入参放宽 `HTMLTextAreaElement` → `HTMLElement`（能绑 textarea 也能绑 DialogContent 容器）。单行 `prompt` 框保持 Enter 提交（无换行歧义、不套设置）。
+- 规则沉淀：`learned-conventions`（图片走 ImageThumb / MarkdownImage、新 ReactMarkdown 必配 img）+ `ui-conventions`（提交快捷键走 useSubmitShortcut、不写死）。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot + 组件进包核验。
+
 ### v0.8.7：模型选择器全站统一 + 重启选模型 + 追加方案批次总览 + SDK 1.0.19 补 connect-node（2026-06-18）
 
 - **模型选择器统一成 `ModelSelect`（`src/components/ui/model-select.tsx`）**：全站 5 处（设置页 / 新建任务 / 推进 dialog / 重启 dialog / chat footer）收敛到一个组件、删旧 `model-picker.tsx`。一个「trigger + 可搜索 popover + chips 参数」一体：① 顶部搜索框按 displayName/id 实时过滤（几十个模型不再纯下拉翻）；② **popover 内零嵌套弹层**（模型列表是普通 button、params 用 ChoiceButton chips 原地切）——根治旧版「Popover 套 Select / Select 套 Select」导致的「选完点空白要点两次才关」。
@@ -312,15 +319,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **SDK 升 1.0.19 + 补 `@connectrpc/connect-node`**：SDK 1.0.19 运行时 import connect-node（Node transport）却漏在自己 package.json 声明依赖 → pnpm 没装、standalone nft 追不到、打包缺包、chat agent 启动即 `Cannot find package '@connectrpc/connect-node'`。项目侧显式 `pnpm add @connectrpc/connect-node@1.7.0`（对齐现有 connect 版本）补上、nft 自动进包、无需改 assemble 脚本。
 - **删除对话不再弹 toast**：`app-sidebar` 删除任务成功的 `toast.success` 去掉（失败仍提示）。
 - 验证：typecheck + lint 全绿、3 步打包 + test（8776）端到端（含运行时 `import @cursor/sdk` 验 connect-node 解析通）。
-
-### v0.8.3：ask_user 逐题贴图 + chat 流式自动滑底 + announce-then-wait 防漏 + ask-reply race 加固（2026-06-16）
-
-- **ask_user 弹窗逐题贴图（仅自定义回答能带图、用户拍板）**：每道题抽 `AskQuestionItem` 子组件、各 call 一次 `useImageAttach`（hook 不能在 `questions.map` 里循环调、故按子组件拆）、各绑各的图。附图按钮 / 缩略图 / 粘贴 / 拖拽整体收进「自定义回答」区——选固定选项（A/B/C）就隐藏且上报空图（图 state 不清、再切回自定义会重现、不丢用户已贴的图）。后端 `ask-reply/route.ts` 收 `imagesByQuestion`、按 questionId 白名单过滤（防客户端塞无关 key）、单题 ≤6 / 合计 ≤12、**先校验后落盘**（确认 agent 还在等才写、避免僵尸态留孤儿文件）、`buildReplyText` 每题 A 行下内联「本题附图：<basename>」做归属、`meta.images` 扁平给前端 `extractUserReplyImages` 渲缩略图、`allAbsPaths` 透传 agent（文末 `[ATTACHED_IMAGES]`）。图-only（只贴图不填字）也算已答。
-- **chat 流式回复自动滑底（修）**：根因——react-virtuoso `followOutput` 只在 data **条数**变化触发、流式是往同一个 `__streaming__` 虚拟 item 追加 text、条数不变（始终 merged.length+1）→ 增长期间不滚。修：`atBottomRef`（Virtuoso `atBottomStateChange` 维护「用户是否贴底」）+ `useEffect([streamingText, items.length])` 贴底时 `scrollToIndex(last, align:"end", behavior:"auto")` + `atBottomThreshold={120}`（默认仅 4px、太敏感、单 chunk 增高就被判离底自废）。EventStream 是 chat / task 共用组件、两边都受益。
-- **chat「宣告计划当正文」announce-then-wait 防漏（7 处文案、task 协议 + 硬闸逻辑不动）**：composer-2.5 实测把「我先写一篇 X、写完后再等」这种**计划宣告**当成回答、文章一字没写就直接挂等。把「预告」从「只举查询型（正在检索 / 让我看看）」**泛化**成「任何只宣告要做、不含成品的话都是预告」；交付用「**本轮成品 / 可用分段**」措辞（不逼一条写完整任务、不压制合理分多轮）。同步 7 处（含离每轮最近的 `CHAT_REPLY_REMINDER`、wait_for_user 工具 description、硬闸拒绝文案）。经 reviewAI 多轮确认范围限 chat。
-- **chat 纯宣告硬闸（announce-then-wait 第二刀、reviewAI 拍板极窄启发式）**：上一刀（7 处文案）实测对 composer-2.5 仍漏——它「知道规则却执行时跳步」、发一句「我先写…进入等待你的下一条」当正文就直接 curl 挂等、命中硬闸「有正文就放行」分支没拦住（原判定只看「有没有正文」、不看是「宣告」还是「成品」）。纯 prompt 兜不住执行层、在 `premature-chat-wait.ts` 加 `isPureAnnouncement` 窄判定（两档：**强信号**=短正文含内部等待机制词「进入等待 / 挂等 / wait_for_user / 监听你下一」、**不收裸 curl** 防误伤「curl 调接口示例」类技术问答；**组合信号**=短正文同时命中「将来式计划 + 交付动词 + 延后/未完成语义」三件套缺一不算、区分「我先给你结论：可以」（已交付不拦）vs「我先写…写完后再发」（未交付拦））。判定拆 `lastSubstantiveAnswerIdx`：纯宣告不刷新「有效回答」位置、防「答→查→只发个宣告」绕过「答后又查没回报」。误拦靠既有 `CAP=2` 兜底。chat 起手顶部加一句 blockquote 铁律（计划 / 预告 / 等待说明都不是交付物）、waitDiscipline 核心段不动。+10 回归单测。经 reviewAI 两轮 review（揪出裸 curl 误拦 + 纯宣告刷新位置 2 个 P1、已修）终审通过。
-- **ask-reply 后端 race 加固（2 个 P1、reviewAI 提）**：① **重排**「先 `submitAskReply` 成功、再写 ask_user_reply 事件 + publish + 切 running」——旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时用户已看到「已答」但 agent 没收到（假已答）；② pending 校验**从 task 级升到 token 级**：`submitAskReply` 加 `expectedToken`、新增 `hasPendingToken(taskId, token)`、route 从 ask_user_request 事件 `meta.token` 取——防旧弹窗答案串进被 force-new-agent / 顶替换掉的新 pending。
-- 验证：typecheck + lint 全绿、vitest 118 全过、3 步打包 + test（8776）端到端验证。
 
 ---
 

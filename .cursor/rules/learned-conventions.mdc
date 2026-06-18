@@ -90,7 +90,7 @@ alwaysApply: true
 - enabled 开关用于「父子组件二选一订阅」场景（如 task page + ChatView 都能订阅同一个任务、但只让其中一方订）。
 - 回调里需要拿最新 task / state 时、调用方自己用 ref 模式（hook 内部已经把 callbacks 集合做了 ref 化、不需要再 ref 化包一层）。
 
-## 共享 UI：LoadingState / EmptyHint / ChoiceButton
+## 共享 UI：LoadingState / EmptyHint / ChoiceButton / ImageThumb
 
 - **加载中**一律用 `<LoadingState variant="block" | "card" | "inline" />`、不要再写裸 `<div>加载中…</div>` 或自己拼 Card 包一遍。
   - block：页面级（默认占满 viewport 减顶 bar）
@@ -103,6 +103,11 @@ alwaysApply: true
   - chip：圆角小药丸（preset 标签、Other 切换）
   - tab：行内按钮（phase-progress 那种 hover 态切换）
   - 这是给「shadcn `<Button>` 不能直接套的自定义视觉选中态」准备的——不要自己拼 `cn("rounded border ...", selected && "border-primary")`。
+- **图片展示**一律用 `<ImageThumb>`（缩略图、点击站内 lightbox 看大图）、**不要再手写 `<img>` 缩略图 / `<a target="_blank">` 跳系统浏览器**（V0.8.8 立规、用户痛点：原生 img 不能预览、新 tab 在 Electron 壳里跳出 app 体验差）。
+  - 组件 + 全局 lightbox 都在 `src/components/ui/image-preview.tsx`：`ImageThumb`（缩略图）、`ImagePreviewProvider`（已挂 `providers.tsx`）、`useImagePreview()`（任意组件手动唤起预览）、`MarkdownImage`（markdown 内嵌图）。
+  - 发送前预览传 `onRemove`（右上角显示移除 X）；同组多图传 `group: PreviewImage[]` + `index`、lightbox 内可 ←→ 切换 + 键盘。
+  - **markdown 正文里的图（`![]()`）**走 `MarkdownImage`——新加任何 `ReactMarkdown` 实例的 `components` 必须配 `{ a: MarkdownLink, img: MarkdownImage }`（跟链接同等待遇、否则图退回不可预览的原生 `<img>`）。
+  - 唯一例外：纯装饰 / logo（`/logo.png` 那种）不用 ImageThumb（不需要预览）。
 
 ## 关于 useEffect 依赖
 

@@ -13,8 +13,10 @@ export const getSubmitShortcutHint = (shortcut: SubmitShortcut): string =>
 export const getSubmitShortcutTitle = (shortcut: SubmitShortcut): string =>
   shortcut === "enter" ? "Enter" : "Cmd/Ctrl+Enter";
 
+// 接受任意元素的 KeyboardEvent（textarea / dialog 容器都可传）——只读 key / 修饰键 / isComposing、
+// 不碰 textarea 专属属性。这样既能绑在 textarea 上、也能绑在 DialogContent 容器上（ask_user 弹窗）。
 export const shouldSubmitOnKeyDown = (
-  event: KeyboardEvent<HTMLTextAreaElement>,
+  event: KeyboardEvent<HTMLElement>,
   shortcut: SubmitShortcut,
 ): boolean => {
   if (event.key !== "Enter") return false;

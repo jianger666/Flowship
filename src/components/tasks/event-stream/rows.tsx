@@ -24,6 +24,11 @@ import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
 import { MarkdownLink } from "@/components/markdown-link";
+import {
+  ImageThumb,
+  MarkdownImage,
+  type PreviewImage,
+} from "@/components/ui/image-preview";
 import { buildIdeLink, pathBasename } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
@@ -82,6 +87,8 @@ export const MarkdownText = ({ text }: { text: string }) => (
       components={{
         // 链接统一新窗口 / 系统浏览器打开、相对路径降级纯文本（V0.7.7）
         a: MarkdownLink,
+        // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
+        img: MarkdownImage,
       }}
     >
       {text}
@@ -279,6 +286,21 @@ const EventRowImpl = ({
     [isUser, ev.meta],
   );
 
+  // 同组附图（lightbox 内左右切换整组）：缩略图 / 大图同源（uploads 静态文件）、title 带文件名 + 大小
+  const imageGroup = useMemo<PreviewImage[]>(
+    () =>
+      images.map((img) => {
+        const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;
+        const sizeKb = img.bytes > 0 ? (img.bytes / 1024).toFixed(1) : "?";
+        return {
+          src: url,
+          alt: img.filename ?? "附图",
+          title: `${img.filename ?? pathBasename(img.absPath)} · ${sizeKb} KB`,
+        };
+      }),
+    [images, taskId],
+  );
+
   // 折叠状态：所有事件都可折叠、默认值由 DEFAULT_EXPANDED_KINDS 决定
   // - assistant_message / user_reply：默认展开（用户主要看的就是这俩）
   // - info 里带 meta.awaitingAck 的「Action 产出完成、等待 ack」里程碑事件也默认展开（用户要 ack）
@@ -330,22 +352,16 @@ const EventRowImpl = ({
           </div>
           {images.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
-              {images.map((img) => {
-                const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;
-                return (
-                  <a
-                    key={img.absPath}
-                    href={url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="block size-14 overflow-hidden rounded-md border transition-opacity hover:opacity-80"
-                    title={img.filename ?? pathBasename(img.absPath)}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={url} alt={img.filename ?? "附图"} className="size-full object-cover" loading="lazy" />
-                  </a>
-                );
-              })}
+              {imageGroup.map((g, i) => (
+                <ImageThumb
+                  key={images[i].absPath}
+                  src={g.src}
+                  alt={g.alt}
+                  title={g.title}
+                  group={imageGroup}
+                  index={i}
+                />
+              ))}
             </div>
           )}
           {attachments.length > 0 && (
@@ -482,31 +498,20 @@ const EventRowImpl = ({
             </div>
           ))}
         {/* user_reply / ask_user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
-            点缩略图新 tab 打开看大图、不内嵌 lightbox（保持轻量、浏览器自带的图片查看够用）*/}
+            点缩略图站内 lightbox 看大图、多图可左右切换（V0.8.8 统一 ImageThumb）*/}
         {hasImageMeta && images.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
-            {images.map((img) => {
-              const url = `/api/tasks/${taskId}/uploads/${pathBasename(img.absPath)}`;
-              const sizeKb = img.bytes > 0 ? (img.bytes / 1024).toFixed(1) : "?";
-              return (
-                <a
-                  key={img.absPath}
-                  href={url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="group block size-16 overflow-hidden rounded-md border bg-card transition-opacity hover:opacity-80"
-                  title={`${img.filename ?? pathBasename(img.absPath)} · ${sizeKb} KB`}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={url}
-                    alt={img.filename ?? "附图"}
-                    className="size-full object-cover"
-                    loading="lazy"
-                  />
-                </a>
-              );
-            })}
+            {imageGroup.map((g, i) => (
+              <ImageThumb
+                key={images[i].absPath}
+                src={g.src}
+                alt={g.alt}
+                title={g.title}
+                className="size-16"
+                group={imageGroup}
+                index={i}
+              />
+            ))}
           </div>
         )}
         {/* user_reply 附路径 chips：跟图片一样、始终显示（不受折叠影响）

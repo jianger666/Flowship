@@ -22,7 +22,7 @@
  */
 
 import { memo, useEffect, useState } from "react";
-import { Loader2, Paperclip, X } from "lucide-react";
+import { Loader2, Paperclip } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { useImageAttach } from "@/hooks/use-image-attach";
@@ -138,30 +139,22 @@ const ReviseDialogImpl = ({
           onDragLeave={onDragLeave}
           onDrop={onDrop}
         >
-          {/* 缩略图区：发送前可移除单张 */}
+          {/* 缩略图区：发送前可移除单张、点击站内看大图（多图左右切换） */}
           {images.length > 0 && (
             <div className="flex flex-wrap gap-2">
-              {images.map((img) => (
-                <div
+              {images.map((img, i) => (
+                <ImageThumb
                   key={img.id}
-                  className="group relative size-16 overflow-hidden rounded-md border bg-card"
-                  title={img.file.name}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={img.dataUrl}
-                    alt={img.file.name}
-                    className="size-full object-cover"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => removeImage(img.id)}
-                    className="absolute top-0.5 right-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                    aria-label="移除"
-                  >
-                    <X className="size-3" />
-                  </button>
-                </div>
+                  src={img.dataUrl}
+                  alt={img.file.name}
+                  className="size-16"
+                  onRemove={() => removeImage(img.id)}
+                  group={images.map((im) => ({
+                    src: im.dataUrl,
+                    alt: im.file.name,
+                  }))}
+                  index={i}
+                />
               ))}
             </div>
           )}

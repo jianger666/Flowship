@@ -27,7 +27,6 @@ import {
   Notebook,
   Plus,
   Trash2,
-  X,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -40,6 +39,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { ImageThumb } from "@/components/ui/image-preview";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -234,12 +234,12 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                       className="flex min-w-0 items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/30 group"
                     >
                       {thumb ? (
-                        // image 类型展示缩略图、原生 img 不走 next/image 优化（dataUrl / 内部静态文件、不需要）
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
+                        // image 类型展示缩略图、点击站内看大图（行内小图、去掉默认框）
+                        <ImageThumb
                           src={thumb}
                           alt={doc.title}
-                          className="size-5 shrink-0 rounded object-cover"
+                          className="size-5 shrink-0 rounded border-0 bg-transparent"
+                          imgClassName="rounded"
                         />
                       ) : (
                         <span className="text-muted-foreground">
@@ -333,29 +333,21 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
               />
             </div>
 
-            {/* 贴图区：缩略图 + 添加按钮 */}
+            {/* 贴图区：缩略图（点击站内看大图、多图左右切换）+ 添加按钮 */}
             <div className="flex flex-wrap items-center gap-2">
-              {attach.images.map((img) => (
-                <div
+              {attach.images.map((img, i) => (
+                <ImageThumb
                   key={img.id}
-                  className="group relative size-14 overflow-hidden rounded border bg-background"
-                  title={img.file.name}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={img.dataUrl}
-                    alt={img.file.name}
-                    className="size-full object-cover"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => attach.removeImage(img.id)}
-                    className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
-                    aria-label="移除"
-                  >
-                    <X className="size-3" />
-                  </button>
-                </div>
+                  src={img.dataUrl}
+                  alt={img.file.name}
+                  className="size-14 rounded bg-background"
+                  onRemove={() => attach.removeImage(img.id)}
+                  group={attach.images.map((im) => ({
+                    src: im.dataUrl,
+                    alt: im.file.name,
+                  }))}
+                  index={i}
+                />
               ))}
               <Button
                 type="button"

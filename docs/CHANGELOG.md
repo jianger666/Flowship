@@ -15,6 +15,17 @@
 
 ---
 
+### v0.8.3：ask_user 逐题贴图 + chat 流式自动滑底 + announce-then-wait 防漏 + ask-reply race 加固（2026-06-16）
+
+- **ask_user 弹窗逐题贴图（仅自定义回答能带图、用户拍板）**：每道题抽 `AskQuestionItem` 子组件、各 call 一次 `useImageAttach`（hook 不能在 `questions.map` 里循环调、故按子组件拆）、各绑各的图。附图按钮 / 缩略图 / 粘贴 / 拖拽整体收进「自定义回答」区——选固定选项（A/B/C）就隐藏且上报空图（图 state 不清、再切回自定义会重现、不丢用户已贴的图）。后端 `ask-reply/route.ts` 收 `imagesByQuestion`、按 questionId 白名单过滤（防客户端塞无关 key）、单题 ≤6 / 合计 ≤12、**先校验后落盘**（确认 agent 还在等才写、避免僵尸态留孤儿文件）、`buildReplyText` 每题 A 行下内联「本题附图：<basename>」做归属、`meta.images` 扁平给前端 `extractUserReplyImages` 渲缩略图、`allAbsPaths` 透传 agent（文末 `[ATTACHED_IMAGES]`）。图-only（只贴图不填字）也算已答。
+- **chat 流式回复自动滑底（修）**：根因——react-virtuoso `followOutput` 只在 data **条数**变化触发、流式是往同一个 `__streaming__` 虚拟 item 追加 text、条数不变（始终 merged.length+1）→ 增长期间不滚。修：`atBottomRef`（Virtuoso `atBottomStateChange` 维护「用户是否贴底」）+ `useEffect([streamingText, items.length])` 贴底时 `scrollToIndex(last, align:"end", behavior:"auto")` + `atBottomThreshold={120}`（默认仅 4px、太敏感、单 chunk 增高就被判离底自废）。EventStream 是 chat / task 共用组件、两边都受益。
+- **chat「宣告计划当正文」announce-then-wait 防漏（7 处文案、task 协议 + 硬闸逻辑不动）**：composer-2.5 实测把「我先写一篇 X、写完后再等」这种**计划宣告**当成回答、文章一字没写就直接挂等。把「预告」从「只举查询型（正在检索 / 让我看看）」**泛化**成「任何只宣告要做、不含成品的话都是预告」；交付用「**本轮成品 / 可用分段**」措辞（不逼一条写完整任务、不压制合理分多轮）。同步 7 处（含离每轮最近的 `CHAT_REPLY_REMINDER`、wait_for_user 工具 description、硬闸拒绝文案）。经 reviewAI 多轮确认范围限 chat。
+- **chat 纯宣告硬闸（announce-then-wait 第二刀、reviewAI 拍板极窄启发式）**：上一刀（7 处文案）实测对 composer-2.5 仍漏——它「知道规则却执行时跳步」、发一句「我先写…进入等待你的下一条」当正文就直接 curl 挂等、命中硬闸「有正文就放行」分支没拦住（原判定只看「有没有正文」、不看是「宣告」还是「成品」）。纯 prompt 兜不住执行层、在 `premature-chat-wait.ts` 加 `isPureAnnouncement` 窄判定（两档：**强信号**=短正文含内部等待机制词「进入等待 / 挂等 / wait_for_user / 监听你下一」、**不收裸 curl** 防误伤「curl 调接口示例」类技术问答；**组合信号**=短正文同时命中「将来式计划 + 交付动词 + 延后/未完成语义」三件套缺一不算、区分「我先给你结论：可以」（已交付不拦）vs「我先写…写完后再发」（未交付拦））。判定拆 `lastSubstantiveAnswerIdx`：纯宣告不刷新「有效回答」位置、防「答→查→只发个宣告」绕过「答后又查没回报」。误拦靠既有 `CAP=2` 兜底。chat 起手顶部加一句 blockquote 铁律（计划 / 预告 / 等待说明都不是交付物）、waitDiscipline 核心段不动。+10 回归单测。经 reviewAI 两轮 review（揪出裸 curl 误拦 + 纯宣告刷新位置 2 个 P1、已修）终审通过。
+- **ask-reply 后端 race 加固（2 个 P1、reviewAI 提）**：① **重排**「先 `submitAskReply` 成功、再写 ask_user_reply 事件 + publish + 切 running」——旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时用户已看到「已答」但 agent 没收到（假已答）；② pending 校验**从 task 级升到 token 级**：`submitAskReply` 加 `expectedToken`、新增 `hasPendingToken(taskId, token)`、route 从 ask_user_request 事件 `meta.token` 取——防旧弹窗答案串进被 force-new-agent / 顶替换掉的新 pending。
+- 验证：typecheck + lint 全绿、vitest 118 全过、3 步打包 + test（8776）端到端验证。
+
+---
+
 ### v0.8.2：侧栏任务状态 + wait_for_user 误拦修复 + 长连接友好文案 + 重启模型保持（2026-06-16）
 
 - **侧栏任务运行态指示**：任务列表显示 running 转圈 / awaiting_user 脉冲点（`task-list-item.tsx`）+ 条件轮询实时更新（`use-task-list.tsx`、切到 B 也能看到 A 的状态）。

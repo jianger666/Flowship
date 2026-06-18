@@ -46,6 +46,10 @@ alwaysApply: true
 
 - 可点击卡片不要只挂 div onClick——主要动作给真 `<Link>`（参考 task-card 标题）、键盘 tab 可达
 - 弹窗内表单 Enter 提交、Esc 行为遵循 use-dialog 既定约定（不允许 Esc 误关 confirm）
+- **「输入框 / textarea 提交快捷键」一律走设置页偏好、不要写死 Enter / Cmd+Enter**（V0.8.8 立规）：
+  - 用 `useSubmitShortcut()`（`@/hooks/use-settings`）拿当前偏好 + `shouldSubmitOnKeyDown(e, shortcut)`（`@/lib/submit-shortcut`、已处理 IME / enter vs mod-enter）判定。现成例子：event-stream / advance-dialog / revise-dialog / ask-user-dialog。
+  - 多焦点弹窗（如 ask_user 有选项按钮 + textarea）把 handler 绑在 `DialogContent` 容器级（事件冒泡覆盖 textarea）；但 `enter` 模式要 guard `e.target.tagName === "TEXTAREA"`、只在 textarea 内裸 Enter 提交、避免焦点在按钮 / 容器时裸 Enter 误提交整表。
+  - 例外：**单行 `<Input>`**（如 `useDialog().prompt` 重命名框）保持 Enter 提交即可——设置项本意是「多行 textarea 的 Enter 歧义」、单行无歧义、不套设置。
 
 ## 设计 skill（V0.7.8 引入、两个都在 .cursor/skills/）
 

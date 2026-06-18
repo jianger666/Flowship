@@ -37,7 +37,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Paperclip, Sparkles, X } from "lucide-react";
+import { AlertTriangle, Paperclip, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -49,11 +49,14 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
+import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { useDialog } from "@/hooks/use-dialog";
 import { useImageAttach } from "@/hooks/use-image-attach";
+import { useSubmitShortcut } from "@/hooks/use-settings";
+import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitAskReply } from "@/lib/task-store";
 import type { ImagePayload } from "@/lib/task-store";
 import type {
@@ -284,30 +287,21 @@ const AskQuestionItem = ({
             disabled={submitting}
           />
 
-          {/* 缩略图：发送前可移除单张 */}
+          {/* 缩略图：发送前可移除单张、点击站内看大图（多图左右切换） */}
           {images.length > 0 && (
             <div className="flex flex-wrap gap-2">
-              {images.map((img) => (
-                <div
+              {images.map((img, i) => (
+                <ImageThumb
                   key={img.id}
-                  className="group relative size-14 overflow-hidden rounded-md border bg-card"
-                  title={img.file.name}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={img.dataUrl}
-                    alt={img.file.name}
-                    className="size-full object-cover"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => removeImage(img.id)}
-                    className="absolute top-0.5 right-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                    aria-label="移除"
-                  >
-                    <X className="size-3" />
-                  </button>
-                </div>
+                  src={img.dataUrl}
+                  alt={img.file.name}
+                  onRemove={() => removeImage(img.id)}
+                  group={images.map((im) => ({
+                    src: im.dataUrl,
+                    alt: im.file.name,
+                  }))}
+                  index={i}
+                />
               ))}
             </div>
           )}
@@ -342,6 +336,8 @@ const AskQuestionItem = ({
 export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   // useDialog 提供 confirm Promise API、用户点「稍后再补充」时弹二次确认
   const { confirm } = useDialog();
+  // 提交快捷键跟设置页个人偏好走（全站统一、不再写死 Cmd+Enter）
+  const submitShortcut = useSubmitShortcut();
 
   // 找最新一条待答的 ask_user_request
   // - 倒序扫、第一条没对应 reply 的就是「当前要弹的」
@@ -506,9 +502,19 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
         className="flex max-h-[80vh] w-full max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
         showCloseButton={false}
         onKeyDown={(e) => {
-          // 弹窗级提交快捷键：Mac Cmd+Enter，Windows/Linux Ctrl+Enter。
-          // 不只绑 textarea，避免焦点在选项按钮上时快捷键失效。
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          // 弹窗级提交快捷键、跟设置页偏好走（全站统一）。事件冒泡到 DialogContent、textarea 的
+          // Enter 也会经过这里。两档语义：
+          // - mod-enter（默认）：Cmd/Ctrl+Enter 任意焦点（选项按钮 / 容器 / textarea）都可提交
+          // - enter：裸 Enter 只在 textarea 内提交（避免焦点在选项按钮 / 容器上时裸 Enter 误提交整表）
+          const inTextarea =
+            (e.target as HTMLElement).tagName === "TEXTAREA";
+          if (submitShortcut === "enter" && !inTextarea) return;
+          if (
+            shouldSubmitOnKeyDown(
+              e as React.KeyboardEvent<HTMLElement>,
+              submitShortcut,
+            )
+          ) {
             e.preventDefault();
             void handleSubmit();
           }

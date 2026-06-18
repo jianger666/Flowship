@@ -31,6 +31,7 @@ import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
 import { ChoiceButton } from "@/components/ui/choice-button";
+import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
   Select,
@@ -132,6 +133,8 @@ const buildMarkdownComponents = (
   // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
   // （inline code 路径的 cursor:// 跳转在下面 code 组件、不受影响）
   a: MarkdownLink,
+  // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
+  img: MarkdownImage,
   // 只覆盖 inline code、fenced code block 走默认渲染
   code: ({ className, children, ...rest }) => {
     if (className) {

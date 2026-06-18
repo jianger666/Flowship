@@ -34,6 +34,7 @@ import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { useImageAttach } from "@/hooks/use-image-attach";
@@ -389,23 +390,18 @@ const EventStreamImpl = ({
             {/* 附件预览：岛内顶部（图缩略 + 路径 chips） */}
             {(attachedImages.length > 0 || attachedPaths.length > 0) && (
               <div className="flex flex-wrap gap-2 px-3 pt-3">
-                {attachedImages.map((img) => (
-                  <div
+                {attachedImages.map((img, i) => (
+                  <ImageThumb
                     key={img.id}
-                    className="group relative size-14 overflow-hidden rounded-md border bg-card"
-                    title={img.file.name}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={img.dataUrl} alt={img.file.name} className="size-full object-cover" />
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveImage(img.id)}
-                      className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                      aria-label="移除"
-                    >
-                      <X className="size-3" />
-                    </button>
-                  </div>
+                    src={img.dataUrl}
+                    alt={img.file.name}
+                    onRemove={() => handleRemoveImage(img.id)}
+                    group={attachedImages.map((im) => ({
+                      src: im.dataUrl,
+                      alt: im.file.name,
+                    }))}
+                    index={i}
+                  />
                 ))}
                 {attachedPaths.map((p) => {
                   const looksLikeDir = !pathBasename(p).includes(".");
@@ -565,30 +561,22 @@ const EventStreamImpl = ({
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
-        {/* 缩略图区：发送前可移除单张 */}
+        {/* 缩略图区：发送前可移除单张、点击站内看大图（多图左右切换） */}
         {attachedImages.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">
-            {attachedImages.map((img) => (
-              <div
+            {attachedImages.map((img, i) => (
+              <ImageThumb
                 key={img.id}
-                className="group relative size-16 overflow-hidden rounded-md border bg-card"
-                title={img.file.name}
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={img.dataUrl}
-                  alt={img.file.name}
-                  className="size-full object-cover"
-                />
-                <button
-                  type="button"
-                  onClick={() => handleRemoveImage(img.id)}
-                  className="absolute right-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                  aria-label="移除"
-                >
-                  <X className="size-3" />
-                </button>
-              </div>
+                src={img.dataUrl}
+                alt={img.file.name}
+                className="size-16"
+                onRemove={() => handleRemoveImage(img.id)}
+                group={attachedImages.map((im) => ({
+                  src: im.dataUrl,
+                  alt: im.file.name,
+                }))}
+                index={i}
+              />
             ))}
           </div>
         )}
