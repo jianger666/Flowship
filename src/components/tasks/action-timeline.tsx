@@ -84,21 +84,25 @@ const ActionChip = ({
         selected={isSelected}
         onClick={() => onSelectAction(action.id)}
         className={cn(
-          "relative text-foreground/85 hover:bg-muted/50 hover:text-foreground",
+          "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
+          // 当前查看 = 靛蓝描边 + 靛蓝字（无填充底）。
+          // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
+          // 选中前后宽高完全一致、点击切换不抖动。
           isSelected &&
-            "bg-primary/15 text-primary ring-1 ring-primary/70 hover:bg-primary/20",
+            "text-indigo-600 ring-1 ring-indigo-500/55 dark:text-indigo-300 dark:ring-indigo-400/55",
           isExcluded && "line-through opacity-60",
         )}
         title={title}
       >
         <span
           className={cn(
-            "mr-1 text-[10px] text-muted-foreground/85",
-            isSelected && "text-primary/80",
+            "text-[10px] text-muted-foreground/80",
+            isSelected && "text-indigo-600/80 dark:text-indigo-300/80",
           )}
         >
           #{action.n}
         </span>
+        {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
         <span>{ACTION_LABEL_SHORT[action.type]}</span>
       </ChoiceButton>
       {onToggleExclude && (

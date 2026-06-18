@@ -304,20 +304,18 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.11：action timeline 重做 + 修 CI sqlite3 死依赖打包失败（2026-06-18）
+
+- **修 CI 打包失败（v0.8.7~v0.8.10 连挂 4 版的根因）**：`release.yml` electron job 的「修平台依赖」步还 hardcode 探测 + 装 + 验证 `sqlite3`，但 sqlite3 早已是死依赖（源码 0 引用、`pnpm-lock.yaml` 仅剩 overrides 声明、零实际包条目、standalone 产物根本不含它、test 包一直能正常 boot 证明运行时不需要）。standalone 里没有 sqlite3 → `node -p require('./node_modules/sqlite3/package.json')` 第一行直接炸 → win/mac 两个打包 job 全挂、release 卡在 draft。修：① step 8 删 sqlite3 三处（版本探测 / npm install / require 验证）、只留 `@cursor/sdk-<platform>` 平台包处理；② `package.json` 删 `overrides` + `pnpm.overrides` + `onlyBuiltDependencies` 里的 sqlite3；③ `pnpm install` 同步 lockfile（CI `--frozen-lockfile` 要求一致、本地已校验通过）。v0.8.6 之前 standalone 还含 sqlite3（那时有间接依赖引它）所以成功、v0.8.7 起依赖链断了但 CI / package.json 没同步清。
+- **action timeline 重做（UX）**：原一排灰字 chip 太素 + 点击抖动。改：① 去类型图标 / 连接段（之前加过、太宽 + 把整行撑到换行临界、点击时右侧文件名变宽触发换行抖动）；② **timeline 独占整行拿满宽度**、文件名从右侧同行挪到**下方单独一行 + 固定行高占位**（根治「文件名挤压 timeline 宽度 → 换行重排 → 抖动」、加载中文件名暂空也不塌行）；③ 选中态 = **靛蓝描边 + 靛蓝字、无填充底 / 无背景色**（ring 是 box-shadow 不占盒模型、不加 border / 不改 padding / 不改字重 ⇒ 选中前后几何零变化、点击不闪不抖）；④ 去掉 workbench header 右侧 action 单步状态指示（运行中 / 失败…用户拍板：历史态意义不大、还抢视线 + 变宽加剧抖动）；⑤ 切换 task 默认选中**最后一个（最近）action**（直接看最新产物、不再跟 `currentActionId`）。涉及 `action-timeline.tsx` / `action-workbench-header.tsx` / `tasks/[id]/page.tsx`。
+- 验证：typecheck + lint 全绿、lockfile `--frozen-lockfile` 通过、3 步打包 + test（8776）boot；产物确认无 sqlite3。
+
 ### v0.8.10：API Key 进页面自动验证 + 展示账号信息（2026-06-18）
 
 - **进设置页自动验证**：以前 providers 已有 app 级模型预热、但设置页是另一个 `useModels` 实例不读缓存 → 用户进来要手动点「验证」才出模型。改成：配置加载完、有 apiKey 就自动拉一次（模型 + 账号信息、走 SWR 缓存秒出、`didInitValidate` ref 保证只跑一次）；apiKey 改完失焦（`onCommit`）也自动重验。
 - **展示账号信息**：新增 `/api/me`（`Cursor.me`、同 `/api/models` 的 10min 内存缓存 + 超时兜底）+ `src/hooks/use-api-key-info.ts`（SWR：localStorage 先返 + 后台刷）；`ApiKeyCard` 在密钥下方显示「姓名 · 邮箱 / 密钥『name』· 创建于 YYYY-MM-DD」（团队 / service key 无邮箱时退回只显示有的字段）。`src/lib/types.ts` 加 `ApiKeyInfo`。
 - **删过时文案**：设置页顶「编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器」整句删——桌面端唯一交付、文案误导。
 - 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；产物旧文案 0 命中、`/api/me` route 已进包、`/settings` 200、`/api/me` 空 body 返 400「缺少 apiKey」（路由挂载正常）。
-
-### v0.8.9：桌面端「检查更新」按钮（2026-06-18）
-
-- **手动检查更新**：壳本就有自动自更新（启动 + 每 2h 轮询 GitHub releases/latest、发现新版亮右上角「新版本」标识 + 弹一次原生框、mac 壳内下载替换 / win 重启即装），但「没更新就静默」、用户没法主动确认自己是不是最新。补一个按需通道：
-  - `electron-app/main.js`：IPC `check-for-update` → `manualCheckForUpdate()`，按需查一次、返回 `{ status: "latest"|"available"|"error", current, latest? }`（mac 查 GitHub latest tag 比对 / win 走 `electron-updater.checkForUpdates`、复用现有 `fetchLatestVersion` / `isNewer` / `notifyPageUpdateReady`）；发现新版同样 set `updateReadyVersion` + 点亮右上角标识、接既有自更新流程。win 下 lazy init `winAutoUpdater`（test / 非打包早退场景兜底、轻监听不重复注册）。
-  - `electron-app/preload.cjs`：暴露 `window.__appUpdater.check()`。
-  - `src/components/settings/check-update-button.tsx`：设置页版本号旁「检查更新」按钮（仅桌面壳显示、disabled+spinner 防双击）——已最新 → toast「已是最新版本 vX」、发现新版 → toast「发现新版本 vX、点右上角更新」+ 标识亮起、失败 → toast.error。
-- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；asar 含新 IPC/preload 字符串、设置页文案进 chunk、`/settings` 200；用户在 test 实例点按钮端到端验通（test 版恒低于线上 → 走 available 分支、标识亮起）。
 
 ---
 

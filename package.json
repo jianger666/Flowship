@@ -67,15 +67,8 @@
     "unified": "^11.0.5",
     "vitest": "^4.1.8"
   },
-  "overrides": {
-    "sqlite3": "^6.0.1"
-  },
   "pnpm": {
-    "overrides": {
-      "sqlite3": "^6.0.1"
-    },
     "onlyBuiltDependencies": [
-      "sqlite3",
       "sharp",
       "unrs-resolver",
       "msw",

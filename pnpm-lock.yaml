@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  sqlite3: ^6.0.1
-
 importers:
 
   .:

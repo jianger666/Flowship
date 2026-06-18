@@ -184,8 +184,11 @@ const TaskDetailPage = () => {
   useEffect(() => {
     if (!task) return;
     if (selectedActionTaskIdRef.current !== task.id) {
+      // 切到新 task：默认选中最后一个（最近）action、直接看最新产物——
+      // 不用 currentActionId（idle 时它可能为空 / 指向较早的步）
       selectedActionTaskIdRef.current = task.id;
-      setSelectedActionId(task.currentActionId ?? null);
+      const lastAction = task.actions[task.actions.length - 1];
+      setSelectedActionId(lastAction?.id ?? task.currentActionId ?? null);
       return;
     }
     if (!selectedActionId) {

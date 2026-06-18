@@ -15,6 +15,16 @@
 
 ---
 
+### v0.8.9：桌面端「检查更新」按钮（2026-06-18）
+
+- **手动检查更新**：壳本就有自动自更新（启动 + 每 2h 轮询 GitHub releases/latest、发现新版亮右上角「新版本」标识 + 弹一次原生框、mac 壳内下载替换 / win 重启即装），但「没更新就静默」、用户没法主动确认自己是不是最新。补一个按需通道：
+  - `electron-app/main.js`：IPC `check-for-update` → `manualCheckForUpdate()`，按需查一次、返回 `{ status: "latest"|"available"|"error", current, latest? }`（mac 查 GitHub latest tag 比对 / win 走 `electron-updater.checkForUpdates`、复用现有 `fetchLatestVersion` / `isNewer` / `notifyPageUpdateReady`）；发现新版同样 set `updateReadyVersion` + 点亮右上角标识、接既有自更新流程。win 下 lazy init `winAutoUpdater`（test / 非打包早退场景兜底、轻监听不重复注册）。
+  - `electron-app/preload.cjs`：暴露 `window.__appUpdater.check()`。
+  - `src/components/settings/check-update-button.tsx`：设置页版本号旁「检查更新」按钮（仅桌面壳显示、disabled+spinner 防双击）——已最新 → toast「已是最新版本 vX」、发现新版 → toast「发现新版本 vX、点右上角更新」+ 标识亮起、失败 → toast.error。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；asar 含新 IPC/preload 字符串、设置页文案进 chunk、`/settings` 200；用户在 test 实例点按钮端到端验通（test 版恒低于线上 → 走 available 分支、标识亮起）。
+
+---
+
 ### v0.8.8：图片统一组件 + 站内预览 + 提交快捷键全站统一（2026-06-18）
 
 - **图片统一组件 + 站内 lightbox（`src/components/ui/image-preview.tsx`）**：全站「用户内容图」收敛到 `ImageThumb`（缩略图）+ `MarkdownImage`（markdown 内嵌图）、`ImagePreviewProvider` / `useImagePreview` 提供全局 lightbox（挂 `providers.tsx`）。点击站内看大图（点背景 / Esc / X 关、多图 ←→ + 键盘 + N/total 计数、锁 body 滚动、**不跳出 app**）。替换 7+ 处：事件流已发送图（rows chat+log、**去掉 `target=_blank` 跳系统浏览器**）、5 处输入预览（event-stream 岛内 + 独立 / advance / revise / ask-user / context-docs、保留移除 X）、context-docs image doc 行内小图；两个 ReactMarkdown 实例（MarkdownText + artifact-panel）都配 `img: MarkdownImage`、markdown 内嵌图也可预览。痛点根源：原生 img 不能预览 + 新 tab 在 Electron 壳跳出 app 体验差。
