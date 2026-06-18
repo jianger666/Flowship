@@ -304,11 +304,21 @@ export const AdvanceDialog = ({
   const { models: availableModels, fetchModels } = useModels();
   // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
   const submitShortcut = useSubmitShortcut();
-  const hasPlanHistory = task.actions.some(
+  // 是否已有「有效方案历史」——决定本次 plan 是不是 append（追加补充）。
+  // 实时值：排除 excluded（划除的 action 不进 prompt 上下文、append 判定也不该算它）。
+  const hasPlanHistoryNow = task.actions.some(
     (a) =>
-      a.type === "plan" ||
-      (a.type === "build" && (a.requestedBatchIds?.length ?? 0) > 0),
+      !a.excluded &&
+      (a.type === "plan" ||
+        (a.type === "build" && (a.requestedBatchIds?.length ?? 0) > 0)),
   );
+  // ref 持实时值——open effect 只在「打开瞬间」读它快照、不进 effect 依赖
+  //（task.actions 进依赖会让 SSE 推 task 时重跑 open effect、把用户已改的表单打回默认）
+  const hasPlanHistoryRef = useRef(hasPlanHistoryNow);
+  hasPlanHistoryRef.current = hasPlanHistoryNow;
+  // 打开瞬间快照：本次正在创建的 plan 提交后会进 task.actions、但快照不变——
+  // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
+  const [hasPlanHistory, setHasPlanHistory] = useState(false);
 
   // 指令输入框的图附件（粘贴 / 拖拽 / 选文件）、跟 revise-dialog 共用 hook
   const {
@@ -352,6 +362,8 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
+    // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
+    setHasPlanHistory(hasPlanHistoryRef.current);
   }, [open, defaultActionType, defaultRemoveSourceBranch]);
 
   // V0.6.25 review：ship 时拉 server precheck（含工作区指纹比对）决定 override 区。
