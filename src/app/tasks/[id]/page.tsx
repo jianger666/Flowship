@@ -49,6 +49,7 @@ import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
+import { RestartDialog } from "@/components/tasks/restart-dialog";
 import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { Badge } from "@/components/ui/badge";
@@ -83,6 +84,7 @@ import {
   REPO_STATUS_VARIANT,
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
+  deriveEffectiveBatches,
   formatRepoPathsForDisplay,
 } from "@/lib/task-display";
 import { getEffectiveCwd, getRepoShortNames } from "@/lib/path-utils";
@@ -115,6 +117,8 @@ const TaskDetailPage = () => {
   const [streamingText, setStreamingText] = useState("");
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
+  // 「重启当前阶段」dialog 开关（带模型选择、默认选中该 action 的 agentModel）
+  const [restartOpen, setRestartOpen] = useState(false);
   // SSE 重连 epoch：任意「让 agent 又活起来」的路径 ++、useTaskWatch 重连
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
@@ -244,6 +248,25 @@ const TaskDetailPage = () => {
     if (!task || !task.currentActionId) return null;
     return task.actions.find((a) => a.id === task.currentActionId) ?? null;
   }, [task]);
+
+  // 全量有效批次（task 级、跨所有 plan action 派生）——传给 ArtifactPanel 的批次表、
+  // 让追加 plan 也能看到完整批次盘子 b1/b2/b3 + 进度，跟选批界面 / 进度条同源
+  const effectiveBatches = useMemo(
+    () => (task ? deriveEffectiveBatches(task).batches : []),
+    [task],
+  );
+
+  // 当前查看的 plan 之前的历次 plan（仅追加 / 重建场景用）——artifact 顶部「前序方案」入口
+  const priorPlans = useMemo(() => {
+    if (!task || selectedAction?.type !== "plan" || !selectedAction.replanMode) {
+      return [];
+    }
+    return task.actions
+      .filter(
+        (a) => a.type === "plan" && !a.excluded && a.n < selectedAction.n,
+      )
+      .map((a) => ({ n: a.n }));
+  }, [task, selectedAction]);
 
   // ack 按钮可用态：current action 处于 awaiting_ack 且 runStatus = awaiting_user
   // （hooks 必须在早返回前、所以在这里 useMemo 算、下方渲染区直接用）
@@ -498,24 +521,19 @@ const TaskDetailPage = () => {
   };
 
   // ---- 重启当前 action：不追加 action，只把当前 action 原地拉起 ----
-  const handleRestartCurrentAction = async () => {
+  // RestartDialog 确认后回调、model 是用户在 dialog 里选的（默认 = 该 action 的 agentModel）
+  const handleRestartCurrentAction = async (model: ModelSelection) => {
     if (!task || !currentAction) return;
-    const ok = await confirm({
-      title: `重启当前 ${ACTION_LABEL[currentAction.type]} 阶段？`,
-      description:
-        "不会新建 action，也不会删除已有产物；会起一个新 agent，先读事件和现有 artifact，再继续这个阶段。",
-      confirmLabel: "重启当前阶段",
-    });
-    if (!ok) return;
     setStarting(true);
     try {
+      // 复用 prepareRunArgs 做 apiKey 校验（model 用 dialog 传来的、不用它算的）
       const args = prepareRunArgs(task);
       if (!args) return;
       const settings = getSettings();
       const { task: updated, action } = await restartCurrentActionRequest(task.id, {
         actionId: currentAction.id,
         apiKey: args.apiKey,
-        model: args.model,
+        model,
         username: settings.username?.trim() || undefined,
         gitHost: settings.gitHost?.trim() || undefined,
         gitToken: settings.gitToken?.trim() || undefined,
@@ -523,6 +541,7 @@ const TaskDetailPage = () => {
       setTask(updated);
       setSelectedActionId(action.id);
       setWatchEpoch((n) => n + 1);
+      setRestartOpen(false);
     } catch (err) {
       toast.error(`重启失败：${(err as Error).message}`);
     } finally {
@@ -745,9 +764,9 @@ const TaskDetailPage = () => {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={handleRestartCurrentAction}
+                onClick={() => setRestartOpen(true)}
                 disabled={starting}
-                title="SDK / agent 断掉但当前阶段没做完时，原地重启这个 action"
+                title="SDK / agent 断掉但当前阶段没做完时，原地重启这个 action（可换模型）"
               >
                 {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
                 重启当前阶段
@@ -888,6 +907,9 @@ const TaskDetailPage = () => {
                           )
                         : undefined
                     }
+                    // V0.8.x：批次表全量化 + 追加方案前序入口
+                    effectiveBatches={effectiveBatches}
+                    priorPlans={priorPlans}
                     onArtifactRefClick={(ref) => {
                       // 找最近匹配 (n, type) 的 action、切过去
                       const target = task.actions.find(
@@ -938,6 +960,18 @@ const TaskDetailPage = () => {
           actionLabel={ACTION_LABEL[currentAction.type]}
           submitting={ackSubmitting}
           onSubmit={handleSubmitRevise}
+        />
+      )}
+
+      {/* 重启当前阶段 dialog（带模型选择） */}
+      {currentAction && (
+        <RestartDialog
+          open={restartOpen}
+          onOpenChange={setRestartOpen}
+          task={task}
+          action={currentAction}
+          submitting={starting}
+          onConfirm={handleRestartCurrentAction}
         />
       )}
 

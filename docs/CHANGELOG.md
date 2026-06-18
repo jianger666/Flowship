@@ -15,6 +15,17 @@
 
 ---
 
+### v0.8.2：侧栏任务状态 + wait_for_user 误拦修复 + 长连接友好文案 + 重启模型保持（2026-06-16）
+
+- **侧栏任务运行态指示**：任务列表显示 running 转圈 / awaiting_user 脉冲点（`task-list-item.tsx`）+ 条件轮询实时更新（`use-task-list.tsx`、切到 B 也能看到 A 的状态）。
+- **wait_for_user 误拦两层修复**：chat-runner 认 MCP wrapper 包的 wait_for_user（从 `msg.args` 提 innerToolName、mirror task-runner）、`premature-chat-wait.ts` 结构化识别握手工具（不再靠展示文本子串、wait-ack 用 `curl` + `/api/tasks/` + `/wait-ack` 三条件）+ 全量读事件（limit=0 防长首轮 fail-open）+ 22 单测。
+- **长连接断开友好文案**：长连接被断（status=error / expired 无诊断）→ 事件流换「长连接已断开」友好提示、有诊断的错照旧展详情、dump 仍进 console（`sdk-error.ts` `summarizeRunFailure` + 13 单测）。
+- **boot-recovery 文案通用化**：task / chat 共用「重新发起即可恢复」（不再提「推进」、自由模式不合理）。
+- **prompt 全局规则 front-load**：`_super.md` 把注入的用户全局规则段前移、提升权重（修「task 模式回英文」、语言无关、不写死永远中文）。
+- **重启 action 用实跑模型**：`restartCurrentActionInner` 用 `action.agentModel`（不再掉回创建默认 composer）+ 老数据回填 agentModel（effectiveStartTask/Action 一致返回）；`advance-dialog` 默认沿用本 task 最近 action 实跑模型（settings fallback 移回 open-effect 当次读、不 stale）。
+
+---
+
 ### v0.8.1：自更新防残缺包 + 发版改 draft 流程（修 v0.8.0 自更新事故）（2026-06-15）
 
 v0.8.0 发版当场踩了自更新事故：旧 `release.yml` 先建 **published** 占位 release → 用户 app 在 dmg/yml 还没传完时就 `fetchLatestVersion` 查到新版 → mac 自更新下到残缺 dmg（只 1.78MB）→ `ditto` 拷残缺文件报 `Unknown error 1000`、且残缺 dmg 被 `hdiutil attach` 挂成坏卷没卸干净 → Finder 扫描坏卷 I/O 卡死。并发 publish 还撞出 **0 字节 `latest.yml`**（win electron-updater 全靠它、win 同事自更新挂）。

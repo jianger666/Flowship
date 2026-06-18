@@ -23,7 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import { FileText, Info } from "lucide-react";
+import { FileText, Info, Layers } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -53,6 +53,7 @@ import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-undersc
 import {
   ACTION_LABEL_EN,
   ACTION_LABEL_SHORT,
+  type EffectivePlanBatch,
 } from "@/lib/task-display";
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
@@ -239,6 +240,16 @@ interface Props {
   baseDir?: string;
   /** 多仓 task 的仓短名清单（相对 baseDir）、用于路径前缀校验；单仓不传 = 不校验 */
   repoShortNames?: string[];
+  /**
+   * 全量有效批次（plan action 才传、来自 deriveEffectiveBatches）。
+   * 批次表用它而非 action.planBatches——追加补充需求后也能看到完整批次盘子 + 进度。
+   */
+  effectiveBatches?: EffectivePlanBatch[];
+  /**
+   * 前序 plan 列表（仅追加 / 重建 plan 时传）——在 artifact 顶部给「前序方案」跳转入口、
+   * 让用户一键回看主方案、解决追加方案「只见增量、总览难」。
+   */
+  priorPlans?: Array<{ n: number }>;
   onArtifactRefClick?: (ref: ActionArtifactRef) => void;
   /**
    * 当前 artifact 文件名上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
@@ -265,6 +276,8 @@ export const ArtifactPanel = ({
   taskId,
   baseDir,
   repoShortNames,
+  effectiveBatches,
+  priorPlans,
   onArtifactRefClick,
   onArtifactMetaChange,
 }: Props) => {
@@ -560,9 +573,40 @@ export const ArtifactPanel = ({
                 <CheckRunSummaryCard checkRun={action.checkRun} />
               </div>
             )}
-            {/* V0.6.24 (A')：plan 没拆批次时显式提示 + 兜底入口——防 AI 漏调 set_plan_batches、用户却不知情 */}
+            {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
             {action.type === "plan" &&
-              (!action.planBatches || action.planBatches.length === 0) && (
+              action.replanMode &&
+              priorPlans &&
+              priorPlans.length > 0 && (
+                <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
+                    <Layers className="size-3.5 shrink-0" />
+                    <span>
+                      本方案在以下方案基础上
+                      {action.replanMode === "append" ? "追加补充需求" : "重建后续"}
+                      、点开可回看完整方案
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {priorPlans.map((p) => (
+                      <button
+                        key={p.n}
+                        type="button"
+                        onClick={() =>
+                          onArtifactRefClick?.({ n: p.n, type: "plan" })
+                        }
+                        className="rounded border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:border-primary hover:text-primary"
+                      >
+                        方案 #{p.n}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            {/* V0.6.24 (A')：plan 没拆批次时显式提示——这里用全量有效批次判空（不是单 action
+                delta）、避免「追加 plan 自己没上报批次、但 task 其实有批次」时误显示未分批 */}
+            {action.type === "plan" &&
+              (!effectiveBatches || effectiveBatches.length === 0) && (
                 <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
                   <Info className="size-3.5 shrink-0" />
                   <span>
@@ -578,11 +622,15 @@ export const ArtifactPanel = ({
                 {currentArtifact.content}
               </ReactMarkdown>
             </div>
-            {/* V0.6.24：plan 批次表从 planBatches 渲染（单一真相源、不再写进 artifact md） */}
+            {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
+                追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
             {action.type === "plan" &&
-              action.planBatches &&
-              action.planBatches.length > 0 && (
-                <BatchPlanTable batches={action.planBatches} />
+              effectiveBatches &&
+              effectiveBatches.length > 0 && (
+                <BatchPlanTable
+                  batches={effectiveBatches}
+                  currentActionN={action.n}
+                />
               )}
           </div>
         ) : diffLoading || !diffData ? (

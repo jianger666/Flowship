@@ -554,17 +554,31 @@ const buildRestartActionInstruction = (task: Task, action: ActionRecord): string
   const lines: string[] = [
     "[RESTART_ACTION]",
     "当前 action 因 SDK/agent 断开或用户手动重启而重新拉起。不要追加新 action、不要从零重做，继续完成同一个 action。",
+    "你可能是被换上来接手的新模型——务必先把下面的上下文完整读一遍、确认理解了断点和已有产物，再动手。",
     "",
-    "重启后的第一步：",
-    `- 先读取事件日志，确认断点和用户最近反馈：\`${getEventsLogPath(task.id)}\``,
-    "- 再检查相关仓库当前工作区，基于已存在的半成品继续推进。",
+    "重启后严格按顺序执行：",
+    `1. 先读取事件日志，确认断点和用户最近反馈：\`${getEventsLogPath(task.id)}\``,
+    "2. 再检查相关仓库当前工作区，摸清已有的半成品。",
   ];
 
+  let step = 3;
   if (action.artifactPath) {
     lines.push(
-      `- 如果已有 artifact，请先读取并在同一路径继续覆盖更新：\`${getActionArtifactPath(task.id, action.n, action.type)}\``,
+      `${step}. 如果已有 artifact，先读取它：\`${getActionArtifactPath(task.id, action.n, action.type)}\`（后续在同一路径覆盖更新）。`,
     );
+    step += 1;
   }
+
+  // 读完上下文、动手前先问用户：按原计划继续、还是有新调整（用户拍板的重启语义、避免闷头继续）
+  // 只给一个「按原计划继续」业务选项、allow_text=true 时 UI 自带「自定义回答」入口让用户改方向。
+  lines.push(
+    `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（参数照抄、只给这一个选项）：`,
+    `   - task_id="${task.id}"、action_id="${action.id}"`,
+    '   - questions=[{ id:"restart_intent", question:"检测到当前阶段被重启。要我按原计划继续完成这个阶段、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
+    "   - 用户选「按原计划继续」→ 直接接着推进、不要再追问。",
+    "   - 用户写了自定义回答 → 按新指示调整方向后再推进。",
+  );
+
   if (action.userInstruction.trim().length > 0) {
     lines.push("", "原始用户指令：", action.userInstruction.trim());
   }
@@ -1549,30 +1563,25 @@ const restartCurrentActionInner = async (
         ? buildReviewScopeDirective(startTask)
         : undefined;
 
-  // 重启 = 用「这个 action 当初实际跑的模型」重跑：advance 起新 agent 时一次性挑的模型存在
-  // action.agentModel 上（不回写 task.model、避免污染任务级 / 设置页全局）。所以重启要优先它、
-  // 没存（老数据）才回退 body 传来的 model（task.model / settings.defaultModel）。
-  // 否则重启会掉回创建时的默认模型（踩过：plan 选了 opus-4.8、断线重启变 composer-2.5）。
-  const restartModel = startAction.agentModel?.id?.trim()
-    ? startAction.agentModel
-    : input.model;
+  // 重启模型 = 用户在 RestartDialog 里选的（input.model）。前端 dialog 默认就回填该 action 的
+  // agentModel：没改 = 沿用原模型重跑、改了 = 换个模型接手。这样「断线重启掉回默认模型」那个老坑
+  // （plan 选 opus-4.8、重启变 composer-2.5）由「前端默认填 agentModel」从源头堵住、后端不必再
+  // 优先 agentModel。
+  const restartModel = input.model;
 
-  // 老数据 action 没存 agentModel：把本次回退用的模型补写回库、让「卡片显示模型 = 实际重跑模型」、
-  // 不再出现显示 / 实跑不一致（本次 RCA 本质就是这三者漂移、顺手堵掉老数据这条缝）。
-  // patch 后 task / action 一并取最新值（effectiveStartTask / effectiveStartAction）、
-  // 让启动 prompt、SSE publish、最终 return 三处口径一致（避免 response.action 缺刚回填的 agentModel）。
+  // 每次重启都把 agentModel 回写成 restartModel（可能换了模型、也可能补老数据空 agentModel）、
+  // 保证「卡片显示模型 = 实际重跑模型」一致。patch 后 task / action 取最新值
+  // （effectiveStartTask / effectiveStartAction）、让启动 prompt、SSE publish、最终 return 三处口径一致。
   let effectiveStartTask = startTask;
   let effectiveStartAction = startAction;
-  if (!startAction.agentModel?.id?.trim()) {
-    const patched = await patchAction(fresh.id, startAction.id, {
-      agentModel: restartModel,
-    });
-    if (patched) {
-      effectiveStartTask = patched;
-      effectiveStartAction =
-        patched.actions.find((a) => a.id === startAction.id) ?? startAction;
-      publish(fresh.id, { kind: "task", task: patched });
-    }
+  const patchedModel = await patchAction(fresh.id, startAction.id, {
+    agentModel: restartModel,
+  });
+  if (patchedModel) {
+    effectiveStartTask = patchedModel;
+    effectiveStartAction =
+      patchedModel.actions.find((a) => a.id === startAction.id) ?? startAction;
+    publish(fresh.id, { kind: "task", task: patchedModel });
     publish(fresh.id, { kind: "action", action: effectiveStartAction });
   }
 

@@ -3,8 +3,8 @@
 /**
  * 默认模型卡片
  *
- * 包了一层 Card + SaveButton + 「获取列表」按钮的 ModelPicker
- * 实际「选 base + 选 params」UI 已经下沉到 `src/components/ui/model-picker.tsx`、给 advance-dialog 共享
+ * 包了一层 Card + 「获取列表」按钮的统一 ModelSelect
+ * 实际「搜索 base + 选 params」UI 在 `src/components/ui/model-select.tsx`、全站共享
  */
 
 import { Loader2, RefreshCw } from "lucide-react";
@@ -18,7 +18,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { ModelPicker } from "@/components/ui/model-picker";
+import { ModelSelect } from "@/components/ui/model-select";
 
 import type { ModelOption, ModelSelection } from "@/lib/types";
 
@@ -72,7 +72,7 @@ export const ModelCard = ({
       {modelsError && (
         <div className="text-destructive text-xs">{modelsError}</div>
       )}
-      <ModelPicker
+      <ModelSelect
         models={models}
         selection={selection}
         onChange={onChange}

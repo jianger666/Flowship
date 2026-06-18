@@ -14,7 +14,7 @@
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
  *   - reuseAgent（开关、默认 false = 起新 agent、V0.6.27 语义反转）：想省 send 配额 / 要连续上下文时打开续用
  *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认值 = 本 task 最近 action 实际
- *       用的模型 → task.model → settings.defaultModel（沿用我在这个任务一直用的模型、不必每次重挑）、
+ *       用的模型 → task.model → settings.defaultModel（统一 ModelSelect、沿用我在这个任务一直用的模型、不必每次重挑）、
  *       可以临时换 base + 调 thinking/effort 等 params；勾续用后本段隐藏、续接走 task.model
  *
  * 行为：
@@ -47,7 +47,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
-import { ModelPicker } from "@/components/ui/model-picker";
+import { ModelSelect } from "@/components/ui/model-select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
@@ -841,12 +841,12 @@ export const AdvanceDialog = ({
                 <Label className="text-xs text-foreground/80">
                   本次起新 agent 用的模型
                 </Label>
-                <ModelPicker
+                <ModelSelect
                   models={availableModels}
                   selection={pickedModel}
                   onChange={setPickedModel}
                   disabled={submitting}
-                  variant="compact"
+                  variant="full"
                   emptyPlaceholder="（请先在设置页拉取模型列表）"
                 />
               </div>

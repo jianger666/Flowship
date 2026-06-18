@@ -67,7 +67,7 @@ V0.5 兼容代码 / 数据彻底删（不写 migration、开发期接受重置 d
 ## 技术栈
 
 - Next.js 15 + React 19 + Tailwind 4
-- `@cursor/sdk` 1.0.17（Beta、2026-06-01 从 1.0.13 升）
+- `@cursor/sdk` 1.0.19（Beta、2026-06-17 从 1.0.17 升）
 - `@modelcontextprotocol/sdk` 1.29.0（HTTP MCP transport）
 - shadcn/ui base-nova（@base-ui/react、不是 Radix）
 - TypeScript strict

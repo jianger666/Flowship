@@ -304,6 +304,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.7：模型选择器全站统一 + 重启选模型 + 追加方案批次总览 + SDK 1.0.19 补 connect-node（2026-06-18）
+
+- **模型选择器统一成 `ModelSelect`（`src/components/ui/model-select.tsx`）**：全站 5 处（设置页 / 新建任务 / 推进 dialog / 重启 dialog / chat footer）收敛到一个组件、删旧 `model-picker.tsx`。一个「trigger + 可搜索 popover + chips 参数」一体：① 顶部搜索框按 displayName/id 实时过滤（几十个模型不再纯下拉翻）；② **popover 内零嵌套弹层**（模型列表是普通 button、params 用 ChoiceButton chips 原地切）——根治旧版「Popover 套 Select / Select 套 Select」导致的「选完点空白要点两次才关」。
+- **重启当前阶段加选模型（`RestartDialog`）**：原纯文字 confirm 升级成带 ModelSelect 的 dialog、默认回填该 action 的 `agentModel`（不改沿用、想换更强 / 更省的模型接手就改）。后端 `buildRestartActionInstruction` 加「你可能是被换上来的新模型、先读全上下文」+ 有序步骤 + **读完上下文动手前先 `ask_user` 确认方向**（一个「按原计划继续」选项 + allow_text 自定义）；`restartCurrentActionInner` 改用 `input.model`（前端默认填 agentModel、从源头堵「断线重启掉回默认模型」）、每次回写 agentModel 保证「卡片显示 = 实跑模型」。
+- **追加方案「批次总览」（artifact-panel + batch-plan-table）**：补充需求重跑 plan 后、artifact 批次表从「单 action delta（只 b3）」改用全量 `deriveEffectiveBatches(task)`（b1/b2/b3）、跟选批界面 / 进度条同源——加状态列（已实现 / 待实现）+ 进度 badge（X/Y）+ 来源 #N + 「本次新增」标记；追加 / 重建 plan 顶部加「前序方案」跳转入口。设计原则：**数据保持增量、视图做聚合**（不改 agent 行为、不把主方案正文重抄进新 md、避免漂移）。
+- **SDK 升 1.0.19 + 补 `@connectrpc/connect-node`**：SDK 1.0.19 运行时 import connect-node（Node transport）却漏在自己 package.json 声明依赖 → pnpm 没装、standalone nft 追不到、打包缺包、chat agent 启动即 `Cannot find package '@connectrpc/connect-node'`。项目侧显式 `pnpm add @connectrpc/connect-node@1.7.0`（对齐现有 connect 版本）补上、nft 自动进包、无需改 assemble 脚本。
+- **删除对话不再弹 toast**：`app-sidebar` 删除任务成功的 `toast.success` 去掉（失败仍提示）。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）端到端（含运行时 `import @cursor/sdk` 验 connect-node 解析通）。
+
 ### v0.8.3：ask_user 逐题贴图 + chat 流式自动滑底 + announce-then-wait 防漏 + ask-reply race 加固（2026-06-16）
 
 - **ask_user 弹窗逐题贴图（仅自定义回答能带图、用户拍板）**：每道题抽 `AskQuestionItem` 子组件、各 call 一次 `useImageAttach`（hook 不能在 `questions.map` 里循环调、故按子组件拆）、各绑各的图。附图按钮 / 缩略图 / 粘贴 / 拖拽整体收进「自定义回答」区——选固定选项（A/B/C）就隐藏且上报空图（图 state 不清、再切回自定义会重现、不丢用户已贴的图）。后端 `ask-reply/route.ts` 收 `imagesByQuestion`、按 questionId 白名单过滤（防客户端塞无关 key）、单题 ≤6 / 合计 ≤12、**先校验后落盘**（确认 agent 还在等才写、避免僵尸态留孤儿文件）、`buildReplyText` 每题 A 行下内联「本题附图：<basename>」做归属、`meta.images` 扁平给前端 `extractUserReplyImages` 渲缩略图、`allAbsPaths` 透传 agent（文末 `[ATTACHED_IMAGES]`）。图-only（只贴图不填字）也算已答。
@@ -312,15 +321,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **chat 纯宣告硬闸（announce-then-wait 第二刀、reviewAI 拍板极窄启发式）**：上一刀（7 处文案）实测对 composer-2.5 仍漏——它「知道规则却执行时跳步」、发一句「我先写…进入等待你的下一条」当正文就直接 curl 挂等、命中硬闸「有正文就放行」分支没拦住（原判定只看「有没有正文」、不看是「宣告」还是「成品」）。纯 prompt 兜不住执行层、在 `premature-chat-wait.ts` 加 `isPureAnnouncement` 窄判定（两档：**强信号**=短正文含内部等待机制词「进入等待 / 挂等 / wait_for_user / 监听你下一」、**不收裸 curl** 防误伤「curl 调接口示例」类技术问答；**组合信号**=短正文同时命中「将来式计划 + 交付动词 + 延后/未完成语义」三件套缺一不算、区分「我先给你结论：可以」（已交付不拦）vs「我先写…写完后再发」（未交付拦））。判定拆 `lastSubstantiveAnswerIdx`：纯宣告不刷新「有效回答」位置、防「答→查→只发个宣告」绕过「答后又查没回报」。误拦靠既有 `CAP=2` 兜底。chat 起手顶部加一句 blockquote 铁律（计划 / 预告 / 等待说明都不是交付物）、waitDiscipline 核心段不动。+10 回归单测。经 reviewAI 两轮 review（揪出裸 curl 误拦 + 纯宣告刷新位置 2 个 P1、已修）终审通过。
 - **ask-reply 后端 race 加固（2 个 P1、reviewAI 提）**：① **重排**「先 `submitAskReply` 成功、再写 ask_user_reply 事件 + publish + 切 running」——旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时用户已看到「已答」但 agent 没收到（假已答）；② pending 校验**从 task 级升到 token 级**：`submitAskReply` 加 `expectedToken`、新增 `hasPendingToken(taskId, token)`、route 从 ask_user_request 事件 `meta.token` 取——防旧弹窗答案串进被 force-new-agent / 顶替换掉的新 pending。
 - 验证：typecheck + lint 全绿、vitest 118 全过、3 步打包 + test（8776）端到端验证。
-
-### v0.8.2：侧栏任务状态 + wait_for_user 误拦修复 + 长连接友好文案 + 重启模型保持（2026-06-16）
-
-- **侧栏任务运行态指示**：任务列表显示 running 转圈 / awaiting_user 脉冲点（`task-list-item.tsx`）+ 条件轮询实时更新（`use-task-list.tsx`、切到 B 也能看到 A 的状态）。
-- **wait_for_user 误拦两层修复**：chat-runner 认 MCP wrapper 包的 wait_for_user（从 `msg.args` 提 innerToolName、mirror task-runner）、`premature-chat-wait.ts` 结构化识别握手工具（不再靠展示文本子串、wait-ack 用 `curl` + `/api/tasks/` + `/wait-ack` 三条件）+ 全量读事件（limit=0 防长首轮 fail-open）+ 22 单测。
-- **长连接断开友好文案**：长连接被断（status=error / expired 无诊断）→ 事件流换「长连接已断开」友好提示、有诊断的错照旧展详情、dump 仍进 console（`sdk-error.ts` `summarizeRunFailure` + 13 单测）。
-- **boot-recovery 文案通用化**：task / chat 共用「重新发起即可恢复」（不再提「推进」、自由模式不合理）。
-- **prompt 全局规则 front-load**：`_super.md` 把注入的用户全局规则段前移、提升权重（修「task 模式回英文」、语言无关、不写死永远中文）。
-- **重启 action 用实跑模型**：`restartCurrentActionInner` 用 `action.agentModel`（不再掉回创建默认 composer）+ 老数据回填 agentModel（effectiveStartTask/Action 一致返回）；`advance-dialog` 默认沿用本 task 最近 action 实跑模型（settings fallback 移回 open-effect 当次读、不 stale）。
 
 ---
 
@@ -382,7 +382,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | 设置：仓库列表 + per-repo 分支 + 模板覆盖（V0.6.7）+ 检查命令（V0.6.25 CheckRun checkCommands 编辑器） | `src/components/settings/repo-card.tsx` + `repo-check-commands.tsx` |
 | 设置：GitLab Host + PAT（V0.6.1 新增） | `src/components/settings/git-card.tsx` |
 | **feature 分支命名模板引擎（V0.6.7、client+server 共用）** | `src/lib/branch-template.ts` |
-| 模型选择器共享组件（V0.6.0.1 抽出、settings + advance dialog 共用） | `src/components/ui/model-picker.tsx` |
+| 模型选择器统一组件（可搜索 popover + chips 参数、全站 5 处共用） | `src/components/ui/model-select.tsx` |
 | Skills loader | `src/lib/server/skills-loader.ts` |
 
 ## 设计变动流程

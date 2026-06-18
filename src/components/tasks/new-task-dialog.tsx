@@ -36,6 +36,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { ModelSelect } from "@/components/ui/model-select";
 import { MultiSelect } from "@/components/ui/multi-select";
 import {
   Select,
@@ -52,6 +53,7 @@ import { createTask } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import {
   TASK_ROLE_LABEL,
+  type ModelSelection,
   type RepoConfig,
   type CheckCommand,
   type Task,
@@ -107,9 +109,9 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起
   const [mcpExpanded, setMcpExpanded] = useState(false);
-  // 任务级模型 id；默认 = settings.defaultModel.id
-  const [pickedModelId, setPickedModelId] = useState<string>("");
-  // 默认模型 id（用来判断「选了跟默认一样就保留 params」）
+  // 任务级模型选择（含 thinking/effort/context 等 params）；默认 = settings.defaultModel
+  const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
+  // 默认模型 id（仅用于「已切到非默认模型」提示判断）
   const [defaultModelId, setDefaultModelId] = useState<string>("");
   // 模型列表（异步拉）
   const {
@@ -125,9 +127,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     setRepos(s.repos);
     // V0.6.5：默认带上设置页配的「常用 MCP」黑名单快照、用户可在下面临时增减
     setDisabledMcp(s.disabledMcpServers ?? []);
-    const defaultId = s.defaultModel?.id ?? "";
-    setDefaultModelId(defaultId);
-    setPickedModelId(defaultId);
+    setDefaultModelId(s.defaultModel?.id ?? "");
+    setPickedModel(s.defaultModel?.id?.trim() ? s.defaultModel : { id: "" });
     if (s.apiKey?.trim() && availableModels.length === 0 && !modelsLoading) {
       void fetchModels(s.apiKey);
     }
@@ -144,7 +145,7 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     setFeatureBranches({});
     setDisabledMcp([]);
     setMcpExpanded(false);
-    setPickedModelId("");
+    setPickedModel({ id: "" });
     setDefaultModelId("");
   }, [open]);
 
@@ -192,17 +193,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     setSubmitting(true);
     try {
       const settings = getSettings();
-      let model;
-      if (pickedModelId) {
-        if (
-          pickedModelId === defaultModelId &&
-          settings.defaultModel?.id === pickedModelId
-        ) {
-          model = settings.defaultModel;
-        } else {
-          model = { id: pickedModelId };
-        }
-      }
+      // pickedModel 已含完整 params（ModelSelect 维护）、直接用；没选 id 留 undefined 走默认
+      const model = pickedModel.id?.trim() ? pickedModel : undefined;
 
       // V0.6.3：从 settings 查选中仓的「线上分支」、快照进 task
       //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build 用这份）
@@ -486,40 +478,21 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
 
           {/* 模型选择（两种模式都展示） */}
           <div className="grid gap-1.5">
-            <Label htmlFor="t-model">模型</Label>
-            <Select
-              // 空值用 null 保持受控（避免 Base UI Select 非受控转受控警告）
-              value={pickedModelId || null}
-              onValueChange={(v) => v && setPickedModelId(v)}
-              disabled={availableModels.length === 0}
-            >
-              <SelectTrigger id="t-model" className="w-full">
-                <SelectValue
-                  placeholder={
-                    availableModels.length === 0
-                      ? defaultModelId
-                        ? `默认: ${defaultModelId}（API Key 没填、改不了）`
-                        : "未配模型、请先去设置页选"
-                      : "选模型"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {availableModels.map((m) => (
-                  <SelectItem key={m.id} value={m.id}>
-                    <span className="flex flex-col">
-                      <span>{m.displayName}</span>
-                      <span className="font-mono text-xs text-muted-foreground">
-                        {m.id}
-                      </span>
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {pickedModelId &&
+            <Label>模型</Label>
+            <ModelSelect
+              models={availableModels}
+              selection={pickedModel}
+              onChange={setPickedModel}
+              variant="full"
+              emptyPlaceholder={
+                defaultModelId
+                  ? `默认: ${defaultModelId}（API Key 没填、改不了）`
+                  : "未配模型、请先去设置页选"
+              }
+            />
+            {pickedModel.id &&
               defaultModelId &&
-              pickedModelId !== defaultModelId && (
+              pickedModel.id !== defaultModelId && (
                 <p className="text-xs text-amber-500">已切到非默认模型</p>
               )}
           </div>

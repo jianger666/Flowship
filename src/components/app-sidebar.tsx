@@ -129,7 +129,6 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     try {
       const okDel = await deleteTask(task.id);
       if (!okDel) throw new Error("任务不存在");
-      toast.success(`已删除「${task.title}」`);
       if (activeId === task.id) router.push("/");
     } catch (err) {
       toast.error(`删除失败：${(err as Error).message}`);
