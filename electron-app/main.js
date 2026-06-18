@@ -705,6 +705,49 @@ const setupAutoUpdate = async () => {
   setInterval(() => void runUpdateCheck(), UPDATE_POLL_MS);
 };
 
+// 手动「检查更新」（设置页按钮触发）——按需查一次、返回结构化结果给页面 toast。
+// 跟自动轮询 runUpdateCheck 复用 fetchLatestVersion / isNewer / notifyPageUpdateReady，
+// 区别：自动轮询「没更新就静默」、这里把「已是最新」也明确返回（用户主动点要个确定反馈）。
+const manualCheckForUpdate = async () => {
+  const current = app.getVersion();
+  try {
+    if (process.platform === "win32") {
+      // win 走 electron-updater；test / 非打包下 setupAutoUpdate 早退、winAutoUpdater 仍为 null，
+      // 这里 lazy init（只挂点亮标识的轻监听、不挂自动弹框、避免和 setup 的监听重复注册）
+      if (!winAutoUpdater) {
+        const { default: updater } = await import("electron-updater");
+        winAutoUpdater = updater.autoUpdater;
+        winAutoUpdater.on("update-downloaded", (info) => {
+          updateReadyVersion = info?.version || "";
+          notifyPageUpdateReady();
+        });
+        winAutoUpdater.on("error", (err) => log(`[updater] ${err?.message || err}`));
+      }
+      const r = await winAutoUpdater.checkForUpdates();
+      const latest = r?.updateInfo?.version || null;
+      // 有新版会后台自动下载、下载完 update-downloaded 事件点亮标识
+      if (latest && isNewer(latest, current)) return { status: "available", current, latest };
+      return { status: "latest", current };
+    }
+    // mac / linux：查 GitHub latest release tag 版本号比对
+    const latest = await fetchLatestVersion();
+    if (!latest) return { status: "error", current, message: "拿不到最新版本号" };
+    if (isNewer(latest, current)) {
+      updateReadyVersion = latest;
+      log(`[updater] 手动检查发现新版本 v${latest}（当前 v${current}）`);
+      notifyPageUpdateReady();
+      return { status: "available", current, latest };
+    }
+    return { status: "latest", current };
+  } catch (err) {
+    log(`[updater] 手动检查更新失败 ${err?.message || err}`);
+    return { status: "error", current, message: err?.message || String(err) };
+  }
+};
+
+// 设置页「检查更新」按钮 → preload window.__appUpdater.check() → 这里
+ipcMain.handle("check-for-update", () => manualCheckForUpdate());
+
 // ---------- 生命周期 ----------
 
 // 单实例锁：二开时聚焦已有窗口

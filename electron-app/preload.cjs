@@ -18,6 +18,13 @@ contextBridge.exposeInMainWorld("__nativePicker", {
   pick: (opts) => ipcRenderer.invoke("native-pick", opts),
 });
 
+// 检查更新（设置页「检查更新」按钮）——按需查一次、返回 { status, current, latest? }；
+// 发现新版时壳会同步点亮右上角「新版本」标识（走既有 UpdateBadge / 自更新流程）
+contextBridge.exposeInMainWorld("__appUpdater", {
+  /** @returns {Promise<{ status: "latest"|"available"|"error", current: string, latest?: string, message?: string }>} */
+  check: () => ipcRenderer.invoke("check-for-update"),
+});
+
 // 壳能力 / 平台信息（自定义标题栏用）
 contextBridge.exposeInMainWorld("__shell", {
   // "darwin" | "win32" | "linux"——页面据此给右侧控件让出 Windows 控制按钮位

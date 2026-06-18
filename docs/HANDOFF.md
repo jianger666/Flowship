@@ -304,21 +304,20 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.9：桌面端「检查更新」按钮（2026-06-18）
+
+- **手动检查更新**：壳本就有自动自更新（启动 + 每 2h 轮询 GitHub releases/latest、发现新版亮右上角「新版本」标识 + 弹一次原生框、mac 壳内下载替换 / win 重启即装），但「没更新就静默」、用户没法主动确认自己是不是最新。补一个按需通道：
+  - `electron-app/main.js`：IPC `check-for-update` → `manualCheckForUpdate()`，按需查一次、返回 `{ status: "latest"|"available"|"error", current, latest? }`（mac 查 GitHub latest tag 比对 / win 走 `electron-updater.checkForUpdates`、复用现有 `fetchLatestVersion` / `isNewer` / `notifyPageUpdateReady`）；发现新版同样 set `updateReadyVersion` + 点亮右上角标识、接既有自更新流程。win 下 lazy init `winAutoUpdater`（test / 非打包早退场景兜底、轻监听不重复注册）。
+  - `electron-app/preload.cjs`：暴露 `window.__appUpdater.check()`。
+  - `src/components/settings/check-update-button.tsx`：设置页版本号旁「检查更新」按钮（仅桌面壳显示、disabled+spinner 防双击）——已最新 → toast「已是最新版本 vX」、发现新版 → toast「发现新版本 vX、点右上角更新」+ 标识亮起、失败 → toast.error。
+- 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot；asar 含新 IPC/preload 字符串、设置页文案进 chunk、`/settings` 200；用户在 test 实例点按钮端到端验通（test 版恒低于线上 → 走 available 分支、标识亮起）。
+
 ### v0.8.8：图片统一组件 + 站内预览 + 提交快捷键全站统一（2026-06-18）
 
 - **图片统一组件 + 站内 lightbox（`src/components/ui/image-preview.tsx`）**：全站「用户内容图」收敛到 `ImageThumb`（缩略图）+ `MarkdownImage`（markdown 内嵌图）、`ImagePreviewProvider` / `useImagePreview` 提供全局 lightbox（挂 `providers.tsx`）。点击站内看大图（点背景 / Esc / X 关、多图 ←→ + 键盘 + N/total 计数、锁 body 滚动、**不跳出 app**）。替换 7+ 处：事件流已发送图（rows chat+log、**去掉 `target=_blank` 跳系统浏览器**）、5 处输入预览（event-stream 岛内 + 独立 / advance / revise / ask-user / context-docs、保留移除 X）、context-docs image doc 行内小图；两个 ReactMarkdown 实例（MarkdownText + artifact-panel）都配 `img: MarkdownImage`、markdown 内嵌图也可预览。痛点根源：原生 img 不能预览 + 新 tab 在 Electron 壳跳出 app 体验差。
 - **提交快捷键全站统一**：`ask_user` 弹窗从写死 Cmd+Enter 改成跟设置页偏好走（`useSubmitShortcut` + `shouldSubmitOnKeyDown`）——mod-enter 任意焦点提交 / enter 只在 textarea 内提交（guard `tagName`、避免焦点在选项按钮上裸 Enter 误提交整表）；`shouldSubmitOnKeyDown` 入参放宽 `HTMLTextAreaElement` → `HTMLElement`（能绑 textarea 也能绑 DialogContent 容器）。单行 `prompt` 框保持 Enter 提交（无换行歧义、不套设置）。
 - 规则沉淀：`learned-conventions`（图片走 ImageThumb / MarkdownImage、新 ReactMarkdown 必配 img）+ `ui-conventions`（提交快捷键走 useSubmitShortcut、不写死）。
 - 验证：typecheck + lint 全绿、3 步打包 + test（8776）boot + 组件进包核验。
-
-### v0.8.7：模型选择器全站统一 + 重启选模型 + 追加方案批次总览 + SDK 1.0.19 补 connect-node（2026-06-18）
-
-- **模型选择器统一成 `ModelSelect`（`src/components/ui/model-select.tsx`）**：全站 5 处（设置页 / 新建任务 / 推进 dialog / 重启 dialog / chat footer）收敛到一个组件、删旧 `model-picker.tsx`。一个「trigger + 可搜索 popover + chips 参数」一体：① 顶部搜索框按 displayName/id 实时过滤（几十个模型不再纯下拉翻）；② **popover 内零嵌套弹层**（模型列表是普通 button、params 用 ChoiceButton chips 原地切）——根治旧版「Popover 套 Select / Select 套 Select」导致的「选完点空白要点两次才关」。
-- **重启当前阶段加选模型（`RestartDialog`）**：原纯文字 confirm 升级成带 ModelSelect 的 dialog、默认回填该 action 的 `agentModel`（不改沿用、想换更强 / 更省的模型接手就改）。后端 `buildRestartActionInstruction` 加「你可能是被换上来的新模型、先读全上下文」+ 有序步骤 + **读完上下文动手前先 `ask_user` 确认方向**（一个「按原计划继续」选项 + allow_text 自定义）；`restartCurrentActionInner` 改用 `input.model`（前端默认填 agentModel、从源头堵「断线重启掉回默认模型」）、每次回写 agentModel 保证「卡片显示 = 实跑模型」。
-- **追加方案「批次总览」（artifact-panel + batch-plan-table）**：补充需求重跑 plan 后、artifact 批次表从「单 action delta（只 b3）」改用全量 `deriveEffectiveBatches(task)`（b1/b2/b3）、跟选批界面 / 进度条同源——加状态列（已实现 / 待实现）+ 进度 badge（X/Y）+ 来源 #N + 「本次新增」标记；追加 / 重建 plan 顶部加「前序方案」跳转入口。设计原则：**数据保持增量、视图做聚合**（不改 agent 行为、不把主方案正文重抄进新 md、避免漂移）。
-- **SDK 升 1.0.19 + 补 `@connectrpc/connect-node`**：SDK 1.0.19 运行时 import connect-node（Node transport）却漏在自己 package.json 声明依赖 → pnpm 没装、standalone nft 追不到、打包缺包、chat agent 启动即 `Cannot find package '@connectrpc/connect-node'`。项目侧显式 `pnpm add @connectrpc/connect-node@1.7.0`（对齐现有 connect 版本）补上、nft 自动进包、无需改 assemble 脚本。
-- **删除对话不再弹 toast**：`app-sidebar` 删除任务成功的 `toast.success` 去掉（失败仍提示）。
-- 验证：typecheck + lint 全绿、3 步打包 + test（8776）端到端（含运行时 `import @cursor/sdk` 验 connect-node 解析通）。
 
 ---
 

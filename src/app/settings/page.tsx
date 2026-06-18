@@ -37,6 +37,7 @@ import { McpCard } from "@/components/settings/mcp-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 import { ShortcutCard } from "@/components/settings/shortcut-card";
+import { CheckUpdateButton } from "@/components/settings/check-update-button";
 
 const SettingsPage = () => {
   const router = useRouter();
@@ -72,13 +73,14 @@ const SettingsPage = () => {
           <ArrowLeft />
           返回
         </Button>
-        <div className="flex items-baseline gap-2">
+        <div className="flex items-center gap-2">
           <h1 className="text-lg font-semibold">设置</h1>
           {appVersion && (
             <span className="text-xs text-muted-foreground" title="桌面端版本号">
               v{appVersion}
             </span>
           )}
+          <CheckUpdateButton />
         </div>
         <p className="text-xs text-muted-foreground mt-1">
           编辑即保存、所有数据仅存浏览器 localStorage、不上传服务器
