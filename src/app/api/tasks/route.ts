@@ -14,6 +14,7 @@
 
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
+import { buildPlaceholderChatTitle } from "@/lib/task-display";
 import type {
   CheckCommand,
   NewTaskInput,
@@ -111,11 +112,12 @@ export const POST = async (req: Request) => {
       );
     }
 
-    // chat 模式未填 title 时自动生成「对话 · MM-DD HH:mm」（侧栏窄、标题尽量短）
+    // chat 模式未填 title 时补占位「对话 · MM-DD HH:mm」（侧栏窄、标题尽量短；
+    // 用户发首条消息后由 chat-reply 用 deriveChatTitleFromMessage 覆盖、单一源见 task-display）
     const title = isNonEmptyString(body.title)
       ? body.title.trim()
       : isChat
-        ? `对话 · ${new Date().toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}`
+        ? buildPlaceholderChatTitle()
         : "";
 
     const task = await createTask({

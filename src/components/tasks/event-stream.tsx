@@ -69,10 +69,28 @@ interface StreamingItem {
   text: string;
 }
 
-type RenderItem = TaskEvent | StreamingItem;
+// agent 已在跑、但还没吐出第一个 token 的「起手空窗」占位
+// （取代旧的「正在启动 agent」toast、不打断、收到首个 delta 即被 streaming item 取代）
+interface LoadingItem {
+  kind: "__loading__";
+  id: string;
+}
+
+type RenderItem = TaskEvent | StreamingItem | LoadingItem;
 
 const isStreamingItem = (it: RenderItem): it is StreamingItem =>
   it.kind === "__streaming__";
+
+const isLoadingItem = (it: RenderItem): it is LoadingItem =>
+  it.kind === "__loading__";
+
+// 「发出消息 → 程序受理」空白期的 loading 占位行：小转圈 +「正在响应…」、muted 细行风格
+const PendingRow = () => (
+  <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
+    <Loader2 className="size-3.5 animate-spin" />
+    <span>正在响应…</span>
+  </div>
+);
 
 interface Props {
   task: Task;
@@ -101,6 +119,8 @@ interface Props {
   disabledHint?: string;
   // V0.6.24：footer 左侧 slot（chat 模式注入模型选择器、plan / task 模式不传）
   composerLeading?: ReactNode;
+  // chat 模式 textarea 上方一行 slot（注入工作目录 + 分支选择器、跟底部 model 分两处放）
+  composerTop?: ReactNode;
   // V0.7.21：chat 运行态——agent 正在生成时、底部操作行把发送键换成红色停止键 + loading 转圈
   // （取代顶栏旧的「AI 正在回 + 停止」、统一收进输入岛、靠原地替换不顶布局）
   isRunning?: boolean;
@@ -128,6 +148,7 @@ const EventStreamImpl = ({
   canReply,
   disabledHint,
   composerLeading,
+  composerTop,
   isRunning,
   onStop,
   stopping,
@@ -163,12 +184,23 @@ const EventStreamImpl = ({
   //    一起参与虚拟滚动 + followOutput 贴底跟随
   const items: RenderItem[] = useMemo(() => {
     const merged = mergeAdjacentToolCall(mergeAdjacentThinking(task.events));
-    if (!streamingText) return merged;
-    return [
-      ...merged,
-      { kind: "__streaming__", id: "__streaming__", text: streamingText },
-    ];
-  }, [task.events, streamingText]);
+    // agent 在吐字 → 末尾打字机 item；
+    // 在跑但还没吐字（起手空窗）→ 末尾 loading item；都没有 → 原样
+    if (streamingText) {
+      return [
+        ...merged,
+        { kind: "__streaming__", id: "__streaming__", text: streamingText },
+      ];
+    }
+    // 「发出消息 → 程序受理」空白期：agent 已在跑、但事件流最后一条还是用户刚发的消息
+    // （启动 info / thinking / tool 都还没冒出来）→ 末尾挂一行 loading。
+    // 一旦出现第一个 agent 事件、last 不再是 user_reply、loading 自动消失（不会盖住链路）。
+    const last = merged[merged.length - 1];
+    if (isRunning && last?.kind === "user_reply") {
+      return [...merged, { kind: "__loading__", id: "__loading__" }];
+    }
+    return merged;
+  }, [task.events, streamingText, isRunning]);
 
   // 流式回复自动贴底（V0.8.3 修）：
   // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
@@ -361,6 +393,8 @@ const EventStreamImpl = ({
               >
                 {isStreamingItem(item) ? (
                   <StreamingAssistantRow text={item.text} variant={variant} />
+                ) : isLoadingItem(item) ? (
+                  <PendingRow />
                 ) : item.kind === "ask_user_request" ? (
                   <AskUserRequestRow ev={item} task={task} />
                 ) : (
@@ -387,9 +421,16 @@ const EventStreamImpl = ({
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
-            {/* 附件预览：岛内顶部（图缩略 + 路径 chips） */}
+            {/* 选择器行（工作目录 / 分支）：岛最顶、本次对话配置归一条。
+                workdir 常驻 → 此行高度恒定、不随 branch 显隐而跳动 */}
+            {composerTop && (
+              <div className="flex flex-wrap items-center gap-1.5 border-b border-border/50 px-3 pb-2.5 pt-3">
+                {composerTop}
+              </div>
+            )}
+            {/* 附件预览：紧贴输入框上方（图缩略 + 路径 chips） */}
             {(attachedImages.length > 0 || attachedPaths.length > 0) && (
-              <div className="flex flex-wrap gap-2 px-3 pt-3">
+              <div className="flex flex-wrap gap-2 px-3 pt-2.5">
                 {attachedImages.map((img, i) => (
                   <ImageThumb
                     key={img.id}
@@ -444,13 +485,14 @@ const EventStreamImpl = ({
                   : (disabledHint ?? "agent 当前没有等待你回复")
               }
               disabled={!isAwaitingUser}
-              className="min-h-13 resize-none border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+              className="max-h-48 min-h-13 resize-none overflow-y-auto border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
             />
-            {/* 底部操作行：左模型选择、右附件 + 发送
-                pt-1.5：跟上方文本框留一道间距（否则模型选择器贴着输入区、挤在一起）
+            {/* 底部操作行：左下放模型选择器（composerLeading）、右侧放动作（附图 / 文件 / 目录 + 发送）。
+                工作目录 / 分支选择器在岛顶部 composerTop 一条。
                 运行态：右侧整组换成 loading 转圈 + 红色停止键——原地替换、不新增行、不顶布局 */}
             <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-1.5">
-              <div className="flex min-w-0 items-center gap-1.5">{composerLeading}</div>
+              {/* 左下：模型选择器（chat 注入 composerLeading）；不传时空 div、右侧仍靠右 */}
+              <div className="flex min-w-0 items-center">{composerLeading}</div>
               <div className="flex shrink-0 items-center gap-0.5">
                 {isRunning ? (
                   <>
@@ -530,14 +572,6 @@ const EventStreamImpl = ({
               </div>
             </div>
           </div>
-          {/* 岛下方状态行：仅在用户主动加了附件时显示计数。
-              运行 / 禁用提示不再放这——它会在 agent 每次跑起来时多撑一行、把输入岛顶上去
-              （V0.7.21 移除、运行态改用操作行内 loading + 红停止键、零布局抖动） */}
-          {(attachedImages.length > 0 || attachedPaths.length > 0) && (
-            <div className="mx-auto mt-1.5 w-full max-w-3xl px-1 text-center text-[11px] text-muted-foreground/70">
-              {`图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`}
-            </div>
-          )}
           {/* 隐藏 input：附图按钮触发它 */}
           <input
             ref={fileInputRef}

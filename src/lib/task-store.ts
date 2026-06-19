@@ -18,6 +18,7 @@ import type {
   ArtifactRevision,
   AskUserAnswer,
   CheckCommand,
+  GitBranchState,
   McpHealth,
   NewTaskInput,
   ShipPrecheck,
@@ -192,6 +193,54 @@ export const setTaskModel = async (
   });
   const data = await handleJson<{ task: Task }>(res);
   return data.task;
+};
+
+/**
+ * V0.8：chat 模式「选工作目录」——替换 task.repoPaths（PATCH /api/tasks/[id]）
+ *
+ * 自由对话用原生 picker 选文件夹当 agent cwd、重选即替换、空数组 = 不绑（agent 起在 ai-flow 项目本身）。
+ * 跟切模型同款：下一个 run 启动生效、不影响正在跑的 run、调用方 running 时禁用入口。
+ */
+export const setTaskRepoPaths = async (
+  id: string,
+  repoPaths: string[],
+): Promise<Task> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repoPaths }),
+  });
+  const data = await handleJson<{ task: Task }>(res);
+  return data.task;
+};
+
+/**
+ * V0.8：读 chat 工作目录（repoPaths[0]）的本地 git 分支状态（GET /api/tasks/[id]/branches）
+ * 非 git 仓返回 isRepo=false、调用方据此隐藏分支选择器。
+ */
+export const fetchTaskBranches = async (
+  id: string,
+): Promise<GitBranchState> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/branches`);
+  const data = await handleJson<{ state: GitBranchState }>(res);
+  return data.state;
+};
+
+/**
+ * V0.8：切 chat 工作目录的 git 分支（POST /api/tasks/[id]/branches、body {branch}）
+ * 成功返回切换后的最新分支状态；失败（分支冲突 / 工作区脏）抛 git stderr。
+ */
+export const checkoutTaskBranch = async (
+  id: string,
+  branch: string,
+): Promise<GitBranchState> => {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/branches`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ branch }),
+  });
+  const data = await handleJson<{ ok: true; state: GitBranchState }>(res);
+  return data.state;
 };
 
 // ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------

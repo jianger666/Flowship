@@ -63,6 +63,8 @@ export const UpdateBadge = () => {
         ? "自动下载安装（Dock 图标显示进度）、完成后重启生效、数据不丢。"
         : "应用会重启、正在运行的任务会被中断。",
       confirmLabel: download ? "立即更新" : "重启更新",
+      // 重操作（重启 app 中断任务）opt-out 默认聚焦：焦点留「取消」、避免回车误触发更新
+      defaultFocus: "cancel",
     });
     // 壳的 will-navigate 拦截这个伪协议——win quitAndInstall、mac 壳内下载替换自身
     if (ok) window.location.href = "app-update://install";

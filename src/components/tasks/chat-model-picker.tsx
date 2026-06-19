@@ -8,14 +8,16 @@
  * - 打开时按需拉模型列表
  *
  * 硬约束（用户拍板的语义）：chat 是单个 SDK run、模型在 run 启动时绑死。所以：
- * - runStatus=running 时禁用：当前轮换不了、禁用避免误导
- * - 切了不立即重启：用户下条消息起的新 run 才用新模型（chat done 后再发消息自动起新 run）
+ * - runStatus=running 时禁用：agent 正吐字、当前轮换不了、禁用避免误导
+ * - 切了不立即停对话、只存 task.model（懒重启）：用户下条消息发出时、后端 chat-reply 比对
+ *   「当前 run 绑定模型 vs 现在选的」——变了才取消旧 run + 用新模型起新 run（历史靠 events 续）、
+ *   没变（切了又切回 / 没真改）就正常续接。所以这里切完零副作用、不必重启、不弹提示。
  *
  * 重构记：旧版是 Popover 套 ModelPicker(内含 Select) = 嵌套弹层、用户实测「选完点空白要两次才关」。
  * 改用 ModelSelect（自带单层 popover + chips 参数、零嵌套）后、点一次空白即关。
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { ModelSelect } from "@/components/ui/model-select";
@@ -56,6 +58,16 @@ export const ChatModelPicker = ({ task, onTaskUpdate }: Props) => {
       setSaving(false);
     }
   };
+
+  // 挂载即拉一次模型列表（不等 popover 打开）——否则 trigger 只能显示 task.model.id、
+  // 反查不到完整 displayName + 参数摘要（用户实测「首次进对话模型名不全、点一下才对」）。
+  // useModels 有 SWR 缓存、命中立即填充、不会每次进对话都打网络。
+  useEffect(() => {
+    const s = getSettings();
+    if (s.apiKey?.trim() && models.length === 0) {
+      void fetchModels(s.apiKey);
+    }
+  }, [models.length, fetchModels]);
 
   // 打开时按需拉模型列表（已有则跳过、省请求）
   const handleOpenChange = (open: boolean) => {

@@ -48,6 +48,23 @@ export const isValidModel = (m: unknown): m is ModelSelection => {
   return typeof x.id === "string" && x.id.length > 0;
 };
 
+/**
+ * 「模型 + 参数」深比：id 相同 且 params 完全一致（无视 params 顺序）。
+ *
+ * chat 懒重启用：用户切了模型 / 调了参数（fast、thinking 级别等都在 params 里）后发下条消息、
+ * 比对「当前 Run 绑定模型」vs「现在选的」——一致就续接（切了又切回零成本）、不一致才重启换模型。
+ * 规范化序列化比、params 按 id 排序消顺序差异。
+ */
+const canonicalModel = (m: ModelSelection): string => {
+  const params = [...(m.params ?? [])]
+    .map((p) => [p.id, p.value] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify({ id: m.id, params });
+};
+
+export const modelEquals = (a: ModelSelection, b: ModelSelection): boolean =>
+  canonicalModel(a) === canonicalModel(b);
+
 // ----------------- Image 入参校验 -----------------
 
 /**

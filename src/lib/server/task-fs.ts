@@ -1399,6 +1399,28 @@ export const setTaskModel = async (
     return await hydrateTask(meta);
   });
 
+/**
+ * V0.8：chat 模式「选工作目录」——替换 meta.repoPaths（区别于 updateTaskFields 的追加语义）。
+ *
+ * 自由对话直接用原生 picker 选文件夹当 agent cwd（对齐 codex / Cursor Agent Window）、重选即替换、
+ * 空数组 = 不绑（agent 起在 ai-flow 项目本身、getEffectiveCwd fallback process.cwd()）。
+ * 跟切模型同款硬约束：cwd 在 SDK run 启动时绑死、改了下一轮 agent 启动才生效（调用方 running 时禁用入口）。
+ */
+export const setTaskRepoPaths = async (
+  id: string,
+  repoPaths: string[],
+): Promise<Task | null> =>
+  withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return null;
+    meta.repoPaths = repoPaths
+      .map((p) => p.trim().replace(/\/+$/, ""))
+      .filter((p) => p.length > 0);
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
 // ----------------- 公开 API（V0.6 新）：action / repoStatus / runStatus / gitBranches / mr -----------------
 
 /**

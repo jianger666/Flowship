@@ -16,7 +16,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Check, ChevronRight, ListFilter, Plus } from "lucide-react";
+import { Check, ChevronRight, ListFilter, Loader2, Plus, SquareKanban } from "lucide-react";
 import { toast } from "sonner";
 
 import { NewTaskDialog } from "@/components/tasks/new-task-dialog";
@@ -30,6 +30,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useDialog } from "@/hooks/use-dialog";
+import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
 import { deleteTask, setTaskPinned } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
@@ -102,6 +103,9 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     router.push(`/tasks/${task.id}`);
   };
 
+  // 一键新建对话（零表单、对齐 codex / Cursor Agent Window）——逻辑抽进 useNewChat、跟首页复用
+  const { createChat, creating: creatingChat } = useNewChat(handleCreated);
+
   // 置顶 / 取消置顶：乐观更新 → 失败回滚 + refresh 兜底
   const handlePin = async (task: TaskSummary) => {
     const next = !task.pinned;
@@ -148,14 +152,29 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     >
       {/* 固定内容宽度、收起时被外层裁掉、不挤压换行 */}
       <div className="flex h-full w-64 flex-col">
-        {/* 顶部：新建任务（占满）+ 类型筛选（图标触发下拉）。toggle 已移到顶栏红绿灯右侧。 */}
+        {/* 顶部：新建对话（主入口、占满）+ 新建任务（图标）+ 类型筛选（图标触发下拉）。
+            toggle 已移到顶栏红绿灯右侧。自由对话高频、一键零表单当主入口；结构化任务低频、降为图标。 */}
         <div className="flex items-center gap-1 p-2">
+          <Button
+            className="flex-1"
+            onClick={createChat}
+            disabled={creatingChat}
+          >
+            {creatingChat ? <Loader2 className="animate-spin" /> : <Plus />}
+            新建对话
+          </Button>
           <NewTaskDialog
             onCreated={handleCreated}
             trigger={
-              <Button className="flex-1">
-                <Plus />
-                新建任务
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="新建结构化任务"
+                title="新建结构化任务（走完整 方案 / 实现 / 复核 流程）"
+                className="shrink-0 gap-1.5"
+              >
+                <SquareKanban className="size-4" />
+                任务
               </Button>
             }
           />

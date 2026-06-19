@@ -199,6 +199,46 @@ export const formatRelative = (ts: number): string => {
 };
 
 // ===========================================
+// chat 对话标题：占位 + 首条消息派生（前后端共用单一源）
+// ===========================================
+//
+// 自由对话「不填表单」后没有用户起的标题——新建时先给「对话 · MM-DD HH:mm」占位、
+// 用户发出首条消息后用前 ~24 字覆盖（对齐 codex / Cursor Agent Window 的 first-message-wins）。
+// 占位前缀单一来源、判断「是否还是占位」靠它、改前缀只改这里。
+
+/** chat 占位标题前缀——侧栏窄、占位尽量短 */
+export const CHAT_TITLE_PLACEHOLDER_PREFIX = "对话 · ";
+
+/** 生成 chat 占位标题（新建空对话 / 后端补缺省共用） */
+export const buildPlaceholderChatTitle = (now: Date = new Date()): string =>
+  `${CHAT_TITLE_PLACEHOLDER_PREFIX}${now.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+
+/** 是否还是占位标题（用户尚未发首条消息）、用于决定要不要用首条消息覆盖 */
+export const isPlaceholderChatTitle = (title: string): boolean =>
+  title.startsWith(CHAT_TITLE_PLACEHOLDER_PREFIX);
+
+/**
+ * 从用户首条消息派生 chat 标题（纯截取、不调 AI）：
+ * 去代码块 / 常见 markdown 标记 / 折叠空白换行 → 截到 ~24 字（CJK 占位宽、侧栏窄）、超出加省略号。
+ * 全空白返回 null（调用方保留占位）。
+ */
+export const deriveChatTitleFromMessage = (text: string): string | null => {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#`*_>~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return null;
+  const MAX = 24;
+  return cleaned.length > MAX ? `${cleaned.slice(0, MAX)}…` : cleaned;
+};
+
+// ===========================================
 // V0.6.23 build 分批：批次推导（前后端共用单一源）
 // ===========================================
 //

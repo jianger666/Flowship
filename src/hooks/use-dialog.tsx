@@ -60,6 +60,10 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   // 走 destructive 主题色（红）、适合「删除 / 覆盖」类操作
   destructive?: boolean;
+  // 弹窗打开时初始焦点落哪个键（决定回车默认触发谁）。默认 "confirm"：
+  // 用户点了某个入口才弹确认、手不在键盘上、焦点放主操作上、看一眼回车即确认更顺手。
+  // 重操作（如重启 app 更新）传 "cancel" opt-out、避免回车误触发。
+  defaultFocus?: "confirm" | "cancel";
 }
 
 // Prompt 配置
@@ -115,6 +119,9 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
 
   // prompt input 受控值、单独 state 避免 update state 时丢 resolve 引用
   const [promptValue, setPromptValue] = useState("");
+
+  // confirm 的「确认」键 ref——弹窗打开时把初始焦点落在它上（回车即确认、由 defaultFocus 控制）
+  const confirmActionRef = useRef<HTMLButtonElement>(null);
 
   // 卸载时 resolve 残留的 promise 避免泄漏（很罕见但保险）
   const stateRef = useRef(state);
@@ -175,7 +182,11 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
         }}
       >
         {state.kind === "confirm" && (
-          <AlertDialogContent>
+          <AlertDialogContent
+            initialFocus={
+              state.opts.defaultFocus === "cancel" ? undefined : confirmActionRef
+            }
+          >
             <AlertDialogHeader>
               <AlertDialogTitle>{state.opts.title}</AlertDialogTitle>
               {state.opts.description && (
@@ -189,6 +200,7 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
                 {state.opts.cancelLabel ?? "取消"}
               </AlertDialogCancel>
               <AlertDialogAction
+                ref={confirmActionRef}
                 variant={state.opts.destructive ? "destructive" : "default"}
                 onClick={() => closeConfirm(true)}
               >

@@ -52,12 +52,16 @@ import {
   setChatAwaitingNotifier,
   unmarkTaskAsChat,
 } from "./chat-mcp";
-import { chatWaitProtocolSection } from "./wait-protocol-prompt";
+import {
+  chatWaitProtocolSection,
+  replyThenWaitReminder,
+} from "./wait-protocol-prompt";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
 } from "@/lib/path-utils";
+import os from "node:os";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -96,6 +100,9 @@ interface RunningChatRecord {
   agentId: string;
   startedAt: number;
   cancel: () => void;
+  // 本 Run 启动时绑定的模型（Agent.create 时定死、Run 期间不可变）。
+  // 切模型懒重启用：用户切模型后发下条消息、chat-reply 比对「选中模型 vs 这个」决定续接还是起新 Run。
+  model: ModelSelection;
 }
 
 interface ChatRunnerGlobalState {
@@ -136,6 +143,40 @@ export const cancelChatRun = (taskId: string): boolean => {
   if (!rec) return false;
   rec.cancel();
   return true;
+};
+
+/**
+ * 读当前活 chat Run 启动时绑定的模型（无活 Run 返 null）。
+ * 切模型懒重启用：chat-reply 收到新消息时、比对「用户现在选的模型 vs 这个」决定续接 or 重启。
+ */
+export const getChatRunModel = (taskId: string): ModelSelection | null =>
+  runningChats.get(taskId)?.model ?? null;
+
+/**
+ * 等当前 chat Run 真退（轮询 runningChats、退了返 true、超时返 false）。
+ * 切模型重启时：cancelChatRun 后等旧 Run 的 finally 清掉自己、再起新 Run、防两个 Run 并存
+ *（runChatSession 入口 has(taskId) 为真会直接 return、不等就起会被挡）。对齐 task-runner.waitForTaskToStop。
+ */
+export const waitForChatToStop = async (
+  taskId: string,
+  timeoutMs: number,
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!runningChats.has(taskId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !runningChats.has(taskId);
+};
+
+/**
+ * 强清 chat Run 运行时状态（pending + runningChats entry）。
+ * 仅 waitForChatToStop 超时兜底用：旧 Run cancel 卡住没按期退、强清好让新 Run 起得来。
+ * 旧 Run 迟到的 finally 再 delete 无害（delete 不存在的 key 不报错）。
+ */
+export const forceClearChatRun = (taskId: string): void => {
+  cancelPending(taskId);
+  runningChats.delete(taskId);
 };
 
 // ----------------- publish 帮手（复用 task-runner SSE 通道） -----------------
@@ -257,11 +298,7 @@ const buildOpeningStanceSection = (
   }
 
   const lines: string[] = [
-    "## 起手姿势：先回答用户首条消息",
-    "",
-    "下面是用户在 ai-flow UI 上发的第一条消息。**要查代码 / 资料才能答的、先查清楚再答；要写 / 做的、就在这条正文里直接做出来**（或先交付本轮一个可用分段）；把成品（结果 / 代码 / 文章 / 方案 / 链接 / 结论）写成一条正文发出去——只『宣告要做』而没成品都是预告、不算回答（不管是『正在检索 / 正在处理』还是『我先写 X、写完后再等』），然后才调 wait_for_user 等下一句。",
-    "",
-    "用户消息：",
+    "## 用户的第一条消息",
     "",
     firstMessage.text.length > 0
       ? firstMessage.text
@@ -283,6 +320,9 @@ const buildOpeningStanceSection = (
       "",
     );
   }
+  // recency 钉子：和续接路径（chat-mcp CHAT_REPLY_REMINDER）同一份单一源、钉在用户首条之后、
+  // 让 agent 最后读到的是「先成品再挂等」（治切模型懒重启「读历史 / 预告完没写成品就挂等」）
+  lines.push(replyThenWaitReminder(), "");
   return lines;
 };
 
@@ -479,6 +519,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
   runningChats.set(task.id, {
     agentId: "",
     startedAt: Date.now(),
+    // 记下本 Run 绑定模型、供「切模型懒重启」比对（见 chat-reply route）
+    model,
     cancel: () => {
       cancelled = true;
       cancelPending(task.id);
@@ -573,7 +615,16 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       // settingSources:["project"] = 加载目标仓库 .cursor/ 的 rules/skills/mcp/hooks（project 层）
       //（跟 Cursor IDE 一致、配置双向绑定）；全局 ~/.cursor/（user 层）SDK 够不着、
       // 由 fe 读了注入（rules/skills 进 prompt、mcp 进 inline mergedMcp）、详见 cursor-config.ts
-      local: { cwd: getEffectiveCwd(task.repoPaths), settingSources: ["project"] },
+      local: {
+        // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
+        //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
+        // Cursor（默认 workspace）：总给个用户地盘的合法 cwd、要 agent 干活就让用户选目录。
+        cwd:
+          task.repoPaths.length > 0
+            ? getEffectiveCwd(task.repoPaths)
+            : os.homedir(),
+        settingSources: ["project"],
+      },
       mcpServers: mergedMcp,
     });
 

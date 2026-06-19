@@ -631,6 +631,21 @@ export interface MRRecord {
  *   - task.title 保留中文、非法字符（\s / : * ? " < > | 【 】 ( ) 等）换成 -
  *   baseBranch 由 agent 启动 build 时自己探测（origin/HEAD 或 git remote show）、不在 settings 里配
  */
+/**
+ * chat 工作目录的本地 git 分支状态（V0.8、前后端共用）
+ *
+ * 读自 git-branches.readGitBranchState：自由对话工作目录是 git 仓时给分支选择器用。
+ * 跟 GitBranchInfo（agent 工作分支记录）无关——这只是「目录现在有哪些本地分支 + 在哪个分支上」。
+ */
+export interface GitBranchState {
+  /** 该目录是不是 git 仓（false 时 current/branches 为空、前端隐藏分支选择器） */
+  isRepo: boolean;
+  /** 当前分支名；detached HEAD 时为 null */
+  current: string | null;
+  /** 本地分支名列表（不含 remote、按最近提交倒序） */
+  branches: string[];
+}
+
 export interface GitBranchInfo {
   /**
    * V0.6.1：关联到 task.repoPaths 里的某个仓、多仓 task 时区分用

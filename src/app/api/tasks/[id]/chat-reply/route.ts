@@ -45,20 +45,30 @@ import {
   getTask,
   saveImageAttachments,
   setTaskRunStatus,
+  updateTaskFields,
 } from "@/lib/server/task-fs";
+import {
+  deriveChatTitleFromMessage,
+  isPlaceholderChatTitle,
+} from "@/lib/task-display";
 import {
   hasPending,
   submitUserMessage,
 } from "@/lib/server/chat-mcp";
 import {
+  cancelChatRun,
+  forceClearChatRun,
+  getChatRunModel,
   isChatRunning,
   runChatSession,
+  waitForChatToStop,
 } from "@/lib/server/chat-runner";
 import { publishTaskStreamEvent } from "@/lib/server/task-runner";
 import {
   errorResponse,
   isValidModel,
   KEEPALIVE_RACE_RETRY_MS,
+  modelEquals,
   parseAndValidateImages,
   sleep,
 } from "@/lib/server/route-helpers";
@@ -83,6 +93,8 @@ interface PostBody {
 
 const MAX_IMAGES_PER_REPLY = 6;
 const MAX_ATTACHMENTS_PER_REPLY = 10;
+// 切模型懒重启：cancel 旧 Run 后等它真退的上限（对齐 task-runner force-new 的 5s）、超时强清继续
+const CHAT_RESTART_STOP_TIMEOUT_MS = 5000;
 
 export const runtime = "nodejs";
 
@@ -200,6 +212,24 @@ export const POST = async (req: Request, { params }: Ctx) => {
     publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
   }
 
+  // 首条消息派生标题：占位「对话 · 时间」被用户首条消息前 ~24 字覆盖（first-message-wins、
+  // 对齐 codex / Cursor Agent Window）。放在写完 user_reply、启 agent 之前——这样后续
+  // setTaskRunStatus 读到的 meta 已是新标题、publish 的 task 一次带上新名、侧栏不闪旧占位。
+  if (text && isPlaceholderChatTitle(task.title)) {
+    const derived = deriveChatTitleFromMessage(text);
+    if (derived) {
+      const renamed = await updateTaskFields(task.id, { title: derived });
+      if (renamed) {
+        publishTaskStreamEvent(task.id, { kind: "task", task: renamed });
+        task.title = derived;
+      }
+    }
+  }
+
+  // bootArgs（apiKey + model）前端永远附带——模式 1 懒重启换模型、模式 2 自动启动都要用、
+  // 提到模式判断前声明（原在模式 2 处、模式 1 引用会 TDZ 报错）
+  const bootArgs = body.bootArgs;
+
   // 决定模式：awaiting_user + hasPending → 正常推进；否则 → 自动启 agent
   // race 兜底：刚切到 awaiting_user 但 hasPending 还没注册、KEEPALIVE_RACE_RETRY_MS 内 retry 一次
   let pending = hasPending(task.id);
@@ -209,14 +239,63 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   if (pending && task.runStatus === "awaiting_user") {
-    // 模式 1：正常对话循环
-    submitUserMessage(task.id, text, imageAbsPaths, attachmentAbsPaths);
+    // 切模型懒重启：用户可能在上轮答完后切了模型 / 调了参数（只存进 task.model、没动当前 Run）。
+    // 比对「当前 Run 绑定模型」vs「现在选的（bootArgs.model）」决定续接还是换模型重启。
+    const runModel = getChatRunModel(task.id);
+    // 续接条件：没绑定模型可比 / 缺起新 Run 的 apiKey+model / 模型没变（含切了又切回）→ 同 Run 续接、省计费
+    if (
+      !runModel ||
+      !bootArgs?.apiKey ||
+      !isValidModel(bootArgs.model) ||
+      modelEquals(runModel, bootArgs.model)
+    ) {
+      submitUserMessage(task.id, text, imageAbsPaths, attachmentAbsPaths);
+      const runningTask = await setTaskRunStatus(task.id, "running");
+      if (runningTask)
+        publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
+      const fresh = await getTask(task.id);
+      return new Response(
+        JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // 模型真变了 → 懒重启：取消旧 Run、等它真退（超时强清）、用新模型起新 Run（这条消息作首条）、
+    // 历史靠 events.jsonl 续上（跟「服务重启后再聊」同一条恢复路径、buildInitialPrompt 已给 agent eventsLogPath）
+    cancelChatRun(task.id);
+    const stopped = await waitForChatToStop(
+      task.id,
+      CHAT_RESTART_STOP_TIMEOUT_MS,
+    );
+    if (!stopped) {
+      console.warn(
+        `[chat-reply] task=${task.id} 切模型重启：旧 Run 没在 ${CHAT_RESTART_STOP_TIMEOUT_MS}ms 内退、强清继续`,
+      );
+      forceClearChatRun(task.id);
+    }
     const runningTask = await setTaskRunStatus(task.id, "running");
     if (runningTask)
       publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
+    void runChatSession({
+      task: runningTask ?? task,
+      apiKey: bootArgs.apiKey,
+      model: bootArgs.model,
+      firstMessage: {
+        text,
+        imagePaths: imageAbsPaths,
+        attachmentPaths:
+          attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+      },
+      firstMessageEventId: replyEvent?.id,
+    }).catch((err) => {
+      console.error(
+        `[chat-reply] 切模型重启 runChatSession task=${task.id} failed:`,
+        err,
+      );
+    });
     const fresh = await getTask(task.id);
     return new Response(
-      JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
+      JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: true }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
   }
@@ -247,8 +326,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
   }
 
-  // 校验 bootArgs
-  const bootArgs = body.bootArgs;
+  // 校验 bootArgs（声明已提到模式判断前）
   if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
     return errorResponse("缺 bootArgs.apiKey、终态发消息触发自动启动必传");
   }

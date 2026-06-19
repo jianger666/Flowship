@@ -23,6 +23,8 @@ import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
+import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
+import { ChatWorkdirPicker } from "@/components/tasks/chat-workdir-picker";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
 import { useTaskWatch } from "@/hooks/use-task-watch";
@@ -114,7 +116,7 @@ export const ChatView = ({
         );
         onTaskUpdateRef.current(latest);
         if (autoStarted) {
-          toast.info("正在启动 agent、首条消息会在它就位后自动回复");
+          // 起手 loading 行由 EventStream 按「最后一条是用户消息 + running」渲染（取代旧 toast）
           // 上一轮 agent done 后 SSE 已断、++ 触发重连、才能收到新一轮 agent 的事件流
           setWatchEpoch((n) => n + 1);
         }
@@ -170,7 +172,7 @@ export const ChatView = ({
       {/* 顶部 bar：返回 + title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片）
           V0.7.11：轻量化——无底色、状态文案只在异常 / 进行中出现（不常驻占行） */}
       <div className="border-b px-6 py-2.5">
-        <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3">
+        <div className="flex w-full items-center justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 items-center gap-2">
               <h1 className="truncate text-sm font-medium tracking-tight">
@@ -192,7 +194,7 @@ export const ChatView = ({
         </div>
         {/* 状态条文案：仅异常 / 发送中显示 */}
         {statusHint && (
-          <div className="mx-auto mt-1 w-full max-w-3xl text-xs text-muted-foreground">
+          <div className="mt-1 w-full text-xs text-muted-foreground">
             {statusHint}
           </div>
         )}
@@ -212,6 +214,12 @@ export const ChatView = ({
           stopping={stopping}
           composerLeading={
             <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
+          }
+          composerTop={
+            <>
+              <ChatWorkdirPicker task={task} onTaskUpdate={onTaskUpdate} />
+              <ChatBranchPicker task={task} />
+            </>
           }
         />
       </div>

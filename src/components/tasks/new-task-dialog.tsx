@@ -1,30 +1,19 @@
 "use client";
 
 /**
- * 新建任务 Dialog（V0.6.0.1 重新加 mode tab 切换）
+ * 新建任务 Dialog（结构化任务专用）
  *
- * 顶部两选一 ModeCard：
- *   - **任务**：mode="task"、走 plan → build → review 完整流
- *     字段：title / repos / feishuStoryUrl 三必填 + role + 模型 + MCP
- *   - **自由对话**：mode="chat"、跑独立 chat-runner、UI 是简单聊天页
- *     字段：title / repos 都选填 + 模型 + MCP（不展示 role / feishu）
+ * 只建 mode="task"：走 plan → build → review 完整流。
+ * 字段：title / repos / feishuStoryUrl / role 必填 + 模型 + MCP（飞书 MCP 是命脉、缺了不让建）。
  *
- * V0.5 → V0.6.0.1 沿用一致：用户拍板「跟以前一样」、自由对话独立于 action 体系。
+ * 自由对话已独立成一键入口（侧栏 / 首页「新建对话」→ useNewChat）、不再塞进本表单的 mode 切换。
  */
 
 import { useEffect, useMemo, useState } from "react";
-import {
-  ChevronDown,
-  ChevronUp,
-  MessageCircle,
-  Plug,
-  Plus,
-  Workflow,
-} from "lucide-react";
+import { ChevronDown, ChevronUp, Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
   DialogContent,
@@ -57,7 +46,6 @@ import {
   type RepoConfig,
   type CheckCommand,
   type Task,
-  type TaskMode,
   type TaskRole,
 } from "@/lib/types";
 
@@ -80,16 +68,14 @@ interface Props {
 export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   // dialog 开关
   const [open, setOpen] = useState(false);
-  // V0.6.0.1：任务模式（"task" / "chat"、对应顶部 ModeCard 切换）
-  const [mode, setMode] = useState<TaskMode>("task");
-  // V0.4 任务角色：决定 agent 以哪种视角读 story / 出方案（仅 task 模式显示）
+  // V0.4 任务角色：决定 agent 以哪种视角读 story / 出方案
   // V0.6.12：不默认前端、初始空——强制用户主动选、避免后端同学顺手提交成前端
   const [role, setRole] = useState<TaskRole | "">("");
-  // 任务标题（task 模式必填；chat 模式选填、空时后端自动补「未命名对话 MM-DD HH:mm」）
+  // 任务标题（必填）
   const [title, setTitle] = useState("");
-  // 目标仓库（task 模式必填至少 1 个；chat 模式选填、空时 agent cwd = home）
+  // 目标仓库（必填至少 1 个）
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
-  // 飞书项目链接（仅 task 模式必填、chat 模式不展示）
+  // 飞书项目链接（必填）
   const [feishuStoryUrl, setFeishuStoryUrl] = useState("");
   // V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、用户已自己建分支做了一部分时填、build 复用不另建）
   const [featureBranches, setFeatureBranches] = useState<
@@ -137,7 +123,6 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   // 关闭时重置
   useEffect(() => {
     if (open) return;
-    setMode("task");
     setRole("");
     setTitle("");
     setRepoPaths([]);
@@ -151,11 +136,11 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // task 模式下「未配置 or 本次被关掉」的飞书 MCP——非空则禁止创建（飞书是 task 命脉）。
+  // 「未配置 or 本次被关掉」的飞书 MCP——非空则禁止创建（飞书是任务命脉）。
   // 判定：启用的 server（key 不在本次黑名单）里、有没有 url 命中飞书域名；没命中 = 缺。
   // mcpLoading 时先按「不缺」处理、避免列表没拉回来就误报缺失闪一下红。
   const missingFeishuMcp = useMemo(() => {
-    if (mode !== "task" || mcpLoading) return [];
+    if (mcpLoading) return [];
     const enabledUrls = Object.entries(mcpServers)
       .filter(([key]) => !disabledMcp.includes(key))
       .map(([, cfg]) => ("url" in cfg ? cfg.url : ""))
@@ -163,23 +148,20 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     return REQUIRED_FEISHU_MCP.filter(
       (m) => !enabledUrls.some((u) => u.includes(m.host)),
     );
-  }, [mode, mcpLoading, mcpServers, disabledMcp]);
+  }, [mcpLoading, mcpServers, disabledMcp]);
 
-  // task 模式必填 title/repos/feishu/role + 飞书 MCP 齐全；chat 模式全选填、随便点都能提交
+  // 必填 title/repos/feishu/role + 飞书 MCP 齐全才放行
   const canSubmit = useMemo(() => {
     if (submitting) return false;
-    if (mode === "task") {
-      if (!title.trim()) return false;
-      if (repoPaths.length === 0) return false;
-      if (!feishuStoryUrl.trim()) return false;
-      if (!role) return false; // V0.6.12：角色必选、不再默认前端
-      if (mcpLoading) return false; // MCP 列表还没拉回来、等确认飞书依赖再放行
-      if (missingFeishuMcp.length > 0) return false; // 飞书 MCP 缺失、不让建
-    }
+    if (!title.trim()) return false;
+    if (repoPaths.length === 0) return false;
+    if (!feishuStoryUrl.trim()) return false;
+    if (!role) return false; // V0.6.12：角色必选、不再默认前端
+    if (mcpLoading) return false; // MCP 列表还没拉回来、等确认飞书依赖再放行
+    if (missingFeishuMcp.length > 0) return false; // 飞书 MCP 缺失、不让建
     return true;
   }, [
     submitting,
-    mode,
     title,
     repoPaths,
     feishuStoryUrl,
@@ -237,8 +219,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
       }
 
       const task = await createTask({
-        mode,
-        // task 模式 canSubmit 已保证 role 非空；chat 模式无角色、"" → undefined
+        mode: "task",
+        // canSubmit 已保证 role 非空
         role: role || undefined,
         title: title.trim(),
         repoPaths,
@@ -293,71 +275,34 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
       />
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>新建{mode === "chat" ? "对话" : "任务"}</DialogTitle>
+          <DialogTitle>新建任务</DialogTitle>
         </DialogHeader>
 
         <div className="flex flex-col gap-3">
-          {/* 顶部模式切换：task / chat */}
+          {/* 标题 */}
           <div className="grid gap-1.5">
-            <Label required>类型</Label>
-            <div className="grid grid-cols-2 gap-2">
-              <ChoiceButton
-                shape="card"
-                selected={mode === "task"}
-                onClick={() => setMode("task")}
-              >
-                <div className="flex items-center gap-2">
-                  <Workflow className="size-4" />
-                  <span className="font-medium">任务</span>
-                </div>
-              </ChoiceButton>
-              <ChoiceButton
-                shape="card"
-                selected={mode === "chat"}
-                onClick={() => setMode("chat")}
-              >
-                <div className="flex items-center gap-2">
-                  <MessageCircle className="size-4" />
-                  <span className="font-medium">自由对话</span>
-                </div>
-              </ChoiceButton>
-            </div>
-          </div>
-
-          {/* 标题：task 必填、chat 选填 */}
-          <div className="grid gap-1.5">
-            <Label htmlFor="t-title" required={mode === "task"}>
-              {mode === "chat" ? "标题（选填）" : "任务标题"}
+            <Label htmlFor="t-title" required>
+              任务标题
             </Label>
             <Input
               id="t-title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder={
-                mode === "chat"
-                  ? "不填用「对话 · MM-DD HH:mm」占位"
-                  : "如：需求标题"
-              }
+              placeholder="如：需求标题"
               autoFocus
             />
           </div>
 
-          {/* 仓库：task 必填、chat 选填 */}
+          {/* 仓库 */}
           <div className="grid gap-1.5">
-            <Label required={mode === "task"}>
-              {mode === "chat" ? "目标仓库（选填）" : "目标仓库"}
-            </Label>
+            <Label required>目标仓库</Label>
             {repos.length > 0 ? (
               <MultiSelect<RepoConfig>
                 options={repos}
                 value={repoPaths}
                 onChange={setRepoPaths}
                 getKey={(r) => r.path}
-                placeholder={
-                  mode === "chat"
-                    ? "选填、不选时 agent 起在 AI工作流项目本身"
-                    : "选择仓库（可多选）"
-                }
+                placeholder="选择仓库（可多选）"
                 renderOption={(r) => (
                   <>
                     <span className="block w-full truncate font-medium">
@@ -395,85 +340,81 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
             ) : (
               <EmptyHint size="sm">
                 还没配置仓库——先去 <strong>设置</strong> 加一个
-                {mode === "chat" && "、或者不选直接聊"}
               </EmptyHint>
             )}
           </div>
 
-          {/* 角色、飞书：仅 task 模式展示 */}
-          {mode === "task" && (
-            <>
-              <div className="grid gap-1.5">
-                <Label htmlFor="t-role" required>
-                  角色
-                </Label>
-                <Select
-                  value={role}
-                  onValueChange={(v) => v && setRole(v as TaskRole)}
-                >
-                  <SelectTrigger id="t-role" className="w-full">
-                    <SelectValue placeholder="选择角色">
-                      {role ? TASK_ROLE_LABEL[role] : null}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ROLE_OPTIONS.map((r) => (
-                      <SelectItem key={r} value={r}>
-                        {TASK_ROLE_LABEL[r]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+          {/* 角色 */}
+          <div className="grid gap-1.5">
+            <Label htmlFor="t-role" required>
+              角色
+            </Label>
+            <Select
+              value={role}
+              onValueChange={(v) => v && setRole(v as TaskRole)}
+            >
+              <SelectTrigger id="t-role" className="w-full">
+                <SelectValue placeholder="选择角色">
+                  {role ? TASK_ROLE_LABEL[role] : null}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {ROLE_OPTIONS.map((r) => (
+                  <SelectItem key={r} value={r}>
+                    {TASK_ROLE_LABEL[r]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
-              <div className="grid gap-1.5">
-                <Label htmlFor="t-story" required>
-                  飞书项目链接
-                </Label>
-                <Input
-                  id="t-story"
-                  value={feishuStoryUrl}
-                  onChange={(e) => setFeishuStoryUrl(e.target.value)}
-                  placeholder="https://project.feishu.cn/<space>/story/detail/..."
-                />
-              </div>
+          {/* 飞书项目链接 */}
+          <div className="grid gap-1.5">
+            <Label htmlFor="t-story" required>
+              飞书项目链接
+            </Label>
+            <Input
+              id="t-story"
+              value={feishuStoryUrl}
+              onChange={(e) => setFeishuStoryUrl(e.target.value)}
+              placeholder="https://project.feishu.cn/<space>/story/detail/..."
+            />
+          </div>
 
-              {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建 */}
-              {repoPaths.length > 0 && (
-                <div className="grid gap-1.5">
-                  <Label>已有工作分支（选填）</Label>
-                  <div className="grid gap-2">
-                    {repoPaths.map((p) => {
-                      const repo = repos.find((r) => r.path === p);
-                      return (
-                        <div key={p} className="flex items-center gap-2">
-                          <span
-                            className="w-28 shrink-0 truncate text-sm text-muted-foreground"
-                            title={repo?.name ?? p}
-                          >
-                            {repo?.name ?? p}
-                          </span>
-                          <Input
-                            value={featureBranches[p] ?? ""}
-                            onChange={(e) =>
-                              setFeatureBranches((prev) => ({
-                                ...prev,
-                                [p]: e.target.value,
-                              }))
-                            }
-                            placeholder="留空自动建 feature/…"
-                            className="min-w-0 flex-1"
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    已自己建分支做了一部分？填进来、build 直接复用、不另建
-                  </p>
-                </div>
-              )}
-            </>
+          {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建 */}
+          {repoPaths.length > 0 && (
+            <div className="grid gap-1.5">
+              <Label>已有工作分支（选填）</Label>
+              <div className="grid gap-2">
+                {repoPaths.map((p) => {
+                  const repo = repos.find((r) => r.path === p);
+                  return (
+                    <div key={p} className="flex items-center gap-2">
+                      <span
+                        className="w-28 shrink-0 truncate text-sm text-muted-foreground"
+                        title={repo?.name ?? p}
+                      >
+                        {repo?.name ?? p}
+                      </span>
+                      <Input
+                        value={featureBranches[p] ?? ""}
+                        onChange={(e) =>
+                          setFeatureBranches((prev) => ({
+                            ...prev,
+                            [p]: e.target.value,
+                          }))
+                        }
+                        placeholder="留空自动建 feature/…"
+                        className="min-w-0 flex-1"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                已自己建分支做了一部分？填进来、build 直接复用、不另建
+              </p>
+            </div>
           )}
 
           {/* 模型选择（两种模式都展示） */}
@@ -530,8 +471,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
           )}
         </div>
 
-        {/* task 模式缺飞书 MCP 时的硬提示——飞书是「需求 → PR」命脉、缺了按钮置灰不让建 */}
-        {mode === "task" && missingFeishuMcp.length > 0 && (
+        {/* 缺飞书 MCP 时的硬提示——飞书是「需求 → PR」命脉、缺了按钮置灰不让建 */}
+        {missingFeishuMcp.length > 0 && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             创建任务需先启用{" "}
             <strong>{missingFeishuMcp.map((m) => m.label).join("、")}</strong>

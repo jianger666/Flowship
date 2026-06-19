@@ -18,6 +18,7 @@ import {
   setTaskDisabledMcpServers,
   setTaskModel,
   setTaskPinned,
+  setTaskRepoPaths,
   setTaskUiLayout,
   updateTaskFields,
 } from "@/lib/server/task-fs";
@@ -52,6 +53,8 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       uiLayout?: { artifactPanelSize?: number } | null;
       // V0.6.24：chat 模式切模型（持久化 task.model、下一个 run 生效）
       model?: ModelSelection;
+      // V0.8：chat 模式选工作目录（替换 task.repoPaths、下一个 run 生效）
+      repoPaths?: string[];
       // V0.6.6：编辑任务字段（详情页编辑弹窗、可一次传多个）
       title?: string;
       role?: TaskRole;
@@ -136,6 +139,21 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
         );
       }
       const task = await setTaskModel(id, m);
+      if (!task)
+        return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
+    }
+
+    // V0.8：chat 模式选工作目录——替换 repoPaths（必须字符串数组、空数组 = 不绑工作目录）
+    if ("repoPaths" in body) {
+      const value = body.repoPaths;
+      if (!Array.isArray(value) || !value.every((p) => typeof p === "string")) {
+        return NextResponse.json(
+          { error: "repoPaths 必须是字符串数组" },
+          { status: 400 },
+        );
+      }
+      const task = await setTaskRepoPaths(id, value);
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });
       return NextResponse.json({ task });
