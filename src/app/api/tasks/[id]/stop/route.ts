@@ -23,7 +23,11 @@ import {
   patchAction,
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
-import { cancelTaskRun, publishTaskStreamEvent } from "@/lib/server/task-runner";
+import {
+  cancelTaskRun,
+  publishTaskStreamEvent,
+  supersedePendingAsks,
+} from "@/lib/server/task-runner";
 import { cancelChatRun } from "@/lib/server/chat-runner";
 import { reapTaskOrphans } from "@/lib/server/kill-orphans";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
@@ -59,6 +63,9 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   for (const a of stale) {
     await patchAction(id, a.id, { status: "cancelled" });
   }
+  // 作废旧 agent 没答完的孤儿 ask（停止后旧 agent 已断、不清掉前端会弹失效的旧问题弹窗、
+  // 用户答了必报错）。停止 = 主动中断、不续传旧问题、只清孤儿。
+  await supersedePendingAsks(id, "用户停止");
   // 事件文案用「当前 / 最近一个」非终态 action
   const current =
     (task.currentActionId

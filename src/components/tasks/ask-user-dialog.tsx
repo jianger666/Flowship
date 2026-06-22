@@ -51,6 +51,7 @@ import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { useDialog } from "@/hooks/use-dialog";
@@ -342,24 +343,12 @@ export const AskUserDialog = ({ task, onAnswered }: AskUserDialogProps) => {
   // 找最新一条待答的 ask_user_request
   // - 倒序扫、第一条没对应 reply 的就是「当前要弹的」
   // - 一次只弹一个 ask（用户答完才会有下一个 ask、串行）
-  const pendingEvent = useMemo<TaskEvent | null>(() => {
-    for (let i = task.events.length - 1; i >= 0; i--) {
-      const ev = task.events[i];
-      if (ev.kind !== "ask_user_request") continue;
-      const askId =
-        typeof ev.meta?.askId === "string" ? ev.meta.askId : null;
-      if (!askId) continue;
-      const replied = task.events.some(
-        (e) =>
-          e.kind === "ask_user_reply" &&
-          typeof e.meta?.askId === "string" &&
-          e.meta.askId === askId,
-      );
-      if (!replied) return ev;
-      // 已答的略过、看下一条更老的（一般也是已答、循环到底）
-    }
-    return null;
-  }, [task.events]);
+  // 找当前唯一该弹的 ask：倒序第一条「没了结（未答 且 未作废）」的（判定收口在 lib/ask-pending）。
+  // 作废 = 断线重启 / 换 agent / 停止时后端补的 info 标记——排除掉它才不会反复复活失效旧弹窗。
+  const pendingEvent = useMemo<TaskEvent | null>(
+    () => findPendingAskEvent(task.events),
+    [task.events],
+  );
 
   const askId =
     pendingEvent && typeof pendingEvent.meta?.askId === "string"

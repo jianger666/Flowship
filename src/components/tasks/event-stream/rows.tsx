@@ -12,6 +12,7 @@
 
 import { memo, useMemo, useState } from "react";
 import {
+  Ban,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -29,6 +30,7 @@ import {
   MarkdownImage,
   type PreviewImage,
 } from "@/components/ui/image-preview";
+import { isAskSuperseded } from "@/lib/ask-pending";
 import { buildIdeLink, pathBasename } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
@@ -601,6 +603,13 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
   );
   const answered = !!replyEvent;
 
+  // 是否已被作废：断线重启 / 换 agent / 停止时后端补一条 info 标记（判定见 lib/ask-pending）。
+  // 作废的 ask 没有真实 reply、显示中性失效态、别再误导成「正在等你答」。
+  const superseded = useMemo(
+    () => isAskSuperseded(task.events, askId),
+    [task.events, askId],
+  );
+
   // 问题数量：从 meta.questions 拿、没有就尝试用 text 行数估
   const questionsCount =
     ev.meta && Array.isArray(ev.meta.questions)
@@ -611,27 +620,35 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
     <div
       className={cn(
         "flex flex-col gap-2 rounded-md border-2 p-3",
-        answered
-          ? "border-emerald-500/30 bg-emerald-500/5"
-          : "border-amber-500/40 bg-amber-500/10",
+        superseded
+          ? "border-muted bg-muted/30"
+          : answered
+            ? "border-emerald-500/30 bg-emerald-500/5"
+            : "border-amber-500/40 bg-amber-500/10",
       )}
     >
       <div className="flex items-center gap-2 text-xs">
-        {answered ? (
+        {superseded ? (
+          <Ban className="size-4 text-muted-foreground" />
+        ) : answered ? (
           <CheckCircle2 className="size-4 text-emerald-500" />
         ) : (
           <Sparkles className="size-4 text-amber-500 animate-pulse" />
         )}
-        <span className="font-medium">
-          {answered
-            ? `已回答 ${questionsCount} 个问题`
-            : `AI 正在弹窗里问你 ${questionsCount} 个问题`}
+        <span
+          className={cn("font-medium", superseded && "text-muted-foreground")}
+        >
+          {superseded
+            ? "这组提问已失效（断线重启）"
+            : answered
+              ? `已回答 ${questionsCount} 个问题`
+              : `AI 正在弹窗里问你 ${questionsCount} 个问题`}
         </span>
         <span className="text-muted-foreground/70">{formatTs(ev.ts)}</span>
       </div>
 
-      {/* 未答：占位提示、不放交互、引导用户看弹窗 */}
-      {!answered && (
+      {/* 未答（且未失效）：占位提示、不放交互、引导用户看弹窗 */}
+      {!answered && !superseded && (
         <div className="rounded-md border border-dashed bg-card/40 px-3 py-2 text-xs text-muted-foreground">
           请在屏幕中央的弹窗里答完所有问题、答完后这里会显示完整 Q&A 历史
         </div>

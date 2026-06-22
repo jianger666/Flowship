@@ -98,6 +98,7 @@ import { filterHealthyMcp } from "./mcp-probe";
 import type {
   ActionRecord,
   ActionType,
+  AskUserQuestion,
   CheckOverride,
   GitBranchInfo,
   RepoStatus,
@@ -115,6 +116,7 @@ import {
 } from "@/lib/types";
 import { computeBatchProgress } from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
+import { isAskSettled } from "@/lib/ask-pending";
 
 // ----------------- 配置 -----------------
 
@@ -576,7 +578,14 @@ const buildNextActionDirective = (input: {
   return lines.join("\n");
 };
 
-const buildRestartActionInstruction = (task: Task, action: ActionRecord): string => {
+const buildRestartActionInstruction = (
+  task: Task,
+  action: ActionRecord,
+  // 断线前 agent 正等用户回答、但用户还没答完的那组问题（断点续传重问用）。
+  // 非空 = 断点卡在「等用户答问题」→ 让新 agent 原样重新问；
+  // 空 = 断在干活（或没有未答问题）→ 走 restart_intent 确认方向。
+  pendingQuestions: AskUserQuestion[] = [],
+): string => {
   const lines: string[] = [
     "[RESTART_ACTION]",
     "当前 action 因 SDK/agent 断开或用户手动重启而重新拉起。不要追加新 action、不要从零重做，继续完成同一个 action。",
@@ -595,15 +604,36 @@ const buildRestartActionInstruction = (task: Task, action: ActionRecord): string
     step += 1;
   }
 
-  // 读完上下文、动手前先问用户：按原计划继续、还是有新调整（用户拍板的重启语义、避免闷头继续）
-  // 只给一个「按原计划继续」业务选项、allow_text=true 时 UI 自带「自定义回答」入口让用户改方向。
-  lines.push(
-    `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（参数照抄、只给这一个选项）：`,
-    `   - task_id="${task.id}"、action_id="${action.id}"`,
-    '   - questions=[{ id:"restart_intent", question:"检测到当前阶段被重启。要我按原计划继续完成这个阶段、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
-    "   - 用户选「按原计划继续」→ 直接接着推进、不要再追问。",
-    "   - 用户写了自定义回答 → 按新指示调整方向后再推进。",
-  );
+  if (pendingQuestions.length > 0) {
+    // 断点续传：断线前 agent 卡在「等用户答这组问题」、用户是被网络打断、不是主动放弃 →
+    // 让接手的新 agent 把原问题原样重新问一遍（新 ask_user = 新 askId/token、用户能有效作答）。
+    // 不走 restart_intent（agent 还没动手、问「按原计划还是改方向」没意义）、更不准 default 跳过。
+    const questionsJson = JSON.stringify(
+      pendingQuestions.map((q) => ({
+        id: q.id,
+        question: q.question,
+        ...(q.options && q.options.length > 0 ? { options: q.options } : {}),
+        allow_text: q.allowText ?? true,
+      })),
+    );
+    lines.push(
+      `${step}. **断点续传（关键、优先做）**：断线前你正等用户回答下面这组问题、用户还没来得及答（是被网络打断、不是主动放弃）。读完上下文后、动手之前，先调一次 \`ask_user\` 把这组问题**原样重新问一遍**：`,
+      `   - task_id="${task.id}"、action_id="${action.id}"`,
+      `   - questions=${questionsJson}`,
+      "   - ⛔ 不要替用户作答、不要按 default 跳过、不要改写问题——用户是想答的、必须重新问到。",
+      "   - 拿到用户答案后再按答案推进。",
+    );
+  } else {
+    // 读完上下文、动手前先问用户：按原计划继续、还是有新调整（用户拍板的重启语义、避免闷头继续）
+    // 只给一个「按原计划继续」业务选项、allow_text=true 时 UI 自带「自定义回答」入口让用户改方向。
+    lines.push(
+      `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（参数照抄、只给这一个选项）：`,
+      `   - task_id="${task.id}"、action_id="${action.id}"`,
+      '   - questions=[{ id:"restart_intent", question:"检测到当前阶段被重启。要我按原计划继续完成这个阶段、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
+      "   - 用户选「按原计划继续」→ 直接接着推进、不要再追问。",
+      "   - 用户写了自定义回答 → 按新指示调整方向后再推进。",
+    );
+  }
 
   if (action.userInstruction.trim().length > 0) {
     lines.push("", "原始用户指令：", action.userInstruction.trim());
@@ -613,6 +643,52 @@ const buildRestartActionInstruction = (task: Task, action: ActionRecord): string
     "完成后仍然调用 `wait_for_user({ task_id, action_id, artifact_path })`，等待用户对这个同一个 action approve / revise。",
   );
   return lines.join("\n");
+};
+
+/**
+ * 作废 task 下「当前还没被回答的 ask_user_request」。
+ *
+ * 为什么需要（用户实测踩坑、断线重启「多弹窗并发」根因）：
+ *   旧 agent 被 cancel / 断线后、它发起的那组 ask 的 token 已失效、永远不会再被 resolve。
+ *   但前端 AskUserDialog 只看「ask_user_request 有没有配对的 ask_user_reply」来决定弹不弹——
+ *   不作废这条孤儿 ask、它会永久 pending：重启后反复复活弹窗、用户答了必 410（agent 没了）
+ *   再把 runStatus 打回 error、和失效态/restart_intent 弹窗在单例上反复横跳、关不完。
+ *
+ * 作废方式：写一条 info 事件标记 `meta.supersededAskId=askId`（不补 ask_user_reply——那会让
+ *   事件流显示成「你的回答」、语义不对；也不走 deferred——断线是被动打断、不是用户主动放弃）。
+ *   前端 pendingEvent / AskUserRequestRow 据此把这条旧 ask 当「已失效」、不再弹。
+ *
+ * 调用方：
+ *   - restartCurrentAction：清孤儿 + 用返回的 questions 让新 agent 断点续传重问
+ *   - advanceTask（起新 agent）/ stop 路由：只清孤儿（开新 action / 主动停、不续传）、忽略返回值
+ *
+ * @returns 最近一条被作废的 ask 的 questions（供重启时让新 agent 断点续传重新问）、没有则空数组。
+ */
+export const supersedePendingAsks = async (
+  taskId: string,
+  reason: string,
+): Promise<AskUserQuestion[]> => {
+  const task = await getTask(taskId);
+  if (!task) return [];
+  // 最近一条未答 ask 的问题（events 正序遍历、后命中的覆盖前面的 = 时间上最近的那组）
+  let latestQuestions: AskUserQuestion[] = [];
+  for (const ev of task.events) {
+    if (ev.kind !== "ask_user_request") continue;
+    const askId = typeof ev.meta?.askId === "string" ? ev.meta.askId : null;
+    if (!askId) continue;
+    // 已被回答 / 已被作废过的跳过（幂等：重复重启不重复写标记、判定见 lib/ask-pending）
+    if (isAskSettled(task.events, askId)) continue;
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      actionId: ev.actionId,
+      text: `上一组提问因${reason}失效、未送达 agent。`,
+      meta: { supersededAskId: askId },
+    });
+    if (Array.isArray(ev.meta?.questions)) {
+      latestQuestions = ev.meta.questions as AskUserQuestion[];
+    }
+  }
+  return latestQuestions;
 };
 
 // ----------------- 工具截断 -----------------
@@ -1485,6 +1561,10 @@ const advanceTaskInner = async (
     // 收尾被新 agent 取代的旧非终态 action（排除本次刚 appendAction 的新 action、否则误伤）
     await finalizeStaleActions(task.id, "cancelled", action.id);
   }
+  // 起新 agent 跑新 action 前、作废上一个 agent 没答完的孤儿 ask（同 restartCurrentAction：不清掉
+  // 前端会弹失效的旧问题弹窗、用户答了必报错；严重时还把 runStatus 打回 error 死循环）。
+  // 推进是「开新 action」语义、不续传旧问题（用户主动换方向 = 放弃旧断点）、只清孤儿、忽略返回值。
+  await supersedePendingAsks(task.id, "推进新 action");
   await internalStartAgent({
     task: taskAfterAppend,
     action,
@@ -1549,6 +1629,11 @@ const restartCurrentActionInner = async (
   }
   cancelPending(fresh.id);
   reapTaskOrphans(fresh.repoPaths);
+
+  // 作废旧 agent 那条还没答完的 ask（断线后它的 token 已失效、不清掉前端会反复弹失效旧弹窗、
+  // 用户答了必 410 把 runStatus 打回 error、形成多弹窗并发 + 死循环）。
+  // 返回的 pendingQuestions = 用户没答完的那组问题：非空 → 新 agent 断点续传原样重问；空 → 走 restart_intent。
+  const pendingQuestions = await supersedePendingAsks(fresh.id, "agent 断线重启");
 
   const patchedTask = await patchAction(fresh.id, action.id, { status: "running" });
   const patchedAction =
@@ -1629,6 +1714,7 @@ const restartCurrentActionInner = async (
     userInstruction: buildRestartActionInstruction(
       effectiveStartTask,
       effectiveStartAction,
+      pendingQuestions,
     ),
     branchCheckoutHint,
     apiKey: input.apiKey,

@@ -304,6 +304,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.17：修断线重启「多弹窗并发 + 死循环」+ ask 断点续传（2026-06-22）
+
+- **问题（用户实测）**：agent 正 `ask_user` 提问时网络断开、用户点「重启当前阶段」→ 仨弹窗并发横跳关不完：上一轮提问窗 + restart_intent「按原计划继续」窗 + 「Agent 已断开」失效窗；用户答旧问题必 410（旧 agent 没了）→ runStatus 打回 error → 失效窗复活 → 死循环。
+- **根因**：重启 / 推进 / 停止时旧 agent 被 cancel、但它发起的那条未答 ask **没被作废**——token 永久失效却仍 pending。前端 `AskUserDialog` 只看「`ask_user_request` 有没有配对 `ask_user_reply`」决定弹不弹 → 这条孤儿 ask 反复复活、答了 410 标 error 死循环。
+- **修法（治本、力出一孔）**：① 新增 `supersedePendingAsks`（task-runner）——任何让旧 agent 终止的路径都作废未答 ask（补 `info` 事件标 `meta.supersededAskId`、**不**伪造 reply、**不**走 deferred 这种「用户主动放弃」语义、断网是被动打断）；② `restartCurrentAction` 把作废拿回的「你没答完的那组问题」交给新 agent **断点续传原样重问**（断在干活才走 restart_intent 确认方向）；③ `advanceTask`（推进）/ `stop`（停止）同类孤儿 ask 一并清（换 action / 主动停语义、只清不续传）；④ 判定逻辑下沉 `lib/ask-pending.ts` 单一源（`isAskReplied / isAskSuperseded / isAskSettled / findPendingAskEvent`、原散在前端 pendingEvent + rows + 后端 3 处）；⑤ 事件流失效 ask 显示中性「这组提问已失效（断线重启）」、不再假装「正在等你答」。
+- 验证：typecheck + lint 全绿、vitest **130 全过**（新增 `tests/ask-pending.test.ts` 18 条、含断线重启「旧作废 + 新已答 → 不复活」核心回归）。
+
 ### v0.8.12：append 已分批的 task 强制出新批次（2026-06-18）
 
 - **问题（实测线上 task t_…is2xsd #15 踩到）**：已分批（b1/b2、2/2 完成）的 task 追加需求时、plan agent 在 artifact 自判「补充小、不分批」没调 `set_plan_batches`（符合旧 §5.3「小可跳过」）→ 追加的 Task 8-10 不进任何批次 → 主页批次进度仍显示 2/2（看着像全完成）、追加需求游离、用户无法按批推进。根因：§5.3「小需求可不分批」对首次 plan 合理、但对「已分批 task 的 append」造成不一致。
@@ -311,12 +318,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **附带（修中文换行）**：① task 详情页标题行 `h1` + 容器加 `min-w-0`、修长标题把状态 badge 挤换行；② 批次表（`batch-plan-table`）状态列「待实现」被挤成「待实 / 现」——根因 shadcn `TableCell`(td) 默认无 `whitespace-nowrap`（只 `TableHead`(th) 有）、给状态 / 测试策略两窄列 td 补 nowrap + 图标 `shrink-0` + 状态列 `w-20`→`w-24`（v0.8.13 补）。
 - 暂缓：系统侧「隐式批次派生」兜底（agent 真违抗时自动把漏报范围归批）评估后暂不做——A 已治本、等观察到 A 不生效再补这层防御性冗余。
 - 验证：typecheck + lint 全绿。
-
-### v0.8.11：action timeline 重做 + 修 CI sqlite3 死依赖打包失败（2026-06-18）
-
-- **修 CI 打包失败（v0.8.7~v0.8.10 连挂 4 版的根因）**：`release.yml` electron job 的「修平台依赖」步还 hardcode 探测 + 装 + 验证 `sqlite3`，但 sqlite3 早已是死依赖（源码 0 引用、`pnpm-lock.yaml` 仅剩 overrides 声明、零实际包条目、standalone 产物根本不含它、test 包一直能正常 boot 证明运行时不需要）。standalone 里没有 sqlite3 → `node -p require('./node_modules/sqlite3/package.json')` 第一行直接炸 → win/mac 两个打包 job 全挂、release 卡在 draft。修：① step 8 删 sqlite3 三处（版本探测 / npm install / require 验证）、只留 `@cursor/sdk-<platform>` 平台包处理；② `package.json` 删 `overrides` + `pnpm.overrides` + `onlyBuiltDependencies` 里的 sqlite3；③ `pnpm install` 同步 lockfile（CI `--frozen-lockfile` 要求一致、本地已校验通过）。v0.8.6 之前 standalone 还含 sqlite3（那时有间接依赖引它）所以成功、v0.8.7 起依赖链断了但 CI / package.json 没同步清。
-- **action timeline 重做（UX）**：原一排灰字 chip 太素 + 点击抖动。改：① 去类型图标 / 连接段（之前加过、太宽 + 把整行撑到换行临界、点击时右侧文件名变宽触发换行抖动）；② **timeline 独占整行拿满宽度**、文件名从右侧同行挪到**下方单独一行 + 固定行高占位**（根治「文件名挤压 timeline 宽度 → 换行重排 → 抖动」、加载中文件名暂空也不塌行）；③ 选中态 = **靛蓝描边 + 靛蓝字、无填充底 / 无背景色**（ring 是 box-shadow 不占盒模型、不加 border / 不改 padding / 不改字重 ⇒ 选中前后几何零变化、点击不闪不抖）；④ 去掉 workbench header 右侧 action 单步状态指示（运行中 / 失败…用户拍板：历史态意义不大、还抢视线 + 变宽加剧抖动）；⑤ 切换 task 默认选中**最后一个（最近）action**（直接看最新产物、不再跟 `currentActionId`）。涉及 `action-timeline.tsx` / `action-workbench-header.tsx` / `tasks/[id]/page.tsx`。
-- 验证：typecheck + lint 全绿、lockfile `--frozen-lockfile` 通过、3 步打包 + test（8776）boot；产物确认无 sqlite3。
 
 ---
 

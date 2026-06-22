@@ -15,6 +15,12 @@
 
 ---
 
+### v0.8.11：action timeline 重做 + 修 CI sqlite3 死依赖打包失败（2026-06-18）
+
+- **修 CI 打包失败（v0.8.7~v0.8.10 连挂 4 版的根因）**：`release.yml` electron job 的「修平台依赖」步还 hardcode 探测 + 装 + 验证 `sqlite3`，但 sqlite3 早已是死依赖（源码 0 引用、`pnpm-lock.yaml` 仅剩 overrides 声明、零实际包条目、standalone 产物根本不含它、test 包一直能正常 boot 证明运行时不需要）。standalone 里没有 sqlite3 → `node -p require('./node_modules/sqlite3/package.json')` 第一行直接炸 → win/mac 两个打包 job 全挂、release 卡在 draft。修：① step 8 删 sqlite3 三处（版本探测 / npm install / require 验证）、只留 `@cursor/sdk-<platform>` 平台包处理；② `package.json` 删 `overrides` + `pnpm.overrides` + `onlyBuiltDependencies` 里的 sqlite3；③ `pnpm install` 同步 lockfile（CI `--frozen-lockfile` 要求一致、本地已校验通过）。v0.8.6 之前 standalone 还含 sqlite3（那时有间接依赖引它）所以成功、v0.8.7 起依赖链断了但 CI / package.json 没同步清。
+- **action timeline 重做（UX）**：原一排灰字 chip 太素 + 点击抖动。改：① 去类型图标 / 连接段（之前加过、太宽 + 把整行撑到换行临界、点击时右侧文件名变宽触发换行抖动）；② **timeline 独占整行拿满宽度**、文件名从右侧同行挪到**下方单独一行 + 固定行高占位**（根治「文件名挤压 timeline 宽度 → 换行重排 → 抖动」、加载中文件名暂空也不塌行）；③ 选中态 = **靛蓝描边 + 靛蓝字、无填充底 / 无背景色**（ring 是 box-shadow 不占盒模型、不加 border / 不改 padding / 不改字重 ⇒ 选中前后几何零变化、点击不闪不抖）；④ 去掉 workbench header 右侧 action 单步状态指示（运行中 / 失败…用户拍板：历史态意义不大、还抢视线 + 变宽加剧抖动）；⑤ 切换 task 默认选中**最后一个（最近）action**（直接看最新产物、不再跟 `currentActionId`）。涉及 `action-timeline.tsx` / `action-workbench-header.tsx` / `tasks/[id]/page.tsx`。
+- 验证：typecheck + lint 全绿、lockfile `--frozen-lockfile` 通过、3 步打包 + test（8776）boot；产物确认无 sqlite3。
+
 ### v0.8.10：API Key 进页面自动验证 + 展示账号信息（2026-06-18）
 
 - **进设置页自动验证**：以前 providers 已有 app 级模型预热、但设置页是另一个 `useModels` 实例不读缓存 → 用户进来要手动点「验证」才出模型。改成：配置加载完、有 apiKey 就自动拉一次（模型 + 账号信息、走 SWR 缓存秒出、`didInitValidate` ref 保证只跑一次）；apiKey 改完失焦（`onCommit`）也自动重验。
