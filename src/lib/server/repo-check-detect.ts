@@ -74,11 +74,30 @@ const detectPackageManager = async (
 };
 
 /**
+ * 脚本命令是否 watch 模式（含独立 `-w` / `--watch` flag）
+ *
+ * V0.8.19：watch 模式编译/lint 完不退出、一直挂着监听文件——被当 check 跑必然撞满 timeout 被杀
+ * （线上 cp-haomao 的 `"tsc": "node_modules/typescript/bin/tsc -w"` 被自动检测当 typecheck 拉进来、
+ *  三次 build 全 `timed_out` ~120s；且当时这 120s 还同步卡死 wait_for_user、把 agent 整懵、踩过）。
+ * 检测阶段就识别出 watch 脚本、不直接拿它当 check（typecheck 兜底换一次性命令、lint 直接跳过）。
+ *
+ * 匹配独立 token（前置行首/空白 + 词边界）、不误伤 `--ext .tsx` / `--noEmit` 这类含字母 w 的参数。
+ */
+export const isWatchScript = (script: string): boolean =>
+  /(?:^|\s)(?:-w|--watch)\b/.test(script);
+
+/**
  * Node / 前端仓检测——读 package.json.scripts、按白名单 script 名识别
  *
  * 第一版只输出 required 的 lint + typecheck：
- *   - lint：scripts.lint 存在 → `<pm> run lint`
+ *   - lint：scripts.lint 存在且非 watch → `<pm> run lint`
  *   - typecheck：scripts.typecheck 优先、否则 scripts.tsc → `<pm> run <typecheck|tsc>`
+ *
+ * V0.8.19 watch 防呆（不改变正常脚本的既有行为、只在脚本是 watch 时才走兜底分支）：
+ *   - 选中的 typecheck 脚本是 watch（如 `tsc -w`）→ 不用脚本、兜底跑一次性 `npx tsc --noEmit`、
+ *     且 required=false（这是我们替换猜的命令、不如项目脚本可信、降级只展示不挡 ship、沿用本模块
+ *     「宁可少挡不误挡」哲学）。
+ *   - lint 脚本是 watch → 直接跳过不加（watch 的 lint 罕见、且无标准一次性 fallback）。
  *
  * 故意不输出 test / build（第一版、用户拍板）：
  *   - test 慢 / 可能 watch / 依赖环境（DB·Redis）、且 CheckRun 跑期间 build 停在 running 会卡用户
@@ -99,11 +118,17 @@ const detectNodeChecks = async (
     const v = scriptMap[name];
     return typeof v === "string" && v.trim().length > 0;
   };
+  // 取脚本命令体（非字符串归一空串、配合 isWatchScript 用）
+  const body = (name: string): string => {
+    const v = scriptMap[name];
+    return typeof v === "string" ? v : "";
+  };
 
   const pm = await detectPackageManager(repoPath);
   const cmds: CheckCommand[] = [];
 
-  if (has("lint")) {
+  // lint 脚本非 watch 才加（watch 的 lint 没标准一次性兜底、跳过免得卡 timeout）
+  if (has("lint") && !isWatchScript(body("lint"))) {
     cmds.push({
       name: "lint",
       cmd: `${pm} run lint`,
@@ -121,14 +146,26 @@ const detectNodeChecks = async (
       ? "tsc"
       : null;
   if (typecheckScript) {
-    cmds.push({
-      name: "typecheck",
-      cmd: `${pm} run ${typecheckScript}`,
-      kind: "typecheck",
-      required: true,
-      timeoutMs: NODE_CHECK_TIMEOUT_MS,
-      source: "auto",
-    });
+    if (isWatchScript(body(typecheckScript))) {
+      // 选中的脚本是 watch（永不退出、当 check 必 timeout）→ 兜底跑一次性 tsc --noEmit、降级不挡 ship
+      cmds.push({
+        name: "typecheck",
+        cmd: "npx tsc --noEmit",
+        kind: "typecheck",
+        required: false,
+        timeoutMs: NODE_CHECK_TIMEOUT_MS,
+        source: "auto",
+      });
+    } else {
+      cmds.push({
+        name: "typecheck",
+        cmd: `${pm} run ${typecheckScript}`,
+        kind: "typecheck",
+        required: true,
+        timeoutMs: NODE_CHECK_TIMEOUT_MS,
+        source: "auto",
+      });
+    }
   }
 
   return cmds;

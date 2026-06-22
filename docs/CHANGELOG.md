@@ -15,6 +15,13 @@
 
 ---
 
+### v0.8.17：修断线重启「多弹窗并发 + 死循环」+ ask 断点续传（2026-06-22）
+
+- **问题（用户实测）**：agent 正 `ask_user` 提问时网络断开、用户点「重启当前阶段」→ 仨弹窗并发横跳关不完：上一轮提问窗 + restart_intent「按原计划继续」窗 + 「Agent 已断开」失效窗；用户答旧问题必 410（旧 agent 没了）→ runStatus 打回 error → 失效窗复活 → 死循环。
+- **根因**：重启 / 推进 / 停止时旧 agent 被 cancel、但它发起的那条未答 ask **没被作废**——token 永久失效却仍 pending。前端 `AskUserDialog` 只看「`ask_user_request` 有没有配对 `ask_user_reply`」决定弹不弹 → 这条孤儿 ask 反复复活、答了 410 标 error 死循环。
+- **修法（治本、力出一孔）**：① 新增 `supersedePendingAsks`（task-runner）——任何让旧 agent 终止的路径都作废未答 ask（补 `info` 事件标 `meta.supersededAskId`、**不**伪造 reply、**不**走 deferred 这种「用户主动放弃」语义、断网是被动打断）；② `restartCurrentAction` 把作废拿回的「你没答完的那组问题」交给新 agent **断点续传原样重问**（断在干活才走 restart_intent 确认方向）；③ `advanceTask`（推进）/ `stop`（停止）同类孤儿 ask 一并清（换 action / 主动停语义、只清不续传）；④ 判定逻辑下沉 `lib/ask-pending.ts` 单一源（`isAskReplied / isAskSuperseded / isAskSettled / findPendingAskEvent`、原散在前端 pendingEvent + rows + 后端 3 处）；⑤ 事件流失效 ask 显示中性「这组提问已失效（断线重启）」、不再假装「正在等你答」。
+- 验证：typecheck + lint 全绿、vitest **130 全过**（新增 `tests/ask-pending.test.ts` 18 条、含断线重启「旧作废 + 新已答 → 不复活」核心回归）。
+
 ### v0.8.12：append 已分批的 task 强制出新批次（2026-06-18）
 
 - **问题（实测线上 task t_…is2xsd #15 踩到）**：已分批（b1/b2、2/2 完成）的 task 追加需求时、plan agent 在 artifact 自判「补充小、不分批」没调 `set_plan_batches`（符合旧 §5.3「小可跳过」）→ 追加的 Task 8-10 不进任何批次 → 主页批次进度仍显示 2/2（看着像全完成）、追加需求游离、用户无法按批推进。根因：§5.3「小需求可不分批」对首次 plan 合理、但对「已分批 task 的 append」造成不一致。
