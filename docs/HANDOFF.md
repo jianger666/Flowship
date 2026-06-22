@@ -131,7 +131,7 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 **单 Run 内协议不变**（agent 视角无感知、它不知道自己会跑几个 action）：
 
 - 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → runner 写 `[NEXT_ACTION ...]` 接力
-- agent 跑完 action → 调 `wait_for_user(action_id)` → runner 把 action 标 `awaiting_ack` + 跑后置检查
+- agent 跑完 action → 调 `wait_for_user(action_id)` → runner **后台异步**跑后置检查（V0.8.18、不阻塞 wait_for_user 工具返回）、跑完再把 action 标 `awaiting_ack`
 - 用户 ack → wait-ack 写 `[ACTION_ACK approve|revise]` → agent 接着调 `wait_for_user(待命态)` 等下一指令
 - 终结 task → finalize 路由写 `[TASK_DONE]` / `[TASK_ABANDONED]` → agent 自然退出 Run；agent 不在 wait 挂起时 finalize 直接 `cancelTaskRun` 硬停（V0.6.27 B3）
 
@@ -189,7 +189,7 @@ V0.6.3 撤掉 build 写死的 `pnpm typecheck/lint`（多技术栈误报）后 b
 
 - **配置 + 快照链（V0.6.26 自动检测为主、手动 override）**：建 task 时 per-repo 走 `manual override > auto detect`——设置页 repo-card 手配了 `checkCommands`（`RepoCheckCommands` 编辑器）就用手配、没配则 `detectRepoCheckCommands`（`repo-check-detect.ts`）按 repo 文件结构自动识别（Node `<pm> run lint`+`typecheck`/`tsc`、Maven `mvn -DskipTests compile`、Gradle `<wrapper> compileTestJava`）→ 快照进 `Task.repoCheckCommands`（key=repoPath；server 读不到 localStorage、必须快照）。`CheckCommand { name; cmd; kind; required; timeoutMs?; source? }`、`source` ∈ manual/auto（审计 + 未来 UI 徽章、不影响执行）、`kind` ∈ typecheck/lint/unit-test/build/custom（仅给默认超时 + UI 分组、不影响执行）。手动 + 自动两条来源统一过 `task-fs.sanitizeCheckCommands`：归一非法 kind 防 `setTimeout(0)` 秒杀、硬上限每仓≤10 条 / name≤80 / cmd≤2000 / timeoutMs clamp[5s,30min]。
 - **产品语义三态（V0.6.26）**：设置页该仓检查命令**留空 = 自动检测**、**手动配置非空 = 覆盖自动检测**、**UI 暂不支持「禁用自动检测」**（清空 ≠ 禁用、等于回到自动检测——createTask 层 `repoCheckCommands[repo]=[]` 内部能表「禁用」、但 new-task-dialog / route 都 `length>0` 过滤、空数组到不了 server、第一版有意不暴露）。required 分级：Node lint/typecheck + Maven compile = `required=true`（挡 ship）、Gradle compileTestJava = `required=false`（Android/Kotlin 不通用、不自动挡 ship、用户可手动覆盖）。
-- **触发**：build agent 调 `wait_for_user(build_action_id)` → 现成 `awaitingNotifier` 跑 `runActionCheck` → `case "build"` 走 `checkBuild`（`action-checks.ts`）。**复用现有钩子、不新增 action 步骤**。check 跑期间 build 停在 running、跑完才 awaiting_ack（配了 test 的仓用户要等）。
+- **触发（V0.8.18 改后台异步）**：build agent 调 `wait_for_user(build_action_id)` → `awaitingNotifier` **立即返回**（wait_for_user 工具秒回、不阻塞）+ 后台起 `runActionPostCheck` 跑 `runActionCheck` → `case "build"` 走 `checkBuild`（`action-checks.ts`）。check 跑期间 build 仍停在 running、跑完才 awaiting_ack（配了 test 的仓用户要等）。**为什么必须后台**：check 同步 await 会把 wait_for_user 阻塞到超 Cursor SDK ~60s 工具超时、agent 误判失败乱来（线上踩过、详见「最近演进」v0.8.18）。配套 `runningChecks` map 去重 + `AbortSignal` 停止 / 推进 / 重启时杀子进程、check 落状态前校验「仍是当前 check + action 仍 running」否则丢弃（防状态交错）。
 - **执行**（`checkBuild` → `runRepoChecks` → `runCheckShell`）：遍历 `task.repoPaths`、按 `repoCheckCommands[repo]` 串行跑——`sh -c`（支持 `&&` / `cd` / 管道）· `detached` + 进程组 kill（超时连子进程一起杀防孤儿）· PATH 继承 runner + 补常见 bin · **每条命令跑前后比 `git status --porcelain --untracked-files=no`**、tracked 变了 = `mutatedWorktree`（命令偷改源码、如 `--fix`）判 failed。build 改动停在工作区（未 commit）、check 校验的正是这批改动。
 - **结果落盘**：完整输出落 `actions/.checks/<actionId>/<slug>.log`（`.checks` 隐藏目录不混进 artifact 列表、slug=`<idx>-<repo 末段>` 防多仓同名覆盖；单命令 output 累积 >512KB 截断打 `[output truncated]` 防内存爆）；摘要 `CheckRunSummary`（per-repo per-command status + logTail + **每仓 worktreeFingerprint**）落 `ActionRecord.checkRun`；`postCheck = { passed, details }` 复用红绿条。
 - **聚合**（V0.6.25 review 加固）：repo 级——required 命令挂 **或任一命令 mutated（污染工作区、无视 required）** → failed；没配命令的仓按是否被本次 build 改过分 `not_configured`（dirty、改了没检查）/ `skipped`（clean、没碰）。run 级——任一 repo failed → failed；**任一** repo not_configured → not_configured（不让「一个仓过」掩盖「另一个仓改了没检查」）；否则 passed（含 skipped 仓）。
@@ -304,20 +304,20 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.18：build 后置 CheckRun 改后台异步、修 wait_for_user 被 check 阻塞超时（2026-06-22）
+
+- **问题（线上 task t_…vcft9c 实测）**：agent 调用顺序错乱——「先报完成又继续思考做事」、甚至「不调 wait_for_user」。事件流见 wait_for_user 反复超时、agent 瞎编不存在的 `/wait` 端点 + read events 自救、「Action 产出完成」事件重复刷且跨 action 边界冒出（act_4 的 check 在 act_5 运行期间才落、状态交错）。
+- **根因**：build 的后置 CheckRun（用户配的 lint/typecheck、可达 120s）以前在 `awaitingNotifier` 里被 `wait_for_user` MCP 工具**同步 await**（工具 handler → safeNotifyAwaiting → notifier → runActionCheck）。于是 agent 调 wait_for_user 后工具阻塞到 check 跑完才返回、超过 Cursor SDK ~60s 工具超时 → agent 收到「wait_for_user 失败」乱来。对照组 `ask_user` 不跑 check、秒回成功 → agent 误以为只有 ask_user 能用。
+- **修法（治本）**：① 后置 check 改**后台异步**（`runActionPostCheck`、task-runner）——notifier 立即返回、agent 的 wait_for_user 秒回引导、第一时间挂 curl long-poll 等 ack；check 在后台跑、跑完再落 postCheck/checkRun + 切 awaiting_ack + 发「产出完成」事件。② `AbortSignal` 贯穿 `runActionCheck → checkBuild → runRepoChecks → runCheckShell`、停止 / 推进 / 重启 / 删除时 `abortRunningCheck` 杀掉 lint/typecheck 子进程树（不让它空跑几分钟）。③ 去重 + 防交错：一个 task 同时只一个在跑的 check（`runningChecks` map）、新一轮 wait 顶替旧的用最新代码重跑；check 落状态前两道校验「仍是当前 check（未被 abort/顶替）+ action 仍 running」、否则丢弃结果不写状态不发事件（根治「旧 action 的 check 在新 action 期间冒『产出完成』」）。
+- 遗留（未动）：「不 ack 直接推进新 action」时旧 action 停在 running 僵尸态——原本就在、不影响新 action、待后续评估是否在推进时标 cancelled。
+- 验证：typecheck + lint 全绿、vitest 130 全过。
+
 ### v0.8.17：修断线重启「多弹窗并发 + 死循环」+ ask 断点续传（2026-06-22）
 
 - **问题（用户实测）**：agent 正 `ask_user` 提问时网络断开、用户点「重启当前阶段」→ 仨弹窗并发横跳关不完：上一轮提问窗 + restart_intent「按原计划继续」窗 + 「Agent 已断开」失效窗；用户答旧问题必 410（旧 agent 没了）→ runStatus 打回 error → 失效窗复活 → 死循环。
 - **根因**：重启 / 推进 / 停止时旧 agent 被 cancel、但它发起的那条未答 ask **没被作废**——token 永久失效却仍 pending。前端 `AskUserDialog` 只看「`ask_user_request` 有没有配对 `ask_user_reply`」决定弹不弹 → 这条孤儿 ask 反复复活、答了 410 标 error 死循环。
 - **修法（治本、力出一孔）**：① 新增 `supersedePendingAsks`（task-runner）——任何让旧 agent 终止的路径都作废未答 ask（补 `info` 事件标 `meta.supersededAskId`、**不**伪造 reply、**不**走 deferred 这种「用户主动放弃」语义、断网是被动打断）；② `restartCurrentAction` 把作废拿回的「你没答完的那组问题」交给新 agent **断点续传原样重问**（断在干活才走 restart_intent 确认方向）；③ `advanceTask`（推进）/ `stop`（停止）同类孤儿 ask 一并清（换 action / 主动停语义、只清不续传）；④ 判定逻辑下沉 `lib/ask-pending.ts` 单一源（`isAskReplied / isAskSuperseded / isAskSettled / findPendingAskEvent`、原散在前端 pendingEvent + rows + 后端 3 处）；⑤ 事件流失效 ask 显示中性「这组提问已失效（断线重启）」、不再假装「正在等你答」。
 - 验证：typecheck + lint 全绿、vitest **130 全过**（新增 `tests/ask-pending.test.ts` 18 条、含断线重启「旧作废 + 新已答 → 不复活」核心回归）。
-
-### v0.8.12：append 已分批的 task 强制出新批次（2026-06-18）
-
-- **问题（实测线上 task t_…is2xsd #15 踩到）**：已分批（b1/b2、2/2 完成）的 task 追加需求时、plan agent 在 artifact 自判「补充小、不分批」没调 `set_plan_batches`（符合旧 §5.3「小可跳过」）→ 追加的 Task 8-10 不进任何批次 → 主页批次进度仍显示 2/2（看着像全完成）、追加需求游离、用户无法按批推进。根因：§5.3「小需求可不分批」对首次 plan 合理、但对「已分批 task 的 append」造成不一致。
-- **两层硬约束（治本、保证生效）**：① `prompts/action-plan.md` §5.3 / [REPLAN_MODE append] 段加硬约束「**已分过批次的 task、append 追加需求一律调 `set_plan_batches` 出 ≥1 新批次、不适用『小可跳过』**」、引导 agent 从 NEXT_ACTION 里的「本 task 已拆 N 批」字样判断；② `task-runner.ts` `buildPlanReplanDirective` 加 `task` 参数、注入 NEXT_ACTION 时按 `computeBatchProgress(task).total > 0`（已分批）→ 注入「⚠️ 本 task 已拆 N 批、追加需求必须出 ≥1 新批次」**动态硬指令**（带真实批次数、不给 agent「因小跳过」口子）；没分批历史的 append 维持原弹性按规模自判。`replanDirective` 由 advanceTask / restart 两处算好（都拿得到 task）、透传 `buildNextActionDirective` + `internalStartAgent`、覆盖续接 / 降级 / 新 Run / 重启**全部启动路径**。
-- **附带（修中文换行）**：① task 详情页标题行 `h1` + 容器加 `min-w-0`、修长标题把状态 badge 挤换行；② 批次表（`batch-plan-table`）状态列「待实现」被挤成「待实 / 现」——根因 shadcn `TableCell`(td) 默认无 `whitespace-nowrap`（只 `TableHead`(th) 有）、给状态 / 测试策略两窄列 td 补 nowrap + 图标 `shrink-0` + 状态列 `w-20`→`w-24`（v0.8.13 补）。
-- 暂缓：系统侧「隐式批次派生」兜底（agent 真违抗时自动把漏报范围归批）评估后暂不做——A 已治本、等观察到 A 不生效再补这层防御性冗余。
-- 验证：typecheck + lint 全绿。
 
 ---
 

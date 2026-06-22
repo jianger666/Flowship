@@ -24,6 +24,7 @@ import {
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
 import {
+  abortRunningCheck,
   cancelTaskRun,
   publishTaskStreamEvent,
   supersedePendingAsks,
@@ -50,6 +51,8 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
   const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
   cleanupChatTaskState(id);
+  // V0.8.18：取消正在后台跑的后置 check（杀 lint/typecheck 子进程、丢弃结果、不让它在停止后冒「产出完成」）
+  abortRunningCheck(id);
 
   // V0.6.8：run.cancel() 杀不到 agent 用 shell 拉起的孙子进程（如 `npm run lint`=`ng lint --fix`、
   // 会 orphan 后继续改写整个仓库）。这里主动清理落在本 task repoPaths 里的孤儿 / agent-shell 进程树。

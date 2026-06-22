@@ -22,7 +22,7 @@ import {
   setTaskUiLayout,
   updateTaskFields,
 } from "@/lib/server/task-fs";
-import { cancelTaskRun } from "@/lib/server/task-runner";
+import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import { cancelChatRun } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
 import type { CheckCommand, ModelSelection, TaskRole } from "@/lib/types";
@@ -230,6 +230,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // chat task 的 run 在 chat-runner 的 runningChats、cancelTaskRun 停不到、两个都试（同 stop route）
     if (!cancelTaskRun(id)) cancelChatRun(id);
     cleanupChatTaskState(id);
+    // V0.8.18：连带杀掉可能还在后台跑的后置 check 子进程（删 task 后 check 跑完也无处落、防孤儿）
+    abortRunningCheck(id);
     const ok = await deleteTask(id);
     if (!ok) return NextResponse.json({ error: "not_found" }, { status: 404 });
     return NextResponse.json({ ok: true });

@@ -61,9 +61,11 @@ export interface ActionCheckResult {
 }
 
 // 主入口：跑给定 action 的 deterministic 检查
+// signal（V0.8.18）：仅 build 用——后置 CheckRun 后台异步跑、停止 / 推进新 action 时 abort 杀子进程
 export const runActionCheck = async (
   task: Task,
   action: ActionRecord,
+  signal?: AbortSignal,
 ): Promise<ActionCheckResult> => {
   try {
     switch (action.type) {
@@ -72,7 +74,7 @@ export const runActionCheck = async (
       // build（V0.6.25 CheckRun）：per-repo 跑用户配的 checkCommands、不再写死 pnpm
       //   （绕开 V0.6.3 撤掉的「写死 pnpm 搞死多栈」：没配命令的仓记 not_configured、不误报）
       case "build":
-        return await checkBuild(task, action);
+        return await checkBuild(task, action, signal);
       // test：还没实现
       case "test":
         return {
@@ -520,8 +522,15 @@ const runCheckShell = (
   cwd: string,
   timeoutMs: number,
   maxOutputBytes = CHECK_OUTPUT_CAP,
+  // V0.8.18：外部取消信号（停止 / 推进新 action 时 abort、杀掉慢命令子进程树、不让 typecheck 空跑几分钟）
+  signal?: AbortSignal,
 ): Promise<CheckShellResult> =>
   new Promise((resolve) => {
+    // 已被取消 → 不起子进程、直接返回（结果由调用方按 aborted 丢弃）
+    if (signal?.aborted) {
+      resolve({ exitCode: -1, output: "[aborted]", timedOut: false });
+      return;
+    }
     let output = "";
     // 已达上限、之后输出直接丢弃（进程仍跑、只是不再收集、防内存爆）
     let truncated = false;
@@ -537,6 +546,13 @@ const runCheckShell = (
       timedOut = true;
       killProcessTree(proc);
     }, timeoutMs);
+    // 外部 abort（停止 / 推进）→ 杀整棵进程树、由 close 事件兜底 resolve
+    const onAbort = () => killProcessTree(proc);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
     // 累积 output、到上限就截断并打明显标记（否则用户看尾部以为命令自然结束）
     const append = (d: unknown) => {
       if (truncated) return;
@@ -551,7 +567,7 @@ const runCheckShell = (
     proc.stdout?.on("data", append);
     proc.stderr?.on("data", append);
     proc.on("error", (err) => {
-      clearTimeout(timer);
+      cleanup();
       resolve({
         exitCode: -1,
         output: output + `\n[spawn error] ${err.message}`,
@@ -559,7 +575,7 @@ const runCheckShell = (
       });
     });
     proc.on("close", (code) => {
-      clearTimeout(timer);
+      cleanup();
       resolve({ exitCode: code ?? -1, output, timedOut });
     });
   });
@@ -638,6 +654,8 @@ const runRepoChecks = async (
   repoPath: string,
   slug: string,
   commands: CheckCommand[],
+  // V0.8.18：透传给慢命令（lint/typecheck）的取消信号、停止/推进时杀子进程
+  signal?: AbortSignal,
 ): Promise<CheckRepoResult> => {
   // 该仓基底 commit
   const headRes = await runCheckShell("git rev-parse HEAD", repoPath, 15_000);
@@ -671,7 +689,7 @@ const runRepoChecks = async (
     // 跑前后各取一次 tracked 状态、变了 = 命令偷改了源码
     const before = await trackedWorktreeStatus(repoPath);
     const started = Date.now();
-    const r = await runCheckShell(c.cmd, repoPath, timeoutMs);
+    const r = await runCheckShell(c.cmd, repoPath, timeoutMs, undefined, signal);
     const durationMs = Date.now() - started;
     const after = await trackedWorktreeStatus(repoPath);
     const mutatedWorktree =
@@ -736,6 +754,7 @@ const runRepoChecks = async (
 const checkBuild = async (
   task: Task,
   action: ActionRecord,
+  signal?: AbortSignal,
 ): Promise<ActionCheckResult> => {
   const startedAt = Date.now();
   const repoResults: CheckRepoResult[] = [];
@@ -747,7 +766,7 @@ const checkBuild = async (
     const commands = task.repoCheckCommands?.[repoPath] ?? [];
     const slug = `${i}-${repoTailName(repoPath)}`;
     repoResults.push(
-      await runRepoChecks(task.id, action.id, repoPath, slug, commands),
+      await runRepoChecks(task.id, action.id, repoPath, slug, commands, signal),
     );
   }
 

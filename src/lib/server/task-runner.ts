@@ -736,6 +736,14 @@ interface RunningTaskRecord {
   cancel: () => void;
 }
 
+// V0.8.18：一个 action 正在后台跑的后置 check 句柄（见 runActionPostCheck）
+interface RunningCheck {
+  // 这个 check 属于哪个 action（结果有效性判定 + 去重用）
+  actionId: string;
+  // 停止 / 推进新 action / 被新一轮 wait 顶替时 abort、杀 lint/typecheck 子进程
+  controller: AbortController;
+}
+
 interface TaskRunnerGlobalState {
   // taskId → 运行中的 task 控制对象
   runningTasks: Map<string, RunningTaskRecord>;
@@ -744,10 +752,13 @@ interface TaskRunnerGlobalState {
   // V0.6：标记 task 即将被 force new agent（advanceTask forceNewAgent=true）
   // cancel 旧 run 时命中跳过 done、保留 SSE 通道给新 agent 用
   forkPendingTasks: Set<string>;
+  // V0.8.18：taskId → 正在后台跑的后置 check（一个 task 同时只一个、新的顶旧的）
+  runningChecks: Map<string, RunningCheck>;
 }
 
+// V3：2026-06-22 V0.8.18 加 runningChecks（后置 check 异步化、bump 防 dev hot reload 拿到旧 state 缺字段）
 // V2：2026-05-27 V0.6 上线、bump 版本号防 dev hot reload 拿到 V0.5 残留 state
-const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV2__";
+const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV3__";
 
 const getRunnerState = (): TaskRunnerGlobalState => {
   const g = globalThis as unknown as Record<
@@ -759,6 +770,7 @@ const getRunnerState = (): TaskRunnerGlobalState => {
       runningTasks: new Map(),
       subscribers: new Map(),
       forkPendingTasks: new Set(),
+      runningChecks: new Map(),
     };
   }
   return g[TASK_RUNNER_GLOBAL_KEY]!;
@@ -767,6 +779,7 @@ const getRunnerState = (): TaskRunnerGlobalState => {
 const runningTasks = getRunnerState().runningTasks;
 const subscribers = getRunnerState().subscribers;
 const forkPendingTasks = getRunnerState().forkPendingTasks;
+const runningChecks = getRunnerState().runningChecks;
 
 // ----------------- publish / subscribe -----------------
 
@@ -831,6 +844,149 @@ export const cancelTaskRun = (taskId: string): boolean => {
   if (!rec) return false;
   rec.cancel();
   return true;
+};
+
+/**
+ * V0.8.18：后台跑某 action 的后置 deterministic check（异步、不阻塞调用方）。
+ *
+ * # 为什么必须后台跑（线上踩过、本次修复的根因）
+ * build 的 CheckRun 跑用户配的 lint/typecheck（typecheck 可达 120s）。以前这段在 awaitingNotifier 里被
+ * `wait_for_user` MCP 工具**同步 await**（工具 handler → safeNotifyAwaiting → notifier → runActionCheck）、
+ * 于是 agent 调 `wait_for_user` 后工具要阻塞到 check 跑完才返回。超过 Cursor SDK ~60s 的工具超时 →
+ * agent 收到 wait_for_user「超时」→ 困惑乱来（反复重调、瞎编不存在的 /wait 端点、read events 自救）、
+ * 状态机被搅乱（`ask_user` 不跑 check 所以秒回成功、对比之下 agent 以为只有 ask_user 能用）。
+ * 改成：notifier 立即返回（agent 秒回引导、第一时间挂 curl long-poll 等 ack）、check 在这里后台跑、
+ * 跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
+ *
+ * # 去重 + 取消（消灭重复跑 + 状态交错）
+ * 一个 task 同时只允许一个在跑的 check（runningChecks）。新一轮 wait（如 revise 改完代码再 wait）会
+ * abort 旧的、用最新代码重跑。停止 / 推进新 action 调 abortRunningCheck。check 跑完前判「自己是否仍是
+ * 当前 check + action 是否仍在 running」——被顶替 / abort / action 已 cancelled → 丢弃结果、不写状态不发事件
+ * （否则会出现「旧 action 的 check 跑完后在新 action 运行期间冒出『产出完成』事件」的交错、线上踩过）。
+ */
+const runActionPostCheck = (
+  taskId: string,
+  actionId: string,
+  artifactPath: string | undefined,
+): void => {
+  // 顶替：同 task 已有在跑的 check（agent 反复 wait、或换了 action）→ abort 旧的、本轮用最新代码重跑
+  runningChecks.get(taskId)?.controller.abort();
+
+  const controller = new AbortController();
+  const self: RunningCheck = { actionId, controller };
+  runningChecks.set(taskId, self);
+
+  void (async () => {
+    // 结果是否仍由「自己」当家：被新一轮 check 顶替 / 被 abort（停止 / 推进）→ 不该写状态
+    const stillOwner = () =>
+      !controller.signal.aborted && runningChecks.get(taskId) === self;
+
+    let postCheck: ActionRecord["postCheck"] | undefined;
+    // build 的结构化校验摘要单独落 checkRun 字段（postCheck 只留 passed/details）
+    let checkRun: ActionRecord["checkRun"] | undefined;
+    try {
+      const fresh = await getTask(taskId);
+      const targetAction = fresh?.actions.find((a) => a.id === actionId);
+      if (fresh && targetAction) {
+        const result = await runActionCheck(
+          fresh,
+          targetAction,
+          controller.signal,
+        );
+        postCheck = { passed: result.passed, details: result.details };
+        checkRun = result.checkRun;
+        console.log(
+          `[task-runner] runActionPostCheck task=${taskId} action=${actionId} passed=${result.passed} details=${result.details.slice(0, 200)}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[task-runner] runActionPostCheck 异常 task=${taskId} action=${actionId}：`,
+        err,
+      );
+    }
+
+    // 被取消 / 顶替 → 丢弃结果、不写任何状态（防状态交错）
+    // ⚠️ 此处先「不」从 runningChecks 摘除自己——要一直挂到落完状态那刻、
+    //    好让落状态前的每个 await 点（下面的 getTask）都能被 abortRunningCheck（停止 / 推进）接住。
+    //    若在这就 delete、停止恰好插在「getTask 期间」会丢失 abort、旧 check 仍把已停止的 task 改回 awaiting_ack。
+    if (!stillOwner()) {
+      console.log(
+        `[task-runner] runActionPostCheck task=${taskId} action=${actionId} 结果作废（已 abort / 被顶替）`,
+      );
+      return;
+    }
+
+    // 再确认 action 仍在等 check（没被 stop 标 cancelled / 没被推进改状态）
+    const after = await getTask(taskId);
+    // getTask 这个 await 期间可能被停止 / 推进 abort（杀子进程 + 标 cancelled）→ 落状态前再查一次 owner
+    if (!stillOwner()) {
+      console.log(
+        `[task-runner] runActionPostCheck task=${taskId} action=${actionId} 结果作废（落状态前被 abort / 顶替）`,
+      );
+      return;
+    }
+    const a0 = after?.actions.find((a) => a.id === actionId);
+    if (!a0 || a0.status !== "running") {
+      console.log(
+        `[task-runner] runActionPostCheck task=${taskId} action=${actionId} 已非 running（${a0?.status ?? "缺失"}）、跳过落 awaiting_ack`,
+      );
+      // 正常收尾（不是被顶替）→ 摘除自己；带身份校验防误删后来者
+      if (runningChecks.get(taskId) === self) runningChecks.delete(taskId);
+      return;
+    }
+
+    // 落 check 结果 + 切 awaiting_ack（原 awaitingNotifier 同步分支尾段、整段搬到后台）
+    const patched = await patchAction(taskId, actionId, {
+      status: "awaiting_ack",
+      ...(postCheck ? { postCheck } : {}),
+      ...(checkRun ? { checkRun } : {}),
+    });
+    if (patched) {
+      publish(taskId, { kind: "task", task: patched });
+      const a = patched.actions.find((x) => x.id === actionId);
+      if (a) publish(taskId, { kind: "action", action: a });
+    }
+    const updated = await setTaskRunStatus(taskId, "awaiting_user", actionId);
+    if (updated) publish(taskId, { kind: "task", task: updated });
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      actionId,
+      text: `Action 产出完成、等待用户 ack${
+        artifactPath ? `（artifact=${artifactPath}）` : ""
+      }`,
+      meta: {
+        artifactPath,
+        // 留个标志位给将来 UI 调试面板用、文本里不展示
+        postCheckPassed: postCheck?.passed,
+        // 里程碑标记：UI 事件流默认展开（action 产出完成等 ack、用户要看 artifact 决定 approve / revise）
+        awaitingAck: true,
+      },
+    });
+    // 全部落完、摘除自己；带身份校验：万一落状态期间被新一轮 wait 顶替、别误删后来者
+    if (runningChecks.get(taskId) === self) runningChecks.delete(taskId);
+  })().catch((err) => {
+    // 兜底：落状态那段（patchAction / setTaskRunStatus）万一抛、别变成 unhandledRejection
+    console.error(
+      `[task-runner] runActionPostCheck 未捕获异常 task=${taskId} action=${actionId}：`,
+      err,
+    );
+    if (runningChecks.get(taskId) === self) runningChecks.delete(taskId);
+  });
+};
+
+/**
+ * V0.8.18：取消某 task 正在后台跑的后置 check（停止 / 推进新 action / 重启当前 action 时调）。
+ * abort 会杀掉 lint/typecheck 子进程树、且让 check 结果作废（不写 awaiting_ack、不发「产出完成」事件）。
+ */
+export const abortRunningCheck = (taskId: string): void => {
+  const cur = runningChecks.get(taskId);
+  if (!cur) return;
+  cur.controller.abort();
+  runningChecks.delete(taskId);
+  console.log(
+    `[task-runner] abortRunningCheck task=${taskId} action=${cur.actionId}`,
+  );
 };
 
 /**
@@ -1391,6 +1547,9 @@ const advanceTaskInner = async (
     checkOverride,
   } = input;
 
+  // V0.8.18：推进新 action 前、取消上一 action 可能还在后台跑的 check（结果对新 action 无意义、且防状态交错）
+  abortRunningCheck(task.id);
+
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
@@ -1591,6 +1750,8 @@ export const restartCurrentAction = async (
 const restartCurrentActionInner = async (
   input: RestartCurrentActionInput,
 ): Promise<{ action: ActionRecord }> => {
+  // V0.8.18：重启当前 action 前、取消它可能还在后台跑的旧 check（要重跑、且防旧结果污染新一轮）
+  abortRunningCheck(input.task.id);
   const fresh = await getTask(input.task.id);
   if (!fresh) throw new Error("task 不存在、无法重启当前 action");
   if (fresh.mode === "chat") {
@@ -2209,69 +2370,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       return;
     }
 
-    // awaiting_start：agent 完成一个 action 调 wait_for_user(action_id) → 切 action.status=awaiting_ack
+    // awaiting_start：agent 完成一个 action 调 wait_for_user(action_id) → 后台跑 check + 切 awaiting_ack
     //                 或 agent 待命 wait_for_user(待命态、不带 action_id) → 只切 runStatus=awaiting_user
     if (signal.actionId) {
-      // V0.6 门槛 2：先跑后置 deterministic 检查、把 postCheck 落到 ActionRecord
-      // 跑完无论 pass / fail 都切 awaiting_ack（用户看到结果再决定 approve / revise）
-      // 跑后置 deterministic 检查（V0.6 门槛 2）
-      // V0.6.0.1：检查结果只落到 action.postCheck 字段（meta.json 里）、不再 publish 到事件流给用户看
-      // 用户原话：「这个检查不应该给用户看吧、我理解这更像是调试内容」
-      // 想 debug 时直接看 data/tasks/<id>/meta.json 里对应 action 的 postCheck 字段、或者后续 UI 加「调试信息」折叠面板
-      let postCheck: ActionRecord["postCheck"] | undefined;
-      // V0.6.25 CheckRun：build 的结构化校验摘要单独落 checkRun 字段（postCheck 只留 passed/details）
-      let checkRun: ActionRecord["checkRun"] | undefined;
-      const fresh = await getTask(task.id);
-      const targetAction = fresh?.actions.find(
-        (a) => a.id === signal.actionId,
-      );
-      if (fresh && targetAction) {
-        try {
-          const result = await runActionCheck(fresh, targetAction);
-          // postCheck 只存 passed/details（复用红绿条）；checkRun 是 build 专属结构化明细、分开落
-          postCheck = { passed: result.passed, details: result.details };
-          checkRun = result.checkRun;
-          console.log(
-            `[task-runner] runActionCheck task=${task.id} action=${signal.actionId} passed=${result.passed} details=${result.details.slice(0, 200)}`,
-          );
-        } catch (err) {
-          console.warn(
-            `[task-runner] runActionCheck 异常 task=${task.id} action=${signal.actionId}：`,
-            err,
-          );
-        }
-      }
-
-      const patched = await patchAction(task.id, signal.actionId, {
-        status: "awaiting_ack",
-        ...(postCheck ? { postCheck } : {}),
-        ...(checkRun ? { checkRun } : {}),
-      });
-      if (patched) {
-        publish(task.id, { kind: "task", task: patched });
-        const a = patched.actions.find((x) => x.id === signal.actionId);
-        if (a) publish(task.id, { kind: "action", action: a });
-      }
-      const updated = await setTaskRunStatus(
-        task.id,
-        "awaiting_user",
-        signal.actionId,
-      );
-      if (updated) publish(task.id, { kind: "task", task: updated });
-      await writeEventAndPublish(task.id, {
-        kind: "info",
-        actionId: signal.actionId,
-        text: `Action 产出完成、等待用户 ack${
-          signal.artifactPath ? `（artifact=${signal.artifactPath}）` : ""
-        }`,
-        meta: {
-          artifactPath: signal.artifactPath,
-          // 留个标志位给将来 UI 调试面板用、文本里不展示
-          postCheckPassed: postCheck?.passed,
-          // 里程碑标记：UI 事件流默认展开（action 产出完成等 ack、用户要看 artifact 决定 approve / revise）
-          awaitingAck: true,
-        },
-      });
+      // V0.8.18：后置 deterministic check（build 的 lint/typecheck 可达 120s）改后台异步跑——
+      // 这样 notifier 立即返回、agent 的 wait_for_user 工具秒回引导、第一时间挂上 curl long-poll 等 ack
+      // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「wait_for_user 失败」乱来、线上踩过）。
+      // check 跑完再由 runActionPostCheck 落 postCheck/checkRun + 切 awaiting_ack + 发「产出完成」事件。
+      runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
     } else {
       // 待命态：runStatus 切 awaiting_user、currentActionId 留 null
       const updated = await setTaskRunStatus(task.id, "awaiting_user", null);
