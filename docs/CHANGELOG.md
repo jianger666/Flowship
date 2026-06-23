@@ -15,6 +15,14 @@
 
 ---
 
+### v0.8.18：build 后置 CheckRun 改后台异步、修 wait_for_user 被 check 阻塞超时（2026-06-22）
+
+- **问题（线上 task t_…vcft9c 实测）**：agent 调用顺序错乱——「先报完成又继续思考做事」、甚至「不调 wait_for_user」。事件流见 wait_for_user 反复超时、agent 瞎编不存在的 `/wait` 端点 + read events 自救、「Action 产出完成」事件重复刷且跨 action 边界冒出（act_4 的 check 在 act_5 运行期间才落、状态交错）。
+- **根因**：build 的后置 CheckRun（用户配的 lint/typecheck、可达 120s）以前在 `awaitingNotifier` 里被 `wait_for_user` MCP 工具**同步 await**（工具 handler → safeNotifyAwaiting → notifier → runActionCheck）。于是 agent 调 wait_for_user 后工具阻塞到 check 跑完才返回、超过 Cursor SDK ~60s 工具超时 → agent 收到「wait_for_user 失败」乱来。对照组 `ask_user` 不跑 check、秒回成功 → agent 误以为只有 ask_user 能用。
+- **修法（治本）**：① 后置 check 改**后台异步**（`runActionPostCheck`、task-runner）——notifier 立即返回、agent 的 wait_for_user 秒回引导、第一时间挂 curl long-poll 等 ack；check 在后台跑、跑完再落 postCheck/checkRun + 切 awaiting_ack + 发「产出完成」事件。② `AbortSignal` 贯穿 `runActionCheck → checkBuild → runRepoChecks → runCheckShell`、停止 / 推进 / 重启 / 删除时 `abortRunningCheck` 杀掉 lint/typecheck 子进程树（不让它空跑几分钟）。③ 去重 + 防交错：一个 task 同时只一个在跑的 check（`runningChecks` map）、新一轮 wait 顶替旧的用最新代码重跑；check 落状态前两道校验「仍是当前 check（未被 abort/顶替）+ action 仍 running」、否则丢弃结果不写状态不发事件（根治「旧 action 的 check 在新 action 期间冒『产出完成』」）。
+- 遗留（未动）：「不 ack 直接推进新 action」时旧 action 停在 running 僵尸态——原本就在、不影响新 action、待后续评估是否在推进时标 cancelled。
+- 验证：typecheck + lint 全绿、vitest 130 全过。
+
 ### v0.8.17：修断线重启「多弹窗并发 + 死循环」+ ask 断点续传（2026-06-22）
 
 - **问题（用户实测）**：agent 正 `ask_user` 提问时网络断开、用户点「重启当前阶段」→ 仨弹窗并发横跳关不完：上一轮提问窗 + restart_intent「按原计划继续」窗 + 「Agent 已断开」失效窗；用户答旧问题必 410（旧 agent 没了）→ runStatus 打回 error → 失效窗复活 → 死循环。

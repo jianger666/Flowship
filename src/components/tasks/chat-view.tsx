@@ -19,6 +19,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
@@ -27,10 +28,17 @@ import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
 import { ChatWorkdirPicker } from "@/components/tasks/chat-workdir-picker";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import { useDialog } from "@/hooks/use-dialog";
 import { prepareRunArgs } from "@/lib/run-args";
 import { RUN_STATUS_LABEL, RUN_STATUS_VARIANT } from "@/lib/task-display";
-import { sendChatReply, stopTask, type ImagePayload } from "@/lib/task-store";
+import {
+  sendChatReply,
+  stopTask,
+  updateTaskFields,
+  type ImagePayload,
+} from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
 interface Props {
@@ -56,6 +64,9 @@ export const ChatView = ({
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+
+  // 全局 prompt 弹窗（重命名对话用）
+  const { prompt } = useDialog();
 
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
@@ -145,6 +156,25 @@ export const ChatView = ({
     }
   }, [task.id]);
 
+  // 重命名对话：chat 模式去掉了新建弹窗、这个是唯一改名入口
+  // 走通用 prompt 拿新名 → PATCH 落盘 → 回填最新 task（复用 task 模式的 updateTaskFields）
+  const handleRename = useCallback(async () => {
+    const next = await prompt({
+      title: "重命名对话",
+      defaultValue: task.title,
+      placeholder: "对话名称",
+      validate: (v) => (v.trim() ? "" : "名称不能为空"),
+    });
+    // null=取消；与原名相同省去一次请求
+    if (next === null || next === task.title) return;
+    try {
+      const updated = await updateTaskFields(task.id, { title: next });
+      onTaskUpdateRef.current(updated);
+    } catch (err) {
+      toast.error(`重命名失败：${(err as Error).message}`);
+    }
+  }, [prompt, task.id, task.title]);
+
   // 输入框可用条件
   // - running：agent 在说话、disable
   // - isSubmitting：请求飞行中、disable 防双击
@@ -178,6 +208,17 @@ export const ChatView = ({
               <h1 className="truncate text-sm font-medium tracking-tight">
                 {task.title}
               </h1>
+              {/* 重命名：chat 模式没有编辑弹窗、这个铅笔是唯一改名入口 */}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="shrink-0 text-muted-foreground hover:text-foreground"
+                onClick={handleRename}
+                title="重命名对话"
+                aria-label="重命名对话"
+              >
+                <Pencil />
+              </Button>
               <Badge variant="outline" className="text-[10px]">
                 对话
               </Badge>

@@ -39,23 +39,17 @@ const isIconToken = (s?: string) => !s || /:icon-/.test(s);
 const renderParamLabel = (p: ModelParameter): string =>
   isIconToken(p.displayName) ? p.id : (p.displayName as string);
 
-const renderParamValue = (
-  p: ModelParameter,
-  v: { value: string; displayName?: string },
-): string => {
-  const base = isIconToken(v.displayName)
+const renderParamValue = (v: {
+  value: string;
+  displayName?: string;
+}): string =>
+  isIconToken(v.displayName)
     ? v.value === "true"
       ? "开"
       : v.value === "false"
         ? "关"
         : v.value
     : (v.displayName as string);
-  // context=1m = Cursor MAX mode、整个 run 按 token 折算请求数、给个警示后缀（沿用旧逻辑）
-  if (p.id.toLowerCase() === "context" && /^1m$/i.test(v.value)) {
-    return `${base}（MAX、按量计费）`;
-  }
-  return base;
-};
 
 // 选 base 模型时给个合理初始 params：优先取 variants 里 isDefault 的那组
 const defaultParamsFor = (
@@ -114,7 +108,7 @@ export const ModelSelect = ({
         const def = selectedModel?.parameters?.find((p) => p.id === sp.id);
         if (!def) return null;
         const vv = def.values.find((x) => x.value === sp.value);
-        return vv ? renderParamValue(def, vv) : null;
+        return vv ? renderParamValue(vv) : null;
       })
       .filter(Boolean);
     return paramSummary.length > 0 ? `${name} · ${paramSummary.join(" · ")}` : name;
@@ -259,7 +253,7 @@ export const ModelSelect = ({
                         disabled={disabled}
                         onClick={() => handlePickParam(p.id, v.value)}
                       >
-                        {renderParamValue(p, v)}
+                        {renderParamValue(v)}
                       </ChoiceButton>
                     ))}
                   </div>
