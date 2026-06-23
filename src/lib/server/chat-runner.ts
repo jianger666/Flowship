@@ -54,7 +54,7 @@ import {
 } from "./chat-mcp";
 import {
   chatWaitProtocolSection,
-  replyThenWaitReminder,
+  firstTurnReplyThenWaitReminder,
 } from "./wait-protocol-prompt";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
@@ -103,6 +103,9 @@ interface RunningChatRecord {
   // 本 Run 启动时绑定的模型（Agent.create 时定死、Run 期间不可变）。
   // 切模型懒重启用：用户切模型后发下条消息、chat-reply 比对「选中模型 vs 这个」决定续接还是起新 Run。
   model: ModelSelection;
+  // 本 Run 启动时绑定的 MCP 黑名单快照（启动时按它过滤 mcpServers、Run 期间不可变）。
+  // 切 MCP 懒重启用：用户改 MCP 开关后发下条消息、chat-reply 比对「现在 task 的黑名单 vs 这个」决定续接还是起新 Run。
+  disabledMcpServers: string[];
 }
 
 interface ChatRunnerGlobalState {
@@ -151,6 +154,13 @@ export const cancelChatRun = (taskId: string): boolean => {
  */
 export const getChatRunModel = (taskId: string): ModelSelection | null =>
   runningChats.get(taskId)?.model ?? null;
+
+/**
+ * 读当前活 chat Run 启动时绑定的 MCP 黑名单快照（无活 Run 返 null）。
+ * 切 MCP 懒重启用：chat-reply 收到新消息时、比对「现在 task 的黑名单 vs 这个」决定续接 or 重启。
+ */
+export const getChatRunDisabledMcp = (taskId: string): string[] | null =>
+  runningChats.get(taskId)?.disabledMcpServers ?? null;
 
 /**
  * 等当前 chat Run 真退（轮询 runningChats、退了返 true、超时返 false）。
@@ -320,9 +330,9 @@ const buildOpeningStanceSection = (
       "",
     );
   }
-  // recency 钉子：和续接路径（chat-mcp CHAT_REPLY_REMINDER）同一份单一源、钉在用户首条之后、
-  // 让 agent 最后读到的是「先成品再挂等」（治切模型懒重启「读历史 / 预告完没写成品就挂等」）
-  lines.push(replyThenWaitReminder(), "");
+  // recency 钉子：首轮专用强版（动作序列、见 wait-protocol-prompt 变体说明）、钉在用户首条之后、
+  // 让 agent 最后读到的是「先成品 → 紧接着挂等」（治首轮冷启动 / 切模型懒重启漏挂等）
+  lines.push(firstTurnReplyThenWaitReminder(), "");
   return lines;
 };
 
@@ -521,6 +531,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     startedAt: Date.now(),
     // 记下本 Run 绑定模型、供「切模型懒重启」比对（见 chat-reply route）
     model,
+    // 记下本 Run 绑定的 MCP 黑名单快照（下面 filterDisabledMcp 按它过滤）、供「切 MCP 懒重启」比对
+    disabledMcpServers: task.disabledMcpServers ?? [],
     cancel: () => {
       cancelled = true;
       cancelPending(task.id);

@@ -114,7 +114,7 @@ export const chatShellWaitGuideBody = (url: string): string =>
   ].join("\n");
 
 /**
- * 「回答完用户要的内容后、必调 wait_for_user」单一源提醒（chat 两条路径共用、recency 钉子）。
+ * 「回答完用户要的内容后、必调 wait_for_user」单一源提醒（recency 钉子）。
  *
  * 钉子钉两个最易翻的点、且这是 agent「调 wait 之前」唯一能拦住的位置：
  *   ① 先写成品（治「只预告『我这就写』、没写成品就挂等」——实测 composer-2.5 懒重启首轮就这么翻）
@@ -122,10 +122,23 @@ export const chatShellWaitGuideBody = (url: string): string =>
  * 为什么顺序提醒必须在钉子（recency 最强）、不能只靠每轮 wait 返回的引导（chatShellWaitGuideBody
  * 也讲「先确认正文发了」）：agent 看到那条时已经调了 wait_for_user、在挂等流程里、太晚——实测它
  * 「意识到顺序有误」却还是 curl 挂等了、没回头补写。
- * 两处引用、字符级一致、改一处全生效：
- *   - 起手 / 切模型懒重启：chat-runner buildOpeningStanceSection 末尾（钉在用户首条之后）
- *   - 续接对话：chat-mcp CHAT_REPLY_REMINDER（钉在每轮用户回复尾部）
  * 钉在「离用户消息最近、agent 下一步就是回复」的位置——模型不缺理解、缺眼前的执行提醒。
+ *
+ * 分首轮 / 续接两个变体（V0.8.21、对症「首轮冷启动最易漏挂等」——线上 opus 首轮答完没调
+ * wait_for_user、run 直接 finished 退出、第二轮起才正常）：
+ *   - replyThenWaitReminder（续接版、单句精简）：chat-mcp CHAT_REPLY_REMINDER 钉每轮用户回复尾部。
+ *     续接轮 agent 刚从 wait_for_user 返回、挂等惯性还在、单句够。
+ *   - firstTurnReplyThenWaitReminder（首轮版、动作序列）：chat-runner buildOpeningStanceSection
+ *     末尾用（冷启动 / 切模型懒重启首轮）。首轮 agent 无挂等惯性、且钉子被前面 rules/skills 稀释、
+ *     把「答完 → 挂等」讲成不可拆的两步收尾 + 点明漏第二步的后果（run 结束、对话中断）。
+ * 注意：dial back、不堆 🚨（见文件顶部设计原则）——首轮版也只是「动作序列 + why」、不是加强威胁。
  */
 export const replyThenWaitReminder = (): string =>
   "在回答完用户要的内容后，必须调用 `wait_for_user` 工具等待反馈结果。";
+
+/**
+ * 首轮专用强版钉子（见 replyThenWaitReminder 注释里的变体说明）。
+ * 把「答完 → 挂等」讲成不可拆的两步收尾动作序列、并点明漏第二步的后果（run 结束、对话中断）。
+ */
+export const firstTurnReplyThenWaitReminder = (): string =>
+  "这是你启动后的第一轮、也最容易漏挂等：先把答案写成正文发出 → 紧接着调 `wait_for_user` 挂等下一条。这两步是一轮的完整收尾、缺第二步 run 会就此结束、对话中断。";

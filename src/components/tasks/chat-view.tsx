@@ -26,6 +26,7 @@ import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
 import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
 import { ChatWorkdirPicker } from "@/components/tasks/chat-workdir-picker";
+import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
 import { EventStream } from "@/components/tasks/event-stream";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -260,6 +261,7 @@ export const ChatView = ({
             <>
               <ChatWorkdirPicker task={task} onTaskUpdate={onTaskUpdate} />
               <ChatBranchPicker task={task} />
+              <ChatMcpPicker task={task} onTaskUpdate={onTaskUpdate} />
             </>
           }
         />

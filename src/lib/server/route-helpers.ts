@@ -65,6 +65,22 @@ const canonicalModel = (m: ModelSelection): string => {
 export const modelEquals = (a: ModelSelection, b: ModelSelection): boolean =>
   canonicalModel(a) === canonicalModel(b);
 
+/**
+ * 字符串集合相等比对（顺序无关、去重后比）。
+ *
+ * 切 MCP 懒重启用：chat-reply 比对「当前 Run 绑定的 MCP 黑名单 vs 现在的」、
+ * 决定续接还是重启（改了又改回去 = 净变化 0 = 相等 = 不重启）。
+ */
+export const stringSetEquals = (a: string[], b: string[]): boolean => {
+  if (a.length !== b.length) return false;
+  const setB = new Set(b);
+  for (const x of a) {
+    if (!setB.has(x)) return false;
+  }
+  // 长度相等 + a 全在 b 里 + 去重后 b 不会更大（用 Set 比 size 兜重复项）
+  return setB.size === new Set(a).size;
+};
+
 // ----------------- Image 入参校验 -----------------
 
 /**

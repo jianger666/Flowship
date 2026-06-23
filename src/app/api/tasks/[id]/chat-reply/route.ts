@@ -58,6 +58,7 @@ import {
 import {
   cancelChatRun,
   forceClearChatRun,
+  getChatRunDisabledMcp,
   getChatRunModel,
   isChatRunning,
   runChatSession,
@@ -71,6 +72,7 @@ import {
   modelEquals,
   parseAndValidateImages,
   sleep,
+  stringSetEquals,
 } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -239,15 +241,21 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   if (pending && task.runStatus === "awaiting_user") {
-    // 切模型懒重启：用户可能在上轮答完后切了模型 / 调了参数（只存进 task.model、没动当前 Run）。
-    // 比对「当前 Run 绑定模型」vs「现在选的（bootArgs.model）」决定续接还是换模型重启。
+    // 切模型 / 切 MCP 懒重启：用户可能在上轮答完后切了模型 / 调了参数 / 改了 MCP 开关
+    //（只存进 task.model / task.disabledMcpServers、没动当前 Run）。
+    // 比对「当前 Run 绑定的 模型 + MCP 黑名单」vs「现在的」、任一变了就重启、都没变就续接。
     const runModel = getChatRunModel(task.id);
-    // 续接条件：没绑定模型可比 / 缺起新 Run 的 apiKey+model / 模型没变（含切了又切回）→ 同 Run 续接、省计费
+    // 当前 Run 绑定的 MCP 黑名单快照 vs 现在 task 的（task 是上面 getTask 读的最新值、PATCH 已生效）。
+    // runMcp === null = 没活 Run 可比（pending 时理论不会、防御性当作没变、走续接）。
+    const runMcp = getChatRunDisabledMcp(task.id);
+    const mcpUnchanged =
+      runMcp === null || stringSetEquals(runMcp, task.disabledMcpServers ?? []);
+    // 续接条件：没绑定模型可比 / 缺起新 Run 的 apiKey+model /（模型没变 且 MCP 没变）→ 同 Run 续接、省计费
     if (
       !runModel ||
       !bootArgs?.apiKey ||
       !isValidModel(bootArgs.model) ||
-      modelEquals(runModel, bootArgs.model)
+      (modelEquals(runModel, bootArgs.model) && mcpUnchanged)
     ) {
       submitUserMessage(task.id, text, imageAbsPaths, attachmentAbsPaths);
       const runningTask = await setTaskRunStatus(task.id, "running");
@@ -260,8 +268,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
     }
 
-    // 模型真变了 → 懒重启：取消旧 Run、等它真退（超时强清）、用新模型起新 Run（这条消息作首条）、
-    // 历史靠 events.jsonl 续上（跟「服务重启后再聊」同一条恢复路径、buildInitialPrompt 已给 agent eventsLogPath）
+    // 模型 或 MCP 变了 → 懒重启：取消旧 Run、等它真退（超时强清）、用新模型 + 新 MCP 集合起新 Run
+    //（这条消息作首条）、历史靠 events.jsonl 续上（跟「服务重启后再聊」同一条恢复路径、
+    // buildInitialPrompt 已给 agent eventsLogPath；新 Run 内 filterDisabledMcp 读 task 最新黑名单）
     cancelChatRun(task.id);
     const stopped = await waitForChatToStop(
       task.id,

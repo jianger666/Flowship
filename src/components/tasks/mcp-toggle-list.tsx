@@ -224,14 +224,18 @@ export const McpToggleList = ({
                   }}
                 />
               )}
-              {isPending ? (
-                <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-              ) : (
-                <Switch
-                  checked={!isDisabled}
-                  onCheckedChange={(checked) => void toggle(name, checked)}
-                />
-              )}
+              {/* 固定 h-5 w-9 格子（与 Switch 同尺寸）：toggle 期间 Switch ↔ Loader2 互换时
+                  行高恒定、不跳变——否则 popover 形态（ChatMcpPicker）下行高跳 4px 会触发重定位抖动 */}
+              <span className="flex h-5 w-9 shrink-0 items-center justify-center">
+                {isPending ? (
+                  <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                ) : (
+                  <Switch
+                    checked={!isDisabled}
+                    onCheckedChange={(checked) => void toggle(name, checked)}
+                  />
+                )}
+              </span>
             </li>
           );
         })}
