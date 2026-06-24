@@ -333,11 +333,12 @@ const prematureWaitRejects = getGlobalState().prematureWaitRejects;
 const PREMATURE_WAIT_REJECT_CAP = 2;
 
 // 兜底 A 拒绝时返回给 agent 的纠正文本（不给 curl / 不注册 pending entry——
-// 没有可挂等的 token、模型唯一出路就是先把答案写成正文、再重调 wait_for_user）。
+// 没有可挂等的 token、模型唯一出路就是把正文直接输出、再调 wait_for_user）。
+// M/C'：只在「message 空 + 用户在等回答 + 也没 stream 出正文」时才触发。
 const PREMATURE_WAIT_REJECT_TEXT = [
-  "[ANSWER_FIRST] 还没把回答写成正文发出去就想挂等——本次 wait_for_user 不予受理。",
-  "（用户看不到你的 thinking / 工具调用、只看得到你发出的正文；现在用户那边是空白。）",
-  "先把本轮的答案 / 可用分段写成一条正文消息发出去、再调 `wait_for_user`。",
+  "[ANSWER_FIRST] 你还没把回答交付给用户就想挂等——本次 wait_for_user 不予受理。",
+  "（用户看得到你直接输出的正文、但你这轮一个字的正文都没输出、用户那边一片空白。）",
+  "把本轮的答案 / 可用分段**直接输出**给用户（成品本身、不是「我这就写」的计划）、再调 `wait_for_user`（message 填一句话概括）。",
 ].join("\n");
 
 /**
@@ -894,10 +895,10 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 调用前提（按你所处模式自检）",
         "",
-        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id })`）**：本轮**已收到用户消息**时、调本工具前先把答案写成**一条正文消息**发出去（只调工具 / 跑脚本、或只说「我先查…我先写…」= 正文空 = 用户看到空白、不算回答）。**无用户消息**（起手等第一句）时可直接调。",
-        "- **Task 模式（action 容器）**：写完 artifact 就是交付、按下方 A / B 用法调本工具等 ack——**不必**再额外发一条总结正文（见下方「调用礼仪」）。",
+        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id, message })`）**：把回复**正文直接输出**给用户（正常说话、会实时流式显示）；`message` 参数只填**这一轮回复的一句话概括**（给历史 / 标题用、不是完整正文）。本轮已收到用户消息时、先把正文输出出来、再调本工具（message 填概括）；无用户消息（起手等第一句）时可不带 message 直接调。",
+        "- **Task 模式（action 容器）**：写完 artifact 就是交付、按下方 A / B 用法调本工具等 ack——**不必**带 message（artifact 已是交付物、见下方「调用礼仪」）。",
         "",
-        "> 下方「硬性规则 / 两种用法 / 调用礼仪」只适用于 **Task 模式**；**Chat 模式**只需守住上面那条「答完正文再 wait」、与 action / artifact / approve / runner failed 无关、别把 task 待命态规则套到 chat 上。",
+        "> 下方「硬性规则 / 两种用法 / 调用礼仪」只适用于 **Task 模式**；**Chat 模式**只需守住上面那条「正文直接输出、message 填概括、再 wait」、与 action / artifact / approve / runner failed 无关、别把 task 待命态规则套到 chat 上。",
         "",
         "## 硬性规则（task 模式、不遵守 ai-flow runner 会把任务标 failed）",
         "",
@@ -925,6 +926,12 @@ const buildMcpServer = (): McpServer => {
       ].join("\n"),
       inputSchema: {
         task_id: z.string().describe("任务 id（agent 启动时被告知）"),
+        message: z
+          .string()
+          .optional()
+          .describe(
+            "【Chat 模式：填这一轮回复的一句话概括】给历史记录 / 标题用、不是完整正文——回复正文请直接输出给用户（会实时流式显示）。Task 模式 / chat 起手等第一句时不用传。",
+          ),
         action_id: z
           .string()
           .optional()
@@ -939,33 +946,44 @@ const buildMcpServer = (): McpServer => {
           ),
       },
     },
-    async ({ task_id, action_id, artifact_path }) => {
+    async ({ task_id, message, action_id, artifact_path }) => {
       console.log(
-        `[chat-mcp] wait_for_user 入参 task_id=${task_id} action_id=${action_id ?? "<待命>"} artifact_path=${artifact_path ?? "<none>"}`,
+        `[chat-mcp] wait_for_user 入参 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<待命>"} artifact_path=${artifact_path ?? "<none>"}`,
       );
 
-      // V0.8.x 兜底 A：仅 chat 模式 + 待命态（不带 action_id）才检测 premature wait。
-      // task 模式的 wait_for_user 是 action 内 ack（artifact 已落 = 已交付）、语义不同、不掺。
-      // premature = 这一轮做了工具调用但没把答案写成正文就想挂等 → 不给 curl、责令先发正文。
-      // 不注册 pending entry / 不通知 awaiting：模型没有可挂等的 token、唯一出路就是补正文再重调。
+      // M/C'（text-delta + 概括）：chat 回复正文走「直接输出」（text-delta、case "assistant" 流式展示）、
+      // message 只填一句话概括、纯做「逼 composer 先产出正文再挂等」的钩子、不展示给用户
+      //（task 模式 wait 是 action 内 ack、artifact 已落 = 已交付、语义不同、不掺）。
+      // 仅 chat + 待命态（不带 action_id）走这套：
+      //   - message 非空（概括）= composer 声明本轮已回复 → 清拒绝计数、放行挂等（概括不展示、正文已 text-delta 流式展示）
+      //   - message 空 → 兜底 A（读 events 判定）：只有「用户在等回答 + 本轮也没 stream 出任何正文」才拦
+      //     （premature）。两个合法空场景不误拦：① chat 起手无首条 = 无 obligation = 放行；
+      //     ② agent 把正文走了 text-delta = hasAnswered = 不拦（M/C' 正常路径、正文已流式展示）。
       if (chatModeTasks.has(task_id) && !action_id) {
-        const rejected = prematureWaitRejects.get(task_id) ?? 0;
-        if (
-          rejected < PREMATURE_WAIT_REJECT_CAP &&
-          (await detectPrematureChatWait(task_id))
-        ) {
-          prematureWaitRejects.set(task_id, rejected + 1);
-          console.warn(
-            `[chat-mcp] wait_for_user 兜底拦截 premature wait：task=${task_id} 第 ${rejected + 1} 次（上限 ${PREMATURE_WAIT_REJECT_CAP}）`,
-          );
-          return {
-            content: [
-              { type: "text" as const, text: PREMATURE_WAIT_REJECT_TEXT },
-            ],
-          };
+        const chatMsg = (message ?? "").trim();
+        if (chatMsg.length > 0) {
+          if ((prematureWaitRejects.get(task_id) ?? 0) > 0) {
+            prematureWaitRejects.delete(task_id);
+          }
+        } else {
+          const rejected = prematureWaitRejects.get(task_id) ?? 0;
+          if (
+            rejected < PREMATURE_WAIT_REJECT_CAP &&
+            (await detectPrematureChatWait(task_id))
+          ) {
+            prematureWaitRejects.set(task_id, rejected + 1);
+            console.warn(
+              `[chat-mcp] wait_for_user 兜底拦截 premature wait：task=${task_id} 第 ${rejected + 1} 次（上限 ${PREMATURE_WAIT_REJECT_CAP}）`,
+            );
+            return {
+              content: [
+                { type: "text" as const, text: PREMATURE_WAIT_REJECT_TEXT },
+              ],
+            };
+          }
+          // 正常放行（或已达上限放弃拦截）→ 清计数、下一轮从头算
+          if (rejected > 0) prematureWaitRejects.delete(task_id);
         }
-        // 正常放行（或已达上限放弃拦截）→ 清计数、下一轮从头算
-        if (rejected > 0) prematureWaitRejects.delete(task_id);
       }
 
       // V0.6.31 自动纠正：上一次 ack 是 revise 且 agent 还没闭环（没带原 action_id 回来）时——

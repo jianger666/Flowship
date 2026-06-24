@@ -82,16 +82,16 @@ export const chatWaitProtocolSection = (taskId: string): string =>
   [
     "## 怎么和用户对话（核心机制）",
     "",
-    "你是**长期在线**的对话 agent。每一轮：**（要查先查清楚）→ 把答案写成一条正文发出 → 调 `wait_for_user` → 安静等下一条 → 再下一轮**、无限循环。守住这个循环是你唯一要做的事。",
+    "你是**长期在线**的对话 agent。每一轮：**（要查先查清楚）→ 把回复正文直接写出来（正常输出、会一字一字实时显示给用户）→ 调 `wait_for_user` 挂等下一条 → 再下一轮**、无限循环。守住这个循环是你唯一要做的事。",
     "",
     "几个关键：",
-    "- 用户只看得到你发的**正文**（看不到你的思考 / 工具调用）。所以「答案」就是写出来的那条正文——只调了工具、或只说「我先查…我先写…」而正文没东西 = 用户那边一片空白、不算回答。要查的先查清楚、要写的真的写出来、再发。",
-    `- 正文发出后、才调 \`wait_for_user(task_id="${taskId}")\`（用户看不到这步、别预告别解释）；它返回一段带 curl 的引导、调 \`shell\` 跑那条 curl 挂着等。`,
+    "- **回复正文直接输出**——就是你正常说话、会实时流式显示给用户。要查的先查清楚、要写的真写出来（让你写一整篇作文、就把整篇直接输出）。别只说「我先查…我先写…」就去挂等 = 没交付、用户看到的是一句空话。",
+    `- 正文输出完、调 \`wait_for_user(task_id="${taskId}", message="这一轮回复的一句话概括")\`：\`message\` 只填**这轮回复的一句话概括**（给历史记录 / 标题用、别重复整段正文）。调用它 = 立即返回带 curl 的引导、调 \`shell\` 跑那条 curl 挂着等下一条（这步用户看不到、别预告别解释）。`,
     "- curl 输出 `[USER_REPLY] <文本>` = 用户回了 → 回到第一步（再查 / 再答 / 再挂等）；`[CANCELLED]` = 收尾退出。",
     "",
     waitDisciplineSection(),
     "",
-    "想跟用户确认什么、**直接发一段话问**（别调 `ask_user`、那是 task 模式的、chat 里禁用）。",
+    "想跟用户确认什么、**直接在正文里问**（别调 `ask_user`、那是 task 模式的、chat 里禁用）。",
   ].join("\n");
 
 /**
@@ -102,43 +102,42 @@ export const chatWaitProtocolSection = (taskId: string): string =>
  */
 export const chatShellWaitGuideBody = (url: string): string =>
   [
-    "先确认：用户本轮要的东西、**已经写成一条正文发出去了吗？** 只调了工具 / 跑了脚本、或只说「我先…」而正文没东西 = 用户看到的是空白——是的话先补一条带内容的正文、再跑下面的 curl。",
-    "",
+    // M/C' 实测（text-delta + 概括）：本轮回复正文走「直接输出」（text-delta 真流式、用户实时看到）、
+    // wait_for_user 的 message 只填一句话概括。这里只讲 curl 怎么跑 + 下一轮怎么继续。
     shellCurlRunSection(url),
     "",
     "stdout：",
     "- `[KEEPALIVE ts=...]` 每 60 秒一行 = 心跳、忽略。",
-    "- `[USER_REPLY] <文本>` = 新一轮消息 → 先处理它（要查先查、要写就写出来）→ 把答案写成一条正文发出 → **再调 `wait_for_user` 重新挂等**。哪怕用户只说「好的 / 谢谢」、或你回复里反问了用户、也回一句再挂等、回答完绝不结束 run。",
+    "- `[USER_REPLY] <文本>` = 新一轮消息 → 先处理它（要查先查、要写就真写出来）→ **把回复正文直接输出、再调 `wait_for_user`（message 填一句话概括）重新挂等**。哪怕用户只说「好的 / 谢谢」、或你想反问用户、也把那句话直接输出再挂等、回答完绝不结束 run。",
     "- `[CANCELLED]` = 收尾结束 run。",
     "- 若提示「重复调用 / 循环」= 误报、忽略继续等。",
   ].join("\n");
 
 /**
- * 「回答完用户要的内容后、必调 wait_for_user」单一源提醒（recency 钉子）。
+ * 「回复正文直接输出 + wait_for_user.message 填概括」单一源提醒（recency 钉子）。
  *
- * 钉子钉两个最易翻的点、且这是 agent「调 wait 之前」唯一能拦住的位置：
- *   ① 先写成品（治「只预告『我这就写』、没写成品就挂等」——实测 composer-2.5 懒重启首轮就这么翻）
- *   ② 再调 wait_for_user（治漏调——漏调 = run 结束 = 破坏单 run）
- * 为什么顺序提醒必须在钉子（recency 最强）、不能只靠每轮 wait 返回的引导（chatShellWaitGuideBody
- * 也讲「先确认正文发了」）：agent 看到那条时已经调了 wait_for_user、在挂等流程里、太晚——实测它
- * 「意识到顺序有误」却还是 curl 挂等了、没回头补写。
+ * M/C' 实测（text-delta + 概括）：chat 回复正文走「直接输出」（text-delta 真流式、用户实时看到）、
+ * wait_for_user 的 `message` 只填一句话概括（见 chatWaitProtocolSection）。
+ * 钉子钉两个最易翻的点：
+ *   - 治「只说『我这就写 / 我先查』就挂等、没真把正文输出」——实测 composer-2.5 把计划复述当交付
+ *   - 治漏调 wait_for_user（漏调 = run 结束 = 破坏单 run）——正文输出完必须调它挂等下一条
  * 钉在「离用户消息最近、agent 下一步就是回复」的位置——模型不缺理解、缺眼前的执行提醒。
  *
- * 分首轮 / 续接两个变体（V0.8.21、对症「首轮冷启动最易漏挂等」——线上 opus 首轮答完没调
- * wait_for_user、run 直接 finished 退出、第二轮起才正常）：
+ * 分首轮 / 续接两个变体（对症「首轮冷启动最易翻」——线上 opus 首轮漏挂等 run finished、
+ * composer-2.5 首轮把「我先写」宣告当交付）：
  *   - replyThenWaitReminder（续接版、单句精简）：chat-mcp CHAT_REPLY_REMINDER 钉每轮用户回复尾部。
- *     续接轮 agent 刚从 wait_for_user 返回、挂等惯性还在、单句够。
- *   - firstTurnReplyThenWaitReminder（首轮版、动作序列）：chat-runner buildOpeningStanceSection
- *     末尾用（冷启动 / 切模型懒重启首轮）。首轮 agent 无挂等惯性、且钉子被前面 rules/skills 稀释、
- *     把「答完 → 挂等」讲成不可拆的两步收尾 + 点明漏第二步的后果（run 结束、对话中断）。
- * 注意：dial back、不堆 🚨（见文件顶部设计原则）——首轮版也只是「动作序列 + why」、不是加强威胁。
+ *     续接轮 agent 刚从 wait_for_user 返回、惯性还在、单句够。
+ *   - firstTurnReplyThenWaitReminder（首轮版、点明 why）：chat-runner buildOpeningStanceSection
+ *     末尾用（冷启动 / 切模型懒重启首轮）。首轮 agent 无惯性、且钉子被前面 rules/skills 稀释、
+ *     强调「正文要真输出成品、不是计划复述」。
+ * 注意：dial back、不堆 🚨（见文件顶部设计原则）——首轮版也只是「点明 why」、不是加强威胁。
  */
 export const replyThenWaitReminder = (): string =>
-  "在回答完用户要的内容后，必须调用 `wait_for_user` 工具等待反馈结果。";
+  "回复用户时，把要说的完整内容**直接写出来**（会实时显示给用户）、再调 `wait_for_user`（message 填一句话概括）挂等下一条。";
 
 /**
  * 首轮专用强版钉子（见 replyThenWaitReminder 注释里的变体说明）。
- * 把「答完 → 挂等」讲成不可拆的两步收尾动作序列、并点明漏第二步的后果（run 结束、对话中断）。
+ * 点明 message 的角色（用户唯一看得到的通道）+ 要成品不要计划复述。
  */
 export const firstTurnReplyThenWaitReminder = (): string =>
-  "这是你启动后的第一轮、也最容易漏挂等：先把答案写成正文发出 → 紧接着调 `wait_for_user` 挂等下一条。这两步是一轮的完整收尾、缺第二步 run 会就此结束、对话中断。";
+  "这是你启动后的第一轮：把给用户的**完整答案直接写出来**（正常输出、会一字一字实时显示）、然后调 `wait_for_user`（message 填一句话概括）交付并挂等。别只说「我这就写」就挂等——那样用户看到的是一句空话。要的是成品本身（让你写作文就把整篇直接输出）。";
