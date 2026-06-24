@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronUp, Plug, Plus } from "lucide-react";
 import { toast } from "sonner";
+import type { McpServerConfig } from "@cursor/sdk";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -51,13 +52,35 @@ import {
 
 const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
 
-// task 模式创建强制依赖的飞书 MCP——按 url 域名认、不认 key 名（别人把 key 叫 lark-mcp、
+// task 模式创建强制依赖的飞书 MCP——按域名认、不认 key 名（别人把 key 叫 lark-mcp、
 // my-feishu 也能识别、只要它连的是飞书）。整个「需求 → PR」流程的命脉：plan 拉 story /
 // build 摸需求 / ship @ 测试人员全靠它。chat 模式不强制（自由对话不依赖飞书）。
+// 两种配法都兼容：① url 远程型（url 含域名）② stdio 命令型（域名藏在 command/args/env、
+//   如 npx @lark-project/mcp --domain https://project.feishu.cn）。
 const REQUIRED_FEISHU_MCP: { host: string; label: string }[] = [
   { host: "mcp.feishu.cn", label: "飞书 MCP" },
   { host: "project.feishu.cn", label: "飞书项目 MCP" },
 ];
+
+// 把单个 MCP server 配置里「所有可能出现飞书域名的字符串」拼成一段、供域名 substring 匹配。
+// - url 远程型：url 字段（如 https://project.feishu.cn/mcp_server/v1）
+// - stdio 命令型：command + args + env 值都扫（域名常作 --domain 参数塞 args、token 塞 env）
+const collectMcpHaystack = (cfg: McpServerConfig): string => {
+  const parts: string[] = [];
+  if ("url" in cfg && typeof cfg.url === "string") parts.push(cfg.url);
+  if ("command" in cfg && typeof cfg.command === "string") {
+    parts.push(cfg.command);
+  }
+  if ("args" in cfg && Array.isArray(cfg.args)) {
+    for (const a of cfg.args) {
+      if (typeof a === "string") parts.push(a);
+    }
+  }
+  if ("env" in cfg && cfg.env && typeof cfg.env === "object") {
+    for (const v of Object.values(cfg.env)) parts.push(String(v));
+  }
+  return parts.join("\n");
+};
 
 interface Props {
   onCreated: (task: Task) => void;
@@ -137,16 +160,16 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   const [submitting, setSubmitting] = useState(false);
 
   // 「未配置 or 本次被关掉」的飞书 MCP——非空则禁止创建（飞书是任务命脉）。
-  // 判定：启用的 server（key 不在本次黑名单）里、有没有 url 命中飞书域名；没命中 = 缺。
+  // 判定：启用的 server（key 不在本次黑名单）的配置里、有没有命中飞书域名；没命中 = 缺。
+  //   配置扫 url + command/args/env（兼容 url 远程型 + stdio 命令型两种配法）。
   // mcpLoading 时先按「不缺」处理、避免列表没拉回来就误报缺失闪一下红。
   const missingFeishuMcp = useMemo(() => {
     if (mcpLoading) return [];
-    const enabledUrls = Object.entries(mcpServers)
+    const enabledHaystacks = Object.entries(mcpServers)
       .filter(([key]) => !disabledMcp.includes(key))
-      .map(([, cfg]) => ("url" in cfg ? cfg.url : ""))
-      .filter(Boolean);
+      .map(([, cfg]) => collectMcpHaystack(cfg));
     return REQUIRED_FEISHU_MCP.filter(
-      (m) => !enabledUrls.some((u) => u.includes(m.host)),
+      (m) => !enabledHaystacks.some((h) => h.includes(m.host)),
     );
   }, [mcpLoading, mcpServers, disabledMcp]);
 
