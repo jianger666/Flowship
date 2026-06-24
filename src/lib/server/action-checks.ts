@@ -48,6 +48,7 @@ import type {
 import { CHECK_KIND_DEFAULT_TIMEOUT_MS } from "@/lib/types";
 
 import { getActionArtifactPath, getCheckLogPaths } from "./task-fs";
+import { isMutatingScript } from "./repo-check-detect";
 import { getEffectiveCwd } from "@/lib/path-utils";
 
 export interface ActionCheckResult {
@@ -648,6 +649,35 @@ const isRepoDirty = async (repoPath: string): Promise<boolean> => {
   return r.exitCode === 0 && r.output.trim().length > 0;
 };
 
+// 命令会不会「自动改写工作区源码」（跑前预判、避免在用户工作区跑 --fix 类命令）（V0.8.20）
+// 两条识别路径：
+//   1) cmd 字符串本身含修复 flag（用户在设置页手配的裸命令、如 `eslint --fix src`）
+//   2) cmd 是 `<pm> run <script>`、解析 repo package.json 里该 script 体含修复 flag
+//      ——识破 `ng lint --fix=true` 这种藏在 script 内部、cmd 字面看不出来的；
+//        且覆盖「存量 task 已把 `yarn run lint` 固化进 repoCheckCommands」的场景
+//        （探测层 isMutatingScript 过滤只对新建 task 生效、老 task 数据里命令已落库）。
+// 读不到 package.json / 非标准命令格式 → 返 false（无法判定、fail-open、交给事后 mutated 检测兜底）。
+const willCommandMutateWorktree = async (
+  cmd: string,
+  repoPath: string,
+): Promise<boolean> => {
+  if (isMutatingScript(cmd)) return true;
+  const m = cmd.trim().match(/^(?:pnpm|yarn|npm|bun)\s+run\s+([\w:.-]+)/);
+  if (!m) return false;
+  const scriptName = m[1]!;
+  try {
+    const pkgRaw = await fs.readFile(
+      path.join(repoPath, "package.json"),
+      "utf-8",
+    );
+    const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, unknown> };
+    const body = pkg.scripts?.[scriptName];
+    return typeof body === "string" && isMutatingScript(body);
+  } catch {
+    return false;
+  }
+};
+
 const runRepoChecks = async (
   taskId: string,
   actionId: string,
@@ -682,6 +712,30 @@ const runRepoChecks = async (
   const logBlocks: string[] = [];
 
   for (const c of commands) {
+    // V0.8.20：跑前预判命令会不会自动改写工作区（--fix/--write 类）。会的话直接跳过不跑——
+    // 避免 ① 污染工作区被事后判 failed（误红）；② 用户本地 dev server 被连环触发热重载、
+    // 终端「一直重启」（线上 cp-admin 的 `ng lint --fix=true` 跑满 120s、期间 dev 每 3s 重编译、踩过）。
+    // 修复型命令本就不是只读门禁、跳过记 skipped + 原因、不计入 failed（下方聚合排除 skipped）。
+    if (await willCommandMutateWorktree(c.cmd, repoPath)) {
+      const skipNote =
+        "跳过：该命令会自动改写源码（检测到 --fix/--write 类修复 flag）、不当只读门禁跑。如需 lint 门禁，请在设置页把命令改成只读形式（去掉 --fix）。";
+      results.push({
+        name: c.name,
+        cmd: c.cmd,
+        kind: c.kind,
+        required: c.required,
+        status: "skipped",
+        exitCode: 0,
+        durationMs: 0,
+        mutatedWorktree: false,
+        logTail: skipNote,
+      });
+      logBlocks.push(
+        `=== ${c.name}（${c.cmd}）[跳过：会改写工作区] ===\n${skipNote}`,
+      );
+      continue;
+    }
+
     const timeoutMs =
       c.timeoutMs && c.timeoutMs > 0
         ? c.timeoutMs
@@ -733,17 +787,28 @@ const runRepoChecks = async (
     );
   }
 
-  // repo 聚合（V0.6.25 review）：
-  //   - required 命令非 passed → failed
-  //   - 任一命令污染工作区（mutated）→ failed：污染是独立安全语义、无视 required
-  //     （否则误配 eslint --fix 之类、required=false 时改了源码还能绿灯、ship 就会带上偷改的代码）
+  // repo 聚合（V0.6.25 review + V0.8.20 skipped 处理）：
+  //   - mutated（任一命令偷改工作区）→ failed：污染是独立安全语义、无视 required
+  //     （兜底「没被跑前预判拦住的 --fix」；正常情况已在 willCommandMutateWorktree 拦截、走 skipped）
+  //   - required 命令非 passed → failed；但 skipped（会改写、跑前主动跳过）不算失败、排除在外
+  //   - 配了命令却「全被跳过」（没有任何真正执行的只读门禁）→ 退回 commands.length===0 语义：
+  //     本仓被本次 build 改过（dirty）记 not_configured（ship 要确认）、没碰记 skipped
+  const executed = results.filter((x) => x.status !== "skipped");
   const mutated = results.some((x) => x.mutatedWorktree);
-  const requiredFailed = results.some(
+  const requiredFailed = executed.some(
     (x) => x.required && x.status !== "passed",
   );
+  let repoStatus: CheckRepoResult["status"];
+  if (mutated || requiredFailed) {
+    repoStatus = "failed";
+  } else if (executed.length === 0) {
+    repoStatus = (await isRepoDirty(repoPath)) ? "not_configured" : "skipped";
+  } else {
+    repoStatus = "passed";
+  }
   return {
     repoPath,
-    status: mutated || requiredFailed ? "failed" : "passed",
+    status: repoStatus,
     headCommit,
     worktreeFingerprint,
     logPath,

@@ -332,7 +332,7 @@ export type ReplanMode = "append" | "rebuild";
 
 /**
  * V0.6.25 CheckRun：单条 check 命令的执行结果
- * - status：passed（exit 0）/ failed（exit≠0）/ timed_out（超时强杀）/ skipped（预留、暂不用）
+ * - status：passed（exit 0）/ failed（exit≠0）/ timed_out（超时强杀）/ skipped（会改写工作区的 --fix/--write 类命令、跑前预判主动跳过、不当只读门禁、V0.8.20）
  * - mutatedWorktree：跑完该仓 tracked 文件被改了（命令偷改源码、如手滑配了 --fix）→ 视为不可信、判 failed
  * - logTail：末尾若干行（UI 摘要直接看）、完整输出在 CheckRepoResult.logPath 文件里
  */

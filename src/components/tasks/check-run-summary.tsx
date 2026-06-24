@@ -62,13 +62,21 @@ export const CheckRunSummaryCard = ({ checkRun }: Props) => {
             </Badge>
           </div>
 
-          {repo.status === "not_configured" ? (
+          {/* 仓级一句话说明（没配命令 / 配了但全跳过 / 没改动）；有命令则下方统一展开命令级明细 */}
+          {repo.status === "not_configured" && repo.commands.length === 0 && (
             <div className="text-muted-foreground">
               有改动但没配检查命令、ship 需确认
             </div>
-          ) : repo.status === "skipped" ? (
+          )}
+          {repo.status === "not_configured" && repo.commands.length > 0 && (
+            <div className="text-muted-foreground">
+              配的检查命令会改写源码、已跳过（无只读门禁、ship 需确认）
+            </div>
+          )}
+          {repo.status === "skipped" && repo.commands.length === 0 && (
             <div className="text-muted-foreground">本次没改动、跳过</div>
-          ) : (
+          )}
+          {repo.commands.length > 0 && (
             <div className="grid gap-1.5">
               {repo.commands.map((cmd) => {
                 // 失败 / 超时 / 偷改工作区 → 默认展开末尾日志定位问题

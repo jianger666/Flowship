@@ -87,6 +87,26 @@ export const isWatchScript = (script: string): boolean =>
   /(?:^|\s)(?:-w|--watch)\b/.test(script);
 
 /**
+ * 脚本是否会「自动改写工作区源码」（含 --fix / --write / --apply 等修复 flag）
+ *
+ * V0.8.20：lint 脚本带 --fix（如 `ng lint --fix=true` / `eslint --fix` / `prettier --write`）
+ * 会逐文件改写源码。被当后置 check 跑时有两个坑（线上 cp-admin 踩过）：
+ *   ① 污染工作区——`mutatedWorktree` 事后判 failed = 误红（业务代码本没问题）；
+ *   ② 用户本地若开着 dev server（`ng serve`/`vite` 等 watch），lint --fix 在跑的几十秒~数分钟里
+ *      持续改文件 → dev server 连环热重载、终端看起来「一直重启」（实测 `ng lint --fix=true`
+ *      跑满 120s 超时、期间 dev 每 3s 重编译一次）。
+ * 这类「修复型」脚本本质不是只读校验、不该当 required check、检测阶段就识别出来、不拉进来。
+ *
+ * 匹配独立 token 的修复 flag：
+ *   - `--fix` / `--fix=true`（eslint / ng lint）；用 negative-lookahead 排除 `--fix-dry-run`
+ *     （eslint 只读预览、不落盘、不算改写）
+ *   - `--write`（prettier）
+ *   - `--apply` / `--apply-unsafe`（biome 旧版；新版 biome 也用 `--write`、已被上面覆盖）
+ */
+export const isMutatingScript = (script: string): boolean =>
+  /(?:^|\s)(?:--fix(?!-dry-run)|--write|--apply)\b/.test(script);
+
+/**
  * Node / 前端仓检测——读 package.json.scripts、按白名单 script 名识别
  *
  * 第一版只输出 required 的 lint + typecheck：
@@ -127,8 +147,16 @@ const detectNodeChecks = async (
   const pm = await detectPackageManager(repoPath);
   const cmds: CheckCommand[] = [];
 
-  // lint 脚本非 watch 才加（watch 的 lint 没标准一次性兜底、跳过免得卡 timeout）
-  if (has("lint") && !isWatchScript(body("lint"))) {
+  // lint 脚本只在「既非 watch、又不会自动改写源码」时才加：
+  //   - watch（如 `eslint --watch`）：永不退出、当 check 必 timeout（V0.8.19）
+  //   - mutating（如 `ng lint --fix=true` / `eslint --fix`）：会改源码、污染工作区误判 failed
+  //     + 触发用户本地 dev server 连环热重载、终端「一直重启」（V0.8.20、线上 cp-admin 踩过）
+  // 两类都不是只读门禁、且无通用「只读化」兜底（去 --fix 要解析 script 内部、本模块不做）、直接跳过不加。
+  if (
+    has("lint") &&
+    !isWatchScript(body("lint")) &&
+    !isMutatingScript(body("lint"))
+  ) {
     cmds.push({
       name: "lint",
       cmd: `${pm} run lint`,
@@ -146,7 +174,11 @@ const detectNodeChecks = async (
       ? "tsc"
       : null;
   if (typecheckScript) {
-    if (isWatchScript(body(typecheckScript))) {
+    const tcBody = body(typecheckScript);
+    if (isMutatingScript(tcBody)) {
+      // 罕见：typecheck 脚本含 --fix/--write 会改写文件——同 lint、不当只读 check、跳过不加
+      // （tsc 本身没 --fix、一般命中不了；防极个别项目把格式化 fix 塞进 typecheck 脚本、V0.8.20）
+    } else if (isWatchScript(tcBody)) {
       // 选中的脚本是 watch（永不退出、当 check 必 timeout）→ 兜底跑一次性 tsc --noEmit、降级不挡 ship
       cmds.push({
         name: "typecheck",
