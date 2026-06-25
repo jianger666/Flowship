@@ -169,7 +169,6 @@ const TaskDetailPage = () => {
     task?.currentActionId,
     task?.title,
     task?.pinned,
-    task?.archived,
     task?.actions.length,
   ]);
 

@@ -905,7 +905,6 @@ export interface Task {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户手动置顶（排到任务列表最上）。缺省 / undefined = 未置顶。 */
   pinned?: boolean;
-  archived: boolean;
   createdAt: number;
   updatedAt: number;
   model?: ModelSelection;

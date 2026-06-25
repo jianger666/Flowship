@@ -305,7 +305,6 @@ interface TaskMetaV06 {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户置顶（缺省 false） */
   pinned?: boolean;
-  archived: boolean;
   createdAt: number;
   updatedAt: number;
   model?: ModelSelection;
@@ -349,7 +348,6 @@ const TaskMetaV06Schema = z
     mrs: z.array(z.looseObject({})),
     role: z.enum(["fe", "be", "adaptive"]),
     repoPaths: z.array(z.string()),
-    archived: z.boolean(),
     pinned: z.boolean().optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
@@ -667,7 +665,6 @@ const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     disabledMcpServers: meta.disabledMcpServers,
     removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
     pinned: meta.pinned,
-    archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
     model: meta.model,
@@ -698,7 +695,6 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
     pinned: meta.pinned,
-    archived: meta.archived,
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
     model: meta.model,
@@ -707,21 +703,6 @@ const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     lastActionType: lastAction?.type,
     lastActionStatus: lastAction?.status,
   };
-};
-
-// ----------------- 自动归档 -----------------
-
-// completed（merged）/ abandoned 且 7 天没动 → archived=true
-const AUTO_ARCHIVE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
-
-const shouldAutoArchive = (
-  repoStatus: RepoStatus,
-  archived: boolean,
-  updatedAt: number,
-): boolean => {
-  if (archived) return false;
-  if (repoStatus !== "merged" && repoStatus !== "abandoned") return false;
-  return Date.now() - updatedAt > AUTO_ARCHIVE_AFTER_MS;
 };
 
 // ----------------- 进程冷启动恢复 -----------------
@@ -842,21 +823,6 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
     }
 
     const summary = hydrateTaskSummary(raw);
-    if (shouldAutoArchive(summary.repoStatus, summary.archived, summary.updatedAt)) {
-      await withTaskLock(id, async () => {
-        const fresh = await readMetaRaw(id);
-        if (
-          fresh &&
-          isValidMetaShape(fresh) &&
-          shouldAutoArchive(fresh.repoStatus, fresh.archived, fresh.updatedAt)
-        ) {
-          fresh.archived = true;
-          await writeMeta(fresh);
-        }
-      });
-      summary.archived = true;
-    }
-
     summaries.push(summary);
   }
   return summaries;
@@ -1031,7 +997,6 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
         : undefined,
     model: input.model,
     pinned: false,
-    archived: false,
     createdAt: now,
     updatedAt: now,
   };
@@ -1050,7 +1015,7 @@ export const deleteTask = async (id: string): Promise<boolean> => {
 
 // updatedAt 落盘节流间隔——事件是高频流（每个 tool_call / thinking 一条）、原来每条
 // 都整写 meta.json + hydrateTask（全量重读 events.jsonl）是 O(N²) 写放大。updatedAt
-// 只影响列表排序 / 自动归档判断、5s 粒度足够。
+// 只影响列表排序、5s 粒度足够。
 const META_TOUCH_INTERVAL_MS = 5_000;
 const lastMetaTouchAt = new Map<string, number>();
 
@@ -1204,18 +1169,6 @@ export const setTaskRemoveSourceBranchOnMerge = async (
     if (!meta) return null;
     meta.removeSourceBranchOnMerge = value;
     meta.updatedAt = Date.now();
-    await writeMeta(meta);
-    return await hydrateTask(meta);
-  });
-
-export const setTaskArchived = async (
-  id: string,
-  archived: boolean,
-): Promise<Task | null> =>
-  withTaskLock(id, async () => {
-    const meta = await readMetaV06(id);
-    if (!meta) return null;
-    meta.archived = archived;
     await writeMeta(meta);
     return await hydrateTask(meta);
   });

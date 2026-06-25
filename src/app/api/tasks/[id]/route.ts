@@ -2,7 +2,7 @@
  * /api/tasks/[id]
  *
  *   GET    → 单任务详情（含 events + 各 action artifact）
- *   PATCH  → 元数据修改（archived / disabledMcpServers / uiLayout / V0.6.6 建任务字段）
+ *   PATCH  → 元数据修改（pinned / disabledMcpServers / uiLayout / V0.6.6 建任务字段）
  *   DELETE → 删除任务（连带 data/tasks/<id>/ 整个文件夹）
  *
  * V0.6 改造：cancelChat → cancelTaskRun（task-runner）
@@ -14,7 +14,6 @@ import { NextResponse } from "next/server";
 import {
   deleteTask,
   getTask,
-  setTaskArchived,
   setTaskDisabledMcpServers,
   setTaskModel,
   setTaskPinned,
@@ -47,7 +46,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
   try {
     const { id } = await params;
     const body = (await req.json()) as {
-      archived?: boolean;
       pinned?: boolean;
       disabledMcpServers?: string[] | null;
       uiLayout?: { artifactPanelSize?: number } | null;
@@ -68,13 +66,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       addRepoBranchTemplates?: Record<string, string>;
       addRepoCheckCommands?: Record<string, CheckCommand[]>;
     };
-
-    if (typeof body.archived === "boolean") {
-      const task = await setTaskArchived(id, body.archived);
-      if (!task)
-        return NextResponse.json({ error: "not_found" }, { status: 404 });
-      return NextResponse.json({ task });
-    }
 
     if (typeof body.pinned === "boolean") {
       const task = await setTaskPinned(id, body.pinned);
@@ -212,7 +203,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
 
     return NextResponse.json(
       {
-        error: "需要 archived / pinned / disabledMcpServers / uiLayout / 编辑字段 之一",
+        error: "需要 pinned / disabledMcpServers / uiLayout / 编辑字段 之一",
       },
       { status: 400 },
     );

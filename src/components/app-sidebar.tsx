@@ -10,7 +10,7 @@
  *  - 顶部一栏：新建任务 + 类型筛选图标（下拉单选 全部 / 任务 / 对话、localStorage 记忆）
  *  - toggle 不在侧栏内、常驻顶栏红绿灯右侧（位置固定不随开合跳）
  *  - 列表：置顶优先 + updatedAt 倒序
- *  - 「更早」折叠分组：自动归档（7 天没动）的任务收在这、默认折叠
+ *  - 「更早」折叠分组：updatedAt 超 7 天没动的任务收在这、默认折叠（置顶的不沉底）
  *  - 行尾 hover：置顶（已置顶常显高亮）/ 删除（二次确认）
  */
 
@@ -44,6 +44,9 @@ const FILTER_LABEL: Record<FilterMode, string> = {
   chat: "对话",
 };
 const FILTER_STORAGE_KEY = "fe-ai-flow:sidebar-filter";
+
+// 「更早」分组阈值：updatedAt 距今超 7 天没动 → 折进「更早」（纯前端展示分组、不落盘）
+const EARLIER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const AppSidebar = ({ open }: { open: boolean }) => {
   const router = useRouter();
@@ -79,6 +82,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   };
 
   // 先按 mode 过滤、再排序（置顶优先 → updatedAt 倒序）、最后拆活跃 / 更早两组
+  // 「更早」= updatedAt 距今超 7 天没动（纯前端按时间算、不落盘）；置顶任务永远算活跃、不沉底
   const { active, earlier } = useMemo(() => {
     const filtered = tasks.filter((t) => {
       if (filter === "task") return (t.mode ?? "task") === "task";
@@ -91,9 +95,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       if (ap !== bp) return bp - ap; // 置顶排最上
       return b.updatedAt - a.updatedAt;
     });
+    const earlierBefore = Date.now() - EARLIER_AFTER_MS;
     return {
-      active: sorted.filter((t) => !t.archived),
-      earlier: sorted.filter((t) => t.archived),
+      active: sorted.filter((t) => t.pinned || t.updatedAt >= earlierBefore),
+      earlier: sorted.filter((t) => !t.pinned && t.updatedAt < earlierBefore),
     };
   }, [tasks, filter]);
 
@@ -248,7 +253,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 />
               ))}
 
-              {/* 更早（自动归档）折叠分组 */}
+              {/* 更早（超 7 天没动）折叠分组 */}
               {earlier.length > 0 && (
                 <div className="mt-2">
                   <Button
@@ -263,7 +268,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                         earlierOpen && "rotate-90",
                       )}
                     />
-                    更早 ({earlier.length})
+                    更早（超 7 天）· {earlier.length}
                   </Button>
                   {earlierOpen && (
                     <div className="mt-0.5 flex flex-col gap-0.5">
