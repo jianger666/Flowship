@@ -15,6 +15,11 @@
 
 ---
 
+### v0.8.21：兼容 stdio 命令方式配置的飞书 MCP——新建任务校验不再只认 url（2026-06-24）
+
+- **问题**：同事用 `npx @lark-project/mcp --domain https://project.feishu.cn` 这种 stdio 命令方式配飞书项目 MCP（无 `url` 字段、域名在 args、token 在 env）、task 新建弹窗旧校验只看 `"url" in cfg` → 误判飞书 MCP 未配置、创建按钮一直置灰。
+- **改法**（`new-task-dialog.tsx`）：飞书 MCP 校验从「只扫 url 字段」改为新增 `collectMcpHaystack`——把单个 server 配置里 `url + command + args + env 值`全拼成一段、按域名（`mcp.feishu.cn` / `project.feishu.cn`）substring 匹配。两种配法都兼容：① url 远程型（域名在 url）；② stdio 命令型（域名藏 command/args/env）。按域名认、不认 key 名。
+
 ### v0.8.20：chat 体验三处打磨——工作目录 Open Recent picker + 对话重命名 + 模型 1M 去「按量计费」（2026-06-23）
 
 - **工作目录选择器（chat footer）改 Open Recent 模式**：原来点开下拉只有一个「选择文件夹」按钮、等于空壳多一步（用户实测嫌赘）。抄 codex / Cursor Agents / VS Code 共识：点开 = 顶部当前完整路径（不截断）+「最近」用过的目录一键切换 +「浏览…」选新目录 +「改用主目录」重置。最近目录走 `src/lib/recent-workdirs.ts`（localStorage MRU、去重 + 上限 5、纯本地便利、不进 config.json）。

@@ -224,7 +224,8 @@ export type ActionType =
   | "review"
   | "ship"
   | "test"
-  | "learn";
+  | "learn"
+  | "dev";
 
 export const ACTION_TYPES = [
   "plan",
@@ -233,7 +234,15 @@ export const ACTION_TYPES = [
   "ship",
   "test",
   "learn",
+  "dev",
 ] as const;
+
+/**
+ * V0.x：联调（dev action）的推送方式——推进 dialog 二选一、advance 时落 ActionRecord.devPushMode。
+ * - direct：本地基于 origin/dev merge feature 后直推（默认、最快触发流水线、省 MR review）
+ * - mr：提 PR（feature→dev、走 submit_mr、跟 ship 同一套落详情页 MR 列表 + 冲突门禁）
+ */
+export type DevPushMode = "direct" | "mr";
 
 /**
  * action 中文 label（UI 选 action / timeline 展示用、统一来源）
@@ -245,6 +254,7 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   ship: "提测",
   test: "AI 手测",
   learn: "沉淀",
+  dev: "联调",
 };
 
 /**
@@ -273,6 +283,7 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   ship: false,
   test: false,
   learn: false,
+  dev: false,
 };
 
 /**
@@ -513,6 +524,8 @@ export interface ActionRecord {
   sideEffects?: {
     mrs?: Array<{
       repoPath: string;
+      /** V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支）、区分同仓提测/联调 MR */
+      targetBranch?: string;
       mrUrl: string;
       mrVersion: number;
       branch: string;
@@ -546,6 +559,14 @@ export interface ActionRecord {
   requestedBatchIds?: string[];
 
   /**
+   * V0.x：联调（dev action）本次推送方式——推进 dialog 选、advance 时后端直接存（仅 dev action 有意义）
+   * - direct：本地 merge dev + 直推
+   * - mr：提 PR（feature→dev、走 submit_mr）
+   * 不存 = 非 dev action / 老数据（dev handler 读时兜底 direct）
+   */
+  devPushMode?: DevPushMode;
+
+  /**
    * 模型选择（V0.6 推进 dialog 高级选项支持切模型）
    * - 不存 = 沿用 task.model / settings.defaultModel
    */
@@ -573,6 +594,12 @@ export interface MRRecord {
    * V0.6.1：关联到 task.repoPaths 里的某个仓、单仓 task 时 = task.repoPaths[0]
    */
   repoPath: string;
+  /**
+   * V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支）。
+   * 同仓的提测 MR 和联调 MR 按 repoPath+targetBranch 区分（各自累计 version、各自关旧 MR、互不覆盖）。
+   * 老记录缺这字段 → 读时兜底当测试分支（历史上只有提测 MR、见 mrTargetBranchOf）。
+   */
+  targetBranch?: string;
   /**
    * 本仓累计 push 次数（首次 createMR 时 = 1、之后每次 ship 都 ++）
    * 跟 GitLab MR ID（iid）没关系、只是 ai-flow 内部计数

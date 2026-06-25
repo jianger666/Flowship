@@ -61,20 +61,31 @@ export const validateSubmitMr = async (
       error: `repo_path ${a.repoPath} 不属于本 task（合法仓：${task.repoPaths.join(", ") || "无"}）`,
     };
   }
-  // 2) action_id 必须是本 task 的 ship action（防把 MR 挂到错 action / 非 ship 阶段）
+  // 2) action_id 必须是本 task 的 ship 或 dev action（防把 MR 挂到错 action / 非提交阶段）
+  //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、共用 submit_mr 同一通道
   const action = task.actions.find((x) => x.id === a.actionId);
-  if (!action || action.type !== "ship") {
+  if (!action || (action.type !== "ship" && action.type !== "dev")) {
     return {
       ok: false,
-      error: `action_id ${a.actionId} 不是本 task 的 ship action`,
+      error: `action_id ${a.actionId} 不是本 task 的 ship / dev action`,
     };
   }
-  // 3) target_branch 必须是该仓「测试分支」（提测工作流、不许提到 master / 任意分支）
-  const expectedTarget = task.repoTestBranches?.[a.repoPath]?.trim() || "test";
+  // 3) target_branch 按 action 类型校验：提测→该仓测试分支（默认 test）、联调→该仓 dev 分支（必须显式配）。
+  //    一律不许提到 master / 任意分支。
+  const expectedTarget =
+    action.type === "dev"
+      ? task.repoDevBranches?.[a.repoPath]?.trim()
+      : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
+  if (!expectedTarget) {
+    return {
+      ok: false,
+      error: `该仓没配 dev 分支、联调无法提 PR（请去设置页给该仓配 dev 分支）：${a.repoPath}`,
+    };
+  }
   if (a.targetBranch !== expectedTarget) {
     return {
       ok: false,
-      error: `target_branch 必须是该仓测试分支「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
+      error: `target_branch 必须是该仓${action.type === "dev" ? " dev 分支" : "测试分支"}「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
     };
   }
   // 4) source_branch 必须是该仓 feature 分支、或一次性 <feature>__conflict 解冲突分支

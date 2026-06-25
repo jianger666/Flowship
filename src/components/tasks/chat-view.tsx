@@ -5,7 +5,7 @@
  *
  * 跟正经 task 模式（page.tsx 的 ResizablePanelGroup）的区别：
  *   - 不展示 ActionTimeline / ArtifactPanel / ContextDocs / MCP 面板 / repo / branch / role
- *   - 不展示推进 / 再聊聊 / 通过 / 终结 / 删除按钮（chat 就是临时聊、删除走首页卡片入口）
+ *   - 不展示推进 / 再聊聊 / 终结 / 删除按钮（chat 就是临时聊、删除走首页卡片入口）
  *   - 只有 EventStream + 底部输入框、用户随时发消息
  *
  * 跟 V0.5 ChatView 的区别：

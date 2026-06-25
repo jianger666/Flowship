@@ -27,7 +27,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { notFound, useParams } from "next/navigation";
 import {
   Ban,
-  CheckCircle2,
   ExternalLink,
   Flag,
   Loader2,
@@ -80,18 +79,22 @@ import {
 } from "@/lib/task-store";
 import {
   ACTION_LABEL,
+  MR_KIND_LABEL,
   REPO_STATUS_LABEL,
   REPO_STATUS_VARIANT,
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
   deriveEffectiveBatches,
   formatRepoPathsForDisplay,
+  mrKindOf,
+  mrTargetBranchOf,
 } from "@/lib/task-display";
 import { getEffectiveCwd, getRepoShortNames } from "@/lib/path-utils";
 import type {
   ActionRecord,
   ActionType,
   CheckOverride,
+  DevPushMode,
   ModelSelection,
   Task,
 } from "@/lib/types";
@@ -357,13 +360,12 @@ const TaskDetailPage = () => {
   // 上方 Cmd/Ctrl+J 快捷键用：能否打开「再聊聊」= 跟「再聊聊」按钮同条件（canAck 且没在提交 / 没开）
   canOpenReviseRef.current = canAck && !ackSubmitting && !reviseOpen;
 
-  // 推进按钮：任务非终结态 + agent 不在跑代码 + 当前没有待 ack 的 action
+  // 推进按钮：任务非终结态 + agent 不在跑代码
   //   - idle / error：没活 agent、推进会起新 Run
-  //   - awaiting_user + currentAction.status != awaiting_ack：agent 在待命态等下一指令、推进走 submitNextAction 续接
-  //   - awaiting_user + awaiting_ack：先 ack、本按钮隐藏（!canAck 兜底）
+  //   - awaiting_user（含当前 action 等 ack 时）：去掉「通过」按钮后、推进会隐式认可当前 action、
+  //     再走 submitNextAction 续接 / force-new 起新（V0.x 去掉了原先「先 ack 才解锁」的 !canAck 限制）
   const canAdvance =
     task.runStatus !== "running" &&
-    !canAck &&
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
 
@@ -404,6 +406,8 @@ const TaskDetailPage = () => {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（advance-dialog 仅 build 且 plan 拆批时给值）
     requestedBatchIds?: string[];
+    // V0.x：联调推送方式（advance-dialog 仅 dev 时给值、direct 直推 / mr 提 PR）
+    devPushMode?: DevPushMode;
     // V0.8.x：plan 重跑时的批次合并语义（追加补充 / 重建后续）
     replanMode?: "append" | "rebuild";
     // V0.6.25：ship gate override（advance-dialog 仅 ship 且最新 build 的 check 没过时给值）
@@ -419,6 +423,21 @@ const TaskDetailPage = () => {
       const model = input.model?.id ? input.model : args.model;
       // gitHost / gitToken / username 不在 prepareRunArgs 暴露字段里、单独读 settings
       const settings = getSettings();
+      // V0.x A 方案：带上设置页最新分支配置（只收本 task 各仓 + settings 找得到 + 非空）、
+      //   server 据此刷新 task 分支快照——设置页改了 dev/test/线上分支、老 task 下次推进就生效。
+      const repoBaseBranches: Record<string, string> = {};
+      const repoTestBranches: Record<string, string> = {};
+      const repoDevBranches: Record<string, string> = {};
+      for (const p of task.repoPaths) {
+        const repo = settings.repos.find((r) => r.path === p);
+        if (!repo) continue;
+        const ob = repo.onlineBranch?.trim();
+        if (ob) repoBaseBranches[p] = ob;
+        const tb = repo.testBranch?.trim();
+        if (tb) repoTestBranches[p] = tb;
+        const db = repo.devBranch?.trim();
+        if (db) repoDevBranches[p] = db;
+      }
 
       const res = await fetch(`/api/tasks/${task.id}/advance`, {
         method: "POST",
@@ -441,10 +460,25 @@ const TaskDetailPage = () => {
           removeSourceBranch: input.removeSourceBranch,
           // V0.6.23 build action：本次做哪些批次（仅 build 且 plan 拆批时有值、否则 undefined=全做）
           requestedBatchIds: input.requestedBatchIds,
+          // V0.x dev action：联调推送方式（direct 直推 / mr 提 PR）
+          devPushMode: input.devPushMode,
           // V0.8.x plan action：重跑方案时的批次合并语义
           replanMode: input.replanMode,
           // V0.6.25 ship action：CheckRun gate override（仅 ship 且最新 build 的 check 没过时有值）
           checkOverride: input.checkOverride,
+          // V0.x A 方案：设置页最新分支配置（server 据此刷新 task 分支快照、设置页改了下次推进生效）
+          repoBaseBranches:
+            Object.keys(repoBaseBranches).length > 0
+              ? repoBaseBranches
+              : undefined,
+          repoTestBranches:
+            Object.keys(repoTestBranches).length > 0
+              ? repoTestBranches
+              : undefined,
+          repoDevBranches:
+            Object.keys(repoDevBranches).length > 0
+              ? repoDevBranches
+              : undefined,
         }),
       });
       if (!res.ok) {
@@ -460,20 +494,6 @@ const TaskDetailPage = () => {
       toast.error(`推进失败：${(err as Error).message}`);
     } finally {
       setStarting(false);
-    }
-  };
-
-  // ---- ack：通过 ----
-  const handleApprove = async () => {
-    if (!currentAction) return;
-    setAckSubmitting(true);
-    try {
-      const updated = await submitActionAck(task.id, currentAction.id, "approve");
-      setTask(updated);
-    } catch (err) {
-      toast.error(`通过失败：${(err as Error).message}`);
-    } finally {
-      setAckSubmitting(false);
     }
   };
 
@@ -714,16 +734,29 @@ const TaskDetailPage = () => {
                     const tail =
                       mr.repoPath.split("/").filter(Boolean).pop() ?? mr.repoPath;
                     const versionTag = mr.version > 1 ? ` v${mr.version}` : "";
+                    // V0.x：标注提测 / 联调（同仓提测 MR→test 和联调 MR→dev 可并存、按目标分支区分）
+                    const kind = mrKindOf(
+                      mr,
+                      task.repoTestBranches,
+                      task.repoDevBranches,
+                    );
+                    const target = mrTargetBranchOf(mr, task.repoTestBranches);
                     return (
                       <a
-                        key={`${mr.repoPath}-${mr.version}`}
+                        key={`${mr.repoPath}-${target}-${mr.version}`}
                         href={mr.url}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
-                        title={`${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
+                        title={`${MR_KIND_LABEL[kind]} → ${target}\n${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
                       >
                         <ExternalLink className="size-3" />
+                        <Badge
+                          variant="outline"
+                          className="px-1 py-0 text-[10px] font-normal"
+                        >
+                          {MR_KIND_LABEL[kind]}
+                        </Badge>
                         {tail}
                         {versionTag}
                       </a>
@@ -737,32 +770,16 @@ const TaskDetailPage = () => {
           {/* 主操作区 */}
           <div className="flex items-center gap-2">
             {canAck && (
-              <>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setReviseOpen(true)}
-                  disabled={ackSubmitting}
-                  title={`想改 ${currentAction ? ACTION_LABEL[currentAction.type] : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
-                >
-                  <MessageCircleQuestion />
-                  再聊聊
-                </Button>
-                <Button
-                  variant="default"
-                  size="sm"
-                  onClick={handleApprove}
-                  disabled={ackSubmitting}
-                  title={`通过 ${currentAction ? ACTION_LABEL[currentAction.type] : ""}、等下一指令`}
-                >
-                  {ackSubmitting ? (
-                    <Loader2 className="animate-spin" />
-                  ) : (
-                    <CheckCircle2 />
-                  )}
-                  通过 {currentAction && ACTION_LABEL[currentAction.type]}
-                </Button>
-              </>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setReviseOpen(true)}
+                disabled={ackSubmitting}
+                title={`想改 ${currentAction ? ACTION_LABEL[currentAction.type] : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
+              >
+                <MessageCircleQuestion />
+                再聊聊
+              </Button>
             )}
             {canRestartCurrentAction && (
               <Button
@@ -778,7 +795,7 @@ const TaskDetailPage = () => {
             )}
             {canAdvance && (
               <Button
-                variant={canAck ? "ghost" : "default"}
+                variant="default"
                 size="sm"
                 onClick={() => setAdvanceDialogOpen(true)}
                 disabled={starting}

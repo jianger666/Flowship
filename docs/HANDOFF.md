@@ -62,7 +62,7 @@
 V0.5 phase chain（`plan → build → review`、固定顺序）已废弃、改为 **task 容器 + action 历史**：
 
 - **task** = 单个需求生命周期容器、多 MR / 多次推进、终态 `merged` / `abandoned`
-- **action** = 单次动作（plan / build / review / ship / test / learn）、任意触发、不强制顺序
+- **action** = 单次动作（plan / build / review / ship / dev 联调 / test / learn）、任意触发、不强制顺序
 
 ```
 新建 task → 推进 plan (#1) → ack → 推进 build (#2) → ack → 推进 review (#3) → ack
@@ -101,10 +101,11 @@ UI 卡片 / 详情页头部分两个 badge 显示。
 |---|---|---|---|
 | plan | ✅ 已实装 | 永远可 | artifact 存在 + 内容长度 >= 100 + 必备段（需求理解 / Task 拆分、V0.6.27）|
 | build | ✅ 已实装 | 永远可（V0.6.17 放开 plan 前置）| V0.6.25 CheckRun：per-repo 跑用户配的 checkCommands（typecheck/lint/test）+ 工作区污染检测 + 兄弟仓越权检测（V0.6.27）、详见下「Build 后置 CheckRun」段 |
-| review | ✅ 已实装 | 至少 1 个 build completed | 必备段（总评 / 需求对照 / bug 复审）+ 基底 commit 跟 HEAD 一致（V0.6.25 P1-2 修死代码正则）+ 工作区指纹未变（V0.6.27 只读硬校验）|
-| ship | ✅ 已实装 | 至少 1 个 build + settings 配 GitLab Host + PAT | `task.mrs[]` 覆盖所有 repoPath（URL 非空） + 跳仓有原因 |
-| test | 🚧 V0.6.2 | 至少 1 个 build | （未实现） |
-| learn | 🚧 V0.6.3 | `repoStatus = merged` + 整 task 只跑一次 | （未实现） |
+| review | ✅ 已实装 | 永远可（v0.8.23 去「先 build」流程前置）| 必备段（总评 / 需求对照 / bug 复审）+ 基底 commit 跟 HEAD 一致（V0.6.25 P1-2 修死代码正则）+ 工作区指纹未变（V0.6.27 只读硬校验）|
+| ship | ✅ 已实装 | settings 配 GitLab Host + PAT（v0.8.23 去「先 build」、只留技术前置）| `task.mrs[]` 覆盖所有 repoPath（URL 非空） + 跳仓有原因 |
+| dev（联调）| ✅ 已实装 v0.8.23 | 至少一仓配 dev 分支 | 直推无 MR 信任 artifact；提 PR 同 ship 门禁（URL 非空 + 冲突拦）|
+| test | 🚧 V0.6.2 | （stub、UI 灰掉「待上线」）| （未实现） |
+| learn | ✅ 已实装 | 永远可（v0.8.23 去「先有 completed action」）| 必备段 + checkLearn 证据验真 |
 
 stub action 的 prompt 文件存在（V0.6.2+ 设计草稿）、UI 推进 dialog 灰掉、runner 准入拒绝。
 
@@ -161,14 +162,14 @@ agent 调 wait_for_user / ask_user
 - **placeholder 动态**：按 action 类型 + task 状态变（has_bug + build → 「修哪个 bug」/ 首次 plan vs 再次 plan 不同）
 - **reuseAgent**（V0.6.27 语义反转）：默认不勾 = 起新 agent（可顺带临时换模型）、勾上 = 续用当前 agent（省 send 配额、review 勾了也强起新）
 
-### Ack：approve / revise（V0.6 简化）
+### Ack：再聊聊 + 推进隐式认可（v0.8.23 去掉「通过」按钮）
 
-V0.5 「通过 PHASE 高级配置 dialog」（切模型 / 换 agent）拆掉、ack 路径简化：
+ack 路径简化到只剩「再聊聊」、approve 收进「推进」：
 
-- **通过**：顶部「通过」按钮 → submitActionAck("approve") → 同 agent 接着等下一指令
+- **通过 = 推进**（v0.8.23）：删掉独立「通过」按钮——推进时若当前 action 还 `awaiting_ack`、`advanceTask` 先隐式认可它（续接走 `acknowledgeAction(approve)`、force-new/无活 agent 走 `patchAction(completed)` + 审计事件、认可后重读 task），少一次点击；HITL 不变（推进仍是人主动触发）。`canAdvance` 不再被 `!canAck` 卡、`inferDefaultActionType` 把 `awaiting_ack` 也算「这步做完」顺推下一类型；配 `setTaskAwaitingIfIdle`（锁内 compare-set）防 force-new 秒推 race。
 - **再聊聊（revise）**：「再聊聊」按钮 → ReviseDialog 写 feedback + 可选附图 → submitActionAck("revise", feedback, images) → 同 agent 改 artifact
 
-切模型 / 换 agent 现在统一在「推进」dialog 的高级选项里、ack 路径不再支持。
+切模型 / 换 agent 统一在「推进」dialog 的高级选项里。
 
 ### 6 个 Harness 门槛（V0.6 核心）
 
@@ -247,7 +248,8 @@ ship 实现要点：
 - **提测目标分支 per-repo（V0.6.7）**：MR target = 该仓的测试分支（`task.repoTestBranches[repoPath]`、建 task 时从设置页快照）、没配回退 `test`；agent 从 super prompt「仓库分支配置」段读、不探 `origin/HEAD`（那是默认主分支、跟提测工作流不符）
 - **PAT 不暴露给 agent**：agent 通过 MCP 工具 `submit_mr` 间接调、server 端凭 settings 闭包的 token 访问 GitLab；MCP 工具返结构化 JSON（`{ ok, mr_url, mr_iid, mr_version }`）
 - **多仓 task 每仓 1 条 MR**：`Task.gitBranches[]` / `Task.mrs[]` / `ActionRecord.sideEffects.mrs[]` 都按 `repoPath` 区分；某仓 `git diff` 为空时 agent 跳过、在 artifact 写跳过原因
-- **同分支累计 commit**：同 `repoPath` 多次 ship 不开新 MR、`task.mrs[repoPath]` 的 `version` 累加、保留 `createdAt` 首次值——`upsertMR(taskId, repoPath, ...)`
+- **同分支累计 commit**：同 `(repoPath, 目标分支)` 多次提交不开新 MR、`version` 累加、保留 `createdAt` 首次值——`upsertMR(taskId, repoPath, { targetBranch, ... })`（v0.8.23 去重键加目标分支、同仓提测 MR→test 和联调 MR→dev 各记各的）
+- **dev（联调）复用同一 GitLab 基建（v0.8.23）**：提 PR 模式跟 ship 共用 `submit_mr` + `MRRecord` + 冲突门禁、唯一区别 target = dev 分支；直推模式不提 MR（本地 merge dev 直推）。详见「最近演进」v0.8.23
 - **飞书 @ 测试人员（A+C 策略）**：首次 ship 由 agent 调飞书 MCP `get_workitem_brief` 自动探测（A、role_members 的 `member.key` 就是 user_key）、探不到时 ask_user 让用户填用户名（C、`search_user_info` 转 user_key）、结果通过 `set_feishu_testers` MCP 工具持久化到 `task.feishuTesterUserKeys`、后续 ship 直接复用。id 体系 = 飞书项目 user_key（2026-06-12 起、lark_user_id 被官方 MCP 封死、详见 action-ship.md §4）
 
 settings 新加 2 个全局字段：
@@ -304,16 +306,23 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.8.23：联调（dev）action + 分支配置同步 + 去「通过」按钮隐式认可 + task 做完给结论（2026-06-25）
+
+- **联调（dev）action 落地**（新 action 类型、把改动送 dev 分支触发联调流水线）：advance-dialog 选两种推送方式、`buildDevDirective` 把 `[DEV_PUSH_MODE]` 钉进 `[NEXT_ACTION]` 载荷——① **直推**：本地基于 `origin/<dev>` `checkout -B` 重置本地 dev、`merge --no-ff` 把 feature 合进来、`push origin dev:dev`（feature 全程不动、绝不 force）；② **提 PR**：push feature + 复用 ship 的 `submit_mr`（唯一区别 `target_branch` = dev 分支）。冲突处理两模式共用（直推在本地 dev 就地解 / 提 PR 走 `<feature>__conflict` 一次性分支、同 ship §3.6）。准入 = 至少一仓配 dev 分支（技术必需、没配不知推哪）；`checkDev` 直推无 MR 信任 artifact、提 PR 复用 ship 门禁（URL 非空 + 冲突拦）。**联调源分支绝不删**（`isDevSubmit ? false`、合入后还要继续开发/提测）。配套 `prompts/action-dev.md` + `chat-mcp` submit_mr describe 泛化 ship/dev。
+- **MR 数据模型扩展 targetBranch**（同仓提测 MR→test 和联调 MR→dev 并存）：`MRRecord.targetBranch` + `ActionRecord.sideEffects.mrs[].targetBranch`、`upsertMR` 去重键从 `repoPath` 改 `(repoPath, targetBranch)`——各自累计 version、各自关旧 MR、互不覆盖；老记录缺字段 → `mrTargetBranchOf` 兜底该仓测试分支、跟新提测 MR 正确合并不撞联调。`mrTargetBranchOf` / `mrKindOf`（判提测/联调）下沉 `task-display.ts` 前后端单一源；详情页 MR 链接标「提测/联调 → 目标分支」badge。
+- **分支配置同步（A 方案、治「设置页改了老 task 用不上」）**：建 task 时 base/test/dev 分支从设置页快照固化、后改不影响老 task。改：推进时 client（`page.tsx handleAdvance`）带本 task 各仓设置页最新 base/test/dev 分支 → `advance/route` sanitize 透传 → `advanceTask` 起 agent 注入前调 `refreshRepoBranches`（task-fs、upsert：只覆盖「绑了的仓 + 传来非空」、没传/空保留、防误清）刷 task 快照（放在准入 + appendAction + renderRepoBranchSection 之前、否则用旧快照）。advance-dialog 联调 chip 准入读设置页**实时** dev 分支（`liveDevBranches`、dialog 打开瞬间读、同 gitConfig 套路）不被旧快照挡。**limitation**：reuseAgent 续接时 super prompt「仓库分支配置」段仍是起 agent 时旧值（一次性注入）——但 server `submit-mr-guard` 用 task 最新值兜底校验、推不错分支；联调默认起新 agent、极边缘。
+- **去掉「通过」按钮 + 推进隐式认可**（HITL 不变、少一次点击）：详情页删「通过」按钮、只留「再聊聊」；`advanceTask` 推进时若当前 action 还 `awaiting_ack` 先隐式认可（续接走 `acknowledgeAction(approve)`、force-new/无活 agent 走 `patchAction(completed)` + 写审计事件、认可后重读 task 供准入），放在准入前；`canAdvance` 去掉 `!canAck` 限制、`inferDefaultActionType` 把 `awaiting_ack` 也算「这步做完」（build 刚完点推进默认顺推 review）。配 `setTaskAwaitingIfIdle`（task-fs、锁内 compare-set）防 force-new 秒推 race 把 running 覆盖回 awaiting_user（僵尸组合、推进按钮误亮）。
+- **task 做完给 1-3 句结论（结论方案 A）**：`_super.md` + `action-build/plan/dev.md` 把「写完 artifact 沉默调 wait_for_user」改成「写完 artifact 先流式输出 1-3 句简短结论（改了什么 / 结果 / 有无遗留）→ 紧跟 wait_for_user」。精准区分三场景：写完 artifact 收尾**给**结论 / 拿 `[ACTION_ACK approve]` 后等下一 action **不** narrate / 调 ask_user 前**不**前置消息。复用 chat 已验证的 text-delta 流式管道、零渲染改动。
+- **去 review/ship/learn 流程前置、留技术前置**：`checkActionPrerequisites` + `inferDisabledReason` 删「review/ship 必须先 build」「learn 必须先有 completed action」——可直接 review 现状找 bug / 没改动直接 ship（agent 自报工作区干净）/ 空 task learn 自说明；保留 ship gitHost+token、dev 至少一仓配 dev 分支（技术必需、非流程）。
+- **push 同名分支修复（--no-track）**：build checkout feature 改 `git checkout -b <feature> --no-track "origin/$BASE"`——堵 git `autoSetupMerge=true` 默认把 feature 的 upstream 设成 `origin/<线上>`、导致后续裸 `git push` 误推线上分支（后端同事踩过、其线上分支名跟前端不同）；同名 upstream 由 ship 首次 `git push -u origin <feature>` 自然建立、build 不主动 unset（不打扰用户手动设的同名 upstream）。
+- **restart ask_user 给「上次进展」背景**：阶段重启时 ask_user question 不写死固定句、要 agent 基于事件日志 + artifact + 工作区半成品先 1-2 句说清「上次断到哪、在做啥」再接确认问句（重启间隔久 / 换人接手常忘进度）。
+- 验证：typecheck + lint 全绿、vitest 135 全过（submit-mr-guard 加 dev 用例）；打 test 包核验联调 UI + 分支同步透传进包。
+
 ### v0.8.22：自由对话回归 text-delta 流式（M/C' 范式）+ 后置 check 跳过 --fix/--write 类命令（2026-06-24）
 
 - **自由对话回归流式（M/C' 范式、替代 V0.8.21 的 message 范式）**：原 message 范式把整篇回复正文塞进 `wait_for_user` 的 `message` 参数让 composer「先产出再挂等」（治提前挂等）、但工具参数**不流式**、用户要等一次性 flush 才看到全部。调研实证 SDK 不发 partial-tool-call（5 轮探针、`message` 无法增量流式）。改回：**正文直接走 text-delta 通道输出**（天然逐字流式、`case "assistant"` 实时展示）、`wait_for_user.message` 改填**一句话概括**（给历史 / 标题、不展示给用户）、纯做「逼 composer 先产出正文再挂等」的钩子。premature 兜底相应改为：message 非空（声明已回复）→ 清计数放行；message 空 → 读 events 判（仅「用户在等 + 本轮没 stream 出正文」才拦）。删 `chat_message` 派发整套（`AwaitingSignal` 类型 / `safeNotifyChatMessage` / handler 调用 / chat-runner 展示分支 / task-runner 防御）。**task 模式零影响**：新逻辑全包在 `chatModeTasks.has(task_id) && !action_id` 内、task 永不在 `chatModeTasks`（仅 chat-runner `markTaskAsChat` 写入）；改的 4 个 prompt 片段（`chatWaitProtocolSection` / `chatShellWaitGuideBody` / `replyThenWaitReminder` / `firstTurnReplyThenWaitReminder`）全 chat 专用、task 用的 `waitDisciplineSection` 没动；`wait_for_user` describe 里 task 的硬性规则段一字未改。
 - **后置 check 跳过会改写工作区的命令（--fix/--write 类）**：lint 脚本带 `--fix`（`ng lint --fix=true` / `eslint --fix` / `prettier --write`）当 check 跑有两坑（线上 cp-admin 踩过）：① 偷改源码污染工作区、被 `mutatedWorktree` 事后判 failed（误红）；② 用户本地开着 dev server（`ng serve` / `vite` watch）时、lint --fix 跑的几十秒里连环改文件 → dev 连环热重载、终端「一直重启」。新增 `isMutatingScript`（`repo-check-detect.ts`、识别 --fix/--write/--apply、negative-lookahead 排除 --fix-dry-run）+ `willCommandMutateWorktree`（`action-checks.ts`、解析 `<pm> run <script>` 的 package.json script 体、识破藏在 script 内的 fix flag）。检测层（过滤新建 task auto-detect）+ 执行层（拦存量 task 已固化命令）双重拦截、跳过记 `skipped` + 原因、不计入 failed（聚合用 `executed` 排除 skipped、全跳过退回 dirty 判定记 not_configured）。UI（`check-run-summary.tsx`）配了命令但全跳过显示「会改写源码、已跳过」。
 - 验证：typecheck + lint 全绿；打包 test 探针实测 ✅ composer 完整正文走 text-delta（1102 chunk）、概括进 message；用户简单跑过。
-
-### v0.8.21：兼容 stdio 命令方式配置的飞书 MCP——新建任务校验不再只认 url（2026-06-24）
-
-- **问题**：同事用 `npx @lark-project/mcp --domain https://project.feishu.cn` 这种 stdio 命令方式配飞书项目 MCP（无 `url` 字段、域名在 args、token 在 env）、task 新建弹窗旧校验只看 `"url" in cfg` → 误判飞书 MCP 未配置、创建按钮一直置灰。
-- **改法**（`new-task-dialog.tsx`）：飞书 MCP 校验从「只扫 url 字段」改为新增 `collectMcpHaystack`——把单个 server 配置里 `url + command + args + env 值`全拼成一段、按域名（`mcp.feishu.cn` / `project.feishu.cn`）substring 匹配。两种配法都兼容：① url 远程型（域名在 url）；② stdio 命令型（域名藏 command/args/env）。按域名认、不认 key 名。
 
 ---
 

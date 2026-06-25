@@ -39,6 +39,7 @@ import type {
   ArtifactRevision,
   CheckCommand,
   CheckCommandKind,
+  DevPushMode,
   GitBranchInfo,
   MRRecord,
   ModelSelection,
@@ -55,6 +56,7 @@ import type {
   TaskSummary,
 } from "@/lib/types";
 import { CHECK_COMMAND_KIND_LABEL, ACTION_TYPES } from "@/lib/types";
+import { mrTargetBranchOf } from "@/lib/task-display";
 import { getEffectiveCwd } from "@/lib/path-utils";
 import { dataRoot } from "./data-root";
 import { detectRepoCheckCommands } from "./repo-check-detect";
@@ -1396,6 +1398,8 @@ export const appendAction = async (
     requestedBatchIds?: string[];
     /** V0.8.x：plan 重跑时如何合并批次 */
     replanMode?: ReplanMode;
+    /** V0.x：联调推送方式（仅 dev 传）——direct 直推 / mr 提 PR */
+    devPushMode?: DevPushMode;
   },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
   withTaskLock(taskId, async () => {
@@ -1425,6 +1429,8 @@ export const appendAction = async (
           ? input.requestedBatchIds
           : undefined,
       replanMode: input.type === "plan" ? input.replanMode : undefined,
+      // V0.x：仅 dev action 带推送方式（其它 undefined）
+      devPushMode: input.type === "dev" ? input.devPushMode : undefined,
     };
 
     meta.actions = [...meta.actions, action];
@@ -1560,6 +1566,8 @@ export const appendActionSideEffectMR = async (
   actionId: string,
   mr: {
     repoPath: string;
+    /** V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支） */
+    targetBranch?: string;
     mrUrl: string;
     mrVersion: number;
     branch: string;
@@ -1610,6 +1618,36 @@ export const setTaskRunStatus = async (
     if (currentActionId !== undefined) {
       meta.currentActionId = currentActionId;
     }
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * 待命态专用：仅当「当前没有正在跑的 action」时、才把 runStatus 切 awaiting_user（+ 清 currentActionId）。
+ *
+ * 防 force-new「秒推下一 action」race（僵尸组合、awaitingNotifier 待命分支踩过）：
+ *   approve action_N 后用户秒推 action_N+1 → advanceTask 已 appendAction 把 runStatus 设 running + 新
+ *   action 在跑；但被取消的旧 agent 那条「approve 后进待命态」的迟到 wait_for_user(空 action_id) 通知若
+ *   晚到、用裸 setTaskRunStatus 会把 running 错覆盖回 awaiting_user（还顺手清了 currentActionId）→ 新
+ *   action 明明在跑、UI 却显示「等待回复」、推进 / 终结 / 再聊聊按钮误亮（点了会和正在跑的 action 打架）。
+ *   续接路径靠 pendingNextActions 兑现 + chat-mcp `!entry.resolved` 守卫挡住、但 force-new 不入队、漏了。
+ * 治法：read-compare-set 整段在 withTaskLock 内原子完成——读到「当前 action 已 running」就直接跳过、
+ *   保住 running（杜绝「裸读 fresh + 再 set」之间的 TOCTOU race）。
+ *
+ * @returns 设成功 → 新 Task；跳过（已有 running action）或 meta 不存在 → null（调用方据此决定是否 publish）
+ */
+export const setTaskAwaitingIfIdle = async (
+  taskId: string,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    // 已有正在跑的新 action（说明用户已推进下一步）→ 不打回 awaiting_user、保住 running
+    const current = meta.actions.find((a) => a.id === meta.currentActionId);
+    if (current?.status === "running") return null;
+    meta.runStatus = "awaiting_user";
+    meta.currentActionId = null;
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
@@ -1676,6 +1714,49 @@ export const setFeishuTesterUserKeys = async (
   });
 
 /**
+ * 用「client 随推进带来的设置页最新分支配置」刷新 task 的分支快照（V0.x A 方案）。
+ *
+ * 背景：线上/测试/dev 分支建 task 时从设置页快照固化、设置页后改不影响老 task。
+ *   为了「设置页改了、老 task 下次推进也能用上」、advanceTask 每次推进前调本函数同步一次。
+ *
+ * upsert 语义（关键边界、防误清）：
+ *   - 只覆盖「本 task 绑了的仓（allowed）+ 传来非空值」的 key
+ *   - 没传的仓 / 传空值的、保留原快照（用户从设置页移除某仓时、不把 task 里该仓分支清成空）
+ *   - 不动 feature 分支（git 已建、必须固化、不在本函数范围）
+ */
+export const refreshRepoBranches = async (
+  taskId: string,
+  input: {
+    base?: Record<string, string>;
+    test?: Record<string, string>;
+    dev?: Record<string, string>;
+  },
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const allowed = new Set(meta.repoPaths);
+    const apply = (
+      current: Record<string, string> | undefined,
+      incoming: Record<string, string> | undefined,
+    ): Record<string, string> | undefined => {
+      if (!incoming) return current;
+      const merged: Record<string, string> = { ...current };
+      for (const [repo, v] of Object.entries(incoming)) {
+        const b = v?.trim();
+        if (allowed.has(repo) && b) merged[repo] = b;
+      }
+      return Object.keys(merged).length > 0 ? merged : undefined;
+    };
+    meta.repoBaseBranches = apply(meta.repoBaseBranches, input.base);
+    meta.repoTestBranches = apply(meta.repoTestBranches, input.test);
+    meta.repoDevBranches = apply(meta.repoDevBranches, input.dev);
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
  * Upsert MR 记录（V0.6.1 ship action 多仓适配）
  *
  * 按 `repoPath` 匹配：
@@ -1690,6 +1771,8 @@ export const upsertMR = async (
   taskId: string,
   repoPath: string,
   input: {
+    /** V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支）、去重按 repoPath+targetBranch */
+    targetBranch: string;
     url: string;
     title: string;
     branch: string;
@@ -1706,12 +1789,19 @@ export const upsertMR = async (
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
     const now = Date.now();
-    const idx = meta.mrs.findIndex((m) => m.repoPath === repoPath);
+    // 去重键 = repoPath + 目标分支：同仓提测 MR（→test）和联调 MR（→dev）各记各的、各自累计 version。
+    // 老记录缺 targetBranch（历史只有提测）→ mrTargetBranchOf 兜底成该仓测试分支、跟新提测 MR 正确合并、不跟联调 MR 撞。
+    const idx = meta.mrs.findIndex(
+      (m) =>
+        m.repoPath === repoPath &&
+        mrTargetBranchOf(m, meta.repoTestBranches) === input.targetBranch,
+    );
     let nextMR: MRRecord;
     if (idx >= 0) {
       const old = meta.mrs[idx]!;
       nextMR = {
         ...old,
+        targetBranch: input.targetBranch,
         url: input.url,
         title: input.title,
         branch: input.branch,
@@ -1730,6 +1820,7 @@ export const upsertMR = async (
     } else {
       nextMR = {
         repoPath,
+        targetBranch: input.targetBranch,
         url: input.url,
         title: input.title,
         branch: input.branch,

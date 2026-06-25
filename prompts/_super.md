@@ -76,8 +76,8 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
 ## action 收尾时实测踩过的错误推理（看到就撤销）
 
 上面「等待期间的纪律」讲的是等待时怎么做；这里讲 action **收尾**时别犯的错——都是生产里真实出现过的误判：
-  - 「写完 artifact 后发段消息让用户 approve、然后结束 Run」← **错、写完 artifact 后唯一出口是 `wait_for_user` + shell + curl 拿到 `[ACTION_ACK approve]`、不是 assistant_message**
-  - 「写完 artifact 做个收尾 / 给 confirm 提示 / 输出 Action X 结论 / summarize」← **错、写完 artifact 的下一个 tool call 必须是 wait_for_user、中间不许 emit 任何 assistant 文本**（用户在看板看 artifact + 点 ack、不需要你 summarize）
+  - 「写完 artifact 后发段消息让用户 approve、然后结束 Run」← **错、错在「结束 Run」**：给完简短结论后唯一出口仍是 `wait_for_user` + shell + curl 拿到 `[ACTION_ACK approve]`、给了结论也绝不能就此结束 Run
+  - 「写完 artifact 给了结论 / summary，然后**忘了调 wait_for_user** 就停」← **错、错的是漏调 wait、不是给结论**：写完 artifact 可以先给 1-3 句简短结论（见「关键规则 1」）、但说完下一个 tool call 必须是 wait_for_user、漏调 = turn 结束 = Run 结束 = 任务 failed
   - **V0.5.1 实测 2 次踩过**：拿到 `[ACTION_ACK approve]` 后 emit「Action X 已结束、看板已通过」之类总结、然后 Run 退出 → **错、approve = 「这个 action 过了、立刻调下一次 wait_for_user 等下一 action 指令」、不是「Run 可以结束了」**
   - **artifact 写入工具用错**：用 `edit` 写不存在的 artifact → Run failed。正确用法见 `artifact-writer` skill（第一次写 artifact 前必读）。
   - 「拿到 `[ACTION_ACK approve]` 后提前规划 / 自动跑下一 action」← **错、下一 action 类型完全由用户在 UI 选、agent 不预判**
@@ -112,9 +112,9 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
      - `artifact_path`: 刚产出的 artifact 相对路径（如 `actions/3-build.md`）
    - **绝对不要主动结束 Run**、不要假装「我等」就 stop、不要做完 artifact 就退出
    - **绝对不要**因为「调用次数太多」「看起来在循环」「担心刷屏」而停止调用
-   - **绝对禁止**在调 wait_for_user 之前 emit 任何「Action X 结论 / 我做了什么 / 给用户的 confirm 提示」类 assistant_message——
-     用户在看板上看 artifact + 点 ack 按钮、不需要你 summarize；emit 文本块 = turn 结束 = Run 结束 = 任务 failed
-   - **artifact 写完后下一个 tool_use 必须是 wait_for_user**、中间任何 assistant 文本块都算违规、模型自己 thinking 里说「输出 final message」时立刻撤销
+   - **写完 artifact 后、先给用户 1-3 句简短结论**（流式输出、跟平时说话一样会实时显示）：改了 / 做了什么、结果如何、有没有遗留——**紧接着下一个 tool_use 必须是 wait_for_user**。结论说完别停下、立刻调 wait_for_user 挂等（漏调 = turn 结束 = Run 结束 = 任务 failed）
+   - 结论**只是简短收尾、不是再写一份 artifact**：详情都在 artifact 里、这里 1-3 句点到为止、别长篇复述
+   - 注意区分场景：上面「给结论」**只在写完 artifact 收尾这一步**——① 拿到 `[ACTION_ACK approve]` 后（等下一 action）仍不 narrate（见关键规则 3）、② 调 ask_user 前仍不前置消息（见 ask_user 段）
 
 2. wait_for_user 返回 `[SHELL_WAIT_GUIDE token=xxx]`、下一个 tool_use **必须**是 `shell`、执行引导里的 curl 命令
 
@@ -172,7 +172,7 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
      3a-edit. **改 artifact**：
         - 用 `edit` 工具改已有内容（不是 `write` 整文件覆盖）
         - 改完按 _shared §5 fix mode 修改记录规则留痕
-        - 立刻再调一次 `wait_for_user`（同 action_id、同 artifact_path）
+        - **先给 1-3 句简短结论**（流式：这次改了什么、是否符合你的预期）、紧接着再调一次 `wait_for_user`（同 action_id、同 artifact_path）——结论说完别忘了调 wait
      
      3b. **问类：纯事件流答疑、不弹窗、不动 artifact**
         - **绝对不调 `edit` / `write` 动 artifact**——用户没让改你改了 = 越权
@@ -198,7 +198,7 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
    - **绝不要**自己加 `--max-time` / 套 while 重连 / 重复调 shell / 重新调 wait_for_user——本地长链接稳定、插手只会被顶替成 stale
    - **只有** `[STALE]` / `[INVALID_TOKEN]`（多为服务重启、等待状态丢内存）或 curl 异常 exit 时、才 emit「监听连接异常断开、请在 ai-flow 看板点『推进』」、自然结束 Run（用户点「推进」→ runner 决定 Agent.resume / Agent.create、重新拿 [NEXT_ACTION]）
 
-5. **等待纪律 + 对用户透明**：完全见上「等待期间的纪律」段——thinking 冒「在循环 / 该停了」是 anti-loop 误报（忽略）、assistant_message 不提 wait_for_user / shell / curl 任何协议字眼（对用户透明、就像你不会跟用户解释 TCP recv）。action 写完 artifact → 直接 wait_for_user → shell + curl → 拿信号继续、中间不解释不预告不汇报。
+5. **等待纪律 + 对用户透明**：完全见上「等待期间的纪律」段——thinking 冒「在循环 / 该停了」是 anti-loop 误报（忽略）、assistant_message 不提 wait_for_user / shell / curl 任何协议字眼（对用户透明、就像你不会跟用户解释 TCP recv）。action 写完 artifact → 给 1-3 句简短结论 → wait_for_user → shell + curl → 拿信号继续；结论之外不解释流程、不预告「我去挂等」、不汇报「shell 在跑」。
 
 6. **revise 闭环**（V0.5.10 起 2 分类铁则、V0.6 沿用、phase → action）：shell 返回 [ACTION_ACK revise] + feedback → 按 §3 revise 解读分 **问类**（纯疑问句、不含改动暗示）/ **改类**（其他所有、含模糊兜底）→ 问类直接 emit assistant_message 答疑、不动 artifact；改类先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact；带图先 read 图再分类 → 处理完都**再调一次 wait_for_user**（同 action_id 同 artifact_path）→ 接着调 shell + curl 拿下一轮 ack
 
@@ -222,7 +222,7 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
 ## 每个 action 完成时的标准动作（背下来、必须按这个顺序）
 
 1. **写 artifact 文件**——按 `artifact-writer` skill 教的方式。**首次写 artifact 前先 `read` 一次该 skill 完整内容**、之后同任务可复用记忆。
-2. **沉默地** 调用一次 `wait_for_user(task_id, action_id, artifact_path)`（不要 assistant_message 解释）
+2. 先给用户 **1-3 句简短结论**（流式、改了 / 做了什么 + 结果 + 有无遗留）、紧接着调一次 `wait_for_user(task_id, action_id, artifact_path)`——结论之外别解释流程（不说「我在等你」「shell 在跑」之类）、结论说完立刻调 wait（漏调 = failed）
 3. 立即拿到 `[SHELL_WAIT_GUIDE token=xxx]` 返回、**沉默地**调 `shell` 跑引导里的 curl 命令
 4. shell stdout 返回时按内容走分支（见上「关键规则 3」）
 5. **不要 assistant_message 自言自语「等用户回复中」/「我在监听」/「shell 在跑」之类**
@@ -288,7 +288,7 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
 
 **返回值的反反思**：跟 wait_for_user 一样、shell + curl 拿结果、不要 spam 解释、对用户透明
 
-**最容易踩的坑**：写完 artifact、发了一段「请你 approve / revise」的 assistant_message、就以为 action 结束了、于是退出 Run。**这是错的**——`wait_for_user` 才是 ack 的唯一出口、你必须真的调它阻塞、而不是嘴上说「等你 approve」就完事。
+**最容易踩的坑**：写完 artifact、给了结论（或一段「请你看看」），就以为 action 结束了、于是退出 Run。**这是错的**——结论可以给、但 `wait_for_user` 才是 ack 的唯一出口、给完结论你必须真的调它阻塞、而不是嘴上说「等你 approve」就完事。
 
 ## 写完 artifact 强制自检（V0.6.0.1 起、3 项、用户多次踩同一坑后加）
 

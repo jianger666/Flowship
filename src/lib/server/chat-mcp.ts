@@ -1203,9 +1203,9 @@ const buildMcpServer = (): McpServer => {
   srv.registerTool(
     "submit_mr",
     {
-      title: "提交 GitLab MR（ship action 专用、server 同步调 REST API）",
+      title: "提交 GitLab MR（ship 提测 / dev 联调用、server 同步调 REST API）",
       description: [
-        "ship action 跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
+        "ship（提测→该仓测试分支）/ dev 联调提 PR（→该仓 dev 分支）跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
         "",
         "## 调用前置（agent 自己保证）",
         "",
@@ -1228,16 +1228,16 @@ const buildMcpServer = (): McpServer => {
         "  - `mr_url`：MR 网页 URL、直接给用户点开",
         "  - `mr_iid`：GitLab project 内 MR 编号（用户看到的 !N、不是全局 ID）",
         "  - `mr_version`：本仓累计 push 次数（首次=1、之后每次 ship ++、用于在 MR description 里标 `v2 / v3` 等）",
-        "  - `has_conflicts`：**重点**——本 MR 跟 `test` 有没有冲突、`true` = 合不了、按下方铁律处理",
+        "  - `has_conflicts`：**重点**——本 MR 跟目标分支有没有冲突、`true` = 合不了、按下方铁律处理",
         "  - `merge_status`：GitLab detailed_merge_status 原值（mergeable / conflict / checking ...）、审计用",
         "  - `merge_undetermined`：GitLab 还在异步算可合性、本次没查准（保守当无冲突、可在 artifact 注明待人工复核）",
         "",
         "## ⚠️ has_conflicts=true 时（铁律、按 ship prompt §3.5/§3.6 走）",
         "",
-        "1. **绝不**把 `test` `merge` / `rebase` / `pull` 进 **feature** 分支、也不 force push feature/测试分支——feature 本体永远干净",
+        "1. **绝不**把目标分支 `merge` / `rebase` / `pull` 进 **feature** 分支、也不 force push feature/目标分支——feature 本体永远干净",
         "2. **先不**发飞书评论——飞书 @ 评论只在「所有仓 MR 都无冲突」时才发、不能把合不了的 MR 甩给测试人员",
         "3. 调 `ask_user` 问用户「AI 智能解 / 自己解」：",
-        "   - 选 **AI 解** → 按 §3.6：另建一次性 `<feature>__conflict` 分支（基于 test）、把 feature 合进去解冲突、`push -f` 后用 `__conflict` 当 source_branch 再调本工具（server 会自动关掉被取代的旧 MR）。仅这条 `__conflict` 分支上的 merge / force push 是铁律豁免、feature 全程不动",
+        "   - 选 **AI 解** → 按 ship §3.6 / dev prompt 同款：另建一次性 `<feature>__conflict` 分支（基于目标分支）、把 feature 合进去解冲突、`push -f` 后用 `__conflict` 当 source_branch 再调本工具（server 会自动关掉被取代的旧 MR）。仅这条 `__conflict` 分支上的 merge / force push 是铁律豁免、feature 全程不动",
         "   - 选 **自己解** → 等用户解完回复、重跑 ship",
         "",
         "失败：`{ ok: false, error: \"<人类可读错误>\" }`",
@@ -1250,7 +1250,7 @@ const buildMcpServer = (): McpServer => {
       ].join("\n"),
       inputSchema: {
         task_id: z.string().describe("任务 id"),
-        action_id: z.string().describe("当前 ship action 的 id"),
+        action_id: z.string().describe("当前 ship / dev action 的 id"),
         repo_path: z
           .string()
           .describe(
@@ -1267,7 +1267,7 @@ const buildMcpServer = (): McpServer => {
         target_branch: z
           .string()
           .describe(
-            "MR 目标分支 = 该仓的测试分支（见 super prompt「## 仓库分支配置」段、没配则 `test`）、不要探 origin/HEAD 拿 master/main",
+            "MR 目标分支（见 super prompt「## 仓库分支配置」段、不要探 origin/HEAD 拿 master/main）：ship 提测填该仓测试分支（没配则 `test`）；dev 联调填该仓 dev 分支。按本次 action 类型 + [DEV_PUSH_MODE] 指令决定",
           ),
         title: z.string().describe("MR 标题（建议格式：`[role] <task.title>`）"),
         description: z

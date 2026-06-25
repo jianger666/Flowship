@@ -37,6 +37,7 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   ship: "提测",
   test: "AI 手测",
   learn: "沉淀",
+  dev: "联调",
 };
 
 /** 英文短标、用在 timeline 副标 / event stream inline */
@@ -47,6 +48,7 @@ export const ACTION_LABEL_EN: Record<ActionType, string> = {
   ship: "Ship",
   test: "Test",
   learn: "Learn",
+  dev: "Dev",
 };
 
 /** 中文 2 字短标、用在事件流 inline tag 等紧凑场景 */
@@ -57,6 +59,48 @@ export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
   ship: "提测",
   test: "手测",
   learn: "沉淀",
+  dev: "联调",
+};
+
+// ===========================================
+// V0.x：MR 目标分支 / 类型（提测 vs 联调）——前后端共用单一源
+// ===========================================
+//
+// 同仓的提测 MR（→测试分支）和联调 MR（→dev 分支）按 (repoPath, targetBranch) 区分。
+// 取目标分支 / 判类型的算法放这一处、task-fs upsertMR 去重 + task-runner 找旧 MR + UI 标注都复用、
+// 不在多处各写一份兜底逻辑（防漂移）。
+
+/**
+ * 取一条 MR 的有效目标分支。
+ * - 新记录（提测 / 联调）都显式存了 targetBranch；
+ * - 老记录缺 targetBranch（提测时代）→ 兜底该仓测试分支（repoTestBranches）、再兜底 "test"。
+ */
+export const mrTargetBranchOf = (
+  mr: { repoPath: string; targetBranch?: string },
+  repoTestBranches?: Record<string, string>,
+): string =>
+  mr.targetBranch?.trim() ||
+  repoTestBranches?.[mr.repoPath]?.trim() ||
+  "test";
+
+/**
+ * 判断一条 MR 是「提测」还是「联调」——目标分支等于该仓 dev 分支 = 联调、否则提测。
+ * dev 分支没配则一律算提测（联调必须显式配 dev 分支才提得了）。
+ */
+export const mrKindOf = (
+  mr: { repoPath: string; targetBranch?: string },
+  repoTestBranches?: Record<string, string>,
+  repoDevBranches?: Record<string, string>,
+): "ship" | "dev" => {
+  const dev = repoDevBranches?.[mr.repoPath]?.trim();
+  if (dev && mrTargetBranchOf(mr, repoTestBranches) === dev) return "dev";
+  return "ship";
+};
+
+/** MR 类型中文标（UI badge：提测 / 联调） */
+export const MR_KIND_LABEL: Record<"ship" | "dev", string> = {
+  ship: "提测",
+  dev: "联调",
 };
 
 // ===========================================

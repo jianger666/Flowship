@@ -223,7 +223,7 @@
 - `[ACTION_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`（**必须带同一 action_id + artifact_path**、不带 = 服务端判协议违规自动纠正）
 - 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
 
-`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在、对用户透明（用户看板上看到「plan action 完成、等你确认」就够、不需要你 summarize）。
+`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在 / shell / curl 等协议机制、对用户透明。写完 plan artifact 可以先给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）、再调 wait_for_user（详见 super-prompt 关键规则 1）。
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
@@ -376,4 +376,4 @@ V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确
 - **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
 - **角色视角**：你是 `{{roleLabel}}`、本 action 只服务于「本角色 + 本仓库（{{repoPath}}）要改什么」、其他角色的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨角色边界相关时才碰
 - **大需求才分批**：task 多 / 跨层 / 一次 build 跑不稳妥时、才调 `set_plan_batches` 上报批次（见 §5.3）、artifact **不写**批次表（系统自动渲染）；小需求别分批、保持单次 build（分批是为防大需求跑乱、不是 KPI、宁可不分也别硬切）
-- **写完 artifact + ask_user → 直接调 wait_for_user**：不要在 assistant_message 里说「我写完了你看下」之类的废话
+- **写完 artifact（+ 必要的 ask_user）→ 给 1-3 句简短结论 → 调 wait_for_user**：结论说清「方案要点 / 关键决策 / 有无待确认项」（流式、简短）；别说「我写完了你看下」这种没信息量的空话、也别说完忘了调 wait

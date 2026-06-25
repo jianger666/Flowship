@@ -294,6 +294,6 @@ shell stdout 返回行解析：
 - **TypeScript strict**：仓库一般开了 strict、不要写 `any`（除非局部有非常充分的理由）
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
 - **跑 shell 慢的命令**：`pnpm install` / 全量 build 可能耗时几分钟、agent 不要因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
-- **写完 → 直接调 wait_for_user**：不要在 assistant_message 里说「我改完了你看下」之类的话
+- **写完 → 给 1-3 句简短结论 → 调 wait_for_user**：结论说清「改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留」（流式、简短、别长篇复述）；别说「我改完了你看下」这种没信息量的空话、也别说完忘了调 wait（详见 super-prompt 关键规则 1）
 - **绝对不自动进入下一 action**：build 拿到 [ACTION_ACK approve] 后立刻 wait_for_user 等下一 action 指令、不要自己跑 review / ship——下一 action 类型由用户在 UI 选
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

@@ -51,6 +51,7 @@ import {
   ACTION_TYPES,
   type ActionType,
   type CheckOverride,
+  type DevPushMode,
   type ReplanMode,
 } from "@/lib/types";
 
@@ -75,11 +76,17 @@ interface PostBody {
   removeSourceBranch?: boolean;
   // V0.6.23 build action 用：本次做哪些批次（advance-dialog 勾选、透传给 advanceTask）
   requestedBatchIds?: string[];
+  // V0.x dev action 用：联调推送方式（direct 直推 / mr 提 PR、advance-dialog 选）
+  devPushMode?: string;
   // V0.8.x plan action 用：重跑方案时的批次合并语义
   replanMode?: string;
   // V0.6.25 ship action 用：CheckRun gate override（最新 build check 没过/没配时、用户勾「仍继续」+ reason）
   // 结构由 parseCheckOverride narrow、server 端 checkShipCheckGate 再校验绑定有效性
   checkOverride?: unknown;
+  // V0.x A 方案：client 随推进带来的设置页最新分支配置（per-repo）、server 据此刷新 task 分支快照
+  repoBaseBranches?: Record<string, string>;
+  repoTestBranches?: Record<string, string>;
+  repoDevBranches?: Record<string, string>;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -90,6 +97,21 @@ const isValidActionType = (v: unknown): v is ActionType =>
 
 const parseReplanMode = (v: unknown): ReplanMode | undefined =>
   v === "append" || v === "rebuild" ? v : undefined;
+
+const parseDevPushMode = (v: unknown): DevPushMode | undefined =>
+  v === "direct" || v === "mr" ? v : undefined;
+
+// V0.x A 方案：per-repo 分支配置 map 粗清洗（object + value trim 非空、空 map 归 undefined）
+const sanitizeRepoBranchMap = (
+  v: unknown,
+): Record<string, string> | undefined => {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === "string" && val.trim()) out[k] = val.trim();
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+};
 
 // V0.6.25：把 client 传的 checkOverride narrow 成 CheckOverride（语义有效性交给 server gate 校验）
 const parseCheckOverride = (raw: unknown): CheckOverride | undefined => {
@@ -229,8 +251,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
         ? body.requestedBatchIds.filter((x) => typeof x === "string")
         : undefined,
       replanMode: actionType === "plan" ? parseReplanMode(body.replanMode) : undefined,
+      // V0.x：联调推送方式（仅 dev 有意义、缺省 direct——advanceTask/appendAction 内部也按 type 过滤）
+      devPushMode:
+        actionType === "dev"
+          ? (parseDevPushMode(body.devPushMode) ?? "direct")
+          : undefined,
       // V0.6.25：ship gate override（仅 ship 有意义、server checkShipCheckGate 校验绑定有效性）
       checkOverride: parseCheckOverride(body.checkOverride),
+      // V0.x A 方案：client 带来的设置页最新分支配置、server 据此刷新 task 分支快照（设置页改了下次推进生效）
+      repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
+      repoTestBranches: sanitizeRepoBranchMap(body.repoTestBranches),
+      repoDevBranches: sanitizeRepoBranchMap(body.repoDevBranches),
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

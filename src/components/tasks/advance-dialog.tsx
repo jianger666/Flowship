@@ -51,6 +51,7 @@ import { Label } from "@/components/ui/label";
 import { ModelSelect } from "@/components/ui/model-select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip } from "@/components/ui/tooltip";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
@@ -59,6 +60,7 @@ import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import {
   ACTION_LABEL,
   computeBatchProgress,
+  mrKindOf,
   type EffectivePlanBatch,
 } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
@@ -68,6 +70,7 @@ import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import type {
   ActionType,
   CheckOverride,
+  DevPushMode,
   ModelSelection,
   ShipPrecheck,
   Task,
@@ -80,6 +83,7 @@ const IMPLEMENTED_ACTIONS: ActionType[] = [
   "build",
   "review",
   "ship",
+  "dev",
   "learn",
 ];
 const STUB_ACTIONS: ActionType[] = ["test"];
@@ -90,6 +94,7 @@ const STUB_VERSION: Record<ActionType, string | undefined> = {
   ship: undefined,
   test: "待上线",
   learn: undefined,
+  dev: undefined,
 };
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
@@ -97,10 +102,14 @@ const STUB_VERSION: Record<ActionType, string | undefined> = {
 const inferDisabledReason = (
   task: Task,
   type: ActionType,
-  ctx: { host?: string; token?: string } = {},
+  // devBranches：设置页实时 dev 分支快照（dialog 打开时读）、优先于 task 旧快照——
+  //   设置页刚配的 dev 分支也能即时放行联调 chip（server advance 时会 refreshRepoBranches 同步准入、两边一致）
+  ctx: {
+    host?: string;
+    token?: string;
+    devBranches?: Record<string, string>;
+  } = {},
 ): string | null => {
-  const hasCompleted = (t: ActionType) =>
-    task.actions.some((a) => a.type === t && a.status === "completed");
   switch (type) {
     case "plan":
       return null;
@@ -108,20 +117,26 @@ const inferDisabledReason = (
       // V0.6.17：放开 plan 前置——无 plan 也能直接 build（按指令改、范围以指令为准）
       return null;
     case "review":
-      return hasCompleted("build") ? null : "需要先有一个已通过的 build";
+      // V0.x：去掉「review 必须先有 build」流程限制——可直接 review 现状代码找 bug
+      return null;
     case "ship":
-      // V0.6.1：ship 准入 = 至少 1 个 build 已 approve + settings 配齐 gitHost/gitToken
-      if (!hasCompleted("build")) return "需要先有一个已通过的 build";
+      // V0.x：去掉「ship 必须先有 build」流程限制；只留 GitLab host/token（技术必需、没配真提不了 MR）
       if (!ctx.host) return "需要先在「设置 → GitLab 配置」填 host";
       if (!ctx.token) return "需要先在「设置 → GitLab 配置」填 PAT";
       return null;
     case "learn":
-      // V0.6.29：跟 runner 准入对齐——至少 1 个已完成的 action 才有可沉淀的经验
-      return task.actions.some(
-        (a) => a.type !== "learn" && a.status === "completed",
-      )
-        ? null
-        : "需要至少 1 个已完成的 action";
+      // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 自己说明
+      return null;
+    case "dev": {
+      // V0.x：联调技术准入——至少一仓配了 dev 分支（跟 server checkActionPrerequisites 对齐）
+      //   优先用设置页实时值（ctx.devBranches）、回退 task 旧快照——设置页刚配的 dev 分支也即时放行
+      const devBranches = ctx.devBranches ?? task.repoDevBranches;
+      const anyDev = task.repoPaths.some(
+        (p) => (devBranches?.[p]?.trim() ?? "").length > 0,
+      );
+      if (!anyDev) return "需要先在「设置 → 仓库列表」给仓库配 dev 分支";
+      return null;
+    }
     case "test":
       return `${STUB_VERSION[type]}`;
     default: {
@@ -140,6 +155,7 @@ const ACTION_SUBTITLE: Record<ActionType, string> = {
   ship: "提 MR 到 test",
   test: "AI 手测",
   learn: "沉淀经验进仓库",
+  dev: "推送到 develop",
 };
 
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
@@ -151,6 +167,7 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
   ship: "（可选）MR 标题 / 描述要点、不填自动生成",
   test: "（待上线）跑哪些 case？默认全跑",
   learn: "（可选）想重点沉淀什么？默认全量复盘提炼",
+  dev: "（可选）联调要点、不填按标准流程推 dev",
 };
 
 // 根据 task 当前状态 + 选中 action 类型动态调整 placeholder
@@ -168,9 +185,25 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
     );
     return hasPlan ? "方案要怎么调整？" : "需求是什么？要解决什么问题？";
   }
+  // 提测 / 联调 placeholder 的「已有 v<N> MR」提示按目标分支分流——
+  // 同仓提测 MR（→test）和联调 MR（→dev）各自累计 version、别混在一起取 max。
   if (type === "ship" && task.mrs.length > 0) {
-    const maxVersion = Math.max(...task.mrs.map((m) => m.version));
-    return `已有 v${maxVersion} MR、本次继续推、可选填要点`;
+    const shipMrs = task.mrs.filter(
+      (m) => mrKindOf(m, task.repoTestBranches, task.repoDevBranches) === "ship",
+    );
+    if (shipMrs.length > 0) {
+      const maxVersion = Math.max(...shipMrs.map((m) => m.version));
+      return `已有 v${maxVersion} MR、本次继续推、可选填要点`;
+    }
+  }
+  if (type === "dev" && task.mrs.length > 0) {
+    const devMrs = task.mrs.filter(
+      (m) => mrKindOf(m, task.repoTestBranches, task.repoDevBranches) === "dev",
+    );
+    if (devMrs.length > 0) {
+      const maxVersion = Math.max(...devMrs.map((m) => m.version));
+      return `已有 v${maxVersion} 联调 MR、本次继续推、可选填要点`;
+    }
   }
   return ACTION_PLACEHOLDER[type];
 };
@@ -194,11 +227,13 @@ const inferDefaultActionType = (task: Task): ActionType => {
 
   if (task.actions.length === 0) return "plan";
 
+  // V0.x：completed 或 awaiting_ack（产物已交付、推进时会隐式认可）都算「这步做完了」、
+  //   这样 build 刚完成（awaiting_ack）点推进时默认顺推到 review、不会停在 build
   const last = [...task.actions]
     .reverse()
     .find(
       (a) =>
-        a.status === "completed" &&
+        (a.status === "completed" || a.status === "awaiting_ack") &&
         (a.type === "plan" ||
           a.type === "build" ||
           a.type === "review" ||
@@ -228,6 +263,8 @@ interface Props {
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（仅 build 且 plan 拆批时传、其它 undefined=全做）
     requestedBatchIds?: string[];
+    // V0.x：联调推送方式（仅 dev action 传、direct 直推 / mr 提 PR）
+    devPushMode?: DevPushMode;
     // V0.8.x：重跑 plan 时如何处理历史批次；仅 plan action 有意义
     replanMode?: "append";
     // V0.6.25：ship gate override（仅 ship 且最新 build 的 check 没过、用户勾「仍继续」时传）
@@ -281,6 +318,8 @@ export const AdvanceDialog = ({
   const [reuseAgent, setReuseAgent] = useState(false);
   // V0.6.14：ship 提测「合并后删除源分支」开关（默认保留、用户拍板；dialog 打开时按 task 上次选择初始化）
   const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
+  // V0.x：联调（dev action）推送方式——direct 直推 / mr 提 PR、默认直推（最快触发流水线）
+  const [devPushMode, setDevPushMode] = useState<DevPushMode>("direct");
   // V0.6.23：build 分批——本次勾选的批次 id（仅 build 且 plan 拆了批次时用、空=未拆/全做）
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([]);
   // V0.6.29：「自由改动（不绑定批次）」显式选项卡——修 bug / 跨批次散改、跟批次勾选互斥
@@ -291,6 +330,11 @@ export const AdvanceDialog = ({
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照、不实时同步（用户开 dialog 中途换 host/token 极少）
   const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
+    {},
+  );
+  // V0.x：设置页实时 dev 分支快照（per-repo、本 task 各仓）——dialog 打开瞬间读、供联调 chip 准入判断。
+  //   不实时同步（开 dialog 中途改设置页极少）、跟 gitConfig 同套路。
+  const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
     {},
   );
   // V0.6.25：ship override——最新 build 的 check 没过时、勾「仍继续提测」+ 填原因才放行
@@ -316,6 +360,9 @@ export const AdvanceDialog = ({
   //（task.actions 进依赖会让 SSE 推 task 时重跑 open effect、把用户已改的表单打回默认）
   const hasPlanHistoryRef = useRef(hasPlanHistoryNow);
   hasPlanHistoryRef.current = hasPlanHistoryNow;
+  // ref 持本 task 各仓路径——open effect 读设置页 dev 分支时用、不进 effect 依赖（同 hasPlanHistoryRef 套路）
+  const repoPathsRef = useRef(task.repoPaths);
+  repoPathsRef.current = task.repoPaths;
   // 打开瞬间快照：本次正在创建的 plan 提交后会进 task.actions、但快照不变——
   // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
   const [hasPlanHistory, setHasPlanHistory] = useState(false);
@@ -347,6 +394,8 @@ export const AdvanceDialog = ({
     setInstruction("");
     setReuseAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
+    // V0.x：联调推送方式每次打开回到默认「直推」
+    setDevPushMode("direct");
     // V0.6.23：build 批次默认不勾选，避免用户回头修 bug 时误提交到下一个未完成批次。
     // V0.6.29：批次 / 自由改动二选一、都不选拦提交（语义不明）——每次打开都回到「未表态」。
     setSelectedBatchIds([]);
@@ -362,6 +411,14 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
+    // 读设置页最新 dev 分支（只收本 task 各仓 + 非空）——联调 chip 准入用实时值、不被 task 旧快照挡住
+    const devMap: Record<string, string> = {};
+    for (const p of repoPathsRef.current) {
+      const repo = s.repos.find((r) => r.path === p);
+      const db = repo?.devBranch?.trim();
+      if (db) devMap[p] = db;
+    }
+    setLiveDevBranches(devMap);
     // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
     setHasPlanHistory(hasPlanHistoryRef.current);
   }, [open, defaultActionType, defaultRemoveSourceBranch]);
@@ -410,8 +467,12 @@ export const AdvanceDialog = ({
 
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
   const disabledReason = useMemo(
-    () => inferDisabledReason(task, actionType, gitConfig),
-    [task, actionType, gitConfig],
+    () =>
+      inferDisabledReason(task, actionType, {
+        ...gitConfig,
+        devBranches: liveDevBranches,
+      }),
+    [task, actionType, gitConfig, liveDevBranches],
   );
   // V0.6.25：ship 且 server precheck 判定需 override → 必须勾「仍继续」+ 填原因才能提测
   const shipNeedsOverride =
@@ -543,6 +604,8 @@ export const AdvanceDialog = ({
         actionType === "build" && hasBatches && selectedBatchIds.length > 0
           ? selectedBatchIds
           : undefined,
+      // 仅 dev 传推送方式（direct / mr）
+      devPushMode: actionType === "dev" ? devPushMode : undefined,
       replanMode:
         actionType === "plan" && hasPlanHistory ? "append" : undefined,
       // V0.6.25：ship 绕过 check 的 override（仅 ship 且 check 没过 + 勾「仍继续」时传、server 再校验绑定）
@@ -572,24 +635,38 @@ export const AdvanceDialog = ({
             <Label>下一步</Label>
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
               {IMPLEMENTED_ACTIONS.map((type) => {
-                const reason = inferDisabledReason(task, type, gitConfig);
+                const reason = inferDisabledReason(task, type, {
+                  ...gitConfig,
+                  devBranches: liveDevBranches,
+                });
                 return (
-                  <ChoiceButton
-                    key={type}
-                    shape="card"
-                    selected={actionType === type}
-                    onClick={() => setActionType(type)}
-                    disabled={submitting || !!reason}
-                    className="flex flex-col items-start gap-0.5"
-                    title={reason ?? `选「${ACTION_LABEL[type]}」推进`}
-                  >
-                    <div className="flex w-full items-center justify-between gap-1">
-                      <span className="font-medium">{ACTION_LABEL[type]}</span>
-                    </div>
-                    <span className="text-[10px] text-muted-foreground">
-                      {reason ?? ACTION_SUBTITLE[type]}
-                    </span>
-                  </ChoiceButton>
+                  // 外包 relative 容器：disabled 的 <button> 不触发子元素 hover，
+                  // 警告 icon 必须叠在 button 外层才能挂 tooltip（副标题恒显短文案、不被长 reason 撑高）
+                  <div key={type} className="relative">
+                    <ChoiceButton
+                      shape="card"
+                      selected={actionType === type}
+                      onClick={() => setActionType(type)}
+                      disabled={submitting || !!reason}
+                      className="flex h-full w-full flex-col items-start gap-0.5"
+                      title={reason ? undefined : `选「${ACTION_LABEL[type]}」推进`}
+                    >
+                      <div className="flex w-full items-center justify-between gap-1">
+                        <span className="font-medium">{ACTION_LABEL[type]}</span>
+                      </div>
+                      <span className="text-[10px] text-muted-foreground">
+                        {ACTION_SUBTITLE[type]}
+                      </span>
+                    </ChoiceButton>
+                    {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
+                    {reason && (
+                      <Tooltip content={reason}>
+                        <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
+                          <AlertTriangle className="size-3.5" />
+                        </span>
+                      </Tooltip>
+                    )}
+                  </div>
                 );
               })}
               {STUB_ACTIONS.map((type) => (
@@ -820,6 +897,39 @@ export const AdvanceDialog = ({
                 onCheckedChange={setRemoveSourceBranch}
                 disabled={submitting}
               />
+            </div>
+          )}
+
+          {/* V0.x：联调（dev）——推送方式二选一：直推 develop / 提 PR（仅选「联调」时显示） */}
+          {actionType === "dev" && (
+            <div className="grid gap-1.5">
+              <Label>推送方式</Label>
+              <div className="grid grid-cols-2 gap-2">
+                <ChoiceButton
+                  shape="card"
+                  selected={devPushMode === "direct"}
+                  onClick={() => setDevPushMode("direct")}
+                  disabled={submitting}
+                  className="flex flex-col items-start gap-0.5"
+                >
+                  <span className="text-xs font-medium">直接推送</span>
+                  <span className="text-[10px] text-muted-foreground">
+                    本地合 dev 后直推、最快触发流水线
+                  </span>
+                </ChoiceButton>
+                <ChoiceButton
+                  shape="card"
+                  selected={devPushMode === "mr"}
+                  onClick={() => setDevPushMode("mr")}
+                  disabled={submitting}
+                  className="flex flex-col items-start gap-0.5"
+                >
+                  <span className="text-xs font-medium">提 PR</span>
+                  <span className="text-[10px] text-muted-foreground">
+                    建 feature→dev 的 MR、进 MR 列表
+                  </span>
+                </ChoiceButton>
+              </div>
             </div>
           )}
 

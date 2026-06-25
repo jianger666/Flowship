@@ -43,11 +43,13 @@ import {
   getEventsLogPath,
   getTask,
   patchAction,
+  refreshRepoBranches,
   setFeishuTesterUserKeys,
   upsertGitBranch,
   upsertMR,
   setTaskRepoStatus,
   setTaskRunStatus,
+  setTaskAwaitingIfIdle,
   snapshotActionArtifact,
 } from "./task-fs";
 import {
@@ -100,6 +102,7 @@ import type {
   ActionType,
   AskUserQuestion,
   CheckOverride,
+  DevPushMode,
   GitBranchInfo,
   RepoStatus,
   ReplanMode,
@@ -114,7 +117,7 @@ import {
   TASK_ROLE_LABEL,
   TEST_STRATEGY_LABEL,
 } from "@/lib/types";
-import { computeBatchProgress } from "@/lib/task-display";
+import { computeBatchProgress, mrTargetBranchOf } from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
 import { isAskSettled } from "@/lib/ask-pending";
 
@@ -138,6 +141,7 @@ const ACTION_PROMPT_FILE: Record<ActionType, string> = {
   ship: "action-ship.md",
   test: "action-test.md",
   learn: "action-learn.md",
+  dev: "action-dev.md",
 };
 
 // 已实装的 action 类型（advanceTask 准入门槛 1）
@@ -148,6 +152,7 @@ const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
   "review",
   "ship",
   "learn",
+  "dev",
 ]);
 
 const NULL_PLACEHOLDER = "（未提供）";
@@ -498,6 +503,28 @@ const buildPlanReplanDirective = (
   ].join("\n");
 };
 
+// V0.x：联调（dev action）推送方式指令——根据 action.devPushMode 钉「直推 / 提 PR」、两套流程细节在 action-dev.md。
+//   仅 dev action 有值（其它 action 返 undefined）。复用 buildNextActionDirective 通道注入（它已持 action、
+//   不必再走 buildSuperPrompt / internalStartAgent 那一长串传参）。
+const buildDevDirective = (action: ActionRecord): string | undefined => {
+  if (action.type !== "dev") return undefined;
+  const mode = action.devPushMode ?? "direct";
+  if (mode === "mr") {
+    return [
+      "[DEV_PUSH_MODE] 本次联调走「提 PR」：",
+      "- push feature 到 origin、调 submit_mr（target = 该仓 dev 分支、见上方「仓库分支配置」段）建 feature→dev 的 MR。",
+      "- 冲突处理按 action-dev.md「提 PR」段走（同 ship 的 __conflict 智能解 / 用户自己解）。",
+      "- 不要走直推（不在本地 merge dev、不 push dev 分支）。",
+    ].join("\n");
+  }
+  return [
+    "[DEV_PUSH_MODE] 本次联调走「直推」：",
+    "- 本地基于 origin/dev 切 dev、把 feature merge 进来、直推 origin/dev（feature 分支全程不动）。",
+    "- 冲突处理按 action-dev.md「直推」段走（在本地 dev 上 AI 智能解 / 用户自己解）。",
+    "- 不要走提 PR（不调 submit_mr）。",
+  ].join("\n");
+};
+
 // 构造一个 [NEXT_ACTION ...] 头部 + 任务字段热更 + 用户指令 + 批次指令 + 附件段 + branch checkout hint
 // V0.6.27：续接路径（用户勾「续用当前 agent」）可传 actionPlaybook——super prompt 只注入了启动时
 // 那个 action 的 playbook、续接的新 action 指令必须随载荷下发（同类型也附、利用新近性强化遵循）
@@ -546,6 +573,11 @@ const buildNextActionDirective = (input: {
   // V0.6.23：build 分批指令（仅 build 且 plan 有批次时有值）放用户指令后、让 agent 先框定本次范围
   if (batchDirective && batchDirective.trim().length > 0) {
     lines.push(batchDirective.trim(), "");
+  }
+  // V0.x：联调推送方式指令（仅 dev action 有值）——直推 / 提 PR 二选一、从 action.devPushMode 算
+  const devDirective = buildDevDirective(action);
+  if (devDirective) {
+    lines.push(devDirective, "");
   }
   if (attachedImagePaths && attachedImagePaths.length > 0) {
     lines.push(
@@ -626,10 +658,14 @@ const buildRestartActionInstruction = (
   } else {
     // 读完上下文、动手前先问用户：按原计划继续、还是有新调整（用户拍板的重启语义、避免闷头继续）
     // 只给一个「按原计划继续」业务选项、allow_text=true 时 UI 自带「自定义回答」入口让用户改方向。
+    // question 不写死固定句：让 agent 基于刚读的事件日志 + artifact + 工作区半成品、先用 1-2 句
+    // 简述「上次断到哪、当时在做啥」再接问句——重启间隔可能很久、用户（尤其换人接手）常忘了上次
+    // 进度（同事实测痛点）、给个背景才好决策。前端 ask_user 弹窗按 markdown 渲染 question、换行 OK。
     lines.push(
-      `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（参数照抄、只给这一个选项）：`,
+      `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（只给这一个选项）：`,
       `   - task_id="${task.id}"、action_id="${action.id}"`,
-      '   - questions=[{ id:"restart_intent", question:"检测到当前阶段被重启。要我按原计划继续完成这个阶段、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
+      "   - **question 必须先给「上次进展」背景**：基于你刚读的事件日志 + artifact + 工作区半成品，用 1-2 句话说清「上次断开前进展到哪、当时正在做什么」——具体到改了哪个文件 / 哪块逻辑、卡在哪一步，**别套话**（别只写「正在推进这个阶段」这种废话）。换行后再接确认问句。",
+      '   - questions 形如：[{ id:"restart_intent", question:"**上次进展**：<你的 1-2 句简述>。\\n\\n检测到这个阶段被重启，要我按原计划继续完成、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
       "   - 用户选「按原计划继续」→ 直接接着推进、不要再追问。",
       "   - 用户写了自定义回答 → 按新指示调整方向后再推进。",
     );
@@ -1040,15 +1076,9 @@ const checkActionPrerequisites = (
   if (!AVAILABLE_ACTIONS.has(actionType)) {
     return {
       ok: false,
-      reason: `action 类型「${ACTION_LABEL[actionType]}」尚未实现、当前支持 plan / build / review / ship / learn。`,
+      reason: `action 类型「${ACTION_LABEL[actionType]}」尚未实现、当前支持 plan / build / review / ship / learn / dev（联调）。`,
     };
   }
-
-  const lastCompletedOfType = (t: ActionType): ActionRecord | undefined =>
-    task.actions
-      .slice()
-      .reverse()
-      .find((a) => a.type === t && a.status === "completed");
 
   switch (actionType) {
     case "plan":
@@ -1058,23 +1088,12 @@ const checkActionPrerequisites = (
       // 有 plan 时按 plan 工单走、无 plan 时按用户指令直接改（范围以指令为准、靠 review 兜底）。
       return { ok: true };
     case "review":
-      if (!lastCompletedOfType("build")) {
-        return {
-          ok: false,
-          reason: "review 前需要至少 1 个已 approve 的 build action。先推进 build、再进 review。",
-        };
-      }
+      // V0.x：去掉「review 必须先有 build」流程限制——允许直接 review 现状代码找 bug、
+      //   不强求先 build（agent 无改动可复核时会在 artifact 自己说明、不报错）。
       return { ok: true };
     case "ship": {
-      // V0.6.1 准入：
-      //   1. 至少 1 个 build 已 approve（不强求 review、用户可跳过 review 直接 ship）
-      //   2. settings 配了 gitHost + gitToken（不然 server 没法调 GitLab API）
-      if (!lastCompletedOfType("build")) {
-        return {
-          ok: false,
-          reason: "ship 前需要至少 1 个已 approve 的 build action。先推进 build、再进 ship。",
-        };
-      }
+      // V0.x：去掉「ship 必须先有 build」流程限制（没改动直接 ship、agent 会发现工作区干净自己报）。
+      //   保留 GitLab host/token 校验——技术必需（没配真调不了 GitLab API、提不了 MR）、不是流程限制。
       if (!ctx.gitHost || ctx.gitHost.trim().length === 0) {
         return {
           ok: false,
@@ -1089,18 +1108,21 @@ const checkActionPrerequisites = (
       }
       return { ok: true };
     }
-    case "learn": {
-      // V0.6.29 放宽（原草稿要求 merged 后 + 整 task 一次）：
-      //   - 很多沉淀点在 review / ship 阶段就暴露了、且用户不一定及时标 merged
-      //   - 多次跑无危害（prompt 要求第二轮先读上一轮 learn artifact、不重复提炼）
-      const hasCompleted = task.actions.some(
-        (a) => a.type !== "learn" && a.status === "completed",
+    case "learn":
+      // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 会发现
+      //   没过程可复盘、自己说明、不报错。把判断权交给用户。
+      return { ok: true };
+    case "dev": {
+      // V0.x：联调技术准入——至少一个仓配了 dev 分支（dev 分支名没法猜默认、必须设置页显式配）。
+      //   没配 dev 分支的仓 agent 会跳过、全没配则这里拦 + 提示去设置页配（同 ship host/token 性质：技术必需、非流程限制）。
+      const anyDev = task.repoPaths.some(
+        (p) => (task.repoDevBranches?.[p]?.trim() ?? "").length > 0,
       );
-      if (!hasCompleted) {
+      if (!anyDev) {
         return {
           ok: false,
           reason:
-            "learn 需要至少 1 个已完成的 action（plan / build / review / ship）——有了过程才有可沉淀的经验。",
+            "联调需要先给仓库配 dev 分支（设置 → 仓库列表 → dev 分支）、否则不知道推到哪。",
         };
       }
       return { ok: true };
@@ -1367,7 +1389,12 @@ const planBranchesForBuild = (
     lines.push(`  git checkout ${name}`);
     lines.push("else");
     lines.push(
-      `  git fetch origin "$BASE" && git checkout -b ${name} "origin/$BASE"`,
+      // --no-track：feature 绝不 track 线上分支。否则 git 默认（autoSetupMerge=true、从 origin/<线上>
+      //   切时自动设 upstream=origin/<线上>）会让之后的裸 git push（+ push.default=upstream/tracking）
+      //   误推线上、污染线上分支。--no-track 让新建分支不设 upstream；同名 upstream（origin/feature）
+      //   由 ship 首次 `git push -u origin <feature>` 自然建立（-u 会覆盖、连存量脏分支也一并修回同名）。
+      //   注：build 故意不主动 unset upstream——保住用户/ship 手动设好的同名 upstream、不打扰人手动推送。
+      `  git fetch origin "$BASE" && git checkout -b ${name} --no-track "origin/$BASE"`,
     );
     lines.push("fi");
     // V0.6.20 防御：checkout 后强制 verify 当前分支 == 目标分支。
@@ -1430,11 +1457,19 @@ export interface AdvanceTaskInput {
   gitToken?: string;
   // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=自由改动不计进度）
   requestedBatchIds?: string[];
+  // V0.x：联调推送方式（仅 dev、推进 dialog 选）——direct 直推 / mr 提 PR
+  devPushMode?: DevPushMode;
   // V0.8.x：plan 重跑时如何合并批次（append=补充需求、rebuild=重建后续）
   replanMode?: ReplanMode;
   // V0.6.25 CheckRun：ship 时的 gate override（最新 build 的 check 没过 / 没配、用户勾「仍继续」+ reason）
   //   server 端校验它绑的是最新 build 的 checkRun（防重 build 后失效的 override 蒙混过关）、仅 ship 用
   checkOverride?: CheckOverride;
+  // V0.x A 方案：client 随推进带来的设置页最新分支配置（per-repo、只含设置页找得到 + 非空的仓）。
+  //   advanceTask 起 agent 注入前调 refreshRepoBranches 刷新 task 快照——设置页改了、老 task 下次推进就生效。
+  //   只覆盖传来的仓、没传的保留原快照（防误清）。不含 feature 分支（git 已建、必须固化）。
+  repoBaseBranches?: Record<string, string>;
+  repoTestBranches?: Record<string, string>;
+  repoDevBranches?: Record<string, string>;
 }
 
 export interface RestartCurrentActionInput {
@@ -1531,7 +1566,6 @@ const advanceTaskInner = async (
   input: AdvanceTaskInput,
 ): Promise<{ action: ActionRecord }> => {
   const {
-    task,
     actionType,
     userInstruction,
     attachedImagePaths,
@@ -1543,18 +1577,71 @@ const advanceTaskInner = async (
     gitHost,
     gitToken,
     requestedBatchIds,
+    devPushMode,
     replanMode,
     checkOverride,
+    repoBaseBranches,
+    repoTestBranches,
+    repoDevBranches,
   } = input;
+  // task 用 let：去掉「通过」后、推进开头会隐式认可当前 awaiting_ack action、之后重读最新 task 供准入 / appendAction 用
+  let task = input.task;
 
   // V0.8.18：推进新 action 前、取消上一 action 可能还在后台跑的 check（结果对新 action 无意义、且防状态交错）
   abortRunningCheck(task.id);
+
+  // V0.x A 方案：用 client 随推进带来的设置页最新分支配置刷新 task 分支快照。
+  //   必须放在准入（checkActionPrerequisites 读 repoDevBranches）/ appendAction /
+  //   agent 注入（renderRepoBranchSection 读 repoXxxBranches）之前——否则用的还是建 task 旧快照。
+  //   只覆盖传来的仓、没传的保留（refreshRepoBranches 内 allowed + 非空过滤、防误清）。
+  if (repoBaseBranches || repoTestBranches || repoDevBranches) {
+    const refreshed = await refreshRepoBranches(task.id, {
+      base: repoBaseBranches,
+      test: repoTestBranches,
+      dev: repoDevBranches,
+    });
+    if (refreshed) task = refreshed;
+  }
 
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
   const effectiveForceNewAgent =
     !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
+
+  // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
+  //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites / checkShipCheckGate 看到的就是
+  //   「认可后」状态（当前 action 已 completed）、原准入逻辑一行不用动。
+  const existingRecord = runningTasks.get(task.id);
+  const pendingAck = task.actions.find(
+    (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
+  );
+  if (pendingAck) {
+    if (existingRecord && !effectiveForceNewAgent) {
+      // 续接：acknowledgeAction 发 [ACTION_ACK approve] 让旧 agent 转待命 + 标 completed + 写事件。
+      //   下方 submitNextAction 若早于 agent 进待命、pendingNextActions 兜时序（V0.6.19）。
+      await acknowledgeAction(task.id, pendingAck.id, "approve");
+    } else {
+      // force-new / 无活 agent：旧 agent 下面反正要 cancel、不发信号（发了会因 agent 将死 throw）、
+      //   只标 completed + 写审计事件——否则 force-new 路径的 finalizeStaleActions 会把它误标 cancelled。
+      const patched = await patchAction(task.id, pendingAck.id, {
+        status: "completed",
+      });
+      if (patched) {
+        publish(task.id, { kind: "task", task: patched });
+        const a = patched.actions.find((x) => x.id === pendingAck.id);
+        if (a) publish(task.id, { kind: "action", action: a });
+      }
+      await writeEventAndPublish(task.id, {
+        kind: "action_ack",
+        actionId: pendingAck.id,
+        text: `Action ${pendingAck.type} n=${pendingAck.n} 已通过（推进时自动认可）`,
+        meta: { decision: "approve" },
+      });
+    }
+    // 认可改了当前 action 状态 → 重读最新 task、后续准入 / appendAction / 路由都用它
+    task = (await getTask(task.id)) ?? task;
+  }
 
   // 1) 准入条件（V0.6 门槛 1）
   const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
@@ -1579,6 +1666,8 @@ const advanceTaskInner = async (
     // V0.6.23：仅 build 带批次选择（其它 action 不传、appendAction 内部空数组也归 undefined）
     requestedBatchIds: actionType === "build" ? requestedBatchIds : undefined,
     replanMode: actionType === "plan" ? replanMode : undefined,
+    // V0.x：仅 dev 带推送方式（appendAction 内部也按 type 过滤）
+    devPushMode: actionType === "dev" ? devPushMode : undefined,
   });
   if (!created) {
     throw new Error(`appendAction 失败 task=${task.id}（task 不存在）`);
@@ -1646,8 +1735,7 @@ const advanceTaskInner = async (
   // buildPlanReplanDirective 内部自己判 plan + replanMode、非 plan / 无 replanMode 返 undefined
   const replanDirective = buildPlanReplanDirective(action, taskAfterAppend);
 
-  // 4) 决定路由
-  const existingRecord = runningTasks.get(task.id);
+  // 4) 决定路由（existingRecord 已在开头隐式认可段提前取）
   if (existingRecord && !effectiveForceNewAgent) {
     // V0.6.6 热更：agent 长生期间用户可能在详情页改了 role / title / feishuStoryUrl
     // diff 启动快照、有变才拼一段 [TASK_UPDATED] 注入；注入后把快照推进到当前值、避免下次重复告知同一变更
@@ -1996,6 +2084,18 @@ export const finalizeTask = async (
     );
   }
 
+  // V0.x：merged（已合入）时、当前还在等 ack 的 action 标 completed——用户认可了产物才去合 MR、
+  //   不该记成 cancelled（abandoned 维持下面的 cancelled：没认可就放弃）。
+  if (finalStatus === "merged") {
+    const fresh = await getTask(taskId);
+    const cur = fresh?.actions.find(
+      (a) => a.id === fresh.currentActionId && a.status === "awaiting_ack",
+    );
+    if (cur) {
+      const patched = await patchAction(taskId, cur.id, { status: "completed" });
+      if (patched) publish(taskId, { kind: "task", task: patched });
+    }
+  }
   // 兜底收尾遗留的非终态 action（防 abandon / merge 后 action 卡 awaiting_ack、永久划不掉）
   await finalizeStaleActions(taskId, "cancelled");
 
@@ -2155,18 +2255,29 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         return { ok: false, error: valid.error };
       }
 
+      // V0.x：submit_mr 共用 ship / dev（dev = 联调提 PR→dev 分支）、下面按 action 类型分流。
+      const submitAction = fresh.actions.find((x) => x.id === taskAction.actionId);
+      const isDevSubmit = submitAction?.type === "dev";
+
       // V0.6.8：AI 智能解冲突会换 source 分支（feature → feature__conflict）、
-      // 先读出该仓「上一次 ship 用的 source 分支」、待新 MR 建好后把旧 MR 关掉（防双 MR 垃圾）。
+      // 先读出该仓「上一次同目标分支 MR 的 source 分支」、待新 MR 建好后把旧 MR 关掉（防双 MR 垃圾）。
+      // V0.x：按 (repoPath, 目标分支) 找——提测 MR（→test）和联调 MR（→dev）各找各的、互不误关。
       const prevMrBranch = fresh.mrs?.find(
-        (m) => m.repoPath === taskAction.repoPath,
+        (m) =>
+          m.repoPath === taskAction.repoPath &&
+          mrTargetBranchOf(m, fresh.repoTestBranches) === taskAction.targetBranch,
       )?.branch;
 
       // V0.6.14：合并后是否删源分支——读 task 配置（缺省保留、用户拍板）。
-      // 但 `<feature>__conflict` 一次性解冲突分支必删（不留垃圾分支、不受用户开关影响）。
+      // - `<feature>__conflict` 一次性解冲突分支：必删（不留垃圾、不受开关影响）。
+      // - dev（联调）提 PR：feature 源分支绝不删（联调合入后还要继续开发 / 提测、删了就没分支了）。
+      // - ship（提测）：按 task 配置 removeSourceBranchOnMerge（缺省保留）。
       const isConflictBranch = taskAction.sourceBranch.endsWith("__conflict");
       const removeSourceBranch = isConflictBranch
         ? true
-        : (fresh.removeSourceBranchOnMerge ?? false);
+        : isDevSubmit
+          ? false
+          : (fresh.removeSourceBranchOnMerge ?? false);
 
       const result = await createMR({
         config: { host: gitHost, token: gitToken },
@@ -2223,8 +2334,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const detailedStatus = mergeStatus.ok ? mergeStatus.detailedStatus : "unknown";
       const mergeUndetermined = mergeStatus.ok ? mergeStatus.undetermined : true;
 
-      // upsert task.mrs[]（按 repoPath、同仓多次 ship 累计 version++）
+      // upsert task.mrs[]（按 repoPath+目标分支、同仓同目标多次提交累计 version++）
       const upserted = await upsertMR(task.id, taskAction.repoPath, {
+        targetBranch: taskAction.targetBranch,
         url: result.url,
         title: taskAction.title,
         branch: taskAction.sourceBranch,
@@ -2243,6 +2355,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // 走 task-fs 原子函数（withTaskLock 包 read-modify-write）、不在这里 getTask→patchAction 两段非原子
       const patched = await appendActionSideEffectMR(task.id, taskAction.actionId, {
         repoPath: taskAction.repoPath,
+        targetBranch: taskAction.targetBranch,
         mrUrl: result.url,
         mrVersion,
         branch: taskAction.sourceBranch,
@@ -2379,8 +2492,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // check 跑完再由 runActionPostCheck 落 postCheck/checkRun + 切 awaiting_ack + 发「产出完成」事件。
       runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
     } else {
-      // 待命态：runStatus 切 awaiting_user、currentActionId 留 null
-      const updated = await setTaskRunStatus(task.id, "awaiting_user", null);
+      // 待命态：agent ack 完、调 wait_for_user(空 action_id) 等下一 action 指令 → 切 awaiting_user。
+      // 用 setTaskAwaitingIfIdle（锁内 compare-set）防 force-new 秒推 race：approve 后用户秒推下一 action、
+      //   advanceTask 已把 runStatus 设 running 且新 action 在跑时、此处被取消的旧 agent 迟到的待命通知
+      //   不能把 running 覆盖回 awaiting_user（否则新 action 在跑却显示「等待回复」、推进按钮误亮、僵尸组合）。
+      const updated = await setTaskAwaitingIfIdle(task.id);
       if (updated) publish(task.id, { kind: "task", task: updated });
     }
   };

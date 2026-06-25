@@ -88,6 +88,8 @@ export const runActionCheck = async (
         return await checkReview(task, action);
       case "ship":
         return await checkShip(task, action);
+      case "dev":
+        return await checkDev(task, action);
       default: {
         const _: never = action.type;
         return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
@@ -457,6 +459,72 @@ const checkShip = async (
   return {
     passed: allPassed,
     details: sections.length > 0 ? sections.join("\n\n") : "ship 检查通过",
+  };
+};
+
+// ----------------- dev（联调、V0.x）-----------------
+//
+// 联调两种推送方式（action.devPushMode）：
+//   - direct（直推）：本地 merge dev + 推 origin/dev、无 MR。推送 / 流水线结果 ai-flow 不追、
+//     信任 agent 在 artifact 自述——这里不做 MR 维度门禁、只校验有产出（artifactPath）。
+//   - mr（提 PR）：建 feature→dev 的 MR、复用 ship 同款门禁（URL 非空 + 冲突拦），文案换成联调 / dev。
+// 不做 ship 那套「每仓缺 MR 必须写跳过说明」的强校验——联调更轻、不强制覆盖所有仓、避免误拦。
+const checkDev = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult> => {
+  if (!action.artifactPath) {
+    return { passed: false, details: "联调没产出 artifact" };
+  }
+  const mrRecords = action.sideEffects?.mrs ?? [];
+
+  // 无 MR：直推模式（或提 PR 模式跳过了所有仓）——无 MR 维度可验、信任 artifact 自述、放行。
+  if (mrRecords.length === 0) {
+    return {
+      passed: true,
+      details:
+        action.devPushMode === "mr"
+          ? "联调（提 PR）：本次没记录到 MR、按 artifact 自述处理（可能所有仓都跳过了）"
+          : "联调（直推）：无 MR、推送 / 流水线结果见 artifact",
+    };
+  }
+
+  // 有 MR（提 PR 模式）：URL 非空 + 无冲突（同 ship 门禁、文案换成联调 / dev）。
+  const sections: string[] = [];
+  let allPassed = true;
+
+  const missingUrl = mrRecords.filter(
+    (m) => !m.mrUrl || m.mrUrl.trim().length === 0,
+  );
+  if (missingUrl.length > 0) {
+    allPassed = false;
+    sections.push(
+      `❌ ${missingUrl.length} 条联调 MR 记录 URL 为空（${missingUrl
+        .map((m) => m.repoPath)
+        .join(", ")}）`,
+    );
+  } else {
+    sections.push(
+      `✅ ${mrRecords.length} 条联调 MR、URL 都非空：\n${mrRecords
+        .map((m) => `   - ${m.repoPath}（v${m.mrVersion}）: ${m.mrUrl}`)
+        .join("\n")}`,
+    );
+  }
+
+  // 跟 dev 分支有冲突 → 联调不算干净完成（同 ship 冲突门禁）、用户解完重跑。
+  const conflictMrs = mrRecords.filter((m) => m.hasConflicts === true);
+  if (conflictMrs.length > 0) {
+    allPassed = false;
+    sections.push(
+      `❌ ${conflictMrs.length} 条联调 MR 跟 dev 有冲突、需用户手动解决后重跑：\n${conflictMrs
+        .map((m) => `   - ${m.repoPath}（v${m.mrVersion}）: ${m.mrUrl}`)
+        .join("\n")}`,
+    );
+  }
+
+  return {
+    passed: allPassed,
+    details: sections.join("\n\n"),
   };
 };
 

@@ -67,13 +67,13 @@ describe("validateSubmitMr", () => {
     if (!r.ok) expect(r.error).toContain("不属于本 task");
   });
 
-  it("action_id 不是 ship action → 拒", async () => {
+  it("action_id 不是 ship / dev action → 拒", async () => {
     const r = await validateSubmitMr(baseTask(), {
       ...baseMr,
       actionId: "act_2", // build action
     });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("ship action");
+    if (!r.ok) expect(r.error).toContain("ship / dev action");
   });
 
   it("target_branch 不是该仓测试分支 → 拒（不许提 master）", async () => {
@@ -122,6 +122,39 @@ describe("validateSubmitMr", () => {
     expect(
       (await validateSubmitMr(task, { ...baseMr, sourceBranch: "  " })).ok,
     ).toBe(false);
+  });
+
+  // V0.x：联调（dev action）提 PR——target 校验改成该仓 dev 分支（必须显式配）
+  const devTask = (over: Partial<Task> = {}): Task =>
+    baseTask({
+      currentActionId: "act_4",
+      actions: [
+        { id: "act_2", n: 2, type: "build", status: "completed" },
+        { id: "act_4", n: 4, type: "dev", status: "running" },
+      ],
+      repoDevBranches: { [REPO]: "develop" },
+      ...over,
+    } as Partial<Task>);
+  const devMr = { ...baseMr, actionId: "act_4", targetBranch: "develop" };
+
+  it("dev action + target=该仓 dev 分支 → ok", async () => {
+    expect((await validateSubmitMr(devTask(), devMr)).ok).toBe(true);
+  });
+
+  it("dev action + target 不是 dev 分支（如 test）→ 拒", async () => {
+    const r = await validateSubmitMr(devTask(), {
+      ...devMr,
+      targetBranch: "test",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("dev 分支");
+  });
+
+  it("dev action 但该仓没配 dev 分支 → 拒", async () => {
+    const task = devTask({ repoDevBranches: undefined } as Partial<Task>);
+    const r = await validateSubmitMr(task, devMr);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("没配 dev 分支");
   });
 });
 
