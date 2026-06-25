@@ -304,19 +304,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### v0.8.20：chat 体验三处打磨——工作目录 Open Recent picker + 对话重命名 + 模型 1M 去「按量计费」（2026-06-23）
+### v0.8.22：自由对话回归 text-delta 流式（M/C' 范式）+ 后置 check 跳过 --fix/--write 类命令（2026-06-24）
 
-- **工作目录选择器（chat footer）改 Open Recent 模式**：原来点开下拉只有一个「选择文件夹」按钮、等于空壳多一步（用户实测嫌赘）。抄 codex / Cursor Agents / VS Code 共识：点开 = 顶部当前完整路径（不截断）+「最近」用过的目录一键切换 +「浏览…」选新目录 +「改用主目录」重置。最近目录走 `src/lib/recent-workdirs.ts`（localStorage MRU、去重 + 上限 5、纯本地便利、不进 config.json）。
-- **chat 对话重命名**：chat 模式去掉新建弹窗后没了改名入口、在 `chat-view.tsx` 顶部标题旁加 ghost 铅笔按钮、走 `useDialog().prompt` → 复用 `updateTaskFields(id, { title })` 落盘。
-- **模型选 1M 去掉「（MAX、按量计费）」后缀**（`model-select.tsx`）：用户实测是没用的废话、删 `renderParamValue` 里 context=1m 的特判（顺手清掉不再用的 `p` 参数 + 2 个调用处）。
-- 验证：typecheck + lint 全绿；test 包重打 + 核验（chunk hash 变、MRU key +「浏览…」在新包里）。
+- **自由对话回归流式（M/C' 范式、替代 V0.8.21 的 message 范式）**：原 message 范式把整篇回复正文塞进 `wait_for_user` 的 `message` 参数让 composer「先产出再挂等」（治提前挂等）、但工具参数**不流式**、用户要等一次性 flush 才看到全部。调研实证 SDK 不发 partial-tool-call（5 轮探针、`message` 无法增量流式）。改回：**正文直接走 text-delta 通道输出**（天然逐字流式、`case "assistant"` 实时展示）、`wait_for_user.message` 改填**一句话概括**（给历史 / 标题、不展示给用户）、纯做「逼 composer 先产出正文再挂等」的钩子。premature 兜底相应改为：message 非空（声明已回复）→ 清计数放行；message 空 → 读 events 判（仅「用户在等 + 本轮没 stream 出正文」才拦）。删 `chat_message` 派发整套（`AwaitingSignal` 类型 / `safeNotifyChatMessage` / handler 调用 / chat-runner 展示分支 / task-runner 防御）。**task 模式零影响**：新逻辑全包在 `chatModeTasks.has(task_id) && !action_id` 内、task 永不在 `chatModeTasks`（仅 chat-runner `markTaskAsChat` 写入）；改的 4 个 prompt 片段（`chatWaitProtocolSection` / `chatShellWaitGuideBody` / `replyThenWaitReminder` / `firstTurnReplyThenWaitReminder`）全 chat 专用、task 用的 `waitDisciplineSection` 没动；`wait_for_user` describe 里 task 的硬性规则段一字未改。
+- **后置 check 跳过会改写工作区的命令（--fix/--write 类）**：lint 脚本带 `--fix`（`ng lint --fix=true` / `eslint --fix` / `prettier --write`）当 check 跑有两坑（线上 cp-admin 踩过）：① 偷改源码污染工作区、被 `mutatedWorktree` 事后判 failed（误红）；② 用户本地开着 dev server（`ng serve` / `vite` watch）时、lint --fix 跑的几十秒里连环改文件 → dev 连环热重载、终端「一直重启」。新增 `isMutatingScript`（`repo-check-detect.ts`、识别 --fix/--write/--apply、negative-lookahead 排除 --fix-dry-run）+ `willCommandMutateWorktree`（`action-checks.ts`、解析 `<pm> run <script>` 的 package.json script 体、识破藏在 script 内的 fix flag）。检测层（过滤新建 task auto-detect）+ 执行层（拦存量 task 已固化命令）双重拦截、跳过记 `skipped` + 原因、不计入 failed（聚合用 `executed` 排除 skipped、全跳过退回 dirty 判定记 not_configured）。UI（`check-run-summary.tsx`）配了命令但全跳过显示「会改写源码、已跳过」。
+- 验证：typecheck + lint 全绿；打包 test 探针实测 ✅ composer 完整正文走 text-delta（1102 chunk）、概括进 message；用户简单跑过。
 
-### v0.8.19：auto-detect 跳过 watch 模式脚本、从源头防 typecheck 当 check 卡死（2026-06-22）
+### v0.8.21：兼容 stdio 命令方式配置的飞书 MCP——新建任务校验不再只认 url（2026-06-24）
 
-- **背景（接 v0.8.18 同一次排查）**：v0.8.18 根因之一是 cp-haomao 的 `"tsc": "node_modules/typescript/bin/tsc -w"`（watch 模式）被自动检测当 typecheck check 拉进来——watch 永不退出、必撞满 120s timeout（meta.json 实证三次 build 全 timed_out ~120s）。v0.8.18 治了「check 卡死 wait_for_user」的架构层；本版从源头治「别把 watch 脚本当 check」。
-- **改法（不动正常脚本既有行为、只在脚本是 watch 时走兜底）**：`repo-check-detect.ts` 新增 `isWatchScript`（识别独立 `-w`/`--watch` token、词边界、不误伤 `--ext .tsx`/`--noEmit`）。① 选中的 typecheck 脚本是 watch → 不用脚本、兜底跑一次性 `npx tsc --noEmit` 且 `required:false`（我们替换猜的命令、降级只展示不挡 ship、沿用本模块「宁可少挡不误挡」哲学）；② lint 脚本是 watch → 直接跳过。**正常（非 watch）脚本逐字不变**。
-- **影响面（零碰线上已有）**：auto-detect 唯一调用点是 `task-fs.createTask`、**只在建 task 时跑、只影响新建 task**、对线上已有 task 零影响（快照不动）；已踩坑的老 task 需在设置页手动覆盖该仓 typecheck 为 `tsc --noEmit` 或重建。
-- 验证：typecheck + lint 全绿、vitest **132 全过**（新增 `tests/repo-check-detect.test.ts`：isWatchScript 正反用例 + cp-haomao 真实案例）。
+- **问题**：同事用 `npx @lark-project/mcp --domain https://project.feishu.cn` 这种 stdio 命令方式配飞书项目 MCP（无 `url` 字段、域名在 args、token 在 env）、task 新建弹窗旧校验只看 `"url" in cfg` → 误判飞书 MCP 未配置、创建按钮一直置灰。
+- **改法**（`new-task-dialog.tsx`）：飞书 MCP 校验从「只扫 url 字段」改为新增 `collectMcpHaystack`——把单个 server 配置里 `url + command + args + env 值`全拼成一段、按域名（`mcp.feishu.cn` / `project.feishu.cn`）substring 匹配。两种配法都兼容：① url 远程型（域名在 url）；② stdio 命令型（域名藏 command/args/env）。按域名认、不认 key 名。
 
 ---
 

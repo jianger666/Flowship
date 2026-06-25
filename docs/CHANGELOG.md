@@ -15,6 +15,20 @@
 
 ---
 
+### v0.8.20：chat 体验三处打磨——工作目录 Open Recent picker + 对话重命名 + 模型 1M 去「按量计费」（2026-06-23）
+
+- **工作目录选择器（chat footer）改 Open Recent 模式**：原来点开下拉只有一个「选择文件夹」按钮、等于空壳多一步（用户实测嫌赘）。抄 codex / Cursor Agents / VS Code 共识：点开 = 顶部当前完整路径（不截断）+「最近」用过的目录一键切换 +「浏览…」选新目录 +「改用主目录」重置。最近目录走 `src/lib/recent-workdirs.ts`（localStorage MRU、去重 + 上限 5、纯本地便利、不进 config.json）。
+- **chat 对话重命名**：chat 模式去掉新建弹窗后没了改名入口、在 `chat-view.tsx` 顶部标题旁加 ghost 铅笔按钮、走 `useDialog().prompt` → 复用 `updateTaskFields(id, { title })` 落盘。
+- **模型选 1M 去掉「（MAX、按量计费）」后缀**（`model-select.tsx`）：用户实测是没用的废话、删 `renderParamValue` 里 context=1m 的特判（顺手清掉不再用的 `p` 参数 + 2 个调用处）。
+- 验证：typecheck + lint 全绿；test 包重打 + 核验（chunk hash 变、MRU key +「浏览…」在新包里）。
+
+### v0.8.19：auto-detect 跳过 watch 模式脚本、从源头防 typecheck 当 check 卡死（2026-06-22）
+
+- **背景（接 v0.8.18 同一次排查）**：v0.8.18 根因之一是 cp-haomao 的 `"tsc": "node_modules/typescript/bin/tsc -w"`（watch 模式）被自动检测当 typecheck check 拉进来——watch 永不退出、必撞满 120s timeout（meta.json 实证三次 build 全 timed_out ~120s）。v0.8.18 治了「check 卡死 wait_for_user」的架构层；本版从源头治「别把 watch 脚本当 check」。
+- **改法（不动正常脚本既有行为、只在脚本是 watch 时走兜底）**：`repo-check-detect.ts` 新增 `isWatchScript`（识别独立 `-w`/`--watch` token、词边界、不误伤 `--ext .tsx`/`--noEmit`）。① 选中的 typecheck 脚本是 watch → 不用脚本、兜底跑一次性 `npx tsc --noEmit` 且 `required:false`（我们替换猜的命令、降级只展示不挡 ship、沿用本模块「宁可少挡不误挡」哲学）；② lint 脚本是 watch → 直接跳过。**正常（非 watch）脚本逐字不变**。
+- **影响面（零碰线上已有）**：auto-detect 唯一调用点是 `task-fs.createTask`、**只在建 task 时跑、只影响新建 task**、对线上已有 task 零影响（快照不动）；已踩坑的老 task 需在设置页手动覆盖该仓 typecheck 为 `tsc --noEmit` 或重建。
+- 验证：typecheck + lint 全绿、vitest **132 全过**（新增 `tests/repo-check-detect.test.ts`：isWatchScript 正反用例 + cp-haomao 真实案例）。
+
 ### v0.8.18：build 后置 CheckRun 改后台异步、修 wait_for_user 被 check 阻塞超时（2026-06-22）
 
 - **问题（线上 task t_…vcft9c 实测）**：agent 调用顺序错乱——「先报完成又继续思考做事」、甚至「不调 wait_for_user」。事件流见 wait_for_user 反复超时、agent 瞎编不存在的 `/wait` 端点 + read events 自救、「Action 产出完成」事件重复刷且跨 action 边界冒出（act_4 的 check 在 act_5 运行期间才落、状态交错）。
