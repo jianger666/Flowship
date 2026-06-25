@@ -78,12 +78,13 @@ import type {
 
 // 已实装的 action 类型；test 灰掉（learn V0.6.29 实装）
 // V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
+// 顺序即工作流推进顺序：build → review → 先联调（dev、推 develop 触发联调流水线）→ 再提测（ship、推测试分支）
 const IMPLEMENTED_ACTIONS: ActionType[] = [
   "plan",
   "build",
   "review",
-  "ship",
   "dev",
+  "ship",
   "learn",
 ];
 const STUB_ACTIONS: ActionType[] = ["test"];

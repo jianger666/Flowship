@@ -316,6 +316,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **去 review/ship/learn 流程前置、留技术前置**：`checkActionPrerequisites` + `inferDisabledReason` 删「review/ship 必须先 build」「learn 必须先有 completed action」——可直接 review 现状找 bug / 没改动直接 ship（agent 自报工作区干净）/ 空 task learn 自说明；保留 ship gitHost+token、dev 至少一仓配 dev 分支（技术必需、非流程）。
 - **push 同名分支修复（--no-track）**：build checkout feature 改 `git checkout -b <feature> --no-track "origin/$BASE"`——堵 git `autoSetupMerge=true` 默认把 feature 的 upstream 设成 `origin/<线上>`、导致后续裸 `git push` 误推线上分支（后端同事踩过、其线上分支名跟前端不同）；同名 upstream 由 ship 首次 `git push -u origin <feature>` 自然建立、build 不主动 unset（不打扰用户手动设的同名 upstream）。
 - **restart ask_user 给「上次进展」背景**：阶段重启时 ask_user question 不写死固定句、要 agent 基于事件日志 + artifact + 工作区半成品先 1-2 句说清「上次断到哪、在做啥」再接确认问句（重启间隔久 / 换人接手常忘进度）。
+- **（v0.8.24）推进 dialog action 顺序**：联调（dev）chip 排到提测（ship）前——工作流先联调推 develop、再提测推测试分支。
 - 验证：typecheck + lint 全绿、vitest 135 全过（submit-mr-guard 加 dev 用例）；打 test 包核验联调 UI + 分支同步透传进包。
 
 ### v0.8.22：自由对话回归 text-delta 流式（M/C' 范式）+ 后置 check 跳过 --fix/--write 类命令（2026-06-24）
