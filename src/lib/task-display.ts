@@ -35,7 +35,6 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   build: "改代码",
   review: "复核",
   ship: "提测",
-  test: "AI 手测",
   learn: "沉淀",
   dev: "联调",
 };
@@ -46,7 +45,6 @@ export const ACTION_LABEL_EN: Record<ActionType, string> = {
   build: "Build",
   review: "Review",
   ship: "Ship",
-  test: "Test",
   learn: "Learn",
   dev: "Dev",
 };
@@ -57,7 +55,6 @@ export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
   build: "实现",
   review: "复核",
   ship: "提测",
-  test: "手测",
   learn: "沉淀",
   dev: "联调",
 };

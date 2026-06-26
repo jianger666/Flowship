@@ -7,8 +7,8 @@
  * 选下一个 action 类型 + 写指令。
  *
  * 字段：
- *   - action 类型（plan / build / review / ship / test / learn）
- *     - 已实装：plan / build / review / ship / learn（V0.6.29）；test 仍 stub 灰掉
+ *   - action 类型（plan / build / review / ship / learn / dev）
+ *     - 全部已实装（learn V0.6.29）
  *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
@@ -76,7 +76,7 @@ import type {
   Task,
 } from "@/lib/types";
 
-// 已实装的 action 类型；test 灰掉（learn V0.6.29 实装）
+// 已实装的 action 类型（全部已实装、learn V0.6.29）
 // V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
 // 顺序即工作流推进顺序：build → review → 先联调（dev、推 develop 触发联调流水线）→ 再提测（ship、推测试分支）
 const IMPLEMENTED_ACTIONS: ActionType[] = [
@@ -87,16 +87,6 @@ const IMPLEMENTED_ACTIONS: ActionType[] = [
   "ship",
   "learn",
 ];
-const STUB_ACTIONS: ActionType[] = ["test"];
-const STUB_VERSION: Record<ActionType, string | undefined> = {
-  plan: undefined,
-  build: undefined,
-  review: undefined,
-  ship: undefined,
-  test: "待上线",
-  learn: undefined,
-  dev: undefined,
-};
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
 // 服务端会双重校验、UI 仅为提示用户「为什么这个 action 不能选」
@@ -138,8 +128,6 @@ const inferDisabledReason = (
       if (!anyDev) return "需要先在「设置 → 仓库列表」给仓库配 dev 分支";
       return null;
     }
-    case "test":
-      return `${STUB_VERSION[type]}`;
     default: {
       const _: never = type;
       return _;
@@ -154,7 +142,6 @@ const ACTION_SUBTITLE: Record<ActionType, string> = {
   build: "写代码",
   review: "复核差异 + 找 bug",
   ship: "提 MR 到 test",
-  test: "AI 手测",
   learn: "沉淀经验进仓库",
   dev: "推送到 develop",
 };
@@ -166,7 +153,6 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
   build: "具体改什么、指向哪个文件 / 函数 / bug",
   review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
   ship: "（可选）MR 标题 / 描述要点、不填自动生成",
-  test: "（待上线）跑哪些 case？默认全跑",
   learn: "（可选）想重点沉淀什么？默认全量复盘提炼",
   dev: "（可选）联调要点、不填按标准流程推 dev",
 };
@@ -212,7 +198,7 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
 // 算 dialog 打开时默认选中哪个 action chip（V0.6.0.1 起改名、原 inferRecommended）：
 // - repoStatus = has_bug → build（业务状态映射：有 bug 就是要回 build）
 // - repoStatus = awaiting_test → ship（V0.6.1 起：还能再推一次 / fix 后再 ship）
-// - repoStatus = merged → learn（V0.6.29 起、task 收尾沉淀时机）
+// - repoStatus = merged → 走通用 fall through（V0.x：去掉「merged 默认 learn」、沉淀改纯按需、不再主动推荐）
 // - repoStatus = abandoned → plan（task 已关闭、用户也不会走推进 dialog）
 // - 无 action → plan
 // - 最近一条 completed action：plan → build / build → review / review → ship（V0.6.1 起解锁）
@@ -222,8 +208,8 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
 const inferDefaultActionType = (task: Task): ActionType => {
   if (task.repoStatus === "has_bug") return "build";
   if (task.repoStatus === "awaiting_test") return "ship"; // 测试反馈后 fix 完仍走 ship
-  // merged 后默认 learn（V0.6.29 实装）：task 收尾、经验最完整的沉淀时机
-  if (task.repoStatus === "merged") return "learn";
+  // V0.x：去掉「merged → learn」默认（沉淀太频繁、用户拍板改纯按需）——merged 走下面通用 fall through、
+  //   想沉淀用户自己选 learn chip、系统不再默认选中 / 不暗示「该沉淀了」
   if (task.repoStatus === "abandoned") return "plan";
 
   if (task.actions.length === 0) return "plan";
@@ -670,27 +656,6 @@ export const AdvanceDialog = ({
                   </div>
                 );
               })}
-              {STUB_ACTIONS.map((type) => (
-                <ChoiceButton
-                  key={type}
-                  shape="card"
-                  selected={false}
-                  onClick={() => {}}
-                  disabled
-                  className="flex flex-col items-start gap-0.5 opacity-50"
-                  title={`${STUB_VERSION[type]} 上线`}
-                >
-                  <div className="flex w-full items-center justify-between gap-1">
-                    <span className="font-medium">{ACTION_LABEL[type]}</span>
-                    <span className="text-[10px] text-muted-foreground">
-                      {STUB_VERSION[type]}
-                    </span>
-                  </div>
-                  <span className="text-[10px] text-muted-foreground">
-                    未实装
-                  </span>
-                </ChoiceButton>
-              ))}
             </div>
           </div>
 

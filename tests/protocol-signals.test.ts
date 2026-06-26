@@ -86,7 +86,7 @@ describe("信号构造函数格式", () => {
     );
     // _super.md 里教 agent 的格式样例必须与构造端字段顺序一致
     expect(superMd).toContain(
-      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|test|learn> n=<N> artifact_path=actions/<N>-<type>.md]",
+      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev> n=<N> artifact_path=actions/<N>-<type>.md]",
     );
   });
 
@@ -157,7 +157,7 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       // V0.6.29：learn action 挖事件日志
       "eventsLogPath",
     ]);
-    for (const type of ["plan", "build", "review", "ship", "test", "learn"]) {
+    for (const type of ["plan", "build", "review", "ship", "learn", "dev"]) {
       const md = readFileSync(
         path.join(promptsDir, `action-${type}.md`),
         "utf-8",

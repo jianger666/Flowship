@@ -17,7 +17,6 @@
  *   - review: artifact「总评」段声明的「基底 commit」跟实际 `git rev-parse HEAD` 一致（防 agent 拿错 / 编造基底）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
  *   - learn（V0.6.29）：必备段（提炼条目 / 本次无可沉淀）+ 证据路径真实 + 落地记录闭环
- *   - test: stub、暂不实现
  *   - chat 不走本机制（chat 是独立 mode、不复用 action 体系、详见 chat-runner.ts）
  *
  * 关于 plan「黑名单 grep」的历史决策（2026-05-28 用户拍板删）：
@@ -76,12 +75,6 @@ export const runActionCheck = async (
       //   （绕开 V0.6.3 撤掉的「写死 pnpm 搞死多栈」：没配命令的仓记 not_configured、不误报）
       case "build":
         return await checkBuild(task, action, signal);
-      // test：还没实现
-      case "test":
-        return {
-          passed: true,
-          details: "test action 暂未实现 deterministic 检查、跳过",
-        };
       case "learn":
         return await checkLearn(task, action);
       case "review":

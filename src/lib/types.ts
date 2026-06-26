@@ -203,7 +203,7 @@ export interface ApiKeyInfo {
 //
 // 设计原则（详见 docs/V0.6-REFACTOR.md、已 archived）：
 // 1. task = 一个需求的完整生命周期容器（飞书 story 进来 → 合入 main / abandon）
-// 2. action = task 内的单次动作（plan / build / review / ship / test / learn；chat 走独立 mode）
+// 2. action = task 内的单次动作（plan / build / review / ship / learn / dev；chat 走独立 mode）
 //    - 自由触发顺序（不强制 plan→build→review、靠 6 个 harness 门槛兜底质量）
 //    - N 累计序号、文件名 actions/N-<type>.md（cancelled 也占 N、不释放）
 // 3. 单 SDK Run 永生（task 不终态 Run 不退、wait_for_user 阻塞等下一 action 指令）
@@ -215,15 +215,14 @@ export interface ApiKeyInfo {
  * - `build`    改代码
  * - `review`   复核（plan/build 差异核对 + fresh peer bug 复审）
  * - `ship`     提测（push 改动 + 提 MR 到 test 分支 + 飞书 story 评论 @ 测试人员）
- * - `test`     AI 手测
  * - `learn`    沉淀
+ * - `dev`      联调
  */
 export type ActionType =
   | "plan"
   | "build"
   | "review"
   | "ship"
-  | "test"
   | "learn"
   | "dev";
 
@@ -232,7 +231,6 @@ export const ACTION_TYPES = [
   "build",
   "review",
   "ship",
-  "test",
   "learn",
   "dev",
 ] as const;
@@ -252,7 +250,6 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   build: "改代码",
   review: "复核",
   ship: "提测",
-  test: "AI 手测",
   learn: "沉淀",
   dev: "联调",
 };
@@ -281,7 +278,6 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   build: false,
   review: true,
   ship: false,
-  test: false,
   learn: false,
   dev: false,
 };
@@ -813,7 +809,7 @@ export interface ArtifactRevision {
 /**
  * V0.6.0.1：task 模式（重新引入 V0.5 概念、用户拍板「自由模式跟以前一样」）
  *
- * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / test / learn）
+ * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / learn / dev）
  *   UI = ActionTimeline + ArtifactPanel + EventStream 三栏布局
  * - `chat`：自由对话、不走 action 体系、跑独立 chat-runner + chat-reply 通路
  *   UI = ChatView 单栏（事件流 + 输入框）、用户消息立刻显示、agent 长存活靠 wait_for_user 阻塞

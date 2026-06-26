@@ -15,7 +15,6 @@
  * # 行为
  *
  * - finalStatus=merged: agent 拿 [TASK_DONE] 退出、repoStatus=merged + runStatus=idle
- *   V0.6.29 起推进 dialog 默认推荐 learn action 沉淀经验
  * - finalStatus=abandoned: agent 拿 [TASK_ABANDONED] 退出、repoStatus=abandoned + runStatus=idle
  *
  * # 错误语义

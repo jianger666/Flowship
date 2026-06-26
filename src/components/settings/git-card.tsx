@@ -8,8 +8,12 @@
  * - 公司内部场景所有仓共用同一个 GitLab 实例、所以是全局字段（不是 per-repo）
  * - PAT 明文 localStorage、跟 apiKey 同安全级别——别在共用机器配
  * - host 不带协议前缀、agent 端拼 `https://<host>` 调 API
+ * - PAT 默认密码框、小眼睛一键切明文（复用 api-key-card 的模式、防截图泄漏）
  */
 
+import { Eye, EyeOff } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -19,6 +23,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+
+import { useState } from "react";
 
 interface GitCardProps {
   gitHost: string;
@@ -38,6 +44,9 @@ export const GitCard = ({
   onHostCommit,
   onTokenCommit,
 }: GitCardProps) => {
+  // 是否明文显示 PAT（默认隐藏、防截图泄漏）
+  const [showToken, setShowToken] = useState(false);
+
   return (
     <Card>
       <CardHeader>
@@ -57,14 +66,26 @@ export const GitCard = ({
         </div>
         <div className="grid gap-1.5">
           <Label htmlFor="settings-git-token">Personal Access Token</Label>
-          <Input
-            id="settings-git-token"
-            type="password"
-            value={gitToken}
-            onChange={(e) => onTokenChange(e.target.value)}
-            onBlur={() => onTokenCommit(gitToken)}
-            placeholder="glpat-xxx（需要 api scope）"
-          />
+          <div className="flex gap-2">
+            <Input
+              id="settings-git-token"
+              type={showToken ? "text" : "password"}
+              value={gitToken}
+              onChange={(e) => onTokenChange(e.target.value)}
+              onBlur={() => onTokenCommit(gitToken)}
+              placeholder="glpat-xxx（需要 api scope）"
+              className="font-mono"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => setShowToken((s) => !s)}
+              title={showToken ? "隐藏" : "显示"}
+            >
+              {showToken ? <EyeOff /> : <Eye />}
+            </Button>
+          </div>
           <p className="text-xs text-muted-foreground">
             明文 localStorage、跟 API key 同安全级别、共用机器别配
           </p>

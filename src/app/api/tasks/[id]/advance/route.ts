@@ -9,7 +9,7 @@
  *
  * ```
  * {
- *   actionType: ActionType,            // plan / build / review / ship / test / learn
+ *   actionType: ActionType,            // plan / build / review / ship / learn / dev
  *   userInstruction: string,           // 用户在推进 dialog 写的指令（可空）
  *   images?: [{data, mimeType, filename}],
  *   attachments?: string[],            // 文件 / 目录绝对路径（原生 picker 选的）

@@ -1066,12 +1066,12 @@ const buildMcpServer = (): McpServer => {
     {
       title: "action 内打包提问（一次问完所有不确定项）",
       description: [
-        "结构化 action（plan / build / review / ship / test / learn）内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、阻塞等用户在 UI 弹窗里答完整组。",
+        "结构化 action（plan / build / review / ship / learn / dev）内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、阻塞等用户在 UI 弹窗里答完整组。",
         "对标 Cursor `askFollowUpQuestion`：UI 出选项按钮 + 可选自由文本输入。",
         "",
         "## ⚠️ chat 模式（task.mode === 'chat'）禁用（V0.6.0.1 拍板）",
         "",
-        "**本工具只用于 task 容器模式的 action（plan / build / review / ship / test / learn）**。chat（自由对话）任务跑在独立 chat-runner、prompt 里已禁用 ask_user——",
+        "**本工具只用于 task 容器模式的 action（plan / build / review / ship / learn / dev）**。chat（自由对话）任务跑在独立 chat-runner、prompt 里已禁用 ask_user——",
         "chat 模式有问题想跟用户确认时、**直接 emit 一段 assistant_message 问**就行（用 markdown 列清楚 A/B/C 选项也可以、但走文本不走弹窗）、然后正常 wait_for_user 等用户回。",
         "用户原话：「自由模式下不用提问、直接回答、自由模式就是 talk 而已」。",
         "",
@@ -1120,7 +1120,7 @@ const buildMcpServer = (): McpServer => {
         action_id: z
           .string()
           .optional()
-          .describe("当前 action id（plan / build / review / ship / test / learn）"),
+          .describe("当前 action id（plan / build / review / ship / learn / dev）"),
         questions: z
           .array(
             z.object({
@@ -1851,7 +1851,7 @@ export const submitTaskTerminate = (
   }
   const defaultMessage =
     kind === "done"
-      ? "Task 已合入 main、整个 task 结束、请收尾并结束 run（用户之后可能另起 learn action 沉淀经验、那会是新指令、现在直接收尾）。"
+      ? "Task 已合入 main、整个 task 结束、请收尾并结束 run。"
       : "Task 已被用户 abandon、整个 task 结束、请收尾并结束 run。";
   finalizeEntry(taskId, entry, {
     kind: "task_terminate",

@@ -604,7 +604,7 @@ const TaskDetailPage = () => {
       title: finalStatus === "merged" ? "确认任务已合入" : "确认放弃任务",
       description:
         finalStatus === "merged"
-          ? "标记本任务对应 MR 已合入 main、agent 收尾结束 run；之后可在「推进」里跑沉淀（learn）提炼经验"
+          ? "标记本任务对应 MR 已合入 main、agent 收尾结束 run"
           : "标记本任务已放弃、agent 收尾结束 run、产物保留只读",
       destructive: finalStatus === "abandoned",
       confirmLabel: finalStatus === "merged" ? "已合入" : "放弃任务",
@@ -799,7 +799,7 @@ const TaskDetailPage = () => {
                 size="sm"
                 onClick={() => setAdvanceDialogOpen(true)}
                 disabled={starting}
-                title="推进任务：选下一个 action（plan / build / review / ship / test / learn）"
+                title="推进任务：选下一个 action（plan / build / review / ship / learn / dev）"
               >
                 {starting ? <Loader2 className="animate-spin" /> : <Zap />}
                 推进

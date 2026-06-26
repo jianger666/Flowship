@@ -22,7 +22,7 @@
  *           att_xxx.png
  *
  * V0.5 → V0.6 关键变化（不写 migration、老数据直接清空）：
- * - phase chain → action history（plan/build/review/ship/test/learn 自由触发；chat 走独立 mode、不在 actions[] 里）
+ * - phase chain → action history（plan/build/review/ship/learn/dev 自由触发；chat 走独立 mode、不在 actions[] 里）
  * - `phases` 三段位 → `actions[]` 数组（按时间正序、N 累计）
  * - artifact 命名 `01-plan.md` → `N-plan.md`（不前导 0、N 是 ActionRecord.n）
  * - `currentPhase` → `currentActionId`

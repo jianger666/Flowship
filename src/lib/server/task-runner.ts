@@ -4,7 +4,7 @@
  * # 整体模型（详见 docs/V0.6-REFACTOR.md）
  *
  * - **task 容器 + action 历史**：task = 需求生命周期容器、action = 单次动作
- *   （plan / build / review / ship / test / learn）、用户自由触发
+ *   （plan / build / review / ship / learn / dev）、用户自由触发
  * - **单 SDK Run 永生**：整个 task 共用一个 Agent + Run、task 终态前不退
  * - **每次推进** = 后端 `appendAction` + 向 agent 发 `[NEXT_ACTION ...]` 指令
  * - **每次 ack** = wait-ack write `[ACTION_ACK approve|revise]`
@@ -139,13 +139,11 @@ const ACTION_PROMPT_FILE: Record<ActionType, string> = {
   build: "action-build.md",
   review: "action-review.md",
   ship: "action-ship.md",
-  test: "action-test.md",
   learn: "action-learn.md",
   dev: "action-dev.md",
 };
 
 // 已实装的 action 类型（advanceTask 准入门槛 1）
-// learn V0.6.29 实装；test 待上线、当前拒绝
 const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
   "plan",
   "build",
@@ -1127,9 +1125,6 @@ const checkActionPrerequisites = (
       }
       return { ok: true };
     }
-    case "test":
-      // 已被上面 AVAILABLE_ACTIONS 拦掉、走不到这里
-      return { ok: false, reason: "test action 未实现" };
     default: {
       const _: never = actionType;
       return { ok: false, reason: `未知 action 类型：${_}` };
@@ -2054,7 +2049,6 @@ export const acknowledgeAction = async (
  * V0.6 终态：task 合入 / abandon
  *
  * - merged：write [TASK_DONE]、agent 收尾退出、setTaskRepoStatus=merged + runStatus=idle
- *   V0.6.29 起 merged 后推进 dialog 默认选 learn（沉淀时机、runner 准入允许）
  * - abandoned：write [TASK_ABANDONED]、agent 立刻退、setTaskRepoStatus=abandoned + runStatus=idle
  */
 export const finalizeTask = async (
