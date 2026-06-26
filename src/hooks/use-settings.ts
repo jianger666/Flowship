@@ -104,6 +104,14 @@ const isFieldEqual = (
     if (x.length !== y.length) return false;
     return x.every((s, i) => s === y[i]);
   }
+  if (key === "actionLayout") {
+    // order 是排序、顺序有意义——逐位比；hidden 同样逐位比
+    const ax = a.actionLayout ?? { order: [], hidden: [] };
+    const bx = b.actionLayout ?? { order: [], hidden: [] };
+    const eqArr = (m: string[], n: string[]) =>
+      m.length === n.length && m.every((v, i) => v === n[i]);
+    return eqArr(ax.order, bx.order) && eqArr(ax.hidden, bx.hidden);
+  }
   // defaultModel：浅比较 id + params 数组
   const x = a.defaultModel;
   const y = b.defaultModel;
@@ -157,6 +165,7 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      actionLayout: !isFieldEqual("actionLayout", settings, savedSettings),
     }),
     [settings, savedSettings]
   );

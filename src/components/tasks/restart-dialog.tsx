@@ -25,7 +25,7 @@ import {
 import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
 import { getSettings } from "@/lib/local-store";
-import { ACTION_LABEL } from "@/lib/task-display";
+import { actionDisplayLabel } from "@/lib/task-display";
 import type { ActionRecord, ModelSelection, Task } from "@/lib/types";
 
 interface Props {
@@ -86,7 +86,7 @@ export const RestartDialog = ({
     <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>重启当前 {ACTION_LABEL[action.type]} 阶段</DialogTitle>
+          <DialogTitle>重启当前 {actionDisplayLabel(action)} 阶段</DialogTitle>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 text-sm">

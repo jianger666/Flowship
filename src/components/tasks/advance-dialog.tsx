@@ -34,7 +34,15 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowRight, Info, Loader2, Paperclip } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  ChevronDown,
+  Info,
+  Loader2,
+  Paperclip,
+  Wrench,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -65,28 +73,26 @@ import {
 } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
 import { fetchShipPrecheck } from "@/lib/task-store";
+import { fetchCustomActions } from "@/lib/custom-action-client";
+import {
+  arrangeByLayout,
+  BUILTIN_ADVANCE_ACTIONS,
+  isBuiltinAdvanceAction,
+} from "@/lib/action-layout";
 import { cn } from "@/lib/utils";
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import type {
   ActionType,
   CheckOverride,
+  CustomActionDef,
   DevPushMode,
   ModelSelection,
   ShipPrecheck,
   Task,
 } from "@/lib/types";
 
-// 已实装的 action 类型（全部已实装、learn V0.6.29）
-// V0.6.0.1：ActionType 不再含 chat（chat 走独立 mode=chat 任务、不复用 action 体系）
-// 顺序即工作流推进顺序：build → review → 先联调（dev、推 develop 触发联调流水线）→ 再提测（ship、推测试分支）
-const IMPLEMENTED_ACTIONS: ActionType[] = [
-  "plan",
-  "build",
-  "review",
-  "dev",
-  "ship",
-  "learn",
-];
+// 推进面板内置 action 顺序 + 渲染走 @/lib/action-layout 的 BUILTIN_ADVANCE_ACTIONS
+//（单一来源、跟 /actions 布局配置页共用；custom 不在内、自定义组单独渲染）
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
 // 服务端会双重校验、UI 仅为提示用户「为什么这个 action 不能选」
@@ -128,6 +134,9 @@ const inferDisabledReason = (
       if (!anyDev) return "需要先在「设置 → 仓库列表」给仓库配 dev 分支";
       return null;
     }
+    case "custom":
+      // 自定义 action：无准入软提示（定义存在性由 server advance 校验）
+      return null;
     default: {
       const _: never = type;
       return _;
@@ -137,7 +146,7 @@ const inferDisabledReason = (
 
 // action 卡片副标题（V0.6.29 抽常量表——原来是嵌套三元、新增 learn 时漏改、
 // fallthrough 兜底把「沉淀」卡也显示成「提 MR 到 test」、用户实测抓到）
-const ACTION_SUBTITLE: Record<ActionType, string> = {
+const ACTION_SUBTITLE: Record<Exclude<ActionType, "custom">, string> = {
   plan: "出方案",
   build: "写代码",
   review: "复核差异 + 找 bug",
@@ -148,7 +157,7 @@ const ACTION_SUBTITLE: Record<ActionType, string> = {
 
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
 // 简单情况下用固定文案；首次 plan / 修 bug 等场景由 buildPlaceholder() 进一步细化
-const ACTION_PLACEHOLDER: Record<ActionType, string> = {
+const ACTION_PLACEHOLDER: Record<Exclude<ActionType, "custom">, string> = {
   plan: "需求是什么？要解决什么问题？",
   build: "具体改什么、指向哪个文件 / 函数 / bug",
   review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
@@ -163,6 +172,9 @@ const ACTION_PLACEHOLDER: Record<ActionType, string> = {
 // - 有 plan + plan → 「方案要怎么调整？」（再次 plan）
 // - 已有 MR + ship → 「已有 v<N> MR、本次继续推、可选填要点」
 const buildPlaceholder = (task: Task, type: ActionType): string => {
+  if (type === "custom") {
+    return "（可选）补充说明、不填按该 action 的 playbook 执行";
+  }
   if (type === "build" && task.repoStatus === "has_bug") {
     return "修哪个 bug、症状 / 复现路径";
   }
@@ -256,6 +268,8 @@ interface Props {
     replanMode?: "append";
     // V0.6.25：ship gate override（仅 ship 且最新 build 的 check 没过、用户勾「仍继续」时传）
     checkOverride?: CheckOverride;
+    // V0.9：自定义 action 指向的定义 id（仅 actionType==="custom" 时传）
+    customActionId?: string;
   }) => Promise<void>;
   submitting: boolean;
 }
@@ -299,6 +313,19 @@ export const AdvanceDialog = ({
 
   // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
   const [actionType, setActionType] = useState<ActionType>(defaultActionType);
+  // 自定义 action 列表（dialog 打开拉一次）
+  const [customActions, setCustomActions] = useState<CustomActionDef[]>([]);
+  // 当前选中的 custom 定义 id（仅 actionType="custom" 时有效）
+  const [selectedCustomActionId, setSelectedCustomActionId] = useState<
+    string | null
+  >(null);
+  // V0.9：「推进」弹窗折叠区（更多）是否展开——被隐藏的 action 平时收起、点「更多」才显示
+  const [showMore, setShowMore] = useState(false);
+  // V0.9：推进面板布局偏好（顺序 + 显隐）；open effect 里读 getSettings() 刷新（非响应式、靠重开拉最新）
+  const [actionLayout, setActionLayout] = useState<{
+    order: string[];
+    hidden: string[];
+  }>({ order: [], hidden: [] });
   // 用户指令、选填——飞书/上下文都已带上、空也能跑
   const [instruction, setInstruction] = useState("");
   // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接
@@ -378,6 +405,7 @@ export const AdvanceDialog = ({
   useEffect(() => {
     if (!open) return;
     setActionType(defaultActionType);
+    setSelectedCustomActionId(null);
     setInstruction("");
     setReuseAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
@@ -408,6 +436,10 @@ export const AdvanceDialog = ({
     setLiveDevBranches(devMap);
     // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
     setHasPlanHistory(hasPlanHistoryRef.current);
+    // V0.9：读最新布局偏好（顺序 + 显隐）；默认选中的 action 若被折叠、自动展开「更多」、避免选中态藏在收起区
+    const layout = s.actionLayout ?? { order: [], hidden: [] };
+    setActionLayout(layout);
+    setShowMore(layout.hidden.includes(defaultActionType));
   }, [open, defaultActionType, defaultRemoveSourceBranch]);
 
   // V0.6.25 review：ship 时拉 server precheck（含工作区指纹比对）决定 override 区。
@@ -445,12 +477,111 @@ export const AdvanceDialog = ({
     }
   }, [open, availableModels.length, fetchModels]);
 
+  // dialog 打开时拉自定义 action 列表（供「我的 Action」组渲染）；拉失败静默清空、不挡内置 action
+  useEffect(() => {
+    if (!open) return;
+    void fetchCustomActions()
+      .then(setCustomActions)
+      .catch(() => setCustomActions([]));
+  }, [open]);
+
   // dialog 关闭时清空附图、下次打开不残留上次的图
   //（resetImages 每次 render 新引用、故意只在 open 变化时跑、不进 deps）
   useEffect(() => {
     if (!open) resetImages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // V0.9：内置 + 自定义混排成一个列表、按 layout 统一排序 + 分主区/折叠（更多）。
+  const customById = useMemo(
+    () => new Map(customActions.map((d) => [d.id, d] as const)),
+    [customActions],
+  );
+  const arranged = useMemo(
+    () =>
+      arrangeByLayout(
+        [...BUILTIN_ADVANCE_ACTIONS, ...customById.keys()],
+        actionLayout,
+      ),
+    [customById, actionLayout],
+  );
+  // 主区显示的 key（folded 部分仅 showMore 展开时追加到末尾）
+  const visibleKeys = showMore
+    ? [...arranged.visible, ...arranged.folded]
+    : arranged.visible;
+  // 被折叠的 action 数（决定「更多」按钮显隐）
+  const foldedCount = arranged.folded.length;
+
+  // V0.9：渲染单个 action 卡片——内置走准入判断 + 副标题；自定义走 def + 扳手角标区分
+  const renderActionChip = (key: string) => {
+    if (isBuiltinAdvanceAction(key)) {
+      const type = key;
+      const reason = inferDisabledReason(task, type, {
+        ...gitConfig,
+        devBranches: liveDevBranches,
+      });
+      return (
+        // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip
+        <div key={key} className="relative">
+          <ChoiceButton
+            shape="card"
+            selected={actionType === type}
+            onClick={() => {
+              setActionType(type);
+              setSelectedCustomActionId(null);
+            }}
+            disabled={submitting || !!reason}
+            className="flex h-full w-full flex-col items-start gap-0.5"
+            title={reason ? undefined : `选「${ACTION_LABEL[type]}」推进`}
+          >
+            <span className="w-full truncate font-medium">
+              {ACTION_LABEL[type]}
+            </span>
+            <span className="w-full truncate text-[10px] text-muted-foreground">
+              {ACTION_SUBTITLE[type]}
+            </span>
+          </ChoiceButton>
+          {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
+          {reason && (
+            <Tooltip content={reason}>
+              <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
+                <AlertTriangle className="size-3.5" />
+              </span>
+            </Tooltip>
+          )}
+        </div>
+      );
+    }
+    // 自定义 action：key 是 custom id、还原成 def 渲染
+    const def = customById.get(key);
+    if (!def) return null;
+    return (
+      <div key={key} className="relative">
+        <ChoiceButton
+          shape="card"
+          selected={actionType === "custom" && selectedCustomActionId === def.id}
+          onClick={() => {
+            setActionType("custom");
+            setSelectedCustomActionId(def.id);
+          }}
+          disabled={submitting}
+          className="flex h-full w-full flex-col items-start gap-0.5"
+          title={`选「${def.label}」推进`}
+        >
+          <span className="w-full truncate pr-4 font-medium">{def.label}</span>
+          <span className="w-full truncate text-[10px] text-muted-foreground">
+            {def.summary?.trim() || "自定义流程"}
+          </span>
+        </ChoiceButton>
+        {/* 自定义 action 角标：扳手图标 + tooltip、跟内置区分 */}
+        <Tooltip content="自定义 Action">
+          <span className="absolute right-1 top-1 inline-flex items-center justify-center rounded-full bg-background/80 p-0.5 text-muted-foreground">
+            <Wrench className="size-3" />
+          </span>
+        </Tooltip>
+      </div>
+    );
+  };
 
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
   const disabledReason = useMemo(
@@ -467,6 +598,8 @@ export const AdvanceDialog = ({
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (disabledReason) return false;
+    // V0.9：自定义 action 必须选中一个具体定义
+    if (actionType === "custom" && !selectedCustomActionId) return false;
     // V0.6.25 review：ship 时等 precheck 拉完再判断（没拿到 gate 结论就放行会被 server 拒）
     if (actionType === "ship" && shipPrecheckLoading) return false;
     // V0.6.29：分批 build 必须显式表态——选批 or「自由改动」选项卡、都没选语义不明拦提交
@@ -487,6 +620,7 @@ export const AdvanceDialog = ({
     submitting,
     disabledReason,
     actionType,
+    selectedCustomActionId,
     shipPrecheckLoading,
     hasBatches,
     selectedBatchIds.length,
@@ -605,6 +739,11 @@ export const AdvanceDialog = ({
               createdAt: Date.now(),
             }
           : undefined,
+      // V0.9：自定义 action 指向的定义 id（仅 custom）
+      customActionId:
+        actionType === "custom"
+          ? (selectedCustomActionId ?? undefined)
+          : undefined,
     });
   };
 
@@ -617,47 +756,33 @@ export const AdvanceDialog = ({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-2">
-          {/* action 类型选择：grid 卡片 */}
+          {/* action 类型选择：内置 + 自定义混排成一个 grid（顺序 / 显隐在 /actions 页配） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-              {IMPLEMENTED_ACTIONS.map((type) => {
-                const reason = inferDisabledReason(task, type, {
-                  ...gitConfig,
-                  devBranches: liveDevBranches,
-                });
-                return (
-                  // 外包 relative 容器：disabled 的 <button> 不触发子元素 hover，
-                  // 警告 icon 必须叠在 button 外层才能挂 tooltip（副标题恒显短文案、不被长 reason 撑高）
-                  <div key={type} className="relative">
-                    <ChoiceButton
-                      shape="card"
-                      selected={actionType === type}
-                      onClick={() => setActionType(type)}
-                      disabled={submitting || !!reason}
-                      className="flex h-full w-full flex-col items-start gap-0.5"
-                      title={reason ? undefined : `选「${ACTION_LABEL[type]}」推进`}
-                    >
-                      <div className="flex w-full items-center justify-between gap-1">
-                        <span className="font-medium">{ACTION_LABEL[type]}</span>
-                      </div>
-                      <span className="text-[10px] text-muted-foreground">
-                        {ACTION_SUBTITLE[type]}
-                      </span>
-                    </ChoiceButton>
-                    {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
-                    {reason && (
-                      <Tooltip content={reason}>
-                        <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
-                          <AlertTriangle className="size-3.5" />
-                        </span>
-                      </Tooltip>
-                    )}
-                  </div>
-                );
-              })}
+              {visibleKeys.map((key) => renderActionChip(key))}
             </div>
           </div>
+
+          {/* V0.9：折叠区开关——被隐藏的 action 收进「更多」、显隐 / 顺序在 /actions 页配置 */}
+          {foldedCount > 0 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowMore((v) => !v)}
+              disabled={submitting}
+              className="h-7 self-start px-2 text-xs text-muted-foreground"
+            >
+              {showMore ? "收起" : `更多（${foldedCount}）`}
+              <ChevronDown
+                className={cn(
+                  "ml-1 size-3.5 transition-transform",
+                  showMore && "rotate-180",
+                )}
+              />
+            </Button>
+          )}
 
           {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动） */}
           {actionType === "build" && hasBatches && (

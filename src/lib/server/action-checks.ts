@@ -47,6 +47,7 @@ import type {
 import { CHECK_KIND_DEFAULT_TIMEOUT_MS } from "@/lib/types";
 
 import { getActionArtifactPath, getCheckLogPaths } from "./task-fs";
+import { getCustomAction } from "./custom-action-fs";
 import { isMutatingScript } from "./repo-check-detect";
 import { getEffectiveCwd } from "@/lib/path-utils";
 
@@ -83,6 +84,8 @@ export const runActionCheck = async (
         return await checkShip(task, action);
       case "dev":
         return await checkDev(task, action);
+      case "custom":
+        return await checkCustom(task, action, signal);
       default: {
         const _: never = action.type;
         return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
@@ -518,6 +521,77 @@ const checkDev = async (
   return {
     passed: allPassed,
     details: sections.join("\n\n"),
+  };
+};
+
+// ----------------- custom（V0.9 自定义 action）-----------------
+//
+// 后置检查 = artifact 基本盘（产出非空）+ 定义里可选的 checkCommands。
+// 不强制 artifact 必备段（custom 的 playbook 由用户自定义、没有固定骨架）。
+// checkCommands 在 effective cwd 跑（不分仓、custom 命令是定义级）、复用 runRepoChecks 拿污染检测 + 日志。
+const checkCustom = async (
+  task: Task,
+  action: ActionRecord,
+  signal?: AbortSignal,
+): Promise<ActionCheckResult> => {
+  if (!action.artifactPath) {
+    return { passed: false, details: "自定义 action 没产出 artifact" };
+  }
+  const absPath = getActionArtifactPath(task.id, action.n, action.type);
+  let content: string;
+  try {
+    content = await fs.readFile(absPath, "utf-8");
+  } catch (err) {
+    return {
+      passed: false,
+      details: `自定义 action artifact 读取失败：${absPath}（${err instanceof Error ? err.message : String(err)}）`,
+    };
+  }
+  if (content.trim().length === 0) {
+    return { passed: false, details: "自定义 action artifact 为空" };
+  }
+
+  // 定义里配的可选后置校验命令（读不到定义 / 没配命令 → 仅 artifact 基本盘通过）
+  const def = action.customActionId
+    ? await getCustomAction(action.customActionId)
+    : null;
+  const commands = def?.checkCommands ?? [];
+  if (commands.length === 0) {
+    return {
+      passed: true,
+      details: "自定义 action artifact 已落盘（未配后置校验命令）",
+    };
+  }
+
+  const cwd = getEffectiveCwd(task.repoPaths);
+  const repoResult = await runRepoChecks(
+    task.id,
+    action.id,
+    cwd,
+    `custom-${action.n}`,
+    commands,
+    signal,
+  );
+  const status: CheckRunSummary["status"] =
+    repoResult.status === "failed"
+      ? "failed"
+      : repoResult.status === "not_configured"
+        ? "not_configured"
+        : "passed";
+  const checkRun: CheckRunSummary = {
+    id: `cr_${action.id}_${Date.now()}`,
+    status,
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    repos: [repoResult],
+  };
+  const cmdSummary = repoResult.commands
+    .map((c) => `${c.name}=${c.status}`)
+    .join(" / ");
+  return {
+    passed: repoResult.status !== "failed",
+    details: `自定义 action 后置校验：${status}（${cmdSummary || "无命令执行"}）`,
+    checkRun,
   };
 };
 

@@ -29,9 +29,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import {
-  ACTION_LABEL_SHORT,
-} from "@/lib/task-display";
+import { actionDisplayLabel } from "@/lib/task-display";
 import type { ActionRecord } from "@/lib/types";
 
 interface Props {
@@ -65,7 +63,7 @@ const ActionChip = ({
   // timeline 只表达「正在查看」和「是否划除」：
   // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
   const titleParts = [
-    `#${action.n} ${ACTION_LABEL_SHORT[action.type]}`,
+    `#${action.n} ${actionDisplayLabel(action, "short")}`,
   ];
   if (isSelected) {
     titleParts.push("当前正在查看");
@@ -103,7 +101,7 @@ const ActionChip = ({
           #{action.n}
         </span>
         {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
-        <span>{ACTION_LABEL_SHORT[action.type]}</span>
+        <span>{actionDisplayLabel(action, "short")}</span>
       </ChoiceButton>
       {onToggleExclude && (
         <button

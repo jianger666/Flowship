@@ -37,6 +37,8 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   ship: "提测",
   learn: "沉淀",
   dev: "联调",
+  // 兜底——custom action 实际展示走定义里的 label（见 actionDisplayLabel），拿不到才回退
+  custom: "自定义",
 };
 
 /** 英文短标、用在 timeline 副标 / event stream inline */
@@ -47,6 +49,7 @@ export const ACTION_LABEL_EN: Record<ActionType, string> = {
   ship: "Ship",
   learn: "Learn",
   dev: "Dev",
+  custom: "Custom",
 };
 
 /** 中文 2 字短标、用在事件流 inline tag 等紧凑场景 */
@@ -57,6 +60,29 @@ export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
   ship: "提测",
   learn: "沉淀",
   dev: "联调",
+  custom: "自定义",
+};
+
+/**
+ * 取一条 action 的展示 label（统一来源、展示层都该走这个、不要裸 ACTION_LABEL[type]）。
+ * - 内置 6 个 → 按 variant 取 ACTION_LABEL / ACTION_LABEL_SHORT / ACTION_LABEL_EN
+ * - custom → action.customLabel 快照（advance 时从定义固化）、缺省回退兜底「自定义」
+ *   （快照原因同 MRRecord.title：定义改名 / 删了、历史 action 仍显示当时的名字、不漂移）
+ *   custom 没有 short/en 版、各 variant 都返回 customLabel 快照
+ */
+export const actionDisplayLabel = (
+  action: {
+    type: ActionType;
+    customLabel?: string;
+  },
+  variant: "default" | "short" | "en" = "default",
+): string => {
+  if (action.type === "custom") {
+    return action.customLabel?.trim() || ACTION_LABEL.custom;
+  }
+  if (variant === "short") return ACTION_LABEL_SHORT[action.type];
+  if (variant === "en") return ACTION_LABEL_EN[action.type];
+  return ACTION_LABEL[action.type];
 };
 
 // ===========================================

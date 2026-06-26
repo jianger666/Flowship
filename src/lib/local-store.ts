@@ -19,7 +19,11 @@
  */
 
 import { DEFAULT_BRANCH_TEMPLATE } from "./branch-template";
-import type { FeAiFlowSettings, ModelSelection } from "./types";
+import type {
+  ActionLayoutPref,
+  FeAiFlowSettings,
+  ModelSelection,
+} from "./types";
 
 const KEY = "fe-ai-flow:settings";
 const API = "/api/settings";
@@ -39,6 +43,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   gitToken: "",
   branchTemplate: DEFAULT_BRANCH_TEMPLATE,
   disabledMcpServers: [],
+  actionLayout: { order: [], hidden: [] },
 };
 
 const isBrowser = (): boolean =>
@@ -56,6 +61,15 @@ const readDefaultModel = (raw: unknown): ModelSelection => {
     return raw as ModelSelection;
   }
   return { id: "" };
+};
+
+// 推进面板布局偏好归一：order / hidden 必须是字符串数组、坏值 / 缺省回退空
+const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
+  if (!raw || typeof raw !== "object") return { order: [], hidden: [] };
+  const o = raw as { order?: unknown; hidden?: unknown };
+  const toStrArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  return { order: toStrArr(o.order), hidden: toStrArr(o.hidden) };
 };
 
 /**
@@ -90,6 +104,8 @@ const normalizeSettings = (
     disabledMcpServers: Array.isArray(parsed.disabledMcpServers)
       ? parsed.disabledMcpServers
       : [],
+    // V0.9：推进面板布局偏好、坏值 / 缺省回退空（= 全显示、默认顺序）
+    actionLayout: normalizeActionLayout(parsed.actionLayout),
   };
 };
 

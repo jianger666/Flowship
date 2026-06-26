@@ -305,6 +305,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v0.9.0：自定义 Action + 推进面板布局可配置（2026-06-26）
+
+- **自定义 Action（新 action 类型 `custom`）**：把 skill / playbook / 后置 check 串联封装成一个 action、在任务「推进」里像内置一样选（**不单独给 action 配 MCP——用 task 现有的、避免与 task 级 MCP 冲突**、用户拍板）。定义存 `dataRoot()/custom-actions/<id>.md`（gray-matter frontmatter 存 label/summary/skills/checkCommands/freshAgent + 正文 playbook）；`ActionType` 加 `"custom"`、`ActionRecord.customActionId/customLabel` 链定义；运行时 `task-runner` `loadActionPrompt` 走自定义 playbook、freshAgent / label 取 customDef、`checkActionPrerequisites` + `action-checks` 加 custom 分支（artifact 存在 + 跑用户配的 checkCommands）。管理页 `/actions`（列表 + `CustomActionEditor`、复用 `MultiSelect` 选 skill + `RepoCheckCommands` 配 check）；`_super.md` 的 `[NEXT_ACTION]` 协议头放行 `custom`。**关键修复**：`task-fs` 的 `ActionRecordLooseSchema` 必须放行 `"custom"`（`z.enum([...ACTION_TYPES, "custom"])`）——否则推过 custom 的 task `meta.json` 校验不过、`getTask` 返 null → 整个 task 读不了（404）、是首发数据损坏 bug。
+- **推进面板布局可配置**：内置 + 自定义 action 在「推进」弹窗的顺序 + 显隐个人级可配、落 `settings.actionLayout`（config.json、`{order, hidden}`）。`/actions` 页加「推进面板布局」区——**拖拽排序（`framer-motion` Reorder、只手柄发起拖、松手才落盘防狂写）** + 开关控显隐、内置 / 自定义**混排**（自定义带扳手 `Wrench` 角标区分）。推进弹窗按偏好排（`arrangeByLayout`）、隐藏的收进「更多」可展开、默认选中项被隐藏时自动展开。排序纯函数 `src/lib/action-layout.ts`（`BUILTIN_ADVANCE_ACTIONS` / `sortByOrder` / `arrangeByLayout` / `isBuiltinAdvanceAction`）配置页 + 弹窗单一源。
+- 验证：typecheck + lint 全绿、vitest 135 全过；打 test 包核验自定义 action 推进 + 拖拽 / 混排 UI 进包。
+
 ### v0.8.23：联调（dev）action + 分支配置同步 + 去「通过」按钮隐式认可 + task 做完给结论（2026-06-25）
 
 - **联调（dev）action 落地**（新 action 类型、把改动送 dev 分支触发联调流水线）：advance-dialog 选两种推送方式、`buildDevDirective` 把 `[DEV_PUSH_MODE]` 钉进 `[NEXT_ACTION]` 载荷——① **直推**：本地基于 `origin/<dev>` `checkout -B` 重置本地 dev、`merge --no-ff` 把 feature 合进来、`push origin dev:dev`（feature 全程不动、绝不 force）；② **提 PR**：push feature + 复用 ship 的 `submit_mr`（唯一区别 `target_branch` = dev 分支）。冲突处理两模式共用（直推在本地 dev 就地解 / 提 PR 走 `<feature>__conflict` 一次性分支、同 ship §3.6）。准入 = 至少一仓配 dev 分支（技术必需、没配不知推哪）；`checkDev` 直推无 MR 信任 artifact、提 PR 复用 ship 门禁（URL 非空 + 冲突拦）。**联调源分支绝不删**（`isDevSubmit ? false`、合入后还要继续开发/提测）。配套 `prompts/action-dev.md` + `chat-mcp` submit_mr describe 泛化 ship/dev。
@@ -317,12 +323,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **restart ask_user 给「上次进展」背景**：阶段重启时 ask_user question 不写死固定句、要 agent 基于事件日志 + artifact + 工作区半成品先 1-2 句说清「上次断到哪、在做啥」再接确认问句（重启间隔久 / 换人接手常忘进度）。
 - **（v0.8.24）推进 dialog action 顺序**：联调（dev）chip 排到提测（ship）前——工作流先联调推 develop、再提测推测试分支。
 - 验证：typecheck + lint 全绿、vitest 135 全过（submit-mr-guard 加 dev 用例）；打 test 包核验联调 UI + 分支同步透传进包。
-
-### v0.8.22：自由对话回归 text-delta 流式（M/C' 范式）+ 后置 check 跳过 --fix/--write 类命令（2026-06-24）
-
-- **自由对话回归流式（M/C' 范式、替代 V0.8.21 的 message 范式）**：原 message 范式把整篇回复正文塞进 `wait_for_user` 的 `message` 参数让 composer「先产出再挂等」（治提前挂等）、但工具参数**不流式**、用户要等一次性 flush 才看到全部。调研实证 SDK 不发 partial-tool-call（5 轮探针、`message` 无法增量流式）。改回：**正文直接走 text-delta 通道输出**（天然逐字流式、`case "assistant"` 实时展示）、`wait_for_user.message` 改填**一句话概括**（给历史 / 标题、不展示给用户）、纯做「逼 composer 先产出正文再挂等」的钩子。premature 兜底相应改为：message 非空（声明已回复）→ 清计数放行；message 空 → 读 events 判（仅「用户在等 + 本轮没 stream 出正文」才拦）。删 `chat_message` 派发整套（`AwaitingSignal` 类型 / `safeNotifyChatMessage` / handler 调用 / chat-runner 展示分支 / task-runner 防御）。**task 模式零影响**：新逻辑全包在 `chatModeTasks.has(task_id) && !action_id` 内、task 永不在 `chatModeTasks`（仅 chat-runner `markTaskAsChat` 写入）；改的 4 个 prompt 片段（`chatWaitProtocolSection` / `chatShellWaitGuideBody` / `replyThenWaitReminder` / `firstTurnReplyThenWaitReminder`）全 chat 专用、task 用的 `waitDisciplineSection` 没动；`wait_for_user` describe 里 task 的硬性规则段一字未改。
-- **后置 check 跳过会改写工作区的命令（--fix/--write 类）**：lint 脚本带 `--fix`（`ng lint --fix=true` / `eslint --fix` / `prettier --write`）当 check 跑有两坑（线上 cp-admin 踩过）：① 偷改源码污染工作区、被 `mutatedWorktree` 事后判 failed（误红）；② 用户本地开着 dev server（`ng serve` / `vite` watch）时、lint --fix 跑的几十秒里连环改文件 → dev 连环热重载、终端「一直重启」。新增 `isMutatingScript`（`repo-check-detect.ts`、识别 --fix/--write/--apply、negative-lookahead 排除 --fix-dry-run）+ `willCommandMutateWorktree`（`action-checks.ts`、解析 `<pm> run <script>` 的 package.json script 体、识破藏在 script 内的 fix flag）。检测层（过滤新建 task auto-detect）+ 执行层（拦存量 task 已固化命令）双重拦截、跳过记 `skipped` + 原因、不计入 failed（聚合用 `executed` 排除 skipped、全跳过退回 dirty 判定记 not_configured）。UI（`check-run-summary.tsx`）配了命令但全跳过显示「会改写源码、已跳过」。
-- 验证：typecheck + lint 全绿；打包 test 探针实测 ✅ composer 完整正文走 text-delta（1102 chunk）、概括进 message；用户简单跑过。
 
 ---
 
@@ -370,7 +370,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | Artifact 面板（V0.6 适配 ActionRecord） | `src/components/tasks/artifact-panel.tsx` |
 | Artifact diff 组件 | `src/components/tasks/artifact-diff.tsx` |
 | **Action timeline（V0.6 新）** | `src/components/tasks/action-timeline.tsx` |
-| 推进 dialog（V0.6 重写、选 action） | `src/components/tasks/advance-dialog.tsx` |
+| 推进 dialog（V0.6 重写、选 action；V0.9 内置+自定义混排 + 折叠「更多」） | `src/components/tasks/advance-dialog.tsx` |
+| **自定义 Action（V0.9、`custom` 类型 + 定义存储 + 管理页 + 客户端）** | `src/lib/server/custom-action-fs.ts` + `src/app/api/custom-actions/*` + `src/app/api/skills/route.ts` + `src/app/actions/page.tsx` + `src/components/custom-actions/custom-action-editor.tsx` + `src/lib/custom-action-client.ts` |
+| **推进面板布局（V0.9、内置+自定义混排排序/显隐、framer-motion 拖拽配置）** | `src/lib/action-layout.ts` + `src/components/custom-actions/action-layout-config.tsx` + `FeAiFlowSettings.actionLayout` |
 | 再聊聊 dialog（V0.6 适配 actionLabel） | `src/components/tasks/revise-dialog.tsx` |
 | 新建任务 dialog（V0.6.0.1 重新加 mode tab、V0.8 加 `trigger` prop 供侧栏自定义触发） | `src/components/tasks/new-task-dialog.tsx` |
 | 编辑任务 dialog + 字段热更（V0.6.6、详情页改软配置字段、reused agent diff 注入 `[TASK_UPDATED]`） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` + `task-runner.ts: buildTaskUpdateHint` |

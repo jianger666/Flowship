@@ -78,7 +78,7 @@ import {
   type ImagePayload,
 } from "@/lib/task-store";
 import {
-  ACTION_LABEL,
+  actionDisplayLabel,
   MR_KIND_LABEL,
   REPO_STATUS_LABEL,
   REPO_STATUS_VARIANT,
@@ -412,6 +412,8 @@ const TaskDetailPage = () => {
     replanMode?: "append" | "rebuild";
     // V0.6.25：ship gate override（advance-dialog 仅 ship 且最新 build 的 check 没过时给值）
     checkOverride?: CheckOverride;
+    // V0.9：自定义 action 指向的定义 id（advance-dialog 仅 custom 时给值）
+    customActionId?: string;
   }) => {
     setStarting(true);
     try {
@@ -466,6 +468,8 @@ const TaskDetailPage = () => {
           replanMode: input.replanMode,
           // V0.6.25 ship action：CheckRun gate override（仅 ship 且最新 build 的 check 没过时有值）
           checkOverride: input.checkOverride,
+          // V0.9 custom action：指向的定义 id（仅 custom 时有值）
+          customActionId: input.customActionId,
           // V0.x A 方案：设置页最新分支配置（server 据此刷新 task 分支快照、设置页改了下次推进生效）
           repoBaseBranches:
             Object.keys(repoBaseBranches).length > 0
@@ -482,8 +486,14 @@ const TaskDetailPage = () => {
         }),
       });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error?.message ?? `HTTP ${res.status}`);
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: unknown;
+        };
+        // 服务端 errorResponse 返回 { error: "文字" }——error 是字符串、不是带 .message 的对象。
+        // 之前写成 data.error?.message → 永远 undefined → 真实报错被吞成「HTTP 404」误导排查、必须直接读 data.error。
+        throw new Error(
+          typeof data.error === "string" ? data.error : `HTTP ${res.status}`,
+        );
       }
       const data = (await res.json()) as { task: Task; action: ActionRecord };
       setTask(data.task);
@@ -577,7 +587,7 @@ const TaskDetailPage = () => {
     if (!task) return;
     if (!action.excluded) {
       const ok = await confirm({
-        title: `划除 #${action.n} ${ACTION_LABEL[action.type]}？`,
+        title: `划除 #${action.n} ${actionDisplayLabel(action)}？`,
         description:
           "把这个 action 从 agent 上下文里排除（后续推进 / 接力不再参考它）。不删数据、随时可恢复。",
         confirmLabel: "划除",
@@ -775,7 +785,7 @@ const TaskDetailPage = () => {
                 size="sm"
                 onClick={() => setReviseOpen(true)}
                 disabled={ackSubmitting}
-                title={`想改 ${currentAction ? ACTION_LABEL[currentAction.type] : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
+                title={`想改 ${currentAction ? actionDisplayLabel(currentAction) : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
               >
                 <MessageCircleQuestion />
                 再聊聊
@@ -835,7 +845,7 @@ const TaskDetailPage = () => {
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Loader2 className="size-3.5 animate-spin" />
                   agent 正在跑
-                  {currentAction && ` ${ACTION_LABEL[currentAction.type]}`}
+                  {currentAction && ` ${actionDisplayLabel(currentAction)}`}
                 </div>
                 <Button
                   variant="ghost"
@@ -978,7 +988,7 @@ const TaskDetailPage = () => {
         <ReviseDialog
           open={reviseOpen}
           onOpenChange={setReviseOpen}
-          actionLabel={ACTION_LABEL[currentAction.type]}
+          actionLabel={actionDisplayLabel(currentAction)}
           submitting={ackSubmitting}
           onSubmit={handleSubmitRevise}
         />

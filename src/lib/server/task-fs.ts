@@ -324,7 +324,10 @@ const ActionRecordLooseSchema = z
   .looseObject({
     id: z.string().min(1),
     n: z.number().int().nonnegative(),
-    type: z.enum(ACTION_TYPES),
+    // V0.9：持久化的 action 可以是 custom（运行时类型、故意不进 ACTION_TYPES 内置清单）。
+    // schema 必须放行 custom、否则推过 custom 的 task meta.json 会校验不过 → getTask 返 null /
+    // readMetaV06 抛错 → 整个 task 从此读不了（404 / 历史报错）。漏了这条是 V0.9 首发的数据损坏 bug。
+    type: z.enum([...ACTION_TYPES, "custom"] as const),
     status: z.enum(["running", "awaiting_ack", "completed", "error", "cancelled"]),
     userInstruction: z.string(),
     artifactPath: z.string().nullable(),
@@ -1400,6 +1403,10 @@ export const appendAction = async (
     replanMode?: ReplanMode;
     /** V0.x：联调推送方式（仅 dev 传）——direct 直推 / mr 提 PR */
     devPushMode?: DevPushMode;
+    /** V0.9：自定义 action 指向的定义 id（仅 type=custom 传） */
+    customActionId?: string;
+    /** V0.9：自定义 action 展示名快照（仅 type=custom 传） */
+    customLabel?: string;
   },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
   withTaskLock(taskId, async () => {
@@ -1431,6 +1438,9 @@ export const appendAction = async (
       replanMode: input.type === "plan" ? input.replanMode : undefined,
       // V0.x：仅 dev action 带推送方式（其它 undefined）
       devPushMode: input.type === "dev" ? input.devPushMode : undefined,
+      // V0.9：仅 custom action 带定义 id + 展示名快照（用于运行时读 playbook + 历史展示）
+      customActionId: input.type === "custom" ? input.customActionId : undefined,
+      customLabel: input.type === "custom" ? input.customLabel : undefined,
     };
 
     meta.actions = [...meta.actions, action];

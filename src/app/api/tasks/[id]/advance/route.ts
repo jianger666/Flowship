@@ -47,6 +47,7 @@ import {
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
 import { advanceTask } from "@/lib/server/task-runner";
+import { getCustomAction } from "@/lib/server/custom-action-fs";
 import {
   ACTION_TYPES,
   type ActionType,
@@ -87,13 +88,16 @@ interface PostBody {
   repoBaseBranches?: Record<string, string>;
   repoTestBranches?: Record<string, string>;
   repoDevBranches?: Record<string, string>;
+  // V0.9：自定义 action 指向的定义 id（仅 actionType="custom" 时必填）
+  customActionId?: string;
 }
 
 const MAX_IMAGES_PER_REQUEST = 6;
 const MAX_ATTACHMENTS_PER_REQUEST = 10;
 
 const isValidActionType = (v: unknown): v is ActionType =>
-  typeof v === "string" && (ACTION_TYPES as readonly string[]).includes(v);
+  typeof v === "string" &&
+  ((ACTION_TYPES as readonly string[]).includes(v) || v === "custom");
 
 const parseReplanMode = (v: unknown): ReplanMode | undefined =>
   v === "append" || v === "rebuild" ? v : undefined;
@@ -147,7 +151,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const actionType = body.actionType;
   if (!isValidActionType(actionType)) {
     return errorResponse(
-      `actionType 非法、必须是 ${ACTION_TYPES.join(" / ")} 之一`,
+      `actionType 非法、必须是 ${ACTION_TYPES.join(" / ")} / custom 之一`,
     );
   }
   const userInstruction = (body.userInstruction ?? "").trim();
@@ -193,6 +197,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
         return errorResponse(`attachments 无权限读取：${raw}`);
       }
       return errorResponse(`attachments stat 失败：${(err as Error).message}`);
+    }
+  }
+
+  // V0.9：自定义 action 必须带存在的定义 id（定义可能被删——这里挡住、不让起一个找不到 playbook 的 agent）
+  let customActionId: string | undefined;
+  if (actionType === "custom") {
+    customActionId = body.customActionId?.trim();
+    if (!customActionId) {
+      return errorResponse("自定义 action 必须带 customActionId");
+    }
+    const def = await getCustomAction(customActionId);
+    if (!def) {
+      return errorResponse(`自定义 action 定义不存在：${customActionId}`, 404);
     }
   }
 
@@ -262,6 +279,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
       repoTestBranches: sanitizeRepoBranchMap(body.repoTestBranches),
       repoDevBranches: sanitizeRepoBranchMap(body.repoDevBranches),
+      // V0.9：自定义 action 定义 id（仅 custom、上面已校验定义存在）
+      customActionId,
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

@@ -97,6 +97,7 @@ import {
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
+import { getCustomAction } from "./custom-action-fs";
 import type {
   ActionRecord,
   ActionType,
@@ -117,7 +118,11 @@ import {
   TASK_ROLE_LABEL,
   TEST_STRATEGY_LABEL,
 } from "@/lib/types";
-import { computeBatchProgress, mrTargetBranchOf } from "@/lib/task-display";
+import {
+  actionDisplayLabel,
+  computeBatchProgress,
+  mrTargetBranchOf,
+} from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
 import { isAskSettled } from "@/lib/ask-pending";
 
@@ -133,8 +138,9 @@ const PROMPTS_DIR = path.join(process.cwd(), "prompts");
 const SUPER_PROMPT_FILE = "_super.md";
 const SHARED_PROMPT_FILE = "_shared.md";
 
-// 每种 action 对应的 prompt 文件、_super.md 占位符注入用
-const ACTION_PROMPT_FILE: Record<ActionType, string> = {
+// 每种内置 action 对应的 prompt 文件、_super.md 占位符注入用
+// custom 不在此表（playbook 来自用户定义、见 loadCustomActionPlaybook）
+const ACTION_PROMPT_FILE: Record<Exclude<ActionType, "custom">, string> = {
   plan: "action-plan.md",
   build: "action-build.md",
   review: "action-review.md",
@@ -151,6 +157,8 @@ const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
   "ship",
   "learn",
   "dev",
+  // 自定义 action：定义存在性在 advance API 校验、这里放行
+  "custom",
 ]);
 
 const NULL_PLACEHOLDER = "（未提供）";
@@ -203,12 +211,10 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
 //   {{eventsLogPath}}（V0.6.29、learn action 挖事件日志用）
 // ⚠️ 加占位符记得同步 tests/protocol-signals.test.ts 的供值表对账
 const loadActionPrompt = async (
-  type: ActionType,
+  action: ActionRecord,
   task: Task,
 ): Promise<string> => {
-  const fname = ACTION_PROMPT_FILE[type];
-  const tpl = await loadFileSafe(fname);
-  return fillTemplate(tpl, {
+  const vars = {
     taskId: task.id,
     taskTitle: task.title,
     repoPath: getEffectiveCwd(task.repoPaths),
@@ -216,7 +222,39 @@ const loadActionPrompt = async (
     roleLabel: TASK_ROLE_LABEL[task.role],
     actionArtifactsDir: getActionsDir(task.id),
     eventsLogPath: getEventsLogPath(task.id),
-  });
+  };
+  // 自定义 action：playbook 来自用户定义（dataRoot/custom-actions）、不走 prompts/action-*.md
+  if (action.type === "custom") {
+    return loadCustomActionPlaybook(action, vars);
+  }
+  const tpl = await loadFileSafe(ACTION_PROMPT_FILE[action.type]);
+  return fillTemplate(tpl, vars);
+};
+
+// 自定义 action 的 playbook 渲染：定义正文（填同样的模板变量）+ 点名本 action 重点用的 skill。
+// 全量 skill 已在 super prompt 的可用 skills 段、这里只是高亮、agent 按需 read 完整 SKILL.md。
+const loadCustomActionPlaybook = async (
+  action: ActionRecord,
+  vars: Record<string, string | undefined>,
+): Promise<string> => {
+  const def = action.customActionId
+    ? await getCustomAction(action.customActionId)
+    : null;
+  if (!def) {
+    return `（自定义 action 定义未找到${
+      action.customActionId ? `：${action.customActionId}` : "（缺 id）"
+    }、可能已在 /actions 页删除。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明定义缺失。）`;
+  }
+  const parts = [fillTemplate(def.playbook, vars)];
+  if (def.skills && def.skills.length > 0) {
+    parts.push(
+      "",
+      "## 本 action 重点使用以下 skill",
+      "（详情见上方可用 skills 段、按场景用 `read` 读完整 SKILL.md）：",
+      ...def.skills.map((s) => `- ${s}`),
+    );
+  }
+  return parts.join("\n");
 };
 
 // ----------------- super-prompt 拼装 -----------------
@@ -258,7 +296,7 @@ const buildSuperPrompt = async (
   const currentActionPlaybook = [
     `### Action: ${currentType}`,
     "",
-    await loadActionPrompt(currentType, task),
+    await loadActionPrompt(firstNextAction.action, task),
   ].join("\n");
 
   // 当前已存在的 action history（agent 起 Run 时能看到之前的工作）
@@ -1125,6 +1163,9 @@ const checkActionPrerequisites = (
       }
       return { ok: true };
     }
+    case "custom":
+      // 自定义 action：技术准入无额外要求（定义存在性 + customActionId 在 advance API 校验）。
+      return { ok: true };
     default: {
       const _: never = actionType;
       return { ok: false, reason: `未知 action 类型：${_}` };
@@ -1465,6 +1506,8 @@ export interface AdvanceTaskInput {
   repoBaseBranches?: Record<string, string>;
   repoTestBranches?: Record<string, string>;
   repoDevBranches?: Record<string, string>;
+  // V0.9：自定义 action 指向的定义 id（仅 actionType="custom" 传）
+  customActionId?: string;
 }
 
 export interface RestartCurrentActionInput {
@@ -1578,9 +1621,17 @@ const advanceTaskInner = async (
     repoBaseBranches,
     repoTestBranches,
     repoDevBranches,
+    customActionId,
   } = input;
   // task 用 let：去掉「通过」后、推进开头会隐式认可当前 awaiting_ack action、之后重读最新 task 供准入 / appendAction 用
   let task = input.task;
+
+  // 自定义 action：提前读定义（拿 freshAgent 默认 + label 快照）。读不到不致命——
+  //   loadActionPrompt 会兜底提示、appendAction 的 customLabel 留空。
+  const customDef =
+    actionType === "custom" && customActionId
+      ? await getCustomAction(customActionId)
+      : null;
 
   // V0.8.18：推进新 action 前、取消上一 action 可能还在后台跑的 check（结果对新 action 无意义、且防状态交错）
   abortRunningCheck(task.id);
@@ -1601,8 +1652,12 @@ const advanceTaskInner = async (
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
-  const effectiveForceNewAgent =
-    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
+  // 自定义 action 的 fresh 默认取定义里的 freshAgent（缺省回退 ACTION_FRESH_AGENT_DEFAULT.custom）
+  const actionFreshDefault =
+    customDef && typeof customDef.freshAgent === "boolean"
+      ? customDef.freshAgent
+      : ACTION_FRESH_AGENT_DEFAULT[actionType];
+  const effectiveForceNewAgent = !reuseAgent || actionFreshDefault;
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites / checkShipCheckGate 看到的就是
@@ -1663,6 +1718,9 @@ const advanceTaskInner = async (
     replanMode: actionType === "plan" ? replanMode : undefined,
     // V0.x：仅 dev 带推送方式（appendAction 内部也按 type 过滤）
     devPushMode: actionType === "dev" ? devPushMode : undefined,
+    // V0.9：仅 custom 带定义 id + label 快照（appendAction 内部也按 type 过滤）
+    customActionId: actionType === "custom" ? customActionId : undefined,
+    customLabel: actionType === "custom" ? customDef?.label : undefined,
   });
   if (!created) {
     throw new Error(`appendAction 失败 task=${task.id}（task 不存在）`);
@@ -1689,7 +1747,7 @@ const advanceTaskInner = async (
     kind: "action_start",
     actionId: action.id,
     // V0.6.25：ship override reason 拼进事件流——审计「明知 check 没过仍提测」的可见留痕（reviewer 要求至少进 task event）
-    text: `开始 ${ACTION_LABEL[actionType]}（${action.type}）n=${action.n}${
+    text: `开始 ${actionDisplayLabel(action)}（${action.type}）n=${action.n}${
       userInstruction.trim().length > 0 ? `\n用户指令：${truncate(userInstruction, 200)}` : ""
     }${
       actionType === "ship" && checkOverride
@@ -1741,7 +1799,7 @@ const advanceTaskInner = async (
     existingRecord.startSnapshot = captureTaskFieldsSnapshot(taskAfterAppend);
     // V0.6.27：续接载荷附本 action 的完整 playbook——super prompt 只注入了启动时那个
     // action 的指令、续接的新 action（哪怕同类型）以载荷这份为准
-    const actionPlaybook = await loadActionPrompt(action.type, taskAfterAppend);
+    const actionPlaybook = await loadActionPrompt(action, taskAfterAppend);
     // agent 在「待命态」（等下一 action 指令）、submitNextAction 直接续接
     const ok = submitNextAction(
       task.id,
@@ -1895,7 +1953,7 @@ const restartCurrentActionInner = async (
   await writeEventAndPublish(fresh.id, {
     kind: "info",
     actionId: action.id,
-    text: `用户重启了当前 ${ACTION_LABEL[action.type]} action（n=${action.n}），沿用原 action 继续执行`,
+    text: `用户重启了当前 ${actionDisplayLabel(action)} action（n=${action.n}），沿用原 action 继续执行`,
     meta: { restartedActionId: action.id, actionType: action.type, n: action.n },
   });
 

@@ -84,9 +84,9 @@ describe("信号构造函数格式", () => {
     expect(head).toBe(
       "[NEXT_ACTION action_id=act_3 type=build n=3 artifact_path=actions/3-build.md]",
     );
-    // _super.md 里教 agent 的格式样例必须与构造端字段顺序一致
+    // _super.md 里教 agent 的格式样例必须与构造端字段顺序一致（type 枚举含 custom）
     expect(superMd).toContain(
-      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev> n=<N> artifact_path=actions/<N>-<type>.md]",
+      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev|custom> n=<N> artifact_path=actions/<N>-<type>.md]",
     );
   });
 

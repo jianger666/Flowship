@@ -149,6 +149,21 @@ export interface FeAiFlowSettings {
    * 省得每次新建都手动关一堆不常用的。新增 server 不在黑名单 = 默认开。
    */
   disabledMcpServers?: string[];
+  /**
+   * V0.9：推进面板布局偏好（「推进」弹窗里 action 的顺序 + 显隐、个人级、落 config.json）
+   */
+  actionLayout?: ActionLayoutPref;
+}
+
+/**
+ * 推进面板布局偏好——自定义「推进」弹窗里 action 卡片的顺序 + 显隐。
+ * 内置组、自定义组各自按 order 排（不混排）。
+ */
+export interface ActionLayoutPref {
+  /** action key 排序：内置用 type（"plan"）、自定义用 id（"custom_xxx"）；不在表里的排末尾 */
+  order: string[];
+  /** 默认折叠进「更多」的 action key（不是禁用、展开仍可选） */
+  hidden: string[];
 }
 
 /**
@@ -210,13 +225,20 @@ export interface ApiKeyInfo {
 // 4. 不写 V0.5 → V0.6 migration 脚本、V0.5 老 task 数据靠 listTasks 自动跳过（schema 不匹配的 meta.json 在 hydrate 时被 skip）
 
 /**
- * 6 种 action 类型（V0.6.0.1 起 chat 从 action 里剥离、走独立 mode=chat 通路）
+ * action 类型（V0.6.0.1 起 chat 从 action 里剥离、走独立 mode=chat 通路）
+ *
+ * 6 个内置：
  * - `plan`     出方案
  * - `build`    改代码
  * - `review`   复核（plan/build 差异核对 + fresh peer bug 复审）
  * - `ship`     提测（push 改动 + 提 MR 到 test 分支 + 飞书 story 评论 @ 测试人员）
  * - `learn`    沉淀
  * - `dev`      联调
+ *
+ * `custom`（自定义 action）：用户在 /actions 页自己封装的 action（playbook + skill + 可选 check）。
+ *   一条 type=custom 的 ActionRecord 用 `customActionId` 指向 custom-actions/<id>.md 定义。
+ *   custom **不进** ACTION_TYPES（那是「内置 action 选择」清单）、但要补进所有 `Record<ActionType,X>` 兜底键。
+ *   展示文案以定义里的 label 为准、表里的 "自定义" 只是没拿到定义时的兜底。
  */
 export type ActionType =
   | "plan"
@@ -224,8 +246,10 @@ export type ActionType =
   | "review"
   | "ship"
   | "learn"
-  | "dev";
+  | "dev"
+  | "custom";
 
+// 内置 action 类型清单（advance 准入 / UI 内置选项；custom 不在内、单独走自定义清单）
 export const ACTION_TYPES = [
   "plan",
   "build",
@@ -252,6 +276,8 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   ship: "提测",
   learn: "沉淀",
   dev: "联调",
+  // 兜底——custom action 实际展示用定义里的 label、拿不到定义才回退到这个
+  custom: "自定义",
 };
 
 /**
@@ -280,7 +306,42 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   ship: false,
   learn: false,
   dev: false,
+  // 自定义 action 默认 fresh（跟 V0.6.27 全员默认 fresh 一致、各 custom 可在定义里覆盖）
+  custom: true,
 };
+
+/**
+ * V0.9：自定义 action 定义（用户在 /actions 页建、存 dataRoot()/custom-actions/<id>.md）
+ *
+ * 存储格式：md 文件——frontmatter 配元信息 + 正文是 playbook。
+ * 运行时：一条 type="custom" 的 ActionRecord 用 customActionId 指向这里、runner 把 playbook
+ *   当 action prompt 注入、按 skills 提示 agent 重点用、跑完按 checkCommands 验。
+ *
+ * - id：唯一（= 文件名 <id>.md 的 id 段、如 custom_xxx）
+ * - label：动作名（如「性能审计」、推进菜单 + timeline 展示）
+ * - summary：一句话简介（列表副标题、可选）
+ * - playbook：正文（干什么 / 怎么做 / 产出什么、markdown）
+ * - skills：选用的 skill name 列表（loadSkills 扫出来的、可选）
+ * - checkCommands：可选后置校验命令（跑完自动验、复用 build 的 CheckCommand 结构）
+ * - freshAgent：是否强起新 agent（默认 true、跟内置默认 fresh 一致）
+ */
+export interface CustomActionDef {
+  id: string;
+  label: string;
+  summary?: string;
+  playbook: string;
+  skills?: string[];
+  checkCommands?: CheckCommand[];
+  freshAgent?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 新建 / 更新自定义 action 的入参（不含 id / 时间戳、那些由存储层管、前后端共用） */
+export type CustomActionInput = Omit<
+  CustomActionDef,
+  "id" | "createdAt" | "updatedAt"
+>;
 
 /**
  * action 状态机
@@ -561,6 +622,21 @@ export interface ActionRecord {
    * 不存 = 非 dev action / 老数据（dev handler 读时兜底 direct）
    */
   devPushMode?: DevPushMode;
+
+  /**
+   * V0.9：自定义 action 指向的定义 id（仅 type="custom" 的 action 有）
+   * - 指向 dataRoot()/custom-actions/<customActionId>.md
+   * - runner 据此读 playbook 当 action prompt、按定义里的 skills/checkCommands/freshAgent 跑
+   * - 不存 = 非 custom action（内置 6 个走 ACTION_PROMPT_FILE 文件）
+   */
+  customActionId?: string;
+
+  /**
+   * V0.9：自定义 action 的展示名快照（advance 时从定义 label 固化、仅 type="custom" 有）
+   * - 展示层直接用这个、不用每次回查定义文件（同 MRRecord.title 思路）
+   * - 快照原因：定义后来改名 / 删了、历史 action 仍显示当时的名字、不漂移
+   */
+  customLabel?: string;
 
   /**
    * 模型选择（V0.6 推进 dialog 高级选项支持切模型）

@@ -19,7 +19,7 @@
  */
 
 import Link from "next/link";
-import { PanelLeft, Settings } from "lucide-react";
+import { Blocks, PanelLeft, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
@@ -131,6 +131,22 @@ export const AppHeader = ({
         <UpdateBadge />
         {/* 主题切换（浅色 / 深色 / 跟随系统） */}
         <ThemeToggle />
+        {/* 自定义 Action 管理入口 */}
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          nativeButton={false}
+          render={
+            <Link
+              href="/actions"
+              className="no-underline"
+              aria-label="自定义 Action"
+              title="自定义 Action"
+            />
+          }
+        >
+          <Blocks />
+        </Button>
         <Button
           variant="ghost"
           size="icon-sm"
