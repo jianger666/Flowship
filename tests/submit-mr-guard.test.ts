@@ -67,13 +67,13 @@ describe("validateSubmitMr", () => {
     if (!r.ok) expect(r.error).toContain("不属于本 task");
   });
 
-  it("action_id 不是 ship / dev action → 拒", async () => {
+  it("action_id 不是 ship / dev / custom action → 拒", async () => {
     const r = await validateSubmitMr(baseTask(), {
       ...baseMr,
       actionId: "act_2", // build action
     });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("ship / dev action");
+    if (!r.ok) expect(r.error).toContain("ship / dev / custom action");
   });
 
   it("target_branch 不是该仓测试分支 → 拒（不许提 master）", async () => {
@@ -155,6 +155,48 @@ describe("validateSubmitMr", () => {
     const r = await validateSubmitMr(task, devMr);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("没配 dev 分支");
+  });
+
+  // V0.9.2：受控放开——任意 custom action 提 feature→base（线上）MR、
+  // 唯一能提线上分支的口子、但仍只放行「该仓 base 分支」这一个值、且其余越权防线不变。
+  const customTask = (over: Partial<Task> = {}): Task =>
+    baseTask({
+      currentActionId: "act_5",
+      actions: [
+        { id: "act_2", n: 2, type: "build", status: "completed" },
+        { id: "act_5", n: 5, type: "custom", status: "running" },
+      ],
+      repoBaseBranches: { [REPO]: "master" },
+      ...over,
+    } as Partial<Task>);
+  const customMr = { ...baseMr, actionId: "act_5", targetBranch: "master" };
+
+  it("custom action + target=该仓 base 分支 → ok（受控放开线上 MR）", async () => {
+    expect((await validateSubmitMr(customTask(), customMr)).ok).toBe(true);
+  });
+
+  it("custom action + target 不是 base 分支（如 test）→ 拒", async () => {
+    const r = await validateSubmitMr(customTask(), {
+      ...customMr,
+      targetBranch: "test",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("base");
+  });
+
+  it("custom action 但该仓没配 base 分支 → 拒", async () => {
+    const task = customTask({ repoBaseBranches: undefined } as Partial<Task>);
+    const r = await validateSubmitMr(task, customMr);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("base");
+  });
+
+  it("custom action 仍受 source 必须 feature 约束（不能拿 base 当 source）", async () => {
+    const r = await validateSubmitMr(customTask(), {
+      ...customMr,
+      sourceBranch: "master",
+    });
+    expect(r.ok).toBe(false);
   });
 });
 

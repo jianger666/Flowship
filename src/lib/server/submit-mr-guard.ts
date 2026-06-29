@@ -61,31 +61,50 @@ export const validateSubmitMr = async (
       error: `repo_path ${a.repoPath} 不属于本 task（合法仓：${task.repoPaths.join(", ") || "无"}）`,
     };
   }
-  // 2) action_id 必须是本 task 的 ship 或 dev action（防把 MR 挂到错 action / 非提交阶段）
-  //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、共用 submit_mr 同一通道
+  // 2) action_id 必须是本 task 的 ship / dev / custom action（防把 MR 挂到错 action / 非提交阶段）
+  //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、custom = 任意自定义 action（→该仓 base 分支）、
+  //    三者共用 submit_mr 同一通道（custom 是 V0.9.2「受控放开」加的、对所有自定义 action 一视同仁、详见下方 target 校验）
   const action = task.actions.find((x) => x.id === a.actionId);
-  if (!action || (action.type !== "ship" && action.type !== "dev")) {
+  if (
+    !action ||
+    (action.type !== "ship" &&
+      action.type !== "dev" &&
+      action.type !== "custom")
+  ) {
     return {
       ok: false,
-      error: `action_id ${a.actionId} 不是本 task 的 ship / dev action`,
+      error: `action_id ${a.actionId} 不是本 task 的 ship / dev / custom action`,
     };
   }
-  // 3) target_branch 按 action 类型校验：提测→该仓测试分支（默认 test）、联调→该仓 dev 分支（必须显式配）。
-  //    一律不许提到 master / 任意分支。
+  // 3) target_branch 按 action 类型校验（受控放开、每种只放行「该仓对应那一个分支」、仍挡死任意分支）：
+  //    - 提测（ship）→ 该仓测试分支（默认 test）
+  //    - 联调（dev）→ 该仓 dev 分支（必须显式配）
+  //    - 自定义（custom、任意自定义 action）→ 该仓 base 分支（线上/基线、必须显式配）
+  //      ⚠️ 这是唯一能提到线上分支的口子：仅对 custom 类型放行、且只放行「该仓 base 分支」这一个值，
+  //         ship/dev 仍一律禁止提 master（原安全语义不变）。custom 仍受闸 1/4/5 约束（仓范围 / source 必须 feature / project 对账）。
   const expectedTarget =
     action.type === "dev"
       ? task.repoDevBranches?.[a.repoPath]?.trim()
-      : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
+      : action.type === "custom"
+        ? task.repoBaseBranches?.[a.repoPath]?.trim()
+        : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
   if (!expectedTarget) {
+    const branchKind = action.type === "custom" ? "base（线上/基线）" : "dev";
     return {
       ok: false,
-      error: `该仓没配 dev 分支、联调无法提 PR（请去设置页给该仓配 dev 分支）：${a.repoPath}`,
+      error: `该仓没配 ${branchKind} 分支、无法提 MR（请去设置页给该仓配 ${branchKind} 分支）：${a.repoPath}`,
     };
   }
   if (a.targetBranch !== expectedTarget) {
+    const branchKind =
+      action.type === "dev"
+        ? " dev 分支"
+        : action.type === "custom"
+          ? " base（线上/基线）分支"
+          : "测试分支";
     return {
       ok: false,
-      error: `target_branch 必须是该仓${action.type === "dev" ? " dev 分支" : "测试分支"}「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
+      error: `target_branch 必须是该仓${branchKind}「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
     };
   }
   // 4) source_branch 必须是该仓 feature 分支、或一次性 <feature>__conflict 解冲突分支
