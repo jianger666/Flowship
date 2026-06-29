@@ -157,8 +157,8 @@ describe("validateSubmitMr", () => {
     if (!r.ok) expect(r.error).toContain("没配 dev 分支");
   });
 
-  // V0.9.2：受控放开——任意 custom action 提 feature→线上分支 MR、
-  // 唯一能提线上分支的口子、但仍只放行「该仓线上分支」这一个值、且其余越权防线不变。
+  // V0.9.4：custom action 的 target 完全放开（任意分支、由该 action playbook 决定）。
+  // target 提到的都是「本仓内」分支、不构成越权；越权仍由 仓范围 / source 必须 feature / project 对账 三道闸守着。
   const customTask = (over: Partial<Task> = {}): Task =>
     baseTask({
       currentActionId: "act_5",
@@ -171,24 +171,39 @@ describe("validateSubmitMr", () => {
     } as Partial<Task>);
   const customMr = { ...baseMr, actionId: "act_5", targetBranch: "master" };
 
-  it("custom action + target=该仓线上分支 → ok（受控放开线上 MR）", async () => {
+  it("custom action + target=线上分支 → ok", async () => {
     expect((await validateSubmitMr(customTask(), customMr)).ok).toBe(true);
   });
 
-  it("custom action + target 不是线上分支（如 test）→ 拒", async () => {
+  it("custom action + target=test → ok（放开、不限分支）", async () => {
     const r = await validateSubmitMr(customTask(), {
       ...customMr,
       targetBranch: "test",
     });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("线上分支");
+    expect(r.ok).toBe(true);
   });
 
-  it("custom action 但该仓没配线上分支 → 拒", async () => {
+  it("custom action + target=任意分支（如 release/1.2）→ ok（放开、不限分支）", async () => {
+    const r = await validateSubmitMr(customTask(), {
+      ...customMr,
+      targetBranch: "release/1.2",
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("custom action 没配线上分支也能提（target 不再依赖 repoBaseBranches）", async () => {
     const task = customTask({ repoBaseBranches: undefined } as Partial<Task>);
-    const r = await validateSubmitMr(task, customMr);
+    const r = await validateSubmitMr(task, { ...customMr, targetBranch: "test" });
+    expect(r.ok).toBe(true);
+  });
+
+  it("custom action 仍受仓范围约束（repo_path 不在 task → 拒）", async () => {
+    const r = await validateSubmitMr(customTask(), {
+      ...customMr,
+      repoPath: "/other/repo",
+    });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("线上分支");
+    if (!r.ok) expect(r.error).toContain("不属于本 task");
   });
 
   it("custom action 仍受 source 必须 feature 约束（不能拿线上分支当 source）", async () => {

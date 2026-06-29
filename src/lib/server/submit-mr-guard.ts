@@ -62,8 +62,8 @@ export const validateSubmitMr = async (
     };
   }
   // 2) action_id 必须是本 task 的 ship / dev / custom action（防把 MR 挂到错 action / 非提交阶段）
-  //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、custom = 任意自定义 action（→该仓 base 分支）、
-  //    三者共用 submit_mr 同一通道（custom 是 V0.9.2「受控放开」加的、对所有自定义 action 一视同仁、详见下方 target 校验）
+  //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、custom = 任意自定义 action（→target 不限、由 playbook 决定）、
+  //    三者共用 submit_mr 同一通道（custom 对所有自定义 action 一视同仁、详见下方 target 校验）
   const action = task.actions.find((x) => x.id === a.actionId);
   if (
     !action ||
@@ -76,36 +76,33 @@ export const validateSubmitMr = async (
       error: `action_id ${a.actionId} 不是本 task 的 ship / dev / custom action`,
     };
   }
-  // 3) target_branch 按 action 类型校验（受控放开、每种只放行「该仓对应那一个分支」、仍挡死任意分支）：
+  // 3) target_branch 校验：ship / dev 写死「该仓对应那一个分支」、custom 完全放开（任意分支）。
   //    - 提测（ship）→ 该仓测试分支（默认 test）
   //    - 联调（dev）→ 该仓 dev 分支（必须显式配）
-  //    - 自定义（custom、任意自定义 action）→ 该仓线上分支（设置页 onlineBranch、必须显式配）
-  //      ⚠️ 这是唯一能提到线上分支的口子：仅对 custom 类型放行、且只放行「该仓线上分支」这一个值，
-  //         ship/dev 仍一律禁止提 master（原安全语义不变）。custom 仍受闸 1/4/5 约束（仓范围 / source 必须 feature / project 对账）。
-  const expectedTarget =
-    action.type === "dev"
-      ? task.repoDevBranches?.[a.repoPath]?.trim()
-      : action.type === "custom"
-        ? task.repoBaseBranches?.[a.repoPath]?.trim()
-        : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
-  if (!expectedTarget) {
-    const branchKind = action.type === "custom" ? "线上分支" : "dev 分支";
-    return {
-      ok: false,
-      error: `该仓没配 ${branchKind}、无法提 MR（请去设置页给该仓配 ${branchKind}）：${a.repoPath}`,
-    };
-  }
-  if (a.targetBranch !== expectedTarget) {
-    const branchKind =
+  //    - 自定义（custom）→ 不校验 target、提到哪个分支由该 action 的 playbook + agent 决定
+  //      ⚠️ custom 是用户自定义 action、目标分支该由用户 playbook 说了算、这道闸对它放开。
+  //         越权安全由闸 1（仓范围）/ 闸 4（source 必须 feature）/ 闸 5（project 对账）守着——
+  //         target 提到的是「本仓内」分支（test / 线上 / dev / release 等都行）、不构成越权；
+  //         ship / dev 仍写死目标分支、原安全语义完全不变（仍禁提 master）。
+  if (action.type !== "custom") {
+    const expectedTarget =
       action.type === "dev"
-        ? " dev 分支"
-        : action.type === "custom"
-          ? "线上分支"
-          : "测试分支";
-    return {
-      ok: false,
-      error: `target_branch 必须是该仓${branchKind}「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
-    };
+        ? task.repoDevBranches?.[a.repoPath]?.trim()
+        : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
+    if (!expectedTarget) {
+      // 走到这里只可能是 dev（ship 有 "test" 兜底、永远有值）
+      return {
+        ok: false,
+        error: `该仓没配 dev 分支、无法提 MR（请去设置页给该仓配 dev 分支）：${a.repoPath}`,
+      };
+    }
+    if (a.targetBranch !== expectedTarget) {
+      const branchKind = action.type === "dev" ? " dev 分支" : "测试分支";
+      return {
+        ok: false,
+        error: `target_branch 必须是该仓${branchKind}「${expectedTarget}」、收到「${a.targetBranch}」（不许提到其它分支）`,
+      };
+    }
   }
   // 4) source_branch 必须是该仓 feature 分支、或一次性 <feature>__conflict 解冲突分支
   const known = task.gitBranches?.find((b) => b.repoPath === a.repoPath)?.name;
@@ -116,7 +113,7 @@ export const validateSubmitMr = async (
         error: `source_branch 必须是「${known}」或「${known}__conflict」、收到「${a.sourceBranch}」`,
       };
     }
-  } else if (!a.sourceBranch.trim() || a.sourceBranch === expectedTarget) {
+  } else if (!a.sourceBranch.trim() || a.sourceBranch === a.targetBranch) {
     // gitBranches 没记这仓（如没 feishuStoryUrl 没建 branch）→ 退化兜底：至少非空且不等于目标分支
     return {
       ok: false,

@@ -2307,10 +2307,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         return { ok: false, error: valid.error };
       }
 
-      // V0.x：submit_mr 共用 ship / dev / custom（dev = 联调提 PR→dev 分支、custom = 自定义 action 提 base MR）、下面按 action 类型分流。
+      // V0.x：submit_mr 共用 ship / dev / custom（dev = 联调提 PR→dev 分支、custom = 自定义 action、target 由 playbook 决定）、下面按 action 类型分流。
       const submitAction = fresh.actions.find((x) => x.id === taskAction.actionId);
       const isDevSubmit = submitAction?.type === "dev";
-      // V0.9.2：custom（任意自定义 action）提的是 feature→base（线上）MR、跟 dev 一样源 feature 绝不删（MR 还没合、feature 还要继续用）
+      // custom（任意自定义 action）提的 MR 跟 dev 一样源 feature 绝不删（MR 还没合、feature 还要继续用）
       const isCustomSubmit = submitAction?.type === "custom";
 
       // V0.6.8：AI 智能解冲突会换 source 分支（feature → feature__conflict）、
@@ -2324,7 +2324,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
       // V0.6.14：合并后是否删源分支——读 task 配置（缺省保留、用户拍板）。
       // - `<feature>__conflict` 一次性解冲突分支：必删（不留垃圾、不受开关影响）。
-      // - dev（联调）/ custom（任意自定义 action 提 base 分支）提 PR：feature 源分支绝不删（合入后还要继续开发 / 提测、删了就没分支了）。
+      // - dev（联调）/ custom（任意自定义 action 提的 MR）：feature 源分支绝不删（合入后还要继续开发 / 提测、删了就没分支了）。
       // - ship（提测）：按 task 配置 removeSourceBranchOnMerge（缺省保留）。
       const isConflictBranch = taskAction.sourceBranch.endsWith("__conflict");
       const removeSourceBranch = isConflictBranch
