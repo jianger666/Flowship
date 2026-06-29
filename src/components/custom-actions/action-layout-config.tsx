@@ -1,17 +1,19 @@
 "use client";
 
 /**
- * 推进面板布局配置（V0.9、嵌在 /actions 页）
+ * Action 管理列表（V0.9、嵌在 /actions 页、内置 + 自定义统一一个地方管）
  *
- * 内置 + 自定义混排成一个列表、拖拽调顺序（framer-motion Reorder）+ 开关控显隐、自定义项带扳手角标。
- * 隐藏的在「推进」弹窗收进「更多」。偏好落 config.json（settings.actionLayout）、个人级、全任务生效。
+ * 内置 + 自定义混排成一个列表：拖拽调「推进」里的顺序（framer-motion Reorder）+ 开关控显隐、
+ * 自定义项带扳手角标、且额外给「编辑 / 删除」入口（内置不可改不可删）。
+ * 隐藏的在「推进」弹窗收进「更多」。顺序 / 显隐偏好落 config.json（settings.actionLayout）、个人级、全任务生效。
  * 拖拽：onReorder 只更新本地态、松手（onDragEnd）才落盘——避免拖动过程狂发 config.json 写请求。
  */
 
 import { useEffect, useRef, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
-import { GripVertical, Wrench } from "lucide-react";
+import { GripVertical, Pencil, Trash2, Wrench } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -28,6 +30,9 @@ import { cn } from "@/lib/utils";
 interface Props {
   // 当前自定义 action 列表（由 /actions 页加载后传入、增删后自动反映）
   customActions: CustomActionDef[];
+  // 自定义 action 行的编辑 / 删除（内置行不展示这两个按钮）
+  onEdit: (def: CustomActionDef) => void;
+  onDelete: (def: CustomActionDef) => void;
 }
 
 interface RowProps {
@@ -37,9 +42,12 @@ interface RowProps {
   isHidden: boolean;
   onToggleHidden: (visible: boolean) => void;
   onDragEnd: () => void;
+  // 仅自定义 action 传——内置 action 不可编辑 / 删除
+  onEdit?: () => void;
+  onDelete?: () => void;
 }
 
-// 单行：拖拽手柄 + 名称（自定义带扳手角标）+ 显隐开关
+// 单行：拖拽手柄 + 名称（自定义带扳手角标）+ [自定义]编辑 / 删除 + 显隐开关
 const LayoutRow = ({
   value,
   label,
@@ -47,8 +55,10 @@ const LayoutRow = ({
   isHidden,
   onToggleHidden,
   onDragEnd,
+  onEdit,
+  onDelete,
 }: RowProps) => {
-  // 每个 Item 独立拖拽控制器——dragListener={false} 只让手柄发起拖拽、不误触开关 / 整行
+  // 每个 Item 独立拖拽控制器——dragListener={false} 只让手柄发起拖拽、不误触开关 / 按钮 / 整行
   const controls = useDragControls();
   return (
     <Reorder.Item
@@ -84,12 +94,27 @@ const LayoutRow = ({
           收进「更多」
         </span>
       )}
+      {/* 编辑 / 删除仅自定义行有——内置 action 不可改不可删 */}
+      {onEdit && (
+        <Button variant="ghost" size="icon-sm" onClick={onEdit} title="编辑">
+          <Pencil />
+        </Button>
+      )}
+      {onDelete && (
+        <Button variant="ghost" size="icon-sm" onClick={onDelete} title="删除">
+          <Trash2 />
+        </Button>
+      )}
       <Switch checked={!isHidden} onCheckedChange={onToggleHidden} />
     </Reorder.Item>
   );
 };
 
-export const ActionLayoutConfig = ({ customActions }: Props) => {
+export const ActionLayoutConfig = ({
+  customActions,
+  onEdit,
+  onDelete,
+}: Props) => {
   const { settings, saveFieldValue, loaded } = useSettings();
   const layout = settings.actionLayout ?? { order: [], hidden: [] };
   const hiddenSet = new Set(layout.hidden);
@@ -142,21 +167,26 @@ export const ActionLayoutConfig = ({ customActions }: Props) => {
       onReorder={setOrder}
       className="grid gap-1.5"
     >
-      {order.map((key) => (
-        <LayoutRow
-          key={key}
-          value={key}
-          label={
-            isBuiltinAdvanceAction(key)
-              ? ACTION_LABEL[key]
-              : (customById.get(key)?.label ?? key)
-          }
-          isCustom={!isBuiltinAdvanceAction(key)}
-          isHidden={hiddenSet.has(key)}
-          onToggleHidden={(visible) => toggleHidden(key, visible)}
-          onDragEnd={handleDragEnd}
-        />
-      ))}
+      {order.map((key) => {
+        const def = customById.get(key);
+        return (
+          <LayoutRow
+            key={key}
+            value={key}
+            label={
+              isBuiltinAdvanceAction(key)
+                ? ACTION_LABEL[key]
+                : (def?.label ?? key)
+            }
+            isCustom={!isBuiltinAdvanceAction(key)}
+            isHidden={hiddenSet.has(key)}
+            onToggleHidden={(visible) => toggleHidden(key, visible)}
+            onDragEnd={handleDragEnd}
+            onEdit={def ? () => onEdit(def) : undefined}
+            onDelete={def ? () => onDelete(def) : undefined}
+          />
+        );
+      })}
     </Reorder.Group>
   );
 };

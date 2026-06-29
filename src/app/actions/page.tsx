@@ -1,21 +1,20 @@
 "use client";
 
 /**
- * 自定义 Action 管理页（V0.9、独立页 /actions）
+ * Action 管理页（V0.9、独立页 /actions）
  *
- * 列表 + 新建 / 编辑（CustomActionEditor Dialog）+ 删除。
- * 把常用流程封装成 action、之后在任务详情「推进」菜单的「我的」组里像内置一样选。
+ * 内置 + 自定义 action 统一一个列表管理（ActionLayoutConfig）：拖拽排序 + 显隐开关、
+ * 自定义的额外可编辑 / 删除（CustomActionEditor Dialog）+ 顶部「新建」。
+ * 顺序 / 显隐影响任务详情「推进」菜单里 action 的排列。
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Pencil, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { LoadingState } from "@/components/ui/loading-state";
-import { EmptyHint } from "@/components/ui/empty-hint";
 import { useDialog } from "@/hooks/use-dialog";
 import { CustomActionEditor } from "@/components/custom-actions/custom-action-editor";
 import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-config";
@@ -109,9 +108,9 @@ const ActionsPage = () => {
         </Button>
         <div className="flex items-center justify-between gap-2">
           <div>
-            <h1 className="text-lg font-semibold">自定义 Action</h1>
+            <h1 className="text-lg font-semibold">Action 管理</h1>
             <p className="text-sm text-muted-foreground">
-              把常用流程封装成 action、在任务里像内置一样推进
+              拖拽调「推进」里的顺序、开关控显隐、自定义的可编辑 / 删除
             </p>
           </div>
           <Button onClick={handleNew}>
@@ -121,68 +120,16 @@ const ActionsPage = () => {
         </div>
       </div>
 
+      {/* 内置 + 自定义混排成一个列表统一管理：拖拽排序 + 显隐开关、自定义行额外可编辑 / 删除 */}
       {loading ? (
         <LoadingState variant="card" />
-      ) : actions.length === 0 ? (
-        <EmptyHint variant="dashed" size="lg" align="center">
-          还没有自定义 action、点右上角「新建」封装一个
-        </EmptyHint>
       ) : (
-        <div className="grid gap-3">
-          {actions.map((a) => (
-            <Card
-              key={a.id}
-              className="flex-row items-start justify-between gap-3 p-4"
-            >
-              <div className="min-w-0 flex-1">
-                <div className="font-medium">{a.label}</div>
-                {a.summary && (
-                  <div className="mt-0.5 line-clamp-1 text-sm text-muted-foreground">
-                    {a.summary}
-                  </div>
-                )}
-                <div className="mt-1.5 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                  {a.skills && a.skills.length > 0 && (
-                    <span>{a.skills.length} 个 skill</span>
-                  )}
-                  {a.checkCommands && a.checkCommands.length > 0 && (
-                    <span>{a.checkCommands.length} 条 check</span>
-                  )}
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  onClick={() => handleEdit(a)}
-                  title="编辑"
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  onClick={() => handleDelete(a)}
-                  title="删除"
-                >
-                  <Trash2 />
-                </Button>
-              </div>
-            </Card>
-          ))}
-        </div>
+        <ActionLayoutConfig
+          customActions={actions}
+          onEdit={handleEdit}
+          onDelete={handleDelete}
+        />
       )}
-
-      {/* V0.9：推进面板布局——配「推进」弹窗里 action 的顺序 + 显隐 */}
-      <div className="mt-8 border-t pt-6">
-        <div className="mb-3">
-          <h2 className="text-base font-semibold">推进面板布局</h2>
-          <p className="text-sm text-muted-foreground">
-            调「推进」里 action 的顺序和显隐、隐藏的收进「更多」
-          </p>
-        </div>
-        <ActionLayoutConfig customActions={actions} />
-      </div>
 
       <CustomActionEditor
         open={editorOpen}

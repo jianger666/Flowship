@@ -79,8 +79,8 @@ export const validateSubmitMr = async (
   // 3) target_branch 按 action 类型校验（受控放开、每种只放行「该仓对应那一个分支」、仍挡死任意分支）：
   //    - 提测（ship）→ 该仓测试分支（默认 test）
   //    - 联调（dev）→ 该仓 dev 分支（必须显式配）
-  //    - 自定义（custom、任意自定义 action）→ 该仓 base 分支（线上/基线、必须显式配）
-  //      ⚠️ 这是唯一能提到线上分支的口子：仅对 custom 类型放行、且只放行「该仓 base 分支」这一个值，
+  //    - 自定义（custom、任意自定义 action）→ 该仓线上分支（设置页 onlineBranch、必须显式配）
+  //      ⚠️ 这是唯一能提到线上分支的口子：仅对 custom 类型放行、且只放行「该仓线上分支」这一个值，
   //         ship/dev 仍一律禁止提 master（原安全语义不变）。custom 仍受闸 1/4/5 约束（仓范围 / source 必须 feature / project 对账）。
   const expectedTarget =
     action.type === "dev"
@@ -89,10 +89,10 @@ export const validateSubmitMr = async (
         ? task.repoBaseBranches?.[a.repoPath]?.trim()
         : task.repoTestBranches?.[a.repoPath]?.trim() || "test";
   if (!expectedTarget) {
-    const branchKind = action.type === "custom" ? "base（线上/基线）" : "dev";
+    const branchKind = action.type === "custom" ? "线上分支" : "dev 分支";
     return {
       ok: false,
-      error: `该仓没配 ${branchKind} 分支、无法提 MR（请去设置页给该仓配 ${branchKind} 分支）：${a.repoPath}`,
+      error: `该仓没配 ${branchKind}、无法提 MR（请去设置页给该仓配 ${branchKind}）：${a.repoPath}`,
     };
   }
   if (a.targetBranch !== expectedTarget) {
@@ -100,7 +100,7 @@ export const validateSubmitMr = async (
       action.type === "dev"
         ? " dev 分支"
         : action.type === "custom"
-          ? " base（线上/基线）分支"
+          ? "线上分支"
           : "测试分支";
     return {
       ok: false,

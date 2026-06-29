@@ -1205,7 +1205,7 @@ const buildMcpServer = (): McpServer => {
     {
       title: "提交 GitLab MR（ship 提测 / dev 联调 / custom 自定义 action 用、server 同步调 REST API）",
       description: [
-        "ship（提测→该仓测试分支）/ dev 联调提 PR（→该仓 dev 分支）/ custom 自定义 action（→该仓 base 线上分支）跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
+        "ship（提测→该仓测试分支）/ dev 联调提 PR（→该仓 dev 分支）/ custom 自定义 action（→该仓线上分支）跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
         "",
         "## 调用前置（agent 自己保证）",
         "",
@@ -1267,7 +1267,7 @@ const buildMcpServer = (): McpServer => {
         target_branch: z
           .string()
           .describe(
-            "MR 目标分支（见 super prompt「## 仓库分支配置」段、不要探 origin/HEAD）：ship 提测填该仓测试分支（没配则 `test`）；dev 联调填该仓 dev 分支；custom 自定义 action 填该仓 base（线上/基线）分支。按本次 action 类型 + 指令决定",
+            "MR 目标分支（见 super prompt「## 仓库分支配置」段、不要探 origin/HEAD）：ship 提测填该仓测试分支（没配则 `test`）；dev 联调填该仓 dev 分支；custom 自定义 action 填该仓线上分支。按本次 action 类型 + 指令决定",
           ),
         title: z.string().describe("MR 标题（建议格式：`[role] <task.title>`）"),
         description: z
