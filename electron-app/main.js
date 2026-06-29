@@ -457,10 +457,9 @@ ipcMain.on("set-titlebar-overlay", (_e, opts) => {
 // 已就绪的新版本号（null = 无更新待装）
 let updateReadyVersion = null;
 
-// 更新动作模式：win 用 electron-updater 下载完「重启即装」；
-// mac 未签名跑不了 Squirrel.Mac——v0.7.7 曾退化为「开系统浏览器下载页」、
-// v0.7.12 起改壳内自更新（fetch dmg 无 quarantine + ditto 替换自身、见 macSelfUpdate）、
-// 故此处 "download" 现指「壳内下载替换自身」、不再是「跳下载页」
+// 更新动作模式（installUpdateNow 据此分平台路径、两端 UX 已对齐：点按钮→下载→完成重启）：
+// - win="install"：electron-updater、autoDownload=false → 点按钮才 downloadUpdate、下载完 quitAndInstall
+// - mac="download"：未签名跑不了 Squirrel.Mac，走壳内自更新（fetch dmg 无 quarantine + ditto 替换自身、见 macSelfUpdate）
 const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 
@@ -489,7 +488,8 @@ const markPrompted = async (version) => {
 //  did-finish-load 时重注入、页面刷新也不丢标识）
 const notifyPageUpdateReady = () => {
   if (!mainWindow || !updateReadyVersion) return;
-  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.__appUpdateMode=${JSON.stringify(UPDATE_MODE)};window.dispatchEvent(new Event("app-update-ready"));`;
+  // win/mac 现在行为一致（都是点按钮→下载→完成重启）、不再注入 __appUpdateMode 区分文案
+  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.dispatchEvent(new Event("app-update-ready"));`;
   mainWindow.webContents.executeJavaScript(js).catch(() => {});
 };
 
@@ -594,7 +594,8 @@ const macSelfUpdate = async (version) => {
 };
 
 // 应用更新（页面点「新版本」标识、或对话框确认走到这）：
-// win 重启即装（before-quit 兜底杀 server、不留孤儿）；mac 壳内下载替换自身
+// mac 壳内下载替换自身；win 此刻才开始下载（autoDownload=false、对齐 mac「点按钮才下载」）、
+// 下载完由 update-downloaded 监听器弹「立即重启」→ quitAndInstall（before-quit 兜底杀 server、不留孤儿）。
 const installUpdateNow = async () => {
   if (!updateReadyVersion) return;
   if (UPDATE_MODE === "download") {
@@ -602,9 +603,20 @@ const installUpdateNow = async () => {
     await macSelfUpdate(updateReadyVersion);
     return;
   }
-  log(`[updater] 用户确认、重启安装 v${updateReadyVersion}`);
-  const { default: updater } = await import("electron-updater");
-  updater.autoUpdater.quitAndInstall();
+  // win：此刻才下载（进度走任务栏、见 download-progress 监听）；完成后弹「立即重启」装
+  try {
+    log(`[updater] win 开始下载 v${updateReadyVersion}`);
+    const updater = await ensureWinAutoUpdater();
+    await updater.downloadUpdate();
+  } catch (err) {
+    mainWindow?.setProgressBar(-1);
+    log(`[updater] win 下载失败 ${err?.message || err}`);
+    dialog.showErrorBox(
+      "下载更新失败",
+      `${err?.message || err}\n\n可稍后重试、或去发布页手动下载安装。`,
+    );
+    void shell.openExternal(RELEASE_LATEST_URL);
+  }
 };
 
 // 「发现新版本」对话框（win / mac 文案、按钮行为不同、弹一次的记账共用）
@@ -646,28 +658,69 @@ const isNewer = (a, b) => {
 // 不止在启动时查一次（v0.7.22）。同版本只弹一次靠 promptUpdateOnce 的 wasPrompted 去重。
 const UPDATE_POLL_MS = 2 * 60 * 60 * 1000;
 
-// win electron-updater 单例：首次 setup 时初始化 + 注册事件、轮询复用、不重复注册监听器
+// win electron-updater 单例：首次用到时初始化、轮询 / 手动检查 / 下载复用同一个、不重复注册监听器
 let winAutoUpdater = null;
 
-// 查一次更新（启动 + 每 2h 轮询都走这）。win 触发后台下载、下载完走 update-downloaded 事件；
-// mac 查版本号比对、有新版直接提醒。同版本重复查只刷新页面标识、不重复弹窗（wasPrompted 去重）。
+// win electron-updater 懒加载初始化（只做一次）：
+// - autoDownload=false 是本方案核心——检查更新只查版本号、不自动下载、把下载推迟到用户点按钮后（对齐 mac）
+// - 注册下载进度（任务栏进度条）/ 下载完成（弹「立即重启」装）/ 出错事件、只注册一次防监听器泄漏
+const ensureWinAutoUpdater = async () => {
+  if (winAutoUpdater) return winAutoUpdater;
+  // electron-updater 是 CJS、ESM 下走 default 再解构最稳
+  const { default: updater } = await import("electron-updater");
+  winAutoUpdater = updater.autoUpdater;
+  winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
+  // 下载进度 → 任务栏进度条（对齐 mac macSelfUpdate 的 Dock 进度条）
+  winAutoUpdater.on("download-progress", (p) => {
+    if (mainWindow && typeof p?.percent === "number") mainWindow.setProgressBar(p.percent / 100);
+  });
+  // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）→ 弹「立即重启」装
+  winAutoUpdater.on("update-downloaded", async (info) => {
+    mainWindow?.setProgressBar(-1);
+    const v = info?.version || updateReadyVersion;
+    log(`[updater] 新版本 v${v} 已下载完成`);
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "更新完成",
+      message: `已下载 v${v}`,
+      detail: "重启应用后生效。",
+      buttons: ["立即重启", "稍后"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) {
+      quitting = true;
+      winAutoUpdater.quitAndInstall();
+    }
+  });
+  winAutoUpdater.on("error", (err) => {
+    mainWindow?.setProgressBar(-1);
+    log(`[updater] ${err?.message || err}`);
+  });
+  return winAutoUpdater;
+};
+
+// 查一次更新（启动 + 每 2h 轮询都走这）。win/mac 逻辑已对齐：只查「有没有新版」、不下载；
+// 查到 → 点亮页面右上角「新版本」标识 + 弹一次「发现新版本」框（wasPrompted 去重、同版本不重复骚扰）。
+// 区别仅「怎么查版本号」：win 走 electron-updater checkForUpdates 拿 updateInfo、mac 查 GitHub release tag。
 const runUpdateCheck = async () => {
   try {
-    if (process.platform === "win32") {
-      // 查更新 + 自动后台下载（autoDownload 默认 true）、下载完走 update-downloaded 事件
-      if (winAutoUpdater) await winAutoUpdater.checkForUpdates();
-      return;
-    }
-    // mac：查版本号、有新版提醒「应用内自更新」（壳下载 dmg 替换自身、v0.7.12）
-    const latest = await fetchLatestVersion();
     const current = app.getVersion();
+    // 查最新版本号：win 走 electron-updater（autoDownload=false、只查不下）、mac 查 GitHub release tag
+    let latest = null;
+    if (process.platform === "win32") {
+      const r = await (await ensureWinAutoUpdater()).checkForUpdates();
+      latest = r?.updateInfo?.version || null;
+    } else {
+      latest = await fetchLatestVersion();
+    }
     if (!latest || !isNewer(latest, current)) return;
     updateReadyVersion = latest;
     log(`[updater] 发现新版本 v${latest}（当前 v${current}）`);
     notifyPageUpdateReady();
     await promptUpdateOnce(latest, {
       message: `新版本 v${latest} 已发布`,
-      detail: "点「立即更新」自动下载安装（Dock 图标显示进度）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
+      detail: "点「立即更新」自动下载安装（进度在任务栏 / Dock 显示）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
       confirmLabel: "立即更新",
     });
   } catch (err) {
@@ -679,23 +732,10 @@ const runUpdateCheck = async () => {
 const setupAutoUpdate = async () => {
   // 测试实例版本号永远是 0.0.0-dev、查更新必弹「发现新版本」、纯骚扰——跳过
   if (!app.isPackaged || IS_TEST) return;
-  // win：初始化 electron-updater + 注册「下载就绪 / 出错」事件（仅一次、轮询不重注册、防监听器泄漏）
+  // win：预初始化 electron-updater（autoDownload=false + 注册事件、仅一次、见 ensureWinAutoUpdater）
   if (process.platform === "win32") {
     try {
-      // electron-updater 是 CJS、ESM 下走 default 再解构最稳
-      const { default: updater } = await import("electron-updater");
-      winAutoUpdater = updater.autoUpdater;
-      winAutoUpdater.on("update-downloaded", async (info) => {
-        updateReadyVersion = info?.version || "";
-        log(`[updater] 新版本 v${updateReadyVersion} 已下载就绪`);
-        notifyPageUpdateReady();
-        await promptUpdateOnce(updateReadyVersion, {
-          message: `新版本 v${updateReadyVersion} 已下载完成`,
-          detail: "可以立即重启更新；点「稍后」的话、随时点页面右上角「新版本」标识更新。",
-          confirmLabel: "立即重启更新",
-        });
-      });
-      winAutoUpdater.on("error", (err) => log(`[updater] ${err?.message || err}`));
+      await ensureWinAutoUpdater();
     } catch (err) {
       log(`[updater] electron-updater 初始化失败（忽略）${err?.message || err}`);
     }
@@ -706,33 +746,23 @@ const setupAutoUpdate = async () => {
 };
 
 // 手动「检查更新」（设置页按钮触发）——按需查一次、返回结构化结果给页面 toast。
-// 跟自动轮询 runUpdateCheck 复用 fetchLatestVersion / isNewer / notifyPageUpdateReady，
+// 跟自动轮询 runUpdateCheck 同款查版本号（win checkForUpdates / mac fetchLatestVersion）+ 点亮逻辑，
 // 区别：自动轮询「没更新就静默」、这里把「已是最新」也明确返回（用户主动点要个确定反馈）。
 const manualCheckForUpdate = async () => {
   const current = app.getVersion();
   try {
+    // 查最新版本号（同 runUpdateCheck）：win 走 electron-updater（autoDownload=false、只查不下）、
+    // mac 查 GitHub release tag。test / 非打包下 ensureWinAutoUpdater 也会懒加载初始化。
+    let latest = null;
     if (process.platform === "win32") {
-      // win 走 electron-updater；test / 非打包下 setupAutoUpdate 早退、winAutoUpdater 仍为 null，
-      // 这里 lazy init（只挂点亮标识的轻监听、不挂自动弹框、避免和 setup 的监听重复注册）
-      if (!winAutoUpdater) {
-        const { default: updater } = await import("electron-updater");
-        winAutoUpdater = updater.autoUpdater;
-        winAutoUpdater.on("update-downloaded", (info) => {
-          updateReadyVersion = info?.version || "";
-          notifyPageUpdateReady();
-        });
-        winAutoUpdater.on("error", (err) => log(`[updater] ${err?.message || err}`));
-      }
-      const r = await winAutoUpdater.checkForUpdates();
-      const latest = r?.updateInfo?.version || null;
-      // 有新版会后台自动下载、下载完 update-downloaded 事件点亮标识
-      if (latest && isNewer(latest, current)) return { status: "available", current, latest };
-      return { status: "latest", current };
+      const r = await (await ensureWinAutoUpdater()).checkForUpdates();
+      latest = r?.updateInfo?.version || null;
+    } else {
+      latest = await fetchLatestVersion();
     }
-    // mac / linux：查 GitHub latest release tag 版本号比对
-    const latest = await fetchLatestVersion();
     if (!latest) return { status: "error", current, message: "拿不到最新版本号" };
     if (isNewer(latest, current)) {
+      // 立即点亮右上角「新版本」标识（win/mac 一致、不再等下载完）
       updateReadyVersion = latest;
       log(`[updater] 手动检查发现新版本 v${latest}（当前 v${current}）`);
       notifyPageUpdateReady();
