@@ -41,17 +41,17 @@ import type {
 
 import {
   appendEvent,
-  getEventsLogPath,
   getTask,
   setTaskRunStatus,
 } from "./task-fs";
+import { getEventsLogPath } from "./task-fs-core";
+import { getChatMcpUrl } from "./chat-mcp";
 import {
   cancelPending,
-  getChatMcpUrl,
   markTaskAsChat,
   setChatAwaitingNotifier,
   unmarkTaskAsChat,
-} from "./chat-mcp";
+} from "./chat-pending";
 import {
   chatWaitProtocolSection,
   firstTurnReplyThenWaitReminder,
@@ -78,7 +78,7 @@ import { summarizeRunFailure } from "./sdk-error";
 import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
-} from "./task-runner";
+} from "./task-stream";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { Task, TaskEvent } from "@/lib/types";
 

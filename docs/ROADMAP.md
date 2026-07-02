@@ -1,193 +1,142 @@
 # ROADMAP
 
 > 渐进式、不一次性做完。每个阶段验证 ROI 后再投资源。
+> 权威源 = 代码 + `docs/HANDOFF.md`。本文件只管「**未来往哪走 + 明确不做什么 + 决策原则**」；已落地细节看 HANDOFF「当前架构快照」+ `docs/CHANGELOG.md`。
 
-> ⚠️ **2026-05-28 同步**：V0.6.0 核心重构（phase chain → task 容器 + action 历史）已落地、V0.6.0.1 持续打磨期收尾、V0.6.1 ship action 上线（server-side GitLab REST + 多仓 MR + 飞书 @ 测试人员）。**当前架构**看 `docs/HANDOFF.md`「当前架构快照」段；V0.5 及之前的历史看 `docs/CHANGELOG.md`（时间倒序、新在上）；V0.6 重构设计文档 `docs/V0.6-REFACTOR.md` 已 archived。
-
----
-
-## V0.6.0 + V0.6.0.1 + V0.6.1 已落地（2026-05-27 ~ 2026-05-28）
-
-V0.5 phase chain 模型废弃、改为 **task 容器 + action 历史** 模型：
-
-- **task 容器**：单个需求生命周期、双状态（`repoStatus` 业务状态 + `runStatus` agent 运行时状态）
-- **action 历史**：6 种 action（`plan / build / review / ship / test / learn`）、任意触发不强制顺序、N 单调递增（chat 不是 action、走独立 mode、见下条）
-- **mode 区分**：`task` 模式走 action 体系、`chat` 模式走独立 chat-runner（V0.6.0.1 重新剥离）
-- **6 个 harness 门槛**：action 前置准入 / 后置 deterministic check / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（P2 留 V0.6.4+）/ placeholder 动态
-- **单 SDK Run 永生**：整 task 跑在一个 Run、不一个 action 一个 Run、shell + curl long-poll 保活
-- **V0.5 兼容代码 / 数据全删**（不写 migration、开发期重置 `data/tasks/*`）
-
-V0.6.0.1 体验断点 10 条修完、V0.6.1 ship action 端到端跑通（多仓 MR / 飞书 @ 测试人员）。`pnpm typecheck` + `pnpm lint` 三版本都双绿。详细演进看 HANDOFF V0.6.1 + V0.6.0.1 段（V0.6.0 已迁 `docs/CHANGELOG.md`）。
+> 🔄 **2026-07-01 校准**：上次同步还停在 5/28（V0.6.0 刚落地）、实际已推进到 **v0.9.4**。「飞书 story → 多仓 MR」核心闭环（`plan → build → review → ship/dev → learn`）已**完整落地并每天在用**（正式实例 22 个真实 task）；**test action 已于 v0.8.25 止损删除**。本文件据此重写：把「已落地」从待办里移出、纠正 test 方向、补代码健康度现状。历史待办表（V0.6.2+ 那版）已过时删除。
 
 ---
 
-## V0.6.2+ 待办（不一次性做完、按 ROI 排）
+## 一、已落地能力总览（不再是「待办」、细节见 HANDOFF / CHANGELOG）
 
-| 版本 | 内容 | 工时 | 关键依赖 |
-|---|---|---|---|
-| ~~V0.6.1（ship action）~~ | ✅ V0.6.1 已上线、server-side GitLab REST + 多仓 MR + A+C 飞书 @ 测试人员 | done | done |
-| **V0.6.2**（test action）| 飞书测试用例 + AI 手测能力 | 1-2 天 | 飞书 MCP 已接入 |
-| **V0.6.3**（learn action）| HITL 落库 dialog + super-prompt 自动注入 AGENTS.md | 1-2 天 | merged 后触发、需先有真实合入 task 验证 |
-| **V0.6.4+**（高级）| cross-action 一致性自检（门槛 5）/ MR 状态 polling / learn 自动 cleanup / worktree 隔离 | TBD | 需要前 3 个版本积累足够 task 数据再决定 |
+一句话：**「飞书 story → 多仓 MR」的核心闭环 + Harness 加固 + 桌面端发版链、都已上线并在日常使用。**
+
+- **Action 体系全实装**：`plan / build / review / ship / dev（联调）/ learn / custom（自定义）`——任意触发不强制顺序、每步落 md artifact、action 间 HITL ack（test 已删、见「四、止损」）
+- **6 harness 门槛（缺门槛 5）**：前置准入 / 后置 deterministic check / 默认推断 / anti-patterns prompt / placeholder 动态；**门槛 5（cross-action 一致性自检）仍未做**、见「二、未来候选」
+- **Build 后置 CheckRun**：per-repo typecheck/lint/test + 工作区污染检测 + 命令自动检测 + ship 指纹门禁 + override
+- **Shell 命令硬拦截**：beforeShellExecution hook + 黑名单策略引擎（确定性、非 prompt 软约束）
+- **GitLab REST 集成**：多仓 MR + 同分支累计 commit + 冲突门禁 + 飞书 @ 测试人员（A+C 策略）
+- **大需求分批 build** + 自适应 TDD 策略（每批 tdd/after/none、无测试设施自动退化）
+- **Agent 生命周期**：每 action 默认新 agent（context 隔离）+ shell/curl long-poll 保活
+- **配置双向绑定 Cursor**：消费 `~/.cursor` + repo `.cursor` 的 mcp/rules/skills/hooks（fe 只读不写、附录 A）
+- **MCP OAuth**：走 OAuth 的远程 MCP 授权 + 注入
+- **自定义 Action + 推进面板布局可配**：skill/playbook/check 封装成 action、拖拽排序 + 显隐混排
+- **应用外壳 + 侧栏任务导航** + light/dark 三态主题
+- **Electron 桌面端唯一发版链**：薄壳 + 打包 + 自更新（win/mac UX 对齐）
+- **learn 知识沉淀「先问后落」**：AI 提炼候选 → 逐条 ask_user → 只落用户批准的
 
 ---
 
-## 质量保证体系蓝图：博采四大库 + 飞书差异化（2026-06-05 讨论沉淀、待拍板）
+## 二、未来候选（没做、按 ROI 排、不一次做完）
 
-> 用户问「质量保证对齐四大库（Spec Kit / OpenSpec / Superpowers / GStack）后、各借鉴哪些点、做出来啥效果」。这里沉淀讨论结论 + 一个**待拍板的关键矛盾**。**还没动代码、方向待用户回头敲定。**
-
-> **V0.6.23 现状补注**：本段讨论的是 **test action（动态运行时验证）** 方向、仍待拍板。但 **build 阶段**已先用「自适应 TDD 批次策略」部分落地 Superpowers TDD 借鉴点——大需求分批时每批标 `tdd`/`after`/`none`、build agent 按策略用 shell 实跑、**无测试设施自动退化**（正好化解下面「没单测 TDD 落不了地」的矛盾、不强求）。即：TDD 在 build 侧以「自适应可选」形态存在；浏览器 QA / 飞书验收用例（test action）仍空白、方向不变。
-
-### 定位回顾
-
-质量保证对标四大库（详见 `PRODUCT-COMPARISON.md`）：我们「需求层 + 静态代码层」已到位 / 超越（飞书需求 × git diff + fresh peer 两阶段 review + 确定性后置检查），**唯一真空白 = 测试验证（跑起来验证）** = Superpowers 的 TDD + GStack 的浏览器 QA。test action 就是补这格。review（静态、读代码）vs test（动态、跑起来）**不重叠、是两层防线**（四大库也都把 code-review 和 TDD/qa 拆成两件事）。
-
-### 各库借鉴点
-
-| 来源 | 借鉴点 | 落到哪 |
+| 方向 | 内容 | 状态 / 依赖 |
 |---|---|---|
-| Superpowers | TDD 红绿闭环（Red-Green-Refactor、失败回修；不抄 test-first 硬律、改「build 后补测」） | test ①（自动化测试） |
-| GStack | `/qa` 真浏览器 QA（Playwright 真人式点击）+ **diff-aware**（只测 git diff 改动）+ **失败自动生成回归测试** + 三档深度 + qa-only gate | test ②（浏览器 / 运行时） |
-| Spec Kit | `/analyze` 跨 artifact 一致性 → 补**门槛 5 cross-action 自检**（plan ↔ build ↔ test 漂移核查） | 门槛 5 |
-| OpenSpec | archive 合并 delta → living spec → **注入 AGENTS.md / rules** | learn action |
-| 我们独有 | 飞书验收用例作 test 基准（测「满足需求没」、四大库只有 diff 没需求基准） | test 护城河 |
+| **Cost / Token Dashboard** | 每 task / action / 全局看 token + 成本、扫 `events.jsonl` 汇总；可选接 Langfuse / Helicone | 未做、数据源已有（events.jsonl 已记 token） |
+| **门槛 5：cross-action 一致性自检** | `plan ↔ build ↔ review` 漂移核查（借鉴 Spec Kit `/analyze`） | 未做、一直 pending |
+| **多 task 复用 plan / artifact** | 链接式引用、不复制 | 未做 |
+| **比较同 task 多次执行差异** | `actions/` 时间序 diff 可视化 | 未做 |
+| **多角色扩展** | `be / data / mobile / qa`（`TaskRole` schema 已预留） | 未做 |
+| **MR 状态 polling / worktree 隔离** | 高级、需更多 task 数据再评估 | 未做 |
 
-### 端到端效果
-
-`plan → build → review（静态）→ ✨test（动态：diff-aware 拉飞书用例 → 跑测试 / 浏览器 QA → 失败推 build 修 + 生成回归）→ ship → ✨learn（沉淀注入 AGENTS.md）`、每箭头 HITL ack、每步落 md artifact。出来的 PR = 「静态复核过 + 运行时验证过 + 回归沉淀」。比四大库强在多回答「满足飞书需求吗」（需求层验收）。
-
-### ⚠️ 待拍板的关键矛盾（回头必须先解）
-
-**蓝图的 test ①（Superpowers TDD = 跑单测 / e2e）跟本文「不打算做」里的「自动跑测试用例：公司没单测 / e2e、强行做没意义」直接冲突。**
-
-- 校准后判断：对 crm-web 这种**没单测基础**的项目、① TDD 落不了地（没测可跑、补测又被判无意义）；反而 **② GStack 式浏览器黑盒 QA 不依赖项目有单测**（从 UI 外部跑、真人式点）、+ 飞书验收用例、才是适配「没单测公司项目」的质量保证主线。
-- 即：一期主线应是 **②（浏览器 QA + 飞书用例）而非 ①（TDD）**——但 ② 需先接 playwright / puppeteer MCP。
-- 连带要做：把「不打算做」的「自动跑测试用例」条款**精确化**为「自动跑单测 / e2e（公司无基础设施）」、并澄清「浏览器黑盒 QA」不在此列、是可做项。
-
-**结论：方向（① vs ②、是否接浏览器 MCP、是否修订止损条款）待用户回头敲定、再动代码 / 改上面的 V0.6.2+ 待办表。**
+> 体验清单已消化：**归档**（已由「7 天 auto-archive + 侧栏折叠」替代、手动归档概念已删）；**cancel 中途打断**（`forceNewAgent` + 停止/重启已覆盖大部分）。
 
 ---
 
-## 配置双向绑定 Cursor（跟 Cursor 共用工具、2026-06-01 完成）
+## 三、代码健康度快照（2026-07-01、待拍板是否投入）
 
-> ✅ 已完成。ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
+客观现状、作为「要不要重构」的讨论输入（**非既定计划**）：
 
-### 最终分工（关键：repo 层 vs 全局层分开处理）
+| 文件 | 行数 | 备注 |
+|---|---|---|
+| ~~`src/lib/server/task-runner.ts` 2944~~ | **1650**（v0.9.7 已拆） | 拆出 `task-stream` / `task-prompts` / `action-gates` / `sdk-message-handler` 四模块、runner 只留编排；`internalStartAgent`（565 行）耦合深、本轮保守未拆 |
+| ~~`src/lib/server/chat-mcp.ts` 1967~~ | **949**（v0.9.8 已拆） | 拆出 `chat-pending`（1049 行、pending 状态机 + 信号 API）、chat-mcp 只留 MCP server 本体；`buildMcpServer` 的工具 description 长文本占大头、不再细拆 |
+| ~~`src/lib/server/task-fs.ts` 1851~~ | **1181**（v0.9.9 已拆） | 拆出 `task-fs-core`（462 行、路径/schema/锁/事件 IO/hydrate 底座）+ `task-artifacts`（302 行、附件/artifact/revisions）、task-fs 只留 CRUD + patch API |
+| `action-checks.ts` / `advance-dialog.tsx` / `tasks/[id]/page.tsx` | 1000+ | 偏大、暂不动（内聚性尚可） |
 
-`settingSources` 是**分层**枚举（SDK `options.d.ts`：`SettingSource = "project" | "user" | "team" | "mdm" | "plugins" | "all"`、project 跟 user 是不同层）：
+与 `learned-conventions`（「方法体 > 30 行就拆」「减少手戳代码」）冲突。**2026-07-02 用户拍板启动重构**（「6吧。你做好点，不要改出问题了」）：三轮全部完成——task-runner（v0.9.7）→ chat-mcp（v0.9.8）→ task-fs（v0.9.9）、均纯搬家零逻辑变更 + 归一化 diff 核验 + test 包冒烟。仓库不再有 >1700 行的 server 文件。
+
+---
+
+## 四、明确不做（止损）
+
+| 不做的事 | 为什么 |
+|---|---|
+| **test action / 自动跑单测 · e2e**（v0.8.25 已删）| 公司项目普遍无单测 / e2e 基础设施、强行做 ROI 低（补测又被判无意义、TDD 落不了地）。质量验证最终定型 = **review（静态读代码）+ build CheckRun（typecheck/lint 确定性门禁）+ 人工验收兜底**。GStack 式浏览器黑盒 QA（不依赖单测）曾评估、但需接 playwright MCP + 维护成本、**暂不启动**。build 侧自适应 TDD 批次策略是唯一保留的 Superpowers 借鉴点（附录 B） |
+| 真·multi-agent 协作（PM/Dev/QA 谈判式、如 BMAD） | Cognition 警告、共识盲点、debug 灾难。注：单 task 多 action 链是合法的、跟这条不冲突 |
+| AI 自审 review bot（纯 LLM 看 LLM 写的代码判对错） | 共识盲点 + 性价比低。**注**：V0.6 review action ≠ 这条——前者拿 git diff × plan artifact × build artifact 做结构化差值、用确定性产物、不是 LLM 判断对错、本质是 harness 增量 |
+| 跨 AI 厂商路由（LiteLLM） | 没必要、增加复杂度、Cursor SDK 已覆盖主流模型 |
+| 自动 merge MR | 责任归属问题、永远不该自动 |
+| 接 IDE plugin | 命令行 + Web UI（现桌面壳）已够、IDE plugin 维护成本高 |
+| 黑名单 / 字符串 predicate（V0.5.6.5 试过、V0.6.0.1 已删） | 业务高频词误伤、replace by「客观可证伪 predicate」路线（命令 exit code / hash / 文件存在性 / JSON schema 校验） |
+| advance dialog「推荐」微标签（V0.6.0.1 已删） | 推断逻辑只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导。保留「默认选中」减少首次点击、但不标推荐二字 |
+| ActionTimeline 失败 chip retry 快捷入口（V0.6.0.1 加过又砍） | 语义混乱：点旧 error chip 实际是打断当前 running + 起新 action、跟直觉「修复那条历史」差太远。统一从「推进」按钮 + `forceNewAgent` 恢复 |
+
+---
+
+## 五、决策检查表（V 转 V 时）
+
+每个 V 完成后、问自己 4 个问题、再决定下一步投不投：
+
+1. 当前 V 在真实 task 上的命中率 ≥ 70% 吗？（不够、回去调 prompt / 加 harness 门槛）
+2. 用户实际使用频次足够吗？（一周用不到 3 次、说明价值不够、暂停下一版）
+3. 维护成本是否在增长？（prompt 越来越长、规则越来越多、文档越来越散、**核心文件越来越大**——警惕）
+4. 用户主动要扩展吗？（用户不主动提、就是没痒处、不要硬推）
+
+**任意一个 ❌ → 暂停、调研、不要硬推下一阶段**。
+
+---
+
+## 附录 · 调研沉淀留档（已落地 / 已止损、保留当时分析）
+
+> 下面三段是历史调研记录、已有明确结论。保留分析过程供回溯、不再当「待办」。
+
+### A. 配置双向绑定 Cursor（✅ 2026-06-01 完成）
+
+ai-flow 不自己维护 MCP / rules / skills、统一消费 Cursor 的全局（`~/.cursor/`）+ 项目（repo `.cursor/`）配置。定位「锦上添花」、配置单一源在 Cursor、fe 只读不写。
+
+**最终分工（关键：repo 层 vs 全局层分开处理）**——`settingSources` 是分层枚举（`SettingSource = "project" | "user" | "team" | "mdm" | "plugins" | "all"`）：
 
 | 配置层 | 来源 | 谁加载 |
 |---|---|---|
 | **项目层** repo `.cursor/`（rules/skills/mcp/hooks）| 目标仓库 | `Agent.create({ local: { settingSources: ["project"] } })`、SDK 读 |
 | **全局层** `~/.cursor/`（rules/skills/mcp）| 用户机器 | **fe 后端自己读**（`cursor-config.ts` + `skills-loader.ts`）注入 |
 
-**为什么全局层 fe 自己读、不靠 settingSources**：`["project"]` **只加载 project 层、够不着 user 层**（全局要 settingSources 含 `"user"`）。但 `"user"` 是粗开关、一开把全局 20-30 个 MCP 全塞进 context、没法 per-task 精简。fe 自己读：可控、可用 `task.disabledMcpServers` per-task 过滤。
+为什么全局层 fe 自己读、不靠 settingSources：`["project"]` 只加载 project 层、够不着 user 层；`"user"` 是粗开关、一开把全局 20-30 个 MCP 全塞进 context、没法 per-task 精简。fe 自己读：可控、可用 `task.disabledMcpServers` per-task 过滤。
 
-### ⚠️ 纠正 2026-05-29 旧探针的误读
+**✅ 头号风险已验证（2026-05-29 探针实测、`scripts/probe-mcp-*.mjs`）· chat-tool MCP 共存安全**：
+- **结论 1（不同名来源）：叠加、不覆盖。** inline=probeInline + repo `.cursor/mcp.json`=probeProject → 两 server 都被 spawn、两工具都调通。chat-tool 开 settingSources 后不会丢、安全。
+- **结论 2（同名 key 冲突）：inline 赢、双保险。** 同 server key 时两进程都 spawn、但工具层 inline 覆盖 project、agent 只看到 inline 工具。chat-tool 哪怕撞用户同名 key、用的也是 fe 的 inline 版。
 
-旧结论写「`["project"]` 连带加载**全局** skills（skillCount 13 来自 `~/.cursor/skills`）」——**错**：
-- 依据 1：SDK 类型 `SettingSource` 把 `project` / `user` 明确分层（注释「project/team 在 cloud always on、user/mdm 无 VM equivalent」）、`["project"]` 只 project 层。
-- 依据 2：本地 `~/.cursor/skills/` 实测仅 **3 个**（learn-and-persist-rules / pua / quarterly-review-generator）、跟「13」对不上。那 13 大概率是 fixture cwd 自身的**项目层** skills（恰好印证 `["project"]` 读 project 层）。
+**skills 加载**：`loadSkills()` 读平台自带 `<ai-flow>/skills/` + 全局 `~/.cursor/skills/`（同名平台优先）；不读 repo `.cursor/skills/`（交 settingSources、避免同一 skill 进 prompt 两次）。
 
-**✅ 头号风险已验证（2026-05-29 探针实测、`scripts/probe-mcp-*.mjs`）· chat-tool MCP 共存安全**（两组对照探针）：
-- 探针手法：开 `settingSources:["project"]` + inline `mcpServers` 注入零依赖手写 stdio MCP（spawn / 工具调用各落 `/tmp/probe-mcp-<role>.log`、读日志判定、不靠 agent 自我报告）。
-- **结论 1（不同名来源、`probe-mcp-coexist.mjs`）：叠加、不覆盖。** inline=probeInline + repo `.cursor/mcp.json`=probeProject（两个不同 key）→ 两个 server 都被 spawn、两个工具 agent 都调通（`PROBE-INLINE-OK` + `PROBE-PROJECT-OK`）。即 **chat-tool（inline 的 aiFlowChat）开 settingSources 后不会丢、安全**；且 settingSources 确实加载 repo `.cursor/mcp.json`（Q1=是、MCP 双向绑定可行）。
-- **结论 2（同名 key 冲突、`probe-mcp-conflict.mjs`）：inline 赢、双保险。** inline 跟 repo `.cursor/mcp.json` 用**同一个 server key**（probeShared）时——两进程**都被 spawn**（SDK 进程层不去重、project 进程也 initialize + tools/list 了），但**工具层 inline 覆盖 project**：agent 工具列表里只有 inline 的工具、project 的工具根本不暴露（agent 原话「probeShared 上只有 probe_inline_tool」）。即 **chat-tool 哪怕撞了用户 Cursor 配置的同名 key、agent 用的也是 fe 的 inline 版**（inline 优先级 > settingSources）。小代价：同名时多 spawn 一个没用的 project 进程（无害、且 chat-tool 用独特 key 根本不会撞）。
-- 副产品：日志 `skillCount: 13` 来自全局 `~/.cursor/skills`（fixture 自己没 skills）、印证 settingSources 连带加载全局 skills、对应下方「skills 别重复」待办。
-- ⚠️ 实测脚本对 stdio MCP 用「server spawn cwd 可能是目标仓库 /tmp」这点踩过坑：探针 server 必须零 npm 依赖（手写 JSON-RPC）、否则 import 阶段崩、日志写不出会误判成「没加载」。
+**hooks**：`["project"]` 加载 repo `.cursor/hooks.json`、fe 用它做 stop hook + beforeShellExecution 兜底（没 hooks.json 就建 / 有就补缺 / fail-open 只认领 fe 的 agent、不误伤 IDE agent）。
 
-### skills 加载（2026-06-01 修订）
-- `loadSkills()` 读**平台自带** `<ai-flow>/skills/` + **全局** `~/.cursor/skills/`（同名平台优先）。
-- 不读 repo `.cursor/skills/`（project 层、交 settingSources、避免同一 skill 进 prompt 两次）。
-- ⚠️ 修正 0529「只读平台自带」：那样全局 `~/.cursor/skills` 会丢（`["project"]` 够不着 user 层）、必须 fe 读。
+### B. 质量保证体系蓝图 · 博采四大库 + 飞书差异化（2026-06-05 调研 · ⚠️ test 方向已止损）
 
-### 实装清单（2026-06-01）
-- **新 `cursor-config.ts`**：`readGlobalCursorMcpServers` / `readGlobalCursorRulesForPrompt`（alwaysApply 全文 / 其余列 index）/ `getGlobalCursorDirs`（跨平台、win 加 `%APPDATA%` fallback）/ `filterDisabledMcp`。
-- **MCP 注入移 server 端**：runner `mergedMcp` = 全局 mcp（按 task 黑名单过滤）+ chat-tool；删 client→server 传 mcpServers 全链路（run-args / route body / runner input）。
-- **rules 注入 prompt**：`_super.md` 加 `{{rulesSection}}`、chat `buildInitialPrompt` 加 rules 段。
-- **fe 端 MCP 只读**：`GET /api/cursor-mcp` 原样返回 `~/.cursor/mcp.json`（**不脱敏**、用户拍板：本地单机、跟 Cursor 一致）；`mcp-card` 编辑器→只读展示；黑名单候选源走 `useCursorMcp` hook；localStorage `mcpServersJson` 整套废弃。
+> ✅ **结论已定（2026-07-01）**：本段讨论的 test action（动态运行时验证）**方向已止损**——test action 于 v0.8.25 删除（理由见「四、止损」）。build 侧「自适应 TDD 批次策略」是唯一落地的借鉴点（大需求分批时每批标 `tdd`/`after`/`none`、build agent 按策略用 shell 实跑、无测试设施自动退化）。下面是当时的对标分析、留档。
 
-### 留心
-- repo `.cursor/mcp.json`（settingSources 加载）的 server **不进 fe task 黑名单候选**（fe 只读全局 mcp.json）——用户 mcp 通常都在全局、repo 级罕见、可接受。
-- **hooks（V0.6.3 起用于 stop hook 兜底）**：`["project"]` 加载 repo `.cursor/hooks.json`（已探针实测、auto + gemini 两模型都验过 stop hook follow-up 同会话拉回成立）。fe 用它做「保证 agent 交卷」的 stop hook 兜底——没 hooks.json 就建 / 有就不注入 / 留存复用 / hook fail-open 向 fe 认领、不误伤 IDE agent。详见 HANDOFF V0.6.3 段。
-- **ripgrep 配置**：独立 SDK 进程（非 Next.js）跑 local agent 会报 `Ripgrep path not configured`、需把 `@cursor/sdk-darwin-arm64/bin` 加进 PATH（让内部 `resolveRipgrepFromPath` 命中）。V0.6.3 stop hook 探针复现了这个警告、但**不影响 agent 正常 finished**（只是 ignore 文件映射降级、agent 照常跑完）。**仍待核查 task-runner 在 Next.js 环境下 agent 的 grep 能力是否受影响**。
+对标四大库（详见 `PRODUCT-COMPARISON.md`）：我们「需求层 + 静态代码层」已到位 / 超越（飞书需求 × git diff + fresh peer 两阶段 review + 确定性后置检查）。当时判断唯一空白 = 测试验证（跑起来验证）：
 
----
+| 来源 | 借鉴点 | 当时设想落点 | 现状 |
+|---|---|---|---|
+| Superpowers | TDD 红绿闭环（改「build 后补测」）| test ① | ✅ 以「build 侧自适应 TDD」落地 |
+| GStack | 真浏览器 QA（Playwright）+ diff-aware + 失败生成回归 | test ② | ❌ 止损（需 playwright MCP、ROI 低） |
+| Spec Kit | `/analyze` 跨 artifact 一致性 | 门槛 5 | ⏳ 仍未做（见「二、未来候选」） |
+| OpenSpec | archive 合并 delta → 注入 AGENTS.md | learn action | ✅ learn 已落地（先问后落） |
+| 我们独有 | 飞书验收用例作 test 基准 | test 护城河 | ❌ 随 test 止损 |
 
-## V0.7+ 候选（V0.6 系列稳定后再启动）
+**当时的关键矛盾（已由止损化解）**：Superpowers TDD（跑单测/e2e）跟「公司没单测、强行做没意义」冲突。校准后判断：对无单测基础的项目、① TDD 落不了地、② 浏览器黑盒 QA 需接 MCP + 维护成本。最终整个 test 动态验证方向止损、只保留 build 侧自适应 TDD。
 
-### V0.7 · Cost / Token Dashboard
+### C. harness memory 业界调研（2026-05-26 · ✅ learn 已落地）
 
-**目标**：每个 task / 每个 action / 全局看 token 消耗 + 成本。
-
-**实现**：
-
-- `data/tasks/<id>/events.jsonl` 已经记 token 数（SDK 返回的话）
-- 加 `/dashboard` 页面、汇总：今日总 token + cost、按 task / action 类型分布、平均 latency
-- 数据源：扫 `data/tasks/*/events.jsonl`
-- 可选升级：接 Langfuse / Helicone 自托管 dashboard、白送一套观测能力
-
-**预计**：1 天。
-
-### V0.8+ · 体验优化清单
-
-- [ ] task 搜索 + 标签（归档已落 ✅）
-- [ ] cancel 中途打断（不删 task）—— 当前 `forceNewAgent` 已覆盖大部分场景、看实测频率
-- [ ] 多 task 间复用 plan / artifact（链接式引用、不复制）
-- [ ] 比较同一 task 多次执行的 plan 差异（actions/ 时间序差值可视化）
-- [ ] 多语言 prompt 模板（B / C 端分开）
-- [ ] 团队共享 prompt 库（git submodule？）
-- [ ] task 卡片右键菜单（快速 archive / mark merged）
-
----
-
-## 不打算做（明确止损）
-
-| 不做的事 | 为什么 |
-|---|---|
-| 真·multi-agent 协作（PM/Dev/QA 互相谈判式、如 BMAD） | Cognition 警告、共识盲点、debug 灾难。注：单 task 多 action 链是合法的、跟这条不冲突 |
-| AI 自审 review bot（纯 LLM 看 LLM 写的代码判对错） | 共识盲点 + 性价比低。**注**：V0.6 review action ≠ 这条——前者是「拿 git diff × plan artifact × build artifact 做结构化差值」、用确定性产物、不是 LLM 判断对错、本质是 harness 增量 |
-| 跨 AI 厂商路由（LiteLLM） | 没必要、增加复杂度、Cursor SDK 已经覆盖主流模型 |
-| 自动跑测试用例 | 公司没单测 / e2e、强行做没意义 |
-| 自动 merge MR | 责任归属问题、永远不该自动 |
-| 接 IDE plugin | 命令行 + Web UI 已经够、IDE plugin 维护成本高 |
-| 黑名单 / 字符串 predicate（V0.5.6.5 试过、V0.6.0.1 已删） | 业务高频词误伤、replace by 「客观可证伪 predicate」路线（命令 exit code / hash / 文件存在性 / JSON schema 校验） |
-| advance dialog 「推荐」微标签（V0.6.0.1 已删） | 推断逻辑只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导。保留「默认选中」作为减少首次点击的 UX 工具、但不再标推荐二字 |
-| ActionTimeline 失败 chip retry 快捷入口（V0.6.0.1 加过又砍） | 语义混乱：点旧 error chip 实际是打断当前 running + 起新 action、跟用户直觉「修复那条历史」差太远。统一从「推进」按钮 + `forceNewAgent` 开关恢复 |
-
----
-
-## 业界调研结论（2026-05-26、harness memory 部分、V0.6.3 落地）
-
-5 类 harness memory pattern：
+5 类 harness memory pattern 取舍：
 
 | 模式 | 是否采用 | 理由 |
 |---|---|---|
-| 静态规则文件（Cursor `.cursor/rules/*.mdc` / `CLAUDE.md` / `AGENTS.md`） | ✅ | 项目已用、可控 |
-| auto-memory（Claude Code MEMORY.md 自动写） | ⚠️ | 风险：AI 自己改自己 prompt、debug 困难 |
+| 静态规则文件（`.cursor/rules/*.mdc` / `CLAUDE.md` / `AGENTS.md`） | ✅ | 项目已用、可控 |
+| auto-memory（AI 自动写 MEMORY.md） | ⚠️ | AI 自己改自己 prompt、debug 困难 |
 | 自动生成规则（RepoScaffold / mirrorai） | ⚠️ | 同上、自动 review 自动写 rule 易脏 |
-| Reflexion 自学习（evolve-loop / Homunculus） | ✅ | learn action 的灵感来源、跟「客观可证伪 predicate」结合 |
-| Memory infra runtime（Mem0 / Letta / Zep / Cognee） | ❌ | 重、维护成本高、跟 Cursor SDK 已有的 conversation history 重叠 |
+| Reflexion 自学习（evolve-loop） | ✅ | learn action 灵感来源、跟「客观可证伪 predicate」结合 |
+| Memory infra runtime（Mem0 / Letta / Zep） | ❌ | 重、跟 Cursor SDK 已有 conversation history 重叠 |
 
-**最终方案 = Reflexion-lite + AGENTS.md 落库**（取业界 1 + 4 类组合、V0.6.3 落地）。
-
-跟现有机制呼应：
-
-- build action 的 `pnpm typecheck` / `pnpm lint` exit code
-- review action 的 git diff hash 一致性
-- ship action 的 PR URL 非空
-
-这些都是 deterministic predicate、能写进 ACS 沉淀复用。V0.5.6.5 ~ V0.6.0 试过 plan 黑名单 grep 这种字符串 predicate、误伤高、V0.6.0.1 已删——后续 predicate 沉淀走「客观可证伪」路线（命令 exit code / hash / 文件存在性 / JSON schema 校验）、不走「凑字符串黑名单」路线。
-
----
-
-## 决策检查表（V 转 V 时）
-
-每个 V 完成后、问自己 4 个问题、再决定下一步投不投：
-
-1. 当前 V 在真实 task 上的命中率 ≥ 70% 吗？（不够、回去调 prompt / 加 harness 门槛）
-2. 用户实际使用频次足够吗？（一周用不到 3 次、说明价值不够、暂停下一版）
-3. 维护成本是否在增长？（prompt 越来越长、规则越来越多、文档越来越散——警惕）
-4. 用户主动要扩展吗？（用户不主动提、就是没痒处、不要硬推）
-
-**任意一个 ❌ → 暂停、调研、不要硬推下一阶段**。
+**最终方案 = Reflexion-lite + AGENTS.md 落库**（业界 1 + 4 类组合）、已由 learn action「先问后落」落地。predicate 沉淀走「客观可证伪」路线（命令 exit code / hash / 文件存在性 / JSON schema 校验）、不走「凑字符串黑名单」。

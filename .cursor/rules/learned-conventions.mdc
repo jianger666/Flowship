@@ -9,7 +9,8 @@ alwaysApply: true
 
 - **用户本机日常运行着「AI工作流」桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关「AI工作流」窗口。
 - **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
-  - 打包（**完整 3 步、缺一不可**、2026-06-15 踩过：只跑 dist:test 会把旧代码打进包、验证时 curl 到旧 UI 排查半天）：
+  - **⚠️ 打 test 包前必须先退掉正在跑的 test 实例（2026-07-02 踩过、把用户测试环境搞半残）**：`electron:dist:test` 会把 `dist/electron/mac-arm64/AI工作流test.app` **整个删掉重建**——老进程还在跑时脚下 bundle 被换、已加载的路由还能服务（boot 200、curl 冒烟全过、**假象**）、但之后 agent 每次执行 shell、SDK 沙箱的 zsh state-dump helper 因 bundle 资源失配**永久挂死**（僵尸 `/bin/zsh -ilc dump_zsh_state` 进程、每跑一条 shell 挂一个）→ wait curl 发不出去、任务永远「运行中」假卡死。另一个坑：打完 `open` 只会聚焦老进程（单实例锁）、**你以为在冒烟新包、实际测的是老进程老代码**。正确顺序：`osascript -e 'tell application "AI工作流test" to quit'` → 完整 3 步打包 → `open` → **核对主进程 lstart 晚于打包时间**再冒烟。
+ - 打包（**完整 3 步、缺一不可**、2026-06-15 踩过：只跑 dist:test 会把旧代码打进包、验证时 curl 到旧 UI 排查半天）：
     1. `BUILD_STANDALONE=1 pnpm build`——产新 `.next/standalone`（不带 BUILD_STANDALONE 不会出 standalone、见 next.config.ts）
     2. `node scripts/assemble-electron-server.mjs`——从 standalone 重组 `dist/app-server`（内部先 rm 再 cp + 补 SDK 平台包）
     3. `pnpm electron:dist:test`——afterPack（`scripts/electron-after-pack.mjs`）把 `dist/app-server` 拷进「AI工作流test.app」（productName 带 test）+ ad-hoc 签名

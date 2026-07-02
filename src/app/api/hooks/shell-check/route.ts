@@ -14,7 +14,8 @@
  * 认领（fail-safe、同 stop-check）：agent_id 不在 runningTasks（IDE agent / 已死 task）
  * → 一律放行、绝不误伤非 fe agent。
  */
-import { findTaskIdByAgentId, publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { findTaskIdByAgentId } from "@/lib/server/task-runner";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import { appendEvent } from "@/lib/server/task-fs";
 import { evaluateShellCommand } from "@/lib/server/shell-guard-rules";
 

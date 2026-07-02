@@ -13,7 +13,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import type { ChatTaskAction } from "./chat-mcp";
+import type { ChatTaskAction } from "./chat-pending";
 import type { Task } from "../types";
 
 const execFileAsync = promisify(execFile);

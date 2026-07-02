@@ -97,6 +97,14 @@ describe("findPendingAskEvent", () => {
     expect(findPendingAskEvent(events)?.meta?.askId).toBe("Y");
   });
 
+  // 核心回归（同事踩坑、2026-07 修）：agent 重问后旧 ask 没标作废、用户答完新的、
+  // 修复前旧弹窗会复活（倒序找「第一条未了结」命中 X）、答了必失败还把任务误标 error。
+  // 修复后只认最新一条：Y 已答 → null、X 永不复活。
+  it("旧 ask 未作废 + 新 ask 已答 → null（旧提问不复活）", () => {
+    const events = [ask("X"), ask("Y"), reply("Y")];
+    expect(findPendingAskEvent(events)).toBeNull();
+  });
+
   it("ask_user_request 缺 askId → 跳过", () => {
     const broken = ev("ask_user_request", { questions: [] });
     expect(findPendingAskEvent([broken])).toBeNull();

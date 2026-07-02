@@ -23,7 +23,7 @@ import {
 } from "@/lib/server/task-fs";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import { cancelChatRun } from "@/lib/server/chat-runner";
-import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
+import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import type { CheckCommand, ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {

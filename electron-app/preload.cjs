@@ -25,6 +25,22 @@ contextBridge.exposeInMainWorld("__appUpdater", {
   check: () => ipcRenderer.invoke("check-for-update"),
 });
 
+// 任务注意力通知（v0.9.5）：页面发现任务转入「等你回复 / 提问 / 失败」且窗口不在前台
+// 时发系统通知；点通知壳聚焦窗口并回传 taskId、页面自己跳详情页
+contextBridge.exposeInMainWorld("__notify", {
+  /** @param {{ title: string, body?: string, taskId?: string }} payload */
+  send: (payload) => ipcRenderer.send("task-notify", payload),
+  /**
+   * 订阅「用户点了通知」——回传 taskId、页面 router.push 跳过去。返回取消订阅函数。
+   * @param {(taskId: string) => void} callback
+   */
+  onNotifyClick: (callback) => {
+    const listener = (_event, taskId) => callback(taskId);
+    ipcRenderer.on("task-notify-click", listener);
+    return () => ipcRenderer.removeListener("task-notify-click", listener);
+  },
+});
+
 // 壳能力 / 平台信息（自定义标题栏用）
 contextBridge.exposeInMainWorld("__shell", {
   // "darwin" | "win32" | "linux"——页面据此给右侧控件让出 Windows 控制按钮位

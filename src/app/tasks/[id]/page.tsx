@@ -576,6 +576,9 @@ const TaskDetailPage = () => {
       setRestartOpen(false);
     } catch (err) {
       toast.error(`重启失败：${(err as Error).message}`);
+      // 重启被拒大多因页面状态已过期（如服务端 action 已走到 awaiting_ack、按钮却还亮着）——
+      // 重拉一次任务对齐真实状态、按钮 / 弹窗自动纠正
+      void refresh();
     } finally {
       setStarting(false);
     }

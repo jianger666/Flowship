@@ -23,7 +23,7 @@ import { getTask } from "@/lib/server/task-fs";
 import {
   type TaskStreamEvent,
   subscribeTaskStream,
-} from "@/lib/server/task-runner";
+} from "@/lib/server/task-stream";
 
 interface Ctx {
   params: Promise<{ id: string }>;

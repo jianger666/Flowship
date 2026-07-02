@@ -26,8 +26,9 @@
  * - 划除一个还在进行中的 action → 409（提示先停止）
  */
 
-import { getTask, setActionArtifactExcluded } from "@/lib/server/task-fs";
-import { publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { getTask } from "@/lib/server/task-fs";
+import { setActionArtifactExcluded } from "@/lib/server/task-artifacts";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 interface Ctx {

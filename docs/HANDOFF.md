@@ -16,7 +16,7 @@
 4. `prompts/_super.md` —— super-prompt 主模板（V0.6.27 起只注入当前 action playbook + action history）
 5. `prompts/_shared.md` —— 跨 action 通用 artifact 写法 + 跨 action 规则
 6. `prompts/action-plan.md` / `action-build.md` / `action-review.md` / `action-ship.md` / `action-learn.md` / `action-dev.md` —— 各 action 的特有约束
-7. `src/lib/server/task-runner.ts` —— V0.6 统一 runner（V0.5 plan-runner + chat-runner 合一）
+7. `src/lib/server/task-runner.ts` —— V0.6 统一 runner（v0.9.7 拆出 task-stream / task-prompts / action-gates / sdk-message-handler 四模块、runner 只留编排）
 8. `src/lib/types.ts` —— V0.6 schema（Task / ActionRecord / RepoStatus / RunStatus 等）
 9. `docs/CHANGELOG.md` —— 历史演进档案（V0.2 ~ V0.5.16-design）、想看某条早期变更细节再翻
 
@@ -305,28 +305,21 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### v0.9.0：自定义 Action + 推进面板布局可配置（2026-06-26）
+### v0.9.10：去掉 Dock 角标（2026-07-02、用户实测反馈）
 
-- **自定义 Action（新 action 类型 `custom`）**：把 skill / playbook / 后置 check 串联封装成一个 action、在任务「推进」里像内置一样选（**不单独给 action 配 MCP——用 task 现有的、避免与 task 级 MCP 冲突**、用户拍板）。定义存 `dataRoot()/custom-actions/<id>.md`（gray-matter frontmatter 存 label/summary/skills/checkCommands/freshAgent + 正文 playbook）；`ActionType` 加 `"custom"`、`ActionRecord.customActionId/customLabel` 链定义；运行时 `task-runner` `loadActionPrompt` 走自定义 playbook、freshAgent / label 取 customDef、`checkActionPrerequisites` + `action-checks` 加 custom 分支（artifact 存在 + 跑用户配的 checkCommands）。管理页 `/actions`（列表 + `CustomActionEditor`、复用 `MultiSelect` 选 skill + `RepoCheckCommands` 配 check）；`_super.md` 的 `[NEXT_ACTION]` 协议头放行 `custom`。**关键修复**：`task-fs` 的 `ActionRecordLooseSchema` 必须放行 `"custom"`（`z.enum([...ACTION_TYPES, "custom"])`）——否则推过 custom 的 task `meta.json` 校验不过、`getTask` 返 null → 整个 task 读不了（404）、是首发数据损坏 bug。
-- **推进面板布局可配置**：内置 + 自定义 action 在「推进」弹窗的顺序 + 显隐个人级可配、落 `settings.actionLayout`（config.json、`{order, hidden}`）。`/actions` 页加「推进面板布局」区——**拖拽排序（`framer-motion` Reorder、只手柄发起拖、松手才落盘防狂写）** + 开关控显隐、内置 / 自定义**混排**（自定义带扳手 `Wrench` 角标区分）。推进弹窗按偏好排（`arrangeByLayout`）、隐藏的收进「更多」可展开、默认选中项被隐藏时自动展开。排序纯函数 `src/lib/action-layout.ts`（`BUILTIN_ADVANCE_ACTIONS` / `sortByOrder` / `arrangeByLayout` / `isBuiltinAdvanceAction`）配置页 + 弹窗单一源。
-- **（v0.9.1）win/mac 自动更新 UX 对齐**：win 之前 `electron-updater` `autoDownload=true`（检查到就后台偷偷下、下载完才点亮右上角「新版本」标识）、mac 是「检查到立即点亮、点按钮才下载」——两端不一致、且「发现新版本」toast 都说「随时点右上角新版本」但 win 当时标识根本没亮（用户反馈）。改：win 也 `autoDownload=false`（新 `ensureWinAutoUpdater` 懒加载单例统一管 `autoDownload` + `download-progress` 任务栏进度条 + `update-downloaded` 弹「立即重启」+ `error`、只注册一次防监听器泄漏），`runUpdateCheck` / `manualCheckForUpdate` 两端逻辑对齐（只查「有没有新版」不下载、查到立即 `notifyPageUpdateReady` 点亮标识 + 弹一次框、区别仅查版本号方式 win=`checkForUpdates` / mac=`fetchLatestVersion`），`installUpdateNow` win 分支点按钮才 `downloadUpdate`。`update-badge.tsx` 去掉 `__appUpdateMode` 分支、win/mac 共用「下载并安装更新、完成后会提示重启、数据不丢」一套文案。
-- **（v0.9.2）受控放开 custom action 建线上 MR**：自定义 action 需把 feature 提到该仓 base（线上/基线）分支、但 `submit-mr-guard` 原两道闸挡死（只认 ship/dev type + target 一律禁 master）。改「受控放开」：闸 2 放行 `type==="custom"`、闸 3 对 custom 把 target 校验成该仓 `repoBaseBranches[repoPath]`（**仅放行这一个值、非任意分支**）；其余越权防线全不动（仓范围 / project 对真实 remote / source 必须 feature；ship/dev 校验完全不变、仍禁提 master）。`task-runner` handler 加 `isCustomSubmit`——custom 提 MR 跟 dev 一样 source(feature) 绝不删、失败事件「提测失败」泛化「提 MR 失败」。`chat-mcp` submit_mr describe 补 custom。冲突复用 ship `__conflict` 智能解（ask_user 选 AI 解 / 自己解、基于 base 另建分支 merge、feature 不动）。**逻辑全按 `action.type==="custom"` 判、对所有自定义 action 一视同仁、零具体 action 特判**。typecheck/lint/vitest 139 全过。
-- **（v0.9.3）措辞统一「线上分支」+ 自定义 action 编辑入口可发现性**：① 把「base（线上/基线）分支」措辞在 `submit-mr-guard` 报错 + `chat-mcp` submit_mr describe 全统一成「线上分支」（跟设置页 `onlineBranch` + super prompt `renderRepoBranchSection` 一致、用户/agent 看报错不再被「base」绕、纯文案 0 逻辑改动）。② `/actions` 页合并成「Action 管理」单列表（去掉原上方独立的自定义 action 卡片列表）——内置 + 自定义混排在原「推进面板布局」那一个列表里统一管：拖拽排序 + 显隐开关不变、自定义行额外加编辑 / 删除按钮（内置不可改不可删、`ActionLayoutConfig` 新增 `onEdit/onDelete` props）。一个地方管完顺序 / 显隐 / 增删改。typecheck/lint/vitest 139 全过。
-- **（v0.9.4）custom action 的 MR target 完全放开（任意分支）**：v0.9.2「受控放开」只给 custom 开了「该仓线上分支」一个口、写死 `target===repoBaseBranches[repoPath]`——但 custom 是用户自定义的、写死一个分支限制了灵活性（想做个提到 test 的 custom action 直接被拦、用户反馈「没必要拦、不然以后没法做针对 test 的自定义 action」）。改：`submit-mr-guard` 闸 3 对 `type==="custom"` **整段跳过 target 校验**（ship/dev 仍写死目标分支、原语义完全不变、仍禁提 master）、闸 4 退化兜底的「source≠目标」从 `expectedTarget` 改用 `a.targetBranch`（expectedTarget 收进 if 块、对所有类型都直接拿上报 target 判）。**越权安全不降级**——仓范围（闸1）/ source 必须 feature（闸4）/ project 对真实 remote（闸5）三道全留着；target 提到的是「本仓内」分支（test / 线上 / dev / release 都行）、同 project 内不构成越权。custom 不再依赖 `repoBaseBranches`（没配也能提）。配套 `chat-mcp` submit_mr describe + `task-runner` 注释改成「custom 提哪个分支由该 action 的 playbook 决定」。typecheck/lint/vitest 141 全过（custom 用例从「只放线上、否则拒」改成「任意分支放行」+ 补仓范围约束）。
-- 验证：typecheck + lint 全绿、vitest 141 全过；打 test 包核验自定义 action 推进 + 拖拽 / 混排 UI 进包。
+- **动机**：v0.9.5 加的 Dock 角标 = 「等待回复任务数」、用户实测两点不满：① 点开任务看了、角标还常驻不消（等待语义 ≠ 用户期望的未读语义）；② 「只看 icon 上的角标作用也不大」——进 app 后还是不知道哪个任务在等。讨论过「未读语义 + 顶栏 chip」方案、用户拍板**直接去掉角标**、注意力提醒收敛到系统通知（点击跳任务、这个保留）+ 侧栏琥珀脉冲点。
+- 删干净三层：`task-attention-watcher.tsx` 的 setAttentionBadge 调用、`shell-notify.ts` 的 setBadge 封装、`preload.cjs` + `main.js` 的 `set-attention-badge` IPC。
 
-### v0.8.23：联调（dev）action + 分支配置同步 + 去「通过」按钮隐式认可 + task 做完给结论（2026-06-25）
+### v0.9.9：task-fs.ts 拆出 core + artifacts（2026-07-02、代码健康度重构第三轮）
 
-- **联调（dev）action 落地**（新 action 类型、把改动送 dev 分支触发联调流水线）：advance-dialog 选两种推送方式、`buildDevDirective` 把 `[DEV_PUSH_MODE]` 钉进 `[NEXT_ACTION]` 载荷——① **直推**：本地基于 `origin/<dev>` `checkout -B` 重置本地 dev、`merge --no-ff` 把 feature 合进来、`push origin dev:dev`（feature 全程不动、绝不 force）；② **提 PR**：push feature + 复用 ship 的 `submit_mr`（唯一区别 `target_branch` = dev 分支）。冲突处理两模式共用（直推在本地 dev 就地解 / 提 PR 走 `<feature>__conflict` 一次性分支、同 ship §3.6）。准入 = 至少一仓配 dev 分支（技术必需、没配不知推哪）；`checkDev` 直推无 MR 信任 artifact、提 PR 复用 ship 门禁（URL 非空 + 冲突拦）。**联调源分支绝不删**（`isDevSubmit ? false`、合入后还要继续开发/提测）。配套 `prompts/action-dev.md` + `chat-mcp` submit_mr describe 泛化 ship/dev。
-- **MR 数据模型扩展 targetBranch**（同仓提测 MR→test 和联调 MR→dev 并存）：`MRRecord.targetBranch` + `ActionRecord.sideEffects.mrs[].targetBranch`、`upsertMR` 去重键从 `repoPath` 改 `(repoPath, targetBranch)`——各自累计 version、各自关旧 MR、互不覆盖；老记录缺字段 → `mrTargetBranchOf` 兜底该仓测试分支、跟新提测 MR 正确合并不撞联调。`mrTargetBranchOf` / `mrKindOf`（判提测/联调）下沉 `task-display.ts` 前后端单一源；详情页 MR 链接标「提测/联调 → 目标分支」badge。
-- **分支配置同步（A 方案、治「设置页改了老 task 用不上」）**：建 task 时 base/test/dev 分支从设置页快照固化、后改不影响老 task。改：推进时 client（`page.tsx handleAdvance`）带本 task 各仓设置页最新 base/test/dev 分支 → `advance/route` sanitize 透传 → `advanceTask` 起 agent 注入前调 `refreshRepoBranches`（task-fs、upsert：只覆盖「绑了的仓 + 传来非空」、没传/空保留、防误清）刷 task 快照（放在准入 + appendAction + renderRepoBranchSection 之前、否则用旧快照）。advance-dialog 联调 chip 准入读设置页**实时** dev 分支（`liveDevBranches`、dialog 打开瞬间读、同 gitConfig 套路）不被旧快照挡。**limitation**：reuseAgent 续接时 super prompt「仓库分支配置」段仍是起 agent 时旧值（一次性注入）——但 server `submit-mr-guard` 用 task 最新值兜底校验、推不错分支；联调默认起新 agent、极边缘。
-- **去掉「通过」按钮 + 推进隐式认可**（HITL 不变、少一次点击）：详情页删「通过」按钮、只留「再聊聊」；`advanceTask` 推进时若当前 action 还 `awaiting_ack` 先隐式认可（续接走 `acknowledgeAction(approve)`、force-new/无活 agent 走 `patchAction(completed)` + 写审计事件、认可后重读 task 供准入），放在准入前；`canAdvance` 去掉 `!canAck` 限制、`inferDefaultActionType` 把 `awaiting_ack` 也算「这步做完」（build 刚完点推进默认顺推 review）。配 `setTaskAwaitingIfIdle`（task-fs、锁内 compare-set）防 force-new 秒推 race 把 running 覆盖回 awaiting_user（僵尸组合、推进按钮误亮）。
-- **task 做完给 1-3 句结论（结论方案 A）**：`_super.md` + `action-build/plan/dev.md` 把「写完 artifact 沉默调 wait_for_user」改成「写完 artifact 先流式输出 1-3 句简短结论（改了什么 / 结果 / 有无遗留）→ 紧跟 wait_for_user」。精准区分三场景：写完 artifact 收尾**给**结论 / 拿 `[ACTION_ACK approve]` 后等下一 action **不** narrate / 调 ask_user 前**不**前置消息。复用 chat 已验证的 text-delta 流式管道、零渲染改动。
-- **去 review/ship/learn 流程前置、留技术前置**：`checkActionPrerequisites` + `inferDisabledReason` 删「review/ship 必须先 build」「learn 必须先有 completed action」——可直接 review 现状找 bug / 没改动直接 ship（agent 自报工作区干净）/ 空 task learn 自说明；保留 ship gitHost+token、dev 至少一仓配 dev 分支（技术必需、非流程）。
-- **push 同名分支修复（--no-track）**：build checkout feature 改 `git checkout -b <feature> --no-track "origin/$BASE"`——堵 git `autoSetupMerge=true` 默认把 feature 的 upstream 设成 `origin/<线上>`、导致后续裸 `git push` 误推线上分支（后端同事踩过、其线上分支名跟前端不同）；同名 upstream 由 ship 首次 `git push -u origin <feature>` 自然建立、build 不主动 unset（不打扰用户手动设的同名 upstream）。
-- **restart ask_user 给「上次进展」背景**：阶段重启时 ask_user question 不写死固定句、要 agent 基于事件日志 + artifact + 工作区半成品先 1-2 句说清「上次断到哪、在做啥」再接确认问句（重启间隔久 / 换人接手常忘进度）。
-- **（v0.8.24）推进 dialog action 顺序**：联调（dev）chip 排到提测（ship）前——工作流先联调推 develop、再提测推测试分支。
-- 验证：typecheck + lint 全绿、vitest 135 全过（submit-mr-guard 加 dev 用例）；打 test 包核验联调 UI + 分支同步透传进包。
+- **动机**：`task-fs.ts` ~1850 行（重构后仓库第一大文件）、「路径/schema/锁/事件 IO 底座」「artifact/附件读写」「boot recovery + CRUD + meta patch API」三个切面糊在一起。ROADMAP 代码健康度项收尾。
+- **原则同前两轮：纯搬家零逻辑变更**（归一化 diff 核验：仅 `taskDir` 一处换行格式差异、零逻辑差异）。拆完 task-fs 1181 行、task-fs-core 462 行、task-artifacts 302 行。
+- **`task-fs-core.ts`（新、底座层）**：数据目录路径常量 + `newTaskId`/`newActionId` 等 id 生成 + 路径 helper（events.jsonl / actions/ / artifact / check log）、`TaskMetaV06` 类型 + zod schema + `readMetaV06`/`writeMeta` 原子读写、`withTaskLock` per-task mutex（globalThis、拆文件不拆状态）、事件流 IO（`readEvents`/`readRecentEvents`/`appendEventLine`）、`hydrateTask`/`hydrateTaskSummary`。**只依赖 types / data-root、不回 import task-fs / task-artifacts**。
+- **`task-artifacts.ts`（新、artifact/附件层）**：`saveImageAttachments`（uploads/）、`readCurrentActionArtifact`、revisions 快照（`snapshotActionArtifact`/`listActionRevisions`/`readActionRevisionContent`）、划除挪移（`setActionArtifactExcluded`、`.excluded/` 物理挪移）。只依赖 core。
+- **`task-fs.ts`（瘦身后）**：boot recovery + 公开 CRUD（list / get / create / delete）+ `sanitizeCheckCommands` + `appendEvent`（节流）+ 上下文文档 + 各类 meta patch API（setTaskXxx / appendAction / patchAction / upsertMR 等）。
+- **引用方改指向、无 re-export barrel**：路径 helper / `readRecentEvents` 用方（action-checks / chat-mcp / chat-runner / task-prompts）改 `task-fs-core`；`saveImageAttachments` / revisions / 划除用方（action-ack / ask-reply / chat-reply / advance / context-docs / action-diff / action-exclude / action-revisions 路由、route-helpers、task-runner 的 snapshot）改 `task-artifacts`；CRUD / patch API 仍从 `task-fs`。
+- 验证：typecheck + lint 全绿、vitest 142 全过；完整三步打 test 包、boot 200、任务列表 / 任务详情（core hydrate 链路）+ action-revisions（artifacts 层）冒烟正常。
+- 代码健康度三轮重构（task-runner → chat-mcp → task-fs）至此收尾、仓库不再有 >1700 行的 server 文件。
 
 ---
 
@@ -335,7 +328,11 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | 内容 | 位置 |
 |---|---|
 | **V0.6 重构设计文档（已 archived、V0.6.0 落地完成）** | `docs/V0.6-REFACTOR.md` |
-| **V0.6 统一 runner（task 容器 + action history）** | `src/lib/server/task-runner.ts` |
+| **V0.6 统一 runner（task 容器 + action history、v0.9.7 起只留编排：advance / restart / ack / finalize / internalStartAgent）** | `src/lib/server/task-runner.ts` |
+| **流事件底座（v0.9.7 拆出：TaskStreamEvent 协议 + publish/subscribe + writeEventAndPublish + runningTasks 等 globalThis 状态）** | `src/lib/server/task-stream.ts` |
+| **Prompt 拼装（v0.9.7 拆出：buildSuperPrompt + NEXT_ACTION/RESTART directive + 字段热更 diff、纯函数）** | `src/lib/server/task-prompts.ts` |
+| **Action 门禁（v0.9.7 拆出：checkActionPrerequisites + ship CheckRun 门禁 + build 分支规划、纯函数）** | `src/lib/server/action-gates.ts` |
+| **SDK 消息翻译器（v0.9.7 拆出：handleSdkMessage + AssistantBufferCtx）** | `src/lib/server/sdk-message-handler.ts` |
 | **V0.6 action 后置 deterministic check（含 V0.6.25 build CheckRun：checkBuild / runCheckShell / 工作区污染 + V0.6.25.1 指纹检测 / computeWorktreeFingerprint）** | `src/lib/server/action-checks.ts` |
 | **CheckRun 检查命令自动检测（V0.6.26、建 task 没手配则按 repo 文件结构识别 Node/Maven/Gradle；manual override > auto detect）** | `src/lib/server/repo-check-detect.ts` + `task-fs.sanitizeCheckCommands` |
 | **协议信号单一常量源（V0.6.27、信号 ↔ prompt 一致性由测试守护）** | `src/lib/protocol-signals.ts` + `tests/protocol-signals.test.ts` |
@@ -343,8 +340,8 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **submit_mr 范围校验（V0.6.27 从 task-runner 拆出、防 agent 越权提 MR）** | `src/lib/server/submit-mr-guard.ts` |
 | **vitest 测试（V0.6.27、安全关键纯函数 + prompt 一致性）** | `vitest.config.ts` + `tests/*.test.ts` |
 | **Build CheckRun 结果展示卡（V0.6.25、每仓 / 每命令红绿 + 失败日志末尾 + 完整日志路径）** | `src/components/tasks/check-run-summary.tsx` |
-| **ship 前置预检 API（V0.6.25.1、复用 checkShipCheckGate 给 advance-dialog 拿 gate 结论展示 override 区）** | `src/app/api/tasks/[id]/ship-precheck/route.ts` + `getShipPrecheck`（task-runner）|
-| **V0.6 task schema + 文件系统** | `src/lib/types.ts` + `src/lib/server/task-fs.ts` |
+| **ship 前置预检 API（V0.6.25.1、复用 checkShipCheckGate 给 advance-dialog 拿 gate 结论展示 override 区）** | `src/app/api/tasks/[id]/ship-precheck/route.ts` + `getShipPrecheck`（action-gates）|
+| **V0.6 task schema + 文件系统（v0.9.9 拆三层：CRUD/patch 在 task-fs、路径/schema/锁/事件 IO/hydrate 在 task-fs-core、附件/artifact/revisions 在 task-artifacts）** | `src/lib/types.ts` + `src/lib/server/{task-fs,task-fs-core,task-artifacts}.ts` |
 | **批次推导 + 展示（V0.6.23 起、computeBatchProgress 前后端共用 / 进度 chip / 批次表 / 选批 / 测试策略 label）** | `src/lib/task-display.ts` + `src/lib/types.ts: PlanBatch / TestStrategy / TEST_STRATEGY_LABEL` + `src/components/tasks/{batch-progress,batch-plan-table}.tsx` + `advance-dialog.tsx` 选批 |
 | **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |
 | **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
@@ -363,7 +360,8 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |
 | **chat 模式 API** | `src/app/api/tasks/[id]/chat-reply/route.ts` |
 | **等待协议 prompt 单一源（v0.7.21、chat+task 共用「写完→wait_for_user→shell curl 挂等」机制纪律 + 三认知陷阱；v0.7.23 强化「先回复正文再 wait」）** | `src/lib/server/wait-protocol-prompt.ts` |
-| `wait_for_user` / `ask_user` 实现 + pendingMap（v0.7.23 `CHAT_REPLY_REMINDER` 重排两步正文在前） | `src/lib/server/chat-mcp.ts` |
+| MCP server 本体（v0.9.8 瘦身：五工具注册 + shell 等待引导 + premature wait 兜底 + session transport） | `src/lib/server/chat-mcp.ts` |
+| pending 等待状态机 + 信号 API（v0.9.8 拆出：pendingMap / ToolReturn / submitXxx / notifier 注册表、routes 与 runner 都从这 import） | `src/lib/server/chat-pending.ts` |
 | wait-ack 长连接路由（保活核心） | `src/app/api/tasks/[id]/wait-ack/route.ts` |
 | 推进 / ack / 终结 路由 | `src/app/api/tasks/[id]/{advance,action-ack,finalize}/route.ts` |
 | watch-task SSE 路由 | `src/app/api/tasks/[id]/watch-task/route.ts` |
@@ -379,8 +377,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **推进面板布局（V0.9、内置+自定义混排排序/显隐、framer-motion 拖拽配置）** | `src/lib/action-layout.ts` + `src/components/custom-actions/action-layout-config.tsx` + `FeAiFlowSettings.actionLayout` |
 | 再聊聊 dialog（V0.6 适配 actionLabel） | `src/components/tasks/revise-dialog.tsx` |
 | 新建任务 dialog（V0.6.0.1 重新加 mode tab、V0.8 加 `trigger` prop 供侧栏自定义触发） | `src/components/tasks/new-task-dialog.tsx` |
-| 编辑任务 dialog + 字段热更（V0.6.6、详情页改软配置字段、reused agent diff 注入 `[TASK_UPDATED]`） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` + `task-runner.ts: buildTaskUpdateHint` |
+| 编辑任务 dialog + 字段热更（V0.6.6、详情页改软配置字段、reused agent diff 注入 `[TASK_UPDATED]`） | `src/components/tasks/edit-task-dialog.tsx` + `task-fs.ts: updateTaskFields` + `task-prompts.ts: buildTaskUpdateHint` |
 | **应用外壳 + 侧栏任务导航（V0.8、常驻侧栏切任务 / 展开收起 ⌘B / 共享列表 store / 欢迎页 / 任务行类型图标 + pin 置顶 + 类型筛选）** | `src/components/app-shell.tsx` + `src/components/app-sidebar.tsx` + `src/hooks/use-task-list.tsx` + `src/components/tasks/task-list-item.tsx` + `src/components/ui/tooltip.tsx` + `src/app/page.tsx` |
+| **任务注意力系统通知（v0.9.5、awaiting 转变沿 → 后台系统通知点击跳任务；v0.9.10 用户拍板去掉 Dock 角标——常驻不消被当噪声、作用不大）** | `src/components/task-attention-watcher.tsx` + `src/lib/shell-notify.ts` + `electron-app/{main.js,preload.cjs}` 的 `task-notify` IPC |
 | 任务详情页（V0.6 重写、V0.8 去返回按钮 + h-full 适配外壳） | `src/app/tasks/[id]/page.tsx` |
 | 任务角色 schema + 展示文案 | `src/lib/types.ts: TaskRole / TASK_ROLE_LABEL` |
 | 多仓 cwd / repoPaths 工具 | `src/lib/path-utils.ts: getEffectiveCwd / formatRepoSectionForPrompt` |

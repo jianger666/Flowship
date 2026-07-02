@@ -39,16 +39,21 @@ export const isAskSettled = (events: TaskEvent[], askId: string): boolean =>
   isAskReplied(events, askId) || isAskSuperseded(events, askId);
 
 /**
- * 找当前唯一该弹窗的 ask_user_request：倒序扫、第一条「没了结」的就是它。
- * 一次只弹一个（串行）；都了结了返回 null（弹窗关闭）。
+ * 找当前唯一该弹窗的 ask_user_request：**只看最新一条**——没了结就弹它、了结了直接 null。
+ *
+ * 为什么不继续往前找「更老的未了结 ask」（同事踩坑、2026-07 修）：后端 pending 是单例、
+ * 新 ask 注册即顶掉旧 ask、旧 ask 的 token 已死、永远不可能再被成功回答——把老的未了结 ask
+ * 复活弹出来、用户答了必失败（严重时把还在跑的任务误标 error）。后端现在写新 ask 前会补作废
+ * 标记、这里只认最新一条是同一不变量的前端兜底（顺带救活存量脏数据任务）。
  */
 export const findPendingAskEvent = (events: TaskEvent[]): TaskEvent | null => {
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i];
     if (ev.kind !== "ask_user_request") continue;
     const askId = typeof ev.meta?.askId === "string" ? ev.meta.askId : null;
+    // 缺 askId 的脏数据跳过、继续往前找
     if (!askId) continue;
-    if (!isAskSettled(events, askId)) return ev;
+    return isAskSettled(events, askId) ? null : ev;
   }
   return null;
 };

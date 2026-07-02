@@ -38,9 +38,12 @@ declare global {
   }
 }
 
+// 底色 = globals.css --background 的 oklch 精确换算 hex（深 oklch(0.17 0.005 264)、
+// 浅 oklch(0.967 0.002 247)）——写死值跟真实背景差一截会让 win 控制按钮条一眼异色（同事实测踩过）。
+// 改主题色时这里（和 electron-app/main.js 的 HEADER_BG_*）要一起换算更新。
 const TITLEBAR_OVERLAY_COLOR = {
-  dark: { color: "#17181c", symbolColor: "#e5e5e5" },
-  light: { color: "#f3f4f6", symbolColor: "#404040" },
+  dark: { color: "#0e0f12", symbolColor: "#e5e5e5" },
+  light: { color: "#f3f4f5", symbolColor: "#404040" },
 };
 
 interface AppHeaderProps {

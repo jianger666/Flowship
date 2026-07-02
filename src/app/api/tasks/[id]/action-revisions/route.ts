@@ -17,7 +17,7 @@ import { NextResponse } from "next/server";
 import {
   listActionRevisions,
   readCurrentActionArtifact,
-} from "@/lib/server/task-fs";
+} from "@/lib/server/task-artifacts";
 
 interface Ctx {
   params: Promise<{ id: string }>;

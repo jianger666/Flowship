@@ -19,7 +19,7 @@
 
 import type { ModelSelection } from "@cursor/sdk";
 
-import type { ImageAttachmentInput } from "@/lib/server/task-fs";
+import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
 
 // ----------------- Response helpers -----------------
 

@@ -32,15 +32,15 @@ import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
 import {
   appendEvent,
   getTask,
-  saveImageAttachments,
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
+import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import type {
   ImageAttachmentInput,
   ImageAttachmentSaved,
-} from "@/lib/server/task-fs";
-import { hasPending, hasPendingToken, submitAskReply } from "@/lib/server/chat-mcp";
-import { publishTaskStreamEvent } from "@/lib/server/task-runner";
+} from "@/lib/server/task-artifacts";
+import { hasPending, hasPendingToken, submitAskReply } from "@/lib/server/chat-pending";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
   KEEPALIVE_RACE_RETRY_MS,
@@ -274,9 +274,30 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   if (!pending) {
-    if (task.runStatus === "awaiting_user" || task.runStatus === "running") {
+    // 判定用最新状态：retry sleep 期间 runStatus 可能已变（agent 继续跑 / 停下等新问题）
+    const fresh = (await getTask(id)) ?? task;
+
+    // 这组 ask 已被顶替（task 还有别的活 pending）或 agent 还在跑——**不是僵尸、不能误杀任务**
+    // （同事踩坑：答旧弹窗把还在跑的任务打成 error +「Agent 已断开」+ 关流）。
+    // 只补一条作废标记把这条旧弹窗关掉、409 温和提示。
+    if (hasPending(task.id) || fresh.runStatus === "running") {
+      console.log(
+        `[ask-reply] task=${task.id} askId=${askId} 提问已失效（被顶替 / agent 在跑、runStatus=${fresh.runStatus}）、作废旧弹窗`,
+      );
+      const info = await appendEvent(task.id, {
+        kind: "info",
+        actionId: reqEvent.actionId,
+        text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
+        meta: { supersededAskId: askId },
+      });
+      if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
+      return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
+    }
+
+    // 真僵尸：任务声称在等回复、内部却没有任何等待（进程重启 / agent 异常退出）——标 error 让用户重启
+    if (fresh.runStatus === "awaiting_user") {
       console.warn(
-        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
+        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=awaiting_user、当场标 error`,
       );
       const errorEvent = await appendEvent(task.id, {
         kind: "error",
@@ -298,7 +319,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       return errorResponse("agent 已断开、请点「推进」起新 agent", 410);
     }
     return errorResponse(
-      `agent 当前没在等问答（task.runStatus=${task.runStatus}）`,
+      `agent 当前没在等问答（task.runStatus=${fresh.runStatus}）`,
       409,
     );
   }

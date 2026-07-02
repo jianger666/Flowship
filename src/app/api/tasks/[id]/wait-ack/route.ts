@@ -37,7 +37,7 @@ import {
   subscribeWaitAck,
   formatToolReturnAsText,
   getWaitAckKeepaliveMs,
-} from "@/lib/server/chat-mcp";
+} from "@/lib/server/chat-pending";
 import { SIGNALS, keepaliveLine } from "@/lib/protocol-signals";
 
 // 强制走 Node runtime（不要 edge、edge 不支持长连接 + 我们的 globalState）

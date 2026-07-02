@@ -25,7 +25,8 @@
  *   - 不通知 agent run（节奏同步问题暂时由 UI 提示「下次启动 / revise 时生效」处理）
  */
 
-import { addContextDoc, saveImageAttachments } from "@/lib/server/task-fs";
+import { addContextDoc } from "@/lib/server/task-fs";
+import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { parseAndValidateImages } from "@/lib/server/route-helpers";
 import type { AddContextDocInput } from "@/lib/types";
 

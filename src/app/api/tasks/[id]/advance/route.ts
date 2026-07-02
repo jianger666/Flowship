@@ -43,9 +43,9 @@ import {
 } from "@/lib/server/route-helpers";
 import {
   getTask,
-  saveImageAttachments,
   setTaskRemoveSourceBranchOnMerge,
 } from "@/lib/server/task-fs";
+import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { advanceTask } from "@/lib/server/task-runner";
 import { getCustomAction } from "@/lib/server/custom-action-fs";
 import {

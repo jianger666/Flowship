@@ -31,14 +31,15 @@
  * - agent 不在等 ack（has no pending）→ 409 / 410
  */
 
-import { hasPending } from "@/lib/server/chat-mcp";
+import { hasPending } from "@/lib/server/chat-pending";
 import {
   appendEvent,
   getTask,
-  saveImageAttachments,
   setTaskRunStatus,
 } from "@/lib/server/task-fs";
-import { acknowledgeAction, publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { saveImageAttachments } from "@/lib/server/task-artifacts";
+import { acknowledgeAction } from "@/lib/server/task-runner";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
   KEEPALIVE_RACE_RETRY_MS,

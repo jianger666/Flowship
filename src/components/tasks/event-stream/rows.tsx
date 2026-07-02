@@ -639,7 +639,7 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
           className={cn("font-medium", superseded && "text-muted-foreground")}
         >
           {superseded
-            ? "这组提问已失效（断线重启）"
+            ? "这组提问已失效"
             : answered
               ? `已回答 ${questionsCount} 个问题`
               : `AI 正在弹窗里问你 ${questionsCount} 个问题`}

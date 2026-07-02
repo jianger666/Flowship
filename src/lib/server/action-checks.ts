@@ -46,7 +46,7 @@ import type {
 } from "@/lib/types";
 import { CHECK_KIND_DEFAULT_TIMEOUT_MS } from "@/lib/types";
 
-import { getActionArtifactPath, getCheckLogPaths } from "./task-fs";
+import { getActionArtifactPath, getCheckLogPaths } from "./task-fs-core";
 import { getCustomAction } from "./custom-action-fs";
 import { isMutatingScript } from "./repo-check-detect";
 import { getEffectiveCwd } from "@/lib/path-utils";

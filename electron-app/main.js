@@ -14,7 +14,7 @@
  * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
  *   更新 / 卸载重装都不丢
  */
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promises as fs, mkdirSync, createWriteStream, readdirSync } from "node:fs";
 import net from "node:net";
@@ -40,6 +40,12 @@ app.setPath(
   "userData",
   path.join(app.getPath("appData"), IS_TEST ? "fe-ai-flow-test" : "fe-ai-flow"),
 );
+
+// Windows 系统通知要求进程有 AppUserModelID 才能归属到本 app（图标 / 名字正确显示）、
+// 跟 electron-builder 的 appId 保持一致；mac 不需要、API 本身也是 win-only
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.jianger.fe-ai-flow");
+}
 
 // 不碰 mac 钥匙串（v0.7.14、用户同事实测痛点「一直弹钥匙串密码框」）：
 // Chromium 启动时要拿 Safe Storage 加密 key（加密 cookies / localStorage 用）、
@@ -313,13 +319,15 @@ const saveWindowState = async () => {
 
 // 等 server 期间先显示的极简 loading 页（避免白屏 / 无反馈）；跟随系统深浅色、
 // 避免浅色系统启动闪一下黑底。深浅背景跟应用 globals.css 的 --background 对齐。
-const LOADING_BG_DARK = "#0a0a0a";
-const LOADING_BG_LIGHT = "#f5f6f8";
-// 自定义标题栏底色：跟应用 --background 同色。
+const LOADING_BG_DARK = "#0e0f12";
+const LOADING_BG_LIGHT = "#f3f4f5";
+// 自定义标题栏底色：跟应用 --background 同色（globals.css oklch 精确换算 hex、
+// 深 oklch(0.17 0.005 264)=#0e0f12、浅 oklch(0.967 0.002 247)=#f3f4f5——
+// 同事实测 win 右上角控制按钮条偏亮、就是旧写死值 #17181c 跟真实背景对不上）。
 // Windows titleBarOverlay 控制按钮条的初始底色用它、之后由页面按主题 IPC 精确同步；
 // mac 走 hiddenInset、overlay 配置被忽略、这里只兜初始。
-const HEADER_BG_DARK = "#17181c";
-const HEADER_BG_LIGHT = "#f3f4f6";
+const HEADER_BG_DARK = "#0e0f12";
+const HEADER_BG_LIGHT = "#f3f4f5";
 const IS_MAC = process.platform === "darwin";
 const loadingUrl = (dark) => {
   const bg = dark ? LOADING_BG_DARK : LOADING_BG_LIGHT;
@@ -433,6 +441,35 @@ ipcMain.handle("native-pick", async (_e, opts) => {
   });
   if (canceled || filePaths.length === 0) return { canceled: true };
   return { paths: filePaths };
+});
+
+// ---------- 任务注意力通知（v0.9.5） ----------
+//
+// 页面（TaskAttentionWatcher）发现某 task 转入「等你回复 / 提问 / 失败」且窗口不在前台时、
+// IPC 过来发系统通知；点通知 → 聚焦窗口 + 回传 taskId 给页面路由跳转。
+// 通知只是「叫人回来」的信使、判断「什么时候该叫」全在页面侧（那边有完整任务状态）。
+ipcMain.on("task-notify", (_e, payload) => {
+  if (!Notification.isSupported()) return;
+  const title = typeof payload?.title === "string" ? payload.title.slice(0, 80) : "AI工作流";
+  const body = typeof payload?.body === "string" ? payload.body.slice(0, 200) : "";
+  const taskId = typeof payload?.taskId === "string" ? payload.taskId : "";
+  try {
+    const n = new Notification({ title, body, silent: false });
+    n.on("click", () => {
+      // 聚焦窗口 + 告诉页面「用户点了哪个任务的通知」（页面自己 router.push）
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+        if (taskId) {
+          mainWindow.webContents.send("task-notify-click", taskId);
+        }
+      }
+    });
+    n.show();
+  } catch (err) {
+    log(`[notify] 系统通知失败（忽略）${err?.message || err}`);
+  }
 });
 
 // ---------- 自定义标题栏：Windows 控制按钮 overlay 底色跟随主题 ----------

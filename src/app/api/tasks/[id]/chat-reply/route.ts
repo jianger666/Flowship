@@ -43,10 +43,10 @@ import type { ModelSelection } from "@cursor/sdk";
 import {
   appendEvent,
   getTask,
-  saveImageAttachments,
   setTaskRunStatus,
   updateTaskFields,
 } from "@/lib/server/task-fs";
+import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import {
   deriveChatTitleFromMessage,
   isPlaceholderChatTitle,
@@ -54,7 +54,7 @@ import {
 import {
   hasPending,
   submitUserMessage,
-} from "@/lib/server/chat-mcp";
+} from "@/lib/server/chat-pending";
 import {
   cancelChatRun,
   forceClearChatRun,
@@ -64,7 +64,7 @@ import {
   runChatSession,
   waitForChatToStop,
 } from "@/lib/server/chat-runner";
-import { publishTaskStreamEvent } from "@/lib/server/task-runner";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
   isValidModel,

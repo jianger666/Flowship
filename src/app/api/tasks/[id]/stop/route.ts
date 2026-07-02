@@ -26,12 +26,12 @@ import {
 import {
   abortRunningCheck,
   cancelTaskRun,
-  publishTaskStreamEvent,
   supersedePendingAsks,
 } from "@/lib/server/task-runner";
+import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import { cancelChatRun } from "@/lib/server/chat-runner";
 import { reapTaskOrphans } from "@/lib/server/kill-orphans";
-import { cleanupChatTaskState } from "@/lib/server/chat-mcp";
+import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 interface Ctx {

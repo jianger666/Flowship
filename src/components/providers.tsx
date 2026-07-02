@@ -15,6 +15,7 @@ import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
+import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { getSettings, initSettings } from "@/lib/local-store";
 import { useModels } from "@/hooks/use-models";
@@ -53,7 +54,11 @@ export const Providers = ({ children }: ProvidersProps) => {
         {/* ImagePreviewProvider：全局图片 lightbox（任意 ImageThumb 点击站内看大图、多图左右切换） */}
         <ImagePreviewProvider>
           {/* TaskListProvider：侧栏 + 各页面共享同一份任务列表、新建 / 删除 / 状态变化统一同步 */}
-          <TaskListProvider>{children}</TaskListProvider>
+          <TaskListProvider>
+            {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
+            <TaskAttentionWatcher />
+            {children}
+          </TaskListProvider>
         </ImagePreviewProvider>
       </DialogProvider>
     </ThemeProvider>
