@@ -15,6 +15,37 @@
 
 ---
 
+### v0.9.12：推进弹窗通用化——删「更多」折叠区 + 删默认 action 推断（2026-07-03、用户拍板「工具往通用走」）
+
+- **背景**：用户在 /actions 页关掉某 action 后、推进弹窗里它收进「更多」且（默认选中项恰好被隐藏时）自动展开——「我关了它、它反而默认展开」反直觉。讨论后用户给出更深的方向：工具要往通用走、不能假设用户是前端研发（测试 / BI 用户可能把内置 action 全关、纯用自定义）、连「按仓库状态推断默认选中哪个 action」的逻辑也不该要。
+- **「更多」折叠区删**：`arrangeByLayout` 从返回 `{visible, folded}` 改为直接返回过滤后的可见数组；隐藏语义彻底化——/actions 页关掉的 action 在推进弹窗**直接不出现**、重新启用回 /actions 页开开关（行尾标签「收进『更多』」→「已隐藏」）。
+- **默认 action 推断删**：`inferDefaultActionType`（repoStatus 映射 + plan→build→review→ship 顺推）整套删了。默认选中 = **混排可见列表第一位**（用户自己拖的顺序、无业务假设；第一位是自定义 action 也能选中——open-effect 经 `customActionsRef` 读缓存、首次打开列表未拉到时只在内置里选、拉完不追改防跳变）。
+- **全部隐藏的空态**：`actionType` 放宽为 `ActionType | null`（null = 无选中、canSubmit 拦）、chips 区显示 EmptyHint 引导去 /actions 页开启或新建。
+
+### v0.9.11：续用 Agent 默认值可配 + 仓库分支字段 Combobox 化（2026-07-03）
+
+- **「续用当前 Agent」默认值可配**：设置页原「提交快捷键」卡扩成**「交互偏好」卡**（`preference-card.tsx`、shortcut-card 删）、加开关「推进时默认续用当前 Agent」（`FeAiFlowSettings.reuseAgentDefault`、默认 false = 保持每 action 新 agent）。advance-dialog 打开时从 settings 读初始勾选、dialog 内仍可临时切；review 强起新 agent 的 server 铁律不受影响。
+- **仓库分支字段 → git 分支下拉 + 搜索**：设置页仓库卡的线上 / 测试 / dev 分支、新建 / 编辑任务 dialog 的「已有工作分支」、全部从手填 Input 换成新抽的 `Combobox`（`ui/combobox.tsx`、可搜索 + 可清空 + 列表缺分支时手填兜底「使用 "xxx"」项）。
+  - server：`git-branches.ts` 加 `listRepoBranches(dir)`——`for-each-ref refs/heads refs/remotes` 一条命令混列本地 + 远端（去 remote 前缀 / 滤 origin/HEAD / 去重、按最近提交倒序）、不主动 fetch；新只读路由 `GET /api/repo-branches?path=`（设置页配仓时 task 还不存在、按前端传路径查、仅 400 拦非绝对路径）。
+  - client：`useRepoBranches(paths)` 批量 hook（行都是 map 渲染的、顶层调一次行内查）——`undefined`=拉取中（先禁用）、`isRepo:false`=非 git（保持禁用、placeholder 提示「非 git 仓库」）、git 仓自动放开。
+  - repo-card 分支三字段由「草稿 + blur 落盘」改为选中即落盘（离散选择）；分支模板覆盖字段不是分支名、保持 Input。
+
+### v0.9.10：去掉 Dock 角标（2026-07-02、用户实测反馈）
+
+- **动机**：v0.9.5 加的 Dock 角标 = 「等待回复任务数」、用户实测两点不满：① 点开任务看了、角标还常驻不消（等待语义 ≠ 用户期望的未读语义）；② 「只看 icon 上的角标作用也不大」——进 app 后还是不知道哪个任务在等。讨论过「未读语义 + 顶栏 chip」方案、用户拍板**直接去掉角标**、注意力提醒收敛到系统通知（点击跳任务、这个保留）+ 侧栏琥珀脉冲点。
+- 删干净三层：`task-attention-watcher.tsx` 的 setAttentionBadge 调用、`shell-notify.ts` 的 setBadge 封装、`preload.cjs` + `main.js` 的 `set-attention-badge` IPC。
+
+### v0.9.9：task-fs.ts 拆出 core + artifacts（2026-07-02、代码健康度重构第三轮）
+
+- **动机**：`task-fs.ts` ~1850 行（重构后仓库第一大文件）、「路径/schema/锁/事件 IO 底座」「artifact/附件读写」「boot recovery + CRUD + meta patch API」三个切面糊在一起。ROADMAP 代码健康度项收尾。
+- **原则同前两轮：纯搬家零逻辑变更**（归一化 diff 核验：仅 `taskDir` 一处换行格式差异、零逻辑差异）。拆完 task-fs 1181 行、task-fs-core 462 行、task-artifacts 302 行。
+- **`task-fs-core.ts`（新、底座层）**：数据目录路径常量 + `newTaskId`/`newActionId` 等 id 生成 + 路径 helper（events.jsonl / actions/ / artifact / check log）、`TaskMetaV06` 类型 + zod schema + `readMetaV06`/`writeMeta` 原子读写、`withTaskLock` per-task mutex（globalThis、拆文件不拆状态）、事件流 IO（`readEvents`/`readRecentEvents`/`appendEventLine`）、`hydrateTask`/`hydrateTaskSummary`。**只依赖 types / data-root、不回 import task-fs / task-artifacts**。
+- **`task-artifacts.ts`（新、artifact/附件层）**：`saveImageAttachments`（uploads/）、`readCurrentActionArtifact`、revisions 快照（`snapshotActionArtifact`/`listActionRevisions`/`readActionRevisionContent`）、划除挪移（`setActionArtifactExcluded`、`.excluded/` 物理挪移）。只依赖 core。
+- **`task-fs.ts`（瘦身后）**：boot recovery + 公开 CRUD（list / get / create / delete）+ `sanitizeCheckCommands` + `appendEvent`（节流）+ 上下文文档 + 各类 meta patch API（setTaskXxx / appendAction / patchAction / upsertMR 等）。
+- **引用方改指向、无 re-export barrel**：路径 helper / `readRecentEvents` 用方（action-checks / chat-mcp / chat-runner / task-prompts）改 `task-fs-core`；`saveImageAttachments` / revisions / 划除用方（action-ack / ask-reply / chat-reply / advance / context-docs / action-diff / action-exclude / action-revisions 路由、route-helpers、task-runner 的 snapshot）改 `task-artifacts`；CRUD / patch API 仍从 `task-fs`。
+- 验证：typecheck + lint 全绿、vitest 142 全过；完整三步打 test 包、boot 200、任务列表 / 任务详情（core hydrate 链路）+ action-revisions（artifacts 层）冒烟正常。
+- 代码健康度三轮重构（task-runner → chat-mcp → task-fs）至此收尾、仓库不再有 >1700 行的 server 文件。
+
 ### v0.9.8：chat-mcp.ts 拆出 chat-pending（2026-07-02、代码健康度重构第二轮）
 
 - **动机**：`chat-mcp.ts` ~1970 行（仓库第二大文件）、「pending 等待状态机 + 信号 API」和「MCP server 工具注册 + transport」两个切面糊在一起；routes（wait-ack / ask-reply / chat-reply / action-ack 等）本只依赖前者、却都 import 整个 MCP server 模块。

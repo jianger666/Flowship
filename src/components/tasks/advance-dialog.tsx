@@ -12,7 +12,8 @@
  *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
- *   - reuseAgent（开关、默认 false = 起新 agent、V0.6.27 语义反转）：想省 send 配额 / 要连续上下文时打开续用
+ *   - reuseAgent（开关、默认起新 agent、V0.6.27 语义反转；v0.9.11 默认勾选可在设置页「交互偏好」配）：
+ *     想省 send 配额 / 要连续上下文时打开续用
  *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认值 = 本 task 最近 action 实际
  *       用的模型 → task.model → settings.defaultModel（统一 ModelSelect、沿用我在这个任务一直用的模型、不必每次重挑）、
  *       可以临时换 base + 调 thinking/effort 等 params；勾续用后本段隐藏、续接走 task.model
@@ -29,15 +30,19 @@
  *   - V0.6.0.1 末段把右上角「推荐」微标签删了：那条逻辑（has_bug→build / plan→build / build→review）本身
  *     只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导；改成「打开 dialog 时
  *     默认选中一个、用户每次自己拍」、函数也重命名为 inferDefaultActionType
+ *   - v0.9.12 通用化（用户拍板「工具往通用走」）：inferDefaultActionType（按 repoStatus / 最近 action
+ *     顺推 plan→build→review→ship）整套删了——不再假设用户走前端研发流程（测试 / BI 用户可能全关内置、
+ *     纯用自定义 action）。默认选中 = 布局可见列表第一位（用户自己排的顺序、无业务假设）；「更多」折叠区
+ *     同时删（隐藏语义彻底化：/actions 页关了就不出现、要用回去重开）、全部隐藏时空态引导去 /actions 页
  *   - 同时加换模型是为了「task 在不同阶段配不同模型」更自然——比如 plan 用 opus、build 切 sonnet 省 token；
  *     之前 agent 挂掉重启时也没法换模型、只能去 settings 改全局再回来
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
   AlertTriangle,
   ArrowRight,
-  ChevronDown,
   Info,
   Loader2,
   Paperclip,
@@ -54,6 +59,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { EmptyHint } from "@/components/ui/empty-hint";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { Label } from "@/components/ui/label";
 import { ModelSelect } from "@/components/ui/model-select";
@@ -83,7 +89,6 @@ import { cn } from "@/lib/utils";
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import type {
   ActionType,
-  CheckOverride,
   CustomActionDef,
   DevPushMode,
   ModelSelection,
@@ -171,9 +176,19 @@ const ACTION_PLACEHOLDER: Record<Exclude<ActionType, "custom">, string> = {
 // - 没 plan + plan → 「需求是什么？要解决什么问题？」（首次）
 // - 有 plan + plan → 「方案要怎么调整？」（再次 plan）
 // - 已有 MR + ship → 「已有 v<N> MR、本次继续推、可选填要点」
-const buildPlaceholder = (task: Task, type: ActionType): string => {
+// - custom → 定义里配的 placeholder 优先（v0.9.14 轻量参数化）、没配用通用文案
+const buildPlaceholder = (
+  task: Task,
+  type: ActionType | null,
+  customDef?: CustomActionDef,
+): string => {
+  // v0.9.12：全部 action 被隐藏时无选中项（正常情况打开即默认选中第一位、不会是 null）
+  if (!type) return "先在上方选一个 action";
   if (type === "custom") {
-    return "（可选）补充说明、不填按该 action 的 playbook 执行";
+    return (
+      customDef?.placeholder?.trim() ||
+      "（可选）补充说明、不填按该 action 的 playbook 执行"
+    );
   }
   if (type === "build" && task.repoStatus === "has_bug") {
     return "修哪个 bug、症状 / 复现路径";
@@ -207,44 +222,6 @@ const buildPlaceholder = (task: Task, type: ActionType): string => {
   return ACTION_PLACEHOLDER[type];
 };
 
-// 算 dialog 打开时默认选中哪个 action chip（V0.6.0.1 起改名、原 inferRecommended）：
-// - repoStatus = has_bug → build（业务状态映射：有 bug 就是要回 build）
-// - repoStatus = awaiting_test → ship（V0.6.1 起：还能再推一次 / fix 后再 ship）
-// - repoStatus = merged → 走通用 fall through（V0.x：去掉「merged 默认 learn」、沉淀改纯按需、不再主动推荐）
-// - repoStatus = abandoned → plan（task 已关闭、用户也不会走推进 dialog）
-// - 无 action → plan
-// - 最近一条 completed action：plan → build / build → review / review → ship（V0.6.1 起解锁）
-// V0.6.0.1 删的：「最后一条 error → 同 type」——之前是 retry 入口的兜底、retry 砍掉后保留它跟「没有自动重试」
-// 语义冲突、不如让默认值仍按流程顺推（error 后用户手动选要不要换 type 走、跟没失败时一样）
-// 注意：这个函数算的是「默认值」、不是「推荐」——UI 上不会标「推荐」二字、避免暗示「我跟你说要走这个」
-const inferDefaultActionType = (task: Task): ActionType => {
-  if (task.repoStatus === "has_bug") return "build";
-  if (task.repoStatus === "awaiting_test") return "ship"; // 测试反馈后 fix 完仍走 ship
-  // V0.x：去掉「merged → learn」默认（沉淀太频繁、用户拍板改纯按需）——merged 走下面通用 fall through、
-  //   想沉淀用户自己选 learn chip、系统不再默认选中 / 不暗示「该沉淀了」
-  if (task.repoStatus === "abandoned") return "plan";
-
-  if (task.actions.length === 0) return "plan";
-
-  // V0.x：completed 或 awaiting_ack（产物已交付、推进时会隐式认可）都算「这步做完了」、
-  //   这样 build 刚完成（awaiting_ack）点推进时默认顺推到 review、不会停在 build
-  const last = [...task.actions]
-    .reverse()
-    .find(
-      (a) =>
-        (a.status === "completed" || a.status === "awaiting_ack") &&
-        (a.type === "plan" ||
-          a.type === "build" ||
-          a.type === "review" ||
-          a.type === "ship"),
-    );
-  if (!last) return "plan";
-  if (last.type === "plan") return "build";
-  if (last.type === "build") return "review";
-  if (last.type === "review") return "ship";
-  return "plan"; // ship 后流程结束、默认回 plan、用户实际场景多半点终结 dialog
-};
-
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -266,8 +243,6 @@ interface Props {
     devPushMode?: DevPushMode;
     // V0.8.x：重跑 plan 时如何处理历史批次；仅 plan action 有意义
     replanMode?: "append";
-    // V0.6.25：ship gate override（仅 ship 且最新 build 的 check 没过、用户勾「仍继续」时传）
-    checkOverride?: CheckOverride;
     // V0.9：自定义 action 指向的定义 id（仅 actionType==="custom" 时传）
     customActionId?: string;
   }) => Promise<void>;
@@ -281,8 +256,6 @@ export const AdvanceDialog = ({
   onSubmit,
   submitting,
 }: Props) => {
-  // dialog 打开时默认选中哪个 chip（不叫推荐、纯减少首次点击）
-  const defaultActionType = useMemo(() => inferDefaultActionType(task), [task]);
   // V0.6.14：ship「合并后删源分支」开关初始值（取 task 上次选择、缺省 false=保留）。
   // 提成 memo 依赖 primitive 字段、effect 据它初始化而非整个 task（防 SSE 推 task 引用变打回表单）
   const defaultRemoveSourceBranch = useMemo(
@@ -311,16 +284,19 @@ export const AdvanceDialog = ({
   const defaultPickedModelRef = useRef(defaultPickedModel);
   defaultPickedModelRef.current = defaultPickedModel;
 
-  // 当前选的 action 类型；dialog 打开时取默认值、用户随便改
-  const [actionType, setActionType] = useState<ActionType>(defaultActionType);
+  // 当前选的 action 类型；dialog 打开时默认选可见列表第一位、用户随便改。
+  // v0.9.12：null = 无选中（仅全部 action 被隐藏时出现、canSubmit 拦提交）
+  const [actionType, setActionType] = useState<ActionType | null>(null);
   // 自定义 action 列表（dialog 打开拉一次）
   const [customActions, setCustomActions] = useState<CustomActionDef[]>([]);
+  // ref 持自定义列表——open-effect 算「默认选中第一位」时读打开瞬间的缓存、不进 effect 依赖
+  //（进依赖会让异步拉取完成时重跑 open-effect、把用户已改的表单打回默认）
+  const customActionsRef = useRef(customActions);
+  customActionsRef.current = customActions;
   // 当前选中的 custom 定义 id（仅 actionType="custom" 时有效）
   const [selectedCustomActionId, setSelectedCustomActionId] = useState<
     string | null
   >(null);
-  // V0.9：「推进」弹窗折叠区（更多）是否展开——被隐藏的 action 平时收起、点「更多」才显示
-  const [showMore, setShowMore] = useState(false);
   // V0.9：推进面板布局偏好（顺序 + 显隐）；open effect 里读 getSettings() 刷新（非响应式、靠重开拉最新）
   const [actionLayout, setActionLayout] = useState<{
     order: string[];
@@ -328,7 +304,8 @@ export const AdvanceDialog = ({
   }>({ order: [], hidden: [] });
   // 用户指令、选填——飞书/上下文都已带上、空也能跑
   const [instruction, setInstruction] = useState("");
-  // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接
+  // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接；
+  // v0.9.11：默认勾选可在设置页「交互偏好」配置（打开 dialog 时从 settings 读、见 reset effect）
   const [reuseAgent, setReuseAgent] = useState(false);
   // V0.6.14：ship 提测「合并后删除源分支」开关（默认保留、用户拍板；dialog 打开时按 task 上次选择初始化）
   const [removeSourceBranch, setRemoveSourceBranch] = useState(false);
@@ -351,13 +328,8 @@ export const AdvanceDialog = ({
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
     {},
   );
-  // V0.6.25：ship override——最新 build 的 check 没过时、勾「仍继续提测」+ 填原因才放行
-  const [shipOverrideOn, setShipOverrideOn] = useState(false);
-  const [shipOverrideReason, setShipOverrideReason] = useState("");
-  // V0.6.25 review：ship 前置预检（server 算 gate 结论、含工作区指纹比对）——决定是否显示 override 区
-  // client 算不了 git 指纹、不再自己用 checkRun.status 猜、gate 单一源在 server
+  // ship 前置预检（v0.9.13 瘦身后只剩 reviewMissing 流程提醒、非阻断）——展示「build 后没 review」黄条
   const [shipPrecheck, setShipPrecheck] = useState<ShipPrecheck | null>(null);
-  const [shipPrecheckLoading, setShipPrecheckLoading] = useState(false);
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
   // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
@@ -399,15 +371,12 @@ export const AdvanceDialog = ({
   } = useImageAttach();
 
   // dialog 打开时初始化表单 state。
-  // 关键：依赖只放 open / defaultActionType，绝不放 availableModels.length——
+  // 关键：绝不把 availableModels.length 放进依赖——
   // 否则模型列表异步加载完成（length 0→N）会重跑本 effect，把用户已经改过的 action 选中
   //（如「提测」）、指令、开关全部打回默认值（「方案」），这就是「打开弹窗选中会跳一下」的根因。
   useEffect(() => {
     if (!open) return;
-    setActionType(defaultActionType);
-    setSelectedCustomActionId(null);
     setInstruction("");
-    setReuseAgent(false);
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.x：联调推送方式每次打开回到默认「直推」
     setDevPushMode("direct");
@@ -415,12 +384,11 @@ export const AdvanceDialog = ({
     // V0.6.29：批次 / 自由改动二选一、都不选拦提交（语义不明）——每次打开都回到「未表态」。
     setSelectedBatchIds([]);
     setFreeFormBuild(false);
-    // V0.6.25：每次打开重置 ship override（默认不绕过、需用户主动勾）
-    setShipOverrideOn(false);
-    setShipOverrideReason("");
     // 默认模型 = 本 task 最近 action 用的 → task.model（ref.current、打开瞬间最新、不进 deps 防 SSE 重置）
     // → 当次 getSettings().defaultModel 兜底（含 params）。settings 在这里读、保证拿到最新设置页默认模型。
     const s = getSettings();
+    // v0.9.11：「续用当前 Agent」默认勾选走设置页偏好（缺省 false = 每 action 新 agent）；dialog 内仍可临时切
+    setReuseAgent(s.reuseAgentDefault ?? false);
     setPickedModel(defaultPickedModelRef.current ?? s.defaultModel ?? { id: "" });
     setGitConfig({
       host: s.gitHost?.trim() || undefined,
@@ -436,13 +404,34 @@ export const AdvanceDialog = ({
     setLiveDevBranches(devMap);
     // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
     setHasPlanHistory(hasPlanHistoryRef.current);
-    // V0.9：读最新布局偏好（顺序 + 显隐）；默认选中的 action 若被折叠、自动展开「更多」、避免选中态藏在收起区
+    // V0.9：读最新布局偏好（顺序 + 显隐）；隐藏项直接不渲染（v0.9.12 删「更多」折叠区、重新启用去 /actions 页）
     const layout = s.actionLayout ?? { order: [], hidden: [] };
     setActionLayout(layout);
-    setShowMore(layout.hidden.includes(defaultActionType));
-  }, [open, defaultActionType, defaultRemoveSourceBranch]);
+    // v0.9.12 通用化：默认选中 = 混排可见列表第一位（用户自己排的顺序、无业务状态假设——
+    // 原「按 repoStatus / 最近 action 顺推」的 inferDefaultActionType 已删）。
+    // customActions 用 ref 读打开瞬间的缓存：首次打开还没拉到就只在内置里选、
+    // 拉完不追改选中（用户可能已开始操作、追改会跳）；第二次打开起缓存已有、custom 排第一也能选中。
+    const first = arrangeByLayout(
+      [
+        ...BUILTIN_ADVANCE_ACTIONS,
+        ...customActionsRef.current.map((d) => d.id),
+      ],
+      layout,
+    )[0];
+    if (first === undefined) {
+      // 全部 action 被隐藏（且无自定义）——无选中、chips 区显示空态引导
+      setActionType(null);
+      setSelectedCustomActionId(null);
+    } else if (isBuiltinAdvanceAction(first)) {
+      setActionType(first);
+      setSelectedCustomActionId(null);
+    } else {
+      setActionType("custom");
+      setSelectedCustomActionId(first);
+    }
+  }, [open, defaultRemoveSourceBranch]);
 
-  // V0.6.25 review：ship 时拉 server precheck（含工作区指纹比对）决定 override 区。
+  // ship 时拉 server precheck（v0.9.13 后只剩 reviewMissing 流程提醒）。
   // actionType 可能在 dialog 里被切到 ship、所以依赖它；非 ship 清空。
   useEffect(() => {
     if (!open || actionType !== "ship") {
@@ -450,17 +439,13 @@ export const AdvanceDialog = ({
       return;
     }
     let cancelled = false;
-    setShipPrecheckLoading(true);
     fetchShipPrecheck(task.id)
       .then((pc) => {
         if (!cancelled) setShipPrecheck(pc);
       })
       .catch(() => {
-        // 拉失败不挡提交、server /advance 会再跑同一套 gate 兜底
+        // 拉失败不挡提交、提醒是非阻断的
         if (!cancelled) setShipPrecheck(null);
-      })
-      .finally(() => {
-        if (!cancelled) setShipPrecheckLoading(false);
       });
     return () => {
       cancelled = true;
@@ -492,12 +477,13 @@ export const AdvanceDialog = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // V0.9：内置 + 自定义混排成一个列表、按 layout 统一排序 + 分主区/折叠（更多）。
+  // V0.9：内置 + 自定义混排成一个列表、按 layout 统一排序 + 过滤隐藏项
+  //（v0.9.12：隐藏的直接不出现、「更多」折叠区已删）。
   const customById = useMemo(
     () => new Map(customActions.map((d) => [d.id, d] as const)),
     [customActions],
   );
-  const arranged = useMemo(
+  const visibleKeys = useMemo(
     () =>
       arrangeByLayout(
         [...BUILTIN_ADVANCE_ACTIONS, ...customById.keys()],
@@ -505,12 +491,6 @@ export const AdvanceDialog = ({
       ),
     [customById, actionLayout],
   );
-  // 主区显示的 key（folded 部分仅 showMore 展开时追加到末尾）
-  const visibleKeys = showMore
-    ? [...arranged.visible, ...arranged.folded]
-    : arranged.visible;
-  // 被折叠的 action 数（决定「更多」按钮显隐）
-  const foldedCount = arranged.folded.length;
 
   // V0.9：渲染单个 action 卡片——内置走准入判断 + 副标题；自定义走 def + 扳手角标区分
   const renderActionChip = (key: string) => {
@@ -583,25 +563,24 @@ export const AdvanceDialog = ({
     );
   };
 
-  // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）
+  // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）；无选中时无所谓准入
   const disabledReason = useMemo(
     () =>
-      inferDisabledReason(task, actionType, {
-        ...gitConfig,
-        devBranches: liveDevBranches,
-      }),
+      actionType
+        ? inferDisabledReason(task, actionType, {
+            ...gitConfig,
+            devBranches: liveDevBranches,
+          })
+        : null,
     [task, actionType, gitConfig, liveDevBranches],
   );
-  // V0.6.25：ship 且 server precheck 判定需 override → 必须勾「仍继续」+ 填原因才能提测
-  const shipNeedsOverride =
-    actionType === "ship" && !!shipPrecheck?.needsOverride;
   const canSubmit = useMemo(() => {
     if (submitting) return false;
+    // v0.9.12：无选中（全部 action 被隐藏）不能提交
+    if (!actionType) return false;
     if (disabledReason) return false;
     // V0.9：自定义 action 必须选中一个具体定义
     if (actionType === "custom" && !selectedCustomActionId) return false;
-    // V0.6.25 review：ship 时等 precheck 拉完再判断（没拿到 gate 结论就放行会被 server 拒）
-    if (actionType === "ship" && shipPrecheckLoading) return false;
     // V0.6.29：分批 build 必须显式表态——选批 or「自由改动」选项卡、都没选语义不明拦提交
     if (
       actionType === "build" &&
@@ -611,23 +590,15 @@ export const AdvanceDialog = ({
     ) {
       return false;
     }
-    // V0.6.25：ship 需 override 时、必须勾「仍继续」+ 填原因
-    if (shipNeedsOverride && (!shipOverrideOn || !shipOverrideReason.trim())) {
-      return false;
-    }
     return true;
   }, [
     submitting,
     disabledReason,
     actionType,
     selectedCustomActionId,
-    shipPrecheckLoading,
     hasBatches,
     selectedBatchIds.length,
     freeFormBuild,
-    shipNeedsOverride,
-    shipOverrideOn,
-    shipOverrideReason,
   ]);
 
   // V0.6.23：批次卡片点选 toggle（含已做批次、允许返工重选）
@@ -709,7 +680,8 @@ export const AdvanceDialog = ({
   };
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    // actionType 判空给 TS narrow 用（canSubmit 已含该拦截）
+    if (!canSubmit || !actionType) return;
     await onSubmit({
       actionType,
       userInstruction: instruction.trim(),
@@ -729,16 +701,6 @@ export const AdvanceDialog = ({
       devPushMode: actionType === "dev" ? devPushMode : undefined,
       replanMode:
         actionType === "plan" && hasPlanHistory ? "append" : undefined,
-      // V0.6.25：ship 绕过 check 的 override（仅 ship 且 check 没过 + 勾「仍继续」时传、server 再校验绑定）
-      checkOverride:
-        shipNeedsOverride && shipOverrideOn
-          ? {
-              checkRunId: shipPrecheck?.checkRunId ?? "",
-              buildActionId: shipPrecheck?.buildActionId ?? "",
-              reason: shipOverrideReason.trim(),
-              createdAt: Date.now(),
-            }
-          : undefined,
       // V0.9：自定义 action 指向的定义 id（仅 custom）
       customActionId:
         actionType === "custom"
@@ -756,33 +718,24 @@ export const AdvanceDialog = ({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-2">
-          {/* action 类型选择：内置 + 自定义混排成一个 grid（顺序 / 显隐在 /actions 页配） */}
+          {/* action 类型选择：内置 + 自定义混排成一个 grid（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
-            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-              {visibleKeys.map((key) => renderActionChip(key))}
-            </div>
+            {visibleKeys.length > 0 ? (
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                {visibleKeys.map((key) => renderActionChip(key))}
+              </div>
+            ) : (
+              // 全部 action 被隐藏（极端配置）——引导去 /actions 页开启或新建、不把关掉的又摆出来
+              <EmptyHint size="sm">
+                所有 action 都已隐藏，去{" "}
+                <Link href="/actions" className="text-primary underline">
+                  Action 管理
+                </Link>{" "}
+                开启或新建。
+              </EmptyHint>
+            )}
           </div>
-
-          {/* V0.9：折叠区开关——被隐藏的 action 收进「更多」、显隐 / 顺序在 /actions 页配置 */}
-          {foldedCount > 0 && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowMore((v) => !v)}
-              disabled={submitting}
-              className="h-7 self-start px-2 text-xs text-muted-foreground"
-            >
-              {showMore ? "收起" : `更多（${foldedCount}）`}
-              <ChevronDown
-                className={cn(
-                  "ml-1 size-3.5 transition-transform",
-                  showMore && "rotate-180",
-                )}
-              />
-            </Button>
-          )}
 
           {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动） */}
           {actionType === "build" && hasBatches && (
@@ -896,7 +849,13 @@ export const AdvanceDialog = ({
                     void handleSubmit();
                   }
                 }}
-                placeholder={buildPlaceholder(task, actionType)}
+                placeholder={buildPlaceholder(
+                  task,
+                  actionType,
+                  actionType === "custom" && selectedCustomActionId
+                    ? customById.get(selectedCustomActionId)
+                    : undefined,
+                )}
                 disabled={submitting}
                 rows={4}
                 autoFocus
@@ -937,39 +896,6 @@ export const AdvanceDialog = ({
           {actionType === "ship" && shipPrecheck?.reviewMissing && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
               最新 build 之后还没跑过 review——建议先复核再提测（不拦、可直接继续）。
-            </div>
-          )}
-
-          {/* V0.6.25：ship override——最新 build 的 check 没过时、必须确认才放行（HITL 底线、留痕） */}
-          {shipNeedsOverride && (
-            <div className="grid gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
-              <div className="text-xs font-medium text-destructive">
-                {shipPrecheck?.reason || "最新 build 的检查没通过、确认仍要提测？"}
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <label
-                  htmlFor="ship-override"
-                  className="flex-1 cursor-pointer text-xs text-foreground/80"
-                >
-                  仍继续提测（绕过检查）
-                </label>
-                <Switch
-                  id="ship-override"
-                  checked={shipOverrideOn}
-                  onCheckedChange={setShipOverrideOn}
-                  disabled={submitting}
-                />
-              </div>
-              {shipOverrideOn && (
-                <Textarea
-                  value={shipOverrideReason}
-                  onChange={(e) => setShipOverrideReason(e.target.value)}
-                  placeholder="为什么检查没过还提测？（必填、进审计）"
-                  rows={2}
-                  disabled={submitting}
-                  className="resize-none text-xs"
-                />
-              )}
             </div>
           )}
 

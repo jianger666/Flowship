@@ -72,3 +72,38 @@ export const fetchSkills = async (): Promise<SkillOption[]> => {
   const { skills } = await handleJson<{ skills: SkillOption[] }>(res);
   return skills;
 };
+
+/** 导入结果（服务端逐文件处理、失败的带原因给 toast 汇总） */
+export interface ImportActionsResult {
+  imported: CustomActionDef[];
+  failed: { path: string; reason: string }[];
+}
+
+export const importCustomActionsReq = async (
+  dir: string,
+): Promise<ImportActionsResult> => {
+  const res = await fetch("/api/custom-actions/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir }),
+  });
+  return handleJson<ImportActionsResult>(res);
+};
+
+/** 导出结果（每个成功项带写入的文件绝对路径） */
+export interface ExportActionsResult {
+  exported: { id: string; file: string }[];
+  failed: { id: string; reason: string }[];
+}
+
+export const exportCustomActionsReq = async (
+  ids: string[],
+  dir: string,
+): Promise<ExportActionsResult> => {
+  const res = await fetch("/api/custom-actions/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids, dir }),
+  });
+  return handleJson<ExportActionsResult>(res);
+};

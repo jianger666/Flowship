@@ -3,13 +3,17 @@
 /**
  * 自定义 action 编辑器（V0.9、新建 / 编辑共用一个 Dialog）
  *
- * 字段：动作名 + 一句话简介 + playbook（大文本、带 3 段推荐模板）+ skill 多选 + 可选 check 命令。
+ * 字段：动作名 + 一句话简介 + playbook（大文本、带 3 段推荐模板）
+ *      + 推进输入提示（placeholder、轻量参数化）+ skill 多选 + 是否每次新 Agent。
+ * 模板变量 chips 曾加过又删（用户实测「不知道是干嘛的、没太大用处」）——任务标题 / 仓库路径 /
+ * artifact 目录这些上下文 super prompt 本来就有独立段落传给 agent、playbook 不需要点位引用；
+ * 运行时 {{var}} 替换链路仍在（跟内置 prompt 同一条 fillTemplate）、手写仍生效、只是不宣传。
  * 协议层（产出 artifact / HITL / wait_for_user / 再聊聊）由 runner 自动包、用户不用在 playbook 里写。
  *
- * 复用：MultiSelect（skill 勾选）、RepoCheckCommands（check 命令编辑、纯受控）。
+ * 复用：MultiSelect（skill 勾选、已勾但本机没有的显示灰 chip）。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import {
@@ -23,9 +27,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { MultiSelect } from "@/components/ui/multi-select";
-import { RepoCheckCommands } from "@/components/settings/repo-check-commands";
 import {
   createCustomActionReq,
   fetchSkills,
@@ -33,6 +37,7 @@ import {
   type SkillOption,
 } from "@/lib/custom-action-client";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 // 新建时预填的 playbook 模板（3 段、改改就能用）
 const PLAYBOOK_TEMPLATE = `## 目标
@@ -47,12 +52,14 @@ const PLAYBOOK_TEMPLATE = `## 目标
 （产出的报告 / artifact 长什么样；留空则让 agent 自己组织一份 markdown 报告）
 `;
 
+// MultiSelect 选项：正常 skill + 「已勾但本机没有」的合成灰项
+type EditorSkillOption = SkillOption & { missing?: boolean };
+
 const emptyDraft = (): CustomActionInput => ({
   label: "",
   summary: "",
   playbook: PLAYBOOK_TEMPLATE,
   skills: [],
-  checkCommands: [],
 });
 
 interface Props {
@@ -87,8 +94,8 @@ export const CustomActionEditor = ({
             summary: editing.summary ?? "",
             playbook: editing.playbook,
             skills: editing.skills ?? [],
-            checkCommands: editing.checkCommands ?? [],
             freshAgent: editing.freshAgent,
+            placeholder: editing.placeholder ?? "",
           }
         : emptyDraft(),
     );
@@ -114,6 +121,20 @@ export const CustomActionEditor = ({
 
   const patch = (p: Partial<CustomActionInput>) =>
     setDraft((d) => ({ ...d, ...p }));
+
+  // 已勾但本机没有的 skill（导入的定义常见）合成灰项进 options——
+  // MultiSelect 的 trigger / 列表都按 options 渲染、不合进去这些勾选会「隐身」
+  const optionsWithMissing = useMemo<EditorSkillOption[]>(() => {
+    const known = new Set(skillOptions.map((s) => s.name));
+    const missing = (draft.skills ?? [])
+      .filter((n) => !known.has(n))
+      .map((n) => ({
+        name: n,
+        description: "本机未找到、推进时会自动跳过",
+        missing: true,
+      }));
+    return [...missing, ...skillOptions];
+  }, [skillOptions, draft.skills]);
 
   const handleSave = async () => {
     if (!draft.label.trim()) {
@@ -147,7 +168,7 @@ export const CustomActionEditor = ({
             {editing ? "编辑自定义 Action" : "新建自定义 Action"}
           </DialogTitle>
           <DialogDescription>
-            把 playbook + skill + 可选 check 封装成一个能在任务里推进的 action
+            把 playbook + skill 封装成一个能在任务里推进的 action
           </DialogDescription>
         </DialogHeader>
 
@@ -186,16 +207,33 @@ export const CustomActionEditor = ({
           </div>
 
           <div className="grid gap-1.5">
+            <Label htmlFor="ca-placeholder">推进输入框提示（可选）</Label>
+            <Input
+              id="ca-placeholder"
+              value={draft.placeholder ?? ""}
+              onChange={(e) => patch({ placeholder: e.target.value })}
+              placeholder="推进选中这个 action 时、告诉使用者该填什么"
+            />
+          </div>
+
+          <div className="grid gap-1.5">
             <Label>带哪些 skill（可选）</Label>
             <MultiSelect
-              options={skillOptions}
+              options={optionsWithMissing}
               value={draft.skills ?? []}
               onChange={(next) => patch({ skills: next })}
               getKey={(s) => s.name}
               placeholder="不选则不带 skill"
               renderOption={(s) => (
                 <>
-                  <span className="font-medium">{s.name}</span>
+                  <span
+                    className={cn(
+                      "font-medium",
+                      s.missing && "text-muted-foreground line-through",
+                    )}
+                  >
+                    {s.name}
+                  </span>
                   <span className="line-clamp-2 text-xs text-muted-foreground">
                     {s.description}
                   </span>
@@ -204,12 +242,12 @@ export const CustomActionEditor = ({
             />
           </div>
 
-          <div className="grid gap-1.5">
-            <Label>跑完校验命令（可选）</Label>
-            <RepoCheckCommands
-              commands={draft.checkCommands ?? []}
-              onChange={(next) => patch({ checkCommands: next })}
-              onCommit={(next) => patch({ checkCommands: next })}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="ca-fresh">每次推进都用新 Agent</Label>
+            <Switch
+              id="ca-fresh"
+              checked={draft.freshAgent ?? true}
+              onCheckedChange={(v) => patch({ freshAgent: v })}
             />
           </div>
         </div>

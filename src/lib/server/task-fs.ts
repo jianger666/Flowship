@@ -41,8 +41,6 @@ import path from "node:path";
 import type {
   ActionRecord,
   ActionType,
-  CheckCommand,
-  CheckCommandKind,
   DevPushMode,
   GitBranchInfo,
   ModelSelection,
@@ -58,10 +56,8 @@ import type {
   TaskRole,
   TaskSummary,
 } from "@/lib/types";
-import { CHECK_COMMAND_KIND_LABEL } from "@/lib/types";
 import { mrTargetBranchOf } from "@/lib/task-display";
 import { getEffectiveCwd } from "@/lib/path-utils";
-import { detectRepoCheckCommands } from "./repo-check-detect";
 import {
   DATA_DIR,
   META_FILE,
@@ -226,55 +222,6 @@ export const getTask = async (id: string): Promise<Task | null> => {
 };
 
 /**
- * V0.6.26：清洗单个 repo 的 check 命令数组（手动配置 + 自动检测共用、统一约束）
- *
- * 抽出来的动机：手动配置（createTask input）和自动检测（detectRepoCheckCommands）两条来源
- * 都要走同一道清洗、约束必须完全一致（否则自动检测的命令绕过了防呆上限）。
- *
- * - 丢无效命令（name / cmd 空）
- * - name / cmd 长度硬上限——命令会被 server 自动执行、防配置错误塞超长串
- * - kind 归一：非法值兜回 custom（否则 runner 取 CHECK_KIND_DEFAULT_TIMEOUT_MS[kind]=undefined → setTimeout(0) 秒杀命令）
- * - required 缺省视为 true（阻塞 ship gate）
- * - timeoutMs clamp 到 [5s, 30min]（防 0/负数秒杀命令、或超大值卡死 harness）
- * - source 由调用方统一打标（手动→manual、检测→auto）、不信入参里的 source（防伪造来源）
- * - 每仓最多 10 条命令、防刷爆 harness
- *
- * export 仅供单测（tests/sanitize-check-commands.test.ts）、业务方不要直接调。
- */
-export const sanitizeCheckCommands = (
-  cmds: CheckCommand[],
-  source: "manual" | "auto",
-): CheckCommand[] =>
-  cmds
-    .filter(
-      (c) =>
-        c &&
-        typeof c.name === "string" &&
-        c.name.trim() &&
-        typeof c.cmd === "string" &&
-        c.cmd.trim(),
-    )
-    .map((c) => ({
-      name: c.name.trim().slice(0, 80),
-      cmd: c.cmd.trim().slice(0, 2000),
-      kind:
-        typeof c.kind === "string" && c.kind in CHECK_COMMAND_KIND_LABEL
-          ? (c.kind as CheckCommandKind)
-          : "custom",
-      required: c.required !== false,
-      source,
-      ...(c.timeoutMs && c.timeoutMs > 0
-        ? {
-            timeoutMs: Math.min(
-              Math.max(Math.round(c.timeoutMs), 5_000),
-              1_800_000,
-            ),
-          }
-        : {}),
-    }))
-    .slice(0, 10);
-
-/**
  * 创建新 task（V0.6）
  * - V0.6 不分 mode / workflowId、统一走 action 流
  * - 初始状态：repoStatus=developing / runStatus=idle / actions=[] / mrs=[]
@@ -334,21 +281,6 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && t) repoBranchTemplates[repo] = t;
   }
 
-  // V0.6.26 CheckRun 自动检测——每仓走「manual override > auto detect」：
-  //   - input 显式给了该仓命令数组（含空数组、= 调用方明确意图）→ 用手动配置（标 source=manual）
-  //   - 没给（key 不存在）→ 调 detectRepoCheckCommands 按 repo 文件结构自动识别（标 source=auto）
-  // 两条来源统一过 sanitizeCheckCommands、约束一致（长度 / kind 归一 / required 缺省 / 超时 clamp / 每仓≤10）。
-  // 注：正常 UI 路径下 route 层已把空数组过滤、所以「空数组 = 禁用检测」当前只在直接调 createTask 时生效；
-  //   第一版不从 UI 暴露「禁用」（详见 HANDOFF V0.6.26）。遍历 trimmedRepoPaths 本身就把 key 限定在本 task 仓内。
-  const repoCheckCommands: Record<string, CheckCommand[]> = {};
-  for (const repo of trimmedRepoPaths) {
-    const manual = input.repoCheckCommands?.[repo];
-    const cleaned = Array.isArray(manual)
-      ? sanitizeCheckCommands(manual, "manual")
-      : sanitizeCheckCommands(await detectRepoCheckCommands(repo), "auto");
-    if (cleaned.length > 0) repoCheckCommands[repo] = cleaned;
-  }
-
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -373,10 +305,6 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoBranchTemplates:
       Object.keys(repoBranchTemplates).length > 0
         ? repoBranchTemplates
-        : undefined,
-    repoCheckCommands:
-      Object.keys(repoCheckCommands).length > 0
-        ? repoCheckCommands
         : undefined,
     feishuStoryUrl: input.feishuStoryUrl,
     contextDocs: initialContextDocs,
@@ -610,7 +538,7 @@ export interface UpdateTaskFieldsInput {
   /**
    * V0.6.28：中途**追加**仓库（只增不删、删仓涉及已建分支 / MR 残留引用、边界多收益低）
    * - 语义：跟现有 repoPaths 做并集、已存在的忽略；生效于下一个 action（正在跑的 run cwd 已绑死）
-   * - 新仓的 per-repo 快照（线上 / 测试 / dev 分支、命名模板、check 命令）由前端从
+   * - 新仓的 per-repo 快照（线上 / 测试 / dev 分支、命名模板）由前端从
    *   settings 取好随本字段一起传（settings 在 localStorage、server 读不到、跟建 task 同因）
    */
   addRepoPaths?: string[];
@@ -619,7 +547,6 @@ export interface UpdateTaskFieldsInput {
   addRepoTestBranches?: Record<string, string>;
   addRepoDevBranches?: Record<string, string>;
   addRepoBranchTemplates?: Record<string, string>;
-  addRepoCheckCommands?: Record<string, CheckCommand[]>;
 }
 
 export const updateTaskFields = async (
@@ -690,10 +617,6 @@ export const updateTaskFields = async (
         meta.repoBranchTemplates = mergeSnapshot(
           meta.repoBranchTemplates,
           input.addRepoBranchTemplates,
-        );
-        meta.repoCheckCommands = mergeSnapshot(
-          meta.repoCheckCommands,
-          input.addRepoCheckCommands,
         );
       }
     }
@@ -849,8 +772,6 @@ export const patchAction = async (
       ActionRecord,
       | "status"
       | "postCheck"
-      | "checkRun"
-      | "checkOverride"
       | "sideEffects"
       | "agentModel"
       | "excluded"

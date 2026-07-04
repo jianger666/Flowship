@@ -8,16 +8,21 @@
  *     UI 上挂红条「后置检查未过」、用户可以选 revise 让 agent 改
  *   - 检查通过：postCheck.passed=true、UI 上挂绿条
  *
- * 检查内容（V0.6.1 范围、用户拍板删 plan 黑名单 grep 后简化）：
- *   - plan: artifact 文件存在 + 内容长度 >= 100
- *   - build（V0.6.25 CheckRun 复活）：per-repo 跑用户配的 checkCommands（typecheck/lint/test/...）、
- *     执行前后比对 tracked 工作区检测「命令偷改源码」、并记录每仓工作区指纹给 ship gate 比对。
- *     历史：V0.6.3 曾撤掉写死的 pnpm（多技术栈如 Java 误报）、V0.6.25 改「用户 per-repo 配命令、
- *     没配的仓按是否被本次 build 改过分 not_configured/skipped」复活、详见 checkBuild / runRepoChecks
+ * 检查范围（v0.9.13 拍板：只查「agent 交付诚实性」、不跑项目命令）：
+ *   - plan: artifact 文件存在 + 内容长度 >= 100 + 必备段
+ *   - build: artifact 落盘 + 必备段（全量校验 / 修改记录）+ 兄弟仓越权检测
  *   - review: artifact「总评」段声明的「基底 commit」跟实际 `git rev-parse HEAD` 一致（防 agent 拿错 / 编造基底）
+ *     + 工作区指纹未变（review 只读硬校验）
  *   - ship（V0.6.1）：task.mrs 覆盖所有 repoPath（每仓 1 条 url 非空）、或 artifact 说明跳过原因
  *   - learn（V0.6.29）：必备段（提炼条目 / 本次无可沉淀）+ 证据路径真实 + 落地记录闭环
+ *   - custom：artifact 落盘非空
  *   - chat 不走本机制（chat 是独立 mode、不复用 action 体系、详见 chat-runner.ts）
+ *
+ * 关于 CheckRun（跑 typecheck / lint 等项目命令）的历史决策（2026-07-03 用户拍板删）：
+ *   V0.6.3 写死 pnpm 检查（多技术栈误报）→ 撤；V0.6.25 改「用户 per-repo 配命令」复活（含 ship gate
+ *   override 留痕、污染检测、--fix 预判等一整套）→ v0.9.13 整套删除。根因是语义错配：全仓检查问的是
+ *   「项目是不是绿的」、但存量项目基线本来就红（历史债）、agent 只改两个文件也永远红 → 红色失去信息量、
+ *   还连带 ship 每次都要 override 填原因。方向通用化后（非研发用户）这套「研发流程假设」也不再成立。
  *
  * 关于 plan「黑名单 grep」的历史决策（2026-05-28 用户拍板删）：
  *   V0.5.6.5 加过一组 13 个不确定字眼黑名单（或 / 约 / TBD / 可能 / 示例 / 节选 ...）、
@@ -36,46 +41,27 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import type {
-  ActionRecord,
-  CheckCommand,
-  CheckCommandResult,
-  CheckRepoResult,
-  CheckRunSummary,
-  Task,
-} from "@/lib/types";
-import { CHECK_KIND_DEFAULT_TIMEOUT_MS } from "@/lib/types";
+import type { ActionRecord, Task } from "@/lib/types";
 
-import { getActionArtifactPath, getCheckLogPaths } from "./task-fs-core";
-import { getCustomAction } from "./custom-action-fs";
-import { isMutatingScript } from "./repo-check-detect";
+import { getActionArtifactPath } from "./task-fs-core";
 import { getEffectiveCwd } from "@/lib/path-utils";
 
 export interface ActionCheckResult {
   passed: boolean;
   details: string;
-  /**
-   * V0.6.25 CheckRun：build action 专属——结构化校验摘要（per-repo per-command）
-   * runner 把它落到 ActionRecord.checkRun（passed/details 仍落 postCheck、复用现成红绿条 UI）。
-   */
-  checkRun?: CheckRunSummary;
 }
 
-// 主入口：跑给定 action 的 deterministic 检查
-// signal（V0.8.18）：仅 build 用——后置 CheckRun 后台异步跑、停止 / 推进新 action 时 abort 杀子进程
+// 主入口：跑给定 action 的 deterministic 检查（v0.9.13 起全是轻量 fs / git 检查、同步 await 即可）
 export const runActionCheck = async (
   task: Task,
   action: ActionRecord,
-  signal?: AbortSignal,
 ): Promise<ActionCheckResult> => {
   try {
     switch (action.type) {
       case "plan":
         return await checkPlan(task, action);
-      // build（V0.6.25 CheckRun）：per-repo 跑用户配的 checkCommands、不再写死 pnpm
-      //   （绕开 V0.6.3 撤掉的「写死 pnpm 搞死多栈」：没配命令的仓记 not_configured、不误报）
       case "build":
-        return await checkBuild(task, action, signal);
+        return await checkBuild(task, action);
       case "learn":
         return await checkLearn(task, action);
       case "review":
@@ -85,7 +71,7 @@ export const runActionCheck = async (
       case "dev":
         return await checkDev(task, action);
       case "custom":
-        return await checkCustom(task, action, signal);
+        return await checkCustom(task, action);
       default: {
         const _: never = action.type;
         return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
@@ -526,13 +512,11 @@ const checkDev = async (
 
 // ----------------- custom（V0.9 自定义 action）-----------------
 //
-// 后置检查 = artifact 基本盘（产出非空）+ 定义里可选的 checkCommands。
+// 后置检查 = artifact 基本盘（产出非空）。
 // 不强制 artifact 必备段（custom 的 playbook 由用户自定义、没有固定骨架）。
-// checkCommands 在 effective cwd 跑（不分仓、custom 命令是定义级）、复用 runRepoChecks 拿污染检测 + 日志。
 const checkCustom = async (
   task: Task,
   action: ActionRecord,
-  signal?: AbortSignal,
 ): Promise<ActionCheckResult> => {
   if (!action.artifactPath) {
     return { passed: false, details: "自定义 action 没产出 artifact" };
@@ -550,65 +534,12 @@ const checkCustom = async (
   if (content.trim().length === 0) {
     return { passed: false, details: "自定义 action artifact 为空" };
   }
-
-  // 定义里配的可选后置校验命令（读不到定义 / 没配命令 → 仅 artifact 基本盘通过）
-  const def = action.customActionId
-    ? await getCustomAction(action.customActionId)
-    : null;
-  const commands = def?.checkCommands ?? [];
-  if (commands.length === 0) {
-    return {
-      passed: true,
-      details: "自定义 action artifact 已落盘（未配后置校验命令）",
-    };
-  }
-
-  const cwd = getEffectiveCwd(task.repoPaths);
-  const repoResult = await runRepoChecks(
-    task.id,
-    action.id,
-    cwd,
-    `custom-${action.n}`,
-    commands,
-    signal,
-  );
-  const status: CheckRunSummary["status"] =
-    repoResult.status === "failed"
-      ? "failed"
-      : repoResult.status === "not_configured"
-        ? "not_configured"
-        : "passed";
-  const checkRun: CheckRunSummary = {
-    id: `cr_${action.id}_${Date.now()}`,
-    status,
-    startedAt: Date.now(),
-    endedAt: Date.now(),
-    repos: [repoResult],
-  };
-  const cmdSummary = repoResult.commands
-    .map((c) => `${c.name}=${c.status}`)
-    .join(" / ");
-  return {
-    passed: repoResult.status !== "failed",
-    details: `自定义 action 后置校验：${status}（${cmdSummary || "无命令执行"}）`,
-    checkRun,
-  };
+  return { passed: true, details: "自定义 action artifact 已落盘" };
 };
 
-// ----------------- build（V0.6.25 CheckRun）-----------------
-//
-// 设计见 types.ts CheckCommand 注释。核心：
-//   - 遍历 task.repoPaths、按 task.repoCheckCommands?.[repoPath] 跑 per-repo 校验命令
-//   - 命令走 `sh -c`（支持 && / cd / 管道）、PATH 继承 runner 环境 + 补常见 bin（兜 nvm/volta/mvn）
-//   - 每条命令跑前后比对 git tracked 状态——命令偷改源码（如手滑 --fix）判 mutated = failed（结果不可信）
-//   - 完整输出落 actions/.checks/<actionId>/<slug>.log、摘要（per-command logTail）进 ActionRecord.checkRun
-//   - build 改动停在工作区（未 commit）、check 校验的正是这批工作区改动（符合 build「不碰 .git」铁律）
-//
-// 聚合：任一 required 命令 failed/timed_out/mutated → repo failed；全 repo not_configured → 整体 not_configured
-// postCheck.passed = checkRun.status !== "failed"（not_configured 不算失败、UI 灰条、但 ship gate 仍会拦）
+// ----------------- 内部 shell 执行底座（fingerprint / status hash 用）-----------------
 
-// check 命令执行环境：继承 runner（next dev）PATH + 补常见 bin 目录
-// 局限：nvm 按版本的 node 路径不固定、第一版只兜静态常见路径；找不到工具时命令 exit 127、记 failed
+// 命令执行环境：继承 runner（next dev）PATH + 补常见 bin 目录
 const buildCheckEnv = (): NodeJS.ProcessEnv => {
   const home = process.env.HOME ?? "";
   const extraBins = [
@@ -650,7 +581,7 @@ const killProcessTree = (proc: ReturnType<typeof spawn>) => {
 };
 
 // 跑一条 shell 命令（sh -c、支持组合命令）、带超时强杀
-// 单命令 output 累积上限——超了截断、防巨大测试输出打爆 Next server 内存（V0.6.25 review）
+// 单命令 output 累积上限——超了截断、防巨大输出打爆 Next server 内存（V0.6.25 review）
 const CHECK_OUTPUT_CAP = 512 * 1024;
 
 const runCheckShell = (
@@ -658,15 +589,8 @@ const runCheckShell = (
   cwd: string,
   timeoutMs: number,
   maxOutputBytes = CHECK_OUTPUT_CAP,
-  // V0.8.18：外部取消信号（停止 / 推进新 action 时 abort、杀掉慢命令子进程树、不让 typecheck 空跑几分钟）
-  signal?: AbortSignal,
 ): Promise<CheckShellResult> =>
   new Promise((resolve) => {
-    // 已被取消 → 不起子进程、直接返回（结果由调用方按 aborted 丢弃）
-    if (signal?.aborted) {
-      resolve({ exitCode: -1, output: "[aborted]", timedOut: false });
-      return;
-    }
     let output = "";
     // 已达上限、之后输出直接丢弃（进程仍跑、只是不再收集、防内存爆）
     let truncated = false;
@@ -682,13 +606,6 @@ const runCheckShell = (
       timedOut = true;
       killProcessTree(proc);
     }, timeoutMs);
-    // 外部 abort（停止 / 推进）→ 杀整棵进程树、由 close 事件兜底 resolve
-    const onAbort = () => killProcessTree(proc);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-    };
     // 累积 output、到上限就截断并打明显标记（否则用户看尾部以为命令自然结束）
     const append = (d: unknown) => {
       if (truncated) return;
@@ -703,7 +620,7 @@ const runCheckShell = (
     proc.stdout?.on("data", append);
     proc.stderr?.on("data", append);
     proc.on("error", (err) => {
-      cleanup();
+      clearTimeout(timer);
       resolve({
         exitCode: -1,
         output: output + `\n[spawn error] ${err.message}`,
@@ -711,34 +628,11 @@ const runCheckShell = (
       });
     });
     proc.on("close", (code) => {
-      cleanup();
+      clearTimeout(timer);
       resolve({ exitCode: code ?? -1, output, timedOut });
     });
   });
 
-// 取该仓 tracked 文件改动状态（污染检测基线）
-// untracked 不算（coverage / .turbo / 报告目录是临时产物、通常 gitignored）；非 git 仓 / git 失败 → null（不判 mutated）
-const trackedWorktreeStatus = async (cwd: string): Promise<string | null> => {
-  const r = await runCheckShell(
-    "git status --porcelain --untracked-files=no",
-    cwd,
-    15_000,
-  );
-  return r.exitCode === 0 ? r.output.trim() : null;
-};
-
-// 取末尾 maxLines 行（logTail 摘要、完整在日志文件）
-const tailLines = (text: string, maxLines = 15): string => {
-  const trimmed = text.replace(/\s+$/, "");
-  const lines = trimmed.split("\n");
-  return lines.length <= maxLines ? trimmed : lines.slice(-maxLines).join("\n");
-};
-
-// repo 末段名（日志 slug + UI 展示用）
-const repoTailName = (repoPath: string): string =>
-  repoPath.split("/").filter(Boolean).pop() ?? repoPath;
-
-// 跑单仓所有 check 命令、返结构化结果 + 把完整日志写文件
 // 工作区指纹脚本（V0.6.25 review）——覆盖：tracked 改 / staged / 删除 / 新增 untracked 文件 / untracked 内容变化
 // 关键：`git diff HEAD` 不含 untracked 文件内容、`git status` 只含路径不含内容、所以单独对 untracked 逐文件 hash。
 // 用 `git hash-object --stdin-paths`（git 原生、空输入安全不 hang、不依赖 bash `read -d` 跨 mac/linux dash 都行）。
@@ -754,8 +648,8 @@ const FINGERPRINT_SCRIPT = [
 ].join("\n");
 
 // 该仓「工作区内容指纹」= sha256(headCommit + tracked diff + untracked 路径 + untracked 内容 hash)
-// check 结束记录、ship gate 前重算比对——不一致 = check 后工作区又被改、旧 checkRun 不代表当前要 ship 的内容。
-// 给 20MB cap（指纹要完整 diff、不能被默认 512KB 截断）；非 git 仓 / 异常 → null（gate 端视为「无法比对、不拦」）。
+// review 启动基线记录、结束后重算比对——不一致 = review 期间工作区被改（违反 review 只读铁律）。
+// 给 20MB cap（指纹要完整 diff、不能被默认 512KB 截断）；非 git 仓 / 异常 → null（视为「无法比对、不拦」）。
 // ⚠ 边界：tracked diff 全文 + untracked hash 列表累积 >20MB 会被截断、理论上漏掉 20MB 之后的 tracked 改动
 //   （实际罕见、20MB 纯文本 diff 极大）。要严格无上限、可把 tracked 部分也改成逐文件 hash-object（untracked 已是）。
 export const computeWorktreeFingerprint = async (
@@ -772,235 +666,15 @@ export const computeWorktreeFingerprint = async (
   return createHash("sha256").update(r.output).digest("hex");
 };
 
-// 本仓是否被改动过——tracked 改 + staged + 删除 + 新增 untracked（--untracked-files=all）全算。
-// 决定「没配 check 命令的仓」是 not_configured（改了没检查、要关注）还是 skipped（没碰、不影响整体）。
-// 跟 trackedWorktreeStatus 的区别：那个 untracked=no（污染检测、untracked 是命令产物不算）；这个要含新增文件。
-const isRepoDirty = async (repoPath: string): Promise<boolean> => {
-  const r = await runCheckShell(
-    "git status --porcelain --untracked-files=all",
-    repoPath,
-    15_000,
-  );
-  return r.exitCode === 0 && r.output.trim().length > 0;
-};
-
-// 命令会不会「自动改写工作区源码」（跑前预判、避免在用户工作区跑 --fix 类命令）（V0.8.20）
-// 两条识别路径：
-//   1) cmd 字符串本身含修复 flag（用户在设置页手配的裸命令、如 `eslint --fix src`）
-//   2) cmd 是 `<pm> run <script>`、解析 repo package.json 里该 script 体含修复 flag
-//      ——识破 `ng lint --fix=true` 这种藏在 script 内部、cmd 字面看不出来的；
-//        且覆盖「存量 task 已把 `yarn run lint` 固化进 repoCheckCommands」的场景
-//        （探测层 isMutatingScript 过滤只对新建 task 生效、老 task 数据里命令已落库）。
-// 读不到 package.json / 非标准命令格式 → 返 false（无法判定、fail-open、交给事后 mutated 检测兜底）。
-const willCommandMutateWorktree = async (
-  cmd: string,
-  repoPath: string,
-): Promise<boolean> => {
-  if (isMutatingScript(cmd)) return true;
-  const m = cmd.trim().match(/^(?:pnpm|yarn|npm|bun)\s+run\s+([\w:.-]+)/);
-  if (!m) return false;
-  const scriptName = m[1]!;
-  try {
-    const pkgRaw = await fs.readFile(
-      path.join(repoPath, "package.json"),
-      "utf-8",
-    );
-    const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, unknown> };
-    const body = pkg.scripts?.[scriptName];
-    return typeof body === "string" && isMutatingScript(body);
-  } catch {
-    return false;
-  }
-};
-
-const runRepoChecks = async (
-  taskId: string,
-  actionId: string,
-  repoPath: string,
-  slug: string,
-  commands: CheckCommand[],
-  // V0.8.18：透传给慢命令（lint/typecheck）的取消信号、停止/推进时杀子进程
-  signal?: AbortSignal,
-): Promise<CheckRepoResult> => {
-  // 该仓基底 commit
-  const headRes = await runCheckShell("git rev-parse HEAD", repoPath, 15_000);
-  const headCommit =
-    headRes.exitCode === 0 ? headRes.output.trim() || null : null;
-  // 工作区指纹：check 这一刻的工作区内容快照（ship gate 重算比对、防 check 后又被改）
-  const worktreeFingerprint = await computeWorktreeFingerprint(repoPath);
-
-  // 没配 check 命令——按本仓是否被本次 build 改过区分：
-  //   dirty（改了没检查）→ not_configured（拉低整体、ship 要 override）；clean（没碰）→ skipped（不影响 passed）
-  if (commands.length === 0) {
-    const dirty = await isRepoDirty(repoPath);
-    return {
-      repoPath,
-      status: dirty ? "not_configured" : "skipped",
-      headCommit,
-      worktreeFingerprint,
-      logPath: null,
-      commands: [],
-    };
-  }
-
-  const results: CheckCommandResult[] = [];
-  const logBlocks: string[] = [];
-
-  for (const c of commands) {
-    // V0.8.20：跑前预判命令会不会自动改写工作区（--fix/--write 类）。会的话直接跳过不跑——
-    // 避免 ① 污染工作区被事后判 failed（误红）；② 用户本地 dev server 被连环触发热重载、
-    // 终端「一直重启」（线上 cp-admin 的 `ng lint --fix=true` 跑满 120s、期间 dev 每 3s 重编译、踩过）。
-    // 修复型命令本就不是只读门禁、跳过记 skipped + 原因、不计入 failed（下方聚合排除 skipped）。
-    if (await willCommandMutateWorktree(c.cmd, repoPath)) {
-      const skipNote =
-        "跳过：该命令会自动改写源码（检测到 --fix/--write 类修复 flag）、不当只读门禁跑。如需 lint 门禁，请在设置页把命令改成只读形式（去掉 --fix）。";
-      results.push({
-        name: c.name,
-        cmd: c.cmd,
-        kind: c.kind,
-        required: c.required,
-        status: "skipped",
-        exitCode: 0,
-        durationMs: 0,
-        mutatedWorktree: false,
-        logTail: skipNote,
-      });
-      logBlocks.push(
-        `=== ${c.name}（${c.cmd}）[跳过：会改写工作区] ===\n${skipNote}`,
-      );
-      continue;
-    }
-
-    const timeoutMs =
-      c.timeoutMs && c.timeoutMs > 0
-        ? c.timeoutMs
-        : CHECK_KIND_DEFAULT_TIMEOUT_MS[c.kind];
-    // 跑前后各取一次 tracked 状态、变了 = 命令偷改了源码
-    const before = await trackedWorktreeStatus(repoPath);
-    const started = Date.now();
-    const r = await runCheckShell(c.cmd, repoPath, timeoutMs, undefined, signal);
-    const durationMs = Date.now() - started;
-    const after = await trackedWorktreeStatus(repoPath);
-    const mutatedWorktree =
-      before !== null && after !== null && before !== after;
-
-    let status: CheckCommandResult["status"];
-    if (r.timedOut) status = "timed_out";
-    else if (r.exitCode !== 0) status = "failed";
-    else if (mutatedWorktree) status = "failed";
-    else status = "passed";
-
-    results.push({
-      name: c.name,
-      cmd: c.cmd,
-      kind: c.kind,
-      required: c.required,
-      status,
-      exitCode: r.exitCode,
-      durationMs,
-      mutatedWorktree,
-      logTail: tailLines(r.output),
-    });
-    logBlocks.push(
-      `=== ${c.name}（${c.cmd}）exit=${r.exitCode}${
-        r.timedOut ? " [超时]" : ""
-      }${mutatedWorktree ? " [工作区被改]" : ""} ${durationMs}ms ===\n${r.output}`,
-    );
-  }
-
-  // 写完整日志（best-effort、写失败不影响判定、logPath 退回 null）
-  let logPath: string | null = null;
-  try {
-    const { absPath, relPath } = getCheckLogPaths(taskId, actionId, slug);
-    await fs.mkdir(path.dirname(absPath), { recursive: true });
-    await fs.writeFile(absPath, logBlocks.join("\n\n"), "utf-8");
-    logPath = relPath;
-  } catch (err) {
-    console.warn(
-      `[action-check] checkBuild 写日志失败 task=${taskId} repo=${repoPath}：`,
-      err,
-    );
-  }
-
-  // repo 聚合（V0.6.25 review + V0.8.20 skipped 处理）：
-  //   - mutated（任一命令偷改工作区）→ failed：污染是独立安全语义、无视 required
-  //     （兜底「没被跑前预判拦住的 --fix」；正常情况已在 willCommandMutateWorktree 拦截、走 skipped）
-  //   - required 命令非 passed → failed；但 skipped（会改写、跑前主动跳过）不算失败、排除在外
-  //   - 配了命令却「全被跳过」（没有任何真正执行的只读门禁）→ 退回 commands.length===0 语义：
-  //     本仓被本次 build 改过（dirty）记 not_configured（ship 要确认）、没碰记 skipped
-  const executed = results.filter((x) => x.status !== "skipped");
-  const mutated = results.some((x) => x.mutatedWorktree);
-  const requiredFailed = executed.some(
-    (x) => x.required && x.status !== "passed",
-  );
-  let repoStatus: CheckRepoResult["status"];
-  if (mutated || requiredFailed) {
-    repoStatus = "failed";
-  } else if (executed.length === 0) {
-    repoStatus = (await isRepoDirty(repoPath)) ? "not_configured" : "skipped";
-  } else {
-    repoStatus = "passed";
-  }
-  return {
-    repoPath,
-    status: repoStatus,
-    headCommit,
-    worktreeFingerprint,
-    logPath,
-    commands: results,
-  };
-};
-
+// ----------------- build -----------------
+//
+// v0.9.13 起不再跑项目命令（CheckRun 删除、见文件头历史决策）——
+// 只查 agent 交付诚实性：artifact 落盘 + 必备段 + 兄弟仓越权检测。
 const checkBuild = async (
   task: Task,
   action: ActionRecord,
-  signal?: AbortSignal,
 ): Promise<ActionCheckResult> => {
-  const startedAt = Date.now();
-  const repoResults: CheckRepoResult[] = [];
-
-  // 遍历所有 repo——配了命令的跑、没配的按是否被本次 build 改过记 not_configured（改了）/ skipped（没改）
-  // slug 用 idx 前缀防多仓末段同名（/a/client + /b/client）日志互相覆盖
-  for (let i = 0; i < task.repoPaths.length; i++) {
-    const repoPath = task.repoPaths[i]!;
-    const commands = task.repoCheckCommands?.[repoPath] ?? [];
-    const slug = `${i}-${repoTailName(repoPath)}`;
-    repoResults.push(
-      await runRepoChecks(task.id, action.id, repoPath, slug, commands, signal),
-    );
-  }
-
-  // 整体聚合：任一 repo failed → failed；全 not_configured → not_configured；否则 passed
-  const anyFailed = repoResults.some((r) => r.status === "failed");
-  const anyNotConfigured = repoResults.some(
-    (r) => r.status === "not_configured",
-  );
-  const status: CheckRunSummary["status"] = anyFailed
-    ? "failed"
-    : anyNotConfigured
-      ? "not_configured"
-      : "passed";
-
-  const checkRun: CheckRunSummary = {
-    id: `cr_${action.id}_${startedAt}`,
-    status,
-    startedAt,
-    endedAt: Date.now(),
-    repos: repoResults,
-  };
-
-  // postCheck 文本摘要（复用 action 红绿条 UI）
-  const detailLines = repoResults.map((r) => {
-    const tail = repoTailName(r.repoPath);
-    if (r.status === "not_configured")
-      return `  - ${tail}：有改动但没配检查命令（ship 需确认）`;
-    if (r.status === "skipped") return `  - ${tail}：本次没改动、跳过`;
-    const cmdSummary = r.commands.map((c) => `${c.name}=${c.status}`).join(" / ");
-    return `  - ${tail}：${r.status}（${cmdSummary}）`;
-  });
-  const sections: string[] = [
-    `build CheckRun ${status}：\n${detailLines.join("\n")}`,
-  ];
+  const sections: string[] = [];
   let artifactLintPassed = true;
 
   // V0.6.27 artifact 小节 lint：「全量校验」「修改记录」是 build 骨架铁段
@@ -1051,10 +725,13 @@ const checkBuild = async (
     }
   }
 
+  if (artifactLintPassed && sections.length === 0) {
+    sections.push("build artifact 已落盘、必备段齐全");
+  }
+
   return {
-    passed: status !== "failed" && artifactLintPassed,
+    passed: artifactLintPassed,
     details: sections.join("\n\n"),
-    checkRun,
   };
 };
 

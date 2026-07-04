@@ -97,6 +97,10 @@ const isFieldEqual = (
         r.path === b.repos[i].path && r.name === b.repos[i].name,
     );
   }
+  if (key === "reuseAgentDefault") {
+    // boolean 字段：缺省视同 false 比较
+    return (a[key] ?? false) === (b[key] ?? false);
+  }
   if (key === "disabledMcpServers") {
     // 黑名单是集合、顺序无关——排序后逐项比
     const x = [...(a.disabledMcpServers ?? [])].sort();
@@ -166,6 +170,11 @@ export const useSettings = (): UseSettingsResult => {
         savedSettings,
       ),
       actionLayout: !isFieldEqual("actionLayout", settings, savedSettings),
+      reuseAgentDefault: !isFieldEqual(
+        "reuseAgentDefault",
+        settings,
+        savedSettings,
+      ),
     }),
     [settings, savedSettings]
   );

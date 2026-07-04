@@ -29,7 +29,6 @@ import remarkGfm from "remark-gfm";
 
 import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
-import { CheckRunSummaryCard } from "@/components/tasks/check-run-summary";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -571,12 +570,6 @@ export const ArtifactPanel = ({
       <div className="flex-1 overflow-y-auto">
         {mode === "content" ? (
           <div className="px-6 py-4">
-            {/* V0.6.25：build 的确定性检查结果（CheckRun 跑完的明细、正文上方先给红绿摘要） */}
-            {action.type === "build" && action.checkRun && (
-              <div className="mb-3">
-                <CheckRunSummaryCard checkRun={action.checkRun} />
-              </div>
-            )}
             {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
             {action.type === "plan" &&
               action.replanMode &&

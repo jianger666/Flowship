@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import type { McpServerConfig } from "@cursor/sdk";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -37,6 +38,7 @@ import {
 } from "@/components/ui/select";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
+import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { createTask } from "@/lib/task-store";
@@ -45,7 +47,6 @@ import {
   TASK_ROLE_LABEL,
   type ModelSelection,
   type RepoConfig,
-  type CheckCommand,
   type Task,
   type TaskRole,
 } from "@/lib/types";
@@ -128,6 +129,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     loading: modelsLoading,
     fetchModels,
   } = useModels();
+  // v0.9.11：已选仓的分支候选（「已有工作分支」Combobox 用）——undefined=拉取中、isRepo=false=非 git
+  const branchMap = useRepoBranches(repoPaths);
 
   // 打开时读 settings.repos + 拉模型（MCP 候选源走 useCursorMcp）
   useEffect(() => {
@@ -221,11 +224,9 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
 
       // V0.6.7：从 settings.repos 快照每仓的测试分支 / dev 分支 / 有效命名模板
       //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build / ship 用这份）
-      // V0.6.25：同款快照每仓的 check 命令（build 后 runner 跑、详见 types.ts CheckCommand）
       const repoTestBranches: Record<string, string> = {};
       const repoDevBranches: Record<string, string> = {};
       const repoBranchTemplates: Record<string, string> = {};
-      const repoCheckCommands: Record<string, CheckCommand[]> = {};
       for (const p of repoPaths) {
         const repo = settings.repos.find((r) => r.path === p);
         const tb = repo?.testBranch?.trim();
@@ -237,8 +238,6 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
           repo?.branchTemplate,
           settings.branchTemplate,
         );
-        const cmds = repo?.checkCommands;
-        if (cmds && cmds.length > 0) repoCheckCommands[p] = cmds;
       }
 
       const task = await createTask({
@@ -265,10 +264,6 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
         repoBranchTemplates:
           Object.keys(repoBranchTemplates).length > 0
             ? repoBranchTemplates
-            : undefined,
-        repoCheckCommands:
-          Object.keys(repoCheckCommands).length > 0
-            ? repoCheckCommands
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
         model,
@@ -404,13 +399,15 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
             />
           </div>
 
-          {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建 */}
+          {/* V0.6.3：per-repo「已有工作分支」覆盖——已自己建分支做了一部分时填、build 复用不另建。
+              v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用 */}
           {repoPaths.length > 0 && (
             <div className="grid gap-1.5">
               <Label>已有工作分支（选填）</Label>
               <div className="grid gap-2">
                 {repoPaths.map((p) => {
                   const repo = repos.find((r) => r.path === p);
+                  const entry = branchMap[p];
                   return (
                     <div key={p} className="flex items-center gap-2">
                       <span
@@ -419,15 +416,19 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
                       >
                         {repo?.name ?? p}
                       </span>
-                      <Input
+                      <Combobox
                         value={featureBranches[p] ?? ""}
-                        onChange={(e) =>
-                          setFeatureBranches((prev) => ({
-                            ...prev,
-                            [p]: e.target.value,
-                          }))
+                        onValueChange={(v) =>
+                          setFeatureBranches((prev) => ({ ...prev, [p]: v }))
                         }
-                        placeholder="留空自动建 feature/…"
+                        options={entry?.branches ?? []}
+                        loading={!entry}
+                        disabled={!entry?.isRepo}
+                        placeholder={
+                          entry?.isRepo === false
+                            ? "非 git 仓库"
+                            : "留空自动建 feature/…"
+                        }
                         className="min-w-0 flex-1"
                       />
                     </div>

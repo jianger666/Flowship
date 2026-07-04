@@ -17,7 +17,6 @@ import type {
   ActionRecord,
   ArtifactRevision,
   AskUserAnswer,
-  CheckCommand,
   GitBranchState,
   McpHealth,
   NewTaskInput,
@@ -151,7 +150,6 @@ export const updateTaskFields = async (
     addRepoTestBranches?: Record<string, string>;
     addRepoDevBranches?: Record<string, string>;
     addRepoBranchTemplates?: Record<string, string>;
-    addRepoCheckCommands?: Record<string, CheckCommand[]>;
   },
 ): Promise<Task> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {

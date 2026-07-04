@@ -9,7 +9,7 @@
  *
  * 设计原则：
  * - **保守黑名单**——只拦「prompt 已明令禁止 + 误伤面可控」的命令、宁放过不误杀
- *   （误杀会卡住正常 action 流、比放过的代价更大；放过还有 CheckRun mutatedWorktree 兜底）
+ *   （误杀会卡住正常 action 流、比放过的代价更大）
  * - **deny 不终结 Run**——hook 返回 deny 后 agent 收到 agent_message、换只读命令重试即可
  * - 规则全部带 reason、deny 时写进 task 事件流（可观测、可审计）
  */
@@ -54,7 +54,7 @@ export const SHELL_GUARD_RULES: GuardRule[] = [
     name: "git-reset-hard",
     pattern: /git(\s+-C\s+\S+)?\s+reset\s+(.*\s)?--hard(\s|$)/,
     reason:
-      "禁 git reset --hard（会丢弃工作区 / 本地提交、破坏 build 增量与 CheckRun 指纹）。",
+      "禁 git reset --hard（会丢弃工作区 / 本地提交、破坏 build 增量）。",
   },
   {
     name: "git-rebase",

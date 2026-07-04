@@ -44,6 +44,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   branchTemplate: DEFAULT_BRANCH_TEMPLATE,
   disabledMcpServers: [],
   actionLayout: { order: [], hidden: [] },
+  reuseAgentDefault: false,
 };
 
 const isBrowser = (): boolean =>
@@ -106,6 +107,8 @@ const normalizeSettings = (
       : [],
     // V0.9：推进面板布局偏好、坏值 / 缺省回退空（= 全显示、默认顺序）
     actionLayout: normalizeActionLayout(parsed.actionLayout),
+    // v0.9.11：推进 dialog「续用当前 Agent」默认勾选、缺省 / 坏值回退 false（每 action 新 agent）
+    reuseAgentDefault: parsed.reuseAgentDefault === true,
   };
 };
 

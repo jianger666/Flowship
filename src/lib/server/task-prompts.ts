@@ -25,7 +25,11 @@ import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
 } from "@/lib/path-utils";
-import { renderSkillsForPrompt, type SkillEntry } from "./skills-loader";
+import {
+  listAvailableSkillNames,
+  renderSkillsForPrompt,
+  type SkillEntry,
+} from "./skills-loader";
 import { readGlobalCursorRulesForPrompt } from "./cursor-config";
 import { getCustomAction } from "./custom-action-fs";
 import type {
@@ -119,7 +123,7 @@ export const loadActionPrompt = async (
   };
   // 自定义 action：playbook 来自用户定义（dataRoot/custom-actions）、不走 prompts/action-*.md
   if (action.type === "custom") {
-    return loadCustomActionPlaybook(action, vars);
+    return loadCustomActionPlaybook(action, task, vars);
   }
   const tpl = await loadFileSafe(ACTION_PROMPT_FILE[action.type]);
   return fillTemplate(tpl, vars);
@@ -129,6 +133,7 @@ export const loadActionPrompt = async (
 // 全量 skill 已在 super prompt 的可用 skills 段、这里只是高亮、agent 按需 read 完整 SKILL.md。
 const loadCustomActionPlaybook = async (
   action: ActionRecord,
+  task: Task,
   vars: Record<string, string | undefined>,
 ): Promise<string> => {
   const def = action.customActionId
@@ -141,12 +146,19 @@ const loadCustomActionPlaybook = async (
   }
   const parts = [fillTemplate(def.playbook, vars)];
   if (def.skills && def.skills.length > 0) {
-    parts.push(
-      "",
-      "## 本 action 重点使用以下 skill",
-      "（详情见上方可用 skills 段、按场景用 `read` 读完整 SKILL.md）：",
-      ...def.skills.map((s) => `- ${s}`),
-    );
+    // v0.9.14 skill 缺失兜底：定义可能是别人导出的、引用了对方个人 skill——
+    // 本机（平台 + 全局 + 绑定仓 repo 层）不存在的名字静默滤掉、不进 prompt、
+    // agent 不会拿着悬空引用去文件系统瞎找 / 脑补。UI 侧另有灰 chip 提示用户。
+    const available = await listAvailableSkillNames(task.repoPaths ?? []);
+    const usable = def.skills.filter((s) => available.has(s));
+    if (usable.length > 0) {
+      parts.push(
+        "",
+        "## 本 action 重点使用以下 skill",
+        "（详情见上方可用 skills 段、按场景用 `read` 读完整 SKILL.md）：",
+        ...usable.map((s) => `- ${s}`),
+      );
+    }
   }
   return parts.join("\n");
 };

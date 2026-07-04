@@ -12,15 +12,14 @@
 一句话：**「飞书 story → 多仓 MR」的核心闭环 + Harness 加固 + 桌面端发版链、都已上线并在日常使用。**
 
 - **Action 体系全实装**：`plan / build / review / ship / dev（联调）/ learn / custom（自定义）`——任意触发不强制顺序、每步落 md artifact、action 间 HITL ack（test 已删、见「四、止损」）
-- **6 harness 门槛（缺门槛 5）**：前置准入 / 后置 deterministic check / 默认推断 / anti-patterns prompt / placeholder 动态；**门槛 5（cross-action 一致性自检）仍未做**、见「二、未来候选」
-- **Build 后置 CheckRun**：per-repo typecheck/lint/test + 工作区污染检测 + 命令自动检测 + ship 指纹门禁 + override
+- **6 harness 门槛（缺门槛 5）**：前置准入 / 后置 deterministic check / 默认选中 / anti-patterns prompt / placeholder 动态；**门槛 5（cross-action 一致性自检）仍未做**、见「二、未来候选」
 - **Shell 命令硬拦截**：beforeShellExecution hook + 黑名单策略引擎（确定性、非 prompt 软约束）
 - **GitLab REST 集成**：多仓 MR + 同分支累计 commit + 冲突门禁 + 飞书 @ 测试人员（A+C 策略）
 - **大需求分批 build** + 自适应 TDD 策略（每批 tdd/after/none、无测试设施自动退化）
 - **Agent 生命周期**：每 action 默认新 agent（context 隔离）+ shell/curl long-poll 保活
 - **配置双向绑定 Cursor**：消费 `~/.cursor` + repo `.cursor` 的 mcp/rules/skills/hooks（fe 只读不写、附录 A）
 - **MCP OAuth**：走 OAuth 的远程 MCP 授权 + 注入
-- **自定义 Action + 推进面板布局可配**：skill/playbook/check 封装成 action、拖拽排序 + 显隐混排
+- **自定义 Action + 推进面板布局可配**：skill/playbook 封装成 action、拖拽排序 + 显隐混排
 - **应用外壳 + 侧栏任务导航** + light/dark 三态主题
 - **Electron 桌面端唯一发版链**：薄壳 + 打包 + 自更新（win/mac UX 对齐）
 - **learn 知识沉淀「先问后落」**：AI 提炼候选 → 逐条 ask_user → 只落用户批准的
@@ -61,7 +60,8 @@
 
 | 不做的事 | 为什么 |
 |---|---|
-| **test action / 自动跑单测 · e2e**（v0.8.25 已删）| 公司项目普遍无单测 / e2e 基础设施、强行做 ROI 低（补测又被判无意义、TDD 落不了地）。质量验证最终定型 = **review（静态读代码）+ build CheckRun（typecheck/lint 确定性门禁）+ 人工验收兜底**。GStack 式浏览器黑盒 QA（不依赖单测）曾评估、但需接 playwright MCP + 维护成本、**暂不启动**。build 侧自适应 TDD 批次策略是唯一保留的 Superpowers 借鉴点（附录 B） |
+| **test action / 自动跑单测 · e2e**（v0.8.25 已删）| 公司项目普遍无单测 / e2e 基础设施、强行做 ROI 低（补测又被判无意义、TDD 落不了地）。质量验证最终定型 = **review（静态读代码）+ build agent 增量自查（v0.9.13 起系统级 CheckRun 也删、见下条）+ 人工验收兜底**。GStack 式浏览器黑盒 QA（不依赖单测）曾评估、但需接 playwright MCP + 维护成本、**暂不启动**。build 侧自适应 TDD 批次策略是唯一保留的 Superpowers 借鉴点（附录 B） |
+| **系统级跑项目命令的 CheckRun**（V0.6.25 建、v0.9.13 已删）| 全仓 typecheck/lint 问的是「项目绿不绿」、存量项目基线本来就红——agent 只改两文件也永远红、红色失去信息量、ship 每次都要 override。质量校验改由 build agent **增量**自查（改哪查哪）+ review 人审；后置 check 只保「交付诚实性」（artifact / 指纹 / MR 验真）。细节见 HANDOFF「后置 check 的边界」段 |
 | 真·multi-agent 协作（PM/Dev/QA 谈判式、如 BMAD） | Cognition 警告、共识盲点、debug 灾难。注：单 task 多 action 链是合法的、跟这条不冲突 |
 | AI 自审 review bot（纯 LLM 看 LLM 写的代码判对错） | 共识盲点 + 性价比低。**注**：V0.6 review action ≠ 这条——前者拿 git diff × plan artifact × build artifact 做结构化差值、用确定性产物、不是 LLM 判断对错、本质是 harness 增量 |
 | 跨 AI 厂商路由（LiteLLM） | 没必要、增加复杂度、Cursor SDK 已覆盖主流模型 |

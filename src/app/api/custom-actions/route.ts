@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions
  *   GET  → 自定义 action 列表
- *   POST → 新建（body: { label, playbook, summary?, skills?, checkCommands?, freshAgent? }）
+ *   POST → 新建（body: { label, playbook, summary?, skills?, freshAgent?, placeholder? }）
  *
  * 定义存 dataRoot()/custom-actions/<id>.md、CRUD 归 custom-action-fs.ts、route 只做 IO + 校验。
  */
@@ -10,7 +10,6 @@ import { NextResponse } from "next/server";
 import {
   createCustomAction,
   listCustomActions,
-  sanitizeCheckCommands,
   sanitizeSkills,
 } from "@/lib/server/custom-action-fs";
 
@@ -41,9 +40,11 @@ export const POST = async (req: Request) => {
       playbook: body.playbook,
       summary: isNonEmptyString(body.summary) ? body.summary : undefined,
       skills: sanitizeSkills(body.skills),
-      checkCommands: sanitizeCheckCommands(body.checkCommands),
       freshAgent:
         typeof body.freshAgent === "boolean" ? body.freshAgent : undefined,
+      placeholder: isNonEmptyString(body.placeholder)
+        ? body.placeholder
+        : undefined,
     });
     return NextResponse.json({ action }, { status: 201 });
   } catch (err) {

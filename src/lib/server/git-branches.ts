@@ -11,7 +11,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import type { GitBranchState } from "../types";
+import type { GitBranchState, RepoBranchList } from "../types";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,6 +48,52 @@ export const readGitBranchState = async (
       branches,
     };
   } catch {
+    return empty;
+  }
+};
+
+/**
+ * 列某仓的分支候选：本地 + 远端合并去重（v0.9.11、设置页分支下拉 / 任务 dialog「已有工作分支」用）。
+ *
+ * 跟 readGitBranchState 的区别：线上 / test / develop 这类长期分支本地常常没 checkout 过、
+ * 只列本地分支会缺——所以一并列 refs/remotes、去掉 remote 名前缀后合并。
+ * 不主动 git fetch（慢 + 可能要凭据）、用本地已知的 refs；列表缺分支时前端 Combobox 支持手填兜底。
+ */
+export const listRepoBranches = async (dir: string): Promise<RepoBranchList> => {
+  const empty: RepoBranchList = { isRepo: false, branches: [] };
+  if (!dir) return empty;
+  try {
+    // 一条命令混列本地 + 远端、按最近提交倒序（活跃分支排前面、两类场景都顺手）
+    const { stdout } = await execFileAsync(
+      "git",
+      [
+        "for-each-ref",
+        "refs/heads",
+        "refs/remotes",
+        "--format=%(refname)",
+        "--sort=-committerdate",
+      ],
+      { cwd: dir, timeout: 10_000 },
+    );
+    const seen = new Set<string>();
+    for (const line of stdout.split("\n")) {
+      const ref = line.trim();
+      if (!ref) continue;
+      let name: string | null = null;
+      if (ref.startsWith("refs/heads/")) {
+        name = ref.slice("refs/heads/".length);
+      } else if (ref.startsWith("refs/remotes/")) {
+        // refs/remotes/<remote>/<branch>：去掉 remote 段；origin/HEAD 是符号引用、跳过
+        const rest = ref.slice("refs/remotes/".length);
+        const idx = rest.indexOf("/");
+        name = idx >= 0 ? rest.slice(idx + 1) : null;
+        if (name === "HEAD") name = null;
+      }
+      if (name) seen.add(name);
+    }
+    return { isRepo: true, branches: [...seen] };
+  } catch {
+    // 非 git 仓 / 路径不存在 / git 命令失败一律降级为「非 git」、前端据此禁用分支选择
     return empty;
   }
 };

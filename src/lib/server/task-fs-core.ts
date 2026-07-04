@@ -18,7 +18,6 @@ import path from "node:path";
 import type {
   ActionRecord,
   ActionType,
-  CheckCommand,
   GitBranchInfo,
   MRRecord,
   ModelSelection,
@@ -110,23 +109,6 @@ export const getActionArtifactPath = (
   type: ActionType,
 ): string => path.join(getActionsDir(taskId), actionArtifactFilename(n, type));
 
-/**
- * V0.6.25 CheckRun：单仓 check 完整日志的文件路径
- * - 落 actions/.checks/<actionId>/<slug>.log（.checks 隐藏目录、不混进 artifact 列表）
- * - 返绝对路径（写文件用）+ 相对路径（存进 CheckRepoResult.logPath、UI 按需读、防路径穿越）
- * - slug 由调用方保证唯一（如 `<idx>-<repo 末段>`、防多仓末段同名互相覆盖）
- */
-export const getCheckLogPaths = (
-  taskId: string,
-  actionId: string,
-  slug: string,
-): { absPath: string; relPath: string } => {
-  const safeAction = actionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const safeSlug = slug.replace(/[^a-zA-Z0-9_.-]/g, "_");
-  const relPath = `${ACTIONS_DIR}/.checks/${safeAction}/${safeSlug}.log`;
-  return { absPath: path.join(taskDir(taskId), relPath), relPath };
-};
-
 // ----------------- 基础 fs helper -----------------
 
 export const ensureDataDir = async (): Promise<void> => {
@@ -179,8 +161,6 @@ export interface TaskMetaV06 {
   repoDevBranches?: Record<string, string>;
   /** V0.6.7：per-repo 有效命名模板快照（build 渲染分支名用） */
   repoBranchTemplates?: Record<string, string>;
-  /** V0.6.25：per-repo check 命令快照（build 后 runner 跑、详见 types.ts Task.repoCheckCommands） */
-  repoCheckCommands?: Record<string, CheckCommand[]>;
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
@@ -415,7 +395,6 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     repoTestBranches: meta.repoTestBranches,
     repoDevBranches: meta.repoDevBranches,
     repoBranchTemplates: meta.repoBranchTemplates,
-    repoCheckCommands: meta.repoCheckCommands,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,

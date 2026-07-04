@@ -1,22 +1,20 @@
 /**
- * Action 准入门槛 + ship 门禁 + build 分支规划（V0.9.x 从 task-runner.ts 拆出、纯搬家零逻辑变更）
+ * Action 准入门槛 + ship 预检 + build 分支规划（V0.9.x 从 task-runner.ts 拆出、纯搬家零逻辑变更）
  *
  * 职责（推进前的「能不能推」判定、全是纯函数 / 只读 git）：
  *   - checkActionPrerequisites：action 类型准入（门槛 1、技术必需类校验）
- *   - checkShipCheckGate / getShipPrecheck：ship 前 CheckRun 门禁（V0.6.25、可 override 但留痕）
+ *   - getShipPrecheck：ship 前流程提醒（v0.9.13 CheckRun 门禁删除后只剩 reviewMissing、非阻断）
  *   - planBranchesForBuild：build 首动作的分支规划 + idempotent checkout hint
  *
- * 依赖方向（保证无环）：只依赖 action-checks / branch-template / types、不 import task-runner。
+ * 依赖方向（保证无环）：只依赖 branch-template / types、不 import task-runner。
  */
 
-import { computeWorktreeFingerprint } from "./action-checks";
 import {
   DEFAULT_BRANCH_TEMPLATE,
   renderBranchName,
 } from "@/lib/branch-template";
 import type {
   ActionType,
-  CheckOverride,
   GitBranchInfo,
   ShipPrecheck,
   Task,
@@ -112,98 +110,19 @@ export const checkActionPrerequisites = (
 };
 
 /**
- * V0.6.25 ship gate：最新 build 的 CheckRun 没过 / 没配 / 没运行时、要求 per-ship override（风险接受、不是偏好）
+ * ship 前置预检（GET /api/tasks/[id]/ship-precheck 调）
  *
- * - 只看「最新一个 completed build」的 checkRun（ship 提的就是它的产出）
- * - checkRun.status === passed **且各仓工作区指纹没变** → 直接放行
- * - 工作区指纹比对（V0.6.25 review）：check 后又改工作区 → 指纹不一致、即使 passed 也要 override（防「曾经检查过」≠「当前要 ship 的内容检查过」）
- * - failed / not_configured / 没 checkRun（老 build / 异常）→ 必须带 override、且：
- *   · override.buildActionId 等于这个 build（重 build = 新 build action id、旧 override 自动失效）
- *   · checkRun 存在时 override.checkRunId 也要等于它（双保险：同 build 重跑过 check 也失效）
- *   · override.reason 非空（审计：为什么明知没过还提测）
- * - HITL 底线：这道门永远能被 override 越过、但必须留痕。
- */
-export const checkShipCheckGate = async (
-  task: Task,
-  override?: CheckOverride,
-): Promise<{ ok: true } | { ok: false; reason: string }> => {
-  const lastBuild = task.actions
-    .slice()
-    .reverse()
-    .find((a) => a.type === "build" && a.status === "completed");
-  // 没 completed build 的情况由 checkActionPrerequisites 先拦、这里兜底放行
-  if (!lastBuild) return { ok: true };
-
-  const cr = lastBuild.checkRun;
-  let worktreeChanged = false;
-  if (cr) {
-    for (const repo of cr.repos) {
-      if (!repo.worktreeFingerprint) continue;
-      const current = await computeWorktreeFingerprint(repo.repoPath);
-      if (current && current !== repo.worktreeFingerprint) {
-        worktreeChanged = true;
-        break;
-      }
-    }
-  }
-  if (cr && cr.status === "passed" && !worktreeChanged) return { ok: true };
-
-  const why = worktreeChanged
-    ? "检查通过后工作区又被改动（建议重新 build 检查、或确认风险后强制提测）"
-    : !cr
-      ? "未运行检查"
-      : cr.status === "failed"
-        ? "检查未通过"
-        : cr.status === "not_configured"
-          ? "有改动的仓没配检查命令"
-          : "检查未通过";
-  if (!override) {
-    return {
-      ok: false,
-      reason: `最新 build 的${why}、ship 被拦。如确认无碍、请在提测 dialog 勾「仍继续提测」并填写原因。`,
-    };
-  }
-  if (override.buildActionId !== lastBuild.id) {
-    return {
-      ok: false,
-      reason:
-        "提测确认已失效（绑定的不是最新 build、可能你又 build 过）、请重新勾选确认。",
-    };
-  }
-  if (cr && override.checkRunId !== cr.id) {
-    return {
-      ok: false,
-      reason: "提测确认已失效（检查已重跑）、请重新勾选确认。",
-    };
-  }
-  if (!override.reason.trim()) {
-    return { ok: false, reason: "提测确认必须填写原因。" };
-  }
-  return { ok: true };
-};
-
-/**
- * V0.6.25 review：ship 前置预检（GET /api/tasks/[id]/ship-precheck 调）
- *
- * 复用 checkShipCheckGate（不带 override）跑一遍、把结论给 client 展示 override 区。
- * gate 逻辑单一源在此、client 不自己用 checkRun.status 猜。⚠ 仅展示、/advance 仍会重算 gate。
+ * v0.9.13：CheckRun ship 门禁（override 留痕那套）随 CheckRun 一起删除、
+ * 只剩「最新 build 后没 review 过」的非阻断流程提醒。
  */
 export const getShipPrecheck = async (task: Task): Promise<ShipPrecheck> => {
   const lastBuild = task.actions
     .slice()
     .reverse()
     .find((a) => a.type === "build" && a.status === "completed");
-  // 没 completed build：ship 准入会被 checkActionPrerequisites 拦、这里不涉及 override
   if (!lastBuild) {
-    return {
-      needsOverride: false,
-      reason: "",
-      buildActionId: null,
-      checkRunId: null,
-      reviewMissing: false,
-    };
+    return { reviewMissing: false };
   }
-  const gate = await checkShipCheckGate(task);
   // V0.6.27 F3：最新 build 之后有没有 completed review——没有就提醒（非阻断、HITL 用户可跳过）。
   // 按 startedAt 比：action 串行、review 启动晚于 build 启动即必然 review 的是这轮 build 后的代码。
   const reviewMissing = !task.actions.some(
@@ -213,13 +132,7 @@ export const getShipPrecheck = async (task: Task): Promise<ShipPrecheck> => {
       !a.excluded &&
       a.startedAt > lastBuild.startedAt,
   );
-  return {
-    needsOverride: !gate.ok,
-    reason: gate.ok ? "" : gate.reason,
-    buildActionId: lastBuild.id,
-    checkRunId: lastBuild.checkRun?.id ?? null,
-    reviewMissing,
-  };
+  return { reviewMissing };
 };
 
 // ----------------- branch checkout 挂接（build action 第一次跑前）-----------------

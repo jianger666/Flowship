@@ -38,7 +38,7 @@ import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
-import { ShortcutCard } from "@/components/settings/shortcut-card";
+import { PreferenceCard } from "@/components/settings/preference-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 
 const SettingsPage = () => {
@@ -136,9 +136,11 @@ const SettingsPage = () => {
         onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
       />
 
-      <ShortcutCard
+      <PreferenceCard
         submitShortcut={settings.submitShortcut ?? "mod-enter"}
+        reuseAgentDefault={settings.reuseAgentDefault ?? false}
         onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
+        onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
       />
 
       <GitCard

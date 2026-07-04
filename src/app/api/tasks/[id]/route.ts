@@ -24,7 +24,7 @@ import {
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import { cancelChatRun } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
-import type { CheckCommand, ModelSelection, TaskRole } from "@/lib/types";
+import type { ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -64,7 +64,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       addRepoTestBranches?: Record<string, string>;
       addRepoDevBranches?: Record<string, string>;
       addRepoBranchTemplates?: Record<string, string>;
-      addRepoCheckCommands?: Record<string, CheckCommand[]>;
     };
 
     if (typeof body.pinned === "boolean") {
@@ -194,7 +193,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
         addRepoTestBranches: body.addRepoTestBranches,
         addRepoDevBranches: body.addRepoDevBranches,
         addRepoBranchTemplates: body.addRepoBranchTemplates,
-        addRepoCheckCommands: body.addRepoCheckCommands,
       });
       if (!task)
         return NextResponse.json({ error: "not_found" }, { status: 404 });

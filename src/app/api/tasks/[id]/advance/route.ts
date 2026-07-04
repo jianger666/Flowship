@@ -51,7 +51,6 @@ import { getCustomAction } from "@/lib/server/custom-action-fs";
 import {
   ACTION_TYPES,
   type ActionType,
-  type CheckOverride,
   type DevPushMode,
   type ReplanMode,
 } from "@/lib/types";
@@ -81,9 +80,6 @@ interface PostBody {
   devPushMode?: string;
   // V0.8.x plan action 用：重跑方案时的批次合并语义
   replanMode?: string;
-  // V0.6.25 ship action 用：CheckRun gate override（最新 build check 没过/没配时、用户勾「仍继续」+ reason）
-  // 结构由 parseCheckOverride narrow、server 端 checkShipCheckGate 再校验绑定有效性
-  checkOverride?: unknown;
   // V0.x A 方案：client 随推进带来的设置页最新分支配置（per-repo）、server 据此刷新 task 分支快照
   repoBaseBranches?: Record<string, string>;
   repoTestBranches?: Record<string, string>;
@@ -115,25 +111,6 @@ const sanitizeRepoBranchMap = (
     if (typeof val === "string" && val.trim()) out[k] = val.trim();
   }
   return Object.keys(out).length > 0 ? out : undefined;
-};
-
-// V0.6.25：把 client 传的 checkOverride narrow 成 CheckOverride（语义有效性交给 server gate 校验）
-const parseCheckOverride = (raw: unknown): CheckOverride | undefined => {
-  if (!raw || typeof raw !== "object") return undefined;
-  const o = raw as Record<string, unknown>;
-  if (
-    typeof o.buildActionId !== "string" ||
-    typeof o.checkRunId !== "string" ||
-    typeof o.reason !== "string"
-  ) {
-    return undefined;
-  }
-  return {
-    checkRunId: o.checkRunId,
-    buildActionId: o.buildActionId,
-    reason: o.reason,
-    createdAt: typeof o.createdAt === "number" ? o.createdAt : Date.now(),
-  };
 };
 
 export const runtime = "nodejs";
@@ -273,8 +250,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
         actionType === "dev"
           ? (parseDevPushMode(body.devPushMode) ?? "direct")
           : undefined,
-      // V0.6.25：ship gate override（仅 ship 有意义、server checkShipCheckGate 校验绑定有效性）
-      checkOverride: parseCheckOverride(body.checkOverride),
       // V0.x A 方案：client 带来的设置页最新分支配置、server 据此刷新 task 分支快照（设置页改了下次推进生效）
       repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
       repoTestBranches: sanitizeRepoBranchMap(body.repoTestBranches),

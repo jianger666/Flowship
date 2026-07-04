@@ -93,7 +93,6 @@ import { getEffectiveCwd, getRepoShortNames } from "@/lib/path-utils";
 import type {
   ActionRecord,
   ActionType,
-  CheckOverride,
   DevPushMode,
   ModelSelection,
   Task,
@@ -410,8 +409,6 @@ const TaskDetailPage = () => {
     devPushMode?: DevPushMode;
     // V0.8.x：plan 重跑时的批次合并语义（追加补充 / 重建后续）
     replanMode?: "append" | "rebuild";
-    // V0.6.25：ship gate override（advance-dialog 仅 ship 且最新 build 的 check 没过时给值）
-    checkOverride?: CheckOverride;
     // V0.9：自定义 action 指向的定义 id（advance-dialog 仅 custom 时给值）
     customActionId?: string;
   }) => {
@@ -466,8 +463,6 @@ const TaskDetailPage = () => {
           devPushMode: input.devPushMode,
           // V0.8.x plan action：重跑方案时的批次合并语义
           replanMode: input.replanMode,
-          // V0.6.25 ship action：CheckRun gate override（仅 ship 且最新 build 的 check 没过时有值）
-          checkOverride: input.checkOverride,
           // V0.9 custom action：指向的定义 id（仅 custom 时有值）
           customActionId: input.customActionId,
           // V0.x A 方案：设置页最新分支配置（server 据此刷新 task 分支快照、设置页改了下次推进生效）

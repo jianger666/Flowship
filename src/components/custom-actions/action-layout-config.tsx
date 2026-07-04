@@ -5,7 +5,8 @@
  *
  * 内置 + 自定义混排成一个列表：拖拽调「推进」里的顺序（framer-motion Reorder）+ 开关控显隐、
  * 自定义项带扳手角标、且额外给「编辑 / 删除」入口（内置不可改不可删）。
- * 隐藏的在「推进」弹窗收进「更多」。顺序 / 显隐偏好落 config.json（settings.actionLayout）、个人级、全任务生效。
+ * 隐藏的在「推进」弹窗直接不出现（v0.9.12 删「更多」折叠区、本页开关是唯一恢复入口）。
+ * 顺序 / 显隐偏好落 config.json（settings.actionLayout）、个人级、全任务生效。
  * 拖拽：onReorder 只更新本地态、松手（onDragEnd）才落盘——避免拖动过程狂发 config.json 写请求。
  */
 
@@ -30,7 +31,9 @@ import { cn } from "@/lib/utils";
 interface Props {
   // 当前自定义 action 列表（由 /actions 页加载后传入、增删后自动反映）
   customActions: CustomActionDef[];
-  // 自定义 action 行的编辑 / 删除（内置行不展示这两个按钮）
+  // 本机可用 skill 名集合（/actions 页拉一次传入；null = 未拉到、不判定缺失防误报）
+  knownSkills: Set<string> | null;
+  // 自定义 action 行的编辑 / 删除（内置行不展示这些按钮；导出走页面顶部批量入口、不做行内单导）
   onEdit: (def: CustomActionDef) => void;
   onDelete: (def: CustomActionDef) => void;
 }
@@ -40,6 +43,8 @@ interface RowProps {
   label: string;
   isCustom: boolean;
   isHidden: boolean;
+  // 自定义 action 引用的 skill（缺失的灰显、提示推进时跳过）
+  skills?: { name: string; missing: boolean }[];
   onToggleHidden: (visible: boolean) => void;
   onDragEnd: () => void;
   // 仅自定义 action 传——内置 action 不可编辑 / 删除
@@ -47,12 +52,13 @@ interface RowProps {
   onDelete?: () => void;
 }
 
-// 单行：拖拽手柄 + 名称（自定义带扳手角标）+ [自定义]编辑 / 删除 + 显隐开关
+// 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill chips）+ [自定义]编辑 / 删除 + 显隐开关
 const LayoutRow = ({
   value,
   label,
   isCustom,
   isHidden,
+  skills,
   onToggleHidden,
   onDragEnd,
   onEdit,
@@ -78,7 +84,7 @@ const LayoutRow = ({
       </button>
       <span
         className={cn(
-          "flex flex-1 items-center gap-1.5 truncate text-sm",
+          "flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-sm",
           isHidden && "text-muted-foreground line-through",
         )}
       >
@@ -88,10 +94,26 @@ const LayoutRow = ({
             <Wrench className="size-3 shrink-0 text-muted-foreground" />
           </Tooltip>
         )}
+        {/* 引用的 skill chips：缺失的灰显划线（本机未找到、推进时自动跳过） */}
+        {skills?.map((s) => (
+          <Tooltip
+            key={s.name}
+            content={s.missing ? "本机未找到、推进时自动跳过" : "引用的 skill"}
+          >
+            <span
+              className={cn(
+                "shrink-0 rounded border px-1 py-px font-mono text-[10px] text-muted-foreground",
+                s.missing && "border-dashed line-through opacity-60",
+              )}
+            >
+              {s.name}
+            </span>
+          </Tooltip>
+        ))}
       </span>
       {isHidden && (
         <span className="shrink-0 text-[10px] text-muted-foreground">
-          收进「更多」
+          已隐藏
         </span>
       )}
       {/* 编辑 / 删除仅自定义行有——内置 action 不可改不可删 */}
@@ -112,6 +134,7 @@ const LayoutRow = ({
 
 export const ActionLayoutConfig = ({
   customActions,
+  knownSkills,
   onEdit,
   onDelete,
 }: Props) => {
@@ -180,6 +203,11 @@ export const ActionLayoutConfig = ({
             }
             isCustom={!isBuiltinAdvanceAction(key)}
             isHidden={hiddenSet.has(key)}
+            // skill 存在性判定：knownSkills 没拉到（null）时不标缺失、避免加载中误报
+            skills={def?.skills?.map((name) => ({
+              name,
+              missing: knownSkills !== null && !knownSkills.has(name),
+            }))}
             onToggleHidden={(visible) => toggleHidden(key, visible)}
             onDragEnd={handleDragEnd}
             onEdit={def ? () => onEdit(def) : undefined}

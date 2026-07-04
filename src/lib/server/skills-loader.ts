@@ -181,6 +181,26 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
 };
 
 /**
+ * 本机「可用 skill 名字」全集：loadSkills（平台 + 全局）∪ 各绑定仓的 `.cursor/skills/`。
+ *
+ * 给自定义 action 的 skills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
+ * 定义文件可能是别人导出的、引用了对方个人 skill——渲染 playbook 前按这个集合
+ * 静默过滤、agent 不会拿到「点了名却查无此人」的引用去瞎找。
+ * repo 层也要算进来：SDK settingSources 会加载它们、agent 实际用得上、不能误杀。
+ */
+export const listAvailableSkillNames = async (
+  repoPaths: string[],
+): Promise<Set<string>> => {
+  const names = new Set<string>();
+  for (const s of await loadSkills()) names.add(s.name);
+  for (const repo of repoPaths) {
+    const entries = await scanSkillsDir(path.join(repo, ".cursor", "skills"));
+    for (const s of entries) names.add(s.name);
+  }
+  return names;
+};
+
+/**
  * 把 skills 渲染成 prompt 末尾的 [AVAILABLE_SKILLS] 段
  *
  * 每个 skill 占 3 行：

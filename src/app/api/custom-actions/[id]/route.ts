@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions/[id]
  *   GET    → 单个自定义 action
- *   PATCH  → 更新（部分字段：label / summary / playbook / skills / checkCommands / freshAgent）
+ *   PATCH  → 更新（部分字段：label / summary / playbook / skills / freshAgent / placeholder）
  *   DELETE → 删除
  *
  * Next.js 15 的 dynamic route params 是 Promise、要 await。
@@ -11,7 +11,6 @@ import { NextResponse } from "next/server";
 import {
   getCustomAction,
   removeCustomAction,
-  sanitizeCheckCommands,
   sanitizeSkills,
   updateCustomAction,
   type CustomActionInput,
@@ -65,12 +64,14 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     if ("skills" in body) {
       patch.skills = sanitizeSkills(body.skills);
     }
-    if ("checkCommands" in body) {
-      patch.checkCommands = sanitizeCheckCommands(body.checkCommands);
-    }
     if ("freshAgent" in body) {
       patch.freshAgent =
         typeof body.freshAgent === "boolean" ? body.freshAgent : undefined;
+    }
+    if ("placeholder" in body) {
+      // 空字符串 = 清空（updateCustomAction 内 trim 后归 undefined）
+      patch.placeholder =
+        typeof body.placeholder === "string" ? body.placeholder : "";
     }
 
     const action = await updateCustomAction(id, patch);

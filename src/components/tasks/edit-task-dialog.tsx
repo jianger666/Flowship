@@ -27,6 +27,7 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -45,12 +46,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
 import {
   TASK_ROLE_LABEL,
-  type CheckCommand,
   type RepoConfig,
   type Task,
   type TaskRole,
@@ -118,6 +119,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     [settingsRepos, task.repoPaths],
   );
 
+  // v0.9.11：分支候选（已绑仓 + 本次追加仓、「已有工作分支」Combobox 用）
+  const branchMap = useRepoBranches([...task.repoPaths, ...addRepos]);
+
   const canSubmit = title.trim().length > 0 && !submitting;
 
   const handleSubmit = async () => {
@@ -137,7 +141,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
       const addRepoTestBranches: Record<string, string> = {};
       const addRepoDevBranches: Record<string, string> = {};
       const addRepoBranchTemplates: Record<string, string> = {};
-      const addRepoCheckCommands: Record<string, CheckCommand[]> = {};
       for (const p of addRepos) {
         const repo = settingsRepos.find((r) => r.path === p);
         const online = repo?.onlineBranch?.trim();
@@ -150,8 +153,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
           repo?.branchTemplate,
           settings.branchTemplate,
         );
-        const cmds = repo?.checkCommands;
-        if (cmds && cmds.length > 0) addRepoCheckCommands[p] = cmds;
       }
 
       const updated = await updateTaskFields(task.id, {
@@ -167,7 +168,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               addRepoTestBranches,
               addRepoDevBranches,
               addRepoBranchTemplates,
-              addRepoCheckCommands,
             }
           : {}),
       });
@@ -288,32 +288,40 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             </div>
           )}
 
-          {/* 已有工作分支：per-repo（已绑仓 + 本次追加仓） */}
+          {/* 已有工作分支：per-repo（已绑仓 + 本次追加仓）。
+              v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用 */}
           {task.repoPaths.length + addRepos.length > 0 && (
             <div className="grid gap-1.5">
               <Label>已有工作分支（选填）</Label>
               <div className="grid gap-2">
-                {[...task.repoPaths, ...addRepos].map((p) => (
-                  <div key={p} className="flex items-center gap-2">
-                    <span
-                      className="w-28 shrink-0 truncate text-sm text-muted-foreground"
-                      title={repoNameOf(p)}
-                    >
-                      {repoNameOf(p)}
-                    </span>
-                    <Input
-                      value={featureBranches[p] ?? ""}
-                      onChange={(e) =>
-                        setFeatureBranches((prev) => ({
-                          ...prev,
-                          [p]: e.target.value,
-                        }))
-                      }
-                      placeholder="留空自动建 feature/…"
-                      className="min-w-0 flex-1"
-                    />
-                  </div>
-                ))}
+                {[...task.repoPaths, ...addRepos].map((p) => {
+                  const entry = branchMap[p];
+                  return (
+                    <div key={p} className="flex items-center gap-2">
+                      <span
+                        className="w-28 shrink-0 truncate text-sm text-muted-foreground"
+                        title={repoNameOf(p)}
+                      >
+                        {repoNameOf(p)}
+                      </span>
+                      <Combobox
+                        value={featureBranches[p] ?? ""}
+                        onValueChange={(v) =>
+                          setFeatureBranches((prev) => ({ ...prev, [p]: v }))
+                        }
+                        options={entry?.branches ?? []}
+                        loading={!entry}
+                        disabled={!entry?.isRepo}
+                        placeholder={
+                          entry?.isRepo === false
+                            ? "非 git 仓库"
+                            : "留空自动建 feature/…"
+                        }
+                        className="min-w-0 flex-1"
+                      />
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

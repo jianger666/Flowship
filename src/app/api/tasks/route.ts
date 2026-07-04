@@ -15,12 +15,7 @@
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
-import type {
-  CheckCommand,
-  NewTaskInput,
-  TaskMode,
-  TaskRole,
-} from "@/lib/types";
+import type { NewTaskInput, TaskMode, TaskRole } from "@/lib/types";
 
 const isNonEmptyString = (v: unknown): v is string =>
   typeof v === "string" && v.trim().length > 0;
@@ -49,27 +44,6 @@ const sanitizeRepoBranchMap = (
   const out: Record<string, string> = {};
   for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
     if (typeof val === "string" && val.trim()) out[k] = val.trim();
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
-};
-
-// V0.6.25：per-repo check 命令 map 粗清洗（只收 plain object + value 是含 name/cmd 的对象数组）
-// 细清洗（trim / 限定 repoPaths / required 缺省）交给 task-fs.createTask
-const sanitizeRepoCheckCommands = (
-  v: unknown,
-): Record<string, CheckCommand[]> | undefined => {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
-  const out: Record<string, CheckCommand[]> = {};
-  for (const [repo, cmds] of Object.entries(v as Record<string, unknown>)) {
-    if (!Array.isArray(cmds)) continue;
-    const cleaned = cmds.filter(
-      (c): c is CheckCommand =>
-        !!c &&
-        typeof c === "object" &&
-        typeof (c as CheckCommand).name === "string" &&
-        typeof (c as CheckCommand).cmd === "string",
-    );
-    if (cleaned.length > 0) out[repo] = cleaned;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 };
@@ -132,8 +106,6 @@ export const POST = async (req: Request) => {
       repoTestBranches: sanitizeRepoBranchMap(body.repoTestBranches),
       repoDevBranches: sanitizeRepoBranchMap(body.repoDevBranches),
       repoBranchTemplates: sanitizeRepoBranchMap(body.repoBranchTemplates),
-      // V0.6.25 CheckRun：per-repo 校验命令快照
-      repoCheckCommands: sanitizeRepoCheckCommands(body.repoCheckCommands),
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
         : undefined,

@@ -21,7 +21,7 @@
  * 其余切面拆到同目录四个模块（依赖方向单向、无环）：
  *   - task-stream.ts：流事件协议 + publish/subscribe + 进程全局状态 + writeEventAndPublish
  *   - task-prompts.ts：super-prompt 拼装 + [NEXT_ACTION]/[RESTART_ACTION] directive 构造（纯函数）
- *   - action-gates.ts：action 准入门槛 + ship CheckRun 门禁 + build 分支规划（纯函数）
+ *   - action-gates.ts：action 准入门槛 + ship 预检 + build 分支规划（纯函数）
  *   - sdk-message-handler.ts：SDKMessage → 事件流翻译器
  */
 
@@ -98,7 +98,6 @@ import {
 } from "./task-prompts";
 import {
   checkActionPrerequisites,
-  checkShipCheckGate,
   planBranchesForBuild,
 } from "./action-gates";
 import {
@@ -109,7 +108,6 @@ import type {
   ActionRecord,
   ActionType,
   AskUserQuestion,
-  CheckOverride,
   DevPushMode,
   RepoStatus,
   ReplanMode,
@@ -191,14 +189,13 @@ export const cancelTaskRun = (taskId: string): boolean => {
 /**
  * V0.8.18：后台跑某 action 的后置 deterministic check（异步、不阻塞调用方）。
  *
- * # 为什么必须后台跑（线上踩过、本次修复的根因）
- * build 的 CheckRun 跑用户配的 lint/typecheck（typecheck 可达 120s）。以前这段在 awaitingNotifier 里被
- * `wait_for_user` MCP 工具**同步 await**（工具 handler → safeNotifyAwaiting → notifier → runActionCheck）、
- * 于是 agent 调 `wait_for_user` 后工具要阻塞到 check 跑完才返回。超过 Cursor SDK ~60s 的工具超时 →
- * agent 收到 wait_for_user「超时」→ 困惑乱来（反复重调、瞎编不存在的 /wait 端点、read events 自救）、
- * 状态机被搅乱（`ask_user` 不跑 check 所以秒回成功、对比之下 agent 以为只有 ask_user 能用）。
+ * # 为什么后台跑（线上踩过）
+ * check 若在 awaitingNotifier 里被 `wait_for_user` MCP 工具**同步 await**、工具就要阻塞到
+ * check 跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
  * 改成：notifier 立即返回（agent 秒回引导、第一时间挂 curl long-poll 等 ack）、check 在这里后台跑、
  * 跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
+ * （v0.9.13 CheckRun 删除后 check 只剩 artifact 读文件 + git status hash、通常秒级、
+ *   但 review 多仓 git 指纹仍可能上秒、后台架构保留。）
  *
  * # 去重 + 取消（消灭重复跑 + 状态交错）
  * 一个 task 同时只允许一个在跑的 check（runningChecks）。新一轮 wait（如 revise 改完代码再 wait）会
@@ -224,19 +221,12 @@ const runActionPostCheck = (
       !controller.signal.aborted && runningChecks.get(taskId) === self;
 
     let postCheck: ActionRecord["postCheck"] | undefined;
-    // build 的结构化校验摘要单独落 checkRun 字段（postCheck 只留 passed/details）
-    let checkRun: ActionRecord["checkRun"] | undefined;
     try {
       const fresh = await getTask(taskId);
       const targetAction = fresh?.actions.find((a) => a.id === actionId);
       if (fresh && targetAction) {
-        const result = await runActionCheck(
-          fresh,
-          targetAction,
-          controller.signal,
-        );
+        const result = await runActionCheck(fresh, targetAction);
         postCheck = { passed: result.passed, details: result.details };
-        checkRun = result.checkRun;
         console.log(
           `[task-runner] runActionPostCheck task=${taskId} action=${actionId} passed=${result.passed} details=${result.details.slice(0, 200)}`,
         );
@@ -282,7 +272,6 @@ const runActionPostCheck = (
     const patched = await patchAction(taskId, actionId, {
       status: "awaiting_ack",
       ...(postCheck ? { postCheck } : {}),
-      ...(checkRun ? { checkRun } : {}),
     });
     if (patched) {
       publish(taskId, { kind: "task", task: patched });
@@ -319,7 +308,7 @@ const runActionPostCheck = (
 
 /**
  * V0.8.18：取消某 task 正在后台跑的后置 check（停止 / 推进新 action / 重启当前 action 时调）。
- * abort 会杀掉 lint/typecheck 子进程树、且让 check 结果作废（不写 awaiting_ack、不发「产出完成」事件）。
+ * abort 让 check 结果作废（不写 awaiting_ack、不发「产出完成」事件）。
  */
 export const abortRunningCheck = (taskId: string): void => {
   const cur = runningChecks.get(taskId);
@@ -382,9 +371,6 @@ export interface AdvanceTaskInput {
   devPushMode?: DevPushMode;
   // V0.8.x：plan 重跑时如何合并批次（append=补充需求、rebuild=重建后续）
   replanMode?: ReplanMode;
-  // V0.6.25 CheckRun：ship 时的 gate override（最新 build 的 check 没过 / 没配、用户勾「仍继续」+ reason）
-  //   server 端校验它绑的是最新 build 的 checkRun（防重 build 后失效的 override 蒙混过关）、仅 ship 用
-  checkOverride?: CheckOverride;
   // V0.x A 方案：client 随推进带来的设置页最新分支配置（per-repo、只含设置页找得到 + 非空的仓）。
   //   advanceTask 起 agent 注入前调 refreshRepoBranches 刷新 task 快照——设置页改了、老 task 下次推进就生效。
   //   只覆盖传来的仓、没传的保留原快照（防误清）。不含 feature 分支（git 已建、必须固化）。
@@ -502,7 +488,6 @@ const advanceTaskInner = async (
     requestedBatchIds,
     devPushMode,
     replanMode,
-    checkOverride,
     repoBaseBranches,
     repoTestBranches,
     repoDevBranches,
@@ -545,7 +530,7 @@ const advanceTaskInner = async (
   const effectiveForceNewAgent = !reuseAgent || actionFreshDefault;
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
-  //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites / checkShipCheckGate 看到的就是
+  //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
   //   「认可后」状态（当前 action 已 completed）、原准入逻辑一行不用动。
   const existingRecord = runningTasks.get(task.id);
   const pendingAck = task.actions.find(
@@ -584,15 +569,6 @@ const advanceTaskInner = async (
     throw new Error(`准入条件不满足：${pre.reason}`);
   }
 
-  // V0.6.25 ship gate：最新 build 的 CheckRun 没过 / 没配 / 工作区指纹变了时、要求 per-ship override（绑当前 checkRunId）
-  // async：要重算 git 指纹比对（防 check 后又改工作区）
-  if (actionType === "ship") {
-    const gate = await checkShipCheckGate(task, checkOverride);
-    if (!gate.ok) {
-      throw new Error(`准入条件不满足：${gate.reason}`);
-    }
-  }
-
   // 2) appendAction：写一条新 ActionRecord、task.runStatus 自动转 running
   const created = await appendAction(task.id, {
     type: actionType,
@@ -613,12 +589,6 @@ const advanceTaskInner = async (
   const { task: taskAfterAppend, action } = created;
   publish(task.id, { kind: "task", task: taskAfterAppend });
   publish(task.id, { kind: "action", action });
-  // V0.6.25：ship gate override 落到本 ship action（审计：明知 check 没过仍提测的原因 + 绑定指纹）
-  if (actionType === "ship" && checkOverride) {
-    await patchAction(task.id, action.id, {
-      checkOverride: { ...checkOverride, createdAt: Date.now() },
-    });
-  }
   // V0.6.27：review / build 启动基线（review=各仓内容指纹、build=兄弟仓状态 hash）
   // 后置检查比对用（review 只读硬校验 / 兄弟仓越权检测）、采集失败 fail-open 不挡启动
   if (actionType === "review" || actionType === "build") {
@@ -631,13 +601,8 @@ const advanceTaskInner = async (
   await writeEventAndPublish(task.id, {
     kind: "action_start",
     actionId: action.id,
-    // V0.6.25：ship override reason 拼进事件流——审计「明知 check 没过仍提测」的可见留痕（reviewer 要求至少进 task event）
     text: `开始 ${actionDisplayLabel(action)}（${action.type}）n=${action.n}${
       userInstruction.trim().length > 0 ? `\n用户指令：${truncate(userInstruction, 200)}` : ""
-    }${
-      actionType === "ship" && checkOverride
-        ? `\n⚠ 绕过检查提测、原因：${truncate(checkOverride.reason, 200)}`
-        : ""
     }`,
     meta: { type: actionType, n: action.n, artifactPath: action.artifactPath },
   });
@@ -1432,7 +1397,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // V0.8.18：后置 deterministic check（build 的 lint/typecheck 可达 120s）改后台异步跑——
       // 这样 notifier 立即返回、agent 的 wait_for_user 工具秒回引导、第一时间挂上 curl long-poll 等 ack
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「wait_for_user 失败」乱来、线上踩过）。
-      // check 跑完再由 runActionPostCheck 落 postCheck/checkRun + 切 awaiting_ack + 发「产出完成」事件。
+      // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
     } else {
       // 待命态：agent ack 完、调 wait_for_user(空 action_id) 等下一 action 指令 → 切 awaiting_user。

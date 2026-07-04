@@ -15,6 +15,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import {
@@ -24,12 +25,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { RepoCheckCommands } from "@/components/settings/repo-check-commands";
 import { useDialog } from "@/hooks/use-dialog";
+import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { pickNativePaths } from "@/lib/native-picker";
 import { pathBasename } from "@/lib/path-utils";
 
-import type { CheckCommand, RepoConfig } from "@/lib/types";
+import type { RepoConfig } from "@/lib/types";
 
 interface RepoCardProps {
   repos: RepoConfig[];
@@ -43,6 +44,9 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
 
   // 原生 picker 调用中（防双击连开两个系统对话框）
   const [picking, setPicking] = useState(false);
+
+  // v0.9.11：每仓分支候选（本地 + 远端）——undefined=拉取中、isRepo=false=非 git（分支字段禁用）
+  const branchMap = useRepoBranches(repos.map((r) => r.path));
 
   // 添加若干仓库、name 默认 basename、重复路径跳过
   const addRepos = (paths: string[]) => {
@@ -111,17 +115,15 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onCommit(repos);
   };
 
-  // V0.6.25：改某仓 checkCommands（编辑器内部维护完整数组、这里只塞回对应 repo）
-  // commit 语义同上：文本输入中改草稿（false）、增删 / select / switch / 失焦落盘（true）
-  const setRepoCheckCommands = (
+  // v0.9.11：分支字段改 Combobox 后是离散选择、选中即落盘（不再走「草稿 + blur」）
+  const commitRepoField = (
     path: string,
-    next: CheckCommand[],
-    commit: boolean,
+    field: "onlineBranch" | "testBranch" | "devBranch",
+    value: string,
   ) => {
-    const updated = repos.map((r) =>
-      r.path === path ? { ...r, checkCommands: next } : r,
+    onCommit(
+      repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)),
     );
-    (commit ? onCommit : onChange)(updated);
   };
 
   // 删除是离散操作、直接落盘
@@ -134,8 +136,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
         <CardDescription>
-          点「选择文件夹」添加仓库；每仓可配分支、检查命令（build
-          后自动跑、留空自动识别）、均选填
+          点「选择文件夹」添加仓库；每仓可配分支、均选填
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -145,92 +146,93 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
           </EmptyHint>
         ) : (
           <div className="space-y-2">
-            {repos.map((r) => (
-              <div
-                key={r.path}
-                className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
-              >
-                {/* 第一行：仓名 + 路径 + 删除 */}
-                <div className="flex items-center gap-2">
-                  <Input
-                    value={r.name}
-                    onChange={(e) => renameRepo(r.path, e.target.value)}
-                    onBlur={(e) => onRenameBlur(r.path, e.target.value)}
-                    className="w-40 shrink-0"
-                    placeholder="仓库名"
-                  />
-                  <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
-                    {r.path}
-                  </code>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={() => removeRepo(r.path)}
-                    title="删除"
-                  >
-                    <Trash2 />
-                  </Button>
-                </div>
+            {repos.map((r) => {
+              // v0.9.11：该仓分支候选——undefined=拉取中（先禁用）、isRepo=false=非 git（保持禁用）
+              const entry = branchMap[r.path];
+              const branchDisabled = !entry?.isRepo;
+              const branchPlaceholder =
+                entry?.isRepo === false ? "非 git 仓库" : undefined;
+              return (
+                <div
+                  key={r.path}
+                  className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
+                >
+                  {/* 第一行：仓名 + 路径 + 删除 */}
+                  <div className="flex items-center gap-2">
+                    <Input
+                      value={r.name}
+                      onChange={(e) => renameRepo(r.path, e.target.value)}
+                      onBlur={(e) => onRenameBlur(r.path, e.target.value)}
+                      className="w-40 shrink-0"
+                      placeholder="仓库名"
+                    />
+                    <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
+                      {r.path}
+                    </code>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => removeRepo(r.path)}
+                      title="删除"
+                    >
+                      <Trash2 />
+                    </Button>
+                  </div>
 
-                {/* 第二行：线上 / 测试 / dev 分支（都选填） */}
-                <div className="grid grid-cols-3 gap-2">
+                  {/* 第二行：线上 / 测试 / dev 分支（都选填）。
+                      v0.9.11 换 Combobox：候选自动拉本地 + 远端分支、可搜索、列表缺分支时可手填；
+                      非 git 目录（手填的坏路径 / 普通文件夹）禁用——没分支可选 */}
+                  <div className="grid grid-cols-3 gap-2">
+                    <Combobox
+                      value={r.onlineBranch ?? ""}
+                      onValueChange={(v) =>
+                        commitRepoField(r.path, "onlineBranch", v)
+                      }
+                      options={entry?.branches ?? []}
+                      loading={!entry}
+                      disabled={branchDisabled}
+                      placeholder={branchPlaceholder ?? "线上分支"}
+                      title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
+                    />
+                    <Combobox
+                      value={r.testBranch ?? ""}
+                      onValueChange={(v) =>
+                        commitRepoField(r.path, "testBranch", v)
+                      }
+                      options={entry?.branches ?? []}
+                      loading={!entry}
+                      disabled={branchDisabled}
+                      placeholder={branchPlaceholder ?? "测试分支"}
+                      title="ship 提测 MR 的目标分支、留空则默认 test"
+                    />
+                    <Combobox
+                      value={r.devBranch ?? ""}
+                      onValueChange={(v) =>
+                        commitRepoField(r.path, "devBranch", v)
+                      }
+                      options={entry?.branches ?? []}
+                      loading={!entry}
+                      disabled={branchDisabled}
+                      placeholder={branchPlaceholder ?? "dev 分支"}
+                      title="dev / 联调分支（当前仅存配置）"
+                    />
+                  </div>
+
+                  {/* 第三行：分支模板覆盖（留空用设置页全局默认） */}
                   <Input
-                    value={r.onlineBranch ?? ""}
+                    value={r.branchTemplate ?? ""}
                     onChange={(e) =>
-                      setRepoField(r.path, "onlineBranch", e.target.value)
+                      setRepoField(r.path, "branchTemplate", e.target.value)
                     }
                     onBlur={onRepoFieldBlur}
-                    placeholder="线上分支"
-                    title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
-                  />
-                  <Input
-                    value={r.testBranch ?? ""}
-                    onChange={(e) =>
-                      setRepoField(r.path, "testBranch", e.target.value)
-                    }
-                    onBlur={onRepoFieldBlur}
-                    placeholder="测试分支"
-                    title="ship 提测 MR 的目标分支、留空则默认 test"
-                  />
-                  <Input
-                    value={r.devBranch ?? ""}
-                    onChange={(e) =>
-                      setRepoField(r.path, "devBranch", e.target.value)
-                    }
-                    onBlur={onRepoFieldBlur}
-                    placeholder="dev 分支"
-                    title="dev / 联调分支（当前仅存配置）"
+                    placeholder="分支模板覆盖（留空用全局默认）"
+                    title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
+                    className="font-mono text-xs"
                   />
                 </div>
-
-                {/* 第三行：分支模板覆盖（留空用设置页全局默认） */}
-                <Input
-                  value={r.branchTemplate ?? ""}
-                  onChange={(e) =>
-                    setRepoField(r.path, "branchTemplate", e.target.value)
-                  }
-                  onBlur={onRepoFieldBlur}
-                  placeholder="分支模板覆盖（留空用全局默认）"
-                  title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
-                  className="font-mono text-xs"
-                />
-
-                {/* 第四行：检查命令（build 后 runner 自动跑、per-repo 配、失败可挡提测） */}
-                <div className="grid gap-1.5">
-                  <span className="text-xs text-muted-foreground">
-                    检查命令（留空自动识别、可手填覆盖）
-                  </span>
-                  <RepoCheckCommands
-                    commands={r.checkCommands ?? []}
-                    onChange={(next) =>
-                      setRepoCheckCommands(r.path, next, false)
-                    }
-                    onCommit={(next) => setRepoCheckCommands(r.path, next, true)}
-                  />
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
