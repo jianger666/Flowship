@@ -579,7 +579,14 @@ export const submitTaskQuestion = async (
     body: JSON.stringify({
       text,
       images: images && images.length > 0 ? images : undefined,
-      bootArgs: { apiKey: s.apiKey, model: s.defaultModel },
+      bootArgs: {
+        apiKey: s.apiKey,
+        model: s.defaultModel,
+        // 唤醒模式（会话接不回、原地续当前 action）要建 worktree / 提 MR、随手带全
+        username: s.username,
+        gitHost: s.gitHost,
+        gitToken: s.gitToken,
+      },
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
     }),
   });

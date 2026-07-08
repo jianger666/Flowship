@@ -3,19 +3,20 @@
 /**
  * 任务页统一「跟 AI 说」输入条（V0.11.9、事件流底部常驻）
  *
- * 用户拍板的入口合一（原「再聊聊」弹窗 + 「问一问」输入条 90% 重复、二合一）：
+ * 用户拍板的入口合一（原「再聊聊」弹窗 + 「问一问」输入条 + 「重启当前阶段」三合一）：
  * 一个输入条、系统按任务状态自动懂语境：
  * - 当前产出在等审阅（awaiting_ack）→ 按「再聊聊」送（[ACTION_ACK revise]、
  *   agent 自己二分类：纯疑问就答疑、改动意见就改完重新交卷）
- * - 其他时刻 → 纯提问（[USER_QUESTION]、只答不动手不动任务进度）
- * - 会话接不回 → 服务端自动起一次性答疑 agent 兜底（带任务上下文、只读）
- * - 显式选了模型 → 一律走一次性答疑 agent（存活会话的模型锁死换不了）
+ * - 其他时刻、会话在 → 纯提问（[USER_QUESTION]、只答不动手不动任务进度）
+ * - 会话接不回 + 当前 action 停在半路（error / cancelled）→ **唤醒模式**（服务端
+ *   起新 agent 原地续同一个 action、用户消息当最新指示、不多一条 action 链——旧「重启当前阶段」的替身）
+ * - 会话接不回 + action 已完结 / 显式选了模型 → 一次性答疑 agent（只答不动手）
  *
- * 支持贴图（粘贴 / 附图按钮）——「改成这样」+ 截图是再聊聊高频用法。
+ * 支持贴图（粘贴 / 附图按钮）；Cmd/Ctrl+J 聚焦（沿用原再聊聊快捷键）。
  * agent 正在跑时禁用；任务终态整条隐藏。
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ImagePlus, Loader2, MessageCircleQuestion, Send, X } from "lucide-react";
 import { toast } from "sonner";
 
@@ -49,6 +50,17 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   const { models, fetchModels } = useModels();
   // 贴图（粘贴 / 选文件）——revise 高频带截图
   const attach = useImageAttach({ maxImages: 6, disabled: submitting });
+  // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== "j" || !(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      textareaRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // 当前产出是否在等审阅：是 → 输入按「再聊聊」送、agent 二分类处理
   const currentAction = useMemo(
@@ -103,6 +115,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
       <div className="flex items-end gap-1.5 px-3 pt-2">
         <MessageCircleQuestion className="mb-2 size-3.5 shrink-0 text-muted-foreground/60" />
         <Textarea
+          ref={textareaRef}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onPaste={attach.onPaste}
@@ -112,11 +125,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               void handleSubmit();
             }
           }}
-          placeholder={
-            canAck
-              ? "跟 AI 说：改意见或提问（针对当前产出、可贴图）"
-              : "问一问（只回答、不改代码、不影响任务进度）"
-          }
+          placeholder="想改、想问、贴图都行（⌘/Ctrl+J）"
           rows={1}
           disabled={busy}
           className="min-h-8 resize-none border-0 bg-transparent px-1 py-1.5 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"

@@ -33,6 +33,7 @@ import {
 } from "./skills-loader";
 import { readGlobalCursorRulesForPrompt } from "./cursor-config";
 import { getCustomAction } from "./custom-action-fs";
+import type { AskUserQuestion } from "@/lib/types";
 import type {
   ActionRecord,
   ActionType,
@@ -584,3 +585,81 @@ export const buildNextActionDirective = (input: {
   return lines.join("\n");
 };
 
+/**
+ * 「输入条唤醒当前 action」指令（V0.11.9、原「重启当前阶段」按钮退役后的替身）
+ *
+ * 场景：action 停在 error / cancelled、会话接不回、用户在底部输入条说话——
+ * 起新 agent **原地续同一个 action**（不 append 新 action、链不分叉）、用户这条消息就是最新指示。
+ */
+export const buildResumeActionInstruction = (
+  task: Task,
+  action: ActionRecord,
+  // 断线前 agent 正等用户回答、但用户还没答完的那组问题（断点续传重问用）
+  pendingQuestions: AskUserQuestion[],
+  // 用户唤醒时说的话（输入条内容、非空）
+  userMessage: string,
+  imagePaths?: string[],
+): string => {
+  const lines: string[] = [
+    "[RESUME_ACTION]",
+    "当前 action 之前中断了（agent 断开 / 报错 / 被停止）、现在被用户唤醒。不要追加新 action、不要从零重做，继续完成同一个 action。",
+    "你可能是被换上来接手的新模型——先把下面的上下文完整读一遍、确认理解了断点和已有产物，再动手。",
+    "",
+    "严格按顺序执行：",
+    `1. 先读取事件日志，确认断点和用户最近反馈：\`${getEventsLogPath(task.id)}\``,
+    "2. 再检查相关仓库当前工作区，摸清已有的半成品。",
+  ];
+
+  let step = 3;
+  if (action.artifactPath) {
+    lines.push(
+      `${step}. 如果已有 artifact，先读取它：\`${getActionArtifactPath(task.id, action.n, action.type)}\`（后续在同一路径覆盖更新）。`,
+    );
+    step += 1;
+  }
+
+  // 用户唤醒时说的话 = 最新指示（纯提问先答疑、指令按它执行）——这条消息就是「方向确认」、
+  // 不再像旧「重启」那样先 ask_user 问「按原计划继续吗」
+  lines.push(
+    `${step}. **用户唤醒本阶段时说了这条消息（最新指示、优先处理）**：`,
+    "",
+    `> ${userMessage.split("\n").join("\n> ")}`,
+    "",
+    "   - 纯提问 → 先在事件流里答疑（emit assistant_message）、再继续完成本 action",
+    "   - 改动 / 继续类指令 → 按它执行",
+  );
+  step += 1;
+  if (imagePaths && imagePaths.length > 0) {
+    lines.push(
+      "   - 用户随消息附了图、先用 \`read\` 逐一读：",
+      ...imagePaths.map((p, i) => `     ${i + 1}. ${p}`),
+    );
+  }
+
+  if (pendingQuestions.length > 0) {
+    // 断点在「等用户答问题」：接手 agent 把没答完的问题原样重问（用户消息若已回答某题、跳过该题）
+    const questionsJson = JSON.stringify(
+      pendingQuestions.map((q) => ({
+        id: q.id,
+        question: q.question,
+        ...(q.options && q.options.length > 0 ? { options: q.options } : {}),
+        allow_text: q.allowText ?? true,
+      })),
+    );
+    lines.push(
+      `${step}. **断点续传**：中断前你正等用户回答下面这组问题、用户还没答完。若上面那条用户消息没有回答它们、读完上下文后调一次 \`ask_user\` 原样重问（已被回答的题跳过）：`,
+      `   - task_id="${task.id}"、action_id="${action.id}"`,
+      `   - questions=${questionsJson}`,
+      "   - ⛔ 不要替用户作答、不要按 default 跳过。",
+    );
+  }
+
+  if (action.userInstruction.trim().length > 0) {
+    lines.push("", "本 action 的原始用户指令：", action.userInstruction.trim());
+  }
+  lines.push(
+    "",
+    "完成后调用 \`wait_for_user({ task_id, action_id, artifact_path })\` 对这个同一个 action 交卷、然后结束本轮回复。",
+  );
+  return lines.join("\n");
+};

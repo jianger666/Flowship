@@ -22,6 +22,7 @@ import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { getPendingAsk } from "@/lib/server/chat-pending";
 import {
   deliverTaskQuestion,
+  resumeCurrentActionWithMessage,
   startOneShotQuestion,
 } from "@/lib/server/task-runner";
 import { publishTaskStreamEvent, runningTasks } from "@/lib/server/task-stream";
@@ -40,6 +41,9 @@ interface PostBody {
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
+    username?: string;
+    gitHost?: string;
+    gitToken?: string;
   };
   /**
    * 用户在问一问输入条上显式选的模型（V0.11.9 追加）：
@@ -108,18 +112,31 @@ export const POST = async (req: Request, { params }: Ctx) => {
       : undefined;
 
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）、直接起一次性答疑 agent 用它答；
-  // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回才兜底
+  // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   const sent = forceModel
     ? false
     : await deliverTaskQuestion(task, text, imageAbsPaths, { apiKey, model });
-  const useFallback = !sent;
+
+  // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
+  // - 当前 action 停在半路（error / cancelled / 僵死 running）且没显式换模型 →
+  //   **唤醒模式**：起新 agent 原地续同一个 action、用户消息当最新指示
+  // - 其他（action 已完结 / 没 action / 显式选了模型）→ 一次性答疑 agent（只答不动手）
+  const currentAction = task.actions.find((a) => a.id === task.currentActionId);
+  const canResume =
+    !sent &&
+    !forceModel &&
+    !!currentAction &&
+    (currentAction.status === "error" ||
+      currentAction.status === "cancelled" ||
+      currentAction.status === "running");
+  const useOneShot = !sent && !canResume;
   const fallbackModel = forceModel ?? model;
-  if (useFallback && (!apiKey || !fallbackModel)) {
-    return errorResponse("缺 bootArgs（apiKey / model）、答疑 agent 起不来", 400);
+  if (!sent && (!apiKey || !fallbackModel)) {
+    return errorResponse("缺 bootArgs（apiKey / model）、agent 起不来", 400);
   }
 
   console.log(
-    `[question] task=${task.id} text=${text.slice(0, 60)} images=${images.length} fallback=${useFallback}`,
+    `[question] task=${task.id} text=${text.slice(0, 60)} images=${images.length} mode=${sent ? "send" : canResume ? "resume" : "oneshot"}`,
   );
 
   const questionEvent = await appendEvent(task.id, {
@@ -135,12 +152,38 @@ export const POST = async (req: Request, { params }: Ctx) => {
     publishTaskStreamEvent(task.id, { kind: "event", event: questionEvent });
   }
 
+  if (canResume) {
+    // 唤醒模式自己管状态（patch action running + runStatus + 事件）；失败标 error 有内部兜底
+    void resumeCurrentActionWithMessage({
+      task,
+      userMessage: text,
+      imagePaths: imageAbsPaths,
+      apiKey: apiKey!,
+      fallbackModel: fallbackModel!,
+      username: body.bootArgs?.username?.trim() || undefined,
+      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
+      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+    }).catch(async (err) => {
+      console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
+      const ev = await appendEvent(task.id, {
+        kind: "error",
+        text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,
+      });
+      if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
+    });
+    const fresh = await getTask(task.id);
+    return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   // 回答期间 runStatus=running（保留 currentActionId、进度不动）；
   // 答完 consumeSessionRun / startOneShotQuestion 按最后 action 状态归位
   const updated = await setTaskRunStatus(task.id, "running");
   if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 
-  if (useFallback) {
+  if (useOneShot) {
     startOneShotQuestion(task, text, imageAbsPaths, {
       apiKey: apiKey!,
       model: fallbackModel!,

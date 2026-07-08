@@ -98,6 +98,7 @@ import {
   buildBatchDirective,
   buildNextActionDirective,
   buildPlanReplanDirective,
+  buildResumeActionInstruction,
   buildReviewScopeDirective,
   buildSuperPrompt,
   buildTaskUpdateHint,
@@ -849,6 +850,147 @@ const advanceTaskInner = async (
   });
 
   return { action };
+};
+
+/**
+ * V0.11.9「输入条唤醒当前 action」（原「重启当前阶段」按钮退役后的替身、用户拍板
+ * 「底部输入条就能覆盖重启、别多一条 action 链」）：
+ *
+ * 场景：当前 action 停在 error / cancelled（会话接不回）、用户在输入条说话 →
+ * 起新 agent **原地续同一个 action**（不 append 新 action）、用户消息进指令
+ * （纯提问先答疑、指令按它执行、最后交卷）。question 路由的恢复分支调用。
+ */
+export interface ResumeCurrentActionInput {
+  task: Task;
+  userMessage: string;
+  imagePaths?: string[];
+  apiKey: string;
+  /** 模型优先级：action.agentModel → task.model → 这里的兜底（bootArgs.model） */
+  fallbackModel: ModelSelection;
+  username?: string;
+  gitHost?: string;
+  gitToken?: string;
+}
+
+export const resumeCurrentActionWithMessage = async (
+  input: ResumeCurrentActionInput,
+): Promise<void> =>
+  runAdvanceExclusive(input.task.id, () => resumeCurrentActionInner(input));
+
+const resumeCurrentActionInner = async (
+  input: ResumeCurrentActionInput,
+): Promise<void> => {
+  await assertNoUpdatePendingRestart();
+  abortRunningCheck(input.task.id);
+  const fresh = await getTask(input.task.id);
+  if (!fresh) throw new Error("task 不存在、无法唤醒当前 action");
+
+  const actionId = fresh.currentActionId;
+  const action = fresh.actions.find((a) => a.id === actionId);
+  if (!action) throw new Error("当前没有可唤醒的 action");
+
+  // 旧 run 残留（理论上没有、调用方已判）→ 停干净再起
+  const existingRecord = runningTasks.get(fresh.id);
+  if (existingRecord) {
+    forkPendingTasks.add(fresh.id);
+    existingRecord.cancel();
+    const stopped = await waitForTaskToStop(fresh.id, 5000);
+    if (!stopped) forceClearStaleRunnerState(fresh.id);
+  }
+  // 换新 agent、旧会话关掉（reap 下一行显式扫）
+  closeTaskSession(fresh.id, undefined, { reap: false });
+  cancelPending(fresh.id);
+  reapTaskOrphans(getTaskWorkRepoPaths(fresh));
+
+  // 作废旧 agent 没答完的 ask（返回未答问题、新 agent 断点续传重问）
+  const pendingQuestions = await supersedePendingAsks(fresh.id, "输入条唤醒当前 action");
+
+  const patchedTask = await patchAction(fresh.id, action.id, { status: "running" });
+  const patchedAction =
+    patchedTask?.actions.find((a) => a.id === action.id) ?? action;
+  if (patchedTask) {
+    publish(fresh.id, { kind: "task", task: patchedTask });
+    publish(fresh.id, { kind: "action", action: patchedAction });
+  }
+  let startTask =
+    (await setTaskRunStatus(fresh.id, "running", action.id)) ?? patchedTask ?? fresh;
+  publish(fresh.id, { kind: "task", task: startTask });
+
+  await writeEventAndPublish(fresh.id, {
+    kind: "info",
+    actionId: action.id,
+    text: `已唤醒当前 ${actionDisplayLabel(action)} 阶段（n=${action.n}）、新 agent 接手继续`,
+    meta: { resumedActionId: action.id, actionType: action.type, n: action.n },
+  });
+
+  // 隔离工作区 task → 确保 worktree 在（可能被手删过）
+  if (isWorktreeTask(startTask)) {
+    const ensured = await ensureTaskWorktrees(startTask, input.username);
+    const existingRepos = new Set(
+      (startTask.gitBranches ?? []).map((b) => b.repoPath),
+    );
+    for (const info of ensured.infos) {
+      if (!existingRepos.has(info.repoPath)) {
+        await upsertGitBranch(fresh.id, info);
+      }
+    }
+    startTask = (await getTask(fresh.id)) ?? startTask;
+  }
+
+  let branchCheckoutHint: string | undefined;
+  if (action.type === "build" && !isWorktreeTask(startTask)) {
+    const planned = planBranchesForBuild(startTask, input.username);
+    if (planned) {
+      const existingRepos = new Set(
+        (startTask.gitBranches ?? []).map((b) => b.repoPath),
+      );
+      for (const info of planned.infos) {
+        if (!existingRepos.has(info.repoPath)) {
+          await upsertGitBranch(fresh.id, info);
+        }
+      }
+      branchCheckoutHint = planned.promptHint;
+      startTask = (await getTask(fresh.id)) ?? startTask;
+    }
+  }
+  const startAction =
+    startTask.actions.find((a) => a.id === action.id) ?? patchedAction;
+  const batchDirective =
+    startAction.type === "build"
+      ? buildBatchDirective(startTask, startAction.requestedBatchIds)
+      : startAction.type === "review"
+        ? buildReviewScopeDirective(startTask)
+        : undefined;
+
+  // 模型：沿用该 action 当初跑的 agentModel（没有则 task.model、再兜 bootArgs 默认）——
+  // 唤醒是「接着干」、不该悄悄换模型；想换模型答疑走输入条的模型选择（一次性答疑 agent）
+  const model =
+    startAction.agentModel?.id?.trim()
+      ? startAction.agentModel
+      : startTask.model?.id?.trim()
+        ? startTask.model
+        : input.fallbackModel;
+
+  const replanDirective = buildPlanReplanDirective(startAction, startTask);
+
+  await internalStartAgent({
+    task: startTask,
+    action: startAction,
+    userInstruction: buildResumeActionInstruction(
+      startTask,
+      startAction,
+      pendingQuestions,
+      input.userMessage,
+      input.imagePaths,
+    ),
+    branchCheckoutHint,
+    apiKey: input.apiKey,
+    model,
+    gitHost: input.gitHost,
+    gitToken: input.gitToken,
+    batchDirective,
+    replanDirective,
+  });
 };
 
 /**
