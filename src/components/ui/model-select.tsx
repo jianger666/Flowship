@@ -22,7 +22,7 @@
  */
 
 import { useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Search, Zap } from "lucide-react";
+import { Check, ChevronDown, Search } from "lucide-react";
 
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
@@ -186,7 +186,8 @@ export const ModelSelect = ({
   const quickPickRow =
     quickPicks && topUsed.length > 0 ? (
       <div className="flex flex-wrap items-center gap-1.5">
-        <Zap className="size-3.5 shrink-0 text-muted-foreground/70" />
+        {/* 文字标签（用户拍板：闪电图标像「快速模式」、有误导） */}
+        <span className="shrink-0 text-[11px] text-muted-foreground/70">常用</span>
         {topUsed.map((entry) => (
           <ChoiceButton
             key={`${entry.id}:${(entry.params ?? []).map((p) => `${p.id}=${p.value}`).join(",")}`}

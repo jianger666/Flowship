@@ -41,6 +41,12 @@ interface PostBody {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
   };
+  /**
+   * 用户在问一问输入条上显式选的模型（V0.11.9 追加）：
+   * 传了 = 直接起一次性答疑 agent 用它回答（不续会话——会话模型锁死没法换）；
+   * 不传 = 优先续接存活会话（会话模型）、接不回才兜底 agent（bootArgs.model）。
+   */
+  forceModel?: { id?: string; params?: Array<{ id: string; value: string }> };
 }
 
 const MAX_IMAGES = 6;
@@ -96,16 +102,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
     body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
       ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
       : undefined;
+  const forceModel =
+    body.forceModel && typeof body.forceModel.id === "string"
+      ? { id: body.forceModel.id, params: body.forceModel.params }
+      : undefined;
 
-  // 先送达再落事件（同 ask-reply 顺序约定：送不到就不写、防「用户看到已发出、agent 没收到」）
-  const sent = await deliverTaskQuestion(task, text, imageAbsPaths, {
-    apiKey,
-    model,
-  });
-  // 会话接不回（agent 报错过 / 停过 / 隔了几天早没了）→ 一次性答疑 agent 兜底
-  //（带任务事件日志 / artifact 上下文、只读答疑、不影响任务状态；见 startOneShotQuestion）
+  // 用户显式选了模型 → 不续会话（会话模型锁死换不了）、直接起一次性答疑 agent 用它答；
+  // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回才兜底
+  const sent = forceModel
+    ? false
+    : await deliverTaskQuestion(task, text, imageAbsPaths, { apiKey, model });
   const useFallback = !sent;
-  if (useFallback && (!apiKey || !model)) {
+  const fallbackModel = forceModel ?? model;
+  if (useFallback && (!apiKey || !fallbackModel)) {
     return errorResponse("缺 bootArgs（apiKey / model）、答疑 agent 起不来", 400);
   }
 
@@ -134,7 +143,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (useFallback) {
     startOneShotQuestion(task, text, imageAbsPaths, {
       apiKey: apiKey!,
-      model: model!,
+      model: fallbackModel!,
     });
   }
 
