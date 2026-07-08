@@ -97,18 +97,26 @@ jobs:
       - run: mkdir -p dist && tar -xzf app-server.tar.gz -C dist
         shell: bash
 
-      # 修平台依赖（v0.7.6）：server 布局是 ubuntu 组的——
+      # 修平台依赖（v0.7.6 引入、V0.11.5 改 npm pack 精准落包）：server 布局是 ubuntu 组的——
       # SDK 平台工具包（@cursor/sdk-<platform>、含 ripgrep / 沙箱 helper）是运行时
-      # 动态拼名加载、构建追踪追不到、整包缺失；在目标平台 runner 上重装对应平台版本
-      # （npm 单包安装、不动树里其它东西）。
+      # 动态拼名加载、构建追踪追不到、整包缺失；在目标平台 runner 下载对应平台包解进 node_modules。
+      # ⚠️ 不能用 `npm install <pkg>`（v0.7.6~v0.11.4 踩的大坑）：dist/app-server 的 package.json
+      # 是全项目的、npm install 装单包时会顺手把「缺失」的全部 dependencies 重装成**完整包**
+      # （full next + @next/swc 平台二进制 + lucide 等、app-server 85M → 532M）、
+      # 安装包被撑到 190-215MB、Windows 安装要多落盘 ~500MB——这就是「装得慢、包太大」的主根因。
+      # `npm pack` 只取平台包 tarball 本体、零依赖解析。
       # 注：sqlite3 早已不是项目依赖（v0.8.11 清理死配置）——standalone 里根本没有它，
       # 旧脚本还在探测 `sqlite3/package.json` 版本直接炸（v0.8.7~v0.8.10 打包全挂的根因）。
       - run: |
           # 版本读已装包的真实版本（不带 ^、跟 ubuntu 解析结果钉死一致）
           SDK_VERSION=$(node -p "require('./node_modules/@cursor/sdk/package.json').version")
-          npm install --no-save --no-package-lock --omit=dev "@cursor/sdk-${{ matrix.sdk_platform }}@${SDK_VERSION}"
+          PKG="@cursor/sdk-${{ matrix.sdk_platform }}"
+          npm pack "${PKG}@${SDK_VERSION}"
+          mkdir -p "node_modules/${PKG}"
+          tar -xzf "cursor-sdk-${{ matrix.sdk_platform }}-${SDK_VERSION}.tgz" -C "node_modules/${PKG}" --strip-components=1
+          rm "cursor-sdk-${{ matrix.sdk_platform }}-${SDK_VERSION}.tgz"
           # 实加载验真：平台包缺失 / 版本不符在这里当场炸、不带病发版
-          node -p "require('@cursor/sdk-${{ matrix.sdk_platform }}/package.json').version + ' platform pkg ok'"
+          node -p "require('${PKG}/package.json').version + ' platform pkg ok'"
         shell: bash
         working-directory: dist/app-server
 

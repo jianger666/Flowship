@@ -299,6 +299,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.5：揪出安装包隐性膨胀根因——CI npm install 重装全依赖（2026-07-08）
+
+- **异常信号**：V0.11.4 压缩优化后线上包 192/189.5MB、远超本地实测 118/112MB → 挂载线上 dmg 对账：**app-server 532MB**（本地组包只有 79MB）
+- **根因（自 v0.7.6 起每一版都中招）**：CI「修平台依赖」步在 dist/app-server 里跑 `npm install @cursor/sdk-<platform>`——standalone 的 package.json 是全项目的、npm 装单包时顺手把「缺失」的全部 dependencies 重装成**完整包**（full next 152M + @next/swc 平台二进制 124M + lucide-react 36M + typescript 23M…）、~450MB 死重进包。用户「Windows 装得特别久」主根因就是解包落盘 ~770MB
+- **修复**：`npm install` → `npm pack` + tar 解到 `node_modules/@cursor/<平台包>`、零依赖解析只落平台包本体；实加载验真步保留
+- 效果：解包 771MB → ~310MB、安装包 190+ → ~110-120MB（真·减半、叠加 V0.11.4 压缩优化）
+
 ### V0.11.4：安装包减半（2026-07-08、用户点名「包太大、装太久」）
 
 - **win exe 213.6MB → 实测 112MB（-48%）**：`compression: maximum`（electron-builder.yml 全局）。回收 v0.8.10「7z 降到 level 3 提安装速度」特例——release 体积历史证明那次前后都 213MB、没变小也没装快（LZMA 解压速度和压缩级别基本无关、安装慢卡在落盘 300MB + Defender 扫描）
