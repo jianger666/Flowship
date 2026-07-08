@@ -1655,17 +1655,39 @@ const handleRunFailure = async (
 };
 
 /**
+ * 问一问 run 收尾：按当前 action 状态把 runStatus 归回「提问前」的等待位
+ * （awaiting_ack → awaiting_user、error → error、其余 → idle）。
+ * 只在 runStatus 还挂 running 时动手（compare-set、不覆盖 notifier 已落的状态）。
+ */
+const restoreRunStatusAfterQuestion = async (taskId: string): Promise<void> => {
+  const fresh = await getTask(taskId);
+  if (!fresh || fresh.runStatus !== "running") return;
+  const cur = fresh.actions.find((a) => a.id === fresh.currentActionId);
+  const target =
+    cur?.status === "awaiting_ack"
+      ? ("awaiting_user" as const)
+      : cur?.status === "error"
+        ? ("error" as const)
+        : ("idle" as const);
+  const updated = await setTaskRunStatus(taskId, target, cur?.id ?? null);
+  if (updated) publish(taskId, { kind: "task", task: updated });
+};
+
+/**
  * 消费一个 SDK run 的完整生命周期（流式事件 → 终态处理）。
  *
  * V0.11 语义：run 自然 finished 是**正常出口**（agent 交卷 / 提问 / 说完了就该结束 turn）——
  * 只有「最后一个 action 还在 running、且没有 check 在跑、也没有 ask 在等答案」才判「没交卷就跑了」标 error。
  * 会话（agent 实例）在 finished 后保留、用户下一步操作用 send 续接；cancel / error 才关会话。
+ *
+ * opts.questionRun（V0.11.9）：这个 run 是「问一问」纯答疑——**任何出口都不动 action**
+ * （停止 / 失败也不把 awaiting_ack 审阅位打成 cancelled/error）、不关会话、只把 runStatus 归位。
  */
 const consumeSessionRun = async (
   task: Task,
   agent: AgentInstance,
   run: SessionRun,
-  opts: { errorActionId?: string },
+  opts: { errorActionId?: string; questionRun?: boolean },
 ): Promise<void> => {
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -1729,6 +1751,13 @@ const consumeSessionRun = async (
         });
         return;
       }
+      // 问一问的 run 被停：只是不想听它说了——action / 会话都不动、runStatus 归回等待位
+      if (opts.questionRun) {
+        await restoreRunStatusAfterQuestion(task.id);
+        const freshQ = await getTask(task.id);
+        publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
+        return;
+      }
       // 正常 cancel（停止 / 硬超时触发）→ 收尾卡住的 action + 关运行时状态 + 关会话
       // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
       await finalizeStaleActions(task.id, "cancelled");
@@ -1789,6 +1818,14 @@ const consumeSessionRun = async (
       return;
     }
 
+    // 问一问 run 答完：按当前 action 状态归回等待位（含 error 位、比下面的通用兜底全）
+    if (opts.questionRun) {
+      await restoreRunStatusAfterQuestion(task.id);
+      const freshQ = await getTask(task.id);
+      publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
+      return;
+    }
+
     // 正常结束：交卷已入 check 管道（awaiting_ack / awaiting_user 由 check、notifier 落）、
     // 或 ask 在等答案。会话保留、用户下一步操作 send 续接。
     // 兜底：最后 action 已终态（completed / cancelled / error）而 runStatus 还挂 running → 归 idle
@@ -1803,7 +1840,7 @@ const consumeSessionRun = async (
         if (updated) publish(task.id, { kind: "task", task: updated });
       }
     } else if (lastAction.status === "awaiting_ack") {
-      // V0.11.9「问一问」：等审阅期间的提问 run（route 切了 running）自然结束 → 回等待位。
+      // 等审阅期间的续接 run（如 revise 处理完自然结束）兜底回等待位。
       // 正常交卷路径 runStatus 早被 notifier 落成 awaiting_user、这里 compare-set 不动它。
       const freshest = await getTask(task.id);
       if (freshest?.runStatus === "running") {
@@ -1814,8 +1851,22 @@ const consumeSessionRun = async (
     publish(task.id, { kind: "done", task: fresh ?? task, ok: true });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
-    await handleRunFailure(task.id, opts.errorActionId, err);
-    closeTaskSession(task.id, agent.agentId);
+    if (opts.questionRun) {
+      // 问一问失败（网络抖动 / SDK 报错）：只报错误事件 + 归位 runStatus——
+      // 绝不把 awaiting_ack 审阅位 / 半路 action 打成 error（答疑失败不该伤任务本体）
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[task-runner] task=${task.id} 问一问 run 失败：`, err);
+      await writeEventAndPublish(task.id, {
+        kind: "error",
+        text: `答疑失败：${summarizeRunFailure(message, err).text}`,
+      });
+      await restoreRunStatusAfterQuestion(task.id);
+      const freshQ = await getTask(task.id);
+      publish(task.id, { kind: "done", task: freshQ ?? task, ok: false });
+    } else {
+      await handleRunFailure(task.id, opts.errorActionId, err);
+      closeTaskSession(task.id, agent.agentId);
+    }
   } finally {
     runningTasks.delete(task.id);
     // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
@@ -1938,7 +1989,7 @@ export const deliverTaskQuestion = async (
   sendToTaskSession(
     task,
     buildAgentMessage({ kind: "question", text, imagePaths }),
-    { creds },
+    { creds, questionRun: true },
   );
 
 /**
@@ -1987,14 +2038,8 @@ export const startOneShotQuestion = (
         "- 直接回答、答完自然结束回复",
       ].join("\n");
       const run = await agent.send(prompt);
-      await consumeSessionRun(task, agent, run, {});
-      // consumeSessionRun 的归位只认 completed/cancelled/awaiting_ack——其余（如上次 action
-      // 停在 error）会让 running 悬着、这里兜回提问前的状态
-      const fresh = await getTask(task.id);
-      if (fresh?.runStatus === "running") {
-        const restored = await setTaskRunStatus(task.id, prevRunStatus);
-        if (restored) publish(task.id, { kind: "task", task: restored });
-      }
+      // questionRun：任何出口（答完 / 被停 / 失败）都不动 action、runStatus 由 consume 统一归位
+      await consumeSessionRun(task, agent, run, { questionRun: true });
     } catch (err) {
       console.error(`[task-runner] task=${task.id} 问一问兜底失败：`, err);
       await writeEventAndPublish(task.id, {
@@ -2041,7 +2086,7 @@ const waitForRunToDrain = async (
 const sendToTaskSession = async (
   task: Task,
   text: string,
-  opts: { errorActionId?: string; creds?: SessionCreds } = {},
+  opts: { errorActionId?: string; creds?: SessionCreds; questionRun?: boolean } = {},
 ): Promise<boolean> => {
   if (!(await waitForRunToDrain(task.id))) {
     console.warn(
@@ -2066,6 +2111,9 @@ const sendToTaskSession = async (
   }
   session.lastActiveAt = Date.now();
   // fire-and-forget 消费（跟首个 run 同一管道）；调用方只需要「send 成功已开跑」
-  void consumeSessionRun(task, agent, run, { errorActionId: opts.errorActionId });
+  void consumeSessionRun(task, agent, run, {
+    errorActionId: opts.errorActionId,
+    questionRun: opts.questionRun,
+  });
   return true;
 };
