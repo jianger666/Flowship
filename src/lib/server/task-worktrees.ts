@@ -178,8 +178,8 @@ export interface EnsureWorktreesResult {
   infos: GitBranchInfo[];
   /** 本次真正新建了 worktree 的原仓库路径（写事件流告知用户用） */
   createdRepos: string[];
-  /** 本次从原仓库秒级克隆了 node_modules 的原仓库路径（写事件流告知用户用） */
-  clonedNodeModulesRepos: string[];
+  /** 本次从原仓库秒级克隆到的依赖目录（写事件流告知用户用）：原仓路径 + 目录名列表 */
+  clonedDeps: { repoPath: string; dirs: string[] }[];
 }
 
 /**
@@ -201,7 +201,7 @@ export const ensureTaskWorktrees = async (
   const infos = planWorktreeBranchInfos(task, username);
   const workPaths = getTaskWorkRepoPaths(task);
   const createdRepos: string[] = [];
-  const clonedNodeModulesRepos: string[] = [];
+  const clonedDeps: { repoPath: string; dirs: string[] }[] = [];
 
   await fs.mkdir(getTaskWorktreesDir(task.id), { recursive: true });
 
@@ -211,14 +211,13 @@ export const ensureTaskWorktrees = async (
     const info = infos[i];
 
     // 已存在且是合法工作区 → 复用（幂等热路径、每次推进都会走到）。
-    // 顺手补克隆 node_modules（老 worktree 建于克隆功能上线前 / 上次克隆失败）——
+    // 顺手补克隆依赖目录（老 worktree 建于克隆功能上线前 / 上次克隆失败）——
     // 缺依赖会连锁炸 pre-commit hook / lint / typecheck（实测：dev 联调 agent 被迫 --no-verify）
     if (await pathExists(path.join(workDir, ".git"))) {
       const check = await runGit(workDir, ["rev-parse", "--is-inside-work-tree"]);
       if (check.ok) {
-        if (await cloneNodeModules(repoPath, workDir)) {
-          clonedNodeModulesRepos.push(repoPath);
-        }
+        const dirs = await cloneDepDirs(repoPath, workDir);
+        if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
         continue;
       }
     }
@@ -319,45 +318,64 @@ export const ensureTaskWorktrees = async (
     info.baseBranch = resolvedBase;
     info.checkedOut = true;
     await copyRootEnvFiles(repoPath, workDir);
-    if (await cloneNodeModules(repoPath, workDir)) {
-      clonedNodeModulesRepos.push(repoPath);
-    }
+    const dirs = await cloneDepDirs(repoPath, workDir);
+    if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
     createdRepos.push(repoPath);
   }
 
-  return { infos, createdRepos, clonedNodeModulesRepos };
+  return { infos, createdRepos, clonedDeps };
 };
 
 /**
- * node_modules 秒级克隆（V0.10.1、用户实测痛点：umi 类大包每个 worktree 重装太久、
- * 且 postinstall 在新环境偶发失败 → build 的 lint/typecheck 被迫 skip）。
+ * 各生态「可安全整目录克隆」的依赖目录白名单（V0.11.3 从写死 node_modules 泛化、
+ * 用户点名「通用项目、别只考虑前端」）。探测到就克、都是可重定位目录（拷到新路径直接可用）：
+ * - `node_modules`：JS/TS（npm / pnpm / yarn）
+ * - `vendor`：PHP composer / Ruby bundler（vendor/bundle 嵌套在内）/ Go vendor 模式
+ * - `Pods`：iOS CocoaPods
  *
- * 原仓库有现成 node_modules 时用 APFS copy-on-write 克隆（mac `cp -Rc`、clonefile(2)）：
+ * 明确**不在**白名单里的：
+ * - ⚠️ `.venv` / `venv`（Python 虚拟环境）：shebang / activate 写死绝对路径、克隆到新路径
+ *   是坏的、比不克更坑（agent 以为环境可用、一跑就炸）——Python 由 agent 在 worktree 自建
+ * - Java（~/.m2 / ~/.gradle）、Go（module cache）、.NET（NuGet）走全局缓存、
+ *   不在项目目录里、worktree 天然秒可用、无需克隆
+ */
+const CLONABLE_DEP_DIRS = ["node_modules", "vendor", "Pods"];
+
+/**
+ * 依赖目录秒级克隆（V0.10.1 上线 node_modules、V0.11.3 泛化多语言白名单；
+ * 用户实测痛点：umi 类大包每个 worktree 重装太久、且 postinstall 在新环境偶发失败）。
+ *
+ * 原仓库有白名单目录时用 APFS copy-on-write 克隆（mac `cp -Rc`、clonefile(2)）：
  * 不走网络、秒到十几秒级、磁盘块共享几乎不占空间、postinstall 产物原样带过来。
  * 两边是独立副本（非 symlink）、互不污染；分支间依赖有差异时 agent 增量 install 补齐。
  * 失败（跨卷 / 非 APFS / 非 mac）静默跳过、回退 agent 自装。
+ * @returns 本次真正克隆到的目录名列表（一个没克 = 空数组）
  */
-const cloneNodeModules = async (
+const cloneDepDirs = async (
   repoPath: string,
   workDir: string,
-): Promise<boolean> => {
-  if (process.platform !== "darwin") return false; // clonefile 仅 APFS、其它平台回退 agent 自装
-  const src = path.join(repoPath, "node_modules");
-  const dst = path.join(workDir, "node_modules");
-  if (!(await pathExists(src)) || (await pathExists(dst))) return false;
-  try {
-    // -c = clonefile；大 node_modules（几十万文件）逐文件克隆也只是元数据操作、给足超时
-    await execFileAsync("cp", ["-Rc", src, dst], { timeout: 600_000 });
-    return true;
-  } catch (err) {
-    // 半截残留必须清掉——否则 agent 看到 node_modules 存在就不装了、比没有更坑
-    await fs.rm(dst, { recursive: true, force: true }).catch(() => {});
-    console.warn(
-      `[task-worktrees] node_modules 克隆失败（回退 agent 自装）repo=${repoPath}：`,
-      err,
-    );
-    return false;
+): Promise<string[]> => {
+  if (process.platform !== "darwin") return []; // clonefile 仅 APFS、其它平台回退 agent 自装
+  const cloned: string[] = [];
+  for (const dir of CLONABLE_DEP_DIRS) {
+    const src = path.join(repoPath, dir);
+    const dst = path.join(workDir, dir);
+    // 原仓没有该目录 / worktree 已有（tracked 检出自带 / 上次克过）→ 跳过
+    if (!(await pathExists(src)) || (await pathExists(dst))) continue;
+    try {
+      // -c = clonefile；大目录（几十万文件）逐文件克隆也只是元数据操作、给足超时
+      await execFileAsync("cp", ["-Rc", src, dst], { timeout: 600_000 });
+      cloned.push(dir);
+    } catch (err) {
+      // 半截残留必须清掉——否则 agent 看到目录存在就不装了、比没有更坑
+      await fs.rm(dst, { recursive: true, force: true }).catch(() => {});
+      console.warn(
+        `[task-worktrees] 依赖目录 ${dir} 克隆失败（回退 agent 自装）repo=${repoPath}：`,
+        err,
+      );
+    }
   }
+  return cloned;
 };
 
 // 拷原仓库根目录的 .env* 到 worktree（只拷 worktree 里没有的——tracked 的 .env 检出自带、不覆盖）

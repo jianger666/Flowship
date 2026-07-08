@@ -287,7 +287,7 @@ const renderRepoSection = (task: Task): string => {
     ...branchLines,
     "  - 任务分支已由系统检出好——**禁止自己 checkout / 切换分支**、也不要 cd 到原仓库目录去改代码",
     "  - git 命令（diff / add / commit / push / fetch）在 worktree 里照常用、跟原仓库共享同一 git 数据库",
-    "  - 工作区是全新检出：node_modules 等依赖不存在——需要跑安装 / 构建 / 测试时先自行装依赖（按仓库的包管理器来、如 pnpm install）",
+    "  - 依赖：系统会尽量把原仓库现成的依赖目录（node_modules / vendor / Pods）克隆过来；克隆不了 / 其它生态（如 Python venv）时、需要跑安装 / 构建 / 测试前先自行装依赖（按仓库的包管理器来、如 pnpm install / pip venv）",
   ].join("\n");
 };
 

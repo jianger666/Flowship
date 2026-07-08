@@ -299,6 +299,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.3：依赖目录克隆多语言泛化（2026-07-08、用户点名「通用项目、别只考虑前端」）
+
+- worktree 依赖秒级克隆从写死 `node_modules` 泛化为**安全克隆白名单**（`CLONABLE_DEP_DIRS`）：`node_modules`（JS）/ `vendor`（PHP composer / Ruby bundler / Go vendor 模式）/ `Pods`（iOS）——都是可重定位目录、探测到就克
+- **明确排除 `.venv`/`venv`**（Python 虚拟环境 shebang/activate 写死绝对路径、克隆过去是坏的、比不克更坑）——Python 走 agent 自建；Java/Go/.NET 依赖存全局缓存、天然不需要克隆
+- `EnsureWorktreesResult.clonedNodeModulesRepos` → `clonedDeps: { repoPath, dirs }[]`、事件流 / prompt 仓库段措辞同步改「依赖目录」；集成测试补 vendor 正例 + `.venv` 反例
+- 不加设置项（白名单够用、疼了再开 per-repo 配置）
+
 ### V0.11.2：Windows / macOS 兼容性全面扫描修复（2026-07-08、用户点名全查）
 
 - **P1 工作区指纹 / status hash 在 Windows 静默失效**：原实现 `spawn("sh", ["-c", 多行 POSIX 脚本])`——Windows 没有 `sh`、`2>/dev/null` 也非 cmd 语法 → fingerprint 恒 null、review 只读硬校验 / build 兄弟仓越权检测形同虚设。重写成纯 Node 逐条 `execFile git`（唯一要喂 stdin 的 `hash-object --stdin-paths` 单独 spawn）、平台无关；顺带删掉 `buildCheckEnv`（PATH 用 `:` 拼 + 读 `HOME`、Windows 分隔符是 `;`、会把 PATH 首项写坏）——现在只跑 git、不需要自拼 PATH。新增 `tests/action-checks.integration.test.ts`（真 git 仓锁指纹语义 5 条）

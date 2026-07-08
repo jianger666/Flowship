@@ -51,18 +51,23 @@ beforeAll(async () => {
   git(REPO, "config", "user.email", "t@t.local");
   git(REPO, "config", "user.name", "t");
   await fs.writeFile(path.join(REPO, "a.txt"), "hello\n");
-  // gitignore 的 .env.local / node_modules——worktree 检出不带、靠拷贝 / 克隆
+  // gitignore 的 .env.local / 依赖目录——worktree 检出不带、靠拷贝 / 克隆
   await fs.writeFile(
     path.join(REPO, ".gitignore"),
-    ".env.local\nnode_modules/\n",
+    ".env.local\nnode_modules/\nvendor/\n.venv/\n",
   );
   await fs.writeFile(path.join(REPO, ".env.local"), "SECRET=1\n");
-  // 模拟已装好的 node_modules（V0.10.1 秒级克隆的源）
+  // 模拟已装好的依赖目录（V0.11.3 白名单克隆的源）：node_modules（JS）+ vendor（PHP/Ruby/Go）
   await fs.mkdir(path.join(REPO, "node_modules", "some-pkg"), { recursive: true });
   await fs.writeFile(
     path.join(REPO, "node_modules", "some-pkg", "index.js"),
     "module.exports = 1;\n",
   );
+  await fs.mkdir(path.join(REPO, "vendor", "acme"), { recursive: true });
+  await fs.writeFile(path.join(REPO, "vendor", "acme", "lib.php"), "<?php\n");
+  // .venv 是白名单外的反例（Python 虚拟环境路径写死、克隆过去是坏的、必须不跟过来）
+  await fs.mkdir(path.join(REPO, ".venv", "bin"), { recursive: true });
+  await fs.writeFile(path.join(REPO, ".venv", "bin", "python"), "#!/abs/path\n");
   git(REPO, "add", "-A");
   git(REPO, "commit", "-m", "init");
 });
@@ -75,7 +80,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   const task = makeTask();
   const workDir = getTaskWorkRepoPaths(task)[0];
 
-  it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆 node_modules", async () => {
+  it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆依赖目录", async () => {
     const res = await ensureTaskWorktrees(task, "clj");
     expect(res.createdRepos).toEqual([REPO]);
     expect(res.infos[0].name).toBe("feature/clj/888888-集成测试");
@@ -94,15 +99,22 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await expect(
       fs.readFile(path.join(workDir, ".env.local"), "utf8"),
     ).resolves.toBe("SECRET=1\n");
-    // node_modules 秒级克隆（APFS clonefile 仅 mac、其它平台跳过回退 agent 自装）
+    // 依赖目录白名单克隆（APFS clonefile 仅 mac、其它平台跳过回退 agent 自装）
     if (process.platform === "darwin") {
-      expect(res.clonedNodeModulesRepos).toEqual([REPO]);
+      expect(res.clonedDeps).toEqual([
+        { repoPath: REPO, dirs: ["node_modules", "vendor"] },
+      ]);
       await expect(
         fs.readFile(path.join(workDir, "node_modules", "some-pkg", "index.js"), "utf8"),
       ).resolves.toBe("module.exports = 1;\n");
+      await expect(
+        fs.readFile(path.join(workDir, "vendor", "acme", "lib.php"), "utf8"),
+      ).resolves.toBe("<?php\n");
     } else {
-      expect(res.clonedNodeModulesRepos).toEqual([]);
+      expect(res.clonedDeps).toEqual([]);
     }
+    // 白名单外的 .venv 绝不跟过来（Python venv 路径写死、克隆过去是坏的）
+    await expect(fs.access(path.join(workDir, ".venv"))).rejects.toThrow();
   });
 
   it("二次 ensure 幂等：复用现成 worktree、createdRepos 为空", async () => {

@@ -630,9 +630,12 @@ const advanceTaskInner = async (
       }
     }
     const cloneNote =
-      ensured.clonedNodeModulesRepos.length > 0
-        ? `node_modules 已从原仓库秒级克隆（${ensured.clonedNodeModulesRepos
-            .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+      ensured.clonedDeps.length > 0
+        ? `依赖目录已从原仓库秒级克隆（${ensured.clonedDeps
+            .map(
+              (c) =>
+                `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
+            )
             .join("、")}）、不需要重新下载`
         : "";
     if (ensured.createdRepos.length > 0) {

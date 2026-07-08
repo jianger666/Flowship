@@ -54,7 +54,7 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 - **6 个 Harness 门槛**：action 前置准入 / 后置确定性检查 / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（V0.6.4+）/ placeholder 动态
 - **「再聊聊」（revise）**：对 artifact 有意见 / 疑问 → agent 先复述意图再决定（想改就改 artifact、想问就只答疑、严禁偷偷动 artifact）
 - **每 action 默认新 Agent**：context 截断治跑偏、artifact 是唯一接力棒；勾「续用当前 Agent」才 send 续接旧会话（review 强制换人复审）
-- **任务隔离工作区（V0.10）**：每 (task × 仓) 一个 git worktree、并行任务互不干扰；分支由系统确定性检出、node_modules 从原仓秒级克隆
+- **任务隔离工作区（V0.10）**：每 (task × 仓) 一个 git worktree、并行任务互不干扰；分支由系统确定性检出、依赖目录（node_modules / vendor / Pods）从原仓秒级克隆
 - **Git 分支自动建（多仓 + 模板化）**：build 前 runner 按模板（默认 `feature/{username}/{storyId}-{taskTitle}`、可 per-repo 覆盖）拼分支名、prompt 注入 idempotent checkout 引导；填了「已有工作分支」则复用
 - **决定链落 md**：review 提的 bug、用户裁决（改 / 不改 / 延后）写进 review artifact、后续 build 不重复问（换 agent 也读得到）
 - **大需求分批 build（可选）**：plan 可把大需求在 task 之上再拆「批次」（每批标测试策略 tdd / after / none）、build 时勾本次做哪批、每批可新启 Agent 换干净上下文、review 按进度自动切「增量 / 集成」两层；全程一个 task、进度纯派生、详情页头部 chip 看批次进度
