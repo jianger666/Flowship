@@ -12,7 +12,7 @@
  *   - 模板预览用示例变量实时渲染、让用户直观看到分支名长啥样
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -32,6 +32,9 @@ import {
 } from "@/components/ui/select";
 import { renderBranchName } from "@/lib/branch-template";
 import { JUMP_IDE_LABEL, type JumpIde } from "@/lib/types";
+
+// 全部候选工具（探测结果没回来前的兜底顺序）
+const ALL_IDES: JumpIde[] = ["cursor", "vscode", "idea", "webstorm"];
 
 interface UserProfileCardProps {
   username: string;
@@ -57,6 +60,27 @@ export const UserProfileCard = ({
   onBranchTemplateChange,
   onBranchTemplateCommit,
 }: UserProfileCardProps) => {
+  // 本机探测到的可用 IDE 集合（V0.11.8：后端扫安装位置 + PATH、不再写死两个）；
+  // null = 探测结果还没回来（全部可选、不置灰）
+  const [availableIdes, setAvailableIdes] = useState<Set<JumpIde> | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void fetch("/api/system/ide-tools")
+      .then((r) => r.json())
+      .then((data: { tools?: Array<{ id: JumpIde; available: boolean }> }) => {
+        if (!alive || !Array.isArray(data.tools)) return;
+        setAvailableIdes(
+          new Set(data.tools.filter((t) => t.available).map((t) => t.id)),
+        );
+      })
+      .catch(() => {
+        // 探测失败不挡配置、保持全部可选
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   // 模板预览：用一组示例变量渲染当前模板、用户改模板时实时看到效果
   const preview = useMemo(
     () =>
@@ -92,14 +116,29 @@ export const UserProfileCard = ({
           <Label htmlFor="settings-jump-ide">代码跳转 IDE</Label>
           <Select
             value={jumpIde}
-            onValueChange={(v) => onJumpIdeChange(v === "idea" ? "idea" : "cursor")}
+            onValueChange={(v) =>
+              onJumpIdeChange(
+                ALL_IDES.includes(v as JumpIde) ? (v as JumpIde) : "cursor",
+              )
+            }
           >
-            <SelectTrigger id="settings-jump-ide" className="w-44">
+            <SelectTrigger id="settings-jump-ide" className="w-52">
               <SelectValue>{JUMP_IDE_LABEL[jumpIde]}</SelectValue>
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="cursor">{JUMP_IDE_LABEL.cursor}</SelectItem>
-              <SelectItem value="idea">{JUMP_IDE_LABEL.idea}</SelectItem>
+              {ALL_IDES.map((id) => {
+                // 探测结果回来后：未装的置灰（当前已选的不置灰、免得显示成锁死态）
+                const unavailable =
+                  availableIdes !== null &&
+                  !availableIdes.has(id) &&
+                  id !== jumpIde;
+                return (
+                  <SelectItem key={id} value={id} disabled={unavailable}>
+                    {JUMP_IDE_LABEL[id]}
+                    {unavailable ? "（未检测到）" : ""}
+                  </SelectItem>
+                );
+              })}
             </SelectContent>
           </Select>
         </div>

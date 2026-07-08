@@ -31,8 +31,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { getIdeAnchorProps } from "@/lib/ide-open";
 import { getSettings, initSettings } from "@/lib/local-store";
-import { buildIdeLink } from "@/lib/path-utils";
 import {
   fetchPreviewStatus,
   startTaskPreview,
@@ -100,7 +100,8 @@ export const WorkspaceActions = ({ task }: Props) => {
   const workCwd = task.workCwd;
   if (!workCwd || task.repoPaths.length === 0) return null;
 
-  const ideLink = buildIdeLink(workCwd, undefined, prefs?.jumpIde ?? "cursor");
+  // V0.11.8：cursor/vscode = 协议 deep link、JetBrains 系 = onClick 后端拉起（不依赖 idea:// 协议）
+  const ideAnchor = getIdeAnchorProps(workCwd, undefined, prefs?.jumpIde ?? "cursor");
 
   const copyPath = async () => {
     try {
@@ -144,8 +145,9 @@ export const WorkspaceActions = ({ task }: Props) => {
 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1">
-      {/* cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议、页面不动）——ui-conventions 约定 */}
-      {ideLink && (
+      {/* cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议、页面不动）——ui-conventions 约定；
+          JetBrains 系走 onClick 后端拉起（getIdeAnchorProps 内部切换） */}
+      {ideAnchor && (
         <Button
           variant="ghost"
           size="sm"
@@ -153,7 +155,7 @@ export const WorkspaceActions = ({ task }: Props) => {
           nativeButton={false}
           render={
             <a
-              href={ideLink}
+              {...ideAnchor}
               className="no-underline"
               title={`在 IDE 打开任务工作区\n${workCwd}`}
             />

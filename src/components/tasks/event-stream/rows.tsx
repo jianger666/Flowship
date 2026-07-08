@@ -31,7 +31,8 @@ import {
   type PreviewImage,
 } from "@/components/ui/image-preview";
 import { isAskSuperseded } from "@/lib/ask-pending";
-import { buildIdeLink, pathBasename } from "@/lib/path-utils";
+import { getIdeAnchorProps } from "@/lib/ide-open";
+import { pathBasename } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
@@ -376,7 +377,7 @@ const EventRowImpl = ({
               {attachments.map((att) => (
                 <a
                   key={att.absPath}
-                  href={buildIdeLink(att.absPath, undefined, jumpIde) ?? ""}
+                  {...(getIdeAnchorProps(att.absPath, undefined, jumpIde) ?? { href: "" })}
                   className="flex max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
                   title={`${att.absPath}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
@@ -535,12 +536,13 @@ const EventRowImpl = ({
                       : `${(att.bytes / 1024 / 1024).toFixed(1)} MB`
                   : "";
               // att.absPath 一定是绝对路径（原生 picker 选出来的）、
-              // buildIdeLink 在绝对路径下永远不会返 null；?? "" 兜底纯为满足 href 类型
-              const href = buildIdeLink(att.absPath, undefined, jumpIde) ?? "";
+              // getIdeAnchorProps 在绝对路径下永远不会返 null；?? 兜底纯为满足类型
+              const anchor =
+                getIdeAnchorProps(att.absPath, undefined, jumpIde) ?? { href: "" };
               return (
                 <a
                   key={att.absPath}
-                  href={href}
+                  {...anchor}
                   className="flex max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs no-underline hover:bg-muted"
                   title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >

@@ -40,8 +40,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { getIdeAnchorProps } from "@/lib/ide-open";
 import {
-  buildIdeLink,
   hasValidRepoPrefix,
   looksLikeArtifactRef,
   looksLikePath,
@@ -164,17 +164,19 @@ const buildMarkdownComponents = (
       // 多仓 task：相对路径首段不是任务里的仓名 = agent 漏写仓名前缀、
       // 拼出来的链接必 404（实测弹「路径不存在」）——降级纯文本、不给误导性链接
       const prefixOk = hasValidRepoPrefix(text, repoShortNames);
-      const href = prefixOk ? buildIdeLink(text, baseDir, ide) : null;
+      // V0.11.8：跳转属性统一走 getIdeAnchorProps（cursor/vscode = deep link、
+      // JetBrains 系 = onClick 后端拉起、不依赖 idea:// 协议）
+      const anchor = prefixOk ? getIdeAnchorProps(text, baseDir, ide) : null;
       // 多段行号（`path:147-175、341-370、485-508`）→ 每段独立链接、点哪段跳哪段
       //   首段渲染 `path:147-175`、后续段渲染 `、341-370`（sep 原样保留、视觉跟原文一致）
-      //   单段 / 无行号 / 拼不出链接（href null）→ 走下面原有的整条单链接 / 纯文本分支
+      //   单段 / 无行号 / 拼不出链接（anchor null）→ 走下面原有的整条单链接 / 纯文本分支
       const parsed = parsePathSegments(text);
-      if (href && parsed && parsed.segments.length > 1) {
+      if (anchor && parsed && parsed.segments.length > 1) {
         return (
           <span className="font-mono text-[0.85em]">
             {parsed.segments.map((seg, i) => {
               // 每段单独拼 `path:起始行` 生成各自的跳转目标
-              const segHref = buildIdeLink(
+              const segAnchor = getIdeAnchorProps(
                 `${parsed.path}:${seg.line}`,
                 baseDir,
                 ide,
@@ -183,7 +185,7 @@ const buildMarkdownComponents = (
                 <span key={`${seg.line}-${i}`}>
                   {seg.sep}
                   <a
-                    href={segHref ?? undefined}
+                    {...(segAnchor ?? { href: undefined })}
                     className="no-underline"
                     title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${parsed.path}:${seg.line}`}
                   >
@@ -201,7 +203,7 @@ const buildMarkdownComponents = (
         <span
           className={cn(
             "font-mono text-[0.85em]",
-            href
+            anchor
               ? "text-sky-600 dark:text-sky-400 underline-offset-2 group-hover:underline"
               : "text-foreground",
           )}
@@ -209,7 +211,7 @@ const buildMarkdownComponents = (
           {text}
         </span>
       );
-      if (!href) {
+      if (!anchor) {
         return (
           <span
             title={
@@ -225,7 +227,7 @@ const buildMarkdownComponents = (
       }
       return (
         <a
-          href={href}
+          {...anchor}
           className="group no-underline"
           title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${text}`}
         >

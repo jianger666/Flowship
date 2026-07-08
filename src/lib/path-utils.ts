@@ -216,11 +216,15 @@ export const looksLikeArtifactRef = (s: string): ActionArtifactRef | null => {
  * Windows：`cursor://file/D:/IdeaProjects/...`（同 VS Code `vscode://file/c:/...` 约定、
  *   盘符段的 `:` 必须保留不 encode、否则 IDE 不认）
  */
-export const buildIdeLink = (
+/**
+ * 把「路径（可带行号后缀）+ baseDir」解析成绝对路径 + 起始行（V0.11.8 从 buildIdeLink 抽出）。
+ * deep link（buildIdeLink）和后端拉起（open-in-ide、JetBrains 系）共用同一套解析。
+ * 解析不出（相对路径没 baseDir / 本身是 url）返 null。
+ */
+export const resolveIdeTarget = (
   pathLike: string,
   baseDir?: string,
-  ide: JumpIde = "cursor",
-): string | null => {
+): { absolute: string; line?: number } | null => {
   if (!pathLike) return null;
   if (/^[a-z]+:\/\//i.test(pathLike)) return null;
   const { path, line } = parsePathWithLine(pathLike);
@@ -231,6 +235,17 @@ export const buildIdeLink = (
     const base = normalizeSeparators(baseDir).replace(/\/+$/, "");
     absolute = `${base}/${normalized.replace(/^\.?\/+/, "")}`;
   }
+  return { absolute, line };
+};
+
+export const buildIdeLink = (
+  pathLike: string,
+  baseDir?: string,
+  ide: JumpIde = "cursor",
+): string | null => {
+  const target = resolveIdeTarget(pathLike, baseDir);
+  if (!target) return null;
+  const { absolute, line } = target;
   const encodedPath = absolute
     .split("/")
     // 首段是盘符（`D:`）时保留原样、`:` encode 了 IDE 不认
@@ -240,14 +255,18 @@ export const buildIdeLink = (
     .join("/");
   // POSIX 绝对路径自带前导 `/`、Windows 盘符路径要手动补一个（`cursor://file/D:/...`）
   const prefix = encodedPath.startsWith("/") ? "" : "/";
-  if (ide === "idea") {
+  if (ide === "idea" || ide === "webstorm") {
+    // 注：JetBrains 协议只有装了 Toolbox 才注册——渲染层对 JetBrains 系应改走
+    // 后端拉起（见 ide-open.ts getIdeAnchorProps）、这里保留仅作 fallback
     return line !== undefined
-      ? `idea://open?file=${prefix}${encodedPath}&line=${line}`
-      : `idea://open?file=${prefix}${encodedPath}`;
+      ? `${ide}://open?file=${prefix}${encodedPath}&line=${line}`
+      : `${ide}://open?file=${prefix}${encodedPath}`;
   }
+  // cursor / vscode 同一套 `<scheme>://file/<path>[:line]` 约定
+  const scheme = ide === "vscode" ? "vscode" : "cursor";
   return line !== undefined
-    ? `cursor://file${prefix}${encodedPath}:${line}`
-    : `cursor://file${prefix}${encodedPath}`;
+    ? `${scheme}://file${prefix}${encodedPath}:${line}`
+    : `${scheme}://file${prefix}${encodedPath}`;
 };
 
 /**

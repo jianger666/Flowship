@@ -299,6 +299,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.8：IDE 跳转去协议依赖 + 自动探测（2026-07-08、同事 Windows 实测「idea:// 打不开」）
+
+- **根因**：`idea://` 协议只有 JetBrains Toolbox 会注册——直接装 IDEA 的 Windows 机器点跳转弹「找不到应用」（两位同事实测）
+- **方案（本地 app 不需要经过浏览器协议）**：
+  - `src/lib/server/ide-tools.ts`：探测本机装了哪些 IDE（常规安装位 + JetBrains Toolbox 目录 + PATH、60s 缓存）+ `openInIde` 后端直接 spawn 可执行文件（带 `--line`；Toolbox .cmd 脚本经 cmd /c；mac 用 `open -na`）
+  - 跳转双通道（`JUMP_IDE_USES_PROTOCOL`）：cursor / vscode 协议注册可靠、仍走 deep link；JetBrains 系（idea / webstorm）走 `POST /api/system/open-in-ide` 后端拉起、协议没注册也能开
+  - 渲染统一走 `getIdeAnchorProps`（`src/lib/ide-open.ts`）：协议工具返 href、后端工具返 onClick——artifact 路径链接 / 事件流附件 / 工作区「在 IDE 打开」五处收口
+  - `JumpIde` 扩成 cursor / vscode / idea / webstorm；设置页下拉按 `GET /api/system/ide-tools` 探测结果动态列、未装的置灰「（未检测到）」、不再写死两个
+- 同批攒着的：黄点收窄 + approve 归 idle、常用模型快捷位、提测黄条删除（见下）
+
 ### V0.11.8（未发版、攒着）：黄点收窄 + approve 归 idle（2026-07-08、用户点名「黄点什么时候消失」）
 
 - **背景**：V0.11 后 awaiting_user 成了常态静息位（chat 每轮说完 / task 交卷等 ack / approve 后都停在这）——侧栏琥珀脉冲点按旧条件（runStatus=awaiting_user 就亮）几乎满屏常亮、失去注意力信号价值

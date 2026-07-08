@@ -80,11 +80,28 @@ export interface PreviewSlotStatus {
  * - cursor：`cursor://file/<path>:<line>`
  * - idea：`idea://open?file=<path>&line=<line>`（需装 JetBrains Toolbox 或 IDE 自带协议）
  */
-export type JumpIde = "cursor" | "idea";
+// V0.11.8 从写死 cursor/idea 扩成四个、设置页按后端探测结果动态列（未装的置灰）
+export type JumpIde = "cursor" | "vscode" | "idea" | "webstorm";
 
 export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
   cursor: "Cursor",
+  vscode: "VS Code",
   idea: "IDEA",
+  webstorm: "WebStorm",
+};
+
+/**
+ * 跳转走浏览器协议（deep link）还是后端拉起（V0.11.8）：
+ * - cursor / vscode：安装器可靠注册协议、deep link 直开（零往返、体验最好）
+ * - JetBrains 系：`idea://` 只有 JetBrains Toolbox 会注册、直接装 IDEA 的机器点了弹
+ *   「找不到应用」（用户同事 Windows 实测）——改走 POST /api/system/open-in-ide、
+ *   后端探测安装位置直接 spawn 可执行文件、不依赖协议
+ */
+export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
+  cursor: true,
+  vscode: true,
+  idea: false,
+  webstorm: false,
 };
 
 export type SubmitShortcut = "mod-enter" | "enter";
