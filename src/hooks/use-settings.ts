@@ -175,6 +175,8 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      // 模型使用计数：非设置页字段（recordModelUsage 直写）、恒不 dirty
+      modelUsage: false,
     }),
     [settings, savedSettings]
   );

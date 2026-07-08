@@ -41,7 +41,7 @@ import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, recordModelUsage } from "@/lib/local-store";
 import { createTask } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import {
@@ -207,6 +207,7 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
       const settings = getSettings();
       // pickedModel 已含完整 params（ModelSelect 维护）、直接用；没选 id 留 undefined 走默认
       const model = pickedModel.id?.trim() ? pickedModel : undefined;
+      if (model) recordModelUsage(model); // 常用模型计数（建任务是一次真实使用）
 
       // V0.6.3：从 settings 查选中仓的「线上分支」、快照进 task
       //   （settings 在 localStorage、server 读不到、故建 task 时固化、之后 build 用这份）
@@ -455,6 +456,7 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
               selection={pickedModel}
               onChange={setPickedModel}
               variant="full"
+              quickPicks
               emptyPlaceholder={
                 defaultModelId
                   ? `默认: ${defaultModelId}（API Key 没填、改不了）`

@@ -69,7 +69,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, recordModelUsage } from "@/lib/local-store";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import {
   ACTION_LABEL,
@@ -657,6 +657,8 @@ export const AdvanceDialog = ({
   const handleSubmit = async () => {
     // actionType 判空给 TS narrow 用（canSubmit 已含该拦截）
     if (!canSubmit || !actionType) return;
+    // 常用模型计数：只在「起新 agent 且选了模型」时记（续用不换模型、不算一次使用）
+    if (!reuseAgent && pickedModel.id) recordModelUsage(pickedModel);
     await onSubmit({
       actionType,
       userInstruction: instruction.trim(),
@@ -947,6 +949,7 @@ export const AdvanceDialog = ({
                   onChange={setPickedModel}
                   disabled={submitting}
                   variant="full"
+                  quickPicks
                   emptyPlaceholder="（请先在设置页拉取模型列表）"
                 />
               </div>

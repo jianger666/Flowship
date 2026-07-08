@@ -22,7 +22,7 @@ import { toast } from "sonner";
 
 import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, recordModelUsage } from "@/lib/local-store";
 import { setTaskModel } from "@/lib/task-store";
 import type { ModelSelection, Task } from "@/lib/types";
 
@@ -51,6 +51,7 @@ export const ChatModelPicker = ({ task, onTaskUpdate }: Props) => {
     setSaving(true);
     try {
       const latest = await setTaskModel(task.id, next);
+      recordModelUsage(next); // 常用模型计数（chat 换模型也是一次真实使用）
       onTaskUpdate(latest);
     } catch (err) {
       toast.error(`切换模型失败：${(err as Error).message}`);

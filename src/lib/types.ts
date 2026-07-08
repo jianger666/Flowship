@@ -127,6 +127,20 @@ export interface FeAiFlowSettings {
    * 只影响 dialog 打开时的初始勾选、review 强起新 agent 的 server 铁律不受它影响。
    */
   reuseAgentDefault?: boolean;
+  /**
+   * V0.11.x：模型使用计数（「常用模型」快捷 chip 的数据源、用户拍板自动按次数排序）。
+   * 每次真正提交使用某模型（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型）计一次、
+   * 按「模型 id + 参数组合」区分（Fable High 和 Fable Low 是两个条目）。上限 20 条防膨胀。
+   */
+  modelUsage?: ModelUsageEntry[];
+}
+
+/** 单条模型使用计数（key = id + params 组合） */
+export interface ModelUsageEntry {
+  id: string;
+  params?: Array<{ id: string; value: string }>;
+  count: number;
+  lastUsedAt: number;
 }
 
 /**

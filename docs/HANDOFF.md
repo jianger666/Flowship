@@ -299,6 +299,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.8（未发版、攒着）：常用模型快捷位——按使用次数自动排（2026-07-08、用户点名「切模型太麻烦」）
+
+- **交互**：模型选择器（ModelSelect `quickPicks` 开关）上方常驻 2 个 chip = 使用次数 top2 的「模型 + 参数组合」（Fable High 和 Fable Low 算两个条目）、点一下连参数一步选中、不用开下拉搜。用户拍板「自动记录选择次数做排序」、零配置无需手动星标
+- **计数**：`settings.modelUsage`（config.json、上限 20 条防膨胀、淘汰次数最少）+ `recordModelUsage`/`getTopUsedModels`（local-store）。只在**真实使用**时 +1：推进起新 agent / 重启阶段 / 新建任务 / chat 换模型；在下拉里点着玩不计
+- **生效面**：推进弹窗 / 重启阶段弹窗 / 新建任务弹窗（full 变体）；chat 底部 compact 选择器不加 chip（空间紧）但换模型计数照记
+
 ### V0.11.7：修「秒答 ask 弹窗撞在飞 run」——第一次提交报「没有活跃会话」、重试才过（2026-07-08、用户线上实测）
 
 - **现象**：agent 调 ask_user 后弹窗立即弹给用户、但本回合 run 还要再跑几秒才 finished（收尾旁白 + stop-check 往返）——用户手快秒答、`sendToTaskSession` 撞上 `runningTasks.has` 直接拒 → 409「没有可续接的 agent 会话」、几秒后重试就成功（线上日志实锤：ask 14:16:41 → 首答 14:16:52.420 被拒 → run 14:16:52.9 才排空 → 重试 14:16:59 成功）

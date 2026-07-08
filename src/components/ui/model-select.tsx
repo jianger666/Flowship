@@ -22,7 +22,7 @@
  */
 
 import { useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Search } from "lucide-react";
+import { Check, ChevronDown, Search, Zap } from "lucide-react";
 
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
@@ -30,6 +30,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { getTopUsedModels } from "@/lib/local-store";
 import type { ModelOption, ModelParameter, ModelSelection } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -64,6 +65,35 @@ const defaultParamsFor = (
 const modelName = (m: ModelOption): string =>
   isIconToken(m.displayName) ? m.id : m.displayName;
 
+// 「模型名 · 参数摘要」（trigger 和常用 chip 共用）；models 里反查不到就退回 id
+const summarizeSelection = (
+  models: ModelOption[],
+  sel: { id: string; params?: Array<{ id: string; value: string }> },
+): string => {
+  const m = models.find((x) => x.id === sel.id);
+  const name = m ? modelName(m) : sel.id;
+  const paramSummary = (sel.params ?? [])
+    .map((sp) => {
+      const def = m?.parameters?.find((p) => p.id === sp.id);
+      if (!def) return null;
+      const vv = def.values.find((x) => x.value === sp.value);
+      return vv ? renderParamValue(vv) : null;
+    })
+    .filter(Boolean);
+  return paramSummary.length > 0 ? `${name} · ${paramSummary.join(" · ")}` : name;
+};
+
+// 判断两个 selection 是不是同一「模型 + 参数组合」（params 顺序无关）
+const sameSelection = (
+  a: { id: string; params?: Array<{ id: string; value: string }> },
+  b: { id: string; params?: Array<{ id: string; value: string }> },
+): boolean => {
+  if (a.id !== b.id) return false;
+  const key = (params?: Array<{ id: string; value: string }>) =>
+    (params ?? []).map((p) => `${p.id}=${p.value}`).sort().join(",");
+  return key(a.params) === key(b.params);
+};
+
 interface Props {
   models: ModelOption[];
   selection: ModelSelection;
@@ -74,6 +104,9 @@ interface Props {
   emptyPlaceholder?: string;
   // 打开 / 关闭回调：调用方可在 open=true 时按需拉模型列表
   onOpenChange?: (open: boolean) => void;
+  // 常用模型快捷位（V0.11.x 用户拍板「按使用次数自动排」）：true 时 trigger 上方
+  // 常驻 top2 使用最多的「模型 + 参数组合」chip、点一下直接选中、不用开下拉搜
+  quickPicks?: boolean;
 }
 
 export const ModelSelect = ({
@@ -84,6 +117,7 @@ export const ModelSelect = ({
   variant = "full",
   emptyPlaceholder = "选择模型",
   onOpenChange,
+  quickPicks = false,
 }: Props) => {
   // popover 开关（受控）：选模型 / 调参数都不主动关、允许连续操作；点外 / Esc 才关
   const [open, setOpen] = useState(false);
@@ -101,18 +135,15 @@ export const ModelSelect = ({
   // trigger 摘要：模型名 + 各 param 当前值（如「Claude Opus 4.8 · 思考 高」）
   const triggerLabel = useMemo(() => {
     if (!selection.id) return emptyPlaceholder;
-    const name = selectedModel ? modelName(selectedModel) : selection.id;
-    // params 摘要：只在能反查到 parameter 定义时拼、拼不出就只显示模型名
-    const paramSummary = (selection.params ?? [])
-      .map((sp) => {
-        const def = selectedModel?.parameters?.find((p) => p.id === sp.id);
-        if (!def) return null;
-        const vv = def.values.find((x) => x.value === sp.value);
-        return vv ? renderParamValue(vv) : null;
-      })
-      .filter(Boolean);
-    return paramSummary.length > 0 ? `${name} · ${paramSummary.join(" · ")}` : name;
-  }, [selection, selectedModel, emptyPlaceholder]);
+    return summarizeSelection(models, selection);
+  }, [selection, models, emptyPlaceholder]);
+
+  // 常用模型 top2（使用次数自动排、getSettings 同步缓存直接读——挂载时快照一次即可、
+  // 计数在提交动作时才变、同一次弹窗内不需要响应式刷新）
+  const topUsed = useMemo(
+    () => (quickPicks ? getTopUsedModels(2) : []),
+    [quickPicks],
+  );
 
   // 过滤后的模型列表（displayName / id 大小写不敏感匹配）
   const filtered = useMemo(() => {
@@ -150,7 +181,27 @@ export const ModelSelect = ({
     onChange({ id: selection.id, params: next });
   };
 
-  return (
+  // 常用模型快捷 chip 行（quickPicks 且有使用记录才显示）：点一下直接选中「模型 + 参数组合」
+  const quickPickRow =
+    quickPicks && topUsed.length > 0 ? (
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Zap className="size-3.5 shrink-0 text-muted-foreground/70" />
+        {topUsed.map((entry) => (
+          <ChoiceButton
+            key={`${entry.id}:${(entry.params ?? []).map((p) => `${p.id}=${p.value}`).join(",")}`}
+            shape="chip"
+            selected={sameSelection(selection, entry)}
+            disabled={disabled}
+            onClick={() => onChange({ id: entry.id, params: entry.params })}
+            className="text-xs"
+          >
+            {summarizeSelection(models, entry)}
+          </ChoiceButton>
+        ))}
+      </div>
+    ) : null;
+
+  const popoverEl = (
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         render={
@@ -264,5 +315,14 @@ export const ModelSelect = ({
         )}
       </PopoverContent>
     </Popover>
+  );
+
+  // 没有快捷位时保持原结构（不包 wrapper、compact 行内用法零影响）
+  if (!quickPickRow) return popoverEl;
+  return (
+    <div className="flex flex-col gap-1.5">
+      {quickPickRow}
+      {popoverEl}
+    </div>
   );
 };

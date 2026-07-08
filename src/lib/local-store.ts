@@ -23,6 +23,7 @@ import type {
   ActionLayoutPref,
   FeAiFlowSettings,
   ModelSelection,
+  ModelUsageEntry,
 } from "./types";
 
 const KEY = "fe-ai-flow:settings";
@@ -45,6 +46,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   disabledMcpServers: [],
   actionLayout: { order: [], hidden: [] },
   reuseAgentDefault: false,
+  modelUsage: [],
 };
 
 const isBrowser = (): boolean =>
@@ -109,6 +111,12 @@ const normalizeSettings = (
     actionLayout: normalizeActionLayout(parsed.actionLayout),
     // v0.9.11：推进 dialog「续用当前 Agent」默认勾选、缺省 / 坏值回退 false（每 action 新 agent）
     reuseAgentDefault: parsed.reuseAgentDefault === true,
+    // V0.11.x：模型使用计数、坏值 / 缺省回退空
+    modelUsage: Array.isArray(parsed.modelUsage)
+      ? (parsed.modelUsage as ModelUsageEntry[]).filter(
+          (e) => e && typeof e.id === "string" && typeof e.count === "number",
+        )
+      : [],
   };
 };
 
@@ -212,3 +220,48 @@ export const saveSettings = (next: FeAiFlowSettings): boolean => {
     return false;
   }
 };
+
+// ----------------- 模型使用计数（「常用模型」快捷 chip 数据源、V0.11.x） -----------------
+
+// 「模型 + 参数组合」唯一 key（params 排序后拼、顺序无关）
+const modelUsageKey = (sel: {
+  id: string;
+  params?: Array<{ id: string; value: string }>;
+}): string =>
+  `${sel.id}||${(sel.params ?? [])
+    .map((p) => `${p.id}=${p.value}`)
+    .sort()
+    .join(",")}`;
+
+// 计数上限：超了淘汰「次数最少、其次最久没用」的条目、防列表无限膨胀
+const MODEL_USAGE_CAP = 20;
+
+/**
+ * 记一次模型使用（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型时调）。
+ * 按 id + params 组合计数、写回 settings（异步落 config.json）。
+ */
+export const recordModelUsage = (sel: ModelSelection): void => {
+  if (!sel.id?.trim()) return;
+  const s = getSettings();
+  const key = modelUsageKey(sel);
+  const list = [...(s.modelUsage ?? [])];
+  const idx = list.findIndex((e) => modelUsageKey(e) === key);
+  if (idx >= 0) {
+    list[idx] = { ...list[idx], count: list[idx].count + 1, lastUsedAt: Date.now() };
+  } else {
+    list.push({ id: sel.id, params: sel.params, count: 1, lastUsedAt: Date.now() });
+  }
+  if (list.length > MODEL_USAGE_CAP) {
+    list.sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt);
+    list.length = MODEL_USAGE_CAP;
+  }
+  saveSettings({ ...s, modelUsage: list });
+};
+
+/**
+ * 取使用次数 top N 的模型（次数同则最近用过的优先）——「常用模型」chip 用。
+ */
+export const getTopUsedModels = (n: number): ModelUsageEntry[] =>
+  [...(getSettings().modelUsage ?? [])]
+    .sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt)
+    .slice(0, n);

@@ -24,7 +24,7 @@ import {
 } from "@/components/ui/dialog";
 import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, recordModelUsage } from "@/lib/local-store";
 import { actionDisplayLabel } from "@/lib/task-display";
 import type { ActionRecord, ModelSelection, Task } from "@/lib/types";
 
@@ -78,6 +78,7 @@ export const RestartDialog = ({
 
   const handleConfirm = () => {
     if (!model.id?.trim()) return;
+    recordModelUsage(model); // 常用模型计数（重启也是一次真实使用）
     onConfirm(model);
   };
 
@@ -101,6 +102,7 @@ export const RestartDialog = ({
               onChange={setModel}
               disabled={submitting}
               variant="full"
+              quickPicks
             />
           </div>
         </div>
