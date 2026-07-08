@@ -60,8 +60,8 @@ export const ChatView = ({
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // SSE 重连 epoch：agent 上一轮 done 后 SSE 会 close、自动重连不处理 done（靠这个 key）；
-  // 用户再发消息自动启新 agent 时 ++、触发 useTaskWatch 重连、否则收不到新一轮事件（V0.6.12 修）
+  // SSE 重连 epoch：V0.11.6 起流跨回合保活（done 不再关流）、这个 key 只剩「终态任务
+  // 被重新激活（如自动启新 agent）」时强制重订阅的兜底作用
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
@@ -127,7 +127,7 @@ export const ChatView = ({
         onTaskUpdateRef.current(latest);
         if (autoStarted) {
           // 起手 loading 行由 EventStream 按「最后一条是用户消息 + running」渲染（取代旧 toast）
-          // 上一轮 agent done 后 SSE 已断、++ 触发重连、才能收到新一轮 agent 的事件流
+          // 终态任务被自动启新 agent 激活时、旧订阅可能已按终态关流、++ 强制重订阅兜底
           setWatchEpoch((n) => n + 1);
         }
       } catch (err) {

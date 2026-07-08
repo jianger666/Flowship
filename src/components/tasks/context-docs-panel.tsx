@@ -20,6 +20,9 @@
 
 import { useMemo, useState } from "react";
 import {
+  ArrowLeft,
+  Copy,
+  ExternalLink,
   FileText,
   Image as ImageIcon,
   ImagePlus,
@@ -106,11 +109,20 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
   const [submitting, setSubmitting] = useState(false);
   // 当前正在删的 docId、避免重复点击
   const [removingId, setRemovingId] = useState<string | null>(null);
+  // 正在看详情的 doc id（非 null 时 Dialog 切详情视图、返回键回列表）——
+  // 存 id 不存对象、删除/刷新后从最新 task.contextDocs 反查、不会看到过期内容
+  const [detailDocId, setDetailDocId] = useState<string | null>(null);
 
   // 贴图 hook：粘贴 / 拖拽 / 选文件 → 缩略图 → 上传
   const attach = useImageAttach({ maxImages: 6 });
 
   const docs = task.contextDocs ?? [];
+
+  // 详情视图的 doc（从最新列表反查、被删后自动回列表视图）
+  const detailDoc = detailDocId
+    ? (docs.find((d) => d.id === detailDocId) ?? null)
+    : null;
+  const detailThumb = detailDoc ? imageThumbnailUrl(task.id, detailDoc) : null;
 
   // 任务跑动中的提示文案
   const isLive =
@@ -207,14 +219,111 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
         open={open}
         onOpenChange={(o) => {
           setOpen(o);
-          if (!o) resetForm();
+          if (!o) {
+            resetForm();
+            setDetailDocId(null);
+          }
         }}
       >
         <DialogContent className="sm:max-w-lg">
+          {detailDoc ? (
+            // ---------- 详情视图（点列表行进入、返回键回列表） ----------
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex min-w-0 items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    onClick={() => setDetailDocId(null)}
+                    aria-label="返回列表"
+                    title="返回列表"
+                    className="shrink-0"
+                  >
+                    <ArrowLeft />
+                  </Button>
+                  <span className="truncate min-w-0">{detailDoc.title}</span>
+                  <span className="text-[10px] uppercase text-muted-foreground/60 shrink-0">
+                    {detailDoc.type}
+                  </span>
+                </DialogTitle>
+              </DialogHeader>
+
+              {detailThumb ? (
+                // 图片：大图预览（点击站内 lightbox 再放大）
+                <ImageThumb
+                  src={detailThumb}
+                  alt={detailDoc.title}
+                  className="max-h-72 w-full rounded-md border bg-muted/30"
+                  imgClassName="max-h-72 w-full object-contain"
+                />
+              ) : (
+                // 文本 / URL / 路径：全文展示（限高滚动、长串可折断）
+                <div className="max-h-72 overflow-y-auto rounded-md border bg-muted/30 px-3 py-2">
+                  <p className="whitespace-pre-wrap text-xs leading-relaxed wrap-anywhere text-foreground/90">
+                    {detailDoc.content}
+                  </p>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2">
+                {detailDoc.type === "url" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    nativeButton={false}
+                    render={
+                      <a
+                        href={detailDoc.content.trim()}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="no-underline"
+                      />
+                    }
+                  >
+                    <ExternalLink />
+                    打开链接
+                  </Button>
+                )}
+                {detailDoc.type !== "image" && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(detailDoc.content);
+                        toast.success("已复制");
+                      } catch {
+                        toast.error("复制失败");
+                      }
+                    }}
+                  >
+                    <Copy />
+                    复制内容
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    void handleRemove(detailDoc.id);
+                    setDetailDocId(null);
+                  }}
+                  className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <Trash2 />
+                  删除
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
           <DialogHeader>
             <DialogTitle>上下文文档</DialogTitle>
             <DialogDescription>
-              agent 启动时会看到清单、按需读取
+              agent 启动时会看到清单、按需读取（点条目看全文）
             </DialogDescription>
           </DialogHeader>
 
@@ -246,15 +355,20 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                           {renderTypeIcon(doc.type)}
                         </span>
                       )}
-                      <span className="font-medium text-foreground/90 shrink-0">
-                        {doc.title}
-                      </span>
-                      <span
-                        className="text-muted-foreground truncate flex-1 min-w-0"
-                        title={doc.content}
+                      {/* 标题 + 预览区整体可点、进详情看全文（V0.11.x 用户痛点：加完看不了详情） */}
+                      <button
+                        type="button"
+                        onClick={() => setDetailDocId(doc.id)}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left cursor-pointer"
+                        title="查看详情"
                       >
-                        {renderPreview(doc)}
-                      </span>
+                        <span className="font-medium text-foreground/90 shrink-0 group-hover:underline underline-offset-2">
+                          {doc.title}
+                        </span>
+                        <span className="text-muted-foreground truncate flex-1 min-w-0">
+                          {renderPreview(doc)}
+                        </span>
+                      </button>
                       <span className="text-[10px] uppercase text-muted-foreground/60 shrink-0">
                         {doc.type}
                       </span>
@@ -383,6 +497,8 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
               </Button>
             </div>
           </div>
+            </>
+          )}
         </DialogContent>
       </Dialog>
     </>

@@ -299,6 +299,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.6：修 V0.11 回归「done 即断流」——ask 弹窗答完永远卡「提交中」（2026-07-08、用户线上实测踩到）
+
+- **现象**：task 模式 ask 弹窗答完后按钮永远「提交中…」、弹窗关不掉（by design 不可 dismiss）、页面再也不更新；后端其实全链路正常（答案已送达、agent 已继续跑完交卷）
+- **根因（V0.11 语义冲突）**：watch-task SSE 沿用旧「publish done → 关流」+ 客户端 hook「收到 done → 不再重连（靠 reconnectKey）」。旧模型 run=整个 action、done 很少见；V0.11 起 run=一个回合、**agent 每说完一轮都 publish done** → 页面在任意回合后断流、后续 `agent.send` 起的新 run 事件全收不到。advance / restart / chat 自动启动路径恰好有 `watchEpoch++` 兜底才没暴露、ask-reply / revise 等路径没有 → 弹窗卡死（Electron 还禁了 cmd+R、用户没有自救手段）
+- **修复（回合结束 ≠ 订阅结束）**：
+  - 服务端 watch-task：done 帧照发、**只有 task 业务终态（merged/abandoned）才关流**、其余保持挂着跨 run 存活
+  - 客户端 use-task-watch：只有「终态 done」才停止订阅、回合级 done 不停、被动断流照常退避重连
+  - reopen（终态恢复）补 `watchEpoch++`（终态时订阅已按终态停、恢复后强制重订阅）；chat-view / page 的旧 epoch 兜底保留不动
+- 顺带：上下文文档弹窗支持点条目看详情（全文 / URL 打开+复制 / 图片大图、返回键回列表）——用户点名「加了就没法看详情」
+
 ### V0.11.5：揪出安装包隐性膨胀根因——CI npm install 重装全依赖（2026-07-08）
 
 - **异常信号**：V0.11.4 压缩优化后线上包 192/189.5MB、远超本地实测 118/112MB → 挂载线上 dmg 对账：**app-server 532MB**（本地组包只有 79MB）

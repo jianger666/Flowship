@@ -649,6 +649,8 @@ const TaskDetailPage = () => {
     try {
       const updated = await reopenTask(task.id);
       setTask(updated);
+      // 终态时订阅已按「终态 done」停掉（V0.11.6 语义）、恢复后要强制重订阅
+      setWatchEpoch((n) => n + 1);
     } catch (err) {
       toast.error(`恢复失败：${(err as Error).message}`);
     } finally {

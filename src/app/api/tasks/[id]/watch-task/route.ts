@@ -6,7 +6,12 @@
  * 协议：
  *   - 进来先发一帧 `task`（当前 task meta）+ 所有历史 `event` 帧
  *   - 然后挂着、有新 task/event/action 变化就 push 增量
- *   - agent run 终止时 push 一帧 `done` + 关闭流
+ *   - agent run 终止时 push 一帧 `done`；**只有任务业务终态（merged / abandoned）才关流**
+ *
+ * V0.11.6 修「done 即关流」：V0.11 起 run = 一个回合（交卷 / 提问 / 说完都自然 finished）、
+ * 每回合结束都会 publish done——沿用旧「done 即关流」语义会让页面在 agent 每说完一轮后断流、
+ * 后续 send 起的新 run 事件全部收不到（实测：ask 弹窗答完卡「提交中」、页面永远不更新）。
+ * 回合结束 ≠ 订阅结束、流保持挂着跨 run 存活。
  *
  * 行为：
  *   - 任务不存在 → 404
@@ -94,11 +99,17 @@ export const GET = async (_req: Request, { params }: Ctx) => {
           case "action":
             send({ type: "action", action: ev.action });
             break;
-          case "done":
+          case "done": {
             send({ type: "done", task: ev.task, ok: ev.ok });
             doneSent = true;
-            closeStream();
+            // V0.11.6：done = 本回合 run 结束、不再等于「本次订阅结束」——
+            // 只有任务真终态才关流、否则保持挂着接后续 send 起的新 run
+            const finalNow =
+              ev.task.repoStatus === "merged" ||
+              ev.task.repoStatus === "abandoned";
+            if (finalNow) closeStream();
             break;
+          }
           case "error":
             send({ type: "error", message: ev.message });
             break;

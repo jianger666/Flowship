@@ -35,9 +35,11 @@
  * - **被动断开自动重连（V0.6.8）**：SSE 流可能被动断开（route 的 maxDuration=300s 到点、
  *   网络抖动、服务端重启），此时 watchTaskStream 正常返回 / 抛错、但 effect 不会自己重跑、
  *   客户端就**静默停在断连那一刻的状态**——典型表现：agent 产出了 artifact 但页面不刷新、
- *   必须手动刷新 / 切 action tab 才看到。解法是 hook 内部用 loop 自动重连：
- *   收到 `done`（agent run 主动结束）= 不重连（靠 reconnectKey 再订阅）；
- *   没收到 done 的被动断流 = 退避后重连（重连时服务端重发 task 快照、对齐漏掉的更新）。
+ *   必须手动刷新 / 切 action tab 才看到。解法是 hook 内部用 loop 自动重连。
+ * - **done ≠ 停止订阅（V0.11.6 修）**：V0.11 起 run = 一个回合、agent 每说完一轮都 publish
+ *   done——旧「收到 done 就不再重连」会让页面在任意一轮后断流、后续 send 起的新 run 事件
+ *   全收不到（实测：ask 弹窗答完永远卡「提交中」）。现在只有 done 里的 task 是业务终态
+ *   （merged / abandoned、服务端也只在这种情况关流）才停止订阅、其余照常保持 / 重连。
  */
 
 import { useEffect, useRef } from "react";
@@ -80,11 +82,13 @@ export const useTaskWatch = (
     const ctrl = new AbortController();
     let cancelled = false;
 
-    // 自动重连循环：被动断流（没收到 done）就退避后重连、收到 done 就停
+    // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」才停止订阅
     const loop = async () => {
       let failures = 0; // 连续报错次数、用于退避 + 兜底放弃
       while (!cancelled) {
-        let gotDone = false; // 本次连接是否收到 done（agent run 主动结束）
+        // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
+        // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
+        let gotTerminalDone = false;
         const sseCallbacks: TaskStreamCallbacks = {
           onEvent: (ev) => callbacksRef.current.onEvent?.(ev),
           onTaskUpdate: (t) => callbacksRef.current.onTaskUpdate?.(t),
@@ -92,7 +96,9 @@ export const useTaskWatch = (
           onAssistantDelta: (text) =>
             callbacksRef.current.onAssistantDelta?.(text),
           onDone: (t, ok) => {
-            gotDone = true;
+            if (t.repoStatus === "merged" || t.repoStatus === "abandoned") {
+              gotTerminalDone = true;
+            }
             callbacksRef.current.onDone?.(t, ok);
           },
           onError: (msg) => {
@@ -118,9 +124,9 @@ export const useTaskWatch = (
           // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
         }
 
-        // 收到 done = agent run 主动结束 → 不重连（靠 reconnectKey 再订阅）；
+        // 终态 done（merged/abandoned、服务端已关流）→ 停止订阅（reopen 走 reconnectKey）；
         // 卸载 / 切 task 也停
-        if (cancelled || gotDone) return;
+        if (cancelled || gotTerminalDone) return;
 
         // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连
         // 重连时服务端 bootstrap 会重发当前 task 快照、把断连期间漏掉的更新对齐回来
