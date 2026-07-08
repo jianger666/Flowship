@@ -1941,18 +1941,36 @@ export const deliverAskReply = async (
 /**
  * V0.11：把用户操作以新消息发给 task 的存活会话（`agent.send`）、并消费产生的新 run。
  * V0.11.1：内存没会话但有落盘 sessionAgentId 且带了凭据 → 先 Agent.resume 接回再 send。
+ * V0.11.7：入口先等在飞 run 排空（几秒级协议间隙、见 waitForRunToDrain）再 send、
+ * 不再直接拒——用户秒答 ask 弹窗撞上「run 还没 finished」曾被误报「没有活跃会话」。
  *
- * @returns false = 没有可续接的会话（没 session 且 resume 不了 / 有 run 正在跑 / send 抛错）、
+ * @returns false = 没有可续接的会话（没 session 且 resume 不了 / run 排空超时 / send 抛错）、
  * 调用方走降级（推进 → force-new agent；再聊聊 / ask 答案 → 报错让用户推进或重启）
  */
+// 等 task 的在飞 run 自然结束（V0.11.7）。返回 false = 超时还在跑。
+// 场景：ask_user 弹窗在 agent 调工具的瞬间就弹给用户、但本回合 run 要再过几秒才 finished
+// （收尾旁白 + stop-check 往返）——用户手快秒答会撞上「run 在跑」。这几秒是协议的正常间隙、
+// 等它排空再 send、而不是把用户的答案拒回去（实测踩过：第一次提交报「没有活跃会话」、几秒后重试才过）。
+const waitForRunToDrain = async (
+  taskId: string,
+  timeoutMs = 90_000,
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (runningTasks.has(taskId)) {
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return true;
+};
+
 const sendToTaskSession = async (
   task: Task,
   text: string,
   opts: { errorActionId?: string; creds?: SessionCreds } = {},
 ): Promise<boolean> => {
-  if (runningTasks.has(task.id)) {
+  if (!(await waitForRunToDrain(task.id))) {
     console.warn(
-      `[task-runner] sendToTaskSession: task=${task.id} 有 run 在跑、拒绝并发 send`,
+      `[task-runner] sendToTaskSession: task=${task.id} run 排空超时、拒绝并发 send`,
     );
     return false;
   }

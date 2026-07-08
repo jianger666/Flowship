@@ -299,6 +299,11 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.7：修「秒答 ask 弹窗撞在飞 run」——第一次提交报「没有活跃会话」、重试才过（2026-07-08、用户线上实测）
+
+- **现象**：agent 调 ask_user 后弹窗立即弹给用户、但本回合 run 还要再跑几秒才 finished（收尾旁白 + stop-check 往返）——用户手快秒答、`sendToTaskSession` 撞上 `runningTasks.has` 直接拒 → 409「没有可续接的 agent 会话」、几秒后重试就成功（线上日志实锤：ask 14:16:41 → 首答 14:16:52.420 被拒 → run 14:16:52.9 才排空 → 重试 14:16:59 成功）
+- **修复**：`sendToTaskSession` 入口不再见 run 就拒、改 `waitForRunToDrain`（300ms 轮询等排空、90s 上限兜底）——协议间隙由 server 消化、不再把用户答案弹回去。推进 / 再聊聊路径本来就在 run 结束后才可操作、等待为 no-op 零影响
+
 ### V0.11.6：修 V0.11 回归「done 即断流」——ask 弹窗答完永远卡「提交中」（2026-07-08、用户线上实测踩到）
 
 - **现象**：task 模式 ask 弹窗答完后按钮永远「提交中…」、弹窗关不掉（by design 不可 dismiss）、页面再也不更新；后端其实全链路正常（答案已送达、agent 已继续跑完交卷）

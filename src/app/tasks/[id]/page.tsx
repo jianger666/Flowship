@@ -992,8 +992,11 @@ const TaskDetailPage = () => {
         </ResizablePanelGroup>
       </div>
 
-      {/* AskUserDialog：agent 调 ask_user 时弹窗 */}
-      <AskUserDialog task={task} />
+      {/* AskUserDialog：agent 调 ask_user 时弹窗。
+          onAnswered=refresh 兜底：提交成功后主动拉一次最新 task——正常靠 SSE 推
+          ask_user_reply 关弹窗、万一流恰好在重连间隙也能靠这次 refetch 收口、
+          不会再出现「后端已送达、弹窗永远卡提交中」（V0.11.6 事故的第二道保险） */}
+      <AskUserDialog task={task} onAnswered={() => void refresh()} />
 
       {/* 再聊聊 Dialog */}
       {currentAction && (
