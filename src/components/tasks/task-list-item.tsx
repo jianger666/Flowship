@@ -9,9 +9,14 @@
  *
  * 行首指示按 runStatus 三态切换（复用同一个槽位、不回到「满屏色点」）：
  *  - running       → 转圈（多任务并行时一眼看出哪个 AI 在跑）
- *  - awaiting_user → 琥珀色脉冲点（哪个在等我回复）
- *  - idle / error  → 类型图标（对话气泡 / 任务清单）
+ *  - awaiting_user 且**真有事等你**（task 模式、action 等审阅 / ask 等答案）→ 琥珀色脉冲点
+ *  - 其余（idle / error / chat 静息 / approve 后静息）→ 类型图标（对话气泡 / 任务清单）
  * （error 不特殊标：断线类 error 常见、标了反而噪声。）
+ *
+ * V0.11.x 收窄琥珀点（用户点名「黄点什么时候才会消失」）：V0.11 后 chat 每轮说完、
+ * task 交卷等 ack 都停在 awaiting_user——老条件下侧栏几乎满屏常亮黄点、失去注意力信号价值。
+ * 现在只有「需要你行动」才亮：等你审阅（awaiting_ack）或 agent 提问等答案（action 还 running）。
+ * chat 静息（你一句我一句的正常状态）不亮。
  */
 
 import Link from "next/link";
@@ -34,12 +39,19 @@ const LeadingIndicator = ({ task }: { task: TaskSummary }) => {
       />
     );
   }
-  // 跑完等你 ack / 回复：琥珀脉冲点（注意力信号、跟运行中区分开）
-  if (task.runStatus === "awaiting_user") {
+  // 真有事等你才亮琥珀点（task 模式限定、见文件头 V0.11.x 收窄说明）：
+  // - awaiting_ack：交卷了等你审阅（通过 / 再聊聊）
+  // - running + awaiting_user：agent 提问（ask 弹窗）等你答案
+  const needsAttention =
+    task.runStatus === "awaiting_user" &&
+    task.mode !== "chat" &&
+    (task.lastActionStatus === "awaiting_ack" ||
+      task.lastActionStatus === "running");
+  if (needsAttention) {
     return (
       <span
         className="flex size-3.5 shrink-0 items-center justify-center"
-        aria-label="等待你回复"
+        aria-label="等待你处理"
       >
         <span className="size-2 animate-pulse rounded-full bg-amber-500" />
       </span>

@@ -1094,6 +1094,12 @@ export const acknowledgeAction = async (
   if (decision === "revise") {
     const running = await setTaskRunStatus(taskId, "running", actionId);
     if (running) publish(taskId, { kind: "task", task: running });
+  } else {
+    // V0.11.x：approve 后没有任何「在等你」的东西了（action 已 completed、无 ask）——
+    // runStatus 归 idle。原来停在 awaiting_user、侧栏琥珀点 / 顶部「等待回复」会永远亮着误导用户。
+    // 不传第三参：保留 currentActionId（「重启当前阶段」等入口还要用）。
+    const idled = await setTaskRunStatus(taskId, "idle");
+    if (idled) publish(taskId, { kind: "task", task: idled });
   }
   await writeEventAndPublish(taskId, {
     kind: "action_ack",

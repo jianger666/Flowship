@@ -299,6 +299,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.8（未发版、攒着）：黄点收窄 + approve 归 idle（2026-07-08、用户点名「黄点什么时候消失」）
+
+- **背景**：V0.11 后 awaiting_user 成了常态静息位（chat 每轮说完 / task 交卷等 ack / approve 后都停在这）——侧栏琥珀脉冲点按旧条件（runStatus=awaiting_user 就亮）几乎满屏常亮、失去注意力信号价值
+- **改法**：
+  - server：approve 后 runStatus 归 idle（action 已 completed、无 ask、没有任何「在等你」的东西；原来永远停在 awaiting_user、顶部「等待回复」badge 也误导）
+  - 侧栏琥珀点只在「需要你行动」时亮（task 模式限定）：lastAction awaiting_ack（等你审阅）或 running + awaiting_user（ask 弹窗等答案）；chat 静息不亮
+
 ### V0.11.8（未发版、攒着）：常用模型快捷位——按使用次数自动排（2026-07-08、用户点名「切模型太麻烦」）
 
 - **交互**：模型选择器（ModelSelect `quickPicks` 开关）上方常驻 2 个 chip = 使用次数 top2 的「模型 + 参数组合」（Fable High 和 Fable Low 算两个条目）、点一下连参数一步选中、不用开下拉搜。用户拍板「自动记录选择次数做排序」、零配置无需手动星标
