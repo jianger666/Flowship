@@ -678,13 +678,11 @@ export interface GitBranchInfo {
  * task 级仓库状态机（跟 MR 生命周期对齐）
  *
  * 状态转移（用户 ack dialog 拍板）：
- *   developing → ship → awaiting_test → (has_bug → build → ship)* → merged
+ *   developing → …（推进各类 action）… → merged / abandoned
  *   任何状态可转 abandoned
  */
 export type RepoStatus =
   | "developing"
-  | "awaiting_test"
-  | "has_bug"
   | "merged"
   | "abandoned";
 

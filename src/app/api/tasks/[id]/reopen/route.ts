@@ -14,7 +14,7 @@
  * # 错误语义
  *
  * - task 不存在 → 404
- * - task 不是终态（developing / awaiting_test / has_bug）→ 400（非终态没有「恢复」一说）
+ * - task 不是终态（developing）→ 400（非终态没有「恢复」一说）
  */
 
 import { errorResponse } from "@/lib/server/route-helpers";

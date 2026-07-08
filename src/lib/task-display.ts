@@ -155,8 +155,6 @@ export const ACTION_STATUS_VARIANT: Record<
 
 export const REPO_STATUS_LABEL: Record<RepoStatus, string> = {
   developing: "开发中",
-  awaiting_test: "待测",
-  has_bug: "有 bug",
   merged: "已合入",
   abandoned: "已放弃",
 };
@@ -166,8 +164,6 @@ export const REPO_STATUS_VARIANT: Record<
   "default" | "secondary" | "destructive" | "outline"
 > = {
   developing: "default",
-  awaiting_test: "secondary",
-  has_bug: "destructive",
   merged: "secondary",
   abandoned: "outline",
 };

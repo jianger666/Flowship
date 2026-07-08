@@ -442,7 +442,6 @@ const TaskDetailPage = () => {
       setTask(data.task);
       setSelectedActionId(data.action.id);
       setAdvanceDialogOpen(false);
-      setWatchEpoch((n) => n + 1);
     } catch (err) {
       toast.error(`推进失败：${(err as Error).message}`);
     } finally {
@@ -456,7 +455,7 @@ const TaskDetailPage = () => {
     const ok = await confirm({
       title: "停止当前 action？",
       description:
-        "会中断正在跑的 agent（如果它正在改代码、可能留下半成品）。停止后可重新「推进」。",
+        "会中断正在跑的 agent（如果它正在改代码、可能留下半成品）。停止后在底部输入条说句话即可唤醒继续。",
       confirmLabel: "停止",
       destructive: true,
     });

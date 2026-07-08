@@ -27,7 +27,7 @@
  *     用户实测发现「点旧 error chip retry」语义混乱（实际是打断当前 running + 起一个全新 action）、retry chip
  *     整套砍了、本 dialog 入口唯一、不接外部 prefill；同步把 `inferRecommended` 里「last action error → 同 type」
  *     那一条删了、错误后默认仍走流程顺推（plan→build→review）、用户手动改、跟「没有自动重试」语义一致
- *   - V0.6.0.1 末段把右上角「推荐」微标签删了：那条逻辑（has_bug→build / plan→build / build→review）本身
+ *   - V0.6.0.1 末段把右上角「推荐」微标签删了：那条推荐逻辑本身
  *     只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导；改成「打开 dialog 时
  *     默认选中一个、用户每次自己拍」、函数也重命名为 inferDefaultActionType
  *   - v0.9.12 通用化（用户拍板「工具往通用走」）：inferDefaultActionType（按 repoStatus / 最近 action
@@ -193,7 +193,6 @@ const ACTION_PLACEHOLDER: Record<Exclude<ActionType, "custom">, string> = {
 };
 
 // 根据 task 当前状态 + 选中 action 类型动态调整 placeholder
-// - has_bug + build → 「修哪个 bug、症状 / 复现路径」
 // - 没 plan + plan → 「需求是什么？要解决什么问题？」（首次）
 // - 有 plan + plan → 「方案要怎么调整？」（再次 plan）
 // - 已有 MR + ship → 「已有 v<N> MR、本次继续推、可选填要点」
@@ -210,9 +209,6 @@ const buildPlaceholder = (
       customDef?.placeholder?.trim() ||
       "（可选）补充说明、不填按该 action 的 playbook 执行"
     );
-  }
-  if (type === "build" && task.repoStatus === "has_bug") {
-    return "修哪个 bug、症状 / 复现路径";
   }
   if (type === "plan") {
     const hasPlan = task.actions.some(

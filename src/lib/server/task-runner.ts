@@ -1779,7 +1779,7 @@ const consumeSessionRun = async (
         text: [
           `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 wait_for_user）就结束了回复`,
           "",
-          "下一步：重新「推进」该阶段重跑、或换更稳的模型",
+          "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
         ].join("\n"),
       });
       const updated = await getTask(task.id);

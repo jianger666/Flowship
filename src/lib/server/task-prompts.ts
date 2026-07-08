@@ -19,7 +19,7 @@ import {
   getEventsLogPath,
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
-import { turnDisciplineSection } from "./wait-protocol-prompt";
+import { turnDisciplineSection } from "./turn-discipline";
 import { formatRepoSectionForPrompt } from "@/lib/path-utils";
 import {
   getTaskCwd,

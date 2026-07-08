@@ -42,7 +42,7 @@ import {
 import { getEventsLogPath } from "./task-fs-core";
 import { getChatMcpUrl } from "./chat-mcp";
 import { setChatAwaitingNotifier } from "./chat-pending";
-import { chatTurnProtocolSection } from "./wait-protocol-prompt";
+import { chatTurnProtocolSection } from "./turn-discipline";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,

@@ -83,7 +83,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (runningTasks.has(task.id) || task.runStatus === "running") {
     return errorResponse("agent 正在跑、等它说完这轮再问", 409);
   }
-  if (getPendingAsk(task.id)) {
+  // ask 弹窗还在等答案时把用户往弹窗引——但当前 action 已停在半路（agent 报错 / 被停、
+  // 弹窗其实已经没人接了）时不拦：放行走唤醒模式、悬着的问题会随断点续传重新问到
+  const haltedAction = task.actions.find(
+    (a) =>
+      a.id === task.currentActionId &&
+      (a.status === "error" || a.status === "cancelled"),
+  );
+  if (getPendingAsk(task.id) && !haltedAction) {
     return errorResponse("AI 正在弹窗等你回答、先答完弹窗里的问题", 409);
   }
 

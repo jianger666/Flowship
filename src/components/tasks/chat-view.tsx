@@ -60,9 +60,6 @@ export const ChatView = ({
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // SSE 重连 epoch：V0.11.6 起流跨回合保活（done 不再关流）、这个 key 只剩「终态任务
-  // 被重新激活（如自动启新 agent）」时强制重订阅的兜底作用
-  const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
 
@@ -96,8 +93,7 @@ export const ChatView = ({
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
-    // enabled=true 恒开；reconnectKey=watchEpoch 让「自动启新 agent」后能重连 SSE
-  }, true, watchEpoch);
+  }, true);
 
   // 用户回复：无论 task.runStatus 是什么、统一走 sendChatReply
   // 后端 chat-reply 路由自己决定（V0.11）：有存活会话 → send 续接；无会话 → bootArgs 起新会话
@@ -114,7 +110,7 @@ export const ChatView = ({
 
       setIsSubmitting(true);
       try {
-        const { task: latest, autoStarted } = await sendChatReply(
+        const { task: latest } = await sendChatReply(
           task.id,
           text,
           images,
@@ -125,11 +121,6 @@ export const ChatView = ({
           },
         );
         onTaskUpdateRef.current(latest);
-        if (autoStarted) {
-          // 起手 loading 行由 EventStream 按「最后一条是用户消息 + running」渲染（取代旧 toast）
-          // 终态任务被自动启新 agent 激活时、旧订阅可能已按终态关流、++ 强制重订阅兜底
-          setWatchEpoch((n) => n + 1);
-        }
       } catch (err) {
         toast.error(`回复失败：${(err as Error).message}`);
       } finally {

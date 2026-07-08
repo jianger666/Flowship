@@ -209,8 +209,6 @@ const TaskMetaV06Schema = z
     mode: z.enum(["task", "chat"]).optional(),
     repoStatus: z.enum([
       "developing",
-      "awaiting_test",
-      "has_bug",
       "merged",
       "abandoned",
     ]),
