@@ -844,13 +844,17 @@ const TaskDetailPage = () => {
             maxSize="80%"
           >
             <aside className="flex h-full flex-col">
-              {/* hideReplyComposer=true：V0.6 任务推进通过顶部「推进」按钮、回复通过「再聊聊」dialog */}
-              <EventStream
-                task={task}
-                streamingText={streamingText}
-                hideReplyComposer
-              />
-              {/* V0.11.9 统一「跟 AI 说」入口：等审阅时按再聊聊送（agent 二分类）、其他时刻纯提问 */}
+              {/* min-h-0 + flex-1：EventStream 根节点是 h-full、必须给它一个「刨掉底部输入条后」
+                  的确定高度容器、否则总高超 100%、事件流滚不到底（V0.11.9 加输入条时踩过） */}
+              <div className="min-h-0 flex-1">
+                {/* hideReplyComposer=true：任务模式回复走底部 TaskTalkComposer、不用 EventStream 内置输入框 */}
+                <EventStream
+                  task={task}
+                  streamingText={streamingText}
+                  hideReplyComposer
+                />
+              </div>
+              {/* V0.11.9 统一「跟 AI 说」入口：等审阅时按再聊聊送（agent 二分类）、其他时刻纯提问 / 唤醒 */}
               <TaskTalkComposer task={task} onTaskUpdate={setTask} />
             </aside>
           </ResizablePanel>

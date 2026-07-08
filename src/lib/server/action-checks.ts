@@ -2,7 +2,7 @@
  * Action 后置 deterministic 检查（V0.6 门槛 2）
  *
  * 设计原则：
- *   - 每个 action 类型一组检查、runner 在 agent 调 wait_for_user(action_id) 切 awaiting_ack 前跑
+ *   - 每个 action 类型一组检查、runner 在 agent 调 submit_work(action_id) 切 awaiting_ack 前跑
  *   - 检查不依赖 agent 自称、走真实 shell / fs / git diff
  *   - 检查不通过：action 仍切 awaiting_ack（让用户看到结果）、但 postCheck.passed=false
  *     UI 上挂红条「后置检查未过」、用户可以选 revise 让 agent 改

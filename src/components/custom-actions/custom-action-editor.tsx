@@ -8,7 +8,7 @@
  * 模板变量 chips 曾加过又删（用户实测「不知道是干嘛的、没太大用处」）——任务标题 / 仓库路径 /
  * artifact 目录这些上下文 super prompt 本来就有独立段落传给 agent、playbook 不需要点位引用；
  * 运行时 {{var}} 替换链路仍在（跟内置 prompt 同一条 fillTemplate）、手写仍生效、只是不宣传。
- * 协议层（产出 artifact / HITL / wait_for_user / 再聊聊）由 runner 自动包、用户不用在 playbook 里写。
+ * 协议层（产出 artifact / HITL / submit_work / 再聊聊）由 runner 自动包、用户不用在 playbook 里写。
  *
  * 复用：MultiSelect（skill 勾选、已勾但本机没有的显示灰 chip）。
  */

@@ -278,9 +278,9 @@ add_comment({
 - `feishuTesterUserKeys` 为空数组（用户选了跳过）：评论不加 @ mention 块、只贴链接、notify 两参数省略（或传空）
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
 
-### 5. 写 ship artifact + wait_for_user
+### 5. 写 ship artifact + submit_work
 
-artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `wait_for_user({ task_id, action_id, artifact_path: "actions/<N>-ship.md" })` 等用户 ack。
+artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit_work({ task_id, action_id, artifact_path: "actions/<N>-ship.md" })` 等用户 ack。
 
 ## MR description 模板
 

@@ -48,7 +48,7 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 
 ## 关键属性
 
-- **会话跨 run 存活（V0.11）**：agent 交卷（`wait_for_user`、非阻塞）/ 提问（`ask_user`）后自然结束回合；用户的每一步操作（推进续用 / 再聊聊 / 答弹窗 / chat 消息）由服务端 `agent.send()` 以新消息续接同一会话、上下文不丢
+- **会话跨 run 存活（V0.11）**：agent 交卷（`submit_work`、非阻塞）/ 提问（`ask_user`）后自然结束回合；用户的每一步操作（推进续用 / 再聊聊 / 答弹窗 / chat 消息）由服务端 `agent.send()` 以新消息续接同一会话、上下文不丢
 - **HITL 是底线**：每个 action 边界都要用户 ack（**通过** / **再聊聊**）、不会偷偷往下走
 - **双状态**：`repoStatus`（developing / awaiting_test / has_bug / merged / abandoned）+ `runStatus`（idle / running / awaiting_user / error）分两个 badge 显示
 - **6 个 Harness 门槛**：action 前置准入 / 后置确定性检查 / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（V0.6.4+）/ placeholder 动态
@@ -128,7 +128,7 @@ ai-flow/
 │       └── server/
 │           ├── task-runner.ts               # V0.6 统一 runner（task 模式、单 SDK Run + action 推进）
 │           ├── chat-runner.ts               # chat 模式 agent 生命周期
-│           ├── chat-mcp.ts                  # 本地 HTTP MCP（wait_for_user / ask_user）
+│           ├── chat-mcp.ts                  # 本地 HTTP MCP（submit_work / ask_user）
 │           ├── action-checks.ts             # action 后置确定性检查
 │           ├── gitlab-client.ts             # ship：server-side GitLab REST
 │           ├── cursor-config.ts             # 读 ~/.cursor 全局 MCP / rules 注入
@@ -164,7 +164,7 @@ ai-flow/
 | Cursor API Key | localStorage | 不上传服务器、每用户自配 |
 | 默认模型 + 参数 | localStorage | `ModelSelection`、跟 SDK schema 一致 |
 | 仓库列表 | localStorage | 桌面端原生 picker（`pickNativePaths`）选目录、可多仓 |
-| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `aiFlowChat`（提供 `wait_for_user` / `ask_user`） |
+| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `aiFlowChat`（提供 `submit_work` / `ask_user`） |
 | 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP |
 | Prompt 模板 | `prompts/action-*.md` + `_super.md` / `_shared.md` | 用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |
 | 任务数据 | `data/tasks/<id>/` | meta.json + events.jsonl + actions/ 目录 |

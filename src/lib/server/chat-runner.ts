@@ -12,7 +12,7 @@
  *   - 有存活会话（agent 在、无 run 在跑）→ sendChatMessage（agent.send 续同一会话）
  *   - 无会话（首条 / agent 已关 / 服务重启过）→ runChatSession（Agent.create + 首条进起手 prompt）
  * - agent 答完自然结束 turn → run finished → runStatus=awaiting_user 等下一条、**会话保留**
- * - 不再有 wait_for_user / shell curl 长轮询——agent 就是正常的多轮对话
+ * - 不再有 submit_work / shell curl 长轮询——agent 就是正常的多轮对话
  *
  * # 状态机
  *
@@ -260,10 +260,10 @@ interface InitialUserMessage {
  * 拼 chat agent 起手 prompt
  *
  * 跟 V0.6 task-runner 的 _super.md 完全无关、不夹任务容器协议（[NEXT_ACTION] / [ACTION_ACK] / [TASK_DONE]）。
- * 只装 chat 必备：wait_for_user + shell long-poll + 禁止泄露协议。
+ * 只装 chat 必备：submit_work + shell long-poll + 禁止泄露协议。
  *
  * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答（V0.5 自由化策略）
- * 无 firstMessage：起手姿势就是 wait_for_user 等用户发第一句（边界情况、resume run）
+ * 无 firstMessage：起手姿势就是 submit_work 等用户发第一句（边界情况、resume run）
  */
 const buildInitialPrompt = (
   task: Task,
@@ -319,7 +319,7 @@ const buildInitialPrompt = (
     "",
   ];
 
-  // 起手姿势：有首条 → 直接答；无首条 → wait_for_user 起手等
+  // 起手姿势：有首条 → 直接答；无首条 → submit_work 起手等
   lines.push(...buildOpeningStanceSection(task.id, firstMessage));
 
   return lines.join("\n");
@@ -432,19 +432,19 @@ const handleSdkMessage = async (
       const argsAny = (msg.args ?? {}) as Record<string, unknown>;
       const innerToolName =
         typeof argsAny.toolName === "string" ? argsAny.toolName : "";
-      // 区分 wait_for_user / 其他工具：wait_for_user 的成功调用不刷事件（notifier 已处理 awaiting）。
-      // 必须连 MCP wrapper 一起认——漏认会把 wait_for_user 写成普通 tool_call、
+      // 区分 submit_work / 其他工具：submit_work 的成功调用不刷事件（notifier 已处理 awaiting）。
+      // 必须连 MCP wrapper 一起认——漏认会把 submit_work 写成普通 tool_call、
       // 被兜底 A 误当「答后又干活」拦下（2026-06-16 线上事故根因）。
       const isWaitForUser =
-        msg.name === "wait_for_user" ||
+        msg.name === "submit_work" ||
         msg.name === "Wait For User" ||
-        innerToolName === "wait_for_user" ||
+        innerToolName === "submit_work" ||
         innerToolName === "Wait For User";
       if (isWaitForUser) {
         if (msg.status === "error") {
           await writeEventAndPublish(taskId, {
             kind: "error",
-            text: `wait_for_user 工具调用失败：${truncate(stringifyMeta(msg.result), 200)}`,
+            text: `submit_work 工具调用失败：${truncate(stringifyMeta(msg.result), 200)}`,
           });
         }
         break;
@@ -696,7 +696,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
 // ----------------- V0.11.1：notifier 注册 + 会话恢复 -----------------
 
-// chat 的 awaiting notifier：agent 误调 wait_for_user / ask_user 时的防御兜底
+// chat 的 awaiting notifier：agent 误调 submit_work / ask_user 时的防御兜底
 //（chat prompt 已禁这两个工具、但模型偶发不听话——别让状态漂）
 const registerChatNotifier = (task: Task): void => {
   setChatAwaitingNotifier(task.id, async (signal) => {

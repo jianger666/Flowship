@@ -2,7 +2,7 @@
  * hooks 注入（V0.6.3 stop、V0.6.27 加 beforeShellExecution）
  *
  * 目的：给 fe 起的 SDK agent 套两道硬约束——
- * 1. **stop hook**：agent 退出前必须交卷（调 wait_for_user）、否则 follow-up 同会话拉回补调。
+ * 1. **stop hook**：agent 退出前必须交卷（调 submit_work）、否则 follow-up 同会话拉回补调。
  *    这是 L1-L4 所有后置 deterministic check 的「触发保证层」。探针实测见 HANDOFF V0.6.3 段。
  * 2. **beforeShellExecution hook（shell-guard）**：每条 shell 命令前问 fe /api/hooks/shell-check、
  *    踩硬禁令（--fix / force push / dev server 等）直接 deny——把 _shared.md 的 prompt

@@ -659,7 +659,7 @@ export const buildResumeActionInstruction = (
   }
   lines.push(
     "",
-    "完成后调用 \`wait_for_user({ task_id, action_id, artifact_path })\` 对这个同一个 action 交卷、然后结束本轮回复。",
+    "完成后调用 \`submit_work({ task_id, action_id, artifact_path })\` 对这个同一个 action 交卷、然后结束本轮回复。",
   );
   return lines.join("\n");
 };

@@ -2,7 +2,7 @@
  * /api/mcp/chat-tool
  *
  * 这是 ai-flow 自己起的 HTTP MCP server endpoint、
- * Cursor SDK 启的 agent 会作为 MCP 客户端连过来、调里面的 `wait_for_user` 工具。
+ * Cursor SDK 启的 agent 会作为 MCP 客户端连过来、调里面的 `submit_work` 工具。
  *
  * 全部 GET / POST / DELETE 都直接转给 chat-mcp 模块里的 transport 处理、
  * 这一层只负责把 Next.js 的 Request → MCP transport.handleRequest。

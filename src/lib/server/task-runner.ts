@@ -285,7 +285,7 @@ export const cancelTaskRun = (taskId: string): boolean => {
  * V0.8.18：后台跑某 action 的后置 deterministic check（异步、不阻塞调用方）。
  *
  * # 为什么后台跑（线上踩过）
- * check 若在 awaitingNotifier 里被 `wait_for_user` MCP 工具**同步 await**、工具就要阻塞到
+ * check 若在 awaitingNotifier 里被 `submit_work` MCP 工具**同步 await**、工具就要阻塞到
  * check 跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
  * 改成：notifier 立即返回（agent 秒回引导、第一时间挂 curl long-poll 等 ack）、check 在这里后台跑、
  * 跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
@@ -1205,7 +1205,7 @@ interface StartAgentInput {
 // taskActionHandler（submit_mr / set_feishu_testers / set_plan_batches 同步 RPC）+
 // awaitingNotifier（交卷跑后置 check / ask 弹窗事件 / 切 awaiting）原来是 internalStartAgent
 // 的内联闭包；V0.11.1 抽出来：Agent.resume 恢复会话时也必须重注册这两座桥、否则恢复后的
-// agent 调 submit_mr / wait_for_user 全部落空。闭包持 gitHost / gitToken 快照（会话期不可变）。
+// agent 调 submit_mr / submit_work 全部落空。闭包持 gitHost / gitToken 快照（会话期不可变）。
 const registerSessionBridges = (
   task: Task,
   opts: { gitHost?: string; gitToken?: string } = {},
@@ -1481,16 +1481,16 @@ const registerSessionBridges = (
       return;
     }
 
-    // awaiting_start：agent 完成一个 action 调 wait_for_user(action_id) → 后台跑 check + 切 awaiting_ack
-    //                 或 agent 待命 wait_for_user(待命态、不带 action_id) → 只切 runStatus=awaiting_user
+    // awaiting_start：agent 完成一个 action 调 submit_work(action_id) → 后台跑 check + 切 awaiting_ack
+    //                 或 agent 待命 submit_work(待命态、不带 action_id) → 只切 runStatus=awaiting_user
     if (signal.actionId) {
       // V0.8.18：后置 deterministic check（build 的 lint/typecheck 可达 120s）改后台异步跑——
-      // 这样 notifier 立即返回、agent 的 wait_for_user 工具秒回引导、第一时间挂上 curl long-poll 等 ack
-      // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「wait_for_user 失败」乱来、线上踩过）。
+      // 这样 notifier 立即返回、agent 的 submit_work 工具秒回引导、第一时间挂上 curl long-poll 等 ack
+      // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
     } else {
-      // 待命态：agent ack 完、调 wait_for_user(空 action_id) 等下一 action 指令 → 切 awaiting_user。
+      // 待命态：agent ack 完、调 submit_work(空 action_id) 等下一 action 指令 → 切 awaiting_user。
       // 用 setTaskAwaitingIfIdle（锁内 compare-set）防 force-new 秒推 race：approve 后用户秒推下一 action、
       //   advanceTask 已把 runStatus 设 running 且新 action 在跑时、此处被取消的旧 agent 迟到的待命通知
       //   不能把 running 覆盖回 awaiting_user（否则新 action 在跑却显示「等待回复」、推进按钮误亮、僵尸组合）。
@@ -1777,7 +1777,7 @@ const consumeSessionRun = async (
         kind: "error",
         actionId: lastAction.id,
         text: [
-          `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 wait_for_user）就结束了回复`,
+          `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 submit_work）就结束了回复`,
           "",
           "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
         ].join("\n"),
@@ -1881,7 +1881,7 @@ const resumeTaskSession = async (
       local: { cwd: getTaskCwd(task), settingSources: ["project"] },
       mcpServers: mergedMcp,
     });
-    // 恢复的 agent 调 submit_mr / wait_for_user 要走桥、必须重注册
+    // 恢复的 agent 调 submit_mr / submit_work 要走桥、必须重注册
     registerSessionBridges(task, {
       gitHost: creds.gitHost,
       gitToken: creds.gitToken,

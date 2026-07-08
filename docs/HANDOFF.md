@@ -305,7 +305,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - Cmd/Ctrl+J 快捷键改为聚焦底部输入条（原开再聊聊弹窗）
 - **唤醒模式周边收口**（用户点名全面检查）：ask 弹窗失效态 / 停止确认 / 「没交卷」error 三处引导文案改成「底部输入条说句话即可唤醒」；question 路由的 pendingAsk 拦截对「action 已停在半路」豁免（stale 弹窗没人接、不该把用户堵在弹窗上——唤醒后断点续传会重新问到）
 - **E 批小清理**：repoStatus 死枚举 awaiting_test / has_bug 删除（全仓从未写入过）；V0.11.6 后冗余的 watchEpoch 重连兜底清掉（只留 reopen 终态重订阅）；wait-protocol-prompt.ts 改名 turn-discipline.ts
-- **待讨论候选（用户拍板「记下后面翻出来」）**：① chat / task 双 runner 合一（最大代码冗余、双份逻辑漂移是 bug 温床）② wait_for_user 改名（仍在积极使用、是每个 action 的交卷工具；改名纯语义收益、低优先）
+- **交卷工具改名 `wait_for_user` → `submit_work`**（用户拍板）：prompts / 工具注册 / src 文案全量改；**旧名保留一版 alias**（同 handler、升级前启动的会话 in-context 还教旧名、断代会交不了卷、下版本删）；sdk-message-handler 的交卷特判两个名字都认
+- **事件流滚不到底修复**：EventStream 根节点是 `h-full`、底部加输入条后总高超 100%——外层包 `min-h-0 flex-1` 容器给它确定高度
+- **待讨论候选（用户拍板「记下后面翻出来」）**：chat / task 双 runner 合一（最大代码冗余、双份逻辑漂移是 bug 温床）
 - **说话入口合一（TaskTalkComposer）**：原「再聊聊」弹窗（+Cmd/Ctrl+J）与「问一问」输入条 90% 重复、二合一成事件流底部常驻输入条——**系统按状态自动懂语境**：当前产出等审阅 → 按 revise 送（agent 二分类：问就答、改就改完重新交卷）；其他时刻 → [USER_QUESTION] 纯提问；显式选模型 → 一次性答疑 agent。支持贴图（粘贴 / 附图）。revise-dialog.tsx 删除
 - **prompt 措辞修正**（用户实测 agent 旁白「等你点通过」误导）：_super / action-* 全部清掉「用户点通过」概念、改「认可 = 直接推进（无通过按钮）、旁白禁说点通过」
 

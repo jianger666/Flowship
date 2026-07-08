@@ -3,13 +3,13 @@
  *
  * 这个文件做的事情（V0.9.x 拆分、V0.11 wait 协议退役后）：
  * 1. 用官方 `@modelcontextprotocol/sdk` 起一个 stateful 的 HTTP MCP server
- * 2. 在它上面注册 `wait_for_user` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` 工具
+ * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` 工具
  * 3. 工具 handler 调 chat-pending 的 registerPendingAsk / runTaskAction / safeNotifyXxx
  * 4. 暴露一个 fetch-style 的 `handleChatMcpRequest`、给 Next.js App Router 直接调
  *
  * ## V0.11 模型：create + 多轮 send、run 自然结束（wait 协议退役）
  *
- * - `wait_for_user` = **交卷**（非阻塞）：通知 runner 跑后置 check + 切 awaiting_ack、
+ * - `submit_work` = **交卷**（非阻塞）：通知 runner 跑后置 check + 切 awaiting_ack、
  *   返回「结束本轮回复」——agent 正常结束 turn、run 自然 finished 是**正常路径**
  * - `ask_user` = **弹窗**（非阻塞）：登记 pendingAsk + 通知 runner 写事件、返回「结束本轮回复」
  * - 用户的一切后续操作（再聊聊 / 推进 / ask 答案 / chat 消息）由 server 端
@@ -39,7 +39,7 @@ import {
 
 // ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
-// wait_for_user 交卷成功后的返回：明确「结束回复、别等待」——这是 run 自然结束的正常出口
+// submit_work 交卷成功后的返回：明确「结束回复、别等待」——这是 run 自然结束的正常出口
 const submittedText = (actionId: string): string =>
   [
     `[SUBMITTED] action=${actionId} 已交卷、系统正在后台跑质量检查、用户会收到通知。`,
@@ -74,9 +74,10 @@ const buildMcpServer = (): McpServer => {
     version: "1.0.0",
   });
 
-  srv.registerTool(
-    "wait_for_user",
-    {
+  // V0.11.9 改名：wait_for_user → submit_work（语义早就是「交卷」不是「等待」、名字跟上）。
+  // 抽出 config / handler 供双注册：旧名保留一版作 alias（升级前启动的会话 in-context prompt
+  // 还教的旧名、断代会让在跑任务交不了卷）、下个大版本删。
+  const submitWorkConfig = {
       title: "交卷：宣告当前 action 完成（非阻塞、调完就结束本轮回复）",
       description: [
         "Task 模式（action 容器）专用：完成一个 action（写完 artifact）后调本工具**交卷**。",
@@ -91,7 +92,7 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 用法",
         "",
-        "`wait_for_user({ task_id, action_id, artifact_path })`",
+        "`submit_work({ task_id, action_id, artifact_path })`",
         "  - `action_id`：当前 action 的 id（agent 启动时 / [NEXT_ACTION ...] 头里传过的）",
         "  - `artifact_path`：刚产出的 artifact 相对路径（如 `actions/1-plan.md`）",
         "",
@@ -119,10 +120,20 @@ const buildMcpServer = (): McpServer => {
             "完成 action 时可选：刚产出的 artifact 相对 task 根的路径（如 `actions/1-plan.md`）。用于 UI 展示和审计。",
           ),
       },
-    },
-    async ({ task_id, message, action_id, artifact_path }) => {
+    };
+  const submitWorkHandler = async ({
+    task_id,
+    message,
+    action_id,
+    artifact_path,
+  }: {
+    task_id: string;
+    message?: string;
+    action_id?: string;
+    artifact_path?: string;
+  }) => {
       console.log(
-        `[chat-mcp] wait_for_user 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"}`,
+        `[chat-mcp] submit_work 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"}`,
       );
 
       // 不带 action_id（chat 模式旧姿势 / 老 prompt 惯性「待命态」）→ 不需要任何等待、
@@ -143,7 +154,19 @@ const buildMcpServer = (): McpServer => {
       return {
         content: [{ type: "text" as const, text: submittedText(action_id) }],
       };
+    };
+
+  srv.registerTool("submit_work", submitWorkConfig, submitWorkHandler);
+  // 旧名 alias（仅为升级前启动的在跑会话兜底、新 prompt 全部教 submit_work、下版本删）
+  srv.registerTool(
+    "wait_for_user",
+    {
+      ...submitWorkConfig,
+      title: "（旧名、= submit_work）交卷：宣告当前 action 完成",
+      description:
+        "本工具已改名 `submit_work`、行为完全一致——这是旧名 alias、仅供升级前启动的会话使用；能用 submit_work 就用它。",
     },
+    submitWorkHandler,
   );
 
   // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态、V0.11 非阻塞）-----------------
@@ -172,7 +195,7 @@ const buildMcpServer = (): McpServer => {
         "",
         "- **单次调用内**：把当前轮想问的问题**全部打包**到 questions[]、UI modal 一次答完——不要同一时刻调多次（一时刻只能有一组 pending、第二次会顶替第一次）",
         "- **整个 action 内无次数上限**：agent 按内容判断——「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项」是正常流程",
-        "- **收敛标准**：所有问题都得到「明确的业务决策」（能直接落进 artifact 的）才交卷（wait_for_user）。判不准就再问、不要打 default 跳过",
+        "- **收敛标准**：所有问题都得到「明确的业务决策」（能直接落进 artifact 的）才交卷（submit_work）。判不准就再问、不要打 default 跳过",
         "- **只在确实有不确定项时调用**——没问题就跳过、直接交卷",
         "- **options 里不要手动塞「Other / 其他 / 其它 / 以上都不是 / 自定义」类的兜底选项**——`allow_text=true` 时 UI 会自动渲染「以上都不是 / 自定义回答…」按钮、你再加会重复",
         "",
@@ -267,7 +290,7 @@ const buildMcpServer = (): McpServer => {
 
   // ----------------- submit_mr 工具（V0.6.1、ship action 专用、同步调 GitLab API）-----------------
   //
-  // 这是「同步 RPC 工具」、跟 wait_for_user / ask_user 的「长阻塞 + shell long-poll」完全不同：
+  // 这是「同步 RPC 工具」、跟 submit_work / ask_user 的「长阻塞 + shell long-poll」完全不同：
   //   - 不需要等用户操作、纯 server-side 调 GitLab REST API、立即返回结果
   //   - 不需要写 shell + curl 引导、agent 拿到 MCP 结果就接着推进
   //   - 不需要 token / pendingMap：每次调用 server 自己访问 GitLab 即可
@@ -549,7 +572,7 @@ const buildMcpServer = (): McpServer => {
 // ----------------- 会话表（stateful 模式） -----------------
 //
 // stateless 模式 SDK 会硬拒「跨请求复用 transport」、
-// 但我们 wait_for_user 是长阻塞工具、必须跨请求保留 transport 生命周期。
+// 但我们 submit_work 是长阻塞工具、必须跨请求保留 transport 生命周期。
 // 所以走 stateful：客户端 init 拿 sessionId、后续请求带 sessionId 复用 transport。
 //
 // 「sessionId → transport」表本体在 chat-pending 的 globalThis 状态里（拆文件不拆状态）、
@@ -563,7 +586,7 @@ const buildSessionTransport =
       //
       // 背景：MCP StreamableHTTP transport 默认 client 启 transport 后会建一条 GET SSE
       // 长连接接 server push notification。但我们业务上：
-      //   - wait_for_user / ask_user 都是立即返回 SHELL_WAIT_GUIDE、不走 SSE stream
+      //   - submit_work / ask_user 都是立即返回 SHELL_WAIT_GUIDE、不走 SSE stream
       //   - UI 事件流推送走 ai-flow 自己的 /api/tasks/[id]/events 端点、不走 MCP push
       //
       // 空挂着的 GET 在 Next.js dev / 中间层会被 idle 5 分钟超时砍、

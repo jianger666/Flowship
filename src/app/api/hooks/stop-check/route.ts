@@ -2,7 +2,7 @@
  * POST /api/hooks/stop-check（V0.6.3）
  *
  * fe 起的 SDK agent 想结束 Run 时、业务仓库 .cursor/hooks.json 里的 fe stop hook 脚本会 curl 本路由。
- * 本路由判断「当前 action 交卷没」、决定放行结束、还是 follow-up 把 agent 同会话拉回补调 wait_for_user。
+ * 本路由判断「当前 action 交卷没」、决定放行结束、还是 follow-up 把 agent 同会话拉回补调 submit_work。
  *
  * 请求：{ agent_id: string }（= stop hook stdin 的 conversation_id）
  *
@@ -83,7 +83,7 @@ export const POST = async (req: Request): Promise<Response> => {
       "[ai-flow] 检测到你还没对当前 action 交卷、不要结束本次回复。",
       `当前 action：id=${last.id}、type=${last.type}、n=${last.n}。`,
       last.artifactPath ? `artifact 路径：${last.artifactPath}。` : "",
-      "请先调用 wait_for_user 工具（传 task_id / action_id / artifact_path）交卷、然后再结束回复。",
+      "请先调用 submit_work 工具（传 task_id / action_id / artifact_path）交卷、然后再结束回复。",
     ]
       .filter(Boolean)
       .join("\n");

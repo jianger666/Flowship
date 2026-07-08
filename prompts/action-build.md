@@ -15,8 +15,8 @@
   - **原仓库直跑模式**：runner 在 [NEXT_ACTION ...] 头后注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
     - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
     - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
-    - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 wait_for_user 等用户处理、**不要**自己 force / reset
-    - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + wait_for_user）
+    - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 submit_work 等用户处理、**不要**自己 force / reset
+    - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + submit_work）
 
 - **🔒 铁律（V0.6.20、写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git rev-parse --abbrev-ref HEAD` 拿当前分支、跟「## 仓库分支配置」段里这仓的 branch name 比对：
   - 一致 → 正常往下做
@@ -58,7 +58,7 @@
 4. **不动用户业务仓库根的 README / package.json**——除非最新 plan artifact 明确说要改
 5. **不上 npm install / pnpm add 新依赖**——除非最新 plan artifact 明确批准了某个依赖
 6. **不动 ai-flow 项目本身**——agent 改的是用户业务仓库（`{{repoPath}}`）、不是 ai-flow
-7. **不跑下一个 action**——build action 写完 artifact 后调 wait_for_user 等用户 ack、拿到 approve 后等下一 action 指令（**不要**自动 review）
+7. **不跑下一个 action**——build action 写完 artifact 后调 submit_work 等用户 ack、拿到 approve 后等下一 action 指令（**不要**自动 review）
 8. **artifact 只写本轮增量、禁止搬运上轮实现文档**——新建一个 build action 时，`actions/<n>-build.md` 的主语是「本轮做了什么 / 没做什么 / 为什么」。可以引用上一轮 build（如「沿用 build #14」），但不要把上一轮的 Task 完成情况、实现细节、验收清单整段复制过来伪装成本轮产出。
 
 ## 执行步骤
@@ -179,7 +179,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 `<n>` 是从 [NEXT_ACTION] 头里拿的 action.n。artifact 写入工具用法见「跨 action 共享规范 §1 artifact 写入工具」。格式按下面骨架。
 
-### 6. 调 `wait_for_user` 交卷、结束回复
+### 6. 调 `submit_work` 交卷、结束回复
 
 参数：
 - `task_id={{taskId}}`
@@ -188,7 +188,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
 
-- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`（同 action_id + artifact_path）重新交卷、结束回复
+- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行、**绝对不自动进入 review**——下一个 action 类型由用户在 UI 选
 
 ## 自检（V0.6.3 起：runner 不再自动跑后置检查、build 质量靠你自检 + 用户人眼把关）
@@ -295,6 +295,6 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 - **TypeScript strict**：仓库一般开了 strict、不要写 `any`（除非局部有非常充分的理由）
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
 - **跑 shell 慢的命令**：`pnpm install` / 全量 build 可能耗时几分钟、agent 不要因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
-- **写完 → 给 1-3 句简短结论 → 调 wait_for_user**：结论说清「改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留」（流式、简短、别长篇复述）；别说「我改完了你看下」这种没信息量的空话、也别说完忘了调 wait（详见 super-prompt 关键规则 1）
+- **写完 → 给 1-3 句简短结论 → 调 submit_work**：结论说清「改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留」（流式、简短、别长篇复述）；别说「我改完了你看下」这种没信息量的空话、也别说完忘了调 wait（详见 super-prompt 关键规则 1）
 - **绝对不自动进入下一 action**：build 交卷后结束回复、不要自己跑 review / ship——下一 action 类型由用户在 UI 选
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

@@ -943,7 +943,7 @@ export const setTaskRunStatus = async (
  *
  * 防「秒推下一 action」race（僵尸组合、旧 wait 协议时代踩过、V0.11 沿用防御）：
  *   用户推进新 action → runStatus 已设 running、新 action 在跑；此时旧 agent 迟到的
- *   awaiting 通知（不带 action_id 的 wait_for_user 调用）若用裸 setTaskRunStatus、会把
+ *   awaiting 通知（不带 action_id 的 submit_work 调用）若用裸 setTaskRunStatus、会把
  *   running 错覆盖回 awaiting_user（还顺手清了 currentActionId）→ 新 action 明明在跑、
  *   UI 却显示「等待回复」、推进 / 终结 / 再聊聊按钮误亮（点了会和正在跑的 action 打架）。
  * 治法：read-compare-set 整段在 withTaskLock 内原子完成——读到「当前 action 已 running」就直接跳过、

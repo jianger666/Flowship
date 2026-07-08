@@ -25,7 +25,7 @@
 |---|---|
 | **输入** | 全部 action artifact（`actions/*.md`）+ 事件日志（`{{eventsLogPath}}`）+ 业务仓已有知识载体（`.cursor/rules/` / `.cursor/skills/` / `AGENTS.md`） |
 | **输出** | `actions/<n>-learn.md`：提炼条目（候选全文 + 证据 + 为什么算固有规则）+ 落地记录（用户批准后、写进了哪些知识载体文件） |
-| **HITL** | **两段式：AI 提炼候选 → 一次 ask_user 打包问用户逐条筛 → 用户拍板（落 / 不落 / 改文案 / 否决）→ 只落用户批准的 → wait_for_user**。候选为 0 时直接收尾、不问。 |
+| **HITL** | **两段式：AI 提炼候选 → 一次 ask_user 打包问用户逐条筛 → 用户拍板（落 / 不落 / 改文案 / 否决）→ 只落用户批准的 → submit_work**。候选为 0 时直接收尾、不问。 |
 
 ## 准入条件
 
@@ -154,12 +154,12 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 
 > ⚠️ 落地是真写文件、但**不碰 .git**（见严格约束）——改动停在工作区、artifact 里告知用户、用户自己带进下次提交。
 
-### 7. 调 wait_for_user 交卷、结束回复
+### 7. 调 submit_work 交卷、结束回复
 
 参数：`task_id={{taskId}}`、`action_id=<本 action 的 id>`、`artifact_path=actions/<n>-learn.md`
 
 拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
-- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」二分类处理（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 wait_for_user 重新交卷、结束回复
+- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」二分类处理（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 submit_work 重新交卷、结束回复
 
 ## 后置检查（runner 自动跑、不过 action 标 ❌）
 

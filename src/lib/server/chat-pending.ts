@@ -2,7 +2,7 @@
  * Agent ↔ server 信号桥 + ask 弹窗登记（V0.11 大幅瘦身）
  *
  * V0.11 背景：wait 协议退役（「单 Run 永生 + shell curl 长轮询」→「create + 多轮 send」）。
- * 原来这里是 wait_for_user / ask_user 的完整等待状态机（pendingMap / token / grace /
+ * 原来这里是 submit_work / ask_user 的完整等待状态机（pendingMap / token / grace /
  * keepalive / submitXxx 信号 API、~1000 行）；新模型下 agent 说完自然结束 run、用户操作
  * 经 `agent.send()` 以新消息送达、不再有「阻塞等待」可 resolve。本文件只剩三块：
  *
@@ -44,7 +44,7 @@ export interface PendingAsk {
 
 export type AwaitingSignal =
   | {
-      // agent 调 wait_for_user 交卷（V0.11 起非阻塞）：runner 据此跑后置 check + 切 awaiting_ack；
+      // agent 调 submit_work 交卷（V0.11 起非阻塞）：runner 据此跑后置 check + 切 awaiting_ack；
       // 不带 actionId 的调用（旧「待命态」姿势）只切 runStatus=awaiting_user
       kind: "awaiting_start";
       actionId?: string;
@@ -380,7 +380,7 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
       msg.text,
       ...attachmentSections(msg),
       "",
-      "（这是任务过程中的**纯提问**、不是修改要求也不是推进指令：直接回答即可、不要改任何代码 / 文件、不要调 wait_for_user / submit_mr 等动作工具、回答完自然结束本轮回复。任务仍停在原地等用户后续操作。）",
+      "（这是任务过程中的**纯提问**、不是修改要求也不是推进指令：直接回答即可、不要改任何代码 / 文件、不要调 submit_work / submit_mr 等动作工具、回答完自然结束本轮回复。任务仍停在原地等用户后续操作。）",
     ];
     return lines.join("\n");
   }

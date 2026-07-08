@@ -88,11 +88,11 @@ const formatShortTime = (ts: number): string => {
 
 // artifact 读到空、但 action 已是「该有产物」态时的退避重试参数
 // 修「agent 产出了 artifact、但页面停在『没有产物』、要手动刷新 / 切 tab 才看到」：
-// 产出那一刻文件刚落盘 / agent 调 wait_for_user 与写文件有时序差、一次性拉可能读到 null、
+// 产出那一刻文件刚落盘 / agent 调 submit_work 与写文件有时序差、一次性拉可能读到 null、
 // 之后 action.status 不再变 effect 就不会重拉 → 退避重试几次自愈。
 //
 // V0.6.12 实测加码：agent 第一次 edit 新 artifact 因工具参数名（contents/content）写失败、
-// 却抢跑调 wait_for_user 标了 awaiting_ack（meta 已写 artifactPath、文件却还不存在）、
+// 却抢跑调 submit_work 标了 awaiting_ack（meta 已写 artifactPath、文件却还不存在）、
 // 2~3s 后才 thinking「写入失败」并重写落盘——原 5×800ms=4s 固定退避刚好差 ~2s 没等到、
 // 停在「没有产物」要切 tab 才出。改指数退避、总时长拉到 ~28s 覆盖 agent 重写落盘的延迟。
 const ARTIFACT_LOAD_MAX_RETRIES = 8;

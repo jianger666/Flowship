@@ -4,7 +4,7 @@
  * 职责：把 SDK run.stream() 吐的每条消息翻译成 events.jsonl 事件 + SSE publish：
  *   - thinking / tool_call / assistant（流式缓冲）/ status
  *   - artifact 写入检测（write/edit 命中 actions/ 路径 → 「在写 artifact」+ 落盘后刷 artifactUpdatedAt）
- *   - wait_for_user 特判（状态由 awaitingNotifier 管、这里只记 error）
+ *   - submit_work 特判（状态由 awaitingNotifier 管、这里只记 error）
  *
  * 依赖方向（保证无环）：只依赖 task-stream + task-fs、不 import task-runner。
  */
@@ -64,11 +64,16 @@ export const handleSdkMessage = async (
       const argsAny = (msg.args ?? {}) as Record<string, unknown>;
       const innerToolName =
         typeof argsAny.toolName === "string" ? argsAny.toolName : "";
+      // 交卷工具特判：V0.11.9 改名 submit_work、旧名 wait_for_user 仍以 alias 存在
+      //（升级前启动的会话还调旧名）、两个名字（含 SDK 展示名变体）都要认
+      const SUBMIT_TOOL_NAMES = new Set([
+        "submit_work",
+        "Submit Work",
+        "wait_for_user",
+        "Wait For User",
+      ]);
       const isWaitForUser =
-        msg.name === "wait_for_user" ||
-        msg.name === "Wait For User" ||
-        innerToolName === "wait_for_user" ||
-        innerToolName === "Wait For User";
+        SUBMIT_TOOL_NAMES.has(msg.name) || SUBMIT_TOOL_NAMES.has(innerToolName);
 
       // V0.6：write / edit 写 actions/N-<type>.md 时推一份「在写 artifact」事件给 UI（同 V0.5 artifacts/ 同款套路）
       // ⚠️ 必须先用 WRITE_TOOL_NAMES 卡是不是「写」工具——read 跟 edit 都用 path 参数、
@@ -134,7 +139,7 @@ export const handleSdkMessage = async (
           const resStr = stringifyMeta(msg.result);
           await writeEventAndPublish(taskId, {
             kind: "error",
-            text: `wait_for_user 工具调用失败：${truncate(resStr, 200)}`,
+            text: `submit_work 工具调用失败：${truncate(resStr, 200)}`,
           });
         }
         break;
