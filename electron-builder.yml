@@ -71,10 +71,10 @@ mac:
   identity: null
 
 dmg:
-  # ULMO=LZMA（V0.11.4、实测 215MB → 97MB、-55%）。原 ULFO（LZFSE）为挂载速度选的、
-  # 但实测 ULMO 挂载 9s + 全量拷出 8s——安装/自更新多花十来秒、换下载少 118MB、净赚。
-  # macOS 10.15+ 支持（Electron 42 本来就要求 macOS 11+）。
-  format: ULMO
+  # UDBZ=bzip2（V0.11.4、实测 215MB → 118MB、-45%）。原 ULFO（LZFSE）为挂载速度选的、
+  # 但实测 UDBZ 挂载 25s + 全量拷出 12s——安装/自更新多花半分钟、换下载少 ~100MB、净赚。
+  # 注：ULMO（LZMA）实测更小（97MB）但 electron-builder 26.15.2 schema 不认、CI 直接拒（踩过）。
+  format: UDBZ
 
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
 # releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset
