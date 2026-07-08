@@ -299,6 +299,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.12 P0（进行中）：内置飞书官方 CLI（2026-07-08 晚、用户拍板「内置两套 CLI、不强迫用户配 MCP、尽可能都接进来」）
+
+- **两个官方 CLI**：lark-cli（larksuite/cli、飞书开放平台 200+ 命令 + 26 官方 Agent Skills）+ meegle（larksuite/meegle-cli、飞书项目 16 域 50+ 命令）、都 MIT
+- **分发（不进安装包、运行时一键装到 `<dataRoot>/tools/`）**：lark-cli 走 GitHub Releases 平台二进制（China fallback npmmirror `/-/binary/` 镜像、URL 规则照官方 install.js）；meegle npm 包自带全平台 Go 二进制、解 tgz 抽当前平台的；官方 skills 从两仓库 main tarball 的 `skills/` 抽（失败不阻断）
+- **agent 接入**：`injectFeishuCliPath` 把 tools/bin 注 process.env.PATH（instrumentation 启动 + 装完即时）、SDK agent 子进程继承直呼；skills-loader 增扫 tools/skills（优先级最低）
+- **登录**：CLI 自带 OAuth（自动开浏览器）——lark-cli 无配置走 `config init --new`（官方引导建应用）、有配置 `auth login --recommend`；meegle 先 `config set host`（默认 project.feishu.cn）再 `auth login`。spawn 托管 + 抓输出授权 URL 给 UI 兜底
+- **UI**：设置页「飞书集成」卡片（安装/更新 + 每工具登录按钮 + 版本/账号状态、流程中 2s 轮询）
+- **后续（明天）**：P1 新建任务「从飞书需求选」+ 首页我的需求面板；P2 状态反向同步；飞书项目 MCP 链退役（用户拍板不留兼容）
+
 ### V0.11.9（未发版、攒着）：说话入口合一 + 重启概念退役（2026-07-08、用户拍板「有些设计是之前冗余的」）
 
 - **「重启当前阶段」按钮/弹窗/route 删除、能力并入输入条「唤醒模式」**（用户拍板「输入条覆盖重启、别多一条 action 链」）：会话接不回 + 当前 action 停在半路（error/cancelled/僵死 running）时、输入条消息触发 `resumeCurrentActionWithMessage`——起新 agent **原地续同一个 action**（`[RESUME_ACTION]` 指令 = 旧 restart 骨架 + 用户消息当最新指示、不再 ask「按原计划继续吗」；pendingQuestions 断点续传保留）。模型沿用 action.agentModel（唤醒不悄悄换模型）
