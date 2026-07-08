@@ -5,7 +5,6 @@
  *   - prompt 模板渲染（fillTemplate / renderSuperPromptTemplate / loadActionPrompt）
  *   - super-prompt 拼装（buildSuperPrompt + 各 render 段）
  *   - [NEXT_ACTION] directive 构造（buildNextActionDirective + 批次 / replan / dev 指令段）
- *   - [RESTART_ACTION] 重启指令（buildRestartActionInstruction）
  *   - task 字段热更快照 / diff（captureTaskFieldsSnapshot / buildTaskUpdateHint）
  *
  * 依赖方向（保证无环）：只依赖 task-fs / 各 prompt 片段模块 / types、不 import task-runner / task-stream。
@@ -37,7 +36,6 @@ import { getCustomAction } from "./custom-action-fs";
 import type {
   ActionRecord,
   ActionType,
-  AskUserQuestion,
   Task,
 } from "@/lib/types";
 import { TASK_ROLE_LABEL, TEST_STRATEGY_LABEL } from "@/lib/types";
@@ -586,73 +584,3 @@ export const buildNextActionDirective = (input: {
   return lines.join("\n");
 };
 
-export const buildRestartActionInstruction = (
-  task: Task,
-  action: ActionRecord,
-  // 断线前 agent 正等用户回答、但用户还没答完的那组问题（断点续传重问用）。
-  // 非空 = 断点卡在「等用户答问题」→ 让新 agent 原样重新问；
-  // 空 = 断在干活（或没有未答问题）→ 走 restart_intent 确认方向。
-  pendingQuestions: AskUserQuestion[] = [],
-): string => {
-  const lines: string[] = [
-    "[RESTART_ACTION]",
-    "当前 action 因 SDK/agent 断开或用户手动重启而重新拉起。不要追加新 action、不要从零重做，继续完成同一个 action。",
-    "你可能是被换上来接手的新模型——务必先把下面的上下文完整读一遍、确认理解了断点和已有产物，再动手。",
-    "",
-    "重启后严格按顺序执行：",
-    `1. 先读取事件日志，确认断点和用户最近反馈：\`${getEventsLogPath(task.id)}\``,
-    "2. 再检查相关仓库当前工作区，摸清已有的半成品。",
-  ];
-
-  let step = 3;
-  if (action.artifactPath) {
-    lines.push(
-      `${step}. 如果已有 artifact，先读取它：\`${getActionArtifactPath(task.id, action.n, action.type)}\`（后续在同一路径覆盖更新）。`,
-    );
-    step += 1;
-  }
-
-  if (pendingQuestions.length > 0) {
-    // 断点续传：断线前 agent 卡在「等用户答这组问题」、用户是被网络打断、不是主动放弃 →
-    // 让接手的新 agent 把原问题原样重新问一遍（新 ask_user = 新 askId/token、用户能有效作答）。
-    // 不走 restart_intent（agent 还没动手、问「按原计划还是改方向」没意义）、更不准 default 跳过。
-    const questionsJson = JSON.stringify(
-      pendingQuestions.map((q) => ({
-        id: q.id,
-        question: q.question,
-        ...(q.options && q.options.length > 0 ? { options: q.options } : {}),
-        allow_text: q.allowText ?? true,
-      })),
-    );
-    lines.push(
-      `${step}. **断点续传（关键、优先做）**：断线前你正等用户回答下面这组问题、用户还没来得及答（是被网络打断、不是主动放弃）。读完上下文后、动手之前，先调一次 \`ask_user\` 把这组问题**原样重新问一遍**：`,
-      `   - task_id="${task.id}"、action_id="${action.id}"`,
-      `   - questions=${questionsJson}`,
-      "   - ⛔ 不要替用户作答、不要按 default 跳过、不要改写问题——用户是想答的、必须重新问到。",
-      "   - 拿到用户答案后再按答案推进。",
-    );
-  } else {
-    // 读完上下文、动手前先问用户：按原计划继续、还是有新调整（用户拍板的重启语义、避免闷头继续）
-    // 只给一个「按原计划继续」业务选项、allow_text=true 时 UI 自带「自定义回答」入口让用户改方向。
-    // question 不写死固定句：让 agent 基于刚读的事件日志 + artifact + 工作区半成品、先用 1-2 句
-    // 简述「上次断到哪、当时在做啥」再接问句——重启间隔可能很久、用户（尤其换人接手）常忘了上次
-    // 进度（同事实测痛点）、给个背景才好决策。前端 ask_user 弹窗按 markdown 渲染 question、换行 OK。
-    lines.push(
-      `${step}. **读完上下文后、动手之前**，先调一次 \`ask_user\` 跟用户确认方向（只给这一个选项）：`,
-      `   - task_id="${task.id}"、action_id="${action.id}"`,
-      "   - **question 必须先给「上次进展」背景**：基于你刚读的事件日志 + artifact + 工作区半成品，用 1-2 句话说清「上次断开前进展到哪、当时正在做什么」——具体到改了哪个文件 / 哪块逻辑、卡在哪一步，**别套话**（别只写「正在推进这个阶段」这种废话）。换行后再接确认问句。",
-      '   - questions 形如：[{ id:"restart_intent", question:"**上次进展**：<你的 1-2 句简述>。\\n\\n检测到这个阶段被重启，要我按原计划继续完成、还是有新的调整？", options:[{ id:"continue", label:"按原计划继续" }], allow_text:true }]',
-      "   - 用户选「按原计划继续」→ 直接接着推进、不要再追问。",
-      "   - 用户写了自定义回答 → 按新指示调整方向后再推进。",
-    );
-  }
-
-  if (action.userInstruction.trim().length > 0) {
-    lines.push("", "原始用户指令：", action.userInstruction.trim());
-  }
-  lines.push(
-    "",
-    "完成后调用 `wait_for_user({ task_id, action_id, artifact_path })` 对这个同一个 action 交卷、然后结束本轮回复。",
-  );
-  return lines.join("\n");
-};

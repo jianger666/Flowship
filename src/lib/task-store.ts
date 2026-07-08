@@ -640,32 +640,6 @@ export const stopTask = async (taskId: string): Promise<Task> => {
 };
 
 /**
- * 重启当前 action：SDK / agent 断掉但不想重复推进同类型 action 时使用。
- * 不 append 新 action，沿用原 actionId / artifactPath 起新 Run。
- */
-export const restartCurrentAction = async (
-  taskId: string,
-  input: {
-    actionId?: string;
-    apiKey: string;
-    model: ModelSelection;
-    username?: string;
-    gitHost?: string;
-    gitToken?: string;
-  },
-): Promise<{ task: Task; action: ActionRecord }> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/restart-action`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
-    },
-  );
-  return await handleJson<{ ok: true; task: Task; action: ActionRecord }>(res);
-};
-
-/**
  * 「划除 / 恢复」单条 action（软删、可逆）
  * - excluded=true：排出 agent 上下文（renderActionHistorySection 跳过、不进 prompt）
  * - excluded=false：恢复

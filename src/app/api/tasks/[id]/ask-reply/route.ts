@@ -376,7 +376,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   );
   if (!ok) {
     return errorResponse(
-      "没有可续接的 agent 会话（会话已失效 / 正在跑）——点「重启当前阶段」把问题断点续传给新 agent",
+      "没有可续接的 agent 会话（会话已失效）——重新「推进」该阶段、问题上下文会自动带给新 agent",
       409,
     );
   }

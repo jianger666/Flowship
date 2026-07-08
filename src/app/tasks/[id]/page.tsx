@@ -30,7 +30,6 @@ import {
   ExternalLink,
   Flag,
   Loader2,
-  MessageCircleQuestion,
   Pencil,
   RotateCcw,
   Sparkles,
@@ -48,10 +47,8 @@ import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
-import { RestartDialog } from "@/components/tasks/restart-dialog";
-import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
-import { TaskQuestionComposer } from "@/components/tasks/task-question-composer";
+import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -72,11 +69,9 @@ import {
   fetchTask,
   finalizeTask,
   reopenTask,
-  restartCurrentAction as restartCurrentActionRequest,
   setActionExcluded,
   setTaskUiLayout,
   stopTask,
-  submitActionAck,
   type ImagePayload,
 } from "@/lib/task-store";
 import {
@@ -117,16 +112,10 @@ const TaskDetailPage = () => {
   const selectedActionTaskIdRef = useRef<string | null>(null);
   // 推进按钮 loading 态
   const [starting, setStarting] = useState(false);
-  // 「再聊聊」对话框开关
-  const [reviseOpen, setReviseOpen] = useState(false);
-  // 「通过 / 再聊聊」按钮提交锁、防连点
-  const [ackSubmitting, setAckSubmitting] = useState(false);
   // 流式打字态（assistant chunk 累加、收到 assistant_message 事件清空）
   const [streamingText, setStreamingText] = useState("");
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
-  // 「重启当前阶段」dialog 开关（带模型选择、默认选中该 action 的 agentModel）
-  const [restartOpen, setRestartOpen] = useState(false);
   // SSE 重连 epoch：任意「让 agent 又活起来」的路径 ++、useTaskWatch 重连
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
@@ -289,13 +278,6 @@ const TaskDetailPage = () => {
     [task, currentAction],
   );
 
-  // V0.6.33.1：「再聊聊」改非模态后、弹窗开着页面其它按钮（通过 / 停止等）仍可点——
-  // 任何路径丢掉 ack 态（通过 / 停止 / agent 推进 / 重启）都自动收掉弹窗、
-  // 防止把 revise 草稿提交到已经不在等 ack 的 action 上（服务端会拒、UI 也错乱）
-  useEffect(() => {
-    if (!canAck) setReviseOpen(false);
-  }, [canAck]);
-
   // V0.5.10：Resizable 分栏初始 size
   const artifactSizePercent = useMemo(() => {
     const v = task?.uiLayout?.artifactPanelSize;
@@ -325,32 +307,6 @@ const TaskDetailPage = () => {
     [],
   );
 
-  // V0.6.24：Cmd/Ctrl+J 快捷打开「再聊聊」
-  // 能否打开的条件在下方 canAck 算出后写进 ref（hooks 必须在早返回前、canAck 在早返回后、故用 ref 中转）；
-  // effect 只绑一次 listener、内部读 ref.current 拿最新值、避免 task SSE 高频 setState 反复重绑。
-  const canOpenReviseRef = useRef(false);
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      // 只认 Cmd(mac) / Ctrl(其它) + J
-      if (e.key.toLowerCase() !== "j" || !(e.metaKey || e.ctrlKey)) return;
-      if (!canOpenReviseRef.current) return;
-      // 焦点在输入框 / 可编辑区时让行、不抢用户打字
-      const el = document.activeElement as HTMLElement | null;
-      if (
-        el &&
-        (el.tagName === "INPUT" ||
-          el.tagName === "TEXTAREA" ||
-          el.isContentEditable)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      setReviseOpen(true);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
   if (!loaded) {
     return <LoadingState variant="block" />;
   }
@@ -362,26 +318,12 @@ const TaskDetailPage = () => {
   // ---- 按钮渲染条件 ----
   // canAck 在上方 hooks 区 useMemo 算好（auto-close effect 也要用）
 
-  // 上方 Cmd/Ctrl+J 快捷键用：能否打开「再聊聊」= 跟「再聊聊」按钮同条件（canAck 且没在提交 / 没开）
-  canOpenReviseRef.current = canAck && !ackSubmitting && !reviseOpen;
-
   // 推进按钮：任务非终结态 + agent 不在跑代码
   //   - idle / error：没活 agent、推进会起新 Run
   //   - awaiting_user（含当前 action 等 ack 时）：去掉「通过」按钮后、推进会隐式认可当前 action、
   //     再走 submitNextAction 续接 / force-new 起新（V0.x 去掉了原先「先 ack 才解锁」的 !canAck 限制）
   const canAdvance =
     task.runStatus !== "running" &&
-    task.repoStatus !== "merged" &&
-    task.repoStatus !== "abandoned";
-
-  // 重启当前阶段：SDK / agent 断掉但 action 还没做完时，原地重启当前 action，不追加新 action。
-  const canRestartCurrentAction =
-    !!currentAction &&
-    task.runStatus !== "running" &&
-    (currentAction.status === "running" ||
-      currentAction.status === "error" ||
-      currentAction.status === "cancelled") &&
-    !canAck &&
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
 
@@ -508,29 +450,6 @@ const TaskDetailPage = () => {
     }
   };
 
-  // ---- ack：再聊聊（revise）----
-  const handleSubmitRevise = async (
-    feedback: string,
-    images?: ImagePayload[],
-  ) => {
-    if (!currentAction) return;
-    setAckSubmitting(true);
-    try {
-      const updated = await submitActionAck(
-        task.id,
-        currentAction.id,
-        "revise",
-        { feedback, images },
-      );
-      setTask(updated);
-      setReviseOpen(false);
-    } catch (err) {
-      toast.error(`提交失败：${(err as Error).message}`);
-    } finally {
-      setAckSubmitting(false);
-    }
-  };
-
   // ---- 停止：中断当前正在跑 / 等 ack 的 action ----
   const handleStop = async () => {
     if (!task) return;
@@ -550,38 +469,6 @@ const TaskDetailPage = () => {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
       setStopping(false);
-    }
-  };
-
-  // ---- 重启当前 action：不追加 action，只把当前 action 原地拉起 ----
-  // RestartDialog 确认后回调、model 是用户在 dialog 里选的（默认 = 该 action 的 agentModel）
-  const handleRestartCurrentAction = async (model: ModelSelection) => {
-    if (!task || !currentAction) return;
-    setStarting(true);
-    try {
-      // 复用 prepareRunArgs 做 apiKey 校验（model 用 dialog 传来的、不用它算的）
-      const args = prepareRunArgs(task);
-      if (!args) return;
-      const settings = getSettings();
-      const { task: updated, action } = await restartCurrentActionRequest(task.id, {
-        actionId: currentAction.id,
-        apiKey: args.apiKey,
-        model,
-        username: settings.username?.trim() || undefined,
-        gitHost: settings.gitHost?.trim() || undefined,
-        gitToken: settings.gitToken?.trim() || undefined,
-      });
-      setTask(updated);
-      setSelectedActionId(action.id);
-      setWatchEpoch((n) => n + 1);
-      setRestartOpen(false);
-    } catch (err) {
-      toast.error(`重启失败：${(err as Error).message}`);
-      // 重启被拒大多因页面状态已过期（如服务端 action 已走到 awaiting_ack、按钮却还亮着）——
-      // 重拉一次任务对齐真实状态、按钮 / 弹窗自动纠正
-      void refresh();
-    } finally {
-      setStarting(false);
     }
   };
 
@@ -788,30 +675,6 @@ const TaskDetailPage = () => {
 
           {/* 主操作区 */}
           <div className="flex items-center gap-2">
-            {canAck && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setReviseOpen(true)}
-                disabled={ackSubmitting}
-                title={`想改 ${currentAction ? actionDisplayLabel(currentAction) : ""} 产物 / 有疑问、走这里（⌘/Ctrl+J）`}
-              >
-                <MessageCircleQuestion />
-                再聊聊
-              </Button>
-            )}
-            {canRestartCurrentAction && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setRestartOpen(true)}
-                disabled={starting}
-                title="SDK / agent 断掉但当前阶段没做完时，原地重启这个 action（可换模型）"
-              >
-                {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-                重启当前阶段
-              </Button>
-            )}
             {canAdvance && (
               <Button
                 variant="default"
@@ -988,8 +851,8 @@ const TaskDetailPage = () => {
                 streamingText={streamingText}
                 hideReplyComposer
               />
-              {/* V0.11.9「问一问」：纯提问不动任务进度（改代码类意见走「再聊聊」） */}
-              <TaskQuestionComposer task={task} onTaskUpdate={setTask} />
+              {/* V0.11.9 统一「跟 AI 说」入口：等审阅时按再聊聊送（agent 二分类）、其他时刻纯提问 */}
+              <TaskTalkComposer task={task} onTaskUpdate={setTask} />
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>
@@ -1000,29 +863,6 @@ const TaskDetailPage = () => {
           ask_user_reply 关弹窗、万一流恰好在重连间隙也能靠这次 refetch 收口、
           不会再出现「后端已送达、弹窗永远卡提交中」（V0.11.6 事故的第二道保险） */}
       <AskUserDialog task={task} onAnswered={() => void refresh()} />
-
-      {/* 再聊聊 Dialog */}
-      {currentAction && (
-        <ReviseDialog
-          open={reviseOpen}
-          onOpenChange={setReviseOpen}
-          actionLabel={actionDisplayLabel(currentAction)}
-          submitting={ackSubmitting}
-          onSubmit={handleSubmitRevise}
-        />
-      )}
-
-      {/* 重启当前阶段 dialog（带模型选择） */}
-      {currentAction && (
-        <RestartDialog
-          open={restartOpen}
-          onOpenChange={setRestartOpen}
-          task={task}
-          action={currentAction}
-          submitting={starting}
-          onConfirm={handleRestartCurrentAction}
-        />
-      )}
 
       {/* 推进 dialog */}
       <AdvanceDialog

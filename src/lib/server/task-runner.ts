@@ -20,7 +20,7 @@
  * 本文件只留「编排」：advance / restart / ack / finalize / reopen + internalStartAgent。
  * 其余切面拆到同目录四个模块（依赖方向单向、无环）：
  *   - task-stream.ts：流事件协议 + publish/subscribe + 进程全局状态 + writeEventAndPublish
- *   - task-prompts.ts：super-prompt 拼装 + [NEXT_ACTION]/[RESTART_ACTION] directive 构造（纯函数）
+ *   - task-prompts.ts：super-prompt 拼装 + [NEXT_ACTION] directive 构造（纯函数）
  *   - action-gates.ts：action 准入门槛 + ship 预检 + build 分支规划（纯函数）
  *   - sdk-message-handler.ts：SDKMessage → 事件流翻译器
  */
@@ -98,7 +98,6 @@ import {
   buildBatchDirective,
   buildNextActionDirective,
   buildPlanReplanDirective,
-  buildRestartActionInstruction,
   buildReviewScopeDirective,
   buildSuperPrompt,
   buildTaskUpdateHint,
@@ -154,7 +153,6 @@ const TASK_TOOL_MCP_NAME = "aiFlowChat";
  *   前端 pendingEvent / AskUserRequestRow 据此把这条旧 ask 当「已失效」、不再弹。
  *
  * 调用方：
- *   - restartCurrentAction：清孤儿 + 用返回的 questions 让新 agent 断点续传重问
  *   - advanceTask（起新 agent）/ stop 路由：只清孤儿（开新 action / 主动停、不续传）、忽略返回值
  *
  * @returns 最近一条被作废的 ask 的 questions（供重启时让新 agent 断点续传重新问）、没有则空数组。
@@ -403,7 +401,7 @@ const runActionPostCheck = (
 };
 
 /**
- * V0.8.18：取消某 task 正在后台跑的后置 check（停止 / 推进新 action / 重启当前 action 时调）。
+ * V0.8.18：取消某 task 正在后台跑的后置 check（停止 / 推进新 action 时调）。
  * abort 让 check 结果作废（不写 awaiting_ack、不发「产出完成」事件）。
  */
 export const abortRunningCheck = (taskId: string): void => {
@@ -477,15 +475,6 @@ export interface AdvanceTaskInput {
   customActionId?: string;
 }
 
-export interface RestartCurrentActionInput {
-  task: Task;
-  actionId?: string;
-  apiKey: string;
-  model: ModelSelection;
-  username?: string;
-  gitHost?: string;
-  gitToken?: string;
-}
 
 /**
  * 收尾 task 里所有「卡在非终态」（running / awaiting_ack）的 action（V0.6.12）
@@ -839,7 +828,7 @@ const advanceTaskInner = async (
   }
   // 旧会话（如有）关掉：新 agent 马上在同一 worktree 起 shell、不 reap（V0.6.8 误杀坑）
   closeTaskSession(task.id, undefined, { reap: false });
-  // 起新 agent 跑新 action 前、作废上一个 agent 没答完的孤儿 ask（同 restartCurrentAction：不清掉
+  // 起新 agent 跑新 action 前、作废上一个 agent 没答完的孤儿 ask（不清掉
   // 前端会弹失效的旧问题弹窗、用户答了必报错；严重时还把 runStatus 打回 error 死循环）。
   // 推进是「开新 action」语义、不续传旧问题（用户主动换方向 = 放弃旧断点）、只清孤儿、忽略返回值。
   cancelPending(task.id);
@@ -860,172 +849,6 @@ const advanceTaskInner = async (
   });
 
   return { action };
-};
-
-export const restartCurrentAction = async (
-  input: RestartCurrentActionInput,
-): Promise<{ action: ActionRecord }> =>
-  runAdvanceExclusive(input.task.id, () => restartCurrentActionInner(input));
-
-const restartCurrentActionInner = async (
-  input: RestartCurrentActionInput,
-): Promise<{ action: ActionRecord }> => {
-  // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
-  await assertNoUpdatePendingRestart();
-  // V0.8.18：重启当前 action 前、取消它可能还在后台跑的旧 check（要重跑、且防旧结果污染新一轮）
-  abortRunningCheck(input.task.id);
-  const fresh = await getTask(input.task.id);
-  if (!fresh) throw new Error("task 不存在、无法重启当前 action");
-  if (fresh.mode === "chat") {
-    throw new Error("chat 模式不支持 action 重启，请继续发消息");
-  }
-  if (fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
-    throw new Error("任务已终结，不能重启当前 action");
-  }
-
-  const actionId = input.actionId ?? fresh.currentActionId;
-  if (!actionId) {
-    throw new Error("当前没有可重启的 action");
-  }
-  const action = fresh.actions.find((a) => a.id === actionId);
-  if (!action) {
-    throw new Error(`action ${actionId} 不存在、无法重启`);
-  }
-  if (action.status === "awaiting_ack") {
-    throw new Error("当前 action 已在等待确认，请用「再聊聊」继续修改");
-  }
-  if (action.status === "completed") {
-    throw new Error("已通过的 action 不能重启，请推进新的 action");
-  }
-
-  const existingRecord = runningTasks.get(fresh.id);
-  if (existingRecord) {
-    forkPendingTasks.add(fresh.id);
-    existingRecord.cancel();
-    const stopped = await waitForTaskToStop(fresh.id, 5000);
-    if (!stopped) {
-      console.warn(
-        `[task-runner] restartCurrentAction: task=${fresh.id} 旧 agent 没在 5s 内停、强清 runner state 继续`,
-      );
-      forceClearStaleRunnerState(fresh.id);
-    }
-  }
-  // V0.11：重启 = 换新 agent、旧会话关掉（新 agent 马上起、不在 close 里 reap——下一行显式扫）
-  closeTaskSession(fresh.id, undefined, { reap: false });
-  cancelPending(fresh.id);
-  // V0.10：孤儿进程扫的是 agent 实际工作目录（隔离 task = worktree 路径）
-  reapTaskOrphans(getTaskWorkRepoPaths(fresh));
-
-  // 作废旧 agent 那条还没答完的 ask（断线后它的 token 已失效、不清掉前端会反复弹失效旧弹窗、
-  // 用户答了必 410 把 runStatus 打回 error、形成多弹窗并发 + 死循环）。
-  // 返回的 pendingQuestions = 用户没答完的那组问题：非空 → 新 agent 断点续传原样重问；空 → 走 restart_intent。
-  const pendingQuestions = await supersedePendingAsks(fresh.id, "agent 断线重启");
-
-  const patchedTask = await patchAction(fresh.id, action.id, { status: "running" });
-  const patchedAction =
-    patchedTask?.actions.find((a) => a.id === action.id) ?? action;
-  if (patchedTask) {
-    publish(fresh.id, { kind: "task", task: patchedTask });
-    publish(fresh.id, { kind: "action", action: patchedAction });
-  }
-  let startTask =
-    (await setTaskRunStatus(fresh.id, "running", action.id)) ??
-    patchedTask ??
-    fresh;
-  publish(fresh.id, { kind: "task", task: startTask });
-
-  await writeEventAndPublish(fresh.id, {
-    kind: "info",
-    actionId: action.id,
-    text: `用户重启了当前 ${actionDisplayLabel(action)} action（n=${action.n}），沿用原 action 继续执行`,
-    meta: { restartedActionId: action.id, actionType: action.type, n: action.n },
-  });
-
-  // V0.10：隔离工作区 task → 重启前同样确保 worktree 在（可能被手删过）、失败抛错不带病重启
-  if (isWorktreeTask(startTask)) {
-    const ensured = await ensureTaskWorktrees(startTask, input.username);
-    const existingRepos = new Set(
-      (startTask.gitBranches ?? []).map((b) => b.repoPath),
-    );
-    for (const info of ensured.infos) {
-      if (!existingRepos.has(info.repoPath)) {
-        await upsertGitBranch(fresh.id, info);
-      }
-    }
-    startTask = (await getTask(fresh.id)) ?? startTask;
-  }
-
-  let branchCheckoutHint: string | undefined;
-  if (action.type === "build" && !isWorktreeTask(startTask)) {
-    const planned = planBranchesForBuild(startTask, input.username);
-    if (planned) {
-      const existingRepos = new Set(
-        (startTask.gitBranches ?? []).map((b) => b.repoPath),
-      );
-      for (const info of planned.infos) {
-        if (!existingRepos.has(info.repoPath)) {
-          await upsertGitBranch(fresh.id, info);
-        }
-      }
-      branchCheckoutHint = planned.promptHint;
-      startTask = (await getTask(fresh.id)) ?? startTask;
-    }
-  }
-  const startAction =
-    startTask.actions.find((a) => a.id === action.id) ?? patchedAction;
-  const batchDirective =
-    startAction.type === "build"
-      ? buildBatchDirective(startTask, startAction.requestedBatchIds)
-      : startAction.type === "review"
-        ? buildReviewScopeDirective(startTask)
-        : undefined;
-
-  // 重启模型 = 用户在 RestartDialog 里选的（input.model）。前端 dialog 默认就回填该 action 的
-  // agentModel：没改 = 沿用原模型重跑、改了 = 换个模型接手。这样「断线重启掉回默认模型」那个老坑
-  // （plan 选 opus-4.8、重启变 composer-2.5）由「前端默认填 agentModel」从源头堵住、后端不必再
-  // 优先 agentModel。
-  const restartModel = input.model;
-
-  // 每次重启都把 agentModel 回写成 restartModel（可能换了模型、也可能补老数据空 agentModel）、
-  // 保证「卡片显示模型 = 实际重跑模型」一致。patch 后 task / action 取最新值
-  // （effectiveStartTask / effectiveStartAction）、让启动 prompt、SSE publish、最终 return 三处口径一致。
-  let effectiveStartTask = startTask;
-  let effectiveStartAction = startAction;
-  const patchedModel = await patchAction(fresh.id, startAction.id, {
-    agentModel: restartModel,
-  });
-  if (patchedModel) {
-    effectiveStartTask = patchedModel;
-    effectiveStartAction =
-      patchedModel.actions.find((a) => a.id === startAction.id) ?? startAction;
-    publish(fresh.id, { kind: "task", task: patchedModel });
-    publish(fresh.id, { kind: "action", action: effectiveStartAction });
-  }
-
-  // V0.8.12 A：重启 plan append 同样要硬约束出新批次（基于 patch 后最新 task / action 口径）
-  const replanDirective = buildPlanReplanDirective(
-    effectiveStartAction,
-    effectiveStartTask,
-  );
-
-  await internalStartAgent({
-    task: effectiveStartTask,
-    action: effectiveStartAction,
-    userInstruction: buildRestartActionInstruction(
-      effectiveStartTask,
-      effectiveStartAction,
-      pendingQuestions,
-    ),
-    branchCheckoutHint,
-    apiKey: input.apiKey,
-    model: restartModel,
-    gitHost: input.gitHost,
-    gitToken: input.gitToken,
-    batchDirective,
-    replanDirective,
-  });
-
-  return { action: effectiveStartAction };
 };
 
 /**
@@ -1082,7 +905,7 @@ export const acknowledgeAction = async (
     );
     if (!ok) {
       throw new Error(
-        "没有可续接的 agent 会话（会话已失效 / 正在跑）——点「重启当前阶段」或「推进」起新 agent 处理这条意见",
+        "没有可续接的 agent 会话（会话已失效）——重新「推进」起新 agent 处理这条意见",
       );
     }
   }
@@ -1103,7 +926,7 @@ export const acknowledgeAction = async (
   } else {
     // V0.11.x：approve 后没有任何「在等你」的东西了（action 已 completed、无 ask）——
     // runStatus 归 idle。原来停在 awaiting_user、侧栏琥珀点 / 顶部「等待回复」会永远亮着误导用户。
-    // 不传第三参：保留 currentActionId（「重启当前阶段」等入口还要用）。
+    // 不传第三参：保留 currentActionId（推进弹窗默认项等还要用）。
     const idled = await setTaskRunStatus(taskId, "idle");
     if (idled) publish(taskId, { kind: "task", task: idled });
   }
@@ -1768,7 +1591,6 @@ const consumeSessionRun = async (
       // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
       await finalizeStaleActions(task.id, "cancelled");
       // 保留 currentActionId（不传第三参）：被停的 action 已标 cancelled、仍是「当前 action」、
-      // 前端 canRestartCurrentAction 命中 → 用户能「重启当前阶段」
       const updated = await setTaskRunStatus(task.id, "idle");
       if (updated) publish(task.id, { kind: "task", task: updated });
       publish(task.id, { kind: "done", task: updated ?? task, ok: true });
@@ -1815,7 +1637,7 @@ const consumeSessionRun = async (
         text: [
           `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 wait_for_user）就结束了回复`,
           "",
-          "下一步：点「重启当前阶段」重跑、或换更稳的模型",
+          "下一步：重新「推进」该阶段重跑、或换更稳的模型",
         ].join("\n"),
       });
       const updated = await getTask(task.id);

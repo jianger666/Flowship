@@ -299,6 +299,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.9（未发版、攒着）：说话入口合一 + 重启概念退役（2026-07-08、用户拍板「有些设计是之前冗余的」）
+
+- **「重启当前阶段」整链删除**（旧 wait 协议时代「shell 断了」的救急口、V0.11 会话可 resume 后冗余）：restart-action route / restartCurrentAction(Inner) / RestartDialog / `[RESTART_ACTION]` 指令构造（task-prompts）全删；error/cancelled 态的恢复 = 重新「推进」该 action 类型（fresh agent 读历史、n+1）、相关错误文案已改口径
+- **说话入口合一（TaskTalkComposer）**：原「再聊聊」弹窗（+Cmd/Ctrl+J）与「问一问」输入条 90% 重复、二合一成事件流底部常驻输入条——**系统按状态自动懂语境**：当前产出等审阅 → 按 revise 送（agent 二分类：问就答、改就改完重新交卷）；其他时刻 → [USER_QUESTION] 纯提问；显式选模型 → 一次性答疑 agent。支持贴图（粘贴 / 附图）。revise-dialog.tsx 删除
+- **prompt 措辞修正**（用户实测 agent 旁白「等你点通过」误导）：_super / action-* 全部清掉「用户点通过」概念、改「认可 = 直接推进（无通过按钮）、旁白禁说点通过」
+
 ### V0.11.9（未发版、攒着）：任务内「问一问」+ 设置页整理（2026-07-08、用户大方向讨论第一批）
 
 - **任务内「问一问」**（用户痛点：想就任务问点问题、以前必须推进 action 再嘱咐「只回答别改代码」）：
