@@ -22,7 +22,8 @@ import {
   updateTaskFields,
 } from "@/lib/server/task-fs";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
-import { cancelChatRun } from "@/lib/server/chat-runner";
+import { waitForTaskToStop } from "@/lib/server/task-stream";
+import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import type { ModelSelection, TaskRole } from "@/lib/types";
 
@@ -221,6 +222,11 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     cleanupChatTaskState(id);
     // V0.8.18：连带杀掉可能还在后台跑的后置 check 子进程（删 task 后 check 跑完也无处落、防孤儿）
     abortRunningCheck(id);
+    // cancel 只是发信号、run 的 finally 还会写 events.jsonl——不等它真退就 rm、
+    // 迟到的写入会跟递归删除撞车（目录被删一半 + ENOTEMPTY）、表现为
+    // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
+    await waitForTaskToStop(id, 8000);
+    await waitForChatToStop(id, 8000);
     const ok = await deleteTask(id);
     if (!ok) return NextResponse.json({ error: "not_found" }, { status: 404 });
     return NextResponse.json({ ok: true });

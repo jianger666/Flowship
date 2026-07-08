@@ -210,20 +210,19 @@
 >
 > ⚠️ **重跑 / 接续 plan 必须重调**：批次绑在「当前 action」上、**不会**从上一版 plan 自动继承。如果这是重试 / 接续之前的 plan（哪怕用户只说「启动一下」）、只要你重写了 plan 内容且需求仍要分批——**就必须重新调一次 `set_plan_batches`**、否则本 action 没批次、分批 build 读不到（系统虽会兜底回退到上一版拆好的批次、但别依赖兜底）。
 
-### 6. 调 `wait_for_user`
+### 6. 调 `wait_for_user` 交卷、结束回复
 
 参数：
 - `task_id={{taskId}}`
 - `action_id=<本 action 的 id>`（从 [NEXT_ACTION] 头拿）
 - `artifact_path=actions/<n>-plan.md`
 
-阻塞等用户拍板。**实际等用户的姿势走 super-prompt 里的「shell + curl long-poll」机制**——调完 `wait_for_user` 立刻拿到 `[SHELL_WAIT_GUIDE token=xxx]`、用 `shell` 工具跑里面的 curl 命令、shell stdout 返回行解析：
+拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**——不跑任何等待命令。用户的下一步会以新消息送达：
 
-- `[ACTION_ACK approve]` → 立刻再调 `wait_for_user(task_id={{taskId}})`（不带 action_id、不带 artifact_path）等下一 action 指令、**绝对不退出 Run**
-- `[ACTION_ACK revise]` + 后续 feedback 文本 → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`（**必须带同一 action_id + artifact_path**、不带 = 服务端判协议违规自动纠正）
-- 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
+- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `wait_for_user`（同 action_id + artifact_path）重新交卷、结束回复
+- `[NEXT_ACTION ...]` → 用户已通过并推进下一 action、按新指令执行
 
-`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在 / shell / curl 等协议机制、对用户透明。写完 plan artifact 可以先给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）、再调 wait_for_user（详见 super-prompt 关键规则 1）。
+`wait_for_user` 调用前后不要在 assistant_message 里讲它的存在等协议机制、对用户透明。写完 plan artifact 先给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）、再交卷（详见 super-prompt 关键规则 1）。
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 

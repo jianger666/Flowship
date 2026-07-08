@@ -102,3 +102,13 @@ export const resolveBranchTemplate = (
   globalTemplate: string | undefined,
 ): string =>
   repoTemplate?.trim() || globalTemplate?.trim() || DEFAULT_BRANCH_TEMPLATE;
+
+/**
+ * 从飞书 story URL 抠 story id（V0.10 从 action-gates 抽出、worktree 分支命名共用）
+ * 规则：优先 detail/<digits> 段、兜底最长一段 ≥6 位连续数字；抠不到返 null
+ */
+export const extractFeishuStoryId = (url: string | undefined): string | null => {
+  if (!url || url.trim().length === 0) return null;
+  const m = url.match(/detail\/(\d+)/) ?? url.match(/(\d{6,})/);
+  return m ? m[1] : null;
+};

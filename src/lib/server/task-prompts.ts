@@ -20,11 +20,13 @@ import {
   getEventsLogPath,
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
-import { waitDisciplineSection } from "./wait-protocol-prompt";
+import { turnDisciplineSection } from "./wait-protocol-prompt";
+import { formatRepoSectionForPrompt } from "@/lib/path-utils";
 import {
-  formatRepoSectionForPrompt,
-  getEffectiveCwd,
-} from "@/lib/path-utils";
+  getTaskCwd,
+  getTaskWorkRepoPaths,
+  isWorktreeTask,
+} from "./task-worktrees";
 import {
   listAvailableSkillNames,
   renderSkillsForPrompt,
@@ -96,7 +98,8 @@ const loadFileSafe = async (rel: string): Promise<string> => {
 const loadSharedPrompt = async (task: Task): Promise<string> => {
   const tpl = await loadFileSafe(SHARED_PROMPT_FILE);
   return fillTemplate(tpl, {
-    repoPath: getEffectiveCwd(task.repoPaths),
+    // V0.10：隔离 task 的 repoPath 占位符 = worktree cwd（agent 实际干活的地方）
+    repoPath: getTaskCwd(task),
     taskId: task.id,
   });
 };
@@ -115,7 +118,7 @@ export const loadActionPrompt = async (
   const vars = {
     taskId: task.id,
     taskTitle: task.title,
-    repoPath: getEffectiveCwd(task.repoPaths),
+    repoPath: getTaskCwd(task),
     role: task.role,
     roleLabel: TASK_ROLE_LABEL[task.role],
     actionArtifactsDir: getActionsDir(task.id),
@@ -214,9 +217,9 @@ export const buildSuperPrompt = async (
   return renderSuperPromptTemplate(template, {
     taskId: task.id,
     taskTitle: task.title,
-    repoSection: formatRepoSectionForPrompt(task.repoPaths),
+    repoSection: renderRepoSection(task),
     repoBranchSection: renderRepoBranchSection(task),
-    repoPath: getEffectiveCwd(task.repoPaths),
+    repoPath: getTaskCwd(task),
     roleLabel: TASK_ROLE_LABEL[task.role],
     role: task.role,
     contextDocsSection: renderContextDocsSection(
@@ -232,7 +235,7 @@ export const buildSuperPrompt = async (
     firstActionDirective,
     currentActionPlaybook,
     // V0.7.20：等待纪律共用片段（chat / task 单一源、见 wait-protocol-prompt.ts）
-    waitDiscipline: waitDisciplineSection(),
+    waitDiscipline: turnDisciplineSection(),
   });
 };
 
@@ -264,22 +267,49 @@ const renderActionHistorySection = (task: Task): string => {
   return lines.join("\n");
 };
 
+// 渲染「任务基本信息」的仓库段：非隔离 = 原样列原仓库路径；隔离 task 额外拼一段
+// worktree 语境说明（分支已由系统检出、禁自己 checkout、依赖要自装）
+const renderRepoSection = (task: Task): string => {
+  const workPaths = getTaskWorkRepoPaths(task);
+  const base = formatRepoSectionForPrompt(workPaths);
+  if (!isWorktreeTask(task)) return base;
+
+  // 逐仓列已检出的任务分支（ensureTaskWorktrees 已 upsert 进 gitBranches、此处必有值）
+  const branchLines = task.repoPaths.map((p) => {
+    const tail = p.split("/").filter(Boolean).pop() ?? p;
+    const branch = task.gitBranches?.find((b) => b.repoPath === p)?.name;
+    return `  - \`${tail}\`：分支 \`${branch ?? "（未记录）"}\`（原仓库 \`${p}\`）`;
+  });
+  return [
+    base,
+    "",
+    "**⚠️ 任务隔离工作区（git worktree）**：以上路径是系统为本 task 专门检出的 worktree、不是原仓库目录：",
+    ...branchLines,
+    "  - 任务分支已由系统检出好——**禁止自己 checkout / 切换分支**、也不要 cd 到原仓库目录去改代码",
+    "  - git 命令（diff / add / commit / push / fetch）在 worktree 里照常用、跟原仓库共享同一 git 数据库",
+    "  - 工作区是全新检出：node_modules 等依赖不存在——需要跑安装 / 构建 / 测试时先自行装依赖（按仓库的包管理器来、如 pnpm install）",
+  ].join("\n");
+};
+
 // V0.6.7：渲染「仓库分支配置」段注入 super prompt——ship 读测试分支、各 action 兜底参考
 // 每仓列：线上分支（feature 拉取基线）/ 测试分支（ship 提测 MR 目标）/ dev 分支
 const renderRepoBranchSection = (task: Task): string => {
   const repoPaths = task.repoPaths ?? [];
   if (repoPaths.length === 0) return "（无绑定仓库）";
+  // V0.10：隔离 task 括号里展示 worktree 路径（agent 实际干活的目录、别引它 cd 回原仓库）
+  const workPaths = getTaskWorkRepoPaths(task);
   const lines: string[] = [
     "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
     "",
   ];
-  for (const p of repoPaths) {
+  for (let i = 0; i < repoPaths.length; i++) {
+    const p = repoPaths[i];
     const online = task.repoBaseBranches?.[p]?.trim();
     const test = task.repoTestBranches?.[p]?.trim();
     const dev = task.repoDevBranches?.[p]?.trim();
     const tail = p.split("/").filter(Boolean).pop() ?? p;
     lines.push(
-      `- \`${tail}\`（${p}）：线上分支=${online || "（未配、自动探测）"}、` +
+      `- \`${tail}\`（${workPaths[i]}）：线上分支=${online || "（未配、自动探测）"}、` +
         `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}`,
     );
   }
@@ -622,7 +652,7 @@ export const buildRestartActionInstruction = (
   }
   lines.push(
     "",
-    "完成后仍然调用 `wait_for_user({ task_id, action_id, artifact_path })`，等待用户对这个同一个 action approve / revise。",
+    "完成后调用 `wait_for_user({ task_id, action_id, artifact_path })` 对这个同一个 action 交卷、然后结束本轮回复。",
   );
   return lines.join("\n");
 };

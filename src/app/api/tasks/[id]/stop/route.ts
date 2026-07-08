@@ -5,7 +5,7 @@
  *
  * 用户选错 action 起跑了、或不想继续当前 action 时点「停止」：
  *   1) cancelTaskRun：abort SDK Run（agent 进程收到 cancel 信号、自行退出）
- *   2) cleanupChatTaskState：清掉 pending 的 wait-ack long-poll、不留悬挂 promise
+ *   2) cleanupChatTaskState：清掉未答的 ask 登记等进程级状态
  *   3) 当前 running / awaiting_ack 的 action 标 cancelled（endedAt 自动落）
  *   4) runStatus 回 idle——用户可重新「推进」起新 Run
  *
@@ -46,7 +46,7 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // 1) abort SDK Run + 清 pending wait-ack（先断 agent 再清 pending）
+  // 1) abort SDK Run + 关会话 + 清 ask 登记（先断 agent 再清状态）
   // chat task 的 run 在 chat-runner 的 runningChats、正经 task 在 task-runner 的 runningTasks、
   // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
   const hadAgent = cancelTaskRun(id) || cancelChatRun(id);

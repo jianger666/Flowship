@@ -29,6 +29,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { parseMainGitDirFromPointer } from "./task-worktrees";
+
 // fe 固定 hook 脚本绝对路径（process.cwd() = fe 项目根、Next.js 运行时）
 // V0.6.29：command 包一层 node 调用——路径可能含空格、引号兜住；sh -c / cmd 都认这个写法
 // V0.6.30：node 用 process.execPath（跑本服务的那个 node 的绝对路径）、不裸写 `node`——
@@ -155,21 +157,31 @@ const pathExists = async (p: string): Promise<boolean> => {
 };
 
 /**
- * 把 `.cursor/hooks.json` 加进 cwd/.git/info/exclude（仅 cwd 本身是 git 仓时）
+ * 把 `.cursor/hooks.json` 加进 cwd 所属 git 仓的 info/exclude（仅 cwd 本身是 git 工作区时）
  *
  * 多仓公共父目录不是 git 仓、文件不归任何仓管、无需 exclude、直接跳过。
+ * V0.10：cwd 是 worktree 时（.git 是文件、内容 `gitdir: <主仓>/.git/worktrees/<name>`）、
+ * exclude 写到主仓公共 git dir 的 info/exclude（git 对所有 worktree 统一读这份）。
  */
 const addGitExclude = async (cwd: string): Promise<void> => {
   const gitDir = path.join(cwd, ".git");
-  // .git 必须是目录（worktree 的 .git 是文件、保守跳过）
+  let gitInfoDir: string;
   try {
     const stat = await fs.stat(gitDir);
-    if (!stat.isDirectory()) return;
+    if (stat.isDirectory()) {
+      gitInfoDir = path.join(gitDir, "info");
+    } else {
+      // worktree：从 .git 指针文件解析主仓公共 git dir（…/.git/worktrees/<name> → …/.git）
+      // 注意 git 在 Windows 也写正斜杠、解析统一走 parseMainGitDirFromPointer
+      const pointer = await fs.readFile(gitDir, "utf8");
+      const mainGitDir = parseMainGitDirFromPointer(pointer);
+      if (!mainGitDir) return; // 解析不了、保守跳过（exclude 只是防误 commit 的软保护）
+      gitInfoDir = path.join(mainGitDir, "info");
+    }
   } catch {
     return; // 没 .git（多仓公共父目录）、跳过
   }
 
-  const gitInfoDir = path.join(gitDir, "info");
   const excludePath = path.join(gitInfoDir, "exclude");
   const entry = ".cursor/hooks.json";
   try {

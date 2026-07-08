@@ -15,10 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   SIGNALS,
   SIGNAL_PREFIXES,
-  TERMINAL_SIGNAL_TOKENS,
   buildNextActionHead,
-  keepaliveLine,
-  shellWaitGuideHead,
 } from "@/lib/protocol-signals";
 
 const promptsDir = path.resolve(import.meta.dirname, "..", "prompts");
@@ -26,49 +23,43 @@ const superMd = readFileSync(path.join(promptsDir, "_super.md"), "utf-8");
 
 describe("信号常量 ↔ _super.md 一致性", () => {
   it("agent 面向的固定信号、_super.md 都要教（字面量出现）", () => {
-    // SHELL_WAIT_GUIDE / ATTACHED_* 是工具返回头、INTERNAL_ERROR 是错误头——
-    // 这些也都该在 super prompt 里出现过、agent 才认识
+    // V0.11：send 消息头只剩三种（revise / 用户回复 / NEXT_ACTION 前缀）+ 附件段头
     const agentFacing = [
-      SIGNALS.ACTION_ACK_APPROVE,
       SIGNALS.ACTION_ACK_REVISE,
       SIGNALS.USER_REPLY,
-      SIGNALS.TASK_DONE,
-      SIGNALS.TASK_ABANDONED,
-      SIGNALS.CANCELLED,
-      SIGNALS.STALE,
-      SIGNALS.INVALID_TOKEN,
-      // 历史事故主角：曾在 grep 终态表里、prompt 却没教（R2 review 发现、V0.6.27 补）
-      SIGNALS.INTERNAL_ERROR,
+      SIGNALS.ATTACHED_IMAGES,
     ];
     for (const sig of agentFacing) {
       expect(superMd, `_super.md 缺信号说明：${sig}`).toContain(sig);
     }
   });
 
-  it("带参信号前缀（NEXT_ACTION / KEEPALIVE / SHELL_WAIT_GUIDE）在 _super.md 出现", () => {
+  it("带参信号前缀（NEXT_ACTION）在 _super.md 出现", () => {
     expect(superMd).toContain(SIGNAL_PREFIXES.NEXT_ACTION);
-    expect(superMd).toContain(SIGNAL_PREFIXES.KEEPALIVE);
-    expect(superMd).toContain("[SHELL_WAIT_GUIDE token=");
   });
 
-  it("终态 token 表覆盖全部固定信号的 token（少一个 = agent 拿到结果还在空转）", () => {
-    // 从 SIGNALS 里抠出所有 token（方括号内第一个词）
-    const tokens = new Set(
-      Object.values(SIGNALS)
-        .map((s) => /^\[([A-Z_]+)/.exec(s)?.[1])
-        .filter((t): t is string => !!t),
-    );
-    // SHELL_WAIT_GUIDE / ATTACHED_* 不是 wait-ack stdout 终态行、不要求在 grep 表里
-    tokens.delete("SHELL_WAIT_GUIDE");
-    tokens.delete("ATTACHED_IMAGES");
-    tokens.delete("ATTACHED_PATHS");
-    tokens.add("NEXT_ACTION"); // 带参信号、也是终态
+  it("工具返回头（SUBMITTED / ASK_SUBMITTED / ASK_USER_REPLY）在 _super.md 出现", () => {
+    // 这些头由 chat-mcp 工具返回 / ask-reply 路由拼、_super.md 教 agent 怎么读
+    expect(superMd).toContain("[SUBMITTED]");
+    expect(superMd).toContain("[ASK_SUBMITTED]");
+    expect(superMd).toContain("[ASK_USER_REPLY]");
+    expect(superMd).toContain("[ASK_USER_REPLY deferred]");
+  });
 
-    for (const t of tokens) {
-      expect(
-        TERMINAL_SIGNAL_TOKENS as readonly string[],
-        `TERMINAL_SIGNAL_TOKENS 缺 ${t}`,
-      ).toContain(t);
+  it("旧 wait 协议残留不该再出现在 _super.md（协议已退役）", () => {
+    for (const legacy of [
+      "[SHELL_WAIT_GUIDE",
+      "[KEEPALIVE",
+      "[TASK_DONE]",
+      "[TASK_ABANDONED]",
+      "[STALE]",
+      "[INVALID_TOKEN]",
+      "wait-ack",
+      "long-poll",
+    ]) {
+      expect(superMd, `_super.md 残留旧协议字样：${legacy}`).not.toContain(
+        legacy,
+      );
     }
   });
 });
@@ -95,11 +86,6 @@ describe("信号构造函数格式", () => {
     expect(buildNextActionHead({ actionType: "plan" })).toBe(
       "[NEXT_ACTION type=plan]",
     );
-  });
-
-  it("keepaliveLine / shellWaitGuideHead 前缀正确", () => {
-    expect(keepaliveLine()).toMatch(/^\[KEEPALIVE ts=\d+\]\n$/);
-    expect(shellWaitGuideHead("tok_1")).toBe("[SHELL_WAIT_GUIDE token=tok_1]");
   });
 });
 

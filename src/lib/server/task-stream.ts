@@ -61,6 +61,27 @@ export interface RunningTaskRecord {
   cancel: () => void;
 }
 
+/**
+ * V0.11：跨 run 存活的 agent 会话（wait 协议退役、改「create + 多轮 send」）。
+ * run 自然结束后 agent 不 close、记录留在这——用户下一次操作（推进续用 / 再聊聊 /
+ * ask 答案）直接 `agent.send()` 续同一会话。stop / error / finalize / 换新 agent 才关。
+ * 泛型上不引 SDK 类型（task-stream 保持零 SDK 依赖）、由 task-runner 存取时收窄。
+ */
+export interface AgentSessionRecord {
+  // Agent 实例（Awaited<ReturnType<typeof Agent.create>>、这里用结构化最小面收窄）
+  agent: {
+    agentId: string;
+    send: (text: string) => Promise<unknown>;
+    close: () => void;
+  };
+  agentId: string;
+  createdAt: number;
+  // V0.11.1：最近活跃时间（run 结束 / send 时刷）——空闲回收 sweeper 按它判 TTL
+  lastActiveAt: number;
+  // V0.6.6 热更快照（原挂 RunningTaskRecord、会话跨 run 后归会话所有）
+  startSnapshot: TaskFieldsSnapshot;
+}
+
 // V0.8.18：一个 action 正在后台跑的后置 check 句柄（见 task-runner 的 runActionPostCheck）
 export interface RunningCheck {
   // 这个 check 属于哪个 action（结果有效性判定 + 去重用）
@@ -72,6 +93,8 @@ export interface RunningCheck {
 interface TaskRunnerGlobalState {
   // taskId → 运行中的 task 控制对象
   runningTasks: Map<string, RunningTaskRecord>;
+  // V0.11：taskId → 跨 run 存活的 agent 会话（见 AgentSessionRecord）
+  agentSessions: Map<string, AgentSessionRecord>;
   // taskId → 订阅者集合（watch-task 路由 subscribe）
   subscribers: Map<string, Set<TaskStreamListener>>;
   // V0.6：标记 task 即将被 force new agent（advanceTask forceNewAgent=true）
@@ -81,9 +104,10 @@ interface TaskRunnerGlobalState {
   runningChecks: Map<string, RunningCheck>;
 }
 
+// V4：2026-07-07 V0.11 加 agentSessions（wait 退役、agent 会话跨 run 存活）
 // V3：2026-06-22 V0.8.18 加 runningChecks（后置 check 异步化、bump 防 dev hot reload 拿到旧 state 缺字段）
 // V2：2026-05-27 V0.6 上线、bump 版本号防 dev hot reload 拿到 V0.5 残留 state
-const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV3__";
+const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV4__";
 
 const getRunnerState = (): TaskRunnerGlobalState => {
   const g = globalThis as unknown as Record<
@@ -93,6 +117,7 @@ const getRunnerState = (): TaskRunnerGlobalState => {
   if (!g[TASK_RUNNER_GLOBAL_KEY]) {
     g[TASK_RUNNER_GLOBAL_KEY] = {
       runningTasks: new Map(),
+      agentSessions: new Map(),
       subscribers: new Map(),
       forkPendingTasks: new Set(),
       runningChecks: new Map(),
@@ -102,6 +127,7 @@ const getRunnerState = (): TaskRunnerGlobalState => {
 };
 
 export const runningTasks = getRunnerState().runningTasks;
+export const agentSessions = getRunnerState().agentSessions;
 const subscribers = getRunnerState().subscribers;
 export const forkPendingTasks = getRunnerState().forkPendingTasks;
 export const runningChecks = getRunnerState().runningChecks;
@@ -186,4 +212,14 @@ export const waitForTaskToStop = async (
 export const forceClearStaleRunnerState = (taskId: string): void => {
   runningTasks.delete(taskId);
   forkPendingTasks.delete(taskId);
+  // V0.11：连会话一起强清（agent close 尽力而为）
+  const session = agentSessions.get(taskId);
+  if (session) {
+    agentSessions.delete(taskId);
+    try {
+      session.agent.close();
+    } catch {
+      /* noop */
+    }
+  }
 };

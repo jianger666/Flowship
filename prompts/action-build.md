@@ -10,16 +10,18 @@
 ## 准入条件（V0.6.17 起：plan 可选）
 
 - **plan 不再是硬前置**（V0.6.17 放开）——有 plan 按 plan 工单走、无 plan 按用户指令直接改（改文案 / 修小 bug 不必先出方案）。两种模式差异见「本 action 的目标」+「执行步骤 1」。
-- runner 在 [NEXT_ACTION ...] 头后会注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
-  - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
-  - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
-  - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 wait_for_user 等用户处理、**不要**自己 force / reset
-  - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + wait_for_user）
+- **分支准入分两种模式**（看「任务基本信息」段有没有「任务隔离工作区」说明）：
+  - **隔离工作区模式（V0.10 默认）**：分支已由系统在 worktree 里检出好、[NEXT_ACTION] 不会注入 checkout 引导——**你不需要（也不许）自己 checkout**、直接做下面的铁律自检后开工
+  - **原仓库直跑模式**：runner 在 [NEXT_ACTION ...] 头后注入一段「## 准入：build 第一动作、逐仓 idempotent checkout 分支」shell 引导、按那段命令**逐仓** checkout / 建分支：
+    - 多仓 task：每仓共用同一 branch name；base 分支 = 用户建 task 时填的「线上分支」、没填则各仓自探（`git symbolic-ref refs/remotes/origin/HEAD`）
+    - **idempotent**：每次 build 都会注入这段 hint、命令本身判 `if git show-ref ... then checkout else fetch + checkout -b`、多次跑不会副作用
+    - checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓）→ 立刻 emit 简短 assistant_message 告知问题、调 wait_for_user 等用户处理、**不要**自己 force / reset
+    - **注入的 checkout 引导末尾带一道 verify**（V0.6.20）：checkout 后会 `git rev-parse` 确认当前分支 == 目标分支、不对则 `exit 1`——看到这个 error 别忽略、当成 checkout 失败处理（停 + wait_for_user）
 
-- **🔒 铁律（V0.6.20、写代码前最后一道闸）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git rev-parse --abbrev-ref HEAD` 拿当前分支、跟「## 仓库分支配置」段里这仓的 branch name 比对：
+- **🔒 铁律（V0.6.20、写代码前最后一道闸、两种模式都必做）：动任何代码前、必须确认当前在本 task 的 feature 分支上**——`git rev-parse --abbrev-ref HEAD` 拿当前分支、跟「## 仓库分支配置」段里这仓的 branch name 比对：
   - 一致 → 正常往下做
   - 不一致（在主分支 / 别的 feature / 别的 task 的分支）→ **立刻停**、`ask_user` 报告「当前在 X 分支、不是目标 Y 分支、要我切过去还是你来处理」、**绝不在错分支上改一行代码**
-  - **即使上面的 checkout 引导没注入 / 没跑成功（异常情况），这道自检也必须做**——曾踩坑：agent 没收到 checkout 引导就直接在别的需求分支上改了代码、污染了那个分支
+  - **即使 checkout 引导没注入 / 没跑成功（异常情况），这道自检也必须做**——曾踩坑：agent 没收到 checkout 引导就直接在别的需求分支上改了代码、污染了那个分支
 
 ## 本 action 的目标
 
@@ -50,7 +52,7 @@
    - **无 plan**（V0.6.17 直接 build）：范围 = 用户指令圈定的文件 / 模块。指令没点到的别顺手改、拿不准是否该动就 ask_user
    - **review 授权的修复**：执行步骤 1.2 里用户答应本次修的 review bug、属于已授权范围、可以改
 2. **不动 .git**——不 commit、不 push、不 rebase、不 reset、不 stash
-   - **例外**：build action 开头 runner 注入的 idempotent checkout hint、按那段 shell 命令跑（详见上面准入条件）
+   - **例外**：原仓库直跑模式下、build action 开头 runner 注入的 idempotent checkout hint、按那段 shell 命令跑（详见上面准入条件）；隔离工作区模式无此例外（分支已检出、全程不动 git）
    - 跑完 checkout 后**绝对不再动 git**——commit / push / pr 都是 ship action 的职责、不归 build
 3. **不删测试 / 配置文件**——除非最新 plan artifact 明确指定
 4. **不动用户业务仓库根的 README / package.json**——除非最新 plan artifact 明确说要改
@@ -177,18 +179,17 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 `<n>` 是从 [NEXT_ACTION] 头里拿的 action.n。artifact 写入工具用法见「跨 action 共享规范 §1 artifact 写入工具」。格式按下面骨架。
 
-### 6. 调 `wait_for_user`
+### 6. 调 `wait_for_user` 交卷、结束回复
 
 参数：
 - `task_id={{taskId}}`
 - `action_id=<本 action 的 id>`
 - `artifact_path=actions/<n>-build.md`
 
-shell stdout 返回行解析：
+拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
 
-- `[ACTION_ACK approve]` → **立刻再调 `wait_for_user(task_id={{taskId}})`** 等下一 action 指令、**绝对不退出 Run、绝对不自动进入 review**——下一个 action 类型由用户在 UI 选
-- `[ACTION_ACK revise]` + 后续 feedback → 按 super-prompt §3 revise 解读分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`（**必须带同一 action_id + artifact_path**、不带 = 服务端判协议违规自动纠正）
-- 其他终态（CANCELLED / STALE / INVALID_TOKEN）的处理见 super-prompt「关键规则 3」段
+- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `wait_for_user`（同 action_id + artifact_path）重新交卷、结束回复
+- `[NEXT_ACTION ...]` → 用户已通过并推进下一 action、按新指令执行、**绝对不自动进入 review**——下一个 action 类型由用户在 UI 选
 
 ## 自检（V0.6.3 起：runner 不再自动跑后置检查、build 质量靠你自检 + 用户人眼把关）
 
@@ -295,5 +296,5 @@ shell stdout 返回行解析：
 - **不写无信息密度的注释**：「调用接口」「返回 null」这种废话注释不要加。中文注释、解释「为什么」不解释「是什么」
 - **跑 shell 慢的命令**：`pnpm install` / 全量 build 可能耗时几分钟、agent 不要因为「等太久」就放弃、shell 工具有 timeout 参数、合理放宽
 - **写完 → 给 1-3 句简短结论 → 调 wait_for_user**：结论说清「改了哪几个文件 / 实现了什么 / typecheck·lint 过没 / 有无遗留」（流式、简短、别长篇复述）；别说「我改完了你看下」这种没信息量的空话、也别说完忘了调 wait（详见 super-prompt 关键规则 1）
-- **绝对不自动进入下一 action**：build 拿到 [ACTION_ACK approve] 后立刻 wait_for_user 等下一 action 指令、不要自己跑 review / ship——下一 action 类型由用户在 UI 选
+- **绝对不自动进入下一 action**：build 交卷后结束回复、不要自己跑 review / ship——下一 action 类型由用户在 UI 选
 - **分批 build 只做被指定的批次**：[NEXT_ACTION] 带 `[BUILD_BATCHES]` 时严守本次批次范围、别顺手把别的批次也做了（那样 review / 进度推导就乱了）；artifact 总览记清「本次完成批次」

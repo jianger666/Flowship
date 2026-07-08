@@ -154,12 +154,12 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 
 > ⚠️ 落地是真写文件、但**不碰 .git**（见严格约束）——改动停在工作区、artifact 里告知用户、用户自己带进下次提交。
 
-### 7. 调 wait_for_user
+### 7. 调 wait_for_user 交卷、结束回复
 
 参数：`task_id={{taskId}}`、`action_id=<本 action 的 id>`、`artifact_path=actions/<n>-learn.md`
 
-- `[ACTION_ACK approve]` → 立刻再调 `wait_for_user(task_id={{taskId}})` 等下一指令（**不退出 Run**、用户标「已合入」时你会收到 [TASK_DONE]、那才是退出信号）
-- `[ACTION_ACK revise]` + feedback → 按 super-prompt §3 revise 二分类处理（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 wait_for_user
+拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
+- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」二分类处理（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 wait_for_user 重新交卷、结束回复
 
 ## 后置检查（runner 自动跑、不过 action 标 ❌）
 

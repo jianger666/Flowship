@@ -19,7 +19,8 @@
  *
  * # 注意
  * - 仅 best-effort：失败只 log、不抛、不阻断停止流程。
- * - macOS / Linux 通用（依赖 `ps` + `lsof`）。
+ * - macOS / Linux 通用（依赖 `ps` + `lsof`）；Windows 没有这俩、入口直接跳过
+ *   （孤儿风险仍在、但树杀由壳退出时 taskkill /T 兜底、不值得为此接 wmic/CIM）。
  * - **不要在 force-new-agent（换新 agent）场景调**——新 agent 会在同仓拉起带同样签名的 shell、
  *   会被误杀。调用方负责只在「真正停止 / 自然结束 / 报错」时调（见 task-runner stop 路径 + finally 守卫）。
  */
@@ -108,6 +109,10 @@ const collectSubtree = (
 export const killOrphansInRepos = async (
   repoPaths: string[],
 ): Promise<void> => {
+  // Windows：没有 ps / lsof、这套「按 cwd 扫孤儿」实施不了——直接跳过、
+  // 不让每次停止任务都白跑 + 打 error 日志（本保护本就 best-effort、
+  // Windows 端 agent 子进程树最终由壳退出时 taskkill /T 兜底）
+  if (process.platform === "win32") return;
   if (!repoPaths || repoPaths.length === 0) return;
   const repos = repoPaths.map((p) => path.resolve(p));
   const selfPid = process.pid;

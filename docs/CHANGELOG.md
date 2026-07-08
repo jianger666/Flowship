@@ -15,6 +15,60 @@
 
 ---
 
+### V0.10：任务 worktree 隔离（2026-07-06 实装）
+
+- **动机**：agent 直接在用户配置的仓库目录里干活（`local.cwd = getEffectiveCwd(repoPaths)`）——同仓两个 task 并行必互踩（checkout 互切、A 的现场被 B 掀掉）、agent 和用户本人抢同一工作区、review 指纹易被无关改动误触。这是单机并行使用的物理天花板。
+- **核心模块 `src/lib/server/task-worktrees.ts`**：每 (task × 仓) 一个 `git worktree`（同一仓库数据库长出多个独立工作目录、历史/分支引用共享、HEAD/index/工作文件独立、git 原生保证同分支不能双检出）：
+  - 路径 `<数据目录>/worktrees/<taskId>/<仓名>`（仓名重名加 `-2` 后缀、`getUniqueRepoDirNames` in path-utils 前后端共用）——多仓 task 的 cwd = `worktrees/<taskId>/` 公共父目录、单仓 = worktree 自身、`getTaskCwd(task)` 统一封装（非隔离 task 原样走 `getEffectiveCwd`）
+  - **`ensureTaskWorktrees`（幂等）**：advance / restart 时 runner 在起 agent 前调——分支名复用 branch-template 引擎渲染（storyId 抠取抽成 `extractFeishuStoryId` 进 branch-template.ts、action-gates 同源复用）、`fetch origin <base>` best-effort（离线回退本地 base）、分支已存在则直接挂载 / 不存在 `worktree add -b`、已有 worktree 直接复用；同 task 后续 action 零成本复用
+  - **建分支从 prompt 软约束升级为 harness 保证**：隔离 task 不再注 build checkout hint、`action-build.md` 准入条件按「隔离 / 原仓直跑」两模式分写；prompt 仓库段（`renderRepoSection`）对隔离 task 说明「分支已检出、别自己 checkout、缺依赖自己装」
+  - **路径归一**：agent 报的是 worktree 路径、后端记录/校验要原仓路径——`resolveOriginalRepoPath` 在 submit_mr 入口归一、review 指纹 / 起点基线 / 孤儿收割走 `getTaskWorkRepoPaths(task)`
+  - **清理**：task 终结（merged/abandoned）/ 删除时 `worktree remove --force` + `prune`（**任务分支保留**、reopen 可重建续推）；boot recovery 扫 `worktrees/` 下不属于存活 task 的孤儿目录清掉
+  - **删前 WIP 快照保底**（全项目 bug 扫描修的 P0）：build 铁律不 commit → 未 ship 的产物只以未提交改动活在 worktree 里、`--force` 删除会连带销毁。`snapshotDirtyWorktree`：删前 `status --porcelain` 查脏、脏则 `add -A` + `commit --no-verify`（带兜底身份、绕业务仓 hooks）落 WIP 快照到任务分支——「分支保留 = 产物保留」才真成立、reopen 重建检出即无缝续推。finalize / deleteTask / boot 孤儿清理三条路径都走
+  - stop-hook 的 `addGitExclude` 学会解析 worktree 的 `.git` 指针文件、exclude 写到主仓公共 git dir（解析统一走 `parseMainGitDirFromPointer`——git 在 Windows 也写正斜杠、不能用 path.sep 匹配）
+  - 仓短名去重改探重循环（`getUniqueRepoDirNames`）：旧「第 N 次出现拼 -N」会跟真实目录名 `web-2` 撞车、两仓静默映射同一 worktree
+- **顺手修「删任务要删两遍」老 bug**（用户实测反馈）：DELETE route 的 cancel 只是发信号、run 的 finally 迟到写 events.jsonl 会跟递归删除撞车（目录删一半 + ENOTEMPTY → 首删报错、任务内容被清空、二删才成）——route 删前 `waitForTaskToStop` + `waitForChatToStop` 等 run 真退、`deleteTask` 的 `fs.rm` 加 `maxRetries: 5` 双保险
+- **三个拍板设计点**（2026-07-06 用户确认）：
+  1. node_modules（untracked、不跟过来）：第一版不自动装、prompt 告知 agent 缺依赖自己 install；疼了再上 per-repo 初始化命令
+  2. `.env*` 本地配置：创建时从原仓根目录拷（仅根层 `.env*` 文件、白名单 per-repo 可配留到有需求再做）
+  3. 任务分支恰好被用户本人 IDE 检出：`worktree add` 失败、报错透传 UI（提示在主仓切走）、不默默降级
+- **逃生口**（用户拍板「留个逃生口」）：新建任务弹窗 MCP 块下加勾选「直接在原仓库运行」、默认不勾（即默认隔离）——适合「让 agent 接着我手头现场继续干」；chat 模式恒不隔离。`Task.isolateWorktree`（新建 task 默认 true、老 task undefined 走旧路径、不写 migration）
+- **V0.10.1 配套体验（同日追加、用户实测 worktree 后的三个痛点）**：
+  - **node_modules 秒级克隆**（`cloneNodeModules`）：建 worktree 时原仓有 node_modules 就 APFS copy-on-write 克隆（mac `cp -Rc`、clonefile）——不走网络、秒级、磁盘块共享、postinstall 产物原样带过来（实测痛点：umi 大包重装久 + 新环境 postinstall 偶发失败导致 build 校验被 skip）。独立副本互不污染、失败静默回退 agent 自装、非 mac 跳过
+  - **`Task.workCwd` 计算字段**（hydrate 时 `getTaskCwd` 算、不落盘）：client 拿 agent 实际工作目录（dataRoot 只有 server 知道）
+  - **任务页工作区快捷操作条**（`workspace-actions.tsx`、路径行下方）：「在 IDE 打开」（cursor:// deep link 直开 worktree）＋「复制路径」＋「预览」
+  - **单预览位**（`preview-manager.ts` + `/api/preview` + 设置页 per-repo「预览启动命令」）：全局最多一个 dev server、点任务「预览」自动停旧起新（对齐单分支心智、端口不撞）。进程组隔离（detached + kill(-pid)）、pidfile 兜底（app 重启杀残留、boot recovery 调 `killStalePreview`）、日志环形缓冲 + URL 探测（探到 localhost 地址 UI 出「打开」）。app 不理解命令语义、只执行配置
+- **测试**：`tests/task-worktrees.test.ts`（纯函数、含短名撞车 / gitdir 指针解析）+ `tests/task-worktrees.integration.test.ts`（真临时 git 仓跑 ensure/remove 全流程：建/幂等/同分支冲突报错/脏工作区 WIP 快照/清理留分支/reopen 重建续接快照内容/node_modules 克隆）。typecheck / lint / vitest 160 全绿。
+- ~~后续期次 ①「在 IDE 打开 worktree」按钮 ② 单预览位~~——**已在 V0.10.1 当日做完**（见上）。剩余方向：③ 飞书收件箱一期（app 内列「指派给我的 story」+ 一键建 task）→ 二期（后台轮询自动建 task + 自动跑 plan、停在 awaiting_ack 等人审）——二期自动并发建 task 恰好依赖 worktree 隔离、顺序正确
+
+### v0.9.14：自定义 action 增强——编辑器补全 + skill 缺失兜底 + 导入导出（2026-07-03、通用化讨论落地第一批）
+
+- **背景**：通用化方向下自定义 action 可能是非研发用户（测试 / BI）的全部工作流。走查出三块短板：编辑器可发现性差（模板变量没提示、freshAgent 有字段没 UI）、引用的 skill 别人机器没有时 agent 拿悬空引用瞎找、团队没有轻量共享路径。同轮讨论还拍板了「建任务仓库改可选、飞书 story 保留必填」——**动面大、留到下一轮单做**。
+- **编辑器小改**（`custom-action-editor.tsx`）：
+  - 模板变量 chips 加过又删（用户实测「不知道是干嘛的、没太大用处」）——任务标题 / 仓库路径 / artifact 目录这些上下文 super prompt 本来就有独立段落传给 agent、playbook 不需要点位引用；运行时 `{{var}}` 替换链路保留（跟内置 prompt 同一条 fillTemplate）、手写仍生效、只是不宣传
+  - `freshAgent` 补开关「每次推进都用新 Agent」（字段 / API / 运行链早就支持、一直没 UI 改不了）
+  - 新字段 `CustomActionDef.placeholder`（推进输入框提示、轻量参数化——告诉使用者该填什么）：fs 层 parse/serialize + POST/PATCH 入参 + advance-dialog `buildPlaceholder` custom 分支读定义、缺省回通用文案
+- **skill 缺失兜底**（导入别人的定义 / 换机器场景）：
+  - **agent 侧静默过滤**：`skills-loader` 新增 `listAvailableSkillNames(repoPaths)`（平台 + 全局 ∪ 各绑定仓 `.cursor/skills/`、repo 层算进来防误杀）、`loadCustomActionPlaybook` 渲染点名段前按集合过滤——缺的名字不进 prompt、agent 无感零幻觉
+  - **用户侧显式提示**：/actions 页自定义行显示 skill chips（缺失的灰显划线 + tooltip「本机未找到、推进时自动跳过」）；编辑器 MultiSelect 把「已勾但本机没有」合成灰项显示（不合进 options 这些勾选会隐身）
+  - 定义文件不动（换机器 / 同事装了 skill 引用又活）——机器看不见缺的、人看得见缺的、文件不动
+- **导入 / 导出**（团队点对点共享、比 repo `.cursor/actions/` 层更轻、先做这个）：
+  - 定义本来就是单个 md 文件（frontmatter + playbook）、天然交换格式——飞书传文件即可共享
+  - **都以文件夹为单位**（用户拍板「批量就用文件夹的形式」）——导出：只有 /actions 页顶部一个入口（不做行内单个导出、同轮拍板）、先弹勾选（`export-actions-dialog.tsx`、默认全选 / 全选 checkbox 带 indeterminate、用户反馈「一键全部太糙」当轮改）、确认后原生目录 picker、每个写 `<label>.md`（重名自动 -2 后缀不覆盖）；导入：顶部「导入」、原生 picker 选文件夹、server 扫目录第一层 md 逐个解析（借 `parseDef` 清洗、不递归）、**id 一律重新生成**防撞、单文件失败不影响其余（toast 汇总）；顺带补了 `ui/checkbox.tsx` 基础组件（base-nova、项目此前没有）
+  - 新路由 `POST /api/custom-actions/import`（body paths、1MB/文件上限）+ `POST /api/custom-actions/export`（body ids + dir）、绝对路径校验、信任模型同 `/api/repo-branches`（本地单用户桌面 app）
+- typecheck / lint / vitest 133 全绿。repo 层 action（`.cursor/actions/` 跟仓走）暂缓、看导入导出的实际使用效果再定。
+
+### v0.9.13：删「跑项目命令」的确定性检查（2026-07-03、用户拍板「lint / typecheck 这类删掉」）
+
+- **背景**：用户实测「公司项目几乎全部不通过」——CheckRun 对全仓跑 typecheck / lint、存量项目基线本来就红（历史债）、agent 只改两个文件也永远红、红色失去信息量、ship 还每次都要 override 填原因。加上工具通用化方向（非研发用户）、「研发流程假设」不再成立。拍板范围 = 档 A：**删所有「跑项目命令」的检查、保留「agent 交付诚实性」检查**（artifact 落盘 / 必备段 / review 只读指纹 / MR URL 验真等全保留）。
+- **删除面（types → server → API → UI 全链）**：
+  - types：`CheckCommand` / `CheckCommandKind` / `CheckCommandResult` / `CheckRepoResult` / `CheckRunSummary` / `CheckOverride` / `Task.repoCheckCommands` / `RepoConfig.checkCommands` / `CustomActionDef.checkCommands` / `ActionRecord.checkRun` / `ActionRecord.checkOverride` 全删；`ShipPrecheck` 瘦身成 `{ reviewMissing }`。
+  - server：`repo-check-detect.ts` 整文件删（自动检测）；`action-checks.ts` 删 `runRepoChecks` / 污染检测 / `--fix` 预判、`checkBuild` 只留 artifact 必备段 + 兄弟仓越权、`checkCustom` 只留 artifact 非空；`action-gates.ts` 删 `checkShipCheckGate`（ship override 门禁）；`task-fs.sanitizeCheckCommands` / createTask 检测链 / `addRepoCheckCommands` patch 链删；`task-fs-core` 删 `getCheckLogPaths` + meta 字段。
+  - API：advance 路由删 `checkOverride` 入参、tasks 路由删 `repoCheckCommands` / `addRepoCheckCommands`、custom-actions 路由删 `checkCommands`、ship-precheck 只返 `reviewMissing`。
+  - UI：`check-run-summary.tsx` / `repo-check-commands.tsx` 两组件删；repo-card 检查命令编辑区删、advance-dialog ship override 区删（reviewMissing 黄条保留）、custom-action-editor 校验命令字段删、task-display 删 `CHECK_STATUS_LABEL/VARIANT`。
+- **保留**：`runActionPostCheck` 后台异步框架（runningChecks 去重 + abort、checkReview 多仓 git 指纹仍可能上秒）、`runCheckShell` / `computeWorktreeFingerprint` / `computeRepoStatusHash`（review 指纹 + 兄弟仓基线的底座）。老 task 数据里的 `checkRun` 字段读时被 schema 忽略、不写 migration。
+- 质量兜底改由 build agent 自查（action-build.md「验证仓库脚本」段让 agent 增量校验、未动）+ review 人审。测试删 `sanitize-check-commands.test.ts` / `repo-check-detect.test.ts`（142 → 133 条全绿）。
+
 ### v0.9.12：推进弹窗通用化——删「更多」折叠区 + 删默认 action 推断（2026-07-03、用户拍板「工具往通用走」）
 
 - **背景**：用户在 /actions 页关掉某 action 后、推进弹窗里它收进「更多」且（默认选中项恰好被隐藏时）自动展开——「我关了它、它反而默认展开」反直觉。讨论后用户给出更深的方向：工具要往通用走、不能假设用户是前端研发（测试 / BI 用户可能把内置 action 全关、纯用自定义）、连「按仓库状态推断默认选中哪个 action」的逻辑也不该要。

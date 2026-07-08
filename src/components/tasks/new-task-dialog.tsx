@@ -15,6 +15,7 @@ import { toast } from "sonner";
 import type { McpServerConfig } from "@cursor/sdk";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Combobox } from "@/components/ui/combobox";
 import {
   Dialog,
@@ -119,6 +120,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
   const [disabledMcp, setDisabledMcp] = useState<string[]>([]);
   // MCP 区折叠态、默认收起
   const [mcpExpanded, setMcpExpanded] = useState(false);
+  // V0.10 逃生口：勾了直接在原仓库运行（不建隔离 worktree）、默认不勾 = 隔离
+  const [runInRepo, setRunInRepo] = useState(false);
   // 任务级模型选择（含 thinking/effort/context 等 params）；默认 = settings.defaultModel
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   // 默认模型 id（仅用于「已切到非默认模型」提示判断）
@@ -156,6 +159,7 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
     setFeatureBranches({});
     setDisabledMcp([]);
     setMcpExpanded(false);
+    setRunInRepo(false);
     setPickedModel({ id: "" });
     setDefaultModelId("");
   }, [open]);
@@ -266,6 +270,8 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
             ? repoBranchTemplates
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
+        // V0.10：默认隔离 worktree、勾了逃生口才直跑原仓库
+        isolateWorktree: !runInRepo,
         model,
       });
       setOpen(false);
@@ -493,6 +499,18 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
               )}
             </div>
           )}
+
+          {/* V0.10 逃生口：默认每 task 建隔离 worktree、特殊场景（想直接看着原仓库改）勾这个 */}
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="t-run-in-repo"
+              checked={runInRepo}
+              onCheckedChange={setRunInRepo}
+            />
+            <Label htmlFor="t-run-in-repo" className="cursor-pointer font-normal">
+              直接在原仓库运行（不隔离工作区、并行任务会互相影响）
+            </Label>
+          </div>
         </div>
 
         {/* 缺飞书 MCP 时的硬提示——飞书是「需求 → PR」命脉、缺了按钮置灰不让建 */}

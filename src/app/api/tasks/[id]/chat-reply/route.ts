@@ -15,25 +15,25 @@
  * }
  * ```
  *
- * # 路由职责（两种模式）
+ * # 路由职责（V0.11：wait 协议退役、两种模式）
  *
- * 1. **awaiting_user + hasPending=true**（正常对话循环）：
+ * 1. **有存活会话（agent 在、无 run 在跑）**（正常对话循环）：
  *    - 写 user_reply 事件
- *    - submitUserMessage（resolve wait_for_user）
- *    - patch task.runStatus=running
+ *    - sendChatMessage（`agent.send` 续同一会话、新 run）
+ *    -（切模型 / 切 MCP 时懒重启：关旧会话、起新会话、这条消息作首条）
  *
- * 2. **idle / error / 上一轮 completed + 无 pending**（自动启动）：
+ * 2. **无会话（首条 / agent 已关 / 服务重启过）**（自动启动）：
  *    - 写 user_reply 事件（用户立刻看到自己的话）
  *    - patch task.runStatus=running
- *    - fire-and-forget runChatSession(firstMessage=text) 启 agent
- *    - agent 起手 prompt 已含用户首条、直接回答、答完调 wait_for_user 进等待
+ *    - fire-and-forget runChatSession(firstMessage=text) 起新会话
+ *    - agent 起手 prompt 已含用户首条、直接回答、答完自然结束回复
  *
  * # 失败情况
  *
  * - task 不存在 → 404
  * - task.mode !== "chat" → 409（任务模式不走本路由、应走 advance）
+ * - run 正在跑（agent 正在回）→ 409
  * - 模式 2 但缺 bootArgs → 400
- * - hasPending=false 且 runStatus=awaiting_user/running → 410（僵尸态、当场标 error）
  */
 
 import { promises as fs } from "node:fs";
@@ -52,26 +52,23 @@ import {
   isPlaceholderChatTitle,
 } from "@/lib/task-display";
 import {
-  hasPending,
-  submitUserMessage,
-} from "@/lib/server/chat-pending";
-import {
   cancelChatRun,
   forceClearChatRun,
   getChatRunDisabledMcp,
   getChatRunModel,
   isChatRunning,
+  resumeChatSession,
   runChatSession,
+  sendChatMessage,
   waitForChatToStop,
 } from "@/lib/server/chat-runner";
 import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import {
   errorResponse,
   isValidModel,
-  KEEPALIVE_RACE_RETRY_MS,
   modelEquals,
   parseAndValidateImages,
-  sleep,
   stringSetEquals,
 } from "@/lib/server/route-helpers";
 
@@ -232,121 +229,92 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 提到模式判断前声明（原在模式 2 处、模式 1 引用会 TDZ 报错）
   const bootArgs = body.bootArgs;
 
-  // 决定模式：awaiting_user + hasPending → 正常推进；否则 → 自动启 agent
-  // race 兜底：刚切到 awaiting_user 但 hasPending 还没注册、KEEPALIVE_RACE_RETRY_MS 内 retry 一次
-  let pending = hasPending(task.id);
-  if (!pending && task.runStatus === "awaiting_user") {
-    await sleep(KEEPALIVE_RACE_RETRY_MS);
-    pending = hasPending(task.id);
+  // V0.11.1：内存没会话但有落盘锚点（服务重启 / 空闲回收后）→ 先 Agent.resume 接回、
+  // 下面统一走「有会话」分支 send 续接、上下文不丢。resume 失败会清锚点、自然落到起新会话。
+  if (
+    !isChatRunning(task.id) &&
+    task.sessionAgentId &&
+    bootArgs?.apiKey &&
+    isValidModel(bootArgs.model)
+  ) {
+    await resumeChatSession(task, {
+      apiKey: bootArgs.apiKey,
+      model: bootArgs.model,
+    });
   }
 
-  if (pending && task.runStatus === "awaiting_user") {
-    // 切模型 / 切 MCP 懒重启：用户可能在上轮答完后切了模型 / 调了参数 / 改了 MCP 开关
-    //（只存进 task.model / task.disabledMcpServers、没动当前 Run）。
-    // 比对「当前 Run 绑定的 模型 + MCP 黑名单」vs「现在的」、任一变了就重启、都没变就续接。
+  // 决定模式（V0.11）：有存活会话且没 run 在跑 → send 续接；否则 → 起新会话
+  if (isChatRunning(task.id)) {
+    // 切模型 / 切 MCP 懒重启：用户可能在上轮答完后切了模型 / 改了 MCP 开关
+    //（只存进 task.model / task.disabledMcpServers、没动当前会话）。
+    // 比对「会话绑定的模型 + MCP 黑名单」vs「现在的」、任一变了就重开会话、都没变就 send 续接。
     const runModel = getChatRunModel(task.id);
-    // 当前 Run 绑定的 MCP 黑名单快照 vs 现在 task 的（task 是上面 getTask 读的最新值、PATCH 已生效）。
-    // runMcp === null = 没活 Run 可比（pending 时理论不会、防御性当作没变、走续接）。
     const runMcp = getChatRunDisabledMcp(task.id);
     const mcpUnchanged =
       runMcp === null || stringSetEquals(runMcp, task.disabledMcpServers ?? []);
-    // 续接条件：没绑定模型可比 / 缺起新 Run 的 apiKey+model /（模型没变 且 MCP 没变）→ 同 Run 续接、省计费
-    if (
+    const canRestart = !!bootArgs?.apiKey && isValidModel(bootArgs.model);
+    const unchanged =
       !runModel ||
-      !bootArgs?.apiKey ||
-      !isValidModel(bootArgs.model) ||
-      (modelEquals(runModel, bootArgs.model) && mcpUnchanged)
-    ) {
-      submitUserMessage(task.id, text, imageAbsPaths, attachmentAbsPaths);
-      const runningTask = await setTaskRunStatus(task.id, "running");
-      if (runningTask)
-        publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
-      const fresh = await getTask(task.id);
-      return new Response(
-        JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
+      !canRestart ||
+      (modelEquals(runModel, bootArgs!.model!) && mcpUnchanged);
+
+    if (unchanged) {
+      // send 续接同一会话（agent 正在回时返 false → 409 让用户等说完）
+      const sent = await sendChatMessage(
+        task,
+        text || fallbackText,
+        imageAbsPaths,
+        attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
       );
+      if (sent) {
+        const fresh = await getTask(task.id);
+        return new Response(
+          JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // send 失败两种情况：run 在跑（agent 正在回）→ 409；会话坏了（已被 close）→ 落到下面起新会话
+      if (isChatRunning(task.id)) {
+        return errorResponse("agent 正在回、等它说完一段再发", 409);
+      }
+    } else {
+      // V0.10.1：更新就位未重启 → 起新会话必挂死。懒重启会关掉还健康的旧会话、拦在关之前
+      const pendingRestartMsg = await checkUpdatePendingRestart();
+      if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
+
+      // 模型 或 MCP 变了 → 懒重启：关旧会话、起新会话（这条消息作首条）、
+      // 历史靠 events.jsonl 续上（buildInitialPrompt 已给 agent eventsLogPath）
+      cancelChatRun(task.id);
+      const stopped = await waitForChatToStop(
+        task.id,
+        CHAT_RESTART_STOP_TIMEOUT_MS,
+      );
+      if (!stopped) {
+        console.warn(
+          `[chat-reply] task=${task.id} 切模型重启：旧会话没在 ${CHAT_RESTART_STOP_TIMEOUT_MS}ms 内退、强清继续`,
+        );
+        forceClearChatRun(task.id);
+      }
     }
-
-    // 模型 或 MCP 变了 → 懒重启：取消旧 Run、等它真退（超时强清）、用新模型 + 新 MCP 集合起新 Run
-    //（这条消息作首条）、历史靠 events.jsonl 续上（跟「服务重启后再聊」同一条恢复路径、
-    // buildInitialPrompt 已给 agent eventsLogPath；新 Run 内 filterDisabledMcp 读 task 最新黑名单）
-    cancelChatRun(task.id);
-    const stopped = await waitForChatToStop(
-      task.id,
-      CHAT_RESTART_STOP_TIMEOUT_MS,
-    );
-    if (!stopped) {
-      console.warn(
-        `[chat-reply] task=${task.id} 切模型重启：旧 Run 没在 ${CHAT_RESTART_STOP_TIMEOUT_MS}ms 内退、强清继续`,
-      );
-      forceClearChatRun(task.id);
-    }
-    const runningTask = await setTaskRunStatus(task.id, "running");
-    if (runningTask)
-      publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
-    void runChatSession({
-      task: runningTask ?? task,
-      apiKey: bootArgs.apiKey,
-      model: bootArgs.model,
-      firstMessage: {
-        text,
-        imagePaths: imageAbsPaths,
-        attachmentPaths:
-          attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
-      },
-      firstMessageEventId: replyEvent?.id,
-    }).catch((err) => {
-      console.error(
-        `[chat-reply] 切模型重启 runChatSession task=${task.id} failed:`,
-        err,
-      );
-    });
-    const fresh = await getTask(task.id);
-    return new Response(
-      JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: true }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
   }
 
-  // agent 进程其实还活着（runningChats 有）但没 pending = 它正在说话（running 态本来就没 pending）
-  // → 不是僵尸、绝不标 error、让用户等它这段说完。前端正常会拦 running、这里兜 SSE 滞后导致
-  //   前端拿过期 runStatus 发消息的 race（否则会把正在跑的 agent 误杀成 error）
-  if (!pending && isChatRunning(task.id)) {
-    return errorResponse("agent 正在回、等它说完一段再发", 409);
-  }
-
-  // 模式 2：自动启 agent（终态发消息）
-  // 进程已经没了（runningChats 无）但 meta 状态停在 awaiting_user/running
-  //   = agent 异常退出 / 服务重启、状态没收尾 → 真僵尸、当场标 error、引导用户再发一条重启
-  if (
-    !pending &&
-    (task.runStatus === "awaiting_user" || task.runStatus === "running")
-  ) {
-    console.warn(
-      `[chat-reply] task=${task.id} 僵尸态 runStatus=${task.runStatus}（进程已不在）、当场标 error`,
-    );
-    const errorTask = await setTaskRunStatus(task.id, "error");
-    if (errorTask)
-      publishTaskStreamEvent(task.id, { kind: "task", task: errorTask });
-    return errorResponse(
-      "Chat agent 已断开（进程重启或异常退出）、再发一条消息即可重启新一轮对话",
-      410,
-    );
-  }
-
-  // 校验 bootArgs（声明已提到模式判断前）
+  // 模式 2：起新会话（首条 / 会话已关 / 懒重启后）
+  // 校验 bootArgs
   if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
-    return errorResponse("缺 bootArgs.apiKey、终态发消息触发自动启动必传");
+    return errorResponse("缺 bootArgs.apiKey、起新会话必传");
   }
   if (!isValidModel(bootArgs.model)) {
     return errorResponse("bootArgs.model 非法");
   }
 
-  // 防重复启动：agent 还在跑（理论不该走到这、防御性）
+  // 防重复启动：会话还在（send 失败但 run 在跑等 race）→ 409
   if (isChatRunning(task.id)) {
     return errorResponse("Chat agent 已经在跑、不需要重启", 409);
   }
+
+  // V0.10.1：更新就位未重启 → 起新 Run 必挂死、拦在标 running 之前
+  const pendingRestartMsg = await checkUpdatePendingRestart();
+  if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
 
   // 切 task.runStatus=running、fire-and-forget runChatSession
   const runningTask = await setTaskRunStatus(task.id, "running");

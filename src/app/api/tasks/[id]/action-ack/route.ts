@@ -16,35 +16,25 @@
  * }
  * ```
  *
- * # 行为
+ * # 行为（V0.11：wait 协议退役、send 送达）
  *
- * - approve：调 acknowledgeAction(approve)、agent 拿 [ACTION_ACK approve]
- *   → action.status 转 completed
- *   → agent 立刻调 wait_for_user(待命态) 等下一 action
- * - revise：先 snapshotActionArtifact 旧版本、再 acknowledgeAction(revise, feedback)
- *   action.status 保持 running、agent 接着改
+ * - approve：acknowledgeAction(approve) 纯服务端落状态（action → completed）、agent 不需要收信号
+ * - revise：先 snapshotActionArtifact 旧版本、再 `agent.send([ACTION_ACK revise] + feedback)`
+ *   续同一会话让 agent 处理；没有可续接的会话 → 409（用户点重启 / 推进）
  *
  * # 错误语义
  *
  * - task 不存在 → 404
- * - action 不存在 / 已 completed / cancelled → 409
- * - agent 不在等 ack（has no pending）→ 409 / 410
+ * - action 不存在 / 已 completed / cancelled / 会话不在 → 409
  */
 
-import { hasPending } from "@/lib/server/chat-pending";
-import {
-  appendEvent,
-  getTask,
-  setTaskRunStatus,
-} from "@/lib/server/task-fs";
+import { appendEvent, getTask } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { acknowledgeAction } from "@/lib/server/task-runner";
 import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
-  KEEPALIVE_RACE_RETRY_MS,
   parseAndValidateImages,
-  sleep,
 } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -56,6 +46,13 @@ interface PostBody {
   decision?: "approve" | "revise";
   feedback?: string;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
+  // V0.11.1：会话恢复凭据（服务重启 / 空闲回收后 revise 靠它 Agent.resume 接回会话）
+  bootArgs?: {
+    apiKey?: string;
+    model?: { id?: string; params?: Array<{ id: string; value: string }> };
+    gitHost?: string;
+    gitToken?: string;
+  };
 }
 
 const MAX_IMAGES_PER_REVISE = 6;
@@ -100,34 +97,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // hasPending 检测（V0.3.5 race 兜底、200ms 内 retry 一次）
-  let pending = hasPending(task.id);
-  if (!pending) {
-    await sleep(KEEPALIVE_RACE_RETRY_MS);
-    pending = hasPending(task.id);
-  }
-  if (!pending) {
-    if (task.runStatus === "awaiting_user" || task.runStatus === "running") {
-      console.warn(
-        `[action-ack] task=${task.id} 僵尸态 runStatus=${task.runStatus}、当场标 error`,
-      );
-      const errorEvent = await appendEvent(task.id, {
-        kind: "error",
-        actionId,
-        text: "Agent 已断开（进程重启或异常退出）、本次 ack 没送到。请点「推进」起新 agent。",
-      });
-      if (errorEvent) {
-        publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
-      }
-      const updated = await setTaskRunStatus(task.id, "error");
-      if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
-      return errorResponse("agent 已断开、请点「推进」起新 agent", 410);
-    }
-    return errorResponse(
-      `agent 当前没在等 ack（task.runStatus=${task.runStatus}）`,
-      409,
-    );
-  }
+  // V0.11：不再依赖「agent 挂起等待」——approve 纯服务端落状态、revise 由
+  // acknowledgeAction 内部校验会话存活（没会话 → 抛错 → 409 提示重启 / 推进）
 
   // revise 带图：先落盘
   // - imageAbsPaths：给 agent（绝对路径）
@@ -171,7 +142,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   try {
-    await acknowledgeAction(task.id, actionId, decision, feedback, imageAbsPaths);
+    await acknowledgeAction(task.id, actionId, decision, feedback, imageAbsPaths, {
+      apiKey: body.bootArgs?.apiKey?.trim() || undefined,
+      model:
+        body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+          ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+          : undefined,
+      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
+      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(message, 409);

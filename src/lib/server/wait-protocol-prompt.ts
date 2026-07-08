@@ -1,143 +1,53 @@
 /**
- * 等待协议 prompt 片段（chat + task 单一源、V0.7.20 方案 B）
+ * 回合协议 prompt 片段（V0.11：wait 协议退役、chat + task 单一源）
  *
- * # 为什么有这个文件
+ * # 背景
  *
- * 「写完东西 → 调 wait_for_user → shell curl 挂着等下一条」这套等待协议、原来在三处各写
- * 一长段、互相漂移、且每个 AI 来改都往上堆「🚨 绝对禁止 / 钢铁纪律」、越改越长越乱（典型
- * over-prompting）：
- *   1. chat-runner.ts buildInitialPrompt（chat 起手讲一遍）
- *   2. prompts/_super.md（task 起手又讲一遍）
- *   3. chat-mcp.ts buildShellWaitGuidance（每轮 wait 返回再讲一遍操作、chat / task 共一个函数）
- * 收口到这里：把**真正和「信号是什么 / 怎么传参 / 起手做什么」无关的纯机制纪律**抽成共用
- * 片段、chat 与 task 四处统一引用、改一处全生效。
+ * V0.3.5~V0.10 的「写完东西 → 调 wait_for_user → shell curl 挂着等下一条」保活协议已退役
+ * （Cursor 去掉按次计费 + worktree 隔离后现场可断可续、用户拍板改回「create + 多轮 send」）。
+ * 本文件从「等待纪律」改为「回合纪律」：agent 说完 / 交卷完 / 提问完就**正常结束回复**、
+ * 用户的下一步操作会以新消息（agent.send）送达、同一会话继续。
  *
- * # 哪些抽得动、哪些抽不动（边界、改前必读）
+ * # 设计原则（依据 Anthropic prompting best practices、沿用 2026-06-14 立的规矩）
  *
- * - **抽得动（waitDisciplineSection / shellCurlRunSection）**：等待期间的行为纪律 + 两个易翻点
- *   （答完必 wait / anti-loop 误报）+ 内部机制别泄露 + curl 怎么跑。chat / task 一字一样。
- * - **抽不动（各自保留）**：
- *   - 信号解读表——chat 只有 USER_REPLY / CANCELLED；task 有 ACTION_ACK / NEXT_ACTION /
- *     TASK_DONE 等一大套。且 `tests/protocol-signals.test.ts` 强制 `_super.md` **源文件**里
- *     出现全部信号字面量、所以 task 信号表只能留在 _super.md、不能抽走。
- *   - 起手姿势 / wait_for_user 传参 / artifact / revise 二分类等 task 业务。
- *
- * # 设计原则（依据 Anthropic prompting best practices、2026-06-14 立）
- *
- * - **dial back aggressive language**：不堆「🚨 第一铁律 / 绝对禁止 / 致命错误」——官方实测
- *   这类 over-prompting 会让模型 overtrigger / 抓不住重点。改成「点明陷阱 + 解释 why」。
- * - **正面回应真实系统警告**：Cursor 的 anti-loop「flagged as looping」是会真实注入给模型的
- *   系统消息、不是模型自己的念头。必须说清「这是误报、为什么、怎么办」、而不是只让它
- *   「忽略你自己的循环念头」（旧 prompt 的盲区——这次 composer-2.5 就是没被这套话术接住）。
- * - **消解 turn 矛盾**：composer-2.5 实测反复纠结「不调工具 turn 就结束」——讲清
- *   「后台 curl 还在跑 = turn 没结束 = 合法等待」、这个误解才是它最终卡死的根。
+ * - dial back aggressive language：不堆「🚨 绝对禁止」、点明陷阱 + 解释 why
+ * - 单一源：chat 起手（chatTurnProtocolSection）、task super prompt（{{waitDiscipline}} 占位、
+ *   注入 turnDisciplineSection）各引一份、不再三处漂移
  */
 
 /**
- * 等待期间的「纯行为纪律」段——chat + task 字符级共用单一源。
+ * task 模式的「回合纪律」段（_super.md {{waitDiscipline}} 占位注入）。
  *
- * 只讲 agent 在「shell curl 挂着等」期间该守的纪律 + 两个易翻点（答完必 wait / anti-loop 误报）
- * + 内部机制别泄露。chat 起手（chatWaitProtocolSection）、_super.md（{{waitDiscipline}}）、
- * chat-mcp 两个等待引导分支都引用同一份。
+ * 讲清三件事：交卷 / 提问都是「调完工具就结束回复」；用户操作以新消息续达；
+ * 别执行任何等待命令（旧协议肌肉记忆 / 网上教程的轮询套路都不要）。
  */
-export const waitDisciplineSection = (): string =>
+export const turnDisciplineSection = (): string =>
   [
-    "### 等待期间的纪律",
+    "### 回合纪律（怎么把控制权交回用户）",
     "",
-    "shell curl 挂着等用户、可能 0 秒也可能几小时——**任何长度都正常**。期间 stdout 每 60 秒刷一行 `[KEEPALIVE ts=...]`（心跳、忽略）。没看到「结果行」（chat 的 `[USER_REPLY]`、task 的 `[ACTION_ACK]` / `[NEXT_ACTION]`、或 `[CANCELLED]` 等）之前、唯一该做的就是**安静等**——别 read terminal、别重调 shell / wait_for_user、别 emit「我在等」、别 summarize 退出（每一个都会真把等待打断）。",
+    "你和用户之间是**多轮消息**：每一轮你干完该干的、调完该调的工具、就**正常结束本轮回复**（结束 turn）。用户的决定（通过 / 再聊聊 / 推进下一步 / 回答提问）会作为**新消息**发给你、你在同一会话里继续、上下文不丢。",
     "",
-    "两个易翻的点：",
-    "- **回复完的下一步永远是 `wait_for_user` 挂等**、不管这轮答得多完整 / 有没有反问用户——只有用户触发的收尾信号才结束 run（最常翻：用户问「为啥挂等」、你解释一段却忘了挂）。",
-    "- Cursor 若提示「重复调用 / flagged as looping / 检测到循环」是**误报**（long-poll 的 curl 被转后台、留了两条相同记录所致）、忽略、继续等、别因此 read terminal / 重调 shell / 总结退出。",
-    "",
-    "`wait_for_user` / `shell` / `curl` 是内部机制、用户看不到——**别在正文里提（不说「我在等你」「正在监听」之类）、也别把「我接下来去挂等 / 我先接个话」这类流程念出来**、直接给用户该看的内容就行。",
-  ].join("\n");
-
-/**
- * 每轮 wait 引导里的「shell + curl 怎么跑」段——chat + task 字符级共用（含本次 url）。
- *
- * chat-mcp buildShellWaitGuidance 的 chat / task 两个分支都用。只讲「跑哪条 curl + 别画蛇添足」、
- * 不重复 waitDisciplineSection 的纪律（dial back：每轮注入的文本最该短）。
- */
-export const shellCurlRunSection = (url: string): string =>
-  [
-    "调 `shell` 跑这条 curl、并给它一个**很长的前台阻塞时长**让它前台挂住实时等用户（正常前台调用、**别**自己加 `&` / `nohup` / `disown`、**别**主动标 background）：",
-    "",
-    "```",
-    `curl -sN "${url}"`,
-    "```",
-    "",
-    "- 调 shell 时**除 `command` 外、把「前台阻塞时长」参数设成 `86400000`（24 小时、毫秒）**——这参数你的 shell 工具里可能叫 `timeout`、也可能叫 `block_until_ms`（用你 schema 里实际有的那个、值都填 86400000）。它指「转后台前在前台最多等多久」、**不是**给 curl 的超时。设大它、curl 才会前台挂住等用户、不会几秒就被转后台。",
-    "- `-s` 静默、`-N` 不缓冲（KEEPALIVE / 终态行实时可见）；本地回环长链接、不会断、**别**给 curl 加 `--max-time`、**别**套 while 重连。",
-    "- 用户回复时、`[USER_REPLY]` + 正文直接出现在**这次 shell 的 stdout 里**、直接读即可。万一它仍被转入后台、stdout 只剩 `[USER_REPLY]` 标记没正文、这时才去 read 那个 terminal 文件取正文。",
+    "- 完成一个 action（写完 artifact）→ 调 `wait_for_user` 交卷 → **结束回复**",
+    "- 有不确定项 → 调 `ask_user` 推弹窗 → **结束回复**（答案以 `[ASK_USER_REPLY]` 开头的新消息送达）",
+    "- **不要执行任何等待 / 轮询命令**——curl 长轮询、sleep 循环、watch 都不要；调完工具直接结束回复就是正确姿势",
+    "- 结束回复前不用输出总结（用户在看板看 timeline 就够）；交卷 / 提问是内部机制、别在正文里提",
   ].join("\n");
 
 /**
  * chat 起手 prompt 里的「怎么和用户对话」段（chat-runner buildInitialPrompt 用）。
  *
- * 把 chat 专属的循环 / 信号 / 收尾 / ask_user 禁用讲清楚**一次**、纪律部分内联共用片段、
- * 后续每轮 chatShellWaitGuideBody 只给精简提醒、不再重复整套。
+ * V0.11：chat 就是正常多轮对话——把回复正文直接输出（实时流式显示）、说完自然结束回复、
+ * 用户下一条消息会续接同一会话。没有任何等待工具 / 协议要遵守。
  */
-export const chatWaitProtocolSection = (taskId: string): string =>
+export const chatTurnProtocolSection = (): string =>
   [
-    "## 怎么和用户对话（核心机制）",
+    "## 怎么和用户对话",
     "",
-    "你是**长期在线**的对话 agent。每一轮：**（要查先查清楚）→ 把回复正文直接写出来（正常输出、会一字一字实时显示给用户）→ 调 `wait_for_user` 挂等下一条 → 再下一轮**、无限循环。守住这个循环是你唯一要做的事。",
+    "这是**正常的多轮对话**：用户发消息 → 你回答（正文直接输出、会一字一字实时显示给用户）→ **说完自然结束本轮回复** → 用户的下一条消息会续接同一会话、上下文不丢。",
     "",
     "几个关键：",
-    "- **回复正文直接输出**——就是你正常说话、会实时流式显示给用户。要查的先查清楚、要写的真写出来（让你写一整篇作文、就把整篇直接输出）。别只说「我先查…我先写…」就去挂等 = 没交付、用户看到的是一句空话。",
-    `- 正文输出完、调 \`wait_for_user(task_id="${taskId}", message="这一轮回复的一句话概括")\`：\`message\` 只填**这轮回复的一句话概括**（给历史记录 / 标题用、别重复整段正文）。调用它 = 立即返回带 curl 的引导、调 \`shell\` 跑那条 curl 挂着等下一条（这步用户看不到、别预告别解释）。`,
-    "- curl 输出 `[USER_REPLY] <文本>` = 用户回了 → 回到第一步（再查 / 再答 / 再挂等）；`[CANCELLED]` = 收尾退出。",
-    "",
-    waitDisciplineSection(),
-    "",
-    "想跟用户确认什么、**直接在正文里问**（别调 `ask_user`、那是 task 模式的、chat 里禁用）。",
+    "- **回复正文直接输出**——要查的先查清楚、要写的真写出来（让你写一整篇作文、就把整篇直接输出）。别只说「我先查…我先写…」就结束回复 = 没交付、用户看到的是一句空话。",
+    "- **说完就正常结束回复**——不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要调 `wait_for_user`（本模式用不到它）。",
+    "- 想跟用户确认什么、**直接在正文里问**（markdown 列 A/B/C 选项也行、别调 `ask_user`、那是 task 模式的弹窗工具）。",
+    "- 内部机制（工具名 / 协议）别在正文里提、直接给用户该看的内容。",
   ].join("\n");
-
-/**
- * 每轮 wait_for_user 返回的 shell 引导正文（chat 版、chat-mcp buildShellWaitGuidance 的 chat 分支用）。
- *
- * 起手 prompt 已用 chatWaitProtocolSection 讲全纪律、这里只给「补全答案 + 跑 curl + 信号速查」、
- * 纪律不再整套重复（dial back）、只留一句 anti-loop 误报兜底。
- */
-export const chatShellWaitGuideBody = (url: string): string =>
-  [
-    // M/C' 实测（text-delta + 概括）：本轮回复正文走「直接输出」（text-delta 真流式、用户实时看到）、
-    // wait_for_user 的 message 只填一句话概括。这里只讲 curl 怎么跑 + 下一轮怎么继续。
-    shellCurlRunSection(url),
-    "",
-    "stdout：",
-    "- `[KEEPALIVE ts=...]` 每 60 秒一行 = 心跳、忽略。",
-    "- `[USER_REPLY] <文本>` = 新一轮消息 → 先处理它（要查先查、要写就真写出来）→ **把回复正文直接输出、再调 `wait_for_user`（message 填一句话概括）重新挂等**。哪怕用户只说「好的 / 谢谢」、或你想反问用户、也把那句话直接输出再挂等、回答完绝不结束 run。",
-    "- `[CANCELLED]` = 收尾结束 run。",
-    "- 若提示「重复调用 / 循环」= 误报、忽略继续等。",
-  ].join("\n");
-
-/**
- * 「回复正文直接输出 + wait_for_user.message 填概括」单一源提醒（recency 钉子）。
- *
- * M/C' 实测（text-delta + 概括）：chat 回复正文走「直接输出」（text-delta 真流式、用户实时看到）、
- * wait_for_user 的 `message` 只填一句话概括（见 chatWaitProtocolSection）。
- * 钉子钉两个最易翻的点：
- *   - 治「只说『我这就写 / 我先查』就挂等、没真把正文输出」——实测 composer-2.5 把计划复述当交付
- *   - 治漏调 wait_for_user（漏调 = run 结束 = 破坏单 run）——正文输出完必须调它挂等下一条
- * 钉在「离用户消息最近、agent 下一步就是回复」的位置——模型不缺理解、缺眼前的执行提醒。
- *
- * 分首轮 / 续接两个变体（对症「首轮冷启动最易翻」——线上 opus 首轮漏挂等 run finished、
- * composer-2.5 首轮把「我先写」宣告当交付）：
- *   - replyThenWaitReminder（续接版、单句精简）：chat-mcp CHAT_REPLY_REMINDER 钉每轮用户回复尾部。
- *     续接轮 agent 刚从 wait_for_user 返回、惯性还在、单句够。
- *   - firstTurnReplyThenWaitReminder（首轮版、点明 why）：chat-runner buildOpeningStanceSection
- *     末尾用（冷启动 / 切模型懒重启首轮）。首轮 agent 无惯性、且钉子被前面 rules/skills 稀释、
- *     强调「正文要真输出成品、不是计划复述」。
- * 注意：dial back、不堆 🚨（见文件顶部设计原则）——首轮版也只是「点明 why」、不是加强威胁。
- */
-export const replyThenWaitReminder = (): string =>
-  "回复用户时，把要说的完整内容**直接写出来**（会实时显示给用户）、再调 `wait_for_user`（message 填一句话概括）挂等下一条。";
-
-/**
- * 首轮专用强版钉子（见 replyThenWaitReminder 注释里的变体说明）。
- * 点明 message 的角色（用户唯一看得到的通道）+ 要成品不要计划复述。
- */
-export const firstTurnReplyThenWaitReminder = (): string =>
-  "这是你启动后的第一轮：把给用户的**完整答案直接写出来**（正常输出、会一字一字实时显示）、然后调 `wait_for_user`（message 填一句话概括）交付并挂等。别只说「我这就写」就挂等——那样用户看到的是一句空话。要的是成品本身（让你写作文就把整篇直接输出）。";

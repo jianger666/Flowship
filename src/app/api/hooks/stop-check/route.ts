@@ -13,7 +13,9 @@
  * 认领（fail-safe）：agent_id 不在 runningTasks（IDE agent / 已死 task）→ 返 {} 放行、绝不误伤非 fe agent。
  */
 import { findTaskIdByAgentId } from "@/lib/server/task-runner";
+import { getPendingAsk } from "@/lib/server/chat-pending";
 import { getTask } from "@/lib/server/task-fs";
+import { runningChecks } from "@/lib/server/task-stream";
 
 export const runtime = "nodejs";
 
@@ -59,16 +61,29 @@ export const POST = async (req: Request): Promise<Response> => {
   const last = task.actions[task.actions.length - 1];
   if (!last) return passthrough();
 
-  // running = agent 干完想退但没调 wait_for_user（= 没交卷）→ follow-up 同会话拉回补调
+  // running = agent 干完想退但没交卷 → follow-up 同会话拉回补调。
+  // V0.11 两个豁免（run 自然结束是正常出口）：
+  //   - 刚交卷、后置 check 还在后台跑（action 状态尚未翻 awaiting_ack）→ 放行
+  //   - ask_user 提问在等用户答（结束回复等答案就是正确姿势）→ 放行
   if (last.status === "running") {
+    const checkInFlight = runningChecks.get(taskId)?.actionId === last.id;
+    const askPending = !!getPendingAsk(taskId);
+    if (checkInFlight || askPending) {
+      console.log(
+        `[stop-check] task=${taskId} action#${last.n}(${last.type}) ${
+          checkInFlight ? "已交卷（check 在跑）" : "ask 等答案"
+        } → 放行`,
+      );
+      return passthrough();
+    }
     console.log(
       `[stop-check] task=${taskId} action#${last.n}(${last.type}) 未交卷 → followup 拉回`,
     );
     const followup = [
-      "[ai-flow] 检测到你还没对当前 action 交卷、不要结束本次运行。",
+      "[ai-flow] 检测到你还没对当前 action 交卷、不要结束本次回复。",
       `当前 action：id=${last.id}、type=${last.type}、n=${last.n}。`,
       last.artifactPath ? `artifact 路径：${last.artifactPath}。` : "",
-      "请先调用 wait_for_user 工具（传 task_id / action_id / artifact_path）把控制权交回用户、收到 ACTION_ACK 后再继续。",
+      "请先调用 wait_for_user 工具（传 task_id / action_id / artifact_path）交卷、然后再结束回复。",
     ]
       .filter(Boolean)
       .join("\n");

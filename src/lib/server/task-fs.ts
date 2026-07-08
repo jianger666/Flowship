@@ -57,7 +57,13 @@ import type {
   TaskSummary,
 } from "@/lib/types";
 import { mrTargetBranchOf } from "@/lib/task-display";
-import { getEffectiveCwd } from "@/lib/path-utils";
+import {
+  cleanupOrphanTaskWorktrees,
+  getTaskCwd,
+  isWorktreeTask,
+  removeTaskWorktrees,
+} from "./task-worktrees";
+import { killStalePreview } from "./preview-manager";
 import {
   DATA_DIR,
   META_FILE,
@@ -109,22 +115,34 @@ const runBootRecovery = async (): Promise<void> => {
   }
 
   let recovered = 0;
+  // V0.10：顺路收集「存活 task」id（meta 读得到、且未终结）——扫完清孤儿 worktree 用。
+  // meta 破损的保守当存活（读不出 repoStatus、宁可留着不误删）。
+  const liveTaskIds = new Set<string>();
   for (const id of ids) {
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
     } catch (err) {
       console.warn(`[task-fs] boot recovery: 读 meta 失败 id=${id}`, err);
+      liveTaskIds.add(id);
       continue;
     }
     if (!raw) continue;
     if (!isValidMetaShape(raw)) {
       // V0.5 残留 / schema 破损 → 不参与 recovery
+      liveTaskIds.add(id);
       continue;
     }
 
     const meta = raw;
-    if (meta.runStatus !== "running" && meta.runStatus !== "awaiting_user") {
+    if (meta.repoStatus !== "merged" && meta.repoStatus !== "abandoned") {
+      liveTaskIds.add(id);
+    }
+    // V0.11.1：awaiting_user 不再标 error——这是新模型的正常静息态（agent 答完 / 交卷完
+    // run 已自然结束、没有「断掉的连接」可言）。会话内存虽丢、但 sessionAgentId 落盘了、
+    // 用户下一步操作（再聊聊 / 答弹窗 / 发消息 / 续用推进）会 Agent.resume 无缝接回。
+    // 只有 running（run 真在跑时进程死了）才是僵尸、标 error。
+    if (meta.runStatus !== "running") {
       continue;
     }
 
@@ -134,7 +152,7 @@ const runBootRecovery = async (): Promise<void> => {
       ts: Date.now(),
       kind: "error",
       // task / chat 共用：chat 没有「推进」按钮、用通用措辞（任务点推进 / 对话发消息都算「重新发起」）
-      text: "[boot-recovery] Web 进程已重启、agent 上下文已丢失。重新发起即可恢复。",
+      text: "[boot-recovery] Web 进程重启时本任务的 agent 正在运行、这一轮已中断。重新发起即可恢复。",
     };
     try {
       await appendEventLine(id, event);
@@ -169,6 +187,12 @@ const runBootRecovery = async (): Promise<void> => {
       `[task-fs] boot recovery: 标记 ${recovered} 个僵尸 task 的 runStatus 为 error`,
     );
   }
+
+  // V0.10：清孤儿 worktree（task 被删 / 终结但清理没跑成的残留）、best-effort 不抛
+  await cleanupOrphanTaskWorktrees(liveTaskIds);
+
+  // V0.10.1：杀上一次进程遗留的预览 dev server（内存 slot 已丢、进程还占端口）、pidfile 兜底
+  await killStalePreview().catch(() => {});
 };
 
 const ensureBootRecovery = async (): Promise<void> => {
@@ -312,6 +336,10 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
       input.disabledMcpServers && input.disabledMcpServers.length > 0
         ? input.disabledMcpServers
         : undefined,
+    // V0.10：task 模式默认隔离工作区、显式传 false（新建弹窗逃生口）才直跑原仓库；
+    // chat 模式恒不隔离（不建分支、直接用所选目录）
+    isolateWorktree:
+      input.mode === "chat" ? undefined : input.isolateWorktree !== false,
     model: input.model,
     pinned: false,
     createdAt: now,
@@ -324,7 +352,16 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
 export const deleteTask = async (id: string): Promise<boolean> => {
   const dir = taskDir(id);
   if (!(await exists(dir))) return false;
-  await fs.rm(dir, { recursive: true, force: true });
+  // V0.10：先清隔离工作区（要读 meta 拿 repoPaths、必须在删 task 目录前）；
+  // 失败不挡删除、boot 孤儿扫描兜底
+  try {
+    const meta = await readMetaV06(id).catch(() => null);
+    if (meta && isWorktreeTask(meta)) await removeTaskWorktrees(meta);
+  } catch (err) {
+    console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
+  }
+  // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
+  await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   return true;
 };
 
@@ -489,6 +526,22 @@ export const setTaskRemoveSourceBranchOnMerge = async (
     await writeMeta(meta);
     return await hydrateTask(meta);
   });
+
+/**
+ * V0.11.1：落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
+ * 不动 updatedAt（纯运行时锚点、与任务活跃度无关）。best-effort：调用方一般 void 掉。
+ */
+export const setTaskSessionAgentId = async (
+  id: string,
+  agentId: string | undefined,
+): Promise<void> => {
+  await withTaskLock(id, async () => {
+    const meta = await readMetaV06(id);
+    if (!meta) return;
+    meta.sessionAgentId = agentId;
+    await writeMeta(meta);
+  });
+};
 
 // V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。不动 updatedAt（置顶与活跃度无关）。
 export const setTaskPinned = async (
@@ -735,7 +788,8 @@ export const appendAction = async (
       endedAt: null,
       // V0.6.28：快照创建时的 effective cwd——task 中途追加仓库后 cwd 会变、
       // artifact 链接渲染必须按写入时基准解析（详见 types.ts ActionRecord.cwd）
-      cwd: getEffectiveCwd(meta.repoPaths),
+      // V0.10：隔离 task 快照的是 worktree cwd（artifact 相对路径基准就是 worktree）
+      cwd: getTaskCwd(meta),
       agentModel: input.agentModel,
       // V0.6.23：仅 build 带值（其它 action 为 undefined、JSON.stringify 自动忽略）
       requestedBatchIds:
@@ -885,14 +939,13 @@ export const setTaskRunStatus = async (
   });
 
 /**
- * 待命态专用：仅当「当前没有正在跑的 action」时、才把 runStatus 切 awaiting_user（+ 清 currentActionId）。
+ * 条件切等待：仅当「当前没有正在跑的 action」时、才把 runStatus 切 awaiting_user（+ 清 currentActionId）。
  *
- * 防 force-new「秒推下一 action」race（僵尸组合、awaitingNotifier 待命分支踩过）：
- *   approve action_N 后用户秒推 action_N+1 → advanceTask 已 appendAction 把 runStatus 设 running + 新
- *   action 在跑；但被取消的旧 agent 那条「approve 后进待命态」的迟到 wait_for_user(空 action_id) 通知若
- *   晚到、用裸 setTaskRunStatus 会把 running 错覆盖回 awaiting_user（还顺手清了 currentActionId）→ 新
- *   action 明明在跑、UI 却显示「等待回复」、推进 / 终结 / 再聊聊按钮误亮（点了会和正在跑的 action 打架）。
- *   续接路径靠 pendingNextActions 兑现 + chat-mcp `!entry.resolved` 守卫挡住、但 force-new 不入队、漏了。
+ * 防「秒推下一 action」race（僵尸组合、旧 wait 协议时代踩过、V0.11 沿用防御）：
+ *   用户推进新 action → runStatus 已设 running、新 action 在跑；此时旧 agent 迟到的
+ *   awaiting 通知（不带 action_id 的 wait_for_user 调用）若用裸 setTaskRunStatus、会把
+ *   running 错覆盖回 awaiting_user（还顺手清了 currentActionId）→ 新 action 明明在跑、
+ *   UI 却显示「等待回复」、推进 / 终结 / 再聊聊按钮误亮（点了会和正在跑的 action 打架）。
  * 治法：read-compare-set 整段在 withTaskLock 内原子完成——读到「当前 action 已 running」就直接跳过、
  *   保住 running（杜绝「裸读 fresh + 再 set」之间的 TOCTOU race）。
  *

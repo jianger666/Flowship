@@ -17,11 +17,11 @@
  * }
  * ```
  *
- * # 行为
+ * # 行为（V0.11：wait 协议退役、send 送达）
  *
- * 1. 校验 task / askId / 没被答过 / pending 状态
+ * 1. 校验 task / askId / 没被答过 / pendingAsk 仍是这组问题（token 防旧弹窗答案串新提问）
  * 2. 逐题落盘各自的图、拼接 [ASK_USER_REPLY] 文本（每题答案下内联「本题附图：<basename>」做归属）
- * 3. submitAskReply 解 agent 的 ask_user、把全部图绝对路径汇总透传（文末自动拼 [ATTACHED_IMAGES]）
+ * 3. `agent.send([ASK_USER_REPLY]…)` 续同一会话送达答案（deliverAskReply）
  * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred + images 扁平数组给前端渲缩略图）+ publish SSE
  * 5. 切 runStatus = running
  */
@@ -39,13 +39,12 @@ import type {
   ImageAttachmentInput,
   ImageAttachmentSaved,
 } from "@/lib/server/task-artifacts";
-import { hasPending, hasPendingToken, submitAskReply } from "@/lib/server/chat-pending";
-import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
+import { deliverAskReply } from "@/lib/server/task-runner";
+import { agentSessions, publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
-  KEEPALIVE_RACE_RETRY_MS,
   parseAndValidateImages,
-  sleep,
 } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -69,6 +68,13 @@ interface PostBody {
   answers?: AnswerPayload[];
   deferred?: boolean;
   imagesByQuestion?: Record<string, RawImagePayload[]>;
+  // V0.11.1：会话恢复凭据（服务重启 / 空闲回收后答案靠它 Agent.resume 接回会话送达）
+  bootArgs?: {
+    apiKey?: string;
+    model?: { id?: string; params?: Array<{ id: string; value: string }> };
+    gitHost?: string;
+    gitToken?: string;
+  };
 }
 
 // 单题最多附 6 张图；全部题加起来最多 12 张（防一次答超多题各塞满图把 agent context 撑爆）
@@ -228,13 +234,17 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse(`askId=${askId} 的 questions 元信息丢失、无法处理`, 500);
   }
 
-  // 本组 ask 的 token（runner 写 ask_user_request 时落进 meta）。用它把「agent 是否还在等」
-  // 收窄到「还在等这组 ask」——防旧弹窗答案串进被顶替的新 pending（force-new-agent / 顶替 race）。
-  // 极旧数据可能没 token：退回 task 级判定（与旧行为一致、不写兼容分支）。
+  // 本组 ask 的 token（runner 写 ask_user_request 时落进 meta）。用它把「是否还在等」
+  // 收窄到「还在等这组 ask」——防旧弹窗答案串进被顶替的新提问（force-new-agent / 顶替 race）。
   const expectedToken =
     typeof reqEvent.meta?.token === "string" ? reqEvent.meta.token : undefined;
-  const checkPending = (): boolean =>
-    expectedToken ? hasPendingToken(task.id, expectedToken) : hasPending(task.id);
+  const checkPending = (): boolean => {
+    const pendingAsk = getPendingAsk(task.id);
+    if (!pendingAsk) return false;
+    if (pendingAsk.askId !== askId) return false;
+    if (expectedToken && pendingAsk.token !== expectedToken) return false;
+    return true;
+  };
 
   const questionIds = new Set(questions.map((q) => q.id));
 
@@ -267,20 +277,20 @@ export const POST = async (req: Request, { params }: Ctx) => {
     validatedByQuestion[qid] = result.images;
   }
 
-  let pending = checkPending();
-  if (!pending) {
-    await sleep(KEEPALIVE_RACE_RETRY_MS);
-    pending = checkPending();
-  }
+  const pending = checkPending();
 
   if (!pending) {
-    // 判定用最新状态：retry sleep 期间 runStatus 可能已变（agent 继续跑 / 停下等新问题）
     const fresh = (await getTask(id)) ?? task;
 
-    // 这组 ask 已被顶替（task 还有别的活 pending）或 agent 还在跑——**不是僵尸、不能误杀任务**
+    // 这组 ask 已被顶替（task 有别的新提问在等）/ agent 还在跑 / **会话还活着**（V0.11：
+    // 交卷后 run 自然结束、agent 空闲等用户是健康态）——都**不是僵尸、不能误杀任务**
     // （同事踩坑：答旧弹窗把还在跑的任务打成 error +「Agent 已断开」+ 关流）。
     // 只补一条作废标记把这条旧弹窗关掉、409 温和提示。
-    if (hasPending(task.id) || fresh.runStatus === "running") {
+    if (
+      getPendingAsk(task.id) ||
+      fresh.runStatus === "running" ||
+      agentSessions.has(task.id)
+    ) {
       console.log(
         `[ask-reply] task=${task.id} askId=${askId} 提问已失效（被顶替 / agent 在跑、runStatus=${fresh.runStatus}）、作废旧弹窗`,
       );
@@ -347,17 +357,30 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const replyText = buildReplyText(questions, answers, deferred, savedByQuestion);
 
-  // 先 resolve 阻塞中的 agent（带 token 校验）——成功了才写「已答」事件 + publish。
-  // 顺序很关键：旧版先写事件再 submit、submit 失败（pending 被顶替 / keepalive 切换）时
-  // 用户已经在事件流看到「已答」、agent 却没收到 → 假已答。现在 submit 成功才落「已答」、
-  // 失败直接 409、不写事件（此时图已落盘成孤儿、暂无清理 helper、概率低可接受）。
-  const ok = submitAskReply(task.id, replyText, allAbsPaths, expectedToken);
+  // V0.11：`agent.send` 送达答案——成功了才写「已答」事件 + publish（顺序关键：先送再落
+  // 事件、失败不写、防「用户看到已答、agent 没收到」的假已答）。send 成功即清 pendingAsk。
+  const ok = await deliverAskReply(
+    task,
+    replyText,
+    allAbsPaths.length > 0 ? allAbsPaths : undefined,
+    reqEvent.actionId,
+    {
+      apiKey: body.bootArgs?.apiKey?.trim() || undefined,
+      model:
+        body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+          ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+          : undefined,
+      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
+      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+    },
+  );
   if (!ok) {
     return errorResponse(
-      "agent 已不在等问答（可能并发处理 / keepalive 切换 / 等待已被顶替）、稍后重试",
+      "没有可续接的 agent 会话（会话已失效 / 正在跑）——点「重启当前阶段」把问题断点续传给新 agent",
       409,
     );
   }
+  clearPendingAsk(task.id);
 
   const actionId = reqEvent.actionId;
   const replyEvent = await appendEvent(task.id, {

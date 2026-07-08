@@ -48,13 +48,13 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 
 ## 关键属性
 
-- **单 SDK Run 永生**：整 task 跑在一个 SDK Run、不一个 action 一个 Run、计费一次。action 间用 `wait_for_user` MCP 阻塞等用户 ack；终结 task 才退出 Run（实测比每 action 起新 Run 省大量扣费）
+- **会话跨 run 存活（V0.11）**：agent 交卷（`wait_for_user`、非阻塞）/ 提问（`ask_user`）后自然结束回合；用户的每一步操作（推进续用 / 再聊聊 / 答弹窗 / chat 消息）由服务端 `agent.send()` 以新消息续接同一会话、上下文不丢
 - **HITL 是底线**：每个 action 边界都要用户 ack（**通过** / **再聊聊**）、不会偷偷往下走
 - **双状态**：`repoStatus`（developing / awaiting_test / has_bug / merged / abandoned）+ `runStatus`（idle / running / awaiting_user / error）分两个 badge 显示
 - **6 个 Harness 门槛**：action 前置准入 / 后置确定性检查 / 默认值推断 / anti-patterns prompt / cross-action 一致性自检（V0.6.4+）/ placeholder 动态
 - **「再聊聊」（revise）**：对 artifact 有意见 / 疑问 → agent 先复述意图再决定（想改就改 artifact、想问就只答疑、严禁偷偷动 artifact）
-- **新启 Agent（forceNewAgent）**：推进 dialog 高级选项、默认 false；勾上 cancel 旧 Run + 起新 Agent（换模型 / reviewer ≠ author 场景、耗 +1 send 配额）
-- **shell + curl long-poll 保活**：agent 拿到 `wait_for_user` 返回的 shell 引导后调 `shell` 工具 curl 跟服务端长连接、根治旧版 anti-loop
+- **每 action 默认新 Agent**：context 截断治跑偏、artifact 是唯一接力棒；勾「续用当前 Agent」才 send 续接旧会话（review 强制换人复审）
+- **任务隔离工作区（V0.10）**：每 (task × 仓) 一个 git worktree、并行任务互不干扰；分支由系统确定性检出、node_modules 从原仓秒级克隆
 - **Git 分支自动建（多仓 + 模板化）**：build 前 runner 按模板（默认 `feature/{username}/{storyId}-{taskTitle}`、可 per-repo 覆盖）拼分支名、prompt 注入 idempotent checkout 引导；填了「已有工作分支」则复用
 - **决定链落 md**：review 提的 bug、用户裁决（改 / 不改 / 延后）写进 review artifact、后续 build 不重复问（换 agent 也读得到）
 - **大需求分批 build（可选）**：plan 可把大需求在 task 之上再拆「批次」（每批标测试策略 tdd / after / none）、build 时勾本次做哪批、每批可新启 Agent 换干净上下文、review 按进度自动切「增量 / 集成」两层；全程一个 task、进度纯派生、详情页头部 chip 看批次进度
@@ -111,7 +111,7 @@ ai-flow/
 │   │       ├── tasks/[id]/advance/          # POST：task 模式推进下一个 action
 │   │       ├── tasks/[id]/action-ack/       # POST：action ack（approve / revise）
 │   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（兼自动启 agent）
-│   │       ├── tasks/[id]/wait-ack/         # GET：shell long-poll 长连接、保活核心
+│   │       ├── tasks/[id]/advance/          # POST：推进 action（V0.11 起会话 send 续接 / 新建）
 │   │       ├── tasks/[id]/stop/             # POST：停止当前 Run（task / chat 通用）
 │   │       └── cursor-mcp/                  # GET：原样读 ~/.cursor/mcp.json + health 探测
 │   ├── components/

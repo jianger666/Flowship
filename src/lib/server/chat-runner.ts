@@ -1,35 +1,29 @@
 /**
- * Chat runner（V0.6.0.1 重新引入、对齐 V0.5 自由对话体验）
+ * Chat runner（V0.6.0.1 重新引入、V0.11 改「create + 多轮 send」正常对话流）
  *
  * 跟 task-runner 完全独立：
- *   - 用户拍板「自由模式跟以前一样」、所以 chat 不再作为 action 类型
  *   - chat task（task.mode === "chat"）走自己的 prompt（无 _super.md 任务容器协议）
- *   - 自己的 runtime state（runningChats）、不跟 task-runner runningTasks 混
- *   - 复用 V0.6 chat-mcp（submitUserMessage / wait_for_user / shell long-poll）
+ *   - 自己的 runtime state（runningChats = 会话表）、不跟 task-runner runningTasks 混
  *   - 复用 task-runner 的 publish/subscribe（同一个 SSE 通道、watch-task 路由透明）
  *
- * # 核心机制
+ * # 核心机制（V0.11、wait 协议退役）
  *
  * - 用户在 ChatView 输入框发消息 → POST /chat-reply
- *   - awaiting_user + hasPending → submitUserMessage（解 wait_for_user pending）
- *   - 终态（idle / error / 上一轮 completed）+ 无 pending → runChatSession（启 agent）
- *   - agent 起手 prompt 已含用户首条、第一 turn 就回答
- * - agent 每答完一段 → 调 wait_for_user → shell + curl long-poll 等下一条
- * - chat agent 长存活、靠 wait_for_user 阻塞、不主动退 Run
+ *   - 有存活会话（agent 在、无 run 在跑）→ sendChatMessage（agent.send 续同一会话）
+ *   - 无会话（首条 / agent 已关 / 服务重启过）→ runChatSession（Agent.create + 首条进起手 prompt）
+ * - agent 答完自然结束 turn → run finished → runStatus=awaiting_user 等下一条、**会话保留**
+ * - 不再有 wait_for_user / shell curl 长轮询——agent 就是正常的多轮对话
  *
- * # 状态机（V0.6 字段映射）
+ * # 状态机
  *
- *   V0.5 task.status      → V0.6 task.runStatus
- *   draft / completed     → idle
- *   running               → running
- *   awaiting_user         → awaiting_user
- *   failed                → error
+ *   running        → run 在跑（agent 正在答）
+ *   awaiting_user  → 会话在、等用户下一条
+ *   idle / error   → 停止 / 出错（会话已关、下一条消息起新会话、靠 events.jsonl 恢复上下文）
  *
  * # 跟 task-runner 的区别（避免误用）
  *
  * - chat-runner 不写 actions[]、不生成 artifact 文件
- * - chat-runner prompt 里没有 [NEXT_ACTION] / [ACTION_ACK] / [TASK_DONE] 概念
- * - chat-runner 终态不靠 [TASK_DONE]、靠 cancel / 用户主动「结束对话」按钮
+ * - chat prompt 里没有 [NEXT_ACTION] / [ACTION_ACK] 概念
  */
 
 import { Agent } from "@cursor/sdk";
@@ -43,19 +37,12 @@ import {
   appendEvent,
   getTask,
   setTaskRunStatus,
+  setTaskSessionAgentId,
 } from "./task-fs";
 import { getEventsLogPath } from "./task-fs-core";
 import { getChatMcpUrl } from "./chat-mcp";
-import {
-  cancelPending,
-  markTaskAsChat,
-  setChatAwaitingNotifier,
-  unmarkTaskAsChat,
-} from "./chat-pending";
-import {
-  chatWaitProtocolSection,
-  firstTurnReplyThenWaitReminder,
-} from "./wait-protocol-prompt";
+import { setChatAwaitingNotifier } from "./chat-pending";
+import { chatTurnProtocolSection } from "./wait-protocol-prompt";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -100,11 +87,17 @@ interface RunningChatRecord {
   agentId: string;
   startedAt: number;
   cancel: () => void;
-  // 本 Run 启动时绑定的模型（Agent.create 时定死、Run 期间不可变）。
-  // 切模型懒重启用：用户切模型后发下条消息、chat-reply 比对「选中模型 vs 这个」决定续接还是起新 Run。
+  // V0.11：会话持有的 Agent 实例（run 结束不关、下一条消息 send 续接）；冷启动占位期为 null
+  agent: ChatAgent | null;
+  // V0.11：当前是否有 run 在消费（true 时新消息拒收、防并发 send）
+  runActive: boolean;
+  // V0.11.1：最近活跃时间（run 结束 / send 时刷）——空闲回收 sweeper 按它判 TTL
+  lastActiveAt: number;
+  // 本会话启动时绑定的模型（Agent.create 时定死、会话期间不可变）。
+  // 切模型懒重启用：用户切模型后发下条消息、chat-reply 比对「选中模型 vs 这个」决定续接还是重开会话。
   model: ModelSelection;
-  // 本 Run 启动时绑定的 MCP 黑名单快照（启动时按它过滤 mcpServers、Run 期间不可变）。
-  // 切 MCP 懒重启用：用户改 MCP 开关后发下条消息、chat-reply 比对「现在 task 的黑名单 vs 这个」决定续接还是起新 Run。
+  // 本会话启动时绑定的 MCP 黑名单快照（启动时按它过滤 mcpServers、会话期间不可变）。
+  // 切 MCP 懒重启用：比对「现在 task 的黑名单 vs 这个」决定续接还是重开会话。
   disabledMcpServers: string[];
 }
 
@@ -134,17 +127,63 @@ const runningChats = getRunnerState().runningChats;
 export const isChatRunning = (taskId: string): boolean =>
   runningChats.has(taskId);
 
+// V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort
+// keepPersisted = 空闲回收用（sessionAgentId 留着、下次消息 Agent.resume 接回）
+const closeChatSession = (
+  taskId: string,
+  opts: { keepPersisted?: boolean } = {},
+): void => {
+  if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+  const rec = runningChats.get(taskId);
+  if (!rec) return;
+  runningChats.delete(taskId);
+  setChatAwaitingNotifier(taskId, null);
+  if (rec.agent) {
+    try {
+      rec.agent.close();
+    } catch {
+      /* noop */
+    }
+  }
+};
+
+// V0.11.1：chat 会话空闲回收（同 task-runner sweeper、TTL 2h、resume 兜恢复）
+const CHAT_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
+const CHAT_SWEEPER_KEY = "__feAiFlowChatSweeperV1__";
+{
+  const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
+  if (!g[CHAT_SWEEPER_KEY]) {
+    g[CHAT_SWEEPER_KEY] = setInterval(() => {
+      const now = Date.now();
+      for (const [taskId, rec] of runningChats) {
+        if (rec.runActive) continue;
+        if (now - rec.lastActiveAt > CHAT_IDLE_TTL_MS) {
+          console.log(`[chat-runner] 会话空闲回收 task=${taskId}（可 resume 接回）`);
+          closeChatSession(taskId, { keepPersisted: true });
+        }
+      }
+    }, 10 * 60 * 1000);
+    g[CHAT_SWEEPER_KEY]?.unref?.();
+  }
+}
+
 /**
- * 中断正在跑的 chat agent（按 taskId）、返回是否真有活 agent 被停。
+ * 中断 chat（按 taskId）、返回是否真有会话被停。
  *
- * 为什么单独需要：chat agent 注册在本模块的 runningChats、不在 task-runner 的
+ * 为什么单独需要：chat 会话注册在本模块的 runningChats、不在 task-runner 的
  * runningTasks（见文件顶部说明）、所以 /stop route 的 cancelTaskRun 停不到它、
  * 必须额外调本函数。一个 task 只会落两个 map 之一、调用方两个都试即可。
+ *
+ * V0.11：run 在跑 → cancel（run 收尾分支会关会话）；idle 会话 → 直接关。
  */
 export const cancelChatRun = (taskId: string): boolean => {
   const rec = runningChats.get(taskId);
   if (!rec) return false;
-  rec.cancel();
+  if (rec.runActive) {
+    rec.cancel();
+  } else {
+    closeChatSession(taskId);
+  }
   return true;
 };
 
@@ -180,13 +219,12 @@ export const waitForChatToStop = async (
 };
 
 /**
- * 强清 chat Run 运行时状态（pending + runningChats entry）。
- * 仅 waitForChatToStop 超时兜底用：旧 Run cancel 卡住没按期退、强清好让新 Run 起得来。
- * 旧 Run 迟到的 finally 再 delete 无害（delete 不存在的 key 不报错）。
+ * 强清 chat 会话运行时状态。
+ * 仅 waitForChatToStop 超时兜底用：旧 Run cancel 卡住没按期退、强清好让新会话起得来。
+ * 旧 Run 迟到的收尾再 delete 无害（delete 不存在的 key 不报错）。
  */
 export const forceClearChatRun = (taskId: string): void => {
-  cancelPending(taskId);
-  runningChats.delete(taskId);
+  closeChatSession(taskId);
 };
 
 // ----------------- publish 帮手（复用 task-runner SSE 通道） -----------------
@@ -237,13 +275,13 @@ const buildInitialPrompt = (
   const eventsLogPath = getEventsLogPath(task.id);
 
   const lines: string[] = [
-    "你正在 ai-flow 的 **Chat 任务**里跑——一个长期在线的自由对话助手。和用户来回聊、答疑、查资料、读写代码都行。",
+    "你正在 ai-flow 的 **Chat 任务**里跑——一个自由对话助手。和用户来回聊、答疑、查资料、读写代码都行。",
     "",
     `任务 ID：\`${task.id}\``,
     `任务标题：${task.title}`,
     "",
-    // 等待协议（回答 → wait_for_user → shell curl 挂着等下一条）单一源、见 chat-wait-prompt.ts
-    chatWaitProtocolSection(task.id),
+    // 回合协议（正常多轮对话、说完自然结束回复）单一源、见 wait-protocol-prompt.ts
+    chatTurnProtocolSection(),
     "",
     "## 你能用的工具",
     "",
@@ -291,18 +329,19 @@ const buildInitialPrompt = (
 /**
  * 起手姿势段：根据有没有首条用户消息分两种
  *
- * - 有首条（V0.4 自由化主路径、99% 场景）：直接答用户首条、答完调 wait_for_user
- * - 没首条（极少数边界、resume run 或外部触发）：先 wait_for_user 等用户说话
+ * - 有首条（99% 场景）：直接答用户首条、答完结束回复
+ * - 没首条（极少数边界）：直接结束回复、等用户第一条消息（会以新消息送达）
  */
 const buildOpeningStanceSection = (
   taskId: string,
   firstMessage?: InitialUserMessage,
 ): string[] => {
+  void taskId;
   if (!firstMessage) {
     return [
       "## 起手姿势（无首条消息）",
       "",
-      `本任务尚无用户首条、立刻调 \`wait_for_user(task_id=${taskId})\` 等用户在输入框发第一句、再开始对话。`,
+      "本任务尚无用户首条消息：直接结束本轮回复即可、用户的第一句会作为新消息发给你。",
       "",
     ];
   }
@@ -330,9 +369,11 @@ const buildOpeningStanceSection = (
       "",
     );
   }
-  // recency 钉子：首轮专用强版（动作序列、见 wait-protocol-prompt 变体说明）、钉在用户首条之后、
-  // 让 agent 最后读到的是「先成品 → 紧接着挂等」（治首轮冷启动 / 切模型懒重启漏挂等）
-  lines.push(firstTurnReplyThenWaitReminder(), "");
+  // recency 钉子：钉在用户首条之后、治「只说『我这就写』就结束回复、没真把正文输出」
+  lines.push(
+    "把给用户的**完整答案直接写出来**（正常输出、会实时显示）、说完自然结束回复。别只说「我这就写 / 我先查」就结束——要的是成品本身。",
+    "",
+  );
   return lines;
 };
 
@@ -510,14 +551,10 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
   let agent: ChatAgent | null = null;
   let run: ChatRun | null = null;
   let cancelled = false;
-  let hardTimer: NodeJS.Timeout | null = null;
 
-  // cancel 收尾：归位 idle + publish done（不落 info——主动停时 /stop route 已落「用户停止了对话」、避免重复）
+  // cancel 收尾：关会话 + 归位 idle + publish done（不落 info——主动停时 /stop route 已落「用户停止了对话」、避免重复）
   const finishCancelled = async (): Promise<void> => {
-    if (hardTimer) {
-      clearTimeout(hardTimer);
-      hardTimer = null;
-    }
+    closeChatSession(task.id);
     const t = await setTaskRunStatus(task.id, "idle");
     if (t) publish(task.id, { kind: "task", task: t });
     publish(task.id, { kind: "done", task: t ?? task, ok: true });
@@ -525,25 +562,23 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
   // 进入即占位注册：任何时刻（含 create/send/MCP 探测冷启动期）点停止、cancelChatRun 都能命中、
   // 置 cancelled（有 run 时一并真取消 SDK run）；agentId 先空、send 出来再回填。
-  // 注册后所有逻辑全纳入下面 try/finally、保证占位 record 必被清理（否则 has=true 永真、卡死后续启动）。
   runningChats.set(task.id, {
     agentId: "",
     startedAt: Date.now(),
-    // 记下本 Run 绑定模型、供「切模型懒重启」比对（见 chat-reply route）
+    agent: null,
+    runActive: true,
+    lastActiveAt: Date.now(),
+    // 记下本会话绑定模型、供「切模型懒重启」比对（见 chat-reply route）
     model,
-    // 记下本 Run 绑定的 MCP 黑名单快照（下面 filterDisabledMcp 按它过滤）、供「切 MCP 懒重启」比对
+    // 记下本会话绑定的 MCP 黑名单快照（下面 filterDisabledMcp 按它过滤）、供「切 MCP 懒重启」比对
     disabledMcpServers: task.disabledMcpServers ?? [],
     cancel: () => {
       cancelled = true;
-      cancelPending(task.id);
       if (run) void run.cancel().catch(() => {});
     },
   });
 
   try {
-    // V0.7.20：标记 chat 模式、让 chat-mcp 的 wait 引导走精简 chat 版（USER_REPLY 语境、不夹 task 信号）
-    markTaskAsChat(task.id);
-
     // 1) 切到 running、写一条 info event
     const startedTask = await setTaskRunStatus(task.id, "running");
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
@@ -600,25 +635,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       });
     }
 
-    // 3) 注入 awaiting notifier：agent 调 wait_for_user → 切 task.runStatus=awaiting_user
-    // chat 模式不会调 ask_user（prompt 已禁）、所以只处理 awaiting_start
-    setChatAwaitingNotifier(task.id, async (signal) => {
-      if (signal.kind === "ask_user_request") {
-        // 防御性：agent 即使无视 prompt 调了 ask_user、也别让它挂死、转 assistant_message 提示用户
-        const previewText = signal.questions
-          .map((q, idx) => `Q${idx + 1}: ${q.question}`)
-          .join("\n");
-        await writeEventAndPublish(task.id, {
-          kind: "assistant_message",
-          text: `[agent 误调 ask_user、chat 模式不支持]\n${previewText}`,
-        });
-        const updated = await setTaskRunStatus(task.id, "awaiting_user");
-        if (updated) publish(task.id, { kind: "task", task: updated });
-        return;
-      }
-      const updated = await setTaskRunStatus(task.id, "awaiting_user");
-      if (updated) publish(task.id, { kind: "task", task: updated });
-    });
+    // 3) 注入 awaiting notifier（V0.11.1 抽成共用、resume 时也要重注册）
+    registerChatNotifier(task);
 
     // 4) 启动 agent + 流式消费
     agent = await Agent.create({
@@ -657,9 +675,14 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const initialPrompt = buildInitialPrompt(task, skills, rulesSection, firstMessage);
     run = await agent.send(initialPrompt);
 
-    // 回填真实 agentId（占位注册时是空串）
+    // 回填真实 agentId / agent 实例（占位注册时是空串 / null）——从此会话可被 send 续接。
+    // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 接回
     const rec = runningChats.get(task.id);
-    if (rec) rec.agentId = agent.agentId;
+    if (rec) {
+      rec.agentId = agent.agentId;
+      rec.agent = agent;
+    }
+    void setTaskSessionAgentId(task.id, agent.agentId);
 
     // send 期间被停 → run 已就位、真取消它再收尾
     if (cancelled) {
@@ -668,20 +691,152 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       return;
     }
 
-    // run 此刻必非 null（send 成功 + 未取消）、用局部 const 给后续 stream/wait/hardTimer、
-    // 免「let + 闭包捕获」让 TS 把 narrow 丢回 null
-    const activeRun = run;
+    await consumeChatRun(task, run, () => cancelled);
+  } catch (err) {
+    // Agent.create / send 阶段失败（consumeChatRun 内部错误它自己处理、不会抛）
+    await handleChatRunFailure(task, err);
+  }
+};
 
+// ----------------- V0.11.1：notifier 注册 + 会话恢复 -----------------
+
+// chat 的 awaiting notifier：agent 误调 wait_for_user / ask_user 时的防御兜底
+//（chat prompt 已禁这两个工具、但模型偶发不听话——别让状态漂）
+const registerChatNotifier = (task: Task): void => {
+  setChatAwaitingNotifier(task.id, async (signal) => {
+    if (signal.kind === "ask_user_request") {
+      // 防御性：agent 即使无视 prompt 调了 ask_user、转 assistant_message 提示用户
+      const previewText = signal.questions
+        .map((q, idx) => `Q${idx + 1}: ${q.question}`)
+        .join("\n");
+      await writeEventAndPublish(task.id, {
+        kind: "assistant_message",
+        text: `[agent 误调 ask_user、chat 模式不支持]\n${previewText}`,
+      });
+      const updated = await setTaskRunStatus(task.id, "awaiting_user");
+      if (updated) publish(task.id, { kind: "task", task: updated });
+      return;
+    }
+    const updated = await setTaskRunStatus(task.id, "awaiting_user");
+    if (updated) publish(task.id, { kind: "task", task: updated });
+  });
+};
+
+/**
+ * V0.11.1：从落盘的 sessionAgentId 恢复 chat 会话（服务重启 / 空闲回收后）。
+ * 成功 = 会话表就位（runActive=false、可立即 sendChatMessage）；失败 = 清锚点返 false。
+ */
+export const resumeChatSession = async (
+  task: Task,
+  bootArgs: { apiKey: string; model: ModelSelection },
+): Promise<boolean> => {
+  if (!task.sessionAgentId || runningChats.has(task.id)) return false;
+  try {
+    // inline MCP 不随 resume 持久化、重传（同 runChatSession 的 merge 逻辑）
+    const enrichedMcp = await enrichMcpServersWithOAuth(
+      filterDisabledMcp(
+        await readGlobalCursorMcpServers(),
+        task.disabledMcpServers,
+      ),
+    );
+    const { servers: cursorMcp } = await filterHealthyMcp(enrichedMcp);
+    const mergedMcp: Record<string, McpServerConfig> = {
+      ...cursorMcp,
+      [CHAT_TOOL_MCP_NAME]: { type: "http", url: getChatMcpUrl() },
+    };
+    const agent = await Agent.resume(task.sessionAgentId, {
+      apiKey: bootArgs.apiKey,
+      // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
+      model: bootArgs.model,
+      // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
+      local: {
+        cwd:
+          task.repoPaths.length > 0
+            ? getEffectiveCwd(task.repoPaths)
+            : os.homedir(),
+        settingSources: ["project"],
+      },
+      mcpServers: mergedMcp,
+    });
+    runningChats.set(task.id, {
+      agentId: agent.agentId,
+      startedAt: Date.now(),
+      agent,
+      runActive: false,
+      lastActiveAt: Date.now(),
+      model: bootArgs.model,
+      disabledMcpServers: task.disabledMcpServers ?? [],
+      cancel: () => {},
+    });
+    registerChatNotifier(task);
+    console.log(
+      `[chat-runner] task=${task.id} 会话已恢复（Agent.resume agentId=${agent.agentId}）`,
+    );
+    return true;
+  } catch (err) {
+    console.warn(
+      `[chat-runner] task=${task.id} Agent.resume 失败（清锚点、降级新会话）`,
+      err,
+    );
+    void setTaskSessionAgentId(task.id, undefined);
+    return false;
+  }
+};
+
+// ----------------- V0.11：chat run 消费管道（首个 run + 后续 send 共用） -----------------
+
+// run 失败的统一收尾：关会话 + 标 error + 事件 + publish
+const handleChatRunFailure = async (task: Task, err: unknown): Promise<void> => {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error("[chat-runner] task", task.id, "failed:", err);
+  closeChatSession(task.id);
+  // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
+  // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
+  const failure = summarizeRunFailure(message, err);
+  const eventText = failure.isConnectionDrop
+    ? failure.text
+    : `Chat agent 异常：${failure.text}`;
+  await writeEventAndPublish(task.id, {
+    kind: "error",
+    text: eventText,
+    // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
+    meta: { detail: failure.detail },
+  });
+  const errorTask = await setTaskRunStatus(task.id, "error");
+  if (errorTask) publish(task.id, { kind: "task", task: errorTask });
+  const finalTask = await getTask(task.id);
+  publish(task.id, { kind: "done", task: finalTask ?? task, ok: false });
+  publish(task.id, { kind: "error", message: eventText });
+};
+
+/**
+ * 消费一个 chat run 的完整生命周期。
+ * 自然 finished = 正常出口：runStatus → awaiting_user（等下一条消息）、**会话保留**；
+ * cancel / error → 关会话（下一条消息起新会话、靠 events.jsonl 恢复上下文）。
+ */
+const consumeChatRun = async (
+  task: Task,
+  run: ChatRun,
+  externallyCancelled?: () => boolean,
+): Promise<void> => {
+  let cancelled = false;
+  let hardTimer: NodeJS.Timeout | null = null;
+  const rec = runningChats.get(task.id);
+  if (rec) {
+    rec.runActive = true;
+    rec.cancel = () => {
+      cancelled = true;
+      void run.cancel().catch(() => {});
+    };
+  }
+  try {
     // 兜底硬超时：24h
     hardTimer = setTimeout(() => {
       cancelled = true;
-      cancelPending(task.id);
-      void activeRun.cancel().catch(() => {});
+      void run.cancel().catch(() => {});
     }, CHAT_HARD_TIMEOUT_MS);
 
-    // 流式消费 + buffer flush
-    // 用一个 buffer 累积 assistant text、遇到非 assistant 消息或 run 结束时再 flush 成一条 assistant_message
-    // 这样一轮 agent 完整回复 → 一条事件、UI 不会出现「我」「在」「想」这种碎片
+    // 流式消费 + buffer flush：一轮完整回复 → 一条 assistant_message 事件
     const ctx: AssistantBufferCtx = {
       buffer: "",
       flush: async () => {
@@ -695,13 +850,10 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       },
     };
 
-    for await (const msg of activeRun.stream()) {
+    for await (const msg of run.stream()) {
       // handleSdkMessage 内部已在 thinking / tool_call case 自己 flush buffer
-      // 这里不重复 flush、否则 IO 抖动
       await handleSdkMessage(task.id, msg, ctx);
     }
-
-    // 流结束、最后一段 assistant text 也要 flush
     await ctx.flush();
 
     if (hardTimer) {
@@ -709,11 +861,12 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       hardTimer = null;
     }
 
-    const result = await activeRun.wait();
+    const result = await run.wait();
 
-    if (cancelled || result.status === "cancelled") {
-      // cancel 收尾只归位 runStatus + publish done、不落 info——
-      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复（跟 task-runner cancel 分支对齐）
+    if (cancelled || externallyCancelled?.() || result.status === "cancelled") {
+      // cancel 收尾：关会话 + 归位 idle + publish done、不落 info——
+      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复
+      closeChatSession(task.id);
       const cancelledTask = await setTaskRunStatus(task.id, "idle");
       if (cancelledTask) publish(task.id, { kind: "task", task: cancelledTask });
       publish(task.id, { kind: "done", task: cancelledTask ?? task, ok: true });
@@ -724,8 +877,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       const sdkErr = ctx.sdkErrorMessage
         ? `\n--- SDK stream error message ---\n${ctx.sdkErrorMessage}`
         : "";
-      // dump 完整 result（对齐 task-runner）：RunResult 类型没声明 errorCode、但运行时可能藏未声明字段、
-      // 落进 dump → 事后从 events.meta.detail 看 SDK 到底给了啥（区分额度 vs 连接断的唯一线索）。
+      // dump 完整 result（对齐 task-runner）：运行时可能藏未声明字段、落 dump 供事后定位
       const resultDump = stringifyMeta(result).slice(0, 1500);
       throw new Error(
         `agent run status=${result.status}${
@@ -734,40 +886,67 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       );
     }
 
-    const completedTask = await setTaskRunStatus(task.id, "idle");
-    if (completedTask) publish(task.id, { kind: "task", task: completedTask });
-    await writeEventAndPublish(task.id, {
-      kind: "info",
-      text: "Chat 任务结束、agent 正常退出（再发一句可重启对话）",
-    });
-    publish(task.id, { kind: "done", task: completedTask ?? task, ok: true });
+    // 自然 finished：agent 答完这轮、等用户下一条（会话保留、send 续接）
+    if (rec) {
+      rec.runActive = false;
+      rec.lastActiveAt = Date.now();
+    }
+    const doneTask = await setTaskRunStatus(task.id, "awaiting_user");
+    if (doneTask) publish(task.id, { kind: "task", task: doneTask });
+    publish(task.id, { kind: "done", task: doneTask ?? task, ok: true });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[chat-runner] task", task.id, "failed:", err);
-    // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
-    // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
-    const failure = summarizeRunFailure(message, err);
-    const eventText = failure.isConnectionDrop
-      ? failure.text
-      : `Chat agent 异常：${failure.text}`;
-    await writeEventAndPublish(task.id, {
-      kind: "error",
-      text: eventText,
-      // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
-      meta: { detail: failure.detail },
-    });
-    const errorTask = await setTaskRunStatus(task.id, "error");
-    if (errorTask) publish(task.id, { kind: "task", task: errorTask });
-    const finalTask = await getTask(task.id);
-    publish(task.id, {
-      kind: "done",
-      task: finalTask ?? task,
-      ok: false,
-    });
-    publish(task.id, { kind: "error", message: eventText });
-  } finally {
-    runningChats.delete(task.id);
-    unmarkTaskAsChat(task.id);
+    await handleChatRunFailure(task, err);
   }
+};
+
+// ----------------- V0.11：sendChatMessage（续接存活会话） -----------------
+
+/**
+ * 把用户新消息发给存活的 chat 会话（`agent.send`）、消费产生的新 run。
+ *
+ * @returns false = 没有可续接的会话（没记录 / agent 没就位 / run 在跑 / send 抛错）、
+ *          调用方（chat-reply 路由）走 runChatSession 起新会话
+ */
+export const sendChatMessage = async (
+  task: Task,
+  text: string,
+  imagePaths?: string[],
+  attachmentPaths?: string[],
+): Promise<boolean> => {
+  const rec = runningChats.get(task.id);
+  if (!rec || !rec.agent || rec.runActive) return false;
+
+  // 组消息：正文 + 附件段（图走 read 转 vision、路径自己 read/grep）
+  const lines: string[] = [text];
+  if (imagePaths && imagePaths.length > 0) {
+    lines.push(
+      "",
+      "[ATTACHED_IMAGES] 用户附了以下图片、请用 `read` 工具逐一读取（会转成 vision、你能直接看到图像内容）：",
+      ...imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+  if (attachmentPaths && attachmentPaths.length > 0) {
+    lines.push(
+      "",
+      "[ATTACHED_PATHS] 用户附了以下文件 / 目录路径、按需用 `read` / `grep` / `glob` 读取：",
+      ...attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+
+  let run: ChatRun;
+  try {
+    run = await rec.agent.send(lines.join("\n"));
+  } catch (err) {
+    console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
+    closeChatSession(task.id);
+    return false;
+  }
+  rec.lastActiveAt = Date.now();
+
+  // 切 running + fire-and-forget 消费
+  const runningTask = await setTaskRunStatus(task.id, "running");
+  if (runningTask) publish(task.id, { kind: "task", task: runningTask });
+  void consumeChatRun(task, run);
+  return true;
 };

@@ -10,6 +10,7 @@ alwaysApply: true
 - **用户本机日常运行着「AI工作流」桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关「AI工作流」窗口。
 - **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
   - **⚠️ 打 test 包前必须先退掉正在跑的 test 实例（2026-07-02 踩过、把用户测试环境搞半残）**：`electron:dist:test` 会把 `dist/electron/mac-arm64/AI工作流test.app` **整个删掉重建**——老进程还在跑时脚下 bundle 被换、已加载的路由还能服务（boot 200、curl 冒烟全过、**假象**）、但之后 agent 每次执行 shell、SDK 沙箱的 zsh state-dump helper 因 bundle 资源失配**永久挂死**（僵尸 `/bin/zsh -ilc dump_zsh_state` 进程、每跑一条 shell 挂一个）→ wait curl 发不出去、任务永远「运行中」假卡死。另一个坑：打完 `open` 只会聚焦老进程（单实例锁）、**你以为在冒烟新包、实际测的是老进程老代码**。正确顺序：`osascript -e 'tell application "AI工作流test" to quit'` → 完整 3 步打包 → `open` → **核对主进程 lstart 晚于打包时间**再冒烟。
+ - **正式包自更新点「稍后重启」踩的是同一个坑（2026-07-07 线上事故确诊）**：mac 自更新原地替换 /Applications 里的 .app、用户点「稍后」→ 老进程 + 新 bundle → 之后每个新 agent run 第一批 shell 就永久挂死、任务假死「运行中」。诊断特征：壳日志反复打 `发现新版本 vX（当前 vY）`（X = 磁盘版本 Y = 运行版本）、UI 右上角挂「新版本」徽标、next-server 下挂僵尸 `dump_zsh_state`。**V0.10.1 起有硬闸**：壳替换后写 `<data>/update-pending-restart.json`、server 起新 run 前查到直接拒绝提示重启（`update-pending.ts`）；再遇到「任务卡死 + 事件流停在 shell 调用后」先查这个。修复 = 让用户重启正式 app（我不能动 8876）。
  - 打包（**完整 3 步、缺一不可**、2026-06-15 踩过：只跑 dist:test 会把旧代码打进包、验证时 curl 到旧 UI 排查半天）：
     1. `BUILD_STANDALONE=1 pnpm build`——产新 `.next/standalone`（不带 BUILD_STANDALONE 不会出 standalone、见 next.config.ts）
     2. `node scripts/assemble-electron-server.mjs`——从 standalone 重组 `dist/app-server`（内部先 rm 再 cp + 补 SDK 平台包）
@@ -18,6 +19,7 @@ alwaysApply: true
   - 壳探测到名字带 test（或 env `FE_AI_FLOW_TEST=1`）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**、单实例锁天然独立（按 userData 算）
   - 要关 / 删的话（用户主动说时）动的也是「AI工作流test」（名字带 test）、不会误伤正式应用
 - 验证写法：`open dist/electron/mac-arm64/AI工作流test.app` + `curl 127.0.0.1:8776/...`。**验完默认不关窗、不删包**（见下条）。
+- **⚠️ 重打包后 TCC 文件权限会重置、锁屏时验 task 模式必假卡死（2026-07-07 踩过、排查 1 小时）**：ad-hoc 签名每次重打都变、macOS 把新包当新 app、agent 子进程首次访问 `~/Documents` 下的仓库要重新弹「文件与文件夹」授权——**用户不在电脑前 / 锁屏时弹窗出不来、系统调用直接永久挂起**（采样实锤：git 挂在 `getcwd→open` 内核调用、Agent.create 卡 20 分钟无报错）。表现三件套：chat 模式正常（cwd=home 不受限）、独立终端跑 SDK 正常（终端有权限）、只有 app 里 task 模式挂。规避：① 冒烟 task 模式必须屏幕解锁、人在电脑前点掉授权弹窗；② 一劳永逸——系统设置→隐私与安全→完全磁盘访问 给「AI工作流test」勾上；③ 绕开法：用 `/tmp` 下的临时仓验链路（不触发 TCC）、但 skills 在 app bundle（Documents 下）里、agent 读 skill 仍会卡——治标不治本、优先 ②。
 - 盲写直接发版（不本地验证）也不可取——能 test 实例验的就验一轮再 tag。
 - **test 实例 + test 包默认都不关不删（2026-06-15 用户修订、覆盖旧「测完删包 / 立即关 test」约定）**：验完 test 实例**留着跑、test 包（`dist/electron`）也留着**、下次要再测直接 open 复用、不用重打。**只有用户主动说「关」「删」时才动手**。配置数据目录 `~/Library/Application Support/fe-ai-flow-test`（API Key / 模型 / 仓库 / 飞书登录态）一直保留、不要删。
 - **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：**起 test 跑对话前、确认正式实例此刻没在跑对话**（idle 挂着不跑 SDK 不会撞、所以 test 默认留着即可、不必为规避并发去关它）。真把正式挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。

@@ -11,6 +11,7 @@
 
 import {
   DEFAULT_BRANCH_TEMPLATE,
+  extractFeishuStoryId,
   renderBranchName,
 } from "@/lib/branch-template";
 import type {
@@ -168,10 +169,8 @@ export const planBranchesForBuild = (
     return null;
   }
 
-  // 飞书 story id：URL 里 detail/<digits> 这段、最长一段连续数字兜底
-  const m = task.feishuStoryUrl.match(/detail\/(\d+)/) ??
-    task.feishuStoryUrl.match(/(\d{6,})/);
-  const storyId = m ? m[1] : null;
+  // 飞书 story id：URL 里 detail/<digits> 这段、最长一段连续数字兜底（V0.10 抽到 branch-template 共用）
+  const storyId = extractFeishuStoryId(task.feishuStoryUrl);
   if (!storyId) {
     return null;
   }
@@ -291,7 +290,7 @@ export const planBranchesForBuild = (
     lines.push("CURRENT=$(git rev-parse --abbrev-ref HEAD)");
     lines.push(`if [ "$CURRENT" != ${JSON.stringify(name)} ]; then`);
     lines.push(
-      `  echo "[error] 当前分支 $CURRENT != 目标分支 ${name}、停止 build（不要在错分支改代码、调 wait_for_user 报告用户）"`,
+      `  echo "[error] 当前分支 $CURRENT != 目标分支 ${name}、停止 build（不要在错分支改代码、调 ask_user 报告用户等处理）"`,
     );
     lines.push("  exit 1");
     lines.push("fi");
@@ -304,7 +303,7 @@ export const planBranchesForBuild = (
     "checkout 成功后、按下面 build action 标准流程做实施（多仓 task：所有仓都得 checkout 成功才开始改代码）。",
   );
   lines.push(
-    "checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓库）→ emit 一段简短 assistant_message 告知问题、调 wait_for_user 等用户处理（**不要**自己 force / reset 操作硬盘）。",
+    "checkout 失败（工作区脏 / 探不到主分支 / 仓不是 git 仓库）→ 调 ask_user 说明问题、问用户怎么处理（**不要**自己 force / reset 操作硬盘）。",
   );
 
   return { infos, promptHint: lines.join("\n") };

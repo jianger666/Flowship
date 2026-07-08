@@ -352,6 +352,30 @@ export const getEffectiveCwd = (repoPaths: string[]): string => {
  * 单仓不调这个（cwd 就是仓库自身、短名等于 "."、prompt 也不用列）。
  * export 给 task 详情页算 ArtifactPanel 的 repoShortNames（多仓路径前缀校验）用。
  */
+/**
+ * 逐仓算「目录短名」= basename、重名追加序号去重（V0.10、client + server 共用）
+ *
+ * 语义：task 隔离工作区（git worktree）里每个仓的子目录名——
+ * server 端 task-worktrees 用它定 worktree 路径、client 端 task 详情页用它做
+ * 多仓 artifact 路径前缀校验（隔离 task 的 cwd 是 worktrees/<taskId>、原仓库路径
+ * 不在其下、getRepoShortNames 算不出短名）。确定性：只由 repoPaths 顺序决定。
+ */
+export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
+  // 探重循环而不是「第 N 次出现拼 -N」：后者会跟真实目录名撞车
+  //（如 [web, web, web-2] → web / web-2 / web-2、两仓映射同一目录）
+  const taken = new Set<string>();
+  return repoPaths.map((p) => {
+    const base =
+      normalizeSeparators(p).replace(/\/+$/, "").split("/").filter(Boolean).pop() ||
+      "repo";
+    let name = base;
+    let i = 2;
+    while (taken.has(name)) name = `${base}-${i++}`;
+    taken.add(name);
+    return name;
+  });
+};
+
 export const getRepoShortNames = (
   repoPaths: string[],
   cwd: string,

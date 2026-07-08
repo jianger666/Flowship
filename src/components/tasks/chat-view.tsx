@@ -100,9 +100,7 @@ export const ChatView = ({
   }, true, watchEpoch);
 
   // 用户回复：无论 task.runStatus 是什么、统一走 sendChatReply
-  // 后端 chat-reply 路由按 runStatus + hasPending 自己决定：
-  //   - awaiting_user：解 wait_for_user（正常回合）
-  //   - idle / error / completed：bootArgs 启 agent + 投递首条
+  // 后端 chat-reply 路由自己决定（V0.11）：有存活会话 → send 续接；无会话 → bootArgs 起新会话
   // 前端为最简化、永远附 bootArgs（后端用得上就用、用不上就忽略）
   const handleUserReply = useCallback(
     async (text: string, images?: ImagePayload[], attachments?: string[]) => {

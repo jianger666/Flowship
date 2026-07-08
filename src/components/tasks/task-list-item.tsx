@@ -11,7 +11,7 @@
  *  - running       → 转圈（多任务并行时一眼看出哪个 AI 在跑）
  *  - awaiting_user → 琥珀色脉冲点（哪个在等我回复）
  *  - idle / error  → 类型图标（对话气泡 / 任务清单）
- * （error 不特殊标：shell long-poll 超时几乎必 error、标了反而噪声。）
+ * （error 不特殊标：断线类 error 常见、标了反而噪声。）
  */
 
 import Link from "next/link";

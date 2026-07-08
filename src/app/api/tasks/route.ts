@@ -114,6 +114,11 @@ export const POST = async (req: Request) => {
         body.disabledMcpServers.every((s) => typeof s === "string")
           ? body.disabledMcpServers
           : undefined,
+      // V0.10：任务隔离工作区开关（缺省 = task 模式默认 true、见 createTask）
+      isolateWorktree:
+        typeof body.isolateWorktree === "boolean"
+          ? body.isolateWorktree
+          : undefined,
       model: body.model,
     });
     return NextResponse.json({ task }, { status: 201 });

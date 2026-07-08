@@ -201,7 +201,7 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完调 `wait_fo
 - ❌ 没配 dev 分支的仓硬推（跳过、artifact 记原因）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不落库、详情页看不到）
 - ❌ push 被拒（non-fast-forward）时 force push 覆盖远程（绝对不、报用户处理 / 重跑）
-- ❌ approve 后自动跑下一 action（绝对不、wait_for_user 待命态等用户推进）
+- ❌ 交卷后自动跑下一 action（绝对不、交卷即结束回复、等用户推进）
 
 ## 调用礼仪
 

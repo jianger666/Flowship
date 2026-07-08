@@ -379,7 +379,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `wait_f
 - ❌ 拿到 `submit_mr` 失败结果时自动重试 / force push（**绝对不**、artifact 记错、让用户手动处理）
 - ❌ 跳过的仓没在 artifact §3 写原因（后置检查会挡）
 - ❌ artifact 没写 `task.feishuTesterUserKeys` 来源（A / C / 沿用、需可审计）
-- ❌ ship approve 后自动跑下一 action（绝对不、wait_for_user 待命态等用户推进）
+- ❌ ship 交卷后自动跑下一 action（绝对不、交卷即结束回复、等用户推进）
 - ❌ 飞书评论里 URL 后面追加 `(v1)` / `（v1）` / 任何字符（飞书 IM 会一起 link 化导致 404）
 
 ## 调用礼仪

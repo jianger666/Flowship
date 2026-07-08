@@ -13,6 +13,8 @@
  */
 
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+
+import { getSettings } from "./local-store";
 import type {
   ActionRecord,
   ArtifactRevision,
@@ -20,6 +22,7 @@ import type {
   GitBranchState,
   McpHealth,
   NewTaskInput,
+  PreviewSlotStatus,
   ShipPrecheck,
   Task,
   TaskEvent,
@@ -485,9 +488,9 @@ export interface TaskBootArgs {
 /**
  * V0.6.0.1 chat 模式：用户在 ChatView 输入框发一条消息
  *
- * 后端语义（详见 /chat-reply route 顶部注释）：
- *   - awaiting_user + hasPending → submitUserMessage（正常对话循环）
- *   - idle / error / 上一轮 completed → bootArgs 启 chat agent + 投递首条
+ * 后端语义（详见 /chat-reply route 顶部注释、V0.11）：
+ *   - 有存活会话 → `agent.send` 续接（正常对话循环）
+ *   - 无会话（首条 / 已停 / 服务重启过）→ bootArgs 起新会话 + 首条进起手 prompt
  *
  * 调用方简化：无脑传 bootArgs、后端按需取用。
  *
@@ -541,6 +544,8 @@ export const submitActionAck = async (
   decision: "approve" | "revise",
   options?: ActionAckOptions,
 ): Promise<Task> => {
+  // V0.11.1：随手带会话恢复凭据——服务重启 / 空闲回收后 revise 靠它 Agent.resume 接回会话
+  const s = getSettings();
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/action-ack`,
     {
@@ -551,6 +556,12 @@ export const submitActionAck = async (
         decision,
         feedback: options?.feedback,
         images: options?.images,
+        bootArgs: {
+          apiKey: s.apiKey,
+          model: s.defaultModel,
+          gitHost: s.gitHost,
+          gitToken: s.gitToken,
+        },
       }),
     },
   );
@@ -726,6 +737,8 @@ export const submitAskReply = async (
         ),
       )
     : undefined;
+  // V0.11.1：随手带会话恢复凭据——服务重启 / 空闲回收后答案靠它 Agent.resume 接回会话送达
+  const s = getSettings();
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/ask-reply`,
     {
@@ -738,6 +751,12 @@ export const submitAskReply = async (
         ...(imagesByQuestion && Object.keys(imagesByQuestion).length > 0
           ? { imagesByQuestion }
           : {}),
+        bootArgs: {
+          apiKey: s.apiKey,
+          model: s.defaultModel,
+          gitHost: s.gitHost,
+          gitToken: s.gitToken,
+        },
       }),
     },
   );
@@ -794,5 +813,34 @@ export const fetchActionDiff = async (
       `/api/tasks/${encodeURIComponent(taskId)}/action-diff?${params.toString()}`,
       { cache: "no-store" },
     ),
+  );
+};
+
+// ----------------- 单预览位（V0.10.1）-----------------
+
+export const fetchPreviewStatus = async (): Promise<PreviewSlotStatus | null> => {
+  const data = await handleJson<{ slot: PreviewSlotStatus | null }>(
+    await fetch("/api/preview", { cache: "no-store" }),
+  );
+  return data.slot;
+};
+
+/** 起预览（单预览位：自动停掉上一个任务的 dev server）。返回被顶掉的任务标题（没有则 null） */
+export const startTaskPreview = async (
+  taskId: string,
+  repoPath: string,
+  command: string,
+): Promise<{ slot: PreviewSlotStatus; replacedTaskTitle: string | null }> =>
+  await handleJson<{ slot: PreviewSlotStatus; replacedTaskTitle: string | null }>(
+    await fetch("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ taskId, repoPath, command }),
+    }),
+  );
+
+export const stopTaskPreview = async (): Promise<void> => {
+  await handleJson<{ ok: true }>(
+    await fetch("/api/preview", { method: "DELETE" }),
   );
 };

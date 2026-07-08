@@ -31,6 +31,12 @@ export interface RepoConfig {
    * 占位符见 branch-template.ts：{username} / {storyId} / {taskTitle} / {date:MM-dd}
    */
   branchTemplate?: string;
+  /**
+   * V0.10.1：预览启动命令（如 `npm run dev`）——配了任务页才显示「预览」按钮。
+   * 点预览 = 单预览位：停掉上一个任务的 dev server、在当前任务工作区起这条命令
+   * （app 不理解命令语义、只负责执行；见 preview-manager.ts）
+   */
+  previewCommand?: string;
 }
 
 /**
@@ -40,6 +46,26 @@ export interface RepoConfig {
 export interface ModelSelection {
   id: string;
   params?: Array<{ id: string; value: string }>;
+}
+
+/**
+ * 单预览位状态（V0.10.1、client / server 共用——server 端管理见 preview-manager.ts）
+ * 全局最多一个 dev server 在跑、点任务「预览」自动停旧起新
+ */
+export interface PreviewSlotStatus {
+  taskId: string;
+  taskTitle: string;
+  repoPath: string;
+  workDir: string;
+  command: string;
+  startedAt: number;
+  /** 从 dev server 输出探到的本地地址（探不到为 null、UI 不显示「打开」） */
+  url: string | null;
+  /** 进程已退出（启动失败 / 被外部杀）——UI 显示失败态 + 日志 */
+  exited: boolean;
+  exitCode: number | null;
+  /** 最近日志（启动失败排查用） */
+  logTail: string[];
 }
 
 /**
@@ -169,7 +195,7 @@ export interface ApiKeyInfo {
 // 2. action = task 内的单次动作（plan / build / review / ship / learn / dev；chat 走独立 mode）
 //    - 自由触发顺序（不强制 plan→build→review、靠 6 个 harness 门槛兜底质量）
 //    - N 累计序号、文件名 actions/N-<type>.md（cancelled 也占 N、不释放）
-// 3. 单 SDK Run 永生（task 不终态 Run 不退、wait_for_user 阻塞等下一 action 指令）
+// 3. agent 会话跨 run 存活（V0.11：交卷 / 提问后 run 自然结束、用户操作经 agent.send 续接同一会话）
 // 4. 不写 V0.5 → V0.6 migration 脚本、V0.5 老 task 数据靠 listTasks 自动跳过（schema 不匹配的 meta.json 在 hydrate 时被 skip）
 
 /**
@@ -757,7 +783,7 @@ export interface ArtifactRevision {
  * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / learn / dev）
  *   UI = ActionTimeline + ArtifactPanel + EventStream 三栏布局
  * - `chat`：自由对话、不走 action 体系、跑独立 chat-runner + chat-reply 通路
- *   UI = ChatView 单栏（事件流 + 输入框）、用户消息立刻显示、agent 长存活靠 wait_for_user 阻塞
+ *   UI = ChatView 单栏（事件流 + 输入框）、用户消息立刻显示、会话跨 run 存活（send 续接）
  *
  * 两套通路完全独立、不共享 runner / prompt / API、避免 chat 场景被 V0.6 task 容器协议夹胀。
  */
@@ -858,6 +884,31 @@ export interface Task {
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
   /**
+   * V0.10：任务隔离工作区（git worktree）开关。
+   * - true（新建 task 默认）→ runner 起 agent 前在 dataRoot/worktrees/<taskId>/ 逐仓
+   *   `git worktree add` 并确定性检出任务分支、agent cwd / 后置检查全走 worktree、
+   *   并行任务不再互踩同一个仓的工作区
+   * - false（新建弹窗的逃生口「直接在原仓库运行」）/ undefined（V0.10 前的老 task）
+   *   → 直接在原仓库目录运行、分支靠 build checkout hint 引导 agent 自己切（旧行为）
+   * - chat 模式恒不隔离（自由对话不建分支、直接用所选目录）
+   */
+  isolateWorktree?: boolean;
+  /**
+   * V0.11.1：最近一次 agent 会话的 agentId（会话持久化）。
+   * - 会话创建（Agent.create / 每次换新 agent）时写入；停止 / 终结 / 会话报错时清空
+   * - 服务重启后内存会话丢了、但这个 id 还在 → 用户再聊聊 / 答弹窗 / 续用推进时
+   *   `Agent.resume(agentId)` 无缝接回原会话（上下文不丢）；resume 失败自动清空、退回 fresh agent
+   * - 空闲回收（会话闲置自动 close 省内存）**不清**这个 id——下次操作 resume 回来
+   */
+  sessionAgentId?: string;
+  /**
+   * V0.10.1：agent 实际工作目录（**计算字段、不落盘**——hydrateTask 时由 getTaskCwd 算出）。
+   * - 隔离 task → worktree cwd（单仓 = worktree 自身、多仓 = worktrees/<taskId> 公共父目录）
+   * - 非隔离 → 原仓库 effective cwd
+   * client 的「在 IDE 打开工作区」「复制路径」「预览」按钮用（dataRoot 只有 server 知道、client 拼不出）
+   */
+  workCwd?: string;
+  /**
    * V0.6.14：ship 提测建 MR 时「合并后是否删源分支」。
    * - 缺省 / undefined → 保留源分支（用户拍板默认保留：合并后常要看 / 续推、删了得去 GitLab 重推很麻烦）
    * - true → 合并后删源分支（GitLab remove_source_branch）
@@ -891,6 +942,7 @@ export type NewTaskInput = Pick<
   | "repoTestBranches"
   | "repoDevBranches"
   | "repoBranchTemplates"
+  | "isolateWorktree"
 > & {
   role?: TaskRole;
   mode?: TaskMode;

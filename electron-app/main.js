@@ -538,6 +538,33 @@ const execFileStrict = (cmd, args) =>
     );
   });
 
+// 启动清扫（V0.10.1）：
+// 1. 删「更新就位、等重启」marker——能跑到这说明已经在新 bundle 上、server 不用再拦
+// 2. 清 updates/ 残留（old-*.app 暂存旧包 / mnt-* 挂载点 / *.dmg）——替换现场的 rm
+//    偶发失败且早前被静默吞（实测积了 4 份 200MB+ 旧包）、启动时统一兜底
+const cleanupUpdateLeftovers = async () => {
+  const marker = path.join(app.getPath("userData"), "data", "update-pending-restart.json");
+  await fs.rm(marker, { force: true }).catch(() => {});
+  const updatesDir = path.join(app.getPath("userData"), "updates");
+  let entries = [];
+  try {
+    entries = readdirSync(updatesDir);
+  } catch {
+    return; // 没 updates 目录、没得清
+  }
+  for (const name of entries) {
+    const p = path.join(updatesDir, name);
+    // 历史挂载点可能还挂着 dmg、先卸再删（fail-open）
+    if (name.startsWith("mnt-")) await execFileP("hdiutil", ["detach", p, "-quiet"]);
+    try {
+      await fs.rm(p, { recursive: true, force: true });
+      log(`[updater] 启动清扫 updates/${name}`);
+    } catch (err) {
+      log(`[updater] 启动清扫 updates/${name} 失败（忽略）${err?.message || err}`);
+    }
+  }
+};
+
 // mac 应用内自更新（v0.7.12）：壳自己下载 dmg → 替换 /Applications 里的自己 → 重启生效。
 // 关键原理：quarantine 隔离标记只有浏览器等下载器会打、壳进程 fetch 落盘的文件没有
 // → Gatekeeper 不评估 → 免开发者证书实现「类自动更新」、解决用户实测痛点
@@ -598,7 +625,21 @@ const macSelfUpdate = async (version) => {
       await fs.rename(stagedOld, appPath).catch(() => {});
       throw err;
     }
-    await fs.rm(stagedOld, { recursive: true, force: true }).catch(() => {});
+    // 失败别静默吞（实测 updates/ 积过 4 份旧包）——记日志、启动清扫兜底再清
+    await fs.rm(stagedOld, { recursive: true, force: true }).catch((err) => {
+      log(`[updater] 清理暂存旧包失败（启动时兜底再清）${err?.message || err}`);
+    });
+
+    // 关键 marker（V0.10.1）：bundle 已被替换、但本进程还是老版本——用户点「稍后」期间
+    // server 起新 agent run 必挂死（SDK 沙箱 shell helper 与新 bundle 失配、v0.9.10→14 实测事故）。
+    // 落 marker 到 data/ 让 server 入口硬拦；壳下次启动（= 已跑新版本）时删。
+    try {
+      const marker = path.join(app.getPath("userData"), "data", "update-pending-restart.json");
+      mkdirSync(path.dirname(marker), { recursive: true });
+      await fs.writeFile(marker, JSON.stringify({ version, at: Date.now() }));
+    } catch (err) {
+      log(`[updater] 写待重启 marker 失败（忽略）${err?.message || err}`);
+    }
 
     log(`[updater] v${version} 已就位、等用户重启`);
     const { response } = await dialog.showMessageBox(mainWindow, {
@@ -829,6 +870,8 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")}`);
+    // 删待重启 marker + 清 updates/ 残留（不阻塞启动、fail-open）
+    void cleanupUpdateLeftovers();
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默
     try {
       await fs.access(path.join(serverDir, "server.js"));

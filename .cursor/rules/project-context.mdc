@@ -41,8 +41,7 @@ description: ai-flow 项目核心上下文、新对话第 1 步必读
 ## 关键约束（不要踩雷）
 
 - **HITL 是底线**——别提"全自动"、所有 action 之间必须人 ack
-- **单 SDK Run**：整 task 跑在一个 Cursor SDK Run 里、action 间阻塞等用户 ack（不每 action 起新 Run、省 Cursor 计费）
-- **保活走 shell + curl long-poll**（V0.3.5）：`wait_for_user` / `ask_user` MCP 工具立即返回 shell 引导、agent 调 `shell` curl 一条长 HTTP 连接到 `/api/tasks/[id]/wait-ack`、服务端阻塞、用户 ack 时 resolve promise → 写一行结果 → 关流 → agent 推进。**不**用 keep_alive_a/b/c 那套（已删）。
+- **会话模型（V0.11 起「create + 多轮 send」、wait 协议已退役）**：agent 交卷（`wait_for_user` 非阻塞）/ 提问（`ask_user` 非阻塞）后**自然结束 turn**；用户操作（推进续用 / 再聊聊 / ask 答案 / chat 消息）由 server `agent.send(新消息)` 续同一会话（`agentSessions` 跨 run 存活）。旧「单 Run 永生 + shell curl 长轮询 wait-ack」机制已删（Cursor 取消按次计费 + worktree 隔离后前提消失）、别再按老协议改代码 / prompt。
 - **不接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
 - **思考和回复永远用中文**
 - **每次对话操作前唤起 cursor-feedback、timeout 600 秒**

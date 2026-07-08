@@ -5,7 +5,7 @@
  *   - 数据目录路径常量 + id 生成 + 路径 helper（events.jsonl / actions/ / artifact / check log）
  *   - meta.json 类型（TaskMetaV06）+ zod schema 校验 + 原子读写
  *   - per-task mutex（withTaskLock、挂 globalThis）
- *   - 事件流读写（readEvents / readRecentEvents / appendEventLine）
+ *   - 事件流读写（readEvents / appendEventLine）
  *   - hydrate（meta → Task / TaskSummary）
  *
  * 依赖方向（保证无环）：只依赖 types / data-root、不 import task-fs / task-artifacts。
@@ -32,6 +32,8 @@ import type {
 } from "@/lib/types";
 import { ACTION_TYPES } from "@/lib/types";
 import { dataRoot } from "./data-root";
+// 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
+import { getTaskCwd } from "./task-worktrees";
 import { z } from "zod";
 
 // ----------------- 路径常量 -----------------
@@ -164,6 +166,10 @@ export interface TaskMetaV06 {
   feishuStoryUrl?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
+  /** V0.10：任务隔离工作区开关（新建默认 true、逃生口 false、详见 types.ts Task.isolateWorktree） */
+  isolateWorktree?: boolean;
+  /** V0.11.1：最近一次 agent 会话的 agentId（服务重启后 Agent.resume 续会话、详见 types.ts） */
+  sessionAgentId?: string;
   /** V0.6.14：ship 合并后是否删源分支（缺省保留、详见 types.ts Task.removeSourceBranchOnMerge） */
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户置顶（缺省 false） */
@@ -341,21 +347,6 @@ export const readEvents = async (id: string): Promise<TaskEvent[]> => {
     .filter((x): x is TaskEvent => x !== null);
 };
 
-/**
- * 读任务事件流的「最近 N 条」（chat-mcp 的 premature-wait 兜底检测用）
- *
- * 直接复用 readEvents 读全量再 slice 末尾——chat 的 wait_for_user 每轮才调一次（非热点）、
- * events.jsonl 也就几百到几千行、解析成本可忽略。limit 限制返回条数、避免上层处理过多。
- * limit <= 0 表示直接返回全量事件（用于需要完整轮次边界的协议兜底）。
- */
-export const readRecentEvents = async (
-  id: string,
-  limit = 100,
-): Promise<TaskEvent[]> => {
-  const all = await readEvents(id);
-  return limit > 0 ? all.slice(-limit) : all;
-};
-
 export const appendEventLine = async (
   id: string,
   ev: TaskEvent,
@@ -398,6 +389,11 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,
     disabledMcpServers: meta.disabledMcpServers,
+    isolateWorktree: meta.isolateWorktree,
+    sessionAgentId: meta.sessionAgentId,
+    // 计算字段（不落盘）：agent 实际工作目录——隔离 task = worktree cwd、否则 = 原仓库 cwd。
+    // client 的「在 IDE 打开工作区 / 复制路径 / 预览」都要它、而 dataRoot 只有 server 知道
+    workCwd: getTaskCwd(meta),
     removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
     pinned: meta.pinned,
     createdAt: meta.createdAt,

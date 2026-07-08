@@ -1,19 +1,16 @@
 /**
  * 公共 API 路由 helper
  *
- * 抽出来的动机：`chat-reply/route.ts` 和 `phase-ack/route.ts` 都各自实现了：
+ * 抽出来的动机：多个 route 各自实现过：
  *   - `errorResponse(msg, status)`
  *   - `isValidModel(m)`
  *   - `images[]` 入参 parse + 单图字段校验 + 累计字节上限校验
- *   - `KEEPALIVE_RACE_RETRY_MS` + `sleep`
  *
- * 三处复制粘贴（V0.5.5 ask-reply 加贴图时本来要变四处）。统一到这里、未来加新
- * route 直接复用、改 image 校验规则也只改一份。
+ * 统一到这里、未来加新 route 直接复用、改 image 校验规则也只改一份。
  *
  * 设计取舍：
  *   - 不抽 chat-reply 独有的 attachments 校验（涉及 fs.stat 异步 + 路径校验、且只一处用）
- *   - 不抽 hasPending 双查（语义跟 keepalive race 强相关、嵌套 if 在 route 里读更清楚）
- *   - 不抽各路由自定义的「images 总数上限」常量（chat 6 / revise 6 / 未来 ask 1）、
+ *   - 不抽各路由自定义的「images 总数上限」常量（chat 6 / revise 6）、
  *     这些是业务参数、由 route 自己定、helper 只校验「不超传入的 max」
  */
 
@@ -173,20 +170,3 @@ export const parseAndValidateImages = (
   return { ok: true, images };
 };
 
-// ----------------- hasPending race 兜底 -----------------
-
-/**
- * hasPending 第一次为 false 时、稍等再查一次的延迟（毫秒）
- *
- * V0.3.5 起保活机制改成 shell + curl long-poll、entry 一旦 registerPendingEntry
- * 就一直在 pendingMap 里（直到 finalizeEntry resolve）。理论上没有 V0.3.5 之前
- * 的「50s timer fire → resolve → 重新调 wait_for_user」中间空窗。
- *
- * 仍保留 retry 作防御：极少数 race 场景下（用户连答两次 / agent 主动顶替旧 wait
- * → grace cleanup 期 + 新 wait_for_user 还没到达）hasPending 可能瞬时 false。
- * 200ms 给的余量足够、命中代价仅 200ms 延迟、保留更稳。
- */
-export const KEEPALIVE_RACE_RETRY_MS = 200;
-
-export const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));

@@ -106,7 +106,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
   // 通用 setter：输入改草稿、blur 落盘——按 field 改对应字段、省得每个字段写一对
   const setRepoField = (
     path: string,
-    field: "onlineBranch" | "testBranch" | "devBranch" | "branchTemplate",
+    field: "onlineBranch" | "testBranch" | "devBranch" | "branchTemplate" | "previewCommand",
     value: string,
   ) => {
     onChange(repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)));
@@ -219,17 +219,29 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                     />
                   </div>
 
-                  {/* 第三行：分支模板覆盖（留空用设置页全局默认） */}
-                  <Input
-                    value={r.branchTemplate ?? ""}
-                    onChange={(e) =>
-                      setRepoField(r.path, "branchTemplate", e.target.value)
-                    }
-                    onBlur={onRepoFieldBlur}
-                    placeholder="分支模板覆盖（留空用全局默认）"
-                    title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
-                    className="font-mono text-xs"
-                  />
+                  {/* 第三行：分支模板覆盖（留空用全局默认）+ 预览启动命令 */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      value={r.branchTemplate ?? ""}
+                      onChange={(e) =>
+                        setRepoField(r.path, "branchTemplate", e.target.value)
+                      }
+                      onBlur={onRepoFieldBlur}
+                      placeholder="分支模板覆盖（留空用全局默认）"
+                      title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
+                      className="font-mono text-xs"
+                    />
+                    <Input
+                      value={r.previewCommand ?? ""}
+                      onChange={(e) =>
+                        setRepoField(r.path, "previewCommand", e.target.value)
+                      }
+                      onBlur={onRepoFieldBlur}
+                      placeholder="预览启动命令（如 npm run dev）"
+                      title="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server"
+                      className="font-mono text-xs"
+                    />
+                  </div>
                 </div>
               );
             })}

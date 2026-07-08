@@ -49,22 +49,27 @@ import {
 import { summarizeRunFailure } from "./sdk-error";
 import { getChatMcpUrl } from "./chat-mcp";
 import {
+  buildAgentMessage,
   cancelPending,
+  getPendingAsk,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
-  submitActionAck,
-  submitNextAction,
-  submitTaskTerminate,
-  unsetChatAwaitingNotifierIf,
-  unsetChatTaskActionHandlerIf,
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-pending";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
 import { ensureStopHookInstalled } from "./stop-hook-inject";
+import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
-import { getEffectiveCwd } from "@/lib/path-utils";
+import {
+  ensureTaskWorktrees,
+  getTaskCwd,
+  getTaskWorkRepoPaths,
+  isWorktreeTask,
+  removeTaskWorktrees,
+  resolveOriginalRepoPath,
+} from "./task-worktrees";
 import { loadSkills, type SkillEntry } from "./skills-loader";
 import {
   filterDisabledMcp,
@@ -73,7 +78,9 @@ import {
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
+import { setTaskSessionAgentId } from "./task-fs";
 import {
+  agentSessions,
   forceClearStaleRunnerState,
   forkPendingTasks,
   publish,
@@ -83,6 +90,7 @@ import {
   writeEventAndPublish,
   truncate,
   stringifyMeta,
+  type AgentSessionRecord,
   type RunningCheck,
 } from "./task-stream";
 import {
@@ -179,11 +187,98 @@ export const supersedePendingAsks = async (
 
 // ----------------- 公开 query API -----------------
 
+// SDK Agent 实例类型（AgentSessionRecord 里存的是结构化最小面、runner 内部用这个收窄）
+type AgentInstance = Awaited<ReturnType<typeof Agent.create>>;
+
+// V0.11.1：续会话 / resume 需要的凭据（ack / ask-reply 路由随 bootArgs 带来、advance 本来就有）
+export interface SessionCreds {
+  apiKey?: string;
+  // resume 后的 send 必须有显式 model（恢复的本地 agent 不保留 model、实测踩过）；
+  // 服务端优先用 task 自己记的模型（最近 action 的 agentModel）、这里是兜底
+  model?: ModelSelection;
+  gitHost?: string;
+  gitToken?: string;
+}
+
+/**
+ * V0.11：关掉某 task 的跨 run agent 会话（agent close + 注销 notifier/handler + 清孤儿进程）。
+ * agentId 传了就只在「当前会话确实是它」时才关（异步收尾路径防误关新会话）、不传 = 关当前的。
+ *
+ * @param opts.keepPersisted true = 保留落盘的 sessionAgentId（空闲回收用——下次操作 Agent.resume
+ *   接回来）；缺省 false = 连持久化锚点一起清（停止 / 终结 / 报错 / 换新 agent 是真结束）
+ * @returns 是否真的关了一个会话
+ */
+const closeTaskSession = (
+  taskId: string,
+  agentId?: string,
+  opts: { reap?: boolean; keepPersisted?: boolean } = {},
+): boolean => {
+  const session = agentSessions.get(taskId);
+  if (!session) {
+    // 内存没会话、但调用方语义是「真结束」→ 持久化锚点也要清（防重启后 resume 回已放弃的会话）
+    if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+    return false;
+  }
+  if (agentId && session.agentId !== agentId) return false;
+  agentSessions.delete(taskId);
+  // 会话是当前的 → 注册表里的 notifier / handler 必属于它、无条件注销安全
+  setChatAwaitingNotifier(taskId, null);
+  setChatTaskActionHandler(taskId, null);
+  try {
+    session.agent.close();
+  } catch {
+    /* noop */
+  }
+  if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+  // 清孤儿进程（要 task.repoPaths、异步读、fire-and-forget）。
+  // 换新 agent（fork）场景传 reap:false——新 agent 马上在同一 worktree 拉 shell、
+  // reap 的 2.5s 二次扫会误杀（V0.6.8 老坑、语义沿用）
+  if (opts.reap !== false) {
+    void getTask(taskId)
+      .then((t) => {
+        if (t) reapTaskOrphans(getTaskWorkRepoPaths(t));
+      })
+      .catch(() => {});
+  }
+  return true;
+};
+
+// ----------------- V0.11.1：会话空闲回收（省内存 / 进程数、resume 兜恢复） -----------------
+//
+// 每个未终结任务的 agent 子进程会随会话常驻；空闲超 TTL 自动 close（keepPersisted——
+// sessionAgentId 还在、用户下次操作 Agent.resume 无缝接回、体感无差）。
+const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const SESSION_SWEEPER_KEY = "__feAiFlowSessionSweeperV1__";
+{
+  const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
+  if (!g[SESSION_SWEEPER_KEY]) {
+    g[SESSION_SWEEPER_KEY] = setInterval(() => {
+      const now = Date.now();
+      for (const [taskId, s] of agentSessions) {
+        if (runningTasks.has(taskId)) continue; // run 在跑不算空闲
+        if (now - s.lastActiveAt > SESSION_IDLE_TTL_MS) {
+          console.log(
+            `[task-runner] 会话空闲回收 task=${taskId} agentId=${s.agentId}（闲置 ${Math.round((now - s.lastActiveAt) / 60000)} 分钟、可 resume 接回）`,
+          );
+          closeTaskSession(taskId, s.agentId, { reap: false, keepPersisted: true });
+        }
+      }
+    }, SESSION_SWEEP_INTERVAL_MS);
+    // 不阻止进程退出
+    g[SESSION_SWEEPER_KEY]?.unref?.();
+  }
+}
+
+/**
+ * 停止 task：取消活 run（如有）+ 关会话。
+ * @returns 是否有活的 run / 会话被停掉
+ */
 export const cancelTaskRun = (taskId: string): boolean => {
   const rec = runningTasks.get(taskId);
-  if (!rec) return false;
-  rec.cancel();
-  return true;
+  if (rec) rec.cancel();
+  const closed = closeTaskSession(taskId);
+  return !!rec || closed;
 };
 
 /**
@@ -496,6 +591,9 @@ const advanceTaskInner = async (
   // task 用 let：去掉「通过」后、推进开头会隐式认可当前 awaiting_ack action、之后重读最新 task 供准入 / appendAction 用
   let task = input.task;
 
+  // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
+  await assertNoUpdatePendingRestart();
+
   // 自定义 action：提前读定义（拿 freshAgent 默认 + label 快照）。读不到不致命——
   //   loadActionPrompt 会兜底提示、appendAction 的 customLabel 留空。
   const customDef =
@@ -519,6 +617,38 @@ const advanceTaskInner = async (
     if (refreshed) task = refreshed;
   }
 
+  // V0.10：隔离工作区 task → 推进前确定性建 / 复用 worktree（幂等、已存在秒过）。
+  //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
+  //   创建失败直接抛（带处置建议）、不带病起 agent。
+  if (isWorktreeTask(task)) {
+    const ensured = await ensureTaskWorktrees(task, username);
+    // 仅新仓 upsert gitBranches（老条目保留 createdAt / baseBranch 历史值、跟 build hint 老规则一致）
+    const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
+    for (const info of ensured.infos) {
+      if (!existingRepos.has(info.repoPath)) {
+        await upsertGitBranch(task.id, info);
+      }
+    }
+    const cloneNote =
+      ensured.clonedNodeModulesRepos.length > 0
+        ? `node_modules 已从原仓库秒级克隆（${ensured.clonedNodeModulesRepos
+            .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+            .join("、")}）、不需要重新下载`
+        : "";
+    if (ensured.createdRepos.length > 0) {
+      await writeEventAndPublish(task.id, {
+        kind: "info",
+        text: `已创建任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
+          .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+          .join("、")}${cloneNote ? `；${cloneNote}` : ""}`,
+      });
+    } else if (cloneNote) {
+      // 复用已有 worktree 时补克隆（老 worktree 建于克隆功能上线前）也要让用户知道
+      await writeEventAndPublish(task.id, { kind: "info", text: cloneNote });
+    }
+    task = (await getTask(task.id)) ?? task;
+  }
+
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
@@ -532,33 +662,25 @@ const advanceTaskInner = async (
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
   //   「认可后」状态（当前 action 已 completed）、原准入逻辑一行不用动。
-  const existingRecord = runningTasks.get(task.id);
+  // V0.11：approve 纯服务端落状态（agent 不需要收信号）、续接 / force-new 同一条路径。
   const pendingAck = task.actions.find(
     (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
   );
   if (pendingAck) {
-    if (existingRecord && !effectiveForceNewAgent) {
-      // 续接：acknowledgeAction 发 [ACTION_ACK approve] 让旧 agent 转待命 + 标 completed + 写事件。
-      //   下方 submitNextAction 若早于 agent 进待命、pendingNextActions 兜时序（V0.6.19）。
-      await acknowledgeAction(task.id, pendingAck.id, "approve");
-    } else {
-      // force-new / 无活 agent：旧 agent 下面反正要 cancel、不发信号（发了会因 agent 将死 throw）、
-      //   只标 completed + 写审计事件——否则 force-new 路径的 finalizeStaleActions 会把它误标 cancelled。
-      const patched = await patchAction(task.id, pendingAck.id, {
-        status: "completed",
-      });
-      if (patched) {
-        publish(task.id, { kind: "task", task: patched });
-        const a = patched.actions.find((x) => x.id === pendingAck.id);
-        if (a) publish(task.id, { kind: "action", action: a });
-      }
-      await writeEventAndPublish(task.id, {
-        kind: "action_ack",
-        actionId: pendingAck.id,
-        text: `Action ${pendingAck.type} n=${pendingAck.n} 已通过（推进时自动认可）`,
-        meta: { decision: "approve" },
-      });
+    const patched = await patchAction(task.id, pendingAck.id, {
+      status: "completed",
+    });
+    if (patched) {
+      publish(task.id, { kind: "task", task: patched });
+      const a = patched.actions.find((x) => x.id === pendingAck.id);
+      if (a) publish(task.id, { kind: "action", action: a });
     }
+    await writeEventAndPublish(task.id, {
+      kind: "action_ack",
+      actionId: pendingAck.id,
+      text: `Action ${pendingAck.type} n=${pendingAck.n} 已通过（推进时自动认可）`,
+      meta: { decision: "approve" },
+    });
     // 认可改了当前 action 状态 → 重读最新 task、后续准入 / appendAction / 路由都用它
     task = (await getTask(task.id)) ?? task;
   }
@@ -608,8 +730,10 @@ const advanceTaskInner = async (
   });
 
   // 3) branch checkout 挂接（仅 build action、V0.6.1 每次都 inject 多仓 idempotent hint）
+  //    V0.10：隔离工作区 task 不注入——分支已由 runner 在 worktree 里确定性检出、
+  //    agent 不需要（也不该）自己 checkout
   let branchCheckoutHint: string | undefined;
-  if (actionType === "build") {
+  if (actionType === "build" && !isWorktreeTask(taskAfterAppend)) {
     const planned = planBranchesForBuild(taskAfterAppend, username);
     if (planned) {
       // 仅新仓 upsert（已存在的保留 createdAt / baseBranch 历史值、不覆盖）
@@ -638,69 +762,62 @@ const advanceTaskInner = async (
   // buildPlanReplanDirective 内部自己判 plan + replanMode、非 plan / 无 replanMode 返 undefined
   const replanDirective = buildPlanReplanDirective(action, taskAfterAppend);
 
-  // 4) 决定路由（existingRecord 已在开头隐式认可段提前取）
-  if (existingRecord && !effectiveForceNewAgent) {
-    // V0.6.6 热更：agent 长生期间用户可能在详情页改了 role / title / feishuStoryUrl
+  // 4) 决定路由（V0.11：续接 = 对存活会话 agent.send [NEXT_ACTION]、没会话 / force-new = 起新 agent；
+  //    V0.11.1：内存会话丢了但有落盘锚点 → sendToTaskSession 内部 Agent.resume 接回）
+  const existingSession = agentSessions.get(task.id);
+  const activeRun = runningTasks.get(task.id);
+  if (
+    (existingSession || task.sessionAgentId) &&
+    !activeRun &&
+    !effectiveForceNewAgent
+  ) {
+    // V0.6.6 热更：agent 会话期间用户可能在详情页改了 role / title / feishuStoryUrl
     // diff 启动快照、有变才拼一段 [TASK_UPDATED] 注入；注入后把快照推进到当前值、避免下次重复告知同一变更
-    const taskUpdateHint = buildTaskUpdateHint(
-      taskAfterAppend,
-      existingRecord.startSnapshot,
-    );
-    existingRecord.startSnapshot = captureTaskFieldsSnapshot(taskAfterAppend);
+    //（resume 场景没有旧快照可 diff、跳过 hint——resume 后的快照即当前值）
+    const taskUpdateHint = existingSession
+      ? buildTaskUpdateHint(taskAfterAppend, existingSession.startSnapshot)
+      : undefined;
+    if (existingSession) {
+      existingSession.startSnapshot = captureTaskFieldsSnapshot(taskAfterAppend);
+    }
     // V0.6.27：续接载荷附本 action 的完整 playbook——super prompt 只注入了启动时那个
     // action 的指令、续接的新 action（哪怕同类型）以载荷这份为准
     const actionPlaybook = await loadActionPrompt(action, taskAfterAppend);
-    // agent 在「待命态」（等下一 action 指令）、submitNextAction 直接续接
-    const ok = submitNextAction(
-      task.id,
-      {
-        actionId: action.id,
-        type: action.type,
-        n: action.n,
-        artifactPath: action.artifactPath ?? "",
-      },
-      buildNextActionDirective({
-        action,
-        userInstruction,
-        attachedImagePaths,
-        attachedFilePaths,
-        branchCheckoutHint,
-        taskUpdateHint,
-        batchDirective,
-        replanDirective,
-        actionPlaybook,
+    const ok = await sendToTaskSession(
+      taskAfterAppend,
+      buildAgentMessage({
+        kind: "next_action",
+        text: buildNextActionDirective({
+          action,
+          userInstruction,
+          attachedImagePaths,
+          attachedFilePaths,
+          branchCheckoutHint,
+          taskUpdateHint,
+          batchDirective,
+          replanDirective,
+          actionPlaybook,
+        }),
+        nextActionId: action.id,
+        nextActionType: action.type,
+        nextN: action.n,
+        nextArtifactPath: action.artifactPath ?? "",
+        imagePaths: attachedImagePaths,
+        attachmentPaths: attachedFilePaths,
       }),
-      attachedImagePaths,
-      attachedFilePaths,
+      { errorActionId: action.id, creds: { apiKey, gitHost, gitToken } },
     );
-    if (!ok) {
-      // race：runningTasks entry 存在但 chat-mcp pendingMap 没（agent 已死、entry 还没清）
-      // 走「force new agent」分支补救
-      console.warn(
-        `[task-runner] advanceTask: task=${task.id} runningTasks 有 entry 但 submitNextAction 失败、降级 force-new-agent`,
-      );
-      await internalStartAgent({
-        task: taskAfterAppend,
-        action,
-        userInstruction,
-        attachedImagePaths,
-        attachedFilePaths,
-        branchCheckoutHint,
-        apiKey,
-        model,
-        gitHost,
-        gitToken,
-        batchDirective,
-        replanDirective,
-      });
-    }
-    return { action };
+    if (ok) return { action };
+    // 会话失效（send 抛错已被 close）→ 降级 force-new
+    console.warn(
+      `[task-runner] advanceTask: task=${task.id} 会话续接失败、降级 force-new-agent`,
+    );
   }
 
-  // 5) 没活 agent / forceNewAgent：起新 Run
-  if (existingRecord && effectiveForceNewAgent) {
+  // 5) 没会话 / forceNewAgent / 续接失败：起新 agent
+  if (activeRun) {
     forkPendingTasks.add(task.id);
-    existingRecord.cancel();
+    activeRun.cancel();
     const stopped = await waitForTaskToStop(task.id, 5000);
     if (!stopped) {
       console.warn(
@@ -711,9 +828,12 @@ const advanceTaskInner = async (
     // 收尾被新 agent 取代的旧非终态 action（排除本次刚 appendAction 的新 action、否则误伤）
     await finalizeStaleActions(task.id, "cancelled", action.id);
   }
+  // 旧会话（如有）关掉：新 agent 马上在同一 worktree 起 shell、不 reap（V0.6.8 误杀坑）
+  closeTaskSession(task.id, undefined, { reap: false });
   // 起新 agent 跑新 action 前、作废上一个 agent 没答完的孤儿 ask（同 restartCurrentAction：不清掉
   // 前端会弹失效的旧问题弹窗、用户答了必报错；严重时还把 runStatus 打回 error 死循环）。
   // 推进是「开新 action」语义、不续传旧问题（用户主动换方向 = 放弃旧断点）、只清孤儿、忽略返回值。
+  cancelPending(task.id);
   await supersedePendingAsks(task.id, "推进新 action");
   await internalStartAgent({
     task: taskAfterAppend,
@@ -741,6 +861,8 @@ export const restartCurrentAction = async (
 const restartCurrentActionInner = async (
   input: RestartCurrentActionInput,
 ): Promise<{ action: ActionRecord }> => {
+  // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
+  await assertNoUpdatePendingRestart();
   // V0.8.18：重启当前 action 前、取消它可能还在后台跑的旧 check（要重跑、且防旧结果污染新一轮）
   abortRunningCheck(input.task.id);
   const fresh = await getTask(input.task.id);
@@ -779,8 +901,11 @@ const restartCurrentActionInner = async (
       forceClearStaleRunnerState(fresh.id);
     }
   }
+  // V0.11：重启 = 换新 agent、旧会话关掉（新 agent 马上起、不在 close 里 reap——下一行显式扫）
+  closeTaskSession(fresh.id, undefined, { reap: false });
   cancelPending(fresh.id);
-  reapTaskOrphans(fresh.repoPaths);
+  // V0.10：孤儿进程扫的是 agent 实际工作目录（隔离 task = worktree 路径）
+  reapTaskOrphans(getTaskWorkRepoPaths(fresh));
 
   // 作废旧 agent 那条还没答完的 ask（断线后它的 token 已失效、不清掉前端会反复弹失效旧弹窗、
   // 用户答了必 410 把 runStatus 打回 error、形成多弹窗并发 + 死循环）。
@@ -807,8 +932,22 @@ const restartCurrentActionInner = async (
     meta: { restartedActionId: action.id, actionType: action.type, n: action.n },
   });
 
+  // V0.10：隔离工作区 task → 重启前同样确保 worktree 在（可能被手删过）、失败抛错不带病重启
+  if (isWorktreeTask(startTask)) {
+    const ensured = await ensureTaskWorktrees(startTask, input.username);
+    const existingRepos = new Set(
+      (startTask.gitBranches ?? []).map((b) => b.repoPath),
+    );
+    for (const info of ensured.infos) {
+      if (!existingRepos.has(info.repoPath)) {
+        await upsertGitBranch(fresh.id, info);
+      }
+    }
+    startTask = (await getTask(fresh.id)) ?? startTask;
+  }
+
   let branchCheckoutHint: string | undefined;
-  if (action.type === "build") {
+  if (action.type === "build" && !isWorktreeTask(startTask)) {
     const planned = planBranchesForBuild(startTask, input.username);
     if (planned) {
       const existingRepos = new Set(
@@ -881,12 +1020,11 @@ const restartCurrentActionInner = async (
 };
 
 /**
- * V0.6 ack：approve / revise 当前 action
+ * V0.6 ack：approve / revise 当前 action（V0.11 改 send 送达）
  *
- * - approve：write [ACTION_ACK approve] → agent 接着调 wait_for_user(待命态) 等下一 action
- *   后端 patch action.status=awaiting_ack（之前是 running）→ completed（approve 时）
- * - revise：先 snapshotActionArtifact 旧版本、再 write [ACTION_ACK revise] + feedback
- *   action.status 保持 running（agent 接着改）
+ * - approve：纯服务端落状态（action → completed）、agent 不需要收信号
+ * - revise：先 snapshotActionArtifact 旧版本、再 `agent.send([ACTION_ACK revise] + feedback)`
+ *   续同一会话让 agent 处理；没有可续接的会话（已退出 / 服务重启）→ 抛错让用户重启 / 推进
  */
 export const acknowledgeAction = async (
   taskId: string,
@@ -894,6 +1032,8 @@ export const acknowledgeAction = async (
   decision: "approve" | "revise",
   feedback?: string,
   imagePaths?: string[],
+  // V0.11.1：revise 送达要会话；服务重启后靠 creds（客户端 bootArgs 带来）Agent.resume 接回
+  creds?: SessionCreds,
 ): Promise<void> => {
   const task = await getTask(taskId);
   if (!task) {
@@ -903,9 +1043,8 @@ export const acknowledgeAction = async (
   if (!action) {
     throw new Error(`action ${actionId} 不存在`);
   }
-  // P0-1：只有「agent 正在等 ack」（awaiting_ack）的 action 才能 ack。
-  //   running（ask_user 进行中 / revise 后还在改）/ completed / cancelled 一律拒——
-  //   配合 chat-mcp submitActionAck 的 pending.actionId 绑定校验、双层堵住「ack 错对象」。
+  // P0-1：只有「在等 ack」（awaiting_ack）的 action 才能 ack。
+  //   running（ask_user 进行中 / revise 后还在改）/ completed / cancelled 一律拒。
   if (action.status !== "awaiting_ack") {
     throw new Error(
       `action ${actionId} 当前状态 ${action.status}、不是在等 ack（awaiting_ack）、无法 ack`,
@@ -921,11 +1060,22 @@ export const acknowledgeAction = async (
     });
   }
 
-  const res = submitActionAck(taskId, actionId, decision, feedback, imagePaths);
-  if (!res.ok) {
-    throw new Error(
-      `${res.reason}（agent 可能已推进 / 已退出、刷新后重试、或点「推进」起新 agent）`,
+  if (decision === "revise") {
+    const ok = await sendToTaskSession(
+      task,
+      buildAgentMessage({
+        kind: "action_revise",
+        text: feedback ?? "",
+        feedback,
+        imagePaths,
+      }),
+      { errorActionId: actionId, creds },
     );
+    if (!ok) {
+      throw new Error(
+        "没有可续接的 agent 会话（会话已失效 / 正在跑）——点「重启当前阶段」或「推进」起新 agent 处理这条意见",
+      );
+    }
   }
 
   // V0.6：approve 时 action 标 completed；revise 时 agent 已重新开跑，同步把 task.runStatus 拉回 running。
@@ -969,22 +1119,14 @@ export const finalizeTask = async (
     throw new Error("task 不存在、无法 finalize");
   }
 
-  // 让 agent 拿到终态信号、自然退出 Run
-  const kind = finalStatus === "merged" ? "done" : "abandoned";
-  const ok = submitTaskTerminate(taskId, kind, reason);
-  if (!ok) {
-    // 信号发不出去 = agent 不在 wait 挂起。两种情况：
-    //   a) agent 已退出 → runningTasks 无 entry、什么都不用做
-    //   b) agent 正在跑（如 build 中途）→ 不硬停的话它会继续改代码、之后挂在
-    //      wait_for_user 上没人再发终态信号、长挂到超时——而 task 在 UI 已显示终态。
-    //      finalize 语义就是「关掉这个 task」、直接 cancel 掉 SDK Run。
-    const hadLiveRun = cancelTaskRun(taskId);
-    console.log(
-      `[task-runner] finalizeTask: task=${taskId} 没活 pending、${
-        hadLiveRun ? "硬停了运行中的 agent" : "agent 已退出"
-      }、patch repoStatus=${finalStatus}`,
-    );
-  }
+  // V0.11：不再向 agent 发终态信号——finalize 语义就是「关掉这个 task」：
+  // 有活 run 直接 cancel、跨 run 会话一并关掉（cancelTaskRun 内部处理）
+  const hadLive = cancelTaskRun(taskId);
+  console.log(
+    `[task-runner] finalizeTask: task=${taskId} ${
+      hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
+    }、patch repoStatus=${finalStatus}`,
+  );
 
   // V0.x：merged（已合入）时、当前还在等 ack 的 action 标 completed——用户认可了产物才去合 MR、
   //   不该记成 cancelled（abandoned 维持下面的 cancelled：没认可就放弃）。
@@ -1005,6 +1147,28 @@ export const finalizeTask = async (
   const patched = await setTaskRepoStatus(taskId, finalStatus);
   if (patched) publish(taskId, { kind: "task", task: patched });
   await setTaskRunStatus(taskId, "idle", null);
+
+  // V0.10：终结即清隔离工作区（feature 分支保留在原仓库、随时可 reopen 重建 worktree 续推；
+  // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
+  // best-effort：失败只 log、boot 孤儿扫描兜底。
+  if (isWorktreeTask(task)) {
+    const removed = await removeTaskWorktrees(task).catch((err) => {
+      console.warn(`[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`, err);
+      return null;
+    });
+    if (removed?.removedAny) {
+      const snapshotNote =
+        removed.snapshotRepos.length > 0
+          ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos
+              .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+              .join("、")}）`
+          : "";
+      await writeEventAndPublish(taskId, {
+        kind: "info",
+        text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}）`,
+      });
+    }
+  }
 
   await writeEventAndPublish(taskId, {
     kind: "info",
@@ -1056,78 +1220,17 @@ interface StartAgentInput {
   replanDirective?: string;
 }
 
-const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
-  const {
-    task,
-    action,
-    userInstruction,
-    attachedImagePaths,
-    attachedFilePaths,
-    branchCheckoutHint,
-    apiKey,
-    model,
-    gitHost,
-    gitToken,
-    batchDirective,
-    replanDirective,
-  } = input;
-
-  // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
-  if (runningTasks.has(task.id)) {
-    console.warn(
-      `[task-runner] internalStartAgent: task=${task.id} 已有 running entry、跳过（幂等）`,
-    );
-    return;
-  }
-
-  // 1) merge MCP：全局 cursor mcp（按 task 黑名单过滤）+ chat-tool（我们的 wait_for_user / ask_user）
-  //    全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、
-  //    per-task 用 task.disabledMcpServers 精简、详见 cursor-config.ts
-  // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
-  // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
-  const enrichedMcp = await enrichMcpServersWithOAuth(
-    filterDisabledMcp(
-      await readGlobalCursorMcpServers(),
-      task.disabledMcpServers,
-    ),
-  );
-  // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
-  const { servers: cursorMcp, dropped: droppedMcp } =
-    await filterHealthyMcp(enrichedMcp);
-  const mergedMcp: Record<string, McpServerConfig> = {
-    ...cursorMcp,
-    [TASK_TOOL_MCP_NAME]: {
-      type: "http",
-      url: getChatMcpUrl(),
-    },
-  };
-  const cursorMcpNames = Object.keys(cursorMcp).filter(
-    (n) => n !== TASK_TOOL_MCP_NAME,
-  );
-  const mcpDesc = `Task MCP: ${TASK_TOOL_MCP_NAME}${
-    cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
-  }`;
-
-  await writeEventAndPublish(task.id, {
-    kind: "info",
-    actionId: action.id,
-    text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
-  });
-
-  // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
-  if (droppedMcp.length > 0) {
-    await writeEventAndPublish(task.id, {
-      kind: "info",
-      actionId: action.id,
-      text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
-        .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
-        .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
-    });
-  }
-
-  // 2) 注册 task-scoped action handler（V0.6.1 submit_mr / set_feishu_testers）
-  // 闭包里持 gitHost / gitToken 快照——task 运行期间不可变、要换 token 需 force-new-agent
-  // 具名化：finally 注销走 conditional unset（只清自己这个实例、防 force-new-agent race 误清新 handler）
+// ----------------- V0.11.1：会话桥工厂（handler + notifier、create / resume 共用） -----------------
+//
+// taskActionHandler（submit_mr / set_feishu_testers / set_plan_batches 同步 RPC）+
+// awaitingNotifier（交卷跑后置 check / ask 弹窗事件 / 切 awaiting）原来是 internalStartAgent
+// 的内联闭包；V0.11.1 抽出来：Agent.resume 恢复会话时也必须重注册这两座桥、否则恢复后的
+// agent 调 submit_mr / wait_for_user 全部落空。闭包持 gitHost / gitToken 快照（会话期不可变）。
+const registerSessionBridges = (
+  task: Task,
+  opts: { gitHost?: string; gitToken?: string } = {},
+): void => {
+  const { gitHost, gitToken } = opts;
   const taskActionHandler: ChatTaskActionHandler = async (taskAction) => {
     if (taskAction.kind === "submit_mr") {
       if (!gitHost || !gitToken) {
@@ -1143,22 +1246,29 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       if (!fresh) {
         return { ok: false, error: "task 不存在、无法校验 submit_mr" };
       }
-      const valid = await validateSubmitMr(fresh, taskAction);
+      // V0.10：隔离 task 的 agent 在 worktree 里 `pwd`、上报的是 worktree 路径——
+      // 归一回原仓库路径再校验 / 落库（task.repoPaths / gitBranches / MR 记录全按原路径记）。
+      // 用新 const（不是重赋值参数）：参数一旦被赋值、TS 在下面的闭包里会丢 narrowing。
+      const mr = {
+        ...taskAction,
+        repoPath: resolveOriginalRepoPath(fresh, taskAction.repoPath),
+      };
+      const valid = await validateSubmitMr(fresh, mr);
       if (!valid.ok) {
         await writeEventAndPublish(task.id, {
           kind: "error",
-          actionId: taskAction.actionId,
-          text: `提测被拦截（${taskAction.repoPath}）：${valid.error}`,
+          actionId: mr.actionId,
+          text: `提测被拦截（${mr.repoPath}）：${valid.error}`,
           meta: {
-            repoPath: taskAction.repoPath,
-            projectPath: taskAction.projectPath,
+            repoPath: mr.repoPath,
+            projectPath: mr.projectPath,
           },
         });
         return { ok: false, error: valid.error };
       }
 
       // V0.x：submit_mr 共用 ship / dev / custom（dev = 联调提 PR→dev 分支、custom = 自定义 action、target 由 playbook 决定）、下面按 action 类型分流。
-      const submitAction = fresh.actions.find((x) => x.id === taskAction.actionId);
+      const submitAction = fresh.actions.find((x) => x.id === mr.actionId);
       const isDevSubmit = submitAction?.type === "dev";
       // custom（任意自定义 action）提的 MR 跟 dev 一样源 feature 绝不删（MR 还没合、feature 还要继续用）
       const isCustomSubmit = submitAction?.type === "custom";
@@ -1168,15 +1278,15 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // V0.x：按 (repoPath, 目标分支) 找——提测 MR（→test）和联调 MR（→dev）各找各的、互不误关。
       const prevMrBranch = fresh.mrs?.find(
         (m) =>
-          m.repoPath === taskAction.repoPath &&
-          mrTargetBranchOf(m, fresh.repoTestBranches) === taskAction.targetBranch,
+          m.repoPath === mr.repoPath &&
+          mrTargetBranchOf(m, fresh.repoTestBranches) === mr.targetBranch,
       )?.branch;
 
       // V0.6.14：合并后是否删源分支——读 task 配置（缺省保留、用户拍板）。
       // - `<feature>__conflict` 一次性解冲突分支：必删（不留垃圾、不受开关影响）。
       // - dev（联调）/ custom（任意自定义 action 提的 MR）：feature 源分支绝不删（合入后还要继续开发 / 提测、删了就没分支了）。
       // - ship（提测）：按 task 配置 removeSourceBranchOnMerge（缺省保留）。
-      const isConflictBranch = taskAction.sourceBranch.endsWith("__conflict");
+      const isConflictBranch = mr.sourceBranch.endsWith("__conflict");
       const removeSourceBranch = isConflictBranch
         ? true
         : isDevSubmit || isCustomSubmit
@@ -1185,42 +1295,42 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
       const result = await createMR({
         config: { host: gitHost, token: gitToken },
-        projectPath: taskAction.projectPath,
-        sourceBranch: taskAction.sourceBranch,
-        targetBranch: taskAction.targetBranch,
-        title: taskAction.title,
-        description: taskAction.description,
+        projectPath: mr.projectPath,
+        sourceBranch: mr.sourceBranch,
+        targetBranch: mr.targetBranch,
+        title: mr.title,
+        description: mr.description,
         removeSourceBranch,
       });
       if (!result.ok) {
         await writeEventAndPublish(task.id, {
           kind: "error",
-          actionId: taskAction.actionId,
-          text: `提 MR 失败（${taskAction.repoPath}）：${result.error}`,
-          meta: { repoPath: taskAction.repoPath, projectPath: taskAction.projectPath },
+          actionId: mr.actionId,
+          text: `提 MR 失败（${mr.repoPath}）：${result.error}`,
+          meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
         });
         return { ok: false, error: result.error };
       }
 
       // 新 MR 建好后、若 source 分支跟上一次不同（= 走了 __conflict 智能解冲突流程）、
       // 把被取代的旧 `<旧分支>→test` MR 关掉。失败只记日志、不阻塞 ship（新 MR 已建好、旧的留着也只是脏）。
-      if (prevMrBranch && prevMrBranch !== taskAction.sourceBranch) {
+      if (prevMrBranch && prevMrBranch !== mr.sourceBranch) {
         const closed = await closeOpenMR({
           config: { host: gitHost, token: gitToken },
-          projectPath: taskAction.projectPath,
+          projectPath: mr.projectPath,
           sourceBranch: prevMrBranch,
-          targetBranch: taskAction.targetBranch,
+          targetBranch: mr.targetBranch,
         });
         if (!closed.ok) {
           console.warn(
-            `[task-runner] 关旧 MR 失败（${taskAction.projectPath} ${prevMrBranch}→${taskAction.targetBranch}）：${closed.error}`,
+            `[task-runner] 关旧 MR 失败（${mr.projectPath} ${prevMrBranch}→${mr.targetBranch}）：${closed.error}`,
           );
         } else if (closed.closed) {
           await writeEventAndPublish(task.id, {
             kind: "info",
-            actionId: taskAction.actionId,
-            text: `已关闭被取代的旧 MR（${prevMrBranch} → ${taskAction.targetBranch}、冲突废弃）`,
-            meta: { repoPath: taskAction.repoPath, projectPath: taskAction.projectPath },
+            actionId: mr.actionId,
+            text: `已关闭被取代的旧 MR（${prevMrBranch} → ${mr.targetBranch}、冲突废弃）`,
+            meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
           });
         }
       }
@@ -1230,7 +1340,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       // 且 GitLab 异步算 mergeability、刚建完可能还在 checking、getMRMergeStatus 内部 poll 到稳定
       const mergeStatus = await getMRMergeStatus({
         config: { host: gitHost, token: gitToken },
-        projectPath: taskAction.projectPath,
+        projectPath: mr.projectPath,
         iid: result.iid,
       });
       // poll 失败 / 超时未定时、保守按「无冲突」处理（不误拦 ship、detailed 记 unknown 供审计）
@@ -1239,14 +1349,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const mergeUndetermined = mergeStatus.ok ? mergeStatus.undetermined : true;
 
       // upsert task.mrs[]（按 repoPath+目标分支、同仓同目标多次提交累计 version++）
-      const upserted = await upsertMR(task.id, taskAction.repoPath, {
-        targetBranch: taskAction.targetBranch,
+      const upserted = await upsertMR(task.id, mr.repoPath, {
+        targetBranch: mr.targetBranch,
         url: result.url,
-        title: taskAction.title,
-        branch: taskAction.sourceBranch,
+        title: mr.title,
+        branch: mr.sourceBranch,
         status: "open",
-        createdByActionId: taskAction.actionId,
-        lastCommitHash: taskAction.lastCommitHash,
+        createdByActionId: mr.actionId,
+        lastCommitHash: mr.lastCommitHash,
         hasConflicts,
         mergeStatus: detailedStatus,
       });
@@ -1257,18 +1367,18 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
       // 把本次 MR 原子追加到 action.sideEffects.mrs[]（多仓 task 一次 ship 可能落 N 条）
       // 走 task-fs 原子函数（withTaskLock 包 read-modify-write）、不在这里 getTask→patchAction 两段非原子
-      const patched = await appendActionSideEffectMR(task.id, taskAction.actionId, {
-        repoPath: taskAction.repoPath,
-        targetBranch: taskAction.targetBranch,
+      const patched = await appendActionSideEffectMR(task.id, mr.actionId, {
+        repoPath: mr.repoPath,
+        targetBranch: mr.targetBranch,
         mrUrl: result.url,
         mrVersion,
-        branch: taskAction.sourceBranch,
-        commitHash: taskAction.lastCommitHash,
+        branch: mr.sourceBranch,
+        commitHash: mr.lastCommitHash,
         hasConflicts,
       });
       if (patched) {
         publish(task.id, { kind: "task", task: patched });
-        const a = patched.actions.find((x) => x.id === taskAction.actionId);
+        const a = patched.actions.find((x) => x.id === mr.actionId);
         if (a) publish(task.id, { kind: "action", action: a });
       }
 
@@ -1277,11 +1387,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       if (hasConflicts) {
         await writeEventAndPublish(task.id, {
           kind: "error",
-          actionId: taskAction.actionId,
-          text: `MR 已${mrVerb}、但跟 ${taskAction.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
+          actionId: mr.actionId,
+          text: `MR 已${mrVerb}、但跟 ${mr.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
           meta: {
-            repoPath: taskAction.repoPath,
-            projectPath: taskAction.projectPath,
+            repoPath: mr.repoPath,
+            projectPath: mr.projectPath,
             mrUrl: result.url,
             mrIid: result.iid,
             mrVersion,
@@ -1291,11 +1401,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       } else {
         await writeEventAndPublish(task.id, {
           kind: "info",
-          actionId: taskAction.actionId,
+          actionId: mr.actionId,
           text: `MR 已${mrVerb}：${result.url}`,
           meta: {
-            repoPath: taskAction.repoPath,
-            projectPath: taskAction.projectPath,
+            repoPath: mr.repoPath,
+            projectPath: mr.projectPath,
             mrUrl: result.url,
             mrIid: result.iid,
             mrVersion,
@@ -1409,20 +1519,69 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     }
   };
   setChatAwaitingNotifier(task.id, awaitingNotifier);
+};
 
-  // 4) 启动 Agent + 消息循环（在独立 Promise 里跑、advanceTask 立即返回）
-  let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
-  let cancelled = false;
-  // V0.6.8：标记本次结束是「换新 agent」（force-new-agent）——是的话 finally 不清孤儿进程、
-  // 否则会误杀新 agent 刚在同仓拉起的 shell（带同样签名、cwd 也在 repoPaths）
-  let isForkRestart = false;
-  let hardTimer: NodeJS.Timeout | null = null;
+const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
+  const {
+    task,
+    action,
+    userInstruction,
+    attachedImagePaths,
+    attachedFilePaths,
+    branchCheckoutHint,
+    apiKey,
+    model,
+    gitHost,
+    gitToken,
+    batchDirective,
+    replanDirective,
+  } = input;
 
-  // fire-and-forget：advanceTask 立即返回、外部 waitForTaskToStop 靠 poll runningTasks.has 收敛、不依赖此 promise
+  // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
+  if (runningTasks.has(task.id)) {
+    console.warn(
+      `[task-runner] internalStartAgent: task=${task.id} 已有 running entry、跳过（幂等）`,
+    );
+    return;
+  }
+
+  // 1) merge MCP（V0.11.1 抽成共用 helper、resume 会话时也要重传 inline MCP）
+  const { mergedMcp, cursorMcpNames, droppedMcp } =
+    await buildMergedMcpForTask(task);
+  const mcpDesc = `Task MCP: ${TASK_TOOL_MCP_NAME}${
+    cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
+  }`;
+
+  await writeEventAndPublish(task.id, {
+    kind: "info",
+    actionId: action.id,
+    text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
+  });
+
+  // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
+  if (droppedMcp.length > 0) {
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      actionId: action.id,
+      text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
+        .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
+        .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
+    });
+  }
+
+  // 2) 注册 task-scoped action handler + awaiting notifier（V0.11.1 抽成共用工厂、
+  //    resume 会话时也要重注册——见 registerSessionBridges）
+  registerSessionBridges(task, { gitHost, gitToken });
+
+
+  // 4) 启动 Agent + 首个 run（在独立 Promise 里跑、advanceTask 立即返回）
+  // fire-and-forget：外部 waitForTaskToStop 靠 poll runningTasks.has 收敛、不依赖此 promise
   void (async () => {
+    let agent: AgentInstance | null = null;
     try {
       // V0.6.3：起 agent 前给业务仓库装 stop hook（保证 agent 交卷后才放行结束 Run、失败不阻断启动）
-      const effectiveCwd = getEffectiveCwd(task.repoPaths);
+      // V0.10：隔离 task 的 cwd = worktree（advance / restart 已提前 ensureTaskWorktrees）
+      const effectiveCwd = getTaskCwd(task);
       await ensureStopHookInstalled(effectiveCwd);
 
       agent = await Agent.create({
@@ -1437,6 +1596,17 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       console.log(
         `[task-runner] task=${task.id} Agent.create OK agentId=${agent.agentId}`,
       );
+
+      // V0.11：注册跨 run 会话——run 自然结束后 agent 不关、用户下一步操作 send 续接。
+      // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 无缝接回
+      agentSessions.set(task.id, {
+        agent,
+        agentId: agent.agentId,
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+        startSnapshot: captureTaskFieldsSnapshot(task),
+      });
+      void setTaskSessionAgentId(task.id, agent.agentId);
 
       // 加载平台自带 skills（repo + 全局 skills 由 settingSources 交给 SDK 加载、不在此读、避免重复进 prompt）
       const skills = await loadSkills().catch((err) => {
@@ -1454,162 +1624,352 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
 
       const run = await agent.send(superPrompt);
+      await consumeSessionRun(task, agent, run, { errorActionId: action.id });
+    } catch (err) {
+      // Agent.create / 首次 send 阶段失败（consumeSessionRun 内部错误它自己处理、不会抛）
+      await handleRunFailure(task.id, action.id, err);
+      if (agent) {
+        closeTaskSession(task.id, agent.agentId);
+      } else {
+        // create 都没成：会话没注册、手动注销 handler / notifier
+        setChatAwaitingNotifier(task.id, null);
+        setChatTaskActionHandler(task.id, null);
+      }
+    }
+  })();
+};
 
-      runningTasks.set(task.id, {
-        agentId: agent.agentId,
-        startedAt: Date.now(),
-        startSnapshot: captureTaskFieldsSnapshot(task),
-        cancel: () => {
-          cancelled = true;
-          cancelPending(task.id);
-          void run.cancel().catch(() => {
-            /* noop */
-          });
-        },
-      });
+// ----------------- V0.11：run 消费管道（首个 run + 后续 send 共用） -----------------
 
-      hardTimer = setTimeout(() => {
+type SessionRun = Awaited<ReturnType<AgentInstance["send"]>>;
+
+// run 失败（SDK 抛错 / status=error）的统一收尾：标 error + 事件 + publish
+const handleRunFailure = async (
+  taskId: string,
+  errorActionId: string | undefined,
+  err: unknown,
+): Promise<void> => {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[task-runner] task=${taskId} run failed:`, err);
+  // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
+  // 其它有诊断的错（认证 / 限流 / MCP / 协议）→ 带详情、加「失败」前缀。原始 err 已 console.error。
+  const failure = summarizeRunFailure(message, err);
+  const eventText = failure.isConnectionDrop
+    ? failure.text
+    : `Task agent 失败：${failure.text}`;
+  await finalizeStaleActions(taskId, "error");
+  await setTaskRunStatus(taskId, "error", errorActionId ?? null);
+  await writeEventAndPublish(taskId, {
+    kind: "error",
+    actionId: errorActionId,
+    text: eventText,
+    // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
+    meta: { detail: failure.detail },
+  });
+  const errored = await getTask(taskId);
+  if (errored) publish(taskId, { kind: "done", task: errored, ok: false });
+  publish(taskId, { kind: "error", message: eventText });
+};
+
+/**
+ * 消费一个 SDK run 的完整生命周期（流式事件 → 终态处理）。
+ *
+ * V0.11 语义：run 自然 finished 是**正常出口**（agent 交卷 / 提问 / 说完了就该结束 turn）——
+ * 只有「最后一个 action 还在 running、且没有 check 在跑、也没有 ask 在等答案」才判「没交卷就跑了」标 error。
+ * 会话（agent 实例）在 finished 后保留、用户下一步操作用 send 续接；cancel / error 才关会话。
+ */
+const consumeSessionRun = async (
+  task: Task,
+  agent: AgentInstance,
+  run: SessionRun,
+  opts: { errorActionId?: string },
+): Promise<void> => {
+  let cancelled = false;
+  let hardTimer: NodeJS.Timeout | null = null;
+  try {
+    runningTasks.set(task.id, {
+      agentId: agent.agentId,
+      startedAt: Date.now(),
+      startSnapshot: captureTaskFieldsSnapshot(task),
+      cancel: () => {
         cancelled = true;
         cancelPending(task.id);
         void run.cancel().catch(() => {
           /* noop */
         });
-      }, TASK_HARD_TIMEOUT_MS);
+      },
+    });
 
-      // 流式消费
-      const assistantCtx: AssistantBufferCtx = {
-        buffer: "",
-        flush: async () => {
-          const trimmed = assistantCtx.buffer.trim();
-          assistantCtx.buffer = "";
-          if (trimmed.length === 0) return;
-          await writeEventAndPublish(task.id, {
-            kind: "assistant_message",
-            actionId: undefined,
-            text: trimmed,
-          });
-        },
-      };
+    hardTimer = setTimeout(() => {
+      cancelled = true;
+      cancelPending(task.id);
+      void run.cancel().catch(() => {
+        /* noop */
+      });
+    }, TASK_HARD_TIMEOUT_MS);
 
-      for await (const msg of run.stream()) {
-        await handleSdkMessage(task.id, msg, assistantCtx);
-      }
-      await assistantCtx.flush();
+    // 流式消费
+    const assistantCtx: AssistantBufferCtx = {
+      buffer: "",
+      flush: async () => {
+        const trimmed = assistantCtx.buffer.trim();
+        assistantCtx.buffer = "";
+        if (trimmed.length === 0) return;
+        await writeEventAndPublish(task.id, {
+          kind: "assistant_message",
+          actionId: undefined,
+          text: trimmed,
+        });
+      },
+    };
 
-      if (hardTimer) {
-        clearTimeout(hardTimer);
-        hardTimer = null;
-      }
+    for await (const msg of run.stream()) {
+      await handleSdkMessage(task.id, msg, assistantCtx);
+    }
+    await assistantCtx.flush();
 
-      const result = await run.wait();
+    if (hardTimer) {
+      clearTimeout(hardTimer);
+      hardTimer = null;
+    }
 
-      if (cancelled || result.status === "cancelled") {
-        const isForkPending = forkPendingTasks.has(task.id);
-        if (isForkPending) {
-          forkPendingTasks.delete(task.id);
-          isForkRestart = true; // 换新 agent：finally 不清孤儿（新 agent 同仓 shell 会被误杀）
-          await writeEventAndPublish(task.id, {
-            kind: "info",
-            text: "旧 agent 已收尾、正在为推进起新 agent...",
-          });
-          return;
-        }
-        // 正常 cancel（stop / 硬超时触发）→ 收尾卡住的 action + 关运行时状态
-        // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
-        await finalizeStaleActions(task.id, "cancelled");
-        // 保留 currentActionId（不传第三参）：被停的 action 此刻已被 finalizeStaleActions 标 cancelled、
-        // 让它仍是「当前 action」、前端 canRestartCurrentAction 命中 cancelled → 用户能「重启当前阶段」、
-        // 不必只能推新 action（修：手动停止后重启按钮消失——之前这里传 null 把 currentActionId 清了）。
-        const updated = await setTaskRunStatus(task.id, "idle");
-        if (updated) publish(task.id, { kind: "task", task: updated });
-        publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+    const result = await run.wait();
+
+    if (cancelled || result.status === "cancelled") {
+      const isForkPending = forkPendingTasks.has(task.id);
+      if (isForkPending) {
+        forkPendingTasks.delete(task.id);
+        // 换新 agent：会话由 advance 的 force-new 分支显式关（reap:false）、这里不动
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          text: "旧 agent 已收尾、正在为推进起新 agent...",
+        });
         return;
       }
+      // 正常 cancel（停止 / 硬超时触发）→ 收尾卡住的 action + 关运行时状态 + 关会话
+      // （repoStatus 仍由 finalizeTask 管、这里只补 action 收尾、不动业务态）
+      await finalizeStaleActions(task.id, "cancelled");
+      // 保留 currentActionId（不传第三参）：被停的 action 已标 cancelled、仍是「当前 action」、
+      // 前端 canRestartCurrentAction 命中 → 用户能「重启当前阶段」
+      const updated = await setTaskRunStatus(task.id, "idle");
+      if (updated) publish(task.id, { kind: "task", task: updated });
+      publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+      closeTaskSession(task.id, agent.agentId);
+      return;
+    }
 
-      if (result.status !== "finished") {
-        const resultDump = stringifyMeta(result).slice(0, 1500);
-        const sdkErr = assistantCtx.sdkErrorMessage
-          ? `\n--- SDK stream error message ---\n${assistantCtx.sdkErrorMessage}`
+    if (result.status !== "finished") {
+      const resultDump = stringifyMeta(result).slice(0, 1500);
+      const sdkErr = assistantCtx.sdkErrorMessage
+        ? `\n--- SDK stream error message ---\n${assistantCtx.sdkErrorMessage}`
+        : "";
+      // result.result 是 SDK 给的最终文本/诊断：非空就 inline 到 status 后、
+      // 这样 summarizeRunFailure 的「裸 error」正则自然不命中、诊断不会被当连接断吞掉
+      const inlineResult =
+        typeof result.result === "string" && result.result.trim()
+          ? `: ${result.result.slice(0, 200)}`
           : "";
-        // result.result 是 SDK 给的最终文本/诊断（mirror chat-runner）：非空就 inline 到 status 后、
-        // 这样 summarizeRunFailure 的「裸 error」正则自然不命中、诊断不会被当连接断吞掉
-        const inlineResult =
-          typeof result.result === "string" && result.result.trim()
-            ? `: ${result.result.slice(0, 200)}`
-            : "";
-        throw new Error(
-          `agent run status=${result.status}${inlineResult}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
-        );
-      }
+      throw new Error(
+        `agent run status=${result.status}${inlineResult}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
+      );
+    }
 
-      // SDK run 自然 finished：在 V0.6 单 Run 永生模型下、这意味着 agent 主动 exit
-      // 检查最后一个 action 是否 ack——没 ack 就标 error
-      const fresh = await getTask(task.id);
-      const lastAction = fresh?.actions[fresh.actions.length - 1];
-      if (
-        lastAction &&
-        (lastAction.status === "running" || lastAction.status === "awaiting_ack")
-      ) {
-        await patchAction(task.id, lastAction.id, { status: "error" });
-        await setTaskRunStatus(task.id, "error", lastAction.id);
-        await writeEventAndPublish(task.id, {
-          kind: "error",
-          actionId: lastAction.id,
-          text: [
-            `agent 在 action ${lastAction.type} n=${lastAction.n} 没 ack 就自然结束 Run、这通常是协议理解错误`,
-            "",
-            "下一步：点顶部「推进」选「换新 agent」、或换更稳的模型（claude-opus-4 / claude-sonnet-4）",
-          ].join("\n"),
-        });
-        const updated = await getTask(task.id);
-        if (updated) publish(task.id, { kind: "task", task: updated });
-        publish(task.id, { kind: "done", task: updated ?? task, ok: false });
-      } else {
-        // 干净结束：last action 已 completed、agent 自愿退出（极少见、正常应等终态信号）
-        const updated = await setTaskRunStatus(task.id, "idle", null);
-        if (updated) publish(task.id, { kind: "task", task: updated });
-        publish(task.id, { kind: "done", task: updated ?? task, ok: true });
-      }
-    } catch (err) {
-      if (hardTimer) clearTimeout(hardTimer);
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[task-runner] task=${task.id} failed:`, err);
-
-      // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
-      // 其它有诊断的错（认证 / 限流 / MCP / 协议）→ 带详情、加「失败」前缀。原始 err 已 console.error。
-      const failure = summarizeRunFailure(message, err);
-      const eventText = failure.isConnectionDrop
-        ? failure.text
-        : `Task agent 失败：${failure.text}`;
-
-      // 收尾所有卡在非终态的 action（单 Run 多 action：卡住的可能 ≠ 闭包起的 action、见 finalizeStaleActions）
-      await finalizeStaleActions(task.id, "error");
-      await setTaskRunStatus(task.id, "error", action.id);
+    // V0.11：run 自然 finished = 正常出口。判定 agent 这轮是否「有交代」：
+    //   - 交卷了（notifier 同步注册的后置 check 在跑 / action 已 awaiting_ack）→ 正常
+    //   - 提问了（pendingAsk 在等用户答）→ 正常
+    //   - 都没有、最后一个 action 还挂 running → 没交卷就跑了、标 error + 关会话
+    const fresh = await getTask(task.id);
+    const lastAction = fresh?.actions[fresh.actions.length - 1];
+    const checkInFlight =
+      !!lastAction && runningChecks.get(task.id)?.actionId === lastAction.id;
+    const askPending = !!getPendingAsk(task.id);
+    if (
+      lastAction &&
+      lastAction.status === "running" &&
+      !checkInFlight &&
+      !askPending
+    ) {
+      await patchAction(task.id, lastAction.id, { status: "error" });
+      await setTaskRunStatus(task.id, "error", lastAction.id);
       await writeEventAndPublish(task.id, {
         kind: "error",
-        actionId: action.id,
-        text: eventText,
-        // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
-        meta: { detail: failure.detail },
+        actionId: lastAction.id,
+        text: [
+          `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 wait_for_user）就结束了回复`,
+          "",
+          "下一步：点「重启当前阶段」重跑、或换更稳的模型",
+        ].join("\n"),
       });
-      const errored = await getTask(task.id);
-      publish(task.id, { kind: "done", task: errored ?? task, ok: false });
-      publish(task.id, { kind: "error", message: eventText });
-    } finally {
-      runningTasks.delete(task.id);
-      cancelPending(task.id);
-      // conditional unset：只清「自己注册的那个实例」、force-new-agent race 下新 handler/notifier 不被误清
-      unsetChatAwaitingNotifierIf(task.id, awaitingNotifier);
-      unsetChatTaskActionHandlerIf(task.id, taskActionHandler);
-      // V0.6.8：真正结束（停止 / 自然退出 / 报错）才清孤儿进程；换新 agent 不清（见 isForkRestart 注释）
-      if (!isForkRestart) reapTaskOrphans(task.repoPaths);
-      if (agent) {
-        try {
-          agent.close();
-        } catch {
-          /* noop */
-        }
+      const updated = await getTask(task.id);
+      if (updated) publish(task.id, { kind: "task", task: updated });
+      publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+      closeTaskSession(task.id, agent.agentId);
+      return;
+    }
+
+    // 正常结束：交卷已入 check 管道（awaiting_ack / awaiting_user 由 check、notifier 落）、
+    // 或 ask 在等答案。会话保留、用户下一步操作 send 续接。
+    // 兜底：最后 action 已终态（completed / cancelled / error）而 runStatus 还挂 running → 归 idle
+    if (
+      !lastAction ||
+      lastAction.status === "completed" ||
+      lastAction.status === "cancelled"
+    ) {
+      const freshest = await getTask(task.id);
+      if (freshest?.runStatus === "running") {
+        const updated = await setTaskRunStatus(task.id, "idle", null);
+        if (updated) publish(task.id, { kind: "task", task: updated });
       }
     }
-  })();
+    publish(task.id, { kind: "done", task: fresh ?? task, ok: true });
+  } catch (err) {
+    if (hardTimer) clearTimeout(hardTimer);
+    await handleRunFailure(task.id, opts.errorActionId, err);
+    closeTaskSession(task.id, agent.agentId);
+  } finally {
+    runningTasks.delete(task.id);
+    // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
+    const session = agentSessions.get(task.id);
+    if (session && session.agentId === agent.agentId) {
+      session.lastActiveAt = Date.now();
+    }
+  }
+};
+
+/**
+ * V0.11.1：merge 本 task 的 MCP 集合（全局 cursor mcp 按黑名单过滤 + OAuth 注入 +
+ * 健康剔除 + 内置 chat-tool）——Agent.create 和 Agent.resume 共用（inline MCP 不随
+ * resume 持久化、恢复会话必须重传）。
+ */
+const buildMergedMcpForTask = async (
+  task: Task,
+): Promise<{
+  mergedMcp: Record<string, McpServerConfig>;
+  cursorMcpNames: string[];
+  droppedMcp: Awaited<ReturnType<typeof filterHealthyMcp>>["dropped"];
+}> => {
+  const enrichedMcp = await enrichMcpServersWithOAuth(
+    filterDisabledMcp(await readGlobalCursorMcpServers(), task.disabledMcpServers),
+  );
+  const { servers: cursorMcp, dropped: droppedMcp } =
+    await filterHealthyMcp(enrichedMcp);
+  const mergedMcp: Record<string, McpServerConfig> = {
+    ...cursorMcp,
+    [TASK_TOOL_MCP_NAME]: {
+      type: "http",
+      url: getChatMcpUrl(),
+    },
+  };
+  const cursorMcpNames = Object.keys(cursorMcp).filter(
+    (n) => n !== TASK_TOOL_MCP_NAME,
+  );
+  return { mergedMcp, cursorMcpNames, droppedMcp };
+};
+
+/**
+ * V0.11.1：从落盘的 sessionAgentId 恢复会话（服务重启 / 空闲回收后）。
+ * 成功 = agent 接回 + 桥重注册 + 会话表就位；失败 = 清锚点返 null（调用方降级 fresh agent）。
+ */
+const resumeTaskSession = async (
+  task: Task,
+  creds: SessionCreds,
+): Promise<AgentSessionRecord | null> => {
+  if (!task.sessionAgentId || !creds.apiKey) return null;
+  // resume 后 send 必须有显式 model：优先「原会话实际在用的模型」（最近带 agentModel 的 action）、
+  // 兜底 client 传来的（settings 默认模型）
+  const model =
+    [...task.actions].reverse().find((a) => a.agentModel)?.agentModel ??
+    task.model ??
+    creds.model;
+  if (!model) return null;
+  try {
+    const { mergedMcp } = await buildMergedMcpForTask(task);
+    const agent = await Agent.resume(task.sessionAgentId, {
+      apiKey: creds.apiKey,
+      model,
+      // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
+      local: { cwd: getTaskCwd(task), settingSources: ["project"] },
+      mcpServers: mergedMcp,
+    });
+    // 恢复的 agent 调 submit_mr / wait_for_user 要走桥、必须重注册
+    registerSessionBridges(task, {
+      gitHost: creds.gitHost,
+      gitToken: creds.gitToken,
+    });
+    const record: AgentSessionRecord = {
+      agent,
+      agentId: agent.agentId,
+      createdAt: Date.now(),
+      lastActiveAt: Date.now(),
+      startSnapshot: captureTaskFieldsSnapshot(task),
+    };
+    agentSessions.set(task.id, record);
+    console.log(
+      `[task-runner] task=${task.id} 会话已恢复（Agent.resume agentId=${agent.agentId}）`,
+    );
+    return record;
+  } catch (err) {
+    console.warn(
+      `[task-runner] task=${task.id} Agent.resume 失败（清锚点、降级 fresh agent）`,
+      err,
+    );
+    void setTaskSessionAgentId(task.id, undefined);
+    return null;
+  }
+};
+
+/**
+ * V0.11：ask_user 答案送达（ask-reply 路由用）——`agent.send([ASK_USER_REPLY]…)` 续会话。
+ * @returns false = 没有可续接的会话、路由报 409 让用户重启断点续传
+ */
+export const deliverAskReply = async (
+  task: Task,
+  replyText: string,
+  imagePaths?: string[],
+  errorActionId?: string,
+  creds?: SessionCreds,
+): Promise<boolean> =>
+  sendToTaskSession(
+    task,
+    buildAgentMessage({ kind: "user_reply", text: replyText, imagePaths }),
+    { errorActionId, creds },
+  );
+
+/**
+ * V0.11：把用户操作以新消息发给 task 的存活会话（`agent.send`）、并消费产生的新 run。
+ * V0.11.1：内存没会话但有落盘 sessionAgentId 且带了凭据 → 先 Agent.resume 接回再 send。
+ *
+ * @returns false = 没有可续接的会话（没 session 且 resume 不了 / 有 run 正在跑 / send 抛错）、
+ * 调用方走降级（推进 → force-new agent；再聊聊 / ask 答案 → 报错让用户推进或重启）
+ */
+const sendToTaskSession = async (
+  task: Task,
+  text: string,
+  opts: { errorActionId?: string; creds?: SessionCreds } = {},
+): Promise<boolean> => {
+  if (runningTasks.has(task.id)) {
+    console.warn(
+      `[task-runner] sendToTaskSession: task=${task.id} 有 run 在跑、拒绝并发 send`,
+    );
+    return false;
+  }
+  let session = agentSessions.get(task.id) ?? null;
+  if (!session && opts.creds) {
+    session = await resumeTaskSession(task, opts.creds);
+  }
+  if (!session) return false;
+  const agent = session.agent as AgentInstance;
+  let run: SessionRun;
+  try {
+    run = await agent.send(text);
+  } catch (err) {
+    // send 失败（会话失效 / SDK 异常）→ 关掉这个坏会话、调用方降级
+    console.error(`[task-runner] sendToTaskSession: task=${task.id} send 失败`, err);
+    closeTaskSession(task.id, session.agentId);
+    return false;
+  }
+  session.lastActiveAt = Date.now();
+  // fire-and-forget 消费（跟首个 run 同一管道）；调用方只需要「send 成功已开跑」
+  void consumeSessionRun(task, agent, run, { errorActionId: opts.errorActionId });
+  return true;
 };

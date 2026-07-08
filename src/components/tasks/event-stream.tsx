@@ -98,8 +98,8 @@ interface Props {
   // 非空时在事件流末尾渲染一个「AI 回复中...」卡片、内容随 chunk 拼接增长（打字机效果）
   // V1 仅 chat 模式用、plan 模式不传
   streamingText?: string;
-  // attachments：附加的文件 / 目录绝对路径数组、后端 wait_for_user return 会拼成
-  // [ATTACHED_PATHS] 段给 agent、agent 用 `read` 工具自己读
+  // attachments：附加的文件 / 目录绝对路径数组、后端发给 agent 时拼成
+  // [ATTACHED_PATHS] 段、agent 用 `read` 工具自己读
   onUserReply?: (
     text: string,
     images?: ImagePayload[],
@@ -226,8 +226,7 @@ const EventStreamImpl = ({
   const canCompose = canReply ?? task.runStatus === "awaiting_user";
 
   // 输入框自动聚焦判定：跟 canCompose 同款（之前用 isAwaitingUser、现在统一走 canCompose）
-  // - chat 自由化下、agent 起手就 wait_for_user、进 ChatView 时 status 大概率立刻变 awaiting_user
-  //   → canCompose 变 true 触发 focus
+  // - chat 下 agent 答完自然结束回合、status 变 awaiting_user → canCompose 变 true 触发 focus
   const isAwaitingUser = canCompose;
 
   // V0.5.4 图附件管理统一走 hook、跟 revise-dialog 共用（同款约束、同款交互）

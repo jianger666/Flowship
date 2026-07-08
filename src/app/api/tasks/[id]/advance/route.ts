@@ -22,8 +22,8 @@
  *
  * # 行为分支（由 task-runner.advanceTask 内部决定）
  *
- * - reuseAgent 且有活 agent 在「待命态」 → submitNextAction 推 [NEXT_ACTION] 接力（不消耗 send 配额）
- * - 默认 / 没活 agent → Agent.create + send superPrompt（消耗 1 次 send 配额）
+ * - reuseAgent 且有存活会话 → `agent.send([NEXT_ACTION ...])` 续同一会话（V0.11）
+ * - 默认 / 没会话 → Agent.create + send superPrompt（fresh agent 冷启动）
  *
  * # 错误语义
  *

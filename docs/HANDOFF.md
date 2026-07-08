@@ -128,29 +128,26 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 - 生效逻辑（`advanceTask`）：`effectiveForceNewAgent = !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[type]`——UI「续用当前 Agent」开关是例外逃生口（省 send 配额 / 需要连续上下文时手动勾）、review 勾了也强起新（换人复审铁律）
 - 连带：super prompt 只注入**当前 action** 的 playbook（不再全量 6 种、体积 -60%+）；续用路径收到 `[NEXT_ACTION]` 时、server 在载荷里附带新 action 的完整 playbook（`buildNextActionDirective(actionPlaybook)`）
 
-**单 Run 内协议不变**（agent 视角无感知、它不知道自己会跑几个 action）：
+**会话内协议（V0.11 起「create + 多轮 send」、run 自然结束）**：
 
-- 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → runner 写 `[NEXT_ACTION ...]` 接力
-- agent 跑完 action → 调 `wait_for_user(action_id)` → runner **后台异步**跑后置检查（V0.8.18、不阻塞 wait_for_user 工具返回）、跑完再把 action 标 `awaiting_ack`
-- 用户 ack → wait-ack 写 `[ACTION_ACK approve|revise]` → agent 接着调 `wait_for_user(待命态)` 等下一指令
-- 终结 task → finalize 路由写 `[TASK_DONE]` / `[TASK_ABANDONED]` → agent 自然退出 Run；agent 不在 wait 挂起时 finalize 直接 `cancelTaskRun` 硬停（V0.6.27 B3）
+- 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → 对存活会话 `agent.send([NEXT_ACTION ...])` 接力
+- agent 跑完 action → 调 `wait_for_user(action_id)` **交卷**（非阻塞、返回「结束回复」）→ agent 正常结束 turn、run finished；runner **后台异步**跑后置检查（V0.8.18）、跑完把 action 标 `awaiting_ack`
+- 用户操作以 send 送达：再聊聊 = `send([ACTION_ACK revise]+feedback)`、ask 答案 = `send([ASK_USER_REPLY]…)`；**通过纯服务端落状态**（agent 不需要收信号）
+- 终结 task → finalize 直接 cancel 活 run + 关会话（不再发 [TASK_DONE] 信号）
 
-**字段热更（V0.6.6、仅续用路径需要）**：super prompt 只在 Run 启动时构造一次、reused agent 推进时用户在详情页编辑的 `title/role/feishuStoryUrl` 会 stale。runner 在 `runningTasks` record 存 agent 启动快照（内存、不落盘）、reused 推进时 diff 出变更、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（注入后推进快照防重复告知）。`model` 是 Run 启动时绑定改不了、`repoFeatureBranches` build 前本就读盘、二者都不走此机制。
+**字段热更（V0.6.6、仅续用路径需要）**：super prompt 只在会话启动时构造一次、续用推进时用户在详情页编辑的 `title/role/feishuStoryUrl` 会 stale。runner 在 `agentSessions` record 存启动快照（内存、不落盘）、续用推进时 diff 出变更、**有变才**拼一段 `[TASK_UPDATED]` 注入 `[NEXT_ACTION]` directive（注入后推进快照防重复告知）。
 
-agent 永远不会主动 emit assistant_message + exit Run、只通过 wait_for_user 把控制权交回用户。
-
-### 保活机制：shell + curl long-poll（V0.3.5 沿用）
+### 会话机制：agent 会话跨 run 存活（V0.11、替代 V0.3.5~V0.10 的 shell curl 长轮询）
 
 ```
-agent 调 wait_for_user / ask_user
-  → MCP 工具立即返回 shell 引导文本
-  → agent 用 SDK shell 工具调 curl -sN <base>/api/tasks/:id/wait-ack?token=…
-  → 长 HTTP 连接挂住、服务端每 60 秒 write 一行 [KEEPALIVE ts=...]
-  → 用户 ack/reply / next_action / terminate → 服务端 resolve promise → 写一行结果 → 关流
-  → curl exit → agent stdout 拿到结果推进
+Agent.create（每 action 默认新建 / 勾续用复用）
+  → agent.send(prompt) → run 流式消费 → agent 交卷 / 提问后自然结束 turn → run finished
+  → agent 实例保留在 agentSessions（不 close）
+  → 用户下一步操作（推进续用 / 再聊聊 / ask 答案 / chat 消息）→ agent.send(新消息) → 新 run
+  → stop / error / finalize / 换新 agent / 服务重启 → 会话关闭（下次 fresh agent + artifact/events 恢复上下文）
 ```
 
-**不**走 MCP 60s timer + 轮转——会踩 Cursor backend anti-loop。
+「run 自然 finished 但最后 action 还 running」时豁免两种正常情况（后置 check 在跑 = 刚交卷、pendingAsk 在等答案）、否则判「没交卷就跑了」标 error（stop-hook 同口径先行拦截）。
 
 ### 推进 dialog（V0.6 重写）
 
@@ -279,13 +276,12 @@ V0.6 不写 V0.5 → V0.6 migration 脚本、`listTasks` / `getTask` 用 `isVali
 
 `Task.role: TaskRole`（当前仅 `"fe"`、未来扩 `be / data / mobile / qa`）、`TASK_ROLE_LABEL` 中文映射、prompt 顶部「当前角色：xxx」提示。
 
-### 多仓库 cwd 公共父目录（V0.5.9 沿用）
+### 多仓库 cwd 公共父目录（V0.5.9 沿用、V0.10 叠加 worktree 隔离）
 
-`Task.repoPaths: string[]`、SDK Run `local.cwd = getEffectiveCwd(repoPaths)`：
+`Task.repoPaths: string[]`、SDK Run `local.cwd = getTaskCwd(task)`（task-worktrees.ts）：
 
-- 单仓 → cwd = 仓自身
-- 多仓 → cwd = 公共父目录、AI 视角下挂 N 个 git 子仓、路径首段是仓名
-- 0 仓 → cwd = home（纯探索 / 答疑场景）
+- **隔离 task（`isolateWorktree`、新建默认）** → cwd = `<数据目录>/worktrees/<taskId>/`下的 worktree（单仓 = worktree 自身、多仓 = taskId 目录做公共父）、并行任务互不干扰
+- 非隔离（逃生口 / 老 task / chat）走 `getEffectiveCwd(repoPaths)` 旧逻辑：单仓 = 仓自身、多仓 = 公共父目录、0 仓 = home（纯探索 / 答疑场景）
 
 ### Resizable 分栏 + Diff 视图（V0.5.10 + V0.5.12 沿用）
 
@@ -303,33 +299,41 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### v0.9.14：自定义 action 增强——编辑器补全 + skill 缺失兜底 + 导入导出（2026-07-03、通用化讨论落地第一批）
+### V0.11.2：Windows / macOS 兼容性全面扫描修复（2026-07-08、用户点名全查）
 
-- **背景**：通用化方向下自定义 action 可能是非研发用户（测试 / BI）的全部工作流。走查出三块短板：编辑器可发现性差（模板变量没提示、freshAgent 有字段没 UI）、引用的 skill 别人机器没有时 agent 拿悬空引用瞎找、团队没有轻量共享路径。同轮讨论还拍板了「建任务仓库改可选、飞书 story 保留必填」——**动面大、留到下一轮单做**。
-- **编辑器小改**（`custom-action-editor.tsx`）：
-  - 模板变量 chips 加过又删（用户实测「不知道是干嘛的、没太大用处」）——任务标题 / 仓库路径 / artifact 目录这些上下文 super prompt 本来就有独立段落传给 agent、playbook 不需要点位引用；运行时 `{{var}}` 替换链路保留（跟内置 prompt 同一条 fillTemplate）、手写仍生效、只是不宣传
-  - `freshAgent` 补开关「每次推进都用新 Agent」（字段 / API / 运行链早就支持、一直没 UI 改不了）
-  - 新字段 `CustomActionDef.placeholder`（推进输入框提示、轻量参数化——告诉使用者该填什么）：fs 层 parse/serialize + POST/PATCH 入参 + advance-dialog `buildPlaceholder` custom 分支读定义、缺省回通用文案
-- **skill 缺失兜底**（导入别人的定义 / 换机器场景）：
-  - **agent 侧静默过滤**：`skills-loader` 新增 `listAvailableSkillNames(repoPaths)`（平台 + 全局 ∪ 各绑定仓 `.cursor/skills/`、repo 层算进来防误杀）、`loadCustomActionPlaybook` 渲染点名段前按集合过滤——缺的名字不进 prompt、agent 无感零幻觉
-  - **用户侧显式提示**：/actions 页自定义行显示 skill chips（缺失的灰显划线 + tooltip「本机未找到、推进时自动跳过」）；编辑器 MultiSelect 把「已勾但本机没有」合成灰项显示（不合进 options 这些勾选会隐身）
-  - 定义文件不动（换机器 / 同事装了 skill 引用又活）——机器看不见缺的、人看得见缺的、文件不动
-- **导入 / 导出**（团队点对点共享、比 repo `.cursor/actions/` 层更轻、先做这个）：
-  - 定义本来就是单个 md 文件（frontmatter + playbook）、天然交换格式——飞书传文件即可共享
-  - **都以文件夹为单位**（用户拍板「批量就用文件夹的形式」）——导出：只有 /actions 页顶部一个入口（不做行内单个导出、同轮拍板）、先弹勾选（`export-actions-dialog.tsx`、默认全选 / 全选 checkbox 带 indeterminate、用户反馈「一键全部太糙」当轮改）、确认后原生目录 picker、每个写 `<label>.md`（重名自动 -2 后缀不覆盖）；导入：顶部「导入」、原生 picker 选文件夹、server 扫目录第一层 md 逐个解析（借 `parseDef` 清洗、不递归）、**id 一律重新生成**防撞、单文件失败不影响其余（toast 汇总）；顺带补了 `ui/checkbox.tsx` 基础组件（base-nova、项目此前没有）
-  - 新路由 `POST /api/custom-actions/import`（body paths、1MB/文件上限）+ `POST /api/custom-actions/export`（body ids + dir）、绝对路径校验、信任模型同 `/api/repo-branches`（本地单用户桌面 app）
-- typecheck / lint / vitest 133 全绿。repo 层 action（`.cursor/actions/` 跟仓走）暂缓、看导入导出的实际使用效果再定。
+- **P1 工作区指纹 / status hash 在 Windows 静默失效**：原实现 `spawn("sh", ["-c", 多行 POSIX 脚本])`——Windows 没有 `sh`、`2>/dev/null` 也非 cmd 语法 → fingerprint 恒 null、review 只读硬校验 / build 兄弟仓越权检测形同虚设。重写成纯 Node 逐条 `execFile git`（唯一要喂 stdin 的 `hash-object --stdin-paths` 单独 spawn）、平台无关；顺带删掉 `buildCheckEnv`（PATH 用 `:` 拼 + 读 `HOME`、Windows 分隔符是 `;`、会把 PATH 首项写坏）——现在只跑 git、不需要自拼 PATH。新增 `tests/action-checks.integration.test.ts`（真 git 仓锁指纹语义 5 条）
+- **P2 kill-orphans 在 Windows 白跑报错**：依赖 `ps` + `lsof`、win32 入口直接跳过（孤儿树杀由壳退出时 taskkill /T 兜底、不值得接 wmic/CIM）
+- **P2 预览 dev server 在 Windows 弹控制台黑框**：`detached: true` 在 win 会给子进程开独立控制台——改 win 不 detach + `windowsHide`（树杀本就走 `taskkill /T`、不依赖进程组）；其它 git spawn 也补了 `windowsHide` 防闪框
+- 确认无问题的面：task-worktrees（gitdir 正反斜杠都认）、path-utils（盘符/反斜杠归一化齐全）、hooks 脚本（纯 Node + win 分支）、Electron 壳（netstat/taskkill 分支齐全）、node_modules 克隆（darwin 门控、其它平台回退 agent 自装）
+- typecheck / lint 全绿、vitest 148 全绿
 
-### v0.9.13：删「跑项目命令」的确定性检查（2026-07-03、用户拍板「lint / typecheck 这类删掉」）
+### V0.11：wait 协议退役——回归「create + 多轮 send」正常流程（2026-07-07 用户拍板、当日实装）
 
-- **背景**：用户实测「公司项目几乎全部不通过」——CheckRun 对全仓跑 typecheck / lint、存量项目基线本来就红（历史债）、agent 只改两个文件也永远红、红色失去信息量、ship 还每次都要 override 填原因。加上工具通用化方向（非研发用户）、「研发流程假设」不再成立。拍板范围 = 档 A：**删所有「跑项目命令」的检查、保留「agent 交付诚实性」检查**（artifact 落盘 / 必备段 / review 只读指纹 / MR URL 验真等全保留）。
-- **删除面（types → server → API → UI 全链）**：
-  - types：`CheckCommand` / `CheckCommandKind` / `CheckCommandResult` / `CheckRepoResult` / `CheckRunSummary` / `CheckOverride` / `Task.repoCheckCommands` / `RepoConfig.checkCommands` / `CustomActionDef.checkCommands` / `ActionRecord.checkRun` / `ActionRecord.checkOverride` 全删；`ShipPrecheck` 瘦身成 `{ reviewMissing }`。
-  - server：`repo-check-detect.ts` 整文件删（自动检测）；`action-checks.ts` 删 `runRepoChecks` / 污染检测 / `--fix` 预判、`checkBuild` 只留 artifact 必备段 + 兄弟仓越权、`checkCustom` 只留 artifact 非空；`action-gates.ts` 删 `checkShipCheckGate`（ship override 门禁）；`task-fs.sanitizeCheckCommands` / createTask 检测链 / `addRepoCheckCommands` patch 链删；`task-fs-core` 删 `getCheckLogPaths` + meta 字段。
-  - API：advance 路由删 `checkOverride` 入参、tasks 路由删 `repoCheckCommands` / `addRepoCheckCommands`、custom-actions 路由删 `checkCommands`、ship-precheck 只返 `reviewMissing`。
-  - UI：`check-run-summary.tsx` / `repo-check-commands.tsx` 两组件删；repo-card 检查命令编辑区删、advance-dialog ship override 区删（reviewMissing 黄条保留）、custom-action-editor 校验命令字段删、task-display 删 `CHECK_STATUS_LABEL/VARIANT`。
-- **保留**：`runActionPostCheck` 后台异步框架（runningChecks 去重 + abort、checkReview 多仓 git 指纹仍可能上秒）、`runCheckShell` / `computeWorktreeFingerprint` / `computeRepoStatusHash`（review 指纹 + 兄弟仓基线的底座）。老 task 数据里的 `checkRun` 字段读时被 schema 忽略、不写 migration。
-- 质量兜底改由 build agent 自查（action-build.md「验证仓库脚本」段让 agent 增量校验、未动）+ review 人审。测试删 `sanitize-check-commands.test.ts` / `repo-check-detect.test.ts`（142 → 133 条全绿）。
+- **动机**：Cursor 已去掉按次计费、「单 Run 永生 + wait_for_user 挂 shell curl 长轮询省 send」的历史前提消失；worktree 隔离（V0.10）后现场永久保留、Run 随时可断可续；且长挂 curl 是全系统最脆的机制（升级假卡死 / 僵尸 zsh / premature wait / 失效 ask 弹窗死循环等事故大户）。用户原话「首次是 create、后面就都是 send、改回正常流程」。
+- **新模型**：
+  - **agent 会话跨 run 存活**：`agentSessions`（task-stream globalThis）持有 Agent 实例；`runningTasks` 只表示「有 run 在跑」。run 自然结束不 close agent、下一次用户操作 `agent.send()` 续上（SDK 官方多轮语义）；stop / error / finalize / 换模型才关会话。app 重启丢会话 → 沿用旧 fresh-agent + events.jsonl 恢复路径。
+  - **wait_for_user 改「交卷」语义（非阻塞）**：完成 action 调它（带 action_id）→ 后台跑 check + 切 awaiting_ack（同今天）→ 返回「交卷成功、立即结束本轮回复」→ run 自然 finished = 正常（旧模型里是 error）。不带 action_id 的「待命态」概念删除。
+  - **ask_user 改「弹窗 + 结束回复」**：注册 pendingAsk（askId/token 校验保留）→ UI 弹窗 → 返回「结束本轮回复」；用户答案经 `agent.send([ASK_USER_REPLY]…)` 送达新 run。
+  - **用户操作 → send**：推进（续用会话）= send [NEXT_ACTION…]；再聊聊 = send [ACTION_ACK revise]+feedback；ask 答案 = send [ASK_USER_REPLY]；chat 每条消息 = send。通过（approve）纯服务端落状态、不再需要通知 agent。终态（merged/abandoned）不再发 [TASK_DONE]、直接 cancel 活 run + 关会话。
+  - **chat 模式回归普通对话**：agent 无需任何 wait 工具、说完自然结束 turn；run 结束 → runStatus=awaiting_user 等下一条消息。premature-wait 兜底 / 概括 message / recency 提醒全部删除。
+  - **stop-hook 语义保留但收窄**：只拦「当前 action 还在 running（没交卷）且无 pendingAsk」的提前退出；交卷后 / ask 后 / chat 模式放行。
+- **删除面**：wait-ack 长轮询 route、pendingMap/token/grace/keepalive 状态机（chat-pending 1049→370 行、pendingAsks 轻量表保留）、premature-chat-wait 模块 + 测试、SHELL_WAIT_GUIDE/KEEPALIVE/STALE/INVALID_TOKEN/TASK_DONE 信号、prompts 里全部 curl 协议段（_super.md 重写、action-*.md 交卷语义）。
+- **实装要点**：`agentSessions`（task-stream V4）+ `consumeSessionRun`（首 run / send 共用消费管道）+ `sendToTaskSession`；chat 侧 `RunningChatRecord` 变会话记录（agent + runActive）+ `sendChatMessage` + `consumeChatRun`；「run 自然 finished 且 lastAction 还 running」时豁免两种正常情况（后置 check 在跑 = 刚交卷、pendingAsk 在等答案）才判「没交卷就跑了」；stop-hook 同口径豁免。approve 纯服务端落状态。协议信号瘦身到 3 个（ACTION_ACK_REVISE / USER_REPLY / NEXT_ACTION 前缀 + 附件段头）、一致性测试改守「旧协议字样不得残留」。
+- **V0.11.1 会话持久化 + 空闲回收（同日、用户拍板 abc 全做）**：
+  - **Agent.resume 跨重启续会话**：`Task.sessionAgentId` 落盘（create/resume 时写、停止/终结/报错/换新 agent 清、空闲回收保留）；task 侧 `resumeTaskSession`（重建 mergedMcp + `registerSessionBridges` 重注册 handler/notifier——从 internalStartAgent 抽出的共用工厂）、chat 侧 `resumeChatSession` + `registerChatNotifier`。ack / ask-reply 路由随 client `bootArgs`（apiKey/model/gitHost/gitToken、task-store 内部自动附）拿恢复凭据；advance 续用 / chat-reply 天然有。服务重启后「再聊聊 / 答弹窗 / 续用推进 / chat 消息」全部无缝接回原会话
+  - **⚠️ resume 两个必传（实测踩过、AgentNotFoundError / ConfigurationError）**：① `local.cwd` 必须和 create 时一致（本地 agent 按 cwd 定位持久化存储）；② `model` 必须显式传（恢复的 agent 不保留 model、send 会炸）——task 侧优先用最近 action 的 agentModel、chat 侧用 bootArgs.model。已用「记暗号 → 重启 app → 问暗号」实测全链路：resume 成功（autoStarted=false）+ 上下文保留
+  - **会话空闲回收**：task / chat 各一个 sweeper（10min 扫、闲置 2h close、keepPersisted——下次操作 resume 接回、体感无差）、降常驻 agent 子进程数
+  - **boot recovery 不再误伤**：只有 `running`（run 真在跑时进程死了）才标 error；`awaiting_user` 是新模型正常静息态、保留原状（resume 可续）
+  - **preview Windows 杀进程树**：`kill(-pid)` 负号语义 win 不支持、改 `taskkill /T /F`
+  - 顺手清了旧协议死代码 / 误导注释（route-helpers KEEPALIVE 常量、readRecentEvents、十余处注释、README 关键属性段）
+- typecheck / lint / vitest 143 全绿；chat 多轮 send 续接实测通过、task 模式冒烟因 TCC 权限（锁屏 + 重签名）只验到 agent 启动 + 工具调用正常、见 learned-conventions 新增踩坑条目。
+
+### V0.10.1：自更新「稍后重启」防挂死闸 + updates/ 启动清扫（2026-07-07、线上事故沉淀）
+
+- **事故**：正式 app（v0.9.10 进程）7-6 早自更新到 v0.9.14 后用户点「稍后」没重启——mac 自更新是**原地替换 /Applications 里的 .app**、老进程继续跑在被替换的 bundle 上、此后 SDK 沙箱 zsh state-dump helper 因 bundle 失配**永久挂死**（跟 learned-conventions 里「test 包重打不退老实例」同机制）：每起一个 agent run、第一批 shell 调用就永远不返回、任务假死「运行中」（next-server 下挂一排僵尸 `dump_zsh_state`）。7-7 早用户跑「上线审查」action 连卡两次、排查确诊。
+- **修复（marker 硬闸）**：壳 `macSelfUpdate` 替换成功后写 `<data>/update-pending-restart.json`（含新版本号）、壳下次启动删；server 在**所有起新 agent run 的入口**查 marker、存在直接拒绝并提示重启——`advanceTaskInner` / `restartCurrentActionInner` 开头 throw（API 400 透传 toast）、chat-reply 懒重启分支（拦在杀健康旧 Run 之前）+ 终态自动启动分支返 409。已在跑的 run（更新前起的、仍健康）不受影响。新模块 `src/lib/server/update-pending.ts` + `tests/update-pending.test.ts`。
+- **顺带**：壳启动 `cleanupUpdateLeftovers`——清 updates/ 残留（`old-*.app` 暂存旧包 / `mnt-*` 挂载点先 detach 再删 / 残留 dmg；替换现场 rm 偶发失败早前被静默吞、实测积了 4 份 200MB+ 旧包）、并删待重启 marker；替换现场 rm 失败改记日志不再静默。
+- typecheck / lint / vitest 155 全绿（改动含 electron-app/main.js、`node --check` 过）。
 
 ---
 
@@ -353,6 +357,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **批次推导 + 展示（V0.6.23 起、computeBatchProgress 前后端共用 / 进度 chip / 批次表 / 选批 / 测试策略 label）** | `src/lib/task-display.ts` + `src/lib/types.ts: PlanBatch / TestStrategy / TEST_STRATEGY_LABEL` + `src/components/tasks/{batch-progress,batch-plan-table}.tsx` + `advance-dialog.tsx` 选批 |
 | **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |
 | **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
+| **任务 worktree 隔离（V0.10：ensure/remove/孤儿扫描/getTaskCwd/路径归一）** | `src/lib/server/task-worktrees.ts` + `tests/task-worktrees{,.integration}.test.ts` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |
 | **Cursor MCP 只读 API + hook（V0.6.2 新）** | `src/app/api/cursor-mcp/route.ts` + `src/hooks/use-cursor-mcp.ts` |
 | **MCP OAuth（V0.6.4 新、走 OAuth 的远程 MCP 授权 + 注入）** | `src/lib/server/mcp-oauth.ts` + `src/app/api/mcp-oauth/{start,callback,status,revoke}` + `src/hooks/use-mcp-oauth.ts` |

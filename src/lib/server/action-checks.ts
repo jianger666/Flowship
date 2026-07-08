@@ -36,7 +36,8 @@
  * 避免环境问题挡用户主流程（这是软兜底、最终质量靠用户人眼把关）。
  */
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -44,7 +45,7 @@ import path from "node:path";
 import type { ActionRecord, Task } from "@/lib/types";
 
 import { getActionArtifactPath } from "./task-fs-core";
-import { getEffectiveCwd } from "@/lib/path-utils";
+import { getTaskCwd, getTaskWorkRepoPaths } from "./task-worktrees";
 
 export interface ActionCheckResult {
   passed: boolean;
@@ -188,7 +189,8 @@ const checkReview = async (
   }
 
   // 基底 commit 一致性检查（V0.6 门槛 2、P1-2 修复）
-  const cwd = getEffectiveCwd(task.repoPaths);
+  // V0.10：隔离 task 的 cwd = worktree（agent 实际干活的地方、HEAD 在这里才是对的）
+  const cwd = getTaskCwd(task);
   try {
     await fs.access(path.join(cwd, ".git"));
   } catch {
@@ -233,7 +235,8 @@ const checkReview = async (
   // startBaseline 缺失（老 action / 启动时记录失败）→ 跳过比对、fail-open。
   if (action.startBaseline) {
     const touched: string[] = [];
-    for (const repoPath of task.repoPaths) {
+    // V0.10：隔离 task 的基线 key = worktree 路径（captureActionStartBaseline 同口径）
+    for (const repoPath of getTaskWorkRepoPaths(task)) {
       const baseline = action.startBaseline[repoPath];
       if (!baseline) continue;
       const current = await computeWorktreeFingerprint(repoPath);
@@ -537,133 +540,107 @@ const checkCustom = async (
   return { passed: true, details: "自定义 action artifact 已落盘" };
 };
 
-// ----------------- 内部 shell 执行底座（fingerprint / status hash 用）-----------------
+// ----------------- 内部 git 执行底座（fingerprint / status hash 用）-----------------
+//
+// V0.11.x 跨平台改造：原来用 `sh -c` 跑多行 POSIX 脚本拼指纹——Windows 没有 `sh`、
+// `2>/dev/null` 也不是 cmd 语法、整套在 Windows 静默失效（fingerprint 恒返 null、
+// review 只读硬校验 / 兄弟仓越权检测形同虚设）。改成纯 Node 逐条 execFile git：
+// 平台无关、无 shell 注入面、也不再需要自拼 PATH（原 buildCheckEnv 的 unix bin
+// 目录 + `:` 分隔符在 Windows 反而会把 PATH 首项写坏）。
 
-// 命令执行环境：继承 runner（next dev）PATH + 补常见 bin 目录
-const buildCheckEnv = (): NodeJS.ProcessEnv => {
-  const home = process.env.HOME ?? "";
-  const extraBins = [
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    home ? `${home}/.volta/bin` : "",
-    home ? `${home}/.local/bin` : "",
-  ].filter(Boolean);
-  const basePath = process.env.PATH ?? "";
-  return {
-    ...process.env,
-    PATH: [...extraBins, basePath].filter(Boolean).join(":"),
-  };
-};
+const execFileAsync = promisify(execFile);
 
-interface CheckShellResult {
-  exitCode: number;
-  // stdout + stderr 合并（check 日志不区分两路、按时间穿插即可）
-  output: string;
-  timedOut: boolean;
-}
+// 单段输出上限：tracked diff 可能巨大、20MB 兜底防打爆内存（超限 execFile 抛错 →
+// 该段视为采不到、整个指纹返 null = 「无法比对、不拦」、fail-open 同旧行为）
+const FINGERPRINT_PART_CAP = 20 * 1024 * 1024;
 
-// 超时强杀：优先按进程组杀（-pid、连 sh 起的 pnpm/jest 等子进程一起杀、防孤儿泄漏）、退回单进程杀
-// 背景：`sh -c "pnpm test"` 超时只 kill sh 时、真正干活的子进程会脱离成孤儿继续占资源（V0.6.25 蓝军）
-const killProcessTree = (proc: ReturnType<typeof spawn>) => {
+// 跑一条 git 命令、成功返 stdout、失败（非 git 仓 / 超时 / 输出超限）返 null
+const gitCapture = async (
+  repoPath: string,
+  args: string[],
+  timeoutMs = 30_000,
+): Promise<string | null> => {
   try {
-    if (proc.pid) {
-      process.kill(-proc.pid, "SIGKILL");
-      return;
-    }
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: repoPath,
+      timeout: timeoutMs,
+      maxBuffer: FINGERPRINT_PART_CAP,
+    });
+    return stdout;
   } catch {
-    // 进程组不存在 / 平台不支持 negative pid → 退回单杀
-  }
-  try {
-    proc.kill("SIGKILL");
-  } catch {
-    /* 已退出、noop */
+    return null;
   }
 };
 
-// 跑一条 shell 命令（sh -c、支持组合命令）、带超时强杀
-// 单命令 output 累积上限——超了截断、防巨大输出打爆 Next server 内存（V0.6.25 review）
-const CHECK_OUTPUT_CAP = 512 * 1024;
-
-const runCheckShell = (
-  cmd: string,
-  cwd: string,
-  timeoutMs: number,
-  maxOutputBytes = CHECK_OUTPUT_CAP,
-): Promise<CheckShellResult> =>
+// `git hash-object --stdin-paths`：把 untracked 路径列表从 stdin 喂进去、拿逐文件内容 hash。
+// 唯一需要写 stdin 的调用、单独用 spawn（execFile 不便喂 stdin）；出错 / 超时返空串（best-effort）
+const gitHashObjectStdinPaths = (
+  repoPath: string,
+  pathsInput: string,
+): Promise<string> =>
   new Promise((resolve) => {
-    let output = "";
-    // 已达上限、之后输出直接丢弃（进程仍跑、只是不再收集、防内存爆）
-    let truncated = false;
-    let timedOut = false;
-    // detached：子进程独立成新进程组、超时时按 -pid 杀整组（见 killProcessTree）；
-    // 不 unref（仍要等 close 事件收尾）、stdio 默认 pipe 不受影响
-    const proc = spawn("sh", ["-c", cmd], {
-      cwd,
-      env: buildCheckEnv(),
-      detached: true,
+    const proc = spawn("git", ["hash-object", "--stdin-paths"], {
+      cwd: repoPath,
+      windowsHide: true,
     });
+    let out = "";
     const timer = setTimeout(() => {
-      timedOut = true;
-      killProcessTree(proc);
-    }, timeoutMs);
-    // 累积 output、到上限就截断并打明显标记（否则用户看尾部以为命令自然结束）
-    const append = (d: unknown) => {
-      if (truncated) return;
-      output += String(d);
-      if (output.length > maxOutputBytes) {
-        output =
-          output.slice(0, maxOutputBytes) +
-          `\n[output truncated at ${Math.round(maxOutputBytes / 1024)}KB]`;
-        truncated = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* 已退出 */
       }
-    };
-    proc.stdout?.on("data", append);
-    proc.stderr?.on("data", append);
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: -1,
-        output: output + `\n[spawn error] ${err.message}`,
-        timedOut,
-      });
+    }, 30_000);
+    proc.stdout?.on("data", (d) => {
+      out += String(d);
     });
-    proc.on("close", (code) => {
+    proc.on("error", () => {
       clearTimeout(timer);
-      resolve({ exitCode: code ?? -1, output, timedOut });
+      resolve("");
     });
+    proc.on("close", () => {
+      clearTimeout(timer);
+      resolve(out);
+    });
+    // 路径里的文件被并发删掉时 git 会提前退出、stdin 写入报 EPIPE——吞掉、close 兜底 resolve
+    proc.stdin?.on("error", () => {});
+    proc.stdin?.end(pathsInput);
   });
-
-// 工作区指纹脚本（V0.6.25 review）——覆盖：tracked 改 / staged / 删除 / 新增 untracked 文件 / untracked 内容变化
-// 关键：`git diff HEAD` 不含 untracked 文件内容、`git status` 只含路径不含内容、所以单独对 untracked 逐文件 hash。
-// 用 `git hash-object --stdin-paths`（git 原生、空输入安全不 hang、不依赖 bash `read -d` 跨 mac/linux dash 都行）。
-// `--exclude-standard` 排除 gitignore（coverage/cache/node_modules 不算进指纹）。
-const FINGERPRINT_SCRIPT = [
-  "git rev-parse HEAD 2>/dev/null || echo __NOGIT__",
-  "echo __DIFF__",
-  "git diff --no-ext-diff --binary HEAD -- 2>/dev/null",
-  "echo __UPATHS__",
-  "git ls-files --others --exclude-standard 2>/dev/null",
-  "echo __UHASHES__",
-  "git ls-files --others --exclude-standard 2>/dev/null | git hash-object --stdin-paths 2>/dev/null",
-].join("\n");
 
 // 该仓「工作区内容指纹」= sha256(headCommit + tracked diff + untracked 路径 + untracked 内容 hash)
 // review 启动基线记录、结束后重算比对——不一致 = review 期间工作区被改（违反 review 只读铁律）。
-// 给 20MB cap（指纹要完整 diff、不能被默认 512KB 截断）；非 git 仓 / 异常 → null（视为「无法比对、不拦」）。
-// ⚠ 边界：tracked diff 全文 + untracked hash 列表累积 >20MB 会被截断、理论上漏掉 20MB 之后的 tracked 改动
-//   （实际罕见、20MB 纯文本 diff 极大）。要严格无上限、可把 tracked 部分也改成逐文件 hash-object（untracked 已是）。
+// 覆盖：tracked 改 / staged / 删除 / 新增 untracked 文件 / untracked 内容变化——
+// `git diff HEAD` 不含 untracked 文件内容、所以单独对 untracked 逐文件 hash-object；
+// `--exclude-standard` 排除 gitignore（coverage/cache/node_modules 不算进指纹）。
+// 非 git 仓 / 空仓无 HEAD / 异常 → null（视为「无法比对、不拦」）。
 export const computeWorktreeFingerprint = async (
   repoPath: string,
 ): Promise<string | null> => {
-  const r = await runCheckShell(
-    FINGERPRINT_SCRIPT,
-    repoPath,
-    30_000,
-    20 * 1024 * 1024,
-  );
-  if (r.exitCode !== 0) return null;
-  if (r.output.split("\n", 1)[0]?.trim() === "__NOGIT__") return null;
-  return createHash("sha256").update(r.output).digest("hex");
+  const head = await gitCapture(repoPath, ["rev-parse", "HEAD"]);
+  if (head === null) return null; // 非 git 仓 / 无 HEAD（同旧 __NOGIT__ 分支）
+  const diff = await gitCapture(repoPath, [
+    "diff",
+    "--no-ext-diff",
+    "--binary",
+    "HEAD",
+    "--",
+  ]);
+  if (diff === null) return null; // diff 采不到（超限 / 异常）→ 指纹不可信、不拦
+  const upaths =
+    (await gitCapture(repoPath, ["ls-files", "--others", "--exclude-standard"])) ?? "";
+  const uhashes =
+    upaths.trim().length > 0
+      ? await gitHashObjectStdinPaths(repoPath, upaths)
+      : "";
+  return createHash("sha256")
+    .update(head)
+    .update("__DIFF__")
+    .update(diff)
+    .update("__UPATHS__")
+    .update(upaths)
+    .update("__UHASHES__")
+    .update(uhashes)
+    .digest("hex");
 };
 
 // ----------------- build -----------------
@@ -744,19 +721,22 @@ const checkBuild = async (
 const computeRepoStatusHash = async (
   repoPath: string,
 ): Promise<string | null> => {
-  const r = await runCheckShell(
-    "git status --porcelain --untracked-files=all",
+  const out = await gitCapture(
     repoPath,
+    ["status", "--porcelain", "--untracked-files=all"],
     15_000,
   );
-  if (r.exitCode !== 0) return null;
-  return createHash("sha256").update(r.output).digest("hex");
+  if (out === null) return null;
+  return createHash("sha256").update(out).digest("hex");
 };
 
 // 发现 effective cwd 下「非本 task 的兄弟 git 仓」（多仓 cwd = 公共父目录时才有）
+// V0.10：隔离 task 的 cwd = worktrees/<taskId>/、下面只挂本 task 的仓、天然无兄弟仓（返空）
 const discoverSiblingRepos = async (task: Task): Promise<string[]> => {
-  const cwd = getEffectiveCwd(task.repoPaths);
-  const taskRepoSet = new Set(task.repoPaths.map((p) => path.resolve(p)));
+  const cwd = getTaskCwd(task);
+  const taskRepoSet = new Set(
+    getTaskWorkRepoPaths(task).map((p) => path.resolve(p)),
+  );
   // 单仓：cwd = 仓本身、没有兄弟仓概念
   if (taskRepoSet.has(path.resolve(cwd))) return [];
   let entries: import("node:fs").Dirent[];
@@ -795,8 +775,9 @@ export const captureActionStartBaseline = async (
 ): Promise<Record<string, string> | undefined> => {
   try {
     if (actionType === "review") {
+      // V0.10：隔离 task 指纹按 worktree 路径采（agent 实际工作区、key 跟 checkReview 对齐）
       const entries = await Promise.all(
-        task.repoPaths.map(async (p) => {
+        getTaskWorkRepoPaths(task).map(async (p) => {
           const fp = await computeWorktreeFingerprint(p);
           return [p, fp] as const;
         }),
@@ -849,7 +830,9 @@ const runShell = (
   new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
-    const proc = spawn(cmd, args, { cwd, shell: false });
+    // windowsHide：Windows 上从无控制台的 GUI 进程（Electron 壳）起 console 子进程
+    // 会闪黑框、CREATE_NO_WINDOW 压掉（mac/linux 无此概念、传了无副作用）
+    const proc = spawn(cmd, args, { cwd, shell: false, windowsHide: true });
     let timer: NodeJS.Timeout | null = setTimeout(() => {
       try {
         proc.kill("SIGKILL");

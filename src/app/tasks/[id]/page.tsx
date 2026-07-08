@@ -51,6 +51,7 @@ import { EventStream } from "@/components/tasks/event-stream";
 import { RestartDialog } from "@/components/tasks/restart-dialog";
 import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
+import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -89,7 +90,11 @@ import {
   mrKindOf,
   mrTargetBranchOf,
 } from "@/lib/task-display";
-import { getEffectiveCwd, getRepoShortNames } from "@/lib/path-utils";
+import {
+  getEffectiveCwd,
+  getRepoShortNames,
+  getUniqueRepoDirNames,
+} from "@/lib/path-utils";
 import type {
   ActionRecord,
   ActionType,
@@ -735,6 +740,9 @@ const TaskDetailPage = () => {
                   </span>
                 )}
               </div>
+              {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
+                  ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
+              <WorkspaceActions task={task} />
               {/* V0.6.1：MR 链接（ship action 落档后展示、多仓 task 平铺多条） */}
               {task.mrs.length > 0 && (
                 <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
@@ -928,12 +936,16 @@ const TaskDetailPage = () => {
                     baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
                     // 多仓 task：仓短名清单给路径前缀校验用（agent 漏写仓名前缀的
                     // 路径不渲染链接、点了必 404）；单仓不传 = 不校验
+                    // V0.10 隔离 task：cwd 是 worktrees/<taskId>、原仓库路径不在其下、
+                    // 短名 = worktree 子目录名（getUniqueRepoDirNames、跟 server 同源）
                     repoShortNames={
                       task.repoPaths.length > 1
-                        ? getRepoShortNames(
-                            task.repoPaths,
-                            selectedAction.cwd ?? getEffectiveCwd(task.repoPaths),
-                          )
+                        ? task.isolateWorktree
+                          ? getUniqueRepoDirNames(task.repoPaths)
+                          : getRepoShortNames(
+                              task.repoPaths,
+                              selectedAction.cwd ?? getEffectiveCwd(task.repoPaths),
+                            )
                         : undefined
                     }
                     // V0.8.x：批次表全量化 + 追加方案前序入口

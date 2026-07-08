@@ -1,50 +1,25 @@
 /**
  * Task action 模式专用的本地 HTTP MCP server
  *
- * 这个文件做的事情（V0.9.x 拆分后、等待状态机本体在 chat-pending.ts）：
+ * 这个文件做的事情（V0.9.x 拆分、V0.11 wait 协议退役后）：
  * 1. 用官方 `@modelcontextprotocol/sdk` 起一个 stateful 的 HTTP MCP server
  * 2. 在它上面注册 `wait_for_user` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` 工具
- * 3. 工具 handler 调 chat-pending 的 registerPendingEntry / runTaskAction 等（pendingMap 状态在那边）
+ * 3. 工具 handler 调 chat-pending 的 registerPendingAsk / runTaskAction / safeNotifyXxx
  * 4. 暴露一个 fetch-style 的 `handleChatMcpRequest`、给 Next.js App Router 直接调
  *
- * ## V0.6 关键变化：单 SDK Run 永生 + action 历史模型
+ * ## V0.11 模型：create + 多轮 send、run 自然结束（wait 协议退役）
  *
- * task 启动后整段生命周期跑在一个 SDK Run 里。agent 永远不主动结束 Run、
- * 只有 server 端写明确终止信号（[TASK_DONE] / [TASK_ABANDONED] / [CANCELLED]）才退。
+ * - `wait_for_user` = **交卷**（非阻塞）：通知 runner 跑后置 check + 切 awaiting_ack、
+ *   返回「结束本轮回复」——agent 正常结束 turn、run 自然 finished 是**正常路径**
+ * - `ask_user` = **弹窗**（非阻塞）：登记 pendingAsk + 通知 runner 写事件、返回「结束本轮回复」
+ * - 用户的一切后续操作（再聊聊 / 推进 / ask 答案 / chat 消息）由 server 端
+ *   `agent.send(buildAgentMessage(...))` 以新消息送达、agent 在同一会话（同 Agent 实例）继续：
+ *   - `[ACTION_ACK revise] <feedback>`：用户点「再聊聊」
+ *   - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]` + 指令：推进（续用会话）
+ *   - `[USER_REPLY]` / `[ASK_USER_REPLY]`：chat 消息 / ask 答案
+ * - approve（通过）纯服务端落状态、终态（合入/放弃）直接 cancel 活 run + 关会话——都不再发信号
  *
- * 信号统一改成 action 维度：
- *   - `[ACTION_ACK approve]` / `[ACTION_ACK revise]`：ack 当前 action（替 V0.5 [PHASE_ACK *]）
- *   - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]`：用户在 UI 推进新 action
- *   - `[USER_REPLY]`：ask_user 答完 / chat 模式用户消息（chat 模式走独立 chat-runner、但复用同一 pendingMap / wait-ack 通路）
- *   - `[CANCELLED]` / `[STALE]` / `[INVALID_TOKEN]`：终态（沿用）
- *
- * agent 协议（详见 prompts/_super.md）：
- *   - 一个 action 完成（写完 artifact）→ wait_for_user({task_id, action_id, artifact_path}) 等 ACTION_ACK
- *   - ACTION_ACK approve → 立刻再调 wait_for_user({task_id}) （**不**带 action_id）等下一 action 指令
- *   - 收到 [NEXT_ACTION ...] → 解析头部 + 用户指令、执行对应 action prompt
- *   - 整段 Run 持续到 server 写 [TASK_DONE] / [TASK_ABANDONED] / [CANCELLED]
- *
- * ## V0.3.5 保活机制：shell + curl long-poll 取代 MCP 轮转（沿用至 V0.6）
- *
- * wait_for_user / ask_user 立即返回 shell 引导、agent 调 `shell` 工具跑
- * `curl -sN '<url>/api/tasks/:id/wait-ack?token=…'` 跟服务端建一条长 HTTP 连接。
- * /wait-ack 路由 subscribeWaitAck 拿 pendingMap 里的 promise、服务端 chunked write
- * 每 60 秒一次 `[KEEPALIVE ts=...]` 普通文本行、用户 ack/reply/advance 时 resolve
- * 这个 promise → 写一行结果 + 关连接 → curl 拿到 stdout → agent 推进下一步。
- *
- * ## 不做的
- *
- * - 不做 MCP session id 跨进程：本来 stateless 就够、但 wait_for_user 长阻塞必须 stateful 复用 transport
- * - 不做并发去重：同一个 task 同时只允许一个 pending entry、新 wait_for_user 顶旧的
- * - 不做 dev hot reload 状态恢复：开发时模块重载会丢 pendingMap、能接受
- * - **单条 curl 长链接（V0.7.18 起、简化自旧 while 重连）**：wait-ack 引导给的就是一条 `curl -sN`——本地回环连接稳定、
- *   不加 `--max-time`、不套 while 重连。服务端每 60 秒发 `[KEEPALIVE]` 维持（防 SDK shell idle-timeout 杀连接）、
- *   用户 ack 时 resolve → 写终态行 + 关流 → curl 自然 exit、agent 推进。旧 while/max-time 是早期对「连接会断」的过度防御、
- *   实测本地长连不会断、反而徒增 agent 把 curl 放后台 / 自己重连的误操作面（V0.7.17 踩过 composer 放后台导致 run 提前退）、故 V0.7.18 砍掉。
- *   （subscribeWaitAck 不消费 token、route abort 不清 pendingMap entry、所以 curl 万一意外断、同 token 再调一次能接上同一 entry。）
- * - **只有真失效才退 run**：[STALE]/[INVALID_TOKEN]（多为 dev hot reload / 服务重启丢 pendingMap）或 curl 异常 exit、
- *   agent 退 run、用户在 UI 手动「推进」起新 agent 接力（task 走 /advance→advanceTask、chat 走 /chat-reply→runChatSession、
- *   Agent.create + send、靠任务事件日志恢复上下文、不是 resume 原会话）
+ * 旧「单 Run 永生 + shell curl 长轮询 wait-ack」机制（V0.3.5~V0.10）已删、见 git 历史。
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -53,138 +28,43 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
-import type { TaskEvent } from "../types";
-import { shellWaitGuideHead } from "../protocol-signals";
 import {
-  chatShellWaitGuideBody,
-  shellCurlRunSection,
-  waitDisciplineSection,
-} from "./wait-protocol-prompt";
-import { readRecentEvents } from "./task-fs-core";
-import {
-  PREMATURE_CHAT_WAIT_EVENT_LIMIT,
-  classifyPrematureChatWait,
-} from "./premature-chat-wait";
-import {
-  chatModeTasks,
-  prematureWaitRejects,
-  registerPendingEntry,
+  registerPendingAsk,
   runTaskAction,
   safeNotifyAskUserRequest,
   safeNotifyAwaiting,
   sessionTransports,
-  unansweredRevises,
-  waitingTasks,
   type AskUserQuestion,
 } from "./chat-pending";
 
-// ----------------- chat premature wait 兜底（跟 wait_for_user handler 强耦合、留本文件） -----------------
+// ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
-// 连续拒绝上限：超过就放行（宁可让对话继续、也不让模型死循环烧 token）。
-// 2 = 给模型「拒一次→补正文」的机会、第二次还不补就别拦了（极少数模型真不配合）。
-const PREMATURE_WAIT_REJECT_CAP = 2;
-
-// 兜底 A 拒绝时返回给 agent 的纠正文本（不给 curl / 不注册 pending entry——
-// 没有可挂等的 token、模型唯一出路就是把正文直接输出、再调 wait_for_user）。
-// M/C'：只在「message 空 + 用户在等回答 + 也没 stream 出正文」时才触发。
-const PREMATURE_WAIT_REJECT_TEXT = [
-  "[ANSWER_FIRST] 你还没把回答交付给用户就想挂等——本次 wait_for_user 不予受理。",
-  "（用户看得到你直接输出的正文、但你这轮一个字的正文都没输出、用户那边一片空白。）",
-  "把本轮的答案 / 可用分段**直接输出**给用户（成品本身、不是「我这就写」的计划）、再调 `wait_for_user`（message 填一句话概括）。",
-].join("\n");
-
-/**
- * 兜底 A 检测的 IO 包装：读最近事件喂给纯判定 classifyPrematureChatWait（见同名独立模块）。
- * limit=0 读全量事件：chat 每轮 wait_for_user 才跑一次、events.jsonl 通常也就几百到几千行，
- * 不值得为这点 IO 冒「长首轮把 runStart / firstMessage 挤出窗口」导致 fail-open 的风险。
- * 读不到 / 解析异常一律 fail-open（返 false 不拦）——兜底逻辑不能反过来卡死正常对话。
- */
-const isPrematureChatWaitOnce = async (taskId: string): Promise<boolean> => {
-  let events: TaskEvent[];
-  try {
-    events = await readRecentEvents(taskId, PREMATURE_CHAT_WAIT_EVENT_LIMIT);
-  } catch {
-    return false;
-  }
-  return classifyPrematureChatWait(events);
-};
-
-const detectPrematureChatWait = async (taskId: string): Promise<boolean> => {
-  // 第一次判不 premature → 直接放行
-  if (!(await isPrematureChatWaitOnce(taskId))) return false;
-  // 判 premature 时再给 250ms 复核：防「正文刚发出、flush 的 assistant_message 事件还没落盘」
-  // 的竞态把合法回答误判成 premature（wait_for_user 的 MCP 调用和事件落盘是并发的）。
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  return await isPrematureChatWaitOnce(taskId);
-};
-
-// ----------------- shell 引导文本：教 agent 调 shell + curl wait-ack -----------------
-//
-// wait_for_user / ask_user MCP 工具 handler 立即返回这段文本、agent 看到 [SHELL_WAIT_GUIDE]
-// 标记就该调 shell 工具执行 curl 命令、跟服务端 /api/tasks/:id/wait-ack 路由建长连接。
-//
-// V0.6 改造：context 文案改成 action 维度、新增 [NEXT_ACTION ...] 解读说明
-const buildShellWaitGuidance = (
-  taskId: string,
-  token: string,
-  opts: {
-    actionId?: string;
-    artifactPath?: string;
-    mode: "wait_for_user" | "ask_user";
-    // V0.6.31：未处理 revise 自动纠正命中时 true、引导文本头部加责令段
-    reviseCorrection?: boolean;
-  },
-): string => {
-  const baseUrl = getServerBaseUrl();
-  const url = `${baseUrl}/api/tasks/${encodeURIComponent(taskId)}/wait-ack?token=${encodeURIComponent(token)}`;
-  // V0.7.20：chat 模式走精简引导（USER_REPLY 语境、不夹 task 专属的 ACTION_ACK / NEXT_ACTION 信号）。
-  // 完整等待纪律已在 chat 起手 prompt（chatWaitProtocolSection）讲过一次、这里只给 curl + 怎么读输出。
-  if (chatModeTasks.has(taskId)) {
-    return [shellWaitGuideHead(token), "", chatShellWaitGuideBody(url)].join("\n");
-  }
-  const contextLine =
-    opts.mode === "ask_user"
-      ? "等用户在 UI 弹窗里答完 ask_user 问题、curl 拿到 `[USER_REPLY]` 行带 markdown Q&A、解析每条答案接着工作。"
-      : opts.actionId
-        ? `等用户对 action=${opts.actionId}（artifact=${opts.artifactPath ?? "<未指定>"}）点 approve / revise、curl 拿到 \`[ACTION_ACK approve]\` 或 \`[ACTION_ACK revise] <feedback>\` 接着推进。`
-        : "等用户在 UI 点「推进」选下一 action。curl 可能拿到：\n    - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]\\n\\n<用户指令>` → 解析头部 + 按对应 action prompt 执行";
-  const correctionBlock = opts.reviseCorrection
-    ? [
-        "",
-        "## 🚨 协议违规、已被服务端纠正（先读这段再跑 shell）",
-        "",
-        `你刚收到 action=${opts.actionId} 的 [ACTION_ACK revise] feedback、但**没做任何处理**就调了 wait_for_user 且没带 action_id。`,
-        "服务端已强制把本次等待绑回该 action。**在跑下面的 shell 之前、你必须先补上欠用户的处理**（super-prompt §3 revise 二分类）：",
-        "  - feedback 是纯疑问句（问类）→ 立刻 emit 一条 assistant_message 完整答疑、不动 artifact",
-        "  - 其他（改类、含模糊兜底）→ 立刻调 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动手",
-        "处理完再跑 shell 等这个 action 的下一次 ack。下次记住：revise 处理完重新调 wait_for_user 时**必须带同一 action_id**。",
-      ]
-    : [];
-  return [
-    shellWaitGuideHead(token),
-    ...correctionBlock,
+// wait_for_user 交卷成功后的返回：明确「结束回复、别等待」——这是 run 自然结束的正常出口
+const submittedText = (actionId: string): string =>
+  [
+    `[SUBMITTED] action=${actionId} 已交卷、系统正在后台跑质量检查、用户会收到通知。`,
     "",
-    shellCurlRunSection(url),
-    "",
-    "## stdout 解读规则（决定你下一步动作、必背）",
-    "",
-    "shell stdout 按时序输出这些行、看到哪个按哪个走：",
-    "",
-    "  - `[KEEPALIVE ts=...]`：60 秒一次心跳、忽略它。",
-    `  - \`[ACTION_ACK approve]\`：用户点了「通过」、curl exit。**不要结束 Run**、立刻再调 \`wait_for_user(task_id=${taskId})\`（不带 action_id）等下一 action 指令。**别 emit 总结**——用户在看板看 timeline 推进就够。`,
-    "  - `[ACTION_ACK revise] <feedback>`：用户点了「再聊聊」、按 super-prompt §3 revise 二分类处理（问类 emit 答疑 / 改类 ask_user 复述后 edit）、完事再调 `wait_for_user(task_id, action_id, artifact_path)` 等同 action 下一次 ack。",
-    "  - `[NEXT_ACTION action_id=... type=... n=... artifact_path=...]` + 空行 + `<用户指令>`：用户推进新 action、解析头部 + 指令、跳对应 action 执行。",
-    "  - `[USER_REPLY] <markdown Q&A>`：ask_user 答完、按内容推进（chat 自由对话不走本工具）。",
-    "  - `[TASK_DONE]` / `[TASK_ABANDONED]` / `[CANCELLED]`：收尾结束 Run。",
-    "  - `[STALE]` / `[INVALID_TOKEN]`：本 token 失效、别重试、自然结束 Run。",
-    "  - `[INTERNAL_ERROR]`：服务端内部错误、重调一次 `wait_for_user`（同参数）重建、连续 2 次仍 INTERNAL_ERROR 才结束 Run。",
-    "",
-    waitDisciplineSection(),
-    "",
-    "## 这次 wait 的目的",
-    contextLine,
+    "**你这一轮的工作已全部完成、请立即结束本轮回复（正常结束 turn）。**",
+    "- 不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要再调本工具",
+    "- 不要输出总结（用户在看板看 timeline 就够）",
+    "- 用户的决定（通过 / 再聊聊 / 推进下一步）之后会作为**新消息**发给你、你会在同一会话里继续",
   ].join("\n");
-};
+
+// 旧「待命态」姿势（不带 action_id）兜底：告诉 agent 直接结束回复
+const idleWaitText = (): string =>
+  [
+    "[NO_WAIT_NEEDED] 本系统不需要挂起等待：请直接结束本轮回复（正常结束 turn）。",
+    "用户的下一步操作会作为新消息发给你、你会在同一会话里继续。",
+  ].join("\n");
+
+// ask_user 提交成功后的返回：弹窗已推给用户、结束回复等答案以新消息送达
+const askSubmittedText = (askId: string): string =>
+  [
+    `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 弹窗）。`,
+    "",
+    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问。",
+    "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（含每条 Q 的答案、或 `[ASK_USER_REPLY deferred]` 表示用户选了稍后再补充——按 default 推进并把未答项列进 artifact §6 待澄清）。",
+  ].join("\n");
 
 // ----------------- McpServer 构造 -----------------
 
@@ -197,55 +77,40 @@ const buildMcpServer = (): McpServer => {
   srv.registerTool(
     "wait_for_user",
     {
-      title: "发起一次等用户 ack 请求（立即返回 shell 引导）",
+      title: "交卷：宣告当前 action 完成（非阻塞、调完就结束本轮回复）",
       description: [
-        "ai-flow 用这个工具发起一次「等用户」请求、本工具**立即返回一段 [SHELL_WAIT_GUIDE] 引导文本**、",
-        "教你调 `shell` 工具用 curl 跟服务端 /api/tasks/:id/wait-ack 路由建长连接等结果。",
+        "Task 模式（action 容器）专用：完成一个 action（写完 artifact）后调本工具**交卷**。",
+        "系统会在后台跑质量检查、然后通知用户来审。**本工具立即返回、不会阻塞**。",
         "",
-        "## 调用前提（按你所处模式自检）",
+        "## 硬性规则",
         "",
-        "- **Chat 模式（自由对话、形如 `wait_for_user({ task_id, message })`）**：把回复**正文直接输出**给用户（正常说话、会实时流式显示）；`message` 参数只填**这一轮回复的一句话概括**（给历史 / 标题用、不是完整正文）。本轮已收到用户消息时、先把正文输出出来、再调本工具（message 填概括）；无用户消息（起手等第一句）时可不带 message 直接调。",
-        "- **Task 模式（action 容器）**：写完 artifact 就是交付、按下方 A / B 用法调本工具等 ack——**不必**带 message（artifact 已是交付物、见下方「调用礼仪」）。",
+        "- **完成一个 action（写完 artifact）后必须调一次本工具**——不调 = action 没完成、runner 会把任务标 failed",
+        "- **不要写完 artifact 只发 assistant_message 说「请你确认」就结束**——必须调本工具交卷",
+        "- **调完本工具后、立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）",
+        "- 用户的决定（通过 / 再聊聊 / 推进下一步）会作为**新消息**发给你、你在同一会话里继续",
         "",
-        "> 下方「硬性规则 / 两种用法 / 调用礼仪」只适用于 **Task 模式**；**Chat 模式**只需守住上面那条「正文直接输出、message 填概括、再 wait」、与 action / artifact / approve / runner failed 无关、别把 task 待命态规则套到 chat 上。",
+        "## 用法",
         "",
-        "## 硬性规则（task 模式、不遵守 ai-flow runner 会把任务标 failed）",
-        "",
-        "- **完成一个 action（写完 artifact）后必须调一次本工具**、shell 拿到 `[ACTION_ACK approve]` / `[ACTION_ACK revise]` 才能继续",
-        "- **不调本工具 = action 没完成**、runner 在 run 结束时硬检测、有 action 状态不是 ack 一律标 failed",
-        "- **不要写完 artifact 后只发 assistant_message 说「请你 approve」就退出 run**——实测最常见的错误模式",
-        "- **绝对不要主动结束 Run**——只有服务端写 [TASK_DONE] / [TASK_ABANDONED] / [CANCELLED] 时 Run 才该结束",
-        "",
-        "## 两种用法（按所处阶段选）",
-        "",
-        "### A. action 内 ack（完成 action artifact 后）",
-        "  - 用法：`wait_for_user({ task_id, action_id, artifact_path })`",
+        "`wait_for_user({ task_id, action_id, artifact_path })`",
         "  - `action_id`：当前 action 的 id（agent 启动时 / [NEXT_ACTION ...] 头里传过的）",
         "  - `artifact_path`：刚产出的 artifact 相对路径（如 `actions/1-plan.md`）",
-        "  - 返回：`[SHELL_WAIT_GUIDE]`、按引导调 shell + curl 等用户 approve / revise",
-        "",
-        "### B. 待命态（ack approve 完、等用户推进下一 action）",
-        "  - 用法：`wait_for_user({ task_id })`（**不**传 action_id）",
-        "  - 返回：`[SHELL_WAIT_GUIDE]`、curl 等用户在 UI 选下一 action、stdout 拿 `[NEXT_ACTION ...]` + 用户指令",
         "",
         "## 调用礼仪",
-        "  - 调用前 / 中 / 后都不要在 assistant_message 里讲本工具的存在、对用户透明",
-        "  - 每完成一个 action 调一次 A 路径（不要每写一句就调、也不要写完了不调）",
-        "  - 拿到 [ACTION_ACK approve] 后立刻调 B 路径（不带 action_id）等下一 action 指令",
+        "  - 每完成一个 action 调一次（不要每写一句就调、也不要写完了不调）",
+        "  - 调用前 / 后都不要在正文里讲本工具的存在、对用户透明",
+        "  - Chat 模式（自由对话）**不需要**调本工具——直接把回复正文输出、说完自然结束回复即可",
       ].join("\n"),
       inputSchema: {
         task_id: z.string().describe("任务 id（agent 启动时被告知）"),
         message: z
           .string()
           .optional()
-          .describe(
-            "【Chat 模式：填这一轮回复的一句话概括】给历史记录 / 标题用、不是完整正文——回复正文请直接输出给用户（会实时流式显示）。Task 模式 / chat 起手等第一句时不用传。",
-          ),
+          .describe("可选：这一轮工作的一句话概括（审计用、不展示给用户）"),
         action_id: z
           .string()
           .optional()
           .describe(
-            "完成一个 action 后必传：当前 action 的 id（agent 启动 / [NEXT_ACTION] 头里传过的）。等下一 action 指令时留空。",
+            "完成一个 action 后必传：当前 action 的 id（agent 启动 / [NEXT_ACTION] 头里传过的）。",
           ),
         artifact_path: z
           .string()
@@ -257,139 +122,58 @@ const buildMcpServer = (): McpServer => {
     },
     async ({ task_id, message, action_id, artifact_path }) => {
       console.log(
-        `[chat-mcp] wait_for_user 入参 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<待命>"} artifact_path=${artifact_path ?? "<none>"}`,
+        `[chat-mcp] wait_for_user 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"}`,
       );
 
-      // M/C'（text-delta + 概括）：chat 回复正文走「直接输出」（text-delta、case "assistant" 流式展示）、
-      // message 只填一句话概括、纯做「逼 composer 先产出正文再挂等」的钩子、不展示给用户
-      //（task 模式 wait 是 action 内 ack、artifact 已落 = 已交付、语义不同、不掺）。
-      // 仅 chat + 待命态（不带 action_id）走这套：
-      //   - message 非空（概括）= composer 声明本轮已回复 → 清拒绝计数、放行挂等（概括不展示、正文已 text-delta 流式展示）
-      //   - message 空 → 兜底 A（读 events 判定）：只有「用户在等回答 + 本轮也没 stream 出任何正文」才拦
-      //     （premature）。两个合法空场景不误拦：① chat 起手无首条 = 无 obligation = 放行；
-      //     ② agent 把正文走了 text-delta = hasAnswered = 不拦（M/C' 正常路径、正文已流式展示）。
-      if (chatModeTasks.has(task_id) && !action_id) {
-        const chatMsg = (message ?? "").trim();
-        if (chatMsg.length > 0) {
-          if ((prematureWaitRejects.get(task_id) ?? 0) > 0) {
-            prematureWaitRejects.delete(task_id);
-          }
-        } else {
-          const rejected = prematureWaitRejects.get(task_id) ?? 0;
-          if (
-            rejected < PREMATURE_WAIT_REJECT_CAP &&
-            (await detectPrematureChatWait(task_id))
-          ) {
-            prematureWaitRejects.set(task_id, rejected + 1);
-            console.warn(
-              `[chat-mcp] wait_for_user 兜底拦截 premature wait：task=${task_id} 第 ${rejected + 1} 次（上限 ${PREMATURE_WAIT_REJECT_CAP}）`,
-            );
-            return {
-              content: [
-                { type: "text" as const, text: PREMATURE_WAIT_REJECT_TEXT },
-              ],
-            };
-          }
-          // 正常放行（或已达上限放弃拦截）→ 清计数、下一轮从头算
-          if (rejected > 0) prematureWaitRejects.delete(task_id);
-        }
+      // 不带 action_id（chat 模式旧姿势 / 老 prompt 惯性「待命态」）→ 不需要任何等待、
+      // 通知 runner 切 awaiting_user（有 notifier 才生效）、指示 agent 直接结束回复
+      if (!action_id) {
+        await safeNotifyAwaiting(task_id, {});
+        return {
+          content: [{ type: "text" as const, text: idleWaitText() }],
+        };
       }
 
-      // V0.6.31 自动纠正：上一次 ack 是 revise 且 agent 还没闭环（没带原 action_id 回来）时——
-      //   - 不带 action_id（实测踩坑姿势：agent 收到 revise 什么都不干直接退待命）→ 强制按原 action
-      //     注册 ack 态：UI 的 通过/再聊聊 按钮不丢、用户还能继续对话；返回文本责令 agent 补处理
-      //   - 带原 action_id 回来（协议正确、答疑 / 弹窗已做）→ 标记闭环、正常放行
-      let effectiveActionId = action_id;
-      let effectiveArtifactPath = artifact_path;
-      let reviseCorrection = false;
-      const owed = unansweredRevises.get(task_id);
-      if (owed) {
-        if (!action_id) {
-          effectiveActionId = owed.actionId;
-          effectiveArtifactPath = owed.artifactPath;
-          reviseCorrection = true;
-          console.warn(
-            `[chat-mcp] wait_for_user 自动纠正：task=${task_id} 有未处理 revise（action=${owed.actionId}）、agent 没带 action_id、强制回 ack 态`,
-          );
-        } else {
-          // 带了 action_id（原 action 或新 action）都视为 agent 已在正轨、标记闭环
-          unansweredRevises.delete(task_id);
-        }
-      }
-
-      // V0.3.5：注册 pending entry（建 promise、写 pendingMap、生成 token）、立即返回 shell 引导
-      // 旧 entry 由 registerPendingEntry 自动 stale 顶替（极少见、agent 通常一次 wait 走完）
-      const entry = registerPendingEntry(task_id, {
-        actionId: effectiveActionId,
-        artifactPath: effectiveArtifactPath,
+      // 交卷：通知 runner（后台跑 check + 切 awaiting_ack、见 task-runner awaitingNotifier）
+      await safeNotifyAwaiting(task_id, {
+        actionId: action_id,
+        artifactPath: artifact_path,
       });
 
-      // 仅当「之前不在等待」时才通知 runner 切 task.runStatus = awaiting_user
-      // （registerPendingEntry 顶替旧 entry 时 finalizeEntry 会清 waitingTasks、所以这里能再 add）
-      // V0.6.19：若 registerPendingEntry 刚兑现了挂起的 NEXT_ACTION（entry 已 resolved）、
-      // agent 马上要跑下一 action、不是真在等用户 → 跳过 awaiting_user notify、
-      // 否则会把 advanceTask 刚设的 running 错切回 awaiting_user（build 全程显示成「等待用户」）。
-      if (!entry.resolved && !waitingTasks.has(task_id)) {
-        waitingTasks.add(task_id);
-        await safeNotifyAwaiting(task_id, {
-          actionId: effectiveActionId,
-          artifactPath: effectiveArtifactPath,
-        });
-      }
-
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: buildShellWaitGuidance(task_id, entry.token, {
-              actionId: effectiveActionId,
-              artifactPath: effectiveArtifactPath,
-              mode: "wait_for_user",
-              reviseCorrection,
-            }),
-          },
-        ],
+        content: [{ type: "text" as const, text: submittedText(action_id) }],
       };
     },
   );
 
-  // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态、V0.5.6 无上限）-----------------
+  // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态、V0.11 非阻塞）-----------------
   //
   // 设计动机（用户拍板）：
   //   - 单次调用：把当前 turn 想得到的不确定项**一次性打包**成 questions[]、UI modal 一次问完
   //   - V0.5.6 改：**没有「一个 action 最多 1 次」上限**——agent 按内容判断、按需多次调
-  //     比如初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项
-  //     直到所有问题都收敛到明确决策（A 路径）才 wait_for_user
   //   - V0.5.6 加 defer：用户可在 UI 弹窗点「稍后再补充」、agent 拿 [ASK_USER_REPLY deferred]
   //     跳过这组 Q、按 default 推进、列进 artifact §6 待澄清
   //
-  // 返回值：拼接成 markdown 的文本、agent 直接读、按头部协议分两种走法：
-  //   - 用户答了：`[ASK_USER_REPLY]\nQ1: ...\nA: ...\n\nQ2: ...\nA: ...`
-  //   - 用户点稍后再补充：`[ASK_USER_REPLY deferred]\n...\n未答问题清单：\nQ1: ...\nQ2: ...`
-  //
-  // V0.3.5 保活语义同 wait_for_user：立即返回 [SHELL_WAIT_GUIDE token=xxx]、
-  // agent 调 shell 工具跑 curl 长连接 /api/tasks/:id/wait-ack、stdout 一行解析结果。
-  // 复用 pendingMap：同一时刻一个 task 只能有一个 pending
+  // V0.11 非阻塞语义：调用 = 弹窗推给用户 + 登记 pendingAsk、立即返回「结束本轮回复」；
+  // 用户答完后答案以 `[ASK_USER_REPLY]` 开头的新消息（agent.send）送达、agent 同会话继续。
   srv.registerTool(
     "ask_user",
     {
       title: "action 内打包提问（一次问完所有不确定项）",
       description: [
-        "结构化 action（plan / build / review / ship / learn / dev）内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、阻塞等用户在 UI 弹窗里答完整组。",
+        "结构化 action（plan / build / review / ship / learn / dev）内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、推给用户 UI 弹窗。",
         "对标 Cursor `askFollowUpQuestion`：UI 出选项按钮 + 可选自由文本输入。",
         "",
         "## ⚠️ chat 模式（task.mode === 'chat'）禁用（V0.6.0.1 拍板）",
         "",
-        "**本工具只用于 task 容器模式的 action（plan / build / review / ship / learn / dev）**。chat（自由对话）任务跑在独立 chat-runner、prompt 里已禁用 ask_user——",
-        "chat 模式有问题想跟用户确认时、**直接 emit 一段 assistant_message 问**就行（用 markdown 列清楚 A/B/C 选项也可以、但走文本不走弹窗）、然后正常 wait_for_user 等用户回。",
-        "用户原话：「自由模式下不用提问、直接回答、自由模式就是 talk 而已」。",
+        "**本工具只用于 task 容器模式的 action**。chat（自由对话）有问题想确认时、直接在正文里问（markdown 列 A/B/C 选项也行）、说完结束回复等用户下一条消息。",
         "",
-        "## 关键约束（V0.5.6 重写：无次数上限、按内容收敛）",
+        "## 关键约束",
         "",
-        "- **单次调用内**：把当前轮想问的问题**全部打包**到 questions[]、UI modal 一次答完——不要同一时刻调多次（一时刻只能有一个 pending、第二次会顶替第一次）",
-        "- **整个 action 内无次数上限**：agent 按内容判断——比如「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项」是正常流程",
-        "- **收敛标准**：所有问题都得到「明确的业务决策」（即 A 路径——能直接落进 artifact 的）才能 wait_for_user。判不准就再问、不要打 default 跳过",
-        "- **只在确实有不确定项时调用**——没问题就跳过、直接 wait_for_user",
+        "- **单次调用内**：把当前轮想问的问题**全部打包**到 questions[]、UI modal 一次答完——不要同一时刻调多次（一时刻只能有一组 pending、第二次会顶替第一次）",
+        "- **整个 action 内无次数上限**：agent 按内容判断——「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项」是正常流程",
+        "- **收敛标准**：所有问题都得到「明确的业务决策」（能直接落进 artifact 的）才交卷（wait_for_user）。判不准就再问、不要打 default 跳过",
+        "- **只在确实有不确定项时调用**——没问题就跳过、直接交卷",
         "- **options 里不要手动塞「Other / 其他 / 其它 / 以上都不是 / 自定义」类的兜底选项**——`allow_text=true` 时 UI 会自动渲染「以上都不是 / 自定义回答…」按钮、你再加会重复",
         "",
         "## 何时调用",
@@ -397,30 +181,17 @@ const buildMcpServer = (): McpServer => {
         "- artifact 初稿写完、扫一遍发现有不确定 / 多选 / 歧义点：上下文冲突、口径不清、接口字段不明、技术路线 A/B",
         "- 用户上一轮答案模糊 /「你定 / 看代码再说」——read/grep 形成判断后、再调一次给具体业务选项让用户拍板",
         "- revise 闭环里用户 feedback 含混（C 路径）——调一次复述意图",
-        "- 把当前轮所有问题打包进 questions[]、一次问完",
         "",
-        "## 入参",
+        "## 返回值（V0.11 非阻塞）",
         "",
-        "- `task_id`：任务 id（启动时被告知）",
-        "- `action_id`：当前所处 action 的 id（agent 启动 / [NEXT_ACTION] 头里传过的）",
-        "- `questions`：问题数组、每条结构：",
-        "    - `id`：问题唯一标识、不要重复（如 `q1` / `q2` / `conflict_role`）",
-        "    - `question`：问题正文、清晰可读、必要时带背景（≤ 200 字）",
-        "    - `options`：可选项数组 `[{id, label}, ...]`、2-4 个具体**业务选项**、最多 6 个、**UI 自动加 A/B/C/D 字母前缀**",
-        "      - **严禁** 在 options[] 里塞「其他 / Other / 自定义 / 自由文本说明 …」这类兜底项",
-        "    - `allow_text`：保留默认 true。它只是控制 UI 是否渲染那个「以上都不是 / 自定义回答…」按钮、不要把它理解成「我要在 options 里加一个 Other 选项」",
-        "",
-        "## 返回值（V0.3.5 起：shell + curl long-poll、V0.5.6 加 deferred）",
-        "",
-        "- 立即返回 `[SHELL_WAIT_GUIDE token=xxx]`、文本里附完整 curl 命令——调一次 `shell` 工具跑这条命令、长连接挂在 /api/tasks/:id/wait-ack",
-        "- 用户在弹窗答完后、shell stdout 可能拿到两类头：",
-        "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按 A/B/C/D 分级处理（A 直接落 artifact；C 模糊 → 再调一次 ask_user 给具体选项）",
-        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user 2）把这些 Q 完整列进 artifact「§6 待澄清」段、按你判断的合理 default 推进 3）继续 wait_for_user",
-        "- 其他可能 stdout 行：`[CANCELLED]`（用户取消任务）/ `[STALE]`（旧 token 被新 wait_for_user 顶替）/ `[INVALID_TOKEN]`",
+        "- 立即返回 `[ASK_SUBMITTED]` = 弹窗已推送——**你应立即结束本轮回复（正常结束 turn）**、不要执行任何等待 / 轮询命令",
+        "- 用户答完后、答案以**新消息**发给你（同一会话继续）、两种头：",
+        "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按内容推进（模糊 → 再调一次 ask_user 给具体选项）",
+        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——1）不再就这组 Q 重新提问 2）把这些 Q 完整列进 artifact「§6 待澄清」段、按你判断的合理 default 推进",
         "",
         "## 调用礼仪",
         "",
-        "- 调用前 / 后不要 assistant_message 解释「我先问几个问题」「我再问一次」之类、UI modal 会自动弹出来",
+        "- 调用前 / 后不要在正文解释「我先问几个问题」之类、UI modal 会自动弹出来",
         "- 答完后不要复述「你刚才选了 X」、直接按答案推进、在 artifact 正文（§1 / §3 / §4 等结论引用处）就地加 `> ✅ ask_user 已确认：用户选 X` 内联备注",
         "- 答案**只**写到 artifact、**不再**自动落 contextDocs——单一数据源、避免重复",
       ].join("\n"),
@@ -470,31 +241,26 @@ const buildMcpServer = (): McpServer => {
         allowText: q.allow_text !== false,
       }));
 
-      // V0.3.5：注册 pending entry（生成 token、建 promise）、立即返回 shell 引导
-      const entry = registerPendingEntry(task_id, { actionId: action_id });
+      // V0.11：登记 pendingAsk（新提问顶旧的、token 防旧弹窗答案串新提问）、立即返回「结束回复」
+      const ask = registerPendingAsk(task_id, {
+        askId,
+        questions: normalized,
+        actionId: action_id,
+      });
       console.log(
-        `[chat-mcp] ask_user 入参 task=${task_id} action_id=${action_id ?? "<none>"} askId=${askId} token=${entry.token} questions=${normalized.length}`,
+        `[chat-mcp] ask_user 入参 task=${task_id} action_id=${action_id ?? "<none>"} askId=${askId} token=${ask.token} questions=${normalized.length}`,
       );
 
       // 通知 runner 写 ask_user_request 事件 + 切 runStatus = awaiting_user
       await safeNotifyAskUserRequest(task_id, {
         askId,
-        token: entry.token,
+        token: ask.token,
         questions: normalized,
         actionId: action_id,
       });
-      waitingTasks.add(task_id);
 
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: buildShellWaitGuidance(task_id, entry.token, {
-              actionId: action_id,
-              mode: "ask_user",
-            }),
-          },
-        ],
+        content: [{ type: "text" as const, text: askSubmittedText(askId) }],
       };
     },
   );
@@ -926,24 +692,3 @@ export const getChatMcpUrl = (): string => {
   return `http://127.0.0.1:${port}/api/mcp/chat-tool`;
 };
 
-/**
- * 给 buildShellWaitGuidance 用：推算 web server 的 base URL、agent 拼成 /wait-ack URL 让 shell curl
- *
- * 优先级跟 getChatMcpUrl 对齐、避免两套配置：
- *   1. FE_AI_FLOW_BASE_URL（拼协议+域名、外网可达）
- *   2. PORT（Next.js dev/prod 都注入）
- *   3. 8876 兜底
- *
- * 注意：必须 agent 本机能访问到的 URL。本机跑 dev 一般 127.0.0.1:8876、
- * agent 跑在 cloud / 容器时要靠 FE_AI_FLOW_BASE_URL 显式注入。
- */
-const getServerBaseUrl = (): string => {
-  const base = process.env.FE_AI_FLOW_BASE_URL;
-  if (base && base.trim().length > 0) {
-    return base.replace(/\/+$/, "");
-  }
-  const port = process.env.PORT && /^\d+$/.test(process.env.PORT)
-    ? process.env.PORT
-    : "8876";
-  return `http://127.0.0.1:${port}`;
-};
