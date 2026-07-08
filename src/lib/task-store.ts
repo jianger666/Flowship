@@ -23,7 +23,6 @@ import type {
   McpHealth,
   NewTaskInput,
   PreviewSlotStatus,
-  ShipPrecheck,
   Task,
   TaskEvent,
   TaskRole,
@@ -60,16 +59,6 @@ export const fetchTask = async (id: string): Promise<Task | null> => {
   if (res.status === 404) return null;
   const data = await handleJson<{ task: Task }>(res);
   return data.task;
-};
-
-// V0.6.25 review：ship 前置预检——拉 server gate 结论给 advance-dialog 决定 override 区
-export const fetchShipPrecheck = async (id: string): Promise<ShipPrecheck> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(id)}/ship-precheck`,
-    { cache: "no-store" },
-  );
-  const data = await handleJson<{ precheck: ShipPrecheck }>(res);
-  return data.precheck;
 };
 
 // ----------------- 创建 / 删除 / 配置 patch -----------------

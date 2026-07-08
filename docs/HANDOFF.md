@@ -190,7 +190,7 @@ V0.5 phase 顺序拆掉后、用 6 个显性门槛补回保证：
 - 方向通用化后（测试 / BI 等非研发用户、纯自定义 action）「研发流程假设」不再成立
 - 代码质量校验由 build agent 自己做（`action-build.md` 让 agent 找仓库命令做**增量**校验、改哪查哪）+ review action 人审兜底
 
-保留的基建：`runActionPostCheck` 后台异步框架（`runningChecks` 去重 + abort、防状态交错——check 同步 await 会把 wait_for_user 阻塞到超 Cursor SDK ~60s 工具超时、线上踩过）、`runCheckShell` / `computeWorktreeFingerprint` / `computeRepoStatusHash`（review 指纹 + 兄弟仓基线用）。`GET /ship-precheck` 瘦身成只返回 `reviewMissing`（build 后没 review 的非阻断提醒）。
+保留的基建：`runActionPostCheck` 后台异步框架（`runningChecks` 去重 + abort、防状态交错——check 同步 await 会把 wait_for_user 阻塞到超 Cursor SDK ~60s 工具超时、线上踩过）、`computeWorktreeFingerprint` / `computeRepoStatusHash`（review 指纹 + 兄弟仓基线用、V0.11.2 起纯 Node execFile git 实现）。`GET /ship-precheck`（reviewMissing 提醒）已于 V0.11.7 随黄条整链删除。
 
 ### Shell 命令硬拦截（V0.6.27、beforeShellExecution hook）
 
@@ -303,6 +303,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 - **现象**：agent 调 ask_user 后弹窗立即弹给用户、但本回合 run 还要再跑几秒才 finished（收尾旁白 + stop-check 往返）——用户手快秒答、`sendToTaskSession` 撞上 `runningTasks.has` 直接拒 → 409「没有可续接的 agent 会话」、几秒后重试就成功（线上日志实锤：ask 14:16:41 → 首答 14:16:52.420 被拒 → run 14:16:52.9 才排空 → 重试 14:16:59 成功）
 - **修复**：`sendToTaskSession` 入口不再见 run 就拒、改 `waitForRunToDrain`（300ms 轮询等排空、90s 上限兜底）——协议间隙由 server 消化、不再把用户答案弹回去。推进 / 再聊聊路径本来就在 run 结束后才可操作、等待为 no-op 零影响
+- **顺带删「build 后没 review」黄条整链**（用户拍板「文案去掉」）：判定只认 status=completed、刚交卷 awaiting_ack 的 review 也被误报「没复核」（实测 review #20 刚跑完没 ack、提测弹窗仍黄条）——`GET /ship-precheck` route / `getShipPrecheck` / `ShipPrecheck` 类型 / dialog 黄条全删
 
 ### V0.11.6：修 V0.11 回归「done 即断流」——ask 弹窗答完永远卡「提交中」（2026-07-08、用户线上实测踩到）
 
@@ -388,7 +389,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | **shell 命令硬拦截（V0.6.27、beforeShellExecution hook 策略引擎）** | `src/lib/server/shell-guard-rules.ts` + `scripts/shell-guard.mjs` + `src/app/api/hooks/shell-check/route.ts` |
 | **submit_mr 范围校验（V0.6.27 从 task-runner 拆出、防 agent 越权提 MR）** | `src/lib/server/submit-mr-guard.ts` |
 | **vitest 测试（V0.6.27、安全关键纯函数 + prompt 一致性）** | `vitest.config.ts` + `tests/*.test.ts` |
-| **ship 前置预检 API（v0.9.13 瘦身、只返 reviewMissing 给 advance-dialog 显示非阻断提醒）** | `src/app/api/tasks/[id]/ship-precheck/route.ts` + `getShipPrecheck`（action-gates）|
 | **V0.6 task schema + 文件系统（v0.9.9 拆三层：CRUD/patch 在 task-fs、路径/schema/锁/事件 IO/hydrate 在 task-fs-core、附件/artifact/revisions 在 task-artifacts）** | `src/lib/types.ts` + `src/lib/server/{task-fs,task-fs-core,task-artifacts}.ts` |
 | **批次推导 + 展示（V0.6.23 起、computeBatchProgress 前后端共用 / 进度 chip / 批次表 / 选批 / 测试策略 label）** | `src/lib/task-display.ts` + `src/lib/types.ts: PlanBatch / TestStrategy / TEST_STRATEGY_LABEL` + `src/components/tasks/{batch-progress,batch-plan-table}.tsx` + `advance-dialog.tsx` 选批 |
 | **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |

@@ -17,7 +17,6 @@ import {
 import type {
   ActionType,
   GitBranchInfo,
-  ShipPrecheck,
   Task,
 } from "@/lib/types";
 import { ACTION_LABEL } from "@/lib/types";
@@ -110,31 +109,11 @@ export const checkActionPrerequisites = (
   }
 };
 
-/**
- * ship 前置预检（GET /api/tasks/[id]/ship-precheck 调）
- *
- * v0.9.13：CheckRun ship 门禁（override 留痕那套）随 CheckRun 一起删除、
- * 只剩「最新 build 后没 review 过」的非阻断流程提醒。
- */
-export const getShipPrecheck = async (task: Task): Promise<ShipPrecheck> => {
-  const lastBuild = task.actions
-    .slice()
-    .reverse()
-    .find((a) => a.type === "build" && a.status === "completed");
-  if (!lastBuild) {
-    return { reviewMissing: false };
-  }
-  // V0.6.27 F3：最新 build 之后有没有 completed review——没有就提醒（非阻断、HITL 用户可跳过）。
-  // 按 startedAt 比：action 串行、review 启动晚于 build 启动即必然 review 的是这轮 build 后的代码。
-  const reviewMissing = !task.actions.some(
-    (a) =>
-      a.type === "review" &&
-      a.status === "completed" &&
-      !a.excluded &&
-      a.startedAt > lastBuild.startedAt,
-  );
-  return { reviewMissing };
-};
+// ship 前置预检（reviewMissing 黄条）历史（V0.11.7 用户拍板整链删除）：
+// v0.9.13 CheckRun 门禁删除后只剩「最新 build 后没 completed review」提醒——但判定只认
+// status=completed（用户点过「通过」）、刚交卷 awaiting_ack 的 review 也被当「没复核」误报
+//（实测：review #20 刚跑完没 ack、提测弹窗仍黄条）；用户拍板「文案可以去掉」、整链
+//（route / getShipPrecheck / ShipPrecheck 类型 / dialog 黄条）删除、不留提醒。
 
 // ----------------- branch checkout 挂接（build action 第一次跑前）-----------------
 

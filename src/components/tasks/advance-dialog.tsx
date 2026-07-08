@@ -78,7 +78,6 @@ import {
   type EffectivePlanBatch,
 } from "@/lib/task-display";
 import type { ImagePayload } from "@/lib/task-store";
-import { fetchShipPrecheck } from "@/lib/task-store";
 import { fetchCustomActions } from "@/lib/custom-action-client";
 import {
   arrangeByLayout,
@@ -92,7 +91,6 @@ import type {
   CustomActionDef,
   DevPushMode,
   ModelSelection,
-  ShipPrecheck,
   Task,
 } from "@/lib/types";
 
@@ -328,8 +326,6 @@ export const AdvanceDialog = ({
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
     {},
   );
-  // ship 前置预检（v0.9.13 瘦身后只剩 reviewMissing 流程提醒、非阻断）——展示「build 后没 review」黄条
-  const [shipPrecheck, setShipPrecheck] = useState<ShipPrecheck | null>(null);
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
   // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
@@ -430,27 +426,6 @@ export const AdvanceDialog = ({
       setSelectedCustomActionId(first);
     }
   }, [open, defaultRemoveSourceBranch]);
-
-  // ship 时拉 server precheck（v0.9.13 后只剩 reviewMissing 流程提醒）。
-  // actionType 可能在 dialog 里被切到 ship、所以依赖它；非 ship 清空。
-  useEffect(() => {
-    if (!open || actionType !== "ship") {
-      setShipPrecheck(null);
-      return;
-    }
-    let cancelled = false;
-    fetchShipPrecheck(task.id)
-      .then((pc) => {
-        if (!cancelled) setShipPrecheck(pc);
-      })
-      .catch(() => {
-        // 拉失败不挡提交、提醒是非阻断的
-        if (!cancelled) setShipPrecheck(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, actionType, task.id]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -891,13 +866,6 @@ export const AdvanceDialog = ({
               </div>
             </div>
           </div>
-
-          {/* V0.6.27 F3：最新 build 后没 review 过——非阻断提醒（用户有权跳过、但要知情） */}
-          {actionType === "ship" && shipPrecheck?.reviewMissing && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-              最新 build 之后还没跑过 review——建议先复核再提测（不拦、可直接继续）。
-            </div>
-          )}
 
           {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
           {actionType === "ship" && (

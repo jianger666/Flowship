@@ -375,17 +375,6 @@ export interface PlanBatch {
 export type ReplanMode = "append" | "rebuild";
 
 /**
- * ship 前置预检结果（GET /api/tasks/[id]/ship-precheck 返回）
- *
- * 纯 UI 展示用（v0.9.13 CheckRun 门禁删除后只剩流程提醒、无阻断项）：
- * - reviewMissing：最新 build 之后没有 completed review（V0.6.27 F3）——**非阻断**、
- *   只在 dialog 展示一行提醒（HITL：用户有权跳过 review 直接提测、但要知情）
- */
-export interface ShipPrecheck {
-  reviewMissing: boolean;
-}
-
-/**
  * 单条 action 记录
  *
  * - id：任务内唯一（如 act_1 / act_2、生成时单调递增不复用）
