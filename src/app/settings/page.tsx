@@ -42,6 +42,7 @@ import { GitCard } from "@/components/settings/git-card";
 import { PreferenceCard } from "@/components/settings/preference-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
+import { FeishuCliCard } from "@/components/settings/feishu-cli-card";
 
 const SettingsPage = () => {
   const router = useRouter();
@@ -219,6 +220,8 @@ const SettingsPage = () => {
           onCommit={(next) => saveFieldValue("repos", next)}
         />,
       )}
+
+      {wrapCard("card-feishu", <FeishuCliCard />)}
 
       {wrapCard(
         "card-mcp",

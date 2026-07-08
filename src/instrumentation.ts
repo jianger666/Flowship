@@ -38,4 +38,8 @@ export const register = (): void => {
       reason,
     );
   });
+
+  // V0.12：内置飞书 CLI（lark-cli / meegle）的 bin 目录注进 PATH——
+  // SDK agent 是本进程子进程、继承后 shell 直接调两个 CLI（没装时目录不存在、无副作用）
+  void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
 };

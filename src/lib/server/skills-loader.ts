@@ -27,6 +27,7 @@ import path from "node:path";
 import matter from "gray-matter";
 
 import { getGlobalCursorDirs } from "./cursor-config";
+import { getToolsSkillsDir } from "./feishu-cli";
 
 // ai-flow 平台自身 skills 目录的相对路径
 // V0.3 起：从 `.ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
@@ -172,8 +173,11 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   for (const dir of getGlobalCursorDirs()) {
     global.push(...(await scanSkillsDir(path.join(dir, "skills"))));
   }
-  // 合并去重（同名平台自带优先：先放 global、再放 own 覆盖同名）
+  // V0.12：内置飞书 CLI 的官方 skills（<dataRoot>/tools/skills、一键安装时落盘）
+  const feishuCli = await scanSkillsDir(getToolsSkillsDir());
+  // 合并去重（优先级：平台自带 > 全局 > 飞书 CLI 官方——用户全局同名 skill 视为有意覆盖）
   const byName = new Map<string, SkillEntry>();
+  for (const s of feishuCli) byName.set(s.name, s);
   for (const s of global) byName.set(s.name, s);
   for (const s of own) byName.set(s.name, s);
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
