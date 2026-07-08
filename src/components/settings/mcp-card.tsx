@@ -1,21 +1,16 @@
 "use client";
 
 /**
- * MCP servers 卡片（V0.6.2 起只读展示 Cursor 配置 + V0.6.4 加 OAuth 授权区）
+ * MCP servers 卡片
  *
- * 背景「跟 Cursor 共用工具」：fe 不再自己存 / 编辑 MCP 配置、统一读 Cursor 的
- * `~/.cursor/mcp.json` 展示（单一源）。用户要改 MCP 去 Cursor 改、fe 这边只读 +
- * 留 task 级黑名单开关（在任务详情页 / 新建弹窗里选本任务挂哪些）。
- *
- * V0.6.4：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、Cursor 存自己内部、
- * fe 的 SDK agent 是 headless 弹不了浏览器 → 这里给这类 server 一个「授权」入口、
- * fe 自己跑标准 OAuth flow、token 落盘、起 agent 时注入。详见 mcp-oauth.ts。
- *
- * 不脱敏（用户拍板）：本地单机工具、原样展示完整 JSON（含 token / env）、跟 Cursor 一致。
+ * fe 自管 MCP（可编辑 JSON）+ Cursor mcp.json（只读）+ 一键从 Cursor 导入；
+ * agent 启动时 server 端 merge 两份配置后再按黑名单过滤。
  */
 
-import { useMemo } from "react";
-import { FileCode, Plug, RefreshCw, ShieldCheck } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Download, Plug, Plus, RefreshCw, ShieldCheck } from "lucide-react";
+import { toast } from "sonner";
+import type { McpServerConfig } from "@cursor/sdk";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,29 +25,45 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
+import { useDialog } from "@/hooks/use-dialog";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { useMcpOAuth } from "@/hooks/use-mcp-oauth";
+import { mergeMcpSources } from "@/lib/mcp-config";
+import { fetchCursorMcp } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 
 interface McpCardProps {
-  // 设置页配的「常用 MCP」默认黑名单（建任务时取这份快照、关掉的进黑名单）
+  appServers: Record<string, McpServerConfig>;
+  onAppServersChange: (next: Record<string, McpServerConfig>) => void;
+  onAppServersCommit: (next: Record<string, McpServerConfig>) => void;
   disabledServers: string[];
-  // toggle 改即存（无需保存按钮）
   onChange: (next: string[]) => void;
 }
 
-export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
-  const { servers, names, dirs, loading, error } = useCursorMcp();
+export const McpCard = ({
+  appServers,
+  onAppServersChange,
+  onAppServersCommit,
+  disabledServers,
+  onChange,
+}: McpCardProps) => {
+  const { prompt } = useDialog();
+  const { cursorServers, dirs, loading, error, refresh } = useCursorMcp();
   const { statuses, busy, authorize, revoke } = useMcpOAuth();
-  // 已开启的 server（不在黑名单里的）——只探这些（关闭的不连、对齐 Cursor）
-  const enabledServers = useMemo(
-    () => names.filter((n) => !disabledServers.includes(n)),
-    [names, disabledServers],
+
+  // 合并后的 server 集合（常用开关 / 健康探测候选）
+  const mergedServers = useMemo(
+    () => mergeMcpSources(cursorServers, appServers),
+    [cursorServers, appServers],
   );
-  // 各 server 连通性（进设置页探一次开启的、可手动重测、打开某个时单独探）
-  // active 传 !loading：等 useCursorMcp 把 names 拉回来（enabledServers ready）再首探、
-  // 否则 mount 时探到空集合就再不重探（V0.6.13 修的首探竞态）
+  const mergedNames = useMemo(() => Object.keys(mergedServers), [mergedServers]);
+
+  const enabledServers = useMemo(
+    () => mergedNames.filter((n) => !disabledServers.includes(n)),
+    [mergedNames, disabledServers],
+  );
+
   const {
     health,
     loadingServers,
@@ -60,50 +71,152 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
     probeOne,
   } = useMcpHealth(enabledServers, !loading);
 
-  // 原样拼回 { mcpServers: {...} }（跟 ~/.cursor/mcp.json 文件结构一致）、只读展示
-  const json = JSON.stringify({ mcpServers: servers }, null, 2);
-  // 读取来源（展示「配置读自哪个文件」、让用户知道去哪改）
+  const appJson = JSON.stringify({ mcpServers: appServers }, null, 2);
+  const cursorJson = JSON.stringify({ mcpServers: cursorServers }, null, 2);
   const sourceFile = dirs[0] ? `${dirs[0]}/mcp.json` : "~/.cursor/mcp.json";
-
-  // 走 OAuth 的 server 由后端探测决定（连 server 看是否 401）、statuses 只含「要授权 / 已授权」的、
-  // 本地服务 / url 自带 token / 公开 MCP 不会进来。详见 mcp-oauth.ts evaluateMcpOAuthStatuses
   const oauthServers = Object.keys(statuses);
+
+  // 编辑 fe 自管 JSON 草稿（blur 落盘）
+  const [appJsonDraft, setAppJsonDraft] = useState(appJson);
+  const [importing, setImporting] = useState(false);
+
+  const syncAppJsonDraft = (next: Record<string, McpServerConfig>) => {
+    setAppJsonDraft(JSON.stringify({ mcpServers: next }, null, 2));
+  };
+
+  useEffect(() => {
+    syncAppJsonDraft(appServers);
+  }, [appServers]);
+
+  const handleAppJsonChange = (raw: string) => {
+    setAppJsonDraft(raw);
+    try {
+      const parsed = JSON.parse(raw) as { mcpServers?: Record<string, McpServerConfig> };
+      if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
+        onAppServersChange(parsed.mcpServers);
+        onAppServersCommit(parsed.mcpServers);
+      }
+    } catch {
+      // 编辑中途 JSON 可能暂时非法
+    }
+  };
+
+  const handleImportCursor = async () => {
+    setImporting(true);
+    try {
+      const data = await fetchCursorMcp();
+      const next = { ...appServers, ...data.servers };
+      onAppServersCommit(next);
+      syncAppJsonDraft(next);
+      toast.success(`已从 Cursor 导入 ${Object.keys(data.servers).length} 个 server`);
+    } catch (err) {
+      toast.error(
+        `导入失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleAddServer = async () => {
+    const name = await prompt({
+      title: "新增 MCP",
+      placeholder: "server 名称",
+      confirmLabel: "添加",
+      validate: (v) => {
+        const trimmed = v.trim();
+        if (!trimmed) return "名称不能为空";
+        if (mergedServers[trimmed]) return "名称已存在";
+        return "";
+      },
+    });
+    if (name === null) return;
+    const key = name.trim();
+    const next = {
+      ...appServers,
+      [key]: { type: "http", url: "" } as McpServerConfig,
+    };
+    onAppServersCommit(next);
+    syncAppJsonDraft(next);
+  };
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>MCP servers</CardTitle>
-        <CardDescription>
-          配置只读、读自 Cursor 的{" "}
-          <code className="text-xs">{sourceFile}</code>
-          。下面「常用」开关改即生效、建任务时取它作默认
-        </CardDescription>
+        <CardDescription>本应用配置与 Cursor 合并后传给 agent</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={importing}
+            onClick={() => void handleImportCursor()}
+          >
+            <Download />
+            从 Cursor 导入
+          </Button>
+          <Button type="button" variant="outline" size="sm" onClick={() => void handleAddServer()}>
+            <Plus />
+            新增
+          </Button>
+          <Button type="button" variant="ghost" size="sm" onClick={refresh}>
+            <RefreshCw />
+            刷新 Cursor
+          </Button>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium">本应用 MCP</div>
+          <CodeEditor
+            id="app-mcp-json"
+            value={appJsonDraft}
+            onChange={handleAppJsonChange}
+            language="json"
+            rows={10}
+          />
+        </div>
+
         {loading ? (
           <LoadingState variant="inline" />
         ) : error ? (
-          <div className="text-destructive text-xs">读取失败：{error}</div>
-        ) : names.length === 0 ? (
-          <EmptyHint>Cursor 里没配 MCP server（{sourceFile}）</EmptyHint>
+          <div className="text-destructive text-xs">读取 Cursor 失败：{error}</div>
+        ) : Object.keys(cursorServers).length > 0 ? (
+          <div className="space-y-1.5">
+            <div className="text-xs text-muted-foreground">
+              Cursor（只读）<code className="ml-1 text-[11px]">{sourceFile}</code>
+            </div>
+            <CodeEditor
+              id="cursor-mcp-json"
+              value={cursorJson}
+              onChange={() => {}}
+              language="json"
+              rows={8}
+              disabled
+            />
+          </div>
+        ) : (
+          <EmptyHint size="sm">Cursor 里没配 MCP（{sourceFile}）</EmptyHint>
+        )}
+
+        {mergedNames.length === 0 ? (
+          <EmptyHint>还没有任何 MCP server</EmptyHint>
         ) : (
           <>
-            {/* OAuth 授权区：走 OAuth 的 MCP 在这点授权、token 自动续期 */}
             {oauthServers.length > 0 && (
               <div className="space-y-2 rounded-md border border-border/60 p-3">
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <ShieldCheck className="size-3.5 shrink-0" />
-                  OAuth 授权——走 OAuth 的 MCP（如飞书项目）在这授权、token 自动续期
+                  OAuth 授权
                 </div>
                 <div className="space-y-1.5">
                   {oauthServers.map((name) => {
                     const authorized = statuses[name]?.authorized;
                     return (
                       <div key={name} className="flex items-center gap-2">
-                        <span
-                          className="min-w-0 flex-1 truncate text-sm"
-                          title={name}
-                        >
+                        <span className="min-w-0 flex-1 truncate text-sm" title={name}>
                           {name}
                         </span>
                         {authorized && (
@@ -136,12 +249,11 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
               </div>
             )}
 
-            {/* 常用 MCP 开关：勾选的建任务默认带、关掉的进默认黑名单、改即生效（无需保存按钮） */}
             <div className="space-y-2 rounded-md border border-border/60 p-3">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
                   <Plug className="size-3.5 shrink-0" />
-                  常用 MCP——勾选的建任务默认带；右侧绿=正常 / 红=失败（点击看日志）
+                  常用 MCP
                 </div>
                 <Button
                   type="button"
@@ -160,7 +272,7 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
                 </Button>
               </div>
               <McpToggleList
-                availableServers={names}
+                availableServers={mergedNames}
                 disabled={disabledServers}
                 onChange={onChange}
                 health={health}
@@ -168,19 +280,6 @@ export const McpCard = ({ disabledServers, onChange }: McpCardProps) => {
                 onEnableProbe={probeOne}
               />
             </div>
-
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <FileCode className="size-3.5 shrink-0" />共 {names.length} 个
-              server、按 task 级黑名单过滤后传给 agent
-            </div>
-            <CodeEditor
-              id="mcp-json"
-              value={json}
-              onChange={() => {}}
-              language="json"
-              rows={14}
-              disabled
-            />
           </>
         )}
       </CardContent>

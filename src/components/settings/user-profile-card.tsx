@@ -19,7 +19,6 @@ import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -96,9 +95,6 @@ export const UserProfileCard = ({
     <Card>
       <CardHeader>
         <CardTitle>个人信息</CardTitle>
-        <CardDescription>
-          用户名 + feature 分支命名模板（建任务时按此生成分支名）
-        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-1.5">

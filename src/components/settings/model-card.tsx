@@ -45,11 +45,9 @@ export const ModelCard = ({
   <Card>
     <CardHeader>
       <CardTitle>默认模型</CardTitle>
-      <CardDescription>
-        {models.length === 0
-          ? "点右侧「获取列表」按钮拉取可用模型（需先填好 API key）"
-          : `共 ${models.length} 个可用模型`}
-      </CardDescription>
+      {models.length > 0 && (
+        <CardDescription>共 {models.length} 个可用模型</CardDescription>
+      )}
       <CardAction className="flex items-center gap-2">
         <Button
           type="button"

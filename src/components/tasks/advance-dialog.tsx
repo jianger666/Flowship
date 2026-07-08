@@ -38,7 +38,7 @@
  *     之前 agent 挂掉重启时也没法换模型、只能去 settings 改全局再回来
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -70,6 +70,7 @@ import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
+import { SettingsLink } from "@/lib/settings-link";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import {
   ACTION_LABEL,
@@ -106,10 +107,12 @@ const inferDisabledReason = (
   //   设置页刚配的 dev 分支也能即时放行联调 chip（server advance 时会 refreshRepoBranches 同步准入、两边一致）
   ctx: {
     host?: string;
+    resolvedHost?: string;
     token?: string;
     devBranches?: Record<string, string>;
   } = {},
-): string | null => {
+): ReactNode | null => {
+  const effectiveHost = ctx.host || ctx.resolvedHost;
   switch (type) {
     case "plan":
       return null;
@@ -120,9 +123,22 @@ const inferDisabledReason = (
       // V0.x：去掉「review 必须先有 build」流程限制——可直接 review 现状代码找 bug
       return null;
     case "ship":
-      // V0.x：去掉「ship 必须先有 build」流程限制；只留 GitLab host/token（技术必需、没配真提不了 MR）
-      if (!ctx.host) return "需要先在「设置 → GitLab 配置」填 host";
-      if (!ctx.token) return "需要先在「设置 → GitLab 配置」填 PAT";
+      if (!effectiveHost) {
+        return (
+          <>
+            缺少 GitLab Host，
+            <SettingsLink focus="git">去设置</SettingsLink>
+          </>
+        );
+      }
+      if (!ctx.token) {
+        return (
+          <>
+            缺少 GitLab PAT，
+            <SettingsLink focus="git">去设置</SettingsLink>
+          </>
+        );
+      }
       return null;
     case "learn":
       // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 自己说明
@@ -134,7 +150,14 @@ const inferDisabledReason = (
       const anyDev = task.repoPaths.some(
         (p) => (devBranches?.[p]?.trim() ?? "").length > 0,
       );
-      if (!anyDev) return "需要先在「设置 → 仓库列表」给仓库配 dev 分支";
+      if (!anyDev) {
+        return (
+          <>
+            需要配 dev 分支，
+            <SettingsLink focus="repos">去设置</SettingsLink>
+          </>
+        );
+      }
       return null;
     }
     case "custom":
@@ -321,6 +344,8 @@ export const AdvanceDialog = ({
   const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
     {},
   );
+  // settings 未填 host 时、从 task 仓库 remote 自动推导（跟 server resolveEffectiveGitHost 对齐）
+  const [resolvedGitHost, setResolvedGitHost] = useState<string | undefined>();
   // V0.x：设置页实时 dev 分支快照（per-repo、本 task 各仓）——dialog 打开瞬间读、供联调 chip 准入判断。
   //   不实时同步（开 dialog 中途改设置页极少）、跟 gitConfig 同套路。
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
@@ -390,6 +415,16 @@ export const AdvanceDialog = ({
       host: s.gitHost?.trim() || undefined,
       token: s.gitToken?.trim() || undefined,
     });
+    setResolvedGitHost(undefined);
+    if (!s.gitHost?.trim() && repoPathsRef.current.length > 0) {
+      const q = encodeURIComponent(repoPathsRef.current.join(","));
+      void fetch(`/api/repo-remote-meta?paths=${q}`)
+        .then((r) => r.json())
+        .then((d: { host?: string | null }) =>
+          setResolvedGitHost(d.host?.trim() || undefined),
+        )
+        .catch(() => setResolvedGitHost(undefined));
+    }
     // 读设置页最新 dev 分支（只收本 task 各仓 + 非空）——联调 chip 准入用实时值、不被 task 旧快照挡住
     const devMap: Record<string, string> = {};
     for (const p of repoPathsRef.current) {
@@ -473,6 +508,7 @@ export const AdvanceDialog = ({
       const type = key;
       const reason = inferDisabledReason(task, type, {
         ...gitConfig,
+        resolvedHost: resolvedGitHost,
         devBranches: liveDevBranches,
       });
       return (
@@ -544,10 +580,11 @@ export const AdvanceDialog = ({
       actionType
         ? inferDisabledReason(task, actionType, {
             ...gitConfig,
+            resolvedHost: resolvedGitHost,
             devBranches: liveDevBranches,
           })
         : null,
-    [task, actionType, gitConfig, liveDevBranches],
+    [task, actionType, gitConfig, resolvedGitHost, liveDevBranches],
   );
   const canSubmit = useMemo(() => {
     if (submitting) return false;

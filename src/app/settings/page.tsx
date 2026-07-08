@@ -20,7 +20,7 @@
  * - 不预选默认模型：避免误用
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
@@ -31,6 +31,7 @@ import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import { getSettings } from "@/lib/local-store";
+import { cn } from "@/lib/utils";
 
 import { ApiKeyCard } from "@/components/settings/api-key-card";
 import { ModelCard } from "@/components/settings/model-card";
@@ -40,6 +41,7 @@ import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 import { PreferenceCard } from "@/components/settings/preference-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
+import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
 
 const SettingsPage = () => {
   const router = useRouter();
@@ -82,6 +84,36 @@ const SettingsPage = () => {
     if (key) validateApiKey(key);
   }, [loaded, validateApiKey]);
 
+  // ?focus=api-key 等锚点：滚到对应卡片并短暂高亮（toast / 链接跳转用）
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!loaded) return;
+    const focus = new URLSearchParams(window.location.search).get("focus");
+    if (!focus) return;
+    const id = `card-${focus}`;
+    const el = document.getElementById(id);
+    if (!el) return;
+    requestAnimationFrame(() => {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightId(id);
+    });
+    const timer = window.setTimeout(() => setHighlightId(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [loaded]);
+
+  // 卡片外层包稳定 id + 锚点高亮 ring
+  const wrapCard = (id: string, node: ReactNode) => (
+    <div
+      id={id}
+      className={cn(
+        "rounded-xl transition-shadow duration-300",
+        highlightId === id && "ring-2 ring-primary/60",
+      )}
+    >
+      {node}
+    </div>
+  );
+
   if (!loaded) {
     return <LoadingState variant="block" />;
   }
@@ -112,66 +144,92 @@ const SettingsPage = () => {
               v{appVersion}
             </span>
           )}
+          <DiagnosticsButton />
           <CheckUpdateButton />
         </div>
       </div>
 
-      <ApiKeyCard
-        apiKey={settings.apiKey}
-        info={apiKeyInfo}
-        onChange={(v) => update("apiKey", v)}
-        onCommit={handleApiKeyCommit}
-        onValidate={validateApiKey}
-        validating={modelsLoading || infoLoading}
-      />
+      {wrapCard(
+        "card-api-key",
+        <ApiKeyCard
+          apiKey={settings.apiKey}
+          info={apiKeyInfo}
+          onChange={(v) => update("apiKey", v)}
+          onCommit={handleApiKeyCommit}
+          onValidate={validateApiKey}
+          validating={modelsLoading || infoLoading}
+        />,
+      )}
 
-      <UserProfileCard
-        username={settings.username ?? ""}
-        branchTemplate={settings.branchTemplate ?? ""}
-        jumpIde={settings.jumpIde ?? "cursor"}
-        onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
-        onChange={(v) => update("username", v)}
-        onCommit={(v) => saveFieldValue("username", v)}
-        onBranchTemplateChange={(v) => update("branchTemplate", v)}
-        onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
-      />
+      {wrapCard(
+        "card-profile",
+        <UserProfileCard
+          username={settings.username ?? ""}
+          branchTemplate={settings.branchTemplate ?? ""}
+          jumpIde={settings.jumpIde ?? "cursor"}
+          onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
+          onChange={(v) => update("username", v)}
+          onCommit={(v) => saveFieldValue("username", v)}
+          onBranchTemplateChange={(v) => update("branchTemplate", v)}
+          onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
+        />,
+      )}
 
-      <PreferenceCard
-        submitShortcut={settings.submitShortcut ?? "mod-enter"}
-        reuseAgentDefault={settings.reuseAgentDefault ?? false}
-        onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
-        onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
-      />
+      {wrapCard(
+        "card-preference",
+        <PreferenceCard
+          submitShortcut={settings.submitShortcut ?? "mod-enter"}
+          reuseAgentDefault={settings.reuseAgentDefault ?? false}
+          onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
+          onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
+        />,
+      )}
 
-      <GitCard
-        gitHost={settings.gitHost ?? ""}
-        gitToken={settings.gitToken ?? ""}
-        onHostChange={(v) => update("gitHost", v)}
-        onTokenChange={(v) => update("gitToken", v)}
-        onHostCommit={(v) => saveFieldValue("gitHost", v)}
-        onTokenCommit={(v) => saveFieldValue("gitToken", v)}
-      />
+      {wrapCard(
+        "card-git",
+        <GitCard
+          gitHost={settings.gitHost ?? ""}
+          gitToken={settings.gitToken ?? ""}
+          repos={settings.repos}
+          onHostChange={(v) => update("gitHost", v)}
+          onTokenChange={(v) => update("gitToken", v)}
+          onHostCommit={(v) => saveFieldValue("gitHost", v)}
+          onTokenCommit={(v) => saveFieldValue("gitToken", v)}
+        />,
+      )}
 
-      <ModelCard
-        models={models}
-        modelsError={modelsError}
-        selection={settings.defaultModel}
-        onChange={(next) => saveFieldValue("defaultModel", next)}
-        apiKey={settings.apiKey}
-        refreshing={modelsLoading}
-        onRefresh={fetchModels}
-      />
+      {wrapCard(
+        "card-model",
+        <ModelCard
+          models={models}
+          modelsError={modelsError}
+          selection={settings.defaultModel}
+          onChange={(next) => saveFieldValue("defaultModel", next)}
+          apiKey={settings.apiKey}
+          refreshing={modelsLoading}
+          onRefresh={fetchModels}
+        />,
+      )}
 
-      <RepoCard
-        repos={settings.repos}
-        onChange={(next) => update("repos", next)}
-        onCommit={(next) => saveFieldValue("repos", next)}
-      />
+      {wrapCard(
+        "card-repos",
+        <RepoCard
+          repos={settings.repos}
+          onChange={(next) => update("repos", next)}
+          onCommit={(next) => saveFieldValue("repos", next)}
+        />,
+      )}
 
-      <McpCard
-        disabledServers={settings.disabledMcpServers ?? []}
-        onChange={(next) => saveFieldValue("disabledMcpServers", next)}
-      />
+      {wrapCard(
+        "card-mcp",
+        <McpCard
+          appServers={settings.mcpServers ?? {}}
+          onAppServersChange={(next) => update("mcpServers", next)}
+          onAppServersCommit={(next) => saveFieldValue("mcpServers", next)}
+          disabledServers={settings.disabledMcpServers ?? []}
+          onChange={(next) => saveFieldValue("disabledMcpServers", next)}
+        />,
+      )}
     </div>
   );
 };

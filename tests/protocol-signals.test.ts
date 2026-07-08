@@ -23,10 +23,11 @@ const superMd = readFileSync(path.join(promptsDir, "_super.md"), "utf-8");
 
 describe("信号常量 ↔ _super.md 一致性", () => {
   it("agent 面向的固定信号、_super.md 都要教（字面量出现）", () => {
-    // V0.11：send 消息头只剩三种（revise / 用户回复 / NEXT_ACTION 前缀）+ 附件段头
+    // V0.11：send 消息头（revise / 用户回复 / 问一问 / NEXT_ACTION 前缀）+ 附件段头
     const agentFacing = [
       SIGNALS.ACTION_ACK_REVISE,
       SIGNALS.USER_REPLY,
+      SIGNALS.USER_QUESTION,
       SIGNALS.ATTACHED_IMAGES,
     ];
     for (const sig of agentFacing) {

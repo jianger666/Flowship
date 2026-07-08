@@ -18,6 +18,9 @@ import path from "node:path";
 import matter from "gray-matter";
 import type { McpServerConfig } from "@cursor/sdk";
 
+import { mergeMcpSources } from "../mcp-config";
+import { dataRoot } from "./data-root";
+
 /**
  * 全局 Cursor 配置目录候选（按优先级、取第一个能命中的）
  * - mac/linux/win 官方都是 home 下的 `.cursor/`（`os.homedir()` 自适配跨平台）
@@ -56,6 +59,38 @@ export const readGlobalCursorMcpServers = async (): Promise<
   }
   return {};
 };
+
+/** 读 fe 自管 MCP（data/config.json → settings.mcpServers） */
+export const readAppMcpServers = async (): Promise<
+  Record<string, McpServerConfig>
+> => {
+  try {
+    const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
+    const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+    const servers = parsed?.mcpServers;
+    if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+      return servers as Record<string, McpServerConfig>;
+    }
+  } catch {
+    // 文件不存在 / 坏 JSON → 当空
+  }
+  return {};
+};
+
+/** Cursor + fe 自管合并（fe 同名覆盖） */
+export const readMergedMcpServers = async (): Promise<
+  Record<string, McpServerConfig>
+> =>
+  mergeMcpSources(
+    await readGlobalCursorMcpServers(),
+    await readAppMcpServers(),
+  );
+
+/** agent 启动用：合并后再按 task 黑名单过滤 */
+export const resolveTaskMcpServers = async (
+  disabled: string[] | undefined,
+): Promise<Record<string, McpServerConfig>> =>
+  filterDisabledMcp(await readMergedMcpServers(), disabled);
 
 /**
  * 按 task 黑名单过滤 MCP（server 端用、对应 `task.disabledMcpServers`）

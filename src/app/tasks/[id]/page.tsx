@@ -51,6 +51,7 @@ import { EventStream } from "@/components/tasks/event-stream";
 import { RestartDialog } from "@/components/tasks/restart-dialog";
 import { ReviseDialog } from "@/components/tasks/revise-dialog";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
+import { TaskQuestionComposer } from "@/components/tasks/task-question-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -987,6 +988,8 @@ const TaskDetailPage = () => {
                 streamingText={streamingText}
                 hideReplyComposer
               />
+              {/* V0.11.9「问一问」：纯提问不动任务进度（改代码类意见走「再聊聊」） */}
+              <TaskQuestionComposer task={task} onTaskUpdate={setTask} />
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>

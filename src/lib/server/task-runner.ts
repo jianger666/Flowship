@@ -42,6 +42,7 @@ import {
   setTaskAwaitingIfIdle,
 } from "./task-fs";
 import { snapshotActionArtifact } from "./task-artifacts";
+import { getActionsDir, getEventsLogPath } from "./task-fs-core";
 import {
   runActionCheck,
   captureActionStartBaseline,
@@ -72,9 +73,9 @@ import {
 } from "./task-worktrees";
 import { loadSkills, type SkillEntry } from "./skills-loader";
 import {
-  filterDisabledMcp,
-  readGlobalCursorMcpServers,
+  resolveTaskMcpServers,
 } from "./cursor-config";
+import { resolveEffectiveGitHost } from "./gitlab-host";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
@@ -689,7 +690,12 @@ const advanceTaskInner = async (
   }
 
   // 1) 准入条件（V0.6 门槛 1）
-  const pre = checkActionPrerequisites(task, actionType, { gitHost, gitToken });
+  const effectiveGitHost =
+    (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+  const pre = checkActionPrerequisites(task, actionType, {
+    gitHost: effectiveGitHost,
+    gitToken,
+  });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
   }
@@ -847,7 +853,7 @@ const advanceTaskInner = async (
     branchCheckoutHint,
     apiKey,
     model,
-    gitHost,
+    gitHost: effectiveGitHost,
     gitToken,
     batchDirective,
     replanDirective,
@@ -1546,6 +1552,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     replanDirective,
   } = input;
 
+  const effectiveGitHost =
+    (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+
   // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
   if (runningTasks.has(task.id)) {
     console.warn(
@@ -1580,7 +1589,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
   // 2) 注册 task-scoped action handler + awaiting notifier（V0.11.1 抽成共用工厂、
   //    resume 会话时也要重注册——见 registerSessionBridges）
-  registerSessionBridges(task, { gitHost, gitToken });
+  registerSessionBridges(task, { gitHost: effectiveGitHost, gitToken });
 
 
   // 4) 启动 Agent + 首个 run（在独立 Promise 里跑、advanceTask 立即返回）
@@ -1829,6 +1838,14 @@ const consumeSessionRun = async (
         const updated = await setTaskRunStatus(task.id, "idle", null);
         if (updated) publish(task.id, { kind: "task", task: updated });
       }
+    } else if (lastAction.status === "awaiting_ack") {
+      // V0.11.9「问一问」：等审阅期间的提问 run（route 切了 running）自然结束 → 回等待位。
+      // 正常交卷路径 runStatus 早被 notifier 落成 awaiting_user、这里 compare-set 不动它。
+      const freshest = await getTask(task.id);
+      if (freshest?.runStatus === "running") {
+        const updated = await setTaskRunStatus(task.id, "awaiting_user", lastAction.id);
+        if (updated) publish(task.id, { kind: "task", task: updated });
+      }
     }
     publish(task.id, { kind: "done", task: fresh ?? task, ok: true });
   } catch (err) {
@@ -1858,7 +1875,7 @@ const buildMergedMcpForTask = async (
   droppedMcp: Awaited<ReturnType<typeof filterHealthyMcp>>["dropped"];
 }> => {
   const enrichedMcp = await enrichMcpServersWithOAuth(
-    filterDisabledMcp(await readGlobalCursorMcpServers(), task.disabledMcpServers),
+    await resolveTaskMcpServers(task.disabledMcpServers),
   );
   const { servers: cursorMcp, dropped: droppedMcp } =
     await filterHealthyMcp(enrichedMcp);
@@ -1943,6 +1960,94 @@ export const deliverAskReply = async (
     buildAgentMessage({ kind: "user_reply", text: replyText, imagePaths }),
     { errorActionId, creds },
   );
+
+/**
+ * V0.11.9 任务内「问一问」：把纯提问 send 给存活会话（内联「只答不动手」约束、
+ * 见 buildAgentMessage question 分支）。无会话时凭 creds resume、接不回返 false。
+ */
+export const deliverTaskQuestion = async (
+  task: Task,
+  text: string,
+  imagePaths?: string[],
+  creds?: SessionCreds,
+): Promise<boolean> =>
+  sendToTaskSession(
+    task,
+    buildAgentMessage({ kind: "question", text, imagePaths }),
+    { creds },
+  );
+
+/**
+ * V0.11.9 问一问兜底：会话接不回（agent 报错过 / 停过 / 隔了几天早没了）时、
+ * 起一个**一次性**轻量 Q&A agent 回答（用户拍板「接不回来另起一个没问题」）。
+ *
+ * 跟正式会话的区别（有意为之）：
+ * - 不注入 action playbook / 不装 chat-tool MCP（没有交卷 / 提问 / MR 语义、也调不了）
+ * - 不注册 agentSessions / 不落盘锚点——它只懂答疑、不能被后续「续用推进」误当正式会话
+ * - 答完 close、下次再问再起（低频场景、冷启动可接受）
+ *
+ * fire-and-forget：调用方写完事件 / 切 running 后调、失败在内部标回原状态 + error 事件。
+ */
+export const startOneShotQuestion = (
+  task: Task,
+  questionText: string,
+  imagePaths: string[] | undefined,
+  creds: { apiKey: string; model: ModelSelection },
+): void => {
+  const prevRunStatus = task.runStatus === "running" ? "idle" : task.runStatus;
+  void (async () => {
+    let agent: AgentInstance | null = null;
+    try {
+      const effectiveCwd = getTaskCwd(task);
+      agent = await Agent.create({
+        apiKey: creds.apiKey,
+        model: creds.model,
+        local: { cwd: effectiveCwd, settingSources: ["project"] },
+      });
+      console.log(
+        `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${agent.agentId}`,
+      );
+      const prompt = [
+        `你是任务「${task.title}」的答疑助手。用户在任务页问了一个问题、你只负责回答、不推进任务。`,
+        "",
+        "# 任务背景（按需 read / grep、先查再答）",
+        `- 任务事件日志（完整历史）：${getEventsLogPath(task.id)}`,
+        `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(task.id)}`,
+        `- 工作目录：${effectiveCwd}`,
+        "",
+        "# 用户的问题",
+        buildAgentMessage({ kind: "question", text: questionText, imagePaths }),
+        "",
+        "# 铁律",
+        "- 只读答疑：禁止修改任何文件、禁止 git 写操作",
+        "- 直接回答、答完自然结束回复",
+      ].join("\n");
+      const run = await agent.send(prompt);
+      await consumeSessionRun(task, agent, run, {});
+      // consumeSessionRun 的归位只认 completed/cancelled/awaiting_ack——其余（如上次 action
+      // 停在 error）会让 running 悬着、这里兜回提问前的状态
+      const fresh = await getTask(task.id);
+      if (fresh?.runStatus === "running") {
+        const restored = await setTaskRunStatus(task.id, prevRunStatus);
+        if (restored) publish(task.id, { kind: "task", task: restored });
+      }
+    } catch (err) {
+      console.error(`[task-runner] task=${task.id} 问一问兜底失败：`, err);
+      await writeEventAndPublish(task.id, {
+        kind: "error",
+        text: `答疑 agent 启动失败：${err instanceof Error ? err.message : String(err)}`,
+      });
+      const restored = await setTaskRunStatus(task.id, prevRunStatus);
+      if (restored) publish(task.id, { kind: "task", task: restored });
+    } finally {
+      try {
+        agent?.close();
+      } catch {
+        /* noop */
+      }
+    }
+  })();
+};
 
 /**
  * V0.11：把用户操作以新消息发给 task 的存活会话（`agent.send`）、并消费产生的新 run。

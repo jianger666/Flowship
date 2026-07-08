@@ -55,9 +55,8 @@ import {
   type SkillEntry,
 } from "./skills-loader";
 import {
-  filterDisabledMcp,
-  readGlobalCursorMcpServers,
   readGlobalCursorRulesForPrompt,
+  resolveTaskMcpServers,
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
@@ -589,10 +588,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
     // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
     const enrichedMcp = await enrichMcpServersWithOAuth(
-      filterDisabledMcp(
-        await readGlobalCursorMcpServers(),
-        task.disabledMcpServers,
-      ),
+      await resolveTaskMcpServers(task.disabledMcpServers),
     );
     // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
     const { servers: cursorMcp, dropped: droppedMcp } =
@@ -734,10 +730,7 @@ export const resumeChatSession = async (
   try {
     // inline MCP 不随 resume 持久化、重传（同 runChatSession 的 merge 逻辑）
     const enrichedMcp = await enrichMcpServersWithOAuth(
-      filterDisabledMcp(
-        await readGlobalCursorMcpServers(),
-        task.disabledMcpServers,
-      ),
+      await resolveTaskMcpServers(task.disabledMcpServers),
     );
     const { servers: cursorMcp } = await filterHealthyMcp(enrichedMcp);
     const mergedMcp: Record<string, McpServerConfig> = {

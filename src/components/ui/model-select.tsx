@@ -31,6 +31,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { getTopUsedModels } from "@/lib/local-store";
+import { settingsUrl } from "@/lib/settings-link";
 import type { ModelOption, ModelParameter, ModelSelection } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -247,7 +248,12 @@ export const ModelSelect = ({
         <ul className="max-h-60 overflow-y-auto p-1">
           {models.length === 0 ? (
             <li className="px-2 py-6 text-center text-xs text-muted-foreground">
-              请先在设置页拉取模型列表
+              <a
+                href={settingsUrl("model")}
+                className="text-primary underline-offset-2 hover:underline"
+              >
+                去设置页拉取模型列表
+              </a>
             </li>
           ) : filtered.length === 0 ? (
             <li className="px-2 py-6 text-center text-xs text-muted-foreground">

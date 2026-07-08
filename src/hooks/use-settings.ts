@@ -108,6 +108,11 @@ const isFieldEqual = (
     if (x.length !== y.length) return false;
     return x.every((s, i) => s === y[i]);
   }
+  if (key === "mcpServers") {
+    return (
+      JSON.stringify(a.mcpServers ?? {}) === JSON.stringify(b.mcpServers ?? {})
+    );
+  }
   if (key === "actionLayout") {
     // order 是排序、顺序有意义——逐位比；hidden 同样逐位比
     const ax = a.actionLayout ?? { order: [], hidden: [] };
@@ -169,6 +174,7 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      mcpServers: !isFieldEqual("mcpServers", settings, savedSettings),
       actionLayout: !isFieldEqual("actionLayout", settings, savedSettings),
       reuseAgentDefault: !isFieldEqual(
         "reuseAgentDefault",

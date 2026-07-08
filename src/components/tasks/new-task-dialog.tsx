@@ -42,6 +42,7 @@ import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
+import { SettingsLink, settingsUrl } from "@/lib/settings-link";
 import { createTask } from "@/lib/task-store";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import {
@@ -364,7 +365,13 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
               />
             ) : (
               <EmptyHint size="sm">
-                还没配置仓库——先去 <strong>设置</strong> 加一个
+                还没配置仓库——
+                <a
+                  href={settingsUrl("repos")}
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  去设置页添加
+                </a>
               </EmptyHint>
             )}
           </div>
@@ -520,7 +527,11 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             创建任务需先启用{" "}
             <strong>{missingFeishuMcp.map((m) => m.label).join("、")}</strong>
-            （在 Cursor 配置、或在上方 MCP 区打开）
+            （
+            <SettingsLink focus="mcp" className="text-destructive">
+              去设置页启用
+            </SettingsLink>
+            ）
           </div>
         )}
 

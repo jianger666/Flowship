@@ -223,27 +223,30 @@ export const checkoutTaskBranch = async (
 // ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------
 
 export interface CursorMcpInfo {
-  // ~/.cursor/mcp.json 里的 mcpServers 原样（含 type/url/command/env...）
+  /** 合并后的 MCP（Cursor + fe 自管） */
   servers: Record<string, McpServerConfig>;
-  // 读取候选目录（展示「配置读自哪个 ~/.cursor/」）
+  /** Cursor ~/.cursor/mcp.json */
+  cursor: Record<string, McpServerConfig>;
+  /** fe config.json 里的 mcpServers */
+  app: Record<string, McpServerConfig>;
   dirs: string[];
 }
 
-/**
- * 读 Cursor 全局 MCP 配置（GET /api/cursor-mcp）
- *
- * V0.6.2「跟 Cursor 共用工具」：fe 不再让用户编辑 MCP、统一展示 Cursor 的配置（单一源）。
- * 用在：设置页 mcp-card 只读展示 + new-task / task-mcp-panel 的「黑名单候选源」。
- * MCP 真正注入 agent 在 server 端做（cursor-config.ts）、client 只拿来展示 / 选黑名单。
- */
 export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
   const res = await fetch("/api/cursor-mcp", { cache: "no-store" });
   const data = await handleJson<{
     ok: true;
     servers: Record<string, McpServerConfig>;
+    cursor: Record<string, McpServerConfig>;
+    app: Record<string, McpServerConfig>;
     dirs: string[];
   }>(res);
-  return { servers: data.servers, dirs: data.dirs };
+  return {
+    servers: data.servers,
+    cursor: data.cursor,
+    app: data.app,
+    dirs: data.dirs,
+  };
 };
 
 /**
@@ -554,6 +557,29 @@ export const submitActionAck = async (
       }),
     },
   );
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return data.task;
+};
+
+/**
+ * V0.11.9 任务内「问一问」：纯提问送给存活会话（只答不动手、不新建 action、进度不动）。
+ * bootArgs 无脑带上（服务重启 / 空闲回收后靠它 Agent.resume 接回会话）。
+ */
+export const submitTaskQuestion = async (
+  taskId: string,
+  text: string,
+  images?: ImagePayload[],
+): Promise<Task> => {
+  const s = getSettings();
+  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text,
+      images: images && images.length > 0 ? images : undefined,
+      bootArgs: { apiKey: s.apiKey, model: s.defaultModel },
+    }),
+  });
   const data = await handleJson<{ ok: true; task: Task }>(res);
   return data.task;
 };

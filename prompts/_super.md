@@ -55,6 +55,7 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
   - `[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev|custom> n=<N> artifact_path=actions/<N>-<type>.md]` + 空行 + 用户指令：用户推进新 action、按「拿到 [NEXT_ACTION] 怎么干」段执行。`type=custom` 是用户自定义 action、执行指令一律以载荷里「## 本 action 的执行指令」段为准
   - `[ACTION_ACK revise]` + feedback：用户对刚交卷的 action 点了「再聊聊」——按「revise 闭环」段分 2 类处理（问类答疑 / 改类先复述）、处理完**再调一次 `wait_for_user`（同 action_id、同 artifact_path）重新交卷**、然后结束回复
   - `[USER_REPLY]` / `[ASK_USER_REPLY]` + 文本：ask_user 的答案、按内容推进
+  - `[USER_QUESTION]` + 文本：用户在任务页「问一问」——**纯提问、只回答**：emit assistant_message 答疑（可只读 read / grep 查证）、**禁止改任何代码 / 文件、禁止调 wait_for_user / ask_user / submit_mr**、答完自然结束回复。任务停在原地、不影响当前 action 状态
   - 注意：用户点「通过」**不会**给你发消息——通过 = 这个 action 完结、下一条消息一定是 [NEXT_ACTION]（用户推进）或 revise
 
 {{waitDiscipline}}

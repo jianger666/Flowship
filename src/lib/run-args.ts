@@ -24,6 +24,7 @@ import { toast } from "sonner";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { getSettings } from "@/lib/local-store";
+import { settingsUrl } from "@/lib/settings-link";
 import type { Task } from "@/lib/types";
 
 export interface RunArgs {
@@ -35,7 +36,14 @@ export const prepareRunArgs = (task: Task): RunArgs | null => {
   const settings = getSettings();
 
   if (!settings.apiKey?.trim()) {
-    toast.error("缺少 API Key、请先在设置页填好");
+    toast.error("缺少 API Key", {
+      action: {
+        label: "去设置",
+        onClick: () => {
+          window.location.href = settingsUrl("api-key");
+        },
+      },
+    });
     return null;
   }
 
@@ -50,7 +58,14 @@ export const prepareRunArgs = (task: Task): RunArgs | null => {
       : null;
 
   if (!model) {
-    toast.error("缺少模型、请在任务表单或设置页选好");
+    toast.error("缺少模型", {
+      action: {
+        label: "去设置",
+        onClick: () => {
+          window.location.href = settingsUrl("model");
+        },
+      },
+    });
     return null;
   }
 

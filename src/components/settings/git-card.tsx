@@ -3,15 +3,12 @@
 /**
  * GitLab 配置卡片（V0.6.1 新增、ship action 用）
  *
- * 设计取舍（V0.6.1 拍板）：
- * - server 内置 GitLab REST API、不依赖 glab CLI / 不引入外部 MCP server
- * - 公司内部场景所有仓共用同一个 GitLab 实例、所以是全局字段（不是 per-repo）
- * - PAT 明文 localStorage、跟 apiKey 同安全级别——别在共用机器配
- * - host 不带协议前缀、agent 端拼 `https://<host>` 调 API
- * - PAT 默认密码框、小眼睛一键切明文（复用 api-key-card 的模式、防截图泄漏）
+ * host 可留空：从 settings 仓库列表的 origin remote 自动推导；token 仍必填。
  */
 
-import { Eye, EyeOff } from "lucide-react";
+import { Eye, EyeOff, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,17 +16,17 @@ import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 
-import { useState } from "react";
+import type { RepoConfig } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface GitCardProps {
   gitHost: string;
   gitToken: string;
-  // 输入时改草稿、失焦（onBlur）落盘
+  repos: RepoConfig[];
   onHostChange: (next: string) => void;
   onTokenChange: (next: string) => void;
   onHostCommit: (value: string) => void;
@@ -39,6 +36,7 @@ interface GitCardProps {
 export const GitCard = ({
   gitHost,
   gitToken,
+  repos,
   onHostChange,
   onTokenChange,
   onHostCommit,
@@ -46,23 +44,89 @@ export const GitCard = ({
 }: GitCardProps) => {
   // 是否明文显示 PAT（默认隐藏、防截图泄漏）
   const [showToken, setShowToken] = useState(false);
+  // 从仓库 remote 自动检测到的 host（settings 留空时展示）
+  const [detectedHost, setDetectedHost] = useState<string | null>(null);
+  // 检测请求中（防连点）
+  const [detecting, setDetecting] = useState(false);
+
+  const detectFromRepos = async (paths: string[]): Promise<string | null> => {
+    if (paths.length === 0) {
+      setDetectedHost(null);
+      return null;
+    }
+    setDetecting(true);
+    try {
+      const q = encodeURIComponent(paths.join(","));
+      const res = await fetch(`/api/repo-remote-meta?paths=${q}`);
+      const data = (await res.json()) as { host?: string | null };
+      const host = data.host?.trim() || null;
+      setDetectedHost(host);
+      return host;
+    } catch {
+      setDetectedHost(null);
+      return null;
+    } finally {
+      setDetecting(false);
+    }
+  };
+
+  // 有仓库且 host 留空时自动检测一次
+  useEffect(() => {
+    if (gitHost.trim()) {
+      setDetectedHost(null);
+      return;
+    }
+    void detectFromRepos(repos.map((r) => r.path).filter(Boolean));
+  }, [gitHost, repos]);
+
+  const handleDetectClick = async () => {
+    const paths = repos.map((r) => r.path).filter(Boolean);
+    if (paths.length === 0) {
+      toast.error("请先在仓库列表添加仓库");
+      return;
+    }
+    const host = await detectFromRepos(paths);
+    if (!host) {
+      toast.error("未从 remote 检测到 GitLab host");
+      return;
+    }
+    onHostChange(host);
+    onHostCommit(host);
+    toast.success(`已填入 ${host}`);
+  };
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>GitLab 配置</CardTitle>
-        <CardDescription>提测时走 REST API 创建 MR（目标分支固定 test）、不依赖 glab CLI</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid gap-1.5">
-          <Label htmlFor="settings-git-host">GitLab Host</Label>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="settings-git-host">GitLab Host</Label>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={detecting || repos.length === 0}
+              onClick={() => void handleDetectClick()}
+            >
+              <RefreshCw className={cn(detecting && "animate-spin")} />
+              从仓库检测
+            </Button>
+          </div>
           <Input
             id="settings-git-host"
             value={gitHost}
             onChange={(e) => onHostChange(e.target.value)}
             onBlur={() => onHostCommit(gitHost)}
-            placeholder="如 gitlab.wukongedu.net（不带 https://）"
+            placeholder="留空则从仓库 remote 自动检测"
           />
+          {!gitHost.trim() && detectedHost && (
+            <p className="text-xs text-muted-foreground">
+              已从 remote 检测：{detectedHost}
+            </p>
+          )}
         </div>
         <div className="grid gap-1.5">
           <Label htmlFor="settings-git-token">Personal Access Token</Label>
@@ -86,9 +150,6 @@ export const GitCard = ({
               {showToken ? <EyeOff /> : <Eye />}
             </Button>
           </div>
-          <p className="text-xs text-muted-foreground">
-            明文 localStorage、跟 API key 同安全级别、共用机器别配
-          </p>
         </div>
       </CardContent>
     </Card>

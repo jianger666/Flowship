@@ -18,17 +18,14 @@ import type { McpServerConfig } from "@cursor/sdk";
 import { fetchCursorMcp } from "@/lib/task-store";
 
 export interface UseCursorMcpResult {
-  // mcp.json 里的 mcpServers 原样
+  /** 合并后的 MCP（黑名单候选 / 飞书校验用） */
   servers: Record<string, McpServerConfig>;
-  // server 名列表（黑名单候选源用）、servers 的 key
+  /** Cursor 侧只读配置 */
+  cursorServers: Record<string, McpServerConfig>;
   names: string[];
-  // 读取候选目录（展示来源路径）
   dirs: string[];
-  // 首次加载中（仅首次 true、focus 刷新不翻 true、避免列表闪烁）
   loading: boolean;
-  // 读取出错信息（一般是 server 端异常、mcp.json 不存在不算错、返空对象）
   error: string | null;
-  // 手动重拉
   refresh: () => void;
 }
 
@@ -38,6 +35,9 @@ export interface UseCursorMcpResult {
 export const useCursorMcp = (enabled = true): UseCursorMcpResult => {
   // cursor mcp.json 解析出的 servers（key=名、value=配置）
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
+  const [cursorServers, setCursorServers] = useState<
+    Record<string, McpServerConfig>
+  >({});
   // 配置来源候选目录
   const [dirs, setDirs] = useState<string[]>([]);
   // 首次加载标志、focus 重拉不翻它（enabled 时初始即 true、避免首帧闪空态）
@@ -49,6 +49,7 @@ export const useCursorMcp = (enabled = true): UseCursorMcpResult => {
     fetchCursorMcp()
       .then((data) => {
         setServers(data.servers);
+        setCursorServers(data.cursor);
         setDirs(data.dirs);
         setError(null);
       })
@@ -70,6 +71,7 @@ export const useCursorMcp = (enabled = true): UseCursorMcpResult => {
 
   return {
     servers,
+    cursorServers,
     names: Object.keys(servers),
     dirs,
     loading,

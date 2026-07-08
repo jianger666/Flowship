@@ -12,7 +12,6 @@
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -44,7 +43,6 @@ export const PreferenceCard = ({
   <Card>
     <CardHeader>
       <CardTitle>交互偏好</CardTitle>
-      <CardDescription>输入框提交方式、推进默认行为</CardDescription>
     </CardHeader>
     <CardContent className="space-y-4">
       <div className="grid gap-1.5">

@@ -312,7 +312,8 @@ export type AgentMessage = {
   // user_reply：chat 消息 / ask_user 答案（[ASK_USER_REPLY] Q&A 块由 route 拼好传入）
   // action_revise：用户点「再聊聊」
   // next_action：用户在 UI 推进新 action（续用会话时）
-  kind: "user_reply" | "action_revise" | "next_action";
+  // question：任务内「问一问」（V0.11.9）——纯提问、只回答不改代码不动任务进度
+  kind: "user_reply" | "action_revise" | "next_action" | "question";
   text: string;
   // 图片附件绝对路径（拼 [ATTACHED_IMAGES] 段、agent 用 read 工具看图）
   imagePaths?: string[];
@@ -369,6 +370,18 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
     const lines: string[] = [head];
     if (msg.text && msg.text.trim()) lines.push("", msg.text);
     lines.push(...attachmentSections(msg));
+    return lines.join("\n");
+  }
+  if (msg.kind === "question") {
+    // 「问一问」：行为约束内联在消息里（比只靠 prompt 教稳）——只答不动手、答完自然结束
+    const lines: string[] = [
+      SIGNALS.USER_QUESTION,
+      "",
+      msg.text,
+      ...attachmentSections(msg),
+      "",
+      "（这是任务过程中的**纯提问**、不是修改要求也不是推进指令：直接回答即可、不要改任何代码 / 文件、不要调 wait_for_user / submit_mr 等动作工具、回答完自然结束本轮回复。任务仍停在原地等用户后续操作。）",
+    ];
     return lines.join("\n");
   }
   // user_reply

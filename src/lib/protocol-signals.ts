@@ -14,6 +14,8 @@
 export const SIGNALS = {
   ACTION_ACK_REVISE: "[ACTION_ACK revise]",
   USER_REPLY: "[USER_REPLY]",
+  // V0.11.9「问一问」：任务过程中的纯提问——只回答、不改代码 / 不交卷 / 不动任务进度
+  USER_QUESTION: "[USER_QUESTION]",
   // 附件清单段头（跟在主信号 body 后）
   ATTACHED_IMAGES: "[ATTACHED_IMAGES]",
   ATTACHED_PATHS: "[ATTACHED_PATHS]",

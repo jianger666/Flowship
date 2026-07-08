@@ -15,6 +15,9 @@ import { promisify } from "node:util";
 
 import type { ChatTaskAction } from "./chat-pending";
 import type { Task } from "../types";
+import { parseHostFromRemoteUrl, parseProjectPathFromRemoteUrl } from "../git-remote";
+
+export { parseProjectPathFromRemoteUrl };
 
 const execFileAsync = promisify(execFile);
 
@@ -38,14 +41,22 @@ export const deriveProjectPathFromRepo = async (
   }
 };
 
-// remote URL → project path 纯函数（拆出便于单测：git@ / https:// / 边角输入）
-export const parseProjectPathFromRemoteUrl = (url: string): string | null => {
-  const projectPath = url
-    .replace(/^[^@]+@[^:]+:/, "") // git@host:
-    .replace(/^https?:\/\/[^/]+\//, "") // https://host/
-    .replace(/\.git$/, "")
-    .trim();
-  return projectPath.length > 0 ? projectPath : null;
+// 从仓库 origin remote 推导 GitLab host（settings 未填 host 时的 fallback）
+export const deriveHostFromRepo = async (
+  repoPath: string,
+): Promise<string | null> => {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["config", "--get", "remote.origin.url"],
+      { cwd: repoPath, timeout: 10_000 },
+    );
+    const url = stdout.trim();
+    if (!url) return null;
+    return parseHostFromRemoteUrl(url);
+  } catch {
+    return null;
+  }
 };
 
 // 校验 agent 上报的 submit_mr 参数是否在本 task 的授权范围内。

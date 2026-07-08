@@ -30,6 +30,7 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { settingsUrl } from "@/lib/settings-link";
 import { setTaskDisabledMcpServers } from "@/lib/task-store";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { McpHealth, McpHealthStatus, Task } from "@/lib/types";
@@ -256,7 +257,14 @@ export const McpToggleList = ({
               <span className="text-muted-foreground">连接失败</span>
             </DialogTitle>
             <DialogDescription>
-              探测这个 MCP 时的报错详情；排查或去设置页授权后点「重新检测」
+              排查后
+              <a
+                href={settingsUrl("mcp")}
+                className="text-primary underline-offset-2 hover:underline"
+              >
+                去设置页授权
+              </a>
+              ，再点「重新检测」
             </DialogDescription>
           </DialogHeader>
           <pre className="max-h-80 overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap wrap-anywhere">

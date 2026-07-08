@@ -7,13 +7,13 @@
  * 返回：{ ok, statuses: Record<serverName, McpOAuthStatus> }
  */
 
-import { readGlobalCursorMcpServers } from "@/lib/server/cursor-config";
+import { readMergedMcpServers } from "@/lib/server/cursor-config";
 import { evaluateMcpOAuthStatuses } from "@/lib/server/mcp-oauth";
 
 export const runtime = "nodejs";
 
 export const GET = async () => {
-  const servers = await readGlobalCursorMcpServers();
+  const servers = await readMergedMcpServers();
   const statuses = await evaluateMcpOAuthStatuses(servers);
   return new Response(JSON.stringify({ ok: true, statuses }), {
     status: 200,

@@ -16,15 +16,27 @@
 
 import {
   getGlobalCursorDirs,
+  readAppMcpServers,
   readGlobalCursorMcpServers,
+  readMergedMcpServers,
 } from "@/lib/server/cursor-config";
 
 export const runtime = "nodejs";
 
 export const GET = async () => {
-  const servers = await readGlobalCursorMcpServers();
+  const [cursor, app, merged] = await Promise.all([
+    readGlobalCursorMcpServers(),
+    readAppMcpServers(),
+    readMergedMcpServers(),
+  ]);
   return new Response(
-    JSON.stringify({ ok: true, servers, dirs: getGlobalCursorDirs() }),
+    JSON.stringify({
+      ok: true,
+      servers: merged,
+      cursor,
+      app,
+      dirs: getGlobalCursorDirs(),
+    }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

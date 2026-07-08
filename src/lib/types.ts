@@ -116,7 +116,7 @@ export interface FeAiFlowSettings {
   submitShortcut?: SubmitShortcut;
   /**
    * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
-   * 空时 ship action 准入会拦、提示用户先配
+   * 留空则从仓库 remote 自动推导、可选手动覆盖
    */
   gitHost?: string;
   /**
@@ -135,6 +135,8 @@ export interface FeAiFlowSettings {
    * 省得每次新建都手动关一堆不常用的。新增 server 不在黑名单 = 默认开。
    */
   disabledMcpServers?: string[];
+  /** fe 自管 MCP（可视化增删改、与 Cursor mcp.json 合并后传给 agent） */
+  mcpServers?: Record<string, import("@cursor/sdk").McpServerConfig>;
   /**
    * V0.9：推进面板布局偏好（「推进」弹窗里 action 的顺序 + 显隐、个人级、落 config.json）
    */

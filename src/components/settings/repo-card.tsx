@@ -21,7 +21,6 @@ import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -135,9 +134,6 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     <Card>
       <CardHeader>
         <CardTitle>仓库列表</CardTitle>
-        <CardDescription>
-          点「选择文件夹」添加仓库；每仓可配分支、均选填
-        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {repos.length === 0 ? (

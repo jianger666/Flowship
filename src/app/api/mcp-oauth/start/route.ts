@@ -8,7 +8,7 @@
  * 返回：{ ok, authorizationUrl } | { ok, alreadyAuthorized } | { ok:false, error }
  */
 
-import { readGlobalCursorMcpServers } from "@/lib/server/cursor-config";
+import { readMergedMcpServers } from "@/lib/server/cursor-config";
 import { startMcpOAuth } from "@/lib/server/mcp-oauth";
 
 export const runtime = "nodejs";
@@ -32,7 +32,7 @@ export const POST = async (req: Request) => {
   }
 
   // 从 Cursor mcp.json 拿这个 server 的 url（只有 http/sse 类能走 oauth）
-  const servers = await readGlobalCursorMcpServers();
+  const servers = await readMergedMcpServers();
   const cfg = servers[serverName];
   if (!cfg || !("url" in cfg)) {
     return json(

@@ -208,6 +208,12 @@ const detectAll = async (): Promise<Record<JumpIde, DetectResult>> => {
   ]);
   const results: Record<JumpIde, DetectResult> = { cursor, vscode, idea, webstorm };
   cache = { at: Date.now(), results };
+  // 探测结果落日志（同事机器排查「点了没反应」全靠这行——exec 指到哪一眼看清）
+  console.log(
+    `[ide-tools] 探测：${(Object.keys(results) as JumpIde[])
+      .map((k) => `${k}=${results[k].available ? results[k].exec : "无"}`)
+      .join(" | ")}`,
+  );
   return results;
 };
 
@@ -218,6 +224,19 @@ export const listIdeTools = async (): Promise<IdeToolInfo[]> => {
     id,
     name: IDE_NAMES[id],
     available: results[id].available,
+  }));
+};
+
+/** 带 exec 路径的探测明细（诊断包用、不进普通 API 响应） */
+export const listIdeToolsDetailed = async (): Promise<
+  Array<IdeToolInfo & { exec?: string }>
+> => {
+  const results = await detectAll();
+  return (Object.keys(IDE_NAMES) as JumpIde[]).map((id) => ({
+    id,
+    name: IDE_NAMES[id],
+    available: results[id].available,
+    exec: results[id].exec,
   }));
 };
 
@@ -249,6 +268,10 @@ export const openInIde = async (
     args.push(absPath);
   }
 
+  console.log(
+    `[ide-tools] open ide=${ide} exec=${tool.exec} cmdScript=${!!tool.isCmdScript} args=${JSON.stringify(args)}`,
+  );
+
   try {
     if (tool.isMacApp) {
       // mac：open -na <App>.app --args <IDE 参数>（open 立即返回、IDE 自己接管）
@@ -257,7 +280,7 @@ export const openInIde = async (
       });
       return null;
     }
-    // Windows / Linux：直接 spawn 可执行文件、detach 不等它退（GUI 进程）
+    // Windows / Linux：直接 spawn 可执行文件。
     // Toolbox 的 .cmd 脚本必须经 cmd /c（Windows 不能直接 exec 批处理）
     const [cmd, cmdArgs] = tool.isCmdScript
       ? ["cmd.exe", ["/d", "/s", "/c", tool.exec, ...args]]
@@ -267,6 +290,39 @@ export const openInIde = async (
       stdio: "ignore",
       windowsHide: true,
     });
+    // 静默失败探测（V0.11.9、同事 Windows 实测「点了没反应」）：spawn 本身成功但进程
+    // 秒退（脚本路径带空格被 cmd 拆坏 / exe 损坏）时原实现直接当成功、用户零反馈。
+    // 等 1.5s：spawn error / 非零码退出 → 报错给前端 toast；仍在跑 / 零码退出 → 视为已拉起。
+    const failure = await new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(null); // 1.5s 还活着 = IDE 正常启动中
+      }, 1_500);
+      const onError = (err: Error) => {
+        cleanup();
+        resolve(`拉起失败：${err.message}（exec=${tool.exec}）`);
+      };
+      const onExit = (code: number | null) => {
+        cleanup();
+        // GUI exe 常驻不会退；launcher / .cmd 正常退 0。非零码 = 启动失败
+        resolve(
+          code === 0 || code === null
+            ? null
+            : `启动进程立即退出（code=${code}、exec=${tool.exec}）——把 app 日志发我排查`,
+        );
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.off("error", onError);
+        child.off("exit", onExit);
+      };
+      child.once("error", onError);
+      child.once("exit", onExit);
+    });
+    if (failure) {
+      console.error(`[ide-tools] open 失败 ide=${ide}：${failure}`);
+      return `拉起 ${IDE_NAMES[ide]} 失败：${failure}`;
+    }
     child.unref();
     return null;
   } catch (err) {

@@ -299,6 +299,20 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.9（未发版、攒着）：任务内「问一问」+ 设置页整理（2026-07-08、用户大方向讨论第一批）
+
+- **任务内「问一问」**（用户痛点：想就任务问点问题、以前必须推进 action 再嘱咐「只回答别改代码」）：
+  - 任务页事件流底部轻量输入条（`task-question-composer.tsx`、单行 textarea、agent 跑动中禁用、终态隐藏）
+  - `POST /api/tasks/[id]/question` → `deliverTaskQuestion` → send `[USER_QUESTION]` 给存活会话（约束内联：只答不动手、不调动作工具、答完自然结束；_super.md 同步教、protocol-signals 加常量 + 一致性测试）
+  - 不新建 action、不动任务进度：回答期间 runStatus=running、答完 consumeSessionRun 按最后 action 状态归位（awaiting_ack → awaiting_user、completed → idle——后者是本次补的 tail 分支、也顺手修了「等审阅期间任何 send 后 runStatus 卡 running」的隐患）
+  - 拒绝口径：agent 在跑 / ask 弹窗未答 / 无会话且 resume 不了（409 提示推进或重启阶段）
+- **问一问兜底：一次性答疑 agent**（用户拍板「接不回来另起一个没问题」）：会话接不回时 `startOneShotQuestion` 起轻量 Q&A agent——带任务事件日志 / artifact 目录路径、只读答疑铁律、**不注册会话不落锚点**（防被「续用推进」误当正式会话）、答完 close、runStatus 答完兜回提问前状态。语义澄清（用户问「这算重启吗」）：不算——重启当前阶段 = 换 agent 重做产出、问一问 = 只聊不动产出、两者并存
+- **诊断包一键导出**（用户点名「让同事找日志太麻烦」）：设置页顶部「导出诊断包」→ `POST /api/system/diagnostics-export` → 单个 txt 落 ~/Downloads（版本 / IDE 探测含 exec 路径 / **脱敏**配置概要 / main.log 尾部 300KB）、toast 路径 + 自动复制。`server/diagnostics.ts`
+- **IDE 打开「没反应」诊断增强**（同事 Windows 复现待定位）：探测结果落日志（每次探测打 exec 路径）+ spawn 静默失败探测（1.5s 内 error / 非零码退出 → 报错 toast、不再假成功）
+- **设置页整理**（sub-agent 执行、已逐 diff 审过）：删安全警示式啰嗦文案、`?focus=<卡片>` 锚点定位 + 2s 高亮、「去设置页」提示改可点快捷跳转（toast action / 空态内联链接、`settings-link.tsx` 统一拼 URL）
+- **GitLab host 可不填**（sub-agent 执行）：`resolveEffectiveGitHost` settings 显式值 > 仓库 origin remote 推导（`git-remote.ts` 纯函数 + `GET /api/repo-remote-meta`）；设置页「从仓库检测」按钮、advance-dialog ship 准入同口径
+- **MCP 自管 + Cursor 导入**（sub-agent 执行）：`settings.mcpServers`（config.json）可视化增删 + 「从 Cursor 导入」、`readMergedMcpServers` 合并（同名本应用覆盖、aiFlowChat 保留名不可占用）、task/chat/OAuth/健康探测全部读 merged
+
 ### V0.11.8：IDE 跳转去协议依赖 + 自动探测（2026-07-08、同事 Windows 实测「idea:// 打不开」）
 
 - **根因**：`idea://` 协议只有 JetBrains Toolbox 会注册——直接装 IDEA 的 Windows 机器点跳转弹「找不到应用」（两位同事实测）

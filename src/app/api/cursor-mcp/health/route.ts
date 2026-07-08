@@ -14,14 +14,14 @@
  * 返回：{ ok: true, health: Record<serverName, McpHealth> }
  */
 
-import { readGlobalCursorMcpServers } from "@/lib/server/cursor-config";
+import { readMergedMcpServers } from "@/lib/server/cursor-config";
 import { enrichMcpServersWithOAuth } from "@/lib/server/mcp-oauth";
 import { probeMcpHealthAll } from "@/lib/server/mcp-probe";
 
 export const runtime = "nodejs";
 
 export const GET = async (req: Request) => {
-  const all = await readGlobalCursorMcpServers();
+  const all = await readMergedMcpServers();
   const enriched = await enrichMcpServersWithOAuth(all);
 
   // ?servers=a,b,c → 只探这几个（前端传「已开启」的 / 单个）；不传探全部
