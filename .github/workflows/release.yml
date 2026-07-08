@@ -123,21 +123,14 @@ jobs:
         shell: bash
         working-directory: electron-app
 
+      # 压缩策略统一走 electron-builder.yml 的 compression: maximum（V0.11.4）——
+      # 旧「win 降级到 level 3 提安装速度」特例已回收：实测对体积/安装速度都无变化
+      # （LZMA 解压速度和压缩级别基本无关）、拉满后 exe 213MB→112MB
       - run: npx electron-builder ${{ matrix.args }} --publish always
-        if: matrix.os != 'windows-latest'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-
-      # Windows 安装慢主要卡在 NSIS 进度条阶段：解压大包 + 逐文件落盘/扫描。
-      # 先把 7z 压缩级别降到 3，换更快的安装解压；不直接 store，避免下载包暴涨。
-      - run: npx electron-builder ${{ matrix.args }} --publish always
-        if: matrix.os == 'windows-latest'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          ELECTRON_BUILDER_COMPRESSION_LEVEL: "3"
 
   # 所有平台包（exe / dmg / latest.yml / latest-mac.yml）都传完后、把 draft release 转正 published。
   # needs electron = win/mac 都成功才转正：有平台挂就留 draft、不对外发半成品（手动看日志重跑即可）。

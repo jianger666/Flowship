@@ -95,6 +95,23 @@ const addSdkPlatformPackage = async (rootDir, destDir) => {
   console.log(`[assemble] 已补 SDK 平台包 @cursor/${platformPkg}@${version}`);
 };
 
+// 递归删指定扩展名文件（sourcemap 瘦身用）
+const removeFilesByExt = async (dir, ext) => {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) await removeFilesByExt(p, ext);
+    else if (e.isFile() && e.name.endsWith(ext)) {
+      await fs.rm(p, { force: true }).catch(() => {});
+    }
+  }
+};
+
 export const assembleServerLayout = async (rootDir, destDir) => {
   const standaloneDir = path.join(rootDir, ".next", "standalone");
   if (!(await exists(standaloneDir))) {
@@ -116,6 +133,9 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   // 隐私剔除：file tracing 会把本机 data/（任务数据 + mcp-oauth 凭证）一并拖进
   // standalone、绝对不能随包分发——无条件删掉、首次运行自动重建空目录
   await fs.rm(path.join(destDir, "data"), { recursive: true, force: true });
+
+  // 瘦身：sourcemap 生产运行时用不到（报错栈不映射也够定位）、随包纯死重
+  await removeFilesByExt(destDir, ".map");
 
   // ---------- 2. 运行时按 cwd 读的目录（tracing 对动态 fs 读不保证、显式拷一遍兜底） ----------
   await cp(path.join(rootDir, "prompts"), path.join(destDir, "prompts"));

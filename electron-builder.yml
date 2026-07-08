@@ -19,6 +19,12 @@ directories:
 # electron-updater 没有 native 依赖、跳过 rebuild 省时间
 npmRebuild: false
 
+# 7z 压缩拉满（V0.11.4、实测 win exe 213.6MB → 112MB、-48%）：
+# LZMA 解压速度和压缩级别基本无关（安装慢卡在落盘 300MB + Defender 扫描、不卡解压）、
+# 压缩级别只影响 CI 打包时长（每平台 +3-5min）——用户下载量减半、纯赚。
+# 历史：v0.8.10 曾把级别降到 3 想提安装速度、实测体积/速度都没变化（前后都 213MB）、已回收。
+compression: maximum
+
 # 语言包瘦身：Electron/Chromium 默认塞 ~220 国 locale（mac .lproj / win .pak、~47M 死重）。
 # 只留中英——本应用 UI 全自绘中文、仅 Chromium 原生右键菜单/表单提示会用到 locale、中英足够。
 # 不影响 icudtl.dat（中文显示/排序/日期格式照常）。
@@ -65,8 +71,10 @@ mac:
   identity: null
 
 dmg:
-  # 大包挂载 / 自更新 attach 时优先要解压速度；ULFO=LZFSE，macOS 10.11+ 支持。
-  format: ULFO
+  # ULMO=LZMA（V0.11.4、实测 215MB → 97MB、-55%）。原 ULFO（LZFSE）为挂载速度选的、
+  # 但实测 ULMO 挂载 9s + 全量拷出 8s——安装/自更新多花十来秒、换下载少 118MB、净赚。
+  # macOS 10.15+ 支持（Electron 42 本来就要求 macOS 11+）。
+  format: ULMO
 
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
 # releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset

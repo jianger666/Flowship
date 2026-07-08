@@ -299,6 +299,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.4：安装包减半（2026-07-08、用户点名「包太大、装太久」）
+
+- **win exe 213.6MB → 实测 112MB（-48%）**：`compression: maximum`（electron-builder.yml 全局）。回收 v0.8.10「7z 降到 level 3 提安装速度」特例——release 体积历史证明那次前后都 213MB、没变小也没装快（LZMA 解压速度和压缩级别基本无关、安装慢卡在落盘 300MB + Defender 扫描）
+- **mac dmg 215MB → 实测 97MB（-55%）**：格式 ULFO（LZFSE）→ ULMO（LZMA）。实测挂载 9s + 全量拷出 8s、安装/自更新多花十来秒换下载少 118MB
+- assemble 布局顺带删 sourcemap（*.map、生产死重）
+- 代价：CI 打包每平台 +3-5min；天花板说明：压缩后 ~100MB 基本到底（Electron/Chromium 底座占大头、再小要换底座、不动）
+
 ### V0.11.3：依赖目录克隆多语言泛化（2026-07-08、用户点名「通用项目、别只考虑前端」）
 
 - worktree 依赖秒级克隆从写死 `node_modules` 泛化为**安全克隆白名单**（`CLONABLE_DEP_DIRS`）：`node_modules`（JS）/ `vendor`（PHP composer / Ruby bundler / Go vendor 模式）/ `Pods`（iOS）——都是可重定位目录、探测到就克
