@@ -81,15 +81,15 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   const workDir = getTaskWorkRepoPaths(task)[0];
 
   it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆依赖目录", async () => {
-    const res = await ensureTaskWorktrees(task, "clj");
+    const res = await ensureTaskWorktrees(task);
     expect(res.createdRepos).toEqual([REPO]);
-    expect(res.infos[0].name).toBe("feature/clj/888888-集成测试");
+    expect(res.infos[0].name).toBe("feature/888888-集成测试");
     expect(res.infos[0].baseBranch).toBe("main");
     expect(res.infos[0].checkedOut).toBe(true);
 
     // worktree 里检出的就是任务分支、原仓库 HEAD 不动
     expect(git(workDir, "branch", "--show-current")).toBe(
-      "feature/clj/888888-集成测试",
+      "feature/888888-集成测试",
     );
     expect(git(REPO, "branch", "--show-current")).toBe("main");
     // 内容检出 + gitignore 的 .env.local 已拷过来
@@ -118,14 +118,14 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("二次 ensure 幂等：复用现成 worktree、createdRepos 为空", async () => {
-    const res = await ensureTaskWorktrees(task, "clj");
+    const res = await ensureTaskWorktrees(task);
     expect(res.createdRepos).toEqual([]);
   });
 
   it("同分支被占用时另一个 task 明确报错（git 同分支单检出约束）", async () => {
     // 同 feishuStoryUrl + 同 title → 渲染出同名分支、必撞「already checked out」
     const other = makeTask({ id: "t_1700000000002_it" });
-    await expect(ensureTaskWorktrees(other, "clj")).rejects.toThrow(
+    await expect(ensureTaskWorktrees(other)).rejects.toThrow(
       /创建隔离工作区失败/,
     );
   });
@@ -141,12 +141,12 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(removed.skippedRepos).toEqual([]);
     await expect(fs.access(workDir)).rejects.toThrow();
     // 分支还在（合入前产物不丢、reopen 后可重建 worktree 续推）
-    const branches = git(REPO, "branch", "--list", "feature/clj/888888-集成测试");
-    expect(branches).toContain("feature/clj/888888-集成测试");
+    const branches = git(REPO, "branch", "--list", "feature/888888-集成测试");
+    expect(branches).toContain("feature/888888-集成测试");
     // git 注册也清了（可立刻重建）
     expect(git(REPO, "worktree", "list")).not.toContain(workDir);
     // WIP 快照真的落在任务分支上（未提交改动没被 --force 销毁）
-    expect(git(REPO, "log", "-1", "--format=%s", "feature/clj/888888-集成测试")).toContain(
+    expect(git(REPO, "log", "-1", "--format=%s", "feature/888888-集成测试")).toContain(
       "WIP",
     );
     const wipFiles = git(
@@ -154,17 +154,17 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
       "show",
       "--stat",
       "--format=",
-      "feature/clj/888888-集成测试",
+      "feature/888888-集成测试",
     );
     expect(wipFiles).toContain("a.txt");
     expect(wipFiles).toContain("new-file.ts");
   });
 
   it("移除后可重建（reopen 场景）：分支已存在 → 直接挂载、WIP 快照内容还在", async () => {
-    const res = await ensureTaskWorktrees(task, "clj");
+    const res = await ensureTaskWorktrees(task);
     expect(res.createdRepos).toEqual([REPO]);
     expect(git(workDir, "branch", "--show-current")).toBe(
-      "feature/clj/888888-集成测试",
+      "feature/888888-集成测试",
     );
     // 上一条 case 的 WIP 快照随分支检出回来（产物真的没丢）
     await expect(
@@ -177,21 +177,21 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("复用热路径：worktree 里手动 checkout 切走 → ensure 自动切回任务分支", async () => {
-    await ensureTaskWorktrees(task, "clj");
-    const taskBranch = "feature/clj/888888-集成测试";
+    await ensureTaskWorktrees(task);
+    const taskBranch = "feature/888888-集成测试";
     // main 在原仓检出、不能在 worktree 再切；另建旁路分支模拟用户 / agent 手动切走
     git(REPO, "branch", "side-detour", "main");
     git(workDir, "checkout", "side-detour");
     expect(git(workDir, "branch", "--show-current")).toBe("side-detour");
 
-    const res = await ensureTaskWorktrees(task, "clj");
+    const res = await ensureTaskWorktrees(task);
     expect(res.createdRepos).toEqual([]);
     expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
   });
 
   it("remove：merge 冲突态 WIP 快照失败 → 跳过删除、目录与未提交改动保留", async () => {
     // 前置：上一条 ensure 后 worktree 仍在任务分支上
-    const taskBranch = "feature/clj/888888-集成测试";
+    const taskBranch = "feature/888888-集成测试";
     const conflictFile = path.join(workDir, "conflict.txt");
     await fs.writeFile(conflictFile, "base\n");
     git(workDir, "add", "conflict.txt");

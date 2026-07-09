@@ -121,8 +121,7 @@ export const checkActionPrerequisites = (
  * V0.6.1：build action 第一动作前、拼每仓 GitBranchInfo + 引导 agent 逐仓 idempotent checkout
  *
  * branch 命名规则（V0.6 拍板、多仓共用同一 name）：
- *   `feature/<username>/<飞书 story id>-<task.title 转换后>`
- *   - username 取自 settings.username
+ *   按分支模板渲染（默认 `feature/<飞书 story id>-<task.title 转换后>`）
  *   - 飞书 story id 从 task.feishuStoryUrl 抠 URL 末段数字（如 detail/6956910305）
  *   - task.title 转换：保留中文、空白/特殊字符替换为 -
  *
@@ -132,14 +131,12 @@ export const checkActionPrerequisites = (
  *   （branch 存在 → checkout、不存在 → 基于探到的主分支建）、不再维护 checkedOut 状态。
  *   gitBranches 数组只在首次建条目时落库、之后保留 createdAt 历史值。
  *
- * 返回 null：缺 username / feishuStoryUrl / repoPaths 为空、不建 branch
+ * 返回 null：缺 feishuStoryUrl / repoPaths 为空、不建 branch
  */
 export const planBranchesForBuild = (
   task: Task,
-  username: string | undefined,
 ): { infos: GitBranchInfo[]; promptHint: string } | null => {
-  // V0.6.7：username 不再硬性必需（后端模板可能用 {date} 段替代 {username} 段）；
-  //   storyId 仍需要（默认 + 后端模板都含 {storyId}）、feishuStoryUrl 空则不建分支
+  // storyId 必需（默认 + 各模板都含 {storyId}）、feishuStoryUrl 空则不建分支
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
     return null;
   }
@@ -156,11 +153,11 @@ export const planBranchesForBuild = (
 
   const now = Date.now();
   // V0.6.7：分支名按 per-repo 有效模板渲染（task.repoBranchTemplates 建 task 时固化、缺省回退内置默认）。
-  //   占位符 {username}/{storyId}/{taskTitle}/{date:fmt}、值各自 branch-safe 化、详见 branch-template.ts
+  //   占位符 {storyId}/{taskTitle}/{date:fmt}、值各自 branch-safe 化、详见 branch-template.ts
   const renderForRepo = (repoPath: string): string =>
     renderBranchName(
       task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
-      { username, storyId, taskTitle: task.title },
+      { storyId, taskTitle: task.title },
     );
 
   // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch / createdAt）

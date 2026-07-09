@@ -6,20 +6,20 @@
  * 支持占位符、前后端不同命名规范都能覆盖。
  *
  * 占位符：
- *   {username}    → settings.username
  *   {storyId}     → 飞书 story id（从 feishuStoryUrl 抠 detail/<digits>）
  *   {taskTitle}   → task.title（自动转 branch-safe）
  *   {date:FORMAT} → 当前日期、FORMAT 支持 yyyy/yy/MM/dd/HH/mm/ss token（如 {date:MM-dd}）
+ *   {username}    → 已废弃（V0.12.x 删除 settings.username、老配置迁移时已把名字烘焙进模板）；
+ *                   老任务快照里残留的该占位符渲染为空段、由连续 `/` 清理兜住
  *
  * 渲染规则：
  *   - 每个占位符的值单独 sanitize（git 非法字符 + 路径分隔 `/` 都换成 -）、模板字面里的 `/` 保留
- *     → 这样 `feature/{username}/...` 的层级 `/` 保留、但变量值里混进的 `/` 不会撑出多余层级
  *   - 渲染完清理连续 `/` + 首尾 `/`（防某占位符为空导致 `feature//xxx`）
  *   - 未知占位符原样保留（不报错、方便用户排查 typo）
  */
 
-/** 内置默认模板（settings.branchTemplate 没配 / 为空时回退、跟 V0.6.6 前的写死算法一致） */
-export const DEFAULT_BRANCH_TEMPLATE = "feature/{username}/{storyId}-{taskTitle}";
+/** 内置兜底模板（模板留空时运行时回退用、不再预填进设置页） */
+export const DEFAULT_BRANCH_TEMPLATE = "feature/{storyId}-{taskTitle}";
 
 /**
  * 单段 branch-safe：保留中文 + 字母数字；空白 / 各种括号 / git 非法字符（~ ^ @ : ? * [ \ / < > | "）

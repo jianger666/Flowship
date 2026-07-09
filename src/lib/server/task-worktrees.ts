@@ -102,10 +102,7 @@ export const resolveOriginalRepoPath = (
  * 跟 action-gates.planBranchesForBuild 同一套命名规则；区别是这里必须**总能**给出
  * 分支名（worktree 创建不能没分支）——storyId 抠不到时兜底用 task id 的时间戳段。
  */
-export const planWorktreeBranchInfos = (
-  task: Task,
-  username: string | undefined,
-): GitBranchInfo[] => {
+export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
   const storyId =
     extractFeishuStoryId(task.feishuStoryUrl) ??
     // task id 形如 t_<ts>_<rand>、取时间戳段兜底（branch-safe 纯数字、跨 task 唯一性够用）
@@ -123,7 +120,7 @@ export const planWorktreeBranchInfos = (
         explicitName ||
         renderBranchName(
           task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
-          { username, storyId, taskTitle: task.title },
+          { storyId, taskTitle: task.title },
         ),
       baseBranch: "",
       checkedOut: false,
@@ -197,9 +194,8 @@ export interface EnsureWorktreesResult {
  */
 export const ensureTaskWorktrees = async (
   task: Task,
-  username: string | undefined,
 ): Promise<EnsureWorktreesResult> => {
-  const infos = planWorktreeBranchInfos(task, username);
+  const infos = planWorktreeBranchInfos(task);
   const workPaths = getTaskWorkRepoPaths(task);
   const createdRepos: string[] = [];
   const clonedDeps: { repoPath: string; dirs: string[] }[] = [];

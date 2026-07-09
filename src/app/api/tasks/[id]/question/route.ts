@@ -41,7 +41,6 @@ interface PostBody {
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
-    username?: string;
     gitHost?: string;
     gitToken?: string;
   };
@@ -167,7 +166,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       imagePaths: imageAbsPaths,
       apiKey: apiKey!,
       fallbackModel: fallbackModel!,
-      username: body.bootArgs?.username?.trim() || undefined,
       gitHost: body.bootArgs?.gitHost?.trim() || undefined,
       gitToken: body.bootArgs?.gitToken?.trim() || undefined,
     }).catch(async (err) => {

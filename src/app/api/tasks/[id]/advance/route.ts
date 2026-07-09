@@ -16,7 +16,6 @@
  *   apiKey: string,
  *   model: ModelSelection,
  *   reuseAgent?: boolean,              // UI「续用当前 agent」勾选时为 true（V0.6.27 默认每 action 新 agent）
- *   username?: string,                 // settings.username、拼 build branch 名用
  * }
  * ```
  *
@@ -67,7 +66,6 @@ interface PostBody {
   apiKey?: string;
   model?: ModelSelection;
   reuseAgent?: boolean;
-  username?: string;
   // V0.6.1 ship action 用：GitLab host + PAT、ship 准入校验 + agent 调 submit_mr 时用
   // 非 ship action 时为空字符串也 OK、不参与校验
   gitHost?: string;
@@ -237,7 +235,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       apiKey,
       model,
       reuseAgent: body.reuseAgent === true,
-      username: body.username?.trim() || undefined,
       gitHost: body.gitHost?.trim() || undefined,
       gitToken: body.gitToken?.trim() || undefined,
       // V0.6.23：build 分批选择（仅 build 有意义、advanceTask 内部按 actionType 取用）

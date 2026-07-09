@@ -458,8 +458,6 @@ export interface AdvanceTaskInput {
   // true = 续用内存里活着的 agent entry（续接 [NEXT_ACTION]、省 send 配额）；
   // 注：ACTION_FRESH_AGENT_DEFAULT 里 true 的 action（review）勾了续用也强起 fresh。
   reuseAgent?: boolean;
-  // 设置页 username（拼 build branch 名用、缺省时不建 branch）
-  username?: string;
   // V0.6.1 ship action 用：GitLab host（不带协议）+ Personal Access Token
   // 来自 settings.gitHost / gitToken、agent 启动时快照、改 token 需 forceNewAgent
   gitHost?: string;
@@ -572,7 +570,6 @@ const advanceTaskInner = async (
     apiKey,
     model,
     reuseAgent,
-    username,
     gitHost,
     gitToken,
     requestedBatchIds,
@@ -616,7 +613,7 @@ const advanceTaskInner = async (
   //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
   //   创建失败直接抛（带处置建议）、不带病起 agent。
   if (isWorktreeTask(task)) {
-    const ensured = await ensureTaskWorktrees(task, username);
+    const ensured = await ensureTaskWorktrees(task);
     // 仅新仓 upsert gitBranches（老条目保留 createdAt / baseBranch 历史值、跟 build hint 老规则一致）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
@@ -737,7 +734,7 @@ const advanceTaskInner = async (
   //    agent 不需要（也不该）自己 checkout
   let branchCheckoutHint: string | undefined;
   if (actionType === "build" && !isWorktreeTask(taskAfterAppend)) {
-    const planned = planBranchesForBuild(taskAfterAppend, username);
+    const planned = planBranchesForBuild(taskAfterAppend);
     if (planned) {
       // 仅新仓 upsert（已存在的保留 createdAt / baseBranch 历史值、不覆盖）
       const existingRepos = new Set(
@@ -871,7 +868,6 @@ export interface ResumeCurrentActionInput {
   apiKey: string;
   /** 模型优先级：action.agentModel → task.model → 这里的兜底（bootArgs.model） */
   fallbackModel: ModelSelection;
-  username?: string;
   gitHost?: string;
   gitToken?: string;
 }
@@ -929,7 +925,7 @@ const resumeCurrentActionInner = async (
 
   // 隔离工作区 task → 确保 worktree 在（可能被手删过）
   if (isWorktreeTask(startTask)) {
-    const ensured = await ensureTaskWorktrees(startTask, input.username);
+    const ensured = await ensureTaskWorktrees(startTask);
     const existingRepos = new Set(
       (startTask.gitBranches ?? []).map((b) => b.repoPath),
     );
@@ -943,7 +939,7 @@ const resumeCurrentActionInner = async (
 
   let branchCheckoutHint: string | undefined;
   if (action.type === "build" && !isWorktreeTask(startTask)) {
-    const planned = planBranchesForBuild(startTask, input.username);
+    const planned = planBranchesForBuild(startTask);
     if (planned) {
       const existingRepos = new Set(
         (startTask.gitBranches ?? []).map((b) => b.repoPath),
@@ -1528,12 +1524,11 @@ const registerSessionBridges = (
  * 隔离 task 起 / 接 agent 前保证 worktree 目录在盘上。
  * reopen 不重建、finalize 清过再问一问、用户手删 worktree——cwd 会指到不存在的路径；
  * ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
- * username 传 undefined：分支名多已落盘（gitBranches）；新建分支场景走 advance 会带 username。
  * 失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
  */
 const ensureWorkspaceReady = async (task: Task): Promise<void> => {
   if (!isWorktreeTask(task)) return;
-  await ensureTaskWorktrees(task, undefined);
+  await ensureTaskWorktrees(task);
 };
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {

@@ -71,7 +71,7 @@ export interface UseSettingsResult {
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
-// - apiKey / username / gitHost / gitToken：字符串直接 ===
+// - apiKey / gitHost / gitToken：字符串直接 ===
 // - defaultModel：嵌套对象、id + params 数组按位比较
 // - repos：数组、长度 + 每项 path/name 比较
 const isFieldEqual = (
@@ -81,7 +81,6 @@ const isFieldEqual = (
 ): boolean => {
   if (
     key === "apiKey" ||
-    key === "username" ||
     key === "gitHost" ||
     key === "gitToken" ||
     key === "branchTemplate" ||
@@ -163,7 +162,6 @@ export const useSettings = (): UseSettingsResult => {
       apiKey: !isFieldEqual("apiKey", settings, savedSettings),
       defaultModel: !isFieldEqual("defaultModel", settings, savedSettings),
       repos: !isFieldEqual("repos", settings, savedSettings),
-      username: !isFieldEqual("username", settings, savedSettings),
       jumpIde: !isFieldEqual("jumpIde", settings, savedSettings),
       submitShortcut: !isFieldEqual("submitShortcut", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),

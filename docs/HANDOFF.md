@@ -213,9 +213,9 @@ agent 要跑 shell 命令
 
 build action 每次跑前、runner 拼 `GitBranchInfo[]`（每仓 1 条 branch）、prompt 头部追加**多仓 idempotent** checkout 引导。
 
-**分支名按模板渲染**（V0.6.7、`src/lib/branch-template.ts`、内置默认 `feature/{username}/{storyId}-{taskTitle}`）：
+**分支名按模板渲染**（V0.6.7、`src/lib/branch-template.ts`、内置兜底 `feature/{storyId}-{taskTitle}`、V0.12.x 删 username 字段——老配置迁移时把名字烘焙进模板）：
 
-- 占位符：`{username}` / `{storyId}`（从 feishuStoryUrl 抠）/ `{taskTitle}` / `{date:FORMAT}`、每个值各自 branch-safe 化（含路径分隔 `/`、模板字面的 `/` 才是层级）
+- 占位符：`{storyId}`（从 feishuStoryUrl 抠）/ `{taskTitle}` / `{date:FORMAT}`、每个值各自 branch-safe 化（含路径分隔 `/`、模板字面的 `/` 才是层级）；老任务快照里的 `{username}` 渲染为空段、由 `/` 清理兜住
 - 模板层级：per-repo 覆盖 > 全局默认 > 内置默认；建 task 时由 client `resolveBranchTemplate` 算「有效模板」固化进 `task.repoBranchTemplates`、build 直接渲染——**不同仓可用不同模板**（如后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）
 - 用户在新建 / 编辑 dialog 给某仓填了「已有工作分支」(`repoFeatureBranches`) → 用它当 name（build 复用、不另建）
 
@@ -232,7 +232,7 @@ fi
 
 每次 build 都重新 inject 这段 hint、不再维护 `checkedOut` 状态。多仓各仓 branch name 取决于模板（同模板=同名、不同模板=各异）。
 
-没填 feishuStoryUrl / 没绑仓时不建 branch、走 fallback（V0.6.7 起 username 不再硬性必需、后端模板可能不含 `{username}`）。
+没填 feishuStoryUrl / 没绑仓时不建 branch、走 fallback。
 
 ### Ship action + GitLab REST 集成（V0.6.1）
 
@@ -298,6 +298,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 ## 最近演进（窗口式、保留 2 个子版本）
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
+
+### V0.12.2（未发版、攒着）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
+
+- **结论**：username 唯一消费方是分支模板 `{username}` 占位符（不进 prompt / MR / git 身份）、单机 app 写死在模板等价——字段删除
+- **无感迁移**（normalizeSettings、幂等）：老配置有 username 时把全局 + 各仓模板里的 `{username}` 一次性替换成真实名字（没显式配过模板的老用户按旧默认烘焙成 `feature/<名字>/{storyId}-{taskTitle}`）、老用户分支名零变化；migration 后字段不再落盘
+- **默认模板留空**：设置页模板输入框默认空（placeholder 提示）、运行时留空回退内置兜底 `feature/{storyId}-{taskTitle}`（DEFAULT_BRANCH_TEMPLATE 改值）；渲染引擎保留 `{username}` token 兼容老任务快照（渲染为空段、`/` 清理兜住）
+- 链路清理：ensureTaskWorktrees / planWorktreeBranchInfos / planBranchesForBuild 去 username 参数、advance / question route 及 client 透传全删、设置页「用户名/缩写」输入框删
 
 ### V0.11.11（未发版、攒着）：worktree 全流程审计 + 7 项修复（2026-07-09、用户点名「好好检查 worktree」、4 审计 + 3 修复 subagent 并行）
 
@@ -510,7 +517,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 | 任务角色 schema + 展示文案 | `src/lib/types.ts: TaskRole / TASK_ROLE_LABEL` |
 | 多仓 cwd / repoPaths 工具 | `src/lib/path-utils.ts: getEffectiveCwd / formatRepoSectionForPrompt` |
 | Artifact ref / 文件路径渲染（V0.6.0.1 加 `actions/` 前缀支持） | `src/lib/path-utils.ts: looksLikeArtifactRef / looksLikePath / buildCursorLink` |
-| 设置：username + 默认分支命名模板（V0.6.7 加模板） | `src/components/settings/user-profile-card.tsx` |
+| 设置：代码跳转 IDE + 默认分支命名模板（V0.12.x 删 username 字段） | `src/components/settings/user-profile-card.tsx` |
 | 设置：仓库列表 + per-repo 分支 + 模板覆盖（V0.6.7）；分支字段 v0.9.11 起 Combobox 下拉（候选自动拉、非 git 禁用） | `src/components/settings/repo-card.tsx` |
 | **仓库分支候选（v0.9.11、本地 + 远端合并去重、设置页 / 任务 dialog 分支下拉数据源）** | `src/lib/server/git-branches.ts: listRepoBranches` + `src/app/api/repo-branches/route.ts` + `src/hooks/use-repo-branches.ts` |
 | 通用可搜索单选下拉（v0.9.11 抽、支持自由输入 + 清空、首用于分支字段） | `src/components/ui/combobox.tsx` |

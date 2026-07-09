@@ -37,7 +37,6 @@ const readSanitizedConfig = async (): Promise<string> => {
       `gitHost: ${typeof cfg.gitHost === "string" && cfg.gitHost ? cfg.gitHost : "（空、自动推导）"}`,
       `jumpIde: ${String(cfg.jumpIde ?? "cursor")}`,
       `defaultModel: ${JSON.stringify(cfg.defaultModel ?? null)}`,
-      `username: ${String(cfg.username ?? "")}`,
       `repos: ${
         Array.isArray(cfg.repos)
           ? (cfg.repos as Array<{ path?: string }>).map((r) => r.path).join("、") || "（空）"

@@ -18,7 +18,6 @@
  * 数据 schema 看 src/lib/types.ts
  */
 
-import { DEFAULT_BRANCH_TEMPLATE } from "./branch-template";
 import { JUMP_IDES } from "./types";
 import type {
   ActionLayoutPref,
@@ -38,12 +37,12 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
   defaultModel: { id: "" },
   repos: [],
-  username: "",
   jumpIde: "cursor",
   submitShortcut: "mod-enter",
   gitHost: "",
   gitToken: "",
-  branchTemplate: DEFAULT_BRANCH_TEMPLATE,
+  // 留空 = 运行时回退内置兜底（feature/{storyId}-{taskTitle}）、不再预填进设置页
+  branchTemplate: "",
   disabledMcpServers: [],
   mcpServers: {},
   actionLayout: { order: [], hidden: [] },
@@ -82,16 +81,42 @@ const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
  * 缺省 / 坏值回退默认。localStorage 和文件两条来源共用同一套归一逻辑。
  */
 const normalizeSettings = (
-  parsed: (Partial<FeAiFlowSettings> & { defaultModel?: unknown }) | null,
+  parsed: (Partial<FeAiFlowSettings> & {
+    defaultModel?: unknown;
+    /** V0.12.x 已删的老字段：读到时做一次「烘焙进模板」迁移、之后不再落盘 */
+    username?: unknown;
+  }) | null,
 ): FeAiFlowSettings => {
   if (!parsed || typeof parsed !== "object") return DEFAULT_SETTINGS;
+
+  // ---- username 迁移（V0.12.x 删字段）----
+  // 老配置有 username 时：把模板里的 {username} 一次性替换成真实名字（全局 + 各仓覆盖）、
+  // 老用户分支名零变化；模板缺省时老默认是 feature/{username}/... 、同样烘焙成显式模板。
+  // 幂等：替换后模板里没有 {username}、重复跑无副作用；下次 saveSettings 落盘即完成迁移。
+  const legacyUsername =
+    typeof parsed.username === "string" ? parsed.username.trim() : "";
+  const bakeUsername = (tpl: string | undefined): string | undefined => {
+    if (!legacyUsername || !tpl) return tpl;
+    return tpl.replaceAll("{username}", legacyUsername);
+  };
+  const rawGlobalTemplate =
+    typeof parsed.branchTemplate === "string" && parsed.branchTemplate.trim()
+      ? parsed.branchTemplate
+      : // 老用户没显式配过模板但有 username = 依赖老默认 feature/{username}/...——烘焙成显式模板保行为
+        legacyUsername
+        ? "feature/{username}/{storyId}-{taskTitle}"
+        : "";
+  const repos = (Array.isArray(parsed.repos) ? parsed.repos : []).map((r) =>
+    r?.branchTemplate ? { ...r, branchTemplate: bakeUsername(r.branchTemplate)! } : r,
+  );
+  const merged = { ...DEFAULT_SETTINGS, ...parsed };
+  // 老字段不落进归一结果（Partial 展开会带上、显式删）
+  delete (merged as Record<string, unknown>).username;
+
   return {
-    ...DEFAULT_SETTINGS,
-    ...parsed,
+    ...merged,
     defaultModel: readDefaultModel(parsed.defaultModel),
-    repos: Array.isArray(parsed.repos) ? parsed.repos : [],
-    // V0.6 加：username 串行存档可能丢、强转 string 兜底
-    username: typeof parsed.username === "string" ? parsed.username : "",
+    repos,
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
     jumpIde: JUMP_IDES.includes(parsed.jumpIde as never)
       ? (parsed.jumpIde as FeAiFlowSettings["jumpIde"])
@@ -102,11 +127,8 @@ const normalizeSettings = (
     // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
     gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
     gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
-    // V0.6.7：全局默认分支命名模板、缺省 / 非串回退内置默认
-    branchTemplate:
-      typeof parsed.branchTemplate === "string" && parsed.branchTemplate.trim()
-        ? parsed.branchTemplate
-        : DEFAULT_BRANCH_TEMPLATE,
+    // V0.6.7：全局默认分支命名模板；V0.12.x 起留空合法（运行时回退内置兜底）
+    branchTemplate: bakeUsername(rawGlobalTemplate) ?? "",
     // V0.6.5：建任务默认 MCP 黑名单快照源
     disabledMcpServers: Array.isArray(parsed.disabledMcpServers)
       ? parsed.disabledMcpServers

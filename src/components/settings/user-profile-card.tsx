@@ -3,7 +3,6 @@
 /**
  * 用户基本信息卡片（V0.6 新增、V0.6.7 加分支命名模板）
  *
- * V0.6 username：用于拼 feature 分支前缀、多人共用 ai-flow 不互踩。
  * V0.6.7 branchTemplate：全局默认 feature 分支命名模板、支持占位符、
  *   per-repo 可在「仓库列表」卡覆盖（如后端用 {date:MM-dd} 段替代 {username} 段）。
  *
@@ -33,26 +32,19 @@ import { renderBranchName } from "@/lib/branch-template";
 import { JUMP_IDES, JUMP_IDE_LABEL, type JumpIde } from "@/lib/types";
 
 interface UserProfileCardProps {
-  username: string;
   branchTemplate: string;
   // 代码跳转 IDE（artifact / 事件流里路径链接的打开目标）、选择即保存
   jumpIde: JumpIde;
   onJumpIdeChange: (next: JumpIde) => void;
-  // 用户名：输入改草稿、失焦落盘
-  onChange: (next: string) => void;
-  onCommit: (value: string) => void;
   // 分支模板：输入改草稿、失焦落盘
   onBranchTemplateChange: (next: string) => void;
   onBranchTemplateCommit: (value: string) => void;
 }
 
 export const UserProfileCard = ({
-  username,
   branchTemplate,
   jumpIde,
   onJumpIdeChange,
-  onChange,
-  onCommit,
   onBranchTemplateChange,
   onBranchTemplateCommit,
 }: UserProfileCardProps) => {
@@ -77,15 +69,14 @@ export const UserProfileCard = ({
     };
   }, []);
 
-  // 模板预览：用一组示例变量渲染当前模板、用户改模板时实时看到效果
+  // 模板预览：用一组示例变量渲染当前模板（留空 = 内置兜底）、用户改模板时实时看到效果
   const preview = useMemo(
     () =>
       renderBranchName(branchTemplate, {
-        username: username || "clj",
         storyId: "6956910305",
         taskTitle: "需求标题",
       }),
-    [branchTemplate, username],
+    [branchTemplate],
   );
 
   return (
@@ -94,17 +85,6 @@ export const UserProfileCard = ({
         <CardTitle>个人信息</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="grid gap-1.5">
-          <Label htmlFor="settings-username">用户名 / 缩写</Label>
-          <Input
-            id="settings-username"
-            value={username}
-            onChange={(e) => onChange(e.target.value)}
-            onBlur={() => onCommit(username)}
-            placeholder="如 clj"
-          />
-        </div>
-
         <div className="grid gap-1.5">
           <Label htmlFor="settings-jump-ide">代码跳转 IDE</Label>
           <Select
@@ -142,12 +122,11 @@ export const UserProfileCard = ({
             value={branchTemplate}
             onChange={(e) => onBranchTemplateChange(e.target.value)}
             onBlur={() => onBranchTemplateCommit(branchTemplate)}
-            placeholder="feature/{username}/{storyId}-{taskTitle}"
+            placeholder="留空默认 feature/{storyId}-{taskTitle}（想带名字直接写、如 feature/clj/…）"
             className="font-mono"
           />
           <p className="text-xs text-muted-foreground">
-            占位符 <code className="font-mono">{"{username}"}</code>{" "}
-            <code className="font-mono">{"{storyId}"}</code>{" "}
+            占位符 <code className="font-mono">{"{storyId}"}</code>{" "}
             <code className="font-mono">{"{taskTitle}"}</code>{" "}
             <code className="font-mono">{"{date:MM-dd}"}</code>；可在仓库列表为单仓覆盖
           </p>

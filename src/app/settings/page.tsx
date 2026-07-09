@@ -165,12 +165,9 @@ const SettingsPage = () => {
       {wrapCard(
         "card-profile",
         <UserProfileCard
-          username={settings.username ?? ""}
           branchTemplate={settings.branchTemplate ?? ""}
           jumpIde={settings.jumpIde ?? "cursor"}
           onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
-          onChange={(v) => update("username", v)}
-          onCommit={(v) => saveFieldValue("username", v)}
           onBranchTemplateChange={(v) => update("branchTemplate", v)}
           onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
         />,

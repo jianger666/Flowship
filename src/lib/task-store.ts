@@ -583,7 +583,6 @@ export const submitTaskQuestion = async (
         apiKey: s.apiKey,
         model: s.defaultModel,
         // 唤醒模式（会话接不回、原地续当前 action）要建 worktree / 提 MR、随手带全
-        username: s.username,
         gitHost: s.gitHost,
         gitToken: s.gitToken,
       },

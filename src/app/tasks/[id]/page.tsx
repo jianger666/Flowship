@@ -368,7 +368,7 @@ const TaskDetailPage = () => {
       if (!args) return;
       // input.model 仅起新 agent 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
-      // gitHost / gitToken / username 不在 prepareRunArgs 暴露字段里、单独读 settings
+      // gitHost / gitToken 不在 prepareRunArgs 暴露字段里、单独读 settings
       const settings = getSettings();
       // V0.x A 方案：带上设置页最新分支配置（只收本 task 各仓 + settings 找得到 + 非空）、
       //   server 据此刷新 task 分支快照——设置页改了 dev/test/线上分支、老 task 下次推进就生效。
@@ -398,7 +398,6 @@ const TaskDetailPage = () => {
           apiKey: args.apiKey,
           model,
           reuseAgent: input.reuseAgent,
-          username: settings.username?.trim() || undefined,
           // V0.6.1 ship action 用：每次推进都带上 settings 里最新的 gitHost/gitToken
           // task-runner 闭包到 internalStartAgent 里、续接路径只在 ship 准入校验时用
           gitHost: settings.gitHost?.trim() || undefined,

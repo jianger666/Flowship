@@ -120,15 +120,14 @@ describe("planWorktreeBranchInfos 分支规划", () => {
     const t = baseTask({
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/6956910305",
     });
-    const infos = planWorktreeBranchInfos(t, "clj");
+    const infos = planWorktreeBranchInfos(t);
     expect(infos).toHaveLength(1);
-    expect(infos[0].name).toBe("feature/clj/6956910305-测试需求");
+    expect(infos[0].name).toBe("feature/6956910305-测试需求");
 
     // 已有记录（返工场景）→ 不重算、保 createdAt / baseBranch 历史值
     const existing = { ...infos[0], name: "feature/manual", baseBranch: "master" };
     const again = planWorktreeBranchInfos(
       baseTask({ ...t, gitBranches: [existing] }),
-      "clj",
     );
     expect(again[0]).toEqual(existing);
   });
@@ -138,12 +137,12 @@ describe("planWorktreeBranchInfos 分支规划", () => {
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/123456",
       repoFeatureBranches: { "/Users/me/work/crm-web": "feature/mine" },
     });
-    expect(planWorktreeBranchInfos(t, "clj")[0].name).toBe("feature/mine");
+    expect(planWorktreeBranchInfos(t)[0].name).toBe("feature/mine");
   });
 
   it("无飞书 URL（抠不到 storyId）兜底用 task id 时间戳段、分支名仍合法非空", () => {
-    const infos = planWorktreeBranchInfos(baseTask(), "clj");
-    expect(infos[0].name).toBe("feature/clj/1700000000000-测试需求");
+    const infos = planWorktreeBranchInfos(baseTask());
+    expect(infos[0].name).toBe("feature/1700000000000-测试需求");
   });
 });
 

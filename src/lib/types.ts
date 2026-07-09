@@ -28,7 +28,7 @@ export interface RepoConfig {
   devBranch?: string;
   /**
    * V0.6.7：feature 分支命名模板覆盖（per-repo、留空则用 settings.branchTemplate 全局默认）
-   * 占位符见 branch-template.ts：{username} / {storyId} / {taskTitle} / {date:MM-dd}
+   * 占位符见 branch-template.ts：{storyId} / {taskTitle} / {date:MM-dd}
    */
   branchTemplate?: string;
   /**
@@ -69,11 +69,11 @@ export interface PreviewSlotStatus {
 }
 
 /**
- * settings：localStorage 持久化的用户配置
- * V0.6 新增 username：用于 ship action 的 branch prefix
- *   （branch 模板 = `feature/<username>/<飞书id>-<task.title>`、多人用 ai-flow 不互踩）
+ * settings：config.json 持久化的用户配置
  * V0.6.1 新增 gitHost + gitToken：ship action 走 server 内置 GitLab REST API、
  *   不依赖外部 glab CLI；当前公司场景所有仓共用同一个 GitLab 实例、所以是全局字段。
+ * V0.12.x 删 username：唯一用途是分支模板 {username} 占位符、单机 app 里直接把名字
+ *   写进模板等价——迁移时把老配置的名字烘焙进模板后字段彻底移除。
  */
 /**
  * 代码跳转目标 IDE（2026-06-12 加、用户要求支持 IDEA）
@@ -138,7 +138,6 @@ export type SubmitShortcut = "mod-enter" | "enter";
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
-  username?: string;
   /** 代码路径点击跳转的 IDE、默认 cursor */
   jumpIde?: JumpIde;
   /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */
@@ -156,7 +155,7 @@ export interface FeAiFlowSettings {
   repos: RepoConfig[];
   /**
    * V0.6.7：全局默认 feature 分支命名模板（per-repo 没配 branchTemplate 时用这份）
-   * 默认 `feature/{username}/{storyId}-{taskTitle}`、占位符见 branch-template.ts
+   * 留空 = 内置兜底 `feature/{storyId}-{taskTitle}`、占位符见 branch-template.ts
    */
   branchTemplate?: string;
   /**
@@ -656,9 +655,8 @@ export interface MRRecord {
  * - 多仓 task：每仓 1 条 GitBranchInfo、name 同名、base branch 各仓自探
  * - 后续 build / ship 都复用同一条 branch（V0.6.1：每仓同名 branch、累计 commit、单仓 1 MR）
  *
- * 命名规则（V0.6 拍板、V0.6.1 沿用）：
- *   name = `feature/<username>/<飞书 story id>-<task.title>`（多仓共用同一 name）
- *   - username 取自 settings.username
+ * 命名规则（V0.6.7 起模板化、见 branch-template.ts）：
+ *   name = 按分支模板渲染（默认 `feature/<飞书 story id>-<task.title>`、多仓共用同一 name）
  *   - 飞书 story id 从 task.feishuStoryUrl 抠（URL 末段数字）
  *   - task.title 保留中文、非法字符（\s / : * ? " < > | 【 】 ( ) 等）换成 -
  *   baseBranch 由 agent 启动 build 时自己探测（origin/HEAD 或 git remote show）、不在 settings 里配
@@ -909,7 +907,7 @@ export interface Task {
    * - 场景：用户（尤其后端）建 task 前已自己 checkout 了分支、做了一部分 → 建 task 时填进来、
    *   build 不再按算法名建新分支、而是复用这个已有分支（git show-ref 命中 → checkout、他的代码都在）
    * - 来源：建 task 弹窗 per-repo 现填（每个需求不一样、不是仓库级固定属性、故不放设置页）
-   * - 没填（key 不存在 / 空）→ build 用算法名 `feature/<username>/<storyId>-<title>`（现状默认）
+   * - 没填（key 不存在 / 空）→ build 按分支模板生成（默认 `feature/<storyId>-<title>`）
    * - 落到 gitBranches[].name = 这个名、ship 提测自动用对（MR 源分支取自 gitBranches[].name）
    */
   repoFeatureBranches?: Record<string, string>;
