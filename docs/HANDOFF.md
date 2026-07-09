@@ -304,7 +304,11 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **运行时只读 fe 自管配置**（config.json → settings.mcpServers）、不再 live 合并 `~/.cursor/mcp.json`——在 Cursor 改配置不再影响本 app；`readMergedMcpServers` → `readEffectiveMcpServers`（自管 + 剔 RESERVED 名）、resolveTaskMcpServers / health / oauth 四处消费方统一切换
 - **老用户无感迁移**（`migrateCursorMcpOnce`、单飞 + 幂等）：调用点 = /api/settings **GET**（client 首拉配置前必过、cache 一定含快照 → 整对象 PUT 不盖丢）+ **PUT**（localStorage 过渡期老用户 config.json 首次落盘后补迁、响应返最终盘上 settings、client putSettings 回填 mcpServers 进 cache）+ readEffectiveMcpServers（boot 直接 resume agent 路径）。config.json 已存在 → Cursor 快照合入自管（自管同名优先、原子写）+ 落标记；不存在 → 什么都不做不落标记（等首次 PUT 出生后再迁）。标记 `data/.mcp-cursor-migrated` 防重、失败清单飞下次重试。审计（grok subagent 蓝军）揪出的 2 个 P0（迁移 vs 整对象 PUT 竞态、localStorage-only 老用户被误判新装）均按此修复
 - **设置页 MCP 卡重做**（`mcp-card.tsx` 条目化）：每 server 一行（类型摘要 + 编辑 / 删除）、新增 / 编辑 dialog（名称 + 单 server JSON）、「从 Cursor 导入」dialog 勾选挑 server（已存在标「导入将覆盖」）、高级折叠保留整体 JSON 编辑；OAuth / 常用开关 / 健康探测数据源全切自管
-- `/api/cursor-mcp` 语义改：`servers` = 有效集（自管）、`cursor` 仅供导入 dialog；`settingSources:["project"]` / 全局 rules / skills 注入**本期不动**（prompt 上下文体系、接第二 backend 时再抽统一层）
+- `/api/cursor-mcp` 语义改：`servers` = 有效集（自管）、`cursor` 仅供导入 dialog；`settingSources:["project"]` / 全局 rules 注入**本期不动**（prompt 上下文体系、接第二 backend 时再抽统一层）
+- **V0.13-P1 Skill 独立化 + MCP 卡整合**（同日追加、用户拍板）：
+  - app 自管 skills 目录 `<dataRoot>/skills/<name>/SKILL.md`（`app-skills.ts`）、loadSkills 纳入扫描（优先级：平台内置 > 自管 > Cursor 全局 > 飞书 CLI）
+  - 设置页新增 Skills 卡（`skills-card.tsx`）：列全部来源（带标签）、自管可新增 / 编辑 / 删除（编辑 SKILL.md、CodeEditor 加 markdown 高亮）、「从 Cursor 导入」勾选 dialog（**整目录拷贝**、含脚本附属文件）；API：GET/POST/DELETE `/api/skills` + `/api/skills/content` + `/api/skills/import`
+  - MCP 卡「常用 MCP」独立区块砍掉（用户：太长）——常用开关 + 健康徽标 + OAuth 授权全并进条目行内、`HealthBadge` 从 mcp-toggle-list export 复用
 
 ### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
 

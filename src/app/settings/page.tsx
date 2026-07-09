@@ -37,6 +37,7 @@ import { ApiKeyCard } from "@/components/settings/api-key-card";
 import { ModelCard } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
+import { SkillsCard } from "@/components/settings/skills-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 import { PreferenceCard } from "@/components/settings/preference-card";
@@ -231,6 +232,8 @@ const SettingsPage = () => {
           onChange={(next) => saveFieldValue("disabledMcpServers", next)}
         />,
       )}
+
+      {wrapCard("card-skills", <SkillsCard />)}
     </div>
   );
 };

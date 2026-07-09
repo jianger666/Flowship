@@ -13,14 +13,15 @@ import { useId } from "react";
 import Editor from "react-simple-code-editor";
 import { highlight, languages } from "prismjs";
 import "prismjs/components/prism-json";
+import "prismjs/components/prism-markdown";
 
 import { cn } from "@/lib/utils";
 
 interface CodeEditorProps {
   value: string;
   onChange: (next: string) => void;
-  // 目前只接 json、想加新语言要先 import 对应 prism 语言包
-  language?: "json";
+  // 想加新语言要先 import 对应 prism 语言包
+  language?: "json" | "markdown";
   placeholder?: string;
   rows?: number;
   className?: string;

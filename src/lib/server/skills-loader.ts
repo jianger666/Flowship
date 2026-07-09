@@ -27,7 +27,11 @@ import path from "node:path";
 import matter from "gray-matter";
 
 import { getGlobalCursorDirs } from "./cursor-config";
+import { dataRoot } from "./data-root";
 import { getToolsSkillsDir } from "./feishu-cli";
+
+/** app 自管 skills 目录（V0.13 独立化、设置页可视化管理、随 data 目录走） */
+export const getAppSkillsDir = (): string => path.join(dataRoot(), "skills");
 
 // ai-flow 平台自身 skills 目录的相对路径
 // V0.3 起：从 `.ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
@@ -54,8 +58,9 @@ export interface SkillEntry {
  *
  * @param rootDir   要扫的根目录绝对路径
  * @returns         所有解析出的 SkillEntry（解析失败的 silent skip）
+ * export：app-skills.ts（设置页 Skill 管理）复用
  */
-const scanSkillsDir = async (rootDir: string): Promise<SkillEntry[]> => {
+export const scanSkillsDir = async (rootDir: string): Promise<SkillEntry[]> => {
   // 目录不存在 / 不可读、直接当作 0 个 skill、不抛错
   // skill 是「可选能力」、没装就是没装、不该让 chat 启动失败
   try {
@@ -152,22 +157,27 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
 };
 
 /**
- * 加载本次 agent 可用的 skills：平台自带 + 全局 `~/.cursor/skills/`
+ * 加载本次 agent 可用的 skills：平台自带 + app 自管 + 全局 `~/.cursor/skills/` + 飞书 CLI
  *
- * 两类来源（都由 fe 注入 prompt、不靠 settingSources）：
+ * 来源（都由 fe 注入 prompt、不靠 settingSources）：
  *   1. **平台自带** `<ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
- *   2. **全局** `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）——
+ *   2. **app 自管** `<dataRoot>/skills/`（V0.13 独立化：设置页可视化增删改、见 app-skills.ts）
+ *   3. **全局** `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）——
  *      `settingSources:["project"]` 只读 project 层、够不着 user 层、必须 fe 自己读
+ *   4. **飞书 CLI 官方** `<dataRoot>/tools/skills/`（V0.12 一键安装时落盘）
  *
  * 不读 repo `.cursor/skills/`（project 层、由 `settingSources:["project"]` 交给 SDK 加载、
  * 避免同一份 SKILL.md 进 prompt 两次）。
  *
- * 同名去重：平台自带优先（own 覆盖 global、平台 skill 是 fe 特定行为、不该被全局同名顶掉）。
+ * 同名去重优先级：平台自带 > app 自管 > 全局 > 飞书 CLI
+ * （自管是用户在本 app 里的显式配置、该压过跟 Cursor 共用的全局；平台 skill 是 fe 特定行为、不被顶掉）。
  */
 export const loadSkills = async (): Promise<SkillEntry[]> => {
   const own = await scanSkillsDir(
     path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
   );
+  // app 自管 <dataRoot>/skills/（V0.13、设置页管理）
+  const app = await scanSkillsDir(getAppSkillsDir());
   // 全局 ~/.cursor/skills/（user 层、settingSources["project"] 够不着、fe 自己读）
   const global: SkillEntry[] = [];
   for (const dir of getGlobalCursorDirs()) {
@@ -175,10 +185,11 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   }
   // V0.12：内置飞书 CLI 的官方 skills（<dataRoot>/tools/skills、一键安装时落盘）
   const feishuCli = await scanSkillsDir(getToolsSkillsDir());
-  // 合并去重（优先级：平台自带 > 全局 > 飞书 CLI 官方——用户全局同名 skill 视为有意覆盖）
+  // 合并去重（后 set 的覆盖先 set 的、所以低优先级先放）
   const byName = new Map<string, SkillEntry>();
   for (const s of feishuCli) byName.set(s.name, s);
   for (const s of global) byName.set(s.name, s);
+  for (const s of app) byName.set(s.name, s);
   for (const s of own) byName.set(s.name, s);
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));

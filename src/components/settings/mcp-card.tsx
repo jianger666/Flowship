@@ -4,10 +4,10 @@
  * MCP servers 卡片（V0.13 独立化重做）
  *
  * fe 自管 MCP 是唯一运行时来源（不再 live 合并 Cursor）：
- * - 条目化管理：每个 server 一行（类型摘要 + 编辑 / 删除）、新增 / 编辑走 dialog
- * - 从 Cursor 导入：dialog 勾选挑 server、一次性拷贝成自管条目（之后互不影响）
+ * - 条目化管理：每个 server 一行、**常用开关 + 健康徽标 + OAuth 都并在行内**
+ *  （用户拍板「常用 MCP 整合到配置上、不然太长」——不再单独两个区块）
+ * - 新增 / 编辑走 dialog；从 Cursor 导入 dialog 勾选挑 server（一次性拷贝、之后互不影响）
  * - 高级：整体 JSON 编辑（折叠、批量粘贴场景用）
- * - 常用开关（新任务默认黑名单）+ 健康探测 + OAuth 授权沿用
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -16,7 +16,6 @@ import {
   ChevronRight,
   Download,
   Pencil,
-  Plug,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -24,6 +23,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import type { McpServerConfig } from "@cursor/sdk";
+
+import type { McpHealth } from "@/lib/types";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -46,7 +47,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
+import { HealthBadge } from "@/components/tasks/mcp-toggle-list";
+import { Switch } from "@/components/ui/switch";
 import { useDialog } from "@/hooks/use-dialog";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
@@ -102,8 +104,8 @@ export const McpCard = ({
   const [importOpen, setImportOpen] = useState(false);
   // 高级 JSON 折叠
   const [advancedOpen, setAdvancedOpen] = useState(false);
-
-  const oauthServers = Object.keys(statuses);
+  // 失败日志弹窗：当前查看的失败 server 的 health（null = 不开）
+  const [logHealth, setLogHealth] = useState<McpHealth | null>(null);
 
   const handleDelete = async (name: string) => {
     const ok = await confirm({
@@ -125,7 +127,7 @@ export const McpCard = ({
         <CardDescription>本应用独立配置、传给 agent；可从 Cursor 导入</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
             variant="outline"
@@ -144,52 +146,119 @@ export const McpCard = ({
             <Plus />
             新增
           </Button>
+          {names.length > 0 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="ml-auto"
+              onClick={recheckHealth}
+              disabled={loadingServers.size > 0}
+            >
+              <RefreshCw
+                className={cn(loadingServers.size > 0 && "animate-spin")}
+              />
+              重新检测
+            </Button>
+          )}
         </div>
 
-        {/* 条目列表 */}
+        {/* 条目列表：常用开关 + 健康徽标 + OAuth 全并在行内（不再单独区块、页面不拉长） */}
         {names.length === 0 ? (
           <EmptyHint>还没配 MCP server——从 Cursor 导入或手动新增</EmptyHint>
         ) : (
           <div className="divide-y divide-border/60 rounded-md border border-border/60">
-            {names.map((name) => (
-              <div key={name} className="flex items-center gap-2 px-3 py-2">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm" title={name}>
-                    {name}
+            {names.map((name) => {
+              const isDisabled = disabledServers.includes(name);
+              const oauth = statuses[name];
+              return (
+                <div key={name} className="flex items-center gap-2 px-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    <div
+                      className={cn(
+                        "truncate text-sm",
+                        isDisabled && "text-muted-foreground/60 line-through",
+                      )}
+                      title={name}
+                    >
+                      {name}
+                    </div>
+                    <div
+                      className="truncate font-mono text-[11px] text-muted-foreground"
+                      title={summarizeServer(appServers[name])}
+                    >
+                      {summarizeServer(appServers[name])}
+                    </div>
                   </div>
-                  <div
-                    className="truncate font-mono text-[11px] text-muted-foreground"
-                    title={summarizeServer(appServers[name])}
+                  {!isDisabled && (
+                    <HealthBadge
+                      h={health[name]}
+                      loading={loadingServers.has(name)}
+                      onShowLog={() => {
+                        const h = health[name];
+                        if (h) setLogHealth(h);
+                      }}
+                    />
+                  )}
+                  {/* OAuth：需要授权的 server 行内给动作（已授权 hover 换「重新授权 / 撤销」入口在编辑侧边） */}
+                  {oauth &&
+                    (oauth.authorized ? (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        className="shrink-0 text-muted-foreground"
+                        onClick={() => revoke(name)}
+                        disabled={busy === name}
+                        title="已授权、点击撤销"
+                      >
+                        <ShieldCheck className="text-emerald-500" />
+                        已授权
+                      </Button>
+                    ) : (
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        className="shrink-0"
+                        onClick={() => authorize(name)}
+                        disabled={busy === name}
+                      >
+                        授权
+                      </Button>
+                    ))}
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={`编辑 ${name}`}
+                    title="编辑"
+                    onClick={() => setEditing({ name })}
                   >
-                    {summarizeServer(appServers[name])}
-                  </div>
+                    <Pencil />
+                  </Button>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={`删除 ${name}`}
+                    title="删除"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => void handleDelete(name)}
+                  >
+                    <Trash2 />
+                  </Button>
+                  {/* 常用开关：关 = 进新任务默认黑名单（跟原「常用 MCP」区同语义） */}
+                  <Switch
+                    checked={!isDisabled}
+                    onCheckedChange={(checked) => {
+                      onChange(
+                        checked
+                          ? disabledServers.filter((s) => s !== name)
+                          : [...new Set([...disabledServers, name])],
+                      );
+                      if (checked) probeOne(name);
+                    }}
+                  />
                 </div>
-                {statuses[name]?.authorized && (
-                  <Badge variant="secondary" className="shrink-0">
-                    已授权
-                  </Badge>
-                )}
-                <Button
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={`编辑 ${name}`}
-                  title="编辑"
-                  onClick={() => setEditing({ name })}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={`删除 ${name}`}
-                  title="删除"
-                  className="text-muted-foreground hover:text-destructive"
-                  onClick={() => void handleDelete(name)}
-                >
-                  <Trash2 />
-                </Button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -218,86 +287,28 @@ export const McpCard = ({
           )}
         </div>
 
-        {names.length > 0 && (
-          <>
-            {oauthServers.length > 0 && (
-              <div className="space-y-2 rounded-md border border-border/60 p-3">
-                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <ShieldCheck className="size-3.5 shrink-0" />
-                  OAuth 授权
-                </div>
-                <div className="space-y-1.5">
-                  {oauthServers.map((name) => {
-                    const authorized = statuses[name]?.authorized;
-                    return (
-                      <div key={name} className="flex items-center gap-2">
-                        <span className="min-w-0 flex-1 truncate text-sm" title={name}>
-                          {name}
-                        </span>
-                        {authorized && (
-                          <Badge variant="secondary" className="shrink-0">
-                            已授权
-                          </Badge>
-                        )}
-                        <Button
-                          size="xs"
-                          variant={authorized ? "ghost" : "default"}
-                          onClick={() => authorize(name)}
-                          disabled={busy === name}
-                        >
-                          {authorized ? "重新授权" : "授权"}
-                        </Button>
-                        {authorized && (
-                          <Button
-                            size="xs"
-                            variant="ghost"
-                            onClick={() => revoke(name)}
-                            disabled={busy === name}
-                          >
-                            撤销
-                          </Button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            <div className="space-y-2 rounded-md border border-border/60 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-                  <Plug className="size-3.5 shrink-0" />
-                  常用 MCP
-                </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  onClick={recheckHealth}
-                  disabled={loadingServers.size > 0}
-                >
-                  <RefreshCw
-                    className={cn(
-                      "size-3",
-                      loadingServers.size > 0 && "animate-spin",
-                    )}
-                  />
-                  重新检测
-                </Button>
-              </div>
-              <McpToggleList
-                availableServers={names}
-                disabled={disabledServers}
-                onChange={onChange}
-                health={health}
-                loadingServers={loadingServers}
-                onEnableProbe={probeOne}
-              />
-            </div>
-          </>
-        )}
       </CardContent>
+
+      {/* 健康探测失败日志弹窗（点行内失败徽标弹出） */}
+      <Dialog
+        open={!!logHealth}
+        onOpenChange={(o) => {
+          if (!o) setLogHealth(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <span className="size-2 shrink-0 rounded-full bg-red-500" />
+              <span className="truncate font-mono">{logHealth?.name}</span>
+              <span className="text-muted-foreground">连接失败</span>
+            </DialogTitle>
+          </DialogHeader>
+          <pre className="max-h-80 overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap wrap-anywhere">
+            {logHealth?.detail ?? "（无详情、可能是未知错误）"}
+          </pre>
+        </DialogContent>
+      </Dialog>
 
       {editing !== null && (
         <ServerEditDialog

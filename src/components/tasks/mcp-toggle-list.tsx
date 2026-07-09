@@ -47,7 +47,8 @@ const HEALTH_TEXT: Record<McpHealthStatus, string> = {
 
 // 单个 server 的连通性徽标：点 + 中文。h 没探到 + loading → spinner。
 // 失败（fail）渲染成可点 button、点 onShowLog 弹报错日志；正常（ok）是普通 span（hover 看详情）。
-const HealthBadge = ({
+// export：设置页 MCP 卡条目行复用（V0.13 常用开关并入条目行后、设置页不再挂整个 McpToggleList）
+export const HealthBadge = ({
   h,
   loading,
   onShowLog,
