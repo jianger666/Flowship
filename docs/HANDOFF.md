@@ -315,6 +315,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - ~~CLI 内置进安装包~~（做完当天用户撤回「cli 不内置」——预取脚本 / afterPack / 种子拷贝已全部回退、维持按需在线安装）
   - 飞书 CLI 安装器增量化（同日修 bug）：已装且版本一致跳过、按钮「缺任一叫安装、都在叫更新」
 - **Skills 列表按来源分组折叠**（用户拍板「几十上百个太长」）：自管组常驻展开、内置 / Cursor 全局 / 飞书 CLI 各一折叠组（标题带数量、默认收起）
+- **输入条统一语义 `[USER_MESSAGE]`**（同日、用户拍板「别这么多分支、AI 自主判断」）：原「再聊聊（[ACTION_ACK revise]）/ 问一问（[USER_QUESTION]）」双通道合一——客户端只有 submitTaskQuestion 一条路、消息统一 `[USER_MESSAGE]`、AI 按二分类铁则自主判断（纯疑问就答、别把问题当改码指令；修改要求才动手）。服务端内务：awaiting_ack 时自动 snapshot artifact + 消息尾附〈产出审阅中〉提示（处理完须 submit_work 重新交卷、原 revise 状态机保留：action 回 running）；无 ack 上下文 = 插话（能改文件、不推进任务链）。`acknowledgeAction` / action-ack 路由 / submitActionAck / ACTION_ACK_REVISE 信号全部退役删除；approve 由推进时自动认可承担；canResume 加 awaiting_ack（会话断 / 换模型时唤醒接手）。prompt 手术：_super.md「revise 闭环」段改写为「[USER_MESSAGE] 统一处理」、action-build/learn/plan + _shared 同步、协议一致性测试守护旧信号不回流
 - **ask_user 弹窗 → 事件流内联答题卡**（同日、用户拍板「弹窗挡整屏不合理」）：模态 AskUserDialog 删除（旧 wait_for_user 阻塞协议遗产）、答题逻辑整体搬进 `ask-user-inline.tsx`（AskUserInlineCard）；event-stream 分流：`findPendingAskEvent` 命中的 ask 行渲染内联卡（选项 / 自定义 / 每题贴图 / 稍后再补充 / 快捷键全保留）、已答 / 作废走 AskUserRequestRow 回放；失效态（runStatus=error）内联警示不再需要 dismiss；chat-view 的兜底弹窗一并删（EventStream 内已覆盖）。对齐 Cursor / Claude Code 的内联提问形态、答题时能看事件流上下文
 
 ### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）

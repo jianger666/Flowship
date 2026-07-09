@@ -12,10 +12,11 @@
 
 // 固定文本信号（消息头 + 空行 + body）
 export const SIGNALS = {
-  ACTION_ACK_REVISE: "[ACTION_ACK revise]",
   USER_REPLY: "[USER_REPLY]",
-  // V0.11.9「问一问」：任务过程中的纯提问——只回答、不改代码 / 不交卷 / 不动任务进度
-  USER_QUESTION: "[USER_QUESTION]",
+  // V0.13.x 统一消息（原 [USER_QUESTION] + [ACTION_ACK revise] 合一、用户拍板「别这么多分支」）：
+  // 任务页输入条的任何消息——AI 自主二分类（疑问就答 / 要改就改）；带「产出审阅中」
+  // 上下文标注时处理完须重新交卷、否则不推进任务链
+  USER_MESSAGE: "[USER_MESSAGE]",
   // 附件清单段头（跟在主信号 body 后）
   ATTACHED_IMAGES: "[ATTACHED_IMAGES]",
   ATTACHED_PATHS: "[ATTACHED_PATHS]",

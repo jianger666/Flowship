@@ -85,7 +85,7 @@
 
 1. `shell ls {{actionArtifactsDir}}/` 列出全部 artifact、按 action 类型逐份 read
 2. read 事件日志 `{{eventsLogPath}}`（大文件先 `grep` 关键头再定位）、重点挖四类高价值信号：
-   - **用户 revise 反馈原话**（`[ACTION_ACK revise]` 后的 feedback）——用户纠正过 agent 的地方 = 最高价值沉淀信号
+   - **用户修改反馈原话**（产出审阅中 `[USER_MESSAGE]` 的改类消息）——用户纠正过 agent 的地方 = 最高价值沉淀信号
    - **ask_user 问答**——用户拍板的业务口径 / 技术选型
    - **review「bug 复审」+「用户裁决」段**——真 bug 的模式、用户对 bug 的处理偏好
    - **check 失败记录 / build「偏离 plan」记录**——agent 反复踩的坑
@@ -159,7 +159,7 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 参数：`task_id={{taskId}}`、`action_id=<本 action 的 id>`、`artifact_path=actions/<n>-learn.md`
 
 拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
-- `[ACTION_ACK revise]` + feedback → 按 super-prompt「revise 闭环」二分类处理（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 submit_work 重新交卷、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」二分类（问类答疑 / 改类复述确认后改）——用户可能说「条目 2 写得太宽、收窄到 XX」「这条不该落、删掉」——改知识载体文件 + artifact 后再 submit_work 重新交卷、结束回复
 
 ## 后置检查（runner 自动跑、不过 action 标 ❌）
 
@@ -210,7 +210,7 @@ ls .cursor/rules/ 2>/dev/null; ls .cursor/skills/ 2>/dev/null; ls AGENTS.md 2>/d
 
 ## 修改记录
 
-> 仅当用户 ack 时点「再聊聊」后按反馈做了修正才追加、初稿省略。格式见「跨 action 共享规范 §5.1」。
+> 仅当产出审阅中用户发消息要求修改、按反馈修正后才追加、初稿省略。格式见「跨 action 共享规范 §5.1」。
 ```
 
 ## 反例（实测高发、写之前自查）

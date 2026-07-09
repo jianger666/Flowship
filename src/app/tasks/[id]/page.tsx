@@ -858,7 +858,7 @@ const TaskDetailPage = () => {
                   hideReplyComposer
                 />
               </div>
-              {/* V0.11.9 统一「跟 AI 说」入口：等审阅时按再聊聊送（agent 二分类）、其他时刻纯提问 / 唤醒 */}
+              {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
               <TaskTalkComposer task={task} onTaskUpdate={setTask} />
             </aside>
           </ResizablePanel>

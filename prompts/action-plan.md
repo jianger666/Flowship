@@ -144,7 +144,7 @@
 
 ### 5.1 拿到 ask_user 答案后按清晰度分级（V0.5.5、V0.5.6 加 D）
 
-⚠️ **跟 super-prompt §3 revise 解读不是同一回事**——super-prompt §3 revise 处理「用户点再聊聊输入的 freeform feedback」、§5.1 处理「ask_user 弹窗答案」。下面这套 A/B/C/D/E 分级只用在「ask_user 答案」场景：
+⚠️ **跟 super-prompt 的 [USER_MESSAGE] 处理不是同一回事**——那边处理「用户在输入条发的 freeform 消息」、§5.1 处理「ask_user 弹窗答案」。下面这套 A/B/C/D/E 分级只用在「ask_user 答案」场景：
 
 - **A. 答案明确**（选了具体选项 / 自由文本含具体决策）
   → 直接把结论写进 plan artifact 对应位置
@@ -156,7 +156,7 @@
   → 二轮 ask_user 的 question 写清楚：你看了哪些代码、判断有几种走法、各自优劣
 - **D. 答案头是 `[ASK_USER_REPLY deferred]`**（用户点了「稍后再补充」按钮）
   → **不重问这组 Q**（用户已明示稍后补、再问是冒犯）
-  → 把所有未答 Q 完整列进 plan artifact「§6 待澄清 / 不确定项」段、提示用户后续在「再聊聊」或上下文文档里补
+  → 把所有未答 Q 完整列进 plan artifact「§6 待澄清 / 不确定项」段、提示用户后续在输入条或上下文文档里补
   → 按你判断的合理 default 推进、artifact 对应位置加 `> （ack 待澄清：xxx）` 标记
   → 然后**继续走到步骤 6** submit_work
 - **E. 部分清晰 + 部分模糊**（混合）

@@ -10,7 +10,7 @@
  *      ask-reply 路由校验「答案对应的还是当前这组问题」用（防旧弹窗答案串新提问）
  *   2. **notifier / task action handler 注册表**：runner ↔ chat-mcp 的回调桥（方向不变：
  *      task-runner → chat-mcp、chat-mcp 不反向 import runner）
- *   3. **buildAgentMessage**：用户操作 → 发给 agent 的消息文本（[NEXT_ACTION] / [ACTION_ACK
+ *   3. **buildAgentMessage**：用户操作 → 发给 agent 的消息文本（[NEXT_ACTION] / [USER_MESSAGE]
  *      revise] / [USER_REPLY] 头 + 附件段）——原 formatToolReturnAsText 的瘦身版、信号
  *      字面量与 prompts 的约定由 tests/protocol-signals.test.ts 守护
  *
@@ -305,22 +305,22 @@ export const safeNotifyAskUserRequest = async (
 // ----------------- buildAgentMessage：用户操作 → agent.send 的消息文本 -----------------
 
 /**
- * 用户操作载荷（V0.11：原 wait 协议 ToolReturn 的瘦身版——只剩会「发给 agent」的三种；
- * approve / 终态不再需要通知 agent：approve 纯服务端落状态、终态直接 cancel run + 关会话）
+ * 用户操作载荷（V0.11：原 wait 协议 ToolReturn 的瘦身版；
+ * V0.13.x：action_revise 并入 user_message——「再聊聊 / 问一问」统一成一条消息语义、
+ * AI 自主二分类；approve / 终态不需要通知 agent）
  */
 export type AgentMessage = {
   // user_reply：chat 消息 / ask_user 答案（[ASK_USER_REPLY] Q&A 块由 route 拼好传入）
-  // action_revise：用户点「再聊聊」
   // next_action：用户在 UI 推进新 action（续用会话时）
-  // question：任务内「问一问」（V0.11.9）——纯提问、只回答不改代码不动任务进度
-  kind: "user_reply" | "action_revise" | "next_action" | "question";
+  // user_message：任务页输入条的任何消息（V0.13.x 统一语义）——AI 自主判断问 / 改
+  kind: "user_reply" | "next_action" | "user_message";
   text: string;
   // 图片附件绝对路径（拼 [ATTACHED_IMAGES] 段、agent 用 read 工具看图）
   imagePaths?: string[];
   // 文件 / 目录附件绝对路径（拼 [ATTACHED_PATHS] 段）
   attachmentPaths?: string[];
-  // action_revise 的修改意见文本
-  feedback?: string;
+  // user_message：当前有产出在等审阅时的上下文（服务端附加、要求处理完重新交卷）
+  ackContext?: { actionId: string; artifactPath?: string };
   // next_action 的元数据（拼 [NEXT_ACTION ...] 头）
   nextActionId?: string;
   nextActionType?: ActionType;
@@ -330,7 +330,7 @@ export type AgentMessage = {
 
 /**
  * 把用户操作序列化成发给 agent 的消息文本（`agent.send(text)`）。
- * 头部信号字面量（[NEXT_ACTION] / [ACTION_ACK revise] / [USER_REPLY]…）与 prompts 的
+ * 头部信号字面量（[NEXT_ACTION] / [USER_MESSAGE] / [USER_REPLY]…）与 prompts 的
  * 解读约定一致、由 tests/protocol-signals.test.ts 守护。
  */
 export const buildAgentMessage = (msg: AgentMessage): string => {
@@ -353,13 +353,6 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
     return lines;
   };
 
-  if (msg.kind === "action_revise") {
-    const lines: string[] = [SIGNALS.ACTION_ACK_REVISE];
-    const fb = (msg.feedback ?? msg.text ?? "").trim();
-    if (fb) lines.push("", fb);
-    lines.push(...attachmentSections(msg));
-    return lines.join("\n");
-  }
   if (msg.kind === "next_action") {
     const head = buildNextActionHead({
       actionId: msg.nextActionId,
@@ -372,18 +365,25 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
     lines.push(...attachmentSections(msg));
     return lines.join("\n");
   }
-  if (msg.kind === "question") {
-    // 「跟 AI 说」：行为约束内联在消息里（比只靠 prompt 教稳）。
-    // V0.13.x 放开「只答不动手」（用户拍板「纯答疑限制太死」）：疑问就答、
-    // 要改就直接改——只是不推进任务链（不调 submit_work / submit_mr）
+  if (msg.kind === "user_message") {
+    // V0.13.x 统一消息（用户拍板「别这么多分支、AI 自主判断」）：行为约束内联在消息里
+    //（比只靠 prompt 教稳）。有产出在等审阅时附上下文、要求处理完重新交卷（原 revise 语义）。
     const lines: string[] = [
-      SIGNALS.USER_QUESTION,
+      SIGNALS.USER_MESSAGE,
       "",
       msg.text,
       ...attachmentSections(msg),
       "",
-      "（这是任务过程中用户的插话、不是推进指令：是疑问就直接回答；是修改要求就直接动手改（改完说明改了什么）。**不要**调 submit_work / submit_mr 等推进类工具——任务进度停在原地、等用户自己推进。处理完自然结束本轮回复。）",
     ];
+    if (msg.ackContext) {
+      lines.push(
+        `（提示：你有一份产出正在等用户审阅（action_id=${msg.ackContext.actionId}${msg.ackContext.artifactPath ? `、artifact=${msg.ackContext.artifactPath}` : ""}）。先判断这条消息的性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改意见**才动 artifact / 代码（模糊的先 ask_user 复述确认）。无论问还是改、处理完都要调 submit_work（同 action_id）重新交卷、然后结束回复。）`,
+      );
+    } else {
+      lines.push(
+        "（这是任务过程中用户的插话、不是推进指令。先判断性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改要求**才动手改（改完说明改了什么）。不要调 submit_work / submit_mr 推进任务链——进度停在原地、等用户自己推进。处理完自然结束本轮回复。）",
+      );
+    }
     return lines.join("\n");
   }
   // user_reply

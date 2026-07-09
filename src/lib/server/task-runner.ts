@@ -7,7 +7,7 @@
  *   （plan / build / review / ship / learn / dev）、用户自由触发
  * - **单 SDK Run 永生**：整个 task 共用一个 Agent + Run、task 终态前不退
  * - **每次推进** = 后端 `appendAction` + 向 agent 发 `[NEXT_ACTION ...]` 指令
- * - **每次 ack** = wait-ack write `[ACTION_ACK approve|revise]`
+ * - **用户输入条消息** = `agent.send([USER_MESSAGE]…)`（V0.13.x 统一语义）
  * - **终态** = wait-ack write `[TASK_DONE]` / `[TASK_ABANDONED]` / `[CANCELLED]`
  *
  * # V0.6.0.1：chat 模式剥离
@@ -1002,91 +1002,11 @@ const resumeCurrentActionInner = async (
  * V0.6 ack：approve / revise 当前 action（V0.11 改 send 送达）
  *
  * - approve：纯服务端落状态（action → completed）、agent 不需要收信号
- * - revise：先 snapshotActionArtifact 旧版本、再 `agent.send([ACTION_ACK revise] + feedback)`
+ * -（历史）revise 通道已并入 question route 统一消息、见 V0.13.x
  *   续同一会话让 agent 处理；没有可续接的会话（已退出 / 服务重启）→ 抛错让用户重启 / 推进
  */
-export const acknowledgeAction = async (
-  taskId: string,
-  actionId: string,
-  decision: "approve" | "revise",
-  feedback?: string,
-  imagePaths?: string[],
-  // V0.11.1：revise 送达要会话；服务重启后靠 creds（客户端 bootArgs 带来）Agent.resume 接回
-  creds?: SessionCreds,
-): Promise<void> => {
-  const task = await getTask(taskId);
-  if (!task) {
-    throw new Error("task 不存在、无法 ack action");
-  }
-  const action = task.actions.find((a) => a.id === actionId);
-  if (!action) {
-    throw new Error(`action ${actionId} 不存在`);
-  }
-  // P0-1：只有「在等 ack」（awaiting_ack）的 action 才能 ack。
-  //   running（ask_user 进行中 / revise 后还在改）/ completed / cancelled 一律拒。
-  if (action.status !== "awaiting_ack") {
-    throw new Error(
-      `action ${actionId} 当前状态 ${action.status}、不是在等 ack（awaiting_ack）、无法 ack`,
-    );
-  }
-
-  if (decision === "revise" && action.artifactPath) {
-    await snapshotActionArtifact(taskId, actionId).catch((err) => {
-      console.warn(
-        `[task-runner] snapshotActionArtifact 失败 task=${taskId} action=${actionId}（吞错继续）：`,
-        err,
-      );
-    });
-  }
-
-  if (decision === "revise") {
-    const ok = await sendToTaskSession(
-      task,
-      buildAgentMessage({
-        kind: "action_revise",
-        text: feedback ?? "",
-        feedback,
-        imagePaths,
-      }),
-      { errorActionId: actionId, creds },
-    );
-    if (!ok) {
-      throw new Error(
-        "没有可续接的 agent 会话（会话已失效）——重新「推进」起新 agent 处理这条意见",
-      );
-    }
-  }
-
-  // V0.6：approve 时 action 标 completed；revise 时 agent 已重新开跑，同步把 task.runStatus 拉回 running。
-  // 之前只把 action 改回 running、task 仍停在 awaiting_user，会出现「当前 action=running 但顶部显示推进」的僵尸组合。
-  const patched = await patchAction(taskId, actionId, {
-    status: decision === "approve" ? "completed" : "running",
-  });
-  if (patched) {
-    publish(taskId, { kind: "task", task: patched });
-    const newAction = patched.actions.find((a) => a.id === actionId);
-    if (newAction) publish(taskId, { kind: "action", action: newAction });
-  }
-  if (decision === "revise") {
-    const running = await setTaskRunStatus(taskId, "running", actionId);
-    if (running) publish(taskId, { kind: "task", task: running });
-  } else {
-    // V0.11.x：approve 后没有任何「在等你」的东西了（action 已 completed、无 ask）——
-    // runStatus 归 idle。原来停在 awaiting_user、侧栏琥珀点 / 顶部「等待回复」会永远亮着误导用户。
-    // 不传第三参：保留 currentActionId（推进弹窗默认项等还要用）。
-    const idled = await setTaskRunStatus(taskId, "idle");
-    if (idled) publish(taskId, { kind: "task", task: idled });
-  }
-  await writeEventAndPublish(taskId, {
-    kind: "action_ack",
-    actionId,
-    text:
-      decision === "approve"
-        ? `Action ${action.type} n=${action.n} 已通过`
-        : `Action ${action.type} n=${action.n} 用户要求改：${truncate(feedback ?? "", 200)}`,
-    meta: { decision, feedback: feedback ? truncate(feedback, 500) : undefined },
-  });
-};
+// V0.13.x：acknowledgeAction 已退役——「再聊聊」（revise）并入 question route 统一消息
+//（AI 自主二分类）；approve 语义由推进时自动认可（advanceTask 开头的隐式 approve）承担。
 
 /**
  * V0.6 终态：task 合入 / abandon
@@ -2017,19 +1937,26 @@ export const deliverAskReply = async (
   );
 
 /**
- * V0.11.9 任务内「问一问」：把纯提问 send 给存活会话（内联「只答不动手」约束、
- * 见 buildAgentMessage question 分支）。无会话时凭 creds resume、接不回返 false。
+ * V0.13.x 统一消息：把任务页输入条的消息 send 给存活会话（AI 自主二分类、见
+ * buildAgentMessage user_message 分支）。无会话时凭 creds resume、接不回返 false。
+ *
+ * @param ackContext 当前产出在等审阅时传（route 判定 awaiting_ack 后附上）：
+ *   消息里附「处理完重新交卷」提示（原 revise 语义）、且这个 run 不按 questionRun
+ *   处理（agent 会 submit_work、run 出口要走正常 action 状态机）
  */
 export const deliverTaskQuestion = async (
   task: Task,
   text: string,
   imagePaths?: string[],
   creds?: SessionCreds,
+  ackContext?: { actionId: string; artifactPath?: string },
 ): Promise<boolean> =>
   sendToTaskSession(
     task,
-    buildAgentMessage({ kind: "question", text, imagePaths }),
-    { creds, questionRun: true },
+    buildAgentMessage({ kind: "user_message", text, imagePaths, ackContext }),
+    ackContext
+      ? { creds, errorActionId: ackContext.actionId }
+      : { creds, questionRun: true },
   );
 
 /**
@@ -2075,7 +2002,7 @@ export const startOneShotQuestion = (
         `- 工作目录：${effectiveCwd}`,
         "",
         "# 用户的话",
-        buildAgentMessage({ kind: "question", text: questionText, imagePaths }),
+        buildAgentMessage({ kind: "user_message", text: questionText, imagePaths }),
         "",
         "# 边界",
         "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",

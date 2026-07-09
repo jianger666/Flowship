@@ -30,7 +30,7 @@ import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { getSettings } from "@/lib/local-store";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
-import { submitActionAck, submitTaskQuestion } from "@/lib/task-store";
+import { submitTaskQuestion } from "@/lib/task-store";
 import type { ModelSelection, Task } from "@/lib/types";
 
 interface Props {
@@ -70,16 +70,6 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // 当前产出是否在等审阅：是 → 输入按「再聊聊」送、agent 二分类处理
-  const currentAction = useMemo(
-    () => task.actions.find((a) => a.id === task.currentActionId) ?? null,
-    [task],
-  );
-  const canAck =
-    !!currentAction &&
-    currentAction.status === "awaiting_ack" &&
-    task.runStatus === "awaiting_user";
-
   // agent 在跑时不可说；任务终态整条隐藏
   const busy = submitting || task.runStatus === "running";
 
@@ -89,20 +79,14 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     setSubmitting(true);
     try {
       const images = attach.toUploadPayload();
-      // 等审阅且没显式换模型 → revise 通道（agent 二分类：问就答、改就改完重新交卷）；
-      // 否则 → 插话通道（疑问就答 / 要改就改、不推进任务链；显式选模型 = 换模型处理）
-      const updated =
-        canAck && !pickedModel.id
-          ? await submitActionAck(task.id, currentAction!.id, "revise", {
-              feedback: text,
-              images,
-            })
-          : await submitTaskQuestion(
-              task.id,
-              text,
-              images,
-              pickedModel.id ? pickedModel : undefined,
-            );
+      // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
+      // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文
+      const updated = await submitTaskQuestion(
+        task.id,
+        text,
+        images,
+        pickedModel.id ? pickedModel : undefined,
+      );
       onTaskUpdate(updated);
       setDraft("");
       attach.reset();

@@ -1,24 +1,24 @@
 /**
- * POST /api/tasks/[id]/question——任务内「问一问」（V0.11.9）
+ * POST /api/tasks/[id]/question——任务页输入条的统一消息通道（V0.13.x）
  *
- * 用户痛点：想就任务问点问题、以前必须推进一个具体 action 再嘱咐「只回答别改代码」。
- * 本路由把用户插话 `agent.send([USER_QUESTION]…)` 给存活会话（消息内联「疑问就答 / 要改就改、
- * 答完自然结束」约束）、不新建 action、不动任务进度：
- * - 回答期间 runStatus=running（UI 显示 agent 在说话）
- * - 回答完 run 自然结束、consumeSessionRun 按最后 action 状态归位
- *   （awaiting_ack → awaiting_user、completed → idle）
+ * V0.13.x 用户拍板「别这么多分支」：原「再聊聊（revise）/ 问一问（question）」两条客户端
+ * 通道合一——任何输入条消息都走这里、`agent.send([USER_MESSAGE]…)`、AI 自主二分类
+ *（疑问就答 / 要改就改）。服务端只做状态机内务：
+ * - 当前产出在等审阅（awaiting_ack）→ 先 snapshot artifact 版本、消息附「处理完重新交卷」
+ *   上下文、action 回 running（原 revise 的状态机语义、对 AI 是同一条消息模板）
+ * - 其他时刻 → 插话语义（不推进任务链）、回答完 consumeSessionRun 按最后 action 状态归位
  *
- * Body: { text: string, images?: [{data,mimeType,filename}], bootArgs?: { apiKey, model } }
+ * 传输分流（对用户透明）：会话活着 send；会话断 + action 停半路（含 awaiting_ack）唤醒
+ * 新 agent 原地续（显式换模型用新模型跑）；会话断 + 已完结起一次性临时 agent。
  *
- * 拒绝情况：
- * - task 不存在 → 404；chat 模式 → 409（chat 本来就能随便聊）
- * - agent 正在跑 → 409（等它说完）
- * - ask 弹窗在等答案 → 409（先答弹窗、别两条通道打架）
- * - 无会话且 resume 不了 → 409（提问需要有上下文的 agent、提示推进 / 重启阶段）
+ * Body: { text, images?, bootArgs?: { apiKey, model }, forceModel? }
  */
 
-import { appendEvent, getTask, setTaskRunStatus } from "@/lib/server/task-fs";
-import { saveImageAttachments } from "@/lib/server/task-artifacts";
+import { appendEvent, getTask, patchAction, setTaskRunStatus } from "@/lib/server/task-fs";
+import {
+  saveImageAttachments,
+  snapshotActionArtifact,
+} from "@/lib/server/task-artifacts";
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
 import {
   deliverTaskQuestion,
@@ -46,9 +46,8 @@ interface PostBody {
     gitToken?: string;
   };
   /**
-   * 用户在问一问输入条上显式选的模型（V0.11.9 追加）：
-   * 传了 = 直接起一次性答疑 agent 用它回答（不续会话——会话模型锁死没法换）；
-   * 不传 = 优先续接存活会话（会话模型）、接不回才兜底 agent（bootArgs.model）。
+   * 用户在输入条显式选的模型：传了 = 不续会话（会话模型锁死换不了）、
+   * 走唤醒（新 agent 用新模型跑）或一次性临时 agent。
    */
   forceModel?: { id?: string; params?: Array<{ id: string; value: string }> };
 }
@@ -118,11 +117,34 @@ export const POST = async (req: Request, { params }: Ctx) => {
       ? { id: body.forceModel.id, params: body.forceModel.params }
       : undefined;
 
+  // 当前产出在等审阅（awaiting_ack）= 原「再聊聊」场景：先 snapshot artifact 版本
+  //（用户可能要求改、保留改前版本）、消息附「处理完重新交卷」上下文
+  const ackAction = task.actions.find(
+    (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
+  );
+  const ackContext = ackAction
+    ? { actionId: ackAction.id, artifactPath: ackAction.artifactPath ?? undefined }
+    : undefined;
+  if (ackAction?.artifactPath) {
+    await snapshotActionArtifact(task.id, ackAction.id).catch((err) => {
+      console.warn(
+        `[question] snapshotActionArtifact 失败 task=${task.id}（吞错继续）：`,
+        err,
+      );
+    });
+  }
+
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   const sent = forceModel
     ? false
-    : await deliverTaskQuestion(task, text, imageAbsPaths, { apiKey, model });
+    : await deliverTaskQuestion(
+        task,
+        text,
+        imageAbsPaths,
+        { apiKey, model },
+        ackContext,
+      );
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
   // - 当前 action 停在半路（error / cancelled / 僵死 running）→ **唤醒模式**：
@@ -137,7 +159,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     !!currentAction &&
     (currentAction.status === "error" ||
       currentAction.status === "cancelled" ||
-      currentAction.status === "running");
+      currentAction.status === "running" ||
+      // awaiting_ack + 会话断（或显式换模型）：唤醒新 agent 处理这条意见并重新交卷
+      currentAction.status === "awaiting_ack");
   const useOneShot = !sent && !canResume;
   const fallbackModel = forceModel ?? model;
   if (!sent && (!apiKey || !fallbackModel)) {
@@ -167,6 +191,26 @@ export const POST = async (req: Request, { params }: Ctx) => {
   });
   if (questionEvent) {
     publishTaskStreamEvent(task.id, { kind: "event", event: questionEvent });
+  }
+
+  // send 成功且产出在等审阅：action 回 running（agent 处理完会重新交卷回 awaiting_ack）——
+  // 原 revise 的状态机语义、防「artifact 在改、UI 还显示等审阅」
+  if (sent && ackContext) {
+    const patched = await patchAction(task.id, ackContext.actionId, {
+      status: "running",
+    });
+    if (patched) {
+      publishTaskStreamEvent(task.id, { kind: "task", task: patched });
+      const a = patched.actions.find((x) => x.id === ackContext.actionId);
+      if (a) publishTaskStreamEvent(task.id, { kind: "action", action: a });
+    }
+    const running = await setTaskRunStatus(task.id, "running", ackContext.actionId);
+    if (running) publishTaskStreamEvent(task.id, { kind: "task", task: running });
+    const fresh = await getTask(task.id);
+    return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   if (canResume) {

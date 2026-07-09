@@ -513,49 +513,8 @@ export const sendChatReply = async (
   return { task: data.task, autoStarted: !!data.autoStarted };
 };
 
-/**
- * V0.6 ack 当前 action（approve / revise）
- *
- * @param decision approve：用户「通过」、agent 推进等下一 action 指令
- *                 revise：用户「再聊聊」、agent 按 V0.5.10 二分类铁则处理
- * @param feedback revise 时的反馈文本（带 images 时可空）、approve 时忽略
- * @param images   revise 时携带图片附件（用户截图说改这里）
- */
-export interface ActionAckOptions {
-  feedback?: string;
-  images?: ImagePayload[];
-}
-
-export const submitActionAck = async (
-  taskId: string,
-  actionId: string,
-  decision: "approve" | "revise",
-  options?: ActionAckOptions,
-): Promise<Task> => {
-  // V0.11.1：随手带会话恢复凭据——服务重启 / 空闲回收后 revise 靠它 Agent.resume 接回会话
-  const s = getSettings();
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/action-ack`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        actionId,
-        decision,
-        feedback: options?.feedback,
-        images: options?.images,
-        bootArgs: {
-          apiKey: s.apiKey,
-          model: s.defaultModel,
-          gitHost: s.gitHost,
-          gitToken: s.gitToken,
-        },
-      }),
-    },
-  );
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
-};
+// V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道
+//（服务端按 awaiting_ack 自动附「重新交卷」上下文）；approve 由推进时自动认可承担。
 
 /**
  * V0.11.9 任务内「跟 AI 说」：消息送给存活会话（疑问就答 / 要改就改、不新建 action、进度不动）。

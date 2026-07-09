@@ -23,7 +23,7 @@
  * # 跟 task-runner 的区别（避免误用）
  *
  * - chat-runner 不写 actions[]、不生成 artifact 文件
- * - chat prompt 里没有 [NEXT_ACTION] / [ACTION_ACK] 概念
+ * - chat prompt 里没有 [NEXT_ACTION] / [USER_MESSAGE] 任务容器概念
  */
 
 import { Agent } from "@cursor/sdk";
@@ -259,7 +259,7 @@ interface InitialUserMessage {
 /**
  * 拼 chat agent 起手 prompt
  *
- * 跟 V0.6 task-runner 的 _super.md 完全无关、不夹任务容器协议（[NEXT_ACTION] / [ACTION_ACK] / [TASK_DONE]）。
+ * 跟 V0.6 task-runner 的 _super.md 完全无关、不夹任务容器协议（[NEXT_ACTION] / [USER_MESSAGE]）。
  * 只装 chat 必备：submit_work + shell long-poll + 禁止泄露协议。
  *
  * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答（V0.5 自由化策略）
