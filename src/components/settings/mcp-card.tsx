@@ -64,17 +64,6 @@ interface McpCardProps {
   onChange: (next: string[]) => void;
 }
 
-/** 单 server 的一行摘要（stdio 显示命令、http 显示 url、别的类型显示 type） */
-const summarizeServer = (cfg: McpServerConfig): string => {
-  const c = cfg as Record<string, unknown>;
-  if (typeof c.command === "string") {
-    const args = Array.isArray(c.args) ? ` ${(c.args as string[]).join(" ")}` : "";
-    return `$ ${c.command}${args}`;
-  }
-  if (typeof c.url === "string") return c.url;
-  return typeof c.type === "string" ? c.type : "（未知类型）";
-};
-
 export const McpCard = ({
   appServers,
   onAppServersChange,
@@ -173,22 +162,15 @@ export const McpCard = ({
               const oauth = statuses[name];
               return (
                 <div key={name} className="flex items-center gap-2 px-3 py-2">
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className={cn(
-                        "truncate text-sm",
-                        isDisabled && "text-muted-foreground/60 line-through",
-                      )}
-                      title={name}
-                    >
-                      {name}
-                    </div>
-                    <div
-                      className="truncate font-mono text-[11px] text-muted-foreground"
-                      title={summarizeServer(appServers[name])}
-                    >
-                      {summarizeServer(appServers[name])}
-                    </div>
+                  {/* 只留名称（用户拍板：指令摘要太长、想看细节点编辑看 JSON） */}
+                  <div
+                    className={cn(
+                      "min-w-0 flex-1 truncate text-sm",
+                      isDisabled && "text-muted-foreground/60 line-through",
+                    )}
+                    title={name}
+                  >
+                    {name}
                   </div>
                   {!isDisabled && (
                     <HealthBadge
