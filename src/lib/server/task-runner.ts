@@ -1943,22 +1943,32 @@ const consumeSessionRun = async (
       publish(task.id, { kind: "done", task: freshQ ?? task, ok: false });
     } else {
       // V0.13.x：网络类失败先自动重连（重试 5 次、事件流显示「重连中」）——
-      // 网络波动一下聊天就断、以前每次都要用户手动唤醒（用户拍板加的）
+      // 网络波动一下聊天就断、以前每次都要用户手动唤醒（用户拍板加的）。
+      // cancelled = 用户点过停止（run 抛错与 cancel 可能同时到达）→ 按停止语义收尾、
+      // 绝不标 error（审计 P1：原来 cancelled 走 give-up 会把用户主动停止标成失败）
       const outcome = cancelled
-        ? ("give-up" as const)
+        ? ("cancelled" as const)
         : await tryAutoReconnect(task, err, opts, () => cancelled);
       if (outcome === "handled") {
         // 重连成功、新 run 已在递归调用里消费完毕——这里什么都不用做
       } else if (outcome === "cancelled") {
-        // 用户在重连期间点了停止：按停止语义收尾（不标 error）
-        await finalizeStaleActions(task.id, "cancelled");
-        const updated = await setTaskRunStatus(task.id, "idle");
-        if (updated) publish(task.id, { kind: "task", task: updated });
-        publish(task.id, { kind: "done", task: updated ?? task, ok: true });
-        closeTaskSession(task.id, agent.agentId);
+        if (forkPendingTasks.has(task.id)) {
+          // force-new 在飞（cancel 旧 run 引发的抛错路径）：新 agent 由 advance 分支管、
+          // 这里不动状态、更不能关会话（会误关刚起的新会话）
+          forkPendingTasks.delete(task.id);
+        } else {
+          // 用户在重连期间点了停止：按停止语义收尾（不标 error）。
+          // 关会话不带 agentId：重连过程可能已注册新会话（resume 成功 send 失败）、
+          // 用旧 agentId 关不掉会泄漏（审计 P1）
+          await finalizeStaleActions(task.id, "cancelled");
+          const updated = await setTaskRunStatus(task.id, "idle");
+          if (updated) publish(task.id, { kind: "task", task: updated });
+          publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+          closeTaskSession(task.id);
+        }
       } else {
         await handleRunFailure(task.id, opts.errorActionId, err);
-        closeTaskSession(task.id, agent.agentId);
+        closeTaskSession(task.id);
       }
     }
   } finally {
