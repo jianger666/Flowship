@@ -24,7 +24,7 @@ import {
   planWorktreeBranchInfos,
   resolveOriginalRepoPath,
 } from "@/lib/server/task-worktrees";
-import { getUniqueRepoDirNames } from "@/lib/path-utils";
+import { getRepoWorkDirs, getUniqueRepoDirNames } from "@/lib/path-utils";
 import { extractFeishuStoryId } from "@/lib/branch-template";
 
 const baseTask = (patch: Partial<Task> = {}): Task =>
@@ -168,6 +168,27 @@ describe("getUniqueRepoDirNames / extractFeishuStoryId 基础件", () => {
       "web",
       "web-3",
     ]);
+  });
+
+  it("getRepoWorkDirs：多仓给各自项目根、绝不给公共父目录（IDE 打开用）", () => {
+    // 非隔离多仓：workCwd 是公共父（D:/IdeaProjects）、必须逐仓返原仓路径
+    expect(
+      getRepoWorkDirs(
+        ["D:\\IdeaProjects\\tch-studio", "D:\\IdeaProjects\\stu-center"],
+        "D:/IdeaProjects",
+        false,
+      ).map((t) => t.workDir),
+    ).toEqual(["D:/IdeaProjects/tch-studio", "D:/IdeaProjects/stu-center"]);
+    // 隔离多仓：worktree 容器下的每仓子目录
+    expect(
+      getRepoWorkDirs(["/a/web", "/b/web"], "/data/worktrees/t1", true).map(
+        (t) => t.workDir,
+      ),
+    ).toEqual(["/data/worktrees/t1/web", "/data/worktrees/t1/web-2"]);
+    // 单仓：workCwd 自身（隔离 = worktree、非隔离 = 原仓）
+    expect(
+      getRepoWorkDirs(["/a/web"], "/data/worktrees/t1/web", true)[0].workDir,
+    ).toBe("/data/worktrees/t1/web");
   });
 
   it("storyId：detail 段优先、长数字兜底、抠不到返 null", () => {

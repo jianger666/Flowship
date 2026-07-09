@@ -395,6 +395,35 @@ export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
   });
 };
 
+/**
+ * 逐仓算「IDE 该打开的项目目录」（V0.12.3、client 用）
+ *
+ * 背景：任务页「在 IDE 打开」原来传 task.workCwd——多仓任务时那是**公共父目录**
+ * （如 D:/IdeaProjects），IDEA 会把整个父目录当一个项目打开（同事 Windows 实测）。
+ * 正确语义是逐仓打开各自的项目根：
+ * - 隔离 task 多仓：worktrees/<taskId>/<仓短名>（跟 server 端 worktree 布局一致）
+ * - 隔离 task 单仓：workCwd 自身就是该仓 worktree
+ * - 非隔离：原仓库路径本身（多仓时绝不给公共父目录）
+ */
+export const getRepoWorkDirs = (
+  repoPaths: string[],
+  workCwd: string,
+  isolated: boolean,
+): Array<{ repoPath: string; workDir: string; shortName: string }> => {
+  const names = getUniqueRepoDirNames(repoPaths);
+  const base = normalizeSeparators(workCwd).replace(/\/+$/, "");
+  return repoPaths.map((repoPath, i) => ({
+    repoPath,
+    shortName: names[i],
+    workDir:
+      repoPaths.length === 1
+        ? base
+        : isolated
+          ? `${base}/${names[i]}`
+          : normalizeSeparators(repoPath).replace(/\/+$/, ""),
+  }));
+};
+
 export const getRepoShortNames = (
   repoPaths: string[],
   cwd: string,

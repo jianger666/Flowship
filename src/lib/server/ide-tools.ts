@@ -393,11 +393,14 @@ export const openInIde = async (
     }
   }
 
-  // 参数拼法：JetBrains `--line N <path>`；VS Code 系 `-g <path>:N`
+  // 参数拼法：JetBrains `--line N <path>`；VS Code 系带行号 `-g <path>:N`、
+  // 开目录（无行号 = 打开项目）用 `-n` 强制新窗口——别复用已有窗口把人家打开的项目顶掉。
+  // JetBrains 开目录天然各项目各窗口、无需（也没有）新窗口 flag。
   const isVsCodeFamily = IDE_SPECS[ide].family === "vscode";
   const args: string[] = [];
   if (isVsCodeFamily) {
-    args.push("-g", line ? `${absPath}:${line}` : absPath);
+    if (line) args.push("-g", `${absPath}:${line}`);
+    else args.push("-n", absPath);
   } else {
     if (line) args.push("--line", String(line));
     args.push(absPath);

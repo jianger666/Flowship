@@ -32,6 +32,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { getIdeAnchorProps } from "@/lib/ide-open";
+import { getRepoWorkDirs } from "@/lib/path-utils";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
   fetchPreviewStatus,
@@ -100,8 +101,13 @@ export const WorkspaceActions = ({ task }: Props) => {
   const workCwd = task.workCwd;
   if (!workCwd || task.repoPaths.length === 0) return null;
 
-  // V0.11.8：cursor/vscode = 协议 deep link、JetBrains 系 = onClick 后端拉起（不依赖 idea:// 协议）
-  const ideAnchor = getIdeAnchorProps(workCwd, undefined, prefs?.jumpIde ?? "cursor");
+  // V0.12.3：IDE 逐仓打开各自项目根、不再打开多仓公共父目录（同事实测 IDEA 把整个
+  // D:/IdeaProjects 当项目开了）；每仓一个按钮、单仓时不带短名后缀
+  const ideTargets = getRepoWorkDirs(
+    task.repoPaths,
+    workCwd,
+    task.isolateWorktree === true,
+  );
 
   const copyPath = async () => {
     try {
@@ -146,25 +152,32 @@ export const WorkspaceActions = ({ task }: Props) => {
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1">
       {/* cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议、页面不动）——ui-conventions 约定；
-          JetBrains 系走 onClick 后端拉起（getIdeAnchorProps 内部切换） */}
-      {ideAnchor && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          nativeButton={false}
-          render={
-            <a
-              {...ideAnchor}
-              className="no-underline"
-              title={`在 IDE 打开任务工作区\n${workCwd}`}
-            />
-          }
-        >
-          <SquareArrowOutUpRight className="size-3" />
-          在 IDE 打开
-        </Button>
-      )}
+          JetBrains 系走 onClick 后端拉起（getIdeAnchorProps 内部切换）。
+          多仓逐仓一个按钮（各开各的项目窗口）、单仓不带短名后缀 */}
+      {ideTargets.map((t) => {
+        const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor");
+        if (!anchor) return null;
+        return (
+          <Button
+            key={t.repoPath}
+            variant="ghost"
+            size="sm"
+            className={BTN_CLS}
+            nativeButton={false}
+            render={
+              <a
+                {...anchor}
+                className="no-underline"
+                title={`在 IDE 打开项目\n${t.workDir}`}
+              />
+            }
+          >
+            <SquareArrowOutUpRight className="size-3" />
+            在 IDE 打开
+            {ideTargets.length > 1 && `（${t.shortName}）`}
+          </Button>
+        );
+      })}
       <Button
         variant="ghost"
         size="sm"
