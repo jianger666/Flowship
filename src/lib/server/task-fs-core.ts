@@ -319,7 +319,21 @@ export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
     .slice(2, 8)}`;
   try {
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
-    await fs.rename(tmpPath, finalPath);
+    // Windows：目标文件被并发读 / 杀软扫描持有句柄时 rename 会 EPERM（同事线上实测、
+    // mac/linux 无此语义）——短退避重试几轮、基本都能等到句柄释放；重试穿透才抛
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await fs.rename(tmpPath, finalPath);
+        return;
+      } catch (err) {
+        lastErr = err;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw err;
+        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;

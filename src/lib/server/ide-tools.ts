@@ -238,6 +238,22 @@ const findOnPath = async (bins: string[]): Promise<string | null> => {
   return null;
 };
 
+// PATH 探到 JetBrains 的 .bat/.cmd 启动脚本时、优先换成同目录的 64 位 exe——
+// exe 是 GUI launcher、detach 即返、绕开「cmd 拉 .bat + 路径带空格」的引号地狱
+//（同事实测：IDEA 装在 D:\Idea\...、PATH 探到 idea.bat、cmd 拉起 code=1 打不开）
+const preferSiblingExe = (scriptPath: string): DetectResult => {
+  const m = path.basename(scriptPath).match(/^(.+)\.(cmd|bat)$/i);
+  if (m) {
+    const exe = path.join(path.dirname(scriptPath), `${m[1]}64.exe`);
+    if (existsSync(exe)) return { available: true, exec: exe };
+  }
+  return {
+    available: true,
+    exec: scriptPath,
+    isCmdScript: /\.(cmd|bat)$/i.test(scriptPath),
+  };
+};
+
 // 按 spec 探测单个 IDE（family 决定 win 侧扫哪些目录、mac / PATH 两层通用）
 const detectOne = async (spec: IdeSpec): Promise<DetectResult> => {
   // Xcode 是 mac 专属、其它平台直接不可用（不做 PATH 探测、省得撞同名命令误报）
@@ -291,6 +307,9 @@ const detectOne = async (spec: IdeSpec): Promise<DetectResult> => {
   }
   const onPath = await findOnPath(spec.pathBins);
   if (onPath) {
+    // JetBrains 系 PATH 常探到 bin 下的 .bat 启动脚本（如 D:\Idea\...\bin\idea.bat）——
+    // 优先换同目录 64 位 exe（同事 Windows 实测 .bat 经 cmd 拉起 code=1 打不开）
+    if (spec.family === "jetbrains") return preferSiblingExe(onPath);
     return {
       available: true,
       exec: onPath,
