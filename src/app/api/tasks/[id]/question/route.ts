@@ -19,11 +19,12 @@
 
 import { appendEvent, getTask, setTaskRunStatus } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
-import { getPendingAsk } from "@/lib/server/chat-pending";
+import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
 import {
   deliverTaskQuestion,
   resumeCurrentActionWithMessage,
   startOneShotQuestion,
+  supersedePendingAsks,
 } from "@/lib/server/task-runner";
 import { publishTaskStreamEvent, runningTasks } from "@/lib/server/task-stream";
 import {
@@ -144,6 +145,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
   console.log(
     `[question] task=${task.id} text=${text.slice(0, 60)} images=${images.length} mode=${sent ? "send" : canResume ? "resume" : "oneshot"}`,
   );
+
+  // 用户绕开 ask 弹窗直接在输入条说话 = 旧弹窗事实作废（send：agent 收到新消息就继续了；
+  // oneshot：旧会话已死、答案永远送不到）。不作废的话弹窗永远挂着（用户实测卡死、再答 409）。
+  // canResume 分支不用管——resumeCurrentActionWithMessage 内部已 supersede。
+  if (sent || useOneShot) {
+    await supersedePendingAsks(task.id, "用户已在输入条继续对话");
+    clearPendingAsk(task.id);
+  }
 
   const questionEvent = await appendEvent(task.id, {
     kind: "user_reply",

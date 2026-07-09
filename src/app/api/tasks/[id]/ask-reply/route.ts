@@ -40,7 +40,7 @@ import type {
   ImageAttachmentSaved,
 } from "@/lib/server/task-artifacts";
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
-import { deliverAskReply } from "@/lib/server/task-runner";
+import { deliverAskReply, supersedePendingAsks } from "@/lib/server/task-runner";
 import { agentSessions, publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
@@ -375,6 +375,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     },
   );
   if (!ok) {
+    // 会话已死 = 这组 ask 的答案永远送不到——当场作废旧弹窗 + 清 pending，
+    // 否则弹窗永远卡着（用户踩过：改用输入条把任务跑起来了、旧弹窗还挂着、再答又 409）。
+    // 之后重新「推进」时 advance 的 supersede 本来就忽略返回值、不影响任何续传逻辑。
+    await supersedePendingAsks(task.id, "会话已失效");
+    clearPendingAsk(task.id);
     return errorResponse(
       "没有可续接的 agent 会话（会话已失效）——重新「推进」该阶段、问题上下文会自动带给新 agent",
       409,
