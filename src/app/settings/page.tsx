@@ -162,6 +162,9 @@ const SettingsPage = () => {
         />,
       )}
 
+      {/* 飞书集成紧跟 API Key（用户拍板：两个都是「接外部服务」的一等配置、放一起） */}
+      {wrapCard("card-feishu", <FeishuCliCard />)}
+
       {wrapCard(
         "card-profile",
         <UserProfileCard
@@ -217,8 +220,6 @@ const SettingsPage = () => {
           onCommit={(next) => saveFieldValue("repos", next)}
         />,
       )}
-
-      {wrapCard("card-feishu", <FeishuCliCard />)}
 
       {wrapCard(
         "card-mcp",
