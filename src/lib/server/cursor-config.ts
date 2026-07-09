@@ -83,11 +83,14 @@ export const readAppMcpServers = async (): Promise<
 
 /**
  * 运行时有效 MCP 集（V0.13 = fe 自管、不再合并 Cursor）
- * RESERVED 名（aiFlowChat）剔除——runtime 强制注入、不允许用户条目顶掉
+ * RESERVED 名（aiFlowChat）剔除——runtime 强制注入、不允许用户条目顶掉。
+ * 入口先 await 一次性迁移：boot 后 client 还没打开、直接 resume agent 的路径
+ * （session 持久化）也要拿到迁移后的配置。跑过后是同步 marker 检查、零开销。
  */
 export const readEffectiveMcpServers = async (): Promise<
   Record<string, McpServerConfig>
 > => {
+  await migrateCursorMcpOnce();
   const app = await readAppMcpServers();
   const out: Record<string, McpServerConfig> = {};
   for (const [name, cfg] of Object.entries(app)) {
@@ -102,52 +105,74 @@ export const resolveTaskMcpServers = async (
 ): Promise<Record<string, McpServerConfig>> =>
   filterDisabledMcp(await readEffectiveMcpServers(), disabled);
 
+// 迁移单飞：GET/PUT settings、readEffectiveMcpServers 多路并发调时只跑一份；
+// 失败清空、下次调用重试（dev HMR / 首跑失败都不会永久卡死）
+let migrationPromise: Promise<void> | null = null;
+
 /**
- * 老用户无感迁移（V0.13、boot 时跑一次）：把 Cursor mcp.json 快照进自管配置。
+ * 老用户无感迁移（V0.13）：把 Cursor mcp.json 一次性快照进自管配置。
+ *
+ * 调用点（全部 await、幂等）：/api/settings GET（client 首次拉配置前必过、拿到的
+ * cache 一定含快照——之后整对象 PUT 不会盖丢）、/api/settings PUT（localStorage-only
+ * 老用户首次落盘 config.json 后立刻补迁移）、readEffectiveMcpServers（boot 直接
+ * resume agent 的路径）。
  *
  * 判定「老 / 新」用 config.json 是否存在：
- * - 存在（升级上来的老用户、此前依赖 live 合并 Cursor）→ Cursor servers 合入
- *   settings.mcpServers（自管同名优先）、行为零变化
- * - 不存在（全新安装）→ 只落标记、不自动迁——新用户在设置页自己挑着导入
+ * - 存在（老用户、此前依赖 live 合并 Cursor）→ Cursor servers 合入
+ *   settings.mcpServers（自管同名优先）、行为零变化、落标记
+ * - 不存在 → **什么都不做、也不落标记**——可能是「配置还在 localStorage 的过渡期
+ *   老用户」（client 首次 PUT 落盘后、PUT handler 会再调本函数完成迁移）；
+ *   真·新用户直到第一次写配置才落标记、此时 Cursor 里有啥都不自动搬（设置页自己导入）
  *
- * 标记文件 `data/.mcp-cursor-migrated` 保证只跑一次；config.json 解析失败时
- * 不写标记（下次 boot 重试）。boot 时 client 还没加载、无与 /api/settings 写并发。
+ * 注意：真·新用户首次 PUT 时 Cursor 配置也会被快照进来——可接受（有 = 顺手带上、
+ * 相当于默认导入一次；不想要的在设置页删）。标记文件 `data/.mcp-cursor-migrated`
+ * 防重；config.json 解析失败不落标记、下次重试。
  */
-export const migrateCursorMcpOnce = async (): Promise<void> => {
-  const marker = path.join(dataRoot(), ".mcp-cursor-migrated");
-  if (existsSync(marker)) return;
-  const configFile = path.join(dataRoot(), "config.json");
-  let raw: string | null = null;
-  try {
-    raw = await fs.readFile(configFile, "utf-8");
-  } catch {
-    raw = null;
-  }
-  if (raw === null) {
-    // 全新安装：没有历史行为要保、落标记即可
-    await fs.mkdir(dataRoot(), { recursive: true }).catch(() => {});
-    await fs.writeFile(marker, new Date().toISOString()).catch(() => {});
-    return;
-  }
-  try {
-    const cfg = JSON.parse(raw) as Record<string, unknown>;
-    const app =
-      cfg.mcpServers && typeof cfg.mcpServers === "object" && !Array.isArray(cfg.mcpServers)
-        ? (cfg.mcpServers as Record<string, McpServerConfig>)
-        : {};
-    const cursor = await readGlobalCursorMcpServers();
-    const merged = mergeMcpSources(cursor, app);
-    const addedCount = Object.keys(merged).length - Object.keys(app).length;
-    cfg.mcpServers = merged;
-    await fs.writeFile(configFile, JSON.stringify(cfg, null, 2), "utf-8");
-    await fs.writeFile(marker, new Date().toISOString(), "utf-8");
-    console.log(
-      `[cursor-config] MCP 独立化迁移完成：从 Cursor 快照 ${addedCount} 个 server 进自管配置（共 ${Object.keys(merged).length} 个）`,
-    );
-  } catch (err) {
-    // config.json 坏 / 写失败：不落标记、下次 boot 重试
-    console.warn("[cursor-config] MCP 迁移失败（下次启动重试）：", err);
-  }
+export const migrateCursorMcpOnce = (): Promise<void> => {
+  if (migrationPromise) return migrationPromise;
+  migrationPromise = (async () => {
+    const marker = path.join(dataRoot(), ".mcp-cursor-migrated");
+    if (existsSync(marker)) return;
+    const configFile = path.join(dataRoot(), "config.json");
+    let raw: string | null = null;
+    try {
+      raw = await fs.readFile(configFile, "utf-8");
+    } catch {
+      raw = null;
+    }
+    if (raw === null) {
+      // config.json 还没出生（新装 / localStorage 过渡期老用户）——什么都不做、
+      // 等首次 PUT 落盘后 PUT handler 再调进来走下面的合并分支
+      migrationPromise = null;
+      return;
+    }
+    try {
+      const cfg = JSON.parse(raw) as Record<string, unknown>;
+      const app =
+        cfg.mcpServers && typeof cfg.mcpServers === "object" && !Array.isArray(cfg.mcpServers)
+          ? (cfg.mcpServers as Record<string, McpServerConfig>)
+          : {};
+      const cursor = await readGlobalCursorMcpServers();
+      const merged = mergeMcpSources(cursor, app);
+      const addedCount = Object.keys(merged).length - Object.keys(app).length;
+      if (addedCount > 0) {
+        cfg.mcpServers = merged;
+        // 原子写（对齐 /api/settings PUT）：防崩溃留半截 JSON
+        const tmp = `${configFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+        await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
+        await fs.rename(tmp, configFile);
+      }
+      await fs.writeFile(marker, new Date().toISOString(), "utf-8");
+      console.log(
+        `[cursor-config] MCP 独立化迁移完成：从 Cursor 快照 ${addedCount} 个 server 进自管配置（共 ${Object.keys(merged).length} 个）`,
+      );
+    } catch (err) {
+      // config.json 坏 / 写失败：不落标记、清单飞、下次调用重试
+      console.warn("[cursor-config] MCP 迁移失败（下次重试）：", err);
+      migrationPromise = null;
+    }
+  })();
+  return migrationPromise;
 };
 
 /**

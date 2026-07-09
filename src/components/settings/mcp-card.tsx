@@ -10,7 +10,7 @@
  * - 常用开关（新任务默认黑名单）+ 健康探测 + OAuth 授权沿用
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -310,6 +310,8 @@ export const McpCard = ({
             next[name] = cfg;
             onAppServersCommit(next);
             setEditing(null);
+            // 新增 / 改配置的 server 立即探连通性（首探只探挂载时那批、不会自动带上新条目）
+            if (!disabledServers.includes(name)) probeOne(name);
           }}
         />
       )}
@@ -323,6 +325,10 @@ export const McpCard = ({
           onAppServersCommit(next);
           setImportOpen(false);
           toast.success(`已导入 ${Object.keys(picked).length} 个 server`);
+          // 导入的 server 立即探连通性（同上、首探不会自动带上新条目）
+          for (const name of Object.keys(picked)) {
+            if (!disabledServers.includes(name)) probeOne(name);
+          }
         }}
       />
     </Card>
@@ -344,7 +350,14 @@ const BulkJsonEditor = ({
   const [draft, setDraft] = useState(
     JSON.stringify({ mcpServers: appServers }, null, 2),
   );
+  // 自己最后一次成功 commit 的序列化值：外部 appServers 变化回流时据此区分
+  // 「自己打字引起的回声」（不重置 draft、免得正在编辑被顶掉）和「条目操作 / 导入
+  // 等外部变更」（重置、保持同步——否则展开着的旧 JSON 一 commit 会把删掉的写回来）
+  const lastEmittedRef = useRef(JSON.stringify(appServers));
   useEffect(() => {
+    const incoming = JSON.stringify(appServers);
+    if (incoming === lastEmittedRef.current) return;
+    lastEmittedRef.current = incoming;
     setDraft(JSON.stringify({ mcpServers: appServers }, null, 2));
   }, [appServers]);
 
@@ -359,6 +372,7 @@ const BulkJsonEditor = ({
             mcpServers?: Record<string, McpServerConfig>;
           };
           if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
+            lastEmittedRef.current = JSON.stringify(parsed.mcpServers);
             onChange(parsed.mcpServers);
             onCommit(parsed.mcpServers);
           }
@@ -475,8 +489,11 @@ const ImportCursorDialog = ({
 }) => {
   // 只在 dialog 打开时才读 Cursor mcp.json
   const { cursorServers, dirs, loading, error, refresh } = useCursorMcp(open);
-  // 勾选集合（默认全不勾、用户自己挑）
+  // 勾选集合（默认全不勾、用户自己挑）；关闭时清空、重开不残留上次勾选
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!open) setPicked(new Set());
+  }, [open]);
 
   const cursorNames = Object.keys(cursorServers);
   const sourceFile = dirs[0] ? `${dirs[0]}/mcp.json` : "~/.cursor/mcp.json";

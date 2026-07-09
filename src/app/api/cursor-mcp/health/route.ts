@@ -1,7 +1,7 @@
 /**
  * GET /api/cursor-mcp/health[?servers=a,b,c]
  *
- * 探测全局 Cursor MCP（`~/.cursor/mcp.json`）各 server 的连通性、给设置页 + 任务面板
+ * 探测自管 MCP（config.json → settings.mcpServers、V0.13 独立化）各 server 的连通性、给设置页 + 任务面板
  * 展示「正常 / 失败」状态（V0.6.13 起两态、失败原因落 detail、前端可点开看日志）。
  *
  * `?servers=` 只探指定子集（逗号分隔的 server 名）——前端只探「已开启」的、或用户

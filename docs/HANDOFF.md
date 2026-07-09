@@ -302,7 +302,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 ### V0.13-P0（未发版、攒着）：MCP 独立化（2026-07-09、用户拍板「先解耦、为接 Codex / Claude Code 等多 backend 留口子」）
 
 - **运行时只读 fe 自管配置**（config.json → settings.mcpServers）、不再 live 合并 `~/.cursor/mcp.json`——在 Cursor 改配置不再影响本 app；`readMergedMcpServers` → `readEffectiveMcpServers`（自管 + 剔 RESERVED 名）、resolveTaskMcpServers / health / oauth 四处消费方统一切换
-- **老用户无感迁移**（`migrateCursorMcpOnce`、instrumentation boot 挂）：config.json 已存在（老用户）→ Cursor mcp.json 一次性快照合入自管（自管同名优先）；全新安装 → 只落标记不自动迁（新用户设置页自己导入）；标记文件 `data/.mcp-cursor-migrated` 防重、config 解析失败不落标记下次重试
+- **老用户无感迁移**（`migrateCursorMcpOnce`、单飞 + 幂等）：调用点 = /api/settings **GET**（client 首拉配置前必过、cache 一定含快照 → 整对象 PUT 不盖丢）+ **PUT**（localStorage 过渡期老用户 config.json 首次落盘后补迁、响应返最终盘上 settings、client putSettings 回填 mcpServers 进 cache）+ readEffectiveMcpServers（boot 直接 resume agent 路径）。config.json 已存在 → Cursor 快照合入自管（自管同名优先、原子写）+ 落标记；不存在 → 什么都不做不落标记（等首次 PUT 出生后再迁）。标记 `data/.mcp-cursor-migrated` 防重、失败清单飞下次重试。审计（grok subagent 蓝军）揪出的 2 个 P0（迁移 vs 整对象 PUT 竞态、localStorage-only 老用户被误判新装）均按此修复
 - **设置页 MCP 卡重做**（`mcp-card.tsx` 条目化）：每 server 一行（类型摘要 + 编辑 / 删除）、新增 / 编辑 dialog（名称 + 单 server JSON）、「从 Cursor 导入」dialog 勾选挑 server（已存在标「导入将覆盖」）、高级折叠保留整体 JSON 编辑；OAuth / 常用开关 / 健康探测数据源全切自管
 - `/api/cursor-mcp` 语义改：`servers` = 有效集（自管）、`cursor` 仅供导入 dialog；`settingSources:["project"]` / 全局 rules / skills 注入**本期不动**（prompt 上下文体系、接第二 backend 时再抽统一层）
 
@@ -365,7 +365,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **IDE 打开「没反应」诊断增强**（同事 Windows 复现待定位）：探测结果落日志（每次探测打 exec 路径）+ spawn 静默失败探测（1.5s 内 error / 非零码退出 → 报错 toast、不再假成功）
 - **设置页整理**（sub-agent 执行、已逐 diff 审过）：删安全警示式啰嗦文案、`?focus=<卡片>` 锚点定位 + 2s 高亮、「去设置页」提示改可点快捷跳转（toast action / 空态内联链接、`settings-link.tsx` 统一拼 URL）
 - **GitLab host 可不填**（sub-agent 执行）：`resolveEffectiveGitHost` settings 显式值 > 仓库 origin remote 推导（`git-remote.ts` 纯函数 + `GET /api/repo-remote-meta`）；设置页「从仓库检测」按钮、advance-dialog ship 准入同口径
-- **MCP 自管 + Cursor 导入**（sub-agent 执行）：`settings.mcpServers`（config.json）可视化增删 + 「从 Cursor 导入」、`readMergedMcpServers` 合并（同名本应用覆盖、aiFlowChat 保留名不可占用）、task/chat/OAuth/健康探测全部读 merged
+- **MCP 自管 + Cursor 导入**（sub-agent 执行；V0.13 起运行时不再合并 Cursor、见 V0.13-P0 段）：`settings.mcpServers`（config.json）可视化增删 + 「从 Cursor 导入」、aiFlowChat 保留名不可占用、task/chat/OAuth/健康探测全部读自管有效集
 
 ### V0.11.8：IDE 跳转去协议依赖 + 自动探测（2026-07-08、同事 Windows 实测「idea:// 打不开」）
 

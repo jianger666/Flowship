@@ -195,6 +195,36 @@ const warnIfMigrationExpired = (): void => {
  * （来自 localStorage 的旧配置）写进文件、完成无感迁移。文件链路挂了不阻塞、继续用
  * localStorage 兜底的缓存、下次启动再试。
  */
+/**
+ * PUT config.json 并消费返回（V0.13）：server 可能在首次落盘后跑 MCP 一次性迁移
+ * （Cursor 快照合入 mcpServers）——盘上最终内容随响应返回、这里回填进 cache、
+ * 否则 cache 不含快照、下次整对象 PUT 会把迁移结果盖丢。
+ * 只回填 mcpServers（server 唯一会改的字段）、不整包覆盖——防连续快速编辑时
+ * 响应把用户更新的其它字段顶回去。
+ */
+const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
+  const res = await fetch(API, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  try {
+    const data = (await res.json()) as {
+      ok?: boolean;
+      settings?: Partial<FeAiFlowSettings>;
+    };
+    const returned = data?.settings?.mcpServers;
+    if (
+      returned &&
+      JSON.stringify(returned) !== JSON.stringify(body.mcpServers ?? {})
+    ) {
+      cache = { ...cache, mcpServers: returned };
+    }
+  } catch {
+    // 响应体解析失败不影响写入本身（老版 server 只返 {ok}）
+  }
+};
+
 export const initSettings = (): Promise<void> => {
   if (!isBrowser()) return Promise.resolve();
   // 已在跑 / 已跑完：复用同一 promise、不重复 fetch
@@ -209,12 +239,9 @@ export const initSettings = (): Promise<void> => {
       if (data.exists && data.settings) {
         cache = normalizeSettings(data.settings as Partial<FeAiFlowSettings>);
       } else {
-        // 首次升级：把当前缓存（localStorage 旧配置 / 默认）迁移进 config.json
-        await fetch(API, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cache),
-        });
+        // 首次升级：把当前缓存（localStorage 旧配置 / 默认）迁移进 config.json；
+        // server 会在落盘后补跑 MCP 迁移、putSettings 内部回填快照进 cache
+        await putSettings(cache);
       }
     } catch (err) {
       console.warn(
@@ -237,12 +264,10 @@ export const initSettings = (): Promise<void> => {
 export const saveSettings = (next: FeAiFlowSettings): boolean => {
   cache = next;
   if (!isBrowser()) return false;
-  // 异步落 config.json（权威源）、不阻塞 UI
-  void fetch(API, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(next),
-  }).catch((err) => console.error("[local-store] 写 config.json 失败", err));
+  // 异步落 config.json（权威源）、不阻塞 UI；响应里可能带 MCP 迁移回填（见 putSettings）
+  void putSettings(next).catch((err) =>
+    console.error("[local-store] 写 config.json 失败", err),
+  );
   // 【过渡期】双写 localStorage：回滚保险 + 同步探测 quota（清理版删掉这段）
   try {
     window.localStorage.setItem(KEY, JSON.stringify(next));

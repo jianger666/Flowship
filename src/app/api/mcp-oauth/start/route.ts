@@ -1,10 +1,10 @@
 /**
  * POST /api/mcp-oauth/start
  *
- * 发起某个 MCP server 的 OAuth 授权：读 Cursor mcp.json 拿该 server 的 url、跑 SDK 的发现 +
+ * 发起某个 MCP server 的 OAuth 授权：读自管配置拿该 server 的 url、跑 SDK 的发现 +
  * DCR 注册 + 生成 PKCE 授权 URL、把授权 URL 返给前端（前端开浏览器让用户登录授权）。
  *
- * 入参：{ serverName }（mcp.json 里的 key）
+ * 入参：{ serverName }（settings.mcpServers 里的 key）
  * 返回：{ ok, authorizationUrl } | { ok, alreadyAuthorized } | { ok:false, error }
  */
 

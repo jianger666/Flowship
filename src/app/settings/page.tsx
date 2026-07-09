@@ -3,12 +3,12 @@
 /**
  * 设置页（壳子）
  *
- * 配置块（除 MCP 外都存 localStorage、不上服务器）：
+ * 配置块（存 data/config.json、client 内存缓存）：
  *   1. Cursor API Key —— 后续所有 SDK 调用要用、可点「验证」拉模型列表
  *   2. 默认模型 —— 不预设默认值、列表通过 /api/models 动态拉
  *   3. 仓库列表 —— agent 启动时作为 cwd 用、暂时只支持本地绝对路径
  *      通过桌面端原生 picker（pickNativePaths）选本地目录
- *   4. MCP servers —— 只读展示 Cursor 的 ~/.cursor/mcp.json（V0.6.2 起、不再 fe 自存）
+ *   4. MCP servers —— fe 自管独立配置（V0.13、条目化管理 + 从 Cursor 导入）
  *
  * 拆分约定：
  * - 状态管理 → src/hooks/use-settings.ts、use-models.ts
