@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ImagePlus, Loader2, Send } from "lucide-react";
 import { toast } from "sonner";
 
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { ModelSelect } from "@/components/ui/model-select";
@@ -38,9 +39,16 @@ interface Props {
   onTaskUpdate: (next: Task) => void;
 }
 
+// 输入框自定义拖高的上下界（px）：下界 = 默认两行高、上界防把事件流顶没
+const MIN_BOX_HEIGHT = 52;
+const MAX_BOX_HEIGHT = 400;
+
 export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   // 草稿
   const [draft, setDraft] = useState("");
+  // 输入框高度（null = 默认）：原生 resize-y 拖柄在右下、往下拉才变高——对贴底输入条反直觉
+  //（用户点名）、改成顶边拖柄：往上拉变高、往下拉变矮
+  const [boxHeight, setBoxHeight] = useState<number | null>(null);
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
   // 显式指定的答疑模型（id 空 = 跟随会话；选了 = 一次性答疑 agent 用它答）
@@ -115,6 +123,36 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     // textarea 在上、模型 + 附图 / 发送收进同一条 footer（不再单独一排）
     <div className="border-t px-3 py-2">
       <div className="flex flex-col rounded-lg border bg-background/40 transition-colors focus-within:border-ring/60">
+        {/* 顶边拖柄：贴底输入条的直觉方向——往上拉变高。pointer capture 保证拖出手柄仍跟手 */}
+        <div
+          className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startH =
+              boxHeight ??
+              textareaRef.current?.getBoundingClientRect().height ??
+              MIN_BOX_HEIGHT;
+            const onMove = (ev: PointerEvent) => {
+              const next = Math.min(
+                MAX_BOX_HEIGHT,
+                Math.max(MIN_BOX_HEIGHT, startH + (startY - ev.clientY)),
+              );
+              setBoxHeight(next);
+            };
+            const onUp = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+            };
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp);
+          }}
+          aria-label="拖动调整输入框高度"
+          title="上下拖动调整高度"
+        >
+          <div className="h-1 w-10 rounded-full bg-border/60 transition-colors group-hover:bg-muted-foreground/50" />
+        </div>
+
         {/* 已贴的图（发送前可移除、点击看大图）——贴输入框上方 */}
         {attach.images.length > 0 && (
           <div className="flex flex-wrap gap-1.5 px-3 pt-2">
@@ -135,7 +173,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
           </div>
         )}
 
-        {/* resize-y：用户拍板「至少能上下调大小」——手动拖拽调高、min/max 兜边界 */}
+        {/* 高度由顶边拖柄控制（style.height）、不用原生 resize（方向反直觉） */}
         <Textarea
           ref={textareaRef}
           value={draft}
@@ -150,7 +188,12 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
           placeholder="想改、想问、贴图都行（⌘/Ctrl+J）"
           rows={2}
           disabled={busy}
-          className="max-h-64 min-h-13 resize-y overflow-y-auto border-0 bg-transparent px-3 py-2.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+          style={boxHeight != null ? { height: boxHeight } : undefined}
+          // 没手动拖过：field-sizing 随内容自增、max-h 兜顶；拖过：固定高度接管
+          className={cn(
+            "min-h-13 resize-none overflow-y-auto border-0 bg-transparent px-3 pt-0.5 pb-2.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent",
+            boxHeight == null && "max-h-64",
+          )}
         />
 
         {/* footer：左 = 答疑模型（默认跟随会话、下拉里可随时点回）、右 = 附图 + 发送 */}
