@@ -582,7 +582,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const startedTask = await setTaskRunStatus(task.id, "running");
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
-    // 2) 拼 mcpServers：全局 cursor mcp（按 task 黑名单过滤）+ 我们自己的 chat-tool
+    // 2) 拼 mcpServers：fe 自管 MCP（按 task 黑名单过滤）+ 我们自己的 chat-tool
     // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
     // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
     // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、

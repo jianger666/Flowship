@@ -1,15 +1,13 @@
 "use client";
 
 /**
- * 读 Cursor 全局 MCP 配置（`~/.cursor/mcp.json`）的共享 hook
+ * 读 MCP 配置的共享 hook（V0.13 独立化后语义）
  *
- * 背景（V0.6.2「跟 Cursor 共用工具」）：fe 不再让用户在设置页编辑 MCP、改为直接展示
- * Cursor 的配置（单一源、用户在 Cursor 改）。本 hook 封装「fetch + loading + error +
- * focus 自动刷新」、给三类调用方复用：
- *   - 设置页 mcp-card：只读展示完整 servers
- *   - new-task-dialog / task-mcp-panel：拿 server 名列表当「黑名单候选源」
+ * - `servers` = **运行时有效集（fe 自管配置）**——new-task-dialog / task-mcp-panel /
+ *   chat-mcp-picker 拿它当「黑名单候选源」
+ * - `cursorServers` = Cursor `~/.cursor/mcp.json` 原样——仅设置页「从 Cursor 导入」dialog 用
  *
- * focus 刷新：用户可能切到 Cursor 改了 mcp.json 再切回来、focus 时重拉一次保持同步。
+ * 封装「fetch + loading + error + focus 自动刷新」；focus 刷新兜「设置页改完切回任务页」的同步。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -18,9 +16,9 @@ import type { McpServerConfig } from "@cursor/sdk";
 import { fetchCursorMcp } from "@/lib/task-store";
 
 export interface UseCursorMcpResult {
-  /** 合并后的 MCP（黑名单候选 / 飞书校验用） */
+  /** 运行时有效 MCP（= fe 自管、黑名单候选 / 飞书校验用） */
   servers: Record<string, McpServerConfig>;
-  /** Cursor 侧只读配置 */
+  /** Cursor 侧配置（仅「从 Cursor 导入」dialog 用） */
   cursorServers: Record<string, McpServerConfig>;
   names: string[];
   dirs: string[];

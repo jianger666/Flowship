@@ -42,4 +42,7 @@ export const register = (): void => {
   // V0.12：内置飞书 CLI（lark-cli / meegle）的 bin 目录注进 PATH——
   // SDK agent 是本进程子进程、继承后 shell 直接调两个 CLI（没装时目录不存在、无副作用）
   void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
+
+  // V0.13：MCP 独立化的老用户一次性迁移（Cursor mcp.json 快照进自管配置、标记文件防重）
+  void import("./lib/server/cursor-config").then((m) => m.migrateCursorMcpOnce());
 };

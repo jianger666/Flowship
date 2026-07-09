@@ -220,15 +220,13 @@ export const checkoutTaskBranch = async (
   return data.state;
 };
 
-// ----------------- Cursor 全局 MCP（只读展示 + task 黑名单候选源） -----------------
+// ----------------- MCP 配置读取（V0.13 独立化：servers = fe 自管有效集） -----------------
 
 export interface CursorMcpInfo {
-  /** 合并后的 MCP（Cursor + fe 自管） */
+  /** 运行时有效 MCP（= fe 自管配置、黑名单候选 / 健康探测用） */
   servers: Record<string, McpServerConfig>;
-  /** Cursor ~/.cursor/mcp.json */
+  /** Cursor ~/.cursor/mcp.json（仅「从 Cursor 导入」dialog 展示挑选用） */
   cursor: Record<string, McpServerConfig>;
-  /** fe config.json 里的 mcpServers */
-  app: Record<string, McpServerConfig>;
   dirs: string[];
 }
 
@@ -238,13 +236,11 @@ export const fetchCursorMcp = async (): Promise<CursorMcpInfo> => {
     ok: true;
     servers: Record<string, McpServerConfig>;
     cursor: Record<string, McpServerConfig>;
-    app: Record<string, McpServerConfig>;
     dirs: string[];
   }>(res);
   return {
     servers: data.servers,
     cursor: data.cursor,
-    app: data.app,
     dirs: data.dirs,
   };
 };

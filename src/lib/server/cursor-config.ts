@@ -1,24 +1,27 @@
 /**
- * 读 Cursor 全局配置（`~/.cursor/`）给 fe agent 用
+ * MCP 配置源 + Cursor 全局配置读取
  *
- * 背景（2026-06「跟 Cursor 共用工具」定案、详见 ROADMAP）：
- * - `settingSources:["project"]` 只加载目标 repo 的 `.cursor/`（project 层）、
- *   够不着全局 `~/.cursor/`（user 层、SDK 要 settingSources 含 `"user"` 才加载）。
- * - 但 `"user"` 是粗开关、一开会把全局 MCP 全量塞进 agent context（用户 20-30 个）、
- *   且没法 per-task 精简。所以全局配置改由 fe 后端自己读：可控、可 per-task 过滤。
- * - 职责分工：MCP server 本体在 Cursor 配（fe 只读、不改）；「哪个 task 用哪些」在 fe per-task 开关。
+ * V0.13「MCP 独立化」（用户拍板：为后续接 Codex / Claude Code 等多 backend 留口子）：
+ * - agent 运行时 **只读 fe 自管配置**（config.json → settings.mcpServers）、
+ *   不再 live 合并 `~/.cursor/mcp.json`——在 Cursor 里改配置不再影响本 app。
+ * - Cursor mcp.json 仅作**导入源**：设置页「从 Cursor 导入」拷贝成自管条目、之后互不影响。
+ * - 老用户无感迁移：升级后首次 boot 把 Cursor mcp.json 一次性快照进自管（见
+ *   migrateCursorMcpOnce）；全新安装不自动迁、用户在设置页自己导入。
  *
- * 本文件集中「读 `~/.cursor/` 全局配置」：mcp.json + rules/。
+ * 历史（V0.6.2「跟 Cursor 共用工具」、已废弃）：曾经每次起 agent 实时合并 Cursor 配置、
+ * `settingSources:["project"]` 只加载 repo 层所以全局配置由 fe 自己读。
+ *
+ * 本文件还保留「读 `~/.cursor/` 全局 rules」（prompt 注入用、与 MCP 独立化无关）。
  * 全局 skills 在 `skills-loader.ts` 读（复用它的 scanSkillsDir、避免循环依赖）。
  */
 
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import matter from "gray-matter";
 import type { McpServerConfig } from "@cursor/sdk";
 
-import { mergeMcpSources } from "../mcp-config";
+import { mergeMcpSources, RESERVED_MCP_NAMES } from "../mcp-config";
 import { dataRoot } from "./data-root";
 
 /**
@@ -38,7 +41,8 @@ export const getGlobalCursorDirs = (): string[] => {
 
 /**
  * 读全局 `~/.cursor/mcp.json` → `{ name: McpServerConfig }`
- * - 文件不存在 / 解析失败 → 返 `{}`（不抛、不阻塞 agent 启动；MCP 是可选能力）
+ * - V0.13 起仅作**导入源**（设置页导入 dialog + 老用户一次性迁移）、运行时不再读它
+ * - 文件不存在 / 解析失败 → 返 `{}`（不抛；MCP 是可选能力）
  * - 多候选目录取第一个能读到的
  */
 export const readGlobalCursorMcpServers = async (): Promise<
@@ -77,20 +81,74 @@ export const readAppMcpServers = async (): Promise<
   return {};
 };
 
-/** Cursor + fe 自管合并（fe 同名覆盖） */
-export const readMergedMcpServers = async (): Promise<
+/**
+ * 运行时有效 MCP 集（V0.13 = fe 自管、不再合并 Cursor）
+ * RESERVED 名（aiFlowChat）剔除——runtime 强制注入、不允许用户条目顶掉
+ */
+export const readEffectiveMcpServers = async (): Promise<
   Record<string, McpServerConfig>
-> =>
-  mergeMcpSources(
-    await readGlobalCursorMcpServers(),
-    await readAppMcpServers(),
-  );
+> => {
+  const app = await readAppMcpServers();
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, cfg] of Object.entries(app)) {
+    if (!RESERVED_MCP_NAMES.has(name)) out[name] = cfg;
+  }
+  return out;
+};
 
-/** agent 启动用：合并后再按 task 黑名单过滤 */
+/** agent 启动用：有效集再按 task 黑名单过滤 */
 export const resolveTaskMcpServers = async (
   disabled: string[] | undefined,
 ): Promise<Record<string, McpServerConfig>> =>
-  filterDisabledMcp(await readMergedMcpServers(), disabled);
+  filterDisabledMcp(await readEffectiveMcpServers(), disabled);
+
+/**
+ * 老用户无感迁移（V0.13、boot 时跑一次）：把 Cursor mcp.json 快照进自管配置。
+ *
+ * 判定「老 / 新」用 config.json 是否存在：
+ * - 存在（升级上来的老用户、此前依赖 live 合并 Cursor）→ Cursor servers 合入
+ *   settings.mcpServers（自管同名优先）、行为零变化
+ * - 不存在（全新安装）→ 只落标记、不自动迁——新用户在设置页自己挑着导入
+ *
+ * 标记文件 `data/.mcp-cursor-migrated` 保证只跑一次；config.json 解析失败时
+ * 不写标记（下次 boot 重试）。boot 时 client 还没加载、无与 /api/settings 写并发。
+ */
+export const migrateCursorMcpOnce = async (): Promise<void> => {
+  const marker = path.join(dataRoot(), ".mcp-cursor-migrated");
+  if (existsSync(marker)) return;
+  const configFile = path.join(dataRoot(), "config.json");
+  let raw: string | null = null;
+  try {
+    raw = await fs.readFile(configFile, "utf-8");
+  } catch {
+    raw = null;
+  }
+  if (raw === null) {
+    // 全新安装：没有历史行为要保、落标记即可
+    await fs.mkdir(dataRoot(), { recursive: true }).catch(() => {});
+    await fs.writeFile(marker, new Date().toISOString()).catch(() => {});
+    return;
+  }
+  try {
+    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const app =
+      cfg.mcpServers && typeof cfg.mcpServers === "object" && !Array.isArray(cfg.mcpServers)
+        ? (cfg.mcpServers as Record<string, McpServerConfig>)
+        : {};
+    const cursor = await readGlobalCursorMcpServers();
+    const merged = mergeMcpSources(cursor, app);
+    const addedCount = Object.keys(merged).length - Object.keys(app).length;
+    cfg.mcpServers = merged;
+    await fs.writeFile(configFile, JSON.stringify(cfg, null, 2), "utf-8");
+    await fs.writeFile(marker, new Date().toISOString(), "utf-8");
+    console.log(
+      `[cursor-config] MCP 独立化迁移完成：从 Cursor 快照 ${addedCount} 个 server 进自管配置（共 ${Object.keys(merged).length} 个）`,
+    );
+  } catch (err) {
+    // config.json 坏 / 写失败：不落标记、下次 boot 重试
+    console.warn("[cursor-config] MCP 迁移失败（下次启动重试）：", err);
+  }
+};
 
 /**
  * 按 task 黑名单过滤 MCP（server 端用、对应 `task.disabledMcpServers`）

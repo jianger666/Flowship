@@ -299,7 +299,14 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### V0.12.2（未发版、攒着）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
+### V0.13-P0（未发版、攒着）：MCP 独立化（2026-07-09、用户拍板「先解耦、为接 Codex / Claude Code 等多 backend 留口子」）
+
+- **运行时只读 fe 自管配置**（config.json → settings.mcpServers）、不再 live 合并 `~/.cursor/mcp.json`——在 Cursor 改配置不再影响本 app；`readMergedMcpServers` → `readEffectiveMcpServers`（自管 + 剔 RESERVED 名）、resolveTaskMcpServers / health / oauth 四处消费方统一切换
+- **老用户无感迁移**（`migrateCursorMcpOnce`、instrumentation boot 挂）：config.json 已存在（老用户）→ Cursor mcp.json 一次性快照合入自管（自管同名优先）；全新安装 → 只落标记不自动迁（新用户设置页自己导入）；标记文件 `data/.mcp-cursor-migrated` 防重、config 解析失败不落标记下次重试
+- **设置页 MCP 卡重做**（`mcp-card.tsx` 条目化）：每 server 一行（类型摘要 + 编辑 / 删除）、新增 / 编辑 dialog（名称 + 单 server JSON）、「从 Cursor 导入」dialog 勾选挑 server（已存在标「导入将覆盖」）、高级折叠保留整体 JSON 编辑；OAuth / 常用开关 / 健康探测数据源全切自管
+- `/api/cursor-mcp` 语义改：`servers` = 有效集（自管）、`cursor` 仅供导入 dialog；`settingSources:["project"]` / 全局 rules / skills 注入**本期不动**（prompt 上下文体系、接第二 backend 时再抽统一层）
+
+### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
 
 - **结论**：username 唯一消费方是分支模板 `{username}` 占位符（不进 prompt / MR / git 身份）、单机 app 写死在模板等价——字段删除
 - **无感迁移**（normalizeSettings、幂等）：老配置有 username 时把全局 + 各仓模板里的 `{username}` 一次性替换成真实名字（没显式配过模板的老用户按旧默认烘焙成 `feature/<名字>/{storyId}-{taskTitle}`）、老用户分支名零变化；migration 后字段不再落盘
