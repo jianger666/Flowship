@@ -12,7 +12,8 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Download, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Download, Pencil, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -37,7 +38,10 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Textarea } from "@/components/ui/textarea";
 import { useDialog } from "@/hooks/use-dialog";
+import { getSettings } from "@/lib/local-store";
+import { createTask, sendChatReply } from "@/lib/task-store";
 
 // 跟 /api/skills 返回对齐的条目形态
 interface SkillRow {
@@ -74,10 +78,13 @@ description: 一句话说清这个 skill 什么场景用（agent 靠它决定要
 
 export const SkillsCard = () => {
   const { confirm } = useDialog();
+  const router = useRouter();
   // 全部来源的 skill 列表（null = 还没加载完）
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
   // Cursor 全局可导入清单
   const [cursorGlobal, setCursorGlobal] = useState<CursorGlobalSkill[]>([]);
+  // 自管 skills 目录绝对路径（「AI 帮建」开对话当 cwd 用、server 返回）
+  const [appSkillsDir, setAppSkillsDir] = useState("");
   // 编辑 dialog：null 关；name 空串 = 新增
   const [editing, setEditing] = useState<{
     name: string;
@@ -85,6 +92,8 @@ export const SkillsCard = () => {
   } | null>(null);
   // 导入 dialog 开关
   const [importOpen, setImportOpen] = useState(false);
+  // 「AI 帮建」dialog 开关
+  const [aiCreateOpen, setAiCreateOpen] = useState(false);
   // 请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
 
@@ -94,9 +103,11 @@ export const SkillsCard = () => {
       const data = (await res.json()) as {
         skills?: SkillRow[];
         cursorGlobal?: CursorGlobalSkill[];
+        appSkillsDir?: string;
       };
       setSkills(data.skills ?? []);
       setCursorGlobal(data.cursorGlobal ?? []);
+      setAppSkillsDir(data.appSkillsDir ?? "");
     } catch (err) {
       toast.error(
         `读取 skills 失败：${err instanceof Error ? err.message : String(err)}`,
@@ -104,6 +115,51 @@ export const SkillsCard = () => {
       setSkills([]);
     }
   }, []);
+
+  // 「AI 帮建」：开一个工作目录锁在 data/skills 的对话、把需求拼成规范 prompt 直接发、
+  // 跳对话页看 AI 现场建（对齐 Claude Code skill-creator 的对话式建法）
+  const handleAiCreate = async (requirement: string) => {
+    const s = getSettings();
+    if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
+      toast.error("先在设置页配好 API Key 和默认模型");
+      return;
+    }
+    if (!appSkillsDir) {
+      toast.error("skills 目录还没就绪、点「刷新」后重试");
+      return;
+    }
+    setBusy(true);
+    try {
+      const task = await createTask({
+        mode: "chat",
+        title: "AI 建 skill",
+        repoPaths: [appSkillsDir],
+        model: s.defaultModel,
+        disabledMcpServers:
+          s.disabledMcpServers && s.disabledMcpServers.length > 0
+            ? s.disabledMcpServers
+            : undefined,
+      });
+      const prompt =
+        `我想创建一个 skill：${requirement.trim()}\n\n` +
+        "请按 skill-creator 规范在当前工作目录（本平台的 skill 目录）创建：" +
+        "kebab-case 目录名、SKILL.md 的 frontmatter 必须含 name 和 description" +
+        "（description 要写清何时触发、触发词罗列全）、需要辅助脚本放同目录并在文中引用。" +
+        "信息不够先问我、别瞎猜；建完列出文件结构和触发方式。";
+      await sendChatReply(task.id, prompt, undefined, undefined, {
+        apiKey: s.apiKey,
+        model: s.defaultModel,
+      });
+      setAiCreateOpen(false);
+      router.push(`/tasks/${task.id}`);
+    } catch (err) {
+      toast.error(
+        `发起失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     void refresh();
@@ -200,6 +256,15 @@ export const SkillsCard = () => {
             type="button"
             variant="outline"
             size="sm"
+            onClick={() => setAiCreateOpen(true)}
+          >
+            <Sparkles />
+            AI 帮建
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
             onClick={() => setImportOpen(true)}
           >
             <Download />
@@ -212,7 +277,7 @@ export const SkillsCard = () => {
             onClick={() => setEditing({ name: "", content: NEW_SKILL_TEMPLATE })}
           >
             <Plus />
-            新增
+            手写
           </Button>
           <Button
             type="button"
@@ -326,7 +391,65 @@ export const SkillsCard = () => {
         onClose={() => setImportOpen(false)}
         onImport={(names) => void handleImport(names)}
       />
+
+      <AiCreateDialog
+        open={aiCreateOpen}
+        busy={busy}
+        onClose={() => setAiCreateOpen(false)}
+        onSubmit={(req) => void handleAiCreate(req)}
+      />
     </Card>
+  );
+};
+
+// ----------------- AI 帮建 dialog -----------------
+
+const AiCreateDialog = ({
+  open,
+  busy,
+  onClose,
+  onSubmit,
+}: {
+  open: boolean;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (requirement: string) => void;
+}) => {
+  // 需求描述草稿
+  const [requirement, setRequirement] = useState("");
+  useEffect(() => {
+    if (!open) setRequirement("");
+  }, [open]);
+
+  return (
+    // disablePointerDismissal：带草稿、点外误关丢内容（ui-conventions 约定）
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()} disablePointerDismissal>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>AI 帮建 skill</DialogTitle>
+          <p className="text-xs text-muted-foreground">
+            会开一个对话让 AI 现场建（可追问迭代）、建完回这里刷新可见
+          </p>
+        </DialogHeader>
+        <Textarea
+          value={requirement}
+          onChange={(e) => setRequirement(e.target.value)}
+          placeholder="描述你想要的 skill、如：生成周报、要能拉 git log 汇总本周提交"
+          rows={4}
+        />
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button
+            onClick={() => onSubmit(requirement)}
+            disabled={busy || !requirement.trim()}
+          >
+            {busy ? "发起中…" : "开聊"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 };
 

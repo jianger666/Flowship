@@ -6,6 +6,7 @@
  * DELETE /api/skills?name=<n>           → 删 app 自管 skill
  */
 
+import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 
 import {
@@ -15,11 +16,15 @@ import {
   shortenHomePath,
   writeAppSkill,
 } from "@/lib/server/app-skills";
+import { getAppSkillsDir } from "@/lib/server/skills-loader";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 export const runtime = "nodejs";
 
 export const GET = async () => {
+  // 顺手保证自管目录存在：「AI 帮建」开对话要拿它当 cwd、不存在 agent 起不来
+  const appSkillsDir = getAppSkillsDir();
+  await fs.mkdir(appSkillsDir, { recursive: true }).catch(() => {});
   const [skills, cursorGlobal] = await Promise.all([
     listSkillsWithSource(),
     listCursorGlobalSkills(),
@@ -34,6 +39,7 @@ export const GET = async () => {
       absPath: shortenHomePath(s.absPath),
     })),
     cursorGlobal,
+    appSkillsDir,
   });
 };
 
