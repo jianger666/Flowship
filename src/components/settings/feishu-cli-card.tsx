@@ -196,7 +196,9 @@ export const FeishuCliCard = () => {
             onClick={() => void handleInstall()}
           >
             {installing ? <Loader2 className="animate-spin" /> : <Download />}
-            {state?.larkCli.installed || state?.meegle.installed ? "更新" : "安装"}
+            {/* 两个都装了才叫「更新」；缺任何一个都叫「安装」（用户踩过：meegle 没装、
+                按钮却只有「更新」、以为装不了）。装过的且已最新会自动跳过、不重复下载 */}
+            {state?.larkCli.installed && state?.meegle.installed ? "更新" : "安装"}
           </Button>
           {installing && installLog.length > 0 && (
             <span className="text-xs text-muted-foreground">

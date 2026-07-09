@@ -131,6 +131,12 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
     throw new Error(`lark-cli 不支持当前平台：${process.platform}/${process.arch}`);
   }
   const version = await fetchNpmLatestVersion("@larksuite/cli");
+  // 增量语义（用户踩过：已装 v 最新还整包重下）：已装且版本一致 → 跳过
+  const installed = await probeVersion(larkCliBin());
+  if (installed === version) {
+    log(`lark-cli v${version} 已是最新、跳过`);
+    return;
+  }
   log(`lark-cli 最新版本 v${version}、开始下载…`);
   const ext = isWin ? ".zip" : ".tar.gz";
   const archiveName = `lark-cli-${version}-${platform}-${arch}${ext}`;
@@ -161,6 +167,12 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
 
 const installMeegle = async (log: (line: string) => void): Promise<void> => {
   const version = await fetchNpmLatestVersion("@lark-project/meegle");
+  // 增量语义：已装且版本一致 → 跳过（同 installLarkCli）
+  const installed = await probeVersion(meegleBin());
+  if (installed === version) {
+    log(`meegle v${version} 已是最新、跳过`);
+    return;
+  }
   log(`meegle 最新版本 v${version}、开始下载…`);
   const urls = [
     `https://registry.npmjs.org/@lark-project/meegle/-/meegle-${version}.tgz`,
