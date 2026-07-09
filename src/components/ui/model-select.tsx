@@ -108,6 +108,9 @@ interface Props {
   // 常用模型快捷位（V0.11.x 用户拍板「按使用次数自动排」）：true 时 trigger 上方
   // 常驻 top2 使用最多的「模型 + 参数组合」chip、点一下直接选中、不用开下拉搜
   quickPicks?: boolean;
+  // 「不指定模型」选项文案（V0.12.x 任务页说话条用「跟随会话」）：传了就在列表顶部
+  // 渲染一个可选项、点选 = onChange({ id: "" })——否则选过模型后没有入口回到未指定态
+  followOption?: string;
 }
 
 export const ModelSelect = ({
@@ -119,6 +122,7 @@ export const ModelSelect = ({
   emptyPlaceholder = "选择模型",
   onOpenChange,
   quickPicks = false,
+  followOption,
 }: Props) => {
   // popover 开关（受控）：选模型 / 调参数都不主动关、允许连续操作；点外 / Esc 才关
   const [open, setOpen] = useState(false);
@@ -247,6 +251,30 @@ export const ModelSelect = ({
 
         {/* 模型列表：普通 button 列表（非嵌套 Select）、选中打勾、点选不关 popover */}
         <ul className="max-h-60 overflow-y-auto p-1">
+          {/* 「不指定模型」项（如任务页的「跟随会话」）：常驻列表顶部、随时可点回未指定态 */}
+          {followOption && (
+            <li>
+              <button
+                type="button"
+                onClick={() => {
+                  onChange({ id: "" });
+                  handleOpenChange(false);
+                }}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent",
+                  !selection.id && "bg-accent/40",
+                )}
+              >
+                <Check
+                  className={cn(
+                    "size-4 shrink-0",
+                    !selection.id ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                <span className="truncate text-sm">{followOption}</span>
+              </button>
+            </li>
+          )}
           {models.length === 0 ? (
             <li className="px-2 py-6 text-center text-xs text-muted-foreground">
               <a

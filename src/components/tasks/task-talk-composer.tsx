@@ -17,7 +17,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ImagePlus, Loader2, MessageCircleQuestion, Send, X } from "lucide-react";
+import { ImagePlus, Loader2, Send } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -111,9 +111,31 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   }
 
   return (
-    <div className="flex flex-col border-t">
-      <div className="flex items-end gap-1.5 px-3 pt-2">
-        <MessageCircleQuestion className="mb-2 size-3.5 shrink-0 text-muted-foreground/60" />
+    // 输入岛（对齐 chat 输入条形态、V0.12.x 用户点名重整）：圆角边框、focus 高亮、
+    // textarea 在上、模型 + 附图 / 发送收进同一条 footer（不再单独一排）
+    <div className="border-t px-3 py-2">
+      <div className="flex flex-col rounded-lg border bg-background/40 transition-colors focus-within:border-ring/60">
+        {/* 已贴的图（发送前可移除、点击看大图）——贴输入框上方 */}
+        {attach.images.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+            {attach.images.map((img, i) => (
+              <ImageThumb
+                key={img.id}
+                src={img.dataUrl}
+                alt={img.file.name}
+                className="size-10 rounded bg-background"
+                onRemove={() => attach.removeImage(img.id)}
+                group={attach.images.map((im) => ({
+                  src: im.dataUrl,
+                  alt: im.file.name,
+                }))}
+                index={i}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* resize-y：用户拍板「至少能上下调大小」——手动拖拽调高、min/max 兜边界 */}
         <Textarea
           ref={textareaRef}
           value={draft}
@@ -126,89 +148,62 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
             }
           }}
           placeholder="想改、想问、贴图都行（⌘/Ctrl+J）"
-          rows={1}
+          rows={2}
           disabled={busy}
-          className="min-h-8 resize-none border-0 bg-transparent px-1 py-1.5 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
+          className="max-h-64 min-h-13 resize-y overflow-y-auto border-0 bg-transparent px-3 py-2.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
         />
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={attach.triggerFilePicker}
-          disabled={busy || attach.images.length >= attach.maxImages}
-          aria-label="附图"
-          title="附图（也可直接粘贴）"
-          className="mb-1 shrink-0 text-muted-foreground/70"
-        >
-          <ImagePlus />
-        </Button>
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => void handleSubmit()}
-          disabled={busy || (draft.trim().length === 0 && attach.images.length === 0)}
-          aria-label="发送"
-          title="发送"
-          className="mb-1 shrink-0 text-muted-foreground"
-        >
-          {submitting ? <Loader2 className="animate-spin" /> : <Send />}
-        </Button>
-        <input
-          ref={attach.fileInputRef}
-          type="file"
-          accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-          multiple
-          className="hidden"
-          onChange={attach.onFileInputChange}
-        />
-      </div>
 
-      {/* 已贴的图（发送前可移除、点击看大图） */}
-      {attach.images.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 px-3 pt-1 pl-8">
-          {attach.images.map((img, i) => (
-            <ImageThumb
-              key={img.id}
-              src={img.dataUrl}
-              alt={img.file.name}
-              className="size-10 rounded bg-background"
-              onRemove={() => attach.removeImage(img.id)}
-              group={attach.images.map((im) => ({
-                src: im.dataUrl,
-                alt: im.file.name,
-              }))}
-              index={i}
-            />
-          ))}
+        {/* footer：左 = 答疑模型（默认跟随会话、下拉里可随时点回）、右 = 附图 + 发送 */}
+        <div className="flex items-center justify-between gap-2 px-2 pb-1.5 pt-0.5">
+          <ModelSelect
+            models={models}
+            selection={pickedModel}
+            onChange={setPickedModel}
+            disabled={busy}
+            variant="compact"
+            emptyPlaceholder="模型 · 跟随会话"
+            followOption="跟随会话"
+            onOpenChange={(open) => {
+              if (!open) return;
+              const s = getSettings();
+              if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
+            }}
+          />
+          <div className="flex shrink-0 items-center gap-0.5">
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              onClick={attach.triggerFilePicker}
+              disabled={busy || attach.images.length >= attach.maxImages}
+              aria-label="附图"
+              title="附图（也可直接粘贴）"
+              className="text-muted-foreground/70"
+            >
+              <ImagePlus />
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              onClick={() => void handleSubmit()}
+              disabled={
+                busy || (draft.trim().length === 0 && attach.images.length === 0)
+              }
+              aria-label="发送"
+              title="发送"
+              className="text-muted-foreground"
+            >
+              {submitting ? <Loader2 className="animate-spin" /> : <Send />}
+            </Button>
+          </div>
+          <input
+            ref={attach.fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            onChange={attach.onFileInputChange}
+          />
         </div>
-      )}
-
-      {/* 答疑模型（可选）：默认跟随会话；显式选了 = 单独起答疑 agent 用它答 */}
-      <div className="flex items-center gap-1 px-3 pb-1.5 pl-8">
-        <ModelSelect
-          models={models}
-          selection={pickedModel}
-          onChange={setPickedModel}
-          disabled={busy}
-          variant="compact"
-          emptyPlaceholder="模型 · 跟随会话"
-          onOpenChange={(open) => {
-            if (!open) return;
-            const s = getSettings();
-            if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
-          }}
-        />
-        {pickedModel.id && (
-          <Button
-            size="icon-xs"
-            variant="ghost"
-            onClick={() => setPickedModel({ id: "" })}
-            aria-label="恢复跟随会话模型"
-            title="恢复跟随会话模型"
-            className="text-muted-foreground/60"
-          >
-            <X />
-          </Button>
-        )}
       </div>
     </div>
   );
