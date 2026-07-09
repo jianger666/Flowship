@@ -92,7 +92,8 @@ export type JumpIde =
   | "pycharm"
   | "goland"
   | "phpstorm"
-  | "android-studio";
+  | "android-studio"
+  | "xcode";
 
 export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
   cursor: "Cursor",
@@ -105,6 +106,7 @@ export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
   goland: "GoLand",
   phpstorm: "PhpStorm",
   "android-studio": "Android Studio",
+  xcode: "Xcode",
 };
 
 /** 全部候选（顺序 = 设置页下拉顺序）、单一来源、别在组件 / route 里再抄一份 */
@@ -128,6 +130,7 @@ export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
   goland: false,
   phpstorm: false,
   "android-studio": false,
+  xcode: false,
 };
 
 export type SubmitShortcut = "mod-enter" | "enter";

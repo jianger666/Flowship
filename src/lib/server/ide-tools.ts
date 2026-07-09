@@ -52,6 +52,7 @@ const IDE_NAMES: Record<JumpIde, string> = {
   goland: "GoLand",
   phpstorm: "PhpStorm",
   "android-studio": "Android Studio",
+  xcode: "Xcode",
 };
 
 /**
@@ -60,9 +61,10 @@ const IDE_NAMES: Record<JumpIde, string> = {
  *   `%LOCALAPPDATA%\Programs\<dir>` 或 Program Files、打开参数 `-g path:line`
  * - family=jetbrains：IntelliJ 平台系——win 装目录带版本号前缀匹配、支持 Toolbox
  *   两代安装位、打开参数 `--line N path`
+ * - family=xcode：mac 专属、用随 Xcode 安装的 `xed` CLI 打开（`xed --line N path`）
  */
 interface IdeSpec {
-  family: "vscode" | "jetbrains";
+  family: "vscode" | "jetbrains" | "xcode";
   /** mac /Applications 下的 .app 名候选（不带 .app 后缀） */
   macApps: string[];
   /** PATH 上的命令名候选 */
@@ -172,6 +174,12 @@ const IDE_SPECS: Record<JumpIde, IdeSpec> = {
       path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Android"),
     ],
   },
+  // Xcode：mac 专属（iOS 开发）、探 /Applications/Xcode.app、打开走 xed CLI
+  xcode: {
+    family: "xcode",
+    macApps: ["Xcode", "Xcode-beta"],
+    pathBins: ["xed"],
+  },
 };
 
 // ---------- 平台探测 ----------
@@ -232,6 +240,10 @@ const findOnPath = async (bins: string[]): Promise<string | null> => {
 
 // 按 spec 探测单个 IDE（family 决定 win 侧扫哪些目录、mac / PATH 两层通用）
 const detectOne = async (spec: IdeSpec): Promise<DetectResult> => {
+  // Xcode 是 mac 专属、其它平台直接不可用（不做 PATH 探测、省得撞同名命令误报）
+  if (spec.family === "xcode" && process.platform !== "darwin") {
+    return { available: false };
+  }
   if (process.platform === "darwin") {
     const app = findMacApp(spec.macApps);
     if (app.available) return app;
@@ -349,6 +361,17 @@ export const openInIde = async (
   const tool = results[ide];
   if (!tool.available || !tool.exec) {
     return `本机没探测到 ${IDE_NAMES[ide]}——确认已安装、或去设置页换一个跳转工具`;
+  }
+
+  // Xcode：不走 .app launcher（open --args 传不了文件定位）、用随 Xcode 安装的 xed CLI
+  if (IDE_SPECS[ide].family === "xcode") {
+    try {
+      const xedArgs = line ? ["--line", String(line), absPath] : [absPath];
+      await execFileAsync("xed", xedArgs, { timeout: 15_000 });
+      return null;
+    } catch (err) {
+      return `拉起 Xcode 失败：${err instanceof Error ? err.message : String(err)}`;
+    }
   }
 
   // 参数拼法：JetBrains `--line N <path>`；VS Code 系 `-g <path>:N`
