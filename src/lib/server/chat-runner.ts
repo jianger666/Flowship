@@ -48,7 +48,11 @@ import {
   formatRepoSectionForPrompt,
   getEffectiveCwd,
 } from "@/lib/path-utils";
+import { promises as fs } from "node:fs";
 import os from "node:os";
+import path from "node:path";
+
+import { dataRoot } from "./data-root";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -60,7 +64,7 @@ import {
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
-import { summarizeRunFailure } from "./sdk-error";
+import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import {
   publishTaskStreamEvent,
   type TaskStreamEvent,
@@ -767,12 +771,110 @@ export const resumeChatSession = async (
     );
     return true;
   } catch (err) {
+    // V0.13.x：网络类失败不清锚点（自动重连还要靠它再试）；确定性失败才清
+    const m = err instanceof Error ? err.message : String(err);
+    if (isRetryableRunError(m, err)) {
+      console.warn(
+        `[chat-runner] task=${task.id} Agent.resume 网络类失败（保留锚点、可重试）`,
+        err,
+      );
+      return false;
+    }
     console.warn(
       `[chat-runner] task=${task.id} Agent.resume 失败（清锚点、降级新会话）`,
       err,
     );
     void setTaskSessionAgentId(task.id, undefined);
     return false;
+  }
+};
+
+// ----------------- V0.13.x：chat run 网络断自动重连（同 task-runner 口径、重试 5 次） -----------------
+
+const RECONNECT_MAX = 5;
+const RECONNECT_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
+
+// 服务端凭据兜底（重连时没有 client bootArgs）：读 config.json
+const readServerChatCreds = async (): Promise<{
+  apiKey: string;
+  model: ModelSelection;
+} | null> => {
+  try {
+    const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
+    const cfg = JSON.parse(raw) as {
+      apiKey?: string;
+      defaultModel?: ModelSelection;
+    };
+    if (!cfg.apiKey || !cfg.defaultModel?.id) return null;
+    return { apiKey: cfg.apiKey, model: cfg.defaultModel };
+  } catch {
+    return null;
+  }
+};
+
+// 可中断 sleep（1s 分片）：退避期间用户停止要立即生效
+const sleepWithCancel = async (
+  ms: number,
+  isCancelled: () => boolean,
+): Promise<boolean> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (isCancelled()) return true;
+    await new Promise((r) => setTimeout(r, Math.min(1_000, deadline - Date.now())));
+  }
+  return isCancelled();
+};
+
+/**
+ * chat run 网络类失败的自动重连：写「重连中 n/5」事件 → 退避 → resumeChatSession 接回 →
+ * send 系统提示继续 → 递归消费新 run。返回 true = 已接管（无论最终成败、后续都在递归里处理）。
+ */
+const tryChatAutoReconnect = async (
+  task: Task,
+  err: unknown,
+  attempt: number,
+  isCancelled: () => boolean,
+): Promise<boolean> => {
+  if (attempt > RECONNECT_MAX) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!isRetryableRunError(msg, err)) return false;
+  if (isCancelled()) return false;
+  const fresh = await getTask(task.id);
+  if (!fresh || fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
+    return false;
+  }
+  await writeEventAndPublish(task.id, {
+    kind: "info",
+    text: `连接中断、正在自动重连（第 ${attempt}/${RECONNECT_MAX} 次）…`,
+    meta: { kind: "reconnecting", attempt, max: RECONNECT_MAX },
+  });
+  if (await sleepWithCancel(RECONNECT_BACKOFF_MS[attempt - 1], isCancelled)) {
+    return false;
+  }
+  // 内存会话关掉、**锚点必须保留**（resumeChatSession 靠 sessionAgentId 接回）
+  closeChatSession(task.id, { keepPersisted: true });
+  const creds = await readServerChatCreds();
+  if (!creds) return false;
+  const resumed = await resumeChatSession(fresh, creds).catch(() => false);
+  if (!resumed) {
+    return tryChatAutoReconnect(fresh, err, attempt + 1, isCancelled);
+  }
+  const rec = runningChats.get(task.id);
+  if (!rec?.agent) return false;
+  try {
+    const run = await rec.agent.send(
+      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续——已说完的不用重复、接着回答即可。）",
+    );
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: `重连成功（第 ${attempt} 次）、AI 继续回复`,
+      meta: { kind: "reconnected", attempt },
+    });
+    rec.runActive = true;
+    await consumeChatRun(fresh, run, undefined, attempt);
+    return true;
+  } catch (sendErr) {
+    return tryChatAutoReconnect(fresh, sendErr, attempt + 1, isCancelled);
   }
 };
 
@@ -811,6 +913,8 @@ const consumeChatRun = async (
   task: Task,
   run: ChatRun,
   externallyCancelled?: () => boolean,
+  // V0.13.x 自动重连计数（tryChatAutoReconnect 递归时递增、防无限重连）
+  reconnectAttempt = 0,
 ): Promise<void> => {
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -889,7 +993,19 @@ const consumeChatRun = async (
     publish(task.id, { kind: "done", task: doneTask ?? task, ok: true });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
-    await handleChatRunFailure(task, err);
+    // V0.13.x：网络类失败先自动重连（重试 5 次、事件流显示「重连中」）
+    const handled =
+      !cancelled &&
+      !externallyCancelled?.() &&
+      (await tryChatAutoReconnect(
+        task,
+        err,
+        reconnectAttempt + 1,
+        () => cancelled || !!externallyCancelled?.(),
+      ));
+    if (!handled) {
+      await handleChatRunFailure(task, err);
+    }
   }
 };
 

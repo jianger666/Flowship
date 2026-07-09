@@ -8,7 +8,8 @@
  *    → 发系统通知；点通知壳聚焦窗口 + 回传 taskId、这里 router.push 跳详情页
  *
  * 只做「转变沿」检测：mount 时已在等待的任务不补发（陈旧噪声）。
- * error 不通知（跟侧栏同款决策：断线类 error 常见、通知反而噪声）。
+ * V0.13.x 起 error 也通知：网络类失败已有自动重连兜底（重试 5 次）、真落到 error
+ * 的都是需要人处理的问题、值得叫人回来（原「断线 error 噪声」的前提不再成立）。
  * 窗口在前台时不发系统通知（用户正看着 app、侧栏琥珀脉冲点已足够）。
  * 非桌面端没有 __notify 通道、shell-notify 封装内静默降级。
  */
@@ -54,14 +55,18 @@ export const TaskAttentionWatcher = () => {
 
     for (const task of tasks) {
       const was = prev.get(task.id);
-      if (
-        task.runStatus === "awaiting_user" &&
-        was !== undefined &&
-        was !== "awaiting_user"
-      ) {
+      if (was === undefined) continue; // 新任务首见、只记录基线
+      if (task.runStatus === "awaiting_user" && was !== "awaiting_user") {
         sendTaskNotification({
           title: task.title,
           body: buildBody(task),
+          taskId: task.id,
+        });
+      } else if (task.runStatus === "error" && was !== "error") {
+        // V0.13.x：自动重连兜底后、真 error 都值得叫人（重连 5 次失败 / 非网络类问题）
+        sendTaskNotification({
+          title: task.title,
+          body: "任务异常中断、点击查看",
           taskId: task.id,
         });
       }

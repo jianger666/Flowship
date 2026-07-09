@@ -27,6 +27,7 @@ import {
   Loader2,
   Paperclip,
   Send,
+  Sparkles as SparklesIcon,
   Square,
   X,
 } from "lucide-react";
@@ -57,6 +58,7 @@ import {
 import {
   AskUserRequestRow,
   EventRow,
+  ReconnectingRow,
   StreamingAssistantRow,
 } from "./event-stream/rows";
 import { AskUserInlineCard } from "./ask-user-inline";
@@ -175,6 +177,8 @@ const EventStreamImpl = ({
   // 初始 true：进来 initialTopMostItemIndex 定位到末尾、就是贴底态。
   // 关键作用：流式回复时只有「用户本来就在底部」才自动跟随、用户主动往上翻看历史就不打扰。
   const atBottomRef = useRef(true);
+  // 贴底状态的 state 版（V0.13.x「AI 在等你回答」悬浮条显隐用——ref 不触发渲染）
+  const [atBottomState, setAtBottomState] = useState(true);
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -348,8 +352,26 @@ const EventStreamImpl = ({
           事件流
         </div>
       )}
-      {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll */}
-      <div className="min-h-0 flex-1">
+      {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
+          relative：给「AI 在等你回答」悬浮条定位 */}
+      <div className="relative min-h-0 flex-1">
+        {/* V0.13.x 注意力悬浮条（用户拍板「事件流太弱、怕注意不到」）：
+            有未答提问且用户滚在历史里（不贴底）时、底部悬浮提示、点击滚到答题卡 */}
+        {pendingAskEvent && !atBottomState && (
+          <button
+            type="button"
+            onClick={() => {
+              const idx = items.findIndex((it) => it.id === pendingAskEvent.id);
+              if (idx >= 0) {
+                virtuosoRef.current?.scrollToIndex({ index: idx, align: "center", behavior: "smooth" });
+              }
+            }}
+            className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-amber-500/50 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-600 shadow-md backdrop-blur transition-colors hover:bg-amber-500/25 dark:text-amber-400"
+          >
+            <SparklesIcon className="size-3.5 animate-pulse" />
+            AI 在等你回答、点击查看
+          </button>
+        )}
         {items.length === 0 ? (
           <div
             className={cn(
@@ -372,6 +394,7 @@ const EventStreamImpl = ({
             // 维护「用户是否贴底」给上面的流式自动滚 effect 用。
             atBottomStateChange={(atBottom) => {
               atBottomRef.current = atBottom;
+              setAtBottomState(atBottom);
             }}
             // 贴底判定余量调大（默认仅 4px）：流式时最后一项每来一个 chunk 会增高若干像素、
             // 余量太小会立刻被判成「离开底部」→ effect 自废不再跟随。120px 覆盖常见 chunk 增量、
@@ -411,6 +434,9 @@ const EventStreamImpl = ({
                   ) : (
                     <AskUserRequestRow ev={item} task={task} />
                   )
+                ) : item.kind === "info" && item.meta?.kind === "reconnecting" ? (
+                  // V0.13.x 自动重连过程行（spinner、同 thinking 一档的细行）
+                  <ReconnectingRow ev={item} events={task.events} />
                 ) : (
                   <EventRow ev={item} taskId={task.id} task={task} variant={variant} />
                 )}

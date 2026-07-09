@@ -18,6 +18,8 @@ import {
   ChevronRight,
   File as FileIcon,
   Folder,
+  Loader2,
+  Plug,
   Sparkles,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -241,6 +243,40 @@ const ProcessEventRow = ({
   </div>
 );
 
+// V0.13.x「重连中」过程行（自动重连、event-stream 分流层直挂）：
+// spinner + 琥珀文案、同 thinking / 工具调用一档的细行、不可折叠。
+// 是否还在转圈看后续事件：出现 reconnected / error / 更新的 reconnecting 后静态显示
+export const ReconnectingRow = memo(
+  ({ ev, events }: { ev: TaskEvent; events: TaskEvent[] }) => {
+    const idx = events.findIndex((e) => e.id === ev.id);
+    const settled =
+      idx < 0 ||
+      events
+        .slice(idx + 1)
+        .some(
+          (e) =>
+            e.kind === "error" ||
+            (e.kind === "info" &&
+              (e.meta?.kind === "reconnected" ||
+                e.meta?.kind === "reconnecting")),
+        );
+    return (
+      <div className="flex items-center gap-2 px-1.5 py-1 text-xs text-amber-600 dark:text-amber-500">
+        {settled ? (
+          <Plug className="size-3.5 shrink-0 opacity-60" />
+        ) : (
+          <Loader2 className="size-3.5 shrink-0 animate-spin" />
+        )}
+        <span className={cn(settled && "opacity-60")}>{ev.text}</span>
+        <span className="text-[10px] text-muted-foreground/70">
+          {formatTs(ev.ts)}
+        </span>
+      </div>
+    );
+  },
+);
+ReconnectingRow.displayName = "ReconnectingRow";
+
 const EventRowImpl = ({
   ev,
   taskId,
@@ -259,6 +295,7 @@ const EventRowImpl = ({
     ? task.actions.find((a) => a.id === ev.actionId)
     : undefined;
   const actionType: ActionType | undefined = action?.type;
+
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
   const isUser = ev.kind === "user_reply";

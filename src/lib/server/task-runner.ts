@@ -25,8 +25,13 @@
  *   - sdk-message-handler.ts：SDKMessage → 事件流翻译器
  */
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
+
 import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+
+import { dataRoot } from "./data-root";
 
 import {
   appendAction,
@@ -47,7 +52,7 @@ import {
   runActionCheck,
   captureActionStartBaseline,
 } from "./action-checks";
-import { summarizeRunFailure } from "./sdk-error";
+import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import { getChatMcpUrl } from "./chat-mcp";
 import {
   buildAgentMessage,
@@ -1584,6 +1589,116 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
 type SessionRun = Awaited<ReturnType<AgentInstance["send"]>>;
 
+// ----------------- V0.13.x：run 网络断自动重连（用户拍板「重试 5 次、显示重连中」） -----------------
+
+const RECONNECT_MAX = 5;
+// 指数退避（毫秒）：网络波动多在几秒内恢复、前两次快试、后面拉长
+const RECONNECT_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
+
+/**
+ * 服务端凭据兜底（自动重连时没有 client bootArgs 可用）：直接读 config.json。
+ * 跟 client settings 同一份文件、apiKey / 默认模型 / git 凭据都在。
+ */
+const readServerCreds = async (): Promise<SessionCreds> => {
+  try {
+    const raw = await fs.readFile(
+      path.join(dataRoot(), "config.json"),
+      "utf-8",
+    );
+    const cfg = JSON.parse(raw) as {
+      apiKey?: string;
+      defaultModel?: ModelSelection;
+      gitHost?: string;
+      gitToken?: string;
+    };
+    return {
+      apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : undefined,
+      model: cfg.defaultModel?.id ? cfg.defaultModel : undefined,
+      gitHost: typeof cfg.gitHost === "string" ? cfg.gitHost : undefined,
+      gitToken: typeof cfg.gitToken === "string" ? cfg.gitToken : undefined,
+    };
+  } catch {
+    return {};
+  }
+};
+
+// 可中断 sleep（1s 分片）：重连退避期间用户点「停止」要立即生效、返回 true = 被取消
+const sleepWithCancel = async (
+  ms: number,
+  isCancelled: () => boolean,
+): Promise<boolean> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (isCancelled()) return true;
+    await new Promise((r) => setTimeout(r, Math.min(1_000, deadline - Date.now())));
+  }
+  return isCancelled();
+};
+
+/**
+ * run 网络类失败的自动重连：写「重连中 n/5」事件 → 退避 → Agent.resume 接回同一会话 →
+ * send 系统提示「从断点继续」→ 递归消费新 run（attempt 计数随 opts 传递、防无限）。
+ *
+ * @returns handled = 已接管（重连成功、新 run 消费完毕）；cancelled = 用户停止；
+ *          give-up = 不可重试 / 次数烧完（调用方走原报错路径）
+ */
+const tryAutoReconnect = async (
+  task: Task,
+  err: unknown,
+  opts: { errorActionId?: string; reconnectAttempt?: number },
+  isCancelled: () => boolean,
+): Promise<"handled" | "cancelled" | "give-up"> => {
+  const attempt = (opts.reconnectAttempt ?? 0) + 1;
+  if (attempt > RECONNECT_MAX) return "give-up";
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!isRetryableRunError(msg, err)) return "give-up";
+  if (isCancelled()) return "cancelled";
+  // 任务已终结（用户重连期间 finalize / 删除）不再折腾
+  const fresh = await getTask(task.id);
+  if (!fresh || fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
+    return "give-up";
+  }
+  await writeEventAndPublish(task.id, {
+    kind: "info",
+    actionId: opts.errorActionId,
+    text: `连接中断、正在自动重连（第 ${attempt}/${RECONNECT_MAX} 次）…`,
+    // 事件流按 reconnecting 渲染成过程行（spinner、同 thinking / 工具调用一档）
+    meta: { kind: "reconnecting", attempt, max: RECONNECT_MAX },
+  });
+  if (await sleepWithCancel(RECONNECT_BACKOFF_MS[attempt - 1], isCancelled)) {
+    return "cancelled";
+  }
+  // 旧 agent 连接已死：关内存会话但保留持久化锚点、Agent.resume 靠它接回同一会话
+  closeTaskSession(task.id, undefined, { reap: false, keepPersisted: true });
+  const creds = await readServerCreds();
+  const record = await resumeTaskSession(fresh, creds).catch(() => null);
+  if (!record) {
+    // resume 没成（多半仍断网）：算一次、继续下一轮退避
+    return tryAutoReconnect(fresh, err, { ...opts, reconnectAttempt: attempt }, isCancelled);
+  }
+  try {
+    // AgentSessionRecord.agent 是结构化最小面、这里收窄回完整实例（同 sendToTaskSession 口径）
+    const resumedAgent = record.agent as AgentInstance;
+    const run = await resumedAgent.send(
+      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续当前工作——已完成的部分不用重做；处理完按正常流程交卷 / 提问 / 结束回复。）",
+    );
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      actionId: opts.errorActionId,
+      text: `重连成功（第 ${attempt} 次）、AI 继续工作`,
+      meta: { kind: "reconnected", attempt },
+    });
+    await consumeSessionRun(fresh, resumedAgent, run, {
+      ...opts,
+      reconnectAttempt: attempt,
+    });
+    return "handled";
+  } catch (sendErr) {
+    // send 又失败（网络还没恢复）：继续下一轮
+    return tryAutoReconnect(fresh, sendErr, { ...opts, reconnectAttempt: attempt }, isCancelled);
+  }
+};
+
 // run 失败（SDK 抛错 / status=error）的统一收尾：标 error + 事件 + publish
 const handleRunFailure = async (
   taskId: string,
@@ -1645,7 +1760,12 @@ const consumeSessionRun = async (
   task: Task,
   agent: AgentInstance,
   run: SessionRun,
-  opts: { errorActionId?: string; questionRun?: boolean },
+  opts: {
+    errorActionId?: string;
+    questionRun?: boolean;
+    // V0.13.x 自动重连计数（tryAutoReconnect 递归时递增、防无限重连）
+    reconnectAttempt?: number;
+  },
 ): Promise<void> => {
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
@@ -1822,8 +1942,24 @@ const consumeSessionRun = async (
       const freshQ = await getTask(task.id);
       publish(task.id, { kind: "done", task: freshQ ?? task, ok: false });
     } else {
-      await handleRunFailure(task.id, opts.errorActionId, err);
-      closeTaskSession(task.id, agent.agentId);
+      // V0.13.x：网络类失败先自动重连（重试 5 次、事件流显示「重连中」）——
+      // 网络波动一下聊天就断、以前每次都要用户手动唤醒（用户拍板加的）
+      const outcome = cancelled
+        ? ("give-up" as const)
+        : await tryAutoReconnect(task, err, opts, () => cancelled);
+      if (outcome === "handled") {
+        // 重连成功、新 run 已在递归调用里消费完毕——这里什么都不用做
+      } else if (outcome === "cancelled") {
+        // 用户在重连期间点了停止：按停止语义收尾（不标 error）
+        await finalizeStaleActions(task.id, "cancelled");
+        const updated = await setTaskRunStatus(task.id, "idle");
+        if (updated) publish(task.id, { kind: "task", task: updated });
+        publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+        closeTaskSession(task.id, agent.agentId);
+      } else {
+        await handleRunFailure(task.id, opts.errorActionId, err);
+        closeTaskSession(task.id, agent.agentId);
+      }
     }
   } finally {
     runningTasks.delete(task.id);
@@ -1910,6 +2046,16 @@ const resumeTaskSession = async (
     );
     return record;
   } catch (err) {
+    // V0.13.x：网络类失败**不清锚点**——自动重连还要靠它再试；只有确定性失败
+    //（会话真没了 / 认证错）才清、防重启后 resume 回已死会话死循环
+    const m = err instanceof Error ? err.message : String(err);
+    if (isRetryableRunError(m, err)) {
+      console.warn(
+        `[task-runner] task=${task.id} Agent.resume 网络类失败（保留锚点、可重试）`,
+        err,
+      );
+      return null;
+    }
     console.warn(
       `[task-runner] task=${task.id} Agent.resume 失败（清锚点、降级 fresh agent）`,
       err,
