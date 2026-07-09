@@ -242,6 +242,10 @@ export const buildIdeLink = (
   pathLike: string,
   baseDir?: string,
   ide: JumpIde = "cursor",
+  opts?: {
+    /** 强制新窗口（开工作区目录用；文件跳转别传、应复用项目已开的窗口） */
+    newWindow?: boolean;
+  },
 ): string | null => {
   const target = resolveIdeTarget(pathLike, baseDir);
   if (!target) return null;
@@ -262,11 +266,14 @@ export const buildIdeLink = (
       ? `${ide}://open?file=${prefix}${encodedPath}&line=${line}`
       : `${ide}://open?file=${prefix}${encodedPath}`;
   }
-  // cursor / vscode 同一套 `<scheme>://file/<path>[:line]` 约定
+  // cursor / vscode 同一套 `<scheme>://file/<path>[:line]` 约定；
+  // windowId=_blank = VS Code 系 URL handler 的「新窗口」参数——不带的话打开目录
+  // 会把当前活跃窗口的工作区直接换掉（用户实测点了正干活的窗口没了）
   const scheme = ide === "vscode" ? "vscode" : "cursor";
+  const suffix = opts?.newWindow ? "?windowId=_blank" : "";
   return line !== undefined
-    ? `${scheme}://file${prefix}${encodedPath}:${line}`
-    : `${scheme}://file${prefix}${encodedPath}`;
+    ? `${scheme}://file${prefix}${encodedPath}:${line}${suffix}`
+    : `${scheme}://file${prefix}${encodedPath}${suffix}`;
 };
 
 /**

@@ -50,9 +50,13 @@ export const getIdeAnchorProps = (
   pathLike: string,
   baseDir: string | undefined,
   ide: JumpIde,
+  opts?: {
+    /** 强制新窗口（开工作区目录用）；文件跳转别传、复用项目已开的窗口 */
+    newWindow?: boolean;
+  },
 ): IdeAnchorProps | null => {
   if (JUMP_IDE_USES_PROTOCOL[ide]) {
-    const href = buildIdeLink(pathLike, baseDir, ide);
+    const href = buildIdeLink(pathLike, baseDir, ide, opts);
     return href ? { href } : null;
   }
   const target = resolveIdeTarget(pathLike, baseDir);

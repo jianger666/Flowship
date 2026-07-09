@@ -155,7 +155,11 @@ export const WorkspaceActions = ({ task }: Props) => {
           JetBrains 系走 onClick 后端拉起（getIdeAnchorProps 内部切换）。
           多仓逐仓一个按钮（各开各的项目窗口）、单仓不带短名后缀 */}
       {ideTargets.map((t) => {
-        const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor");
+        // newWindow：开的是整个工作区目录、必须新窗口——cursor:// 默认会把当前活跃
+        // 窗口的工作区直接换掉（用户实测正干活的窗口没了）
+        const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor", {
+          newWindow: true,
+        });
         if (!anchor) return null;
         return (
           <Button
