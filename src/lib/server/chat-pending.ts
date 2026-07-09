@@ -373,14 +373,16 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
     return lines.join("\n");
   }
   if (msg.kind === "question") {
-    // 「问一问」：行为约束内联在消息里（比只靠 prompt 教稳）——只答不动手、答完自然结束
+    // 「跟 AI 说」：行为约束内联在消息里（比只靠 prompt 教稳）。
+    // V0.13.x 放开「只答不动手」（用户拍板「纯答疑限制太死」）：疑问就答、
+    // 要改就直接改——只是不推进任务链（不调 submit_work / submit_mr）
     const lines: string[] = [
       SIGNALS.USER_QUESTION,
       "",
       msg.text,
       ...attachmentSections(msg),
       "",
-      "（这是任务过程中的**纯提问**、不是修改要求也不是推进指令：直接回答即可、不要改任何代码 / 文件、不要调 submit_work / submit_mr 等动作工具、回答完自然结束本轮回复。任务仍停在原地等用户后续操作。）",
+      "（这是任务过程中用户的插话、不是推进指令：是疑问就直接回答；是修改要求就直接动手改（改完说明改了什么）。**不要**调 submit_work / submit_mr 等推进类工具——任务进度停在原地、等用户自己推进。处理完自然结束本轮回复。）",
     ];
     return lines.join("\n");
   }

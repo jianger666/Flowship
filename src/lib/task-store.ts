@@ -558,14 +558,14 @@ export const submitActionAck = async (
 };
 
 /**
- * V0.11.9 任务内「问一问」：纯提问送给存活会话（只答不动手、不新建 action、进度不动）。
+ * V0.11.9 任务内「跟 AI 说」：消息送给存活会话（疑问就答 / 要改就改、不新建 action、进度不动）。
  * bootArgs 无脑带上（服务重启 / 空闲回收后靠它 Agent.resume 接回会话）。
  */
 export const submitTaskQuestion = async (
   taskId: string,
   text: string,
   images?: ImagePayload[],
-  // 显式指定模型（V0.11.9）：传了 = 起一次性答疑 agent 用它答、不续会话（会话模型换不了）
+  // 显式指定模型（V0.11.9）：传了 = 不续会话（会话模型换不了）、按后端分流换模型处理
   forceModel?: ModelSelection,
 ): Promise<Task> => {
   const s = getSettings();

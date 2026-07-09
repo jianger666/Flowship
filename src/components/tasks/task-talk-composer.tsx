@@ -7,10 +7,10 @@
  * 一个输入条、系统按任务状态自动懂语境：
  * - 当前产出在等审阅（awaiting_ack）→ 按「再聊聊」送（[ACTION_ACK revise]、
  *   agent 自己二分类：纯疑问就答疑、改动意见就改完重新交卷）
- * - 其他时刻、会话在 → 纯提问（[USER_QUESTION]、只答不动手不动任务进度）
+ * - 其他时刻、会话在 → 插话（[USER_QUESTION]、疑问就答 / 要改就改、只是不推进任务链——V0.13.x 放开只读限制）
  * - 会话接不回 + 当前 action 停在半路（error / cancelled）→ **唤醒模式**（服务端
  *   起新 agent 原地续同一个 action、用户消息当最新指示、不多一条 action 链——旧「重启当前阶段」的替身）
- * - 会话接不回 + action 已完结 / 显式选了模型 → 一次性答疑 agent（只答不动手）
+ * - 会话接不回 + action 已完结 → 一次性临时 agent（疑问就答 / 小改直接改、大改引导走推进）
  *
  * 支持贴图（粘贴 / 附图按钮）；Cmd/Ctrl+J 聚焦（沿用原再聊聊快捷键）。
  * agent 正在跑时禁用；任务终态整条隐藏。
@@ -51,7 +51,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   const [boxHeight, setBoxHeight] = useState<number | null>(null);
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
-  // 显式指定的答疑模型（id 空 = 跟随会话；选了 = 一次性答疑 agent 用它答）
+  // 显式指定的模型（id 空 = 跟随会话；选了 = 换这个模型处理本条消息）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const submitShortcut = useSubmitShortcut();
   // 模型列表：打开选择器时按需拉（SWR 缓存、不重复打网络）
@@ -90,7 +90,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     try {
       const images = attach.toUploadPayload();
       // 等审阅且没显式换模型 → revise 通道（agent 二分类：问就答、改就改完重新交卷）；
-      // 否则 → 问一问通道（只答不动手；显式选模型 = 一次性答疑 agent）
+      // 否则 → 插话通道（疑问就答 / 要改就改、不推进任务链；显式选模型 = 换模型处理）
       const updated =
         canAck && !pickedModel.id
           ? await submitActionAck(task.id, currentAction!.id, "revise", {
@@ -196,7 +196,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
           )}
         />
 
-        {/* footer：左 = 答疑模型（默认跟随会话、下拉里可随时点回）、右 = 附图 + 发送 */}
+        {/* footer：左 = 模型（默认跟随会话、下拉里可随时点回）、右 = 附图 + 发送 */}
         <div className="flex items-center justify-between gap-2 px-2 pb-1.5 pt-0.5">
           <ModelSelect
             models={models}

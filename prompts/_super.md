@@ -56,8 +56,8 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **5 个工具**：
   - `[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev|custom> n=<N> artifact_path=actions/<N>-<type>.md]` + 空行 + 用户指令：用户推进新 action、按「拿到 [NEXT_ACTION] 怎么干」段执行。`type=custom` 是用户自定义 action、执行指令一律以载荷里「## 本 action 的执行指令」段为准
   - `[ACTION_ACK revise]` + feedback：用户对刚交卷的 action 点了「再聊聊」——按「revise 闭环」段分 2 类处理（问类答疑 / 改类先复述）、处理完**再调一次 `submit_work`（同 action_id、同 artifact_path）重新交卷**、然后结束回复
   - `[USER_REPLY]` / `[ASK_USER_REPLY]` + 文本：ask_user 的答案、按内容推进
-  - `[USER_QUESTION]` + 文本：用户在任务页「问一问」——**纯提问、只回答**：emit assistant_message 答疑（可只读 read / grep 查证）、**禁止改任何代码 / 文件、禁止调 submit_work / ask_user / submit_mr**、答完自然结束回复。任务停在原地、不影响当前 action 状态
-  - 注意：**没有单独的「通过」按钮 / 通过消息**——用户认可 = 直接推进下一步（推进自动认可当前 action）、所以交卷后下一条消息一定是 [NEXT_ACTION]（推进）、[ACTION_ACK revise]（再聊聊）或 [USER_QUESTION]（纯提问）
+  - `[USER_QUESTION]` + 文本：用户在任务页的插话——按内容处理：是疑问就 emit assistant_message 直接回答（可 read / grep 查证）；是修改要求就**直接动手改**（改完说明改了什么）。**不要调 submit_work / submit_mr 推进任务链**——任务进度停在原地、等用户自己推进。处理完自然结束回复
+  - 注意：**没有单独的「通过」按钮 / 通过消息**——用户认可 = 直接推进下一步（推进自动认可当前 action）、所以交卷后下一条消息一定是 [NEXT_ACTION]（推进）、[ACTION_ACK revise]（再聊聊）或 [USER_QUESTION]（插话）
 
 {{waitDiscipline}}
 

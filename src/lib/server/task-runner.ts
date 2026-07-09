@@ -2064,20 +2064,23 @@ export const startOneShotQuestion = (
       console.log(
         `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${agent.agentId}`,
       );
+      // V0.13.x 放开「只读答疑」（用户拍板「纯答疑限制太死」）：疑问就答、要改就改——
+      // 只是不推进任务链（本 agent 没有 action 上下文、大改动引导用户走推进）
       const prompt = [
-        `你是任务「${task.title}」的答疑助手。用户在任务页问了一个问题、你只负责回答、不推进任务。`,
+        `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
         "",
         "# 任务背景（按需 read / grep、先查再答）",
         `- 任务事件日志（完整历史）：${getEventsLogPath(task.id)}`,
         `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(task.id)}`,
         `- 工作目录：${effectiveCwd}`,
         "",
-        "# 用户的问题",
+        "# 用户的话",
         buildAgentMessage({ kind: "question", text: questionText, imagePaths }),
         "",
-        "# 铁律",
-        "- 只读答疑：禁止修改任何文件、禁止 git 写操作",
-        "- 直接回答、答完自然结束回复",
+        "# 边界",
+        "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
+        "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
+        "- 不要提交 commit / 提 MR、处理完自然结束回复",
       ].join("\n");
       const run = await agent.send(prompt);
       // questionRun：任何出口（答完 / 被停 / 失败）都不动 action、runStatus 由 consume 统一归位

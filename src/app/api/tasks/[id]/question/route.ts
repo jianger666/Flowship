@@ -2,7 +2,7 @@
  * POST /api/tasks/[id]/question——任务内「问一问」（V0.11.9）
  *
  * 用户痛点：想就任务问点问题、以前必须推进一个具体 action 再嘱咐「只回答别改代码」。
- * 本路由把纯提问 `agent.send([USER_QUESTION]…)` 给存活会话（消息内联「只答不动手、
+ * 本路由把用户插话 `agent.send([USER_QUESTION]…)` 给存活会话（消息内联「疑问就答 / 要改就改、
  * 答完自然结束」约束）、不新建 action、不动任务进度：
  * - 回答期间 runStatus=running（UI 显示 agent 在说话）
  * - 回答完 run 自然结束、consumeSessionRun 按最后 action 状态归位
