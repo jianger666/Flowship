@@ -39,6 +39,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Separator } from "@/components/ui/separator";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import { pickNativePaths } from "@/lib/native-picker";
 import { pathBasename } from "@/lib/path-utils";
 import {
@@ -58,6 +59,7 @@ import {
   EventRow,
   StreamingAssistantRow,
 } from "./event-stream/rows";
+import { AskUserInlineCard } from "./ask-user-inline";
 
 // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
 // kind 用未出现在 EventKind 里的字面量、做 discriminated union 区分
@@ -201,6 +203,13 @@ const EventStreamImpl = ({
     }
     return merged;
   }, [task.events, streamingText, isRunning]);
+
+  // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
+  // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
+  const pendingAskEvent = useMemo(
+    () => findPendingAskEvent(task.events),
+    [task.events],
+  );
 
   // 流式回复自动贴底（V0.8.3 修）：
   // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
@@ -395,7 +404,13 @@ const EventStreamImpl = ({
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
                 ) : item.kind === "ask_user_request" ? (
-                  <AskUserRequestRow ev={item} task={task} />
+                  // V0.13.x：当前待答的 ask 直接内联答题卡（原模态弹窗淘汰、用户拍板
+                  // 「弹窗挡整屏不合理」）；已答 / 已作废走回放卡
+                  pendingAskEvent?.id === item.id ? (
+                    <AskUserInlineCard task={task} ev={item} />
+                  ) : (
+                    <AskUserRequestRow ev={item} task={task} />
+                  )
                 ) : (
                   <EventRow ev={item} taskId={task.id} task={task} variant={variant} />
                 )}

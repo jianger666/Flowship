@@ -22,7 +22,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
-import { AskUserDialog } from "@/components/tasks/ask-user-dialog";
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
 import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
 import { ChatWorkdirPicker } from "@/components/tasks/chat-workdir-picker";
@@ -256,8 +255,7 @@ export const ChatView = ({
         />
       </div>
 
-      {/* agent 误调 ask_user 时兜底（chat 模式 prompt 已禁、走这里基本不该发生） */}
-      <AskUserDialog task={task} />
+      {/* agent 误调 ask_user 的兜底：EventStream 内已分流内联答题卡（V0.13.x）、无需弹窗 */}
     </div>
   );
 };

@@ -309,6 +309,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - app 自管 skills 目录 `<dataRoot>/skills/<name>/SKILL.md`（`app-skills.ts`）、loadSkills 纳入扫描（优先级：平台内置 > 自管 > Cursor 全局 > 飞书 CLI）
   - 设置页新增 Skills 卡（`skills-card.tsx`）：列全部来源（带标签）、自管可新增 / 编辑 / 删除（编辑 SKILL.md、CodeEditor 加 markdown 高亮）、「从 Cursor 导入」勾选 dialog（**整目录拷贝**、含脚本附属文件）；API：GET/POST/DELETE `/api/skills` + `/api/skills/content` + `/api/skills/import`
   - MCP 卡「常用 MCP」独立区块砍掉（用户：太长）——常用开关 + 健康徽标 + OAuth 授权全并进条目行内、`HealthBadge` 从 mcp-toggle-list export 复用
+- **ask_user 弹窗 → 事件流内联答题卡**（同日、用户拍板「弹窗挡整屏不合理」）：模态 AskUserDialog 删除（旧 wait_for_user 阻塞协议遗产）、答题逻辑整体搬进 `ask-user-inline.tsx`（AskUserInlineCard）；event-stream 分流：`findPendingAskEvent` 命中的 ask 行渲染内联卡（选项 / 自定义 / 每题贴图 / 稍后再补充 / 快捷键全保留）、已答 / 作废走 AskUserRequestRow 回放；失效态（runStatus=error）内联警示不再需要 dismiss；chat-view 的兜底弹窗一并删（EventStream 内已覆盖）。对齐 Cursor / Claude Code 的内联提问形态、答题时能看事件流上下文
 
 ### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
 

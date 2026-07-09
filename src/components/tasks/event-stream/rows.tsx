@@ -644,15 +644,15 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
             ? "这组提问已失效"
             : answered
               ? `已回答 ${questionsCount} 个问题`
-              : `AI 正在弹窗里问你 ${questionsCount} 个问题`}
+              : `AI 问了 ${questionsCount} 个问题`}
         </span>
         <span className="text-muted-foreground/70">{formatTs(ev.ts)}</span>
       </div>
 
-      {/* 未答（且未失效）：占位提示、不放交互、引导用户看弹窗 */}
+      {/* 未答且未失效但没走内联卡（非最新一条的脏数据残留）：中性占位、不放交互 */}
       {!answered && !superseded && (
         <div className="rounded-md border border-dashed bg-card/40 px-3 py-2 text-xs text-muted-foreground">
-          请在屏幕中央的弹窗里答完所有问题、答完后这里会显示完整 Q&A 历史
+          这组提问未被回答（已被更新的提问顶替）
         </div>
       )}
 
