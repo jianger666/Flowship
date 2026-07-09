@@ -30,10 +30,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { renderBranchName } from "@/lib/branch-template";
-import { JUMP_IDE_LABEL, type JumpIde } from "@/lib/types";
-
-// 全部候选工具（探测结果没回来前的兜底顺序）
-const ALL_IDES: JumpIde[] = ["cursor", "vscode", "idea", "webstorm"];
+import { JUMP_IDES, JUMP_IDE_LABEL, type JumpIde } from "@/lib/types";
 
 interface UserProfileCardProps {
   username: string;
@@ -114,7 +111,7 @@ export const UserProfileCard = ({
             value={jumpIde}
             onValueChange={(v) =>
               onJumpIdeChange(
-                ALL_IDES.includes(v as JumpIde) ? (v as JumpIde) : "cursor",
+                JUMP_IDES.includes(v as JumpIde) ? (v as JumpIde) : "cursor",
               )
             }
           >
@@ -122,18 +119,18 @@ export const UserProfileCard = ({
               <SelectValue>{JUMP_IDE_LABEL[jumpIde]}</SelectValue>
             </SelectTrigger>
             <SelectContent>
-              {ALL_IDES.map((id) => {
-                // 探测结果回来后：未装的置灰（当前已选的不置灰、免得显示成锁死态）
-                const unavailable =
-                  availableIdes !== null &&
-                  !availableIdes.has(id) &&
-                  id !== jumpIde;
-                return (
-                  <SelectItem key={id} value={id} disabled={unavailable}>
-                    {JUMP_IDE_LABEL[id]}
-                  </SelectItem>
-                );
-              })}
+              {JUMP_IDES.filter(
+                // 只列本机装了的（用户拍板「没有的就不展示」）；当前已选的即使没探到也列
+                //（免得下拉里连当前值都找不到）；探测没回来前先全列
+                (id) =>
+                  availableIdes === null ||
+                  availableIdes.has(id) ||
+                  id === jumpIde,
+              ).map((id) => (
+                <SelectItem key={id} value={id}>
+                  {JUMP_IDE_LABEL[id]}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>

@@ -299,6 +299,11 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.10（未发版、攒着）：IDE 探测扩到 10 个 + 设置页只列已装（2026-07-09、用户点名）
+
+- `JumpIde` 扩：VS Code 系（Cursor / VS Code / **Windsurf / Trae**）+ JetBrains 全家（IDEA / WebStorm / **PyCharm / GoLand / PhpStorm / Android Studio**、Android Studio win 装 `Program Files\Android` 下 exe=studio64 单独配）；探测改 `IDE_SPECS` 配置表驱动（ide-tools.ts）、加新 IDE = 加一行配置；候选清单单一来源 `JUMP_IDES`（types.ts）、组件 / route / normalize 全引它
+- 设置页下拉**只列本机探测到的**（用户拍板「没有的就不展示」；当前已选的即使没探到也列、防下拉找不到当前值）、「（未检测到）」后缀已删
+
 ### V0.12 P0（进行中）：内置飞书官方 CLI（2026-07-08 晚、用户拍板「内置两套 CLI、不强迫用户配 MCP、尽可能都接进来」）
 
 - **两个官方 CLI**：lark-cli（larksuite/cli、飞书开放平台 200+ 命令 + 26 官方 Agent Skills）+ meegle（larksuite/meegle-cli、飞书项目 16 域 50+ 命令）、都 MIT

@@ -11,11 +11,11 @@
 
 import { NextResponse } from "next/server";
 import { openInIde } from "@/lib/server/ide-tools";
-import type { JumpIde } from "@/lib/types";
+import { JUMP_IDES, type JumpIde } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-const VALID_IDES = new Set<string>(["cursor", "vscode", "idea", "webstorm"]);
+const VALID_IDES = new Set<string>(JUMP_IDES);
 
 export const POST = async (req: Request) => {
   let body: { ide?: string; path?: string; line?: number };

@@ -19,6 +19,7 @@
  */
 
 import { DEFAULT_BRANCH_TEMPLATE } from "./branch-template";
+import { JUMP_IDES } from "./types";
 import type {
   ActionLayoutPref,
   FeAiFlowSettings,
@@ -92,9 +93,7 @@ const normalizeSettings = (
     // V0.6 加：username 串行存档可能丢、强转 string 兜底
     username: typeof parsed.username === "string" ? parsed.username : "",
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
-    jumpIde: (["cursor", "vscode", "idea", "webstorm"] as const).includes(
-      parsed.jumpIde as never,
-    )
+    jumpIde: JUMP_IDES.includes(parsed.jumpIde as never)
       ? (parsed.jumpIde as FeAiFlowSettings["jumpIde"])
       : "cursor",
     // 提交快捷键：旧配置没有 / 手改坏时回退当前默认行为

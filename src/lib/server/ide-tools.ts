@@ -44,8 +44,134 @@ interface DetectResult {
 const IDE_NAMES: Record<JumpIde, string> = {
   cursor: "Cursor",
   vscode: "VS Code",
+  windsurf: "Windsurf",
+  trae: "Trae",
   idea: "IDEA",
   webstorm: "WebStorm",
+  pycharm: "PyCharm",
+  goland: "GoLand",
+  phpstorm: "PhpStorm",
+  "android-studio": "Android Studio",
+};
+
+/**
+ * 每个 IDE 的探测配置（V0.11.10 改配置驱动、从写死四个扩到 10 个）：
+ * - family=vscode：VS Code 系（Cursor / VS Code / Windsurf / Trae）——win 装在
+ *   `%LOCALAPPDATA%\Programs\<dir>` 或 Program Files、打开参数 `-g path:line`
+ * - family=jetbrains：IntelliJ 平台系——win 装目录带版本号前缀匹配、支持 Toolbox
+ *   两代安装位、打开参数 `--line N path`
+ */
+interface IdeSpec {
+  family: "vscode" | "jetbrains";
+  /** mac /Applications 下的 .app 名候选（不带 .app 后缀） */
+  macApps: string[];
+  /** PATH 上的命令名候选 */
+  pathBins: string[];
+  /** vscode 系：win 安装目录名候选（Programs / Program Files 下） */
+  winProgramDirs?: string[];
+  /** vscode 系：win 可执行文件名 */
+  winExe?: string;
+  /** jetbrains 系：win 安装目录前缀（带版本号、前缀匹配） */
+  winDirPrefix?: string;
+  /** jetbrains 系：bin/ 下的可执行文件名 */
+  winExeName?: string;
+  /** jetbrains 系：Toolbox scripts 目录里的脚本名 */
+  toolboxScript?: string;
+  /** jetbrains 系：win 额外的安装父目录（默认只扫 Programs + Program Files\JetBrains） */
+  winExtraParents?: string[];
+}
+
+const IDE_SPECS: Record<JumpIde, IdeSpec> = {
+  cursor: {
+    family: "vscode",
+    macApps: ["Cursor"],
+    pathBins: ["cursor"],
+    winProgramDirs: ["cursor"],
+    winExe: "Cursor.exe",
+  },
+  vscode: {
+    family: "vscode",
+    macApps: ["Visual Studio Code"],
+    pathBins: ["code"],
+    winProgramDirs: ["Microsoft VS Code"],
+    winExe: "Code.exe",
+  },
+  windsurf: {
+    family: "vscode",
+    macApps: ["Windsurf"],
+    pathBins: ["windsurf"],
+    winProgramDirs: ["Windsurf"],
+    winExe: "Windsurf.exe",
+  },
+  trae: {
+    family: "vscode",
+    macApps: ["Trae"],
+    pathBins: ["trae"],
+    winProgramDirs: ["Trae"],
+    winExe: "Trae.exe",
+  },
+  idea: {
+    family: "jetbrains",
+    macApps: [
+      "IntelliJ IDEA",
+      "IntelliJ IDEA Ultimate",
+      "IntelliJ IDEA CE",
+      "IntelliJ IDEA Community Edition",
+    ],
+    pathBins: ["idea"],
+    winDirPrefix: "IntelliJ IDEA",
+    winExeName: "idea64.exe",
+    toolboxScript: "idea",
+  },
+  webstorm: {
+    family: "jetbrains",
+    macApps: ["WebStorm"],
+    pathBins: ["webstorm"],
+    winDirPrefix: "WebStorm",
+    winExeName: "webstorm64.exe",
+    toolboxScript: "webstorm",
+  },
+  pycharm: {
+    family: "jetbrains",
+    macApps: [
+      "PyCharm",
+      "PyCharm Professional",
+      "PyCharm Community Edition",
+      "PyCharm CE",
+    ],
+    pathBins: ["pycharm"],
+    winDirPrefix: "PyCharm",
+    winExeName: "pycharm64.exe",
+    toolboxScript: "pycharm",
+  },
+  goland: {
+    family: "jetbrains",
+    macApps: ["GoLand"],
+    pathBins: ["goland"],
+    winDirPrefix: "GoLand",
+    winExeName: "goland64.exe",
+    toolboxScript: "goland",
+  },
+  phpstorm: {
+    family: "jetbrains",
+    macApps: ["PhpStorm"],
+    pathBins: ["phpstorm"],
+    winDirPrefix: "PhpStorm",
+    winExeName: "phpstorm64.exe",
+    toolboxScript: "phpstorm",
+  },
+  // Android Studio 是 IntelliJ 平台但 win 装在 Program Files\Android 下、exe 叫 studio64
+  "android-studio": {
+    family: "jetbrains",
+    macApps: ["Android Studio"],
+    pathBins: ["studio"],
+    winDirPrefix: "Android Studio",
+    winExeName: "studio64.exe",
+    toolboxScript: "studio",
+    winExtraParents: [
+      path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Android"),
+    ],
+  },
 };
 
 // ---------- 平台探测 ----------
@@ -104,46 +230,54 @@ const findOnPath = async (bins: string[]): Promise<string | null> => {
   return null;
 };
 
-// JetBrains 系（idea / webstorm）探测
-const detectJetBrains = async (
-  dirPrefix: string, // "IntelliJ IDEA" / "WebStorm"
-  macApps: string[],
-  winExe: string, // "idea64.exe" / "webstorm64.exe"
-  pathBins: string[], // ["idea"] / ["webstorm"]
-  toolboxScript: string, // "idea" / "webstorm"
-): Promise<DetectResult> => {
+// 按 spec 探测单个 IDE（family 决定 win 侧扫哪些目录、mac / PATH 两层通用）
+const detectOne = async (spec: IdeSpec): Promise<DetectResult> => {
   if (process.platform === "darwin") {
-    const app = findMacApp(macApps);
+    const app = findMacApp(spec.macApps);
     if (app.available) return app;
   }
   if (process.platform === "win32") {
     const local = process.env.LOCALAPPDATA ?? "";
-    const exe = findWinExeInDirs(
-      [
-        // Toolbox 新式安装位（2023+ 默认）：%LOCALAPPDATA%\Programs\IntelliJ IDEA Ultimate\bin\
-        local ? path.join(local, "Programs") : "",
-        // 直接安装器默认位：C:\Program Files\JetBrains\IntelliJ IDEA 2024.x\bin\
-        path.join(process.env.ProgramFiles ?? "C:\\Program Files", "JetBrains"),
-      ],
-      dirPrefix,
-      path.join("bin", winExe),
-    );
-    if (exe) return { available: true, exec: exe };
-    // Toolbox 旧式 shell scripts：%LOCALAPPDATA%\JetBrains\Toolbox\scripts\idea.cmd
-    if (local) {
-      const script = path.join(
-        local,
-        "JetBrains",
-        "Toolbox",
-        "scripts",
-        `${toolboxScript}.cmd`,
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    if (spec.family === "vscode") {
+      for (const dir of spec.winProgramDirs ?? []) {
+        const candidates = [
+          local ? path.join(local, "Programs", dir, spec.winExe!) : "",
+          path.join(programFiles, dir, spec.winExe!),
+        ].filter(Boolean);
+        for (const p of candidates) {
+          if (existsSync(p)) return { available: true, exec: p };
+        }
+      }
+    } else {
+      const exe = findWinExeInDirs(
+        [
+          // Toolbox 新式安装位（2023+ 默认）：%LOCALAPPDATA%\Programs\IntelliJ IDEA Ultimate\bin\
+          local ? path.join(local, "Programs") : "",
+          // 直接安装器默认位：C:\Program Files\JetBrains\IntelliJ IDEA 2024.x\bin\
+          path.join(programFiles, "JetBrains"),
+          ...(spec.winExtraParents ?? []),
+        ],
+        spec.winDirPrefix!,
+        path.join("bin", spec.winExeName!),
       );
-      if (existsSync(script)) {
-        return { available: true, exec: script, isCmdScript: true };
+      if (exe) return { available: true, exec: exe };
+      // Toolbox 旧式 shell scripts：%LOCALAPPDATA%\JetBrains\Toolbox\scripts\idea.cmd
+      if (local && spec.toolboxScript) {
+        const script = path.join(
+          local,
+          "JetBrains",
+          "Toolbox",
+          "scripts",
+          `${spec.toolboxScript}.cmd`,
+        );
+        if (existsSync(script)) {
+          return { available: true, exec: script, isCmdScript: true };
+        }
       }
     }
   }
-  const onPath = await findOnPath(pathBins);
+  const onPath = await findOnPath(spec.pathBins);
   if (onPath) {
     return {
       available: true,
@@ -154,34 +288,6 @@ const detectJetBrains = async (
   return { available: false };
 };
 
-// VS Code 系（cursor / vscode）探测——只探「装没装」（跳转走协议、不需要 exec）
-const detectVsCodeFamily = async (
-  macApps: string[],
-  winProgramDirs: string[], // %LOCALAPPDATA%\Programs 下的目录名
-  winExe: string,
-  pathBins: string[],
-): Promise<DetectResult> => {
-  if (process.platform === "darwin") {
-    const app = findMacApp(macApps);
-    if (app.available) return app;
-  }
-  if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA ?? "";
-    for (const dir of winProgramDirs) {
-      const candidates = [
-        local ? path.join(local, "Programs", dir, winExe) : "",
-        path.join(process.env.ProgramFiles ?? "C:\\Program Files", dir, winExe),
-      ].filter(Boolean);
-      for (const p of candidates) {
-        if (existsSync(p)) return { available: true, exec: p };
-      }
-    }
-  }
-  const onPath = await findOnPath(pathBins);
-  if (onPath) return { available: true, exec: onPath };
-  return { available: false };
-};
-
 // ---------- 探测入口（缓存 60s） ----------
 
 let cache: { at: number; results: Record<JumpIde, DetectResult> } | null = null;
@@ -189,24 +295,11 @@ const CACHE_TTL_MS = 60_000;
 
 const detectAll = async (): Promise<Record<JumpIde, DetectResult>> => {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.results;
-  const [cursor, vscode, idea, webstorm] = await Promise.all([
-    detectVsCodeFamily(["Cursor"], ["cursor"], "Cursor.exe", ["cursor"]),
-    detectVsCodeFamily(
-      ["Visual Studio Code"],
-      ["Microsoft VS Code"],
-      "Code.exe",
-      ["code"],
-    ),
-    detectJetBrains(
-      "IntelliJ IDEA",
-      ["IntelliJ IDEA", "IntelliJ IDEA Ultimate", "IntelliJ IDEA CE", "IntelliJ IDEA Community Edition"],
-      "idea64.exe",
-      ["idea"],
-      "idea",
-    ),
-    detectJetBrains("WebStorm", ["WebStorm"], "webstorm64.exe", ["webstorm"], "webstorm"),
-  ]);
-  const results: Record<JumpIde, DetectResult> = { cursor, vscode, idea, webstorm };
+  const ids = Object.keys(IDE_SPECS) as JumpIde[];
+  const detected = await Promise.all(ids.map((id) => detectOne(IDE_SPECS[id])));
+  const results = Object.fromEntries(
+    ids.map((id, i) => [id, detected[i]]),
+  ) as Record<JumpIde, DetectResult>;
   cache = { at: Date.now(), results };
   // 探测结果落日志（同事机器排查「点了没反应」全靠这行——exec 指到哪一眼看清）
   console.log(
@@ -259,7 +352,7 @@ export const openInIde = async (
   }
 
   // 参数拼法：JetBrains `--line N <path>`；VS Code 系 `-g <path>:N`
-  const isVsCodeFamily = ide === "cursor" || ide === "vscode";
+  const isVsCodeFamily = IDE_SPECS[ide].family === "vscode";
   const args: string[] = [];
   if (isVsCodeFamily) {
     args.push("-g", line ? `${absPath}:${line}` : absPath);

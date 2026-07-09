@@ -80,28 +80,54 @@ export interface PreviewSlotStatus {
  * - cursor：`cursor://file/<path>:<line>`
  * - idea：`idea://open?file=<path>&line=<line>`（需装 JetBrains Toolbox 或 IDE 自带协议）
  */
-// V0.11.8 从写死 cursor/idea 扩成四个、设置页按后端探测结果动态列（未装的置灰）
-export type JumpIde = "cursor" | "vscode" | "idea" | "webstorm";
+// V0.11.8 从写死 cursor/idea 扩成动态列表（设置页按后端探测结果只列已装的）；
+// V0.11.10 再扩 JetBrains 全家桶 + VS Code 系分叉（用户点名「多针对几个常用的」）
+export type JumpIde =
+  | "cursor"
+  | "vscode"
+  | "windsurf"
+  | "trae"
+  | "idea"
+  | "webstorm"
+  | "pycharm"
+  | "goland"
+  | "phpstorm"
+  | "android-studio";
 
 export const JUMP_IDE_LABEL: Record<JumpIde, string> = {
   cursor: "Cursor",
   vscode: "VS Code",
+  windsurf: "Windsurf",
+  trae: "Trae",
   idea: "IDEA",
   webstorm: "WebStorm",
+  pycharm: "PyCharm",
+  goland: "GoLand",
+  phpstorm: "PhpStorm",
+  "android-studio": "Android Studio",
 };
+
+/** 全部候选（顺序 = 设置页下拉顺序）、单一来源、别在组件 / route 里再抄一份 */
+export const JUMP_IDES = Object.keys(JUMP_IDE_LABEL) as JumpIde[];
 
 /**
  * 跳转走浏览器协议（deep link）还是后端拉起（V0.11.8）：
  * - cursor / vscode：安装器可靠注册协议、deep link 直开（零往返、体验最好）
- * - JetBrains 系：`idea://` 只有 JetBrains Toolbox 会注册、直接装 IDEA 的机器点了弹
- *   「找不到应用」（用户同事 Windows 实测）——改走 POST /api/system/open-in-ide、
- *   后端探测安装位置直接 spawn 可执行文件、不依赖协议
+ * - 其余（JetBrains 系 / Windsurf / Trae）：协议注册不可靠（`idea://` 只有 Toolbox 会注册、
+ *   直装 IDEA 的机器点了弹「找不到应用」、同事 Windows 实测）——走 POST
+ *   /api/system/open-in-ide、后端探测安装位置直接 spawn 可执行文件、不依赖协议
  */
 export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
   cursor: true,
   vscode: true,
+  windsurf: false,
+  trae: false,
   idea: false,
   webstorm: false,
+  pycharm: false,
+  goland: false,
+  phpstorm: false,
+  "android-studio": false,
 };
 
 export type SubmitShortcut = "mod-enter" | "enter";
