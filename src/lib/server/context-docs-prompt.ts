@@ -2,7 +2,7 @@
  * 渲染「任务上下文文档」段落、注入 agent 初始 prompt
  *
  * 抽出来给 plan-runner + chat-runner 共用、保证两边对 contextDocs 的呈现方式一致：
- *   - URL / path：只列出元信息、让 agent 按需拉（feishu-mcp / fetch / `read` 工具）
+ *   - URL / path：只列出元信息、让 agent 按需拉（飞书 MCP 或内置 CLI / fetch / `read` 工具）
  *   - text：≤ 1000 字默认全 inject、> 1000 字截断（信息保真要求）
  *   - image（V0.6.0.1）：列绝对路径、agent 用 `read` 工具读、SDK 自动转 vision
  */

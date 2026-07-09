@@ -90,7 +90,7 @@
 - §5「Task 拆分」：执行顺序 + task 自带的验收点（验收点直接对应每个 task、不再有单独的「验收对照」表）
 - §6「待澄清 / 不确定项」：用户 deferred 或答「你定」按 default 走的、本 action 实施时按 plan 的 default 走、有阻塞才 ask_user
 
-> **PRD / 飞书原文需要现查时**：plan 不复述 PRD、所以业务背景细节直接看 SDK Run 上下文里 plan agent 已经读过的 contextDocs；找不到时用 `feishu-mcp` / `feishu-project-mcp` 再拉一次（少量 token、可接受）。
+> **PRD / 飞书原文需要现查时**：plan 不复述 PRD、所以业务背景细节直接看 SDK Run 上下文里 plan agent 已经读过的 contextDocs；找不到时用可用的飞书工具（`feishu-mcp` / `feishu-project-mcp`、没配 MCP 就用内置 `lark-cli` / `meegle` CLI）再拉一次（少量 token、可接受）。
 
 ### 2. 验证仓库脚本（编译 / 类型检查 / lint）
 

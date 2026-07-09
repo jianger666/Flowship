@@ -730,7 +730,7 @@ export type RunStatus = "idle" | "running" | "awaiting_user" | "error";
 //
 // 用户在任务详情页随时加 / 删上下文（飞书文档 URL / 本地路径 / 自由文本 / 截图）、
 // agent 在 super-prompt 里看到清单、但内容不全量 inject：
-//  - url 类型：agent 用 feishu-mcp / fetch 工具按需拉
+//  - url 类型：agent 用飞书工具（MCP / 内置 CLI）/ fetch 按需拉
 //  - path 类型：agent 用 SDK 内置 `read` 工具按需读
 //  - text 类型：内容 ≤ 1000 字默认直接 inject、> 1000 字截断
 //  - image 类型（V0.6.0.1）：content 是图片绝对路径、agent 用 `read` 工具读、SDK 自动转 vision

@@ -55,14 +55,17 @@ import {
 
 const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
 
-// task 模式创建强制依赖的飞书 MCP——按域名认、不认 key 名（别人把 key 叫 lark-mcp、
-// my-feishu 也能识别、只要它连的是飞书）。整个「需求 → PR」流程的命脉：plan 拉 story /
-// build 摸需求 / ship @ 测试人员全靠它。chat 模式不强制（自由对话不依赖飞书）。
-// 两种配法都兼容：① url 远程型（url 含域名）② stdio 命令型（域名藏在 command/args/env、
-//   如 npx @lark-project/mcp --domain https://project.feishu.cn）。
-const REQUIRED_FEISHU_MCP: { host: string; label: string }[] = [
-  { host: "mcp.feishu.cn", label: "飞书 MCP" },
-  { host: "project.feishu.cn", label: "飞书项目 MCP" },
+// 飞书能力域（V0.13.x 起软提示、不阻断）：每个域「MCP 命中域名 或 对应内置 CLI 已装」
+// 任一满足即就绪。MCP 按域名认、不认 key 名（别人把 key 叫 lark-mcp、my-feishu 也能识别）；
+// 两种配法都兼容：① url 远程型（url 含域名）② stdio 命令型（域名藏在 command/args/env）。
+// CLI = V0.12 内置的 lark-cli（飞书文档）/ meegle（飞书项目）、装了 agent 直接 shell 调。
+const FEISHU_CAPABILITIES: {
+  host: string;
+  label: string;
+  cli: "larkCli" | "meegle";
+}[] = [
+  { host: "mcp.feishu.cn", label: "飞书文档", cli: "larkCli" },
+  { host: "project.feishu.cn", label: "飞书项目", cli: "meegle" },
 ];
 
 // 把单个 MCP server 配置里「所有可能出现飞书域名的字符串」拼成一段、供域名 substring 匹配。
@@ -167,39 +170,61 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
 
   const [submitting, setSubmitting] = useState(false);
 
-  // 「未配置 or 本次被关掉」的飞书 MCP——非空则禁止创建（飞书是任务命脉）。
-  // 判定：启用的 server（key 不在本次黑名单）的配置里、有没有命中飞书域名；没命中 = 缺。
-  //   配置扫 url + command/args/env（兼容 url 远程型 + stdio 命令型两种配法）。
-  // mcpLoading 时先按「不缺」处理、避免列表没拉回来就误报缺失闪一下红。
-  const missingFeishuMcp = useMemo(() => {
+  // 内置飞书 CLI 安装状态（open 时拉一次）：null = 还没回来（按「已装」处理、不闪红）
+  const [cliInstalled, setCliInstalled] = useState<{
+    larkCli: boolean;
+    meegle: boolean;
+  } | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    void fetch("/api/system/feishu-cli")
+      .then((r) => r.json())
+      .then(
+        (d: {
+          larkCli?: { installed?: boolean };
+          meegle?: { installed?: boolean };
+        }) => {
+          if (!alive) return;
+          setCliInstalled({
+            larkCli: !!d.larkCli?.installed,
+            meegle: !!d.meegle?.installed,
+          });
+        },
+      )
+      .catch(() => {
+        // 探测失败不挡创建
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
+  // 未就绪的飞书能力域（V0.13.x 软提示、不阻断创建）：
+  // 每个域 = MCP 命中域名（启用中）或 对应内置 CLI 已装、任一满足即就绪。
+  // mcpLoading / cli 状态没回来时先按「就绪」处理、避免闪一下红。
+  const missingFeishu = useMemo(() => {
     if (mcpLoading) return [];
     const enabledHaystacks = Object.entries(mcpServers)
       .filter(([key]) => !disabledMcp.includes(key))
       .map(([, cfg]) => collectMcpHaystack(cfg));
-    return REQUIRED_FEISHU_MCP.filter(
-      (m) => !enabledHaystacks.some((h) => h.includes(m.host)),
-    );
-  }, [mcpLoading, mcpServers, disabledMcp]);
+    return FEISHU_CAPABILITIES.filter((m) => {
+      const mcpOk = enabledHaystacks.some((h) => h.includes(m.host));
+      const cliOk = cliInstalled === null || cliInstalled[m.cli];
+      return !mcpOk && !cliOk;
+    });
+  }, [mcpLoading, mcpServers, disabledMcp, cliInstalled]);
 
-  // 必填 title/repos/feishu/role + 飞书 MCP 齐全才放行
+  // 必填 title/repos/feishu/role 齐才放行（飞书能力缺失只 warn、不再阻断——CLI/MCP 双通道后
+  // 用户可能建完再装、AI 也能靠已 inject 的上下文文档干活）
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     if (!title.trim()) return false;
     if (repoPaths.length === 0) return false;
     if (!feishuStoryUrl.trim()) return false;
     if (!role) return false; // V0.6.12：角色必选、不再默认前端
-    if (mcpLoading) return false; // MCP 列表还没拉回来、等确认飞书依赖再放行
-    if (missingFeishuMcp.length > 0) return false; // 飞书 MCP 缺失、不让建
     return true;
-  }, [
-    submitting,
-    title,
-    repoPaths,
-    feishuStoryUrl,
-    role,
-    mcpLoading,
-    missingFeishuMcp,
-  ]);
+  }, [submitting, title, repoPaths, feishuStoryUrl, role]);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -522,16 +547,14 @@ export const NewTaskDialog = ({ onCreated, trigger }: Props) => {
           </div>
         </div>
 
-        {/* 缺飞书 MCP 时的硬提示——飞书是「需求 → PR」命脉、缺了按钮置灰不让建 */}
-        {missingFeishuMcp.length > 0 && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            创建任务需先启用{" "}
-            <strong>{missingFeishuMcp.map((m) => m.label).join("、")}</strong>
-            （
-            <SettingsLink focus="mcp" className="text-destructive">
-              去设置页启用
+        {/* 飞书能力缺失的软提示（V0.13.x 不再阻断）：MCP 和内置 CLI 都没有的域才提 */}
+        {missingFeishu.length > 0 && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-500">
+            <strong>{missingFeishu.map((m) => m.label).join("、")}</strong>
+            {" "}能力未就绪（没配 MCP、也没装内置 CLI）——AI 拉不了需求原文。
+            <SettingsLink focus="feishu" className="text-amber-600 dark:text-amber-500 underline underline-offset-2">
+              去设置页装飞书 CLI
             </SettingsLink>
-            ）
           </div>
         )}
 

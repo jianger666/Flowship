@@ -13,7 +13,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Download, Pencil, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -296,57 +305,13 @@ export const SkillsCard = () => {
         ) : skills.length === 0 ? (
           <EmptyHint>还没有任何 skill——从 Cursor 导入或手动新增</EmptyHint>
         ) : (
-          <div className="divide-y divide-border/60 rounded-md border border-border/60">
-            {skills.map((s) => (
-              <div
-                key={`${s.source}:${s.name}`}
-                className="flex items-center gap-2 px-3 py-2"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm" title={s.absPath}>
-                      {s.name}
-                    </span>
-                    <Badge
-                      variant={s.source === "app" ? "default" : "secondary"}
-                      className="shrink-0 text-[10px]"
-                    >
-                      {SOURCE_LABEL[s.source]}
-                    </Badge>
-                  </div>
-                  <div
-                    className="truncate text-[11px] text-muted-foreground"
-                    title={s.description}
-                  >
-                    {s.description}
-                  </div>
-                </div>
-                {s.editable && (
-                  <>
-                    <Button
-                      size="icon-xs"
-                      variant="ghost"
-                      aria-label={`编辑 ${s.name}`}
-                      title="编辑 SKILL.md"
-                      onClick={() => void openEdit(s.name)}
-                    >
-                      <Pencil />
-                    </Button>
-                    <Button
-                      size="icon-xs"
-                      variant="ghost"
-                      aria-label={`删除 ${s.name}`}
-                      title="删除"
-                      className="text-muted-foreground hover:text-destructive"
-                      onClick={() => void handleDelete(s.name)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
+          // 按来源分组（用户拍板「几十上百个太长」）：自管常驻展开（用户自己管的）、
+          // 其余来源各一个折叠组、标题带数量、默认收起
+          <SkillGroups
+            skills={skills}
+            onEdit={(name) => void openEdit(name)}
+            onDelete={(name) => void handleDelete(name)}
+          />
         )}
       </CardContent>
 
@@ -450,6 +415,125 @@ const AiCreateDialog = ({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+};
+
+// ----------------- 分组列表（自管展开、其余折叠） -----------------
+
+// 分组展示顺序：自管在前（可编辑、用户最关心）、然后内置 / Cursor / 飞书 CLI
+const GROUP_ORDER: SkillRow["source"][] = ["app", "builtin", "cursor", "feishu-cli"];
+
+const SkillGroups = ({
+  skills,
+  onEdit,
+  onDelete,
+}: {
+  skills: SkillRow[];
+  onEdit: (name: string) => void;
+  onDelete: (name: string) => void;
+}) => {
+  // 各折叠组的展开态（自管组不折叠、不进这个 state）
+  const [openGroups, setOpenGroups] = useState<Set<SkillRow["source"]>>(
+    new Set(),
+  );
+
+  const row = (s: SkillRow) => (
+    <div
+      key={`${s.source}:${s.name}`}
+      className="flex items-center gap-2 px-3 py-2"
+    >
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm" title={s.absPath}>
+          {s.name}
+        </div>
+        <div
+          className="truncate text-[11px] text-muted-foreground"
+          title={s.description}
+        >
+          {s.description}
+        </div>
+      </div>
+      {s.editable && (
+        <>
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            aria-label={`编辑 ${s.name}`}
+            title="编辑 SKILL.md"
+            onClick={() => onEdit(s.name)}
+          >
+            <Pencil />
+          </Button>
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            aria-label={`删除 ${s.name}`}
+            title="删除"
+            className="text-muted-foreground hover:text-destructive"
+            onClick={() => onDelete(s.name)}
+          >
+            <Trash2 />
+          </Button>
+        </>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="space-y-2">
+      {GROUP_ORDER.map((source) => {
+        const group = skills.filter((s) => s.source === source);
+        if (group.length === 0) return null;
+        // 自管组：常驻展开、无折叠头
+        if (source === "app") {
+          return (
+            <div key={source}>
+              <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Badge variant="default" className="text-[10px]">
+                  {SOURCE_LABEL[source]}
+                </Badge>
+                {group.length} 个
+              </div>
+              <div className="divide-y divide-border/60 rounded-md border border-border/60">
+                {group.map(row)}
+              </div>
+            </div>
+          );
+        }
+        const opened = openGroups.has(source);
+        return (
+          <div key={source}>
+            <button
+              type="button"
+              className="flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              onClick={() =>
+                setOpenGroups((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(source)) next.delete(source);
+                  else next.add(source);
+                  return next;
+                })
+              }
+            >
+              {opened ? (
+                <ChevronDown className="size-3" />
+              ) : (
+                <ChevronRight className="size-3" />
+              )}
+              <Badge variant="secondary" className="text-[10px]">
+                {SOURCE_LABEL[source]}
+              </Badge>
+              {group.length} 个（只读）
+            </button>
+            {opened && (
+              <div className="mt-1 divide-y divide-border/60 rounded-md border border-border/60">
+                {group.map(row)}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 };
 

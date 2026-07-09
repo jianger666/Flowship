@@ -282,6 +282,65 @@ const G = globalThis as unknown as {
 export const getInstallState = (): InstallState =>
   (G.__feishuCliInstall ??= { running: false, log: [] });
 
+/**
+ * 内置种子拷贝（V0.13.x「CLI 内置进安装包」、boot 时跑一次）：
+ * 安装包 resources/feishu-tools 里带了当前平台的 lark-cli / meegle 二进制 + 官方 skills
+ *（CI 打包时 scripts/fetch-feishu-cli.mjs 预取）——data/tools/bin 里还没有对应二进制时
+ * 拷过去、用户开箱即用不用点「安装」。已有（老用户装过 / 更新过）不覆盖——
+ * 用户在线更新到的版本可能比包里种子新。dev / 没内置时静默跳过。
+ */
+export const seedFeishuToolsFromResources = async (): Promise<void> => {
+  const resourcesDir = process.env.FE_AI_FLOW_RESOURCES_DIR;
+  if (!resourcesDir) return;
+  const seedRoot = path.join(resourcesDir, "feishu-tools");
+  try {
+    await fs.access(seedRoot);
+  } catch {
+    return; // 包里没内置（本地打包没跑预取脚本）
+  }
+  try {
+    // bin：逐个文件、缺才拷（不覆盖用户在线更新过的新版本）
+    const seedBin = path.join(seedRoot, "bin");
+    const bins = await fs.readdir(seedBin).catch(() => [] as string[]);
+    let copied = 0;
+    for (const name of bins) {
+      const dest = path.join(getToolsBinDir(), name);
+      try {
+        await fs.access(dest);
+        continue; // 已有、不覆盖
+      } catch {
+        // 缺、拷
+      }
+      await fs.mkdir(getToolsBinDir(), { recursive: true });
+      await fs.copyFile(path.join(seedBin, name), dest);
+      if (!isWin) await fs.chmod(dest, 0o755);
+      copied += 1;
+    }
+    // skills：逐目录、缺才拷（同上、不盖在线更新过的）
+    const seedSkills = path.join(seedRoot, "skills");
+    const skills = await fs
+      .readdir(seedSkills, { withFileTypes: true })
+      .catch(() => []);
+    for (const ent of skills) {
+      if (!ent.isDirectory()) continue;
+      const dest = path.join(getToolsSkillsDir(), ent.name);
+      try {
+        await fs.access(dest);
+        continue;
+      } catch {
+        // 缺、拷
+      }
+      await fs.cp(path.join(seedSkills, ent.name), dest, { recursive: true });
+    }
+    if (copied > 0) {
+      injectFeishuCliPath();
+      console.log(`[feishu-cli] 内置种子已就位：拷入 ${copied} 个 CLI 二进制 + 官方 skills`);
+    }
+  } catch (err) {
+    console.warn("[feishu-cli] 内置种子拷贝失败（可去设置页在线安装）：", err);
+  }
+};
+
 /** 一键安装 / 更新两个 CLI + 官方 skills（后台跑、UI 轮询 getInstallState） */
 export const startInstall = (): boolean => {
   const state = getInstallState();

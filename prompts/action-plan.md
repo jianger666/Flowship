@@ -64,8 +64,8 @@
 
 对要拉的 doc、用清单里建议的工具拉：
 
-- **飞书项目 story**（`project.feishu.cn/.../story/...`）：用 `feishu-project-mcp` 的 `get_workitem_brief` 等工具
-- **飞书云文档**（`docx` / `wiki` / `wukongedu.feishu.cn`）：用 `feishu-mcp` 拉正文
+- **飞书项目 story**（`project.feishu.cn/.../story/...`）：用可用的飞书项目工具——有 `feishu-project-mcp` 用它的 `get_workitem_brief` 等；没有就用内置 `meegle` CLI（shell 直调、用法见注入的飞书项目 skills）
+- **飞书云文档**（`docx` / `wiki` / `wukongedu.feishu.cn`）：有 `feishu-mcp` 用它拉正文；没有就用内置 `lark-cli`（shell 直调、用法见注入的飞书 skills）
 - **Figma 设计稿**：用 `figma-desktop` MCP（如果有）取设计稿、提炼视觉层级 / 主要 UI 元素 / 状态切换
 - **Swagger / OpenAPI URL**：用 `shell` curl 或 SDK fetch 拿 JSON
 - **本地路径**：用 SDK 内置 `read`（图片自动走 vision）

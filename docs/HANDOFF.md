@@ -309,6 +309,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - app 自管 skills 目录 `<dataRoot>/skills/<name>/SKILL.md`（`app-skills.ts`）、loadSkills 纳入扫描（优先级：平台内置 > 自管 > Cursor 全局 > 飞书 CLI）
   - 设置页新增 Skills 卡（`skills-card.tsx`）：列全部来源（带标签）、自管可新增 / 编辑 / 删除（编辑 SKILL.md、CodeEditor 加 markdown 高亮）、「从 Cursor 导入」勾选 dialog（**整目录拷贝**、含脚本附属文件）；API：GET/POST/DELETE `/api/skills` + `/api/skills/content` + `/api/skills/import`
   - MCP 卡「常用 MCP」独立区块砍掉（用户：太长）——常用开关 + 健康徽标 + OAuth 授权全并进条目行内、`HealthBadge` 从 mcp-toggle-list export 复用
+- **飞书工具去 MCP 强绑定 + CLI 内置进安装包**（同日、用户拍板）：
+  - prompt 中性化：action-plan / build / ship + context-docs-handler skill 里点名 `feishu-mcp` / `feishu-project-mcp` 的地方全改「有 MCP 用 MCP、没有用内置 lark-cli / meegle CLI（用法见注入的官方 skills）」
+  - 建任务校验降级：原「缺飞书 MCP 不让建」→ 按能力域（飞书文档 ↔ lark-cli、飞书项目 ↔ meegle）判定「MCP 或 CLI 任一就绪即过」、都缺才 amber 提示且**不阻断**（跳设置页飞书卡）
+  - CLI 内置（+~14MB、用户拍板）：CI 打包前 `scripts/fetch-feishu-cli.mjs --platform <target>` 预取平台二进制 + 官方 skills 到 `dist/feishu-tools`、afterPack 拷进 `resources/feishu-tools`、boot 时 `seedFeishuToolsFromResources`（壳传 `FE_AI_FLOW_RESOURCES_DIR`）缺才拷进 data/tools/——开箱即用、在线「更新」仍走增量下载、种子不覆盖用户更新过的新版本
+  - 飞书 CLI 安装器增量化（同日修 bug）：已装且版本一致跳过、按钮「缺任一叫安装、都在叫更新」
+- **Skills 列表按来源分组折叠**（用户拍板「几十上百个太长」）：自管组常驻展开、内置 / Cursor 全局 / 飞书 CLI 各一折叠组（标题带数量、默认收起）
 - **ask_user 弹窗 → 事件流内联答题卡**（同日、用户拍板「弹窗挡整屏不合理」）：模态 AskUserDialog 删除（旧 wait_for_user 阻塞协议遗产）、答题逻辑整体搬进 `ask-user-inline.tsx`（AskUserInlineCard）；event-stream 分流：`findPendingAskEvent` 命中的 ask 行渲染内联卡（选项 / 自定义 / 每题贴图 / 稍后再补充 / 快捷键全保留）、已答 / 作废走 AskUserRequestRow 回放；失效态（runStatus=error）内联警示不再需要 dismiss；chat-view 的兜底弹窗一并删（EventStream 内已覆盖）。对齐 Cursor / Claude Code 的内联提问形态、答题时能看事件流上下文
 
 ### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
