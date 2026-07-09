@@ -131,7 +131,6 @@ export const UserProfileCard = ({
                 return (
                   <SelectItem key={id} value={id} disabled={unavailable}>
                     {JUMP_IDE_LABEL[id]}
-                    {unavailable ? "（未检测到）" : ""}
                   </SelectItem>
                 );
               })}
