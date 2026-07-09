@@ -455,11 +455,12 @@ export interface ActionRecord {
   endedAt: number | null;
 
   /**
-   * V0.6.28：action 创建时的 effective cwd 快照（= 当时 getEffectiveCwd(task.repoPaths)）
-   * - why：task 支持中途追加仓库后、effectiveCwd 会从单仓自身变成公共父目录、
+   * V0.6.28：action 创建时的 cwd 快照（= 当时 getTaskCwd(task)；隔离=worktree、非隔离=原仓）
+   * - why：task 支持中途追加仓库后、cwd 会从单仓自身变成公共父目录、
    *   artifact 里 agent 写的相对路径基准随之漂移；前端渲染 cursor:// 链接必须用
    *   「artifact 写入时」的基准而不是实时计算值、否则改仓后老 artifact 链接集体失效
-   * - 老数据没这字段 → 前端回退实时 getEffectiveCwd（改过仓的老 task 接受历史链接漂移）
+   * - 老数据没这字段 → 前端回退 task.workCwd ?? getEffectiveCwd（隔离老 action 必须先走 workCwd、
+   *   否则相对路径会拼到原仓而不是 worktree 工作副本）
    */
   cwd?: string;
 

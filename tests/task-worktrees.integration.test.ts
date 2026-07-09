@@ -138,6 +138,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     const removed = await removeTaskWorktrees(task);
     expect(removed.removedAny).toBe(true);
     expect(removed.snapshotRepos).toEqual([REPO]);
+    expect(removed.skippedRepos).toEqual([]);
     await expect(fs.access(workDir)).rejects.toThrow();
     // 分支还在（合入前产物不丢、reopen 后可重建 worktree 续推）
     const branches = git(REPO, "branch", "--list", "feature/clj/888888-集成测试");
@@ -172,5 +173,58 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     const removed = await removeTaskWorktrees(task);
     // 这轮没新改动、不再落快照
     expect(removed.snapshotRepos).toEqual([]);
+    expect(removed.skippedRepos).toEqual([]);
+  });
+
+  it("复用热路径：worktree 里手动 checkout 切走 → ensure 自动切回任务分支", async () => {
+    await ensureTaskWorktrees(task, "clj");
+    const taskBranch = "feature/clj/888888-集成测试";
+    // main 在原仓检出、不能在 worktree 再切；另建旁路分支模拟用户 / agent 手动切走
+    git(REPO, "branch", "side-detour", "main");
+    git(workDir, "checkout", "side-detour");
+    expect(git(workDir, "branch", "--show-current")).toBe("side-detour");
+
+    const res = await ensureTaskWorktrees(task, "clj");
+    expect(res.createdRepos).toEqual([]);
+    expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
+  });
+
+  it("remove：merge 冲突态 WIP 快照失败 → 跳过删除、目录与未提交改动保留", async () => {
+    // 前置：上一条 ensure 后 worktree 仍在任务分支上
+    const taskBranch = "feature/clj/888888-集成测试";
+    const conflictFile = path.join(workDir, "conflict.txt");
+    await fs.writeFile(conflictFile, "base\n");
+    git(workDir, "add", "conflict.txt");
+    git(workDir, "commit", "-m", "conflict base");
+
+    // 两分支改同文件 → merge 必冲突（porcelain 出现 UU、工作区留下 <<<<<<<）
+    git(workDir, "checkout", "-b", "conflict-side");
+    await fs.writeFile(conflictFile, "from-side\n");
+    git(workDir, "add", "conflict.txt");
+    git(workDir, "commit", "-m", "side edit");
+
+    git(workDir, "checkout", taskBranch);
+    await fs.writeFile(conflictFile, "from-feature\n");
+    git(workDir, "add", "conflict.txt");
+    git(workDir, "commit", "-m", "feature edit");
+
+    let mergeFailed = false;
+    try {
+      git(workDir, "merge", "conflict-side");
+    } catch {
+      mergeFailed = true;
+    }
+    expect(mergeFailed).toBe(true);
+    const before = await fs.readFile(conflictFile, "utf8");
+    expect(before).toMatch(/<<<<<<</);
+
+    const removed = await removeTaskWorktrees(task);
+    expect(removed.skippedRepos).toEqual([REPO]);
+    expect(removed.snapshotRepos).toEqual([]);
+    expect(removed.removedAny).toBe(false);
+    // 目录保留、冲突内容还在（没被 --force 抹掉）
+    await expect(fs.access(workDir)).resolves.toBeUndefined();
+    await expect(fs.readFile(conflictFile, "utf8")).resolves.toBe(before);
+    expect(git(REPO, "worktree", "list")).toContain(workDir);
   });
 });

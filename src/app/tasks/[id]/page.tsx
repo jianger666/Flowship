@@ -795,10 +795,16 @@ const TaskDetailPage = () => {
                     key={selectedAction.id}
                     action={selectedAction}
                     taskId={task.id}
-                    // V0.6.28：优先用 action 创建时的 cwd 快照——task 中途追加仓库后
-                    // effectiveCwd 会变、老 artifact 的相对路径必须按写入时基准解析；
-                    // 老数据没快照（V0.6.28 前的 action）回退实时计算
-                    baseDir={selectedAction.cwd ?? getEffectiveCwd(task.repoPaths)}
+                    // V0.6.28 / V0.10：相对路径链接的解析基准回退链——
+                    // 1) action.cwd 快照（写入时基准，中途加仓后也不会漂）
+                    // 2) task.workCwd（hydrate 算出的当前工作区：隔离=worktree、非隔离=原仓）
+                    // 3) getEffectiveCwd(repoPaths)（最老兜底）
+                    // 缺 cwd 的老隔离 action 若直接跳到 3、会把链接拼到原仓而非 worktree 副本
+                    baseDir={
+                      selectedAction.cwd ??
+                      task.workCwd ??
+                      getEffectiveCwd(task.repoPaths)
+                    }
                     // 多仓 task：仓短名清单给路径前缀校验用（agent 漏写仓名前缀的
                     // 路径不渲染链接、点了必 404）；单仓不传 = 不校验
                     // V0.10 隔离 task：cwd 是 worktrees/<taskId>、原仓库路径不在其下、

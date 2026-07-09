@@ -63,7 +63,11 @@ import {
   isWorktreeTask,
   removeTaskWorktrees,
 } from "./task-worktrees";
-import { killStalePreview } from "./preview-manager";
+import {
+  getPreviewStatus,
+  killStalePreview,
+  stopPreview,
+} from "./preview-manager";
 import {
   DATA_DIR,
   META_FILE,
@@ -352,6 +356,14 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
 export const deleteTask = async (id: string): Promise<boolean> => {
   const dir = taskDir(id);
   if (!(await exists(dir))) return false;
+  // 清 worktree / 删目录前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
+  // best-effort：失败不挡删除主流程（跟下面 worktree 清理同口径）。
+  try {
+    const slot = getPreviewStatus();
+    if (slot?.taskId === id) await stopPreview();
+  } catch (err) {
+    console.warn(`[task-fs] deleteTask: 停预览失败（忽略）id=${id}`, err);
+  }
   // V0.10：先清隔离工作区（要读 meta 拿 repoPaths、必须在删 task 目录前）；
   // 失败不挡删除、boot 孤儿扫描兜底
   try {

@@ -299,6 +299,19 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### V0.11.11（未发版、攒着）：worktree 全流程审计 + 7 项修复（2026-07-09、用户点名「好好检查 worktree」、4 审计 + 3 修复 subagent 并行）
+
+- **审计结论**：主链路扎实（幂等 / 路径归一 / 指纹 key / 孤儿 live 集合 / 跨实例 dataRoot 隔离 / chat 旁路都验过没问题）；证伪了一个 subagent 误报（「跨实例 worktree 注册名必撞」——真 git 实验：git 会自动给重名注册加后缀 crm-web/crm-web1、不存在该问题）
+- **修复 7 项**：
+  1. ensure 复用热路径校验当前分支——被手动 checkout 切走 / detached HEAD 自动切回、切不回抛清晰错（原「build 自检兜底」实际不存在、静默错分支干活）
+  2. WIP 快照改三态（clean/snapshotted/failed）：merge/rebase 冲突中（porcelain 未合并码）直接 failed 且**跳过删除**（原来快照失败仍 --force 删、未提交改动被销毁）；`RemoveWorktreesResult.skippedRepos` + finalize 事件⚠️提示；孤儿清理同口径整目录保留
+  3. 分支占用报错识别新版 git 文案 `already used by worktree`（2.4x+ 改了措辞、原正则只认 already checked out、中文提示不出——昨天线上实测）+ 提示补「检查另一实例（正式/test）是否占用」
+  4. finalizeTask 补 `waitForTaskToStop`（对齐 DELETE、防 agent 边写边删）
+  5. deleteTask / finalizeTask 清 worktree 前停本任务预览（防 dev server 悬空占端口）
+  6. `ensureWorkspaceReady`：internalStartAgent / resumeTaskSession / startOneShotQuestion 入口幂等 ensure（reopen 后问一问 / 手删 worktree 后 resume 不再指向不存在目录）
+  7. ArtifactPanel baseDir 回退链补 `task.workCwd`（隔离任务老 action 缺 cwd 快照时、链接不再拼到原仓）；ActionRecord.cwd 注释同步
+- 集成测试 +2（分支切走自动纠正 / merge 冲突态删除跳过）、全量 150 绿
+
 ### V0.11.10（未发版、攒着）：IDE 探测扩到 10 个 + 设置页只列已装（2026-07-09、用户点名）
 
 - `JumpIde` 扩：VS Code 系（Cursor / VS Code / **Windsurf / Trae**）+ JetBrains 全家（IDEA / WebStorm / **PyCharm / GoLand / PhpStorm / Android Studio**、Android Studio win 装 `Program Files\Android` 下 exe=studio64 单独配）；探测改 `IDE_SPECS` 配置表驱动（ide-tools.ts）、加新 IDE = 加一行配置；候选清单单一来源 `JUMP_IDES`（types.ts）、组件 / route / normalize 全引它

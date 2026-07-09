@@ -64,6 +64,10 @@ import { ensureStopHookInstalled } from "./stop-hook-inject";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
 import {
+  getPreviewStatus,
+  stopPreview,
+} from "./preview-manager";
+import {
   ensureTaskWorktrees,
   getTaskCwd,
   getTaskWorkRepoPaths,
@@ -1107,6 +1111,9 @@ export const finalizeTask = async (
       hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
     }、patch repoStatus=${finalStatus}`,
   );
+  // cancel 只是发信号、run 的 finally 可能还在往 worktree 写文件——对齐 DELETE 路由 /
+  // deleteTask 口径、等真停再删、防边写边删撞车。没活 run 时秒过。
+  await waitForTaskToStop(taskId, 8000);
 
   // V0.x：merged（已合入）时、当前还在等 ack 的 action 标 completed——用户认可了产物才去合 MR、
   //   不该记成 cancelled（abandoned 维持下面的 cancelled：没认可就放弃）。
@@ -1128,6 +1135,18 @@ export const finalizeTask = async (
   if (patched) publish(taskId, { kind: "task", task: patched });
   await setTaskRunStatus(taskId, "idle", null);
 
+  // 清 worktree 前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
+  // best-effort：失败不挡终结主流程。
+  try {
+    const slot = getPreviewStatus();
+    if (slot?.taskId === taskId) await stopPreview();
+  } catch (err) {
+    console.warn(
+      `[task-runner] finalizeTask: 停预览失败（忽略）task=${taskId}`,
+      err,
+    );
+  }
+
   // V0.10：终结即清隔离工作区（feature 分支保留在原仓库、随时可 reopen 重建 worktree 续推；
   // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
   // best-effort：失败只 log、boot 孤儿扫描兜底。
@@ -1136,16 +1155,20 @@ export const finalizeTask = async (
       console.warn(`[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`, err);
       return null;
     });
-    if (removed?.removedAny) {
+    if (removed?.removedAny || (removed?.skippedRepos.length ?? 0) > 0) {
+      const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
       const snapshotNote =
-        removed.snapshotRepos.length > 0
-          ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos
-              .map((p) => p.split("/").filter(Boolean).pop() ?? p)
-              .join("、")}）`
+        removed && removed.snapshotRepos.length > 0
+          ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
+          : "";
+      // 快照落不了（merge/rebase 冲突中等）的仓不删、必须让用户知道目录还在哪等处理
+      const skippedNote =
+        removed && removed.skippedRepos.length > 0
+          ? `；⚠️ ${removed.skippedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动（如 merge 冲突中）、工作区目录已保留未删、请自行处理后可手动删除`
           : "";
       await writeEventAndPublish(taskId, {
         kind: "info",
-        text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}）`,
+        text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${skippedNote}）`,
       });
     }
   }
@@ -1501,6 +1524,18 @@ const registerSessionBridges = (
   setChatAwaitingNotifier(task.id, awaitingNotifier);
 };
 
+/**
+ * 隔离 task 起 / 接 agent 前保证 worktree 目录在盘上。
+ * reopen 不重建、finalize 清过再问一问、用户手删 worktree——cwd 会指到不存在的路径；
+ * ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
+ * username 传 undefined：分支名多已落盘（gitBranches）；新建分支场景走 advance 会带 username。
+ * 失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
+ */
+const ensureWorkspaceReady = async (task: Task): Promise<void> => {
+  if (!isWorktreeTask(task)) return;
+  await ensureTaskWorktrees(task, undefined);
+};
+
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   const {
     task,
@@ -1516,6 +1551,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     batchDirective,
     replanDirective,
   } = input;
+
+  // 兜底：调用方约定已 ensure，但 resume / 问一问 / 手删 worktree 等路径可能漏——入口再保证一次
+  await ensureWorkspaceReady(task);
 
   const effectiveGitHost =
     (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
@@ -1563,7 +1601,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     let agent: AgentInstance | null = null;
     try {
       // V0.6.3：起 agent 前给业务仓库装 stop hook（保证 agent 交卷后才放行结束 Run、失败不阻断启动）
-      // V0.10：隔离 task 的 cwd = worktree（advance / restart 已提前 ensureTaskWorktrees）
+      // V0.10：隔离 task 的 cwd = worktree（入口 ensureWorkspaceReady 已保证目录在盘上）
       const effectiveCwd = getTaskCwd(task);
       await ensureStopHookInstalled(effectiveCwd);
 
@@ -1923,6 +1961,8 @@ const resumeTaskSession = async (
     task.model ??
     creds.model;
   if (!model) return null;
+  // 放 try 外：ensure 失败（分支被占等）应冒泡给调用方；try 只兜 Agent.resume 失败降级
+  await ensureWorkspaceReady(task);
   try {
     const { mergedMcp } = await buildMergedMcpForTask(task);
     const agent = await Agent.resume(task.sessionAgentId, {
@@ -2013,6 +2053,8 @@ export const startOneShotQuestion = (
   void (async () => {
     let agent: AgentInstance | null = null;
     try {
+      // finalize / 手删后 worktree 可能已不在——起兜底 agent 前先保证目录存在
+      await ensureWorkspaceReady(task);
       const effectiveCwd = getTaskCwd(task);
       agent = await Agent.create({
         apiKey: creds.apiKey,
