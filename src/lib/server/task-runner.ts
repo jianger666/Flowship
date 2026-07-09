@@ -866,8 +866,10 @@ export interface ResumeCurrentActionInput {
   userMessage: string;
   imagePaths?: string[];
   apiKey: string;
-  /** 模型优先级：action.agentModel → task.model → 这里的兜底（bootArgs.model） */
+  /** 模型优先级：forceModel → action.agentModel → task.model → 这里的兜底（bootArgs.model） */
   fallbackModel: ModelSelection;
+  /** 用户在输入条显式选的模型（V0.13.x：换模型唤醒、最高优先——用户意图就是换个模型继续干） */
+  forceModel?: ModelSelection;
   gitHost?: string;
   gitToken?: string;
 }
@@ -962,14 +964,17 @@ const resumeCurrentActionInner = async (
         ? buildReviewScopeDirective(startTask)
         : undefined;
 
-  // 模型：沿用该 action 当初跑的 agentModel（没有则 task.model、再兜 bootArgs 默认）——
-  // 唤醒是「接着干」、不该悄悄换模型；想换模型答疑走输入条的模型选择（一次性答疑 agent）
+  // 模型：用户显式选的（forceModel）最优先——V0.13.x 修「换模型说话被锁进只读答疑」：
+  // 换模型唤醒 = 用户想换个模型继续干活；没显式选才沿用该 action 当初的 agentModel
+  //（唤醒是「接着干」、不该悄悄换模型）、再退 task.model、最后兜 bootArgs 默认
   const model =
-    startAction.agentModel?.id?.trim()
-      ? startAction.agentModel
-      : startTask.model?.id?.trim()
-        ? startTask.model
-        : input.fallbackModel;
+    input.forceModel?.id?.trim()
+      ? input.forceModel
+      : startAction.agentModel?.id?.trim()
+        ? startAction.agentModel
+        : startTask.model?.id?.trim()
+          ? startTask.model
+          : input.fallbackModel;
 
   const replanDirective = buildPlanReplanDirective(startAction, startTask);
 

@@ -118,20 +118,22 @@ export const POST = async (req: Request, { params }: Ctx) => {
       ? { id: body.forceModel.id, params: body.forceModel.params }
       : undefined;
 
-  // 用户显式选了模型 → 不续会话（会话模型锁死换不了）、直接起一次性答疑 agent 用它答；
+  // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   const sent = forceModel
     ? false
     : await deliverTaskQuestion(task, text, imageAbsPaths, { apiKey, model });
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
-  // - 当前 action 停在半路（error / cancelled / 僵死 running）且没显式换模型 →
-  //   **唤醒模式**：起新 agent 原地续同一个 action、用户消息当最新指示
-  // - 其他（action 已完结 / 没 action / 显式选了模型）→ 一次性答疑 agent（只答不动手）
+  // - 当前 action 停在半路（error / cancelled / 僵死 running）→ **唤醒模式**：
+  //   起新 agent 原地续同一个 action、用户消息当最新指示。
+  //   V0.13.x 修：显式换模型**不再**排除唤醒——唤醒起的本来就是新 agent、直接用新模型跑。
+  //   （用户实测踩坑：停掉 fable5 换 grok 说「帮我删掉单测」、被锁进只读答疑 agent、
+  //   AI 反复回「我在答疑模式动不了文件」——用户换模型的意图是换个模型继续干活、不是问问题）
+  // - 其他（action 已完结 / 没 action）→ 一次性答疑 agent（只答不动手）
   const currentAction = task.actions.find((a) => a.id === task.currentActionId);
   const canResume =
     !sent &&
-    !forceModel &&
     !!currentAction &&
     (currentAction.status === "error" ||
       currentAction.status === "cancelled" ||
@@ -175,6 +177,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       imagePaths: imageAbsPaths,
       apiKey: apiKey!,
       fallbackModel: fallbackModel!,
+      // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
+      forceModel,
       gitHost: body.bootArgs?.gitHost?.trim() || undefined,
       gitToken: body.bootArgs?.gitToken?.trim() || undefined,
     }).catch(async (err) => {

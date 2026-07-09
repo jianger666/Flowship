@@ -120,11 +120,6 @@ jobs:
         shell: bash
         working-directory: dist/app-server
 
-      # V0.13.x：预取目标平台的飞书 CLI（lark-cli + meegle 二进制 + 官方 skills）到
-      # dist/feishu-tools、afterPack 拷进 resources/feishu-tools、首次 boot 种子拷贝进
-      # data/tools/——用户开箱即用不用点「安装」（+~14MB、用户拍板内置）
-      - run: node scripts/fetch-feishu-cli.mjs --platform ${{ matrix.sdk_platform }}
-
       # 壳的 runtime 依赖（只有 electron-updater）、装进 electron-app/node_modules 进 asar。
       # 必须用 pnpm（跟根项目一致）：electron-builder 按根 lockfile 判定 pm=pnpm、
       # npm 风格的 node_modules 收集不到、会 fallback 把主项目全家桶打进 asar（271M 事故）

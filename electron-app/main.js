@@ -219,9 +219,6 @@ const startServer = () => {
       PORT: String(PORT),
       HOSTNAME: HOST,
       FE_AI_FLOW_DATA_DIR: path.join(app.getPath("userData"), "data"),
-      // V0.13.x：resources 目录给 server 用（飞书 CLI 内置种子在 resources/feishu-tools、
-      // 首次 boot 拷进 data/tools/；server 是子进程、拿不到 process.resourcesPath）
-      FE_AI_FLOW_RESOURCES_DIR: process.resourcesPath,
     },
     // cwd 不用管：standalone server.js 启动时自己 process.chdir(__dirname)
     stdio: ["ignore", "pipe", "pipe"],

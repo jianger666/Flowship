@@ -382,6 +382,15 @@ const cloneDepDirs = async (
     try {
       // -c = clonefile；大目录（几十万文件）逐文件克隆也只是元数据操作、给足超时
       await execFileAsync("cp", ["-Rc", src, dst], { timeout: 600_000 });
+      // 构建工具缓存必须删（V0.13.x、用户实测「worktree 里 dev server 热更新极慢 /
+      // 刷新一直 loading」）：webpack / babel / vue-cli 等的 node_modules/.cache 里
+      // 记录的是**原仓库的绝对路径**、克隆过来后路径全错——dev server 每次都缓存
+      // 失配 → 全量重编译。删掉让它在 worktree 里冷启动重建正确缓存、之后热更新正常。
+      if (dir === "node_modules") {
+        await fs
+          .rm(path.join(dst, ".cache"), { recursive: true, force: true })
+          .catch(() => {});
+      }
       cloned.push(dir);
     } catch (err) {
       // 半截残留必须清掉——否则 agent 看到目录存在就不装了、比没有更坑

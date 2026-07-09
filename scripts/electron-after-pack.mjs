@@ -33,23 +33,6 @@ export default async (context) => {
   await fs.cp(src, dest, { recursive: true, verbatimSymlinks: true });
   console.log(`  • afterPack：server 布局已拷入 ${dest}`);
 
-  // V0.13.x：飞书 CLI 内置（scripts/fetch-feishu-cli.mjs 预取到 dist/feishu-tools）——
-  // 存在才拷（本地没跑预取脚本时跳过、不阻断打包）；运行时首次 boot 从 resources
-  // 种子拷贝到 data/tools/（feishu-cli.ts seedFeishuToolsFromResources）
-  const toolsSrc = path.join(process.cwd(), "dist", "feishu-tools");
-  try {
-    await fs.access(toolsSrc);
-    const toolsDest = path.join(
-      context.packager.getResourcesDir(context.appOutDir),
-      "feishu-tools",
-    );
-    await fs.rm(toolsDest, { recursive: true, force: true });
-    await fs.cp(toolsSrc, toolsDest, { recursive: true });
-    console.log(`  • afterPack：飞书 CLI 已内置 ${toolsDest}`);
-  } catch {
-    console.log("  • afterPack：dist/feishu-tools 不存在、跳过内置（运行时在线安装）");
-  }
-
   if (context.electronPlatformName === "darwin") {
     // appOutDir 下找 .app（产物只有一个）
     const appName = (await fs.readdir(context.appOutDir)).find((n) =>
