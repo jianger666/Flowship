@@ -41,7 +41,7 @@ export const getToolsSkillsDir = (): string => path.join(getToolsDir(), "skills"
 
 const larkCliBin = (): string =>
   path.join(getToolsBinDir(), isWin ? "lark-cli.exe" : "lark-cli");
-const meegleBin = (): string =>
+export const meegleBin = (): string =>
   path.join(getToolsBinDir(), isWin ? "meegle.exe" : "meegle");
 
 /**

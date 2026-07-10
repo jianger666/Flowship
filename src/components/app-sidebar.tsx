@@ -16,10 +16,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Check, ChevronRight, ListFilter, Loader2, Plus, SquareKanban } from "lucide-react";
+import { Check, ChevronRight, ListFilter, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
-import { NewTaskDialog } from "@/components/tasks/new-task-dialog";
 import { TaskListItem } from "@/components/tasks/task-list-item";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -157,8 +156,9 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     >
       {/* 固定内容宽度、收起时被外层裁掉、不挤压换行 */}
       <div className="flex h-full w-64 flex-col">
-        {/* 顶部：新建对话（主入口、占满）+ 新建任务（图标）+ 类型筛选（图标触发下拉）。
-            toggle 已移到顶栏红绿灯右侧。自由对话高频、一键零表单当主入口；结构化任务低频、降为图标。 */}
+        {/* 顶部：新建对话（主入口、占满）+ 类型筛选（图标触发下拉）。
+            V0.14 砍「新建任务」入口（用户拍板）：任务只从首页飞书看板点工作项进；
+            临时需求 / 自由探索走新建对话。 */}
         <div className="flex items-center gap-1 p-2">
           <Button
             className="flex-1"
@@ -168,21 +168,6 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
             {creatingChat ? <Loader2 className="animate-spin" /> : <Plus />}
             新建对话
           </Button>
-          <NewTaskDialog
-            onCreated={handleCreated}
-            trigger={
-              <Button
-                variant="outline"
-                size="sm"
-                aria-label="新建结构化任务"
-                title="新建结构化任务（走完整 方案 / 实现 / 复核 流程）"
-                className="shrink-0 gap-1.5"
-              >
-                <SquareKanban className="size-4" />
-                任务
-              </Button>
-            }
-          />
           {/* 类型筛选：图标触发、下拉单选；非「全部」时图标高亮提示当前有筛选 */}
           <Popover open={filterOpen} onOpenChange={setFilterOpen}>
             <PopoverTrigger

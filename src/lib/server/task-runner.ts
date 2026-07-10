@@ -46,7 +46,6 @@ import {
   setTaskRunStatus,
   setTaskAwaitingIfIdle,
 } from "./task-fs";
-import { snapshotActionArtifact } from "./task-artifacts";
 import { getActionsDir, getEventsLogPath } from "./task-fs-core";
 import {
   runActionCheck,

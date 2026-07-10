@@ -315,6 +315,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - ~~CLI 内置进安装包~~（做完当天用户撤回「cli 不内置」——预取脚本 / afterPack / 种子拷贝已全部回退、维持按需在线安装）
   - 飞书 CLI 安装器增量化（同日修 bug）：已装且版本一致跳过、按钮「缺任一叫安装、都在叫更新」
 - **Skills 列表按来源分组折叠**（用户拍板「几十上百个太长」）：自管组常驻展开、内置 / Cursor 全局 / 飞书 CLI 各一折叠组（标题带数量、默认收起）
+- **V0.14 已实装（2026-07-10 下午、详见下方规划段的拍板细节）**：`meegle-cli.ts`（execFile 封装、三态错误 not_installed/not_authed/error、normalizeWorkitem 宽松归一——mywork 响应无公开 schema、字段名多重兜底、**待用户登录 meegle 后实测校准**）+ `/api/feishu/board`（mywork + 本地任务 join、url 缺失按 host/projectKey/type/id 兜底拼）+ `/api/feishu/workitem`（详情、支持 url decode）+ 首页 `FeishuBoard`（列表/时间线切换、待办/本周/逾期/已办 tabs、双状态徽标、sessionStorage 缓存秒开、降级引导）+ `BoardTimeline`（28 天横向时间轴、今天纵线、逾期红/合入绿/进行中主题色、未排期组）+ 预览页 `/workitems/[id]`（WorkitemDetail + TaskLaunchForm、启动才建任务、防重复建兜底）+ `TaskLaunchForm`（原 NewTaskDialog 表单核心、上次仓库/角色记忆预填、缺项琥珀引导）+ NewTaskDialog 删除（侧栏/首页入口砍）+ workspace-actions「需求详情」dialog（WorkitemDetail 复用）+ action-ship §4.5 节点流转（meegle 三步曲、best-effort、未就绪跳过）
 - **V0.14 规划（已定型待开工、2026-07-10 用户拍板）——首页改造成飞书项目看板**：
   - 首页 = 工作台：飞书项目工作项看板（meegle CLI `mywork`/workitem 拉数据、全部/我的筛选、列表 + **真时间线视图**切换（横向时间轴、排期条、今天标线、首版只读不拖拽、过 frontend-design 定调）、每项带**双状态徽标**（飞书节点状态 + AI 任务状态）、未登录 meegle 降级现状 + 授权引导、列表缓存 + 手动刷新）
   - 点工作项 → **预览态**（工作项详情 + 铺开的配置区、不落盘）→ 点「启动」才真正创建任务容器（防点开看看就产生空任务）；配置区预填「上次任务的仓库组合」+ 默认模型/角色、90% 场景零操作一键启动；缺项时启动置灰 + 琥珀高亮引导（防隐性卡点、用户提的）

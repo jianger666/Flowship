@@ -278,6 +278,16 @@ add_comment({
 - `feishuTesterUserKeys` 为空数组（用户选了跳过）：评论不加 @ mention 块、只贴链接、notify 两参数省略（或传空）
 - 飞书评论失败：artifact «§4 飞书评论» 记 ❌ + 错误信息、不阻塞 ship action 完成（用户后续手动补）
 
+### 4.5 飞书工作项节点流转（V0.14 状态同步、best-effort）
+
+> **前置门禁**：同 §4（所有仓 MR 无冲突才做）；且仅当内置 `meegle` CLI 可用并已登录（`meegle auth status` 的 `authenticated=true`）。未装 / 未登录 → 整步跳过、artifact §4.5 记「跳过（meegle 未就绪）」、**不要**让用户去装。
+
+提测 MR 已交、把飞书工作项流转到「提测 / 待测试」类节点、让飞书侧状态跟上：
+
+1. 按注入的飞书项目 skills 里 `sop-transition-node.md` 的三步曲走：`workflow get-node`（看当前节点）→ `workflow list-state-transitions` 或节点信息（看合法流转）→ `workflow transition`（流转）
+2. **目标节点自己判断**：合法流转里选语义为「提测 / 待测试 / 测试中」的节点；**没有明确匹配的就不要流转**（各空间节点命名不同、流转错状态比不流转更糟）、artifact 记「未找到提测类节点、跳过」
+3. 失败（权限 / 参数 / 网络）：artifact «§4.5 节点流转» 记 ❌ + 原因、**不阻塞 ship 完成**、不重试超过 1 次
+
 ### 5. 写 ship artifact + submit_work
 
 artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit_work({ task_id, action_id, artifact_path: "actions/<N>-ship.md" })` 等用户 ack。
@@ -348,6 +358,10 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 - @ 的测试人员: <user_key 列表、或「跳过」>
 - 状态: ✅ 成功 / ❌ 失败 + 错误信息 / ⏸ 因 MR 冲突跳过（待用户解决后重跑 ship 再评论）
 - ⚠️ 通知送达: 评论已发、但官方 MCP 通知链路故障（2026-06-12 起）、@ 仅渲染不推送——必要时请在飞书 IM 手动知会测试人员
+
+## §4.5 节点流转
+
+- 状态: ✅ 已流转到「<节点名>」 / ⏭ 跳过（meegle 未就绪 / 未找到提测类节点） / ❌ 失败 + 原因
 
 ## §5 自检结果
 
