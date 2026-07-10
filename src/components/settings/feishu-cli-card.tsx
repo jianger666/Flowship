@@ -124,7 +124,7 @@ export const FeishuCliCard = () => {
   const handleUninstall = async () => {
     const ok = await confirm({
       title: "卸载飞书 CLI？",
-      description: "删除两个 CLI 和官方 skills、登录态保留、可随时重装",
+      description: "删除两个 CLI、官方 skills 和配置（含登录态）、重装后需重新登录",
       destructive: true,
     });
     if (!ok) return;

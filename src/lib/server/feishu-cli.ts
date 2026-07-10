@@ -281,8 +281,9 @@ const G = globalThis as unknown as {
 
 /**
  * 卸载（V0.14.x 用户点名「万一想卸载后重装」）：删 bin（两个 CLI 二进制）+ skills
- *（官方技能）。HOME 级登录态（~/.lark-cli / ~/.meegle）不动——重装后即用、
- * 想彻底重来的用户可以自己清（或以后加选项）。
+ *（官方技能）+ HOME 级配置 / 登录态（~/.lark-cli、~/.meegle）。
+ * 配置一并删是用户拍板（2026-07-10）：同事踩过「半截坏配置卸载重装也修不好」
+ *（卸载保留配置 → 重装后 auth login 仍拿坏配置直接退 code=3）——卸载语义就该彻底。
  */
 export const uninstallFeishuTools = async (): Promise<void> => {
   if (getInstallState().running) {
@@ -290,7 +291,9 @@ export const uninstallFeishuTools = async (): Promise<void> => {
   }
   await fs.rm(getToolsBinDir(), { recursive: true, force: true });
   await fs.rm(getToolsSkillsDir(), { recursive: true, force: true });
-  console.log("[feishu-cli] 已卸载（bin + skills 删除、登录态保留）");
+  await fs.rm(path.join(os.homedir(), ".lark-cli"), { recursive: true, force: true });
+  await fs.rm(path.join(os.homedir(), ".meegle"), { recursive: true, force: true });
+  console.log("[feishu-cli] 已卸载（bin + skills + 配置/登录态 全部删除）");
 };
 
 export const getInstallState = (): InstallState =>
