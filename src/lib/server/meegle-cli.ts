@@ -289,6 +289,92 @@ export const fetchWorkitemDetail = async (
   return {};
 };
 
+// ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------
+
+/** 工作项的单个节点排期（甘特展开行用） */
+export interface WorkitemNode {
+  name: string;
+  /** not_started / doing / done 等（CLI basic.status 原样） */
+  status?: string;
+  start?: number;
+  end?: number;
+}
+
+// 节点排期缓存：49 个工作项逐个调 CLI 太贵（每次 ~1s）、10 分钟内复用
+const nodesCache = new Map<string, { at: number; nodes: WorkitemNode[] }>();
+const NODES_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 拉工作项的全部节点排期（workflow get-node --node-id-list '["_all"]'、实测结构：
+ * list[].basic.{name,node_key,status} + schedule.{estimate_start_time,estimate_finish_time}）。
+ * 失败返回空数组（甘特降级为只显示 mywork 的当前节点排期）。
+ */
+export const fetchWorkitemNodes = async (
+  workItemId: string,
+  projectKey?: string,
+  opts: { skipCache?: boolean } = {},
+): Promise<WorkitemNode[]> => {
+  const cacheKey = `${projectKey ?? ""}:${workItemId}`;
+  if (!opts.skipCache) {
+    const hit = nodesCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < NODES_TTL_MS) return hit.nodes;
+  }
+  try {
+    const args = [
+      "workflow",
+      "get-node",
+      "--work-item-id",
+      workItemId,
+      "--node-id-list",
+      '["_all"]',
+    ];
+    if (projectKey) args.push("--project-key", projectKey);
+    const resp = await runMeegle(args);
+    const nodes: WorkitemNode[] = [];
+    for (const raw of extractItems(resp)) {
+      if (!raw || typeof raw !== "object") continue;
+      const m = raw as Record<string, unknown>;
+      const basic =
+        m.basic && typeof m.basic === "object"
+          ? (m.basic as Record<string, unknown>)
+          : m;
+      const name = asStr(basic.name);
+      if (!name) continue;
+      let start: number | undefined;
+      let end: number | undefined;
+      if (m.schedule && typeof m.schedule === "object") {
+        const s = m.schedule as Record<string, unknown>;
+        start = asDateMs(s.estimate_start_time);
+        end = asDateMs(s.estimate_finish_time);
+      }
+      nodes.push({ name, status: asStr(basic.status), start, end });
+    }
+    nodesCache.set(cacheKey, { at: Date.now(), nodes });
+    return nodes;
+  } catch {
+    return [];
+  }
+};
+
+/** 并发拉多个工作项的节点排期（限并发、看板聚合需求级跨度用） */
+export const fetchNodesForItems = async (
+  items: Array<{ id: string; projectKey?: string }>,
+  opts: { skipCache?: boolean } = {},
+): Promise<Map<string, WorkitemNode[]>> => {
+  const out = new Map<string, WorkitemNode[]>();
+  const CONCURRENCY = 8;
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(CONCURRENCY, items.length) }, async () => {
+    while (idx < items.length) {
+      const cur = items[idx++];
+      const nodes = await fetchWorkitemNodes(cur.id, cur.projectKey, opts);
+      out.set(cur.id, nodes);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+};
+
 // ---------- 空间 simple_name 解析（URL 拼接用） ----------
 
 // project_key（哈希）→ simple_name（URL 里的空间短名、如 wk-dm）缓存：

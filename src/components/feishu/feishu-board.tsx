@@ -50,6 +50,8 @@ export interface BoardItem {
   scheduleStart?: number;
   scheduleEnd?: number;
   url?: string;
+  /** 节点排期（甘特展开细节、服务端 workflow get-node 聚合） */
+  nodes?: Array<{ name: string; status?: string; start?: number; end?: number }>;
   task: BoardTaskBrief | null;
 }
 
@@ -118,11 +120,11 @@ export const FeishuBoard = () => {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (fresh = false) => {
     const seq = ++seqRef.current;
     setRefreshing(true);
     try {
-      const r = await fetch("/api/feishu/board?action=todo");
+      const r = await fetch(`/api/feishu/board?action=todo${fresh ? "&fresh=1" : ""}`);
       const data = (await r.json()) as BoardResp;
       try {
         sessionStorage.setItem(CACHE_KEY, JSON.stringify(data));
@@ -260,10 +262,10 @@ export const FeishuBoard = () => {
           size="icon-xs"
           variant="ghost"
           className="ml-auto"
-          onClick={() => void refresh()}
+          onClick={() => void refresh(true)}
           disabled={refreshing}
           aria-label="刷新"
-          title="刷新"
+          title="刷新（重新拉节点排期）"
         >
           <RefreshCw className={cn(refreshing && "animate-spin")} />
         </Button>
