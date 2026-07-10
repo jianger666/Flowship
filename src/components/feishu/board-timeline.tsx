@@ -16,7 +16,6 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
-import { ChoiceButton } from "@/components/ui/choice-button";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -24,6 +23,9 @@ import { cn } from "@/lib/utils";
 interface Props {
   items: BoardItem[];
   onOpen: (it: BoardItem) => void;
+  /** 时间范围（受控、V0.14.1 提升到 FeishuBoard——接口按区间查、变化要重拉） */
+  range: DayRange;
+  onRangeChange: (r: DayRange) => void;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -50,17 +52,9 @@ const toCols = (
   };
 };
 
-export const BoardTimeline = ({ items, onOpen }: Props) => {
-  // 时间范围（用户拍板）：默认今天前 3 天 ~ 后 10 天（两周、一屏正好放下）
-  const [range, setRange] = useState<DayRange>(() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
-  });
+export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) => {
   // 展开的需求 id 集合（展开 = 下方插节点排期子行）
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  // 只看自己的子任务（默认开、用户拍板「展开全部人的太多了」）
-  const [mineOnly, setMineOnly] = useState(true);
 
   const windowStart = range.from;
   // 窗口天数（含首尾）
@@ -117,10 +111,10 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     for (const { it, cols } of scheduled) {
       out.push({ kind: "item", item: it, cols });
       if (expanded.has(it.id)) {
-        // 只出子任务行（用户拍板：节点分组行不要、只关心自己的活）；
+        // 只出子任务行（workhour 排期语义下天然只有自己的、不再需要 mine 过滤）；
         // **窗口外的子任务不渲染**——原来挤在最左弱化显示、被误读成排在窗口头几天（用户实锤）
         for (const n of it.nodes ?? []) {
-          for (const s of (n.subTasks ?? []).filter((s) => !mineOnly || s.mine)) {
+          for (const s of n.subTasks ?? []) {
             const cols = toCols(s.start, s.end, windowStart, span);
             if (!cols) continue;
             out.push({
@@ -138,7 +132,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
       }
     }
     return out;
-  }, [items, windowStart, span, expanded, mineOnly]);
+  }, [items, windowStart, span, expanded]);
 
   const rowCount = Math.max(rows.length, 1);
 
@@ -178,16 +172,14 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     <div className="flex h-full flex-col gap-3">
       {/* 工具条：日期范围筛选（飞书同款）+ 前后平移 */}
       <div className="flex shrink-0 items-center gap-1.5">
-        <DateRangePicker value={range} onChange={setRange} />
+        <DateRangePicker value={range} onChange={onRangeChange} />
         <Button
           size="icon-xs"
           variant="ghost"
-          onClick={() =>
-            setRange((r) => {
-              const shift = Math.floor(span / 2) * DAY_MS;
-              return { from: r.from - shift, to: r.to - shift };
-            })
-          }
+          onClick={() => {
+            const shift = Math.floor(span / 2) * DAY_MS;
+            onRangeChange({ from: range.from - shift, to: range.to - shift });
+          }}
           aria-label="往前平移"
           title="往前平移"
         >
@@ -196,26 +188,15 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         <Button
           size="icon-xs"
           variant="ghost"
-          onClick={() =>
-            setRange((r) => {
-              const shift = Math.floor(span / 2) * DAY_MS;
-              return { from: r.from + shift, to: r.to + shift };
-            })
-          }
+          onClick={() => {
+            const shift = Math.floor(span / 2) * DAY_MS;
+            onRangeChange({ from: range.from + shift, to: range.to + shift });
+          }}
           aria-label="往后平移"
           title="往后平移"
         >
           <ChevronRight />
         </Button>
-        <div className="mx-1 h-4 w-px bg-border" />
-        <ChoiceButton
-          shape="chip"
-          selected={mineOnly}
-          onClick={() => setMineOnly((v) => !v)}
-          className="px-2.5 py-1 text-xs"
-        >
-          只看自己
-        </ChoiceButton>
         <span className="ml-auto text-xs text-muted-foreground">
           {rows.filter((r) => r.kind === "item").length} 项排期中 · 点条展开节点
         </span>

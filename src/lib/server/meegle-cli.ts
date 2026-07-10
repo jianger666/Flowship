@@ -250,39 +250,7 @@ const extractItems = (resp: unknown): unknown[] => {
   return [];
 };
 
-// ---------- 业务查询 ----------
-
-export type MyworkAction = "todo" | "done" | "overdue" | "this_week";
-
-/** 我的工作项（跨空间、不用配 space）——首页看板主数据源 */
-export const fetchMyWorkitems = async (
-  action: MyworkAction,
-  pageNum = 1,
-): Promise<BoardWorkitem[]> => {
-  const resp = await runMeegle([
-    "mywork",
-    "todo",
-    "--action",
-    action,
-    "--page-num",
-    String(pageNum),
-  ]);
-  const raw = extractItems(resp);
-  const parsed = raw
-    .map(normalizeWorkitem)
-    .filter((x): x is BoardWorkitem => x !== null);
-  // 诊断日志（同事「有排期但看板空」排查不了才加的）：原始条数 vs 解析成功条数——
-  // 两者差距大 = 响应结构变体没兜住；raw=0 = mywork 本身没返回
-  console.log(
-    `[meegle] mywork ${action} p${pageNum}：原始 ${raw.length} 条、解析成功 ${parsed.length} 条`,
-  );
-  if (raw.length > 0 && parsed.length === 0) {
-    console.warn(
-      `[meegle] mywork 全部解析失败、首条原始结构：${JSON.stringify(raw[0]).slice(0, 500)}`,
-    );
-  }
-  return parsed;
-};
+// ---------- 业务查询（mywork 已退役、V0.14.1 看板换 workhour list-schedule） ----------
 
 /** 工作项详情（预览页 / 任务详情融合用；默认字段已含 description） */
 export const fetchWorkitemDetail = async (
@@ -443,27 +411,159 @@ export const fetchNodesForItems = async (
   return out;
 };
 
-// ---------- 空间 simple_name 解析（URL 拼接用） ----------
+// ---------- 人员排期（V0.14.1 起看板主数据源、飞书「人员排期」视图同款接口） ----------
 
-// project_key（哈希）→ simple_name（URL 里的空间短名、如 wk-dm）缓存：
-// mywork 只给 project_key、拼详情页 URL 必须 simple_name（实测 project search 结构：
-// { projects: [{ name, project_key, simple_name }] }）。10 分钟缓存、空间列表极少变。
-let projectNameCache: { at: number; map: Map<string, string> } | null = null;
+/**
+ * 按空间 + 人 + 时间区间查排期（workhour list-schedule、实测结构）：
+ * ```
+ * user_workload_list[0].tasks[]: {
+ *   work_item_info: { id, name, work_item_status },
+ *   time: { start: "2026-06-15 00:00:00", end: "...", duration: 0.5 },   // 需求级排期
+ *   state: { state_name: "技术排期" },                                    // 当前节点名
+ *   subtasks: [{ id, name, time: {...} }],                               // 我的子任务
+ * }
+ * ```
+ * 为什么换它：mywork todo 只覆盖「当前节点等我操作」的工作项、同事的需求
+ * （子任务负责人、非节点 owner）拉不到、空间下拉也因此缺空间——workhour 是
+ * 飞书人员排期视图的底层接口、按空间查我参与的全部排期、语义正确。
+ */
+export const fetchUserSchedule = async (
+  projectKey: string,
+  userKey: string,
+  startMs: number,
+  endMs: number,
+): Promise<BoardWorkitem[]> => {
+  const fmt = (ms: number): string => {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const resp = (await runMeegle([
+    "workhour",
+    "list-schedule",
+    "--project-key",
+    projectKey,
+    "--user-keys",
+    JSON.stringify([userKey]),
+    "--start-time",
+    fmt(startMs),
+    "--end-time",
+    fmt(endMs),
+    "--work-item-type-keys",
+    '["_all"]',
+  ])) as Record<string, unknown>;
+
+  const workloads = Array.isArray(resp.user_workload_list)
+    ? (resp.user_workload_list as Array<Record<string, unknown>>)
+    : [];
+  const tasks = Array.isArray(workloads[0]?.tasks)
+    ? (workloads[0]!.tasks as Array<Record<string, unknown>>)
+    : [];
+
+  // "2026-06-15 00:00:00"（空格分隔）→ ms
+  const parseTime = (v: unknown): number | undefined => {
+    if (typeof v !== "string" || !v.trim()) return undefined;
+    const t = Date.parse(v.replace(" ", "T"));
+    return Number.isFinite(t) && t > 0 ? t : undefined;
+  };
+
+  const items: BoardWorkitem[] = [];
+  for (const task of tasks) {
+    const info =
+      task.work_item_info && typeof task.work_item_info === "object"
+        ? (task.work_item_info as Record<string, unknown>)
+        : {};
+    const id = asStr(info.id);
+    const name = asStr(info.name);
+    if (!id || !name) continue;
+
+    const time =
+      task.time && typeof task.time === "object"
+        ? (task.time as Record<string, unknown>)
+        : {};
+    const state =
+      task.state && typeof task.state === "object"
+        ? (task.state as Record<string, unknown>)
+        : {};
+
+    // 子任务（人员排期语义下天然只有自己的）
+    const subTasks: WorkitemSubTask[] = [];
+    if (Array.isArray(task.subtasks)) {
+      for (const sub of task.subtasks as Array<Record<string, unknown>>) {
+        const subName = asStr(sub.name);
+        if (!subName) continue;
+        const st =
+          sub.time && typeof sub.time === "object"
+            ? (sub.time as Record<string, unknown>)
+            : {};
+        subTasks.push({
+          name: subName,
+          start: parseTime(st.start),
+          end: parseTime(st.end),
+        });
+      }
+    }
+
+    const statusLabel = asStr(state.state_name);
+    items.push({
+      id,
+      name,
+      projectKey,
+      statusLabel,
+      scheduleStart: parseTime(time.start),
+      scheduleEnd: parseTime(time.end),
+      raw: task,
+    });
+    // 前端展开逻辑遍历 nodes 取 subTasks——包一层单节点结构复用现有渲染
+    const last = items[items.length - 1] as BoardWorkitem & {
+      nodes?: WorkitemNode[];
+    };
+    last.nodes =
+      subTasks.length > 0
+        ? [{ name: statusLabel ?? "排期", status: undefined, start: undefined, end: undefined, subTasks }]
+        : [];
+  }
+  console.log(
+    `[meegle] workhour ${projectKey} ${fmt(startMs)}~${fmt(endMs)}：原始 ${tasks.length} 条、解析 ${items.length} 条`,
+  );
+  return items;
+};
+
+// ---------- 空间列表（下拉数据源 + URL 拼接） ----------
+
+/** 可访问空间（project search 实测结构 { projects: [{ name, project_key, simple_name }] }） */
+export interface MeegleProject {
+  key: string;
+  name: string;
+  simpleName?: string;
+}
+
+// 空间列表缓存（10 分钟、空间极少变）——空间下拉 + URL 拼接共用
+let projectsCache: { at: number; list: MeegleProject[] } | null = null;
+
+/** 当前用户可访问的全部空间（V0.14.1 起空间下拉数据源——不再从数据聚合、
+ * 同事踩过：mywork 覆盖不全导致下拉缺空间、看不到自己需求所在的空间） */
+export const fetchProjects = async (): Promise<MeegleProject[]> => {
+  if (projectsCache && Date.now() - projectsCache.at < 10 * 60 * 1000) {
+    return projectsCache.list;
+  }
+  const resp = (await runMeegle(["project", "search"])) as Record<string, unknown>;
+  const projects = Array.isArray(resp.projects) ? resp.projects : [];
+  const list: MeegleProject[] = [];
+  for (const p of projects as Array<Record<string, unknown>>) {
+    const key = asStr(p.project_key);
+    const name = asStr(p.name);
+    if (key && name) list.push({ key, name, simpleName: asStr(p.simple_name) });
+  }
+  projectsCache = { at: Date.now(), list };
+  return list;
+};
 
 export const fetchProjectSimpleNames = async (): Promise<Map<string, string>> => {
-  if (projectNameCache && Date.now() - projectNameCache.at < 10 * 60 * 1000) {
-    return projectNameCache.map;
-  }
   const map = new Map<string, string>();
   try {
-    const resp = (await runMeegle(["project", "search"])) as Record<string, unknown>;
-    const projects = Array.isArray(resp.projects) ? resp.projects : [];
-    for (const p of projects as Array<Record<string, unknown>>) {
-      const key = asStr(p.project_key);
-      const simple = asStr(p.simple_name);
-      if (key && simple) map.set(key, simple);
+    for (const p of await fetchProjects()) {
+      if (p.simpleName) map.set(p.key, p.simpleName);
     }
-    projectNameCache = { at: Date.now(), map };
   } catch {
     // 拉不到就返回空 map（URL 兜底拼接降级为跳过）
   }

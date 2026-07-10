@@ -1,15 +1,18 @@
 "use client";
 
 /**
- * 首页飞书项目看板（V0.14.1 简化版、用户拍板「只要一个像飞书排期那样的甘特图」）
+ * 首页飞书排期甘特（V0.14.1 数据源重写、同事实测踩坑后定型）
  *
- * 数据源 /api/feishu/board（meegle mywork todo）：**跨空间**拉「我负责的待办工作项」
- *（12 个空间里指派给我的都在、不是单空间全量）+ 本地任务 join（AI 状态徽标）。
+ * 数据源 /api/feishu/board（meegle workhour list-schedule、飞书「人员排期」视图
+ * 同款接口）：按 空间 + 我 + 时间区间 查我参与的全部排期。
+ * 为什么不用 mywork todo：只覆盖「当前节点等我操作」的工作项、子任务负责人
+ *（非节点 owner）拉不到自己的需求、空间下拉也因此缺空间（同事踩过）。
  *
- * 形态：单一甘特视图（BoardTimeline、日期段筛选在甘特工具条里）。
- * 点击：已有任务 → 直进任务页；没有 → 工作项预览页（启动才建任务）。
- * 降级态：CLI 未装 / 未授权 → 引导卡；报错 → 重试。
- * sessionStorage 缓存秒开、后台刷新；请求序号防快速刷新竞态。
+ * - 空间列表 = project search 全量（下拉切换、记忆上次选择）
+ * - 时间范围变化 → 重新拉取（接口按区间查）
+ * - 点击：已有任务 → 任务页；没有 → 工作项预览页（启动才建任务）
+ * - 降级态：CLI 未装 / 未授权 → 引导卡；报错 → 重试
+ * - sessionStorage 缓存秒开、请求序号防竞态
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -17,6 +20,7 @@ import { useRouter } from "next/navigation";
 import { Plug, RefreshCw } from "lucide-react";
 
 import { BoardTimeline } from "@/components/feishu/board-timeline";
+import type { DayRange } from "@/components/ui/date-range-picker";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -50,7 +54,7 @@ export interface BoardItem {
   scheduleStart?: number;
   scheduleEnd?: number;
   url?: string;
-  /** 节点排期（甘特展开细节、服务端 workflow get-node 聚合、含子任务） */
+  /** 展开细节（workhour 排期语义下天然只有自己的子任务） */
   nodes?: Array<{
     name: string;
     status?: string;
@@ -61,8 +65,6 @@ export interface BoardItem {
       start?: number;
       end?: number;
       finished?: boolean;
-      /** 当前登录用户是负责人（「只看自己」过滤用、服务端标好） */
-      mine?: boolean;
     }>;
   }>;
   task: BoardTaskBrief | null;
@@ -74,9 +76,13 @@ interface BoardResp {
   status: BoardStatus;
   message?: string;
   items?: BoardItem[];
+  /** 可访问空间（project search 全量） */
+  projects?: Array<{ key: string; name: string }>;
 }
 
-const CACHE_KEY = "feaiflow.board.cache.v2";
+const CACHE_KEY = "feaiflow.board.cache.v3";
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SPACE_KEY = "feaiflow.board.space";
 
 // ---------- AI 任务状态徽标 ----------
 
@@ -117,29 +123,53 @@ export const FeishuBoard = () => {
   const [refreshing, setRefreshing] = useState(false);
   // 请求序号：旧请求晚到不覆盖新数据
   const seqRef = useRef(0);
+  // 选中空间（localStorage 记忆、首次 = 列表第一个）
+  const [spaceKey, setSpaceKey] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(SPACE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  // 时间范围（接口按区间查、变化触发重拉）：默认今天前 3 天 ~ 后 10 天
+  const [range, setRange] = useState<DayRange>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
+  });
 
-  // mount：先吃缓存秒开、再后台刷新
+  // mount：先吃缓存秒开（按空间分 key）、再后台刷新
   useEffect(() => {
     try {
-      const cached = sessionStorage.getItem(CACHE_KEY);
+      const cached = sessionStorage.getItem(`${CACHE_KEY}.${spaceKey ?? ""}`);
       if (cached) setResp(JSON.parse(cached) as BoardResp);
     } catch {
       /* 缓存坏了忽略 */
     }
-  }, []);
+  }, [spaceKey]);
 
-  const refresh = useCallback(async (fresh = false) => {
+  const refresh = useCallback(async () => {
     const seq = ++seqRef.current;
     setRefreshing(true);
     try {
-      const r = await fetch(`/api/feishu/board?action=todo${fresh ? "&fresh=1" : ""}`);
+      const qs = new URLSearchParams();
+      if (spaceKey) qs.set("project", spaceKey);
+      qs.set("from", String(range.from));
+      qs.set("to", String(range.to));
+      const r = await fetch(`/api/feishu/board?${qs.toString()}`);
       const data = (await r.json()) as BoardResp;
       try {
-        sessionStorage.setItem(CACHE_KEY, JSON.stringify(data));
+        sessionStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
       } catch {
         /* 超配额忽略 */
       }
-      if (seq === seqRef.current) setResp(data);
+      if (seq === seqRef.current) {
+        setResp(data);
+        // 没选过空间：默认列表第一个（触发下一轮带 project 的拉取）
+        if (!spaceKey && data.status === "ok" && (data.projects?.length ?? 0) > 0) {
+          setSpaceKey(data.projects![0].key);
+        }
+      }
     } catch (err) {
       if (seq === seqRef.current) {
         setResp({
@@ -150,7 +180,7 @@ export const FeishuBoard = () => {
     } finally {
       if (seq === seqRef.current) setRefreshing(false);
     }
-  }, []);
+  }, [spaceKey, range]);
 
   useEffect(() => {
     void refresh();
@@ -173,45 +203,17 @@ export const FeishuBoard = () => {
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
+  // 空间列表：project search 全量（V0.14.1、不再从数据聚合——mywork 覆盖不全踩过）
+  const spaces = resp?.projects ?? [];
 
-  // 空间切换（用户拍板「空间要可切、不要展示全部」）：
-  // mywork 数据本身跨空间、前端按 projectKey 过滤即可；空间列表从数据聚合。
-  // 选择记 localStorage、下次进来直接是上次看的空间；默认工作项最多的空间。
-  const spaces = useMemo(() => {
-    const m = new Map<string, { key: string; name: string; count: number }>();
-    for (const it of items) {
-      if (!it.projectKey) continue;
-      const cur = m.get(it.projectKey);
-      if (cur) cur.count += 1;
-      else m.set(it.projectKey, { key: it.projectKey, name: it.projectName ?? it.projectKey, count: 1 });
-    }
-    return [...m.values()].sort((a, b) => b.count - a.count);
-  }, [items]);
-  const [spaceKey, setSpaceKey] = useState<string | null>(null);
-  // 生效空间：显式选的 > localStorage 记忆（仍在列表里）> 工作项最多的
-  const effectiveSpace = useMemo(() => {
-    if (spaceKey && spaces.some((s) => s.key === spaceKey)) return spaceKey;
-    try {
-      const saved = localStorage.getItem("feaiflow.board.space");
-      if (saved && spaces.some((s) => s.key === saved)) return saved;
-    } catch {
-      /* noop */
-    }
-    return spaces[0]?.key ?? null;
-  }, [spaceKey, spaces]);
   const handlePickSpace = useCallback((key: string) => {
     setSpaceKey(key);
     try {
-      localStorage.setItem("feaiflow.board.space", key);
+      localStorage.setItem(SPACE_KEY, key);
     } catch {
       /* noop */
     }
   }, []);
-
-  const visibleItems = useMemo(
-    () => (effectiveSpace ? items.filter((it) => it.projectKey === effectiveSpace) : items),
-    [items, effectiveSpace],
-  );
 
   // ---------- 降级态 ----------
   if (resp && resp.status !== "ok") {
@@ -251,20 +253,20 @@ export const FeishuBoard = () => {
     <div className="mx-auto flex h-full w-full max-w-5xl flex-col gap-3 px-6 py-4">
       <div className="flex shrink-0 items-center gap-2.5">
         <h1 className="text-lg font-semibold tracking-tight">我的排期</h1>
-        {/* 空间切换：单选、不提供「全部」（用户拍板） */}
+        {/* 空间切换：单选、project search 全量（用户拍板「不要展示全部」混排） */}
         {spaces.length > 0 && (
-          <Select value={effectiveSpace ?? undefined} onValueChange={(v) => v && handlePickSpace(v)}>
+          <Select value={spaceKey ?? undefined} onValueChange={(v) => v && handlePickSpace(v)}>
             <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
               {/* SelectValue 默认渲染 value（projectKey 哈希）——显式渲染空间名（用户截图点名「这里是个 id」） */}
               <SelectValue placeholder="选择空间">
-                {spaces.find((s) => s.key === effectiveSpace)?.name ?? "选择空间"}
+                {spaces.find((s) => s.key === spaceKey)?.name ?? "选择空间"}
               </SelectValue>
             </SelectTrigger>
             {/* w-auto：默认弹层宽=触发器宽、长空间名被裁（用户截图踩过）——放开自适应 */}
             <SelectContent className="w-auto min-w-(--anchor-width) max-w-80">
               {spaces.map((s) => (
                 <SelectItem key={s.key} value={s.key}>
-                  {s.name}（{s.count}）
+                  {s.name}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -274,20 +276,25 @@ export const FeishuBoard = () => {
           size="icon-xs"
           variant="ghost"
           className="ml-auto"
-          onClick={() => void refresh(true)}
+          onClick={() => void refresh()}
           disabled={refreshing}
           aria-label="刷新"
-          title="刷新（重新拉节点排期）"
+          title="刷新"
         >
           <RefreshCw className={cn(refreshing && "animate-spin")} />
         </Button>
       </div>
 
       <div className="min-h-0 flex-1">
-        {resp === null ? (
-          <LoadingState variant="block" label="正在拉取飞书工作项…" />
+        {resp === null || (refreshing && items.length === 0) ? (
+          <LoadingState variant="block" label="正在拉取飞书排期…" />
         ) : (
-          <BoardTimeline items={visibleItems} onOpen={handleOpen} />
+          <BoardTimeline
+            items={items}
+            onOpen={handleOpen}
+            range={range}
+            onRangeChange={setRange}
+          />
         )}
       </div>
     </div>
