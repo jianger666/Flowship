@@ -28,13 +28,6 @@ interface Props {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEKDAY = ["日", "一", "二", "三", "四", "五", "六"];
-// 节点状态 → 中文（CLI basic.status 实测值）
-const NODE_STATUS_LABEL: Record<string, string> = {
-  not_started: "未开始",
-  doing: "进行中",
-  done: "已完成",
-};
-
 // 窗口内列区间（与窗口无交集返 null）
 const toCols = (
   start: number | undefined,
@@ -124,24 +117,15 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     for (const { it, cols } of scheduled) {
       out.push({ kind: "item", item: it, cols });
       if (expanded.has(it.id)) {
+        // 只出子任务行（用户拍板：【技术排期】【测试排期】节点分组行不要、只关心自己的活）
         for (const n of it.nodes ?? []) {
-          const subs = (n.subTasks ?? []).filter((s) => !mineOnly || s.mine);
-          // 节点行：有排期或有子任务才出（都没有的节点画不上轴、纯噪音）
-          if (n.start || n.end || subs.length > 0) {
-            out.push({
-              kind: "node",
-              parentId: it.id,
-              name: n.name,
-              status: n.status,
-              cols: toCols(n.start, n.end, windowStart, span),
-            });
-          }
-          // 子任务行（具体任务名、飞书展开的最细粒度）
-          for (const s of subs) {
+          for (const s of (n.subTasks ?? []).filter((s) => !mineOnly || s.mine)) {
             out.push({
               kind: "node",
               parentId: it.id,
               name: s.name,
+              // 节点名收进 tooltip（行上不占地）
+              status: n.name,
               isSub: true,
               finished: s.finished,
               cols: toCols(s.start, s.end, windowStart, span),
@@ -297,7 +281,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                 const tone = barTone(it);
                 const isOpen = expanded.has(it.id);
                 const hasNodes = (it.nodes ?? []).some(
-                  (n) => n.start || n.end || (n.subTasks ?? []).length > 0,
+                  (n) => (n.subTasks ?? []).length > 0,
                 );
                 const tip = `${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}${
                   it.projectName ? `（${it.projectName}）` : ""
@@ -353,13 +337,11 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
               // 展开子行：节点行（分组标题感）/ 子任务行（具体任务名）。
               // 文字超出条宽 → 省略号、hover title 看全部（用户拍板、不再溢出条外）
               const cols = row.cols;
-              const label = `${row.isSub ? row.name : `【${row.name}】`}${
-                !row.isSub && row.status && NODE_STATUS_LABEL[row.status]
-                  ? ` · ${NODE_STATUS_LABEL[row.status]}`
-                  : ""
-              }${row.isSub && row.finished ? " ✓" : ""}${!cols ? "（窗口外）" : ""}`;
+              const label = `${row.name}${row.finished ? " ✓" : ""}${!cols ? "（窗口外）" : ""}`;
+              // tooltip 补节点归属（行上不占地、悬停可查）
+              const tipLabel = row.status ? `${label}（${row.status}）` : label;
               return (
-                <Tooltip key={`n-${row.parentId}-${row.name}-${idx}`} content={label} delay={100} side="top">
+                <Tooltip key={`n-${row.parentId}-${row.name}-${idx}`} content={tipLabel} delay={100} side="top">
                 <div
                   className={cn(
                     "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center overflow-hidden rounded pl-1.5 pr-2",
