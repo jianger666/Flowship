@@ -101,7 +101,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         /** 子任务行（缩进更深、名字是具体任务名——用户点名要的层级） */
         isSub?: boolean;
         finished?: boolean;
-        cols: NonNullable<ReturnType<typeof toCols>> | null;
+        cols: NonNullable<ReturnType<typeof toCols>>;
       };
 
   const rows = useMemo<RenderRow[]>(() => {
@@ -117,9 +117,12 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     for (const { it, cols } of scheduled) {
       out.push({ kind: "item", item: it, cols });
       if (expanded.has(it.id)) {
-        // 只出子任务行（用户拍板：【技术排期】【测试排期】节点分组行不要、只关心自己的活）
+        // 只出子任务行（用户拍板：节点分组行不要、只关心自己的活）；
+        // **窗口外的子任务不渲染**——原来挤在最左弱化显示、被误读成排在窗口头几天（用户实锤）
         for (const n of it.nodes ?? []) {
           for (const s of (n.subTasks ?? []).filter((s) => !mineOnly || s.mine)) {
+            const cols = toCols(s.start, s.end, windowStart, span);
+            if (!cols) continue;
             out.push({
               kind: "node",
               parentId: it.id,
@@ -128,7 +131,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
               status: n.name,
               isSub: true,
               finished: s.finished,
-              cols: toCols(s.start, s.end, windowStart, span),
+              cols,
             });
           }
         }
@@ -337,7 +340,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
               // 展开子行：节点行（分组标题感）/ 子任务行（具体任务名）。
               // 文字超出条宽 → 省略号、hover title 看全部（用户拍板、不再溢出条外）
               const cols = row.cols;
-              const label = `${row.name}${row.finished ? " ✓" : ""}${!cols ? "（窗口外）" : ""}`;
+              const label = `${row.name}${row.finished ? " ✓" : ""}`;
               // tooltip 补节点归属（行上不占地、悬停可查）
               const tipLabel = row.status ? `${label}（${row.status}）` : label;
               return (
@@ -350,14 +353,10 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                       : "border border-muted-foreground/25 bg-muted-foreground/10",
                     row.finished && "opacity-55",
                   )}
-                  style={
-                    cols
-                      ? {
-                          gridColumn: `${cols.colStart + 1} / ${cols.colEnd + 2}`,
-                          gridRow: idx + 2,
-                        }
-                      : { gridColumn: "1 / 5", gridRow: idx + 2, opacity: 0.45 }
-                  }
+                  style={{
+                    gridColumn: `${cols.colStart + 1} / ${cols.colEnd + 2}`,
+                    gridRow: idx + 2,
+                  }}
                 >
                   <span
                     className={cn(
