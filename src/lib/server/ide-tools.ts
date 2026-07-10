@@ -223,6 +223,58 @@ const findWinExeInDirs = (
   return null;
 };
 
+/**
+ * Windows 注册表探测（V0.14.x、同事把 IDEA 装在 D:\ 自定义目录、常规目录 + PATH 都探不到）：
+ * JetBrains 安装器会往卸载表写 DisplayName + InstallLocation——
+ * `reg query ...\Uninstall /s /f "<DisplayName 前缀>" /d` 一次查出安装位置。
+ * HKLM（所有用户安装）+ HKCU（仅当前用户安装）都扫；查询失败 / 超时静默降级。
+ */
+const findWinRegistryInstall = async (
+  displayNamePrefix: string,
+  relExe: string,
+): Promise<string | null> => {
+  const hives = [
+    "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+  ];
+  for (const hive of hives) {
+    try {
+      const { stdout } = await execFileAsync(
+        "reg",
+        ["query", hive, "/s", "/f", displayNamePrefix, "/d"],
+        { timeout: 10_000 },
+      );
+      // 输出形如：
+      //   HKEY_LOCAL_MACHINE\...\Uninstall\IntelliJ IDEA 2024.3.5
+      //       DisplayName    REG_SZ    IntelliJ IDEA 2024.3.5
+      // 命中的子键名就含安装目录信息——但 InstallLocation 才是权威、逐个子键再查
+      const keys = stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => /^HKEY_/.test(l));
+      for (const key of keys) {
+        try {
+          const { stdout: loc } = await execFileAsync(
+            "reg",
+            ["query", key, "/v", "InstallLocation"],
+            { timeout: 5_000 },
+          );
+          const m = loc.match(/InstallLocation\s+REG_SZ\s+(.+)/);
+          const installDir = m?.[1]?.trim();
+          if (!installDir) continue;
+          const exe = path.join(installDir, relExe);
+          if (existsSync(exe)) return exe;
+        } catch {
+          // 该子键没有 InstallLocation、看下一个
+        }
+      }
+    } catch {
+      // 该 hive 无命中 / reg 查询失败、试下一个
+    }
+  }
+  return null;
+};
+
 // PATH 探测（where / which）
 const findOnPath = async (bins: string[]): Promise<string | null> => {
   const probe = process.platform === "win32" ? "where" : "which";
@@ -303,6 +355,13 @@ const detectOne = async (spec: IdeSpec): Promise<DetectResult> => {
           return { available: true, exec: script, isCmdScript: true };
         }
       }
+      // 注册表兜底（V0.14.x）：安装器装到自定义目录（如 D:\Idea\...）时上面全探不到——
+      // 卸载表的 InstallLocation 是权威安装位（同事诊断包实锤：IDEA 2024.3.5 装 D 盘没检出）
+      const regExe = await findWinRegistryInstall(
+        spec.winDirPrefix!,
+        path.join("bin", spec.winExeName!),
+      );
+      if (regExe) return { available: true, exec: regExe };
     }
   }
   const onPath = await findOnPath(spec.pathBins);

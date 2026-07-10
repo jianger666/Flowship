@@ -181,7 +181,8 @@ export const FeishuCliCard = () => {
                 </Button>
               </>
             )}
-            {/* 登录中：服务端已尝试自动开浏览器、链接兜底（二维码试过、用户嫌丑撤了） */}
+            {/* 登录中：服务端已尝试自动开浏览器（首次登录分两步：建应用 → 授权、
+                两个页面会依次弹出）、链接兜底（二维码试过、用户嫌丑撤了） */}
             {login?.running && login.authUrl && (
               <a
                 href={login.authUrl}
@@ -189,7 +190,7 @@ export const FeishuCliCard = () => {
                 rel="noopener noreferrer"
                 className="text-xs text-primary underline-offset-2 hover:underline"
               >
-                浏览器没弹？点这里授权
+                浏览器没弹？点这里继续（建应用后还有一步授权）
               </a>
             )}
             {login?.error && (

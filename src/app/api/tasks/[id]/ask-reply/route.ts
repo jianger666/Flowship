@@ -40,7 +40,11 @@ import type {
   ImageAttachmentSaved,
 } from "@/lib/server/task-artifacts";
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
-import { deliverAskReply, supersedePendingAsks } from "@/lib/server/task-runner";
+import {
+  deliverAskReply,
+  resumeCurrentActionWithMessage,
+  supersedePendingAsks,
+} from "@/lib/server/task-runner";
 import { agentSessions, publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
@@ -375,9 +379,58 @@ export const POST = async (req: Request, { params }: Ctx) => {
     },
   );
   if (!ok) {
-    // 会话已死 = 这组 ask 的答案永远送不到——当场作废旧弹窗 + 清 pending，
-    // 否则弹窗永远卡着（用户踩过：改用输入条把任务跑起来了、旧弹窗还挂着、再答又 409）。
-    // 之后重新「推进」时 advance 的 supersede 本来就忽略返回值、不影响任何续传逻辑。
+    // V0.14.x（用户点名「AI 断开时提问没法提交」）：会话死不再丢答案 + 报错让用户
+    // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去（question 路由
+    // 唤醒模式同款）。顺序关键：先 clearPendingAsk（答案已拿到、这组不再 pending）、
+    // 唤醒内部的 supersedePendingAsks 就不会把已答的这组再列成「未答问题」重问。
+    const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
+    const model =
+      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+        : undefined;
+    const currentAction = task.actions.find((a) => a.id === task.currentActionId);
+    if (currentAction && apiKey && model) {
+      clearPendingAsk(task.id);
+      // 答案落档（用户视角：已答、事件流可见）、新 agent 从 userMessage 里拿全文
+      const replyEv = await appendEvent(task.id, {
+        kind: "ask_user_reply",
+        actionId: reqEvent.actionId,
+        text: replyText,
+        meta: {
+          askId,
+          answers,
+          ...(deferred ? { deferred: true } : {}),
+          ...(allSaved.length > 0 ? { images: allSaved } : {}),
+        },
+      });
+      if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
+      console.log(
+        `[ask-reply] task=${task.id} askId=${askId} 会话已死、走唤醒兜底（新 agent 接手、答案随消息带过去）`,
+      );
+      void resumeCurrentActionWithMessage({
+        task,
+        userMessage: replyText,
+        imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        apiKey,
+        fallbackModel: model,
+        gitHost: body.bootArgs?.gitHost?.trim() || undefined,
+        gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+      }).catch(async (err) => {
+        console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
+        const ev = await appendEvent(task.id, {
+          kind: "error",
+          actionId: reqEvent.actionId,
+          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+        });
+        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
+      });
+      const fresh = await getTask(task.id);
+      return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    // 没凭据 / 没有当前 action（极端）：维持原作废 + 报错兜底
     await supersedePendingAsks(task.id, "会话已失效");
     clearPendingAsk(task.id);
     return errorResponse(

@@ -334,6 +334,8 @@ interface LoginState {
   running: boolean;
   // 输出里抓到的最后一个 https URL（CLI 自己会开浏览器、这里给 UI 兜底展示）
   authUrl?: string;
+  // 已自动开过浏览器的 URL 计数（两步流程会先后出两个 URL、上限 3 防误开一堆 tab）
+  openedUrls?: number;
   tail: string[];
   error?: string;
   exitCode?: number | null;
@@ -406,26 +408,28 @@ export const startLogin = async (
         state.tail.push(trimmed);
         if (state.tail.length > 50) state.tail.shift();
         // 抓授权 URL（CLI 会打印）。用户实测 CLI 不一定自动开浏览器（spawn 子进程环境）——
-        // 首次抓到时服务端主动开系统浏览器；UI 同时展示链接 + 二维码兜底
+        // 服务端主动开系统浏览器；UI 同时展示链接 + 二维码兜底。
+        // V0.14.x：lark-cli `config init --new` 是**两步**（建应用 → 授权）、CLI 会先后
+        // 打印两个不同 URL——**每个新 URL 都要开**（原来只开第一个、用户卡在第二步
+        // 授权不知道要操作、只能靠 AI 聊天时提醒）
         const m = trimmed.match(/https:\/\/\S+/);
-        if (m) {
-          const first = !state.authUrl;
+        // 最多自动开 3 个不同 URL（两步流程足够）、防 CLI 输出里夹文档链接开一堆 tab
+        if (m && m[0] !== state.authUrl && (state.openedUrls ?? 0) < 3) {
+          state.openedUrls = (state.openedUrls ?? 0) + 1;
           state.authUrl = m[0];
-          if (first) {
-            const opener =
-              process.platform === "darwin"
-                ? ["open", [m[0]]]
-                : process.platform === "win32"
-                  ? ["cmd", ["/c", "start", "", m[0]]]
-                  : ["xdg-open", [m[0]]];
-            try {
-              spawn(opener[0] as string, opener[1] as string[], {
-                detached: true,
-                stdio: "ignore",
-              }).unref();
-            } catch {
-              // 打不开就靠 UI 链接 / 二维码
-            }
+          const opener =
+            process.platform === "darwin"
+              ? ["open", [m[0]]]
+              : process.platform === "win32"
+                ? ["cmd", ["/c", "start", "", m[0]]]
+                : ["xdg-open", [m[0]]];
+          try {
+            spawn(opener[0] as string, opener[1] as string[], {
+              detached: true,
+              stdio: "ignore",
+            }).unref();
+          } catch {
+            // 打不开就靠 UI 链接 / 二维码
           }
         }
       }
