@@ -232,7 +232,7 @@ const AskQuestionItem = ({
             value={text}
             onChange={(e) => setText(e.target.value)}
             onPaste={onPaste}
-            placeholder="输入你的回答…（可粘贴 / 拖拽贴图、或写「不清楚 / 你定」让 AI 按 default 走）"
+            placeholder="输入你的回答…"
             rows={3}
             className="resize-none bg-background text-sm"
             disabled={submitting}

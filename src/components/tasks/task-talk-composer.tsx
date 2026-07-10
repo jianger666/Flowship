@@ -28,6 +28,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import { getSettings } from "@/lib/local-store";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitTaskQuestion } from "@/lib/task-store";
@@ -72,6 +73,16 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
 
   // agent 在跑时不可说；任务终态整条隐藏
   const busy = submitting || task.runStatus === "running";
+
+  // 有未答提问（且当前阶段没停摆）→ 输入条切「答题引导态」：禁输入、placeholder 指路。
+  // 原来能输入、回车才 toast 报 409——用户验收点名「卡点要提前可视化」。
+  // 阶段停摆（error/cancelled）时提问已没人接、照常放行（唤醒通道）。
+  const halted = task.actions.some(
+    (a) =>
+      a.id === task.currentActionId &&
+      (a.status === "error" || a.status === "cancelled"),
+  );
+  const awaitingAnswer = !halted && !!findPendingAskEvent(task.events);
 
   const handleSubmit = async () => {
     const text = draft.trim();
@@ -169,9 +180,11 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               void handleSubmit();
             }
           }}
-          placeholder="想改、想问、贴图都行（⌘/Ctrl+J）"
+          placeholder={
+            awaitingAnswer ? "先回答上方 AI 的提问" : "想改、想问、贴图都行（⌘/Ctrl+J）"
+          }
           rows={2}
-          disabled={busy}
+          disabled={busy || awaitingAnswer}
           style={boxHeight != null ? { height: boxHeight } : undefined}
           // 没手动拖过：field-sizing 随内容自增、max-h 兜顶；拖过：固定高度接管
           className={cn(
@@ -186,7 +199,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
             models={models}
             selection={pickedModel}
             onChange={setPickedModel}
-            disabled={busy}
+            disabled={busy || awaitingAnswer}
             variant="compact"
             emptyPlaceholder="模型 · 跟随会话"
             followOption="跟随会话"
@@ -201,7 +214,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               size="icon-xs"
               variant="ghost"
               onClick={attach.triggerFilePicker}
-              disabled={busy || attach.images.length >= attach.maxImages}
+              disabled={busy || awaitingAnswer || attach.images.length >= attach.maxImages}
               aria-label="附图"
               title="附图（也可直接粘贴）"
               className="text-muted-foreground/70"
@@ -213,7 +226,9 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               variant="ghost"
               onClick={() => void handleSubmit()}
               disabled={
-                busy || (draft.trim().length === 0 && attach.images.length === 0)
+                busy ||
+                awaitingAnswer ||
+                (draft.trim().length === 0 && attach.images.length === 0)
               }
               aria-label="发送"
               title="发送"

@@ -90,7 +90,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       (a.status === "error" || a.status === "cancelled"),
   );
   if (getPendingAsk(task.id) && !haltedAction) {
-    return errorResponse("AI 正在弹窗等你回答、先答完弹窗里的问题", 409);
+    return errorResponse("先回答上方 AI 的提问", 409);
   }
 
   // 图先落盘（给 agent read 的绝对路径 + 事件缩略图 meta）
