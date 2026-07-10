@@ -26,6 +26,7 @@ import dynamic from "next/dynamic";
 import { FileText, Info, Layers } from "lucide-react";
 import {
   Streamdown,
+  defaultRemarkPlugins,
   type Components,
   type ThemeInput,
 } from "streamdown";
@@ -46,6 +47,12 @@ const ARTIFACT_STREAMDOWN_PLUGINS = {
 const ARTIFACT_SHIKI_THEME: [ThemeInput, ThemeInput] = [
   "github-light",
   "github-dark",
+];
+// remark 插件：带上 defaultRemarkPlugins（含 gfm）再追加自定义（审计 P1、同 markdown-text）
+const ARTIFACT_REMARK_PLUGINS = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkKeepTrailingUnderscore,
+  remarkTrimAutolinkCjk,
 ];
 
 import { MarkdownLink } from "@/components/markdown-link";
@@ -154,28 +161,19 @@ const buildMarkdownComponents = (
   onArtifactRefClick: ((ref: ActionArtifactRef) => void) | undefined,
 ): Components => (({
   // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
-  // （inline code 路径的 cursor:// 跳转在下面 code 组件、不受影响）
   a: MarkdownLink,
   // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
   img: MarkdownImage,
-  // 只覆盖 inline code、fenced code block 走默认渲染（Streamdown code 插件接管）。
-  // 显式标 props 类型——外层对象整体断言成 Components 后会丢失参数推断
-  code: ({
-    className,
+  // 只覆盖 **inline code**（走 Streamdown 的 inlineCode 槽、审计 P1：原来覆盖 code
+  // 会连 fenced 一起接管、fenced 失去 Shiki 高亮）——fenced 交给 code 插件的 CodeBlock。
+  // inline code 里识别文件路径 / artifact 引用、转可点跳转（跳 IDE / 跳 action）
+  inlineCode: ({
     children,
     ...rest
   }: {
-    className?: string;
     children?: React.ReactNode;
     [key: string]: unknown;
   }) => {
-    if (className) {
-      return (
-        <code className={className} {...rest}>
-          {children}
-        </code>
-      );
-    }
     const text = String(children ?? "");
     const ref = looksLikeArtifactRef(text);
     if (ref && onArtifactRefClick) {
@@ -656,10 +654,7 @@ export const ArtifactPanel = ({
                 mode="static"
                 shikiTheme={ARTIFACT_SHIKI_THEME}
                 plugins={ARTIFACT_STREAMDOWN_PLUGINS}
-                remarkPlugins={[
-                  remarkKeepTrailingUnderscore,
-                  remarkTrimAutolinkCjk,
-                ]}
+                remarkPlugins={ARTIFACT_REMARK_PLUGINS}
                 components={markdownComponents}
               >
                 {currentArtifact.content}

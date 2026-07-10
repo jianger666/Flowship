@@ -21,6 +21,7 @@
 import { memo } from "react";
 import {
   Streamdown,
+  defaultRemarkPlugins,
   type Components,
   type ThemeInput,
 } from "streamdown";
@@ -41,6 +42,14 @@ import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
 // Shiki 主题对（浅 / 深）——跟站内 next-themes 的 .light/.dark 对齐
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
+// remark 插件：**必须带上 Streamdown 内置的 defaultRemarkPlugins（含 remark-gfm）**——
+// 直接传 remarkPlugins 是整表替换、不追加、漏了 gfm 表格/删除线/autolink 全失效
+//（审计 P1 实锤）；我们两个自定义插件跟在其后
+const REMARK_PLUGINS = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkKeepTrailingUnderscore,
+  remarkTrimAutolinkCjk,
+];
 // a/img 覆盖：我们的组件用宽松 props（string|Blob 等）、跟 Streamdown Components 的
 // 严格签名对不上、这里整体断言（运行时形状兼容、只是类型系统更严）
 const MARKDOWN_COMPONENTS = {
@@ -67,10 +76,11 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
     <Streamdown
       mode={streaming ? "streaming" : "static"}
       isAnimating={streaming}
+      // 流式末尾闪烁光标（审计 P1：caret 无默认、不显式传就没光标）
+      caret={streaming ? "block" : undefined}
       shikiTheme={SHIKI_THEME}
       plugins={STREAMDOWN_PLUGINS}
-      // keepTrailingUnderscore / trimAutolinkCjk：GFM 之后跑（remend 修尾 _ / CJK autolink）
-      remarkPlugins={[remarkKeepTrailingUnderscore, remarkTrimAutolinkCjk]}
+      remarkPlugins={REMARK_PLUGINS}
       components={MARKDOWN_COMPONENTS}
     >
       {text}

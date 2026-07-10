@@ -46,13 +46,14 @@ const taskStageLine = (
   }
   if (task.runStatus === "awaiting_user") {
     // awaiting_ack = 交卷等审阅；running（此刻不在跑但 action 挂 running）= agent 提问等答
-    const status =
-      task.lastActionStatus === "awaiting_ack"
-        ? "待确认"
-        : task.lastActionStatus === "running"
-          ? "待回答"
-          : "等待中";
-    return { stage, status, tone: "wait" };
+    if (task.lastActionStatus === "awaiting_ack") {
+      return { stage, status: "待确认", tone: "wait" };
+    }
+    if (task.lastActionStatus === "running") {
+      return { stage, status: "待回答", tone: "wait" };
+    }
+    // completed / cancelled 等静息态：没有真正等你的事、按空闲显示（不用琥珀色误导）
+    return { stage, status: "空闲", tone: "idle" };
   }
   return { stage, status: "空闲", tone: "idle" };
 };
