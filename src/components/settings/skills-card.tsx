@@ -48,7 +48,6 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LoadingState } from "@/components/ui/loading-state";
-import { Textarea } from "@/components/ui/textarea";
 import { useDialog } from "@/hooks/use-dialog";
 import { getSettings } from "@/lib/local-store";
 import { setPendingSlashSkill } from "@/components/slash-skills";
