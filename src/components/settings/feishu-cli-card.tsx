@@ -11,8 +11,10 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, Download, Loader2, LogIn, XCircle } from "lucide-react";
+import { CheckCircle2, Download, Loader2, LogIn, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
+
+import { useDialog } from "@/hooks/use-dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -50,6 +52,7 @@ const TOOL_LABEL: Record<"larkCli" | "meegle", string> = {
 
 
 export const FeishuCliCard = () => {
+  const { confirm } = useDialog();
   // 服务端状态快照（轮询）
   const [state, setState] = useState<FeishuCliState | null>(null);
   // 操作请求飞行中（防双击）
@@ -112,6 +115,28 @@ export const FeishuCliCard = () => {
         return;
       }
       toast.success("登录流程已启动、浏览器会自动打开授权页");
+      void refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleUninstall = async () => {
+    const ok = await confirm({
+      title: "卸载飞书 CLI？",
+      description: "删除两个 CLI 和官方 skills、登录态保留、可随时重装",
+      destructive: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const res = await fetch("/api/system/feishu-cli", { method: "DELETE" });
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) {
+        toast.error(data.error ?? "卸载失败");
+        return;
+      }
+      toast.success("已卸载");
       void refresh();
     } finally {
       setBusy(false);
@@ -208,6 +233,20 @@ export const FeishuCliCard = () => {
           )}
           {!installing && state?.install.error && (
             <span className="text-xs text-destructive">{state.install.error}</span>
+          )}
+          {/* 卸载（用户点名「万一想卸载后重装」）：装了任一才显示 */}
+          {!installing && (state?.larkCli.installed || state?.meegle.installed) && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => void handleUninstall()}
+              className="ml-auto text-muted-foreground hover:text-destructive"
+            >
+              <Trash2 />
+              卸载
+            </Button>
           )}
         </div>
         {renderToolRow("larkCli")}

@@ -1,9 +1,10 @@
 /**
  * 飞书 CLI 集成状态 / 操作（V0.12 P0）
  *
- * GET  → { larkCli, meegle, install, logins }（设置页轮询）
- * POST → { action: "install" } 一键安装两个 CLI + 官方 skills
- *        { action: "login", tool: "lark-cli" | "meegle", meegleHost? } 发起登录
+ * GET    → { larkCli, meegle, install, logins }（设置页轮询）
+ * POST   → { action: "install" } 一键安装两个 CLI + 官方 skills
+ *          { action: "login", tool: "lark-cli" | "meegle", meegleHost? } 发起登录
+ * DELETE → 卸载（bin + skills 删除、HOME 级登录态保留、重装即用）
  */
 
 import { NextResponse } from "next/server";
@@ -14,6 +15,7 @@ import {
   getLoginState,
   startInstall,
   startLogin,
+  uninstallFeishuTools,
 } from "@/lib/server/feishu-cli";
 import { errorResponse } from "@/lib/server/route-helpers";
 
@@ -61,4 +63,13 @@ export const POST = async (req: Request) => {
   }
 
   return errorResponse("未知 action");
+};
+
+export const DELETE = async () => {
+  try {
+    await uninstallFeishuTools();
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return errorResponse(err instanceof Error ? err.message : String(err), 409);
+  }
 };

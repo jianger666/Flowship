@@ -279,6 +279,20 @@ const G = globalThis as unknown as {
   __feishuCliLogins?: Map<string, LoginState>;
 };
 
+/**
+ * 卸载（V0.14.x 用户点名「万一想卸载后重装」）：删 bin（两个 CLI 二进制）+ skills
+ *（官方技能）。HOME 级登录态（~/.lark-cli / ~/.meegle）不动——重装后即用、
+ * 想彻底重来的用户可以自己清（或以后加选项）。
+ */
+export const uninstallFeishuTools = async (): Promise<void> => {
+  if (getInstallState().running) {
+    throw new Error("安装进行中、等安装完成后再卸载");
+  }
+  await fs.rm(getToolsBinDir(), { recursive: true, force: true });
+  await fs.rm(getToolsSkillsDir(), { recursive: true, force: true });
+  console.log("[feishu-cli] 已卸载（bin + skills 删除、登录态保留）");
+};
+
 export const getInstallState = (): InstallState =>
   (G.__feishuCliInstall ??= { running: false, log: [] });
 
