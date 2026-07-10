@@ -57,11 +57,11 @@ const toCols = (
 };
 
 export const BoardTimeline = ({ items, onOpen }: Props) => {
-  // 时间范围（用户拍板「像飞书那样的日期范围筛选」）：默认今天前 7 天 ~ 后 21 天
+  // 时间范围（用户拍板）：默认今天前 3 天 ~ 后 10 天（两周、一屏正好放下）
   const [range, setRange] = useState<DayRange>(() => {
     const d = new Date();
     d.setHours(0, 0, 0, 0);
-    return { from: d.getTime() - 7 * DAY_MS, to: d.getTime() + 21 * DAY_MS };
+    return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
   });
   // 展开的需求 id 集合（展开 = 下方插节点排期子行）
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -237,7 +237,11 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
       <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border/60">
         <div
           className="relative grid min-w-full"
-          style={{ gridTemplateColumns: `repeat(${span}, minmax(28px, 1fr))` }}
+          style={{
+            gridTemplateColumns: `repeat(${span}, minmax(56px, 1fr))`,
+            // 每列保底 56px：跨度大时横向滚动、一屏可见约半个月（用户拍板「太窄了」）
+            minWidth: `${span * 56}px`,
+          }}
         >
           {/* 日期头（sticky 顶部） */}
           {days.map((d, i) => (
@@ -331,24 +335,33 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                       title={`${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}${
                         it.projectName ? `（${it.projectName}）` : ""
                       }`}
-                      className="flex items-center gap-1.5 whitespace-nowrap text-left"
+                      className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                     >
-                      <span className="text-xs font-medium">{it.name}</span>
+                      <span className="min-w-0 truncate text-xs font-medium">{it.name}</span>
                       {it.statusLabel && (
-                        <span className="text-[10px] text-muted-foreground">{it.statusLabel}</span>
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {it.statusLabel}
+                        </span>
                       )}
                       <AiStatusBadge task={it.task} />
                     </button>
                   </div>
                 );
               }
-              // 展开子行：节点行（分组标题感）/ 子任务行（具体任务、用户要看的名字）
+              // 展开子行：节点行（分组标题感）/ 子任务行（具体任务名）。
+              // 文字超出条宽 → 省略号、hover title 看全部（用户拍板、不再溢出条外）
               const cols = row.cols;
+              const label = `${row.isSub ? row.name : `【${row.name}】`}${
+                !row.isSub && row.status && NODE_STATUS_LABEL[row.status]
+                  ? ` · ${NODE_STATUS_LABEL[row.status]}`
+                  : ""
+              }${row.isSub && row.finished ? " ✓" : ""}${!cols ? "（窗口外）" : ""}`;
               return (
                 <div
                   key={`n-${row.parentId}-${row.name}-${idx}`}
+                  title={label}
                   className={cn(
-                    "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center rounded pl-1.5 pr-2",
+                    "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center overflow-hidden rounded pl-1.5 pr-2",
                     row.isSub
                       ? "border border-primary/35 bg-primary/14"
                       : "border border-muted-foreground/25 bg-muted-foreground/10",
@@ -359,23 +372,17 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                       ? {
                           gridColumn: `${cols.colStart + 1} / ${cols.colEnd + 2}`,
                           gridRow: idx + 2,
-                          overflow: "visible",
                         }
                       : { gridColumn: "1 / 5", gridRow: idx + 2, opacity: 0.45 }
                   }
                 >
                   <span
                     className={cn(
-                      "whitespace-nowrap text-[10px]",
+                      "min-w-0 truncate text-[10px]",
                       row.isSub ? "text-foreground/80" : "text-muted-foreground",
                     )}
                   >
-                    {row.isSub ? row.name : `【${row.name}】`}
-                    {!row.isSub && row.status && NODE_STATUS_LABEL[row.status]
-                      ? ` · ${NODE_STATUS_LABEL[row.status]}`
-                      : ""}
-                    {row.isSub && row.finished ? " ✓" : ""}
-                    {!cols && "（窗口外）"}
+                    {label}
                   </span>
                 </div>
               );

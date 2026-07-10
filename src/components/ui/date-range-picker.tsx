@@ -93,41 +93,39 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
         }
       />
       <PopoverContent align="start" className="w-auto p-3">
-        <div
-          className="flex flex-col gap-2"
-          // react-day-picker 主题变量接 app token（dark 自动跟随）；不用 styled-jsx（App Router 下多一层风险）
-          style={
-            {
-              // v10 真实变量名（node_modules style.css 核对过）——range_middle 的
-              // 背景不覆盖会用默认 accent-background、dark 下渲染成大白块（用户截图踩过）
-              "--rdp-accent-color": "var(--primary)",
-              "--rdp-accent-background-color":
-                "color-mix(in oklab, var(--primary) 16%, transparent)",
-              "--rdp-range_middle-background-color":
-                "color-mix(in oklab, var(--primary) 16%, transparent)",
-              "--rdp-range_middle-color": "var(--foreground)",
-              "--rdp-range_start-background":
-                "color-mix(in oklab, var(--primary) 16%, transparent)",
-              "--rdp-range_end-background":
-                "color-mix(in oklab, var(--primary) 16%, transparent)",
-              "--rdp-range_start-color": "var(--primary-foreground)",
-              "--rdp-range_end-color": "var(--primary-foreground)",
-              "--rdp-range_start-date-background-color": "var(--primary)",
-              "--rdp-range_end-date-background-color": "var(--primary)",
-              "--rdp-selected-border": "1px solid var(--primary)",
-              "--rdp-today-color": "var(--primary)",
-              "--rdp-day-height": "30px",
-              "--rdp-day-width": "30px",
-              "--rdp-day_button-height": "28px",
-              "--rdp-day_button-width": "28px",
-              fontSize: "12px",
-            } as React.CSSProperties
-          }
-        >
+        <div className="flex flex-col gap-2">
           <DayPicker
             mode="range"
             numberOfMonths={2}
             locale={zhCN}
+            // ⚠️ 主题变量必须打在 DayPicker 自己的 root 上（style prop → 内联优先级最高）：
+            // 它的 .rdp-root 类自带同名变量默认值、写在外层 div 的继承会被覆盖——
+            // 之前写外层导致选中区间渲染成大白块（用户截图两连踩）
+            style={
+              {
+                "--rdp-accent-color": "var(--primary)",
+                "--rdp-accent-background-color":
+                  "color-mix(in oklab, var(--primary) 16%, transparent)",
+                "--rdp-range_middle-background-color":
+                  "color-mix(in oklab, var(--primary) 16%, transparent)",
+                "--rdp-range_middle-color": "var(--foreground)",
+                "--rdp-range_start-background":
+                  "color-mix(in oklab, var(--primary) 16%, transparent)",
+                "--rdp-range_end-background":
+                  "color-mix(in oklab, var(--primary) 16%, transparent)",
+                "--rdp-range_start-color": "var(--primary-foreground)",
+                "--rdp-range_end-color": "var(--primary-foreground)",
+                "--rdp-range_start-date-background-color": "var(--primary)",
+                "--rdp-range_end-date-background-color": "var(--primary)",
+                "--rdp-selected-border": "1px solid var(--primary)",
+                "--rdp-today-color": "var(--primary)",
+                "--rdp-day-height": "30px",
+                "--rdp-day-width": "30px",
+                "--rdp-day_button-height": "28px",
+                "--rdp-day_button-width": "28px",
+                fontSize: "12px",
+              } as React.CSSProperties
+            }
             selected={
               draft ?? { from: new Date(value.from), to: new Date(value.to) }
             }
