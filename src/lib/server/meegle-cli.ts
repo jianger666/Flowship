@@ -289,6 +289,23 @@ export const fetchWorkitemDetail = async (
   return {};
 };
 
+// ---------- 当前用户（子任务「只看自己」过滤用） ----------
+
+// user me 缓存（user_key 不会变、进程级缓存即可）
+let meCache: string | null | undefined;
+
+/** 当前登录用户的 user_key（实测 user me 返回 { user_key, name_cn, ... }）；拿不到返 null */
+export const fetchMyUserKey = async (): Promise<string | null> => {
+  if (meCache !== undefined) return meCache;
+  try {
+    const resp = (await runMeegle(["user", "me"])) as Record<string, unknown>;
+    meCache = asStr(resp.user_key) ?? null;
+  } catch {
+    meCache = null;
+  }
+  return meCache;
+};
+
 // ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------
 
 /** 节点下的子任务（甘特展开的最细粒度、用户要看的「具体任务」） */
@@ -297,6 +314,8 @@ export interface WorkitemSubTask {
   start?: number;
   end?: number;
   finished?: boolean;
+  /** 负责人 user_key 列表（owner 字段是 JSON 字符串 `[{"username":"<user_key>"}]`、实测） */
+  owners?: string[];
 }
 
 /** 工作项的单个节点排期（甘特展开行用） */
@@ -365,11 +384,22 @@ export const fetchWorkitemNodes = async (
         for (const rawSub of m.sub_tasks as Array<Record<string, unknown>>) {
           const subName = asStr(rawSub.sub_task_name ?? rawSub.name);
           if (!subName) continue;
+          // owner 是 JSON 字符串（[{"username":"<user_key>"}]、实测）——解出 user_key 列表
+          let owners: string[] | undefined;
+          if (typeof rawSub.owner === "string" && rawSub.owner.trim()) {
+            try {
+              const arr = JSON.parse(rawSub.owner) as Array<{ username?: string }>;
+              owners = arr.map((o) => o.username).filter((v): v is string => !!v);
+            } catch {
+              /* owner 格式变了就不过滤 */
+            }
+          }
           subTasks.push({
             name: subName,
             start: asDateMs(rawSub.estimate_start_date),
             end: asDateMs(rawSub.estimate_end_date),
             finished: rawSub.is_finished === true,
+            owners,
           });
         }
       }

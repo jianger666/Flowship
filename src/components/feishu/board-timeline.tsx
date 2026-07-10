@@ -16,6 +16,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { cn } from "@/lib/utils";
 
@@ -64,6 +65,8 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
   });
   // 展开的需求 id 集合（展开 = 下方插节点排期子行）
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // 只看自己的子任务（默认开、用户拍板「展开全部人的太多了」）
+  const [mineOnly, setMineOnly] = useState(true);
 
   const windowStart = range.from;
   // 窗口天数（含首尾）
@@ -121,7 +124,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
       out.push({ kind: "item", item: it, cols });
       if (expanded.has(it.id)) {
         for (const n of it.nodes ?? []) {
-          const subs = n.subTasks ?? [];
+          const subs = (n.subTasks ?? []).filter((s) => !mineOnly || s.mine);
           // 节点行：有排期或有子任务才出（都没有的节点画不上轴、纯噪音）
           if (n.start || n.end || subs.length > 0) {
             out.push({
@@ -147,7 +150,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
       }
     }
     return out;
-  }, [items, windowStart, span, expanded]);
+  }, [items, windowStart, span, expanded, mineOnly]);
 
   const rowCount = Math.max(rows.length, 1);
 
@@ -203,6 +206,15 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         >
           <ChevronRight />
         </Button>
+        <div className="mx-1 h-4 w-px bg-border" />
+        <ChoiceButton
+          shape="chip"
+          selected={mineOnly}
+          onClick={() => setMineOnly((v) => !v)}
+          className="px-2.5 py-1 text-xs"
+        >
+          只看自己
+        </ChoiceButton>
         <span className="ml-auto text-xs text-muted-foreground">
           {rows.filter((r) => r.kind === "item").length} 项排期中 · 点条展开节点
         </span>

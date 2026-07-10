@@ -56,7 +56,14 @@ export interface BoardItem {
     status?: string;
     start?: number;
     end?: number;
-    subTasks?: Array<{ name: string; start?: number; end?: number; finished?: boolean }>;
+    subTasks?: Array<{
+      name: string;
+      start?: number;
+      end?: number;
+      finished?: boolean;
+      /** 当前登录用户是负责人（「只看自己」过滤用、服务端标好） */
+      mine?: boolean;
+    }>;
   }>;
   task: BoardTaskBrief | null;
 }

@@ -17,6 +17,7 @@ import { NextResponse } from "next/server";
 
 import { extractFeishuStoryId } from "@/lib/branch-template";
 import {
+  fetchMyUserKey,
   fetchMyWorkitems,
   fetchNodesForItems,
   fetchProjectSimpleNames,
@@ -71,10 +72,13 @@ export const GET = async (req: Request) => {
     const items = [...byId.values()];
 
     // 节点排期聚合：需求级跨度 = 节点排期 min~max、nodes 下发给甘特展开
-    const nodesMap = await fetchNodesForItems(
-      items.map((it) => ({ id: it.id, projectKey: it.projectKey })),
-      { skipCache: fresh },
-    );
+    const [nodesMap, myKey] = await Promise.all([
+      fetchNodesForItems(
+        items.map((it) => ({ id: it.id, projectKey: it.projectKey })),
+        { skipCache: fresh },
+      ),
+      fetchMyUserKey(),
+    ]);
     for (const it of items) {
       const nodes = nodesMap.get(it.id) ?? [];
       // start/end 都收进候选：有的节点只有单边排期、只按各自字段聚合会出现
@@ -112,7 +116,14 @@ export const GET = async (req: Request) => {
       return {
         ...it,
         raw: undefined,
-        nodes: nodesMap.get(it.id) ?? [],
+        // 子任务标 mine（「只看自己」过滤用）：owners 含当前用户 user_key
+        nodes: (nodesMap.get(it.id) ?? []).map((n) => ({
+          ...n,
+          subTasks: n.subTasks.map((s) => ({
+            ...s,
+            mine: !!myKey && (s.owners ?? []).includes(myKey),
+          })),
+        })),
         task: t
           ? {
               id: t.id,
