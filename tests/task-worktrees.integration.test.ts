@@ -189,6 +189,47 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
   });
 
+  it("CR-03 fail-closed：原仓被移走（git status 查不了）→ 绝不删、脏改动保留", async () => {
+    // 独立仓 + 独立 task（不污染共享 REPO 的后续用例）
+    const repo2 = path.join(TMP_ROOT, "origin-repo-2");
+    const repo2Moved = `${repo2}-moved`;
+    await fs.mkdir(repo2, { recursive: true });
+    git(repo2, "init", "-b", "main");
+    git(repo2, "config", "user.email", "t@t.local");
+    git(repo2, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo2, "b.txt"), "hi\n");
+    git(repo2, "add", "-A");
+    git(repo2, "commit", "-m", "init");
+
+    const task2 = makeTask({
+      id: "t_1700000000003_it",
+      repoPaths: [repo2],
+      repoBaseBranches: { [repo2]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999999",
+    });
+    await ensureTaskWorktrees(task2);
+    const workDir2 = getTaskWorkRepoPaths(task2)[0];
+    // 工作区留未提交改动
+    await fs.writeFile(path.join(workDir2, "uncommitted.txt"), "precious\n");
+
+    // 原仓整个移走 → worktree 的 .git 指针失效、git status 必失败。
+    // 旧实现把「status 查不了」当 clean、git worktree remove 也失败后回退
+    // fs.rm --force 递归删——未提交改动被永久销毁（本用例在旧实现上必挂）
+    await fs.rename(repo2, repo2Moved);
+    try {
+      const removed = await removeTaskWorktrees(task2);
+      expect(removed.skippedRepos).toEqual([repo2]);
+      expect(removed.removedAny).toBe(false);
+      // 目录 + 未提交文件都还在
+      await expect(
+        fs.readFile(path.join(workDir2, "uncommitted.txt"), "utf8"),
+      ).resolves.toBe("precious\n");
+    } finally {
+      // 还原（afterAll 统一清 TMP_ROOT、这里只为不影响潜在后续用例）
+      await fs.rename(repo2Moved, repo2).catch(() => {});
+    }
+  });
+
   it("remove：merge 冲突态 WIP 快照失败 → 跳过删除、目录与未提交改动保留", async () => {
     // 前置：上一条 ensure 后 worktree 仍在任务分支上
     const taskBranch = "feature/888888-集成测试";

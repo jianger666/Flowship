@@ -128,10 +128,11 @@ export const WorkspaceActions = ({ task }: Props) => {
     }
   };
 
-  const start = async (repoPath: string, command: string) => {
+  // 命令仅用于按钮 title 展示——实际执行的命令由 server 从权威配置查（CR-01）
+  const start = async (repoPath: string) => {
     setBusy(true);
     try {
-      const res = await startTaskPreview(task.id, repoPath, command);
+      const res = await startTaskPreview(task.id, repoPath);
       setSlot(res.slot);
       if (res.replacedTaskTitle) {
         toast.info(`已停掉「${res.replacedTaskTitle}」的预览`);
@@ -239,7 +240,7 @@ export const WorkspaceActions = ({ task }: Props) => {
             size="sm"
             className={BTN_CLS}
             disabled={busy}
-            onClick={() => void start(c.repoPath, c.command)}
+            onClick={() => void start(c.repoPath)}
             title={
               `在任务工作区起 dev server：${c.command}` +
               (slot && !slot.exited && slot.taskId !== task.id
@@ -308,7 +309,7 @@ export const WorkspaceActions = ({ task }: Props) => {
             size="sm"
             className={BTN_CLS}
             disabled={busy}
-            onClick={() => void start(mine.repoPath, mine.command)}
+            onClick={() => void start(mine.repoPath)}
             title="用同一命令重新启动预览"
           >
             <Play className="size-3" />

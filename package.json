@@ -8,11 +8,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "next dev -p 8876",
+    "dev": "next dev -p 8876 -H 127.0.0.1",
     "start": "node scripts/dev-open.mjs",
     "serve": "next build && node scripts/dev-open.mjs start",
     "build": "next build",
-    "start:prod": "next start -p 8876",
+    "start:prod": "next start -p 8876 -H 127.0.0.1",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

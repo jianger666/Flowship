@@ -10,7 +10,7 @@
  * - initSettings()：app 启动 await 一次、读 config.json；文件在 → 用文件（权威）；
  *   文件不在（首次升级）→ 把当前 cache（localStorage 旧配置）写进文件（迁移）
  * - getSettings()：同步读 cache（签名不变、9 处调用方零改动）
- * - saveSettings()：写 cache + 异步落 config.json（权威）+ 过渡期双写 localStorage（回滚保险）
+ * - saveSettings()：写 cache + **串行队列 await** 落 config.json（权威、CR-08）+ 过渡期双写 localStorage（回滚保险）
  *
  * ⏰ 清理任务（见 REMOVE_LOCALSTORAGE_AFTER）：过了保留期、且确认所有同事都升级过本过渡版后、
  *   做「清理版」——删掉 localStorage 读取 / 迁移 / 双写、saveSettings 改纯文件、只留 config.json + 缓存。
@@ -28,6 +28,9 @@ import type {
 
 const KEY = "fe-ai-flow:settings";
 const API = "/api/settings";
+// CR-01：默认 GET /api/settings 已脱敏（apiKey / gitToken 掩码）、client 初始化
+// 灌 cache 必须拿真值——走专门的全量读取口（仅 loopback、middleware 强制）
+const API_FULL = "/api/settings/full";
 
 // ⏰ localStorage 迁移逻辑的保留截止日。过了这天、dev 控制台会红字提醒做「清理版」、
 //    届时把本文件里所有 localStorage 读 / 写 / 迁移逻辑删掉、只留 config.json + 内存缓存。
@@ -201,6 +204,8 @@ const warnIfMigrationExpired = (): void => {
  * 否则 cache 不含快照、下次整对象 PUT 会把迁移结果盖丢。
  * 只回填 mcpServers（server 唯一会改的字段）、不整包覆盖——防连续快速编辑时
  * 响应把用户更新的其它字段顶回去。
+ *
+ * CR-08：非 2xx 一律 throw——原实现 500 也静默当成功、重启后修改凭空消失。
  */
 const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
   const res = await fetch(API, {
@@ -208,6 +213,16 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`;
+    try {
+      const data = (await res.json()) as { error?: string };
+      if (data?.error) message = data.error;
+    } catch {
+      // 错误体不是 JSON、用状态码兜底
+    }
+    throw new Error(message);
+  }
   try {
     const data = (await res.json()) as {
       ok?: boolean;
@@ -221,7 +236,7 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
       cache = { ...cache, mcpServers: returned };
     }
   } catch {
-    // 响应体解析失败不影响写入本身（老版 server 只返 {ok}）
+    // 响应体解析失败不影响写入本身（写已成功、只是拿不到回填）
   }
 };
 
@@ -231,7 +246,8 @@ export const initSettings = (): Promise<void> => {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     try {
-      const res = await fetch(API);
+      // 全量口（含明文密钥、仅 loopback）——默认 /api/settings 已脱敏、灌 cache 必须真值
+      const res = await fetch(API_FULL);
       const data = (await res.json()) as {
         exists?: boolean;
         settings?: unknown;
@@ -255,25 +271,38 @@ export const initSettings = (): Promise<void> => {
   return initPromise;
 };
 
+// CR-08：客户端写队列——连续快速保存串行落盘、后发请求不可能被先发的整对象覆盖
+let writeQueue: Promise<void> = Promise.resolve();
+
 /**
- * 写设置
+ * 写设置（CR-08 起 async：await 权威文件 config.json 写成功才算成功）
  *
- * @returns true=本地落盘成功；false=被浏览器拒绝（quota 满 / 隐私模式）。调用方据此 toast。
- *          config.json 异步落盘、失败只 console.error（不影响返回值、下次写自纠正）。
+ * @returns true=服务端 config.json 落盘成功；false=写失败（500 / 网络断 / 磁盘只读）。
+ *          调用方据此决定是否把字段标成「已保存」+ toast。
+ *          内存 cache 同步更新（乐观、getSettings 立即可读）；localStorage 双写为
+ *          过渡期回滚保险、其失败不影响返回值。
  */
-export const saveSettings = (next: FeAiFlowSettings): boolean => {
+export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => {
   cache = next;
   if (!isBrowser()) return false;
-  // 异步落 config.json（权威源）、不阻塞 UI；响应里可能带 MCP 迁移回填（见 putSettings）
-  void putSettings(next).catch((err) =>
-    console.error("[local-store] 写 config.json 失败", err),
-  );
-  // 【过渡期】双写 localStorage：回滚保险 + 同步探测 quota（清理版删掉这段）
+  // 【过渡期】双写 localStorage：回滚保险（清理版删掉这段）；失败只 log、不挡权威写
   try {
     window.localStorage.setItem(KEY, JSON.stringify(next));
-    return true;
   } catch (err) {
     console.error("[local-store] saveSettings localStorage 失败", err);
+  }
+  // 权威写：挂到串行队列尾（保序）、await 服务端结果（失败不再被静默当成功）
+  const attempt = writeQueue.then(() => putSettings(next));
+  // 队列指针只关心「上一个写是否结束」、错误由本次调用方消费、不传染下一个
+  writeQueue = attempt.then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    await attempt;
+    return true;
+  } catch (err) {
+    console.error("[local-store] 写 config.json 失败", err);
     return false;
   }
 };
@@ -312,7 +341,8 @@ export const recordModelUsage = (sel: ModelSelection): void => {
     list.sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt);
     list.length = MODEL_USAGE_CAP;
   }
-  saveSettings({ ...s, modelUsage: list });
+  // 计数是尽力而为的统计、写失败无需打扰用户（下次使用再计）
+  void saveSettings({ ...s, modelUsage: list });
 };
 
 /**

@@ -778,17 +778,19 @@ export const fetchPreviewStatus = async (): Promise<PreviewSlotStatus | null> =>
   return data.slot;
 };
 
-/** 起预览（单预览位：自动停掉上一个任务的 dev server）。返回被顶掉的任务标题（没有则 null） */
+/**
+ * 起预览（单预览位：自动停掉上一个任务的 dev server）。返回被顶掉的任务标题（没有则 null）。
+ * CR-01：不再传 command——命令由 server 按 repoPath 从权威 config.json 查（防注入）。
+ */
 export const startTaskPreview = async (
   taskId: string,
   repoPath: string,
-  command: string,
 ): Promise<{ slot: PreviewSlotStatus; replacedTaskTitle: string | null }> =>
   await handleJson<{ slot: PreviewSlotStatus; replacedTaskTitle: string | null }>(
     await fetch("/api/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ taskId, repoPath, command }),
+      body: JSON.stringify({ taskId, repoPath }),
     }),
   );
 

@@ -25,7 +25,28 @@ import {
   initSettings,
   saveSettings,
 } from "@/lib/local-store";
-import type { FeAiFlowSettings, JumpIde, SubmitShortcut } from "@/lib/types";
+import type {
+  FeAiFlowSettings,
+  JumpIde,
+  RepoConfig,
+  SubmitShortcut,
+} from "@/lib/types";
+
+// RepoConfig 稳定序列化比较：字段顺序固定、可选字段缺省归一空串（CR-09）。
+// 加新字段时记得补这里——漏了该字段的编辑不会触发 dirty。
+const repoConfigCanonical = (r: RepoConfig): string =>
+  JSON.stringify([
+    r.path,
+    r.name,
+    r.onlineBranch ?? "",
+    r.testBranch ?? "",
+    r.devBranch ?? "",
+    r.branchTemplate ?? "",
+    r.previewCommand ?? "",
+  ]);
+
+export const repoConfigEquals = (a: RepoConfig, b: RepoConfig): boolean =>
+  repoConfigCanonical(a) === repoConfigCanonical(b);
 
 /**
  * 轻量读「代码跳转 IDE」配置（artifact-panel / 事件流附件 chip 等展示组件用）
@@ -67,7 +88,7 @@ export interface UseSettingsResult {
   saveFieldValue: <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K],
-  ) => boolean;
+  ) => void;
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
@@ -90,11 +111,10 @@ const isFieldEqual = (
     return (a[key] ?? "") === (b[key] ?? "");
   }
   if (key === "repos") {
+    // CR-09：完整比较 RepoConfig 全部持久字段（稳定序列化、undefined 归一空串）——
+    // 原实现只比 path/name、编辑分支 / 模板 / 预览命令时 dirty 恒 false、离页不提示
     if (a.repos.length !== b.repos.length) return false;
-    return a.repos.every(
-      (r, i) =>
-        r.path === b.repos[i].path && r.name === b.repos[i].name,
-    );
+    return a.repos.every((r, i) => repoConfigEquals(r, b.repos[i]));
   }
   if (key === "reuseAgentDefault") {
     // boolean 字段：缺省视同 false 比较
@@ -203,20 +223,23 @@ export const useSettings = (): UseSettingsResult => {
   // - 文本框：onChange 只改草稿（update）、onBlur 时调本方法落盘（传当前值）
   // base 取 getSettings() 读「落盘最新」而非 savedSettings 闭包——连续存不同字段不会互相覆盖；
   // state 只更新该字段（不整体替换）——避免把其它正在输入、尚未 blur 的草稿字段冲掉。
+  // CR-08：await 服务端 config.json 写结果——成功才把字段标「已保存」（savedSettings）、
+  // 失败 toast（原实现 500 也静默当成功、重启后修改凭空消失）。草稿态先行更新（乐观）。
   // 不弹 success toast：编辑即存高频、刷屏没意义、仅失败时提示
   const saveFieldValue = <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K],
-  ): boolean => {
+  ): void => {
     const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
-    const ok = saveSettings(next);
-    if (ok) {
-      setSavedSettings((prev) => ({ ...prev, [key]: value }));
-      setSettings((prev) => ({ ...prev, [key]: value }));
-    } else {
-      toast.error("保存失败、可能 localStorage 配额已满或处于隐私模式");
-    }
-    return ok;
+    setSettings((prev) => ({ ...prev, [key]: value }));
+    void saveSettings(next).then((ok) => {
+      if (ok) {
+        setSavedSettings((prev) => ({ ...prev, [key]: value }));
+      } else {
+        // 保存失败：savedSettings 不动 → 字段保持 dirty、离页仍会拦截提示
+        toast.error("保存失败：配置没能写入 config.json、请重试");
+      }
+    });
   };
 
   // 离页前拦截：用 ref 持有最新 hasUnsaved、listener 只挂一次

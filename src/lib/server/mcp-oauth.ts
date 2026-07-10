@@ -13,12 +13,13 @@
  *
  * 通用：任何标准 OAuth 2.1 的 MCP 都能用、不止飞书项目。
  *
- * 存储：`data/mcp-oauth/<serverName>.json`（serverName = mcp.json 里的 key）。
+ * 存储：`data/mcp-oauth/<sha256(serverName)>.json`（serverName = mcp.json 里的 key；
+ * CR-04 起哈希命名防碰撞、记录内 serverName/serverUrl 读取时强校验、旧文件一次性迁移）。
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   auth,
   type OAuthClientProvider,
@@ -35,8 +36,9 @@ import { dataRoot } from "./data-root";
 
 // ---- 路径 / 常量 ----
 
-// OAuth 凭证落盘目录（每个 server 一个 json）
-const OAUTH_DIR = path.join(dataRoot(), "mcp-oauth");
+// OAuth 凭证落盘目录（每个 server 一个 json）。惰性求值——模块加载时
+// FE_AI_FLOW_DATA_DIR 可能还没注入（测试 / 特殊启动顺序）、跟 data-root 用法对齐
+const oauthDir = (): string => path.join(dataRoot(), "mcp-oauth");
 
 // fe 自身的 base url——**必须端口感知**（V0.13 验收踩过：硬编码 8876 时、test 实例
 // （8776）发起授权、回调被打到正式实例（8876）、state 对不上直接「校验失败」）。
@@ -51,7 +53,7 @@ const EXPIRY_BUFFER_MS = 60_000;
 
 // ---- 落盘记录 ----
 
-/** 单个 server 的 OAuth 状态（落 `data/mcp-oauth/<serverName>.json`） */
+/** 单个 server 的 OAuth 状态（落 `data/mcp-oauth/<sha256(serverName)>.json`） */
 interface OAuthRecord {
   /** mcp.json 里的原始 server 名（文件名会 sanitize、这里存原名供反查） */
   serverName: string;
@@ -73,16 +75,61 @@ interface OAuthRecord {
   discovery?: OAuthDiscoveryState;
 }
 
-// serverName → 安全文件名（防路径穿越 / 特殊字符）
+// serverName → 文件名 = sha256(serverName)（CR-04）：旧「替换非法字符」清洗不是一一映射、
+// `foo/bar` 和 `foo?bar` 撞同一个文件、互相覆盖 OAuth 状态、更糟的是 A 的 bearer token
+// 可能被发到 B（可被攻击者控制）的 URL。哈希无碰撞 + 天然防路径穿越。
 const recordFile = (serverName: string): string =>
-  path.join(OAUTH_DIR, `${serverName.replace(/[^a-zA-Z0-9_.-]/g, "_")}.json`);
+  path.join(
+    oauthDir(),
+    `${createHash("sha256").update(serverName, "utf8").digest("hex")}.json`,
+  );
+
+// 旧清洗规则的文件路径（一次性迁移用、迁完删）
+const legacyRecordFile = (serverName: string): string =>
+  path.join(oauthDir(), `${serverName.replace(/[^a-zA-Z0-9_.-]/g, "_")}.json`);
+
+// server url 归一（比较口径）：去首尾空白 + 尾斜杠
+const normalizeServerUrl = (u: string | undefined): string =>
+  (u ?? "").trim().replace(/\/+$/, "");
+
+/**
+ * 旧文件一次性迁移：新哈希路径没有时、按旧清洗规则找文件。
+ * **只有记录里的 serverName 完全一致才迁**（record 出生起就带 serverName）——
+ * 碰撞名写的记录（旧规则下 `foo/bar` / `foo?bar` 共用一个文件、内容属于后写的那个）
+ * 不猜归属、返 null 要求该 server 重新授权。
+ */
+const migrateLegacyRecord = async (
+  serverName: string,
+): Promise<OAuthRecord | null> => {
+  try {
+    const legacyPath = legacyRecordFile(serverName);
+    const raw = await fs.readFile(legacyPath, "utf-8");
+    const rec = JSON.parse(raw) as OAuthRecord;
+    if (rec.serverName !== serverName) return null; // 碰撞受害方、不迁、重新授权
+    await fs.mkdir(oauthDir(), { recursive: true });
+    await fs.writeFile(
+      recordFile(serverName),
+      JSON.stringify(rec, null, 2),
+      "utf-8",
+    );
+    await fs.unlink(legacyPath).catch(() => {});
+    console.log(`[mcp-oauth] 已迁移旧凭证文件（${serverName}）到哈希命名`);
+    return rec;
+  } catch {
+    return null; // 旧文件也没有 / 坏 JSON
+  }
+};
 
 const readRecord = async (serverName: string): Promise<OAuthRecord | null> => {
   try {
     const raw = await fs.readFile(recordFile(serverName), "utf-8");
-    return JSON.parse(raw) as OAuthRecord;
+    const rec = JSON.parse(raw) as OAuthRecord;
+    // 身份强校验（CR-04）：记录不属于本 serverName（手动拷文件 / 极端碰撞）→ 拒用
+    if (rec.serverName !== serverName) return null;
+    return rec;
   } catch {
-    return null;
+    // 新路径没有 → 尝试旧清洗规则文件的一次性迁移
+    return migrateLegacyRecord(serverName);
   }
 };
 
@@ -90,7 +137,7 @@ const writeRecord = async (
   serverName: string,
   rec: OAuthRecord,
 ): Promise<void> => {
-  await fs.mkdir(OAUTH_DIR, { recursive: true });
+  await fs.mkdir(oauthDir(), { recursive: true });
   await fs.writeFile(
     recordFile(serverName),
     JSON.stringify(rec, null, 2),
@@ -419,13 +466,10 @@ export const evaluateMcpOAuthStatuses = async (
   );
 };
 
-/** 撤销授权：删凭证文件（下次起 agent 不再注入、需重新授权） */
+/** 撤销授权：删凭证文件（下次起 agent 不再注入、需重新授权）。旧清洗命名的残留一并清。 */
 export const clearMcpOAuth = async (serverName: string): Promise<void> => {
-  try {
-    await fs.unlink(recordFile(serverName));
-  } catch {
-    // 文件不存在、忽略
-  }
+  await fs.unlink(recordFile(serverName)).catch(() => {});
+  await fs.unlink(legacyRecordFile(serverName)).catch(() => {});
 };
 
 /**
@@ -441,6 +485,15 @@ const getValidAccessToken = async (
 ): Promise<string | null> => {
   const rec = await readRecord(serverName);
   if (!rec?.tokens?.access_token) return null;
+
+  // URL 强校验（CR-04）：同名 server 改绑了新 URL → 旧 token 绝不能发给新地址
+  // （新地址可能是攻击者的）——要求重新授权
+  if (normalizeServerUrl(rec.serverUrl) !== normalizeServerUrl(serverUrl)) {
+    console.warn(
+      `[mcp-oauth] ${serverName} 的 URL 已变更（${rec.serverUrl} → ${serverUrl}）、旧 token 不注入、需重新授权`,
+    );
+    return null;
+  }
 
   const expiresAt =
     rec.obtainedAt && rec.tokens.expires_in

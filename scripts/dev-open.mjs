@@ -27,7 +27,9 @@ const FALLBACK_DELAY_MS = 10_000;
 
 // argv[2]：start → 生产模式（需先 next build、由 package.json serve 串好）；缺省 → dev 热更
 const MODE = process.argv[2] === "start" ? "start" : "dev";
-const child = spawn("next", [MODE, "-p", PORT], {
+// -H 127.0.0.1：只绑 loopback——next 默认 0.0.0.0 会把无鉴权 API（含密钥读取 /
+// shell 执行能力）暴露给整个局域网（CR-01）、源码运行也必须钉死本机
+const child = spawn("next", [MODE, "-p", PORT, "-H", "127.0.0.1"], {
   stdio: ["inherit", "pipe", "pipe"],
 });
 

@@ -16,7 +16,8 @@
  */
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
-import { promises as fs, mkdirSync, createWriteStream, readdirSync } from "node:fs";
+import { createHash, createPublicKey, verify } from "node:crypto";
+import { promises as fs, mkdirSync, createReadStream, createWriteStream, readdirSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -565,10 +566,74 @@ const cleanupUpdateLeftovers = async () => {
   }
 };
 
+// ---------- 更新 manifest 验签（CR-02） ----------
+//
+// mac 包无 Apple 签名、Gatekeeper 又被绕开（fetch 下载无 quarantine）——dmg 的真实性
+// 必须自证：CI 用 Ed25519 私钥对「版本 + asset SHA-256 清单」签名产 update-manifest.json
+// （scripts/generate-update-manifest.mjs）、壳内置公钥先验签再验哈希、验不过保留旧应用。
+//
+// 启用步骤（维护者一次性）：跑 `node scripts/generate-update-keypair.mjs`、
+// 私钥进 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`、公钥（整段 PEM）贴到下面常量。
+// ⚠️ 留空 = 跳过验签只打警告（渐进启用、不打断存量用户更新）；配好后强制验签。
+const UPDATE_MANIFEST_PUBLIC_KEY = ``;
+
+// 流式算文件 SHA-256（dmg 100MB+、不整读进内存）
+const sha256File = (file) =>
+  new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(file);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+  });
+
+// 下载完的 dmg 验 manifest 签名 + SHA-256 + 大小。验不过 throw（调用方 catch 降级、
+// 此时还没动旧应用）；公钥未内置时跳过并 warn（渐进启用）。
+const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
+  if (!UPDATE_MANIFEST_PUBLIC_KEY.trim()) {
+    log(
+      "[updater] ⚠️ 未内置更新验签公钥、跳过 manifest 校验——" +
+        "维护者请跑 scripts/generate-update-keypair.mjs 生成密钥对启用（CR-02）",
+    );
+    return;
+  }
+  const manifestUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/update-manifest.json`;
+  const res = await fetch(manifestUrl);
+  if (!res.ok) {
+    // 公钥已配置 = 发版链必产 manifest——拿不到就当被篡改 / 降级攻击、拒绝更新
+    throw new Error(`更新 manifest 下载失败 HTTP ${res.status}、已中止替换`);
+  }
+  const manifest = await res.json();
+  // 验签 payload 只覆盖 version + files、跟 generate-update-manifest.mjs 同序重建
+  const payload = JSON.stringify({ version: manifest.version, files: manifest.files });
+  const ok = verify(
+    null, // Ed25519 内建 digest
+    Buffer.from(payload, "utf8"),
+    createPublicKey(UPDATE_MANIFEST_PUBLIC_KEY),
+    Buffer.from(String(manifest.signature ?? ""), "base64"),
+  );
+  if (!ok) throw new Error("更新 manifest 签名校验失败、已中止替换");
+  if (manifest.version !== version) {
+    throw new Error(`manifest 版本不符（${manifest.version} ≠ ${version}）、已中止替换`);
+  }
+  const entry = (manifest.files ?? []).find((f) => f?.name === assetName);
+  if (!entry) throw new Error(`manifest 里没有 ${assetName} 的摘要、已中止替换`);
+  const stat = await fs.stat(dmgPath);
+  if (stat.size !== entry.size) {
+    throw new Error(`dmg 大小不符（${stat.size} ≠ ${entry.size}）、已中止替换`);
+  }
+  const digest = await sha256File(dmgPath);
+  if (digest !== entry.sha256) {
+    throw new Error("dmg SHA-256 校验失败（内容被篡改 / 传输损坏）、已中止替换");
+  }
+  log(`[updater] manifest 验签 + dmg 摘要校验通过（${assetName}）`);
+};
+
 // mac 应用内自更新（v0.7.12）：壳自己下载 dmg → 替换 /Applications 里的自己 → 重启生效。
 // 关键原理：quarantine 隔离标记只有浏览器等下载器会打、壳进程 fetch 落盘的文件没有
 // → Gatekeeper 不评估 → 免开发者证书实现「类自动更新」、解决用户实测痛点
 // 「每版都要去 系统设置→隐私与安全性 放行 + 输密码」。
+// CR-02：下载完先过 verifyDownloadedUpdate（签名 manifest + SHA-256）再 attach 替换。
 const macSelfUpdate = async (version) => {
   const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/fe-ai-flow-${version}-mac-arm64.dmg`;
   // 当前 .app 包路径：execPath = <app>.app/Contents/MacOS/<bin>、往上三层
@@ -607,6 +672,10 @@ const macSelfUpdate = async (version) => {
     if (total && got !== total) {
       throw new Error(`dmg 下载不完整（${got}/${total} 字节）、已中止替换`);
     }
+
+    // CR-02：签名 manifest 校验（Ed25519 验签 + SHA-256 + 大小）——在 attach / 替换
+    // 之前拦掉被篡改的包、验不过直接 throw 走 catch 降级、旧应用一动不动
+    await verifyDownloadedUpdate(version, dmgPath, `fe-ai-flow-${version}-mac-arm64.dmg`);
 
     await execFileStrict("hdiutil", [
       "attach", dmgPath, "-nobrowse", "-quiet", "-mountpoint", mountPoint,

@@ -140,6 +140,22 @@ jobs:
           # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
+      # mac 自更新签名 manifest（CR-02）：对 dmg 算 SHA-256、Ed25519 私钥签名、
+      # 产 update-manifest.json 传到同 tag release（壳内置公钥先验签再验哈希）。
+      # secret `UPDATE_MANIFEST_PRIVATE_KEY` 未配置时脚本打 ::warning:: 退出 0、
+      # 不产文件、不打断发版（渐进启用、见 scripts/generate-update-keypair.mjs）。
+      - if: matrix.os == 'macos-latest'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/generate-update-manifest.mjs "$VERSION" "dist/electron/fe-ai-flow-${VERSION}-mac-arm64.dmg"
+          if [ -f update-manifest.json ]; then
+            gh release upload "$GITHUB_REF_NAME" update-manifest.json --clobber
+          fi
+        shell: bash
+        env:
+          UPDATE_MANIFEST_PRIVATE_KEY: ${{ secrets.UPDATE_MANIFEST_PRIVATE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # 所有平台包（exe / dmg / latest.yml / latest-mac.yml）都传完后、把 draft release 转正 published。
   # needs electron = win/mac 都成功才转正：有平台挂就留 draft、不对外发半成品（手动看日志重跑即可）。
   # 转正后 /releases/latest 才指向它、mac fetchLatestVersion / win electron-updater 这才查得到、

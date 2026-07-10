@@ -2,16 +2,19 @@
  * /api/preview——单预览位 dev server（V0.10.1）
  *
  *   GET    → 当前预览位状态（null = 没在预览）
- *   POST   → 起预览：{ taskId, repoPath, command }——自动停掉上一个任务的预览（单位语义）
+ *   POST   → 起预览：{ taskId, repoPath }——自动停掉上一个任务的预览（单位语义）
  *   DELETE → 停预览（幂等）
  *
  * workDir 由 server 按 task 算（隔离 task = worktree、否则原仓库）、不信 client 传目录。
- * 信任模型同 /api/repo-branches：本地单用户桌面 app、repoPath 校验「属于该 task」即可。
+ * CR-01：**命令也不信 client**——原来接受任意 command 直接 spawn(shell:true)、
+ * 构成「建 chat task → 起 preview」的无鉴权 RCE 链；改为服务端按 repoPath 从权威
+ * config.json 查设置页配的 previewCommand、client 只能选「预览哪个仓」。
  */
 import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 
 import { errorResponse } from "@/lib/server/route-helpers";
+import { getRepoPreviewCommand } from "@/lib/server/settings-fs";
 import { getTask } from "@/lib/server/task-fs";
 import { getTaskWorkRepoPaths } from "@/lib/server/task-worktrees";
 import {
@@ -25,7 +28,7 @@ export const runtime = "nodejs";
 export const GET = async () => NextResponse.json({ slot: getPreviewStatus() });
 
 export const POST = async (req: Request) => {
-  let body: { taskId?: string; repoPath?: string; command?: string };
+  let body: { taskId?: string; repoPath?: string };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -33,12 +36,8 @@ export const POST = async (req: Request) => {
   }
   const taskId = body.taskId?.trim();
   const repoPath = body.repoPath?.trim();
-  const command = body.command?.trim();
-  if (!taskId || !repoPath || !command) {
-    return errorResponse("缺少 taskId / repoPath / command");
-  }
-  if (command.length > 500) {
-    return errorResponse("command 过长（上限 500 字符）");
+  if (!taskId || !repoPath) {
+    return errorResponse("缺少 taskId / repoPath");
   }
 
   const task = await getTask(taskId);
@@ -46,6 +45,12 @@ export const POST = async (req: Request) => {
   const idx = task.repoPaths.indexOf(repoPath);
   if (idx < 0) {
     return errorResponse(`repoPath 不属于该任务：${repoPath}`);
+  }
+
+  // 命令唯一来源 = 设置页 per-repo 配置（服务端权威 config.json）、不接受请求注入
+  const command = await getRepoPreviewCommand(repoPath);
+  if (!command) {
+    return errorResponse("该仓库未配置预览启动命令（设置页 → 仓库列表）", 409);
   }
 
   // 工作目录：隔离 task = 该仓 worktree、非隔离 = 原仓库（getTaskWorkRepoPaths 统一处理）

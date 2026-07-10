@@ -442,7 +442,16 @@ type SnapshotResult = "clean" | "snapshotted" | "failed";
  */
 const snapshotDirtyWorktree = async (workDir: string): Promise<SnapshotResult> => {
   const status = await runGit(workDir, ["status", "--porcelain"]);
-  if (!status.ok || status.stdout.length === 0) return "clean"; // 干净 / 查不了 → 可删
+  // CR-03 fail-closed：status 本身跑不了（原仓被移走 / .git 指针坏 / git 不在 PATH）
+  // 时**无法证明干净**、必须按 failed 保留目录——旧实现按 clean 走会 --force 递归删、
+  // 工作区里可能还有未提交改动、直接永久销毁
+  if (!status.ok) {
+    console.warn(
+      `[task-worktrees] git status 失败、无法证明工作区干净、跳过删除：${workDir}：${status.stderr}`,
+    );
+    return "failed";
+  }
+  if (status.stdout.length === 0) return "clean";
   // 未合并路径（merge/rebase 冲突）：add 会假解决、必须跳过删除等用户处理
   const hasUnmerged = status.stdout
     .split("\n")
