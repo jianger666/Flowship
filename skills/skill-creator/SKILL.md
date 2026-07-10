@@ -20,6 +20,9 @@ name + description 索引、场景匹配时才读全文——所以 **descriptio
 
 1. **先弄清意图再动手**：如果当前对话里已经有一段成功的工作流（用户说「把刚才这套沉淀成 skill」），
    直接从对话历史提取步骤 / 工具 / 输入输出格式；信息不够就问、一次问全、别挤牙膏。
+   **用户要的 skill 若已有现成实现（开源 skill 仓库 / npm 包 / 别处已写好的 SKILL.md）→ 优先安装 + 适配、
+   不要从零重写山寨版**：装好依赖（CLI / 数据文件）、按本规范补齐 SKILL.md（frontmatter + 触发词）、
+   附带更新脚本方便日后升级、并在正文标注来源（仓库 / 包名）。
 2. **目录名**：kebab-case 短横线小写（如 `weekly-report`）、只用字母数字和 `-`。
 3. **SKILL.md 结构**：
    - frontmatter 必填 `name`（跟目录名一致）+ `description`
