@@ -315,6 +315,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
   - ~~CLI 内置进安装包~~（做完当天用户撤回「cli 不内置」——预取脚本 / afterPack / 种子拷贝已全部回退、维持按需在线安装）
   - 飞书 CLI 安装器增量化（同日修 bug）：已装且版本一致跳过、按钮「缺任一叫安装、都在叫更新」
 - **Skills 列表按来源分组折叠**（用户拍板「几十上百个太长」）：自管组常驻展开、内置 / Cursor 全局 / 飞书 CLI 各一折叠组（标题带数量、默认收起）
+- **V0.14 规划（已定型待开工、2026-07-10 用户拍板）——首页改造成飞书项目看板**：
+  - 首页 = 工作台：飞书项目工作项看板（meegle CLI `mywork`/workitem 拉数据、全部/我的筛选、列表 + **真时间线视图**切换（横向时间轴、排期条、今天标线、首版只读不拖拽、过 frontend-design 定调）、每项带**双状态徽标**（飞书节点状态 + AI 任务状态）、未登录 meegle 降级现状 + 授权引导、列表缓存 + 手动刷新）
+  - 点工作项 → **预览态**（工作项详情 + 铺开的配置区、不落盘）→ 点「启动」才真正创建任务容器（防点开看看就产生空任务）；配置区预填「上次任务的仓库组合」+ 默认模型/角色、90% 场景零操作一键启动；缺项时启动置灰 + 琥珀高亮引导（防隐性卡点、用户提的）
+  - 任务详情页融合飞书工作项详情（描述/字段/节点状态、不用跳飞书看需求）
+  - **「新建任务」入口砍掉**（用户拍板）：任务只从飞书工作项进；临时 bug / 自由探索走新建对话（chat）
+  - 二期：状态反向同步——ship 提完 MR / 标合入时 agent 走 meegle `workflow get-node → list-state-transitions → transition` 三步曲流转节点（合法流转 CLI 自带、无需配映射；事件流可见、失败不阻断）
+  - 约束：lark-cli 只用免审权限功能（用户拍板）——im 发消息等需审批的 scope 一律不入方案；meegle 走用户本人 OAuth 不受限
 - **SDK run 网络断自动重连**（同日、用户拍板「网络波动断了要自动重连、重试 5 次、显示重连中」）：task / chat 两个 runner 的 run 消费 catch 挂 `tryAutoReconnect` / `tryChatAutoReconnect`——`isRetryableRunError`（sdk-error.ts：isConnectionDrop / SDK isRetryable / 网络关键字、认证类排除）判定后指数退避（2/4/8/15/30s、1s 分片可被停止中断）、`Agent.resume` 接回同一会话 + send「从断点继续」系统提示、递归消费新 run（attempt 随 opts 传递防无限）；resume 的网络类失败**不清 sessionAgentId 锚点**（重试还要用）；重连凭据服务端直读 config.json（readServerCreds）。事件流渲染：info + meta.kind=reconnecting → ReconnectingRow（spinner 琥珀细行、后续出现 reconnected/error 后静态化）
 - **注意力信号补强**（同日、用户顾虑「内联卡太弱、切走注意不到」、拍板系统通知 + 页内横幅、Dock 徽标不做）：系统通知链路 v0.9.5 已有（TaskAttentionWatcher + 壳 task-notify 通道 + AppUserModelId）、本轮把 error 也纳入通知（自动重连兜底后真 error 都值得叫人）；事件流新增悬浮条——有未答 ask 且用户滚离底部时「AI 在等你回答、点击查看」（点击 scrollToIndex 到答题卡）
 - **输入条统一语义 `[USER_MESSAGE]`**（同日、用户拍板「别这么多分支、AI 自主判断」）：原「再聊聊（[ACTION_ACK revise]）/ 问一问（[USER_QUESTION]）」双通道合一——客户端只有 submitTaskQuestion 一条路、消息统一 `[USER_MESSAGE]`、AI 按二分类铁则自主判断（纯疑问就答、别把问题当改码指令；修改要求才动手）。服务端内务：awaiting_ack 时自动 snapshot artifact + 消息尾附〈产出审阅中〉提示（处理完须 submit_work 重新交卷、原 revise 状态机保留：action 回 running）；无 ack 上下文 = 插话（能改文件、不推进任务链）。`acknowledgeAction` / action-ack 路由 / submitActionAck / ACTION_ACK_REVISE 信号全部退役删除；approve 由推进时自动认可承担；canResume 加 awaiting_ack（会话断 / 换模型时唤醒接手）。prompt 手术：_super.md「revise 闭环」段改写为「[USER_MESSAGE] 统一处理」、action-build/learn/plan + _shared 同步、协议一致性测试守护旧信号不回流
