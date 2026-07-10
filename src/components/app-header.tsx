@@ -19,13 +19,15 @@
  */
 
 import Link from "next/link";
-import { Blocks, PanelLeft, Settings } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Blocks, LayoutDashboard, MessageSquare, PanelLeft, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UpdateBadge } from "@/components/update-badge";
 import { Button } from "@/components/ui/button";
+import { useAppMode, type AppMode } from "@/hooks/use-app-mode";
 import { cn } from "@/lib/utils";
 
 declare global {
@@ -55,6 +57,47 @@ interface AppHeaderProps {
   scrolled: boolean;
 }
 
+/**
+ * 胶囊双模式切换（v1.0 界面重构核心）：顶栏居中、点段切模式——
+ * 工作台 → `/`（飞书看板 + task 类任务）、对话 → `/chats`（chat 类任务落点）。
+ * 当前模式由 URL 推导（useAppMode）、不是本地 state——刷新 / 直开链接不漂移。
+ */
+const ModeSwitch = ({ mode }: { mode: AppMode }) => {
+  const router = useRouter();
+  const segments: Array<{ key: AppMode; label: string; icon: React.ReactNode; href: string }> = [
+    { key: "work", label: "工作台", icon: <LayoutDashboard className="size-3.5" />, href: "/" },
+    { key: "chat", label: "对话", icon: <MessageSquare className="size-3.5" />, href: "/chats" },
+  ];
+  return (
+    <div
+      role="tablist"
+      aria-label="模式切换"
+      className="flex items-center gap-0.5 rounded-full border border-border/70 bg-muted/50 p-0.5"
+    >
+      {segments.map((s) => {
+        const active = mode === s.key;
+        return (
+          <button
+            key={s.key}
+            role="tab"
+            aria-selected={active}
+            onClick={() => router.push(s.href)}
+            className={cn(
+              "flex cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1 text-xs font-medium transition-colors",
+              active
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {s.icon}
+            {s.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+};
+
 export const AppHeader = ({
   sidebarOpen,
   onToggleSidebar,
@@ -64,6 +107,8 @@ export const AppHeader = ({
   const { resolvedTheme } = useTheme();
   // 平台（"darwin" | "win32" | "linux" | ""）——决定左让交通灯 / 右让控制按钮
   const [platform, setPlatform] = useState("");
+  // 当前模式（URL 推导）——胶囊高亮 + 侧栏过滤都用它
+  const mode = useAppMode();
 
   useEffect(() => {
     setPlatform(window.__shell?.platform ?? "");
@@ -97,7 +142,7 @@ export const AppHeader = ({
           mac 用更大左 padding 让开交通灯、再多留一段间距（用户要「离红绿灯远一点」）。 */}
       <div
         className={cn(
-          "flex items-center pl-3 *:[-webkit-app-region:no-drag]",
+          "flex items-center gap-2 pl-3 *:[-webkit-app-region:no-drag]",
           isMac && "pl-22",
         )}
       >
@@ -110,18 +155,22 @@ export const AppHeader = ({
         >
           <PanelLeft />
         </Button>
+        {/* v1.0：品牌挪左（居中位让给模式胶囊）、点击回当前模式首页 */}
+        <Link
+          href="/"
+          className="flex items-center gap-2 font-semibold tracking-tight text-foreground no-underline hover:opacity-80"
+        >
+          {/* logo 图本身就是「扣了黑边」的透明角 squircle、不再加方框 ring / CSS 圆角 */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/logo.png" alt="" className="size-7" />
+          <span className="hidden sm:inline">AI工作流</span>
+        </Link>
       </div>
 
-      {/* 居中品牌：logo（圆角方块图标、与 app 图标一致）+ 名字、点击回首页 */}
-      <Link
-        href="/"
-        className="absolute left-1/2 flex -translate-x-1/2 items-center gap-2 font-semibold tracking-tight text-foreground no-underline hover:opacity-80 [-webkit-app-region:no-drag]"
-      >
-        {/* logo 图本身就是「扣了黑边」的透明角 squircle、不再加方框 ring / CSS 圆角 */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src="/logo.png" alt="" className="size-7" />
-        AI工作流
-      </Link>
+      {/* 居中：工作台 / 对话 胶囊切换（v1.0 双模式核心） */}
+      <div className="absolute left-1/2 -translate-x-1/2 [-webkit-app-region:no-drag]">
+        <ModeSwitch mode={mode} />
+      </div>
 
       {/* 右：功能键（win 让出右上角窗口控制按钮位）；主题 / 设置统一纯图标 ghost、规格对齐 */}
       <div
