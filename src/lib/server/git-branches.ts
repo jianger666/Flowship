@@ -92,8 +92,17 @@ export const listRepoBranches = async (dir: string): Promise<RepoBranchList> => 
       if (name) seen.add(name);
     }
     return { isRepo: true, branches: [...seen] };
-  } catch {
-    // 非 git 仓 / 路径不存在 / git 命令失败一律降级为「非 git」、前端据此禁用分支选择
+  } catch (err) {
+    // 区分「git 命令不存在」和「真不是 git 仓」（同事 Windows 踩过：git 只在 IDEA
+    // 内置、系统 PATH 没有 → 所有仓都显示"非 git 仓库"、误导）
+    const e = err as NodeJS.ErrnoException & { stderr?: string };
+    if (e.code === "ENOENT") {
+      console.warn(`[git-branches] git 命令不存在（PATH 里没有）、dir=${dir}`);
+      return { isRepo: false, branches: [], gitMissing: true };
+    }
+    console.warn(
+      `[git-branches] listRepoBranches 失败 dir=${dir}：${(e.stderr || e.message || "").slice(0, 200)}`,
+    );
     return empty;
   }
 };

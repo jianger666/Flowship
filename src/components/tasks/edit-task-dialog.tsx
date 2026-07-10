@@ -314,7 +314,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                         disabled={!entry?.isRepo}
                         placeholder={
                           entry?.isRepo === false
-                            ? "非 git 仓库"
+                            ? entry.gitMissing
+                              ? "未检测到 git 命令"
+                              : "非 git 仓库"
                             : "留空自动建 feature/…"
                         }
                         className="min-w-0 flex-1"

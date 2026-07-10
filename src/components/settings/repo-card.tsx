@@ -147,7 +147,11 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
               const entry = branchMap[r.path];
               const branchDisabled = !entry?.isRepo;
               const branchPlaceholder =
-                entry?.isRepo === false ? "非 git 仓库" : undefined;
+                entry?.isRepo === false
+                  ? entry.gitMissing
+                    ? "未检测到 git 命令（装 Git 后重启 app）"
+                    : "非 git 仓库"
+                  : undefined;
               return (
                 <div
                   key={r.path}

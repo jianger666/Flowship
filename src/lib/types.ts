@@ -688,6 +688,8 @@ export interface RepoBranchList {
   isRepo: boolean;
   /** 分支名候选（本地 + 远端去重、按最近提交倒序） */
   branches: string[];
+  /** git 命令本身不存在（PATH 里没有）——前端提示装 git、而不是误报「非 git 仓库」 */
+  gitMissing?: boolean;
 }
 
 export interface GitBranchInfo {
