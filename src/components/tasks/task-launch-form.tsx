@@ -328,9 +328,11 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
                     disabled={!entry || (entry.isRepo === false && !entry.gitMissing)}
                     placeholder={
                       entry?.isRepo === false
-                        ? entry.gitMissing
-                          ? "未检测到 git、可手填分支"
-                          : "非 git 仓库"
+                        ? entry.pathMissing
+                          ? "路径不存在"
+                          : entry.gitMissing
+                            ? "未检测到 git、可手填分支"
+                            : "非 git 仓库"
                         : "留空自动建 feature/…"
                     }
                     className="min-w-0 flex-1"

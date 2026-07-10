@@ -150,9 +150,11 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
               const branchDisabled = !entry || (entry.isRepo === false && !entry.gitMissing);
               const branchPlaceholder =
                 entry?.isRepo === false
-                  ? entry.gitMissing
-                    ? "未检测到 git、可手填分支"
-                    : "非 git 仓库"
+                  ? entry.pathMissing
+                    ? "路径不存在、检查一下"
+                    : entry.gitMissing
+                      ? "未检测到 git、可手填分支"
+                      : "非 git 仓库"
                   : undefined;
               return (
                 <div

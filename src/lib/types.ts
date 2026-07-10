@@ -690,6 +690,8 @@ export interface RepoBranchList {
   branches: string[];
   /** git 命令本身不存在（PATH 里没有）——前端提示装 git、而不是误报「非 git 仓库」 */
   gitMissing?: boolean;
+  /** 仓库路径不存在——前端提示检查路径（手填多一层目录 / 打错、跟非 git 仓分开说） */
+  pathMissing?: boolean;
 }
 
 export interface GitBranchInfo {

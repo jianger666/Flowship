@@ -9,11 +9,25 @@
  */
 
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
 
 import type { GitBranchState, RepoBranchList } from "../types";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * 判定 dir 是否存在（目录）。
+ * ⚠️ 为什么必须先查：Node spawn 在 **cwd 不存在** 时也报 ENOENT、跟「git 命令
+ * 不存在」错误码一模一样——不先区分会把「路径填错」误诊成「没装 git」。
+ */
+const dirExists = async (dir: string): Promise<boolean> => {
+  try {
+    return (await fs.stat(dir)).isDirectory();
+  } catch {
+    return false;
+  }
+};
 
 /**
  * 读某目录的本地 git 分支状态。
@@ -93,10 +107,16 @@ export const listRepoBranches = async (dir: string): Promise<RepoBranchList> => 
     }
     return { isRepo: true, branches: [...seen] };
   } catch (err) {
-    // 区分「git 命令不存在」和「真不是 git 仓」（同事 Windows 踩过：git 只在 IDEA
-    // 内置、系统 PATH 没有 → 所有仓都显示"非 git 仓库"、误导）
+    // 三种失败分开诊断（同事 Windows「真 git 仓被报非 git」排查不动、被迫较真）：
+    // ① 路径不存在（spawn cwd 不存在也报 ENOENT、必须先 stat 区分）
+    // ② git 命令不存在（PATH 里没有）
+    // ③ 真不是 git 仓 / 其他 git 报错
     const e = err as NodeJS.ErrnoException & { stderr?: string };
     if (e.code === "ENOENT") {
+      if (!(await dirExists(dir))) {
+        console.warn(`[git-branches] 仓库路径不存在：${dir}`);
+        return { isRepo: false, branches: [], pathMissing: true };
+      }
       console.warn(`[git-branches] git 命令不存在（PATH 里没有）、dir=${dir}`);
       return { isRepo: false, branches: [], gitMissing: true };
     }
