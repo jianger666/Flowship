@@ -157,43 +157,66 @@ const pick = (obj: Record<string, unknown>, keys: string[]): unknown => {
   return undefined;
 };
 
-/** 单个工作项的宽松归一（字段名按飞书项目 openapi 常见命名多重兜底） */
+// 日期解析：ms 时间戳（秒级兜底）或 "YYYY-MM-DD" 字符串（mywork 实测形态）
+const asDateMs = (v: unknown): number | undefined => {
+  const n = asMs(v);
+  if (n) return n;
+  if (typeof v === "string" && v.trim()) {
+    const t = Date.parse(v);
+    if (Number.isFinite(t) && t > 0) return t;
+  }
+  return undefined;
+};
+
+/**
+ * 单个工作项归一。mywork todo 实测结构（2026-07-10 登录后校准）：
+ * ```
+ * { node_info: { node_name: "前端开发", node_state_key },
+ *   project_key, project_name,
+ *   schedule: { start_time: "2025-06-03", end_time: "2025-06-04" },   // 字符串日期
+ *   work_item_info: { work_item_id: 4969867129, work_item_name, work_item_type_key } }
+ * ```
+ * 顶层扁平形态（workitem query 等其他接口可能用）保留兜底。
+ */
 export const normalizeWorkitem = (rawItem: unknown): BoardWorkitem | null => {
   if (!rawItem || typeof rawItem !== "object") return null;
   const m = rawItem as Record<string, unknown>;
-  const id = asStr(pick(m, ["work_item_id", "workItemId", "id"]));
-  const name = asStr(pick(m, ["name", "work_item_name", "title", "simple_name"]));
+  // 核心字段可能嵌在 work_item_info 子对象（mywork 实测）、也可能顶层扁平
+  const info =
+    m.work_item_info && typeof m.work_item_info === "object"
+      ? (m.work_item_info as Record<string, unknown>)
+      : m;
+  const id = asStr(pick(info, ["work_item_id", "workItemId", "id"]));
+  const name = asStr(pick(info, ["work_item_name", "name", "title"]));
   if (!id || !name) return null;
 
-  // 状态：可能是字符串、也可能是 {label} / {name} 对象
-  const rawStatus = pick(m, [
-    "work_item_status",
-    "status",
-    "current_status",
-    "state",
-    "node_name",
-  ]);
+  // 状态：mywork 在 node_info.node_name（当前节点名）；其他接口可能给字符串 / 对象
   let statusLabel: string | undefined;
-  if (typeof rawStatus === "string") statusLabel = rawStatus;
-  else if (rawStatus && typeof rawStatus === "object") {
-    const s = rawStatus as Record<string, unknown>;
-    statusLabel = asStr(pick(s, ["label", "name", "state_key", "status_key", "value"]));
+  if (m.node_info && typeof m.node_info === "object") {
+    statusLabel = asStr((m.node_info as Record<string, unknown>).node_name);
+  }
+  if (!statusLabel) {
+    const rawStatus = pick(m, ["work_item_status", "status", "current_status", "state"]);
+    if (typeof rawStatus === "string") statusLabel = rawStatus;
+    else if (rawStatus && typeof rawStatus === "object") {
+      const s = rawStatus as Record<string, unknown>;
+      statusLabel = asStr(pick(s, ["label", "name", "state_key", "value"]));
+    }
   }
 
-  // 排期：schedule 对象 / 顶层字段两种形态
+  // 排期：mywork 的 schedule.{start_time,end_time} 是 "YYYY-MM-DD" 字符串；ms 形态兜底
   let scheduleStart: number | undefined;
   let scheduleEnd: number | undefined;
   const sched = pick(m, ["schedule", "node_schedule"]);
   if (sched && typeof sched === "object") {
     const s = sched as Record<string, unknown>;
-    scheduleStart = asMs(pick(s, ["estimate_start_date", "start_date", "start"]));
-    scheduleEnd = asMs(pick(s, ["estimate_end_date", "end_date", "end", "due_date"]));
+    scheduleStart = asDateMs(pick(s, ["start_time", "estimate_start_date", "start_date", "start"]));
+    scheduleEnd = asDateMs(pick(s, ["end_time", "estimate_end_date", "end_date", "end", "due_date"]));
   }
-  scheduleStart ??= asMs(pick(m, ["estimate_start_date", "start_date", "start_time"]));
-  scheduleEnd ??= asMs(pick(m, ["estimate_end_date", "end_date", "deadline", "due_date", "expected_work_item_end_date"]));
+  scheduleStart ??= asDateMs(pick(m, ["estimate_start_date", "start_date", "start_time"]));
+  scheduleEnd ??= asDateMs(pick(m, ["estimate_end_date", "end_date", "deadline", "due_date"]));
 
-  const projectKey = asStr(pick(m, ["project_key", "projectKey", "space_id"]));
-  const typeRaw = pick(m, ["work_item_type_key", "work_item_type", "type_key", "type"]);
+  const typeRaw = pick(info, ["work_item_type_key", "work_item_type", "type_key", "type"]);
   const typeLabel =
     typeof typeRaw === "string"
       ? typeRaw
@@ -204,7 +227,7 @@ export const normalizeWorkitem = (rawItem: unknown): BoardWorkitem | null => {
   return {
     id,
     name,
-    projectKey,
+    projectKey: asStr(pick(m, ["project_key", "projectKey", "space_id"])),
     projectName: asStr(pick(m, ["project_name", "space_name", "simple_name"])),
     typeLabel,
     statusLabel,
@@ -264,6 +287,33 @@ export const fetchWorkitemDetail = async (
     return r;
   }
   return {};
+};
+
+// ---------- 空间 simple_name 解析（URL 拼接用） ----------
+
+// project_key（哈希）→ simple_name（URL 里的空间短名、如 wk-dm）缓存：
+// mywork 只给 project_key、拼详情页 URL 必须 simple_name（实测 project search 结构：
+// { projects: [{ name, project_key, simple_name }] }）。10 分钟缓存、空间列表极少变。
+let projectNameCache: { at: number; map: Map<string, string> } | null = null;
+
+export const fetchProjectSimpleNames = async (): Promise<Map<string, string>> => {
+  if (projectNameCache && Date.now() - projectNameCache.at < 10 * 60 * 1000) {
+    return projectNameCache.map;
+  }
+  const map = new Map<string, string>();
+  try {
+    const resp = (await runMeegle(["project", "search"])) as Record<string, unknown>;
+    const projects = Array.isArray(resp.projects) ? resp.projects : [];
+    for (const p of projects as Array<Record<string, unknown>>) {
+      const key = asStr(p.project_key);
+      const simple = asStr(p.simple_name);
+      if (key && simple) map.set(key, simple);
+    }
+    projectNameCache = { at: Date.now(), map };
+  } catch {
+    // 拉不到就返回空 map（URL 兜底拼接降级为跳过）
+  }
+  return map;
 };
 
 /** URL → 结构化字段（纯本地解析、无网络）；非工作项详情 URL 返回 null */

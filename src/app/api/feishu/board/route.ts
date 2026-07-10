@@ -13,6 +13,7 @@ import { NextResponse } from "next/server";
 import { extractFeishuStoryId } from "@/lib/branch-template";
 import {
   fetchMyWorkitems,
+  fetchProjectSimpleNames,
   meegleAuthStatus,
   MeegleError,
   type MyworkAction,
@@ -42,13 +43,17 @@ export const GET = async (req: Request) => {
       items.push(...page2);
     }
 
-    // url 兜底：mywork 响应可能不带详情页 URL——按飞书项目常见路径拼
-    //（`https://<host>/<projectKey>/<typeKey>/detail/<id>`、格式以实测校准；
-    // 它只作 feishuStoryUrl 关联 + AI 拉需求的入口、id 兜底可用）
-    const { host } = await meegleAuthStatus();
+    // url 兜底：mywork 响应不带详情页 URL（实测确认）——按飞书项目标准路径拼
+    // `https://<host>/<simple_name>/<type_key>/detail/<id>`。simple_name（空间短名）
+    // 从 project search 映射（project_key 是哈希、不能直接进 URL）
+    const [{ host }, simpleNames] = await Promise.all([
+      meegleAuthStatus(),
+      fetchProjectSimpleNames(),
+    ]);
     for (const it of items) {
-      if (!it.url && host && it.projectKey) {
-        it.url = `https://${host}/${it.projectKey}/${it.typeLabel ?? "story"}/detail/${it.id}`;
+      const simple = it.projectKey ? simpleNames.get(it.projectKey) : undefined;
+      if (!it.url && host && simple) {
+        it.url = `https://${host}/${simple}/${it.typeLabel ?? "story"}/detail/${it.id}`;
       }
     }
 
