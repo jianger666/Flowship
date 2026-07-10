@@ -82,13 +82,8 @@ const CACHE_KEY = "feaiflow.board.cache.v2";
 
 /** AI 任务状态 → 徽标（甘特行 + 未排期 chip 共用） */
 export const AiStatusBadge = ({ task }: { task: BoardTaskBrief | null }) => {
-  if (!task) {
-    return (
-      <Badge variant="outline" className="shrink-0 text-[10px] text-muted-foreground">
-        未开始
-      </Badge>
-    );
-  }
+  // 没有 AI 任务不显示徽标（用户拍板：满屏「未开始」纯噪音、AI 在干的才亮）
+  if (!task) return null;
   if (task.repoStatus === "merged")
     return <Badge className="shrink-0 bg-emerald-600 text-[10px] text-white">已合入</Badge>;
   if (task.repoStatus === "abandoned")
