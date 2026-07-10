@@ -433,7 +433,13 @@ export const startLogin = async (
       state.running = false;
       state.exitCode = code;
       if (code !== 0) {
-        state.error = `登录进程退出 code=${code}`;
+        // 带上 CLI 输出尾部（真实报错在这）——只给 code 用户和维护者都没法排查
+        //（同事实测「code=3」猜不出原因）；完整 tail 落 main.log、诊断包可取
+        const tailText = state.tail.slice(-3).join(" | ");
+        state.error = `登录进程退出 code=${code}${tailText ? `：${tailText}` : ""}`;
+        console.warn(
+          `[feishu-cli] ${tool} 登录失败 code=${code}、CLI 输出尾部：\n${state.tail.join("\n")}`,
+        );
       }
     });
     child.on("error", (err) => {
