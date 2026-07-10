@@ -20,7 +20,8 @@
  */
 
 import { spawn, execFile } from "node:child_process";
-import { promises as fs, createWriteStream } from "node:fs";
+import { createHash } from "node:crypto";
+import { promises as fs, createReadStream, createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -58,6 +59,11 @@ export const injectFeishuCliPath = (): void => {
 
 // ----------------- 下载 / 解包工具 -----------------
 
+// 私有临时目录（CR-05）：os.tmpdir 是共享可写目录、可预测文件名有 symlink / 抢占
+// 风险——统一用 mkdtemp 拿带随机后缀的私有目录、下载 / 解包全在里面做
+const makePrivateTmpDir = async (label: string): Promise<string> =>
+  fs.mkdtemp(path.join(os.tmpdir(), `fe-ai-flow-${label}-`));
+
 // 下载到文件（跟随重定向；github 或 npm registry 都走这里）
 const downloadTo = async (url: string, dest: string): Promise<void> => {
   const res = await fetch(url, { redirect: "follow" });
@@ -68,7 +74,7 @@ const downloadTo = async (url: string, dest: string): Promise<void> => {
   // Web ReadableStream → Node stream、流式落盘（二进制 10-20MB、不进内存）
   await pipeline(
     Readable.fromWeb(res.body as import("node:stream/web").ReadableStream),
-    createWriteStream(dest),
+    createWriteStream(dest, { flags: "wx" }), // 排他创建：dest 已存在（被抢占）直接失败
   );
 };
 
@@ -77,6 +83,7 @@ const downloadFirstOk = async (urls: string[], dest: string): Promise<string> =>
   let lastErr: unknown;
   for (const url of urls) {
     try {
+      await fs.rm(dest, { force: true }); // 上一个源写了半截、清掉再试（wx 排他）
       await downloadTo(url, dest);
       return url;
     } catch (err) {
@@ -95,20 +102,85 @@ const extractArchive = async (archive: string, destDir: string): Promise<void> =
   });
 };
 
-// npm registry 拿包最新版本号（npmjs → npmmirror 兜底）
-const fetchNpmLatestVersion = async (pkg: string): Promise<string> => {
+// 流式算文件哈希（sha512 / sha1、验 npm integrity 用）
+const hashFile = (file: string, algo: "sha512" | "sha1"): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const hash = createHash(algo);
+    const stream = createReadStream(file);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("base64")));
+    stream.on("error", reject);
+  });
+
+/**
+ * 验 npm 包 tarball 完整性（CR-05）：对照 registry metadata 的 `dist.integrity`
+ * （SRI 格式 `sha512-<base64>`）或旧式 `dist.shasum`（sha1 hex）。
+ * 镜像只当字节源——摘要跟 tarball 同一个 registry 响应给出、至少保证
+ * 「装的字节 = registry 元数据声明的字节」、传输被改 / 镜像内容错位直接拒。
+ * 两个字段都没有（异常 registry）→ 拒装、不静默放行。
+ * （export 仅为回归测试、业务只在 installMeegle 内用）
+ */
+export const verifyNpmTarball = async (
+  file: string,
+  dist: { integrity?: string; shasum?: string },
+  label: string,
+): Promise<void> => {
+  if (dist.integrity) {
+    const m = dist.integrity.match(/^sha512-(.+)$/);
+    if (!m) throw new Error(`${label} 的 integrity 格式不认识：${dist.integrity}`);
+    const actual = await hashFile(file, "sha512");
+    if (actual !== m[1]) {
+      throw new Error(`${label} tarball SHA-512 校验失败（内容被篡改 / 传输损坏）、已中止安装`);
+    }
+    return;
+  }
+  if (dist.shasum) {
+    const actual = Buffer.from(await hashFile(file, "sha1"), "base64").toString("hex");
+    if (actual !== dist.shasum) {
+      throw new Error(`${label} tarball SHA-1 校验失败、已中止安装`);
+    }
+    return;
+  }
+  throw new Error(`${label} 的 registry 元数据没有 integrity/shasum、拒绝安装`);
+};
+
+// npm 包 latest 元数据（版本号 + dist 摘要；npmjs → npmmirror 兜底）
+interface NpmLatestMeta {
+  version: string;
+  dist: { integrity?: string; shasum?: string };
+}
+
+const fetchNpmLatestMeta = async (pkg: string): Promise<NpmLatestMeta> => {
   const encoded = pkg.replace("/", "%2F");
   for (const base of ["https://registry.npmjs.org", "https://registry.npmmirror.com"]) {
     try {
       const res = await fetch(`${base}/${encoded}/latest`, { redirect: "follow" });
       if (!res.ok) continue;
-      const meta = (await res.json()) as { version?: string };
-      if (meta.version) return meta.version;
+      const meta = (await res.json()) as {
+        version?: string;
+        dist?: { integrity?: string; shasum?: string };
+      };
+      if (meta.version) return { version: meta.version, dist: meta.dist ?? {} };
     } catch {
       // 换下一个源
     }
   }
   throw new Error(`拿不到 ${pkg} 的最新版本号（npmjs / npmmirror 都失败）`);
+};
+
+// 二进制原子就位（CR-05）：先拷到 bin 目录内的临时名、chmod 后 rename 到最终名
+// （同目录 rename 原子）——安装失败绝不把已装好的旧版本覆盖成半截
+const installBinaryAtomic = async (src: string, dest: string): Promise<void> => {
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  const staged = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await fs.copyFile(src, staged);
+    if (!isWin) await fs.chmod(staged, 0o755);
+    await fs.rename(staged, dest);
+  } catch (err) {
+    await fs.rm(staged, { force: true }).catch(() => {});
+    throw err;
+  }
 };
 
 // ----------------- 安装：lark-cli -----------------
@@ -130,7 +202,7 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
   if (!platform || !arch) {
     throw new Error(`lark-cli 不支持当前平台：${process.platform}/${process.arch}`);
   }
-  const version = await fetchNpmLatestVersion("@larksuite/cli");
+  const { version } = await fetchNpmLatestMeta("@larksuite/cli");
   // 增量语义（用户踩过：已装 v 最新还整包重下）：已装且版本一致 → 跳过
   const installed = await probeVersion(larkCliBin());
   if (installed === version) {
@@ -145,28 +217,33 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
     // 中国网络兜底：npmmirror 的二进制镜像（官方 install.js 同款路径）
     `https://registry.npmmirror.com/-/binary/lark-cli/v${version}/${archiveName}`,
   ];
-  const tmp = path.join(os.tmpdir(), `fe-ai-flow-${archiveName}`);
-  const used = await downloadFirstOk(urls, tmp);
-  log(`已下载（${used.includes("npmmirror") ? "npmmirror 镜像" : "GitHub"}）、解包中…`);
+  // ⚠️ 剩余风险（CR-05）：GitHub Release / npmmirror 二进制镜像官方都不发 checksum、
+  // 这条链只能信 TLS + 版本固定；能做的加固（私有 mkdtemp + 排他写 + 原子替换）已做——
+  // 官方哪天发 checksum / signature、在这里补校验
+  const tmpDir = await makePrivateTmpDir("lark-cli");
+  try {
+    const tmp = path.join(tmpDir, archiveName);
+    const used = await downloadFirstOk(urls, tmp);
+    log(`已下载（${used.includes("npmmirror") ? "npmmirror 镜像" : "GitHub"}）、解包中…`);
 
-  const staging = path.join(os.tmpdir(), `fe-ai-flow-lark-cli-${Date.now()}`);
-  await extractArchive(tmp, staging);
-  // 包里就是单个二进制（可能带一层目录）、递归找出来
-  const binName = isWin ? "lark-cli.exe" : "lark-cli";
-  const found = await findFileRecursive(staging, binName);
-  if (!found) throw new Error(`解包后找不到 ${binName}`);
-  await fs.mkdir(getToolsBinDir(), { recursive: true });
-  await fs.copyFile(found, larkCliBin());
-  if (!isWin) await fs.chmod(larkCliBin(), 0o755);
-  await fs.rm(tmp, { force: true });
-  await fs.rm(staging, { recursive: true, force: true });
-  log(`lark-cli v${version} 安装完成`);
+    const staging = path.join(tmpDir, "extract");
+    await extractArchive(tmp, staging);
+    // 包里就是单个二进制（可能带一层目录）、递归找出来
+    const binName = isWin ? "lark-cli.exe" : "lark-cli";
+    const found = await findFileRecursive(staging, binName);
+    if (!found) throw new Error(`解包后找不到 ${binName}`);
+    // staging + 同目录 rename 原子就位——失败不碰已装旧版
+    await installBinaryAtomic(found, larkCliBin());
+    log(`lark-cli v${version} 安装完成`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 };
 
 // ----------------- 安装：meegle -----------------
 
 const installMeegle = async (log: (line: string) => void): Promise<void> => {
-  const version = await fetchNpmLatestVersion("@lark-project/meegle");
+  const { version, dist } = await fetchNpmLatestMeta("@lark-project/meegle");
   // 增量语义：已装且版本一致 → 跳过（同 installLarkCli）
   const installed = await probeVersion(meegleBin());
   if (installed === version) {
@@ -178,27 +255,30 @@ const installMeegle = async (log: (line: string) => void): Promise<void> => {
     `https://registry.npmjs.org/@lark-project/meegle/-/meegle-${version}.tgz`,
     `https://registry.npmmirror.com/@lark-project/meegle/-/meegle-${version}.tgz`,
   ];
-  const tmp = path.join(os.tmpdir(), `fe-ai-flow-meegle-${version}.tgz`);
-  await downloadFirstOk(urls, tmp);
-  log("已下载、解包中…");
-
-  const staging = path.join(os.tmpdir(), `fe-ai-flow-meegle-${Date.now()}`);
-  await extractArchive(tmp, staging);
-  // npm 包自带全平台 Go 二进制（bin/meegle-<platform>-<arch>[.exe]）、挑当前平台的拷出来
-  const platArch = `${process.platform}-${process.arch}`;
-  const binName = `meegle-${platArch}${isWin ? ".exe" : ""}`;
-  const src = path.join(staging, "package", "bin", binName);
+  const tmpDir = await makePrivateTmpDir("meegle");
   try {
-    await fs.access(src);
-  } catch {
-    throw new Error(`meegle 包里没有当前平台二进制：${binName}`);
+    const tmp = path.join(tmpDir, `meegle-${version}.tgz`);
+    await downloadFirstOk(urls, tmp);
+    // CR-05：对照 registry metadata 的 dist.integrity 验 tarball（镜像只当字节源）
+    await verifyNpmTarball(tmp, dist, `meegle v${version}`);
+    log("已下载并通过完整性校验、解包中…");
+
+    const staging = path.join(tmpDir, "extract");
+    await extractArchive(tmp, staging);
+    // npm 包自带全平台 Go 二进制（bin/meegle-<platform>-<arch>[.exe]）、挑当前平台的拷出来
+    const platArch = `${process.platform}-${process.arch}`;
+    const binName = `meegle-${platArch}${isWin ? ".exe" : ""}`;
+    const src = path.join(staging, "package", "bin", binName);
+    try {
+      await fs.access(src);
+    } catch {
+      throw new Error(`meegle 包里没有当前平台二进制：${binName}`);
+    }
+    await installBinaryAtomic(src, meegleBin());
+    log(`meegle v${version} 安装完成`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
-  await fs.mkdir(getToolsBinDir(), { recursive: true });
-  await fs.copyFile(src, meegleBin());
-  if (!isWin) await fs.chmod(meegleBin(), 0o755);
-  await fs.rm(tmp, { force: true });
-  await fs.rm(staging, { recursive: true, force: true });
-  log(`meegle v${version} 安装完成`);
 };
 
 // ----------------- 安装：官方 Agent Skills -----------------
@@ -219,28 +299,43 @@ const SKILLS_SOURCES = [
 ] as const;
 
 const installSkills = async (log: (line: string) => void): Promise<void> => {
+  // ⚠️ 剩余风险（CR-05）：两个官方仓都不打 tag / release、只能跟可变 main 分支——
+  // 无法固定 commit / 验签、仓库或账号被攻破时 skills 内容可被注入（skills 会进
+  // agent prompt、等于持久 prompt 供应链面）。本地已做的加固：私有 mkdtemp 下载
+  // 解包 + staging 后原子替换（不会装半截）。官方开始发 tag 后应改为固定版本拉取。
   for (const srcDef of SKILLS_SOURCES) {
+    const tmpDir = await makePrivateTmpDir(`${srcDef.name}-skills`);
     try {
-      const tmp = path.join(os.tmpdir(), `fe-ai-flow-${srcDef.name}-repo.tgz`);
+      const tmp = path.join(tmpDir, "repo.tgz");
       await downloadTo(srcDef.tarball, tmp);
-      const staging = path.join(os.tmpdir(), `fe-ai-flow-${srcDef.name}-skills-${Date.now()}`);
+      const staging = path.join(tmpDir, "extract");
       await extractArchive(tmp, staging);
       const skillsSrc = path.join(staging, srcDef.topDir, "skills");
       const entries = await fs.readdir(skillsSrc, { withFileTypes: true }).catch(() => []);
       let count = 0;
+      await fs.mkdir(getToolsSkillsDir(), { recursive: true });
       for (const ent of entries) {
         if (!ent.isDirectory()) continue;
         const dest = path.join(getToolsSkillsDir(), ent.name);
-        await fs.rm(dest, { recursive: true, force: true });
-        await fs.cp(path.join(skillsSrc, ent.name), dest, { recursive: true });
-        count += 1;
+        // staging 拷到 skills 目录内的临时名、再原子 rename 就位——
+        // 中途失败留下的是 .tmp- 前缀目录、skills-loader 不认、旧版本不受损
+        const staged = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        try {
+          await fs.cp(path.join(skillsSrc, ent.name), staged, { recursive: true });
+          await fs.rm(dest, { recursive: true, force: true });
+          await fs.rename(staged, dest);
+          count += 1;
+        } catch (err) {
+          await fs.rm(staged, { recursive: true, force: true }).catch(() => {});
+          throw err;
+        }
       }
       log(`${srcDef.name} skills 已装 ${count} 个`);
-      await fs.rm(tmp, { force: true });
-      await fs.rm(staging, { recursive: true, force: true });
     } catch (err) {
       // skills 拉不下来不阻断（CLI 本体已可用）、下次安装/更新会重试
       log(`${srcDef.name} skills 拉取失败（不影响 CLI 使用）：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 };

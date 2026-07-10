@@ -26,4 +26,8 @@ export const middleware = (req: NextRequest): NextResponse => {
 
 export const config = {
   matcher: "/api/:path*",
+  // Node runtime（Next 15.5 起稳定）：默认 edge 编译会把 instrumentation.ts 链上的
+  // node-only 模块（feishu-cli / cursor-config）一起拖进 webpack edge bundle、
+  // 报 node: scheme 不支持；本应用只跑 Node server、没有 edge 场景
+  runtime: "nodejs",
 };
