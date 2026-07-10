@@ -30,7 +30,7 @@ import type {
   TaskRole,
   TaskSummary,
 } from "@/lib/types";
-import { ACTION_TYPES } from "@/lib/types";
+import { ACTION_TYPES, TASK_ROLES } from "@/lib/types";
 import { dataRoot } from "./data-root";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
 import { getTaskCwd } from "./task-worktrees";
@@ -216,7 +216,7 @@ const TaskMetaV06Schema = z
     currentActionId: z.string().nullable(),
     actions: z.array(ActionRecordLooseSchema),
     mrs: z.array(z.looseObject({})),
-    role: z.enum(["fe", "be", "adaptive"]),
+    role: z.enum(TASK_ROLES), // 单一源（CR-07）：枚举扩展只改 types.ts
     repoPaths: z.array(z.string()),
     pinned: z.boolean().optional(),
     createdAt: z.number(),

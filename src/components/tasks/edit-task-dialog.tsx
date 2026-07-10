@@ -52,12 +52,13 @@ import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
 import {
   TASK_ROLE_LABEL,
+  TASK_ROLES,
   type RepoConfig,
   type Task,
   type TaskRole,
 } from "@/lib/types";
 
-const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
+const ROLE_OPTIONS: readonly TaskRole[] = TASK_ROLES;
 
 interface Props {
   open: boolean;

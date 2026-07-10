@@ -15,6 +15,7 @@
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
+import { isTaskRole } from "@/lib/types";
 import type { NewTaskInput, TaskMode, TaskRole } from "@/lib/types";
 
 const isNonEmptyString = (v: unknown): v is string =>
@@ -27,10 +28,9 @@ const sanitizeRepoPaths = (v: unknown): string[] => {
     .map((p) => p.trim());
 };
 
-const sanitizeRole = (v: unknown): TaskRole | undefined => {
-  if (v === "fe" || v === "be" || v === "adaptive") return v;
-  return undefined;
-};
+// 共享 guard（CR-07）：枚举变更只改 types.ts 的 TASK_ROLES、route 不再各写一份白名单
+const sanitizeRole = (v: unknown): TaskRole | undefined =>
+  isTaskRole(v) ? v : undefined;
 
 const sanitizeMode = (v: unknown): TaskMode => {
   return v === "chat" ? "chat" : "task";

@@ -759,6 +759,13 @@ export interface TaskContextDoc {
 
 export type TaskRole = "fe" | "be" | "adaptive";
 
+// 角色枚举单一源（CR-07）：route 校验一律走 isTaskRole、不要再手写白名单——
+// 之前 PATCH route 漏了 adaptive、自适应任务连改标题都 400
+export const TASK_ROLES = ["fe", "be", "adaptive"] as const satisfies readonly TaskRole[];
+
+export const isTaskRole = (v: unknown): v is TaskRole =>
+  typeof v === "string" && (TASK_ROLES as readonly string[]).includes(v);
+
 export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
   fe: "前端",
   be: "后端",

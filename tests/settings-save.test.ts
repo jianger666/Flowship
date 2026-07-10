@@ -1,0 +1,137 @@
+/**
+ * 设置保存链（CR-08）+ repos dirty 完整比较（CR-09）
+ *
+ * 回归点（旧实现上失败）：
+ * - saveSettings：服务端 500 时旧实现照样返 true（fire-and-forget）、修后返 false
+ * - 并发保存：旧实现无队列、两个 PUT 同时在飞可能后发先至被旧对象覆盖；
+ *   修后严格串行——前一个响应没回来、下一个请求不发出
+ * - isFieldEqual("repos") 旧实现只比 path/name、分支 / 模板 / 预览命令改了 dirty 恒 false
+ */
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+// ---- 模拟最小浏览器环境（local-store 的 isBrowser 闸门 + localStorage 双写）----
+const localStorageStub = {
+  store: new Map<string, string>(),
+  getItem(key: string): string | null {
+    return this.store.get(key) ?? null;
+  },
+  setItem(key: string, value: string): void {
+    this.store.set(key, value);
+  },
+};
+(globalThis as unknown as { window: unknown }).window = {
+  localStorage: localStorageStub,
+};
+
+import { DEFAULT_SETTINGS, saveSettings } from "@/lib/local-store";
+import { repoConfigEquals } from "@/hooks/use-settings";
+import type { RepoConfig } from "@/lib/types";
+
+// 可控 fetch stub：记录调用、由测试手动放行响应
+interface PendingCall {
+  body: unknown;
+  resolve: (res: Response) => void;
+}
+let pendingCalls: PendingCall[] = [];
+
+const okResponse = (): Response =>
+  new Response(JSON.stringify({ ok: true, settings: {} }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+const errResponse = (): Response =>
+  new Response(JSON.stringify({ error: "磁盘只读" }), {
+    status: 500,
+    headers: { "Content-Type": "application/json" },
+  });
+
+beforeAll(() => {
+  vi.stubGlobal(
+    "fetch",
+    (_url: string, init?: RequestInit) =>
+      new Promise<Response>((resolve) => {
+        pendingCalls.push({
+          body: init?.body ? JSON.parse(String(init.body)) : null,
+          resolve,
+        });
+      }),
+  );
+});
+
+afterEach(() => {
+  pendingCalls = [];
+});
+
+describe("saveSettings（CR-08）", () => {
+  it("服务端 500 → 返回 false（旧实现静默当成功返 true）", async () => {
+    const p = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "k1" });
+    // 等 fetch 被发出
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(errResponse());
+    await expect(p).resolves.toBe(false);
+  });
+
+  it("连续两次保存严格串行：前一个响应未回、第二个请求不发出（防乱序覆盖）", async () => {
+    const p1 = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "第一次" });
+    const p2 = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "第二次" });
+
+    // 只有第一个请求在飞（旧实现两个同时发出、此断言失败）
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    expect((pendingCalls[0].body as { apiKey: string }).apiKey).toBe("第一次");
+
+    // 放行第一个 → 第二个才发出、且携带第二次的内容（顺序保住）
+    pendingCalls[0].resolve(okResponse());
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    expect((pendingCalls[1].body as { apiKey: string }).apiKey).toBe("第二次");
+    pendingCalls[1].resolve(okResponse());
+
+    await expect(p1).resolves.toBe(true);
+    await expect(p2).resolves.toBe(true);
+  });
+
+  it("第一个失败不传染第二个（队列断链保护）", async () => {
+    const p1 = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "会失败" });
+    const p2 = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "会成功" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(errResponse());
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    pendingCalls[1].resolve(okResponse());
+    await expect(p1).resolves.toBe(false);
+    await expect(p2).resolves.toBe(true);
+  });
+});
+
+describe("repoConfigEquals（CR-09）", () => {
+  const base: RepoConfig = {
+    name: "web",
+    path: "/repo/web",
+    onlineBranch: "master",
+    testBranch: "test",
+    devBranch: "develop",
+    branchTemplate: "feature/{storyId}",
+    previewCommand: "npm run dev",
+  };
+
+  it("全字段一致 → 相等；可选字段 undefined 与空串视同", () => {
+    expect(repoConfigEquals(base, { ...base })).toBe(true);
+    expect(
+      repoConfigEquals(
+        { name: "a", path: "/a" },
+        { name: "a", path: "/a", onlineBranch: "", previewCommand: "" },
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["onlineBranch", { onlineBranch: "release" }],
+    ["testBranch", { testBranch: "qa" }],
+    ["devBranch", { devBranch: "dev" }],
+    ["branchTemplate", { branchTemplate: "feat/{storyId}" }],
+    ["previewCommand", { previewCommand: "pnpm dev" }],
+    ["name", { name: "web2" }],
+    ["path", { path: "/repo/web2" }],
+  ] as const)("%s 单独改动 → 不相等（旧实现漏比五个字段）", (_field, patch) => {
+    expect(repoConfigEquals(base, { ...base, ...patch })).toBe(false);
+  });
+});

@@ -10,11 +10,37 @@ import {
   buildIdeLink,
   getEffectiveCwd,
   hasValidRepoPrefix,
+  isAbsolutePathLike,
   looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
   pathBasename,
 } from "@/lib/path-utils";
+
+// CR-11 回归：/api/repo-branches 与设置页手填校验共用的跨平台绝对路径判断——
+// 旧实现只认 `/` 开头、Windows 盘符 / UNC 仓库全被 400 / 拦在手填校验
+describe("isAbsolutePathLike（CR-11、跨平台绝对路径）", () => {
+  it("POSIX 绝对路径", () => {
+    expect(isAbsolutePathLike("/Users/me/repo")).toBe(true);
+  });
+
+  it("Windows 盘符：反斜杠 / 正斜杠都认", () => {
+    expect(isAbsolutePathLike("C:\\work\\repo")).toBe(true);
+    expect(isAbsolutePathLike("D:/repo")).toBe(true);
+  });
+
+  it("UNC 路径", () => {
+    expect(isAbsolutePathLike("\\\\server\\share\\repo")).toBe(true);
+    expect(isAbsolutePathLike("//server/share/repo")).toBe(true);
+  });
+
+  it("相对路径 / 裸盘符 / 空串拒绝", () => {
+    expect(isAbsolutePathLike("relative/path")).toBe(false);
+    expect(isAbsolutePathLike("C:")).toBe(false);
+    expect(isAbsolutePathLike("C:repo")).toBe(false); // 盘相对路径不算绝对
+    expect(isAbsolutePathLike("")).toBe(false);
+  });
+});
 
 const BASE = "/Users/me/work";
 

@@ -42,13 +42,14 @@ import { createTask } from "@/lib/task-store";
 
 import {
   TASK_ROLE_LABEL,
+  TASK_ROLES,
   type ModelSelection,
   type RepoConfig,
   type Task,
   type TaskRole,
 } from "@/lib/types";
 
-const ROLE_OPTIONS: TaskRole[] = ["fe", "be", "adaptive"];
+const ROLE_OPTIONS: readonly TaskRole[] = TASK_ROLES;
 
 // 上次启动配置的记忆 key（仓库组合 + 角色——下次预填、零操作启动）
 const LAST_LAUNCH_KEY = "feaiflow.lastLaunch.v1";

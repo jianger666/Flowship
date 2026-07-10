@@ -27,7 +27,7 @@ import {
 import { useDialog } from "@/hooks/use-dialog";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { pickNativePaths } from "@/lib/native-picker";
-import { pathBasename } from "@/lib/path-utils";
+import { isAbsolutePathLike, pathBasename } from "@/lib/path-utils";
 
 import type { RepoConfig } from "@/lib/types";
 
@@ -75,21 +75,23 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
 
   // 手填路径备份入口（粘贴绝对路径、给极端场景兜底）
   // 用 useDialog().prompt 替代 window.prompt——shadcn 风格 + 内联校验、不阻塞主线程
+  // CR-11：校验走共享跨平台判断——Windows 盘符（D:\repo）/ UNC 路径也放行、
+  // 原实现只认 `/` 开头、Windows 用户手填兜底完全不可用
   const promptManualPath = async () => {
     const input = await prompt({
       title: "手填仓库路径",
-      description: "输入绝对路径（以 / 开头）、仅 server 同机有效",
+      description: "输入绝对路径、仅 server 同机有效",
       placeholder: "/Users/me/some-repo",
       confirmLabel: "添加",
       validate: (v) => {
-        const trimmed = v.trim().replace(/\/+$/, "");
+        const trimmed = v.trim().replace(/[\\/]+$/, "");
         if (!trimmed) return "路径不能为空";
-        if (!trimmed.startsWith("/")) return "请填绝对路径（以 / 开头）";
+        if (!isAbsolutePathLike(trimmed)) return "请填绝对路径";
         return "";
       },
     });
     if (input === null) return;
-    addRepos([input.replace(/\/+$/, "")]);
+    addRepos([input.trim().replace(/[\\/]+$/, "")]);
   };
 
   // 仓库重命名：输入时改草稿、blur 落盘（空串 fallback 回 basename）

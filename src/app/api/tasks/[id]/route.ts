@@ -25,6 +25,7 @@ import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import { waitForTaskToStop } from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
+import { isTaskRole, TASK_ROLES } from "@/lib/types";
 import type { ModelSelection, TaskRole } from "@/lib/types";
 
 interface Ctx {
@@ -160,9 +161,10 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       "addRepoPaths",
     ] as const;
     if (editKeys.some((k) => k in body)) {
-      if ("role" in body && body.role !== "fe" && body.role !== "be") {
+      // 共享 guard（CR-07）：原手写白名单漏了 adaptive、自适应任务连改标题都 400
+      if ("role" in body && !isTaskRole(body.role)) {
         return NextResponse.json(
-          { error: "role 必须是 fe / be" },
+          { error: `role 必须是 ${TASK_ROLES.join(" / ")}` },
           { status: 400 },
         );
       }
