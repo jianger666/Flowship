@@ -1,14 +1,17 @@
 "use client";
 
 /**
- * 首页甘特图（V0.14.1、用户拍板「首页只要一个像飞书排期那样的甘特图」）
+ * 首页排期甘特（V0.14.2、对齐飞书人员排期的呈现方式——用户两轮纠偏后定型）
  *
- * 对齐飞书人员排期的阅读结构：
- * - 左侧固定名称列（sticky、工作项名 + AI 状态徽标）、右侧按天分列的时间网格
- * - 排期条落在网格上（逾期红 / 已合入绿 / 有 AI 任务主题色 / 未开始灰）
- * - 「今天」贯穿竖线 + 日期头高亮、周末底色
- * - 日期段筛选：窗口跨度（2 周 / 4 周 / 8 周）+ 前后翻页 + 回今天
- * - 未排期项收在甘特下方平铺 chip
+ * 核心：**排了期的需求本身是时间线上的条**——条从排期开始画到排期结束、
+ * 条内（或条右侧溢出）直接写需求名 + 节点状态、一眼「什么需求排在什么时候」。
+ * （第一版把需求名放左列、条上只写节点状态——用户实测「这是把节点放时间线上」、错）
+ *
+ * - 日期头（今天高亮）+ 今天贯穿竖线 + 周末底色
+ * - 条色：逾期红 / 已合入绿 / 有 AI 任务主题色 / 未开始灰；AI 状态徽标跟在名字后
+ * - 条太短放不下文字 → 文字向右溢出条外（飞书同款处理）
+ * - 日期段筛选：窗口跨度 2/4/8 周 + 前后翻页 + 回今天
+ * - 未排期项收在甘特下方平铺
  */
 
 import { useMemo, useState } from "react";
@@ -34,13 +37,10 @@ const SPAN_OPTIONS = [
   { days: 56, label: "8 周" },
 ] as const;
 
-// 名称列宽（左侧 sticky）
-const NAME_COL = "232px";
-
 export const BoardTimeline = ({ items, onOpen }: Props) => {
   // 窗口跨度（天）
   const [span, setSpan] = useState<number>(28);
-  // 窗口起点偏移（天、相对「今天往前 1/4 窗口」的默认锚点）——翻页按钮改它
+  // 窗口起点偏移（天）——翻页按钮改它
   const [offset, setOffset] = useState(0);
 
   // 窗口起点：默认让「今天」落在窗口前 1/4 处（重点看未来）
@@ -55,7 +55,6 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     d.setHours(0, 0, 0, 0);
     return d.getTime();
   }, []);
-  // 今天在窗口内的列号（0-based、不在窗口内 = -1）
   const todayIdx = Math.floor((today0 - windowStart) / DAY_MS);
   const todayVisible = todayIdx >= 0 && todayIdx < span;
 
@@ -76,7 +75,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     [windowStart, span, todayIdx],
   );
 
-  // 分组：有排期（与窗口有交集）上甘特；其余归「未排期」
+  // 分组：排期与窗口有交集的上轴；没排期的归「未排期」；排了但窗口外的不渲染（翻页看）
   const { scheduled, unscheduled } = useMemo(() => {
     const sch: Array<
       BoardItem & { colStart: number; colEnd: number; clippedL: boolean; clippedR: boolean }
@@ -90,10 +89,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         unsch.push(it);
         continue;
       }
-      if (e < windowStart || s >= windowEnd) {
-        // 有排期但不在窗口内——不进未排期组（翻页能看到）、直接不渲染
-        continue;
-      }
+      if (e < windowStart || s >= windowEnd) continue;
       const rawStart = Math.floor((s - windowStart) / DAY_MS);
       const rawEnd = Math.floor((e - windowStart) / DAY_MS);
       sch.push({
@@ -104,23 +100,29 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         clippedR: rawEnd > span - 1,
       });
     }
-    sch.sort((a, b) => (a.scheduleEnd ?? 0) - (b.scheduleEnd ?? 0));
+    // 开始早的在上（时间自然阅读序）；同起点按结束时间
+    sch.sort(
+      (a, b) =>
+        (a.scheduleStart ?? a.scheduleEnd ?? 0) - (b.scheduleStart ?? b.scheduleEnd ?? 0) ||
+        (a.scheduleEnd ?? 0) - (b.scheduleEnd ?? 0),
+    );
     return { scheduled: sch, unscheduled: unsch };
   }, [items, windowStart, span]);
 
-  // 排期条配色
-  const barClass = (it: BoardItem): string => {
+  // 条色（左侧竖色标 + 条底色）
+  const barTone = (it: BoardItem): { bar: string; accent: string } => {
     if (it.task?.repoStatus === "merged")
-      return "bg-emerald-500/20 border-emerald-500/50";
+      return { bar: "bg-emerald-500/12 hover:bg-emerald-500/20", accent: "bg-emerald-500" };
     if ((it.scheduleEnd ?? 0) < today0)
-      return "bg-red-500/15 border-red-500/50";
-    if (it.task) return "bg-primary/20 border-primary/50";
-    return "bg-muted border-border";
+      return { bar: "bg-red-500/10 hover:bg-red-500/18", accent: "bg-red-500" };
+    if (it.task)
+      return { bar: "bg-primary/12 hover:bg-primary/20", accent: "bg-primary" };
+    return { bar: "bg-muted/70 hover:bg-muted", accent: "bg-muted-foreground/50" };
   };
 
   return (
     <div className="flex h-full flex-col gap-3">
-      {/* 甘特工具条：窗口跨度 + 翻页 + 回今天 */}
+      {/* 工具条：窗口跨度 + 翻页 + 回今天 */}
       <div className="flex shrink-0 items-center gap-1.5">
         {SPAN_OPTIONS.map((o) => (
           <ChoiceButton
@@ -168,30 +170,22 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         </span>
       </div>
 
-      {/* 甘特主体：左名称列（sticky）+ 右时间网格 */}
+      {/* 甘特主体：需求条铺在时间网格上（飞书排期同款阅读方式） */}
       <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border/60">
         <div
-          className="relative grid w-max min-w-full"
-          style={{
-            gridTemplateColumns: `${NAME_COL} repeat(${span}, minmax(30px, 42px))`,
-          }}
+          className="relative grid min-w-full"
+          style={{ gridTemplateColumns: `repeat(${span}, minmax(28px, 1fr))` }}
         >
-          {/* 表头：名称列头 + 日期带 */}
-          <div
-            className="sticky left-0 z-30 border-b border-r border-border/60 bg-background px-3 py-1.5 text-[11px] text-muted-foreground"
-            style={{ gridColumn: 1, gridRow: 1 }}
-          >
-            工作项
-          </div>
+          {/* 日期头 */}
           {days.map((d, i) => (
             <div
               key={i}
               className={cn(
-                "flex flex-col items-center gap-0.5 border-b border-border/60 py-1.5 text-[10px]",
-                d.isWeekend && "bg-muted/30",
+                "sticky top-0 z-30 flex flex-col items-center gap-0.5 border-b border-border/60 bg-background py-1.5 text-[10px]",
+                d.isWeekend && "bg-muted/40",
                 d.isToday && "bg-primary/10",
               )}
-              style={{ gridColumn: i + 2, gridRow: 1 }}
+              style={{ gridColumn: i + 1, gridRow: 1 }}
             >
               <span
                 className={cn(
@@ -209,7 +203,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
             </div>
           ))}
 
-          {/* 周末底色（贯穿行区） */}
+          {/* 周末底色 */}
           {days.map(
             (d, i) =>
               d.isWeekend && (
@@ -217,7 +211,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                   key={`we-${i}`}
                   className="bg-muted/20"
                   style={{
-                    gridColumn: i + 2,
+                    gridColumn: i + 1,
                     gridRow: `2 / ${Math.max(scheduled.length, 1) + 2}`,
                   }}
                   aria-hidden
@@ -225,66 +219,64 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
               ),
           )}
 
-          {/* 行：左名称 + 右排期条 */}
+          {/* 需求条：一行一条、条画在排期区间上、名字在条内（放不下向右溢出条外） */}
           {scheduled.length === 0 ? (
             <div
               className="py-10 text-center text-xs text-muted-foreground"
-              style={{ gridColumn: `1 / ${span + 2}`, gridRow: 2 }}
+              style={{ gridColumn: `1 / ${span + 1}`, gridRow: 2 }}
             >
               窗口内没有已排期的工作项——用上面箭头翻别的时间段
             </div>
           ) : (
-            scheduled.map((it, row) => (
-              <div key={it.id} className="contents">
-                {/* 名称列（sticky left、点击同排期条） */}
+            scheduled.map((it, row) => {
+              const tone = barTone(it);
+              return (
                 <button
+                  key={it.id}
                   type="button"
                   onClick={() => onOpen(it)}
-                  title={it.name}
-                  className="group sticky left-0 z-20 flex min-w-0 items-center gap-1.5 border-b border-r border-border/40 bg-background px-3 py-1.5 text-left transition-colors hover:bg-muted/40"
-                  style={{ gridColumn: 1, gridRow: row + 2 }}
-                >
-                  <span className="min-w-0 flex-1 truncate text-xs">{it.name}</span>
-                  <AiStatusBadge task={it.task} />
-                </button>
-                {/* 行底线（时间网格区） */}
-                <div
-                  className="border-b border-border/40"
-                  style={{ gridColumn: `2 / ${span + 2}`, gridRow: row + 2 }}
-                  aria-hidden
-                />
-                {/* 排期条 */}
-                <button
-                  type="button"
-                  onClick={() => onOpen(it)}
-                  title={`${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}`}
+                  title={`${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}${
+                    it.projectName ? `（${it.projectName}）` : ""
+                  }`}
                   className={cn(
-                    "z-10 my-1 flex min-w-0 items-center gap-1 self-center rounded border px-1.5 py-0.5 text-left transition-all hover:z-20 hover:shadow-md",
-                    barClass(it),
-                    it.clippedL && "rounded-l-none border-l-0",
-                    it.clippedR && "rounded-r-none border-r-0",
+                    "group z-10 my-0.5 flex h-7 min-w-0 items-center gap-1.5 self-center rounded pl-0 pr-2 text-left transition-colors",
+                    tone.bar,
+                    it.clippedL && "rounded-l-none",
+                    it.clippedR && "rounded-r-none",
                   )}
                   style={{
-                    gridColumn: `${it.colStart + 2} / ${it.colEnd + 3}`,
+                    gridColumn: `${it.colStart + 1} / ${it.colEnd + 2}`,
                     gridRow: row + 2,
+                    // 文字放不下时向右溢出条外显示（飞书同款）——不裁剪
+                    overflow: "visible",
                   }}
                 >
-                  {it.statusLabel && (
-                    <span className="truncate text-[10px] text-muted-foreground">
-                      {it.statusLabel}
-                    </span>
-                  )}
+                  {/* 左端竖色标（状态色、飞书排期条同款视觉锚点） */}
+                  <span
+                    className={cn("h-full w-1 shrink-0 rounded-l", tone.accent)}
+                    aria-hidden
+                  />
+                  {/* 需求名 + 节点状态 + AI 徽标：nowrap、条短时溢出到条右侧 */}
+                  <span className="flex items-center gap-1.5 whitespace-nowrap">
+                    <span className="text-xs font-medium">{it.name}</span>
+                    {it.statusLabel && (
+                      <span className="text-[10px] text-muted-foreground">
+                        {it.statusLabel}
+                      </span>
+                    )}
+                    <AiStatusBadge task={it.task} />
+                  </span>
                 </button>
-              </div>
-            ))
+              );
+            })
           )}
 
-          {/* 今天竖线（在窗口内才画、置顶层不挡点击） */}
+          {/* 今天竖线 */}
           {todayVisible && (
             <div
               className="pointer-events-none z-20 w-px justify-self-center bg-primary/70"
               style={{
-                gridColumn: todayIdx + 2,
+                gridColumn: todayIdx + 1,
                 gridRow: `1 / ${Math.max(scheduled.length, 1) + 2}`,
               }}
               aria-hidden
