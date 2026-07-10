@@ -18,6 +18,7 @@ import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board"
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -298,9 +299,12 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                 const hasNodes = (it.nodes ?? []).some(
                   (n) => n.start || n.end || (n.subTasks ?? []).length > 0,
                 );
+                const tip = `${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}${
+                  it.projectName ? `（${it.projectName}）` : ""
+                }`;
                 return (
+                  <Tooltip key={`i-${it.id}`} content={tip} delay={100} side="top">
                   <div
-                    key={`i-${it.id}`}
                     className={cn(
                       "group z-10 my-0.5 flex h-7 min-w-0 items-center gap-1 self-center rounded pr-2 text-left transition-colors",
                       tone.bar,
@@ -332,9 +336,6 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                     <button
                       type="button"
                       onClick={() => onOpen(it)}
-                      title={`${it.name}${it.statusLabel ? ` · ${it.statusLabel}` : ""}${
-                        it.projectName ? `（${it.projectName}）` : ""
-                      }`}
                       className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                     >
                       <span className="min-w-0 truncate text-xs font-medium">{it.name}</span>
@@ -346,6 +347,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                       <AiStatusBadge task={it.task} />
                     </button>
                   </div>
+                  </Tooltip>
                 );
               }
               // 展开子行：节点行（分组标题感）/ 子任务行（具体任务名）。
@@ -357,9 +359,8 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                   : ""
               }${row.isSub && row.finished ? " ✓" : ""}${!cols ? "（窗口外）" : ""}`;
               return (
+                <Tooltip key={`n-${row.parentId}-${row.name}-${idx}`} content={label} delay={100} side="top">
                 <div
-                  key={`n-${row.parentId}-${row.name}-${idx}`}
-                  title={label}
                   className={cn(
                     "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center overflow-hidden rounded pl-1.5 pr-2",
                     row.isSub
@@ -385,6 +386,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                     {label}
                   </span>
                 </div>
+                </Tooltip>
               );
             })
           )}
