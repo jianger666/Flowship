@@ -10,6 +10,7 @@
 
 import { NextResponse } from "next/server";
 
+import { extractFeishuStoryId } from "@/lib/branch-template";
 import {
   fetchMyWorkitems,
   meegleAuthStatus,
@@ -34,7 +35,10 @@ export const GET = async (req: Request) => {
     const page1 = await fetchMyWorkitems(action, 1);
     const items = [...page1];
     if (page1.length === 50) {
-      const page2 = await fetchMyWorkitems(action, 2).catch(() => []);
+      const page2 = await fetchMyWorkitems(action, 2).catch((err) => {
+        console.warn("[feishu-board] 第 2 页拉取失败（只展示前 50 条）", err);
+        return [];
+      });
       items.push(...page2);
     }
 
@@ -48,14 +52,14 @@ export const GET = async (req: Request) => {
       }
     }
 
-    // join 本地任务：feishuStoryUrl 含工作项 id → 已有任务
+    // join 本地任务：feishuStoryUrl 抠出的 story id 精确等于工作项 id → 已有任务
+    //（不用 includes——短 id 是长 id 子串时会误 join、审计 P1）
     const tasks = await listTasks();
     const linked = items.map((it) => {
       const t = tasks.find(
         (task) =>
           task.mode !== "chat" &&
-          typeof task.feishuStoryUrl === "string" &&
-          task.feishuStoryUrl.includes(it.id),
+          extractFeishuStoryId(task.feishuStoryUrl) === it.id,
       );
       return {
         ...it,

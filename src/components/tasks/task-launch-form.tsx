@@ -129,11 +129,12 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   );
   // 缺项引导文案（启动置灰时告诉用户差什么、防隐性卡点）
   const missingHint = useMemo(() => {
+    if (!feishuStoryUrl) return "工作项链接缺失、回看板重新进入";
     if (repoPaths.length === 0) return "选个目标仓库即可启动";
     if (!role) return "选个角色即可启动";
     if (!title.trim()) return "填个任务标题即可启动";
     return null;
-  }, [repoPaths, role, title]);
+  }, [feishuStoryUrl, repoPaths, role, title]);
 
   const handleLaunch = async () => {
     if (!canSubmit) return;

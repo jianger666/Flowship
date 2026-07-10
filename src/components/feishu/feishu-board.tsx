@@ -12,7 +12,7 @@
  * - sessionStorage 缓存：秒开上次数据、后台刷新（CLI 调用 1-3s、别白屏等）
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarRange, ListTodo, Plug, RefreshCw, Rows3 } from "lucide-react";
 
@@ -129,6 +129,8 @@ export const FeishuBoard = () => {
   const [resp, setResp] = useState<BoardResp | null>(null);
   // 刷新飞行中（顶部转圈、不清空已有数据）
   const [refreshing, setRefreshing] = useState(false);
+  // 请求序号：快切 tab 时旧请求晚到不覆盖新 tab 数据（审计 P1 竞态）
+  const seqRef = useRef(0);
 
   // mount：先吃缓存秒开、再后台刷新
   useEffect(() => {
@@ -141,23 +143,27 @@ export const FeishuBoard = () => {
   }, [action]);
 
   const refresh = useCallback(async () => {
+    const seq = ++seqRef.current;
     setRefreshing(true);
     try {
       const r = await fetch(`/api/feishu/board?action=${action}`);
       const data = (await r.json()) as BoardResp;
-      setResp(data);
+      // 期间用户切了 tab / 又点了刷新 → 本响应过期、只写缓存不动 UI
       try {
         sessionStorage.setItem(`${CACHE_KEY}.${action}`, JSON.stringify(data));
       } catch {
         /* 超配额忽略 */
       }
+      if (seq === seqRef.current) setResp(data);
     } catch (err) {
-      setResp({
-        status: "error",
-        message: err instanceof Error ? err.message : String(err),
-      });
+      if (seq === seqRef.current) {
+        setResp({
+          status: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
     } finally {
-      setRefreshing(false);
+      if (seq === seqRef.current) setRefreshing(false);
     }
   }, [action]);
 

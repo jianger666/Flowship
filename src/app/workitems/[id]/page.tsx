@@ -12,7 +12,7 @@
  * query：?project=<projectKey>&name=<工作项名>&url=<详情页URL>
  */
 
-import { use, useMemo } from "react";
+import { Suspense, use, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, Rocket } from "lucide-react";
@@ -22,9 +22,10 @@ import { WorkitemDetail } from "@/components/feishu/workitem-detail";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { useTaskList } from "@/hooks/use-task-list";
+import { extractFeishuStoryId } from "@/lib/branch-template";
 import type { Task } from "@/lib/types";
 
-const WorkitemPreviewPage = ({ params }: { params: Promise<{ id: string }> }) => {
+const WorkitemPreviewInner = ({ params }: { params: Promise<{ id: string }> }) => {
   const { id } = use(params);
   const router = useRouter();
   const sp = useSearchParams();
@@ -33,14 +34,13 @@ const WorkitemPreviewPage = ({ params }: { params: Promise<{ id: string }> }) =>
   const url = sp.get("url") ?? "";
   const { tasks, upsertTask } = useTaskList();
 
-  // 兜底防重复建：该工作项已有任务（看板正常不会带进来、直开 URL 场景）→ 提示直进
+  // 兜底防重复建：该工作项已有任务（看板正常不会带进来、直开 URL 场景）→ 提示直进。
+  // 精确比 story id（不用 includes、防短 id 子串误匹配、与 board join 同口径）
   const existing = useMemo(
     () =>
       tasks.find(
         (t) =>
-          (t.mode ?? "task") === "task" &&
-          typeof t.feishuStoryUrl === "string" &&
-          t.feishuStoryUrl.includes(id),
+          t.mode !== "chat" && extractFeishuStoryId(t.feishuStoryUrl) === id,
       ),
     [tasks, id],
   );
@@ -86,5 +86,12 @@ const WorkitemPreviewPage = ({ params }: { params: Promise<{ id: string }> }) =>
     </div>
   );
 };
+
+// useSearchParams 必须包 Suspense（Next 15 构建约束 missing-suspense）
+const WorkitemPreviewPage = ({ params }: { params: Promise<{ id: string }> }) => (
+  <Suspense>
+    <WorkitemPreviewInner params={params} />
+  </Suspense>
+);
 
 export default WorkitemPreviewPage;
