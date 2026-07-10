@@ -262,8 +262,14 @@ export const FeishuBoard = () => {
                 {spaces.find((s) => s.key === spaceKey)?.name ?? "选择空间"}
               </SelectValue>
             </SelectTrigger>
-            {/* w-auto：默认弹层宽=触发器宽、长空间名被裁（用户截图踩过）——放开自适应 */}
-            <SelectContent className="w-auto min-w-(--anchor-width) max-w-80">
+            {/* w-auto：弹层宽自适应（长空间名被裁踩过）；
+                alignItemWithTrigger=false：默认会把选中项对准触发器、列表长时向上溢出
+                盖到 Electron 标题栏（drag 区域点不了、用户截图踩过）——强制往下弹 */}
+            <SelectContent
+              className="w-auto min-w-(--anchor-width) max-w-80"
+              alignItemWithTrigger={false}
+              side="bottom"
+            >
               {spaces.map((s) => (
                 <SelectItem key={s.key} value={s.key}>
                   {s.name}
