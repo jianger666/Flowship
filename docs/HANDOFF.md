@@ -299,6 +299,17 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-10 夜 v1.0 界面重构 + Markdown 渲染升级（用户拍板、Grok 蓝军审核过）
+
+- **胶囊双模式**：顶栏居中「工作台 / 对话」胶囊（`use-app-mode.ts` 按 URL 推导：`/`+`/workitems`=工作台、`/chats`+chat 任务=对话、`/tasks/:id` 看 task.mode）；顶栏删 logo（桌面 app 有 dock 图标、品牌冗余、回首页归胶囊）；`/chats` 落点页自动跳最近对话 / 空态新建
+- **侧栏按页型自适应（A）**：看板页（`/`）自动收侧栏（全屏甘特、看板=唯一导航中心）、详情页自动展；手动 toggle 同页型内最高优先、切页型恢复默认（`lastAutoTypeRef` 记切换沿）；删了 localStorage 持久化偏好（改按页型）
+- **任务行升级监控行（C）**：task 行第二行「阶段 · 状态」（方案/实现/审阅 + 运行中/待确认/待回答/空闲、tone 分色）、chat 行不显示——侧栏从「名字列表」变「多任务进度一览」
+- **`/` 唤起 skill**（`slash-skills.tsx` 共享）：所有聊天框打 `/` 弹 skill 菜单（↑↓/Enter/Tab/Esc、IME guard）、选中转高亮 chip、发送时消息头拼「先 read SKILL.md 再执行」；skills 缓存 TTL 60s；chat 输入岛 + 任务输入条两处接入；「对话创建 skill」直跳带 chip（setPendingSlashSkill sessionStorage handoff）
+- **chat 消息编辑重发**：hover 用户消息出「编辑重发」、原文填回输入框改完再发（原消息保留）
+- **Markdown 渲染迁 Streamdown**（Vercel AI 流式渲染库）：Shiki 代码高亮（VS Code 引擎、200+ 语言、复制按钮）+ Mermaid 图 + KaTeX 公式 + CJK + 流式容错 + 块级 memo。统一 `markdown-text.tsx`（rows.tsx re-export 保路径）+ artifact-panel 两处；**remarkPlugins 必须带 `defaultRemarkPlugins`（含 gfm）再追加自定义**（整表替换会丢 gfm、审计 P1 踩过）；artifact 路径/引用跳转挂 **`inlineCode`** 槽（覆盖 `code` 会连 fenced 一起接管、丢 Shiki、审计 P1 踩过）；流式显式 `caret="block"`（无默认光标）
+- **本地图片 HTTP 通道**：`/api/local-image?path=`（图片扩展名白名单 + 30MB、本机 loopback 不扩威胁面）——AI 在工作目录生成的图（二维码 / 图表）markdown 本地路径浏览器加载不了的根因；`MarkdownImage.toLoadableImageSrc` 本地绝对路径转通道、站内/http/data 原样；`MarkdownLink` 本地图片路径可点预览
+- **踩坑记账**：next 升 15.5.20 后 standalone 启动会 require next-config-ts/transpile-config → `next/dist/lib/typescript/required-packages`，而 outputFileTracingExcludes 的 `node_modules/**/typescript/**` 把 Next 自己的 dist/lib/typescript 也删了 → 打包态启动崩（dev/build 不复现）。修：`next.config.ts→.mjs`（原生加载不转译配置）+ 排除收窄到 `.pnpm/typescript@*` + `node_modules/typescript`。**发版前必带此 commit（3d2f73b）、否则 15.5.20 包必崩**
+
 ### 2026-07-10 全仓安全审查修复（CR-01~13、批次 A~D 四个 commit）
 
 GPT-5.6 全仓审查报了 13 项（2 P0 / 4 P1 / 6 P2 / 1 P3）、已全部处理：源码启动绑 127.0.0.1 + `/api/**` Host/Origin loopback 校验（middleware、Node runtime）；`/api/preview` 命令改服务端从 config.json 查（掐 RCE 链）；`/api/settings` GET 脱敏 + `/api/settings/full` 全量口；mac 自更新签名 manifest 链（Ed25519、公钥占位渐进启用）；worktree 清理 fail-closed；OAuth 凭证 sha256 命名 + 身份/URL 双校验；meegle 下载 dist.integrity 验真 + 全下载链 mkdtemp/原子替换；依赖治理（next 15.5.20、audit 45→2）；adaptive PATCH 修复；settings 保存 await + 双端串行队列；repos dirty 全字段；preview 并发 mutex + PID 归属核验；Windows 路径共享判断；lint 迁 ESLint CLI。**两个待办**：
