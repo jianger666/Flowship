@@ -422,14 +422,19 @@ export interface CliToolStatus {
 }
 
 const probeVersion = async (bin: string): Promise<string | null> => {
-  try {
-    const { stdout } = await execFileAsync(bin, ["--version"], { timeout: 10_000 });
-    // 形如 "lark-cli version 1.0.66" / "meegle version x.y.z"、抓第一个语义化版本号
-    const m = stdout.match(/\d+\.\d+\.\d+/);
-    return m ? m[0] : stdout.trim().slice(0, 40);
-  } catch {
-    return null;
+  // lark-cli 认 `--version` flag；meegle（cobra CLI）只有 `version` 子命令、
+  // 传 --version 报 unknown flag exit 1（实测踩过：装好了却被 UI 判「未安装」）——两种都试
+  for (const args of [["--version"], ["version"]]) {
+    try {
+      const { stdout } = await execFileAsync(bin, args, { timeout: 10_000 });
+      // 形如 "lark-cli version 1.0.66" / 裸 "1.0.16"、抓第一个语义化版本号
+      const m = stdout.match(/\d+\.\d+\.\d+/);
+      return m ? m[0] : stdout.trim().slice(0, 40);
+    } catch {
+      // 换下一种形态
+    }
   }
+  return null;
 };
 
 const probeLarkAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> => {
