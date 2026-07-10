@@ -18,7 +18,6 @@ import { useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { cn } from "@/lib/utils";
@@ -75,20 +74,17 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     [windowStart, span, todayIdx],
   );
 
-  // 分组：排期与窗口有交集的上轴；没排期的归「未排期」；排了但窗口外的不渲染（翻页看）
-  const { scheduled, unscheduled } = useMemo(() => {
+  // 只收「排期与窗口有交集」的上轴；没排期的不显示（用户拍板「只要一个甘特图」）；窗口外的翻页看
+  const scheduled = useMemo(() => {
     const sch: Array<
       BoardItem & { colStart: number; colEnd: number; clippedL: boolean; clippedR: boolean }
     > = [];
-    const unsch: BoardItem[] = [];
     const windowEnd = windowStart + span * DAY_MS;
     for (const it of items) {
       const s = it.scheduleStart ?? it.scheduleEnd;
       const e = it.scheduleEnd ?? it.scheduleStart;
-      if (!s || !e) {
-        unsch.push(it);
-        continue;
-      }
+      // 没排期的不显示（用户拍板「只要一个甘特图」）；窗口外的翻页看
+      if (!s || !e) continue;
       if (e < windowStart || s >= windowEnd) continue;
       const rawStart = Math.floor((s - windowStart) / DAY_MS);
       const rawEnd = Math.floor((e - windowStart) / DAY_MS);
@@ -106,7 +102,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         (a.scheduleStart ?? a.scheduleEnd ?? 0) - (b.scheduleStart ?? b.scheduleEnd ?? 0) ||
         (a.scheduleEnd ?? 0) - (b.scheduleEnd ?? 0),
     );
-    return { scheduled: sch, unscheduled: unsch };
+    return sch;
   }, [items, windowStart, span]);
 
   // 条色（左侧竖色标 + 条底色）
@@ -166,7 +162,6 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         )}
         <span className="ml-auto text-xs text-muted-foreground">
           {scheduled.length} 项排期中
-          {unscheduled.length > 0 && ` · ${unscheduled.length} 项未排期`}
         </span>
       </div>
 
@@ -285,31 +280,6 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         </div>
       </div>
 
-      {/* 未排期：甘特下方平铺 */}
-      {unscheduled.length > 0 && (
-        <div className="flex shrink-0 flex-col gap-2">
-          <div className="text-xs text-muted-foreground">未排期 · {unscheduled.length} 项</div>
-          <div className="flex max-h-28 flex-wrap gap-2 overflow-y-auto">
-            {unscheduled.map((it) => (
-              <button
-                key={it.id}
-                type="button"
-                onClick={() => onOpen(it)}
-                className="flex max-w-full items-center gap-2 rounded-md border border-border/60 bg-card/50 px-2.5 py-1.5 text-xs transition-colors hover:bg-muted/40"
-                title={it.name}
-              >
-                <span className="min-w-0 truncate">{it.name}</span>
-                {it.statusLabel && (
-                  <Badge variant="outline" className="shrink-0 text-[10px]">
-                    {it.statusLabel}
-                  </Badge>
-                )}
-                <AiStatusBadge task={it.task} />
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 };

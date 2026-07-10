@@ -20,6 +20,13 @@ import { BoardTimeline } from "@/components/feishu/board-timeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { settingsUrl } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
 
@@ -157,6 +164,45 @@ export const FeishuBoard = () => {
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
 
+  // 空间切换（用户拍板「空间要可切、不要展示全部」）：
+  // mywork 数据本身跨空间、前端按 projectKey 过滤即可；空间列表从数据聚合。
+  // 选择记 localStorage、下次进来直接是上次看的空间；默认工作项最多的空间。
+  const spaces = useMemo(() => {
+    const m = new Map<string, { key: string; name: string; count: number }>();
+    for (const it of items) {
+      if (!it.projectKey) continue;
+      const cur = m.get(it.projectKey);
+      if (cur) cur.count += 1;
+      else m.set(it.projectKey, { key: it.projectKey, name: it.projectName ?? it.projectKey, count: 1 });
+    }
+    return [...m.values()].sort((a, b) => b.count - a.count);
+  }, [items]);
+  const [spaceKey, setSpaceKey] = useState<string | null>(null);
+  // 生效空间：显式选的 > localStorage 记忆（仍在列表里）> 工作项最多的
+  const effectiveSpace = useMemo(() => {
+    if (spaceKey && spaces.some((s) => s.key === spaceKey)) return spaceKey;
+    try {
+      const saved = localStorage.getItem("feaiflow.board.space");
+      if (saved && spaces.some((s) => s.key === saved)) return saved;
+    } catch {
+      /* noop */
+    }
+    return spaces[0]?.key ?? null;
+  }, [spaceKey, spaces]);
+  const handlePickSpace = useCallback((key: string) => {
+    setSpaceKey(key);
+    try {
+      localStorage.setItem("feaiflow.board.space", key);
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const visibleItems = useMemo(
+    () => (effectiveSpace ? items.filter((it) => it.projectKey === effectiveSpace) : items),
+    [items, effectiveSpace],
+  );
+
   // ---------- 降级态 ----------
   if (resp && resp.status !== "ok") {
     const isSetup = resp.status === "not_installed" || resp.status === "not_authed";
@@ -193,11 +239,23 @@ export const FeishuBoard = () => {
   // ---------- 甘特主体 ----------
   return (
     <div className="mx-auto flex h-full w-full max-w-5xl flex-col gap-3 px-6 py-4">
-      <div className="flex shrink-0 items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2.5">
         <h1 className="text-lg font-semibold tracking-tight">我的排期</h1>
-        <span className="text-xs text-muted-foreground">
-          全部空间 · 我负责的待办{items.length > 0 ? ` · ${items.length} 项` : ""}
-        </span>
+        {/* 空间切换：单选、不提供「全部」（用户拍板） */}
+        {spaces.length > 0 && (
+          <Select value={effectiveSpace ?? undefined} onValueChange={(v) => v && handlePickSpace(v)}>
+            <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
+              <SelectValue placeholder="选择空间" />
+            </SelectTrigger>
+            <SelectContent>
+              {spaces.map((s) => (
+                <SelectItem key={s.key} value={s.key}>
+                  {s.name}（{s.count}）
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
         <Button
           size="icon-xs"
           variant="ghost"
@@ -215,7 +273,7 @@ export const FeishuBoard = () => {
         {resp === null ? (
           <LoadingState variant="block" label="正在拉取飞书工作项…" />
         ) : (
-          <BoardTimeline items={items} onOpen={handleOpen} />
+          <BoardTimeline items={visibleItems} onOpen={handleOpen} />
         )}
       </div>
     </div>
