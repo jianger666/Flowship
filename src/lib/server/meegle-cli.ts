@@ -267,9 +267,21 @@ export const fetchMyWorkitems = async (
     "--page-num",
     String(pageNum),
   ]);
-  return extractItems(resp)
+  const raw = extractItems(resp);
+  const parsed = raw
     .map(normalizeWorkitem)
     .filter((x): x is BoardWorkitem => x !== null);
+  // 诊断日志（同事「有排期但看板空」排查不了才加的）：原始条数 vs 解析成功条数——
+  // 两者差距大 = 响应结构变体没兜住；raw=0 = mywork 本身没返回
+  console.log(
+    `[meegle] mywork ${action} p${pageNum}：原始 ${raw.length} 条、解析成功 ${parsed.length} 条`,
+  );
+  if (raw.length > 0 && parsed.length === 0) {
+    console.warn(
+      `[meegle] mywork 全部解析失败、首条原始结构：${JSON.stringify(raw[0]).slice(0, 500)}`,
+    );
+  }
+  return parsed;
 };
 
 /** 工作项详情（预览页 / 任务详情融合用；默认字段已含 description） */

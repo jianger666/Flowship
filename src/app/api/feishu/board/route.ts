@@ -135,6 +135,9 @@ export const GET = async (req: Request) => {
           : null,
       };
     });
+    console.log(
+      `[feishu-board] action=${action} 去重后 ${items.length} 项、有节点排期 ${linked.filter((i) => (i.nodes?.length ?? 0) > 0).length} 项、关联任务 ${linked.filter((i) => i.task).length} 项`,
+    );
     return NextResponse.json({ status: "ok", action, items: linked });
   } catch (err) {
     if (err instanceof MeegleError) {
