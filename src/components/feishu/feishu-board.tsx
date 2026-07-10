@@ -258,7 +258,8 @@ export const FeishuBoard = () => {
                 {spaces.find((s) => s.key === effectiveSpace)?.name ?? "选择空间"}
               </SelectValue>
             </SelectTrigger>
-            <SelectContent>
+            {/* w-auto：默认弹层宽=触发器宽、长空间名被裁（用户截图踩过）——放开自适应 */}
+            <SelectContent className="w-auto min-w-(--anchor-width) max-w-80">
               {spaces.map((s) => (
                 <SelectItem key={s.key} value={s.key}>
                   {s.name}（{s.count}）

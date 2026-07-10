@@ -98,9 +98,23 @@ export const DateRangePicker = ({ value, onChange, className }: Props) => {
           // react-day-picker 主题变量接 app token（dark 自动跟随）；不用 styled-jsx（App Router 下多一层风险）
           style={
             {
+              // v10 真实变量名（node_modules style.css 核对过）——range_middle 的
+              // 背景不覆盖会用默认 accent-background、dark 下渲染成大白块（用户截图踩过）
               "--rdp-accent-color": "var(--primary)",
               "--rdp-accent-background-color":
-                "color-mix(in oklab, var(--primary) 18%, transparent)",
+                "color-mix(in oklab, var(--primary) 16%, transparent)",
+              "--rdp-range_middle-background-color":
+                "color-mix(in oklab, var(--primary) 16%, transparent)",
+              "--rdp-range_middle-color": "var(--foreground)",
+              "--rdp-range_start-background":
+                "color-mix(in oklab, var(--primary) 16%, transparent)",
+              "--rdp-range_end-background":
+                "color-mix(in oklab, var(--primary) 16%, transparent)",
+              "--rdp-range_start-color": "var(--primary-foreground)",
+              "--rdp-range_end-color": "var(--primary-foreground)",
+              "--rdp-range_start-date-background-color": "var(--primary)",
+              "--rdp-range_end-date-background-color": "var(--primary)",
+              "--rdp-selected-border": "1px solid var(--primary)",
               "--rdp-today-color": "var(--primary)",
               "--rdp-day-height": "30px",
               "--rdp-day-width": "30px",
