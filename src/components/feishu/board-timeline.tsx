@@ -14,7 +14,7 @@
 import { useMemo, useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
-import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board";
+import type { BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
 import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -145,28 +145,10 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
     });
   };
 
-  // 条色（需求主条）：底色 + 同色系边框——纯透明底色在浅色模式下几乎隐形（用户点名对比度太低）
-  const barTone = (it: BoardItem): { bar: string; accent: string } => {
-    if (it.task?.repoStatus === "merged")
-      return {
-        bar: "border border-emerald-500/50 bg-emerald-500/18 hover:bg-emerald-500/28",
-        accent: "bg-emerald-500",
-      };
-    if ((it.scheduleEnd ?? 0) < today0)
-      return {
-        bar: "border border-red-500/50 bg-red-500/15 hover:bg-red-500/25",
-        accent: "bg-red-500",
-      };
-    if (it.task)
-      return {
-        bar: "border border-primary/50 bg-primary/18 hover:bg-primary/28",
-        accent: "bg-primary",
-      };
-    return {
-      bar: "border border-muted-foreground/35 bg-muted-foreground/12 hover:bg-muted-foreground/20",
-      accent: "bg-muted-foreground/70",
-    };
-  };
+  // 条配色：统一素色（用户拍板「红的和标签先不加、后面再考虑」——逾期红 /
+  // AI 状态色 / 竖色标整套撤下、只留一种带边框的中性条）
+  const BAR_CLS =
+    "border border-muted-foreground/35 bg-muted-foreground/12 hover:bg-muted-foreground/20";
 
   return (
     <div className="flex h-full flex-col gap-3">
@@ -262,7 +244,6 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
             rows.map((row, idx) => {
               if (row.kind === "item") {
                 const { item: it, cols } = row;
-                const tone = barTone(it);
                 const isOpen = expanded.has(it.id);
                 const hasNodes = (it.nodes ?? []).some(
                   (n) => (n.subTasks ?? []).length > 0,
@@ -274,8 +255,8 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                   <Tooltip key={`i-${it.id}`} content={tip} delay={100} side="top">
                   <div
                     className={cn(
-                      "group z-10 my-0.5 flex h-7 min-w-0 items-center gap-1 self-center rounded pr-2 text-left transition-colors",
-                      tone.bar,
+                      "group z-10 my-0.5 flex h-7 min-w-0 items-center gap-1 self-center rounded pl-1.5 pr-2 text-left transition-colors",
+                      BAR_CLS,
                       cols.clippedL && "rounded-l-none",
                       cols.clippedR && "rounded-r-none",
                     )}
@@ -285,7 +266,6 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                       overflow: "visible",
                     }}
                   >
-                    <span className={cn("h-full w-1 shrink-0 rounded-l", tone.accent)} aria-hidden />
                     {/* 展开箭头（有带排期的节点才显示） */}
                     {hasNodes && (
                       <button
@@ -312,7 +292,6 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                           {it.statusLabel}
                         </span>
                       )}
-                      <AiStatusBadge task={it.task} />
                     </button>
                   </div>
                   </Tooltip>
