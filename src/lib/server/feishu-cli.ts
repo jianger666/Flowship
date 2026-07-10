@@ -369,7 +369,10 @@ export const startLogin = async (
         return { ok: false, error: state.error };
       }
     }
-    args = ["auth", "login"];
+    // 裸 auth login 走 Authorization Code flow、需要交互式浏览器回调——spawn 子进程
+    // 环境跑不了（实测退出提示改用 device-code）。device-code flow 打印 verification
+    // URL、正好接我们的「抓 URL 自动开浏览器」逻辑
+    args = ["auth", "login", "--device-code", "--host", host];
   }
 
   try {

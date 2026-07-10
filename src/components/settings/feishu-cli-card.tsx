@@ -48,32 +48,6 @@ const TOOL_LABEL: Record<"larkCli" | "meegle", string> = {
   meegle: "飞书项目（meegle）",
 };
 
-/**
- * 授权链接二维码（手机飞书扫码授权、跟浏览器打开二选一）。
- * qrcode 库纯前端生成 dataURL、url 变了重新生成。
- */
-const LoginQrCode = ({ url }: { url: string }) => {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    void import("qrcode").then((QR) =>
-      QR.toDataURL(url, { width: 132, margin: 1 }).then((d) => {
-        if (alive) setDataUrl(d);
-      }),
-    );
-    return () => {
-      alive = false;
-    };
-  }, [url]);
-  if (!dataUrl) return null;
-  return (
-    <div className="flex w-full items-center gap-2 pl-36">
-      {/* eslint-disable-next-line @next/next/no-img-element -- dataURL 二维码、非资源图 */}
-      <img src={dataUrl} alt="授权二维码" className="size-24 rounded bg-white p-1" />
-      <span className="text-xs text-muted-foreground">或用手机飞书扫码授权</span>
-    </div>
-  );
-};
 
 export const FeishuCliCard = () => {
   // 服务端状态快照（轮询）
@@ -182,20 +156,16 @@ export const FeishuCliCard = () => {
                 </Button>
               </>
             )}
-            {/* 登录中：服务端已尝试自动开浏览器；这里给链接 + 二维码双兜底
-                （用户点名：网页可能没弹、且要支持手机飞书扫码授权） */}
+            {/* 登录中：服务端已尝试自动开浏览器、链接兜底（二维码试过、用户嫌丑撤了） */}
             {login?.running && login.authUrl && (
-              <>
-                <a
-                  href={login.authUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-primary underline-offset-2 hover:underline"
-                >
-                  浏览器没弹？点这里授权
-                </a>
-                <LoginQrCode url={login.authUrl} />
-              </>
+              <a
+                href={login.authUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-primary underline-offset-2 hover:underline"
+              >
+                浏览器没弹？点这里授权
+              </a>
             )}
             {login?.error && (
               <span className="text-xs text-destructive">{login.error}</span>
