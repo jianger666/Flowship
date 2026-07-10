@@ -77,10 +77,15 @@ export const GET = async (req: Request) => {
     );
     for (const it of items) {
       const nodes = nodesMap.get(it.id) ?? [];
-      const starts = nodes.map((n) => n.start).filter((v): v is number => !!v);
-      const ends = nodes.map((n) => n.end).filter((v): v is number => !!v);
-      if (starts.length > 0) it.scheduleStart = Math.min(...starts);
-      if (ends.length > 0) it.scheduleEnd = Math.max(...ends);
+      // start/end 都收进候选：有的节点只有单边排期、只按各自字段聚合会出现
+      // min(start) > max(end) 的倒挂（实测「新增Follow筛选」踩到）——统一取全体时间点的 min/max
+      const points = nodes
+        .flatMap((n) => [n.start, n.end])
+        .filter((v): v is number => !!v);
+      if (points.length > 0) {
+        it.scheduleStart = Math.min(...points);
+        it.scheduleEnd = Math.max(...points);
+      }
     }
 
     // url 兜底：mywork 响应不带详情页 URL（实测确认）——按飞书项目标准路径拼
