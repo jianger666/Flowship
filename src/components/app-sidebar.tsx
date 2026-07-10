@@ -116,10 +116,12 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const empty = active.length === 0 && earlier.length === 0;
 
   return (
+    // 底色比主区深半档（bg-muted/30）：侧栏与内容区分层、不再「格格不入」（用户点名）——
+    // 对标 Cursor / Linear 的侧栏做法；border-r 保留细分隔
     <aside
       aria-hidden={!open}
       className={cn(
-        "h-full shrink-0 overflow-hidden border-r bg-background transition-[width] duration-200 ease-out",
+        "h-full shrink-0 overflow-hidden border-r border-border/60 bg-muted/30 transition-[width] duration-200 ease-out",
         open ? "w-64" : "w-0",
       )}
     >

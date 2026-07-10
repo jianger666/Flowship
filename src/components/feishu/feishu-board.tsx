@@ -250,7 +250,9 @@ export const FeishuBoard = () => {
 
   // ---------- 甘特主体 ----------
   return (
-    <div className="mx-auto flex h-full w-full max-w-5xl flex-col gap-3 px-6 py-4">
+    // 甘特是时间线视图、大屏该吃满宽度（原 max-w-5xl 大屏两侧留白难看、用户点名）；
+    // 1760px 上限防超宽屏拉到没法看、padding 随屏放大
+    <div className="mx-auto flex h-full w-full max-w-[1760px] flex-col gap-3 px-6 py-5 xl:px-10">
       <div className="flex shrink-0 items-center gap-2.5">
         <h1 className="text-lg font-semibold tracking-tight">我的排期</h1>
         {/* 空间切换：单选、project search 全量（用户拍板「不要展示全部」混排） */}

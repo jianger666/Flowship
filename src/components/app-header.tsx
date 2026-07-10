@@ -141,9 +141,11 @@ export const AppHeader = ({
     >
       {/* 左：侧栏 toggle 常驻顶栏（红绿灯右侧、位置固定不随开合跳——展开 / 收起都点这一个）。
           mac 用更大左 padding 让开交通灯、再多留一段间距（用户要「离红绿灯远一点」）。 */}
+      {/* v1.0：顶栏去品牌（桌面 app 有 dock 图标 + 窗口标题、顶栏 logo 冗余且突兀——
+          用户点名）；回首页 = 点胶囊「工作台」、语义更明确 */}
       <div
         className={cn(
-          "flex items-center gap-2 pl-3 *:[-webkit-app-region:no-drag]",
+          "flex items-center pl-3 *:[-webkit-app-region:no-drag]",
           isMac && "pl-22",
         )}
       >
@@ -156,16 +158,6 @@ export const AppHeader = ({
         >
           <PanelLeft />
         </Button>
-        {/* v1.0：品牌挪左（居中位让给模式胶囊）、点击回当前模式首页 */}
-        <Link
-          href="/"
-          className="flex items-center gap-2 font-semibold tracking-tight text-foreground no-underline hover:opacity-80"
-        >
-          {/* logo 图本身就是「扣了黑边」的透明角 squircle、不再加方框 ring / CSS 圆角 */}
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt="" className="size-7" />
-          <span className="hidden sm:inline">AI工作流</span>
-        </Link>
       </div>
 
       {/* 居中：工作台 / 对话 胶囊切换（v1.0 双模式核心） */}
