@@ -24,8 +24,29 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { FileText, Info, Layers } from "lucide-react";
-import ReactMarkdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
+import {
+  Streamdown,
+  type Components,
+  type ThemeInput,
+} from "streamdown";
+import { code as streamdownCode } from "@streamdown/code";
+import { mermaid as streamdownMermaid } from "@streamdown/mermaid";
+import { math as streamdownMath } from "@streamdown/math";
+import { cjk as streamdownCjk } from "@streamdown/cjk";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
+
+// Streamdown 插件 / 主题（模块级一份、Shiki 高亮器有初始化开销）
+const ARTIFACT_STREAMDOWN_PLUGINS = {
+  code: streamdownCode,
+  mermaid: streamdownMermaid,
+  math: streamdownMath,
+  cjk: streamdownCjk,
+};
+const ARTIFACT_SHIKI_THEME: [ThemeInput, ThemeInput] = [
+  "github-light",
+  "github-dark",
+];
 
 import { MarkdownLink } from "@/components/markdown-link";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
@@ -124,19 +145,30 @@ const writeSeenTs = (taskId: string, actionId: string, ts: number) => {
   }
 };
 
+// 返回体断言成 Streamdown Components——我们的 a/img/code 用宽松 props（string|Blob 等）、
+// 跟 Streamdown 严格签名对不上、运行时形状兼容
 const buildMarkdownComponents = (
   baseDir: string | undefined,
   repoShortNames: string[] | undefined,
   ide: JumpIde,
   onArtifactRefClick: ((ref: ActionArtifactRef) => void) | undefined,
-): Components => ({
+): Components => (({
   // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
   // （inline code 路径的 cursor:// 跳转在下面 code 组件、不受影响）
   a: MarkdownLink,
   // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
   img: MarkdownImage,
-  // 只覆盖 inline code、fenced code block 走默认渲染
-  code: ({ className, children, ...rest }) => {
+  // 只覆盖 inline code、fenced code block 走默认渲染（Streamdown code 插件接管）。
+  // 显式标 props 类型——外层对象整体断言成 Components 后会丢失参数推断
+  code: ({
+    className,
+    children,
+    ...rest
+  }: {
+    className?: string;
+    children?: React.ReactNode;
+    [key: string]: unknown;
+  }) => {
     if (className) {
       return (
         <code className={className} {...rest}>
@@ -237,7 +269,7 @@ const buildMarkdownComponents = (
     }
     return <code {...rest}>{children}</code>;
   },
-});
+}) as unknown as Components);
 
 interface Props {
   action: ActionRecord;
@@ -616,17 +648,22 @@ export const ArtifactPanel = ({
             {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
                 让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
                 （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
-            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-pre:bg-muted prose-pre:text-foreground prose-code:before:content-none prose-code:after:content-none">
-              <ReactMarkdown
+            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
+              {/* v1.0 迁 Streamdown：artifact 是完整产出、static 模式；Shiki 代码高亮 +
+                  Mermaid + KaTeX；保留自定义 code 组件（inline 代码里的文件路径 / artifact
+                  引用点击跳转）——fenced 代码块交给 Shiki 插件、inline 走 components.code */}
+              <Streamdown
+                mode="static"
+                shikiTheme={ARTIFACT_SHIKI_THEME}
+                plugins={ARTIFACT_STREAMDOWN_PLUGINS}
                 remarkPlugins={[
-                  remarkGfm,
                   remarkKeepTrailingUnderscore,
                   remarkTrimAutolinkCjk,
                 ]}
                 components={markdownComponents}
               >
                 {currentArtifact.content}
-              </ReactMarkdown>
+              </Streamdown>
             </div>
             {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
                 追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}

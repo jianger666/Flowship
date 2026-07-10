@@ -10,6 +10,14 @@
 @import "tw-animate-css";
 @plugin "@tailwindcss/typography";
 
+/* Streamdown（v1.0 md 渲染升级）：让 Tailwind 扫到 streamdown + 各插件的工具类
+ * （globals.css 在 src/app/ 下、到仓库根 node_modules 是 ../../node_modules） */
+@source "../../node_modules/streamdown/dist/*.js";
+@source "../../node_modules/@streamdown/code/dist/*.js";
+@source "../../node_modules/@streamdown/mermaid/dist/*.js";
+@source "../../node_modules/@streamdown/math/dist/*.js";
+@source "../../node_modules/@streamdown/cjk/dist/*.js";
+
 /* Tailwind 4 默认 dark variant 跟随系统 media。本项目由 next-themes 在 <html>
  * 挂 .light/.dark class 控制、所以显式改成 class-based dark variant。 */
 @custom-variant dark (&:is(.dark *));

@@ -23,22 +23,16 @@ import {
   Plug,
   Sparkles,
 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-
 import { cn } from "@/lib/utils";
-import { MarkdownLink } from "@/components/markdown-link";
+import { MarkdownText } from "@/components/markdown-text";
 import {
   ImageThumb,
-  MarkdownImage,
   type PreviewImage,
 } from "@/components/ui/image-preview";
 import { isAskSuperseded } from "@/lib/ask-pending";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { pathBasename } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
-import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
-import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
 import {
   JUMP_IDE_LABEL,
@@ -58,54 +52,9 @@ import {
   type ToolCallBatchItem,
 } from "./utils";
 
-/**
- * Markdown 渲染组件：用于 assistant_message / user_reply / 流式 placeholder
- *
- * 为什么用 markdown：AI 输出常含粗体 / 列表 / inline code / 标题 / 表格、
- *   纯文本渲染会出现 `**xxx**` 字面量、易读性差（用户实测反馈）。
- *
- * 实现要点：
- *   - prose 类来自 @tailwindcss/typography、dark:prose-invert 让暗色背景下也能读
- *   - max-w-none：取消 prose 自带的 65ch 宽度限制（聊天窗口已经够窄了）
- *   - prose-sm：缩到聊天卡片的字号档（默认 prose 偏大）
- *   - prose-p:my-1 等：把 prose 默认的大段 margin 拉小、贴近聊天气泡密度
- *   - remark-gfm：支持表格 / 删除线 / 任务清单等扩展语法
- *   - 流式拼接的 markdown 可能不完整（比如开头有 ** 但还没闭合）、react-markdown 容错够好、不会炸
- *
- * export 给 ask-user-dialog 复用（V0.6.29）：agent 问的问题常带 inline code / 列表、弹窗里也要渲染
- */
-export const MarkdownText = ({ text }: { text: string }) => (
-  <div
-    className={cn(
-      "prose prose-sm dark:prose-invert max-w-none wrap-break-word",
-      // 聊天密度：默认 prose 段间距太松、缩紧
-      "prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0",
-      // 标题：常见 AI 用 ## / ### 起标题、prose 默认 mt 太大、缩
-      "prose-headings:mt-2 prose-headings:mb-1",
-      // inline code：默认会加引号 + 灰底、去掉引号、保留底色
-      "prose-code:before:content-none prose-code:after:content-none",
-      // pre 代码块：暗色调对齐 muted 背景、文字色继承 foreground
-      "prose-pre:bg-muted prose-pre:text-foreground prose-pre:my-2",
-    )}
-  >
-    <ReactMarkdown
-      // keepTrailingUnderscore：裸链接尾部 _ 被 GFM 剥掉的修正（V0.7.13、用户实测 404）
-      remarkPlugins={[
-        remarkGfm,
-        remarkKeepTrailingUnderscore,
-        remarkTrimAutolinkCjk,
-      ]}
-      components={{
-        // 链接统一新窗口 / 系统浏览器打开、相对路径降级纯文本（V0.7.7）
-        a: MarkdownLink,
-        // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
-        img: MarkdownImage,
-      }}
-    >
-      {text}
-    </ReactMarkdown>
-  </div>
-);
+// Markdown 渲染统一走 @/components/markdown-text（v1.0 迁 Streamdown）——
+// 这里 re-export 保持既有 import 路径不变（ask-user-inline / workitem-detail 等仍从本文件拿）
+export { MarkdownText } from "@/components/markdown-text";
 
 /**
  * 流式 placeholder 卡片：复用 assistant_message 的视觉样式
@@ -122,12 +71,11 @@ const StreamingAssistantRowImpl = ({
   text: string;
   variant?: "log" | "chat";
 }) => {
-  // chat 形态：跟正式 AI 回复同样平铺、只多一个末尾闪烁光标（Cursor 风格、流式无容器）
+  // chat 形态：跟正式 AI 回复同样平铺（Streamdown streaming 模式自带流式动画、无容器）
   if (variant === "chat") {
     return (
       <div className="text-sm leading-relaxed">
-        <MarkdownText text={text} />
-        <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-foreground/60 align-middle" />
+        <MarkdownText text={text} streaming />
       </div>
     );
   }
@@ -143,10 +91,8 @@ const StreamingAssistantRowImpl = ({
           </span>
         </div>
         <div className="mt-1 leading-relaxed wrap-break-word text-foreground">
-          {/* 流式过程中也按 markdown 渲染、用户看到的就是最终样式、不会出现 **xx** 字面量 */}
-          <MarkdownText text={text} />
-          {/* 末尾闪烁光标、强提示「正在打字」 */}
-          <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-emerald-500/70 align-middle" />
+          {/* 流式过程按 markdown 渲染、Streamdown 未闭合块平滑处理 */}
+          <MarkdownText text={text} streaming />
         </div>
       </div>
     </div>
