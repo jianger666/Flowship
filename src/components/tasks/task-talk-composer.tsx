@@ -1,18 +1,13 @@
 "use client";
 
 /**
- * 任务页统一「跟 AI 说」输入条（V0.11.9、事件流底部常驻）
+ * 任务页统一「跟 AI 说」输入条（V0.13.x 单一语义、事件流底部常驻）
  *
- * 用户拍板的入口合一（原「再聊聊」弹窗 + 「问一问」输入条 + 「重启当前阶段」三合一）：
- * 一个输入条、系统按任务状态自动懂语境：
- * - 当前产出在等审阅（awaiting_ack）→ 按「再聊聊」送（[ACTION_ACK revise]、
- *   agent 自己二分类：纯疑问就答疑、改动意见就改完重新交卷）
- * - 其他时刻、会话在 → 插话（[USER_QUESTION]、疑问就答 / 要改就改、只是不推进任务链——V0.13.x 放开只读限制）
- * - 会话接不回 + 当前 action 停在半路（error / cancelled）→ **唤醒模式**（服务端
- *   起新 agent 原地续同一个 action、用户消息当最新指示、不多一条 action 链——旧「重启当前阶段」的替身）
- * - 会话接不回 + action 已完结 → 一次性临时 agent（疑问就答 / 小改直接改、大改引导走推进）
+ * 客户端只有一条通道（submitTaskQuestion）、所有消息都是 [USER_MESSAGE]、
+ * AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」
+ * 上下文；会话断时服务端按 action 状态走唤醒 / 一次性临时 agent、客户端无感。
  *
- * 支持贴图（粘贴 / 附图按钮）；Cmd/Ctrl+J 聚焦（沿用原再聊聊快捷键）。
+ * 支持贴图（粘贴 / 附图按钮）、`/` 唤起 skill（v1.0）；Cmd/Ctrl+J 聚焦。
  * agent 正在跑时禁用；任务终态整条隐藏。
  */
 
@@ -21,6 +16,11 @@ import { ImagePlus, Loader2, Send } from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
+import {
+  SlashSkillChips,
+  SlashSkillMenu,
+  useSlashSkills,
+} from "@/components/slash-skills";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { ModelSelect } from "@/components/ui/model-select";
@@ -74,6 +74,9 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   // agent 在跑时不可说；任务终态整条隐藏
   const busy = submitting || task.runStatus === "running";
 
+  // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
+  const slash = useSlashSkills({ applyDraft: setDraft });
+
   // 有未答提问（且当前阶段没停摆）→ 输入条切「答题引导态」：禁输入、placeholder 指路。
   // 原来能输入、回车才 toast 报 409——用户验收点名「卡点要提前可视化」。
   // 阶段停摆（error/cancelled）时提问已没人接、照常放行（唤醒通道）。
@@ -91,15 +94,17 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     try {
       const images = attach.toUploadPayload();
       // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
-      // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文
+      // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文。
+      // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
       const updated = await submitTaskQuestion(
         task.id,
-        text,
+        slash.buildSkillPrefix() + text,
         images,
         pickedModel.id ? pickedModel : undefined,
       );
       onTaskUpdate(updated);
       setDraft("");
+      slash.reset();
       attach.reset();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
@@ -117,7 +122,10 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     // 输入岛（对齐 chat 输入条形态、V0.12.x 用户点名重整）：圆角边框、focus 高亮、
     // textarea 在上、模型 + 附图 / 发送收进同一条 footer（不再单独一排）
     <div className="border-t px-3 py-2">
-      <div className="flex flex-col rounded-lg border bg-background/40 transition-colors focus-within:border-ring/60">
+      <div className="relative flex flex-col rounded-lg border bg-background/40 transition-colors focus-within:border-ring/60">
+        {/* `/` skill 菜单（浮输入条上方）+ 已选 chips（v1.0） */}
+        <SlashSkillMenu slash={slash} />
+        <SlashSkillChips slash={slash} />
         {/* 顶边拖柄：贴底输入条的直觉方向——往上拉变高。pointer capture 保证拖出手柄仍跟手 */}
         <div
           className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
@@ -172,16 +180,26 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         <Textarea
           ref={textareaRef}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            slash.onDraftChange(
+              e.target.value,
+              e.target.selectionStart ?? e.target.value.length,
+            );
+          }}
           onPaste={attach.onPaste}
           onKeyDown={(e) => {
+            // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
+            if (slash.onKeyDown(e)) return;
             if (shouldSubmitOnKeyDown(e, submitShortcut)) {
               e.preventDefault();
               void handleSubmit();
             }
           }}
           placeholder={
-            awaitingAnswer ? "先回答上方 AI 的提问" : "想改、想问、贴图都行（⌘/Ctrl+J）"
+            awaitingAnswer
+              ? "先回答上方 AI 的提问"
+              : "想改、想问、贴图、/ 唤起 skill（⌘/Ctrl+J）"
           }
           rows={2}
           disabled={busy || awaitingAnswer}

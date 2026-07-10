@@ -92,7 +92,7 @@ export const SkillsCard = () => {
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
   // Cursor 全局可导入清单
   const [cursorGlobal, setCursorGlobal] = useState<CursorGlobalSkill[]>([]);
-  // 自管 skills 目录绝对路径（「AI 帮建」开对话当 cwd 用、server 返回）
+  // 自管 skills 目录绝对路径（「对话创建」开对话当 cwd 用、server 返回）
   const [appSkillsDir, setAppSkillsDir] = useState("");
   // 编辑 dialog：null 关；name 空串 = 新增
   const [editing, setEditing] = useState<{
@@ -101,7 +101,7 @@ export const SkillsCard = () => {
   } | null>(null);
   // 导入 dialog 开关
   const [importOpen, setImportOpen] = useState(false);
-  // 「AI 帮建」dialog 开关
+  // 「对话创建」dialog 开关
   const [aiCreateOpen, setAiCreateOpen] = useState(false);
   // 请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
@@ -125,8 +125,9 @@ export const SkillsCard = () => {
     }
   }, []);
 
-  // 「AI 帮建」：开一个工作目录锁在 data/skills 的对话、把需求拼成规范 prompt 直接发、
-  // 跳对话页看 AI 现场建（对齐 Claude Code skill-creator 的对话式建法）
+  // 「对话创建」：开一个工作目录锁在 data/skills 的对话、跳对话页看 AI 现场建
+  //（对齐 Claude Code skill-creator 的对话式建法）。规范单一源 = 内置 skill-creator
+  // skill（prompt 只点名引用、不复述细节——复述会跟 skill 内容漂移）
   const handleAiCreate = async (requirement: string) => {
     const s = getSettings();
     if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
@@ -151,9 +152,8 @@ export const SkillsCard = () => {
       });
       const prompt =
         `我想创建一个 skill：${requirement.trim()}\n\n` +
-        "请按 skill-creator 规范在当前工作目录（本平台的 skill 目录）创建：" +
-        "kebab-case 目录名、SKILL.md 的 frontmatter 必须含 name 和 description" +
-        "（description 要写清何时触发、触发词罗列全）、需要辅助脚本放同目录并在文中引用。" +
+        "请先 read 你 skills 清单里的 `skill-creator`（平台内置的建 skill 规范）、" +
+        "严格按它在当前工作目录（本平台 skill 目录）创建。" +
         "信息不够先问我、别瞎猜；建完列出文件结构和触发方式。";
       await sendChatReply(task.id, prompt, undefined, undefined, {
         apiKey: s.apiKey,
@@ -268,7 +268,7 @@ export const SkillsCard = () => {
             onClick={() => setAiCreateOpen(true)}
           >
             <Sparkles />
-            AI 帮建
+            对话创建
           </Button>
           <Button
             type="button"
@@ -367,7 +367,7 @@ export const SkillsCard = () => {
   );
 };
 
-// ----------------- AI 帮建 dialog -----------------
+// ----------------- 对话创建 skill dialog -----------------
 
 const AiCreateDialog = ({
   open,
@@ -391,9 +391,9 @@ const AiCreateDialog = ({
     <Dialog open={open} onOpenChange={(o) => !o && onClose()} disablePointerDismissal>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>AI 帮建 skill</DialogTitle>
+          <DialogTitle>对话创建 skill</DialogTitle>
           <p className="text-xs text-muted-foreground">
-            会开一个对话让 AI 现场建（可追问迭代）、建完回这里刷新可见
+            开一个对话、AI 按内置规范现场创建（可追问迭代）、建完回这里刷新可见
           </p>
         </DialogHeader>
         <Textarea
@@ -410,7 +410,7 @@ const AiCreateDialog = ({
             onClick={() => onSubmit(requirement)}
             disabled={busy || !requirement.trim()}
           >
-            {busy ? "发起中…" : "开聊"}
+            {busy ? "发起中…" : "开始创建"}
           </Button>
         </DialogFooter>
       </DialogContent>

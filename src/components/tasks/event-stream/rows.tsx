@@ -19,6 +19,7 @@ import {
   File as FileIcon,
   Folder,
   Loader2,
+  PencilLine,
   Plug,
   Sparkles,
 } from "lucide-react";
@@ -282,6 +283,7 @@ const EventRowImpl = ({
   taskId,
   task,
   variant = "log",
+  onEditResend,
 }: {
   ev: TaskEvent;
   taskId: string;
@@ -289,6 +291,9 @@ const EventRowImpl = ({
   // log：task 模式事件流（卡片 + header + 折叠、信息密度优先）
   // chat：自由模式对话（V0.7.11、Cursor agent window 风格——AI 平铺 / 用户浅色块 / 过程细行）
   variant?: "log" | "chat";
+  // v1.0：chat 用户消息「编辑重发」（手动停止 / 断网后想改内容重发）——
+  // 点击把原文填回输入框、hover 才显按钮；不传不显示
+  onEditResend?: (text: string) => void;
 }) => {
   // V0.6：用 actionId 查 action 类型、渲染 tag
   const action = ev.actionId
@@ -388,10 +393,22 @@ const EventRowImpl = ({
         </div>
       );
     }
-    // 用户消息：浅色圆角块 + 附件
+    // 用户消息：浅色圆角块 + 附件（hover 右上角出「编辑重发」、v1.0）
     if (isUser) {
       return (
-        <div className="rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
+        <div className="group relative rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
+          {onEditResend && (
+            <button
+              type="button"
+              onClick={() => onEditResend(ev.text)}
+              title="编辑后重发（原消息保留）"
+              aria-label="编辑后重发"
+              className="absolute -top-2.5 right-2 flex cursor-pointer items-center gap-1 rounded-md border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground group-hover:opacity-100"
+            >
+              <PencilLine className="size-3" />
+              编辑重发
+            </button>
+          )}
           <div className="text-sm leading-relaxed">
             <MarkdownText text={ev.text} />
           </div>

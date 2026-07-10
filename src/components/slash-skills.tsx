@@ -1,0 +1,279 @@
+"use client";
+
+/**
+ * 输入框 `/` 唤起 skill（v1.0、用户点名「所有聊天框都可以用 / 唤起并高亮 skill」）
+ *
+ * 交互（对齐 Cursor / Claude Code 的 slash 菜单）：
+ * - 光标前正在打 `/xxx`（行首或空格后）→ 输入框上方弹 skill 菜单、继续打字过滤
+ * - ↑↓ 选、Enter/Tab 确认、Esc 关；点击也可选
+ * - 选中：把文本里的 `/xxx` 摘掉、变成输入框上方的 **skill chip**（高亮可删）——
+ *   不在 textarea 里做富文本高亮（overlay mirror 成本高、chip 更清晰）
+ * - 发送时调 buildSkillPrefix() 拼消息头：点名让 AI 先 read 对应 SKILL.md 再执行
+ *
+ * 用法（调用方三步）：
+ *   const slash = useSlashSkills();
+ *   <Textarea onChange={(e) => { setDraft(v); slash.onDraftChange(v, e.target.selectionStart); }}
+ *             onKeyDown={(e) => { if (slash.onKeyDown(e)) return; ...原有逻辑 }} />
+ *   容器里挂 <SlashSkillMenu slash={slash} onApply={(next) => setDraft(next)} />、
+ *   chips 挂 <SlashSkillChips slash={slash} />、发送时 text = slash.buildSkillPrefix() + text
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
+import { Sparkles, X } from "lucide-react";
+
+import { cn } from "@/lib/utils";
+
+export interface SlashSkill {
+  name: string;
+  description: string;
+  absPath: string;
+}
+
+// 模块级缓存：skills 列表全局一份、多个输入框 / 反复挂载不重复拉
+let skillsCache: SlashSkill[] | null = null;
+let skillsInflight: Promise<SlashSkill[]> | null = null;
+
+const fetchSkills = async (): Promise<SlashSkill[]> => {
+  if (skillsCache) return skillsCache;
+  skillsInflight ??= fetch("/api/skills", { cache: "no-store" })
+    .then((r) => r.json())
+    .then((d: { skills?: Array<{ name?: string; description?: string; absPath?: string }> }) => {
+      // 同名多来源（builtin/app/cursor…）按扫描顺序去重取首个——跟 loadSkills 注入优先级一致
+      const seen = new Set<string>();
+      const out: SlashSkill[] = [];
+      for (const s of d.skills ?? []) {
+        if (!s.name || !s.absPath || seen.has(s.name)) continue;
+        seen.add(s.name);
+        out.push({ name: s.name, description: s.description ?? "", absPath: s.absPath });
+      }
+      skillsCache = out;
+      return out;
+    })
+    .catch(() => {
+      skillsInflight = null; // 失败不缓存、下次重试
+      return [] as SlashSkill[];
+    });
+  return skillsInflight;
+};
+
+// 光标前文本匹配「正在打 slash 词」：行首或空白后的 /xxx（xxx 允许空 = 刚打出 /）
+const SLASH_RE = /(^|\s)\/([a-zA-Z0-9._-]*)$/;
+
+export interface SlashSkillsApi {
+  /** 菜单是否打开（有匹配的 slash 词 + 有候选） */
+  menuOpen: boolean;
+  /** 过滤后的候选（按 query 前缀 > 包含 排序） */
+  filtered: SlashSkill[];
+  /** 键盘高亮索引 */
+  activeIndex: number;
+  /** 已选 skill chips */
+  picked: SlashSkill[];
+  /** textarea onChange 时调（传最新草稿 + 光标位置） */
+  onDraftChange: (draft: string, cursor: number) => void;
+  /** textarea onKeyDown 最前面调；返回 true = 事件已被菜单消费、调用方直接 return */
+  onKeyDown: (e: KeyboardEvent) => boolean;
+  /** 点击菜单项选中 */
+  pickAt: (index: number) => void;
+  /** 移除一个 chip */
+  removeSkill: (name: string) => void;
+  /** 发送时拼消息头（没选 skill 返回空串）；调用方发送成功后调 reset() */
+  buildSkillPrefix: () => string;
+  reset: () => void;
+}
+
+export const useSlashSkills = (opts: {
+  /** 选中 skill 后把摘掉 /token 的新草稿写回调用方 state */
+  applyDraft: (next: string) => void;
+}): SlashSkillsApi => {
+  // 全量 skills（首次用到时拉、模块级缓存）
+  const [skills, setSkills] = useState<SlashSkill[]>([]);
+  // 当前 slash 查询词（null = 没在打 slash、菜单关）
+  const [query, setQuery] = useState<string | null>(null);
+  // 键盘高亮索引
+  const [activeIndex, setActiveIndex] = useState(0);
+  // 已选 chips
+  const [picked, setPicked] = useState<SlashSkill[]>([]);
+  // 最近一次 onDraftChange 的草稿 + 光标（选中时做文本替换用）
+  const stateRef = useRef({ draft: "", cursor: 0 });
+
+  useEffect(() => {
+    void fetchSkills().then(setSkills);
+  }, []);
+
+  const filtered = useMemo(() => {
+    if (query === null) return [];
+    const q = query.toLowerCase();
+    const pickedNames = new Set(picked.map((p) => p.name));
+    const pool = skills.filter((s) => !pickedNames.has(s.name));
+    if (!q) return pool.slice(0, 8);
+    const starts = pool.filter((s) => s.name.toLowerCase().startsWith(q));
+    const contains = pool.filter(
+      (s) => !s.name.toLowerCase().startsWith(q) && s.name.toLowerCase().includes(q),
+    );
+    return [...starts, ...contains].slice(0, 8);
+  }, [skills, query, picked]);
+
+  const menuOpen = query !== null && filtered.length > 0;
+
+  const onDraftChange = useCallback((draft: string, cursor: number) => {
+    stateRef.current = { draft, cursor };
+    const before = draft.slice(0, cursor);
+    const m = before.match(SLASH_RE);
+    setQuery(m ? m[2] : null);
+    setActiveIndex(0);
+  }, []);
+
+  const { applyDraft } = opts;
+  const pickAt = useCallback(
+    (index: number) => {
+      const skill = filtered[index];
+      if (!skill) return;
+      const { draft, cursor } = stateRef.current;
+      const before = draft.slice(0, cursor);
+      const m = before.match(SLASH_RE);
+      if (m) {
+        // 把光标前的 `/xxx` 摘掉（保留分隔空白）、skill 转为 chip
+        const cut = before.slice(0, before.length - (m[2].length + 1));
+        applyDraft(cut + draft.slice(cursor));
+      }
+      setPicked((prev) =>
+        prev.some((p) => p.name === skill.name) ? prev : [...prev, skill],
+      );
+      setQuery(null);
+    },
+    [filtered, applyDraft],
+  );
+
+  const onKeyDown = useCallback(
+    (e: KeyboardEvent): boolean => {
+      if (!menuOpen) return false;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveIndex((i) => (i + 1) % filtered.length);
+        return true;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
+        return true;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        pickAt(activeIndex);
+        return true;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setQuery(null);
+        return true;
+      }
+      return false;
+    },
+    [menuOpen, filtered.length, activeIndex, pickAt],
+  );
+
+  const removeSkill = useCallback((name: string) => {
+    setPicked((prev) => prev.filter((p) => p.name !== name));
+  }, []);
+
+  const buildSkillPrefix = useCallback(() => {
+    if (picked.length === 0) return "";
+    return [
+      "[使用 skill] 处理本条消息前、先逐个 read 以下 skill 并严格遵循：",
+      ...picked.map((p) => `- ${p.name}：${p.absPath}`),
+      "",
+      "",
+    ].join("\n");
+  }, [picked]);
+
+  const reset = useCallback(() => {
+    setPicked([]);
+    setQuery(null);
+  }, []);
+
+  return {
+    menuOpen,
+    filtered,
+    activeIndex,
+    picked,
+    onDraftChange,
+    onKeyDown,
+    pickAt,
+    removeSkill,
+    buildSkillPrefix,
+    reset,
+  };
+};
+
+/** slash 菜单（挂在输入框容器内、absolute 浮在上方）。容器需要 relative。 */
+export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
+  if (!slash.menuOpen) return null;
+  return (
+    <div className="absolute bottom-full left-2 z-30 mb-1 w-80 max-w-[calc(100%-1rem)] overflow-hidden rounded-lg border bg-popover shadow-md">
+      <div className="max-h-64 overflow-y-auto p-1">
+        {slash.filtered.map((s, i) => (
+          <button
+            key={s.name}
+            type="button"
+            // onMouseDown 防 textarea 失焦（blur 会先于 click 关菜单）
+            onMouseDown={(e) => {
+              e.preventDefault();
+              slash.pickAt(i);
+            }}
+            className={cn(
+              "flex w-full cursor-pointer flex-col items-start gap-0.5 rounded-md px-2.5 py-1.5 text-left transition-colors",
+              i === slash.activeIndex ? "bg-accent" : "hover:bg-accent/60",
+            )}
+          >
+            <span className="flex items-center gap-1.5 text-xs font-medium">
+              <Sparkles className="size-3 text-primary" />
+              {s.name}
+            </span>
+            {s.description && (
+              <span className="line-clamp-1 text-[11px] text-muted-foreground">
+                {s.description}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+      <div className="border-t bg-muted/40 px-2.5 py-1 text-[10px] text-muted-foreground">
+        ↑↓ 选择 · Enter 确认 · Esc 关闭
+      </div>
+    </div>
+  );
+};
+
+/** 已选 skill chips（输入框上方一行、高亮可删） */
+export const SlashSkillChips = ({ slash }: { slash: SlashSkillsApi }) => {
+  if (slash.picked.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+      {slash.picked.map((s) => (
+        <span
+          key={s.name}
+          className="flex items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"
+          title={s.description}
+        >
+          <Sparkles className="size-3" />
+          {s.name}
+          <button
+            type="button"
+            onClick={() => slash.removeSkill(s.name)}
+            aria-label={`移除 skill ${s.name}`}
+            className="cursor-pointer rounded-full p-0.5 hover:bg-primary/20"
+          >
+            <X className="size-2.5" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+};

@@ -17,7 +17,7 @@
  *   - event-stream/rows.tsx  MarkdownText / StreamingAssistantRow / EventRow / AskUserRequestRow
  */
 
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
   ArrowUp,
@@ -34,6 +34,11 @@ import {
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
+import {
+  SlashSkillChips,
+  SlashSkillMenu,
+  useSlashSkills,
+} from "@/components/slash-skills";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
@@ -182,6 +187,13 @@ const EventStreamImpl = ({
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // v1.0：chat 用户消息「编辑重发」——原文填回输入框（覆盖当前草稿）+ 聚焦；
+  // 原消息保留在事件流（历史不改写）、用户改完当新消息发。useCallback 保 EventRow memo 不破
+  const handleEditResend = useCallback((text: string) => {
+    setDraft(text);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
   // 渲染前两道合并 pass + 拼 streaming placeholder：
   // 1) thinking 合并：连续相邻 thinking 拼成一条、避免「思考被切碎」
   // 2) tool_call 合并：同 phase 连续 ≥2 条合一、降密度（review 阶段一连
@@ -317,19 +329,26 @@ const EventStreamImpl = ({
     setAttachedPaths((prev) => prev.filter((x) => x !== p));
   };
 
+  // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
+  const slash = useSlashSkills({ applyDraft: setDraft });
+
   const handleSend = () => {
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
     if (!text && attachedImages.length === 0 && attachedPaths.length === 0) return;
     const images: ImagePayload[] | undefined = imagesToUploadPayload();
     const attachments = attachedPaths.length > 0 ? attachedPaths : undefined;
-    onUserReply?.(text, images, attachments);
+    // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
+    onUserReply?.(slash.buildSkillPrefix() + text, images, attachments);
     setDraft("");
+    slash.reset();
     resetAttachedImages();
     setAttachedPaths([]);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
+    if (slash.onKeyDown(e)) return;
     if (shouldSubmitOnKeyDown(e, submitShortcut)) {
       e.preventDefault();
       handleSend();
@@ -438,7 +457,14 @@ const EventStreamImpl = ({
                   // V0.13.x 自动重连过程行（spinner、同 thinking 一档的细行）
                   <ReconnectingRow ev={item} events={task.events} />
                 ) : (
-                  <EventRow ev={item} taskId={task.id} task={task} variant={variant} />
+                  <EventRow
+                    ev={item}
+                    taskId={task.id}
+                    task={task}
+                    variant={variant}
+                    // chat 用户消息「编辑重发」：填回输入框（原消息保留）、聚焦
+                    onEditResend={isChat ? handleEditResend : undefined}
+                  />
                 )}
               </div>
             )}
@@ -452,7 +478,7 @@ const EventStreamImpl = ({
         <div className="shrink-0 px-6 pb-5 pt-1">
           <div
             className={cn(
-              "mx-auto w-full max-w-3xl rounded-xl border bg-card/70 shadow-sm transition-all",
+              "relative mx-auto w-full max-w-3xl rounded-xl border bg-card/70 shadow-sm transition-all",
               "focus-within:border-ring/60 focus-within:shadow-md",
               isDragging && "border-primary/50 bg-primary/5",
               !isAwaitingUser && "opacity-70",
@@ -461,6 +487,9 @@ const EventStreamImpl = ({
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
+            {/* `/` skill 菜单（浮岛上方）+ 已选 chips（v1.0） */}
+            <SlashSkillMenu slash={slash} />
+            <SlashSkillChips slash={slash} />
             {/* 选择器行（工作目录 / 分支）：岛最顶、本次对话配置归一条。
                 workdir 常驻 → 此行高度恒定、不随 branch 显隐而跳动 */}
             {composerTop && (
@@ -515,13 +544,16 @@ const EventStreamImpl = ({
             <Textarea
               ref={inputRef}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                slash.onDraftChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
+              }}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={2}
               placeholder={
                 isAwaitingUser
-                  ? `随便聊、贴图、拖文件（${submitShortcutHint}）`
+                  ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
                   : (disabledHint ?? "agent 当前没有等待你回复")
               }
               disabled={!isAwaitingUser}
