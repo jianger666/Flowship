@@ -94,7 +94,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   // 模型（默认 settings.defaultModel）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const [defaultModelId, setDefaultModelId] = useState("");
-  const { models: availableModels, loading: modelsLoading, fetchModels } = useModels();
+  const { models: availableModels, fetchModels } = useModels();
   const branchMap = useRepoBranches(repoPaths);
   const [submitting, setSubmitting] = useState(false);
 

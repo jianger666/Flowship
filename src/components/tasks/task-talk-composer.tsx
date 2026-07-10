@@ -16,7 +16,7 @@
  * agent 正在跑时禁用；任务终态整条隐藏。
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ImagePlus, Loader2, Send } from "lucide-react";
 import { toast } from "sonner";
 

@@ -247,7 +247,10 @@ export const FeishuBoard = () => {
         {spaces.length > 0 && (
           <Select value={effectiveSpace ?? undefined} onValueChange={(v) => v && handlePickSpace(v)}>
             <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
-              <SelectValue placeholder="选择空间" />
+              {/* SelectValue 默认渲染 value（projectKey 哈希）——显式渲染空间名（用户截图点名「这里是个 id」） */}
+              <SelectValue placeholder="选择空间">
+                {spaces.find((s) => s.key === effectiveSpace)?.name ?? "选择空间"}
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               {spaces.map((s) => (

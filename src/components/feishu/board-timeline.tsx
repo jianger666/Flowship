@@ -7,7 +7,7 @@
  *   节点状态 + AI 徽标、条短时文字向右溢出条外（飞书同款）
  * - **默认收起、可展开**（用户拍板）：点条左端箭头展开、下方插入每个节点的排期子行
  *  （节点名 + 小号排期条）、再点收起
- * - 日期头 + 今天竖线 + 周末底色；窗口跨度 2/4/8 周 + 前后翻页 + 回今天
+ * - 日期头 + 今天竖线 + 周末底色；时间范围 = 日期范围选择器（飞书同款、含快捷档）
  * - 未排期项不显示（用户拍板「只要一个甘特图」）
  */
 
@@ -16,7 +16,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { AiStatusBadge, type BoardItem } from "@/components/feishu/feishu-board";
 import { Button } from "@/components/ui/button";
-import { ChoiceButton } from "@/components/ui/choice-button";
+import { DateRangePicker, type DayRange } from "@/components/ui/date-range-picker";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -26,12 +26,6 @@ interface Props {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEKDAY = ["日", "一", "二", "三", "四", "五", "六"];
-const SPAN_OPTIONS = [
-  { days: 14, label: "2 周" },
-  { days: 28, label: "4 周" },
-  { days: 56, label: "8 周" },
-] as const;
-
 // 节点状态 → 中文（CLI basic.status 实测值）
 const NODE_STATUS_LABEL: Record<string, string> = {
   not_started: "未开始",
@@ -62,19 +56,18 @@ const toCols = (
 };
 
 export const BoardTimeline = ({ items, onOpen }: Props) => {
-  // 窗口跨度（天）
-  const [span, setSpan] = useState<number>(28);
-  // 窗口起点偏移（天）——翻页按钮改
-  const [offset, setOffset] = useState(0);
+  // 时间范围（用户拍板「像飞书那样的日期范围筛选」）：默认今天前 7 天 ~ 后 21 天
+  const [range, setRange] = useState<DayRange>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return { from: d.getTime() - 7 * DAY_MS, to: d.getTime() + 21 * DAY_MS };
+  });
   // 展开的需求 id 集合（展开 = 下方插节点排期子行）
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  // 窗口起点：默认「今天」落在窗口前 1/4 处（重点看未来）
-  const windowStart = useMemo(() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d.getTime() - Math.floor(span / 4) * DAY_MS + offset * DAY_MS;
-  }, [span, offset]);
+  const windowStart = range.from;
+  // 窗口天数（含首尾）
+  const span = Math.max(1, Math.round((range.to - range.from) / DAY_MS) + 1);
 
   const today0 = useMemo(() => {
     const d = new Date();
@@ -159,48 +152,37 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
 
   return (
     <div className="flex h-full flex-col gap-3">
-      {/* 工具条：窗口跨度 + 翻页 + 回今天 */}
+      {/* 工具条：日期范围筛选（飞书同款）+ 前后平移 */}
       <div className="flex shrink-0 items-center gap-1.5">
-        {SPAN_OPTIONS.map((o) => (
-          <ChoiceButton
-            key={o.days}
-            shape="chip"
-            selected={span === o.days}
-            onClick={() => setSpan(o.days)}
-            className="px-2.5 py-1 text-xs"
-          >
-            {o.label}
-          </ChoiceButton>
-        ))}
-        <div className="mx-1 h-4 w-px bg-border" />
+        <DateRangePicker value={range} onChange={setRange} />
         <Button
           size="icon-xs"
           variant="ghost"
-          onClick={() => setOffset((v) => v - Math.floor(span / 2))}
-          aria-label="往前翻"
-          title="往前翻"
+          onClick={() =>
+            setRange((r) => {
+              const shift = Math.floor(span / 2) * DAY_MS;
+              return { from: r.from - shift, to: r.to - shift };
+            })
+          }
+          aria-label="往前平移"
+          title="往前平移"
         >
           <ChevronLeft />
         </Button>
         <Button
           size="icon-xs"
           variant="ghost"
-          onClick={() => setOffset((v) => v + Math.floor(span / 2))}
-          aria-label="往后翻"
-          title="往后翻"
+          onClick={() =>
+            setRange((r) => {
+              const shift = Math.floor(span / 2) * DAY_MS;
+              return { from: r.from + shift, to: r.to + shift };
+            })
+          }
+          aria-label="往后平移"
+          title="往后平移"
         >
           <ChevronRight />
         </Button>
-        {offset !== 0 && (
-          <Button
-            size="xs"
-            variant="ghost"
-            className="text-xs text-primary"
-            onClick={() => setOffset(0)}
-          >
-            回今天
-          </Button>
-        )}
         <span className="ml-auto text-xs text-muted-foreground">
           {rows.filter((r) => r.kind === "item").length} 项排期中 · 点条展开节点
         </span>
@@ -256,7 +238,7 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
               className="py-10 text-center text-xs text-muted-foreground"
               style={{ gridColumn: `1 / ${span + 1}`, gridRow: 2 }}
             >
-              窗口内没有已排期的工作项——用上面箭头翻别的时间段
+              该空间在这个时间段没有排期——切换空间或调整时间范围
             </div>
           ) : (
             rows.map((row, idx) => {
