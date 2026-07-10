@@ -249,6 +249,21 @@ export const ImageThumb = ({
  * markdown 图按自然尺寸内联展示（不是固定缩略图）、但同样点击进 lightbox 看大图。
  * 所有 ReactMarkdown 实例都要配上、否则 markdown 里的图会退回不可预览的原生 <img>。
  */
+// 本地绝对路径（POSIX / Windows 盘符 / file://）→ 走 /api/local-image 通道加载。
+// AI 在工作目录生成的图（二维码 / 图表）markdown 里写的是本地路径、浏览器直接加载不了
+//（用户同事实测「AI 生成了二维码但没展示」的根因）
+const toLoadableImageSrc = (url: string): string => {
+  const stripped = url.startsWith("file://") ? url.slice("file://".length) : url;
+  const isLocalAbs = stripped.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(stripped);
+  // http(s) / data: / 相对路径（uploads 通道等）原样；本地绝对路径转通道。
+  // 注意 `/api/...` `/uploads/...` 这类站内路径也以 / 开头——真实文件系统里不存在
+  // 这些顶级目录、用「已知站内前缀」放行
+  if (/^(https?:|data:|blob:)/.test(url)) return url;
+  if (!isLocalAbs) return url;
+  if (/^\/(api|uploads|_next)\//.test(stripped)) return url;
+  return `/api/local-image?path=${encodeURIComponent(stripped)}`;
+};
+
 export const MarkdownImage = ({
   src,
   alt,
@@ -260,7 +275,7 @@ export const MarkdownImage = ({
 }) => {
   const { open } = useImagePreview();
   // src 可能是 string（url / dataUrl）；react-markdown 类型上带 Blob、运行时基本是 string
-  const url = typeof src === "string" ? src : "";
+  const url = typeof src === "string" ? toLoadableImageSrc(src) : "";
   if (!url) return null;
   return (
     // eslint-disable-next-line @next/next/no-img-element
