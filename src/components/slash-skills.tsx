@@ -66,6 +66,19 @@ const fetchSkills = async (): Promise<SlashSkill[]> => {
 // 光标前文本匹配「正在打 slash 词」：行首或空白后的 /xxx（xxx 允许空 = 刚打出 /）
 const SLASH_RE = /(^|\s)\/([a-zA-Z0-9._-]*)$/;
 
+// 跨页 handoff：别处（如设置页「对话创建 skill」）跳转进对话前写入、
+// 输入框 mount 时消费一次自动挂上对应 skill chip（用完即删、不残留）
+const PENDING_KEY = "fe-ai-flow:pending-slash-skill";
+
+/** 跳转到对话页前调：让目标页输入框自动带上指定 skill 的 chip */
+export const setPendingSlashSkill = (name: string) => {
+  try {
+    sessionStorage.setItem(PENDING_KEY, name);
+  } catch {
+    /* sessionStorage 不可用、降级为用户自己 / 唤起 */
+  }
+};
+
 export interface SlashSkillsApi {
   /** 菜单是否打开（有匹配的 slash 词 + 有候选） */
   menuOpen: boolean;
@@ -104,7 +117,24 @@ export const useSlashSkills = (opts: {
   const stateRef = useRef({ draft: "", cursor: 0 });
 
   useEffect(() => {
-    void fetchSkills().then(setSkills);
+    void fetchSkills().then((list) => {
+      setSkills(list);
+      // 消费跨页 handoff（setPendingSlashSkill 写入的）：自动挂 chip
+      try {
+        const pending = sessionStorage.getItem(PENDING_KEY);
+        if (pending) {
+          sessionStorage.removeItem(PENDING_KEY);
+          const s = list.find((x) => x.name === pending);
+          if (s) {
+            setPicked((prev) =>
+              prev.some((p) => p.name === s.name) ? prev : [...prev, s],
+            );
+          }
+        }
+      } catch {
+        /* 忽略 */
+      }
+    });
   }, []);
 
   const filtered = useMemo(() => {

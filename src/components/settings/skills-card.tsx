@@ -17,6 +17,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Loader2,
   Pencil,
   Plus,
   RefreshCw,
@@ -50,7 +51,8 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Textarea } from "@/components/ui/textarea";
 import { useDialog } from "@/hooks/use-dialog";
 import { getSettings } from "@/lib/local-store";
-import { createTask, sendChatReply } from "@/lib/task-store";
+import { setPendingSlashSkill } from "@/components/slash-skills";
+import { createTask } from "@/lib/task-store";
 
 // 跟 /api/skills 返回对齐的条目形态
 interface SkillRow {
@@ -101,8 +103,6 @@ export const SkillsCard = () => {
   } | null>(null);
   // 导入 dialog 开关
   const [importOpen, setImportOpen] = useState(false);
-  // 「对话创建」dialog 开关
-  const [aiCreateOpen, setAiCreateOpen] = useState(false);
   // 请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
 
@@ -125,10 +125,10 @@ export const SkillsCard = () => {
     }
   }, []);
 
-  // 「对话创建」：开一个工作目录锁在 data/skills 的对话、跳对话页看 AI 现场建
-  //（对齐 Claude Code skill-creator 的对话式建法）。规范单一源 = 内置 skill-creator
-  // skill（prompt 只点名引用、不复述细节——复述会跟 skill 内容漂移）
-  const handleAiCreate = async (requirement: string) => {
+  // 「对话创建」（v1.0 直跳版、用户拍板「不用弹窗输入那么麻烦」）：
+  // 点按钮直接开一个工作目录锁在 data/skills 的对话、输入框自动挂上
+  // skill-creator 的 / chip（setPendingSlashSkill handoff）、用户到对话里说需求即可
+  const handleAiCreate = async () => {
     const s = getSettings();
     if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
       toast.error("先在设置页配好 API Key 和默认模型");
@@ -142,7 +142,7 @@ export const SkillsCard = () => {
     try {
       const task = await createTask({
         mode: "chat",
-        title: "AI 建 skill",
+        title: "创建 skill",
         repoPaths: [appSkillsDir],
         model: s.defaultModel,
         disabledMcpServers:
@@ -150,16 +150,7 @@ export const SkillsCard = () => {
             ? s.disabledMcpServers
             : undefined,
       });
-      const prompt =
-        `我想创建一个 skill：${requirement.trim()}\n\n` +
-        "请先 read 你 skills 清单里的 `skill-creator`（平台内置的建 skill 规范）、" +
-        "严格按它在当前工作目录（本平台 skill 目录）创建。" +
-        "信息不够先问我、别瞎猜；建完列出文件结构和触发方式。";
-      await sendChatReply(task.id, prompt, undefined, undefined, {
-        apiKey: s.apiKey,
-        model: s.defaultModel,
-      });
-      setAiCreateOpen(false);
+      setPendingSlashSkill("skill-creator");
       router.push(`/tasks/${task.id}`);
     } catch (err) {
       toast.error(
@@ -265,9 +256,10 @@ export const SkillsCard = () => {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => setAiCreateOpen(true)}
+            onClick={() => void handleAiCreate()}
+            disabled={busy}
           >
-            <Sparkles />
+            {busy ? <Loader2 className="animate-spin" /> : <Sparkles />}
             对话创建
           </Button>
           <Button
@@ -356,65 +348,7 @@ export const SkillsCard = () => {
         onClose={() => setImportOpen(false)}
         onImport={(names) => void handleImport(names)}
       />
-
-      <AiCreateDialog
-        open={aiCreateOpen}
-        busy={busy}
-        onClose={() => setAiCreateOpen(false)}
-        onSubmit={(req) => void handleAiCreate(req)}
-      />
     </Card>
-  );
-};
-
-// ----------------- 对话创建 skill dialog -----------------
-
-const AiCreateDialog = ({
-  open,
-  busy,
-  onClose,
-  onSubmit,
-}: {
-  open: boolean;
-  busy: boolean;
-  onClose: () => void;
-  onSubmit: (requirement: string) => void;
-}) => {
-  // 需求描述草稿
-  const [requirement, setRequirement] = useState("");
-  useEffect(() => {
-    if (!open) setRequirement("");
-  }, [open]);
-
-  return (
-    // disablePointerDismissal：带草稿、点外误关丢内容（ui-conventions 约定）
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()} disablePointerDismissal>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>对话创建 skill</DialogTitle>
-          <p className="text-xs text-muted-foreground">
-            开一个对话、AI 按内置规范现场创建（可追问迭代）、建完回这里刷新可见
-          </p>
-        </DialogHeader>
-        <Textarea
-          value={requirement}
-          onChange={(e) => setRequirement(e.target.value)}
-          placeholder="描述你想要的 skill、如：生成周报、要能拉 git log 汇总本周提交"
-          rows={4}
-        />
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose} disabled={busy}>
-            取消
-          </Button>
-          <Button
-            onClick={() => onSubmit(requirement)}
-            disabled={busy || !requirement.trim()}
-          >
-            {busy ? "发起中…" : "开始创建"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 };
 
