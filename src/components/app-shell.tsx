@@ -1,13 +1,19 @@
 "use client";
 
 /**
- * 应用外壳（V0.8 侧栏导航）
+ * 应用外壳（V0.8 侧栏导航、v1.0 按页型自适应）
  *
- * 结构：顶栏（全宽、含 mac 交通灯拖拽区 + 居中品牌 + 侧栏 toggle）
+ * 结构：顶栏（全宽、含 mac 交通灯拖拽区 + 模式胶囊 + 侧栏 toggle）
  *      └ 下方横向：侧栏（可展开 / 收起）| 主内容区（滚动）
  *
+ * v1.0 侧栏自适应（用户拍板「看板=导航中心、侧栏=快切」）：
+ *  - 看板页（/）自动收侧栏——全屏甘特、看板本身就是导航、侧栏不抢戏
+ *  - 详情页（任务 / 对话 / 设置等）自动展侧栏——多任务快切是刚需
+ *  - **手动 toggle 最高优先级**：在某页型手动开 / 关后、留在同页型内不再被自动改；
+ *    切到另一页型时恢复该页型的自动默认（用 ref 记「上次自动应用的页型」判断切换沿）
+ *
  * 职责：
- *  - 持侧栏展开 / 收起态、localStorage 记忆、Cmd/Ctrl+B 快捷切换
+ *  - 持侧栏展开 / 收起态、Cmd/Ctrl+B 快捷切换
  *  - 主区滚动 → scrolled 状态传给顶栏（保留原「滚动才显分隔线」体验）
  *  - 路由切换时主区归顶 + 重置 scrolled
  */
@@ -18,36 +24,33 @@ import { usePathname } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { AppSidebar } from "@/components/app-sidebar";
 
-const STORAGE_KEY = "fe-ai-flow:sidebar-open";
+// 页型：board（看板首页、默认收）vs detail（其余、默认展）
+const routeType = (pathname: string): "board" | "detail" =>
+  pathname === "/" ? "board" : "detail";
 
 export const AppShell = ({ children }: { children: React.ReactNode }) => {
-  // 侧栏展开 / 收起（默认展开；mount 后读 localStorage 覆盖、避免 SSR hydration mismatch）
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const pathname = usePathname();
+  // 侧栏展开 / 收起：初值按当前页型的自动默认（board 收 / detail 展）
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => routeType(pathname) !== "board",
+  );
   // 主区是否已向下滚动——传给顶栏控制分隔线
   const [scrolled, setScrolled] = useState(false);
   // 主滚动容器 ref（onScroll 算 scrolled、路由切换归顶）
   const mainRef = useRef<HTMLElement>(null);
-  const pathname = usePathname();
+  // 上次「自动应用默认」的页型——只在页型切换沿重置侧栏、同页型内保留用户手动结果
+  const lastAutoTypeRef = useRef<"board" | "detail">(routeType(pathname));
 
+  // 页型切换沿：应用该页型的自动默认（board 收 / detail 展）；同页型内不动（保留手动 toggle）
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved !== null) setSidebarOpen(saved === "1");
-    } catch {
-      /* localStorage 不可用、用默认展开 */
-    }
-  }, []);
+    const type = routeType(pathname);
+    if (type === lastAutoTypeRef.current) return;
+    lastAutoTypeRef.current = type;
+    setSidebarOpen(type !== "board");
+  }, [pathname]);
 
   const toggleSidebar = useCallback(() => {
-    setSidebarOpen((v) => {
-      const next = !v;
-      try {
-        localStorage.setItem(STORAGE_KEY, next ? "1" : "0");
-      } catch {
-        /* 忽略写入失败 */
-      }
-      return next;
-    });
+    setSidebarOpen((v) => !v);
   }, []);
 
   // Cmd/Ctrl+B 切侧栏（对标 VSCode / Cursor）；焦点在输入框时让行、不抢打字

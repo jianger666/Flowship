@@ -24,8 +24,45 @@ import { ListTodo, Loader2, MessageCircle, Pin, Trash2 } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import { actionDisplayLabel } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 import type { TaskSummary } from "@/lib/types";
+
+// v1.0 监控栏（用户拍板「侧栏升级成监控面板」）：task 行第二行显示「阶段 · 状态」、
+// 让侧栏从「名字列表」变「多任务进度一览」。chat 行不显示（对话没有阶段概念）。
+// 状态文案比 RUN_STATUS_LABEL 更具体：区分「待确认（审阅）」和「待回答（提问）」。
+const taskStageLine = (
+  task: TaskSummary,
+): { stage: string; status: string; tone: "run" | "wait" | "error" | "idle" } | null => {
+  if (task.mode === "chat") return null;
+  const stage = task.lastActionType
+    ? actionDisplayLabel({ type: task.lastActionType }, "short")
+    : "未开始";
+  if (task.runStatus === "running") {
+    return { stage, status: "运行中", tone: "run" };
+  }
+  if (task.runStatus === "error") {
+    return { stage, status: "失败", tone: "error" };
+  }
+  if (task.runStatus === "awaiting_user") {
+    // awaiting_ack = 交卷等审阅；running（此刻不在跑但 action 挂 running）= agent 提问等答
+    const status =
+      task.lastActionStatus === "awaiting_ack"
+        ? "待确认"
+        : task.lastActionStatus === "running"
+          ? "待回答"
+          : "等待中";
+    return { stage, status, tone: "wait" };
+  }
+  return { stage, status: "空闲", tone: "idle" };
+};
+
+const TONE_CLASS: Record<"run" | "wait" | "error" | "idle", string> = {
+  run: "text-primary",
+  wait: "text-amber-600 dark:text-amber-500",
+  error: "text-destructive",
+  idle: "text-muted-foreground/70",
+};
 
 // 行首指示：runStatus 优先（运行 / 等你回复）、否则回退类型图标。
 // 所有形态统一 size-3.5 占位、保证各行标题左缘对齐。
@@ -83,6 +120,8 @@ export const TaskListItem = ({
   onPin,
 }: TaskListItemProps) => {
   const hasActions = !!(onPin || onDelete);
+  // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null、只显标题）
+  const stageLine = taskStageLine(task);
   return (
     <div className="group/item relative">
       {/* 当前任务：左侧 2px 强调竖条（对标 Cursor / Linear 的 active 指示） */}
@@ -93,7 +132,7 @@ export const TaskListItem = ({
         href={`/tasks/${task.id}`}
         onClick={onNavigate}
         className={cn(
-          "flex min-w-0 items-center gap-2 rounded-md py-1.5 pl-3 text-sm no-underline transition-colors",
+          "flex min-w-0 items-start gap-2 rounded-md py-1.5 pl-3 text-sm no-underline transition-colors",
           // 有操作按钮时给行尾留白、避免标题被盖
           hasActions ? "pr-14" : "pr-2",
           active
@@ -101,12 +140,24 @@ export const TaskListItem = ({
             : "text-foreground/75 hover:bg-muted/50 hover:text-foreground",
         )}
       >
-        {/* 行首指示：runStatus（运行中 / 等你回复）优先、否则类型图标——所有行左缘对齐 */}
-        <LeadingIndicator task={task} />
-        {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
-        <Tooltip content={task.title}>
-          <span className="min-w-0 flex-1 truncate">{task.title}</span>
-        </Tooltip>
+        {/* 行首指示：runStatus（运行中 / 等你回复）优先、否则类型图标——顶对齐两行 */}
+        <span className="mt-0.5">
+          <LeadingIndicator task={task} />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
+          <Tooltip content={task.title}>
+            <span className="min-w-0 truncate leading-tight">{task.title}</span>
+          </Tooltip>
+          {/* 监控行：阶段 · 状态（task 模式）——侧栏一眼看清每个任务卡在哪一步 */}
+          {stageLine && (
+            <span className="flex items-center gap-1 text-[11px] leading-none">
+              <span className="text-muted-foreground/70">{stageLine.stage}</span>
+              <span className="text-muted-foreground/40">·</span>
+              <span className={TONE_CLASS[stageLine.tone]}>{stageLine.status}</span>
+            </span>
+          )}
+        </span>
       </Link>
       {hasActions && (
         <div className="absolute inset-y-0 right-1 my-auto flex h-6 items-center gap-0.5">
