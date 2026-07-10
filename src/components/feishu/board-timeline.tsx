@@ -163,14 +163,27 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     });
   };
 
-  // 条色（需求主条）
+  // 条色（需求主条）：底色 + 同色系边框——纯透明底色在浅色模式下几乎隐形（用户点名对比度太低）
   const barTone = (it: BoardItem): { bar: string; accent: string } => {
     if (it.task?.repoStatus === "merged")
-      return { bar: "bg-emerald-500/12 hover:bg-emerald-500/20", accent: "bg-emerald-500" };
+      return {
+        bar: "border border-emerald-500/50 bg-emerald-500/18 hover:bg-emerald-500/28",
+        accent: "bg-emerald-500",
+      };
     if ((it.scheduleEnd ?? 0) < today0)
-      return { bar: "bg-red-500/10 hover:bg-red-500/18", accent: "bg-red-500" };
-    if (it.task) return { bar: "bg-primary/12 hover:bg-primary/20", accent: "bg-primary" };
-    return { bar: "bg-muted/70 hover:bg-muted", accent: "bg-muted-foreground/50" };
+      return {
+        bar: "border border-red-500/50 bg-red-500/15 hover:bg-red-500/25",
+        accent: "bg-red-500",
+      };
+    if (it.task)
+      return {
+        bar: "border border-primary/50 bg-primary/18 hover:bg-primary/28",
+        accent: "bg-primary",
+      };
+    return {
+      bar: "border border-muted-foreground/35 bg-muted-foreground/12 hover:bg-muted-foreground/20",
+      accent: "bg-muted-foreground/70",
+    };
   };
 
   return (
@@ -335,8 +348,10 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                 <div
                   key={`n-${row.parentId}-${row.name}-${idx}`}
                   className={cn(
-                    "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center rounded pr-2",
-                    row.isSub ? "bg-primary/8 pl-1.5" : "bg-muted/50 pl-1.5",
+                    "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center rounded pl-1.5 pr-2",
+                    row.isSub
+                      ? "border border-primary/35 bg-primary/14"
+                      : "border border-muted-foreground/25 bg-muted-foreground/10",
                     row.finished && "opacity-55",
                   )}
                   style={
