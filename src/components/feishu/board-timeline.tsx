@@ -101,6 +101,9 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
         parentId: string;
         name: string;
         status?: string;
+        /** 子任务行（缩进更深、名字是具体任务名——用户点名要的层级） */
+        isSub?: boolean;
+        finished?: boolean;
         cols: NonNullable<ReturnType<typeof toCols>> | null;
       };
 
@@ -117,11 +120,28 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
     for (const { it, cols } of scheduled) {
       out.push({ kind: "item", item: it, cols });
       if (expanded.has(it.id)) {
-        // 有排期的节点才出子行（没排期的节点画不上轴、跳过）
         for (const n of it.nodes ?? []) {
-          const nCols = toCols(n.start, n.end, windowStart, span);
-          if (n.start || n.end) {
-            out.push({ kind: "node", parentId: it.id, name: n.name, status: n.status, cols: nCols });
+          const subs = n.subTasks ?? [];
+          // 节点行：有排期或有子任务才出（都没有的节点画不上轴、纯噪音）
+          if (n.start || n.end || subs.length > 0) {
+            out.push({
+              kind: "node",
+              parentId: it.id,
+              name: n.name,
+              status: n.status,
+              cols: toCols(n.start, n.end, windowStart, span),
+            });
+          }
+          // 子任务行（具体任务名、飞书展开的最细粒度）
+          for (const s of subs) {
+            out.push({
+              kind: "node",
+              parentId: it.id,
+              name: s.name,
+              isSub: true,
+              finished: s.finished,
+              cols: toCols(s.start, s.end, windowStart, span),
+            });
           }
         }
       }
@@ -246,7 +266,9 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                 const { item: it, cols } = row;
                 const tone = barTone(it);
                 const isOpen = expanded.has(it.id);
-                const hasNodes = (it.nodes ?? []).some((n) => n.start || n.end);
+                const hasNodes = (it.nodes ?? []).some(
+                  (n) => n.start || n.end || (n.subTasks ?? []).length > 0,
+                );
                 return (
                   <div
                     key={`i-${it.id}`}
@@ -295,12 +317,16 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                   </div>
                 );
               }
-              // 节点子行：窗口内有排期画小条、窗口外的显示在最左（弱化）
+              // 展开子行：节点行（分组标题感）/ 子任务行（具体任务、用户要看的名字）
               const cols = row.cols;
               return (
                 <div
                   key={`n-${row.parentId}-${row.name}-${idx}`}
-                  className="z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center rounded bg-muted/50 pl-1.5 pr-2"
+                  className={cn(
+                    "z-10 my-px flex h-5 min-w-0 items-center gap-1 self-center rounded pr-2",
+                    row.isSub ? "bg-primary/8 pl-1.5" : "bg-muted/50 pl-1.5",
+                    row.finished && "opacity-55",
+                  )}
                   style={
                     cols
                       ? {
@@ -308,14 +334,20 @@ export const BoardTimeline = ({ items, onOpen }: Props) => {
                           gridRow: idx + 2,
                           overflow: "visible",
                         }
-                      : { gridColumn: "1 / 4", gridRow: idx + 2, opacity: 0.5 }
+                      : { gridColumn: "1 / 5", gridRow: idx + 2, opacity: 0.45 }
                   }
                 >
-                  <span className="whitespace-nowrap text-[10px] text-muted-foreground">
-                    {row.name}
-                    {row.status && NODE_STATUS_LABEL[row.status]
+                  <span
+                    className={cn(
+                      "whitespace-nowrap text-[10px]",
+                      row.isSub ? "text-foreground/80" : "text-muted-foreground",
+                    )}
+                  >
+                    {row.isSub ? row.name : `【${row.name}】`}
+                    {!row.isSub && row.status && NODE_STATUS_LABEL[row.status]
                       ? ` · ${NODE_STATUS_LABEL[row.status]}`
                       : ""}
+                    {row.isSub && row.finished ? " ✓" : ""}
                     {!cols && "（窗口外）"}
                   </span>
                 </div>

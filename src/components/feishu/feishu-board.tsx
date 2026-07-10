@@ -50,8 +50,14 @@ export interface BoardItem {
   scheduleStart?: number;
   scheduleEnd?: number;
   url?: string;
-  /** 节点排期（甘特展开细节、服务端 workflow get-node 聚合） */
-  nodes?: Array<{ name: string; status?: string; start?: number; end?: number }>;
+  /** 节点排期（甘特展开细节、服务端 workflow get-node 聚合、含子任务） */
+  nodes?: Array<{
+    name: string;
+    status?: string;
+    start?: number;
+    end?: number;
+    subTasks?: Array<{ name: string; start?: number; end?: number; finished?: boolean }>;
+  }>;
   task: BoardTaskBrief | null;
 }
 

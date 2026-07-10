@@ -291,6 +291,14 @@ export const fetchWorkitemDetail = async (
 
 // ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------
 
+/** 节点下的子任务（甘特展开的最细粒度、用户要看的「具体任务」） */
+export interface WorkitemSubTask {
+  name: string;
+  start?: number;
+  end?: number;
+  finished?: boolean;
+}
+
 /** 工作项的单个节点排期（甘特展开行用） */
 export interface WorkitemNode {
   name: string;
@@ -298,6 +306,8 @@ export interface WorkitemNode {
   status?: string;
   start?: number;
   end?: number;
+  /** 节点下子任务（--need-sub-task true、实测字段 sub_task_name + ISO 日期 + is_finished） */
+  subTasks: WorkitemSubTask[];
 }
 
 // 节点排期缓存：49 个工作项逐个调 CLI 太贵（每次 ~1s）、10 分钟内复用
@@ -327,6 +337,8 @@ export const fetchWorkitemNodes = async (
       workItemId,
       "--node-id-list",
       '["_all"]',
+      "--need-sub-task",
+      "true",
     ];
     if (projectKey) args.push("--project-key", projectKey);
     const resp = await runMeegle(args);
@@ -347,7 +359,21 @@ export const fetchWorkitemNodes = async (
         start = asDateMs(s.estimate_start_time);
         end = asDateMs(s.estimate_finish_time);
       }
-      nodes.push({ name, status: asStr(basic.status), start, end });
+      // 子任务（实测：sub_task_name + estimate_start/end_date 为 ISO 字符串 + is_finished）
+      const subTasks: WorkitemSubTask[] = [];
+      if (Array.isArray(m.sub_tasks)) {
+        for (const rawSub of m.sub_tasks as Array<Record<string, unknown>>) {
+          const subName = asStr(rawSub.sub_task_name ?? rawSub.name);
+          if (!subName) continue;
+          subTasks.push({
+            name: subName,
+            start: asDateMs(rawSub.estimate_start_date),
+            end: asDateMs(rawSub.estimate_end_date),
+            finished: rawSub.is_finished === true,
+          });
+        }
+      }
+      nodes.push({ name, status: asStr(basic.status), start, end, subTasks });
     }
     nodesCache.set(cacheKey, { at: Date.now(), nodes });
     return nodes;
