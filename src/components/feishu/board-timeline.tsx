@@ -263,7 +263,6 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                     style={{
                       gridColumn: `${cols.colStart + 1} / ${cols.colEnd + 2}`,
                       gridRow: idx + 2,
-                      overflow: "visible",
                     }}
                   >
                     {/* 展开箭头（有带排期的节点才显示） */}
@@ -286,12 +285,14 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                       onClick={() => onOpen(it)}
                       className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                     >
-                      <span className="min-w-0 truncate text-xs font-medium">{it.name}</span>
-                      {it.statusLabel && (
-                        <span className="shrink-0 text-[10px] text-muted-foreground">
-                          {it.statusLabel}
-                        </span>
-                      )}
+                      <span className="min-w-0 truncate text-xs">
+                        <span className="font-medium">{it.name}</span>
+                        {it.statusLabel && (
+                          <span className="ml-1.5 text-[10px] text-muted-foreground">
+                            {it.statusLabel}
+                          </span>
+                        )}
+                      </span>
                     </button>
                   </div>
                   </Tooltip>
