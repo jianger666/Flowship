@@ -143,13 +143,15 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
         ) : (
           <div className="space-y-2">
             {repos.map((r) => {
-              // v0.9.11：该仓分支候选——undefined=拉取中（先禁用）、isRepo=false=非 git（保持禁用）
+              // v0.9.11：该仓分支候选——undefined=拉取中（先禁用）、真非 git 仓禁用；
+              // gitMissing（git 命令不可用、判定不了）不禁用、放开手填（同事 Windows 踩过：
+              // git 只在 IDE 内置、全部输入被禁死没法配置）
               const entry = branchMap[r.path];
-              const branchDisabled = !entry?.isRepo;
+              const branchDisabled = !entry || (entry.isRepo === false && !entry.gitMissing);
               const branchPlaceholder =
                 entry?.isRepo === false
                   ? entry.gitMissing
-                    ? "未检测到 git 命令（装 Git 后重启 app）"
+                    ? "未检测到 git、可手填分支"
                     : "非 git 仓库"
                   : undefined;
               return (

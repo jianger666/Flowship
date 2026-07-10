@@ -311,11 +311,11 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                         }
                         options={entry?.branches ?? []}
                         loading={!entry}
-                        disabled={!entry?.isRepo}
+                        disabled={!entry || (entry.isRepo === false && !entry.gitMissing)}
                         placeholder={
                           entry?.isRepo === false
                             ? entry.gitMissing
-                              ? "未检测到 git 命令"
+                              ? "未检测到 git、可手填分支"
                               : "非 git 仓库"
                             : "留空自动建 feature/…"
                         }
