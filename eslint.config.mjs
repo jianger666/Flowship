@@ -20,9 +20,17 @@ const config = [
       "build/**",
       "dist/**",
       "data/**",
+      "next-env.d.ts", // Next 生成文件（triple-slash reference 是它的固定形态）
       "src/components/ui/**", // shadcn 生成的、不让规则去管
       "scripts/**",
     ],
+  },
+  {
+    // Electron preload 必须是 CJS（sandbox 下主进程按 CJS 加载）——require 是唯一写法
+    files: ["electron-app/**/*.cjs"],
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+    },
   },
 ];
 

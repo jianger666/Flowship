@@ -89,7 +89,7 @@ pnpm dev    # 浏览器开 http://localhost:8876
    - **API Key**：粘贴 Cursor API Key（[这里办一个](https://cursor.com/dashboard/integrations)、`crsr_` 开头）
    - **默认模型**：从 SDK 拉的可用模型列表选 + SDK 参数（thinking / context / effort 等）
    - **仓库**：点「选择文件夹」弹原生 dialog 选目录、可多仓
-   - **MCP servers**：**只读展示** `~/.cursor/mcp.json`（跟 Cursor 共用配置、fe 不自己维护）、可按任务关掉某些 MCP（黑名单）、失败的可点开看报错日志
+   - **MCP servers**：app **自管配置**（V0.13 起、存 `data/config.json`）、可增删改、支持从 `~/.cursor/mcp.json` 一键导入（导入后互不影响）；可按任务关掉某些 MCP（黑名单）、失败的可点开看报错日志
 2. **主页 `/`**：任务卡片看板、点「新建任务」开始；选 mode（task / chat）
 3. **task 详情页**：左 action 时间线 + 中 artifact 预览 + 右事件流；顶部「再聊聊 / 通过」按钮；「推进」按钮开 dialog 选下一个 action + 写指令（可勾「新启 Agent」/ 切模型）
 4. **chat 详情页**：底部输入框发消息自动启 agent；running 时可「停止」
@@ -104,20 +104,20 @@ ai-flow/
 ├── src/
 │   ├── app/
 │   │   ├── page.tsx                         # 主页：任务卡片看板（task / chat 共用）
-│   │   ├── settings/page.tsx                # 设置：API key / 默认模型 / 仓库 / MCP（只读 Cursor 全局）
+│   │   ├── settings/page.tsx                # 设置：API key / 默认模型 / 仓库 / MCP（app 自管 + Cursor 导入）
 │   │   ├── tasks/[id]/page.tsx              # 任务详情、按 task.mode 渲染（task 三栏 / chat 单栏）
 │   │   └── api/
+│   │       ├── settings/                    # GET（脱敏）/ PUT 配置；full/ 全量读取（仅 loopback）
 │   │       ├── tasks/route.ts               # GET 列表 / POST 新建
-│   │       ├── tasks/[id]/advance/          # POST：task 模式推进下一个 action
-│   │       ├── tasks/[id]/action-ack/       # POST：action ack（approve / revise）
-│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（兼自动启 agent）
 │   │       ├── tasks/[id]/advance/          # POST：推进 action（V0.11 起会话 send 续接 / 新建）
+│   │       ├── tasks/[id]/chat-reply/       # POST：chat 用户回复（兼自动启 agent）
+│   │       ├── tasks/[id]/ask-reply/        # POST：答 agent 的 ask_user 提问
 │   │       ├── tasks/[id]/stop/             # POST：停止当前 Run（task / chat 通用）
-│   │       └── cursor-mcp/                  # GET：原样读 ~/.cursor/mcp.json + health 探测
+│   │       └── cursor-mcp/                  # GET：读 ~/.cursor/mcp.json（仅作导入源）+ health 探测
 │   ├── components/
 │   │   ├── ui/                              # shadcn/ui base-nova + LoadingState / EmptyHint / ChoiceButton / MultiSelect
-│   │   ├── settings/                        # 设置 Card（含 mcp-card 只读展示 + 健康探测）
-│   │   └── tasks/                           # 任务卡片 / 新建对话框 / 事件流 / artifact 面板 / action 时间线 / chat 视图 / 推进 dialog / 再聊聊 dialog
+│   │   ├── settings/                        # 设置 Card（含 mcp-card 自管编辑 + 导入 + 健康探测）
+│   │   └── tasks/                           # 任务卡片 / 启动表单 / 事件流 / artifact 面板 / action 时间线 / chat 视图 / 推进 dialog / 编辑 dialog
 │   ├── hooks/                               # use-dialog / use-settings / use-task-watch（SSE）/ use-mcp-health / use-image-attach
 │   └── lib/
 │       ├── types.ts                         # V0.6 schema（Task / ActionRecord / RepoStatus / RunStatus / TaskRole）
@@ -134,9 +134,9 @@ ai-flow/
 │           ├── cursor-config.ts             # 读 ~/.cursor 全局 MCP / rules 注入
 │           └── task-fs.ts                   # data/tasks/ 持久化（meta + events + actions/）
 ├── prompts/
-│   ├── _super.md                           # super-prompt 主模板（注入 7 种 action prompt + action history）
+│   ├── _super.md                           # super-prompt 主模板（V0.6.27 起只注入当前 action playbook + action history）
 │   ├── _shared.md                          # 跨 action 通用 artifact 写法 + 规则
-│   └── action-{plan,build,review,ship,test,learn}.md   # 各 action 特有约束（test/learn 是 V0.6.2+ 草稿）
+│   └── action-{plan,build,review,ship,dev,learn}.md    # 各 action 特有约束（test 仍是蓝图、无 prompt 文件）
 ├── skills/                                  # 平台自带 skills（agent 按需 read）
 │   └── {artifact-writer,chat-attachments,chat-history-recovery,context-docs-handler}/SKILL.md
 ├── data/                                    # 任务持久化（git ignore）
@@ -161,13 +161,15 @@ ai-flow/
 
 | 类型 | 位置 | 说明 |
 |---|---|---|
-| Cursor API Key | localStorage | 不上传服务器、每用户自配 |
-| 默认模型 + 参数 | localStorage | `ModelSelection`、跟 SDK schema 一致 |
-| 仓库列表 | localStorage | 桌面端原生 picker（`pickNativePaths`）选目录、可多仓 |
-| MCP servers | `~/.cursor/mcp.json` | **跟 Cursor 共用、fe 只读不写**；runtime 自动追加内置 `aiFlowChat`（提供 `submit_work` / `ask_user`） |
+| Cursor API Key / GitLab PAT | `data/config.json`（V0.7.16 起、Electron 下在 userData） | **明文存本机文件**、不出本机；`/api/settings` GET 默认脱敏返回、全量读取仅 loopback 专用接口 |
+| 默认模型 + 参数 | `data/config.json` | `ModelSelection`、跟 SDK schema 一致 |
+| 仓库列表 | `data/config.json` | 桌面端原生 picker（`pickNativePaths`）选目录、可多仓 |
+| MCP servers | `data/config.json`（app 自管、V0.13 起） | `~/.cursor/mcp.json` 仅作**导入源**（设置页一键导入、之后互不影响）；runtime 自动追加内置 `aiFlowChat`（提供 `submit_work` / `ask_user`） |
 | 任务级 MCP 黑名单 | `data/tasks/<id>/meta.json` | 默认全开、按任务关掉某些 MCP |
 | Prompt 模板 | `prompts/action-*.md` + `_super.md` / `_shared.md` | 用户可直接改、`fs.readFile` 不缓存、保存后下次跑就生效 |
 | 任务数据 | `data/tasks/<id>/` | meta.json + events.jsonl + actions/ 目录 |
+
+> **网络边界**：服务只绑 `127.0.0.1`（源码脚本 `-H` / Electron 壳 `HOSTNAME`）、所有 `/api/**` 另做 Host/Origin loopback 校验（防 DNS rebinding）——API 无鉴权的前提是「只有本机能碰到」。
 
 ### 飞书 MCP（task 模式命脉、强校验）
 
@@ -181,12 +183,12 @@ task 模式按 url 域名强校验这两个、漏配不让建：
 ## 设计哲学
 
 - **HITL 是底线**——所有真生产产品都没敢全自动、action 边界强制人 ack
-- **单 SDK Run 跑完全程**——整 task 共享上下文、计费一次；ack 时可手动起新 Agent（reviewer ≠ author 这种场景）
+- **每 action 默认新 Agent + 会话跨 run 存活（V0.11）**——context 截断治跑偏、artifact 是唯一接力棒；勾「续用当前 Agent」时服务端 `agent.send()` 续接同一会话（review 强制换人复审）
 - **所有 LLM 调用打日志 + 产物落盘**——可观测、可回退、`data/tasks/` 全部可 diff
 - **能用确定性工具兜的、就不让 LLM 自己判断**——eslint / typecheck / git hash / JSON Schema 优先（客观可证伪 predicate、不走字符串黑名单）
 - **不是 multi-agent**——单 agent 跑全程（不是 Cognition 反对的「角色协作」、是 Anthropic 推荐的 prompt chaining）；单 task 多 action 链合法
 - **角色驱动而非端驱动**——`task.role` 字段、同一 story 多端建多 task、agent 按角色挑相关部分（详见 `docs/MULTI-ROLE.md`）
-- **跟 Cursor 共用配置**——MCP / rules / skills 统一消费 Cursor 全局（`~/.cursor/`）+ 项目（repo `.cursor/`）、fe 只读不写
+- **rules / skills 消费 Cursor 全局配置、MCP 自管**——`~/.cursor/rules` + repo `.cursor/` 只读注入；MCP V0.13 起 app 自管（Cursor mcp.json 仅作导入源）
 
 ---
 

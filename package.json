@@ -13,7 +13,7 @@
     "serve": "next build && node scripts/dev-open.mjs start",
     "build": "next build",
     "start:prod": "next start -p 8876 -H 127.0.0.1",
-    "lint": "next lint",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "electron:server": "node scripts/assemble-electron-server.mjs",
