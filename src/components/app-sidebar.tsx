@@ -89,7 +89,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     }
   };
 
-  // 删除：二次确认 → 乐观移除 → 删的是当前任务则回首页 → 失败 refresh 兜底找回
+  // 删除：二次确认 → 乐观移除 → 删的是当前任务则回本模式首页 → 失败 refresh 兜底找回
   const handleDelete = async (task: TaskSummary) => {
     const ok = await confirm({
       title: "确认删除任务",
@@ -102,7 +102,11 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     try {
       const okDel = await deleteTask(task.id);
       if (!okDel) throw new Error("任务不存在");
-      if (activeId === task.id) router.push("/");
+      // v1.0 双模式：按被删任务的模式回对应落点（对话删完回 /chats 跳下一条对话、
+      // 不能踢回工作台看板——审计 P1）
+      if (activeId === task.id) {
+        router.push(task.mode === "chat" ? "/chats" : "/");
+      }
     } catch (err) {
       toast.error(`删除失败：${(err as Error).message}`);
       void refresh();

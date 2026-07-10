@@ -12,7 +12,7 @@
  * 列表还没加载完时先用记忆模式兜底、加载后自动校正。
  */
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, usePathname } from "next/navigation";
 
 import { useTaskList } from "@/hooks/use-task-list";
@@ -21,19 +21,23 @@ export type AppMode = "work" | "chat";
 
 const MODE_STORAGE_KEY = "fe-ai-flow:app-mode";
 
-// 读记忆模式（中性页 / 任务列表未加载时的兜底）
-const readRememberedMode = (): AppMode => {
-  try {
-    return localStorage.getItem(MODE_STORAGE_KEY) === "chat" ? "chat" : "work";
-  } catch {
-    return "work";
-  }
-};
-
 export const useAppMode = (): AppMode => {
   const pathname = usePathname();
   const params = useParams<{ id?: string }>();
   const { tasks, loaded } = useTaskList();
+  // 记忆模式（中性页 / 任务列表未加载时的兜底）。仓库既定 hydration 模式：
+  // useState 默认值 + mount 后 effect 读 localStorage 覆盖——SSR 与 client 首帧
+  // 都渲 "work"、不在渲染期读 localStorage（防 hydration mismatch、审计 P2）
+  const [remembered, setRemembered] = useState<AppMode>("work");
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(MODE_STORAGE_KEY) === "chat") {
+        setRemembered("chat");
+      }
+    } catch {
+      /* localStorage 不可用、用默认 work */
+    }
+  }, []);
 
   const mode = useMemo<AppMode>(() => {
     if (!pathname) return "work";
@@ -43,13 +47,14 @@ export const useAppMode = (): AppMode => {
       const t = tasks.find((x) => x.id === params.id);
       if (t) return t.mode === "chat" ? "chat" : "work";
       // 列表没回来 / 任务不在列表（刚删）→ 记忆模式兜底
-      return typeof window !== "undefined" ? readRememberedMode() : "work";
+      return remembered;
     }
     // 中性页（设置 / 自定义 Action 等）：维持上次模式
-    return typeof window !== "undefined" ? readRememberedMode() : "work";
-  }, [pathname, params?.id, tasks]);
+    return remembered;
+  }, [pathname, params?.id, tasks, remembered]);
 
-  // 确定态（非兜底推导出的）落记忆——loaded 后 tasks 查得到、或非任务页的明确路由
+  // 确定态（非兜底推导出的）落记忆——loaded 后 tasks 查得到、或非任务页的明确路由。
+  // 同步 setRemembered：下一个中性页 / 兜底场景直接用最新值、不再等 localStorage 读
   useEffect(() => {
     const definite =
       pathname === "/" ||
@@ -57,6 +62,7 @@ export const useAppMode = (): AppMode => {
       pathname?.startsWith("/chats") ||
       (pathname?.startsWith("/tasks/") && loaded);
     if (!definite) return;
+    setRemembered(mode);
     try {
       localStorage.setItem(MODE_STORAGE_KEY, mode);
     } catch {
