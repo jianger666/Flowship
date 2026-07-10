@@ -13,12 +13,15 @@
 import { NextResponse } from "next/server";
 
 import { listRepoBranches } from "@/lib/server/git-branches";
+import { isWindowsAbsPath } from "@/lib/path-utils";
 
 export const runtime = "nodejs";
 
 export const GET = async (req: Request) => {
   const path = new URL(req.url).searchParams.get("path")?.trim() ?? "";
-  if (!path.startsWith("/")) {
+  // 绝对路径校验必须兼容 Windows 盘符（`D:\...`）——V0.14.x 踩过：只认 `/` 开头、
+  // Windows 仓库全部 400、前端把 400 归一成「非 git 仓库」、git 探测压根没执行
+  if (!path.startsWith("/") && !isWindowsAbsPath(path)) {
     return NextResponse.json(
       { error: "path 必须是绝对路径" },
       { status: 400 },

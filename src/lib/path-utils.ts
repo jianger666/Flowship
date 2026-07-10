@@ -26,7 +26,7 @@
 import { ACTION_TYPES, type ActionType, type JumpIde } from "./types";
 
 /** Windows 盘符绝对路径（`D:\...` / `D:/...`）。归一化前后都能判。 */
-const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
+export const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
 
 /** 把 Windows 反斜杠分隔符归一化成 `/`（POSIX 路径原样返回） */
 const normalizeSeparators = (p: string): string => p.replace(/\\/g, "/");
