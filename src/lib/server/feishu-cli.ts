@@ -385,9 +385,29 @@ export const startLogin = async (
         if (!trimmed) continue;
         state.tail.push(trimmed);
         if (state.tail.length > 50) state.tail.shift();
-        // 抓授权 URL（CLI 会打印、万一没自动开浏览器 UI 能给用户点）
+        // 抓授权 URL（CLI 会打印）。用户实测 CLI 不一定自动开浏览器（spawn 子进程环境）——
+        // 首次抓到时服务端主动开系统浏览器；UI 同时展示链接 + 二维码兜底
         const m = trimmed.match(/https:\/\/\S+/);
-        if (m) state.authUrl = m[0];
+        if (m) {
+          const first = !state.authUrl;
+          state.authUrl = m[0];
+          if (first) {
+            const opener =
+              process.platform === "darwin"
+                ? ["open", [m[0]]]
+                : process.platform === "win32"
+                  ? ["cmd", ["/c", "start", "", m[0]]]
+                  : ["xdg-open", [m[0]]];
+            try {
+              spawn(opener[0] as string, opener[1] as string[], {
+                detached: true,
+                stdio: "ignore",
+              }).unref();
+            } catch {
+              // 打不开就靠 UI 链接 / 二维码
+            }
+          }
+        }
       }
     };
     child.stdout?.on("data", onChunk);
