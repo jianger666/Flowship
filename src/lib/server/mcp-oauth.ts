@@ -38,9 +38,12 @@ import { dataRoot } from "./data-root";
 // OAuth 凭证落盘目录（每个 server 一个 json）
 const OAUTH_DIR = path.join(dataRoot(), "mcp-oauth");
 
-// fe 自身的 base url（dev/prod 都 8876、可被 env 覆盖）；OAuth 回调地址必须跟 DCR 注册时一致
+// fe 自身的 base url——**必须端口感知**（V0.13 验收踩过：硬编码 8876 时、test 实例
+// （8776）发起授权、回调被打到正式实例（8876）、state 对不上直接「校验失败」）。
+// 壳启动 server 时传了 PORT（正式 8876 / test 8776）、dev 兜底 8876；env 可整体覆盖。
 const getBaseUrl = (): string =>
-  process.env.FE_AI_FLOW_BASE_URL ?? "http://localhost:8876";
+  process.env.FE_AI_FLOW_BASE_URL ??
+  `http://localhost:${process.env.PORT ?? "8876"}`;
 const getRedirectUri = (): string => `${getBaseUrl()}/api/mcp-oauth/callback`;
 
 // access token 过期前多久就提前续期（避免临界过期、起 agent 时刚好失效）
