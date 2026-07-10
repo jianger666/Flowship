@@ -36,12 +36,19 @@ export interface SlashSkill {
   absPath: string;
 }
 
-// 模块级缓存：skills 列表全局一份、多个输入框 / 反复挂载不重复拉
+// 模块级缓存：skills 列表全局一份、多个输入框 / 反复挂载不重复拉。
+// TTL 60s（审计 P1：永不失效会让「对话创建」刚建好的 skill 唤不起）——过期后
+// 下一个输入框 mount 时重拉
+const SKILLS_CACHE_TTL_MS = 60_000;
 let skillsCache: SlashSkill[] | null = null;
+let skillsCachedAt = 0;
 let skillsInflight: Promise<SlashSkill[]> | null = null;
 
 const fetchSkills = async (): Promise<SlashSkill[]> => {
-  if (skillsCache) return skillsCache;
+  if (skillsCache && Date.now() - skillsCachedAt < SKILLS_CACHE_TTL_MS) {
+    return skillsCache;
+  }
+  skillsCache = null;
   skillsInflight ??= fetch("/api/skills", { cache: "no-store" })
     .then((r) => r.json())
     .then((d: { skills?: Array<{ name?: string; description?: string; absPath?: string }> }) => {
@@ -54,6 +61,8 @@ const fetchSkills = async (): Promise<SlashSkill[]> => {
         out.push({ name: s.name, description: s.description ?? "", absPath: s.absPath });
       }
       skillsCache = out;
+      skillsCachedAt = Date.now();
+      skillsInflight = null; // 下次过期后能重新发起
       return out;
     })
     .catch(() => {
@@ -184,6 +193,8 @@ export const useSlashSkills = (opts: {
   const onKeyDown = useCallback(
     (e: KeyboardEvent): boolean => {
       if (!menuOpen) return false;
+      // IME 组合输入中（中文选词的 Enter / ↑↓）不归菜单——否则输入法候选操作被吞（审计 P1）
+      if ((e.nativeEvent as globalThis.KeyboardEvent).isComposing) return false;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setActiveIndex((i) => (i + 1) % filtered.length);

@@ -187,12 +187,6 @@ const EventStreamImpl = ({
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // v1.0：chat 用户消息「编辑重发」——原文填回输入框（覆盖当前草稿）+ 聚焦；
-  // 原消息保留在事件流（历史不改写）、用户改完当新消息发。useCallback 保 EventRow memo 不破
-  const handleEditResend = useCallback((text: string) => {
-    setDraft(text);
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }, []);
 
   // 渲染前两道合并 pass + 拼 streaming placeholder：
   // 1) thinking 合并：连续相邻 thinking 拼成一条、避免「思考被切碎」
@@ -331,6 +325,18 @@ const EventStreamImpl = ({
 
   // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
   const slash = useSlashSkills({ applyDraft: setDraft });
+
+  // v1.0：chat 用户消息「编辑重发」——原文填回输入框（覆盖当前草稿）+ 聚焦；
+  // 原消息保留在事件流（历史不改写）、用户改完当新消息发。useCallback 保 EventRow memo 不破。
+  // 同步 slash 状态（onDraftChange）：防旧的 / 菜单 query 残留在新文本上（审计 P2）
+  const handleEditResend = useCallback(
+    (text: string) => {
+      setDraft(text);
+      slash.onDraftChange(text, text.length);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [slash],
+  );
 
   const handleSend = () => {
     const text = draft.trim();

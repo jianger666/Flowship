@@ -260,7 +260,14 @@ export const isPlaceholderChatTitle = (title: string): boolean =>
  * 全空白返回 null（调用方保留占位）。
  */
 export const deriveChatTitleFromMessage = (text: string): string | null => {
-  const cleaned = text
+  // 带 `/` skill 前缀的消息（slash-skills buildSkillPrefix 拼的「[使用 skill] …」头 +
+  // 空行 + 正文）：标题只取正文、别把指令头当标题（审计 P1：污染成「[使用 skill] 处理…」）
+  let body = text;
+  if (body.startsWith("[使用 skill]")) {
+    const sep = body.indexOf("\n\n");
+    if (sep >= 0) body = body.slice(sep + 2);
+  }
+  const cleaned = body
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/[#`*_>~]/g, "")
     .replace(/\s+/g, " ")
