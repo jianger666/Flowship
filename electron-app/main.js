@@ -23,7 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // 测试实例（v0.7.9 用户拍板）：本地验证打包 app 时用 `pnpm electron:dist:test`
-// 产出「AI工作流test」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
+// 产出「FlowshipTest」、自动走独立端口 + 独立数据目录、跟用户日常在用的正式实例
 // （8876 + fe-ai-flow）互不干扰、也不会被单实例锁互踢（锁按 userData 算）
 // ⚠️ 探测不能用 app.getName()：-c.productName 只改包名 / Info.plist、不改 asar 内
 // package.json、getName() 拿到的还是正式名（实测踩坑）——看可执行文件名最可靠
@@ -35,8 +35,8 @@ const PORT = Number(process.env.FE_AI_FLOW_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
 
-// userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名改成中文「AI工作流」
-// 或以后再改名、数据目录都不漂移、用户任务数据不丢；测试实例独立目录防污染
+// userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名从「AI工作流」改成
+// 「Flowship」（v1.1.0）或以后再改名、数据目录都不漂移、用户任务数据不丢；测试实例独立目录防污染
 app.setPath(
   "userData",
   path.join(app.getPath("appData"), IS_TEST ? "fe-ai-flow-test" : "fe-ai-flow"),
@@ -509,7 +509,7 @@ ipcMain.handle("native-pick", async (_e, opts) => {
 // 通知只是「叫人回来」的信使、判断「什么时候该叫」全在页面侧（那边有完整任务状态）。
 ipcMain.on("task-notify", (_e, payload) => {
   if (!Notification.isSupported()) return;
-  const title = typeof payload?.title === "string" ? payload.title.slice(0, 80) : "AI工作流";
+  const title = typeof payload?.title === "string" ? payload.title.slice(0, 80) : "Flowship";
   const body = typeof payload?.body === "string" ? payload.body.slice(0, 200) : "";
   const taskId = typeof payload?.taskId === "string" ? payload.taskId : "";
   try {

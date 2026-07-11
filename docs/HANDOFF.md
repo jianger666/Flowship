@@ -6,6 +6,8 @@
 
 站在 Cursor SDK 肩膀上的**项目级 AI Harness 平台 · 飞书 story → MR 自动化**。核心是 Harness（缰绳）：每个 action 边界用确定性工具（artifact 落盘 / 必备段 lint / review 只读指纹 / 基底 commit 校验 / MR 门禁 / HITL ack）压住 LLM 非确定性、保证产出可观测、可回退、可复用。
 
+> 产品显示名 **Flowship**（v1.1.0 起、原「AI工作流」）；内部标识（appId / userData `fe-ai-flow` / artifactName / 仓库名）永远不改。
+
 ## 给 AI 接力的最小上下文
 
 按顺序读：
@@ -298,6 +300,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 ## 最近演进（窗口式、保留 2 个子版本）
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
+
+### 2026-07-11 v1.1.0 改名「Flowship」+ 开屏 splash 独立小窗（正式第一版、用户拍板）
+
+- **产品改名 Flowship**（flow=需求流转 + ship=交付上线 action、用户三轮选型拍板；替代「AI工作流」）：只改**显示层**——`productName`（electron-builder.yml + electron-app/package.json）、页面 title、诊断包名、OAuth 回调文案、通知默认标题、test 包名 `FlowshipTest`；**内部标识一律不动**——appId `com.jianger.fe-ai-flow`（win 升级不裂）、userData `fe-ai-flow`（壳钉死、数据不漂移）、artifactName ascii（updater 下载链路稳）、仓库名。注意：mac 老用户应用内自更新是 ditto 替换 .app **内容**、磁盘上文件名仍是「AI工作流.app」、Finder 显示名 / Dock 会变 Flowship（纯外观残留、无害）
+- **开屏 splash 改独立 frameless 小窗、直接到底**（用户实测「开屏和工作台 loading 始终有衔接闪烁」、拍板「splash 直接到底」）：boot 期间只有品牌小窗可见（BrandMark 通电动效、可拖）、主窗 `show:false` 静默加载 BASE_URL、`ready-to-show` 先亮主窗再收 splash——可见窗口里**没有任何文档切换**、闪烁源头消除（此前方案：主窗先 load splash 文档再 loadURL 换页、必有一两帧空白）；splash 关闭不触发 window-all-closed（主窗 hidden 仍算窗口）；loadURL 完成兜底亮窗（个别路径 ready-to-show 不触发）
+- **README 全面刷新**：改名说明、胶囊双模式 / 飞书看板一键建任务（V0.14 砍手动新建）、内置飞书 CLI 替代自配 MCP 强校验、就绪清单 onboarding、能力页 /actions、项目结构树补 chats/actions 页
 
 ### 2026-07-11 v1.0.x 渲染减重 + 编辑重发 + 事件懒加载 + 存储清理（用户晨间验收反馈、Grok 蓝军审核）
 

@@ -1,6 +1,8 @@
-# ai-flow
+# Flowship
 
 **项目级 AI Harness 平台 · 飞书 story → MR 自动化**——站在 Cursor SDK 肩膀上、把「读飞书 / 拉接口文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验 / 提 MR」这 80% 的手工活自动化、用户只在每个 action 边界 ack 一次。
+
+> 产品名 **Flowship**（flow = 需求流转、ship = 交付上线，v1.1.0 起启用；原「AI工作流」）；仓库 / 产物文件名 / 数据目录沿用 `fe-ai-flow`、老用户升级无感。
 
 **核心是 Harness（缰绳）**：每个 action 边界都用确定性工具（typecheck / lint / git diff hash / MCP / HITL ack）加固质量、压住 LLM 的非确定性、保证产出可观测、可回退、可复用。UI 上的「任务看板 + action 时间线」是产品形态、底下是「AI 写代码 + harness 保质量」这套工程哲学。
 
@@ -33,16 +35,16 @@ V0.6 起从「phase chain（`plan → build → review` 固定顺序）」重构
 
 ---
 
-## 两套 mode：task / chat
+## 两套 mode：task / chat（顶栏胶囊切「工作台 / 对话」）
 
-新建任务 dialog 顶部 tab 二选一、两套通路完全独立（不共享 runner / prompt / 推进入口）：
+顶栏胶囊二选一切视图、两套通路完全独立（不共享 runner / prompt / 推进入口）：
 
-| mode | 用途 | UI | 必填 |
+| mode | 入口 | 用途 | UI |
 |---|---|---|---|
-| **task** | 正经需求、走 action 容器 | 三栏（左 action 时间线 + 中 artifact 预览 + 右事件流） | 标题、仓库（多仓）、飞书 story URL；**强制配齐飞书 MCP + 飞书项目 MCP** |
-| **chat** | 跟 AI 临时聊（答疑 / 探索 / 思路碰撞、不走完整流程） | 单栏对话（顶部 bar + 事件流 + 输入框、随时可「停止」） | 全选填、空标题自动补「未命名对话 MM-DD HH:mm」 |
+| **task** | **工作台首页 = 飞书需求看板**、从工作项一键建任务（V0.14 起砍掉手动「新建任务」） | 正经需求、走 action 容器 | 三栏（左 action 时间线 + 中 artifact 预览 + 右事件流） |
+| **chat** | 对话视图「新对话」 | 跟 AI 临时聊（答疑 / 探索 / 思路碰撞、不走完整流程） | 单栏对话（事件流 + 输入框、随时可「停止」）、空标题自动补名 |
 
-> 飞书两个 MCP 是「需求 → MR」全流程命脉（plan 拉 story / build 摸需求 / ship @ 测试人员全靠它）、**task 模式按 url 域名强校验**（`mcp.feishu.cn` + `project.feishu.cn`、不认 key 名）、漏配不让建。chat 模式不依赖、放行。
+> 飞书能力走**内置 CLI**（`lark-cli` 飞书 + `meegle-cli` 飞书项目、V0.13 起）：设置页一键安装 + 浏览器授权登录、不再要求用户自配飞书 MCP。新用户首页有三项就绪清单（API Key / 飞书工具 / 仓库）引导、配齐才进看板。
 
 ---
 
@@ -76,35 +78,37 @@ pnpm dev    # 浏览器开 http://localhost:8876
 
 | 平台 | 包 | 安装 |
 |---|---|---|
-| Windows | `fe-ai-flow-<版本>-win-x64.exe` | 双击安装（一键装到用户目录、免管理员）、之后自动更新 |
+| Windows | `fe-ai-flow-<版本>-win-x64.exe` | 双击安装（向导装到用户目录、免管理员）、之后应用内自动更新 |
 | mac（M 芯片） | `fe-ai-flow-<版本>-mac-arm64.dmg` | 拖进「应用程序」、**首次右键 →「打开」** 过 Gatekeeper |
 
-桌面端 app 自带运行时、装完即用；win 启动自动检查新版静默更新、mac 应用内自更新（任务数据保留）。
+桌面端 app 自带运行时、装完即用；应用内检查新版自更新（任务数据保留）。安装后显示名为 **Flowship**。
 
-> 发版（维护者）：`git tag v0.7.X && git push origin v0.7.X`、CI 自动 build win/mac 安装包传 Release。
+> 发版（维护者）：`git tag v1.1.0 && git push origin v1.1.0`、CI 自动 build win/mac 安装包传 Release。
 
 按以下顺序操作：
 
-1. **设置页 `/settings`**：
+1. **首次进入 = 就绪清单**：首页引导三件事、配齐才进看板
    - **API Key**：粘贴 Cursor API Key（[这里办一个](https://cursor.com/dashboard/integrations)、`crsr_` 开头）
-   - **默认模型**：从 SDK 拉的可用模型列表选 + SDK 参数（thinking / context / effort 等）
-   - **仓库**：点「选择文件夹」弹原生 dialog 选目录、可多仓
-   - **MCP servers**：app **自管配置**（V0.13 起、存 `data/config.json`）、可增删改、支持从 `~/.cursor/mcp.json` 一键导入（导入后互不影响）；可按任务关掉某些 MCP（黑名单）、失败的可点开看报错日志
-2. **主页 `/`**：任务卡片看板、点「新建任务」开始；选 mode（task / chat）
-3. **task 详情页**：左 action 时间线 + 中 artifact 预览 + 右事件流；顶部「再聊聊 / 通过」按钮；「推进」按钮开 dialog 选下一个 action + 写指令（可勾「新启 Agent」/ 切模型）
-4. **chat 详情页**：底部输入框发消息自动启 agent；running 时可「停止」
-5. 不想要的任务可手动归档 / 删除；终态 7 天没动自动归档
+   - **飞书工具**：一键安装内置 `lark-cli` + `meegle-cli`、浏览器授权登录
+   - **仓库**：原生 dialog 选本地仓库目录、可多仓（GitLab host 从仓库 origin 自动推导、只需填 PAT）
+2. **工作台首页 `/`**：飞书需求看板（我的工作项）、从工作项一键建 task；顶栏胶囊切「工作台 / 对话」
+3. **task 详情页**：左 action 时间线 + 中 artifact 预览 + 右事件流；顶部「再聊聊 / 通过」；「推进」选下一个 action + 写指令（可勾「新启 Agent」/ 切模型、常用模型有快捷位）
+4. **对话视图 `/chats`**：新对话即聊、支持 `/` 唤起 skill 菜单、消息可编辑重发；running 时可「停止」
+5. **能力页 `/actions`**：Action / Skill / MCP 三个 tab 集中管理（skill 可让 AI 帮建、MCP 可从 Cursor 导入）
+6. 不想要的任务可手动归档 / 删除；设置页「存储」可清理历史任务占用
 
 ---
 
 ## 项目结构
 
 ```
-ai-flow/
+fe-ai-flow/
 ├── src/
 │   ├── app/
-│   │   ├── page.tsx                         # 主页：任务卡片看板（task / chat 共用）
-│   │   ├── settings/page.tsx                # 设置：API key / 默认模型 / 仓库 / MCP（app 自管 + Cursor 导入）
+│   │   ├── page.tsx                         # 工作台首页：新用户就绪清单 / 飞书需求看板
+│   │   ├── chats/page.tsx                   # 对话视图落地页（顶栏胶囊切换）
+│   │   ├── settings/page.tsx                # 设置：侧边导航 + 连接（API key / GitLab / 飞书 CLI）/ 偏好 / 仓库 / 存储
+│   │   ├── actions/page.tsx                 # 能力页：Action / Skill / MCP 三 tab 集中管理
 │   │   ├── tasks/[id]/page.tsx              # 任务详情、按 task.mode 渲染（task 三栏 / chat 单栏）
 │   │   └── api/
 │   │       ├── settings/                    # GET（脱敏）/ PUT 配置；full/ 全量读取（仅 loopback）
@@ -171,12 +175,12 @@ ai-flow/
 
 > **网络边界**：服务只绑 `127.0.0.1`（源码脚本 `-H` / Electron 壳 `HOSTNAME`）、所有 `/api/**` 另做 Host/Origin loopback 校验（防 DNS rebinding）——API 无鉴权的前提是「只有本机能碰到」。
 
-### 飞书 MCP（task 模式命脉、强校验）
+### 飞书内置 CLI（task 模式命脉、V0.13 起替代自配 MCP）
 
-task 模式按 url 域名强校验这两个、漏配不让建：
+- `lark-cli`（飞书）：拉 wiki / docx 关联 PRD、发消息 @ 人（story 通常只指向 wiki、详细需求正文在 wiki 里）
+- `meegle-cli`（飞书项目）：拉 story 详情 / 工作项字段 / 关联文档、同步状态
 
-- `mcp.feishu.cn`：拉飞书 wiki / docx 关联 PRD（story 通常只指向 wiki、详细需求正文在 wiki 里）
-- `project.feishu.cn`：拉 story 详情 / 工作项字段 / 关联文档
+设置页「飞书集成」一键安装（增量更新、跳过已是最新的组件）+ 浏览器授权登录；新用户就绪清单强制引导、装好前不进看板。
 
 ---
 
@@ -188,15 +192,15 @@ task 模式按 url 域名强校验这两个、漏配不让建：
 - **能用确定性工具兜的、就不让 LLM 自己判断**——eslint / typecheck / git hash / JSON Schema 优先（客观可证伪 predicate、不走字符串黑名单）
 - **不是 multi-agent**——单 agent 跑全程（不是 Cognition 反对的「角色协作」、是 Anthropic 推荐的 prompt chaining）；单 task 多 action 链合法
 - **角色驱动而非端驱动**——`task.role` 字段、同一 story 多端建多 task、agent 按角色挑相关部分（详见 `docs/MULTI-ROLE.md`）
-- **rules / skills 消费 Cursor 全局配置、MCP 自管**——`~/.cursor/rules` + repo `.cursor/` 只读注入；MCP V0.13 起 app 自管（Cursor mcp.json 仅作导入源）
+- **rules 消费 Cursor 全局配置、MCP / skills 自管**——`~/.cursor/rules` + repo `.cursor/` 只读注入；MCP + skills V0.13 起 app 自管（Cursor 配置仅作一键导入源、导入后互不影响）
 
 ---
 
 ## 下一步
 
-- 优先：跑通真飞书 story → plan → build → review → ship 全流程端到端 demo
-- `test` action：运行时验证（飞书验收用例 + 浏览器 QA、蓝图 + 待拍板矛盾见 `docs/ROADMAP.md`）
-- 扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）
-- cross-action 一致性自检（门槛 5）/ token-cost dashboard
+- 飞书项目深度集成 Phase 2：任务状态自动同步回工作项（agent 驱动）
+- `test` action：运行时验证（飞书验收用例 + 浏览器 QA、蓝图见 `docs/ROADMAP.md`）
+- 扩 `task.role` 枚举到后端 / 数仓 / 测试（详见 `docs/MULTI-ROLE.md` checklist）、往非开发用户（QA / BI）通用化靠
+- 长会话「新对话带摘要」/ token-cost dashboard
 
 详见 [docs/ROADMAP.md](./docs/ROADMAP.md) + [docs/HANDOFF.md](./docs/HANDOFF.md)（接力第一文件、必读）。

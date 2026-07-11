@@ -1,6 +1,6 @@
 {
   "name": "ai-flow",
-  "productName": "AI工作流",
+  "productName": "Flowship",
   "version": "0.0.0-dev",
   "private": true,
   "description": "ai-flow 桌面端（Electron 壳、CI 发版时 version 会被改写成 tag 版本）",

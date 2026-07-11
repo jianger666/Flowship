@@ -5,7 +5,7 @@ import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI工作流",
+  title: "Flowship",
   description: "开发流水线",
 };
 

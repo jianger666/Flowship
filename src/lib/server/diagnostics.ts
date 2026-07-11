@@ -88,7 +88,7 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
   ]);
 
   const content = [
-    "===== AI工作流 诊断包 =====",
+    "===== Flowship 诊断包 =====",
     `导出时间: ${new Date().toISOString()}`,
     `app 版本: ${appVersion || "（未知、可能是 dev / 旧壳）"}`,
     `平台: ${process.platform} ${process.arch} / Node ${process.version}`,
@@ -109,7 +109,7 @@ export const exportDiagnostics = async (appVersion?: string): Promise<string> =>
   // 时间戳文件名（本地时间、精确到分、重复导出不覆盖）
   const ts = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
-  const filename = `AI工作流诊断-${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.txt`;
+  const filename = `Flowship诊断-${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.txt`;
 
   // 首选「下载」目录（mac / win 都是 ~/Downloads）、写不进回退数据目录
   const downloads = path.join(os.homedir(), "Downloads");

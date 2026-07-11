@@ -6,8 +6,9 @@
 # 已经由 Next standalone 自己 trace 好、走 extraResources 进包。
 # appId 永远不改（win updater / 安装器按它认应用、改了升级会裂成两个 app）
 appId: com.jianger.fe-ai-flow
-# 显示名（桌面图标 / 开始菜单 / .app 名 / userData 目录名）
-productName: AI工作流
+# 显示名（桌面图标 / 开始菜单 / .app 名）——v1.1.0 起「Flowship」（原「AI工作流」）；
+# userData 由壳钉死在 fe-ai-flow、改显示名不漂移数据
+productName: Flowship
 
 directories:
   app: electron-app
