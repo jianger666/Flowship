@@ -27,9 +27,16 @@ interface LoadingStateProps {
    * hero 专用：跳过 250ms 延迟出场、立即可见。
    * 启动链（首页 gate → 看板拉取）连续两段 loading 都带延迟会「亮-灭-亮」闪几下
    *（用户实测）——必然要等的场景用 immediate、只有「大概率秒开」的路径保留延迟防闪现。
+   * 注意只在启动窗口内生效（见 APP_BOOT_TS）。
    */
   immediate?: boolean;
 }
+
+// 页面 JS 启动时刻：immediate 只在启动后的短窗口内生效——启动链（splash 接力）必须
+// 立即可见防白屏；之后的应用内切换（胶囊来回等）常常秒开、loading 闪一下就没很突兀
+//（用户点名「加个 delay、小于阈值就不展示」）——统一回 hero-appear 延迟出场
+const APP_BOOT_TS = Date.now();
+const BOOT_WINDOW_MS = 10_000;
 
 const HeroLoading = ({
   label,
@@ -39,21 +46,25 @@ const HeroLoading = ({
   label: string;
   className?: string;
   immediate?: boolean;
-}) => (
-  <div
-    className={cn(
-      "flex h-full min-h-[60vh] flex-col items-center justify-center gap-4",
-      // 延迟 250ms 出场（globals.css hero-appear）：秒开路径整个 loading 不闪现（用户实测）
-      !immediate && "hero-appear",
-      className,
-    )}
-    role="status"
-    aria-label={label}
-  >
-    <BrandMark size={64} animated />
-    <div className="text-sm text-muted-foreground">{label}</div>
-  </div>
-);
+}) => {
+  // 出场是否延迟（250ms 内秒开就完全不显示）：非 immediate、或已过启动窗口
+  const delayed = !immediate || Date.now() - APP_BOOT_TS > BOOT_WINDOW_MS;
+  return (
+    <div
+      className={cn(
+        "flex h-full min-h-[60vh] flex-col items-center justify-center gap-4",
+        // 延迟 250ms 出场（globals.css hero-appear）：秒开路径整个 loading 不闪现（用户实测）
+        delayed && "hero-appear",
+        className,
+      )}
+      role="status"
+      aria-label={label}
+    >
+      <BrandMark size={64} animated />
+      <div className="text-sm text-muted-foreground">{label}</div>
+    </div>
+  );
+};
 
 export const LoadingState = ({
   variant = "block",
