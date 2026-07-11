@@ -757,6 +757,21 @@ const macSelfUpdate = async (version) => {
       log(`[updater] 清理暂存旧包失败（启动时兜底再清）${err?.message || err}`);
     });
 
+    // 磁盘文件名跟随新包（v1.1.0 产品改名 Flowship 后的自愈）：ditto 只换内容、
+    // 文件名还是老的（如 AI工作流.app）——同卷 rename 原子改名；失败（目标已存在等）
+    // 保持原名 fail-open。代价：Dock 固定过的图标按路径记、改名后需用户重新固定一次
+    let finalAppPath = appPath;
+    if (path.basename(appPath) !== newApp) {
+      const renamedPath = path.join(path.dirname(appPath), newApp);
+      try {
+        await fs.rename(appPath, renamedPath);
+        finalAppPath = renamedPath;
+        log(`[updater] 应用文件名 ${path.basename(appPath)} → ${newApp}`);
+      } catch (err) {
+        log(`[updater] 应用改名失败（保持原名）${err?.message || err}`);
+      }
+    }
+
     // 关键 marker（V0.10.1）：bundle 已被替换、但本进程还是老版本——用户点「稍后」期间
     // server 起新 agent run 必挂死（SDK 沙箱 shell helper 与新 bundle 失配、v0.9.10→14 实测事故）。
     // 落 marker 到 data/ 让 server 入口硬拦；壳下次启动（= 已跑新版本）时删。
@@ -769,18 +784,27 @@ const macSelfUpdate = async (version) => {
     }
 
     log(`[updater] v${version} 已就位、等用户重启`);
+    const wasRenamed = finalAppPath !== appPath;
     const { response } = await dialog.showMessageBox(mainWindow, {
       type: "info",
       title: "更新完成",
       message: `已更新到 v${version}`,
-      detail: "重启应用后生效。",
+      detail: wasRenamed
+        ? `重启应用后生效。应用已更名为「${path.basename(finalAppPath, ".app")}」、Dock 固定过的请重新固定。`
+        : "重启应用后生效。",
       buttons: ["立即重启", "稍后"],
       defaultId: 0,
       cancelId: 1,
     });
     if (response === 0) {
       quitting = true;
-      app.relaunch();
+      // 改过名时不能用默认 relaunch（还指向旧 execPath、路径已不存在）——
+      // 用 /usr/bin/open 按新 .app 路径拉起
+      if (wasRenamed) {
+        app.relaunch({ execPath: "/usr/bin/open", args: [finalAppPath] });
+      } else {
+        app.relaunch();
+      }
       app.quit();
     }
   } catch (err) {
