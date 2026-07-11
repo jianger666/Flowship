@@ -26,6 +26,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { actionDisplayLabel } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
+import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
 
 // v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
@@ -46,8 +47,12 @@ const taskStageLine = (
   if (task.runStatus === "awaiting_user") {
     // awaiting_ack = 交卷等审阅；running（此刻不在跑但 action 挂 running）= agent 提问等答
     if (task.lastActionStatus === "awaiting_ack") {
+      // 已读即清（v1.1.x 用户拍板「点进去看过、状态就该清掉」）：交卷后打开过详情
+      //（seenAt 晚于任务最后动静）→ 回归静息单行；再有新交卷 updatedAt 前移、重新亮
+      if (getTaskSeenAt(task.id) >= task.updatedAt) return null;
       return { stage, status: "待确认", tone: "wait" };
     }
+    // 待回答不做已读清除：AI 被阻塞在等答案、不答永远停——必须一直亮
     if (task.lastActionStatus === "running") {
       return { stage, status: "待回答", tone: "wait" };
     }
@@ -74,12 +79,13 @@ const LeadingIndicator = ({ task }: { task: TaskSummary }) => {
     );
   }
   // 真有事等你才亮琥珀点（task 模式限定、见文件头 V0.11.x 收窄说明）：
-  // - awaiting_ack：交卷了等你审阅（通过 / 再聊聊）
-  // - running + awaiting_user：agent 提问（ask 弹窗）等你答案
+  // - awaiting_ack 且**未读**（v1.1.x：看过详情即清、跟监控行同判定）
+  // - running + awaiting_user：agent 提问（ask 弹窗）等你答案（不做已读清除）
   const needsAttention =
     task.runStatus === "awaiting_user" &&
     task.mode !== "chat" &&
-    (task.lastActionStatus === "awaiting_ack" ||
+    ((task.lastActionStatus === "awaiting_ack" &&
+      getTaskSeenAt(task.id) < task.updatedAt) ||
       task.lastActionStatus === "running");
   if (needsAttention) {
     return (

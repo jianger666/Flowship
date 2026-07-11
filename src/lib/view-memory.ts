@@ -63,6 +63,48 @@ export const saveScrollAnchor = (taskId: string, anchor: ScrollAnchor) => {
 export const getScrollAnchor = (taskId: string): ScrollAnchor | undefined =>
   scrollAnchors.get(taskId);
 
+// ---------- 任务已读（「待确认」已读即清、用户拍板） ----------
+//
+// 交卷后侧栏标「待确认」、但用户**点进去看过**之后这个状态就该清掉（否则常亮 = 没信号）。
+// localStorage（跨重启保留、丢了会重新全亮很烦）：{ [taskId]: 最后打开详情的时间戳 }。
+// 判定在消费方：seenAt >= task.updatedAt = 已读（交卷后没再有新动静）。
+
+const SEEN_KEY = "fe-ai-flow:task-seen";
+// 防无限膨胀：只保留最近 300 个任务的记录
+const SEEN_CAP = 300;
+
+const readSeenMap = (): Record<string, number> => {
+  try {
+    return JSON.parse(localStorage.getItem(SEEN_KEY) ?? "{}") as Record<
+      string,
+      number
+    >;
+  } catch {
+    return {};
+  }
+};
+
+export const markTaskSeen = (taskId: string) => {
+  try {
+    const map = readSeenMap();
+    map[taskId] = Date.now();
+    const ids = Object.keys(map);
+    if (ids.length > SEEN_CAP) {
+      // 按时间升序裁掉最老的（早被删的任务记录自然被挤出去）
+      ids
+        .sort((a, b) => map[a] - map[b])
+        .slice(0, ids.length - SEEN_CAP)
+        .forEach((id) => delete map[id]);
+    }
+    localStorage.setItem(SEEN_KEY, JSON.stringify(map));
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+export const getTaskSeenAt = (taskId: string): number =>
+  readSeenMap()[taskId] ?? 0;
+
 // ---------- 输入条拖过的高度（全局偏好、跨任务共用） ----------
 
 const BOX_HEIGHT_KEY = "fe-ai-flow:talk-box-height";

@@ -17,7 +17,6 @@ import {
   Copy,
   ExternalLink,
   FileTerminal,
-  FileText,
   Loader2,
   Play,
   Square,
@@ -26,14 +25,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
-import { WorkitemDetail } from "@/components/feishu/workitem-detail";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   Popover,
   PopoverContent,
@@ -66,8 +58,6 @@ export const WorkspaceActions = ({ task }: Props) => {
   const [slot, setSlot] = useState<PreviewSlotStatus | null>(null);
   // 启动 / 停止请求进行中（防双击）
   const [busy, setBusy] = useState(false);
-  // V0.14：飞书工作项详情 dialog 开关
-  const [storyOpen, setStoryOpen] = useState(false);
 
   useEffect(() => {
     void initSettings().then(() => {
@@ -204,31 +194,8 @@ export const WorkspaceActions = ({ task }: Props) => {
         复制路径
       </Button>
 
-      {/* V0.14：飞书工作项详情（需求原文不用跳飞书）——有关联链接才显示 */}
-      {task.feishuStoryUrl && (
-        <>
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            onClick={() => setStoryOpen(true)}
-            title="查看飞书工作项详情"
-          >
-            <FileText className="size-3" />
-            需求详情
-          </Button>
-          <Dialog open={storyOpen} onOpenChange={setStoryOpen}>
-            <DialogContent className="flex max-h-[80vh] w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
-              <DialogHeader className="border-b px-5 py-3.5">
-                <DialogTitle className="text-sm">需求详情</DialogTitle>
-              </DialogHeader>
-              <div className="flex-1 overflow-y-auto px-5 py-4">
-                {storyOpen && <WorkitemDetail url={task.feishuStoryUrl} />}
-              </div>
-            </DialogContent>
-          </Dialog>
-        </>
-      )}
+      {/* 「需求详情」按钮已删（v1.1.x 用户拍板）：工作项的 description 字段团队实践里
+          都是空的（产品写飞书文档、往工作项贴链接）、点开永远空白纯误导 */}
 
       {candidates.length > 0 && !mine && (
         // 未在预览（或预览位被别的任务占着）：起本任务的预览。

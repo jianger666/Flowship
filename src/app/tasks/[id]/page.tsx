@@ -91,7 +91,7 @@ import {
   getRepoShortNames,
   getUniqueRepoDirNames,
 } from "@/lib/path-utils";
-import { rememberLastChat } from "@/lib/view-memory";
+import { markTaskSeen, rememberLastChat } from "@/lib/view-memory";
 import type {
   ActionRecord,
   ActionType,
@@ -205,6 +205,12 @@ const TaskDetailPage = () => {
   useEffect(() => {
     if (task?.mode === "chat") rememberLastChat(task.id);
   }, [task?.id, task?.mode]);
+
+  // 已读上报（v1.1.x「待确认」已读即清）：正在看这个任务 = 交卷动静都算已读、
+  // 侧栏「待确认」标记 / 琥珀点随之熄灭（依赖 updatedAt：页内新交卷也即时算已读）
+  useEffect(() => {
+    if (task?.id) markTaskSeen(task.id);
+  }, [task?.id, task?.updatedAt]);
 
   // currentActionId 变化时把 selectedActionId 跟到 currentActionId
   // 用户主动切别的 action 后、currentActionId 又变（agent 又推进一步）时不强行带回——
