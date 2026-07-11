@@ -175,6 +175,11 @@ export interface FeAiFlowSettings {
    */
   reuseAgentDefault?: boolean;
   /**
+   * v1.1.x：新任务「隔离工作区」的默认值（默认 true）。只影响新建任务表单
+   * 「直接在原仓库运行」的初始勾选（只读型用法如测试团队可默认关隔离）、可在表单临时改。
+   */
+  isolateWorktreeDefault?: boolean;
+  /**
    * V0.11.x：模型使用计数（「常用模型」快捷 chip 的数据源、用户拍板自动按次数排序）。
    * 每次真正提交使用某模型（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型）计一次、
    * 按「模型 id + 参数组合」区分（Fable High 和 Fable Low 是两个条目）。上限 20 条防膨胀。

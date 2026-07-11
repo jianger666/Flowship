@@ -120,6 +120,10 @@ const isFieldEqual = (
     // boolean 字段：缺省视同 false 比较
     return (a[key] ?? false) === (b[key] ?? false);
   }
+  if (key === "isolateWorktreeDefault") {
+    // boolean 字段：缺省视同 true 比较（默认隔离）
+    return (a[key] ?? true) === (b[key] ?? true);
+  }
   if (key === "disabledMcpServers") {
     // 黑名单是集合、顺序无关——排序后逐项比
     const x = [...(a.disabledMcpServers ?? [])].sort();
@@ -196,6 +200,11 @@ export const useSettings = (): UseSettingsResult => {
       actionLayout: !isFieldEqual("actionLayout", settings, savedSettings),
       reuseAgentDefault: !isFieldEqual(
         "reuseAgentDefault",
+        settings,
+        savedSettings,
+      ),
+      isolateWorktreeDefault: !isFieldEqual(
+        "isolateWorktreeDefault",
         settings,
         savedSettings,
       ),

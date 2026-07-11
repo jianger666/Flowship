@@ -50,6 +50,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   mcpServers: {},
   actionLayout: { order: [], hidden: [] },
   reuseAgentDefault: false,
+  isolateWorktreeDefault: true,
   modelUsage: [],
 };
 
@@ -146,6 +147,8 @@ const normalizeSettings = (
     actionLayout: normalizeActionLayout(parsed.actionLayout),
     // v0.9.11：推进 dialog「续用当前 Agent」默认勾选、缺省 / 坏值回退 false（每 action 新 agent）
     reuseAgentDefault: parsed.reuseAgentDefault === true,
+    // v1.1.x：新任务默认隔离工作区、缺省 / 坏值回退 true（只有显式 false 才默认直跑原仓）
+    isolateWorktreeDefault: parsed.isolateWorktreeDefault !== false,
     // V0.11.x：模型使用计数、坏值 / 缺省回退空
     modelUsage: Array.isArray(parsed.modelUsage)
       ? (parsed.modelUsage as ModelUsageEntry[]).filter(

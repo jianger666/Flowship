@@ -106,6 +106,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     setDisabledMcp(s.disabledMcpServers ?? []);
     setDefaultModelId(s.defaultModel?.id ?? "");
     setPickedModel(s.defaultModel?.id?.trim() ? s.defaultModel : { id: "" });
+    // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
+    setRunInRepo(s.isolateWorktreeDefault === false);
     const last = readLastLaunch();
     const validPaths = (last.repoPaths ?? []).filter((p) =>
       s.repos.some((r) => r.path === p),

@@ -319,6 +319,10 @@ const SettingsPage = () => {
                 reuseAgentDefault={settings.reuseAgentDefault ?? false}
                 onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
                 onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
+                isolateWorktreeDefault={settings.isolateWorktreeDefault ?? true}
+                onIsolateWorktreeDefaultChange={(v) =>
+                  saveFieldValue("isolateWorktreeDefault", v)
+                }
                 models={models}
                 modelsError={modelsError}
                 modelSelection={settings.defaultModel}

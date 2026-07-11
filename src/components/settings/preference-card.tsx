@@ -44,11 +44,13 @@ interface PreferenceSectionsProps {
   branchTemplate: string;
   onBranchTemplateChange: (next: string) => void;
   onBranchTemplateCommit: (value: string) => void;
-  // 提交快捷键 / 续用 Agent
+  // 提交快捷键 / 续用 Agent / 隔离工作区默认值
   submitShortcut: SubmitShortcut;
   reuseAgentDefault: boolean;
   onSubmitShortcutChange: (next: SubmitShortcut) => void;
   onReuseAgentDefaultChange: (next: boolean) => void;
+  isolateWorktreeDefault: boolean;
+  onIsolateWorktreeDefaultChange: (next: boolean) => void;
   // 默认模型
   models: ModelOption[];
   modelsError: string;
@@ -69,6 +71,8 @@ export const PreferenceSections = ({
   reuseAgentDefault,
   onSubmitShortcutChange,
   onReuseAgentDefaultChange,
+  isolateWorktreeDefault,
+  onIsolateWorktreeDefaultChange,
   models,
   modelsError,
   modelSelection,
@@ -179,6 +183,17 @@ export const PreferenceSections = ({
           <Switch
             checked={reuseAgentDefault}
             onCheckedChange={onReuseAgentDefaultChange}
+          />
+        }
+      />
+
+      <SettingRow
+        label="新任务默认隔离工作区"
+        hint="关闭后新任务直接在原仓库运行（只读型用法适用）"
+        control={
+          <Switch
+            checked={isolateWorktreeDefault}
+            onCheckedChange={onIsolateWorktreeDefaultChange}
           />
         }
       />
