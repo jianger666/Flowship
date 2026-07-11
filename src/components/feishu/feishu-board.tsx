@@ -294,7 +294,7 @@ export const FeishuBoard = () => {
 
       <div className="min-h-0 flex-1">
         {resp === null || (refreshing && items.length === 0) ? (
-          <LoadingState variant="hero" label="正在拉取飞书排期…" />
+          <LoadingState variant="hero" />
         ) : (
           <BoardTimeline
             items={items}

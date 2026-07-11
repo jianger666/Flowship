@@ -20,6 +20,7 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 
 import { useSettings } from "@/hooks/use-settings";
@@ -176,20 +177,18 @@ const SettingsPage = () => {
       {/* 左侧锚点导航：sticky 跟随、点击定位、滚动高亮当前节 */}
       <nav className="sticky top-6 hidden h-fit w-40 shrink-0 flex-col gap-0.5 self-start md:flex">
         <div className="mb-2 px-2 text-xs font-medium text-muted-foreground">设置</div>
+        {/* 选中态封装在 ChoiceButton 里（用户拍板「规范封装进组件、AI 用了就是规范」）、
+            不再手拼 className */}
         {NAV_ITEMS.map((item) => (
-          <button
+          <ChoiceButton
             key={item.focus}
-            type="button"
+            shape="tab"
+            selected={activeFocus === item.focus}
             onClick={() => scrollToFocus(item.focus)}
-            className={cn(
-              "cursor-pointer rounded-md px-2 py-1.5 text-left text-sm transition-colors",
-              activeFocus === item.focus
-                ? "bg-selected font-medium text-selected-foreground"
-                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-            )}
+            className="w-full cursor-pointer"
           >
             {item.label}
-          </button>
+          </ChoiceButton>
         ))}
         {/* 能力入口指路（MCP / Skill / Action 已迁能力页；文案短、用户点名「太长」） */}
         <div className="mt-3 border-t pt-2">
