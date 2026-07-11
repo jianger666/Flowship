@@ -53,7 +53,7 @@ import {
   getSubmitShortcutTitle,
   shouldSubmitOnKeyDown,
 } from "@/lib/submit-shortcut";
-import type { ImagePayload } from "@/lib/task-store";
+import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import type { Task, TaskEvent } from "@/lib/types";
 
 import {
@@ -140,6 +140,9 @@ interface Props {
   // chat：自由模式对话——Cursor agent window 风格（窄列居中 / AI 平铺 /
   //       用户浅色块 / 过程细行 / 圆角输入岛）
   variant?: "log" | "chat";
+  // v1.0.x 事件懒加载：上拉到顶自动拉更早分页、拉到的事件通过它插到父组件事件列表头部。
+  // 不传 = 不启用分页（task.eventsTruncated 也不看）。
+  onPrependEvents?: (events: TaskEvent[]) => void;
 }
 
 // chat 单次最多附几条路径（防滥用 / context 爆）
@@ -149,6 +152,27 @@ const MAX_ATTACHMENTS_PER_REPLY = 10;
 // 用 React.memo 包裹：详情页输入交互（如「再聊聊」对话框输入）触发 page 重渲染时、
 // 只要 task / streamingText 引用没变就跳过本组件、避免几百条 events 的子树参与 reconcile
 // 这是用户实测踩过的性能坑（输入卡顿 / [Violation] message handler took XXXms）
+// Virtuoso firstItemIndex 起始基数（prepend 分页时递减、官方要求保持正数——取个够大的）
+const FIRST_INDEX_BASE = 1_000_000;
+// 上拉一页拉多少条
+const EARLIER_PAGE_SIZE = 300;
+
+// Virtuoso context 形状（Header 靠它拿「正在拉更早」状态、组件本身保持模块级稳定引用）
+interface StreamListContext {
+  loadingEarlier: boolean;
+}
+
+// 顶部「加载更早…」细行：仅分页请求飞行中显示
+const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) =>
+  context?.loadingEarlier ? (
+    <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
+      <Loader2 className="size-3.5 animate-spin" />
+      加载更早…
+    </div>
+  ) : null;
+
+const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
+
 const EventStreamImpl = ({
   task,
   streamingText,
@@ -162,6 +186,7 @@ const EventStreamImpl = ({
   onStop,
   stopping,
   variant = "log",
+  onPrependEvents,
 }: Props) => {
   const isChat = variant === "chat";
   // 输入草稿、发送后清空
@@ -221,6 +246,73 @@ const EventStreamImpl = ({
     [task.events],
   );
 
+  // ---------- v1.0.x 事件懒加载（上拉分页） ----------
+  // firstItemIndex：Virtuoso prepend 保滚动位置的官方机制——头部插 N 个 item 就减 N
+  const [firstItemIndex, setFirstItemIndex] = useState(FIRST_INDEX_BASE);
+  // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  // 拉取飞行中（顶部小 spinner、渲染用）
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // 同步重入闸（蓝军 P1：state 版有一帧延迟、startReached 同帧可双进 → firstItemIndex 多减）
+  const loadingEarlierRef = useRef(false);
+  // 是否已经拉过至少一页（防 SSE 重连把 eventsTruncated 重新置 true 时误重开分页）
+  const pagedOnceRef = useRef(false);
+  // 最新 events 的 ref：分页请求飞行期间可能有新事件 append、算 items 增量要用最新值
+  const latestEventsRef = useRef(task.events);
+  latestEventsRef.current = task.events;
+
+  // 切 task 重置分页状态
+  useEffect(() => {
+    pagedOnceRef.current = false;
+    loadingEarlierRef.current = false;
+    setFirstItemIndex(FIRST_INDEX_BASE);
+    setHasMoreEarlier(false);
+    setLoadingEarlier(false);
+  }, [task.id]);
+  // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
+  // 已经拉过页就不再被它改（本地分页状态才是准的）
+  useEffect(() => {
+    if (!pagedOnceRef.current) setHasMoreEarlier(!!task.eventsTruncated);
+  }, [task.eventsTruncated]);
+
+  // 上拉到顶：拉上一页、prepend + firstItemIndex 同步递减（同一次 React batch、滚动不跳）
+  const loadEarlier = async () => {
+    if (loadingEarlierRef.current || !hasMoreEarlier || !onPrependEvents) return;
+    const anchor = latestEventsRef.current[0];
+    if (!anchor) return;
+    loadingEarlierRef.current = true;
+    setLoadingEarlier(true);
+    try {
+      const { events: older, hasMore } = await fetchEarlierEvents(
+        task.id,
+        anchor.id,
+        EARLIER_PAGE_SIZE,
+      );
+      pagedOnceRef.current = true;
+      // 先按当前本地事件去重（蓝军 P1：飞行期间本地可能已合入部分重叠事件、
+      // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
+      const cur = latestEventsRef.current;
+      const known = new Set(cur.map((e) => e.id));
+      const fresh = older.filter((e) => !known.has(e.id));
+      if (fresh.length > 0) {
+        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool_call 相邻合并、
+        // 拼接边界还可能跨页合并——用同一套纯函数分别算前后 items 数、差值才是真 prepend 数
+        const beforeLen = mergeAdjacentToolCall(mergeAdjacentThinking(cur)).length;
+        const afterLen = mergeAdjacentToolCall(
+          mergeAdjacentThinking([...fresh, ...cur]),
+        ).length;
+        onPrependEvents(fresh);
+        setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
+      }
+      setHasMoreEarlier(hasMore);
+    } catch (err) {
+      toast.error(`加载更早事件失败：${(err as Error).message}`);
+    } finally {
+      loadingEarlierRef.current = false;
+      setLoadingEarlier(false);
+    }
+  };
+
   // 流式回复自动贴底（V0.8.3 修）：
   // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
   // merged.length + 1）。react-virtuoso 的 followOutput 只在 data 条数变化时触发滚动、对「最后一项
@@ -234,7 +326,8 @@ const EventStreamImpl = ({
     if (!streamingText) return;
     if (!atBottomRef.current) return;
     virtuosoRef.current?.scrollToIndex({
-      index: items.length - 1,
+      // "LAST"：末尾项——比 items.length-1 稳（firstItemIndex 分页下不用管 index 空间）
+      index: "LAST",
       align: "end",
       behavior: "auto",
     });
@@ -326,17 +419,23 @@ const EventStreamImpl = ({
   // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
   const slash = useSlashSkills({ applyDraft: setDraft });
 
-  // v1.0：chat 用户消息「编辑重发」——原文填回输入框（覆盖当前草稿）+ 聚焦；
-  // 原消息保留在事件流（历史不改写）、用户改完当新消息发。useCallback 保 EventRow memo 不破。
-  // 同步 slash 状态（onDraftChange）：防旧的 / 菜单 query 残留在新文本上（审计 P2）
-  const handleEditResend = useCallback(
+  // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
+  // 原消息保留（append-only 事件日志、持久会话没法真 fork）；只有最后一条才给入口（用户拍板：
+  // 早期消息重发有上下文歧义、fork 语义做不了、砍掉）。不带图 / 附件（原消息的附件不重传）。
+  const handleResend = useCallback(
     (text: string) => {
-      setDraft(text);
-      slash.onDraftChange(text, text.length);
-      requestAnimationFrame(() => inputRef.current?.focus());
+      onUserReply?.(text);
     },
-    [slash],
+    [onUserReply],
   );
+
+  // 最后一条用户消息的 id：只有它 hover 出「重发 / 编辑」两 icon
+  const lastUserReplyId = useMemo(() => {
+    for (let i = task.events.length - 1; i >= 0; i--) {
+      if (task.events[i].kind === "user_reply") return task.events[i].id;
+    }
+    return undefined;
+  }, [task.events]);
 
   const handleSend = () => {
     const text = draft.trim();
@@ -411,6 +510,15 @@ const EventStreamImpl = ({
             ref={virtuosoRef}
             className="h-full"
             data={items}
+            // v1.0.x 上拉分页三件套：
+            // - computeItemKey：item 身份稳定（prepend 后不整列重挂）
+            // - firstItemIndex：头部插 N 项就减 N、Virtuoso 保滚动位置（官方 prepend 机制）
+            // - startReached：滚到顶自动拉上一页
+            computeItemKey={(_idx, item) => item.id}
+            firstItemIndex={firstItemIndex}
+            startReached={() => void loadEarlier()}
+            context={{ loadingEarlier }}
+            components={VIRTUOSO_COMPONENTS}
             // 贴底跟随语义：用户贴在底部时新 item 来自动滚（smooth）；
             // 用户主动滚走看历史时不打扰；滚回底部恢复跟随
             // 这一行替代了老的 stickToBottomRef + handleScroll + autoScroll useEffect、
@@ -427,8 +535,12 @@ const EventStreamImpl = ({
             atBottomThreshold={120}
             // 初始定位到末尾（任务详情首次进来直接看最新事件、不用手动滚）
             initialTopMostItemIndex={items.length - 1}
-            // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距
-            itemContent={(idx, item) => (
+            // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距。
+            // 注意：firstItemIndex 存在时 Virtuoso 传来的 idx 是「偏移后」的绝对索引、
+            // 要先减回 firstItemIndex 才能对 items 数组做定位（分页 prepend 后不减必错位）
+            itemContent={(absIdx, item) => {
+              const idx = absIdx - firstItemIndex;
+              return (
               <div
                 className={cn(
                   "px-4",
@@ -468,12 +580,17 @@ const EventStreamImpl = ({
                     taskId={task.id}
                     task={task}
                     variant={variant}
-                    // chat 用户消息「编辑重发」：填回输入框（原消息保留）、聚焦
-                    onEditResend={isChat ? handleEditResend : undefined}
+                    // chat 最后一条用户消息：hover 出「重发 / 原地编辑」两 icon（可发消息时才给）
+                    onResend={
+                      isChat && canCompose && item.id === lastUserReplyId
+                        ? handleResend
+                        : undefined
+                    }
                   />
                 )}
               </div>
-            )}
+              );
+            }}
           />
         )}
       </div>

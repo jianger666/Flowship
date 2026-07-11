@@ -214,3 +214,36 @@
 *::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* ---------- Streamdown 代码块 / 表格减重（v1.0.x、用户实测「双层卡片 + 操作栏太重」） ----------
+   Streamdown 默认给代码块 / 表格 / mermaid 套「外层 rounded-xl border bg-sidebar p-2 +
+   内层再一圈 border」的双层卡片、外加 my-4 大间距——聊天密度下视觉过重。
+   这里按稳定锚点 data-streamdown="..." 把外壳打薄：去外层底色 / 边框 / 内衬、间距 my-4 → 收紧、
+   只留内层一圈边框（GitHub 风）。选择器锚 data 属性、streamdown 版本升级改类名也不怕。 */
+.prose [data-streamdown="code-block"],
+.prose [data-streamdown="mermaid-block"],
+.prose [data-streamdown="table-wrapper"] {
+  margin-block: 0.625rem;
+  padding: 0;
+  gap: 0.25rem;
+  background: transparent;
+  border: none;
+  border-radius: 0.5rem;
+}
+/* 代码块内层（padding 在 code-block-body 包裹层上、不在 pre 上）：p-4 → 收一档、
+   字号跟聊天正文对齐 */
+.prose [data-streamdown="code-block-body"] {
+  padding: 0.75rem;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+/* 行号隐藏（用户「太重」）：不能传 lineNumbers=false——上游 v2.x 该路径行 span 不带
+   block class、非空行也不吐 \n、整块代码会塌成一行（headless 实测）。保留上游
+   lineNumbers=true 的行结构（span.block + ::before 计数器）、只把行号伪元素藏掉。 */
+.prose [data-streamdown="code-block"] pre code > span::before {
+  display: none;
+}
+/* 表格去掉外层双圆角残留、单层边框即可 */
+.prose [data-streamdown="table-wrapper"] table {
+  margin-block: 0;
+}

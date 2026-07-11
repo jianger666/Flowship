@@ -52,13 +52,55 @@ export const fetchTasks = async (): Promise<TaskSummary[]> => {
   return data.tasks;
 };
 
-export const fetchTask = async (id: string): Promise<Task | null> => {
-  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+export const fetchTask = async (
+  id: string,
+  opts?: { tail?: number },
+): Promise<Task | null> => {
+  const qs = opts?.tail && opts.tail > 0 ? `?tail=${opts.tail}` : "";
+  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}${qs}`, {
     cache: "no-store",
   });
   if (res.status === 404) return null;
   const data = await handleJson<{ task: Task }>(res);
   return data.task;
+};
+
+/**
+ * v1.0.x 事件懒加载：拉「某条事件之前」的更早历史（上拉分页）
+ */
+export const fetchEarlierEvents = async (
+  id: string,
+  before: string,
+  limit = 300,
+): Promise<{ events: TaskEvent[]; hasMore: boolean }> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/events?before=${encodeURIComponent(before)}&limit=${limit}`,
+    { cache: "no-store" },
+  );
+  return await handleJson<{ events: TaskEvent[]; hasMore: boolean }>(res);
+};
+
+/**
+ * v1.0.x：把服务端来的 task 快照合并进本地 state、**本地事件列表只增不换**。
+ *
+ * 背景：事件懒加载后、task 快照的 events 可能是空（SSE 中途帧）/ 尾部切片（GET ?tail）/
+ * 全量（mutation 响应等旧路径）——而本地是「尾部 + 已上拉分页的部分」。规则（蓝军 P0 修）：
+ *   - 只吸收「本地末尾之后」的新增事件（SSE 漏发时靠 mutation 响应兜底对齐）
+ *   - **更早的回灌一律丢弃**——mutation 响应带全量 events 会把懒加载一次打穿
+ *     （发条消息就灌进上万条、打开秒开白做）；更早历史只归上拉分页管
+ * 事件日志 append-only（supersede 等都是追加新 info、从不改写旧事件）、丢弃早段无信息损失。
+ */
+export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
+  if (!prev || prev.id !== next.id || prev.events.length === 0) return next;
+  const prevIds = new Set(prev.events.map((e) => e.id));
+  const lastTs = prev.events[prev.events.length - 1].ts;
+  // >=：同毫秒新事件不漏（id 去重兜住同一条）
+  const newer = next.events.filter((e) => !prevIds.has(e.id) && e.ts >= lastTs);
+  return {
+    ...next,
+    events: newer.length > 0 ? [...prev.events, ...newer] : prev.events,
+    eventsTruncated: next.eventsTruncated ?? prev.eventsTruncated,
+  };
 };
 
 // ----------------- 创建 / 删除 / 配置 patch -----------------

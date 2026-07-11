@@ -38,6 +38,7 @@ import { ModelCard } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { McpCard } from "@/components/settings/mcp-card";
 import { SkillsCard } from "@/components/settings/skills-card";
+import { StorageCard } from "@/components/settings/storage-card";
 import { UserProfileCard } from "@/components/settings/user-profile-card";
 import { GitCard } from "@/components/settings/git-card";
 import { PreferenceCard } from "@/components/settings/preference-card";
@@ -234,6 +235,8 @@ const SettingsPage = () => {
       )}
 
       {wrapCard("card-skills", <SkillsCard />)}
+
+      {wrapCard("card-storage", <StorageCard />)}
     </div>
   );
 };

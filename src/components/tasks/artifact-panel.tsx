@@ -51,11 +51,13 @@ const ARTIFACT_SHIKI_THEME: [ThemeInput, ThemeInput] = [
 // remark 插件：带上 defaultRemarkPlugins（含 gfm）再追加自定义（审计 P1、同 markdown-text）
 const ARTIFACT_REMARK_PLUGINS = [
   ...Object.values(defaultRemarkPlugins),
+  remarkCodeReference,
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
 ];
 
 import { MarkdownLink } from "@/components/markdown-link";
+import { STREAMDOWN_CONTROLS } from "@/components/markdown-text";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { MarkdownImage } from "@/components/ui/image-preview";
@@ -77,6 +79,7 @@ import {
   type ActionArtifactRef,
 } from "@/lib/path-utils";
 import { useJumpIde } from "@/hooks/use-settings";
+import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 import {
@@ -656,6 +659,8 @@ export const ArtifactPanel = ({
                 plugins={ARTIFACT_STREAMDOWN_PLUGINS}
                 remarkPlugins={ARTIFACT_REMARK_PLUGINS}
                 components={markdownComponents}
+                controls={STREAMDOWN_CONTROLS}
+                // 行号靠 globals.css 藏（lineNumbers=false 会让代码塌成一行、见 markdown-text）
               >
                 {currentArtifact.content}
               </Streamdown>

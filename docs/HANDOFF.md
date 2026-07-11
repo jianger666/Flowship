@@ -299,6 +299,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-11 v1.0.x 渲染减重 + 编辑重发 + 事件懒加载 + 存储清理（用户晨间验收反馈、Grok 蓝军审核）
+
+- **chat 最后一条用户消息「重发 / 原地编辑」**：hover 出两 icon（↻ 原样重发 / ✎ 原地编辑）、铅笔把气泡原地变 textarea（Esc 取消、Cmd/Ctrl+Enter 发）——语义 = 把内容作为**新消息发到末尾**（append-only 事件日志 + SDK 持久会话没有 fork API、做不了 ChatGPT 式截断重生、用户拍板只支持最后一条）；旧「填回输入框」交互删除
+- **Streamdown 代码块 / 表格减重**（用户实测「双层卡片 + 操作栏太重」）：controls 精简（代码只留复制、表格全关、mermaid 留全屏 + 拖拽缩放）；globals.css 按稳定锚点 `[data-streamdown="code-block|mermaid-block|table-wrapper"]` 打薄外层卡壳（去 bg-sidebar / 外边框 / p-2、my-4 收紧）。**⚠️ 行号不能用 `lineNumbers={false}` 关**（上游 v2.x 该路径行 span 不带 block class、非空行也不吐 `\n`、整块代码塌成一行——headless CDP 实测）——保留默认行结构、globals.css 把行号 `::before` 计数器藏掉
+- **代码引用围栏高亮修复**（`remark-code-reference.ts` + 单测）：AI 常输出 ```` ```12:34:src/foo.tsx ```` 的 Cursor 代码引用 fence、info 串不是合法语言 → Shiki 全灰（用户报「代码没高亮」主因）；插件把 lang 重写为按文件后缀推断的语言 + 前插一行 inlineCode「路径 · L12-34」出处（路径带空格的 lang+meta 拼回整体匹配）
+- **事件懒加载（上拉分页）**：打开任务只拉最近 300 条（GET `?tail=` + watch-task bootstrap 同口径）、Virtuoso `startReached` 上拉自动补更早分页（GET `/events?before=&limit=`、`firstItemIndex` 官方 prepend 机制保滚动位、items 增量按合并纯函数前后差值算——thinking/tool 相邻合并会跨页；`loadingEarlierRef` 同步重入闸 + prepend 前按本地 id 去重、防 firstItemIndex 多减错位）；**SSE 中途 task/done 帧一律剥 events**（原来每帧重传全量事件日志、长对话每帧几百 KB 纯浪费）；客户端所有「服务端 task 快照 → state」收口 `mergeTaskEvents`（**本地事件只增不换**：只吸收末尾新增、更早回灌一律丢——蓝军 P0：mutation 响应带全量 events、发条消息就把懒加载打穿；事件 append-only 从不改写、丢弃早段无损；有单测）
+- **设置页存储卡**（app 越用越大、用户拍板手动清理不自动删）：`/api/system/storage` 扫 data/tasks 占用（按大小降序）、勾选批量删（走既有 DELETE 完整停 agent 链路）、快捷筛选「已终结任务 / 30 天未活跃对话」（chat 无终态、按不活跃挑）
+- **长会话上下文结论（用户问）**：SDK 本地 agent 与 CLI/IDE 同 runtime、context 满自动摘要交给 Cursor 管、我们不干预；SDK 无 fork/checkpoint API（能力面只有 create/prompt/resume/send/getRun）、真要「从此处开新对话」只能截断历史 + 新会话、列为将来独立功能
+
 ### 2026-07-10 夜 v1.0 界面重构 + Markdown 渲染升级（用户拍板、Grok 蓝军审核过）
 
 - **胶囊双模式**：顶栏居中「工作台 / 对话」胶囊（`use-app-mode.ts` 按 URL 推导：`/`+`/workitems`=工作台、`/chats`+chat 任务=对话、`/tasks/:id` 看 task.mode）；顶栏删 logo（桌面 app 有 dock 图标、品牌冗余、回首页归胶囊）；`/chats` 落点页自动跳最近对话 / 空态新建

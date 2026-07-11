@@ -35,6 +35,7 @@ import "streamdown/styles.css";
 import { cn } from "@/lib/utils";
 import { MarkdownLink } from "@/components/markdown-link";
 import { MarkdownImage } from "@/components/ui/image-preview";
+import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
 
@@ -44,12 +45,20 @@ const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
 // remark 插件：**必须带上 Streamdown 内置的 defaultRemarkPlugins（含 remark-gfm）**——
 // 直接传 remarkPlugins 是整表替换、不追加、漏了 gfm 表格/删除线/autolink 全失效
-//（审计 P1 实锤）；我们两个自定义插件跟在其后
+//（审计 P1 实锤）；我们三个自定义插件跟在其后
 const REMARK_PLUGINS = [
   ...Object.values(defaultRemarkPlugins),
+  remarkCodeReference,
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
 ];
+// 操作栏精简（用户反馈「又有间距又有操作栏、太重」）：代码块只留复制、表格全关、
+// mermaid 留全屏 + 拖拽缩放（图表真需要）；行号也关（聊天场景不引用行号、纯噪音）
+export const STREAMDOWN_CONTROLS = {
+  code: { copy: true, download: false },
+  table: false,
+  mermaid: { copy: false, download: false, fullscreen: true, panZoom: true },
+} as const;
 // a/img 覆盖：我们的组件用宽松 props（string|Blob 等）、跟 Streamdown Components 的
 // 严格签名对不上、这里整体断言（运行时形状兼容、只是类型系统更严）
 const MARKDOWN_COMPONENTS = {
@@ -82,6 +91,9 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
       plugins={STREAMDOWN_PLUGINS}
       remarkPlugins={REMARK_PLUGINS}
       components={MARKDOWN_COMPONENTS}
+      controls={STREAMDOWN_CONTROLS}
+      // 行号视觉上不要（globals.css 藏 ::before 计数器）、但 **不能传 lineNumbers=false**：
+      // 上游该路径行 span 不带 block class 也不吐换行、整块代码塌成一行（headless 实测）
     >
       {text}
     </Streamdown>

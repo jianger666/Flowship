@@ -67,6 +67,7 @@ import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
   finalizeTask,
+  mergeTaskEvents,
   reopenTask,
   setActionExcluded,
   setTaskUiLayout,
@@ -96,7 +97,11 @@ import type {
   DevPushMode,
   ModelSelection,
   Task,
+  TaskEvent,
 } from "@/lib/types";
+
+// 打开任务默认只加载最近这么多条事件（更早的上拉分页、v1.0.x 事件懒加载）
+const EVENT_TAIL = 300;
 
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
@@ -134,18 +139,40 @@ const TaskDetailPage = () => {
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
   const { upsertTask } = useTaskList();
 
-  // ---- 拉一次任务详情 ----
+  // v1.0.x 事件懒加载：所有「服务端 task 快照 → 本地 state」都走 absorbTask、
+  // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
+  const absorbTask = useCallback((next: Task | null) => {
+    if (!next) {
+      setTask(null);
+      return;
+    }
+    setTask((prev) => mergeTaskEvents(prev, next));
+  }, []);
+
+  // v1.0.x：上拉分页拉到的更早事件、插到本地事件列表头部（按 id 去重）
+  const handlePrependEvents = useCallback((older: TaskEvent[]) => {
+    if (older.length === 0) return;
+    setTask((prev) => {
+      if (!prev) return prev;
+      const known = new Set(prev.events.map((e) => e.id));
+      const fresh = older.filter((e) => !known.has(e.id));
+      if (fresh.length === 0) return prev;
+      return { ...prev, events: [...fresh, ...prev.events] };
+    });
+  }, []);
+
+  // ---- 拉一次任务详情（只带最近 EVENT_TAIL 条、更早的上拉分页）----
   const refresh = useCallback(async () => {
     if (!id) return;
     try {
-      const t = await fetchTask(id);
-      setTask(t);
+      const t = await fetchTask(id, { tail: EVENT_TAIL });
+      absorbTask(t);
     } catch (err) {
       toast.error(`加载任务失败：${(err as Error).message}`);
     } finally {
       setLoaded(true);
     }
-  }, [id]);
+  }, [id, absorbTask]);
 
   useEffect(() => {
     void refresh();
@@ -210,7 +237,7 @@ const TaskDetailPage = () => {
           return { ...prev, events: [...prev.events, ev] };
         });
       },
-      onTaskUpdate: (t) => setTask(t),
+      onTaskUpdate: absorbTask,
       onActionUpdate: (action) => {
         // 单独 action 更新事件（status 变 / artifact 重写）→ 合并进 task.actions
         setTask((prev) => {
@@ -226,7 +253,7 @@ const TaskDetailPage = () => {
       },
       onDone: (t) => {
         setStreamingText("");
-        setTask(t);
+        absorbTask(t);
       },
       onAssistantDelta: (text) => setStreamingText((p) => p + text),
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
@@ -437,7 +464,7 @@ const TaskDetailPage = () => {
         );
       }
       const data = (await res.json()) as { task: Task; action: ActionRecord };
-      setTask(data.task);
+      absorbTask(data.task);
       setSelectedActionId(data.action.id);
       setAdvanceDialogOpen(false);
     } catch (err) {
@@ -461,7 +488,7 @@ const TaskDetailPage = () => {
     setStopping(true);
     try {
       const updated = await stopTask(task.id);
-      setTask(updated);
+      absorbTask(updated);
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
@@ -488,7 +515,7 @@ const TaskDetailPage = () => {
         action.id,
         !action.excluded,
       );
-      setTask(updated);
+      absorbTask(updated);
     } catch (err) {
       toast.error(`操作失败：${(err as Error).message}`);
     }
@@ -511,7 +538,7 @@ const TaskDetailPage = () => {
     setStarting(true);
     try {
       const updated = await finalizeTask(task.id, finalStatus);
-      setTask(updated);
+      absorbTask(updated);
       if (finalStatus === "abandoned") toast.success("任务已放弃");
     } catch (err) {
       toast.error(`终结失败：${(err as Error).message}`);
@@ -533,7 +560,7 @@ const TaskDetailPage = () => {
     setStarting(true);
     try {
       const updated = await reopenTask(task.id);
-      setTask(updated);
+      absorbTask(updated);
       // 终态时订阅已按「终态 done」停掉（V0.11.6 语义）、恢复后要强制重订阅
       setWatchEpoch((n) => n + 1);
     } catch (err) {
@@ -550,7 +577,7 @@ const TaskDetailPage = () => {
       <div className="flex h-full flex-col">
         <ChatView
           task={task}
-          onTaskUpdate={setTask}
+          onTaskUpdate={absorbTask}
           onEventAppend={(ev) => {
             setTask((prev) => {
               if (!prev) return prev;
@@ -558,6 +585,7 @@ const TaskDetailPage = () => {
               return { ...prev, events: [...prev.events, ev] };
             });
           }}
+          onPrependEvents={handlePrependEvents}
         />
       </div>
     );
@@ -746,8 +774,8 @@ const TaskDetailPage = () => {
 
         {/* 上下文文档 + MCP + 批次：都是 chip + 点开 dialog、同一行、不各占一行 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <ContextDocsPanel task={task} onTaskUpdate={setTask} />
-          <TaskMcpPanel task={task} onTaskUpdate={setTask} />
+          <ContextDocsPanel task={task} onTaskUpdate={absorbTask} />
+          <TaskMcpPanel task={task} onTaskUpdate={absorbTask} />
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
         </div>
@@ -856,10 +884,11 @@ const TaskDetailPage = () => {
                   task={task}
                   streamingText={streamingText}
                   hideReplyComposer
+                  onPrependEvents={handlePrependEvents}
                 />
               </div>
               {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
-              <TaskTalkComposer task={task} onTaskUpdate={setTask} />
+              <TaskTalkComposer task={task} onTaskUpdate={absorbTask} />
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>

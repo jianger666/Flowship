@@ -46,12 +46,15 @@ interface Props {
   // 父组件持 task state、ChatView 把最新 task / event 推回去（SSE 增量驱动）
   onTaskUpdate: (next: Task) => void;
   onEventAppend: (ev: TaskEvent) => void;
+  // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
+  onPrependEvents?: (events: TaskEvent[]) => void;
 }
 
 export const ChatView = ({
   task,
   onTaskUpdate,
   onEventAppend,
+  onPrependEvents,
 }: Props) => {
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
@@ -242,6 +245,7 @@ export const ChatView = ({
           isRunning={task.runStatus === "running"}
           onStop={handleStop}
           stopping={stopping}
+          onPrependEvents={onPrependEvents}
           composerLeading={
             <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
           }

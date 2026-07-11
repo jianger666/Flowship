@@ -982,6 +982,12 @@ export interface Task {
   model?: ModelSelection;
   uiLayout?: { artifactPanelSize?: number };
   events: TaskEvent[];
+  /**
+   * v1.0.x 事件懒加载：本 Task object 的 events 是「尾部切片」（不是全量）——
+   * 服务端 GET ?tail=N / watch-task bootstrap 切片时置 true、客户端据此启用「上拉加载更早」。
+   * 运行时字段、不落盘（meta.json 没有它）。
+   */
+  eventsTruncated?: boolean;
 }
 
 /**

@@ -32,11 +32,20 @@ interface Ctx {
   params: Promise<{ id: string }>;
 }
 
-export const GET = async (_req: Request, { params }: Ctx) => {
+export const GET = async (req: Request, { params }: Ctx) => {
   try {
     const { id } = await params;
     const task = await getTask(id);
     if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
+    // v1.0.x 事件懒加载：?tail=N 只带最近 N 条事件（长对话打开慢的主因是全量事件传输 + 渲染）。
+    // 切了片就置 eventsTruncated、客户端据此开「上拉加载更早」；更早的走 GET events?before= 分页。
+    const tailRaw = new URL(req.url).searchParams.get("tail");
+    const tail = tailRaw ? Number.parseInt(tailRaw, 10) : NaN;
+    if (Number.isFinite(tail) && tail > 0 && task.events.length > tail) {
+      return NextResponse.json({
+        task: { ...task, events: task.events.slice(-tail), eventsTruncated: true },
+      });
+    }
     return NextResponse.json({ task });
   } catch (err) {
     console.error("[GET /api/tasks/[id]] failed", err);

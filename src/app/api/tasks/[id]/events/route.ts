@@ -1,11 +1,13 @@
 /**
- * POST /api/tasks/[id]/events
+ * /api/tasks/[id]/events
  *
- * V0.6：只支持追加事件。状态推进 / 切换走 /advance、/action-ack、/finalize。
+ * GET（v1.0.x 事件懒加载）：分页拉「某条事件之前」的更早历史
+ *   query：before=<eventId>（必填、锚点）、limit=<N>（默认 300）
+ *   返回：{ events, hasMore }——events 按时间正序、紧邻 before 之前的 N 条
  *
- * 替代 V0.5 路由：events（原来支持 patch + event 二合一、phase 维度）
+ * POST：只支持追加事件。状态推进 / 切换走 /advance、/finalize。
  *
- * # Body
+ * # POST Body
  *
  * ```
  * {
@@ -18,12 +20,48 @@
  *
  * # 用途
  *
- * 给 UI / 调试 / 老 V0.5 task 调试视图用、agent 自己写事件走 task-runner.writeEventAndPublish。
+ * 给 UI / 调试用、agent 自己写事件走 task-runner.writeEventAndPublish。
  */
 
 import { NextResponse } from "next/server";
-import { appendEvent } from "@/lib/server/task-fs";
+import { appendEvent, getTask } from "@/lib/server/task-fs";
 import type { EventKind } from "@/lib/types";
+
+const DEFAULT_PAGE = 300;
+
+export const GET = async (req: Request, { params }: Ctx) => {
+  try {
+    const { id } = await params;
+    const url = new URL(req.url);
+    const before = url.searchParams.get("before") ?? "";
+    if (!before) {
+      return NextResponse.json({ error: "before 必填" }, { status: 400 });
+    }
+    const limitRaw = url.searchParams.get("limit");
+    const limitParsed = limitRaw ? Number.parseInt(limitRaw, 10) : NaN;
+    const limit =
+      Number.isFinite(limitParsed) && limitParsed > 0
+        ? Math.min(limitParsed, 2000)
+        : DEFAULT_PAGE;
+
+    const task = await getTask(id);
+    if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
+
+    const idx = task.events.findIndex((e) => e.id === before);
+    if (idx < 0) {
+      // 锚点不存在（事件被清 / id 错）——按「没有更早」处理、别 404 打断 UI
+      return NextResponse.json({ events: [], hasMore: false });
+    }
+    const start = Math.max(0, idx - limit);
+    return NextResponse.json({
+      events: task.events.slice(start, idx),
+      hasMore: start > 0,
+    });
+  } catch (err) {
+    console.error("[GET /api/tasks/[id]/events] failed", err);
+    return NextResponse.json({ error: "bad_request" }, { status: 400 });
+  }
+};
 
 const VALID_KINDS: EventKind[] = [
   "info",

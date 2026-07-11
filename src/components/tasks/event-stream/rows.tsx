@@ -10,7 +10,7 @@
  *   - AskUserRequestRow：ask_user 事件历史回放卡（V0.3.2 起交互移到 modal、这里只放历史）
  */
 
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   Ban,
   CheckCircle2,
@@ -21,9 +21,13 @@ import {
   Loader2,
   PencilLine,
   Plug,
+  RotateCcw,
+  Send,
   Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { MarkdownText } from "@/components/markdown-text";
 import {
   ImageThumb,
@@ -32,7 +36,8 @@ import {
 import { isAskSuperseded } from "@/lib/ask-pending";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { pathBasename } from "@/lib/path-utils";
-import { useJumpIde } from "@/hooks/use-settings";
+import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
+import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
 import { ACTION_LABEL_SHORT } from "@/lib/task-display";
 import {
   JUMP_IDE_LABEL,
@@ -229,7 +234,7 @@ const EventRowImpl = ({
   taskId,
   task,
   variant = "log",
-  onEditResend,
+  onResend,
 }: {
   ev: TaskEvent;
   taskId: string;
@@ -237,15 +242,27 @@ const EventRowImpl = ({
   // log：task 模式事件流（卡片 + header + 折叠、信息密度优先）
   // chat：自由模式对话（V0.7.11、Cursor agent window 风格——AI 平铺 / 用户浅色块 / 过程细行）
   variant?: "log" | "chat";
-  // v1.0：chat 用户消息「编辑重发」（手动停止 / 断网后想改内容重发）——
-  // 点击把原文填回输入框、hover 才显按钮；不传不显示
-  onEditResend?: (text: string) => void;
+  // v1.0：chat「最后一条用户消息」的重发 / 原地编辑（手动停止 / 断网后想改一下重说）——
+  // hover 出两个 icon：↻ 原样重发、✎ 原地编辑后发；都是「发一条新消息到末尾」（架构是
+  // 持久会话 append-only、做不了 ChatGPT 那种 fork 截断）；只有最后一条用户消息才传（父组件把关）
+  onResend?: (text: string) => void;
 }) => {
   // V0.6：用 actionId 查 action 类型、渲染 tag
   const action = ev.actionId
     ? task.actions.find((a) => a.id === ev.actionId)
     : undefined;
   const actionType: ActionType | undefined = action?.type;
+
+  // 原地编辑态（仅 chat 用户消息 + onResend 存在时有意义）：
+  // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
+  // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、蓝军 P1：别写死）
+  const submitShortcut = useSubmitShortcut();
+  // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
+  useEffect(() => {
+    if (!onResend) setEditing(false);
+  }, [onResend]);
 
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
@@ -339,21 +356,75 @@ const EventRowImpl = ({
         </div>
       );
     }
-    // 用户消息：浅色圆角块 + 附件（hover 右上角出「编辑重发」、v1.0）
+    // 用户消息：浅色圆角块 + 附件；最后一条 hover 右上角出「重发 / 编辑」两 icon（v1.0）
     if (isUser) {
+      // 原地编辑态：气泡整体换成 textarea + 取消 / 发送（对齐 ChatGPT / Claude 的编辑交互；
+      // 语义是「编辑后作为新消息发到末尾」、原消息保留、不是 fork）
+      if (editing && onResend) {
+        const trimmed = editDraft.trim();
+        const submitEdit = () => {
+          if (!trimmed) return;
+          setEditing(false);
+          onResend(trimmed);
+        };
+        return (
+          <div className="rounded-lg border border-ring/60 bg-muted/40 p-2 shadow-sm">
+            <Textarea
+              value={editDraft}
+              onChange={(e) => setEditDraft(e.target.value)}
+              autoFocus
+              className="max-h-64 min-h-[52px] resize-none border-none bg-transparent p-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  setEditing(false);
+                  return;
+                }
+                // 提交快捷键跟设置页偏好一致（helper 内部已处理 IME / enter vs mod-enter）
+                if (shouldSubmitOnKeyDown(e, submitShortcut)) {
+                  e.preventDefault();
+                  submitEdit();
+                }
+              }}
+            />
+            <div className="mt-1 flex items-center justify-end gap-1.5">
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setEditing(false)}>
+                取消
+              </Button>
+              <Button size="sm" className="h-7 text-xs" disabled={!trimmed} onClick={submitEdit}>
+                <Send className="size-3" />
+                发送
+              </Button>
+            </div>
+          </div>
+        );
+      }
       return (
         <div className="group relative rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
-          {onEditResend && (
-            <button
-              type="button"
-              onClick={() => onEditResend(ev.text)}
-              title="编辑后重发（原消息保留）"
-              aria-label="编辑后重发"
-              className="absolute -top-2.5 right-2 flex cursor-pointer items-center gap-1 rounded-md border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground group-hover:opacity-100"
-            >
-              <PencilLine className="size-3" />
-              编辑重发
-            </button>
+          {onResend && (
+            <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+              <button
+                type="button"
+                onClick={() => onResend(ev.text)}
+                title="原样重发这条消息"
+                aria-label="重发"
+                className="flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <RotateCcw className="size-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setEditDraft(ev.text);
+                  setEditing(true);
+                }}
+                title="编辑后重发（原消息保留）"
+                aria-label="编辑后重发"
+                className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <PencilLine className="size-3" />
+              </button>
+            </div>
           )}
           <div className="text-sm leading-relaxed">
             <MarkdownText text={ev.text} />
