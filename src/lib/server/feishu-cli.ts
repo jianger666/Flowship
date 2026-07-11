@@ -283,34 +283,48 @@ const installMeegle = async (log: (line: string) => void): Promise<void> => {
 
 // ----------------- 安装：官方 Agent Skills -----------------
 
-// 两个仓库的 skills/ 目录随主分支 tarball 拉（codeload 直连、失败不阻断 CLI 安装）
+// 两个官方仓的 skills/ 目录、**钉 commit SHA 拉**（v1.0.x 供应链加固、用户拍板「风险点处理掉」）：
+// 官方不打 tag、原来跟可变 main——仓库/账号被攻破时注入内容会直接进 agent prompt（持久
+// 供应链面）。钉 SHA = 内容不可变（commit sha 即内容哈希）、每次升级由我们人工审后改这里。
+// 升级方式：确认新 commit 内容 OK → 更新 commit 字段 → 用户点「检查更新」重装 skills。
 const SKILLS_SOURCES = [
   {
     name: "lark-cli",
-    tarball: "https://codeload.github.com/larksuite/cli/tar.gz/refs/heads/main",
-    // tarball 顶层目录名（github 规则：<repo>-<ref>）
-    topDir: "cli-main",
+    repo: "larksuite/cli",
+    // 2026-07-10 main（人工核过 skills/ 目录内容）
+    commit: "452734f82443f9decd8a7a34f17ae169c7ae2b50",
   },
   {
     name: "meegle",
-    tarball: "https://codeload.github.com/larksuite/meegle-cli/tar.gz/refs/heads/main",
-    topDir: "meegle-cli-main",
+    repo: "larksuite/meegle-cli",
+    // 2026-07-07 main（人工核过 skills/ 目录内容）
+    commit: "674042f0f58b62962103aff91598c9bc85ccb138",
   },
 ] as const;
 
+// 解包后动态找顶层目录（github tarball 顶层名 = <repo>-<sha>、不再硬编码）
+const findSingleTopDir = async (staging: string): Promise<string | null> => {
+  const entries = await fs.readdir(staging, { withFileTypes: true }).catch(() => []);
+  const dirs = entries.filter((e) => e.isDirectory());
+  return dirs.length === 1 ? path.join(staging, dirs[0].name) : null;
+};
+
 const installSkills = async (log: (line: string) => void): Promise<void> => {
-  // ⚠️ 剩余风险（CR-05）：两个官方仓都不打 tag / release、只能跟可变 main 分支——
-  // 无法固定 commit / 验签、仓库或账号被攻破时 skills 内容可被注入（skills 会进
-  // agent prompt、等于持久 prompt 供应链面）。本地已做的加固：私有 mkdtemp 下载
-  // 解包 + staging 后原子替换（不会装半截）。官方开始发 tag 后应改为固定版本拉取。
+  // 供应链加固（CR-05 收尾）：钉 commit SHA 拉（不可变）+ 私有 mkdtemp 下载解包 +
+  // staging 后原子替换（不会装半截）。官方开始发 tag 后可改为跟版本 tag。
   for (const srcDef of SKILLS_SOURCES) {
     const tmpDir = await makePrivateTmpDir(`${srcDef.name}-skills`);
     try {
       const tmp = path.join(tmpDir, "repo.tgz");
-      await downloadTo(srcDef.tarball, tmp);
+      await downloadTo(
+        `https://codeload.github.com/${srcDef.repo}/tar.gz/${srcDef.commit}`,
+        tmp,
+      );
       const staging = path.join(tmpDir, "extract");
       await extractArchive(tmp, staging);
-      const skillsSrc = path.join(staging, srcDef.topDir, "skills");
+      const topDir = await findSingleTopDir(staging);
+      if (!topDir) throw new Error("tarball 结构异常：顶层不是单目录");
+      const skillsSrc = path.join(topDir, "skills");
       const entries = await fs.readdir(skillsSrc, { withFileTypes: true }).catch(() => []);
       let count = 0;
       await fs.mkdir(getToolsSkillsDir(), { recursive: true });
