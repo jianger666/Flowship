@@ -60,13 +60,14 @@ export const BrandMark = ({
       />
       <circle cx="13" cy="33" r="2.2" fill="var(--background)" />
       <circle cx="34" cy="12" r="2.2" fill="var(--background)" />
-      {/* loading 电流：一段亮白电流沿闪电轮廓环流（pathLength=100 归一、dash 动画见 globals） */}
+      {/* loading 电流：一段亮电流沿闪电轮廓环流（pathLength=100 归一、dash 动画见 globals）；
+          颜色随主题变量（浅色深琥珀 / 深色近白暖光、白底下白电流看不清——用户实测） */}
       {animated && (
         <path
           className="brand-current"
           d="M27 4 L10 27 H21 L18 44 L38 19 H26 Z"
           pathLength={100}
-          stroke="#fff7e0"
+          stroke="var(--brand-current-color)"
           strokeWidth="2.6"
           strokeLinejoin="round"
           strokeLinecap="round"

@@ -29,6 +29,8 @@ const HeroLoading = ({ label, className }: { label: string; className?: string }
   <div
     className={cn(
       "flex h-full min-h-[60vh] flex-col items-center justify-center gap-4",
+      // 延迟 250ms 出场（globals.css hero-appear）：秒开路径整个 loading 不闪现（用户实测）
+      "hero-appear",
       className,
     )}
     role="status"

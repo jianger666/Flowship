@@ -269,6 +269,25 @@
   transform-origin: 24px 24px;
   animation: brand-glow-breathe 1.8s ease-in-out infinite;
 }
+/* 电流颜色随主题（用户实测：浅色下白电流贴白底看不清）——
+   浅色用深琥珀焦糖、深色用近白暖光；BrandMark stroke 引用本变量 */
+:root {
+  --brand-current-color: oklch(0.45 0.13 55);
+}
+.dark {
+  --brand-current-color: #fff7e0;
+}
+/* 延迟出场（用户实测：秒开页面 loading 闪一下就没、很突兀）——
+   前 250ms 完全不可见、真要等才浮现；快路径整个 loading 不闪 */
+.hero-appear {
+  opacity: 0;
+  animation: hero-appear 0.2s ease-out 0.25s forwards;
+}
+@keyframes hero-appear {
+  to {
+    opacity: 1;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .brand-current {
     animation: none;
@@ -277,6 +296,10 @@
   }
   .brand-glow {
     animation: none;
+  }
+  .hero-appear {
+    animation: none;
+    opacity: 1;
   }
 }
 
