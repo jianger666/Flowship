@@ -24,7 +24,7 @@ interface LoadingStateProps {
   label?: string;
   className?: string;
   /**
-   * hero 专用：跳过 250ms 延迟出场、立即可见。
+   * hero 专用：跳过 200ms 延迟出场、立即可见。
    * 启动链（首页 gate → 看板拉取）连续两段 loading 都带延迟会「亮-灭-亮」闪几下
    *（用户实测）——必然要等的场景用 immediate、只有「大概率秒开」的路径保留延迟防闪现。
    * 注意只在启动窗口内生效（见 APP_BOOT_TS）。

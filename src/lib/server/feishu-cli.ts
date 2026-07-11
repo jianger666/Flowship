@@ -389,6 +389,9 @@ const G = globalThis as unknown as {
   // 状态快照缓存 + 后台刷新 single-flight（v1.1.x 启动提速、见「状态探测」节）
   __feishuStatusCache?: StatusSnapshot | null;
   __feishuStatusRefreshing?: Promise<StatusSnapshot> | null;
+  // 缓存代数（蓝军 P1）：invalidate 递增、in-flight 探测落盘前核对——
+  // 失效前发起的旧探测结果不写回缓存（否则装完/登完立刻被旧快照覆盖）
+  __feishuStatusGen?: number;
 };
 
 /**
@@ -569,6 +572,8 @@ export const startLogin = async (
     child.on("error", (err) => {
       state.running = false;
       state.error = err.message;
+      // spawn 失败也可能是环境变了（bin 被删等）：一并失效状态缓存（蓝军 P2）
+      invalidateStatusCache();
     });
     return { ok: true };
   } catch (err) {
@@ -698,27 +703,37 @@ const statusCacheFile = (): string => path.join(getToolsDir(), "status-cache.jso
 // 后台真探测 + 落双缓存（single-flight：并发 GET 只探一次）
 const refreshStatusCache = (): Promise<StatusSnapshot> => {
   if (G.__feishuStatusRefreshing) return G.__feishuStatusRefreshing;
-  G.__feishuStatusRefreshing = (async () => {
+  const gen = (G.__feishuStatusGen ??= 0);
+  const flight: Promise<StatusSnapshot> = (async () => {
     try {
       const snap = await probeStatusNow();
-      G.__feishuStatusCache = snap;
-      try {
-        await fs.mkdir(getToolsDir(), { recursive: true });
-        await fs.writeFile(statusCacheFile(), JSON.stringify(snap));
-      } catch {
-        /* 缓存写不进不影响功能 */
+      // 探测期间被 invalidate（装/登/卸完成）→ 本结果基于旧世界、丢弃不落盘
+      if (G.__feishuStatusGen === gen) {
+        G.__feishuStatusCache = snap;
+        try {
+          await fs.mkdir(getToolsDir(), { recursive: true });
+          await fs.writeFile(statusCacheFile(), JSON.stringify(snap));
+        } catch {
+          /* 缓存写不进不影响功能 */
+        }
       }
       return snap;
     } finally {
-      G.__feishuStatusRefreshing = null;
+      // 条件注销（按代数比对）：没被 invalidate 时当前 flight 只有自己、清掉；
+      // 被 invalidate 过则引用已被清（可能已有新 flight 顶上）、不动别人的
+      if (G.__feishuStatusGen === gen) G.__feishuStatusRefreshing = null;
     }
   })();
-  return G.__feishuStatusRefreshing;
+  G.__feishuStatusRefreshing = flight;
+  return flight;
 };
 
 // 安装 / 登录 / 卸载后调：下一次 GET 走真探测（用户正守着设置页、等真值可接受）
 const invalidateStatusCache = (): void => {
+  G.__feishuStatusGen = (G.__feishuStatusGen ?? 0) + 1;
   G.__feishuStatusCache = null;
+  // 放弃 in-flight（其结果代数已过期、落盘会被上面的核对拦住；引用清空让下次真探）
+  G.__feishuStatusRefreshing = null;
   void fs.rm(statusCacheFile(), { force: true }).catch(() => {});
 };
 

@@ -236,6 +236,9 @@ export const ChatView = ({
       {/* 中间区：EventStream（chat 形态：窄列对话流 + 圆角输入岛）+ 底部输入框 */}
       <div className="min-h-0 flex-1">
         <EventStream
+          // 切对话时强制重挂（蓝军 P1）：Virtuoso 的 initialTopMostItemIndex 只在 mount
+          // 生效、不重挂则滚动位置记忆恢复失效（task 模式的三栏布局本来就按 task.id 重挂、对齐）
+          key={task.id}
           task={task}
           variant="chat"
           streamingText={streamingText}
