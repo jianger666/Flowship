@@ -33,6 +33,7 @@ export const GitLabSection = ({
     <SettingRow
       stacked
       label="GitLab Token"
+      hint="Personal Access Token、需要 api 权限"
       control={
         <div className="flex gap-2">
           <Input

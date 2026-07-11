@@ -111,6 +111,7 @@ export const PreferenceSections = ({
     <div className="divide-y">
       <SettingRow
         label="代码跳转 IDE"
+        hint="路径链接 / 打开工作区用哪个"
         control={
           <Select
             value={jumpIde}
@@ -142,6 +143,7 @@ export const PreferenceSections = ({
 
       <SettingRow
         label="提交快捷键"
+        hint="聊天 / 推进输入框的发送方式"
         control={
           <Select
             value={submitShortcut}
@@ -198,7 +200,7 @@ export const PreferenceSections = ({
             value={branchTemplate}
             onChange={(e) => onBranchTemplateChange(e.target.value)}
             onBlur={() => onBranchTemplateCommit(branchTemplate)}
-            placeholder="留空默认 feature/{storyId}-{taskTitle}"
+            placeholder="留空默认 feature/{storyId}-{taskTitle}（想带名字直接写、如 feature/clj/…）"
             className="font-mono"
           />
         }
@@ -207,11 +209,14 @@ export const PreferenceSections = ({
       <SettingRow
         stacked
         label="默认模型"
-        // 只在拉列表报错时给 hint、正常态标题自解释（文案简洁原则）
         hint={
           modelsError ? (
             <span className="text-destructive">{modelsError}</span>
-          ) : undefined
+          ) : models.length > 0 ? (
+            `共 ${models.length} 个可用模型`
+          ) : (
+            "新任务 / 对话的默认 AI"
+          )
         }
         labelExtra={
           <Button
