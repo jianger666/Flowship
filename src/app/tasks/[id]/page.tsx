@@ -334,7 +334,7 @@ const TaskDetailPage = () => {
   );
 
   if (!loaded) {
-    return <LoadingState variant="block" />;
+    return <LoadingState variant="hero" />;
   }
 
   if (!task) {

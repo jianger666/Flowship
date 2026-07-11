@@ -162,7 +162,7 @@ const SettingsPage = () => {
   );
 
   if (!loaded) {
-    return <LoadingState variant="block" />;
+    return <LoadingState variant="hero" />;
   }
 
   // 返回 = 回来路（任务详情 / 首页都可能）、无历史（直开 /settings）兜底回首页
@@ -191,14 +191,14 @@ const SettingsPage = () => {
             {item.label}
           </button>
         ))}
-        {/* 能力入口：MCP / Skill / Action 已迁能力页、留个去处 */}
+        {/* 能力入口指路（MCP / Skill / Action 已迁能力页；文案短、用户点名「太长」） */}
         <div className="mt-3 border-t pt-2">
           <button
             type="button"
             onClick={() => router.push("/actions")}
             className="w-full cursor-pointer rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
           >
-            能力（Action / Skill / MCP）→
+            能力 →
           </button>
         </div>
       </nav>

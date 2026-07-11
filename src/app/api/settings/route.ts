@@ -80,18 +80,13 @@ export const PUT = async (req: Request): Promise<Response> => {
     const dir = dataRoot();
     await fs.mkdir(dir, { recursive: true });
     const finalPath = configPath();
-    // 密钥只升不降守卫（v1.0.x 真实事故：stale cache 整对象 PUT 把盘上 apiKey 清空）：
-    // 进来的 apiKey / gitToken 为空或带脱敏掩码、而盘上有真值 → 保留盘上值
+    // 掩码值兜底（不是「防清空」守卫——用户拍板「自己清 key 是合法操作、别拦」）：
+    // 只拦「client 误把脱敏展示值当真值回写」这一种明确的坏数据；清空放行
     const current = await readSettingsFile();
-    const { settings: guarded, preserved } = preserveSecretsOnPut(
+    const { settings: guarded } = preserveSecretsOnPut(
       body as Record<string, unknown>,
       current,
     );
-    if (preserved.length > 0) {
-      console.warn(
-        `[/api/settings] PUT 带空/掩码密钥字段（${preserved.join(", ")}）、已保留盘上真值（防 stale cache 覆盖）`,
-      );
-    }
     const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
       .toString(36)
       .slice(2)}`;

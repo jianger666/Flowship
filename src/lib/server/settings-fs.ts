@@ -54,15 +54,10 @@ export const maskSettingsSecrets = (
 const MASK_MARKER = "已脱敏";
 
 /**
- * PUT 守卫：**密钥字段只升不降**（v1.0.x、真实事故复盘）。
+ * PUT 掩码兜底：进来的 apiKey / gitToken 带脱敏掩码（maskSecret 产物）→ 保留盘上真值。
  *
- * 事故：test 实例 config.json 的 apiKey 被清空、其余字段完好——整对象 PUT 的
- * lost-update：某个会话的内存 cache 缺 apiKey（initSettings 失败退 localStorage 兜底 /
- * 旧同步脚本没带密钥等）、之后任意一次「编辑即保存」把整份 stale cache 落盘、盘上密钥没了。
- *
- * 守卫规则：进来的 apiKey / gitToken 为空或带脱敏掩码、而盘上有真值 → 保留盘上值。
- * 代价：想「清空」密钥清不掉（只能覆盖成新值）——真实工作流里不存在清空需求、
- * 而静默丢密钥是灾难（agent 全挂、用户完全无感知），不对称性明显、值得。
+ * 只拦「client 误把脱敏展示值当真值回写」这一种明确坏数据——掩码串写进盘、agent 直接全挂。
+ * **空值不拦**（用户拍板「自己清 key 是合法操作」）：清空放行。
  */
 export const preserveSecretsOnPut = (
   incoming: Record<string, unknown>,
@@ -75,7 +70,7 @@ export const preserveSecretsOnPut = (
     const cur = typeof current[key] === "string" ? (current[key] as string) : "";
     if (!cur) continue; // 盘上本来就没有、不管
     const inc = typeof out[key] === "string" ? (out[key] as string) : "";
-    if (!inc.trim() || inc.includes(MASK_MARKER)) {
+    if (inc.includes(MASK_MARKER)) {
       out[key] = cur;
       preserved.push(key);
     }

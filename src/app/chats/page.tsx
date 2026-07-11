@@ -38,10 +38,10 @@ const ChatsPage = () => {
     router.replace(`/tasks/${latest.id}`);
   }, [loaded, chats, router]);
 
-  if (!loaded) return <LoadingState variant="block" />;
+  if (!loaded) return <LoadingState variant="hero" />;
 
   // 有对话时 effect 会跳走、这里只在「一条对话都没有」时真正渲染
-  if (chats.length > 0) return <LoadingState variant="block" />;
+  if (chats.length > 0) return <LoadingState variant="hero" />;
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8">

@@ -230,6 +230,58 @@
   border: none;
   border-radius: 0.5rem;
 }
+/* ---------- Hero loading（v1.0.x、用户点名「做个炫酷的 loading、后续都可以使用」） ----------
+   签名装置 = 迷你甘特骨架：几根排期条流光呼吸 + 一根「今天线」左右扫描——
+   属于本产品（首页就是排期甘特）的 loading、比通用 spinner 有身份。
+   实现全 CSS（无 JS 帧）、prefers-reduced-motion 下停动画只留静态骨架。 */
+@keyframes hero-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+@keyframes hero-sweep {
+  0%,
+  100% {
+    left: 12%;
+  }
+  50% {
+    left: 88%;
+  }
+}
+@keyframes hero-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.hero-loading-bar {
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklch, var(--muted-foreground) 14%, transparent) 25%,
+    color-mix(in oklch, var(--muted-foreground) 34%, transparent) 50%,
+    color-mix(in oklch, var(--muted-foreground) 14%, transparent) 75%
+  );
+  background-size: 200% 100%;
+  animation:
+    hero-shimmer 2.2s linear infinite,
+    hero-breathe 2.2s ease-in-out infinite;
+}
+.hero-loading-sweep {
+  animation: hero-sweep 3.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-loading-bar,
+  .hero-loading-sweep {
+    animation: none;
+  }
+}
+
 /* 代码块内层（padding 在 code-block-body 包裹层上、不在 pre 上）：p-4 → 收一档、
    字号跟聊天正文对齐 */
 .prose [data-streamdown="code-block-body"] {

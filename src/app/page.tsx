@@ -15,7 +15,7 @@ import { LoadingState } from "@/components/ui/loading-state";
 
 const HomePage = () => {
   const gate = useSetupGate();
-  if (gate.loading) return <LoadingState variant="block" />;
+  if (gate.loading) return <LoadingState variant="hero" />;
   if (!gate.ready) return <SetupChecklist gate={gate} />;
   return <FeishuBoard />;
 };
