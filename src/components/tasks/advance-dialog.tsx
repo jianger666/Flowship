@@ -107,7 +107,8 @@ const inferDisabledReason = (
   //   设置页刚配的 dev 分支也能即时放行联调 chip（server advance 时会 refreshRepoBranches 同步准入、两边一致）
   ctx: {
     host?: string;
-    resolvedHost?: string;
+    // undefined = 推导请求飞行中（不警告）、null = 推导完成没推出来、string = 推出来了
+    resolvedHost?: string | null;
     token?: string;
     devBranches?: Record<string, string>;
   } = {},
@@ -124,6 +125,8 @@ const inferDisabledReason = (
       return null;
     case "ship":
       if (!effectiveHost) {
+        // 推导请求还在飞（undefined）：不闪警告——server 推进时会再推一次、真推不出那边拦
+        if (!ctx.host && ctx.resolvedHost === undefined) return null;
         // Host 无输入框（v1.0.x 删）、只能自动推导——推不出说明仓库没配 origin remote
         return <>未能从仓库 remote 推导 GitLab 地址、检查仓库是否配了 origin</>;
       }
@@ -336,8 +339,10 @@ export const AdvanceDialog = ({
   const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
     {},
   );
-  // settings 未填 host 时、从 task 仓库 remote 自动推导（跟 server resolveEffectiveGitHost 对齐）
-  const [resolvedGitHost, setResolvedGitHost] = useState<string | undefined>();
+  // settings 未填 host 时、从 task 仓库 remote 自动推导（跟 server resolveEffectiveGitHost 对齐）。
+  // 三态：undefined = 推导请求飞行中（ship 不显警告、防打开瞬间闪一下误报）、
+  //       null = 推导完成但没推出来（真警告）、string = 推出来了
+  const [resolvedGitHost, setResolvedGitHost] = useState<string | null | undefined>();
   // V0.x：设置页实时 dev 分支快照（per-repo、本 task 各仓）——dialog 打开瞬间读、供联调 chip 准入判断。
   //   不实时同步（开 dialog 中途改设置页极少）、跟 gitConfig 同套路。
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
@@ -413,9 +418,13 @@ export const AdvanceDialog = ({
       void fetch(`/api/repo-remote-meta?paths=${q}`)
         .then((r) => r.json())
         .then((d: { host?: string | null }) =>
-          setResolvedGitHost(d.host?.trim() || undefined),
+          // null = 推导完成但没推出来（真警告）；飞行中保持 undefined 不警告
+          setResolvedGitHost(d.host?.trim() || null),
         )
-        .catch(() => setResolvedGitHost(undefined));
+        .catch(() => setResolvedGitHost(null));
+    } else if (!s.gitHost?.trim()) {
+      // 没仓库可推：直接定格「推不出」
+      setResolvedGitHost(null);
     }
     // 读设置页最新 dev 分支（只收本 task 各仓 + 非空）——联调 chip 准入用实时值、不被 task 旧快照挡住
     const devMap: Record<string, string> = {};
