@@ -906,12 +906,13 @@ const TaskDetailPage = () => {
         submitting={starting}
       />
 
-      {/* V0.6.6 编辑任务 dialog */}
+      {/* V0.6.6 编辑任务 dialog；onSaved 走 absorbTask（发版前蓝军 P1：直接 setTask 会被
+          PATCH 响应的全量 events 冲掉已分页历史、懒加载契约打穿） */}
       <EditTaskDialog
         open={editDialogOpen}
         onOpenChange={setEditDialogOpen}
         task={task}
-        onSaved={setTask}
+        onSaved={absorbTask}
       />
     </div>
   );

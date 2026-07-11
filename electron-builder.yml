@@ -47,9 +47,11 @@ artifactName: "fe-ai-flow-${version}-${os}-${arch}.${ext}"
 
 win:
   target: nsis
-  # Windows 不像 macOS Tahoe 会自动给图标加圆角遮罩——给 win 单独一个预圆角 squircle
-  # （透明角 = 任务栏/桌面显示成圆角）。mac 继续用 packaging/icon.png 满幅方块（自动检测）、
-  # Tahoe 自己加圆角且不垫白底；若 mac 也共用透明角图标会被 Tahoe 垫成白底方块（v0.7.x 踩过）。
+  # Windows 不会自动给图标加圆角——win 用满画布预圆角（透明角）；
+  # mac 用 packaging/icon.png = Big Sur 官方模板（1024 画布 + 824 squircle 居中留白）：
+  # pre-Tahoe 原样显示即标准圆角、Tahoe 识别标准形状自动适配（v1.0.x 换 logo 时定稿；
+  # 注意不能用「满画布预圆角」——非标准形状会被 Tahoe 垫成白底方块、v0.7.x 踩过）。
+  # 图标产出：node scripts/brand/render-icons.mjs（模板 scripts/brand/icon-template.html）
   icon: icon-win.png
 
 nsis:

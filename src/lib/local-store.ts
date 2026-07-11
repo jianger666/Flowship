@@ -248,16 +248,22 @@ export const initSettings = (): Promise<void> => {
     try {
       // 全量口（含明文密钥、仅 loopback）——默认 /api/settings 已脱敏、灌 cache 必须真值
       const res = await fetch(API_FULL);
+      // 非 2xx（middleware 拦 / 服务端异常）必须 throw 走重试——否则 body 没有 exists
+      // 字段会被误判成「首次升级」、把默认空 cache 整包 PUT 上去（发版前蓝军 P1）
+      if (!res.ok) throw new Error(`GET ${API_FULL} HTTP ${res.status}`);
       const data = (await res.json()) as {
         exists?: boolean;
         settings?: unknown;
       };
       if (data.exists && data.settings) {
         cache = normalizeSettings(data.settings as Partial<FeAiFlowSettings>);
-      } else {
-        // 首次升级：把当前缓存（localStorage 旧配置 / 默认）迁移进 config.json；
-        // server 会在落盘后补跑 MCP 迁移、putSettings 内部回填快照进 cache
+      } else if (data.exists === false) {
+        // 明确「文件不存在」才算首次升级：把当前缓存（localStorage 旧配置 / 默认）
+        // 迁移进 config.json；server 会在落盘后补跑 MCP 迁移、putSettings 回填快照进 cache
         await putSettings(cache);
+      } else {
+        // exists 字段缺失 = 响应形状不对、按失败处理（防误迁移）
+        throw new Error("GET full settings 响应形状异常（缺 exists）");
       }
     } catch (err) {
       console.warn(

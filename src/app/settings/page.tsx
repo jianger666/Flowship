@@ -96,15 +96,20 @@ const SettingsPage = () => {
   };
 
   // GitLab host 自动烘焙（用户拍板「选仓库时就推导、别等推进」）：
-  // 仓库变更 / 首次加载时从仓库 origin 推导、静默写进 settings.gitHost（无 UI 字段）——
+  // 仓库变更时从仓库 origin 推导、静默写进 settings.gitHost（无 UI 字段）——
   // 推进弹窗 / 服务端直接用现成值、运行时零推导零闪烁。推不出（没配 origin）保持原值、
   // 服务端起 agent 时仍有兜底推导。
+  // 代次守卫（发版前蓝军 P1）：连续快速改仓库列表时多个 fetch 乱序返回、旧响应可能
+  // 覆盖新 host——只认最后一次发起的请求。
+  const bakeGenRef = useRef(0);
   const bakeGitHost = useCallback((repoPaths: string[]) => {
     if (repoPaths.length === 0) return;
+    const gen = ++bakeGenRef.current;
     const q = encodeURIComponent(repoPaths.join(","));
     void fetch(`/api/repo-remote-meta?paths=${q}`)
       .then((r) => r.json())
       .then((d: { host?: string | null }) => {
+        if (gen !== bakeGenRef.current) return; // 已有更新一次烘焙、本次作废
         const derived = d.host?.trim();
         if (derived && derived !== (getSettings().gitHost ?? "").trim()) {
           saveFieldValue("gitHost", derived);

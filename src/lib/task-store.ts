@@ -421,6 +421,10 @@ export interface TaskStreamCallbacks {
   onAssistantDelta?: (text: string) => void;
 }
 
+/**
+ * 订阅任务 SSE（v1.0.x 起 bootstrap 只带尾部 tail 条事件、不是全部历史——
+ * 更早的走 fetchEarlierEvents 上拉分页；中途 task/done 帧不带 events）
+ */
 export const watchTaskStream = async (
   taskId: string,
   callbacks: TaskStreamCallbacks = {},
