@@ -219,8 +219,10 @@ const SettingsPage = () => {
 
   return (
     <div className="mx-auto flex max-w-5xl gap-8 px-6 py-8">
-      {/* 左侧锚点导航：sticky 跟随、点击定位、滚动高亮当前节 */}
-      <nav className="sticky top-6 hidden h-fit w-40 shrink-0 flex-col gap-0.5 self-start md:flex">
+      {/* 左侧锚点导航：sticky 跟随、点击定位、滚动高亮当前节。
+          top-8 必须 = 容器 py-8：sticky 吸附位和自然位重合、开始滚动那一刻不跳 8px
+          （用户实测「出现顶栏分隔线时导航动一下」的根因） */}
+      <nav className="sticky top-8 hidden h-fit w-40 shrink-0 flex-col gap-0.5 self-start md:flex">
         <div className="mb-2 px-2 text-xs font-medium text-muted-foreground">设置</div>
         {NAV_ITEMS.map((item) => (
           <ChoiceButton

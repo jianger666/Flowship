@@ -338,7 +338,9 @@ const loadingUrl = (dark) => {
   const slit = bg; // 裂隙镂空 = 背景色
   const current = dark ? "#fff7e0" : "#8a5a12"; // 电流：深色近白暖光 / 浅色深琥珀
   const html = `<!doctype html><html><head><style>
-    body{margin:0;display:grid;place-items:center;height:100vh;background:${bg};color:${fg};font:13px system-ui}
+    /* padding-top = 应用顶栏高度（56px）：让 logo 的屏幕位置和页面加载后的
+       hero loading 完全重合、splash → 页面 loading 交接不跳动（用户实测「往下抖」） */
+    body{margin:0;display:grid;place-items:center;height:100vh;box-sizing:border-box;padding-top:56px;background:${bg};color:${fg};font:13px system-ui}
     .wrap{display:flex;flex-direction:column;align-items:center;gap:14px}
     @keyframes flow{to{stroke-dashoffset:-100}}
     @keyframes glow{0%,100%{opacity:.15}50%{opacity:.9}}

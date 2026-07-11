@@ -248,6 +248,13 @@ export const FeishuBoard = () => {
     );
   }
 
+  // ---------- 首拉 loading：整区居中（不带看板头部行）----------
+  // 位置跟首页 gate 的 hero 完全重合——原来 loading 在头部行下方的 flex-1 里、
+  // 中心比 gate loading 低一截、启动链三段 loading 逐级往下跳（用户实测「不断往下抖」）
+  if (resp === null || (refreshing && items.length === 0)) {
+    return <LoadingState variant="hero" immediate />;
+  }
+
   // ---------- 甘特主体 ----------
   return (
     // 甘特是时间线视图、直接铺满全宽（用户拍板「大屏直接铺满」）、只留 padding
@@ -293,16 +300,12 @@ export const FeishuBoard = () => {
       </div>
 
       <div className="min-h-0 flex-1">
-        {resp === null || (refreshing && items.length === 0) ? (
-          <LoadingState variant="hero" immediate />
-        ) : (
-          <BoardTimeline
-            items={items}
-            onOpen={handleOpen}
-            range={range}
-            onRangeChange={setRange}
-          />
-        )}
+        <BoardTimeline
+          items={items}
+          onOpen={handleOpen}
+          range={range}
+          onRangeChange={setRange}
+        />
       </div>
     </div>
   );
