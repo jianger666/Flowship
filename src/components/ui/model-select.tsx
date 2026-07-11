@@ -262,7 +262,7 @@ export const ModelSelect = ({
                 }}
                 className={cn(
                   "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent",
-                  !selection.id && "bg-accent/40",
+                  !selection.id && "bg-selected text-selected-foreground",
                 )}
               >
                 <Check
@@ -298,7 +298,7 @@ export const ModelSelect = ({
                     onClick={() => handlePickModel(m)}
                     className={cn(
                       "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent",
-                      selected && "bg-accent/40",
+                      selected && "bg-selected text-selected-foreground",
                     )}
                   >
                     <Check

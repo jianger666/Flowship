@@ -46,6 +46,11 @@
     --input: oklch(0.9 0.004 264);
     --ring: oklch(0.6 0.01 264);
     --radius: 0.625rem;
+    /* 选中态底色（v1.0.x 全局规范、用户点名「白色选中态太弱、沉淀到全局」）：
+     * 比 muted 深两档、浅色模式下肉眼一眼可辨；所有「当前项 / 选中 tab / 激活行」
+     * 一律 bg-selected + text-selected-foreground、别再用 bg-muted/xx 自拼 */
+    --selected: oklch(0.885 0.006 247);
+    --selected-foreground: oklch(0.185 0.008 264);
   }
 
   .dark {
@@ -69,6 +74,9 @@
     --border: oklch(1 0 0 / 12%);
     --input: oklch(1 0 0 / 15%);
     --ring: oklch(0.556 0.01 264);
+    /* 选中态底色：比 muted(0.27) 提两档、深色下同样一眼可辨 */
+    --selected: oklch(0.34 0.008 264);
+    --selected-foreground: oklch(0.97 0.003 247);
   }
 }
 
@@ -93,6 +101,8 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-selected: var(--selected);
+  --color-selected-foreground: var(--selected-foreground);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -230,54 +240,68 @@
   border: none;
   border-radius: 0.5rem;
 }
-/* ---------- Hero loading（v1.0.x、用户点名「做个炫酷的 loading、后续都可以使用」） ----------
-   签名装置 = 迷你甘特骨架：几根排期条流光呼吸 + 一根「今天线」左右扫描——
-   属于本产品（首页就是排期甘特）的 loading、比通用 spinner 有身份。
-   实现全 CSS（无 JS 帧）、prefers-reduced-motion 下停动画只留静态骨架。 */
-@keyframes hero-shimmer {
-  0% {
-    background-position: 200% 0;
-  }
-  100% {
-    background-position: -200% 0;
+/* ---------- Hero loading（v1.0.x、用户点名「通用的好看的全局 loading」） ----------
+   双弧环：主题色渐变弧顺时针快转 + 半透明细弧逆时针慢转、中心柔光呼吸——
+   通用（不绑任何页面语义）、有层次但克制。全 CSS、
+   prefers-reduced-motion 下停动画只留静态圆环。 */
+@keyframes hero-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
-@keyframes hero-sweep {
+@keyframes hero-spin-rev {
+  to {
+    transform: rotate(-360deg);
+  }
+}
+@keyframes hero-glow {
   0%,
   100% {
-    left: 12%;
+    opacity: 0.25;
+    transform: scale(0.85);
   }
   50% {
-    left: 88%;
+    opacity: 0.6;
+    transform: scale(1.05);
   }
 }
-@keyframes hero-breathe {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-.hero-loading-bar {
-  background: linear-gradient(
-    90deg,
-    color-mix(in oklch, var(--muted-foreground) 14%, transparent) 25%,
-    color-mix(in oklch, var(--muted-foreground) 34%, transparent) 50%,
-    color-mix(in oklch, var(--muted-foreground) 14%, transparent) 75%
+/* 外弧：主题色渐变尾迹（conic 渐变 + mask 抠成环） */
+.hero-loading-ring {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 70deg,
+    color-mix(in oklch, var(--primary) 85%, transparent) 360deg
   );
-  background-size: 200% 100%;
-  animation:
-    hero-shimmer 2.2s linear infinite,
-    hero-breathe 2.2s ease-in-out infinite;
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+  animation: hero-spin 1s cubic-bezier(0.45, 0.1, 0.55, 0.9) infinite;
 }
-.hero-loading-sweep {
-  animation: hero-sweep 3.2s ease-in-out infinite;
+/* 内弧：细、反向、慢——两层错动出「机械感」层次 */
+.hero-loading-ring-inner {
+  background: conic-gradient(
+    from 180deg,
+    transparent 0deg,
+    transparent 200deg,
+    color-mix(in oklch, var(--muted-foreground) 55%, transparent) 360deg
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+  animation: hero-spin-rev 2.4s linear infinite;
+}
+/* 中心柔光：呼吸节律、给环一点体积感 */
+.hero-loading-glow {
+  background: radial-gradient(
+    circle,
+    color-mix(in oklch, var(--primary) 30%, transparent) 0%,
+    transparent 70%
+  );
+  animation: hero-glow 2s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .hero-loading-bar,
-  .hero-loading-sweep {
+  .hero-loading-ring,
+  .hero-loading-ring-inner,
+  .hero-loading-glow {
     animation: none;
   }
 }

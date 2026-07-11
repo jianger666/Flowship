@@ -68,7 +68,7 @@ export const ThemeToggle = () => {
               className={cn(
                 "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors",
                 active
-                  ? "bg-accent text-accent-foreground"
+                  ? "bg-selected text-selected-foreground"
                   : "text-muted-foreground hover:bg-accent hover:text-foreground",
               )}
             >

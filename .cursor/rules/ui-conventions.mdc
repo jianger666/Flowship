@@ -35,6 +35,14 @@ alwaysApply: true
 - **一律走 `pickNativePaths`**（`src/lib/native-picker.ts`）：桌面端 Electron 壳走主进程 `dialog.showOpenDialog`（秒弹 + 自动前台聚焦）。项目只交付桌面端、非桌面环境直接 toast 提示、不再写自绘文件浏览器或 HTTP 兜底。
 - 调用期间给按钮 spinner（防双击连开两个对话框、参考 event-stream 附文件按钮）。
 
+## 选中态颜色（v1.0.x 立规、用户实测「白色的选中状态太弱」+ 拍板「沉淀到全局规范」）
+
+- **持久选中态**（当前 tab / 当前导航项 / 侧栏激活行 / 下拉里已选项 / 主题选中项等「离开后还在」的状态）一律用全局 token：`bg-selected text-selected-foreground`（globals.css `--selected` / `--selected-foreground`、浅深两套已调好对比度）。
+ - ⛔ 不要再自拼 `bg-muted/60`、`bg-accent/40` 这类半透明灰当选中态——浅色模式下叠在白底上肉眼几乎不可见（踩过：能力页 tab / 设置页导航 / 下拉已选项全中招）。
+- **瞬时态**（hover / 键盘高亮 / drag-over）保持 shadcn 惯例：`hover:bg-accent`、`hover:bg-muted/50` 等——转瞬即逝、弱一点没关系、跟选中态拉开层次。
+- 需要「品牌强调」的选中（ChoiceButton card/chip）继续走 `border-primary + bg-primary/5~10 + text-primary`（有边框和文字色双重信号、两种模式都可辨）。
+- 改 `--selected` 值只动 globals.css 一处、所有选中态全站跟随。
+
 ## 操作反馈（已有约定、汇总）
 
 - 加载中 → `LoadingState`；空态 → `EmptyHint`；选中卡片 → `ChoiceButton`（见 learned-conventions）

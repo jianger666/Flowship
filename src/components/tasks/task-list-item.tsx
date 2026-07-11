@@ -133,7 +133,7 @@ export const TaskListItem = ({
           // 有操作按钮时给行尾留白、避免标题被盖
           hasActions ? "pr-14" : "pr-2",
           active
-            ? "bg-muted font-medium text-foreground"
+            ? "bg-selected font-medium text-selected-foreground"
             : "text-foreground/75 hover:bg-muted/50 hover:text-foreground",
         )}
       >

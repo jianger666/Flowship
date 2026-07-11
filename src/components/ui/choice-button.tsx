@@ -67,11 +67,12 @@ const choiceButtonVariants = cva(
         selected: false,
         className: "border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground",
       },
-      // tab 形状
+      // tab 形状——选中态走全局 selected token（bg-muted/60 在浅色下几乎不可见、
+      // 用户实测点名「白色的选中状态太弱」、v1.0.x 立规见 ui-conventions）
       {
         shape: "tab",
         selected: true,
-        className: "bg-muted/60 text-foreground",
+        className: "bg-selected font-medium text-selected-foreground",
       },
       {
         shape: "tab",

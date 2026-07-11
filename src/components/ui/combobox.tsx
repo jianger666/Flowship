@@ -167,7 +167,7 @@ export const Combobox = ({
                       onClick={() => pick(o)}
                       className={cn(
                         "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent",
-                        selected && "bg-accent/40",
+                        selected && "bg-selected text-selected-foreground",
                       )}
                     >
                       <Check

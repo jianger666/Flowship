@@ -119,7 +119,7 @@ export const MultiSelect = <T,>({
                       onClick={() => handleToggle(key)}
                       className={cn(
                         "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent",
-                        selected && "bg-accent/40",
+                        selected && "bg-selected text-selected-foreground",
                       )}
                     >
                       <Check

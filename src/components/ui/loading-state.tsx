@@ -8,10 +8,10 @@ import { Card, CardContent } from "@/components/ui/card";
  * 风格不一致（Card vs 裸 div、「...」vs「…」）。
  *
  * variant：
- * - hero：页面级「迷你甘特骨架」loading（v1.0.x 用户点名「炫酷点、后续都可以使用」）——
- *   几根排期条流光呼吸 + 一根「今天线」左右扫描、属于本产品（首页=排期甘特）的签名装置；
- *   纯 CSS 动画（globals.css hero-*）、reduced-motion 自动降级静态骨架
- * - block：屏幕中部一段灰色文本（不适合骨架的小页面用）
+ * - hero：页面级通用 loading（v1.0.x 用户点名「通用的好看的全局 loading」）——
+ *   双弧环（主题色渐变弧快转 + 细弧反向慢转）+ 中心柔光呼吸；
+ *   纯 CSS 动画（globals.css hero-*）、reduced-motion 自动降级静态环
+ * - block：屏幕中部一段灰色文本（不适合动画的小场景用）
  * - card：用 Card 包裹（列表 loading 用、跟其他卡片视觉对齐）
  * - inline：行内一小段灰色文本（按钮旁、面板里小区块用）
  *
@@ -25,43 +25,20 @@ interface LoadingStateProps {
   className?: string;
 }
 
-// 迷你甘特骨架的条形排布（left / width 百分比 + 錯落延迟）——静态写死、不随机（SSR 稳定）
-const HERO_BARS: Array<{ left: string; width: string; delay: string }> = [
-  { left: "6%", width: "34%", delay: "0s" },
-  { left: "24%", width: "46%", delay: "0.25s" },
-  { left: "14%", width: "26%", delay: "0.5s" },
-  { left: "42%", width: "38%", delay: "0.75s" },
-  { left: "30%", width: "22%", delay: "1s" },
-];
-
 const HeroLoading = ({ label, className }: { label: string; className?: string }) => (
   <div
     className={cn(
-      "flex h-full min-h-[60vh] flex-col items-center justify-center gap-6",
+      "flex h-full min-h-[60vh] flex-col items-center justify-center gap-5",
       className,
     )}
     role="status"
     aria-label={label}
   >
-    {/* 迷你甘特：排期条骨架 + 扫描「今天线」 */}
-    <div className="relative w-full max-w-sm px-6">
-      <div className="flex flex-col gap-3">
-        {HERO_BARS.map((b, i) => (
-          <div key={i} className="relative h-3">
-            <div
-              className="hero-loading-bar absolute inset-y-0 rounded-full"
-              style={{ left: b.left, width: b.width, animationDelay: b.delay }}
-            />
-          </div>
-        ))}
-      </div>
-      {/* 今天线：一根主题色细线左右扫描（甘特的身份符号） */}
-      <div
-        className="hero-loading-sweep pointer-events-none absolute -top-2 bottom-0 w-px bg-primary/60"
-        aria-hidden
-      >
-        <span className="absolute -top-1 left-1/2 size-1.5 -translate-x-1/2 rounded-full bg-primary/80" />
-      </div>
+    {/* 双弧环 + 柔光：三层同心、全 CSS 动画 */}
+    <div className="relative size-12">
+      <div className="hero-loading-glow absolute inset-0 rounded-full" aria-hidden />
+      <div className="hero-loading-ring absolute inset-0 rounded-full" aria-hidden />
+      <div className="hero-loading-ring-inner absolute inset-[7px] rounded-full" aria-hidden />
     </div>
     <div className="text-sm text-muted-foreground">{label}</div>
   </div>

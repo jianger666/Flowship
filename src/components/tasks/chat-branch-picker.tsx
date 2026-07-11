@@ -158,7 +158,7 @@ export const ChatBranchPicker = ({ task }: Props) => {
                     onClick={() => void handleCheckout(b)}
                     className={cn(
                       "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
-                      selected && "bg-accent/40",
+                      selected && "bg-selected text-selected-foreground",
                     )}
                   >
                     <Check

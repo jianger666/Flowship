@@ -184,7 +184,7 @@ const SettingsPage = () => {
             className={cn(
               "cursor-pointer rounded-md px-2 py-1.5 text-left text-sm transition-colors",
               activeFocus === item.focus
-                ? "bg-muted font-medium text-foreground"
+                ? "bg-selected font-medium text-selected-foreground"
                 : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
             )}
           >
