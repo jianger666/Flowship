@@ -201,12 +201,7 @@ export const FeishuCliSection = () => {
 
   return (
     <div className="space-y-3">
-      <div>
-        <div className="text-sm font-medium">飞书集成</div>
-        <p className="text-xs text-muted-foreground">
-          内置官方 CLI、装完登录即可——AI 自动获得飞书 / 飞书项目全部能力
-        </p>
-      </div>
+      <div className="text-sm font-medium">飞书集成</div>
       <div className="space-y-3">
         <div className="flex items-center gap-2">
           <Button
