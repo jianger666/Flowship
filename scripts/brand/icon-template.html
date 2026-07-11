@@ -3,9 +3,11 @@
   桌面图标渲染模板（v1.0.x logo「雷芯」、与 src/components/ui/brand-mark.tsx 同一套几何）
 
   用 headless Chrome 截图产出位图（node scripts/brand/render-icons.mjs 一键跑）：
-    ?mode=mac  → 1024×1024 满幅方图（mac：Tahoe 系统自动加 squircle 圆角、不能预圆角）
-    ?mode=win  → 1024×1024 预圆角（26.5% 半径、四角透明——win 不会自动圆角）
-    ?mode=logo → 512×512 预圆角（public/logo.png 通用资产）
+    ?mode=mac  → 1024×1024 Big Sur 官方模板（squircle 824px 居中 + 透明留白、圆角 ~22.5%）
+                 ——pre-Tahoe 原样显示就是标准圆角；Tahoe 识别「标准形状」后自动适配新样式。
+                 ⚠️ 不能用满画布预圆角（非标准形状、Tahoe 垫白底方块、v0.7.x 踩过）
+    ?mode=win  → 1024×1024 满画布预圆角（26.5% 半径、四角透明——win 任务栏/桌面直接显示成圆角）
+    ?mode=logo → 512×512 满画布预圆角（public/logo.png 通用资产）
 -->
 <html>
 <head>
@@ -13,6 +15,7 @@
 <style>
   * { margin: 0; }
   html, body { background: transparent; }
+  #stage { width: 1024px; height: 1024px; display: flex; align-items: center; justify-content: center; }
   #tile {
     width: 1024px; height: 1024px;
     background: linear-gradient(150deg, #23252d 0%, #131419 62%, #0c0d11 100%);
@@ -24,10 +27,10 @@
     content: ""; position: absolute; inset: 0;
     background: linear-gradient(180deg, #ffffff14 0%, transparent 18%);
   }
-  .rounded { border-radius: 26.5%; }
 </style>
 </head>
 <body>
+  <div id="stage">
   <div id="tile">
     <svg id="mark" width="660" height="660" viewBox="0 0 48 48" fill="none">
       <defs>
@@ -41,14 +44,26 @@
       <circle cx="34" cy="12" r="2.2" fill="#131419"/>
     </svg>
   </div>
+  </div>
 <script>
   const mode = new URLSearchParams(location.search).get("mode") ?? "mac";
   const tile = document.getElementById("tile");
-  if (mode !== "mac") tile.classList.add("rounded");
+  const mark = document.getElementById("mark");
+  if (mode === "mac") {
+    // Big Sur 官方 grid：1024 画布、squircle 824 居中、圆角约 185px（22.5%）
+    tile.style.width = tile.style.height = "824px";
+    tile.style.borderRadius = "185px";
+    mark.setAttribute("width", "540");
+    mark.setAttribute("height", "540");
+  } else {
+    tile.style.borderRadius = "26.5%";
+  }
   if (mode === "logo") {
+    document.getElementById("stage").style.width = "512px";
+    document.getElementById("stage").style.height = "512px";
     tile.style.width = tile.style.height = "512px";
-    document.getElementById("mark").setAttribute("width", "330");
-    document.getElementById("mark").setAttribute("height", "330");
+    mark.setAttribute("width", "330");
+    mark.setAttribute("height", "330");
   }
 </script>
 </body>
