@@ -13,6 +13,7 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SettingRow } from "@/components/ui/setting-row";
 
 interface GitLabSectionProps {
   gitToken: string;
@@ -29,32 +30,31 @@ export const GitLabSection = ({
   const [showToken, setShowToken] = useState(false);
 
   return (
-    <div className="space-y-2">
-      <div>
-        <div className="text-sm font-medium">GitLab</div>
-        <p className="text-xs text-muted-foreground">
-          Personal Access Token（api 权限）；Host 自动从仓库 remote 推导、不用填
-        </p>
-      </div>
-      <div className="flex gap-2">
-        <Input
-          type={showToken ? "text" : "password"}
-          value={gitToken}
-          onChange={(e) => onTokenChange(e.target.value)}
-          onBlur={() => onTokenCommit(gitToken)}
-          placeholder="glpat-..."
-          className="font-mono"
-        />
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          onClick={() => setShowToken((s) => !s)}
-          title={showToken ? "隐藏" : "显示"}
-        >
-          {showToken ? <EyeOff /> : <Eye />}
-        </Button>
-      </div>
-    </div>
+    <SettingRow
+      stacked
+      label="GitLab Token"
+      hint="Personal Access Token（api 权限）；Host 自动从仓库 remote 推导、不用填"
+      control={
+        <div className="flex gap-2">
+          <Input
+            type={showToken ? "text" : "password"}
+            value={gitToken}
+            onChange={(e) => onTokenChange(e.target.value)}
+            onBlur={() => onTokenCommit(gitToken)}
+            placeholder="glpat-..."
+            className="font-mono"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={() => setShowToken((s) => !s)}
+            title={showToken ? "隐藏" : "显示"}
+          >
+            {showToken ? <EyeOff /> : <Eye />}
+          </Button>
+        </div>
+      }
+    />
   );
 };

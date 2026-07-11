@@ -10,7 +10,7 @@
  * 原 user-profile-card（IDE + 分支模板）/ model-card（默认模型）已并入本文件、单一来源。
  */
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -23,6 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
 import { renderBranchName } from "@/lib/branch-template";
 import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
@@ -34,42 +35,6 @@ import {
   type ModelSelection,
   type SubmitShortcut,
 } from "@/lib/types";
-
-// 统一设置行：左「名称 + 说明」、右控件；stacked = 宽控件（输入框 / 模型选择）放名称下方全宽
-const SettingRow = ({
-  label,
-  hint,
-  control,
-  stacked,
-  labelExtra,
-}: {
-  label: string;
-  hint?: ReactNode;
-  control: ReactNode;
-  stacked?: boolean;
-  // 名称行右侧的附加操作（如「获取列表」按钮）
-  labelExtra?: ReactNode;
-}) =>
-  stacked ? (
-    <div className="space-y-2 py-4 first:pt-0 last:pb-0">
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <div className="text-sm">{label}</div>
-          {hint && <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p>}
-        </div>
-        {labelExtra}
-      </div>
-      {control}
-    </div>
-  ) : (
-    <div className="flex items-center justify-between gap-6 py-4 first:pt-0 last:pb-0">
-      <div className="min-w-0">
-        <div className="text-sm">{label}</div>
-        {hint && <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p>}
-      </div>
-      <div className="shrink-0">{control}</div>
-    </div>
-  );
 
 interface PreferenceSectionsProps {
   // 代码跳转 IDE

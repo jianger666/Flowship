@@ -11,6 +11,7 @@ import { Eye, EyeOff, Loader2, RefreshCw, User } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SettingRow } from "@/components/ui/setting-row";
 
 import { useState } from "react";
 
@@ -66,64 +67,65 @@ export const ApiKeySection = ({
   const name = info ? fullName(info) : "";
 
   return (
-    <div className="space-y-2">
-      <div>
-        <div className="text-sm font-medium">Cursor API Key</div>
-        <p className="text-xs text-muted-foreground">
-          从 cursor.com/dashboard/integrations 创建、以 crsr_ 开头
-        </p>
-      </div>
-      <div className="flex gap-2">
-        <Input
-          type={showKey ? "text" : "password"}
-          value={apiKey}
-          onChange={(e) => onChange(e.target.value)}
-          onBlur={() => onCommit(apiKey)}
-          placeholder="crsr_..."
-          className="font-mono"
-        />
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          onClick={() => setShowKey((s) => !s)}
-          title={showKey ? "隐藏" : "显示"}
-        >
-          {showKey ? <EyeOff /> : <Eye />}
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => onValidate(apiKey)}
-          disabled={validating || !apiKey.trim()}
-        >
-          {validating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-          验证
-        </Button>
-      </div>
-      {masked && (
-        <div className="text-xs text-muted-foreground font-mono">{masked}</div>
-      )}
-      {info && (
-        <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
-          <User className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-          <div className="min-w-0 space-y-0.5">
-            {/* 第一行：姓名 + 邮箱（团队 / service key 可能都没有、退回只显示密钥名） */}
-            <div className="font-medium">
-              {name || info.userEmail || info.apiKeyName}
-              {name && info.userEmail && (
-                <span className="ml-1.5 font-normal text-muted-foreground">
-                  {info.userEmail}
-                </span>
-              )}
-            </div>
-            {/* 第二行：密钥名 · 创建时间 */}
-            <div className="text-muted-foreground">
-              密钥「{info.apiKeyName}」· 创建于 {formatCreatedAt(info.createdAt)}
-            </div>
+    <SettingRow
+      stacked
+      label="Cursor API Key"
+      hint="从 cursor.com/dashboard/integrations 创建、以 crsr_ 开头"
+      control={
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Input
+              type={showKey ? "text" : "password"}
+              value={apiKey}
+              onChange={(e) => onChange(e.target.value)}
+              onBlur={() => onCommit(apiKey)}
+              placeholder="crsr_..."
+              className="font-mono"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => setShowKey((s) => !s)}
+              title={showKey ? "隐藏" : "显示"}
+            >
+              {showKey ? <EyeOff /> : <Eye />}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onValidate(apiKey)}
+              disabled={validating || !apiKey.trim()}
+            >
+              {validating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              验证
+            </Button>
           </div>
+          {masked && (
+            <div className="text-xs text-muted-foreground font-mono">{masked}</div>
+          )}
+          {info && (
+            <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+              <User className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 space-y-0.5">
+                {/* 第一行：姓名 + 邮箱（团队 / service key 可能都没有、退回只显示密钥名） */}
+                <div className="font-medium">
+                  {name || info.userEmail || info.apiKeyName}
+                  {name && info.userEmail && (
+                    <span className="ml-1.5 font-normal text-muted-foreground">
+                      {info.userEmail}
+                    </span>
+                  )}
+                </div>
+                {/* 第二行：密钥名 · 创建时间 */}
+                <div className="text-muted-foreground">
+                  密钥「{info.apiKeyName}」· 创建于 {formatCreatedAt(info.createdAt)}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
-      )}
-    </div>
+      }
+    />
   );
 };

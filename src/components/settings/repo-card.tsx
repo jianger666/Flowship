@@ -186,67 +186,83 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                     </Button>
                   </div>
 
-                  {/* 第二行：线上 / 测试 / dev 分支（都选填）。
+                  {/* 第二行：线上 / 提测 / 联调 分支（都选填）。
                       v0.9.11 换 Combobox：候选自动拉本地 + 远端分支、可搜索、列表缺分支时可手填；
-                      非 git 目录（手填的坏路径 / 普通文件夹）禁用——没分支可选 */}
+                      非 git 目录（手填的坏路径 / 普通文件夹）禁用——没分支可选。
+                      v1.0.x：三框加迷你 label（原来 placeholder-only、有值后就不知道哪个框是啥了） */}
                   <div className="grid grid-cols-3 gap-2">
-                    <Combobox
-                      value={r.onlineBranch ?? ""}
-                      onValueChange={(v) =>
-                        commitRepoField(r.path, "onlineBranch", v)
-                      }
-                      options={entry?.branches ?? []}
-                      loading={!entry}
-                      disabled={branchDisabled}
-                      placeholder={branchPlaceholder ?? "线上分支"}
-                      title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
-                    />
-                    <Combobox
-                      value={r.testBranch ?? ""}
-                      onValueChange={(v) =>
-                        commitRepoField(r.path, "testBranch", v)
-                      }
-                      options={entry?.branches ?? []}
-                      loading={!entry}
-                      disabled={branchDisabled}
-                      placeholder={branchPlaceholder ?? "测试分支"}
-                      title="ship 提测 MR 的目标分支、留空则默认 test"
-                    />
-                    <Combobox
-                      value={r.devBranch ?? ""}
-                      onValueChange={(v) =>
-                        commitRepoField(r.path, "devBranch", v)
-                      }
-                      options={entry?.branches ?? []}
-                      loading={!entry}
-                      disabled={branchDisabled}
-                      placeholder={branchPlaceholder ?? "dev 分支"}
-                      title="dev / 联调分支（当前仅存配置）"
-                    />
+                    <div className="grid gap-1">
+                      <span className="text-[11px] text-muted-foreground">线上分支</span>
+                      <Combobox
+                        value={r.onlineBranch ?? ""}
+                        onValueChange={(v) =>
+                          commitRepoField(r.path, "onlineBranch", v)
+                        }
+                        options={entry?.branches ?? []}
+                        loading={!entry}
+                        disabled={branchDisabled}
+                        placeholder={branchPlaceholder ?? "留空自动探测"}
+                        title="feature 从这个分支拉、留空则 build 时自动探测默认分支"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <span className="text-[11px] text-muted-foreground">提测分支</span>
+                      <Combobox
+                        value={r.testBranch ?? ""}
+                        onValueChange={(v) =>
+                          commitRepoField(r.path, "testBranch", v)
+                        }
+                        options={entry?.branches ?? []}
+                        loading={!entry}
+                        disabled={branchDisabled}
+                        placeholder={branchPlaceholder ?? "留空默认 test"}
+                        title="ship 提测 MR 的目标分支、留空则默认 test"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <span className="text-[11px] text-muted-foreground">联调分支</span>
+                      <Combobox
+                        value={r.devBranch ?? ""}
+                        onValueChange={(v) =>
+                          commitRepoField(r.path, "devBranch", v)
+                        }
+                        options={entry?.branches ?? []}
+                        loading={!entry}
+                        disabled={branchDisabled}
+                        placeholder={branchPlaceholder ?? "选填"}
+                        title="dev / 联调分支（联调 action 的推送目标）"
+                      />
+                    </div>
                   </div>
 
                   {/* 第三行：分支模板覆盖（留空用全局默认）+ 预览启动命令 */}
                   <div className="grid grid-cols-2 gap-2">
-                    <Input
-                      value={r.branchTemplate ?? ""}
-                      onChange={(e) =>
-                        setRepoField(r.path, "branchTemplate", e.target.value)
-                      }
-                      onBlur={onRepoFieldBlur}
-                      placeholder="分支模板覆盖（留空用全局默认）"
-                      title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
-                      className="font-mono text-xs"
-                    />
-                    <Input
-                      value={r.previewCommand ?? ""}
-                      onChange={(e) =>
-                        setRepoField(r.path, "previewCommand", e.target.value)
-                      }
-                      onBlur={onRepoFieldBlur}
-                      placeholder="预览启动命令（如 npm run dev）"
-                      title="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server"
-                      className="font-mono text-xs"
-                    />
+                    <div className="grid gap-1">
+                      <span className="text-[11px] text-muted-foreground">分支模板覆盖</span>
+                      <Input
+                        value={r.branchTemplate ?? ""}
+                        onChange={(e) =>
+                          setRepoField(r.path, "branchTemplate", e.target.value)
+                        }
+                        onBlur={onRepoFieldBlur}
+                        placeholder="留空用全局默认"
+                        title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
+                        className="font-mono text-xs"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <span className="text-[11px] text-muted-foreground">预览启动命令</span>
+                      <Input
+                        value={r.previewCommand ?? ""}
+                        onChange={(e) =>
+                          setRepoField(r.path, "previewCommand", e.target.value)
+                        }
+                        onBlur={onRepoFieldBlur}
+                        placeholder="如 npm run dev"
+                        title="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server"
+                        className="font-mono text-xs"
+                      />
+                    </div>
                   </div>
                 </div>
               );
