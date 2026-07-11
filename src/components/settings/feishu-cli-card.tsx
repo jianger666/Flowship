@@ -47,7 +47,7 @@ interface FeishuCliState {
 
 const TOOL_LABEL: Record<"larkCli" | "meegle", string> = {
   larkCli: "飞书（lark-cli）",
-  meegle: "飞书项目（meegle）",
+  meegle: "飞书项目（meegle-cli）",
 };
 
 
@@ -157,7 +157,8 @@ export const FeishuCliCard = () => {
           <Badge variant="outline" className="text-muted-foreground">未安装</Badge>
         ) : (
           <>
-            <Badge variant="secondary">v{tool.version}</Badge>
+            {/* 版本探测可能超时（Windows Defender 首扫）、文件在盘上就先显「已安装」 */}
+            <Badge variant="secondary">{tool.version ? `v${tool.version}` : "已安装"}</Badge>
             {tool.loggedIn ? (
               <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 <CheckCircle2 className="size-3.5 text-green-500" />
@@ -223,11 +224,12 @@ export const FeishuCliCard = () => {
             onClick={() => void handleInstall()}
           >
             {installing ? <Loader2 className="animate-spin" /> : <Download />}
-            {/* 两个都装了才叫「更新」；缺任何一个都叫「安装」（用户踩过：meegle 没装、
-                按钮却只有「更新」、以为装不了）。装过的且已最新会自动跳过、不重复下载 */}
-            {state?.larkCli.installed && state?.meegle.installed ? "更新" : "安装"}
+            {/* 两个都装了叫「检查更新」（点了会先比对版本、已最新直接跳过——原文案「更新」
+                让用户以为总有新版可更）；缺任何一个叫「安装」 */}
+            {state?.larkCli.installed && state?.meegle.installed ? "检查更新" : "安装"}
           </Button>
-          {installing && installLog.length > 0 && (
+          {/* 最后一条安装日志装完也保留（「已是最新、跳过」这类结果用户要看得到） */}
+          {!state?.install.error && installLog.length > 0 && (
             <span className="text-xs text-muted-foreground">
               {installLog[installLog.length - 1]}
             </span>

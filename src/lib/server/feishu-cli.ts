@@ -608,16 +608,31 @@ const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }
   }
 };
 
+// 二进制文件是否存在（探测版本失败时的兜底判「已安装」）
+const binExists = async (p: string): Promise<boolean> =>
+  !!(await fs.stat(p).catch(() => null));
+
 export const getFeishuCliStatus = async (): Promise<{
   larkCli: CliToolStatus;
   meegle: CliToolStatus;
 }> => {
-  const [larkVer, meegleVer] = await Promise.all([
+  const [larkVer, meegleVer, larkOnDisk, meegleOnDisk] = await Promise.all([
     probeVersion(larkCliBin()),
     probeVersion(meegleBin()),
+    binExists(larkCliBin()),
+    binExists(meegleBin()),
   ]);
-  const larkCli: CliToolStatus = { installed: !!larkVer, version: larkVer ?? undefined };
-  const meegle: CliToolStatus = { installed: !!meegleVer, version: meegleVer ?? undefined };
+  // installed 判定 = 版本探测成功 **或 文件在盘上**——同事实测踩过：Windows 首次起动
+  // Defender 扫描让 spawn 超时、探测失败被判「未安装」、点一次安装才「检测出来」。
+  // 文件在就是装了、版本号探不出来先空着（下轮 / 装完再补）。
+  const larkCli: CliToolStatus = {
+    installed: !!larkVer || larkOnDisk,
+    version: larkVer ?? undefined,
+  };
+  const meegle: CliToolStatus = {
+    installed: !!meegleVer || meegleOnDisk,
+    version: meegleVer ?? undefined,
+  };
   // 已安装才探登录态（并行）
   const [larkAuth, meegleAuth] = await Promise.all([
     larkCli.installed ? probeLarkAuth() : Promise.resolve(null),
