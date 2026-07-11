@@ -362,19 +362,24 @@ const splashUrl = (dark) => {
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 };
 
-// 独立 splash 小窗（frameless 居中卡片、可拖动）：boot 期间唯一可见窗口；
-// 主窗 ready-to-show（页面真渲出来）后 show 主窗 → 关它（先开后关、不触发 window-all-closed）
+// 独立 splash 窗（frameless、可拖动）：boot 期间唯一可见窗口；
+// 主窗 ready-to-show（页面真渲出来）后 show 主窗 → 关它（先开后关、不触发 window-all-closed）。
+// v1.1.x 用户拍板「首屏就和打开后一样大」：尺寸 / 位置 / 最大化都取主窗记忆值——
+// splash → 主窗在同一位置同一大小接力、视觉上只是窗内内容替换、没有窗口跳变
 let splashWindow = null;
-const createSplashWindow = (dark) => {
+const createSplashWindow = (dark, st) => {
   splashWindow = new BrowserWindow({
-    width: 360,
-    height: 300,
+    width: st?.width ?? 1280,
+    height: st?.height ?? 800,
+    x: st?.x,
+    y: st?.y,
     frame: false,
     resizable: false,
     // 不给关闭手段（frameless 本来没按钮）；alwaysOnTop 不设、别挡用户干别的
     backgroundColor: dark ? LOADING_BG_DARK : LOADING_BG_LIGHT,
     show: true,
   });
+  if (st?.maximized) splashWindow.maximize();
   splashWindow.on("closed", () => {
     splashWindow = null;
   });
@@ -1040,8 +1045,8 @@ if (!app.requestSingleInstanceLock()) {
       return;
     }
 
-    // splash 小窗先亮（boot 期间唯一可见窗口）、主窗 hidden 待页面就绪
-    createSplashWindow(nativeTheme.shouldUseDarkColors);
+    // splash 先亮（boot 期间唯一可见窗口、跟主窗同尺寸同位置）、主窗 hidden 待页面就绪
+    createSplashWindow(nativeTheme.shouldUseDarkColors, await loadWindowState());
     await createWindow();
     startServer();
     void setupAutoUpdate();
