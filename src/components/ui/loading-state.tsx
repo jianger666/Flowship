@@ -47,7 +47,7 @@ const HeroLoading = ({
   className?: string;
   immediate?: boolean;
 }) => {
-  // 出场是否延迟（250ms 内秒开就完全不显示）：非 immediate、或已过启动窗口
+  // 出场是否延迟（200ms 内秒开就完全不显示、阈值用户拍板）：非 immediate、或已过启动窗口
   const delayed = !immediate || Date.now() - APP_BOOT_TS > BOOT_WINDOW_MS;
   return (
     <div
