@@ -1,12 +1,12 @@
 "use client";
 
 /**
- * 「飞书集成」卡片（V0.12 P0）
+ * 「飞书集成」配置节（V0.12 P0；v1.0.x 设置整合：Card 壳退役、作为「连接」卡的一节）
  *
  * 内置两个官方 CLI（lark-cli 飞书开放平台 / meegle 飞书项目）的 安装 + 登录 + 状态。
  * 装完 agent 自动获得能力（官方 skills 注入 + PATH）、用户不用再懂 MCP。
  *
- * 交互：一键「安装 / 更新」（后台下载、轮询进度）→ 各自「登录」（CLI 自动开浏览器、
+ * 交互：一键「安装 / 检查更新」（后台下载、轮询进度）→ 各自「登录」（CLI 自动开浏览器、
  * 抓到授权 URL 时给可点链接兜底）→ 状态行显示 版本 + 登录账号。
  */
 
@@ -18,13 +18,6 @@ import { useDialog } from "@/hooks/use-dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 
 // 服务端状态形状（/api/system/feishu-cli GET）
 interface ToolStatus {
@@ -51,7 +44,7 @@ const TOOL_LABEL: Record<"larkCli" | "meegle", string> = {
 };
 
 
-export const FeishuCliCard = () => {
+export const FeishuCliSection = () => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
   const [state, setState] = useState<FeishuCliState | null>(null);
@@ -207,14 +200,14 @@ export const FeishuCliCard = () => {
   const installLog = state?.install.log ?? [];
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>飞书集成</CardTitle>
-        <CardDescription>
+    <div className="space-y-3">
+      <div>
+        <div className="text-sm font-medium">飞书集成</div>
+        <p className="text-xs text-muted-foreground">
           内置官方 CLI、装完登录即可——AI 自动获得飞书 / 飞书项目全部能力
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
+        </p>
+      </div>
+      <div className="space-y-3">
         <div className="flex items-center gap-2">
           <Button
             type="button"
@@ -254,7 +247,7 @@ export const FeishuCliCard = () => {
         </div>
         {renderToolRow("larkCli")}
         {renderToolRow("meegle")}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 };

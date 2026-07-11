@@ -3,16 +3,16 @@
 /**
  * 设置页（壳子）
  *
- * v1.0.x 瘦身（用户拍板）：
- * - 能力类配置（MCP / Skill / Action）迁去 /actions 能力页 tab 管理、这里只留「设置」——
- *   凭据连接 / 模型 / 仓库 / 偏好 / 存储
- * - 左侧锚点导航（长滚动保留、点导航定位到对应卡片 + 滚动跟随高亮）——原来一屏十张卡要一直滚
- * - 旧深链兼容：?focus=mcp / skills 重定向到 /actions?tab=
+ * v1.0.x 整合（用户拍板「太零散、一个 tab 下只有一两个设置项」）：8 张卡收成 4 组——
+ *   连接（Cursor API Key + GitLab Token + 飞书集成）/ 偏好（跳转 IDE + 分支模板 +
+ *   提交快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储。
+ * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航四项。
  *
- * 拆分约定：
- * - 状态管理 → src/hooks/use-settings.ts、use-models.ts
- * - 各配置块 → src/components/settings/*-card.tsx
- * - 这个文件只组合：拿 hook 出来的值、传给 Card
+ * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
+ * - 旧深链兼容：?focus=api-key|feishu|git → 连接、profile|preference|model → 偏好、
+ *   mcp / skills → 重定向 /actions?tab=
+ *
+ * 拆分约定：状态管理 → hooks；配置节 → components/settings/*-card.tsx；本文件只组合。
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
@@ -20,8 +20,15 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Separator } from "@/components/ui/separator";
 
 import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
@@ -29,28 +36,34 @@ import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import { getSettings } from "@/lib/local-store";
 import { cn } from "@/lib/utils";
 
-import { ApiKeyCard } from "@/components/settings/api-key-card";
-import { ModelCard } from "@/components/settings/model-card";
+import { ApiKeySection } from "@/components/settings/api-key-card";
+import { ModelSection } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { StorageCard } from "@/components/settings/storage-card";
-import { UserProfileCard } from "@/components/settings/user-profile-card";
-import { GitCard } from "@/components/settings/git-card";
-import { PreferenceCard } from "@/components/settings/preference-card";
+import { ProfileSection } from "@/components/settings/user-profile-card";
+import { GitLabSection } from "@/components/settings/git-card";
+import { InteractionSection } from "@/components/settings/preference-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
-import { FeishuCliCard } from "@/components/settings/feishu-cli-card";
+import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
 
-// 左侧锚点导航项（顺序 = 页面卡片顺序；id 后缀同 ?focus= 取值、旧链接全兼容）
+// 左侧锚点导航（v1.0.x 四组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
-  { focus: "api-key", label: "Cursor API Key" },
-  { focus: "feishu", label: "飞书集成" },
-  { focus: "profile", label: "个人信息" },
-  { focus: "preference", label: "交互偏好" },
-  { focus: "git", label: "GitLab" },
-  { focus: "model", label: "默认模型" },
+  { focus: "connect", label: "连接" },
+  { focus: "prefs", label: "偏好" },
   { focus: "repos", label: "仓库" },
   { focus: "storage", label: "存储" },
 ];
+
+// 旧 focus 值 → 新分组（全站 settingsUrl("api-key") 等旧跳转不断链）
+const LEGACY_FOCUS: Record<string, string> = {
+  "api-key": "connect",
+  feishu: "connect",
+  git: "connect",
+  profile: "prefs",
+  preference: "prefs",
+  model: "prefs",
+};
 
 // 能力类 focus（已迁去 /actions 能力页）→ 对应 tab 的重定向表
 const CAPABILITY_FOCUS: Record<string, string> = {
@@ -62,7 +75,7 @@ const SettingsPage = () => {
   const router = useRouter();
   const { settings, loaded, update, saveFieldValue } = useSettings();
   const { models, loading: modelsLoading, error: modelsError, fetchModels } = useModels();
-  // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在 ApiKeyCard
+  // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在连接卡
   const { info: apiKeyInfo, loading: infoLoading, fetchInfo } = useApiKeyInfo();
 
   // 一次「验证」同时拉模型列表 + 账号信息（两者都吃 SWR 缓存、重复调很便宜）
@@ -101,10 +114,10 @@ const SettingsPage = () => {
 
   // 当前导航高亮项（点导航 / 滚动跟随都更新）
   const [activeFocus, setActiveFocus] = useState<string>(NAV_ITEMS[0].focus);
-  // ?focus= 锚点定位 + 短暂高亮；能力类 focus（mcp/skills）重定向去能力页
+  // ?focus= 锚点定位 + 短暂高亮
   const [highlightId, setHighlightId] = useState<string | null>(null);
 
-  // 点导航：滚到对应卡片 + 短暂高亮 ring
+  // 点导航：滚到对应组卡 + 短暂高亮 ring
   const scrollToFocus = useCallback((focus: string) => {
     const id = `card-${focus}`;
     const el = document.getElementById(id);
@@ -117,22 +130,22 @@ const SettingsPage = () => {
 
   useEffect(() => {
     if (!loaded) return;
-    const focus = new URLSearchParams(window.location.search).get("focus");
-    if (!focus) return;
-    // 旧深链兼容：MCP / Skills 已迁能力页
-    if (CAPABILITY_FOCUS[focus]) {
-      router.replace(`/actions?tab=${CAPABILITY_FOCUS[focus]}`);
+    const raw = new URLSearchParams(window.location.search).get("focus");
+    if (!raw) return;
+    // 能力类 focus 重定向去能力页
+    if (CAPABILITY_FOCUS[raw]) {
+      router.replace(`/actions?tab=${CAPABILITY_FOCUS[raw]}`);
       return;
     }
+    const focus = LEGACY_FOCUS[raw] ?? raw;
     requestAnimationFrame(() => scrollToFocus(focus));
   }, [loaded, router, scrollToFocus]);
 
-  // 滚动跟随高亮：观察每张卡片、视口上半区内最靠前的算当前节
+  // 滚动跟随高亮：观察每张组卡、视口上半区内最靠前的算当前节
   useEffect(() => {
     if (!loaded) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        // 取「进入视口上缘区域」里最靠上的卡片
         const visible = entries
           .filter((e) => e.isIntersecting)
           .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
@@ -149,7 +162,7 @@ const SettingsPage = () => {
     return () => observer.disconnect();
   }, [loaded]);
 
-  // 卡片外层包稳定 id + 锚点高亮 ring；scroll-mt 给 sticky 顶栏留出定位余量
+  // 组卡外层包稳定 id + 锚点高亮 ring；scroll-mt 给 sticky 顶栏留出定位余量
   const wrapCard = (focus: string, node: ReactNode) => (
     <div
       id={`card-${focus}`}
@@ -177,8 +190,6 @@ const SettingsPage = () => {
       {/* 左侧锚点导航：sticky 跟随、点击定位、滚动高亮当前节 */}
       <nav className="sticky top-6 hidden h-fit w-40 shrink-0 flex-col gap-0.5 self-start md:flex">
         <div className="mb-2 px-2 text-xs font-medium text-muted-foreground">设置</div>
-        {/* 选中态封装在 ChoiceButton 里（用户拍板「规范封装进组件、AI 用了就是规范」）、
-            不再手拼 className */}
         {NAV_ITEMS.map((item) => (
           <ChoiceButton
             key={item.focus}
@@ -190,7 +201,7 @@ const SettingsPage = () => {
             {item.label}
           </ChoiceButton>
         ))}
-        {/* 能力入口指路（MCP / Skill / Action 已迁能力页；文案短、用户点名「太长」） */}
+        {/* 能力入口指路（MCP / Skill / Action 已迁能力页） */}
         <div className="mt-3 border-t pt-2">
           <button
             type="button"
@@ -227,68 +238,71 @@ const SettingsPage = () => {
           </div>
         </div>
 
+        {/* ---- 连接：外部服务凭据（Cursor / GitLab / 飞书）---- */}
         {wrapCard(
-          "api-key",
-          <ApiKeyCard
-            apiKey={settings.apiKey}
-            info={apiKeyInfo}
-            onChange={(v) => update("apiKey", v)}
-            onCommit={handleApiKeyCommit}
-            onValidate={validateApiKey}
-            validating={modelsLoading || infoLoading}
-          />,
+          "connect",
+          <Card>
+            <CardHeader>
+              <CardTitle>连接</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <ApiKeySection
+                apiKey={settings.apiKey}
+                info={apiKeyInfo}
+                onChange={(v) => update("apiKey", v)}
+                onCommit={handleApiKeyCommit}
+                onValidate={validateApiKey}
+                validating={modelsLoading || infoLoading}
+              />
+              <Separator />
+              <GitLabSection
+                gitToken={settings.gitToken ?? ""}
+                onTokenChange={(v) => update("gitToken", v)}
+                onTokenCommit={(v) => saveFieldValue("gitToken", v)}
+              />
+              <Separator />
+              <FeishuCliSection />
+            </CardContent>
+          </Card>,
         )}
 
-        {/* 飞书集成紧跟 API Key（用户拍板：两个都是「接外部服务」的一等配置、放一起） */}
-        {wrapCard("feishu", <FeishuCliCard />)}
-
+        {/* ---- 偏好：个人工作方式（IDE / 分支模板 / 快捷键 / 续用 / 默认模型）---- */}
         {wrapCard(
-          "profile",
-          <UserProfileCard
-            branchTemplate={settings.branchTemplate ?? ""}
-            jumpIde={settings.jumpIde ?? "cursor"}
-            onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
-            onBranchTemplateChange={(v) => update("branchTemplate", v)}
-            onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
-          />,
+          "prefs",
+          <Card>
+            <CardHeader>
+              <CardTitle>偏好</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <ProfileSection
+                branchTemplate={settings.branchTemplate ?? ""}
+                jumpIde={settings.jumpIde ?? "cursor"}
+                onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
+                onBranchTemplateChange={(v) => update("branchTemplate", v)}
+                onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
+              />
+              <Separator />
+              <InteractionSection
+                submitShortcut={settings.submitShortcut ?? "mod-enter"}
+                reuseAgentDefault={settings.reuseAgentDefault ?? false}
+                onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
+                onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
+              />
+              <Separator />
+              <ModelSection
+                models={models}
+                modelsError={modelsError}
+                selection={settings.defaultModel}
+                onChange={(next) => saveFieldValue("defaultModel", next)}
+                apiKey={settings.apiKey}
+                refreshing={modelsLoading}
+                onRefresh={fetchModels}
+              />
+            </CardContent>
+          </Card>,
         )}
 
-        {wrapCard(
-          "preference",
-          <PreferenceCard
-            submitShortcut={settings.submitShortcut ?? "mod-enter"}
-            reuseAgentDefault={settings.reuseAgentDefault ?? false}
-            onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
-            onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
-          />,
-        )}
-
-        {wrapCard(
-          "git",
-          <GitCard
-            gitHost={settings.gitHost ?? ""}
-            gitToken={settings.gitToken ?? ""}
-            repos={settings.repos}
-            onHostChange={(v) => update("gitHost", v)}
-            onTokenChange={(v) => update("gitToken", v)}
-            onHostCommit={(v) => saveFieldValue("gitHost", v)}
-            onTokenCommit={(v) => saveFieldValue("gitToken", v)}
-          />,
-        )}
-
-        {wrapCard(
-          "model",
-          <ModelCard
-            models={models}
-            modelsError={modelsError}
-            selection={settings.defaultModel}
-            onChange={(next) => saveFieldValue("defaultModel", next)}
-            apiKey={settings.apiKey}
-            refreshing={modelsLoading}
-            onRefresh={fetchModels}
-          />,
-        )}
-
+        {/* ---- 仓库 ---- */}
         {wrapCard(
           "repos",
           <RepoCard
@@ -298,6 +312,7 @@ const SettingsPage = () => {
           />,
         )}
 
+        {/* ---- 存储 ---- */}
         {wrapCard("storage", <StorageCard />)}
       </div>
     </div>
