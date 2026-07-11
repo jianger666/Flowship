@@ -245,7 +245,7 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
 const installMeegle = async (log: (line: string) => void): Promise<void> => {
   const { version, dist } = await fetchNpmLatestMeta("@lark-project/meegle");
   // 增量语义：已装且版本一致 → 跳过（同 installLarkCli）
-  const installed = await probeVersion(meegleBin());
+  const installed = await probeVersion(meegleBin(), { preferSubcommand: true });
   if (installed === version) {
     log(`meegle v${version} 已是最新、跳过`);
     return;
@@ -386,6 +386,9 @@ interface InstallState {
 const G = globalThis as unknown as {
   __feishuCliInstall?: InstallState;
   __feishuCliLogins?: Map<string, LoginState>;
+  // 状态快照缓存 + 后台刷新 single-flight（v1.1.x 启动提速、见「状态探测」节）
+  __feishuStatusCache?: StatusSnapshot | null;
+  __feishuStatusRefreshing?: Promise<StatusSnapshot> | null;
 };
 
 /**
@@ -402,6 +405,7 @@ export const uninstallFeishuTools = async (): Promise<void> => {
   await fs.rm(getToolsSkillsDir(), { recursive: true, force: true });
   await fs.rm(path.join(os.homedir(), ".lark-cli"), { recursive: true, force: true });
   await fs.rm(path.join(os.homedir(), ".meegle"), { recursive: true, force: true });
+  invalidateStatusCache();
   console.log("[feishu-cli] 已卸载（bin + skills + 配置/登录态 全部删除）");
 };
 
@@ -432,6 +436,8 @@ export const startInstall = (): boolean => {
     } finally {
       state.running = false;
       state.finishedAt = Date.now();
+      // 装完状态一定变了：失效缓存、设置页下一次 GET 拿真值
+      invalidateStatusCache();
     }
   })();
   return true;
@@ -548,6 +554,8 @@ export const startLogin = async (
     child.on("exit", (code) => {
       state.running = false;
       state.exitCode = code;
+      // 登录态可能变了（成功 / 失效都算）：失效状态缓存、下一次 GET 拿真值
+      invalidateStatusCache();
       if (code !== 0) {
         // 带上 CLI 输出尾部（真实报错在这）——只给 code 用户和维护者都没法排查
         //（同事实测「code=3」猜不出原因）；完整 tail 落 main.log、诊断包可取
@@ -580,10 +588,23 @@ export interface CliToolStatus {
   authDetail?: string;
 }
 
-const probeVersion = async (bin: string): Promise<string | null> => {
+// 两个 CLI 的状态快照（缓存 / 接口返回的最小单元）
+export interface StatusSnapshot {
+  larkCli: CliToolStatus;
+  meegle: CliToolStatus;
+}
+
+const probeVersion = async (
+  bin: string,
+  opts: { preferSubcommand?: boolean } = {},
+): Promise<string | null> => {
   // lark-cli 认 `--version` flag；meegle（cobra CLI）只有 `version` 子命令、
-  // 传 --version 报 unknown flag exit 1（实测踩过：装好了却被 UI 判「未安装」）——两种都试
-  for (const args of [["--version"], ["version"]]) {
+  // 传 --version 报 unknown flag exit 1（实测踩过：装好了却被 UI 判「未安装」）——两种都试。
+  // preferSubcommand：meegle 先试 `version`、省一次必败的 spawn（每次白等一轮进程起落）
+  const forms = opts.preferSubcommand
+    ? [["version"], ["--version"]]
+    : [["--version"], ["version"]];
+  for (const args of forms) {
     try {
       const { stdout } = await execFileAsync(bin, args, { timeout: 10_000 });
       // 形如 "lark-cli version 1.0.66" / 裸 "1.0.16"、抓第一个语义化版本号
@@ -626,13 +647,11 @@ const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }
 const binExists = async (p: string): Promise<boolean> =>
   !!(await fs.stat(p).catch(() => null));
 
-export const getFeishuCliStatus = async (): Promise<{
-  larkCli: CliToolStatus;
-  meegle: CliToolStatus;
-}> => {
+// 真探测（4 个子进程 + auth status 打网络验 token、Windows Defender 首扫下可拖数秒~十几秒）
+const probeStatusNow = async (): Promise<StatusSnapshot> => {
   const [larkVer, meegleVer, larkOnDisk, meegleOnDisk] = await Promise.all([
     probeVersion(larkCliBin()),
-    probeVersion(meegleBin()),
+    probeVersion(meegleBin(), { preferSubcommand: true }),
     binExists(larkCliBin()),
     binExists(meegleBin()),
   ]);
@@ -661,4 +680,65 @@ export const getFeishuCliStatus = async (): Promise<{
     meegle.authDetail = meegleAuth.detail;
   }
   return { larkCli, meegle };
+};
+
+// ----------------- 状态缓存（v1.1.x、同事实测「启动很慢」根因） -----------------
+//
+// 根因链：首页就绪清单 gate 阻塞在 /api/system/feishu-cli GET、而状态探测每次都
+// 真 spawn 4 个子进程（version ×2 + auth status ×2）——Windows Defender 首扫二进制
+// 可拖数秒、`auth status` 还要打网络验 token → 每次启动首页 loading 都卡这一截。
+//
+// 修法 stale-while-revalidate：内存 + 磁盘双缓存、有缓存**立即返回**、后台 single-flight
+// 真探测刷新（首页 3s 轮询下一轮拿到新值）；全新用户没缓存时真探测本身很快
+//（bin 不存在 execFile 立即 ENOENT）、不受影响。安装 / 登录 / 卸载后主动失效、
+// 设置页操作完拿到的一定是真值。
+
+const statusCacheFile = (): string => path.join(getToolsDir(), "status-cache.json");
+
+// 后台真探测 + 落双缓存（single-flight：并发 GET 只探一次）
+const refreshStatusCache = (): Promise<StatusSnapshot> => {
+  if (G.__feishuStatusRefreshing) return G.__feishuStatusRefreshing;
+  G.__feishuStatusRefreshing = (async () => {
+    try {
+      const snap = await probeStatusNow();
+      G.__feishuStatusCache = snap;
+      try {
+        await fs.mkdir(getToolsDir(), { recursive: true });
+        await fs.writeFile(statusCacheFile(), JSON.stringify(snap));
+      } catch {
+        /* 缓存写不进不影响功能 */
+      }
+      return snap;
+    } finally {
+      G.__feishuStatusRefreshing = null;
+    }
+  })();
+  return G.__feishuStatusRefreshing;
+};
+
+// 安装 / 登录 / 卸载后调：下一次 GET 走真探测（用户正守着设置页、等真值可接受）
+const invalidateStatusCache = (): void => {
+  G.__feishuStatusCache = null;
+  void fs.rm(statusCacheFile(), { force: true }).catch(() => {});
+};
+
+export const getFeishuCliStatus = async (): Promise<StatusSnapshot> => {
+  // 内存缓存：立即返回、后台刷新
+  if (G.__feishuStatusCache) {
+    void refreshStatusCache().catch(() => {});
+    return G.__feishuStatusCache;
+  }
+  // 磁盘缓存（上次进程的快照、跨重启生效——启动提速的主力）：立即返回、后台刷新
+  try {
+    const raw = await fs.readFile(statusCacheFile(), "utf8");
+    const snap = JSON.parse(raw) as StatusSnapshot;
+    if (snap?.larkCli && snap?.meegle) {
+      G.__feishuStatusCache = snap;
+      void refreshStatusCache().catch(() => {});
+      return snap;
+    }
+  } catch {
+    /* 没缓存 / 缓存坏 → 真探测 */
+  }
+  return refreshStatusCache();
 };

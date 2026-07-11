@@ -142,10 +142,12 @@ export const FeishuBoard = () => {
     return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
   });
 
-  // mount：先吃缓存秒开（按空间分 key）、再后台刷新
+  // mount：先吃缓存秒开（按空间分 key）、再后台刷新。
+  // v1.1.x 换 localStorage：跨重启也秒开（同事实测「启动很慢」、重启后 session 缓存
+  // 全空、首屏干等飞书接口）——旧数据先亮、refreshing 转圈提示在刷
   useEffect(() => {
     try {
-      const cached = sessionStorage.getItem(`${CACHE_KEY}.${spaceKey ?? ""}`);
+      const cached = localStorage.getItem(`${CACHE_KEY}.${spaceKey ?? ""}`);
       if (cached) setResp(JSON.parse(cached) as BoardResp);
     } catch {
       /* 缓存坏了忽略 */
@@ -163,7 +165,7 @@ export const FeishuBoard = () => {
       const r = await fetch(`/api/feishu/board?${qs.toString()}`);
       const data = (await r.json()) as BoardResp;
       try {
-        sessionStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
+        localStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
       } catch {
         /* 超配额忽略 */
       }
