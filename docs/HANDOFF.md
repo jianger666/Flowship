@@ -309,7 +309,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **长会话上下文结论（用户问）**：SDK 本地 agent 与 CLI/IDE 同 runtime、context 满自动摘要交给 Cursor 管、我们不干预；SDK 无 fork/checkpoint API（能力面只有 create/prompt/resume/send/getRun）、真要「从此处开新对话」只能截断历史 + 新会话、列为将来独立功能
 - **工作台侧栏降噪**（用户实测「有那么多状态反而更杂乱」）：监控行只在 运行中/待确认/待回答 出现、空闲/静息/失败一律单行只标题（失败不标同行首指示原则——陈年断线 error 满屏红字是噪声主源）；工作台折叠组「更早（超7天）」→「已终结（已合入/已放弃）」（时间分组是对话的逻辑不是任务的）、对话侧保持按时间
 - **设置页瘦身 + 能力页**（用户拍板「能力集中一个页面配置、设置页锚点侧导航」）：/actions 升级「能力页」tab 三分（Action=原自定义 action 管理整体迁入 / Skill=SkillsCard / MCP=McpCard+useSettings 落盘链路）；设置页删 MCP/Skills 卡、加左侧 sticky 锚点导航（点击定位 + IntersectionObserver 滚动跟随高亮）；旧深链兼容：settingsUrl("mcp"/"skills") 直出 /actions?tab=、设置页 ?focus=mcp|skills 兜底重定向
-- **新用户「开始使用」就绪清单**（用户点名「飞书工具是最重要的、要保证新用户进来就配」）：`setup-checklist.tsx`——三项就绪度（API Key / 飞书工具两 CLI 装+登 / ≥1 仓库）任一未完成时**占据首页看板位**、每步行内直接可操作（key 输入 / 内嵌 FeishuCliCard / 原生选目录）、全就绪自动切看板；不做 wizard（能跳过=不出现、清单配不完每次打开都在才叫「保证」）；gate 和清单必须共用同一 useSettings 实例（各自 hook 实例间无订阅、保存后打勾不实时——踩过）
+- **新用户「开始使用」就绪清单**（用户点名「飞书工具是最重要的、要保证新用户进来就配」）：`setup-checklist.tsx`——三项就绪度（API Key / 飞书工具两 CLI 装+登 / ≥1 仓库）任一未完成时**占据首页看板位**、全就绪自动切看板；不做 wizard（能跳过=不出现、清单配不完每次打开都在才叫「保证」）。用户实测后简化：单卡三行、每行 = 状态勾 + 标题 + 「去配置」跳设置页对应卡（配置本体都在设置页、行内不塞输入）
+- **⚠️ config.json 密钥丢失事故 + PUT 守卫（同日实修）**：test 实例 apiKey 被清空（其余字段完好）——整对象 PUT 的 lost-update：某会话内存 cache 缺 apiKey、之后任意「编辑即保存」把整份 stale cache 落盘。修法：`preserveSecretsOnPut`（settings-fs、有单测）——PUT 进来 apiKey/gitToken 为空或带脱敏掩码而盘上有真值 → 保留盘上值（代价：密钥清不掉只能覆盖、真实工作流无清空需求）；`recordModelUsage` 先 `await initSettings()` 再整对象落盘（启动早期 stale cache 第二道防线）。彻底解法是字段级 PATCH、择机重构
+- **中性页壳适配**（用户点名「设置页里为啥工作台 active、左边还有侧边栏」）：/settings、/actions 归 standalone 页型——任务侧栏自动收（这两页有自己的内部导航、叠上去是双侧栏）、顶栏胶囊两段都不高亮；胶囊 + 右上角图标加大一档（用户确认「做明显点」）
 
 ### 2026-07-10 夜 v1.0 界面重构 + Markdown 渲染升级（用户拍板、Grok 蓝军审核过）
 

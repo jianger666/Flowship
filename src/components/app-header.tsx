@@ -19,7 +19,7 @@
  */
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { Blocks, LayoutDashboard, MessageSquare, PanelLeft, Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
@@ -61,12 +61,13 @@ interface AppHeaderProps {
  * 胶囊双模式切换（v1.0 界面重构核心）：顶栏居中、点段切模式——
  * 工作台 → `/`（飞书看板 + task 类任务）、对话 → `/chats`（chat 类任务落点）。
  * 当前模式由 URL 推导（useAppMode）、不是本地 state——刷新 / 直开链接不漂移。
+ * 中性页（设置 / 能力页）两段都不高亮（用户点名「设置页里为啥工作台 active」）。
  */
-const ModeSwitch = ({ mode }: { mode: AppMode }) => {
+const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
   const router = useRouter();
   const segments: Array<{ key: AppMode; label: string; icon: React.ReactNode; href: string }> = [
-    { key: "work", label: "工作台", icon: <LayoutDashboard className="size-3.5" />, href: "/" },
-    { key: "chat", label: "对话", icon: <MessageSquare className="size-3.5" />, href: "/chats" },
+    { key: "work", label: "工作台", icon: <LayoutDashboard className="size-4" />, href: "/" },
+    { key: "chat", label: "对话", icon: <MessageSquare className="size-4" />, href: "/chats" },
   ];
   return (
     <div
@@ -83,7 +84,8 @@ const ModeSwitch = ({ mode }: { mode: AppMode }) => {
             aria-selected={active}
             onClick={() => router.push(s.href)}
             className={cn(
-              "flex cursor-pointer items-center gap-1.5 rounded-full px-3.5 py-1 text-xs font-medium transition-colors duration-200",
+              // 尺寸加大一档（px-4 py-1.5 text-sm、用户确认「做明显点」）——顶栏一等导航
+              "flex cursor-pointer items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors duration-200",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
               active
                 ? "bg-background text-foreground shadow-sm"
@@ -110,6 +112,10 @@ export const AppHeader = ({
   const [platform, setPlatform] = useState("");
   // 当前模式（URL 推导）——胶囊高亮 + 侧栏过滤都用它
   const mode = useAppMode();
+  // 中性页（设置 / 能力页）：胶囊两段都不高亮（这两页不属于任一模式）
+  const pathname = usePathname();
+  const isNeutralPage =
+    pathname.startsWith("/settings") || pathname.startsWith("/actions");
 
   useEffect(() => {
     setPlatform(window.__shell?.platform ?? "");
@@ -160,9 +166,9 @@ export const AppHeader = ({
         </Button>
       </div>
 
-      {/* 居中：工作台 / 对话 胶囊切换（v1.0 双模式核心） */}
+      {/* 居中：工作台 / 对话 胶囊切换（v1.0 双模式核心）；中性页不高亮任一段 */}
       <div className="absolute left-1/2 -translate-x-1/2 [-webkit-app-region:no-drag]">
-        <ModeSwitch mode={mode} />
+        <ModeSwitch mode={isNeutralPage ? null : mode} />
       </div>
 
       {/* 右：功能键（win 让出右上角窗口控制按钮位）；主题 / 设置统一纯图标 ghost、规格对齐 */}
@@ -176,10 +182,12 @@ export const AppHeader = ({
         <UpdateBadge />
         {/* 主题切换（浅色 / 深色 / 跟随系统） */}
         <ThemeToggle />
-        {/* 能力页入口（Action / Skill / MCP 集中管理、v1.0.x） */}
+        {/* 能力页入口（Action / Skill / MCP 集中管理、v1.0.x）；
+            图标升一档尺寸（用户确认「做明显点」）+ [&_svg] 放大 */}
         <Button
           variant="ghost"
-          size="icon-sm"
+          size="icon"
+          className="[&_svg:not([class*='size-'])]:size-4.5"
           nativeButton={false}
           render={
             <Link
@@ -194,7 +202,8 @@ export const AppHeader = ({
         </Button>
         <Button
           variant="ghost"
-          size="icon-sm"
+          size="icon"
+          className="[&_svg:not([class*='size-'])]:size-4.5"
           nativeButton={false}
           render={
             <Link

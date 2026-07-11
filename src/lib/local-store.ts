@@ -328,21 +328,27 @@ const MODEL_USAGE_CAP = 20;
  */
 export const recordModelUsage = (sel: ModelSelection): void => {
   if (!sel.id?.trim()) return;
-  const s = getSettings();
-  const key = modelUsageKey(sel);
-  const list = [...(s.modelUsage ?? [])];
-  const idx = list.findIndex((e) => modelUsageKey(e) === key);
-  if (idx >= 0) {
-    list[idx] = { ...list[idx], count: list[idx].count + 1, lastUsedAt: Date.now() };
-  } else {
-    list.push({ id: sel.id, params: sel.params, count: 1, lastUsedAt: Date.now() });
-  }
-  if (list.length > MODEL_USAGE_CAP) {
-    list.sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt);
-    list.length = MODEL_USAGE_CAP;
-  }
-  // 计数是尽力而为的统计、写失败无需打扰用户（下次使用再计）
-  void saveSettings({ ...s, modelUsage: list });
+  // 先确保 cache 已从 config.json 灌注再整对象落盘——启动早期（init 未完成 / 失败）时
+  // cache 可能还是 localStorage 兜底 / 默认值、直接 saveSettings 会把 stale 整份写盘、
+  // 静默丢掉其它字段（v1.0.x 真实事故：apiKey 被这类 lost-update 清空；服务端已加密钥守卫、
+  // 这里是第二道：非密钥字段同样别用 stale cache 覆盖）
+  void initSettings().then(() => {
+    const s = getSettings();
+    const key = modelUsageKey(sel);
+    const list = [...(s.modelUsage ?? [])];
+    const idx = list.findIndex((e) => modelUsageKey(e) === key);
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], count: list[idx].count + 1, lastUsedAt: Date.now() };
+    } else {
+      list.push({ id: sel.id, params: sel.params, count: 1, lastUsedAt: Date.now() });
+    }
+    if (list.length > MODEL_USAGE_CAP) {
+      list.sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt);
+      list.length = MODEL_USAGE_CAP;
+    }
+    // 计数是尽力而为的统计、写失败无需打扰用户（下次使用再计）
+    void saveSettings({ ...s, modelUsage: list });
+  });
 };
 
 /**

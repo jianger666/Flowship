@@ -17,6 +17,7 @@ process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
 import {
   getRepoPreviewCommand,
   maskSettingsSecrets,
+  preserveSecretsOnPut,
   readSettingsFile,
 } from "@/lib/server/settings-fs";
 
@@ -57,6 +58,47 @@ describe("maskSettingsSecrets", () => {
   it("未配置的密钥掩码为空串（不显示假掩码）", () => {
     expect(maskSettingsSecrets({ apiKey: "", gitToken: undefined }).apiKey).toBe("");
     expect(maskSettingsSecrets({}).gitToken).toBe("");
+  });
+});
+
+describe("preserveSecretsOnPut（密钥只升不降、v1.0.x 真实事故回归）", () => {
+  const disk = { apiKey: "sk-real-key", gitToken: "glpat-real", repos: [1] };
+
+  it("PUT 带空密钥 + 盘上有真值 → 保留盘上值（stale cache 整对象覆盖不丢密钥）", () => {
+    const { settings, preserved } = preserveSecretsOnPut(
+      { apiKey: "", gitToken: "glpat-real", repos: [1, 2] },
+      disk,
+    );
+    expect(settings.apiKey).toBe("sk-real-key");
+    expect(settings.repos).toEqual([1, 2]); // 非密钥字段照常用进来的
+    expect(preserved).toEqual(["apiKey"]);
+  });
+
+  it("PUT 带脱敏掩码（client 误把展示值回写）→ 保留盘上值", () => {
+    const { settings, preserved } = preserveSecretsOnPut(
+      { apiKey: "sk-r…（已脱敏、长度 11）", gitToken: "" },
+      disk,
+    );
+    expect(settings.apiKey).toBe("sk-real-key");
+    expect(settings.gitToken).toBe("glpat-real");
+    expect(preserved).toEqual(["apiKey", "gitToken"]);
+  });
+
+  it("PUT 带新真值 → 正常覆盖（改密钥不受守卫影响）", () => {
+    const { settings, preserved } = preserveSecretsOnPut(
+      { apiKey: "sk-new-key", gitToken: "glpat-new" },
+      disk,
+    );
+    expect(settings.apiKey).toBe("sk-new-key");
+    expect(settings.gitToken).toBe("glpat-new");
+    expect(preserved).toEqual([]);
+  });
+
+  it("盘上本来就空 / 首次落盘（current=null）→ 不干预", () => {
+    expect(
+      preserveSecretsOnPut({ apiKey: "" }, { apiKey: "" }).settings.apiKey,
+    ).toBe("");
+    expect(preserveSecretsOnPut({ apiKey: "" }, null).preserved).toEqual([]);
   });
 });
 

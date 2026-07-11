@@ -49,9 +49,9 @@ export const ThemeToggle = () => {
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         aria-label="切换主题"
-        className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }))}
+        className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
       >
-        <TriggerIcon className="size-4" />
+        <TriggerIcon className="size-4.5" />
       </PopoverTrigger>
       <PopoverContent align="end" className="w-40 space-y-0.5 p-1.5">
         {THEME_OPTIONS.map(({ value, label, icon: Icon }) => {

@@ -12,6 +12,7 @@ import { dataRoot } from "@/lib/server/data-root";
 import { errorResponse } from "@/lib/server/route-helpers";
 import {
   maskSettingsSecrets,
+  preserveSecretsOnPut,
   readSettingsFile,
   settingsFilePath,
 } from "@/lib/server/settings-fs";
@@ -79,10 +80,22 @@ export const PUT = async (req: Request): Promise<Response> => {
     const dir = dataRoot();
     await fs.mkdir(dir, { recursive: true });
     const finalPath = configPath();
+    // 密钥只升不降守卫（v1.0.x 真实事故：stale cache 整对象 PUT 把盘上 apiKey 清空）：
+    // 进来的 apiKey / gitToken 为空或带脱敏掩码、而盘上有真值 → 保留盘上值
+    const current = await readSettingsFile();
+    const { settings: guarded, preserved } = preserveSecretsOnPut(
+      body as Record<string, unknown>,
+      current,
+    );
+    if (preserved.length > 0) {
+      console.warn(
+        `[/api/settings] PUT 带空/掩码密钥字段（${preserved.join(", ")}）、已保留盘上真值（防 stale cache 覆盖）`,
+      );
+    }
     const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
       .toString(36)
       .slice(2)}`;
-    await fs.writeFile(tmpPath, JSON.stringify(body, null, 2), "utf-8");
+    await fs.writeFile(tmpPath, JSON.stringify(guarded, null, 2), "utf-8");
     await fs.rename(tmpPath, finalPath);
     // 首次落盘后补迁移（marker 已在则零开销）、把最终盘上内容返给 client 回填
     await migrateCursorMcpOnce();
