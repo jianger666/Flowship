@@ -37,12 +37,10 @@ import { getSettings } from "@/lib/local-store";
 import { cn } from "@/lib/utils";
 
 import { ApiKeySection } from "@/components/settings/api-key-card";
-import { ModelSection } from "@/components/settings/model-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { StorageCard } from "@/components/settings/storage-card";
-import { ProfileSection } from "@/components/settings/user-profile-card";
 import { GitLabSection } from "@/components/settings/git-card";
-import { InteractionSection } from "@/components/settings/preference-card";
+import { PreferenceSections } from "@/components/settings/preference-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
 import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
@@ -300,37 +298,32 @@ const SettingsPage = () => {
           </Card>,
         )}
 
-        {/* ---- 偏好：个人工作方式（IDE / 分支模板 / 快捷键 / 续用 / 默认模型）---- */}
+        {/* ---- 偏好：统一设置行（每项一行「名称+说明 | 控件」、divide-y 分隔——
+             原「三小节各自小标题」层级太多、用户实测「还是有点乱」后定型） ---- */}
         {wrapCard(
           "prefs",
           <Card>
             <CardHeader>
               <CardTitle>偏好</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-5">
-              <ProfileSection
-                branchTemplate={settings.branchTemplate ?? ""}
+            <CardContent>
+              <PreferenceSections
                 jumpIde={settings.jumpIde ?? "cursor"}
                 onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
+                branchTemplate={settings.branchTemplate ?? ""}
                 onBranchTemplateChange={(v) => update("branchTemplate", v)}
                 onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}
-              />
-              <Separator />
-              <InteractionSection
                 submitShortcut={settings.submitShortcut ?? "mod-enter"}
                 reuseAgentDefault={settings.reuseAgentDefault ?? false}
                 onSubmitShortcutChange={(v) => saveFieldValue("submitShortcut", v)}
                 onReuseAgentDefaultChange={(v) => saveFieldValue("reuseAgentDefault", v)}
-              />
-              <Separator />
-              <ModelSection
                 models={models}
                 modelsError={modelsError}
-                selection={settings.defaultModel}
-                onChange={(next) => saveFieldValue("defaultModel", next)}
+                modelSelection={settings.defaultModel}
+                onModelChange={(next) => saveFieldValue("defaultModel", next)}
                 apiKey={settings.apiKey}
-                refreshing={modelsLoading}
-                onRefresh={fetchModels}
+                modelsRefreshing={modelsLoading}
+                onModelsRefresh={fetchModels}
               />
             </CardContent>
           </Card>,
