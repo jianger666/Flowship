@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { BrandMark } from "@/components/ui/brand-mark";
 import { Card, CardContent } from "@/components/ui/card";
 
 /**
@@ -8,15 +9,14 @@ import { Card, CardContent } from "@/components/ui/card";
  * 风格不一致（Card vs 裸 div、「...」vs「…」）。
  *
  * variant：
- * - hero：页面级通用 loading（v1.0.x 用户点名「通用的好看的全局 loading」）——
- *   双弧环（主题色渐变弧快转 + 细弧反向慢转）+ 中心柔光呼吸；
- *   纯 CSS 动画（globals.css hero-*）、reduced-motion 自动降级静态环
+ * - hero：页面级 loading = 品牌 logo「雷芯」通电形态（v1.0.x logo 重设计、
+ *   用户拍板「loading 和 logo 同一图形」）——电流沿闪电轮廓环流 + 光晕呼吸；
+ *   动画 CSS 见 globals.css brand-*、reduced-motion 自动降级静态 logo
  * - block：屏幕中部一段灰色文本（不适合动画的小场景用）
  * - card：用 Card 包裹（列表 loading 用、跟其他卡片视觉对齐）
  * - inline：行内一小段灰色文本（按钮旁、面板里小区块用）
  *
  * 文案统一用「加载中…」（中文省略号、视觉上比「...」更内敛）。
- * 调用方可通过 `label` 覆盖文案（如「正在拉取飞书排期…」）。
  */
 
 interface LoadingStateProps {
@@ -28,18 +28,13 @@ interface LoadingStateProps {
 const HeroLoading = ({ label, className }: { label: string; className?: string }) => (
   <div
     className={cn(
-      "flex h-full min-h-[60vh] flex-col items-center justify-center gap-5",
+      "flex h-full min-h-[60vh] flex-col items-center justify-center gap-4",
       className,
     )}
     role="status"
     aria-label={label}
   >
-    {/* 双弧环 + 柔光：三层同心、全 CSS 动画 */}
-    <div className="relative size-12">
-      <div className="hero-loading-glow absolute inset-0 rounded-full" aria-hidden />
-      <div className="hero-loading-ring absolute inset-0 rounded-full" aria-hidden />
-      <div className="hero-loading-ring-inner absolute inset-[7px] rounded-full" aria-hidden />
-    </div>
+    <BrandMark size={52} animated />
     <div className="text-sm text-muted-foreground">{label}</div>
   </div>
 );

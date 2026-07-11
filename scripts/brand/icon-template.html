@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  桌面图标渲染模板（v1.0.x logo「雷芯」、与 src/components/ui/brand-mark.tsx 同一套几何）
+
+  用 headless Chrome 截图产出位图（node scripts/brand/render-icons.mjs 一键跑）：
+    ?mode=mac  → 1024×1024 满幅方图（mac：Tahoe 系统自动加 squircle 圆角、不能预圆角）
+    ?mode=win  → 1024×1024 预圆角（26.5% 半径、四角透明——win 不会自动圆角）
+    ?mode=logo → 512×512 预圆角（public/logo.png 通用资产）
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  * { margin: 0; }
+  html, body { background: transparent; }
+  #tile {
+    width: 1024px; height: 1024px;
+    background: linear-gradient(150deg, #23252d 0%, #131419 62%, #0c0d11 100%);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden;
+  }
+  /* 顶部内高光：一条极浅的白色渐变、增加「实体感」 */
+  #tile::before {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(180deg, #ffffff14 0%, transparent 18%);
+  }
+  .rounded { border-radius: 26.5%; }
+</style>
+</head>
+<body>
+  <div id="tile">
+    <svg id="mark" width="660" height="660" viewBox="0 0 48 48" fill="none">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#fcd34d"/><stop offset="1" stop-color="#f59e0b"/>
+        </linearGradient>
+      </defs>
+      <path d="M27 4 L10 27 H21 L18 44 L38 19 H26 Z" fill="url(#g)" stroke="url(#g)" stroke-width="2.5" stroke-linejoin="round"/>
+      <path d="M13 33 L34 12" stroke="#131419" stroke-width="3.4" stroke-linecap="round"/>
+      <circle cx="13" cy="33" r="2.2" fill="#131419"/>
+      <circle cx="34" cy="12" r="2.2" fill="#131419"/>
+    </svg>
+  </div>
+<script>
+  const mode = new URLSearchParams(location.search).get("mode") ?? "mac";
+  const tile = document.getElementById("tile");
+  if (mode !== "mac") tile.classList.add("rounded");
+  if (mode === "logo") {
+    tile.style.width = tile.style.height = "512px";
+    document.getElementById("mark").setAttribute("width", "330");
+    document.getElementById("mark").setAttribute("height", "330");
+  }
+</script>
+</body>
+</html>

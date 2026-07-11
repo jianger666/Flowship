@@ -240,68 +240,42 @@
   border: none;
   border-radius: 0.5rem;
 }
-/* ---------- Hero loading（v1.0.x、用户点名「通用的好看的全局 loading」） ----------
-   双弧环：主题色渐变弧顺时针快转 + 半透明细弧逆时针慢转、中心柔光呼吸——
-   通用（不绑任何页面语义）、有层次但克制。全 CSS、
-   prefers-reduced-motion 下停动画只留静态圆环。 */
-@keyframes hero-spin {
+/* ---------- 品牌 loading（v1.0.x、logo 重设计「雷芯」+ 用户拍板「loading = logo 通电」） ----------
+   BrandMark（components/ui/brand-mark.tsx）animated 形态用：
+   - brand-current：一段亮电流沿闪电轮廓环流（pathLength=100 归一、dash 偏移循环）
+   - brand-glow：背后琥珀光晕呼吸
+   prefers-reduced-motion 下停动画、只留静态 logo。 */
+@keyframes brand-flow {
   to {
-    transform: rotate(360deg);
+    stroke-dashoffset: -100;
   }
 }
-@keyframes hero-spin-rev {
-  to {
-    transform: rotate(-360deg);
-  }
-}
-@keyframes hero-glow {
+@keyframes brand-glow-breathe {
   0%,
   100% {
-    opacity: 0.25;
-    transform: scale(0.85);
+    opacity: 0.15;
+    transform: scale(0.9);
   }
   50% {
-    opacity: 0.6;
+    opacity: 0.9;
     transform: scale(1.05);
   }
 }
-/* 外弧：主题色渐变尾迹（conic 渐变 + mask 抠成环） */
-.hero-loading-ring {
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    transparent 70deg,
-    color-mix(in oklch, var(--primary) 85%, transparent) 360deg
-  );
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
-  animation: hero-spin 1s cubic-bezier(0.45, 0.1, 0.55, 0.9) infinite;
+.brand-current {
+  stroke-dasharray: 16 84;
+  animation: brand-flow 1.5s linear infinite;
 }
-/* 内弧：细、反向、慢——两层错动出「机械感」层次 */
-.hero-loading-ring-inner {
-  background: conic-gradient(
-    from 180deg,
-    transparent 0deg,
-    transparent 200deg,
-    color-mix(in oklch, var(--muted-foreground) 55%, transparent) 360deg
-  );
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
-  animation: hero-spin-rev 2.4s linear infinite;
-}
-/* 中心柔光：呼吸节律、给环一点体积感 */
-.hero-loading-glow {
-  background: radial-gradient(
-    circle,
-    color-mix(in oklch, var(--primary) 30%, transparent) 0%,
-    transparent 70%
-  );
-  animation: hero-glow 2s ease-in-out infinite;
+.brand-glow {
+  transform-origin: 24px 24px;
+  animation: brand-glow-breathe 1.8s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .hero-loading-ring,
-  .hero-loading-ring-inner,
-  .hero-loading-glow {
+  .brand-current {
+    animation: none;
+    stroke-dasharray: none;
+    opacity: 0;
+  }
+  .brand-glow {
     animation: none;
   }
 }
