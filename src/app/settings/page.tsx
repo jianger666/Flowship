@@ -95,6 +95,45 @@ const SettingsPage = () => {
     validateApiKey(value);
   };
 
+  // GitLab host 自动烘焙（用户拍板「选仓库时就推导、别等推进」）：
+  // 仓库变更 / 首次加载时从仓库 origin 推导、静默写进 settings.gitHost（无 UI 字段）——
+  // 推进弹窗 / 服务端直接用现成值、运行时零推导零闪烁。推不出（没配 origin）保持原值、
+  // 服务端起 agent 时仍有兜底推导。
+  const bakeGitHost = useCallback((repoPaths: string[]) => {
+    if (repoPaths.length === 0) return;
+    const q = encodeURIComponent(repoPaths.join(","));
+    void fetch(`/api/repo-remote-meta?paths=${q}`)
+      .then((r) => r.json())
+      .then((d: { host?: string | null }) => {
+        const derived = d.host?.trim();
+        if (derived && derived !== (getSettings().gitHost ?? "").trim()) {
+          saveFieldValue("gitHost", derived);
+        }
+      })
+      .catch(() => {
+        /* 推不出不动原值 */
+      });
+    // saveFieldValue 引用稳定（hook 内定义）、不进 deps 防重建
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 仓库提交：落盘 + 重新烘焙 host（换仓库 / 加仓库后 host 跟着换）
+  const handleReposCommit = (next: typeof settings.repos) => {
+    saveFieldValue("repos", next);
+    bakeGitHost(next.map((r) => r.path));
+  };
+
+  // 首次加载：host 还没烘焙过（空）而仓库已有 → 补一次（老用户不用碰仓库列表）
+  const didBakeHost = useRef(false);
+  useEffect(() => {
+    if (!loaded || didBakeHost.current) return;
+    didBakeHost.current = true;
+    const s = getSettings();
+    if (!s.gitHost?.trim() && s.repos.length > 0) {
+      bakeGitHost(s.repos.map((r) => r.path));
+    }
+  }, [loaded, bakeGitHost]);
+
   // 桌面端壳注入的版本号（web 版没有、不显示）；useEffect 读防 hydration mismatch
   const [appVersion, setAppVersion] = useState<string | null>(null);
   useEffect(() => {
@@ -308,7 +347,7 @@ const SettingsPage = () => {
           <RepoCard
             repos={settings.repos}
             onChange={(next) => update("repos", next)}
-            onCommit={(next) => saveFieldValue("repos", next)}
+            onCommit={handleReposCommit}
           />,
         )}
 
