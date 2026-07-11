@@ -15,7 +15,8 @@ import { LoadingState } from "@/components/ui/loading-state";
 
 const HomePage = () => {
   const gate = useSetupGate();
-  if (gate.loading) return <LoadingState variant="hero" />;
+  // immediate：启动链必然要等、延迟出场反而跟后面看板 loading 接力时「亮-灭-亮」闪
+  if (gate.loading) return <LoadingState variant="hero" immediate />;
   if (!gate.ready) return <SetupChecklist gate={gate} />;
   return <FeishuBoard />;
 };

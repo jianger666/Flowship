@@ -23,14 +23,28 @@ interface LoadingStateProps {
   variant?: "hero" | "block" | "card" | "inline";
   label?: string;
   className?: string;
+  /**
+   * hero 专用：跳过 250ms 延迟出场、立即可见。
+   * 启动链（首页 gate → 看板拉取）连续两段 loading 都带延迟会「亮-灭-亮」闪几下
+   *（用户实测）——必然要等的场景用 immediate、只有「大概率秒开」的路径保留延迟防闪现。
+   */
+  immediate?: boolean;
 }
 
-const HeroLoading = ({ label, className }: { label: string; className?: string }) => (
+const HeroLoading = ({
+  label,
+  className,
+  immediate,
+}: {
+  label: string;
+  className?: string;
+  immediate?: boolean;
+}) => (
   <div
     className={cn(
       "flex h-full min-h-[60vh] flex-col items-center justify-center gap-4",
       // 延迟 250ms 出场（globals.css hero-appear）：秒开路径整个 loading 不闪现（用户实测）
-      "hero-appear",
+      !immediate && "hero-appear",
       className,
     )}
     role="status"
@@ -45,9 +59,10 @@ export const LoadingState = ({
   variant = "block",
   label = "加载中…",
   className,
+  immediate,
 }: LoadingStateProps) => {
   if (variant === "hero") {
-    return <HeroLoading label={label} className={className} />;
+    return <HeroLoading label={label} className={className} immediate={immediate} />;
   }
   if (variant === "card") {
     return (

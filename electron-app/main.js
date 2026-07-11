@@ -330,12 +330,34 @@ const LOADING_BG_LIGHT = "#f3f4f5";
 const HEADER_BG_DARK = "#0e0f12";
 const HEADER_BG_LIGHT = "#f3f4f5";
 const IS_MAC = process.platform === "darwin";
+// 启动 splash：品牌 logo「雷芯」+ 电流环流动效（跟站内 BrandMark / hero loading 同一套
+// 几何和节奏、v1.0.x logo 重设计）——server 就绪前的第一屏就是品牌
 const loadingUrl = (dark) => {
   const bg = dark ? LOADING_BG_DARK : LOADING_BG_LIGHT;
   const fg = dark ? "#a1a1aa" : "#6b7280";
-  return `data:text/html;charset=utf-8,${encodeURIComponent(
-    `<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:${bg};color:${fg};font:14px system-ui">AI工作流 启动中…</body></html>`,
-  )}`;
+  const slit = bg; // 裂隙镂空 = 背景色
+  const current = dark ? "#fff7e0" : "#8a5a12"; // 电流：深色近白暖光 / 浅色深琥珀
+  const html = `<!doctype html><html><head><style>
+    body{margin:0;display:grid;place-items:center;height:100vh;background:${bg};color:${fg};font:13px system-ui}
+    .wrap{display:flex;flex-direction:column;align-items:center;gap:14px}
+    @keyframes flow{to{stroke-dashoffset:-100}}
+    @keyframes glow{0%,100%{opacity:.15}50%{opacity:.9}}
+    .cur{stroke-dasharray:16 84;animation:flow 1.5s linear infinite}
+    .gl{animation:glow 1.8s ease-in-out infinite}
+  </style></head><body><div class="wrap">
+    <svg width="52" height="52" viewBox="0 0 48 48" fill="none">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#fcd34d"/><stop offset="1" stop-color="#f59e0b"/>
+      </linearGradient></defs>
+      <circle class="gl" cx="24" cy="24" r="20" fill="#f59e0b26"/>
+      <path d="M27 4 L10 27 H21 L18 44 L38 19 H26 Z" fill="url(#g)" stroke="url(#g)" stroke-width="2.5" stroke-linejoin="round"/>
+      <path d="M13 33 L34 12" stroke="${slit}" stroke-width="3.4" stroke-linecap="round"/>
+      <circle cx="13" cy="33" r="2.2" fill="${slit}"/><circle cx="34" cy="12" r="2.2" fill="${slit}"/>
+      <path class="cur" d="M27 4 L10 27 H21 L18 44 L38 19 H26 Z" pathLength="100" stroke="${current}" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round" fill="none"/>
+    </svg>
+    <div>启动中…</div>
+  </div></body></html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 };
 
 const createWindow = async () => {
