@@ -124,12 +124,8 @@ const inferDisabledReason = (
       return null;
     case "ship":
       if (!effectiveHost) {
-        return (
-          <>
-            缺少 GitLab Host，
-            <SettingsLink focus="git">去设置</SettingsLink>
-          </>
-        );
+        // Host 无输入框（v1.0.x 删）、只能自动推导——推不出说明仓库没配 origin remote
+        return <>未能从仓库 remote 推导 GitLab 地址、检查仓库是否配了 origin</>;
       }
       if (!ctx.token) {
         return (

@@ -67,15 +67,17 @@ export const checkActionPrerequisites = (
       // V0.x：去掉「ship 必须先有 build」流程限制（没改动直接 ship、agent 会发现工作区干净自己报）。
       //   保留 GitLab host/token 校验——技术必需（没配真调不了 GitLab API、提不了 MR）、不是流程限制。
       if (!ctx.gitHost || ctx.gitHost.trim().length === 0) {
+        // v1.0.x：Host 无输入框、由 resolveEffectiveGitHost 从仓库 origin 自动推导——
+        // 走到这说明推导失败（仓库没配 origin remote / 不是 git 仓库）
         return {
           ok: false,
-          reason: "ship 需要配 GitLab Host、请去「设置 → GitLab 配置」填上（如 gitlab.wukongedu.net）。",
+          reason: "未能从仓库 remote 推导 GitLab 地址、检查任务仓库是否配了 origin。",
         };
       }
       if (!ctx.gitToken || ctx.gitToken.trim().length === 0) {
         return {
           ok: false,
-          reason: "ship 需要配 GitLab Personal Access Token、请去「设置 → GitLab 配置」填上（需要 api scope）。",
+          reason: "ship 需要配 GitLab Personal Access Token、请去「设置 → 连接」填上（需要 api scope）。",
         };
       }
       return { ok: true };
