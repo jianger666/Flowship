@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { cn } from "@/lib/utils";
+
 /**
  * 统一设置行（v1.0.x 设置页定式、对标 VS Code / Linear）
  *
@@ -16,6 +18,7 @@ export const SettingRow = ({
   control,
   stacked,
   labelExtra,
+  className,
 }: {
   label: string;
   hint?: ReactNode;
@@ -24,9 +27,11 @@ export const SettingRow = ({
   stacked?: boolean;
   /** 名称行右侧的附加操作（如「获取列表」按钮、显隐切换） */
   labelExtra?: ReactNode;
+  /** 外层容器 class 覆盖（如在 space-y + Separator 分节的卡里去掉自带 py） */
+  className?: string;
 }) =>
   stacked ? (
-    <div className="space-y-2 py-4 first:pt-0 last:pb-0">
+    <div className={cn("space-y-2 py-4 first:pt-0 last:pb-0", className)}>
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm">{label}</div>
@@ -37,7 +42,12 @@ export const SettingRow = ({
       {control}
     </div>
   ) : (
-    <div className="flex items-center justify-between gap-6 py-4 first:pt-0 last:pb-0">
+    <div
+      className={cn(
+        "flex items-center justify-between gap-6 py-4 first:pt-0 last:pb-0",
+        className,
+      )}
+    >
       <div className="min-w-0">
         <div className="text-sm">{label}</div>
         {hint && <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p>}

@@ -69,6 +69,8 @@ export const ApiKeySection = ({
   return (
     <SettingRow
       stacked
+      // 连接卡 space-y + Separator 分节、去掉自带 py 防双倍间距（同 GitLabSection）
+      className="py-0"
       label="Cursor API Key"
       hint="从 cursor.com/dashboard/integrations 创建、以 crsr_ 开头"
       control={

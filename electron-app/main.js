@@ -395,6 +395,59 @@ const closeSplashWindow = () => {
   splashWindow = null;
 };
 
+// ---------- mac 改名自迁移（v1.1.x「Flowship」改名收尾） ----------
+//
+// 老版本（<v1.1.0）的更新器只换 .app 内容不换文件名——不管从哪个老版本升上来、
+// 磁盘上可能还叫「AI工作流.app」。updater 侧的 rename 只覆盖「从 v1.1.0 起跳」的
+// 更新，这里在**新版第一次启动时**兜底：文件名 ≠ 产品名 → 原子 rename → open 新
+// 路径重启接力（运行中不带病续跑：Chromium 之后按旧路径 lazy-load 资源会失败）。
+// 一次性动作、改完后续启动名字匹配直接跳过。
+const renameNoticeFile = () =>
+  path.join(app.getPath("userData"), "rename-notice.json");
+
+const maybeSelfRenameOnMac = async () => {
+  if (!IS_MAC || !app.isPackaged || IS_TEST) return false;
+  const appPath = path.resolve(process.execPath, "..", "..", "..");
+  // 非常规位置（dmg 里直接跑等）不折腾
+  if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) return false;
+  const desired = `${app.getName()}.app`;
+  if (path.basename(appPath) === desired) return false;
+  const target = path.join(path.dirname(appPath), desired);
+  try {
+    await fs.rename(appPath, target);
+  } catch (err) {
+    // 目标已存在 / 没权限：保持原名照常启动、不挡用户
+    log(`[main] 应用文件名迁移失败（保持原名）${err?.message || err}`);
+    return false;
+  }
+  log(`[main] 应用文件名 ${path.basename(appPath)} → ${desired}、重启接力`);
+  // 留 marker：新路径进程启动后据此发「重新固定 Dock」通知（本进程要立刻退、弹不了）
+  try {
+    await fs.writeFile(renameNoticeFile(), JSON.stringify({ at: Date.now() }));
+  } catch {
+    // 通知丢了无妨、改名本体已完成
+  }
+  quitting = true;
+  app.relaunch({ execPath: "/usr/bin/open", args: [target] });
+  app.quit();
+  return true;
+};
+
+// 改名接力后的一次性提示（Dock 固定的旧路径图标会失效、得让用户知道去重新固定）
+const notifyRenameOnce = async () => {
+  try {
+    await fs.access(renameNoticeFile());
+  } catch {
+    return; // 没 marker、不是改名后的首次启动
+  }
+  await fs.rm(renameNoticeFile(), { force: true }).catch(() => {});
+  if (!Notification.isSupported()) return;
+  new Notification({
+    title: `应用已更名为 ${app.getName()}`,
+    body: "Dock 固定过旧图标的话、请重新固定一次。",
+  }).show();
+};
+
 const createWindow = async () => {
   const st = await loadWindowState();
   // 加载期窗口底色跟随系统深浅、避免浅色系统启动闪黑（app 内主题由 next-themes 接管）
@@ -1026,6 +1079,10 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")}`);
+    // mac 改名自迁移：文件名还是老产品名 → rename + 重启接力、本进程到此为止
+    if (await maybeSelfRenameOnMac()) return;
+    // 改名接力后的首次启动：提示重新固定 Dock（一次性）
+    void notifyRenameOnce();
     // 删待重启 marker + 清 updates/ 残留（不阻塞启动、fail-open）
     void cleanupUpdateLeftovers();
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默

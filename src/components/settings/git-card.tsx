@@ -32,6 +32,8 @@ export const GitLabSection = ({
   return (
     <SettingRow
       stacked
+      // 连接卡用 space-y + Separator 分节、SettingRow 自带的 py-4 会叠出双倍间距（用户点名「明显宽」）
+      className="py-0"
       label="GitLab Token"
       hint="Personal Access Token、需要 api 权限"
       control={
