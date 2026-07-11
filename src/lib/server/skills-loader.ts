@@ -29,6 +29,7 @@ import matter from "gray-matter";
 import { getGlobalCursorDirs } from "./cursor-config";
 import { dataRoot } from "./data-root";
 import { getToolsSkillsDir } from "./feishu-cli";
+import { readSettingsFile } from "./settings-fs";
 
 /** app 自管 skills 目录（V0.13 独立化、设置页可视化管理、随 data 目录走） */
 export const getAppSkillsDir = (): string => path.join(dataRoot(), "skills");
@@ -172,6 +173,19 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
  * 同名去重优先级：平台自带 > app 自管 > 全局 > 飞书 CLI
  * （自管是用户在本 app 里的显式配置、该压过跟 Cursor 共用的全局；平台 skill 是 fe 特定行为、不被顶掉）。
  */
+/** 用户禁用的 skill 名单（v1.1.x 可关、settings.disabledSkills、按 name 记） */
+export const readDisabledSkills = async (): Promise<Set<string>> => {
+  try {
+    const raw = await readSettingsFile();
+    const arr = raw?.disabledSkills;
+    return new Set(
+      Array.isArray(arr) ? arr.filter((s): s is string => typeof s === "string") : [],
+    );
+  } catch {
+    return new Set();
+  }
+};
+
 export const loadSkills = async (): Promise<SkillEntry[]> => {
   const own = await scanSkillsDir(
     path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
@@ -191,8 +205,12 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   for (const s of global) byName.set(s.name, s);
   for (const s of app) byName.set(s.name, s);
   for (const s of own) byName.set(s.name, s);
+  // v1.1.x：用户关掉的不注入（settings.disabledSkills、能力页 Skill tab 开关）
+  const disabled = await readDisabledSkills();
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
-  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return [...byName.values()]
+    .filter((s) => !disabled.has(s.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
 };
 
 /**

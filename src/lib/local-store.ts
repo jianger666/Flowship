@@ -51,6 +51,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   actionLayout: { order: [], hidden: [] },
   reuseAgentDefault: false,
   isolateWorktreeDefault: true,
+  disabledSkills: [],
+  disabledRules: [],
   modelUsage: [],
 };
 
@@ -149,6 +151,17 @@ const normalizeSettings = (
     reuseAgentDefault: parsed.reuseAgentDefault === true,
     // v1.1.x：新任务默认隔离工作区、缺省 / 坏值回退 true（只有显式 false 才默认直跑原仓）
     isolateWorktreeDefault: parsed.isolateWorktreeDefault !== false,
+    // v1.1.x：禁用 skill / rule 名单、坏值 / 缺省回退空（= 全启用）
+    disabledSkills: Array.isArray(parsed.disabledSkills)
+      ? (parsed.disabledSkills as unknown[]).filter(
+          (s): s is string => typeof s === "string",
+        )
+      : [],
+    disabledRules: Array.isArray(parsed.disabledRules)
+      ? (parsed.disabledRules as unknown[]).filter(
+          (s): s is string => typeof s === "string",
+        )
+      : [],
     // V0.11.x：模型使用计数、坏值 / 缺省回退空
     modelUsage: Array.isArray(parsed.modelUsage)
       ? (parsed.modelUsage as ModelUsageEntry[]).filter(

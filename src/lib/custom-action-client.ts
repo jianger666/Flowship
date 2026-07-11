@@ -37,6 +37,19 @@ export const fetchCustomActions = async (): Promise<CustomActionDef[]> => {
   return actions;
 };
 
+/** 列表 + 存储目录路径（能力页用：目录给「AI 帮建」开对话当 cwd） */
+export const fetchCustomActionsWithDir = async (): Promise<{
+  actions: CustomActionDef[];
+  dir: string;
+}> => {
+  const res = await fetch("/api/custom-actions");
+  const { actions, customActionsDir } = await handleJson<{
+    actions: CustomActionDef[];
+    customActionsDir?: string;
+  }>(res);
+  return { actions, dir: customActionsDir ?? "" };
+};
+
 export const createCustomActionReq = async (
   input: CustomActionInput,
 ): Promise<CustomActionDef> => {

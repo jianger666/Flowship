@@ -180,6 +180,16 @@ export interface FeAiFlowSettings {
    */
   isolateWorktreeDefault?: boolean;
   /**
+   * v1.1.x：禁用的 skill 名单（按 skill name）。关掉的不注入 agent prompt、
+   * slash 菜单也不出——团队 skill 包装了一堆只想用两个的场景用。
+   */
+  disabledSkills?: string[];
+  /**
+   * v1.1.x：禁用的自管 rule 名单（按文件名不含 .mdc）。关掉的不注入 agent prompt；
+   * 只作用于 app 自管 rules（Cursor 全局的去 Cursor 里管）。
+   */
+  disabledRules?: string[];
+  /**
    * V0.11.x：模型使用计数（「常用模型」快捷 chip 的数据源、用户拍板自动按次数排序）。
    * 每次真正提交使用某模型（推进起新 agent / 重启阶段 / 新建任务 / chat 换模型）计一次、
    * 按「模型 id + 参数组合」区分（Fable High 和 Fable Low 是两个条目）。上限 20 条防膨胀。

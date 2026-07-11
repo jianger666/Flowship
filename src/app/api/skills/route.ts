@@ -16,7 +16,10 @@ import {
   shortenHomePath,
   writeAppSkill,
 } from "@/lib/server/app-skills";
-import { getAppSkillsDir } from "@/lib/server/skills-loader";
+import {
+  getAppSkillsDir,
+  readDisabledSkills,
+} from "@/lib/server/skills-loader";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 export const runtime = "nodejs";
@@ -25,9 +28,10 @@ export const GET = async () => {
   // 顺手保证自管目录存在：「AI 帮建」开对话要拿它当 cwd、不存在 agent 起不来
   const appSkillsDir = getAppSkillsDir();
   await fs.mkdir(appSkillsDir, { recursive: true }).catch(() => {});
-  const [skills, cursorGlobal] = await Promise.all([
+  const [skills, cursorGlobal, disabled] = await Promise.all([
     listSkillsWithSource(),
     listCursorGlobalSkills(),
+    readDisabledSkills(),
   ]);
   return NextResponse.json({
     ok: true,
@@ -36,6 +40,8 @@ export const GET = async () => {
       description: s.description,
       source: s.source,
       editable: s.editable,
+      // v1.1.x 可关：关掉的不注入 agent / 不进 slash 菜单（能力页开关切换）
+      enabled: !disabled.has(s.name),
       absPath: shortenHomePath(s.absPath),
     })),
     cursorGlobal,

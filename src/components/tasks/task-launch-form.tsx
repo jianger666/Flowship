@@ -23,13 +23,6 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Label } from "@/components/ui/label";
 import { ModelSelect } from "@/components/ui/model-select";
 import { MultiSelect } from "@/components/ui/multi-select";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
@@ -41,15 +34,11 @@ import { settingsUrl } from "@/lib/settings-link";
 import { createTask } from "@/lib/task-store";
 
 import {
-  TASK_ROLE_LABEL,
-  TASK_ROLES,
   type ModelSelection,
   type RepoConfig,
   type Task,
   type TaskRole,
 } from "@/lib/types";
-
-const ROLE_OPTIONS: readonly TaskRole[] = TASK_ROLES;
 
 // 上次启动配置的记忆 key（仓库组合 + 角色——下次预填、零操作启动）
 const LAST_LAUNCH_KEY = "feaiflow.lastLaunch.v1";
@@ -79,7 +68,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   // 任务标题（预填工作项名、可改）
   const [title, setTitle] = useState(initialTitle);
   // 角色（预填上次的）
-  const [role, setRole] = useState<TaskRole | "">("");
+  // 角色默认自适应（v1.1.x 用户拍板隐藏选择器）：AI 从需求 + 仓库自己判断视角；
+  // 上次启动记忆若有旧值仍尊重（老用户习惯）、但 UI 不再暴露选择
+  const [role, setRole] = useState<TaskRole | "">("adaptive");
   // 目标仓库（预填上次的、过滤掉已从设置删除的）
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
   // per-repo「已有工作分支」覆盖
@@ -134,10 +125,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const missingHint = useMemo(() => {
     if (!feishuStoryUrl) return "工作项链接缺失、回看板重新进入";
     if (repoPaths.length === 0) return "选个目标仓库即可启动";
-    if (!role) return "选个角色即可启动";
     if (!title.trim()) return "填个任务标题即可启动";
     return null;
-  }, [feishuStoryUrl, repoPaths, role, title]);
+  }, [feishuStoryUrl, repoPaths, title]);
 
   const handleLaunch = async () => {
     if (!canSubmit) return;
@@ -284,26 +274,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         )}
       </div>
 
-      {/* 角色 */}
-      <div className="grid gap-1.5">
-        <Label htmlFor="l-role" required>
-          角色
-        </Label>
-        <Select value={role || undefined} onValueChange={(v) => v && setRole(v as TaskRole)}>
-          <SelectTrigger id="l-role" className="w-full">
-            <SelectValue placeholder="选择角色">
-              {role ? TASK_ROLE_LABEL[role] : null}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {ROLE_OPTIONS.map((r) => (
-              <SelectItem key={r} value={r}>
-                {TASK_ROLE_LABEL[r]}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+      {/* 角色选择已隐藏（v1.1.x 用户拍板「去掉」）：默认自适应——AI 从需求 + 仓库
+          自己判断视角、比每单点一次枚举更省；字段保留在数据层、editing 兜底 */}
 
       {/* 已有工作分支（选填、已自己建分支做了一部分时填） */}
       {repoPaths.length > 0 && (

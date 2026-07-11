@@ -193,49 +193,43 @@ export const filterDisabledMcp = (
   return out;
 };
 
-/**
- * 读全局 `~/.cursor/rules/*.mdc` → 拼成 prompt 段
- *
- * - `alwaysApply:true` → 全文注入（用户要求「总遵守」的通用偏好、如 mac-use）
- * - 其余（globs / description 触发）→ 列 index（desc + 绝对路径）、agent 命中场景再 `read`
- * - 无 rules → 返空提示串
- *
- * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）。
- */
-export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
-  const NONE = "（无全局规则）";
+/** app 自管 rules 目录（v1.1.x Rules 独立化、能力页 Rules tab 管理） */
+export const getAppRulesDir = (): string => path.join(dataRoot(), "rules");
 
-  // 找第一个存在的 rules 目录
-  let rulesDir: string | null = null;
-  for (const dir of getGlobalCursorDirs()) {
-    const candidate = path.join(dir, "rules");
-    try {
-      const stat = await fs.stat(candidate);
-      if (stat.isDirectory()) {
-        rulesDir = candidate;
-        break;
-      }
-    } catch {
-      // 试下一个候选
-    }
+/** 用户禁用的 rule 名单（settings.disabledRules、按文件名不含 .mdc） */
+const readDisabledRules = async (): Promise<Set<string>> => {
+  try {
+    const raw = await fs.readFile(path.join(dataRoot(), "config.json"), "utf-8");
+    const parsed = JSON.parse(raw) as { disabledRules?: unknown };
+    const arr = parsed?.disabledRules;
+    return new Set(
+      Array.isArray(arr) ? arr.filter((s): s is string => typeof s === "string") : [],
+    );
+  } catch {
+    return new Set();
   }
-  if (!rulesDir) return NONE;
+};
 
+// 扫一个 rules 目录：按 alwaysApply 分「全文注入 / 按需 index」两堆（可按名单跳过）
+const collectRulesFromDir = async (
+  rulesDir: string,
+  skip?: Set<string>,
+): Promise<{ always: string[]; indexed: string[] }> => {
+  const always: string[] = [];
+  const indexed: string[] = [];
   let files: string[];
   try {
     const entries = await fs.readdir(rulesDir, { withFileTypes: true });
     files = entries
       .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".mdc"))
-      .map((e) => path.join(rulesDir as string, e.name))
+      .map((e) => path.join(rulesDir, e.name))
       .sort();
   } catch {
-    return NONE;
+    return { always, indexed };
   }
-  if (files.length === 0) return NONE;
-
-  const always: string[] = []; // alwaysApply 全文
-  const indexed: string[] = []; // 按需 read 的 index
   for (const file of files) {
+    const ruleName = path.basename(file, path.extname(file));
+    if (skip?.has(ruleName)) continue;
     try {
       const raw = await fs.readFile(file, "utf-8");
       const parsed = matter(raw);
@@ -252,6 +246,46 @@ export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
       // 单文件解析失败、跳过、不让整段炸
     }
   }
+  return { always, indexed };
+};
+
+/**
+ * 读「全局 `~/.cursor/rules/*.mdc` + app 自管 `<dataRoot>/rules/*.mdc`」→ 拼成 prompt 段
+ *
+ * - `alwaysApply:true` → 全文注入（用户要求「总遵守」的通用偏好、如 mac-use）
+ * - 其余（globs / description 触发）→ 列 index（desc + 绝对路径）、agent 命中场景再 `read`
+ * - app 自管 rules（v1.1.x Rules tab）可被 settings.disabledRules 关掉；Cursor 全局的
+ *   不受此名单影响（那是用户在 Cursor 里管的、要关去 Cursor 删）
+ * - 无 rules → 返空提示串
+ *
+ * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）。
+ */
+export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
+  const NONE = "（无全局规则）";
+
+  const always: string[] = [];
+  const indexed: string[] = [];
+  // 全局 Cursor rules（多候选目录取第一个存在的）
+  for (const dir of getGlobalCursorDirs()) {
+    const candidate = path.join(dir, "rules");
+    try {
+      const stat = await fs.stat(candidate);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const got = await collectRulesFromDir(candidate);
+    always.push(...got.always);
+    indexed.push(...got.indexed);
+    break;
+  }
+  // app 自管 rules（能力页 Rules tab、可关）
+  const appGot = await collectRulesFromDir(
+    getAppRulesDir(),
+    await readDisabledRules(),
+  );
+  always.push(...appGot.always);
+  indexed.push(...appGot.indexed);
 
   const sections: string[] = [];
   if (always.length > 0) sections.push(always.join("\n\n"));

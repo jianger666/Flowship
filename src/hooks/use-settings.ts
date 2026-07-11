@@ -124,10 +124,14 @@ const isFieldEqual = (
     // boolean 字段：缺省视同 true 比较（默认隔离）
     return (a[key] ?? true) === (b[key] ?? true);
   }
-  if (key === "disabledMcpServers") {
+  if (
+    key === "disabledMcpServers" ||
+    key === "disabledSkills" ||
+    key === "disabledRules"
+  ) {
     // 黑名单是集合、顺序无关——排序后逐项比
-    const x = [...(a.disabledMcpServers ?? [])].sort();
-    const y = [...(b.disabledMcpServers ?? [])].sort();
+    const x = [...(a[key] ?? [])].sort();
+    const y = [...(b[key] ?? [])].sort();
     if (x.length !== y.length) return false;
     return x.every((s, i) => s === y[i]);
   }
@@ -208,6 +212,8 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      disabledSkills: !isFieldEqual("disabledSkills", settings, savedSettings),
+      disabledRules: !isFieldEqual("disabledRules", settings, savedSettings),
       // 模型使用计数：非设置页字段（recordModelUsage 直写）、恒不 dirty
       modelUsage: false,
     }),

@@ -48,8 +48,10 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Switch } from "@/components/ui/switch";
+import { cn } from "@/lib/utils";
 import { useDialog } from "@/hooks/use-dialog";
-import { getSettings } from "@/lib/local-store";
+import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { setPendingSlashSkill } from "@/components/slash-skills";
 import { createTask } from "@/lib/task-store";
 
@@ -59,6 +61,8 @@ interface SkillRow {
   description: string;
   source: "builtin" | "app" | "cursor" | "feishu-cli";
   editable: boolean;
+  // v1.1.x 可关：false = 不注入 agent / 不进 slash 菜单
+  enabled: boolean;
   absPath: string;
 }
 
@@ -211,6 +215,22 @@ export const SkillsCard = () => {
     }
   };
 
+  // v1.1.x skill 开关：本地列表即时切 + settings.disabledSkills 落盘（server 注入时过滤）
+  const handleToggle = async (name: string, enabled: boolean) => {
+    setSkills((prev) =>
+      prev
+        ? prev.map((s) => (s.name === name ? { ...s, enabled } : s))
+        : prev,
+    );
+    await initSettings();
+    const s = getSettings();
+    const cur = new Set(s.disabledSkills ?? []);
+    if (enabled) cur.delete(name);
+    else cur.add(name);
+    const ok = await saveSettings({ ...s, disabledSkills: [...cur] });
+    if (!ok) toast.error("开关保存失败、请重试");
+  };
+
   const handleImport = async (dirNames: string[]) => {
     setBusy(true);
     try {
@@ -302,6 +322,7 @@ export const SkillsCard = () => {
             skills={skills}
             onEdit={(name) => void openEdit(name)}
             onDelete={(name) => void handleDelete(name)}
+            onToggle={(name, enabled) => void handleToggle(name, enabled)}
           />
         )}
       </CardContent>
@@ -360,10 +381,12 @@ const SkillGroups = ({
   skills,
   onEdit,
   onDelete,
+  onToggle,
 }: {
   skills: SkillRow[];
   onEdit: (name: string) => void;
   onDelete: (name: string) => void;
+  onToggle: (name: string, enabled: boolean) => void;
 }) => {
   // 各折叠组的展开态（自管组不折叠、不进这个 state）
   const [openGroups, setOpenGroups] = useState<Set<SkillRow["source"]>>(
@@ -375,7 +398,7 @@ const SkillGroups = ({
       key={`${s.source}:${s.name}`}
       className="flex items-center gap-2 px-3 py-2"
     >
-      <div className="min-w-0 flex-1">
+      <div className={cn("min-w-0 flex-1", !s.enabled && "opacity-50")}>
         <div className="truncate text-sm" title={s.absPath}>
           {s.name}
         </div>
@@ -386,6 +409,12 @@ const SkillGroups = ({
           {s.description}
         </div>
       </div>
+      {/* v1.1.x 可关：所有来源都能关（按 name 记禁用、不注入 + slash 菜单不出） */}
+      <Switch
+        checked={s.enabled}
+        onCheckedChange={(v) => onToggle(s.name, v)}
+        aria-label={`${s.enabled ? "禁用" : "启用"} ${s.name}`}
+      />
       {s.editable && (
         <>
           <Button

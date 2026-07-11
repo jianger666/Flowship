@@ -51,13 +51,15 @@ const fetchSkills = async (): Promise<SlashSkill[]> => {
   skillsCache = null;
   skillsInflight ??= fetch("/api/skills", { cache: "no-store" })
     .then((r) => r.json())
-    .then((d: { skills?: Array<{ name?: string; description?: string; absPath?: string }> }) => {
-      // 同名多来源（builtin/app/cursor…）按扫描顺序去重取首个——跟 loadSkills 注入优先级一致
+    .then((d: { skills?: Array<{ name?: string; description?: string; absPath?: string; enabled?: boolean }> }) => {
+      // 同名多来源（builtin/app/cursor…）按扫描顺序去重取首个——跟 loadSkills 注入优先级一致；
+      // v1.1.x：用户关掉的（enabled=false）不进菜单
       const seen = new Set<string>();
       const out: SlashSkill[] = [];
       for (const s of d.skills ?? []) {
         if (!s.name || !s.absPath || seen.has(s.name)) continue;
         seen.add(s.name);
+        if (s.enabled === false) continue;
         out.push({ name: s.name, description: s.description ?? "", absPath: s.absPath });
       }
       skillsCache = out;

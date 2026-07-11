@@ -6,9 +6,11 @@
  * 定义存 dataRoot()/custom-actions/<id>.md、CRUD 归 custom-action-fs.ts、route 只做 IO + 校验。
  */
 
+import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 import {
   createCustomAction,
+  customActionsDir,
   listCustomActions,
   sanitizeSkills,
 } from "@/lib/server/custom-action-fs";
@@ -18,8 +20,11 @@ const isNonEmptyString = (v: unknown): v is string =>
 
 export const GET = async () => {
   try {
+    // 顺手保证目录存在：「AI 帮建」开对话要拿它当 cwd、不存在 agent 起不来
+    const dir = customActionsDir();
+    await fs.mkdir(dir, { recursive: true }).catch(() => {});
     const actions = await listCustomActions();
-    return NextResponse.json({ actions });
+    return NextResponse.json({ actions, customActionsDir: dir });
   } catch (err) {
     console.error("[GET /api/custom-actions] failed", err);
     return NextResponse.json({ error: "list_failed" }, { status: 500 });

@@ -14,7 +14,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, FileDown, FileUp, Loader2, Plus } from "lucide-react";
+import { ArrowLeft, FileDown, FileUp, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -26,34 +26,42 @@ import { CustomActionEditor } from "@/components/custom-actions/custom-action-ed
 import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-config";
 import { ExportActionsDialog } from "@/components/custom-actions/export-actions-dialog";
 import { McpCard } from "@/components/settings/mcp-card";
+import { RulesCard } from "@/components/settings/rules-card";
 import { SkillsCard } from "@/components/settings/skills-card";
 import {
   deleteCustomActionReq,
   exportCustomActionsReq,
-  fetchCustomActions,
+  fetchCustomActionsWithDir,
   fetchSkills,
   importCustomActionsReq,
 } from "@/lib/custom-action-client";
+import { setPendingSlashSkill } from "@/components/slash-skills";
+import { getSettings } from "@/lib/local-store";
 import { pickNativePaths } from "@/lib/native-picker";
+import { createTask } from "@/lib/task-store";
 import type { CustomActionDef } from "@/lib/types";
 
-// 三个能力 tab（key 同时是 ?tab= 的取值）
-type CapTab = "action" | "skills" | "mcp";
+// 四个能力 tab（key 同时是 ?tab= 的取值）
+type CapTab = "action" | "skills" | "mcp" | "rules";
 
 const CAP_TABS: Array<{ key: CapTab; label: string }> = [
   { key: "action", label: "Action" },
   { key: "skills", label: "Skill" },
   { key: "mcp", label: "MCP" },
+  { key: "rules", label: "Rules" },
 ];
 
 const isCapTab = (v: string | null): v is CapTab =>
-  v === "action" || v === "skills" || v === "mcp";
+  v === "action" || v === "skills" || v === "mcp" || v === "rules";
 
 /** Action 管理面板（原 /actions 页主体、整体搬进 tab） */
 const ActionsPanel = () => {
   const { confirm } = useDialog();
+  const router = useRouter();
   // 自定义 action 列表
   const [actions, setActions] = useState<CustomActionDef[]>([]);
+  // 存储目录绝对路径（「AI 帮建」开对话当 cwd、server 返回）
+  const [actionsDir, setActionsDir] = useState("");
   // 列表加载中
   const [loading, setLoading] = useState(true);
   // 编辑器开关
@@ -66,17 +74,56 @@ const ActionsPanel = () => {
   const [transferring, setTransferring] = useState(false);
   // 导出勾选弹窗开关（导出唯一入口：顶部按钮 → 勾选弹窗 → 目录 picker）
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  // 「AI 帮建」发起中（防双击）
+  const [aiCreating, setAiCreating] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setActions(await fetchCustomActions());
+      const { actions: list, dir } = await fetchCustomActionsWithDir();
+      setActions(list);
+      setActionsDir(dir);
     } catch (err) {
       toast.error(`加载失败：${err instanceof Error ? err.message : err}`);
     } finally {
       setLoading(false);
     }
   }, []);
+
+  // 「AI 帮建」（v1.1.x、对齐 skill 的对话创建）：开一个 cwd 锁在 custom-actions
+  // 目录的对话、自动挂 action-creator 的 / chip、用户说需求 AI 直接写 ACTION.md
+  const handleAiCreate = async () => {
+    const s = getSettings();
+    if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
+      toast.error("先在设置页配好 API Key 和默认模型");
+      return;
+    }
+    if (!actionsDir) {
+      toast.error("存储目录还没就绪、稍后重试");
+      return;
+    }
+    setAiCreating(true);
+    try {
+      const task = await createTask({
+        mode: "chat",
+        title: "创建 action",
+        repoPaths: [actionsDir],
+        model: s.defaultModel,
+        disabledMcpServers:
+          s.disabledMcpServers && s.disabledMcpServers.length > 0
+            ? s.disabledMcpServers
+            : undefined,
+      });
+      setPendingSlashSkill("action-creator");
+      router.push(`/tasks/${task.id}`);
+    } catch (err) {
+      toast.error(
+        `发起失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setAiCreating(false);
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -185,6 +232,17 @@ const ActionsPanel = () => {
           拖拽调「推进」里的顺序、开关控显隐、自定义的可编辑 / 删除
         </p>
         <div className="flex shrink-0 items-center gap-2">
+          {/* AI 帮建（v1.1.x）：开对话挂 action-creator chip、说需求直接生成 ACTION.md */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleAiCreate()}
+            disabled={aiCreating}
+            title="开个对话、AI 按你的描述生成 action"
+          >
+            {aiCreating ? <Loader2 className="animate-spin" /> : <Sparkles />}
+            AI 帮建
+          </Button>
           {/* 导入 / 导出（v0.9.14 团队点对点共享）：定义就是 md 文件、飞书传文件即可 */}
           <Button
             variant="outline"
@@ -292,7 +350,7 @@ const CapabilitiesPage = () => {
         </Button>
         <h1 className="text-lg font-semibold">能力</h1>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          AI 干活用的三类能力：推进动作（Action）、技能（Skill）、外部工具（MCP）
+          AI 干活用的四类能力：推进动作（Action）、技能（Skill）、外部工具（MCP）、规则（Rules）
         </p>
         {/* tab 行：切换三块能力面板 */}
         <div className="mt-4 flex items-center gap-1 border-b pb-2">
@@ -312,6 +370,7 @@ const CapabilitiesPage = () => {
       {tab === "action" && <ActionsPanel />}
       {tab === "skills" && <SkillsCard />}
       {tab === "mcp" && <McpPanel />}
+      {tab === "rules" && <RulesCard />}
     </div>
   );
 };

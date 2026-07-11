@@ -237,9 +237,12 @@ export const ensureTaskWorktrees = async (
       }
     }
 
-    // 原仓库必须是 git 仓
+    // 原仓库必须是 git 仓（非 git 目录只能走「直接在原仓库运行」——v1.1.x 测试团队
+    // 挂纯脚本文件夹的场景、建任务时勾逃生口 / 设置页把默认隔离关掉即可）
     if (!(await pathExists(path.join(repoPath, ".git")))) {
-      throw new Error(`仓库 ${repoPath} 不是 git 仓库、无法创建隔离工作区`);
+      throw new Error(
+        `仓库 ${repoPath} 不是 git 仓库、无法创建隔离工作区——建任务时勾选「直接在原仓库运行」（或在设置页关闭「新任务默认隔离工作区」）`,
+      );
     }
 
     // 半截目录（上次创建失败残留 / 非法内容）→ 清掉重来
