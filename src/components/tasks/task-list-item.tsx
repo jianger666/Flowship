@@ -28,21 +28,20 @@ import { actionDisplayLabel } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 import type { TaskSummary } from "@/lib/types";
 
-// v1.0 监控栏（用户拍板「侧栏升级成监控面板」）：task 行第二行显示「阶段 · 状态」、
-// 让侧栏从「名字列表」变「多任务进度一览」。chat 行不显示（对话没有阶段概念）。
-// 状态文案比 RUN_STATUS_LABEL 更具体：区分「待确认（审阅）」和「待回答（提问）」。
+// v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
+// **只有活跃态才出第二行**——运行中 / 待确认 / 待回答；空闲 / 静息 / 失败一律单行只标题。
+// 监控信号只对「正在发生事」的任务有价值、满屏「方案 · 空闲」是废话 + 多色噪音。
+// error 也不标（跟行首指示同一原则：断线类 error 常见、老任务红字刷屏反而噪声；
+// 真失败有系统通知 + 打开任务可见）。
 const taskStageLine = (
   task: TaskSummary,
-): { stage: string; status: string; tone: "run" | "wait" | "error" | "idle" } | null => {
+): { stage: string; status: string; tone: "run" | "wait" } | null => {
   if (task.mode === "chat") return null;
   const stage = task.lastActionType
     ? actionDisplayLabel({ type: task.lastActionType }, "short")
     : "未开始";
   if (task.runStatus === "running") {
     return { stage, status: "运行中", tone: "run" };
-  }
-  if (task.runStatus === "error") {
-    return { stage, status: "失败", tone: "error" };
   }
   if (task.runStatus === "awaiting_user") {
     // awaiting_ack = 交卷等审阅；running（此刻不在跑但 action 挂 running）= agent 提问等答
@@ -52,17 +51,14 @@ const taskStageLine = (
     if (task.lastActionStatus === "running") {
       return { stage, status: "待回答", tone: "wait" };
     }
-    // completed / cancelled 等静息态：没有真正等你的事、按空闲显示（不用琥珀色误导）
-    return { stage, status: "空闲", tone: "idle" };
   }
-  return { stage, status: "空闲", tone: "idle" };
+  // 空闲 / 静息 / 失败：不出第二行
+  return null;
 };
 
-const TONE_CLASS: Record<"run" | "wait" | "error" | "idle", string> = {
+const TONE_CLASS: Record<"run" | "wait", string> = {
   run: "text-primary",
   wait: "text-amber-600 dark:text-amber-500",
-  error: "text-destructive",
-  idle: "text-muted-foreground/70",
 };
 
 // 行首指示：runStatus 优先（运行 / 等你回复）、否则回退类型图标。

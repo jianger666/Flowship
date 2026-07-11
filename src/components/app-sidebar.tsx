@@ -12,7 +12,10 @@
  * 内容（自上而下）：
  *  - 顶部一栏：对话模式 =「新建对话」按钮；工作台模式 = 活跃任务小标题（任务从看板进）
  *  - 列表：置顶优先 + updatedAt 倒序
- *  - 「更早」折叠分组：updatedAt 超 7 天没动的任务收在这、默认折叠（置顶的不沉底）
+ *  - 折叠分组（v1.0.x 按模式分逻辑、用户拍板「时间分组对工作台没用」）：
+ *    - 工作台：按**业务状态**——主列表 = 开发中、折叠组 =「已终结（已合入 / 已放弃）」
+ *      （8 天没动但还在开发中的任务仍是当前工作、不该按时间沉底；刚合入的也不该占主位）
+ *    - 对话：按时间——超 7 天没动折进「更早」（聊天本来就按最近找）
  *  - 行尾 hover：置顶（已置顶常显高亮）/ 删除（二次确认）
  */
 
@@ -33,7 +36,7 @@ import { deleteTask, setTaskPinned } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 import type { Task, TaskSummary } from "@/lib/types";
 
-// 「更早」分组阈值：updatedAt 距今超 7 天没动 → 折进「更早」（纯前端展示分组、不落盘）
+// 对话「更早」分组阈值：updatedAt 距今超 7 天没动 → 折进「更早」（纯前端展示分组、不落盘）
 const EARLIER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const AppSidebar = ({ open }: { open: boolean }) => {
@@ -44,11 +47,12 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const { confirm } = useDialog();
   // 当前模式（顶栏胶囊同源）——决定列表过滤 + 顶部按钮形态
   const mode = useAppMode();
-  // 「更早」分组展开态（默认折叠、不占视觉）
+  // 折叠分组展开态（默认折叠、不占视觉）——工作台 =「已终结」、对话 =「更早」
   const [earlierOpen, setEarlierOpen] = useState(false);
 
-  // 按模式过滤（v1.0：模式即筛选）、再排序（置顶优先 → updatedAt 倒序）、最后拆活跃 / 更早两组
-  // 「更早」= updatedAt 距今超 7 天没动（纯前端按时间算、不落盘）；置顶任务永远算活跃、不沉底
+  // 按模式过滤（v1.0：模式即筛选）、再排序（置顶优先 → updatedAt 倒序）、最后拆主列表 / 折叠组：
+  // - 工作台按业务状态：开发中 = 主列表、已合入 / 已放弃 = 折叠组（时间分组对任务没意义、用户拍板）
+  // - 对话按时间：超 7 天没动 = 折叠「更早」；置顶永远在主列表、不沉底
   const { active, earlier } = useMemo(() => {
     const filtered = tasks.filter((t) =>
       mode === "chat" ? t.mode === "chat" : (t.mode ?? "task") === "task",
@@ -59,10 +63,18 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       if (ap !== bp) return bp - ap; // 置顶排最上
       return b.updatedAt - a.updatedAt;
     });
-    const earlierBefore = Date.now() - EARLIER_AFTER_MS;
+    if (mode === "chat") {
+      const earlierBefore = Date.now() - EARLIER_AFTER_MS;
+      return {
+        active: sorted.filter((t) => t.pinned || t.updatedAt >= earlierBefore),
+        earlier: sorted.filter((t) => !t.pinned && t.updatedAt < earlierBefore),
+      };
+    }
+    const isFinal = (t: TaskSummary) =>
+      t.repoStatus === "merged" || t.repoStatus === "abandoned";
     return {
-      active: sorted.filter((t) => t.pinned || t.updatedAt >= earlierBefore),
-      earlier: sorted.filter((t) => !t.pinned && t.updatedAt < earlierBefore),
+      active: sorted.filter((t) => t.pinned || !isFinal(t)),
+      earlier: sorted.filter((t) => !t.pinned && isFinal(t)),
     };
   }, [tasks, mode]);
 
@@ -170,7 +182,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                 />
               ))}
 
-              {/* 更早（超 7 天没动）折叠分组 */}
+              {/* 折叠分组：工作台 =「已终结」（合入 / 放弃）、对话 =「更早」（超 7 天没动） */}
               {earlier.length > 0 && (
                 <div className="mt-2">
                   <Button
@@ -185,7 +197,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                         earlierOpen && "rotate-90",
                       )}
                     />
-                    更早（超 7 天）· {earlier.length}
+                    {mode === "chat" ? "更早（超 7 天）" : "已终结"} · {earlier.length}
                   </Button>
                   {earlierOpen && (
                     <div className="mt-0.5 flex flex-col gap-0.5">
