@@ -117,22 +117,12 @@ const SettingsPage = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 仓库提交：落盘 + 重新烘焙 host（换仓库 / 加仓库后 host 跟着换）
+  // 仓库提交：落盘 + 重新烘焙 host（换仓库 / 加仓库后 host 跟着换）。
+  // 不做「首次加载补烘焙」的老用户兼容——老用户当年都手填过 host、值本来就在（用户拍板）
   const handleReposCommit = (next: typeof settings.repos) => {
     saveFieldValue("repos", next);
     bakeGitHost(next.map((r) => r.path));
   };
-
-  // 首次加载：host 还没烘焙过（空）而仓库已有 → 补一次（老用户不用碰仓库列表）
-  const didBakeHost = useRef(false);
-  useEffect(() => {
-    if (!loaded || didBakeHost.current) return;
-    didBakeHost.current = true;
-    const s = getSettings();
-    if (!s.gitHost?.trim() && s.repos.length > 0) {
-      bakeGitHost(s.repos.map((r) => r.path));
-    }
-  }, [loaded, bakeGitHost]);
 
   // 桌面端壳注入的版本号（web 版没有、不显示）；useEffect 读防 hydration mismatch
   const [appVersion, setAppVersion] = useState<string | null>(null);
