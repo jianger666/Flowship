@@ -32,6 +32,12 @@ import { findPendingAskEvent } from "@/lib/ask-pending";
 import { getSettings } from "@/lib/local-store";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitTaskQuestion } from "@/lib/task-store";
+import {
+  loadBoxHeight,
+  loadDraft,
+  saveBoxHeight,
+  saveDraft,
+} from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
 
 interface Props {
@@ -45,11 +51,16 @@ const MIN_BOX_HEIGHT = 52;
 const MAX_BOX_HEIGHT = 400;
 
 export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
-  // 草稿
-  const [draft, setDraft] = useState("");
+  // 草稿：按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）、发送后清
+  const [draft, setDraft] = useState(() => loadDraft("talk", task.id));
   // 输入框高度（null = 默认）：原生 resize-y 拖柄在右下、往下拉才变高——对贴底输入条反直觉
-  //（用户点名）、改成顶边拖柄：往上拉变高、往下拉变矮
-  const [boxHeight, setBoxHeight] = useState<number | null>(null);
+  //（用户点名）、改成顶边拖柄：往上拉变高、往下拉变矮；拖过的高度记全局偏好（v1.1.x）
+  const [boxHeight, setBoxHeight] = useState<number | null>(() => {
+    const saved = loadBoxHeight();
+    return saved != null
+      ? Math.min(MAX_BOX_HEIGHT, Math.max(MIN_BOX_HEIGHT, saved))
+      : null;
+  });
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
   // 显式指定的模型（id 空 = 跟随会话；选了 = 换这个模型处理本条消息）
@@ -59,6 +70,11 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   const { models, fetchModels } = useModels();
   // 贴图（粘贴 / 选文件）——revise 高频带截图
   const attach = useImageAttach({ maxImages: 6, disabled: submitting });
+  // 切 task 时换载对应草稿（详情页在不同任务间导航时组件可能不重挂）
+  useEffect(() => {
+    setDraft(loadDraft("talk", task.id));
+  }, [task.id]);
+
   // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -104,6 +120,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
       );
       onTaskUpdate(updated);
       setDraft("");
+      saveDraft("talk", task.id, "");
       slash.reset();
       attach.reset();
     } catch (err) {
@@ -136,16 +153,20 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               boxHeight ??
               textareaRef.current?.getBoundingClientRect().height ??
               MIN_BOX_HEIGHT;
+            // 拖动过程中的最新高度（onUp 时落盘、避免每次 move 都写 localStorage）
+            let latest: number | null = null;
             const onMove = (ev: PointerEvent) => {
               const next = Math.min(
                 MAX_BOX_HEIGHT,
                 Math.max(MIN_BOX_HEIGHT, startH + (startY - ev.clientY)),
               );
+              latest = next;
               setBoxHeight(next);
             };
             const onUp = () => {
               window.removeEventListener("pointermove", onMove);
               window.removeEventListener("pointerup", onUp);
+              if (latest != null) saveBoxHeight(latest);
             };
             window.addEventListener("pointermove", onMove);
             window.addEventListener("pointerup", onUp);
@@ -182,6 +203,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
           value={draft}
           onChange={(e) => {
             setDraft(e.target.value);
+            saveDraft("talk", task.id, e.target.value);
             slash.onDraftChange(
               e.target.value,
               e.target.selectionStart ?? e.target.value.length,

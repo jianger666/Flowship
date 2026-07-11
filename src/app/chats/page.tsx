@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
+import { getLastChatId } from "@/lib/view-memory";
 
 const ChatsPage = () => {
   const router = useRouter();
@@ -32,10 +33,14 @@ const ChatsPage = () => {
 
   useEffect(() => {
     if (!loaded || redirectedRef.current || chats.length === 0) return;
-    // 最近活跃的对话（updatedAt 倒序第一条）
-    const latest = [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    // 优先落「最后浏览的对话」（用户拍板「切到工作台再切回来要记住」）、
+    // 没记录 / 已被删则回退最近活跃（updatedAt 倒序第一条）
+    const lastId = getLastChatId();
+    const target =
+      (lastId && chats.find((t) => t.id === lastId)) ||
+      [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
     redirectedRef.current = true;
-    router.replace(`/tasks/${latest.id}`);
+    router.replace(`/tasks/${target.id}`);
   }, [loaded, chats, router]);
 
   if (!loaded) return <LoadingState variant="hero" />;

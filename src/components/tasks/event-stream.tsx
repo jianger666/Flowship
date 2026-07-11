@@ -54,6 +54,12 @@ import {
   shouldSubmitOnKeyDown,
 } from "@/lib/submit-shortcut";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
+import {
+  getScrollAnchor,
+  loadDraft,
+  saveDraft,
+  saveScrollAnchor,
+} from "@/lib/view-memory";
 import type { Task, TaskEvent } from "@/lib/types";
 
 import {
@@ -189,8 +195,8 @@ const EventStreamImpl = ({
   onPrependEvents,
 }: Props) => {
   const isChat = variant === "chat";
-  // 输入草稿、发送后清空
-  const [draft, setDraft] = useState("");
+  // 输入草稿、发送后清空；按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）
+  const [draft, setDraft] = useState(() => loadDraft("reply", task.id));
   // 原生 picker 调用中（防双击连开系统对话框）；存 mode 让被点的那颗按钮转 spinner
   // ——mac osascript 弹窗有 ~1s 冷启动延迟、用户反馈「点了没反应」、需要即时视觉反馈
   const [picking, setPicking] = useState<false | "file" | "folder">(false);
@@ -209,6 +215,9 @@ const EventStreamImpl = ({
   const atBottomRef = useRef(true);
   // 贴底状态的 state 版（V0.13.x「AI 在等你回答」悬浮条显隐用——ref 不触发渲染）
   const [atBottomState, setAtBottomState] = useState(true);
+  // 初始滚动定位闸（v1.1.x 滚动位置记忆）：首次有 items 时算一次——有「非贴底离开」的
+  // 锚点就恢复到那条、否则默认落底；null = 还没算（切 task 时重开）
+  const initialTopRef = useRef<number | null>(null);
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -261,13 +270,15 @@ const EventStreamImpl = ({
   const latestEventsRef = useRef(task.events);
   latestEventsRef.current = task.events;
 
-  // 切 task 重置分页状态
+  // 切 task 重置分页状态 + 换载对应草稿 + 重开滚动恢复闸
   useEffect(() => {
     pagedOnceRef.current = false;
     loadingEarlierRef.current = false;
     setFirstItemIndex(FIRST_INDEX_BASE);
     setHasMoreEarlier(false);
     setLoadingEarlier(false);
+    setDraft(loadDraft("reply", task.id));
+    initialTopRef.current = null;
   }, [task.id]);
   // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
   // 已经拉过页就不再被它改（本地分页状态才是准的）
@@ -312,6 +323,22 @@ const EventStreamImpl = ({
       setLoadingEarlier(false);
     }
   };
+
+  // v1.1.x 滚动位置记忆：首次有 items 时把初始定位算进闸（渲染期 latch、只写一次）。
+  // 锚点是「离开时视口顶部的事件 id」；贴底离开 / 锚点不在当前尾页（懒加载没包含）→ 落底
+  if (initialTopRef.current === null && items.length > 0) {
+    let idx = items.length - 1;
+    const saved = getScrollAnchor(task.id);
+    if (saved && !saved.atBottom) {
+      const found = items.findIndex((it) => it.id === saved.anchorId);
+      if (found >= 0) {
+        idx = found;
+        // 恢复到历史位置 = 非贴底态、流式自动跟随不要立刻把人拽回底部
+        atBottomRef.current = false;
+      }
+    }
+    initialTopRef.current = idx;
+  }
 
   // 流式回复自动贴底（V0.8.3 修）：
   // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
@@ -446,6 +473,7 @@ const EventStreamImpl = ({
     // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
     onUserReply?.(slash.buildSkillPrefix() + text, images, attachments);
     setDraft("");
+    saveDraft("reply", task.id, "");
     slash.reset();
     resetAttachedImages();
     setAttachedPaths([]);
@@ -528,13 +556,27 @@ const EventStreamImpl = ({
             atBottomStateChange={(atBottom) => {
               atBottomRef.current = atBottom;
               setAtBottomState(atBottom);
+              // 贴底状态变化也刷进锚点记忆（只更新 atBottom、锚点 id 由 rangeChanged 维护）
+              const saved = getScrollAnchor(task.id);
+              if (saved) saveScrollAnchor(task.id, { ...saved, atBottom });
+            }}
+            // v1.1.x 滚动位置记忆：滚动时持续记「视口顶部第一条事件 id + 是否贴底」、
+            // 切走再切回按它恢复（虚拟 item __streaming__/__loading__ 不作锚点）
+            rangeChanged={(range) => {
+              const localIdx = range.startIndex - firstItemIndex;
+              const top = items[localIdx];
+              if (!top || top.id.startsWith("__")) return;
+              saveScrollAnchor(task.id, {
+                anchorId: top.id,
+                atBottom: atBottomRef.current,
+              });
             }}
             // 贴底判定余量调大（默认仅 4px）：流式时最后一项每来一个 chunk 会增高若干像素、
             // 余量太小会立刻被判成「离开底部」→ effect 自废不再跟随。120px 覆盖常见 chunk 增量、
             // 让「滚到底跟随」稳定；用户真往上翻 >120px 才停跟随。
             atBottomThreshold={120}
-            // 初始定位到末尾（任务详情首次进来直接看最新事件、不用手动滚）
-            initialTopMostItemIndex={items.length - 1}
+            // 初始定位：默认末尾（直接看最新事件）；有非贴底离开的锚点则恢复到那条（v1.1.x）
+            initialTopMostItemIndex={initialTopRef.current ?? items.length - 1}
             // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距。
             // 注意：firstItemIndex 存在时 Virtuoso 传来的 idx 是「偏移后」的绝对索引、
             // 要先减回 firstItemIndex 才能对 items 数组做定位（分页 prepend 后不减必错位）
@@ -669,6 +711,7 @@ const EventStreamImpl = ({
               value={draft}
               onChange={(e) => {
                 setDraft(e.target.value);
+                saveDraft("reply", task.id, e.target.value);
                 slash.onDraftChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
               }}
               onKeyDown={handleKeyDown}
@@ -846,7 +889,10 @@ const EventStreamImpl = ({
         <Textarea
           ref={inputRef}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            saveDraft("reply", task.id, e.target.value);
+          }}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           rows={3}

@@ -1,0 +1,111 @@
+/**
+ * 视图记忆（v1.1.x、用户拍板「切走再切回要记住」）——轻量记忆点的单一收口。
+ *
+ * 三档存储、按「该记多久」选：
+ * - sessionStorage：最后浏览的对话 / 输入草稿 / 看板时间范围——重启 app 即忘（符合预期、
+ *   不产生陈旧状态）；Electron 单窗口、session 生命周期 = app 生命周期
+ * - localStorage：输入条拖过的高度——用户的全局偏好、跨重启保留
+ * - 模块级内存 Map：事件流滚动锚点——SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
+ */
+
+// SSR / 存储被禁时兜底 null（客户端组件在 server 也会跑一遍首渲）
+const ss = (): Storage | null => {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+};
+
+// ---------- 最后浏览的对话（胶囊切回「对话」时优先落它、不是最近活跃那条） ----------
+
+const LAST_CHAT_KEY = "fe-ai-flow:last-chat-id";
+
+export const rememberLastChat = (taskId: string) => {
+  ss()?.setItem(LAST_CHAT_KEY, taskId);
+};
+
+export const getLastChatId = (): string | null =>
+  ss()?.getItem(LAST_CHAT_KEY) ?? null;
+
+// ---------- 输入草稿（按 task 记、发送后清；打了半段切页不丢） ----------
+
+// scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条）
+const draftKey = (scope: string, taskId: string) =>
+  `fe-ai-flow:draft:${scope}:${taskId}`;
+
+export const loadDraft = (scope: string, taskId: string): string =>
+  ss()?.getItem(draftKey(scope, taskId)) ?? "";
+
+export const saveDraft = (scope: string, taskId: string, text: string) => {
+  const s = ss();
+  if (!s) return;
+  if (text) s.setItem(draftKey(scope, taskId), text);
+  else s.removeItem(draftKey(scope, taskId));
+};
+
+// ---------- 事件流滚动锚点（离开时视口顶部的事件 id；贴底则回来照常落底） ----------
+
+interface ScrollAnchor {
+  /** 视口顶部第一条渲染 item 的事件 id */
+  anchorId: string;
+  /** 离开时是否贴底（贴底 = 回来不恢复、维持「跟随最新」默认行为） */
+  atBottom: boolean;
+}
+
+// 模块级内存：key = taskId
+const scrollAnchors = new Map<string, ScrollAnchor>();
+
+export const saveScrollAnchor = (taskId: string, anchor: ScrollAnchor) => {
+  scrollAnchors.set(taskId, anchor);
+};
+
+export const getScrollAnchor = (taskId: string): ScrollAnchor | undefined =>
+  scrollAnchors.get(taskId);
+
+// ---------- 输入条拖过的高度（全局偏好、跨任务共用） ----------
+
+const BOX_HEIGHT_KEY = "fe-ai-flow:talk-box-height";
+
+export const loadBoxHeight = (): number | null => {
+  try {
+    const v = Number(localStorage.getItem(BOX_HEIGHT_KEY));
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+};
+
+export const saveBoxHeight = (h: number) => {
+  try {
+    localStorage.setItem(BOX_HEIGHT_KEY, String(Math.round(h)));
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+// ---------- 看板时间范围（会话级：改过区间切页不重置、重启回默认防陈旧日期） ----------
+
+const BOARD_RANGE_KEY = "fe-ai-flow:board-range";
+
+export const loadBoardRange = (): { from: number; to: number } | null => {
+  try {
+    const raw = ss()?.getItem(BOARD_RANGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { from?: unknown; to?: unknown };
+    if (
+      typeof parsed.from === "number" &&
+      typeof parsed.to === "number" &&
+      parsed.from <= parsed.to
+    ) {
+      return { from: parsed.from, to: parsed.to };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+export const saveBoardRange = (range: { from: number; to: number }) => {
+  ss()?.setItem(BOARD_RANGE_KEY, JSON.stringify(range));
+};

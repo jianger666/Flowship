@@ -91,6 +91,7 @@ import {
   getRepoShortNames,
   getUniqueRepoDirNames,
 } from "@/lib/path-utils";
+import { rememberLastChat } from "@/lib/view-memory";
 import type {
   ActionRecord,
   ActionType,
@@ -199,6 +200,11 @@ const TaskDetailPage = () => {
   useEffect(() => {
     setStreamingText("");
   }, [task?.id]);
+
+  // 记住「最后浏览的对话」（v1.1.x）：胶囊切回「对话」时 /chats 优先落它、不是最近活跃那条
+  useEffect(() => {
+    if (task?.mode === "chat") rememberLastChat(task.id);
+  }, [task?.id, task?.mode]);
 
   // currentActionId 变化时把 selectedActionId 跟到 currentActionId
   // 用户主动切别的 action 后、currentActionId 又变（agent 又推进一步）时不强行带回——

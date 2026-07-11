@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/select";
 import { settingsUrl } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
+import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
 
 // ---------- 类型（对齐 /api/feishu/board 返回） ----------
 
@@ -131,8 +132,11 @@ export const FeishuBoard = () => {
       return null;
     }
   });
-  // 时间范围（接口按区间查、变化触发重拉）：默认今天前 3 天 ~ 后 10 天
+  // 时间范围（接口按区间查、变化触发重拉）：默认今天前 3 天 ~ 后 10 天；
+  // 改过的区间记 session（v1.1.x、切页回来不重置；重启回默认、防陈旧日期）
   const [range, setRange] = useState<DayRange>(() => {
+    const saved = loadBoardRange();
+    if (saved) return saved;
     const d = new Date();
     d.setHours(0, 0, 0, 0);
     return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
@@ -304,7 +308,10 @@ export const FeishuBoard = () => {
           items={items}
           onOpen={handleOpen}
           range={range}
-          onRangeChange={setRange}
+          onRangeChange={(r) => {
+            setRange(r);
+            saveBoardRange(r);
+          }}
         />
       </div>
     </div>
