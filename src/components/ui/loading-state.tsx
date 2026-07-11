@@ -50,7 +50,7 @@ const HeroLoading = ({
     role="status"
     aria-label={label}
   >
-    <BrandMark size={52} animated />
+    <BrandMark size={64} animated />
     <div className="text-sm text-muted-foreground">{label}</div>
   </div>
 );

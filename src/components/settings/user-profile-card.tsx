@@ -71,6 +71,13 @@ export const ProfileSection = ({
 
   return (
     <div className="space-y-3">
+      {/* 小节头（用户实测「偏好这块杂乱无章」——跟连接卡同款「节标题 + 说明」层级） */}
+      <div>
+        <div className="text-sm font-medium">代码与分支</div>
+        <p className="text-xs text-muted-foreground">
+          路径链接用哪个 IDE 打开、feature 分支怎么命名
+        </p>
+      </div>
       <div className="grid gap-1.5">
         <Label htmlFor="settings-jump-ide">代码跳转 IDE</Label>
         <Select

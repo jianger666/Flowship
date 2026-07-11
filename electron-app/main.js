@@ -345,7 +345,7 @@ const loadingUrl = (dark) => {
     .cur{stroke-dasharray:16 84;animation:flow 1.5s linear infinite}
     .gl{animation:glow 1.8s ease-in-out infinite}
   </style></head><body><div class="wrap">
-    <svg width="52" height="52" viewBox="0 0 48 48" fill="none">
+    <svg width="64" height="64" viewBox="0 0 48 48" fill="none">
       <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
         <stop offset="0" stop-color="#fcd34d"/><stop offset="1" stop-color="#f59e0b"/>
       </linearGradient></defs>

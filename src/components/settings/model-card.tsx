@@ -36,13 +36,12 @@ export const ModelSection = ({
 }: ModelSectionProps) => (
   <div className="space-y-3">
     <div className="flex items-center justify-between gap-2">
+      {/* 小节头（跟连接卡同款层级） */}
       <div>
-        <Label>默认模型</Label>
-        {models.length > 0 && (
-          <p className="text-xs text-muted-foreground">
-            共 {models.length} 个可用模型
-          </p>
-        )}
+        <div className="text-sm font-medium">默认模型</div>
+        <p className="text-xs text-muted-foreground">
+          {models.length > 0 ? `共 ${models.length} 个可用模型` : "新任务 / 对话的默认 AI"}
+        </p>
       </div>
       <Button
         type="button"
@@ -64,9 +63,4 @@ export const ModelSection = ({
       variant="full"
     />
   </div>
-);
-
-// 局部小标题（跟 ProfileSection 的 Label 风格对齐）
-const Label = ({ children }: { children: React.ReactNode }) => (
-  <div className="text-xs font-medium">{children}</div>
 );

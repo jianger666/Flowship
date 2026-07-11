@@ -35,6 +35,11 @@ export const InteractionSection = ({
   onReuseAgentDefaultChange,
 }: InteractionSectionProps) => (
   <div className="space-y-4">
+    {/* 小节头（跟连接卡同款层级、防「偏好」卡一锅粥） */}
+    <div>
+      <div className="text-sm font-medium">输入习惯</div>
+      <p className="text-xs text-muted-foreground">聊天 / 推进输入框的提交方式</p>
+    </div>
     <div className="grid gap-1.5">
       <Label htmlFor="settings-submit-shortcut" className="text-xs">
         提交快捷键
