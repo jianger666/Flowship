@@ -331,16 +331,16 @@ const HEADER_BG_DARK = "#0e0f12";
 const HEADER_BG_LIGHT = "#f3f4f5";
 const IS_MAC = process.platform === "darwin";
 // 启动 splash：品牌 logo「雷芯」+ 电流环流动效（跟站内 BrandMark / hero loading 同一套
-// 几何和节奏、v1.0.x logo 重设计）——server 就绪前的第一屏就是品牌
-const loadingUrl = (dark) => {
+// 几何和节奏、v1.0.x logo 重设计）——server 就绪前的第一屏就是品牌。
+// v1.0.x 改独立小窗（用户拍板「开屏 loading 直接到底」）：主窗备好才亮、
+// 不再在可见窗口里做文档切换、衔接闪烁彻底消失。
+const splashUrl = (dark) => {
   const bg = dark ? LOADING_BG_DARK : LOADING_BG_LIGHT;
   const fg = dark ? "#a1a1aa" : "#6b7280";
   const slit = bg; // 裂隙镂空 = 背景色
   const current = dark ? "#fff7e0" : "#8a5a12"; // 电流：深色近白暖光 / 浅色深琥珀
   const html = `<!doctype html><html><head><style>
-    /* padding-top = 应用顶栏高度（56px）：让 logo 的屏幕位置和页面加载后的
-       hero loading 完全重合、splash → 页面 loading 交接不跳动（用户实测「往下抖」） */
-    body{margin:0;display:grid;place-items:center;height:100vh;box-sizing:border-box;padding-top:56px;background:${bg};color:${fg};font:13px system-ui}
+    body{margin:0;display:grid;place-items:center;height:100vh;background:${bg};color:${fg};font:13px system-ui;user-select:none;-webkit-app-region:drag}
     .wrap{display:flex;flex-direction:column;align-items:center;gap:14px}
     @keyframes flow{to{stroke-dashoffset:-100}}
     @keyframes glow{0%,100%{opacity:.15}50%{opacity:.9}}
@@ -360,6 +360,34 @@ const loadingUrl = (dark) => {
     <div>启动中…</div>
   </div></body></html>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+};
+
+// 独立 splash 小窗（frameless 居中卡片、可拖动）：boot 期间唯一可见窗口；
+// 主窗 ready-to-show（页面真渲出来）后 show 主窗 → 关它（先开后关、不触发 window-all-closed）
+let splashWindow = null;
+const createSplashWindow = (dark) => {
+  splashWindow = new BrowserWindow({
+    width: 360,
+    height: 300,
+    frame: false,
+    resizable: false,
+    // 不给关闭手段（frameless 本来没按钮）；alwaysOnTop 不设、别挡用户干别的
+    backgroundColor: dark ? LOADING_BG_DARK : LOADING_BG_LIGHT,
+    show: true,
+  });
+  splashWindow.on("closed", () => {
+    splashWindow = null;
+  });
+  void splashWindow.loadURL(splashUrl(dark));
+};
+const closeSplashWindow = () => {
+  if (!splashWindow) return;
+  try {
+    splashWindow.destroy();
+  } catch {
+    // 已关、忽略
+  }
+  splashWindow = null;
 };
 
 const createWindow = async () => {
@@ -397,7 +425,12 @@ const createWindow = async () => {
     },
   });
   if (st?.maximized) mainWindow.maximize();
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  // 页面首次真渲出来才亮主窗 + 收 splash（先亮后收、不触发 window-all-closed）——
+  // 「开屏 loading 直接到底」、中途没有任何可见的文档切换闪烁
+  mainWindow.once("ready-to-show", () => {
+    mainWindow?.show();
+    closeSplashWindow();
+  });
   mainWindow.on("close", () => void saveWindowState());
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -436,7 +469,7 @@ const createWindow = async () => {
     if (isReload) e.preventDefault();
   });
 
-  // 页面每次加载完成（loading 页换正式页 / 首次加载）重注入版本号 + 更新标识、不丢状态
+  // 页面每次加载完成（首次加载 / 更新后重载）重注入版本号 + 更新标识、不丢状态
   mainWindow.webContents.on("did-finish-load", () => {
     // 版本号给设置页显示（用户要能确认「装的是不是最新版」）；web 版没壳、不显示
     mainWindow?.webContents
@@ -445,7 +478,8 @@ const createWindow = async () => {
     notifyPageUpdateReady();
   });
 
-  await mainWindow.loadURL(loadingUrl(nativeTheme.shouldUseDarkColors));
+  // v1.0.x：主窗创建后不再加载 splash 文档（splash 是独立小窗）——
+  // 等 server 就绪后由启动流程直接 loadURL(BASE_URL)、ready-to-show 才亮窗
 };
 
 // ---------- 原生文件选择器 IPC（v0.7.14） ----------
@@ -982,14 +1016,24 @@ if (!app.requestSingleInstanceLock()) {
       return;
     }
 
+    // splash 小窗先亮（boot 期间唯一可见窗口）、主窗 hidden 待页面就绪
+    createSplashWindow(nativeTheme.shouldUseDarkColors);
     await createWindow();
     startServer();
     void setupAutoUpdate();
 
     if (await waitForReady()) {
-      // 等待期间用户可能已手动关窗
-      if (mainWindow) await mainWindow.loadURL(BASE_URL);
+      // 等待期间用户可能已手动关窗（关 splash = 全窗关闭 = 走退出流程）
+      if (mainWindow) {
+        await mainWindow.loadURL(BASE_URL);
+        // 兜底：个别加载路径 ready-to-show 不触发（缓存页等）——加载完成还没亮就直接亮
+        if (mainWindow && !mainWindow.isVisible()) {
+          mainWindow.show();
+          closeSplashWindow();
+        }
+      }
     } else {
+      closeSplashWindow();
       dialog.showErrorBox(
         "启动超时",
         "内部服务 30 秒内没有就绪、请关闭应用重试。",
