@@ -176,7 +176,7 @@ export const AppHeader = ({
         <UpdateBadge />
         {/* 主题切换（浅色 / 深色 / 跟随系统） */}
         <ThemeToggle />
-        {/* 自定义 Action 管理入口 */}
+        {/* 能力页入口（Action / Skill / MCP 集中管理、v1.0.x） */}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -185,8 +185,8 @@ export const AppHeader = ({
             <Link
               href="/actions"
               className="no-underline"
-              aria-label="自定义 Action"
-              title="自定义 Action"
+              aria-label="能力"
+              title="能力（Action / Skill / MCP）"
             />
           }
         >

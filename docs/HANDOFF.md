@@ -307,6 +307,8 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **事件懒加载（上拉分页）**：打开任务只拉最近 300 条（GET `?tail=` + watch-task bootstrap 同口径）、Virtuoso `startReached` 上拉自动补更早分页（GET `/events?before=&limit=`、`firstItemIndex` 官方 prepend 机制保滚动位、items 增量按合并纯函数前后差值算——thinking/tool 相邻合并会跨页；`loadingEarlierRef` 同步重入闸 + prepend 前按本地 id 去重、防 firstItemIndex 多减错位）；**SSE 中途 task/done 帧一律剥 events**（原来每帧重传全量事件日志、长对话每帧几百 KB 纯浪费）；客户端所有「服务端 task 快照 → state」收口 `mergeTaskEvents`（**本地事件只增不换**：只吸收末尾新增、更早回灌一律丢——蓝军 P0：mutation 响应带全量 events、发条消息就把懒加载打穿；事件 append-only 从不改写、丢弃早段无损；有单测）
 - **设置页存储卡**（app 越用越大、用户拍板手动清理不自动删）：`/api/system/storage` 扫 data/tasks 占用（按大小降序）、勾选批量删（走既有 DELETE 完整停 agent 链路）、快捷筛选「已终结任务 / 30 天未活跃对话」（chat 无终态、按不活跃挑）
 - **长会话上下文结论（用户问）**：SDK 本地 agent 与 CLI/IDE 同 runtime、context 满自动摘要交给 Cursor 管、我们不干预；SDK 无 fork/checkpoint API（能力面只有 create/prompt/resume/send/getRun）、真要「从此处开新对话」只能截断历史 + 新会话、列为将来独立功能
+- **工作台侧栏降噪**（用户实测「有那么多状态反而更杂乱」）：监控行只在 运行中/待确认/待回答 出现、空闲/静息/失败一律单行只标题（失败不标同行首指示原则——陈年断线 error 满屏红字是噪声主源）；工作台折叠组「更早（超7天）」→「已终结（已合入/已放弃）」（时间分组是对话的逻辑不是任务的）、对话侧保持按时间
+- **设置页瘦身 + 能力页**（用户拍板「能力集中一个页面配置、设置页锚点侧导航」）：/actions 升级「能力页」tab 三分（Action=原自定义 action 管理整体迁入 / Skill=SkillsCard / MCP=McpCard+useSettings 落盘链路）；设置页删 MCP/Skills 卡、加左侧 sticky 锚点导航（点击定位 + IntersectionObserver 滚动跟随高亮）；旧深链兼容：settingsUrl("mcp"/"skills") 直出 /actions?tab=、设置页 ?focus=mcp|skills 兜底重定向
 
 ### 2026-07-10 夜 v1.0 界面重构 + Markdown 渲染升级（用户拍板、Grok 蓝军审核过）
 

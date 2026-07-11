@@ -1,14 +1,15 @@
 "use client";
 
 /**
- * Action 管理页（V0.9、独立页 /actions）
+ * 能力页（v1.0.x、用户拍板「skill / MCP / action 等能力集中一个页面配置」）
  *
- * 内置 + 自定义 action 统一一个列表管理（ActionLayoutConfig）：拖拽排序 + 显隐开关、
- * 自定义的额外可编辑 / 删除（CustomActionEditor Dialog）+ 顶部「导入 / 导出 / 新建」。
- * 顺序 / 显隐影响任务详情「推进」菜单里 action 的排列。
- * 导入 / 导出（v0.9.14）：都以文件夹为单位（用户拍板「批量就用文件夹的形式」）——导出选目录平铺写 md、
- * 导入选同一个文件夹扫第一层 md、飞书传文件夹（压缩包）即可团队共享。
- * 导出入口只有顶部一个（先弹勾选 ExportActionsDialog、默认全选）——不做行内单个导出（用户拍板、少一处入口）。
+ * 原 /actions 只管自定义 Action（V0.9）；现升级为「能力中心」、tab 切三块：
+ *   - Action：推进动作（内置 + 自定义统一列表：拖拽排序 / 显隐 / 编辑 / 导入导出）
+ *   - Skill：技能（自管可增删改、可从 Cursor 导入、AI 帮建）
+ *   - MCP：MCP servers（条目化管理 + 健康 / OAuth + 从 Cursor 导入）
+ * 设置页只留「设置」（凭据 / 模型 / 仓库 / 偏好 / 存储）、能力配置都在这。
+ *
+ * tab 状态走 ?tab=action|skills|mcp（深链可用：settingsUrl("mcp") 等旧跳转已重定向到这）。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -17,11 +18,15 @@ import { ArrowLeft, FileDown, FileUp, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useDialog } from "@/hooks/use-dialog";
+import { useSettings } from "@/hooks/use-settings";
 import { CustomActionEditor } from "@/components/custom-actions/custom-action-editor";
 import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-config";
 import { ExportActionsDialog } from "@/components/custom-actions/export-actions-dialog";
+import { McpCard } from "@/components/settings/mcp-card";
+import { SkillsCard } from "@/components/settings/skills-card";
 import {
   deleteCustomActionReq,
   exportCustomActionsReq,
@@ -32,8 +37,20 @@ import {
 import { pickNativePaths } from "@/lib/native-picker";
 import type { CustomActionDef } from "@/lib/types";
 
-const ActionsPage = () => {
-  const router = useRouter();
+// 三个能力 tab（key 同时是 ?tab= 的取值）
+type CapTab = "action" | "skills" | "mcp";
+
+const CAP_TABS: Array<{ key: CapTab; label: string }> = [
+  { key: "action", label: "Action" },
+  { key: "skills", label: "Skill" },
+  { key: "mcp", label: "MCP" },
+];
+
+const isCapTab = (v: string | null): v is CapTab =>
+  v === "action" || v === "skills" || v === "mcp";
+
+/** Action 管理面板（原 /actions 页主体、整体搬进 tab） */
+const ActionsPanel = () => {
   const { confirm } = useDialog();
   // 自定义 action 列表
   const [actions, setActions] = useState<CustomActionDef[]>([]);
@@ -71,12 +88,6 @@ const ActionsPage = () => {
       .then((s) => setKnownSkills(new Set(s.map((x) => x.name))))
       .catch(() => setKnownSkills(null));
   }, []);
-
-  // 返回 = 回来路（首页 / 设置页都可能进）、无历史兜底回首页
-  const handleBack = () => {
-    if (window.history.length > 1) router.back();
-    else router.push("/");
-  };
 
   const handleNew = () => {
     setEditing(null);
@@ -167,48 +178,37 @@ const ActionsPage = () => {
   };
 
   return (
-    <div className="mx-auto max-w-3xl px-6 py-8">
-      <div className="mb-6">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="-ml-2 mb-2 px-2"
-          onClick={handleBack}
-        >
-          <ArrowLeft />
-          返回
-        </Button>
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <h1 className="text-lg font-semibold">Action 管理</h1>
-            <p className="text-sm text-muted-foreground">
-              拖拽调「推进」里的顺序、开关控显隐、自定义的可编辑 / 删除
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            {/* 导入 / 导出（v0.9.14 团队点对点共享）：定义就是 md 文件、飞书传文件即可 */}
-            <Button
-              variant="outline"
-              onClick={() => void handleImport()}
-              disabled={transferring}
-            >
-              {transferring ? <Loader2 className="animate-spin" /> : <FileUp />}
-              导入
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => setExportDialogOpen(true)}
-              disabled={transferring || actions.length === 0}
-              title={actions.length === 0 ? "还没有自定义 action" : "勾选导出自定义 action"}
-            >
-              {transferring ? <Loader2 className="animate-spin" /> : <FileDown />}
-              导出
-            </Button>
-            <Button onClick={handleNew}>
-              <Plus />
-              新建
-            </Button>
-          </div>
+    <div>
+      {/* 面板工具行：说明 + 导入 / 导出 / 新建 */}
+      <div className="mb-4 flex items-center justify-between gap-2">
+        <p className="text-sm text-muted-foreground">
+          拖拽调「推进」里的顺序、开关控显隐、自定义的可编辑 / 删除
+        </p>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* 导入 / 导出（v0.9.14 团队点对点共享）：定义就是 md 文件、飞书传文件即可 */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleImport()}
+            disabled={transferring}
+          >
+            {transferring ? <Loader2 className="animate-spin" /> : <FileUp />}
+            导入
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setExportDialogOpen(true)}
+            disabled={transferring || actions.length === 0}
+            title={actions.length === 0 ? "还没有自定义 action" : "勾选导出自定义 action"}
+          >
+            {transferring ? <Loader2 className="animate-spin" /> : <FileDown />}
+            导出
+          </Button>
+          <Button size="sm" onClick={handleNew}>
+            <Plus />
+            新建
+          </Button>
         </div>
       </div>
 
@@ -242,4 +242,78 @@ const ActionsPage = () => {
   );
 };
 
-export default ActionsPage;
+/** MCP 面板：McpCard + useSettings 落盘链路（跟原设置页同一套 hook） */
+const McpPanel = () => {
+  const { settings, loaded, update, saveFieldValue } = useSettings();
+  if (!loaded) return <LoadingState variant="card" />;
+  return (
+    <McpCard
+      appServers={settings.mcpServers ?? {}}
+      onAppServersChange={(next) => update("mcpServers", next)}
+      onAppServersCommit={(next) => saveFieldValue("mcpServers", next)}
+      disabledServers={settings.disabledMcpServers ?? []}
+      onChange={(next) => saveFieldValue("disabledMcpServers", next)}
+    />
+  );
+};
+
+const CapabilitiesPage = () => {
+  const router = useRouter();
+  // 当前 tab（?tab= 初始化、切换时 replaceState 同步 URL、深链 / 刷新不丢）
+  const [tab, setTab] = useState<CapTab>("action");
+
+  useEffect(() => {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    if (isCapTab(t)) setTab(t);
+  }, []);
+
+  const switchTab = (t: CapTab) => {
+    setTab(t);
+    window.history.replaceState(null, "", `/actions?tab=${t}`);
+  };
+
+  // 返回 = 回来路（首页 / 设置页都可能进）、无历史兜底回首页
+  const handleBack = () => {
+    if (window.history.length > 1) router.back();
+    else router.push("/");
+  };
+
+  return (
+    <div className="mx-auto max-w-3xl px-6 py-8">
+      <div className="mb-6">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="-ml-2 mb-2 px-2"
+          onClick={handleBack}
+        >
+          <ArrowLeft />
+          返回
+        </Button>
+        <h1 className="text-lg font-semibold">能力</h1>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          AI 干活用的三类能力：推进动作（Action）、技能（Skill）、外部工具（MCP）
+        </p>
+        {/* tab 行：切换三块能力面板 */}
+        <div className="mt-4 flex items-center gap-1 border-b pb-2">
+          {CAP_TABS.map((t) => (
+            <ChoiceButton
+              key={t.key}
+              shape="tab"
+              selected={tab === t.key}
+              onClick={() => switchTab(t.key)}
+            >
+              {t.label}
+            </ChoiceButton>
+          ))}
+        </div>
+      </div>
+
+      {tab === "action" && <ActionsPanel />}
+      {tab === "skills" && <SkillsCard />}
+      {tab === "mcp" && <McpPanel />}
+    </div>
+  );
+};
+
+export default CapabilitiesPage;
