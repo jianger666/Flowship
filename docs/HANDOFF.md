@@ -301,6 +301,16 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-11 夜 v1.1.1 启动提速 + 视图记忆 + 改名自迁移（用户逐条拍板、Grok 蓝军审核过）
+
+- **同事「启动很慢」根因修复**：首页就绪 gate 阻塞在 `/api/system/feishu-cli`、每次真 spawn 4 个子进程探测（version ×2 + auth status ×2、Windows Defender 首扫 + auth 打网络验 token 可拖 10~30s）——`getFeishuCliStatus` 改 **stale-while-revalidate**（内存 + 磁盘双缓存立即返回、后台 single-flight 真探测刷新；磁盘缓存跨重启、实测 20ms）；装/登/卸后 `invalidateStatusCache`（**代数护栏**：invalidate 递增 gen、旧 in-flight 结果落盘前核对、防失效前快照覆盖回来——蓝军 P1）；看板数据缓存 session → localStorage（重启秒开旧数据 + 转圈后台刷）
+- **mac 改名自迁移**（老版本一次升级即改名）：新版首启发现 .app 文件名 ≠ 产品名 → 原子 rename → open 新路径重启接力 → 通知「重新固定 Dock」；覆盖所有 <v1.1 升级路径。**⚠️ updater 内不做 rename**（蓝军 P0：ditto 后改名、用户点「稍后」= 运行中进程按失效路径 lazy-load 必坏）——迁移只在启动时做、rename 后立即重启、无带病续跑窗口
+- **视图记忆五件套**（`src/lib/view-memory.ts` 单一收口；session 级 = 重启即忘 / localStorage = 全局偏好 / 内存 Map = 滚动锚点）：① 最后浏览的对话（/chats 落点优先回它）② 事件流滚动位置（rangeChanged 记视口顶事件 id、非贴底离开恢复原位；**chat 模式 EventStream 补 `key={task.id}`**——Virtuoso 初始定位只在 mount 生效、蓝军 P1）③ 输入草稿按 task 记（chat 输入岛 + 任务说话条、发送后清）④ 输入条拖过的高度 ⑤ 看板时间范围
+- **侧栏「待确认」已读即清**（用户拍板「点进去看过、状态就该清掉」）：详情页上报 seenAt（localStorage、300 条裁剪）、awaiting_ack 且 seenAt >= updatedAt 时监控行 + 琥珀点熄；新交卷自动重亮；「待回答」不清（AI 阻塞等答案）
+- **splash 改主窗同尺寸同位置**（「首屏就和打开后一样大」）+ hero loading **200ms 静默窗**（应用内切换秒开不闪 loading、启动 10s 窗口内 immediate 仍立即可见防白屏）
+- **设置页**：偏好加「新任务默认隔离工作区」开关（测试类只读用法可默认直跑原仓）；GitLab Token 双倍间距修复（SettingRow 开 className、连接卡两节 py-0）；删「废话 hint」仅一处（解释不存在的 Host 字段那条——判据：解释用户看不到的东西才是废话、全删会光秃秃、用户两轮纠偏）；删任务页「需求详情」按钮（工作项 description 团队实践恒空、纯误导）
+- 方向讨论沉淀（明日清单）：skill 可关 + role 默认自适应隐藏；action 文件夹化（ACTION.md 规范）+ AI 帮建 action；能力页 Rules tab；测试团队接入零新基建（多仓 + 默认不隔离 + action 模板）
+
 ### 2026-07-11 v1.1.0 改名「Flowship」+ 开屏 splash 独立小窗（正式第一版、用户拍板）
 
 - **产品改名 Flowship**（flow=需求流转 + ship=交付上线 action、用户三轮选型拍板；替代「AI工作流」）：只改**显示层**——`productName`（electron-builder.yml + electron-app/package.json）、页面 title、诊断包名、OAuth 回调文案、通知默认标题、test 包名 `FlowshipTest`；**内部标识一律不动**——appId `com.jianger.fe-ai-flow`（win 升级不裂）、userData `fe-ai-flow`（壳钉死、数据不漂移）、artifactName ascii（updater 下载链路稳）、仓库名。注意：mac 老用户应用内自更新是 ditto 替换 .app **内容**、磁盘上文件名仍是「AI工作流.app」、Finder 显示名 / Dock 会变 Flowship（纯外观残留、无害）
