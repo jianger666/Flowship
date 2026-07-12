@@ -24,8 +24,9 @@ import { usePathname } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { AppSidebar } from "@/components/app-sidebar";
 
-// 页型：board（看板首页、默认收）/ standalone（设置 / 能力页、默认收——这类页有自己的
-// 内部导航、任务侧栏叠上去是双侧栏、用户点名「设置页左边还有侧边栏」）/ detail（其余、默认展）
+// 页型：board（看板首页、默认展——2026-07-13 用户拍板「和对话保持一致、别切来切去
+// 一收一放」）/ standalone（设置 / 能力页、默认收——这类页有自己的内部导航、任务侧栏
+// 叠上去是双侧栏、用户点名「设置页左边还有侧边栏」）/ detail（其余、默认展）
 const routeType = (pathname: string): "board" | "standalone" | "detail" => {
   if (pathname === "/") return "board";
   if (pathname.startsWith("/settings") || pathname.startsWith("/actions")) {
@@ -36,9 +37,9 @@ const routeType = (pathname: string): "board" | "standalone" | "detail" => {
 
 export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const pathname = usePathname();
-  // 侧栏展开 / 收起：初值按当前页型的自动默认（board / standalone 收、detail 展）
+  // 侧栏展开 / 收起：初值按当前页型的自动默认（仅 standalone 收、其余展）
   const [sidebarOpen, setSidebarOpen] = useState(
-    () => routeType(pathname) === "detail",
+    () => routeType(pathname) !== "standalone",
   );
   // 主区是否已向下滚动——传给顶栏控制分隔线
   const [scrolled, setScrolled] = useState(false);
@@ -49,13 +50,13 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
     routeType(pathname),
   );
 
-  // 页型切换沿：应用该页型的自动默认（board / standalone 收、detail 展）；
+  // 页型切换沿：应用该页型的自动默认（仅 standalone 收、其余展）；
   // 同页型内不动（保留手动 toggle）
   useEffect(() => {
     const type = routeType(pathname);
     if (type === lastAutoTypeRef.current) return;
     lastAutoTypeRef.current = type;
-    setSidebarOpen(type === "detail");
+    setSidebarOpen(type !== "standalone");
   }, [pathname]);
 
   const toggleSidebar = useCallback(() => {

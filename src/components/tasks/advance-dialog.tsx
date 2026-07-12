@@ -749,8 +749,8 @@ export const AdvanceDialog = ({
         </DialogHeader>
 
         {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5）
-            min-h 兜底六个内置 action 主路径高度，切换时弹窗不抖（分批 build / 大图附件仍可能增高） */}
-        <div className="flex min-h-[28rem] flex-col gap-4">
+            高度随内容自适应（防抖占位撑出大空档、用户实测点名去掉） */}
+        <div className="flex flex-col gap-4">
           {/* action 类型选择：内置 + 自定义混排成 grid 方块（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
@@ -768,8 +768,8 @@ export const AdvanceDialog = ({
                 开启或新建。
               </EmptyHint>
             )}
-            {/* 提示条固定占一行高：有无内容都占位，避免 plan 追加提示出现/消失时高度跳 */}
-            <div className="flex min-h-5 items-center gap-1.5 text-xs text-muted-foreground">
+            {/* plan 追加提示：有内容才渲染（占位防抖已回退） */}
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground empty:hidden">
               {actionType === "plan" && hasPlanHistory ? (
                 <>
                   <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
@@ -930,9 +930,8 @@ export const AdvanceDialog = ({
             </div>
           </div>
 
-          {/* action 专属附加区：固定 min-h 吸收 ship 开关行 / dev 推送方式的高度差
-              （dev 两卡最高；无附加内容时仍占位，六个内置切换不抖） */}
-          <div className="min-h-[5.75rem]">
+          {/* action 专属附加区：有内容才占高（防抖占位会撑出大空档、已回退） */}
+          <div className="empty:hidden">
             {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
             {actionType === "ship" && (
               <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
