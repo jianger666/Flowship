@@ -84,6 +84,7 @@ import {
   arrangeByLayout,
   BUILTIN_ADVANCE_ACTIONS,
   isBuiltinAdvanceAction,
+  usableCustomActions,
 } from "@/lib/action-layout";
 import { cn } from "@/lib/utils";
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
@@ -473,11 +474,12 @@ export const AdvanceDialog = ({
     }
   }, [open, availableModels.length, fetchModels]);
 
-  // dialog 打开时拉自定义 action 列表（供「我的 Action」组渲染）；拉失败静默清空、不挡内置 action
+  // dialog 打开时拉自定义 action 列表（供「我的 Action」组渲染）；拉失败静默清空、不挡内置 action。
+  // 旧格式（legacy）已停用、在这个唯一数据源处滤掉——下游 customById / visibleKeys / 默认选中全部跟随
   useEffect(() => {
     if (!open) return;
     void fetchCustomActions()
-      .then(setCustomActions)
+      .then((defs) => setCustomActions(usableCustomActions(defs)))
       .catch(() => setCustomActions([]));
   }, [open]);
 

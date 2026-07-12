@@ -15,11 +15,19 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, FileUp, Loader2, Plus, Sparkles } from "lucide-react";
+import { ArrowLeft, Copy, FileUp, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useDialog } from "@/hooks/use-dialog";
 import { useSettings } from "@/hooks/use-settings";
@@ -75,6 +83,10 @@ const ActionsPanel = () => {
   const [transferring, setTransferring] = useState(false);
   // 「对话创建」发起中（防双击）
   const [aiCreating, setAiCreating] = useState(false);
+  // 正在查看原内容的旧格式 action（null = 关闭）
+  const [viewingLegacy, setViewingLegacy] = useState<CustomActionDef | null>(
+    null,
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -218,6 +230,17 @@ const ActionsPanel = () => {
     }
   };
 
+  // 复制旧格式原内容（供用户拿去建 skill 后重新挂载）
+  const handleCopyLegacy = async () => {
+    if (!viewingLegacy?.legacyPlaybook) return;
+    try {
+      await navigator.clipboard.writeText(viewingLegacy.legacyPlaybook);
+      toast.success("已复制");
+    } catch (err) {
+      toast.error(`复制失败：${err instanceof Error ? err.message : err}`);
+    }
+  };
+
   // 保存成功：合并进列表（新建追加到最前 / 编辑替换原位）
   const handleSaved = (def: CustomActionDef) => {
     setActions((prev) => {
@@ -274,6 +297,7 @@ const ActionsPanel = () => {
           onEdit={handleEdit}
           onDelete={handleDelete}
           onExport={(def) => void handleExport(def)}
+          onViewLegacy={setViewingLegacy}
         />
       )}
 
@@ -283,6 +307,36 @@ const ActionsPanel = () => {
         editing={editing}
         onSaved={handleSaved}
       />
+
+      {/* 旧格式原内容查看（只读、纯展示——点外可关）；复制后自行建 skill 重新挂载 */}
+      <Dialog
+        open={!!viewingLegacy}
+        onOpenChange={(o) => {
+          if (!o) setViewingLegacy(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>「{viewingLegacy?.label}」原内容</DialogTitle>
+            <DialogDescription>
+              旧格式已停用——把内容建成 skill 后重新新建挂载
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="max-h-96 overflow-auto rounded-md border bg-muted/30 p-3 font-mono text-xs whitespace-pre-wrap wrap-anywhere">
+            {viewingLegacy?.legacyPlaybook}
+          </pre>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleCopyLegacy()}
+            >
+              <Copy />
+              复制
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

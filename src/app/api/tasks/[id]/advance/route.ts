@@ -186,6 +186,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
     if (!def) {
       return errorResponse(`自定义 action 定义不存在：${customActionId}`, 404);
     }
+    // 旧格式已停用（推进弹窗已滤掉、这里挡直连 API）
+    if (def.legacyPlaybook) {
+      return errorResponse(
+        `自定义 action「${def.label}」是旧格式、已停用——请在能力页重建`,
+      );
+    }
   }
 
   const task = await getTask(id);

@@ -6,7 +6,7 @@
  * 偏好来自 settings.actionLayout（个人级、落 config.json）。
  */
 
-import type { ActionType } from "./types";
+import type { ActionType, CustomActionDef } from "./types";
 
 // 推进面板内置 action 的默认顺序——advance-dialog 渲染 + /actions 布局配置页共用、单一来源。
 // custom 不在内（自定义 action 走单独清单、按 id 排）。
@@ -20,6 +20,14 @@ export const BUILTIN_ADVANCE_ACTIONS: Exclude<ActionType, "custom">[] = [
 ];
 
 const BUILTIN_SET = new Set<string>(BUILTIN_ADVANCE_ACTIONS);
+
+/**
+ * 推进弹窗可用的自定义 action：旧格式（legacyPlaybook 残留）已停用、直接滤掉。
+ * 能力页列表不走本函数（legacy 要展示出来供查看 / 删除）。
+ */
+export const usableCustomActions = (
+  defs: CustomActionDef[],
+): CustomActionDef[] => defs.filter((d) => !d.legacyPlaybook);
 
 // key 是不是内置推进 action——混排列表里区分内置 / 自定义（自定义 key 是 custom id）
 export const isBuiltinAdvanceAction = (

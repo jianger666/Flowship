@@ -147,6 +147,11 @@ const loadCustomActionPlaybook = async (
       action.customActionId ? `：${action.customActionId}` : "（缺 id）"
     }、可能已在 /actions 页删除。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明定义缺失。）`;
   }
+  // 旧格式（playbook 写正文、无挂载 skill）已停用——推进列表已滤掉、这里只兜
+  // 历史 action 记录重启等撞到的情况：跟「定义缺失」同款文案、引导重建
+  if (def.legacyPlaybook) {
+    return `（自定义 action「${def.label}」是旧格式、已停用——请在能力页把原内容建成 skill 后重新新建挂载。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明该 action 已停用。）`;
+  }
   // 主 skill 正文 = 真正的 playbook；找不到就跟「定义缺失」同风格兜底、说清缺哪个 skill
   const skillBody = await readSkillBodyByName(def.skill);
   if (!skillBody) {

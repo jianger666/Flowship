@@ -8,9 +8,11 @@
  *   - 正文：空（playbook 内容已迁到对应 skill 的 SKILL.md）
  *   - id = 目录名（新建时按 label slug 化）
  *
- * 存量自动迁移（读到即迁、幂等）：
- *   1. 老平铺 `<id>.md` → `<id>/ACTION.md`（目录化，既有）
- *   2. 老 ACTION.md 有非空 playbook 正文 → 抽成 app 自管 skill + 壳重写为新格式
+ * 旧格式处理（用户拍板「不静默迁移、旧的直接停用」）：
+ *   1. 老平铺 `<id>.md` → `<id>/ACTION.md` 的**目录化**迁移保留（无损布局搬家、不动内容）
+ *   2. 老 ACTION.md 正文还塞着 playbook（无 skill 字段）→ **不再自动抽 skill**；
+ *      parse 成带 `legacyPlaybook` 的 def（skill 空串）——已停用、能力页只供查看原文 + 删除，
+ *      不进推进列表、不注入运行。用户把原内容建成 skill 后重新新建挂载。
  *
  * 错误语义：
  *   - list：单文件解析失败 → warn + skip（不让整个列表炸）
@@ -23,11 +25,7 @@ import path from "node:path";
 import matter from "gray-matter";
 
 import { dataRoot } from "./data-root";
-import {
-  findSkillByName,
-  getAppSkillsDir,
-  loadSkills,
-} from "./skills-loader";
+import { findSkillByName, getAppSkillsDir } from "./skills-loader";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 
 // 对外 re-export、让 route 等调用方能从 fs 层一并拿到入参类型
@@ -103,31 +101,22 @@ export const sanitizeSkillName = (raw: unknown): string | undefined => {
   return s.length > 0 ? s : undefined;
 };
 
-// 解析单个 md → CustomActionDef（label / skill 缺失视为非法、返 null）
-// 注：老文件可能残留 checkCommands / skills / 正文 playbook——调用方先走迁移再 parse
+// 解析单个 md → CustomActionDef
+// 新格式：frontmatter 有 skill、正文空。
+// 旧格式（无 skill 字段、正文塞 playbook）→ 返回带 legacyPlaybook 的 def（skill 空串）——
+// 已停用、只供能力页展示原文；两者都不满足（无 skill 也无正文）视为非法、返 null。
 const parseDef = (id: string, raw: string): CustomActionDef | null => {
   const parsed = matter(raw);
   const data = parsed.data as Record<string, unknown>;
   const label = typeof data.label === "string" ? data.label.trim() : "";
   if (!label) return null;
-  // 新格式必填 skill；兼容读：老 skills 数组已迁完不会走到这里无 skill
-  const skill =
-    sanitizeSkillName(data.skill) ??
-    // 半迁移 / 手改残留：若 frontmatter 还写着老 skills[0] 且无 skill、不当合法壳
-    undefined;
-  if (!skill) return null;
-  return {
-    id,
-    label,
+  const skill = sanitizeSkillName(data.skill);
+  const playbook = parsed.content.trim();
+  // 公共可选字段（新旧格式同构读取）
+  const common = {
     summary:
       typeof data.summary === "string" && data.summary.trim()
         ? data.summary.trim()
-        : undefined,
-    skill,
-    // 产出要求：多行文本、trim 后空则不写（跟 summary / placeholder 同构）
-    output:
-      typeof data.output === "string" && data.output.trim()
-        ? data.output.trim()
         : undefined,
     extraSkills: sanitizeSkills(data.extraSkills) ?? sanitizeSkills(data.skills),
     freshAgent: typeof data.freshAgent === "boolean" ? data.freshAgent : undefined,
@@ -137,6 +126,21 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
         : undefined,
     createdAt: typeof data.createdAt === "number" ? data.createdAt : 0,
     updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : 0,
+  };
+  if (!skill) {
+    if (!playbook) return null;
+    return { id, label, skill: "", legacyPlaybook: playbook, ...common };
+  }
+  return {
+    id,
+    label,
+    skill,
+    // 产出要求：多行文本、trim 后空则不写（跟 summary / placeholder 同构）
+    output:
+      typeof data.output === "string" && data.output.trim()
+        ? data.output.trim()
+        : undefined,
+    ...common,
   };
 };
 
@@ -185,117 +189,7 @@ const migrateLegacyFile = async (id: string, raw: string): Promise<void> => {
   }
 };
 
-/**
- * 挑一个不撞名的 skill 目录名（不覆盖已存在 skill）。
- * 撞名范围：app 自管目录已有 + loadSkills 已注册同名（避免写了却被平台 / 全局同名盖住）。
- */
-const allocateSkillSlug = async (
-  preferred: string,
-  takenNames: Set<string>,
-): Promise<string> => {
-  const appDir = getAppSkillsDir();
-  const base = preferred || `migrated-${Date.now().toString(36)}`;
-  for (let i = 0; i < 30; i += 1) {
-    // 首次用原名、之后 -2 / -3…（跟 action id 撞名约定一致）
-    const candidate = i === 0 ? base : `${base}-${i + 1}`;
-    if (takenNames.has(candidate)) continue;
-    if (await pathExists(path.join(appDir, candidate))) continue;
-    return candidate;
-  }
-  return `${base}-${Date.now().toString(36)}`;
-};
-
-/**
- * 老 playbook 正文 → app 自管 skill + ACTION.md 瘦身壳（读到旧格式即迁、幂等）。
- * 触发条件：正文非空（旧格式把 playbook 写在 ACTION.md 正文）。
- * 已是新格式（正文空 + 有 skill）再读不会进这里。
- */
-const migratePlaybookToSkill = async (
-  id: string,
-  raw: string,
-): Promise<CustomActionDef | null> => {
-  const parsed = matter(raw);
-  const data = parsed.data as Record<string, unknown>;
-  const playbook = parsed.content.trim();
-  if (!playbook) return parseDef(id, raw);
-
-  const label =
-    typeof data.label === "string" && data.label.trim()
-      ? data.label.trim()
-      : id;
-  const summary =
-    typeof data.summary === "string" && data.summary.trim()
-      ? data.summary.trim()
-      : undefined;
-  // 原 skills 引用并入 extraSkills（附加参考）；主内容已是新建的 skill
-  const extraSkills = sanitizeSkills(data.extraSkills) ?? sanitizeSkills(data.skills);
-
-  try {
-    // 已注册名集合：写新 skill 时避开、免得被同名平台 / 全局 skill 盖住后内容丢了
-    const taken = new Set((await loadSkills()).map((s) => s.name));
-    const preferred = slugify(label) || slugify(id) || `action-${id}`;
-    const skillSlug = await allocateSkillSlug(preferred, taken);
-
-    // 写入 app 自管 skills/<slug>/SKILL.md（不覆盖已有——allocate 已探空位）
-    const skillDir = path.join(getAppSkillsDir(), skillSlug);
-    await fs.mkdir(skillDir, { recursive: true });
-    const skillMd = matter.stringify(`\n${playbook}\n`, {
-      name: skillSlug,
-      // description 给 agent 扫一眼用；优先 summary、否则用动作名
-      description: summary || label,
-    });
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), skillMd, "utf-8");
-
-    const def: CustomActionDef = {
-      id,
-      label,
-      summary,
-      skill: skillSlug,
-      extraSkills,
-      freshAgent:
-        typeof data.freshAgent === "boolean" ? data.freshAgent : undefined,
-      placeholder:
-        typeof data.placeholder === "string" && data.placeholder.trim()
-          ? data.placeholder.trim()
-          : undefined,
-      createdAt: typeof data.createdAt === "number" ? data.createdAt : Date.now(),
-      updatedAt: Date.now(),
-    };
-    await writeDef(def);
-    console.log(
-      `[custom-action-fs] 已迁移 playbook→skill：action=${id} skill=${skillSlug}`,
-    );
-    return def;
-  } catch (err) {
-    console.warn(
-      `[custom-action-fs] playbook→skill 迁移失败（下次重试）：${id}`,
-      err,
-    );
-    return null;
-  }
-};
-
-/**
- * 读 ACTION.md 原始内容 → 必要时迁移 → 解析成 Def。
- * 迁移链：正文非空（旧 playbook）先迁 skill；再 parse。
- */
-const readAndMaybeMigrate = async (
-  id: string,
-  raw: string,
-): Promise<CustomActionDef | null> => {
-  const parsed = matter(raw);
-  const playbook = parsed.content.trim();
-  // 旧格式：正文里还塞着 playbook → 抽 skill + 重写壳
-  if (playbook) {
-    const migrated = await migratePlaybookToSkill(id, raw);
-    if (migrated) return migrated;
-    // 迁移失败：没法当新壳用（无 skill 字段）、返 null 让上层跳过 / 报缺失
-    return null;
-  }
-  return parseDef(id, raw);
-};
-
-/** 列出所有自定义 action（按更新时间倒序）；读到旧格式顺手迁移 */
+/** 列出所有自定义 action（按更新时间倒序）；旧平铺文件只做目录化搬家、不动内容 */
 export const listCustomActions = async (): Promise<CustomActionDef[]> => {
   const dir = customActionsDir();
   let entries;
@@ -313,7 +207,7 @@ export const listCustomActions = async (): Promise<CustomActionDef[]> => {
     if (!isSafeId(id)) continue;
     try {
       const raw = await fs.readFile(path.join(dir, id, "ACTION.md"), "utf-8");
-      const def = await readAndMaybeMigrate(id, raw);
+      const def = parseDef(id, raw);
       if (def) {
         defs.push(def);
         seen.add(id);
@@ -328,11 +222,11 @@ export const listCustomActions = async (): Promise<CustomActionDef[]> => {
     if (!isSafeId(id)) continue;
     try {
       const raw = await fs.readFile(path.join(dir, ent.name), "utf-8");
-      // 先目录化、再 playbook→skill（migrateLegacyFile 写完后读目录版走同一条迁移链）
+      // 平铺 → 目录化（无损搬家、内容原样；旧 playbook 格式由 parseDef 打 legacy 标记）
       await migrateLegacyFile(id, raw);
       if (seen.has(id)) continue;
       const dirRaw = await fs.readFile(fileOf(id), "utf-8").catch(() => raw);
-      const def = await readAndMaybeMigrate(id, dirRaw);
+      const def = parseDef(id, dirRaw);
       if (def) {
         defs.push(def);
         seen.add(id);
@@ -347,20 +241,20 @@ export const listCustomActions = async (): Promise<CustomActionDef[]> => {
   return defs.sort((a, b) => b.updatedAt - a.updatedAt);
 };
 
-/** 读单个自定义 action；兼容旧平铺 / 旧 playbook（读到即迁移） */
+/** 读单个自定义 action；旧平铺只目录化搬家、旧 playbook 格式带 legacy 标记返回（不迁移） */
 export const getCustomAction = async (
   id: string,
 ): Promise<CustomActionDef | null> => {
   if (!isSafeId(id)) return null;
   try {
     const raw = await fs.readFile(fileOf(id), "utf-8");
-    return readAndMaybeMigrate(id, raw);
+    return parseDef(id, raw);
   } catch {
     try {
       const raw = await fs.readFile(legacyFileOf(id), "utf-8");
       await migrateLegacyFile(id, raw);
       const dirRaw = await fs.readFile(fileOf(id), "utf-8").catch(() => raw);
-      return readAndMaybeMigrate(id, dirRaw);
+      return parseDef(id, dirRaw);
     } catch {
       return null;
     }
@@ -397,6 +291,10 @@ export const updateCustomAction = async (
 ): Promise<CustomActionDef> => {
   const existing = await getCustomAction(id);
   if (!existing) throw new Error(`custom action 不存在：${id}`);
+  // 旧格式已停用：编辑会把正文 playbook 冲掉（writeDef 只写 frontmatter）、直接挡
+  if (existing.legacyPlaybook) {
+    throw new Error("旧格式 action 已停用、不能编辑——把原内容建成 skill 后重新新建挂载");
+  }
   const nextSkill = (patch.skill ?? existing.skill).trim();
   if (!nextSkill) throw new Error("skill 必填");
   const next: CustomActionDef = {
@@ -490,6 +388,10 @@ export const exportCustomAction = async (
   const absTarget = await assertExistingAbsDir(targetDir, "targetDir");
   const def = await getCustomAction(id);
   if (!def) throw new Error(`custom action 不存在：${id}`);
+  // 旧格式无挂载 skill、没有可导出的包
+  if (def.legacyPlaybook) {
+    throw new Error("旧格式 action 已停用、无法导出——把原内容建成 skill 后重新新建挂载");
+  }
 
   const skillEntry = await findSkillByName(def.skill);
   if (!skillEntry) {

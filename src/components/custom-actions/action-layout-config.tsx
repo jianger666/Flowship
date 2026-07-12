@@ -12,8 +12,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
-import { GripVertical, Pencil, Share, Trash2, Wrench } from "lucide-react";
+import { Eye, GripVertical, Pencil, Share, Trash2, Wrench } from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Switch } from "@/components/ui/switch";
@@ -37,6 +38,8 @@ interface Props {
   onEdit: (def: CustomActionDef) => void;
   onDelete: (def: CustomActionDef) => void;
   onExport: (def: CustomActionDef) => void;
+  // 旧格式行「查看原内容」（只读 dialog、供复制后重建）
+  onViewLegacy: (def: CustomActionDef) => void;
 }
 
 interface RowProps {
@@ -44,6 +47,8 @@ interface RowProps {
   label: string;
   isCustom: boolean;
   isHidden: boolean;
+  // 旧格式（playbook 写正文）已停用：标 Badge + 只留查看 / 删除、开关禁用
+  isLegacy?: boolean;
   // 自定义 action 引用的 skill（缺失的灰显、提示推进时跳过）
   skills?: { name: string; missing: boolean }[];
   onToggleHidden: (visible: boolean) => void;
@@ -52,6 +57,8 @@ interface RowProps {
   onEdit?: () => void;
   onDelete?: () => void;
   onExport?: () => void;
+  // 仅旧格式行传：只读查看原 playbook
+  onViewLegacy?: () => void;
 }
 
 // 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill chips）+ [自定义]编辑 / 删除 + 显隐开关
@@ -60,12 +67,14 @@ const LayoutRow = ({
   label,
   isCustom,
   isHidden,
+  isLegacy,
   skills,
   onToggleHidden,
   onDragEnd,
   onEdit,
   onDelete,
   onExport,
+  onViewLegacy,
 }: RowProps) => {
   // 每个 Item 独立拖拽控制器——dragListener={false} 只让手柄发起拖拽、不误触开关 / 按钮 / 整行
   const controls = useDragControls();
@@ -85,41 +94,63 @@ const LayoutRow = ({
       >
         <GripVertical className="size-4" />
       </button>
-      <span
-        className={cn(
-          "flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-sm",
-          isHidden && "text-muted-foreground line-through",
-        )}
-      >
-        <span className="truncate">{label}</span>
-        {isCustom && (
-          <Tooltip content="自定义 Action">
-            <Wrench className="size-3 shrink-0 text-muted-foreground" />
-          </Tooltip>
-        )}
-        {/* 引用的 skill chips：缺失的灰显划线（本机未找到、推进时自动跳过） */}
-        {skills?.map((s) => (
-          <Tooltip
-            key={s.name}
-            content={s.missing ? "本机未找到、推进时自动跳过" : "引用的 skill"}
-          >
-            <span
-              className={cn(
-                "shrink-0 rounded border px-1 py-px font-mono text-[10px] text-muted-foreground",
-                s.missing && "border-dashed line-through opacity-60",
-              )}
+      <div className="min-w-0 flex-1">
+        <span
+          className={cn(
+            "flex items-center gap-1.5 overflow-hidden text-sm",
+            isHidden && "text-muted-foreground line-through",
+          )}
+        >
+          <span className="truncate">{label}</span>
+          {isCustom && (
+            <Tooltip content="自定义 Action">
+              <Wrench className="size-3 shrink-0 text-muted-foreground" />
+            </Tooltip>
+          )}
+          {isLegacy && (
+            <Badge variant="secondary" className="shrink-0">
+              旧格式・已停用
+            </Badge>
+          )}
+          {/* 引用的 skill chips：缺失的灰显划线（本机未找到、推进时自动跳过） */}
+          {skills?.map((s) => (
+            <Tooltip
+              key={s.name}
+              content={s.missing ? "本机未找到、推进时自动跳过" : "引用的 skill"}
             >
-              {s.name}
-            </span>
-          </Tooltip>
-        ))}
-      </span>
+              <span
+                className={cn(
+                  "shrink-0 rounded border px-1 py-px font-mono text-[10px] text-muted-foreground",
+                  s.missing && "border-dashed line-through opacity-60",
+                )}
+              >
+                {s.name}
+              </span>
+            </Tooltip>
+          ))}
+        </span>
+        {isLegacy && (
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            把原内容建成 skill 后重新新建挂载
+          </p>
+        )}
+      </div>
       {isHidden && (
         <span className="shrink-0 text-[10px] text-muted-foreground">
           已隐藏
         </span>
       )}
-      {/* 编辑 / 导出 / 删除仅自定义行有——内置 action 不可改不可删 */}
+      {/* 编辑 / 导出 / 删除仅自定义行有——内置 action 不可改不可删；旧格式行只留查看 / 删除 */}
+      {onViewLegacy && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={onViewLegacy}
+          title="查看原内容"
+        >
+          <Eye />
+        </Button>
+      )}
       {onEdit && (
         <Button variant="ghost" size="icon-sm" onClick={onEdit} title="编辑">
           <Pencil />
@@ -135,7 +166,12 @@ const LayoutRow = ({
           <Trash2 />
         </Button>
       )}
-      <Switch checked={!isHidden} onCheckedChange={onToggleHidden} />
+      {/* 旧格式不进推进列表、显隐无意义——开关禁用 */}
+      <Switch
+        checked={!isHidden}
+        onCheckedChange={onToggleHidden}
+        disabled={isLegacy}
+      />
     </Reorder.Item>
   );
 };
@@ -146,6 +182,7 @@ export const ActionLayoutConfig = ({
   onEdit,
   onDelete,
   onExport,
+  onViewLegacy,
 }: Props) => {
   const { settings, saveFieldValue, loaded } = useSettings();
   const layout = settings.actionLayout ?? { order: [], hidden: [] };
@@ -201,6 +238,8 @@ export const ActionLayoutConfig = ({
     >
       {order.map((key) => {
         const def = customById.get(key);
+        // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留查看原内容 + 删除
+        const isLegacy = !!def?.legacyPlaybook;
         return (
           <LayoutRow
             key={key}
@@ -212,9 +251,11 @@ export const ActionLayoutConfig = ({
             }
             isCustom={!isBuiltinAdvanceAction(key)}
             isHidden={hiddenSet.has(key)}
-            // 主 skill + 附加：knownSkills 没拉到（null）时不标缺失、避免加载中误报
+            isLegacy={isLegacy}
+            // 主 skill + 附加：knownSkills 没拉到（null）时不标缺失、避免加载中误报；
+            // legacy 无挂载 skill（空串）、chips 不展示
             skills={
-              def
+              def && !isLegacy
                 ? [def.skill, ...(def.extraSkills ?? [])].map((name) => ({
                     name,
                     missing: knownSkills !== null && !knownSkills.has(name),
@@ -223,9 +264,10 @@ export const ActionLayoutConfig = ({
             }
             onToggleHidden={(visible) => toggleHidden(key, visible)}
             onDragEnd={handleDragEnd}
-            onEdit={def ? () => onEdit(def) : undefined}
+            onEdit={def && !isLegacy ? () => onEdit(def) : undefined}
             onDelete={def ? () => onDelete(def) : undefined}
-            onExport={def ? () => onExport(def) : undefined}
+            onExport={def && !isLegacy ? () => onExport(def) : undefined}
+            onViewLegacy={def && isLegacy ? () => onViewLegacy(def) : undefined}
           />
         );
       })}

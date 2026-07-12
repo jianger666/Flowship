@@ -1,9 +1,10 @@
 /**
- * 自定义 action：skill 挂载壳 + 存量 playbook→skill 自动迁移
+ * 自定义 action：skill 挂载壳 + 旧格式停用语义
  *
  * 回归点：
  * - 新格式 frontmatter-only（skill 必填、正文空）读写往返
- * - 老 ACTION.md 非空 playbook → 抽成 app 自管 skill + 壳重写（幂等）
+ * - 旧格式（playbook 写正文、无 skill）：不自动迁移、带 legacyPlaybook 标记返回、
+ *   推进列表滤掉、编辑 / 导出报错；旧平铺 <id>.md 仅目录化搬家（无损）
  */
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -21,6 +22,7 @@ import {
   listCustomActions,
   updateCustomAction,
 } from "@/lib/server/custom-action-fs";
+import { usableCustomActions } from "@/lib/action-layout";
 import { getAppSkillsDir } from "@/lib/server/skills-loader";
 
 beforeAll(async () => {
@@ -106,7 +108,7 @@ describe("custom-action 新格式（skill 挂载壳）", () => {
   });
 });
 
-describe("custom-action 存量迁移 playbook → skill", () => {
+describe("旧格式（playbook 正文）：停用、不自动迁移", () => {
   const writeLegacyAction = async (
     id: string,
     opts: {
@@ -134,7 +136,7 @@ ${opts.playbook}
     await fs.writeFile(path.join(dir, "ACTION.md"), raw, "utf-8");
   };
 
-  it("老 playbook 正文 → 新建 app skill + ACTION.md 瘦身壳", async () => {
+  it("get 不迁移：返回 legacyPlaybook 标记、文件原样、不生成 skill", async () => {
     await writeLegacyAction("perf-audit", {
       label: "Perf Audit",
       summary: "性能扫一遍",
@@ -144,111 +146,95 @@ ${opts.playbook}
 
     const def = await getCustomAction("perf-audit");
     expect(def).not.toBeNull();
-    expect(def!.skill).toBe("perf-audit");
+    // 停用标记：skill 空串 + legacyPlaybook 带原文
+    expect(def!.skill).toBe("");
+    expect(def!.legacyPlaybook).toContain("扫性能瓶颈");
     expect(def!.extraSkills).toEqual(["feishu-doc"]);
-    // 壳正文应已清空
+
+    // 文件不动：playbook 还在正文、没被重写成壳
     const actionRaw = await fs.readFile(
       path.join(TMP_ROOT, "custom-actions", "perf-audit", "ACTION.md"),
       "utf-8",
     );
-    expect(actionRaw).toContain("skill: perf-audit");
-    expect(actionRaw).not.toContain("扫性能瓶颈");
+    expect(actionRaw).toContain("扫性能瓶颈");
+    expect(actionRaw).not.toContain("skill: ");
 
-    // 抽出的 skill 住 app 自管目录、正文 = 原 playbook
-    const skillRaw = await fs.readFile(
-      path.join(getAppSkillsDir(), "perf-audit", "SKILL.md"),
-      "utf-8",
-    );
-    expect(skillRaw).toContain("name: perf-audit");
-    expect(skillRaw).toContain("description: 性能扫一遍");
-    expect(skillRaw).toContain("扫性能瓶颈");
+    // app skills 目录不该冒出新 skill
+    const names = await fs.readdir(getAppSkillsDir()).catch(() => []);
+    expect(names).toEqual([]);
   });
 
-  it("迁移幂等：再读一次不重复建 skill、壳不变", async () => {
-    await writeLegacyAction("rollback", {
-      label: "Rollback",
-      playbook: "执行版本回滚步骤",
+  it("list 不迁移：legacy 定义带标记返回、不生成 skill", async () => {
+    await writeLegacyAction("listed", {
+      label: "Listed",
+      playbook: "列表正文",
     });
-
-    const first = await getCustomAction("rollback");
-    expect(first?.skill).toBe("rollback");
-    const skillPath = path.join(getAppSkillsDir(), "rollback", "SKILL.md");
-    const skillStat1 = await fs.stat(skillPath);
-
-    // 第二次读：正文已空、不应再迁
-    const second = await getCustomAction("rollback");
-    expect(second?.skill).toBe("rollback");
-    const skillStat2 = await fs.stat(skillPath);
-    expect(skillStat2.mtimeMs).toBe(skillStat1.mtimeMs);
-
-    // app skills 下只有一个 rollback、没有 rollback-2
-    const names = await fs.readdir(getAppSkillsDir());
-    expect(names.filter((n) => n.startsWith("rollback"))).toEqual(["rollback"]);
+    const list = await listCustomActions();
+    const legacy = list.find((a) => a.id === "listed");
+    expect(legacy?.legacyPlaybook).toBe("列表正文");
+    expect(legacy?.skill).toBe("");
+    const names = await fs.readdir(getAppSkillsDir()).catch(() => []);
+    expect(names).toEqual([]);
   });
 
-  it("skill 目录撞名 → 探 -2，不覆盖已有 skill", async () => {
-    // 先占坑同名 skill
-    const occupied = path.join(getAppSkillsDir(), "occupied");
-    await fs.mkdir(occupied, { recursive: true });
+  it("推进列表过滤：usableCustomActions 滤掉 legacy、留新格式", async () => {
+    await writeLegacyAction("legacy-one", {
+      label: "旧动作",
+      playbook: "旧正文",
+    });
+    await createCustomAction({ label: "新动作", skill: "some-skill" });
+    const list = await listCustomActions();
+    const usable = usableCustomActions(list);
+    expect(usable.map((a) => a.label)).toEqual(["新动作"]);
+  });
+
+  it("旧平铺 <id>.md 仍目录化（无损搬家、内容不动、legacy 标记正确）", async () => {
+    const flat = path.join(TMP_ROOT, "custom-actions", "flat-legacy.md");
+    await fs.mkdir(path.dirname(flat), { recursive: true });
     await fs.writeFile(
-      path.join(occupied, "SKILL.md"),
-      `---\nname: occupied\ndescription: 已有\n---\n\n旧内容别覆盖\n`,
+      flat,
+      `---\nlabel: Flat\ncreatedAt: 1000\nupdatedAt: 1000\n---\n\n平铺正文\n`,
       "utf-8",
     );
-
-    await writeLegacyAction("occupied-action", {
-      label: "Occupied",
-      playbook: "新 playbook 正文",
-    });
-    // label slug = occupied、跟已有 skill 撞 → 应落到 occupied-2
-    const def = await getCustomAction("occupied-action");
-    expect(def?.skill).toBe("occupied-2");
-
-    const old = await fs.readFile(path.join(occupied, "SKILL.md"), "utf-8");
-    expect(old).toContain("旧内容别覆盖");
-    const neu = await fs.readFile(
-      path.join(getAppSkillsDir(), "occupied-2", "SKILL.md"),
+    const list = await listCustomActions();
+    const def = list.find((a) => a.id === "flat-legacy");
+    expect(def?.legacyPlaybook).toBe("平铺正文");
+    // 平铺文件已清、目录版内容原样（含 playbook 正文）
+    await expect(fs.access(flat)).rejects.toMatchObject({ code: "ENOENT" });
+    const dirRaw = await fs.readFile(
+      path.join(TMP_ROOT, "custom-actions", "flat-legacy", "ACTION.md"),
       "utf-8",
     );
-    expect(neu).toContain("新 playbook 正文");
+    expect(dirRaw).toContain("平铺正文");
   });
 
-  it("中文 label → skill / action id 保留中文（不再回退随机串）", async () => {
-    await writeLegacyAction("legacy-cn", {
-      label: "写代码",
-      summary: "按需求改代码",
-      playbook: "## 步骤\n读需求再改",
+  it("legacy 不可编辑 / 不可导出（报错引导重建）", async () => {
+    await writeLegacyAction("frozen", {
+      label: "Frozen",
+      playbook: "冻结正文",
     });
-    const def = await getCustomAction("legacy-cn");
-    expect(def?.skill).toBe("写代码");
-    const skillRaw = await fs.readFile(
-      path.join(getAppSkillsDir(), "写代码", "SKILL.md"),
-      "utf-8",
+    await expect(
+      updateCustomAction("frozen", { label: "改名" }),
+    ).rejects.toThrow(/旧格式/);
+    const target = path.join(TMP_ROOT, "export-legacy");
+    await fs.mkdir(target, { recursive: true });
+    await expect(exportCustomAction("frozen", target)).rejects.toThrow(
+      /旧格式/,
     );
-    expect(skillRaw).toContain("name: 写代码");
-    expect(skillRaw).toContain("读需求再改");
+  });
 
-    // 新建壳：id 也走中文 slug
+  it("中文 label → action id 保留中文（不再回退随机串）", async () => {
     const created = await createCustomAction({
       label: "写代码",
       skill: "写代码",
     });
-    // 已有目录 legacy-cn 不挡；同 label 的 id「写代码」空着应直接用
     expect(created.id).toBe("写代码");
-  });
-
-  it("listCustomActions 也会触发迁移", async () => {
-    await writeLegacyAction("listed", {
-      label: "Listed",
-      playbook: "列表迁移正文",
+    // 撞名探 -2
+    const second = await createCustomAction({
+      label: "写代码",
+      skill: "写代码",
     });
-    const list = await listCustomActions();
-    expect(list.some((a) => a.id === "listed" && a.skill === "listed")).toBe(
-      true,
-    );
-    await expect(
-      fs.access(path.join(getAppSkillsDir(), "listed", "SKILL.md")),
-    ).resolves.toBeUndefined();
+    expect(second.id).toBe("写代码-2");
   });
 });
 

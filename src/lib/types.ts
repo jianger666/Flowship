@@ -380,20 +380,27 @@ export interface CustomActionDef {
   id: string;
   label: string;
   summary?: string;
+  /** 主 skill 名；旧格式（见 legacyPlaybook）时为空串 */
   skill: string;
   /** 本 action 产出要求（可选）；空 / 未填时 prompt 走系统兜底结构 */
   output?: string;
   extraSkills?: string[];
   freshAgent?: boolean;
   placeholder?: string;
+  /**
+   * 旧格式残留（V0.9~v1.1 playbook 写在 ACTION.md 正文、无 skill 字段）：
+   * 非空 = 该 action 已停用、只供能力页查看原文——不进推进列表、不注入运行。
+   * 用户把原内容建成 skill 后重新新建挂载。
+   */
+  legacyPlaybook?: string;
   createdAt: number;
   updatedAt: number;
 }
 
-/** 新建 / 更新自定义 action 的入参（不含 id / 时间戳、那些由存储层管、前后端共用） */
+/** 新建 / 更新自定义 action 的入参（不含 id / 时间戳 / legacy 标记、那些由存储层管、前后端共用） */
 export type CustomActionInput = Omit<
   CustomActionDef,
-  "id" | "createdAt" | "updatedAt"
+  "id" | "createdAt" | "updatedAt" | "legacyPlaybook"
 >;
 
 /**
