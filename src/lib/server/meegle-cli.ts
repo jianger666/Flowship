@@ -11,6 +11,10 @@
  * - **错误三态**：not_installed（二进制不存在）/ not_authed（未登录）/ error（其他）——
  *   首页据此渲染降级态（装 CLI 引导 / 授权引导 / 报错重试）。
  * - 超时 30s：CLI 走公网 API、网络差时别挂死 route。
+ * - **进程级串行队列**：所有 meegle 子进程同一时刻最多跑 1 个（凭据文件
+ *   `~/.meegle/{.machine-key,credentials.enc}` 并发 refresh 会撞毁 → 等效登出；
+ *   看板 Promise.all 会排队变慢一点，凭据安全 > 首屏 200ms）。
+ *   排队等在 chain 上、30s/10s timeout 仍只罩 execFileAsync——排队时间不计入超时。
  */
 
 import { execFile } from "node:child_process";
@@ -23,6 +27,35 @@ import { dataRoot } from "./data-root";
 import { meegleBin } from "./feishu-cli";
 
 const execFileAsync = promisify(execFile);
+
+// ---------- 进程级串行队列（防 meegle 凭据并发 refresh 撞毁） ----------
+
+// 挂 globalThis：dev 下不同 route chunk 各持一份 module 变量会让串行化失效
+//（同 task-runner 的 advanceChains / submitWorkFollowupCounts）
+const MEEGLE_CHAIN_KEY = "__feAiFlowMeegleChainV1__";
+type MeegleChainState = { current: Promise<void> };
+const getMeegleChain = (): MeegleChainState => {
+  const g = globalThis as unknown as Record<string, MeegleChainState | undefined>;
+  if (!g[MEEGLE_CHAIN_KEY]) g[MEEGLE_CHAIN_KEY] = { current: Promise.resolve() };
+  return g[MEEGLE_CHAIN_KEY]!;
+};
+
+/**
+ * 把一次 meegle 子进程调用排进进程级单飞队列。
+ * - 调用方拿到的 promise 仍按本次成败 resolve/reject
+ * - 链上吞掉前驱异常（`.then(ok, ok)`），前一个失败不打断后续排队
+ */
+const enqueueMeegle = <T>(run: () => Promise<T>): Promise<T> => {
+  const state = getMeegleChain();
+  // 等前驱结束（成败都放行）再跑本次
+  const result = state.current.then(run, run);
+  // 推进链尾：本次无论成败都 settle 成 void，别让 reject 卡住后面
+  state.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
 
 // ---------- 基础执行 ----------
 
@@ -38,8 +71,15 @@ export class MeegleError extends Error {
   }
 }
 
-/** 跑一条 meegle 命令、解析 JSON 输出；失败抛 MeegleError（kind 三态） */
-const runMeegle = async (args: string[]): Promise<unknown> => {
+/**
+ * 跑一条 meegle 命令、解析 JSON 输出；失败抛 MeegleError（kind 三态）。
+ * 整段（含 unknown-command 时的 auth status 复核）进串行队列——复核走 raw、
+ * 避免已持锁再 enqueue 死锁。
+ */
+const runMeegle = (args: string[]): Promise<unknown> =>
+  enqueueMeegle(() => runMeegleUnlocked(args));
+
+const runMeegleUnlocked = async (args: string[]): Promise<unknown> => {
   const bin = meegleBin();
   try {
     await fs.access(bin);
@@ -63,7 +103,8 @@ const runMeegle = async (args: string[]): Promise<unknown> => {
     // 命令集加载慢也会瞬态报同样的错（用户实测「升级完首屏授权像没检测到」）：
     // 用静态命令 auth status 复核、真没登录才报 not_authed、登录着算瞬态错误
     if (/unknown command/i.test(text)) {
-      const st = await meegleAuthStatus();
+      // 已在队列槽内：走 raw，勿再 enqueueMeegle（会死锁）
+      const st = await meegleAuthStatusUnlocked();
       if (st.authenticated) {
         throw new MeegleError("error", "meegle 命令集尚未就绪、请稍后重试");
       }
@@ -94,7 +135,8 @@ const runMeegle = async (args: string[]): Promise<unknown> => {
 
 // ---------- 登录态 ----------
 
-export const meegleAuthStatus = async (): Promise<{
+/** auth status 实际执行（不进队列）；供已持锁的 runMeegleUnlocked 复核用 */
+const meegleAuthStatusUnlocked = async (): Promise<{
   installed: boolean;
   authenticated: boolean;
   host?: string;
@@ -123,6 +165,13 @@ export const meegleAuthStatus = async (): Promise<{
     return { installed: true, authenticated: false };
   }
 };
+
+/** 对外入口：走串行队列（boot / 看板探测也会打这条，必须和 runMeegle 互斥） */
+export const meegleAuthStatus = (): Promise<{
+  installed: boolean;
+  authenticated: boolean;
+  host?: string;
+}> => enqueueMeegle(() => meegleAuthStatusUnlocked());
 
 // ---------- 工作项归一化 ----------
 
