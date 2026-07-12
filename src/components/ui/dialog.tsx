@@ -80,7 +80,9 @@ function DialogContent({
             //   - 加 `*:min-w-0`（Tailwind 4 短写、等价 `[&>*]:min-w-0`）让所有直接 children 可以收缩到 0、
             //     内部 truncate / 自动折行才真正生效
             //   - 如果你后面真有一个 dialog 想让内容撑大（罕见）、再单独 override
-            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 *:min-w-0",
+            // [-webkit-app-region:no-drag]：Electron 拖拽区按像素矩形计算、不看 z-index——
+            // 高弹窗顶部落进 header 的 drag 区时 X 点不动（用户实测）、整个 Popup 显式 no-drag
+            "relative grid w-full max-w-[calc(100%-2rem)] gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 *:min-w-0 [-webkit-app-region:no-drag]",
             className
           )}
           {...props}
