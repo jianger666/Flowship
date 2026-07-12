@@ -3,7 +3,7 @@
  *
  * 这个文件做的事情（V0.9.x 拆分、V0.11 wait 协议退役后）：
  * 1. 用官方 `@modelcontextprotocol/sdk` 起一个 stateful 的 HTTP MCP server
- * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` / `remember_user_role` 工具
+ * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` / `remember_user_role` / `create_custom_action` 工具
  * 3. 工具 handler 调 chat-pending 的 registerPendingAsk / runTaskAction / safeNotifyXxx
  * 4. 暴露一个 fetch-style 的 `handleChatMcpRequest`、给 Next.js App Router 直接调
  *
@@ -36,7 +36,9 @@ import {
   sessionTransports,
   type AskUserQuestion,
 } from "./chat-pending";
+import { createCustomAction } from "./custom-action-fs";
 import { rememberUserRole } from "./meegle-cli";
+import { findSkillByName } from "./skills-loader";
 
 // ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
@@ -522,6 +524,140 @@ const buildMcpServer = (): McpServer => {
           },
         ],
       };
+    },
+  );
+
+  // ----------------- create_custom_action 工具（对话创建 action、全局语义不绑 task）-----------------
+  //
+  // 自定义 action = skill 挂载壳：AI 先把纯方法论 SKILL.md 写进自管 skills，再调本工具挂壳。
+  // 产出要求走 output 参数（壳参数）、不要写进 SKILL.md——skill 可拆卸复用。
+  //
+  // 不需要 task_id：定义存 dataRoot()/custom-actions、跟具体 task 无关。
+  srv.registerTool(
+    "create_custom_action",
+    {
+      title: "挂载自定义 Action（skill 已写好后调用）",
+      description: [
+        "把已写好的主 skill 挂成自定义 Action（推进面板里的一个动作按钮）。",
+        "",
+        "## 调用顺序（必须）",
+        "",
+        "1. **先**把纯方法论 `SKILL.md` 写进自管 skills 目录（目录名 kebab-case = skill 名）",
+        "2. **再**调本工具挂壳——`skill` 参数传刚写好的 skill 名",
+        "3. **产出要求**写进本工具的 `output` 参数、**不要**写进 SKILL.md（skill 是可拆卸方法论、壳才带产出约束）",
+        "",
+        "## 什么时候调",
+        "",
+        "- 用户要「建一个推进动作 / action」、且主 skill 的 SKILL.md 已经落盘",
+        "- 对话创建流程里、写完 skill 后的最后一步",
+        "",
+        "## 什么时候不调",
+        "",
+        "- 主 skill 还没写好 / 写到一半 → 先写完再调；本工具会校验 skill 是否存在、查无返回错误",
+        "- 只要沉淀可复用方法论、不需要出现在推进面板 → 只写 skill、别挂壳",
+        "",
+        "## 入参 / 返回",
+        "",
+        "- `label`：推进按钮显示名（必填）",
+        "- `skill`：主 skill 名（必填、须已存在）",
+        "- `output`：本 action 的产出要求（可选、多行）",
+        "- `summary` / `extra_skills` / `fresh_agent`（默认 true）/ `placeholder`：可选壳参数",
+        "- 成功返回已创建的 action id + label；失败返回错误说明（如 skill 不存在）",
+      ].join("\n"),
+      inputSchema: {
+        label: z
+          .string()
+          .min(1)
+          .describe("推进面板按钮上显示的动作名（如「性能审计」）"),
+        skill: z
+          .string()
+          .min(1)
+          .describe(
+            "主 skill 名（须已写入自管 skills 目录；先写 SKILL.md 再调本工具）",
+          ),
+        output: z
+          .string()
+          .optional()
+          .describe(
+            "本 action 的产出要求（多行可）；属壳参数、不要写进 SKILL.md",
+          ),
+        summary: z
+          .string()
+          .optional()
+          .describe("一句话简介（列表副标题、可选）"),
+        extra_skills: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("附加参考 skill 名列表（可选；本机没有的推进时静默跳过）"),
+        fresh_agent: z
+          .boolean()
+          .optional()
+          .describe(
+            "是否每次执行强起新 agent（默认 true、上下文干净；省略=true）",
+          ),
+        placeholder: z
+          .string()
+          .optional()
+          .describe("推进弹窗输入框的提示文案（可选）"),
+      },
+    },
+    async ({
+      label,
+      skill,
+      output,
+      summary,
+      extra_skills,
+      fresh_agent,
+      placeholder,
+    }) => {
+      const skillName = skill.trim();
+      // 查无此 skill → 返回错误文本让 AI 先建 skill（不抛、MCP 工具约定用 content 回传）
+      const found = await findSkillByName(skillName);
+      if (!found) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `主 skill「${skillName}」本机找不到。请先把纯方法论 SKILL.md 写进自管 skills 目录（目录名=${skillName}），再调本工具挂壳。`,
+            },
+          ],
+        };
+      }
+      try {
+        const action = await createCustomAction({
+          label: label.trim(),
+          skill: skillName,
+          output: output?.trim() || undefined,
+          summary: summary?.trim() || undefined,
+          extraSkills:
+            extra_skills && extra_skills.length > 0
+              ? extra_skills.map((s) => s.trim()).filter(Boolean)
+              : undefined,
+          // 默认 true：自定义 action 通常要干净上下文；显式 false 才关
+          freshAgent: fresh_agent !== false,
+          placeholder: placeholder?.trim() || undefined,
+        });
+        console.log(
+          `[chat-mcp] create_custom_action id=${action.id} skill=${action.skill}`,
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `已挂载自定义 Action：id=${action.id}、label=${action.label}、skill=${action.skill}。请告诉用户去能力页 Action tab 查看 / 排序 / 显隐。`,
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `挂载失败：${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
     },
   );
 

@@ -12,7 +12,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
-import { GripVertical, Pencil, Trash2, Wrench } from "lucide-react";
+import { GripVertical, Pencil, Share, Trash2, Wrench } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -33,9 +33,10 @@ interface Props {
   customActions: CustomActionDef[];
   // 本机可用 skill 名集合（/actions 页拉一次传入；null = 未拉到、不判定缺失防误报）
   knownSkills: Set<string> | null;
-  // 自定义 action 行的编辑 / 删除（内置行不展示这些按钮）
+  // 自定义 action 行的编辑 / 删除 / 导出（内置行不展示这些按钮）
   onEdit: (def: CustomActionDef) => void;
   onDelete: (def: CustomActionDef) => void;
+  onExport: (def: CustomActionDef) => void;
 }
 
 interface RowProps {
@@ -47,9 +48,10 @@ interface RowProps {
   skills?: { name: string; missing: boolean }[];
   onToggleHidden: (visible: boolean) => void;
   onDragEnd: () => void;
-  // 仅自定义 action 传——内置 action 不可编辑 / 删除
+  // 仅自定义 action 传——内置 action 不可编辑 / 删除 / 导出
   onEdit?: () => void;
   onDelete?: () => void;
+  onExport?: () => void;
 }
 
 // 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill chips）+ [自定义]编辑 / 删除 + 显隐开关
@@ -63,6 +65,7 @@ const LayoutRow = ({
   onDragEnd,
   onEdit,
   onDelete,
+  onExport,
 }: RowProps) => {
   // 每个 Item 独立拖拽控制器——dragListener={false} 只让手柄发起拖拽、不误触开关 / 按钮 / 整行
   const controls = useDragControls();
@@ -116,10 +119,15 @@ const LayoutRow = ({
           已隐藏
         </span>
       )}
-      {/* 编辑 / 删除仅自定义行有——内置 action 不可改不可删 */}
+      {/* 编辑 / 导出 / 删除仅自定义行有——内置 action 不可改不可删 */}
       {onEdit && (
         <Button variant="ghost" size="icon-sm" onClick={onEdit} title="编辑">
           <Pencil />
+        </Button>
+      )}
+      {onExport && (
+        <Button variant="ghost" size="icon-sm" onClick={onExport} title="导出">
+          <Share />
         </Button>
       )}
       {onDelete && (
@@ -137,6 +145,7 @@ export const ActionLayoutConfig = ({
   knownSkills,
   onEdit,
   onDelete,
+  onExport,
 }: Props) => {
   const { settings, saveFieldValue, loaded } = useSettings();
   const layout = settings.actionLayout ?? { order: [], hidden: [] };
@@ -216,6 +225,7 @@ export const ActionLayoutConfig = ({
             onDragEnd={handleDragEnd}
             onEdit={def ? () => onEdit(def) : undefined}
             onDelete={def ? () => onDelete(def) : undefined}
+            onExport={def ? () => onExport(def) : undefined}
           />
         );
       })}

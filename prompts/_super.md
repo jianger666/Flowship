@@ -28,7 +28,7 @@
 
 ## 核心机制：工具 + 消息循环（V0.11）
 
-ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **6 个工具**：
+ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **7 个工具**：
 
 | 工具名 | 类型 | 用途 |
 |---|---|---|
@@ -38,6 +38,7 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **6 个工具**：
 | `set_feishu_testers` | 同步 RPC | ship action 用、把飞书测试人员 user_id 列表持久化到 task |
 | `set_plan_batches` | 同步 RPC | plan action 用、大需求拆「批次」后上报、build 据此分批推进 |
 | `remember_user_role` | 同步 RPC | 用户亲口告知角色后调用、存进本地身份缓存供后续任务注入 |
+| `create_custom_action` | 同步 RPC | 对话创建 action：主 skill 写好后挂壳（产出要求走 `output`、不进 SKILL.md） |
 
 **`submit_work`（交卷）**——每完成一个 action 调一次：
 - 入参：

@@ -15,7 +15,9 @@ process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
 
 import {
   createCustomAction,
+  exportCustomAction,
   getCustomAction,
+  importCustomActionBundle,
   listCustomActions,
   updateCustomAction,
 } from "@/lib/server/custom-action-fs";
@@ -223,5 +225,139 @@ ${opts.playbook}
     await expect(
       fs.access(path.join(getAppSkillsDir(), "listed", "SKILL.md")),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）", () => {
+  const seedSkill = async (name: string, body = "方法论正文") => {
+    const dir = path.join(getAppSkillsDir(), name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "SKILL.md"),
+      `---\nname: ${name}\ndescription: 测导出\n---\n\n${body}\n`,
+      "utf-8",
+    );
+    return dir;
+  };
+
+  it("导出：拷主 skill 目录并写 .flowship-action.json（不含 id）", async () => {
+    await seedSkill("export-me", "导出用方法论");
+    const created = await createCustomAction({
+      label: "导出测",
+      skill: "export-me",
+      summary: "简介",
+      output: "要一份报告",
+      freshAgent: true,
+      placeholder: "贴链接",
+    });
+
+    const target = path.join(TMP_ROOT, "export-out");
+    await fs.mkdir(target, { recursive: true });
+    const { skillDir, skillName } = await exportCustomAction(
+      created.id,
+      target,
+    );
+    expect(skillName).toBe("export-me");
+    expect(skillDir).toBe(path.join(target, "export-me"));
+
+    const skillMd = await fs.readFile(
+      path.join(skillDir, "SKILL.md"),
+      "utf-8",
+    );
+    expect(skillMd).toContain("导出用方法论");
+
+    const meta = JSON.parse(
+      await fs.readFile(path.join(skillDir, ".flowship-action.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(meta.label).toBe("导出测");
+    expect(meta.output).toBe("要一份报告");
+    expect(meta).not.toHaveProperty("id");
+    expect(typeof meta.exportedAt).toBe("number");
+  });
+
+  it("导出：主 skill 本机找不到 → 报错", async () => {
+    const created = await createCustomAction({
+      label: "缺 skill",
+      skill: "missing-skill-xyz",
+    });
+    const target = path.join(TMP_ROOT, "export-fail");
+    await fs.mkdir(target, { recursive: true });
+    await expect(exportCustomAction(created.id, target)).rejects.toThrow(
+      /找不到/,
+    );
+  });
+
+  it("导入：带 .flowship-action.json → skill + 挂壳；自管目录不留 .flowship-action.json", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "import-me");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: import-me\ndescription: 导入测\n---\n\n导入正文\n`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(pack, ".flowship-action.json"),
+      JSON.stringify({
+        label: "导入挂壳",
+        output: "产出一份清单",
+        freshAgent: false,
+        exportedAt: Date.now(),
+      }),
+      "utf-8",
+    );
+
+    const r = await importCustomActionBundle(pack);
+    expect(r.skillName).toBe("import-me");
+    expect(r.action?.label).toBe("导入挂壳");
+    expect(r.action?.skill).toBe("import-me");
+    expect(r.action?.output).toBe("产出一份清单");
+    expect(r.action?.freshAgent).toBe(false);
+    expect(r.actionError).toBeUndefined();
+
+    await expect(
+      fs.access(path.join(getAppSkillsDir(), "import-me", "SKILL.md")),
+    ).resolves.toBeUndefined();
+    await expect(
+      fs.access(path.join(getAppSkillsDir(), "import-me", ".flowship-action.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("导入：无 .flowship-action.json → 只进 skill、不挂壳", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "skill-only");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: skill-only\ndescription: 仅 skill\n---\n\n只有方法论\n`,
+      "utf-8",
+    );
+    const r = await importCustomActionBundle(pack);
+    expect(r.skillName).toBe("skill-only");
+    expect(r.action).toBeNull();
+    expect(r.actionError).toBeUndefined();
+  });
+
+  it("导入：同名 skill 已存在 → 报错不覆盖", async () => {
+    await seedSkill("dup-skill", "旧内容");
+    const pack = path.join(TMP_ROOT, "import-pack", "dup-skill");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: dup-skill\ndescription: 新\n---\n\n新内容别覆盖\n`,
+      "utf-8",
+    );
+    await expect(importCustomActionBundle(pack)).rejects.toThrow(
+      /同名 skill 已存在/,
+    );
+    const old = await fs.readFile(
+      path.join(getAppSkillsDir(), "dup-skill", "SKILL.md"),
+      "utf-8",
+    );
+    expect(old).toContain("旧内容");
+  });
+
+  it("导入：缺 SKILL.md → 报错", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "no-skill-md");
+    await fs.mkdir(pack, { recursive: true });
+    await expect(importCustomActionBundle(pack)).rejects.toThrow(/SKILL\.md/);
   });
 });

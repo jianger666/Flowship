@@ -76,3 +76,42 @@ export const fetchSkills = async (): Promise<SkillOption[]> => {
     .filter((s) => s.enabled !== false)
     .map(({ name, description }) => ({ name, description }));
 };
+
+/** 拉自管 skills 目录绝对路径（对话创建 action 时当 cwd） */
+export const fetchAppSkillsDir = async (): Promise<string> => {
+  const res = await fetch("/api/skills");
+  const data = await handleJson<{ appSkillsDir?: string }>(res);
+  return data.appSkillsDir ?? "";
+};
+
+/** 导出单个自定义 action（主 skill 目录 + .flowship-action.json） */
+export const exportCustomActionReq = async (
+  id: string,
+  targetDir: string,
+): Promise<{ skillDir: string; skillName: string }> => {
+  const res = await fetch("/api/custom-actions/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, targetDir }),
+  });
+  return handleJson<{ skillDir: string; skillName: string }>(res);
+};
+
+/** 导入结果：skill 必进；带 .flowship-action.json 时顺手挂壳 */
+export interface ImportActionBundleResult {
+  skillName: string;
+  skillDir: string;
+  action: CustomActionDef | null;
+  actionError?: string;
+}
+
+export const importCustomActionBundleReq = async (
+  sourceDir: string,
+): Promise<ImportActionBundleResult> => {
+  const res = await fetch("/api/custom-actions/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sourceDir }),
+  });
+  return handleJson<ImportActionBundleResult>(res);
+};

@@ -4,7 +4,7 @@
  * 能力页（v1.0.x、用户拍板「skill / MCP / action 等能力集中一个页面配置」）
  *
  * 原 /actions 只管自定义 Action（V0.9）；现升级为「能力中心」、tab 切四块：
- *   - Action：推进动作（内置 + 自定义统一列表：拖拽排序 / 显隐 / 编辑）
+ *   - Action：推进动作（内置 + 自定义统一列表：拖拽排序 / 显隐 / 编辑 / 对话创建 / 导入导出）
  *   - Skill：技能（自管可增删改、可从 Cursor 导入、对话创建）
  *   - MCP：MCP servers（条目化管理 + 健康 / OAuth + 从 Cursor 导入）
  *   - Rules：规则
@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Plus } from "lucide-react";
+import { ArrowLeft, FileUp, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -28,11 +28,18 @@ import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-co
 import { McpCard } from "@/components/settings/mcp-card";
 import { RulesCard } from "@/components/settings/rules-card";
 import { SkillsCard } from "@/components/settings/skills-card";
+import { setPendingSlashSkill } from "@/components/slash-skills";
 import {
   deleteCustomActionReq,
+  exportCustomActionReq,
+  fetchAppSkillsDir,
   fetchCustomActions,
   fetchSkills,
+  importCustomActionBundleReq,
 } from "@/lib/custom-action-client";
+import { getSettings } from "@/lib/local-store";
+import { pickNativePaths } from "@/lib/native-picker";
+import { createTask } from "@/lib/task-store";
 import type { CustomActionDef } from "@/lib/types";
 
 // 四个能力 tab（key 同时是 ?tab= 的取值）
@@ -51,8 +58,11 @@ const isCapTab = (v: string | null): v is CapTab =>
 /** Action 管理面板（原 /actions 页主体、整体搬进 tab） */
 const ActionsPanel = () => {
   const { confirm } = useDialog();
+  const router = useRouter();
   // 自定义 action 列表
   const [actions, setActions] = useState<CustomActionDef[]>([]);
+  // 自管 skills 目录（「对话创建」开对话当 cwd）
+  const [appSkillsDir, setAppSkillsDir] = useState("");
   // 列表加载中
   const [loading, setLoading] = useState(true);
   // 编辑器开关
@@ -61,6 +71,10 @@ const ActionsPanel = () => {
   const [editing, setEditing] = useState<CustomActionDef | null>(null);
   // 本机可用 skill 名集合（给行内 chips 判定缺失；null = 未拉到、不判定防误报）
   const [knownSkills, setKnownSkills] = useState<Set<string> | null>(null);
+  // 导入 / 导出进行中（防双击连开两个原生对话框）
+  const [transferring, setTransferring] = useState(false);
+  // 「对话创建」发起中（防双击）
+  const [aiCreating, setAiCreating] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -73,15 +87,58 @@ const ActionsPanel = () => {
     }
   }, []);
 
+  // 「对话创建」：cwd 锁自管 skills、自动挂 action-creator chip；
+  // AI 先写纯方法论 SKILL.md，再调 create_custom_action 挂壳
+  const handleAiCreate = async () => {
+    const s = getSettings();
+    if (!s.apiKey?.trim() || !s.defaultModel?.id?.trim()) {
+      toast.error("先在设置页配好 API Key 和默认模型");
+      return;
+    }
+    // action-creator 被关时 AI 拿不到创建规范、chip 也挂不上——提示而不是静默降级
+    if (s.disabledSkills?.includes("action-creator")) {
+      toast.error("action-creator skill 已被停用、先在 Skill tab 打开再用对话创建");
+      return;
+    }
+    if (!appSkillsDir) {
+      toast.error("skills 目录还没就绪、稍后重试");
+      return;
+    }
+    setAiCreating(true);
+    try {
+      const task = await createTask({
+        mode: "chat",
+        title: "创建 action",
+        repoPaths: [appSkillsDir],
+        model: s.defaultModel,
+        disabledMcpServers:
+          s.disabledMcpServers && s.disabledMcpServers.length > 0
+            ? s.disabledMcpServers
+            : undefined,
+      });
+      setPendingSlashSkill("action-creator");
+      router.push(`/tasks/${task.id}`);
+    } catch (err) {
+      toast.error(
+        `发起失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setAiCreating(false);
+    }
+  };
+
   useEffect(() => {
     void load();
   }, [load]);
 
-  // skill 集合拉一次（失败保持 null、行内不标缺失、不打扰主流程）
+  // skill 集合 + 自管目录拉一次（目录给对话创建当 cwd）
   useEffect(() => {
     fetchSkills()
       .then((s) => setKnownSkills(new Set(s.map((x) => x.name))))
       .catch(() => setKnownSkills(null));
+    fetchAppSkillsDir()
+      .then(setAppSkillsDir)
+      .catch(() => setAppSkillsDir(""));
   }, []);
 
   const handleNew = () => {
@@ -110,6 +167,57 @@ const ActionsPanel = () => {
     }
   };
 
+  // 导出：原生 picker 选目标目录 → 拷主 skill 目录 + 写 .flowship-action.json
+  const handleExport = async (def: CustomActionDef) => {
+    if (transferring) return;
+    const dirs = await pickNativePaths({
+      mode: "folder",
+      prompt: "选择导出目录",
+    });
+    if (!dirs?.[0]) return;
+    setTransferring(true);
+    try {
+      const r = await exportCustomActionReq(def.id, dirs[0]);
+      toast.success(`已导出到 ${r.skillDir}`);
+    } catch (err) {
+      toast.error(`导出失败：${err instanceof Error ? err.message : err}`);
+    } finally {
+      setTransferring(false);
+    }
+  };
+
+  // 导入：原生 picker 选 skill 文件夹 → 拷进自管 skills → 有 .flowship-action.json 则挂壳
+  const handleImport = async () => {
+    if (transferring) return;
+    const dirs = await pickNativePaths({
+      mode: "folder",
+      prompt: "选择要导入的 skill 文件夹（须含 SKILL.md）",
+    });
+    if (!dirs?.[0]) return;
+    setTransferring(true);
+    try {
+      const r = await importCustomActionBundleReq(dirs[0]);
+      if (r.action) {
+        toast.success("已导入 skill 并挂成 action");
+        void load();
+      } else if (r.actionError) {
+        toast.error(
+          `已导入 skill「${r.skillName}」、挂壳失败：${r.actionError}`,
+        );
+      } else {
+        toast.success("已导入 skill、未带挂载参数、可手动新建 action");
+      }
+      // 刷新 knownSkills、让行内 chips 立刻认新 skill
+      fetchSkills()
+        .then((s) => setKnownSkills(new Set(s.map((x) => x.name))))
+        .catch(() => {});
+    } catch (err) {
+      toast.error(`导入失败：${err instanceof Error ? err.message : err}`);
+    } finally {
+      setTransferring(false);
+    }
+  };
+
   // 保存成功：合并进列表（新建追加到最前 / 编辑替换原位）
   const handleSaved = (def: CustomActionDef) => {
     setActions((prev) => {
@@ -123,18 +231,40 @@ const ActionsPanel = () => {
 
   return (
     <div>
-      {/* 面板工具行：说明 + 新建（内容创作走 Skill tab、分享也走 skill） */}
+      {/* 面板工具行：说明 + 对话创建 / 导入 / 新建 */}
       <div className="mb-4 flex items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           自定义 action = 把某个 skill 挂到任务链上跑；拖拽调顺序、开关控显隐
         </p>
-        <Button size="sm" onClick={handleNew} className="shrink-0">
-          <Plus />
-          新建
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleAiCreate()}
+            disabled={aiCreating}
+            title="开个对话、AI 按你的描述生成 skill 并挂成 action"
+          >
+            {aiCreating ? <Loader2 className="animate-spin" /> : <Sparkles />}
+            对话创建
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleImport()}
+            disabled={transferring}
+            title="导入他人分享的 skill 包（可含 .flowship-action.json）"
+          >
+            {transferring ? <Loader2 className="animate-spin" /> : <FileUp />}
+            导入
+          </Button>
+          <Button size="sm" onClick={handleNew}>
+            <Plus />
+            新建
+          </Button>
+        </div>
       </div>
 
-      {/* 内置 + 自定义混排成一个列表统一管理：拖拽排序 + 显隐开关、自定义行额外可编辑 / 删除 */}
+      {/* 内置 + 自定义混排成一个列表统一管理：拖拽排序 + 显隐开关、自定义行额外可编辑 / 导出 / 删除 */}
       {loading ? (
         <LoadingState variant="card" />
       ) : (
@@ -143,6 +273,7 @@ const ActionsPanel = () => {
           knownSkills={knownSkills}
           onEdit={handleEdit}
           onDelete={handleDelete}
+          onExport={(def) => void handleExport(def)}
         />
       )}
 

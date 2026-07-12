@@ -23,7 +23,11 @@ import path from "node:path";
 import matter from "gray-matter";
 
 import { dataRoot } from "./data-root";
-import { getAppSkillsDir, loadSkills } from "./skills-loader";
+import {
+  findSkillByName,
+  getAppSkillsDir,
+  loadSkills,
+} from "./skills-loader";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 
 // 对外 re-export、让 route 等调用方能从 fs 层一并拿到入参类型
@@ -422,4 +426,172 @@ export const updateCustomAction = async (
 export const removeCustomAction = async (id: string): Promise<void> => {
   await fs.rm(dirOf(id), { recursive: true, force: true });
   await fs.rm(legacyFileOf(id), { force: true });
+};
+
+// ----------------- 共享包（导出 / 导入：skill 目录 + 可选 .flowship-action.json）-----------------
+
+/**
+ * 导出包里的挂载参数（写在 `<skill 目录>/.flowship-action.json`）。
+ * 不含 id——导入方会按 label 重新分配 action id（撞名探号）。
+ * skill 名由目录名决定、不写进 json。
+ */
+export interface ExportedActionMeta {
+  label: string;
+  summary?: string;
+  output?: string;
+  extraSkills?: string[];
+  freshAgent?: boolean;
+  placeholder?: string;
+  exportedAt: number;
+}
+
+/** 校验绝对路径且是已存在的目录；失败抛带中文说明的 Error（route 转 400） */
+const assertExistingAbsDir = async (
+  dir: string,
+  label: string,
+): Promise<string> => {
+  if (typeof dir !== "string" || !dir.trim()) {
+    throw new Error(`${label} 必填`);
+  }
+  const abs = path.resolve(dir.trim());
+  if (!path.isAbsolute(abs)) {
+    throw new Error(`${label} 必须是绝对路径`);
+  }
+  let st;
+  try {
+    st = await fs.stat(abs);
+  } catch {
+    throw new Error(`${label} 不存在：${abs}`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`${label} 不是目录：${abs}`);
+  }
+  return abs;
+};
+
+/**
+ * 导出单个自定义 action：把主 skill 整目录拷到 `<targetDir>/<skill名>/`，
+ * 并在目录里写 .flowship-action.json（挂载参数、不含 id）。
+ * 主 skill 须在本机任一来源找得到（app / 平台 / 全局 / 飞书 CLI）。
+ */
+export const exportCustomAction = async (
+  id: string,
+  targetDir: string,
+): Promise<{ skillDir: string; skillName: string }> => {
+  const absTarget = await assertExistingAbsDir(targetDir, "targetDir");
+  const def = await getCustomAction(id);
+  if (!def) throw new Error(`custom action 不存在：${id}`);
+
+  const skillEntry = await findSkillByName(def.skill);
+  if (!skillEntry) {
+    throw new Error(
+      `主 skill「${def.skill}」本机找不到、无法导出（先确认 skill 已安装）`,
+    );
+  }
+  // absPath 指向 SKILL.md → 导出整棵 skill 目录（含 scripts 等附属文件）
+  const srcSkillDir = path.dirname(skillEntry.absPath);
+  const destSkillDir = path.join(absTarget, def.skill);
+
+  await fs.cp(srcSkillDir, destSkillDir, { recursive: true, force: true });
+
+  const meta: ExportedActionMeta = {
+    label: def.label,
+    ...(def.summary ? { summary: def.summary } : {}),
+    ...(def.output ? { output: def.output } : {}),
+    ...(def.extraSkills && def.extraSkills.length > 0
+      ? { extraSkills: def.extraSkills }
+      : {}),
+    ...(typeof def.freshAgent === "boolean"
+      ? { freshAgent: def.freshAgent }
+      : {}),
+    ...(def.placeholder ? { placeholder: def.placeholder } : {}),
+    exportedAt: Date.now(),
+  };
+  await fs.writeFile(
+    path.join(destSkillDir, ".flowship-action.json"),
+    `${JSON.stringify(meta, null, 2)}\n`,
+    "utf-8",
+  );
+  return { skillDir: destSkillDir, skillName: def.skill };
+};
+
+/**
+ * 从本机文件夹导入：须含 SKILL.md → 拷进自管 skills（同名不覆盖）→
+ * 若带 .flowship-action.json 则顺手 createCustomAction 挂壳。
+ * 硬失败（缺 SKILL.md / 同名已存在）抛 Error；挂壳失败不回滚 skill、action 返 null + actionError。
+ */
+export const importCustomActionBundle = async (
+  sourceDir: string,
+): Promise<{
+  skillName: string;
+  skillDir: string;
+  action: CustomActionDef | null;
+  actionError?: string;
+}> => {
+  const absSource = await assertExistingAbsDir(sourceDir, "sourceDir");
+  const skillMd = path.join(absSource, "SKILL.md");
+  if (!(await pathExists(skillMd))) {
+    throw new Error("所选文件夹缺少 SKILL.md、不是合法 skill 包");
+  }
+
+  // 目录名 = skill 名（导出约定；导入方不改名、撞名直接报错）
+  const skillName = path.basename(absSource);
+  if (!isSafeId(skillName)) {
+    throw new Error(
+      `skill 目录名非法「${skillName}」（只用字母数字 / _ / -）`,
+    );
+  }
+
+  const destSkillDir = path.join(getAppSkillsDir(), skillName);
+  if (await pathExists(destSkillDir)) {
+    throw new Error(`同名 skill 已存在：${skillName}`);
+  }
+
+  await fs.mkdir(getAppSkillsDir(), { recursive: true });
+  await fs.cp(absSource, destSkillDir, { recursive: true });
+
+  // 拷进来的 .flowship-action.json 是挂载参数、不是 skill 内容——读完后从自管目录删掉、
+  // 避免以后编辑 skill 时把壳参数误当成 skill 附属文件
+  const importedMetaPath = path.join(destSkillDir, ".flowship-action.json");
+  let action: CustomActionDef | null = null;
+  let actionError: string | undefined;
+  if (await pathExists(importedMetaPath)) {
+    try {
+      const raw = await fs.readFile(importedMetaPath, "utf-8");
+      const meta = JSON.parse(raw) as Partial<ExportedActionMeta>;
+      const label =
+        typeof meta.label === "string" && meta.label.trim()
+          ? meta.label.trim()
+          : skillName;
+      action = await createCustomAction({
+        label,
+        skill: skillName,
+        summary:
+          typeof meta.summary === "string" && meta.summary.trim()
+            ? meta.summary.trim()
+            : undefined,
+        output:
+          typeof meta.output === "string" && meta.output.trim()
+            ? meta.output.trim()
+            : undefined,
+        extraSkills: sanitizeSkills(meta.extraSkills),
+        freshAgent:
+          typeof meta.freshAgent === "boolean" ? meta.freshAgent : undefined,
+        placeholder:
+          typeof meta.placeholder === "string" && meta.placeholder.trim()
+            ? meta.placeholder.trim()
+            : undefined,
+      });
+    } catch (err) {
+      actionError =
+        err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[custom-action-fs] 导入 skill 成功但挂壳失败：${skillName}`,
+        err,
+      );
+    }
+    await fs.rm(importedMetaPath, { force: true }).catch(() => {});
+  }
+
+  return { skillName, skillDir: destSkillDir, action, actionError };
 };
