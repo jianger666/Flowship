@@ -153,6 +153,21 @@ const loadCustomActionPlaybook = async (
     return `（自定义 action「${def.label}」挂载的主 skill「${def.skill}」未找到、可能已删或未导入。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明 skill 缺失。）`;
   }
   const parts = [fillTemplate(skillBody, vars)];
+  // 产出要求属壳参数（不进 skill）：有则注入用户文案，无则系统兜底结构——skill 可拆卸复用
+  if (def.output?.trim()) {
+    parts.push(
+      "",
+      "## 本 action 的产出要求",
+      def.output.trim(),
+      "（把以上产出写进 artifact、完成后 submit_work 交卷）",
+    );
+  } else {
+    parts.push(
+      "",
+      "## 本 action 的产出要求",
+      "产出要求未指定——把 背景/做了什么/结果/遗留 写进 artifact、完成后 submit_work 交卷",
+    );
+  }
   // v1.1.x（同事「版本回滚 action 切不了分支」实测踩过）：自定义 action 的 git 边界说明——
   // 内置 action 有严格 git 分工（build 不碰 git / ship 才推送）、自定义的以主 skill 正文为准；
   // 隔离工作区（git worktree）下「已被其它工作区检出的分支」不能直接 checkout（git 硬限制）、

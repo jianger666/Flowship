@@ -29,6 +29,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { MultiSelect } from "@/components/ui/multi-select";
 import {
   createCustomActionReq,
@@ -46,6 +47,7 @@ const emptyDraft = (): CustomActionInput => ({
   label: "",
   summary: "",
   skill: "",
+  output: "",
   extraSkills: [],
 });
 
@@ -80,6 +82,7 @@ export const CustomActionEditor = ({
             label: editing.label,
             summary: editing.summary ?? "",
             skill: editing.skill,
+            output: editing.output ?? "",
             extraSkills: editing.extraSkills ?? [],
             freshAgent: editing.freshAgent,
             placeholder: editing.placeholder ?? "",
@@ -206,9 +209,9 @@ export const CustomActionEditor = ({
 
           <div className="grid gap-1.5">
             <Label>主 skill</Label>
-            {/* 用户验收点名疑惑「产出写哪」——做什么/产出什么都在 skill 里、壳只管挂载 */}
+            {/* 用户纠偏：skill = 纯方法论可拆卸；产出要求属壳参数 */}
             <p className="text-xs text-muted-foreground">
-              做什么、产出什么都写在 skill 里；产出会自动写成文档交给你审阅
+              做什么写在 skill 里；这次要产出什么写在下面（可选）
             </p>
             <Select
               value={draft.skill || undefined}
@@ -249,6 +252,17 @@ export const CustomActionEditor = ({
                 ))}
               </SelectContent>
             </Select>
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label htmlFor="ca-output">产出要求（可选）</Label>
+            <Textarea
+              id="ca-output"
+              value={draft.output ?? ""}
+              onChange={(e) => patch({ output: e.target.value })}
+              placeholder="如：输出回滚记录——回到哪个版本、动了哪些分支、验证结果"
+              rows={3}
+            />
           </div>
 
           <div className="grid gap-1.5">

@@ -3,8 +3,8 @@
  *
  * 当前形态（用户拍板「自定义 action = skill 挂载壳」）：
  *   存 `dataRoot()/custom-actions/<id>/ACTION.md`（frontmatter-only、正文留空）：
- *   - frontmatter：label / summary / skill（主 skill）/ extraSkills / freshAgent /
- *     placeholder / createdAt / updatedAt
+ *   - frontmatter：label / summary / skill（主 skill）/ output（产出要求）/
+ *     extraSkills / freshAgent / placeholder / createdAt / updatedAt
  *   - 正文：空（playbook 内容已迁到对应 skill 的 SKILL.md）
  *   - id = 目录名（新建时按 label slug 化）
  *
@@ -111,6 +111,11 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
         ? data.summary.trim()
         : undefined,
     skill,
+    // 产出要求：多行文本、trim 后空则不写（跟 summary / placeholder 同构）
+    output:
+      typeof data.output === "string" && data.output.trim()
+        ? data.output.trim()
+        : undefined,
     extraSkills: sanitizeSkills(data.extraSkills) ?? sanitizeSkills(data.skills),
     freshAgent: typeof data.freshAgent === "boolean" ? data.freshAgent : undefined,
     placeholder:
@@ -128,6 +133,8 @@ const serialize = (def: CustomActionDef): string => {
     label: def.label,
     ...(def.summary ? { summary: def.summary } : {}),
     skill: def.skill,
+    // gray-matter 对多行字符串会用 YAML 字面量块、读写往返 OK
+    ...(def.output ? { output: def.output } : {}),
     ...(def.extraSkills && def.extraSkills.length > 0
       ? { extraSkills: def.extraSkills }
       : {}),
@@ -359,6 +366,7 @@ export const createCustomAction = async (
     label: input.label.trim(),
     summary: input.summary?.trim() || undefined,
     skill,
+    output: input.output?.trim() || undefined,
     extraSkills: input.extraSkills,
     freshAgent: input.freshAgent,
     placeholder: input.placeholder?.trim() || undefined,
@@ -387,6 +395,10 @@ export const updateCustomAction = async (
       patch.summary !== undefined
         ? patch.summary.trim() || undefined
         : existing.summary,
+    output:
+      patch.output !== undefined
+        ? patch.output.trim() || undefined
+        : existing.output,
     placeholder:
       patch.placeholder !== undefined
         ? patch.placeholder.trim() || undefined

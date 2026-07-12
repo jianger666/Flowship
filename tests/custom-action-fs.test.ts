@@ -51,6 +51,7 @@ describe("custom-action 新格式（skill 挂载壳）", () => {
     expect(created.id).toBeTruthy();
     expect(created.skill).toBe("perf-audit");
     expect(created.extraSkills).toEqual(["feishu-doc"]);
+    expect(created.output).toBeUndefined();
 
     const raw = await fs.readFile(
       path.join(TMP_ROOT, "custom-actions", created.id, "ACTION.md"),
@@ -71,6 +72,35 @@ describe("custom-action 新格式（skill 挂载壳）", () => {
     });
     expect(updated.skill).toBe("perf-audit-v2");
     expect(updated.extraSkills).toBeUndefined();
+  });
+
+  it("output 字段：多行读写往返、空串清掉、不写 frontmatter", async () => {
+    const created = await createCustomAction({
+      label: "版本回滚",
+      skill: "rollback-method",
+      output: "输出回滚记录：\n- 回到哪个版本\n- 动了哪些分支\n- 验证结果",
+    });
+    expect(created.output).toContain("回到哪个版本");
+    expect(created.output).toContain("验证结果");
+
+    const raw = await fs.readFile(
+      path.join(TMP_ROOT, "custom-actions", created.id, "ACTION.md"),
+      "utf-8",
+    );
+    expect(raw).toContain("output:");
+    expect(raw).toContain("回到哪个版本");
+
+    const got = await getCustomAction(created.id);
+    expect(got?.output).toBe(created.output);
+
+    // 空串 = 清空，序列化不再写 output 字段
+    const cleared = await updateCustomAction(created.id, { output: "  " });
+    expect(cleared.output).toBeUndefined();
+    const clearedRaw = await fs.readFile(
+      path.join(TMP_ROOT, "custom-actions", created.id, "ACTION.md"),
+      "utf-8",
+    );
+    expect(clearedRaw).not.toContain("output:");
   });
 });
 

@@ -371,6 +371,7 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
  * - label：动作名（如「性能审计」、推进菜单 + timeline 展示）
  * - summary：一句话简介（列表副标题、可选）
  * - skill：主 skill 名（必填、prompt 注入其 SKILL.md 正文）
+ * - output：本 action 的产出要求（可选、多行；属壳参数、不进 skill——skill 可拆卸复用）
  * - extraSkills：附加参考 skill（可选；渲染 prompt 时点名「先 read」、本机没有的静默跳过）
  * - freshAgent：是否强起新 agent（默认 true、跟内置默认 fresh 一致）
  * - placeholder：推进弹窗输入框的提示文案（可选）
@@ -380,6 +381,8 @@ export interface CustomActionDef {
   label: string;
   summary?: string;
   skill: string;
+  /** 本 action 产出要求（可选）；空 / 未填时 prompt 走系统兜底结构 */
+  output?: string;
   extraSkills?: string[];
   freshAgent?: boolean;
   placeholder?: string;
