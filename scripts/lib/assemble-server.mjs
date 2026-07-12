@@ -140,9 +140,6 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   // ---------- 2. 运行时按 cwd 读的目录（tracing 对动态 fs 读不保证、显式拷一遍兜底） ----------
   await cp(path.join(rootDir, "prompts"), path.join(destDir, "prompts"));
   await cp(path.join(rootDir, "skills"), path.join(destDir, "skills"));
-  for (const f of ["stop-hook.mjs", "shell-guard.mjs"]) {
-    await cp(path.join(rootDir, "scripts", f), path.join(destDir, "scripts", f));
-  }
 
   // ---------- 3. SDK 平台二进制包（standalone trace 漏的 optional 平台包）----------
   await addSdkPlatformPackage(rootDir, destDir);

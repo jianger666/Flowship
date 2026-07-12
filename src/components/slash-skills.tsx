@@ -24,6 +24,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { Sparkles } from "lucide-react";
 
@@ -43,7 +44,8 @@ let skillsCache: SlashSkill[] | null = null;
 let skillsCachedAt = 0;
 let skillsInflight: Promise<SlashSkill[]> | null = null;
 
-const fetchSkills = async (): Promise<SlashSkill[]> => {
+/** 拉 enabled skills（模块级 60s 缓存）；气泡高亮 / 菜单共用 */
+export const fetchSkills = async (): Promise<SlashSkill[]> => {
   if (skillsCache && Date.now() - skillsCachedAt < SKILLS_CACHE_TTL_MS) {
     return skillsCache;
   }
@@ -398,4 +400,58 @@ export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
       </div>
     </div>
   );
+};
+
+/**
+ * 已发送消息气泡里的 `/skill-name` 高亮（跟 Composer SkillTokenNode 观感对齐）。
+ * 只认 fetchSkills 返回的真实 skill 名，防 `/usr/bin` 误亮；skills 未拉回前先纯文本。
+ */
+export const SkillTokenText = ({ text }: { text: string }) => {
+  // null = 还在拉；拉齐后是 knownNames（可能空）
+  const [knownNames, setKnownNames] = useState<ReadonlySet<string> | null>(
+    null,
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSkills().then((skills) => {
+      if (cancelled) return;
+      setKnownNames(new Set(skills.map((s) => s.name)));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 未就绪 / 无命中：原样纯文本（whitespace-pre-wrap 保留换行，替代原先 Markdown 换行）
+  if (!knownNames) {
+    return <span className="whitespace-pre-wrap">{text}</span>;
+  }
+
+  const tokens = parseSkillTokens(text, knownNames);
+  if (tokens.length === 0) {
+    return <span className="whitespace-pre-wrap">{text}</span>;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const t of tokens) {
+    if (t.start > cursor) {
+      parts.push(text.slice(cursor, t.start));
+    }
+    parts.push(
+      <span
+        key={`${t.start}-${t.name}`}
+        className="rounded-[4px] bg-primary/15 px-0.5 text-primary ring-1 ring-inset ring-primary/20"
+      >
+        {text.slice(t.start, t.end)}
+      </span>,
+    );
+    cursor = t.end;
+  }
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+
+  return <span className="whitespace-pre-wrap">{parts}</span>;
 };

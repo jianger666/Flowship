@@ -9,7 +9,8 @@
  *   migrateCursorMcpOnce）；全新安装不自动迁、用户在设置页自己导入。
  *
  * 历史（V0.6.2「跟 Cursor 共用工具」、已废弃）：曾经每次起 agent 实时合并 Cursor 配置、
- * `settingSources:["project"]` 只加载 repo 层所以全局配置由 fe 自己读。
+ * 也曾用 `settingSources:["project"]` 让 SDK 加载 repo `.cursor/`——已改为 `[]`、
+ * 全部 fe 自管注入（本文件 + skills-loader + inline mcpServers）。
  *
  * 本文件还管 app 自管 rules 的 prompt 注入（readAppRulesForPrompt、只读
  * `<dataRoot>/rules`——`~/.cursor/rules` 已不再注入、用户拍板彻底脱离 Cursor 安装配置）。
@@ -219,8 +220,8 @@ const readDisabledRules = async (): Promise<Set<string>> => {
  * - settings.disabledRules 名单里的跳过
  * - 无规则 → 返占位提示串
  *
- * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）；
- * `~/.cursor/rules` 已彻底不读（脱离 Cursor 安装配置、要用的规则在能力页自建）。
+ * 注：repo 级 / 全局 `~/.cursor/rules` 都不读（`settingSources:[]` + 脱离 Cursor 安装配置；
+ * 要用的规则在能力页自建、全部 fe 自管注入）。
  */
 export const readAppRulesForPrompt = async (): Promise<string> => {
   const NONE = "（未配置规则）";

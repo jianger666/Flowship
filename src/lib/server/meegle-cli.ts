@@ -409,41 +409,60 @@ const identityFile = (): string => path.join(dataRoot(), "identity.json");
 // 别每次都读文件；写入时同步刷新
 let persistedCache: PersistedIdentity | null | undefined;
 
-/** 读缓存的角色（按 userKey 校验、换账号不串）；失败 / 没存过返 null */
-const readPersistedRole = async (userKey: string): Promise<string | null> => {
-  if (persistedCache === undefined) {
-    try {
-      const raw = await fs.readFile(identityFile(), "utf-8");
-      const parsed = JSON.parse(raw) as Partial<PersistedIdentity>;
-      persistedCache =
-        typeof parsed.userKey === "string" &&
-        typeof parsed.name === "string" &&
-        typeof parsed.role === "string" &&
-        parsed.role.trim()
-          ? {
-              userKey: parsed.userKey,
-              name: parsed.name,
-              role: parsed.role,
-              savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
-            }
-          : null;
-    } catch {
-      // 文件不存在 / JSON 损坏都当没缓存（下次查到角色会重写覆盖）
-      persistedCache = null;
-    }
+/** meegle 未登录时 remember_user_role 的兜底记账身份（本地单用户 app、串号风险可忽略） */
+const LOCAL_IDENTITY: MeegleIdentity = { userKey: "local", name: "用户" };
+
+// 确保 identity.json 已读进进程镜像（只读一次、写入时同步刷新）
+const ensurePersistedLoaded = async (): Promise<void> => {
+  if (persistedCache !== undefined) return;
+  try {
+    const raw = await fs.readFile(identityFile(), "utf-8");
+    const parsed = JSON.parse(raw) as Partial<PersistedIdentity>;
+    persistedCache =
+      typeof parsed.userKey === "string" &&
+      typeof parsed.name === "string" &&
+      typeof parsed.role === "string" &&
+      parsed.role.trim()
+        ? {
+            userKey: parsed.userKey,
+            name: parsed.name,
+            role: parsed.role,
+            savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
+          }
+        : null;
+  } catch {
+    // 文件不存在 / JSON 损坏都当没缓存（下次查到角色会重写覆盖）
+    persistedCache = null;
   }
-  return persistedCache && persistedCache.userKey === userKey
-    ? persistedCache.role
-    : null;
 };
 
-/** story 查到角色时持久化（没存过 / 角色变了才写；原子写 tmp + rename） */
+/**
+ * 读缓存的角色。精确 userKey 优先；没命中时 "local" 条目也认——
+ * meegle 未登录期间 remember_user_role 只能以 "local" 记账、登录后也该能读到
+ *（本地单用户 app、串号风险可忽略）。失败 / 没存过返 null。
+ */
+const readPersistedRole = async (userKey: string): Promise<string | null> => {
+  await ensurePersistedLoaded();
+  if (!persistedCache) return null;
+  if (persistedCache.userKey === userKey) return persistedCache.role;
+  if (persistedCache.userKey === LOCAL_IDENTITY.userKey) return persistedCache.role;
+  return null;
+};
+
+/** 角色持久化（同身份同角色跳过；"local" 条目会被真实 userKey 升级覆盖；原子写 tmp + rename） */
 const savePersistedRole = async (
   identity: MeegleIdentity,
   role: string,
 ): Promise<void> => {
-  const existing = await readPersistedRole(identity.userKey);
-  if (existing === role) return;
+  await ensurePersistedLoaded();
+  // 精确比对身份 + 角色才跳过——story 角色相同但缓存还挂在 "local" 时照写、升级成真实 userKey
+  if (
+    persistedCache &&
+    persistedCache.userKey === identity.userKey &&
+    persistedCache.role === role
+  ) {
+    return;
+  }
   const record: PersistedIdentity = {
     userKey: identity.userKey,
     name: identity.name,
@@ -463,9 +482,22 @@ const savePersistedRole = async (
 };
 
 /**
+ * agent 问到用户角色后的持久化回路（MCP 工具 `remember_user_role` 调）。
+ * meegle 登录 → 以真实 userKey / 姓名记；未登录 → 以 "local" 兜底记账（读取侧放宽认它）。
+ * 返回是否已落盘（写失败返 false、调用方文案降级）。
+ */
+export const rememberUserRole = async (role: string): Promise<boolean> => {
+  const trimmed = role.trim();
+  if (!trimmed) return false;
+  const identity = (await fetchMyIdentity()) ?? LOCAL_IDENTITY;
+  await savePersistedRole(identity, trimmed);
+  return persistedCache?.role === trimmed;
+};
+
+/**
  * 拼 prompt「用户身份」行；无姓名时调用方应整行不注入（本函数要求已有 name）。
- * role.source 区分文案：story = 本需求实排角色（可信）；cache = 历史常用角色（兜底、
- * 提示 agent 如有出入以用户说的为准）。
+ * role.source 区分文案：story = 本需求实排角色；cache = 历史任务角色（持久缓存兜底）。
+ * ⚠️ cache 文案不带「以谁为准」附言——那会误导 agent 再去追问（用户拍板去掉）。
  */
 export const formatUserIdentityLine = (
   name: string,
@@ -475,7 +507,7 @@ export const formatUserIdentityLine = (
   if (role.source === "story") {
     return `- 发起人：${name}（在本需求的角色：${role.name.trim()}）`;
   }
-  return `- 发起人：${name}（常用角色：${role.name.trim()}；本需求未排角色、如有出入以用户说的为准）`;
+  return `- 发起人：${name}（历史任务角色：${role.name.trim()}）`;
 };
 
 /**

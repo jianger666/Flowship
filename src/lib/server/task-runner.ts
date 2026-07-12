@@ -64,7 +64,7 @@ import {
 } from "./chat-pending";
 import { createMR, getMRMergeStatus, closeOpenMR } from "./gitlab-client";
 import { validateSubmitMr } from "./submit-mr-guard";
-import { ensureStopHookInstalled } from "./stop-hook-inject";
+import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
 import {
@@ -1528,18 +1528,19 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   void (async () => {
     let agent: AgentInstance | null = null;
     try {
-      // V0.6.3：起 agent 前给业务仓库装 stop hook（保证 agent 交卷后才放行结束 Run、失败不阻断启动）
       // V0.10：隔离 task 的 cwd = worktree（入口 ensureWorkspaceReady 已保证目录在盘上）
+      // 存量清理：以前 inject 的 fe hooks.json 删掉（hooks 链路已退役、交卷改 send 追问）
       const effectiveCwd = getTaskCwd(task);
-      await ensureStopHookInstalled(effectiveCwd);
+      await cleanupFeHooksJson(effectiveCwd);
 
       agent = await Agent.create({
         apiKey,
         model,
-        // settingSources:["project"] = 加载目标仓库 + 全局 .cursor/ 的 rules/skills/mcp/hooks
-        //（跟 Cursor IDE 一致、配置双向绑定）；inline mcpServers 仍叠加生效、
-        // chat-tool 安全（同名 inline 优先、不同名共存、已探针实测、见 ROADMAP）
-        local: { cwd: effectiveCwd, settingSources: ["project"] },
+        // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
+        // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
+        // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
+        // ~/.cursor MCP 整包漏进 agent（实锤 bug）。
+        local: { cwd: effectiveCwd, settingSources: [] },
         mcpServers: mergedMcp,
       });
       console.log(
@@ -1557,7 +1558,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
       void setTaskSessionAgentId(task.id, agent.agentId);
 
-      // 加载平台自带 skills（repo + 全局 skills 由 settingSources 交给 SDK 加载、不在此读、避免重复进 prompt）
+      // 加载 skills：平台自带 + app 自管 + 全局（全部 fe 注入 prompt、不靠 settingSources）
       const skills = await loadSkills().catch((err) => {
         console.error("[task-runner] loadSkills failed", err);
         return [] as SkillEntry[];
@@ -1761,13 +1762,34 @@ const restoreRunStatusAfterQuestion = async (taskId: string): Promise<void> => {
 /**
  * 消费一个 SDK run 的完整生命周期（流式事件 → 终态处理）。
  *
- * V0.11 语义：run 自然 finished 是**正常出口**（agent 交卷 / 提问 / 说完了就该结束 turn）——
- * 只有「最后一个 action 还在 running、且没有 check 在跑、也没有 ask 在等答案」才判「没交卷就跑了」标 error。
+ * V0.11 语义：run 自然 finished 是**正常出口**（agent 交卷 / 提问 / 说完了就该结束 turn）。
+ * 「最后一个 action 还在 running、且没有 check 在跑、也没有 ask 在等答案」时：
+ * 先 `agent.send` 追问补交卷（每 action 最多 2 次、替代已退役的 stop hook）；
+ * 追问仍不交卷 → 标 error + 关会话。
  * 会话（agent 实例）在 finished 后保留、用户下一步操作用 send 续接；cancel / error 才关会话。
  *
  * opts.questionRun（V0.11.9）：这个 run 是「问一问」纯答疑——**任何出口都不动 action**
  * （停止 / 失败也不把 awaiting_ack 审阅位打成 cancelled/error）、不关会话、只把 runStatus 归位。
  */
+// 每 action 追问交卷次数（进程内计数、防 agent 反复空跑死循环；key = `${taskId}:${actionId}`）
+const submitWorkFollowupCounts = new Map<string, number>();
+const SUBMIT_WORK_FOLLOWUP_MAX = 2;
+
+const buildSubmitWorkFollowup = (last: {
+  id: string;
+  type: string;
+  n: number;
+  artifactPath?: string | null;
+}): string =>
+  [
+    "[ai-flow] 你还没对当前 action 交卷——不要结束本次回复。",
+    `当前 action：id=${last.id}、type=${last.type}、n=${last.n}。`,
+    last.artifactPath ? `artifact 路径：${last.artifactPath}。` : "",
+    "请完成收尾并调用 submit_work（传 task_id / action_id / artifact_path）交卷；若卡在某处、如实说明卡在哪。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
 const consumeSessionRun = async (
   task: Task,
   agent: AgentInstance,
@@ -1878,18 +1900,72 @@ const consumeSessionRun = async (
     // V0.11：run 自然 finished = 正常出口。判定 agent 这轮是否「有交代」：
     //   - 交卷了（notifier 同步注册的后置 check 在跑 / action 已 awaiting_ack）→ 正常
     //   - 提问了（pendingAsk 在等用户答）→ 正常
-    //   - 都没有、最后一个 action 还挂 running → 没交卷就跑了、标 error + 关会话
+    //   - 问一问 / 终态 task → 不动 action、不追问
+    //   - 都没有、最后一个 action 还挂 running → send 追问补交卷（每 action ≤2 次）；
+    //     追问仍不交卷 → 标 error + 关会话（语义对齐原 stop-check）
     const fresh = await getTask(task.id);
     const lastAction = fresh?.actions[fresh.actions.length - 1];
     const checkInFlight =
       !!lastAction && runningChecks.get(task.id)?.actionId === lastAction.id;
     const askPending = !!getPendingAsk(task.id);
+    const taskTerminal =
+      fresh?.repoStatus === "merged" || fresh?.repoStatus === "abandoned";
     if (
+      !opts.questionRun &&
+      !taskTerminal &&
       lastAction &&
       lastAction.status === "running" &&
       !checkInFlight &&
       !askPending
     ) {
+      const followupKey = `${task.id}:${lastAction.id}`;
+      const used = submitWorkFollowupCounts.get(followupKey) ?? 0;
+      // 会话还活着才追问（被关则走下面的 error 收尾）
+      const sessionAlive =
+        agentSessions.get(task.id)?.agentId === agent.agentId;
+      if (used < SUBMIT_WORK_FOLLOWUP_MAX && sessionAlive) {
+        submitWorkFollowupCounts.set(followupKey, used + 1);
+        const followup = buildSubmitWorkFollowup(lastAction);
+        console.log(
+          `[task-runner] task=${task.id} action#${lastAction.n}(${lastAction.type}) 未交卷 → send 追问 ${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}`,
+        );
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          actionId: lastAction.id,
+          text: `未交卷，正在追问 agent 补调 submit_work（${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}）…`,
+        });
+        let nextRun: SessionRun;
+        try {
+          nextRun = await agent.send(followup);
+        } catch (err) {
+          console.error(
+            `[task-runner] task=${task.id} 交卷追问 send 失败`,
+            err,
+          );
+          // send 失败 → 跟追问耗尽一样收尾
+          await patchAction(task.id, lastAction.id, { status: "error" });
+          await setTaskRunStatus(task.id, "error", lastAction.id);
+          await writeEventAndPublish(task.id, {
+            kind: "error",
+            actionId: lastAction.id,
+            text: [
+              `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷就结束了，且追问失败`,
+              "",
+              "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
+            ].join("\n"),
+          });
+          const updated = await getTask(task.id);
+          if (updated) publish(task.id, { kind: "task", task: updated });
+          publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+          closeTaskSession(task.id, agent.agentId);
+          return;
+        }
+        // 追问本身也是一轮 run、走同一管道（计数已 +1、再未交卷会再追或标 error）
+        await consumeSessionRun(task, agent, nextRun, opts);
+        return;
+      }
+      // 追问次数用尽 / 会话已死 → 标 error + 关会话
+      submitWorkFollowupCounts.delete(followupKey);
       await patchAction(task.id, lastAction.id, { status: "error" });
       await setTaskRunStatus(task.id, "error", lastAction.id);
       await writeEventAndPublish(task.id, {
@@ -1906,6 +1982,10 @@ const consumeSessionRun = async (
       publish(task.id, { kind: "done", task: updated ?? task, ok: false });
       closeTaskSession(task.id, agent.agentId);
       return;
+    }
+    // 交卷 / ask / 终态成功路径：清掉该 action 的追问计数（若有）
+    if (lastAction) {
+      submitWorkFollowupCounts.delete(`${task.id}:${lastAction.id}`);
     }
 
     // 问一问 run 答完：按当前 action 状态归回等待位（含 error 位、比下面的通用兜底全）
@@ -2047,7 +2127,8 @@ const resumeTaskSession = async (
       apiKey: creds.apiKey,
       model,
       // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
-      local: { cwd: getTaskCwd(task), settingSources: ["project"] },
+      // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
+      local: { cwd: getTaskCwd(task), settingSources: [] },
       mcpServers: mergedMcp,
     });
     // 恢复的 agent 调 submit_mr / submit_work 要走桥、必须重注册
@@ -2162,7 +2243,8 @@ export const startOneShotQuestion = (
       agent = await Agent.create({
         apiKey: creds.apiKey,
         model: creds.model,
-        local: { cwd: effectiveCwd, settingSources: ["project"] },
+        // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
+        local: { cwd: effectiveCwd, settingSources: [] },
       });
       console.log(
         `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${agent.agentId}`,
@@ -2222,7 +2304,7 @@ export const startOneShotQuestion = (
  */
 // 等 task 的在飞 run 自然结束（V0.11.7）。返回 false = 超时还在跑。
 // 场景：ask_user 弹窗在 agent 调工具的瞬间就弹给用户、但本回合 run 要再过几秒才 finished
-// （收尾旁白 + stop-check 往返）——用户手快秒答会撞上「run 在跑」。这几秒是协议的正常间隙、
+// （收尾旁白；未交卷时还有 send 追问）——用户手快秒答会撞上「run 在跑」。这几秒是协议的正常间隙、
 // 等它排空再 send、而不是把用户的答案拒回去（实测踩过：第一次提交报「没有活跃会话」、几秒后重试才过）。
 const waitForRunToDrain = async (
   taskId: string,

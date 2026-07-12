@@ -596,7 +596,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
     // 2) 拼 mcpServers：fe 自管 MCP（按 task 黑名单过滤）+ 我们自己的 chat-tool
-    // 全局 ~/.cursor/mcp.json 由 fe 读（settingSources["project"] 够不着 user 层）、详见 cursor-config.ts
+    // （settingSources:[] 不加载任何 .cursor mcp；全局 / 项目 MCP 一律走 fe 自管配置）
     // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
     // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
     // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
@@ -651,9 +651,9 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     agent = await Agent.create({
       apiKey,
       model,
-      // settingSources:["project"] = 加载目标仓库 .cursor/ 的 rules/skills/mcp/hooks（project 层）
-      //（跟 Cursor IDE 一致、配置双向绑定）；全局 ~/.cursor/（user 层）SDK 够不着、
-      // 由 fe 读了注入（rules/skills 进 prompt、mcp 进 inline mergedMcp）、详见 cursor-config.ts
+      // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
+      // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
+      // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
       local: {
         // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
         //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
@@ -662,7 +662,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
           task.repoPaths.length > 0
             ? getEffectiveCwd(task.repoPaths)
             : os.homedir(),
-        settingSources: ["project"],
+        settingSources: [],
       },
       mcpServers: mergedMcp,
     });
@@ -673,7 +673,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       return;
     }
 
-    // 加载 skills：平台自带 + 全局 ~/.cursor/skills/（repo 层 skills 由 settingSources 交给 SDK）
+    // 加载 skills：平台自带 + app 自管 + 全局（全部 fe 注入 prompt、不靠 settingSources）
     const skills = await loadSkills().catch((err) => {
       console.error("[chat-runner] loadSkills failed", err);
       return [];
@@ -763,12 +763,13 @@ export const resumeChatSession = async (
       // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
       model: bootArgs.model,
       // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
+      // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
       local: {
         cwd:
           task.repoPaths.length > 0
             ? getEffectiveCwd(task.repoPaths)
             : os.homedir(),
-        settingSources: ["project"],
+        settingSources: [],
       },
       mcpServers: mergedMcp,
     });

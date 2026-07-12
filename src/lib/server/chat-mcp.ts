@@ -3,7 +3,7 @@
  *
  * 这个文件做的事情（V0.9.x 拆分、V0.11 wait 协议退役后）：
  * 1. 用官方 `@modelcontextprotocol/sdk` 起一个 stateful 的 HTTP MCP server
- * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` 工具
+ * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` / `remember_user_role` 工具
  * 3. 工具 handler 调 chat-pending 的 registerPendingAsk / runTaskAction / safeNotifyXxx
  * 4. 暴露一个 fetch-style 的 `handleChatMcpRequest`、给 Next.js App Router 直接调
  *
@@ -36,6 +36,7 @@ import {
   sessionTransports,
   type AskUserQuestion,
 } from "./chat-pending";
+import { rememberUserRole } from "./meegle-cli";
 
 // ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
@@ -466,6 +467,60 @@ const buildMcpServer = (): McpServer => {
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
+  // ----------------- remember_user_role 工具（角色持久化回路、全局语义不绑 task）-----------------
+  //
+  // 「用户身份」行没有角色信息时、_super.md adaptive 段要求 agent 开工前 ask_user
+  // 问用户角色、问到后调本工具存进 <dataRoot>/identity.json——之后所有任务的身份行
+  // 都能用「历史任务角色」兜底注入、不用再问。
+  //
+  // 不需要 task_id：身份缓存是用户级、跟具体 task 无关（meegle 未登录也能以 "local" 记账）。
+  srv.registerTool(
+    "remember_user_role",
+    {
+      title: "记住用户角色（问到后持久化、供后续任务身份注入）",
+      description: [
+        "用户**亲口告知**自己的角色（前端 / 后端 / 测试等）后调用、存进本地身份缓存供后续任务注入。",
+        "",
+        "## 什么时候调",
+        "",
+        "- 「用户身份」行**没有角色信息**、你按 adaptive 规则先 `ask_user` 问了用户角色 → 拿到答案后**立刻调本工具**存起来、再按该视角继续",
+        "- 用户在对话中主动纠正自己的角色（如「我是后端不是前端」）→ 也调本工具更新",
+        "",
+        "## 什么时候不调",
+        "",
+        "- 「用户身份」行**已有角色**（「在本需求的角色」或「历史任务角色」）→ 直接用、不要再问也不用调本工具",
+        "- 角色是你**自己推断**的（没经用户确认）→ 不要存、只存用户亲口说的",
+        "",
+        "## 入参 / 返回",
+        "",
+        "- `role`：用户告知的角色名（如「前端」「后端」「测试」）",
+        "- 成功返回「已记住：<角色>」；失败返回错误说明（不影响你继续按该角色干活）",
+      ].join("\n"),
+      inputSchema: {
+        role: z
+          .string()
+          .min(1)
+          .describe(
+            "用户亲口告知的角色名（如「前端」「后端」「测试」）——用户确认后调用、存进本地身份缓存供后续任务注入",
+          ),
+      },
+    },
+    async ({ role }) => {
+      const saved = await rememberUserRole(role);
+      console.log(`[chat-mcp] remember_user_role role=${role} saved=${saved}`);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: saved
+              ? `已记住：${role.trim()}`
+              : "角色缓存写入失败（不影响本次任务、按该角色继续即可）",
+          },
+        ],
       };
     },
   );

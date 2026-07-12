@@ -3,18 +3,17 @@
  *
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
- * 设计要点（2026-06「跟 Cursor 共用工具」定案、详见 ROADMAP）：
- *   - **平台自带 + 全局两类都读**：`<ai-flow>/skills/`（git 发布、所有用户共享）
- *     + 全局 `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）。
- *   - **repo `.cursor/skills/` 不在这里读**：project 层、由 Agent.create 的
- *     `settingSources:["project"]` 交给 SDK 加载、fe 再读 = 同一份 SKILL.md 进 prompt 两次。
- *     （为什么全局要 fe 读、repo 不用：`["project"]` 只读 project 层、够不着 user 层的全局 skills。）
+ * 设计要点（settingSources:[] 后全部 fe 自管注入 prompt）：
+ *   - **平台自带 + app 自管 + 全局三类都读**：`<ai-flow>/skills/`（git 发布）
+ *     + `<dataRoot>/skills/`（设置页管理）+ 全局 `~/.cursor/skills/`（可导入源 / 兼容存量）。
+ *   - **不读 repo `.cursor/skills/`**：SDK 已不再加载 project 层；仓库级 skill 若要用、
+ *     请导入到 app 自管 skills（能力页）。
  *   - **progressive loading**：启动 agent 时只把每个 skill 的 name + description + absPath 拼进 prompt、
  *     agent 看到场景匹配时**主动用 `read` 工具读** 完整 SKILL.md 拿到详情。
  *     节省 prompt token、跟 Cursor IDE 加载行为一致。
  *
  * 不做的事（V1）：
- *   - 读 `<repo>/.cursor/rules/` 注入（repo rules 由 settingSources 加载；全局 rules 在 cursor-config 读）
+ *   - 读 `<repo>/.cursor/rules/` 注入（repo rules 不进；app 自管 rules 在 cursor-config 读）
  *   - `paths` 字段的 file-scope 过滤（V2 再做、需要知道当前 agent 在动哪些文件）
  *   - `disable-model-invocation`（slash-command 触发、SDK chat 模式用不上）
  *   - 远程 skill 拉取（飞书 / GitHub link、V2 再加）
@@ -160,15 +159,13 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
 /**
  * 加载本次 agent 可用的 skills：平台自带 + app 自管 + 全局 `~/.cursor/skills/` + 飞书 CLI
  *
- * 来源（都由 fe 注入 prompt、不靠 settingSources）：
+ * 来源（都由 fe 注入 prompt、`settingSources:[]` 不靠 SDK 加载 .cursor）：
  *   1. **平台自带** `<ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
  *   2. **app 自管** `<dataRoot>/skills/`（V0.13 独立化：设置页可视化增删改、见 app-skills.ts）
- *   3. **全局** `~/.cursor/skills/`（user 层、跟 Cursor IDE 共用）——
- *      `settingSources:["project"]` 只读 project 层、够不着 user 层、必须 fe 自己读
+ *   3. **全局** `~/.cursor/skills/`（兼容存量 / 导入源）
  *   4. **飞书 CLI 官方** `<dataRoot>/tools/skills/`（V0.12 一键安装时落盘）
  *
- * 不读 repo `.cursor/skills/`（project 层、由 `settingSources:["project"]` 交给 SDK 加载、
- * 避免同一份 SKILL.md 进 prompt 两次）。
+ * 不读 repo `.cursor/skills/`（SDK 已不加载 project 层；要用请导入到 app 自管）。
  *
  * 同名去重优先级：平台自带 > app 自管 > 全局 > 飞书 CLI
  * （自管是用户在本 app 里的显式配置、该压过跟 Cursor 共用的全局；平台 skill 是 fe 特定行为、不被顶掉）。
@@ -192,7 +189,7 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   );
   // app 自管 <dataRoot>/skills/（V0.13、设置页管理）
   const app = await scanSkillsDir(getAppSkillsDir());
-  // 全局 ~/.cursor/skills/（user 层、settingSources["project"] 够不着、fe 自己读）
+  // 全局 ~/.cursor/skills/（兼容存量；全部 fe 注入、不靠 settingSources）
   const global: SkillEntry[] = [];
   for (const dir of getGlobalCursorDirs()) {
     global.push(...(await scanSkillsDir(path.join(dir, "skills"))));
@@ -219,7 +216,7 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
  * 给自定义 action 的 skills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
  * 定义文件可能是别人导出的、引用了对方个人 skill——渲染 playbook 前按这个集合
  * 静默过滤、agent 不会拿到「点了名却查无此人」的引用去瞎找。
- * repo 层也要算进来：SDK settingSources 会加载它们、agent 实际用得上、不能误杀。
+ * repo 层仍算进「名字是否存在」（定义里点了名就算有、避免误杀）；真正注入 prompt 的仍只有 loadSkills。
  */
 export const listAvailableSkillNames = async (
   repoPaths: string[],
@@ -245,7 +242,7 @@ export const listAvailableSkillNames = async (
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、全局 skill 走 `~/.cursor/skills/`；仓库级 skill 由 settingSources 自动加载、不在此列。）";
+    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 `~/.cursor/skills/` 导入。）";
   }
   const lines: string[] = [];
   for (const s of skills) {

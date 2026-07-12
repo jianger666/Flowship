@@ -549,7 +549,7 @@ export const removeTaskWorktrees = async (
 /**
  * 从 worktree `.git` 指针文件内容解析主仓公共 git dir。
  * 内容形如 `gitdir: <原仓>/.git/worktrees/<name>`——注意 git 在 Windows 上也写
- * **正斜杠**、不能用 path.sep 匹配（stop-hook-inject 同款逻辑、双端分隔符都认）。
+ * **正斜杠**、不能用 path.sep 匹配（git 在 Windows 也写正斜杠、双端分隔符都认）。
  * 解析不了返 null。
  */
 export const parseMainGitDirFromPointer = (pointer: string): string | null => {

@@ -156,7 +156,7 @@ const loadCustomActionPlaybook = async (
       "",
       "## git 操作边界（自定义 action 通用）",
       "- 内置 action 对 git 有严格分工、但**本自定义 action 以上面的 playbook 为准**：playbook 明确要求的 git 操作（切分支 / 建分支 / revert / commit / push）可以执行。",
-      "- 硬红线仍然生效（hook 会拦）：force push、`reset --hard`、`rebase`、`clean -f`。",
+      "- 硬红线仍然生效、绝不允许执行：force push、`reset --hard`、`rebase`、`clean -f`。",
       "- 若当前在隔离工作区（git worktree）：**已被原仓库或其它任务检出的分支不能直接 `git checkout`**（git 会报 already checked out）——需要基于某分支 / tag / commit 工作时、用 `git checkout -b <新分支名> <起点>`（例：`git checkout -b revert/v1.2.3 origin/master`）新建分支再操作。",
       "- 动 git 前先 `git status` 确认工作区状态；有未提交改动且 playbook 没说怎么处理时、用 ask_user 问用户、不要自作主张丢弃。",
     ].join("\n"),

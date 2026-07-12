@@ -9,8 +9,7 @@
  *
  * 关键链路（V0.7-ELECTRON-PLAN §3.2）：
  * - ELECTRON_RUN_AS_NODE=1 让 process.execPath 表现为 node、且被孙进程继承——
- *   server 里 stop-hook-inject 用 execPath 拼 hook command、hooks 触发时
- *   同样以 node 模式跑、不会弹出新的 app 窗口
+ *   打包后的 server / 子进程以 node 模式跑、不会弹出新的 app 窗口
  * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
  *   更新 / 卸载重装都不丢
  */

@@ -4,7 +4,8 @@
  * 事件流子组件：Row 系列 + Markdown 渲染
  *
  * 从 event-stream.tsx 抽出（V0.5.11）：
- *   - MarkdownText：assistant_message / user_reply 用 markdown 渲染
+ *   - MarkdownText：assistant_message 用 markdown 渲染
+ *   - SkillTokenText：user_reply 纯文本 + 真实 skill `/name` 高亮
  *   - StreamingAssistantRow：chat 模式流式 placeholder「AI 回复中...」
  *   - EventRow：单条事件渲染（含图标 / phase 标签 / 时间 / 折叠 / 附图 / 附路径）
  *   - AskUserRequestRow：ask_user 事件历史回放卡（V0.3.2 起交互移到 modal、这里只放历史）
@@ -29,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownText } from "@/components/markdown-text";
+import { SkillTokenText } from "@/components/slash-skills";
 import {
   ImageThumb,
   type PreviewImage,
@@ -276,9 +278,10 @@ const EventRowImpl = ({
   const isAwaitingAck = ev.meta?.awaitingAck === true;
   // log 形态降权只看默认折叠规则：过程类降噪，HITL / 失败 / 核心对话保持可见。
   const isDefaultVisible = DEFAULT_EXPANDED_KINDS.has(ev.kind) || isAwaitingAck;
-  // 是否用 markdown 渲染：AI 回复 / 用户回复（用户也可能贴 markdown 进来）
+  // 是否用 markdown 渲染：仅 AI 回复（用户也可能贴 markdown，但气泡要高亮
+  // `/skill-name` token，markdown AST 改太重 → user_reply 走 SkillTokenText 纯文本）
   // thinking / tool_call / info / error 一律纯文本（结构化输出 / 错误消息、markdown 反而碍事）
-  const useMarkdown = isAssistant || isUser;
+  const useMarkdown = isAssistant;
 
   // tool_call 合并卡判定（V0.5.13）：mergeAdjacentToolCall 给同 phase + 同 tool name
   // 连续 ≥2 条合一时塞 meta.batch + meta.count、UI 折叠 / 展开走 batch 分支
@@ -427,7 +430,7 @@ const EventRowImpl = ({
             </div>
           )}
           <div className="text-sm leading-relaxed">
-            <MarkdownText text={ev.text} />
+            <SkillTokenText text={ev.text} />
           </div>
           {images.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
@@ -573,7 +576,13 @@ const EventRowImpl = ({
                   (isDefaultVisible ? "text-foreground" : "text-muted-foreground/75"),
               )}
             >
-              {useMarkdown ? <MarkdownText text={ev.text} /> : ev.text}
+              {isUser ? (
+                <SkillTokenText text={ev.text} />
+              ) : useMarkdown ? (
+                <MarkdownText text={ev.text} />
+              ) : (
+                ev.text
+              )}
             </div>
           ))}
         {/* user_reply / ask_user_reply 附图缩略图：折叠 / 展开都显示（图比文字更值得"始终见到"）
