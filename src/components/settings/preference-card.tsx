@@ -176,8 +176,10 @@ export const PreferenceSections = ({
         }
       />
 
+      {/* 下面两个是「默认值」不是全局行为开关（用户点名歧义）——hint 说清只影响默认勾选 */}
       <SettingRow
         label="推进时默认续用当前 Agent"
+        hint="只是推进弹窗的默认勾选、每次推进仍可临时改"
         // 不绑 htmlFor：点标题就切开关误触率高（用户点名）、只有开关本体可点
         control={
           <Switch
@@ -189,7 +191,7 @@ export const PreferenceSections = ({
 
       <SettingRow
         label="新任务默认隔离工作区"
-        hint="关闭后新任务直接在原仓库运行（只读型用法适用）"
+        hint="只是新建任务时的默认勾选、每个任务仍可单独改；关掉 = 默认直接在原仓库运行"
         control={
           <Switch
             checked={isolateWorktreeDefault}

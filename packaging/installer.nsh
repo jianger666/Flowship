@@ -12,3 +12,16 @@
   System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   nsExec::Exec 'ie4uinit.exe -show'
 !macroend
+
+; 安装器启动时先清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因）：
+; Windows 上内置 server 子进程就是 Flowship.exe 本体（ELECTRON_RUN_AS_NODE、无窗口）——
+; app 崩溃 / 被强杀后它会变成隐形孤儿进程、NSIS 的「应用正在运行」检查永远过不去、
+; 而用户看不到任何可关的窗口。这里直接 taskkill 整棵进程树（任务数据全程落盘、无损）。
+!macro customInit
+  nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+!macroend
+
+; 卸载同款清理（卸载器的「应用正在运行」检查同样会被孤儿卡住）
+!macro customUnInit
+  nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+!macroend
