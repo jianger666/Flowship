@@ -100,7 +100,7 @@ const ActionsPanel = () => {
     }
     // action-creator 被关时 AI 拿不到 ACTION.md 规范、chip 也挂不上——提示而不是静默降级
     if (s.disabledSkills?.includes("action-creator")) {
-      toast.error("action-creator skill 已被停用、先在 Skill tab 打开再用 AI 帮建");
+      toast.error("action-creator skill 已被停用、先在 Skill tab 打开再用对话创建");
       return;
     }
     if (!actionsDir) {
@@ -237,7 +237,7 @@ const ActionsPanel = () => {
           拖拽调「推进」里的顺序、开关控显隐、自定义的可编辑 / 删除
         </p>
         <div className="flex shrink-0 items-center gap-2">
-          {/* AI 帮建（v1.1.x）：开对话挂 action-creator chip、说需求直接生成 ACTION.md */}
+          {/* 对话创建（v1.1.x、命名对齐 Skill tab）：开对话挂 action-creator chip、说需求直接生成 ACTION.md */}
           <Button
             variant="outline"
             size="sm"
@@ -246,7 +246,7 @@ const ActionsPanel = () => {
             title="开个对话、AI 按你的描述生成 action"
           >
             {aiCreating ? <Loader2 className="animate-spin" /> : <Sparkles />}
-            AI 帮建
+            对话创建
           </Button>
           {/* 导入 / 导出（v0.9.14 团队点对点共享）：定义就是 md 文件、飞书传文件即可 */}
           <Button
