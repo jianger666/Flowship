@@ -23,7 +23,7 @@ name + description 索引、场景匹配时才读全文——所以 **descriptio
    **用户要的 skill 若已有现成实现（开源 skill 仓库 / npm 包 / 别处已写好的 SKILL.md）→ 优先安装 + 适配、
    不要从零重写山寨版**：装好依赖（CLI / 数据文件）、按本规范补齐 SKILL.md（frontmatter + 触发词）、
    附带更新脚本方便日后升级、并在正文标注来源（仓库 / 包名）。
-2. **目录名**：kebab-case 短横线小写（如 `weekly-report`）、只用字母数字和 `-`。
+2. **目录名**：用简短中文或 kebab-case 英文都行（如 `写代码` / `weekly-report`）。
 3. **SKILL.md 结构**：
    - frontmatter 必填 `name`（跟目录名一致）+ `description`
    - **description 是唯一的触发依据**：必须同时写「做什么」+「什么场景 / 用户说什么话时用」。

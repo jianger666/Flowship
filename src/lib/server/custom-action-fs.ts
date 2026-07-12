@@ -37,8 +37,10 @@ export type { CustomActionInput };
 export const customActionsDir = (): string =>
   path.join(dataRoot(), "custom-actions");
 
-// id 安全校验：只允许 字母 / 数字 / _ / -（防路径穿越 + 非法文件名）
-const isSafeId = (id: string): boolean => /^[A-Za-z0-9_-]+$/.test(id);
+// id / skill 目录名安全校验：字母数字中文 + ._-；拒绝 / \ 与以 . 开头（拦 .. 路径穿越）
+// 与 app-rules isSafeRuleName / app-skills isSafeSkillName 同构
+const isSafeId = (id: string): boolean =>
+  /^[A-Za-z0-9\u4e00-\u9fa5][A-Za-z0-9\u4e00-\u9fa5._-]*$/.test(id);
 
 // id → 目录 / ACTION.md 路径（非法 id 直接抛、不让拼出越界路径）
 const dirOf = (id: string): string => {
@@ -55,11 +57,18 @@ const legacyFileOf = (id: string): string => {
 const pathExists = async (p: string): Promise<boolean> =>
   !!(await fs.stat(p).catch(() => null));
 
-// label → ASCII slug（作 id / skill 目录名）；中文等非 ASCII 全丢时返空串
+/**
+ * label → 目录名 / skill 名：保留中文与 `[a-z0-9._-]`，空白变 `-`，其余丢弃。
+ * before：纯 ASCII slug、中文全丢 → 空串 → 随机 `custom-xxx`（难看）
+ * after：「写代码」→「写代码」；撞名由调用方探 `-2/-3`；全空才回退随机
+ */
 const slugify = (label: string): string =>
   label
+    .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\u4e00-\u9fa5._-]+/g, "")
+    .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
 
@@ -538,7 +547,7 @@ export const importCustomActionBundle = async (
   const skillName = path.basename(absSource);
   if (!isSafeId(skillName)) {
     throw new Error(
-      `skill 目录名非法「${skillName}」（只用字母数字 / _ / -）`,
+      `skill 目录名非法「${skillName}」（只用字母 / 数字 / 中文 / _ - .）`,
     );
   }
 

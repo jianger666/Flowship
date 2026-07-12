@@ -30,6 +30,17 @@ import { Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { SkillToken } from "@/components/ui/skill-token";
+import { parseSkillTokens, SLASH_RE } from "@/lib/skill-token";
+
+// 对外 re-export：调用方仍可从本模块拿解析 API（Composer 既有 import 路径不断）
+export {
+  matchLongestSkillName,
+  parseSkillTokens,
+  SKILL_NAME_CHAR_CLASS,
+  SKILL_TOKEN_RE,
+  SLASH_RE,
+  type SkillTokenMatch,
+} from "@/lib/skill-token";
 
 export interface SlashSkill {
   name: string;
@@ -74,54 +85,6 @@ export const fetchSkills = async (): Promise<SlashSkill[]> => {
       return [] as SlashSkill[];
     });
   return skillsInflight;
-};
-
-// 光标前文本匹配「正在打 slash 词」：行首或空白后的 /xxx（xxx 允许空 = 刚打出 /）
-const SLASH_RE = /(^|\s)\/([a-zA-Z0-9._-]*)$/;
-
-/**
- * 全文扫描已完成的 skill token（与菜单触发同源：行首或空白后的 `/name`）。
- * 名字必须精确命中 knownNames 才算引用——打到一半的 `/ski` 不高亮、也不进 references。
- *
- * 边界：
- * - 中文紧邻如「帮我/skill-creator建」因前面不是空白、不算 token（可接受）
- * - 尾随空白或行尾都算完成（`(?=\s|$)`）——跟 Composer transform 对齐，避免
- *   「行尾 `/name` 输入端不亮、气泡端亮」的漂移
- */
-export const SKILL_TOKEN_RE = /(^|\s)\/([a-zA-Z0-9._-]+)(?=\s|$)/g;
-
-/** 一次匹配：前缀空白（或空）+ `/name` 整体 */
-export interface SkillTokenMatch {
-  /** `/name` 在全文中的起始下标（不含前导空白） */
-  start: number;
-  /** `/name` 结束下标（不含） */
-  end: number;
-  name: string;
-}
-
-/**
- * 从草稿解析命中已知 skill 的内联 token（去重前可重复出现）。
- * Composer overlay 与 hook.references 共用、避免两份正则漂移。
- */
-export const parseSkillTokens = (
-  text: string,
-  knownNames: Set<string> | ReadonlySet<string>,
-): SkillTokenMatch[] => {
-  const out: SkillTokenMatch[] = [];
-  // 每次调用重置 lastIndex（全局 g 标志会残留）
-  SKILL_TOKEN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = SKILL_TOKEN_RE.exec(text)) !== null) {
-    const name = m[2];
-    if (!knownNames.has(name)) continue;
-    // m[0] = 前导空白 + `/name`；token 本体从空白之后开始
-    const full = m[0];
-    const leading = m[1] ?? "";
-    const start = m.index + leading.length;
-    const end = start + full.length - leading.length;
-    out.push({ start, end, name });
-  }
-  return out;
 };
 
 /**

@@ -213,6 +213,30 @@ ${opts.playbook}
     expect(neu).toContain("新 playbook 正文");
   });
 
+  it("中文 label → skill / action id 保留中文（不再回退随机串）", async () => {
+    await writeLegacyAction("legacy-cn", {
+      label: "写代码",
+      summary: "按需求改代码",
+      playbook: "## 步骤\n读需求再改",
+    });
+    const def = await getCustomAction("legacy-cn");
+    expect(def?.skill).toBe("写代码");
+    const skillRaw = await fs.readFile(
+      path.join(getAppSkillsDir(), "写代码", "SKILL.md"),
+      "utf-8",
+    );
+    expect(skillRaw).toContain("name: 写代码");
+    expect(skillRaw).toContain("读需求再改");
+
+    // 新建壳：id 也走中文 slug
+    const created = await createCustomAction({
+      label: "写代码",
+      skill: "写代码",
+    });
+    // 已有目录 legacy-cn 不挡；同 label 的 id「写代码」空着应直接用
+    expect(created.id).toBe("写代码");
+  });
+
   it("listCustomActions 也会触发迁移", async () => {
     await writeLegacyAction("listed", {
       label: "Listed",

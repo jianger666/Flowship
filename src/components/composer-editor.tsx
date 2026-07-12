@@ -44,6 +44,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   parseSkillTokens,
+  SLASH_RE,
   type SlashSkillsApi,
 } from "@/components/slash-skills";
 import {
@@ -254,14 +255,11 @@ const $setSelectionFromPlainOffset = (offset: number): void => {
 };
 
 /**
- * 手打 `/known-name`（尾随空白或行尾）→ 换成 SkillTokenNode。
+ * 手打 `/known-name`（含中文名、可紧贴后续正文）→ 换成 SkillTokenNode。
  *
- * 为何接受行尾（不只空白）：parseSkillTokens / 气泡高亮用 `(?=\s|$)`，若 transform
- * 只认空白，行尾 `/name` 会「输入端不亮、气泡端亮」。两边统一认行尾更稳。
- *
- * 仍要求「完成边界」：打字中的 `/ski` 不会转；前缀冲突（既有 `skill` 又有
- * `skill-xxx`）时，用户需打完更长名或靠空格确认——行尾误转半截的概率低于
- * 两端语义分裂带来的困惑。
+ * 与 parseSkillTokens 同逻辑：正则粗切 + knownNames 最长前缀命中。
+ * 例「/写代码帮我改下」→ token「写代码」+ 正文「帮我改下」；打到一半的 `/写` 不转。
+ * 英文行尾 `/name` 同样能转（不再依赖尾随空格），与气泡高亮对齐。
  */
 const $transformSkillTokensInTextNode = (
   node: TextNode,
@@ -269,30 +267,24 @@ const $transformSkillTokensInTextNode = (
 ): void => {
   if (!node.isAttached() || !node.isSimpleText()) return;
   const text = node.getTextContent();
-  // 与 SKILL_TOKEN_RE 同构：尾随空白或行尾都算完成 token
-  const re = /(^|\s)\/([a-zA-Z0-9._-]+)(?=\s|$)/g;
-  let match: RegExpExecArray | null;
-  re.lastIndex = 0;
-  while ((match = re.exec(text)) !== null) {
-    const name = match[2];
-    if (!knownNames.has(name)) continue;
-    const leading = match[1] ?? "";
-    const start = match.index + leading.length;
-    const end = start + 1 + name.length;
+  const tokens = parseSkillTokens(text, knownNames);
+  if (tokens.length === 0) return;
+  // 一次只转第一个：split/replace 后节点树变了，交给下次 transform 扫剩余
+  const t = tokens[0]!;
+  const start = t.start;
+  const end = t.end;
 
-    let target: TextNode;
-    if (start === 0 && end === text.length) {
-      target = node;
-    } else if (start === 0) {
-      target = node.splitText(end)[0]!;
-    } else if (end === text.length) {
-      target = node.splitText(start)[1]!;
-    } else {
-      target = node.splitText(start, end)[1]!;
-    }
-    target.replace($createSkillTokenNode(name));
-    return;
+  let target: TextNode;
+  if (start === 0 && end === text.length) {
+    target = node;
+  } else if (start === 0) {
+    target = node.splitText(end)[0]!;
+  } else if (end === text.length) {
+    target = node.splitText(start)[1]!;
+  } else {
+    target = node.splitText(start, end)[1]!;
   }
+  target.replace($createSkillTokenNode(t.name));
 };
 
 /** 选中 slash 项：按纯文本切 `/partial`，重建为 token + 空格 */
@@ -305,7 +297,7 @@ const $replaceSlashPartialWithToken = (
   const plain = $serializeToPlainText();
   const cursor = $getPlainOffset();
   const before = plain.slice(0, cursor);
-  const m = before.match(/(^|\s)\/([a-zA-Z0-9._-]*)$/);
+  const m = before.match(SLASH_RE);
   if (!m) return null;
   const partialLen = m[2].length + 1;
   const cutStart = cursor - partialLen;

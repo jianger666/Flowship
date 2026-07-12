@@ -542,7 +542,7 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 调用顺序（必须）",
         "",
-        "1. **先**把纯方法论 `SKILL.md` 写进自管 skills 目录（目录名 kebab-case = skill 名）",
+        "1. **先**把纯方法论 `SKILL.md` 写进自管 skills 目录（目录名用简短中文或 kebab-case 英文 = skill 名）",
         "2. **再**调本工具挂壳——`skill` 参数传刚写好的 skill 名",
         "3. **产出要求**写进本工具的 `output` 参数、**不要**写进 SKILL.md（skill 是可拆卸方法论、壳才带产出约束）",
         "",

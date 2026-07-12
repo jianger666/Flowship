@@ -4,8 +4,8 @@
  * 目录布局：`<dataRoot>/skills/<skill 名>/SKILL.md`（+ 可能的附属文件、导入时整目录拷）。
  * 只有这个目录下的 skill 可增删改；平台内置 / 全局 ~/.cursor/skills / 飞书 CLI 官方只读展示。
  *
- * 安全约束：skill 名做目录名白名单校验（字母数字 - _ .、拒绝路径穿越）、
- * 所有写操作都锚定在 getAppSkillsDir() 之下。
+ * 安全约束：skill 名做目录名白名单校验（字母数字中文 - _ .、拒绝路径穿越）、
+ * 所有写操作都锚定在 getAppSkillsDir() 之下。与 app-rules isSafeRuleName 同构。
  */
 
 import { promises as fs } from "node:fs";
@@ -29,9 +29,9 @@ export interface SkillWithSource extends SkillEntry {
   editable: boolean;
 }
 
-// skill 名 = 目录名：只允许安全字符、防路径穿越（`../` / 绝对路径 / 分隔符全拒）
+// skill 名 = 目录名：字母数字中文 + ._-、首字符不能是点（拦 `..`）；拒绝 / \
 const isSafeSkillName = (name: string): boolean =>
-  /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name);
+  /^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5._-]{0,63}$/.test(name);
 
 /** 按来源列全部 skill（不去重——同名多来源都展示、用户能看清覆盖关系） */
 export const listSkillsWithSource = async (): Promise<SkillWithSource[]> => {
@@ -74,7 +74,7 @@ export const writeAppSkill = async (
   content: string,
 ): Promise<string | null> => {
   if (!isSafeSkillName(name)) {
-    return "skill 名只能用字母 / 数字 / - _ .（将作为目录名）";
+    return "skill 名只能用字母 / 数字 / 中文 / - _ .（将作为目录名）";
   }
   if (!content.trim()) return "SKILL.md 内容不能为空";
   const dir = path.join(getAppSkillsDir(), name);
