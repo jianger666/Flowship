@@ -15,6 +15,16 @@
 
 ---
 
+### 2026-07-12 晨（已随 v1.1.2 发）能力体系补全批：skill/rules 可关可管 + action 文件夹化 + AI 帮建（用户睡前拍板「都做上、回来验收」）
+
+- **role 隐藏**：建任务表单不再选角色、默认 `adaptive`（AI 从需求 + 仓库自判视角）；字段保留数据层、编辑弹窗兜底
+- **skill 可关**：`settings.disabledSkills`（按 name）——能力页 Skill tab 每行 Switch、所有来源都可关；`loadSkills` 注入前过滤 + `/api/skills` 带 `enabled` + slash 菜单过滤
+- **能力页第四 tab「Rules」**：app 自管 `.mdc`（`data/rules/`、`app-rules.ts` + `/api/rules[/content|/import]` + `rules-card.tsx`）——可建可关（`settings.disabledRules`）可删可导入 Cursor；注入在 `readGlobalCursorRulesForPrompt` 里合并（全局 Cursor rules 照旧 + 自管过滤后追加、alwaysApply 全文 / 其余按需 index）、两处调用点零改动。分层拍板：Cursor 全局 = 个人偏好、自管 = 团队/项目级
+- **action 文件夹化（对齐 skill 规范、用户认「action = task 模式的 skill 接入口」）**：`custom-actions/<id>/ACTION.md`（frontmatter 元信息 + 正文 playbook）；老平铺 `<id>.md` 读到即自动迁移（id 不变、actionLayout/历史引用无损）；导出 = `<label>/ACTION.md` 目录形态、导入兼容新旧；新建 id 按 label slug 化（可读、撞名探 -2/-3）
+- **AI 帮建 action**：内置 `skills/action-creator/SKILL.md`（写清 ACTION.md 规范 + 判定写入目录）+ 能力页「AI 帮建」按钮（对齐 skill 的对话创建：cwd 锁 custom-actions、挂 / chip）
+- **非 git 目录当仓**（测试团队脚本夹）：不隔离任务本就支持（指纹/基线全 fail-open）、隔离模式报错补「勾直接在原仓库运行」指引
+- 全部过 typecheck/lint + 211 单测 + test 包冒烟（/api/rules、/api/skills enabled、custom-actions 迁移实测目录已生成）
+
 ### 2026-07-11 夜 v1.1.1 启动提速 + 视图记忆 + 改名自迁移（用户逐条拍板、Grok 蓝军审核过）
 
 - **同事「启动很慢」根因修复**：首页就绪 gate 阻塞在 `/api/system/feishu-cli`、每次真 spawn 4 个子进程探测（version ×2 + auth status ×2、Windows Defender 首扫 + auth 打网络验 token 可拖 10~30s）——`getFeishuCliStatus` 改 **stale-while-revalidate**（内存 + 磁盘双缓存立即返回、后台 single-flight 真探测刷新；磁盘缓存跨重启、实测 20ms）；装/登/卸后 `invalidateStatusCache`（**代数护栏**：invalidate 递增 gen、旧 in-flight 结果落盘前核对、防失效前快照覆盖回来——蓝军 P1）；看板数据缓存 session → localStorage（重启秒开旧数据 + 转圈后台刷）

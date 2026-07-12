@@ -301,7 +301,18 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-12 午（未发版、攒着）统一输入岛 Composer + 开屏一屏到底 + 升级后授权误报根治
+### 2026-07-12 晚 v1.1.2 发版：Lexical 输入引擎 + 脱离 Cursor 配置 + action=skill 挂载壳（含 07-12 早/午两批、三轮 subagent 审核全修）
+
+- **Composer 输入引擎迁 Lexical**（@lexical/react 0.47、Cursor 同款路线）：skill token = TextNode token 模式**真原子节点**（光标前后可停可见、整删、可夹任意文字中间、手打全名自动转；DecoratorNode 首版光标前沿消失、实测后换）；tag 样式单一来源 `ui/skill-token.tsx`（组件 + 常量、气泡/输入框同款、✨icon 走 ::before 伪元素不进文本流）；`editorKey=task.id` 切任务重建（撤销栈不跨任务串）；**中文 skill 名全链路**（slash 唤起 / token 高亮 / 最长前缀命中「/写代码帮我改下」、共享字符集 `src/lib/skill-token.ts`）
+- **skill 指引所见即所得**：skills 独立字段传输（chat-reply / question 路由 `skills[]` + `parseAndValidateSkills`）、user_reply 事件只存原文、`buildSkillDirective` 只拼进 agent 消息（chat 首条/续聊 + task send/resume/oneshot 五链路）；气泡 `/name` 高亮（SkillTokenText、只认真实 skill 名）；user 消息改纯文本渲染（主流对齐）
+- **settingSources 清零 + hooks 退役**：五处 `settingSources:[]`——SDK 不再碰任何 .cursor（根治「chat 未绑目录 cwd=homedir 把 ~/.cursor 全局 MCP 漏进 agent」实锤 bug）；stop hook 换 **send 追问**（run 结束检测未交卷 → agent.send 追问 ≤2 次、globalThis 计数、cancelled/force-new 并发防线 + runningTasks agentId 身份比对）；shell 红线转 prompt 软约束、hooks 全链路删、业务仓不再被写 hooks.json（存量按内容指纹清理 cleanup-fe-hooks）
+- **Rules 极简**：一句话即规则（无 frontmatter、全常驻注入 readAppRulesForPrompt）、「从 Cursor 导入」与 `~/.cursor/rules` 运行时注入全砍、按需 index 档删
+- **飞书身份注入**：`user me` 姓名 + story 角色组反查（role_members 命中 user_key）三级兜底（实排 → identity.json 持久缓存「历史任务角色」 → 只姓名 + adaptive 开工前 ask_user 问一次并 `remember_user_role` 存）；resolve 5s 总预算 + 60s 负缓存、不堵启动；**meegle CLI 全局串行队列 `meegle-queue.ts`**（实锤事故：boot 并发探测撞 token refresh 毁凭据等效登出——所有短命 meegle 调用单飞、feishu-cli 探测也入队）
+- **自定义 action = skill 挂载壳**（用户拍板概念收敛）：壳只剩 label / 简介 / 主 skill / **产出要求 output**（属底座、skill 保持纯方法论可拆卸）/ placeholder（freshAgent、附加 skills 均删）；对话创建 v2（AI 写纯方法论 skill → `create_custom_action` MCP 工具结构化挂壳）；共享 = 行上导出（skill 目录 + 隐藏 `.flowship-action.json` 挂载参数）+ 顶部导入（自动挂壳）；**旧格式 playbook action 直接停用不兼容**（滤出推进列表、能力页「查看原文 + 删除」）；命名支持中文（「写代码」）
+- 其它：SDK 1.0.19→1.0.23（包内真实对话冒烟过）；Windows 安装卡死修复（installer taskkill 孤儿 Flowship.exe）；skills absPath 修复（~ 短路径致 400）；两个默认值开关 hint 去歧义；自定义 action git 边界段（worktree 已检出分支教 checkout -b 绕）
+- 审核：三轮 subagent 终审（全量 + 增量×2、Bugbot×3）——2 P1 + 10+ P2/P3 全修、无 P0 带病发版
+
+### 2026-07-12 午（已随 v1.1.2 发）统一输入岛 Composer + 开屏一屏到底 + 升级后授权误报根治
 
 - **统一输入岛 `src/components/composer.tsx`**（用户点名「封装一个高级输入框、chat / task 复用」）：圆角岛 + 顶边拖高（setPointerCapture、高度记全局偏好）+ **Codex 风框内 skill token**（品牌色 icon + 文字、hover 出移除、替代旧独立小药丸 SlashSkillChips——已删）+ 图/路径附件预览 + footer（左 slot 模型选择器 / 右附图·附文件·附目录·发送、运行态原地换停止键）。chat 输入岛（event-stream）和 task「跟 AI 说」条全部换用；event-stream 里不可达的旧 log 形态输入区（两个调用方都不走）删除
 - **task 输入条补路径附件**：question 路由收 `attachments`（`parseAndValidateAttachments` 共享 helper、stat 带出 isDir/bytes 写 `meta.attachments`）、send / resume / oneshot 三分流都带 `[ATTACHED_PATHS]`；顺手修老 bug——chat-reply 原来把 meta 写成 `attachmentPaths`（string[]）、前端读的是 `meta.attachments`（对象数组）、**路径 chips 从未显示过**（Bugbot 揪出）；`use-path-attach.ts` 新 hook（去重 / 上限 / picker 状态、两处共用）
@@ -309,16 +320,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **升级后首屏「授权像没检测到」三层根治**：meegle `user me` 只缓存成功；unknown command 先 auth status 复核（登录着 = 瞬态 error 不误报 not_authed）；看板手上有好数据时刷新失败不清屏、5s 静默重试 ×2、只缓存 ok 响应
 - **自定义 action git 边界**（同事「版本回滚 action 切不了分支」）：自定义 action prompt 附 git 操作边界段——playbook 要求的 git 操作放行、worktree 已检出分支教 `checkout -b 新分支 <起点>` 绕、硬红线（force push / reset --hard）仍拦
 - 双 subagent 审核：Bugbot ×2 + 复审各报若干（空看板漏重试 / 脏缓存 / 占位响应早收 splash / 迁移覆盖 / rules 双重注入 / meta 字段错位等）——全修
-
-### 2026-07-12 晨（未发版、攒着）能力体系补全批：skill/rules 可关可管 + action 文件夹化 + AI 帮建（用户睡前拍板「都做上、回来验收」）
-
-- **role 隐藏**：建任务表单不再选角色、默认 `adaptive`（AI 从需求 + 仓库自判视角）；字段保留数据层、编辑弹窗兜底
-- **skill 可关**：`settings.disabledSkills`（按 name）——能力页 Skill tab 每行 Switch、所有来源都可关；`loadSkills` 注入前过滤 + `/api/skills` 带 `enabled` + slash 菜单过滤
-- **能力页第四 tab「Rules」**：app 自管 `.mdc`（`data/rules/`、`app-rules.ts` + `/api/rules[/content|/import]` + `rules-card.tsx`）——可建可关（`settings.disabledRules`）可删可导入 Cursor；注入在 `readGlobalCursorRulesForPrompt` 里合并（全局 Cursor rules 照旧 + 自管过滤后追加、alwaysApply 全文 / 其余按需 index）、两处调用点零改动。分层拍板：Cursor 全局 = 个人偏好、自管 = 团队/项目级
-- **action 文件夹化（对齐 skill 规范、用户认「action = task 模式的 skill 接入口」）**：`custom-actions/<id>/ACTION.md`（frontmatter 元信息 + 正文 playbook）；老平铺 `<id>.md` 读到即自动迁移（id 不变、actionLayout/历史引用无损）；导出 = `<label>/ACTION.md` 目录形态、导入兼容新旧；新建 id 按 label slug 化（可读、撞名探 -2/-3）
-- **AI 帮建 action**：内置 `skills/action-creator/SKILL.md`（写清 ACTION.md 规范 + 判定写入目录）+ 能力页「AI 帮建」按钮（对齐 skill 的对话创建：cwd 锁 custom-actions、挂 / chip）
-- **非 git 目录当仓**（测试团队脚本夹）：不隔离任务本就支持（指纹/基线全 fail-open）、隔离模式报错补「勾直接在原仓库运行」指引
-- 全部过 typecheck/lint + 211 单测 + test 包冒烟（/api/rules、/api/skills enabled、custom-actions 迁移实测目录已生成）
 
 ## 关键文件索引
 
