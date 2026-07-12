@@ -60,6 +60,60 @@ const MAX_BOX_HEIGHT = 400;
 const COMPOSER_TEXT_CLASS =
   "min-h-13 w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
 
+/** Backspace = 向后删光标前一字；Delete = 向前删光标处一字 */
+type TokenDeletionDirection = "backward" | "forward";
+
+/** 命中时要整段抹掉的区间（含 token 后紧跟的一个空格，若有） */
+export interface TokenDeletionHit {
+  /** 删除起点（含）——通常是 `/` 的下标 */
+  start: number;
+  /** 删除终点（不含）——可能已吞掉尾随空格 */
+  end: number;
+}
+
+/**
+ * 判定「这次 Backspace / Delete 会不会碰到某个已命中 skill token 的字符」。
+ *
+ * 为什么要单独抽：textarea 默认按「字符」删，Codex 风 tag 要按「整段 token」删；
+ * 区间判定 + 尾空格吞并放纯函数里，onKeyDown 只负责 preventDefault / 写回草稿。
+ *
+ * 判定矩阵（无选区、非 IME；有选区 / 组合输入由调用方先过滤）：
+ *
+ * | 光标相对 token [start, end) | Backspace              | Delete                 |
+ * |----------------------------|------------------------|------------------------|
+ * | cursor === start           | 不拦（删 token 前一字） | 整段删                 |
+ * | start < cursor < end       | 整段删                 | 整段删                 |
+ * | cursor === end             | 整段删（会碰到末字）   | 不拦（删 token 后一字）|
+ * | cursor === end+1 且 end 处是空格 | 不拦（只删那个空格） | 不拦                   |
+ *
+ * 区间写法：Backspace 命中 `(start, end]`；Delete 命中 `[start, end)`。
+ * 整段删时若 `text[end] === ' '` 一并吞掉（补全时会留尾空格，否则留下孤儿空格）。
+ */
+export const findTokenHitByDeletion = (
+  text: string,
+  cursor: number,
+  direction: TokenDeletionDirection,
+  knownNames: ReadonlySet<string>,
+): TokenDeletionHit | null => {
+  const tokens = parseSkillTokens(text, knownNames);
+  if (tokens.length === 0) return null;
+
+  for (const t of tokens) {
+    const hits =
+      direction === "backward"
+        ? // Backspace 删的是 cursor-1；落在 token 内任意字符上才拦
+          cursor > t.start && cursor <= t.end
+        : // Delete 删的是 cursor；落在 token 内任意字符上才拦
+          cursor >= t.start && cursor < t.end;
+    if (!hits) continue;
+
+    let end = t.end;
+    if (text[end] === " ") end += 1;
+    return { start: t.start, end };
+  }
+  return null;
+};
+
 export interface ComposerProps {
   value: string;
   /** 值变化（调用方存 state + 草稿）；slash 的光标同步组件内部代办 */
@@ -125,7 +179,8 @@ const renderSkillHighlightMirror = (
     parts.push(
       <span
         key={`s-${i}-${t.name}`}
-        className="rounded bg-primary/15 text-transparent"
+        // 描边 + 略深底衬：看起来更像 Codex tag；字仍透明、由上层 textarea 画，避免重影
+        className="rounded-[4px] bg-primary/20 text-transparent ring-1 ring-inset ring-primary/30"
       >
         {text.slice(t.start, t.end)}
       </span>,
@@ -337,6 +392,43 @@ export const Composer = ({
           onKeyDown={(e) => {
             // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
             if (slash?.onKeyDown(e)) return;
+
+            // skill token 原子删除：无选区 + 非 IME 时，Backspace/Delete 碰到 token 字符就整段抹掉
+            if (
+              slash &&
+              !e.nativeEvent.isComposing &&
+              (e.key === "Backspace" || e.key === "Delete")
+            ) {
+              const ta = e.currentTarget;
+              const start = ta.selectionStart ?? 0;
+              const end = ta.selectionEnd ?? 0;
+              // 有选区 = 用户明确圈选编辑，照默认行为走
+              if (start === end) {
+                const hit = findTokenHitByDeletion(
+                  value,
+                  start,
+                  e.key === "Backspace" ? "backward" : "forward",
+                  slash.knownNames,
+                );
+                if (hit) {
+                  e.preventDefault();
+                  const next =
+                    value.slice(0, hit.start) + value.slice(hit.end);
+                  const nextCursor = hit.start;
+                  onChange(next);
+                  // 与 onChange 同构：同步菜单态（删掉 /partial 后应关菜单）
+                  slash.onDraftChange(next, nextCursor);
+                  // 受控 value 更新后再落光标（跟 event-stream applyDraft 同款 rAF）
+                  requestAnimationFrame(() => {
+                    const el = taRef.current;
+                    if (!el) return;
+                    el.setSelectionRange(nextCursor, nextCursor);
+                  });
+                  return;
+                }
+              }
+            }
+
             if (shouldSubmitOnKeyDown(e, submitShortcut)) {
               e.preventDefault();
               handleSubmit();

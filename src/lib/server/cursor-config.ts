@@ -210,6 +210,18 @@ const readDisabledRules = async (): Promise<Set<string>> => {
   }
 };
 
+/**
+ * 判定一条 rule 是否「常驻注入」：
+ * - 无 frontmatter（gray-matter 解析后 data 为空）→ 常驻（一句话纯文本规则）
+ * - 有 frontmatter → 仅 `alwaysApply === true` 才常驻（Cursor 风格按需规则语义不变）
+ *
+ * 跟 app-rules.scanRulesDir 共用，避免列表 badge 与注入分流漂移。
+ */
+export const isAlwaysApplyRule = (
+  parsedData: Record<string, unknown>,
+): boolean =>
+  Object.keys(parsedData).length === 0 || parsedData.alwaysApply === true;
+
 // 扫一个 rules 目录：按 alwaysApply 分「全文注入 / 按需 index」两堆（可按名单跳过）；
 // names = 实际收进来的规则名（调用方做跨目录同名去重用）
 const collectRulesFromDir = async (
@@ -239,7 +251,7 @@ const collectRulesFromDir = async (
       const desc =
         typeof data.description === "string" ? data.description.trim() : "";
       const body = parsed.content.trim();
-      if (data.alwaysApply === true) {
+      if (isAlwaysApplyRule(data)) {
         always.push(body);
       } else {
         indexed.push(`- ${desc || path.basename(file)}（按需读 \`${file}\`）`);
@@ -255,12 +267,12 @@ const collectRulesFromDir = async (
 /**
  * 读「全局 `~/.cursor/rules/*.mdc` + app 自管 `<dataRoot>/rules/*.mdc`」→ 拼成 prompt 段
  *
- * - `alwaysApply:true` → 全文注入（用户要求「总遵守」的通用偏好、如 mac-use）
- * - 其余（globs / description 触发）→ 列 index（desc + 绝对路径）、agent 命中场景再 `read`
+ * - 无 frontmatter / `alwaysApply:true` → 全文注入（一句话纯文本、或显式常驻）
+ * - 有 frontmatter 且非 alwaysApply → 列 index（desc + 绝对路径）、agent 命中场景再 `read`
  * - app 自管 rules（v1.1.x Rules tab）可被 settings.disabledRules 关掉；Cursor 全局的
  *   不受此名单影响（那是用户在 Cursor 里管的、要关去 Cursor 删）
- * - **同名去重（导入 Cursor 规则后两目录各一份）**：启用中的 app 副本优先、Cursor
- *   同名原件跳过；app 副本被关掉时回落到 Cursor 原件（分层语义：关的是 app 这份）
+ * - **同名去重**：启用中的 app 副本优先、Cursor 同名原件跳过；app 副本被关掉时
+ *   回落到 Cursor 原件（分层语义：关的是 app 这份）
  * - 无 rules → 返空提示串
  *
  * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）。

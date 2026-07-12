@@ -1,13 +1,14 @@
 /**
  * app 自管 Rules 管理（v1.1.x Rules 独立化、能力页 Rules tab 的 server 侧）
  *
- * 文件布局：`<dataRoot>/rules/<name>.mdc`（gray-matter frontmatter：
- * description / alwaysApply、正文 = 规则内容——跟 Cursor rules 同规范）。
+ * 文件布局：`<dataRoot>/rules/<name>.mdc`
+ * - 纯文本一句话（无 frontmatter）= 常驻注入
+ * - 带 frontmatter 的跟 Cursor rules 同规范（description / alwaysApply）
  * 注入走 cursor-config.readGlobalCursorRulesForPrompt（全局 Cursor rules + 这里的
  * 自管 rules 合并、disabledRules 名单过滤）。
  *
- * 分层约定（用户拍板）：Cursor 全局 rules = 个人偏好（只读展示、要改去 Cursor）；
- * app 自管 rules = 团队 / 项目级（可建可关可导入）。
+ * 分层约定（用户拍板）：Cursor 全局 rules = 个人偏好（运行时照常注入、不提供 UI 导入）；
+ * app 自管 rules = 团队 / 项目级（可建可关可删；主路径一句话、编辑可改 frontmatter）。
  *
  * 安全约束：rule 名做文件名白名单校验（字母数字 - _ .、拒绝路径穿越）、
  * 所有写操作锚定在 getAppRulesDir() 之下。
@@ -17,7 +18,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 
-import { getAppRulesDir, getGlobalCursorDirs } from "./cursor-config";
+import { getAppRulesDir, isAlwaysApplyRule } from "./cursor-config";
 
 export interface AppRuleEntry {
   /** 文件名（不含 .mdc）、开关 / 增删按它记 */
@@ -61,7 +62,8 @@ const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
         name: path.basename(ent.name, path.extname(ent.name)),
         description:
           typeof data.description === "string" ? data.description.trim() : "",
-        alwaysApply: data.alwaysApply === true,
+        // 跟注入分流一致：无 frontmatter = 常驻
+        alwaysApply: isAlwaysApplyRule(data),
         absPath: abs,
         bodyPreview: firstBodyLine(parsed.content),
       });
@@ -75,15 +77,6 @@ const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
 /** 列 app 自管 rules */
 export const listAppRules = async (): Promise<AppRuleEntry[]> =>
   scanRulesDir(getAppRulesDir());
-
-/** 列全局 ~/.cursor/rules 里可导入的 rule（导入 dialog 数据源） */
-export const listCursorGlobalRules = async (): Promise<AppRuleEntry[]> => {
-  for (const dir of getGlobalCursorDirs()) {
-    const got = await scanRulesDir(path.join(dir, "rules"));
-    if (got.length > 0) return got;
-  }
-  return [];
-};
 
 /** 读某个自管 rule 的 .mdc 全文（不存在返 null） */
 export const readAppRuleContent = async (
@@ -134,48 +127,4 @@ export const deleteAppRule = async (name: string): Promise<string | null> => {
   } catch (err) {
     return `删除失败：${err instanceof Error ? err.message : String(err)}`;
   }
-};
-
-/** 从全局 ~/.cursor/rules 导入（按名字拷文件、同名覆盖） */
-export const importRulesFromCursor = async (
-  names: string[],
-): Promise<{ imported: string[]; failed: Array<{ name: string; error: string }> }> => {
-  const imported: string[] = [];
-  const failed: Array<{ name: string; error: string }> = [];
-  const candidates = getGlobalCursorDirs().map((d) => path.join(d, "rules"));
-  for (const rawName of names) {
-    const name = rawName.trim();
-    if (!isSafeRuleName(name)) {
-      failed.push({ name, error: "名字含非法字符" });
-      continue;
-    }
-    let src: string | null = null;
-    for (const parent of candidates) {
-      const p = path.join(parent, `${name}.mdc`);
-      try {
-        const stat = await fs.stat(p);
-        if (stat.isFile()) {
-          src = p;
-          break;
-        }
-      } catch {
-        // 试下一个候选
-      }
-    }
-    if (!src) {
-      failed.push({ name, error: "在 ~/.cursor/rules 下没找到" });
-      continue;
-    }
-    try {
-      await fs.mkdir(getAppRulesDir(), { recursive: true });
-      await fs.copyFile(src, path.join(getAppRulesDir(), `${name}.mdc`));
-      imported.push(name);
-    } catch (err) {
-      failed.push({
-        name,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-  return { imported, failed };
 };

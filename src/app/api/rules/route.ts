@@ -1,7 +1,7 @@
 /**
  * Rules 管理 API（v1.1.x Rules 独立化、能力页 Rules tab 用）
  *
- * GET    /api/rules            → 自管 rules（带 enabled）+ Cursor 全局可导入清单
+ * GET    /api/rules            → 自管 rules（带 enabled）
  * POST   /api/rules            → 新增 / 覆盖自管 rule { name, content }
  * DELETE /api/rules?name=<n>   → 删自管 rule
  */
@@ -11,7 +11,6 @@ import { NextResponse } from "next/server";
 import {
   deleteAppRule,
   listAppRules,
-  listCursorGlobalRules,
   writeAppRule,
 } from "@/lib/server/app-rules";
 import { readSettingsFile } from "@/lib/server/settings-fs";
@@ -20,9 +19,8 @@ import { errorResponse } from "@/lib/server/route-helpers";
 export const runtime = "nodejs";
 
 export const GET = async () => {
-  const [appRules, cursorGlobal, settings] = await Promise.all([
+  const [appRules, settings] = await Promise.all([
     listAppRules(),
-    listCursorGlobalRules(),
     readSettingsFile(),
   ]);
   const disabledArr = settings?.disabledRules;
@@ -36,11 +34,6 @@ export const GET = async () => {
     rules: appRules.map((r) => ({
       ...r,
       enabled: !disabled.has(r.name),
-    })),
-    cursorGlobal: cursorGlobal.map((r) => ({
-      name: r.name,
-      description: r.description,
-      alwaysApply: r.alwaysApply,
     })),
   });
 };
