@@ -15,8 +15,8 @@ import { cn } from "@/lib/utils";
  * shape：
  * - card：方块卡（ModeCard / option 选项块、左对齐文本、可包多行）
  * - chip：圆角小药丸（preset / Other 切换）
- * - chip-lg：等高 32px 单行选择 chip（推进弹窗「下一步」这类高频主选择区）——
- *   圆角走全局 radius（rounded-md、不用药丸形）、选中态 bg-selected 实底做视觉主角
+ * - chip-lg：等高 ~40px 单行选择 chip（推进弹窗「下一步」主角区）——
+ *   圆角稍大（rounded-lg）、选中态 = bg-selected + 品牌色细环 + 左侧 inset 竖条点睛
  * - tab：行内按钮（phase-progress 之类、轻量 hover）
  *
  * 用法：
@@ -39,7 +39,8 @@ const choiceButtonVariants = cva(
       shape: {
         card: "rounded-md border p-3",
         chip: "rounded-full border px-2.5 py-0.5 text-[11px]",
-        "chip-lg": "inline-flex h-8 items-center rounded-md border px-3.5 text-sm",
+        "chip-lg":
+          "inline-flex h-10 items-center rounded-lg border px-4 text-base font-medium transition-[color,background-color,border-color,box-shadow] duration-200 ease-out",
         tab: "rounded-md px-2 py-1 text-sm",
       },
       selected: {
@@ -70,20 +71,19 @@ const choiceButtonVariants = cva(
         selected: false,
         className: "border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground",
       },
-      // chip-lg 形状——选中走全局 selected token 实底 + 内嵌细 ring（持久选中态规范、
-      // 两模式对比度已调好）；未选中低调、hover 边框亮化 + 背景微升
-      //（transition-colors 默认 150ms、不上浮不夸张）
+      // chip-lg——推进弹窗主角：选中 = selected 实底 + 品牌细环 + 左侧 inset 竖条 + 微内光
+      //（克制、不堆叠装饰；竖条用 inset shadow 不占布局、选中切换不抖）
       {
         shape: "chip-lg",
         selected: true,
         className:
-          "border-transparent bg-selected font-medium text-selected-foreground ring-1 ring-inset ring-foreground/10",
+          "border-transparent bg-selected text-selected-foreground ring-2 ring-primary/40 shadow-[inset_2px_0_0_0_var(--primary),inset_0_1px_12px_0_color-mix(in_oklab,var(--primary)_12%,transparent)]",
       },
       {
         shape: "chip-lg",
         selected: false,
         className:
-          "border-border bg-transparent text-muted-foreground hover:border-ring/60 hover:bg-muted/40 hover:text-foreground",
+          "border-border bg-transparent text-muted-foreground hover:border-primary/35 hover:bg-primary/[0.04] hover:text-foreground",
       },
       // tab 形状——选中态走全局 selected token（bg-muted/60 在浅色下几乎不可见、
       // 用户实测点名「白色的选中状态太弱」、v1.0.x 立规见 ui-conventions）

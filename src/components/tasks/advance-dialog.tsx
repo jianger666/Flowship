@@ -493,8 +493,8 @@ export const AdvanceDialog = ({
     [customById, actionLayout],
   );
 
-  // 「下一步」：单行等高 chip（32px、只显示名字、无副标题 / 描述 tooltip；名字自解释）
-  // 内置 + 自定义混排、flex wrap、无分组标题；chip-lg 选中态 = bg-selected 实底 + 内嵌细 ring、
+  // 「下一步」：单行等高 chip（~40px、只显示名字、无副标题 / 描述 tooltip；名字自解释）
+  // 内置 + 自定义混排、flex wrap、无分组标题；chip-lg 选中态 = bg-selected + 品牌细环 + 左侧竖条、
   // 是弹窗视觉权重最高的主角区。不可选原因仍用角标警告 icon（非描述 tooltip）。
   const renderActionChip = (key: string) => {
     if (isBuiltinAdvanceAction(key)) {
@@ -706,8 +706,9 @@ export const AdvanceDialog = ({
           <DialogTitle>推进任务</DialogTitle>
         </DialogHeader>
 
-        {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5） */}
-        <div className="flex flex-col gap-4">
+        {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5）
+            min-h 兜底六个内置 action 主路径高度，切换时弹窗不抖（分批 build / 大图附件仍可能增高） */}
+        <div className="flex min-h-[28rem] flex-col gap-4">
           {/* action 类型选择：内置 + 自定义混排成一排 chip（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
@@ -725,16 +726,21 @@ export const AdvanceDialog = ({
                 开启或新建。
               </EmptyHint>
             )}
-            {/* plan 追加提示：最轻形态（info icon + muted 小字、无底色无边框）、贴 chips 下方 */}
-            {actionType === "plan" && hasPlanHistory && (
-              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
-                <span>本次会追加到现有方案，新增批次会进入「改代码」选择。</span>
-              </div>
-            )}
+            {/* 提示条固定占一行高：有无内容都占位，避免 plan 追加提示出现/消失时高度跳 */}
+            <div className="flex min-h-5 items-center gap-1.5 text-xs text-muted-foreground">
+              {actionType === "plan" && hasPlanHistory ? (
+                <>
+                  <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
+                  <span>
+                    本次会追加到现有方案，新增批次会进入「改代码」选择。
+                  </span>
+                </>
+              ) : null}
+            </div>
           </div>
 
-          {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动） */}
+          {/* V0.6.23：build 分批——plan 拆了批次时让用户挑本次做哪几批（默认勾未完成的、不勾的不动）
+              有批次时高度会明显高于六个无附加内置 action；不硬兜底（批次数量不定），接受增高 */}
           {actionType === "build" && hasBatches && (
             <div className="grid gap-1.5">
               {batchProgress.latestPlanMissingBatches && (
@@ -882,56 +888,60 @@ export const AdvanceDialog = ({
             </div>
           </div>
 
-          {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
-          {actionType === "ship" && (
-            <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
-              <label
-                htmlFor="advance-remove-source"
-                className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
-              >
-                合并后删除源分支
-              </label>
-              <Switch
-                id="advance-remove-source"
-                checked={removeSourceBranch}
-                onCheckedChange={setRemoveSourceBranch}
-                disabled={submitting}
-              />
-            </div>
-          )}
-
-          {/* V0.x：联调（dev）——推送方式二选一：直推 develop / 提 PR（仅选「联调」时显示） */}
-          {actionType === "dev" && (
-            <div className="grid gap-1.5">
-              <Label>推送方式</Label>
-              <div className="grid grid-cols-2 gap-2">
-                <ChoiceButton
-                  shape="card"
-                  selected={devPushMode === "direct"}
-                  onClick={() => setDevPushMode("direct")}
-                  disabled={submitting}
-                  className="flex flex-col items-start gap-0.5"
+          {/* action 专属附加区：固定 min-h 吸收 ship 开关行 / dev 推送方式的高度差
+              （dev 两卡最高；无附加内容时仍占位，六个内置切换不抖） */}
+          <div className="min-h-[5.75rem]">
+            {/* V0.6.14：ship 提测——合并后是否删源分支（默认保留、用户拍板；仅选「提测」时显示） */}
+            {actionType === "ship" && (
+              <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-3 py-2">
+                <label
+                  htmlFor="advance-remove-source"
+                  className="flex-1 cursor-pointer text-xs font-medium text-foreground/80"
                 >
-                  <span className="text-xs font-medium">直接推送</span>
-                  <span className="text-[10px] text-muted-foreground">
-                    本地合 dev 后直推、最快触发流水线
-                  </span>
-                </ChoiceButton>
-                <ChoiceButton
-                  shape="card"
-                  selected={devPushMode === "mr"}
-                  onClick={() => setDevPushMode("mr")}
+                  合并后删除源分支
+                </label>
+                <Switch
+                  id="advance-remove-source"
+                  checked={removeSourceBranch}
+                  onCheckedChange={setRemoveSourceBranch}
                   disabled={submitting}
-                  className="flex flex-col items-start gap-0.5"
-                >
-                  <span className="text-xs font-medium">提 PR</span>
-                  <span className="text-[10px] text-muted-foreground">
-                    建 feature→dev 的 MR、进 MR 列表
-                  </span>
-                </ChoiceButton>
+                />
               </div>
-            </div>
-          )}
+            )}
+
+            {/* V0.x：联调（dev）——推送方式二选一：直推 develop / 提 PR（仅选「联调」时显示） */}
+            {actionType === "dev" && (
+              <div className="grid gap-1.5">
+                <Label>推送方式</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <ChoiceButton
+                    shape="card"
+                    selected={devPushMode === "direct"}
+                    onClick={() => setDevPushMode("direct")}
+                    disabled={submitting}
+                    className="flex flex-col items-start gap-0.5"
+                  >
+                    <span className="text-xs font-medium">直接推送</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      本地合 dev 后直推、最快触发流水线
+                    </span>
+                  </ChoiceButton>
+                  <ChoiceButton
+                    shape="card"
+                    selected={devPushMode === "mr"}
+                    onClick={() => setDevPushMode("mr")}
+                    disabled={submitting}
+                    className="flex flex-col items-start gap-0.5"
+                  >
+                    <span className="text-xs font-medium">提 PR</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      建 feature→dev 的 MR、进 MR 列表
+                    </span>
+                  </ChoiceButton>
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* 续用开关 + 模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
           <div className="rounded-md border bg-muted/30 px-3 py-2">

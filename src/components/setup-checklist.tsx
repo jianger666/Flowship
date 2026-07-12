@@ -7,8 +7,8 @@
  * 任一未完成 → 首页看板位置显示本清单；全部就绪 → 自动消失、首页变正常飞书排期看板。
  * 已配好的老用户永远看不到这张卡。
  *
- * 形态：单卡多行、多数行 = 状态勾 + 标题 + 「去配置」跳设置页；
- * 「我的角色」行内嵌 ChoiceButton chip 直接点选落盘、无需跳设置页。
+ * 形态（用户拍板「全引导」）：每行 = 状态勾 + 一句话 + 「去设置」——清单不内嵌任何
+ * 输入 / 点选控件、编辑入口统一在设置页；完成状态靠 gate 响应式判定 + CLI 轮询实时刷新。
  */
 
 import { useEffect, useState } from "react";
@@ -16,15 +16,9 @@ import Link from "next/link";
 import { ArrowRight, CheckCircle2, Circle } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
-import { ChoiceButton } from "@/components/ui/choice-button";
 import { buttonVariants } from "@/components/ui/button";
 import { useSettings } from "@/hooks/use-settings";
 import { settingsUrl } from "@/lib/settings-link";
-import {
-  USER_ROLE_LABEL,
-  USER_ROLES,
-  type UserRole,
-} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // /api/system/feishu-cli 的状态形状（跟 feishu-cli-card 同源、这里只取就绪判定要的字段）
@@ -42,22 +36,15 @@ export interface SetupGate {
   feishuReady: boolean;
   reposReady: boolean;
   roleReady: boolean;
-  /** 当前已选角色（清单 chip 选中态、与就绪度同一 settings 实例） */
-  userRole: UserRole | undefined;
-  /** 点选角色即存——写的是本 hook 持有的实例、gate 就地重算、无需切页 */
-  pickRole: (role: UserRole) => void;
 }
 
 /**
  * 就绪度判定 hook（HomePage 用它决定渲染看板还是清单）。
  * 未就绪时 3s 轮询 CLI 状态（安装 / 登录都是后台流程、配完回来打勾要实时）；就绪即停。
- *
- * ⚠️ useSettings 是「每实例独立快照」hook——角色点选必须走本 hook 下发的 pickRole
- * 写同一实例、gate 才会响应式重算；SetupChecklist 里再开一个 useSettings 实例
- * 写入不会同步过来（踩过：点了 chip 清单不刷新、要切页才生效）。
+ * settings 项（API Key / 仓库 / 角色）走 useSettings 响应式判定、设置页改完回来 remount 天然拿最新。
  */
 export const useSetupGate = (): SetupGate => {
-  const { settings, loaded, saveFieldValue } = useSettings();
+  const { settings, loaded } = useSettings();
   // CLI 状态快照（null = 还没拉到）
   const [cli, setCli] = useState<FeishuCliStatus | null>(null);
   // CLI 状态至少拉到过一次（接口失败也算、避免接口挂了首页永远 loading）
@@ -101,12 +88,10 @@ export const useSetupGate = (): SetupGate => {
     feishuReady,
     reposReady,
     roleReady,
-    userRole: settings.userRole,
-    pickRole: (role) => saveFieldValue("userRole", role),
   };
 };
 
-// 单个步骤行：勾/序号圈 + 标题 + 短说明 + 「去配置」
+// 单个步骤行：勾/序号圈 + 标题 + 短说明 + 「去设置」
 const StepRow = ({
   done,
   index,
@@ -145,58 +130,10 @@ const StepRow = ({
           "no-underline",
         )}
       >
-        去配置
+        去设置
         <ArrowRight className="size-3.5" />
       </Link>
     )}
-  </div>
-);
-
-/** 「我的角色」步骤：行内四个 chip 直接点选落盘、无需跳设置页 */
-const RoleStepRow = ({
-  done,
-  index,
-  userRole,
-  onPick,
-}: {
-  done: boolean;
-  index: number;
-  userRole: UserRole | undefined;
-  onPick: (role: UserRole) => void;
-}) => (
-  <div className="flex items-start gap-3 px-4 py-3.5">
-    {done ? (
-      <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-green-500" />
-    ) : (
-      <span className="relative mt-0.5 flex size-5 shrink-0 items-center justify-center">
-        <Circle className="size-5 text-muted-foreground/40" />
-        <span className="absolute text-[10px] font-medium text-muted-foreground">
-          {index}
-        </span>
-      </span>
-    )}
-    <div className="min-w-0 flex-1 space-y-2">
-      <div>
-        <div className={cn("text-sm font-medium", done && "text-muted-foreground")}>
-          选择你的角色
-        </div>
-        <div className="text-xs text-muted-foreground/80">
-          不同角色会解锁对应的辅助能力
-        </div>
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {USER_ROLES.map((id) => (
-          <ChoiceButton
-            key={id}
-            shape="chip"
-            selected={userRole === id}
-            onClick={() => onPick(id)}
-          >
-            {USER_ROLE_LABEL[id]}
-          </ChoiceButton>
-        ))}
-      </div>
-    </div>
   </div>
 );
 
@@ -231,11 +168,12 @@ export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
             hint="至少添加一个"
             focus="repos"
           />
-          <RoleStepRow
+          <StepRow
             done={gate.roleReady}
             index={4}
-            userRole={gate.userRole}
-            onPick={gate.pickRole}
+            title="我的角色"
+            hint="不同角色会解锁对应的辅助能力"
+            focus="prefs"
           />
         </CardContent>
       </Card>
