@@ -262,20 +262,35 @@ const extractItems = (resp: unknown): unknown[] => {
 // ---------- 业务查询（mywork 已退役、V0.14.1 看板换 workhour list-schedule） ----------
 
 /** 工作项详情（预览页 / 任务详情融合用；默认字段已含 description） */
+// 成功结果进程内缓存：同一 story 反复起 agent 时 resolveUserIdentity 不重付 CLI
+const workitemDetailCache = new Map<string, Record<string, unknown>>();
+const workitemDetailCacheKey = (id: string, projectKey?: string): string =>
+  `${projectKey ?? ""}:${id}`;
+
 export const fetchWorkitemDetail = async (
   workItemId: string,
   projectKey?: string,
 ): Promise<Record<string, unknown>> => {
+  const cacheKey = workitemDetailCacheKey(workItemId, projectKey);
+  const cached = workitemDetailCache.get(cacheKey);
+  if (cached) return cached;
+
   const args = ["workitem", "get", "--work-item-id", workItemId];
   if (projectKey) args.push("--project-key", projectKey);
   const resp = await runMeegle(args);
+  let detail: Record<string, unknown> = {};
   if (resp && typeof resp === "object") {
     const r = resp as Record<string, unknown>;
     // 剥常见 data 包裹
-    if (r.data && typeof r.data === "object") return r.data as Record<string, unknown>;
-    return r;
+    if (r.data && typeof r.data === "object") {
+      detail = r.data as Record<string, unknown>;
+    } else {
+      detail = r;
+    }
   }
-  return {};
+  // 成功才缓存（空对象也算一次成功响应、避免同 key 狂打）
+  workitemDetailCache.set(cacheKey, detail);
+  return detail;
 };
 
 // ---------- 当前用户（子任务「只看自己」过滤 + agent prompt 身份注入） ----------
@@ -518,50 +533,97 @@ export const formatUserIdentityLine = (
  * meegle 未登录 / 全程失败 → 返空串（调用方不注入整行）。
  *
  * projectKey 走 `url decode` 的 simple_name（CLI `--project-key` 接受 simpleName）。
+ *
+ * 性能闸（审计 P2）：串行最多 3 个 CLI、单次 30s 超时——网络挂时每次 fresh agent
+ * 都白等。这里包 **5s 总预算**（超时返空串；底层查询继续跑、成功结果进缓存、下次能用）；
+ * 全程失败另记 60s 负缓存、避免每次启动都卡满 5s。
  */
+/** 身份 resolve 总预算（ms）——超时返空、不堵 agent 启动 */
+const IDENTITY_RESOLVE_BUDGET_MS = 5_000;
+/** 失败负缓存 TTL：网络挂时 60s 内不再发起 */
+const IDENTITY_NEG_CACHE_MS = 60_000;
+let identityNegCachedAt = 0;
+
+const resolveUserIdentityForPromptInner = async (
+  feishuStoryUrl?: string,
+): Promise<string> => {
+  const identity = await fetchMyIdentity();
+  if (!identity) return "";
+
+  // 1. story 实排角色
+  let storyRole: string | null = null;
+  const url = feishuStoryUrl?.trim();
+  if (url) {
+    const storyId = extractFeishuStoryId(url);
+    if (storyId) {
+      // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍走兜底）
+      const decoded = await decodeWorkitemUrl(url);
+      const projectKey = decoded?.simpleName;
+      if (projectKey) {
+        storyRole = await fetchMyRoleOnWorkitem(projectKey, storyId);
+      }
+    }
+  }
+  if (storyRole) {
+    // 角色很难变——没存过就存、真变了以新为准更新
+    await savePersistedRole(identity, storyRole);
+    return formatUserIdentityLine(identity.name, {
+      source: "story",
+      name: storyRole,
+    });
+  }
+
+  // 2. 缓存角色兜底（story 没排 / chat 无 story）
+  const cachedRole = await readPersistedRole(identity.userKey);
+  if (cachedRole) {
+    return formatUserIdentityLine(identity.name, {
+      source: "cache",
+      name: cachedRole,
+    });
+  }
+
+  // 3. 只有姓名
+  return formatUserIdentityLine(identity.name);
+};
+
 export const resolveUserIdentityForPrompt = async (
   feishuStoryUrl?: string,
 ): Promise<string> => {
-  try {
-    const identity = await fetchMyIdentity();
-    if (!identity) return "";
-
-    // 1. story 实排角色
-    let storyRole: string | null = null;
-    const url = feishuStoryUrl?.trim();
-    if (url) {
-      const storyId = extractFeishuStoryId(url);
-      if (storyId) {
-        // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍走兜底）
-        const decoded = await decodeWorkitemUrl(url);
-        const projectKey = decoded?.simpleName;
-        if (projectKey) {
-          storyRole = await fetchMyRoleOnWorkitem(projectKey, storyId);
-        }
-      }
-    }
-    if (storyRole) {
-      // 角色很难变——没存过就存、真变了以新为准更新
-      await savePersistedRole(identity, storyRole);
-      return formatUserIdentityLine(identity.name, {
-        source: "story",
-        name: storyRole,
-      });
-    }
-
-    // 2. 缓存角色兜底（story 没排 / chat 无 story）
-    const cachedRole = await readPersistedRole(identity.userKey);
-    if (cachedRole) {
-      return formatUserIdentityLine(identity.name, {
-        source: "cache",
-        name: cachedRole,
-      });
-    }
-
-    // 3. 只有姓名
-    return formatUserIdentityLine(identity.name);
-  } catch {
+  // 负缓存命中：上次预算耗尽未过 60s → 直接空串、别再打 CLI
+  if (
+    identityNegCachedAt > 0 &&
+    Date.now() - identityNegCachedAt < IDENTITY_NEG_CACHE_MS
+  ) {
     return "";
+  }
+
+  // 底层查询挂 catch：Promise.race 输了后它仍可能 reject、别变 unhandled rejection；
+  // 迟到的成功结果清掉负缓存（下次启动就能用已填好的 identity / detail 缓存）
+  const work = resolveUserIdentityForPromptInner(feishuStoryUrl)
+    .then((line) => {
+      if (line) identityNegCachedAt = 0;
+      return line;
+    })
+    .catch((): string => "");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const timeout = new Promise<string>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve("");
+    }, IDENTITY_RESOLVE_BUDGET_MS);
+  });
+  try {
+    const line = await Promise.race([work, timeout]);
+    if (line) {
+      identityNegCachedAt = 0;
+      return line;
+    }
+    // 只有预算耗尽才记负缓存；未登录秒返空不记（登录后马上能注入）
+    if (timedOut) identityNegCachedAt = Date.now();
+    return "";
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 };
 
@@ -849,10 +911,18 @@ export const fetchProjectSimpleNames = async (): Promise<Map<string, string>> =>
   return map;
 };
 
-/** URL → 结构化字段（纯本地解析、无网络）；非工作项详情 URL 返回 null */
+/** URL → 结构化字段；非工作项详情 URL 返回 null */
+// 成功结果按 url 缓存：同一 task 反复起 agent 不重付 decode CLI
+const decodeUrlCache = new Map<
+  string,
+  { workItemId: string; simpleName?: string; typeKey?: string }
+>();
+
 export const decodeWorkitemUrl = async (
   url: string,
 ): Promise<{ workItemId: string; simpleName?: string; typeKey?: string } | null> => {
+  const cached = decodeUrlCache.get(url);
+  if (cached) return cached;
   try {
     const resp = (await runMeegle(["url", "decode", "--url", url])) as Record<
       string,
@@ -861,11 +931,13 @@ export const decodeWorkitemUrl = async (
     const kind = asStr(resp.url_kind);
     const id = asStr(resp.work_item_id);
     if (kind !== "workitem_detail" || !id) return null;
-    return {
+    const decoded = {
       workItemId: id,
       simpleName: asStr(resp.simple_name),
       typeKey: asStr(resp.work_item_type),
     };
+    decodeUrlCache.set(url, decoded);
+    return decoded;
   } catch {
     return null;
   }

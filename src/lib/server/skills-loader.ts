@@ -211,22 +211,47 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
 };
 
 /**
- * 本机「可用 skill 名字」全集：loadSkills（平台 + 全局）∪ 各绑定仓的 `.cursor/skills/`。
+ * 本机「可用 skill」全集：loadSkills（平台 + 全局）∪ 各绑定仓的 `.cursor/skills/`。
  *
  * 给自定义 action 的 extraSkills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
- * 定义可能引用了对方个人 skill——渲染前按这个集合静默过滤、agent 不会拿悬空引用瞎找。
- * repo 层仍算进「名字是否存在」（定义里点了名就算有、避免误杀）；真正注入 prompt 的仍只有 loadSkills。
+ * 定义可能引用了对方个人 / 仓库 skill——渲染前按这个集合静默过滤。
+ *
+ * settingSources:[] 后 repo 层不再注入 [AVAILABLE_SKILLS]，但 repo 自带 skill 仍是
+ * 合法引用目标：返回结构带 absPath + source，点名段对 repo 命中附绝对路径让 agent read。
  */
+export type AvailableSkillSource = "loaded" | "repo";
+
+export interface AvailableSkillRef {
+  name: string;
+  absPath: string;
+  /** loaded = 已进 prompt 的平台/全局；repo = 仅仓库有、点名时需附路径 */
+  source: AvailableSkillSource;
+}
+
+export const listAvailableSkills = async (
+  repoPaths: string[],
+): Promise<Map<string, AvailableSkillRef>> => {
+  const map = new Map<string, AvailableSkillRef>();
+  for (const s of await loadSkills()) {
+    map.set(s.name, { name: s.name, absPath: s.absPath, source: "loaded" });
+  }
+  for (const repo of repoPaths) {
+    const entries = await scanSkillsDir(path.join(repo, ".cursor", "skills"));
+    for (const s of entries) {
+      // 已在 loaded 里的同名不覆盖（注入优先级更高、点名不必再附路径）
+      if (map.has(s.name)) continue;
+      map.set(s.name, { name: s.name, absPath: s.absPath, source: "repo" });
+    }
+  }
+  return map;
+};
+
+/** @deprecated 优先用 listAvailableSkills；保留 Set 形态给只关心名字的调用方 */
 export const listAvailableSkillNames = async (
   repoPaths: string[],
 ): Promise<Set<string>> => {
-  const names = new Set<string>();
-  for (const s of await loadSkills()) names.add(s.name);
-  for (const repo of repoPaths) {
-    const entries = await scanSkillsDir(path.join(repo, ".cursor", "skills"));
-    for (const s of entries) names.add(s.name);
-  }
-  return names;
+  const map = await listAvailableSkills(repoPaths);
+  return new Set(map.keys());
 };
 
 /**

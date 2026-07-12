@@ -24,7 +24,11 @@ import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import { Composer, type ComposerFocusHandle } from "@/components/composer";
-import { useSlashSkills } from "@/components/slash-skills";
+import {
+  useSlashSkills,
+  resolveSkillReferences,
+  fetchSkills,
+} from "@/components/slash-skills";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { usePathAttach } from "@/hooks/use-path-attach";
 import { useSubmitShortcut } from "@/hooks/use-settings";
@@ -372,9 +376,18 @@ const EventStreamImpl = ({
   // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
   // 原消息保留（append-only 事件日志、持久会话没法真 fork）；只有最后一条才给入口（用户拍板：
   // 早期消息重发有上下文歧义、fork 语义做不了、砍掉）。不带图 / 附件（原消息的附件不重传）。
+  // skillRefs：从重发文本重新解析（气泡只存原文 `/name`、不存 refs）——跟发送路径对齐
   const handleResend = useCallback(
     (text: string) => {
-      onUserReply?.(text);
+      void (async () => {
+        const skills = await fetchSkills();
+        const refs = resolveSkillReferences(text, skills);
+        const skillRefs =
+          refs.length > 0
+            ? refs.map((s) => ({ name: s.name, absPath: s.absPath }))
+            : undefined;
+        onUserReply?.(text, undefined, undefined, skillRefs);
+      })();
     },
     [onUserReply],
   );

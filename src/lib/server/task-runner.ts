@@ -1771,9 +1771,29 @@ const restoreRunStatusAfterQuestion = async (taskId: string): Promise<void> => {
  * opts.questionRun（V0.11.9）：这个 run 是「问一问」纯答疑——**任何出口都不动 action**
  * （停止 / 失败也不把 awaiting_ack 审阅位打成 cancelled/error）、不关会话、只把 runStatus 归位。
  */
-// 每 action 追问交卷次数（进程内计数、防 agent 反复空跑死循环；key = `${taskId}:${actionId}`）
-const submitWorkFollowupCounts = new Map<string, number>();
+// 每 action 追问交卷次数（防 agent 反复空跑死循环；key = `${taskId}:${actionId}`）
+// 挂 globalThis：跟 advanceChains 同构——dev 下不同 route chunk 各持一份 module Map
+// 会让计数失效 / 追问上限形同虚设（V0.6.27 踩过）
+const SUBMIT_WORK_FOLLOWUP_COUNTS_KEY = "__feAiFlowSubmitWorkFollowupCountsV1__";
+const getSubmitWorkFollowupCounts = (): Map<string, number> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, number> | undefined
+  >;
+  if (!g[SUBMIT_WORK_FOLLOWUP_COUNTS_KEY]) {
+    g[SUBMIT_WORK_FOLLOWUP_COUNTS_KEY] = new Map();
+  }
+  return g[SUBMIT_WORK_FOLLOWUP_COUNTS_KEY]!;
+};
+const submitWorkFollowupCounts = getSubmitWorkFollowupCounts();
 const SUBMIT_WORK_FOLLOWUP_MAX = 2;
+
+/** 清掉某 task 名下所有交卷追问计数（停止 / 推进 cancelled 出口用） */
+const clearSubmitWorkFollowupCounts = (taskId: string): void => {
+  for (const k of [...submitWorkFollowupCounts.keys()]) {
+    if (k.startsWith(`${taskId}:`)) submitWorkFollowupCounts.delete(k);
+  }
+};
 
 const buildSubmitWorkFollowup = (last: {
   id: string;
@@ -1853,6 +1873,8 @@ const consumeSessionRun = async (
     const result = await run.wait();
 
     if (cancelled || result.status === "cancelled") {
+      // 停止 / 推进：追问计数一并清掉，避免下次同 action 续跑还背着旧计数
+      clearSubmitWorkFollowupCounts(task.id);
       const isForkPending = forkPendingTasks.has(task.id);
       if (isForkPending) {
         forkPendingTasks.delete(task.id);
@@ -1934,6 +1956,28 @@ const consumeSessionRun = async (
           actionId: lastAction.id,
           text: `未交卷，正在追问 agent 补调 submit_work（${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}）…`,
         });
+        // 写事件 ↔ send 之间有 1~3s 窗口：用户此刻点「停止」会 closeTaskSession，
+        // 推进 force-new 会换 agentId。再不查一次就 send 抛错走 error、覆盖 stop 刚落的 cancelled/idle。
+        const stillOwnSession =
+          agentSessions.get(task.id)?.agentId === agent.agentId;
+        if (cancelled || !stillOwnSession) {
+          submitWorkFollowupCounts.delete(followupKey);
+          if (forkPendingTasks.has(task.id)) {
+            forkPendingTasks.delete(task.id);
+            await writeEventAndPublish(task.id, {
+              kind: "info",
+              text: "旧 agent 已收尾、正在为推进起新 agent...",
+            });
+            return;
+          }
+          await finalizeStaleActions(task.id, "cancelled");
+          const updated = await setTaskRunStatus(task.id, "idle");
+          if (updated) publish(task.id, { kind: "task", task: updated });
+          publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+          // 会话可能已被 stop 关掉；带 agentId 避免误关后来者
+          closeTaskSession(task.id, agent.agentId);
+          return;
+        }
         let nextRun: SessionRun;
         try {
           nextRun = await agent.send(followup);
@@ -1942,7 +1986,26 @@ const consumeSessionRun = async (
             `[task-runner] task=${task.id} 交卷追问 send 失败`,
             err,
           );
-          // send 失败 → 跟追问耗尽一样收尾
+          // stop / force-new 导致的 send 失败：按 cancelled 收尾，绝不能标 error 覆盖
+          if (cancelled || forkPendingTasks.has(task.id)) {
+            submitWorkFollowupCounts.delete(followupKey);
+            if (forkPendingTasks.has(task.id)) {
+              forkPendingTasks.delete(task.id);
+              await writeEventAndPublish(task.id, {
+                kind: "info",
+                text: "旧 agent 已收尾、正在为推进起新 agent...",
+              });
+              return;
+            }
+            await finalizeStaleActions(task.id, "cancelled");
+            const updated = await setTaskRunStatus(task.id, "idle");
+            if (updated) publish(task.id, { kind: "task", task: updated });
+            publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+            closeTaskSession(task.id, agent.agentId);
+            return;
+          }
+          // 真·网络 / SDK 失败 → 跟追问耗尽一样收尾
+          submitWorkFollowupCounts.delete(followupKey);
           await patchAction(task.id, lastAction.id, { status: "error" });
           await setTaskRunStatus(task.id, "error", lastAction.id);
           await writeEventAndPublish(task.id, {
@@ -2044,6 +2107,7 @@ const consumeSessionRun = async (
       if (outcome === "handled") {
         // 重连成功、新 run 已在递归调用里消费完毕——这里什么都不用做
       } else if (outcome === "cancelled") {
+        clearSubmitWorkFollowupCounts(task.id);
         if (forkPendingTasks.has(task.id)) {
           // force-new 在飞（cancel 旧 run 引发的抛错路径）：新 agent 由 advance 分支管、
           // 这里不动状态、更不能关会话（会误关刚起的新会话）
@@ -2064,7 +2128,12 @@ const consumeSessionRun = async (
       }
     }
   } finally {
-    runningTasks.delete(task.id);
+    // 身份比对：推进 force-new 超时强清后新 run 已注册时，旧追问链 finally 不能把新登记删掉
+    // （同构 runningChecks 的 `=== self`——这里用 agentId，因每次 set 都是新对象）
+    const cur = runningTasks.get(task.id);
+    if (cur?.agentId === agent.agentId) {
+      runningTasks.delete(task.id);
+    }
     // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
     const session = agentSessions.get(task.id);
     if (session && session.agentId === agent.agentId) {

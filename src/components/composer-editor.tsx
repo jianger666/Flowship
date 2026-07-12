@@ -254,8 +254,14 @@ const $setSelectionFromPlainOffset = (offset: number): void => {
 };
 
 /**
- * 手打 `/known-name `（必须带尾随空白）→ 换成 SkillTokenNode。
- * 不要求尾空格会在「既有 skill 又有 skill-xxx」时误转半截名。
+ * 手打 `/known-name`（尾随空白或行尾）→ 换成 SkillTokenNode。
+ *
+ * 为何接受行尾（不只空白）：parseSkillTokens / 气泡高亮用 `(?=\s|$)`，若 transform
+ * 只认空白，行尾 `/name` 会「输入端不亮、气泡端亮」。两边统一认行尾更稳。
+ *
+ * 仍要求「完成边界」：打字中的 `/ski` 不会转；前缀冲突（既有 `skill` 又有
+ * `skill-xxx`）时，用户需打完更长名或靠空格确认——行尾误转半截的概率低于
+ * 两端语义分裂带来的困惑。
  */
 const $transformSkillTokensInTextNode = (
   node: TextNode,
@@ -263,7 +269,8 @@ const $transformSkillTokensInTextNode = (
 ): void => {
   if (!node.isAttached() || !node.isSimpleText()) return;
   const text = node.getTextContent();
-  const re = /(^|\s)\/([a-zA-Z0-9._-]+)(?=\s)/g;
+  // 与 SKILL_TOKEN_RE 同构：尾随空白或行尾都算完成 token
+  const re = /(^|\s)\/([a-zA-Z0-9._-]+)(?=\s|$)/g;
   let match: RegExpExecArray | null;
   re.lastIndex = 0;
   while ((match = re.exec(text)) !== null) {

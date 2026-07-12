@@ -27,7 +27,7 @@ import {
   isWorktreeTask,
 } from "./task-worktrees";
 import {
-  listAvailableSkillNames,
+  listAvailableSkills,
   readSkillBodyByName,
   renderSkillsForPrompt,
   type SkillEntry,
@@ -169,14 +169,21 @@ const loadCustomActionPlaybook = async (
   );
   if (def.extraSkills && def.extraSkills.length > 0) {
     // skill 缺失兜底：附加引用可能悬空——本机没有的静默滤掉、不进 prompt
-    const available = await listAvailableSkillNames(task.repoPaths ?? []);
-    const usable = def.extraSkills.filter((s) => available.has(s));
+    // repo 层 skill 已不进 [AVAILABLE_SKILLS]、点名行附 absPath 让 agent 能 read
+    const available = await listAvailableSkills(task.repoPaths ?? []);
+    const usable = def.extraSkills
+      .map((name) => available.get(name))
+      .filter((s): s is NonNullable<typeof s> => !!s);
     if (usable.length > 0) {
       parts.push(
         "",
         "## 本 action 重点使用以下 skill",
-        "（详情见上方可用 skills 段、按场景用 `read` 读完整 SKILL.md）：",
-        ...usable.map((s) => `- ${s}`),
+        "（详情见上方可用 skills 段；仓库专属 skill 已附绝对路径、用 `read` 读取）：",
+        ...usable.map((s) =>
+          s.source === "repo"
+            ? `- ${s.name}（路径：${s.absPath}）`
+            : `- ${s.name}`,
+        ),
       );
     }
   }

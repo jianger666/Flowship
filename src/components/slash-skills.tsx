@@ -83,9 +83,12 @@ const SLASH_RE = /(^|\s)\/([a-zA-Z0-9._-]*)$/;
  * 全文扫描已完成的 skill token（与菜单触发同源：行首或空白后的 `/name`）。
  * 名字必须精确命中 knownNames 才算引用——打到一半的 `/ski` 不高亮、也不进 references。
  *
- * 边界：中文紧邻如「帮我/skill-creator建」因前面不是空白、不算 token（可接受）。
+ * 边界：
+ * - 中文紧邻如「帮我/skill-creator建」因前面不是空白、不算 token（可接受）
+ * - 尾随空白或行尾都算完成（`(?=\s|$)`）——跟 Composer transform 对齐，避免
+ *   「行尾 `/name` 输入端不亮、气泡端亮」的漂移
  */
-export const SKILL_TOKEN_RE = /(^|\s)\/([a-zA-Z0-9._-]+)/g;
+export const SKILL_TOKEN_RE = /(^|\s)\/([a-zA-Z0-9._-]+)(?=\s|$)/g;
 
 /** 一次匹配：前缀空白（或空）+ `/name` 整体 */
 export interface SkillTokenMatch {
