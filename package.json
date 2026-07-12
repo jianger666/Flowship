@@ -24,7 +24,7 @@
   "dependencies": {
     "@base-ui/react": "^1.4.1",
     "@connectrpc/connect-node": "1.7.0",
-    "@cursor/sdk": "^1.0.19",
+    "@cursor/sdk": "^1.0.23",
     "@lexical/react": "^0.47.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@streamdown/cjk": "^1.0.3",
