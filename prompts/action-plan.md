@@ -38,7 +38,7 @@
 
 - **role=fe（前端）**：看接口契约 / 字段语义 / 路由 / 组件 / 状态 / 文案、扫仓库找同类弹窗 / 列表 / store / hook、按仓库现有前端技术栈（Vue / React / Tailwind / shadcn / pinia 等）写
 - **role=be（后端）**：看接口契约 / DB schema / 领域模型 / 分层（controller-service-dao）/ 中间件 / 定时任务、扫仓库找同类 controller / service / mapper / DTO、按仓库现有后端技术栈（Spring Boot / MyBatis / Go 等）写
-- **role=adaptive（自适应）**：不锁端——先探测仓库技术栈（`package.json` / `pom.xml` / `build.gradle` / `go.mod` 等）+ story、自己判定本仓库属于前端 / 后端 / 其他、按判定出的角色套用上面对应那条；判不准就 `ask_user` 跟用户确认视角、别硬猜
+- **role=adaptive（自适应）**：不锁端——先判任务性质：内容 / story 是**测试验证类**（写用例、造数据、跑回归、验证、写脚本）→ 视角 QA：**业务仓只读不改**、产出写到脚本目录或指定位置；确需改业务仓 → **先 `ask_user` 确认**。研发类再探测技术栈（`package.json` / `pom.xml` / `build.gradle` / `go.mod` 等）判定前端 / 后端、套用上面对应那条；判不准就 `ask_user` 确认视角、别硬猜
 - 其他 role：未来扩 data / mobile / qa 时按对应角色视角调整、相同结构
 
 ## 输入

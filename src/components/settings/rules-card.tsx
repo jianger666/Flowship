@@ -9,6 +9,8 @@
  *
  * 注入语义跟 Cursor rules 一致：frontmatter `alwaysApply: true` 全文进 prompt、
  * 其余列 index 让 agent 按需 read。开关（disabledRules）只作用于自管条目。
+ *
+ * 主路径 = 「一句话建规则」（输入行 + 添加）；高级新建 / 编辑仍走全文 .mdc dialog。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -49,6 +51,8 @@ interface RuleRow {
   alwaysApply: boolean;
   enabled: boolean;
   absPath: string;
+  /** 正文第一行；一句话规则列表主文字用它 */
+  bodyPreview: string;
 }
 
 interface CursorRule {
@@ -57,7 +61,11 @@ interface CursorRule {
   alwaysApply: boolean;
 }
 
-// 新增 rule 预填模板（跟 Cursor .mdc 规范一致）
+// 跟 server `isSafeRuleName` 对齐——客户端自动命名前本地校验
+const SAFE_RULE_NAME_RE =
+  /^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5._-]{0,63}$/;
+
+// 高级新建预填模板（跟 Cursor .mdc 规范一致）
 const NEW_RULE_TEMPLATE = `---
 description: 一句话说清这条规则管什么（alwaysApply 为 false 时 agent 靠它决定要不要读）
 alwaysApply: true
@@ -66,13 +74,66 @@ alwaysApply: true
 这里写规则正文（agent 每次运行都会遵守）。
 `;
 
+/**
+ * 从一句话洗出合法文件名基底：
+ * - 取前 ~12 个字符（按 Unicode code point）
+ * - 空白 → `-`、非法字符（emoji 等）丢掉
+ * - 空结果兜底 `rule`
+ */
+const slugifyRuleName = (text: string): string => {
+  let raw = "";
+  for (const ch of [...text.trim()]) {
+    if ([...raw].length >= 12) break;
+    if (/\s/u.test(ch)) {
+      // 空白压成单个 `-`，避免连杠
+      if (raw && !raw.endsWith("-")) raw += "-";
+      continue;
+    }
+    if (/[a-zA-Z0-9\u4e00-\u9fa5._-]/u.test(ch)) raw += ch;
+    // emoji / 符号等直接跳过
+  }
+  raw = raw.replace(/^-+|-+$/g, "").replace(/^[^a-zA-Z0-9\u4e00-\u9fa5]+/u, "");
+  if (!raw) return "rule";
+  const cps = [...raw];
+  if (cps.length > 64) raw = cps.slice(0, 64).join("");
+  return SAFE_RULE_NAME_RE.test(raw) ? raw : "rule";
+};
+
+/** 撞已有名时探 `-2` / `-3`…；后缀挤占总长时截基底（仍保 64 上限） */
+const allocateRuleName = (base: string, existing: Set<string>): string => {
+  if (!existing.has(base) && SAFE_RULE_NAME_RE.test(base)) return base;
+  for (let i = 2; i < 1000; i++) {
+    const suffix = `-${i}`;
+    const maxBaseLen = 64 - suffix.length;
+    let truncated = [...base].slice(0, Math.max(1, maxBaseLen)).join("");
+    truncated = truncated.replace(/-+$/g, "");
+    // 截断后首字符仍须合法；否则退到短兜底再拼后缀
+    if (!/^[a-zA-Z0-9\u4e00-\u9fa5]/u.test(truncated)) truncated = "rule";
+    const candidate = `${truncated}${suffix}`;
+    if (SAFE_RULE_NAME_RE.test(candidate) && !existing.has(candidate)) {
+      return candidate;
+    }
+  }
+  // 极端撞名：时间戳后缀（几乎不会走到）
+  return `rule-${Date.now()}`.slice(0, 64);
+};
+
+/** 一句话 → alwaysApply .mdc（description 留空、正文即那句话） */
+const buildQuickRuleMdc = (sentence: string): string =>
+  `---
+alwaysApply: true
+---
+
+${sentence.trim()}
+`;
+
 export const RulesCard = () => {
   const { confirm } = useDialog();
   // 自管 rules（null = 还没加载完）
   const [rules, setRules] = useState<RuleRow[] | null>(null);
   // Cursor 全局可导入清单
   const [cursorGlobal, setCursorGlobal] = useState<CursorRule[]>([]);
-  // 编辑 dialog：null 关；name 空串 = 新增
+  // 编辑 dialog：null 关；name 空串 = 高级新建
   const [editing, setEditing] = useState<{ name: string; content: string } | null>(
     null,
   );
@@ -80,6 +141,8 @@ export const RulesCard = () => {
   const [importOpen, setImportOpen] = useState(false);
   // 请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
+  // 一句话新建输入草稿
+  const [quickDraft, setQuickDraft] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -192,25 +255,83 @@ export const RulesCard = () => {
     }
   };
 
+  // 一句话添加：自动命名 + 拼 alwaysApply .mdc → 现有 POST
+  const handleQuickAdd = async () => {
+    const sentence = quickDraft.trim();
+    if (!sentence || busy) return;
+    const existing = new Set((rules ?? []).map((r) => r.name));
+    const name = allocateRuleName(slugifyRuleName(sentence), existing);
+    const content = buildQuickRuleMdc(sentence);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/rules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, content }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as {
+          error?: string;
+        } | null;
+        toast.error(data?.error ?? "添加失败");
+        return;
+      }
+      toast.success(`已添加「${name}」`);
+      setQuickDraft("");
+      void refresh();
+    } catch (err) {
+      toast.error(
+        `添加失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Rules</CardTitle>
         <CardDescription>
-          注入给 agent 的团队 / 项目级规则（.mdc）；Cursor 全局规则照常生效、这里管本 app 自己的
+          注入给 agent 的团队 / 项目级规则；Cursor 全局规则照常生效
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
+        {/* 主路径：输一句话就建 alwaysApply 规则 */}
+        <div className="flex items-center gap-2">
+          <Input
+            value={quickDraft}
+            onChange={(e) => setQuickDraft(e.target.value)}
+            placeholder="一句话规则，如：回复永远用中文"
+            disabled={busy}
+            className="min-w-0 flex-1"
+            onKeyDown={(e) => {
+              // 单行 Input：裸 Enter 提交（IME 选词中的 Enter 放过）
+              if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+              e.preventDefault();
+              void handleQuickAdd();
+            }}
+          />
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => void handleQuickAdd()}
+            disabled={busy || !quickDraft.trim()}
+          >
+            {busy ? <Loader2 className="animate-spin" /> : <Plus />}
+            添加
+          </Button>
+        </div>
+
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
-            variant="outline"
+            variant="ghost"
             size="sm"
             onClick={() => setEditing({ name: "", content: NEW_RULE_TEMPLATE })}
             disabled={busy}
           >
-            <Plus />
-            新增
+            高级新建
           </Button>
           <Button
             type="button"
@@ -232,55 +353,58 @@ export const RulesCard = () => {
         {rules === null ? (
           <LoadingState variant="inline" />
         ) : rules.length === 0 ? (
-          <EmptyHint>还没有自管规则——从 Cursor 导入或手动新增</EmptyHint>
+          <EmptyHint>还没有自管规则——上面输入一句话即可添加</EmptyHint>
         ) : (
           <div className="divide-y divide-border/60 rounded-md border border-border/60">
-            {rules.map((r) => (
-              <div key={r.name} className="flex items-center gap-2 px-3 py-2">
-                <div className={cn("min-w-0 flex-1", !r.enabled && "opacity-50")}>
-                  <div className="flex items-center gap-1.5">
-                    <span className="truncate text-sm" title={r.absPath}>
-                      {r.name}
-                    </span>
-                    {r.alwaysApply && (
-                      <Badge variant="secondary" className="text-[10px]">
-                        总是注入
+            {rules.map((r) => {
+              // 主文字优先正文第一行；空正文退到 description / 文件名
+              const primary =
+                r.bodyPreview || r.description || r.name;
+              return (
+                <div key={r.name} className="flex items-center gap-2 px-3 py-2">
+                  <div className={cn("min-w-0 flex-1", !r.enabled && "opacity-50")}>
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate text-sm" title={primary}>
+                        {primary}
+                      </span>
+                      <Badge variant="secondary" className="shrink-0 text-[10px]">
+                        {r.alwaysApply ? "常驻" : "按需"}
                       </Badge>
-                    )}
+                    </div>
+                    <div
+                      className="truncate text-[11px] text-muted-foreground"
+                      title={r.absPath}
+                    >
+                      {r.name}
+                    </div>
                   </div>
-                  <div
-                    className="truncate text-[11px] text-muted-foreground"
-                    title={r.description}
+                  <Switch
+                    checked={r.enabled}
+                    onCheckedChange={(v) => void handleToggle(r.name, v)}
+                    aria-label={`${r.enabled ? "禁用" : "启用"} ${r.name}`}
+                  />
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={`编辑 ${r.name}`}
+                    title="编辑 .mdc"
+                    onClick={() => void openEdit(r.name)}
                   >
-                    {r.description || "（无描述）"}
-                  </div>
+                    <Pencil />
+                  </Button>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={`删除 ${r.name}`}
+                    title="删除"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => void handleDelete(r.name)}
+                  >
+                    <Trash2 />
+                  </Button>
                 </div>
-                <Switch
-                  checked={r.enabled}
-                  onCheckedChange={(v) => void handleToggle(r.name, v)}
-                  aria-label={`${r.enabled ? "禁用" : "启用"} ${r.name}`}
-                />
-                <Button
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={`编辑 ${r.name}`}
-                  title="编辑 .mdc"
-                  onClick={() => void openEdit(r.name)}
-                >
-                  <Pencil />
-                </Button>
-                <Button
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={`删除 ${r.name}`}
-                  title="删除"
-                  className="text-muted-foreground hover:text-destructive"
-                  onClick={() => void handleDelete(r.name)}
-                >
-                  <Trash2 />
-                </Button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </CardContent>
@@ -330,7 +454,7 @@ export const RulesCard = () => {
   );
 };
 
-// ----------------- 新增 / 编辑 dialog -----------------
+// ----------------- 高级新建 / 编辑 dialog -----------------
 
 const RuleEditDialog = ({
   initialName,
@@ -355,7 +479,7 @@ const RuleEditDialog = ({
     <Dialog open onOpenChange={(o) => !o && onClose()} disablePointerDismissal>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{isNew ? "新增规则" : `编辑 ${initialName}`}</DialogTitle>
+          <DialogTitle>{isNew ? "高级新建规则" : `编辑 ${initialName}`}</DialogTitle>
         </DialogHeader>
         {isNew && (
           <div className="grid gap-1.5">

@@ -179,7 +179,7 @@ export const PreferenceSections = ({
       {/* 下面两个是「默认值」不是全局行为开关（用户点名歧义）——hint 说清只影响默认勾选 */}
       <SettingRow
         label="推进时默认续用当前 Agent"
-        hint="只是推进弹窗的默认勾选、每次推进仍可临时改"
+        hint="控制推进弹窗的默认勾选、每次推进可改"
         // 不绑 htmlFor：点标题就切开关误触率高（用户点名）、只有开关本体可点
         control={
           <Switch
@@ -191,7 +191,7 @@ export const PreferenceSections = ({
 
       <SettingRow
         label="新任务默认隔离工作区"
-        hint="只是新建任务时的默认勾选、每个任务仍可单独改；关掉 = 默认直接在原仓库运行"
+        hint="控制新建任务时的默认勾选、每个任务可单独改；关掉后默认直接在原仓库运行"
         control={
           <Switch
             checked={isolateWorktreeDefault}
@@ -208,7 +208,7 @@ export const PreferenceSections = ({
             占位符 <code className="font-mono">{"{storyId}"}</code>{" "}
             <code className="font-mono">{"{taskTitle}"}</code>{" "}
             <code className="font-mono">{"{date:MM-dd}"}</code>
-            ；可在仓库列表为单仓覆盖。预览：
+            ；预览：
             <code className="font-mono text-foreground/80">{preview}</code>
           </>
         }

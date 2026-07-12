@@ -25,11 +25,22 @@ export interface AppRuleEntry {
   description: string;
   alwaysApply: boolean;
   absPath: string;
+  /** 正文第一行非空行——列表主文字用（一句话规则直接看到内容） */
+  bodyPreview: string;
 }
 
 // rule 名 = 文件名：只允许安全字符、防路径穿越
 const isSafeRuleName = (name: string): boolean =>
   /^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5._-]{0,63}$/.test(name);
+
+/** 取正文第一行非空行（列表预览；空正文返空串） */
+const firstBodyLine = (body: string): string => {
+  for (const line of body.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t) return t;
+  }
+  return "";
+};
 
 // 扫一个目录下的 *.mdc → 条目列表（解析失败的 silent skip）
 const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
@@ -52,6 +63,7 @@ const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
           typeof data.description === "string" ? data.description.trim() : "",
         alwaysApply: data.alwaysApply === true,
         absPath: abs,
+        bodyPreview: firstBodyLine(parsed.content),
       });
     } catch {
       // 单文件坏了跳过
