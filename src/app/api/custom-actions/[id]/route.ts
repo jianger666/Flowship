@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions/[id]
  *   GET    → 单个自定义 action
- *   PATCH  → 更新（部分字段：label / summary / skill / output / extraSkills / freshAgent / placeholder）
+ *   PATCH  → 更新（部分字段：label / summary / skill / output / placeholder）
  *   DELETE → 删除
  *
  * Next.js 15 的 dynamic route params 是 Promise、要 await。
@@ -12,7 +12,6 @@ import {
   getCustomAction,
   removeCustomAction,
   sanitizeSkillName,
-  sanitizeSkills,
   updateCustomAction,
   type CustomActionInput,
 } from "@/lib/server/custom-action-fs";
@@ -66,15 +65,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     if ("output" in body) {
       // 空字符串 = 清空（updateCustomAction 内 trim 后归 undefined）
       patch.output = typeof body.output === "string" ? body.output : "";
-    }
-    if ("extraSkills" in body) {
-      // 空数组 = 清空附加 skill；sanitizeSkills 对空数组返 undefined、update 层认 undefined 为「显式清空」需区分
-      // 这里传 [] 让 updateCustomAction 的 patch.extraSkills !== undefined 分支走到清空
-      patch.extraSkills = sanitizeSkills(body.extraSkills) ?? [];
-    }
-    if ("freshAgent" in body) {
-      patch.freshAgent =
-        typeof body.freshAgent === "boolean" ? body.freshAgent : undefined;
     }
     if ("placeholder" in body) {
       // 空字符串 = 清空（updateCustomAction 内 trim 后归 undefined）

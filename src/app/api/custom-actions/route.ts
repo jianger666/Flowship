@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions
  *   GET  → 自定义 action 列表
- *   POST → 新建（body: { label, skill, summary?, output?, extraSkills?, freshAgent?, placeholder? }）
+ *   POST → 新建（body: { label, skill, summary?, output?, placeholder? }）
  *
  * 定义存 dataRoot()/custom-actions/<id>/ACTION.md（skill 挂载壳）、CRUD 归 custom-action-fs.ts。
  */
@@ -13,7 +13,6 @@ import {
   customActionsDir,
   listCustomActions,
   sanitizeSkillName,
-  sanitizeSkills,
 } from "@/lib/server/custom-action-fs";
 
 const isNonEmptyString = (v: unknown): v is string =>
@@ -48,9 +47,6 @@ export const POST = async (req: Request) => {
       summary: isNonEmptyString(body.summary) ? body.summary : undefined,
       // 多行产出要求：trim 后空则不写（跟 summary 同构）
       output: isNonEmptyString(body.output) ? body.output.trim() : undefined,
-      extraSkills: sanitizeSkills(body.extraSkills),
-      freshAgent:
-        typeof body.freshAgent === "boolean" ? body.freshAgent : undefined,
       placeholder: isNonEmptyString(body.placeholder)
         ? body.placeholder
         : undefined,

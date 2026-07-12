@@ -43,39 +43,50 @@ beforeEach(async () => {
 });
 
 describe("custom-action 新格式（skill 挂载壳）", () => {
-  it("创建 / 读取 / 更新：skill + extraSkills 落盘、正文为空", async () => {
+  it("创建 / 读取 / 更新：skill 落盘、正文为空", async () => {
     const created = await createCustomAction({
       label: "性能审计",
       skill: "perf-audit",
       summary: "扫一遍性能",
-      extraSkills: ["feishu-doc"],
-      freshAgent: true,
       placeholder: "贴页面 URL",
     });
     expect(created.id).toBeTruthy();
     expect(created.skill).toBe("perf-audit");
-    expect(created.extraSkills).toEqual(["feishu-doc"]);
     expect(created.output).toBeUndefined();
 
     const raw = await fs.readFile(
       path.join(TMP_ROOT, "custom-actions", created.id, "ACTION.md"),
       "utf-8",
     );
-    // frontmatter-only：正文不应再塞 playbook
+    // frontmatter-only：正文不应再塞 playbook；已删的壳配置字段不再写出
     expect(raw).toContain("skill: perf-audit");
-    expect(raw).toContain("extraSkills:");
+    expect(raw).not.toContain("extraSkills:");
+    expect(raw).not.toContain("freshAgent:");
     expect(raw).not.toMatch(/^## /m);
 
     const got = await getCustomAction(created.id);
     expect(got?.skill).toBe("perf-audit");
-    expect(got?.extraSkills).toEqual(["feishu-doc"]);
 
     const updated = await updateCustomAction(created.id, {
       skill: "perf-audit-v2",
-      extraSkills: [],
     });
     expect(updated.skill).toBe("perf-audit-v2");
-    expect(updated.extraSkills).toBeUndefined();
+  });
+
+  it("旧数据残留 extraSkills / freshAgent：解析忽略、不炸也不带出", async () => {
+    // 手写带旧字段的 ACTION.md（壳瘦身前的数据）、验证 parse 兼容
+    const dir = path.join(TMP_ROOT, "custom-actions", "old-fields");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "ACTION.md"),
+      `---\nlabel: 旧字段\nskill: some-skill\nextraSkills:\n  - feishu-doc\nfreshAgent: false\ncreatedAt: 1000\nupdatedAt: 1000\n---\n`,
+      "utf-8",
+    );
+    const def = await getCustomAction("old-fields");
+    expect(def?.skill).toBe("some-skill");
+    // 类型上已无这两个字段；运行时值也不该被带出
+    expect((def as unknown as Record<string, unknown>).extraSkills).toBeUndefined();
+    expect((def as unknown as Record<string, unknown>).freshAgent).toBeUndefined();
   });
 
   it("output 字段：多行读写往返、空串清掉、不写 frontmatter", async () => {
@@ -146,10 +157,9 @@ ${opts.playbook}
 
     const def = await getCustomAction("perf-audit");
     expect(def).not.toBeNull();
-    // 停用标记：skill 空串 + legacyPlaybook 带原文
+    // 停用标记：skill 空串 + legacyPlaybook 带原文（旧 skills 字段解析时忽略）
     expect(def!.skill).toBe("");
     expect(def!.legacyPlaybook).toContain("扫性能瓶颈");
-    expect(def!.extraSkills).toEqual(["feishu-doc"]);
 
     // 文件不动：playbook 还在正文、没被重写成壳
     const actionRaw = await fs.readFile(
@@ -257,7 +267,6 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
       skill: "export-me",
       summary: "简介",
       output: "要一份报告",
-      freshAgent: true,
       placeholder: "贴链接",
     });
 
@@ -310,6 +319,7 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
       JSON.stringify({
         label: "导入挂壳",
         output: "产出一份清单",
+        // 旧导出包残留字段：导入时应被静默忽略、不报错
         freshAgent: false,
         exportedAt: Date.now(),
       }),
@@ -321,7 +331,6 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     expect(r.action?.label).toBe("导入挂壳");
     expect(r.action?.skill).toBe("import-me");
     expect(r.action?.output).toBe("产出一份清单");
-    expect(r.action?.freshAgent).toBe(false);
     expect(r.actionError).toBeUndefined();
 
     await expect(
@@ -369,5 +378,31 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     const pack = path.join(TMP_ROOT, "import-pack", "no-skill-md");
     await fs.mkdir(pack, { recursive: true });
     await expect(importCustomActionBundle(pack)).rejects.toThrow(/SKILL\.md/);
+  });
+
+  it("导入：SKILL.md 缺 description → 报错", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "no-desc");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: no-desc\n---\n\n没 description\n`,
+      "utf-8",
+    );
+    await expect(importCustomActionBundle(pack)).rejects.toThrow(
+      /缺 description|格式不合法/,
+    );
+  });
+
+  it("导入：frontmatter name 与目录名不一致 → 报错", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "name-mismatch");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: other-name\ndescription: 名字对不上\n---\n\n正文\n`,
+      "utf-8",
+    );
+    await expect(importCustomActionBundle(pack)).rejects.toThrow(
+      /不一致/,
+    );
   });
 });

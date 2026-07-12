@@ -252,11 +252,11 @@ export const ActionLayoutConfig = ({
             isCustom={!isBuiltinAdvanceAction(key)}
             isHidden={hiddenSet.has(key)}
             isLegacy={isLegacy}
-            // 主 skill + 附加：knownSkills 没拉到（null）时不标缺失、避免加载中误报；
+            // 主 skill：knownSkills 没拉到（null）时不标缺失、避免加载中误报；
             // legacy 无挂载 skill（空串）、chips 不展示
             skills={
               def && !isLegacy
-                ? [def.skill, ...(def.extraSkills ?? [])].map((name) => ({
+                ? [def.skill].map((name) => ({
                     name,
                     missing: knownSkills !== null && !knownSkills.has(name),
                   }))

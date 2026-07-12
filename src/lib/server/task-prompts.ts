@@ -27,7 +27,6 @@ import {
   isWorktreeTask,
 } from "./task-worktrees";
 import {
-  listAvailableSkills,
   readSkillBodyByName,
   renderSkillsForPrompt,
   type SkillEntry,
@@ -126,17 +125,16 @@ export const loadActionPrompt = async (
   };
   // 自定义 action：主 skill 正文当 playbook（ACTION.md 只是挂载壳）、不走 prompts/action-*.md
   if (action.type === "custom") {
-    return loadCustomActionPlaybook(action, task, vars);
+    return loadCustomActionPlaybook(action, vars);
   }
   const tpl = await loadFileSafe(ACTION_PROMPT_FILE[action.type]);
   return fillTemplate(tpl, vars);
 };
 
-// 自定义 action 的 playbook 渲染：主 skill 的 SKILL.md 正文（填模板变量）+ 点名附加 skill。
-// 全量 skill 已在 super prompt 的可用 skills 段；主 skill 全文注入（内容就在那）、附加只点名让 agent 按需 read。
+// 自定义 action 的 playbook 渲染：主 skill 的 SKILL.md 正文（填模板变量）+ 产出要求 + git 边界。
+// 全量 skill 已在 super prompt 的可用 skills 段；主 skill 全文注入（内容就在那）。
 const loadCustomActionPlaybook = async (
   action: ActionRecord,
-  task: Task,
   vars: Record<string, string | undefined>,
 ): Promise<string> => {
   const def = action.customActionId
@@ -187,26 +185,6 @@ const loadCustomActionPlaybook = async (
       "- 动 git 前先 `git status` 确认工作区状态；有未提交改动且 playbook 没说怎么处理时、用 ask_user 问用户、不要自作主张丢弃。",
     ].join("\n"),
   );
-  if (def.extraSkills && def.extraSkills.length > 0) {
-    // skill 缺失兜底：附加引用可能悬空——本机没有的静默滤掉、不进 prompt
-    // repo 层 skill 已不进 [AVAILABLE_SKILLS]、点名行附 absPath 让 agent 能 read
-    const available = await listAvailableSkills(task.repoPaths ?? []);
-    const usable = def.extraSkills
-      .map((name) => available.get(name))
-      .filter((s): s is NonNullable<typeof s> => !!s);
-    if (usable.length > 0) {
-      parts.push(
-        "",
-        "## 本 action 重点使用以下 skill",
-        "（详情见上方可用 skills 段；仓库专属 skill 已附绝对路径、用 `read` 读取）：",
-        ...usable.map((s) =>
-          s.source === "repo"
-            ? `- ${s.name}（路径：${s.absPath}）`
-            : `- ${s.name}`,
-        ),
-      );
-    }
-  }
   return parts.join("\n");
 };
 

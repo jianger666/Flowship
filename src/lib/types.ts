@@ -356,7 +356,7 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   ship: false,
   learn: false,
   dev: false,
-  // 自定义 action 默认 fresh（跟 V0.6.27 全员默认 fresh 一致、各 custom 可在定义里覆盖）
+  // 自定义 action 恒走内置默认 fresh（跟 V0.6.27 全员默认 fresh 一致、定义里不再有开关）
   custom: true,
 };
 
@@ -372,9 +372,9 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
  * - summary：一句话简介（列表副标题、可选）
  * - skill：主 skill 名（必填、prompt 注入其 SKILL.md 正文）
  * - output：本 action 的产出要求（可选、多行；属壳参数、不进 skill——skill 可拆卸复用）
- * - extraSkills：附加参考 skill（可选；渲染 prompt 时点名「先 read」、本机没有的静默跳过）
- * - freshAgent：是否强起新 agent（默认 true、跟内置默认 fresh 一致）
  * - placeholder：推进弹窗输入框的提示文案（可选）
+ *
+ * 旧数据里残留的 extraSkills / freshAgent 字段（壳瘦身前的配置）解析时直接忽略。
  */
 export interface CustomActionDef {
   id: string;
@@ -384,8 +384,6 @@ export interface CustomActionDef {
   skill: string;
   /** 本 action 产出要求（可选）；空 / 未填时 prompt 走系统兜底结构 */
   output?: string;
-  extraSkills?: string[];
-  freshAgent?: boolean;
   placeholder?: string;
   /**
    * 旧格式残留（V0.9~v1.1 playbook 写在 ACTION.md 正文、无 skill 字段）：
@@ -581,7 +579,7 @@ export interface ActionRecord {
   /**
    * V0.9：自定义 action 指向的定义 id（仅 type="custom" 的 action 有）
    * - 指向 dataRoot()/custom-actions/<customActionId>/ACTION.md
-   * - runner 据此读主 skill 正文当 action prompt、按定义里的 skill/extraSkills/freshAgent 跑
+   * - runner 据此读主 skill 正文当 action prompt、按定义里的 skill / output 跑
    * - 不存 = 非 custom action（内置 6 个走 ACTION_PROMPT_FILE 文件）
    */
   customActionId?: string;

@@ -29,6 +29,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import { dataRoot } from "./data-root";
+import { enqueueMeegle } from "./meegle-queue";
 
 const execFileAsync = promisify(execFile);
 
@@ -245,7 +246,10 @@ const installLarkCli = async (log: (line: string) => void): Promise<void> => {
 const installMeegle = async (log: (line: string) => void): Promise<void> => {
   const { version, dist } = await fetchNpmLatestMeta("@lark-project/meegle");
   // 增量语义：已装且版本一致 → 跳过（同 installLarkCli）
-  const installed = await probeVersion(meegleBin(), { preferSubcommand: true });
+  // 版本探测走 meegle 串行队列，避免与看板 / auth status 并发撞凭据
+  const installed = await enqueueMeegle(() =>
+    probeVersion(meegleBin(), { preferSubcommand: true }),
+  );
   if (installed === version) {
     log(`meegle v${version} 已是最新、跳过`);
     return;
@@ -493,13 +497,24 @@ export const startLogin = async (
   } else {
     cmd = meegleBin();
     const host = opts.meegleHost?.trim() || "project.feishu.cn";
+    // config set/init 是短命调用 → 入 meegle 串行队列（防与看板探测并发撞凭据）
     try {
-      await execFileAsync(meegleBin(), ["config", "set", "host", host], { timeout: 15_000 });
+      await enqueueMeegle(() =>
+        execFileAsync(meegleBin(), ["config", "set", "host", host], {
+          timeout: 15_000,
+        }),
+      );
     } catch (err) {
-      // config.json 不存在时 set 可能失败、先 init 再 set
+      // config.json 不存在时 set 可能失败、先 init 再 set（整段仍在队列内串行）
       try {
-        await execFileAsync(meegleBin(), ["config", "init"], { timeout: 15_000 });
-        await execFileAsync(meegleBin(), ["config", "set", "host", host], { timeout: 15_000 });
+        await enqueueMeegle(async () => {
+          await execFileAsync(meegleBin(), ["config", "init"], {
+            timeout: 15_000,
+          });
+          await execFileAsync(meegleBin(), ["config", "set", "host", host], {
+            timeout: 15_000,
+          });
+        });
       } catch {
         state.running = false;
         state.error = `meegle host 配置失败：${err instanceof Error ? err.message : String(err)}`;
@@ -508,7 +523,9 @@ export const startLogin = async (
     }
     // 裸 auth login 走 Authorization Code flow、需要交互式浏览器回调——spawn 子进程
     // 环境跑不了（实测退出提示改用 device-code）。device-code flow 打印 verification
-    // URL、正好接我们的「抓 URL 自动开浏览器」逻辑
+    // URL、正好接我们的「抓 URL 自动开浏览器」逻辑。
+    // ⚠️ auth login 长驻交互进程不占队列槽：用户显式低频操作、会挂很久；
+    // 占槽会阻塞看板 / auth status 探测。短命调用（config / status / version）已入队。
     args = ["auth", "login", "--device-code", "--host", host];
   }
 
@@ -636,17 +653,25 @@ const probeLarkAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> 
   }
 };
 
-const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> => {
-  try {
-    // 官方文档：exit 0 = token 有效；1 = 未登录 / token 失效；2 = 网络不可达
-    await execFileAsync(meegleBin(), ["auth", "status"], { timeout: 15_000 });
-    return { loggedIn: true };
-  } catch (err) {
-    const e = err as { code?: number; stdout?: string };
-    const reason = typeof e.stdout === "string" ? e.stdout.match(/"reason":\s*"([^"]+)"/)?.[1] : undefined;
-    return { loggedIn: false, detail: reason ?? (e.code === 2 ? "网络不可达" : "未登录") };
-  }
-};
+const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> =>
+  // auth status 短命 → 入 meegle 串行队列（与 meegle-cli / 版本探测互斥）
+  enqueueMeegle(async () => {
+    try {
+      // 官方文档：exit 0 = token 有效；1 = 未登录 / token 失效；2 = 网络不可达
+      await execFileAsync(meegleBin(), ["auth", "status"], { timeout: 15_000 });
+      return { loggedIn: true };
+    } catch (err) {
+      const e = err as { code?: number; stdout?: string };
+      const reason =
+        typeof e.stdout === "string"
+          ? e.stdout.match(/"reason":\s*"([^"]+)"/)?.[1]
+          : undefined;
+      return {
+        loggedIn: false,
+        detail: reason ?? (e.code === 2 ? "网络不可达" : "未登录"),
+      };
+    }
+  });
 
 // 二进制文件是否存在（探测版本失败时的兜底判「已安装」）
 const binExists = async (p: string): Promise<boolean> =>
@@ -656,7 +681,10 @@ const binExists = async (p: string): Promise<boolean> =>
 const probeStatusNow = async (): Promise<StatusSnapshot> => {
   const [larkVer, meegleVer, larkOnDisk, meegleOnDisk] = await Promise.all([
     probeVersion(larkCliBin()),
-    probeVersion(meegleBin(), { preferSubcommand: true }),
+    // meegle 版本探测入串行队列；lark-cli 不动队列
+    enqueueMeegle(() =>
+      probeVersion(meegleBin(), { preferSubcommand: true }),
+    ),
     binExists(larkCliBin()),
     binExists(meegleBin()),
   ]);

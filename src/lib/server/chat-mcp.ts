@@ -561,7 +561,7 @@ const buildMcpServer = (): McpServer => {
         "- `label`：推进按钮显示名（必填）",
         "- `skill`：主 skill 名（必填、须已存在）",
         "- `output`：本 action 的产出要求（可选、多行）",
-        "- `summary` / `extra_skills` / `fresh_agent`（默认 true）/ `placeholder`：可选壳参数",
+        "- `summary` / `placeholder`：可选壳参数",
         "- 成功返回已创建的 action id + label；失败返回错误说明（如 skill 不存在）",
       ].join("\n"),
       inputSchema: {
@@ -585,31 +585,25 @@ const buildMcpServer = (): McpServer => {
           .string()
           .optional()
           .describe("一句话简介（列表副标题、可选）"),
-        extra_skills: z
-          .array(z.string().min(1))
-          .optional()
-          .describe("附加参考 skill 名列表（可选；本机没有的推进时静默跳过）"),
-        fresh_agent: z
-          .boolean()
-          .optional()
-          .describe(
-            "是否每次执行强起新 agent（默认 true、上下文干净；省略=true）",
-          ),
         placeholder: z
           .string()
           .optional()
           .describe("推进弹窗输入框的提示文案（可选）"),
       },
     },
-    async ({
-      label,
-      skill,
-      output,
-      summary,
-      extra_skills,
-      fresh_agent,
-      placeholder,
-    }) => {
+    async ({ label, skill, output, summary, placeholder }) => {
+      const labelTrimmed = label.trim();
+      // 防写出 label 空串僵尸目录（空白 / 纯空格）
+      if (!labelTrimmed) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "label 不能为空（trim 后须有实质内容）",
+            },
+          ],
+        };
+      }
       const skillName = skill.trim();
       // 查无此 skill → 返回错误文本让 AI 先建 skill（不抛、MCP 工具约定用 content 回传）
       const found = await findSkillByName(skillName);
@@ -625,16 +619,10 @@ const buildMcpServer = (): McpServer => {
       }
       try {
         const action = await createCustomAction({
-          label: label.trim(),
+          label: labelTrimmed,
           skill: skillName,
           output: output?.trim() || undefined,
           summary: summary?.trim() || undefined,
-          extraSkills:
-            extra_skills && extra_skills.length > 0
-              ? extra_skills.map((s) => s.trim()).filter(Boolean)
-              : undefined,
-          // 默认 true：自定义 action 通常要干净上下文；显式 false 才关
-          freshAgent: fresh_agent !== false,
           placeholder: placeholder?.trim() || undefined,
         });
         console.log(

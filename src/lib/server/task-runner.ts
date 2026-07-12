@@ -591,7 +591,7 @@ const advanceTaskInner = async (
   // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
   await assertNoUpdatePendingRestart();
 
-  // 自定义 action：提前读定义（拿 freshAgent 默认 + label 快照）。读不到不致命——
+  // 自定义 action：提前读定义（拿 label 快照）。读不到不致命——
   //   loadActionPrompt 会兜底提示、appendAction 的 customLabel 留空。
   const customDef =
     actionType === "custom" && customActionId
@@ -652,12 +652,9 @@ const advanceTaskInner = async (
   // V0.6.27 默认反转：每 action 默认起新 agent（context 截断是治跑偏的根、artifact 是唯一接力棒）。
   // 用户勾「续用当前 agent」（reuseAgent）才续接——除了 ACTION_FRESH_AGENT_DEFAULT 里 true 的
   // action（review = 换人复审铁律）、勾了也压不掉。
-  // 自定义 action 的 fresh 默认取定义里的 freshAgent（缺省回退 ACTION_FRESH_AGENT_DEFAULT.custom）
-  const actionFreshDefault =
-    customDef && typeof customDef.freshAgent === "boolean"
-      ? customDef.freshAgent
-      : ACTION_FRESH_AGENT_DEFAULT[actionType];
-  const effectiveForceNewAgent = !reuseAgent || actionFreshDefault;
+  // 自定义 action 恒走内置默认（ACTION_FRESH_AGENT_DEFAULT.custom、定义里不再有 freshAgent 开关）
+  const effectiveForceNewAgent =
+    !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[actionType];
 
   // V0.x：去掉手动「通过」按钮后、推进吸收认可——若当前 action 还在等 ack、推进时先隐式认可它。
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是

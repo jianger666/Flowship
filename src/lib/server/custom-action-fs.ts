@@ -4,7 +4,8 @@
  * 当前形态（用户拍板「自定义 action = skill 挂载壳」）：
  *   存 `dataRoot()/custom-actions/<id>/ACTION.md`（frontmatter-only、正文留空）：
  *   - frontmatter：label / summary / skill（主 skill）/ output（产出要求）/
- *     extraSkills / freshAgent / placeholder / createdAt / updatedAt
+ *     placeholder / createdAt / updatedAt
+ *   - 旧数据里残留的 extraSkills / freshAgent（壳瘦身前的配置）解析时忽略、不清写
  *   - 正文：空（playbook 内容已迁到对应 skill 的 SKILL.md）
  *   - id = 目录名（新建时按 label slug 化）
  *
@@ -25,7 +26,7 @@ import path from "node:path";
 import matter from "gray-matter";
 
 import { dataRoot } from "./data-root";
-import { findSkillByName, getAppSkillsDir } from "./skills-loader";
+import { findSkillByName, getAppSkillsDir, parseSkillFile } from "./skills-loader";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 
 // 对外 re-export、让 route 等调用方能从 fs 层一并拿到入参类型
@@ -59,6 +60,8 @@ const pathExists = async (p: string): Promise<boolean> =>
  * label → 目录名 / skill 名：保留中文与 `[a-z0-9._-]`，空白变 `-`，其余丢弃。
  * before：纯 ASCII slug、中文全丢 → 空串 → 随机 `custom-xxx`（难看）
  * after：「写代码」→「写代码」；撞名由调用方探 `-2/-3`；全空才回退随机
+ * 前导 `.` 剥掉：slugify(".env 清理") → "env-清理"；否则首字符 `.` 不过 isSafeId、
+ * genId 里 dirOf 会直接抛、用不了 fallback。
  */
 const slugify = (label: string): string =>
   label
@@ -67,31 +70,24 @@ const slugify = (label: string): string =>
     .replace(/\s+/g, "-")
     .replace(/[^a-z0-9\u4e00-\u9fa5._-]+/g, "")
     .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    .replace(/^[.-]+|[.-]+$/g, "") // 剥前导 / 尾随 `.` 与 `-`（id 不许以 `.` 开头）
     .slice(0, 48);
 
-// 生成唯一 action id：优先 label slug、撞名探 -2/-3、全丢时回退随机
+// 生成唯一 action id：优先 label slug、撞名探 -2/-3、全丢 / 非法时回退随机
 const genId = async (label: string): Promise<string> => {
   const slug = slugify(label);
   const fallback = `custom_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  if (!slug) return fallback;
+  if (!slug || !isSafeId(slug)) return fallback;
   for (let i = 0; i < 20; i += 1) {
     const candidate = i === 0 ? slug : `${slug}-${i + 1}`;
+    // 防御：拼后缀后万一仍非法 → 别调 dirOf（会抛）、直接回退
+    if (!isSafeId(candidate)) return fallback;
     const exists =
       (await pathExists(dirOf(candidate))) ||
       (await pathExists(legacyFileOf(candidate)));
     if (!exists) return candidate;
   }
   return fallback;
-};
-
-/** 清洗 skill 名数组（trim、去空）——读文件 / route 入参共用 */
-export const sanitizeSkills = (raw: unknown): string[] | undefined => {
-  if (!Array.isArray(raw)) return undefined;
-  const out = raw
-    .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
-    .map((s) => s.trim());
-  return out.length > 0 ? out : undefined;
 };
 
 /** 清洗单个必填 skill 名 */
@@ -113,13 +109,12 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
   const skill = sanitizeSkillName(data.skill);
   const playbook = parsed.content.trim();
   // 公共可选字段（新旧格式同构读取）
+  // 注：旧数据里的 extraSkills / freshAgent / skills（壳瘦身前的配置）在这里被忽略、不清写
   const common = {
     summary:
       typeof data.summary === "string" && data.summary.trim()
         ? data.summary.trim()
         : undefined,
-    extraSkills: sanitizeSkills(data.extraSkills) ?? sanitizeSkills(data.skills),
-    freshAgent: typeof data.freshAgent === "boolean" ? data.freshAgent : undefined,
     placeholder:
       typeof data.placeholder === "string" && data.placeholder.trim()
         ? data.placeholder.trim()
@@ -152,10 +147,6 @@ const serialize = (def: CustomActionDef): string => {
     skill: def.skill,
     // gray-matter 对多行字符串会用 YAML 字面量块、读写往返 OK
     ...(def.output ? { output: def.output } : {}),
-    ...(def.extraSkills && def.extraSkills.length > 0
-      ? { extraSkills: def.extraSkills }
-      : {}),
-    ...(typeof def.freshAgent === "boolean" ? { freshAgent: def.freshAgent } : {}),
     ...(def.placeholder ? { placeholder: def.placeholder } : {}),
     createdAt: def.createdAt,
     updatedAt: def.updatedAt,
@@ -265,17 +256,17 @@ export const getCustomAction = async (
 export const createCustomAction = async (
   input: CustomActionInput,
 ): Promise<CustomActionDef> => {
+  const label = input.label.trim();
+  if (!label) throw new Error("label 不能为空");
   const skill = input.skill.trim();
   if (!skill) throw new Error("skill 必填");
   const now = Date.now();
   const def: CustomActionDef = {
-    id: await genId(input.label.trim()),
-    label: input.label.trim(),
+    id: await genId(label),
+    label,
     summary: input.summary?.trim() || undefined,
     skill,
     output: input.output?.trim() || undefined,
-    extraSkills: input.extraSkills,
-    freshAgent: input.freshAgent,
     placeholder: input.placeholder?.trim() || undefined,
     createdAt: now,
     updatedAt: now,
@@ -314,17 +305,10 @@ export const updateCustomAction = async (
       patch.placeholder !== undefined
         ? patch.placeholder.trim() || undefined
         : existing.placeholder,
-    // 显式传 extraSkills（含空数组清掉）时用新值；没传保留原值
-    extraSkills:
-      patch.extraSkills !== undefined ? patch.extraSkills : existing.extraSkills,
     id: existing.id,
     createdAt: existing.createdAt,
     updatedAt: Date.now(),
   };
-  // 空数组归一成 undefined、序列化时不写字段
-  if (next.extraSkills && next.extraSkills.length === 0) {
-    next.extraSkills = undefined;
-  }
   await writeDef(next);
   return next;
 };
@@ -346,8 +330,6 @@ export interface ExportedActionMeta {
   label: string;
   summary?: string;
   output?: string;
-  extraSkills?: string[];
-  freshAgent?: boolean;
   placeholder?: string;
   exportedAt: number;
 }
@@ -409,12 +391,6 @@ export const exportCustomAction = async (
     label: def.label,
     ...(def.summary ? { summary: def.summary } : {}),
     ...(def.output ? { output: def.output } : {}),
-    ...(def.extraSkills && def.extraSkills.length > 0
-      ? { extraSkills: def.extraSkills }
-      : {}),
-    ...(typeof def.freshAgent === "boolean"
-      ? { freshAgent: def.freshAgent }
-      : {}),
     ...(def.placeholder ? { placeholder: def.placeholder } : {}),
     exportedAt: Date.now(),
   };
@@ -453,6 +429,24 @@ export const importCustomActionBundle = async (
     );
   }
 
+  // 导入前跑 skills-loader 同款解析：挂壳成功但运行时找不到 skill 的半残包直接拒
+  let parsed;
+  try {
+    parsed = await parseSkillFile(skillMd);
+  } catch {
+    throw new Error("SKILL.md 缺 description / 格式不合法");
+  }
+  if (!parsed) {
+    throw new Error("SKILL.md 缺 description / 格式不合法");
+  }
+  // frontmatter name 缺省时 parseSkillFile 会用父目录名兜底 → 与 skillName 一致；
+  // 显式写了别的 name → 与目录不一致，运行时按目录扫会找不到或指向错内容
+  if (parsed.name !== skillName) {
+    throw new Error(
+      `SKILL.md frontmatter name「${parsed.name}」与目录名「${skillName}」不一致`,
+    );
+  }
+
   const destSkillDir = path.join(getAppSkillsDir(), skillName);
   if (await pathExists(destSkillDir)) {
     throw new Error(`同名 skill 已存在：${skillName}`);
@@ -485,9 +479,7 @@ export const importCustomActionBundle = async (
           typeof meta.output === "string" && meta.output.trim()
             ? meta.output.trim()
             : undefined,
-        extraSkills: sanitizeSkills(meta.extraSkills),
-        freshAgent:
-          typeof meta.freshAgent === "boolean" ? meta.freshAgent : undefined,
+        // 旧导出包里的 extraSkills / freshAgent（壳瘦身前的字段）忽略
         placeholder:
           typeof meta.placeholder === "string" && meta.placeholder.trim()
             ? meta.placeholder.trim()

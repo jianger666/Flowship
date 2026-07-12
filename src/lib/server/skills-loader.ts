@@ -116,8 +116,9 @@ export const scanSkillsDir = async (rootDir: string): Promise<SkillEntry[]> => {
  *   - paths (optional): glob list、限定文件范围
  *
  * 缺失 name / description 视为非法 skill、return null
+ * export：importCustomActionBundle 导入前复用同一套校验
  */
-const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
+export const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
   const raw = await fs.readFile(absPath, "utf-8");
   const parsed = matter(raw);
   const data = parsed.data as Record<string, unknown>;
@@ -167,8 +168,9 @@ const parseSkillFile = async (absPath: string): Promise<SkillEntry | null> => {
  *
  * 不读 repo `.cursor/skills/`（SDK 已不加载 project 层；要用请导入到 app 自管）。
  *
- * 同名去重优先级：平台自带 > app 自管 > 全局 > 飞书 CLI
- * （自管是用户在本 app 里的显式配置、该压过跟 Cursor 共用的全局；平台 skill 是 fe 特定行为、不被顶掉）。
+ * 同名去重优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI
+ * （用户自建覆盖平台默认，与 findSkillByName / playbook 注入一致；平台 skill
+ * 如 action-creator 被同名自管 skill 顶掉属预期）。
  */
 /** 用户禁用的 skill 名单（v1.1.x 可关、settings.disabledSkills、按 name 记） */
 export const readDisabledSkills = async (): Promise<Set<string>> => {
@@ -197,11 +199,12 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   // V0.12：内置飞书 CLI 的官方 skills（<dataRoot>/tools/skills、一键安装时落盘）
   const feishuCli = await scanSkillsDir(getToolsSkillsDir());
   // 合并去重（后 set 的覆盖先 set 的、所以低优先级先放）
+  // 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（与 findSkillByName 一致）
   const byName = new Map<string, SkillEntry>();
   for (const s of feishuCli) byName.set(s.name, s);
   for (const s of global) byName.set(s.name, s);
-  for (const s of app) byName.set(s.name, s);
   for (const s of own) byName.set(s.name, s);
+  for (const s of app) byName.set(s.name, s);
   // v1.1.x：用户关掉的不注入（settings.disabledSkills、能力页 Skill tab 开关）
   const disabled = await readDisabledSkills();
   // 按 name 字母序、稳定输出顺序、方便 prompt 复用 / 调试 diff
@@ -211,52 +214,9 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
 };
 
 /**
- * 本机「可用 skill」全集：loadSkills（平台 + 全局）∪ 各绑定仓的 `.cursor/skills/`。
- *
- * 给自定义 action 的 extraSkills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
- * 定义可能引用了对方个人 / 仓库 skill——渲染前按这个集合静默过滤。
- *
- * settingSources:[] 后 repo 层不再注入 [AVAILABLE_SKILLS]，但 repo 自带 skill 仍是
- * 合法引用目标：返回结构带 absPath + source，点名段对 repo 命中附绝对路径让 agent read。
- */
-export type AvailableSkillSource = "loaded" | "repo";
-
-export interface AvailableSkillRef {
-  name: string;
-  absPath: string;
-  /** loaded = 已进 prompt 的平台/全局；repo = 仅仓库有、点名时需附路径 */
-  source: AvailableSkillSource;
-}
-
-export const listAvailableSkills = async (
-  repoPaths: string[],
-): Promise<Map<string, AvailableSkillRef>> => {
-  const map = new Map<string, AvailableSkillRef>();
-  for (const s of await loadSkills()) {
-    map.set(s.name, { name: s.name, absPath: s.absPath, source: "loaded" });
-  }
-  for (const repo of repoPaths) {
-    const entries = await scanSkillsDir(path.join(repo, ".cursor", "skills"));
-    for (const s of entries) {
-      // 已在 loaded 里的同名不覆盖（注入优先级更高、点名不必再附路径）
-      if (map.has(s.name)) continue;
-      map.set(s.name, { name: s.name, absPath: s.absPath, source: "repo" });
-    }
-  }
-  return map;
-};
-
-/** @deprecated 优先用 listAvailableSkills；保留 Set 形态给只关心名字的调用方 */
-export const listAvailableSkillNames = async (
-  repoPaths: string[],
-): Promise<Set<string>> => {
-  const map = await listAvailableSkills(repoPaths);
-  return new Set(map.keys());
-};
-
-/**
  * 按名找 skill（自定义 action 主 skill 注入用）。
- * 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（迁移写出的 skill 住 app、要压过同名全局）。
+ * 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（与 loadSkills 同名去重一致；
+ * 用户自建覆盖平台默认；迁移写出的 skill 住 app、要压过同名全局）。
  * 不走 disabledSkills 过滤——action 已显式挂载、关掉开关也不该让壳跑空。
  */
 export const findSkillByName = async (
