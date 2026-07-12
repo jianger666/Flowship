@@ -137,6 +137,11 @@ export const SkillsCard = () => {
       toast.error("先在设置页配好 API Key 和默认模型");
       return;
     }
+    // skill-creator 被关时 AI 拿不到 SKILL.md 规范、chip 也挂不上——提示而不是静默降级
+    if (s.disabledSkills?.includes("skill-creator")) {
+      toast.error("skill-creator skill 已被停用、先在列表里打开再用对话创建");
+      return;
+    }
     if (!appSkillsDir) {
       toast.error("skills 目录还没就绪、点「刷新」后重试");
       return;

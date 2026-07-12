@@ -185,6 +185,8 @@ export const RulesCard = () => {
       }
       setImportOpen(false);
       void refresh();
+    } catch (err) {
+      toast.error(`导入失败：${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setBusy(false);
     }
@@ -307,6 +309,8 @@ export const RulesCard = () => {
               toast.success(`已保存「${name}」`);
               setEditing(null);
               void refresh();
+            } catch (err) {
+              toast.error(`保存失败：${err instanceof Error ? err.message : String(err)}`);
             } finally {
               setBusy(false);
             }

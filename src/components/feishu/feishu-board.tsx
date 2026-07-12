@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/select";
 import { settingsUrl } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
+import { markShellContentReady } from "@/lib/shell-ready";
 import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
 
 // ---------- 类型（对齐 /api/feishu/board 返回） ----------
@@ -120,10 +121,16 @@ export const FeishuBoard = () => {
   const router = useRouter();
   // 数据（null = 首次还没回来）
   const [resp, setResp] = useState<BoardResp | null>(null);
+  // resp 的同步镜像（refresh 回调里做「手上是否有好数据」判断、不依赖闭包陈旧值）
+  const respRef = useRef<BoardResp | null>(null);
   // 刷新飞行中（顶部转圈、不清空已有数据）
   const [refreshing, setRefreshing] = useState(false);
   // 请求序号：旧请求晚到不覆盖新数据
   const seqRef = useRef(0);
+  // 瞬态失败静默重试余额（成功回满；见 refresh 里的护栏注释）
+  const retryLeftRef = useRef(2);
+  // refresh 的 ref 化（重试 timer 里调最新版、不把自己塞进依赖）
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
   // 选中空间（localStorage 记忆、首次 = 列表第一个）
   const [spaceKey, setSpaceKey] = useState<string | null>(() => {
     try {
@@ -148,7 +155,14 @@ export const FeishuBoard = () => {
   useEffect(() => {
     try {
       const cached = localStorage.getItem(`${CACHE_KEY}.${spaceKey ?? ""}`);
-      if (cached) setResp(JSON.parse(cached) as BoardResp);
+      if (cached) {
+        const parsed = JSON.parse(cached) as BoardResp;
+        // 只吃 ok 缓存：老版本写过 not_authed / error 进缓存、首屏会闪降级引导
+        if (parsed.status === "ok") {
+          respRef.current = parsed;
+          setResp(parsed);
+        }
+      }
     } catch {
       /* 缓存坏了忽略 */
     }
@@ -164,12 +178,29 @@ export const FeishuBoard = () => {
       qs.set("to", String(range.to));
       const r = await fetch(`/api/feishu/board?${qs.toString()}`);
       const data = (await r.json()) as BoardResp;
-      try {
-        localStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
-      } catch {
-        /* 超配额忽略 */
+      // 只缓存 ok 响应——升级重启后 CLI 冷启动的瞬态失败若写进跨重启缓存、
+      // 下次启动首屏直接渲降级态（用户实测「升级完授权像没检测到」的元凶之一）
+      if (data.status === "ok") {
+        try {
+          localStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
+        } catch {
+          /* 超配额忽略 */
+        }
       }
       if (seq === seqRef.current) {
+        // 瞬态失败护栏：手上有好数据（缓存秒开的旧看板）时、这轮刷新失败不清屏成
+        // 降级引导（升级重启后 CLI 冷启动首拉常瞬态挂、看板被闪成「去授权」踩过）——
+        // 保留旧看板、5s 后静默重试（最多 2 次、之后才认输渲降级态）
+        const prev = respRef.current;
+        if (data.status !== "ok" && prev?.status === "ok" && retryLeftRef.current > 0) {
+          retryLeftRef.current -= 1;
+          setTimeout(() => {
+            if (seq === seqRef.current) void refreshRef.current?.();
+          }, 5_000);
+          return;
+        }
+        if (data.status === "ok") retryLeftRef.current = 2;
+        respRef.current = data;
         setResp(data);
         // 没选过空间：默认列表第一个（触发下一轮带 project 的拉取）
         if (!spaceKey && data.status === "ok" && (data.projects?.length ?? 0) > 0) {
@@ -178,10 +209,21 @@ export const FeishuBoard = () => {
       }
     } catch (err) {
       if (seq === seqRef.current) {
-        setResp({
-          status: "error",
-          message: err instanceof Error ? err.message : String(err),
-        });
+        // fetch 本身挂（网络 / server 短暂不可达）走同一护栏：有好数据不清屏、静默重试
+        const prev = respRef.current;
+        if (prev?.status === "ok" && retryLeftRef.current > 0) {
+          retryLeftRef.current -= 1;
+          setTimeout(() => {
+            if (seq === seqRef.current) void refreshRef.current?.();
+          }, 5_000);
+        } else {
+          const failed: BoardResp = {
+            status: "error",
+            message: err instanceof Error ? err.message : String(err),
+          };
+          respRef.current = failed;
+          setResp(failed);
+        }
       }
     } finally {
       if (seq === seqRef.current) setRefreshing(false);
@@ -189,6 +231,7 @@ export const FeishuBoard = () => {
   }, [spaceKey, range]);
 
   useEffect(() => {
+    refreshRef.current = refresh;
     void refresh();
   }, [refresh]);
 
@@ -211,6 +254,18 @@ export const FeishuBoard = () => {
   const items = useMemo(() => resp?.items ?? [], [resp]);
   // 空间列表：project search 全量（V0.14.1、不再从数据聚合——mywork 覆盖不全踩过）
   const spaces = resp?.projects ?? [];
+
+  // 首启没记忆空间时、第一轮响应只是占位（仅 projects、items 空）——随即自动选
+  // 第一个空间触发真拉取；这个中间态不算内容就绪、也不渲空甘特
+  const pickingSpace =
+    resp?.status === "ok" && !spaceKey && (resp.projects?.length ?? 0) > 0;
+
+  // 开屏一屏到底（v1.1.x）：真实内容（看板 / 降级引导）渲出来才通知壳收 splash——
+  // resp 到了（含缓存秒开）且不再是「纯 loading / 占位」态即算
+  const contentReady = resp !== null && !pickingSpace && !(refreshing && items.length === 0);
+  useEffect(() => {
+    if (contentReady) markShellContentReady();
+  }, [contentReady]);
 
   const handlePickSpace = useCallback((key: string) => {
     setSpaceKey(key);
@@ -257,7 +312,7 @@ export const FeishuBoard = () => {
   // ---------- 首拉 loading：整区居中（不带看板头部行）----------
   // 位置跟首页 gate 的 hero 完全重合——原来 loading 在头部行下方的 flex-1 里、
   // 中心比 gate loading 低一截、启动链三段 loading 逐级往下跳（用户实测「不断往下抖」）
-  if (resp === null || (refreshing && items.length === 0)) {
+  if (resp === null || pickingSpace || (refreshing && items.length === 0)) {
     return <LoadingState variant="hero" immediate />;
   }
 

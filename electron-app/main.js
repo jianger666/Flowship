@@ -381,9 +381,11 @@ const createSplashWindow = (dark, st) => {
   });
   if (st?.maximized) splashWindow.maximize();
   splashWindow.on("closed", () => {
+    log("[main] splash 窗已关");
     splashWindow = null;
   });
   void splashWindow.loadURL(splashUrl(dark));
+  log("[main] splash 窗已建");
 };
 const closeSplashWindow = () => {
   if (!splashWindow) return;
@@ -394,6 +396,19 @@ const closeSplashWindow = () => {
   }
   splashWindow = null;
 };
+
+// 亮主窗 + 收 splash（幂等）：页面 `app-content-ready` IPC / 兜底 timer 都走这
+let mainRevealed = false;
+const revealMainWindow = (source) => {
+  if (mainRevealed) return;
+  mainRevealed = true;
+  log(`[main] reveal 主窗（source=${source ?? "?"}）`);
+  if (mainWindow && !mainWindow.isVisible()) mainWindow.show();
+  closeSplashWindow();
+};
+
+// 页面首页真实内容渲出来（看板 / 就绪清单）→ 此刻切换、启动全程一屏 splash 到底
+ipcMain.on("app-content-ready", () => revealMainWindow("page-ipc"));
 
 // ---------- mac 改名自迁移（v1.1.x「Flowship」改名收尾） ----------
 //
@@ -483,12 +498,9 @@ const createWindow = async () => {
     },
   });
   if (st?.maximized) mainWindow.maximize();
-  // 页面首次真渲出来才亮主窗 + 收 splash（先亮后收、不触发 window-all-closed）——
-  // 「开屏 loading 直接到底」、中途没有任何可见的文档切换闪烁
-  mainWindow.once("ready-to-show", () => {
-    mainWindow?.show();
-    closeSplashWindow();
-  });
+  // v1.1.x「开屏一屏到底」（用户拍板）：ready-to-show（首帧、可能还是页内 loading）
+  // 不亮窗——等页面 IPC `app-content-ready`（首页真实内容渲出来：看板 / 就绪清单）
+  // 才亮主窗 + 收 splash；见 revealMainWindow / whenReady 里的兜底 timer
   mainWindow.on("close", () => void saveWindowState());
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -1092,11 +1104,10 @@ if (!app.requestSingleInstanceLock()) {
       // 等待期间用户可能已手动关窗（关 splash = 全窗关闭 = 走退出流程）
       if (mainWindow) {
         await mainWindow.loadURL(BASE_URL);
-        // 兜底：个别加载路径 ready-to-show 不触发（缓存页等）——加载完成还没亮就直接亮
-        if (mainWindow && !mainWindow.isVisible()) {
-          mainWindow.show();
-          closeSplashWindow();
-        }
+        // 兜底：页面没调 app-content-ready（老缓存页 / 页面异常 / 直落非首页路由）
+        // 也不能永远黑着——加载完成 8s 内没收到信号就强制亮
+        log("[main] loadURL 完成、等页面 content-ready（8s 兜底）");
+        setTimeout(() => revealMainWindow("timeout"), 8_000);
       }
     } else {
       closeSplashWindow();

@@ -98,6 +98,11 @@ const ActionsPanel = () => {
       toast.error("先在设置页配好 API Key 和默认模型");
       return;
     }
+    // action-creator 被关时 AI 拿不到 ACTION.md 规范、chip 也挂不上——提示而不是静默降级
+    if (s.disabledSkills?.includes("action-creator")) {
+      toast.error("action-creator skill 已被停用、先在 Skill tab 打开再用 AI 帮建");
+      return;
+    }
     if (!actionsDir) {
       toast.error("存储目录还没就绪、稍后重试");
       return;

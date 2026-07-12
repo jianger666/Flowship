@@ -147,6 +147,20 @@ const loadCustomActionPlaybook = async (
     }、可能已在 /actions 页删除。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明定义缺失。）`;
   }
   const parts = [fillTemplate(def.playbook, vars)];
+  // v1.1.x（同事「版本回滚 action 切不了分支」实测踩过）：自定义 action 的 git 边界说明——
+  // 内置 action 有严格 git 分工（build 不碰 git / ship 才推送）、自定义的以 playbook 为准；
+  // 隔离工作区（git worktree）下「已被其它工作区检出的分支」不能直接 checkout（git 硬限制）、
+  // 必须教 agent 用「新建分支」绕、否则报 already checked out 就卡死
+  parts.push(
+    [
+      "",
+      "## git 操作边界（自定义 action 通用）",
+      "- 内置 action 对 git 有严格分工、但**本自定义 action 以上面的 playbook 为准**：playbook 明确要求的 git 操作（切分支 / 建分支 / revert / commit / push）可以执行。",
+      "- 硬红线仍然生效（hook 会拦）：force push、`reset --hard`、`rebase`、`clean -f`。",
+      "- 若当前在隔离工作区（git worktree）：**已被原仓库或其它任务检出的分支不能直接 `git checkout`**（git 会报 already checked out）——需要基于某分支 / tag / commit 工作时、用 `git checkout -b <新分支名> <起点>`（例：`git checkout -b revert/v1.2.3 origin/master`）新建分支再操作。",
+      "- 动 git 前先 `git status` 确认工作区状态；有未提交改动且 playbook 没说怎么处理时、用 ask_user 问用户、不要自作主张丢弃。",
+    ].join("\n"),
+  );
   if (def.skills && def.skills.length > 0) {
     // v0.9.14 skill 缺失兜底：定义可能是别人导出的、引用了对方个人 skill——
     // 本机（平台 + 全局 + 绑定仓 repo 层）不存在的名字静默滤掉、不进 prompt、

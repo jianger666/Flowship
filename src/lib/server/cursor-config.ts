@@ -210,13 +210,15 @@ const readDisabledRules = async (): Promise<Set<string>> => {
   }
 };
 
-// 扫一个 rules 目录：按 alwaysApply 分「全文注入 / 按需 index」两堆（可按名单跳过）
+// 扫一个 rules 目录：按 alwaysApply 分「全文注入 / 按需 index」两堆（可按名单跳过）；
+// names = 实际收进来的规则名（调用方做跨目录同名去重用）
 const collectRulesFromDir = async (
   rulesDir: string,
   skip?: Set<string>,
-): Promise<{ always: string[]; indexed: string[] }> => {
+): Promise<{ always: string[]; indexed: string[]; names: Set<string> }> => {
   const always: string[] = [];
   const indexed: string[] = [];
+  const names = new Set<string>();
   let files: string[];
   try {
     const entries = await fs.readdir(rulesDir, { withFileTypes: true });
@@ -225,7 +227,7 @@ const collectRulesFromDir = async (
       .map((e) => path.join(rulesDir, e.name))
       .sort();
   } catch {
-    return { always, indexed };
+    return { always, indexed, names };
   }
   for (const file of files) {
     const ruleName = path.basename(file, path.extname(file));
@@ -242,11 +244,12 @@ const collectRulesFromDir = async (
       } else {
         indexed.push(`- ${desc || path.basename(file)}（按需读 \`${file}\`）`);
       }
+      names.add(ruleName);
     } catch {
       // 单文件解析失败、跳过、不让整段炸
     }
   }
-  return { always, indexed };
+  return { always, indexed, names };
 };
 
 /**
@@ -256,6 +259,8 @@ const collectRulesFromDir = async (
  * - 其余（globs / description 触发）→ 列 index（desc + 绝对路径）、agent 命中场景再 `read`
  * - app 自管 rules（v1.1.x Rules tab）可被 settings.disabledRules 关掉；Cursor 全局的
  *   不受此名单影响（那是用户在 Cursor 里管的、要关去 Cursor 删）
+ * - **同名去重（导入 Cursor 规则后两目录各一份）**：启用中的 app 副本优先、Cursor
+ *   同名原件跳过；app 副本被关掉时回落到 Cursor 原件（分层语义：关的是 app 这份）
  * - 无 rules → 返空提示串
  *
  * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）。
@@ -263,9 +268,15 @@ const collectRulesFromDir = async (
 export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
   const NONE = "（无全局规则）";
 
+  // 先收 app 自管 rules（能力页 Rules tab、可关）——拿到启用名单做同名去重
+  const appGot = await collectRulesFromDir(
+    getAppRulesDir(),
+    await readDisabledRules(),
+  );
+
   const always: string[] = [];
   const indexed: string[] = [];
-  // 全局 Cursor rules（多候选目录取第一个存在的）
+  // 全局 Cursor rules（多候选目录取第一个存在的）；跳过已被 app 启用副本覆盖的同名
   for (const dir of getGlobalCursorDirs()) {
     const candidate = path.join(dir, "rules");
     try {
@@ -274,16 +285,11 @@ export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
     } catch {
       continue;
     }
-    const got = await collectRulesFromDir(candidate);
+    const got = await collectRulesFromDir(candidate, appGot.names);
     always.push(...got.always);
     indexed.push(...got.indexed);
     break;
   }
-  // app 自管 rules（能力页 Rules tab、可关）
-  const appGot = await collectRulesFromDir(
-    getAppRulesDir(),
-    await readDisabledRules(),
-  );
   always.push(...appGot.always);
   indexed.push(...appGot.indexed);
 

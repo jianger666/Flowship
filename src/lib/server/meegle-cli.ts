@@ -56,8 +56,14 @@ const runMeegle = async (args: string[]): Promise<unknown> => {
     if (/not logged in|no local token|auth login|unauthorized|401/i.test(text)) {
       throw new MeegleError("not_authed", "meegle 未登录、请先在设置页授权");
     }
-    // 未登录时动态命令未注册、报 unknown command——同样按未登录处理
+    // 未登录时动态命令未注册、报 unknown command——但升级 / 重启后 CLI 冷启动、
+    // 命令集加载慢也会瞬态报同样的错（用户实测「升级完首屏授权像没检测到」）：
+    // 用静态命令 auth status 复核、真没登录才报 not_authed、登录着算瞬态错误
     if (/unknown command/i.test(text)) {
+      const st = await meegleAuthStatus();
+      if (st.authenticated) {
+        throw new MeegleError("error", "meegle 命令集尚未就绪、请稍后重试");
+      }
       throw new MeegleError("not_authed", "meegle 未登录（命令集未加载）、请先在设置页授权");
     }
     throw new MeegleError("error", (e.stderr || e.message || "meegle 调用失败").slice(0, 500));
@@ -271,19 +277,27 @@ export const fetchWorkitemDetail = async (
 
 // ---------- 当前用户（子任务「只看自己」过滤用） ----------
 
-// user me 缓存（user_key 不会变、进程级缓存即可）
-let meCache: string | null | undefined;
+// user me 缓存（user_key 不会变、进程级缓存即可）——**只缓存成功结果**：
+// v1.1.x 修（用户实测「升级重启后首屏授权像没检测到」的隐患之一）：原来失败也缓存 null、
+// server 冷启动首拉赶上 CLI 慢 / 网络抖一次、看板就永远 not_authed 到进程重启
+let meCache: string | undefined;
 
-/** 当前登录用户的 user_key（实测 user me 返回 { user_key, name_cn, ... }）；拿不到返 null */
+/**
+ * 当前登录用户的 user_key（实测 user me 返回 { user_key, name_cn, ... }）。
+ * 真·未登录返 null；**瞬态失败（超时 / 网络抖）原样抛**——调用方（board route）
+ * 会按 error 态渲染「重试」、而不是误导性的「去授权」（升级重启后冷启动踩过）
+ */
 export const fetchMyUserKey = async (): Promise<string | null> => {
   if (meCache !== undefined) return meCache;
   try {
     const resp = (await runMeegle(["user", "me"])) as Record<string, unknown>;
-    meCache = asStr(resp.user_key) ?? null;
-  } catch {
-    meCache = null;
+    const key = asStr(resp.user_key);
+    if (key) meCache = key;
+    return key ?? null;
+  } catch (err) {
+    if (err instanceof MeegleError && err.kind === "not_authed") return null;
+    throw err;
   }
-  return meCache;
 };
 
 // ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------

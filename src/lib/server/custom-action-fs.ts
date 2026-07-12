@@ -129,10 +129,21 @@ const writeDef = async (def: CustomActionDef): Promise<void> => {
 
 // 老平铺文件 → 目录布局的一次性搬迁（读到旧文件时调、幂等）：
 // `<id>.md` → `<id>/ACTION.md`、内容原样、id 不变（引用它的 actionLayout / 任务历史都不受影响）
+// ⚠️ 目录版已存在（半迁移残留 / 并发窗口里刚被编辑过）时**不覆盖**、只清旧平铺文件——
+// 否则会用旧内容静默回退用户编辑
 const migrateLegacyFile = async (id: string, raw: string): Promise<void> => {
   try {
-    await fs.mkdir(dirOf(id), { recursive: true });
-    await fs.writeFile(fileOf(id), raw, "utf-8");
+    let dirVersionExists = false;
+    try {
+      await fs.access(fileOf(id));
+      dirVersionExists = true;
+    } catch {
+      /* 目录版不存在、正常迁移 */
+    }
+    if (!dirVersionExists) {
+      await fs.mkdir(dirOf(id), { recursive: true });
+      await fs.writeFile(fileOf(id), raw, "utf-8");
+    }
     await fs.rm(legacyFileOf(id), { force: true });
     console.log(`[custom-action-fs] 已迁移到目录布局：${id}`);
   } catch (err) {
@@ -152,20 +163,26 @@ export const listCustomActions = async (): Promise<CustomActionDef[]> => {
     return [];
   }
   const defs: CustomActionDef[] = [];
+  // 先扫目录版（新布局权威）、再扫平铺版——半迁移残留时两者同 id 并存、
+  // 目录版优先、平铺条目跳过 push（只触发清理）、防列表重复 id
+  const seen = new Set<string>();
   for (const ent of entries) {
     // 新布局：<id>/ACTION.md
-    if (ent.isDirectory()) {
-      const id = ent.name;
-      if (!isSafeId(id)) continue;
-      try {
-        const raw = await fs.readFile(path.join(dir, id, "ACTION.md"), "utf-8");
-        const def = parseDef(id, raw);
-        if (def) defs.push(def);
-      } catch {
-        // 没有 ACTION.md 的目录（半截 / 无关）跳过
+    if (!ent.isDirectory()) continue;
+    const id = ent.name;
+    if (!isSafeId(id)) continue;
+    try {
+      const raw = await fs.readFile(path.join(dir, id, "ACTION.md"), "utf-8");
+      const def = parseDef(id, raw);
+      if (def) {
+        defs.push(def);
+        seen.add(id);
       }
-      continue;
+    } catch {
+      // 没有 ACTION.md 的目录（半截 / 无关）跳过
     }
+  }
+  for (const ent of entries) {
     // 旧布局：<id>.md → 读出来 + 顺手迁移成目录
     if (!ent.isFile() || !ent.name.endsWith(".md")) continue;
     const id = ent.name.slice(0, -3);
@@ -174,7 +191,7 @@ export const listCustomActions = async (): Promise<CustomActionDef[]> => {
       const raw = await fs.readFile(path.join(dir, ent.name), "utf-8");
       const def = parseDef(id, raw);
       if (def) {
-        defs.push(def);
+        if (!seen.has(id)) defs.push(def);
         await migrateLegacyFile(id, raw);
       }
     } catch (err) {
