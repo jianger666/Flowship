@@ -217,7 +217,8 @@ export const buildSuperPrompt = async (
     replanDirective?: string;
   },
   /**
-   * 飞书项目推导的「用户身份」行（调用方 await resolveUserIdentityForPrompt 后传入）。
+   * 飞书 / 设置推导的「用户身份」行（调用方 await resolveUserIdentityForPrompt 后传入）。
+   * 有则插入「任务基本信息」；空串整行不注入。
    * 已含 `- 发起人：…` 前缀；空串 = 未登录 / 查不到、整行不注入（不塞「（未提供）」）。
    * 故意不在本函数里打 meegle——保持纯拼装、网络失败不堵模板渲染。
    */

@@ -18,12 +18,13 @@
  * 数据 schema 看 src/lib/types.ts
  */
 
-import { JUMP_IDES } from "./types";
+import { JUMP_IDES, USER_ROLES } from "./types";
 import type {
   ActionLayoutPref,
   FeAiFlowSettings,
   ModelSelection,
   ModelUsageEntry,
+  UserRole,
 } from "./types";
 
 const KEY = "fe-ai-flow:settings";
@@ -168,6 +169,10 @@ const normalizeSettings = (
           (e) => e && typeof e.id === "string" && typeof e.count === "number",
         )
       : [],
+    // 我的角色：枚举外 / 缺省 → undefined（首页就绪清单据此判定未选）
+    userRole: USER_ROLES.includes(parsed.userRole as UserRole)
+      ? (parsed.userRole as UserRole)
+      : undefined,
   };
 };
 

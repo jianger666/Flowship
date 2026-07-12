@@ -439,12 +439,6 @@ const SkillGroups = ({
           {s.description}
         </div>
       </div>
-      {/* v1.1.x 可关：所有来源都能关（按 name 记禁用、不注入 + slash 菜单不出） */}
-      <Switch
-        checked={s.enabled}
-        onCheckedChange={(v) => onToggle(s.name, v)}
-        aria-label={`${s.enabled ? "禁用" : "启用"} ${s.name}`}
-      />
       {s.editable ? (
         <>
           <Button
@@ -479,6 +473,12 @@ const SkillGroups = ({
           <Eye />
         </Button>
       )}
+      {/* 开关放行尾：操作按钮在前、启停最后（跟 Rules / MCP 列表对齐） */}
+      <Switch
+        checked={s.enabled}
+        onCheckedChange={(v) => onToggle(s.name, v)}
+        aria-label={`${s.enabled ? "禁用" : "启用"} ${s.name}`}
+      />
     </div>
   );
 

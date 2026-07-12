@@ -276,11 +276,6 @@ export const RulesCard = () => {
                       {r.name}
                     </div>
                   </div>
-                  <Switch
-                    checked={r.enabled}
-                    onCheckedChange={(v) => void handleToggle(r.name, v)}
-                    aria-label={`${r.enabled ? "禁用" : "启用"} ${r.name}`}
-                  />
                   <Button
                     size="icon-xs"
                     variant="ghost"
@@ -300,6 +295,12 @@ export const RulesCard = () => {
                   >
                     <Trash2 />
                   </Button>
+                  {/* 开关放行尾：操作按钮在前（跟 Skills / MCP 列表对齐） */}
+                  <Switch
+                    checked={r.enabled}
+                    onCheckedChange={(v) => void handleToggle(r.name, v)}
+                    aria-label={`${r.enabled ? "禁用" : "启用"} ${r.name}`}
+                  />
                 </div>
               );
             })}

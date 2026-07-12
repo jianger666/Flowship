@@ -312,6 +312,8 @@ const SettingsPage = () => {
               <PreferenceSections
                 jumpIde={settings.jumpIde ?? "cursor"}
                 onJumpIdeChange={(v) => saveFieldValue("jumpIde", v)}
+                userRole={settings.userRole}
+                onUserRoleChange={(v) => saveFieldValue("userRole", v)}
                 branchTemplate={settings.branchTemplate ?? ""}
                 onBranchTemplateChange={(v) => update("branchTemplate", v)}
                 onBranchTemplateCommit={(v) => saveFieldValue("branchTemplate", v)}

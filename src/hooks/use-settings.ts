@@ -192,6 +192,7 @@ export const useSettings = (): UseSettingsResult => {
       repos: !isFieldEqual("repos", settings, savedSettings),
       jumpIde: !isFieldEqual("jumpIde", settings, savedSettings),
       submitShortcut: !isFieldEqual("submitShortcut", settings, savedSettings),
+      userRole: !isFieldEqual("userRole", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
       gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),

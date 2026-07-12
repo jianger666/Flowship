@@ -1560,10 +1560,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         console.error("[task-runner] loadSkills failed", err);
         return [] as SkillEntry[];
       });
-      // 飞书项目推导发起人姓名 + 本需求角色（失败返空串、不堵启动）
-      const userIdentityLine = await resolveUserIdentityForPrompt(
-        task.feishuStoryUrl,
-      );
+      // 飞书项目推导发起人姓名 + 设置页角色（失败返空串、不堵启动）
+      const userIdentityLine = await resolveUserIdentityForPrompt();
       const superPrompt = await buildSuperPrompt(
         task,
         skills,

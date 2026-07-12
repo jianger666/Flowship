@@ -135,6 +135,18 @@ export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
 
 export type SubmitShortcut = "mod-enter" | "enter";
 
+/** 用户在设置页选的角色（身份注入视角锚点、解锁对应辅助能力） */
+export type UserRole = "fe" | "be" | "qa" | "other";
+
+export const USER_ROLES: readonly UserRole[] = ["fe", "be", "qa", "other"];
+
+export const USER_ROLE_LABEL: Record<UserRole, string> = {
+  fe: "前端",
+  be: "后端",
+  qa: "测试",
+  other: "其它",
+};
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
@@ -142,6 +154,11 @@ export interface FeAiFlowSettings {
   jumpIde?: JumpIde;
   /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */
   submitShortcut?: SubmitShortcut;
+  /**
+   * 我的角色（设置页偏好 / 首页就绪清单必填）。
+   * 注入 prompt「用户身份」行视角锚点；未设时 adaptive 按任务性质判定。
+   */
+  userRole?: UserRole;
   /**
    * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
    * 留空则从仓库 remote 自动推导、可选手动覆盖

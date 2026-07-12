@@ -3,13 +3,12 @@
 /**
  * 首页「开始使用」就绪清单（v1.0.x、用户拍板「保证新用户进来就去配置安装飞书工具」）
  *
- * 三项就绪度：① Cursor API Key ② 飞书工具（两个 CLI 装好 + 登录）③ 至少一个仓库。
+ * 四项就绪度：① Cursor API Key ② 飞书工具 ③ 至少一个仓库 ④ 我的角色。
  * 任一未完成 → 首页看板位置显示本清单；全部就绪 → 自动消失、首页变正常飞书排期看板。
  * 已配好的老用户永远看不到这张卡。
  *
- * 形态（用户实测后简化）：单卡三行、每行 = 状态勾 + 标题 + 「去配置」跳设置页对应卡——
- * 配置本体都在设置页（仓库要配分支等、行内塞不下）、清单只做状态 + 引导。
- * 不做开屏向导（wizard）：向导能跳过、跳过就再也不出现；清单配不完每次打开都在。
+ * 形态：单卡多行、多数行 = 状态勾 + 标题 + 「去配置」跳设置页；
+ * 「我的角色」行内嵌 ChoiceButton chip 直接点选落盘、无需跳设置页。
  */
 
 import { useEffect, useState } from "react";
@@ -17,9 +16,15 @@ import Link from "next/link";
 import { ArrowRight, CheckCircle2, Circle } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import { buttonVariants } from "@/components/ui/button";
 import { useSettings } from "@/hooks/use-settings";
 import { settingsUrl } from "@/lib/settings-link";
+import {
+  USER_ROLE_LABEL,
+  USER_ROLES,
+  type UserRole,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // /api/system/feishu-cli 的状态形状（跟 feishu-cli-card 同源、这里只取就绪判定要的字段）
@@ -31,11 +36,12 @@ interface FeishuCliStatus {
 export interface SetupGate {
   /** 首次判定中（配置 + CLI 状态都没拉到前、别闪清单也别闪看板） */
   loading: boolean;
-  /** 三项全就绪 */
+  /** 四项全就绪 */
   ready: boolean;
   apiKeyReady: boolean;
   feishuReady: boolean;
   reposReady: boolean;
+  roleReady: boolean;
 }
 
 /**
@@ -51,6 +57,7 @@ export const useSetupGate = (): SetupGate => {
 
   const apiKeyReady = loaded && !!settings.apiKey?.trim();
   const reposReady = loaded && settings.repos.length > 0;
+  const roleReady = loaded && !!settings.userRole;
   const feishuReady =
     !!cli &&
     cli.larkCli.installed &&
@@ -81,10 +88,11 @@ export const useSetupGate = (): SetupGate => {
 
   return {
     loading: !loaded || !cliLoaded,
-    ready: apiKeyReady && feishuReady && reposReady,
+    ready: apiKeyReady && feishuReady && reposReady && roleReady,
     apiKeyReady,
     feishuReady,
     reposReady,
+    roleReady,
   };
 };
 
@@ -134,37 +142,95 @@ const StepRow = ({
   </div>
 );
 
-export const SetupChecklist = ({ gate }: { gate: SetupGate }) => (
-  <div className="mx-auto w-full max-w-xl px-6 py-14">
-    <h1 className="text-xl font-semibold tracking-tight">开始使用</h1>
-    <p className="mt-1 text-sm text-muted-foreground">
-      配好这三样、这里就是你的飞书排期看板
-    </p>
-
-    <Card className="mt-6 py-0">
-      <CardContent className="divide-y p-0">
-        <StepRow
-          done={gate.apiKeyReady}
-          index={1}
-          title="Cursor API Key"
-          hint="AI 跑任务的凭据"
-          focus="api-key"
-        />
-        <StepRow
-          done={gate.feishuReady}
-          index={2}
-          title="飞书工具"
-          hint="安装并登录、需求直接变任务"
-          focus="feishu"
-        />
-        <StepRow
-          done={gate.reposReady}
-          index={3}
-          title="代码仓库"
-          hint="至少添加一个"
-          focus="repos"
-        />
-      </CardContent>
-    </Card>
+/** 「我的角色」步骤：行内四个 chip 直接点选落盘、无需跳设置页 */
+const RoleStepRow = ({
+  done,
+  index,
+  userRole,
+  onPick,
+}: {
+  done: boolean;
+  index: number;
+  userRole: UserRole | undefined;
+  onPick: (role: UserRole) => void;
+}) => (
+  <div className="flex items-start gap-3 px-4 py-3.5">
+    {done ? (
+      <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-green-500" />
+    ) : (
+      <span className="relative mt-0.5 flex size-5 shrink-0 items-center justify-center">
+        <Circle className="size-5 text-muted-foreground/40" />
+        <span className="absolute text-[10px] font-medium text-muted-foreground">
+          {index}
+        </span>
+      </span>
+    )}
+    <div className="min-w-0 flex-1 space-y-2">
+      <div>
+        <div className={cn("text-sm font-medium", done && "text-muted-foreground")}>
+          选择你的角色
+        </div>
+        <div className="text-xs text-muted-foreground/80">
+          不同角色会解锁对应的辅助能力
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {USER_ROLES.map((id) => (
+          <ChoiceButton
+            key={id}
+            shape="chip"
+            selected={userRole === id}
+            onClick={() => onPick(id)}
+          >
+            {USER_ROLE_LABEL[id]}
+          </ChoiceButton>
+        ))}
+      </div>
+    </div>
   </div>
 );
+
+export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
+  const { settings, saveFieldValue } = useSettings();
+
+  return (
+    <div className="mx-auto w-full max-w-xl px-6 py-14">
+      <h1 className="text-xl font-semibold tracking-tight">开始使用</h1>
+      <p className="mt-1 text-sm text-muted-foreground">
+        配好这四样、这里就是你的飞书排期看板
+      </p>
+
+      <Card className="mt-6 py-0">
+        <CardContent className="divide-y p-0">
+          <StepRow
+            done={gate.apiKeyReady}
+            index={1}
+            title="Cursor API Key"
+            hint="AI 跑任务的凭据"
+            focus="api-key"
+          />
+          <StepRow
+            done={gate.feishuReady}
+            index={2}
+            title="飞书工具"
+            hint="安装并登录、需求直接变任务"
+            focus="feishu"
+          />
+          <StepRow
+            done={gate.reposReady}
+            index={3}
+            title="代码仓库"
+            hint="至少添加一个"
+            focus="repos"
+          />
+          <RoleStepRow
+            done={gate.roleReady}
+            index={4}
+            userRole={settings.userRole}
+            onPick={(role) => saveFieldValue("userRole", role)}
+          />
+        </CardContent>
+      </Card>
+    </div>
+  );
+};

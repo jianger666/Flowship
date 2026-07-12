@@ -20,13 +20,12 @@
 
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
-import path from "node:path";
 import { promisify } from "node:util";
 
-import { extractFeishuStoryId } from "@/lib/branch-template";
-import { dataRoot } from "./data-root";
+import { USER_ROLE_LABEL, USER_ROLES, type UserRole } from "@/lib/types";
 import { meegleBin } from "./feishu-cli";
 import { enqueueMeegle } from "./meegle-queue";
+import { readSettingsFile } from "./settings-fs";
 
 const execFileAsync = promisify(execFile);
 
@@ -380,273 +379,90 @@ export const fetchMyIdentity = async (): Promise<MeegleIdentity | null> => {
   }
 };
 
-/**
- * 查当前用户在某工作项上的角色名（如「前端开发」「测试」）。
- *
- * 数据源：`workitem get` → `work_item_attribute.role_members[]`
- *（实测 2026-07-12：`{ key, name, members:[{ key:user_key, name, email }] }`；
- * `role_owners` 作兜底字段名）。用户 user_key 命中哪个角色组的 members、就取该组 `name`。
- * 多角色命中用顿号拼接；找不到 / 失败返 null（吞错、不堵启动）。
- */
-export const fetchMyRoleOnWorkitem = async (
-  projectKey: string,
-  workitemId: string,
-): Promise<string | null> => {
-  try {
-    const identity = await fetchMyIdentity();
-    if (!identity) return null;
-    const detail = await fetchWorkitemDetail(workitemId, projectKey);
-    // 角色组挂在 work_item_attribute 下；偶发扁平顶层也兜一下
-    const attr =
-      detail.work_item_attribute && typeof detail.work_item_attribute === "object"
-        ? (detail.work_item_attribute as Record<string, unknown>)
-        : detail;
-    const rawRoles = attr.role_members ?? attr.role_owners;
-    if (!Array.isArray(rawRoles)) return null;
+// ---------- prompt「用户身份」行（姓名 meegle + 角色 settings） ----------
 
-    const hitNames: string[] = [];
-    for (const raw of rawRoles) {
-      if (!raw || typeof raw !== "object") continue;
-      const group = raw as Record<string, unknown>;
-      const roleName = asStr(group.name);
-      if (!roleName) continue;
-      const members = Array.isArray(group.members) ? group.members : [];
-      const hit = members.some((m) => {
-        if (!m || typeof m !== "object") return false;
-        return asStr((m as Record<string, unknown>).key) === identity.userKey;
-      });
-      if (hit) hitNames.push(roleName);
-    }
-    return hitNames.length > 0 ? hitNames.join("、") : null;
-  } catch {
+/**
+ * 从服务端 config.json 读设置页「我的角色」、映射中文标签。
+ * 未设 / 坏值 → null（不注入角色段）。
+ */
+const readUserRoleLabel = async (): Promise<string | null> => {
+  const settings = await readSettingsFile();
+  const raw = settings?.userRole;
+  if (typeof raw !== "string" || !USER_ROLES.includes(raw as UserRole)) {
     return null;
   }
-};
-
-// ---------- 角色持久缓存（<dataRoot>/identity.json） ----------
-
-/**
- * 为什么要持久化：角色（前端 / 后端 / 测试）几乎不变、但不是每个 story 都排了角色组——
- * story 查到角色时存一份、之后「story 没排角色 / chat 无 story」都能拿它兜底注入。
- *
- * ⚠️ 独立小文件、**不进 config.json**：settings 是客户端整对象 PUT、服务端私有字段
- * 塞进去会被下一次保存 clobber。按 userKey 记、换账号登录不会串。
- */
-interface PersistedIdentity {
-  userKey: string;
-  name: string;
-  /** story 角色组查到的角色名（如「前端开发」）、多角色顿号拼接 */
-  role: string;
-  savedAt: number;
-}
-
-const identityFile = (): string => path.join(dataRoot(), "identity.json");
-
-// 文件内容的进程内镜像（undefined = 还没读过磁盘）——角色查询在 agent 启动热路径上、
-// 别每次都读文件；写入时同步刷新
-let persistedCache: PersistedIdentity | null | undefined;
-
-/** meegle 未登录时 remember_user_role 的兜底记账身份（本地单用户 app、串号风险可忽略） */
-const LOCAL_IDENTITY: MeegleIdentity = { userKey: "local", name: "用户" };
-
-// 确保 identity.json 已读进进程镜像（只读一次、写入时同步刷新）
-const ensurePersistedLoaded = async (): Promise<void> => {
-  if (persistedCache !== undefined) return;
-  try {
-    const raw = await fs.readFile(identityFile(), "utf-8");
-    const parsed = JSON.parse(raw) as Partial<PersistedIdentity>;
-    persistedCache =
-      typeof parsed.userKey === "string" &&
-      typeof parsed.name === "string" &&
-      typeof parsed.role === "string" &&
-      parsed.role.trim()
-        ? {
-            userKey: parsed.userKey,
-            name: parsed.name,
-            role: parsed.role,
-            savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
-          }
-        : null;
-  } catch {
-    // 文件不存在 / JSON 损坏都当没缓存（下次查到角色会重写覆盖）
-    persistedCache = null;
-  }
+  return USER_ROLE_LABEL[raw as UserRole];
 };
 
 /**
- * 读缓存的角色。精确 userKey 优先；没命中时 "local" 条目也认——
- * meegle 未登录期间 remember_user_role 只能以 "local" 记账、登录后也该能读到
- *（本地单用户 app、串号风险可忽略）。失败 / 没存过返 null。
- */
-const readPersistedRole = async (userKey: string): Promise<string | null> => {
-  await ensurePersistedLoaded();
-  if (!persistedCache) return null;
-  if (persistedCache.userKey === userKey) return persistedCache.role;
-  if (persistedCache.userKey === LOCAL_IDENTITY.userKey) return persistedCache.role;
-  return null;
-};
-
-/** 角色持久化（同身份同角色跳过；"local" 条目会被真实 userKey 升级覆盖；原子写 tmp + rename） */
-const savePersistedRole = async (
-  identity: MeegleIdentity,
-  role: string,
-): Promise<void> => {
-  await ensurePersistedLoaded();
-  // 精确比对身份 + 角色才跳过——story 角色相同但缓存还挂在 "local" 时照写、升级成真实 userKey
-  if (
-    persistedCache &&
-    persistedCache.userKey === identity.userKey &&
-    persistedCache.role === role
-  ) {
-    return;
-  }
-  const record: PersistedIdentity = {
-    userKey: identity.userKey,
-    name: identity.name,
-    role,
-    savedAt: Date.now(),
-  };
-  try {
-    const file = identityFile();
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
-    await fs.writeFile(tmp, JSON.stringify(record, null, 2), "utf-8");
-    await fs.rename(tmp, file);
-    persistedCache = record;
-  } catch {
-    // 写失败不致命（下次 story 查到角色再试）、也别污染进程镜像
-  }
-};
-
-/**
- * agent 问到用户角色后的持久化回路（MCP 工具 `remember_user_role` 调）。
- * meegle 登录 → 以真实 userKey / 姓名记；未登录 → 以 "local" 兜底记账（读取侧放宽认它）。
- * 返回是否已落盘（写失败返 false、调用方文案降级）。
- */
-export const rememberUserRole = async (role: string): Promise<boolean> => {
-  const trimmed = role.trim();
-  if (!trimmed) return false;
-  const identity = (await fetchMyIdentity()) ?? LOCAL_IDENTITY;
-  await savePersistedRole(identity, trimmed);
-  return persistedCache?.role === trimmed;
-};
-
-/**
- * 拼 prompt「用户身份」行；无姓名时调用方应整行不注入（本函数要求已有 name）。
- * role.source 区分文案：story = 本需求实排角色；cache = 历史任务角色（持久缓存兜底）。
- * ⚠️ cache 文案不带「以谁为准」附言——那会误导 agent 再去追问（用户拍板去掉）。
+ * 拼 prompt「用户身份」行。
+ * - 姓名 + 角色 → `- 发起人：陈禄江（角色：前端）`
+ * - 只有姓名 → `- 发起人：陈禄江`
+ * - 只有角色（meegle 未登录）→ `- 发起人角色：前端`
+ * - 两个都没有 → 空串（调用方不注入整行）
  */
 export const formatUserIdentityLine = (
-  name: string,
-  role?: { source: "story" | "cache"; name: string } | null,
+  name: string | null | undefined,
+  roleLabel: string | null | undefined,
 ): string => {
-  if (!role || !role.name.trim()) return `- 发起人：${name}`;
-  if (role.source === "story") {
-    return `- 发起人：${name}（在本需求的角色：${role.name.trim()}）`;
-  }
-  return `- 发起人：${name}（历史任务角色：${role.name.trim()}）`;
+  const n = name?.trim() ?? "";
+  const r = roleLabel?.trim() ?? "";
+  if (n && r) return `- 发起人：${n}（角色：${r}）`;
+  if (n) return `- 发起人：${n}`;
+  if (r) return `- 发起人角色：${r}`;
+  return "";
 };
 
 /**
- * 解析并拼出可直接塞进 super / chat prompt 的「用户身份」行。三级优先：
- * 1. story 角色组查到 → 「在本需求的角色」（并持久化、供后续兜底）
- * 2. story 没排 / 无 story（chat）→ 缓存角色兜底、「常用角色」措辞
- * 3. 都没有 → 只写姓名
- * meegle 未登录 / 全程失败 → 返空串（调用方不注入整行）。
+ * 解析并拼出可直接塞进 super / chat prompt 的「用户身份」行。
+ * - 姓名：meegle `user me`（进程级缓存保留）
+ * - 角色：只读 settings.userRole（设置页 / 首页清单写入）——不再反查 story 角色组、
+ *   不再读 identity.json、不再依赖 decodeUrl
  *
- * projectKey 走 `url decode` 的 simple_name（CLI `--project-key` 接受 simpleName）。
- *
- * 性能闸（审计 P2）：串行最多 3 个 CLI、单次 30s 超时——网络挂时每次 fresh agent
- * 都白等。这里包 **5s 总预算**（超时返空串；底层查询继续跑、成功结果进缓存、下次能用）；
- * 全程失败另记 60s 负缓存、避免每次启动都卡满 5s。
+ * meegle 查询包 **5s 总预算**（超时仍可用角色单独注入；底层成功结果进缓存、下次能用）；
+ * meegle 失败另记 60s 负缓存、避免每次启动都卡满 5s（角色仍照常注入）。
  */
-/** 身份 resolve 总预算（ms）——超时返空、不堵 agent 启动 */
+/** 姓名 resolve 总预算（ms）——超时跳过姓名、不堵 agent 启动 */
 const IDENTITY_RESOLVE_BUDGET_MS = 5_000;
-/** 失败负缓存 TTL：网络挂时 60s 内不再发起 */
+/** meegle 失败负缓存 TTL：网络挂时 60s 内不再发起 user me */
 const IDENTITY_NEG_CACHE_MS = 60_000;
 let identityNegCachedAt = 0;
 
-const resolveUserIdentityForPromptInner = async (
-  feishuStoryUrl?: string,
-): Promise<string> => {
-  const identity = await fetchMyIdentity();
-  if (!identity) return "";
+export const resolveUserIdentityForPrompt = async (): Promise<string> => {
+  // 角色走本地文件、瞬时；与 meegle 姓名解耦——超时也能注入「发起人角色」
+  const roleLabel = await readUserRoleLabel();
 
-  // 1. story 实排角色
-  let storyRole: string | null = null;
-  const url = feishuStoryUrl?.trim();
-  if (url) {
-    const storyId = extractFeishuStoryId(url);
-    if (storyId) {
-      // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍走兜底）
-      const decoded = await decodeWorkitemUrl(url);
-      const projectKey = decoded?.simpleName;
-      if (projectKey) {
-        storyRole = await fetchMyRoleOnWorkitem(projectKey, storyId);
-      }
-    }
-  }
-  if (storyRole) {
-    // 角色很难变——没存过就存、真变了以新为准更新
-    await savePersistedRole(identity, storyRole);
-    return formatUserIdentityLine(identity.name, {
-      source: "story",
-      name: storyRole,
-    });
-  }
-
-  // 2. 缓存角色兜底（story 没排 / chat 无 story）
-  const cachedRole = await readPersistedRole(identity.userKey);
-  if (cachedRole) {
-    return formatUserIdentityLine(identity.name, {
-      source: "cache",
-      name: cachedRole,
-    });
-  }
-
-  // 3. 只有姓名
-  return formatUserIdentityLine(identity.name);
-};
-
-export const resolveUserIdentityForPrompt = async (
-  feishuStoryUrl?: string,
-): Promise<string> => {
-  // 负缓存命中：上次预算耗尽未过 60s → 直接空串、别再打 CLI
-  if (
+  const negHit =
     identityNegCachedAt > 0 &&
-    Date.now() - identityNegCachedAt < IDENTITY_NEG_CACHE_MS
-  ) {
-    return "";
+    Date.now() - identityNegCachedAt < IDENTITY_NEG_CACHE_MS;
+
+  let name: string | null = null;
+  if (!negHit) {
+    // 迟到成功清负缓存；catch 吞掉防 unhandled rejection
+    const work = fetchMyIdentity()
+      .then((id) => {
+        if (id) identityNegCachedAt = 0;
+        return id?.name ?? null;
+      })
+      .catch((): null => null);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve(null);
+      }, IDENTITY_RESOLVE_BUDGET_MS);
+    });
+    try {
+      name = await Promise.race([work, timeout]);
+      if (name) identityNegCachedAt = 0;
+      else if (timedOut) identityNegCachedAt = Date.now();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
-  // 底层查询挂 catch：Promise.race 输了后它仍可能 reject、别变 unhandled rejection；
-  // 迟到的成功结果清掉负缓存（下次启动就能用已填好的 identity / detail 缓存）
-  const work = resolveUserIdentityForPromptInner(feishuStoryUrl)
-    .then((line) => {
-      if (line) identityNegCachedAt = 0;
-      return line;
-    })
-    .catch((): string => "");
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-  const timeout = new Promise<string>((resolve) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      resolve("");
-    }, IDENTITY_RESOLVE_BUDGET_MS);
-  });
-  try {
-    const line = await Promise.race([work, timeout]);
-    if (line) {
-      identityNegCachedAt = 0;
-      return line;
-    }
-    // 只有预算耗尽才记负缓存；未登录秒返空不记（登录后马上能注入）
-    if (timedOut) identityNegCachedAt = Date.now();
-    return "";
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+  return formatUserIdentityLine(name, roleLabel);
 };
 
 // ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------

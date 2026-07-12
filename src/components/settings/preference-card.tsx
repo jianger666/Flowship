@@ -30,16 +30,22 @@ import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
 import {
   JUMP_IDES,
   JUMP_IDE_LABEL,
+  USER_ROLE_LABEL,
+  USER_ROLES,
   type JumpIde,
   type ModelOption,
   type ModelSelection,
   type SubmitShortcut,
+  type UserRole,
 } from "@/lib/types";
 
 interface PreferenceSectionsProps {
   // 代码跳转 IDE
   jumpIde: JumpIde;
   onJumpIdeChange: (next: JumpIde) => void;
+  // 我的角色（身份注入视角锚点）
+  userRole: UserRole | undefined;
+  onUserRoleChange: (next: UserRole) => void;
   // 分支模板（输入改草稿、失焦落盘）
   branchTemplate: string;
   onBranchTemplateChange: (next: string) => void;
@@ -64,6 +70,8 @@ interface PreferenceSectionsProps {
 export const PreferenceSections = ({
   jumpIde,
   onJumpIdeChange,
+  userRole,
+  onUserRoleChange,
   branchTemplate,
   onBranchTemplateChange,
   onBranchTemplateCommit,
@@ -113,6 +121,34 @@ export const PreferenceSections = ({
 
   return (
     <div className="divide-y">
+      <SettingRow
+        label="我的角色"
+        hint="不同角色会解锁对应的辅助能力"
+        control={
+          <Select
+            value={userRole ?? ""}
+            onValueChange={(v) => {
+              if (USER_ROLES.includes(v as UserRole)) {
+                onUserRoleChange(v as UserRole);
+              }
+            }}
+          >
+            <SelectTrigger className="w-44">
+              <SelectValue placeholder="请选择">
+                {userRole ? USER_ROLE_LABEL[userRole] : undefined}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {USER_ROLES.map((id) => (
+                <SelectItem key={id} value={id}>
+                  {USER_ROLE_LABEL[id]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        }
+      />
+
       <SettingRow
         label="代码跳转 IDE"
         hint="路径链接 / 打开工作区用哪个"
