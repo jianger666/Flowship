@@ -561,7 +561,7 @@ const buildMcpServer = (): McpServer => {
         "- `label`：推进按钮显示名（必填）",
         "- `skill`：主 skill 名（必填、须已存在）",
         "- `output`：本 action 的产出要求（可选、多行）",
-        "- `summary` / `placeholder`：可选壳参数",
+        "- `placeholder`：推进输入框提示（可选）",
         "- 成功返回已创建的 action id + label；失败返回错误说明（如 skill 不存在）",
       ].join("\n"),
       inputSchema: {
@@ -581,17 +581,13 @@ const buildMcpServer = (): McpServer => {
           .describe(
             "本 action 的产出要求（多行可）；属壳参数、不要写进 SKILL.md",
           ),
-        summary: z
-          .string()
-          .optional()
-          .describe("一句话简介（列表副标题、可选）"),
         placeholder: z
           .string()
           .optional()
           .describe("推进弹窗输入框的提示文案（可选）"),
       },
     },
-    async ({ label, skill, output, summary, placeholder }) => {
+    async ({ label, skill, output, placeholder }) => {
       const labelTrimmed = label.trim();
       // 防写出 label 空串僵尸目录（空白 / 纯空格）
       if (!labelTrimmed) {
@@ -622,7 +618,6 @@ const buildMcpServer = (): McpServer => {
           label: labelTrimmed,
           skill: skillName,
           output: output?.trim() || undefined,
-          summary: summary?.trim() || undefined,
           placeholder: placeholder?.trim() || undefined,
         });
         console.log(

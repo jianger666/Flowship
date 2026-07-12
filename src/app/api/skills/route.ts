@@ -1,9 +1,11 @@
 /**
  * Skills 管理 API（V0.13-P1 独立化、设置页 Skills 卡用）
  *
- * GET    /api/skills                    → 列全部来源 skill（带 source 标签）+ 可导入的 Cursor 全局清单
+ * GET    /api/skills                    → 列平台/自管/飞书 CLI skill（带 source）+ 可导入的 Cursor 全局清单
  * POST   /api/skills                    → 新增 / 覆盖 app 自管 skill { name, content }
  * DELETE /api/skills?name=<n>           → 删 app 自管 skill
+ *
+ * cursorGlobal 仅供「从 Cursor 导入」dialog、不进列表 / 不注入 agent。
  */
 
 import { promises as fs } from "node:fs";

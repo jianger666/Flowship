@@ -4,11 +4,12 @@
  * Skills 卡片（V0.13-P1 独立化）
  *
  * 列出 agent 可用的全部 skill（带来源标签）：
- * - 内置（平台随包发布）/ 飞书 CLI 官方 / Cursor 全局（~/.cursor/skills、跟 IDE 共用）→ 只读
+ * - 内置（平台随包发布）/ 飞书 CLI 官方 → 只读（眼睛看全文）
  * - 自管（data/skills、本 app 独立）→ 可新增 / 编辑 / 删除（就是编辑 SKILL.md）
  * - 「从 Cursor 导入」勾选式 dialog（整目录拷贝、含脚本附属文件）——对齐 MCP 卡交互
+ *   Cursor 全局只作导入源、不进列表、不注入 agent
  *
- * 同名覆盖优先级（loadSkills 决定）：内置 > 自管 > Cursor 全局 > 飞书 CLI。
+ * 同名覆盖优先级（loadSkills 决定）：自管 > 内置 > 飞书 CLI。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -17,10 +18,10 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Eye,
   Loader2,
   Pencil,
   Plus,
-  RefreshCw,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -55,11 +56,11 @@ import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { setPendingSlashSkill } from "@/components/slash-skills";
 import { createTask } from "@/lib/task-store";
 
-// 跟 /api/skills 返回对齐的条目形态
+// 跟 /api/skills 返回对齐的条目形态（不含 Cursor 全局——那只进导入 dialog）
 interface SkillRow {
   name: string;
   description: string;
-  source: "builtin" | "app" | "cursor" | "feishu-cli";
+  source: "builtin" | "app" | "feishu-cli";
   editable: boolean;
   // v1.1.x 可关：false = 不注入 agent / 不进 slash 菜单
   enabled: boolean;
@@ -77,7 +78,6 @@ interface CursorGlobalSkill {
 const SOURCE_LABEL: Record<SkillRow["source"], string> = {
   builtin: "内置",
   app: "自管",
-  cursor: "Cursor 全局",
   "feishu-cli": "飞书 CLI",
 };
 
@@ -97,12 +97,17 @@ export const SkillsCard = () => {
   const router = useRouter();
   // 全部来源的 skill 列表（null = 还没加载完）
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
-  // Cursor 全局可导入清单
+  // Cursor 全局可导入清单（仅导入 dialog 用、不进列表分组）
   const [cursorGlobal, setCursorGlobal] = useState<CursorGlobalSkill[]>([]);
   // 自管 skills 目录绝对路径（「对话创建」开对话当 cwd 用、server 返回）
   const [appSkillsDir, setAppSkillsDir] = useState("");
   // 编辑 dialog：null 关；name 空串 = 新增
   const [editing, setEditing] = useState<{
+    name: string;
+    content: string;
+  } | null>(null);
+  // 只读详情 dialog：null 关
+  const [viewing, setViewing] = useState<{
     name: string;
     content: string;
   } | null>(null);
@@ -145,7 +150,7 @@ export const SkillsCard = () => {
       return;
     }
     if (!appSkillsDir) {
-      toast.error("skills 目录还没就绪、点「刷新」后重试");
+      toast.error("skills 目录还没就绪、稍后重试");
       return;
     }
     setBusy(true);
@@ -175,23 +180,40 @@ export const SkillsCard = () => {
     void refresh();
   }, [refresh]);
 
-  const openEdit = async (name: string) => {
+  /** 拉 SKILL.md 全文（编辑 / 只读详情共用；source 消歧同名） */
+  const fetchSkillContent = async (
+    name: string,
+    source: SkillRow["source"],
+  ): Promise<string | null> => {
     try {
       const res = await fetch(
-        `/api/skills/content?name=${encodeURIComponent(name)}`,
+        `/api/skills/content?name=${encodeURIComponent(name)}&source=${encodeURIComponent(source)}`,
         { cache: "no-store" },
       );
       const data = (await res.json()) as { content?: string; error?: string };
       if (!res.ok) {
         toast.error(data.error ?? "读取失败");
-        return;
+        return null;
       }
-      setEditing({ name, content: data.content ?? "" });
+      return data.content ?? "";
     } catch (err) {
       toast.error(
         `读取失败：${err instanceof Error ? err.message : String(err)}`,
       );
+      return null;
     }
+  };
+
+  const openEdit = async (name: string) => {
+    const content = await fetchSkillContent(name, "app");
+    if (content === null) return;
+    setEditing({ name, content });
+  };
+
+  const openView = async (name: string, source: SkillRow["source"]) => {
+    const content = await fetchSkillContent(name, source);
+    if (content === null) return;
+    setViewing({ name, content });
   };
 
   const handleDelete = async (name: string) => {
@@ -306,16 +328,6 @@ export const SkillsCard = () => {
             <Plus />
             手写
           </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            onClick={() => void refresh()}
-          >
-            <RefreshCw />
-            刷新
-          </Button>
         </div>
 
         {skills === null ? (
@@ -328,6 +340,7 @@ export const SkillsCard = () => {
           <SkillGroups
             skills={skills}
             onEdit={(name) => void openEdit(name)}
+            onView={(name, source) => void openView(name, source)}
             onDelete={(name) => void handleDelete(name)}
             onToggle={(name, enabled) => void handleToggle(name, enabled)}
           />
@@ -365,6 +378,14 @@ export const SkillsCard = () => {
         />
       )}
 
+      {viewing !== null && (
+        <SkillViewDialog
+          name={viewing.name}
+          content={viewing.content}
+          onClose={() => setViewing(null)}
+        />
+      )}
+
       <ImportSkillsDialog
         open={importOpen}
         busy={busy}
@@ -381,17 +402,19 @@ export const SkillsCard = () => {
 
 // ----------------- 分组列表（自管展开、其余折叠） -----------------
 
-// 分组展示顺序：自管在前（可编辑、用户最关心）、然后内置 / Cursor / 飞书 CLI
-const GROUP_ORDER: SkillRow["source"][] = ["app", "builtin", "cursor", "feishu-cli"];
+// 分组展示顺序：自管在前（可编辑、用户最关心）、然后内置 / 飞书 CLI
+const GROUP_ORDER: SkillRow["source"][] = ["app", "builtin", "feishu-cli"];
 
 const SkillGroups = ({
   skills,
   onEdit,
+  onView,
   onDelete,
   onToggle,
 }: {
   skills: SkillRow[];
   onEdit: (name: string) => void;
+  onView: (name: string, source: SkillRow["source"]) => void;
   onDelete: (name: string) => void;
   onToggle: (name: string, enabled: boolean) => void;
 }) => {
@@ -422,7 +445,7 @@ const SkillGroups = ({
         onCheckedChange={(v) => onToggle(s.name, v)}
         aria-label={`${s.enabled ? "禁用" : "启用"} ${s.name}`}
       />
-      {s.editable && (
+      {s.editable ? (
         <>
           <Button
             size="icon-xs"
@@ -444,6 +467,17 @@ const SkillGroups = ({
             <Trash2 />
           </Button>
         </>
+      ) : (
+        // 只读来源：眼睛看全文（同位替换自管行的铅笔）
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          aria-label={`查看 ${s.name}`}
+          title="查看 SKILL.md"
+          onClick={() => onView(s.name, s.source)}
+        >
+          <Eye />
+        </Button>
       )}
     </div>
   );
@@ -505,6 +539,35 @@ const SkillGroups = ({
     </div>
   );
 };
+
+// ----------------- 只读详情 dialog -----------------
+
+const SkillViewDialog = ({
+  name,
+  content,
+  onClose,
+}: {
+  name: string;
+  content: string;
+  onClose: () => void;
+}) => (
+  <Dialog open onOpenChange={(o) => !o && onClose()}>
+    <DialogContent className="sm:max-w-2xl">
+      <DialogHeader>
+        <DialogTitle>{name}</DialogTitle>
+      </DialogHeader>
+      {/* 等宽 + 滚动：只读稳妥、不依赖 markdown 渲染 */}
+      <pre className="max-h-[60vh] overflow-auto rounded-md border border-border/60 bg-muted/30 p-3 font-mono text-xs leading-relaxed wrap-anywhere whitespace-pre-wrap">
+        {content}
+      </pre>
+      <DialogFooter>
+        <Button variant="ghost" onClick={onClose}>
+          关闭
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+);
 
 // ----------------- 新增 / 编辑 dialog -----------------
 

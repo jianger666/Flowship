@@ -367,19 +367,18 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
  * 运行时：一条 type="custom" 的 ActionRecord 用 customActionId 指向这里、
  * runner 读主 skill 的 SKILL.md 正文当 action prompt 注入。
  *
+ * 壳四字段：label / skill / output / placeholder（+ id / 时间戳由存储层管）。
  * - id：唯一（= 目录名）
  * - label：动作名（如「性能审计」、推进菜单 + timeline 展示）
- * - summary：一句话简介（列表副标题、可选）
  * - skill：主 skill 名（必填、prompt 注入其 SKILL.md 正文）
  * - output：本 action 的产出要求（可选、多行；属壳参数、不进 skill——skill 可拆卸复用）
  * - placeholder：推进弹窗输入框的提示文案（可选）
  *
- * 旧数据里残留的 extraSkills / freshAgent 字段（壳瘦身前的配置）解析时直接忽略。
+ * 旧数据里残留的 summary / extraSkills / freshAgent 字段（壳瘦身前的配置）解析时直接忽略。
  */
 export interface CustomActionDef {
   id: string;
   label: string;
-  summary?: string;
   /** 主 skill 名；旧格式（见 legacyPlaybook）时为空串 */
   skill: string;
   /** 本 action 产出要求（可选）；空 / 未填时 prompt 走系统兜底结构 */

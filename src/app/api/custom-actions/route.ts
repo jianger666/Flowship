@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions
  *   GET  → 自定义 action 列表
- *   POST → 新建（body: { label, skill, summary?, output?, placeholder? }）
+ *   POST → 新建（body: { label, skill, output?, placeholder? }）
  *
  * 定义存 dataRoot()/custom-actions/<id>/ACTION.md（skill 挂载壳）、CRUD 归 custom-action-fs.ts。
  */
@@ -44,8 +44,7 @@ export const POST = async (req: Request) => {
     const action = await createCustomAction({
       label: body.label,
       skill,
-      summary: isNonEmptyString(body.summary) ? body.summary : undefined,
-      // 多行产出要求：trim 后空则不写（跟 summary 同构）
+      // 多行产出要求：trim 后空则不写（跟 placeholder 同构）
       output: isNonEmptyString(body.output) ? body.output.trim() : undefined,
       placeholder: isNonEmptyString(body.placeholder)
         ? body.placeholder

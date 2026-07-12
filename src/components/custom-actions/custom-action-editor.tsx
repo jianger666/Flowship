@@ -43,7 +43,6 @@ type EditorSkillOption = SkillOption & { missing?: boolean };
 
 const emptyDraft = (): CustomActionInput => ({
   label: "",
-  summary: "",
   skill: "",
   output: "",
 });
@@ -77,7 +76,6 @@ export const CustomActionEditor = ({
       editing
         ? {
             label: editing.label,
-            summary: editing.summary ?? "",
             skill: editing.skill,
             output: editing.output ?? "",
             placeholder: editing.placeholder ?? "",
@@ -167,16 +165,6 @@ export const CustomActionEditor = ({
               value={draft.label}
               onChange={(e) => patch({ label: e.target.value })}
               placeholder="如：性能审计"
-            />
-          </div>
-
-          <div className="grid gap-1.5">
-            <Label htmlFor="ca-summary">一句话简介（可选）</Label>
-            <Input
-              id="ca-summary"
-              value={draft.summary ?? ""}
-              onChange={(e) => patch({ summary: e.target.value })}
-              placeholder="列表里显示、帮你认出这个 action"
             />
           </div>
 

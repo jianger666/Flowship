@@ -291,15 +291,20 @@ V0.6 不写 V0.5 → V0.6 migration 脚本、`listTasks` / `getTask` 用 `isVali
 
 ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `fetchActionDiff` API（V0.5.12 接口同款、key 改 actionId）、有未看 revision 时 Diff 按钮挂红点。
 
-### Skills loader（V0.5 沿用、V0.6 不动）
+### Skills loader
 
-`src/lib/server/skills-loader.ts` 加载 `<repoPath>/.cursor/skills-*/*.md` + `~/.cursor/skills-*/*.md`、注入到 super-prompt。
+`src/lib/server/skills-loader.ts` 加载三源注入 prompt：平台自带 `<app>/skills/` + app 自管 `<dataRoot>/skills/` + 飞书 CLI `<dataRoot>/tools/skills/`。**不扫** `~/.cursor/skills/`（Cursor 全局只作能力页「从 Cursor 导入」源、拷成自管副本后才注入）。同名优先级：自管 > 平台 > 飞书 CLI。
 
 ---
 
 ## 最近演进（窗口式、保留 2 个子版本）
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
+
+### 2026-07-12 夜（未发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
+
+- **运行时不再扫 `~/.cursor/skills/`**：`loadSkills` / `findSkillByName` / 能力页列表只剩平台自带 + app 自管 + 飞书 CLI；「从 Cursor 导入」按钮与 `listCursorGlobalSkills` 保留（导入=拷贝成自管）
+- **只读 skill 眼睛看全文**：内置 / 飞书 CLI 行加 Eye → 只读 Dialog；`GET /api/skills/content` 扩到按 name+source 读任意已知来源（防任意路径）
 
 ### 2026-07-12 晚 v1.1.2 发版：Lexical 输入引擎 + 脱离 Cursor 配置 + action=skill 挂载壳（含 07-12 早/午两批、三轮 subagent 审核全修）
 
@@ -311,15 +316,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **自定义 action = skill 挂载壳**（用户拍板概念收敛）：壳只剩 label / 简介 / 主 skill / **产出要求 output**（属底座、skill 保持纯方法论可拆卸）/ placeholder（freshAgent、附加 skills 均删）；对话创建 v2（AI 写纯方法论 skill → `create_custom_action` MCP 工具结构化挂壳）；共享 = 行上导出（skill 目录 + 隐藏 `.flowship-action.json` 挂载参数）+ 顶部导入（自动挂壳）；**旧格式 playbook action 直接停用不兼容**（滤出推进列表、能力页「查看原文 + 删除」）；命名支持中文（「写代码」）
 - 其它：SDK 1.0.19→1.0.23（包内真实对话冒烟过）；Windows 安装卡死修复（installer taskkill 孤儿 Flowship.exe）；skills absPath 修复（~ 短路径致 400）；两个默认值开关 hint 去歧义；自定义 action git 边界段（worktree 已检出分支教 checkout -b 绕）
 - 审核：三轮 subagent 终审（全量 + 增量×2、Bugbot×3）——2 P1 + 10+ P2/P3 全修、无 P0 带病发版
-
-### 2026-07-12 午（已随 v1.1.2 发）统一输入岛 Composer + 开屏一屏到底 + 升级后授权误报根治
-
-- **统一输入岛 `src/components/composer.tsx`**（用户点名「封装一个高级输入框、chat / task 复用」）：圆角岛 + 顶边拖高（setPointerCapture、高度记全局偏好）+ **Codex 风框内 skill token**（品牌色 icon + 文字、hover 出移除、替代旧独立小药丸 SlashSkillChips——已删）+ 图/路径附件预览 + footer（左 slot 模型选择器 / 右附图·附文件·附目录·发送、运行态原地换停止键）。chat 输入岛（event-stream）和 task「跟 AI 说」条全部换用；event-stream 里不可达的旧 log 形态输入区（两个调用方都不走）删除
-- **task 输入条补路径附件**：question 路由收 `attachments`（`parseAndValidateAttachments` 共享 helper、stat 带出 isDir/bytes 写 `meta.attachments`）、send / resume / oneshot 三分流都带 `[ATTACHED_PATHS]`；顺手修老 bug——chat-reply 原来把 meta 写成 `attachmentPaths`（string[]）、前端读的是 `meta.attachments`（对象数组）、**路径 chips 从未显示过**（Bugbot 揪出）；`use-path-attach.ts` 新 hook（去重 / 上限 / picker 状态、两处共用）
-- **开屏一屏到底**（用户拍板）：壳不再 ready-to-show 亮窗——splash 独立小窗亮到页面 IPC `app-content-ready`（看板 / 就绪清单真渲出来、`src/lib/shell-ready.ts`）才亮主窗收 splash、8s 兜底；首启无空间记忆的占位响应不算就绪（不闪空甘特）
-- **升级后首屏「授权像没检测到」三层根治**：meegle `user me` 只缓存成功；unknown command 先 auth status 复核（登录着 = 瞬态 error 不误报 not_authed）；看板手上有好数据时刷新失败不清屏、5s 静默重试 ×2、只缓存 ok 响应
-- **自定义 action git 边界**（同事「版本回滚 action 切不了分支」）：自定义 action prompt 附 git 操作边界段——playbook 要求的 git 操作放行、worktree 已检出分支教 `checkout -b 新分支 <起点>` 绕、硬红线（force push / reset --hard）仍拦
-- 双 subagent 审核：Bugbot ×2 + 复审各报若干（空看板漏重试 / 脏缓存 / 占位响应早收 splash / 迁移覆盖 / rules 双重注入 / meta 字段错位等）——全修
 
 ## 关键文件索引
 

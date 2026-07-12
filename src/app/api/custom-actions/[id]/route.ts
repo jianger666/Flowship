@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions/[id]
  *   GET    → 单个自定义 action
- *   PATCH  → 更新（部分字段：label / summary / skill / output / placeholder）
+ *   PATCH  → 更新（部分字段：label / skill / output / placeholder）
  *   DELETE → 删除
  *
  * Next.js 15 的 dynamic route params 是 Promise、要 await。
@@ -58,9 +58,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
         );
       }
       patch.skill = skill;
-    }
-    if ("summary" in body) {
-      patch.summary = typeof body.summary === "string" ? body.summary : "";
     }
     if ("output" in body) {
       // 空字符串 = 清空（updateCustomAction 内 trim 后归 undefined）

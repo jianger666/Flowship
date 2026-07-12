@@ -14,9 +14,9 @@
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
  *   - reuseAgent（开关、默认起新 agent、V0.6.27 语义反转；v0.9.11 默认勾选可在设置页「交互偏好」配）：
  *     想省 send 配额 / 要连续上下文时打开续用
- *     - 默认（起新 agent）显示「本次起新 agent 用的模型」ModelPicker、默认值 = 本 task 最近 action 实际
- *       用的模型 → task.model → settings.defaultModel（统一 ModelSelect、沿用我在这个任务一直用的模型、不必每次重挑）、
- *       可以临时换 base + 调 thinking/effort 等 params；勾续用后本段隐藏、续接走 task.model
+ *     - 默认（起新 agent）显示模型选择（常用 chips + 下拉、无单独小标题）、默认值 = 本 task 最近 action
+ *       实际用的模型 → task.model → settings.defaultModel、可以临时换 base + 调 thinking/effort 等 params；
+ *       勾续用后本段隐藏、续接走 task.model
  *
  * 行为：
  *   - 提交后父组件调 advanceTask(taskId, { actionType, userInstruction, reuseAgent, model? })
@@ -46,7 +46,6 @@ import {
   Info,
   Loader2,
   Paperclip,
-  Wrench,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -168,17 +167,6 @@ const inferDisabledReason = (
       return _;
     }
   }
-};
-
-// action 卡片副标题（V0.6.29 抽常量表——原来是嵌套三元、新增 learn 时漏改、
-// fallthrough 兜底把「沉淀」卡也显示成「提 MR 到 test」、用户实测抓到）
-const ACTION_SUBTITLE: Record<Exclude<ActionType, "custom">, string> = {
-  plan: "出方案",
-  build: "写代码",
-  review: "复核差异 + 找 bug",
-  ship: "提 MR 到 test",
-  learn: "沉淀经验进仓库",
-  dev: "推送到 develop",
 };
 
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
@@ -505,7 +493,9 @@ export const AdvanceDialog = ({
     [customById, actionLayout],
   );
 
-  // V0.9：渲染单个 action 卡片——内置走准入判断 + 副标题；自定义走 def + 扳手角标区分
+  // 「下一步」：单行等高 chip（32px、只显示名字、无副标题 / 描述 tooltip；名字自解释）
+  // 内置 + 自定义混排、flex wrap、无分组标题；chip-lg 选中态 = bg-selected 实底 + 内嵌细 ring、
+  // 是弹窗视觉权重最高的主角区。不可选原因仍用角标警告 icon（非描述 tooltip）。
   const renderActionChip = (key: string) => {
     if (isBuiltinAdvanceAction(key)) {
       const type = key;
@@ -518,27 +508,21 @@ export const AdvanceDialog = ({
         // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip
         <div key={key} className="relative">
           <ChoiceButton
-            shape="card"
+            shape="chip-lg"
             selected={actionType === type}
             onClick={() => {
               setActionType(type);
               setSelectedCustomActionId(null);
             }}
             disabled={submitting || !!reason}
-            className="flex h-full w-full flex-col items-start gap-0.5"
-            title={reason ? undefined : `选「${ACTION_LABEL[type]}」推进`}
+            className={cn(reason && "pr-8")}
           >
-            <span className="w-full truncate font-medium">
-              {ACTION_LABEL[type]}
-            </span>
-            <span className="w-full truncate text-[10px] text-muted-foreground">
-              {ACTION_SUBTITLE[type]}
-            </span>
+            {ACTION_LABEL[type]}
           </ChoiceButton>
           {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
           {reason && (
             <Tooltip content={reason}>
-              <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
+              <span className="absolute right-2 top-1/2 inline-flex -translate-y-1/2 cursor-help items-center justify-center text-amber-500">
                 <AlertTriangle className="size-3.5" />
               </span>
             </Tooltip>
@@ -546,34 +530,22 @@ export const AdvanceDialog = ({
         </div>
       );
     }
-    // 自定义 action：key 是 custom id、还原成 def 渲染
+    // 自定义 action：key 是 custom id、还原成 def 渲染（只显示 label）
     const def = customById.get(key);
     if (!def) return null;
     return (
-      <div key={key} className="relative">
-        <ChoiceButton
-          shape="card"
-          selected={actionType === "custom" && selectedCustomActionId === def.id}
-          onClick={() => {
-            setActionType("custom");
-            setSelectedCustomActionId(def.id);
-          }}
-          disabled={submitting}
-          className="flex h-full w-full flex-col items-start gap-0.5"
-          title={`选「${def.label}」推进`}
-        >
-          <span className="w-full truncate pr-4 font-medium">{def.label}</span>
-          <span className="w-full truncate text-[10px] text-muted-foreground">
-            {def.summary?.trim() || "自定义流程"}
-          </span>
-        </ChoiceButton>
-        {/* 自定义 action 角标：扳手图标 + tooltip、跟内置区分 */}
-        <Tooltip content="自定义 Action">
-          <span className="absolute right-1 top-1 inline-flex items-center justify-center rounded-full bg-background/80 p-0.5 text-muted-foreground">
-            <Wrench className="size-3" />
-          </span>
-        </Tooltip>
-      </div>
+      <ChoiceButton
+        key={key}
+        shape="chip-lg"
+        selected={actionType === "custom" && selectedCustomActionId === def.id}
+        onClick={() => {
+          setActionType("custom");
+          setSelectedCustomActionId(def.id);
+        }}
+        disabled={submitting}
+      >
+        {def.label}
+      </ChoiceButton>
     );
   };
 
@@ -734,12 +706,13 @@ export const AdvanceDialog = ({
           <DialogTitle>推进任务</DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-col gap-3 py-2">
-          {/* action 类型选择：内置 + 自定义混排成一个 grid（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
+        {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5） */}
+        <div className="flex flex-col gap-4">
+          {/* action 类型选择：内置 + 自定义混排成一排 chip（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             {visibleKeys.length > 0 ? (
-              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+              <div className="flex flex-wrap gap-2">
                 {visibleKeys.map((key) => renderActionChip(key))}
               </div>
             ) : (
@@ -751,6 +724,13 @@ export const AdvanceDialog = ({
                 </Link>{" "}
                 开启或新建。
               </EmptyHint>
+            )}
+            {/* plan 追加提示：最轻形态（info icon + muted 小字、无底色无边框）、贴 chips 下方 */}
+            {actionType === "plan" && hasPlanHistory && (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
+                <span>本次会追加到现有方案，新增批次会进入「改代码」选择。</span>
+              </div>
             )}
           </div>
 
@@ -810,13 +790,6 @@ export const AdvanceDialog = ({
                   </span>
                 </ChoiceButton>
               </div>
-            </div>
-          )}
-
-          {actionType === "plan" && hasPlanHistory && (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Info className="size-3.5 shrink-0 text-primary/80" />
-              <span>本次会追加到现有方案，新增批次会进入「改代码」选择。</span>
             </div>
           )}
 
@@ -960,8 +933,8 @@ export const AdvanceDialog = ({
             </div>
           )}
 
-          {/* V0.6.27 语义反转：默认每 action 新 agent、勾「续用」才接老 agent（review 勾了也强起新） */}
-          <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2">
+          {/* 续用开关 + 模型选择合并视觉块；续用时模型区收起（续接 Run 不能换模型） */}
+          <div className="rounded-md border bg-muted/30 px-3 py-2">
             <div className="flex items-center justify-between gap-2">
               <label
                 htmlFor="advance-reuse-agent"
@@ -977,29 +950,38 @@ export const AdvanceDialog = ({
               />
             </div>
 
-            {/* 模型选择：起新 agent（默认）时显示、续接 Run 不能换模型 */}
-            {!reuseAgent && (
-              <div className="grid gap-1.5 border-t border-border/60 pt-2">
-                <Label className="text-xs text-foreground/80">
-                  本次起新 agent 用的模型
-                </Label>
-                <ModelSelect
-                  models={availableModels}
-                  selection={pickedModel}
-                  onChange={setPickedModel}
-                  disabled={submitting}
-                  variant="full"
-                  quickPicks
-                  emptyPlaceholder="（请先在设置页拉取模型列表）"
-                />
+            {/* 展开 / 收起走 grid-rows 0fr↔1fr 过渡：高度平滑变化、弹窗不猛跳；
+                收起时 inert 挡 tab 焦点（视觉隐藏但仍挂载、状态不丢） */}
+            <div
+              className={cn(
+                "grid transition-[grid-template-rows,opacity] duration-200",
+                reuseAgent
+                  ? "grid-rows-[0fr] opacity-0"
+                  : "grid-rows-[1fr] opacity-100",
+              )}
+              inert={reuseAgent}
+            >
+              <div className="overflow-hidden">
+                <div className="mt-2 border-t border-border/60 pt-2">
+                  <ModelSelect
+                    models={availableModels}
+                    selection={pickedModel}
+                    onChange={setPickedModel}
+                    disabled={submitting}
+                    variant="full"
+                    quickPicks
+                    emptyPlaceholder="（请先在设置页拉取模型列表）"
+                  />
+                </div>
               </div>
-            )}
+            </div>
           </div>
         </div>
 
         <DialogFooter className="gap-2">
+          {/* 取消降级 ghost：让主按钮「推进 →」独占视觉焦点 */}
           <Button
-            variant="outline"
+            variant="ghost"
             onClick={() => onOpenChange(false)}
             disabled={submitting}
           >

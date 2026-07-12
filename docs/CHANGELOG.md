@@ -15,6 +15,15 @@
 
 ---
 
+### 2026-07-12 午（已随 v1.1.2 发）统一输入岛 Composer + 开屏一屏到底 + 升级后授权误报根治
+
+- **统一输入岛 `src/components/composer.tsx`**（用户点名「封装一个高级输入框、chat / task 复用」）：圆角岛 + 顶边拖高（setPointerCapture、高度记全局偏好）+ **Codex 风框内 skill token**（品牌色 icon + 文字、hover 出移除、替代旧独立小药丸 SlashSkillChips——已删）+ 图/路径附件预览 + footer（左 slot 模型选择器 / 右附图·附文件·附目录·发送、运行态原地换停止键）。chat 输入岛（event-stream）和 task「跟 AI 说」条全部换用；event-stream 里不可达的旧 log 形态输入区（两个调用方都不走）删除
+- **task 输入条补路径附件**：question 路由收 `attachments`（`parseAndValidateAttachments` 共享 helper、stat 带出 isDir/bytes 写 `meta.attachments`）、send / resume / oneshot 三分流都带 `[ATTACHED_PATHS]`；顺手修老 bug——chat-reply 原来把 meta 写成 `attachmentPaths`（string[]）、前端读的是 `meta.attachments`（对象数组）、**路径 chips 从未显示过**（Bugbot 揪出）；`use-path-attach.ts` 新 hook（去重 / 上限 / picker 状态、两处共用）
+- **开屏一屏到底**（用户拍板）：壳不再 ready-to-show 亮窗——splash 独立小窗亮到页面 IPC `app-content-ready`（看板 / 就绪清单真渲出来、`src/lib/shell-ready.ts`）才亮主窗收 splash、8s 兜底；首启无空间记忆的占位响应不算就绪（不闪空甘特）
+- **升级后首屏「授权像没检测到」三层根治**：meegle `user me` 只缓存成功；unknown command 先 auth status 复核（登录着 = 瞬态 error 不误报 not_authed）；看板手上有好数据时刷新失败不清屏、5s 静默重试 ×2、只缓存 ok 响应
+- **自定义 action git 边界**（同事「版本回滚 action 切不了分支」）：自定义 action prompt 附 git 操作边界段——playbook 要求的 git 操作放行、worktree 已检出分支教 `checkout -b 新分支 <起点>` 绕、硬红线（force push / reset --hard）仍拦
+- 双 subagent 审核：Bugbot ×2 + 复审各报若干（空看板漏重试 / 脏缓存 / 占位响应早收 splash / 迁移覆盖 / rules 双重注入 / meta 字段错位等）——全修
+
 ### 2026-07-12 晨（已随 v1.1.2 发）能力体系补全批：skill/rules 可关可管 + action 文件夹化 + AI 帮建（用户睡前拍板「都做上、回来验收」）
 
 - **role 隐藏**：建任务表单不再选角色、默认 `adaptive`（AI 从需求 + 仓库自判视角）；字段保留数据层、编辑弹窗兜底

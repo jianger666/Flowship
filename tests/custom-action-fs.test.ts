@@ -47,7 +47,6 @@ describe("custom-action 新格式（skill 挂载壳）", () => {
     const created = await createCustomAction({
       label: "性能审计",
       skill: "perf-audit",
-      summary: "扫一遍性能",
       placeholder: "贴页面 URL",
     });
     expect(created.id).toBeTruthy();
@@ -73,20 +72,34 @@ describe("custom-action 新格式（skill 挂载壳）", () => {
     expect(updated.skill).toBe("perf-audit-v2");
   });
 
-  it("旧数据残留 extraSkills / freshAgent：解析忽略、不炸也不带出", async () => {
+  it("旧数据残留 summary / extraSkills / freshAgent：解析忽略、不炸也不带出", async () => {
     // 手写带旧字段的 ACTION.md（壳瘦身前的数据）、验证 parse 兼容
     const dir = path.join(TMP_ROOT, "custom-actions", "old-fields");
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "ACTION.md"),
-      `---\nlabel: 旧字段\nskill: some-skill\nextraSkills:\n  - feishu-doc\nfreshAgent: false\ncreatedAt: 1000\nupdatedAt: 1000\n---\n`,
+      `---\nlabel: 旧字段\nsummary: 旧简介\nskill: some-skill\nextraSkills:\n  - feishu-doc\nfreshAgent: false\ncreatedAt: 1000\nupdatedAt: 1000\n---\n`,
       "utf-8",
     );
     const def = await getCustomAction("old-fields");
     expect(def?.skill).toBe("some-skill");
-    // 类型上已无这两个字段；运行时值也不该被带出
+    // 类型上已无这些字段；运行时值也不该被带出
+    expect((def as unknown as Record<string, unknown>).summary).toBeUndefined();
     expect((def as unknown as Record<string, unknown>).extraSkills).toBeUndefined();
     expect((def as unknown as Record<string, unknown>).freshAgent).toBeUndefined();
+    // 重写后 frontmatter 不再含 summary
+    const raw = await fs.readFile(
+      path.join(dir, "ACTION.md"),
+      "utf-8",
+    );
+    // 文件原样保留（parse 只读不改）；update 才会清掉
+    expect(raw).toContain("summary: 旧简介");
+    await updateCustomAction("old-fields", { label: "旧字段" });
+    const rewritten = await fs.readFile(
+      path.join(dir, "ACTION.md"),
+      "utf-8",
+    );
+    expect(rewritten).not.toContain("summary:");
   });
 
   it("output 字段：多行读写往返、空串清掉、不写 frontmatter", async () => {
@@ -124,7 +137,6 @@ describe("旧格式（playbook 正文）：停用、不自动迁移", () => {
     id: string,
     opts: {
       label: string;
-      summary?: string;
       playbook: string;
       skills?: string[];
     },
@@ -135,10 +147,9 @@ describe("旧格式（playbook 正文）：停用、不自动迁移", () => {
       opts.skills && opts.skills.length > 0
         ? `skills:\n${opts.skills.map((s) => `  - ${s}`).join("\n")}\n`
         : "";
-    const summaryLine = opts.summary ? `summary: ${opts.summary}\n` : "";
     const raw = `---
 label: ${opts.label}
-${summaryLine}${skillsLine}createdAt: 1000
+${skillsLine}createdAt: 1000
 updatedAt: 1000
 ---
 
@@ -150,7 +161,6 @@ ${opts.playbook}
   it("get 不迁移：返回 legacyPlaybook 标记、文件原样、不生成 skill", async () => {
     await writeLegacyAction("perf-audit", {
       label: "Perf Audit",
-      summary: "性能扫一遍",
       playbook: "## 目标\n扫性能瓶颈\n\n## 产出\n写报告",
       skills: ["feishu-doc"],
     });
@@ -265,7 +275,6 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     const created = await createCustomAction({
       label: "导出测",
       skill: "export-me",
-      summary: "简介",
       output: "要一份报告",
       placeholder: "贴链接",
     });
@@ -291,6 +300,7 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     expect(meta.label).toBe("导出测");
     expect(meta.output).toBe("要一份报告");
     expect(meta).not.toHaveProperty("id");
+    expect(meta).not.toHaveProperty("summary");
     expect(typeof meta.exportedAt).toBe("number");
   });
 
@@ -320,6 +330,7 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
         label: "导入挂壳",
         output: "产出一份清单",
         // 旧导出包残留字段：导入时应被静默忽略、不报错
+        summary: "旧简介该忽略",
         freshAgent: false,
         exportedAt: Date.now(),
       }),
@@ -331,6 +342,9 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     expect(r.action?.label).toBe("导入挂壳");
     expect(r.action?.skill).toBe("import-me");
     expect(r.action?.output).toBe("产出一份清单");
+    expect(
+      (r.action as unknown as Record<string, unknown> | null)?.summary,
+    ).toBeUndefined();
     expect(r.actionError).toBeUndefined();
 
     await expect(

@@ -3,9 +3,9 @@
  *
  * 当前形态（用户拍板「自定义 action = skill 挂载壳」）：
  *   存 `dataRoot()/custom-actions/<id>/ACTION.md`（frontmatter-only、正文留空）：
- *   - frontmatter：label / summary / skill（主 skill）/ output（产出要求）/
+ *   - frontmatter：label / skill（主 skill）/ output（产出要求）/
  *     placeholder / createdAt / updatedAt
- *   - 旧数据里残留的 extraSkills / freshAgent（壳瘦身前的配置）解析时忽略、不清写
+ *   - 旧数据里残留的 summary / extraSkills / freshAgent（壳瘦身前的配置）解析时忽略、不清写
  *   - 正文：空（playbook 内容已迁到对应 skill 的 SKILL.md）
  *   - id = 目录名（新建时按 label slug 化）
  *
@@ -109,12 +109,8 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
   const skill = sanitizeSkillName(data.skill);
   const playbook = parsed.content.trim();
   // 公共可选字段（新旧格式同构读取）
-  // 注：旧数据里的 extraSkills / freshAgent / skills（壳瘦身前的配置）在这里被忽略、不清写
+  // 注：旧数据里的 summary / extraSkills / freshAgent / skills（壳瘦身前的配置）在这里被忽略、不清写
   const common = {
-    summary:
-      typeof data.summary === "string" && data.summary.trim()
-        ? data.summary.trim()
-        : undefined,
     placeholder:
       typeof data.placeholder === "string" && data.placeholder.trim()
         ? data.placeholder.trim()
@@ -130,7 +126,7 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
     id,
     label,
     skill,
-    // 产出要求：多行文本、trim 后空则不写（跟 summary / placeholder 同构）
+    // 产出要求：多行文本、trim 后空则不写（跟 placeholder 同构）
     output:
       typeof data.output === "string" && data.output.trim()
         ? data.output.trim()
@@ -143,7 +139,6 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
 const serialize = (def: CustomActionDef): string => {
   const fm: Record<string, unknown> = {
     label: def.label,
-    ...(def.summary ? { summary: def.summary } : {}),
     skill: def.skill,
     // gray-matter 对多行字符串会用 YAML 字面量块、读写往返 OK
     ...(def.output ? { output: def.output } : {}),
@@ -264,7 +259,6 @@ export const createCustomAction = async (
   const def: CustomActionDef = {
     id: await genId(label),
     label,
-    summary: input.summary?.trim() || undefined,
     skill,
     output: input.output?.trim() || undefined,
     placeholder: input.placeholder?.trim() || undefined,
@@ -293,10 +287,6 @@ export const updateCustomAction = async (
     ...patch,
     label: (patch.label ?? existing.label).trim(),
     skill: nextSkill,
-    summary:
-      patch.summary !== undefined
-        ? patch.summary.trim() || undefined
-        : existing.summary,
     output:
       patch.output !== undefined
         ? patch.output.trim() || undefined
@@ -328,7 +318,6 @@ export const removeCustomAction = async (id: string): Promise<void> => {
  */
 export interface ExportedActionMeta {
   label: string;
-  summary?: string;
   output?: string;
   placeholder?: string;
   exportedAt: number;
@@ -389,7 +378,6 @@ export const exportCustomAction = async (
 
   const meta: ExportedActionMeta = {
     label: def.label,
-    ...(def.summary ? { summary: def.summary } : {}),
     ...(def.output ? { output: def.output } : {}),
     ...(def.placeholder ? { placeholder: def.placeholder } : {}),
     exportedAt: Date.now(),
@@ -471,15 +459,11 @@ export const importCustomActionBundle = async (
       action = await createCustomAction({
         label,
         skill: skillName,
-        summary:
-          typeof meta.summary === "string" && meta.summary.trim()
-            ? meta.summary.trim()
-            : undefined,
         output:
           typeof meta.output === "string" && meta.output.trim()
             ? meta.output.trim()
             : undefined,
-        // 旧导出包里的 extraSkills / freshAgent（壳瘦身前的字段）忽略
+        // 旧导出包里的 summary / extraSkills / freshAgent（壳瘦身前的字段）忽略
         placeholder:
           typeof meta.placeholder === "string" && meta.placeholder.trim()
             ? meta.placeholder.trim()

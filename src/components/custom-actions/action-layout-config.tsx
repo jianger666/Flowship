@@ -78,7 +78,7 @@ interface RowProps {
   converting?: boolean;
 }
 
-// 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill chips）+ [自定义]编辑 / 删除 + 显隐开关
+// 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill 副标题）+ [自定义]编辑 / 删除 + 显隐开关
 const LayoutRow = ({
   value,
   label,
@@ -131,23 +131,23 @@ const LayoutRow = ({
               旧格式・已停用
             </Badge>
           )}
-          {/* 引用的 skill chips：缺失的灰显划线（本机未找到、推进时自动跳过） */}
-          {skills?.map((s) => (
-            <Tooltip
-              key={s.name}
-              content={s.missing ? "本机未找到、推进时自动跳过" : "引用的 skill"}
-            >
-              <span
-                className={cn(
-                  "shrink-0 rounded border px-1 py-px font-mono text-[10px] text-muted-foreground",
-                  s.missing && "border-dashed line-through opacity-60",
-                )}
-              >
-                {s.name}
-              </span>
-            </Tooltip>
-          ))}
         </span>
+        {/* 自定义 action 副标题：挂载的主 skill 名（不显示 description、太长） */}
+        {skills && skills.length > 0 && (
+          <p
+            className={cn(
+              "mt-0.5 truncate text-xs text-muted-foreground",
+              skills[0]?.missing && "line-through opacity-60",
+            )}
+            title={
+              skills[0]?.missing
+                ? "本机未找到、推进时自动跳过"
+                : undefined
+            }
+          >
+            skill: {skills[0]?.name}
+          </p>
+        )}
         {isLegacy && (
           <p className="mt-0.5 text-xs text-muted-foreground">
             点「转建新版」让 AI 提炼成 skill 并挂壳；验收后再删旧条目

@@ -2,7 +2,8 @@
  * app 自管 Skill 管理（V0.13-P1 独立化、设置页 Skills 卡的 server 侧）
  *
  * 目录布局：`<dataRoot>/skills/<skill 名>/SKILL.md`（+ 可能的附属文件、导入时整目录拷）。
- * 只有这个目录下的 skill 可增删改；平台内置 / 全局 ~/.cursor/skills / 飞书 CLI 官方只读展示。
+ * 只有这个目录下的 skill 可增删改；平台内置 / 飞书 CLI 官方只读展示。
+ * Cursor 全局（~/.cursor/skills）仅作「从 Cursor 导入」数据源、不进列表 / 不注入。
  *
  * 安全约束：skill 名做目录名白名单校验（字母数字中文 - _ .、拒绝路径穿越）、
  * 所有写操作都锚定在 getAppSkillsDir() 之下。与 app-rules isSafeRuleName 同构。
@@ -20,8 +21,8 @@ import {
   type SkillEntry,
 } from "./skills-loader";
 
-/** skill 来源（设置页标签 + 是否可编辑的判定） */
-export type SkillSource = "builtin" | "app" | "cursor" | "feishu-cli";
+/** skill 来源（设置页标签 + 是否可编辑的判定；不含 Cursor 全局——那只作导入源） */
+export type SkillSource = "builtin" | "app" | "feishu-cli";
 
 export interface SkillWithSource extends SkillEntry {
   source: SkillSource;
@@ -43,9 +44,6 @@ export const listSkillsWithSource = async (): Promise<SkillWithSource[]> => {
   };
   push(await scanSkillsDir(path.join(process.cwd(), "skills")), "builtin");
   push(await scanSkillsDir(getAppSkillsDir()), "app");
-  for (const dir of getGlobalCursorDirs()) {
-    push(await scanSkillsDir(path.join(dir, "skills")), "cursor");
-  }
   push(await scanSkillsDir(getToolsSkillsDir()), "feishu-cli");
   return out.sort((a, b) => a.name.localeCompare(b.name));
 };
@@ -60,6 +58,28 @@ export const readAppSkillContent = async (
       path.join(getAppSkillsDir(), name, "SKILL.md"),
       "utf-8",
     );
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * 按名读任意已知来源 skill 的 SKILL.md 全文（只读详情 / 编辑共用）。
+ * 可选 source 消歧同名；未指定时按列表顺序取首个命中。
+ * 名字必须落在 listSkillsWithSource 结果内——防任意路径读。
+ */
+export const readSkillContentByName = async (
+  name: string,
+  source?: SkillSource,
+): Promise<string | null> => {
+  if (!isSafeSkillName(name)) return null;
+  const all = await listSkillsWithSource();
+  const hit = source
+    ? all.find((s) => s.name === name && s.source === source)
+    : all.find((s) => s.name === name);
+  if (!hit) return null;
+  try {
+    return await fs.readFile(hit.absPath, "utf-8");
   } catch {
     return null;
   }

@@ -4,8 +4,9 @@
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
  * 设计要点（settingSources:[] 后全部 fe 自管注入 prompt）：
- *   - **平台自带 + app 自管 + 全局三类都读**：`<ai-flow>/skills/`（git 发布）
- *     + `<dataRoot>/skills/`（设置页管理）+ 全局 `~/.cursor/skills/`（可导入源 / 兼容存量）。
+ *   - **只读平台自管三源**：`<ai-flow>/skills/`（随包发布）+ `<dataRoot>/skills/`（能力页管理）
+ *     + 飞书 CLI skills（`<dataRoot>/tools/skills/`）。
+ *   - **不扫 `~/.cursor/skills/`**：Cursor 全局不再注入；要从 IDE 带过来用能力页「从 Cursor 导入」拷成自管副本。
  *   - **不读 repo `.cursor/skills/`**：SDK 已不再加载 project 层；仓库级 skill 若要用、
  *     请导入到 app 自管 skills（能力页）。
  *   - **progressive loading**：启动 agent 时只把每个 skill 的 name + description + absPath 拼进 prompt、
@@ -25,7 +26,6 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 
-import { getGlobalCursorDirs } from "./cursor-config";
 import { dataRoot } from "./data-root";
 import { getToolsSkillsDir } from "./feishu-cli";
 import { readSettingsFile } from "./settings-fs";
@@ -158,17 +158,17 @@ export const parseSkillFile = async (absPath: string): Promise<SkillEntry | null
 };
 
 /**
- * 加载本次 agent 可用的 skills：平台自带 + app 自管 + 全局 `~/.cursor/skills/` + 飞书 CLI
+ * 加载本次 agent 可用的 skills：平台自带 + app 自管 + 飞书 CLI
  *
  * 来源（都由 fe 注入 prompt、`settingSources:[]` 不靠 SDK 加载 .cursor）：
  *   1. **平台自带** `<ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
  *   2. **app 自管** `<dataRoot>/skills/`（V0.13 独立化：设置页可视化增删改、见 app-skills.ts）
- *   3. **全局** `~/.cursor/skills/`（兼容存量 / 导入源）
- *   4. **飞书 CLI 官方** `<dataRoot>/tools/skills/`（V0.12 一键安装时落盘）
+ *   3. **飞书 CLI 官方** `<dataRoot>/tools/skills/`（V0.12 一键安装时落盘）
  *
+ * 不读 `~/.cursor/skills/`（导入源仅供「从 Cursor 导入」、不注入）；
  * 不读 repo `.cursor/skills/`（SDK 已不加载 project 层；要用请导入到 app 自管）。
  *
- * 同名去重优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI
+ * 同名去重优先级：app 自管 > 平台自带 > 飞书 CLI
  * （用户自建覆盖平台默认，与 findSkillByName / playbook 注入一致；平台 skill
  * 如 action-creator 被同名自管 skill 顶掉属预期）。
  */
@@ -191,18 +191,12 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
   );
   // app 自管 <dataRoot>/skills/（V0.13、设置页管理）
   const app = await scanSkillsDir(getAppSkillsDir());
-  // 全局 ~/.cursor/skills/（兼容存量；全部 fe 注入、不靠 settingSources）
-  const global: SkillEntry[] = [];
-  for (const dir of getGlobalCursorDirs()) {
-    global.push(...(await scanSkillsDir(path.join(dir, "skills"))));
-  }
   // V0.12：内置飞书 CLI 的官方 skills（<dataRoot>/tools/skills、一键安装时落盘）
   const feishuCli = await scanSkillsDir(getToolsSkillsDir());
   // 合并去重（后 set 的覆盖先 set 的、所以低优先级先放）
-  // 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（与 findSkillByName 一致）
+  // 优先级：app 自管 > 平台自带 > 飞书 CLI（与 findSkillByName 一致）
   const byName = new Map<string, SkillEntry>();
   for (const s of feishuCli) byName.set(s.name, s);
-  for (const s of global) byName.set(s.name, s);
   for (const s of own) byName.set(s.name, s);
   for (const s of app) byName.set(s.name, s);
   // v1.1.x：用户关掉的不注入（settings.disabledSkills、能力页 Skill tab 开关）
@@ -215,8 +209,8 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
 
 /**
  * 按名找 skill（自定义 action 主 skill 注入用）。
- * 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（与 loadSkills 同名去重一致；
- * 用户自建覆盖平台默认；迁移写出的 skill 住 app、要压过同名全局）。
+ * 优先级：app 自管 > 平台自带 > 飞书 CLI（与 loadSkills 同名去重一致；
+ * 用户自建覆盖平台默认）。
  * 不走 disabledSkills 过滤——action 已显式挂载、关掉开关也不该让壳跑空。
  */
 export const findSkillByName = async (
@@ -227,7 +221,6 @@ export const findSkillByName = async (
   const sources = [
     getAppSkillsDir(),
     path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
-    ...getGlobalCursorDirs().map((d) => path.join(d, "skills")),
     getToolsSkillsDir(),
   ];
   for (const dir of sources) {
@@ -267,7 +260,7 @@ export const readSkillBodyByName = async (
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 `~/.cursor/skills/` 导入。）";
+    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 Cursor 导入为自管副本。）";
   }
   const lines: string[] = [];
   for (const s of skills) {
