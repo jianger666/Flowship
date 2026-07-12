@@ -42,14 +42,22 @@ export interface SetupGate {
   feishuReady: boolean;
   reposReady: boolean;
   roleReady: boolean;
+  /** 当前已选角色（清单 chip 选中态、与就绪度同一 settings 实例） */
+  userRole: UserRole | undefined;
+  /** 点选角色即存——写的是本 hook 持有的实例、gate 就地重算、无需切页 */
+  pickRole: (role: UserRole) => void;
 }
 
 /**
  * 就绪度判定 hook（HomePage 用它决定渲染看板还是清单）。
  * 未就绪时 3s 轮询 CLI 状态（安装 / 登录都是后台流程、配完回来打勾要实时）；就绪即停。
+ *
+ * ⚠️ useSettings 是「每实例独立快照」hook——角色点选必须走本 hook 下发的 pickRole
+ * 写同一实例、gate 才会响应式重算；SetupChecklist 里再开一个 useSettings 实例
+ * 写入不会同步过来（踩过：点了 chip 清单不刷新、要切页才生效）。
  */
 export const useSetupGate = (): SetupGate => {
-  const { settings, loaded } = useSettings();
+  const { settings, loaded, saveFieldValue } = useSettings();
   // CLI 状态快照（null = 还没拉到）
   const [cli, setCli] = useState<FeishuCliStatus | null>(null);
   // CLI 状态至少拉到过一次（接口失败也算、避免接口挂了首页永远 loading）
@@ -93,6 +101,8 @@ export const useSetupGate = (): SetupGate => {
     feishuReady,
     reposReady,
     roleReady,
+    userRole: settings.userRole,
+    pickRole: (role) => saveFieldValue("userRole", role),
   };
 };
 
@@ -191,8 +201,6 @@ const RoleStepRow = ({
 );
 
 export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
-  const { settings, saveFieldValue } = useSettings();
-
   return (
     <div className="mx-auto w-full max-w-xl px-6 py-14">
       <h1 className="text-xl font-semibold tracking-tight">开始使用</h1>
@@ -226,8 +234,8 @@ export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
           <RoleStepRow
             done={gate.roleReady}
             index={4}
-            userRole={settings.userRole}
-            onPick={(role) => saveFieldValue("userRole", role)}
+            userRole={gate.userRole}
+            onPick={gate.pickRole}
           />
         </CardContent>
       </Card>
