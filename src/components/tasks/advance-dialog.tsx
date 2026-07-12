@@ -206,7 +206,7 @@ const buildPlaceholder = (
   if (type === "custom") {
     return (
       customDef?.placeholder?.trim() ||
-      "（可选）补充说明、不填按该 action 的 playbook 执行"
+      "（可选）补充说明、不填按该 action 的 skill 执行"
     );
   }
   if (type === "plan") {

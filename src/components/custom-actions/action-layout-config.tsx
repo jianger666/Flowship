@@ -33,7 +33,7 @@ interface Props {
   customActions: CustomActionDef[];
   // 本机可用 skill 名集合（/actions 页拉一次传入；null = 未拉到、不判定缺失防误报）
   knownSkills: Set<string> | null;
-  // 自定义 action 行的编辑 / 删除（内置行不展示这些按钮；导出走页面顶部批量入口、不做行内单导）
+  // 自定义 action 行的编辑 / 删除（内置行不展示这些按钮）
   onEdit: (def: CustomActionDef) => void;
   onDelete: (def: CustomActionDef) => void;
 }
@@ -203,11 +203,15 @@ export const ActionLayoutConfig = ({
             }
             isCustom={!isBuiltinAdvanceAction(key)}
             isHidden={hiddenSet.has(key)}
-            // skill 存在性判定：knownSkills 没拉到（null）时不标缺失、避免加载中误报
-            skills={def?.skills?.map((name) => ({
-              name,
-              missing: knownSkills !== null && !knownSkills.has(name),
-            }))}
+            // 主 skill + 附加：knownSkills 没拉到（null）时不标缺失、避免加载中误报
+            skills={
+              def
+                ? [def.skill, ...(def.extraSkills ?? [])].map((name) => ({
+                    name,
+                    missing: knownSkills !== null && !knownSkills.has(name),
+                  }))
+                : undefined
+            }
             onToggleHidden={(visible) => toggleHidden(key, visible)}
             onDragEnd={handleDragEnd}
             onEdit={def ? () => onEdit(def) : undefined}

@@ -285,8 +285,8 @@ export interface ApiKeyInfo {
  * - `learn`    沉淀
  * - `dev`      联调
  *
- * `custom`（自定义 action）：用户在 /actions 页自己封装的 action（playbook + skill + 可选 check）。
- *   一条 type=custom 的 ActionRecord 用 `customActionId` 指向 custom-actions/<id>.md 定义。
+ * `custom`（自定义 action）：用户在 /actions 页把某个 skill 挂到任务链上跑的壳。
+ *   一条 type=custom 的 ActionRecord 用 `customActionId` 指向 custom-actions/<id>/ACTION.md 定义。
  *   custom **不进** ACTION_TYPES（那是「内置 action 选择」清单）、但要补进所有 `Record<ActionType,X>` 兜底键。
  *   展示文案以定义里的 label 为准、表里的 "自定义" 只是没拿到定义时的兜底。
  */
@@ -361,28 +361,26 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
 };
 
 /**
- * V0.9：自定义 action 定义（用户在 /actions 页建、存 dataRoot()/custom-actions/<id>.md）
+ * 自定义 action 定义（用户在 /actions 页建、存 dataRoot()/custom-actions/<id>/ACTION.md）
  *
- * 存储格式：md 文件——frontmatter 配元信息 + 正文是 playbook。
- * 运行时：一条 type="custom" 的 ActionRecord 用 customActionId 指向这里、runner 把 playbook
- *   当 action prompt 注入、按 skills 提示 agent 重点用。
+ * 瘦身后 = skill 挂载壳：内容全部住在 skill 里、ACTION.md 只剩执行参数（frontmatter-only）。
+ * 运行时：一条 type="custom" 的 ActionRecord 用 customActionId 指向这里、
+ * runner 读主 skill 的 SKILL.md 正文当 action prompt 注入。
  *
- * - id：唯一（= 文件名 <id>.md 的 id 段、如 custom_xxx）
+ * - id：唯一（= 目录名）
  * - label：动作名（如「性能审计」、推进菜单 + timeline 展示）
  * - summary：一句话简介（列表副标题、可选）
- * - playbook：正文（干什么 / 怎么做 / 产出什么、markdown）
- * - skills：选用的 skill name 列表（loadSkills 扫出来的、可选；本机没有的
- *   渲染 prompt 时静默跳过、见 task-prompts.loadCustomActionPlaybook）
+ * - skill：主 skill 名（必填、prompt 注入其 SKILL.md 正文）
+ * - extraSkills：附加参考 skill（可选；渲染 prompt 时点名「先 read」、本机没有的静默跳过）
  * - freshAgent：是否强起新 agent（默认 true、跟内置默认 fresh 一致）
- * - placeholder：推进弹窗输入框的提示文案（可选、告诉使用者该填什么——
- *   轻量版「参数化」、缺省用通用文案）
+ * - placeholder：推进弹窗输入框的提示文案（可选）
  */
 export interface CustomActionDef {
   id: string;
   label: string;
   summary?: string;
-  playbook: string;
-  skills?: string[];
+  skill: string;
+  extraSkills?: string[];
   freshAgent?: boolean;
   placeholder?: string;
   createdAt: number;
@@ -572,8 +570,8 @@ export interface ActionRecord {
 
   /**
    * V0.9：自定义 action 指向的定义 id（仅 type="custom" 的 action 有）
-   * - 指向 dataRoot()/custom-actions/<customActionId>.md
-   * - runner 据此读 playbook 当 action prompt、按定义里的 skills/freshAgent 跑
+   * - 指向 dataRoot()/custom-actions/<customActionId>/ACTION.md
+   * - runner 据此读主 skill 正文当 action prompt、按定义里的 skill/extraSkills/freshAgent 跑
    * - 不存 = 非 custom action（内置 6 个走 ACTION_PROMPT_FILE 文件）
    */
   customActionId?: string;

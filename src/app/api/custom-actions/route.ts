@@ -1,9 +1,9 @@
 /**
  * /api/custom-actions
  *   GET  → 自定义 action 列表
- *   POST → 新建（body: { label, playbook, summary?, skills?, freshAgent?, placeholder? }）
+ *   POST → 新建（body: { label, skill, summary?, extraSkills?, freshAgent?, placeholder? }）
  *
- * 定义存 dataRoot()/custom-actions/<id>.md、CRUD 归 custom-action-fs.ts、route 只做 IO + 校验。
+ * 定义存 dataRoot()/custom-actions/<id>/ACTION.md（skill 挂载壳）、CRUD 归 custom-action-fs.ts。
  */
 
 import { promises as fs } from "node:fs";
@@ -12,6 +12,7 @@ import {
   createCustomAction,
   customActionsDir,
   listCustomActions,
+  sanitizeSkillName,
   sanitizeSkills,
 } from "@/lib/server/custom-action-fs";
 
@@ -20,7 +21,7 @@ const isNonEmptyString = (v: unknown): v is string =>
 
 export const GET = async () => {
   try {
-    // 顺手保证目录存在：「AI 帮建」开对话要拿它当 cwd、不存在 agent 起不来
+    // 顺手保证目录存在（list 空目录也 OK）
     const dir = customActionsDir();
     await fs.mkdir(dir, { recursive: true }).catch(() => {});
     const actions = await listCustomActions();
@@ -37,14 +38,15 @@ export const POST = async (req: Request) => {
     if (!isNonEmptyString(body.label)) {
       return NextResponse.json({ error: "label 必填" }, { status: 400 });
     }
-    if (!isNonEmptyString(body.playbook)) {
-      return NextResponse.json({ error: "playbook 必填" }, { status: 400 });
+    const skill = sanitizeSkillName(body.skill);
+    if (!skill) {
+      return NextResponse.json({ error: "skill 必填" }, { status: 400 });
     }
     const action = await createCustomAction({
       label: body.label,
-      playbook: body.playbook,
+      skill,
       summary: isNonEmptyString(body.summary) ? body.summary : undefined,
-      skills: sanitizeSkills(body.skills),
+      extraSkills: sanitizeSkills(body.extraSkills),
       freshAgent:
         typeof body.freshAgent === "boolean" ? body.freshAgent : undefined,
       placeholder: isNonEmptyString(body.placeholder)

@@ -213,9 +213,8 @@ export const loadSkills = async (): Promise<SkillEntry[]> => {
 /**
  * 本机「可用 skill 名字」全集：loadSkills（平台 + 全局）∪ 各绑定仓的 `.cursor/skills/`。
  *
- * 给自定义 action 的 skills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
- * 定义文件可能是别人导出的、引用了对方个人 skill——渲染 playbook 前按这个集合
- * 静默过滤、agent 不会拿到「点了名却查无此人」的引用去瞎找。
+ * 给自定义 action 的 extraSkills 点名做存在性判定（v0.9.14 skill 缺失兜底）：
+ * 定义可能引用了对方个人 skill——渲染前按这个集合静默过滤、agent 不会拿悬空引用瞎找。
  * repo 层仍算进「名字是否存在」（定义里点了名就算有、避免误杀）；真正注入 prompt 的仍只有 loadSkills。
  */
 export const listAvailableSkillNames = async (
@@ -228,6 +227,47 @@ export const listAvailableSkillNames = async (
     for (const s of entries) names.add(s.name);
   }
   return names;
+};
+
+/**
+ * 按名找 skill（自定义 action 主 skill 注入用）。
+ * 优先级：app 自管 > 平台自带 > 全局 > 飞书 CLI（迁移写出的 skill 住 app、要压过同名全局）。
+ * 不走 disabledSkills 过滤——action 已显式挂载、关掉开关也不该让壳跑空。
+ */
+export const findSkillByName = async (
+  name: string,
+): Promise<SkillEntry | null> => {
+  const needle = name.trim();
+  if (!needle) return null;
+  const sources = [
+    getAppSkillsDir(),
+    path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
+    ...getGlobalCursorDirs().map((d) => path.join(d, "skills")),
+    getToolsSkillsDir(),
+  ];
+  for (const dir of sources) {
+    const entries = await scanSkillsDir(dir);
+    const hit = entries.find((e) => e.name === needle);
+    if (hit) return hit;
+  }
+  return null;
+};
+
+/**
+ * 读 skill 的 SKILL.md 正文（去掉 frontmatter、只返 content）。
+ * 找不到 / 读失败 → null（调用方出「定义缺失」兜底文案）。
+ */
+export const readSkillBodyByName = async (
+  name: string,
+): Promise<string | null> => {
+  const entry = await findSkillByName(name);
+  if (!entry) return null;
+  try {
+    const raw = await fs.readFile(entry.absPath, "utf-8");
+    return matter(raw).content.trim();
+  } catch {
+    return null;
+  }
 };
 
 /**

@@ -1,16 +1,10 @@
 "use client";
 
 /**
- * 自定义 action 编辑器（V0.9、新建 / 编辑共用一个 Dialog）
+ * 自定义 action 编辑器（新建 / 编辑共用 Dialog）
  *
- * 字段：动作名 + 一句话简介 + playbook（大文本、带 3 段推荐模板）
- *      + 推进输入提示（placeholder、轻量参数化）+ skill 多选 + 是否每次新 Agent。
- * 模板变量 chips 曾加过又删（用户实测「不知道是干嘛的、没太大用处」）——任务标题 / 仓库路径 /
- * artifact 目录这些上下文 super prompt 本来就有独立段落传给 agent、playbook 不需要点位引用；
- * 运行时 {{var}} 替换链路仍在（跟内置 prompt 同一条 fillTemplate）、手写仍生效、只是不宣传。
- * 协议层（产出 artifact / HITL / submit_work / 再聊聊）由 runner 自动包、用户不用在 playbook 里写。
- *
- * 复用：MultiSelect（skill 勾选、已勾但本机没有的显示灰 chip）。
+ * 瘦身后 = skill 挂载壳：动作名 + 主 skill 下拉 + 附加 skills 多选 + freshAgent + placeholder。
+ * 内容创作走 Skill tab；这里只把已有 skill 挂到推进面板上跑。
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -27,8 +21,14 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { MultiSelect } from "@/components/ui/multi-select";
 import {
   createCustomActionReq,
@@ -39,27 +39,14 @@ import {
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-// 新建时预填的 playbook 模板（3 段、改改就能用）
-const PLAYBOOK_TEMPLATE = `## 目标
-（这个 action 让 agent 干什么、一两句说清）
-
-## 怎么做
-（agent 按这些步骤干活）
-1.
-2.
-
-## 产出什么
-（产出的报告 / artifact 长什么样；留空则让 agent 自己组织一份 markdown 报告）
-`;
-
-// MultiSelect 选项：正常 skill + 「已勾但本机没有」的合成灰项
+// MultiSelect 选项：正常 skill + 「已勾但本机没有」的合成灰项（编辑旧定义时可能出现）
 type EditorSkillOption = SkillOption & { missing?: boolean };
 
 const emptyDraft = (): CustomActionInput => ({
   label: "",
   summary: "",
-  playbook: PLAYBOOK_TEMPLATE,
-  skills: [],
+  skill: "",
+  extraSkills: [],
 });
 
 interface Props {
@@ -79,7 +66,7 @@ export const CustomActionEditor = ({
 }: Props) => {
   // 表单草稿（单对象 state、合并多个相关字段）
   const [draft, setDraft] = useState<CustomActionInput>(emptyDraft);
-  // 可勾选的 skill 列表（打开时拉一次）
+  // 可勾选的 skill 列表（打开时拉一次、只含 enabled）
   const [skillOptions, setSkillOptions] = useState<SkillOption[]>([]);
   // 保存中（防双击）
   const [saving, setSaving] = useState(false);
@@ -92,8 +79,8 @@ export const CustomActionEditor = ({
         ? {
             label: editing.label,
             summary: editing.summary ?? "",
-            playbook: editing.playbook,
-            skills: editing.skills ?? [],
+            skill: editing.skill,
+            extraSkills: editing.extraSkills ?? [],
             freshAgent: editing.freshAgent,
             placeholder: editing.placeholder ?? "",
           }
@@ -122,34 +109,58 @@ export const CustomActionEditor = ({
   const patch = (p: Partial<CustomActionInput>) =>
     setDraft((d) => ({ ...d, ...p }));
 
-  // 已勾但本机没有的 skill（导入的定义常见）合成灰项进 options——
-  // MultiSelect 的 trigger / 列表都按 options 渲染、不合进去这些勾选会「隐身」
-  const optionsWithMissing = useMemo<EditorSkillOption[]>(() => {
+  // 主 skill 下拉：已选但不在 enabled 列表里的（被关 / 删了）合成一项、避免 Select 空白
+  const mainSkillOptions = useMemo<EditorSkillOption[]>(() => {
     const known = new Set(skillOptions.map((s) => s.name));
-    const missing = (draft.skills ?? [])
+    if (draft.skill && !known.has(draft.skill)) {
+      return [
+        {
+          name: draft.skill,
+          description: "本机未找到或已停用",
+          missing: true,
+        },
+        ...skillOptions,
+      ];
+    }
+    return skillOptions;
+  }, [skillOptions, draft.skill]);
+
+  // 附加 skills：已勾但本机没有的合成灰项（跟主 skill 同源列表、排除主 skill 自己）
+  const extraOptions = useMemo<EditorSkillOption[]>(() => {
+    const known = new Set(skillOptions.map((s) => s.name));
+    const missing = (draft.extraSkills ?? [])
       .filter((n) => !known.has(n))
       .map((n) => ({
         name: n,
         description: "本机未找到、推进时会自动跳过",
         missing: true,
       }));
-    return [...missing, ...skillOptions];
-  }, [skillOptions, draft.skills]);
+    // 主 skill 已挂正文、附加列表里再勾同一份没意义——从可选里滤掉
+    const rest = skillOptions.filter((s) => s.name !== draft.skill);
+    return [...missing, ...rest];
+  }, [skillOptions, draft.extraSkills, draft.skill]);
 
   const handleSave = async () => {
     if (!draft.label.trim()) {
       toast.error("请填动作名");
       return;
     }
-    if (!draft.playbook.trim()) {
-      toast.error("请填 playbook");
+    if (!draft.skill.trim()) {
+      toast.error("请选主 skill");
       return;
     }
     setSaving(true);
     try {
+      // 附加里若误含主 skill、提交前剔掉（UI 已滤、防御手改）
+      const payload: CustomActionInput = {
+        ...draft,
+        extraSkills: (draft.extraSkills ?? []).filter(
+          (n) => n !== draft.skill,
+        ),
+      };
       const saved = editing
-        ? await updateCustomActionReq(editing.id, draft)
-        : await createCustomActionReq(draft);
+        ? await updateCustomActionReq(editing.id, payload)
+        : await createCustomActionReq(payload);
       toast.success(editing ? "已保存" : "已创建");
       onSaved(saved);
       onOpenChange(false);
@@ -162,13 +173,13 @@ export const CustomActionEditor = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
             {editing ? "编辑自定义 Action" : "新建自定义 Action"}
           </DialogTitle>
           <DialogDescription>
-            把 playbook + skill 封装成一个能在任务里推进的 action
+            把某个 skill 挂到任务推进链上跑
           </DialogDescription>
         </DialogHeader>
 
@@ -194,36 +205,56 @@ export const CustomActionEditor = ({
           </div>
 
           <div className="grid gap-1.5">
-            <Label htmlFor="ca-playbook">Playbook</Label>
-            <Textarea
-              id="ca-playbook"
-              value={draft.playbook}
-              onChange={(e) => patch({ playbook: e.target.value })}
-              className="min-h-64 font-mono text-xs"
-            />
-            <p className="text-xs text-muted-foreground">
-              写「干什么 / 怎么做 / 产出什么」；产出 artifact、等你确认、再聊聊这套系统会自动包上、不用写
-            </p>
+            <Label>主 skill</Label>
+            <Select
+              value={draft.skill || undefined}
+              onValueChange={(v) => {
+                if (v == null) return;
+                // 换主 skill 时、若它还在附加列表里、顺手剔掉避免重复
+                const extras = (draft.extraSkills ?? []).filter((n) => n !== v);
+                patch({ skill: v, extraSkills: extras });
+              }}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="选一个 skill 作为执行内容">
+                  {draft.skill
+                    ? mainSkillOptions.find((s) => s.name === draft.skill)
+                        ?.name ?? draft.skill
+                    : null}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {mainSkillOptions.map((s) => (
+                  <SelectItem key={s.name} value={s.name}>
+                    <span className="flex min-w-0 flex-col items-start gap-0.5">
+                      <span
+                        className={cn(
+                          "font-medium",
+                          s.missing && "text-muted-foreground line-through",
+                        )}
+                      >
+                        {s.name}
+                      </span>
+                      {s.description ? (
+                        <span className="line-clamp-1 text-xs text-muted-foreground">
+                          {s.description}
+                        </span>
+                      ) : null}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="grid gap-1.5">
-            <Label htmlFor="ca-placeholder">推进输入框提示（可选）</Label>
-            <Input
-              id="ca-placeholder"
-              value={draft.placeholder ?? ""}
-              onChange={(e) => patch({ placeholder: e.target.value })}
-              placeholder="推进选中这个 action 时、告诉使用者该填什么"
-            />
-          </div>
-
-          <div className="grid gap-1.5">
-            <Label>带哪些 skill（可选）</Label>
+            <Label>附加 skills（可选）</Label>
             <MultiSelect
-              options={optionsWithMissing}
-              value={draft.skills ?? []}
-              onChange={(next) => patch({ skills: next })}
+              options={extraOptions}
+              value={draft.extraSkills ?? []}
+              onChange={(next) => patch({ extraSkills: next })}
               getKey={(s) => s.name}
-              placeholder="不选则不带 skill"
+              placeholder="可空、推进时点名先 read"
               renderOption={(s) => (
                 <>
                   <span
@@ -239,6 +270,16 @@ export const CustomActionEditor = ({
                   </span>
                 </>
               )}
+            />
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label htmlFor="ca-placeholder">推进输入框提示（可选）</Label>
+            <Input
+              id="ca-placeholder"
+              value={draft.placeholder ?? ""}
+              onChange={(e) => patch({ placeholder: e.target.value })}
+              placeholder="推进选中这个 action 时、告诉使用者该填什么"
             />
           </div>
 

@@ -1,13 +1,12 @@
 /**
- * 自定义 action 的客户端 fetch 封装（V0.9）
+ * 自定义 action 的客户端 fetch 封装
  *
  * 列表页 / 编辑器 / 推进 dialog 共用、错误归一成 Error(message)（调用方 try/catch + toast）。
- * 不在组件里裸 fetch + JSON.parse + 错误拼接（对齐 task-store 的 handleJson 约定）。
  */
 
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 
-/** 可勾选的 skill（/api/skills 返回、只 name + description） */
+/** 可勾选的 skill（/api/skills 返回、只 name + description；调用方只列 enabled） */
 export interface SkillOption {
   name: string;
   description: string;
@@ -35,19 +34,6 @@ export const fetchCustomActions = async (): Promise<CustomActionDef[]> => {
   const res = await fetch("/api/custom-actions");
   const { actions } = await handleJson<{ actions: CustomActionDef[] }>(res);
   return actions;
-};
-
-/** 列表 + 存储目录路径（能力页用：目录给「AI 帮建」开对话当 cwd） */
-export const fetchCustomActionsWithDir = async (): Promise<{
-  actions: CustomActionDef[];
-  dir: string;
-}> => {
-  const res = await fetch("/api/custom-actions");
-  const { actions, customActionsDir } = await handleJson<{
-    actions: CustomActionDef[];
-    customActionsDir?: string;
-  }>(res);
-  return { actions, dir: customActionsDir ?? "" };
 };
 
 export const createCustomActionReq = async (
@@ -80,43 +66,13 @@ export const deleteCustomActionReq = async (id: string): Promise<void> => {
   await handleJson<{ ok: true }>(res);
 };
 
+/** 拉可用 skill（只返回 enabled=true、给主 skill 下拉 / 附加多选） */
 export const fetchSkills = async (): Promise<SkillOption[]> => {
   const res = await fetch("/api/skills");
-  const { skills } = await handleJson<{ skills: SkillOption[] }>(res);
-  return skills;
-};
-
-/** 导入结果（服务端逐文件处理、失败的带原因给 toast 汇总） */
-export interface ImportActionsResult {
-  imported: CustomActionDef[];
-  failed: { path: string; reason: string }[];
-}
-
-export const importCustomActionsReq = async (
-  dir: string,
-): Promise<ImportActionsResult> => {
-  const res = await fetch("/api/custom-actions/import", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dir }),
-  });
-  return handleJson<ImportActionsResult>(res);
-};
-
-/** 导出结果（每个成功项带写入的文件绝对路径） */
-export interface ExportActionsResult {
-  exported: { id: string; file: string }[];
-  failed: { id: string; reason: string }[];
-}
-
-export const exportCustomActionsReq = async (
-  ids: string[],
-  dir: string,
-): Promise<ExportActionsResult> => {
-  const res = await fetch("/api/custom-actions/export", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids, dir }),
-  });
-  return handleJson<ExportActionsResult>(res);
+  const { skills } = await handleJson<{
+    skills: Array<SkillOption & { enabled?: boolean }>;
+  }>(res);
+  return (skills ?? [])
+    .filter((s) => s.enabled !== false)
+    .map(({ name, description }) => ({ name, description }));
 };

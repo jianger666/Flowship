@@ -28,6 +28,7 @@ import {
 } from "./task-worktrees";
 import {
   listAvailableSkillNames,
+  readSkillBodyByName,
   renderSkillsForPrompt,
   type SkillEntry,
 } from "./skills-loader";
@@ -123,7 +124,7 @@ export const loadActionPrompt = async (
     actionArtifactsDir: getActionsDir(task.id),
     eventsLogPath: getEventsLogPath(task.id),
   };
-  // 自定义 action：playbook 来自用户定义（dataRoot/custom-actions）、不走 prompts/action-*.md
+  // 自定义 action：主 skill 正文当 playbook（ACTION.md 只是挂载壳）、不走 prompts/action-*.md
   if (action.type === "custom") {
     return loadCustomActionPlaybook(action, task, vars);
   }
@@ -131,8 +132,8 @@ export const loadActionPrompt = async (
   return fillTemplate(tpl, vars);
 };
 
-// 自定义 action 的 playbook 渲染：定义正文（填同样的模板变量）+ 点名本 action 重点用的 skill。
-// 全量 skill 已在 super prompt 的可用 skills 段、这里只是高亮、agent 按需 read 完整 SKILL.md。
+// 自定义 action 的 playbook 渲染：主 skill 的 SKILL.md 正文（填模板变量）+ 点名附加 skill。
+// 全量 skill 已在 super prompt 的可用 skills 段；主 skill 全文注入（内容就在那）、附加只点名让 agent 按需 read。
 const loadCustomActionPlaybook = async (
   action: ActionRecord,
   task: Task,
@@ -146,9 +147,14 @@ const loadCustomActionPlaybook = async (
       action.customActionId ? `：${action.customActionId}` : "（缺 id）"
     }、可能已在 /actions 页删除。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明定义缺失。）`;
   }
-  const parts = [fillTemplate(def.playbook, vars)];
+  // 主 skill 正文 = 真正的 playbook；找不到就跟「定义缺失」同风格兜底、说清缺哪个 skill
+  const skillBody = await readSkillBodyByName(def.skill);
+  if (!skillBody) {
+    return `（自定义 action「${def.label}」挂载的主 skill「${def.skill}」未找到、可能已删或未导入。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明 skill 缺失。）`;
+  }
+  const parts = [fillTemplate(skillBody, vars)];
   // v1.1.x（同事「版本回滚 action 切不了分支」实测踩过）：自定义 action 的 git 边界说明——
-  // 内置 action 有严格 git 分工（build 不碰 git / ship 才推送）、自定义的以 playbook 为准；
+  // 内置 action 有严格 git 分工（build 不碰 git / ship 才推送）、自定义的以主 skill 正文为准；
   // 隔离工作区（git worktree）下「已被其它工作区检出的分支」不能直接 checkout（git 硬限制）、
   // 必须教 agent 用「新建分支」绕、否则报 already checked out 就卡死
   parts.push(
@@ -161,12 +167,10 @@ const loadCustomActionPlaybook = async (
       "- 动 git 前先 `git status` 确认工作区状态；有未提交改动且 playbook 没说怎么处理时、用 ask_user 问用户、不要自作主张丢弃。",
     ].join("\n"),
   );
-  if (def.skills && def.skills.length > 0) {
-    // v0.9.14 skill 缺失兜底：定义可能是别人导出的、引用了对方个人 skill——
-    // 本机（平台 + 全局 + 绑定仓 repo 层）不存在的名字静默滤掉、不进 prompt、
-    // agent 不会拿着悬空引用去文件系统瞎找 / 脑补。UI 侧另有灰 chip 提示用户。
+  if (def.extraSkills && def.extraSkills.length > 0) {
+    // skill 缺失兜底：附加引用可能悬空——本机没有的静默滤掉、不进 prompt
     const available = await listAvailableSkillNames(task.repoPaths ?? []);
-    const usable = def.skills.filter((s) => available.has(s));
+    const usable = def.extraSkills.filter((s) => available.has(s));
     if (usable.length > 0) {
       parts.push(
         "",

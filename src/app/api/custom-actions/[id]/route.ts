@@ -1,7 +1,7 @@
 /**
  * /api/custom-actions/[id]
  *   GET    → 单个自定义 action
- *   PATCH  → 更新（部分字段：label / summary / playbook / skills / freshAgent / placeholder）
+ *   PATCH  → 更新（部分字段：label / summary / skill / extraSkills / freshAgent / placeholder）
  *   DELETE → 删除
  *
  * Next.js 15 的 dynamic route params 是 Promise、要 await。
@@ -11,6 +11,7 @@ import { NextResponse } from "next/server";
 import {
   getCustomAction,
   removeCustomAction,
+  sanitizeSkillName,
   sanitizeSkills,
   updateCustomAction,
   type CustomActionInput,
@@ -49,20 +50,23 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       }
       patch.label = body.label;
     }
-    if ("playbook" in body) {
-      if (typeof body.playbook !== "string" || !body.playbook.trim()) {
+    if ("skill" in body) {
+      const skill = sanitizeSkillName(body.skill);
+      if (!skill) {
         return NextResponse.json(
-          { error: "playbook 必须是非空字符串" },
+          { error: "skill 必须是非空字符串" },
           { status: 400 },
         );
       }
-      patch.playbook = body.playbook;
+      patch.skill = skill;
     }
     if ("summary" in body) {
       patch.summary = typeof body.summary === "string" ? body.summary : "";
     }
-    if ("skills" in body) {
-      patch.skills = sanitizeSkills(body.skills);
+    if ("extraSkills" in body) {
+      // 空数组 = 清空附加 skill；sanitizeSkills 对空数组返 undefined、update 层认 undefined 为「显式清空」需区分
+      // 这里传 [] 让 updateCustomAction 的 patch.extraSkills !== undefined 分支走到清空
+      patch.extraSkills = sanitizeSkills(body.extraSkills) ?? [];
     }
     if ("freshAgent" in body) {
       patch.freshAgent =
