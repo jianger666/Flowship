@@ -15,8 +15,6 @@ import { cn } from "@/lib/utils";
  * shape：
  * - card：方块卡（ModeCard / option 选项块、左对齐文本、可包多行）
  * - chip：圆角小药丸（preset / Other 切换）
- * - chip-lg：等高 ~40px 单行选择 chip（推进弹窗「下一步」主角区）——
- *   圆角稍大（rounded-lg）、选中态 = bg-selected + 品牌色细环 + 左侧 inset 竖条点睛
  * - tab：行内按钮（phase-progress 之类、轻量 hover）
  *
  * 用法：
@@ -39,8 +37,6 @@ const choiceButtonVariants = cva(
       shape: {
         card: "rounded-md border p-3",
         chip: "rounded-full border px-2.5 py-0.5 text-[11px]",
-        "chip-lg":
-          "inline-flex h-10 items-center rounded-lg border px-4 text-base font-medium transition-[color,background-color,border-color,box-shadow] duration-200 ease-out",
         tab: "rounded-md px-2 py-1 text-sm",
       },
       selected: {
@@ -49,7 +45,7 @@ const choiceButtonVariants = cva(
       },
     },
     compoundVariants: [
-      // card 形状
+      // card 形状——品牌强调选中（边框 + 浅底），见 ui-conventions ChoiceButton 例外
       {
         shape: "card",
         selected: true,
@@ -70,20 +66,6 @@ const choiceButtonVariants = cva(
         shape: "chip",
         selected: false,
         className: "border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground",
-      },
-      // chip-lg——推进弹窗主角：选中 = selected 实底 + 品牌细环 + 左侧 inset 竖条 + 微内光
-      //（克制、不堆叠装饰；竖条用 inset shadow 不占布局、选中切换不抖）
-      {
-        shape: "chip-lg",
-        selected: true,
-        className:
-          "border-transparent bg-selected text-selected-foreground ring-2 ring-primary/40 shadow-[inset_2px_0_0_0_var(--primary),inset_0_1px_12px_0_color-mix(in_oklab,var(--primary)_12%,transparent)]",
-      },
-      {
-        shape: "chip-lg",
-        selected: false,
-        className:
-          "border-border bg-transparent text-muted-foreground hover:border-primary/35 hover:bg-primary/[0.04] hover:text-foreground",
       },
       // tab 形状——选中态走全局 selected token（bg-muted/60 在浅色下几乎不可见、
       // 用户实测点名「白色的选中状态太弱」、v1.0.x 立规见 ui-conventions）

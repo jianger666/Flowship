@@ -16,7 +16,6 @@ import { Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ModelSelect } from "@/components/ui/model-select";
-import { RolePicker } from "@/components/ui/role-picker";
 import {
   Select,
   SelectContent,
@@ -31,6 +30,8 @@ import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
 import {
   JUMP_IDES,
   JUMP_IDE_LABEL,
+  USER_ROLE_LABEL,
+  USER_ROLES,
   type JumpIde,
   type ModelOption,
   type ModelSelection,
@@ -124,7 +125,27 @@ export const PreferenceSections = ({
         label="我的角色"
         hint="不同角色会解锁对应的辅助能力"
         control={
-          <RolePicker value={userRole} onChange={onUserRoleChange} />
+          <Select
+            value={userRole ?? ""}
+            onValueChange={(v) => {
+              if (USER_ROLES.includes(v as UserRole)) {
+                onUserRoleChange(v as UserRole);
+              }
+            }}
+          >
+            <SelectTrigger className="w-44">
+              <SelectValue placeholder="请选择">
+                {userRole ? USER_ROLE_LABEL[userRole] : undefined}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {USER_ROLES.map((id) => (
+                <SelectItem key={id} value={id}>
+                  {USER_ROLE_LABEL[id]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         }
       />
 

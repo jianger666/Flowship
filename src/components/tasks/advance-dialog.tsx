@@ -493,9 +493,9 @@ export const AdvanceDialog = ({
     [customById, actionLayout],
   );
 
-  // 「下一步」：单行等高 chip（~40px、只显示名字、无副标题 / 描述 tooltip；名字自解释）
-  // 内置 + 自定义混排、flex wrap、无分组标题；chip-lg 选中态 = bg-selected + 品牌细环 + 左侧竖条、
-  // 是弹窗视觉权重最高的主角区。不可选原因仍用角标警告 icon（非描述 tooltip）。
+  // 「下一步」：网格方块卡（历史两行标题+副标题高度、现只居中主标题、无副标题）
+  // 内置 + 自定义混排；不可选原因仍用角标警告 icon。
+  // min-h-[3.75rem] = 当初 p-3 + 主标题行 + gap-0.5 + 副标题 text-[10px] 的实际高度
   const renderActionChip = (key: string) => {
     if (isBuiltinAdvanceAction(key)) {
       const type = key;
@@ -508,21 +508,21 @@ export const AdvanceDialog = ({
         // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip
         <div key={key} className="relative">
           <ChoiceButton
-            shape="chip-lg"
+            shape="card"
             selected={actionType === type}
             onClick={() => {
               setActionType(type);
               setSelectedCustomActionId(null);
             }}
             disabled={submitting || !!reason}
-            className={cn(reason && "pr-8")}
+            className="flex min-h-[3.75rem] w-full items-center justify-center"
           >
-            {ACTION_LABEL[type]}
+            <span className="truncate font-medium">{ACTION_LABEL[type]}</span>
           </ChoiceButton>
           {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
           {reason && (
             <Tooltip content={reason}>
-              <span className="absolute right-2 top-1/2 inline-flex -translate-y-1/2 cursor-help items-center justify-center text-amber-500">
+              <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
                 <AlertTriangle className="size-3.5" />
               </span>
             </Tooltip>
@@ -530,22 +530,24 @@ export const AdvanceDialog = ({
         </div>
       );
     }
-    // 自定义 action：key 是 custom id、还原成 def 渲染（只显示 label）
+    // 自定义 action：key 是 custom id、还原成 def 渲染（只显示 label、居中）
     const def = customById.get(key);
     if (!def) return null;
     return (
-      <ChoiceButton
-        key={key}
-        shape="chip-lg"
-        selected={actionType === "custom" && selectedCustomActionId === def.id}
-        onClick={() => {
-          setActionType("custom");
-          setSelectedCustomActionId(def.id);
-        }}
-        disabled={submitting}
-      >
-        {def.label}
-      </ChoiceButton>
+      <div key={key} className="relative">
+        <ChoiceButton
+          shape="card"
+          selected={actionType === "custom" && selectedCustomActionId === def.id}
+          onClick={() => {
+            setActionType("custom");
+            setSelectedCustomActionId(def.id);
+          }}
+          disabled={submitting}
+          className="flex min-h-[3.75rem] w-full items-center justify-center"
+        >
+          <span className="truncate font-medium">{def.label}</span>
+        </ChoiceButton>
+      </div>
     );
   };
 
@@ -709,11 +711,11 @@ export const AdvanceDialog = ({
         {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5）
             min-h 兜底六个内置 action 主路径高度，切换时弹窗不抖（分批 build / 大图附件仍可能增高） */}
         <div className="flex min-h-[28rem] flex-col gap-4">
-          {/* action 类型选择：内置 + 自定义混排成一排 chip（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
+          {/* action 类型选择：内置 + 自定义混排成 grid 方块（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             {visibleKeys.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                 {visibleKeys.map((key) => renderActionChip(key))}
               </div>
             ) : (
