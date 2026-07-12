@@ -43,17 +43,10 @@ import Link from "next/link";
 import {
   AlertTriangle,
   ArrowRight,
-  BookMarked,
-  Code2,
-  GitMerge,
   Info,
   Loader2,
   Paperclip,
-  PenLine,
-  Rocket,
-  SearchCheck,
   Sparkles,
-  type LucideIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -177,48 +170,35 @@ const inferDisabledReason = (
   }
 };
 
-// action 方块卡 icon 映射（内置六种、语义对应；自定义 action 统一 Sparkles 兜底）
-const ACTION_ICON: Record<Exclude<ActionType, "custom">, LucideIcon> = {
-  plan: PenLine,
-  build: Code2,
-  review: SearchCheck,
-  ship: Rocket,
-  learn: BookMarked,
-  dev: GitMerge,
-};
-
 // action 方块卡共用外观（内置 + 自定义两处渲染、单一来源）：
-// 竖排居中（icon 上 label 下）、py-2 压掉 card 默认 p-3 的纵向、总高≈原「标题+副标题」两行
-// 选中态覆盖 card 默认（bg-primary/5 → bg-selected 实底、border 收敛到 primary/50）、
-// icon / label 变品牌色点睛；未选中时 hover 背景微亮（border 亮化走 card 变体自带的 hover:border-primary/50）
+// 主标题水平垂直居中、左上角固定 ✨ 角标点睛（用户拍板：统一星星、不搞每 action 一个 icon）
+// 总高维持原「标题+副标题」两行的块高；选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
 const actionCardClass = (selected: boolean) =>
   cn(
-    "group flex min-h-[3.75rem] w-full flex-col items-center justify-center gap-1.5 py-2",
+    "group flex min-h-[3.75rem] w-full items-center justify-center py-2",
     selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
   );
 
-// action 方块卡内容（icon + 居中 label）——选中品牌色、未选中 icon muted、hover 过渡到 foreground
+// action 方块卡内容：居中 label + 左上角固定 ✨ 角标（选中品牌色、未选中 muted、hover 过渡）
 const ActionCardContent = ({
-  icon: Icon,
   label,
   selected,
 }: {
-  icon: LucideIcon;
   label: string;
   selected: boolean;
 }) => (
   <>
-    <Icon
+    <Sparkles
       className={cn(
-        "size-5 shrink-0 transition-colors",
+        "absolute left-2 top-2 size-3.5 shrink-0 transition-colors",
         selected
           ? "text-primary"
-          : "text-muted-foreground group-hover:text-foreground",
+          : "text-muted-foreground/60 group-hover:text-muted-foreground",
       )}
     />
     <span
       className={cn(
-        "w-full truncate text-center text-sm font-medium",
+        "w-full truncate px-5 text-center text-sm font-medium",
         selected && "text-primary",
       )}
     >
@@ -576,11 +556,7 @@ export const AdvanceDialog = ({
             disabled={submitting || !!reason}
             className={actionCardClass(selected)}
           >
-            <ActionCardContent
-              icon={ACTION_ICON[type]}
-              label={ACTION_LABEL[type]}
-              selected={selected}
-            />
+            <ActionCardContent label={ACTION_LABEL[type]} selected={selected} />
           </ChoiceButton>
           {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
           {reason && (
@@ -609,7 +585,7 @@ export const AdvanceDialog = ({
           disabled={submitting}
           className={actionCardClass(selected)}
         >
-          <ActionCardContent icon={Sparkles} label={def.label} selected={selected} />
+          <ActionCardContent label={def.label} selected={selected} />
         </ChoiceButton>
       </div>
     );
