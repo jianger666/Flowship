@@ -66,8 +66,21 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   // agent 在跑时不可说；任务终态整条隐藏
   const busy = submitting || task.runStatus === "running";
 
-  // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
-  const slash = useSlashSkills({ applyDraft: setDraft });
+  // `/` 唤起 skill：选中后补全成内联 `/name ` token（Codex 风、留在文本流里）
+  const slash = useSlashSkills({
+    draft,
+    applyDraft: (next, cursor) => {
+      setDraft(next);
+      saveDraft("talk", task.id, next);
+      if (cursor == null) return;
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(cursor, cursor);
+      });
+    },
+  });
 
   // 有未答提问（且当前阶段没停摆）→ 输入条切「答题引导态」：禁输入、placeholder 指路。
   // 阶段停摆（error/cancelled）时提问已没人接、照常放行（唤醒通道）。

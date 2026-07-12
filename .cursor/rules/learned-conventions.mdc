@@ -5,6 +5,13 @@ alwaysApply: true
 
 # 编码约定
 
+## 开发任务交子代理、主线只聊天 + 验收（2026-07-12 用户拍板、覆盖旧「永远不要启动 Subagent」全局规则）
+
+- **用户想法多、等不了主线串行改代码**——后续开发任务（写代码 / 修 bug / 重构）一律派给 subagent 做、模型用 **grok-4.5-fast-xhigh**（用户指定「grok4.5 fast 就行」）。
+- 主线（我）职责：跟用户聊需求 / 拍方案 / 派活；subagent 完成后**验收**（读 diff、跑 typecheck/lint、必要时 test 包冒烟）确认符合要求再汇报。
+- 派活 prompt 要自带完整上下文（subagent 看不到对话）：改哪些文件、约束（本仓 rules 关键条目）、验收标准。
+- 多个独立任务可并行派；互相依赖的串行。
+
 ## 本地测试桌面 app：用 test 实例、别碰 8876（2026-06-12 用户修订）
 
 - **用户本机日常运行着「Flowship」（v1.1.0 改名、原「AI工作流」）桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关正式窗口。

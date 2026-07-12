@@ -353,8 +353,22 @@ const EventStreamImpl = ({
     }
   }, [isAwaitingUser]);
 
-  // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
-  const slash = useSlashSkills({ applyDraft: setDraft });
+  // `/` 唤起 skill：选中后补全成内联 `/name ` token（Codex 风、留在文本流里）
+  const slash = useSlashSkills({
+    draft,
+    applyDraft: (next, cursor) => {
+      setDraft(next);
+      saveDraft("reply", task.id, next);
+      if (cursor == null) return;
+      // 等受控 value commit 后再落光标，否则 selection 会被 React 冲掉
+      requestAnimationFrame(() => {
+        const el = inputRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(cursor, cursor);
+      });
+    },
+  });
 
   // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
   // 原消息保留（append-only 事件日志、持久会话没法真 fork）；只有最后一条才给入口（用户拍板：

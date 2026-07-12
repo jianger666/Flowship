@@ -4,12 +4,11 @@
  * 统一输入岛 Composer（v1.1.x、用户点名「封装一个高级的输入框、chat / task 都复用」）
  *
  * 之前 chat 输入岛（event-stream 内）和 task「跟 AI 说」条（task-talk-composer）
- * 各手写一份、长得像但代码两套；skill chip 也是独立一排小药丸、不像 Codex 那种
- * 「框内内容」的高亮 token。本组件收口全部输入岛能力：
+ * 各手写一份、长得像但代码两套。本组件收口全部输入岛能力：
  *
  * - 岛容器：圆角 + focus 高亮 + 拖拽文件落入高亮
  * - 顶边拖柄：往上拉变高（贴底输入条的直觉方向）、高度记全局偏好
- * - skill chips（Codex 风）：框内第一行、品牌色 icon + 文字 token、hover 出移除键
+ * - skill 内联 token（Codex 风）：文本流里保留 `/skill-name`、mirror overlay 铺品牌色底衬
  * - `/` slash 菜单（浮岛上方）
  * - 附件预览：图缩略（可移除 / 点看大图）+ 文件 / 目录路径 chips
  * - textarea：提交快捷键（个人偏好 + IME 安全）、随内容自增、拖过则固定高
@@ -28,13 +27,16 @@ import {
   FolderOpen,
   ImagePlus,
   Loader2,
-  Sparkles,
   Square,
   X,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { SlashSkillMenu, type SlashSkillsApi } from "@/components/slash-skills";
+import {
+  parseSkillTokens,
+  SlashSkillMenu,
+  type SlashSkillsApi,
+} from "@/components/slash-skills";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { Textarea } from "@/components/ui/textarea";
@@ -50,6 +52,13 @@ import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 // 拖高上下界（px）：下界 = 默认两行高、上界防把上方内容顶没
 const MIN_BOX_HEIGHT = 52;
 const MAX_BOX_HEIGHT = 400;
+
+/**
+ * textarea 与 mirror overlay 共用排版 class——字体度量必须一致，否则底衬错位。
+ * 抽常量防两处漂移。
+ */
+const COMPOSER_TEXT_CLASS =
+  "min-h-13 w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
 
 export interface ComposerProps {
   value: string;
@@ -90,6 +99,49 @@ export interface ComposerProps {
   className?: string;
 }
 
+/**
+ * 把草稿拆成「普通文字 + 命中 skill token」片段，给 mirror 渲染底衬用。
+ * 普通文字 / token 文字都 text-transparent——只靠 token 的 bg 可见、字仍由上层 textarea 画。
+ */
+const renderSkillHighlightMirror = (
+  text: string,
+  knownNames: ReadonlySet<string>,
+) => {
+  if (!text) return null;
+  const tokens = parseSkillTokens(text, knownNames);
+  if (tokens.length === 0) {
+    return <span className="text-transparent">{text}</span>;
+  }
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  tokens.forEach((t, i) => {
+    if (t.start > cursor) {
+      parts.push(
+        <span key={`t-${i}`} className="text-transparent">
+          {text.slice(cursor, t.start)}
+        </span>,
+      );
+    }
+    parts.push(
+      <span
+        key={`s-${i}-${t.name}`}
+        className="rounded bg-primary/15 text-transparent"
+      >
+        {text.slice(t.start, t.end)}
+      </span>,
+    );
+    cursor = t.end;
+  });
+  if (cursor < text.length) {
+    parts.push(
+      <span key="tail" className="text-transparent">
+        {text.slice(cursor)}
+      </span>,
+    );
+  }
+  return parts;
+};
+
 export const Composer = ({
   value,
   onChange,
@@ -121,19 +173,23 @@ export const Composer = ({
   // 内部 fallback ref：调用方不传 textareaRef 时拖高也要能量初始高度
   const innerRef = useRef<HTMLTextAreaElement | null>(null);
   const taRef = textareaRef ?? innerRef;
+  // mirror 底衬层：跟 textarea 同步 scrollTop，避免滚动后高亮错位
+  const mirrorRef = useRef<HTMLDivElement | null>(null);
   const submitShortcut = useSubmitShortcut();
 
   const images = attach?.images ?? [];
   const pathList = paths ?? [];
   const hasContent =
     value.trim().length > 0 || images.length > 0 || pathList.length > 0;
-  const hasContextRow =
-    (slash?.picked.length ?? 0) > 0 || images.length > 0 || pathList.length > 0;
+  // 上下文行只剩图 / 路径（skill 已内联进文本、不再单独占一行）
+  const hasContextRow = images.length > 0 || pathList.length > 0;
 
   const handleSubmit = () => {
     if (disabled || submitting || !hasContent) return;
     onSubmit();
   };
+
+  const boxStyle = boxHeight != null ? { height: boxHeight } : undefined;
 
   return (
     <div
@@ -196,28 +252,9 @@ export const Composer = ({
         </div>
       )}
 
-      {/* 上下文行（框内、Codex 风）：skill token + 图缩略 + 路径 chips 同一片区 */}
+      {/* 上下文行：图缩略 + 路径 chips（skill 已内联、不在这里） */}
       {hasContextRow && (
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 pt-1.5">
-          {/* skill token：品牌色 icon + 文字、像输入内容的一部分；hover 出移除键 */}
-          {slash?.picked.map((s) => (
-            <span
-              key={s.name}
-              className="group/chip inline-flex items-center gap-1 text-[13px] font-medium text-primary"
-              title={s.description}
-            >
-              <Sparkles className="size-3.5" />
-              {s.name}
-              <button
-                type="button"
-                onClick={() => slash.removeSkill(s.name)}
-                aria-label={`移除 skill ${s.name}`}
-                className="cursor-pointer rounded-full p-0.5 opacity-0 transition-opacity hover:bg-primary/15 group-hover/chip:opacity-100"
-              >
-                <X className="size-3" />
-              </button>
-            </span>
-          ))}
           {images.map((img, i) => (
             <ImageThumb
               key={img.id}
@@ -262,36 +299,60 @@ export const Composer = ({
         </div>
       )}
 
-      {/* 输入框：去边框嵌入岛内、岛的 focus-within 提供聚焦反馈。
-          未拖过：field-sizing 随内容自增 + max-h 兜顶；拖过：固定高度接管 */}
-      <Textarea
-        ref={taRef}
-        value={value}
-        onChange={(e) => {
-          onChange(e.target.value);
-          slash?.onDraftChange(
-            e.target.value,
-            e.target.selectionStart ?? e.target.value.length,
-          );
-        }}
-        onPaste={attach?.onPaste}
-        onKeyDown={(e) => {
-          // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
-          if (slash?.onKeyDown(e)) return;
-          if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-            e.preventDefault();
-            handleSubmit();
-          }
-        }}
-        rows={2}
-        placeholder={placeholder}
-        disabled={disabled}
-        style={boxHeight != null ? { height: boxHeight } : undefined}
-        className={cn(
-          "min-h-13 resize-none overflow-y-auto border-0 bg-transparent px-3.5 pt-1 pb-2.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent",
-          boxHeight == null && "max-h-64",
+      {/* 输入区：下层 mirror 铺 skill 底衬、上层原生 textarea（IME / 光标零风险） */}
+      <div className="relative">
+        {slash && value.length > 0 && (
+          <div
+            ref={mirrorRef}
+            aria-hidden
+            className={cn(
+              "pointer-events-none absolute inset-0 z-0 overflow-hidden",
+              COMPOSER_TEXT_CLASS,
+              boxHeight == null && "max-h-64",
+            )}
+            style={boxStyle}
+          >
+            {renderSkillHighlightMirror(value, slash.knownNames)}
+            {/* 末尾换行占位：跟 textarea 一样、末行空行也要有高度 */}
+            {value.endsWith("\n") ? "\n" : null}
+          </div>
         )}
-      />
+        <Textarea
+          ref={taRef}
+          value={value}
+          onChange={(e) => {
+            onChange(e.target.value);
+            slash?.onDraftChange(
+              e.target.value,
+              e.target.selectionStart ?? e.target.value.length,
+            );
+          }}
+          onScroll={(e) => {
+            // 只同步纵向——textarea wrap 不产生水平滚
+            if (mirrorRef.current) {
+              mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
+            }
+          }}
+          onPaste={attach?.onPaste}
+          onKeyDown={(e) => {
+            // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
+            if (slash?.onKeyDown(e)) return;
+            if (shouldSubmitOnKeyDown(e, submitShortcut)) {
+              e.preventDefault();
+              handleSubmit();
+            }
+          }}
+          rows={2}
+          placeholder={placeholder}
+          disabled={disabled}
+          style={boxStyle}
+          className={cn(
+            "relative z-10 resize-none overflow-y-auto border-0 bg-transparent shadow-none focus-visible:ring-0 dark:bg-transparent",
+            COMPOSER_TEXT_CLASS,
+            boxHeight == null && "max-h-64",
+          )}
+        />
+      </div>
 
       {/* footer：左 slot + 右动作组（运行态原地替换、不顶布局） */}
       <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">
