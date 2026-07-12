@@ -7,37 +7,24 @@
  * AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」
  * 上下文；会话断时服务端按 action 状态走唤醒 / 一次性临时 agent、客户端无感。
  *
- * 支持贴图（粘贴 / 附图按钮）、`/` 唤起 skill（v1.0）；Cmd/Ctrl+J 聚焦。
- * agent 正在跑时禁用；任务终态整条隐藏。
+ * v1.1.x 起视觉 / 交互统一走 <Composer>（chat 输入岛同款）：贴图 / 附文件目录 /
+ * `/` 唤起 skill / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定）。
+ * Cmd/Ctrl+J 聚焦。agent 正在跑时禁用；任务终态整条隐藏。
  */
 
 import { useEffect, useRef, useState } from "react";
-import { ImagePlus, Loader2, Send } from "lucide-react";
 import { toast } from "sonner";
 
-import { cn } from "@/lib/utils";
-import {
-  SlashSkillChips,
-  SlashSkillMenu,
-  useSlashSkills,
-} from "@/components/slash-skills";
-import { Button } from "@/components/ui/button";
-import { ImageThumb } from "@/components/ui/image-preview";
+import { Composer } from "@/components/composer";
+import { useSlashSkills } from "@/components/slash-skills";
 import { ModelSelect } from "@/components/ui/model-select";
-import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
-import { useSubmitShortcut } from "@/hooks/use-settings";
+import { usePathAttach } from "@/hooks/use-path-attach";
 import { findPendingAskEvent } from "@/lib/ask-pending";
 import { getSettings } from "@/lib/local-store";
-import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitTaskQuestion } from "@/lib/task-store";
-import {
-  loadBoxHeight,
-  loadDraft,
-  saveBoxHeight,
-  saveDraft,
-} from "@/lib/view-memory";
+import { loadDraft, saveDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
 
 interface Props {
@@ -46,34 +33,23 @@ interface Props {
   onTaskUpdate: (next: Task) => void;
 }
 
-// 输入框自定义拖高的上下界（px）：下界 = 默认两行高、上界防把事件流顶没
-const MIN_BOX_HEIGHT = 52;
-const MAX_BOX_HEIGHT = 400;
-
 export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   // 草稿：按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）、发送后清
   const [draft, setDraft] = useState(() => loadDraft("talk", task.id));
-  // 输入框高度（null = 默认）：原生 resize-y 拖柄在右下、往下拉才变高——对贴底输入条反直觉
-  //（用户点名）、改成顶边拖柄：往上拉变高、往下拉变矮；拖过的高度记全局偏好（v1.1.x）
-  const [boxHeight, setBoxHeight] = useState<number | null>(() => {
-    const saved = loadBoxHeight();
-    return saved != null
-      ? Math.min(MAX_BOX_HEIGHT, Math.max(MIN_BOX_HEIGHT, saved))
-      : null;
-  });
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
   // 显式指定的模型（id 空 = 跟随会话；选了 = 换这个模型处理本条消息）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
-  const submitShortcut = useSubmitShortcut();
   // 模型列表：打开选择器时按需拉（SWR 缓存、不重复打网络）
   const { models, fetchModels } = useModels();
-  // 贴图（粘贴 / 选文件）——revise 高频带截图
-  const attach = useImageAttach({ maxImages: 6, disabled: submitting });
-  // 切 task 时换载对应草稿（详情页在不同任务间导航时组件可能不重挂）
+  // 文件 / 目录路径附件（原生 picker、chat 输入岛同款 hook）
+  const pathAttach = usePathAttach();
+  const resetPaths = pathAttach.reset;
+  // 切 task 时换载对应草稿 + 清路径附件（详情页在不同任务间导航时组件可能不重挂）
   useEffect(() => {
     setDraft(loadDraft("talk", task.id));
-  }, [task.id]);
+    resetPaths();
+  }, [task.id, resetPaths]);
 
   // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -94,7 +70,6 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   const slash = useSlashSkills({ applyDraft: setDraft });
 
   // 有未答提问（且当前阶段没停摆）→ 输入条切「答题引导态」：禁输入、placeholder 指路。
-  // 原来能输入、回车才 toast 报 409——用户验收点名「卡点要提前可视化」。
   // 阶段停摆（error/cancelled）时提问已没人接、照常放行（唤醒通道）。
   const halted = task.actions.some(
     (a) =>
@@ -103,9 +78,19 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   );
   const awaitingAnswer = !halted && !!findPendingAskEvent(task.events);
 
+  // 贴图（粘贴 / 选文件 / 拖拽）——不可输入时（busy / 答题引导态）所有 handler 短路
+  const attach = useImageAttach({
+    maxImages: 6,
+    disabled: busy || awaitingAnswer,
+  });
+
   const handleSubmit = async () => {
     const text = draft.trim();
-    if ((!text && attach.images.length === 0) || busy) return;
+    if (
+      (!text && attach.images.length === 0 && pathAttach.paths.length === 0) ||
+      busy
+    )
+      return;
     setSubmitting(true);
     try {
       const images = attach.toUploadPayload();
@@ -117,12 +102,14 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         slash.buildSkillPrefix() + text,
         images,
         pickedModel.id ? pickedModel : undefined,
+        pathAttach.paths,
       );
       onTaskUpdate(updated);
       setDraft("");
       saveDraft("talk", task.id, "");
       slash.reset();
       attach.reset();
+      pathAttach.reset();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -136,105 +123,29 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   }
 
   return (
-    // 输入岛（对齐 chat 输入条形态、V0.12.x 用户点名重整）：圆角边框、focus 高亮、
-    // textarea 在上、模型 + 附图 / 发送收进同一条 footer（不再单独一排）
     <div className="border-t px-3 py-2">
-      <div className="relative flex flex-col rounded-lg border bg-background/40 transition-colors focus-within:border-ring/60">
-        {/* `/` skill 菜单（浮输入条上方）+ 已选 chips（v1.0） */}
-        <SlashSkillMenu slash={slash} />
-        <SlashSkillChips slash={slash} />
-        {/* 顶边拖柄：贴底输入条的直觉方向——往上拉变高。pointer capture 保证拖出手柄仍跟手 */}
-        <div
-          className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
-          onPointerDown={(e) => {
-            e.preventDefault();
-            const startY = e.clientY;
-            const startH =
-              boxHeight ??
-              textareaRef.current?.getBoundingClientRect().height ??
-              MIN_BOX_HEIGHT;
-            // 拖动过程中的最新高度（onUp 时落盘、避免每次 move 都写 localStorage）
-            let latest: number | null = null;
-            const onMove = (ev: PointerEvent) => {
-              const next = Math.min(
-                MAX_BOX_HEIGHT,
-                Math.max(MIN_BOX_HEIGHT, startH + (startY - ev.clientY)),
-              );
-              latest = next;
-              setBoxHeight(next);
-            };
-            const onUp = () => {
-              window.removeEventListener("pointermove", onMove);
-              window.removeEventListener("pointerup", onUp);
-              if (latest != null) saveBoxHeight(latest);
-            };
-            window.addEventListener("pointermove", onMove);
-            window.addEventListener("pointerup", onUp);
-          }}
-          aria-label="拖动调整输入框高度"
-          title="上下拖动调整高度"
-        >
-          <div className="h-1 w-10 rounded-full bg-border/60 transition-colors group-hover:bg-muted-foreground/50" />
-        </div>
-
-        {/* 已贴的图（发送前可移除、点击看大图）——贴输入框上方 */}
-        {attach.images.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-3 pt-2">
-            {attach.images.map((img, i) => (
-              <ImageThumb
-                key={img.id}
-                src={img.dataUrl}
-                alt={img.file.name}
-                className="size-10 rounded bg-background"
-                onRemove={() => attach.removeImage(img.id)}
-                group={attach.images.map((im) => ({
-                  src: im.dataUrl,
-                  alt: im.file.name,
-                }))}
-                index={i}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* 高度由顶边拖柄控制（style.height）、不用原生 resize（方向反直觉） */}
-        <Textarea
-          ref={textareaRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            saveDraft("talk", task.id, e.target.value);
-            slash.onDraftChange(
-              e.target.value,
-              e.target.selectionStart ?? e.target.value.length,
-            );
-          }}
-          onPaste={attach.onPaste}
-          onKeyDown={(e) => {
-            // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
-            if (slash.onKeyDown(e)) return;
-            if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-              e.preventDefault();
-              void handleSubmit();
-            }
-          }}
-          placeholder={
-            awaitingAnswer
-              ? "先回答上方 AI 的提问"
-              : "想改、想问、贴图、/ 唤起 skill（⌘/Ctrl+J）"
-          }
-          rows={2}
-          disabled={busy || awaitingAnswer}
-          style={boxHeight != null ? { height: boxHeight } : undefined}
-          // 没手动拖过：field-sizing 随内容自增、max-h 兜顶；拖过：固定高度接管
-          className={cn(
-            "min-h-13 resize-none overflow-y-auto border-0 bg-transparent px-3 pt-0.5 pb-2.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent",
-            boxHeight == null && "max-h-64",
-          )}
-        />
-
-        {/* footer：左 = 模型（默认跟随会话、下拉里可随时点回）、右 = 附图 + 发送 */}
-        <div className="flex items-center justify-between gap-2 px-2 pb-1.5 pt-0.5">
+      <Composer
+        value={draft}
+        onChange={(v) => {
+          setDraft(v);
+          saveDraft("talk", task.id, v);
+        }}
+        onSubmit={() => void handleSubmit()}
+        placeholder={
+          awaitingAnswer
+            ? "先回答上方 AI 的提问"
+            : "想改、想问、贴图、/ 唤起 skill（⌘/Ctrl+J）"
+        }
+        disabled={busy || awaitingAnswer}
+        submitting={submitting}
+        textareaRef={textareaRef}
+        slash={slash}
+        attach={attach}
+        paths={pathAttach.paths}
+        onRemovePath={pathAttach.removePath}
+        onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
+        picking={pathAttach.picking}
+        leading={
           <ModelSelect
             models={models}
             selection={pickedModel}
@@ -249,44 +160,8 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
             }}
           />
-          <div className="flex shrink-0 items-center gap-0.5">
-            <Button
-              size="icon-xs"
-              variant="ghost"
-              onClick={attach.triggerFilePicker}
-              disabled={busy || awaitingAnswer || attach.images.length >= attach.maxImages}
-              aria-label="附图"
-              title="附图（也可直接粘贴）"
-              className="text-muted-foreground/70"
-            >
-              <ImagePlus />
-            </Button>
-            <Button
-              size="icon-xs"
-              variant="ghost"
-              onClick={() => void handleSubmit()}
-              disabled={
-                busy ||
-                awaitingAnswer ||
-                (draft.trim().length === 0 && attach.images.length === 0)
-              }
-              aria-label="发送"
-              title="发送"
-              className="text-muted-foreground"
-            >
-              {submitting ? <Loader2 className="animate-spin" /> : <Send />}
-            </Button>
-          </div>
-          <input
-            ref={attach.fileInputRef}
-            type="file"
-            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-            multiple
-            className="hidden"
-            onChange={attach.onFileInputChange}
-          />
-        </div>
-      </div>
+        }
+      />
     </div>
   );
 };

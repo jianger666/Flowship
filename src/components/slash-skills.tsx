@@ -10,12 +10,9 @@
  *   不在 textarea 里做富文本高亮（overlay mirror 成本高、chip 更清晰）
  * - 发送时调 buildSkillPrefix() 拼消息头：点名让 AI 先 read 对应 SKILL.md 再执行
  *
- * 用法（调用方三步）：
- *   const slash = useSlashSkills();
- *   <Textarea onChange={(e) => { setDraft(v); slash.onDraftChange(v, e.target.selectionStart); }}
- *             onKeyDown={(e) => { if (slash.onKeyDown(e)) return; ...原有逻辑 }} />
- *   容器里挂 <SlashSkillMenu slash={slash} onApply={(next) => setDraft(next)} />、
- *   chips 挂 <SlashSkillChips slash={slash} />、发送时 text = slash.buildSkillPrefix() + text
+ * 用法：const slash = useSlashSkills({ applyDraft }) 后把 slash 整个传给
+ * <Composer slash={slash} />（菜单 / chips / 键盘 / 光标同步都在 Composer 内接好）、
+ * 发送时 text = slash.buildSkillPrefix() + text、成功后 slash.reset()。
  */
 
 import {
@@ -26,7 +23,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { Sparkles, X } from "lucide-react";
+import { Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -294,29 +291,5 @@ export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
   );
 };
 
-/** 已选 skill chips（输入框上方一行、高亮可删） */
-export const SlashSkillChips = ({ slash }: { slash: SlashSkillsApi }) => {
-  if (slash.picked.length === 0) return null;
-  return (
-    <div className="flex flex-wrap gap-1.5 px-3 pt-2">
-      {slash.picked.map((s) => (
-        <span
-          key={s.name}
-          className="flex items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"
-          title={s.description}
-        >
-          <Sparkles className="size-3" />
-          {s.name}
-          <button
-            type="button"
-            onClick={() => slash.removeSkill(s.name)}
-            aria-label={`移除 skill ${s.name}`}
-            className="cursor-pointer rounded-full p-0.5 hover:bg-primary/20"
-          >
-            <X className="size-2.5" />
-          </button>
-        </span>
-      ))}
-    </div>
-  );
-};
+// 注：旧的 SlashSkillChips（独立一排小药丸）已退役——chips 渲染收进 <Composer>
+// 的上下文行（Codex 风框内 token）、见 src/components/composer.tsx

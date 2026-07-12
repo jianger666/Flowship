@@ -572,6 +572,8 @@ export const submitTaskQuestion = async (
   images?: ImagePayload[],
   // 显式指定模型（V0.11.9）：传了 = 不续会话（会话模型换不了）、按后端分流换模型处理
   forceModel?: ModelSelection,
+  // 文件 / 目录绝对路径附件（v1.1.x 任务输入条也能附路径）
+  attachments?: string[],
 ): Promise<Task> => {
   const s = getSettings();
   const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
@@ -580,6 +582,8 @@ export const submitTaskQuestion = async (
     body: JSON.stringify({
       text,
       images: images && images.length > 0 ? images : undefined,
+      attachments:
+        attachments && attachments.length > 0 ? attachments : undefined,
       bootArgs: {
         apiKey: s.apiKey,
         model: s.defaultModel,

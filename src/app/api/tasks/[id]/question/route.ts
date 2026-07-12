@@ -11,7 +11,7 @@
  * 传输分流（对用户透明）：会话活着 send；会话断 + action 停半路（含 awaiting_ack）唤醒
  * 新 agent 原地续（显式换模型用新模型跑）；会话断 + 已完结起一次性临时 agent。
  *
- * Body: { text, images?, bootArgs?: { apiKey, model }, forceModel? }
+ * Body: { text, images?, attachments?, bootArgs?: { apiKey, model }, forceModel? }
  */
 
 import { appendEvent, getTask, patchAction, setTaskRunStatus } from "@/lib/server/task-fs";
@@ -29,6 +29,7 @@ import {
 import { publishTaskStreamEvent, runningTasks } from "@/lib/server/task-stream";
 import {
   errorResponse,
+  parseAndValidateAttachments,
   parseAndValidateImages,
 } from "@/lib/server/route-helpers";
 
@@ -39,6 +40,8 @@ interface Ctx {
 interface PostBody {
   text?: string;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
+  /** 文件 / 目录绝对路径（原生 picker 选的、v1.1.x 任务输入条也能附） */
+  attachments?: string[];
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
@@ -53,6 +56,7 @@ interface PostBody {
 }
 
 const MAX_IMAGES = 6;
+const MAX_ATTACHMENTS = 10;
 
 export const runtime = "nodejs";
 
@@ -70,8 +74,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES);
   if (!imagesResult.ok) return imagesResult.errorResponse;
   const images = imagesResult.images;
-  if (!text && images.length === 0) {
-    return errorResponse("text / images 至少一项非空");
+  const attachResult = await parseAndValidateAttachments(
+    body.attachments,
+    MAX_ATTACHMENTS,
+  );
+  if (!attachResult.ok) return attachResult.errorResponse;
+  const attachmentPaths = attachResult.paths;
+  if (!text && images.length === 0 && attachmentPaths.length === 0) {
+    return errorResponse("text / images / attachments 至少一项非空");
   }
 
   const task = await getTask(id);
@@ -144,6 +154,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         imageAbsPaths,
         { apiKey, model },
         ackContext,
+        attachmentPaths.length > 0 ? attachmentPaths : undefined,
       );
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
@@ -183,10 +194,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const questionEvent = await appendEvent(task.id, {
     kind: "user_reply",
     actionId: task.currentActionId ?? undefined,
-    text: text || "(用户附了图片提问)",
+    text: text || "(用户附了图片 / 文件提问)",
     meta: {
       kind: "question",
       ...(savedImages && savedImages.length > 0 ? { images: savedImages } : {}),
+      // 前端 extractUserReplyAttachments 读 meta.attachments（对象数组）渲染路径 chips
+      ...(attachmentPaths.length > 0 ? { attachments: attachResult.metas } : {}),
     },
   });
   if (questionEvent) {
@@ -219,6 +232,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       task,
       userMessage: text,
       imagePaths: imageAbsPaths,
+      attachmentPaths: attachmentPaths.length > 0 ? attachmentPaths : undefined,
       apiKey: apiKey!,
       fallbackModel: fallbackModel!,
       // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
@@ -246,10 +260,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 
   if (useOneShot) {
-    startOneShotQuestion(task, text, imageAbsPaths, {
-      apiKey: apiKey!,
-      model: fallbackModel!,
-    });
+    startOneShotQuestion(
+      task,
+      text,
+      imageAbsPaths,
+      { apiKey: apiKey!, model: fallbackModel! },
+      attachmentPaths.length > 0 ? attachmentPaths : undefined,
+    );
   }
 
   return new Response(JSON.stringify({ ok: true, task: updated ?? task }), {

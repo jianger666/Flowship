@@ -228,7 +228,8 @@ export interface UserReplyImageMeta {
   filename?: string;
 }
 
-// user_reply 事件里 meta.attachments 的形状（chat-reply route 写）
+// user_reply 事件里 meta.attachments 的形状（chat-reply / question route 写、
+// 服务端 route-helpers 的 AttachmentMeta 同形）
 // 跟图片不同：这是用户用原生 picker 选的真实文件 / 目录、不上传内容、只存路径
 export interface UserReplyAttachmentMeta {
   absPath: string;

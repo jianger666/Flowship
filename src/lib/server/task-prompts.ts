@@ -613,6 +613,8 @@ export const buildResumeActionInstruction = (
   // 用户唤醒时说的话（输入条内容、非空）
   userMessage: string,
   imagePaths?: string[],
+  // 用户随消息附的文件 / 目录绝对路径（v1.1.x 任务输入条也能附路径）
+  attachmentPaths?: string[],
 ): string => {
   const lines: string[] = [
     "[RESUME_ACTION]",
@@ -647,6 +649,12 @@ export const buildResumeActionInstruction = (
     lines.push(
       "   - 用户随消息附了图、先用 \`read\` 逐一读：",
       ...imagePaths.map((p, i) => `     ${i + 1}. ${p}`),
+    );
+  }
+  if (attachmentPaths && attachmentPaths.length > 0) {
+    lines.push(
+      "   - 用户随消息附了文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取：",
+      ...attachmentPaths.map((p, i) => `     ${i + 1}. ${p}`),
     );
   }
 

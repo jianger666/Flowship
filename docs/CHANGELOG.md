@@ -15,6 +15,247 @@
 
 ---
 
+### 2026-07-11 夜 v1.1.1 启动提速 + 视图记忆 + 改名自迁移（用户逐条拍板、Grok 蓝军审核过）
+
+- **同事「启动很慢」根因修复**：首页就绪 gate 阻塞在 `/api/system/feishu-cli`、每次真 spawn 4 个子进程探测（version ×2 + auth status ×2、Windows Defender 首扫 + auth 打网络验 token 可拖 10~30s）——`getFeishuCliStatus` 改 **stale-while-revalidate**（内存 + 磁盘双缓存立即返回、后台 single-flight 真探测刷新；磁盘缓存跨重启、实测 20ms）；装/登/卸后 `invalidateStatusCache`（**代数护栏**：invalidate 递增 gen、旧 in-flight 结果落盘前核对、防失效前快照覆盖回来——蓝军 P1）；看板数据缓存 session → localStorage（重启秒开旧数据 + 转圈后台刷）
+- **mac 改名自迁移**（老版本一次升级即改名）：新版首启发现 .app 文件名 ≠ 产品名 → 原子 rename → open 新路径重启接力 → 通知「重新固定 Dock」；覆盖所有 <v1.1 升级路径。**⚠️ updater 内不做 rename**（蓝军 P0：ditto 后改名、用户点「稍后」= 运行中进程按失效路径 lazy-load 必坏）——迁移只在启动时做、rename 后立即重启、无带病续跑窗口
+- **视图记忆五件套**（`src/lib/view-memory.ts` 单一收口；session 级 = 重启即忘 / localStorage = 全局偏好 / 内存 Map = 滚动锚点）：① 最后浏览的对话（/chats 落点优先回它）② 事件流滚动位置（rangeChanged 记视口顶事件 id、非贴底离开恢复原位；**chat 模式 EventStream 补 `key={task.id}`**——Virtuoso 初始定位只在 mount 生效、蓝军 P1）③ 输入草稿按 task 记（chat 输入岛 + 任务说话条、发送后清）④ 输入条拖过的高度 ⑤ 看板时间范围
+- **侧栏「待确认」已读即清**（用户拍板「点进去看过、状态就该清掉」）：详情页上报 seenAt（localStorage、300 条裁剪）、awaiting_ack 且 seenAt >= updatedAt 时监控行 + 琥珀点熄；新交卷自动重亮；「待回答」不清（AI 阻塞等答案）
+- **splash 改主窗同尺寸同位置**（「首屏就和打开后一样大」）+ hero loading **200ms 静默窗**（应用内切换秒开不闪 loading、启动 10s 窗口内 immediate 仍立即可见防白屏）
+- **设置页**：偏好加「新任务默认隔离工作区」开关（测试类只读用法可默认直跑原仓）；GitLab Token 双倍间距修复（SettingRow 开 className、连接卡两节 py-0）；删「废话 hint」仅一处（解释不存在的 Host 字段那条——判据：解释用户看不到的东西才是废话、全删会光秃秃、用户两轮纠偏）；删任务页「需求详情」按钮（工作项 description 团队实践恒空、纯误导）
+- 方向讨论沉淀（明日清单）：skill 可关 + role 默认自适应隐藏；action 文件夹化（ACTION.md 规范）+ AI 帮建 action；能力页 Rules tab；测试团队接入零新基建（多仓 + 默认不隔离 + action 模板）
+
+### 2026-07-11 v1.1.0 改名「Flowship」+ 开屏 splash 独立小窗（正式第一版、用户拍板）
+
+- **产品改名 Flowship**（flow=需求流转 + ship=交付上线 action、用户三轮选型拍板；替代「AI工作流」）：只改**显示层**——`productName`（electron-builder.yml + electron-app/package.json）、页面 title、诊断包名、OAuth 回调文案、通知默认标题、test 包名 `FlowshipTest`；**内部标识一律不动**——appId `com.jianger.fe-ai-flow`（win 升级不裂）、userData `fe-ai-flow`（壳钉死、数据不漂移）、artifactName ascii（updater 下载链路稳）、仓库名。注意：mac 老用户应用内自更新是 ditto 替换 .app **内容**、磁盘上文件名仍是「AI工作流.app」、Finder 显示名 / Dock 会变 Flowship（纯外观残留、无害）
+- **开屏 splash 改独立 frameless 小窗、直接到底**（用户实测「开屏和工作台 loading 始终有衔接闪烁」、拍板「splash 直接到底」）：boot 期间只有品牌小窗可见（BrandMark 通电动效、可拖）、主窗 `show:false` 静默加载 BASE_URL、`ready-to-show` 先亮主窗再收 splash——可见窗口里**没有任何文档切换**、闪烁源头消除（此前方案：主窗先 load splash 文档再 loadURL 换页、必有一两帧空白）；splash 关闭不触发 window-all-closed（主窗 hidden 仍算窗口）；loadURL 完成兜底亮窗（个别路径 ready-to-show 不触发）
+- **README 全面刷新**：改名说明、胶囊双模式 / 飞书看板一键建任务（V0.14 砍手动新建）、内置飞书 CLI 替代自配 MCP 强校验、就绪清单 onboarding、能力页 /actions、项目结构树补 chats/actions 页
+
+### 2026-07-11 v1.0.x 渲染减重 + 编辑重发 + 事件懒加载 + 存储清理（用户晨间验收反馈、Grok 蓝军审核）
+
+- **chat 最后一条用户消息「重发 / 原地编辑」**：hover 出两 icon（↻ 原样重发 / ✎ 原地编辑）、铅笔把气泡原地变 textarea（Esc 取消、Cmd/Ctrl+Enter 发）——语义 = 把内容作为**新消息发到末尾**（append-only 事件日志 + SDK 持久会话没有 fork API、做不了 ChatGPT 式截断重生、用户拍板只支持最后一条）；旧「填回输入框」交互删除
+- **Streamdown 代码块 / 表格减重**（用户实测「双层卡片 + 操作栏太重」）：controls 精简（代码只留复制、表格全关、mermaid 留全屏 + 拖拽缩放）；globals.css 按稳定锚点 `[data-streamdown="code-block|mermaid-block|table-wrapper"]` 打薄外层卡壳（去 bg-sidebar / 外边框 / p-2、my-4 收紧）。**⚠️ 行号不能用 `lineNumbers={false}` 关**（上游 v2.x 该路径行 span 不带 block class、非空行也不吐 `\n`、整块代码塌成一行——headless CDP 实测）——保留默认行结构、globals.css 把行号 `::before` 计数器藏掉
+- **代码引用围栏高亮修复**（`remark-code-reference.ts` + 单测）：AI 常输出 ```` ```12:34:src/foo.tsx ```` 的 Cursor 代码引用 fence、info 串不是合法语言 → Shiki 全灰（用户报「代码没高亮」主因）；插件把 lang 重写为按文件后缀推断的语言 + 前插一行 inlineCode「路径 · L12-34」出处（路径带空格的 lang+meta 拼回整体匹配）
+- **事件懒加载（上拉分页）**：打开任务只拉最近 300 条（GET `?tail=` + watch-task bootstrap 同口径）、Virtuoso `startReached` 上拉自动补更早分页（GET `/events?before=&limit=`、`firstItemIndex` 官方 prepend 机制保滚动位、items 增量按合并纯函数前后差值算——thinking/tool 相邻合并会跨页；`loadingEarlierRef` 同步重入闸 + prepend 前按本地 id 去重、防 firstItemIndex 多减错位）；**SSE 中途 task/done 帧一律剥 events**（原来每帧重传全量事件日志、长对话每帧几百 KB 纯浪费）；客户端所有「服务端 task 快照 → state」收口 `mergeTaskEvents`（**本地事件只增不换**：只吸收末尾新增、更早回灌一律丢——蓝军 P0：mutation 响应带全量 events、发条消息就把懒加载打穿；事件 append-only 从不改写、丢弃早段无损；有单测）
+- **设置页存储卡**（app 越用越大、用户拍板手动清理不自动删）：`/api/system/storage` 扫 data/tasks 占用（按大小降序）、勾选批量删（走既有 DELETE 完整停 agent 链路）、快捷筛选「已终结任务 / 30 天未活跃对话」（chat 无终态、按不活跃挑）
+- **长会话上下文结论（用户问）**：SDK 本地 agent 与 CLI/IDE 同 runtime、context 满自动摘要交给 Cursor 管、我们不干预；SDK 无 fork/checkpoint API（能力面只有 create/prompt/resume/send/getRun）、真要「从此处开新对话」只能截断历史 + 新会话、列为将来独立功能
+- **工作台侧栏降噪**（用户实测「有那么多状态反而更杂乱」）：监控行只在 运行中/待确认/待回答 出现、空闲/静息/失败一律单行只标题（失败不标同行首指示原则——陈年断线 error 满屏红字是噪声主源）；工作台折叠组「更早（超7天）」→「已终结（已合入/已放弃）」（时间分组是对话的逻辑不是任务的）、对话侧保持按时间
+- **设置页瘦身 + 能力页**（用户拍板「能力集中一个页面配置、设置页锚点侧导航」）：/actions 升级「能力页」tab 三分（Action=原自定义 action 管理整体迁入 / Skill=SkillsCard / MCP=McpCard+useSettings 落盘链路）；设置页删 MCP/Skills 卡、加左侧 sticky 锚点导航（点击定位 + IntersectionObserver 滚动跟随高亮）；旧深链兼容：settingsUrl("mcp"/"skills") 直出 /actions?tab=、设置页 ?focus=mcp|skills 兜底重定向
+- **新用户「开始使用」就绪清单**（用户点名「飞书工具是最重要的、要保证新用户进来就配」）：`setup-checklist.tsx`——三项就绪度（API Key / 飞书工具两 CLI 装+登 / ≥1 仓库）任一未完成时**占据首页看板位**、全就绪自动切看板；不做 wizard（能跳过=不出现、清单配不完每次打开都在才叫「保证」）。用户实测后简化：单卡三行、每行 = 状态勾 + 标题 + 「去配置」跳设置页对应卡（配置本体都在设置页、行内不塞输入）
+- **config.json 密钥 PUT 掩码兜底（后经用户澄清收窄）**：test 实例 apiKey 空是**用户自己清的**、不是事故——守卫按用户拍板收窄为「只拦掩码回写、清空放行」：`preserveSecretsOnPut`（settings-fs、有单测）只在 PUT 进来的 apiKey/gitToken 带脱敏掩码（maskSecret 产物）时保留盘上真值；`recordModelUsage` 先 `await initSettings()` 再整对象落盘（启动早期 stale cache 防线、保留）
+- **Logo 重设计「雷芯」+ loading = logo 通电（用户三轮选型拍板：C 闪电 DNA → C1+C2 融合 → F1 图形 + 环流动效）**：实心琥珀渐变闪电 + 贯穿裂隙（= 电路通道、两端节点）；`BrandMark`（components/ui/brand-mark.tsx、useId 防渐变 id 撞）animated 形态 = 亮电流沿闪电轮廓环流（pathLength=100 归一 + dash 动画、globals.css `brand-*`）+ 光晕呼吸；`LoadingState variant="hero"` 即 logo 通电、全站页面级 loading 统一。**桌面图标**：`scripts/brand/`（icon-template.html 同一套几何 + render-icons.mjs 用 headless Chrome 出图）——packaging/icon.png（mac 1024 满幅、Tahoe 自动圆角）/ icon-win.png（1024 预圆角透明角）/ public/logo.png（512）；碳黑渐变底 + 顶部内高光。**Windows 图标缓存**：packaging/installer.nsh（electron-builder 自动 include）装完 SHChangeNotify + ie4uinit 刷新——换 logo 老图标不更新的根因（Explorer iconcache 按 exe 路径做 key、升级不失效、同事实测踩过）；任务栏「固定」图标仍需用户重新固定
+- **设置页二次整合（用户实测「太零散、一个 tab 只有一两个设置项」）**：8 卡收 4 组——连接（API Key + GitLab + 飞书集成）/ 偏好（跳转 IDE + 分支模板 + 快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储；各卡组件改「节」形态（XxxSection、Card 壳退役）由组卡拼装；旧 ?focus= 值全兼容（LEGACY_FOCUS 映射）。**GitLab Host 输入框删除**（用户拍板「直接去掉」）——host 在**设置页仓库提交时**自动从 origin 推导并静默烘焙进 settings.gitHost（无 UI 字段、不做老用户补烘焙——他们都手填过）；运行时 resolveEffectiveGitHost 兜底推导保留、推进弹窗推导态三态化（请求飞行中 ship 不闪误报）；「点标题就切开关」修掉（Label 不再绑 htmlFor）；飞书 CLI 卡：installed 判定加文件在盘兜底（Windows Defender 首扫致 spawn 超时误判未安装、同事实测）、按钮「更新」→「检查更新」、meegle → meegle-cli 命名
+- **选中态全局 token（用户实测「白色的选中状态太弱」+ 拍板「沉淀到全局规范」）**：globals.css 新增 `--selected` / `--selected-foreground`（浅深两套、比 muted 深两档）；**持久选中态**（tab / 导航项 / 侧栏激活行 / 下拉已选项 / 主题选中）一律 `bg-selected text-selected-foreground`、瞬时 hover 态保持 accent——规范落 `ui-conventions.mdc`；本轮改点：ChoiceButton tab / 设置页导航 / task-list-item 激活行 / model-select / combobox / multi-select / chat-branch-picker 已选项 / theme-toggle / table selected
+- **中性页壳适配**（用户点名「设置页里为啥工作台 active、左边还有侧边栏」）：/settings、/actions 归 standalone 页型——任务侧栏自动收（这两页有自己的内部导航、叠上去是双侧栏）、顶栏胶囊两段都不高亮；胶囊 + 右上角图标加大一档（用户确认「做明显点」）
+
+### 2026-07-10 夜 v1.0 界面重构 + Markdown 渲染升级（用户拍板、Grok 蓝军审核过）
+
+- **胶囊双模式**：顶栏居中「工作台 / 对话」胶囊（`use-app-mode.ts` 按 URL 推导：`/`+`/workitems`=工作台、`/chats`+chat 任务=对话、`/tasks/:id` 看 task.mode）；顶栏删 logo（桌面 app 有 dock 图标、品牌冗余、回首页归胶囊）；`/chats` 落点页自动跳最近对话 / 空态新建
+- **侧栏按页型自适应（A）**：看板页（`/`）自动收侧栏（全屏甘特、看板=唯一导航中心）、详情页自动展；手动 toggle 同页型内最高优先、切页型恢复默认（`lastAutoTypeRef` 记切换沿）；删了 localStorage 持久化偏好（改按页型）
+- **任务行升级监控行（C）**：task 行第二行「阶段 · 状态」（方案/实现/审阅 + 运行中/待确认/待回答/空闲、tone 分色）、chat 行不显示——侧栏从「名字列表」变「多任务进度一览」
+- **`/` 唤起 skill**（`slash-skills.tsx` 共享）：所有聊天框打 `/` 弹 skill 菜单（↑↓/Enter/Tab/Esc、IME guard）、选中转高亮 chip、发送时消息头拼「先 read SKILL.md 再执行」；skills 缓存 TTL 60s；chat 输入岛 + 任务输入条两处接入；「对话创建 skill」直跳带 chip（setPendingSlashSkill sessionStorage handoff）
+- **chat 消息编辑重发**：hover 用户消息出「编辑重发」、原文填回输入框改完再发（原消息保留）
+- **Markdown 渲染迁 Streamdown**（Vercel AI 流式渲染库）：Shiki 代码高亮（VS Code 引擎、200+ 语言、复制按钮）+ Mermaid 图 + KaTeX 公式 + CJK + 流式容错 + 块级 memo。统一 `markdown-text.tsx`（rows.tsx re-export 保路径）+ artifact-panel 两处；**remarkPlugins 必须带 `defaultRemarkPlugins`（含 gfm）再追加自定义**（整表替换会丢 gfm、审计 P1 踩过）；artifact 路径/引用跳转挂 **`inlineCode`** 槽（覆盖 `code` 会连 fenced 一起接管、丢 Shiki、审计 P1 踩过）；流式显式 `caret="block"`（无默认光标）
+- **本地图片 HTTP 通道**：`/api/local-image?path=`（图片扩展名白名单 + 30MB、本机 loopback 不扩威胁面）——AI 在工作目录生成的图（二维码 / 图表）markdown 本地路径浏览器加载不了的根因；`MarkdownImage.toLoadableImageSrc` 本地绝对路径转通道、站内/http/data 原样；`MarkdownLink` 本地图片路径可点预览
+- **踩坑记账**：next 升 15.5.20 后 standalone 启动会 require next-config-ts/transpile-config → `next/dist/lib/typescript/required-packages`，而 outputFileTracingExcludes 的 `node_modules/**/typescript/**` 把 Next 自己的 dist/lib/typescript 也删了 → 打包态启动崩（dev/build 不复现）。修：`next.config.ts→.mjs`（原生加载不转译配置）+ 排除收窄到 `.pnpm/typescript@*` + `node_modules/typescript`。**发版前必带此 commit（3d2f73b）、否则 15.5.20 包必崩**
+
+### 2026-07-10 全仓安全审查修复（CR-01~13、批次 A~D 四个 commit）
+
+GPT-5.6 全仓审查报了 13 项（2 P0 / 4 P1 / 6 P2 / 1 P3）、已全部处理：源码启动绑 127.0.0.1 + `/api/**` Host/Origin loopback 校验（middleware、Node runtime）；`/api/preview` 命令改服务端从 config.json 查（掐 RCE 链）；`/api/settings` GET 脱敏 + `/api/settings/full` 全量口；mac 自更新签名 manifest 链（Ed25519、公钥占位渐进启用）；worktree 清理 fail-closed；OAuth 凭证 sha256 命名 + 身份/URL 双校验；meegle 下载 dist.integrity 验真 + 全下载链 mkdtemp/原子替换；依赖治理（next 15.5.20、audit 45→2）；adaptive PATCH 修复；settings 保存 await + 双端串行队列；repos dirty 全字段；preview 并发 mutex + PID 归属核验；Windows 路径共享判断；lint 迁 ESLint CLI。**两个待办**：
+
+- ⏳ **CR-02 收尾（等维护者）**：跑 `node scripts/generate-update-keypair.mjs`、私钥进 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`、公钥贴 `electron-app/main.js` 的 `UPDATE_MANIFEST_PUBLIC_KEY`——没配前更新链只 warn 不验签（渐进启用、不打断存量用户）
+- ⏳ **CR-06 收尾**：CI 加 `pnpm audit --prod --audit-level high` 阻断（带精确 advisory 豁免机制）——本轮为免误伤发版链未加、择机补
+- ⚠️ 报告称 `@connectrpc/connect-node` 未被引用应删——**核实为误报**（@cursor/sdk 1.0.19 运行时动态 import 它却漏声明依赖、CHANGELOG v0.8.7 有案）、保留、其 undici 传递公告用 override 升 6.x 解决（仅 Node<18 Headers polyfill 用途、零风险）
+
+### V0.13-P0（未发版、攒着）：MCP 独立化（2026-07-09、用户拍板「先解耦、为接 Codex / Claude Code 等多 backend 留口子」）
+
+- **运行时只读 fe 自管配置**（config.json → settings.mcpServers）、不再 live 合并 `~/.cursor/mcp.json`——在 Cursor 改配置不再影响本 app；`readMergedMcpServers` → `readEffectiveMcpServers`（自管 + 剔 RESERVED 名）、resolveTaskMcpServers / health / oauth 四处消费方统一切换
+- **老用户无感迁移**（`migrateCursorMcpOnce`、单飞 + 幂等）：调用点 = /api/settings **GET**（client 首拉配置前必过、cache 一定含快照 → 整对象 PUT 不盖丢）+ **PUT**（localStorage 过渡期老用户 config.json 首次落盘后补迁、响应返最终盘上 settings、client putSettings 回填 mcpServers 进 cache）+ readEffectiveMcpServers（boot 直接 resume agent 路径）。config.json 已存在 → Cursor 快照合入自管（自管同名优先、原子写）+ 落标记；不存在 → 什么都不做不落标记（等首次 PUT 出生后再迁）。标记 `data/.mcp-cursor-migrated` 防重、失败清单飞下次重试。审计（grok subagent 蓝军）揪出的 2 个 P0（迁移 vs 整对象 PUT 竞态、localStorage-only 老用户被误判新装）均按此修复
+- **设置页 MCP 卡重做**（`mcp-card.tsx` 条目化）：每 server 一行（类型摘要 + 编辑 / 删除）、新增 / 编辑 dialog（名称 + 单 server JSON）、「从 Cursor 导入」dialog 勾选挑 server（已存在标「导入将覆盖」）、高级折叠保留整体 JSON 编辑；OAuth / 常用开关 / 健康探测数据源全切自管
+- `/api/cursor-mcp` 语义改：`servers` = 有效集（自管）、`cursor` 仅供导入 dialog；`settingSources:["project"]` / 全局 rules 注入**本期不动**（prompt 上下文体系、接第二 backend 时再抽统一层）
+- **V0.13-P1 Skill 独立化 + MCP 卡整合**（同日追加、用户拍板）：
+  - app 自管 skills 目录 `<dataRoot>/skills/<name>/SKILL.md`（`app-skills.ts`）、loadSkills 纳入扫描（优先级：平台内置 > 自管 > Cursor 全局 > 飞书 CLI）
+  - 设置页新增 Skills 卡（`skills-card.tsx`）：列全部来源（带标签）、自管可新增 / 编辑 / 删除（编辑 SKILL.md、CodeEditor 加 markdown 高亮）、「从 Cursor 导入」勾选 dialog（**整目录拷贝**、含脚本附属文件）；API：GET/POST/DELETE `/api/skills` + `/api/skills/content` + `/api/skills/import`
+  - MCP 卡「常用 MCP」独立区块砍掉（用户：太长）——常用开关 + 健康徽标 + OAuth 授权全并进条目行内、`HealthBadge` 从 mcp-toggle-list export 复用
+- **飞书工具去 MCP 强绑定 + CLI 内置进安装包**（同日、用户拍板）：
+  - prompt 中性化：action-plan / build / ship + context-docs-handler skill 里点名 `feishu-mcp` / `feishu-project-mcp` 的地方全改「有 MCP 用 MCP、没有用内置 lark-cli / meegle CLI（用法见注入的官方 skills）」
+  - 建任务校验降级：原「缺飞书 MCP 不让建」→ 按能力域（飞书文档 ↔ lark-cli、飞书项目 ↔ meegle）判定「MCP 或 CLI 任一就绪即过」、都缺才 amber 提示且**不阻断**（跳设置页飞书卡）
+  - ~~CLI 内置进安装包~~（做完当天用户撤回「cli 不内置」——预取脚本 / afterPack / 种子拷贝已全部回退、维持按需在线安装）
+  - 飞书 CLI 安装器增量化（同日修 bug）：已装且版本一致跳过、按钮「缺任一叫安装、都在叫更新」
+- **Skills 列表按来源分组折叠**（用户拍板「几十上百个太长」）：自管组常驻展开、内置 / Cursor 全局 / 飞书 CLI 各一折叠组（标题带数量、默认收起）
+- **V0.14 验收迭代（2026-07-10 下午、用户实测多轮纠偏后定型）**：首页收敛为**单一排期甘特**（列表视图/待办已办 tabs 全砍、mywork 数据源固定待办）；甘特形态对齐飞书人员排期——**需求条 = 需求本身**（条内写需求名+节点状态、超出省略 hover Tooltip 100ms 即显）、需求级跨度 = `workflow get-node _all` 聚合所有节点排期 min~max（8 并发 + 10 分钟缓存、mywork 按节点出重复条已去重）、展开只显示**自己的子任务**（--need-sub-task、「只看自己」chip 默认开、节点分组行删、窗口外子任务不渲染）；**空间单选下拉**（不提供全部混排、localStorage 记忆）；时间筛选 = **日期范围选择器**（react-day-picker 双月 + 快捷档、主题变量必须打在 DayPicker root 的 style prop 上——写外层会被 .rdp-root 自带默认值覆盖渲染成白块、踩过）；无 AI 任务不显示徽标；甘特条同色系边框提对比（浅色模式）。meegle 登录走 **device-code flow**（裸 auth login 需交互式回调、spawn 子进程跑不了）+ 服务端抓授权 URL 自动开浏览器；meegle 版本探测兼容 `version` 子命令（不支持 --version flag、误报未安装踩过）。
+- **V0.14 已实装（2026-07-10 下午、详见下方规划段的拍板细节）**：`meegle-cli.ts`（execFile 封装、三态错误 not_installed/not_authed/error、normalizeWorkitem 宽松归一——mywork 响应无公开 schema、字段名多重兜底、**待用户登录 meegle 后实测校准**）+ `/api/feishu/board`（mywork + 本地任务 join、url 缺失按 host/projectKey/type/id 兜底拼）+ `/api/feishu/workitem`（详情、支持 url decode）+ 首页 `FeishuBoard`（列表/时间线切换、待办/本周/逾期/已办 tabs、双状态徽标、sessionStorage 缓存秒开、降级引导）+ `BoardTimeline`（28 天横向时间轴、今天纵线、逾期红/合入绿/进行中主题色、未排期组）+ 预览页 `/workitems/[id]`（WorkitemDetail + TaskLaunchForm、启动才建任务、防重复建兜底）+ `TaskLaunchForm`（原 NewTaskDialog 表单核心、上次仓库/角色记忆预填、缺项琥珀引导）+ NewTaskDialog 删除（侧栏/首页入口砍）+ workspace-actions「需求详情」dialog（WorkitemDetail 复用）+ action-ship §4.5 节点流转（meegle 三步曲、best-effort、未就绪跳过）
+- **V0.14 规划（已定型待开工、2026-07-10 用户拍板）——首页改造成飞书项目看板**：
+  - 首页 = 工作台：飞书项目工作项看板（meegle CLI `mywork`/workitem 拉数据、全部/我的筛选、列表 + **真时间线视图**切换（横向时间轴、排期条、今天标线、首版只读不拖拽、过 frontend-design 定调）、每项带**双状态徽标**（飞书节点状态 + AI 任务状态）、未登录 meegle 降级现状 + 授权引导、列表缓存 + 手动刷新）
+  - 点工作项 → **预览态**（工作项详情 + 铺开的配置区、不落盘）→ 点「启动」才真正创建任务容器（防点开看看就产生空任务）；配置区预填「上次任务的仓库组合」+ 默认模型/角色、90% 场景零操作一键启动；缺项时启动置灰 + 琥珀高亮引导（防隐性卡点、用户提的）
+  - 任务详情页融合飞书工作项详情（描述/字段/节点状态、不用跳飞书看需求）
+  - **「新建任务」入口砍掉**（用户拍板）：任务只从飞书工作项进；临时 bug / 自由探索走新建对话（chat）
+  - 二期：状态反向同步——ship 提完 MR / 标合入时 agent 走 meegle `workflow get-node → list-state-transitions → transition` 三步曲流转节点（合法流转 CLI 自带、无需配映射；事件流可见、失败不阻断）
+  - 约束：lark-cli 只用免审权限功能（用户拍板）——im 发消息等需审批的 scope 一律不入方案；meegle 走用户本人 OAuth 不受限
+- **SDK run 网络断自动重连**（同日、用户拍板「网络波动断了要自动重连、重试 5 次、显示重连中」）：task / chat 两个 runner 的 run 消费 catch 挂 `tryAutoReconnect` / `tryChatAutoReconnect`——`isRetryableRunError`（sdk-error.ts：isConnectionDrop / SDK isRetryable / 网络关键字、认证类排除）判定后指数退避（2/4/8/15/30s、1s 分片可被停止中断）、`Agent.resume` 接回同一会话 + send「从断点继续」系统提示、递归消费新 run（attempt 随 opts 传递防无限）；resume 的网络类失败**不清 sessionAgentId 锚点**（重试还要用）；重连凭据服务端直读 config.json（readServerCreds）。事件流渲染：info + meta.kind=reconnecting → ReconnectingRow（spinner 琥珀细行、后续出现 reconnected/error 后静态化）
+- **注意力信号补强**（同日、用户顾虑「内联卡太弱、切走注意不到」、拍板系统通知 + 页内横幅、Dock 徽标不做）：系统通知链路 v0.9.5 已有（TaskAttentionWatcher + 壳 task-notify 通道 + AppUserModelId）、本轮把 error 也纳入通知（自动重连兜底后真 error 都值得叫人）；事件流新增悬浮条——有未答 ask 且用户滚离底部时「AI 在等你回答、点击查看」（点击 scrollToIndex 到答题卡）
+- **输入条统一语义 `[USER_MESSAGE]`**（同日、用户拍板「别这么多分支、AI 自主判断」）：原「再聊聊（[ACTION_ACK revise]）/ 问一问（[USER_QUESTION]）」双通道合一——客户端只有 submitTaskQuestion 一条路、消息统一 `[USER_MESSAGE]`、AI 按二分类铁则自主判断（纯疑问就答、别把问题当改码指令；修改要求才动手）。服务端内务：awaiting_ack 时自动 snapshot artifact + 消息尾附〈产出审阅中〉提示（处理完须 submit_work 重新交卷、原 revise 状态机保留：action 回 running）；无 ack 上下文 = 插话（能改文件、不推进任务链）。`acknowledgeAction` / action-ack 路由 / submitActionAck / ACTION_ACK_REVISE 信号全部退役删除；approve 由推进时自动认可承担；canResume 加 awaiting_ack（会话断 / 换模型时唤醒接手）。prompt 手术：_super.md「revise 闭环」段改写为「[USER_MESSAGE] 统一处理」、action-build/learn/plan + _shared 同步、协议一致性测试守护旧信号不回流
+- **ask_user 弹窗 → 事件流内联答题卡**（同日、用户拍板「弹窗挡整屏不合理」）：模态 AskUserDialog 删除（旧 wait_for_user 阻塞协议遗产）、答题逻辑整体搬进 `ask-user-inline.tsx`（AskUserInlineCard）；event-stream 分流：`findPendingAskEvent` 命中的 ask 行渲染内联卡（选项 / 自定义 / 每题贴图 / 稍后再补充 / 快捷键全保留）、已答 / 作废走 AskUserRequestRow 回放；失效态（runStatus=error）内联警示不再需要 dismiss；chat-view 的兜底弹窗一并删（EventStream 内已覆盖）。对齐 Cursor / Claude Code 的内联提问形态、答题时能看事件流上下文
+
+### V0.12.2（已发版）：删 settings.username + 默认模板留空（2026-07-09、用户点名「缩写没意义、可以写死在模板里」）
+
+- **结论**：username 唯一消费方是分支模板 `{username}` 占位符（不进 prompt / MR / git 身份）、单机 app 写死在模板等价——字段删除
+- **无感迁移**（normalizeSettings、幂等）：老配置有 username 时把全局 + 各仓模板里的 `{username}` 一次性替换成真实名字（没显式配过模板的老用户按旧默认烘焙成 `feature/<名字>/{storyId}-{taskTitle}`）、老用户分支名零变化；migration 后字段不再落盘
+- **默认模板留空**：设置页模板输入框默认空（placeholder 提示）、运行时留空回退内置兜底 `feature/{storyId}-{taskTitle}`（DEFAULT_BRANCH_TEMPLATE 改值）；渲染引擎保留 `{username}` token 兼容老任务快照（渲染为空段、`/` 清理兜住）
+- 链路清理：ensureTaskWorktrees / planWorktreeBranchInfos / planBranchesForBuild 去 username 参数、advance / question route 及 client 透传全删、设置页「用户名/缩写」输入框删
+
+### V0.11.11（未发版、攒着）：worktree 全流程审计 + 7 项修复（2026-07-09、用户点名「好好检查 worktree」、4 审计 + 3 修复 subagent 并行）
+
+- **审计结论**：主链路扎实（幂等 / 路径归一 / 指纹 key / 孤儿 live 集合 / 跨实例 dataRoot 隔离 / chat 旁路都验过没问题）；证伪了一个 subagent 误报（「跨实例 worktree 注册名必撞」——真 git 实验：git 会自动给重名注册加后缀 crm-web/crm-web1、不存在该问题）
+- **修复 7 项**：
+  1. ensure 复用热路径校验当前分支——被手动 checkout 切走 / detached HEAD 自动切回、切不回抛清晰错（原「build 自检兜底」实际不存在、静默错分支干活）
+  2. WIP 快照改三态（clean/snapshotted/failed）：merge/rebase 冲突中（porcelain 未合并码）直接 failed 且**跳过删除**（原来快照失败仍 --force 删、未提交改动被销毁）；`RemoveWorktreesResult.skippedRepos` + finalize 事件⚠️提示；孤儿清理同口径整目录保留
+  3. 分支占用报错识别新版 git 文案 `already used by worktree`（2.4x+ 改了措辞、原正则只认 already checked out、中文提示不出——昨天线上实测）+ 提示补「检查另一实例（正式/test）是否占用」
+  4. finalizeTask 补 `waitForTaskToStop`（对齐 DELETE、防 agent 边写边删）
+  5. deleteTask / finalizeTask 清 worktree 前停本任务预览（防 dev server 悬空占端口）
+  6. `ensureWorkspaceReady`：internalStartAgent / resumeTaskSession / startOneShotQuestion 入口幂等 ensure（reopen 后问一问 / 手删 worktree 后 resume 不再指向不存在目录）
+  7. ArtifactPanel baseDir 回退链补 `task.workCwd`（隔离任务老 action 缺 cwd 快照时、链接不再拼到原仓）；ActionRecord.cwd 注释同步
+- 集成测试 +2（分支切走自动纠正 / merge 冲突态删除跳过）、全量 150 绿
+
+### V0.11.10（未发版、攒着）：IDE 探测扩到 10 个 + 设置页只列已装（2026-07-09、用户点名）
+
+- `JumpIde` 扩：VS Code 系（Cursor / VS Code / **Windsurf / Trae**）+ JetBrains 全家（IDEA / WebStorm / **PyCharm / GoLand / PhpStorm / Android Studio**、Android Studio win 装 `Program Files\Android` 下 exe=studio64 单独配）；探测改 `IDE_SPECS` 配置表驱动（ide-tools.ts）、加新 IDE = 加一行配置；候选清单单一来源 `JUMP_IDES`（types.ts）、组件 / route / normalize 全引它
+- 设置页下拉**只列本机探测到的**（用户拍板「没有的就不展示」；当前已选的即使没探到也列、防下拉找不到当前值）、「（未检测到）」后缀已删
+
+### V0.12 P0（进行中）：内置飞书官方 CLI（2026-07-08 晚、用户拍板「内置两套 CLI、不强迫用户配 MCP、尽可能都接进来」）
+
+- **两个官方 CLI**：lark-cli（larksuite/cli、飞书开放平台 200+ 命令 + 26 官方 Agent Skills）+ meegle（larksuite/meegle-cli、飞书项目 16 域 50+ 命令）、都 MIT
+- **分发（不进安装包、运行时一键装到 `<dataRoot>/tools/`）**：lark-cli 走 GitHub Releases 平台二进制（China fallback npmmirror `/-/binary/` 镜像、URL 规则照官方 install.js）；meegle npm 包自带全平台 Go 二进制、解 tgz 抽当前平台的；官方 skills 从两仓库 main tarball 的 `skills/` 抽（失败不阻断）
+- **agent 接入**：`injectFeishuCliPath` 把 tools/bin 注 process.env.PATH（instrumentation 启动 + 装完即时）、SDK agent 子进程继承直呼；skills-loader 增扫 tools/skills（优先级最低）
+- **登录**：CLI 自带 OAuth（自动开浏览器）——lark-cli 无配置走 `config init --new`（官方引导建应用）、有配置 `auth login --recommend`；meegle 先 `config set host`（默认 project.feishu.cn）再 `auth login`。spawn 托管 + 抓输出授权 URL 给 UI 兜底
+- **UI**：设置页「飞书集成」卡片（安装/更新 + 每工具登录按钮 + 版本/账号状态、流程中 2s 轮询）
+- **后续（明天）**：P1 新建任务「从飞书需求选」+ 首页我的需求面板；P2 状态反向同步；飞书项目 MCP 链退役（用户拍板不留兼容）
+
+### V0.11.9（未发版、攒着）：说话入口合一 + 重启概念退役（2026-07-08、用户拍板「有些设计是之前冗余的」）
+
+- **「重启当前阶段」按钮/弹窗/route 删除、能力并入输入条「唤醒模式」**（用户拍板「输入条覆盖重启、别多一条 action 链」）：会话接不回 + 当前 action 停在半路（error/cancelled/僵死 running）时、输入条消息触发 `resumeCurrentActionWithMessage`——起新 agent **原地续同一个 action**（`[RESUME_ACTION]` 指令 = 旧 restart 骨架 + 用户消息当最新指示、不再 ask「按原计划继续吗」；pendingQuestions 断点续传保留）。模型沿用 action.agentModel（唤醒不悄悄换模型）
+- Cmd/Ctrl+J 快捷键改为聚焦底部输入条（原开再聊聊弹窗）
+- **唤醒模式周边收口**（用户点名全面检查）：ask 弹窗失效态 / 停止确认 / 「没交卷」error 三处引导文案改成「底部输入条说句话即可唤醒」；question 路由的 pendingAsk 拦截对「action 已停在半路」豁免（stale 弹窗没人接、不该把用户堵在弹窗上——唤醒后断点续传会重新问到）
+- **E 批小清理**：repoStatus 死枚举 awaiting_test / has_bug 删除（全仓从未写入过）；V0.11.6 后冗余的 watchEpoch 重连兜底清掉（只留 reopen 终态重订阅）；wait-protocol-prompt.ts 改名 turn-discipline.ts
+- **交卷工具改名 `wait_for_user` → `submit_work`**（用户拍板）：prompts / 工具注册 / src 文案全量改；**旧名保留一版 alias**（同 handler、升级前启动的会话 in-context 还教旧名、断代会交不了卷、下版本删）；sdk-message-handler 的交卷特判两个名字都认
+- **事件流滚不到底修复**：EventStream 根节点是 `h-full`、底部加输入条后总高超 100%——外层包 `min-h-0 flex-1` 容器给它确定高度
+- **问一问 run 全出口保护（第二轮全面检查扫出的隐患）**：consumeSessionRun 加 `questionRun` 标——纯答疑 run 被停 / 失败时**绝不动 action**（原 cancel 分支会 finalizeStaleActions 把 awaiting_ack 审阅位打成 cancelled、error 分支同理打成 error——答疑期间点停止 / 网络抖动就会误伤任务本体）、不关会话、runStatus 按当前 action 状态归位（restoreRunStatusAfterQuestion、含 error 位）
+- **待讨论候选（用户拍板「记下后面翻出来」）**：chat / task 双 runner 合一（最大代码冗余、双份逻辑漂移是 bug 温床）
+- **说话入口合一（TaskTalkComposer）**：原「再聊聊」弹窗（+Cmd/Ctrl+J）与「问一问」输入条 90% 重复、二合一成事件流底部常驻输入条——**系统按状态自动懂语境**：当前产出等审阅 → 按 revise 送（agent 二分类：问就答、改就改完重新交卷）；其他时刻 → [USER_QUESTION] 纯提问；显式选模型 → 一次性答疑 agent。支持贴图（粘贴 / 附图）。revise-dialog.tsx 删除
+- **prompt 措辞修正**（用户实测 agent 旁白「等你点通过」误导）：_super / action-* 全部清掉「用户点通过」概念、改「认可 = 直接推进（无通过按钮）、旁白禁说点通过」
+
+### V0.11.9（未发版、攒着）：任务内「问一问」+ 设置页整理（2026-07-08、用户大方向讨论第一批）
+
+- **任务内「问一问」**（用户痛点：想就任务问点问题、以前必须推进 action 再嘱咐「只回答别改代码」）：
+  - 任务页事件流底部轻量输入条（`task-question-composer.tsx`、单行 textarea、agent 跑动中禁用、终态隐藏）
+  - `POST /api/tasks/[id]/question` → `deliverTaskQuestion` → send `[USER_QUESTION]` 给存活会话（约束内联：只答不动手、不调动作工具、答完自然结束；_super.md 同步教、protocol-signals 加常量 + 一致性测试）
+  - 不新建 action、不动任务进度：回答期间 runStatus=running、答完 consumeSessionRun 按最后 action 状态归位（awaiting_ack → awaiting_user、completed → idle——后者是本次补的 tail 分支、也顺手修了「等审阅期间任何 send 后 runStatus 卡 running」的隐患）
+  - 拒绝口径：agent 在跑 / ask 弹窗未答 / 无会话且 resume 不了（409 提示推进或重启阶段）
+- **问一问兜底：一次性答疑 agent**（用户拍板「接不回来另起一个没问题」）：会话接不回时 `startOneShotQuestion` 起轻量 Q&A agent——带任务事件日志 / artifact 目录路径、只读答疑铁律、**不注册会话不落锚点**（防被「续用推进」误当正式会话）、答完 close、runStatus 答完兜回提问前状态。语义澄清（用户问「这算重启吗」）：不算——重启当前阶段 = 换 agent 重做产出、问一问 = 只聊不动产出、两者并存
+- **诊断包一键导出**（用户点名「让同事找日志太麻烦」）：设置页顶部「导出诊断包」→ `POST /api/system/diagnostics-export` → 单个 txt 落 ~/Downloads（版本 / IDE 探测含 exec 路径 / **脱敏**配置概要 / main.log 尾部 300KB）、toast 路径 + 自动复制。`server/diagnostics.ts`
+- **IDE 打开「没反应」诊断增强**（同事 Windows 复现待定位）：探测结果落日志（每次探测打 exec 路径）+ spawn 静默失败探测（1.5s 内 error / 非零码退出 → 报错 toast、不再假成功）
+- **设置页整理**（sub-agent 执行、已逐 diff 审过）：删安全警示式啰嗦文案、`?focus=<卡片>` 锚点定位 + 2s 高亮、「去设置页」提示改可点快捷跳转（toast action / 空态内联链接、`settings-link.tsx` 统一拼 URL）
+- **GitLab host 可不填**（sub-agent 执行）：`resolveEffectiveGitHost` settings 显式值 > 仓库 origin remote 推导（`git-remote.ts` 纯函数 + `GET /api/repo-remote-meta`）；设置页「从仓库检测」按钮、advance-dialog ship 准入同口径
+- **MCP 自管 + Cursor 导入**（sub-agent 执行；V0.13 起运行时不再合并 Cursor、见 V0.13-P0 段）：`settings.mcpServers`（config.json）可视化增删 + 「从 Cursor 导入」、aiFlowChat 保留名不可占用、task/chat/OAuth/健康探测全部读自管有效集
+
+### V0.11.8：IDE 跳转去协议依赖 + 自动探测（2026-07-08、同事 Windows 实测「idea:// 打不开」）
+
+- **根因**：`idea://` 协议只有 JetBrains Toolbox 会注册——直接装 IDEA 的 Windows 机器点跳转弹「找不到应用」（两位同事实测）
+- **方案（本地 app 不需要经过浏览器协议）**：
+  - `src/lib/server/ide-tools.ts`：探测本机装了哪些 IDE（常规安装位 + JetBrains Toolbox 目录 + PATH、60s 缓存）+ `openInIde` 后端直接 spawn 可执行文件（带 `--line`；Toolbox .cmd 脚本经 cmd /c；mac 用 `open -na`）
+  - 跳转双通道（`JUMP_IDE_USES_PROTOCOL`）：cursor / vscode 协议注册可靠、仍走 deep link；JetBrains 系（idea / webstorm）走 `POST /api/system/open-in-ide` 后端拉起、协议没注册也能开
+  - 渲染统一走 `getIdeAnchorProps`（`src/lib/ide-open.ts`）：协议工具返 href、后端工具返 onClick——artifact 路径链接 / 事件流附件 / 工作区「在 IDE 打开」五处收口
+  - `JumpIde` 扩成 cursor / vscode / idea / webstorm；设置页下拉按 `GET /api/system/ide-tools` 探测结果动态列、未装的置灰「（未检测到）」、不再写死两个
+- 同批攒着的：黄点收窄 + approve 归 idle、常用模型快捷位、提测黄条删除（见下）
+
+### V0.11.8（未发版、攒着）：黄点收窄 + approve 归 idle（2026-07-08、用户点名「黄点什么时候消失」）
+
+- **背景**：V0.11 后 awaiting_user 成了常态静息位（chat 每轮说完 / task 交卷等 ack / approve 后都停在这）——侧栏琥珀脉冲点按旧条件（runStatus=awaiting_user 就亮）几乎满屏常亮、失去注意力信号价值
+- **改法**：
+  - server：approve 后 runStatus 归 idle（action 已 completed、无 ask、没有任何「在等你」的东西；原来永远停在 awaiting_user、顶部「等待回复」badge 也误导）
+  - 侧栏琥珀点只在「需要你行动」时亮（task 模式限定）：lastAction awaiting_ack（等你审阅）或 running + awaiting_user（ask 弹窗等答案）；chat 静息不亮
+
+### V0.11.8（未发版、攒着）：常用模型快捷位——按使用次数自动排（2026-07-08、用户点名「切模型太麻烦」）
+
+- **交互**：模型选择器（ModelSelect `quickPicks` 开关）上方常驻 2 个 chip = 使用次数 top2 的「模型 + 参数组合」（Fable High 和 Fable Low 算两个条目）、点一下连参数一步选中、不用开下拉搜。用户拍板「自动记录选择次数做排序」、零配置无需手动星标
+- **计数**：`settings.modelUsage`（config.json、上限 20 条防膨胀、淘汰次数最少）+ `recordModelUsage`/`getTopUsedModels`（local-store）。只在**真实使用**时 +1：推进起新 agent / 重启阶段 / 新建任务 / chat 换模型；在下拉里点着玩不计
+- **生效面**：推进弹窗 / 重启阶段弹窗 / 新建任务弹窗（full 变体）；chat 底部 compact 选择器不加 chip（空间紧）但换模型计数照记
+
+### V0.11.7：修「秒答 ask 弹窗撞在飞 run」——第一次提交报「没有活跃会话」、重试才过（2026-07-08、用户线上实测）
+
+- **现象**：agent 调 ask_user 后弹窗立即弹给用户、但本回合 run 还要再跑几秒才 finished（收尾旁白 + stop-check 往返）——用户手快秒答、`sendToTaskSession` 撞上 `runningTasks.has` 直接拒 → 409「没有可续接的 agent 会话」、几秒后重试就成功（线上日志实锤：ask 14:16:41 → 首答 14:16:52.420 被拒 → run 14:16:52.9 才排空 → 重试 14:16:59 成功）
+- **修复**：`sendToTaskSession` 入口不再见 run 就拒、改 `waitForRunToDrain`（300ms 轮询等排空、90s 上限兜底）——协议间隙由 server 消化、不再把用户答案弹回去。推进 / 再聊聊路径本来就在 run 结束后才可操作、等待为 no-op 零影响
+- **顺带删「build 后没 review」黄条整链**（用户拍板「文案去掉」）：判定只认 status=completed、刚交卷 awaiting_ack 的 review 也被误报「没复核」（实测 review #20 刚跑完没 ack、提测弹窗仍黄条）——`GET /ship-precheck` route / `getShipPrecheck` / `ShipPrecheck` 类型 / dialog 黄条全删
+
+### V0.11.6：修 V0.11 回归「done 即断流」——ask 弹窗答完永远卡「提交中」（2026-07-08、用户线上实测踩到）
+
+- **现象**：task 模式 ask 弹窗答完后按钮永远「提交中…」、弹窗关不掉（by design 不可 dismiss）、页面再也不更新；后端其实全链路正常（答案已送达、agent 已继续跑完交卷）
+- **根因（V0.11 语义冲突）**：watch-task SSE 沿用旧「publish done → 关流」+ 客户端 hook「收到 done → 不再重连（靠 reconnectKey）」。旧模型 run=整个 action、done 很少见；V0.11 起 run=一个回合、**agent 每说完一轮都 publish done** → 页面在任意回合后断流、后续 `agent.send` 起的新 run 事件全收不到。advance / restart / chat 自动启动路径恰好有 `watchEpoch++` 兜底才没暴露、ask-reply / revise 等路径没有 → 弹窗卡死（Electron 还禁了 cmd+R、用户没有自救手段）
+- **修复（回合结束 ≠ 订阅结束）**：
+  - 服务端 watch-task：done 帧照发、**只有 task 业务终态（merged/abandoned）才关流**、其余保持挂着跨 run 存活
+  - 客户端 use-task-watch：只有「终态 done」才停止订阅、回合级 done 不停、被动断流照常退避重连
+  - reopen（终态恢复）补 `watchEpoch++`（终态时订阅已按终态停、恢复后强制重订阅）；chat-view / page 的旧 epoch 兜底保留不动
+- 顺带：上下文文档弹窗支持点条目看详情（全文 / URL 打开+复制 / 图片大图、返回键回列表）——用户点名「加了就没法看详情」
+
+### V0.11.5：揪出安装包隐性膨胀根因——CI npm install 重装全依赖（2026-07-08）
+
+- **异常信号**：V0.11.4 压缩优化后线上包 192/189.5MB、远超本地实测 118/112MB → 挂载线上 dmg 对账：**app-server 532MB**（本地组包只有 79MB）
+- **根因（自 v0.7.6 起每一版都中招）**：CI「修平台依赖」步在 dist/app-server 里跑 `npm install @cursor/sdk-<platform>`——standalone 的 package.json 是全项目的、npm 装单包时顺手把「缺失」的全部 dependencies 重装成**完整包**（full next 152M + @next/swc 平台二进制 124M + lucide-react 36M + typescript 23M…）、~450MB 死重进包。用户「Windows 装得特别久」主根因就是解包落盘 ~770MB
+- **修复**：`npm install` → `npm pack` + tar 解到 `node_modules/@cursor/<平台包>`、零依赖解析只落平台包本体；实加载验真步保留
+- 效果：解包 771MB → ~310MB、安装包 190+ → ~110-120MB（真·减半、叠加 V0.11.4 压缩优化）
+
+### V0.11.4：安装包减半（2026-07-08、用户点名「包太大、装太久」）
+
+- **win exe 213.6MB → 实测 112MB（-48%）**：`compression: maximum`（electron-builder.yml 全局）。回收 v0.8.10「7z 降到 level 3 提安装速度」特例——release 体积历史证明那次前后都 213MB、没变小也没装快（LZMA 解压速度和压缩级别基本无关、安装慢卡在落盘 300MB + Defender 扫描）
+- **mac dmg 215MB → 实测 118MB（-45%）**：格式 ULFO（LZFSE）→ UDBZ（bzip2）。实测挂载 25s + 全量拷出 12s、安装/自更新多花半分钟换下载少 ~100MB。⚠️ ULMO（LZMA）实测更小（97MB）但 electron-builder 26.15.2 schema 只认 UDBZ/UDCO/UDRO/UDRW/UDZO/ULFO、CI 直接拒（踩过、v0.11.4 首次打包双平台全挂重打 tag）
+- assemble 布局顺带删 sourcemap（*.map、生产死重）
+- 代价：CI 打包每平台 +3-5min；天花板说明：压缩后 ~100MB 基本到底（Electron/Chromium 底座占大头、再小要换底座、不动）
+
+### V0.11.3：依赖目录克隆多语言泛化（2026-07-08、用户点名「通用项目、别只考虑前端」）
+
+- worktree 依赖秒级克隆从写死 `node_modules` 泛化为**安全克隆白名单**（`CLONABLE_DEP_DIRS`）：`node_modules`（JS）/ `vendor`（PHP composer / Ruby bundler / Go vendor 模式）/ `Pods`（iOS）——都是可重定位目录、探测到就克
+- **明确排除 `.venv`/`venv`**（Python 虚拟环境 shebang/activate 写死绝对路径、克隆过去是坏的、比不克更坑）——Python 走 agent 自建；Java/Go/.NET 依赖存全局缓存、天然不需要克隆
+- `EnsureWorktreesResult.clonedNodeModulesRepos` → `clonedDeps: { repoPath, dirs }[]`、事件流 / prompt 仓库段措辞同步改「依赖目录」；集成测试补 vendor 正例 + `.venv` 反例
+- 不加设置项（白名单够用、疼了再开 per-repo 配置）
+
+### V0.11.2：Windows / macOS 兼容性全面扫描修复（2026-07-08、用户点名全查）
+
+- **P1 工作区指纹 / status hash 在 Windows 静默失效**：原实现 `spawn("sh", ["-c", 多行 POSIX 脚本])`——Windows 没有 `sh`、`2>/dev/null` 也非 cmd 语法 → fingerprint 恒 null、review 只读硬校验 / build 兄弟仓越权检测形同虚设。重写成纯 Node 逐条 `execFile git`（唯一要喂 stdin 的 `hash-object --stdin-paths` 单独 spawn）、平台无关；顺带删掉 `buildCheckEnv`（PATH 用 `:` 拼 + 读 `HOME`、Windows 分隔符是 `;`、会把 PATH 首项写坏）——现在只跑 git、不需要自拼 PATH。新增 `tests/action-checks.integration.test.ts`（真 git 仓锁指纹语义 5 条）
+- **P2 kill-orphans 在 Windows 白跑报错**：依赖 `ps` + `lsof`、win32 入口直接跳过（孤儿树杀由壳退出时 taskkill /T 兜底、不值得接 wmic/CIM）
+- **P2 预览 dev server 在 Windows 弹控制台黑框**：`detached: true` 在 win 会给子进程开独立控制台——改 win 不 detach + `windowsHide`（树杀本就走 `taskkill /T`、不依赖进程组）；其它 git spawn 也补了 `windowsHide` 防闪框
+- 确认无问题的面：task-worktrees（gitdir 正反斜杠都认）、path-utils（盘符/反斜杠归一化齐全）、hooks 脚本（纯 Node + win 分支）、Electron 壳（netstat/taskkill 分支齐全）、node_modules 克隆（darwin 门控、其它平台回退 agent 自装）
+- typecheck / lint 全绿、vitest 148 全绿
+
+### V0.11：wait 协议退役——回归「create + 多轮 send」正常流程（2026-07-07 用户拍板、当日实装）
+
+- **动机**：Cursor 已去掉按次计费、「单 Run 永生 + wait_for_user 挂 shell curl 长轮询省 send」的历史前提消失；worktree 隔离（V0.10）后现场永久保留、Run 随时可断可续；且长挂 curl 是全系统最脆的机制（升级假卡死 / 僵尸 zsh / premature wait / 失效 ask 弹窗死循环等事故大户）。用户原话「首次是 create、后面就都是 send、改回正常流程」。
+- **新模型**：
+  - **agent 会话跨 run 存活**：`agentSessions`（task-stream globalThis）持有 Agent 实例；`runningTasks` 只表示「有 run 在跑」。run 自然结束不 close agent、下一次用户操作 `agent.send()` 续上（SDK 官方多轮语义）；stop / error / finalize / 换模型才关会话。app 重启丢会话 → 沿用旧 fresh-agent + events.jsonl 恢复路径。
+  - **wait_for_user 改「交卷」语义（非阻塞）**：完成 action 调它（带 action_id）→ 后台跑 check + 切 awaiting_ack（同今天）→ 返回「交卷成功、立即结束本轮回复」→ run 自然 finished = 正常（旧模型里是 error）。不带 action_id 的「待命态」概念删除。
+  - **ask_user 改「弹窗 + 结束回复」**：注册 pendingAsk（askId/token 校验保留）→ UI 弹窗 → 返回「结束本轮回复」；用户答案经 `agent.send([ASK_USER_REPLY]…)` 送达新 run。
+  - **用户操作 → send**：推进（续用会话）= send [NEXT_ACTION…]；再聊聊 = send [ACTION_ACK revise]+feedback；ask 答案 = send [ASK_USER_REPLY]；chat 每条消息 = send。通过（approve）纯服务端落状态、不再需要通知 agent。终态（merged/abandoned）不再发 [TASK_DONE]、直接 cancel 活 run + 关会话。
+  - **chat 模式回归普通对话**：agent 无需任何 wait 工具、说完自然结束 turn；run 结束 → runStatus=awaiting_user 等下一条消息。premature-wait 兜底 / 概括 message / recency 提醒全部删除。
+  - **stop-hook 语义保留但收窄**：只拦「当前 action 还在 running（没交卷）且无 pendingAsk」的提前退出；交卷后 / ask 后 / chat 模式放行。
+- **删除面**：wait-ack 长轮询 route、pendingMap/token/grace/keepalive 状态机（chat-pending 1049→370 行、pendingAsks 轻量表保留）、premature-chat-wait 模块 + 测试、SHELL_WAIT_GUIDE/KEEPALIVE/STALE/INVALID_TOKEN/TASK_DONE 信号、prompts 里全部 curl 协议段（_super.md 重写、action-*.md 交卷语义）。
+- **实装要点**：`agentSessions`（task-stream V4）+ `consumeSessionRun`（首 run / send 共用消费管道）+ `sendToTaskSession`；chat 侧 `RunningChatRecord` 变会话记录（agent + runActive）+ `sendChatMessage` + `consumeChatRun`；「run 自然 finished 且 lastAction 还 running」时豁免两种正常情况（后置 check 在跑 = 刚交卷、pendingAsk 在等答案）才判「没交卷就跑了」；stop-hook 同口径豁免。approve 纯服务端落状态。协议信号瘦身到 3 个（ACTION_ACK_REVISE / USER_REPLY / NEXT_ACTION 前缀 + 附件段头）、一致性测试改守「旧协议字样不得残留」。
+- **V0.11.1 会话持久化 + 空闲回收（同日、用户拍板 abc 全做）**：
+  - **Agent.resume 跨重启续会话**：`Task.sessionAgentId` 落盘（create/resume 时写、停止/终结/报错/换新 agent 清、空闲回收保留）；task 侧 `resumeTaskSession`（重建 mergedMcp + `registerSessionBridges` 重注册 handler/notifier——从 internalStartAgent 抽出的共用工厂）、chat 侧 `resumeChatSession` + `registerChatNotifier`。ack / ask-reply 路由随 client `bootArgs`（apiKey/model/gitHost/gitToken、task-store 内部自动附）拿恢复凭据；advance 续用 / chat-reply 天然有。服务重启后「再聊聊 / 答弹窗 / 续用推进 / chat 消息」全部无缝接回原会话
+  - **⚠️ resume 两个必传（实测踩过、AgentNotFoundError / ConfigurationError）**：① `local.cwd` 必须和 create 时一致（本地 agent 按 cwd 定位持久化存储）；② `model` 必须显式传（恢复的 agent 不保留 model、send 会炸）——task 侧优先用最近 action 的 agentModel、chat 侧用 bootArgs.model。已用「记暗号 → 重启 app → 问暗号」实测全链路：resume 成功（autoStarted=false）+ 上下文保留
+  - **会话空闲回收**：task / chat 各一个 sweeper（10min 扫、闲置 2h close、keepPersisted——下次操作 resume 接回、体感无差）、降常驻 agent 子进程数
+  - **boot recovery 不再误伤**：只有 `running`（run 真在跑时进程死了）才标 error；`awaiting_user` 是新模型正常静息态、保留原状（resume 可续）
+  - **preview Windows 杀进程树**：`kill(-pid)` 负号语义 win 不支持、改 `taskkill /T /F`
+  - 顺手清了旧协议死代码 / 误导注释（route-helpers KEEPALIVE 常量、readRecentEvents、十余处注释、README 关键属性段）
+- typecheck / lint / vitest 143 全绿；chat 多轮 send 续接实测通过、task 模式冒烟因 TCC 权限（锁屏 + 重签名）只验到 agent 启动 + 工具调用正常、见 learned-conventions 新增踩坑条目。
+
+### V0.10.1：自更新「稍后重启」防挂死闸 + updates/ 启动清扫（2026-07-07、线上事故沉淀）
+
+- **事故**：正式 app（v0.9.10 进程）7-6 早自更新到 v0.9.14 后用户点「稍后」没重启——mac 自更新是**原地替换 /Applications 里的 .app**、老进程继续跑在被替换的 bundle 上、此后 SDK 沙箱 zsh state-dump helper 因 bundle 失配**永久挂死**（跟 learned-conventions 里「test 包重打不退老实例」同机制）：每起一个 agent run、第一批 shell 调用就永远不返回、任务假死「运行中」（next-server 下挂一排僵尸 `dump_zsh_state`）。7-7 早用户跑「上线审查」action 连卡两次、排查确诊。
+- **修复（marker 硬闸）**：壳 `macSelfUpdate` 替换成功后写 `<data>/update-pending-restart.json`（含新版本号）、壳下次启动删；server 在**所有起新 agent run 的入口**查 marker、存在直接拒绝并提示重启——`advanceTaskInner` / `restartCurrentActionInner` 开头 throw（API 400 透传 toast）、chat-reply 懒重启分支（拦在杀健康旧 Run 之前）+ 终态自动启动分支返 409。已在跑的 run（更新前起的、仍健康）不受影响。新模块 `src/lib/server/update-pending.ts` + `tests/update-pending.test.ts`。
+- **顺带**：壳启动 `cleanupUpdateLeftovers`——清 updates/ 残留（`old-*.app` 暂存旧包 / `mnt-*` 挂载点先 detach 再删 / 残留 dmg；替换现场 rm 偶发失败早前被静默吞、实测积了 4 份 200MB+ 旧包）、并删待重启 marker；替换现场 rm 失败改记日志不再静默。
+- typecheck / lint / vitest 155 全绿（改动含 electron-app/main.js、`node --check` 过）。
+
+---
+
 ### V0.10：任务 worktree 隔离（2026-07-06 实装）
 
 - **动机**：agent 直接在用户配置的仓库目录里干活（`local.cwd = getEffectiveCwd(repoPaths)`）——同仓两个 task 并行必互踩（checkout 互切、A 的现场被 B 掀掉）、agent 和用户本人抢同一工作区、review 指纹易被无关改动误触。这是单机并行使用的物理天花板。

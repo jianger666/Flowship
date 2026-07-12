@@ -36,8 +36,6 @@
  * - 模式 2 但缺 bootArgs → 400
  */
 
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 
 import {
@@ -68,6 +66,7 @@ import {
   errorResponse,
   isValidModel,
   modelEquals,
+  parseAndValidateAttachments,
   parseAndValidateImages,
   stringSetEquals,
 } from "@/lib/server/route-helpers";
@@ -117,38 +116,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (!imagesResult.ok) return imagesResult.errorResponse;
   const images = imagesResult.images;
 
-  // 校验 attachments：必须绝对路径、必须存在
-  const rawAttachments = Array.isArray(body.attachments) ? body.attachments : [];
-  if (rawAttachments.length > MAX_ATTACHMENTS_PER_REPLY) {
-    return errorResponse(
-      `单次最多附 ${MAX_ATTACHMENTS_PER_REPLY} 条路径（你传了 ${rawAttachments.length}）`,
-    );
-  }
-  const attachmentAbsPaths: string[] = [];
-  for (const raw of rawAttachments) {
-    if (typeof raw !== "string" || !raw.trim()) {
-      return errorResponse("attachments 必须是非空字符串数组");
-    }
-    const abs = path.resolve(raw.trim());
-    if (!path.isAbsolute(abs)) {
-      return errorResponse(`attachments 必须是绝对路径：${raw}`);
-    }
-    try {
-      await fs.stat(abs);
-      attachmentAbsPaths.push(abs);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") {
-        return errorResponse(`attachments 路径不存在：${raw}`);
-      }
-      if (code === "EACCES") {
-        return errorResponse(`attachments 无权限读取：${raw}`);
-      }
-      return errorResponse(
-        `attachments stat 失败：${(err as Error).message}`,
-      );
-    }
-  }
+  // 校验 attachments：必须绝对路径、必须存在（helper 跟 question 路由共用）
+  const attachResult = await parseAndValidateAttachments(
+    body.attachments,
+    MAX_ATTACHMENTS_PER_REPLY,
+  );
+  if (!attachResult.ok) return attachResult.errorResponse;
+  const attachmentAbsPaths = attachResult.paths;
 
   // 必须 text / images / attachments 至少一项
   if (
@@ -195,7 +169,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     userReplyMeta.images = savedImages;
   }
   if (attachmentAbsPaths.length > 0) {
-    userReplyMeta.attachmentPaths = attachmentAbsPaths;
+    // 前端 extractUserReplyAttachments 读的是 meta.attachments（对象数组、带 absPath/isDir）——
+    // 老代码写 attachmentPaths（string[]）导致路径 chips 在事件流一直不显示（v1.1.x Bugbot 揪出）
+    userReplyMeta.attachments = attachResult.metas;
   }
   const fallbackText =
     text.length === 0 && (imageAbsPaths || attachmentAbsPaths.length > 0)

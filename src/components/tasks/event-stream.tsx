@@ -19,40 +19,17 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
-import {
-  ArrowUp,
-  File as FileIcon,
-  Folder,
-  FolderOpen,
-  Loader2,
-  Paperclip,
-  Send,
-  Sparkles as SparklesIcon,
-  Square,
-  X,
-} from "lucide-react";
+import { Loader2, Sparkles as SparklesIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
-import {
-  SlashSkillChips,
-  SlashSkillMenu,
-  useSlashSkills,
-} from "@/components/slash-skills";
-import { Button } from "@/components/ui/button";
-import { ImageThumb } from "@/components/ui/image-preview";
-import { Textarea } from "@/components/ui/textarea";
-import { Separator } from "@/components/ui/separator";
+import { Composer } from "@/components/composer";
+import { useSlashSkills } from "@/components/slash-skills";
 import { useImageAttach } from "@/hooks/use-image-attach";
+import { usePathAttach } from "@/hooks/use-path-attach";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { findPendingAskEvent } from "@/lib/ask-pending";
-import { pickNativePaths } from "@/lib/native-picker";
-import { pathBasename } from "@/lib/path-utils";
-import {
-  getSubmitShortcutHint,
-  getSubmitShortcutTitle,
-  shouldSubmitOnKeyDown,
-} from "@/lib/submit-shortcut";
+import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import {
   getScrollAnchor,
@@ -151,9 +128,7 @@ interface Props {
   onPrependEvents?: (events: TaskEvent[]) => void;
 }
 
-// chat 单次最多附几条路径（防滥用 / context 爆）
-// 跟图片上限保持一致：6 个、但路径不算大、其实可以高点；先 10 平衡
-const MAX_ATTACHMENTS_PER_REPLY = 10;
+// 路径附件上限在 use-path-attach hook 内统一管（10 条、跟服务端路由对齐）
 
 // 用 React.memo 包裹：详情页输入交互（如「再聊聊」对话框输入）触发 page 重渲染时、
 // 只要 task / streamingText 引用没变就跳过本组件、避免几百条 events 的子树参与 reconcile
@@ -197,16 +172,10 @@ const EventStreamImpl = ({
   const isChat = variant === "chat";
   // 输入草稿、发送后清空；按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）
   const [draft, setDraft] = useState(() => loadDraft("reply", task.id));
-  // 原生 picker 调用中（防双击连开系统对话框）；存 mode 让被点的那颗按钮转 spinner
-  // ——mac osascript 弹窗有 ~1s 冷启动延迟、用户反馈「点了没反应」、需要即时视觉反馈
-  const [picking, setPicking] = useState<false | "file" | "folder">(false);
-  // 待发送的文件 / 目录绝对路径列表、跟图片 hook 平行的 state
-  // 发送后清空；元素本身就是绝对路径字符串（不像 images 是 base64 blob）
-  const [attachedPaths, setAttachedPaths] = useState<string[]>([]);
-  // 个人偏好的提交快捷键：默认 Cmd/Ctrl+Enter，设置页可切 Enter 提交。
-  const submitShortcut = useSubmitShortcut();
-  const submitShortcutHint = getSubmitShortcutHint(submitShortcut);
-  const submitShortcutTitle = getSubmitShortcutTitle(submitShortcut);
+  // 文件 / 目录路径附件（原生 picker、跟 task「跟 AI 说」条共用 hook）
+  const pathAttach = usePathAttach();
+  // 个人偏好的提交快捷键（placeholder 提示用；提交判定在 Composer 内部）
+  const submitShortcutHint = getSubmitShortcutHint(useSubmitShortcut());
   // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方 streaming 自动滚 effect）
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   // 用户当前是否贴在底部（由 Virtuoso atBottomStateChange 维护）。
@@ -368,23 +337,9 @@ const EventStreamImpl = ({
   // - chat 下 agent 答完自然结束回合、status 变 awaiting_user → canCompose 变 true 触发 focus
   const isAwaitingUser = canCompose;
 
-  // V0.5.4 图附件管理统一走 hook、跟 revise-dialog 共用（同款约束、同款交互）
+  // V0.5.4 图附件管理统一走 hook（v1.1.x 起整个对象直传 <Composer>）
   // disabled=!isAwaitingUser 时所有 handler 短路、防止 agent 没等待时也能添图
-  const {
-    images: attachedImages,
-    isDragging,
-    fileInputRef,
-    maxImages: MAX_IMAGES_PER_REPLY,
-    removeImage: handleRemoveImage,
-    triggerFilePicker: handleAttachClick,
-    onPaste: handlePaste,
-    onDragOver: handleDragOver,
-    onDragLeave: handleDragLeave,
-    onDrop: handleDrop,
-    onFileInputChange: handleFilePicked,
-    reset: resetAttachedImages,
-    toUploadPayload: imagesToUploadPayload,
-  } = useImageAttach({ disabled: !isAwaitingUser });
+  const attach = useImageAttach({ disabled: !isAwaitingUser });
 
   // 自动聚焦：进入「可输入」时把光标放进输入框、用户立刻可以打字
   // - 解决以前的痛点：agent 回完话、用户得鼠标点输入框才能输入
@@ -397,51 +352,6 @@ const EventStreamImpl = ({
       return () => clearTimeout(timer);
     }
   }, [isAwaitingUser]);
-
-  // 文件 / 目录选完回调：去重 + 上限校验、加进 attachedPaths
-  const handlePathsPicked = (paths: string[]) => {
-    setAttachedPaths((prev) => {
-      const set = new Set(prev);
-      let dupCount = 0;
-      for (const p of paths) {
-        if (set.has(p)) {
-          dupCount++;
-        } else {
-          set.add(p);
-        }
-      }
-      const merged = Array.from(set);
-      if (merged.length > MAX_ATTACHMENTS_PER_REPLY) {
-        toast.warning(
-          `路径数超上限 ${MAX_ATTACHMENTS_PER_REPLY}、已截断到前 ${MAX_ATTACHMENTS_PER_REPLY} 条`,
-        );
-        return merged.slice(0, MAX_ATTACHMENTS_PER_REPLY);
-      }
-      if (dupCount > 0) {
-        toast.info(`已忽略 ${dupCount} 条重复路径`);
-      }
-      return merged;
-    });
-  };
-
-  // 原生 picker（V0.7.13）：附文件 / 附目录各自一键、桌面端走主进程系统对话框
-  const pickPaths = async (mode: "file" | "folder") => {
-    setPicking(mode);
-    try {
-      const paths = await pickNativePaths({
-        mode,
-        multiple: true,
-        prompt: mode === "folder" ? "附加目录（agent 用 read 工具看）" : "附加文件（agent 用 read 工具看）",
-      });
-      if (paths) handlePathsPicked(paths);
-    } finally {
-      setPicking(false);
-    }
-  };
-
-  const handleRemovePath = (p: string) => {
-    setAttachedPaths((prev) => prev.filter((x) => x !== p));
-  };
 
   // v1.0：`/` 唤起 skill（菜单 + chips、选中后从草稿摘掉 /token）
   const slash = useSlashSkills({ applyDraft: setDraft });
@@ -467,25 +377,16 @@ const EventStreamImpl = ({
   const handleSend = () => {
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
-    if (!text && attachedImages.length === 0 && attachedPaths.length === 0) return;
-    const images: ImagePayload[] | undefined = imagesToUploadPayload();
-    const attachments = attachedPaths.length > 0 ? attachedPaths : undefined;
+    if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) return;
+    const images: ImagePayload[] | undefined = attach.toUploadPayload();
+    const attachments = pathAttach.paths.length > 0 ? pathAttach.paths : undefined;
     // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
     onUserReply?.(slash.buildSkillPrefix() + text, images, attachments);
     setDraft("");
     saveDraft("reply", task.id, "");
     slash.reset();
-    resetAttachedImages();
-    setAttachedPaths([]);
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
-    if (slash.onKeyDown(e)) return;
-    if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-      e.preventDefault();
-      handleSend();
-    }
+    attach.reset();
+    pathAttach.reset();
   };
 
   // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
@@ -636,356 +537,41 @@ const EventStreamImpl = ({
           />
         )}
       </div>
-      {/* hideReplyComposer=true 时（plan workflow 模式）只展示事件流、底部输入区由父组件用 phase ack 区替代
-          这里 early-return 避免下面整大段输入区 JSX 进 DOM */}
-      {hideReplyComposer ? null : isChat ? (
-        /* ---------- chat 形态：圆角输入岛（V0.7.11、Cursor agent window 风格） ---------- */
+      {/* hideReplyComposer=true 时（task 模式）只展示事件流、底部输入区由父组件的
+          TaskTalkComposer 替代；chat 形态渲染统一输入岛 <Composer>（v1.1.x 收口） */}
+      {hideReplyComposer || !isChat ? null : (
         <div className="shrink-0 px-6 pb-5 pt-1">
-          <div
+          <Composer
+            value={draft}
+            onChange={(v) => {
+              setDraft(v);
+              saveDraft("reply", task.id, v);
+            }}
+            onSubmit={handleSend}
+            placeholder={
+              isAwaitingUser
+                ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
+                : (disabledHint ?? "agent 当前没有等待你回复")
+            }
+            disabled={!isAwaitingUser}
+            textareaRef={inputRef}
+            slash={slash}
+            attach={attach}
+            paths={pathAttach.paths}
+            onRemovePath={pathAttach.removePath}
+            onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
+            picking={pathAttach.picking}
+            topRow={composerTop}
+            leading={composerLeading}
+            running={isRunning}
+            onStop={onStop}
+            stopping={stopping}
             className={cn(
-              "relative mx-auto w-full max-w-3xl rounded-xl border bg-card/70 shadow-sm transition-all",
-              "focus-within:border-ring/60 focus-within:shadow-md",
-              isDragging && "border-primary/50 bg-primary/5",
-              !isAwaitingUser && "opacity-70",
+              "mx-auto w-full max-w-3xl",
+              !isAwaitingUser && !isRunning && "opacity-70",
             )}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            {/* `/` skill 菜单（浮岛上方）+ 已选 chips（v1.0） */}
-            <SlashSkillMenu slash={slash} />
-            <SlashSkillChips slash={slash} />
-            {/* 选择器行（工作目录 / 分支）：岛最顶、本次对话配置归一条。
-                workdir 常驻 → 此行高度恒定、不随 branch 显隐而跳动 */}
-            {composerTop && (
-              <div className="flex flex-wrap items-center gap-1.5 border-b border-border/50 px-3 pb-2.5 pt-3">
-                {composerTop}
-              </div>
-            )}
-            {/* 附件预览：紧贴输入框上方（图缩略 + 路径 chips） */}
-            {(attachedImages.length > 0 || attachedPaths.length > 0) && (
-              <div className="flex flex-wrap gap-2 px-3 pt-2.5">
-                {attachedImages.map((img, i) => (
-                  <ImageThumb
-                    key={img.id}
-                    src={img.dataUrl}
-                    alt={img.file.name}
-                    onRemove={() => handleRemoveImage(img.id)}
-                    group={attachedImages.map((im) => ({
-                      src: im.dataUrl,
-                      alt: im.file.name,
-                    }))}
-                    index={i}
-                  />
-                ))}
-                {attachedPaths.map((p) => {
-                  const looksLikeDir = !pathBasename(p).includes(".");
-                  return (
-                    <div
-                      key={p}
-                      className="group flex max-w-full items-center gap-1.5 rounded-md border bg-background/60 px-2 py-1 text-xs"
-                      title={p}
-                    >
-                      {looksLikeDir ? (
-                        <Folder className="size-3 shrink-0 text-amber-500" />
-                      ) : (
-                        <FileIcon className="size-3 shrink-0 text-muted-foreground" />
-                      )}
-                      <span className="min-w-0 truncate font-mono text-[11px]">{pathBasename(p)}</span>
-                      <button
-                        type="button"
-                        onClick={() => handleRemovePath(p)}
-                        className="flex size-3.5 shrink-0 items-center justify-center rounded-full opacity-60 hover:bg-muted hover:opacity-100"
-                        aria-label="移除"
-                      >
-                        <X className="size-2.5" />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            {/* 输入框：去边框嵌入岛内、岛本身的 focus-within 提供聚焦反馈 */}
-            <Textarea
-              ref={inputRef}
-              value={draft}
-              onChange={(e) => {
-                setDraft(e.target.value);
-                saveDraft("reply", task.id, e.target.value);
-                slash.onDraftChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
-              }}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
-              rows={2}
-              placeholder={
-                isAwaitingUser
-                  ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
-                  : (disabledHint ?? "agent 当前没有等待你回复")
-              }
-              disabled={!isAwaitingUser}
-              className="max-h-48 min-h-13 resize-none overflow-y-auto border-0 bg-transparent px-3.5 py-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
-            />
-            {/* 底部操作行：左下放模型选择器（composerLeading）、右侧放动作（附图 / 文件 / 目录 + 发送）。
-                工作目录 / 分支选择器在岛顶部 composerTop 一条。
-                运行态：右侧整组换成 loading 转圈 + 红色停止键——原地替换、不新增行、不顶布局 */}
-            <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-1.5">
-              {/* 左下：模型选择器（chat 注入 composerLeading）；不传时空 div、右侧仍靠右 */}
-              <div className="flex min-w-0 items-center">{composerLeading}</div>
-              <div className="flex shrink-0 items-center gap-0.5">
-                {isRunning ? (
-                  <>
-                    <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-                    <Button
-                      type="button"
-                      size="sm"
-                      onClick={onStop}
-                      disabled={stopping}
-                      title="停止生成（中断 agent）"
-                      className="ml-1 size-7 rounded-lg bg-destructive p-0 text-white hover:bg-destructive/90"
-                    >
-                      {stopping ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <Square className="size-3 fill-current" />
-                      )}
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={!isAwaitingUser}
-                      onClick={handleAttachClick}
-                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                      title="附图（也支持粘贴 / 拖拽）"
-                    >
-                      <Paperclip className="size-3.5" />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={!isAwaitingUser || picking !== false}
-                      onClick={() => void pickPaths("file")}
-                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                      title="附文件（agent 会用 `read` 工具看）"
-                    >
-                      {picking === "file" ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <FileIcon className="size-3.5" />
-                      )}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={!isAwaitingUser || picking !== false}
-                      onClick={() => void pickPaths("folder")}
-                      className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                      title="附目录（agent 会用 `read` 工具看）"
-                    >
-                      {picking === "folder" ? (
-                        <Loader2 className="size-3.5 animate-spin" />
-                      ) : (
-                        <FolderOpen className="size-3.5" />
-                      )}
-                    </Button>
-                    <Button
-                      size="sm"
-                      disabled={
-                        !isAwaitingUser ||
-                        (!draft.trim() && attachedImages.length === 0 && attachedPaths.length === 0)
-                      }
-                      onClick={handleSend}
-                      className="ml-1 size-7 rounded-lg p-0"
-                      title={`发送（${submitShortcutTitle}）`}
-                    >
-                      <ArrowUp className="size-4" />
-                    </Button>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-          {/* 隐藏 input：附图按钮触发它 */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-            multiple
-            className="hidden"
-            onChange={handleFilePicked}
           />
         </div>
-      ) : (
-        <>
-      <Separator />
-      {/* 输入区整片支持拖拽：drag over 时整片轮廓变虚线提示 */}
-      <div
-        className={cn(
-          "shrink-0 p-3 transition-colors",
-          isDragging && "bg-primary/5 ring-1 ring-primary/30 ring-inset",
-        )}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-      >
-        {/* 缩略图区：发送前可移除单张、点击站内看大图（多图左右切换） */}
-        {attachedImages.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-2">
-            {attachedImages.map((img, i) => (
-              <ImageThumb
-                key={img.id}
-                src={img.dataUrl}
-                alt={img.file.name}
-                className="size-16"
-                onRemove={() => handleRemoveImage(img.id)}
-                group={attachedImages.map((im) => ({
-                  src: im.dataUrl,
-                  alt: im.file.name,
-                }))}
-                index={i}
-              />
-            ))}
-          </div>
-        )}
-        {/* 路径附件区：一行一个 chip、显示 basename、hover 显完整路径、可单独移除 */}
-        {attachedPaths.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-1.5">
-            {attachedPaths.map((p) => {
-              // 简单判断：末尾不带 . 视为目录（启发式、最终 server 会再 stat）
-              // UI 这里只是图标提示、不影响发送数据
-              const looksLikeDir = !pathBasename(p).includes(".");
-              return (
-                <div
-                  key={p}
-                  className="group flex max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs"
-                  title={p}
-                >
-                  {looksLikeDir ? (
-                    <Folder className="size-3 shrink-0 text-amber-500" />
-                  ) : (
-                    <FileIcon className="size-3 shrink-0 text-muted-foreground" />
-                  )}
-                  <span className="min-w-0 truncate font-mono text-[11px]">
-                    {pathBasename(p)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleRemovePath(p)}
-                    className="flex size-3.5 shrink-0 items-center justify-center rounded-full opacity-60 hover:bg-muted hover:opacity-100"
-                    aria-label="移除"
-                  >
-                    <X className="size-2.5" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-        <Textarea
-          ref={inputRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            saveDraft("reply", task.id, e.target.value);
-          }}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          rows={3}
-          placeholder={
-            isAwaitingUser
-              ? `回复 / 粘贴或拖拽图片 / 点附图按钮（${submitShortcutHint}）`
-              : (disabledHint ?? "agent 当前没有等待你回复")
-          }
-          disabled={!isAwaitingUser}
-          className="resize-none text-sm"
-        />
-        {/* 隐藏 input：附图按钮触发它 */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-          multiple
-          className="hidden"
-          onChange={handleFilePicked}
-        />
-        <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
-          {/* 左边：模型选择器 slot（chat 注入、其它模式不传）+ 状态文案、附件计数 */}
-          <div className="flex min-w-0 items-center gap-2">
-            {composerLeading}
-            <span className="min-w-0 truncate">
-              {isAwaitingUser
-                ? attachedImages.length > 0 || attachedPaths.length > 0
-                  ? `图 ${attachedImages.length}/${MAX_IMAGES_PER_REPLY}、路径 ${attachedPaths.length}/${MAX_ATTACHMENTS_PER_REPLY}`
-                  : "agent 在等你回复"
-                : (disabledHint ?? "agent 在等待你回复时输入框才会激活")}
-            </span>
-          </div>
-          {/* 右边一行：附图 / 附文件 / 发送（聊一起、对齐发送动作）*/}
-          <div className="flex shrink-0 items-center gap-1">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              disabled={!isAwaitingUser}
-              onClick={handleAttachClick}
-              className="h-7 gap-1 px-2 text-xs"
-              title="附图（也支持粘贴 / 拖拽）"
-            >
-              <Paperclip className="size-3.5" />
-              附图
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              disabled={!isAwaitingUser || picking !== false}
-              onClick={() => void pickPaths("file")}
-              className="h-7 gap-1 px-2 text-xs"
-              title="附文件（agent 会用 `read` 工具看）"
-            >
-              {picking === "file" ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <FileIcon className="size-3.5" />
-              )}
-              附文件
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              disabled={!isAwaitingUser || picking !== false}
-              onClick={() => void pickPaths("folder")}
-              className="h-7 gap-1 px-2 text-xs"
-              title="附目录（agent 会用 `read` 工具看）"
-            >
-              {picking === "folder" ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <FolderOpen className="size-3.5" />
-              )}
-              附目录
-            </Button>
-            <Button
-              size="sm"
-              disabled={
-                !isAwaitingUser ||
-                (!draft.trim() && attachedImages.length === 0 && attachedPaths.length === 0)
-              }
-              onClick={handleSend}
-            >
-              <Send className="size-3.5" />
-              发送
-            </Button>
-          </div>
-        </div>
-      </div>
-        </>
       )}
     </div>
   );

@@ -9,10 +9,12 @@
  * 统一到这里、未来加新 route 直接复用、改 image 校验规则也只改一份。
  *
  * 设计取舍：
- *   - 不抽 chat-reply 独有的 attachments 校验（涉及 fs.stat 异步 + 路径校验、且只一处用）
  *   - 不抽各路由自定义的「images 总数上限」常量（chat 6 / revise 6）、
  *     这些是业务参数、由 route 自己定、helper 只校验「不超传入的 max」
  */
+
+import path from "node:path";
+import { promises as fs } from "node:fs";
 
 import type { ModelSelection } from "@cursor/sdk";
 
@@ -168,5 +170,93 @@ export const parseAndValidateImages = (
   }
 
   return { ok: true, images };
+};
+
+// ----------------- 路径附件校验 -----------------
+
+/** user_reply 事件 meta.attachments 的条目形状（前端 extractUserReplyAttachments 读它渲染路径 chips） */
+export interface AttachmentMeta {
+  absPath: string;
+  isDir: boolean;
+  bytes?: number;
+}
+
+interface ParseAttachmentsOk {
+  ok: true;
+  paths: string[];
+  /** stat 顺手带出的展示信息、直接写进事件 meta.attachments */
+  metas: AttachmentMeta[];
+}
+
+interface ParseAttachmentsErr {
+  ok: false;
+  errorResponse: Response;
+}
+
+/**
+ * 校验 body.attachments（文件 / 目录绝对路径数组、原生 picker 选的）：
+ * 非空字符串、绝对路径、真实存在（stat）；超上限 / 任一不合法 → 400。
+ * chat-reply 和 question 路由共用（v1.1.x 任务输入条也能附路径后抽到这）。
+ */
+export const parseAndValidateAttachments = async (
+  raw: unknown,
+  maxCount: number,
+): Promise<ParseAttachmentsOk | ParseAttachmentsErr> => {
+  const rawList = Array.isArray(raw) ? raw : [];
+  if (rawList.length > maxCount) {
+    return {
+      ok: false,
+      errorResponse: errorResponse(
+        `单次最多附 ${maxCount} 条路径（你传了 ${rawList.length}）`,
+      ),
+    };
+  }
+  const paths: string[] = [];
+  const metas: AttachmentMeta[] = [];
+  for (const item of rawList) {
+    if (typeof item !== "string" || !item.trim()) {
+      return {
+        ok: false,
+        errorResponse: errorResponse("attachments 必须是非空字符串数组"),
+      };
+    }
+    const abs = path.resolve(item.trim());
+    if (!path.isAbsolute(abs)) {
+      return {
+        ok: false,
+        errorResponse: errorResponse(`attachments 必须是绝对路径：${item}`),
+      };
+    }
+    try {
+      const st = await fs.stat(abs);
+      paths.push(abs);
+      metas.push({
+        absPath: abs,
+        isDir: st.isDirectory(),
+        bytes: st.isFile() ? st.size : undefined,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        return {
+          ok: false,
+          errorResponse: errorResponse(`attachments 路径不存在：${item}`),
+        };
+      }
+      if (code === "EACCES") {
+        return {
+          ok: false,
+          errorResponse: errorResponse(`attachments 无权限读取：${item}`),
+        };
+      }
+      return {
+        ok: false,
+        errorResponse: errorResponse(
+          `attachments stat 失败：${(err as Error).message}`,
+        ),
+      };
+    }
+  }
+  return { ok: true, paths, metas };
 };
 

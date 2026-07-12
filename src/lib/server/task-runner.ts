@@ -869,6 +869,8 @@ export interface ResumeCurrentActionInput {
   task: Task;
   userMessage: string;
   imagePaths?: string[];
+  /** 用户随消息附的文件 / 目录绝对路径（v1.1.x 任务输入条也能附路径） */
+  attachmentPaths?: string[];
   apiKey: string;
   /** 模型优先级：forceModel → action.agentModel → task.model → 这里的兜底（bootArgs.model） */
   fallbackModel: ModelSelection;
@@ -991,6 +993,7 @@ const resumeCurrentActionInner = async (
       pendingQuestions,
       input.userMessage,
       input.imagePaths,
+      input.attachmentPaths,
     ),
     branchCheckoutHint,
     apiKey: input.apiKey,
@@ -2105,10 +2108,17 @@ export const deliverTaskQuestion = async (
   imagePaths?: string[],
   creds?: SessionCreds,
   ackContext?: { actionId: string; artifactPath?: string },
+  attachmentPaths?: string[],
 ): Promise<boolean> =>
   sendToTaskSession(
     task,
-    buildAgentMessage({ kind: "user_message", text, imagePaths, ackContext }),
+    buildAgentMessage({
+      kind: "user_message",
+      text,
+      imagePaths,
+      attachmentPaths,
+      ackContext,
+    }),
     ackContext
       ? { creds, errorActionId: ackContext.actionId }
       : { creds, questionRun: true },
@@ -2130,6 +2140,7 @@ export const startOneShotQuestion = (
   questionText: string,
   imagePaths: string[] | undefined,
   creds: { apiKey: string; model: ModelSelection },
+  attachmentPaths?: string[],
 ): void => {
   const prevRunStatus = task.runStatus === "running" ? "idle" : task.runStatus;
   void (async () => {
@@ -2157,7 +2168,12 @@ export const startOneShotQuestion = (
         `- 工作目录：${effectiveCwd}`,
         "",
         "# 用户的话",
-        buildAgentMessage({ kind: "user_message", text: questionText, imagePaths }),
+        buildAgentMessage({
+          kind: "user_message",
+          text: questionText,
+          imagePaths,
+          attachmentPaths,
+        }),
         "",
         "# 边界",
         "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",
