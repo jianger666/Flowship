@@ -43,9 +43,17 @@ import Link from "next/link";
 import {
   AlertTriangle,
   ArrowRight,
+  BookMarked,
+  Code2,
+  GitMerge,
   Info,
   Loader2,
   Paperclip,
+  PenLine,
+  Rocket,
+  SearchCheck,
+  Sparkles,
+  type LucideIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
