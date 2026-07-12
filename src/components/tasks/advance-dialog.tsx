@@ -177,6 +177,56 @@ const inferDisabledReason = (
   }
 };
 
+// action 方块卡 icon 映射（内置六种、语义对应；自定义 action 统一 Sparkles 兜底）
+const ACTION_ICON: Record<Exclude<ActionType, "custom">, LucideIcon> = {
+  plan: PenLine,
+  build: Code2,
+  review: SearchCheck,
+  ship: Rocket,
+  learn: BookMarked,
+  dev: GitMerge,
+};
+
+// action 方块卡共用外观（内置 + 自定义两处渲染、单一来源）：
+// 竖排居中（icon 上 label 下）、py-2 压掉 card 默认 p-3 的纵向、总高≈原「标题+副标题」两行
+// 选中态覆盖 card 默认（bg-primary/5 → bg-selected 实底、border 收敛到 primary/50）、
+// icon / label 变品牌色点睛；未选中时 hover 背景微亮（border 亮化走 card 变体自带的 hover:border-primary/50）
+const actionCardClass = (selected: boolean) =>
+  cn(
+    "group flex min-h-[3.75rem] w-full flex-col items-center justify-center gap-1.5 py-2",
+    selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
+  );
+
+// action 方块卡内容（icon + 居中 label）——选中品牌色、未选中 icon muted、hover 过渡到 foreground
+const ActionCardContent = ({
+  icon: Icon,
+  label,
+  selected,
+}: {
+  icon: LucideIcon;
+  label: string;
+  selected: boolean;
+}) => (
+  <>
+    <Icon
+      className={cn(
+        "size-5 shrink-0 transition-colors",
+        selected
+          ? "text-primary"
+          : "text-muted-foreground group-hover:text-foreground",
+      )}
+    />
+    <span
+      className={cn(
+        "w-full truncate text-center text-sm font-medium",
+        selected && "text-primary",
+      )}
+    >
+      {label}
+    </span>
+  </>
+);
+
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
 // 简单情况下用固定文案；首次 plan / 修 bug 等场景由 buildPlaceholder() 进一步细化
 const ACTION_PLACEHOLDER: Record<Exclude<ActionType, "custom">, string> = {
@@ -501,9 +551,9 @@ export const AdvanceDialog = ({
     [customById, actionLayout],
   );
 
-  // 「下一步」：网格方块卡（历史两行标题+副标题高度、现只居中主标题、无副标题）
-  // 内置 + 自定义混排；不可选原因仍用角标警告 icon。
-  // min-h-[3.75rem] = 当初 p-3 + 主标题行 + gap-0.5 + 副标题 text-[10px] 的实际高度
+  // 「下一步」：网格方块卡、竖排居中（icon 上 label 下、Raycast/Linear 式克制点睛）
+  // 内置 + 自定义混排；外观 / 内容走 actionCardClass + ActionCardContent 单一来源；
+  // 不可选原因仍用角标警告 icon（右上角、icon 居中后两者不重叠）。
   const renderActionChip = (key: string) => {
     if (isBuiltinAdvanceAction(key)) {
       const type = key;
@@ -512,20 +562,25 @@ export const AdvanceDialog = ({
         resolvedHost: resolvedGitHost,
         devBranches: liveDevBranches,
       });
+      const selected = actionType === type;
       return (
         // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip
         <div key={key} className="relative">
           <ChoiceButton
             shape="card"
-            selected={actionType === type}
+            selected={selected}
             onClick={() => {
               setActionType(type);
               setSelectedCustomActionId(null);
             }}
             disabled={submitting || !!reason}
-            className="flex min-h-[3.75rem] w-full items-center justify-center"
+            className={actionCardClass(selected)}
           >
-            <span className="truncate font-medium">{ACTION_LABEL[type]}</span>
+            <ActionCardContent
+              icon={ACTION_ICON[type]}
+              label={ACTION_LABEL[type]}
+              selected={selected}
+            />
           </ChoiceButton>
           {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
           {reason && (
@@ -538,22 +593,23 @@ export const AdvanceDialog = ({
         </div>
       );
     }
-    // 自定义 action：key 是 custom id、还原成 def 渲染（只显示 label、居中）
+    // 自定义 action：key 是 custom id、还原成 def 渲染（icon 统一 Sparkles 兜底）
     const def = customById.get(key);
     if (!def) return null;
+    const selected = actionType === "custom" && selectedCustomActionId === def.id;
     return (
       <div key={key} className="relative">
         <ChoiceButton
           shape="card"
-          selected={actionType === "custom" && selectedCustomActionId === def.id}
+          selected={selected}
           onClick={() => {
             setActionType("custom");
             setSelectedCustomActionId(def.id);
           }}
           disabled={submitting}
-          className="flex min-h-[3.75rem] w-full items-center justify-center"
+          className={actionCardClass(selected)}
         >
-          <span className="truncate font-medium">{def.label}</span>
+          <ActionCardContent icon={Sparkles} label={def.label} selected={selected} />
         </ChoiceButton>
       </div>
     );
