@@ -206,6 +206,10 @@ export const CustomActionEditor = ({
 
           <div className="grid gap-1.5">
             <Label>主 skill</Label>
+            {/* 用户验收点名疑惑「产出写哪」——做什么/产出什么都在 skill 里、壳只管挂载 */}
+            <p className="text-xs text-muted-foreground">
+              做什么、产出什么都写在 skill 里；产出会自动写成文档交给你审阅
+            </p>
             <Select
               value={draft.skill || undefined}
               onValueChange={(v) => {
