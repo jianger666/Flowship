@@ -15,9 +15,11 @@
 
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { extractFeishuStoryId } from "@/lib/branch-template";
+import { dataRoot } from "./data-root";
 import { meegleBin } from "./feishu-cli";
 
 const execFileAsync = promisify(execFile);
@@ -384,22 +386,104 @@ export const fetchMyRoleOnWorkitem = async (
   }
 };
 
-/** 拼 prompt「用户身份」行；无姓名时调用方应整行不注入（本函数要求已有 name） */
-export const formatUserIdentityLine = (
-  name: string,
-  roleOnStory?: string | null,
-): string => {
-  if (roleOnStory && roleOnStory.trim()) {
-    return `- 发起人：${name}（在本需求的角色：${roleOnStory.trim()}）`;
+// ---------- 角色持久缓存（<dataRoot>/identity.json） ----------
+
+/**
+ * 为什么要持久化：角色（前端 / 后端 / 测试）几乎不变、但不是每个 story 都排了角色组——
+ * story 查到角色时存一份、之后「story 没排角色 / chat 无 story」都能拿它兜底注入。
+ *
+ * ⚠️ 独立小文件、**不进 config.json**：settings 是客户端整对象 PUT、服务端私有字段
+ * 塞进去会被下一次保存 clobber。按 userKey 记、换账号登录不会串。
+ */
+interface PersistedIdentity {
+  userKey: string;
+  name: string;
+  /** story 角色组查到的角色名（如「前端开发」）、多角色顿号拼接 */
+  role: string;
+  savedAt: number;
+}
+
+const identityFile = (): string => path.join(dataRoot(), "identity.json");
+
+// 文件内容的进程内镜像（undefined = 还没读过磁盘）——角色查询在 agent 启动热路径上、
+// 别每次都读文件；写入时同步刷新
+let persistedCache: PersistedIdentity | null | undefined;
+
+/** 读缓存的角色（按 userKey 校验、换账号不串）；失败 / 没存过返 null */
+const readPersistedRole = async (userKey: string): Promise<string | null> => {
+  if (persistedCache === undefined) {
+    try {
+      const raw = await fs.readFile(identityFile(), "utf-8");
+      const parsed = JSON.parse(raw) as Partial<PersistedIdentity>;
+      persistedCache =
+        typeof parsed.userKey === "string" &&
+        typeof parsed.name === "string" &&
+        typeof parsed.role === "string" &&
+        parsed.role.trim()
+          ? {
+              userKey: parsed.userKey,
+              name: parsed.name,
+              role: parsed.role,
+              savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
+            }
+          : null;
+    } catch {
+      // 文件不存在 / JSON 损坏都当没缓存（下次查到角色会重写覆盖）
+      persistedCache = null;
+    }
   }
-  return `- 发起人：${name}`;
+  return persistedCache && persistedCache.userKey === userKey
+    ? persistedCache.role
+    : null;
+};
+
+/** story 查到角色时持久化（没存过 / 角色变了才写；原子写 tmp + rename） */
+const savePersistedRole = async (
+  identity: MeegleIdentity,
+  role: string,
+): Promise<void> => {
+  const existing = await readPersistedRole(identity.userKey);
+  if (existing === role) return;
+  const record: PersistedIdentity = {
+    userKey: identity.userKey,
+    name: identity.name,
+    role,
+    savedAt: Date.now(),
+  };
+  try {
+    const file = identityFile();
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+    await fs.writeFile(tmp, JSON.stringify(record, null, 2), "utf-8");
+    await fs.rename(tmp, file);
+    persistedCache = record;
+  } catch {
+    // 写失败不致命（下次 story 查到角色再试）、也别污染进程镜像
+  }
 };
 
 /**
- * 解析并拼出可直接塞进 super / chat prompt 的「用户身份」行。
- * - 有飞书 story URL → 尽量查该需求上的角色组，拼「姓名 + 角色」
- * - 无 URL / 查不到角色 → 只写姓名
- * - meegle 未登录 / 全程失败 → 返空串（调用方不注入整行）
+ * 拼 prompt「用户身份」行；无姓名时调用方应整行不注入（本函数要求已有 name）。
+ * role.source 区分文案：story = 本需求实排角色（可信）；cache = 历史常用角色（兜底、
+ * 提示 agent 如有出入以用户说的为准）。
+ */
+export const formatUserIdentityLine = (
+  name: string,
+  role?: { source: "story" | "cache"; name: string } | null,
+): string => {
+  if (!role || !role.name.trim()) return `- 发起人：${name}`;
+  if (role.source === "story") {
+    return `- 发起人：${name}（在本需求的角色：${role.name.trim()}）`;
+  }
+  return `- 发起人：${name}（常用角色：${role.name.trim()}；本需求未排角色、如有出入以用户说的为准）`;
+};
+
+/**
+ * 解析并拼出可直接塞进 super / chat prompt 的「用户身份」行。三级优先：
+ * 1. story 角色组查到 → 「在本需求的角色」（并持久化、供后续兜底）
+ * 2. story 没排 / 无 story（chat）→ 缓存角色兜底、「常用角色」措辞
+ * 3. 都没有 → 只写姓名
+ * meegle 未登录 / 全程失败 → 返空串（调用方不注入整行）。
  *
  * projectKey 走 `url decode` 的 simple_name（CLI `--project-key` 接受 simpleName）。
  */
@@ -410,20 +494,40 @@ export const resolveUserIdentityForPrompt = async (
     const identity = await fetchMyIdentity();
     if (!identity) return "";
 
-    let role: string | null = null;
+    // 1. story 实排角色
+    let storyRole: string | null = null;
     const url = feishuStoryUrl?.trim();
     if (url) {
       const storyId = extractFeishuStoryId(url);
       if (storyId) {
-        // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍注入姓名）
+        // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍走兜底）
         const decoded = await decodeWorkitemUrl(url);
         const projectKey = decoded?.simpleName;
         if (projectKey) {
-          role = await fetchMyRoleOnWorkitem(projectKey, storyId);
+          storyRole = await fetchMyRoleOnWorkitem(projectKey, storyId);
         }
       }
     }
-    return formatUserIdentityLine(identity.name, role);
+    if (storyRole) {
+      // 角色很难变——没存过就存、真变了以新为准更新
+      await savePersistedRole(identity, storyRole);
+      return formatUserIdentityLine(identity.name, {
+        source: "story",
+        name: storyRole,
+      });
+    }
+
+    // 2. 缓存角色兜底（story 没排 / chat 无 story）
+    const cachedRole = await readPersistedRole(identity.userKey);
+    if (cachedRole) {
+      return formatUserIdentityLine(identity.name, {
+        source: "cache",
+        name: cachedRole,
+      });
+    }
+
+    // 3. 只有姓名
+    return formatUserIdentityLine(identity.name);
   } catch {
     return "";
   }
