@@ -15,6 +15,17 @@
 
 ---
 
+### 2026-07-12 晚 v1.1.2 发版：Lexical 输入引擎 + 脱离 Cursor 配置 + action=skill 挂载壳（含 07-12 早/午两批、三轮 subagent 审核全修）
+
+- **Composer 输入引擎迁 Lexical**（@lexical/react 0.47、Cursor 同款路线）：skill token = TextNode token 模式**真原子节点**（光标前后可停可见、整删、可夹任意文字中间、手打全名自动转；DecoratorNode 首版光标前沿消失、实测后换）；tag 样式单一来源 `ui/skill-token.tsx`（组件 + 常量、气泡/输入框同款、✨icon 走 ::before 伪元素不进文本流）；`editorKey=task.id` 切任务重建（撤销栈不跨任务串）；**中文 skill 名全链路**（slash 唤起 / token 高亮 / 最长前缀命中「/写代码帮我改下」、共享字符集 `src/lib/skill-token.ts`）
+- **skill 指引所见即所得**：skills 独立字段传输（chat-reply / question 路由 `skills[]` + `parseAndValidateSkills`）、user_reply 事件只存原文、`buildSkillDirective` 只拼进 agent 消息（chat 首条/续聊 + task send/resume/oneshot 五链路）；气泡 `/name` 高亮（SkillTokenText、只认真实 skill 名）；user 消息改纯文本渲染（主流对齐）
+- **settingSources 清零 + hooks 退役**：五处 `settingSources:[]`——SDK 不再碰任何 .cursor（根治「chat 未绑目录 cwd=homedir 把 ~/.cursor 全局 MCP 漏进 agent」实锤 bug）；stop hook 换 **send 追问**（run 结束检测未交卷 → agent.send 追问 ≤2 次、globalThis 计数、cancelled/force-new 并发防线 + runningTasks agentId 身份比对）；shell 红线转 prompt 软约束、hooks 全链路删、业务仓不再被写 hooks.json（存量按内容指纹清理 cleanup-fe-hooks）
+- **Rules 极简**：一句话即规则（无 frontmatter、全常驻注入 readAppRulesForPrompt）、「从 Cursor 导入」与 `~/.cursor/rules` 运行时注入全砍、按需 index 档删
+- **飞书身份注入**：`user me` 姓名 + **settings.userRole**（设置页 / 首页清单写入）；meegle 未登录仍可只注入角色行；adaptive 无角色时按任务性质判定、判不准 ask_user（不再 `remember_user_role`）；resolve 姓名 5s 预算 + 60s 负缓存；**meegle CLI 全局串行队列 `meegle-queue.ts`**
+- **自定义 action = skill 挂载壳**（用户拍板概念收敛）：壳只剩 label / 简介 / 主 skill / **产出要求 output**（属底座、skill 保持纯方法论可拆卸）/ placeholder（freshAgent、附加 skills 均删）；对话创建 v2（AI 写纯方法论 skill → `create_custom_action` MCP 工具结构化挂壳）；共享 = 行上导出（skill 目录 + 隐藏 `.flowship-action.json` 挂载参数）+ 顶部导入（自动挂壳）；**旧格式 playbook action 直接停用不兼容**（滤出推进列表、能力页「查看原文 + 删除」）；命名支持中文（「写代码」）
+- 其它：SDK 1.0.19→1.0.23（包内真实对话冒烟过）；Windows 安装卡死修复（installer taskkill 孤儿 Flowship.exe）；skills absPath 修复（~ 短路径致 400）；两个默认值开关 hint 去歧义；自定义 action git 边界段（worktree 已检出分支教 checkout -b 绕）
+- 审核：三轮 subagent 终审（全量 + 增量×2、Bugbot×3）——2 P1 + 10+ P2/P3 全修、无 P0 带病发版
+
 ### 2026-07-12 午（已随 v1.1.2 发）统一输入岛 Composer + 开屏一屏到底 + 升级后授权误报根治
 
 - **统一输入岛 `src/components/composer.tsx`**（用户点名「封装一个高级输入框、chat / task 复用」）：圆角岛 + 顶边拖高（setPointerCapture、高度记全局偏好）+ **Codex 风框内 skill token**（品牌色 icon + 文字、hover 出移除、替代旧独立小药丸 SlashSkillChips——已删）+ 图/路径附件预览 + footer（左 slot 模型选择器 / 右附图·附文件·附目录·发送、运行态原地换停止键）。chat 输入岛（event-stream）和 task「跟 AI 说」条全部换用；event-stream 里不可达的旧 log 形态输入区（两个调用方都不走）删除

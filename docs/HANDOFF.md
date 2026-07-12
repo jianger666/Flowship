@@ -301,27 +301,19 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-12 夜（未发）设置页「我的角色」+ 身份注入简化 + Skill 行控件顺序
+### 2026-07-13 v1.1.3 发版：角色设置化 + 能力页收尾 + 推进弹窗定稿（终审无 P0/P1、4 P3 修 3）
 
-- **settings.userRole**（`fe|be|qa|other`）：偏好区 Select + 首页就绪清单必填（四 chip 点选即存）；注入文案 `- 发起人：姓名（角色：前端）` / 仅角色 `- 发起人角色：前端`
-- **身份链路退役**：story 角色组反查 / `identity.json` / `remember_user_role` MCP 全删；角色只读 config.json、姓名仍走 meegle `user me`
-- **列表行控件**：Skills / Rules 统一「操作按钮在前、开关最后」（MCP 原本已是）
+- **settings.userRole**（`fe|be|qa|other`）：偏好区 Select（chips 版用户否掉）+ 首页就绪清单必填一步；身份注入只从设置取角色（story 角色组反查 / `identity.json` / `remember_user_role` MCP **全退役删除**——用户拍板「任务里取+缓存兜底不可靠」）、姓名仍走 meegle `user me`；注入文案 `- 发起人：姓名（角色：前端）`
+- **就绪清单全引导化**：四步统一「打勾 + 一句话 + 去设置（锚点直达）」、不再内嵌任何编辑（用户拍板「要么全统一组件要么全引导」）；点选不刷新 bug 修过一轮（useSettings 每实例独立快照、写入与判定要同实例）
+- **旧格式 action「转建新版」**：一键开对话自动带旧 playbook 全文 + 自动提交首条（apiKey 未配 / send 失败降级草稿、不留孤儿任务）；action-creator 指引精炼（只讲 action=skill 挂载关系、不出现「纯方法论」等会被 AI 复述的修饰词；产出必落任务目录 md、别给「对话里直接回」选项）
+- **推进弹窗定稿**（多轮调整）：4 列网格卡、块高 40px、文字 13px、✨ 左侧垂直居中角标、主标题居中无副标题无 tooltip；防抖 min-h 占位反撑出大空档、全部回退（`empty:hidden` 无内容不占高、JSX 条件渲染假分支产真空元素 `:empty` 命中已验证）；模型区去小标题紧凑化
+- **杂项**：Select 选中项 bg-selected 底色 + 勾勾左侧常驻占位（不再悬浮贴边）；Skills / Rules 行「操作在前、开关最后」；DialogContent 整体 `[-webkit-app-region:no-drag]`（Electron 拖拽区按像素矩形不看 z-index、高弹窗顶部 X 点不动）；侧栏自动默认改「仅设置/能力页收、看板/详情全展」（胶囊切换不再一收一放）；skill 英文命名指引（label 可中文）
+- 终审 P3 修复：isFieldEqual 补 userRole 分支（漏了会 fall-through 到 defaultModel 比较）、chat-runner 身份注释纠漂移、转建失败降级；遗留 P3（可不修）：fetchSlashSkills 60s 缓存窗口内刚启用的 skill 拉不到（有降级自愈）
 
-### 2026-07-12 夜（未发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
+### 2026-07-12 夜（已随 v1.1.3 发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
 
 - **运行时不再扫 `~/.cursor/skills/`**：`loadSkills` / `findSkillByName` / 能力页列表只剩平台自带 + app 自管 + 飞书 CLI；「从 Cursor 导入」按钮与 `listCursorGlobalSkills` 保留（导入=拷贝成自管）
 - **只读 skill 眼睛看全文**：内置 / 飞书 CLI 行加 Eye → 只读 Dialog；`GET /api/skills/content` 扩到按 name+source 读任意已知来源（防任意路径）
-
-### 2026-07-12 晚 v1.1.2 发版：Lexical 输入引擎 + 脱离 Cursor 配置 + action=skill 挂载壳（含 07-12 早/午两批、三轮 subagent 审核全修）
-
-- **Composer 输入引擎迁 Lexical**（@lexical/react 0.47、Cursor 同款路线）：skill token = TextNode token 模式**真原子节点**（光标前后可停可见、整删、可夹任意文字中间、手打全名自动转；DecoratorNode 首版光标前沿消失、实测后换）；tag 样式单一来源 `ui/skill-token.tsx`（组件 + 常量、气泡/输入框同款、✨icon 走 ::before 伪元素不进文本流）；`editorKey=task.id` 切任务重建（撤销栈不跨任务串）；**中文 skill 名全链路**（slash 唤起 / token 高亮 / 最长前缀命中「/写代码帮我改下」、共享字符集 `src/lib/skill-token.ts`）
-- **skill 指引所见即所得**：skills 独立字段传输（chat-reply / question 路由 `skills[]` + `parseAndValidateSkills`）、user_reply 事件只存原文、`buildSkillDirective` 只拼进 agent 消息（chat 首条/续聊 + task send/resume/oneshot 五链路）；气泡 `/name` 高亮（SkillTokenText、只认真实 skill 名）；user 消息改纯文本渲染（主流对齐）
-- **settingSources 清零 + hooks 退役**：五处 `settingSources:[]`——SDK 不再碰任何 .cursor（根治「chat 未绑目录 cwd=homedir 把 ~/.cursor 全局 MCP 漏进 agent」实锤 bug）；stop hook 换 **send 追问**（run 结束检测未交卷 → agent.send 追问 ≤2 次、globalThis 计数、cancelled/force-new 并发防线 + runningTasks agentId 身份比对）；shell 红线转 prompt 软约束、hooks 全链路删、业务仓不再被写 hooks.json（存量按内容指纹清理 cleanup-fe-hooks）
-- **Rules 极简**：一句话即规则（无 frontmatter、全常驻注入 readAppRulesForPrompt）、「从 Cursor 导入」与 `~/.cursor/rules` 运行时注入全砍、按需 index 档删
-- **飞书身份注入**：`user me` 姓名 + **settings.userRole**（设置页 / 首页清单写入）；meegle 未登录仍可只注入角色行；adaptive 无角色时按任务性质判定、判不准 ask_user（不再 `remember_user_role`）；resolve 姓名 5s 预算 + 60s 负缓存；**meegle CLI 全局串行队列 `meegle-queue.ts`**
-- **自定义 action = skill 挂载壳**（用户拍板概念收敛）：壳只剩 label / 简介 / 主 skill / **产出要求 output**（属底座、skill 保持纯方法论可拆卸）/ placeholder（freshAgent、附加 skills 均删）；对话创建 v2（AI 写纯方法论 skill → `create_custom_action` MCP 工具结构化挂壳）；共享 = 行上导出（skill 目录 + 隐藏 `.flowship-action.json` 挂载参数）+ 顶部导入（自动挂壳）；**旧格式 playbook action 直接停用不兼容**（滤出推进列表、能力页「查看原文 + 删除」）；命名支持中文（「写代码」）
-- 其它：SDK 1.0.19→1.0.23（包内真实对话冒烟过）；Windows 安装卡死修复（installer taskkill 孤儿 Flowship.exe）；skills absPath 修复（~ 短路径致 400）；两个默认值开关 hint 去歧义；自定义 action git 边界段（worktree 已检出分支教 checkout -b 绕）
-- 审核：三轮 subagent 终审（全量 + 增量×2、Bugbot×3）——2 P1 + 10+ P2/P3 全修、无 P0 带病发版
 
 ## 关键文件索引
 
