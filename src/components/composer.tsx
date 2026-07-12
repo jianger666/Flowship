@@ -1,5 +1,3 @@
-"use client";
-
 /**
  * 统一输入岛 Composer（v1.1.x、用户点名「封装一个高级的输入框、chat / task 都复用」）
  *
@@ -8,16 +6,18 @@
  *
  * - 岛容器：圆角 + focus 高亮 + 拖拽文件落入高亮
  * - 顶边拖柄：往上拉变高（贴底输入条的直觉方向）、高度记全局偏好
- * - skill 内联 token（Codex 风）：文本流里保留 `/skill-name`、mirror overlay 铺品牌色底衬
+ * - skill 内联 token：Lexical SkillTokenNode（品牌色 tag、原子整删）
  * - `/` slash 菜单（浮岛上方）
  * - 附件预览：图缩略（可移除 / 点看大图）+ 文件 / 目录路径 chips
- * - textarea：提交快捷键（个人偏好 + IME 安全）、随内容自增、拖过则固定高
+ * - 输入引擎：Lexical PlainText（提交快捷键 + IME 安全 + 拖高滚动）
  * - footer：左 slot（模型 / 自定义）+ 右动作组（附图 / 附文件 / 附目录 + 发送）；
  *   运行态原地换成 spinner + 红色停止键（不顶布局）
  *
  * 状态归调用方（草稿 / 附件 hook / slash / 提交逻辑）、本组件只管交互和视觉——
  * 两个调用方各自的业务分支（disabled 判定 / placeholder / 发送通道）不进来。
  */
+
+"use client";
 
 import { useRef, useState, type ReactNode, type RefObject } from "react";
 import {
@@ -33,19 +33,15 @@ import {
 
 import { cn } from "@/lib/utils";
 import {
-  parseSkillTokens,
-  SlashSkillMenu,
-  type SlashSkillsApi,
-} from "@/components/slash-skills";
+  ComposerEditor,
+  type ComposerFocusHandle,
+} from "@/components/composer-editor";
+import { SlashSkillMenu, type SlashSkillsApi } from "@/components/slash-skills";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
-import { Textarea } from "@/components/ui/textarea";
+import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { pathBasename } from "@/lib/path-utils";
-import {
-  getSubmitShortcutTitle,
-  shouldSubmitOnKeyDown,
-} from "@/lib/submit-shortcut";
 import { loadBoxHeight, saveBoxHeight } from "@/lib/view-memory";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 
@@ -53,79 +49,28 @@ import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 const MIN_BOX_HEIGHT = 52;
 const MAX_BOX_HEIGHT = 400;
 
-/**
- * textarea 与 mirror overlay 共用排版 class——字体度量必须一致，否则底衬错位。
- * 抽常量防两处漂移。
- */
-const COMPOSER_TEXT_CLASS =
-  "min-h-13 w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
-
-/** Backspace = 向后删光标前一字；Delete = 向前删光标处一字 */
-type TokenDeletionDirection = "backward" | "forward";
-
-/** 命中时要整段抹掉的区间（含 token 后紧跟的一个空格，若有） */
-export interface TokenDeletionHit {
-  /** 删除起点（含）——通常是 `/` 的下标 */
-  start: number;
-  /** 删除终点（不含）——可能已吞掉尾随空格 */
-  end: number;
-}
-
-/**
- * 判定「这次 Backspace / Delete 会不会碰到某个已命中 skill token 的字符」。
- *
- * 为什么要单独抽：textarea 默认按「字符」删，Codex 风 tag 要按「整段 token」删；
- * 区间判定 + 尾空格吞并放纯函数里，onKeyDown 只负责 preventDefault / 写回草稿。
- *
- * 判定矩阵（无选区、非 IME；有选区 / 组合输入由调用方先过滤）：
- *
- * | 光标相对 token [start, end) | Backspace              | Delete                 |
- * |----------------------------|------------------------|------------------------|
- * | cursor === start           | 不拦（删 token 前一字） | 整段删                 |
- * | start < cursor < end       | 整段删                 | 整段删                 |
- * | cursor === end             | 整段删（会碰到末字）   | 不拦（删 token 后一字）|
- * | cursor === end+1 且 end 处是空格 | 不拦（只删那个空格） | 不拦                   |
- *
- * 区间写法：Backspace 命中 `(start, end]`；Delete 命中 `[start, end)`。
- * 整段删时若 `text[end] === ' '` 一并吞掉（补全时会留尾空格，否则留下孤儿空格）。
- */
-export const findTokenHitByDeletion = (
-  text: string,
-  cursor: number,
-  direction: TokenDeletionDirection,
-  knownNames: ReadonlySet<string>,
-): TokenDeletionHit | null => {
-  const tokens = parseSkillTokens(text, knownNames);
-  if (tokens.length === 0) return null;
-
-  for (const t of tokens) {
-    const hits =
-      direction === "backward"
-        ? // Backspace 删的是 cursor-1；落在 token 内任意字符上才拦
-          cursor > t.start && cursor <= t.end
-        : // Delete 删的是 cursor；落在 token 内任意字符上才拦
-          cursor >= t.start && cursor < t.end;
-    if (!hits) continue;
-
-    let end = t.end;
-    if (text[end] === " ") end += 1;
-    return { start: t.start, end };
-  }
-  return null;
-};
+export type { ComposerFocusHandle };
 
 export interface ComposerProps {
+  /**
+   * 编辑上下文标识（如 task.id）：变化时强制重建 Lexical 编辑器——
+   * 撤销栈 / 内部文档树跟着上下文走、防「切 task 后 Cmd+Z 回滚出上一个任务的草稿」
+   */
+  editorKey?: string;
   value: string;
   /** 值变化（调用方存 state + 草稿）；slash 的光标同步组件内部代办 */
   onChange: (value: string) => void;
   onSubmit: () => void;
   placeholder?: string;
-  /** 整体禁用：textarea + 附件动作 + 发送（停止键不受它管） */
+  /** 整体禁用：编辑器 + 附件动作 + 发送（停止键不受它管） */
   disabled?: boolean;
   /** 请求飞行中：发送键转圈（跟 running 的区别：这是「提交这条」的短暂态） */
   submitting?: boolean;
-  /** textarea ref（调用方做自动聚焦 / Cmd+J 用） */
-  textareaRef?: RefObject<HTMLTextAreaElement | null>;
+  /**
+   * 聚焦句柄（调用方做自动聚焦 / Cmd+J）。
+   * 旧 textareaRef 已退役——调用方只用 `.focus()` / `.prepareCursor()`。
+   */
+  focusRef?: RefObject<ComposerFocusHandle | null>;
 
   /** `/` 唤起 skill（不传 = 无 slash 能力） */
   slash?: SlashSkillsApi;
@@ -153,58 +98,15 @@ export interface ComposerProps {
   className?: string;
 }
 
-/**
- * 把草稿拆成「普通文字 + 命中 skill token」片段，给 mirror 渲染底衬用。
- * 普通文字 / token 文字都 text-transparent——只靠 token 的 bg 可见、字仍由上层 textarea 画。
- */
-const renderSkillHighlightMirror = (
-  text: string,
-  knownNames: ReadonlySet<string>,
-) => {
-  if (!text) return null;
-  const tokens = parseSkillTokens(text, knownNames);
-  if (tokens.length === 0) {
-    return <span className="text-transparent">{text}</span>;
-  }
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  tokens.forEach((t, i) => {
-    if (t.start > cursor) {
-      parts.push(
-        <span key={`t-${i}`} className="text-transparent">
-          {text.slice(cursor, t.start)}
-        </span>,
-      );
-    }
-    parts.push(
-      <span
-        key={`s-${i}-${t.name}`}
-        // 描边 + 略深底衬：看起来更像 Codex tag；字仍透明、由上层 textarea 画，避免重影
-        className="rounded-[4px] bg-primary/20 text-transparent ring-1 ring-inset ring-primary/30"
-      >
-        {text.slice(t.start, t.end)}
-      </span>,
-    );
-    cursor = t.end;
-  });
-  if (cursor < text.length) {
-    parts.push(
-      <span key="tail" className="text-transparent">
-        {text.slice(cursor)}
-      </span>,
-    );
-  }
-  return parts;
-};
-
 export const Composer = ({
+  editorKey,
   value,
   onChange,
   onSubmit,
   placeholder,
   disabled,
   submitting,
-  textareaRef,
+  focusRef,
   slash,
   attach,
   paths,
@@ -218,18 +120,15 @@ export const Composer = ({
   stopping,
   className,
 }: ComposerProps) => {
-  // 手动拖过的高度（null = 未拖过、textarea 随内容自增）；记全局偏好、跨任务共用
+  // 手动拖过的高度（null = 未拖过、编辑器随内容自增）；记全局偏好、跨任务共用
   const [boxHeight, setBoxHeight] = useState<number | null>(() => {
     const saved = loadBoxHeight();
     return saved != null
       ? Math.min(MAX_BOX_HEIGHT, Math.max(MIN_BOX_HEIGHT, saved))
       : null;
   });
-  // 内部 fallback ref：调用方不传 textareaRef 时拖高也要能量初始高度
-  const innerRef = useRef<HTMLTextAreaElement | null>(null);
-  const taRef = textareaRef ?? innerRef;
-  // mirror 底衬层：跟 textarea 同步 scrollTop，避免滚动后高亮错位
-  const mirrorRef = useRef<HTMLDivElement | null>(null);
+  // 量高容器：拖柄读 contentEditable 外包一层的高度
+  const boxContainerRef = useRef<HTMLDivElement | null>(null);
   const submitShortcut = useSubmitShortcut();
 
   const images = attach?.images ?? [];
@@ -243,8 +142,6 @@ export const Composer = ({
     if (disabled || submitting || !hasContent) return;
     onSubmit();
   };
-
-  const boxStyle = boxHeight != null ? { height: boxHeight } : undefined;
 
   return (
     <div
@@ -261,8 +158,7 @@ export const Composer = ({
       {/* `/` skill 菜单（浮岛上方） */}
       {slash && <SlashSkillMenu slash={slash} />}
 
-      {/* 顶边拖柄：往上拉变高、往下拉变矮；setPointerCapture 让拖出手柄仍跟手、
-          且 move/up/cancel 都挂在手柄元素上——组件卸载浏览器自动释放、不留全局监听 */}
+      {/* 顶边拖柄：往上拉变高、往下拉变矮；setPointerCapture 让拖出手柄仍跟手 */}
       <div
         className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
         onPointerDown={(e) => {
@@ -272,7 +168,7 @@ export const Composer = ({
           const startY = e.clientY;
           const startH =
             boxHeight ??
-            taRef.current?.getBoundingClientRect().height ??
+            boxContainerRef.current?.getBoundingClientRect().height ??
             MIN_BOX_HEIGHT;
           // 拖动过程中的最新高度（结束时落盘、避免每次 move 都写 localStorage）
           let latest: number | null = null;
@@ -317,7 +213,10 @@ export const Composer = ({
               alt={img.file.name}
               className="size-10 rounded bg-background"
               onRemove={() => attach?.removeImage(img.id)}
-              group={images.map((im) => ({ src: im.dataUrl, alt: im.file.name }))}
+              group={images.map((im) => ({
+                src: im.dataUrl,
+                alt: im.file.name,
+              }))}
               index={i}
             />
           ))}
@@ -354,97 +253,21 @@ export const Composer = ({
         </div>
       )}
 
-      {/* 输入区：下层 mirror 铺 skill 底衬、上层原生 textarea（IME / 光标零风险） */}
-      <div className="relative">
-        {slash && value.length > 0 && (
-          <div
-            ref={mirrorRef}
-            aria-hidden
-            className={cn(
-              "pointer-events-none absolute inset-0 z-0 overflow-hidden",
-              COMPOSER_TEXT_CLASS,
-              boxHeight == null && "max-h-64",
-            )}
-            style={boxStyle}
-          >
-            {renderSkillHighlightMirror(value, slash.knownNames)}
-            {/* 末尾换行占位：跟 textarea 一样、末行空行也要有高度 */}
-            {value.endsWith("\n") ? "\n" : null}
-          </div>
-        )}
-        <Textarea
-          ref={taRef}
-          value={value}
-          onChange={(e) => {
-            onChange(e.target.value);
-            slash?.onDraftChange(
-              e.target.value,
-              e.target.selectionStart ?? e.target.value.length,
-            );
-          }}
-          onScroll={(e) => {
-            // 只同步纵向——textarea wrap 不产生水平滚
-            if (mirrorRef.current) {
-              mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
-            }
-          }}
-          onPaste={attach?.onPaste}
-          onKeyDown={(e) => {
-            // slash 菜单开着时 ↑↓/Enter/Esc 归菜单、不触发发送
-            if (slash?.onKeyDown(e)) return;
-
-            // skill token 原子删除：无选区 + 非 IME 时，Backspace/Delete 碰到 token 字符就整段抹掉
-            if (
-              slash &&
-              !e.nativeEvent.isComposing &&
-              (e.key === "Backspace" || e.key === "Delete")
-            ) {
-              const ta = e.currentTarget;
-              const start = ta.selectionStart ?? 0;
-              const end = ta.selectionEnd ?? 0;
-              // 有选区 = 用户明确圈选编辑，照默认行为走
-              if (start === end) {
-                const hit = findTokenHitByDeletion(
-                  value,
-                  start,
-                  e.key === "Backspace" ? "backward" : "forward",
-                  slash.knownNames,
-                );
-                if (hit) {
-                  e.preventDefault();
-                  const next =
-                    value.slice(0, hit.start) + value.slice(hit.end);
-                  const nextCursor = hit.start;
-                  onChange(next);
-                  // 与 onChange 同构：同步菜单态（删掉 /partial 后应关菜单）
-                  slash.onDraftChange(next, nextCursor);
-                  // 受控 value 更新后再落光标（跟 event-stream applyDraft 同款 rAF）
-                  requestAnimationFrame(() => {
-                    const el = taRef.current;
-                    if (!el) return;
-                    el.setSelectionRange(nextCursor, nextCursor);
-                  });
-                  return;
-                }
-              }
-            }
-
-            if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-              e.preventDefault();
-              handleSubmit();
-            }
-          }}
-          rows={2}
-          placeholder={placeholder}
-          disabled={disabled}
-          style={boxStyle}
-          className={cn(
-            "relative z-10 resize-none overflow-y-auto border-0 bg-transparent shadow-none focus-visible:ring-0 dark:bg-transparent",
-            COMPOSER_TEXT_CLASS,
-            boxHeight == null && "max-h-64",
-          )}
-        />
-      </div>
+      {/* Lexical 输入区：skill token 原子节点 + slash / 提交 / 粘贴图。
+          key=editorKey：切上下文（如换 task）整体重建、撤销栈不跨任务串（Bugbot 揪出） */}
+      <ComposerEditor
+        key={editorKey}
+        value={value}
+        onChange={onChange}
+        onSubmit={handleSubmit}
+        placeholder={placeholder}
+        disabled={disabled}
+        focusRef={focusRef}
+        boxContainerRef={boxContainerRef}
+        boxHeight={boxHeight}
+        slash={slash}
+        attach={attach}
+      />
 
       {/* footer：左 slot + 右动作组（运行态原地替换、不顶布局） */}
       <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">

@@ -1,14 +1,10 @@
 /**
  * app 自管 Rules 管理（v1.1.x Rules 独立化、能力页 Rules tab 的 server 侧）
  *
- * 文件布局：`<dataRoot>/rules/<name>.mdc`
- * - 纯文本一句话（无 frontmatter）= 常驻注入
- * - 带 frontmatter 的跟 Cursor rules 同规范（description / alwaysApply）
- * 注入走 cursor-config.readGlobalCursorRulesForPrompt（全局 Cursor rules + 这里的
- * 自管 rules 合并、disabledRules 名单过滤）。
- *
- * 分层约定（用户拍板）：Cursor 全局 rules = 个人偏好（运行时照常注入、不提供 UI 导入）；
- * app 自管 rules = 团队 / 项目级（可建可关可删；主路径一句话、编辑可改 frontmatter）。
+ * 文件布局：`<dataRoot>/rules/<name>.mdc`、内容 = 纯文本规则正文（老文件可能
+ * 残留 frontmatter、读取时用 gray-matter 剥掉只取正文）。
+ * 注入走 cursor-config.readAppRulesForPrompt：启用中的规则全文常驻注入、
+ * disabledRules 名单过滤；`~/.cursor/rules` 已不再参与（用户拍板脱离 Cursor）。
  *
  * 安全约束：rule 名做文件名白名单校验（字母数字 - _ .、拒绝路径穿越）、
  * 所有写操作锚定在 getAppRulesDir() 之下。
@@ -18,13 +14,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 
-import { getAppRulesDir, isAlwaysApplyRule } from "./cursor-config";
+import { getAppRulesDir } from "./cursor-config";
 
 export interface AppRuleEntry {
   /** 文件名（不含 .mdc）、开关 / 增删按它记 */
   name: string;
-  description: string;
-  alwaysApply: boolean;
   absPath: string;
   /** 正文第一行非空行——列表主文字用（一句话规则直接看到内容） */
   bodyPreview: string;
@@ -56,14 +50,10 @@ const scanRulesDir = async (dir: string): Promise<AppRuleEntry[]> => {
     if (!ent.isFile() || !ent.name.toLowerCase().endsWith(".mdc")) continue;
     const abs = path.join(dir, ent.name);
     try {
+      // gray-matter 剥掉老文件可能残留的 frontmatter、预览只看正文
       const parsed = matter(await fs.readFile(abs, "utf-8"));
-      const data = parsed.data as Record<string, unknown>;
       out.push({
         name: path.basename(ent.name, path.extname(ent.name)),
-        description:
-          typeof data.description === "string" ? data.description.trim() : "",
-        // 跟注入分流一致：无 frontmatter = 常驻
-        alwaysApply: isAlwaysApplyRule(data),
         absPath: abs,
         bodyPreview: firstBodyLine(parsed.content),
       });

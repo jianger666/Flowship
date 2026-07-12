@@ -6,8 +6,9 @@
  * 交互：
  * - 光标前正在打 `/xxx`（行首或空格后）→ 输入框上方弹 skill 菜单、继续打字过滤
  * - ↑↓ 选、Enter/Tab 确认、Esc 关；点击也可选
- * - 选中：把光标前的 `/partial` **补全成 `/skill-name `**（留在文本流里、可夹在任意文字中间）
- * - 高亮：Composer 用 mirror overlay 给命中的 `/skill-name` 铺品牌色底衬（见 composer.tsx）
+ * - 选中：优先走编辑器注入的 pickHandler（Lexical 直接插 SkillTokenNode）；
+ *   否则 fallback 把光标前 `/partial` 补全成纯文本 `/skill-name `（applyDraft）
+ * - 高亮：Composer Lexical SkillTokenNode 品牌色 tag（见 composer-skill-token-node.tsx）
  * - 发送时调 buildSkillPrefix() 拼消息头：点名让 AI 先 read 对应 SKILL.md 再执行；
  *   正文原样保留 `/skill-name` 字样
  *
@@ -150,6 +151,9 @@ export const setPendingSlashSkill = (name: string) => {
   }
 };
 
+/** Lexical 编辑器注入的选中回调：成功插 token 返 true，否则 hook 走字符串 fallback */
+export type SlashPickHandler = (skill: SlashSkill) => boolean;
+
 export interface SlashSkillsApi {
   /** 菜单是否打开（有匹配的 slash 词 + 有候选） */
   menuOpen: boolean;
@@ -159,17 +163,22 @@ export interface SlashSkillsApi {
   activeIndex: number;
   /**
    * 当前草稿里解析出的 skill 引用（去重、按出现序）。
-   * 供发送拼 prefix；UI 高亮走 parseSkillTokens + mirror，不靠这个渲染 chip。
+   * 供发送拼 prefix；UI token 由 Lexical 节点渲染，不靠这个。
    */
   references: SlashSkill[];
-  /** 已知 enabled skill 名集合——Composer mirror 解析 token 用 */
+  /** 已知 enabled skill 名集合——编辑器 transform / 解析 token 用 */
   knownNames: ReadonlySet<string>;
-  /** textarea onChange 时调（传最新草稿 + 光标位置） */
+  /** 草稿变化时调（传最新纯文本 + 光标纯文本 offset） */
   onDraftChange: (draft: string, cursor: number) => void;
-  /** textarea onKeyDown 最前面调；返回 true = 事件已被菜单消费、调用方直接 return */
+  /** 键盘事件最前面调；返回 true = 事件已被菜单消费、调用方直接 return */
   onKeyDown: (e: KeyboardEvent) => boolean;
-  /** 点击菜单项：把光标前 `/partial` 补全成 `/skill-name ` */
+  /** 点击 / 键盘选中菜单项 */
   pickAt: (index: number) => void;
+  /**
+   * ComposerEditor 挂载时注入：选中后直接插 SkillTokenNode。
+   * 返回 unsubscribe；不传 / 返 false 时 pickAt 仍走 applyDraft 字符串补全。
+   */
+  registerPickHandler: (handler: SlashPickHandler | null) => () => void;
   /** 发送时拼消息头（没引用返回空串）；调用方发送成功后调 reset() */
   buildSkillPrefix: () => string;
   /** 只清菜单态（不清草稿——草稿由调用方清） */
@@ -180,8 +189,8 @@ export const useSlashSkills = (opts: {
   /** 当前草稿——references 从这里实时解析（单一真相、不另存 picked） */
   draft: string;
   /**
-   * 选中 / pending 消费时把新草稿写回调用方 state。
-   * 第二参 cursor：希望 textarea 落位的光标（补全后应在 token 尾空格之后）。
+   * 选中 fallback / pending 消费时把新草稿写回调用方 state。
+   * 第二参 cursor：希望编辑器落位的纯文本 offset（补全后应在 token 尾空格之后）。
    */
   applyDraft: (next: string, cursor?: number) => void;
 }): SlashSkillsApi => {
@@ -193,6 +202,8 @@ export const useSlashSkills = (opts: {
   const [activeIndex, setActiveIndex] = useState(0);
   // 最近一次 onDraftChange 的草稿 + 光标（选中时做文本替换用）
   const stateRef = useRef({ draft: opts.draft, cursor: opts.draft.length });
+  // Lexical 注入的 pick：优先插 DecoratorNode，失败再字符串 fallback
+  const pickHandlerRef = useRef<SlashPickHandler | null>(null);
 
   const { applyDraft, draft } = opts;
   // applyDraft / draft 可能每次 render 都是新引用——ref 化避免 pending effect 依赖抖动
@@ -269,10 +280,22 @@ export const useSlashSkills = (opts: {
     setActiveIndex(0);
   }, []);
 
+  const registerPickHandler = useCallback((handler: SlashPickHandler | null) => {
+    pickHandlerRef.current = handler;
+    return () => {
+      if (pickHandlerRef.current === handler) pickHandlerRef.current = null;
+    };
+  }, []);
+
   const pickAt = useCallback(
     (index: number) => {
       const skill = filtered[index];
       if (!skill) return;
+      // Lexical 编辑器已注入 → 直接插 token 节点（不经字符串 round-trip）
+      if (pickHandlerRef.current?.(skill)) {
+        setQuery(null);
+        return;
+      }
       const { draft: cur, cursor } = stateRef.current;
       const before = cur.slice(0, cursor);
       const m = before.match(SLASH_RE);
@@ -280,7 +303,7 @@ export const useSlashSkills = (opts: {
         setQuery(null);
         return;
       }
-      // 把光标前的 `/partial` 补全成 `/skill-name `（尾空格让菜单自然关掉、方便继续打字）
+      // fallback：把光标前的 `/partial` 补全成 `/skill-name `（尾空格关菜单）
       const cut = before.slice(0, before.length - (m[2].length + 1));
       const next = `${cut}/${skill.name} ${cur.slice(cursor)}`;
       const nextCursor = cut.length + skill.name.length + 2; // `/` + name + ` `
@@ -345,6 +368,7 @@ export const useSlashSkills = (opts: {
     onDraftChange,
     onKeyDown,
     pickAt,
+    registerPickHandler,
     buildSkillPrefix,
     reset,
   };
@@ -360,7 +384,7 @@ export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
           <button
             key={s.name}
             type="button"
-            // onMouseDown 防 textarea 失焦（blur 会先于 click 关菜单）
+            // onMouseDown 防 contentEditable 失焦（blur 会先于 click 关菜单）
             onMouseDown={(e) => {
               e.preventDefault();
               slash.pickAt(i);

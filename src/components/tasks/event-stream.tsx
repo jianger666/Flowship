@@ -23,7 +23,7 @@ import { Loader2, Sparkles as SparklesIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
-import { Composer } from "@/components/composer";
+import { Composer, type ComposerFocusHandle } from "@/components/composer";
 import { useSlashSkills } from "@/components/slash-skills";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { usePathAttach } from "@/hooks/use-path-attach";
@@ -188,7 +188,7 @@ const EventStreamImpl = ({
   // 锚点就恢复到那条、否则默认落底；null = 还没算（切 task 时重开）
   const initialTopRef = useRef<number | null>(null);
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const inputRef = useRef<ComposerFocusHandle | null>(null);
 
 
   // 渲染前两道合并 pass + 拼 streaming placeholder：
@@ -357,15 +357,12 @@ const EventStreamImpl = ({
   const slash = useSlashSkills({
     draft,
     applyDraft: (next, cursor) => {
+      // Lexical pick 通常已直接写编辑器；fallback / pending handoff 走这里
+      if (cursor != null) inputRef.current?.prepareCursor(cursor);
       setDraft(next);
       saveDraft("reply", task.id, next);
-      if (cursor == null) return;
-      // 等受控 value commit 后再落光标，否则 selection 会被 React 冲掉
       requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el) return;
-        el.focus();
-        el.setSelectionRange(cursor, cursor);
+        inputRef.current?.focus();
       });
     },
   });
@@ -556,6 +553,7 @@ const EventStreamImpl = ({
       {hideReplyComposer || !isChat ? null : (
         <div className="shrink-0 px-6 pb-5 pt-1">
           <Composer
+            editorKey={task.id}
             value={draft}
             onChange={(v) => {
               setDraft(v);
@@ -568,7 +566,7 @@ const EventStreamImpl = ({
                 : (disabledHint ?? "agent 当前没有等待你回复")
             }
             disabled={!isAwaitingUser}
-            textareaRef={inputRef}
+            focusRef={inputRef}
             slash={slash}
             attach={attach}
             paths={pathAttach.paths}

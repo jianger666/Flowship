@@ -11,7 +11,8 @@
  * 历史（V0.6.2「跟 Cursor 共用工具」、已废弃）：曾经每次起 agent 实时合并 Cursor 配置、
  * `settingSources:["project"]` 只加载 repo 层所以全局配置由 fe 自己读。
  *
- * 本文件还保留「读 `~/.cursor/` 全局 rules」（prompt 注入用、与 MCP 独立化无关）。
+ * 本文件还管 app 自管 rules 的 prompt 注入（readAppRulesForPrompt、只读
+ * `<dataRoot>/rules`——`~/.cursor/rules` 已不再注入、用户拍板彻底脱离 Cursor 安装配置）。
  * 全局 skills 在 `skills-loader.ts` 读（复用它的 scanSkillsDir、避免循环依赖）。
  */
 
@@ -211,106 +212,46 @@ const readDisabledRules = async (): Promise<Set<string>> => {
 };
 
 /**
- * 判定一条 rule 是否「常驻注入」：
- * - 无 frontmatter（gray-matter 解析后 data 为空）→ 常驻（一句话纯文本规则）
- * - 有 frontmatter → 仅 `alwaysApply === true` 才常驻（Cursor 风格按需规则语义不变）
+ * 读 app 自管 rules（`<dataRoot>/rules/*.mdc`）→ 拼成 prompt 段
  *
- * 跟 app-rules.scanRulesDir 共用，避免列表 badge 与注入分流漂移。
+ * - 所有启用中的规则**全文常驻注入**（规则间空行分隔）——「按需 index」档位已删
+ * - 老文件带 frontmatter 的只取正文（gray-matter body）、frontmatter 不进 prompt
+ * - settings.disabledRules 名单里的跳过
+ * - 无规则 → 返占位提示串
+ *
+ * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）；
+ * `~/.cursor/rules` 已彻底不读（脱离 Cursor 安装配置、要用的规则在能力页自建）。
  */
-export const isAlwaysApplyRule = (
-  parsedData: Record<string, unknown>,
-): boolean =>
-  Object.keys(parsedData).length === 0 || parsedData.alwaysApply === true;
-
-// 扫一个 rules 目录：按 alwaysApply 分「全文注入 / 按需 index」两堆（可按名单跳过）；
-// names = 实际收进来的规则名（调用方做跨目录同名去重用）
-const collectRulesFromDir = async (
-  rulesDir: string,
-  skip?: Set<string>,
-): Promise<{ always: string[]; indexed: string[]; names: Set<string> }> => {
-  const always: string[] = [];
-  const indexed: string[] = [];
-  const names = new Set<string>();
+export const readAppRulesForPrompt = async (): Promise<string> => {
+  const NONE = "（未配置规则）";
+  const disabled = await readDisabledRules();
   let files: string[];
   try {
-    const entries = await fs.readdir(rulesDir, { withFileTypes: true });
+    const entries = await fs.readdir(getAppRulesDir(), { withFileTypes: true });
     files = entries
       .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".mdc"))
-      .map((e) => path.join(rulesDir, e.name))
+      .map((e) => path.join(getAppRulesDir(), e.name))
       .sort();
   } catch {
-    return { always, indexed, names };
+    return NONE;
   }
+  const bodies: string[] = [];
   for (const file of files) {
-    const ruleName = path.basename(file, path.extname(file));
-    if (skip?.has(ruleName)) continue;
+    if (disabled.has(path.basename(file, path.extname(file)))) continue;
     try {
-      const raw = await fs.readFile(file, "utf-8");
-      const parsed = matter(raw);
-      const data = parsed.data as Record<string, unknown>;
-      const desc =
-        typeof data.description === "string" ? data.description.trim() : "";
+      const parsed = matter(await fs.readFile(file, "utf-8"));
+      // 老文件可能「只有 frontmatter description、正文为空」——退到 description、
+      // 别把启用中的规则静默漏掉（Bugbot 揪出：UI 显示启用、prompt 里却没有）
       const body = parsed.content.trim();
-      if (isAlwaysApplyRule(data)) {
-        always.push(body);
-      } else {
-        indexed.push(`- ${desc || path.basename(file)}（按需读 \`${file}\`）`);
-      }
-      names.add(ruleName);
+      const desc =
+        typeof parsed.data.description === "string"
+          ? parsed.data.description.trim()
+          : "";
+      const effective = body || desc;
+      if (effective) bodies.push(effective);
     } catch {
       // 单文件解析失败、跳过、不让整段炸
     }
   }
-  return { always, indexed, names };
-};
-
-/**
- * 读「全局 `~/.cursor/rules/*.mdc` + app 自管 `<dataRoot>/rules/*.mdc`」→ 拼成 prompt 段
- *
- * - 无 frontmatter / `alwaysApply:true` → 全文注入（一句话纯文本、或显式常驻）
- * - 有 frontmatter 且非 alwaysApply → 列 index（desc + 绝对路径）、agent 命中场景再 `read`
- * - app 自管 rules（v1.1.x Rules tab）可被 settings.disabledRules 关掉；Cursor 全局的
- *   不受此名单影响（那是用户在 Cursor 里管的、要关去 Cursor 删）
- * - **同名去重**：启用中的 app 副本优先、Cursor 同名原件跳过；app 副本被关掉时
- *   回落到 Cursor 原件（分层语义：关的是 app 这份）
- * - 无 rules → 返空提示串
- *
- * 注：repo 级 rules 靠 `settingSources:["project"]` 加载、不在此读（避免同一份进两次）。
- */
-export const readGlobalCursorRulesForPrompt = async (): Promise<string> => {
-  const NONE = "（无全局规则）";
-
-  // 先收 app 自管 rules（能力页 Rules tab、可关）——拿到启用名单做同名去重
-  const appGot = await collectRulesFromDir(
-    getAppRulesDir(),
-    await readDisabledRules(),
-  );
-
-  const always: string[] = [];
-  const indexed: string[] = [];
-  // 全局 Cursor rules（多候选目录取第一个存在的）；跳过已被 app 启用副本覆盖的同名
-  for (const dir of getGlobalCursorDirs()) {
-    const candidate = path.join(dir, "rules");
-    try {
-      const stat = await fs.stat(candidate);
-      if (!stat.isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    const got = await collectRulesFromDir(candidate, appGot.names);
-    always.push(...got.always);
-    indexed.push(...got.indexed);
-    break;
-  }
-  always.push(...appGot.always);
-  indexed.push(...appGot.indexed);
-
-  const sections: string[] = [];
-  if (always.length > 0) sections.push(always.join("\n\n"));
-  if (indexed.length > 0) {
-    sections.push(
-      `以下全局规则按需用 \`read\` 工具读全文：\n${indexed.join("\n")}`,
-    );
-  }
-  return sections.length > 0 ? sections.join("\n\n") : NONE;
+  return bodies.length > 0 ? bodies.join("\n\n") : NONE;
 };

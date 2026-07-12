@@ -15,7 +15,7 @@
  *
  * 调用方只需要：
  *   1. `const { images, isDragging, fileInputRef, ...handlers } = useImageAttach({ disabled })`
- *   2. 把 `handlers.onPaste` 绑到 Textarea、`onDragOver/onDragLeave/onDrop` 绑到包裹容器、
+ *   2. 把 `handlers.onPaste` 交给编辑器 PASTE_COMMAND、`onDragOver/onDragLeave/onDrop` 绑到包裹容器、
  *      `onFileInputChange` 绑到隐藏 input、`triggerFilePicker()` 给附图按钮
  *   3. 渲染 `images` 缩略图、`removeImage(id)` 处理移除
  *   4. 提交时 `toUploadPayload()` 拿 ChatReplyImage[]、发完调 `reset()`
@@ -83,8 +83,12 @@ export interface UseImageAttachReturn {
   // 触发隐藏 input file 的 click（绑附图按钮 onClick）
   triggerFilePicker: () => void;
 
-  // 直接绑 Textarea onPaste / 容器 onDragOver/onDragLeave/onDrop / input onChange
-  onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+  // 直接绑编辑器 PASTE_COMMAND / 容器 onDragOver/onDragLeave/onDrop / input onChange
+  // ClipboardEvent 同时覆盖 React 合成事件与 Lexical 原生 paste（两者都有 clipboardData + preventDefault）
+  onPaste: (e: {
+    clipboardData: DataTransfer | null;
+    preventDefault: () => void;
+  }) => void;
   onDragOver: (e: React.DragEvent<HTMLDivElement>) => void;
   onDragLeave: (e: React.DragEvent<HTMLDivElement>) => void;
   onDrop: (e: React.DragEvent<HTMLDivElement>) => void;
@@ -190,8 +194,11 @@ export const useImageAttach = (
   };
 
   // 粘贴：clipboardData.items 里可能含 image（截图工具粘贴 / 浏览器右键复制图片）
-  // 有 image → 阻止默认 + addFiles。纯文本粘贴不拦、走 Textarea 默认行为
-  const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  // 有 image → 阻止默认 + addFiles。纯文本粘贴不拦、走编辑器默认行为
+  const onPaste = (e: {
+    clipboardData: DataTransfer | null;
+    preventDefault: () => void;
+  }) => {
     if (options?.disabled) return;
     const items = e.clipboardData?.items;
     if (!items || items.length === 0) return;

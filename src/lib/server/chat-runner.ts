@@ -59,7 +59,7 @@ import {
   type SkillEntry,
 } from "./skills-loader";
 import {
-  readGlobalCursorRulesForPrompt,
+  readAppRulesForPrompt,
   resolveTaskMcpServers,
 } from "./cursor-config";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
@@ -294,9 +294,9 @@ const buildInitialPrompt = (
     "",
     "另外还有用户配的其他 MCP（飞书 / context7 等）、按场景用。",
     "",
-    "## 全局规则（用户在 Cursor 配的偏好、必遵守）",
+    "## 用户规则（必遵守）",
     "",
-    "下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。alwaysApply 的已全文展开、必遵守；其余按场景用 `read` 读全文：",
+    "下面是用户在能力页配置的规则、每条都必须遵守：",
     "",
     rulesSection,
     "",
@@ -670,8 +670,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       return [];
     });
 
-    // 全局 rules（~/.cursor/rules/、settingSources["project"] 够不着、fe 读了注入）
-    const rulesSection = await readGlobalCursorRulesForPrompt();
+    // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
+    const rulesSection = await readAppRulesForPrompt();
     const initialPrompt = buildInitialPrompt(task, skills, rulesSection, firstMessage);
     run = await agent.send(initialPrompt);
 

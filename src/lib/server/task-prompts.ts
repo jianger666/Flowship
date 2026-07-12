@@ -31,7 +31,7 @@ import {
   renderSkillsForPrompt,
   type SkillEntry,
 } from "./skills-loader";
-import { readGlobalCursorRulesForPrompt } from "./cursor-config";
+import { readAppRulesForPrompt } from "./cursor-config";
 import { getCustomAction } from "./custom-action-fs";
 import type { AskUserQuestion } from "@/lib/types";
 import type {
@@ -210,8 +210,8 @@ export const buildSuperPrompt = async (
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
-  // 全局 rules（~/.cursor/rules/、user 层、settingSources["project"] 够不着、fe 读了注入）
-  const rulesSection = await readGlobalCursorRulesForPrompt();
+  // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
+  const rulesSection = await readAppRulesForPrompt();
 
   // 只加载当前 action 的 playbook（后续 action 的指令随 [NEXT_ACTION] 载荷下发）
   const currentType = firstNextAction.action.type;

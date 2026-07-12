@@ -15,7 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { Composer } from "@/components/composer";
+import { Composer, type ComposerFocusHandle } from "@/components/composer";
 import { useSlashSkills } from "@/components/slash-skills";
 import { ModelSelect } from "@/components/ui/model-select";
 import { useImageAttach } from "@/hooks/use-image-attach";
@@ -52,12 +52,12 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   }, [task.id, resetPaths]);
 
   // Cmd/Ctrl+J 聚焦输入条（沿用原「再聊聊」快捷键、入口合一后指到这里）
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const focusRef = useRef<ComposerFocusHandle | null>(null);
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() !== "j" || !(e.metaKey || e.ctrlKey)) return;
       e.preventDefault();
-      textareaRef.current?.focus();
+      focusRef.current?.focus();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -70,14 +70,11 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   const slash = useSlashSkills({
     draft,
     applyDraft: (next, cursor) => {
+      if (cursor != null) focusRef.current?.prepareCursor(cursor);
       setDraft(next);
       saveDraft("talk", task.id, next);
-      if (cursor == null) return;
       requestAnimationFrame(() => {
-        const el = textareaRef.current;
-        if (!el) return;
-        el.focus();
-        el.setSelectionRange(cursor, cursor);
+        focusRef.current?.focus();
       });
     },
   });
@@ -138,6 +135,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   return (
     <div className="border-t px-3 py-2">
       <Composer
+        editorKey={task.id}
         value={draft}
         onChange={(v) => {
           setDraft(v);
@@ -151,7 +149,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         }
         disabled={busy || awaitingAnswer}
         submitting={submitting}
-        textareaRef={textareaRef}
+        focusRef={focusRef}
         slash={slash}
         attach={attach}
         paths={pathAttach.paths}

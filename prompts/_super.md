@@ -19,9 +19,9 @@
 
 {{contextDocsSection}}
 
-## 全局规则（用户在 Cursor 配的偏好、必遵守）
+## 用户规则（必遵守）
 
-下面是用户在 Cursor 全局配的规则（`~/.cursor/rules/`）。标了 `alwaysApply` 的已全文展开、必须始终遵守；其余按场景描述、命中时用 `read` 工具读全文：
+下面是用户在能力页配置的规则、每条都必须始终遵守：
 
 {{rulesSection}}
 

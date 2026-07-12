@@ -3,16 +3,15 @@
 /**
  * Rules 卡片（v1.1.x Rules 独立化、能力页 Rules tab）
  *
- * 主路径 = 「一句话建规则」（纯文本 .mdc、无 frontmatter → 注入侧视为常驻）。
- * 进阶通道 = 已有规则的「编辑」：打开全文可改 frontmatter（Cursor 风格按需规则）。
- * 运行时仍会合并注入 ~/.cursor/rules（个人偏好）；本卡不再提供「从 Cursor 导入」。
+ * 主路径 = 「一句话建规则」（纯文本、无 frontmatter）；所有启用中的规则每次
+ * 全文常驻注入（「按需」档位已删）。编辑 = 纯文本改内容。
+ * `~/.cursor/rules` 已彻底不参与（不导入也不注入、用户拍板脱离 Cursor）。
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { Loader2, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -21,7 +20,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { CodeEditor } from "@/components/ui/code-editor";
 import {
   Dialog,
   DialogContent,
@@ -31,9 +29,9 @@ import {
 } from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { useDialog } from "@/hooks/use-dialog";
 import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { cn } from "@/lib/utils";
@@ -41,8 +39,6 @@ import { cn } from "@/lib/utils";
 // 跟 /api/rules 返回对齐
 interface RuleRow {
   name: string;
-  description: string;
-  alwaysApply: boolean;
   enabled: boolean;
   absPath: string;
   /** 正文第一行；一句话规则列表主文字用它 */
@@ -97,7 +93,7 @@ const allocateRuleName = (base: string, existing: Set<string>): string => {
   return `rule-${Date.now()}`.slice(0, 64);
 };
 
-/** 一句话 → 纯文本 .mdc（无 frontmatter；注入侧视为常驻） */
+/** 一句话 → 纯文本规则内容（结尾补换行） */
 const buildQuickRuleMdc = (sentence: string): string => `${sentence.trim()}\n`;
 
 export const RulesCard = () => {
@@ -226,11 +222,11 @@ export const RulesCard = () => {
       <CardHeader>
         <CardTitle>Rules</CardTitle>
         <CardDescription>
-          规则尽量简短；复杂流程建议沉淀成 skill
+          规则会常驻注入给 AI；尽量简短、复杂流程建议沉淀成 skill
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {/* 主路径：输一句话就建常驻规则（无 frontmatter） */}
+        {/* 主路径：输一句话就建规则（纯文本、常驻注入） */}
         <div className="flex items-center gap-2">
           <Input
             value={quickDraft}
@@ -263,9 +259,8 @@ export const RulesCard = () => {
         ) : (
           <div className="divide-y divide-border/60 rounded-md border border-border/60">
             {rules.map((r) => {
-              // 主文字优先正文第一行；空正文退到 description / 文件名
-              const primary =
-                r.bodyPreview || r.description || r.name;
+              // 主文字优先正文第一行；空正文退到文件名
+              const primary = r.bodyPreview || r.name;
               return (
                 <div key={r.name} className="flex items-center gap-2 px-3 py-2">
                   <div className={cn("min-w-0 flex-1", !r.enabled && "opacity-50")}>
@@ -273,9 +268,6 @@ export const RulesCard = () => {
                       <span className="truncate text-sm" title={primary}>
                         {primary}
                       </span>
-                      <Badge variant="secondary" className="shrink-0 text-[10px]">
-                        {r.alwaysApply ? "常驻" : "按需"}
-                      </Badge>
                     </div>
                     <div
                       className="truncate text-[11px] text-muted-foreground"
@@ -293,7 +285,7 @@ export const RulesCard = () => {
                     size="icon-xs"
                     variant="ghost"
                     aria-label={`编辑 ${r.name}`}
-                    title="编辑 .mdc"
+                    title="编辑"
                     onClick={() => void openEdit(r.name)}
                   >
                     <Pencil />
@@ -351,7 +343,7 @@ export const RulesCard = () => {
   );
 };
 
-// ----------------- 编辑 dialog（进阶：可改 frontmatter） -----------------
+// ----------------- 编辑 dialog（纯文本改内容） -----------------
 
 const RuleEditDialog = ({
   name,
@@ -366,25 +358,21 @@ const RuleEditDialog = ({
   onClose: () => void;
   onSave: (content: string) => void | Promise<void>;
 }) => {
-  // .mdc 内容草稿
+  // 规则内容草稿
   const [content, setContent] = useState(initialContent);
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()} disablePointerDismissal>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{`编辑 ${name}`}</DialogTitle>
+          <DialogTitle>编辑规则</DialogTitle>
         </DialogHeader>
-        <div className="grid gap-1.5">
-          <Label htmlFor="rule-edit-content">.mdc 内容</Label>
-          <CodeEditor
-            id="rule-edit-content"
-            value={content}
-            onChange={setContent}
-            language="markdown"
-            rows={14}
-          />
-        </div>
+        <Textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          rows={6}
+          aria-label={`规则 ${name} 内容`}
+        />
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
             取消
