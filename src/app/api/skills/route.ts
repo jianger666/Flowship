@@ -42,7 +42,11 @@ export const GET = async () => {
       editable: s.editable,
       // v1.1.x 可关：关掉的不注入 agent / 不进 slash 菜单（能力页开关切换）
       enabled: !disabled.has(s.name),
-      absPath: shortenHomePath(s.absPath),
+      // absPath 必须是真绝对路径——slash 引用把它发给服务端校验 + agent read 用
+      //（v1.1.x 踩过：这里缩成 ~ 短路径、skills[].absPath 校验直接 400「必须是绝对路径」）
+      absPath: s.absPath,
+      // 展示用短路径（设置页列表 title）、跟数据路径分开
+      displayPath: shortenHomePath(s.absPath),
     })),
     cursorGlobal,
     appSkillsDir,

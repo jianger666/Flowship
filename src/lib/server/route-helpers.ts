@@ -13,6 +13,7 @@
  *     这些是业务参数、由 route 自己定、helper 只校验「不超传入的 max」
  */
 
+import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -322,7 +323,11 @@ export const parseAndValidateSkills = (
         errorResponse: errorResponse("skills[].absPath 必须是非空字符串"),
       };
     }
-    if (!path.isAbsolute(absPath)) {
+    // `~/` 开头的展开成真绝对路径（防御：老客户端缓存里可能还是展示用短路径、v1.1.x 实测踩过）
+    const expanded = absPath.startsWith("~/")
+      ? path.join(os.homedir(), absPath.slice(2))
+      : absPath;
+    if (!path.isAbsolute(expanded)) {
       return {
         ok: false,
         errorResponse: errorResponse(
@@ -330,7 +335,7 @@ export const parseAndValidateSkills = (
         ),
       };
     }
-    skills.push({ name: name.trim(), absPath });
+    skills.push({ name: name.trim(), absPath: expanded });
   }
   return { ok: true, skills };
 };

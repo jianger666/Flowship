@@ -64,6 +64,8 @@ interface SkillRow {
   // v1.1.x 可关：false = 不注入 agent / 不进 slash 菜单
   enabled: boolean;
   absPath: string;
+  // 展示用短路径（home 缩成 ~）；absPath 保持真绝对路径给数据链路用
+  displayPath?: string;
 }
 
 interface CursorGlobalSkill {
@@ -404,7 +406,7 @@ const SkillGroups = ({
       className="flex items-center gap-2 px-3 py-2"
     >
       <div className={cn("min-w-0 flex-1", !s.enabled && "opacity-50")}>
-        <div className="truncate text-sm" title={s.absPath}>
+        <div className="truncate text-sm" title={s.displayPath ?? s.absPath}>
           {s.name}
         </div>
         <div
