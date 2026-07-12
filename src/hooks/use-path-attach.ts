@@ -8,7 +8,7 @@
  * 路径本身就是字符串、不上传内容——server 侧 stat 校验后拼 [ATTACHED_PATHS] 给 agent read。
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { pickNativePaths } from "@/lib/native-picker";
@@ -31,6 +31,10 @@ export interface UsePathAttachReturn {
 export const usePathAttach = (): UsePathAttachReturn => {
   // 待发送的文件 / 目录绝对路径列表（原生 picker 选的）
   const [paths, setPaths] = useState<string[]>([]);
+  // paths 的同步镜像：pickPaths 是 async 回调、闭包里的 paths 可能陈旧——合并前读 ref；
+  // 也让 toast 副作用留在事件回调里、不进 setState updater（updater 必须纯、StrictMode 双调会弹两次）
+  const pathsRef = useRef<string[]>([]);
+  pathsRef.current = paths;
   // picker 飞行中标记（存 mode 让被点的那颗按钮转 spinner——mac osascript 有 ~1s 冷启动）
   const [picking, setPicking] = useState<false | "file" | "folder">(false);
 
@@ -47,21 +51,22 @@ export const usePathAttach = (): UsePathAttachReturn => {
             : "附加文件（agent 用 read 工具看）",
       });
       if (!got || got.length === 0) return;
-      setPaths((prev) => {
-        const set = new Set(prev);
-        let dup = 0;
-        for (const p of got) {
-          if (set.has(p)) dup++;
-          else set.add(p);
-        }
-        const merged = Array.from(set);
-        if (dup > 0) toast.info(`已忽略 ${dup} 条重复路径`);
-        if (merged.length > MAX_PATHS) {
-          toast.warning(`路径数超上限 ${MAX_PATHS}、已截断到前 ${MAX_PATHS} 条`);
-          return merged.slice(0, MAX_PATHS);
-        }
-        return merged;
-      });
+      // picking 闸保证同时只有一次 pick 在飞、基于 ref 合并无并发写风险
+      const set = new Set(pathsRef.current);
+      let dup = 0;
+      for (const p of got) {
+        if (set.has(p)) dup++;
+        else set.add(p);
+      }
+      let merged = Array.from(set);
+      if (merged.length > MAX_PATHS) {
+        toast.warning(`路径数超上限 ${MAX_PATHS}、已截断到前 ${MAX_PATHS} 条`);
+        merged = merged.slice(0, MAX_PATHS);
+      } else if (dup > 0) {
+        toast.info(`已忽略 ${dup} 条重复路径`);
+      }
+      pathsRef.current = merged;
+      setPaths(merged);
     } finally {
       setPicking(false);
     }
