@@ -12,7 +12,16 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
-import { Eye, GripVertical, Pencil, Share, Trash2, Wrench } from "lucide-react";
+import {
+  Eye,
+  GripVertical,
+  Loader2,
+  Pencil,
+  Share,
+  Sparkles,
+  Trash2,
+  Wrench,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,6 +49,10 @@ interface Props {
   onExport: (def: CustomActionDef) => void;
   // 旧格式行「查看原内容」（只读 dialog、供复制后重建）
   onViewLegacy: (def: CustomActionDef) => void;
+  // 旧格式行「转建新版」：对话创建 + action-creator 把 playbook 转成 skill+壳
+  onConvertLegacy: (def: CustomActionDef) => void;
+  // 正在转建的旧格式 action id（防双击；非该行不转圈）
+  convertingLegacyId?: string | null;
 }
 
 interface RowProps {
@@ -59,6 +72,10 @@ interface RowProps {
   onExport?: () => void;
   // 仅旧格式行传：只读查看原 playbook
   onViewLegacy?: () => void;
+  // 仅旧格式行传：转建新版（对话创建链路）
+  onConvertLegacy?: () => void;
+  // 本行是否正在转建（按钮 spinner）
+  converting?: boolean;
 }
 
 // 单行：拖拽手柄 + 名称（自定义带扳手角标 + skill chips）+ [自定义]编辑 / 删除 + 显隐开关
@@ -75,6 +92,8 @@ const LayoutRow = ({
   onDelete,
   onExport,
   onViewLegacy,
+  onConvertLegacy,
+  converting,
 }: RowProps) => {
   // 每个 Item 独立拖拽控制器——dragListener={false} 只让手柄发起拖拽、不误触开关 / 按钮 / 整行
   const controls = useDragControls();
@@ -131,7 +150,7 @@ const LayoutRow = ({
         </span>
         {isLegacy && (
           <p className="mt-0.5 text-xs text-muted-foreground">
-            把原内容建成 skill 后重新新建挂载
+            点「转建新版」让 AI 提炼成 skill 并挂壳；验收后再删旧条目
           </p>
         )}
       </div>
@@ -140,7 +159,22 @@ const LayoutRow = ({
           已隐藏
         </span>
       )}
-      {/* 编辑 / 导出 / 删除仅自定义行有——内置 action 不可改不可删；旧格式行只留查看 / 删除 */}
+      {/* 旧格式：主按钮转建 + 查看原文 / 删除；新格式：编辑 / 导出 / 删除 */}
+      {onConvertLegacy && (
+        <Button
+          size="sm"
+          onClick={onConvertLegacy}
+          disabled={converting}
+          title="开对话、把旧 playbook 转建成 skill + 挂载壳"
+        >
+          {converting ? (
+            <Loader2 className="animate-spin" />
+          ) : (
+            <Sparkles />
+          )}
+          转建新版
+        </Button>
+      )}
       {onViewLegacy && (
         <Button
           variant="ghost"
@@ -183,6 +217,8 @@ export const ActionLayoutConfig = ({
   onDelete,
   onExport,
   onViewLegacy,
+  onConvertLegacy,
+  convertingLegacyId,
 }: Props) => {
   const { settings, saveFieldValue, loaded } = useSettings();
   const layout = settings.actionLayout ?? { order: [], hidden: [] };
@@ -238,7 +274,7 @@ export const ActionLayoutConfig = ({
     >
       {order.map((key) => {
         const def = customById.get(key);
-        // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留查看原内容 + 删除
+        // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留转建 / 查看原内容 + 删除
         const isLegacy = !!def?.legacyPlaybook;
         return (
           <LayoutRow
@@ -268,6 +304,10 @@ export const ActionLayoutConfig = ({
             onDelete={def ? () => onDelete(def) : undefined}
             onExport={def && !isLegacy ? () => onExport(def) : undefined}
             onViewLegacy={def && isLegacy ? () => onViewLegacy(def) : undefined}
+            onConvertLegacy={
+              def && isLegacy ? () => onConvertLegacy(def) : undefined
+            }
+            converting={!!def && convertingLegacyId === def.id}
           />
         );
       })}

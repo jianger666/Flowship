@@ -36,7 +36,7 @@ import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-co
 import { McpCard } from "@/components/settings/mcp-card";
 import { RulesCard } from "@/components/settings/rules-card";
 import { SkillsCard } from "@/components/settings/skills-card";
-import { setPendingSlashSkill } from "@/components/slash-skills";
+import { setPendingSlashSkill, fetchSkills as fetchSlashSkills } from "@/components/slash-skills";
 import {
   deleteCustomActionReq,
   exportCustomActionReq,
@@ -47,8 +47,9 @@ import {
 } from "@/lib/custom-action-client";
 import { getSettings } from "@/lib/local-store";
 import { pickNativePaths } from "@/lib/native-picker";
-import { createTask } from "@/lib/task-store";
+import { createTask, sendChatReply } from "@/lib/task-store";
 import type { CustomActionDef } from "@/lib/types";
+import { saveDraft } from "@/lib/view-memory";
 
 // 四个能力 tab（key 同时是 ?tab= 的取值）
 type CapTab = "action" | "skills" | "mcp" | "rules";
@@ -83,6 +84,10 @@ const ActionsPanel = () => {
   const [transferring, setTransferring] = useState(false);
   // 「对话创建」发起中（防双击）
   const [aiCreating, setAiCreating] = useState(false);
+  // 正在转建的旧格式 action id（防双击；null = 无）
+  const [convertingLegacyId, setConvertingLegacyId] = useState<string | null>(
+    null,
+  );
   // 正在查看原内容的旧格式 action（null = 关闭）
   const [viewingLegacy, setViewingLegacy] = useState<CustomActionDef | null>(
     null,
@@ -136,6 +141,76 @@ const ActionsPanel = () => {
       );
     } finally {
       setAiCreating(false);
+    }
+  };
+
+  // 旧格式「转建新版」：同对话创建链路 + 自动提交首条（带 playbook 全文）；
+  // 无 apiKey 时降级为建对话 + 草稿预填，不自动发
+  const handleConvertLegacy = async (def: CustomActionDef) => {
+    if (convertingLegacyId || !def.legacyPlaybook) return;
+    const s = getSettings();
+    if (s.disabledSkills?.includes("action-creator")) {
+      toast.error("action-creator skill 已被停用、先在 Skill tab 打开再转建");
+      return;
+    }
+    if (!appSkillsDir) {
+      toast.error("skills 目录还没就绪、稍后重试");
+      return;
+    }
+
+    const text = `把下面这个旧版自定义 action 转建成新版（skill + 挂载壳）。原 label：「${def.label}」。原 playbook 内容如下、提炼成纯方法论 skill（英文 kebab-case 目录名）并用 create_custom_action 挂壳（产出要求放 output 参数）：\n\n${def.legacyPlaybook}`;
+
+    setConvertingLegacyId(def.id);
+    try {
+      const task = await createTask({
+        mode: "chat",
+        title: `转建：${def.label}`,
+        repoPaths: [appSkillsDir],
+        model: s.defaultModel?.id?.trim() ? s.defaultModel : undefined,
+        disabledMcpServers:
+          s.disabledMcpServers && s.disabledMcpServers.length > 0
+            ? s.disabledMcpServers
+            : undefined,
+      });
+
+      // 无 apiKey / 无默认模型 → 降级：草稿预填 + 挂 chip，用户配好后再发
+      const canAutoSend =
+        !!s.apiKey?.trim() && !!s.defaultModel?.id?.trim();
+      if (!canAutoSend) {
+        toast.error("先在设置页配好 API Key 和默认模型；已把转建说明写入草稿");
+        saveDraft("reply", task.id, text);
+        setPendingSlashSkill("action-creator");
+        router.push(`/tasks/${task.id}`);
+        return;
+      }
+
+      // 拉 action-creator absPath（slash-skills 模块缓存）；找不到则仍建对话 + 草稿
+      const slashSkills = await fetchSlashSkills();
+      const creator = slashSkills.find((x) => x.name === "action-creator");
+      if (!creator) {
+        toast.error("找不到 action-creator skill；已把转建说明写入草稿");
+        saveDraft("reply", task.id, text);
+        setPendingSlashSkill("action-creator");
+        router.push(`/tasks/${task.id}`);
+        return;
+      }
+
+      await sendChatReply(
+        task.id,
+        text,
+        undefined,
+        undefined,
+        { apiKey: s.apiKey, model: s.defaultModel },
+        [{ name: creator.name, absPath: creator.absPath }],
+      );
+      toast.success("已发起转建、AI 正在处理");
+      router.push(`/tasks/${task.id}`);
+    } catch (err) {
+      toast.error(
+        `转建失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setConvertingLegacyId(null);
     }
   };
 
@@ -298,6 +373,8 @@ const ActionsPanel = () => {
           onDelete={handleDelete}
           onExport={(def) => void handleExport(def)}
           onViewLegacy={setViewingLegacy}
+          onConvertLegacy={(def) => void handleConvertLegacy(def)}
+          convertingLegacyId={convertingLegacyId}
         />
       )}
 
@@ -319,7 +396,7 @@ const ActionsPanel = () => {
           <DialogHeader>
             <DialogTitle>「{viewingLegacy?.label}」原内容</DialogTitle>
             <DialogDescription>
-              旧格式已停用——把内容建成 skill 后重新新建挂载
+              旧格式已停用——点「转建新版」让 AI 提炼，或复制后自行重建
             </DialogDescription>
           </DialogHeader>
           <pre className="max-h-96 overflow-auto rounded-md border bg-muted/30 p-3 font-mono text-xs whitespace-pre-wrap wrap-anywhere">

@@ -124,21 +124,23 @@ function SelectItem({
     <SelectPrimitive.Item
       data-slot="select-item"
       className={cn(
-        "relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 *:[span]:last:flex *:[span]:last:items-center *:[span]:last:gap-2",
+        // 选中态走全局 --selected token（持久选中底色）；高亮走 accent（瞬时 hover/键盘）
+        // 勾勾左侧常驻占位（跟 combobox / multi-select 对齐），避免 absolute 贴边悬浮 / 被 overflow 裁切
+        "relative flex w-full cursor-default items-start gap-2 rounded-md px-2 py-1.5 text-sm outline-hidden select-none data-highlighted:bg-accent data-highlighted:text-accent-foreground data-selected:bg-selected data-selected:text-selected-foreground data-selected:data-highlighted:bg-selected data-selected:data-highlighted:text-selected-foreground not-data-[variant=destructive]:data-highlighted:**:text-accent-foreground data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       {...props}
     >
-      <SelectPrimitive.ItemText className="flex flex-1 shrink-0 gap-2 whitespace-nowrap">
+      <SelectPrimitive.ItemIndicator
+        keepMounted
+        className="mt-0.5 flex size-4 shrink-0 items-center justify-center opacity-0 data-selected:opacity-100"
+      >
+        <CheckIcon className="pointer-events-none size-4" />
+      </SelectPrimitive.ItemIndicator>
+      {/* min-w-0：多行 / 长文本条目可截断，不被撑破、不挤勾 */}
+      <SelectPrimitive.ItemText className="min-w-0 flex-1">
         {children}
       </SelectPrimitive.ItemText>
-      <SelectPrimitive.ItemIndicator
-        render={
-          <span className="pointer-events-none absolute right-2 flex size-4 items-center justify-center" />
-        }
-      >
-        <CheckIcon className="pointer-events-none" />
-      </SelectPrimitive.ItemIndicator>
     </SelectPrimitive.Item>
   )
 }

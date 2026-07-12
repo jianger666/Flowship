@@ -204,17 +204,18 @@ export const CustomActionEditor = ({
               <SelectContent>
                 {mainSkillOptions.map((s) => (
                   <SelectItem key={s.name} value={s.name}>
+                    {/* 两行条目：外层 min-w-0 保证选中底色内描述可截断、不与左侧勾重叠 */}
                     <span className="flex min-w-0 flex-col items-start gap-0.5">
                       <span
                         className={cn(
-                          "font-medium",
+                          "w-full truncate font-medium",
                           s.missing && "text-muted-foreground line-through",
                         )}
                       >
                         {s.name}
                       </span>
                       {s.description ? (
-                        <span className="line-clamp-1 text-xs text-muted-foreground">
+                        <span className="line-clamp-1 w-full min-w-0 text-xs text-muted-foreground">
                           {s.description}
                         </span>
                       ) : null}
