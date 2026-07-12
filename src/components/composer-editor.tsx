@@ -2,7 +2,7 @@
  * Composer 输入引擎（Lexical PlainText + SkillTokenNode）
  *
  * 替换原原生 textarea + mirror overlay + 原子删除拦截：
- * - skill token = DecoratorNode（视觉 tag + 整删）
+ * - skill token = TextNode 子类 + token 模式（品牌色 tag、原子整删、caret 前后可见）
  * - 对外仍序列化为纯文本 `/skill-name`，调用方 value/onChange 协议不变
  * - slash 菜单：打 `/xxx` 时复用 useSlashSkills；选中后把 `/partial` 换成 token + 空格
  * - 手打全名 + 空格 / 外部写回草稿：TextNode transform 或整段 parse 转成 token
@@ -193,9 +193,10 @@ const $getPlainOffset = (): number => {
     for (const child of p.getChildren()) {
       if (child.getKey() === anchorNode.getKey()) {
         if ($isTextNode(child)) {
+          // token 也是 TextNode：光标只会在 0 / len（token 模式进不去内部）
           return total + anchor.offset;
         }
-        // Decorator：offset 0 = 节点前，>0 = 节点后
+        // 非文本叶子（LineBreak 等）：offset 0 = 节点前，>0 = 节点后
         return total + (anchor.offset === 0 ? 0 : child.getTextContent().length);
       }
       total += child.getTextContent().length;
@@ -232,14 +233,15 @@ const $setSelectionFromPlainOffset = (offset: number): void => {
     for (const child of children) {
       const len = child.getTextContent().length;
       if (remaining <= len) {
+        // token（也是 TextNode、先判）：不进内部、按半程贴前沿 / 后沿
+        if ($isSkillTokenNode(child)) {
+          if (remaining === 0) child.select(0, 0);
+          else child.select(len, len);
+          return;
+        }
         if ($isTextNode(child)) {
           const o = Math.min(remaining, child.getTextContentSize());
           child.select(o, o);
-          return;
-        }
-        if ($isSkillTokenNode(child)) {
-          if (remaining === 0) child.selectPrevious();
-          else child.selectNext();
           return;
         }
         child.selectNext();

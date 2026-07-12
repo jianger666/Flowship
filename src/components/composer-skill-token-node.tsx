@@ -1,41 +1,31 @@
 /**
- * Composer skill token 的 Lexical DecoratorNode。
+ * Composer skill token 的 Lexical 节点（TextNode 子类 + token 模式）。
  *
- * 为什么用 DecoratorNode 而不是带样式的 TextNode：
- * - 光标进不去内部、Backspace/Delete 天然整删（原子节点）
- * - decorate() 渲染品牌色 tag，视觉跟旧 mirror overlay 对齐
- * - getTextContent() 仍是 `/skill-name`，对外协议 / 复制粘贴保持纯文本形态
+ * 为什么不用 DecoratorNode：decorator 是非文本节点、selection 落在它前沿时
+ * 浏览器 contentEditable 摆不出可见 caret（实测「光标移到 tag 前就消失」）。
+ * TextNode + `setMode("token")` 是 Lexical 官方 mention/tag 路线：
+ * - token 模式天然原子：光标可停在前 / 后但进不去内部、Backspace/Delete 整删
+ * - 文本内容就是 `/skill-name`，序列化 / 复制粘贴天然纯文本
+ * - 样式走 createDOM 在真实文本 span 上加 class（代价：塞不了 React icon、可接受）
  */
 
-import type { JSX } from "react";
-import { Sparkles } from "lucide-react";
 import {
-  DecoratorNode,
-  type DOMExportOutput,
+  TextNode,
+  type EditorConfig,
   type LexicalNode,
   type NodeKey,
-  type SerializedLexicalNode,
+  type SerializedTextNode,
   type Spread,
 } from "lexical";
 
+import { SKILL_TOKEN_CLASS } from "@/components/ui/skill-token";
+
 export type SerializedSkillTokenNode = Spread<
-  { name: string; type: "skill-token"; version: 1 },
-  SerializedLexicalNode
+  { name: string },
+  SerializedTextNode
 >;
 
-/** 视觉：品牌色 tag，显示 `/skill-name`（光标不可入内） */
-const SkillTokenView = ({ name }: { name: string }) => (
-  <span
-    className="mx-0.5 inline-flex items-center gap-0.5 rounded bg-primary/20 px-1 py-px align-baseline text-sm leading-normal text-primary ring-1 ring-inset ring-primary/30"
-    contentEditable={false}
-    data-skill-token={name}
-  >
-    <Sparkles className="size-3 shrink-0 opacity-80" aria-hidden />
-    <span className="font-medium">{`/${name}`}</span>
-  </span>
-);
-
-export class SkillTokenNode extends DecoratorNode<JSX.Element> {
+export class SkillTokenNode extends TextNode {
   __name: string;
 
   static getType(): string {
@@ -43,11 +33,12 @@ export class SkillTokenNode extends DecoratorNode<JSX.Element> {
   }
 
   static clone(node: SkillTokenNode): SkillTokenNode {
-    return new SkillTokenNode(node.__name, node.__key);
+    // afterCloneFrom 会拷 __mode/__format 等 TextNode 内部态、这里只管自有字段
+    return new SkillTokenNode(node.__name, node.__text, node.__key);
   }
 
-  constructor(name: string, key?: NodeKey) {
-    super(key);
+  constructor(name: string, text?: string, key?: NodeKey) {
+    super(text ?? `/${name}`, key);
     this.__name = name;
   }
 
@@ -55,57 +46,47 @@ export class SkillTokenNode extends DecoratorNode<JSX.Element> {
     return this.__name;
   }
 
-  /** 序列化 / 复制 / references 解析都靠这个纯文本形态 */
-  getTextContent(): string {
-    return `/${this.__name}`;
+  createDOM(config: EditorConfig): HTMLElement {
+    const dom = super.createDOM(config);
+    dom.className = SKILL_TOKEN_CLASS;
+    dom.setAttribute("data-skill-token", this.__name);
+    return dom;
   }
 
-  createDOM(): HTMLElement {
-    const span = document.createElement("span");
-    // 行内原子：跟周围文字同一行流排
-    span.style.display = "inline-flex";
-    span.style.verticalAlign = "baseline";
-    return span;
-  }
-
-  updateDOM(): false {
+  /** 边界打字不并入 token：在前 / 后输入时让 Lexical 建独立 TextNode */
+  canInsertTextBefore(): boolean {
     return false;
   }
 
-  isInline(): boolean {
+  canInsertTextAfter(): boolean {
+    return false;
+  }
+
+  isTextEntity(): boolean {
     return true;
-  }
-
-  /** 可选中整颗 token，但不能进内部编辑 */
-  isKeyboardSelectable(): boolean {
-    return true;
-  }
-
-  decorate(): JSX.Element {
-    return <SkillTokenView name={this.__name} />;
-  }
-
-  exportDOM(): DOMExportOutput {
-    const span = document.createElement("span");
-    span.textContent = `/${this.__name}`;
-    return { element: span };
   }
 
   exportJSON(): SerializedSkillTokenNode {
     return {
+      ...super.exportJSON(),
+      name: this.__name,
       type: "skill-token",
       version: 1,
-      name: this.__name,
     };
   }
 
   static importJSON(serialized: SerializedSkillTokenNode): SkillTokenNode {
-    return $createSkillTokenNode(serialized.name);
+    // updateFromJSON 恢复 text/mode/format 等 TextNode 序列化字段
+    return $createSkillTokenNode(serialized.name).updateFromJSON(serialized);
   }
 }
 
-export const $createSkillTokenNode = (name: string): SkillTokenNode =>
-  new SkillTokenNode(name);
+export const $createSkillTokenNode = (name: string): SkillTokenNode => {
+  const node = new SkillTokenNode(name);
+  // token 模式：原子（光标不入内、整删）；必须在创建处设、clone/importJSON 自动继承
+  node.setMode("token");
+  return node;
+};
 
 export const $isSkillTokenNode = (
   node: LexicalNode | null | undefined,

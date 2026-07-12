@@ -29,6 +29,7 @@ import {
 import { Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { SkillToken } from "@/components/ui/skill-token";
 
 export interface SlashSkill {
   name: string;
@@ -202,7 +203,7 @@ export const useSlashSkills = (opts: {
   const [activeIndex, setActiveIndex] = useState(0);
   // 最近一次 onDraftChange 的草稿 + 光标（选中时做文本替换用）
   const stateRef = useRef({ draft: opts.draft, cursor: opts.draft.length });
-  // Lexical 注入的 pick：优先插 DecoratorNode，失败再字符串 fallback
+  // Lexical 注入的 pick：优先插 SkillTokenNode，失败再字符串 fallback
   const pickHandlerRef = useRef<SlashPickHandler | null>(null);
 
   const { applyDraft, draft } = opts;
@@ -440,12 +441,10 @@ export const SkillTokenText = ({ text }: { text: string }) => {
       parts.push(text.slice(cursor, t.start));
     }
     parts.push(
-      <span
-        key={`${t.start}-${t.name}`}
-        className="rounded-[4px] bg-primary/15 px-0.5 text-primary ring-1 ring-inset ring-primary/20"
-      >
+      // 单一视觉来源：跟输入岛 Lexical token 同一份样式（ui/skill-token.tsx）
+      <SkillToken key={`${t.start}-${t.name}`}>
         {text.slice(t.start, t.end)}
-      </span>,
+      </SkillToken>,
     );
     cursor = t.end;
   }
