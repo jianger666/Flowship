@@ -175,7 +175,7 @@ const inferDisabledReason = (
 // 总高维持原「标题+副标题」两行的块高；选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
 const actionCardClass = (selected: boolean) =>
   cn(
-    "group flex min-h-11 w-full items-center justify-center py-1.5",
+    "group flex h-10 w-full items-center justify-center py-0 px-0",
     selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
   );
 
@@ -190,7 +190,7 @@ const ActionCardContent = ({
   <>
     <Sparkles
       className={cn(
-        "absolute left-1.5 top-1.5 size-3 shrink-0 transition-colors",
+        "absolute left-2 top-1/2 size-3 shrink-0 -translate-y-1/2 transition-colors",
         selected
           ? "text-primary"
           : "text-muted-foreground/60 group-hover:text-muted-foreground",
@@ -198,7 +198,7 @@ const ActionCardContent = ({
     />
     <span
       className={cn(
-        "w-full truncate px-3 text-center text-sm font-medium",
+        "w-full truncate px-6 text-center text-[13px] font-medium leading-none",
         selected && "text-primary",
       )}
     >
@@ -755,7 +755,7 @@ export const AdvanceDialog = ({
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             {visibleKeys.length > 0 ? (
-              <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-5">
+              <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4">
                 {visibleKeys.map((key) => renderActionChip(key))}
               </div>
             ) : (
