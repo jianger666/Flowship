@@ -161,6 +161,9 @@ const ActionsPanel = () => {
     const text = `把下面这个旧版自定义 action 转建成新版（skill + 挂载壳）。原 label：「${def.label}」。原 playbook 内容如下、提炼成纯方法论 skill（英文 kebab-case 目录名）并用 create_custom_action 挂壳（产出要求放 output 参数）：\n\n${def.legacyPlaybook}`;
 
     setConvertingLegacyId(def.id);
+    // 终审 P3：createTask 成功但 sendChatReply 失败（409 等）时别只 toast——
+    // 任务已建成、降级为草稿 + 导航过去让用户手动重发、不留孤儿空对话
+    let createdTaskId: string | null = null;
     try {
       const task = await createTask({
         mode: "chat",
@@ -172,6 +175,7 @@ const ActionsPanel = () => {
             ? s.disabledMcpServers
             : undefined,
       });
+      createdTaskId = task.id;
 
       // 无 apiKey / 无默认模型 → 降级：草稿预填 + 挂 chip，用户配好后再发
       const canAutoSend =
@@ -206,9 +210,16 @@ const ActionsPanel = () => {
       toast.success("已发起转建、AI 正在处理");
       router.push(`/tasks/${task.id}`);
     } catch (err) {
-      toast.error(
-        `转建失败：${err instanceof Error ? err.message : String(err)}`,
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      if (createdTaskId) {
+        // 任务已建成、发送失败：草稿兜底 + 导航过去手动重发
+        toast.error(`发送失败：${msg}；已把转建说明写入草稿、进对话后重发即可`);
+        saveDraft("reply", createdTaskId, text);
+        setPendingSlashSkill("action-creator");
+        router.push(`/tasks/${createdTaskId}`);
+      } else {
+        toast.error(`转建失败：${msg}`);
+      }
     } finally {
       setConvertingLegacyId(null);
     }

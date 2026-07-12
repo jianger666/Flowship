@@ -106,7 +106,9 @@ const isFieldEqual = (
     key === "gitToken" ||
     key === "branchTemplate" ||
     key === "jumpIde" ||
-    key === "submitShortcut"
+    key === "submitShortcut" ||
+    // 终审 P3：漏了 userRole 分支会 fall-through 到末尾的 defaultModel 比较、dirty 失真
+    key === "userRole"
   ) {
     return (a[key] ?? "") === (b[key] ?? "");
   }

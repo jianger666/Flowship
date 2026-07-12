@@ -286,7 +286,7 @@ const buildInitialPrompt = (
     `任务 ID：\`${task.id}\``,
     `任务标题：${task.title}`,
   ];
-  // chat 无 story 上下文、只注入姓名（有角色也不会查）；未登录则整行跳过
+  // 身份行 = 姓名（meegle）+ 设置页角色（v1.1.3 起角色只从设置取）；两者都拿不到整行跳过
   if (userIdentityLine.trim()) {
     lines.push(userIdentityLine.trim());
   }
@@ -681,7 +681,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
     // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
     const rulesSection = await readAppRulesForPrompt();
-    // chat 无 story、resolve 只返回姓名行（失败空串）
+    // resolve = 姓名（meegle）+ 设置页角色、失败返空串（不堵启动）
     const userIdentityLine = await resolveUserIdentityForPrompt();
     const initialPrompt = buildInitialPrompt(
       task,
