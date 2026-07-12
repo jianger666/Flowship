@@ -10,6 +10,7 @@
  *   text?: string;                    // 用户消息文本（可空、但 images / attachments 至少一个）
  *   images?: Array<{ data, mimeType, filename }>;
  *   attachments?: string[];           // 文件 / 目录绝对路径（原生 picker 选的）
+ *   skills?: Array<{ name, absPath }>; // skill 引用；指引只进 agent、不进 user_reply
  *   // task 处于 idle / completed / error 时、用户发消息会同时触发「自动启 agent」、需要 SDK 启动参数
  *   bootArgs?: { apiKey, model };
  * }
@@ -18,14 +19,14 @@
  * # 路由职责（V0.11：wait 协议退役、两种模式）
  *
  * 1. **有存活会话（agent 在、无 run 在跑）**（正常对话循环）：
- *    - 写 user_reply 事件
- *    - sendChatMessage（`agent.send` 续同一会话、新 run）
+ *    - 写 user_reply 事件（text = 用户原文）
+ *    - sendChatMessage（`agent.send` 续同一会话、新 run；text = skill 指引 + 原文）
  *    -（切模型 / 切 MCP 时懒重启：关旧会话、起新会话、这条消息作首条）
  *
  * 2. **无会话（首条 / agent 已关 / 服务重启过）**（自动启动）：
- *    - 写 user_reply 事件（用户立刻看到自己的话）
+ *    - 写 user_reply 事件（用户立刻看到自己的话 = 原文）
  *    - patch task.runStatus=running
- *    - fire-and-forget runChatSession(firstMessage=text) 起新会话
+ *    - fire-and-forget runChatSession(firstMessage=指引+原文) 起新会话
  *    - agent 起手 prompt 已含用户首条、直接回答、答完自然结束回复
  *
  * # 失败情况
@@ -62,12 +63,14 @@ import {
 } from "@/lib/server/chat-runner";
 import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
+import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
   isValidModel,
   modelEquals,
   parseAndValidateAttachments,
   parseAndValidateImages,
+  parseAndValidateSkills,
   stringSetEquals,
 } from "@/lib/server/route-helpers";
 
@@ -83,6 +86,7 @@ interface PostBody {
     filename?: string;
   }>;
   attachments?: string[];
+  skills?: Array<{ name?: string; absPath?: string }>;
   bootArgs?: {
     apiKey?: string;
     model?: ModelSelection;
@@ -91,6 +95,7 @@ interface PostBody {
 
 const MAX_IMAGES_PER_REPLY = 6;
 const MAX_ATTACHMENTS_PER_REPLY = 10;
+const MAX_SKILLS_PER_REPLY = 8;
 // 切模型懒重启：cancel 旧 Run 后等它真退的上限（对齐 task-runner force-new 的 5s）、超时强清继续
 const CHAT_RESTART_STOP_TIMEOUT_MS = 5000;
 
@@ -123,6 +128,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   );
   if (!attachResult.ok) return attachResult.errorResponse;
   const attachmentAbsPaths = attachResult.paths;
+
+  // skill 引用：指引只拼进 agent 消息、事件气泡存用户原文
+  const skillsResult = parseAndValidateSkills(body.skills, MAX_SKILLS_PER_REPLY);
+  if (!skillsResult.ok) return skillsResult.errorResponse;
+  const skills = skillsResult.skills;
 
   // 必须 text / images / attachments 至少一项
   if (
@@ -177,6 +187,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     text.length === 0 && (imageAbsPaths || attachmentAbsPaths.length > 0)
       ? "(用户附了图片 / 文件)"
       : "";
+  // 事件 = 用户原文；agent = skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
+  const agentText = buildSkillDirective(skills) + text;
   const replyEvent = await appendEvent(task.id, {
     kind: "user_reply",
     text: text || fallbackText,
@@ -238,7 +250,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       // send 续接同一会话（agent 正在回时返 false → 409 让用户等说完）
       const sent = await sendChatMessage(
         task,
-        text || fallbackText,
+        agentText || fallbackText,
         imageAbsPaths,
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
       );
@@ -302,7 +314,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     apiKey: bootArgs.apiKey,
     model: bootArgs.model,
     firstMessage: {
-      text,
+      text: agentText,
       imagePaths: imageAbsPaths,
       attachmentPaths:
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,

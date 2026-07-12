@@ -62,6 +62,7 @@ import {
   readAppRulesForPrompt,
   resolveTaskMcpServers,
 } from "./cursor-config";
+import { resolveUserIdentityForPrompt } from "./meegle-cli";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
@@ -274,6 +275,8 @@ const buildInitialPrompt = (
   skills: SkillEntry[],
   rulesSection: string,
   firstMessage?: InitialUserMessage,
+  /** 飞书项目推导的发起人姓名行；空串 = 不注入 */
+  userIdentityLine = "",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -282,6 +285,12 @@ const buildInitialPrompt = (
     "",
     `任务 ID：\`${task.id}\``,
     `任务标题：${task.title}`,
+  ];
+  // chat 无 story 上下文、只注入姓名（有角色也不会查）；未登录则整行跳过
+  if (userIdentityLine.trim()) {
+    lines.push(userIdentityLine.trim());
+  }
+  lines.push(
     "",
     // 回合协议（正常多轮对话、说完自然结束回复）单一源、见 wait-protocol-prompt.ts
     chatTurnProtocolSection(),
@@ -321,7 +330,7 @@ const buildInitialPrompt = (
       "→ 用户没传上下文文档、按对话内容判断要不要主动调 MCP / read / grep 摸资料。",
     ),
     "",
-  ];
+  );
 
   // 起手姿势：有首条 → 直接答；无首条 → submit_work 起手等
   lines.push(...buildOpeningStanceSection(task.id, firstMessage));
@@ -672,7 +681,15 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
     // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
     const rulesSection = await readAppRulesForPrompt();
-    const initialPrompt = buildInitialPrompt(task, skills, rulesSection, firstMessage);
+    // chat 无 story、resolve 只返回姓名行（失败空串）
+    const userIdentityLine = await resolveUserIdentityForPrompt();
+    const initialPrompt = buildInitialPrompt(
+      task,
+      skills,
+      rulesSection,
+      firstMessage,
+      userIdentityLine,
+    );
     run = await agent.send(initialPrompt);
 
     // 回填真实 agentId / agent 实例（占位注册时是空串 / null）——从此会话可被 send 续接。

@@ -260,3 +260,78 @@ export const parseAndValidateAttachments = async (
   return { ok: true, paths, metas };
 };
 
+// ----------------- skills 入参校验 -----------------
+
+export interface SkillRefInput {
+  name: string;
+  absPath: string;
+}
+
+interface ParseSkillsOk {
+  ok: true;
+  skills: SkillRefInput[];
+}
+
+interface ParseSkillsErr {
+  ok: false;
+  errorResponse: Response;
+}
+
+/**
+ * 校验 body.skills：数组、每项 name/absPath 非空字符串、上限 max、absPath 必须绝对路径。
+ * 不做 fs.stat（skill 路径来自本机扫描缓存、缺文件由 agent read 时报错即可）。
+ * 缺省 / null / undefined → 空数组（调用方直接拼 directive 即可）。
+ */
+export const parseAndValidateSkills = (
+  raw: unknown,
+  max = 8,
+): ParseSkillsOk | ParseSkillsErr => {
+  if (raw === undefined || raw === null) {
+    return { ok: true, skills: [] };
+  }
+  if (!Array.isArray(raw)) {
+    return { ok: false, errorResponse: errorResponse("skills 必须是数组") };
+  }
+  if (raw.length > max) {
+    return {
+      ok: false,
+      errorResponse: errorResponse(`skills 最多 ${max} 个`),
+    };
+  }
+  const skills: SkillRefInput[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") {
+      return {
+        ok: false,
+        errorResponse: errorResponse("skills[] 每项必须是对象"),
+      };
+    }
+    const { name, absPath } = item as {
+      name?: unknown;
+      absPath?: unknown;
+    };
+    if (typeof name !== "string" || name.trim().length === 0) {
+      return {
+        ok: false,
+        errorResponse: errorResponse("skills[].name 必须是非空字符串"),
+      };
+    }
+    if (typeof absPath !== "string" || absPath.trim().length === 0) {
+      return {
+        ok: false,
+        errorResponse: errorResponse("skills[].absPath 必须是非空字符串"),
+      };
+    }
+    if (!path.isAbsolute(absPath)) {
+      return {
+        ok: false,
+        errorResponse: errorResponse(
+          `skills[].absPath 必须是绝对路径：${absPath}`,
+        ),
+      };
+    }
+    skills.push({ name: name.trim(), absPath });
+  }
+  return { ok: true, skills };
+};
+

@@ -11,7 +11,7 @@
  * 传输分流（对用户透明）：会话活着 send；会话断 + action 停半路（含 awaiting_ack）唤醒
  * 新 agent 原地续（显式换模型用新模型跑）；会话断 + 已完结起一次性临时 agent。
  *
- * Body: { text, images?, attachments?, bootArgs?: { apiKey, model }, forceModel? }
+ * Body: { text, images?, attachments?, skills?, bootArgs?: { apiKey, model }, forceModel? }
  */
 
 import { appendEvent, getTask, patchAction, setTaskRunStatus } from "@/lib/server/task-fs";
@@ -27,10 +27,12 @@ import {
   supersedePendingAsks,
 } from "@/lib/server/task-runner";
 import { publishTaskStreamEvent, runningTasks } from "@/lib/server/task-stream";
+import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
   parseAndValidateAttachments,
   parseAndValidateImages,
+  parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -42,6 +44,8 @@ interface PostBody {
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
   /** 文件 / 目录绝对路径（原生 picker 选的、v1.1.x 任务输入条也能附） */
   attachments?: string[];
+  /** skill 引用：指引只进 agent、不进 user_reply 气泡 */
+  skills?: Array<{ name?: string; absPath?: string }>;
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
@@ -57,6 +61,7 @@ interface PostBody {
 
 const MAX_IMAGES = 6;
 const MAX_ATTACHMENTS = 10;
+const MAX_SKILLS = 8;
 
 export const runtime = "nodejs";
 
@@ -80,6 +85,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   );
   if (!attachResult.ok) return attachResult.errorResponse;
   const attachmentPaths = attachResult.paths;
+  const skillsResult = parseAndValidateSkills(body.skills, MAX_SKILLS);
+  if (!skillsResult.ok) return skillsResult.errorResponse;
+  const skills = skillsResult.skills;
   if (!text && images.length === 0 && attachmentPaths.length === 0) {
     return errorResponse("text / images / attachments 至少一项非空");
   }
@@ -144,13 +152,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
+  // 事件用用户原文；发给 agent 的带 skill 指引（三条分流共用）
+  const agentText = buildSkillDirective(skills) + text;
+
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
   const sent = forceModel
     ? false
     : await deliverTaskQuestion(
         task,
-        text,
+        agentText,
         imageAbsPaths,
         { apiKey, model },
         ackContext,
@@ -230,7 +241,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 唤醒模式自己管状态（patch action running + runStatus + 事件）；失败标 error 有内部兜底
     void resumeCurrentActionWithMessage({
       task,
-      userMessage: text,
+      userMessage: agentText,
       imagePaths: imageAbsPaths,
       attachmentPaths: attachmentPaths.length > 0 ? attachmentPaths : undefined,
       apiKey: apiKey!,
@@ -262,7 +273,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (useOneShot) {
     startOneShotQuestion(
       task,
-      text,
+      agentText,
       imageAbsPaths,
       { apiKey: apiKey!, model: fallbackModel! },
       attachmentPaths.length > 0 ? attachmentPaths : undefined,

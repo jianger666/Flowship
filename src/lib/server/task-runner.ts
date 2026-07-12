@@ -113,6 +113,7 @@ import {
   captureTaskFieldsSnapshot,
   loadActionPrompt,
 } from "./task-prompts";
+import { resolveUserIdentityForPrompt } from "./meegle-cli";
 import {
   checkActionPrerequisites,
   planBranchesForBuild,
@@ -1561,15 +1562,24 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         console.error("[task-runner] loadSkills failed", err);
         return [] as SkillEntry[];
       });
-      const superPrompt = await buildSuperPrompt(task, skills, {
-        action,
-        userInstruction,
-        attachedImagePaths,
-        attachedFilePaths,
-        branchCheckoutHint,
-        batchDirective,
-        replanDirective,
-      });
+      // 飞书项目推导发起人姓名 + 本需求角色（失败返空串、不堵启动）
+      const userIdentityLine = await resolveUserIdentityForPrompt(
+        task.feishuStoryUrl,
+      );
+      const superPrompt = await buildSuperPrompt(
+        task,
+        skills,
+        {
+          action,
+          userInstruction,
+          attachedImagePaths,
+          attachedFilePaths,
+          branchCheckoutHint,
+          batchDirective,
+          replanDirective,
+        },
+        userIdentityLine,
+      );
 
       const run = await agent.send(superPrompt);
       await consumeSessionRun(task, agent, run, { errorActionId: action.id });

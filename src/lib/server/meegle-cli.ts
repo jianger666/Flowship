@@ -17,6 +17,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
 
+import { extractFeishuStoryId } from "@/lib/branch-template";
 import { meegleBin } from "./feishu-cli";
 
 const execFileAsync = promisify(execFile);
@@ -275,12 +276,21 @@ export const fetchWorkitemDetail = async (
   return {};
 };
 
-// ---------- 当前用户（子任务「只看自己」过滤用） ----------
+// ---------- 当前用户（子任务「只看自己」过滤 + agent prompt 身份注入） ----------
 
-// user me 缓存（user_key 不会变、进程级缓存即可）——**只缓存成功结果**：
+// user me 缓存（user_key / 姓名不会变、进程级缓存即可）——**只缓存成功结果**：
 // v1.1.x 修（用户实测「升级重启后首屏授权像没检测到」的隐患之一）：原来失败也缓存 null、
 // server 冷启动首拉赶上 CLI 慢 / 网络抖一次、看板就永远 not_authed 到进程重启
 let meCache: string | undefined;
+/** 身份缓存（姓名 + user_key）；与 meCache 同源、成功后两边一起填 */
+let identityCache: MeegleIdentity | undefined;
+
+/** meegle `user me` 归一：姓名（name_cn 优先）+ user_key */
+export interface MeegleIdentity {
+  userKey: string;
+  /** 展示名：name_cn 优先、否则 name_en */
+  name: string;
+}
 
 /**
  * 当前登录用户的 user_key（实测 user me 返回 { user_key, name_cn, ... }）。
@@ -289,14 +299,133 @@ let meCache: string | undefined;
  */
 export const fetchMyUserKey = async (): Promise<string | null> => {
   if (meCache !== undefined) return meCache;
+  // 身份已缓存时复用（避免再打一次 user me）
+  if (identityCache) {
+    meCache = identityCache.userKey;
+    return meCache;
+  }
   try {
     const resp = (await runMeegle(["user", "me"])) as Record<string, unknown>;
     const key = asStr(resp.user_key);
-    if (key) meCache = key;
+    if (key) {
+      meCache = key;
+      // 顺手填身份缓存（姓名有就存、没有只缓存 key）
+      const name = asStr(resp.name_cn) ?? asStr(resp.name_en);
+      if (name) identityCache = { userKey: key, name };
+    }
     return key ?? null;
   } catch (err) {
     if (err instanceof MeegleError && err.kind === "not_authed") return null;
     throw err;
+  }
+};
+
+/**
+ * 当前登录用户身份（姓名 + user_key）。
+ * 给 agent prompt「发起人」行用——**增强路径、失败一律返 null**（未登录 / 超时 / 缺字段都不抛、
+ * 别堵 task / chat 启动）。成功结果进程级缓存。
+ */
+export const fetchMyIdentity = async (): Promise<MeegleIdentity | null> => {
+  if (identityCache) return identityCache;
+  try {
+    const resp = (await runMeegle(["user", "me"])) as Record<string, unknown>;
+    const userKey = asStr(resp.user_key);
+    const name = asStr(resp.name_cn) ?? asStr(resp.name_en);
+    if (!userKey || !name) return null;
+    identityCache = { userKey, name };
+    meCache = userKey;
+    return identityCache;
+  } catch {
+    // 身份是增强不是依赖：not_authed / 超时 / 解析失败都吞掉
+    return null;
+  }
+};
+
+/**
+ * 查当前用户在某工作项上的角色名（如「前端开发」「测试」）。
+ *
+ * 数据源：`workitem get` → `work_item_attribute.role_members[]`
+ *（实测 2026-07-12：`{ key, name, members:[{ key:user_key, name, email }] }`；
+ * `role_owners` 作兜底字段名）。用户 user_key 命中哪个角色组的 members、就取该组 `name`。
+ * 多角色命中用顿号拼接；找不到 / 失败返 null（吞错、不堵启动）。
+ */
+export const fetchMyRoleOnWorkitem = async (
+  projectKey: string,
+  workitemId: string,
+): Promise<string | null> => {
+  try {
+    const identity = await fetchMyIdentity();
+    if (!identity) return null;
+    const detail = await fetchWorkitemDetail(workitemId, projectKey);
+    // 角色组挂在 work_item_attribute 下；偶发扁平顶层也兜一下
+    const attr =
+      detail.work_item_attribute && typeof detail.work_item_attribute === "object"
+        ? (detail.work_item_attribute as Record<string, unknown>)
+        : detail;
+    const rawRoles = attr.role_members ?? attr.role_owners;
+    if (!Array.isArray(rawRoles)) return null;
+
+    const hitNames: string[] = [];
+    for (const raw of rawRoles) {
+      if (!raw || typeof raw !== "object") continue;
+      const group = raw as Record<string, unknown>;
+      const roleName = asStr(group.name);
+      if (!roleName) continue;
+      const members = Array.isArray(group.members) ? group.members : [];
+      const hit = members.some((m) => {
+        if (!m || typeof m !== "object") return false;
+        return asStr((m as Record<string, unknown>).key) === identity.userKey;
+      });
+      if (hit) hitNames.push(roleName);
+    }
+    return hitNames.length > 0 ? hitNames.join("、") : null;
+  } catch {
+    return null;
+  }
+};
+
+/** 拼 prompt「用户身份」行；无姓名时调用方应整行不注入（本函数要求已有 name） */
+export const formatUserIdentityLine = (
+  name: string,
+  roleOnStory?: string | null,
+): string => {
+  if (roleOnStory && roleOnStory.trim()) {
+    return `- 发起人：${name}（在本需求的角色：${roleOnStory.trim()}）`;
+  }
+  return `- 发起人：${name}`;
+};
+
+/**
+ * 解析并拼出可直接塞进 super / chat prompt 的「用户身份」行。
+ * - 有飞书 story URL → 尽量查该需求上的角色组，拼「姓名 + 角色」
+ * - 无 URL / 查不到角色 → 只写姓名
+ * - meegle 未登录 / 全程失败 → 返空串（调用方不注入整行）
+ *
+ * projectKey 走 `url decode` 的 simple_name（CLI `--project-key` 接受 simpleName）。
+ */
+export const resolveUserIdentityForPrompt = async (
+  feishuStoryUrl?: string,
+): Promise<string> => {
+  try {
+    const identity = await fetchMyIdentity();
+    if (!identity) return "";
+
+    let role: string | null = null;
+    const url = feishuStoryUrl?.trim();
+    if (url) {
+      const storyId = extractFeishuStoryId(url);
+      if (storyId) {
+        // decode 拿 simple_name 当 project-key；decode 失败就跳过角色（仍注入姓名）
+        const decoded = await decodeWorkitemUrl(url);
+        const projectKey = decoded?.simpleName;
+        if (projectKey) {
+          role = await fetchMyRoleOnWorkitem(projectKey, storyId);
+        }
+      }
+    }
+    return formatUserIdentityLine(identity.name, role);
+  } catch {
+    return "";
   }
 };
 

@@ -260,8 +260,8 @@ export const isPlaceholderChatTitle = (title: string): boolean =>
  * 全空白返回 null（调用方保留占位）。
  */
 export const deriveChatTitleFromMessage = (text: string): string | null => {
-  // 带 `/` skill 前缀的消息（slash-skills buildSkillPrefix 拼的「[使用 skill] …」头 +
-  // 空行 + 正文）：标题只取正文、别把指令头当标题（审计 P1：污染成「[使用 skill] 处理…」）
+  // 带 `/` skill 的旧消息（曾把「[使用 skill] …」头拼进 text）：标题只取正文。
+  // 新链路事件已是用户原文、这段只兼容历史事件。
   let body = text;
   if (body.startsWith("[使用 skill]")) {
     const sep = body.indexOf("\n\n");

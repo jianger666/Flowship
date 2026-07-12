@@ -48,3 +48,19 @@ export const buildNextActionHead = (args: {
   ]
     .filter(Boolean)
     .join(" ") + "]";
+
+/**
+ * 拼 skill 指引段（只进 agent 消息、不进 user_reply 事件）。
+ * 格式与旧客户端 buildSkillPrefix 一致，方便 agent / 历史兼容。
+ */
+export const buildSkillDirective = (
+  skills: Array<{ name: string; absPath: string }> | undefined,
+): string => {
+  if (!skills || skills.length === 0) return "";
+  return [
+    "[使用 skill] 处理本条消息前、先逐个 read 以下 skill 并严格遵循：",
+    ...skills.map((p) => `- ${p.name}：${p.absPath}`),
+    "",
+    "",
+  ].join("\n");
+};

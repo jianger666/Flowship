@@ -9,12 +9,12 @@
  * - 选中：优先走编辑器注入的 pickHandler（Lexical 直接插 SkillTokenNode）；
  *   否则 fallback 把光标前 `/partial` 补全成纯文本 `/skill-name `（applyDraft）
  * - 高亮：Composer Lexical SkillTokenNode 品牌色 tag（见 composer-skill-token-node.tsx）
- * - 发送时调 buildSkillPrefix() 拼消息头：点名让 AI 先 read 对应 SKILL.md 再执行；
- *   正文原样保留 `/skill-name` 字样
+ * - 发送时把 slash.references（name + absPath）作为独立字段传给 API；
+ *   用户气泡只存原文（含 `/skill-name`）、skill 指引由服务端拼进 agent 消息
  *
  * 用法：const slash = useSlashSkills({ applyDraft }) 后把 slash 整个传给
  * <Composer slash={slash} />（菜单 / 键盘 / 光标同步都在 Composer 内接好）、
- * 发送时 text = slash.buildSkillPrefix() + text、成功后 slash.reset()（只清菜单态）。
+ * 发送时传 text + skillRefs（= references 的 name/absPath）、成功后 slash.reset()。
  */
 
 import {
@@ -163,7 +163,7 @@ export interface SlashSkillsApi {
   activeIndex: number;
   /**
    * 当前草稿里解析出的 skill 引用（去重、按出现序）。
-   * 供发送拼 prefix；UI token 由 Lexical 节点渲染，不靠这个。
+   * 供发送时作为独立 skills 字段传给 API；UI token 由 Lexical 节点渲染，不靠这个。
    */
   references: SlashSkill[];
   /** 已知 enabled skill 名集合——编辑器 transform / 解析 token 用 */
@@ -179,8 +179,6 @@ export interface SlashSkillsApi {
    * 返回 unsubscribe；不传 / 返 false 时 pickAt 仍走 applyDraft 字符串补全。
    */
   registerPickHandler: (handler: SlashPickHandler | null) => () => void;
-  /** 发送时拼消息头（没引用返回空串）；调用方发送成功后调 reset() */
-  buildSkillPrefix: () => string;
   /** 只清菜单态（不清草稿——草稿由调用方清） */
   reset: () => void;
 }
@@ -344,16 +342,6 @@ export const useSlashSkills = (opts: {
     [menuOpen, filtered.length, activeIndex, pickAt],
   );
 
-  const buildSkillPrefix = useCallback(() => {
-    if (references.length === 0) return "";
-    return [
-      "[使用 skill] 处理本条消息前、先逐个 read 以下 skill 并严格遵循：",
-      ...references.map((p) => `- ${p.name}：${p.absPath}`),
-      "",
-      "",
-    ].join("\n");
-  }, [references]);
-
   const reset = useCallback(() => {
     // 只清菜单态；草稿由调用方清、references 随 draft prop 自然变空
     setQuery(null);
@@ -369,7 +357,6 @@ export const useSlashSkills = (opts: {
     onKeyDown,
     pickAt,
     registerPickHandler,
-    buildSkillPrefix,
     reset,
   };
 };

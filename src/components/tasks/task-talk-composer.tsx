@@ -106,13 +106,18 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
       const images = attach.toUploadPayload();
       // V0.13.x 统一消息通道（用户拍板「别这么多分支」）：全部走 question route、
       // AI 自主二分类（疑问就答 / 要改就改）；产出在等审阅时服务端自动附「重新交卷」上下文。
-      // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
+      // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
+      const skillRefs =
+        slash.references.length > 0
+          ? slash.references.map((s) => ({ name: s.name, absPath: s.absPath }))
+          : undefined;
       const updated = await submitTaskQuestion(
         task.id,
-        slash.buildSkillPrefix() + text,
+        text,
         images,
         pickedModel.id ? pickedModel : undefined,
         pathAttach.paths,
+        skillRefs,
       );
       onTaskUpdate(updated);
       setDraft("");

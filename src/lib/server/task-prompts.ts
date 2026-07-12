@@ -207,6 +207,12 @@ export const buildSuperPrompt = async (
     // V0.8.12 A：plan append 硬指令（已分批 task 追加需求时拼进首个 NEXT_ACTION）
     replanDirective?: string;
   },
+  /**
+   * 飞书项目推导的「用户身份」行（调用方 await resolveUserIdentityForPrompt 后传入）。
+   * 已含 `- 发起人：…` 前缀；空串 = 未登录 / 查不到、整行不注入（不塞「（未提供）」）。
+   * 故意不在本函数里打 meegle——保持纯拼装、网络失败不堵模板渲染。
+   */
+  userIdentityLine = "",
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -230,6 +236,8 @@ export const buildSuperPrompt = async (
   return renderSuperPromptTemplate(template, {
     taskId: task.id,
     taskTitle: task.title,
+    // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
+    userIdentityLine,
     repoSection: renderRepoSection(task),
     repoBranchSection: renderRepoBranchSection(task),
     repoPath: getTaskCwd(task),

@@ -536,6 +536,8 @@ export const sendChatReply = async (
   images?: ImagePayload[],
   attachments?: string[],
   bootArgs?: TaskBootArgs,
+  // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
+  skills?: Array<{ name: string; absPath: string }>,
 ): Promise<{ task: Task; autoStarted: boolean }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
@@ -548,6 +550,7 @@ export const sendChatReply = async (
         attachments:
           attachments && attachments.length > 0 ? attachments : undefined,
         bootArgs,
+        skills: skills && skills.length > 0 ? skills : undefined,
       }),
     },
   );
@@ -574,6 +577,8 @@ export const submitTaskQuestion = async (
   forceModel?: ModelSelection,
   // 文件 / 目录绝对路径附件（v1.1.x 任务输入条也能附路径）
   attachments?: string[],
+  // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
+  skills?: Array<{ name: string; absPath: string }>,
 ): Promise<Task> => {
   const s = getSettings();
   const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
@@ -584,6 +589,7 @@ export const submitTaskQuestion = async (
       images: images && images.length > 0 ? images : undefined,
       attachments:
         attachments && attachments.length > 0 ? attachments : undefined,
+      skills: skills && skills.length > 0 ? skills : undefined,
       bootArgs: {
         apiKey: s.apiKey,
         model: s.defaultModel,

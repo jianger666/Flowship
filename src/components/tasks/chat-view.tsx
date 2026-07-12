@@ -101,7 +101,12 @@ export const ChatView = ({
   // 后端 chat-reply 路由自己决定（V0.11）：有存活会话 → send 续接；无会话 → bootArgs 起新会话
   // 前端为最简化、永远附 bootArgs（后端用得上就用、用不上就忽略）
   const handleUserReply = useCallback(
-    async (text: string, images?: ImagePayload[], attachments?: string[]) => {
+    async (
+      text: string,
+      images?: ImagePayload[],
+      attachments?: string[],
+      skillRefs?: Array<{ name: string; absPath: string }>,
+    ) => {
       if (task.runStatus === "running") {
         toast.warning("agent 正在回、等它先说完一段");
         return;
@@ -121,6 +126,7 @@ export const ChatView = ({
             apiKey: args.apiKey,
             model: args.model,
           },
+          skillRefs,
         );
         onTaskUpdateRef.current(latest);
       } catch (err) {

@@ -92,10 +92,12 @@ interface Props {
   streamingText?: string;
   // attachments：附加的文件 / 目录绝对路径数组、后端发给 agent 时拼成
   // [ATTACHED_PATHS] 段、agent 用 `read` 工具自己读
+  // skillRefs：选中的 skill（name + absPath）、后端拼进 agent 消息、不进 user_reply 气泡
   onUserReply?: (
     text: string,
     images?: ImagePayload[],
     attachments?: string[],
+    skillRefs?: Array<{ name: string; absPath: string }>,
   ) => void;
   // V0.2 plan workflow 模式下传 true、不渲染底部「自由回复」输入框
   // 因为 plan 模式的 HITL 是 phase ack（通过 / 再聊聊）、不是 free-form 聊天
@@ -391,8 +393,12 @@ const EventStreamImpl = ({
     if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) return;
     const images: ImagePayload[] | undefined = attach.toUploadPayload();
     const attachments = pathAttach.paths.length > 0 ? pathAttach.paths : undefined;
-    // 选了 skill：消息头拼「先 read 这些 SKILL.md 再执行」指引
-    onUserReply?.(slash.buildSkillPrefix() + text, images, attachments);
+    // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
+    const skillRefs =
+      slash.references.length > 0
+        ? slash.references.map((s) => ({ name: s.name, absPath: s.absPath }))
+        : undefined;
+    onUserReply?.(text, images, attachments, skillRefs);
     setDraft("");
     saveDraft("reply", task.id, "");
     slash.reset();
