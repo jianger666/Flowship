@@ -11,9 +11,13 @@
 
 import type { ReactNode } from "react";
 
-/** 品牌色 tag：作用在真实文本 span 上（Lexical caret 正常渲染的前提、别加 inline-flex） */
+/**
+ * 品牌色 tag：作用在真实文本 span 上（Lexical caret 正常渲染的前提、别加 inline-flex）。
+ * `skill-token-tag` 走 globals.css 的 ::before 补小闪 icon——伪元素不进文本流、
+ * 不影响 token 文本序列化和光标（真 <svg> 子元素塞进 TextNode 会破坏两者）。
+ */
 export const SKILL_TOKEN_CLASS =
-  "rounded-[4px] bg-primary/20 px-0.5 font-medium text-primary ring-1 ring-inset ring-primary/30";
+  "skill-token-tag rounded-[4px] bg-primary/20 px-0.5 font-medium text-primary ring-1 ring-inset ring-primary/30";
 
 /** React 场景的 skill token tag（气泡高亮等）；children 传 `/skill-name` 原文 */
 export const SkillToken = ({
