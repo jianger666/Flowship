@@ -247,7 +247,7 @@ export const PreferenceSections = ({
             size="sm"
             onClick={() => openSystemNotificationSettings()}
           >
-            系统设置里开启
+            去系统设置
           </Button>
         }
       />
