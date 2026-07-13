@@ -12,6 +12,7 @@
  */
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import type { BoardItem } from "@/components/feishu/feishu-board";
@@ -238,7 +239,13 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
               className="py-10 text-center text-xs text-muted-foreground"
               style={{ gridColumn: `1 / ${span + 1}`, gridRow: 2 }}
             >
-              该空间在这个时间段没有排期——切换空间或调整时间范围
+              该空间在这个时间段没有排期——切换空间或调整时间范围，或
+              <Link
+                href="/workitems/new"
+                className="text-primary underline-offset-2 hover:underline"
+              >
+                手动建任务
+              </Link>
             </div>
           ) : (
             rows.map((row, idx) => {

@@ -15,6 +15,13 @@
 
 ---
 
+### 2026-07-13 v1.1.5 发版：mac Intel（darwin-x64）安装包支持
+
+- **发版矩阵扩三项**：win x64 / mac arm64 / mac x64（arm64 runner 交叉打、`@cursor/sdk-darwin-x64` 平台包对称走 npm pack）；electron-builder.yml mac target 不再写死 arch、CLI `--arm64`/`--x64` 决定（本地 test 打包不带 flag 仍本机架构）
+- **update-manifest 挪 finalize job**：两个 mac job 各签只含自己 dmg 的 manifest 会互相 clobber → finalize 统一 `gh release download` 两枚 dmg（draft、断言恰好 2 枚、少了硬红）→ 一次签进 files[] → upload → 才转正 draft；壳 `verifyDownloadedUpdate` 按 asset 名找条目、多文件 manifest 对老壳向后兼容
+- **壳自更新按 `process.arch` 拼 dmg 名**（main.js、arm64/x64 两处共用 assetName）；README 补 Intel 行
+- 蓝军 review 无 P0；观察点：首个双 mac tag 盯 finalize 的 `gh release download` 对 draft 是否稳（挂了 = 发不出去 fail-closed、不伤存量用户）
+
 ### 2026-07-13 v1.1.4 发版：就绪清单补 GitLab Token + 飞书登录态闪烁根治 + 提测 playbook 切内置 meegle CLI
 
 - **就绪清单五项**：GitLab Token 进首页「开始使用」第 3 步（hint「提 MR 用的凭据」、锚点设置→连接）、仓库/角色顺延 4/5；Host 不进清单（已自动从仓库 origin 推导）

@@ -3,13 +3,14 @@
 /**
  * 任务启动表单（V0.14、原 NewTaskDialog 的表单核心内联成页面组件）
  *
- * V0.14 起任务只从飞书工作项进（用户拍板砍「新建任务」入口）：
- * 看板点工作项 → 预览页（工作项详情 + 本表单）→ 启动 = 创建任务并开跑。
+ * 两条入口：
+ * - 看板点工作项 → 预览页（工作项详情 + 本表单）→ 标题 / 飞书链接预填
+ * - 看板「手动建任务」→ `/workitems/new`（无预填）→ 标题手填、飞书链接可粘贴
  *
  * 零操作设计（解「不选仓库就卡住」的痛点）：
  * - 仓库 / 角色预填「上次启动用的」（localStorage 记忆）、90% 场景直接点启动
  * - 真缺仓库时启动置灰 + 琥珀高亮引导（卡点可见、不是谜题）
- * - 标题预填工作项名（可改）、飞书链接来自工作项（不可改）
+ * - 标题预填工作项名（可改）；飞书链接：有预填则固定带入、无预填则可编辑
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -57,9 +58,9 @@ const readLastLaunch = (): LastLaunch => {
 };
 
 interface Props {
-  /** 工作项名（标题预填、可改） */
+  /** 工作项名（标题预填、可改；手动入口传空） */
   initialTitle: string;
-  /** 工作项详情页 URL（固定带入 feishuStoryUrl、不可改） */
+  /** 工作项详情页 URL；有值则固定带入、空则表单内可粘贴 */
   feishuStoryUrl: string;
   onCreated: (task: Task) => void;
 }
@@ -67,6 +68,10 @@ interface Props {
 export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Props) => {
   // 任务标题（预填工作项名、可改）
   const [title, setTitle] = useState(initialTitle);
+  // 飞书链接：预填路径用 prop；手动路径本地可编辑（初始空时放开输入）
+  const [storyUrl, setStoryUrl] = useState(feishuStoryUrl);
+  // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入
+  const urlEditable = !feishuStoryUrl.trim();
   // 角色（预填上次的）
   // 角色默认自适应（v1.1.x 用户拍板隐藏选择器）：AI 从需求 + 仓库自己判断视角；
   // 上次启动记忆若有旧值仍尊重（老用户习惯）、但 UI 不再暴露选择
@@ -116,18 +121,33 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     setTitle((cur) => (cur.trim() ? cur : initialTitle));
   }, [initialTitle]);
 
+  // 预填 URL 晚到（query 异步）时补上；手动路径不覆盖用户已粘贴的
+  useEffect(() => {
+    if (feishuStoryUrl.trim()) {
+      setStoryUrl((cur) => (cur.trim() ? cur : feishuStoryUrl));
+    }
+  }, [feishuStoryUrl]);
+
   const canSubmit = useMemo(
     () =>
-      !submitting && !!title.trim() && repoPaths.length > 0 && !!role && !!feishuStoryUrl,
-    [submitting, title, repoPaths, role, feishuStoryUrl],
+      !submitting &&
+      !!title.trim() &&
+      repoPaths.length > 0 &&
+      !!role &&
+      !!storyUrl.trim(),
+    [submitting, title, repoPaths, role, storyUrl],
   );
   // 缺项引导文案（启动置灰时告诉用户差什么、防隐性卡点）
   const missingHint = useMemo(() => {
-    if (!feishuStoryUrl) return "工作项链接缺失、回看板重新进入";
+    if (!storyUrl.trim()) {
+      return urlEditable
+        ? "粘贴飞书工作项链接即可启动"
+        : "工作项链接缺失、回看板重新进入";
+    }
     if (repoPaths.length === 0) return "选个目标仓库即可启动";
     if (!title.trim()) return "填个任务标题即可启动";
     return null;
-  }, [feishuStoryUrl, repoPaths, title]);
+  }, [storyUrl, urlEditable, repoPaths, title]);
 
   const handleLaunch = async () => {
     if (!canSubmit) return;
@@ -164,7 +184,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         role: role || undefined,
         title: title.trim(),
         repoPaths,
-        feishuStoryUrl,
+        feishuStoryUrl: storyUrl.trim(),
         repoBaseBranches:
           Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
         repoFeatureBranches:
@@ -212,6 +232,21 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           placeholder="任务标题"
         />
       </div>
+
+      {/* 飞书链接：仅手动入口（无预填）露出；看板进已带 URL、不占一行 */}
+      {urlEditable && (
+        <div className="grid gap-1.5">
+          <Label htmlFor="l-story-url" required>
+            飞书工作项链接
+          </Label>
+          <Input
+            id="l-story-url"
+            value={storyUrl}
+            onChange={(e) => setStoryUrl(e.target.value)}
+            placeholder="粘贴飞书工作项链接"
+          />
+        </div>
+      )}
 
       {/* 仓库（缺项时琥珀高亮引导） */}
       <div className="grid gap-1.5">

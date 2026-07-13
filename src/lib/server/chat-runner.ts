@@ -701,7 +701,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const settings = await readSettingsFile().catch(() => null);
     const qaRoleDirective =
       settings?.userRole === "qa" && task.repoPaths.length > 0
-        ? buildQaRoleDirective("chat", taskHasGitRepo(task))
+        ? // chat 绑原目录、不传 isolate（buildQaRoleDirective 内按 chat 走「不切分支」）
+          buildQaRoleDirective("chat", taskHasGitRepo(task))
         : "";
     const initialPrompt = buildInitialPrompt(
       task,

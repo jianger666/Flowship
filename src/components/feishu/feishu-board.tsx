@@ -17,6 +17,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { Plug, RefreshCw } from "lucide-react";
 
 import { BoardTimeline } from "@/components/feishu/board-timeline";
@@ -348,9 +349,16 @@ export const FeishuBoard = () => {
           </Select>
         )}
         <Button
+          size="sm"
+          variant="outline"
+          className="ml-auto"
+          render={<Link href="/workitems/new" />}
+        >
+          手动建任务
+        </Button>
+        <Button
           size="icon-xs"
           variant="ghost"
-          className="ml-auto"
           onClick={() => void refresh()}
           disabled={refreshing}
           aria-label="刷新"

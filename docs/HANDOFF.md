@@ -301,20 +301,20 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13 v1.1.7 发版：测试角色专项审查修复 + 工作台手动建任务入口
+
+- **测试角色约定专项审查**（用户点名「拉子代理一起 review 影响点」、逐 action 推演 + prompt 一致性 + 边界场景、报 3 P1）：① 守约定反而必红——review 只读指纹把 HEAD 编进 hash、QA detached 切基线必触发红条；② 非隔离任务切基线会动用户原仓 HEAD；③ ship/dev 准入不看角色、playbook（commit+push+提 MR）与 QA 红线硬对撞
+- **修复**：唯一代码闸 = `checkActionPrerequisites` ship/dev 对 `userRole==="qa"` 直接拒（`QA_ROLE_BLOCK_SHIP_DEV_REASON` 单一文案源、服务端准入 + 推进弹窗灰卡共用；advanceTask 读 settings 传 ctx）；其余全 prompt 文案解——`buildQaRoleDirective` 加 `isolateWorktree` 参数：隔离 task 才教 detached 切基线（含 MR ref 姿势）、非隔离 task / chat 一律「不切分支、当前检出只读验证」；追加通用约束（review 期间不切 commit / 误推 build 只产验证报告 / learn 只写任务目录 / 本约定优先于 playbook）
+- **工作台手动建任务**（用户：有些需求没排到甘特上、看板无入口）：看板头部「手动建任务」按钮 + 空态提示带链接 → 新页 `/workitems/new`（TaskLaunchForm 无预填复用）；表单飞书链接字段——有预填固定带入（看板进）、无预填露出可编辑输入（placeholder「粘贴飞书工作项链接」）、必填语义不变
+- 顺带（v1.1.6 发出后的样式跟进）：推进卡两行方案回退单行 truncate + hover Tooltip 补全名（两行让 grid 行高不齐、用户拍板）；文字 13px→12px + padding 收窄、单行多容一两个字
+
 ### 2026-07-13 v1.1.6 发版：非 git 目录混合隔离 + 测试角色约定 + MCP 去自动导入（蓝军终审 1P0 拦下修完复审过）
 
 - **非 git 目录不再拦推进（混合隔离）**：task 绑的 repoPath 没有 `.git` 时——git 仓照旧建 worktree、非 git 目录跳过隔离原地使用（脚本库无分支概念）。核心：`Task.nonGitRepoPaths` 快照（createTask / updateTaskFields / setTaskRepoPaths 三写点、undefined=全 git 老任务兜底、**不做运行时 existsSync**——防 .git 中途增删映射漂移）；`getTaskWorkRepoPaths` 逐仓映射；**`getTaskCwd` 只对 git worktree 聚合**（终审 P0：混着原路径算公共父会漂到 $HOME、agent cwd / IDE 打开路径 / 兄弟仓扫描全翻车——已修+单测锁死）；`formatRepoSectionForPrompt` 混合模板逐仓标注；client `getRepoWorkDirs` 非 git 用原路径；`planBranchesForBuild` 非 git 跳过 checkout hint
 - **测试角色约定（纯 prompt、零服务端行为改动、用户拍板「简单点」）**：`settings.userRole === "qa"` 时 task（+绑仓 chat）注入 `buildQaRoleDirective`——不改仓库代码/不建分支/不 commit push MR（产物放任务目录或非 git 目录）、验证基线=各仓提测分支（detached 姿势切、显式豁免隔离段「禁止 checkout」）、给了 MR 链接用 `merge-requests/<iid>/head` 原生 ref 拉（不需要分支名/Token）、提测分支多需求集成只验当前需求范围；chat 变体不引用「仓库分支配置」段、纯非 git 任务只注入通用部分
 - **MCP 去 Cursor 全局自动导入**：删 V0.13 `migrateCursorMcpOnce` 整套（新用户首次落盘 config.json 会静默快照 ~/.cursor/mcp.json、用户拍板不可接受）；「从 Cursor 导入」手动链路是唯一导入口；老用户早已迁移完成无影响
-- **推进弹窗 action 卡长名**：首版做成两行 clamp、v1.1.6 发出后用户复盘「两行让 grid 行高不齐」改回固定 h-10 单行 truncate + hover `Tooltip` 补全名（跟侧栏任务行同款约定、发版后改动待下版带出）
+- **推进弹窗 action 卡长名两行**（v1.1.7 已回退成 Tooltip 方案、见上）
 - 流程：4 个 grok 子代理并行实施 → 蓝军终审拦下 1 P0 + 1 P1 + 2 P2 → 修复子代理全修 → 蓝军复审通过；余 3 个文案级 P2 攒下版
-
-### 2026-07-13 v1.1.5 发版：mac Intel（darwin-x64）安装包支持
-
-- **发版矩阵扩三项**：win x64 / mac arm64 / mac x64（arm64 runner 交叉打、`@cursor/sdk-darwin-x64` 平台包对称走 npm pack）；electron-builder.yml mac target 不再写死 arch、CLI `--arm64`/`--x64` 决定（本地 test 打包不带 flag 仍本机架构）
-- **update-manifest 挪 finalize job**：两个 mac job 各签只含自己 dmg 的 manifest 会互相 clobber → finalize 统一 `gh release download` 两枚 dmg（draft、断言恰好 2 枚、少了硬红）→ 一次签进 files[] → upload → 才转正 draft；壳 `verifyDownloadedUpdate` 按 asset 名找条目、多文件 manifest 对老壳向后兼容
-- **壳自更新按 `process.arch` 拼 dmg 名**（main.js、arm64/x64 两处共用 assetName）；README 补 Intel 行
-- 蓝军 review 无 P0；观察点：首个双 mac tag 盯 finalize 的 `gh release download` 对 draft 是否稳（挂了 = 发不出去 fail-closed、不伤存量用户）
 
 ## 关键文件索引
 

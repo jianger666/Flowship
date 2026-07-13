@@ -40,7 +40,13 @@ const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
 export interface PrerequisiteContext {
   gitHost?: string;
   gitToken?: string;
+  /** 设置页「我的角色」；qa 时拒 ship / dev（会 push / 提 MR） */
+  userRole?: string;
 }
+
+/** 测试角色拒 ship / dev 的统一文案（服务端准入 + 推进弹窗灰卡共用口径） */
+export const QA_ROLE_BLOCK_SHIP_DEV_REASON =
+  "测试角色不执行提测 / 联调（会 push 代码提 MR）、请用验证类 action。";
 
 export const checkActionPrerequisites = (
   task: Task,
@@ -66,6 +72,10 @@ export const checkActionPrerequisites = (
       //   不强求先 build（agent 无改动可复核时会在 artifact 自己说明、不报错）。
       return { ok: true };
     case "ship": {
+      // 测试角色硬闸：ship 会 push + 提 MR，与 QA 约定冲突——优先于 host/token 技术校验
+      if (ctx.userRole === "qa") {
+        return { ok: false, reason: QA_ROLE_BLOCK_SHIP_DEV_REASON };
+      }
       // V0.x：去掉「ship 必须先有 build」流程限制（没改动直接 ship、agent 会发现工作区干净自己报）。
       //   保留 GitLab host/token 校验——技术必需（没配真调不了 GitLab API、提不了 MR）、不是流程限制。
       if (!ctx.gitHost || ctx.gitHost.trim().length === 0) {
@@ -89,6 +99,10 @@ export const checkActionPrerequisites = (
       //   没过程可复盘、自己说明、不报错。把判断权交给用户。
       return { ok: true };
     case "dev": {
+      // 测试角色硬闸：联调会 push 到 dev 分支，与 QA 约定冲突——优先于「是否配了 dev 分支」
+      if (ctx.userRole === "qa") {
+        return { ok: false, reason: QA_ROLE_BLOCK_SHIP_DEV_REASON };
+      }
       // V0.x：联调技术准入——至少一个仓配了 dev 分支（dev 分支名没法猜默认、必须设置页显式配）。
       //   没配 dev 分支的仓 agent 会跳过、全没配则这里拦 + 提示去设置页配（同 ship host/token 性质：技术必需、非流程限制）。
       const anyDev = task.repoPaths.some(

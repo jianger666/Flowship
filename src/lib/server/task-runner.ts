@@ -688,9 +688,17 @@ const advanceTaskInner = async (
   // 1) 准入条件（V0.6 门槛 1）
   const effectiveGitHost =
     (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+  // 读设置页角色供 QA 硬闸；失败吞掉当 undefined（别堵推进、非 QA 照常走技术校验）
+  // readSettingsFile 返 Record<string, unknown>——只认 string 角色值
+  const settingsForGate = await readSettingsFile().catch(() => null);
+  const gateUserRole =
+    typeof settingsForGate?.userRole === "string"
+      ? settingsForGate.userRole
+      : undefined;
   const pre = checkActionPrerequisites(task, actionType, {
     gitHost: effectiveGitHost,
     gitToken,
+    userRole: gateUserRole,
   });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
@@ -1571,7 +1579,12 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         settings?.userRole === "qa" &&
         task.mode === "task" &&
         task.repoPaths.length > 0
-          ? buildQaRoleDirective("task", taskHasGitRepo(task))
+          ? // isolateWorktree：隔离才教 detached 切基线；非隔离任务禁切分支（会动原仓 HEAD）
+            buildQaRoleDirective(
+              "task",
+              taskHasGitRepo(task),
+              task.isolateWorktree === true,
+            )
           : "";
       const superPrompt = await buildSuperPrompt(
         task,

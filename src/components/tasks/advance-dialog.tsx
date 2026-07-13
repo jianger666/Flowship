@@ -101,6 +101,10 @@ import type {
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
 // 服务端会双重校验、UI 仅为提示用户「为什么这个 action 不能选」
+// QA 拒 ship/dev 文案与 action-gates.QA_ROLE_BLOCK_SHIP_DEV_REASON 同款（客户端不能 import server 模块）
+const QA_ROLE_BLOCK_SHIP_DEV_REASON =
+  "测试角色不执行提测 / 联调（会 push 代码提 MR）、请用验证类 action。";
+
 const inferDisabledReason = (
   task: Task,
   type: ActionType,
@@ -112,6 +116,8 @@ const inferDisabledReason = (
     resolvedHost?: string | null;
     token?: string;
     devBranches?: Record<string, string>;
+    /** 设置页「我的角色」；qa 时灰掉 ship / dev */
+    userRole?: string;
   } = {},
 ): ReactNode | null => {
   const effectiveHost = ctx.host || ctx.resolvedHost;
@@ -125,6 +131,8 @@ const inferDisabledReason = (
       // V0.x：去掉「review 必须先有 build」流程限制——可直接 review 现状代码找 bug
       return null;
     case "ship":
+      // 测试角色硬闸（与 server action-gates 对齐）——优先于 host/token 提示
+      if (ctx.userRole === "qa") return <>{QA_ROLE_BLOCK_SHIP_DEV_REASON}</>;
       if (!effectiveHost) {
         // 推导请求还在飞（undefined）：不闪警告——server 推进时会再推一次、真推不出那边拦
         if (!ctx.host && ctx.resolvedHost === undefined) return null;
@@ -144,6 +152,8 @@ const inferDisabledReason = (
       // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 自己说明
       return null;
     case "dev": {
+      // 测试角色硬闸（与 server action-gates 对齐）——优先于「是否配了 dev 分支」
+      if (ctx.userRole === "qa") return <>{QA_ROLE_BLOCK_SHIP_DEV_REASON}</>;
       // V0.x：联调技术准入——至少一仓配了 dev 分支（跟 server checkActionPrerequisites 对齐）
       //   优先用设置页实时值（ctx.devBranches）、回退 task 旧快照——设置页刚配的 dev 分支也即时放行
       const devBranches = ctx.devBranches ?? task.repoDevBranches;
@@ -378,6 +388,8 @@ export const AdvanceDialog = ({
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
     {},
   );
+  // 设置页「我的角色」快照——qa 时灰掉 ship / dev（与 server 硬闸对齐）
+  const [userRole, setUserRole] = useState<string | undefined>();
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
   // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
@@ -464,6 +476,8 @@ export const AdvanceDialog = ({
       if (db) devMap[p] = db;
     }
     setLiveDevBranches(devMap);
+    // 角色快照：qa 灰卡 ship/dev；开 dialog 瞬间读、不实时同步
+    setUserRole(s.userRole || undefined);
     // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
     setHasPlanHistory(hasPlanHistoryRef.current);
     // V0.9：读最新布局偏好（顺序 + 显隐）；隐藏项直接不渲染（v0.9.12 删「更多」折叠区、重新启用去 /actions 页）
@@ -544,6 +558,7 @@ export const AdvanceDialog = ({
         ...gitConfig,
         resolvedHost: resolvedGitHost,
         devBranches: liveDevBranches,
+        userRole,
       });
       const selected = actionType === type;
       return (
@@ -608,9 +623,10 @@ export const AdvanceDialog = ({
             ...gitConfig,
             resolvedHost: resolvedGitHost,
             devBranches: liveDevBranches,
+            userRole,
           })
         : null,
-    [task, actionType, gitConfig, resolvedGitHost, liveDevBranches],
+    [task, actionType, gitConfig, resolvedGitHost, liveDevBranches, userRole],
   );
   const canSubmit = useMemo(() => {
     if (submitting) return false;
