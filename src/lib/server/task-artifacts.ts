@@ -4,7 +4,8 @@
  * 职责（action artifact 文件 + 用户上传的读写）：
  *   - 用户上传图片（saveImageAttachments、uploads/ 目录）
  *   - artifact 读（readCurrentActionArtifact）
- *   - artifact 快照 revisions（snapshotActionArtifact / listActionRevisions / readActionRevisionContent）
+ *   - artifact 快照 revisions（snapshotActionArtifact / listActionRevisions /
+ *     readActionRevisionContent / pruneIdenticalRevisions）
  *   - artifact 划除 / 恢复（setActionArtifactExcluded、.excluded/ 隐藏目录物理挪移）
  *
  * 依赖方向（保证无环）：只依赖 types / data-root / task-fs-core、不 import task-fs。
@@ -169,6 +170,22 @@ export const snapshotActionArtifact = async (
     }
     if (content.trim().length === 0) return null;
 
+    // 最新一份 revision 已与即将快照内容相同 → 跳过写入。
+    // 场景：产出审阅中连续插话、AI 没改正文，避免堆一串零差异快照。
+    const list = action.revisions ?? [];
+    if (list.length > 0) {
+      const newest = list[list.length - 1]!;
+      try {
+        const newestContent = await fs.readFile(
+          path.join(taskDir(taskId), newest.path),
+          "utf-8",
+        );
+        if (newestContent === content) return null;
+      } catch {
+        // 读不到 tail 就继续写新快照（不因坏文件挡主流程）
+      }
+    }
+
     const now = Date.now();
     const revRelPath = path.join(
       ACTIONS_DIR,
@@ -186,7 +203,6 @@ export const snapshotActionArtifact = async (
       size: Buffer.byteLength(content, "utf-8"),
     };
 
-    const list = action.revisions ?? [];
     const next = [...list, rev];
 
     while (next.length > MAX_REVISIONS_PER_ACTION) {
@@ -201,6 +217,73 @@ export const snapshotActionArtifact = async (
     meta.updatedAt = now;
     await writeMeta(meta);
     return rev;
+  });
+
+/**
+ * 清掉「尾部与当前正文完全相同」的 revision 快照（文件 + meta）。
+ *
+ * 背景：question 路由对任何插话都先 snapshot（分不清问/改）——用户只问句、AI 没改
+ * artifact → 快照 === 正文 → UI 修订开关/红点误亮、打开零差异。
+ *
+ * 语义：只清尾部连续相同（从最新往旧走、遇第一份不同就停）。历史中间的不同快照
+ * 一律保留——那是真改过的版本；多份连续相同一并清（连续插话堆出来的）。
+ *
+ * 当前 artifact 读不到 / 无 revisions → no-op。走 withTaskLock，与 snapshot / GC 同锁。
+ */
+export const pruneIdenticalRevisions = async (
+  taskId: string,
+  actionId: string,
+): Promise<void> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return;
+
+    const action = meta.actions.find((a) => a.id === actionId);
+    if (!action?.revisions?.length || !action.artifactPath) return;
+
+    let current: string;
+    try {
+      current = await fs.readFile(
+        path.join(taskDir(taskId), action.artifactPath),
+        "utf-8",
+      );
+    } catch {
+      // 当前 artifact 读不到 → 无法判定相同、不动 revisions
+      return;
+    }
+
+    // 升序后从尾部 pop：只动「最新往旧」的连续相同段
+    const kept = [...action.revisions].sort(
+      (a, b) => a.timestamp - b.timestamp,
+    );
+    let removed = false;
+
+    while (kept.length > 0) {
+      const newest = kept[kept.length - 1]!;
+      let revContent: string;
+      try {
+        revContent = await fs.readFile(
+          path.join(taskDir(taskId), newest.path),
+          "utf-8",
+        );
+      } catch {
+        // 文件缺失无法比内容 → 停下，避免误删更早的真历史
+        break;
+      }
+      if (revContent !== current) break;
+
+      await fs
+        .unlink(path.join(taskDir(taskId), newest.path))
+        .catch(() => {});
+      kept.pop();
+      removed = true;
+    }
+
+    if (!removed) return;
+
+    action.revisions = kept;
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
   });
 
 export const listActionRevisions = async (

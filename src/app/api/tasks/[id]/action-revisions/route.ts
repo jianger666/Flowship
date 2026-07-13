@@ -16,6 +16,7 @@
 import { NextResponse } from "next/server";
 import {
   listActionRevisions,
+  pruneIdenticalRevisions,
   readCurrentActionArtifact,
 } from "@/lib/server/task-artifacts";
 
@@ -33,6 +34,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
     if (!actionId || !/^[a-zA-Z0-9_-]+$/.test(actionId)) {
       return NextResponse.json({ error: "actionId 必填且只允许字母数字下划线" }, { status: 400 });
     }
+
+    // 先清尾部与当前正文相同的快照（问句插话堆出来的零差异），失败吞错不挡 list
+    await pruneIdenticalRevisions(id, actionId).catch((err) => {
+      console.warn(
+        `[action-revisions] pruneIdenticalRevisions 失败 task=${id} action=${actionId}（吞错继续）：`,
+        err,
+      );
+    });
 
     const [revisions, current] = await Promise.all([
       listActionRevisions(id, actionId),
