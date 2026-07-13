@@ -5,7 +5,7 @@
  *
  * 数据源 /api/feishu/workitem——meegle workitem get 的响应没有公开 schema、
  * 这里做「已知字段精排 + 其余字段兜底表格」两层渲染：
- * - 精排：名称 / 状态 / 描述（markdown）/ 排期
+ * - 精排：名称 / 状态 / 排期（描述在预览页不展示、用户拍板）
  * - 兜底：workitem_fields 里 value 非空的字段两列表格（field_name: value）
  */
 
@@ -14,7 +14,6 @@ import { ExternalLink } from "lucide-react";
 
 import { LoadingState } from "@/components/ui/loading-state";
 import { EmptyHint } from "@/components/ui/empty-hint";
-import { MarkdownText } from "@/components/tasks/event-stream/rows";
 import { settingsUrl } from "@/lib/settings-link";
 
 interface Props {
@@ -140,9 +139,8 @@ export const WorkitemDetail = ({ workItemId, projectKey, url }: Props) => {
 
   const { detail } = state;
   const name = pickStr(detail, ["name", "work_item_name", "title"]);
-  const description = pickStr(detail, ["description", "desc"]);
   const rows = fieldRows(detail);
-  // description 常同时出现在 workitem_fields 里、精排展示过就从兜底表格剔除
+  // 预览页不展示描述（用户拍板）、兜底表格里也把描述字段剔除、避免以原始文本形式漏出
   const restRows = rows.filter(([k]) => !["描述", "description"].includes(k));
 
   return (
@@ -162,14 +160,6 @@ export const WorkitemDetail = ({ workItemId, projectKey, url }: Props) => {
             </a>
           )}
         </div>
-      )}
-
-      {description ? (
-        <div className="rounded-md border bg-card/50 px-4 py-3 text-sm leading-relaxed">
-          <MarkdownText text={description} />
-        </div>
-      ) : (
-        <EmptyHint size="sm">工作项没有描述内容</EmptyHint>
       )}
 
       {restRows.length > 0 && (
