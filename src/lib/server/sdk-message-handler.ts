@@ -84,10 +84,16 @@ export const handleSdkMessage = async (
           (argsAny.file_path as string | undefined) ??
           (argsAny.path as string | undefined))
         : undefined;
+      // Windows agent 写路径常用反斜杠（`…\actions\1-custom.md`）；匹配前先归一成 `/`，
+      // 否则 `includes("/actions/")` 与正则 `actions\/…` 全漏 →「在写 artifact」事件和
+      // artifactUpdatedAt 刷新都不触发、面板停在「没有产物」。
+      const normalizedTarget = possibleTarget
+        ? possibleTarget.replace(/\\/g, "/")
+        : undefined;
       if (
-        possibleTarget &&
-        (possibleTarget.includes("/actions/") ||
-          possibleTarget.startsWith("actions/"))
+        normalizedTarget &&
+        (normalizedTarget.includes("/actions/") ||
+          normalizedTarget.startsWith("actions/"))
       ) {
         if (msg.status === "running") {
           const argsStr = stringifyMeta(msg.args);
@@ -116,7 +122,7 @@ export const handleSdkMessage = async (
         // （artifactPath 在 appendAction 建 action 时已预设成 actions/<n>-<type>.md、文件在即可读、
         //   这里只需触发一次「文件变了、来重读」的信号）
         {
-          const m = possibleTarget.match(/actions\/(\d+)-[a-z]+\.md$/);
+          const m = normalizedTarget.match(/actions\/(\d+)-[a-z]+\.md$/);
           if (m) {
             const n = Number(m[1]);
             const fresh = await getTask(taskId);

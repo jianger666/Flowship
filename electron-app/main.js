@@ -16,7 +16,15 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { promises as fs, mkdirSync, createReadStream, createWriteStream, readdirSync } from "node:fs";
+import {
+  promises as fs,
+  mkdirSync,
+  createReadStream,
+  createWriteStream,
+  readdirSync,
+  existsSync,
+  readFileSync,
+} from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -622,10 +630,12 @@ ipcMain.on("set-titlebar-overlay", (_e, opts) => {
 // 已就绪的新版本号（null = 无更新待装）
 let updateReadyVersion = null;
 
-// 更新动作模式（installUpdateNow 据此分平台路径、两端 UX 已对齐：点按钮→下载→完成重启）：
+// 更新动作模式（installUpdateNow 据此分平台路径）：
 // - win="install"：electron-updater、autoDownload=false → 点按钮才 downloadUpdate、下载完 quitAndInstall
-// - mac="download"：未签名跑不了 Squirrel.Mac，走壳内自更新（fetch dmg 无 quarantine + ditto 替换自身、见 macSelfUpdate）
+// - mac="download"：未签名跑不了 Squirrel.Mac，走壳内延迟自更新（下载暂存 → 立即替换重启 / 稍后退出时替换，见 downloadAndStageMacUpdate）
 const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
+// 退出时正在套用暂存包——before-quit preventDefault 防重入
+let applyingStagedOnQuit = false;
 const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 
 // 「该版本是否已弹过对话框」持久化——同一个新版本只弹一次原生弹窗、
@@ -653,7 +663,7 @@ const markPrompted = async (version) => {
 //  did-finish-load 时重注入、页面刷新也不丢标识）
 const notifyPageUpdateReady = () => {
   if (!mainWindow || !updateReadyVersion) return;
-  // win/mac 现在行为一致（都是点按钮→下载→完成重启）、不再注入 __appUpdateMode 区分文案
+  // win/mac 都点亮「新版本」徽标；mac 此时可能已暂存完毕、点徽标走 apply+relaunch
   const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.dispatchEvent(new Event("app-update-ready"));`;
   mainWindow.webContents.executeJavaScript(js).catch(() => {});
 };
@@ -666,22 +676,85 @@ const execFileStrict = (cmd, args) =>
     );
   });
 
-// 启动清扫（V0.10.1）：
+// 三段式版本比较：a 比 b 新返回 true（清扫 / 暂存套用 / 查更新共用，须放在调用方之前）
+const isNewer = (a, b) => {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+};
+
+// updates/ 目录 + 暂存元信息路径（mac 延迟替换：dmg 验完 ditto 到 staged-*.app，不碰 /Applications）
+const updatesDirPath = () => path.join(app.getPath("userData"), "updates");
+const stagedMetaFile = () => path.join(updatesDirPath(), "staged.json");
+const pendingRestartMarker = () =>
+  path.join(app.getPath("userData"), "data", "update-pending-restart.json");
+
+// 读暂存元信息；损坏 / 缺文件返 null
+const readStagedMeta = async () => {
+  try {
+    const meta = JSON.parse(await fs.readFile(stagedMetaFile(), "utf8"));
+    if (!meta?.version || !meta?.appPath) return null;
+    return meta;
+  } catch {
+    return null;
+  }
+};
+
+const writeStagedMeta = async (meta) => {
+  mkdirSync(updatesDirPath(), { recursive: true });
+  await fs.writeFile(stagedMetaFile(), JSON.stringify(meta), "utf8");
+};
+
+// 清 staged.json + 可选清 staged-*.app（meta 缺失时仍尽量扫掉过期 staged 包）
+const clearStagedUpdate = async (meta) => {
+  if (meta?.appPath) {
+    await fs.rm(meta.appPath, { recursive: true, force: true }).catch(() => {});
+  }
+  await fs.rm(stagedMetaFile(), { force: true }).catch(() => {});
+};
+
+// 当前运行中的 .app 包路径（execPath = <app>.app/Contents/MacOS/<bin>）
+const runningAppPath = () => path.resolve(process.execPath, "..", "..", "..");
+
+// 启动清扫（V0.10.1 + 延迟替换）：
 // 1. 删「更新就位、等重启」marker——能跑到这说明已经在新 bundle 上、server 不用再拦
-// 2. 清 updates/ 残留（old-*.app 暂存旧包 / mnt-* 挂载点 / *.dmg）——替换现场的 rm
-//    偶发失败且早前被静默吞（实测积了 4 份 200MB+ 旧包）、启动时统一兜底
+// 2. 清 updates/ 残留（old-*.app / mnt-* / *.dmg）；staged-*.app / staged.json 仅当版本 ≤ 当前才清
+//    （有效暂存要留给退出替换 / 徽标「立即更新」、绝不能启动一把清掉）
 const cleanupUpdateLeftovers = async () => {
-  const marker = path.join(app.getPath("userData"), "data", "update-pending-restart.json");
-  await fs.rm(marker, { force: true }).catch(() => {});
-  const updatesDir = path.join(app.getPath("userData"), "updates");
+  await fs.rm(pendingRestartMarker(), { force: true }).catch(() => {});
+  const updatesDir = updatesDirPath();
   let entries = [];
   try {
     entries = readdirSync(updatesDir);
   } catch {
     return; // 没 updates 目录、没得清
   }
+  const current = app.getVersion();
+  const stagedMeta = await readStagedMeta();
+  // 有效暂存（版本比当前新且 .app 还在）→ 保留，其余 staged 过期清掉
+  const keepStagedPath =
+    stagedMeta &&
+    isNewer(stagedMeta.version, current) &&
+    existsSync(stagedMeta.appPath)
+      ? path.resolve(stagedMeta.appPath)
+      : null;
+  if (stagedMeta && !keepStagedPath) {
+    log(
+      `[updater] 启动清扫过期暂存 v${stagedMeta.version}（当前 v${current} 或包已丢）`,
+    );
+    await clearStagedUpdate(stagedMeta);
+  }
   for (const name of entries) {
     const p = path.join(updatesDir, name);
+    // 保留有效暂存包 + 其元信息
+    if (name === "staged.json" && keepStagedPath) continue;
+    if (name.startsWith("staged-") && name.endsWith(".app")) {
+      if (keepStagedPath && path.resolve(p) === keepStagedPath) continue;
+      // 孤儿 / 过期 staged-*.app
+    }
     // 历史挂载点可能还挂着 dmg、先卸再删（fail-open）
     if (name.startsWith("mnt-")) await execFileP("hdiutil", ["detach", p, "-quiet"]);
     try {
@@ -756,26 +829,50 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
   log(`[updater] manifest 验签 + dmg 摘要校验通过（${assetName}）`);
 };
 
-// mac 应用内自更新（v0.7.12）：壳自己下载 dmg → 替换 /Applications 里的自己 → 重启生效。
-// 关键原理：quarantine 隔离标记只有浏览器等下载器会打、壳进程 fetch 落盘的文件没有
-// → Gatekeeper 不评估 → 免开发者证书实现「类自动更新」、解决用户实测痛点
-// 「每版都要去 系统设置→隐私与安全性 放行 + 输密码」。
-// CR-02：下载完先过 verifyDownloadedUpdate（签名 manifest + SHA-256）再 attach 替换。
-const macSelfUpdate = async (version) => {
+// ---------- mac 延迟自更新（下载暂存 ≠ 立刻替换） ----------
+//
+// 历史（为什么不再立刻替换 /Applications）：
+// 旧链路（V0.7.12~V0.10.x）下载验签完立刻 ditto 覆盖 /Applications 里的 .app，
+// 再弹「立即重启 / 稍后」。用户点「稍后」= 老进程继续跑 + 磁盘已是新包 →
+// SDK agent 的 shell（cursorsandbox / zsh state-dump helper）按旧路径 lazy-load
+// 资源与新 bundle 失配，永久挂死（v0.9.10→14 / 正式包「稍后重启」线上确诊）。
+// V0.10.1 加了 update-pending-restart.json 硬闸（server 拒起新任务），体验仍差：
+// 点「稍后」就废了、必须重启。
+//
+// 现策略：下载 + 验签 + 挂载后只 ditto 到 userData/updates/staged-<ver>.app，
+// **全程不碰 /Applications**。替换只发生在三个时机：
+//   1) 用户点「立即更新」→ apply + relaunch
+//   2) 用户点「稍后」后正常退出 → before-quit 里 apply（不 relaunch）
+//   3) 退出替换失败 → 下次启动早期 apply + relaunch（窗口未开、无感知）
+// 老进程始终跑在没被动过的老包上，「稍后」完全可用。
+//
+// 原理旁注：quarantine 只有浏览器等下载器会打、壳 fetch 落盘无 quarantine →
+// Gatekeeper 不评估 → 免开发者证书。CR-02：attach 前过 verifyDownloadedUpdate。
+
+// 阶段 1：下载 dmg → 验签 → attach → ditto 到暂存目录；不碰 /Applications。
+// 已有同版本有效暂存则跳过（轮询 / 徽标重入友好）。
+const downloadAndStageMacUpdate = async (version) => {
+  const existing = await readStagedMeta();
+  if (existing?.version === version && existsSync(existing.appPath)) {
+    log(`[updater] v${version} 已暂存于 ${existing.appPath}、跳过下载`);
+    return existing;
+  }
+  // 换版本 / 暂存损坏：清掉旧暂存再下
+  if (existing) await clearStagedUpdate(existing);
+
   // Intel 包 v1.1.5 起提供、老版本 x64 用户不存在所以不用考虑兼容
   const dmgArch = process.arch === "arm64" ? "arm64" : "x64";
   const assetName = `fe-ai-flow-${version}-mac-${dmgArch}.dmg`;
   const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/${assetName}`;
-  // 当前 .app 包路径：execPath = <app>.app/Contents/MacOS/<bin>、往上三层
-  const appPath = path.resolve(process.execPath, "..", "..", "..");
+  const appPath = runningAppPath();
   if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
-    // 非常规安装位置（如直接在 dmg 里跑）、替换无意义 → 降级开下载页
-    void shell.openExternal(RELEASE_LATEST_URL);
-    return;
+    // 非常规安装位置（如直接在 dmg 里跑）——抛给调用方降级开下载页
+    throw new Error("非常规安装位置、无法自更新");
   }
-  const updatesDir = path.join(app.getPath("userData"), "updates");
+  const updatesDir = updatesDirPath();
   const dmgPath = path.join(updatesDir, `v${version}.dmg`);
   const mountPoint = path.join(updatesDir, `mnt-${Date.now()}`);
+  const stagedAppPath = path.join(updatesDir, `staged-${version}.app`);
   try {
     mkdirSync(updatesDir, { recursive: true });
     log(`[updater] 下载 ${dmgUrl}`);
@@ -795,16 +892,12 @@ const macSelfUpdate = async (version) => {
     );
     mainWindow?.setProgressBar(-1);
 
-    // 完整性校验：下到残缺包就直接中止、绝不拿残缺 dmg 去 attach + ditto 替换 app。
-    // v0.8.0 自更新踩过：重复触发时 GitHub asset 还在传、只下到 1.78MB 残缺包、
-    // ditto 拷到一半报 Unknown error 1000、还把已挪走的旧 app 搞成半新半旧。
-    // 这里在 attach / rename 之前拦掉、残缺直接 throw → 走 catch 降级下载页、app 完全不动。
+    // 完整性校验：下到残缺包就直接中止（v0.8.0 踩过残缺 dmg → ditto 半新半旧）
     if (total && got !== total) {
-      throw new Error(`dmg 下载不完整（${got}/${total} 字节）、已中止替换`);
+      throw new Error(`dmg 下载不完整（${got}/${total} 字节）、已中止暂存`);
     }
 
-    // CR-02：签名 manifest 校验（Ed25519 验签 + SHA-256 + 大小）——在 attach / 替换
-    // 之前拦掉被篡改的包、验不过直接 throw 走 catch 降级、旧应用一动不动
+    // CR-02：签名 manifest 校验——在 attach 之前拦掉被篡改的包
     await verifyDownloadedUpdate(version, dmgPath, assetName);
 
     await execFileStrict("hdiutil", [
@@ -813,52 +906,142 @@ const macSelfUpdate = async (version) => {
     const newApp = readdirSync(mountPoint).find((n) => n.endsWith(".app"));
     if (!newApp) throw new Error("dmg 里没找到 .app");
 
-    // 替换：旧 app 先挪到暂存（userData 跟 /Applications 同卷、rename 原子）、
-    // ditto 新 app 就位（保留签名 / 权限 / xattr）、失败回滚旧的
-    const stagedOld = path.join(updatesDir, `old-${Date.now()}.app`);
-    log(`[updater] 替换 ${appPath}`);
-    await fs.rename(appPath, stagedOld);
+    // 拷到暂存（保留签名 / 权限 / xattr）；失败则清半成品、/Applications 未动
+    await fs.rm(stagedAppPath, { recursive: true, force: true }).catch(() => {});
+    log(`[updater] 暂存 ${stagedAppPath}`);
+    await execFileStrict("ditto", [path.join(mountPoint, newApp), stagedAppPath]);
+    const meta = { version, appPath: stagedAppPath };
+    await writeStagedMeta(meta);
+    log(`[updater] v${version} 已暂存、等待立即更新或退出时替换`);
+    return meta;
+  } finally {
+    mainWindow?.setProgressBar(-1);
+    await execFileP("hdiutil", ["detach", mountPoint, "-quiet"]);
+    await fs.rm(dmgPath, { force: true }).catch(() => {});
+  }
+};
+
+// 阶段 2：把暂存 .app 替换到当前 appPath。
+// relaunch=true → 写 pending marker（立即更新防御窗）+ relaunch；
+// pendingMarker=false → 启动兜底路径用（替换后清 marker，马上 relaunch 进新包）。
+// 失败 throw、调用方决定是否挡退出 / 降级开下载页；回滚旧 app。
+const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) => {
+  const meta = await readStagedMeta();
+  if (!meta?.version || !meta?.appPath) {
+    throw new Error("没有有效的暂存更新");
+  }
+  if (!existsSync(meta.appPath)) {
+    await clearStagedUpdate(meta);
+    throw new Error(`暂存包丢失（${meta.appPath}）`);
+  }
+  const appPath = runningAppPath();
+  if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
+    throw new Error("非常规安装位置、无法套用暂存更新");
+  }
+  const updatesDir = updatesDirPath();
+  mkdirSync(updatesDir, { recursive: true });
+  // 旧 app 先挪到暂存（同卷 rename 原子）；新包同卷 rename 优先、跨卷再 ditto
+  const stagedOld = path.join(updatesDir, `old-${Date.now()}.app`);
+  log(`[updater] 套用暂存 v${meta.version} → ${appPath}`);
+  await fs.rename(appPath, stagedOld);
+  try {
     try {
-      await execFileStrict("ditto", [path.join(mountPoint, newApp), appPath]);
-    } catch (err) {
-      await fs.rename(stagedOld, appPath).catch(() => {});
-      throw err;
+      await fs.rename(meta.appPath, appPath);
+    } catch {
+      // EXDEV 等跨卷：ditto 拷过去再删源
+      await execFileStrict("ditto", [meta.appPath, appPath]);
+      await fs.rm(meta.appPath, { recursive: true, force: true }).catch(() => {});
     }
-    // 失败别静默吞（实测 updates/ 积过 4 份旧包）——记日志、启动清扫兜底再清
-    await fs.rm(stagedOld, { recursive: true, force: true }).catch((err) => {
-      log(`[updater] 清理暂存旧包失败（启动时兜底再清）${err?.message || err}`);
-    });
+  } catch (err) {
+    await fs.rename(stagedOld, appPath).catch(() => {});
+    throw err;
+  }
+  await fs.rm(stagedOld, { recursive: true, force: true }).catch((err) => {
+    log(`[updater] 清理暂存旧包失败（启动时兜底再清）${err?.message || err}`);
+  });
+  // 元信息消费掉（包已 rename 走或已删）
+  await fs.rm(stagedMetaFile(), { force: true }).catch(() => {});
 
-    // ⚠️ 这里故意**不** rename 磁盘文件名（蓝军 P0 拦下）：改名后用户点「稍后」
-    // = 运行中进程继续按旧路径 lazy-load 资源、必坏。文件名迁移统一交给下次启动的
-    // maybeSelfRenameOnMac（rename → 立即重启接力、不存在带病续跑窗口）。
+  // ⚠️ 故意不改磁盘文件名（蓝军 P0）：改名后若进程继续跑必坏；交给 maybeSelfRenameOnMac。
 
-    // 关键 marker（V0.10.1）：bundle 已被替换、但本进程还是老版本——用户点「稍后」期间
-    // server 起新 agent run 必挂死（SDK 沙箱 shell helper 与新 bundle 失配、v0.9.10→14 实测事故）。
-    // 落 marker 到 data/ 让 server 入口硬拦；壳下次启动（= 已跑新版本）时删。
+  if (pendingMarker) {
+    // 「立即更新」路径：替换完到 relaunch 之间的极短窗口仍写硬闸（V0.10.1 防御保留）
     try {
-      const marker = path.join(app.getPath("userData"), "data", "update-pending-restart.json");
+      const marker = pendingRestartMarker();
       mkdirSync(path.dirname(marker), { recursive: true });
-      await fs.writeFile(marker, JSON.stringify({ version, at: Date.now() }));
+      await fs.writeFile(
+        marker,
+        JSON.stringify({ version: meta.version, at: Date.now() }),
+      );
     } catch (err) {
       log(`[updater] 写待重启 marker 失败（忽略）${err?.message || err}`);
     }
+  } else {
+    // 启动兜底 / 退出替换：清掉 marker，避免新进程误拦
+    await fs.rm(pendingRestartMarker(), { force: true }).catch(() => {});
+  }
 
-    log(`[updater] v${version} 已就位、等用户重启`);
-    const { response } = await dialog.showMessageBox(mainWindow, {
-      type: "info",
-      title: "更新完成",
-      message: `已更新到 v${version}`,
-      detail: "重启应用后生效。",
-      buttons: ["立即重启", "稍后"],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (response === 0) {
-      quitting = true;
-      app.relaunch();
-      app.quit();
-    }
+  log(`[updater] v${meta.version} 已就位${relaunch ? "、即将重启" : "（退出路径、下次打开即新版）"}`);
+  if (relaunch) {
+    quitting = true;
+    app.relaunch();
+    app.exit(0);
+  }
+};
+
+// 启动早期兜底：有比当前新的暂存 → 立刻套用并 relaunch（窗还没开、用户无感知）；
+// 暂存版本 ≤ 当前（已手动升过 / 退出时已装上）→ 清暂存。返 true = 本进程要退。
+const tryApplyStagedUpdateOnLaunch = async () => {
+  if (!IS_MAC || !app.isPackaged || IS_TEST) return false;
+  const meta = await readStagedMeta();
+  if (!meta) return false;
+  const current = app.getVersion();
+  if (!isNewer(meta.version, current)) {
+    log(`[updater] 启动清过期暂存 v${meta.version}（当前 v${current}）`);
+    await clearStagedUpdate(meta);
+    return false;
+  }
+  if (!existsSync(meta.appPath)) {
+    log(`[updater] 启动发现暂存元信息但包丢失、清 meta`);
+    await clearStagedUpdate(meta);
+    return false;
+  }
+  try {
+    log(`[updater] 启动兜底套用暂存 v${meta.version}`);
+    // pendingMarker=false：替换后清硬闸，马上 relaunch 进新包
+    await applyStagedUpdate({ relaunch: true, pendingMarker: false });
+    return true; // relaunch 后通常走不到这；防守返回
+  } catch (err) {
+    // 替换失败不挡启动——保留暂存下次再试、老包继续跑
+    log(`[updater] 启动兜底套用失败（保留暂存、继续启动）${err?.message || err}`);
+    return false;
+  }
+};
+
+// 退出时套用暂存（不 relaunch）。失败不阻塞退出——下次启动 tryApplyStagedUpdateOnLaunch 再试。
+const applyStagedUpdateOnQuit = async () => {
+  if (!IS_MAC || !app.isPackaged || IS_TEST) return;
+  const meta = await readStagedMeta();
+  if (!meta || !isNewer(meta.version, app.getVersion())) return;
+  if (!existsSync(meta.appPath)) {
+    await clearStagedUpdate(meta);
+    return;
+  }
+  try {
+    log(`[updater] 退出时套用暂存 v${meta.version}`);
+    await applyStagedUpdate({ relaunch: false, pendingMarker: false });
+  } catch (err) {
+    log(`[updater] 退出时套用失败（不挡退出、下次启动再试）${err?.message || err}`);
+  }
+};
+
+// mac 发现新版后的入口（保留函数名、供 installUpdateNow 调用）：
+// 下载暂存（已暂存则跳过）→ 立刻套用并 relaunch。
+// 「稍后」不走这里——只由 promptUpdateOnce 取消分支 / 退出钩子处理。
+const macSelfUpdate = async (version) => {
+  try {
+    await downloadAndStageMacUpdate(version);
+    await applyStagedUpdate({ relaunch: true });
   } catch (err) {
     log(`[updater] 自更新失败：${err?.message || err}、降级开下载页`);
     dialog.showErrorBox(
@@ -868,19 +1051,16 @@ const macSelfUpdate = async (version) => {
     void shell.openExternal(RELEASE_LATEST_URL);
   } finally {
     mainWindow?.setProgressBar(-1);
-    // detach / 清 dmg 都 fail-open（没挂上 / 已弹出都无所谓）
-    await execFileP("hdiutil", ["detach", mountPoint, "-quiet"]);
-    await fs.rm(dmgPath, { force: true }).catch(() => {});
   }
 };
 
 // 应用更新（页面点「新版本」标识、或对话框确认走到这）：
-// mac 壳内下载替换自身；win 此刻才开始下载（autoDownload=false、对齐 mac「点按钮才下载」）、
-// 下载完由 update-downloaded 监听器弹「立即重启」→ quitAndInstall（before-quit 兜底杀 server、不留孤儿）。
+// mac：确保已暂存 → apply + relaunch（「稍后」留下的暂存在此套用；未暂存则先下）
+// win：此刻才开始下载（autoDownload=false）、下载完弹「立即重启」→ quitAndInstall
 const installUpdateNow = async () => {
   if (!updateReadyVersion) return;
   if (UPDATE_MODE === "download") {
-    log(`[updater] mac 自更新开始（v${updateReadyVersion}）`);
+    log(`[updater] mac 套用更新（v${updateReadyVersion}）`);
     await macSelfUpdate(updateReadyVersion);
     return;
   }
@@ -925,16 +1105,6 @@ const fetchLatestVersion = async () => {
   return m ? m[1] : null;
 };
 
-// 三段式版本比较：a 比 b 新返回 true
-const isNewer = (a, b) => {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
-  }
-  return false;
-};
-
 // 每 2 小时轮询一次更新——app 长期开着不关（同事习惯）也能收到新版提醒、
 // 不止在启动时查一次（v0.7.22）。同版本只弹一次靠 promptUpdateOnce 的 wasPrompted 去重。
 const UPDATE_POLL_MS = 2 * 60 * 60 * 1000;
@@ -951,7 +1121,7 @@ const ensureWinAutoUpdater = async () => {
   const { default: updater } = await import("electron-updater");
   winAutoUpdater = updater.autoUpdater;
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
-  // 下载进度 → 任务栏进度条（对齐 mac macSelfUpdate 的 Dock 进度条）
+  // 下载进度 → 任务栏进度条（对齐 mac downloadAndStageMacUpdate 的 Dock 进度条）
   winAutoUpdater.on("download-progress", (p) => {
     if (mainWindow && typeof p?.percent === "number") mainWindow.setProgressBar(p.percent / 100);
   });
@@ -981,9 +1151,10 @@ const ensureWinAutoUpdater = async () => {
   return winAutoUpdater;
 };
 
-// 查一次更新（启动 + 每 2h 轮询都走这）。win/mac 逻辑已对齐：只查「有没有新版」、不下载；
-// 查到 → 点亮页面右上角「新版本」标识 + 弹一次「发现新版本」框（wasPrompted 去重、同版本不重复骚扰）。
-// 区别仅「怎么查版本号」：win 走 electron-updater checkForUpdates 拿 updateInfo、mac 查 GitHub release tag。
+// 查一次更新（启动 + 每 2h 轮询都走这）。
+// win：只查版本号、点按钮才下载（electron-updater autoDownload=false）。
+// mac：查到新版后立刻后台下载暂存（不碰 /Applications）→ 弹一次「立即更新 / 稍后」；
+//       立即 = apply+relaunch；稍后 = 暂存留着、退出时再套用、徽标可再点立即。
 const runUpdateCheck = async () => {
   try {
     const current = app.getVersion();
@@ -999,9 +1170,29 @@ const runUpdateCheck = async () => {
     updateReadyVersion = latest;
     log(`[updater] 发现新版本 v${latest}（当前 v${current}）`);
     notifyPageUpdateReady();
+
+    // mac：先下载暂存（已暂存同版本则跳过），完成后再弹框——保证「立即」只做替换重启
+    if (UPDATE_MODE === "download") {
+      try {
+        await downloadAndStageMacUpdate(latest);
+      } catch (err) {
+        // 后台轮询失败不弹 error box（免 2h 骚扰）；徽标已亮、点徽标会重试并提示
+        log(`[updater] mac 暂存失败（忽略、等用户点徽标重试）${err?.message || err}`);
+        return;
+      }
+      await promptUpdateOnce(latest, {
+        message: `新版本 v${latest} 已就绪`,
+        detail:
+          "点「立即更新」替换并重启；点「稍后」继续用当前版本，退出应用时自动装上。也可随时点右上角「新版本」。",
+        confirmLabel: "立即更新",
+      });
+      return;
+    }
+
     await promptUpdateOnce(latest, {
       message: `新版本 v${latest} 已发布`,
-      detail: "点「立即更新」自动下载安装（进度在任务栏 / Dock 显示）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
+      detail:
+        "点「立即更新」自动下载安装（进度在任务栏显示）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
       confirmLabel: "立即更新",
     });
   } catch (err) {
@@ -1077,7 +1268,10 @@ if (!app.requestSingleInstanceLock()) {
     if (await maybeSelfRenameOnMac()) return;
     // 改名接力后的首次启动：提示重新固定 Dock（一次性）
     void notifyRenameOnce();
-    // 删待重启 marker + 清 updates/ 残留（不阻塞启动、fail-open）
+    // mac 延迟更新：启动早期若有比当前新的暂存 → 立刻套用并 relaunch（窗未开、无感知）
+    // 必须在 cleanup 之前——cleanup 会保留有效暂存，但套用失败时也别先误清
+    if (await tryApplyStagedUpdateOnLaunch()) return;
+    // 删待重启 marker + 清 updates/ 残留（保留版本仍新于当前的 staged；不阻塞启动、fail-open）
     void cleanupUpdateLeftovers();
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默
     try {
@@ -1131,14 +1325,40 @@ if (!app.requestSingleInstanceLock()) {
     app.quit();
   });
 
-  // 兜底：任何退出路径（含 autoUpdater quitAndInstall）都别留 server 孤儿
-  app.on("before-quit", () => {
+  // 退出路径：杀 server 孤儿 + mac 套用暂存更新（不 relaunch）。
+  // ditto 跨卷可能慢 → preventDefault 等替换完再 exit；失败不挡退出（启动兜底再试）。
+  app.on("before-quit", (event) => {
     quitting = true;
     if (serverProc) {
       try {
         serverProc.kill("SIGKILL");
       } catch {
         // 已退、忽略
+      }
+    }
+    if (applyingStagedOnQuit) return; // 套用完二次 exit、不再进
+    // 仅 packaged mac 正式包；有有效暂存才拦截
+    if (IS_MAC && app.isPackaged && !IS_TEST) {
+      // 同步探一下有没有值得套用的暂存（避免无意义 preventDefault）
+      const metaPath = stagedMetaFile();
+      let shouldApply = false;
+      try {
+        if (existsSync(metaPath)) {
+          const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+          shouldApply =
+            meta?.version &&
+            isNewer(meta.version, app.getVersion()) &&
+            existsSync(meta.appPath);
+        }
+      } catch {
+        shouldApply = false;
+      }
+      if (shouldApply) {
+        event.preventDefault();
+        applyingStagedOnQuit = true;
+        void applyStagedUpdateOnQuit().finally(() => {
+          app.exit(0);
+        });
       }
     }
   });

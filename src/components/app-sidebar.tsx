@@ -32,7 +32,7 @@ import { useAppMode } from "@/hooks/use-app-mode";
 import { useDialog } from "@/hooks/use-dialog";
 import { useNewChat } from "@/hooks/use-new-chat";
 import { useTaskList } from "@/hooks/use-task-list";
-import { deleteTask, setTaskPinned } from "@/lib/task-store";
+import { setTaskPinned } from "@/lib/task-store";
 import { cn } from "@/lib/utils";
 import type { Task, TaskSummary } from "@/lib/types";
 
@@ -43,7 +43,14 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
   const router = useRouter();
   const params = useParams<{ id?: string }>();
   const activeId = params?.id;
-  const { tasks, loaded, upsertTask, removeTask, refresh } = useTaskList();
+  const {
+    tasks,
+    loaded,
+    upsertTask,
+    refresh,
+    deletingIds,
+    deleteTaskById,
+  } = useTaskList();
   const { confirm } = useDialog();
   // 当前模式（顶栏胶囊同源）——决定列表过滤 + 顶部按钮形态
   const mode = useAppMode();
@@ -101,8 +108,10 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     }
   };
 
-  // 删除：二次确认 → 乐观移除 → 删的是当前任务则回本模式首页 → 失败 refresh 兜底找回
+  // 删除：确认 → deleteTaskById（锁 id 后立刻离开详情 / 404 幂等）
   const handleDelete = async (task: TaskSummary) => {
+    // 删除中禁二次点（按钮也会 disabled；这里再挡 confirm 竞态）
+    if (deletingIds.has(task.id)) return;
     const ok = await confirm({
       title: "确认删除任务",
       description: `「${task.title}」将被永久删除、连同 data/tasks/${task.id}/ 整个目录、不可恢复。`,
@@ -110,15 +119,16 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       confirmLabel: "确认删除",
     });
     if (!ok) return;
-    removeTask(task.id);
     try {
-      const okDel = await deleteTask(task.id);
-      if (!okDel) throw new Error("任务不存在");
-      // v1.0 双模式：按被删任务的模式回对应落点（对话删完回 /chats 跳下一条对话、
-      // 不能踢回工作台看板——审计 P1）
-      if (activeId === task.id) {
-        router.push(task.mode === "chat" ? "/chats" : "/");
-      }
+      // ok / not_found 都当成功——幽灵回魂后再删会 404，勿 toast「任务不存在」
+      await deleteTaskById(task.id, {
+        onLocked: () => {
+          // 锁定后立刻离开详情页，避免 DELETE 等待期间 upsertTask 回灌
+          if (activeId === task.id) {
+            router.push(task.mode === "chat" ? "/chats" : "/");
+          }
+        },
+      });
     } catch (err) {
       toast.error(`删除失败：${(err as Error).message}`);
       void refresh();
@@ -179,6 +189,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                   active={t.id === activeId}
                   onPin={handlePin}
                   onDelete={handleDelete}
+                  deleteDisabled={deletingIds.has(t.id)}
                 />
               ))}
 
@@ -208,6 +219,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
                           active={t.id === activeId}
                           onPin={handlePin}
                           onDelete={handleDelete}
+                          deleteDisabled={deletingIds.has(t.id)}
                         />
                       ))}
                     </div>

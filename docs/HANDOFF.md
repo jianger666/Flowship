@@ -301,7 +301,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-13 午后（main、**未发版**）：仓库级「只读」取代测试角色机制
+### 2026-07-13 傍晚（main、**未发版**）：线上 bug 修一批 + mac 自更新延迟替换
+
+- **postCheck 红条终于实装**（同事「自定义 action 不知道 AI 写没写产物」根因）：后置检查 fail 一直只落 `action.postCheck`、前端 0 处渲染（V0.6 设计的红条漏做）——artifact 面板正文/空态顶部 destructive 警示条（「后置检查未通过」+ details）+ action timeline 行警示标；顺带修 Windows 反斜杠路径漏检测（sdk-message-handler 匹配前归一 `\`→`/`、否则「在写 artifact」事件与 artifactUpdatedAt 刷新全漏）+ 过时 `skills/artifact-writer` 教旧 artifacts/ 路径纠偏
+- **删任务后看板 404 修复**：看板 `handleOpen` 盲信缓存里的 `item.task` 硬跳已删任务——改成点击前用 `useTaskList()` 实时校验、删了就走 `/workitems/` 预览重新建（用户期望）；任务详情页 `!task` 从裸 `notFound()` 改 EmptyHint+「回工作台」；侧栏删除防重（deletingIds 锁 + 404 幂等成功不再 toast「任务不存在」+ `use-task-list` pendingDeletes 防 2s 轮询回魂 + 删当前任务先导航再等 DELETE）
+- **表单**：任一仓填「已有工作分支」→ 强制原仓运行、worktree 勾选隐藏换一行说明（同事实测踩「已有分支+隔离」必撞 git 同分支双检出）；勾选文案改正向「使用 worktree 隔离运行」（用户拍板「原仓运行别人看不懂」）、设置页对应项同步
+- **mac 自更新改延迟替换**（用户实测「稍后」态被硬闸拦、问能不能不用重启）：下载+验签后只暂存 `updates/staged-<v>.app`、**不碰 /Applications**——「立即更新」= 替换+重启；「稍后」= 老进程跑在没动过的老包上完全正常、before-quit 时替换（preventDefault 等替换完 exit）、启动早期兜底（有效暂存 → 替换+relaunch 无感知）；update-pending-restart 硬闸保留但正常流程不再触发；启动清扫扩展覆盖过期 staged
+- 均未发版、攒在 main；test 包已打给用户验收
+
+### 2026-07-13 午后（main、已含在上、**未发版**）：仓库级「只读」取代测试角色机制
 
 > ⚠️ v1.1.7 tag 被用户手动取消 CI（draft 未转正、对外不存在、latest 仍指 v1.1.6）；本段改动只在 main、等用户亲自验收后再定发版。同日立规：**发版只在用户主动喊「发版」时做、用户没验过的改动绝不发**（见 learned-conventions）。
 

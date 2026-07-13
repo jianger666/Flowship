@@ -12,6 +12,8 @@
  *  - upsertTask(task)：单条插入 / 更新（新建任务后即时插入、不等下次 refresh；
  *    详情页基本信息变化时同步侧栏状态点）
  *  - removeTask(id)：单条移除（删除任务乐观更新）
+ *  - deletingIds / deleteTaskById：删除链路单一来源——锁 id 防双击、
+ *    pendingDeletes 过滤 refresh 防「幽灵回魂」、404 当幂等成功
  *
  * 刷新时机：mount 一次 + 窗口重新聚焦（focus）时——多任务并行，切回 app 拿最新态。
  * 外加「条件轮询」：仅当列表里存在 running 任务时、每 POLL_INTERVAL_MS 刷一次、全跑完即停。
@@ -25,11 +27,16 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 
-import { fetchTasks } from "@/lib/task-store";
+import {
+  deleteTask as deleteTaskApi,
+  fetchTasks,
+  type DeleteTaskResult,
+} from "@/lib/task-store";
 import type { Task, TaskSummary } from "@/lib/types";
 
 interface TaskListContextValue {
@@ -38,6 +45,16 @@ interface TaskListContextValue {
   refresh: () => Promise<void>;
   upsertTask: (task: Task | TaskSummary) => void;
   removeTask: (id: string) => void;
+  /** 正在删除中的 id（侧栏删除按钮 disabled） */
+  deletingIds: ReadonlySet<string>;
+  /**
+   * 统一删除：锁 id → 乐观移除 →（可选 onLocked，如立刻离开详情页）→ DELETE。
+   * 成功或 404 都返结果；非 404 错误抛出（调用方 toast + refresh）。
+   */
+  deleteTaskById: (
+    id: string,
+    options?: { onLocked?: () => void },
+  ) => Promise<DeleteTaskResult>;
 }
 
 const TaskListContext = createContext<TaskListContextValue | null>(null);
@@ -65,11 +82,33 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   // 首次加载完成——侧栏 loading 占位用
   const [loaded, setLoaded] = useState(false);
+  // 删除中 id（驱动按钮 disabled；与 ref 同步，ref 给 refresh/upsert 同步读）
+  const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  // pendingDeletes：DELETE 等待窗口内（running 可等 8s）refresh 不得把任务加回
+  const pendingDeletesRef = useRef<Set<string>>(new Set());
+
+  const markDeleting = useCallback((id: string) => {
+    pendingDeletesRef.current.add(id);
+    setDeletingIds(new Set(pendingDeletesRef.current));
+  }, []);
+
+  const unmarkDeleting = useCallback((id: string) => {
+    pendingDeletesRef.current.delete(id);
+    setDeletingIds(new Set(pendingDeletesRef.current));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
       const list = await fetchTasks();
-      setTasks(list);
+      // 过滤删除中的 id——乐观移除后磁盘任务还在，2s 轮询会把它们「回魂」
+      const pending = pendingDeletesRef.current;
+      setTasks(
+        pending.size === 0
+          ? list
+          : list.filter((t) => !pending.has(t.id)),
+      );
     } catch (err) {
       // 侧栏静默（不 toast 刷屏）；首页 / 详情页自己的拉取会暴露错误
       console.warn("[task-list] 刷新失败", err);
@@ -104,6 +143,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);
+    // 删除中禁止详情页 / 其它路径回灌（否则乐观移除会被 upsert 顶回来）
+    if (pendingDeletesRef.current.has(summary.id)) return;
     setTasks((prev) => {
       const idx = prev.findIndex((t) => t.id === summary.id);
       if (idx < 0) return [summary, ...prev];
@@ -117,9 +158,41 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     setTasks((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
+  const deleteTaskById = useCallback(
+    async (
+      id: string,
+      options?: { onLocked?: () => void },
+    ): Promise<DeleteTaskResult> => {
+      // 已在删：幂等短路，避免双击连发两次 DELETE
+      if (pendingDeletesRef.current.has(id)) return "ok";
+      markDeleting(id);
+      removeTask(id);
+      // 锁定后立刻回调（侧栏用来离开当前详情，避免 upsertTask 回灌）
+      options?.onLocked?.();
+      try {
+        const result = await deleteTaskApi(id);
+        // ok / not_found 都算成功；解锁（服务端已无此任务，refresh 不会再带回）
+        unmarkDeleting(id);
+        return result;
+      } catch (err) {
+        unmarkDeleting(id);
+        throw err;
+      }
+    },
+    [markDeleting, removeTask, unmarkDeleting],
+  );
+
   return (
     <TaskListContext.Provider
-      value={{ tasks, loaded, refresh, upsertTask, removeTask }}
+      value={{
+        tasks,
+        loaded,
+        refresh,
+        upsertTask,
+        removeTask,
+        deletingIds,
+        deleteTaskById,
+      }}
     >
       {children}
     </TaskListContext.Provider>

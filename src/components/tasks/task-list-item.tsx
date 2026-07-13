@@ -111,6 +111,8 @@ interface TaskListItemProps {
   onNavigate?: () => void;
   // 传则行尾 hover 出删除按钮（二次确认由调用方处理）
   onDelete?: (task: TaskSummary) => void;
+  // 删除中禁用（防双击连发 / DELETE 等待窗口内再点）
+  deleteDisabled?: boolean;
   // 传则行尾出置顶按钮（已置顶常显高亮、未置顶 hover 出；切换由调用方处理）
   onPin?: (task: TaskSummary) => void;
 }
@@ -120,6 +122,7 @@ export const TaskListItem = ({
   active,
   onNavigate,
   onDelete,
+  deleteDisabled,
   onPin,
 }: TaskListItemProps) => {
   const hasActions = !!(onPin || onDelete);
@@ -188,9 +191,10 @@ export const TaskListItem = ({
               variant="ghost"
               size="icon-sm"
               onClick={() => onDelete(task)}
+              disabled={deleteDisabled}
               title="删除任务"
               aria-label={`删除任务 ${task.title}`}
-              className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/item:opacity-100 focus-visible:opacity-100"
+              className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
             >
               <Trash2 className="size-3.5" />
             </Button>

@@ -128,6 +128,12 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     }
   }, [feishuStoryUrl]);
 
+  // 当前已选仓任一填了「已有工作分支」→ 强制原仓（隔离 worktree 不能检出原仓已占用的同名分支）
+  const forcedInRepo = useMemo(
+    () => repoPaths.some((p) => !!featureBranches[p]?.trim()),
+    [repoPaths, featureBranches],
+  );
+
   const canSubmit = useMemo(
     () =>
       !submitting &&
@@ -196,10 +202,11 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         repoBranchTemplates:
           Object.keys(repoBranchTemplates).length > 0 ? repoBranchTemplates : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
-        isolateWorktree: !runInRepo,
+        // forcedInRepo 时一律原仓；runInRepo 状态保留不写回、清空分支后勾选框恢复用户原值
+        isolateWorktree: forcedInRepo ? false : !runInRepo,
         model,
       });
-      // 记住这次的配置、下次预填零操作
+      // 记住这次的配置、下次预填零操作（只记仓库 + 角色；runInRepo / isolate 不入记忆）
       try {
         localStorage.setItem(
           LAST_LAUNCH_KEY,
@@ -402,13 +409,24 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         </div>
       )}
 
-      {/* 逃生口 */}
-      <div className="flex items-center gap-2">
-        <Checkbox id="l-run-in-repo" checked={runInRepo} onCheckedChange={setRunInRepo} />
-        <Label htmlFor="l-run-in-repo" className="cursor-pointer font-normal">
-          直接在原仓库运行（不隔离工作区、并行任务会互相影响）
-        </Label>
-      </div>
+      {/* worktree 开关：填了已有分支时强制不用 worktree、隐藏勾选（runInRepo state 保留、清空分支后恢复）。
+          文案围绕 worktree 表述（用户拍板：「原仓运行」大家看不懂、说清用不用 worktree） */}
+      {forcedInRepo ? (
+        <p className="text-xs text-muted-foreground">
+          已填已有分支、本任务不使用 worktree、直接在原仓库该分支上运行
+        </p>
+      ) : (
+        <div className="flex items-center gap-2">
+          <Checkbox
+            id="l-use-worktree"
+            checked={!runInRepo}
+            onCheckedChange={(v) => setRunInRepo(!v)}
+          />
+          <Label htmlFor="l-use-worktree" className="cursor-pointer font-normal">
+            使用 worktree 隔离运行（不影响原仓库、并行任务互不干扰）
+          </Label>
+        </div>
+      )}
 
       {/* 启动 + 缺项引导 */}
       <div className="flex items-center gap-3">

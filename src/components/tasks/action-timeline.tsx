@@ -19,7 +19,7 @@
  */
 
 import { useState } from "react";
-import { RotateCcw, X } from "lucide-react";
+import { AlertTriangle, RotateCcw, X } from "lucide-react";
 
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { EmptyHint } from "@/components/ui/empty-hint";
@@ -62,6 +62,11 @@ const ActionChip = ({
   const isExcluded = action.excluded === true;
   // timeline 只表达「正在查看」和「是否划除」：
   // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
+  // postCheck 未过：列表上一眼可见的警示标（详情在 title、面板正文有完整红条）
+  const postCheckFailed = action.postCheck?.passed === false;
+  const postCheckSummary = postCheckFailed
+    ? action.postCheck!.details.split("\n")[0]!.slice(0, 120)
+    : "";
   const titleParts = [
     `#${action.n} ${actionDisplayLabel(action, "short")}`,
   ];
@@ -70,6 +75,9 @@ const ActionChip = ({
   }
   if (isExcluded) {
     titleParts.push("已划除、不进 agent 上下文");
+  }
+  if (postCheckFailed) {
+    titleParts.push(`后置检查未通过：${postCheckSummary}`);
   }
   const title =
     titleParts.length > 1
@@ -102,6 +110,14 @@ const ActionChip = ({
         </span>
         {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
         <span>{actionDisplayLabel(action, "short")}</span>
+        {postCheckFailed && (
+          <span title={postCheckSummary} className="inline-flex">
+            <AlertTriangle
+              className="size-3 text-destructive"
+              aria-label="后置检查未通过"
+            />
+          </span>
+        )}
       </ChoiceButton>
       {onToggleExclude && (
         <button

@@ -23,7 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import { FileText, Info, Layers } from "lucide-react";
+import { AlertTriangle, FileText, Info, Layers } from "lucide-react";
 import {
   Streamdown,
   defaultRemarkPlugins,
@@ -494,6 +494,21 @@ export const ArtifactPanel = ({
     }
   }, [maxRevisionTs, seenTsLoaded, taskId, action.id]);
 
+  // 后置检查未过：交卷事件不保证落盘、check fail 仍 awaiting_ack（by design）、
+  // 以前 postCheck 前端 0 处渲染 → 坏结果被静默吞掉。空态尤其要挂红条、用户才知道「AI 说写了但文件不在」。
+  const postCheckFailed = action.postCheck?.passed === false;
+  const postCheckBanner = postCheckFailed ? (
+    <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive">
+      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium">后置检查未通过</div>
+        <div className="mt-0.5 whitespace-pre-wrap text-xs text-destructive/90">
+          {action.postCheck!.details}
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   // ---- 渲染 ----
   if (contentLoading && !currentArtifact) {
     return <LoadingState variant="block" label="加载产物…" />;
@@ -501,14 +516,19 @@ export const ArtifactPanel = ({
 
   if (!currentArtifact) {
     return (
-      <div className="flex h-full items-center justify-center px-6 text-center">
-        <div className="text-sm text-muted-foreground">
-          <div className="mb-2 flex justify-center">
-            <FileText className="size-8 opacity-40" />
+      <div className="flex h-full flex-col">
+        {postCheckBanner && (
+          <div className="shrink-0 px-6 pt-4">{postCheckBanner}</div>
+        )}
+        <div className="flex flex-1 items-center justify-center px-6 text-center">
+          <div className="text-sm text-muted-foreground">
+            <div className="mb-2 flex justify-center">
+              <FileText className="size-8 opacity-40" />
+            </div>
+            {action.status === "running"
+              ? `${actionTitle} 正在生成产物…`
+              : `${actionTitle} 没有产物`}
           </div>
-          {action.status === "running"
-            ? `${actionTitle} 正在生成产物…`
-            : `${actionTitle} 没有产物`}
         </div>
       </div>
     );
@@ -605,6 +625,8 @@ export const ArtifactPanel = ({
       <div className="flex-1 overflow-y-auto">
         {mode === "content" ? (
           <div className="px-6 py-4">
+            {/* 有产物时也显示：检查失败可能是必备段缺失等其它原因、不只是「没落盘」 */}
+            {postCheckBanner && <div className="mb-3">{postCheckBanner}</div>}
             {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
             {action.type === "plan" &&
               action.replanMode &&

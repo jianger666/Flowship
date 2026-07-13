@@ -24,7 +24,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { notFound, useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import {
   Ban,
   ExternalLink,
@@ -52,6 +52,7 @@ import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
   ResizableHandle,
@@ -106,6 +107,7 @@ const EVENT_TAIL = 300;
 
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
+  const router = useRouter();
   const id = params.id;
   // 任务对象（V0.6 含 actions / mrs / repoStatus / runStatus 等）
   const [task, setTask] = useState<Task | null>(null);
@@ -349,8 +351,18 @@ const TaskDetailPage = () => {
     return <LoadingState variant="hero" />;
   }
 
+  // 已删 / 直开无效 URL：友好空态，勿裸 notFound()（看板缓存旧 id / 侧栏删后直链都会撞）
   if (!task) {
-    notFound();
+    return (
+      <div className="flex min-h-[50vh] flex-1 flex-col items-center justify-center gap-4 p-8">
+        <EmptyHint variant="dashed" size="md" align="center">
+          任务不存在或已删除
+        </EmptyHint>
+        <Button variant="outline" onClick={() => router.push("/")}>
+          回工作台
+        </Button>
+      </div>
+    );
   }
 
   // ---- 按钮渲染条件 ----

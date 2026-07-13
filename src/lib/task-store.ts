@@ -115,13 +115,17 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
   return data.task;
 };
 
-export const deleteTask = async (id: string): Promise<boolean> => {
+/** 删除结果：ok=已删；not_found=服务端已无（二次删除幂等成功，不当错） */
+export type DeleteTaskResult = "ok" | "not_found";
+
+export const deleteTask = async (id: string): Promise<DeleteTaskResult> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
-  if (res.status === 404) return false;
+  // 404 = 已不存在：调用方当幂等成功，勿 toast「任务不存在」
+  if (res.status === 404) return "not_found";
   await handleJson<{ ok: true }>(res);
-  return true;
+  return "ok";
 };
 
 // V0.8 侧栏：置顶 / 取消置顶（PATCH /api/tasks/[id]）

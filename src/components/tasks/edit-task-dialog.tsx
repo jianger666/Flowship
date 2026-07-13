@@ -290,10 +290,16 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
           )}
 
           {/* 已有工作分支：per-repo（已绑仓 + 本次追加仓）。
-              v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用 */}
+              v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用。
+              隔离任务（isolateWorktree 建完定死）填已有分支可能与原仓检出冲突——只提示、不强制改 isolate */}
           {task.repoPaths.length + addRepos.length > 0 && (
             <div className="grid gap-1.5">
               <Label>已有工作分支（选填）</Label>
+              {task.isolateWorktree === true && (
+                <p className="text-xs text-muted-foreground">
+                  隔离任务填已有分支可能与原仓检出冲突
+                </p>
+              )}
               <div className="grid gap-2">
                 {[...task.repoPaths, ...addRepos].map((p) => {
                   const entry = branchMap[p];

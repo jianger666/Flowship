@@ -226,8 +226,8 @@ export const PreferenceSections = ({
       />
 
       <SettingRow
-        label="新任务默认隔离工作区"
-        hint="控制新建任务时的默认勾选、每个任务可单独改；关掉后默认直接在原仓库运行"
+        label="新任务默认使用 worktree"
+        hint="worktree = 隔离工作区、任务改动不影响原仓库；关掉后新任务默认直接在原仓库运行"
         control={
           <Switch
             checked={isolateWorktreeDefault}

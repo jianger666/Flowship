@@ -36,6 +36,7 @@ import { settingsUrl } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
 import { markShellContentReady } from "@/lib/shell-ready";
 import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
+import { useTaskList } from "@/hooks/use-task-list";
 
 // ---------- 类型（对齐 /api/feishu/board 返回） ----------
 
@@ -120,6 +121,12 @@ export const AiStatusBadge = ({ task }: { task: BoardTaskBrief | null }) => {
 
 export const FeishuBoard = () => {
   const router = useRouter();
+  // 侧栏任务列表：点看板时实时校验 it.task（缓存旧映射不失效，盲跳会 404）
+  const { tasks } = useTaskList();
+  const liveTaskIds = useMemo(
+    () => new Set(tasks.map((t) => t.id)),
+    [tasks],
+  );
   // 数据（null = 首次还没回来）
   const [resp, setResp] = useState<BoardResp | null>(null);
   // resp 的同步镜像（refresh 回调里做「手上是否有好数据」判断、不依赖闭包陈旧值）
@@ -236,10 +243,11 @@ export const FeishuBoard = () => {
     void refresh();
   }, [refresh]);
 
-  // 点击工作项：有任务直进、没任务进预览
+  // 点击工作项：有「仍存活」的任务直进、否则进预览（不盲信看板缓存里的 it.task）
   const handleOpen = useCallback(
     (it: BoardItem) => {
-      if (it.task) {
+      // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验
+      if (it.task && liveTaskIds.has(it.task.id)) {
         router.push(`/tasks/${it.task.id}`);
         return;
       }
@@ -249,7 +257,7 @@ export const FeishuBoard = () => {
       if (it.url) qs.set("url", it.url);
       router.push(`/workitems/${encodeURIComponent(it.id)}?${qs.toString()}`);
     },
-    [router],
+    [router, liveTaskIds],
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
