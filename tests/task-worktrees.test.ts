@@ -172,6 +172,29 @@ describe("getTaskWorkRepoPaths / getTaskCwd 路径映射", () => {
     // 无快照时 SCRIPTS_DIR 也被当 git、映射进 worktree（老任务本就不会挂非 git）
     expect(getTaskWorkRepoPaths(t)[1]).toContain(`/worktrees/${t.id}/`);
   });
+
+  it("只读仓不进 worktree：映射原地、cwd 只聚合可隔离仓", () => {
+    const t = baseTask({
+      repoPaths: [REPO_WEB, REPO_API],
+      readonlyRepoPaths: [REPO_API],
+    });
+    expect(getTaskWorkRepoPaths(t)).toEqual([
+      `${DATA}/worktrees/${t.id}/crm-web`,
+      REPO_API, // 只读仓原地
+    ]);
+    // cwd 只对可隔离仓聚合 → 单仓 worktree 自身（不漂到公共祖先）
+    expect(getTaskCwd(t)).toBe(`${DATA}/worktrees/${t.id}/crm-web`);
+  });
+
+  it("全仓只读的隔离 task：路径全部原地、cwd = 原路径公共父", () => {
+    const t = baseTask({
+      repoPaths: [REPO_WEB, REPO_API],
+      readonlyRepoPaths: [REPO_WEB, REPO_API],
+    });
+    expect(getTaskWorkRepoPaths(t)).toEqual([REPO_WEB, REPO_API]);
+    // 两仓都在 FIXTURE/work/ 下 → 公共父 = .../work
+    expect(getTaskCwd(t)).toBe(path.join(FIXTURE, "work"));
+  });
 });
 
 describe("resolveOriginalRepoPath 反向归一（submit_mr 用）", () => {
@@ -233,6 +256,16 @@ describe("planWorktreeBranchInfos 分支规划", () => {
 
   it("混合隔离：只给 git 仓造分支记录、非 git 目录不进 gitBranches", () => {
     const t = mixedTask([REPO_WEB], [SCRIPTS_DIR]);
+    const infos = planWorktreeBranchInfos(t);
+    expect(infos).toHaveLength(1);
+    expect(infos[0].repoPath).toBe(REPO_WEB);
+  });
+
+  it("只读仓不进 gitBranches（与非 git 同款跳过）", () => {
+    const t = baseTask({
+      repoPaths: [REPO_WEB, REPO_API],
+      readonlyRepoPaths: [REPO_API],
+    });
     const infos = planWorktreeBranchInfos(t);
     expect(infos).toHaveLength(1);
     expect(infos[0].repoPath).toBe(REPO_WEB);
@@ -308,6 +341,20 @@ describe("getUniqueRepoDirNames / getRepoWorkDirs / formatRepoSection / storyId"
       "/data/worktrees/t1/web",
       "/data/worktrees/t1/api",
       "/scripts/qa",
+    ]);
+  });
+
+  it("getRepoWorkDirs 只读仓用原路径、可写仓走 worktree", () => {
+    const dirs = getRepoWorkDirs(
+      ["/repos/web", "/repos/api"],
+      "/data/worktrees/t1/web",
+      true,
+      undefined,
+      ["/repos/api"],
+    );
+    expect(dirs.map((d) => d.workDir)).toEqual([
+      "/data/worktrees/t1/web",
+      "/repos/api",
     ]);
   });
 

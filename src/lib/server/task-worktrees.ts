@@ -52,6 +52,23 @@ export const computeNonGitRepoPaths = (
   return nonGit.length > 0 ? nonGit : undefined;
 };
 
+/**
+ * 从 settings.repos 算出只读仓快照（createTask / updateTaskFields / setTaskRepoPaths 落库用）。
+ * 无匹配 → undefined（跟老任务缺省一致）。
+ */
+export const computeReadonlyRepoPaths = (
+  repoPaths: string[],
+  settingsRepos: ReadonlyArray<{ path?: string; readonly?: boolean }>,
+): string[] | undefined => {
+  const readonlySet = new Set(
+    settingsRepos
+      .filter((r) => r.readonly === true && typeof r.path === "string" && r.path)
+      .map((r) => r.path as string),
+  );
+  const matched = repoPaths.filter((p) => readonlySet.has(p));
+  return matched.length > 0 ? matched : undefined;
+};
+
 // ----------------- 类型：Task / TaskMetaV06 都能喂的最小形状 -----------------
 
 /**
@@ -65,6 +82,8 @@ export interface WorktreeTaskLike {
   isolateWorktree?: boolean;
   /** 非 git 目录快照；undefined = 全 git（老任务） */
   nonGitRepoPaths?: string[];
+  /** 只读仓快照；undefined = 无只读仓（老任务） */
+  readonlyRepoPaths?: string[];
 }
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
@@ -82,9 +101,29 @@ export const isTaskNonGitRepo = (
   repoPath: string,
 ): boolean => (t.nonGitRepoPaths ?? []).includes(repoPath);
 
-/** task 是否至少绑了一个 git 仓（QA 段要不要带 git 姿势） */
+/**
+ * 读快照判断某仓是否只读（undefined / 未列入 = 可写）。
+ * 只读仓不进 worktree、prompt / 门禁 / 后置检测共用。
+ */
+export const isTaskReadonlyRepo = (
+  t: WorktreeTaskLike,
+  repoPath: string,
+): boolean => (t.readonlyRepoPaths ?? []).includes(repoPath);
+
+/** 是否跳过隔离 worktree（非 git 或只读 → 原地使用） */
+export const skipsWorktreeIsolation = (
+  t: WorktreeTaskLike,
+  repoPath: string,
+): boolean => isTaskNonGitRepo(t, repoPath) || isTaskReadonlyRepo(t, repoPath);
+
+/** task 是否至少绑了一个可进 worktree 的 git 仓（git 且非只读） */
 export const taskHasGitRepo = (t: WorktreeTaskLike): boolean =>
-  t.repoPaths.some((p) => !isTaskNonGitRepo(t, p));
+  t.repoPaths.some((p) => !skipsWorktreeIsolation(t, p));
+
+/** 任务绑定的仓是否全部只读（有仓且每个都在快照里） */
+export const taskAllReposReadonly = (t: WorktreeTaskLike): boolean =>
+  t.repoPaths.length > 0 &&
+  t.repoPaths.every((p) => isTaskReadonlyRepo(t, p));
 
 /** 所有 task worktree 的根目录 */
 export const getWorktreesRoot = (): string => path.join(dataRoot(), "worktrees");
@@ -98,9 +137,8 @@ const normPath = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, ""
 
 /**
  * task 的「工作路径」列表——agent 实际干活的目录：
- * - 隔离 task → 逐仓读 nonGitRepoPaths 快照：git 仓映射到 worktree 子目录（子目录名 =
- *   getUniqueRepoDirNames、跟 client 端路径前缀校验同源）；非 git 目录（纯脚本库
- *   等）**原样返回 repoPath**（无分支概念、不建隔离区、原地使用）
+ * - 隔离 task → 逐仓读快照：git 且非只读 → 映射到 worktree 子目录；非 git / 只读
+ *   **原样返回 repoPath**（无分支隔离需求 / 验证要用原仓 pull 切提测分支）
  * - 非隔离 → 原样返回 repoPaths
  * - 顺序始终跟 repoPaths 一一对应（index 对齐是全站路径映射契约）
  */
@@ -109,25 +147,25 @@ export const getTaskWorkRepoPaths = (t: WorktreeTaskLike): string[] => {
   const dir = getTaskWorktreesDir(t.id);
   const names = getUniqueRepoDirNames(t.repoPaths);
   return t.repoPaths.map((repoPath, i) =>
-    isTaskNonGitRepo(t, repoPath) ? repoPath : path.join(dir, names[i]),
+    skipsWorktreeIsolation(t, repoPath) ? repoPath : path.join(dir, names[i]),
   );
 };
 
 /**
  * task 的 effective cwd（Agent.create / stop hook / 检查统一走这里）。
  *
- * 隔离任务：只对「映射进 worktree 的 git 仓」算公共父——非 git 目录靠绝对路径访问、
- * 不参与聚合（否则 worktree 在 Application Support、脚本在 Documents → 聚到 $HOME）。
- * - 纯 / 多 git 仓：现状语义不变（单 = worktree 自身、多 = worktrees/<taskId> 容器）
- * - 全非 git：退回原 repoPaths 的公共父
+ * 隔离任务：只对「映射进 worktree 的仓」算公共父——非 git / 只读靠绝对路径访问、
+ * 不参与聚合（否则 worktree 在 Application Support、原仓在 Documents → 聚到 $HOME）。
+ * - 纯 / 多可隔离仓：现状语义不变（单 = worktree 自身、多 = worktrees/<taskId> 容器）
+ * - 全跳过隔离：退回原 repoPaths 的公共父
  */
 export const getTaskCwd = (t: WorktreeTaskLike): string => {
   if (!isWorktreeTask(t)) return getEffectiveCwd(t.repoPaths);
-  const gitWorkPaths = getTaskWorkRepoPaths(t).filter(
-    (_, i) => !isTaskNonGitRepo(t, t.repoPaths[i]),
+  const isolatedWorkPaths = getTaskWorkRepoPaths(t).filter(
+    (_, i) => !skipsWorktreeIsolation(t, t.repoPaths[i]),
   );
-  if (gitWorkPaths.length === 0) return getEffectiveCwd(t.repoPaths);
-  return getEffectiveCwd(gitWorkPaths);
+  if (isolatedWorkPaths.length === 0) return getEffectiveCwd(t.repoPaths);
+  return getEffectiveCwd(isolatedWorkPaths);
 };
 
 /**
@@ -155,7 +193,7 @@ export const resolveOriginalRepoPath = (
  * 跟 action-gates.planBranchesForBuild 同一套命名规则；区别是这里必须**总能**给出
  * 分支名（worktree 创建不能没分支）——storyId 抠不到时兜底用 task id 的时间戳段。
  *
- * 混合隔离：只给 **git 仓**造记录（非 git 目录无分支概念、不进 gitBranches）。
+ * 混合隔离：只给 **可隔离的 git 仓**造记录（非 git / 只读无隔离需求、不进 gitBranches）。
  */
 export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
   const storyId =
@@ -166,7 +204,7 @@ export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
   const existing = task.gitBranches ?? [];
   const now = Date.now();
   return task.repoPaths
-    .filter((repoPath) => !isTaskNonGitRepo(task, repoPath))
+    .filter((repoPath) => !skipsWorktreeIsolation(task, repoPath))
     .map((repoPath) => {
       const old = existing.find((b) => b.repoPath === repoPath);
       if (old) return old;
@@ -267,10 +305,10 @@ export const ensureTaskWorktrees = async (
     const repoPath = task.repoPaths[i];
     const workDir = workPaths[i];
 
-    // 非 git 仓（读快照）：路径映射已原地返回、这里跳过建 worktree（脚本库无分支概念）
-    if (isTaskNonGitRepo(task, repoPath)) {
+    // 非 git / 只读仓（读快照）：路径映射已原地返回、这里跳过建 worktree
+    if (skipsWorktreeIsolation(task, repoPath)) {
       console.log(
-        `[task-worktrees] 跳过非 git 目录（原地使用、不建隔离工作区）：${repoPath}`,
+        `[task-worktrees] 跳过${isTaskReadonlyRepo(task, repoPath) ? "只读" : "非 git"}目录（原地使用、不建隔离工作区）：${repoPath}`,
       );
       continue;
     }

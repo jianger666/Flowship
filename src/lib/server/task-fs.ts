@@ -60,10 +60,26 @@ import { mrTargetBranchOf } from "@/lib/task-display";
 import {
   cleanupOrphanTaskWorktrees,
   computeNonGitRepoPaths,
+  computeReadonlyRepoPaths,
   getTaskCwd,
   isWorktreeTask,
   removeTaskWorktrees,
 } from "./task-worktrees";
+import { readSettingsFile } from "./settings-fs";
+
+/** 读 settings.repos 算只读快照（失败 / 无匹配 → undefined） */
+const snapshotReadonlyRepoPaths = async (
+  repoPaths: string[],
+): Promise<string[] | undefined> => {
+  const settings = await readSettingsFile().catch(() => null);
+  const repos = Array.isArray(settings?.repos) ? settings!.repos : [];
+  // config.json 里 repos 是宽松 JSON、只收带 path 的条目
+  const entries = (repos as unknown[]).filter(
+    (r): r is { path?: string; readonly?: boolean } =>
+      !!r && typeof r === "object" && !Array.isArray(r),
+  );
+  return computeReadonlyRepoPaths(repoPaths, entries);
+};
 import {
   getPreviewStatus,
   killStalePreview,
@@ -323,6 +339,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoPaths: trimmedRepoPaths,
     // 建 task 时快照：之后路径映射 / cwd 聚合读这份，不再运行时 existsSync
     nonGitRepoPaths: computeNonGitRepoPaths(trimmedRepoPaths),
+    // 只读仓快照：从 settings.repos 匹配（server 端读 config.json、不信 client 传）
+    readonlyRepoPaths: await snapshotReadonlyRepoPaths(trimmedRepoPaths),
     repoBaseBranches:
       Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
     repoFeatureBranches:
@@ -686,8 +704,9 @@ export const updateTaskFields = async (
           meta.repoBranchTemplates,
           input.addRepoBranchTemplates,
         );
-        // 追加仓后重算非 git 快照（只增不删、但新仓可能是脚本目录）
+        // 追加仓后重算非 git / 只读快照（只增不删、新仓可能是脚本目录或只读）
         meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
+        meta.readonlyRepoPaths = await snapshotReadonlyRepoPaths(meta.repoPaths);
       }
     }
 
@@ -753,6 +772,7 @@ export const setTaskRepoPaths = async (
       .filter((p) => p.length > 0);
     // chat 重选工作目录也要刷新快照（cwd / 路径映射契约同一份）
     meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
+    meta.readonlyRepoPaths = await snapshotReadonlyRepoPaths(meta.repoPaths);
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);
@@ -851,6 +871,7 @@ export const patchAction = async (
       | "artifactUpdatedAt"
       | "planBatches"
       | "startBaseline"
+      | "readonlyBaseline"
     >
   >,
 ): Promise<Task | null> =>

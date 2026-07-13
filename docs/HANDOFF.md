@@ -301,7 +301,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-13 v1.1.7 发版：测试角色专项审查修复 + 工作台手动建任务入口
+### 2026-07-13 午后（main、**未发版**）：仓库级「只读」取代测试角色机制
+
+> ⚠️ v1.1.7 tag 被用户手动取消 CI（draft 未转正、对外不存在、latest 仍指 v1.1.6）；本段改动只在 main、等用户亲自验收后再定发版。同日立规：**发版只在用户主动喊「发版」时做、用户没验过的改动绝不发**（见 learned-conventions）。
+
+- **背景（用户复盘）**：v1.1.6/1.1.7 的「测试角色（userRole=qa）」路线提示词越补越多（三变体 20 行 + 按角色的 ship/dev 闸）、维护成本高、开发者自己都记不住。拍板改成**仓库级只读**：语义跟着仓走、配一次永久生效、看得见不靠记忆。
+- **实现**：settings.repos 每仓「只读」Switch（`RepoEntry.readonly`）→ 建任务快照 `task.readonlyRepoPaths`（同 nonGitRepoPaths 三写点模式）；只读仓**不进隔离 worktree**（原仓直接用、用户拍板「不写代码隔离没必要」）；门禁——全仓只读拒 build/ship/dev（`ALL_READONLY_REPOS_BLOCK_REASON` 单一文案源、服务端 + 弹窗灰卡共用）、`submit_mr` 对只读仓拒；prompt 只剩**一行**只读约定（不改内容/不建分支/不 commit push 提 MR、允许 pull + 切测试分支拉最新）、分支配置段只读仓行尾标 🔒；**后置确定性检测**（action-checks、所有 action 通用）：交卷后对只读仓查 `status --porcelain` 脏 + 本地领先 upstream 的 commit、被动过红条罗列（pull/切分支不误报）——「shell 硬拦」的替代（hooks 链路 v1.1.2 已拆、恢复成本高、记账观察）；任务头部只读仓挂 Lock icon
+- **退役删除**：`buildQaRoleDirective` 三变体 + `{{qaRoleDirective}}` 占位 + 两 runner 注入接线 + action-gates/advance-dialog 的 qa 角色闸——角色（userRole）不再影响任何 prompt / 门禁
+
+### 2026-07-13 v1.1.7（tag 已作废、CI 被取消、改动在 main）：测试角色专项审查修复 + 工作台手动建任务入口
 
 - **测试角色约定专项审查**（用户点名「拉子代理一起 review 影响点」、逐 action 推演 + prompt 一致性 + 边界场景、报 3 P1）：① 守约定反而必红——review 只读指纹把 HEAD 编进 hash、QA detached 切基线必触发红条；② 非隔离任务切基线会动用户原仓 HEAD；③ ship/dev 准入不看角色、playbook（commit+push+提 MR）与 QA 红线硬对撞
 - **修复**：唯一代码闸 = `checkActionPrerequisites` ship/dev 对 `userRole==="qa"` 直接拒（`QA_ROLE_BLOCK_SHIP_DEV_REASON` 单一文案源、服务端准入 + 推进弹窗灰卡共用；advanceTask 读 settings 传 ctx）；其余全 prompt 文案解——`buildQaRoleDirective` 加 `isolateWorktree` 参数：隔离 task 才教 detached 切基线（含 MR ref 姿势）、非隔离 task / chat 一律「不切分支、当前检出只读验证」；追加通用约束（review 期间不切 commit / 误推 build 只产验证报告 / learn 只写任务目录 / 本约定优先于 playbook）

@@ -18,8 +18,6 @@
 
 {{repoBranchSection}}
 
-{{qaRoleDirective}}
-
 {{contextDocsSection}}
 
 ## 用户规则（必遵守）

@@ -15,7 +15,11 @@ import {
   extractFeishuStoryId,
   renderBranchName,
 } from "@/lib/branch-template";
-import { isTaskNonGitRepo } from "./task-worktrees";
+import {
+  isTaskNonGitRepo,
+  isTaskReadonlyRepo,
+  taskAllReposReadonly,
+} from "./task-worktrees";
 import type {
   ActionType,
   GitBranchInfo,
@@ -40,13 +44,11 @@ const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
 export interface PrerequisiteContext {
   gitHost?: string;
   gitToken?: string;
-  /** 设置页「我的角色」；qa 时拒 ship / dev（会 push / 提 MR） */
-  userRole?: string;
 }
 
-/** 测试角色拒 ship / dev 的统一文案（服务端准入 + 推进弹窗灰卡共用口径） */
-export const QA_ROLE_BLOCK_SHIP_DEV_REASON =
-  "测试角色不执行提测 / 联调（会 push 代码提 MR）、请用验证类 action。";
+/** 全仓只读拒 build / ship / dev 的统一文案（服务端准入 + 推进弹窗灰卡共用口径） */
+export const ALL_READONLY_REPOS_BLOCK_REASON =
+  "任务所有仓库均为只读、AI 不能改动——如需开发请在设置页取消只读";
 
 export const checkActionPrerequisites = (
   task: Task,
@@ -64,6 +66,10 @@ export const checkActionPrerequisites = (
     case "plan":
       return { ok: true }; // 永远可
     case "build":
+      // 全仓只读 → 拒（部分只读放行：可写仓照常改、只读仓 prompt + 后置检测守）
+      if (taskAllReposReadonly(task)) {
+        return { ok: false, reason: ALL_READONLY_REPOS_BLOCK_REASON };
+      }
       // V0.6.17：放开「build 必须先 plan」——小改 / 修 bug 直接 build、plan 是过度流程。
       // 有 plan 时按 plan 工单走、无 plan 时按用户指令直接改（范围以指令为准、靠 review 兜底）。
       return { ok: true };
@@ -72,9 +78,8 @@ export const checkActionPrerequisites = (
       //   不强求先 build（agent 无改动可复核时会在 artifact 自己说明、不报错）。
       return { ok: true };
     case "ship": {
-      // 测试角色硬闸：ship 会 push + 提 MR，与 QA 约定冲突——优先于 host/token 技术校验
-      if (ctx.userRole === "qa") {
-        return { ok: false, reason: QA_ROLE_BLOCK_SHIP_DEV_REASON };
+      if (taskAllReposReadonly(task)) {
+        return { ok: false, reason: ALL_READONLY_REPOS_BLOCK_REASON };
       }
       // V0.x：去掉「ship 必须先有 build」流程限制（没改动直接 ship、agent 会发现工作区干净自己报）。
       //   保留 GitLab host/token 校验——技术必需（没配真调不了 GitLab API、提不了 MR）、不是流程限制。
@@ -99,9 +104,8 @@ export const checkActionPrerequisites = (
       //   没过程可复盘、自己说明、不报错。把判断权交给用户。
       return { ok: true };
     case "dev": {
-      // 测试角色硬闸：联调会 push 到 dev 分支，与 QA 约定冲突——优先于「是否配了 dev 分支」
-      if (ctx.userRole === "qa") {
-        return { ok: false, reason: QA_ROLE_BLOCK_SHIP_DEV_REASON };
+      if (taskAllReposReadonly(task)) {
+        return { ok: false, reason: ALL_READONLY_REPOS_BLOCK_REASON };
       }
       // V0.x：联调技术准入——至少一个仓配了 dev 分支（dev 分支名没法猜默认、必须设置页显式配）。
       //   没配 dev 分支的仓 agent 会跳过、全没配则这里拦 + 提示去设置页配（同 ship host/token 性质：技术必需、非流程限制）。
@@ -158,10 +162,10 @@ export const planBranchesForBuild = (
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
     return null;
   }
-  // 只对 git 仓拼 checkout hint——非 git 目录跑 git 必炸；全仓非 git → 不注入
-  // 读 nonGitRepoPaths 快照（禁止运行时 existsSync）
+  // 只对可写 git 仓拼 checkout hint——非 git / 只读跑 git checkout 无意义或违规；全跳过 → 不注入
+  // 读快照（禁止运行时 existsSync）
   const repoPaths = (task.repoPaths ?? []).filter(
-    (p) => !isTaskNonGitRepo(task, p),
+    (p) => !isTaskNonGitRepo(task, p) && !isTaskReadonlyRepo(task, p),
   );
   if (repoPaths.length === 0) {
     return null;

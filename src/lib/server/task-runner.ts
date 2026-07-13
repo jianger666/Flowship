@@ -50,6 +50,7 @@ import { getActionsDir, getEventsLogPath } from "./task-fs-core";
 import {
   runActionCheck,
   captureActionStartBaseline,
+  captureReadonlyRepoBaselines,
 } from "./action-checks";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import { getChatMcpUrl } from "./chat-mcp";
@@ -78,7 +79,6 @@ import {
   isWorktreeTask,
   removeTaskWorktrees,
   resolveOriginalRepoPath,
-  taskHasGitRepo,
 } from "./task-worktrees";
 import { loadSkills, type SkillEntry } from "./skills-loader";
 import {
@@ -111,12 +111,10 @@ import {
   buildReviewScopeDirective,
   buildSuperPrompt,
   buildTaskUpdateHint,
-  buildQaRoleDirective,
   captureTaskFieldsSnapshot,
   loadActionPrompt,
 } from "./task-prompts";
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
-import { readSettingsFile } from "./settings-fs";
 import {
   checkActionPrerequisites,
   planBranchesForBuild,
@@ -688,17 +686,9 @@ const advanceTaskInner = async (
   // 1) 准入条件（V0.6 门槛 1）
   const effectiveGitHost =
     (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
-  // 读设置页角色供 QA 硬闸；失败吞掉当 undefined（别堵推进、非 QA 照常走技术校验）
-  // readSettingsFile 返 Record<string, unknown>——只认 string 角色值
-  const settingsForGate = await readSettingsFile().catch(() => null);
-  const gateUserRole =
-    typeof settingsForGate?.userRole === "string"
-      ? settingsForGate.userRole
-      : undefined;
   const pre = checkActionPrerequisites(task, actionType, {
     gitHost: effectiveGitHost,
     gitToken,
-    userRole: gateUserRole,
   });
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
@@ -724,13 +714,20 @@ const advanceTaskInner = async (
   const { task: taskAfterAppend, action } = created;
   publish(task.id, { kind: "task", task: taskAfterAppend });
   publish(task.id, { kind: "action", action });
-  // V0.6.27：review / build 启动基线（review=各仓内容指纹、build=兄弟仓状态 hash）
-  // 后置检查比对用（review 只读硬校验 / 兄弟仓越权检测）、采集失败 fail-open 不挡启动
+  // V0.6.27：review / build 启动基线；只读仓基线所有 action 都采（后置检测兜底）
+  // 采集失败 fail-open 不挡启动
   if (actionType === "review" || actionType === "build") {
     const baseline = await captureActionStartBaseline(task, actionType);
     if (baseline) {
       await patchAction(task.id, action.id, { startBaseline: baseline });
       action.startBaseline = baseline;
+    }
+  }
+  {
+    const readonlyBaseline = await captureReadonlyRepoBaselines(task);
+    if (readonlyBaseline) {
+      await patchAction(task.id, action.id, { readonlyBaseline });
+      action.readonlyBaseline = readonlyBaseline;
     }
   }
   await writeEventAndPublish(task.id, {
@@ -1573,19 +1570,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
       // 飞书项目推导发起人姓名 + 设置页角色（失败返空串、不堵启动）
       const userIdentityLine = await resolveUserIdentityForPrompt();
-      // 设置页「我的角色 = 测试」且绑了仓 → 注入 QA 约定段（纯 prompt、失败当未设）
-      const settings = await readSettingsFile().catch(() => null);
-      const qaRoleDirective =
-        settings?.userRole === "qa" &&
-        task.mode === "task" &&
-        task.repoPaths.length > 0
-          ? // isolateWorktree：隔离才教 detached 切基线；非隔离任务禁切分支（会动原仓 HEAD）
-            buildQaRoleDirective(
-              "task",
-              taskHasGitRepo(task),
-              task.isolateWorktree === true,
-            )
-          : "";
       const superPrompt = await buildSuperPrompt(
         task,
         skills,
@@ -1599,7 +1583,6 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           replanDirective,
         },
         userIdentityLine,
-        qaRoleDirective,
       );
 
       const run = await agent.send(superPrompt);

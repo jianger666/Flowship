@@ -421,32 +421,37 @@ export const getUniqueRepoDirNames = (repoPaths: string[]): string[] => {
  * - 隔离 task 多仓：worktrees/<taskId>/<仓短名>（跟 server 端 worktree 布局一致）
  * - 隔离 task 单仓：workCwd 自身就是该仓 worktree
  * - 非隔离：原仓库路径本身（多仓时绝不给公共父目录）
- * - 非 git 目录（读 nonGitRepoPaths 快照）：隔离与否都直接用原路径、不拼进 workCwd
+ * - 非 git / 只读目录（读快照）：隔离与否都直接用原路径、不拼进 workCwd
  *
  * @param nonGitRepoPaths 任务落库的非 git 清单；undefined = 全 git（老任务）
+ * @param readonlyRepoPaths 任务落库的只读清单；undefined = 无只读仓
  */
 export const getRepoWorkDirs = (
   repoPaths: string[],
   workCwd: string,
   isolated: boolean,
   nonGitRepoPaths?: readonly string[],
+  readonlyRepoPaths?: readonly string[],
 ): Array<{ repoPath: string; workDir: string; shortName: string }> => {
   const names = getUniqueRepoDirNames(repoPaths);
   const base = normalizeSeparators(workCwd).replace(/\/+$/, "");
   const nonGitSet = new Set(nonGitRepoPaths ?? []);
-  // 隔离 cwd 只对 git 仓聚合：唯一 git 仓时 workCwd = 该 worktree 自身（不是容器）
-  const gitCount = repoPaths.filter((p) => !nonGitSet.has(p)).length;
+  const readonlySet = new Set(readonlyRepoPaths ?? []);
+  // 隔离 cwd 只对「进 worktree 的仓」聚合：唯一可隔离仓时 workCwd = 该 worktree 自身
+  const isolatableCount = repoPaths.filter(
+    (p) => !nonGitSet.has(p) && !readonlySet.has(p),
+  ).length;
   return repoPaths.map((repoPath, i) => {
     const shortName = names[i];
     const original = normalizeSeparators(repoPath).replace(/\/+$/, "");
     let workDir: string;
-    if (nonGitSet.has(repoPath)) {
-      // 非 git：不参与 worktree 布局、IDE 直接开原目录
+    if (nonGitSet.has(repoPath) || readonlySet.has(repoPath)) {
+      // 非 git / 只读：不参与 worktree 布局、IDE 直接开原目录
       workDir = original;
     } else if (!isolated) {
       workDir = repoPaths.length === 1 ? base : original;
-    } else if (gitCount <= 1) {
-      // 隔离且至多一个 git 仓：workCwd 就是该 worktree
+    } else if (isolatableCount <= 1) {
+      // 隔离且至多一个可隔离仓：workCwd 就是该 worktree
       workDir = base;
     } else {
       workDir = `${base}/${names[i]}`;

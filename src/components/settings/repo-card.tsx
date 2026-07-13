@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Card,
   CardContent,
@@ -132,6 +133,17 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onCommit(repos.filter((r) => r.path !== path));
   };
 
+  // 只读开关：离散选择、选中即落盘
+  const commitReadonly = (path: string, readonly: boolean) => {
+    onCommit(
+      repos.map((r) =>
+        r.path === path
+          ? { ...r, readonly: readonly ? true : undefined }
+          : r,
+      ),
+    );
+  };
+
   return (
     <Card>
       <CardHeader>
@@ -163,7 +175,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                   key={r.path}
                   className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
                 >
-                  {/* 第一行：仓名 + 路径 + 删除 */}
+                  {/* 第一行：仓名 + 路径 + 只读开关 + 删除 */}
                   <div className="flex items-center gap-2">
                     <Input
                       value={r.name}
@@ -175,6 +187,13 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                     <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground font-mono">
                       {r.path}
                     </code>
+                    <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                      只读
+                      <Switch
+                        checked={r.readonly === true}
+                        onCheckedChange={(v) => commitReadonly(r.path, v)}
+                      />
+                    </label>
                     <Button
                       type="button"
                       variant="ghost"

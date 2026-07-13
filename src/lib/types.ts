@@ -37,6 +37,11 @@ export interface RepoConfig {
    * （app 不理解命令语义、只负责执行；见 preview-manager.ts）
    */
   previewCommand?: string;
+  /**
+   * 只读仓：AI 不允许改内容 / 建分支 / commit / push / 提 MR（允许 pull、切提测分支拉最新做验证）。
+   * 建任务时快照进 task.readonlyRepoPaths；运行时读快照、不回头查设置。
+   */
+  readonly?: boolean;
 }
 
 /**
@@ -542,6 +547,16 @@ export interface ActionRecord {
   startBaseline?: Record<string, string>;
 
   /**
+   * 只读仓启动基线（path → porcelain / ahead-of-upstream）、所有 action 类型交卷后置比对用。
+   * 不比 HEAD（允许 pull / 切提测分支）；工作区变脏或本地多出 upstream 没有的 commit → 红条。
+   * 缺 key / 采集失败 → 该仓跳过（fail-open）。
+   */
+  readonlyBaseline?: Record<
+    string,
+    { porcelain: string; ahead: string | null }
+  >;
+
+  /**
    * 副作用记录（对外部世界的影响）
    *
    * V0.6.1：ship 改成多仓数组——同一 ship action 多仓场景产出 N 条 MR、一仓 1 条记录
@@ -948,6 +963,13 @@ export interface Task {
    * undefined = 全 git（V0.10 前老任务不迁移、按全 git 处理）。
    */
   nonGitRepoPaths?: string[];
+  /**
+   * 只读仓清单（建 / 编辑任务改 repoPaths 时从 settings.repos[].readonly 快照落库）。
+   * 只读仓不进隔离 worktree（原地使用）、prompt 标注、后置检测、submit_mr 闸共用这份——
+   * 运行时不回头查设置（设置页中途改开关不影响已建任务）。
+   * undefined = 无只读仓（老任务不迁移）。
+   */
+  readonlyRepoPaths?: string[];
   /**
    * V0.6.3：每个仓的「线上分支」= feature 拉取基线（per-repo、key=repoPath、value=分支名）
    * - 来源：建 task 时从 settings.repos[].onlineBranch 快照固化（settings 在 localStorage、

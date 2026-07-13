@@ -30,6 +30,7 @@ import {
   ExternalLink,
   Flag,
   Loader2,
+  Lock,
   Pencil,
   RotateCcw,
   Sparkles,
@@ -82,7 +83,6 @@ import {
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
   deriveEffectiveBatches,
-  formatRepoPathsForDisplay,
   mrKindOf,
   mrTargetBranchOf,
 } from "@/lib/task-display";
@@ -646,9 +646,36 @@ const TaskDetailPage = () => {
                 className="text-xs text-muted-foreground"
                 title={task.repoPaths.join("\n")}
               >
-                {task.repoPaths.length > 0
-                  ? formatRepoPathsForDisplay(task.repoPaths)
-                  : "(未绑仓库、agent 在 home 跑)"}
+                {task.repoPaths.length > 0 ? (
+                  <span className="inline-flex flex-wrap items-center gap-x-1">
+                    {task.repoPaths.map((p, i) => {
+                      const readonly = (task.readonlyRepoPaths ?? []).includes(p);
+                      const label =
+                        task.repoPaths.length === 1
+                          ? p
+                          : p.replace(/\/+$/, "").split("/").pop() || p;
+                      return (
+                        <span
+                          key={p}
+                          className="inline-flex items-center gap-0.5"
+                        >
+                          {i > 0 && <span className="text-muted-foreground">+</span>}
+                          <span>{label}</span>
+                          {readonly && (
+                            <span title="只读仓库" className="inline-flex">
+                              <Lock
+                                className="size-3 text-muted-foreground"
+                                aria-label="只读仓库"
+                              />
+                            </span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </span>
+                ) : (
+                  "(未绑仓库、agent 在 home 跑)"
+                )}
                 {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name && (
                   <span
                     className="ml-2 font-mono"

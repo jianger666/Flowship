@@ -45,12 +45,22 @@ import path from "node:path";
 import type { ActionRecord, Task } from "@/lib/types";
 
 import { getActionArtifactPath } from "./task-fs-core";
-import { getTaskCwd, getTaskWorkRepoPaths } from "./task-worktrees";
+import {
+  getTaskCwd,
+  getTaskWorkRepoPaths,
+  isTaskReadonlyRepo,
+} from "./task-worktrees";
 
 export interface ActionCheckResult {
   passed: boolean;
   details: string;
 }
+
+export type ReadonlyRepoBaseline = {
+  porcelain: string;
+  /** null = 无 upstream、跳过 ahead 比对 */
+  ahead: string | null;
+};
 
 // 主入口：跑给定 action 的 deterministic 检查（v0.9.13 起全是轻量 fs / git 检查、同步 await 即可）
 export const runActionCheck = async (
@@ -58,26 +68,48 @@ export const runActionCheck = async (
   action: ActionRecord,
 ): Promise<ActionCheckResult> => {
   try {
+    let typeResult: ActionCheckResult;
     switch (action.type) {
       case "plan":
-        return await checkPlan(task, action);
+        typeResult = await checkPlan(task, action);
+        break;
       case "build":
-        return await checkBuild(task, action);
+        typeResult = await checkBuild(task, action);
+        break;
       case "learn":
-        return await checkLearn(task, action);
+        typeResult = await checkLearn(task, action);
+        break;
       case "review":
-        return await checkReview(task, action);
+        typeResult = await checkReview(task, action);
+        break;
       case "ship":
-        return await checkShip(task, action);
+        typeResult = await checkShip(task, action);
+        break;
       case "dev":
-        return await checkDev(task, action);
+        typeResult = await checkDev(task, action);
+        break;
       case "custom":
-        return await checkCustom(task, action);
+        typeResult = await checkCustom(task, action);
+        break;
       default: {
         const _: never = action.type;
-        return { passed: true, details: `未知 action 类型：${String(_)}、跳过` };
+        typeResult = {
+          passed: true,
+          details: `未知 action 类型：${String(_)}、跳过`,
+        };
       }
     }
+    // 只读仓后置检测：所有 action 类型通用；失败细节拼到 type 检查结果后
+    const readonlyResult = await checkReadonlyRepos(task, action);
+    if (!readonlyResult.passed) {
+      return {
+        passed: false,
+        details: typeResult.passed
+          ? readonlyResult.details
+          : `${typeResult.details}；${readonlyResult.details}`,
+      };
+    }
+    return typeResult;
   } catch (err) {
     // 兜底：检查脚本异常 → 不挡用户、报警 console
     console.warn(
@@ -233,10 +265,14 @@ const checkReview = async (
   // V0.6.27：review 只读硬校验——action 启动时记录的工作区指纹、此刻重算比对。
   // 不一致 = agent 在 review 期间改了代码（review 禁改代码原来纯 prompt 约束、漂了没人知道）。
   // startBaseline 缺失（老 action / 启动时记录失败）→ 跳过比对、fail-open。
+  // 只读仓不走指纹（允许 pull / 切提测分支会动工作树内容）——改由 checkReadonlyRepos 守。
   if (action.startBaseline) {
     const touched: string[] = [];
     // V0.10：隔离 task 的基线 key = worktree 路径（captureActionStartBaseline 同口径）
-    for (const repoPath of getTaskWorkRepoPaths(task)) {
+    const workPaths = getTaskWorkRepoPaths(task);
+    for (let i = 0; i < workPaths.length; i++) {
+      const repoPath = workPaths[i];
+      if (isTaskReadonlyRepo(task, task.repoPaths[i])) continue;
       const baseline = action.startBaseline[repoPath];
       if (!baseline) continue;
       const current = await computeWorktreeFingerprint(repoPath);
@@ -765,7 +801,7 @@ const discoverSiblingRepos = async (task: Task): Promise<string[]> => {
 /**
  * action 启动时采集工作区基线（task-runner 在 appendAction 后调、存 ActionRecord.startBaseline）
  *
- * - review：task 各仓的 worktreeFingerprint（内容指纹）——checkReview 比对、review 只读硬校验
+ * - review：task 各仓的 worktreeFingerprint（跳过只读仓——允许 pull / 切提测、改由 readonlyBaseline 守）
  * - build：cwd 下兄弟 git 仓的 status hash——checkBuild 比对、越权写错仓检测
  * - 其他 action 类型：undefined（不采集）
  *
@@ -778,14 +814,17 @@ export const captureActionStartBaseline = async (
   try {
     if (actionType === "review") {
       // V0.10：隔离 task 指纹按 worktree 路径采（agent 实际工作区、key 跟 checkReview 对齐）
+      const workPaths = getTaskWorkRepoPaths(task);
       const entries = await Promise.all(
-        getTaskWorkRepoPaths(task).map(async (p) => {
+        workPaths.map(async (p, i) => {
+          // 只读仓不采指纹（pull / 切提测会误报）
+          if (isTaskReadonlyRepo(task, task.repoPaths[i])) return null;
           const fp = await computeWorktreeFingerprint(p);
-          return [p, fp] as const;
+          return fp !== null ? ([p, fp] as const) : null;
         }),
       );
       const map = Object.fromEntries(
-        entries.filter((e): e is [string, string] => e[1] !== null),
+        entries.filter((e): e is [string, string] => e !== null),
       );
       return Object.keys(map).length > 0 ? map : undefined;
     }
@@ -811,6 +850,157 @@ export const captureActionStartBaseline = async (
     );
     return undefined;
   }
+};
+
+/**
+ * 采单个仓的只读检测快照：porcelain + ahead-of-upstream。
+ * 无 upstream 时 ahead=null（检查端跳过该项、避免误报）。
+ */
+export const captureReadonlyRepoState = async (
+  workDir: string,
+): Promise<ReadonlyRepoBaseline | null> => {
+  const status = await runShell("git", ["status", "--porcelain"], workDir, 30_000);
+  if (status.notFound || status.exitCode !== 0) return null;
+  // @{u} 在没设 upstream 时会非 0——记 null 跳过 ahead 比对（允许切到无跟踪的提测分支）
+  const aheadRes = await runShell(
+    "git",
+    ["log", "@{u}..HEAD", "--oneline"],
+    workDir,
+    30_000,
+  );
+  const ahead = aheadRes.exitCode === 0 ? aheadRes.stdout.trim() : null;
+  return { porcelain: status.stdout.trimEnd(), ahead };
+};
+
+/**
+ * 纯函数：比对只读仓基线 vs 当前状态，返失败说明列表（空 = 通过）。
+ * - porcelain 相对基线变脏 / 变了 → fail（列当前脏文件）
+ * - ahead 相对基线多出 commit → fail（列多出的 commit）
+ * - 不比 HEAD 本身（pull / 切提测分支会动 HEAD、不能误报）
+ */
+export const diffReadonlyRepoState = (
+  baseline: ReadonlyRepoBaseline,
+  current: ReadonlyRepoBaseline,
+): string[] => {
+  const fails: string[] = [];
+  if (
+    current.porcelain !== baseline.porcelain &&
+    current.porcelain.trim().length > 0
+  ) {
+    const files = current.porcelain
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    fails.push(`工作区被改脏：${files.join("、") || "（有未提交改动）"}`);
+  }
+  if (
+    current.ahead !== null &&
+    baseline.ahead !== null &&
+    current.ahead !== baseline.ahead &&
+    current.ahead.trim().length > 0
+  ) {
+    const baseSet = new Set(
+      baseline.ahead
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+    );
+    const extra = current.ahead
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !baseSet.has(l))
+      .slice(0, 20);
+    if (extra.length > 0) {
+      fails.push(`本地多出 upstream 没有的 commit：${extra.join("、")}`);
+    } else if (current.ahead.trim().length > 0) {
+      fails.push(
+        `本地相对 upstream 的 commit 集合相对启动时有变化：${current.ahead
+          .split("\n")
+          .filter(Boolean)
+          .slice(0, 10)
+          .join("、")}`,
+      );
+    }
+  } else if (
+    current.ahead !== null &&
+    baseline.ahead === null &&
+    current.ahead.trim().length > 0
+  ) {
+    fails.push(
+      `本地多出 upstream 没有的 commit：${current.ahead
+        .split("\n")
+        .filter(Boolean)
+        .slice(0, 20)
+        .join("、")}`,
+    );
+  }
+  return fails;
+};
+
+/**
+ * 任务含只读仓时、action 启动前采每个只读仓基线（存 ActionRecord.readonlyBaseline）。
+ * 无只读仓 / 全失败 → undefined。
+ */
+export const captureReadonlyRepoBaselines = async (
+  task: Task,
+): Promise<Record<string, ReadonlyRepoBaseline> | undefined> => {
+  try {
+    const readonlyPaths = task.readonlyRepoPaths ?? [];
+    if (readonlyPaths.length === 0) return undefined;
+    const workPaths = getTaskWorkRepoPaths(task);
+    const map: Record<string, ReadonlyRepoBaseline> = {};
+    for (let i = 0; i < task.repoPaths.length; i++) {
+      const original = task.repoPaths[i];
+      if (!readonlyPaths.includes(original)) continue;
+      const state = await captureReadonlyRepoState(workPaths[i]);
+      if (state) map[original] = state;
+    }
+    return Object.keys(map).length > 0 ? map : undefined;
+  } catch (err) {
+    console.warn(
+      `[action-check] captureReadonlyRepoBaselines 异常（跳过）task=${task.id}：`,
+      err,
+    );
+    return undefined;
+  }
+};
+
+/** 交卷后置：比对只读仓是否被改动（所有 action 类型） */
+const checkReadonlyRepos = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult> => {
+  const readonlyPaths = task.readonlyRepoPaths ?? [];
+  if (readonlyPaths.length === 0) {
+    return { passed: true, details: "" };
+  }
+  const baseline = action.readonlyBaseline;
+  // 启动时没采到基线 → fail-open（别因采集失败挡交卷）
+  if (!baseline || Object.keys(baseline).length === 0) {
+    return { passed: true, details: "" };
+  }
+  const workPaths = getTaskWorkRepoPaths(task);
+  const failParts: string[] = [];
+  for (let i = 0; i < task.repoPaths.length; i++) {
+    const original = task.repoPaths[i];
+    const base = baseline[original];
+    if (!base) continue;
+    const current = await captureReadonlyRepoState(workPaths[i]);
+    if (!current) continue;
+    const diffs = diffReadonlyRepoState(base, current);
+    if (diffs.length > 0) {
+      const tail = original.split("/").filter(Boolean).pop() ?? original;
+      failParts.push(`${tail}（${diffs.join("；")}）`);
+    }
+  }
+  if (failParts.length === 0) {
+    return { passed: true, details: "" };
+  }
+  return {
+    passed: false,
+    details: `只读仓被改动：${failParts.join("；")}`,
+  };
 };
 
 // ----------------- shell 工具 -----------------

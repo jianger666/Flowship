@@ -58,6 +58,15 @@ describe("validateSubmitMr", () => {
     expect(r.ok).toBe(true);
   });
 
+  it("只读仓拒绝提 MR", async () => {
+    const r = await validateSubmitMr(
+      baseTask({ readonlyRepoPaths: [REPO] }),
+      baseMr,
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("只读仓");
+  });
+
   it("repo_path 不在 task.repoPaths → 拒（核心越权防线）", async () => {
     const r = await validateSubmitMr(baseTask(), {
       ...baseMr,

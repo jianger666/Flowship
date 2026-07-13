@@ -158,6 +158,11 @@ export interface TaskMetaV06 {
    * undefined = 全 git（老任务）。
    */
   nonGitRepoPaths?: string[];
+  /**
+   * 只读仓清单快照（详见 types.ts Task.readonlyRepoPaths）。
+   * undefined = 无只读仓（老任务）。
+   */
+  readonlyRepoPaths?: string[];
   /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
   repoBaseBranches?: Record<string, string>;
   /** V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、建 task 时用户填、空则 build 用算法名） */
@@ -399,6 +404,7 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     role: meta.role,
     repoPaths: meta.repoPaths,
     nonGitRepoPaths: meta.nonGitRepoPaths,
+    readonlyRepoPaths: meta.readonlyRepoPaths,
     repoBaseBranches: meta.repoBaseBranches,
     repoFeatureBranches: meta.repoFeatureBranches,
     repoTestBranches: meta.repoTestBranches,

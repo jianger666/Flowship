@@ -113,9 +113,17 @@ const normalizeSettings = (
         legacyUsername
         ? "feature/{username}/{storyId}-{taskTitle}"
         : "";
-  const repos = (Array.isArray(parsed.repos) ? parsed.repos : []).map((r) =>
-    r?.branchTemplate ? { ...r, branchTemplate: bakeUsername(r.branchTemplate)! } : r,
-  );
+  const repos = (Array.isArray(parsed.repos) ? parsed.repos : []).map((r) => {
+    if (!r || typeof r !== "object") return r;
+    const withTpl = r.branchTemplate
+      ? { ...r, branchTemplate: bakeUsername(r.branchTemplate)! }
+      : { ...r };
+    // 只读开关：只认显式 true、其它（缺省 / 脏值）当可写
+    return {
+      ...withTpl,
+      readonly: r.readonly === true ? true : undefined,
+    };
+  });
   const merged = { ...DEFAULT_SETTINGS, ...parsed };
   // 老字段不落进归一结果（Partial 展开会带上、显式删）
   delete (merged as Record<string, unknown>).username;

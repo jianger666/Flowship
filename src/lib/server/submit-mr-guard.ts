@@ -72,6 +72,13 @@ export const validateSubmitMr = async (
       error: `repo_path ${a.repoPath} 不属于本 task（合法仓：${task.repoPaths.join(", ") || "无"}）`,
     };
   }
+  // 1b) 只读仓禁止提 MR（设置页只读开关快照）
+  if ((task.readonlyRepoPaths ?? []).includes(a.repoPath)) {
+    return {
+      ok: false,
+      error: `仓库 ${a.repoPath} 为只读仓、不允许提 MR`,
+    };
+  }
   // 2) action_id 必须是本 task 的 ship / dev / custom action（防把 MR 挂到错 action / 非提交阶段）
   //    ship = 提测（→测试分支）、dev = 联调提 PR（→dev 分支）、custom = 任意自定义 action（→target 不限、由 playbook 决定）、
   //    三者共用 submit_mr 同一通道（custom 对所有自定义 action 一视同仁、详见下方 target 校验）
