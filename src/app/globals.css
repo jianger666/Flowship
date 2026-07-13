@@ -310,6 +310,18 @@
   font-size: 0.8125rem;
   line-height: 1.6;
 }
+/* Streamdown + Shiki 双主题接法（防回归）：
+ * @tailwindcss/typography 的 `.prose pre` 默认是深底浅字（--tw-prose-pre-bg ≈ gray-800），
+ * 即使浅色主题也如此。Streamdown 的 token 色走 Shiki dual theme：
+ *   浅色 = text-[var(--sdm-c)]（github-light 深字）
+ *   深色 = dark:text-[var(--shiki-dark)]（github-dark 浅字）
+ * 若保留 prose 深底 → 浅色模式变成「深底 + 深字」几乎不可见。
+ * 这里把 pre 底/字交还给外层 code-block-body（bg-background）+ Shiki token 色，
+ * 勿再写死 #0d1117 之类颜色。深色模式靠 next-themes 的 .dark + Tailwind dark: 变体切。 */
+.prose [data-streamdown="code-block"] pre {
+  background-color: transparent;
+  color: inherit;
+}
 /* 行号隐藏（用户「太重」）：不能传 lineNumbers=false——上游 v2.x 该路径行 span 不带
    block class、非空行也不吐 \n、整块代码会塌成一行（headless 实测）。保留上游
    lineNumbers=true 的行结构（span.block + ::before 计数器）、只把行号伪元素藏掉。 */
