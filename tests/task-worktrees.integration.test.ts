@@ -78,7 +78,12 @@ afterAll(async () => {
 
 describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   const task = makeTask();
-  const workDir = getTaskWorkRepoPaths(task)[0];
+  // 混合隔离后路径映射按「有没有 .git」分流——必须等外层 beforeAll 把仓 init 完
+  // （.git 存在）再算 workDir，收集期算会被当成非 git 目录、原地返回 REPO 自身
+  let workDir: string;
+  beforeAll(() => {
+    workDir = getTaskWorkRepoPaths(task)[0];
+  });
 
   it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆依赖目录", async () => {
     const res = await ensureTaskWorktrees(task);
@@ -267,5 +272,75 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await expect(fs.access(workDir)).resolves.toBeUndefined();
     await expect(fs.readFile(conflictFile, "utf8")).resolves.toBe(before);
     expect(git(REPO, "worktree", "list")).toContain(workDir);
+  });
+
+  it("混合隔离：非 git 目录混进 repoPaths → ensure 不抛、映射原地、只建 git 仓 worktree", async () => {
+    // 纯脚本目录（无 .git、测试团队挂脚本库场景）——旧实现在这里直接 throw 拦推进
+    const scriptsDir = path.join(TMP_ROOT, "qa-scripts");
+    await fs.mkdir(scriptsDir, { recursive: true });
+    await fs.writeFile(path.join(scriptsDir, "run.sh"), "#!/bin/sh\necho ok\n");
+
+    const mixed = makeTask({
+      id: "t_1700000000004_it",
+      repoPaths: [REPO, scriptsDir],
+      nonGitRepoPaths: [scriptsDir],
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/777777",
+    });
+
+    // 路径映射：git 仓 → worktree 子目录；非 git → 原路径（index 对齐）
+    const workPaths = getTaskWorkRepoPaths(mixed);
+    expect(workPaths).toHaveLength(2);
+    expect(workPaths[0]).not.toBe(REPO);
+    expect(workPaths[0]).toContain(mixed.id);
+    expect(workPaths[1]).toBe(scriptsDir);
+
+    // ensure 平安走完：只建 git 仓的 worktree、非 git 跳过不抛
+    const res = await ensureTaskWorktrees(mixed);
+    expect(res.createdRepos).toEqual([REPO]);
+    // 分支记录只有 git 仓（非 git 无分支概念、不进 gitBranches）
+    expect(res.infos.map((i) => i.repoPath)).toEqual([REPO]);
+    expect(git(workPaths[0], "branch", "--show-current")).toBe(
+      "feature/777777-集成测试",
+    );
+    // 非 git 目录没被动过（没有 worktree 子目录、原文件还在）
+    await expect(
+      fs.readFile(path.join(scriptsDir, "run.sh"), "utf8"),
+    ).resolves.toContain("echo ok");
+
+    // 二次 ensure 幂等（非 git 跳过路径也幂等）
+    const again = await ensureTaskWorktrees(mixed);
+    expect(again.createdRepos).toEqual([]);
+
+    // remove：只清 git 仓 worktree、绝不碰非 git 原目录
+    const removed = await removeTaskWorktrees(mixed);
+    expect(removed.removedAny).toBe(true);
+    await expect(fs.access(workPaths[0])).rejects.toThrow();
+    await expect(
+      fs.readFile(path.join(scriptsDir, "run.sh"), "utf8"),
+    ).resolves.toContain("echo ok");
+  });
+
+  it("全仓非 git 的隔离 task：ensure 等效 no-op、remove 不碰原目录", async () => {
+    const onlyScripts = path.join(TMP_ROOT, "only-scripts");
+    await fs.mkdir(onlyScripts, { recursive: true });
+    await fs.writeFile(path.join(onlyScripts, "a.py"), "print(1)\n");
+
+    const t = makeTask({
+      id: "t_1700000000005_it",
+      repoPaths: [onlyScripts],
+      nonGitRepoPaths: [onlyScripts],
+      repoBaseBranches: {},
+    });
+    expect(getTaskWorkRepoPaths(t)).toEqual([onlyScripts]);
+
+    const res = await ensureTaskWorktrees(t);
+    expect(res.createdRepos).toEqual([]);
+    expect(res.infos).toEqual([]);
+
+    const removed = await removeTaskWorktrees(t);
+    expect(removed.removedAny).toBe(false);
+    await expect(
+      fs.readFile(path.join(onlyScripts, "a.py"), "utf8"),
+    ).resolves.toBe("print(1)\n");
   });
 });

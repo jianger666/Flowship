@@ -172,14 +172,16 @@ const inferDisabledReason = (
 
 // action 方块卡共用外观（内置 + 自定义两处渲染、单一来源）：
 // 主标题水平垂直居中、左上角固定 ✨ 角标点睛（用户拍板：统一星星、不搞每 action 一个 icon）
-// 总高维持原「标题+副标题」两行的块高；选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
+// 用 min-h-10 而非固定 h-10：短名单行时与原来等高；长名两行时块自然长高，grid 同行卡片自动拉齐
+// 选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
 const actionCardClass = (selected: boolean) =>
   cn(
-    "group flex h-10 w-full items-center justify-center py-0 px-0",
+    "group flex min-h-10 w-full items-center justify-center py-0 px-0",
     selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
   );
 
 // action 方块卡内容：居中 label + 左上角固定 ✨ 角标（选中品牌色、未选中 muted、hover 过渡）
+// ✨ 用 top-1/2 -translate-y-1/2 相对块高垂直居中，两行长高后仍天然居中，无需单独调
 const ActionCardContent = ({
   label,
   selected,
@@ -196,9 +198,11 @@ const ActionCardContent = ({
           : "text-muted-foreground/60 group-hover:text-muted-foreground",
       )}
     />
+    {/* 两行 clamp 代替单行 truncate：多个「飞书项目…」自定义 action 单行截断分不清；title 原生悬停兜底极端长名 */}
     <span
+      title={label}
       className={cn(
-        "w-full truncate px-6 text-center text-[13px] font-medium leading-none",
+        "w-full line-clamp-2 px-6 py-1.5 text-center text-[13px] font-medium leading-tight",
         selected && "text-primary",
       )}
     >

@@ -107,6 +107,7 @@ export const WorkspaceActions = ({ task }: Props) => {
     task.repoPaths,
     workCwd,
     task.isolateWorktree === true,
+    task.nonGitRepoPaths,
   );
 
   const copyPath = async () => {

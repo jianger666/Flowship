@@ -7,7 +7,6 @@
 import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 
-import { migrateCursorMcpOnce } from "@/lib/server/cursor-config";
 import { dataRoot } from "@/lib/server/data-root";
 import { errorResponse } from "@/lib/server/route-helpers";
 import {
@@ -26,13 +25,8 @@ const configPath = (): string => settingsFilePath();
  *
  * CR-01：默认口径不再全量导出密钥——client 初始化要拿真值走 `/api/settings/full`
  * （仅 loopback、middleware 已强制）。文件不存在返 exists:false。
- *
- * V0.13：读之前先 await MCP 一次性迁移——保证 client 首次拉到的 settings 一定
- * 含 Cursor 快照（否则 client cache 是旧的、之后整对象 PUT 会把迁移结果盖丢）。
- * 迁移跑过后是同步 marker 检查、零开销。
  */
 export const GET = async (): Promise<Response> => {
-  await migrateCursorMcpOnce();
   const settings = await readSettingsFile();
   if (!settings) {
     return NextResponse.json({ exists: false, settings: null });
@@ -47,13 +41,9 @@ export const GET = async (): Promise<Response> => {
  * 写配置：PUT /api/settings、body = 整份 settings 对象、返 { ok, settings: 最终盘上内容 }
  * 原子写（tmp + rename）防写一半损坏（沿用 task-fs 的 meta 落盘方式）。
  *
- * CR-01：响应里的 settings 也脱敏（client 只从中回填 mcpServers、掩码不影响）。
+ * CR-01：响应里的 settings 也脱敏。
  * CR-08：写操作串行化（进程级 promise chain）——两个快速 PUT 不会乱序互相覆盖、
  * 后到的请求一定后落盘。
- *
- * V0.13：写完补跑 MCP 迁移——localStorage 过渡期老用户的 config.json 是首次 PUT
- * 才出生的、迁移必须在那之后跑；返回最终盘上 settings 让 client 回填 cache
- * （否则 client cache 不含快照、下次 PUT 盖丢）。
  */
 
 // 写队列单例（dev 多 chunk 共享 globalThis、对齐 preview-manager 的做法）
@@ -92,8 +82,6 @@ export const PUT = async (req: Request): Promise<Response> => {
       .slice(2)}`;
     await fs.writeFile(tmpPath, JSON.stringify(guarded, null, 2), "utf-8");
     await fs.rename(tmpPath, finalPath);
-    // 首次落盘后补迁移（marker 已在则零开销）、把最终盘上内容返给 client 回填
-    await migrateCursorMcpOnce();
     const finalRaw = await fs.readFile(finalPath, "utf-8");
     return NextResponse.json({
       ok: true,

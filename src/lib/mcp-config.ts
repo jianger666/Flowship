@@ -1,21 +1,8 @@
 /**
- * MCP 配置合并（client / server 共用）
+ * MCP 配置常量（client / server 共用）
  *
- * Cursor ~/.cursor/mcp.json 与 fe 自管 settings.mcpServers 合并；
- * 同名时 fe 覆盖（ intentional override）。
+ * 合并 Cursor + 自管配置的 mergeMcpSources 已删——运行时只读 fe 自管、
+ * Cursor mcp.json 仅作能力页「从 Cursor 导入」源、不再做隐式合并。
  */
-import type { McpServerConfig } from "@cursor/sdk";
-
 /** runtime 强制注入、不允许用户占用 */
 export const RESERVED_MCP_NAMES = new Set(["aiFlowChat"]);
-
-export const mergeMcpSources = (
-  cursor: Record<string, McpServerConfig>,
-  app: Record<string, McpServerConfig>,
-): Record<string, McpServerConfig> => {
-  const out = { ...cursor };
-  for (const [name, cfg] of Object.entries(app)) {
-    if (!RESERVED_MCP_NAMES.has(name)) out[name] = cfg;
-  }
-  return out;
-};

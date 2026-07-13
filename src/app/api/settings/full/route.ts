@@ -8,14 +8,11 @@
  */
 import { NextResponse } from "next/server";
 
-import { migrateCursorMcpOnce } from "@/lib/server/cursor-config";
 import { readSettingsFile } from "@/lib/server/settings-fs";
 
 export const runtime = "nodejs";
 
 export const GET = async (): Promise<Response> => {
-  // 同 /api/settings GET：先补 MCP 一次性迁移、client 首次拉到的一定含快照
-  await migrateCursorMcpOnce();
   const settings = await readSettingsFile();
   if (!settings) {
     return NextResponse.json({ exists: false, settings: null });

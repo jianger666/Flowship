@@ -78,6 +78,7 @@ import {
   isWorktreeTask,
   removeTaskWorktrees,
   resolveOriginalRepoPath,
+  taskHasGitRepo,
 } from "./task-worktrees";
 import { loadSkills, type SkillEntry } from "./skills-loader";
 import {
@@ -110,10 +111,12 @@ import {
   buildReviewScopeDirective,
   buildSuperPrompt,
   buildTaskUpdateHint,
+  buildQaRoleDirective,
   captureTaskFieldsSnapshot,
   loadActionPrompt,
 } from "./task-prompts";
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
+import { readSettingsFile } from "./settings-fs";
 import {
   checkActionPrerequisites,
   planBranchesForBuild,
@@ -1562,6 +1565,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
       // 飞书项目推导发起人姓名 + 设置页角色（失败返空串、不堵启动）
       const userIdentityLine = await resolveUserIdentityForPrompt();
+      // 设置页「我的角色 = 测试」且绑了仓 → 注入 QA 约定段（纯 prompt、失败当未设）
+      const settings = await readSettingsFile().catch(() => null);
+      const qaRoleDirective =
+        settings?.userRole === "qa" &&
+        task.mode === "task" &&
+        task.repoPaths.length > 0
+          ? buildQaRoleDirective("task", taskHasGitRepo(task))
+          : "";
       const superPrompt = await buildSuperPrompt(
         task,
         skills,
@@ -1575,6 +1586,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           replanDirective,
         },
         userIdentityLine,
+        qaRoleDirective,
       );
 
       const run = await agent.send(superPrompt);

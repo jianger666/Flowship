@@ -6,7 +6,8 @@
  *   - getShipPrecheck：ship 前流程提醒（v0.9.13 CheckRun 门禁删除后只剩 reviewMissing、非阻断）
  *   - planBranchesForBuild：build 首动作的分支规划 + idempotent checkout hint
  *
- * 依赖方向（保证无环）：只依赖 branch-template / types、不 import task-runner。
+ * 依赖方向（保证无环）：只依赖 branch-template / task-worktrees（isTaskNonGitRepo 读快照）/
+ * types、不 import task-runner。
  */
 
 import {
@@ -14,6 +15,7 @@ import {
   extractFeishuStoryId,
   renderBranchName,
 } from "@/lib/branch-template";
+import { isTaskNonGitRepo } from "./task-worktrees";
 import type {
   ActionType,
   GitBranchInfo,
@@ -142,7 +144,11 @@ export const planBranchesForBuild = (
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
     return null;
   }
-  const repoPaths = task.repoPaths ?? [];
+  // 只对 git 仓拼 checkout hint——非 git 目录跑 git 必炸；全仓非 git → 不注入
+  // 读 nonGitRepoPaths 快照（禁止运行时 existsSync）
+  const repoPaths = (task.repoPaths ?? []).filter(
+    (p) => !isTaskNonGitRepo(task, p),
+  );
   if (repoPaths.length === 0) {
     return null;
   }

@@ -59,6 +59,7 @@ import type {
 import { mrTargetBranchOf } from "@/lib/task-display";
 import {
   cleanupOrphanTaskWorktrees,
+  computeNonGitRepoPaths,
   getTaskCwd,
   isWorktreeTask,
   removeTaskWorktrees,
@@ -320,6 +321,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     mrs: [],
     role: input.role ?? "fe",
     repoPaths: trimmedRepoPaths,
+    // 建 task 时快照：之后路径映射 / cwd 聚合读这份，不再运行时 existsSync
+    nonGitRepoPaths: computeNonGitRepoPaths(trimmedRepoPaths),
     repoBaseBranches:
       Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
     repoFeatureBranches:
@@ -683,6 +686,8 @@ export const updateTaskFields = async (
           meta.repoBranchTemplates,
           input.addRepoBranchTemplates,
         );
+        // 追加仓后重算非 git 快照（只增不删、但新仓可能是脚本目录）
+        meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
       }
     }
 
@@ -746,6 +751,8 @@ export const setTaskRepoPaths = async (
     meta.repoPaths = repoPaths
       .map((p) => p.trim().replace(/\/+$/, ""))
       .filter((p) => p.length > 0);
+    // chat 重选工作目录也要刷新快照（cwd / 路径映射契约同一份）
+    meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

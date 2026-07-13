@@ -942,6 +942,13 @@ export interface Task {
   role: TaskRole;
   repoPaths: string[];
   /**
+   * 非 git 目录清单（建 / 编辑任务改 repoPaths 时 existsSync(.git) 快照落库）。
+   * worktree 映射、cwd 聚合、客户端「在 IDE 打开」拼路径、prompt 文案共用这份——
+   * 运行时不再 existsSync 分流（原仓被移走 / 偶发 IO 会漂）。
+   * undefined = 全 git（V0.10 前老任务不迁移、按全 git 处理）。
+   */
+  nonGitRepoPaths?: string[];
+  /**
    * V0.6.3：每个仓的「线上分支」= feature 拉取基线（per-repo、key=repoPath、value=分支名）
    * - 来源：建 task 时从 settings.repos[].onlineBranch 快照固化（settings 在 localStorage、
    *   server 端读不到、所以建 task 时 client 快照进 task、之后 build 用这份）

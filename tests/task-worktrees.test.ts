@@ -1,11 +1,17 @@
 /**
  * 任务隔离工作区（V0.10）纯函数单测
  *
- * 只测不碰 git / fs 的部分：隔离判定、原仓库 ↔ worktree 路径双向映射、
+ * 只测不碰 git / fs 写操作的部分：隔离判定、原仓库 ↔ worktree 路径双向映射、
  * 分支规划（含 storyId 兜底）、目录短名去重。路径映射错 = agent cwd 错 /
  * submit_mr 校验误拦 / artifact 链接全断、是本特性的正确性基本盘。
+ *
+ * 混合隔离读 nonGitRepoPaths 快照分流（不再运行时 existsSync）——测试里显式塞快照。
+ * isGitRepoPath 仅保留给建 / 编辑任务算快照用、仍用临时目录 + 手造 .git 标记测。
  */
-import { beforeAll, describe, expect, it } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Task } from "@/lib/types";
 
@@ -16,15 +22,37 @@ beforeAll(() => {
 });
 process.env.FE_AI_FLOW_DATA_DIR = DATA;
 
+// fixture：git 仓 = 带 .git 子目录的临时目录；非 git = 裸目录（算快照用）
+const FIXTURE = path.join(os.tmpdir(), `fe-wt-unit-${process.pid}`);
+const REPO_WEB = path.join(FIXTURE, "work", "crm-web");
+const REPO_API = path.join(FIXTURE, "work", "crm-api");
+const REPO_CLIENT_A = path.join(FIXTURE, "a", "client");
+const REPO_CLIENT_B = path.join(FIXTURE, "b", "client");
+// 非 git 纯脚本目录（测试团队挂脚本库场景）——故意放在不同父目录下、验证 cwd 不漂到公共祖先
+const SCRIPTS_DIR = path.join(FIXTURE, "scripts-elsewhere", "qa-scripts");
+for (const repo of [REPO_WEB, REPO_API, REPO_CLIENT_A, REPO_CLIENT_B]) {
+  mkdirSync(path.join(repo, ".git"), { recursive: true });
+}
+mkdirSync(SCRIPTS_DIR, { recursive: true });
+
+afterAll(() => {
+  rmSync(FIXTURE, { recursive: true, force: true });
+});
+
 import {
   getTaskCwd,
   getTaskWorkRepoPaths,
+  isGitRepoPath,
   isWorktreeTask,
   parseMainGitDirFromPointer,
   planWorktreeBranchInfos,
   resolveOriginalRepoPath,
 } from "@/lib/server/task-worktrees";
-import { getRepoWorkDirs, getUniqueRepoDirNames } from "@/lib/path-utils";
+import {
+  formatRepoSectionForPrompt,
+  getRepoWorkDirs,
+  getUniqueRepoDirNames,
+} from "@/lib/path-utils";
 import { extractFeishuStoryId } from "@/lib/branch-template";
 
 const baseTask = (patch: Partial<Task> = {}): Task =>
@@ -35,12 +63,24 @@ const baseTask = (patch: Partial<Task> = {}): Task =>
     role: "fe",
     repoStatus: "developing",
     runStatus: "idle",
-    repoPaths: ["/Users/me/work/crm-web"],
+    repoPaths: [REPO_WEB],
     isolateWorktree: true,
     actions: [],
     mrs: [],
     ...patch,
   }) as Task;
+
+/** 混合仓快捷构造：显式带 nonGitRepoPaths 快照（运行时映射读这份） */
+const mixedTask = (
+  gitRepos: string[],
+  nonGitRepos: string[],
+  patch: Partial<Task> = {},
+): Task =>
+  baseTask({
+    repoPaths: [...gitRepos, ...nonGitRepos],
+    nonGitRepoPaths: nonGitRepos,
+    ...patch,
+  });
 
 describe("isWorktreeTask 隔离判定", () => {
   it("task 模式 + isolateWorktree=true + 有仓 → 隔离", () => {
@@ -55,11 +95,19 @@ describe("isWorktreeTask 隔离判定", () => {
   });
 });
 
+describe("isGitRepoPath 判定（仅建 / 编辑任务算快照用）", () => {
+  it("带 .git 的目录 = git 仓、裸目录 / 不存在的路径 = 非 git", () => {
+    expect(isGitRepoPath(REPO_WEB)).toBe(true);
+    expect(isGitRepoPath(SCRIPTS_DIR)).toBe(false);
+    expect(isGitRepoPath("/no/such/path")).toBe(false);
+  });
+});
+
 describe("getTaskWorkRepoPaths / getTaskCwd 路径映射", () => {
   it("非隔离 task 原样透传（V0.9 行为不变）", () => {
     const t = baseTask({ isolateWorktree: false });
-    expect(getTaskWorkRepoPaths(t)).toEqual(["/Users/me/work/crm-web"]);
-    expect(getTaskCwd(t)).toBe("/Users/me/work/crm-web");
+    expect(getTaskWorkRepoPaths(t)).toEqual([REPO_WEB]);
+    expect(getTaskCwd(t)).toBe(REPO_WEB);
   });
 
   it("单仓隔离：work path = worktrees/<taskId>/<仓短名>、cwd = 该 worktree", () => {
@@ -70,9 +118,7 @@ describe("getTaskWorkRepoPaths / getTaskCwd 路径映射", () => {
   });
 
   it("多仓隔离：cwd = worktrees/<taskId>（公共父目录）、顺序跟 repoPaths 对齐", () => {
-    const t = baseTask({
-      repoPaths: ["/Users/me/work/crm-web", "/Users/me/work/crm-api"],
-    });
+    const t = baseTask({ repoPaths: [REPO_WEB, REPO_API] });
     expect(getTaskWorkRepoPaths(t)).toEqual([
       `${DATA}/worktrees/${t.id}/crm-web`,
       `${DATA}/worktrees/${t.id}/crm-api`,
@@ -80,33 +126,73 @@ describe("getTaskWorkRepoPaths / getTaskCwd 路径映射", () => {
     expect(getTaskCwd(t)).toBe(`${DATA}/worktrees/${t.id}`);
   });
 
-  it("同名末段仓（/a/client + /b/client）短名追加序号去重", () => {
-    const t = baseTask({ repoPaths: ["/a/client", "/b/client"] });
+  it("同名末段仓（a/client + b/client）短名追加序号去重", () => {
+    const t = baseTask({ repoPaths: [REPO_CLIENT_A, REPO_CLIENT_B] });
     expect(getTaskWorkRepoPaths(t)).toEqual([
       `${DATA}/worktrees/${t.id}/client`,
       `${DATA}/worktrees/${t.id}/client-2`,
     ]);
   });
+
+  it("混合隔离：git 仓映射 worktree、非 git 目录原地、index 对齐", () => {
+    const t = mixedTask([REPO_WEB], [SCRIPTS_DIR]);
+    expect(getTaskWorkRepoPaths(t)).toEqual([
+      `${DATA}/worktrees/${t.id}/crm-web`,
+      SCRIPTS_DIR, // 非 git 原样返回、脚本库没有分支概念不需要隔离
+    ]);
+  });
+
+  it("混合 1 git + 非 git：cwd = 该 git worktree 自身（非 git 不参与聚合、不漂到公共祖先）", () => {
+    const t = mixedTask([REPO_WEB], [SCRIPTS_DIR]);
+    const wt = `${DATA}/worktrees/${t.id}/crm-web`;
+    expect(getTaskCwd(t)).toBe(wt);
+    // 旧实现会对 [worktree, scripts] 做公共父 → 落到 FIXTURE 甚至更高、必错
+    expect(getTaskCwd(t)).not.toBe(FIXTURE);
+  });
+
+  it("混合多 git + 非 git：cwd = worktrees/<taskId> 容器", () => {
+    const t = mixedTask([REPO_WEB, REPO_API], [SCRIPTS_DIR]);
+    expect(getTaskCwd(t)).toBe(`${DATA}/worktrees/${t.id}`);
+  });
+
+  it("全仓非 git 的隔离 task：路径全部原地、cwd = 原路径公共父", () => {
+    const t = baseTask({
+      repoPaths: [SCRIPTS_DIR],
+      nonGitRepoPaths: [SCRIPTS_DIR],
+    });
+    expect(getTaskWorkRepoPaths(t)).toEqual([SCRIPTS_DIR]);
+    expect(getTaskCwd(t)).toBe(SCRIPTS_DIR);
+  });
+
+  it("老任务 nonGitRepoPaths=undefined → 按全 git 映射（不迁移兜底）", () => {
+    const t = baseTask({
+      repoPaths: [REPO_WEB, SCRIPTS_DIR],
+      nonGitRepoPaths: undefined,
+    });
+    // 无快照时 SCRIPTS_DIR 也被当 git、映射进 worktree（老任务本就不会挂非 git）
+    expect(getTaskWorkRepoPaths(t)[1]).toContain(`/worktrees/${t.id}/`);
+  });
 });
 
 describe("resolveOriginalRepoPath 反向归一（submit_mr 用）", () => {
-  const t = baseTask({
-    repoPaths: ["/Users/me/work/crm-web", "/Users/me/work/crm-api"],
-  });
+  const t = baseTask({ repoPaths: [REPO_WEB, REPO_API] });
 
   it("agent 上报 worktree 路径 → 归一回原仓库路径（含尾斜杠容错）", () => {
     const wt = `${DATA}/worktrees/${t.id}/crm-api`;
-    expect(resolveOriginalRepoPath(t, wt)).toBe("/Users/me/work/crm-api");
-    expect(resolveOriginalRepoPath(t, `${wt}/`)).toBe("/Users/me/work/crm-api");
+    expect(resolveOriginalRepoPath(t, wt)).toBe(REPO_API);
+    expect(resolveOriginalRepoPath(t, `${wt}/`)).toBe(REPO_API);
   });
 
   it("上报的已是原仓库路径 / 未知路径 → 原样返回（交下游校验兜底）", () => {
-    expect(resolveOriginalRepoPath(t, "/Users/me/work/crm-web")).toBe(
-      "/Users/me/work/crm-web",
-    );
+    expect(resolveOriginalRepoPath(t, REPO_WEB)).toBe(REPO_WEB);
     expect(resolveOriginalRepoPath(t, "/some/other/repo")).toBe(
       "/some/other/repo",
     );
+  });
+
+  it("混合隔离：非 git 目录 workPath = 原路径、归一恒等成立", () => {
+    const mixed = mixedTask([REPO_WEB], [SCRIPTS_DIR]);
+    expect(resolveOriginalRepoPath(mixed, SCRIPTS_DIR)).toBe(SCRIPTS_DIR);
   });
 
   it("非隔离 task 恒原样返回", () => {
@@ -135,7 +221,7 @@ describe("planWorktreeBranchInfos 分支规划", () => {
   it("用户指定「已有工作分支」优先于模板", () => {
     const t = baseTask({
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/123456",
-      repoFeatureBranches: { "/Users/me/work/crm-web": "feature/mine" },
+      repoFeatureBranches: { [REPO_WEB]: "feature/mine" },
     });
     expect(planWorktreeBranchInfos(t)[0].name).toBe("feature/mine");
   });
@@ -144,9 +230,16 @@ describe("planWorktreeBranchInfos 分支规划", () => {
     const infos = planWorktreeBranchInfos(baseTask());
     expect(infos[0].name).toBe("feature/1700000000000-测试需求");
   });
+
+  it("混合隔离：只给 git 仓造分支记录、非 git 目录不进 gitBranches", () => {
+    const t = mixedTask([REPO_WEB], [SCRIPTS_DIR]);
+    const infos = planWorktreeBranchInfos(t);
+    expect(infos).toHaveLength(1);
+    expect(infos[0].repoPath).toBe(REPO_WEB);
+  });
 });
 
-describe("getUniqueRepoDirNames / extractFeishuStoryId 基础件", () => {
+describe("getUniqueRepoDirNames / getRepoWorkDirs / formatRepoSection / storyId", () => {
   it("短名去重：重名追加 -2 / -3、顺序确定", () => {
     expect(getUniqueRepoDirNames(["/a/web", "/b/web", "/c/web"])).toEqual([
       "web",
@@ -189,6 +282,57 @@ describe("getUniqueRepoDirNames / extractFeishuStoryId 基础件", () => {
     expect(
       getRepoWorkDirs(["/a/web"], "/data/worktrees/t1/web", true)[0].workDir,
     ).toBe("/data/worktrees/t1/web");
+  });
+
+  it("getRepoWorkDirs 混合：非 git 用原路径、唯一 git 仓用 workCwd 自身", () => {
+    const dirs = getRepoWorkDirs(
+      ["/repos/crm-web", "/scripts/qa"],
+      "/data/worktrees/t1/crm-web",
+      true,
+      ["/scripts/qa"],
+    );
+    expect(dirs.map((d) => d.workDir)).toEqual([
+      "/data/worktrees/t1/crm-web",
+      "/scripts/qa",
+    ]);
+  });
+
+  it("getRepoWorkDirs 混合多 git：git 拼容器下短名、非 git 原路径", () => {
+    const dirs = getRepoWorkDirs(
+      ["/repos/web", "/repos/api", "/scripts/qa"],
+      "/data/worktrees/t1",
+      true,
+      ["/scripts/qa"],
+    );
+    expect(dirs.map((d) => d.workDir)).toEqual([
+      "/data/worktrees/t1/web",
+      "/data/worktrees/t1/api",
+      "/scripts/qa",
+    ]);
+  });
+
+  it("formatRepoSectionForPrompt 混合：标注种类、用传入 agentCwd、不说『下挂 N 个 git』", () => {
+    const text = formatRepoSectionForPrompt(
+      ["/data/wt/crm-web", "/scripts/qa"],
+      {
+        agentCwd: "/data/wt/crm-web",
+        nonGitRepoPaths: ["/scripts/qa"],
+        originalRepoPaths: ["/repos/crm-web", "/scripts/qa"],
+      },
+    );
+    expect(text).toContain("agent cwd");
+    expect(text).toContain("/data/wt/crm-web");
+    // 标注是中性的「git 仓库」——chat / 非隔离任务也走混合模板、不能写死「隔离」
+    expect(text).toContain("（git 仓库）");
+    expect(text).toContain("非 git 目录");
+    expect(text).not.toContain("下挂");
+    expect(text).not.toContain("公共父目录");
+  });
+
+  it("formatRepoSectionForPrompt 纯多 git：现状模板保留", () => {
+    const text = formatRepoSectionForPrompt(["/a/web", "/a/api"]);
+    expect(text).toContain("下挂 2 个 git 仓库子目录");
+    expect(text).toContain("公共父目录");
   });
 
   it("storyId：detail 段优先、长数字兜底、抠不到返 null", () => {

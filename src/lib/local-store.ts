@@ -220,13 +220,8 @@ const warnIfMigrationExpired = (): void => {
  * localStorage 兜底的缓存、下次启动再试。
  */
 /**
- * PUT config.json 并消费返回（V0.13）：server 可能在首次落盘后跑 MCP 一次性迁移
- * （Cursor 快照合入 mcpServers）——盘上最终内容随响应返回、这里回填进 cache、
- * 否则 cache 不含快照、下次整对象 PUT 会把迁移结果盖丢。
- * 只回填 mcpServers（server 唯一会改的字段）、不整包覆盖——防连续快速编辑时
- * 响应把用户更新的其它字段顶回去。
- *
- * CR-08：非 2xx 一律 throw——原实现 500 也静默当成功、重启后修改凭空消失。
+ * PUT config.json（CR-08：非 2xx 一律 throw——原实现 500 也静默当成功、重启后修改凭空消失）。
+ * 响应里的 settings 脱敏后不再需要回填 mcpServers（server 不再在 PUT 后改写该字段）。
  */
 const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
   const res = await fetch(API, {
@@ -243,21 +238,6 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
       // 错误体不是 JSON、用状态码兜底
     }
     throw new Error(message);
-  }
-  try {
-    const data = (await res.json()) as {
-      ok?: boolean;
-      settings?: Partial<FeAiFlowSettings>;
-    };
-    const returned = data?.settings?.mcpServers;
-    if (
-      returned &&
-      JSON.stringify(returned) !== JSON.stringify(body.mcpServers ?? {})
-    ) {
-      cache = { ...cache, mcpServers: returned };
-    }
-  } catch {
-    // 响应体解析失败不影响写入本身（写已成功、只是拿不到回填）
   }
 };
 
@@ -280,7 +260,7 @@ export const initSettings = (): Promise<void> => {
         cache = normalizeSettings(data.settings as Partial<FeAiFlowSettings>);
       } else if (data.exists === false) {
         // 明确「文件不存在」才算首次升级：把当前缓存（localStorage 旧配置 / 默认）
-        // 迁移进 config.json；server 会在落盘后补跑 MCP 迁移、putSettings 回填快照进 cache
+        // 迁移进 config.json；MCP 不自动从 Cursor 搬——用户在能力页自己导入
         await putSettings(cache);
       } else {
         // exists 字段缺失 = 响应形状不对、按失败处理（防误迁移）

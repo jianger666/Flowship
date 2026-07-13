@@ -63,6 +63,9 @@ import {
   resolveTaskMcpServers,
 } from "./cursor-config";
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
+import { readSettingsFile } from "./settings-fs";
+import { buildQaRoleDirective } from "./task-prompts";
+import { taskHasGitRepo } from "./task-worktrees";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
@@ -277,6 +280,8 @@ const buildInitialPrompt = (
   firstMessage?: InitialUserMessage,
   /** 飞书项目推导的发起人姓名行；空串 = 不注入 */
   userIdentityLine = "",
+  /** 设置页 userRole=qa 且绑仓时的测试角色约定；空串 = 不注入 */
+  qaRoleDirective = "",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -319,8 +324,17 @@ const buildInitialPrompt = (
     "   - skill 触发是判断性的、不是每轮都读、按描述匹配场景再读",
     "   - 同一段对话内同一个 skill 通常读一次就够、内容已经在你 context 里",
     "",
-    `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths)}`,
+    `## 任务 cwd（agent shell / read 默认基准目录）：${formatRepoSectionForPrompt(task.repoPaths, {
+      nonGitRepoPaths: task.nonGitRepoPaths,
+      originalRepoPaths: task.repoPaths,
+    })}`,
     "",
+  );
+  // QA 角色 + 绑仓：紧挨 cwd 注入测试约定（chat 没单独「仓库分支配置」段、约定自带默认 test）
+  if (qaRoleDirective.trim()) {
+    lines.push(qaRoleDirective.trim(), "");
+  }
+  lines.push(
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
     "",
     `  \`${eventsLogPath}\``,
@@ -683,12 +697,19 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const rulesSection = await readAppRulesForPrompt();
     // resolve = 姓名（meegle）+ 设置页角色、失败返空串（不堵启动）
     const userIdentityLine = await resolveUserIdentityForPrompt();
+    // 设置页「我的角色 = 测试」且绑了仓 → 注入 QA 约定（chat 聊代码也不该被引导改仓）
+    const settings = await readSettingsFile().catch(() => null);
+    const qaRoleDirective =
+      settings?.userRole === "qa" && task.repoPaths.length > 0
+        ? buildQaRoleDirective("chat", taskHasGitRepo(task))
+        : "";
     const initialPrompt = buildInitialPrompt(
       task,
       skills,
       rulesSection,
       firstMessage,
       userIdentityLine,
+      qaRoleDirective,
     );
     run = await agent.send(initialPrompt);
 

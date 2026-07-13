@@ -301,19 +301,20 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13 v1.1.6 发版：非 git 目录混合隔离 + 测试角色约定 + MCP 去自动导入（蓝军终审 1P0 拦下修完复审过）
+
+- **非 git 目录不再拦推进（混合隔离）**：task 绑的 repoPath 没有 `.git` 时——git 仓照旧建 worktree、非 git 目录跳过隔离原地使用（脚本库无分支概念）。核心：`Task.nonGitRepoPaths` 快照（createTask / updateTaskFields / setTaskRepoPaths 三写点、undefined=全 git 老任务兜底、**不做运行时 existsSync**——防 .git 中途增删映射漂移）；`getTaskWorkRepoPaths` 逐仓映射；**`getTaskCwd` 只对 git worktree 聚合**（终审 P0：混着原路径算公共父会漂到 $HOME、agent cwd / IDE 打开路径 / 兄弟仓扫描全翻车——已修+单测锁死）；`formatRepoSectionForPrompt` 混合模板逐仓标注；client `getRepoWorkDirs` 非 git 用原路径；`planBranchesForBuild` 非 git 跳过 checkout hint
+- **测试角色约定（纯 prompt、零服务端行为改动、用户拍板「简单点」）**：`settings.userRole === "qa"` 时 task（+绑仓 chat）注入 `buildQaRoleDirective`——不改仓库代码/不建分支/不 commit push MR（产物放任务目录或非 git 目录）、验证基线=各仓提测分支（detached 姿势切、显式豁免隔离段「禁止 checkout」）、给了 MR 链接用 `merge-requests/<iid>/head` 原生 ref 拉（不需要分支名/Token）、提测分支多需求集成只验当前需求范围；chat 变体不引用「仓库分支配置」段、纯非 git 任务只注入通用部分
+- **MCP 去 Cursor 全局自动导入**：删 V0.13 `migrateCursorMcpOnce` 整套（新用户首次落盘 config.json 会静默快照 ~/.cursor/mcp.json、用户拍板不可接受）；「从 Cursor 导入」手动链路是唯一导入口；老用户早已迁移完成无影响
+- **推进弹窗 action 卡长名两行**：h-10→min-h-10 + truncate→line-clamp-2 + title 兜底（多个「飞书项目…」自定义 action 分不清）
+- 流程：4 个 grok 子代理并行实施 → 蓝军终审拦下 1 P0 + 1 P1 + 2 P2 → 修复子代理全修 → 蓝军复审通过；余 3 个文案级 P2 攒下版
+
 ### 2026-07-13 v1.1.5 发版：mac Intel（darwin-x64）安装包支持
 
 - **发版矩阵扩三项**：win x64 / mac arm64 / mac x64（arm64 runner 交叉打、`@cursor/sdk-darwin-x64` 平台包对称走 npm pack）；electron-builder.yml mac target 不再写死 arch、CLI `--arm64`/`--x64` 决定（本地 test 打包不带 flag 仍本机架构）
 - **update-manifest 挪 finalize job**：两个 mac job 各签只含自己 dmg 的 manifest 会互相 clobber → finalize 统一 `gh release download` 两枚 dmg（draft、断言恰好 2 枚、少了硬红）→ 一次签进 files[] → upload → 才转正 draft；壳 `verifyDownloadedUpdate` 按 asset 名找条目、多文件 manifest 对老壳向后兼容
 - **壳自更新按 `process.arch` 拼 dmg 名**（main.js、arm64/x64 两处共用 assetName）；README 补 Intel 行
 - 蓝军 review 无 P0；观察点：首个双 mac tag 盯 finalize 的 `gh release download` 对 draft 是否稳（挂了 = 发不出去 fail-closed、不伤存量用户）
-
-### 2026-07-13 v1.1.4 发版：就绪清单补 GitLab Token + 飞书登录态闪烁根治 + 提测 playbook 切内置 meegle CLI
-
-- **就绪清单五项**：GitLab Token 进首页「开始使用」第 3 步（hint「提 MR 用的凭据」、锚点设置→连接）、仓库/角色顺延 4/5；Host 不进清单（已自动从仓库 origin 推导）
-- **飞书登录态闪烁根治**（同事实测「回工作台又提示去填、过会儿又好」）：状态接口 stale-while-revalidate 的真探测把**瞬态失败**（auth status 超时 / meegle exit 2 网络不可达）当「未登录」写坏快照落盘 → 回首页秒回坏快照闪清单、3s 后台纠正又回看板。两层修：服务端 `mergeAuthPreserve`（feishu-cli.ts）——瞬态「未登录」不把已登录快照降级、transient 只在探测内部流转不进对外 StatusSnapshot；客户端 stickyReady（localStorage `fe-ai-flow:setup-ready-seen`）——曾全就绪过就不再渲清单、跳过 CLI 轮询（飞书真掉登录靠看板降级态引导）
-- **提测 playbook 去飞书项目 MCP 依赖**（action-ship.md）：§2 测试人员探测（url decode → project search → workitem get）/ §2C 用户名转 user_key（user search）/ §4 评论（comment add + --notify-user-* 保留传参）全面切内置 meegle CLI 主路径、mention 块保持纯数字 user_key 不变；§4.5 节点流转**去 auth status 预检**（瞬态失败被 agent 误判「未登录」跳过流转、用户线上截图实锤）——直接尝试流转、失败按原因分类记 artifact；chat-mcp `set_feishu_testers` describe 同步防漂移
-- ⏸ 记账未处理：agent shell 里的 meegle 调用不走 server 串行队列（meegle-queue 只罩本进程短命调用）、理论上与看板轮询并发时凭据 refresh 会撞（官方文档：撞毁等效登出）——改动面大、先观察
 
 ## 关键文件索引
 

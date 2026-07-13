@@ -24,7 +24,9 @@ import { formatRepoSectionForPrompt } from "@/lib/path-utils";
 import {
   getTaskCwd,
   getTaskWorkRepoPaths,
+  isTaskNonGitRepo,
   isWorktreeTask,
+  taskHasGitRepo,
 } from "./task-worktrees";
 import {
   readSkillBodyByName,
@@ -223,6 +225,11 @@ export const buildSuperPrompt = async (
    * 故意不在本函数里打 meegle——保持纯拼装、网络失败不堵模板渲染。
    */
   userIdentityLine = "",
+  /**
+   * 设置页 userRole=qa 时由 runner 传入的「测试角色约定」段；空串 = 不注入。
+   * 拼在「仓库分支配置」之后、agent 读分支语义时一并看到。
+   */
+  qaRoleDirective = "",
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -250,6 +257,8 @@ export const buildSuperPrompt = async (
     userIdentityLine,
     repoSection: renderRepoSection(task),
     repoBranchSection: renderRepoBranchSection(task),
+    // 空串 = 非 QA / 未绑仓、模板里只留空行
+    qaRoleDirective,
     repoPath: getTaskCwd(task),
     roleLabel: TASK_ROLE_LABEL[task.role],
     role: task.role,
@@ -302,12 +311,24 @@ const renderActionHistorySection = (task: Task): string => {
 // worktree 语境说明（分支已由系统检出、禁自己 checkout、依赖要自装）
 const renderRepoSection = (task: Task): string => {
   const workPaths = getTaskWorkRepoPaths(task);
-  const base = formatRepoSectionForPrompt(workPaths);
+  const base = formatRepoSectionForPrompt(workPaths, {
+    // 混合场景必须用新 cwd 语义、否则 workPaths 聚合会漂到 $HOME
+    agentCwd: getTaskCwd(task),
+    nonGitRepoPaths: task.nonGitRepoPaths,
+    originalRepoPaths: task.repoPaths,
+  });
   if (!isWorktreeTask(task)) return base;
 
-  // 逐仓列已检出的任务分支（ensureTaskWorktrees 已 upsert 进 gitBranches、此处必有值）
-  const branchLines = task.repoPaths.map((p) => {
+  // 混合隔离：至少一个 git 仓真的映射到了 worktree 才拼隔离说明；
+  // 全是非 git（脚本目录）时隔离说明会误导
+  if (!taskHasGitRepo(task)) return base;
+
+  // 逐仓列：git 仓写已检出分支；非 git 仓标明原地使用（读快照、不 existsSync）
+  const branchLines = task.repoPaths.map((p, i) => {
     const tail = p.split("/").filter(Boolean).pop() ?? p;
+    if (isTaskNonGitRepo(task, p)) {
+      return `  - \`${tail}\`：非 git 目录、原地使用（\`${workPaths[i]}\`）`;
+    }
     const branch = task.gitBranches?.find((b) => b.repoPath === p)?.name;
     return `  - \`${tail}\`：分支 \`${branch ?? "（未记录）"}\`（原仓库 \`${p}\`）`;
   });
@@ -322,12 +343,57 @@ const renderRepoSection = (task: Task): string => {
   ].join("\n");
 };
 
+/**
+ * 设置页「我的角色 = 测试(qa)」时注入的约定段（纯文案、零服务端行为闸）。
+ * task / chat 变体 + 是否带 git 姿势由调用方按绑仓快照决定。
+ *
+ * - 隔离段「禁止 checkout」对本段 detached 切基线豁免（仍禁新建分支 / 切开发分支）
+ * - chat 无「仓库分支配置」段 → 文案改成问用户 / 用配置的提测分支
+ * - 全非 git：只留通用约定（不改代码 / 产物位置 / 验证范围）、不注入 fetch/checkout
+ */
+export const buildQaRoleDirective = (
+  variant: "task" | "chat",
+  hasGitRepo: boolean,
+): string => {
+  const lines: string[] = [
+    "## 测试角色约定（发起人角色 = 测试）",
+    "",
+    "- 你是在帮测试做验证、**不要改仓库代码、不要建分支、不要 commit / git push / 提 MR**——需要写测试脚本 / 记录产物、放任务目录（artifact / 任务数据目录）或任务绑定的非 git 目录。",
+  ];
+  if (hasGitRepo) {
+    if (variant === "task") {
+      lines.push(
+        "- 验证基线 = 各仓的「测试分支」（见「仓库分支配置」段、没配默认 test）。切基线不建分支、用 detached 姿势：",
+        "  `git fetch origin <测试分支> && git checkout --detach FETCH_HEAD`",
+        "- ⚠️ 隔离工作区「禁止 checkout / 切分支」的约束、**对本段的 detached 切基线操作豁免**；仍然禁止新建分支 / 切到其它开发分支。",
+      );
+    } else {
+      lines.push(
+        "- 验证基线 = 仓库配置的提测分支、不确定分支名就问用户（没配默认 test）。切基线不建分支、用 detached 姿势：",
+        "  `git fetch origin <测试分支> && git checkout --detach FETCH_HEAD`",
+      );
+    }
+    lines.push(
+      "- 任务 / 指令里给了 GitLab MR 链接 → 验证的是该 MR 的代码、MR 编号就在链接尾部（…/merge_requests/<编号>）：",
+      "  `git fetch origin merge-requests/<编号>/head && git checkout --detach FETCH_HEAD`",
+      "- ⚠️ 测试分支是多需求集成环境：上面混着其它需求的改动、验证范围以当前需求（task 标题 / 飞书 story / 用户指令）为准、不要把其它需求的改动当成本需求的实现或 bug；发现疑似其它需求引入的问题、单独标注「疑似非本需求范围」。",
+    );
+  } else {
+    lines.push(
+      "- 验证范围以当前需求（task 标题 / 飞书 story / 用户指令）为准；产物放任务目录或绑定的非 git 目录。",
+    );
+  }
+  return lines.join("\n");
+};
+
 // V0.6.7：渲染「仓库分支配置」段注入 super prompt——ship 读测试分支、各 action 兜底参考
 // 每仓列：线上分支（feature 拉取基线）/ 测试分支（ship 提测 MR 目标）/ dev 分支
+// 非 git 目录：无分支概念、只标「直接在该目录使用」
 const renderRepoBranchSection = (task: Task): string => {
   const repoPaths = task.repoPaths ?? [];
   if (repoPaths.length === 0) return "（无绑定仓库）";
   // V0.10：隔离 task 括号里展示 worktree 路径（agent 实际干活的目录、别引它 cd 回原仓库）
+  // 判断 git 读 nonGitRepoPaths 快照（不 existsSync）
   const workPaths = getTaskWorkRepoPaths(task);
   const lines: string[] = [
     "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
@@ -335,10 +401,16 @@ const renderRepoBranchSection = (task: Task): string => {
   ];
   for (let i = 0; i < repoPaths.length; i++) {
     const p = repoPaths[i];
+    const tail = p.split("/").filter(Boolean).pop() ?? p;
+    if (isTaskNonGitRepo(task, p)) {
+      lines.push(
+        `- \`${tail}\`（${workPaths[i]}）：非 git 目录、无分支概念、直接在该目录使用`,
+      );
+      continue;
+    }
     const online = task.repoBaseBranches?.[p]?.trim();
     const test = task.repoTestBranches?.[p]?.trim();
     const dev = task.repoDevBranches?.[p]?.trim();
-    const tail = p.split("/").filter(Boolean).pop() ?? p;
     lines.push(
       `- \`${tail}\`（${workPaths[i]}）：线上分支=${online || "（未配、自动探测）"}、` +
         `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}`,

@@ -18,7 +18,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 
 import { dataRoot } from "./data-root";
@@ -32,6 +32,26 @@ import type { GitBranchInfo, Task, TaskMode } from "@/lib/types";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * 目录是否为 git 仓（同步 existsSync）。
+ * **只给建 / 编辑任务时算 nonGitRepoPaths 快照用**——运行时路径映射 / 分支规划
+ * 一律读 task.nonGitRepoPaths，禁止再调本函数分流（原仓漂移会打破 cwd 不变式）。
+ * `.git` 可以是目录（普通仓）或文件（worktree 指针）——两者都算。
+ */
+export const isGitRepoPath = (repoPath: string): boolean =>
+  existsSync(path.join(repoPath, ".git"));
+
+/**
+ * 从当前磁盘状态算出 nonGitRepoPaths 快照（createTask / updateTaskFields 落库用）。
+ * 全是 git → undefined（跟老任务缺省语义一致、meta 不占空数组）。
+ */
+export const computeNonGitRepoPaths = (
+  repoPaths: string[],
+): string[] | undefined => {
+  const nonGit = repoPaths.filter((p) => !isGitRepoPath(p));
+  return nonGit.length > 0 ? nonGit : undefined;
+};
+
 // ----------------- 类型：Task / TaskMetaV06 都能喂的最小形状 -----------------
 
 /**
@@ -43,6 +63,8 @@ export interface WorktreeTaskLike {
   mode?: TaskMode;
   repoPaths: string[];
   isolateWorktree?: boolean;
+  /** 非 git 目录快照；undefined = 全 git（老任务） */
+  nonGitRepoPaths?: string[];
 }
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
@@ -50,6 +72,19 @@ export interface WorktreeTaskLike {
 /** 本 task 是否走隔离工作区（chat 模式 / 逃生口 / 无仓库一律不隔离） */
 export const isWorktreeTask = (t: WorktreeTaskLike): boolean =>
   t.mode !== "chat" && t.isolateWorktree === true && t.repoPaths.length > 0;
+
+/**
+ * 读快照判断某仓是否非 git（undefined / 未列入 = git）。
+ * 路径映射 / 分支规划 / prompt / action-gates 统一走这里，禁止运行时 existsSync。
+ */
+export const isTaskNonGitRepo = (
+  t: WorktreeTaskLike,
+  repoPath: string,
+): boolean => (t.nonGitRepoPaths ?? []).includes(repoPath);
+
+/** task 是否至少绑了一个 git 仓（QA 段要不要带 git 姿势） */
+export const taskHasGitRepo = (t: WorktreeTaskLike): boolean =>
+  t.repoPaths.some((p) => !isTaskNonGitRepo(t, p));
 
 /** 所有 task worktree 的根目录 */
 export const getWorktreesRoot = (): string => path.join(dataRoot(), "worktrees");
@@ -63,19 +98,37 @@ const normPath = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, ""
 
 /**
  * task 的「工作路径」列表——agent 实际干活的目录：
- * - 隔离 task → 逐仓映射到 worktree 子目录（子目录名 = getUniqueRepoDirNames、
- *   跟 client 端 task 详情页的路径前缀校验同源；顺序跟 repoPaths 一一对应）
+ * - 隔离 task → 逐仓读 nonGitRepoPaths 快照：git 仓映射到 worktree 子目录（子目录名 =
+ *   getUniqueRepoDirNames、跟 client 端路径前缀校验同源）；非 git 目录（纯脚本库
+ *   等）**原样返回 repoPath**（无分支概念、不建隔离区、原地使用）
  * - 非隔离 → 原样返回 repoPaths
+ * - 顺序始终跟 repoPaths 一一对应（index 对齐是全站路径映射契约）
  */
 export const getTaskWorkRepoPaths = (t: WorktreeTaskLike): string[] => {
   if (!isWorktreeTask(t)) return t.repoPaths;
   const dir = getTaskWorktreesDir(t.id);
-  return getUniqueRepoDirNames(t.repoPaths).map((name) => path.join(dir, name));
+  const names = getUniqueRepoDirNames(t.repoPaths);
+  return t.repoPaths.map((repoPath, i) =>
+    isTaskNonGitRepo(t, repoPath) ? repoPath : path.join(dir, names[i]),
+  );
 };
 
-/** task 的 effective cwd（Agent.create / stop hook / 检查统一走这里、替代裸 getEffectiveCwd） */
-export const getTaskCwd = (t: WorktreeTaskLike): string =>
-  getEffectiveCwd(getTaskWorkRepoPaths(t));
+/**
+ * task 的 effective cwd（Agent.create / stop hook / 检查统一走这里）。
+ *
+ * 隔离任务：只对「映射进 worktree 的 git 仓」算公共父——非 git 目录靠绝对路径访问、
+ * 不参与聚合（否则 worktree 在 Application Support、脚本在 Documents → 聚到 $HOME）。
+ * - 纯 / 多 git 仓：现状语义不变（单 = worktree 自身、多 = worktrees/<taskId> 容器）
+ * - 全非 git：退回原 repoPaths 的公共父
+ */
+export const getTaskCwd = (t: WorktreeTaskLike): string => {
+  if (!isWorktreeTask(t)) return getEffectiveCwd(t.repoPaths);
+  const gitWorkPaths = getTaskWorkRepoPaths(t).filter(
+    (_, i) => !isTaskNonGitRepo(t, t.repoPaths[i]),
+  );
+  if (gitWorkPaths.length === 0) return getEffectiveCwd(t.repoPaths);
+  return getEffectiveCwd(gitWorkPaths);
+};
 
 /**
  * 把 agent 上报的路径归一回「原仓库路径」（submit_mr 校验 / MR 落库用）。
@@ -101,6 +154,8 @@ export const resolveOriginalRepoPath = (
  * 逐仓算本 task 的工作分支（已有 gitBranches 记录 > 用户指定已有分支 > 模板渲染）。
  * 跟 action-gates.planBranchesForBuild 同一套命名规则；区别是这里必须**总能**给出
  * 分支名（worktree 创建不能没分支）——storyId 抠不到时兜底用 task id 的时间戳段。
+ *
+ * 混合隔离：只给 **git 仓**造记录（非 git 目录无分支概念、不进 gitBranches）。
  */
 export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
   const storyId =
@@ -110,23 +165,25 @@ export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
     task.id;
   const existing = task.gitBranches ?? [];
   const now = Date.now();
-  return task.repoPaths.map((repoPath) => {
-    const old = existing.find((b) => b.repoPath === repoPath);
-    if (old) return old;
-    const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
-    return {
-      repoPath,
-      name:
-        explicitName ||
-        renderBranchName(
-          task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
-          { storyId, taskTitle: task.title },
-        ),
-      baseBranch: "",
-      checkedOut: false,
-      createdAt: now,
-    };
-  });
+  return task.repoPaths
+    .filter((repoPath) => !isTaskNonGitRepo(task, repoPath))
+    .map((repoPath) => {
+      const old = existing.find((b) => b.repoPath === repoPath);
+      if (old) return old;
+      const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
+      return {
+        repoPath,
+        name:
+          explicitName ||
+          renderBranchName(
+            task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
+            { storyId, taskTitle: task.title },
+          ),
+        baseBranch: "",
+        checkedOut: false,
+        createdAt: now,
+      };
+    });
 };
 
 // ----------------- git 执行底座 -----------------
@@ -183,6 +240,8 @@ export interface EnsureWorktreesResult {
  * 确保本 task 每个仓的 worktree 都存在且检出了任务分支（幂等、可反复调）。
  *
  * 单仓流程：
+ *   0. 非 git 目录（纯脚本库等）→ 跳过（原地使用、不建 worktree、不抛错；
+ *      全仓非 git = 等效 no-op）
  *   1. worktree 目录已是合法 git 工作区 → 复用；复用前校验当前分支 == 任务分支，
  *      被手动 checkout / detached HEAD 切走则自动 `git checkout` 切回（失败抛错、不带病推进）
  *   2. `git worktree prune` 清掉「目录被手删但 git 还记着」的僵尸注册
@@ -196,6 +255,8 @@ export const ensureTaskWorktrees = async (
   task: Task,
 ): Promise<EnsureWorktreesResult> => {
   const infos = planWorktreeBranchInfos(task);
+  // 混合隔离后 infos 只含 git 仓、跟 repoPaths 不再 index 对齐——按 repoPath 查
+  const infoByRepo = new Map(infos.map((info) => [info.repoPath, info]));
   const workPaths = getTaskWorkRepoPaths(task);
   const createdRepos: string[] = [];
   const clonedDeps: { repoPath: string; dirs: string[] }[] = [];
@@ -205,7 +266,20 @@ export const ensureTaskWorktrees = async (
   for (let i = 0; i < task.repoPaths.length; i++) {
     const repoPath = task.repoPaths[i];
     const workDir = workPaths[i];
-    const info = infos[i];
+
+    // 非 git 仓（读快照）：路径映射已原地返回、这里跳过建 worktree（脚本库无分支概念）
+    if (isTaskNonGitRepo(task, repoPath)) {
+      console.log(
+        `[task-worktrees] 跳过非 git 目录（原地使用、不建隔离工作区）：${repoPath}`,
+      );
+      continue;
+    }
+
+    const info = infoByRepo.get(repoPath);
+    if (!info) {
+      // planWorktreeBranchInfos 已 filter 非 git、此处不应缺失——防御性跳过
+      continue;
+    }
 
     // 已存在且是合法工作区 → 复用（幂等热路径、每次推进都会走到）。
     // 必须校验当前分支：用户 / agent 可能在 worktree 里手动 checkout 切走，
@@ -235,14 +309,6 @@ export const ensureTaskWorktrees = async (
         if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
         continue;
       }
-    }
-
-    // 原仓库必须是 git 仓（非 git 目录只能走「直接在原仓库运行」——v1.1.x 测试团队
-    // 挂纯脚本文件夹的场景、建任务时勾逃生口 / 设置页把默认隔离关掉即可）
-    if (!(await pathExists(path.join(repoPath, ".git")))) {
-      throw new Error(
-        `仓库 ${repoPath} 不是 git 仓库、无法创建隔离工作区——建任务时勾选「直接在原仓库运行」（或在设置页关闭「新任务默认隔离工作区」）`,
-      );
     }
 
     // 半截目录（上次创建失败残留 / 非法内容）→ 清掉重来
@@ -510,13 +576,17 @@ export const removeTaskWorktrees = async (
     return { removedAny: false, snapshotRepos: [], skippedRepos: [] };
   }
 
-  const workPaths = getTaskWorkRepoPaths(t);
+  // 不走 getTaskWorkRepoPaths：那个映射按 nonGitRepoPaths 快照分流、非 git 返回原路径——
+  // 删除逻辑绝不能对原路径下手（会毁掉用户目录）。
+  // 这里独立算「worktree 候选路径」（容器目录 + 仓短名）、只对真实存在的候选目录操作：
+  // 非 git 仓从没建过 worktree、候选不存在天然跳过；原仓被移走时候选还在、照常走快照保护。
+  const names = getUniqueRepoDirNames(t.repoPaths);
   let removedAny = false;
   const snapshotRepos: string[] = [];
   const skippedRepos: string[] = [];
   for (let i = 0; i < t.repoPaths.length; i++) {
     const repoPath = t.repoPaths[i];
-    const workDir = workPaths[i];
+    const workDir = path.join(taskDir, names[i]);
     if (!(await pathExists(workDir))) continue;
     // 未提交改动先落 WIP 快照到任务分支（--force 删除会连未提交改动一起销毁）
     const snap = await snapshotDirtyWorktree(workDir);

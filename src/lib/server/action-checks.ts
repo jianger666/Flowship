@@ -731,7 +731,9 @@ const computeRepoStatusHash = async (
 };
 
 // 发现 effective cwd 下「非本 task 的兄弟 git 仓」（多仓 cwd = 公共父目录时才有）
-// V0.10：隔离 task 的 cwd = worktrees/<taskId>/、下面只挂本 task 的仓、天然无兄弟仓（返空）
+// V0.10：隔离 task 的 cwd = worktrees/<taskId>/（或多 git 容器）、下面只挂本 task 的仓、天然无兄弟仓（返空）
+// 混合隔离后 getTaskCwd 只聚合 git worktree：单 git(+非 git) cwd=worktree 自身 → 早退返空；
+// 多 git(+非 git) cwd=容器 → 只扫容器、非 git 原路径不在容器下、不会误当兄弟。
 const discoverSiblingRepos = async (task: Task): Promise<string[]> => {
   const cwd = getTaskCwd(task);
   const taskRepoSet = new Set(
