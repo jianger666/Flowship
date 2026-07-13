@@ -220,6 +220,23 @@ export const snapshotActionArtifact = async (
   });
 
 /**
+ * list action-revisions 时是否允许跑 pruneIdenticalRevisions（闸在 route、本函数纯判定）。
+ *
+ * 时序竞态：question 先 snapshot（此刻快照 === 正文）→ agent 开始改 → 面板刷新触发
+ * GET action-revisions → 若立刻 prune，会把这份「暂时相同」的快照当垃圾删掉 → AI 改完后
+ * 没快照可比、修订开关不亮。agent 活跃期间（task / 该 action 为 running）只列不清。
+ */
+export const shouldPruneIdenticalRevisionsOnList = (
+  task: Pick<Task, "runStatus" | "actions">,
+  actionId: string,
+): boolean => {
+  if (task.runStatus === "running") return false;
+  const action = task.actions.find((a) => a.id === actionId);
+  if (action?.status === "running") return false;
+  return true;
+};
+
+/**
  * 清掉「尾部与当前正文完全相同」的 revision 快照（文件 + meta）。
  *
  * 背景：question 路由对任何插话都先 snapshot（分不清问/改）——用户只问句、AI 没改
@@ -229,6 +246,7 @@ export const snapshotActionArtifact = async (
  * 一律保留——那是真改过的版本；多份连续相同一并清（连续插话堆出来的）。
  *
  * 当前 artifact 读不到 / 无 revisions → no-op。走 withTaskLock，与 snapshot / GC 同锁。
+ * 调用方（action-revisions GET）须先过 shouldPruneIdenticalRevisionsOnList，running 时勿调。
  */
 export const pruneIdenticalRevisions = async (
   taskId: string,

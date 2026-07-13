@@ -4,6 +4,8 @@
  * 回归：
  * - pruneIdenticalRevisions：尾部与当前正文相同的快照被清；中间不同的保留
  * - snapshotActionArtifact：最新一份已相同则跳过写入
+ * - shouldPruneIdenticalRevisionsOnList：running 态闸（route 调 prune 前判定；
+ *   prune 本身不感知状态——agent 活跃时 route 跳过 prune，只列不清）
  */
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -18,9 +20,10 @@ import { taskDir, writeMeta } from "@/lib/server/task-fs-core";
 import {
   listActionRevisions,
   pruneIdenticalRevisions,
+  shouldPruneIdenticalRevisionsOnList,
   snapshotActionArtifact,
 } from "@/lib/server/task-artifacts";
-import type { ActionRecord, ArtifactRevision } from "@/lib/types";
+import type { ActionRecord, ArtifactRevision, Task } from "@/lib/types";
 
 const TASK_ID = "t_rev_test_1";
 const ACTION_ID = "act_1";
@@ -165,6 +168,37 @@ describe("pruneIdenticalRevisions", () => {
     await fs.unlink(path.join(taskDir(TASK_ID), ARTIFACT_REL));
     await pruneIdenticalRevisions(TASK_ID, ACTION_ID);
     expect((await listActionRevisions(TASK_ID, ACTION_ID)).length).toBe(1);
+  });
+});
+
+describe("shouldPruneIdenticalRevisionsOnList（running 态不清理闸）", () => {
+  const idleTask = (actionStatus: ActionRecord["status"]): Pick<
+    Task,
+    "runStatus" | "actions"
+  > => ({
+    runStatus: "awaiting_user",
+    actions: [{ ...baseAction(), status: actionStatus }],
+  });
+
+  it("task.runStatus === running → 跳过 prune", () => {
+    expect(
+      shouldPruneIdenticalRevisionsOnList(
+        { runStatus: "running", actions: [baseAction()] },
+        ACTION_ID,
+      ),
+    ).toBe(false);
+  });
+
+  it("该 action status === running → 跳过 prune", () => {
+    expect(
+      shouldPruneIdenticalRevisionsOnList(idleTask("running"), ACTION_ID),
+    ).toBe(false);
+  });
+
+  it("idle + awaiting_ack → 允许 prune", () => {
+    expect(
+      shouldPruneIdenticalRevisionsOnList(idleTask("awaiting_ack"), ACTION_ID),
+    ).toBe(true);
   });
 });
 

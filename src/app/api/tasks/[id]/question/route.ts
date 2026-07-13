@@ -26,7 +26,11 @@ import {
   startOneShotQuestion,
   supersedePendingAsks,
 } from "@/lib/server/task-runner";
-import { publishTaskStreamEvent, runningTasks } from "@/lib/server/task-stream";
+import {
+  publishTaskStreamEvent,
+  runningTasks,
+  waitForTaskToStop,
+} from "@/lib/server/task-stream";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
@@ -92,17 +96,35 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("text / images / attachments 至少一项非空");
   }
 
-  const task = await getTask(id);
+  let task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
   if (task.mode === "chat") {
     return errorResponse("chat 对话直接在输入框发消息即可", 409);
   }
-  if (runningTasks.has(task.id) || task.runStatus === "running") {
-    return errorResponse("agent 正在跑、等它说完这轮再问", 409);
-  }
   // 有 pendingAsk 也不再硬拦输入条：用户可绕过答题卡直接说话（下方 sent/oneshot
   // 会 supersede；canResume 唤醒内部也会 supersede）。旧逻辑「先回答上方提问」在
   // 网断 / 会话死后把输入条和答题卡对锁——只能重新推进（同事反馈）。
+
+  // run 还在跑：真·干活中 → 409；已交卷（awaiting_ack）但收尾旁白未完 → 等收敛再发。
+  // 窗口期：submit_work 后 action 已 awaiting_ack、UI 放开输入框，但 runningTasks /
+  // runStatus 仍真几秒~几十秒——用户一说话必撞旧 409。
+  if (runningTasks.has(task.id) || task.runStatus === "running") {
+    const currentActionId = task.currentActionId;
+    const currentWhileRunning = task.actions.find(
+      (a) => a.id === currentActionId,
+    );
+    if (currentWhileRunning?.status === "awaiting_ack") {
+      const stopped = await waitForTaskToStop(task.id, 20_000);
+      if (!stopped) {
+        return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+      }
+      const fresh = await getTask(id);
+      if (!fresh) return errorResponse("not_found", 404);
+      task = fresh;
+    } else {
+      return errorResponse("agent 正在跑、等它说完这轮再问", 409);
+    }
+  }
 
   // 图先落盘（给 agent read 的绝对路径 + 事件缩略图 meta）
   let imageAbsPaths: string[] | undefined;
