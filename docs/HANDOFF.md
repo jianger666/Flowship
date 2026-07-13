@@ -306,7 +306,7 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **非 git 目录不再拦推进（混合隔离）**：task 绑的 repoPath 没有 `.git` 时——git 仓照旧建 worktree、非 git 目录跳过隔离原地使用（脚本库无分支概念）。核心：`Task.nonGitRepoPaths` 快照（createTask / updateTaskFields / setTaskRepoPaths 三写点、undefined=全 git 老任务兜底、**不做运行时 existsSync**——防 .git 中途增删映射漂移）；`getTaskWorkRepoPaths` 逐仓映射；**`getTaskCwd` 只对 git worktree 聚合**（终审 P0：混着原路径算公共父会漂到 $HOME、agent cwd / IDE 打开路径 / 兄弟仓扫描全翻车——已修+单测锁死）；`formatRepoSectionForPrompt` 混合模板逐仓标注；client `getRepoWorkDirs` 非 git 用原路径；`planBranchesForBuild` 非 git 跳过 checkout hint
 - **测试角色约定（纯 prompt、零服务端行为改动、用户拍板「简单点」）**：`settings.userRole === "qa"` 时 task（+绑仓 chat）注入 `buildQaRoleDirective`——不改仓库代码/不建分支/不 commit push MR（产物放任务目录或非 git 目录）、验证基线=各仓提测分支（detached 姿势切、显式豁免隔离段「禁止 checkout」）、给了 MR 链接用 `merge-requests/<iid>/head` 原生 ref 拉（不需要分支名/Token）、提测分支多需求集成只验当前需求范围；chat 变体不引用「仓库分支配置」段、纯非 git 任务只注入通用部分
 - **MCP 去 Cursor 全局自动导入**：删 V0.13 `migrateCursorMcpOnce` 整套（新用户首次落盘 config.json 会静默快照 ~/.cursor/mcp.json、用户拍板不可接受）；「从 Cursor 导入」手动链路是唯一导入口；老用户早已迁移完成无影响
-- **推进弹窗 action 卡长名两行**：h-10→min-h-10 + truncate→line-clamp-2 + title 兜底（多个「飞书项目…」自定义 action 分不清）
+- **推进弹窗 action 卡长名**：首版做成两行 clamp、v1.1.6 发出后用户复盘「两行让 grid 行高不齐」改回固定 h-10 单行 truncate + hover `Tooltip` 补全名（跟侧栏任务行同款约定、发版后改动待下版带出）
 - 流程：4 个 grok 子代理并行实施 → 蓝军终审拦下 1 P0 + 1 P1 + 2 P2 → 修复子代理全修 → 蓝军复审通过；余 3 个文案级 P2 攒下版
 
 ### 2026-07-13 v1.1.5 发版：mac Intel（darwin-x64）安装包支持

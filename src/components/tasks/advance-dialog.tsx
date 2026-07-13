@@ -172,16 +172,16 @@ const inferDisabledReason = (
 
 // action 方块卡共用外观（内置 + 自定义两处渲染、单一来源）：
 // 主标题水平垂直居中、左上角固定 ✨ 角标点睛（用户拍板：统一星星、不搞每 action 一个 icon）
-// 用 min-h-10 而非固定 h-10：短名单行时与原来等高；长名两行时块自然长高，grid 同行卡片自动拉齐
+// 固定 h-10 单行：两行方案会让不同 grid 行高度不齐、用户拍板改 hover Tooltip 补全长名
 // 选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
 const actionCardClass = (selected: boolean) =>
   cn(
-    "group flex min-h-10 w-full items-center justify-center py-0 px-0",
+    "group flex h-10 w-full items-center justify-center py-0 px-0",
     selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
   );
 
 // action 方块卡内容：居中 label + 左上角固定 ✨ 角标（选中品牌色、未选中 muted、hover 过渡）
-// ✨ 用 top-1/2 -translate-y-1/2 相对块高垂直居中，两行长高后仍天然居中，无需单独调
+// 长名单行 truncate、完整名由外层 Tooltip 补全（跟侧栏任务行同款约定）
 const ActionCardContent = ({
   label,
   selected,
@@ -198,11 +198,9 @@ const ActionCardContent = ({
           : "text-muted-foreground/60 group-hover:text-muted-foreground",
       )}
     />
-    {/* 两行 clamp 代替单行 truncate：多个「飞书项目…」自定义 action 单行截断分不清；title 原生悬停兜底极端长名 */}
     <span
-      title={label}
       className={cn(
-        "w-full line-clamp-2 px-6 py-1.5 text-center text-[13px] font-medium leading-tight",
+        "w-full truncate px-6 text-center text-[13px] font-medium leading-none",
         selected && "text-primary",
       )}
     >
@@ -548,29 +546,32 @@ export const AdvanceDialog = ({
       });
       const selected = actionType === type;
       return (
-        // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip
-        <div key={key} className="relative">
-          <ChoiceButton
-            shape="card"
-            selected={selected}
-            onClick={() => {
-              setActionType(type);
-              setSelectedCustomActionId(null);
-            }}
-            disabled={submitting || !!reason}
-            className={actionCardClass(selected)}
-          >
-            <ActionCardContent label={ACTION_LABEL[type]} selected={selected} />
-          </ChoiceButton>
-          {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
-          {reason && (
-            <Tooltip content={reason}>
-              <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
-                <AlertTriangle className="size-3.5" />
-              </span>
-            </Tooltip>
-          )}
-        </div>
+        // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip；
+        // 长名 Tooltip 也挂外层 div（hover 卡片即出全名、disabled 卡也能出）
+        <Tooltip key={key} content={ACTION_LABEL[type]}>
+          <div className="relative">
+            <ChoiceButton
+              shape="card"
+              selected={selected}
+              onClick={() => {
+                setActionType(type);
+                setSelectedCustomActionId(null);
+              }}
+              disabled={submitting || !!reason}
+              className={actionCardClass(selected)}
+            >
+              <ActionCardContent label={ACTION_LABEL[type]} selected={selected} />
+            </ChoiceButton>
+            {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
+            {reason && (
+              <Tooltip content={reason}>
+                <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
+                  <AlertTriangle className="size-3.5" />
+                </span>
+              </Tooltip>
+            )}
+          </div>
+        </Tooltip>
       );
     }
     // 自定义 action：key 是 custom id、还原成 def 渲染（icon 统一 Sparkles 兜底）
@@ -578,20 +579,23 @@ export const AdvanceDialog = ({
     if (!def) return null;
     const selected = actionType === "custom" && selectedCustomActionId === def.id;
     return (
-      <div key={key} className="relative">
-        <ChoiceButton
-          shape="card"
-          selected={selected}
-          onClick={() => {
-            setActionType("custom");
-            setSelectedCustomActionId(def.id);
-          }}
-          disabled={submitting}
-          className={actionCardClass(selected)}
-        >
-          <ActionCardContent label={def.label} selected={selected} />
-        </ChoiceButton>
-      </div>
+      // 自定义 action 名可长（如「飞书项目周报生成」）、单行截断后靠 hover Tooltip 看全名
+      <Tooltip key={key} content={def.label}>
+        <div className="relative">
+          <ChoiceButton
+            shape="card"
+            selected={selected}
+            onClick={() => {
+              setActionType("custom");
+              setSelectedCustomActionId(def.id);
+            }}
+            disabled={submitting}
+            className={actionCardClass(selected)}
+          >
+            <ActionCardContent label={def.label} selected={selected} />
+          </ChoiceButton>
+        </div>
+      </Tooltip>
     );
   };
 
