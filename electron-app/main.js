@@ -851,7 +851,19 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
 
 // 阶段 1：下载 dmg → 验签 → attach → ditto 到暂存目录；不碰 /Applications。
 // 已有同版本有效暂存则跳过（轮询 / 徽标重入友好）。
-const downloadAndStageMacUpdate = async (version) => {
+// 并发互斥（蓝军 P1）：轮询 runUpdateCheck 与徽标 installUpdateNow 可能同时触发、
+// staged.json 落盘前双方都会走下载分支抢写同一 dmg / staged 目录——single-flight、
+// 重入方 await 同一个 promise 拿同一份暂存结果。
+let stagingPromise = null;
+const downloadAndStageMacUpdate = (version) => {
+  if (stagingPromise) return stagingPromise;
+  stagingPromise = downloadAndStageMacUpdateInner(version).finally(() => {
+    stagingPromise = null;
+  });
+  return stagingPromise;
+};
+
+const downloadAndStageMacUpdateInner = async (version) => {
   const existing = await readStagedMeta();
   if (existing?.version === version && existsSync(existing.appPath)) {
     log(`[updater] v${version} 已暂存于 ${existing.appPath}、跳过下载`);

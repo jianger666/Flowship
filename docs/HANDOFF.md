@@ -301,17 +301,24 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-13 傍晚（main、**未发版**）：线上 bug 修一批 + mac 自更新延迟替换
+### 2026-07-13 晚 v1.1.8 发版：今日积压全量（下面三段 + 本段、v1.1.7 tag/draft 已删除作废）
+
+- **GitLab 凭证运行时注入（野路子转正、用户拍板）**：settings 配了 gitToken 时、task + 绑仓 chat 的 prompt 注入「## GitLab 访问」段（host + `config.json` **gitToken 字段**位置 + 「只取该字段别 cat 全文件——里面还有其它密钥」+ 读随意写收敛 + 内置飞书 CLI 已登录勿预检）——AI 不再靠自己摸后门（线上实锤：同事的自定义 action 里 AI 先试 glab 失败、再自己发现 config.json 才跑通）；`action-ship.md`「拿不到 PAT 必然失败」旧措辞纠偏成「MR 创建必须走 submit_mr（落库审计）」。曾讨论过 `gitlab_api_get` 只读代理 + 红线的分级方案、用户拍板不做（本地单机、接受 token 进上下文）
+- **插话答疑顺序硬化**（线上实锤：agent 先交卷后答疑、还把「这是纯疑问：我将…」当回复发出）：〈产出审阅中〉直令 + _super/[USER_MESSAGE] 段改写为「**先发答案、再 submit_work 重新交卷**、禁分类旁白」；本次立原则：**prompt 改动优先改写现有句子、不追加新段**（本批全部净增 ≤4 行）
+- **creator 可移植原则**：action/skill creator 各加一句「凭证/系统工具细节不写进 skill（保通用）、运行时系统会注入」——skill 拿去 Cursor 等环境不废
+- **蓝军全量终审**（v1.1.6..HEAD 8 commit）：无 P0；2 个 P1 已修（看板任务列表未加载时误进预览页——`!loaded` 回退信缓存映射；mac 更新暂存下载无并发互斥——single-flight stagingPromise）；P1-3/4（退出替换窗口强杀空窗、DELETE 挂死锁死列表项）+ 若干 P2 记账攒下版
+- 工作项预览页描述区块整体移除（用户拍板）
+
+### 2026-07-13 傍晚（已随 v1.1.8 发）：线上 bug 修一批 + mac 自更新延迟替换
 
 - **postCheck 红条终于实装**（同事「自定义 action 不知道 AI 写没写产物」根因）：后置检查 fail 一直只落 `action.postCheck`、前端 0 处渲染（V0.6 设计的红条漏做）——artifact 面板正文/空态顶部 destructive 警示条（「后置检查未通过」+ details）+ action timeline 行警示标；顺带修 Windows 反斜杠路径漏检测（sdk-message-handler 匹配前归一 `\`→`/`、否则「在写 artifact」事件与 artifactUpdatedAt 刷新全漏）+ 过时 `skills/artifact-writer` 教旧 artifacts/ 路径纠偏
 - **删任务后看板 404 修复**：看板 `handleOpen` 盲信缓存里的 `item.task` 硬跳已删任务——改成点击前用 `useTaskList()` 实时校验、删了就走 `/workitems/` 预览重新建（用户期望）；任务详情页 `!task` 从裸 `notFound()` 改 EmptyHint+「回工作台」；侧栏删除防重（deletingIds 锁 + 404 幂等成功不再 toast「任务不存在」+ `use-task-list` pendingDeletes 防 2s 轮询回魂 + 删当前任务先导航再等 DELETE）
 - **表单**：任一仓填「已有工作分支」→ 强制原仓运行、worktree 勾选隐藏换一行说明（同事实测踩「已有分支+隔离」必撞 git 同分支双检出）；勾选文案改正向「使用 worktree 隔离运行」（用户拍板「原仓运行别人看不懂」）、设置页对应项同步
 - **mac 自更新改延迟替换**（用户实测「稍后」态被硬闸拦、问能不能不用重启）：下载+验签后只暂存 `updates/staged-<v>.app`、**不碰 /Applications**——「立即更新」= 替换+重启；「稍后」= 老进程跑在没动过的老包上完全正常、before-quit 时替换（preventDefault 等替换完 exit）、启动早期兜底（有效暂存 → 替换+relaunch 无感知）；update-pending-restart 硬闸保留但正常流程不再触发；启动清扫扩展覆盖过期 staged
-- 工作项预览页描述区块整体移除（用户拍板、启动前不需要在预览页读描述）
-- 均未发版、攒在 main；test 包已打给用户验收
+- test 包中途打过一轮给用户验收（只读仓 / 删除 404 / 表单批）
 - ⏸ **讨论后搁置记账：GitLab 能力分级方案**（用户拍板「现在的好像也能用、先不改」）——背景：creator（action/skill）零提系统能力、AI 无「读 GitLab」正规通道、测试同事的 action 靠 AI 自己发现 config.json 明文 token 跑通（野路子、token/apiKey 会进事件流与上下文）。已讨论定型但未实施的方案：A. 两个 creator 加「系统能力速查」（含新原则：工具名不进 skill、只进运行时注入、保 skill 通用性）B. `gitlab_api_get` 通用只读代理 + `add_mr_comment`（读自由写收口、merge/删分支不开）C. 「禁读 config.json 取密钥」红线。将来要做直接按这个捡起来。
 
-### 2026-07-13 午后（main、已含在上、**未发版**）：仓库级「只读」取代测试角色机制
+### 2026-07-13 午后（已随 v1.1.8 发）：仓库级「只读」取代测试角色机制
 
 > ⚠️ v1.1.7 tag 被用户手动取消 CI（draft 未转正、对外不存在、latest 仍指 v1.1.6）；本段改动只在 main、等用户亲自验收后再定发版。同日立规：**发版只在用户主动喊「发版」时做、用户没验过的改动绝不发**（见 learned-conventions）。
 

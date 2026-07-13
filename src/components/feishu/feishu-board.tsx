@@ -122,7 +122,7 @@ export const AiStatusBadge = ({ task }: { task: BoardTaskBrief | null }) => {
 export const FeishuBoard = () => {
   const router = useRouter();
   // 侧栏任务列表：点看板时实时校验 it.task（缓存旧映射不失效，盲跳会 404）
-  const { tasks } = useTaskList();
+  const { tasks, loaded: tasksLoaded } = useTaskList();
   const liveTaskIds = useMemo(
     () => new Set(tasks.map((t) => t.id)),
     [tasks],
@@ -246,8 +246,10 @@ export const FeishuBoard = () => {
   // 点击工作项：有「仍存活」的任务直进、否则进预览（不盲信看板缓存里的 it.task）
   const handleOpen = useCallback(
     (it: BoardItem) => {
-      // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验
-      if (it.task && liveTaskIds.has(it.task.id)) {
+      // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验；
+      // 列表还没加载完（loaded=false、tasks 空）时回退信任缓存映射——否则秒开缓存
+      // 期间点已有任务会被误导去预览页、可能重复建任务（蓝军 P1）
+      if (it.task && (!tasksLoaded || liveTaskIds.has(it.task.id))) {
         router.push(`/tasks/${it.task.id}`);
         return;
       }
@@ -257,7 +259,7 @@ export const FeishuBoard = () => {
       if (it.url) qs.set("url", it.url);
       router.push(`/workitems/${encodeURIComponent(it.id)}?${qs.toString()}`);
     },
-    [router, liveTaskIds],
+    [router, liveTaskIds, tasksLoaded],
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
