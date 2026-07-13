@@ -690,8 +690,10 @@ const checkBuild = async (
   const sections: string[] = [];
   let artifactLintPassed = true;
 
-  // V0.6.27 artifact 小节 lint：「全量校验」「修改记录」是 build 骨架铁段
-  // （有无 plan / 分不分批都必须有、_shared.md「修改记录」段是跨 action 强制规范）
+  // V0.6.27 artifact 小节 lint：「全量校验」是 build 骨架铁段。
+  // 「修改记录」检查已删（2026-07-13 用户拍板）：骨架本来就允许初稿省略该段、
+  // 检查却当铁段必查 → 一次过的正常 build 全被误判「缺必备段」、v1.1.8 红条
+  // 实装后线上冤枉同事初稿——该段有没有交给人审、不值得机器闸。
   if (action.artifactPath) {
     try {
       const artifactContent = await fs.readFile(
@@ -700,7 +702,6 @@ const checkBuild = async (
       );
       const requiredSections: { name: string; re: RegExp }[] = [
         { name: "全量校验", re: /全量校验/ },
-        { name: "修改记录", re: /修改记录/ },
       ];
       const missing = requiredSections.filter(
         (s) => !s.re.test(artifactContent),
