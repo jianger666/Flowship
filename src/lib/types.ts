@@ -42,6 +42,13 @@ export interface RepoConfig {
    * 建任务时快照进 task.readonlyRepoPaths；运行时读快照、不回头查设置。
    */
   readonly?: boolean;
+  /**
+   * 脚本仓：存放脚本类产出（测试脚本 / 工具脚本等）的仓库——纯「性质标注」、
+   * 给 AI 的提示（往里写东西前先看仓内 README / AGENTS.md 约定），不是权限约束。
+   * 与 readonly 正交：只读脚本仓 = 参考库（可读现成脚本、新产出去任务 workspace）。
+   * 建任务时快照进 task.scriptRepoPaths；运行时读快照、不回头查设置。
+   */
+  scriptRepo?: boolean;
 }
 
 /**
@@ -971,6 +978,12 @@ export interface Task {
    */
   readonlyRepoPaths?: string[];
   /**
+   * 脚本仓清单（建 / 编辑任务改 repoPaths 时从 settings.repos[].scriptRepo 快照落库）。
+   * 纯提示性标注：prompt 标 📜 + 一行「先看仓内约定」指引、不影响 worktree / 门禁 / 检测。
+   * undefined = 无脚本仓（老任务不迁移）。
+   */
+  scriptRepoPaths?: string[];
+  /**
    * V0.6.3：每个仓的「线上分支」= feature 拉取基线（per-repo、key=repoPath、value=分支名）
    * - 来源：建 task 时从 settings.repos[].onlineBranch 快照固化（settings 在 localStorage、
    *   server 端读不到、所以建 task 时 client 快照进 task、之后 build 用这份）
@@ -1033,6 +1046,12 @@ export interface Task {
    * client 的「在 IDE 打开工作区」「复制路径」「预览」按钮用（dataRoot 只有 server 知道、client 拼不出）
    */
   workCwd?: string;
+  /**
+   * 任务数据目录绝对路径（**计算字段、不落盘**——hydrateTask 时由 taskDir(id) 算出）。
+   * = data/tasks/<id>/（下有 actions/ artifact、workspace/ 产出、events.jsonl 等）。
+   * client 的「打开任务文件夹」按钮用（dataRoot 只有 server 知道、client 拼不出）。
+   */
+  taskDirPath?: string;
   /**
    * V0.6.14：ship 提测建 MR 时「合并后是否删源分支」。
    * - 缺省 / undefined → 保留源分支（用户拍板默认保留：合并后常要看 / 续推、删了得去 GitLab 重推很麻烦）

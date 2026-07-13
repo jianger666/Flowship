@@ -17,6 +17,7 @@ import {
   Copy,
   ExternalLink,
   FileTerminal,
+  FolderOpen,
   Loader2,
   Play,
   Square,
@@ -99,19 +100,30 @@ export const WorkspaceActions = ({ task }: Props) => {
   }, [candidates.length, refreshSlot]);
 
   const workCwd = task.workCwd;
-  if (!workCwd || task.repoPaths.length === 0) return null;
+  // 任务数据目录（actions/ artifact + workspace/ 产出）——server hydrate 时算好带下来；
+  // 无仓任务也有、单独判断（不跟 workCwd 一起 early return）
+  const taskDirAnchor = task.taskDirPath
+    ? getIdeAnchorProps(task.taskDirPath, undefined, prefs?.jumpIde ?? "cursor", {
+        newWindow: true,
+      })
+    : null;
+  const hasRepoBar = !!workCwd && task.repoPaths.length > 0;
+  if (!hasRepoBar && !taskDirAnchor) return null;
 
   // V0.12.3：IDE 逐仓打开各自项目根、不再打开多仓公共父目录（同事实测 IDEA 把整个
   // D:/IdeaProjects 当项目开了）；每仓一个按钮、单仓时不带短名后缀
-  const ideTargets = getRepoWorkDirs(
-    task.repoPaths,
-    workCwd,
-    task.isolateWorktree === true,
-    task.nonGitRepoPaths,
-    task.readonlyRepoPaths,
-  );
+  const ideTargets = hasRepoBar
+    ? getRepoWorkDirs(
+        task.repoPaths,
+        workCwd!,
+        task.isolateWorktree === true,
+        task.nonGitRepoPaths,
+        task.readonlyRepoPaths,
+      )
+    : [];
 
   const copyPath = async () => {
+    if (!workCwd) return;
     try {
       await navigator.clipboard.writeText(workCwd);
       toast.success("工作区路径已复制");
@@ -185,16 +197,38 @@ export const WorkspaceActions = ({ task }: Props) => {
           </Button>
         );
       })}
-      <Button
-        variant="ghost"
-        size="sm"
-        className={BTN_CLS}
-        onClick={copyPath}
-        title={`复制工作区路径\n${workCwd}`}
-      >
-        <Copy className="size-3" />
-        复制路径
-      </Button>
+      {hasRepoBar && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={BTN_CLS}
+          onClick={copyPath}
+          title={`复制工作区路径\n${workCwd}`}
+        >
+          <Copy className="size-3" />
+          复制路径
+        </Button>
+      )}
+
+      {/* 打开任务数据目录（actions/ artifact + workspace/ 脚本产出）——用户找 AI 产出文件的入口 */}
+      {taskDirAnchor && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={BTN_CLS}
+          nativeButton={false}
+          render={
+            <a
+              {...taskDirAnchor}
+              className="no-underline"
+              title={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
+            />
+          }
+        >
+          <FolderOpen className="size-3" />
+          任务文件夹
+        </Button>
+      )}
 
       {/* 「需求详情」按钮已删（v1.1.x 用户拍板）：工作项的 description 字段团队实践里
           都是空的（产品写飞书文档、往工作项贴链接）、点开永远空白纯误导 */}

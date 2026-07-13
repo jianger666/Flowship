@@ -17,6 +17,7 @@ import {
   getActionArtifactPath,
   getActionsDir,
   getEventsLogPath,
+  getTaskWorkspaceDir,
 } from "./task-fs-core";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import { turnDisciplineSection } from "./turn-discipline";
@@ -26,6 +27,7 @@ import {
   getTaskWorkRepoPaths,
   isTaskNonGitRepo,
   isTaskReadonlyRepo,
+  isTaskScriptRepo,
   isWorktreeTask,
   taskHasGitRepo,
 } from "./task-worktrees";
@@ -289,6 +291,7 @@ export const buildSuperPrompt = async (
     skillsSection: renderSkillsForPrompt(skills),
     eventsLogPath: getEventsLogPath(task.id),
     actionArtifactsDir: getActionsDir(task.id),
+    taskWorkspaceDir: getTaskWorkspaceDir(task.id),
     sharedRules,
     actionHistorySection,
     firstActionDirective,
@@ -371,29 +374,41 @@ export const renderReadonlyRepoDirective = (task: Task): string => {
   return "只读仓：不改内容 / 不建分支 / 不 commit / 不 push / 不提 MR；允许 `git pull` 与切到该仓测试分支拉最新做验证。";
 };
 
+/**
+ * 脚本仓约定一行（task / chat 共用文案、与只读约定独立注入——两层解耦）。
+ * 纯性质说明：告诉 agent 这类仓是干嘛的 + 写入前先看仓内约定；不含权限语义（权限看只读标注）。
+ */
+export const renderScriptRepoDirective = (task: Task): string => {
+  if ((task.scriptRepoPaths ?? []).length === 0) return "";
+  return "脚本仓：专门存放脚本类产出（测试脚本 / 工具脚本等）的仓库。往里新建文件前先看该仓的 README / AGENTS.md 是否有目录组织约定——有就照约定放、没有就按任务语义自行合理组织（如按任务 / 模块建子目录）、不要把文件散在仓库根目录。";
+};
+
 // V0.6.7：渲染「仓库分支配置」段注入 super prompt——ship 读测试分支、各 action 兜底参考
 // 每仓列：线上分支（feature 拉取基线）/ 测试分支（ship 提测 MR 目标）/ dev 分支
-// 非 git 目录：无分支概念、只标「直接在该目录使用」；只读仓行尾标 🔒 只读
+// 非 git 目录：无分支概念、只标「直接在该目录使用」；只读仓行尾标 🔒 只读、脚本仓标 📜 脚本仓
 const renderRepoBranchSection = (task: Task): string => {
   const repoPaths = task.repoPaths ?? [];
   if (repoPaths.length === 0) return "（无绑定仓库）";
   // V0.10：隔离 task 括号里展示 worktree 路径（agent 实际干活的目录、别引它 cd 回原仓库）
-  // 判断 git / 只读读快照（不 existsSync）
+  // 判断 git / 只读 / 脚本仓读快照（不 existsSync）
   const workPaths = getTaskWorkRepoPaths(task);
   const lines: string[] = [
     "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
     "",
   ];
   let hasReadonly = false;
+  let hasScript = false;
   for (let i = 0; i < repoPaths.length; i++) {
     const p = repoPaths[i];
     const tail = p.split("/").filter(Boolean).pop() ?? p;
     const readonly = isTaskReadonlyRepo(task, p);
     if (readonly) hasReadonly = true;
-    const readonlyTag = readonly ? " 🔒 只读" : "";
+    const script = isTaskScriptRepo(task, p);
+    if (script) hasScript = true;
+    const flagTag = `${readonly ? " 🔒 只读" : ""}${script ? " 📜 脚本仓" : ""}`;
     if (isTaskNonGitRepo(task, p)) {
       lines.push(
-        `- \`${tail}\`（${workPaths[i]}）：非 git 目录、无分支概念、直接在该目录使用${readonlyTag}`,
+        `- \`${tail}\`（${workPaths[i]}）：非 git 目录、无分支概念、直接在该目录使用${flagTag}`,
       );
       continue;
     }
@@ -402,12 +417,13 @@ const renderRepoBranchSection = (task: Task): string => {
     const dev = task.repoDevBranches?.[p]?.trim();
     lines.push(
       `- \`${tail}\`（${workPaths[i]}）：线上分支=${online || "（未配、自动探测）"}、` +
-        `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}${readonlyTag}`,
+        `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}${flagTag}`,
     );
   }
-  if (hasReadonly) {
-    lines.push("", renderReadonlyRepoDirective(task));
-  }
+  // 只读 / 脚本仓约定各自独立一行（解耦：只读讲权限、脚本仓讲性质；组合场景 agent 自行推导）
+  if (hasReadonly || hasScript) lines.push("");
+  if (hasReadonly) lines.push(renderReadonlyRepoDirective(task));
+  if (hasScript) lines.push(renderScriptRepoDirective(task));
   return lines.join("\n");
 };
 

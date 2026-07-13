@@ -118,10 +118,11 @@ const normalizeSettings = (
     const withTpl = r.branchTemplate
       ? { ...r, branchTemplate: bakeUsername(r.branchTemplate)! }
       : { ...r };
-    // 只读开关：只认显式 true、其它（缺省 / 脏值）当可写
+    // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
     return {
       ...withTpl,
       readonly: r.readonly === true ? true : undefined,
+      scriptRepo: r.scriptRepo === true ? true : undefined,
     };
   });
   const merged = { ...DEFAULT_SETTINGS, ...parsed };

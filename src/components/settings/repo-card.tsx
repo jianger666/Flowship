@@ -133,13 +133,15 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onCommit(repos.filter((r) => r.path !== path));
   };
 
-  // 只读开关：离散选择、选中即落盘
-  const commitReadonly = (path: string, readonly: boolean) => {
+  // 只读 / 脚本仓开关：离散选择、选中即落盘（关 = undefined、不落 false 脏 config）
+  const commitRepoFlag = (
+    path: string,
+    field: "readonly" | "scriptRepo",
+    value: boolean,
+  ) => {
     onCommit(
       repos.map((r) =>
-        r.path === path
-          ? { ...r, readonly: readonly ? true : undefined }
-          : r,
+        r.path === path ? { ...r, [field]: value ? true : undefined } : r,
       ),
     );
   };
@@ -175,7 +177,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                   key={r.path}
                   className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
                 >
-                  {/* 第一行：仓名 + 路径 + 只读开关 + 删除 */}
+                  {/* 第一行：仓名 + 路径 + 只读 / 脚本仓开关 + 删除 */}
                   <div className="flex items-center gap-2">
                     <Input
                       value={r.name}
@@ -191,7 +193,17 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                       只读
                       <Switch
                         checked={r.readonly === true}
-                        onCheckedChange={(v) => commitReadonly(r.path, v)}
+                        onCheckedChange={(v) => commitRepoFlag(r.path, "readonly", v)}
+                      />
+                    </label>
+                    <label
+                      className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+                      title="标注该仓专门存放脚本类产出（测试脚本 / 工具脚本等）——AI 往里写文件前会先看仓内 README / AGENTS.md 约定。与只读正交：只读脚本仓 = 纯参考库。"
+                    >
+                      脚本仓
+                      <Switch
+                        checked={r.scriptRepo === true}
+                        onCheckedChange={(v) => commitRepoFlag(r.path, "scriptRepo", v)}
                       />
                     </label>
                     <Button

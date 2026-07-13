@@ -43,6 +43,9 @@ const repoConfigCanonical = (r: RepoConfig): string =>
     r.devBranch ?? "",
     r.branchTemplate ?? "",
     r.previewCommand ?? "",
+    // boolean 开关缺省归一 false（修：原先漏 readonly、切开关不触发 dirty）
+    r.readonly ?? false,
+    r.scriptRepo ?? false,
   ]);
 
 export const repoConfigEquals = (a: RepoConfig, b: RepoConfig): boolean =>

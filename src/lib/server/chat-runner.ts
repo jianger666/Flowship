@@ -66,6 +66,7 @@ import { resolveUserIdentityForPrompt } from "./meegle-cli";
 import {
   buildGitlabAccessDirective,
   renderReadonlyRepoDirective,
+  renderScriptRepoDirective,
 } from "./task-prompts";
 import { resolveEffectiveGitHost } from "./gitlab-host";
 import { readSettingsFile } from "./settings-fs";
@@ -337,6 +338,11 @@ const buildInitialPrompt = (
   const readonlyDirective = renderReadonlyRepoDirective(task);
   if (readonlyDirective) {
     lines.push(readonlyDirective, "");
+  }
+  // 绑了脚本仓：同位置注入脚本仓性质说明（与只读约定独立、两层解耦）
+  const scriptDirective = renderScriptRepoDirective(task);
+  if (scriptDirective) {
+    lines.push(scriptDirective, "");
   }
   // 绑仓 + settings 有 gitToken → 注入 GitLab 访问说明（纯聊天不注）
   if (gitlabAccessSection.trim()) {

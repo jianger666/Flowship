@@ -61,25 +61,12 @@ import {
   cleanupOrphanTaskWorktrees,
   computeNonGitRepoPaths,
   computeReadonlyRepoPaths,
+  computeScriptRepoPaths,
   getTaskCwd,
   isWorktreeTask,
   removeTaskWorktrees,
 } from "./task-worktrees";
 import { readSettingsFile } from "./settings-fs";
-
-/** 读 settings.repos 算只读快照（失败 / 无匹配 → undefined） */
-const snapshotReadonlyRepoPaths = async (
-  repoPaths: string[],
-): Promise<string[] | undefined> => {
-  const settings = await readSettingsFile().catch(() => null);
-  const repos = Array.isArray(settings?.repos) ? settings!.repos : [];
-  // config.json 里 repos 是宽松 JSON、只收带 path 的条目
-  const entries = (repos as unknown[]).filter(
-    (r): r is { path?: string; readonly?: boolean } =>
-      !!r && typeof r === "object" && !Array.isArray(r),
-  );
-  return computeReadonlyRepoPaths(repoPaths, entries);
-};
 import {
   getPreviewStatus,
   killStalePreview,
@@ -92,6 +79,7 @@ import {
   appendEventLine,
   ensureDataDir,
   exists,
+  getTaskWorkspaceDir,
   hydrateTask,
   hydrateTaskSummary,
   isValidMetaShape,
@@ -106,6 +94,25 @@ import {
   writeMeta,
   type TaskMetaV06,
 } from "./task-fs-core";
+
+// ----------------- 仓库 flag 快照（只读 / 脚本仓）-----------------
+
+/** 读 settings.repos 算「只读 / 脚本仓」快照（失败 / 无匹配 → 各自 undefined） */
+const snapshotRepoFlagPaths = async (
+  repoPaths: string[],
+): Promise<{ readonly: string[] | undefined; script: string[] | undefined }> => {
+  const settings = await readSettingsFile().catch(() => null);
+  const repos = Array.isArray(settings?.repos) ? settings!.repos : [];
+  // config.json 里 repos 是宽松 JSON、只收带 path 的条目
+  const entries = (repos as unknown[]).filter(
+    (r): r is { path?: string; readonly?: boolean; scriptRepo?: boolean } =>
+      !!r && typeof r === "object" && !Array.isArray(r),
+  );
+  return {
+    readonly: computeReadonlyRepoPaths(repoPaths, entries),
+    script: computeScriptRepoPaths(repoPaths, entries),
+  };
+};
 
 // ----------------- 上下文文档（V0.3、V0.6 不变）-----------------
 
@@ -289,8 +296,10 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
   const finalTitle =
     input.title && input.title.trim() ? input.title.trim() : "未命名任务";
 
+  // 去尾斜杠：settings.repos 落盘无尾 /、快照匹配（readonly / scriptRepo）是精确字符串比对，
+  // 带尾 / 会静默匹配空（跟 addRepoPaths / setTaskRepoPaths 同款归一）
   const trimmedRepoPaths = (input.repoPaths ?? [])
-    .map((p) => p.trim())
+    .map((p) => p.trim().replace(/\/+$/, ""))
     .filter((p) => p.length > 0);
 
   // V0.6.3：清洗 per-repo 线上分支——key 限定在本 task 的 repoPaths 内、value 去空 trim
@@ -326,6 +335,9 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && t) repoBranchTemplates[repo] = t;
   }
 
+  // 只读 / 脚本仓快照：从 settings.repos 匹配（server 端读 config.json、不信 client 传）
+  const repoFlags = await snapshotRepoFlagPaths(trimmedRepoPaths);
+
   const meta: TaskMetaV06 = {
     id: newTaskId(),
     title: finalTitle,
@@ -339,8 +351,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     repoPaths: trimmedRepoPaths,
     // 建 task 时快照：之后路径映射 / cwd 聚合读这份，不再运行时 existsSync
     nonGitRepoPaths: computeNonGitRepoPaths(trimmedRepoPaths),
-    // 只读仓快照：从 settings.repos 匹配（server 端读 config.json、不信 client 传）
-    readonlyRepoPaths: await snapshotReadonlyRepoPaths(trimmedRepoPaths),
+    readonlyRepoPaths: repoFlags.readonly,
+    scriptRepoPaths: repoFlags.script,
     repoBaseBranches:
       Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
     repoFeatureBranches:
@@ -371,6 +383,15 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     updatedAt: now,
   };
   await writeMeta(meta);
+  // 任务专属可写工作目录（task 模式）：artifact 之外的产出兜底落点——只读仓 / 无仓任务
+  // 也永远有合法可写位置。best-effort：建失败不挡建任务（runner 起 agent 前会再 ensure 一次）
+  if (input.mode !== "chat") {
+    await fs
+      .mkdir(getTaskWorkspaceDir(meta.id), { recursive: true })
+      .catch((err) =>
+        console.warn(`[task-fs] createTask: 建 workspace 目录失败（忽略）id=${meta.id}`, err),
+      );
+  }
   return await hydrateTask(meta);
 };
 
@@ -704,9 +725,13 @@ export const updateTaskFields = async (
           meta.repoBranchTemplates,
           input.addRepoBranchTemplates,
         );
-        // 追加仓后重算非 git / 只读快照（只增不删、新仓可能是脚本目录或只读）
+        // 追加仓后重算非 git / 只读 / 脚本仓快照。注意：flag 快照按「当前」settings
+        // 对全部 repoPaths 全量重算（沿用只读快照旧行为）——用户中途在设置页改过
+        // 开关的话、老仓标记也会一并刷新到最新
         meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
-        meta.readonlyRepoPaths = await snapshotReadonlyRepoPaths(meta.repoPaths);
+        const flags = await snapshotRepoFlagPaths(meta.repoPaths);
+        meta.readonlyRepoPaths = flags.readonly;
+        meta.scriptRepoPaths = flags.script;
       }
     }
 
@@ -772,7 +797,9 @@ export const setTaskRepoPaths = async (
       .filter((p) => p.length > 0);
     // chat 重选工作目录也要刷新快照（cwd / 路径映射契约同一份）
     meta.nonGitRepoPaths = computeNonGitRepoPaths(meta.repoPaths);
-    meta.readonlyRepoPaths = await snapshotReadonlyRepoPaths(meta.repoPaths);
+    const flags = await snapshotRepoFlagPaths(meta.repoPaths);
+    meta.readonlyRepoPaths = flags.readonly;
+    meta.scriptRepoPaths = flags.script;
     meta.updatedAt = Date.now();
     await writeMeta(meta);
     return await hydrateTask(meta);

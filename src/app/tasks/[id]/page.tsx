@@ -33,6 +33,7 @@ import {
   Lock,
   Pencil,
   RotateCcw,
+  ScrollText,
   Sparkles,
   XCircle,
   Zap,
@@ -662,6 +663,7 @@ const TaskDetailPage = () => {
                   <span className="inline-flex flex-wrap items-center gap-x-1">
                     {task.repoPaths.map((p, i) => {
                       const readonly = (task.readonlyRepoPaths ?? []).includes(p);
+                      const script = (task.scriptRepoPaths ?? []).includes(p);
                       const label =
                         task.repoPaths.length === 1
                           ? p
@@ -678,6 +680,14 @@ const TaskDetailPage = () => {
                               <Lock
                                 className="size-3 text-muted-foreground"
                                 aria-label="只读仓库"
+                              />
+                            </span>
+                          )}
+                          {script && (
+                            <span title="脚本仓" className="inline-flex">
+                              <ScrollText
+                                className="size-3 text-muted-foreground"
+                                aria-label="脚本仓"
                               />
                             </span>
                           )}

@@ -301,6 +301,15 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13 深夜 v1.1.10 发版：产出解耦——任务 workspace + 脚本仓标注 + 任务文件夹入口（用户明确授权发版、grok 子代理 review 无 P0）
+
+- **背景（用户复盘设计）**：测试建任务挂前后端只读仓 + 自定义「写测试脚本」action 时、脚本没有合法落点——「仓库挂载」和「产出去处」耦合太死。拍板解法：① 每个 task 一个专属可写 workspace（产出兜底、跟仓库选择解耦）② 仓库可标「脚本仓」（纯性质提示、AI 看仓内约定自己落）——两层提示词**独立注入不做组合逻辑**（用户拍板「更解耦」、只读×脚本仓组合让 AI 自行推导）。
+- **任务 workspace 目录**：`<dataRoot>/tasks/<id>/workspace/`（`WORKSPACE_DIR` + `getTaskWorkspaceDir`）——createTask 创建（chat 不建、best-effort）、`ensureWorkspaceReady` 起 agent 前兜底 mkdir（老任务/手删自愈）、随任务目录整体删除；`_super.md` 新增「任务工作目录」段（`{{taskWorkspaceDir}}` 绝对路径 + 「非 artifact 文件没明确去处写这里、artifact 里列产出绝对路径」）、占位符对账测试同步。
+- **脚本仓标注（scriptRepo）**：`RepoConfig.scriptRepo` Switch（设置页仓库行、与只读并排、tooltip 讲清正交语义）→ 三写点快照 `task.scriptRepoPaths`（createTask / addRepoPaths / setTaskRepoPaths、`snapshotRepoFlagPaths` 一次读 settings 算只读+脚本两份）；**纯提示性**：不影响 worktree 隔离/门禁/检测——prompt 分支配置段行尾标 📜 + 独立一行「往里新建文件前先看仓内 README/AGENTS.md 约定、没有就自行合理组织」（`renderScriptRepoDirective`、chat 同注入）；任务头部仓库行挂 ScrollText icon（对称 🔒 Lock）。
+- **「任务文件夹」按钮**（用户：想看 workspace / artifact 这批文件）：`Task.taskDirPath` 计算字段（hydrateTask 算、不落盘——dataRoot 只有 server 知道）→ WorkspaceActions 新按钮走 ide-open 通道（cursor:// 新窗口 / JetBrains 后端 spawn）打开 `tasks/<id>/`；顺带重构 early return——无仓任务也能显示该按钮。
+- **顺带修**：`repoConfigCanonical` 漏 `readonly`（设置页切只读开关不触发 dirty、本次连 scriptRepo 一起补）；createTask repoPaths 去尾斜杠归一（settings 落盘无尾 `/`、flag 快照精确匹配、带尾 `/` 会静默匹配空——addRepoPaths/setTaskRepoPaths 本就归一、补齐 create 口）。
+- 流程：实施 → typecheck/lint/test/build 全绿 → grok 子代理只读 review（无 P0；P1 已修：adaptive QA 产出指引补 workspace、路径归一化、ensureWorkspaceReady chat 守卫、addRepoPaths 全量重算 flag 快照加注释说明）→ 复验全绿。
+
 ### 2026-07-13 深夜 v1.1.9 发版：修订模式 + 今晚全部积压（发版前蓝军终审无 P0、1 P1 已修）
 
 > 本版 = 下面两个「攒着未发」段 + 当晚陆续修的：插话快照治理（相同快照惰性清理 + running 态不清理防时序竞态误删）、断网/提问态输入条不再锁死（去 pendingAsk 硬闸 + 跳过提问给 agent 提示 + 交卷收尾窗口发消息等 run 收敛、等完二次校验防与推进并发——终审 P1）、build 后置检查删「修改记录」铁段（初稿被冤枉红条）、存储统计含 worktree（du+回退）+ 残留工作区清理、mac 通知不传 icon（右侧内容图误加回退）、「任务系统通知」行去 Switch 只留「去系统设置」按钮（notificationsEnabled 字段退役、开关本质在系统层）。终审 P2 记账攒下版：问类插话短暂假红点、答题卡超时解锁未 abort 旧请求、HANDOFF 索引挂着已删 artifact-diff。
@@ -316,38 +325,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **看板 VPN 误报根因**：`/api/feishu/board` 数据链路的 `meegleAuthStatusUnlocked` 把 auth status **超时 / exit 2 / 无 stdout** 一律当 `authenticated:false`；`runMeegleUnlocked` 的 unknown-command 复核据此抛 `not_authed` → 前端渲「去设置页授权」。v1.1.4 只修了就绪清单的 `/api/system/feishu-cli`（`mergeAuthPreserve`），看板自己的 meegle 链路没享受到。
 - **修法**（同哲学：瞬态 ≠ 未登录）：`isMeegleExecTransient` 优先于未登录正则；auth status 瞬态标 `transient`；unknown-command 复核遇 transient 抛 `error` 不抛 `not_authed`。前端护栏本就覆盖 not_authed、服务端分类修对后 VPN 卡显示「加载失败 + 重试」。
 - **系统通知**：通知图标换新 logo（`extraResources` 打 `packaging/icon.png` 进包作 `notify-icon.png`、win 显式传 / mac 走 app icon）；设置→偏好加「任务系统通知」Switch（`settings.notificationsEnabled` 默认开、task-attention-watcher 读设置 gate）+「系统设置里开启」深链（mac/win 各自跳系统通知面板、`__shell.openExternal`、解「系统层误拒后找不到入口」）。
-
-### 2026-07-13 晚 v1.1.8 发版：今日积压全量（下面三段 + 本段、v1.1.7 tag/draft 已删除作废）
-
-- **GitLab 凭证运行时注入（野路子转正、用户拍板）**：settings 配了 gitToken 时、task + 绑仓 chat 的 prompt 注入「## GitLab 访问」段（host + `config.json` **gitToken 字段**位置 + 「只取该字段别 cat 全文件——里面还有其它密钥」+ 读随意写收敛 + 内置飞书 CLI 已登录勿预检）——AI 不再靠自己摸后门（线上实锤：同事的自定义 action 里 AI 先试 glab 失败、再自己发现 config.json 才跑通）；`action-ship.md`「拿不到 PAT 必然失败」旧措辞纠偏成「MR 创建必须走 submit_mr（落库审计）」。曾讨论过 `gitlab_api_get` 只读代理 + 红线的分级方案、用户拍板不做（本地单机、接受 token 进上下文）
-- **插话答疑顺序硬化**（线上实锤：agent 先交卷后答疑、还把「这是纯疑问：我将…」当回复发出）：〈产出审阅中〉直令 + _super/[USER_MESSAGE] 段改写为「**先发答案、再 submit_work 重新交卷**、禁分类旁白」；本次立原则：**prompt 改动优先改写现有句子、不追加新段**（本批全部净增 ≤4 行）
-- **creator 可移植原则**：action/skill creator 各加一句「凭证/系统工具细节不写进 skill（保通用）、运行时系统会注入」——skill 拿去 Cursor 等环境不废
-- **蓝军全量终审**（v1.1.6..HEAD 8 commit）：无 P0；2 个 P1 已修（看板任务列表未加载时误进预览页——`!loaded` 回退信缓存映射；mac 更新暂存下载无并发互斥——single-flight stagingPromise）；P1-3/4（退出替换窗口强杀空窗、DELETE 挂死锁死列表项）+ 若干 P2 记账攒下版
-- 工作项预览页描述区块整体移除（用户拍板）
-
-### 2026-07-13 傍晚（已随 v1.1.8 发）：线上 bug 修一批 + mac 自更新延迟替换
-
-- **postCheck 红条终于实装**（同事「自定义 action 不知道 AI 写没写产物」根因）：后置检查 fail 一直只落 `action.postCheck`、前端 0 处渲染（V0.6 设计的红条漏做）——artifact 面板正文/空态顶部 destructive 警示条（「后置检查未通过」+ details）+ action timeline 行警示标；顺带修 Windows 反斜杠路径漏检测（sdk-message-handler 匹配前归一 `\`→`/`、否则「在写 artifact」事件与 artifactUpdatedAt 刷新全漏）+ 过时 `skills/artifact-writer` 教旧 artifacts/ 路径纠偏
-- **删任务后看板 404 修复**：看板 `handleOpen` 盲信缓存里的 `item.task` 硬跳已删任务——改成点击前用 `useTaskList()` 实时校验、删了就走 `/workitems/` 预览重新建（用户期望）；任务详情页 `!task` 从裸 `notFound()` 改 EmptyHint+「回工作台」；侧栏删除防重（deletingIds 锁 + 404 幂等成功不再 toast「任务不存在」+ `use-task-list` pendingDeletes 防 2s 轮询回魂 + 删当前任务先导航再等 DELETE）
-- **表单**：任一仓填「已有工作分支」→ 强制原仓运行、worktree 勾选隐藏换一行说明（同事实测踩「已有分支+隔离」必撞 git 同分支双检出）；勾选文案改正向「使用 worktree 隔离运行」（用户拍板「原仓运行别人看不懂」）、设置页对应项同步
-- **mac 自更新改延迟替换**（用户实测「稍后」态被硬闸拦、问能不能不用重启）：下载+验签后只暂存 `updates/staged-<v>.app`、**不碰 /Applications**——「立即更新」= 替换+重启；「稍后」= 老进程跑在没动过的老包上完全正常、before-quit 时替换（preventDefault 等替换完 exit）、启动早期兜底（有效暂存 → 替换+relaunch 无感知）；update-pending-restart 硬闸保留但正常流程不再触发；启动清扫扩展覆盖过期 staged
-- test 包中途打过一轮给用户验收（只读仓 / 删除 404 / 表单批）
-- ⏸ **讨论后搁置记账：GitLab 能力分级方案**（用户拍板「现在的好像也能用、先不改」）——背景：creator（action/skill）零提系统能力、AI 无「读 GitLab」正规通道、测试同事的 action 靠 AI 自己发现 config.json 明文 token 跑通（野路子、token/apiKey 会进事件流与上下文）。已讨论定型但未实施的方案：A. 两个 creator 加「系统能力速查」（含新原则：工具名不进 skill、只进运行时注入、保 skill 通用性）B. `gitlab_api_get` 通用只读代理 + `add_mr_comment`（读自由写收口、merge/删分支不开）C. 「禁读 config.json 取密钥」红线。将来要做直接按这个捡起来。
-
-### 2026-07-13 午后（已随 v1.1.8 发）：仓库级「只读」取代测试角色机制
-
-> ⚠️ v1.1.7 tag 被用户手动取消 CI（draft 未转正、对外不存在、latest 仍指 v1.1.6）；本段改动只在 main、等用户亲自验收后再定发版。同日立规：**发版只在用户主动喊「发版」时做、用户没验过的改动绝不发**（见 learned-conventions）。
-
-- **背景（用户复盘）**：v1.1.6/1.1.7 的「测试角色（userRole=qa）」路线提示词越补越多（三变体 20 行 + 按角色的 ship/dev 闸）、维护成本高、开发者自己都记不住。拍板改成**仓库级只读**：语义跟着仓走、配一次永久生效、看得见不靠记忆。
-- **实现**：settings.repos 每仓「只读」Switch（`RepoEntry.readonly`）→ 建任务快照 `task.readonlyRepoPaths`（同 nonGitRepoPaths 三写点模式）；只读仓**不进隔离 worktree**（原仓直接用、用户拍板「不写代码隔离没必要」）；门禁——全仓只读拒 build/ship/dev（`ALL_READONLY_REPOS_BLOCK_REASON` 单一文案源、服务端 + 弹窗灰卡共用）、`submit_mr` 对只读仓拒；prompt 只剩**一行**只读约定（不改内容/不建分支/不 commit push 提 MR、允许 pull + 切测试分支拉最新）、分支配置段只读仓行尾标 🔒；**后置确定性检测**（action-checks、所有 action 通用）：交卷后对只读仓查 `status --porcelain` 脏 + 本地领先 upstream 的 commit、被动过红条罗列（pull/切分支不误报）——「shell 硬拦」的替代（hooks 链路 v1.1.2 已拆、恢复成本高、记账观察）；任务头部只读仓挂 Lock icon
-- **退役删除**：`buildQaRoleDirective` 三变体 + `{{qaRoleDirective}}` 占位 + 两 runner 注入接线 + action-gates/advance-dialog 的 qa 角色闸——角色（userRole）不再影响任何 prompt / 门禁
-
-### 2026-07-13 v1.1.7（tag 已作废、CI 被取消、改动在 main）：测试角色专项审查修复 + 工作台手动建任务入口
-
-- **测试角色约定专项审查**（用户点名「拉子代理一起 review 影响点」、逐 action 推演 + prompt 一致性 + 边界场景、报 3 P1）：① 守约定反而必红——review 只读指纹把 HEAD 编进 hash、QA detached 切基线必触发红条；② 非隔离任务切基线会动用户原仓 HEAD；③ ship/dev 准入不看角色、playbook（commit+push+提 MR）与 QA 红线硬对撞
-- **修复**：唯一代码闸 = `checkActionPrerequisites` ship/dev 对 `userRole==="qa"` 直接拒（`QA_ROLE_BLOCK_SHIP_DEV_REASON` 单一文案源、服务端准入 + 推进弹窗灰卡共用；advanceTask 读 settings 传 ctx）；其余全 prompt 文案解——`buildQaRoleDirective` 加 `isolateWorktree` 参数：隔离 task 才教 detached 切基线（含 MR ref 姿势）、非隔离 task / chat 一律「不切分支、当前检出只读验证」；追加通用约束（review 期间不切 commit / 误推 build 只产验证报告 / learn 只写任务目录 / 本约定优先于 playbook）
-- **工作台手动建任务**（用户：有些需求没排到甘特上、看板无入口）：看板头部「手动建任务」按钮 + 空态提示带链接 → 新页 `/workitems/new`（TaskLaunchForm 无预填复用）；表单飞书链接字段——有预填固定带入（看板进）、无预填露出可编辑输入（placeholder「粘贴飞书工作项链接」）、必填语义不变
-- 顺带（v1.1.6 发出后的样式跟进）：推进卡两行方案回退单行 truncate + hover Tooltip 补全名（两行让 grid 行高不齐、用户拍板）；文字 13px→12px + padding 收窄、单行多容一两个字
 
 ## 关键文件索引
 

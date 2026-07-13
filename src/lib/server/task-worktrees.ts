@@ -69,6 +69,23 @@ export const computeReadonlyRepoPaths = (
   return matched.length > 0 ? matched : undefined;
 };
 
+/**
+ * 从 settings.repos 算出脚本仓快照（跟 computeReadonlyRepoPaths 同款、按 scriptRepo 开关匹配）。
+ * 纯提示性标注——不影响 worktree 隔离 / 门禁；无匹配 → undefined（跟老任务缺省一致）。
+ */
+export const computeScriptRepoPaths = (
+  repoPaths: string[],
+  settingsRepos: ReadonlyArray<{ path?: string; scriptRepo?: boolean }>,
+): string[] | undefined => {
+  const scriptSet = new Set(
+    settingsRepos
+      .filter((r) => r.scriptRepo === true && typeof r.path === "string" && r.path)
+      .map((r) => r.path as string),
+  );
+  const matched = repoPaths.filter((p) => scriptSet.has(p));
+  return matched.length > 0 ? matched : undefined;
+};
+
 // ----------------- 类型：Task / TaskMetaV06 都能喂的最小形状 -----------------
 
 /**
@@ -84,6 +101,8 @@ export interface WorktreeTaskLike {
   nonGitRepoPaths?: string[];
   /** 只读仓快照；undefined = 无只读仓（老任务） */
   readonlyRepoPaths?: string[];
+  /** 脚本仓快照（纯提示性标注、不参与路径映射）；undefined = 无脚本仓（老任务） */
+  scriptRepoPaths?: string[];
 }
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
@@ -109,6 +128,15 @@ export const isTaskReadonlyRepo = (
   t: WorktreeTaskLike,
   repoPath: string,
 ): boolean => (t.readonlyRepoPaths ?? []).includes(repoPath);
+
+/**
+ * 读快照判断某仓是否脚本仓（undefined / 未列入 = 非脚本仓）。
+ * 只用于 prompt 标注（📜 + 「先看仓内约定」指引）——不影响 worktree / cwd / 门禁。
+ */
+export const isTaskScriptRepo = (
+  t: WorktreeTaskLike,
+  repoPath: string,
+): boolean => (t.scriptRepoPaths ?? []).includes(repoPath);
 
 /** 是否跳过隔离 worktree（非 git 或只读 → 原地使用） */
 export const skipsWorktreeIsolation = (

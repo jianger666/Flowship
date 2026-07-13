@@ -117,6 +117,8 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "skillsSection",
       "eventsLogPath",
       "actionArtifactsDir",
+      // 任务工作目录（非 artifact 产出兜底落点、tasks/<id>/workspace/）
+      "taskWorkspaceDir",
       "sharedRules",
       "actionHistorySection",
       "firstActionDirective",

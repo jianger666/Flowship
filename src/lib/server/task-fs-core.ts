@@ -42,6 +42,9 @@ export const DATA_DIR = path.join(dataRoot(), "tasks");
 export const META_FILE = "meta.json";
 export const EVENTS_FILE = "events.jsonl";
 export const ACTIONS_DIR = "actions";
+// 任务专属可写工作目录（V0.x「产出解耦」）：artifact 之外的文件产出（脚本 / 数据 / 中间产物）
+// 没有明确去处时写这里——只读仓 / 无仓任务也永远有合法可写落点。建任务时创建、随任务删除。
+export const WORKSPACE_DIR = "workspace";
 export const REVISIONS_SUBDIR = ".revisions";
 // 划除（软删）的 artifact 挪进这个隐藏子目录——跟 .revisions / .checks 同风格、
 // agent 的 ls / rg 默认都扫不到、防被按编号拼路径翻出来读（V0.8.16、见 setActionArtifactExcluded）
@@ -87,6 +90,13 @@ export const getEventsLogPath = (taskId: string): string =>
  */
 export const getActionsDir = (taskId: string): string =>
   path.join(taskDir(taskId), ACTIONS_DIR);
+
+/**
+ * 任务工作目录 workspace/ 的绝对路径（给 prompt / runner 用）
+ * agent 的非 artifact 产出兜底落点、绝对路径注入 prompt（agent cwd 是业务仓库）
+ */
+export const getTaskWorkspaceDir = (taskId: string): string =>
+  path.join(taskDir(taskId), WORKSPACE_DIR);
 
 /**
  * 给单条 action 算 artifact 文件名（相对名、不含目录前缀）
@@ -163,6 +173,11 @@ export interface TaskMetaV06 {
    * undefined = 无只读仓（老任务）。
    */
   readonlyRepoPaths?: string[];
+  /**
+   * 脚本仓清单快照（详见 types.ts Task.scriptRepoPaths）。
+   * undefined = 无脚本仓（老任务）。
+   */
+  scriptRepoPaths?: string[];
   /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
   repoBaseBranches?: Record<string, string>;
   /** V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、建 task 时用户填、空则 build 用算法名） */
@@ -405,6 +420,7 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     repoPaths: meta.repoPaths,
     nonGitRepoPaths: meta.nonGitRepoPaths,
     readonlyRepoPaths: meta.readonlyRepoPaths,
+    scriptRepoPaths: meta.scriptRepoPaths,
     repoBaseBranches: meta.repoBaseBranches,
     repoFeatureBranches: meta.repoFeatureBranches,
     repoTestBranches: meta.repoTestBranches,
@@ -418,6 +434,9 @@ export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
     // 计算字段（不落盘）：agent 实际工作目录——隔离 task = worktree cwd、否则 = 原仓库 cwd。
     // client 的「在 IDE 打开工作区 / 复制路径 / 预览」都要它、而 dataRoot 只有 server 知道
     workCwd: getTaskCwd(meta),
+    // 计算字段（不落盘）：任务数据目录（artifact / workspace / 事件日志所在）——
+    // client 的「打开任务文件夹」按钮用
+    taskDirPath: taskDir(meta.id),
     removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
     pinned: meta.pinned,
     createdAt: meta.createdAt,

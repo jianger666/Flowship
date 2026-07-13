@@ -46,7 +46,7 @@ import {
   setTaskRunStatus,
   setTaskAwaitingIfIdle,
 } from "./task-fs";
-import { getActionsDir, getEventsLogPath } from "./task-fs-core";
+import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
 import {
   runActionCheck,
   captureActionStartBaseline,
@@ -1460,12 +1460,22 @@ const registerSessionBridges = (
 };
 
 /**
- * 隔离 task 起 / 接 agent 前保证 worktree 目录在盘上。
- * reopen 不重建、finalize 清过再问一问、用户手删 worktree——cwd 会指到不存在的路径；
- * ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
- * 失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
+ * 起 / 接 agent 前保证工作区在盘上：
+ * 1. 任务 workspace 目录（tasks/<id>/workspace/、非 artifact 产出兜底落点）——建任务时已创建、
+ *    这里兜底重建（老任务没有 / 用户手删）、mkdir recursive 幂等秒过、失败只 log 不挡启动
+ * 2. 隔离 task 的 worktree——reopen 不重建、finalize 清过再问一问、用户手删 worktree
+ *    都会让 cwd 指到不存在的路径；ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
+ *    失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
  */
 const ensureWorkspaceReady = async (task: Task): Promise<void> => {
+  // chat 不建 workspace 目录（跟 createTask 口径一致）；当前 chat 不走本 runner、纯防御
+  if (task.mode !== "chat") {
+    await fs
+      .mkdir(getTaskWorkspaceDir(task.id), { recursive: true })
+      .catch((err) =>
+        console.warn(`[task-runner] 建 workspace 目录失败（忽略）task=${task.id}`, err),
+      );
+  }
   if (!isWorktreeTask(task)) return;
   await ensureTaskWorktrees(task);
 };
