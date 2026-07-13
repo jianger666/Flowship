@@ -639,21 +639,44 @@ const probeVersion = async (
   return null;
 };
 
-const probeLarkAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> => {
+/** auth 探测内部结果：transient 只在探测→合并缓存流转、不进对外 StatusSnapshot */
+interface AuthProbeResult {
+  loggedIn: boolean;
+  detail?: string;
+  /** 瞬态失败（超时 / 网络抖）——合并缓存时不得把已登录降成未登录 */
+  transient?: boolean;
+}
+
+/** execFile 超时被 kill / 带 signal → 瞬态（不是「确定未登录」） */
+const isExecTransient = (err: unknown): boolean => {
+  const e = err as { killed?: boolean; signal?: string | null };
+  return e.killed === true || (typeof e.signal === "string" && e.signal.length > 0);
+};
+
+const probeLarkAuth = async (): Promise<AuthProbeResult> => {
   try {
     const { stdout } = await execFileAsync(larkCliBin(), ["auth", "status"], {
       timeout: 15_000,
     });
-    // 输出 JSON：users / identities.user.available 非空即视为已登录
+    // 有 stdout 且能按现有正则解析 → 结果算确定
     const loggedIn = /"available":\s*true/.test(stdout) || /"users":\s*\[\s*\{/.test(stdout);
     const nameMatch = stdout.match(/"userName":\s*"([^"]+)"/);
+    // 有输出但两个正则都没命中 → 仍算确定「未登录」（CLI 明确回了状态）
     return { loggedIn, detail: nameMatch?.[1] };
   } catch (err) {
-    return { loggedIn: false, detail: err instanceof Error ? err.message.slice(0, 80) : undefined };
+    // 超时 kill / 完全无 stdout → 瞬态；别把已登录缓存打成未登录
+    const e = err as { stdout?: string; message?: string };
+    const hasOut = typeof e.stdout === "string" && e.stdout.trim().length > 0;
+    const transient = isExecTransient(err) || !hasOut;
+    return {
+      loggedIn: false,
+      detail: err instanceof Error ? err.message.slice(0, 80) : undefined,
+      transient,
+    };
   }
 };
 
-const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }> =>
+const probeMeegleAuth = async (): Promise<AuthProbeResult> =>
   // auth status 短命 → 入 meegle 串行队列（与 meegle-cli / 版本探测互斥）
   enqueueMeegle(async () => {
     try {
@@ -666,9 +689,13 @@ const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }
         typeof e.stdout === "string"
           ? e.stdout.match(/"reason":\s*"([^"]+)"/)?.[1]
           : undefined;
+      // exit 1 = 确定未登录；exit 2 / 超时 kill / 未知错误 = 瞬态
+      const transient =
+        e.code === 2 || isExecTransient(err) || (e.code !== 0 && e.code !== 1);
       return {
         loggedIn: false,
         detail: reason ?? (e.code === 2 ? "网络不可达" : "未登录"),
+        transient,
       };
     }
   });
@@ -677,8 +704,15 @@ const probeMeegleAuth = async (): Promise<{ loggedIn: boolean; detail?: string }
 const binExists = async (p: string): Promise<boolean> =>
   !!(await fs.stat(p).catch(() => null));
 
+/** 真探测内部结果：带 auth probe（含 transient），落缓存前由 merge 剥掉 */
+interface ProbedStatus {
+  snapshot: StatusSnapshot;
+  larkAuth: AuthProbeResult | null;
+  meegleAuth: AuthProbeResult | null;
+}
+
 // 真探测（4 个子进程 + auth status 打网络验 token、Windows Defender 首扫下可拖数秒~十几秒）
-const probeStatusNow = async (): Promise<StatusSnapshot> => {
+const probeStatusNow = async (): Promise<ProbedStatus> => {
   const [larkVer, meegleVer, larkOnDisk, meegleOnDisk] = await Promise.all([
     probeVersion(larkCliBin()),
     // meegle 版本探测入串行队列；lark-cli 不动队列
@@ -712,7 +746,7 @@ const probeStatusNow = async (): Promise<StatusSnapshot> => {
     meegle.loggedIn = meegleAuth.loggedIn;
     meegle.authDetail = meegleAuth.detail;
   }
-  return { larkCli, meegle };
+  return { snapshot: { larkCli, meegle }, larkAuth, meegleAuth };
 };
 
 // ----------------- 状态缓存（v1.1.x、同事实测「启动很慢」根因） -----------------
@@ -725,8 +759,40 @@ const probeStatusNow = async (): Promise<StatusSnapshot> => {
 // 真探测刷新（首页 3s 轮询下一轮拿到新值）；全新用户没缓存时真探测本身很快
 //（bin 不存在 execFile 立即 ENOENT）、不受影响。安装 / 登录 / 卸载后主动失效、
 // 设置页操作完拿到的一定是真值。
+//
+// 瞬态失败不降级（v1.x）：auth 超时 / meegle exit 2 / 网络抖 不得把已登录快照写成
+// 未登录落盘——见 refreshStatusCache 写缓存前的 mergeAuthPreserve。
 
 const statusCacheFile = (): string => path.join(getToolsDir(), "status-cache.json");
+
+/**
+ * 合并 auth：新探测「未登录且 transient」而旧缓存该工具已登录 → 保留旧 loggedIn / authDetail。
+ * 避免超时 / 网络抖把已登录快照写成未登录落盘、首页就绪清单闪一下。
+ * transient 只在探测内部流转、落缓存的 StatusSnapshot 不含该字段。
+ */
+const mergeAuthPreserve = (
+  next: CliToolStatus,
+  prev: CliToolStatus | undefined,
+  probe: AuthProbeResult | null,
+): CliToolStatus => {
+  if (probe?.transient && !probe.loggedIn && prev?.loggedIn === true) {
+    return {
+      ...next,
+      loggedIn: true,
+      authDetail: prev.authDetail,
+    };
+  }
+  return next;
+};
+
+/** 写缓存前：用旧缓存护住瞬态「未登录」、产出对外干净的 StatusSnapshot */
+const mergeProbedWithCache = (
+  probed: ProbedStatus,
+  prev: StatusSnapshot | null | undefined,
+): StatusSnapshot => ({
+  larkCli: mergeAuthPreserve(probed.snapshot.larkCli, prev?.larkCli, probed.larkAuth),
+  meegle: mergeAuthPreserve(probed.snapshot.meegle, prev?.meegle, probed.meegleAuth),
+});
 
 // 后台真探测 + 落双缓存（single-flight：并发 GET 只探一次）
 const refreshStatusCache = (): Promise<StatusSnapshot> => {
@@ -734,7 +800,11 @@ const refreshStatusCache = (): Promise<StatusSnapshot> => {
   const gen = (G.__feishuStatusGen ??= 0);
   const flight: Promise<StatusSnapshot> = (async () => {
     try {
-      const snap = await probeStatusNow();
+      // 探测前快照旧缓存（合并用）——probe 期间别读可能被并发改的引用
+      const prev = G.__feishuStatusCache;
+      const probed = await probeStatusNow();
+      // 瞬态失败不降级已登录：合并后再写内存 + 磁盘（剥掉 transient）
+      const snap = mergeProbedWithCache(probed, prev);
       // 探测期间被 invalidate（装/登/卸完成）→ 本结果基于旧世界、丢弃不落盘
       if (G.__feishuStatusGen === gen) {
         G.__feishuStatusCache = snap;

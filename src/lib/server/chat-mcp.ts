@@ -416,8 +416,9 @@ const buildMcpServer = (): McpServer => {
   // 把探测 / 用户填的飞书测试人员 user_key 列表持久化到 task.feishuTesterUserKeys。
   // 同 task 后续 ship 不再探测 / 不再问用户、agent 直接读 task 里的字段拼飞书评论。
   //
-  // 2026-06-12 起从 lark_user_id 切到 user_key（官方 MCP add_comment 改按 user_key 校验、
+  // 2026-06-12 起从 lark_user_id 切到 user_key（飞书评论 mention 按 user_key 校验、
   // lark_user_id 报 cross tenant）、describe 必须跟 action-ship.md §2/§4 保持一致。
+  // V0.12+ 探测主路径 = 内置 meegle CLI（workitem get / user search）、不再走飞书项目 MCP。
   //
   // 空数组 = 显式记忆「没测试人 / 用户选了跳过 @」、跟 undefined 区分。
   srv.registerTool(
@@ -430,8 +431,8 @@ const buildMcpServer = (): McpServer => {
         "## 什么时候调",
         "",
         "首次 ship action 内、按以下顺序探测：",
-        "  1. 调飞书 MCP 的 `get_workitem_brief` 抓「测试」角色的 role_members、`member.key` 就是 user_key（纯数字、直接用）",
-        "  2. 探到任意人 → 调本工具持久化 / 探不到 → 调 ask_user 让用户填用户名 + `search_user_info` 取 user_key 字段后用本工具落库",
+        "  1. 用内置 meegle CLI：`url decode` → `workitem get` 抓「测试」角色的 role_members、`member.key` 就是 user_key（纯数字、直接用）",
+        "  2. 探到任意人 → 调本工具持久化 / 探不到 → 调 ask_user 让用户填用户名 + `meegle user search` 取 user_key 字段后用本工具落库",
         "",
         "同 task 后续 ship action 直接读 `task.feishuTesterUserKeys`、**不再调本工具 / 不再探测 / 不再问用户**。",
         "",

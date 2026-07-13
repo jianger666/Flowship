@@ -15,6 +15,11 @@
 
 ---
 
+### 2026-07-12 夜（已随 v1.1.3 发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
+
+- **运行时不再扫 `~/.cursor/skills/`**：`loadSkills` / `findSkillByName` / 能力页列表只剩平台自带 + app 自管 + 飞书 CLI；「从 Cursor 导入」按钮与 `listCursorGlobalSkills` 保留（导入=拷贝成自管）
+- **只读 skill 眼睛看全文**：内置 / 飞书 CLI 行加 Eye → 只读 Dialog；`GET /api/skills/content` 扩到按 name+source 读任意已知来源（防任意路径）
+
 ### 2026-07-12 晚 v1.1.2 发版：Lexical 输入引擎 + 脱离 Cursor 配置 + action=skill 挂载壳（含 07-12 早/午两批、三轮 subagent 审核全修）
 
 - **Composer 输入引擎迁 Lexical**（@lexical/react 0.47、Cursor 同款路线）：skill token = TextNode token 模式**真原子节点**（光标前后可停可见、整删、可夹任意文字中间、手打全名自动转；DecoratorNode 首版光标前沿消失、实测后换）；tag 样式单一来源 `ui/skill-token.tsx`（组件 + 常量、气泡/输入框同款、✨icon 走 ::before 伪元素不进文本流）；`editorKey=task.id` 切任务重建（撤销栈不跨任务串）；**中文 skill 名全链路**（slash 唤起 / token 高亮 / 最长前缀命中「/写代码帮我改下」、共享字符集 `src/lib/skill-token.ts`）

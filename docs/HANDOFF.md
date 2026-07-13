@@ -301,6 +301,13 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13 v1.1.4 发版：就绪清单补 GitLab Token + 飞书登录态闪烁根治 + 提测 playbook 切内置 meegle CLI
+
+- **就绪清单五项**：GitLab Token 进首页「开始使用」第 3 步（hint「提 MR 用的凭据」、锚点设置→连接）、仓库/角色顺延 4/5；Host 不进清单（已自动从仓库 origin 推导）
+- **飞书登录态闪烁根治**（同事实测「回工作台又提示去填、过会儿又好」）：状态接口 stale-while-revalidate 的真探测把**瞬态失败**（auth status 超时 / meegle exit 2 网络不可达）当「未登录」写坏快照落盘 → 回首页秒回坏快照闪清单、3s 后台纠正又回看板。两层修：服务端 `mergeAuthPreserve`（feishu-cli.ts）——瞬态「未登录」不把已登录快照降级、transient 只在探测内部流转不进对外 StatusSnapshot；客户端 stickyReady（localStorage `fe-ai-flow:setup-ready-seen`）——曾全就绪过就不再渲清单、跳过 CLI 轮询（飞书真掉登录靠看板降级态引导）
+- **提测 playbook 去飞书项目 MCP 依赖**（action-ship.md）：§2 测试人员探测（url decode → project search → workitem get）/ §2C 用户名转 user_key（user search）/ §4 评论（comment add + --notify-user-* 保留传参）全面切内置 meegle CLI 主路径、mention 块保持纯数字 user_key 不变；§4.5 节点流转**去 auth status 预检**（瞬态失败被 agent 误判「未登录」跳过流转、用户线上截图实锤）——直接尝试流转、失败按原因分类记 artifact；chat-mcp `set_feishu_testers` describe 同步防漂移
+- ⏸ 记账未处理：agent shell 里的 meegle 调用不走 server 串行队列（meegle-queue 只罩本进程短命调用）、理论上与看板轮询并发时凭据 refresh 会撞（官方文档：撞毁等效登出）——改动面大、先观察
+
 ### 2026-07-13 v1.1.3 发版：角色设置化 + 能力页收尾 + 推进弹窗定稿（终审无 P0/P1、4 P3 修 3）
 
 - **settings.userRole**（`fe|be|qa|other`）：偏好区 Select（chips 版用户否掉）+ 首页就绪清单必填一步；身份注入只从设置取角色（story 角色组反查 / `identity.json` / `remember_user_role` MCP **全退役删除**——用户拍板「任务里取+缓存兜底不可靠」）、姓名仍走 meegle `user me`；注入文案 `- 发起人：姓名（角色：前端）`
@@ -309,11 +316,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **推进弹窗定稿**（多轮调整）：4 列网格卡、块高 40px、文字 13px、✨ 左侧垂直居中角标、主标题居中无副标题无 tooltip；防抖 min-h 占位反撑出大空档、全部回退（`empty:hidden` 无内容不占高、JSX 条件渲染假分支产真空元素 `:empty` 命中已验证）；模型区去小标题紧凑化
 - **杂项**：Select 选中项 bg-selected 底色 + 勾勾左侧常驻占位（不再悬浮贴边）；Skills / Rules 行「操作在前、开关最后」；DialogContent 整体 `[-webkit-app-region:no-drag]`（Electron 拖拽区按像素矩形不看 z-index、高弹窗顶部 X 点不动）；侧栏自动默认改「仅设置/能力页收、看板/详情全展」（胶囊切换不再一收一放）；skill 英文命名指引（label 可中文）
 - 终审 P3 修复：isFieldEqual 补 userRole 分支（漏了会 fall-through 到 defaultModel 比较）、chat-runner 身份注释纠漂移、转建失败降级；遗留 P3（可不修）：fetchSlashSkills 60s 缓存窗口内刚启用的 skill 拉不到（有降级自愈）
-
-### 2026-07-12 夜（已随 v1.1.3 发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
-
-- **运行时不再扫 `~/.cursor/skills/`**：`loadSkills` / `findSkillByName` / 能力页列表只剩平台自带 + app 自管 + 飞书 CLI；「从 Cursor 导入」按钮与 `listCursorGlobalSkills` 保留（导入=拷贝成自管）
-- **只读 skill 眼睛看全文**：内置 / 飞书 CLI 行加 Eye → 只读 Dialog；`GET /api/skills/content` 扩到按 name+source 读任意已知来源（防任意路径）
 
 ## 关键文件索引
 
