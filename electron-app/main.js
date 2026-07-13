@@ -487,7 +487,8 @@ const notifyRenameOnce = async () => {
   new Notification({
     title: `应用已更名为 ${app.getName()}`,
     body: "Dock 固定过旧图标的话、请重新固定一次。",
-    icon: resolveNotifyIcon(),
+    // 同 task-notify：mac 传 icon 会变成横幅右侧内容图、只给 win/linux
+    ...(IS_MAC ? {} : { icon: resolveNotifyIcon() }),
   }).show();
 };
 
@@ -615,8 +616,10 @@ ipcMain.on("task-notify", (_e, payload) => {
       title,
       body,
       silent: false,
-      // win/linux 显式新 logo；mac 忽略此字段、左侧仍走 app icon
-      icon: resolveNotifyIcon(),
+      // win/linux：显式传新 logo（win toast 不传会用默认应用图标）。
+      // ⚠️ mac 不能传：mac 的 icon 字段渲染成横幅**右侧内容图**（左侧永远是 app icon、
+      // 由系统按 bundle 缓存）——传了会凭空多一个图标（用户实测点名去掉）。
+      ...(IS_MAC ? {} : { icon: resolveNotifyIcon() }),
     });
     n.on("click", () => {
       // 聚焦窗口 + 告诉页面「用户点了哪个任务的通知」（页面自己 router.push）
