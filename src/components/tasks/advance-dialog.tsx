@@ -198,9 +198,10 @@ const ActionCardContent = ({
           : "text-muted-foreground/60 group-hover:text-muted-foreground",
       )}
     />
+    {/* 12px + 收窄左右 padding（px-6→px-5、✨ 在 left-2 不重叠）：一行多容 1-2 个字、减少截断 */}
     <span
       className={cn(
-        "w-full truncate px-6 text-center text-[13px] font-medium leading-none",
+        "w-full truncate px-5 text-center text-xs font-medium leading-none",
         selected && "text-primary",
       )}
     >
