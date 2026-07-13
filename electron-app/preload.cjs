@@ -51,4 +51,7 @@ contextBridge.exposeInMainWorld("__shell", {
   // v1.1.x「开屏一屏到底」：首页真实内容（看板 / 就绪清单）渲出来后调——
   // 壳此刻才亮主窗 + 收 splash、启动全程只有一屏 loading、没有衔接切换
   markContentReady: () => ipcRenderer.send("app-content-ready"),
+  // 打开系统外链（设置页「系统设置里开启」通知权限等）——主进程白名单校验
+  /** @param {string} url */
+  openExternal: (url) => ipcRenderer.send("open-external", url),
 });

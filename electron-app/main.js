@@ -455,6 +455,26 @@ const maybeSelfRenameOnMac = async () => {
   return true;
 };
 
+// 系统通知图标路径（v1.0.x 雷芯 logo）：
+// - 打包后：extraResources 拷的 resources/notify-icon.png（= packaging/icon.png）
+// - 开发态：直接读仓库 packaging/icon.png（权威源）
+// mac 通知左侧仍强制用 app icon.icns（Electron 文档：icon 选项仅 win/linux 生效）；
+// win 不显式传会吃 AppUserModelId 关联的 exe 图标、升级后易被系统图标缓存拖成旧图。
+const resolveNotifyIcon = () => {
+  const candidates = app.isPackaged
+    ? [path.join(process.resourcesPath, "notify-icon.png")]
+    : process.platform === "win32"
+      ? [
+          path.join(__dirname, "..", "packaging", "icon-win.png"),
+          path.join(__dirname, "..", "packaging", "icon.png"),
+        ]
+      : [path.join(__dirname, "..", "packaging", "icon.png")];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return undefined;
+};
+
 // 改名接力后的一次性提示（Dock 固定的旧路径图标会失效、得让用户知道去重新固定）
 const notifyRenameOnce = async () => {
   try {
@@ -467,6 +487,7 @@ const notifyRenameOnce = async () => {
   new Notification({
     title: `应用已更名为 ${app.getName()}`,
     body: "Dock 固定过旧图标的话、请重新固定一次。",
+    icon: resolveNotifyIcon(),
   }).show();
 };
 
@@ -590,7 +611,13 @@ ipcMain.on("task-notify", (_e, payload) => {
   const body = typeof payload?.body === "string" ? payload.body.slice(0, 200) : "";
   const taskId = typeof payload?.taskId === "string" ? payload.taskId : "";
   try {
-    const n = new Notification({ title, body, silent: false });
+    const n = new Notification({
+      title,
+      body,
+      silent: false,
+      // win/linux 显式新 logo；mac 忽略此字段、左侧仍走 app icon
+      icon: resolveNotifyIcon(),
+    });
     n.on("click", () => {
       // 聚焦窗口 + 告诉页面「用户点了哪个任务的通知」（页面自己 router.push）
       if (mainWindow) {
@@ -606,6 +633,20 @@ ipcMain.on("task-notify", (_e, payload) => {
   } catch (err) {
     log(`[notify] 系统通知失败（忽略）${err?.message || err}`);
   }
+});
+
+// ---------- 打开系统外链（设置页「系统设置里开启」通知权限等） ----------
+//
+// 只放行系统设置深链 + http(s)——别让页面 IPC 成任意协议跳板。
+const OPEN_EXTERNAL_ALLOWED = /^(https?:|x-apple\.systempreferences:|ms-settings:)/i;
+ipcMain.on("open-external", (_e, url) => {
+  if (typeof url !== "string" || !OPEN_EXTERNAL_ALLOWED.test(url)) {
+    log(`[open-external] 拒绝非法 URL：${String(url).slice(0, 80)}`);
+    return;
+  }
+  void shell.openExternal(url).catch((err) => {
+    log(`[open-external] 失败 ${err?.message || err}`);
+  });
 });
 
 // ---------- 自定义标题栏：Windows 控制按钮 overlay 底色跟随主题 ----------

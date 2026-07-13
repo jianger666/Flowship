@@ -51,6 +51,25 @@ export class MeegleError extends Error {
 const runMeegle = (args: string[]): Promise<unknown> =>
   enqueueMeegle(() => runMeegleUnlocked(args));
 
+/** execFile 超时被 kill / 带 signal / meegle exit 2（网络不可达）→ 瞬态，不是「确定未登录」 */
+const isMeegleExecTransient = (err: unknown): boolean => {
+  const e = err as {
+    killed?: boolean;
+    signal?: string | null;
+    code?: number | string;
+    message?: string;
+    stderr?: string;
+  };
+  if (e.killed === true) return true;
+  if (typeof e.signal === "string" && e.signal.length > 0) return true;
+  // meegle auth status 官方：exit 2 = 网络不可达（与 feishu-cli probeMeegleAuth 对齐）
+  if (e.code === 2) return true;
+  const text = `${e.message ?? ""}\n${e.stderr ?? ""}`;
+  return /ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|timed? ?out|network unreachable/i.test(
+    text,
+  );
+};
+
 const runMeegleUnlocked = async (args: string[]): Promise<unknown> => {
   const bin = meegleBin();
   try {
@@ -68,17 +87,29 @@ const runMeegleUnlocked = async (args: string[]): Promise<unknown> => {
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; message?: string };
     const text = `${e.stdout ?? ""}\n${e.stderr ?? ""}\n${e.message ?? ""}`;
+    // 瞬态优先：VPN 卡 / 超时 kill 的 stderr 偶尔带 "auth login" 提示文案，
+    // 若先走未登录正则会把登录着的人误判成 not_authed（看板弹「去授权」）
+    if (isMeegleExecTransient(err)) {
+      throw new MeegleError(
+        "error",
+        (e.stderr || e.message || "meegle 调用超时或网络不可达").slice(0, 500),
+      );
+    }
     if (/not logged in|no local token|auth login|unauthorized|401/i.test(text)) {
       throw new MeegleError("not_authed", "meegle 未登录、请先在设置页授权");
     }
     // 未登录时动态命令未注册、报 unknown command——但升级 / 重启后 CLI 冷启动、
     // 命令集加载慢也会瞬态报同样的错（用户实测「升级完首屏授权像没检测到」）：
-    // 用静态命令 auth status 复核、真没登录才报 not_authed、登录着算瞬态错误
+    // 用静态命令 auth status 复核、真没登录才报 not_authed、登录着 / 探测瞬态算 error
     if (/unknown command/i.test(text)) {
       // 已在队列槽内：走 raw，勿再 enqueueMeegle（会死锁）
       const st = await meegleAuthStatusUnlocked();
       if (st.authenticated) {
         throw new MeegleError("error", "meegle 命令集尚未就绪、请稍后重试");
+      }
+      // auth status 自己超时 / exit 2 → transient，别当成未登录
+      if (st.transient) {
+        throw new MeegleError("error", "meegle 登录态探测失败（网络超时）、请稍后重试");
       }
       throw new MeegleError("not_authed", "meegle 未登录（命令集未加载）、请先在设置页授权");
     }
@@ -112,6 +143,11 @@ const meegleAuthStatusUnlocked = async (): Promise<{
   installed: boolean;
   authenticated: boolean;
   host?: string;
+  /**
+   * 探测失败是瞬态（超时 kill / exit 2 网络不可达 / 无 stdout）——
+   * 不是「确定未登录」。unknown-command 复核必须看这个，否则 VPN 卡会误报 not_authed。
+   */
+  transient?: boolean;
 }> => {
   const bin = meegleBin();
   try {
@@ -120,10 +156,10 @@ const meegleAuthStatusUnlocked = async (): Promise<{
     return { installed: false, authenticated: false };
   }
   try {
-    // auth status 未登录时 exit 1、但 stdout 仍是 JSON——直接拿输出解析
+    // 官方：exit 0 = token 有效；1 = 未登录 / token 失效；2 = 网络不可达
     const r = await execFileAsync(bin, ["auth", "status"], {
       timeout: 10_000,
-    }).catch((err) => ({ stdout: (err as { stdout?: string }).stdout ?? "" }));
+    });
     const parsed = JSON.parse(r.stdout) as {
       authenticated?: boolean;
       host?: string | null;
@@ -133,8 +169,30 @@ const meegleAuthStatusUnlocked = async (): Promise<{
       authenticated: !!parsed.authenticated,
       host: parsed.host ?? undefined,
     };
-  } catch {
-    return { installed: true, authenticated: false };
+  } catch (err) {
+    const e = err as { code?: number; stdout?: string };
+    // exit 1 时 stdout 仍常有 JSON（authenticated:false）——有输出就信 JSON
+    if (typeof e.stdout === "string" && e.stdout.trim()) {
+      try {
+        const parsed = JSON.parse(e.stdout) as {
+          authenticated?: boolean;
+          host?: string | null;
+        };
+        const transient = isMeegleExecTransient(err);
+        return {
+          installed: true,
+          authenticated: !!parsed.authenticated,
+          host: parsed.host ?? undefined,
+          // exit 2 / 超时即使带 JSON 也标瞬态（调用方不得当未登录）
+          ...(transient ? { transient: true } : {}),
+        };
+      } catch {
+        /* fallthrough */
+      }
+    }
+    // 无可用 stdout（超时 kill / 解析失败）→ 一律瞬态，绝不当 authenticated:false
+    // （旧实现 catch 一律 false，是 VPN 卡看板弹「去授权」的元凶）
+    return { installed: true, authenticated: false, transient: true };
   }
 };
 
@@ -143,6 +201,7 @@ export const meegleAuthStatus = (): Promise<{
   installed: boolean;
   authenticated: boolean;
   host?: string;
+  transient?: boolean;
 }> => enqueueMeegle(() => meegleAuthStatusUnlocked());
 
 // ---------- 工作项归一化 ----------

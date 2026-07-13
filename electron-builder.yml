@@ -42,6 +42,13 @@ electronLanguages:
 # 旁边的文件。不走 extraResources：builder copier 硬排除 node_modules、依赖树会被丢
 afterPack: scripts/electron-after-pack.mjs
 
+# 系统通知图标（v1.0.x 雷芯 logo）：Windows Notification 必须显式传 png 路径（asar 内
+# 路径不可靠）、mac 通知左侧仍走 app icon.icns、这份作 win/linux 权威源 + 兜底。
+# 源 = packaging/icon.png（mac 图标定稿、与 Dock 同源）。
+extraResources:
+  - from: packaging/icon.png
+    to: notify-icon.png
+
 # 产物文件名写死 ascii（不跟 productName 走中文）——GitHub asset url 和
 # latest.yml 引用的文件名保持英文、electron-updater 下载链路稳
 artifactName: "fe-ai-flow-${version}-${os}-${arch}.${ext}"

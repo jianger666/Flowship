@@ -11,6 +11,7 @@
  * V0.13.x 起 error 也通知：网络类失败已有自动重连兜底（重试 5 次）、真落到 error
  * 的都是需要人处理的问题、值得叫人回来（原「断线 error 噪声」的前提不再成立）。
  * 窗口在前台时不发系统通知（用户正看着 app、侧栏琥珀脉冲点已足够）。
+ * 设置页「任务系统通知」关时不发（app 层开关；系统层权限另管）。
  * 非桌面端没有 __notify 通道、shell-notify 封装内静默降级。
  */
 
@@ -18,6 +19,7 @@ import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
 import { useTaskList } from "@/hooks/use-task-list";
+import { getSettings } from "@/lib/local-store";
 import { ACTION_LABEL } from "@/lib/task-display";
 import { onTaskNotifyClick, sendTaskNotification } from "@/lib/shell-notify";
 import type { RunStatus, TaskSummary } from "@/lib/types";
@@ -52,6 +54,8 @@ export const TaskAttentionWatcher = () => {
     if (!prev) return;
     // 窗口在前台：不发系统通知（避免自己看着 app 还被系统横幅打扰）
     if (document.hasFocus()) return;
+    // app 层开关（设置页「任务系统通知」）；系统层权限另由 OS 管
+    if (getSettings().notificationsEnabled === false) return;
 
     for (const task of tasks) {
       const was = prev.get(task.id);

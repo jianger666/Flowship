@@ -26,6 +26,7 @@ import {
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
 import { renderBranchName } from "@/lib/branch-template";
+import { openSystemNotificationSettings } from "@/lib/shell-notify";
 import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
 import {
   JUMP_IDES,
@@ -50,13 +51,15 @@ interface PreferenceSectionsProps {
   branchTemplate: string;
   onBranchTemplateChange: (next: string) => void;
   onBranchTemplateCommit: (value: string) => void;
-  // 提交快捷键 / 续用 Agent / 隔离工作区默认值
+  // 提交快捷键 / 续用 Agent / 隔离工作区默认值 / 系统通知
   submitShortcut: SubmitShortcut;
   reuseAgentDefault: boolean;
   onSubmitShortcutChange: (next: SubmitShortcut) => void;
   onReuseAgentDefaultChange: (next: boolean) => void;
   isolateWorktreeDefault: boolean;
   onIsolateWorktreeDefaultChange: (next: boolean) => void;
+  notificationsEnabled: boolean;
+  onNotificationsEnabledChange: (next: boolean) => void;
   // 默认模型
   models: ModelOption[];
   modelsError: string;
@@ -81,6 +84,8 @@ export const PreferenceSections = ({
   onReuseAgentDefaultChange,
   isolateWorktreeDefault,
   onIsolateWorktreeDefaultChange,
+  notificationsEnabled,
+  onNotificationsEnabledChange,
   models,
   modelsError,
   modelSelection,
@@ -233,6 +238,28 @@ export const PreferenceSections = ({
             checked={isolateWorktreeDefault}
             onCheckedChange={onIsolateWorktreeDefaultChange}
           />
+        }
+      />
+
+      {/* 开关自解释不加 hint；旁路「系统设置里开启」给系统层误拒权限的找回入口 */}
+      <SettingRow
+        label="任务系统通知"
+        control={
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="h-auto px-0 text-xs text-muted-foreground"
+              onClick={() => openSystemNotificationSettings()}
+            >
+              系统设置里开启
+            </Button>
+            <Switch
+              checked={notificationsEnabled}
+              onCheckedChange={onNotificationsEnabledChange}
+            />
+          </div>
         }
       />
 

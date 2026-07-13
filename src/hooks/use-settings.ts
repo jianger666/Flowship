@@ -126,6 +126,10 @@ const isFieldEqual = (
     // boolean 字段：缺省视同 true 比较（默认隔离）
     return (a[key] ?? true) === (b[key] ?? true);
   }
+  if (key === "notificationsEnabled") {
+    // boolean 字段：缺省视同 true 比较（默认开通知）
+    return (a[key] ?? true) === (b[key] ?? true);
+  }
   if (
     key === "disabledMcpServers" ||
     key === "disabledSkills" ||
@@ -212,6 +216,11 @@ export const useSettings = (): UseSettingsResult => {
       ),
       isolateWorktreeDefault: !isFieldEqual(
         "isolateWorktreeDefault",
+        settings,
+        savedSettings,
+      ),
+      notificationsEnabled: !isFieldEqual(
+        "notificationsEnabled",
         settings,
         savedSettings,
       ),

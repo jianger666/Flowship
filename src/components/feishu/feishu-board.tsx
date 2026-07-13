@@ -198,7 +198,9 @@ export const FeishuBoard = () => {
       if (seq === seqRef.current) {
         // 瞬态失败护栏：手上有好数据（缓存秒开的旧看板）时、这轮刷新失败不清屏成
         // 降级引导（升级重启后 CLI 冷启动首拉常瞬态挂、看板被闪成「去授权」踩过）——
-        // 保留旧看板、5s 后静默重试（最多 2 次、之后才认输渲降级态）
+        // 保留旧看板、5s 后静默重试（最多 2 次、之后才认输渲降级态）。
+        // not_authed / error / not_installed 一律进护栏（不绕过）——服务端已保证
+        // 只有确定性未登录才返 not_authed，VPN 超时走 error，重试耗尽后分别渲授权 / 重试空态
         const prev = respRef.current;
         if (data.status !== "ok" && prev?.status === "ok" && retryLeftRef.current > 0) {
           retryLeftRef.current -= 1;

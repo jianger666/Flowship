@@ -52,6 +52,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   actionLayout: { order: [], hidden: [] },
   reuseAgentDefault: false,
   isolateWorktreeDefault: true,
+  // 任务系统通知默认开；用户可在设置页关、或系统层拒权限
+  notificationsEnabled: true,
   disabledSkills: [],
   disabledRules: [],
   modelUsage: [],
@@ -160,6 +162,8 @@ const normalizeSettings = (
     reuseAgentDefault: parsed.reuseAgentDefault === true,
     // v1.1.x：新任务默认隔离工作区、缺省 / 坏值回退 true（只有显式 false 才默认直跑原仓）
     isolateWorktreeDefault: parsed.isolateWorktreeDefault !== false,
+    // 任务系统通知：缺省 / 坏值回退 true（只有显式 false 才关）
+    notificationsEnabled: parsed.notificationsEnabled !== false,
     // v1.1.x：禁用 skill / rule 名单、坏值 / 缺省回退空（= 全启用）
     disabledSkills: Array.isArray(parsed.disabledSkills)
       ? (parsed.disabledSkills as unknown[]).filter(

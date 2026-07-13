@@ -36,6 +36,8 @@ declare global {
     __shell?: {
       platform: string;
       setTitleBarOverlay: (opts: { color: string; symbolColor: string }) => void;
+      markContentReady?: () => void;
+      openExternal?: (url: string) => void;
     };
   }
 }

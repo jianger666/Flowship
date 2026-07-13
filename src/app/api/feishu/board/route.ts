@@ -12,7 +12,9 @@
  * 按 空间 + 我 + 时间区间 查我参与的全部排期——需求条 + 我的子任务一次拿全、
  * 语义与飞书人员排期完全一致（用户拍板对齐的就是那个视图）。
  *
- * 三态返回：ok / not_installed / not_authed——前端按态渲染降级引导。
+ * 四态返回：ok / not_installed / not_authed / error——前端按态渲染降级引导。
+ * 瞬态失败（超时 / 网络不可达）必须走 error（「重试」），不得走 not_authed
+ *（v1.1.x 与 feishu-cli mergeAuthPreserve 同哲学：瞬态 ≠ 未登录）。
  */
 
 import { NextResponse } from "next/server";
@@ -46,6 +48,8 @@ export const GET = async (req: Request) => {
     }
 
     const myKey = await fetchMyUserKey();
+    // fetchMyUserKey：确定性未登录 → null；超时 / 网络抖 → 抛 MeegleError(error)
+    // （旧路径把瞬态也吞成 null → 看板误弹「去授权」、VPN 卡同事踩过）
     if (!myKey) {
       return NextResponse.json({
         status: "not_authed",

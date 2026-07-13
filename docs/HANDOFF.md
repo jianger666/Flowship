@@ -301,6 +301,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13（攒着未发）：看板 VPN 卡误弹「去授权」+ 系统通知 logo/开关
+
+- **看板 VPN 误报根因**：`/api/feishu/board` 数据链路的 `meegleAuthStatusUnlocked` 把 auth status **超时 / exit 2 / 无 stdout** 一律当 `authenticated:false`；`runMeegleUnlocked` 的 unknown-command 复核据此抛 `not_authed` → 前端渲「去设置页授权」。v1.1.4 只修了就绪清单的 `/api/system/feishu-cli`（`mergeAuthPreserve`），看板自己的 meegle 链路没享受到。
+- **修法**（同哲学：瞬态 ≠ 未登录）：`isMeegleExecTransient` 优先于未登录正则；auth status 瞬态标 `transient`；unknown-command 复核遇 transient 抛 `error` 不抛 `not_authed`。前端护栏本就覆盖 not_authed、服务端分类修对后 VPN 卡显示「加载失败 + 重试」。
+- **系统通知**：通知图标换新 logo（`extraResources` 打 `packaging/icon.png` 进包作 `notify-icon.png`、win 显式传 / mac 走 app icon）；设置→偏好加「任务系统通知」Switch（`settings.notificationsEnabled` 默认开、task-attention-watcher 读设置 gate）+「系统设置里开启」深链（mac/win 各自跳系统通知面板、`__shell.openExternal`、解「系统层误拒后找不到入口」）。
+
 ### 2026-07-13 晚 v1.1.8 发版：今日积压全量（下面三段 + 本段、v1.1.7 tag/draft 已删除作废）
 
 - **GitLab 凭证运行时注入（野路子转正、用户拍板）**：settings 配了 gitToken 时、task + 绑仓 chat 的 prompt 注入「## GitLab 访问」段（host + `config.json` **gitToken 字段**位置 + 「只取该字段别 cat 全文件——里面还有其它密钥」+ 读随意写收敛 + 内置飞书 CLI 已登录勿预检）——AI 不再靠自己摸后门（线上实锤：同事的自定义 action 里 AI 先试 glab 失败、再自己发现 config.json 才跑通）；`action-ship.md`「拿不到 PAT 必然失败」旧措辞纠偏成「MR 创建必须走 submit_mr（落库审计）」。曾讨论过 `gitlab_api_get` 只读代理 + 红线的分级方案、用户拍板不做（本地单机、接受 token 进上下文）
