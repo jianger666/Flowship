@@ -762,7 +762,10 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
 // 「每版都要去 系统设置→隐私与安全性 放行 + 输密码」。
 // CR-02：下载完先过 verifyDownloadedUpdate（签名 manifest + SHA-256）再 attach 替换。
 const macSelfUpdate = async (version) => {
-  const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/fe-ai-flow-${version}-mac-arm64.dmg`;
+  // Intel 包 v1.1.5 起提供、老版本 x64 用户不存在所以不用考虑兼容
+  const dmgArch = process.arch === "arm64" ? "arm64" : "x64";
+  const assetName = `fe-ai-flow-${version}-mac-${dmgArch}.dmg`;
+  const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/${assetName}`;
   // 当前 .app 包路径：execPath = <app>.app/Contents/MacOS/<bin>、往上三层
   const appPath = path.resolve(process.execPath, "..", "..", "..");
   if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
@@ -802,7 +805,7 @@ const macSelfUpdate = async (version) => {
 
     // CR-02：签名 manifest 校验（Ed25519 验签 + SHA-256 + 大小）——在 attach / 替换
     // 之前拦掉被篡改的包、验不过直接 throw 走 catch 降级、旧应用一动不动
-    await verifyDownloadedUpdate(version, dmgPath, `fe-ai-flow-${version}-mac-arm64.dmg`);
+    await verifyDownloadedUpdate(version, dmgPath, assetName);
 
     await execFileStrict("hdiutil", [
       "attach", dmgPath, "-nobrowse", "-quiet", "-mountpoint", mountPoint,

@@ -15,6 +15,15 @@
 
 ---
 
+### 2026-07-13 v1.1.3 发版：角色设置化 + 能力页收尾 + 推进弹窗定稿（终审无 P0/P1、4 P3 修 3）
+
+- **settings.userRole**（`fe|be|qa|other`）：偏好区 Select（chips 版用户否掉）+ 首页就绪清单必填一步；身份注入只从设置取角色（story 角色组反查 / `identity.json` / `remember_user_role` MCP **全退役删除**——用户拍板「任务里取+缓存兜底不可靠」）、姓名仍走 meegle `user me`；注入文案 `- 发起人：姓名（角色：前端）`
+- **就绪清单全引导化**：四步统一「打勾 + 一句话 + 去设置（锚点直达）」、不再内嵌任何编辑（用户拍板「要么全统一组件要么全引导」）；点选不刷新 bug 修过一轮（useSettings 每实例独立快照、写入与判定要同实例）
+- **旧格式 action「转建新版」**：一键开对话自动带旧 playbook 全文 + 自动提交首条（apiKey 未配 / send 失败降级草稿、不留孤儿任务）；action-creator 指引精炼（只讲 action=skill 挂载关系、不出现「纯方法论」等会被 AI 复述的修饰词；产出必落任务目录 md、别给「对话里直接回」选项）
+- **推进弹窗定稿**（多轮调整）：4 列网格卡、块高 40px、文字 13px、✨ 左侧垂直居中角标、主标题居中无副标题无 tooltip；防抖 min-h 占位反撑出大空档、全部回退（`empty:hidden` 无内容不占高、JSX 条件渲染假分支产真空元素 `:empty` 命中已验证）；模型区去小标题紧凑化
+- **杂项**：Select 选中项 bg-selected 底色 + 勾勾左侧常驻占位（不再悬浮贴边）；Skills / Rules 行「操作在前、开关最后」；DialogContent 整体 `[-webkit-app-region:no-drag]`（Electron 拖拽区按像素矩形不看 z-index、高弹窗顶部 X 点不动）；侧栏自动默认改「仅设置/能力页收、看板/详情全展」（胶囊切换不再一收一放）；skill 英文命名指引（label 可中文）
+- 终审 P3 修复：isFieldEqual 补 userRole 分支（漏了会 fall-through 到 defaultModel 比较）、chat-runner 身份注释纠漂移、转建失败降级；遗留 P3（可不修）：fetchSlashSkills 60s 缓存窗口内刚启用的 skill 拉不到（有降级自愈）
+
 ### 2026-07-12 夜（已随 v1.1.3 发）Skill 彻底脱离 Cursor 全局注入 + 只读详情
 
 - **运行时不再扫 `~/.cursor/skills/`**：`loadSkills` / `findSkillByName` / 能力页列表只剩平台自带 + app 自管 + 飞书 CLI；「从 Cursor 导入」按钮与 `listCursorGlobalSkills` 保留（导入=拷贝成自管）

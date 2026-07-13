@@ -18,6 +18,7 @@
 |---|---|---|
 | Windows | `fe-ai-flow-<版本>-win-x64.exe` | 双击安装（装到用户目录、免管理员） |
 | mac（M 芯片） | `fe-ai-flow-<版本>-mac-arm64.dmg` | 拖进「应用程序」、**首次右键 →「打开」** 过 Gatekeeper |
+| mac（Intel） | `fe-ai-flow-<版本>-mac-x64.dmg` | 同上 |
 
 装完即用（自带运行时、不需要 node / git 环境）；之后有新版应用内提示、一键自更新，任务数据保留。
 

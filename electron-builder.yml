@@ -66,10 +66,10 @@ nsis:
   deleteAppDataOnUninstall: false
 
 mac:
+  # arch 不在这里写死：CI 矩阵按架构分 job、各 job 传 CLI `--arm64` / `--x64` 决定；
+  # 本地 `pnpm electron:dist:test` 不带 flag 时 electron-builder 默认本机架构、行为不变。
   target:
     - target: dmg
-      arch:
-        - arm64
   # 不签名（内部分发、首次打开需右键 →「打开」过 Gatekeeper）
   identity: null
 

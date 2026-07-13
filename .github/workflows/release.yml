@@ -1,7 +1,9 @@
 # 发版流水线：push 一个 v* tag → 自动 build → 传 GitHub Release
-# 唯一交付物 = Electron 安装包：win nsis（exe + latest.yml、electron-updater 自动更新）+ mac dmg
+# 唯一交付物 = Electron 安装包：win nsis（exe + latest.yml、electron-updater 自动更新）
+#   + mac arm64 dmg + mac x64 dmg（Intel、v1.1.5 起）
 # 流程：ubuntu job build standalone server（纯 JS 跨平台、一份给 win/mac 复用）+ 建 release 占位；
-#       win/mac matrix job 各自打安装包、electron-builder --publish 追加 asset 到同 release
+#       win/mac matrix job 各自打安装包、electron-builder --publish 追加 asset 到同 release；
+#       finalize 汇总两枚 mac dmg 签 update-manifest 再转正 draft
 name: release
 
 on:
@@ -56,7 +58,7 @@ jobs:
           path: app-server.tar.gz
           retention-days: 1
 
-  # Electron 安装包（win + mac 同构、矩阵跑）。
+  # Electron 安装包（win + mac arm64 + mac x64 同构、矩阵跑）。
   # needs build-release：复用它 build 的 server 布局；也让它先建好 release 占位、
   # electron-builder 往同 tag release 追加 asset（exe / dmg / latest.yml）不竞态
   electron:
@@ -73,9 +75,14 @@ jobs:
           - os: windows-latest
             args: --win
             sdk_platform: win32-x64
+          # arch 由 CLI flag 决定（electron-builder.yml 的 mac.target 不再写死 arch）
           - os: macos-latest
-            args: --mac
+            args: --mac --arm64
             sdk_platform: darwin-arm64
+          # arm64 runner 上交叉打 x64 是 electron-builder 官方支持的、Electron 二进制按 arch 下载
+          - os: macos-latest
+            args: --mac --x64
+            sdk_platform: darwin-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -140,14 +147,44 @@ jobs:
           # mac 不签名（内部分发）、关掉证书自动发现防 CI 报错
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
-      # mac 自更新签名 manifest（CR-02）：对 dmg 算 SHA-256、Ed25519 私钥签名、
-      # 产 update-manifest.json 传到同 tag release（壳内置公钥先验签再验哈希）。
-      # secret `UPDATE_MANIFEST_PRIVATE_KEY` 未配置时脚本打 ::warning:: 退出 0、
-      # 不产文件、不打断发版（渐进启用、见 scripts/generate-update-keypair.mjs）。
-      - if: matrix.os == 'macos-latest'
+  # 所有平台包（exe / 两枚 mac dmg / latest.yml / latest-mac.yml）都传完后：
+  # 1) 汇总两枚 dmg 生成签名 update-manifest（必须在转正前、壳按 asset 名找条目）
+  # 2) 把 draft release 转正 published
+  # needs electron = win + 两枚 mac 都成功才进 finalize：任一 matrix 挂 → needs 不满足、
+  # 留 draft 不对外（fail-fast:false 只让兄弟 job 继续跑、不让残缺版变 published）。
+  # 转正后 /releases/latest 才指向它、mac fetchLatestVersion / win electron-updater 这才查得到、
+  # 且此刻 asset + manifest 已齐全——根治 v0.8.0「asset 没传完就被自更新下到残缺」的事故。
+  finalize:
+    needs: electron
+    runs-on: ubuntu-latest
+    steps:
+      # 要用 scripts/generate-update-manifest.mjs（纯 node:crypto、不必 pnpm install）
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 先下载两枚 mac dmg → 一次签进同一 manifest.files[] → 再 upload。
+      # 不能放回 mac matrix job：两 job 会各自生成只含自己 dmg 的 manifest、后跑的
+      # --clobber 覆盖先跑的、壳 verifyDownloadedUpdate 按文件名找条目会缺架构。
+      # 顺序必须在转正之前：published 后 /releases/latest 可见、manifest 必须已齐全。
+      - name: 生成并上传 update-manifest
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          node scripts/generate-update-manifest.mjs "$VERSION" "dist/electron/fe-ai-flow-${VERSION}-mac-arm64.dmg"
+          mkdir -p dmgs
+          gh release download "$GITHUB_REF_NAME" --pattern "fe-ai-flow-*-mac-*.dmg" --dir dmgs
+          echo "已下载的 mac dmg："
+          ls -la dmgs/
+          # 必须恰好 2 枚（arm64 + x64）——少一枚就签出残缺 manifest、对应架构壳验签必挂
+          # （理论不会进 finalize、needs 会拦；保险硬退出、宁可红也不发残缺版）
+          shopt -s nullglob
+          DMGS=(dmgs/*.dmg)
+          if [ ${#DMGS[@]} -ne 2 ]; then
+            echo "::error::mac dmg 应为 2 枚（arm64+x64）、实际 ${#DMGS[@]} 枚、拒绝生成残缺 update-manifest / 转正"
+            exit 1
+          fi
+          node scripts/generate-update-manifest.mjs "$VERSION" "${DMGS[@]}"
           if [ -f update-manifest.json ]; then
             gh release upload "$GITHUB_REF_NAME" update-manifest.json --clobber
           fi
@@ -156,14 +193,7 @@ jobs:
           UPDATE_MANIFEST_PRIVATE_KEY: ${{ secrets.UPDATE_MANIFEST_PRIVATE_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # 所有平台包（exe / dmg / latest.yml / latest-mac.yml）都传完后、把 draft release 转正 published。
-  # needs electron = win/mac 都成功才转正：有平台挂就留 draft、不对外发半成品（手动看日志重跑即可）。
-  # 转正后 /releases/latest 才指向它、mac fetchLatestVersion / win electron-updater 这才查得到、
-  # 且此刻 asset 已齐全——根治 v0.8.0「asset 没传完就被自更新下到残缺」的事故。
-  finalize:
-    needs: electron
-    runs-on: ubuntu-latest
-    steps:
+      # manifest 传完才转正——维持「asset 齐全才对外可见」
       - uses: actions/github-script@v7
         with:
           script: |
