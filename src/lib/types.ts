@@ -202,11 +202,6 @@ export interface FeAiFlowSettings {
    */
   isolateWorktreeDefault?: boolean;
   /**
-   * 任务系统通知（默认 true）：任务转入「等你回复 / 异常」且窗口不在前台时发系统通知。
-   * 关的是 app 层；若系统层曾拒过权限、需到系统设置里重新开启（设置页有入口）。
-   */
-  notificationsEnabled?: boolean;
-  /**
    * v1.1.x：禁用的 skill 名单（按 skill name）。关掉的不注入 agent prompt、
    * slash 菜单也不出——团队 skill 包装了一堆只想用两个的场景用。
    */

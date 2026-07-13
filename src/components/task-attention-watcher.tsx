@@ -19,7 +19,6 @@ import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
 import { useTaskList } from "@/hooks/use-task-list";
-import { getSettings } from "@/lib/local-store";
 import { ACTION_LABEL } from "@/lib/task-display";
 import { onTaskNotifyClick, sendTaskNotification } from "@/lib/shell-notify";
 import type { RunStatus, TaskSummary } from "@/lib/types";
@@ -52,10 +51,9 @@ export const TaskAttentionWatcher = () => {
     prevStatusRef.current = new Map(tasks.map((t) => [t.id, t.runStatus]));
     // 首轮只建基线：已在等待的是陈旧状态、不补发
     if (!prev) return;
-    // 窗口在前台：不发系统通知（避免自己看着 app 还被系统横幅打扰）
+    // 窗口在前台：不发系统通知（避免自己看着 app 还被系统横幅打扰）。
+    // 不做 app 层开关（用户拍板：开关本质在系统层、app 内 Switch 多余）
     if (document.hasFocus()) return;
-    // app 层开关（设置页「任务系统通知」）；系统层权限另由 OS 管
-    if (getSettings().notificationsEnabled === false) return;
 
     for (const task of tasks) {
       const was = prev.get(task.id);

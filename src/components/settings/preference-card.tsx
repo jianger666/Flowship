@@ -58,8 +58,6 @@ interface PreferenceSectionsProps {
   onReuseAgentDefaultChange: (next: boolean) => void;
   isolateWorktreeDefault: boolean;
   onIsolateWorktreeDefaultChange: (next: boolean) => void;
-  notificationsEnabled: boolean;
-  onNotificationsEnabledChange: (next: boolean) => void;
   // 默认模型
   models: ModelOption[];
   modelsError: string;
@@ -84,8 +82,6 @@ export const PreferenceSections = ({
   onReuseAgentDefaultChange,
   isolateWorktreeDefault,
   onIsolateWorktreeDefaultChange,
-  notificationsEnabled,
-  onNotificationsEnabledChange,
   models,
   modelsError,
   modelSelection,
@@ -241,25 +237,18 @@ export const PreferenceSections = ({
         }
       />
 
-      {/* 开关自解释不加 hint；旁路「系统设置里开启」给系统层误拒权限的找回入口 */}
+      {/* 通知开关本质在系统层（用户拍板：不放 app 层 Switch）——这行只做「找回入口」 */}
       <SettingRow
         label="任务系统通知"
         control={
-          <div className="flex items-center gap-3">
-            <Button
-              type="button"
-              variant="link"
-              size="sm"
-              className="h-auto px-0 text-xs text-muted-foreground"
-              onClick={() => openSystemNotificationSettings()}
-            >
-              系统设置里开启
-            </Button>
-            <Switch
-              checked={notificationsEnabled}
-              onCheckedChange={onNotificationsEnabledChange}
-            />
-          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => openSystemNotificationSettings()}
+          >
+            系统设置里开启
+          </Button>
         }
       />
 

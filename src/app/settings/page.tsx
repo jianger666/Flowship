@@ -325,10 +325,6 @@ const SettingsPage = () => {
                 onIsolateWorktreeDefaultChange={(v) =>
                   saveFieldValue("isolateWorktreeDefault", v)
                 }
-                notificationsEnabled={settings.notificationsEnabled ?? true}
-                onNotificationsEnabledChange={(v) =>
-                  saveFieldValue("notificationsEnabled", v)
-                }
                 models={models}
                 modelsError={modelsError}
                 modelSelection={settings.defaultModel}
