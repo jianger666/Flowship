@@ -6,13 +6,13 @@
  * V0.6 变更：
  *   - 接收 `action: ActionRecord` 而非 `phase: PhaseState`
  *   - 拉 artifact 内容走 `fetchActionRevisions(taskId, actionId)`、自己异步加载
- *   - diff 走 `fetchActionDiff(taskId, actionId, from, to)`
+ *   - 修订对比走 `fetchActionDiff(taskId, actionId, from, to)` + buildRevisionView 内联渲染
  *   - PHASE_LABEL → ACTION_LABEL
  *   - looksLikeArtifactRef 返 { n, type }、点击切到目标 action（父组件自己根据 n+type 在 task.actions 里查）
  *
  * 保留：
- *   - 正文 / Diff 切换
- *   - revision 选择 dropdown
+ *   - 正文常显 +「修订」开关（原 Diff tab 已退役）
+ *   - revision 对比基准 Select
  *   - inline code 路径 → cursor:// 跳转
  *   - 红点提示「有未看 revision」（按 actionId 维度记 localStorage）
  *
@@ -21,9 +21,16 @@
  *   - revisions 列表跟 content 同一接口返回（`fetchActionRevisions`）、节省一次 fetch
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import { AlertTriangle, FileText, Info, Layers } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  FileText,
+  Info,
+  Layers,
+} from "lucide-react";
 import {
   Streamdown,
   defaultRemarkPlugins,
@@ -59,6 +66,7 @@ const ARTIFACT_REMARK_PLUGINS = [
 import { MarkdownLink } from "@/components/markdown-link";
 import { STREAMDOWN_CONTROLS } from "@/components/markdown-text";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
+import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -71,6 +79,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { getIdeAnchorProps } from "@/lib/ide-open";
+import { jumpRevisionHit } from "@/lib/revision-hit";
 import {
   hasValidRepoPrefix,
   looksLikeArtifactRef,
@@ -87,6 +96,25 @@ import {
   ACTION_LABEL_SHORT,
   type EffectivePlanBatch,
 } from "@/lib/task-display";
+
+/** toolbar 展示用（与 md-revision.RevisionStats 结构对齐，避免 panel 依赖 md-revision 运行时） */
+type RevisionToolbarStats = {
+  ins: number;
+  del: number;
+  degraded?: boolean;
+};
+
+// 修订视图懒加载（含 Streamdown 修订插件 + buildRevisionView），关修订时不进主 chunk
+const ArtifactRevisionView = dynamic(
+  () =>
+    import("@/components/tasks/artifact-revision-view").then(
+      (m) => m.ArtifactRevisionView,
+    ),
+  {
+    ssr: false,
+    loading: () => <LoadingState variant="block" label="加载修订…" />,
+  },
+);
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
   JUMP_IDE_LABEL,
@@ -95,15 +123,6 @@ import {
   type ArtifactRevision,
   type JumpIde,
 } from "@/lib/types";
-
-// V0.5.12 perf：react-diff-viewer-continued 体积大、懒加载
-const ArtifactDiff = dynamic(
-  () => import("@/components/tasks/artifact-diff").then((m) => m.ArtifactDiff),
-  {
-    ssr: false,
-    loading: () => <LoadingState variant="block" label="加载 diff 库…" />,
-  },
-);
 
 // artifact-panel 的标题用「中文（英文）」复合形式
 // V0.7：中文部分用 SHORT、跟 timeline 同口径——build 全工作区统一叫「实现」、不再「改代码」
@@ -296,8 +315,6 @@ interface Props {
   onArtifactMetaChange?: (meta: { filename: string } | null) => void;
 }
 
-type ViewMode = "content" | "diff";
-
 const revisionOptionLabel = (
   rev: ArtifactRevision,
   idxInDesc: number,
@@ -328,7 +345,7 @@ export const ArtifactPanel = ({
     [baseDir, repoShortNames, jumpIde, onArtifactRefClick],
   );
 
-  const [mode, setMode] = useState<ViewMode>("content");
+  const [revisionOn, setRevisionOn] = useState(false); // 修订开关：开则正文变内联修订视图
   // artifact 正文（异步加载）+ 文件名
   const [currentArtifact, setCurrentArtifact] = useState<{
     content: string;
@@ -339,20 +356,38 @@ export const ArtifactPanel = ({
   const [contentLoading, setContentLoading] = useState(true);
   // revision 列表
   const [revisions, setRevisions] = useState<ArtifactRevision[]>([]);
+  // 对比基准时间戳（默认最新快照 =「上次」）
   const [compareFromTs, setCompareFromTs] = useState<number | null>(null);
-  const [splitView, setSplitView] = useState(false);
+  // 修订对比两端全文（开修订后拉取）
   const [diffData, setDiffData] = useState<{
     from: { content: string; timestamp: number };
     to: { content: string; timestamp: number | null };
   } | null>(null);
+  // 拉对比全文中
   const [diffLoading, setDiffLoading] = useState(false);
+  // 拉对比失败文案（null = 无错）；失败时修订区展示 + 重试，避免假「加载修订…」
+  const [diffError, setDiffError] = useState<string | null>(null);
+  // 子组件算完后回传的词级统计（toolbar +/−）
+  const [revisionStats, setRevisionStats] = useState<RevisionToolbarStats | null>(
+    null,
+  );
+  // 强制重拉 diff（重试按钮递增）
+  const [diffRetryKey, setDiffRetryKey] = useState(0);
+  // localStorage 已读最大 revision timestamp
   const [seenTsLoaded, setSeenTsLoaded] = useState<number>(0);
+  // 「上一处 / 下一处」当前 hit 下标（-1 = 尚未跳过）
+  const hitIndexRef = useRef(-1);
+  // 修订正文滚动容器（跳转 scrollIntoView 用）
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // action 维度的「已看」状态：进 action 时读、切 action 时重置
   useEffect(() => {
     setSeenTsLoaded(readSeenTs(taskId, action.id));
-    setMode("content");
+    setRevisionOn(false);
     setDiffData(null);
+    setDiffError(null);
+    setRevisionStats(null);
+    hitIndexRef.current = -1;
   }, [taskId, action.id]);
 
   // filename 上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
@@ -439,15 +474,18 @@ export const ArtifactPanel = ({
     action.artifactUpdatedAt,
   ]);
 
-  // diff 模式下拉对比数据
+  // 修订开启时拉对比两端全文
   useEffect(() => {
-    if (mode !== "diff" || compareFromTs == null) {
+    if (!revisionOn || compareFromTs == null) {
       setDiffData(null);
+      setDiffError(null);
+      setRevisionStats(null);
       return;
     }
     let cancelled = false;
     const load = async () => {
       setDiffLoading(true);
+      setDiffError(null);
       try {
         const data = await fetchActionDiff(
           taskId,
@@ -457,10 +495,14 @@ export const ArtifactPanel = ({
         );
         if (cancelled) return;
         setDiffData(data);
+        hitIndexRef.current = -1;
       } catch (err) {
         if (cancelled) return;
         console.warn("[artifact-panel] fetch diff 失败", err);
         setDiffData(null);
+        setDiffError(
+          err instanceof Error ? err.message : "加载修订对比失败",
+        );
       } finally {
         if (!cancelled) setDiffLoading(false);
       }
@@ -469,11 +511,23 @@ export const ArtifactPanel = ({
     return () => {
       cancelled = true;
     };
-  }, [mode, compareFromTs, taskId, action.id]);
+  }, [revisionOn, compareFromTs, taskId, action.id, diffRetryKey]);
+
+  const handleRevisionStatsChange = useCallback(
+    (stats: RevisionToolbarStats | null) => {
+      setRevisionStats(stats);
+    },
+    [],
+  );
+
+  const handleDiffRetry = useCallback(() => {
+    setDiffRetryKey((k) => k + 1);
+  }, []);
 
   const hasUnseen = useMemo(
-    () => mode !== "diff" && revisions.some((r) => r.timestamp > seenTsLoaded),
-    [revisions, seenTsLoaded, mode],
+    () =>
+      !revisionOn && revisions.some((r) => r.timestamp > seenTsLoaded),
+    [revisions, seenTsLoaded, revisionOn],
   );
 
   const maxRevisionTs = useMemo(
@@ -486,13 +540,31 @@ export const ArtifactPanel = ({
 
   const revisionsDesc = useMemo(() => [...revisions].reverse(), [revisions]);
 
-  const handleSwitchToDiff = useCallback(() => {
-    setMode("diff");
+  const markRevisionsSeen = useCallback(() => {
     if (maxRevisionTs > 0 && maxRevisionTs > seenTsLoaded) {
       writeSeenTs(taskId, action.id, maxRevisionTs);
       setSeenTsLoaded(maxRevisionTs);
     }
   }, [maxRevisionTs, seenTsLoaded, taskId, action.id]);
+
+  const handleRevisionToggle = useCallback(
+    (next: boolean) => {
+      setRevisionOn(next);
+      if (next) markRevisionsSeen();
+      else hitIndexRef.current = -1;
+    },
+    [markRevisionsSeen],
+  );
+
+  const handleJumpHit = useCallback((direction: "prev" | "next") => {
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    hitIndexRef.current = jumpRevisionHit(
+      scroller,
+      direction,
+      hitIndexRef.current,
+    );
+  }, []);
 
   // 后置检查未过：交卷事件不保证落盘、check fail 仍 awaiting_ack（by design）、
   // 以前 postCheck 前端 0 处渲染 → 坏结果被静默吞掉。空态尤其要挂红条、用户才知道「AI 说写了但文件不在」。
@@ -535,7 +607,7 @@ export const ArtifactPanel = ({
   }
 
   const totalRevisions = revisions.length;
-  const canDiff = totalRevisions > 0;
+  const canRevise = totalRevisions > 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -544,26 +616,21 @@ export const ArtifactPanel = ({
         <div className="flex shrink-0 items-center gap-1">
           <ChoiceButton
             shape="tab"
-            selected={mode === "content"}
-            onClick={() => setMode("content")}
-          >
-            正文
-          </ChoiceButton>
-          <ChoiceButton
-            shape="tab"
-            selected={mode === "diff"}
-            onClick={handleSwitchToDiff}
-            disabled={!canDiff}
+            selected={revisionOn}
+            onClick={() => handleRevisionToggle(!revisionOn)}
+            disabled={!canRevise}
             title={
-              canDiff
+              canRevise
                 ? hasUnseen
-                  ? "AI 有新的修订、点开看改了哪"
-                  : "对比 artifact 修订历史"
+                  ? "AI 有新的修订、打开看改了哪"
+                  : revisionOn
+                    ? "关闭修订视图"
+                    : "打开修订视图（Track Changes）"
                 : "该 action 还没有修订记录、用户「再聊聊」一次后才会有"
             }
             className="relative"
           >
-            Diff
+            修订
             {hasUnseen && (
               <span
                 aria-hidden
@@ -572,16 +639,8 @@ export const ArtifactPanel = ({
             )}
           </ChoiceButton>
 
-          {mode === "diff" && canDiff && (
+          {revisionOn && canRevise && (
             <>
-              <ChoiceButton
-                shape="tab"
-                selected={splitView}
-                onClick={() => setSplitView((s) => !s)}
-                title={splitView ? "切到行内对比" : "切到并排对比"}
-              >
-                {splitView ? "并排" : "行内"}
-              </ChoiceButton>
               <Select
                 // 未选对比版本时用 null 保持受控（undefined 会被判为非受控、选版本后切换会报警告）
                 value={compareFromTs == null ? null : String(compareFromTs)}
@@ -616,105 +675,149 @@ export const ArtifactPanel = ({
                   ))}
                 </SelectContent>
               </Select>
+              {revisionStats && (
+                <span
+                  className="ml-1 tabular-nums text-[11px] text-muted-foreground"
+                  title="词级增删统计"
+                >
+                  <span className="text-green-700 dark:text-green-400">
+                    +{revisionStats.ins}
+                  </span>{" "}
+                  <span className="text-red-700 dark:text-red-400">
+                    −{revisionStats.del}
+                  </span>
+                </span>
+              )}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="ml-0.5"
+                title="上一处改动"
+                disabled={!diffData || !!diffError}
+                onClick={() => handleJumpHit("prev")}
+              >
+                <ChevronUp />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                title="下一处改动"
+                disabled={!diffData || !!diffError}
+                onClick={() => handleJumpHit("next")}
+              >
+                <ChevronDown />
+              </Button>
             </>
           )}
         </div>
       </div>
 
       {/* content area */}
-      <div className="flex-1 overflow-y-auto">
-        {mode === "content" ? (
-          <div className="px-6 py-4">
-            {/* 有产物时也显示：检查失败可能是必备段缺失等其它原因、不只是「没落盘」 */}
-            {postCheckBanner && <div className="mb-3">{postCheckBanner}</div>}
-            {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
-            {action.type === "plan" &&
-              action.replanMode &&
-              priorPlans &&
-              priorPlans.length > 0 && (
-                <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
-                  <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
-                    <Layers className="size-3.5 shrink-0" />
-                    <span>
-                      本方案在以下方案基础上
-                      {action.replanMode === "append" ? "追加补充需求" : "重建后续"}
-                      、点开可回看完整方案
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {priorPlans.map((p) => (
-                      <button
-                        key={p.n}
-                        type="button"
-                        onClick={() =>
-                          onArtifactRefClick?.({ n: p.n, type: "plan" })
-                        }
-                        className="rounded border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:border-primary hover:text-primary"
-                      >
-                        方案 #{p.n}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            {/* V0.6.24 (A')：plan 没拆批次时显式提示——这里用全量有效批次判空（不是单 action
-                delta）、避免「追加 plan 自己没上报批次、但 task 其实有批次」时误显示未分批 */}
-            {action.type === "plan" &&
-              (!effectiveBatches || effectiveBatches.length === 0) && (
-                <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
-                  <Info className="size-3.5 shrink-0" />
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        <div className="px-6 py-4">
+          {/* 有产物时也显示：检查失败可能是必备段缺失等其它原因、不只是「没落盘」 */}
+          {postCheckBanner && <div className="mb-3">{postCheckBanner}</div>}
+          {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
+          {action.type === "plan" &&
+            action.replanMode &&
+            priorPlans &&
+            priorPlans.length > 0 && (
+              <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
+                <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
+                  <Layers className="size-3.5 shrink-0" />
                   <span>
-                    本方案未分批（单次 build）· 大需求可「再聊聊」让 AI 拆批次
+                    本方案在以下方案基础上
+                    {action.replanMode === "append" ? "追加补充需求" : "重建后续"}
+                    、点开可回看完整方案
                   </span>
                 </div>
-              )}
-            {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
-                让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
-                （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
-            <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
-              {/* v1.0 迁 Streamdown：artifact 是完整产出、static 模式；Shiki 代码高亮 +
-                  Mermaid + KaTeX；保留自定义 code 组件（inline 代码里的文件路径 / artifact
-                  引用点击跳转）——fenced 代码块交给 Shiki 插件、inline 走 components.code */}
-              <Streamdown
-                mode="static"
-                shikiTheme={ARTIFACT_SHIKI_THEME}
-                plugins={ARTIFACT_STREAMDOWN_PLUGINS}
-                remarkPlugins={ARTIFACT_REMARK_PLUGINS}
-                components={markdownComponents}
-                controls={STREAMDOWN_CONTROLS}
-                // 行号靠 globals.css 藏（lineNumbers=false 会让代码塌成一行、见 markdown-text）
-              >
-                {currentArtifact.content}
-              </Streamdown>
-            </div>
-            {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
-                追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
-            {action.type === "plan" &&
-              effectiveBatches &&
-              effectiveBatches.length > 0 && (
-                <BatchPlanTable
-                  batches={effectiveBatches}
-                  currentActionN={action.n}
-                />
-              )}
-          </div>
-        ) : diffLoading || !diffData ? (
-          <LoadingState variant="block" label="加载 diff…" />
-        ) : (
-          <div className="px-2 py-2">
-            <ArtifactDiff
-              oldText={diffData.from.content}
-              newText={diffData.to.content}
-              splitView={splitView}
-              leftTitle={formatShortTime(diffData.from.timestamp)}
-              rightTitle={
-                diffData.to.timestamp == null
-                  ? "当前正文"
-                  : formatShortTime(diffData.to.timestamp)
-              }
-            />
-          </div>
-        )}
+                <div className="flex flex-wrap gap-1.5">
+                  {priorPlans.map((p) => (
+                    <button
+                      key={p.n}
+                      type="button"
+                      onClick={() =>
+                        onArtifactRefClick?.({ n: p.n, type: "plan" })
+                      }
+                      className="rounded border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:border-primary hover:text-primary"
+                    >
+                      方案 #{p.n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          {/* V0.6.24 (A')：plan 没拆批次时显式提示——这里用全量有效批次判空（不是单 action
+              delta）、避免「追加 plan 自己没上报批次、但 task 其实有批次」时误显示未分批 */}
+          {action.type === "plan" &&
+            (!effectiveBatches || effectiveBatches.length === 0) && (
+              <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
+                <Info className="size-3.5 shrink-0" />
+                <span>
+                  本方案未分批（单次 build）· 大需求可「再聊聊」让 AI 拆批次
+                </span>
+              </div>
+            )}
+
+          {revisionOn ? (
+            diffLoading ? (
+              <LoadingState variant="block" label="加载修订…" />
+            ) : diffError ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                <p className="text-sm text-muted-foreground">
+                  加载修订失败：{diffError}
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDiffRetry}
+                >
+                  重试
+                </Button>
+              </div>
+            ) : diffData ? (
+              <ArtifactRevisionView
+                oldMd={diffData.from.content}
+                newMd={diffData.to.content}
+                baseComponents={markdownComponents}
+                onStatsChange={handleRevisionStatsChange}
+              />
+            ) : (
+              <LoadingState variant="block" label="加载修订…" />
+            )
+          ) : (
+            <>
+              {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
+                  让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
+                  （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
+              <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
+                <Streamdown
+                  mode="static"
+                  shikiTheme={ARTIFACT_SHIKI_THEME}
+                  plugins={ARTIFACT_STREAMDOWN_PLUGINS}
+                  remarkPlugins={ARTIFACT_REMARK_PLUGINS}
+                  components={markdownComponents}
+                  controls={STREAMDOWN_CONTROLS}
+                >
+                  {currentArtifact.content}
+                </Streamdown>
+              </div>
+              {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
+                  追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
+              {action.type === "plan" &&
+                effectiveBatches &&
+                effectiveBatches.length > 0 && (
+                  <BatchPlanTable
+                    batches={effectiveBatches}
+                    currentActionN={action.n}
+                  />
+                )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

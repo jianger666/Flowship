@@ -301,6 +301,12 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-13 晚（攒着未发）：artifact「修订模式」（Word Track Changes 内联渲染）
+
+- **旧「Diff」tab（md 源码级词对比、用户嫌丑）整个退役**：`artifact-diff.tsx` 删、`react-diff-viewer-continued` 依赖删（prismjs 保留、code-editor 在用）；替代 = 正文 toolbar「修订」开关（默认关、有未读修订挂红点、打开即已读）——正文仍是渲染后富文本、改动处内联标注：**新增绿底、删除红底删除线原位保留**；代码块/表格/mermaid 不做词级、整块左边条+「已修改」角标（点开看旧版）；基准下拉（默认「上次」= 只显最近一轮、可选「初版」看累计）+ 上/下一处跳转 + `+N −M` 计数
+- **实现**（全客户端、服务端 action-diff API 复用零改动）：`src/lib/md-revision.ts`（remark-parse 块级对齐（短文本禁 charOverlap、低相似强制 remove+add）→ jsdiff 词级 diff（中文 `Intl.Segmenter` 分词）→ PUA 哨兵合并、超大文档降级纯块级标注）+ `remark-annotate-revision-blocks.ts`（哨兵 → ins/del 节点、Streamdown 原管道渲染、链接/图片/代码高亮全保留）+ `artifact-revision-view.tsx`（dynamic 懒加载、不拖正文首屏）；`tests/md-revision.test.ts` 17 用例
+- 流程：实施 → 蓝军 review（1 P0 假加载 + 5 P1：短段误配对/跳转重复命中/未懒加载/大文档卡顿/块对齐边界）→ 全修 → 复验全绿
+
 ### 2026-07-13（攒着未发）：看板 VPN 卡误弹「去授权」+ 系统通知 logo/开关
 
 - **看板 VPN 误报根因**：`/api/feishu/board` 数据链路的 `meegleAuthStatusUnlocked` 把 auth status **超时 / exit 2 / 无 stdout** 一律当 `authenticated:false`；`runMeegleUnlocked` 的 unknown-command 复核据此抛 `not_authed` → 前端渲「去设置页授权」。v1.1.4 只修了就绪清单的 `/api/system/feishu-cli`（`mergeAuthPreserve`），看板自己的 meegle 链路没享受到。
