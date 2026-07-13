@@ -120,6 +120,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
       }
       const fresh = await getTask(id);
       if (!fresh) return errorResponse("not_found", 404);
+      // 等待期间用户可能点了「推进」起了新 action / 新 run（蓝军 P1）：
+      // 世界已变、这条消息的语境失效——再校验一次、不满足就让用户重发
+      const freshCurrent = fresh.actions.find(
+        (a) => a.id === fresh.currentActionId,
+      );
+      if (
+        runningTasks.has(fresh.id) ||
+        fresh.runStatus === "running" ||
+        freshCurrent?.id !== currentActionId ||
+        freshCurrent?.status !== "awaiting_ack"
+      ) {
+        return errorResponse("任务状态刚变化（可能已推进）、请重新发送", 409);
+      }
       task = fresh;
     } else {
       return errorResponse("agent 正在跑、等它说完这轮再问", 409);

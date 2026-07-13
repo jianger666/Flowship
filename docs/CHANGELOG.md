@@ -15,6 +15,14 @@
 
 ---
 
+### 2026-07-13 v1.1.6 发版：非 git 目录混合隔离 + 测试角色约定 + MCP 去自动导入（蓝军终审 1P0 拦下修完复审过）
+
+- **非 git 目录不再拦推进（混合隔离）**：task 绑的 repoPath 没有 `.git` 时——git 仓照旧建 worktree、非 git 目录跳过隔离原地使用（脚本库无分支概念）。核心：`Task.nonGitRepoPaths` 快照（createTask / updateTaskFields / setTaskRepoPaths 三写点、undefined=全 git 老任务兜底、**不做运行时 existsSync**——防 .git 中途增删映射漂移）；`getTaskWorkRepoPaths` 逐仓映射；**`getTaskCwd` 只对 git worktree 聚合**（终审 P0：混着原路径算公共父会漂到 $HOME、agent cwd / IDE 打开路径 / 兄弟仓扫描全翻车——已修+单测锁死）；`formatRepoSectionForPrompt` 混合模板逐仓标注；client `getRepoWorkDirs` 非 git 用原路径；`planBranchesForBuild` 非 git 跳过 checkout hint
+- **测试角色约定（纯 prompt、零服务端行为改动、用户拍板「简单点」）**：`settings.userRole === "qa"` 时 task（+绑仓 chat）注入 `buildQaRoleDirective`——不改仓库代码/不建分支/不 commit push MR（产物放任务目录或非 git 目录）、验证基线=各仓提测分支（detached 姿势切、显式豁免隔离段「禁止 checkout」）、给了 MR 链接用 `merge-requests/<iid>/head` 原生 ref 拉（不需要分支名/Token）、提测分支多需求集成只验当前需求范围；chat 变体不引用「仓库分支配置」段、纯非 git 任务只注入通用部分（注：此机制已于当日午后被「仓库级只读」取代退役、随 v1.1.8 发）
+- **MCP 去 Cursor 全局自动导入**：删 V0.13 `migrateCursorMcpOnce` 整套（新用户首次落盘 config.json 会静默快照 ~/.cursor/mcp.json、用户拍板不可接受）；「从 Cursor 导入」手动链路是唯一导入口；老用户早已迁移完成无影响
+- **推进弹窗 action 卡长名两行**（后回退成 Tooltip 方案、随 v1.1.8 发）
+- 流程：4 个 grok 子代理并行实施 → 蓝军终审拦下 1 P0 + 1 P1 + 2 P2 → 修复子代理全修 → 蓝军复审通过
+
 ### 2026-07-13 v1.1.5 发版：mac Intel（darwin-x64）安装包支持
 
 - **发版矩阵扩三项**：win x64 / mac arm64 / mac x64（arm64 runner 交叉打、`@cursor/sdk-darwin-x64` 平台包对称走 npm pack）；electron-builder.yml mac target 不再写死 arch、CLI `--arm64`/`--x64` 决定（本地 test 打包不带 flag 仍本机架构）

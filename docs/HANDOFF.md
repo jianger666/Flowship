@@ -301,13 +301,17 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-13 晚（攒着未发）：artifact「修订模式」（Word Track Changes 内联渲染）
+### 2026-07-13 深夜 v1.1.9 发版：修订模式 + 今晚全部积压（发版前蓝军终审无 P0、1 P1 已修）
+
+> 本版 = 下面两个「攒着未发」段 + 当晚陆续修的：插话快照治理（相同快照惰性清理 + running 态不清理防时序竞态误删）、断网/提问态输入条不再锁死（去 pendingAsk 硬闸 + 跳过提问给 agent 提示 + 交卷收尾窗口发消息等 run 收敛、等完二次校验防与推进并发——终审 P1）、build 后置检查删「修改记录」铁段（初稿被冤枉红条）、存储统计含 worktree（du+回退）+ 残留工作区清理、mac 通知不传 icon（右侧内容图误加回退）、「任务系统通知」行去 Switch 只留「去系统设置」按钮（notificationsEnabled 字段退役、开关本质在系统层）。终审 P2 记账攒下版：问类插话短暂假红点、答题卡超时解锁未 abort 旧请求、HANDOFF 索引挂着已删 artifact-diff。
+
+### 2026-07-13 晚（已随 v1.1.9 发）：artifact「修订模式」（Word Track Changes 内联渲染）
 
 - **旧「Diff」tab（md 源码级词对比、用户嫌丑）整个退役**：`artifact-diff.tsx` 删、`react-diff-viewer-continued` 依赖删（prismjs 保留、code-editor 在用）；替代 = 正文 toolbar「修订」开关（默认关、有未读修订挂红点、打开即已读）——正文仍是渲染后富文本、改动处内联标注：**新增绿底、删除红底删除线原位保留**；代码块/表格/mermaid 不做词级、整块左边条+「已修改」角标（点开看旧版）；基准下拉（默认「上次」= 只显最近一轮、可选「初版」看累计）+ 上/下一处跳转 + `+N −M` 计数
 - **实现**（全客户端、服务端 action-diff API 复用零改动）：`src/lib/md-revision.ts`（remark-parse 块级对齐（短文本禁 charOverlap、低相似强制 remove+add）→ jsdiff 词级 diff（中文 `Intl.Segmenter` 分词）→ PUA 哨兵合并、超大文档降级纯块级标注）+ `remark-annotate-revision-blocks.ts`（哨兵 → ins/del 节点、Streamdown 原管道渲染、链接/图片/代码高亮全保留）+ `artifact-revision-view.tsx`（dynamic 懒加载、不拖正文首屏）；`tests/md-revision.test.ts` 17 用例
 - 流程：实施 → 蓝军 review（1 P0 假加载 + 5 P1：短段误配对/跳转重复命中/未懒加载/大文档卡顿/块对齐边界）→ 全修 → 复验全绿
 
-### 2026-07-13（攒着未发）：看板 VPN 卡误弹「去授权」+ 系统通知 logo/开关
+### 2026-07-13（已随 v1.1.9 发）：看板 VPN 卡误弹「去授权」+ 系统通知 logo/开关
 
 - **看板 VPN 误报根因**：`/api/feishu/board` 数据链路的 `meegleAuthStatusUnlocked` 把 auth status **超时 / exit 2 / 无 stdout** 一律当 `authenticated:false`；`runMeegleUnlocked` 的 unknown-command 复核据此抛 `not_authed` → 前端渲「去设置页授权」。v1.1.4 只修了就绪清单的 `/api/system/feishu-cli`（`mergeAuthPreserve`），看板自己的 meegle 链路没享受到。
 - **修法**（同哲学：瞬态 ≠ 未登录）：`isMeegleExecTransient` 优先于未登录正则；auth status 瞬态标 `transient`；unknown-command 复核遇 transient 抛 `error` 不抛 `not_authed`。前端护栏本就覆盖 not_authed、服务端分类修对后 VPN 卡显示「加载失败 + 重试」。
@@ -344,14 +348,6 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **修复**：唯一代码闸 = `checkActionPrerequisites` ship/dev 对 `userRole==="qa"` 直接拒（`QA_ROLE_BLOCK_SHIP_DEV_REASON` 单一文案源、服务端准入 + 推进弹窗灰卡共用；advanceTask 读 settings 传 ctx）；其余全 prompt 文案解——`buildQaRoleDirective` 加 `isolateWorktree` 参数：隔离 task 才教 detached 切基线（含 MR ref 姿势）、非隔离 task / chat 一律「不切分支、当前检出只读验证」；追加通用约束（review 期间不切 commit / 误推 build 只产验证报告 / learn 只写任务目录 / 本约定优先于 playbook）
 - **工作台手动建任务**（用户：有些需求没排到甘特上、看板无入口）：看板头部「手动建任务」按钮 + 空态提示带链接 → 新页 `/workitems/new`（TaskLaunchForm 无预填复用）；表单飞书链接字段——有预填固定带入（看板进）、无预填露出可编辑输入（placeholder「粘贴飞书工作项链接」）、必填语义不变
 - 顺带（v1.1.6 发出后的样式跟进）：推进卡两行方案回退单行 truncate + hover Tooltip 补全名（两行让 grid 行高不齐、用户拍板）；文字 13px→12px + padding 收窄、单行多容一两个字
-
-### 2026-07-13 v1.1.6 发版：非 git 目录混合隔离 + 测试角色约定 + MCP 去自动导入（蓝军终审 1P0 拦下修完复审过）
-
-- **非 git 目录不再拦推进（混合隔离）**：task 绑的 repoPath 没有 `.git` 时——git 仓照旧建 worktree、非 git 目录跳过隔离原地使用（脚本库无分支概念）。核心：`Task.nonGitRepoPaths` 快照（createTask / updateTaskFields / setTaskRepoPaths 三写点、undefined=全 git 老任务兜底、**不做运行时 existsSync**——防 .git 中途增删映射漂移）；`getTaskWorkRepoPaths` 逐仓映射；**`getTaskCwd` 只对 git worktree 聚合**（终审 P0：混着原路径算公共父会漂到 $HOME、agent cwd / IDE 打开路径 / 兄弟仓扫描全翻车——已修+单测锁死）；`formatRepoSectionForPrompt` 混合模板逐仓标注；client `getRepoWorkDirs` 非 git 用原路径；`planBranchesForBuild` 非 git 跳过 checkout hint
-- **测试角色约定（纯 prompt、零服务端行为改动、用户拍板「简单点」）**：`settings.userRole === "qa"` 时 task（+绑仓 chat）注入 `buildQaRoleDirective`——不改仓库代码/不建分支/不 commit push MR（产物放任务目录或非 git 目录）、验证基线=各仓提测分支（detached 姿势切、显式豁免隔离段「禁止 checkout」）、给了 MR 链接用 `merge-requests/<iid>/head` 原生 ref 拉（不需要分支名/Token）、提测分支多需求集成只验当前需求范围；chat 变体不引用「仓库分支配置」段、纯非 git 任务只注入通用部分
-- **MCP 去 Cursor 全局自动导入**：删 V0.13 `migrateCursorMcpOnce` 整套（新用户首次落盘 config.json 会静默快照 ~/.cursor/mcp.json、用户拍板不可接受）；「从 Cursor 导入」手动链路是唯一导入口；老用户早已迁移完成无影响
-- **推进弹窗 action 卡长名两行**（v1.1.7 已回退成 Tooltip 方案、见上）
-- 流程：4 个 grok 子代理并行实施 → 蓝军终审拦下 1 P0 + 1 P1 + 2 P2 → 修复子代理全修 → 蓝军复审通过；余 3 个文案级 P2 攒下版
 
 ## 关键文件索引
 
