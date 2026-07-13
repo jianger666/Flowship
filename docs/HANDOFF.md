@@ -307,7 +307,9 @@ ArtifactPanel toolbar 加「正文 / Diff」切换、`fetchActionRevisions` / `f
 - **删任务后看板 404 修复**：看板 `handleOpen` 盲信缓存里的 `item.task` 硬跳已删任务——改成点击前用 `useTaskList()` 实时校验、删了就走 `/workitems/` 预览重新建（用户期望）；任务详情页 `!task` 从裸 `notFound()` 改 EmptyHint+「回工作台」；侧栏删除防重（deletingIds 锁 + 404 幂等成功不再 toast「任务不存在」+ `use-task-list` pendingDeletes 防 2s 轮询回魂 + 删当前任务先导航再等 DELETE）
 - **表单**：任一仓填「已有工作分支」→ 强制原仓运行、worktree 勾选隐藏换一行说明（同事实测踩「已有分支+隔离」必撞 git 同分支双检出）；勾选文案改正向「使用 worktree 隔离运行」（用户拍板「原仓运行别人看不懂」）、设置页对应项同步
 - **mac 自更新改延迟替换**（用户实测「稍后」态被硬闸拦、问能不能不用重启）：下载+验签后只暂存 `updates/staged-<v>.app`、**不碰 /Applications**——「立即更新」= 替换+重启；「稍后」= 老进程跑在没动过的老包上完全正常、before-quit 时替换（preventDefault 等替换完 exit）、启动早期兜底（有效暂存 → 替换+relaunch 无感知）；update-pending-restart 硬闸保留但正常流程不再触发；启动清扫扩展覆盖过期 staged
+- 工作项预览页描述区块整体移除（用户拍板、启动前不需要在预览页读描述）
 - 均未发版、攒在 main；test 包已打给用户验收
+- ⏸ **讨论后搁置记账：GitLab 能力分级方案**（用户拍板「现在的好像也能用、先不改」）——背景：creator（action/skill）零提系统能力、AI 无「读 GitLab」正规通道、测试同事的 action 靠 AI 自己发现 config.json 明文 token 跑通（野路子、token/apiKey 会进事件流与上下文）。已讨论定型但未实施的方案：A. 两个 creator 加「系统能力速查」（含新原则：工具名不进 skill、只进运行时注入、保 skill 通用性）B. `gitlab_api_get` 通用只读代理 + `add_mr_comment`（读自由写收口、merge/删分支不开）C. 「禁读 config.json 取密钥」红线。将来要做直接按这个捡起来。
 
 ### 2026-07-13 午后（main、已含在上、**未发版**）：仓库级「只读」取代测试角色机制
 
