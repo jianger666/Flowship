@@ -283,6 +283,92 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   const pending = checkPending();
 
+  // 落盘图 + 拼 replyText：pending 命中 或 僵尸唤醒（pending 丢了但仍 awaiting）都要用。
+  // 抽成闭包、避免两处复制；真正写盘仅在确认要接受这组答案时调用。
+  const persistAnswerAssets = async (): Promise<
+    | { ok: true; savedByQuestion: Record<string, ImageAttachmentSaved[]>; allSaved: ImageAttachmentSaved[]; allAbsPaths: string[]; replyText: string }
+    | { ok: false; errorResponse: Response }
+  > => {
+    const savedByQuestion: Record<string, ImageAttachmentSaved[]> = {};
+    const allSaved: ImageAttachmentSaved[] = [];
+    for (const qid of Object.keys(validatedByQuestion)) {
+      try {
+        const saved = await saveImageAttachments(task.id, validatedByQuestion[qid]);
+        savedByQuestion[qid] = saved;
+        allSaved.push(...saved);
+      } catch (err) {
+        return {
+          ok: false,
+          errorResponse: errorResponse(
+            `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
+          ),
+        };
+      }
+    }
+    return {
+      ok: true,
+      savedByQuestion,
+      allSaved,
+      allAbsPaths: allSaved.map((s) => s.absPath),
+      replyText: buildReplyText(questions, answers, deferred, savedByQuestion),
+    };
+  };
+
+  // 会话已死时的唤醒兜底（V0.14.x + 网断僵尸态）：落 ask_user_reply + 起新 agent 接手
+  const wakeWithAnswer = async (
+    replyText: string,
+    allSaved: ImageAttachmentSaved[],
+    allAbsPaths: string[],
+    reason: string,
+  ): Promise<Response | null> => {
+    const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
+    const model =
+      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+        : undefined;
+    const currentAction = task.actions.find((a) => a.id === task.currentActionId);
+    if (!currentAction || !apiKey || !model) return null;
+
+    clearPendingAsk(task.id);
+    const replyEv = await appendEvent(task.id, {
+      kind: "ask_user_reply",
+      actionId: reqEvent.actionId,
+      text: replyText,
+      meta: {
+        askId,
+        answers,
+        ...(deferred ? { deferred: true } : {}),
+        ...(allSaved.length > 0 ? { images: allSaved } : {}),
+      },
+    });
+    if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
+    console.log(
+      `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（新 agent 接手、答案随消息带过去）`,
+    );
+    void resumeCurrentActionWithMessage({
+      task,
+      userMessage: replyText,
+      imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
+      apiKey,
+      fallbackModel: model,
+      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
+      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+    }).catch(async (err) => {
+      console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
+      const ev = await appendEvent(task.id, {
+        kind: "error",
+        actionId: reqEvent.actionId,
+        text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+      });
+      if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
+    });
+    const fresh = await getTask(task.id);
+    return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
   if (!pending) {
     const fresh = (await getTask(id)) ?? task;
 
@@ -308,15 +394,29 @@ export const POST = async (req: Request, { params }: Ctx) => {
       return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
     }
 
-    // 真僵尸：任务声称在等回复、内部却没有任何等待（进程重启 / agent 异常退出）——标 error 让用户重启
+    // pending 内存丢了（进程重启 / 网断后 agent 异常退出）但任务仍 awaiting_user：
+    // 旧逻辑当场 410 + 标 error → 答题卡 isStale「用输入条唤醒」+ 输入条因未了结 ask
+    // 仍禁用 = 对锁死。有凭据则接受答案并唤醒；没凭据才作废提问 + 标 error 放行输入条。
     if (fresh.runStatus === "awaiting_user") {
       console.warn(
-        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=awaiting_user、当场标 error`,
+        `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=awaiting_user（pending 已丢）、尝试唤醒兜底`,
       );
+      const assets = await persistAnswerAssets();
+      if (!assets.ok) return assets.errorResponse;
+      const woken = await wakeWithAnswer(
+        assets.replyText,
+        assets.allSaved,
+        assets.allAbsPaths,
+        "僵尸态（pending 已丢）",
+      );
+      if (woken) return woken;
+
+      await supersedePendingAsks(task.id, "会话已失效");
+      clearPendingAsk(task.id);
       const errorEvent = await appendEvent(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
-        text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。请点「推进」起新 agent。",
+        text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
       });
       if (errorEvent) {
         publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
@@ -330,7 +430,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
           ok: false,
         });
       }
-      return errorResponse("agent 已断开、请点「推进」起新 agent", 410);
+      return errorResponse(
+        "agent 已断开——在底部输入条说句话即可唤醒，或重新「推进」",
+        410,
+      );
     }
     return errorResponse(
       `agent 当前没在等问答（task.runStatus=${fresh.runStatus}）`,
@@ -343,23 +446,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   );
 
   // 确认 agent 还在等了、现在才真把图写盘（逐题落、按 questionId 归档）。
-  // savedByQuestion 用于 replyText 内联标注归属；allSaved 扁平给前端缩略图；allAbsPaths 给 agent read。
-  const savedByQuestion: Record<string, ImageAttachmentSaved[]> = {};
-  const allSaved: ImageAttachmentSaved[] = [];
-  for (const qid of Object.keys(validatedByQuestion)) {
-    try {
-      const saved = await saveImageAttachments(task.id, validatedByQuestion[qid]);
-      savedByQuestion[qid] = saved;
-      allSaved.push(...saved);
-    } catch (err) {
-      return errorResponse(
-        `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-  const allAbsPaths = allSaved.map((s) => s.absPath);
-
-  const replyText = buildReplyText(questions, answers, deferred, savedByQuestion);
+  const assets = await persistAnswerAssets();
+  if (!assets.ok) return assets.errorResponse;
+  const { allSaved, allAbsPaths, replyText } = assets;
 
   // V0.11：`agent.send` 送达答案——成功了才写「已答」事件 + publish（顺序关键：先送再落
   // 事件、失败不写、防「用户看到已答、agent 没收到」的假已答）。send 成功即清 pendingAsk。
@@ -380,61 +469,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
   );
   if (!ok) {
     // V0.14.x（用户点名「AI 断开时提问没法提交」）：会话死不再丢答案 + 报错让用户
-    // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去（question 路由
-    // 唤醒模式同款）。顺序关键：先 clearPendingAsk（答案已拿到、这组不再 pending）、
-    // 唤醒内部的 supersedePendingAsks 就不会把已答的这组再列成「未答问题」重问。
-    const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
-    const model =
-      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
-        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
-        : undefined;
-    const currentAction = task.actions.find((a) => a.id === task.currentActionId);
-    if (currentAction && apiKey && model) {
-      clearPendingAsk(task.id);
-      // 答案落档（用户视角：已答、事件流可见）、新 agent 从 userMessage 里拿全文
-      const replyEv = await appendEvent(task.id, {
-        kind: "ask_user_reply",
-        actionId: reqEvent.actionId,
-        text: replyText,
-        meta: {
-          askId,
-          answers,
-          ...(deferred ? { deferred: true } : {}),
-          ...(allSaved.length > 0 ? { images: allSaved } : {}),
-        },
-      });
-      if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
-      console.log(
-        `[ask-reply] task=${task.id} askId=${askId} 会话已死、走唤醒兜底（新 agent 接手、答案随消息带过去）`,
-      );
-      void resumeCurrentActionWithMessage({
-        task,
-        userMessage: replyText,
-        imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
-        apiKey,
-        fallbackModel: model,
-        gitHost: body.bootArgs?.gitHost?.trim() || undefined,
-        gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-      }).catch(async (err) => {
-        console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
-        const ev = await appendEvent(task.id, {
-          kind: "error",
-          actionId: reqEvent.actionId,
-          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
-        });
-        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
-      });
-      const fresh = await getTask(task.id);
-      return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去。
+    const woken = await wakeWithAnswer(
+      replyText,
+      allSaved,
+      allAbsPaths,
+      "会话已死",
+    );
+    if (woken) return woken;
     // 没凭据 / 没有当前 action（极端）：维持原作废 + 报错兜底
     await supersedePendingAsks(task.id, "会话已失效");
     clearPendingAsk(task.id);
     return errorResponse(
-      "没有可续接的 agent 会话（会话已失效）——重新「推进」该阶段、问题上下文会自动带给新 agent",
+      "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
       409,
     );
   }

@@ -100,16 +100,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (runningTasks.has(task.id) || task.runStatus === "running") {
     return errorResponse("agent 正在跑、等它说完这轮再问", 409);
   }
-  // ask 弹窗还在等答案时把用户往弹窗引——但当前 action 已停在半路（agent 报错 / 被停、
-  // 弹窗其实已经没人接了）时不拦：放行走唤醒模式、悬着的问题会随断点续传重新问到
-  const haltedAction = task.actions.find(
-    (a) =>
-      a.id === task.currentActionId &&
-      (a.status === "error" || a.status === "cancelled"),
-  );
-  if (getPendingAsk(task.id) && !haltedAction) {
-    return errorResponse("先回答上方 AI 的提问", 409);
-  }
+  // 有 pendingAsk 也不再硬拦输入条：用户可绕过答题卡直接说话（下方 sent/oneshot
+  // 会 supersede；canResume 唤醒内部也会 supersede）。旧逻辑「先回答上方提问」在
+  // 网断 / 会话死后把输入条和答题卡对锁——只能重新推进（同事反馈）。
 
   // 图先落盘（给 agent read 的绝对路径 + 事件缩略图 meta）
   let imageAbsPaths: string[] | undefined;
@@ -152,8 +145,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
+  // 有待答提问时用户直接说话 = 跳过提问（下方会作废）——给 agent 显式提示、
+  // 别把未答的问题悄悄吞掉：信息仍必要就结合新消息重新提问（用户拍板的护栏）
+  const skippedAskHint = getPendingAsk(task.id)
+    ? "（提示：你此前的提问未被用户回答、已作废——若其中信息仍然必要、结合下面的消息重新提问）\n"
+    : "";
   // 事件用用户原文；发给 agent 的带 skill 指引（三条分流共用）
-  const agentText = buildSkillDirective(skills) + text;
+  const agentText = skippedAskHint + buildSkillDirective(skills) + text;
 
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流

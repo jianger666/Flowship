@@ -319,6 +319,9 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   );
   const allAnswered = questions.length > 0 && answeredCount === questions.length;
 
+  // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时强制解锁可重试
+  const SUBMIT_UNLOCK_MS = 30_000;
+
   const handleSubmit = async () => {
     if (!askId || submitting) return;
     if (!allAnswered) {
@@ -340,14 +343,19 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       if (imgs && imgs.length > 0) imagesByQuestion[q.id] = imgs;
     }
     setSubmitting(true);
+    const unlockTimer = window.setTimeout(() => {
+      setSubmitting(false);
+      toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
+    }, SUBMIT_UNLOCK_MS);
     try {
       await submitAskReply(task.id, askId, answers, { imagesByQuestion });
       // 提交成功：等 SSE 推 ask_user_reply、findPendingAskEvent 变 null、
       // event-stream 自动切回放卡——这里不主动收起、避免 race。
-      // 兜底：SSE 恰在重连间隙时卡片会停在「提交中…」——15s 后恢复按钮
-      //（届时事件多半已到、卡片已切换；真没到用户再点会被服务端 409 温和提示已答）
+      // SSE 重连间隙另给 15s：卡片可能仍显示「提交中…」
+      window.clearTimeout(unlockTimer);
       window.setTimeout(() => setSubmitting(false), 15_000);
     } catch (err) {
+      window.clearTimeout(unlockTimer);
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }
@@ -365,9 +373,16 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     });
     if (!ok) return;
     setSubmitting(true);
+    const unlockTimer = window.setTimeout(() => {
+      setSubmitting(false);
+      toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
+    }, SUBMIT_UNLOCK_MS);
     try {
       await submitAskReply(task.id, askId, [], { deferred: true });
+      window.clearTimeout(unlockTimer);
+      window.setTimeout(() => setSubmitting(false), 15_000);
     } catch (err) {
+      window.clearTimeout(unlockTimer);
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }

@@ -79,19 +79,23 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     },
   });
 
-  // 有未答提问（且当前阶段没停摆）→ 输入条切「答题引导态」：禁输入、placeholder 指路。
-  // 阶段停摆（error/cancelled）时提问已没人接、照常放行（唤醒通道）。
-  const halted = task.actions.some(
-    (a) =>
-      a.id === task.currentActionId &&
-      (a.status === "error" || a.status === "cancelled"),
-  );
+  // 有未答提问 → placeholder 轻提示去答题卡；**不禁输入**（同事踩坑：网断 /
+  // 会话死后答题卡变 isStale 引导「用底部输入条唤醒」，但这里曾把 awaitingAnswer
+  // 绑进 disabled，和 isStale 对锁、只能重新推进）。
+  // runStatus=error / action 停摆：提问已没人接，placeholder 也不再指路答题。
+  const halted =
+    task.runStatus === "error" ||
+    task.actions.some(
+      (a) =>
+        a.id === task.currentActionId &&
+        (a.status === "error" || a.status === "cancelled"),
+    );
   const awaitingAnswer = !halted && !!findPendingAskEvent(task.events);
 
-  // 贴图（粘贴 / 选文件 / 拖拽）——不可输入时（busy / 答题引导态）所有 handler 短路
+  // 贴图：仅 agent 在跑时短路（跟输入条同口径——有 pendingAsk 仍可贴图说话）
   const attach = useImageAttach({
     maxImages: 6,
-    disabled: busy || awaitingAnswer,
+    disabled: busy,
   });
 
   const handleSubmit = async () => {
@@ -149,10 +153,10 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         onSubmit={() => void handleSubmit()}
         placeholder={
           awaitingAnswer
-            ? "先回答上方 AI 的提问"
+            ? "可先答上方提问，也可在此继续说"
             : "想改、想问、贴图、/ 唤起 skill（⌘/Ctrl+J）"
         }
-        disabled={busy || awaitingAnswer}
+        disabled={busy}
         submitting={submitting}
         focusRef={focusRef}
         slash={slash}
@@ -166,7 +170,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
             models={models}
             selection={pickedModel}
             onChange={setPickedModel}
-            disabled={busy || awaitingAnswer}
+            disabled={busy}
             variant="compact"
             emptyPlaceholder="模型 · 跟随会话"
             followOption="跟随会话"
