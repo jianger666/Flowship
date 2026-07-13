@@ -65,6 +65,25 @@ const ACTION_PROMPT_FILE: Record<Exclude<ActionType, "custom">, string> = {
 
 const NULL_PLACEHOLDER = "（未提供）";
 
+/**
+ * 运行时注入「GitLab 访问」说明（settings 配了 gitToken 才注入）。
+ * host 空时用「（host 见仓库 origin）」兜底；顺带钉死内置飞书 CLI 勿预检 auth。
+ */
+export const buildGitlabAccessDirective = (
+  gitHost: string | null | undefined,
+  dataRootPath: string,
+): string => {
+  const host =
+    typeof gitHost === "string" && gitHost.trim().length > 0
+      ? gitHost.trim()
+      : "（host 见仓库 origin）";
+  return [
+    "## GitLab 访问",
+    `- 系统已配置 GitLab（host: ${host}）；API 凭证在 \`${dataRootPath}/config.json\` 的 **gitToken 字段**（PRIVATE-TOKEN header）——用 jq/node 只取该字段、**不要 cat 整个文件**（里面还有其它密钥）。`,
+    `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 已安装已登录、直接调、不要先跑 auth status 探测。`,
+  ].join("\n");
+};
+
 // ----------------- prompt 模板渲染 -----------------
 
 // V0.5 沿用：缺失 / 空白都替换成「（未提供）」、防漏 business 字段
@@ -226,6 +245,11 @@ export const buildSuperPrompt = async (
    * 故意不在本函数里打 meegle——保持纯拼装、网络失败不堵模板渲染。
    */
   userIdentityLine = "",
+  /**
+   * GitLab 访问段（调用方：settings 有 gitToken 时用 buildGitlabAccessDirective 产出；否则空串）。
+   * 空串 = 整段不注入（renderSuperPromptTemplate 保留字面空）。
+   */
+  gitlabAccessSection = "",
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -260,6 +284,7 @@ export const buildSuperPrompt = async (
       task,
       "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
     ),
+    gitlabAccessSection,
     rulesSection,
     skillsSection: renderSkillsForPrompt(skills),
     eventsLogPath: getEventsLogPath(task.id),

@@ -63,7 +63,12 @@ import {
   resolveTaskMcpServers,
 } from "./cursor-config";
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
-import { renderReadonlyRepoDirective } from "./task-prompts";
+import {
+  buildGitlabAccessDirective,
+  renderReadonlyRepoDirective,
+} from "./task-prompts";
+import { resolveEffectiveGitHost } from "./gitlab-host";
+import { readSettingsFile } from "./settings-fs";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp } from "./mcp-probe";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
@@ -278,6 +283,8 @@ const buildInitialPrompt = (
   firstMessage?: InitialUserMessage,
   /** 飞书项目推导的发起人姓名行；空串 = 不注入 */
   userIdentityLine = "",
+  /** GitLab 访问段（绑仓 + 配了 gitToken 时注入；空串 = 不注入） */
+  gitlabAccessSection = "",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -330,6 +337,10 @@ const buildInitialPrompt = (
   const readonlyDirective = renderReadonlyRepoDirective(task);
   if (readonlyDirective) {
     lines.push(readonlyDirective, "");
+  }
+  // 绑仓 + settings 有 gitToken → 注入 GitLab 访问说明（纯聊天不注）
+  if (gitlabAccessSection.trim()) {
+    lines.push(gitlabAccessSection.trim(), "");
   }
   lines.push(
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
@@ -694,12 +705,30 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const rulesSection = await readAppRulesForPrompt();
     // resolve = 姓名（meegle）+ 设置页角色、失败返空串（不堵启动）
     const userIdentityLine = await resolveUserIdentityForPrompt();
+    // 绑仓 + settings 有 gitToken 才注入「GitLab 访问」（纯聊天不需要）
+    let gitlabAccessSection = "";
+    if (task.repoPaths.length > 0) {
+      const settings = await readSettingsFile();
+      const gitToken =
+        typeof settings?.gitToken === "string" ? settings.gitToken.trim() : "";
+      if (gitToken) {
+        const gitHost =
+          typeof settings?.gitHost === "string" ? settings.gitHost : undefined;
+        const effectiveHost =
+          (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+        gitlabAccessSection = buildGitlabAccessDirective(
+          effectiveHost,
+          dataRoot(),
+        );
+      }
+    }
     const initialPrompt = buildInitialPrompt(
       task,
       skills,
       rulesSection,
       firstMessage,
       userIdentityLine,
+      gitlabAccessSection,
     );
     run = await agent.send(initialPrompt);
 

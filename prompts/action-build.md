@@ -188,7 +188,7 @@ read 涉及到的文件 → 心里盘清楚改动 → edit / write 改动 →
 
 拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
 
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。处理完再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动代码 / artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算改 X、对吗？」、用户 ✅ 才动代码、改完代码后**用 `edit` 把本轮修正追加到 build artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）；带图先 read 图再分类。先回应再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行、**绝对不自动进入 review**——下一个 action 类型由用户在 UI 选
 
 ## 自检（V0.6.3 起：runner 不再自动跑后置检查、build 质量靠你自检 + 用户人眼把关）

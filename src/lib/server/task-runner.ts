@@ -105,6 +105,7 @@ import {
 } from "./task-stream";
 import {
   buildBatchDirective,
+  buildGitlabAccessDirective,
   buildNextActionDirective,
   buildPlanReplanDirective,
   buildResumeActionInstruction,
@@ -1570,6 +1571,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
       // 飞书项目推导发起人姓名 + 设置页角色（失败返空串、不堵启动）
       const userIdentityLine = await resolveUserIdentityForPrompt();
+      // settings 配了 gitToken 才注入「GitLab 访问」段（给 agent 铺正路读 config.json）
+      const gitlabAccessSection =
+        gitToken && gitToken.trim().length > 0
+          ? buildGitlabAccessDirective(effectiveGitHost, dataRoot())
+          : "";
       const superPrompt = await buildSuperPrompt(
         task,
         skills,
@@ -1583,6 +1589,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           replanDirective,
         },
         userIdentityLine,
+        gitlabAccessSection,
       );
 
       const run = await agent.send(superPrompt);

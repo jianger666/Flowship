@@ -389,7 +389,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 - ❌ MR 有冲突还照发飞书评论 @ 测试人员（合不了的 MR 不能甩给测试、§3.5 门禁拦）
 - ❌ target_branch 探 origin/HEAD 拿 master / main（公司工作流 = 提测、填该仓配置的测试分支、没配才用 test）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不会落库、详情页看不到）
-- ❌ 自己用 SDK `shell` curl GitLab REST API / `glab` / `gh`（PAT 在 server、agent 拿不到、必然失败）
+- ❌ 自己用 SDK `shell` curl GitLab REST API 建 MR（MR 创建必须走 `submit_mr`、task.mrs 要落库；读操作可自调 API、见 super-prompt「GitLab 访问」）
 - ❌ 拿到测试人员 user_key 但漏调 set_feishu_testers（下次 ship 还要重新探、artifact 后置检查会发现）
 - ❌ mention 传 lark_user_id 或加 `lark_user_id_` 前缀（2026-06-12 起服务端按纯数字 user_key 校验、报 `cross tenant` / `no permission`）
 - ❌ 先跑 `meegle auth status` 预检再决定要不要做 §4.5（auth status 瞬态失败会被误判成未登录、直接跳过流转）

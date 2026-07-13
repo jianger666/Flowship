@@ -219,7 +219,7 @@
 
 拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**——不跑任何等待命令。用户的下一步会以新消息送达：
 
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。处理完再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 直接 emit assistant_message 答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。先回应再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行
 
 `submit_work` 调用前后不要在 assistant_message 里讲它的存在等协议机制、对用户透明。写完 plan artifact 先给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）、再交卷（详见 super-prompt 关键规则 1）。

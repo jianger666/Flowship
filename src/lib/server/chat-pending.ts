@@ -379,7 +379,7 @@ export const buildAgentMessage = (msg: AgentMessage): string => {
       // 「〈产出审阅中〉」字面量必须保留——_super.md 教 agent 的判卷闸门就是这个词
       //（审计揪过：文案与 prompt 字面对不上、agent 可能漏交卷）
       lines.push(
-        `〈产出审阅中〉你有一份产出正在等用户审阅（action_id=${msg.ackContext.actionId}${msg.ackContext.artifactPath ? `、artifact=${msg.ackContext.artifactPath}` : ""}）。先判断这条消息的性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改意见**才动 artifact / 代码（模糊的先 ask_user 复述确认）。无论问还是改、处理完都要调 submit_work（同 action_id）重新交卷、然后结束回复。`,
+        `〈产出审阅中〉你有一份产出正在等用户审阅（action_id=${msg.ackContext.actionId}${msg.ackContext.artifactPath ? `、artifact=${msg.ackContext.artifactPath}` : ""}）。先判断这条消息的性质：**纯疑问**就直接回答、别把问题当成改动指令；**修改意见**才动 artifact / 代码（模糊的先 ask_user 复述确认）。无论问还是改：**先把答案 / 改动说明用 assistant_message 发给用户、再调 submit_work（同 action_id）重新交卷**、然后结束回复。不要输出「这是纯疑问 / 我将…」之类的分类旁白、直接给内容。`,
       );
     } else {
       lines.push(

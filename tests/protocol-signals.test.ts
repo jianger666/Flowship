@@ -112,6 +112,7 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "roleLabel",
       "role",
       "contextDocsSection",
+      "gitlabAccessSection",
       "rulesSection",
       "skillsSection",
       "eventsLogPath",
