@@ -80,7 +80,7 @@ describe("信号构造函数格式", () => {
     );
     // _super.md 里教 agent 的格式样例必须与构造端字段顺序一致（type 枚举含 custom）
     expect(superMd).toContain(
-      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|learn|dev|custom> n=<N> artifact_path=actions/<N>-<type>.md]",
+      "[NEXT_ACTION action_id=<id> type=<plan|build|review|ship|dev|custom> n=<N> artifact_path=actions/<N>-<type>.md]",
     );
   });
 
@@ -109,8 +109,6 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "repoSection",
       "repoBranchSection",
       "repoPath",
-      "roleLabel",
-      "role",
       "contextDocsSection",
       "gitlabAccessSection",
       "rulesSection",
@@ -144,13 +142,10 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
       "taskId",
       "taskTitle",
       "repoPath",
-      "role",
-      "roleLabel",
       "actionArtifactsDir",
-      // V0.6.29：learn action 挖事件日志
       "eventsLogPath",
     ]);
-    for (const type of ["plan", "build", "review", "ship", "learn", "dev"]) {
+    for (const type of ["plan", "build", "review", "ship", "dev"]) {
       const md = readFileSync(
         path.join(promptsDir, `action-${type}.md`),
         "utf-8",

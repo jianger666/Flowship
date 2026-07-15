@@ -40,7 +40,6 @@ const taskWithActions = (actions: ActionRecord[]): Task =>
     id: "task_1",
     mode: "task",
     title: "批次测试",
-    role: "fe",
     repoStatus: "developing",
     runStatus: "idle",
     repoPaths: ["/repo"],

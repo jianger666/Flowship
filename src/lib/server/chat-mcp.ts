@@ -59,13 +59,13 @@ const idleWaitText = (): string =>
     "用户的下一步操作会作为新消息发给你、你会在同一会话里继续。",
   ].join("\n");
 
-// ask_user 提交成功后的返回：弹窗已推给用户、结束回复等答案以新消息送达
+// ask_user 提交成功后的返回：答题卡已推、结束回复等答案以新消息送达
 const askSubmittedText = (askId: string): string =>
   [
-    `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 弹窗）。`,
+    `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
     "",
     "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问。",
-    "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（含每条 Q 的答案、或 `[ASK_USER_REPLY deferred]` 表示用户选了稍后再补充——按 default 推进并把未答项列进 artifact §6 待澄清）。",
+    "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（或 `[ASK_USER_REPLY deferred]` = 稍后再补充 → 按 default 推进、未答项自行记住即可）。",
   ].join("\n");
 
 // ----------------- McpServer 构造 -----------------
@@ -184,48 +184,34 @@ const buildMcpServer = (): McpServer => {
   srv.registerTool(
     "ask_user",
     {
-      title: "action 内打包提问（一次问完所有不确定项）",
+      title: "打包提问（一次问完所有不确定项）",
       description: [
-        "结构化 action（plan / build / review / ship / learn / dev）内 agent 遇到不确定项时、把当前轮想问的**全部打包**成 questions[]、推给用户 UI 弹窗。",
-        "对标 Cursor `askFollowUpQuestion`：UI 出选项按钮 + 可选自由文本输入。",
+        "遇到不确定 / 要用户选择时、把当前轮想问的**全部打包**成 questions[]、推 UI 答题卡。task / chat 都可用。",
+        "对标 Cursor `askFollowUpQuestion`：选项按钮 + 可选自由文本。",
         "",
-        "## ⚠️ chat 模式（task.mode === 'chat'）禁用（V0.6.0.1 拍板）",
+        "## 约束",
         "",
-        "**本工具只用于 task 容器模式的 action**。chat（自由对话）有问题想确认时、直接在正文里问（markdown 列 A/B/C 选项也行）、说完结束回复等用户下一条消息。",
+        "- **单次调用**：当前轮问题全部进 questions[]——同一时刻只能有一组 pending、再调会顶替旧的",
+        "- **可多次**：上一轮答模糊 → 形成判断后再问一轮给具体选项，正常",
+        "- **只在确实有不确定项时调**——没问题就跳过",
+        "- **options 不要塞 Other / 其他 / 以上都不是**——`allow_text=true` 时 UI 自动加「自定义」、你再加会重复",
         "",
-        "## 关键约束",
+        "## 返回值（非阻塞）",
         "",
-        "- **单次调用内**：把当前轮想问的问题**全部打包**到 questions[]、UI modal 一次答完——不要同一时刻调多次（一时刻只能有一组 pending、第二次会顶替第一次）",
-        "- **整个 action 内无次数上限**：agent 按内容判断——「初稿打一次包问 → 用户答模糊 → read/grep 形成判断 → 再调一次给具体选项」是正常流程",
-        "- **收敛标准**：所有问题都得到「明确的业务决策」（能直接落进 artifact 的）才交卷（submit_work）。判不准就再问、不要打 default 跳过",
-        "- **只在确实有不确定项时调用**——没问题就跳过、直接交卷",
-        "- **options 里不要手动塞「Other / 其他 / 其它 / 以上都不是 / 自定义」类的兜底选项**——`allow_text=true` 时 UI 会自动渲染「以上都不是 / 自定义回答…」按钮、你再加会重复",
+        "- `[ASK_SUBMITTED]` = 答题卡已推——**立即结束本轮回复**、别等 / 别轮询",
+        "- 用户答完以新消息送达：`[ASK_USER_REPLY]` Q&A、或 `[ASK_USER_REPLY deferred]`（稍后再补 → 按 default 推进、别再问同组）",
         "",
-        "## 何时调用",
+        "## 礼仪",
         "",
-        "- artifact 初稿写完、扫一遍发现有不确定 / 多选 / 歧义点：上下文冲突、口径不清、接口字段不明、技术路线 A/B",
-        "- 用户上一轮答案模糊 /「你定 / 看代码再说」——read/grep 形成判断后、再调一次给具体业务选项让用户拍板",
-        "- 产出审阅中用户消息含混（改类兜底）——调一次复述意图",
-        "",
-        "## 返回值（V0.11 非阻塞）",
-        "",
-        "- 立即返回 `[ASK_SUBMITTED]` = 弹窗已推送——**你应立即结束本轮回复（正常结束 turn）**、不要执行任何等待 / 轮询命令",
-        "- 用户答完后、答案以**新消息**发给你（同一会话继续）、两种头：",
-        "  - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、解析每条 A、按内容推进（模糊 → 再调一次 ask_user 给具体选项）",
-        "  - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——1）不再就这组 Q 重新提问 2）把这些 Q 完整列进 artifact「§6 待澄清」段、按你判断的合理 default 推进",
-        "",
-        "## 调用礼仪",
-        "",
-        "- 调用前 / 后不要在正文解释「我先问几个问题」之类、UI modal 会自动弹出来",
-        "- 答完后不要复述「你刚才选了 X」、直接按答案推进、在 artifact 正文（§1 / §3 / §4 等结论引用处）就地加 `> ✅ ask_user 已确认：用户选 X` 内联备注",
-        "- 答案**只**写到 artifact、**不再**自动落 contextDocs——单一数据源、避免重复",
+        "- 调前 / 后别在正文预告「我先问几个问题」——答题卡自己会出",
+        "- 答完别复述「你选了 X」、直接按答案推进",
       ].join("\n"),
       inputSchema: {
         task_id: z.string().describe("任务 id"),
         action_id: z
           .string()
           .optional()
-          .describe("当前 action id（plan / build / review / ship / learn / dev）"),
+          .describe("当前 action id（task 模式可选；chat 无 action、可不传）"),
         questions: z
           .array(
             z.object({
@@ -242,18 +228,18 @@ const buildMcpServer = (): McpServer => {
                 )
                 .optional()
                 .describe(
-                  "可选项数组、2-4 个最常见、最多 6 个。**不要在这里塞 Other / 其他 / 其它 / 以上都不是 / 自定义 类的兜底项**——allow_text=true 时 UI 会自动加一个「以上都不是 / 自定义回答…」按钮、你再加会重复。",
+                  "可选项、数量不限（常见 2-6 个；候选确实多就列全、别自行截断）。不要塞 Other / 其他 / 以上都不是——allow_text 时 UI 自动加。",
                 ),
               allow_text: z
                 .boolean()
                 .optional()
                 .describe(
-                  "是否在选项底下渲染「以上都不是 / 自定义回答…」按钮、默认 true。注意：不要把这个字段理解成「在 options[] 里加一个 Other 选项」、UI 兜底入口完全由 UI 渲染、你只要列具体业务选项",
+                  "是否渲染「自定义回答」入口、默认 true（不是往 options 里加 Other）",
                 ),
             }),
           )
           .min(1)
-          .describe("问题数组、当前轮所有不确定项打包进来、至少 1 条"),
+          .describe("问题数组、当前轮不确定项打包、至少 1 条"),
       },
     },
     async ({ task_id, action_id, questions }) => {

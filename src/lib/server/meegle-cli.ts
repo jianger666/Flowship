@@ -5,9 +5,7 @@
  *（data/tools/bin/meegle、V0.12 起可在设置页安装）、`--format json` 输出好解析。
  *
  * 关键设计：
- * - **响应结构宽松归一**（normalizeWorkitem）：mywork / workitem get 的响应字段名
- *   没有公开 schema（官方 skill 文档只写了请求参数）、按常见命名多重兜底解析、
- *   解析不出的字段留 undefined、UI 容错渲染。真实结构以用户登录后实测校准。
+ * - **看板主数据源**：`fetchUserSchedule`（workhour list-schedule，人员排期同款接口）。
  * - **错误三态**：not_installed（二进制不存在）/ not_authed（未登录）/ error（其他）——
  *   首页据此渲染降级态（装 CLI 引导 / 授权引导 / 报错重试）。
  * - 超时 30s：CLI 走公网 API、网络差时别挂死 route。
@@ -232,114 +230,7 @@ export interface BoardWorkitem {
 const asStr = (v: unknown): string | undefined =>
   typeof v === "string" && v.trim() ? v : typeof v === "number" ? String(v) : undefined;
 
-const asMs = (v: unknown): number | undefined => {
-  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return undefined;
-  // 秒级时间戳兜底转毫秒（< 10^12 视为秒）
-  return v < 1e12 ? v * 1000 : v;
-};
-
-// 从多个候选 key 里取第一个非空
-const pick = (obj: Record<string, unknown>, keys: string[]): unknown => {
-  for (const k of keys) {
-    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") return obj[k];
-  }
-  return undefined;
-};
-
-// 日期解析：ms 时间戳（秒级兜底）或 "YYYY-MM-DD" 字符串（mywork 实测形态）
-const asDateMs = (v: unknown): number | undefined => {
-  const n = asMs(v);
-  if (n) return n;
-  if (typeof v === "string" && v.trim()) {
-    const t = Date.parse(v);
-    if (Number.isFinite(t) && t > 0) return t;
-  }
-  return undefined;
-};
-
-/**
- * 单个工作项归一。mywork todo 实测结构（2026-07-10 登录后校准）：
- * ```
- * { node_info: { node_name: "前端开发", node_state_key },
- *   project_key, project_name,
- *   schedule: { start_time: "2025-06-03", end_time: "2025-06-04" },   // 字符串日期
- *   work_item_info: { work_item_id: 4969867129, work_item_name, work_item_type_key } }
- * ```
- * 顶层扁平形态（workitem query 等其他接口可能用）保留兜底。
- */
-export const normalizeWorkitem = (rawItem: unknown): BoardWorkitem | null => {
-  if (!rawItem || typeof rawItem !== "object") return null;
-  const m = rawItem as Record<string, unknown>;
-  // 核心字段可能嵌在 work_item_info 子对象（mywork 实测）、也可能顶层扁平
-  const info =
-    m.work_item_info && typeof m.work_item_info === "object"
-      ? (m.work_item_info as Record<string, unknown>)
-      : m;
-  const id = asStr(pick(info, ["work_item_id", "workItemId", "id"]));
-  const name = asStr(pick(info, ["work_item_name", "name", "title"]));
-  if (!id || !name) return null;
-
-  // 状态：mywork 在 node_info.node_name（当前节点名）；其他接口可能给字符串 / 对象
-  let statusLabel: string | undefined;
-  if (m.node_info && typeof m.node_info === "object") {
-    statusLabel = asStr((m.node_info as Record<string, unknown>).node_name);
-  }
-  if (!statusLabel) {
-    const rawStatus = pick(m, ["work_item_status", "status", "current_status", "state"]);
-    if (typeof rawStatus === "string") statusLabel = rawStatus;
-    else if (rawStatus && typeof rawStatus === "object") {
-      const s = rawStatus as Record<string, unknown>;
-      statusLabel = asStr(pick(s, ["label", "name", "state_key", "value"]));
-    }
-  }
-
-  // 排期：mywork 的 schedule.{start_time,end_time} 是 "YYYY-MM-DD" 字符串；ms 形态兜底
-  let scheduleStart: number | undefined;
-  let scheduleEnd: number | undefined;
-  const sched = pick(m, ["schedule", "node_schedule"]);
-  if (sched && typeof sched === "object") {
-    const s = sched as Record<string, unknown>;
-    scheduleStart = asDateMs(pick(s, ["start_time", "estimate_start_date", "start_date", "start"]));
-    scheduleEnd = asDateMs(pick(s, ["end_time", "estimate_end_date", "end_date", "end", "due_date"]));
-  }
-  scheduleStart ??= asDateMs(pick(m, ["estimate_start_date", "start_date", "start_time"]));
-  scheduleEnd ??= asDateMs(pick(m, ["estimate_end_date", "end_date", "deadline", "due_date"]));
-
-  const typeRaw = pick(info, ["work_item_type_key", "work_item_type", "type_key", "type"]);
-  const typeLabel =
-    typeof typeRaw === "string"
-      ? typeRaw
-      : typeRaw && typeof typeRaw === "object"
-        ? asStr((typeRaw as Record<string, unknown>).label ?? (typeRaw as Record<string, unknown>).name)
-        : undefined;
-
-  return {
-    id,
-    name,
-    projectKey: asStr(pick(m, ["project_key", "projectKey", "space_id"])),
-    projectName: asStr(pick(m, ["project_name", "space_name", "simple_name"])),
-    typeLabel,
-    statusLabel,
-    scheduleStart,
-    scheduleEnd,
-    url: asStr(pick(m, ["url", "link", "detail_url"])),
-    raw: m,
-  };
-};
-
-// 响应里挖工作项数组：常见包裹 data.list / list / data / items / results
-const extractItems = (resp: unknown): unknown[] => {
-  if (Array.isArray(resp)) return resp;
-  if (!resp || typeof resp !== "object") return [];
-  const r = resp as Record<string, unknown>;
-  for (const k of ["list", "items", "results", "work_items", "workItems"]) {
-    if (Array.isArray(r[k])) return r[k] as unknown[];
-  }
-  if (r.data !== undefined) return extractItems(r.data);
-  return [];
-};
-
-// ---------- 业务查询（mywork 已退役、V0.14.1 看板换 workhour list-schedule） ----------
+// ---------- 业务查询（看板主源：workhour list-schedule） ----------
 
 /** 工作项详情（预览页 / 任务详情融合用；默认字段已含 description） */
 // 成功结果进程内缓存：同一 story 反复起 agent 时 resolveUserIdentity 不重付 CLI
@@ -445,7 +336,8 @@ export const fetchMyIdentity = async (): Promise<MeegleIdentity | null> => {
  * 未设 / 坏值 → null（不注入角色段）。
  */
 const readUserRoleLabel = async (): Promise<string | null> => {
-  const settings = await readSettingsFile();
+  const result = await readSettingsFile();
+  const settings = result.status === "ok" ? result.settings : null;
   const raw = settings?.userRole;
   if (typeof raw !== "string" || !USER_ROLES.includes(raw as UserRole)) {
     return null;
@@ -524,129 +416,156 @@ export const resolveUserIdentityForPrompt = async (): Promise<string> => {
   return formatUserIdentityLine(name, roleLabel);
 };
 
-// ---------- 节点排期（甘特展开细节 + 需求级跨度聚合） ----------
+// ---------- 节点 / 子任务类型（fetchUserSchedule 展开细节用） ----------
 
-/** 节点下的子任务（甘特展开的最细粒度、用户要看的「具体任务」） */
+/** 节点下的子任务（甘特展开的最细粒度） */
 export interface WorkitemSubTask {
   name: string;
   start?: number;
   end?: number;
   finished?: boolean;
-  /** 负责人 user_key 列表（owner 字段是 JSON 字符串 `[{"username":"<user_key>"}]`、实测） */
+  /** 负责人 user_key 列表 */
   owners?: string[];
 }
 
 /** 工作项的单个节点排期（甘特展开行用） */
 export interface WorkitemNode {
   name: string;
-  /** not_started / doing / done 等（CLI basic.status 原样） */
+  /** not_started / doing / done / finished 等（CLI basic.status 原样） */
   status?: string;
   start?: number;
   end?: number;
-  /** 节点下子任务（--need-sub-task true、实测字段 sub_task_name + ISO 日期 + is_finished） */
   subTasks: WorkitemSubTask[];
 }
 
-// 节点排期缓存：49 个工作项逐个调 CLI 太贵（每次 ~1s）、10 分钟内复用
-const nodesCache = new Map<string, { at: number; nodes: WorkitemNode[] }>();
-const NODES_TTL_MS = 10 * 60 * 1000;
+// ---------- 节点状态（提测收件箱 / workflow get-node） ----------
 
 /**
- * 拉工作项的全部节点排期（workflow get-node --node-id-list '["_all"]'、实测结构：
- * list[].basic.{name,node_key,status} + schedule.{estimate_start_time,estimate_finish_time}）。
- * 失败返回空数组（甘特降级为只显示 mywork 的当前节点排期）。
+ * 拉工作项全部节点（workflow get-node --node-id-list '["_all"]'）。
+ * 实测结构：`{ list: [{ basic: { name, status, node_key }, ... }], pagination }`；
+ * 节点常 >20 个，带 `--auto-paginate`。失败抛 MeegleError（调用方按项跳过）。
  */
 export const fetchWorkitemNodes = async (
   workItemId: string,
   projectKey?: string,
-  opts: { skipCache?: boolean } = {},
-): Promise<WorkitemNode[]> => {
-  const cacheKey = `${projectKey ?? ""}:${workItemId}`;
-  if (!opts.skipCache) {
-    const hit = nodesCache.get(cacheKey);
-    if (hit && Date.now() - hit.at < NODES_TTL_MS) return hit.nodes;
+): Promise<Array<{ name: string; status?: string }>> => {
+  const args = [
+    "workflow",
+    "get-node",
+    "--work-item-id",
+    workItemId,
+    "--node-id-list",
+    '["_all"]',
+    "--auto-paginate",
+  ];
+  if (projectKey) args.push("--project-key", projectKey);
+  const resp = await runMeegle(args);
+  const nodes: Array<{ name: string; status?: string }> = [];
+  for (const raw of extractListItems(resp)) {
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    const basic =
+      m.basic && typeof m.basic === "object"
+        ? (m.basic as Record<string, unknown>)
+        : m;
+    const name = asStr(basic.name);
+    if (!name) continue;
+    nodes.push({ name, status: asStr(basic.status) });
   }
-  try {
-    const args = [
-      "workflow",
-      "get-node",
-      "--work-item-id",
-      workItemId,
-      "--node-id-list",
-      '["_all"]',
-      "--need-sub-task",
-      "true",
-    ];
-    if (projectKey) args.push("--project-key", projectKey);
-    const resp = await runMeegle(args);
-    const nodes: WorkitemNode[] = [];
-    for (const raw of extractItems(resp)) {
-      if (!raw || typeof raw !== "object") continue;
-      const m = raw as Record<string, unknown>;
-      const basic =
-        m.basic && typeof m.basic === "object"
-          ? (m.basic as Record<string, unknown>)
-          : m;
-      const name = asStr(basic.name);
-      if (!name) continue;
-      let start: number | undefined;
-      let end: number | undefined;
-      if (m.schedule && typeof m.schedule === "object") {
-        const s = m.schedule as Record<string, unknown>;
-        start = asDateMs(s.estimate_start_time);
-        end = asDateMs(s.estimate_finish_time);
-      }
-      // 子任务（实测：sub_task_name + estimate_start/end_date 为 ISO 字符串 + is_finished）
-      const subTasks: WorkitemSubTask[] = [];
-      if (Array.isArray(m.sub_tasks)) {
-        for (const rawSub of m.sub_tasks as Array<Record<string, unknown>>) {
-          const subName = asStr(rawSub.sub_task_name ?? rawSub.name);
-          if (!subName) continue;
-          // owner 是 JSON 字符串（[{"username":"<user_key>"}]、实测）——解出 user_key 列表
-          let owners: string[] | undefined;
-          if (typeof rawSub.owner === "string" && rawSub.owner.trim()) {
-            try {
-              const arr = JSON.parse(rawSub.owner) as Array<{ username?: string }>;
-              owners = arr.map((o) => o.username).filter((v): v is string => !!v);
-            } catch {
-              /* owner 格式变了就不过滤 */
-            }
-          }
-          subTasks.push({
-            name: subName,
-            start: asDateMs(rawSub.estimate_start_date),
-            end: asDateMs(rawSub.estimate_end_date),
-            finished: rawSub.is_finished === true,
-            owners,
-          });
-        }
-      }
-      nodes.push({ name, status: asStr(basic.status), start, end, subTasks });
-    }
-    nodesCache.set(cacheKey, { at: Date.now(), nodes });
-    return nodes;
-  } catch {
-    return [];
-  }
+  return nodes;
 };
 
-/** 并发拉多个工作项的节点排期（限并发、看板聚合需求级跨度用） */
-export const fetchNodesForItems = async (
-  items: Array<{ id: string; projectKey?: string }>,
-  opts: { skipCache?: boolean } = {},
-): Promise<Map<string, WorkitemNode[]>> => {
-  const out = new Map<string, WorkitemNode[]>();
-  const CONCURRENCY = 8;
-  let idx = 0;
-  const workers = Array.from({ length: Math.min(CONCURRENCY, items.length) }, async () => {
-    while (idx < items.length) {
-      const cur = items[idx++];
-      const nodes = await fetchWorkitemNodes(cur.id, cur.projectKey, opts);
-      out.set(cur.id, nodes);
-    }
-  });
-  await Promise.all(workers);
+/** 工作项评论（提测收件箱挖 MR 链接用） */
+export interface WorkitemComment {
+  id?: string;
+  content: string;
+  /** 创建时间 ms（解析失败 0） */
+  createdAtMs: number;
+}
+
+/**
+ * 拉工作项评论列表（comment list）。
+ * 实测结构：`{ comments: [{ comment_id, content, created_at, creator, file_url }] }`——
+ * 字段名无公开 schema，按多候选 key 容错（id / comment_id / content / created_at …）。
+ */
+export const fetchWorkitemComments = async (
+  workItemId: string,
+  projectKey: string,
+): Promise<WorkitemComment[]> => {
+  const resp = await runMeegle([
+    "comment",
+    "list",
+    "--work-item-id",
+    workItemId,
+    "--project-key",
+    projectKey,
+    "--auto-paginate",
+  ]);
+  const out: WorkitemComment[] = [];
+  for (const raw of extractCommentItems(resp)) {
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    const content =
+      asStr(m.content) ?? asStr(m.text) ?? asStr(m.body) ?? asStr(m.comment);
+    if (!content) continue;
+    const id =
+      asStr(m.comment_id) ??
+      asStr(m.commentId) ??
+      asStr(m.id) ??
+      (typeof m.comment_id === "number" ? String(m.comment_id) : undefined) ??
+      (typeof m.id === "number" ? String(m.id) : undefined);
+    const createdAtMs =
+      parseCommentTimeMs(m.created_at) ??
+      parseCommentTimeMs(m.createdAt) ??
+      parseCommentTimeMs(m.create_time) ??
+      parseCommentTimeMs(m.created_time) ??
+      0;
+    out.push({ id, content, createdAtMs });
+  }
   return out;
+};
+
+/** 从 get-node / 通用 list 响应挖数组
+ *（transition：list-state-transitions 实测顶层是 `{ state_key, transition: [...] }`——
+ * 2026-07-14 踩过：不认这个键 → 恒空数组 → 收件箱回归通过/打回永远「无法流转」） */
+const extractListItems = (resp: unknown): unknown[] => {
+  if (Array.isArray(resp)) return resp;
+  if (!resp || typeof resp !== "object") return [];
+  const r = resp as Record<string, unknown>;
+  for (const k of ["list", "items", "results", "nodes", "transition", "data"]) {
+    if (Array.isArray(r[k])) return r[k] as unknown[];
+  }
+  if (r.data !== undefined) return extractListItems(r.data);
+  return [];
+};
+
+/** 从 comment list 响应挖评论数组 */
+const extractCommentItems = (resp: unknown): unknown[] => {
+  if (Array.isArray(resp)) return resp;
+  if (!resp || typeof resp !== "object") return [];
+  const r = resp as Record<string, unknown>;
+  for (const k of ["comments", "list", "items", "results", "data"]) {
+    if (Array.isArray(r[k])) return r[k] as unknown[];
+  }
+  if (r.data !== undefined) return extractCommentItems(r.data);
+  return [];
+};
+
+/** 评论时间：毫秒戳 / 秒戳 / "2026-06-25 16:02:33" */
+const parseCommentTimeMs = (v: unknown): number | undefined => {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+    // 10 位当秒、13 位当毫秒
+    return v < 1e12 ? v * 1000 : v;
+  }
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) {
+      return n < 1e12 ? n * 1000 : n;
+    }
+    const t = Date.parse(v.includes("T") ? v : v.replace(" ", "T"));
+    if (Number.isFinite(t) && t > 0) return t;
+  }
+  return undefined;
 };
 
 // ---------- 人员排期（V0.14.1 起看板主数据源、飞书「人员排期」视图同款接口） ----------
@@ -838,4 +757,286 @@ export const decodeWorkitemUrl = async (
   } catch {
     return null;
   }
+};
+
+// ---------- bug 收件箱：MQL 查询 / 状态流转 / 评论 ----------
+
+/**
+ * MQL 批量查工作项（必须走 -P 传 JSON——`--set` 会因 MQL 含 `=` 被拒）。
+ * 返回原始 JSON（调用方用 parseMoqlBugQueryResponse 归一）。
+ */
+export const queryWorkitemsByMql = async (
+  projectKey: string,
+  mql: string,
+): Promise<unknown> =>
+  runMeegle([
+    "workitem",
+    "query",
+    "--project-key",
+    projectKey,
+    "-P",
+    JSON.stringify({ mql }),
+  ]);
+
+/** bug 简要字段（避开 `--fields _all` 的服务端序列化错） */
+export interface BugBrief {
+  name: string;
+  statusKey?: string;
+  statusLabel?: string;
+  priorityLabel?: string;
+  description?: string;
+  relatedStoryId?: string;
+  relatedStoryName?: string;
+}
+
+/**
+ * 拉单条 bug 详情（name / status / priority / description / 关联产品需求）。
+ * fields 显式列、不用 `_all`。
+ */
+export const fetchBugBrief = async (
+  projectKey: string,
+  workItemId: string,
+): Promise<BugBrief> => {
+  const resp = (await runMeegle([
+    "workitem",
+    "get",
+    "--project-key",
+    projectKey,
+    "--work-item-id",
+    workItemId,
+    "--fields",
+    "name,work_item_status,priority,description,field_cf759f",
+  ])) as Record<string, unknown>;
+
+  // 响应可能是扁平字段、也可能包在 fields / data 里——多形态容错
+  const flat = flattenWorkitemFields(resp);
+  const name =
+    asStr(flat.name) ?? asStr(flat.work_item_name) ?? asStr(resp.name) ?? workItemId;
+  const status = pickNestedKeyLabel(flat.work_item_status ?? flat.status);
+  const priority = pickNestedKeyLabel(flat.priority);
+  const related = pickNestedKeyLabel(flat.field_cf759f);
+  const description =
+    asStr(flat.description) ??
+    (typeof flat.description === "object" && flat.description
+      ? asStr((flat.description as Record<string, unknown>).doc_text) ??
+        asStr((flat.description as Record<string, unknown>).text)
+      : undefined);
+
+  return {
+    name,
+    statusKey: status?.key,
+    statusLabel: status?.label,
+    priorityLabel: priority?.label ?? priority?.key,
+    description,
+    relatedStoryId: related?.key,
+    relatedStoryName: related?.label,
+  };
+};
+
+/** 把 workitem get 响应摊成 field_key → value 的扁平 map。
+ * 实测（2026-07-14）响应形状：`{ work_item_attribute: { work_item_name,
+ * work_item_status, ... }, work_item_fields: [{ key, name, value }] }`——
+ * 旧代码只认 fields / data 包裹、导致 name 回落成 id、状态/优先级全丢。 */
+const flattenWorkitemFields = (resp: unknown): Record<string, unknown> => {
+  const out: Record<string, unknown> = {};
+  if (!resp || typeof resp !== "object") return out;
+  const r = resp as Record<string, unknown>;
+  // 顶层直接是字段
+  for (const [k, v] of Object.entries(r)) {
+    if (
+      k === "fields" ||
+      k === "data" ||
+      k === "list" ||
+      k === "work_item_attribute" ||
+      k === "work_item_fields"
+    ) {
+      continue;
+    }
+    out[k] = v;
+  }
+  // work_item_attribute：系统属性（work_item_name / work_item_status …）直接摊平
+  if (r.work_item_attribute && typeof r.work_item_attribute === "object") {
+    Object.assign(out, r.work_item_attribute as Record<string, unknown>);
+  }
+  const flattenFieldArray = (arr: unknown[]): void => {
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const m = item as Record<string, unknown>;
+      const key = asStr(m.field_key) ?? asStr(m.key) ?? asStr(m.name);
+      if (key) out[key] = m.field_value ?? m.value ?? m;
+    }
+  };
+  if (Array.isArray(r.work_item_fields)) {
+    flattenFieldArray(r.work_item_fields);
+  }
+  const nest = r.fields ?? r.data;
+  if (Array.isArray(nest)) {
+    flattenFieldArray(nest);
+  } else if (nest && typeof nest === "object") {
+    Object.assign(out, nest as Record<string, unknown>);
+  }
+  return out;
+};
+
+const pickNestedKeyLabel = (
+  v: unknown,
+): { key?: string; label?: string } | undefined => {
+  if (!v || typeof v !== "object") {
+    if (typeof v === "string") return { label: v };
+    return undefined;
+  }
+  // 多值字段（如关联产品需求）可能是 [{key,label}] 数组——取首个
+  if (Array.isArray(v)) {
+    return v.length > 0 ? pickNestedKeyLabel(v[0]) : undefined;
+  }
+  const o = v as Record<string, unknown>;
+  // 有的形态是 { field_value: { key, label } }
+  const inner =
+    o.field_value && typeof o.field_value === "object"
+      ? (o.field_value as Record<string, unknown>)
+      : o;
+  // id：关联工作项实测形状 [{ id, name }]（workitem get 的 field_cf759f）
+  const key = asStr(inner.key) ?? asStr(inner.value) ?? asStr(inner.id);
+  const label =
+    asStr(inner.label) ?? asStr(inner.name) ?? asStr(inner.cn_name);
+  if (!key && !label) return undefined;
+  return { key, label };
+};
+
+/** 状态流转可选项（list-state-transitions） */
+export interface StateTransitionOption {
+  transitionId: string;
+  /** 目标状态 key（如 BBteJzss3） */
+  targetStateKey?: string;
+  /** 目标状态 label（如 CLOSED） */
+  targetStateLabel?: string;
+  name?: string;
+}
+
+/**
+ * 查 bug 当前可流转项。
+ * work-item-type 固定 `bug`；user-key 用当前登录人。
+ */
+export const listBugStateTransitions = async (
+  projectKey: string,
+  workItemId: string,
+  userKey: string,
+): Promise<StateTransitionOption[]> => {
+  const resp = await runMeegle([
+    "workflow",
+    "list-state-transitions",
+    "--project-key",
+    projectKey,
+    "--work-item-id",
+    workItemId,
+    "--work-item-type",
+    "bug",
+    "--user-key",
+    userKey,
+  ]);
+  const items = extractListItems(resp);
+  const out: StateTransitionOption[] = [];
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    const transitionId =
+      asStr(m.transition_id) ??
+      asStr(m.transitionId) ??
+      asStr(m.id) ??
+      (typeof m.transition_id === "number" ? String(m.transition_id) : undefined);
+    if (!transitionId) continue;
+    // 目标状态可能在 state / target_state / destination 等嵌套里
+    const target =
+      pickNestedKeyLabel(m.state) ??
+      pickNestedKeyLabel(m.target_state) ??
+      pickNestedKeyLabel(m.targetState) ??
+      pickNestedKeyLabel(m.destination) ??
+      pickNestedKeyLabel(m.to_state);
+    out.push({
+      transitionId,
+      targetStateKey: target?.key ?? asStr(m.state_key) ?? asStr(m.stateKey),
+      targetStateLabel: target?.label ?? asStr(m.state_name) ?? asStr(m.name),
+      name: asStr(m.name) ?? asStr(m.transition_name),
+    });
+  }
+  return out;
+};
+
+/** 状态流转必填字段（未覆盖则应降级跳飞书） */
+export interface StateRequiredField {
+  fieldKey: string;
+  fieldName?: string;
+}
+
+/**
+ * 查流转到某 state 的必填字段。
+ * mode=unfinished 只看未填完的——有返回就说明 app 表单盖不住、该去飞书。
+ */
+export const listBugStateRequired = async (
+  projectKey: string,
+  workItemId: string,
+  stateKey: string,
+): Promise<StateRequiredField[]> => {
+  const resp = await runMeegle([
+    "workflow",
+    "list-state-required",
+    "--project-key",
+    projectKey,
+    "--work-item-id",
+    workItemId,
+    "--state-key",
+    stateKey,
+    "--mode",
+    "unfinished",
+  ]);
+  const items = extractListItems(resp);
+  const out: StateRequiredField[] = [];
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    const fieldKey =
+      asStr(m.field_key) ?? asStr(m.fieldKey) ?? asStr(m.key);
+    if (!fieldKey) continue;
+    out.push({
+      fieldKey,
+      fieldName: asStr(m.field_name) ?? asStr(m.name) ?? asStr(m.label),
+    });
+  }
+  return out;
+};
+
+/** 执行状态流转（transition-id 来自 list-state-transitions） */
+export const transitionBugState = async (
+  projectKey: string,
+  workItemId: string,
+  transitionId: string,
+): Promise<void> => {
+  await runMeegle([
+    "workflow",
+    "transition-state",
+    "--project-key",
+    projectKey,
+    "--work-item-id",
+    workItemId,
+    "--transition-id",
+    transitionId,
+  ]);
+};
+
+/** 给工作项加 markdown 评论 */
+export const addWorkitemComment = async (
+  projectKey: string,
+  workItemId: string,
+  content: string,
+): Promise<void> => {
+  await runMeegle([
+    "comment",
+    "add",
+    "--project-key",
+    projectKey,
+    "--work-item-id",
+    workItemId,
+    "--content",
+    content,
+  ]);
 };

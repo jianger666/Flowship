@@ -30,7 +30,6 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   thinking: "思考",
   action_start: "Action 启动",
   action_ack: "Action 确认",
-  action_failed: "Action 失败",
   tool_call: "工具调用",
   user_reply: "用户回复",
   assistant_message: "AI 回复",
@@ -45,8 +44,6 @@ export const renderEventIcon = (kind: EventKind) => {
       return <Sparkles className="size-4 text-primary" />;
     case "action_ack":
       return <CheckCircle2 className="size-4 text-emerald-500" />;
-    case "action_failed":
-      return <CircleAlert className="size-4 text-destructive" />;
     case "tool_call":
       return <ArrowUpRight className="size-4 text-blue-500" />;
     case "thinking":
@@ -116,7 +113,6 @@ export const mergeAdjacentThinking = (events: TaskEvent[]): TaskEvent[] => {
 // **注意**：这只决定「初始 collapsed state」、不决定可不可折叠——所有事件都可手动折叠 / 展开
 export const DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set([
   "action_ack",
-  "action_failed",
   "assistant_message",
   "ask_user_reply",
   "error",

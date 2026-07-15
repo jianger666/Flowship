@@ -9,11 +9,11 @@
  *
  * 返回值约定：
  * - settings：当前编辑中的草稿、UI 双向绑定
- * - savedSettings：已写到 localStorage 的版本、只读
+ * - savedSettings：已写入 config.json 的版本、只读
  * - dirty：各字段的 dirty map（缓存计算结果、不要每次 render 重算）
  * - hasUnsaved：dirty 任一为 true（用于离页提示）
  * - update / saveFieldValue：更新草稿（文本框输入用）/ 落盘某字段（编辑即保存）
- * - loaded：是否完成首次 localStorage 加载（避免 SSR/hydrate 闪空）
+ * - loaded：是否完成首次 config 初始化（避免 SSR/hydrate 闪空）
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -61,7 +61,7 @@ export const repoConfigEquals = (a: RepoConfig, b: RepoConfig): boolean =>
 export const useJumpIde = (): JumpIde => {
   const [ide, setIde] = useState<JumpIde>("cursor");
   useEffect(() => {
-    // 先 await 配置初始化（读 config.json / 首次迁移）、再读；缓存有 localStorage 兜底、init 慢也不空
+    // 先 await 配置初始化（读 config.json）、再读；init 前 cache 是默认值、不空窗
     void initSettings().then(() => setIde(getSettings().jumpIde ?? "cursor"));
   }, []);
   return ide;
@@ -95,7 +95,7 @@ export interface UseSettingsResult {
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
-// - apiKey / gitHost / gitToken：字符串直接 ===
+// - apiKey / gitToken：字符串直接 ===
 // - defaultModel：嵌套对象、id + params 数组按位比较
 // - repos：数组、长度 + 每项 path/name 比较
 const isFieldEqual = (
@@ -105,7 +105,6 @@ const isFieldEqual = (
 ): boolean => {
   if (
     key === "apiKey" ||
-    key === "gitHost" ||
     key === "gitToken" ||
     key === "branchTemplate" ||
     key === "jumpIde" ||
@@ -114,6 +113,16 @@ const isFieldEqual = (
     key === "userRole"
   ) {
     return (a[key] ?? "") === (b[key] ?? "");
+  }
+  if (key === "meegleProject") {
+    // 默认飞书空间：比 key/name/simpleName（缺省视同空串）
+    const ax = a.meegleProject;
+    const bx = b.meegleProject;
+    return (
+      (ax?.key ?? "") === (bx?.key ?? "") &&
+      (ax?.name ?? "") === (bx?.name ?? "") &&
+      (ax?.simpleName ?? "") === (bx?.simpleName ?? "")
+    );
   }
   if (key === "repos") {
     // CR-09：完整比较 RepoConfig 全部持久字段（稳定序列化、undefined 归一空串）——
@@ -167,13 +176,13 @@ export const useSettings = (): UseSettingsResult => {
   // 当前编辑中的设置快照（草稿）、可能跟磁盘上不同
   const [settings, setSettings] = useState<FeAiFlowSettings>(DEFAULT_SETTINGS);
 
-  // 已经写到 localStorage 的快照（已保存版本）、和草稿对比算 dirty
+  // 已经写入 config.json 的快照（已保存版本）、和草稿对比算 dirty
   const [savedSettings, setSavedSettings] = useState<FeAiFlowSettings>(DEFAULT_SETTINGS);
 
-  // 是否已从 localStorage 读到初值；防止 SSR 渲染时闪现空表单
+  // 是否已从 config 初始化灌过初值；防止 SSR 渲染时闪现空表单
   const [loaded, setLoaded] = useState(false);
 
-  // 首次挂载：先 await 配置初始化（读 config.json / 首次从 localStorage 迁移）、再灌进草稿态
+  // 首次挂载：先 await 配置初始化（读 config.json）、再灌进草稿态
   useEffect(() => {
     let alive = true;
     void initSettings().then(() => {
@@ -199,7 +208,6 @@ export const useSettings = (): UseSettingsResult => {
       submitShortcut: !isFieldEqual("submitShortcut", settings, savedSettings),
       userRole: !isFieldEqual("userRole", settings, savedSettings),
       branchTemplate: !isFieldEqual("branchTemplate", settings, savedSettings),
-      gitHost: !isFieldEqual("gitHost", settings, savedSettings),
       gitToken: !isFieldEqual("gitToken", settings, savedSettings),
       disabledMcpServers: !isFieldEqual(
         "disabledMcpServers",
@@ -222,6 +230,7 @@ export const useSettings = (): UseSettingsResult => {
       disabledRules: !isFieldEqual("disabledRules", settings, savedSettings),
       // 模型使用计数：非设置页字段（recordModelUsage 直写）、恒不 dirty
       modelUsage: false,
+      meegleProject: !isFieldEqual("meegleProject", settings, savedSettings),
     }),
     [settings, savedSettings]
   );
@@ -231,7 +240,7 @@ export const useSettings = (): UseSettingsResult => {
     [dirty]
   );
 
-  // 通用字段更新工具：只改草稿、不写 localStorage
+  // 通用字段更新工具：只改草稿、不写 config.json
   const update = <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K]

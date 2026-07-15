@@ -365,16 +365,24 @@ export const StorageCard = () => {
                         <span className="min-w-0 flex-1 truncate text-sm" title={e.title}>
                           {e.title}
                         </span>
-                        <Badge variant="outline" className="shrink-0 text-[10px]">
-                          {e.mode === "chat" ? "对话" : REPO_STATUS_LABEL[e.repoStatus]}
-                        </Badge>
+                        {/* 定宽容器：Badge 本身随 2–3 字变宽，包一层让行间列对齐 */}
+                        <span className="flex w-14 shrink-0 justify-center">
+                          <Badge variant="outline" className="text-[10px]">
+                            {e.mode === "chat" ? "对话" : REPO_STATUS_LABEL[e.repoStatus]}
+                          </Badge>
+                        </span>
                         <span className="w-20 shrink-0 text-right text-xs text-muted-foreground">
                           {e.updatedAt > 0 ? formatRelative(e.updatedAt) : "—"}
                         </span>
-                        <span className="w-44 shrink-0 text-right font-mono text-xs leading-snug">
-                          <span className="block">{entrySizeMain(e.bytes, e.worktreeBytes)}</span>
+                        {/* w-52 定宽 + nowrap：列对齐，且最宽明细「任务数据 … + 工作区 …」不换行 */}
+                        <span className="w-52 shrink-0 text-right font-mono text-xs leading-snug whitespace-nowrap">
+                          <span className="block whitespace-nowrap">
+                            {entrySizeMain(e.bytes, e.worktreeBytes)}
+                          </span>
                           {sizeSub && (
-                            <span className="block text-[10px] text-muted-foreground">{sizeSub}</span>
+                            <span className="block whitespace-nowrap text-[10px] text-muted-foreground">
+                              {sizeSub}
+                            </span>
                           )}
                         </span>
                       </label>
@@ -413,7 +421,8 @@ export const StorageCard = () => {
                         <span className="min-w-0 flex-1 truncate font-mono text-sm" title={s.id}>
                           {s.id}
                         </span>
-                        <span className="w-16 shrink-0 text-right font-mono text-xs">
+                        {/* 单行体积、无明细，窄定宽即可对齐 */}
+                        <span className="w-24 shrink-0 whitespace-nowrap text-right font-mono text-xs">
                           {formatBytes(s.bytes)}
                         </span>
                       </label>

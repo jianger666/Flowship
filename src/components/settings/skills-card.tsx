@@ -52,6 +52,10 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { useDialog } from "@/hooks/use-dialog";
+import {
+  deleteCustomActionReq,
+  fetchCustomActions,
+} from "@/lib/custom-action-client";
 import { getSettings, initSettings, saveSettings } from "@/lib/local-store";
 import { setPendingSlashSkill } from "@/components/slash-skills";
 import { createTask } from "@/lib/task-store";
@@ -216,15 +220,42 @@ export const SkillsCard = () => {
     setViewing({ name, content });
   };
 
+  // 删 skill 前查挂载的 custom action；有挂载则二次确认里说明会一并删（2026-07-15 用户拍板）
   const handleDelete = async (name: string) => {
+    // 拉取失败当没有挂载、走原确认文案——别把删除堵死
+    let mounted: Array<{ id: string; label: string }> = [];
+    try {
+      const defs = await fetchCustomActions();
+      mounted = defs
+        .filter((d) => d.skill === name)
+        .map((d) => ({ id: d.id, label: d.label }));
+    } catch {
+      // ignore
+    }
+    const description =
+      mounted.length > 0
+        ? `有 ${mounted.length} 个 action 挂载此 skill、将一并删除：${mounted
+            .map((a) => `「${a.label}」`)
+            .join("、")}`
+        : "整个 skill 目录（含附属脚本）会被删除";
     const ok = await confirm({
       title: `删除 skill「${name}」？`,
-      description: "整个 skill 目录（含附属脚本）会被删除",
+      description,
       destructive: true,
       confirmLabel: "删除",
     });
     if (!ok) return;
     try {
+      // 先逐个删挂载 action（单个失败 toast 后继续）、再删 skill
+      for (const action of mounted) {
+        try {
+          await deleteCustomActionReq(action.id);
+        } catch (err) {
+          toast.error(
+            `删除 action「${action.label}」失败：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       const res = await fetch(`/api/skills?name=${encodeURIComponent(name)}`, {
         method: "DELETE",
       });

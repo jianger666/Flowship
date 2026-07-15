@@ -45,6 +45,10 @@ import {
   resumeCurrentActionWithMessage,
   supersedePendingAsks,
 } from "@/lib/server/task-runner";
+import {
+  deliverChatAskReply,
+  hasChatSession,
+} from "@/lib/server/chat-runner";
 import { agentSessions, publishTaskStreamEvent } from "@/lib/server/task-stream";
 import {
   errorResponse,
@@ -76,7 +80,6 @@ interface PostBody {
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
-    gitHost?: string;
     gitToken?: string;
   };
 }
@@ -129,7 +132,7 @@ const buildReplyText = (
       "[ASK_USER_REPLY deferred]",
       "",
       "用户选择**稍后再补充**、未提供任何答案。",
-      "请按你判断的合理 default 推进、并把以下问题完整列入 artifact「§6 待澄清 / 不确定项」段、提示用户后续在输入条或上下文文档里补充。",
+      "请按你判断的合理 default 推进；若有文档产出、把以下问题列入「待澄清 / 不确定项」、对话场景则自行记住即可。",
       "**不要**再就这同一组问题重新调 ask_user——用户已明示稍后补、再问就是冒犯。",
       "",
       "未答问题清单：",
@@ -148,7 +151,8 @@ const buildReplyText = (
     // 图-only（只贴图没填字）兜底成「见本题附图」、纯没答兜「未回答」
     const ansText =
       rawText.length > 0 ? rawText : imgs.length > 0 ? "（见本题附图）" : "（未回答）";
-    sections.push("", `Q${idx + 1}: ${q.question}`, `A: ${ansText}`);
+    // 「答：」不用「A:」——自定义作答时 A: 会被误读成选项 A（用户实测指出）
+    sections.push("", `Q${idx + 1}: ${q.question}`, `答：${ansText}`);
     if (imgs.length > 0) {
       const names = imgs.map((s) => path.basename(s.absPath)).join("、");
       sections.push(`   本题附图：${names}`);
@@ -315,19 +319,35 @@ export const POST = async (req: Request, { params }: Ctx) => {
   };
 
   // 会话已死时的唤醒兜底（V0.14.x + 网断僵尸态）：落 ask_user_reply + 起新 agent 接手
+  // chat / task 分叉：chat 走 deliverChatAskReply（绝不能 resumeCurrentActionWithMessage）
+  const isChat = task.mode === "chat";
+  const parseBootArgs = (): {
+    apiKey?: string;
+    model?: { id: string; params?: Array<{ id: string; value: string }> };
+    gitToken?: string;
+  } => ({
+    apiKey: body.bootArgs?.apiKey?.trim() || undefined,
+    model:
+      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
+        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
+        : undefined,
+    gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+  });
+
   const wakeWithAnswer = async (
     replyText: string,
     allSaved: ImageAttachmentSaved[],
     allAbsPaths: string[],
     reason: string,
   ): Promise<Response | null> => {
-    const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
-    const model =
-      body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
-        ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
-        : undefined;
-    const currentAction = task.actions.find((a) => a.id === task.currentActionId);
-    if (!currentAction || !apiKey || !model) return null;
+    const boot = parseBootArgs();
+    // task 唤醒需要 currentAction；chat 只要有 apiKey+model 就能起新会话
+    if (isChat) {
+      if (!boot.apiKey || !boot.model) return null;
+    } else {
+      const currentAction = task.actions.find((a) => a.id === task.currentActionId);
+      if (!currentAction || !boot.apiKey || !boot.model) return null;
+    }
 
     clearPendingAsk(task.id);
     const replyEv = await appendEvent(task.id, {
@@ -343,25 +363,41 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
     if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
     console.log(
-      `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（新 agent 接手、答案随消息带过去）`,
+      `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（${isChat ? "chat 新会话" : "新 agent"}接手、答案随消息带过去）`,
     );
-    void resumeCurrentActionWithMessage({
-      task,
-      userMessage: replyText,
-      imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
-      apiKey,
-      fallbackModel: model,
-      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
-      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-    }).catch(async (err) => {
-      console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
-      const ev = await appendEvent(task.id, {
-        kind: "error",
-        actionId: reqEvent.actionId,
-        text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+
+    if (isChat) {
+      void deliverChatAskReply(
+        task,
+        replyText,
+        allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        boot,
+      ).catch(async (err) => {
+        console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
+        const ev = await appendEvent(task.id, {
+          kind: "error",
+          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
+        });
+        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
       });
-      if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
-    });
+    } else {
+      void resumeCurrentActionWithMessage({
+        task,
+        userMessage: replyText,
+        imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        apiKey: boot.apiKey!,
+        fallbackModel: boot.model!,
+        gitToken: boot.gitToken,
+      }).catch(async (err) => {
+        console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
+        const ev = await appendEvent(task.id, {
+          kind: "error",
+          actionId: reqEvent.actionId,
+          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+        });
+        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
+      });
+    }
     const fresh = await getTask(task.id);
     return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
       status: 200,
@@ -376,10 +412,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 交卷后 run 自然结束、agent 空闲等用户是健康态）——都**不是僵尸、不能误杀任务**
     // （同事踩坑：答旧弹窗把还在跑的任务打成 error +「Agent 已断开」+ 关流）。
     // 只补一条作废标记把这条旧弹窗关掉、409 温和提示。
+    // chat 看 runningChats、task 看 agentSessions。
+    const sessionAlive = isChat
+      ? hasChatSession(task.id)
+      : agentSessions.has(task.id);
     if (
       getPendingAsk(task.id) ||
       fresh.runStatus === "running" ||
-      agentSessions.has(task.id)
+      sessionAlive
     ) {
       console.log(
         `[ask-reply] task=${task.id} askId=${askId} 提问已失效（被顶替 / agent 在跑、runStatus=${fresh.runStatus}）、作废旧弹窗`,
@@ -416,7 +456,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
       const errorEvent = await appendEvent(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
-        text: "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
+        text: isChat
+          ? "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可继续。"
+          : "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
       });
       if (errorEvent) {
         publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
@@ -431,7 +473,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
         });
       }
       return errorResponse(
-        "agent 已断开——在底部输入条说句话即可唤醒，或重新「推进」",
+        isChat
+          ? "agent 已断开——在底部输入条说句话即可继续"
+          : "agent 已断开——在底部输入条说句话即可唤醒，或重新「推进」",
         410,
       );
     }
@@ -452,21 +496,22 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // V0.11：`agent.send` 送达答案——成功了才写「已答」事件 + publish（顺序关键：先送再落
   // 事件、失败不写、防「用户看到已答、agent 没收到」的假已答）。send 成功即清 pendingAsk。
-  const ok = await deliverAskReply(
-    task,
-    replyText,
-    allAbsPaths.length > 0 ? allAbsPaths : undefined,
-    reqEvent.actionId,
-    {
-      apiKey: body.bootArgs?.apiKey?.trim() || undefined,
-      model:
-        body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
-          ? { id: body.bootArgs.model.id, params: body.bootArgs.model.params }
-          : undefined,
-      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
-      gitToken: body.bootArgs?.gitToken?.trim() || undefined,
-    },
-  );
+  // chat → deliverChatAskReply（runningChats）；task → deliverAskReply（agentSessions）
+  const boot = parseBootArgs();
+  const ok = isChat
+    ? await deliverChatAskReply(
+        task,
+        replyText,
+        allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        boot,
+      )
+    : await deliverAskReply(
+        task,
+        replyText,
+        allAbsPaths.length > 0 ? allAbsPaths : undefined,
+        reqEvent.actionId,
+        boot,
+      );
   if (!ok) {
     // V0.14.x（用户点名「AI 断开时提问没法提交」）：会话死不再丢答案 + 报错让用户
     // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去。
@@ -477,11 +522,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
       "会话已死",
     );
     if (woken) return woken;
-    // 没凭据 / 没有当前 action（极端）：维持原作废 + 报错兜底
+    // 没凭据（极端）：维持原作废 + 报错兜底
     await supersedePendingAsks(task.id, "会话已失效");
     clearPendingAsk(task.id);
     return errorResponse(
-      "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
+      isChat
+        ? "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话即可继续"
+        : "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
       409,
     );
   }
@@ -504,6 +551,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
   }
 
+  // deliverChatAskReply / deliverAskReply 内部已切 running；再 set 一次幂等、保证 SSE 推到最新
   const updated = await setTaskRunStatus(task.id, "running");
   if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 

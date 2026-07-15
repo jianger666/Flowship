@@ -34,6 +34,7 @@ import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
 import { getSettings } from "@/lib/local-store";
+import { DEFAULT_MEEGLE_PROJECT } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ApiKeySection } from "@/components/settings/api-key-card";
@@ -93,38 +94,9 @@ const SettingsPage = () => {
     validateApiKey(value);
   };
 
-  // GitLab host 自动烘焙（用户拍板「选仓库时就推导、别等推进」）：
-  // 仓库变更时从仓库 origin 推导、静默写进 settings.gitHost（无 UI 字段）——
-  // 推进弹窗 / 服务端直接用现成值、运行时零推导零闪烁。推不出（没配 origin）保持原值、
-  // 服务端起 agent 时仍有兜底推导。
-  // 代次守卫（发版前蓝军 P1）：连续快速改仓库列表时多个 fetch 乱序返回、旧响应可能
-  // 覆盖新 host——只认最后一次发起的请求。
-  const bakeGenRef = useRef(0);
-  const bakeGitHost = useCallback((repoPaths: string[]) => {
-    if (repoPaths.length === 0) return;
-    const gen = ++bakeGenRef.current;
-    const q = encodeURIComponent(repoPaths.join(","));
-    void fetch(`/api/repo-remote-meta?paths=${q}`)
-      .then((r) => r.json())
-      .then((d: { host?: string | null }) => {
-        if (gen !== bakeGenRef.current) return; // 已有更新一次烘焙、本次作废
-        const derived = d.host?.trim();
-        if (derived && derived !== (getSettings().gitHost ?? "").trim()) {
-          saveFieldValue("gitHost", derived);
-        }
-      })
-      .catch(() => {
-        /* 推不出不动原值 */
-      });
-    // saveFieldValue 引用稳定（hook 内定义）、不进 deps 防重建
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // 仓库提交：落盘 + 重新烘焙 host（换仓库 / 加仓库后 host 跟着换）。
-  // 不做「首次加载补烘焙」的老用户兼容——老用户当年都手填过 host、值本来就在（用户拍板）
+  // 仓库提交：只落盘 repos（host 不进 settings、推进 / ship 时按任务仓库 remote 现推）
   const handleReposCommit = (next: typeof settings.repos) => {
     saveFieldValue("repos", next);
-    bakeGitHost(next.map((r) => r.path));
   };
 
   // 桌面端壳注入的版本号（web 版没有、不显示）；useEffect 读防 hydration mismatch
@@ -295,7 +267,10 @@ const SettingsPage = () => {
                 onTokenCommit={(v) => saveFieldValue("gitToken", v)}
               />
               <Separator />
-              <FeishuCliSection />
+              <FeishuCliSection
+                meegleProject={settings.meegleProject ?? { ...DEFAULT_MEEGLE_PROJECT }}
+                onMeegleProjectChange={(v) => saveFieldValue("meegleProject", v)}
+              />
             </CardContent>
           </Card>,
         )}

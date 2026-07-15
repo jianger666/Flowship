@@ -34,7 +34,7 @@ const readSanitizedConfig = async (): Promise<string> => {
     const lines: string[] = [
       `apiKey: ${maskSecret(cfg.apiKey)}`,
       `gitToken: ${maskSecret(cfg.gitToken)}`,
-      `gitHost: ${typeof cfg.gitHost === "string" && cfg.gitHost ? cfg.gitHost : "（空、自动推导）"}`,
+      `gitHost: （不入 settings、按任务仓库 remote 现推）`,
       `jumpIde: ${String(cfg.jumpIde ?? "cursor")}`,
       `defaultModel: ${JSON.stringify(cfg.defaultModel ?? null)}`,
       `repos: ${

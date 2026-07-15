@@ -3,6 +3,7 @@
  *
  * 回归：
  * - pruneIdenticalRevisions：尾部与当前正文相同的快照被清；中间不同的保留
+ * - filterIdenticalTailRevisionsForDisplay：只滤响应不删文件（running 假红点）
  * - snapshotActionArtifact：最新一份已相同则跳过写入
  * - shouldPruneIdenticalRevisionsOnList：running 态闸（route 调 prune 前判定；
  *   prune 本身不感知状态——agent 活跃时 route 跳过 prune，只列不清）
@@ -18,6 +19,7 @@ process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import { taskDir, writeMeta } from "@/lib/server/task-fs-core";
 import {
+  filterIdenticalTailRevisionsForDisplay,
   listActionRevisions,
   pruneIdenticalRevisions,
   shouldPruneIdenticalRevisionsOnList,
@@ -49,7 +51,6 @@ const baseMeta = (revisions: ArtifactRevision[] = []): TaskMetaV06 => ({
   currentActionId: ACTION_ID,
   actions: [baseAction(revisions)],
   mrs: [],
-  role: "fe",
   repoPaths: ["/tmp/fake-repo"],
   createdAt: 1_000,
   updatedAt: 1_000,
@@ -199,6 +200,63 @@ describe("shouldPruneIdenticalRevisionsOnList（running 态不清理闸）", () 
     expect(
       shouldPruneIdenticalRevisionsOnList(idleTask("awaiting_ack"), ACTION_ID),
     ).toBe(true);
+  });
+});
+
+describe("filterIdenticalTailRevisionsForDisplay（展示层滤相同尾部）", () => {
+  it("尾部与当前相同 → 从响应列表剔掉、磁盘文件仍在", async () => {
+    await seed({
+      current: "# 当前方案\n未改\n",
+      revisions: [
+        { timestamp: 100, content: "# 旧方案\n已改过\n" },
+        { timestamp: 200, content: "# 当前方案\n未改\n" },
+        { timestamp: 300, content: "# 当前方案\n未改\n" },
+      ],
+    });
+
+    const listed = await listActionRevisions(TASK_ID, ACTION_ID);
+    const visible = await filterIdenticalTailRevisionsForDisplay(
+      TASK_ID,
+      listed,
+      "# 当前方案\n未改\n",
+    );
+
+    expect(visible.map((r) => r.timestamp)).toEqual([100]);
+    // 展示过滤不删文件
+    expect(await revExists(200)).toBe(true);
+    expect(await revExists(300)).toBe(true);
+  });
+
+  it("最新不同 → 整表原样返回", async () => {
+    await seed({
+      current: "# 新正文\n",
+      revisions: [
+        { timestamp: 100, content: "# 旧\n" },
+        { timestamp: 200, content: "# 中间\n" },
+      ],
+    });
+
+    const listed = await listActionRevisions(TASK_ID, ACTION_ID);
+    const visible = await filterIdenticalTailRevisionsForDisplay(
+      TASK_ID,
+      listed,
+      "# 新正文\n",
+    );
+    expect(visible.map((r) => r.timestamp)).toEqual([100, 200]);
+  });
+
+  it("current 为空 → 原样返回", async () => {
+    await seed({
+      current: "# x\n",
+      revisions: [{ timestamp: 1, content: "# x\n" }],
+    });
+    const listed = await listActionRevisions(TASK_ID, ACTION_ID);
+    const visible = await filterIdenticalTailRevisionsForDisplay(
+      TASK_ID,
+      listed,
+      null,
+    );
+    expect(visible).toEqual(listed);
   });
 });
 

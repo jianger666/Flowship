@@ -45,6 +45,7 @@ import {
   isGitRepoPath,
   isWorktreeTask,
   parseMainGitDirFromPointer,
+  parseOccupyingWorktreePath,
   planWorktreeBranchInfos,
   resolveOriginalRepoPath,
 } from "@/lib/server/task-worktrees";
@@ -60,7 +61,6 @@ const baseTask = (patch: Partial<Task> = {}): Task =>
     id: "t_1700000000000_abc123",
     mode: "task",
     title: "测试需求",
-    role: "fe",
     repoStatus: "developing",
     runStatus: "idle",
     repoPaths: [REPO_WEB],
@@ -417,5 +417,27 @@ describe("parseMainGitDirFromPointer（worktree .git 指针 → 主仓 git dir�
   it("解析不了返 null", () => {
     expect(parseMainGitDirFromPointer("not a pointer")).toBeNull();
     expect(parseMainGitDirFromPointer("gitdir: /plain/repo/.git")).toBeNull();
+  });
+});
+
+describe("parseOccupyingWorktreePath（git worktree add 占用路径）", () => {
+  it("旧文案 already checked out at", () => {
+    expect(
+      parseOccupyingWorktreePath(
+        "fatal: 'feature/x' is already checked out at '/data/worktrees/t1/crm-web'",
+      ),
+    ).toBe("/data/worktrees/t1/crm-web");
+  });
+
+  it("新文案 already used by worktree at", () => {
+    expect(
+      parseOccupyingWorktreePath(
+        "fatal: 'feature/x' is already used by worktree at '/data/worktrees/t_old/repo'",
+      ),
+    ).toBe("/data/worktrees/t_old/repo");
+  });
+
+  it("无占用路径文案 → null", () => {
+    expect(parseOccupyingWorktreePath("fatal: invalid reference")).toBeNull();
   });
 });

@@ -16,6 +16,12 @@
  *
  * 注意：探测应在 enrichMcpServersWithOAuth 之后做、这样带上 OAuth token 的 server
  * 才能正确探出 ok / unauthorized（否则飞书项目永远 401）。
+ *
+ * v1.1.x 提速：起 agent 前的探测（filterHealthyMcp）走 TTL 缓存——每次推进 / 发消息
+ * 都真探一轮（单服超时 6s）是「点推进后半天没动静」的固定成本之一。ok 结果 5 分钟内
+ * 复用；fail 结果只缓 30s（授权 / 恢复要尽快被看见）。设置页的 probeMcpHealthAll
+ * 保持真探（用户就是来看真值的）、结果写穿缓存——授权完刷新设置页、下次起 agent 即新。
+ * key 含 headers（OAuth token 变了自然失效）。
  */
 
 import type { McpServerConfig } from "@cursor/sdk";
@@ -24,6 +30,45 @@ import type { McpHealth } from "@/lib/types";
 
 // 探测超时（比 oauth probe 的 5s 略宽、避免慢服务误判连不上）
 const PROBE_TIMEOUT_MS = 6000;
+
+// ----------------- 探测结果 TTL 缓存（仅 http server；stdio 本来就秒回不缓存） -----------------
+
+const PROBE_CACHE_OK_MS = 5 * 60_000;
+const PROBE_CACHE_FAIL_MS = 30_000;
+
+// 挂 globalThis：各 route 是不同 chunk、module-level Map 会各持一份（同 runningTasks 老坑）
+const G = globalThis as unknown as {
+  __feMcpProbeCache?: Map<string, { health: McpHealth; at: number }>;
+};
+const probeCache = (G.__feMcpProbeCache ??= new Map());
+
+// 缓存 key：仅 http server（url + headers 快照——token 换了 key 自然变）；stdio 返 null 不缓存
+const probeCacheKey = (name: string, cfg: McpServerConfig): string | null => {
+  if (!("url" in cfg)) return null;
+  return `${name}|${cfg.url}|${JSON.stringify(cfg.headers ?? {})}`;
+};
+
+const readProbeCache = (key: string | null): McpHealth | null => {
+  if (!key) return null;
+  const hit = probeCache.get(key);
+  if (!hit) return null;
+  const ttl = hit.health.status === "ok" ? PROBE_CACHE_OK_MS : PROBE_CACHE_FAIL_MS;
+  return Date.now() - hit.at < ttl ? hit.health : null;
+};
+
+const writeProbeCache = (key: string | null, health: McpHealth): void => {
+  if (key) probeCache.set(key, { health, at: Date.now() });
+};
+
+/**
+ * 整表失效（run 失败时调、task/chat runner 的失败收口各挂一处）：
+ * 缓存 ok 期间 server 挂掉 → 起 agent 带上死 MCP → run 失败——若不清缓存、
+ * 用户立刻重试还会命中同一条过期 ok（最长 5 分钟）连续撞。失败就清、重试必真探；
+ * 代价只是下次启动多付一轮探测（≤6s）、健康 server 探完立刻回填。
+ */
+export const invalidateMcpProbeCache = (): void => {
+  probeCache.clear();
+};
 
 // 发 initialize 拿 HTTP 状态码（连不上则返 error）
 const sendInitialize = async (
@@ -58,7 +103,7 @@ const sendInitialize = async (
 };
 
 /** 探测单个 MCP server 的连通性 */
-export const probeMcpHealth = async (
+const probeMcpHealth = async (
   name: string,
   cfg: McpServerConfig,
 ): Promise<McpHealth> => {
@@ -102,14 +147,19 @@ export const probeMcpHealth = async (
   };
 };
 
-/** 并发探测所有 MCP server（key=server 名） */
+/**
+ * 并发探测所有 MCP server（key=server 名）——**真探不读缓存**（设置页要真值）、
+ * 结果写穿缓存（授权完刷新设置页、下次起 agent 立刻拿到新状态）。
+ */
 export const probeMcpHealthAll = async (
   servers: Record<string, McpServerConfig>,
 ): Promise<Record<string, McpHealth>> => {
   const entries = await Promise.all(
-    Object.entries(servers).map(
-      async ([name, cfg]) => [name, await probeMcpHealth(name, cfg)] as const,
-    ),
+    Object.entries(servers).map(async ([name, cfg]) => {
+      const health = await probeMcpHealth(name, cfg);
+      writeProbeCache(probeCacheKey(name, cfg), health);
+      return [name, health] as const;
+    }),
   );
   return Object.fromEntries(entries);
 };
@@ -126,15 +176,24 @@ export interface FilteredMcp {
  * 本地 stdio 探测时已乐观标 ok、随 ok 一起保留——交给 SDK 起进程自己处理。
  *
  * 入参应是 enrich（注入 OAuth token）之后的 servers。
+ * 走 TTL 缓存（见文件头）：热路径不再每次真探 6s、命中直接秒过。
  */
 export const filterHealthyMcp = async (
   servers: Record<string, McpServerConfig>,
 ): Promise<FilteredMcp> => {
-  const health = await probeMcpHealthAll(servers);
+  const entries = await Promise.all(
+    Object.entries(servers).map(async ([name, cfg]) => {
+      const key = probeCacheKey(name, cfg);
+      const cached = readProbeCache(key);
+      if (cached) return [name, cfg, cached] as const;
+      const health = await probeMcpHealth(name, cfg);
+      writeProbeCache(key, health);
+      return [name, cfg, health] as const;
+    }),
+  );
   const kept: Record<string, McpServerConfig> = {};
   const dropped: McpHealth[] = [];
-  for (const [name, cfg] of Object.entries(servers)) {
-    const h = health[name];
+  for (const [name, cfg, h] of entries) {
     if (h.status === "ok") {
       kept[name] = cfg;
     } else {

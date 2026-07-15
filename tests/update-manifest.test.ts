@@ -5,7 +5,7 @@
  * 回归点：
  * - 私钥签出的 manifest 用公钥可验、asset 的 SHA-256 / size 记录正确
  * - 篡改 asset 任意字节 → 哈希对不上；篡改 manifest → 验签失败
- * - secret 未配置时脚本退出 0 且不产文件（渐进启用、不打断发版）
+ * - secret 未配置时脚本非零退出且不产文件（P0-01 起 fail-closed、缺私钥直接断发版）
  */
 import { execFile } from "node:child_process";
 import {
@@ -63,9 +63,14 @@ const verifyManifest = (manifest: {
 };
 
 describe("generate-update-manifest（CR-02）", () => {
-  it("secret 未配置 → 退出 0、不产 manifest（渐进启用）", async () => {
-    const { stdout } = await runScript({ UPDATE_MANIFEST_PRIVATE_KEY: "" });
-    expect(stdout).toContain("跳过");
+  it("secret 未配置 → 非零退出、不产 manifest（fail-closed）", async () => {
+    // execFile 非零退出会 reject、错误对象带 code/stdout
+    const err = (await runScript({ UPDATE_MANIFEST_PRIVATE_KEY: "" }).catch(
+      (e) => e,
+    )) as NodeJS.ErrnoException & { code?: number; stdout?: string };
+    expect(err).toBeInstanceOf(Error);
+    expect(err.code).toBe(1);
+    expect(`${err.stdout ?? ""}${err.message}`).toContain("未配置");
     await expect(fs.access(path.join(TMP, "update-manifest.json"))).rejects.toThrow();
   });
 

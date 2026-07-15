@@ -1,24 +1,18 @@
 /**
- * 配置存取层（过渡版 V0.7.16：localStorage → config.json 文件迁移中）
+ * 配置存取层：config.json（权威）+ 内存 cache（同步读）
  *
- * 背景：原来配置存浏览器 localStorage（Chromium leveldb）、桌面端有硬伤——
- * 按 origin 含端口隔离（换端口配置就丢、同步 test 还得转端口）、不透明 leveldb、
- * Electron 主进程读不到。改存 `data/config.json`（走 /api/settings、跟 FE_AI_FLOW_DATA_DIR）。
+ * - 内存缓存 cache：初值 DEFAULT_SETTINGS；initSettings() 成功后用 config.json 覆盖
+ * - getSettings()：同步读 cache（签名不变、调用方零改动）
+ * - saveSettings()：写 cache + 串行队列 await 落 config.json（CR-08）
+ * - P1-03：init 未成功前拒绝整对象 PUT，避免用默认/脏缓存覆盖磁盘有效配置
  *
- * 无感迁移（已有用户零操作、配置一条不丢）：
- * - 内存缓存 cache：模块加载即同步读 localStorage 兜底（启动无空窗、providers 等同步读立即有值）
- * - initSettings()：app 启动 await 一次、读 config.json；文件在 → 用文件（权威）；
- *   文件不在（首次升级）→ 把当前 cache（localStorage 旧配置）写进文件（迁移）
- * - getSettings()：同步读 cache（签名不变、9 处调用方零改动）
- * - saveSettings()：写 cache + **串行队列 await** 落 config.json（权威、CR-08）+ 过渡期双写 localStorage（回滚保险）
- *
- * ⏰ 清理任务（见 REMOVE_LOCALSTORAGE_AFTER）：过了保留期、且确认所有同事都升级过本过渡版后、
- *   做「清理版」——删掉 localStorage 读取 / 迁移 / 双写、saveSettings 改纯文件、只留 config.json + 缓存。
+ * 历史：曾从 localStorage 无感迁移到 config.json（截止 2026-06-28）；迁移链已退役。
+ * 纯 UI 偏好类 localStorage（recent-workdirs / 视图记忆等）不走本文件。
  *
  * 数据 schema 看 src/lib/types.ts
  */
 
-import { JUMP_IDES, USER_ROLES } from "./types";
+import { DEFAULT_MEEGLE_PROJECT, JUMP_IDES, USER_ROLES } from "./types";
 import type {
   ActionLayoutPref,
   FeAiFlowSettings,
@@ -27,15 +21,12 @@ import type {
   UserRole,
 } from "./types";
 
-const KEY = "fe-ai-flow:settings";
+/** 已退役的 settings localStorage key——启动时删掉防残留脏数据被误读 */
+const LEGACY_SETTINGS_KEY = "fe-ai-flow:settings";
 const API = "/api/settings";
 // CR-01：默认 GET /api/settings 已脱敏（apiKey / gitToken 掩码）、client 初始化
 // 灌 cache 必须拿真值——走专门的全量读取口（仅 loopback、middleware 强制）
 const API_FULL = "/api/settings/full";
-
-// ⏰ localStorage 迁移逻辑的保留截止日。过了这天、dev 控制台会红字提醒做「清理版」、
-//    届时把本文件里所有 localStorage 读 / 写 / 迁移逻辑删掉、只留 config.json + 内存缓存。
-const REMOVE_LOCALSTORAGE_AFTER = "2026-06-28";
 
 export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
@@ -43,7 +34,6 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   repos: [],
   jumpIde: "cursor",
   submitShortcut: "mod-enter",
-  gitHost: "",
   gitToken: "",
   // 留空 = 运行时回退内置兜底（feature/{storyId}-{taskTitle}）、不再预填进设置页
   branchTemplate: "",
@@ -55,6 +45,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   disabledSkills: [],
   disabledRules: [],
   modelUsage: [],
+  // 默认悟空产研空间——看板 / 收件箱唯一作用域（历史用户零迁移）
+  meegleProject: { ...DEFAULT_MEEGLE_PROJECT },
 };
 
 const isBrowser = (): boolean =>
@@ -84,50 +76,52 @@ const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
 };
 
 /**
- * schema 归一：把原始对象（localStorage 或 config.json 读出来的）填全字段 + 校验、
- * 缺省 / 坏值回退默认。localStorage 和文件两条来源共用同一套归一逻辑。
+ * 默认飞书空间归一：缺失 / 形状不对 / key 非字符串或空 → 回落 DEFAULT_MEEGLE_PROJECT。
+ * 历史 config 无此字段时自动落默认、不写迁移脚本。
  */
-const normalizeSettings = (
-  parsed: (Partial<FeAiFlowSettings> & {
-    defaultModel?: unknown;
-    /** V0.12.x 已删的老字段：读到时做一次「烘焙进模板」迁移、之后不再落盘 */
-    username?: unknown;
-  }) | null,
+const normalizeMeegleProject = (
+  raw: unknown,
+): NonNullable<FeAiFlowSettings["meegleProject"]> => {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_MEEGLE_PROJECT };
+  const o = raw as { key?: unknown; name?: unknown; simpleName?: unknown };
+  if (typeof o.key !== "string" || !o.key.trim()) {
+    return { ...DEFAULT_MEEGLE_PROJECT };
+  }
+  if (typeof o.name !== "string" || !o.name.trim()) {
+    return { ...DEFAULT_MEEGLE_PROJECT };
+  }
+  return {
+    key: o.key,
+    name: o.name,
+    ...(typeof o.simpleName === "string" && o.simpleName
+      ? { simpleName: o.simpleName }
+      : {}),
+  };
+};
+
+/**
+ * schema 归一：把 config.json 读出来的原始对象填全字段 + 校验、
+ * 缺省 / 坏值回退默认。
+ */
+export const normalizeSettings = (
+  parsed: Partial<FeAiFlowSettings> | null,
 ): FeAiFlowSettings => {
   if (!parsed || typeof parsed !== "object") return DEFAULT_SETTINGS;
 
-  // ---- username 迁移（V0.12.x 删字段）----
-  // 老配置有 username 时：把模板里的 {username} 一次性替换成真实名字（全局 + 各仓覆盖）、
-  // 老用户分支名零变化；模板缺省时老默认是 feature/{username}/... 、同样烘焙成显式模板。
-  // 幂等：替换后模板里没有 {username}、重复跑无副作用；下次 saveSettings 落盘即完成迁移。
-  const legacyUsername =
-    typeof parsed.username === "string" ? parsed.username.trim() : "";
-  const bakeUsername = (tpl: string | undefined): string | undefined => {
-    if (!legacyUsername || !tpl) return tpl;
-    return tpl.replaceAll("{username}", legacyUsername);
-  };
-  const rawGlobalTemplate =
-    typeof parsed.branchTemplate === "string" && parsed.branchTemplate.trim()
-      ? parsed.branchTemplate
-      : // 老用户没显式配过模板但有 username = 依赖老默认 feature/{username}/...——烘焙成显式模板保行为
-        legacyUsername
-        ? "feature/{username}/{storyId}-{taskTitle}"
-        : "";
   const repos = (Array.isArray(parsed.repos) ? parsed.repos : []).map((r) => {
     if (!r || typeof r !== "object") return r;
-    const withTpl = r.branchTemplate
-      ? { ...r, branchTemplate: bakeUsername(r.branchTemplate)! }
-      : { ...r };
     // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
     return {
-      ...withTpl,
+      ...r,
       readonly: r.readonly === true ? true : undefined,
       scriptRepo: r.scriptRepo === true ? true : undefined,
     };
   });
   const merged = { ...DEFAULT_SETTINGS, ...parsed };
-  // 老字段不落进归一结果（Partial 展开会带上、显式删）
+  // 历史残留键读取时忽略、不落进归一结果
+  // username：V0.12.x 已删；gitHost：已退役（host 按任务仓库 remote 现推）
   delete (merged as Record<string, unknown>).username;
+  delete (merged as Record<string, unknown>).gitHost;
 
   return {
     ...merged,
@@ -140,11 +134,11 @@ const normalizeSettings = (
     // 提交快捷键：旧配置没有 / 手改坏时回退当前默认行为
     submitShortcut:
       parsed.submitShortcut === "enter" ? "enter" : "mod-enter",
-    // V0.6.1 加：ship action GitLab 配置、PAT 明文存（用户拍板可接受）
-    gitHost: typeof parsed.gitHost === "string" ? parsed.gitHost : "",
+    // V0.6.1 加：ship PAT 明文存（用户拍板可接受）；host 不进 settings
     gitToken: typeof parsed.gitToken === "string" ? parsed.gitToken : "",
     // V0.6.7：全局默认分支命名模板；V0.12.x 起留空合法（运行时回退内置兜底）
-    branchTemplate: bakeUsername(rawGlobalTemplate) ?? "",
+    branchTemplate:
+      typeof parsed.branchTemplate === "string" ? parsed.branchTemplate : "",
     // V0.6.5：建任务默认 MCP 黑名单快照源
     disabledMcpServers: Array.isArray(parsed.disabledMcpServers)
       ? parsed.disabledMcpServers
@@ -182,52 +176,24 @@ const normalizeSettings = (
     userRole: USER_ROLES.includes(parsed.userRole as UserRole)
       ? (parsed.userRole as UserRole)
       : undefined,
+    // 默认飞书空间：缺 / 坏 → 悟空产研（看板 + 收件箱唯一作用域）
+    meegleProject: normalizeMeegleProject(parsed.meegleProject),
   };
 };
 
-// 【过渡期】同步读 localStorage：内存缓存的即时初值 + 首次迁移的数据源
-const readLocalStorage = (): FeAiFlowSettings | null => {
-  if (!isBrowser()) return null;
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return null;
-    return normalizeSettings(JSON.parse(raw));
-  } catch (err) {
-    console.warn("[local-store] localStorage settings 损坏、忽略", err);
-    return null;
-  }
-};
-
-// 内存缓存：模块加载即用 localStorage 兜底（启动无空窗）、initSettings 后被 config.json 覆盖。
+// 内存缓存：初值默认；initSettings 成功后被 config.json 覆盖。
 // getSettings 同步读它——这是「保持同步签名、调用方零改动」的关键。
-let cache: FeAiFlowSettings = readLocalStorage() ?? DEFAULT_SETTINGS;
+let cache: FeAiFlowSettings = DEFAULT_SETTINGS;
 // initSettings 单飞：多个 hook（providers / use-settings）同时调时共享同一 promise、
 // 都等到 config.json 加载完再读缓存；失败时清空、允许下次重试（SPA 不刷页、bool 标志会永久挡住重试）。
 let initPromise: Promise<void> | null = null;
+// P1-03：最近一次 init 是否成功灌过权威 config.json。
+// 失败时 cache 保持 DEFAULT_SETTINGS——禁止用它整对象 PUT 覆盖磁盘。
+let initSucceeded = false;
 
 // 同步读缓存（签名不变、prepareRunArgs 等 9 处调用方一律不用改）
 export const getSettings = (): FeAiFlowSettings => cache;
 
-// 【过渡期】过了保留期就 dev 警告：该做「清理版」删 localStorage 逻辑了
-const warnIfMigrationExpired = (): void => {
-  if (
-    process.env.NODE_ENV !== "production" &&
-    new Date() > new Date(REMOVE_LOCALSTORAGE_AFTER)
-  ) {
-    console.warn(
-      `⚠️ [local-store] localStorage 迁移逻辑已过保留期（${REMOVE_LOCALSTORAGE_AFTER}）、` +
-        "请做「清理版」：删掉 localStorage 读 / 写 / 迁移、只留 config.json + 内存缓存。",
-    );
-  }
-};
-
-/**
- * 启动初始化（app 根组件挂载时 await 一次、initialized 去重）
- *
- * 读 config.json：文件在 → 用文件覆盖缓存（权威源）；文件不在（首次升级）→ 把当前缓存
- * （来自 localStorage 的旧配置）写进文件、完成无感迁移。文件链路挂了不阻塞、继续用
- * localStorage 兜底的缓存、下次启动再试。
- */
 /**
  * PUT config.json（CR-08：非 2xx 一律 throw——原实现 500 也静默当成功、重启后修改凭空消失）。
  * 响应里的 settings 脱敏后不再需要回填 mcpServers（server 不再在 PUT 后改写该字段）。
@@ -250,17 +216,38 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
   }
 };
 
+/**
+ * 启动初始化（app 根组件挂载时 await 一次、initialized 去重）
+ *
+ * 读 config.json：文件在 → 用文件覆盖缓存（权威源）；文件不在 → 用 DEFAULT_SETTINGS
+ * 写进文件起步。文件链路挂了不阻塞、cache 保持 DEFAULT、下次启动再试；
+ * P1-03 闸门禁止失败态整对象 PUT。
+ */
 export const initSettings = (): Promise<void> => {
   if (!isBrowser()) return Promise.resolve();
   // 已在跑 / 已跑完：复用同一 promise、不重复 fetch
   if (initPromise) return initPromise;
   initPromise = (async () => {
+    // 清掉已退役的 settings localStorage 残留（一行、防脏数据被误读）
+    try {
+      window.localStorage.removeItem(LEGACY_SETTINGS_KEY);
+    } catch {
+      // 忽略：隐私模式 / 配额满等、不影响权威 config 路径
+    }
     try {
       // 全量口（含明文密钥、仅 loopback）——默认 /api/settings 已脱敏、灌 cache 必须真值
       const res = await fetch(API_FULL);
-      // 非 2xx（middleware 拦 / 服务端异常）必须 throw 走重试——否则 body 没有 exists
-      // 字段会被误判成「首次升级」、把默认空 cache 整包 PUT 上去（发版前蓝军 P1）
-      if (!res.ok) throw new Error(`GET ${API_FULL} HTTP ${res.status}`);
+      // 非 2xx（含 500 settings_unreadable）必须 throw——不得用默认值整包 PUT 覆盖磁盘
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const errBody = (await res.json()) as { error?: string };
+          if (errBody?.error) detail = errBody.error;
+        } catch {
+          // 错误体非 JSON、用状态码兜底
+        }
+        throw new Error(`GET ${API_FULL} ${detail}`);
+      }
       const data = (await res.json()) as {
         exists?: boolean;
         settings?: unknown;
@@ -268,21 +255,24 @@ export const initSettings = (): Promise<void> => {
       if (data.exists && data.settings) {
         cache = normalizeSettings(data.settings as Partial<FeAiFlowSettings>);
       } else if (data.exists === false) {
-        // 明确「文件不存在」才算首次升级：把当前缓存（localStorage 旧配置 / 默认）
-        // 迁移进 config.json；MCP 不自动从 Cursor 搬——用户在能力页自己导入
+        // 明确「文件不存在」：用当前 cache（= DEFAULT_SETTINGS）写进 config.json 起步；
+        // MCP 不自动从 Cursor 搬——用户在能力页自己导入
         await putSettings(cache);
       } else {
-        // exists 字段缺失 = 响应形状不对、按失败处理（防误迁移）
+        // exists 字段缺失 = 响应形状不对、按失败处理（防误写）
         throw new Error("GET full settings 响应形状异常（缺 exists）");
       }
+      initSucceeded = true;
     } catch (err) {
       console.warn(
-        "[local-store] config.json 初始化失败、暂用 localStorage 兜底缓存、下次再试迁移",
+        "[local-store] config.json 初始化失败、暂用默认设置、下次再试",
         err,
       );
-      initPromise = null; // 失败清空、允许下次重试（避免永久卡在 localStorage）
+      // 失败态：cache 回到默认、拒绝后续整对象 PUT（P1-03）
+      cache = DEFAULT_SETTINGS;
+      initSucceeded = false;
+      initPromise = null; // 失败清空、允许下次重试
     }
-    warnIfMigrationExpired();
   })();
   return initPromise;
 };
@@ -295,17 +285,24 @@ let writeQueue: Promise<void> = Promise.resolve();
  *
  * @returns true=服务端 config.json 落盘成功；false=写失败（500 / 网络断 / 磁盘只读）。
  *          调用方据此决定是否把字段标成「已保存」+ toast。
- *          内存 cache 同步更新（乐观、getSettings 立即可读）；localStorage 双写为
- *          过渡期回滚保险、其失败不影响返回值。
+ *          内存 cache 同步更新（乐观、getSettings 立即可读）。
  */
 export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => {
   cache = next;
   if (!isBrowser()) return false;
-  // 【过渡期】双写 localStorage：回滚保险（清理版删掉这段）；失败只 log、不挡权威写
-  try {
-    window.localStorage.setItem(KEY, JSON.stringify(next));
-  } catch (err) {
-    console.error("[local-store] saveSettings localStorage 失败", err);
+  // P1-03：初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返 false，
+  // 调用方如 use-settings 已有 toast.error——保持 Promise<boolean> 签名、不抛错）
+  if (!initSucceeded) {
+    await initSettings();
+    if (!initSucceeded) await initSettings(); // 再试一次（失败会清空 initPromise）
+    if (!initSucceeded) {
+      console.error(
+        "[local-store] saveSettings 拒绝写入：config.json 初始化仍失败、避免用本地缓存覆盖磁盘配置",
+      );
+      return false;
+    }
+    // 重试成功后 init 可能用服务端值盖掉了 cache——写回用户本次意图再落盘
+    cache = next;
   }
   // 权威写：挂到串行队列尾（保序）、await 服务端结果（失败不再被静默当成功）
   const attempt = writeQueue.then(() => putSettings(next));
@@ -344,11 +341,15 @@ const MODEL_USAGE_CAP = 20;
  */
 export const recordModelUsage = (sel: ModelSelection): void => {
   if (!sel.id?.trim()) return;
-  // 先确保 cache 已从 config.json 灌注再整对象落盘——启动早期（init 未完成 / 失败）时
-  // cache 可能还是 localStorage 兜底 / 默认值、直接 saveSettings 会把 stale 整份写盘、
-  // 静默丢掉其它字段（v1.0.x 真实事故：apiKey 被这类 lost-update 清空；服务端已加密钥守卫、
-  // 这里是第二道：非密钥字段同样别用 stale cache 覆盖）
+  // P1-03：必须等 init 成功后再整对象落盘。init 失败时 cache 是默认值——
+  // 直接 save 会覆盖磁盘有效配置（模型计数是增强数据、丢一次无妨）
   void initSettings().then(() => {
+    if (!initSucceeded) {
+      console.warn(
+        "[local-store] recordModelUsage 跳过保存：settings 初始化未成功",
+      );
+      return;
+    }
     const s = getSettings();
     const key = modelUsageKey(sel);
     const list = [...(s.modelUsage ?? [])];

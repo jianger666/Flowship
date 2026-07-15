@@ -54,4 +54,7 @@ contextBridge.exposeInMainWorld("__shell", {
   // 打开系统外链（设置页「系统设置里开启」通知权限等）——主进程白名单校验
   /** @param {string} url */
   openExternal: (url) => ipcRenderer.send("open-external", url),
+  // 收件箱三期：未读数 → mac Dock 角标 / win 任务栏 overlay（renderer 传 PNG dataUrl）
+  /** @param {{ count: number, dataUrl?: string }} payload */
+  setInboxBadge: (payload) => ipcRenderer.send("inbox:set-badge", payload),
 });

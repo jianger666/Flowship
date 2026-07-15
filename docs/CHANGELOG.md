@@ -15,6 +15,31 @@
 
 ---
 
+### 2026-07-13 深夜 v1.1.10 发版：产出解耦——任务 workspace + 脚本仓标注 + 任务文件夹入口（用户明确授权发版、grok 子代理 review 无 P0）
+
+- **背景（用户复盘设计）**：测试建任务挂前后端只读仓 + 自定义「写测试脚本」action 时、脚本没有合法落点——「仓库挂载」和「产出去处」耦合太死。拍板解法：① 每个 task 一个专属可写 workspace（产出兜底、跟仓库选择解耦）② 仓库可标「脚本仓」（纯性质提示、AI 看仓内约定自己落）——两层提示词**独立注入不做组合逻辑**（用户拍板「更解耦」、只读×脚本仓组合让 AI 自行推导）。
+- **任务 workspace 目录**：`<dataRoot>/tasks/<id>/workspace/`（`WORKSPACE_DIR` + `getTaskWorkspaceDir`）——createTask 创建（chat 不建、best-effort）、`ensureWorkspaceReady` 起 agent 前兜底 mkdir（老任务/手删自愈）、随任务目录整体删除；`_super.md` 新增「任务工作目录」段（`{{taskWorkspaceDir}}` 绝对路径 + 「非 artifact 文件没明确去处写这里、artifact 里列产出绝对路径」）、占位符对账测试同步。
+- **脚本仓标注（scriptRepo）**：`RepoConfig.scriptRepo` Switch（设置页仓库行、与只读并排、tooltip 讲清正交语义）→ 三写点快照 `task.scriptRepoPaths`（createTask / addRepoPaths / setTaskRepoPaths、`snapshotRepoFlagPaths` 一次读 settings 算只读+脚本两份）；**纯提示性**：不影响 worktree 隔离/门禁/检测——prompt 分支配置段行尾标 📜 + 独立一行「往里新建文件前先看仓内 README/AGENTS.md 约定、没有就自行合理组织」（`renderScriptRepoDirective`、chat 同注入）；任务头部仓库行挂 ScrollText icon（对称 🔒 Lock）。
+- **「任务文件夹」按钮**（用户：想看 workspace / artifact 这批文件）：`Task.taskDirPath` 计算字段（hydrateTask 算、不落盘——dataRoot 只有 server 知道）→ WorkspaceActions 新按钮走 ide-open 通道（cursor:// 新窗口 / JetBrains 后端 spawn）打开 `tasks/<id>/`；顺带重构 early return——无仓任务也能显示该按钮。
+- **顺带修**：`repoConfigCanonical` 漏 `readonly`（设置页切只读开关不触发 dirty、本次连 scriptRepo 一起补）；createTask repoPaths 去尾斜杠归一（settings 落盘无尾 `/`、flag 快照精确匹配、带尾 `/` 会静默匹配空——addRepoPaths/setTaskRepoPaths 本就归一、补齐 create 口）。
+- 流程：实施 → typecheck/lint/test/build 全绿 → grok 子代理只读 review（无 P0；P1 已修：adaptive QA 产出指引补 workspace、路径归一化、ensureWorkspaceReady chat 守卫、addRepoPaths 全量重算 flag 快照加注释说明）→ 复验全绿。
+
+### 2026-07-13 深夜 v1.1.9 发版：修订模式 + 今晚全部积压（发版前蓝军终审无 P0、1 P1 已修）
+
+> 本版 = 下面两个「攒着未发」段 + 当晚陆续修的：插话快照治理（相同快照惰性清理 + running 态不清理防时序竞态误删）、断网/提问态输入条不再锁死（去 pendingAsk 硬闸 + 跳过提问给 agent 提示 + 交卷收尾窗口发消息等 run 收敛、等完二次校验防与推进并发——终审 P1）、build 后置检查删「修改记录」铁段（初稿被冤枉红条）、存储统计含 worktree（du+回退）+ 残留工作区清理、mac 通知不传 icon（右侧内容图误加回退）、「任务系统通知」行去 Switch 只留「去系统设置」按钮（notificationsEnabled 字段退役、开关本质在系统层）。终审 P2 记账攒下版：问类插话短暂假红点、答题卡超时解锁未 abort 旧请求、HANDOFF 索引挂着已删 artifact-diff。
+
+### 2026-07-13 晚（已随 v1.1.9 发）：artifact「修订模式」（Word Track Changes 内联渲染）
+
+- **旧「Diff」tab（md 源码级词对比、用户嫌丑）整个退役**：`artifact-diff.tsx` 删、`react-diff-viewer-continued` 依赖删（prismjs 保留、code-editor 在用）；替代 = 正文 toolbar「修订」开关（默认关、有未读修订挂红点、打开即已读）——正文仍是渲染后富文本、改动处内联标注：**新增绿底、删除红底删除线原位保留**；代码块/表格/mermaid 不做词级、整块左边条+「已修改」角标（点开看旧版）；基准下拉（默认「上次」= 只显最近一轮、可选「初版」看累计）+ 上/下一处跳转 + `+N −M` 计数
+- **实现**（全客户端、服务端 action-diff API 复用零改动）：`src/lib/md-revision.ts`（remark-parse 块级对齐（短文本禁 charOverlap、低相似强制 remove+add）→ jsdiff 词级 diff（中文 `Intl.Segmenter` 分词）→ PUA 哨兵合并、超大文档降级纯块级标注）+ `remark-annotate-revision-blocks.ts`（哨兵 → ins/del 节点、Streamdown 原管道渲染、链接/图片/代码高亮全保留）+ `artifact-revision-view.tsx`（dynamic 懒加载、不拖正文首屏）；`tests/md-revision.test.ts` 17 用例
+- 流程：实施 → 蓝军 review（1 P0 假加载 + 5 P1：短段误配对/跳转重复命中/未懒加载/大文档卡顿/块对齐边界）→ 全修 → 复验全绿
+
+### 2026-07-13（已随 v1.1.9 发）：看板 VPN 卡误弹「去授权」+ 系统通知 logo/开关
+
+- **看板 VPN 误报根因**：`/api/feishu/board` 数据链路的 `meegleAuthStatusUnlocked` 把 auth status **超时 / exit 2 / 无 stdout** 一律当 `authenticated:false`；`runMeegleUnlocked` 的 unknown-command 复核据此抛 `not_authed` → 前端渲「去设置页授权」。v1.1.4 只修了就绪清单的 `/api/system/feishu-cli`（`mergeAuthPreserve`），看板自己的 meegle 链路没享受到。
+- **修法**（同哲学：瞬态 ≠ 未登录）：`isMeegleExecTransient` 优先于未登录正则；auth status 瞬态标 `transient`；unknown-command 复核遇 transient 抛 `error` 不抛 `not_authed`。前端护栏本就覆盖 not_authed、服务端分类修对后 VPN 卡显示「加载失败 + 重试」。
+- **系统通知**：通知图标换新 logo（`extraResources` 打 `packaging/icon.png` 进包作 `notify-icon.png`、win 显式传 / mac 走 app icon）；设置→偏好加「任务系统通知」Switch（`settings.notificationsEnabled` 默认开、task-attention-watcher 读设置 gate）+「系统设置里开启」深链（mac/win 各自跳系统通知面板、`__shell.openExternal`、解「系统层误拒后找不到入口」）。
+
 ### 2026-07-13 晚 v1.1.8 发版：今日积压全量（下面三段 + 本段、v1.1.7 tag/draft 已删除作废）
 
 - **GitLab 凭证运行时注入（野路子转正、用户拍板）**：settings 配了 gitToken 时、task + 绑仓 chat 的 prompt 注入「## GitLab 访问」段（host + `config.json` **gitToken 字段**位置 + 「只取该字段别 cat 全文件——里面还有其它密钥」+ 读随意写收敛 + 内置飞书 CLI 已登录勿预检）——AI 不再靠自己摸后门（线上实锤：同事的自定义 action 里 AI 先试 glab 失败、再自己发现 config.json 才跑通）；`action-ship.md`「拿不到 PAT 必然失败」旧措辞纠偏成「MR 创建必须走 submit_mr（落库审计）」。曾讨论过 `gitlab_api_get` 只读代理 + 红线的分级方案、用户拍板不做（本地单机、接受 token 进上下文）

@@ -4,8 +4,8 @@
  * GitLab 配置节（v1.0.x 设置整合：Card 壳退役、作为「连接」卡的一节）
  *
  * 只剩 Token 一个输入（用户拍板「host 输入框直接去掉」）：
- * GitLab Host 运行时自动从任务仓库的 origin remote 推导（resolveEffectiveGitHost）、
- * 不再需要用户填；settings.gitHost 字段保留（老配置的值继续当可选覆盖、无 UI）。
+ * GitLab Host 运行时一律按任务仓库 origin remote 现推（resolveEffectiveGitHost）、
+ * 不进 settings——产品口径=单 GitLab 实例、多仓不一致 fail-fast。
  */
 
 import { Eye, EyeOff } from "lucide-react";

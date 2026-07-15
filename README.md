@@ -1,82 +1,86 @@
 # Flowship
 
-**AI 需求交付平台 · 飞书 story → MR 自动化。**
+**AI 需求交付平台 · 飞书 story → MR。**
 
-把「读飞书需求 / 拉关联文档 / 摸代码 / 写技术方案 / 写代码 / 跑校验 / 提 MR / @ 测试」这 80% 的手工活交给 AI，你只在每个关键节点确认一次。名字里的 flow 是需求流转、ship 是交付上线。
+站在 Cursor SDK 上的项目级 Harness：把读需求、摸代码、出方案、改代码、复核、提测这 80% 手工活交给 AI，你在关键节点推进或纠正。名字里的 flow 是需求流转、ship 是交付。
 
-- **AI 干活、人把关**：AI 每完成一步（方案 / 代码 / 审查 / 提测）都停下来等你「通过」或「再聊聊」，不会偷偷往下走
-- **质量有缰绳**：每一步都有确定性校验兜底（typecheck / lint / git 指纹 / MR 门禁），产出全部落盘、可回看可回退
-- **并行不互踩**：每个任务在独立的 git 工作区（worktree）里干活，多任务同时推进、也不占用你自己的工作目录
+## 核心能力
 
----
+- **Task 容器 + Action 历史**：一个需求 = 一个任务；任务里每次推进是一次 action（`plan` / `build` / `review` / `ship` / `dev`，另可自定义），顺序不强制——小改动可以跳过方案直接写代码。产出落盘为 markdown，可回看。
+- **人在环（HITL）**：AI 交卷后停下等你；「推进」即认可当前步并开下一步，「再聊聊」可改 artifact。不会自动串跑全流程。
+- **Worktree 隔离**：默认每个任务独立 git 工作区，多任务并行、不占用你日常工作目录。
+- **飞书看板 / 工作项**：首页是飞书排期看板；从工作项一键建任务，拉 story 与关联文档。
+- **对话模式**：侧栏可新建自由对话（不走 action 链），输入 `/` 唤起 skill。
+
+后置检查只验**交付诚实性**（artifact 必备段、review 只读指纹、MR 验真等），不替你跑项目 typecheck / lint。代码质量由 build agent 按仓库命令做增量校验，再靠 review 与人工兜底。
 
 ## 安装
 
-从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台的安装包：
+从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台安装包：
 
 | 平台 | 包 | 安装 |
 |---|---|---|
-| Windows | `fe-ai-flow-<版本>-win-x64.exe` | 双击安装（装到用户目录、免管理员） |
-| mac（M 芯片） | `fe-ai-flow-<版本>-mac-arm64.dmg` | 拖进「应用程序」、**首次右键 →「打开」** 过 Gatekeeper |
-| mac（Intel） | `fe-ai-flow-<版本>-mac-x64.dmg` | 同上 |
+| Windows | `fe-ai-flow-*-win-x64.exe` | 双击安装（用户目录、免管理员） |
+| mac（Apple Silicon） | `fe-ai-flow-*-mac-arm64.dmg` | 拖进「应用程序」；首次右键 →「打开」过 Gatekeeper |
+| mac（Intel） | `fe-ai-flow-*-mac-x64.dmg` | 同上 |
 
-装完即用（自带运行时、不需要 node / git 环境）；之后有新版应用内提示、一键自更新，任务数据保留。
+**环境要求（桌面安装包）**
 
-## 快速上手
+- 自带 Node 运行时（Electron），**不必**本机再装 Node
+- **需要系统已安装 Git**（PATH 可用）——建分支、worktree、提 MR 都依赖本机 git
+- 之后有新版会应用内提示、可一键自更新；任务数据保留在本机应用数据目录
 
-首次打开是一张**就绪清单**，配齐三件事才进看板：
+## 首次配置
 
-1. **Cursor API Key**：粘贴你的 Key（[这里办一个](https://cursor.com/dashboard/integrations)、`crsr_` 开头）
-2. **飞书工具**：一键安装内置的 `lark-cli`（飞书）+ `meegle-cli`（飞书项目），浏览器授权登录即可——不需要自己配任何 MCP
-3. **仓库**：选择本地仓库目录（可多仓）；GitLab 地址从仓库 origin 自动推导、只需填一个 PAT
+打开后若未配齐，首页会显示就绪清单（五项都完成后自动变成飞书排期看板）：
 
-然后按日常节奏用：
+1. **Cursor API Key** — AI 跑任务的凭据（[申请](https://cursor.com/dashboard/integrations)，`crsr_` 开头）
+2. **飞书工具** — 安装并登录内置 `lark-cli` + `meegle-cli`（设置页一键，无需自配 MCP）
+3. **GitLab Token** — 提 MR 用的 PAT
+4. **代码仓库** — 至少添加一个本地仓库目录
+5. **我的角色** — 设置页「我的角色」，告诉 AI 你的工作视角 / 身份（注入发起人信息；**不是**任务级角色）
 
-- **工作台（首页）**：你的飞书工作项看板，从工作项**一键创建任务**
-- **任务详情页**：左边是步骤时间线、中间是产出预览（方案 / 审查报告等）、右边是 AI 干活的实时过程；顶部「通过 / 再聊聊」确认，「推进」选择下一步（写方案 / 写代码 / 审查 / 提测……可切模型、常用模型有快捷位）
-- **对话（顶栏胶囊切换）**：不走流程、跟 AI 随便聊；输入 `/` 唤起 skill 菜单，消息可编辑重发
-- **能力页**：Action / Skill / MCP 集中管理——skill 可以让 AI 帮你建，MCP 可从 Cursor 一键导入
-- **设置页**：连接（API Key / GitLab / 飞书）、偏好（IDE 跳转 / 分支模板 / 快捷键 / 默认模型）、仓库、存储清理
+配好后按日常节奏用：侧栏切任务 / 对话；任务详情里推进选 action、看产出与事件流；能力页管理 Action / Skill / MCP；设置页管连接、偏好、仓库与存储。
 
 ## AI 能替你做的事（action）
 
-一个需求 = 一个任务；任务里每次推进是一个 action，顺序不强制——小改动可以跳过方案直接写代码：
-
 | action | 干什么 |
 |---|---|
-| `plan` | 拉 story + 关联 PRD、扫仓库、出技术方案、拆工单 |
-| `build` | 真改代码 + 跑 typecheck / lint；有方案按工单走、没方案按你的指令改 |
-| `review` | 用干净视角把 diff 对着方案和需求复审、结构化报 bug |
-| `ship` | 提 MR（多仓）+ 飞书 @ 测试人员 |
-| `learn` | 把这单踩过的坑沉淀回业务仓（rules / skills / 名词表） |
-| `test` | 验收用例 + 运行时验证（建设中） |
+| `plan` | 拉 story + 关联文档、扫仓库、出技术方案、拆工单（大需求可分批） |
+| `build` | 在 worktree 里改代码；有方案按工单 / 批次走 |
+| `review` | 干净视角对照方案与需求复审、结构化报 bug |
+| `ship` | 推改动、提 MR（多仓）到测试分支，并可飞书 @ 测试 |
+| `dev` | 联调：合入 / 直推或提 PR 到开发分支 |
+| 自定义 | 在能力页把 skill 挂成自定义 action，按你的流程扩展 |
 
-每一步的产出都是一份 markdown 落在本地，换模型、换会话都不丢上下文。
+## 数据与网络边界
 
-## 配置与数据
-
-所有数据都在**本机**、不出网（服务只监听 127.0.0.1）：
-
-| 内容 | 位置 |
-|---|---|
-| API Key / GitLab PAT / 模型偏好 / 仓库列表 / MCP | `data/config.json`（桌面端在应用数据目录） |
-| 任务数据（事件流 / 产出 / 附件） | `data/tasks/<id>/` |
-| Prompt 模板 | `prompts/`（可直接改、保存后下次运行生效） |
-| Skill | 应用内置 + 自建（能力页管理、可从 Cursor 导入） |
+- **本地持久化**：配置、任务事件流、artifact、附件都在本机（桌面端在应用数据目录）；服务只监听 loopback（`127.0.0.1`）
+- **会出网的部分**（按你配置）：Cursor 模型 API（用户输入与仓库上下文会发给模型）、飞书 / 飞书项目（Meegle）、GitLab（MR / 仓库操作）、GitHub（检查应用更新）
+- Prompt 模板在 `prompts/`，可改；Skill 可在能力页自建或从 Cursor 导入
 
 存储占用可在设置页「存储」查看并清理。
 
----
+## 本地开发
 
-## 开发者
+需要本机 **Node（pnpm）+ Git**：
 
 ```bash
 pnpm install
-pnpm dev    # http://localhost:8876
+pnpm dev          # http://127.0.0.1:8876
+pnpm typecheck
+pnpm lint
+pnpm test
 ```
 
-- 代码改完跑 `pnpm typecheck` + `pnpm lint`
-- 发版：`git tag v1.x.y && git push origin v1.x.y`，CI 自动打 win / mac 安装包传 Release
-- 本地验证打包：`BUILD_STANDALONE=1 pnpm build` → `node scripts/assemble-electron-server.mjs` → `pnpm electron:dist:test`（产出 FlowshipTest、独立端口 8776 + 独立数据目录）
+本地打 test 包验证（独立端口 8776 + 独立数据目录）：
 
-架构与设计细节看 [docs/HANDOFF.md](./docs/HANDOFF.md)（接力第一文件），历史演进看 [docs/CHANGELOG.md](./docs/CHANGELOG.md)。
+```bash
+BUILD_STANDALONE=1 pnpm build
+node scripts/assemble-electron-server.mjs
+pnpm electron:dist:test
+```
+
+发版：打 tag 推到 GitHub，CI 打 win / mac 安装包到 Release。
+
+架构与设计细节见 [docs/HANDOFF.md](./docs/HANDOFF.md)；历史演进见 [docs/CHANGELOG.md](./docs/CHANGELOG.md)。

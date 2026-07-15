@@ -33,7 +33,6 @@ const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
   "build",
   "review",
   "ship",
-  "learn",
   "dev",
   // 自定义 action：定义存在性在 advance API 校验、这里放行
   "custom",
@@ -58,7 +57,7 @@ export const checkActionPrerequisites = (
   if (!AVAILABLE_ACTIONS.has(actionType)) {
     return {
       ok: false,
-      reason: `action 类型「${ACTION_LABEL[actionType]}」尚未实现、当前支持 plan / build / review / ship / learn / dev（联调）。`,
+      reason: `action 类型「${ACTION_LABEL[actionType] ?? actionType}」尚未实现、当前支持 plan / build / review / ship / dev（联调）。`,
     };
   }
 
@@ -84,7 +83,7 @@ export const checkActionPrerequisites = (
       // V0.x：去掉「ship 必须先有 build」流程限制（没改动直接 ship、agent 会发现工作区干净自己报）。
       //   保留 GitLab host/token 校验——技术必需（没配真调不了 GitLab API、提不了 MR）、不是流程限制。
       if (!ctx.gitHost || ctx.gitHost.trim().length === 0) {
-        // v1.0.x：Host 无输入框、由 resolveEffectiveGitHost 从仓库 origin 自动推导——
+        // Host 无输入框、由 resolveEffectiveGitHost 从仓库 origin 现推——
         // 走到这说明推导失败（仓库没配 origin remote / 不是 git 仓库）
         return {
           ok: false,
@@ -99,10 +98,6 @@ export const checkActionPrerequisites = (
       }
       return { ok: true };
     }
-    case "learn":
-      // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 会发现
-      //   没过程可复盘、自己说明、不报错。把判断权交给用户。
-      return { ok: true };
     case "dev": {
       if (taskAllReposReadonly(task)) {
         return { ok: false, reason: ALL_READONLY_REPOS_BLOCK_REASON };
@@ -150,8 +145,8 @@ export const checkActionPrerequisites = (
  * base branch 探测交给 agent：每仓自探（不同仓可能 master / main / develop）
  *
  * V0.6.1 简化：**每次 build 都 inject hint、agent 跑 idempotent shell**
- *   （branch 存在 → checkout、不存在 → 基于探到的主分支建）、不再维护 checkedOut 状态。
- *   gitBranches 数组只在首次建条目时落库、之后保留 createdAt 历史值。
+ *   （branch 存在 → checkout、不存在 → 基于探到的主分支建）。
+ *   gitBranches 数组只在首次建条目时落库、之后保留 baseBranch 历史值。
  *
  * 返回 null：缺 feishuStoryUrl / repoPaths 为空、不建 branch
  */
@@ -177,7 +172,6 @@ export const planBranchesForBuild = (
     return null;
   }
 
-  const now = Date.now();
   // V0.6.7：分支名按 per-repo 有效模板渲染（task.repoBranchTemplates 建 task 时固化、缺省回退内置默认）。
   //   占位符 {storyId}/{taskTitle}/{date:fmt}、值各自 branch-safe 化、详见 branch-template.ts
   const renderForRepo = (repoPath: string): string =>
@@ -186,7 +180,7 @@ export const planBranchesForBuild = (
       { storyId, taskTitle: task.title },
     );
 
-  // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch / createdAt）
+  // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch）
   // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建）；否则按模板渲染。
   //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个、自动用对。
   const existing = task.gitBranches ?? [];
@@ -198,8 +192,6 @@ export const planBranchesForBuild = (
       repoPath,
       name: explicitName || renderForRepo(repoPath),
       baseBranch: "",
-      checkedOut: false,
-      createdAt: now,
     };
   });
 

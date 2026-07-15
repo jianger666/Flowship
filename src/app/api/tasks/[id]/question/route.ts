@@ -53,7 +53,6 @@ interface PostBody {
   bootArgs?: {
     apiKey?: string;
     model?: { id?: string; params?: Array<{ id: string; value: string }> };
-    gitHost?: string;
     gitToken?: string;
   };
   /**
@@ -281,7 +280,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       fallbackModel: fallbackModel!,
       // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
       forceModel,
-      gitHost: body.bootArgs?.gitHost?.trim() || undefined,
       gitToken: body.bootArgs?.gitToken?.trim() || undefined,
     }).catch(async (err) => {
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);

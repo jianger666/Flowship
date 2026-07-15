@@ -8,6 +8,7 @@
  *
  * 交互：一键「安装 / 检查更新」（后台下载、轮询进度）→ 各自「登录」（CLI 自动开浏览器、
  * 抓到授权 URL 时给可点链接兜底）→ 状态行显示 版本 + 登录账号。
+ * meegle 已登录时额外一行「默认空间」下拉（工作台看板 + 收件箱扫描唯一作用域）。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,6 +19,15 @@ import { useDialog } from "@/hooks/use-dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { SettingRow } from "@/components/ui/setting-row";
+import type { FeAiFlowSettings } from "@/lib/types";
 
 // 服务端状态形状（/api/system/feishu-cli GET）
 interface ToolStatus {
@@ -38,18 +48,35 @@ interface FeishuCliState {
   logins: { larkCli: LoginState | null; meegle: LoginState | null };
 }
 
+/** 空间列表项（对齐 /api/feishu/board 的 projects） */
+interface MeegleProjectOption {
+  key: string;
+  name: string;
+  simpleName?: string;
+}
+
 const TOOL_LABEL: Record<"larkCli" | "meegle", string> = {
   larkCli: "飞书（lark-cli）",
   meegle: "飞书项目（meegle-cli）",
 };
 
+type MeegleProjectSetting = NonNullable<FeAiFlowSettings["meegleProject"]>;
 
-export const FeishuCliSection = () => {
+export const FeishuCliSection = ({
+  meegleProject,
+  onMeegleProjectChange,
+}: {
+  meegleProject: MeegleProjectSetting;
+  /** 选中即落盘（父级 saveFieldValue） */
+  onMeegleProjectChange: (next: MeegleProjectSetting) => void;
+}) => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
   const [state, setState] = useState<FeishuCliState | null>(null);
   // 操作请求飞行中（防双击）
   const [busy, setBusy] = useState(false);
+  // 可访问空间列表（登录后懒加载、失败静默）
+  const [projects, setProjects] = useState<MeegleProjectOption[]>([]);
   // 有安装 / 登录流程在跑时轮询加密（2s）、否则不轮询
   const timerRef = useRef<number | null>(null);
 
@@ -78,6 +105,29 @@ export const FeishuCliSection = () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
   }, [state, refresh]);
+
+  // meegle 已登录后懒拉空间列表（设置页下拉数据源；失败静默、下拉仍显示当前值）
+  useEffect(() => {
+    if (!state?.meegle.loggedIn) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await fetch("/api/feishu/board");
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          status?: string;
+          projects?: MeegleProjectOption[];
+        };
+        if (!alive || data.status !== "ok" || !Array.isArray(data.projects)) return;
+        setProjects(data.projects);
+      } catch {
+        // 静默：下拉没有列表时仍能显示当前已存空间名
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [state?.meegle.loggedIn]);
 
   const handleInstall = async () => {
     setBusy(true);
@@ -134,6 +184,19 @@ export const FeishuCliSection = () => {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handlePickSpace = (key: string) => {
+    const hit = projects.find((p) => p.key === key);
+    // 列表未加载完时仍允许选中当前值（无 hit 不写、避免冲掉已存 name/simpleName）
+    if (!hit) return;
+    const next: MeegleProjectSetting = {
+      key: hit.key,
+      name: hit.name,
+      ...(hit.simpleName ? { simpleName: hit.simpleName } : {}),
+    };
+    onMeegleProjectChange(next);
+    toast.success("已保存默认空间");
   };
 
   // 单个工具的状态行
@@ -198,6 +261,11 @@ export const FeishuCliSection = () => {
 
   const installing = !!state?.install.running;
   const installLog = state?.install.log ?? [];
+  // 下拉选项：列表未回时至少塞进当前已存项、保证 Select 能显示名称
+  const selectOptions =
+    projects.length > 0
+      ? projects
+      : [{ key: meegleProject.key, name: meegleProject.name, simpleName: meegleProject.simpleName }];
 
   return (
     <div className="space-y-3">
@@ -247,6 +315,36 @@ export const FeishuCliSection = () => {
         </div>
         {renderToolRow("larkCli")}
         {renderToolRow("meegle")}
+        {/* 默认空间：仅 meegle 已登录时展示——看板 / 收件箱只扫这一个空间 */}
+        {state?.meegle.loggedIn && (
+          <SettingRow
+            label="默认空间"
+            hint="工作台与收件箱只处理这个空间"
+            className="py-2"
+            control={
+              <Select
+                value={meegleProject.key}
+                onValueChange={(v) => {
+                  if (v) handlePickSpace(v);
+                }}
+              >
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder="选择空间">
+                    {selectOptions.find((p) => p.key === meegleProject.key)?.name ??
+                      meegleProject.name}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {selectOptions.map((p) => (
+                    <SelectItem key={p.key} value={p.key}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            }
+          />
+        )}
       </div>
     </div>
   );

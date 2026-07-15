@@ -86,7 +86,7 @@ export const POST = async (_req: Request, { params }: Ctx) => {
     task.mode === "chat"
       ? "用户停止了对话（agent 已中断、可继续发消息）"
       : `用户停止了${
-          current ? ` ${ACTION_LABEL[current.type]} action` : ""
+          current ? ` ${ACTION_LABEL[current.type] ?? current.type} action` : ""
         }（agent 已中断、可重新「推进」）`;
   const stopEvent = await appendEvent(id, {
     kind: "info",

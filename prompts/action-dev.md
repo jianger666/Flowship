@@ -121,7 +121,7 @@ submit_mr({
   project_path: "<解析出的 wkid/crm-web>",
   source_branch: "<BRANCH>",
   target_branch: "<该仓 dev 分支>",          // ⚠️ 联调 = dev 分支、不是测试分支、也不是 master
-  title: "[联调][<role>] <task.title>",       // role = task.role 中文 label、v>1 加版本号
+  title: "[联调][<角色>] <task.title>",       // 角色 = 设置页「我的角色」中文 label、无则省略；v>1 加版本号
   description: "<MR description、参考 ship 的 description 模板>",
   last_commit_hash: "<HEAD_SHA>",
 })

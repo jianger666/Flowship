@@ -42,4 +42,29 @@ export const register = (): void => {
   // V0.12：内置飞书 CLI（lark-cli / meegle）的 bin 目录注进 PATH——
   // SDK agent 是本进程子进程、继承后 shell 直接调两个 CLI（没装时目录不存在、无副作用）
   void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
+
+  // P0-02：启动幂等收紧密钥文件权限（config.json 0600 / mcp-oauth 0700+0600）
+  // 失败只 warn、不阻断启动；日志不含文件内容
+  void import("./lib/server/settings-fs").then((m) => m.hardenConfigFilePerms());
+  void import("./lib/server/mcp-oauth").then((m) => m.hardenMcpOAuthPerms());
+
+  // M2：清历史 task meta 里 repoBranchTemplates 的 {username} 残留（幂等、失败不阻断启动）
+  void import("./lib/server/migrate-username-templates")
+    .then((m) => m.migrateUsernameBranchTemplates())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] username 模板迁移失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
+  // 收件箱二期：出厂预置「改bug」custom action + skill（各记一次、删过不重装）
+  void import("./lib/server/preset-actions")
+    .then((m) => m.ensureBuiltinFixBugPreset())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 预置改bug 安装失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
 };

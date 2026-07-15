@@ -19,10 +19,12 @@ import { errorResponse } from "@/lib/server/route-helpers";
 export const runtime = "nodejs";
 
 export const GET = async () => {
-  const [appRules, settings] = await Promise.all([
+  const [appRules, settingsResult] = await Promise.all([
     listAppRules(),
     readSettingsFile(),
   ]);
+  const settings =
+    settingsResult.status === "ok" ? settingsResult.settings : null;
   const disabledArr = settings?.disabledRules;
   const disabled = new Set(
     Array.isArray(disabledArr)

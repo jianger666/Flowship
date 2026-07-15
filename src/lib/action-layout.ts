@@ -16,7 +16,6 @@ export const BUILTIN_ADVANCE_ACTIONS: Exclude<ActionType, "custom">[] = [
   "review",
   "dev",
   "ship",
-  "learn",
 ];
 
 const BUILTIN_SET = new Set<string>(BUILTIN_ADVANCE_ACTIONS);
@@ -65,3 +64,14 @@ export const arrangeByLayout = <T extends string>(
   const hiddenSet = new Set(layout.hidden);
   return sorted.filter((k) => !hiddenSet.has(k));
 };
+
+/**
+ * 从布局偏好里清掉某个 action id（删自定义 action 后同步调、防 order/hidden 残留鬼影 id）。
+ */
+export const removeActionLayoutId = (
+  layout: { order: string[]; hidden: string[] },
+  id: string,
+): { order: string[]; hidden: string[] } => ({
+  order: layout.order.filter((k) => k !== id),
+  hidden: layout.hidden.filter((k) => k !== id),
+});

@@ -13,7 +13,16 @@
  * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
  *   更新 / 卸载重装都不丢
  */
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  nativeImage,
+  nativeTheme,
+  Notification,
+  shell,
+} from "electron";
 import { spawn, execFile } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
 import {
@@ -601,11 +610,54 @@ ipcMain.handle("native-pick", async (_e, opts) => {
   return { paths: filePaths };
 });
 
+// ---------- 收件箱角标（三期注意力） ----------
+//
+// 页面 use-mr-inbox 未读数变化 → preload setInboxBadge → 这里：
+// - mac：app.setBadgeCount（Dock 数字；0 清除）
+// - win：setOverlayIcon（renderer canvas 画的红圆白字 PNG dataUrl；无图则清）
+// linux：无统一角标 API、忽略（仍可发系统通知）
+ipcMain.on("inbox:set-badge", (_e, payload) => {
+  const count = Math.max(0, Math.floor(Number(payload?.count) || 0));
+  try {
+    if (IS_MAC) {
+      app.setBadgeCount(count);
+    }
+  } catch (err) {
+    log(`[inbox-badge] setBadgeCount 失败（忽略）${err?.message || err}`);
+  }
+  if (process.platform !== "win32" || !mainWindow) return;
+  try {
+    if (count <= 0) {
+      mainWindow.setOverlayIcon(null, "");
+      return;
+    }
+    const dataUrl =
+      typeof payload?.dataUrl === "string" && payload.dataUrl.startsWith("data:image/")
+        ? payload.dataUrl
+        : null;
+    if (!dataUrl) {
+      // 无图时不强行 overlay（避免空白/坏图）、直接清
+      mainWindow.setOverlayIcon(null, "");
+      return;
+    }
+    const img = nativeImage.createFromDataURL(dataUrl);
+    if (img.isEmpty()) {
+      mainWindow.setOverlayIcon(null, "");
+      return;
+    }
+    const desc = count > 9 ? "9+ 条未读" : `${count} 条未读`;
+    mainWindow.setOverlayIcon(img, desc);
+  } catch (err) {
+    log(`[inbox-badge] setOverlayIcon 失败（忽略）${err?.message || err}`);
+  }
+});
+
 // ---------- 任务注意力通知（v0.9.5） ----------
 //
 // 页面（TaskAttentionWatcher）发现某 task 转入「等你回复 / 提问 / 失败」且窗口不在前台时、
 // IPC 过来发系统通知；点通知 → 聚焦窗口 + 回传 taskId 给页面路由跳转。
 // 通知只是「叫人回来」的信使、判断「什么时候该叫」全在页面侧（那边有完整任务状态）。
+// 收件箱增量通知也走同一通道（无 taskId、点通知只聚焦窗口）。
 ipcMain.on("task-notify", (_e, payload) => {
   if (!Notification.isSupported()) return;
   const title = typeof payload?.title === "string" ? payload.title.slice(0, 80) : "Flowship";
@@ -682,8 +734,8 @@ const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 let applyingStagedOnQuit = false;
 const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 
-// 「该版本是否已弹过对话框」持久化——同一个新版本只弹一次原生弹窗、
-// 之后（含重启 app 再查到同版本）只靠页面右上角「新版本」标识安静提醒
+// 「该版本是否已弹过错误框」持久化——仅用于 mac 暂存失败的 showErrorBox 去重
+// （发现新版本本身 2026-07-15 起不再弹窗、只静默点亮右上角徽标）
 const promptedFile = () => path.join(app.getPath("userData"), "update-prompted.json");
 
 const wasPrompted = async (version) => {
@@ -698,7 +750,7 @@ const markPrompted = async (version) => {
   try {
     await fs.writeFile(promptedFile(), JSON.stringify({ version }), "utf8");
   } catch {
-    // 写不进去顶多多弹一次、不影响主流程
+    // 写不进去顶多多弹一次错误框、不影响主流程
   }
 };
 
@@ -816,10 +868,14 @@ const cleanupUpdateLeftovers = async () => {
 // 必须自证：CI 用 Ed25519 私钥对「版本 + asset SHA-256 清单」签名产 update-manifest.json
 // （scripts/generate-update-manifest.mjs）、壳内置公钥先验签再验哈希、验不过保留旧应用。
 //
-// 启用步骤（维护者一次性）：跑 `node scripts/generate-update-keypair.mjs`、
-// 私钥进 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`、公钥（整段 PEM）贴到下面常量。
-// ⚠️ 留空 = 跳过验签只打警告（渐进启用、不打断存量用户更新）；配好后强制验签。
-const UPDATE_MANIFEST_PUBLIC_KEY = ``;
+// 公钥单一来源：同目录 update-manifest-public-key.pem（CI verify-update-manifest.mjs 共用、
+// 防双源漂移）。私钥只在 GitHub secret `UPDATE_MANIFEST_PRIVATE_KEY`。
+// **fail-closed**：公钥缺失 / manifest 下载失败 / 签名不匹配 / hash 不匹配 → 一律 throw、
+// 拒绝自动安装；调用方降级开 RELEASE_LATEST_URL 让用户手动下。
+const UPDATE_MANIFEST_PUBLIC_KEY_PATH = path.join(
+  __dirname,
+  "update-manifest-public-key.pem",
+);
 
 // 流式算文件 SHA-256（dmg 100MB+、不整读进内存）
 const sha256File = (file) =>
@@ -831,29 +887,44 @@ const sha256File = (file) =>
     stream.on("error", reject);
   });
 
-// 下载完的 dmg 验 manifest 签名 + SHA-256 + 大小。验不过 throw（调用方 catch 降级、
-// 此时还没动旧应用）；公钥未内置时跳过并 warn（渐进启用）。
+// 下载完的 dmg 验 manifest 签名 + SHA-256 + 大小。任一步不过 → throw（调用方 catch
+// 降级开下载页；此时还没动旧应用）。无「公钥空跳过」分支。
 const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
-  if (!UPDATE_MANIFEST_PUBLIC_KEY.trim()) {
-    log(
-      "[updater] ⚠️ 未内置更新验签公钥、跳过 manifest 校验——" +
-        "维护者请跑 scripts/generate-update-keypair.mjs 生成密钥对启用（CR-02）",
+  let publicKeyPem = "";
+  try {
+    publicKeyPem = readFileSync(UPDATE_MANIFEST_PUBLIC_KEY_PATH, "utf8").trim();
+  } catch (err) {
+    throw new Error(
+      `更新验签公钥缺失（${UPDATE_MANIFEST_PUBLIC_KEY_PATH}）：${err?.message || err}、已中止替换`,
     );
-    return;
   }
+  if (!publicKeyPem) {
+    throw new Error("更新验签公钥为空、已中止替换（fail-closed）");
+  }
+
   const manifestUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/update-manifest.json`;
-  const res = await fetch(manifestUrl);
+  let res;
+  try {
+    res = await fetch(manifestUrl);
+  } catch (err) {
+    throw new Error(`更新 manifest 下载失败：${err?.message || err}、已中止替换`);
+  }
   if (!res.ok) {
-    // 公钥已配置 = 发版链必产 manifest——拿不到就当被篡改 / 降级攻击、拒绝更新
+    // 发版链必产 manifest——拿不到就当被篡改 / 降级攻击、拒绝自动安装
     throw new Error(`更新 manifest 下载失败 HTTP ${res.status}、已中止替换`);
   }
-  const manifest = await res.json();
+  let manifest;
+  try {
+    manifest = await res.json();
+  } catch (err) {
+    throw new Error(`更新 manifest JSON 解析失败：${err?.message || err}、已中止替换`);
+  }
   // 验签 payload 只覆盖 version + files、跟 generate-update-manifest.mjs 同序重建
   const payload = JSON.stringify({ version: manifest.version, files: manifest.files });
   const ok = verify(
     null, // Ed25519 内建 digest
     Buffer.from(payload, "utf8"),
-    createPublicKey(UPDATE_MANIFEST_PUBLIC_KEY),
+    createPublicKey(publicKeyPem),
     Buffer.from(String(manifest.signature ?? ""), "base64"),
   );
   if (!ok) throw new Error("更新 manifest 签名校验失败、已中止替换");
@@ -1093,7 +1164,7 @@ const applyStagedUpdateOnQuit = async () => {
 
 // mac 发现新版后的入口（保留函数名、供 installUpdateNow 调用）：
 // 下载暂存（已暂存则跳过）→ 立刻套用并 relaunch。
-// 「稍后」不走这里——只由 promptUpdateOnce 取消分支 / 退出钩子处理。
+// 「稍后」不走这里——用户不点徽标时由退出钩子套用已暂存包。
 const macSelfUpdate = async (version) => {
   try {
     await downloadAndStageMacUpdate(version);
@@ -1110,9 +1181,9 @@ const macSelfUpdate = async (version) => {
   }
 };
 
-// 应用更新（页面点「新版本」标识、或对话框确认走到这）：
-// mac：确保已暂存 → apply + relaunch（「稍后」留下的暂存在此套用；未暂存则先下）
-// win：此刻才开始下载（autoDownload=false）、下载完弹「立即重启」→ quitAndInstall
+// 应用更新（页面点右上角「新版本」徽标走到这；发现新版本身不弹窗，2026-07-15 用户拍板）：
+// mac：确保已暂存 → apply + relaunch（轮询已后台暂存的包在此套用；未暂存则先下）
+// win：此刻才开始下载（autoDownload=false）、下载完弹「立即重启」→ quitAndInstall（用户主动点徽标触发，保留）
 const installUpdateNow = async () => {
   if (!updateReadyVersion) return;
   if (UPDATE_MODE === "download") {
@@ -1136,22 +1207,6 @@ const installUpdateNow = async () => {
   }
 };
 
-// 「发现新版本」对话框（win / mac 文案、按钮行为不同、弹一次的记账共用）
-const promptUpdateOnce = async (version, { message, detail, confirmLabel }) => {
-  if (await wasPrompted(version)) return;
-  await markPrompted(version);
-  const { response } = await dialog.showMessageBox(mainWindow, {
-    type: "info",
-    title: "发现新版本",
-    message,
-    detail,
-    buttons: [confirmLabel, "稍后"],
-    defaultId: 0,
-    cancelId: 1,
-  });
-  if (response === 0) await installUpdateNow();
-};
-
 // mac：查 GitHub latest release 的版本号——请求 /releases/latest 拿 302 的
 // location（…/releases/tag/vX.Y.Z）抠版本、不走 API 不吃 rate limit
 const fetchLatestVersion = async () => {
@@ -1162,7 +1217,7 @@ const fetchLatestVersion = async () => {
 };
 
 // 每 2 小时轮询一次更新——app 长期开着不关（同事习惯）也能收到新版提醒、
-// 不止在启动时查一次（v0.7.22）。同版本只弹一次靠 promptUpdateOnce 的 wasPrompted 去重。
+// 不止在启动时查一次（v0.7.22）。发现新版只静默点亮徽标、不弹窗（2026-07-15）。
 const UPDATE_POLL_MS = 2 * 60 * 60 * 1000;
 
 // win electron-updater 单例：首次用到时初始化、轮询 / 手动检查 / 下载复用同一个、不重复注册监听器
@@ -1208,9 +1263,10 @@ const ensureWinAutoUpdater = async () => {
 };
 
 // 查一次更新（启动 + 每 2h 轮询都走这）。
-// win：只查版本号、点按钮才下载（electron-updater autoDownload=false）。
-// mac：查到新版后立刻后台下载暂存（不碰 /Applications）→ 弹一次「立即更新 / 稍后」；
-//       立即 = apply+relaunch；稍后 = 暂存留着、退出时再套用、徽标可再点立即。
+// 发现新版一律不弹窗、只静默点亮右上角「新版本」徽标（2026-07-15 用户拍板）。
+// win：只查版本号、用户点徽标才下载（electron-updater autoDownload=false）。
+// mac：查到新版后立刻后台下载暂存（不碰 /Applications）；点徽标 = apply+relaunch，
+//       不点则退出时自动套用；暂存失败仍弹 showErrorBox（每版本一次、降级手动下载）。
 const runUpdateCheck = async () => {
   try {
     const current = app.getVersion();
@@ -1227,30 +1283,25 @@ const runUpdateCheck = async () => {
     log(`[updater] 发现新版本 v${latest}（当前 v${current}）`);
     notifyPageUpdateReady();
 
-    // mac：先下载暂存（已暂存同版本则跳过），完成后再弹框——保证「立即」只做替换重启
+    // mac：后台下载暂存（已暂存同版本则跳过）——不弹窗；点徽标秒装 / 退出时自动套用
     if (UPDATE_MODE === "download") {
       try {
         await downloadAndStageMacUpdate(latest);
       } catch (err) {
-        // 后台轮询失败不弹 error box（免 2h 骚扰）；徽标已亮、点徽标会重试并提示
-        log(`[updater] mac 暂存失败（忽略、等用户点徽标重试）${err?.message || err}`);
-        return;
+        // 验签 / 下载失败 = 拒绝自动安装；徽标已亮，提示一次并开下载页（点徽标仍可重试）
+        log(
+          `[updater] mac 暂存失败（拒绝自动安装、降级手动下载）${err?.message || err}`,
+        );
+        if (!(await wasPrompted(latest))) {
+          await markPrompted(latest);
+          dialog.showErrorBox(
+            "自动更新不可用",
+            `发现新版本 v${latest}，但自动安装未通过完整性校验：\n${err?.message || err}\n\n将打开下载页，请手动下载安装。`,
+          );
+          void shell.openExternal(RELEASE_LATEST_URL);
+        }
       }
-      await promptUpdateOnce(latest, {
-        message: `新版本 v${latest} 已就绪`,
-        detail:
-          "点「立即更新」替换并重启；点「稍后」继续用当前版本，退出应用时自动装上。也可随时点右上角「新版本」。",
-        confirmLabel: "立即更新",
-      });
-      return;
     }
-
-    await promptUpdateOnce(latest, {
-      message: `新版本 v${latest} 已发布`,
-      detail:
-        "点「立即更新」自动下载安装（进度在任务栏显示）、完成后重启生效、数据不丢。点「稍后」的话、随时点页面右上角「新版本」标识。",
-      confirmLabel: "立即更新",
-    });
   } catch (err) {
     // 更新失败不影响正常使用（如离线 / GitHub 不可达）
     log(`[updater] 检查更新失败（忽略）${err?.message || err}`);
@@ -1258,7 +1309,7 @@ const runUpdateCheck = async () => {
 };
 
 const setupAutoUpdate = async () => {
-  // 测试实例版本号永远是 0.0.0-dev、查更新必弹「发现新版本」、纯骚扰——跳过
+  // 测试实例版本号永远是 0.0.0-dev、查更新必点亮「新版本」徽标、纯骚扰——跳过
   if (!app.isPackaged || IS_TEST) return;
   // win：预初始化 electron-updater（autoDownload=false + 注册事件、仅一次、见 ensureWinAutoUpdater）
   if (process.platform === "win32") {

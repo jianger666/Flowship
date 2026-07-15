@@ -27,7 +27,7 @@ export const DEFAULT_BRANCH_TEMPLATE = "feature/{storyId}-{taskTitle}";
  *
  * 注意：`/` 也换成 -——变量值不该自带路径层级、层级由模板字面控制。
  */
-export const sanitizeBranchSegment = (s: string): string =>
+const sanitizeBranchSegment = (s: string): string =>
   s
     .trim()
     .replace(/[\s\\/:*?"<>|~^@【】（）()\[\]{}]+/g, "-")

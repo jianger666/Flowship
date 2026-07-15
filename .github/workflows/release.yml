@@ -169,6 +169,7 @@ jobs:
       # 不能放回 mac matrix job：两 job 会各自生成只含自己 dmg 的 manifest、后跑的
       # --clobber 覆盖先跑的、壳 verifyDownloadedUpdate 按文件名找条目会缺架构。
       # 顺序必须在转正之前：published 后 /releases/latest 可见、manifest 必须已齐全。
+      # fail-closed：无私钥 / 签名失败 / 验签不过 / 文件缺失 → 整 job 红、draft 不转正
       - name: 生成并上传 update-manifest
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -184,10 +185,16 @@ jobs:
             echo "::error::mac dmg 应为 2 枚（arm64+x64）、实际 ${#DMGS[@]} 枚、拒绝生成残缺 update-manifest / 转正"
             exit 1
           fi
+          # 私钥缺失时脚本 exit 1（不再 warn 跳过）
           node scripts/generate-update-manifest.mjs "$VERSION" "${DMGS[@]}"
-          if [ -f update-manifest.json ]; then
-            gh release upload "$GITHUB_REF_NAME" update-manifest.json --clobber
+          if [ ! -f update-manifest.json ]; then
+            echo "::error::update-manifest.json 未生成、拒绝上传 / 转正"
+            exit 1
           fi
+          # 用壳内置公钥（electron-app/update-manifest-public-key.pem）自检验签——
+          # 私钥/公钥不匹配会在转正前拦下，避免发出「壳永远装不上」的 release
+          node scripts/verify-update-manifest.mjs update-manifest.json
+          gh release upload "$GITHUB_REF_NAME" update-manifest.json --clobber
         shell: bash
         env:
           UPDATE_MANIFEST_PRIVATE_KEY: ${{ secrets.UPDATE_MANIFEST_PRIVATE_KEY }}

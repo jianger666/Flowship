@@ -28,7 +28,6 @@ const baseTask = (over: Partial<Task> = {}): Task =>
       { id: "act_3", n: 3, type: "ship", status: "running" },
     ],
     mrs: [],
-    role: "fe",
     repoPaths: [REPO],
     gitBranches: [{ repoPath: REPO, name: "feature/me/123-x", createdAt: 0 }],
     repoTestBranches: { [REPO]: "test" },

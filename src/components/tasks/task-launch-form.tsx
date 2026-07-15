@@ -8,7 +8,7 @@
  * - 看板「手动建任务」→ `/workitems/new`（无预填）→ 标题手填、飞书链接可粘贴
  *
  * 零操作设计（解「不选仓库就卡住」的痛点）：
- * - 仓库 / 角色预填「上次启动用的」（localStorage 记忆）、90% 场景直接点启动
+ * - 仓库预填「上次启动用的」（localStorage 记忆）、90% 场景直接点启动
  * - 真缺仓库时启动置灰 + 琥珀高亮引导（卡点可见、不是谜题）
  * - 标题预填工作项名（可改）；飞书链接：有预填则固定带入、无预填则可编辑
  */
@@ -38,20 +38,23 @@ import {
   type ModelSelection,
   type RepoConfig,
   type Task,
-  type TaskRole,
 } from "@/lib/types";
 
-// 上次启动配置的记忆 key（仓库组合 + 角色——下次预填、零操作启动）
+// 上次启动配置的记忆 key（仓库组合——下次预填、零操作启动）
 const LAST_LAUNCH_KEY = "feaiflow.lastLaunch.v1";
 
 interface LastLaunch {
   repoPaths?: string[];
-  role?: TaskRole;
+  // 旧版曾存 role、读时忽略、写时不再带
 }
 
 const readLastLaunch = (): LastLaunch => {
   try {
-    return JSON.parse(localStorage.getItem(LAST_LAUNCH_KEY) ?? "{}") as LastLaunch;
+    const raw = JSON.parse(
+      localStorage.getItem(LAST_LAUNCH_KEY) ?? "{}",
+    ) as LastLaunch & { role?: unknown };
+    // 丢弃历史 role 字段（任务角色已退役）
+    return { repoPaths: raw.repoPaths };
   } catch {
     return {};
   }
@@ -72,10 +75,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [storyUrl, setStoryUrl] = useState(feishuStoryUrl);
   // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入
   const urlEditable = !feishuStoryUrl.trim();
-  // 角色（预填上次的）
-  // 角色默认自适应（v1.1.x 用户拍板隐藏选择器）：AI 从需求 + 仓库自己判断视角；
-  // 上次启动记忆若有旧值仍尊重（老用户习惯）、但 UI 不再暴露选择
-  const [role, setRole] = useState<TaskRole | "">("adaptive");
   // 目标仓库（预填上次的、过滤掉已从设置删除的）
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
   // per-repo「已有工作分支」覆盖
@@ -111,7 +110,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     // 只配了一个仓库时天然零操作：直接选它
     if (validPaths.length > 0) setRepoPaths(validPaths);
     else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
-    if (last.role) setRole(last.role);
     if (s.apiKey?.trim()) void fetchModels(s.apiKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅 mount 预填一次
   }, []);
@@ -139,9 +137,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       !submitting &&
       !!title.trim() &&
       repoPaths.length > 0 &&
-      !!role &&
       !!storyUrl.trim(),
-    [submitting, title, repoPaths, role, storyUrl],
+    [submitting, title, repoPaths, storyUrl],
   );
   // 缺项引导文案（启动置灰时告诉用户差什么、防隐性卡点）
   const missingHint = useMemo(() => {
@@ -187,7 +184,6 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
       const task = await createTask({
         mode: "task",
-        role: role || undefined,
         title: title.trim(),
         repoPaths,
         feishuStoryUrl: storyUrl.trim(),
@@ -206,13 +202,12 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         isolateWorktree: forcedInRepo ? false : !runInRepo,
         model,
       });
-      // 记住这次的配置、下次预填零操作（只记仓库 + 角色；runInRepo / isolate 不入记忆）
+      // 记住这次的仓库组合、下次预填零操作（旧 LastLaunch.role 不再写入）
       try {
         localStorage.setItem(
           LAST_LAUNCH_KEY,
           JSON.stringify({
             repoPaths,
-            role: role || undefined,
           } satisfies LastLaunch),
         );
       } catch {

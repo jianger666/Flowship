@@ -26,7 +26,7 @@
 import { ACTION_TYPES, type ActionType, type JumpIde } from "./types";
 
 /** Windows 盘符绝对路径（`D:\...` / `D:/...`）。归一化前后都能判。 */
-export const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
+const isWindowsAbsPath = (p: string): boolean => /^[a-zA-Z]:[\\/]/.test(p);
 
 /**
  * 跨平台绝对路径判断（CR-11、client / server route 共用单一源）：

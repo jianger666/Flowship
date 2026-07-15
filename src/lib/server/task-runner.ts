@@ -4,7 +4,7 @@
  * # 整体模型（详见 docs/V0.6-REFACTOR.md）
  *
  * - **task 容器 + action 历史**：task = 需求生命周期容器、action = 单次动作
- *   （plan / build / review / ship / learn / dev）、用户自由触发
+ *   （plan / build / review / ship / dev）、用户自由触发
  * - **单 SDK Run 永生**：整个 task 共用一个 Agent + Run、task 终态前不退
  * - **每次推进** = 后端 `appendAction` + 向 agent 发 `[NEXT_ACTION ...]` 指令
  * - **用户输入条消息** = `agent.send([USER_MESSAGE]…)`（V0.13.x 统一语义）
@@ -60,6 +60,8 @@ import {
   getPendingAsk,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
+  unsetChatAwaitingNotifierIf,
+  unsetChatTaskActionHandlerIf,
   type AwaitingNotifier,
   type ChatTaskActionHandler,
 } from "./chat-pending";
@@ -86,7 +88,7 @@ import {
 } from "./cursor-config";
 import { resolveEffectiveGitHost } from "./gitlab-host";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
-import { filterHealthyMcp } from "./mcp-probe";
+import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
@@ -127,7 +129,6 @@ import {
 import type {
   ActionRecord,
   ActionType,
-  AskUserQuestion,
   DevPushMode,
   RepoStatus,
   ReplanMode,
@@ -141,7 +142,7 @@ import {
   actionDisplayLabel,
   mrTargetBranchOf,
 } from "@/lib/task-display";
-import { isAskSettled } from "@/lib/ask-pending";
+import { supersedePendingAsks } from "./ask-supersede";
 
 // ----------------- 配置 -----------------
 
@@ -151,50 +152,8 @@ const TASK_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 // chat-mcp 在 Agent.mcpServers 里的注册名（agent prompt 里得点明、跟 V0.5 沿用）
 const TASK_TOOL_MCP_NAME = "aiFlowChat";
 
-/**
- * 作废 task 下「当前还没被回答的 ask_user_request」。
- *
- * 为什么需要（用户实测踩坑、断线重启「多弹窗并发」根因）：
- *   旧 agent 被 cancel / 断线后、它发起的那组 ask 的 token 已失效、永远不会再被 resolve。
- *   但前端 AskUserDialog 只看「ask_user_request 有没有配对的 ask_user_reply」来决定弹不弹——
- *   不作废这条孤儿 ask、它会永久 pending：重启后反复复活弹窗、用户答了必 410（agent 没了）
- *   再把 runStatus 打回 error、和失效态/restart_intent 弹窗在单例上反复横跳、关不完。
- *
- * 作废方式：写一条 info 事件标记 `meta.supersededAskId=askId`（不补 ask_user_reply——那会让
- *   事件流显示成「你的回答」、语义不对；也不走 deferred——断线是被动打断、不是用户主动放弃）。
- *   前端 pendingEvent / AskUserRequestRow 据此把这条旧 ask 当「已失效」、不再弹。
- *
- * 调用方：
- *   - advanceTask（起新 agent）/ stop 路由：只清孤儿（开新 action / 主动停、不续传）、忽略返回值
- *
- * @returns 最近一条被作废的 ask 的 questions（供重启时让新 agent 断点续传重新问）、没有则空数组。
- */
-export const supersedePendingAsks = async (
-  taskId: string,
-  reason: string,
-): Promise<AskUserQuestion[]> => {
-  const task = await getTask(taskId);
-  if (!task) return [];
-  // 最近一条未答 ask 的问题（events 正序遍历、后命中的覆盖前面的 = 时间上最近的那组）
-  let latestQuestions: AskUserQuestion[] = [];
-  for (const ev of task.events) {
-    if (ev.kind !== "ask_user_request") continue;
-    const askId = typeof ev.meta?.askId === "string" ? ev.meta.askId : null;
-    if (!askId) continue;
-    // 已被回答 / 已被作废过的跳过（幂等：重复重启不重复写标记、判定见 lib/ask-pending）
-    if (isAskSettled(task.events, askId)) continue;
-    await writeEventAndPublish(taskId, {
-      kind: "info",
-      actionId: ev.actionId,
-      text: `上一组提问因${reason}失效、无需再回答。`,
-      meta: { supersededAskId: askId },
-    });
-    if (Array.isArray(ev.meta?.questions)) {
-      latestQuestions = ev.meta.questions as AskUserQuestion[];
-    }
-  }
-  return latestQuestions;
-};
+/** 对外保持 task-runner 原路径可 import（实现在 ask-supersede.ts） */
+export { supersedePendingAsks };
 
 // ----------------- 公开 query API -----------------
 
@@ -207,7 +166,7 @@ export interface SessionCreds {
   // resume 后的 send 必须有显式 model（恢复的本地 agent 不保留 model、实测踩过）；
   // 服务端优先用 task 自己记的模型（最近 action 的 agentModel）、这里是兜底
   model?: ModelSelection;
-  gitHost?: string;
+  // PAT 仍来自 settings；host 不进凭据——registerSessionBridges 按 task.repoPaths 现推
   gitToken?: string;
 }
 
@@ -298,13 +257,12 @@ export const cancelTaskRun = (taskId: string): boolean => {
  * # 为什么后台跑（线上踩过）
  * check 若在 awaitingNotifier 里被 `submit_work` MCP 工具**同步 await**、工具就要阻塞到
  * check 跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
- * 改成：notifier 立即返回（agent 秒回引导、第一时间挂 curl long-poll 等 ack）、check 在这里后台跑、
- * 跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
- * （v0.9.13 CheckRun 删除后 check 只剩 artifact 读文件 + git status hash、通常秒级、
- *   但 review 多仓 git 指纹仍可能上秒、后台架构保留。）
+ * 改成：notifier 立即返回、check 在这里后台跑、跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
+ * （交付诚实性检查多为 artifact 读文件 + git status hash、通常秒级；
+ *   review 多仓 git 指纹仍可能上秒、后台架构保留。）
  *
  * # 去重 + 取消（消灭重复跑 + 状态交错）
- * 一个 task 同时只允许一个在跑的 check（runningChecks）。新一轮 wait（如 revise 改完代码再 wait）会
+ * 一个 task 同时只允许一个在跑的 check（runningChecks）。新一轮交卷（如按反馈改完再 submit_work）会
  * abort 旧的、用最新代码重跑。停止 / 推进新 action 调 abortRunningCheck。check 跑完前判「自己是否仍是
  * 当前 check + action 是否仍在 running」——被顶替 / abort / action 已 cancelled → 丢弃结果、不写状态不发事件
  * （否则会出现「旧 action 的 check 跑完后在新 action 运行期间冒出『产出完成』事件」的交错、线上踩过）。
@@ -426,19 +384,6 @@ export const abortRunningCheck = (taskId: string): void => {
   );
 };
 
-/**
- * V0.6.3：agent_id 反查 task_id（stop hook 认领用）
- *
- * runningTasks 是 task_id → { agentId, ... }、这里遍历找 agentId 匹配的（活着的 task 数量很小、
- * 遍历开销可忽略）。找不到 = 不是当前活着的 fe task（IDE agent / 已死 task）、stop hook 应放行。
- */
-export const findTaskIdByAgentId = (agentId: string): string | null => {
-  for (const [taskId, rec] of runningTasks) {
-    if (rec.agentId === agentId) return taskId;
-  }
-  return null;
-};
-
 // ----------------- 公开 mutation API -----------------
 
 /**
@@ -465,9 +410,8 @@ export interface AdvanceTaskInput {
   // true = 续用内存里活着的 agent entry（续接 [NEXT_ACTION]、省 send 配额）；
   // 注：ACTION_FRESH_AGENT_DEFAULT 里 true 的 action（review）勾了续用也强起 fresh。
   reuseAgent?: boolean;
-  // V0.6.1 ship action 用：GitLab host（不带协议）+ Personal Access Token
-  // 来自 settings.gitHost / gitToken、agent 启动时快照、改 token 需 forceNewAgent
-  gitHost?: string;
+  // V0.6.1 ship action 用：GitLab PAT（来自 settings.gitToken、agent 启动时快照）
+  // Host 不由调用方传——一律 resolveEffectiveGitHost(task.repoPaths) 现推
   gitToken?: string;
   // V0.6.23：build 分批——本次做哪些批次（推进 dialog 勾选、仅 build、空=自由改动不计进度）
   requestedBatchIds?: string[];
@@ -561,6 +505,56 @@ const runAdvanceExclusive = async <T>(
   }
 };
 
+/**
+ * v1.1.x 提速：建任务后立刻后台预热隔离工作区（fire-and-forget、/api/tasks POST 调）。
+ * worktree 首建（fetch / worktree add / 依赖克隆）动辄十几秒到分钟级、原先全部串行
+ * 算在第一次推进的「agent 启动时间」里——提前到建任务后台做、推进时 ensure 幂等秒过。
+ *
+ * - 走 runAdvanceExclusive 与「建完秒推进」串行：ensureTaskWorktrees 幂等但不可与自己并发
+ *  （两边同时 `git worktree add` 会撞）；预热先拿到锁时推进排队等它、后拿到时 ensure 秒过。
+ * - 失败只 log 不写 error 事件：推进入口的 ensure 是权威兜底、届时给出带处置建议的报错。
+ */
+export const prewarmTaskWorkspace = (taskId: string): void => {
+  void runAdvanceExclusive(taskId, async () => {
+    const task = await getTask(taskId);
+    if (!task || !isWorktreeTask(task)) return;
+    try {
+      const ensured = await ensureTaskWorktrees(task);
+      // 同 advanceTaskInner：仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值）
+      const existingRepos = new Set(
+        (task.gitBranches ?? []).map((b) => b.repoPath),
+      );
+      for (const info of ensured.infos) {
+        if (!existingRepos.has(info.repoPath)) {
+          await upsertGitBranch(task.id, info);
+        }
+      }
+      if (ensured.createdRepos.length > 0) {
+        const cloneNote =
+          ensured.clonedDeps.length > 0
+            ? `；依赖目录已从原仓库秒级克隆（${ensured.clonedDeps
+                .map(
+                  (c) =>
+                    `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
+                )
+                .join("、")}）`
+            : "";
+        await writeEventAndPublish(task.id, {
+          kind: "info",
+          text: `已后台预热任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
+            .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+            .join("、")}${cloneNote}——推进时无需再等待创建`,
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `[task-runner] task=${taskId} 后台预热 worktree 失败（推进时会重试并报具体原因）：`,
+        err,
+      );
+    }
+  });
+};
+
 export const advanceTask = async (
   input: AdvanceTaskInput,
 ): Promise<{ action: ActionRecord }> =>
@@ -577,7 +571,6 @@ const advanceTaskInner = async (
     apiKey,
     model,
     reuseAgent,
-    gitHost,
     gitToken,
     requestedBatchIds,
     devPushMode,
@@ -621,7 +614,7 @@ const advanceTaskInner = async (
   //   创建失败直接抛（带处置建议）、不带病起 agent。
   if (isWorktreeTask(task)) {
     const ensured = await ensureTaskWorktrees(task);
-    // 仅新仓 upsert gitBranches（老条目保留 createdAt / baseBranch 历史值、跟 build hint 老规则一致）
+    // 仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值、跟 build hint 老规则一致）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
       if (!existingRepos.has(info.repoPath)) {
@@ -684,9 +677,9 @@ const advanceTaskInner = async (
     task = (await getTask(task.id)) ?? task;
   }
 
-  // 1) 准入条件（V0.6 门槛 1）
+  // 1) 准入条件（V0.6 门槛 1）：host 按任务仓库 remote 现推（多实例不一致会 throw）
   const effectiveGitHost =
-    (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+    (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
   const pre = checkActionPrerequisites(task, actionType, {
     gitHost: effectiveGitHost,
     gitToken,
@@ -747,7 +740,7 @@ const advanceTaskInner = async (
   if (actionType === "build" && !isWorktreeTask(taskAfterAppend)) {
     const planned = planBranchesForBuild(taskAfterAppend);
     if (planned) {
-      // 仅新仓 upsert（已存在的保留 createdAt / baseBranch 历史值、不覆盖）
+      // 仅新仓 upsert（已存在的保留 baseBranch 历史值、不覆盖）
       const existingRepos = new Set(
         (taskAfterAppend.gitBranches ?? []).map((b) => b.repoPath),
       );
@@ -816,7 +809,7 @@ const advanceTaskInner = async (
         imagePaths: attachedImagePaths,
         attachmentPaths: attachedFilePaths,
       }),
-      { errorActionId: action.id, creds: { apiKey, gitHost, gitToken } },
+      { errorActionId: action.id, creds: { apiKey, gitToken } },
     );
     if (ok) return { action };
     // 会话失效（send 抛错已被 close）→ 降级 force-new
@@ -855,7 +848,6 @@ const advanceTaskInner = async (
     branchCheckoutHint,
     apiKey,
     model,
-    gitHost: effectiveGitHost,
     gitToken,
     batchDirective,
     replanDirective,
@@ -883,7 +875,6 @@ export interface ResumeCurrentActionInput {
   fallbackModel: ModelSelection;
   /** 用户在输入条显式选的模型（V0.13.x：换模型唤醒、最高优先——用户意图就是换个模型继续干） */
   forceModel?: ModelSelection;
-  gitHost?: string;
   gitToken?: string;
 }
 
@@ -1005,7 +996,6 @@ const resumeCurrentActionInner = async (
     branchCheckoutHint,
     apiKey: input.apiKey,
     model,
-    gitHost: input.gitHost,
     gitToken: input.gitToken,
     batchDirective,
     replanDirective,
@@ -1090,20 +1080,23 @@ export const finalizeTask = async (
       console.warn(`[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`, err);
       return null;
     });
-    if (removed?.removedAny || (removed?.skippedRepos.length ?? 0) > 0) {
+    if (
+      removed?.removedAny ||
+      (removed?.snapshotFailedRepos.length ?? 0) > 0
+    ) {
       const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
       const snapshotNote =
         removed && removed.snapshotRepos.length > 0
           ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
           : "";
-      // 快照落不了（merge/rebase 冲突中等）的仓不删、必须让用户知道目录还在哪等处理
-      const skippedNote =
-        removed && removed.skippedRepos.length > 0
-          ? `；⚠️ ${removed.skippedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动（如 merge 冲突中）、工作区目录已保留未删、请自行处理后可手动删除`
+      // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
+      const failedNote =
+        removed && removed.snapshotFailedRepos.length > 0
+          ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
           : "";
       await writeEventAndPublish(taskId, {
         kind: "info",
-        text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${skippedNote}）`,
+        text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
       });
     }
   }
@@ -1149,8 +1142,8 @@ interface StartAgentInput {
   branchCheckoutHint?: string;
   apiKey: string;
   model: ModelSelection;
-  // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包
-  gitHost?: string;
+  // V0.6.1 ship action 用：注册 task-scoped action handler 时闭包 PAT
+  // Host 在 registerSessionBridges / prompt 注入时按 task.repoPaths 现推
   gitToken?: string;
   // V0.6.23：build 分批指令（仅 build 有值、拼进首个 NEXT_ACTION）
   batchDirective?: string;
@@ -1163,14 +1156,24 @@ interface StartAgentInput {
 // taskActionHandler（submit_mr / set_feishu_testers / set_plan_batches 同步 RPC）+
 // awaitingNotifier（交卷跑后置 check / ask 弹窗事件 / 切 awaiting）原来是 internalStartAgent
 // 的内联闭包；V0.11.1 抽出来：Agent.resume 恢复会话时也必须重注册这两座桥、否则恢复后的
-// agent 调 submit_mr / submit_work 全部落空。闭包持 gitHost / gitToken 快照（会话期不可变）。
+// agent 调 submit_mr / submit_work 全部落空。闭包持 gitToken 快照（会话期不可变）；
+// host 在 submit_mr 时按 task.repoPaths 现推（不吃历史 settings.gitHost）。
 const registerSessionBridges = (
   task: Task,
-  opts: { gitHost?: string; gitToken?: string } = {},
-): void => {
-  const { gitHost, gitToken } = opts;
+  opts: { gitToken?: string } = {},
+): { taskActionHandler: ChatTaskActionHandler; awaitingNotifier: AwaitingNotifier } => {
+  const { gitToken } = opts;
   const taskActionHandler: ChatTaskActionHandler = async (taskAction) => {
     if (taskAction.kind === "submit_mr") {
+      let gitHost: string | null = null;
+      try {
+        gitHost = await resolveEffectiveGitHost(task.repoPaths);
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
       if (!gitHost || !gitToken) {
         return {
           ok: false,
@@ -1293,7 +1296,6 @@ const registerSessionBridges = (
         title: mr.title,
         branch: mr.sourceBranch,
         status: "open",
-        createdByActionId: mr.actionId,
         lastCommitHash: mr.lastCommitHash,
         hasConflicts,
         mergeStatus: detailedStatus,
@@ -1413,8 +1415,7 @@ const registerSessionBridges = (
   };
   setChatTaskActionHandler(task.id, taskActionHandler);
 
-  // 3) 注册 awaiting notifier（chat-mcp → runner 的回调）
-  // 具名化：同 taskActionHandler、finally 走 conditional unset 防 force-new-agent race 误清
+  // 具名化：create 失败 / 旧会话迟到清理走 conditional unset，防 force-new-agent race 误清新 handler
   const awaitingNotifier: AwaitingNotifier = async (signal) => {
     if (signal.kind === "ask_user_request") {
       // 新提问落盘前、先作废旧的未了结提问（同事踩坑根因）：
@@ -1457,6 +1458,7 @@ const registerSessionBridges = (
     }
   };
   setChatAwaitingNotifier(task.id, awaitingNotifier);
+  return { taskActionHandler, awaitingNotifier };
 };
 
 /**
@@ -1490,17 +1492,21 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     branchCheckoutHint,
     apiKey,
     model,
-    gitHost,
     gitToken,
     batchDirective,
     replanDirective,
   } = input;
 
+  // 打点（v1.1.x「SDK 比 IDE 慢」排查）：启动链路各段耗时、[perf] 前缀统一可 grep 统计
+  const perfStart = Date.now();
+
   // 兜底：调用方约定已 ensure，但 resume / 问一问 / 手删 worktree 等路径可能漏——入口再保证一次
   await ensureWorkspaceReady(task);
+  const perfWorkspaceMs = Date.now() - perfStart;
 
+  // host 按任务仓库 remote 现推（多实例不一致会 throw、起 agent 失败可见）
   const effectiveGitHost =
-    (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
+    (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
 
   // 已有活 entry 时不重启（advanceTask 入口已处理 forceNewAgent 时的 cancel）
   if (runningTasks.has(task.id)) {
@@ -1511,8 +1517,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   }
 
   // 1) merge MCP（V0.11.1 抽成共用 helper、resume 会话时也要重传 inline MCP）
+  const perfMcpStart = Date.now();
   const { mergedMcp, cursorMcpNames, droppedMcp } =
     await buildMergedMcpForTask(task);
+  const perfMcpMs = Date.now() - perfMcpStart;
   const mcpDesc = `Task MCP: ${TASK_TOOL_MCP_NAME}${
     cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
   }`;
@@ -1536,7 +1544,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
   // 2) 注册 task-scoped action handler + awaiting notifier（V0.11.1 抽成共用工厂、
   //    resume 会话时也要重注册——见 registerSessionBridges）
-  registerSessionBridges(task, { gitHost: effectiveGitHost, gitToken });
+  const bridges = registerSessionBridges(task, { gitToken });
 
 
   // 4) 启动 Agent + 首个 run（在独立 Promise 里跑、advanceTask 立即返回）
@@ -1549,6 +1557,17 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const effectiveCwd = getTaskCwd(task);
       await cleanupFeHooksJson(effectiveCwd);
 
+      // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills 读盘、identity 走
+      // meegle CLI 都可达秒级——create 冷启动本身要数秒、重叠后首 token 提前。
+      // 侧挂 catch 防「create 期间先 reject」的 unhandledRejection 噪音（await 时仍抛）。
+      const skillsPromise = loadSkills().catch((err) => {
+        console.error("[task-runner] loadSkills failed", err);
+        return [] as SkillEntry[];
+      });
+      const identityPromise = resolveUserIdentityForPrompt();
+      identityPromise.catch(() => {});
+
+      const perfCreateStart = Date.now();
       agent = await Agent.create({
         apiKey,
         model,
@@ -1559,6 +1578,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         local: { cwd: effectiveCwd, settingSources: [] },
         mcpServers: mergedMcp,
       });
+      const perfCreateMs = Date.now() - perfCreateStart;
       console.log(
         `[task-runner] task=${task.id} Agent.create OK agentId=${agent.agentId}`,
       );
@@ -1574,13 +1594,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       });
       void setTaskSessionAgentId(task.id, agent.agentId);
 
-      // 加载 skills：平台自带 + app 自管 + 全局（全部 fe 注入 prompt、不靠 settingSources）
-      const skills = await loadSkills().catch((err) => {
-        console.error("[task-runner] loadSkills failed", err);
-        return [] as SkillEntry[];
-      });
-      // 飞书项目推导发起人姓名 + 设置页角色（失败返空串、不堵启动）
-      const userIdentityLine = await resolveUserIdentityForPrompt();
+      // 收割 create 前发起的并行加载（见上）——skills 注入 prompt、identity 拼发起人行
+      const perfPromptStart = Date.now();
+      const skills = await skillsPromise;
+      const userIdentityLine = await identityPromise;
       // settings 配了 gitToken 才注入「GitLab 访问」段（给 agent 铺正路读 config.json）
       const gitlabAccessSection =
         gitToken && gitToken.trim().length > 0
@@ -1601,8 +1618,18 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         userIdentityLine,
         gitlabAccessSection,
       );
+      const perfPromptMs = Date.now() - perfPromptStart;
 
+      const perfSendStart = Date.now();
       const run = await agent.send(superPrompt);
+      // 单行汇总（不写 events、纯日志）：workspace=worktree 确保、mcp=健康探测+merge、
+      // create=SDK 冷启动、prompt=素材收割+拼装（含首包字节数）、send=Run 受理、total=自点推进起
+      console.log(
+        `[perf] task=${task.id} action=${action.type} start-chain ` +
+          `workspace=${perfWorkspaceMs}ms mcp=${perfMcpMs}ms create=${perfCreateMs}ms ` +
+          `prompt=${perfPromptMs}ms/${Math.round(Buffer.byteLength(superPrompt, "utf-8") / 1024)}KB ` +
+          `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
+      );
       await consumeSessionRun(task, agent, run, { errorActionId: action.id });
     } catch (err) {
       // Agent.create / 首次 send 阶段失败（consumeSessionRun 内部错误它自己处理、不会抛）
@@ -1610,9 +1637,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       if (agent) {
         closeTaskSession(task.id, agent.agentId);
       } else {
-        // create 都没成：会话没注册、手动注销 handler / notifier
-        setChatAwaitingNotifier(task.id, null);
-        setChatTaskActionHandler(task.id, null);
+        // create 都没成：会话没注册——条件注销，防 force-new 后新 agent 已注册时误清
+        unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
+        unsetChatTaskActionHandlerIf(task.id, bridges.taskActionHandler);
       }
     }
   })();
@@ -1641,13 +1668,11 @@ const readServerCreds = async (): Promise<SessionCreds> => {
     const cfg = JSON.parse(raw) as {
       apiKey?: string;
       defaultModel?: ModelSelection;
-      gitHost?: string;
       gitToken?: string;
     };
     return {
       apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : undefined,
       model: cfg.defaultModel?.id ? cfg.defaultModel : undefined,
-      gitHost: typeof cfg.gitHost === "string" ? cfg.gitHost : undefined,
       gitToken: typeof cfg.gitToken === "string" ? cfg.gitToken : undefined,
     };
   } catch {
@@ -1740,6 +1765,8 @@ const handleRunFailure = async (
 ): Promise<void> => {
   const message = err instanceof Error ? err.message : String(err);
   console.error(`[task-runner] task=${taskId} run failed:`, err);
+  // run 失败可能是「缓存 ok 期间 MCP 挂了」——清探测缓存、用户重试时必真探（不再连撞过期 ok）
+  invalidateMcpProbeCache();
   // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
   // 其它有诊断的错（认证 / 限流 / MCP / 协议）→ 带详情、加「失败」前缀。原始 err 已 console.error。
   const failure = summarizeRunFailure(message, err);
@@ -1880,7 +1907,16 @@ const consumeSessionRun = async (
       },
     };
 
+    // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
+    const perfStreamStart = Date.now();
+    let perfFirstEventSeen = false;
     for await (const msg of run.stream()) {
+      if (!perfFirstEventSeen) {
+        perfFirstEventSeen = true;
+        console.log(
+          `[perf] task=${task.id} first-event ms=${Date.now() - perfStreamStart}`,
+        );
+      }
       await handleSdkMessage(task.id, msg, assistantCtx);
     }
     await assistantCtx.flush();
@@ -2222,7 +2258,6 @@ const resumeTaskSession = async (
     });
     // 恢复的 agent 调 submit_mr / submit_work 要走桥、必须重注册
     registerSessionBridges(task, {
-      gitHost: creds.gitHost,
       gitToken: creds.gitToken,
     });
     const record: AgentSessionRecord = {

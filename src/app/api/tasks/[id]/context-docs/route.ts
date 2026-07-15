@@ -63,7 +63,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("content 不能超过 50000 字");
   }
 
-  // 校验 images（同 chat-reply / action-ack 路由的处理）
+  // 校验 images（同 ask-reply / question 路由的处理）
   const imagesResult = parseAndValidateImages(body.images, MAX_IMAGES_PER_DOC);
   if (!imagesResult.ok) return imagesResult.errorResponse;
   const images = imagesResult.images;

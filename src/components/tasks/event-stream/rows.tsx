@@ -337,7 +337,7 @@ const EventRowImpl = ({
       collapsed={collapsed}
       summary={summary}
       batch={batch}
-      actionTag={variant === "log" && actionType ? ACTION_LABEL_SHORT[actionType] : undefined}
+      actionTag={variant === "log" && actionType ? (ACTION_LABEL_SHORT[actionType] ?? actionType) : undefined}
       isToolCall={isToolCall}
       isThinking={isThinking}
       onToggle={handleToggle}
@@ -517,7 +517,7 @@ const EventRowImpl = ({
                 isDefaultVisible ? "bg-muted/60" : "bg-muted/30",
               )}
             >
-              {ACTION_LABEL_SHORT[actionType]}
+              {ACTION_LABEL_SHORT[actionType] ?? actionType}
             </span>
           )}
           <span className="text-muted-foreground/70 text-[10px]">

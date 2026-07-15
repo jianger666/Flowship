@@ -268,7 +268,7 @@ export const ChatView = ({
         />
       </div>
 
-      {/* agent 误调 ask_user 的兜底：EventStream 内已分流内联答题卡（V0.13.x）、无需弹窗 */}
+      {/* ask_user 答题卡：EventStream 内联分流（chat / task 同款、V0.13.x） */}
     </div>
   );
 };

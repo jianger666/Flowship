@@ -23,6 +23,20 @@ import {
 } from "@/lib/server/task-worktrees";
 
 const REPO = path.join(TMP_ROOT, "origin-repo");
+const DATA_DIR = process.env.FE_AI_FLOW_DATA_DIR!;
+
+/** 模拟「任务仍存活」：自愈逻辑靠 tasks/<id> 是否存在判定孤儿 */
+const markTaskAlive = async (taskId: string): Promise<void> => {
+  await fs.mkdir(path.join(DATA_DIR, "tasks", taskId), { recursive: true });
+};
+
+/** 模拟「任务已删」：只留 worktree、清掉 tasks/<id> */
+const markTaskDeleted = async (taskId: string): Promise<void> => {
+  await fs.rm(path.join(DATA_DIR, "tasks", taskId), {
+    recursive: true,
+    force: true,
+  });
+};
 
 const git = (cwd: string, ...args: string[]): string =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -32,7 +46,6 @@ const makeTask = (patch: Partial<Task> = {}): Task =>
     id: "t_1700000000001_it",
     mode: "task",
     title: "集成测试",
-    role: "fe",
     repoStatus: "developing",
     runStatus: "idle",
     repoPaths: [REPO],
@@ -86,11 +99,11 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆依赖目录", async () => {
+    await markTaskAlive(task.id);
     const res = await ensureTaskWorktrees(task);
     expect(res.createdRepos).toEqual([REPO]);
     expect(res.infos[0].name).toBe("feature/888888-集成测试");
     expect(res.infos[0].baseBranch).toBe("main");
-    expect(res.infos[0].checkedOut).toBe(true);
 
     // worktree 里检出的就是任务分支、原仓库 HEAD 不动
     expect(git(workDir, "branch", "--show-current")).toBe(
@@ -129,10 +142,33 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
 
   it("同分支被占用时另一个 task 明确报错（git 同分支单检出约束）", async () => {
     // 同 feishuStoryUrl + 同 title → 渲染出同名分支、必撞「already checked out」
+    // 先标活任务目录：否则自愈会把占用方误判成「已删任务孤儿」强删后重试成功
+    await markTaskAlive(task.id);
     const other = makeTask({ id: "t_1700000000002_it" });
+    await markTaskAlive(other.id);
     await expect(ensureTaskWorktrees(other)).rejects.toThrow(
       /创建隔离工作区失败/,
     );
+  });
+
+  it("ensure 撞已删任务孤儿 → 自愈释放后重试成功", async () => {
+    // 前置：task 的 worktree 仍占用分支；清掉 tasks/<id> 模拟「删任务但 worktree 残留」
+    await markTaskDeleted(task.id);
+    const other = makeTask({ id: "t_1700000000006_orphan_heal" });
+    await markTaskAlive(other.id);
+    const res = await ensureTaskWorktrees(other);
+    expect(res.createdRepos).toEqual([REPO]);
+    const otherWork = getTaskWorkRepoPaths(other)[0];
+    expect(git(otherWork, "branch", "--show-current")).toBe(
+      "feature/888888-集成测试",
+    );
+    // 旧孤儿目录应已释放
+    await expect(fs.access(workDir)).rejects.toThrow();
+    // 清掉 other、把共享 task 的 worktree 建回来，方便后续用例
+    await removeTaskWorktrees(other);
+    await markTaskDeleted(other.id);
+    await markTaskAlive(task.id);
+    await ensureTaskWorktrees(task);
   });
 
   it("remove：脏工作区先自动 commit WIP 快照、目录删掉、任务分支保留在原仓库", async () => {
@@ -143,7 +179,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     const removed = await removeTaskWorktrees(task);
     expect(removed.removedAny).toBe(true);
     expect(removed.snapshotRepos).toEqual([REPO]);
-    expect(removed.skippedRepos).toEqual([]);
+    expect(removed.snapshotFailedRepos).toEqual([]);
     await expect(fs.access(workDir)).rejects.toThrow();
     // 分支还在（合入前产物不丢、reopen 后可重建 worktree 续推）
     const branches = git(REPO, "branch", "--list", "feature/888888-集成测试");
@@ -178,7 +214,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     const removed = await removeTaskWorktrees(task);
     // 这轮没新改动、不再落快照
     expect(removed.snapshotRepos).toEqual([]);
-    expect(removed.skippedRepos).toEqual([]);
+    expect(removed.snapshotFailedRepos).toEqual([]);
   });
 
   it("复用热路径：worktree 里手动 checkout 切走 → ensure 自动切回任务分支", async () => {
@@ -194,7 +230,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
   });
 
-  it("CR-03 fail-closed：原仓被移走（git status 查不了）→ 绝不删、脏改动保留", async () => {
+  it("快照失败仍强制删除：原仓被移走（git status 查不了）→ 目录删掉、记 snapshotFailedRepos", async () => {
     // 独立仓 + 独立 task（不污染共享 REPO 的后续用例）
     const repo2 = path.join(TMP_ROOT, "origin-repo-2");
     const repo2Moved = `${repo2}-moved`;
@@ -212,30 +248,27 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
       repoBaseBranches: { [repo2]: "main" },
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999999",
     });
+    await markTaskAlive(task2.id);
     await ensureTaskWorktrees(task2);
     const workDir2 = getTaskWorkRepoPaths(task2)[0];
     // 工作区留未提交改动
     await fs.writeFile(path.join(workDir2, "uncommitted.txt"), "precious\n");
 
     // 原仓整个移走 → worktree 的 .git 指针失效、git status 必失败。
-    // 旧实现把「status 查不了」当 clean、git worktree remove 也失败后回退
-    // fs.rm --force 递归删——未提交改动被永久销毁（本用例在旧实现上必挂）
+    // 用户主动删：仍强制删目录释放占用（未提交改动会丢——已拍板可接受）
     await fs.rename(repo2, repo2Moved);
     try {
       const removed = await removeTaskWorktrees(task2);
-      expect(removed.skippedRepos).toEqual([repo2]);
-      expect(removed.removedAny).toBe(false);
-      // 目录 + 未提交文件都还在
-      await expect(
-        fs.readFile(path.join(workDir2, "uncommitted.txt"), "utf8"),
-      ).resolves.toBe("precious\n");
+      expect(removed.snapshotFailedRepos).toEqual([repo2]);
+      expect(removed.removedAny).toBe(true);
+      await expect(fs.access(workDir2)).rejects.toThrow();
     } finally {
       // 还原（afterAll 统一清 TMP_ROOT、这里只为不影响潜在后续用例）
       await fs.rename(repo2Moved, repo2).catch(() => {});
     }
   });
 
-  it("remove：merge 冲突态 WIP 快照失败 → 跳过删除、目录与未提交改动保留", async () => {
+  it("remove：merge 冲突态 WIP 快照失败 → 仍强制删除、记 snapshotFailedRepos", async () => {
     // 前置：上一条 ensure 后 worktree 仍在任务分支上
     const taskBranch = "feature/888888-集成测试";
     const conflictFile = path.join(workDir, "conflict.txt");
@@ -265,13 +298,12 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(before).toMatch(/<<<<<<</);
 
     const removed = await removeTaskWorktrees(task);
-    expect(removed.skippedRepos).toEqual([REPO]);
+    expect(removed.snapshotFailedRepos).toEqual([REPO]);
     expect(removed.snapshotRepos).toEqual([]);
-    expect(removed.removedAny).toBe(false);
-    // 目录保留、冲突内容还在（没被 --force 抹掉）
-    await expect(fs.access(workDir)).resolves.toBeUndefined();
-    await expect(fs.readFile(conflictFile, "utf8")).resolves.toBe(before);
-    expect(git(REPO, "worktree", "list")).toContain(workDir);
+    expect(removed.removedAny).toBe(true);
+    // 目录已删、分支占用已释放（未提交冲突内容丢——用户主动删可接受）
+    await expect(fs.access(workDir)).rejects.toThrow();
+    expect(git(REPO, "worktree", "list")).not.toContain(workDir);
   });
 
   it("混合隔离：非 git 目录混进 repoPaths → ensure 不抛、映射原地、只建 git 仓 worktree", async () => {

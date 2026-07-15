@@ -57,7 +57,7 @@ import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 
 /** 与旧 textarea 排版对齐，拖高 / placeholder 视觉不变 */
-export const COMPOSER_EDITOR_CLASS =
+const COMPOSER_EDITOR_CLASS =
   "min-h-13 w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
 
 /** 调用方只用 focus（Cmd+J / awaiting 自动聚焦） */

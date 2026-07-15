@@ -19,7 +19,7 @@
 
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getTask } from "@/lib/server/task-fs";
-import { reopenTask } from "@/lib/server/task-runner";
+import { prewarmTaskWorkspace, reopenTask } from "@/lib/server/task-runner";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -39,6 +39,9 @@ export const POST = async (_req: Request, { params }: Ctx) => {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(message, 400);
   }
+
+  // v1.1.x 提速：终结时 worktree 已清、重开后首推进要付重建成本——后台预热（fire-and-forget）
+  prewarmTaskWorkspace(task.id);
 
   const fresh = await getTask(task.id);
   return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {

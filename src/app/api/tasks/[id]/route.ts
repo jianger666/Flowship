@@ -14,6 +14,7 @@ import { NextResponse } from "next/server";
 import {
   deleteTask,
   getTask,
+  getTaskWithTailEvents,
   setTaskDisabledMcpServers,
   setTaskModel,
   setTaskPinned,
@@ -21,12 +22,12 @@ import {
   setTaskUiLayout,
   updateTaskFields,
 } from "@/lib/server/task-fs";
+import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import { waitForTaskToStop } from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
-import { isTaskRole, TASK_ROLES } from "@/lib/types";
-import type { ModelSelection, TaskRole } from "@/lib/types";
+import type { ModelSelection } from "@/lib/types";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -35,17 +36,19 @@ interface Ctx {
 export const GET = async (req: Request, { params }: Ctx) => {
   try {
     const { id } = await params;
-    const task = await getTask(id);
-    if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
-    // v1.0.x 事件懒加载：?tail=N 只带最近 N 条事件（长对话打开慢的主因是全量事件传输 + 渲染）。
+    // v1.0.x 事件懒加载：?tail=N 只带最近 N 条（尾部反向读、不整文件 parse）。
     // 切了片就置 eventsTruncated、客户端据此开「上拉加载更早」；更早的走 GET events?before= 分页。
     const tailRaw = new URL(req.url).searchParams.get("tail");
-    const tail = tailRaw ? Number.parseInt(tailRaw, 10) : NaN;
-    if (Number.isFinite(tail) && tail > 0 && task.events.length > tail) {
-      return NextResponse.json({
-        task: { ...task, events: task.events.slice(-tail), eventsTruncated: true },
-      });
+    const tailParsed = tailRaw ? Number.parseInt(tailRaw, 10) : NaN;
+    if (Number.isFinite(tailParsed) && tailParsed > 0) {
+      const tail = Math.min(tailParsed, MAX_EVENTS_TAIL);
+      const task = await getTaskWithTailEvents(id, tail);
+      if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return NextResponse.json({ task });
     }
+    // 无 tail：真全量（诊断 / 旧客户端）
+    const task = await getTask(id);
+    if (!task) return NextResponse.json({ error: "not_found" }, { status: 404 });
     return NextResponse.json({ task });
   } catch (err) {
     console.error("[GET /api/tasks/[id]] failed", err);
@@ -66,7 +69,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       repoPaths?: string[];
       // V0.6.6：编辑任务字段（详情页编辑弹窗、可一次传多个）
       title?: string;
-      role?: TaskRole;
       feishuStoryUrl?: string | null;
       repoFeatureBranches?: Record<string, string> | null;
       // V0.6.28：中途追加仓库（只增不删）+ 新仓的 per-repo 快照（前端从 settings 取好传来）
@@ -160,23 +162,15 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       return NextResponse.json({ task });
     }
 
-    // V0.6.6：编辑任务的建任务字段（title / role / feishuStoryUrl / repoFeatureBranches、可一次传多个）
+    // V0.6.6：编辑任务的建任务字段（title / feishuStoryUrl / repoFeatureBranches、可一次传多个）
     // V0.6.28：+ addRepoPaths 追加仓库（只增不删、新仓快照随行）
     const editKeys = [
       "title",
-      "role",
       "feishuStoryUrl",
       "repoFeatureBranches",
       "addRepoPaths",
     ] as const;
     if (editKeys.some((k) => k in body)) {
-      // 共享 guard（CR-07）：原手写白名单漏了 adaptive、自适应任务连改标题都 400
-      if ("role" in body && !isTaskRole(body.role)) {
-        return NextResponse.json(
-          { error: `role 必须是 ${TASK_ROLES.join(" / ")}` },
-          { status: 400 },
-        );
-      }
       if ("title" in body && typeof body.title !== "string") {
         return NextResponse.json(
           { error: "title 必须是字符串" },
@@ -197,7 +191,6 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       }
       const task = await updateTaskFields(id, {
         title: body.title,
-        role: body.role,
         feishuStoryUrl: body.feishuStoryUrl,
         repoFeatureBranches: body.repoFeatureBranches,
         addRepoPaths: body.addRepoPaths,

@@ -309,6 +309,35 @@ export const removeCustomAction = async (id: string): Promise<void> => {
   await fs.rm(legacyFileOf(id), { force: true });
 };
 
+/**
+ * 按固定 id 写入 custom action（出厂预置用）。
+ * 已存在则跳过、不覆盖（调用方用 presets-installed 再挡一层）。
+ * @returns "created" | "exists"
+ */
+export const ensureCustomActionById = async (
+  id: string,
+  input: CustomActionInput,
+): Promise<"created" | "exists"> => {
+  if (!isSafeId(id)) throw new Error(`非法 custom action id：${id}`);
+  const existing = await getCustomAction(id);
+  if (existing) return "exists";
+  const label = input.label.trim();
+  if (!label) throw new Error("label 不能为空");
+  const skill = input.skill.trim();
+  if (!skill) throw new Error("skill 必填");
+  const now = Date.now();
+  await writeDef({
+    id,
+    label,
+    skill,
+    output: input.output?.trim() || undefined,
+    placeholder: input.placeholder?.trim() || undefined,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return "created";
+};
+
 // ----------------- 共享包（导出 / 导入：skill 目录 + 可选 .flowship-action.json）-----------------
 
 /**

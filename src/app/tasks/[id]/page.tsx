@@ -23,8 +23,8 @@
  *
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
   Ban,
   ExternalLink,
@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { MrInboxTaskBanner } from "@/components/mr-inbox/mr-inbox-task-banner";
 import { ActionWorkbenchHeader } from "@/components/tasks/action-workbench-header";
 import { AdvanceDialog } from "@/components/tasks/advance-dialog";
 import { ArtifactPanel } from "@/components/tasks/artifact-panel";
@@ -66,6 +67,7 @@ import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 
 import { getSettings } from "@/lib/local-store";
+import { buildFixBugInstruction } from "@/lib/mr-inbox";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
@@ -109,6 +111,7 @@ const EVENT_TAIL = 300;
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const id = params.id;
   // 任务对象（V0.6 含 actions / mrs / repoStatus / runStatus 等）
   const [task, setTask] = useState<Task | null>(null);
@@ -124,6 +127,10 @@ const TaskDetailPage = () => {
   const [streamingText, setStreamingText] = useState("");
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
+  // 收件箱「改bug」降级深链带来的指令预填（打开 dialog 后消费掉）
+  const [advancePrefill, setAdvancePrefill] = useState<{
+    instruction?: string;
+  } | null>(null);
   // SSE 重连 epoch：任意「让 agent 又活起来」的路径 ++、useTaskWatch 重连
   const [watchEpoch, setWatchEpoch] = useState(0);
   // 「停止」按钮提交锁——中断 running agent 期间禁用、防连点
@@ -214,6 +221,23 @@ const TaskDetailPage = () => {
   useEffect(() => {
     if (task?.id) markTaskSeen(task.id);
   }, [task?.id, task?.updatedAt]);
+
+  // 收件箱「改bug」降级深链（预置「改bug」action 被删时才走）：
+  // ?advance=fix-bug&bugTitle=&bugUrl=&storyName= → 打开推进 dialog、只预填 bug 指令、
+  // action 让用户自己选；随后清掉 query 防刷新重复弹。正常路径收件箱已直接推进、不经这里。
+  const canOpenFixBugAdvance = !!task && task.mode !== "chat";
+  useEffect(() => {
+    if (!canOpenFixBugAdvance || !id) return;
+    if (searchParams.get("advance") !== "fix-bug") return;
+    const bugTitle = searchParams.get("bugTitle") ?? "";
+    const bugUrl = searchParams.get("bugUrl") ?? "";
+    const storyName = searchParams.get("storyName") ?? undefined;
+    setAdvancePrefill({
+      instruction: buildFixBugInstruction({ bugTitle, bugUrl, storyName }),
+    });
+    setAdvanceDialogOpen(true);
+    router.replace(`/tasks/${id}`, { scroll: false });
+  }, [canOpenFixBugAdvance, id, searchParams, router]);
 
   // currentActionId 变化时把 selectedActionId 跟到 currentActionId
   // 用户主动切别的 action 后、currentActionId 又变（agent 又推进一步）时不强行带回——
@@ -419,7 +443,7 @@ const TaskDetailPage = () => {
       if (!args) return;
       // input.model 仅起新 agent 时由 dialog 临时挑、优先级最高、覆盖 prepareRunArgs 算的
       const model = input.model?.id ? input.model : args.model;
-      // gitHost / gitToken 不在 prepareRunArgs 暴露字段里、单独读 settings
+      // gitToken 不在 prepareRunArgs 暴露字段里、单独读 settings（host 由 server 按仓库 remote 现推）
       const settings = getSettings();
       // V0.x A 方案：带上设置页最新分支配置（只收本 task 各仓 + settings 找得到 + 非空）、
       //   server 据此刷新 task 分支快照——设置页改了 dev/test/线上分支、老 task 下次推进就生效。
@@ -449,9 +473,7 @@ const TaskDetailPage = () => {
           apiKey: args.apiKey,
           model,
           reuseAgent: input.reuseAgent,
-          // V0.6.1 ship action 用：每次推进都带上 settings 里最新的 gitHost/gitToken
-          // task-runner 闭包到 internalStartAgent 里、续接路径只在 ship 准入校验时用
-          gitHost: settings.gitHost?.trim() || undefined,
+          // V0.6.1 ship action 用：每次推进带上 settings 最新 PAT（host 服务端按 remote 现推）
           gitToken: settings.gitToken?.trim() || undefined,
           // V0.6.14 ship action：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
           removeSourceBranch: input.removeSourceBranch,
@@ -767,7 +789,7 @@ const TaskDetailPage = () => {
                 size="sm"
                 onClick={() => setAdvanceDialogOpen(true)}
                 disabled={starting}
-                title="推进任务：选下一个 action（plan / build / review / ship / learn / dev）"
+                title="推进任务：选下一个 action（plan / build / review / ship / dev）"
               >
                 {starting ? <Loader2 className="animate-spin" /> : <Zap />}
                 推进
@@ -840,6 +862,8 @@ const TaskDetailPage = () => {
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
         </div>
+        {/* 提测收件箱提醒条：本需求（feishuStoryUrl 对应工作项）有未读待测 MR 时挂出 */}
+        <MrInboxTaskBanner feishuStoryUrl={task.feishuStoryUrl} className="mt-3" />
       </div>
 
       <Separator />
@@ -961,8 +985,13 @@ const TaskDetailPage = () => {
       {/* 推进 dialog */}
       <AdvanceDialog
         open={advanceDialogOpen}
-        onOpenChange={setAdvanceDialogOpen}
+        onOpenChange={(open) => {
+          setAdvanceDialogOpen(open);
+          // 关掉时清预填，避免下次手动推进仍带旧 bug 指令
+          if (!open) setAdvancePrefill(null);
+        }}
         task={task}
+        prefill={advancePrefill}
         onSubmit={handleAdvance}
         submitting={starting}
       />
@@ -979,4 +1008,11 @@ const TaskDetailPage = () => {
   );
 };
 
-export default TaskDetailPage;
+// useSearchParams 必须包 Suspense（Next 15 构建约束 missing-suspense）
+const TaskDetailPageWithSuspense = () => (
+  <Suspense fallback={<LoadingState variant="block" />}>
+    <TaskDetailPage />
+  </Suspense>
+);
+
+export default TaskDetailPageWithSuspense;

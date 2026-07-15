@@ -7,8 +7,94 @@
  *
  * 所有要落 data/ 的模块（task-fs / mcp-oauth / uploads route）一律走这里、
  * 不要再各自拼 process.cwd()/data。
+ *
+ * P0-02：含密钥的目录 / 文件统一 0700 / 0600；win32 上 mode/chmod 是 no-op 或近似，
+ * 统一跳过避免抛错。
  */
+import { promises as fs } from "node:fs";
 import path from "node:path";
 
 export const dataRoot = (): string =>
   process.env.FE_AI_FLOW_DATA_DIR || path.join(process.cwd(), "data");
+
+/** win32 上文件权限位不可靠，跳过 mode/chmod */
+export const supportsUnixFileMode = (): boolean => process.platform !== "win32";
+
+/**
+ * 确保目录存在且为 0700（已存在则补 chmod）。
+ * 失败只 warn、不抛——权限收紧是 best-effort，不能阻断业务写。
+ */
+export const ensurePrivateDir = async (dir: string): Promise<void> => {
+  if (supportsUnixFileMode()) {
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    try {
+      await fs.chmod(dir, 0o700);
+    } catch (err) {
+      // 只记路径 + 错误信息，绝不 dump 目录内容
+      console.warn(
+        `[data-root] chmod 0700 失败（${dir}）:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  } else {
+    await fs.mkdir(dir, { recursive: true });
+  }
+};
+
+/**
+ * 原子写私密文件（0600）：同目录 tmp → rename → chmod。
+ * writeFile 的 mode 只对新建生效；rename 覆盖后对最终路径再 chmod 一次兜底。
+ * 失败清理 tmp（参考 feishu-cli installBinaryAtomic）。
+ */
+export const writePrivateFileAtomic = async (
+  finalPath: string,
+  content: string,
+): Promise<void> => {
+  await ensurePrivateDir(path.dirname(finalPath));
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    if (supportsUnixFileMode()) {
+      await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+    } else {
+      await fs.writeFile(tmpPath, content, "utf-8");
+    }
+    await fs.rename(tmpPath, finalPath);
+    // 覆盖已存在的 0644 文件时，部分平台 rename 可能保留旧 inode 权限——显式收紧
+    if (supportsUnixFileMode()) {
+      try {
+        await fs.chmod(finalPath, 0o600);
+      } catch (err) {
+        console.warn(
+          `[data-root] chmod 0600 失败（${finalPath}）:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+};
+
+/**
+ * 幂等收紧已存在路径的权限（启动迁移用）。
+ * ENOENT 静默跳过；其它失败 console.warn、不阻断启动。日志只含路径、不含文件内容。
+ */
+export const hardenPathMode = async (
+  targetPath: string,
+  mode: number,
+): Promise<void> => {
+  if (!supportsUnixFileMode()) return;
+  try {
+    await fs.chmod(targetPath, mode);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    console.warn(
+      `[data-root] 启动收紧权限失败（${targetPath} → ${mode.toString(8)}）:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+};

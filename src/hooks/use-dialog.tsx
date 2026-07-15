@@ -14,6 +14,9 @@
  *   const { confirm, prompt } = useDialog();
  *   const ok = await confirm({ title: "删除？", description: "无法撤销", destructive: true });
  *   const name = await prompt({ title: "重命名", defaultValue: "untitled" });
+ *   // 带可选勾选：
+ *   const r = await confirm({ title: "删除？", checkboxLabel: "同时删除 skill" });
+ *   // r === null 取消；r.ok + r.checked
  *   ```
  *
  * 注意：
@@ -50,6 +53,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 
 // Confirm 配置
@@ -64,6 +68,14 @@ export interface ConfirmOptions {
   // 用户点了某个入口才弹确认、手不在键盘上、焦点放主操作上、看一眼回车即确认更顺手。
   // 重操作（如重启 app 更新）传 "cancel" opt-out、避免回车误触发。
   defaultFocus?: "confirm" | "cancel";
+  /** 可选勾选文案；有值时 confirm 返回 { ok, checked } | null（取消为 null） */
+  checkboxLabel?: string;
+}
+
+/** 带 checkbox 的 confirm 结果（取消 = null） */
+export interface ConfirmWithCheckboxResult {
+  ok: boolean;
+  checked: boolean;
 }
 
 // Prompt 配置
@@ -81,7 +93,13 @@ export interface PromptOptions {
 }
 
 interface DialogContextValue {
-  confirm: (opts: ConfirmOptions) => Promise<boolean>;
+  /** 无 checkbox：返 boolean（取消 false）；有 checkboxLabel：返结果或 null（取消） */
+  confirm: {
+    (
+      opts: ConfirmOptions & { checkboxLabel: string },
+    ): Promise<ConfirmWithCheckboxResult | null>;
+    (opts: ConfirmOptions): Promise<boolean>;
+  };
   prompt: (opts: PromptOptions) => Promise<string | null>;
 }
 
@@ -99,13 +117,18 @@ interface DialogProviderProps {
   children: ReactNode;
 }
 
+type ConfirmResolve =
+  | ((v: boolean) => void)
+  | ((v: ConfirmWithCheckboxResult | null) => void);
+
 // confirm / prompt 内部 state、用 union 表示「当前弹什么」
 type DialogState =
   | { kind: "none" }
   | {
       kind: "confirm";
       opts: ConfirmOptions;
-      resolve: (v: boolean) => void;
+      resolve: ConfirmResolve;
+      withCheckbox: boolean;
     }
   | {
       kind: "prompt";
@@ -119,6 +142,8 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
 
   // prompt input 受控值、单独 state 避免 update state 时丢 resolve 引用
   const [promptValue, setPromptValue] = useState("");
+  // confirm 可选勾选（每次打开默认不勾）
+  const [confirmChecked, setConfirmChecked] = useState(false);
 
   // confirm 的「确认」键 ref——弹窗打开时把初始焦点落在它上（回车即确认、由 defaultFocus 控制）
   const confirmActionRef = useRef<HTMLButtonElement>(null);
@@ -129,17 +154,30 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
   useEffect(
     () => () => {
       const cur = stateRef.current;
-      if (cur.kind === "confirm") cur.resolve(false);
+      if (cur.kind === "confirm") {
+        if (cur.withCheckbox) {
+          (cur.resolve as (v: ConfirmWithCheckboxResult | null) => void)(null);
+        } else {
+          (cur.resolve as (v: boolean) => void)(false);
+        }
+      }
       if (cur.kind === "prompt") cur.resolve(null);
     },
     [],
   );
 
-  const confirm = useCallback((opts: ConfirmOptions) => {
+  const confirm = useCallback(((opts: ConfirmOptions) => {
+    const withCheckbox = typeof opts.checkboxLabel === "string" && opts.checkboxLabel.length > 0;
+    setConfirmChecked(false);
+    if (withCheckbox) {
+      return new Promise<ConfirmWithCheckboxResult | null>((resolve) => {
+        setState({ kind: "confirm", opts, resolve, withCheckbox: true });
+      });
+    }
     return new Promise<boolean>((resolve) => {
-      setState({ kind: "confirm", opts, resolve });
+      setState({ kind: "confirm", opts, resolve, withCheckbox: false });
     });
-  }, []);
+  }) as DialogContextValue["confirm"], []);
 
   const prompt = useCallback((opts: PromptOptions) => {
     setPromptValue(opts.defaultValue ?? "");
@@ -148,10 +186,17 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
     });
   }, []);
 
-  // 关 confirm：把结果 resolve 出去、清 state
-  const closeConfirm = (result: boolean) => {
+  // 关 confirm：无 checkbox → boolean；有 checkbox → 取消 null / 确认 { ok, checked }
+  const closeConfirm = (ok: boolean) => {
     if (state.kind !== "confirm") return;
-    state.resolve(result);
+    if (state.withCheckbox) {
+      const resolve = state.resolve as (
+        v: ConfirmWithCheckboxResult | null,
+      ) => void;
+      resolve(ok ? { ok: true, checked: confirmChecked } : null);
+    } else {
+      (state.resolve as (v: boolean) => void)(ok);
+    }
     setState({ kind: "none" });
   };
 
@@ -169,6 +214,8 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
     state.kind === "prompt"
       ? (state.opts.validate?.(promptValue) ?? "")
       : "";
+
+  const checkboxId = "dialog-confirm-checkbox";
 
   return (
     <DialogContext.Provider value={{ confirm, prompt }}>
@@ -195,6 +242,19 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
                 </AlertDialogDescription>
               )}
             </AlertDialogHeader>
+            {state.withCheckbox && state.opts.checkboxLabel && (
+              <label
+                htmlFor={checkboxId}
+                className="flex cursor-pointer items-center gap-2 text-sm"
+              >
+                <Checkbox
+                  id={checkboxId}
+                  checked={confirmChecked}
+                  onCheckedChange={setConfirmChecked}
+                />
+                <span>{state.opts.checkboxLabel}</span>
+              </label>
+            )}
             <AlertDialogFooter>
               <AlertDialogCancel onClick={() => closeConfirm(false)}>
                 {state.opts.cancelLabel ?? "取消"}

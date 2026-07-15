@@ -173,9 +173,11 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                       : "非 git 仓库"
                   : undefined;
               return (
+                // *:min-w-0：行内长路径的 min-content 会把 grid 隐式轨道撑得比容器宽、
+                // 第二三行跟着溢出块右缘（路径越长越明显、实测踩过）——直接子行统一压回 0
                 <div
                   key={r.path}
-                  className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2"
+                  className="grid gap-2 rounded-lg border bg-card/50 px-3 py-2 *:min-w-0"
                 >
                   {/* 第一行：仓名 + 路径 + 只读 / 脚本仓开关 + 删除 */}
                   <div className="flex items-center gap-2">

@@ -6,12 +6,13 @@
  *   - 对每个 asset 算 SHA-256 + size、拼 manifest payload
  *   - 用 env `UPDATE_MANIFEST_PRIVATE_KEY`（Ed25519 私钥 PEM、GitHub secret）签名
  *   - 产出 `update-manifest.json`（CI 随后传到同 tag release）
- *   - **secret 未配置时**：打警告、退出 0、不产文件——渐进启用、不打断现有发版
+ *   - **secret 未配置 / 签名失败 → exit 1**（fail-closed、不发残缺 / 无验签版）
  *
  * manifest 结构（签名覆盖 version + files、字段顺序即 JSON.stringify 顺序、验签方必须同序重建）：
  *   { version, files: [{ name, size, sha256 }], signature: base64(Ed25519(payload)) }
  *
- * 壳侧验证见 electron-app/main.js 的 verifyDownloadedUpdate。
+ * 壳侧验证见 electron-app/main.js 的 verifyDownloadedUpdate；
+ * 公钥单一来源：electron-app/update-manifest-public-key.pem
  */
 import { createHash, createPrivateKey, sign } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -26,12 +27,12 @@ if (!version || assetPaths.length === 0) {
 
 const privateKeyPem = process.env.UPDATE_MANIFEST_PRIVATE_KEY?.trim();
 if (!privateKeyPem) {
-  // GitHub Actions 的 ::warning:: 注解、在 job 摘要里可见
-  console.log(
-    "::warning::UPDATE_MANIFEST_PRIVATE_KEY 未配置、跳过更新 manifest 签名——" +
-      "自更新将不带完整性校验；用 scripts/generate-update-keypair.mjs 生成密钥对后启用",
+  // fail-closed：无私钥不产 manifest、阻断 finalize（壳也强制验签、无 manifest 会拒装）
+  console.error(
+    "::error::UPDATE_MANIFEST_PRIVATE_KEY 未配置——" +
+      "请用 scripts/generate-update-keypair.mjs 生成密钥对后，把私钥写入 GitHub secret",
   );
-  process.exit(0);
+  process.exit(1);
 }
 
 // 流式算 SHA-256（dmg 100MB+、不整读进内存）
@@ -56,11 +57,17 @@ for (const assetPath of assetPaths) {
 
 // 签名 payload：只覆盖 version + files（signature 字段本身不进 payload）
 const payload = JSON.stringify({ version, files });
-const signature = sign(
-  null, // Ed25519 不用外部 digest 算法
-  Buffer.from(payload, "utf8"),
-  createPrivateKey(privateKeyPem),
-).toString("base64");
+let signature;
+try {
+  signature = sign(
+    null, // Ed25519 不用外部 digest 算法
+    Buffer.from(payload, "utf8"),
+    createPrivateKey(privateKeyPem),
+  ).toString("base64");
+} catch (err) {
+  console.error(`::error::更新 manifest 签名失败：${err?.message || err}`);
+  process.exit(1);
+}
 
 const outPath = "update-manifest.json";
 await fs.writeFile(

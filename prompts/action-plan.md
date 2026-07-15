@@ -1,6 +1,6 @@
 # Action: plan（V0.6）
 
-> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}` `{{role}}` `{{roleLabel}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
+> 占位符在 super-prompt 顶部已注入：`{{taskId}}` `{{taskTitle}}` `{{repoPath}}`、artifact 绝对路径见 super-prompt「Artifact 文件路径」段。
 > 收到 `[NEXT_ACTION type=plan ...]` 时翻到本段、按指令做。
 
 ---
@@ -21,25 +21,18 @@
 第二次以后的 plan action（n > 1）：
 - 不要重写、用 `edit` 在上一次 plan artifact 上改、或新写一份 diff 文档（看用户指令、默认 edit 上一次 + 留 strikethrough 痕迹）
 
-## 关键定位（按 role 调整视角）
+## 关键定位
 
-**你正在以 `{{roleLabel}}`（role={{role}}）的视角、为本地仓库 `{{repoPath}}` 出方案**。
+**你正在为本地仓库 `{{repoPath}}` 出方案**。工作视角以 super-prompt「发起人」行为锚点（设置页角色）；没有发起人角色信息时按仓库技术栈（`package.json` / `pom.xml` / `go.mod` 等）自行判断、判不准再 `ask_user`。
 
-飞书 story 通常是「跨角色共享」的（同一条 story 涉及前端 / 后端 / 数仓 / 测试…）、你**只挑跟你这个角色相关的部分**做：
+飞书 story 通常是「跨角色共享」的——你只挑跟本仓库改动相关的部分做：
 
-- ✅ 收集**本角色 + 本仓库**相关的业务上下文（接口契约 / 字段语义 / 业务规则）
+- ✅ 收集**本仓库**相关的业务上下文（接口契约 / 字段语义 / 业务规则）
 - ✅ 扫仓库、判断需求落到本仓库要改哪几个文件 / 组件 / 路由 / 模块
-- ✅ 出方案 = 改动清单 + task 拆分（按本仓库技术栈、扫 `package.json` / `pom.xml` / `go.mod` 等识别）
+- ✅ 出方案 = 改动清单 + task 拆分（按本仓库技术栈）
 - ❌ **不写代码**（一行业务代码都不许动、build action 才写）
-- ❌ **不收集其他角色的实现细节**（典型反例：前端 task 跑去聊后端 DB 字段类型 / 后端 task 跑去画前端组件树）——除非跟跨角色边界（接口契约 / 字段语义 / 文案）相关
-- ❌ **不问跟本仓库无关的问题**（典型反例：问其他角色的实现细节、问产品验收策略、问业务上线节奏）
-
-### 当前角色提示
-
-- **role=fe（前端）**：看接口契约 / 字段语义 / 路由 / 组件 / 状态 / 文案、扫仓库找同类弹窗 / 列表 / store / hook、按仓库现有前端技术栈（Vue / React / Tailwind / shadcn / pinia 等）写
-- **role=be（后端）**：看接口契约 / DB schema / 领域模型 / 分层（controller-service-dao）/ 中间件 / 定时任务、扫仓库找同类 controller / service / mapper / DTO、按仓库现有后端技术栈（Spring Boot / MyBatis / Go 等）写
-- **role=adaptive（自适应）**：不锁端——先判任务性质：内容 / story 是**测试验证类**（写用例、造数据、跑回归、验证、写脚本）→ 视角 QA：**业务仓只读不改**、产出写到脚本目录或指定位置；确需改业务仓 → **先 `ask_user` 确认**。研发类再探测技术栈（`package.json` / `pom.xml` / `build.gradle` / `go.mod` 等）判定前端 / 后端、套用上面对应那条；判不准就 `ask_user` 确认视角、别硬猜
-- 其他 role：未来扩 data / mobile / qa 时按对应角色视角调整、相同结构
+- ❌ **不收集跟本仓库无关的实现细节**——除非跟跨端边界（接口契约 / 字段语义 / 文案）相关
+- ❌ **不问跟本仓库无关的问题**
 
 ## 输入
 
@@ -373,6 +366,6 @@ V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确
 - **不复述 PRD**：plan 不是 PRD 的副本——业务背景 / 验收标准 / 大段叙述性原文**不要从 PRD 复制粘贴**到 plan 里。build agent 接 plan 时 SDK Run 上下文里 PRD 原文还在、用得到就现查。plan 只放「AI 的判断 / 用户的拍板 / 改动清单 / task 拆分」这种独有信息
 - **保真但精简**：枚举对照表 / 状态机 / 接口字段语义这类「具体到几行表格的关键信息」要保真列出来；纯背景叙述别搬
 - **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
-- **角色视角**：你是 `{{roleLabel}}`、本 action 只服务于「本角色 + 本仓库（{{repoPath}}）要改什么」、其他角色的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨角色边界相关时才碰
+- **本仓视角**：本 action 只服务于「本仓库（{{repoPath}}）要改什么」、其它端的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨端边界相关时才碰
 - **大需求才分批**：task 多 / 跨层 / 一次 build 跑不稳妥时、才调 `set_plan_batches` 上报批次（见 §5.3）、artifact **不写**批次表（系统自动渲染）；小需求别分批、保持单次 build（分批是为防大需求跑乱、不是 KPI、宁可不分也别硬切）
 - **写完 artifact（+ 必要的 ask_user）→ 给 1-3 句简短结论 → 调 submit_work**：结论说清「方案要点 / 关键决策 / 有无待确认项」（流式、简短）；别说「我写完了你看下」这种没信息量的空话、也别说完忘了调 wait

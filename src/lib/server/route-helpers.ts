@@ -19,6 +19,7 @@ import { promises as fs } from "node:fs";
 
 import type { ModelSelection } from "@cursor/sdk";
 
+import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
 
 // ----------------- Response helpers -----------------
@@ -221,13 +222,15 @@ export const parseAndValidateAttachments = async (
         errorResponse: errorResponse("attachments 必须是非空字符串数组"),
       };
     }
-    const abs = path.resolve(item.trim());
-    if (!path.isAbsolute(abs)) {
+    // 必须对原始字符串判绝对路径：path.resolve 后再 isAbsolute 恒为 true，相对路径会被静默接受
+    const trimmed = item.trim();
+    if (!isAbsolutePathLike(trimmed)) {
       return {
         ok: false,
         errorResponse: errorResponse(`attachments 必须是绝对路径：${item}`),
       };
     }
+    const abs = path.resolve(trimmed);
     try {
       const st = await fs.stat(abs);
       paths.push(abs);

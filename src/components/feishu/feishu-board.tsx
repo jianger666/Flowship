@@ -4,15 +4,15 @@
  * 首页飞书排期甘特（V0.14.1 数据源重写、同事实测踩坑后定型）
  *
  * 数据源 /api/feishu/board（meegle workhour list-schedule、飞书「人员排期」视图
- * 同款接口）：按 空间 + 我 + 时间区间 查我参与的全部排期。
+ * 同款接口）：按 默认空间 + 我 + 时间区间 查我参与的全部排期。
  * 为什么不用 mywork todo：只覆盖「当前节点等我操作」的工作项、子任务负责人
- *（非节点 owner）拉不到自己的需求、空间下拉也因此缺空间（同事踩过）。
+ *（非节点 owner）拉不到自己的需求。
  *
- * - 空间列表 = project search 全量（下拉切换、记忆上次选择）
+ * - 空间 = settings.meegleProject（全局唯一默认空间、设置页可改；看板不再切换）
  * - 时间范围变化 → 重新拉取（接口按区间查）
  * - 点击：已有任务 → 任务页；没有 → 工作项预览页（启动才建任务）
  * - 降级态：CLI 未装 / 未授权 → 引导卡；报错 → 重试
- * - sessionStorage 缓存秒开、请求序号防竞态
+ * - localStorage 按空间分 key 缓存秒开、请求序号防竞态
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -22,21 +22,17 @@ import { Plug, RefreshCw } from "lucide-react";
 
 import { BoardTimeline } from "@/components/feishu/board-timeline";
 import type { DayRange } from "@/components/ui/date-range-picker";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { getSettings, initSettings } from "@/lib/local-store";
 import { settingsUrl } from "@/lib/settings-link";
+import { DEFAULT_MEEGLE_PROJECT, type FeAiFlowSettings } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { markShellContentReady } from "@/lib/shell-ready";
 import { loadBoardRange, saveBoardRange } from "@/lib/view-memory";
 import { useTaskList } from "@/hooks/use-task-list";
+
+type MeegleProjectSetting = NonNullable<FeAiFlowSettings["meegleProject"]>;
 
 // ---------- 类型（对齐 /api/feishu/board 返回） ----------
 
@@ -80,42 +76,12 @@ interface BoardResp {
   status: BoardStatus;
   message?: string;
   items?: BoardItem[];
-  /** 可访问空间（project search 全量） */
-  projects?: Array<{ key: string; name: string }>;
+  /** 可访问空间（设置页下拉仍用；看板本身不再切空间） */
+  projects?: Array<{ key: string; name: string; simpleName?: string }>;
 }
 
 const CACHE_KEY = "feaiflow.board.cache.v3";
 const DAY_MS = 24 * 60 * 60 * 1000;
-const SPACE_KEY = "feaiflow.board.space";
-
-// ---------- AI 任务状态徽标 ----------
-
-/** AI 任务状态 → 徽标（甘特行 + 未排期 chip 共用） */
-export const AiStatusBadge = ({ task }: { task: BoardTaskBrief | null }) => {
-  // 没有 AI 任务不显示徽标（用户拍板：满屏「未开始」纯噪音、AI 在干的才亮）
-  if (!task) return null;
-  if (task.repoStatus === "merged")
-    return <Badge className="shrink-0 bg-emerald-600 text-[10px] text-white">已合入</Badge>;
-  if (task.repoStatus === "abandoned")
-    return <Badge variant="secondary" className="shrink-0 text-[10px]">已放弃</Badge>;
-  if (task.runStatus === "running")
-    return (
-      <Badge className="shrink-0 gap-1 bg-blue-600 text-[10px] text-white">
-        <span className="size-1.5 animate-pulse rounded-full bg-white" />
-        AI 进行中
-      </Badge>
-    );
-  if (task.runStatus === "awaiting_user")
-    return (
-      <Badge className="shrink-0 gap-1 bg-amber-500 text-[10px] text-white">
-        <span className="size-1.5 animate-pulse rounded-full bg-white" />
-        等你回复
-      </Badge>
-    );
-  if (task.runStatus === "error")
-    return <Badge variant="destructive" className="shrink-0 text-[10px]">异常</Badge>;
-  return <Badge variant="secondary" className="shrink-0 text-[10px]">进行中</Badge>;
-};
 
 // ---------- 主组件 ----------
 
@@ -139,14 +105,10 @@ export const FeishuBoard = () => {
   const retryLeftRef = useRef(2);
   // refresh 的 ref 化（重试 timer 里调最新版、不把自己塞进依赖）
   const refreshRef = useRef<(() => Promise<void>) | null>(null);
-  // 选中空间（localStorage 记忆、首次 = 列表第一个）
-  const [spaceKey, setSpaceKey] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(SPACE_KEY);
-    } catch {
-      return null;
-    }
-  });
+  // 默认飞书空间（settings.meegleProject；初值硬编码默认、init 后若用户改过会覆盖）
+  const [meegleProject, setMeegleProject] = useState<MeegleProjectSetting>(() => ({
+    ...DEFAULT_MEEGLE_PROJECT,
+  }));
   // 时间范围（接口按区间查、变化触发重拉）：默认今天前 3 天 ~ 后 10 天；
   // 改过的区间记 session（v1.1.x、切页回来不重置；重启回默认、防陈旧日期）
   const [range, setRange] = useState<DayRange>(() => {
@@ -157,12 +119,24 @@ export const FeishuBoard = () => {
     return { from: d.getTime() - 3 * DAY_MS, to: d.getTime() + 10 * DAY_MS };
   });
 
+  // 挂载后读 settings 里的默认空间（可能与硬编码默认不同）
+  useEffect(() => {
+    void initSettings().then(() => {
+      const p = getSettings().meegleProject ?? DEFAULT_MEEGLE_PROJECT;
+      setMeegleProject({
+        key: p.key,
+        name: p.name,
+        ...(p.simpleName ? { simpleName: p.simpleName } : {}),
+      });
+    });
+  }, []);
+
   // mount：先吃缓存秒开（按空间分 key）、再后台刷新。
   // v1.1.x 换 localStorage：跨重启也秒开（同事实测「启动很慢」、重启后 session 缓存
   // 全空、首屏干等飞书接口）——旧数据先亮、refreshing 转圈提示在刷
   useEffect(() => {
     try {
-      const cached = localStorage.getItem(`${CACHE_KEY}.${spaceKey ?? ""}`);
+      const cached = localStorage.getItem(`${CACHE_KEY}.${meegleProject.key}`);
       if (cached) {
         const parsed = JSON.parse(cached) as BoardResp;
         // 只吃 ok 缓存：老版本写过 not_authed / error 进缓存、首屏会闪降级引导
@@ -174,14 +148,14 @@ export const FeishuBoard = () => {
     } catch {
       /* 缓存坏了忽略 */
     }
-  }, [spaceKey]);
+  }, [meegleProject.key]);
 
   const refresh = useCallback(async () => {
     const seq = ++seqRef.current;
     setRefreshing(true);
     try {
       const qs = new URLSearchParams();
-      if (spaceKey) qs.set("project", spaceKey);
+      qs.set("project", meegleProject.key);
       qs.set("from", String(range.from));
       qs.set("to", String(range.to));
       const r = await fetch(`/api/feishu/board?${qs.toString()}`);
@@ -190,7 +164,10 @@ export const FeishuBoard = () => {
       // 下次启动首屏直接渲降级态（用户实测「升级完授权像没检测到」的元凶之一）
       if (data.status === "ok") {
         try {
-          localStorage.setItem(`${CACHE_KEY}.${spaceKey ?? ""}`, JSON.stringify(data));
+          localStorage.setItem(
+            `${CACHE_KEY}.${meegleProject.key}`,
+            JSON.stringify(data),
+          );
         } catch {
           /* 超配额忽略 */
         }
@@ -212,10 +189,6 @@ export const FeishuBoard = () => {
         if (data.status === "ok") retryLeftRef.current = 2;
         respRef.current = data;
         setResp(data);
-        // 没选过空间：默认列表第一个（触发下一轮带 project 的拉取）
-        if (!spaceKey && data.status === "ok" && (data.projects?.length ?? 0) > 0) {
-          setSpaceKey(data.projects![0].key);
-        }
       }
     } catch (err) {
       if (seq === seqRef.current) {
@@ -238,7 +211,7 @@ export const FeishuBoard = () => {
     } finally {
       if (seq === seqRef.current) setRefreshing(false);
     }
-  }, [spaceKey, range]);
+  }, [meegleProject.key, range]);
 
   useEffect(() => {
     refreshRef.current = refresh;
@@ -265,29 +238,13 @@ export const FeishuBoard = () => {
   );
 
   const items = useMemo(() => resp?.items ?? [], [resp]);
-  // 空间列表：project search 全量（V0.14.1、不再从数据聚合——mywork 覆盖不全踩过）
-  const spaces = resp?.projects ?? [];
-
-  // 首启没记忆空间时、第一轮响应只是占位（仅 projects、items 空）——随即自动选
-  // 第一个空间触发真拉取；这个中间态不算内容就绪、也不渲空甘特
-  const pickingSpace =
-    resp?.status === "ok" && !spaceKey && (resp.projects?.length ?? 0) > 0;
 
   // 开屏一屏到底（v1.1.x）：真实内容（看板 / 降级引导）渲出来才通知壳收 splash——
-  // resp 到了（含缓存秒开）且不再是「纯 loading / 占位」态即算
-  const contentReady = resp !== null && !pickingSpace && !(refreshing && items.length === 0);
+  // resp 到了（含缓存秒开）且不再是「纯 loading」态即算
+  const contentReady = resp !== null && !(refreshing && items.length === 0);
   useEffect(() => {
     if (contentReady) markShellContentReady();
   }, [contentReady]);
-
-  const handlePickSpace = useCallback((key: string) => {
-    setSpaceKey(key);
-    try {
-      localStorage.setItem(SPACE_KEY, key);
-    } catch {
-      /* noop */
-    }
-  }, []);
 
   // ---------- 降级态 ----------
   if (resp && resp.status !== "ok") {
@@ -325,7 +282,7 @@ export const FeishuBoard = () => {
   // ---------- 首拉 loading：整区居中（不带看板头部行）----------
   // 位置跟首页 gate 的 hero 完全重合——原来 loading 在头部行下方的 flex-1 里、
   // 中心比 gate loading 低一截、启动链三段 loading 逐级往下跳（用户实测「不断往下抖」）
-  if (resp === null || pickingSpace || (refreshing && items.length === 0)) {
+  if (resp === null || (refreshing && items.length === 0)) {
     return <LoadingState variant="hero" immediate />;
   }
 
@@ -335,31 +292,8 @@ export const FeishuBoard = () => {
     <div className="flex h-full w-full flex-col gap-3 px-6 py-5 xl:px-10">
       <div className="flex shrink-0 items-center gap-2.5">
         <h1 className="text-lg font-semibold tracking-tight">我的排期</h1>
-        {/* 空间切换：单选、project search 全量（用户拍板「不要展示全部」混排） */}
-        {spaces.length > 0 && (
-          <Select value={spaceKey ?? undefined} onValueChange={(v) => v && handlePickSpace(v)}>
-            <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
-              {/* SelectValue 默认渲染 value（projectKey 哈希）——显式渲染空间名（用户截图点名「这里是个 id」） */}
-              <SelectValue placeholder="选择空间">
-                {spaces.find((s) => s.key === spaceKey)?.name ?? "选择空间"}
-              </SelectValue>
-            </SelectTrigger>
-            {/* w-auto：弹层宽自适应（长空间名被裁踩过）；
-                alignItemWithTrigger=false：默认会把选中项对准触发器、列表长时向上溢出
-                盖到 Electron 标题栏（drag 区域点不了、用户截图踩过）——强制往下弹 */}
-            <SelectContent
-              className="w-auto min-w-(--anchor-width) max-w-80"
-              alignItemWithTrigger={false}
-              side="bottom"
-            >
-              {spaces.map((s) => (
-                <SelectItem key={s.key} value={s.key}>
-                  {s.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
+        {/* 当前默认空间名：只展示、不可点（切空间去设置页） */}
+        <span className="text-xs text-muted-foreground">{meegleProject.name}</span>
         <Button
           size="sm"
           variant="outline"

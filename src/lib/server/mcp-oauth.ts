@@ -32,7 +32,11 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { McpServerConfig } from "@cursor/sdk";
-import { dataRoot } from "./data-root";
+import {
+  dataRoot,
+  hardenPathMode,
+  writePrivateFileAtomic,
+} from "./data-root";
 
 // ---- 路径 / 常量 ----
 
@@ -50,6 +54,38 @@ const getRedirectUri = (): string => `${getBaseUrl()}/api/mcp-oauth/callback`;
 
 // access token 过期前多久就提前续期（避免临界过期、起 agent 时刚好失效）
 const EXPIRY_BUFFER_MS = 60_000;
+
+// ---- 按 server 串行（P1-07）：同进程内同一 server 的读-改-写互斥 ----
+// 挂 globalThis：dev HMR / 多 chunk 各持一份 module 变量会让串行化失效
+const OAUTH_LOCKS_KEY = "__feAiFlowMcpOAuthLocksV1__";
+type OAuthLockMap = Map<string, Promise<void>>;
+
+const getOAuthLocks = (): OAuthLockMap => {
+  const g = globalThis as unknown as Record<string, OAuthLockMap | undefined>;
+  if (!g[OAUTH_LOCKS_KEY]) g[OAUTH_LOCKS_KEY] = new Map();
+  return g[OAUTH_LOCKS_KEY]!;
+};
+
+/**
+ * 按 serverName 进程内 promise-chain 互斥（参考 meegle-queue）。
+ * 罩住读-改-写全程；前驱失败不阻断后续；单进程 app、不需要跨进程文件锁。
+ */
+const withServerLock = <T>(
+  serverName: string,
+  run: () => Promise<T>,
+): Promise<T> => {
+  const locks = getOAuthLocks();
+  const prev = locks.get(serverName) ?? Promise.resolve();
+  const result = prev.then(run, run);
+  locks.set(
+    serverName,
+    result.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return result;
+};
 
 // ---- 落盘记录 ----
 
@@ -97,6 +133,8 @@ const normalizeServerUrl = (u: string | undefined): string =>
  * **只有记录里的 serverName 完全一致才迁**（record 出生起就带 serverName）——
  * 碰撞名写的记录（旧规则下 `foo/bar` / `foo?bar` 共用一个文件、内容属于后写的那个）
  * 不猜归属、返 null 要求该 server 重新授权。
+ *
+ * 注意：调用方若已持 withServerLock，不要再包一层（会死锁）；本函数本身不加锁。
  */
 const migrateLegacyRecord = async (
   serverName: string,
@@ -106,12 +144,7 @@ const migrateLegacyRecord = async (
     const raw = await fs.readFile(legacyPath, "utf-8");
     const rec = JSON.parse(raw) as OAuthRecord;
     if (rec.serverName !== serverName) return null; // 碰撞受害方、不迁、重新授权
-    await fs.mkdir(oauthDir(), { recursive: true });
-    await fs.writeFile(
-      recordFile(serverName),
-      JSON.stringify(rec, null, 2),
-      "utf-8",
-    );
+    await writeRecord(serverName, rec);
     await fs.unlink(legacyPath).catch(() => {});
     console.log(`[mcp-oauth] 已迁移旧凭证文件（${serverName}）到哈希命名`);
     return rec;
@@ -133,27 +166,53 @@ const readRecord = async (serverName: string): Promise<OAuthRecord | null> => {
   }
 };
 
+/** 原子写凭证文件（0600 + 目录 0700 + tmp/rename）——内部不加锁，由 withServerLock 罩 */
 const writeRecord = async (
   serverName: string,
   rec: OAuthRecord,
 ): Promise<void> => {
-  await fs.mkdir(oauthDir(), { recursive: true });
-  await fs.writeFile(
+  await writePrivateFileAtomic(
     recordFile(serverName),
     JSON.stringify(rec, null, 2),
-    "utf-8",
   );
 };
 
-// 局部更新（读旧的 merge 新字段、首次没有时用 base 兜底）
+// 局部更新（读旧的 merge 新字段、首次没有时用 base 兜底）——全程持 server 锁
 const patchRecord = async (
   serverName: string,
   serverUrl: string,
   patch: Partial<OAuthRecord>,
-): Promise<void> => {
-  const cur = (await readRecord(serverName)) ?? { serverName, serverUrl };
-  await writeRecord(serverName, { ...cur, ...patch });
+): Promise<void> =>
+  withServerLock(serverName, async () => {
+    const cur = (await readRecord(serverName)) ?? { serverName, serverUrl };
+    await writeRecord(serverName, { ...cur, ...patch });
+  });
+
+/**
+ * 启动幂等迁移：mcp-oauth 目录 0700、内文件 0600。
+ * 失败只 warn、不阻断；日志不含 token 内容。
+ */
+export const hardenMcpOAuthPerms = async (): Promise<void> => {
+  const dir = oauthDir();
+  await hardenPathMode(dir, 0o700);
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    console.warn(
+      `[mcp-oauth] 启动列举凭证目录失败:`,
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  for (const name of names) {
+    // 只收紧普通文件；跳过意外子目录 / 隐藏 tmp（tmp 写完应已清）
+    await hardenPathMode(path.join(dir, name), 0o600);
+  }
 };
+
 
 // ---- OAuthClientProvider 实现（状态全部落盘、跨请求复用） ----
 
@@ -250,20 +309,23 @@ class FileOAuthClientProvider implements OAuthClientProvider {
   async invalidateCredentials(
     scope: "all" | "client" | "tokens" | "verifier" | "discovery",
   ): Promise<void> {
-    const rec = await readRecord(this.serverName);
-    if (!rec) return;
-    if (scope === "all") {
-      await writeRecord(this.serverName, {
-        serverName: this.serverName,
-        serverUrl: this.serverUrl,
-      });
-      return;
-    }
-    if (scope === "client") rec.client = undefined;
-    if (scope === "tokens") rec.tokens = undefined;
-    if (scope === "verifier") rec.codeVerifier = undefined;
-    if (scope === "discovery") rec.discovery = undefined;
-    await writeRecord(this.serverName, rec);
+    // 与 patchRecord 同锁：避免 refresh/revoke 并发把读-改-写打穿
+    await withServerLock(this.serverName, async () => {
+      const rec = await readRecord(this.serverName);
+      if (!rec) return;
+      if (scope === "all") {
+        await writeRecord(this.serverName, {
+          serverName: this.serverName,
+          serverUrl: this.serverUrl,
+        });
+        return;
+      }
+      if (scope === "client") rec.client = undefined;
+      if (scope === "tokens") rec.tokens = undefined;
+      if (scope === "verifier") rec.codeVerifier = undefined;
+      if (scope === "discovery") rec.discovery = undefined;
+      await writeRecord(this.serverName, rec);
+    });
   }
 }
 
@@ -467,10 +529,11 @@ export const evaluateMcpOAuthStatuses = async (
 };
 
 /** 撤销授权：删凭证文件（下次起 agent 不再注入、需重新授权）。旧清洗命名的残留一并清。 */
-export const clearMcpOAuth = async (serverName: string): Promise<void> => {
-  await fs.unlink(recordFile(serverName)).catch(() => {});
-  await fs.unlink(legacyRecordFile(serverName)).catch(() => {});
-};
+export const clearMcpOAuth = async (serverName: string): Promise<void> =>
+  withServerLock(serverName, async () => {
+    await fs.unlink(recordFile(serverName)).catch(() => {});
+    await fs.unlink(legacyRecordFile(serverName)).catch(() => {});
+  });
 
 /**
  * 拿有效 access token：未过期直接返；过期且有 refresh → 用 auth() 自动续；拿不到返 null。

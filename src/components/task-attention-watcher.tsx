@@ -25,10 +25,11 @@ import type { RunStatus, TaskSummary } from "@/lib/types";
 
 // 通知正文：按 mode / 最近 action 状态给一句话（文案简洁原则、不超一行）。
 // TaskSummary 没有 custom action 的 label 快照、custom 显示兜底「自定义」可接受。
+// 历史退役类型（learn 等）查表 miss 时回退原始 type 字符串。
 const buildBody = (task: TaskSummary): string => {
   if (task.mode === "chat") return "AI 已回复";
   if (task.lastActionStatus === "awaiting_ack" && task.lastActionType) {
-    return `「${ACTION_LABEL[task.lastActionType]}」已完成、等你确认`;
+    return `「${ACTION_LABEL[task.lastActionType] ?? task.lastActionType}」已完成、等你确认`;
   }
   return "AI 在等你回复";
 };

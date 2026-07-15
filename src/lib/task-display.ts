@@ -4,15 +4,12 @@
  * V0.6 概念变化：phase chain 拆掉、action history 取代——
  *  - 原 PHASE_LABEL / PHASE_LABEL_EN / PHASE_LABEL_SHORT → ACTION_LABEL_*
  *  - 原 STATUS_LABEL（TaskStatus 单维度）→ REPO_STATUS_LABEL（业务）+ RUN_STATUS_LABEL（运行时）
- *  - 加 ACTION_STATUS_LABEL（单条 action 的状态）
  *
  * 改 action / status 文案 → 只改这一个文件。
  */
 
 import type {
   ActionRecord,
-  ActionStatus,
-  ActionType,
   PlanBatch,
   ReplanMode,
   RepoStatus,
@@ -27,52 +24,51 @@ import type {
 /**
  * Action 中文长版本（主要展示用：advance dialog 选项 / action timeline 卡片）
  *
- * 注意：types.ts 已经 export `ACTION_LABEL`（types 层最小集合）、本文件这版**复用同名**
- * 但放在 display 层、跟其他 display label 一起统一来源。如有偏差以本文件为准。
+ * 用 Record<string,…> 而非 Record<ActionType,…>：历史退役类型（learn / test）读盘后仍可能出现、
+ * 查表 miss 时由 actionDisplayLabel 回退到原始 type 字符串、避免 timeline / 事件流崩。
+ * types.ts 另有一份 ACTION_LABEL（推进准入文案）；展示层以本文件为准。
  */
-export const ACTION_LABEL: Record<ActionType, string> = {
+export const ACTION_LABEL: Record<string, string> = {
   plan: "出方案",
   build: "改代码",
   review: "复核",
   ship: "提测",
-  learn: "沉淀",
   dev: "联调",
   // 兜底——custom action 实际展示走定义里的 label（见 actionDisplayLabel），拿不到才回退
   custom: "自定义",
 };
 
 /** 英文短标、用在 timeline 副标 / event stream inline */
-export const ACTION_LABEL_EN: Record<ActionType, string> = {
+export const ACTION_LABEL_EN: Record<string, string> = {
   plan: "Plan",
   build: "Build",
   review: "Review",
   ship: "Ship",
-  learn: "Learn",
   dev: "Dev",
   custom: "Custom",
 };
 
 /** 中文 2 字短标、用在事件流 inline tag 等紧凑场景 */
-export const ACTION_LABEL_SHORT: Record<ActionType, string> = {
+export const ACTION_LABEL_SHORT: Record<string, string> = {
   plan: "方案",
   build: "实现",
   review: "复核",
   ship: "提测",
-  learn: "沉淀",
   dev: "联调",
   custom: "自定义",
 };
 
 /**
  * 取一条 action 的展示 label（统一来源、展示层都该走这个、不要裸 ACTION_LABEL[type]）。
- * - 内置 6 个 → 按 variant 取 ACTION_LABEL / ACTION_LABEL_SHORT / ACTION_LABEL_EN
+ * - 内置已知类型 → 按 variant 取 ACTION_LABEL / ACTION_LABEL_SHORT / ACTION_LABEL_EN
  * - custom → action.customLabel 快照（advance 时从定义固化）、缺省回退兜底「自定义」
  *   （快照原因同 MRRecord.title：定义改名 / 删了、历史 action 仍显示当时的名字、不漂移）
  *   custom 没有 short/en 版、各 variant 都返回 customLabel 快照
+ * - 未知 / 退役类型（如历史 learn）→ 回退原始 type 字符串、不崩
  */
 export const actionDisplayLabel = (
   action: {
-    type: ActionType;
+    type: string;
     customLabel?: string;
   },
   variant: "default" | "short" | "en" = "default",
@@ -80,9 +76,13 @@ export const actionDisplayLabel = (
   if (action.type === "custom") {
     return action.customLabel?.trim() || ACTION_LABEL.custom;
   }
-  if (variant === "short") return ACTION_LABEL_SHORT[action.type];
-  if (variant === "en") return ACTION_LABEL_EN[action.type];
-  return ACTION_LABEL[action.type];
+  const table =
+    variant === "short"
+      ? ACTION_LABEL_SHORT
+      : variant === "en"
+        ? ACTION_LABEL_EN
+        : ACTION_LABEL;
+  return table[action.type] ?? action.type;
 };
 
 // ===========================================
@@ -127,29 +127,6 @@ export const MR_KIND_LABEL: Record<"ship" | "dev", string> = {
 };
 
 // ===========================================
-// Action 状态标签
-// ===========================================
-
-export const ACTION_STATUS_LABEL: Record<ActionStatus, string> = {
-  running: "运行中",
-  awaiting_ack: "等待确认",
-  completed: "已通过",
-  error: "失败",
-  cancelled: "已取消",
-};
-
-export const ACTION_STATUS_VARIANT: Record<
-  ActionStatus,
-  "default" | "secondary" | "destructive" | "outline"
-> = {
-  running: "default",
-  awaiting_ack: "secondary",
-  completed: "secondary",
-  error: "destructive",
-  cancelled: "outline",
-};
-
-// ===========================================
 // Task 级仓库状态（V0.6 新维度、跟 MR 生命周期对齐）
 // ===========================================
 
@@ -187,31 +164,6 @@ export const RUN_STATUS_VARIANT: Record<
   running: "default",
   awaiting_user: "secondary",
   error: "destructive",
-};
-
-// ===========================================
-// 仓库路径展示
-// ===========================================
-
-/**
- * 任务关联仓库的展示文案（V0.5.9 加、V0.6 不变）
- *
- * - 0 个 → "(未配置仓库)"
- * - 1 个 → 完整路径
- * - 多个 → 各仓 basename 用 " + " 拼接
- *
- * 完整路径展开版本在 hover tooltip 里给（调用方自己加 title 属性）。
- */
-export const formatRepoPathsForDisplay = (paths: string[]): string => {
-  if (paths.length === 0) return "(未配置仓库)";
-  if (paths.length === 1) return paths[0];
-  return paths
-    .map((p) => {
-      const clean = p.replace(/\/+$/, "");
-      const idx = clean.lastIndexOf("/");
-      return idx >= 0 ? clean.slice(idx + 1) || clean : clean;
-    })
-    .join(" + ");
 };
 
 // ===========================================
@@ -463,17 +415,6 @@ export const deriveEffectiveBatches = (task: Task): EffectiveBatchesResult => {
     builtIds,
   };
 };
-
-/**
- * 兼容旧调用名：返回当前有效批次（不是“最新单个 plan”）。
- * 新代码优先直接用 deriveEffectiveBatches / computeBatchProgress。
- */
-export const getLatestPlanBatches = (task: Task): EffectivePlanBatch[] =>
-  deriveEffectiveBatches(task).batches;
-
-/** 已 build 过的批次 effective id 集合（纯派生、不存计数器避免漂移）。 */
-export const collectBuiltBatchIds = (task: Task): Set<string> =>
-  deriveEffectiveBatches(task).builtIds;
 
 /** 批次进度快照（UI 进度条 + 后端 prompt 进度提示共用） */
 export interface BatchProgress {

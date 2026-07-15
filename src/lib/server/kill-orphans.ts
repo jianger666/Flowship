@@ -106,7 +106,7 @@ const collectSubtree = (
 /**
  * 扫描并杀掉落在 repoPaths 里的孤儿 / agent-shell 进程树。best-effort、不抛。
  */
-export const killOrphansInRepos = async (
+const killOrphansInRepos = async (
   repoPaths: string[],
 ): Promise<void> => {
   // Windows：没有 ps / lsof、这套「按 cwd 扫孤儿」实施不了——直接跳过、

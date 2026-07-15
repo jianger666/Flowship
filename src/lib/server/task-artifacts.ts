@@ -5,7 +5,8 @@
  *   - 用户上传图片（saveImageAttachments、uploads/ 目录）
  *   - artifact 读（readCurrentActionArtifact）
  *   - artifact 快照 revisions（snapshotActionArtifact / listActionRevisions /
- *     readActionRevisionContent / pruneIdenticalRevisions）
+ *     readActionRevisionContent / pruneIdenticalRevisions /
+ *     filterIdenticalTailRevisionsForDisplay）
  *   - artifact 划除 / 恢复（setActionArtifactExcluded、.excluded/ 隐藏目录物理挪移）
  *
  * 依赖方向（保证无环）：只依赖 types / data-root / task-fs-core、不 import task-fs。
@@ -141,7 +142,7 @@ const isoForFilename = (ts: number): string =>
 /**
  * V0.6：snapshot 当前 action artifact、追加到对应 ActionRecord.revisions
  *
- * 触发时机：action-ack 路由 revise 分支、submitActionAck 调用前调一次。
+ * 触发时机：question 路由「再聊聊」分支、落用户反馈前调一次。
  *
  * 行为：
  *   - action 没 artifactPath / 文件不存在 / 内容为空 → 返 null、不写、不污染 meta
@@ -237,6 +238,31 @@ export const shouldPruneIdenticalRevisionsOnList = (
 };
 
 /**
+ * 判定某份 revision 是否与当前正文内容完全相同。
+ *
+ * - size 与当前字节数不同 → 直接 false（短路、免读盘）
+ * - 文件读失败 → null（调用方当「无法判定」、停下以免误删/误滤）
+ * prune（物理删）与 filterIdenticalTailRevisionsForDisplay（只滤响应）共用。
+ */
+const revisionMatchesCurrentContent = async (
+  taskId: string,
+  rev: ArtifactRevision,
+  current: string,
+  currentSize: number,
+): Promise<boolean | null> => {
+  if (rev.size !== currentSize) return false;
+  try {
+    const revContent = await fs.readFile(
+      path.join(taskDir(taskId), rev.path),
+      "utf-8",
+    );
+    return revContent === current;
+  } catch {
+    return null;
+  }
+};
+
+/**
  * 清掉「尾部与当前正文完全相同」的 revision 快照（文件 + meta）。
  *
  * 背景：question 路由对任何插话都先 snapshot（分不清问/改）——用户只问句、AI 没改
@@ -270,6 +296,7 @@ export const pruneIdenticalRevisions = async (
       return;
     }
 
+    const currentSize = Buffer.byteLength(current, "utf-8");
     // 升序后从尾部 pop：只动「最新往旧」的连续相同段
     const kept = [...action.revisions].sort(
       (a, b) => a.timestamp - b.timestamp,
@@ -278,17 +305,14 @@ export const pruneIdenticalRevisions = async (
 
     while (kept.length > 0) {
       const newest = kept[kept.length - 1]!;
-      let revContent: string;
-      try {
-        revContent = await fs.readFile(
-          path.join(taskDir(taskId), newest.path),
-          "utf-8",
-        );
-      } catch {
-        // 文件缺失无法比内容 → 停下，避免误删更早的真历史
-        break;
-      }
-      if (revContent !== current) break;
+      const match = await revisionMatchesCurrentContent(
+        taskId,
+        newest,
+        current,
+        currentSize,
+      );
+      // null = 文件缺失无法比 → 停下，避免误删更早的真历史
+      if (match !== true) break;
 
       await fs
         .unlink(path.join(taskDir(taskId), newest.path))
@@ -303,6 +327,41 @@ export const pruneIdenticalRevisions = async (
     meta.updatedAt = Date.now();
     await writeMeta(meta);
   });
+
+/**
+ * 展示层过滤：从升序 revisions 尾部剔掉「内容与当前正文完全相同」的条目。
+ *
+ * 不删文件、不改 meta——专治 running 态假红点：问类插话先 snapshot、正文未改时
+ * prune 被 running 闸住、相同快照仍会短暂进列表 → 红点误亮。响应里滤掉后，
+ * 「最新 revision ts > seenTs」自然不再把相同快照当未读。
+ *
+ * 只扫尾部连续相同段（假红点来源只会是最新快照）；size 不同短路免读盘。
+ */
+export const filterIdenticalTailRevisionsForDisplay = async (
+  taskId: string,
+  revisions: ArtifactRevision[],
+  currentContent: string | null,
+): Promise<ArtifactRevision[]> => {
+  if (!currentContent || revisions.length === 0) return revisions;
+
+  const currentSize = Buffer.byteLength(currentContent, "utf-8");
+  const sorted = [...revisions].sort((a, b) => a.timestamp - b.timestamp);
+  let end = sorted.length;
+
+  while (end > 0) {
+    const newest = sorted[end - 1]!;
+    const match = await revisionMatchesCurrentContent(
+      taskId,
+      newest,
+      currentContent,
+      currentSize,
+    );
+    if (match !== true) break;
+    end -= 1;
+  }
+
+  return sorted.slice(0, end);
+};
 
 export const listActionRevisions = async (
   taskId: string,

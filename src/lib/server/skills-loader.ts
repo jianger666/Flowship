@@ -175,7 +175,8 @@ export const parseSkillFile = async (absPath: string): Promise<SkillEntry | null
 /** 用户禁用的 skill 名单（v1.1.x 可关、settings.disabledSkills、按 name 记） */
 export const readDisabledSkills = async (): Promise<Set<string>> => {
   try {
-    const raw = await readSettingsFile();
+    const result = await readSettingsFile();
+    const raw = result.status === "ok" ? result.settings : null;
     const arr = raw?.disabledSkills;
     return new Set(
       Array.isArray(arr) ? arr.filter((s): s is string => typeof s === "string") : [],

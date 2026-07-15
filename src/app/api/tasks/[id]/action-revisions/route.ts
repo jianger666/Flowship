@@ -16,6 +16,7 @@
 import { NextResponse } from "next/server";
 import { getTask } from "@/lib/server/task-fs";
 import {
+  filterIdenticalTailRevisionsForDisplay,
   listActionRevisions,
   pruneIdenticalRevisions,
   readCurrentActionArtifact,
@@ -54,7 +55,15 @@ export const GET = async (req: Request, { params }: Ctx) => {
       readCurrentActionArtifact(id, actionId),
     ]);
 
-    return NextResponse.json({ revisions, current });
+    // running 态 prune 被闸住时，问类插话的相同快照仍会短暂进列表 → 假红点。
+    // 展示层滤掉尾部相同项（不删文件）；红点「最新 ts > seenTs」随之自然正确。
+    const visible = await filterIdenticalTailRevisionsForDisplay(
+      id,
+      revisions,
+      current?.content ?? null,
+    );
+
+    return NextResponse.json({ revisions: visible, current });
   } catch (err) {
     console.error("[GET /api/tasks/[id]/action-revisions] failed", err);
     return NextResponse.json({ error: "bad_request" }, { status: 400 });

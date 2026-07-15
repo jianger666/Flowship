@@ -24,6 +24,7 @@ import { Blocks, LayoutDashboard, MessageSquare, PanelLeft, Settings } from "luc
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 
+import { MrInboxBell } from "@/components/mr-inbox/mr-inbox-bell";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UpdateBadge } from "@/components/update-badge";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ declare global {
       setTitleBarOverlay: (opts: { color: string; symbolColor: string }) => void;
       markContentReady?: () => void;
       openExternal?: (url: string) => void;
+      setInboxBadge?: (payload: { count: number; dataUrl?: string }) => void;
     };
   }
 }
@@ -182,6 +184,8 @@ export const AppHeader = ({
       >
         {/* 桌面端有新版本就绪时亮起（壳注入版本号后显示） */}
         <UpdateBadge />
+        {/* 提测收件箱（QA 拉取式：Inbox 图标 + 未读数 badge + Popover 面板） */}
+        <MrInboxBell />
         {/* 主题切换（浅色 / 深色 / 跟随系统） */}
         <ThemeToggle />
         {/* 能力页入口（Action / Skill / MCP 集中管理、v1.0.x）；

@@ -41,7 +41,7 @@ export const deriveProjectPathFromRepo = async (
   }
 };
 
-// 从仓库 origin remote 推导 GitLab host（settings 未填 host 时的 fallback）
+// 从仓库 origin remote 推导 GitLab host（ship / submit_mr 唯一来源、不读 settings）
 export const deriveHostFromRepo = async (
   repoPath: string,
 ): Promise<string | null> => {

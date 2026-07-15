@@ -17,7 +17,7 @@ import { buildIdeLink, resolveIdeTarget } from "@/lib/path-utils";
 import { JUMP_IDE_USES_PROTOCOL, type JumpIde } from "@/lib/types";
 
 /** 后端拉起 IDE（JetBrains 系跳转通道）、失败 toast */
-export const openViaBackend = async (
+const openViaBackend = async (
   ide: JumpIde,
   absPath: string,
   line?: number,

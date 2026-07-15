@@ -5,19 +5,20 @@
  *   - 数据目录路径常量 + id 生成 + 路径 helper（events.jsonl / actions/ / artifact / check log）
  *   - meta.json 类型（TaskMetaV06）+ zod schema 校验 + 原子读写
  *   - per-task mutex（withTaskLock、挂 globalThis）
- *   - 事件流读写（readEvents / appendEventLine）
+ *   - 事件流读写（readEvents / readEventsTail / readEventsBefore / appendEventLine）
  *   - hydrate（meta → Task / TaskSummary）
  *
  * 依赖方向（保证无环）：只依赖 types / data-root、不 import task-fs / task-artifacts。
  * 数据布局说明见 task-fs.ts 顶部注释。
  */
 
+import { createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 
 import type {
   ActionRecord,
-  ActionType,
   GitBranchInfo,
   MRRecord,
   ModelSelection,
@@ -27,10 +28,8 @@ import type {
   TaskContextDoc,
   TaskEvent,
   TaskMode,
-  TaskRole,
   TaskSummary,
 } from "@/lib/types";
-import { ACTION_TYPES, TASK_ROLES } from "@/lib/types";
 import { dataRoot } from "./data-root";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
 import { getTaskCwd } from "./task-worktrees";
@@ -101,15 +100,16 @@ export const getTaskWorkspaceDir = (taskId: string): string =>
 /**
  * 给单条 action 算 artifact 文件名（相对名、不含目录前缀）
  * 命名规则：`<N>-<type>.md`、N 不前导 0、跟 V0.6-REFACTOR.md §4.3 一致
+ * type 用 string：历史退役类型（learn / test）磁盘上仍可能有 artifact、路径拼装不能卡死在枚举。
  */
-export const actionArtifactFilename = (n: number, type: ActionType): string =>
+export const actionArtifactFilename = (n: number, type: string): string =>
   `${n}-${type}.md`;
 
 /**
  * 给单条 action 算 artifact 相对路径（meta 里 `ActionRecord.artifactPath` 存这个）
  * 例：`actions/1-plan.md`
  */
-export const actionArtifactRelPath = (n: number, type: ActionType): string =>
+export const actionArtifactRelPath = (n: number, type: string): string =>
   `${ACTIONS_DIR}/${actionArtifactFilename(n, type)}`;
 
 /**
@@ -118,7 +118,7 @@ export const actionArtifactRelPath = (n: number, type: ActionType): string =>
 export const getActionArtifactPath = (
   taskId: string,
   n: number,
-  type: ActionType,
+  type: string,
 ): string => path.join(getActionsDir(taskId), actionArtifactFilename(n, type));
 
 // ----------------- 基础 fs helper -----------------
@@ -161,7 +161,6 @@ export interface TaskMetaV06 {
    * 2026-06-12 起存 user_key（原 lark_user_id 体系被官方 MCP 封死、详见 types.ts）
    */
   feishuTesterUserKeys?: string[];
-  role: TaskRole;
   repoPaths: string[];
   /**
    * 非 git 目录清单快照（详见 types.ts Task.nonGitRepoPaths）。
@@ -216,10 +215,10 @@ const ActionRecordLooseSchema = z
   .looseObject({
     id: z.string().min(1),
     n: z.number().int().nonnegative(),
-    // V0.9：持久化的 action 可以是 custom（运行时类型、故意不进 ACTION_TYPES 内置清单）。
-    // schema 必须放行 custom、否则推过 custom 的 task meta.json 会校验不过 → getTask 返 null /
-    // readMetaV06 抛错 → 整个 task 从此读不了（404 / 历史报错）。漏了这条是 V0.9 首发的数据损坏 bug。
-    type: z.enum([...ACTION_TYPES, "custom"] as const),
+    // 放行任意非空字符串：内置 ACTION_TYPES + custom + 历史退役类型（learn / test）。
+    // 若收窄成枚举、带旧 learn 记录的 meta.json 会整单读失败（404）。
+    // 新推进仍由 advance route 用 ACTION_TYPES / custom 白名单拦。
+    type: z.string().min(1),
     status: z.enum(["running", "awaiting_ack", "completed", "error", "cancelled"]),
     userInstruction: z.string(),
     artifactPath: z.string().nullable(),
@@ -241,7 +240,7 @@ const TaskMetaV06Schema = z
     currentActionId: z.string().nullable(),
     actions: z.array(ActionRecordLooseSchema),
     mrs: z.array(z.looseObject({})),
-    role: z.enum(TASK_ROLES), // 单一源（CR-07）：枚举扩展只改 types.ts
+    // role 已退役：历史 meta 里残留的 role 字段靠 looseObject 自然忽略、不校验不读入
     repoPaths: z.array(z.string()),
     pinned: z.boolean().optional(),
     createdAt: z.number(),
@@ -367,21 +366,153 @@ export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
 
 // ----------------- 事件流 -----------------
 
+/** 尾部 / bootstrap 最多带这么多条（调用方传入更大值会被 clamp） */
+export const MAX_EVENTS_TAIL = 1000;
+/** cursor 分页单页上限 */
+export const MAX_EVENTS_PAGE = 500;
+/** 反向读尾部时每块字节数——IO 量跟「要的条数 × 平均行宽」同阶，不跟文件总长 */
+const EVENTS_TAIL_CHUNK = 64 * 1024;
+
+/** 解析一行 JSONL（容忍 CRLF、空行、崩溃半行） */
+const parseEventLine = (raw: string): TaskEvent | null => {
+  const text = raw.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as TaskEvent;
+  } catch {
+    return null;
+  }
+};
+
+/** 从 Buffer 行去 CR 再 parse（反向按字节扫 \n 时用） */
+const parseEventLineBuf = (buf: Buffer): TaskEvent | null => {
+  let s = buf;
+  if (s.length > 0 && s[s.length - 1] === 0x0d) s = s.subarray(0, s.length - 1);
+  return parseEventLine(s.toString("utf-8"));
+};
+
+/**
+ * 全量读 events.jsonl（诊断包 / 真需要全量的路径）。
+ * 长任务热点路径请用 readEventsTail / readEventsBefore。
+ */
 export const readEvents = async (id: string): Promise<TaskEvent[]> => {
   const p = path.join(taskDir(id), EVENTS_FILE);
   if (!(await exists(p))) return [];
   const raw = await fs.readFile(p, "utf-8");
   return raw
-    .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as TaskEvent;
-      } catch {
-        return null;
-      }
-    })
+    .split(/\r?\n/)
+    .map((line) => parseEventLine(line))
     .filter((x): x is TaskEvent => x !== null);
+};
+
+/**
+ * 从文件尾按块反向读，只解析最后 n 条有效事件。
+ * IO/解析量 ≈ O(n 条对应的字节)，不随文件总长线性增长。
+ * hasMore = 文件里还有比返回结果更早的有效事件（多读到第 n+1 条才置 true）。
+ */
+export const readEventsTail = async (
+  id: string,
+  n: number,
+): Promise<{ events: TaskEvent[]; hasMore: boolean }> => {
+  const limit = Math.max(0, Math.min(Math.floor(n), MAX_EVENTS_TAIL));
+  if (limit === 0) return { events: [], hasMore: false };
+
+  const p = path.join(taskDir(id), EVENTS_FILE);
+  if (!(await exists(p))) return { events: [], hasMore: false };
+
+  const fh = await fs.open(p, "r");
+  try {
+    const { size } = await fh.stat();
+    if (size === 0) return { events: [], hasMore: false };
+
+    let pos = size;
+    // 更靠文件尾一侧、尚未与更早块拼成「行首」的碎片（跨块行）
+    let carry = Buffer.alloc(0);
+    // collected[0] = 文件中最后一条有效事件（倒序）
+    const collected: TaskEvent[] = [];
+
+    while (pos > 0 && collected.length <= limit) {
+      const toRead = Math.min(EVENTS_TAIL_CHUNK, pos);
+      pos -= toRead;
+      const buf = Buffer.allocUnsafe(toRead);
+      const { bytesRead } = await fh.read(buf, 0, toRead, pos);
+      const data = Buffer.concat([buf.subarray(0, bytesRead), carry]);
+
+      // 按字节找 \n，再整行 decode——避免 UTF-8 多字节字符被块边界切断后乱码
+      const linesFromRight: Buffer[] = [];
+      let end = data.length;
+      for (let i = data.length - 1; i >= 0; i--) {
+        if (data[i] !== 0x0a) continue;
+        linesFromRight.push(data.subarray(i + 1, end));
+        end = i;
+      }
+      if (pos > 0) {
+        carry = data.subarray(0, end);
+      } else {
+        carry = Buffer.alloc(0);
+        if (end > 0) linesFromRight.push(data.subarray(0, end));
+      }
+
+      for (const lineBuf of linesFromRight) {
+        const ev = parseEventLineBuf(lineBuf);
+        if (!ev) continue; // 空行 / 崩溃半行 / 坏 JSON
+        collected.push(ev);
+        if (collected.length > limit) break;
+      }
+    }
+
+    const hasMore = collected.length > limit;
+    const events = collected.slice(0, limit).reverse();
+    return { events, hasMore };
+  } finally {
+    await fh.close();
+  }
+};
+
+/**
+ * 流式向前扫：取 cursor（beforeId）之前紧邻的一页更早事件（时间正序）。
+ * 只在内存里保留 page 大小的滑动窗口，找到锚点即停、不把整文件解析成数组。
+ * 锚点不存在 → { events: [], hasMore: false }（与旧路由语义一致）。
+ */
+export const readEventsBefore = async (
+  id: string,
+  beforeId: string,
+  limit: number,
+): Promise<{ events: TaskEvent[]; hasMore: boolean }> => {
+  const page = Math.max(0, Math.min(Math.floor(limit), MAX_EVENTS_PAGE));
+  if (page === 0 || !beforeId) return { events: [], hasMore: false };
+
+  const p = path.join(taskDir(id), EVENTS_FILE);
+  if (!(await exists(p))) return { events: [], hasMore: false };
+
+  const stream = createReadStream(p, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  const window: TaskEvent[] = [];
+  let discarded = false;
+  let found = false;
+
+  try {
+    for await (const line of rl) {
+      const ev = parseEventLine(line);
+      if (!ev) continue;
+      if (ev.id === beforeId) {
+        found = true;
+        break;
+      }
+      window.push(ev);
+      if (window.length > page) {
+        window.shift();
+        discarded = true;
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+
+  if (!found) return { events: [], hasMore: false };
+  return { events: window, hasMore: discarded };
 };
 
 export const appendEventLine = async (
@@ -399,52 +530,71 @@ export const appendEventLine = async (
 
 // ----------------- hydrate（meta → Task）-----------------
 
+/** meta + 已读好的 events → Task（不 IO） */
+export const assembleTask = (
+  meta: TaskMetaV06,
+  events: TaskEvent[],
+): Task => ({
+  id: meta.id,
+  title: meta.title,
+  mode: meta.mode,
+  repoStatus: meta.repoStatus,
+  runStatus: meta.runStatus,
+  currentActionId: meta.currentActionId,
+  actions: meta.actions,
+  mrs: meta.mrs,
+  gitBranches: meta.gitBranches,
+  feishuTesterUserKeys: meta.feishuTesterUserKeys,
+  repoPaths: meta.repoPaths,
+  nonGitRepoPaths: meta.nonGitRepoPaths,
+  readonlyRepoPaths: meta.readonlyRepoPaths,
+  scriptRepoPaths: meta.scriptRepoPaths,
+  repoBaseBranches: meta.repoBaseBranches,
+  repoFeatureBranches: meta.repoFeatureBranches,
+  repoTestBranches: meta.repoTestBranches,
+  repoDevBranches: meta.repoDevBranches,
+  repoBranchTemplates: meta.repoBranchTemplates,
+  feishuStoryUrl: meta.feishuStoryUrl,
+  contextDocs: meta.contextDocs,
+  disabledMcpServers: meta.disabledMcpServers,
+  isolateWorktree: meta.isolateWorktree,
+  sessionAgentId: meta.sessionAgentId,
+  // 计算字段（不落盘）：agent 实际工作目录——隔离 task = worktree cwd、否则 = 原仓库 cwd。
+  // client 的「在 IDE 打开工作区 / 复制路径 / 预览」都要它、而 dataRoot 只有 server 知道
+  workCwd: getTaskCwd(meta),
+  // 计算字段（不落盘）：任务数据目录（artifact / workspace / 事件日志所在）——
+  // client 的「打开任务文件夹」按钮用
+  taskDirPath: taskDir(meta.id),
+  removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
+  pinned: meta.pinned,
+  createdAt: meta.createdAt,
+  updatedAt: meta.updatedAt,
+  model: meta.model,
+  uiLayout: meta.uiLayout,
+  events,
+});
+
 /**
  * meta → Task
- * - 读 events.jsonl + 每条 action 的 artifact、组合成完整 Task object
+ * - 读全量 events.jsonl + 每条 action 的 artifact、组合成完整 Task object
  */
 export const hydrateTask = async (meta: TaskMetaV06): Promise<Task> => {
   const events = await readEvents(meta.id);
-  return {
-    id: meta.id,
-    title: meta.title,
-    mode: meta.mode,
-    repoStatus: meta.repoStatus,
-    runStatus: meta.runStatus,
-    currentActionId: meta.currentActionId,
-    actions: meta.actions,
-    mrs: meta.mrs,
-    gitBranches: meta.gitBranches,
-    feishuTesterUserKeys: meta.feishuTesterUserKeys,
-    role: meta.role,
-    repoPaths: meta.repoPaths,
-    nonGitRepoPaths: meta.nonGitRepoPaths,
-    readonlyRepoPaths: meta.readonlyRepoPaths,
-    scriptRepoPaths: meta.scriptRepoPaths,
-    repoBaseBranches: meta.repoBaseBranches,
-    repoFeatureBranches: meta.repoFeatureBranches,
-    repoTestBranches: meta.repoTestBranches,
-    repoDevBranches: meta.repoDevBranches,
-    repoBranchTemplates: meta.repoBranchTemplates,
-    feishuStoryUrl: meta.feishuStoryUrl,
-    contextDocs: meta.contextDocs,
-    disabledMcpServers: meta.disabledMcpServers,
-    isolateWorktree: meta.isolateWorktree,
-    sessionAgentId: meta.sessionAgentId,
-    // 计算字段（不落盘）：agent 实际工作目录——隔离 task = worktree cwd、否则 = 原仓库 cwd。
-    // client 的「在 IDE 打开工作区 / 复制路径 / 预览」都要它、而 dataRoot 只有 server 知道
-    workCwd: getTaskCwd(meta),
-    // 计算字段（不落盘）：任务数据目录（artifact / workspace / 事件日志所在）——
-    // client 的「打开任务文件夹」按钮用
-    taskDirPath: taskDir(meta.id),
-    removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
-    pinned: meta.pinned,
-    createdAt: meta.createdAt,
-    updatedAt: meta.updatedAt,
-    model: meta.model,
-    uiLayout: meta.uiLayout,
-    events,
-  };
+  return assembleTask(meta, events);
+};
+
+/**
+ * meta → Task，只带尾部 n 条事件（长任务详情 / SSE bootstrap 用）。
+ * eventsTruncated = hasMore（文件里还有更早事件）。
+ */
+export const hydrateTaskWithTailEvents = async (
+  meta: TaskMetaV06,
+  tail: number,
+): Promise<Task> => {
+  const { events, hasMore } = await readEventsTail(meta.id, tail);
+  const task = assembleTask(meta, events);
+  if (hasMore) task.eventsTruncated = true;
+  return task;
 };
 
 /**
@@ -463,7 +613,6 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     mrs: meta.mrs,
     gitBranches: meta.gitBranches,
     feishuTesterUserKeys: meta.feishuTesterUserKeys,
-    role: meta.role,
     repoPaths: meta.repoPaths,
     feishuStoryUrl: meta.feishuStoryUrl,
     contextDocs: meta.contextDocs,

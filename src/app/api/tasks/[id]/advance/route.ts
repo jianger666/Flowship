@@ -9,7 +9,7 @@
  *
  * ```
  * {
- *   actionType: ActionType,            // plan / build / review / ship / learn / dev
+ *   actionType: ActionType,            // plan / build / review / ship / dev / custom
  *   userInstruction: string,           // 用户在推进 dialog 写的指令（可空）
  *   images?: [{data, mimeType, filename}],
  *   attachments?: string[],            // 文件 / 目录绝对路径（原生 picker 选的）
@@ -35,6 +35,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 
+import { isAbsolutePathLike } from "@/lib/path-utils";
 import {
   errorResponse,
   isValidModel,
@@ -66,9 +67,9 @@ interface PostBody {
   apiKey?: string;
   model?: ModelSelection;
   reuseAgent?: boolean;
-  // V0.6.1 ship action 用：GitLab host + PAT、ship 准入校验 + agent 调 submit_mr 时用
+  // V0.6.1 ship action 用：GitLab PAT、ship 准入校验 + agent 调 submit_mr 时用
+  // Host 不由 client 传——server 按任务仓库 remote 现推
   // 非 ship action 时为空字符串也 OK、不参与校验
-  gitHost?: string;
   gitToken?: string;
   // V0.6.14 ship action 用：合并后是否删源分支（用户在推进 dialog 选、落 task 字段、submit_mr handler 读）
   removeSourceBranch?: boolean;
@@ -156,10 +157,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
     if (typeof raw !== "string" || !raw.trim()) {
       return errorResponse("attachments 必须是非空字符串数组");
     }
-    const abs = path.resolve(raw.trim());
-    if (!path.isAbsolute(abs)) {
+    // 必须对原始字符串判绝对路径：path.resolve 后再 isAbsolute 恒为 true，相对路径会被静默接受
+    const trimmed = raw.trim();
+    if (!isAbsolutePathLike(trimmed)) {
       return errorResponse(`attachments 必须是绝对路径：${raw}`);
     }
+    const abs = path.resolve(trimmed);
     try {
       await fs.stat(abs);
       attachmentAbsPaths.push(abs);
@@ -241,7 +244,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       apiKey,
       model,
       reuseAgent: body.reuseAgent === true,
-      gitHost: body.gitHost?.trim() || undefined,
       gitToken: body.gitToken?.trim() || undefined,
       // V0.6.23：build 分批选择（仅 build 有意义、advanceTask 内部按 actionType 取用）
       requestedBatchIds: Array.isArray(body.requestedBatchIds)

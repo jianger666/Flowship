@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-// ---- 模拟最小浏览器环境（local-store 的 isBrowser 闸门 + localStorage 双写）----
+// ---- 模拟最小浏览器环境（local-store 的 isBrowser 闸门；settings 不再双写 localStorage）----
 const localStorageStub = {
   store: new Map<string, string>(),
   getItem(key: string): string | null {
@@ -17,6 +17,9 @@ const localStorageStub = {
   },
   setItem(key: string, value: string): void {
     this.store.set(key, value);
+  },
+  removeItem(key: string): void {
+    this.store.delete(key);
   },
 };
 (globalThis as unknown as { window: unknown }).window = {
@@ -49,13 +52,28 @@ const errResponse = (): Response =>
 beforeAll(() => {
   vi.stubGlobal(
     "fetch",
-    (_url: string, init?: RequestInit) =>
-      new Promise<Response>((resolve) => {
+    (url: string, init?: RequestInit) => {
+      // P1-03：saveSettings 在 init 未成功时会先 GET /api/settings/full——
+      // 单测里自动放行成功，只把真正的 PUT 记进 pendingCalls
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (String(url).includes("/api/settings/full") && method === "GET") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ exists: true, settings: DEFAULT_SETTINGS }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        );
+      }
+      return new Promise<Response>((resolve) => {
         pendingCalls.push({
           body: init?.body ? JSON.parse(String(init.body)) : null,
           resolve,
         });
-      }),
+      });
+    },
   );
 });
 

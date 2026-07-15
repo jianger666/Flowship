@@ -82,10 +82,10 @@ export interface PreviewSlotStatus {
 
 /**
  * settings：config.json 持久化的用户配置
- * V0.6.1 新增 gitHost + gitToken：ship action 走 server 内置 GitLab REST API、
- *   不依赖外部 glab CLI；当前公司场景所有仓共用同一个 GitLab 实例、所以是全局字段。
- * V0.12.x 删 username：唯一用途是分支模板 {username} 占位符、单机 app 里直接把名字
- *   写进模板等价——迁移时把老配置的名字烘焙进模板后字段彻底移除。
+ * V0.6.1 新增 gitToken：ship action 走 server 内置 GitLab REST API、不依赖外部 glab CLI。
+ * Host 不进 settings——一律按任务仓库 origin remote 现推（单实例口径；历史 gitHost 字段已退役）。
+ * V0.12.x 删 username：唯一用途是分支模板 {username} 占位符；历史 task meta
+ *   残留由 server 启动迁移 prune（migrate-username-templates）。
  */
 /**
  * 代码跳转目标 IDE（2026-06-12 加、用户要求支持 IDEA）
@@ -147,7 +147,7 @@ export const JUMP_IDE_USES_PROTOCOL: Record<JumpIde, boolean> = {
 
 export type SubmitShortcut = "mod-enter" | "enter";
 
-/** 用户在设置页选的角色（身份注入视角锚点、解锁对应辅助能力） */
+/** 用户在设置页选的角色——告诉 AI 你的工作视角/身份（注入任务与对话的发起人信息） */
 export type UserRole = "fe" | "be" | "qa" | "other";
 
 export const USER_ROLES: readonly UserRole[] = ["fe", "be", "qa", "other"];
@@ -168,17 +168,13 @@ export interface FeAiFlowSettings {
   submitShortcut?: SubmitShortcut;
   /**
    * 我的角色（设置页偏好 / 首页就绪清单必填）。
-   * 注入 prompt「用户身份」行视角锚点；未设时 adaptive 按任务性质判定。
+   * 注入 prompt「发起人」行（姓名 + 角色），作为 AI 的工作视角/身份锚点。
    */
   userRole?: UserRole;
   /**
-   * V0.6.1 ship：GitLab 自建实例 host（如 `gitlab.wukongedu.net`、不带 https://）
-   * 留空则从仓库 remote 自动推导、可选手动覆盖
-   */
-  gitHost?: string;
-  /**
    * V0.6.1 ship：GitLab Personal Access Token（`glpat-` 开头）
-   * 明文 localStorage、跟 apiKey 同安全级别——别在共用机器配
+   * 明文存 config.json、跟 apiKey 同安全级别——别在共用机器配。
+   * Host 不存 settings、按任务仓库 remote 现推。
    */
   gitToken?: string;
   repos: RepoConfig[];
@@ -224,7 +220,21 @@ export interface FeAiFlowSettings {
    * 按「模型 id + 参数组合」区分（Fable High 和 Fable Low 是两个条目）。上限 20 条防膨胀。
    */
   modelUsage?: ModelUsageEntry[];
+  /**
+   * 默认飞书项目空间（工作台看板 + 收件箱扫描唯一作用域）。
+   * 缺省由 DEFAULT_MEEGLE_PROJECT 兜底（历史用户都是悟空空间、零迁移）。
+   */
+  meegleProject?: { key: string; name: string; simpleName?: string };
 }
+
+/**
+ * 默认飞书项目空间（硬编码悟空产研）——历史用户 config 无此字段时回落这里、不写迁移脚本。
+ */
+export const DEFAULT_MEEGLE_PROJECT = {
+  key: "67bd99b84b71ca10c5256428",
+  name: "悟空产研需求管理空间",
+  simpleName: "wk-dm",
+} as const;
 
 /** 单条模型使用计数（key = id + params 组合） */
 export interface ModelUsageEntry {
@@ -297,8 +307,8 @@ export interface ApiKeyInfo {
 //
 // 设计原则（详见 docs/V0.6-REFACTOR.md、已 archived）：
 // 1. task = 一个需求的完整生命周期容器（飞书 story 进来 → 合入 main / abandon）
-// 2. action = task 内的单次动作（plan / build / review / ship / learn / dev；chat 走独立 mode）
-//    - 自由触发顺序（不强制 plan→build→review、靠 6 个 harness 门槛兜底质量）
+// 2. action = task 内的单次动作（plan / build / review / ship / dev；chat 走独立 mode）
+//    - 自由触发顺序（不强制 plan→build→review、靠 harness 门槛兜底质量）
 //    - N 累计序号、文件名 actions/N-<type>.md（cancelled 也占 N、不释放）
 // 3. agent 会话跨 run 存活（V0.11：交卷 / 提问后 run 自然结束、用户操作经 agent.send 续接同一会话）
 // 4. 不写 V0.5 → V0.6 migration 脚本、V0.5 老 task 数据靠 listTasks 自动跳过（schema 不匹配的 meta.json 在 hydrate 时被 skip）
@@ -306,25 +316,25 @@ export interface ApiKeyInfo {
 /**
  * action 类型（V0.6.0.1 起 chat 从 action 里剥离、走独立 mode=chat 通路）
  *
- * 6 个内置：
+ * 5 个内置：
  * - `plan`     出方案
  * - `build`    改代码
  * - `review`   复核（plan/build 差异核对 + fresh peer bug 复审）
  * - `ship`     提测（push 改动 + 提 MR 到 test 分支 + 飞书 story 评论 @ 测试人员）
- * - `learn`    沉淀
  * - `dev`      联调
  *
  * `custom`（自定义 action）：用户在 /actions 页把某个 skill 挂到任务链上跑的壳。
  *   一条 type=custom 的 ActionRecord 用 `customActionId` 指向 custom-actions/<id>/ACTION.md 定义。
  *   custom **不进** ACTION_TYPES（那是「内置 action 选择」清单）、但要补进所有 `Record<ActionType,X>` 兜底键。
  *   展示文案以定义里的 label 为准、表里的 "自定义" 只是没拿到定义时的兜底。
+ *
+ * 历史退役类型（旧沉淀 / AI 手测等）不在本枚举——磁盘上可能仍有旧 ActionRecord、展示层按原始字符串兜底。
  */
 export type ActionType =
   | "plan"
   | "build"
   | "review"
   | "ship"
-  | "learn"
   | "dev"
   | "custom";
 
@@ -334,7 +344,6 @@ export const ACTION_TYPES = [
   "build",
   "review",
   "ship",
-  "learn",
   "dev",
 ] as const;
 
@@ -353,7 +362,6 @@ export const ACTION_LABEL: Record<ActionType, string> = {
   build: "改代码",
   review: "复核",
   ship: "提测",
-  learn: "沉淀",
   dev: "联调",
   // 兜底——custom action 实际展示用定义里的 label、拿不到定义才回退到这个
   custom: "自定义",
@@ -371,7 +379,7 @@ export const ACTION_LABEL: Record<ActionType, string> = {
  *   super prompt 开头的规则遵循率必然下降、改 prompt 措辞治不了、截断 context 才能
  * - artifact 本来就是 action 间唯一合法通信媒介、新 agent 冷启动所需上下文全量可重建
  *   （review forceNewAgent 自 V0.6.9 已验证这条路可行且效果更好）
- * - 连带收益：super prompt 不再全量注入 6 个 playbook、只注入当前 action 的（体积 -60%+）
+ * - 连带收益：super prompt 不再全量注入全部 playbook、只注入当前 action 的（体积 -60%+）
  * - review = true 是铁律（「换人复审」绕开自己审自己、UI 勾「续用」也压不掉）
  *
  * 生效逻辑见 task-runner.advanceTask：`effective = !reuseAgent || ACTION_FRESH_AGENT_DEFAULT[type]`
@@ -383,7 +391,6 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
   build: false,
   review: true,
   ship: false,
-  learn: false,
   dev: false,
   // 自定义 action 恒走内置默认 fresh（跟 V0.6.27 全员默认 fresh 一致、定义里不再有开关）
   custom: true,
@@ -536,7 +543,7 @@ export interface ActionRecord {
    * - review: 基底 commit 一致 + 必备段非空 + bug 复审段非空（V0.6.9 fresh peer 阶段二）
    *   + 工作区指纹未变（V0.6.27、review 只读硬校验）
    * - ship（V0.6.1）：需提 MR 的仓都有 task.mrs 记录 + URL 非空、跳过仓有原因
-   * - learn: propose 段有内容 + evidence 路径都能 read 到
+   * - custom：artifact 落盘非空（定义存在性由 advance 准入拦）
    */
   postCheck?: {
     passed: boolean;
@@ -677,11 +684,6 @@ export interface MRRecord {
   status: "open" | "closed" | "merged";
   createdAt: number;
   /**
-   * V0.6.1：status 转 merged 时记 timestamp、统计「ship → merge 耗时」用
-   * 当前 V0.6.1 不实现 polling、只在用户手动 mark-merged 时更新
-   */
-  mergedAt?: number;
-  /**
    * V0.6.1：当前最新 commit hash（每次 ship push 后更新）
    * version 是「push 次数」、lastCommitHash 是「当前最新 commit」、互补
    */
@@ -700,25 +702,21 @@ export interface MRRecord {
    * 留作审计 + UI 展示「为什么没法合」
    */
   mergeStatus?: string;
-  createdByActionId: string;
 }
 
 /**
- * Git branch 状态（build 第一次跑前生成、不可改写）
+ * Git branch 状态（build 第一次跑前生成）
  *
  * 时机（V0.6.1 起为每仓 1 条）：
  * - plan action 不建 branch（plan 不写代码）
  * - build action 第一次跑前、runner 检测 task.gitBranches 是否覆盖所有 repoPath
- *   → prompt inject「逐仓先 `git checkout -b <name> origin/<baseBranch>`、再写代码」
- *   → agent shell 跑、跑完 patch 对应仓的 checkedOut=true
+ *   → prompt inject「逐仓 idempotent checkout（存在则切、不存在则建）」
  * - 多仓 task：每仓 1 条 GitBranchInfo、name 同名、base branch 各仓自探
- * - 后续 build / ship 都复用同一条 branch（V0.6.1：每仓同名 branch、累计 commit、单仓 1 MR）
+ * - 后续 build / ship 都复用同一条 branch
  *
  * 命名规则（V0.6.7 起模板化、见 branch-template.ts）：
  *   name = 按分支模板渲染（默认 `feature/<飞书 story id>-<task.title>`、多仓共用同一 name）
- *   - 飞书 story id 从 task.feishuStoryUrl 抠（URL 末段数字）
- *   - task.title 保留中文、非法字符（\s / : * ? " < > | 【 】 ( ) 等）换成 -
- *   baseBranch 由 agent 启动 build 时自己探测（origin/HEAD 或 git remote show）、不在 settings 里配
+ *   baseBranch 由 agent / worktree 建树时探测（origin/HEAD 等）
  */
 /**
  * chat 工作目录的本地 git 分支状态（V0.8、前后端共用）
@@ -761,8 +759,6 @@ export interface GitBranchInfo {
   repoPath: string;
   name: string;
   baseBranch: string;
-  checkedOut: boolean;
-  createdAt: number;
 }
 
 /**
@@ -809,29 +805,6 @@ export interface TaskContextDoc {
 }
 
 // ===========================================
-// 任务角色（V0.4、保留）
-// ===========================================
-//
-// 飞书 story 是「跨角色共享」的、每个研发只关心 story 里跟自己角色相关的部分。
-// 当前枚举 `fe` / `be` / `adaptive`、未来扩 data / mobile-ios / mobile-android / qa（详见 docs/MULTI-ROLE.md）。
-// adaptive（自适应）：不锁端、agent 按仓库技术栈（package.json=前端 / pom.xml=Java 后端 / go.mod=Go 后端 等）+ story 自己定位本仓库该用什么视角、再按那个视角做（给「全栈仓 / 不确定 / 懒得纠结」用）。
-
-export type TaskRole = "fe" | "be" | "adaptive";
-
-// 角色枚举单一源（CR-07）：route 校验一律走 isTaskRole、不要再手写白名单——
-// 之前 PATCH route 漏了 adaptive、自适应任务连改标题都 400
-export const TASK_ROLES = ["fe", "be", "adaptive"] as const satisfies readonly TaskRole[];
-
-export const isTaskRole = (v: unknown): v is TaskRole =>
-  typeof v === "string" && (TASK_ROLES as readonly string[]).includes(v);
-
-export const TASK_ROLE_LABEL: Record<TaskRole, string> = {
-  fe: "前端",
-  be: "后端",
-  adaptive: "自适应",
-};
-
-// ===========================================
 // 事件流（V0.6：phase_* → action_*）
 // ===========================================
 
@@ -840,7 +813,6 @@ export type EventKind =
   | "thinking"
   | "action_start"
   | "action_ack"
-  | "action_failed"
   | "tool_call"
   | "user_reply"
   | "assistant_message"
@@ -898,7 +870,7 @@ export interface ArtifactRevision {
 /**
  * V0.6.0.1：task 模式（重新引入 V0.5 概念、用户拍板「自由模式跟以前一样」）
  *
- * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / learn / dev）
+ * - `task`：默认、走完整 V0.6 task 容器流（plan / build / review / ship / dev）
  *   UI = ActionTimeline + ArtifactPanel + EventStream 三栏布局
  * - `chat`：自由对话、不走 action 体系、跑独立 chat-runner + chat-reply 通路
  *   UI = ChatView 单栏（事件流 + 输入框）、用户消息立刻显示、会话跨 run 存活（send 续接）
@@ -959,9 +931,8 @@ export interface Task {
    */
   feishuTesterUserKeys?: string[];
 
-  // ===== 保留字段（V0.5 → V0.6 不变）=====
+  // ===== 仓库 / 上下文 =====
 
-  role: TaskRole;
   repoPaths: string[];
   /**
    * 非 git 目录清单（建 / 编辑任务改 repoPaths 时 existsSync(.git) 快照落库）。
@@ -1009,7 +980,7 @@ export interface Task {
   repoTestBranches?: Record<string, string>;
   /**
    * V0.6.7：per-repo dev 分支快照（key=repoPath、建 task 时从 settings.repos[].devBranch 固化）
-   * 当前仅存、暂无固定用途
+   * — dev action 准入 / prompt / submit-mr-guard 在用
    */
   repoDevBranches?: Record<string, string>;
   /**
@@ -1094,7 +1065,6 @@ export type NewTaskInput = Pick<
   | "repoBranchTemplates"
   | "isolateWorktree"
 > & {
-  role?: TaskRole;
   mode?: TaskMode;
 };
 

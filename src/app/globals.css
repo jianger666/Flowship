@@ -332,6 +332,26 @@
 .prose [data-streamdown="table-wrapper"] table {
   margin-block: 0;
 }
+/* ---------- Streamdown 表格列宽自适应（用户实测：备注中文长文本被挤成一字一行、
+   MR 长 URL 反倒抢宽 + 横向滚动把首列滚出视口） ----------
+   根因：table 自动布局按各列 max-content 比例分宽。URL 是超长不可折 token →
+   min/max-content 都巨大、抢走宽度还撑出横向滚动；中文哪里都能断 → min-content
+   极小、被挤成竖排。Streamdown 默认 th 还带 whitespace-nowrap、表头也不能折。
+   修法（Playwright 700px 容器实测胜出 B）：
+   - td/th overflow-wrap: anywhere + 去掉 th nowrap → URL 可折、min-content 塌缩、
+     中文备注列按内容量拿回宽度；
+   - td a word-break: break-all → 链接彻底可断、表高再降一截。
+   对比：table-layout:fixed 均分列宽、备注仍不够宽（否决）；nth-child 限 MR 列
+   max-width 备注更宽但表更高且绑死列序（否决）。只打表格单元格、不动代码块 /
+   段落。 */
+.prose [data-streamdown="table-header-cell"],
+.prose [data-streamdown="table-cell"] {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.prose [data-streamdown="table-cell"] a {
+  word-break: break-all;
+}
 
 /* skill token tag 的小闪 icon（ui/skill-token.tsx 单一来源的一部分）：
    Lexical token 是真文本节点、塞 <svg> 子元素会破坏序列化和光标——用 ::before

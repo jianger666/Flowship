@@ -23,12 +23,15 @@
  *   - 客户端断开 → unsubscribe + close、agent 不受影响
  *   - 多个 tab 同时 watch 同一个任务 → 各自一份 fanout、互不干扰
  *
- * race 处理：
- *   订阅在读 snapshot 之前就开始、新事件先入 buffer。读完 snapshot 后用
- *   sentEventIds 去重 buffer、保证不丢不重。
+ * race 处理（P1-01）：
+ *   必须「先 subscribe → 再 getTask 快照」——订阅期间事件一律进 buffer，
+ *   否则 getTask 到 subscribe 之间产生的事件既不在快照里、也进不了 buffer（真丢）。
+ *   快照发完后用 sentEventIds 去重回放 buffer，再转直通；快照 tail 的 event id
+ *   也预先写入 sentEventIds，保证不丢不重。
  */
 
-import { getTask } from "@/lib/server/task-fs";
+import { getTaskWithTailEvents } from "@/lib/server/task-fs";
+import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import {
   type TaskStreamEvent,
   subscribeTaskStream,
@@ -60,18 +63,46 @@ const errorJson = (message: string, status = 400) =>
 export const GET = async (req: Request, { params }: Ctx) => {
   const { id } = await params;
 
-  const initial = await getTask(id);
-  if (!initial) return errorJson("not_found", 404);
-
   const tailRaw = new URL(req.url).searchParams.get("tail");
   const tailParsed = tailRaw ? Number.parseInt(tailRaw, 10) : NaN;
-  const tail =
-    Number.isFinite(tailParsed) && tailParsed > 0 ? tailParsed : DEFAULT_TAIL;
-  const truncated = initial.events.length > tail;
-  const tailEvents = truncated ? initial.events.slice(-tail) : initial.events;
+  const tail = Math.min(
+    Number.isFinite(tailParsed) && tailParsed > 0 ? tailParsed : DEFAULT_TAIL,
+    MAX_EVENTS_TAIL,
+  );
+
+  // P1-01：订阅必须先于快照读取——controller 尚未 ready 时事件只能进 buffer。
+  // liveDispatch 在 ReadableStream start 里装上后才转直通。
+  const buffered: TaskStreamEvent[] = [];
+  let bootstrapping = true;
+  let liveDispatch: ((ev: TaskStreamEvent) => void) | null = null;
+  let unsubscribeFn: (() => void) | null = subscribeTaskStream(id, (ev) => {
+    if (bootstrapping) {
+      buffered.push(ev);
+      return;
+    }
+    liveDispatch?.(ev);
+  });
+
+  // 订阅已挂上：此 await 期间产生的事件进 buffer，不会丢
+  // 尾部反向读、不整文件 parse（P1-02）
+  let initial: Task | null;
+  try {
+    initial = await getTaskWithTailEvents(id, tail);
+  } catch (err) {
+    unsubscribeFn();
+    unsubscribeFn = null;
+    throw err;
+  }
+  if (!initial) {
+    unsubscribeFn();
+    unsubscribeFn = null;
+    return errorJson("not_found", 404);
+  }
+
+  const truncated = !!initial.eventsTruncated;
+  const tailEvents = initial.events;
 
   const encoder = new TextEncoder();
-  let unsubscribeFn: (() => void) | null = null;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -86,9 +117,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
       };
       const send = (payload: unknown) => safeEnqueue(sseFrame(payload));
 
+      // 快照 tail + buffer 回放共用：同一 event id 只发一次
       const sentEventIds = new Set<string>();
-      const buffered: TaskStreamEvent[] = [];
-      let bootstrapping = true;
       let doneSent = false;
 
       const closeStream = () => {
@@ -137,13 +167,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
         }
       };
 
-      unsubscribeFn = subscribeTaskStream(id, (ev) => {
-        if (bootstrapping) {
-          buffered.push(ev);
-          return;
-        }
-        dispatchStreamEvent(ev);
-      });
+      // 装上直通入口：bootstrapping 关掉后新事件走这里
+      liveDispatch = dispatchStreamEvent;
 
       try {
         // bootstrap task 帧不带 events（事件走下面的 event 帧）、但带 eventsTruncated
@@ -160,6 +185,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
         console.error("[watch-task] bootstrap failed:", err);
       }
 
+      // 先回放 buffer（与快照重叠的 event 被 sentEventIds 丢掉），再转直通
       bootstrapping = false;
       for (const ev of buffered) {
         dispatchStreamEvent(ev);

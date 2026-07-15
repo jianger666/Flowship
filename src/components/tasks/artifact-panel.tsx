@@ -119,15 +119,17 @@ import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
   JUMP_IDE_LABEL,
   type ActionRecord,
-  type ActionType,
   type ArtifactRevision,
   type JumpIde,
 } from "@/lib/types";
 
 // artifact-panel 的标题用「中文（英文）」复合形式
 // V0.7：中文部分用 SHORT、跟 timeline 同口径——build 全工作区统一叫「实现」、不再「改代码」
-const formatActionTitle = (type: ActionType) =>
-  `${ACTION_LABEL_SHORT[type]} (${ACTION_LABEL_EN[type]})`;
+const formatActionTitle = (type: string) => {
+  const short = ACTION_LABEL_SHORT[type] ?? type;
+  const en = ACTION_LABEL_EN[type];
+  return en ? `${short} (${en})` : short;
+};
 
 // 短时间格式（dropdown 选项用）：MM-DD HH:mm
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -204,7 +206,7 @@ const buildMarkdownComponents = (
           type="button"
           className="group cursor-pointer bg-transparent p-0 align-baseline"
           onClick={() => onArtifactRefClick(ref)}
-          title={`跳到 ${ACTION_LABEL_SHORT[ref.type]} action #${ref.n}`}
+          title={`跳到 ${ACTION_LABEL_SHORT[ref.type] ?? ref.type} action #${ref.n}`}
         >
           <span className="font-mono text-[0.85em] text-sky-600 dark:text-sky-400 underline-offset-2 group-hover:underline">
             {text}

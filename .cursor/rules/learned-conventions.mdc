@@ -19,7 +19,7 @@ alwaysApply: true
   - **⚠️ 打 test 包前必须先退掉正在跑的 test 实例（2026-07-02 踩过、把用户测试环境搞半残）**：`electron:dist:test` 会把 `dist/electron/mac-arm64/FlowshipTest.app`（v1.1.0 前叫 AI工作流test.app）**整个删掉重建**——老进程还在跑时脚下 bundle 被换、已加载的路由还能服务（boot 200、curl 冒烟全过、**假象**）、但之后 agent 每次执行 shell、SDK 沙箱的 zsh state-dump helper 因 bundle 资源失配**永久挂死**（僵尸 `/bin/zsh -ilc dump_zsh_state` 进程、每跑一条 shell 挂一个）→ wait curl 发不出去、任务永远「运行中」假卡死。另一个坑：打完 `open` 只会聚焦老进程（单实例锁）、**你以为在冒烟新包、实际测的是老进程老代码**。正确顺序：`osascript -e 'tell application "FlowshipTest" to quit'` → 完整 3 步打包 → `open` → **核对主进程 lstart 晚于打包时间**再冒烟。
  - **正式包自更新点「稍后重启」踩的是同一个坑（2026-07-07 线上事故确诊）**：mac 自更新原地替换 /Applications 里的 .app、用户点「稍后」→ 老进程 + 新 bundle → 之后每个新 agent run 第一批 shell 就永久挂死、任务假死「运行中」。诊断特征：壳日志反复打 `发现新版本 vX（当前 vY）`（X = 磁盘版本 Y = 运行版本）、UI 右上角挂「新版本」徽标、next-server 下挂僵尸 `dump_zsh_state`。**V0.10.1 起有硬闸**：壳替换后写 `<data>/update-pending-restart.json`、server 起新 run 前查到直接拒绝提示重启（`update-pending.ts`）；再遇到「任务卡死 + 事件流停在 shell 调用后」先查这个。修复 = 让用户重启正式 app（我不能动 8876）。
  - 打包（**完整 3 步、缺一不可**、2026-06-15 踩过：只跑 dist:test 会把旧代码打进包、验证时 curl 到旧 UI 排查半天）：
-    1. `BUILD_STANDALONE=1 pnpm build`——产新 `.next/standalone`（不带 BUILD_STANDALONE 不会出 standalone、见 next.config.ts）
+    1. `BUILD_STANDALONE=1 pnpm build`——产新 `.next/standalone`（不带 BUILD_STANDALONE 不会出 standalone、见 next.config.mjs）
     2. `node scripts/assemble-electron-server.mjs`——从 standalone 重组 `dist/app-server`（内部先 rm 再 cp + 补 SDK 平台包）
     3. `pnpm electron:dist:test`——afterPack（`scripts/electron-after-pack.mjs`）把 `dist/app-server` 拷进「FlowshipTest.app」（productName 带 test）+ ad-hoc 签名
     ⚠️ `electron:dist:test` **只拷不组**：afterPack 源固定是 `dist/app-server`、自己不 build / 不 assemble。漏掉第 1、2 步 → 打进包的是上一次的旧 `dist/app-server`（产物 mtime 会骗你说是新的、但内容是旧的）。核验：`grep -c <本次新增/删除的文案> "dist/electron/mac-arm64/FlowshipTest.app/Contents/Resources/app-server/.next/server/app/index.html"`。
@@ -31,7 +31,7 @@ alwaysApply: true
 - **test 实例 + test 包默认都不关不删（2026-06-15 用户修订、覆盖旧「测完删包 / 立即关 test」约定）**：验完 test 实例**留着跑、test 包（`dist/electron`）也留着**、下次要再测直接 open 复用、不用重打。**只有用户主动说「关」「删」时才动手**。配置数据目录 `~/Library/Application Support/fe-ai-flow-test`（API Key / 模型 / 仓库 / 飞书登录态）一直保留、不要删。
 - **⚠️ test 和正式不能同机同时跑 SDK run（2026-06-13 把用户生产搞挂、踩过）**：两个独立 app 进程（test 8776 + 正式 8876）各跑各的 cursor-agent、抢同一个本机 `~/.cursor` session 初始化 / 文件锁 → race（[官方已知 bug](https://forum.cursor.com/t/concurrent-headless-cursor-agent-invocations-fail-without-delay/142677)、表现一个正常一个秒 `SDK status=ERROR message=(none)`）。**同进程内多 agent 不受影响**（正式包内并行多任务一直 OK）、**跨进程才撞**。所以：**起 test 跑对话前、确认正式实例此刻没在跑对话**（idle 挂着不跑 SDK 不会撞、所以 test 默认留着即可、不必为规避并发去关它）。真把正式挤挂了：重启正式 app 即恢复（重置 SDK 会话态）。
 - **test 包自动补 SDK 平台包（v0.7.17、assemble-server.addSdkPlatformPackage）**：`electron:dist:test` 走 standalone、Next nft 追不到 `@cursor/sdk-<platform>` 运行时动态加载的平台子包（native cursorsandbox + rg）→ 缺了 SDK 直接 `fetch failed`、对话全挂。组包公共函数已自动补（本地 pnpm 拓扑拷平台包 + symlink、CI hoisted 跳过）——打完可 `ls .../app-server/node_modules/.pnpm/@cursor+sdk@*/node_modules/@cursor/` 确认有 `sdk-darwin-arm64` symlink。
-- **同步正式配置到 test**：`scripts/sync-test-config.mjs`（需 `classic-level`、按需 `pnpm add -D classic-level`）。配置存 Chromium localStorage（`Local Storage/leveldb`）、按 origin（含端口）隔离、正式 8876 ≠ test 8776 直接拷读不到。流程：cp 正式 `Local Storage/leveldb` → `/tmp/fe-prod-ls`（正式 app 在跑、有 LOCK、只能读副本）→ test app 先退出（leveldb 单写锁）→ 脚本读副本、把 key 里 origin 端口 `8876→8776` 转换写入 test（`--probe` 只读看 / `--verify` 读回校验 / 无参正式同步）。
+- **同步正式配置到 test**：同步脚本已删除（classic-level 旧方案退役）；需要同步时在设置页手动配、或按需重写脚本。
 - **删依赖要同步清 CI 打包链 + lockfile（v0.8.11 踩过、连挂 4 版才发现）**：`release.yml` 的 electron job「修平台依赖」步会 hardcode 按目标平台重装「nft 追不到、运行时动态加载」的原生包。**移除某依赖时若这步还在探测它 → standalone 产物里没有 → `node -p require('./node_modules/<pkg>/package.json')` 第一行直接炸、win+mac 两个 job 全挂、release 永远卡 draft**。典型 sqlite3：早成死依赖（源码 0 引用 / lockfile 仅剩 overrides 声明、零实际包条目 / standalone 不含 / test 包一直能 boot 证明运行时不需要），但 CI + `package.json`（overrides + onlyBuiltDependencies）没同步清 → v0.8.7~v0.8.10 打包全失败。删依赖三件套：① 清 `package.json` 依赖 / overrides / onlyBuiltDependencies；② 清 `release.yml` 里对该包的探测 / install / require 验证；③ `pnpm install` 同步 lockfile（CI `--frozen-lockfile` 要求一致、本地先跑一遍 `pnpm install --frozen-lockfile` 校验过）。
 - **查 GitHub Actions 失败原因（本机 `gh` 没装）**：用 `TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | sed -n 's/^password=//p')` 取本地存储凭据（helper=store）、再 `curl -H "Authorization: Bearer $TOKEN"` 调 Actions REST API：`/actions/runs` 列 run、`/actions/runs/<id>/jobs` 看哪步挂、`/actions/jobs/<id>/logs` 下日志 grep 报错。匿名调有 rate limit、必须带 token；token 只进变量 / `-H`、别 echo 出来。
 
@@ -211,18 +211,18 @@ alwaysApply: true
 
 ## 不要把「用户偏好级」规则写死进产品 prompt（2026-06-16 用户拍板）
 
-- **语言（中文 / 英文）、语气、个人风格这类「用户偏好」不该硬编码进 `_super.md` / `_shared.md` / chat prompt**——用户的 Cursor 全局 user rule（`~/.cursor/rules/`）已经由 `skills-loader` / rulesSection 注入进 prompt 了（如「思考和回复永远用中文」就是从这来的）。写死 = 剥夺灵活性（万一有用户偏好英文呢）。
+- **语言（中文 / 英文）、语气、个人风格这类「用户偏好」不该硬编码进 `_super.md` / `_shared.md` / chat prompt**——用户偏好应落在 app 自管 rules（`<dataRoot>/rules`、能力页 Rules tab 管理），由 `cursor-config` 的 `readAppRulesForPrompt` 注入进 prompt（`~/.cursor/rules` 已不再注入）。写死进产品 prompt = 剥夺灵活性（万一有用户偏好英文呢）。
 - **判断闸门：「这是我们代码的 bug、还是用户偏好没传到 / 模型没遵守？」**
-  - 是**我们代码的 bug**（如全局规则压根没注入、注入顺序错、被截断）→ 修我们的代码。
-  - 是**用户偏好**（语言 / 风格）→ 不在产品 prompt 里写死、交给注入的 user rule 承载；模型在英文基座上下文里偶尔不遵守是模型层问题、不靠我们硬塞偏好来「治」。
-- 反例（2026-06-16 差点踩）：线上 task agent 旁白掉英文、本想往 `_super.md` 顶层加一条「所有 narration 永远中文」硬规则——被用户拦下：语言是偏好、全局 rule 已注入、不写死。
-- 推论：要提升注入的 user rule 的「权重 / 位置」（如 front-load）是**语言无关的中性改进**、可单独评估；但别把改进做成「专门写死某个具体偏好」。
+  - 是**我们代码的 bug**（如 app rules 压根没注入、注入顺序错、被截断）→ 修我们的代码。
+  - 是**用户偏好**（语言 / 风格）→ 不在产品 prompt 里写死、交给注入的 app rules 承载；模型在英文基座上下文里偶尔不遵守是模型层问题、不靠我们硬塞偏好来「治」。
+- 反例（2026-06-16 差点踩）：线上 task agent 旁白掉英文、本想往 `_super.md` 顶层加一条「所有 narration 永远中文」硬规则——被用户拦下：语言是偏好、应靠 app rules 注入、不写死。
+- 推论：要提升注入的 app rules 的「权重 / 位置」（如 front-load）是**语言无关的中性改进**、可单独评估；但别把改进做成「专门写死某个具体偏好」。
 
-## task-scoped handler / notifier 注销用 conditional unset（V0.6.1 踩过）
+## task-scoped handler / notifier 注销用 conditional unset（V0.6.1 踩过、仍有效）
 
 - chat-mcp 的 `taskActionHandler` / `awaitingNotifier` 按 taskId 存单例 Map、force-new-agent 时新旧 agent 共享同一 key。
-- 旧 agent finally **注销前比对实例引用**（`if (map.get(taskId) === expected) map.delete(taskId)`）、只清「自己注册的那个」——否则旧 agent 迟到的 finally 会误清新 agent 刚注册的 handler、submit_mr 就拿不到 handler。
-- 用 `unsetChatTaskActionHandlerIf(taskId, expected)` / `unsetChatAwaitingNotifierIf`、不要无条件 `set(taskId, null)`。
+- Agent.create 失败路径的迟到清理必须 **比对实例引用**（`unsetChatTaskActionHandlerIf` / `unsetChatAwaitingNotifierIf`）、只清「自己注册的那个」——否则旧 start 失败会误清新 agent 刚注册的 handler。
+- `closeTaskSession(taskId, agentId)` 已用 agentId 身份门控（会话不是自己的就 return）、可无条件清 handler；create 失败（尚无 session）必须走 conditional unset。
 
 ## 改代码前先 feedback 确认方案（2026-06-10 用户拍板）
 

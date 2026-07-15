@@ -124,7 +124,7 @@ export const PreferenceSections = ({
     <div className="divide-y">
       <SettingRow
         label="我的角色"
-        hint="不同角色会解锁对应的辅助能力"
+        hint="用于告诉 AI 你的工作视角/身份（注入任务与对话的发起人信息）"
         control={
           <Select
             value={userRole ?? ""}

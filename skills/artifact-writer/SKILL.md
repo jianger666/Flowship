@@ -122,7 +122,7 @@ args: {
 - **plan** → `actions/<n>-plan.md`（章节按 `prompts/action-plan.md`）
 - **build** → `actions/<n>-build.md`（除了写 artifact、还要 edit 业务代码）
 - **review** → `actions/<n>-review.md`（**只读业务代码、不改**）
-- **ship / learn / custom / …** → `actions/<n>-<type>.md`（按对应 action prompt）
+- **ship / custom / …** → `actions/<n>-<type>.md`（按对应 action prompt）
 
 同一 task 内 `n` 单调递增、不按 type 分编号、不补前导 0。模板看对应 action prompt（super-prompt 里嵌入过）。
 

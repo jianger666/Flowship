@@ -7,8 +7,8 @@
  * 选下一个 action 类型 + 写指令。
  *
  * 字段：
- *   - action 类型（plan / build / review / ship / learn / dev）
- *     - 全部已实装（learn V0.6.29）
+ *   - action 类型（plan / build / review / ship / dev）
+ *     - 全部已实装
  *     - V0.6.0.1 起 chat 不再是 action 类型——chat 走 task.mode="chat" 独立通路、ChatView 渲染、跟本 dialog 无关
  *     - dialog 打开时按 task 状态选一个默认 chip 选中、纯减少用户点击；UI 不再标「推荐」二字（避免「我跟你说要走这个」的语义）
  *   - 用户指令（textarea、选填）、placeholder 跟着 action 类型动态变
@@ -115,14 +115,15 @@ const inferDisabledReason = (
   // devBranches：设置页实时 dev 分支快照（dialog 打开时读）、优先于 task 旧快照——
   //   设置页刚配的 dev 分支也能即时放行联调 chip（server advance 时会 refreshRepoBranches 同步准入、两边一致）
   ctx: {
-    host?: string;
     // undefined = 推导请求飞行中（不警告）、null = 推导完成没推出来、string = 推出来了
     resolvedHost?: string | null;
+    /** 多仓不同 GitLab 实例等推导失败文案（优先于「推不出」通用提示） */
+    hostError?: string | null;
     token?: string;
     devBranches?: Record<string, string>;
   } = {},
 ): ReactNode | null => {
-  const effectiveHost = ctx.host || ctx.resolvedHost;
+  const effectiveHost = ctx.resolvedHost;
   switch (type) {
     case "plan":
       return null;
@@ -135,10 +136,11 @@ const inferDisabledReason = (
       return null;
     case "ship":
       if (taskAllReposReadonly(task)) return <>{ALL_READONLY_REPOS_BLOCK_REASON}</>;
+      if (ctx.hostError) return <>{ctx.hostError}</>;
       if (!effectiveHost) {
         // 推导请求还在飞（undefined）：不闪警告——server 推进时会再推一次、真推不出那边拦
-        if (!ctx.host && ctx.resolvedHost === undefined) return null;
-        // Host 无输入框（v1.0.x 删）、只能自动推导——推不出说明仓库没配 origin remote
+        if (ctx.resolvedHost === undefined) return null;
+        // Host 一律按仓库 remote 现推——推不出说明仓库没配 origin remote
         return <>未能从仓库 remote 推导 GitLab 地址、检查仓库是否配了 origin</>;
       }
       if (!ctx.token) {
@@ -149,9 +151,6 @@ const inferDisabledReason = (
           </>
         );
       }
-      return null;
-    case "learn":
-      // V0.x：去掉「learn 必须先有 completed action」流程限制——空 task learn 时 agent 自己说明
       return null;
     case "dev": {
       if (taskAllReposReadonly(task)) return <>{ALL_READONLY_REPOS_BLOCK_REASON}</>;
@@ -228,7 +227,6 @@ const ACTION_PLACEHOLDER: Record<Exclude<ActionType, "custom">, string> = {
   build: "具体改什么、指向哪个文件 / 函数 / bug",
   review: "（可选）特别关注什么？默认对照 plan + 飞书需求差异分析",
   ship: "（可选）MR 标题 / 描述要点、不填自动生成",
-  learn: "（可选）想重点沉淀什么？默认全量复盘提炼",
   dev: "（可选）联调要点、不填按标准流程推 dev",
 };
 
@@ -283,6 +281,13 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   task: Task;
+  /**
+   * 外部预填（收件箱「改bug」降级：预置 action 被删时只预填指令、action 用户自己选）。
+   * 只用一次——父组件应在关闭后清掉，避免下次手动打开仍带旧预填。
+   */
+  prefill?: {
+    instruction?: string;
+  } | null;
   onSubmit: (input: {
     actionType: ActionType;
     userInstruction: string;
@@ -312,6 +317,7 @@ export const AdvanceDialog = ({
   task,
   onSubmit,
   submitting,
+  prefill,
 }: Props) => {
   // V0.6.14：ship「合并后删源分支」开关初始值（取 task 上次选择、缺省 false=保留）。
   // 提成 memo 依赖 primitive 字段、effect 据它初始化而非整个 task（防 SSE 推 task 引用变打回表单）
@@ -376,16 +382,16 @@ export const AdvanceDialog = ({
   // 起新 agent 时用的模型 selection、默认从 settings.defaultModel 拷一份
   // 仅起新 agent（默认）时透传给父组件、勾续用时 ignore（续接 Run 不能换模型）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
-  // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照、不实时同步（用户开 dialog 中途换 host/token 极少）
-  const [gitConfig, setGitConfig] = useState<{ host?: string; token?: string }>(
-    {},
-  );
-  // settings 未填 host 时、从 task 仓库 remote 自动推导（跟 server resolveEffectiveGitHost 对齐）。
+  // V0.6.1：ship 准入 UI 软提示用、dialog 打开时从 settings 快照 Token（host 按仓库现推）
+  const [gitToken, setGitToken] = useState<string | undefined>();
+  // 从 task 仓库 remote 推导 host（跟 server resolveEffectiveGitHost 对齐）。
   // 三态：undefined = 推导请求飞行中（ship 不显警告、防打开瞬间闪一下误报）、
   //       null = 推导完成但没推出来（真警告）、string = 推出来了
   const [resolvedGitHost, setResolvedGitHost] = useState<string | null | undefined>();
+  // 多仓不同 GitLab 实例等推导失败文案（与 MULTI_GITLAB_HOST_ERROR 同口径）
+  const [gitHostError, setGitHostError] = useState<string | null>(null);
   // V0.x：设置页实时 dev 分支快照（per-repo、本 task 各仓）——dialog 打开瞬间读、供联调 chip 准入判断。
-  //   不实时同步（开 dialog 中途改设置页极少）、跟 gitConfig 同套路。
+  //   不实时同步（开 dialog 中途改设置页极少）、跟 gitToken 同套路。
   const [liveDevBranches, setLiveDevBranches] = useState<Record<string, string>>(
     {},
   );
@@ -429,13 +435,19 @@ export const AdvanceDialog = ({
     toUploadPayload,
   } = useImageAttach();
 
+  // 用 ref 持预填：只在「打开瞬间」读、不进 effect 依赖——
+  // 否则父组件清 prefill / 换引用会把用户已改的表单打回。
+  const prefillRef = useRef(prefill);
+  prefillRef.current = prefill;
+
   // dialog 打开时初始化表单 state。
   // 关键：绝不把 availableModels.length 放进依赖——
   // 否则模型列表异步加载完成（length 0→N）会重跑本 effect，把用户已经改过的 action 选中
   //（如「提测」）、指令、开关全部打回默认值（「方案」），这就是「打开弹窗选中会跳一下」的根因。
   useEffect(() => {
     if (!open) return;
-    setInstruction("");
+    // 收件箱「改bug」降级深链预填指令；无预填则清空
+    setInstruction(prefillRef.current?.instruction?.trim() || "");
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.x：联调推送方式每次打开回到默认「直推」
     setDevPushMode("direct");
@@ -449,21 +461,24 @@ export const AdvanceDialog = ({
     // v0.9.11：「续用当前 Agent」默认勾选走设置页偏好（缺省 false = 每 action 新 agent）；dialog 内仍可临时切
     setReuseAgent(s.reuseAgentDefault ?? false);
     setPickedModel(defaultPickedModelRef.current ?? s.defaultModel ?? { id: "" });
-    setGitConfig({
-      host: s.gitHost?.trim() || undefined,
-      token: s.gitToken?.trim() || undefined,
-    });
+    setGitToken(s.gitToken?.trim() || undefined);
     setResolvedGitHost(undefined);
-    if (!s.gitHost?.trim() && repoPathsRef.current.length > 0) {
+    setGitHostError(null);
+    if (repoPathsRef.current.length > 0) {
       const q = encodeURIComponent(repoPathsRef.current.join(","));
       void fetch(`/api/repo-remote-meta?paths=${q}`)
         .then((r) => r.json())
-        .then((d: { host?: string | null }) =>
+        .then((d: { host?: string | null; error?: string }) => {
+          if (d.error?.trim()) {
+            setGitHostError(d.error.trim());
+            setResolvedGitHost(null);
+            return;
+          }
           // null = 推导完成但没推出来（真警告）；飞行中保持 undefined 不警告
-          setResolvedGitHost(d.host?.trim() || null),
-        )
+          setResolvedGitHost(d.host?.trim() || null);
+        })
         .catch(() => setResolvedGitHost(null));
-    } else if (!s.gitHost?.trim()) {
+    } else {
       // 没仓库可推：直接定格「推不出」
       setResolvedGitHost(null);
     }
@@ -552,8 +567,9 @@ export const AdvanceDialog = ({
     if (isBuiltinAdvanceAction(key)) {
       const type = key;
       const reason = inferDisabledReason(task, type, {
-        ...gitConfig,
+        token: gitToken,
         resolvedHost: resolvedGitHost,
+        hostError: gitHostError,
         devBranches: liveDevBranches,
       });
       const selected = actionType === type;
@@ -616,12 +632,13 @@ export const AdvanceDialog = ({
     () =>
       actionType
         ? inferDisabledReason(task, actionType, {
-            ...gitConfig,
+            token: gitToken,
             resolvedHost: resolvedGitHost,
+            hostError: gitHostError,
             devBranches: liveDevBranches,
           })
         : null,
-    [task, actionType, gitConfig, resolvedGitHost, liveDevBranches],
+    [task, actionType, gitToken, resolvedGitHost, gitHostError, liveDevBranches],
   );
   const canSubmit = useMemo(() => {
     if (submitting) return false;
@@ -854,7 +871,7 @@ export const AdvanceDialog = ({
                     自由改动（不绑定批次）
                   </span>
                   <span className="text-[10px] text-muted-foreground">
-                    修 bug / 跨批次散改、范围以指令为准、不计批次进度
+                    改bug / 跨批次散改、范围以指令为准、不计批次进度
                   </span>
                 </ChoiceButton>
               </div>

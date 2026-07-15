@@ -43,6 +43,7 @@ import { getEventsLogPath } from "./task-fs-core";
 import { getChatMcpUrl } from "./chat-mcp";
 import { setChatAwaitingNotifier } from "./chat-pending";
 import { chatTurnProtocolSection } from "./turn-discipline";
+import { supersedePendingAsks } from "./ask-supersede";
 import { renderContextDocsSection } from "./context-docs-prompt";
 import {
   formatRepoSectionForPrompt,
@@ -71,7 +72,7 @@ import {
 import { resolveEffectiveGitHost } from "./gitlab-host";
 import { readSettingsFile } from "./settings-fs";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
-import { filterHealthyMcp } from "./mcp-probe";
+import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import {
   publishTaskStreamEvent,
@@ -135,7 +136,12 @@ const getRunnerState = (): ChatRunnerGlobalState => {
 
 const runningChats = getRunnerState().runningChats;
 
-export const isChatRunning = (taskId: string): boolean =>
+/**
+ * 会话对象是否在表（含 run 自然结束后 idle 等用户的健康态）——与 task 侧
+ * `agentSessions.has` 语义对齐。⚠️ 不是「run 正在跑」（那是 rec.runActive）；
+ * 旧名 hasChatSession 连 AI review 都会误读、2026-07-14 改名。
+ */
+export const hasChatSession = (taskId: string): boolean =>
   runningChats.has(taskId);
 
 // V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort
@@ -272,10 +278,10 @@ interface InitialUserMessage {
  * 拼 chat agent 起手 prompt
  *
  * 跟 V0.6 task-runner 的 _super.md 完全无关、不夹任务容器协议（[NEXT_ACTION] / [USER_MESSAGE]）。
- * 只装 chat 必备：submit_work + shell long-poll + 禁止泄露协议。
+ * 回合纪律见 chatTurnProtocolSection（含 ask_user 答题卡）；submit_work 在 chat 不用。
  *
- * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答（V0.5 自由化策略）
- * 无 firstMessage：起手姿势就是 submit_work 等用户发第一句（边界情况、resume run）
+ * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答
+ * 无 firstMessage：起手等用户发第一句（边界情况）
  */
 const buildInitialPrompt = (
   task: Task,
@@ -584,6 +590,9 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     return;
   }
 
+  // 打点（v1.1.x「SDK 比 IDE 慢」排查）：启动链路各段耗时、[perf] 前缀统一可 grep 统计
+  const perfStart = Date.now();
+
   // 句柄 + 取消标志提到最前：配合下面「进入即占位注册」消除冷启动竞态——
   // Agent.create / agent.send / MCP 健康探测都要数秒、旧版到 send 之后才注册进 runningChats、
   // 这几秒窗口里点停止 cancelChatRun 会 get 不到、扑空（连 cancelled 都来不及设）、
@@ -628,12 +637,14 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     // 配置里万一也叫 aiFlowChat、按我们的为准（直接覆盖）
     // 注入 OAuth token：走 OAuth 授权的远程 MCP（如飞书项目）token 不在 mcp.json、
     // 由 fe 自己跑过 OAuth 落盘、起 agent 前补到 headers.Authorization、详见 mcp-oauth.ts
+    const perfMcpStart = Date.now();
     const enrichedMcp = await enrichMcpServersWithOAuth(
       await resolveTaskMcpServers(task.disabledMcpServers),
     );
     // V0.6.11 容错：起 agent 前剔除连不上 / 未授权的远程 MCP、单个 MCP 挂不拖垮整个 run
     const { servers: cursorMcp, dropped: droppedMcp } =
       await filterHealthyMcp(enrichedMcp);
+    const perfMcpMs = Date.now() - perfMcpStart;
     const mergedMcp: Record<string, McpServerConfig> = {
       ...cursorMcp,
       [CHAT_TOOL_MCP_NAME]: {
@@ -675,7 +686,35 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     // 3) 注入 awaiting notifier（V0.11.1 抽成共用、resume 时也要重注册）
     registerChatNotifier(task);
 
+    // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills / rules 读盘、identity 走
+    // meegle CLI、gitlab 段读 settings + 推 remote host——都不依赖 agent、重叠后首 token 提前。
+    // 侧挂 catch 防「create 期间先 reject」的 unhandledRejection 噪音（await 时仍抛给外层 catch）。
+    const skillsPromise = loadSkills().catch((err) => {
+      console.error("[chat-runner] loadSkills failed", err);
+      return [];
+    });
+    const rulesPromise = readAppRulesForPrompt();
+    rulesPromise.catch(() => {});
+    const identityPromise = resolveUserIdentityForPrompt();
+    identityPromise.catch(() => {});
+    const gitlabAccessPromise = (async (): Promise<string> => {
+      // 绑仓 + settings 有 gitToken 才注入「GitLab 访问」（纯聊天不需要）
+      if (task.repoPaths.length === 0) return "";
+      const settingsResult = await readSettingsFile();
+      const settings =
+        settingsResult.status === "ok" ? settingsResult.settings : null;
+      const gitToken =
+        typeof settings?.gitToken === "string" ? settings.gitToken.trim() : "";
+      if (!gitToken) return "";
+      // host 一律按任务仓库 remote 现推（不再读 settings.gitHost）
+      const effectiveHost =
+        (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
+      return buildGitlabAccessDirective(effectiveHost, dataRoot());
+    })();
+    gitlabAccessPromise.catch(() => {});
+
     // 4) 启动 agent + 流式消费
+    const perfCreateStart = Date.now();
     agent = await Agent.create({
       apiKey,
       model,
@@ -694,6 +733,7 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       },
       mcpServers: mergedMcp,
     });
+    const perfCreateMs = Date.now() - perfCreateStart;
 
     // Agent.create 冷启动也要数秒、create 期间被停 → 别 send、直接收尾
     if (cancelled) {
@@ -701,33 +741,12 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       return;
     }
 
-    // 加载 skills：平台自带 + app 自管 + 全局（全部 fe 注入 prompt、不靠 settingSources）
-    const skills = await loadSkills().catch((err) => {
-      console.error("[chat-runner] loadSkills failed", err);
-      return [];
-    });
-
-    // app 自管 rules（能力页 Rules tab、启用中的全文常驻注入）
-    const rulesSection = await readAppRulesForPrompt();
-    // resolve = 姓名（meegle）+ 设置页角色、失败返空串（不堵启动）
-    const userIdentityLine = await resolveUserIdentityForPrompt();
-    // 绑仓 + settings 有 gitToken 才注入「GitLab 访问」（纯聊天不需要）
-    let gitlabAccessSection = "";
-    if (task.repoPaths.length > 0) {
-      const settings = await readSettingsFile();
-      const gitToken =
-        typeof settings?.gitToken === "string" ? settings.gitToken.trim() : "";
-      if (gitToken) {
-        const gitHost =
-          typeof settings?.gitHost === "string" ? settings.gitHost : undefined;
-        const effectiveHost =
-          (await resolveEffectiveGitHost(gitHost, task.repoPaths)) ?? undefined;
-        gitlabAccessSection = buildGitlabAccessDirective(
-          effectiveHost,
-          dataRoot(),
-        );
-      }
-    }
+    // 收割 create 前发起的并行加载（见上）
+    const perfPromptStart = Date.now();
+    const skills = await skillsPromise;
+    const rulesSection = await rulesPromise;
+    const userIdentityLine = await identityPromise;
+    const gitlabAccessSection = await gitlabAccessPromise;
     const initialPrompt = buildInitialPrompt(
       task,
       skills,
@@ -736,7 +755,18 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
       userIdentityLine,
       gitlabAccessSection,
     );
+    const perfPromptMs = Date.now() - perfPromptStart;
+
+    const perfSendStart = Date.now();
     run = await agent.send(initialPrompt);
+    // 单行汇总（不写 events、纯日志）：mcp=探测+merge、create=SDK 冷启动、
+    // prompt=素材收割+拼装（含首包字节数）、send=Run 受理、total=自进入本函数起
+    console.log(
+      `[perf] task=${task.id} chat start-chain ` +
+        `mcp=${perfMcpMs}ms create=${perfCreateMs}ms ` +
+        `prompt=${perfPromptMs}ms/${Math.round(Buffer.byteLength(initialPrompt, "utf-8") / 1024)}KB ` +
+        `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
+    );
 
     // 回填真实 agentId / agent 实例（占位注册时是空串 / null）——从此会话可被 send 续接。
     // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 接回
@@ -763,23 +793,32 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
 
 // ----------------- V0.11.1：notifier 注册 + 会话恢复 -----------------
 
-// chat 的 awaiting notifier：agent 误调 submit_work / ask_user 时的防御兜底
-//（chat prompt 已禁这两个工具、但模型偶发不听话——别让状态漂）
+// chat 的 awaiting notifier：ask_user 写真实 ask_user_request 事件（与 task-runner 对齐）；
+// submit_work 误调仍只切 awaiting_user（chat 不用交卷）
 const registerChatNotifier = (task: Task): void => {
   setChatAwaitingNotifier(task.id, async (signal) => {
     if (signal.kind === "ask_user_request") {
-      // 防御性：agent 即使无视 prompt 调了 ask_user、转 assistant_message 提示用户
+      // 新提问落盘前作废旧的未了结提问（同 task-runner：防旧答题卡复活）
+      await supersedePendingAsks(task.id, "被新提问顶替");
       const previewText = signal.questions
         .map((q, idx) => `Q${idx + 1}: ${q.question}`)
         .join("\n");
       await writeEventAndPublish(task.id, {
-        kind: "assistant_message",
-        text: `[agent 误调 ask_user、chat 模式不支持]\n${previewText}`,
+        kind: "ask_user_request",
+        // chat 无 action——有 actionId 才带（误传也无害）
+        ...(signal.actionId ? { actionId: signal.actionId } : {}),
+        text: previewText,
+        meta: {
+          askId: signal.askId,
+          token: signal.token,
+          questions: signal.questions,
+        },
       });
       const updated = await setTaskRunStatus(task.id, "awaiting_user");
       if (updated) publish(task.id, { kind: "task", task: updated });
       return;
     }
+    // submit_work 等非 ask 信号：chat 不用交卷、只切 awaiting_user
     const updated = await setTaskRunStatus(task.id, "awaiting_user");
     if (updated) publish(task.id, { kind: "task", task: updated });
   });
@@ -948,6 +987,8 @@ const tryChatAutoReconnect = async (
 const handleChatRunFailure = async (task: Task, err: unknown): Promise<void> => {
   const message = err instanceof Error ? err.message : String(err);
   console.error("[chat-runner] task", task.id, "failed:", err);
+  // run 失败可能是「缓存 ok 期间 MCP 挂了」——清探测缓存、用户重试时必真探（同 task-runner）
+  invalidateMcpProbeCache();
   closeChatSession(task.id);
   // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
   // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
@@ -1011,7 +1052,16 @@ const consumeChatRun = async (
       },
     };
 
+    // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
+    const perfStreamStart = Date.now();
+    let perfFirstEventSeen = false;
     for await (const msg of run.stream()) {
+      if (!perfFirstEventSeen) {
+        perfFirstEventSeen = true;
+        console.log(
+          `[perf] task=${task.id} first-event ms=${Date.now() - perfStreamStart}`,
+        );
+      }
       // handleSdkMessage 内部已在 thinking / tool_call case 自己 flush buffer
       await handleSdkMessage(task.id, msg, ctx);
     }
@@ -1121,5 +1171,75 @@ export const sendChatMessage = async (
   const runningTask = await setTaskRunStatus(task.id, "running");
   if (runningTask) publish(task.id, { kind: "task", task: runningTask });
   void consumeChatRun(task, run);
+  return true;
+};
+
+/**
+ * 把 ask_user 答案送达 chat 会话（ask-reply 路由 chat 分支用）。
+ *
+ * 路径（对齐 chat-reply、绝不能走 task 的 resumeCurrentActionWithMessage）：
+ *   1. 存活会话 → sendChatMessage
+ *   2. 内存无会话但有 sessionAgentId + bootArgs → resume 后再 send
+ *   3. 仍接不回 → 凭 bootArgs 起新会话、答案作首条 firstMessage
+ *
+ * @returns false = 没凭据起不了新会话、调用方报错让用户用输入条唤醒
+ */
+export const deliverChatAskReply = async (
+  task: Task,
+  replyText: string,
+  imagePaths?: string[],
+  bootArgs?: { apiKey?: string; model?: ModelSelection },
+): Promise<boolean> => {
+  // 1) 存活会话直接 send
+  if (hasChatSession(task.id)) {
+    const sent = await sendChatMessage(task, replyText, imagePaths);
+    if (sent) return true;
+    // send 失败已 close 会话 → 落到下面 resume / 新会话
+  }
+
+  const apiKey = bootArgs?.apiKey?.trim() || undefined;
+  const model =
+    bootArgs?.model && typeof bootArgs.model.id === "string"
+      ? bootArgs.model
+      : undefined;
+
+  // 2) 服务重启 / 空闲回收后：Agent.resume 接回再 send
+  if (task.sessionAgentId && apiKey && model && !hasChatSession(task.id)) {
+    const resumed = await resumeChatSession(task, { apiKey, model });
+    if (resumed) {
+      const sent = await sendChatMessage(task, replyText, imagePaths);
+      if (sent) return true;
+    }
+  }
+
+  // 3) 起新会话（答案作首条）——同 chat-reply 模式 2
+  if (!apiKey || !model) return false;
+  if (hasChatSession(task.id)) {
+    // race：resume 后别处又起了 run → 再试一次 send
+    return sendChatMessage(task, replyText, imagePaths);
+  }
+
+  const runningTask = await setTaskRunStatus(task.id, "running");
+  if (runningTask) publish(task.id, { kind: "task", task: runningTask });
+  // ⚠️ 上面 await 是让出点：期间别处（chat-reply / resume）可能已注册会话——
+  // runChatSession 开头的幂等 return 会**静默吞掉 firstMessage**（答案丢失且无
+  // 错误事件、调用方却报成功）。复查一次、已有会话就改走 send 续接。
+  if (hasChatSession(task.id)) {
+    return sendChatMessage(task, replyText, imagePaths);
+  }
+  void runChatSession({
+    task: runningTask ?? task,
+    apiKey,
+    model,
+    firstMessage: {
+      text: replyText,
+      imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
+    },
+  }).catch((err) => {
+    console.error(
+      `[chat-runner] deliverChatAskReply runChatSession task=${task.id} failed:`,
+      err,
+    );
+  });
   return true;
 };

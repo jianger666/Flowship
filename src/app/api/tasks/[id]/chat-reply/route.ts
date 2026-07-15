@@ -55,7 +55,7 @@ import {
   forceClearChatRun,
   getChatRunDisabledMcp,
   getChatRunModel,
-  isChatRunning,
+  hasChatSession,
   resumeChatSession,
   runChatSession,
   sendChatMessage,
@@ -220,7 +220,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // V0.11.1：内存没会话但有落盘锚点（服务重启 / 空闲回收后）→ 先 Agent.resume 接回、
   // 下面统一走「有会话」分支 send 续接、上下文不丢。resume 失败会清锚点、自然落到起新会话。
   if (
-    !isChatRunning(task.id) &&
+    !hasChatSession(task.id) &&
     task.sessionAgentId &&
     bootArgs?.apiKey &&
     isValidModel(bootArgs.model)
@@ -232,7 +232,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   // 决定模式（V0.11）：有存活会话且没 run 在跑 → send 续接；否则 → 起新会话
-  if (isChatRunning(task.id)) {
+  if (hasChatSession(task.id)) {
     // 切模型 / 切 MCP 懒重启：用户可能在上轮答完后切了模型 / 改了 MCP 开关
     //（只存进 task.model / task.disabledMcpServers、没动当前会话）。
     // 比对「会话绑定的模型 + MCP 黑名单」vs「现在的」、任一变了就重开会话、都没变就 send 续接。
@@ -262,7 +262,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         );
       }
       // send 失败两种情况：run 在跑（agent 正在回）→ 409；会话坏了（已被 close）→ 落到下面起新会话
-      if (isChatRunning(task.id)) {
+      if (hasChatSession(task.id)) {
         return errorResponse("agent 正在回、等它说完一段再发", 409);
       }
     } else {
@@ -296,7 +296,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   // 防重复启动：会话还在（send 失败但 run 在跑等 race）→ 409
-  if (isChatRunning(task.id)) {
+  if (hasChatSession(task.id)) {
     return errorResponse("Chat agent 已经在跑、不需要重启", 409);
   }
 

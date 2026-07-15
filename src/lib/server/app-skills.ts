@@ -48,21 +48,6 @@ export const listSkillsWithSource = async (): Promise<SkillWithSource[]> => {
   return out.sort((a, b) => a.name.localeCompare(b.name));
 };
 
-/** 读某个 app 自管 skill 的 SKILL.md 全文（不存在返 null） */
-export const readAppSkillContent = async (
-  name: string,
-): Promise<string | null> => {
-  if (!isSafeSkillName(name)) return null;
-  try {
-    return await fs.readFile(
-      path.join(getAppSkillsDir(), name, "SKILL.md"),
-      "utf-8",
-    );
-  } catch {
-    return null;
-  }
-};
-
 /**
  * 按名读任意已知来源 skill 的 SKILL.md 全文（只读详情 / 编辑共用）。
  * 可选 source 消歧同名；未指定时按列表顺序取首个命中。

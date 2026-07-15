@@ -45,7 +45,8 @@ import {
   fetchSkills,
   importCustomActionBundleReq,
 } from "@/lib/custom-action-client";
-import { getSettings } from "@/lib/local-store";
+import { removeActionLayoutId } from "@/lib/action-layout";
+import { getSettings, saveSettings } from "@/lib/local-store";
 import { pickNativePaths } from "@/lib/native-picker";
 import { createTask, sendChatReply } from "@/lib/task-store";
 import type { CustomActionDef } from "@/lib/types";
@@ -250,16 +251,88 @@ const ActionsPanel = () => {
   };
 
   const handleDelete = async (def: CustomActionDef) => {
-    const ok = await confirm({
-      title: `删除「${def.label}」？`,
-      description: "用它跑过的历史任务不受影响、但之后不能再新推进这个 action。",
-      destructive: true,
-    });
-    if (!ok) return;
+    // skill 仅 app 源时可勾「同步删除」；内置 / 飞书不给勾（删不了）
+    let syncSkillName: string | null = null;
+    const skillName = def.skill?.trim();
+    if (skillName) {
+      try {
+        const res = await fetch("/api/skills");
+        if (res.ok) {
+          const body = (await res.json()) as {
+            skills?: Array<{ name: string; source: string }>;
+          };
+          const hit = (body.skills ?? []).find(
+            (s) => s.name === skillName && s.source === "app",
+          );
+          if (hit) syncSkillName = hit.name;
+        }
+      } catch {
+        // 拉 skills 失败不挡删 action、只是不出勾选
+      }
+    }
+
+    let alsoDeleteSkill = false;
+    if (syncSkillName) {
+      const result = await confirm({
+        title: `删除「${def.label}」？`,
+        description:
+          "用它跑过的历史任务不受影响、但之后不能再新推进这个 action。",
+        destructive: true,
+        checkboxLabel: `同时删除 skill「${syncSkillName}」`,
+      });
+      if (!result) return;
+      alsoDeleteSkill = result.checked;
+    } else {
+      const ok = await confirm({
+        title: `删除「${def.label}」？`,
+        description:
+          "用它跑过的历史任务不受影响、但之后不能再新推进这个 action。",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+
     try {
       await deleteCustomActionReq(def.id);
-      toast.success("已删除");
+      // D10：同步清 actionLayout 里该 id 的 order/hidden 残留（不等拖拽时才 prune）
+      const s = getSettings();
+      const layout = s.actionLayout ?? { order: [], hidden: [] };
+      const pruned = removeActionLayoutId(layout, def.id);
+      if (
+        pruned.order.length !== layout.order.length ||
+        pruned.hidden.length !== layout.hidden.length
+      ) {
+        void saveSettings({ ...s, actionLayout: pruned });
+      }
       setActions((prev) => prev.filter((a) => a.id !== def.id));
+
+      if (alsoDeleteSkill && syncSkillName) {
+        try {
+          const delRes = await fetch(
+            `/api/skills?name=${encodeURIComponent(syncSkillName)}`,
+            { method: "DELETE" },
+          );
+          if (!delRes.ok) {
+            let msg = `HTTP ${delRes.status}`;
+            try {
+              const body = (await delRes.json()) as { error?: string };
+              if (body.error) msg = body.error;
+            } catch {
+              // ignore
+            }
+            toast.error(`action 已删，但删除 skill 失败：${msg}`);
+            return;
+          }
+          toast.success("已删除 action 和 skill");
+          return;
+        } catch (err) {
+          toast.error(
+            `action 已删，但删除 skill 失败：${err instanceof Error ? err.message : err}`,
+          );
+          return;
+        }
+      }
+      toast.success("已删除");
     } catch (err) {
       toast.error(`删除失败：${err instanceof Error ? err.message : err}`);
     }

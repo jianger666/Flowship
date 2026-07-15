@@ -137,7 +137,7 @@ submit_mr({
   project_path: "<解析出的 wkid/crm-web>",
   source_branch: "<BRANCH>",
   target_branch: "<该仓测试分支、默认 test>",                       // 见「## 仓库分支配置」段、没配才用 test
-  title: "[<role>] <task.title>",            // role = task.role 中文 label、title 加上版本号 if v>1
+  title: "[<角色>] <task.title>",            // 角色 = 设置页「我的角色」中文 label（见发起人行）、无则省略括号段；v>1 加版本号
   description: "<MR description>",            // 见下方模板
   last_commit_hash: "<HEAD_SHA>",
 })
@@ -235,7 +235,7 @@ submit_mr({
   project_path: "<wkid/crm-web>",
   source_branch: "<CONFLICT>",                 // ⚠️ source 是 __conflict、不是原 feature
   target_branch: "<该仓测试分支、默认 test>",
-  title: "[<role>] <task.title>",
+  title: "[<角色>] <task.title>",
   description: "<同 §3 的 MR description>",
   last_commit_hash: "<HEAD_SHA>",
 })

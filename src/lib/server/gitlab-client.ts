@@ -84,6 +84,33 @@ export type MRMergeStatusResult =
     }
   | { ok: false; error: string };
 
+/** 单个 MR 详情（提测收件箱展示 + 合并门禁） */
+export interface GetMRInput {
+  config: GitLabConfig;
+  projectPath: string;
+  iid: number;
+}
+
+export type GetMRResult =
+  | {
+      ok: true;
+      iid: number;
+      url: string;
+      title: string;
+      description: string;
+      state: string;
+      sourceBranch: string;
+      targetBranch: string;
+      detailedMergeStatus: string;
+      hasConflicts: boolean;
+      mergeable: boolean;
+    }
+  | { ok: false; error: string };
+
+export type MergeMRResult =
+  | { ok: true; url: string; iid: number }
+  | { ok: false; error: string };
+
 const buildBaseUrl = (host: string): string => {
   const trimmed = host.trim().replace(/\/+$/, "").replace(/^https?:\/\//, "");
   if (!trimmed) throw new Error("GitLab host 为空");
@@ -409,4 +436,95 @@ export const getMRMergeStatus = async (
     mergeable: false,
     undetermined: true,
   };
+};
+
+/**
+ * 拉单个 MR 详情（提测收件箱：标题 / 分支 / state / 可合性）。
+ * 不做 poll——收件箱列表要快，checking 态交给 UI chip 展示。
+ */
+export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
+  let base: string;
+  let headers: HeadersInit;
+  try {
+    base = buildBaseUrl(input.config.host);
+    headers = buildHeaders(input.config.token);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
+  try {
+    const res = await fetch(url, { method: "GET", headers });
+    if (!res.ok) {
+      return { ok: false, error: await formatGitLabError(res) };
+    }
+    const body = await res.json();
+    const detailed: string =
+      typeof body?.detailed_merge_status === "string"
+        ? body.detailed_merge_status
+        : typeof body?.merge_status === "string"
+          ? body.merge_status
+          : "unchecked";
+    const hasConflicts =
+      detailed === "conflict" ||
+      detailed === "cannot_be_merged" ||
+      body?.has_conflicts === true;
+    const mergeable =
+      detailed === "mergeable" || detailed === "can_be_merged";
+    return {
+      ok: true,
+      iid: typeof body?.iid === "number" ? body.iid : input.iid,
+      url: typeof body?.web_url === "string" ? body.web_url : "",
+      title: typeof body?.title === "string" ? body.title : "",
+      description: typeof body?.description === "string" ? body.description : "",
+      state: typeof body?.state === "string" ? body.state : "opened",
+      sourceBranch:
+        typeof body?.source_branch === "string" ? body.source_branch : "",
+      targetBranch:
+        typeof body?.target_branch === "string" ? body.target_branch : "",
+      detailedMergeStatus: detailed,
+      hasConflicts,
+      mergeable,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+};
+
+/**
+ * 合并 MR（PUT …/merge）。失败返结构化错误（冲突 / pipeline / 权限等）。
+ */
+export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
+  let base: string;
+  let headers: HeadersInit;
+  try {
+    base = buildBaseUrl(input.config.host);
+    headers = buildHeaders(input.config.token);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}/merge`;
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      return { ok: false, error: await formatGitLabError(res) };
+    }
+    const body = await res.json();
+    return {
+      ok: true,
+      iid: typeof body?.iid === "number" ? body.iid : input.iid,
+      url: typeof body?.web_url === "string" ? body.web_url : "",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 };

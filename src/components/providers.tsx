@@ -17,6 +17,7 @@ import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
+import { MrInboxProvider } from "@/hooks/use-mr-inbox";
 import { getSettings, initSettings } from "@/lib/local-store";
 import { useModels } from "@/hooks/use-models";
 
@@ -55,9 +56,12 @@ export const Providers = ({ children }: ProvidersProps) => {
         <ImagePreviewProvider>
           {/* TaskListProvider：侧栏 + 各页面共享同一份任务列表、新建 / 删除 / 状态变化统一同步 */}
           <TaskListProvider>
-            {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
-            <TaskAttentionWatcher />
-            {children}
+            {/* MrInboxProvider：提测收件箱（顶栏 badge + 任务内提醒条共享一份、前台 10 分钟轮询） */}
+            <MrInboxProvider>
+              {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
+              <TaskAttentionWatcher />
+              {children}
+            </MrInboxProvider>
           </TaskListProvider>
         </ImagePreviewProvider>
       </DialogProvider>

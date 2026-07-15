@@ -22,7 +22,7 @@
  *           att_xxx.png
  *
  * V0.5 → V0.6 关键变化（不写 migration、老数据直接清空）：
- * - phase chain → action history（plan/build/review/ship/learn/dev 自由触发；chat 走独立 mode、不在 actions[] 里）
+ * - phase chain → action history（plan/build/review/ship/dev 自由触发；chat 走独立 mode、不在 actions[] 里）
  * - `phases` 三段位 → `actions[]` 数组（按时间正序、N 累计）
  * - artifact 命名 `01-plan.md` → `N-plan.md`（不前导 0、N 是 ActionRecord.n）
  * - `currentPhase` → `currentActionId`
@@ -53,7 +53,6 @@ import type {
   TaskContextDoc,
   TaskContextDocType,
   TaskEvent,
-  TaskRole,
   TaskSummary,
 } from "@/lib/types";
 import { mrTargetBranchOf } from "@/lib/task-display";
@@ -82,11 +81,13 @@ import {
   getTaskWorkspaceDir,
   hydrateTask,
   hydrateTaskSummary,
+  hydrateTaskWithTailEvents,
   isValidMetaShape,
   newActionId,
   newContextDocId,
   newEventId,
   newTaskId,
+  readEventsBefore,
   readMetaRaw,
   readMetaV06,
   taskDir,
@@ -101,8 +102,11 @@ import {
 const snapshotRepoFlagPaths = async (
   repoPaths: string[],
 ): Promise<{ readonly: string[] | undefined; script: string[] | undefined }> => {
-  const settings = await readSettingsFile().catch(() => null);
-  const repos = Array.isArray(settings?.repos) ? settings!.repos : [];
+  const result = await readSettingsFile().catch(
+    () => ({ status: "error" as const, reason: "read_failed" }),
+  );
+  const settings = result.status === "ok" ? result.settings : null;
+  const repos = Array.isArray(settings?.repos) ? settings.repos : [];
   // config.json 里 repos 是宽松 JSON、只收带 path 的条目
   const entries = (repos as unknown[]).filter(
     (r): r is { path?: string; readonly?: boolean; scriptRepo?: boolean } =>
@@ -274,6 +278,36 @@ export const getTask = async (id: string): Promise<Task | null> => {
 };
 
 /**
+ * 只读 meta + 尾部 n 条事件（不整文件 parse）。
+ * 形状与 getTask 相同；有更早事件时带 eventsTruncated=true。
+ */
+export const getTaskWithTailEvents = async (
+  id: string,
+  tail: number,
+): Promise<Task | null> => {
+  await ensureBootRecovery();
+  const raw = await readMetaRaw(id);
+  if (!raw) return null;
+  if (!isValidMetaShape(raw)) return null;
+  return await hydrateTaskWithTailEvents(raw, tail);
+};
+
+/**
+ * cursor 分页：before 之前更早的一页。任务不存在返 null；锚点缺失返空页。
+ */
+export const getTaskEventsBefore = async (
+  id: string,
+  beforeId: string,
+  limit: number,
+): Promise<{ events: TaskEvent[]; hasMore: boolean } | null> => {
+  await ensureBootRecovery();
+  const raw = await readMetaRaw(id);
+  if (!raw) return null;
+  if (!isValidMetaShape(raw)) return null;
+  return await readEventsBefore(id, beforeId, limit);
+};
+
+/**
  * 创建新 task（V0.6）
  * - V0.6 不分 mode / workflowId、统一走 action 流
  * - 初始状态：repoStatus=developing / runStatus=idle / actions=[] / mrs=[]
@@ -347,7 +381,6 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     currentActionId: null,
     actions: [],
     mrs: [],
-    role: input.role ?? "fe",
     repoPaths: trimmedRepoPaths,
     // 建 task 时快照：之后路径映射 / cwd 聚合读这份，不再运行时 existsSync
     nonGitRepoPaths: computeNonGitRepoPaths(trimmedRepoPaths),
@@ -631,7 +664,7 @@ export const setTaskUiLayout = async (
 /**
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
- * 只放可安全后改的软配置：title / role / feishuStoryUrl / repoFeatureBranches。
+ * 只放可安全后改的软配置：title / feishuStoryUrl / repoFeatureBranches。
  * 不在此改 model（SDK Run 启动时绑定、改了只能换新 agent）/ mode（切通路）/
  * repoPaths（副作用大、影响 cwd + 已建分支）/ repoStatus / runStatus / actions。
  *
@@ -639,7 +672,6 @@ export const setTaskUiLayout = async (
  */
 export interface UpdateTaskFieldsInput {
   title?: string;
-  role?: TaskRole;
   feishuStoryUrl?: string | null;
   repoFeatureBranches?: Record<string, string> | null;
   /**
@@ -668,10 +700,6 @@ export const updateTaskFields = async (
     if (input.title !== undefined) {
       const t = input.title.trim();
       if (t) meta.title = t;
-    }
-
-    if (input.role !== undefined) {
-      meta.role = input.role;
     }
 
     // 飞书链接：改动时同步「建任务自动生成的那条 url 上下文文档」、否则 agent 读 contextDocs 仍是旧链接、两处漂移
@@ -1054,8 +1082,7 @@ export const setTaskRepoStatus = async (
  * 单条仓库的 git branch upsert（V0.6.1 多仓适配）
  *
  * - 按 `repoPath` 匹配：已有同 repoPath 则替换、否则 append
- * - build action 第一次跑前、runner 为每个 repoPath 逐仓初始化一条（baseBranch 暂空、agent 探完再 patch）
- * - agent 跑完 git checkout 后、callers 再调一次把对应仓的 checkedOut=true / baseBranch 填好
+ * - build / worktree 首次建条目时写入；之后可 patch baseBranch
  */
 export const upsertGitBranch = async (
   taskId: string,
@@ -1141,7 +1168,7 @@ export const refreshRepoBranches = async (
  * Upsert MR 记录（V0.6.1 ship action 多仓适配）
  *
  * 按 `repoPath` 匹配：
- *   - 已有：version++、更新 url/title/branch/status/lastCommitHash、保留 createdAt + createdByActionId（首次创建的）
+ *   - 已有：version++、更新 url/title/branch/status/lastCommitHash、保留 createdAt（首次创建的）
  *   - 没有：插入新 record、version=1、createdAt=now
  *
  * 注意：本表 `task.mrs[]` 是 task 维度的「当前最新 MR」、跟 `action.sideEffects.mrs[]` 是 action 维度的「本次 ship 产出」不同——
@@ -1158,7 +1185,6 @@ export const upsertMR = async (
     title: string;
     branch: string;
     status: MRRecord["status"];
-    createdByActionId: string;
     lastCommitHash?: string;
     /** V0.6.1.1：本仓 MR 跟 test 是否有冲突（每次 ship push 后 poll GitLab 写） */
     hasConflicts?: boolean;
@@ -1209,7 +1235,6 @@ export const upsertMR = async (
         lastCommitHash: input.lastCommitHash,
         hasConflicts: input.hasConflicts,
         mergeStatus: input.mergeStatus,
-        createdByActionId: input.createdByActionId,
         version: 1,
         createdAt: now,
       };

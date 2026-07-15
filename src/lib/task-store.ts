@@ -25,7 +25,6 @@ import type {
   PreviewSlotStatus,
   Task,
   TaskEvent,
-  TaskRole,
   TaskSummary,
 } from "./types";
 
@@ -171,7 +170,7 @@ export const setTaskUiLayout = async (
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
  * 走 PATCH /api/tasks/[id]、字段语义：不传 = 不改、传值 = 改、传 null = 显式清空（仅可空字段）。
- * 可改：title / role / feishuStoryUrl / repoFeatureBranches；mode / model 不在此改
+ * 可改：title / feishuStoryUrl / repoFeatureBranches；mode / model 不在此改
  *（model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、走推进 dialog 的模型选择）。
  * V0.6.28：+ addRepoPaths 追加仓库（只增不删、生效于下一个 action）、新仓的
  * per-repo 快照（分支 / 模板 / check 命令）由调用方从 settings 取好随行传。
@@ -180,7 +179,6 @@ export const updateTaskFields = async (
   id: string,
   patch: {
     title?: string;
-    role?: TaskRole;
     feishuStoryUrl?: string | null;
     repoFeatureBranches?: Record<string, string> | null;
     addRepoPaths?: string[];
@@ -597,8 +595,8 @@ export const submitTaskQuestion = async (
       bootArgs: {
         apiKey: s.apiKey,
         model: s.defaultModel,
-        // 唤醒模式（会话接不回、原地续当前 action）要建 worktree / 提 MR、随手带全
-        gitHost: s.gitHost,
+        // 唤醒模式（会话接不回、原地续当前 action）要建 worktree / 提 MR、带上 PAT
+        // （host 由 server 按任务仓库 remote 现推）
         gitToken: s.gitToken,
       },
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
@@ -611,7 +609,7 @@ export const submitTaskQuestion = async (
 /**
  * V0.6 任务终态控制（用户在 ack dialog 选「合入」/「abandon」）
  *
- * - merged: 标 repoStatus=merged + write [TASK_DONE] + Agent 退出 + 可触发 learn
+ * - merged: 标 repoStatus=merged + write [TASK_DONE] + Agent 退出
  * - abandoned: write [TASK_ABANDONED] + Agent 自然退出 + cleanup
  */
 export const finalizeTask = async (
@@ -737,9 +735,11 @@ export const submitAskReply = async (
   askId: string,
   answers: AskUserAnswer[],
   // V0.8.3：imagesByQuestion key=questionId、每题各自绑各自的图（图-only 也算已答）
+  // signal：答题卡 30s 超时解锁时 abort，避免旧请求迟到与重试撞重复回答
   options?: {
     deferred?: boolean;
     imagesByQuestion?: Record<string, ImagePayload[]>;
+    signal?: AbortSignal;
   },
 ): Promise<{ ok: true }> => {
   // 只发非空的题图、避免 body 里塞一堆空数组
@@ -757,6 +757,7 @@ export const submitAskReply = async (
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: options?.signal,
       body: JSON.stringify({
         askId,
         answers,
@@ -767,7 +768,6 @@ export const submitAskReply = async (
         bootArgs: {
           apiKey: s.apiKey,
           model: s.defaultModel,
-          gitHost: s.gitHost,
           gitToken: s.gitToken,
         },
       }),

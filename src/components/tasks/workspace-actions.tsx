@@ -3,12 +3,11 @@
 /**
  * 任务工作区快捷操作条（V0.10.1、worktree 隔离的配套体验）
  *
- * 渲染在任务详情页路径行下方、三组能力：
- * 1. 在 IDE 打开工作区——cursor:// deep link 直接打开 agent 实际干活的目录
- *    （隔离 task = worktree、路径很深、手动找很费劲）
- * 2. 复制工作区路径——终端 cd 用
- * 3. 预览（单预览位）——设置页给仓库配了「预览启动命令」才显示；点了自动停掉
- *    上一个任务的 dev server、在本任务工作区起新的（体验对齐单分支时代）
+ * 渲染在任务详情页路径行下方：按仓分组（多仓有边框+短名 label、单仓扁平）
+ * 1. 在 IDE 打开该仓工作区——cursor:// deep link
+ * 2. 复制该仓实际工作目录路径——终端 cd 用
+ * 3. 预览（全局单预览位）——设置页配了「预览启动命令」才显示；组内挂载
+ * 4. 「任务文件夹」固定整条末尾
  *
  * 预览状态轮询 /api/preview（仅本组件挂载期间、4s 一次、本地调用很轻）。
  */
@@ -122,10 +121,10 @@ export const WorkspaceActions = ({ task }: Props) => {
       )
     : [];
 
-  const copyPath = async () => {
-    if (!workCwd) return;
+  // 按仓复制该仓实际工作目录（与 IDE 打开同源的 workDir），不再复制公共父目录
+  const copyPath = async (dir: string) => {
     try {
-      await navigator.clipboard.writeText(workCwd);
+      await navigator.clipboard.writeText(dir);
       toast.success("工作区路径已复制");
     } catch {
       toast.error("复制失败、请手动复制");
@@ -163,103 +162,16 @@ export const WorkspaceActions = ({ task }: Props) => {
 
   // 预览位属于本任务才展示运行态（别的任务在预览时、本任务仍显示「预览」、点了顶掉）
   const mine = slot?.taskId === task.id ? slot : null;
+  // 多仓才画组边框 + 短名 label；单仓保持扁平、避免无谓加重
+  const multi = ideTargets.length > 1;
+  const ideRepoSet = new Set(ideTargets.map((t) => t.repoPath));
+  // candidates 理论上都挂在 ideTargets 上；对不上的兜底单独放（避免预览按钮消失）
+  const orphanCandidates = candidates.filter((c) => !ideRepoSet.has(c.repoPath));
 
-  return (
-    <div className="mt-1 flex flex-wrap items-center gap-1">
-      {/* cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议、页面不动）——ui-conventions 约定；
-          JetBrains 系走 onClick 后端拉起（getIdeAnchorProps 内部切换）。
-          多仓逐仓一个按钮（各开各的项目窗口）、单仓不带短名后缀 */}
-      {ideTargets.map((t) => {
-        // newWindow：开的是整个工作区目录、必须新窗口——cursor:// 默认会把当前活跃
-        // 窗口的工作区直接换掉（用户实测正干活的窗口没了）
-        const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor", {
-          newWindow: true,
-        });
-        if (!anchor) return null;
-        return (
-          <Button
-            key={t.repoPath}
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            nativeButton={false}
-            render={
-              <a
-                {...anchor}
-                className="no-underline"
-                title={`在 IDE 打开项目\n${t.workDir}`}
-              />
-            }
-          >
-            <SquareArrowOutUpRight className="size-3" />
-            在 IDE 打开
-            {ideTargets.length > 1 && `（${t.shortName}）`}
-          </Button>
-        );
-      })}
-      {hasRepoBar && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          onClick={copyPath}
-          title={`复制工作区路径\n${workCwd}`}
-        >
-          <Copy className="size-3" />
-          复制路径
-        </Button>
-      )}
-
-      {/* 打开任务数据目录（actions/ artifact + workspace/ 脚本产出）——用户找 AI 产出文件的入口 */}
-      {taskDirAnchor && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          nativeButton={false}
-          render={
-            <a
-              {...taskDirAnchor}
-              className="no-underline"
-              title={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
-            />
-          }
-        >
-          <FolderOpen className="size-3" />
-          任务文件夹
-        </Button>
-      )}
-
-      {/* 「需求详情」按钮已删（v1.1.x 用户拍板）：工作项的 description 字段团队实践里
-          都是空的（产品写飞书文档、往工作项贴链接）、点开永远空白纯误导 */}
-
-      {candidates.length > 0 && !mine && (
-        // 未在预览（或预览位被别的任务占着）：起本任务的预览。
-        // 多仓多命令时逐仓给按钮（常见就 1 个、不上 dropdown）
-        candidates.map((c) => (
-          <Button
-            key={c.repoPath}
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            disabled={busy}
-            onClick={() => void start(c.repoPath)}
-            title={
-              `在任务工作区起 dev server：${c.command}` +
-              (slot && !slot.exited && slot.taskId !== task.id
-                ? `\n（会停掉「${slot.taskTitle}」正在跑的预览——全局单预览位）`
-                : "")
-            }
-          >
-            {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
-            预览
-            {candidates.length > 1 &&
-              `（${c.repoPath.split("/").filter(Boolean).pop()}）`}
-          </Button>
-        ))
-      )}
-
-      {mine && !mine.exited && (
+  /** 某仓组内的预览区：未跑→启动钮；本仓在跑→运行态；本仓已退→重试 */
+  const renderPreviewForRepo = (repoPath: string) => {
+    if (mine && mine.repoPath === repoPath && !mine.exited) {
+      return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-muted-foreground">
             <span className="size-1.5 animate-pulse rounded-full bg-emerald-500" />
@@ -298,9 +210,10 @@ export const WorkspaceActions = ({ task }: Props) => {
             停止
           </Button>
         </>
-      )}
-
-      {mine && mine.exited && (
+      );
+    }
+    if (mine && mine.repoPath === repoPath && mine.exited) {
+      return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive/80">
             <span className="size-1.5 rounded-full bg-destructive/80" />
@@ -319,6 +232,138 @@ export const WorkspaceActions = ({ task }: Props) => {
             重试
           </Button>
         </>
+      );
+    }
+    // 本任务未占预览位（或占着别的仓）：有命令才显示启动钮；组 label 已表明归属、不再缀短名
+    if (!mine) {
+      const c = candidates.find((x) => x.repoPath === repoPath);
+      if (!c) return null;
+      return (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={BTN_CLS}
+          disabled={busy}
+          onClick={() => void start(c.repoPath)}
+          title={
+            `在任务工作区起 dev server：${c.command}` +
+            (slot && !slot.exited && slot.taskId !== task.id
+              ? `\n（会停掉「${slot.taskTitle}」正在跑的预览——全局单预览位）`
+              : "")
+          }
+        >
+          {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
+          预览
+        </Button>
+      );
+    }
+    return null;
+  };
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1">
+      {/* 按仓分组：IDE 打开 + 复制该仓路径 + 预览（有命令才有）。
+          cursor:// 同 frame 裸 <a>（壳 will-navigate 拦截转系统协议）——ui-conventions 约定 */}
+      {ideTargets.map((t) => {
+        // newWindow：开的是整个工作区目录、必须新窗口——cursor:// 默认会把当前活跃
+        // 窗口的工作区直接换掉（用户实测正干活的窗口没了）
+        const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor", {
+          newWindow: true,
+        });
+        const groupInner = (
+          <>
+            {multi && (
+              <span className="px-1 text-[11px] text-muted-foreground">{t.shortName}</span>
+            )}
+            {anchor && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className={BTN_CLS}
+                nativeButton={false}
+                render={
+                  <a
+                    {...anchor}
+                    className="no-underline"
+                    title={`在 IDE 打开项目\n${t.workDir}`}
+                  />
+                }
+              >
+                <SquareArrowOutUpRight className="size-3" />
+                在 IDE 打开
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className={BTN_CLS}
+              onClick={() => void copyPath(t.workDir)}
+              title={`复制工作区路径\n${t.workDir}`}
+            >
+              <Copy className="size-3" />
+              复制路径
+            </Button>
+            {renderPreviewForRepo(t.repoPath)}
+          </>
+        );
+        return multi ? (
+          <div
+            key={t.repoPath}
+            className="inline-flex items-center gap-0.5 rounded-md border border-border/50 px-1 py-0.5"
+          >
+            {groupInner}
+          </div>
+        ) : (
+          <div key={t.repoPath} className="contents">
+            {groupInner}
+          </div>
+        );
+      })}
+
+      {/* candidates 的 repoPath 不在 ideTargets 时兜底（理论上不该发生） */}
+      {orphanCandidates.map((c) => {
+        const orphanInner = (
+          <>
+            {multi && (
+              <span className="px-1 text-[11px] text-muted-foreground">
+                {c.repoPath.split("/").filter(Boolean).pop()}
+              </span>
+            )}
+            {renderPreviewForRepo(c.repoPath)}
+          </>
+        );
+        return multi ? (
+          <div
+            key={`orphan-${c.repoPath}`}
+            className="inline-flex items-center gap-0.5 rounded-md border border-border/50 px-1 py-0.5"
+          >
+            {orphanInner}
+          </div>
+        ) : (
+          <div key={`orphan-${c.repoPath}`} className="contents">
+            {orphanInner}
+          </div>
+        );
+      })}
+
+      {/* 打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
+      {taskDirAnchor && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={BTN_CLS}
+          nativeButton={false}
+          render={
+            <a
+              {...taskDirAnchor}
+              className="no-underline"
+              title={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
+            />
+          }
+        >
+          <FolderOpen className="size-3" />
+          任务文件夹
+        </Button>
       )}
     </div>
   );

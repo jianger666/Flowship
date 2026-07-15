@@ -44,7 +44,7 @@ import type {
   ActionType,
   Task,
 } from "@/lib/types";
-import { TASK_ROLE_LABEL, TEST_STRATEGY_LABEL } from "@/lib/types";
+import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import { computeBatchProgress } from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
 
@@ -61,7 +61,6 @@ const ACTION_PROMPT_FILE: Record<Exclude<ActionType, "custom">, string> = {
   build: "action-build.md",
   review: "action-review.md",
   ship: "action-ship.md",
-  learn: "action-learn.md",
   dev: "action-dev.md",
 };
 
@@ -130,9 +129,8 @@ const loadSharedPrompt = async (task: Task): Promise<string> => {
 // 加载某个 action 的 prompt、填模板变量
 // V0.6 模板可用占位符：
 //   {{taskId}} / {{taskTitle}} / {{repoPath}}（effective cwd）
-//   {{role}} / {{roleLabel}}
 //   {{actionArtifactsDir}}（绝对路径、给 agent write 用）
-//   {{eventsLogPath}}（V0.6.29、learn action 挖事件日志用）
+//   {{eventsLogPath}}（事件日志绝对路径）
 // ⚠️ 加占位符记得同步 tests/protocol-signals.test.ts 的供值表对账
 export const loadActionPrompt = async (
   action: ActionRecord,
@@ -142,8 +140,6 @@ export const loadActionPrompt = async (
     taskId: task.id,
     taskTitle: task.title,
     repoPath: getTaskCwd(task),
-    role: task.role,
-    roleLabel: TASK_ROLE_LABEL[task.role],
     actionArtifactsDir: getActionsDir(task.id),
     eventsLogPath: getEventsLogPath(task.id),
   };
@@ -280,8 +276,6 @@ export const buildSuperPrompt = async (
     repoSection: renderRepoSection(task),
     repoBranchSection: renderRepoBranchSection(task),
     repoPath: getTaskCwd(task),
-    roleLabel: TASK_ROLE_LABEL[task.role],
-    role: task.role,
     contextDocsSection: renderContextDocsSection(
       task,
       "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
@@ -429,18 +423,16 @@ const renderRepoBranchSection = (task: Task): string => {
 
 // ----------------- task 字段热更（快照 + diff） -----------------
 
-// V0.6.6 热更：agent 长生期间用户可能在详情页编辑 role / title / feishuStoryUrl、
+// V0.6.6 热更：agent 长生期间用户可能在详情页编辑 title / feishuStoryUrl、
 // 用 agent 启动时的快照 diff 出「变了哪几项」、reused 推进时注入告知。
 // 注：model 是 SDK Run 启动时绑定的硬约束、改了只能换新 agent、不在热更之列。
 export interface TaskFieldsSnapshot {
   title: string;
-  role: Task["role"];
   feishuStoryUrl?: string;
 }
 
 export const captureTaskFieldsSnapshot = (task: Task): TaskFieldsSnapshot => ({
   title: task.title,
-  role: task.role,
   feishuStoryUrl: task.feishuStoryUrl,
 });
 
@@ -450,11 +442,6 @@ export const buildTaskUpdateHint = (
   snapshot: TaskFieldsSnapshot,
 ): string | undefined => {
   const lines: string[] = [];
-  if (task.role !== snapshot.role) {
-    lines.push(
-      `- ⚠️ 角色已从「${TASK_ROLE_LABEL[snapshot.role]}」改为「${TASK_ROLE_LABEL[task.role]}」、后续所有 action 以此角色视角为准、忽略开头 super prompt 里的旧角色`,
-    );
-  }
   if (task.title !== snapshot.title) {
     lines.push(`- 任务标题已更新为「${task.title}」`);
   }

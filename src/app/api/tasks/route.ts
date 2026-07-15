@@ -14,9 +14,9 @@
 
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
+import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
-import { isTaskRole } from "@/lib/types";
-import type { NewTaskInput, TaskMode, TaskRole } from "@/lib/types";
+import type { NewTaskInput, TaskMode } from "@/lib/types";
 
 const isNonEmptyString = (v: unknown): v is string =>
   typeof v === "string" && v.trim().length > 0;
@@ -27,10 +27,6 @@ const sanitizeRepoPaths = (v: unknown): string[] => {
     .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
     .map((p) => p.trim());
 };
-
-// 共享 guard（CR-07）：枚举变更只改 types.ts 的 TASK_ROLES、route 不再各写一份白名单
-const sanitizeRole = (v: unknown): TaskRole | undefined =>
-  isTaskRole(v) ? v : undefined;
 
 const sanitizeMode = (v: unknown): TaskMode => {
   return v === "chat" ? "chat" : "task";
@@ -97,7 +93,6 @@ export const POST = async (req: Request) => {
     const task = await createTask({
       title,
       repoPaths,
-      role: sanitizeRole(body.role),
       mode,
       repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
       repoFeatureBranches: sanitizeRepoBranchMap(body.repoFeatureBranches),
@@ -121,6 +116,9 @@ export const POST = async (req: Request) => {
           : undefined,
       model: body.model,
     });
+    // v1.1.x 提速：隔离工作区后台预热（fire-and-forget、chat / 非隔离任务内部 no-op）——
+    // worktree 首建 + 依赖克隆不再算进第一次推进的等待时间
+    prewarmTaskWorkspace(task.id);
     return NextResponse.json({ task }, { status: 201 });
   } catch (err) {
     console.error("[POST /api/tasks] failed", err);

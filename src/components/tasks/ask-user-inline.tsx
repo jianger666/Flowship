@@ -52,7 +52,7 @@ interface AnswerDraft {
 }
 
 // 从 ev.meta 抠 questions[]（meta 不规整时返空、上层判定空就不渲染）
-export const extractAskQuestions = (
+const extractAskQuestions = (
   meta: TaskEvent["meta"],
 ): AskUserQuestion[] => {
   if (!meta || !Array.isArray(meta.questions)) return [];
@@ -81,8 +81,10 @@ export const extractAskQuestions = (
   return out;
 };
 
-// 字母前缀：A/B/C/D/E/F、超过就用数字（一般不会超 6 个）
-const LETTER_PREFIX = ["A", "B", "C", "D", "E", "F"];
+// 字母前缀：A-Z、超过 26 个回退数字（选项数量不设上限、schema 已放开）
+const LETTER_PREFIX = Array.from({ length: 26 }, (_, i) =>
+  String.fromCharCode(65 + i),
+);
 
 // 判断一道题是否已答：选了 option / 填了文字 / 贴了图、任一即算
 const isDraftAnswered = (d?: AnswerDraft): boolean =>
@@ -322,6 +324,11 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
   // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时强制解锁可重试
   const SUBMIT_UNLOCK_MS = 30_000;
 
+  // AbortError：超时解锁已 toast + abort，勿再弹一次错误 toast
+  const isAbortError = (err: unknown): boolean =>
+    (err instanceof DOMException || err instanceof Error) &&
+    err.name === "AbortError";
+
   const handleSubmit = async () => {
     if (!askId || submitting) return;
     if (!allAnswered) {
@@ -343,12 +350,18 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       if (imgs && imgs.length > 0) imagesByQuestion[q.id] = imgs;
     }
     setSubmitting(true);
+    // 超时解锁时 abort 在飞请求，避免迟到响应与用户重试撞成重复回答
+    const ac = new AbortController();
     const unlockTimer = window.setTimeout(() => {
+      ac.abort();
       setSubmitting(false);
       toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
     }, SUBMIT_UNLOCK_MS);
     try {
-      await submitAskReply(task.id, askId, answers, { imagesByQuestion });
+      await submitAskReply(task.id, askId, answers, {
+        imagesByQuestion,
+        signal: ac.signal,
+      });
       // 提交成功：等 SSE 推 ask_user_reply、findPendingAskEvent 变 null、
       // event-stream 自动切回放卡——这里不主动收起、避免 race。
       // SSE 重连间隙另给 15s：卡片可能仍显示「提交中…」
@@ -356,6 +369,10 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       window.setTimeout(() => setSubmitting(false), 15_000);
     } catch (err) {
       window.clearTimeout(unlockTimer);
+      if (isAbortError(err)) {
+        setSubmitting(false);
+        return;
+      }
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }
@@ -367,22 +384,31 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     const ok = await confirm({
       title: "稍后再补充这些问题？",
       description:
-        "AI 会跳过这一组问题、按 default 推进、并把它们列进方案文档「待澄清 / 不确定项」段。你可以稍后在输入条里补充。",
+        "AI 会跳过这一组问题、按 default 继续。你可以稍后在输入条里补充。",
       confirmLabel: "确认稍后补",
       cancelLabel: "回去答题",
     });
     if (!ok) return;
     setSubmitting(true);
+    const ac = new AbortController();
     const unlockTimer = window.setTimeout(() => {
+      ac.abort();
       setSubmitting(false);
       toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
     }, SUBMIT_UNLOCK_MS);
     try {
-      await submitAskReply(task.id, askId, [], { deferred: true });
+      await submitAskReply(task.id, askId, [], {
+        deferred: true,
+        signal: ac.signal,
+      });
       window.clearTimeout(unlockTimer);
       window.setTimeout(() => setSubmitting(false), 15_000);
     } catch (err) {
       window.clearTimeout(unlockTimer);
+      if (isAbortError(err)) {
+        setSubmitting(false);
+        return;
+      }
       toast.error(err instanceof Error ? err.message : String(err));
       setSubmitting(false);
     }

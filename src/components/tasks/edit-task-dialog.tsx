@@ -4,7 +4,7 @@
  * 编辑任务 Dialog（V0.6.6）
  *
  * 详情页「编辑」按钮打开、改建任务时填的软配置字段：
- *   角色 / 标题 / 飞书链接 / 已有工作分支（per-repo）
+ *   标题 / 飞书链接 / 已有工作分支（per-repo）
  *
  * 刻意不在此改：
  *   - 模型 model（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）
@@ -17,7 +17,7 @@
  *   命名模板、check 命令）提交时从 settings 现取随行传（跟建 task 同款逻辑）。
  *
  * 副作用约定（V0.6.6 热更）：
- *   - 角色 / 标题 / 飞书链接：长生 agent reused 推进时 task-runner 会 diff 启动快照、有变拼 [TASK_UPDATED] 注入告知（立即生效）
+ *   - 标题 / 飞书链接：长生 agent reused 推进时 task-runner 会 diff 启动快照、有变拼 [TASK_UPDATED] 注入告知（立即生效）
  *   - 标题 / 飞书链接：已建的 git 分支名不会改（建时已固化）、只影响之后新建的
  *   - running 时不让编辑（详情页入口禁用）、避免改了跟正在跑的不一致
  */
@@ -39,26 +39,11 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { MultiSelect } from "@/components/ui/multi-select";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { updateTaskFields } from "@/lib/task-store";
-import {
-  TASK_ROLE_LABEL,
-  TASK_ROLES,
-  type RepoConfig,
-  type Task,
-  type TaskRole,
-} from "@/lib/types";
-
-const ROLE_OPTIONS: readonly TaskRole[] = TASK_ROLES;
+import type { RepoConfig, Task } from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -69,8 +54,6 @@ interface Props {
 }
 
 export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => {
-  // 角色（fe/be）
-  const [role, setRole] = useState<TaskRole>(task.role);
   // 任务标题（必填）
   const [title, setTitle] = useState(task.title);
   // 飞书项目链接（选填、空=清空）
@@ -93,7 +76,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   useEffect(() => {
     if (!open) return;
     const t = taskRef.current;
-    setRole(t.role);
     setTitle(t.title);
     setFeishuStoryUrl(t.feishuStoryUrl ?? "");
     setFeatureBranches(t.repoFeatureBranches ?? {});
@@ -158,7 +140,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
 
       const updated = await updateTaskFields(task.id, {
         title: title.trim(),
-        role,
         feishuStoryUrl: feishuStoryUrl.trim() || null,
         repoFeatureBranches:
           Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
@@ -189,28 +170,6 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-1">
-          {/* 角色 */}
-          <div className="grid gap-1.5">
-            <Label htmlFor="edit-role" required>
-              角色
-            </Label>
-            <Select
-              value={role}
-              onValueChange={(v) => v && setRole(v as TaskRole)}
-            >
-              <SelectTrigger id="edit-role" className="w-full">
-                <SelectValue>{TASK_ROLE_LABEL[role]}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {ROLE_OPTIONS.map((r) => (
-                  <SelectItem key={r} value={r}>
-                    {TASK_ROLE_LABEL[r]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
           {/* 标题 */}
           <div className="grid gap-1.5">
             <Label htmlFor="edit-title" required>
