@@ -287,6 +287,18 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-15 v1.1.14 发版：改bug 走深链推进弹窗 + 更新链重定向安全 + review 修复批
+
+> 用户拍板「改bug 就和推进普通 action 一样」；本批含两轮子代理 review（4+2 个 grok 审查 agent）揪出的 P1 修复。
+
+- **改bug 深链化（替代 2026-07-14「点按钮即确认直接 POST advance」）**：收件箱「改bug」→ 任务页深链 `?advance=fix-bug&bugTitle&bugUrl&storyName` → 打开推进弹窗、指令框预填 bug 事实信息（标题/链接/关联需求，**不带行为约束句**——复现/修复/HITL 流转的约束全在 fix-bug skill 里）、预选出厂「改bug」action、用户确认后启动。`fix-bug-advance.ts` 职责收窄为「查预置可用 + confirm 重建」；服务端零特殊分支、运行链路与普通 custom action 完全一致。
+- **深链防弹（review 揪出）**：一次性消费标记（token=`id|query`、防 replace 清参前 effect 重跑重开弹窗冲掉草稿；URL 无参时复位、同 bug 可再次深链）；与 canAdvance 口径对齐（running / merged / abandoned 不开弹窗、各有 toast、深链不能绕过叠跑推进）；推进成功显式清预填（程序化关弹窗不触发 onOpenChange）。
+- **推进弹窗选中保护**：`userTouchedActionRef`——用户手点过 action chip 后、迟到的自定义列表请求不再把选中盖回预选。
+- **收件箱流转下拉修复**：请求代数 `transitionsReqIdRef` 防竞态（状态变化作废 in-flight、过期响应丢弃）；失败保持 `transitions===null` 可重开重试（原 `[]` 会被守卫当已加载卡死）；菜单开着时状态变化立即按新状态重拉（防空白菜单）。
+- **mac 更新链重定向安全**：`fetchLatestVersion` 改 `redirect:"follow"` 从最终 URL 抠 tag（修 07-15 仓库改名事故——旧 `redirect:"manual"` 只读第一跳、改名重定向不含 /tag/ 导致存量客户端更新链断）+ 补 15s 超时与 `res.ok`。⚠️ 只保护装了本版的客户端：改名 Flowship 须等全员升到 ≥1.1.14 再执行；README / publish.repo 保持 fe-ai-flow。
+- **prompt 与 runtime 文案统一**：prompts/ 全量去「emit assistant_message」教法改「直接回复」（防 agent 把事件名当工具调）；`chat-pending.ts`〈产出审阅中〉注入、`chat-mcp.ts` 交卷/提测礼仪、`task-prompts.ts` 唤醒插话同步改词（〈产出审阅中〉字面量契约保留）。
+- 另：MCP 探测 fail 缓存拉到 5 分钟（与 ok 同、注释写明 401 场景权衡）；设置页 shell 提速卡「无需优化」态；一批过时注释校正（收件箱直推说明 / advance-dialog「不接外部 prefill」/ providers 轮询 10→5 分钟）。
+
 ### 2026-07-15 v1.1.13 发版：Agent shell 提速一键优化
 
 > 背景：调研「SDK 比 IDE 慢」——Cursor 官方论坛已确认的性能 bug（agent shell 每条命令「快照恢复→执行→重新序列化 shell 状态」、rc 加载的重型工具函数表让序列化滚雪球、同会话越用越慢直至挂死；官方缓解 = rc 顶部加 `COMPOSER_NO_INTERACTION` 守卫跳过重型初始化）。本机实测：zsh -il 启动 3.0s→1.0s、函数表 -68%；用户今早真实任务实锤退化曲线（10 点 shell 中位 0.56s → 11 点中位 6.18s/p90 84.9s）。出处：forum.cursor.com/t/agent-shell-gets-progressively-slower-then-eventually-hangs/158535（Cursor 员工确认已立项、尚未发布修复）。
@@ -295,18 +307,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 - **安全三件套**：写前备份 `<file>.bak-YYYYMMDD`（已有不覆盖）、幂等（已含守卫跳过）、保留原文件 mode + tmp/rename 原子写；rc 不存在**不创建**（没 rc 就没重型加载、注入无意义）。
 - 实现：`src/lib/server/shell-boost.ts`（探测/注入纯逻辑可测、4 断言单测）+ `api/system/shell-boost` route（GET 探测 / POST 注入）。
 - 生效范围：新建的 agent 会话；对 rc 干净的用户无感、对装 oh-my-zsh/nvm/rvm 的用户每条 shell 快约 2 秒且防滚雪球挂死。
-
-### 2026-07-15 v1.1.12 发版：停止竞态修复 + 预置重建防弹化 + 恐龙快跑等待视图 + 仓库改名
-
-> v1.1.11 发出当天下午按用户实测反馈继续打磨的一批。全程 grok 子代理实施、主线验收。
-
-- **停止竞态修复（线上实锤）**：推进后 4~8 秒启动窗口（Agent.create→首条 send 返回前、runningTasks 未注册）内点「停止」会失效——状态标了 cancelled/idle 但 agent 照跑到自然结束（实测白跑 6 分钟、写代码类 action 会在「已停止」假象下继续改代码）。修法：进程级 `pendingStopRequests` 标记（task-stream globalThis V5）——cancelTaskRun 无 run 记录时置标记；启动链四个检查点（create 后 / resume 后 / send 拿到 run 后 / 消费循环入口）命中即 `applyPendingStopIfRequested`（run.cancel + 关会话 + 与正常停止一致收尾、写「停止请求已生效」事件）；新推进/唤醒前清标记防误杀；问一问路径单独分支（只取消 run 不动 action）。
-- **预置重建防弹化（同事诊断日志实锤的死循环）**：旧重建判 skill 存在用「目录存在」、点「改bug」检查用「skill 列表可见」——用户改坏 fix-bug 目录（改 frontmatter name / 删 SKILL.md 留目录）后重建永远无效。拍板原则「**用户可以随便删/改、重建必须总能恢复可用**」：重建判定与点击检查统一口径（skill 按列表可见判、不可见就覆盖写模板；action 按「存在+非旧格式+有挂载+挂载 skill 可见」四条判、不满足整体写回出厂壳）；点击检查改看 **action 实际挂载的 skill**（挂用户自定义 skill 也算可用——把 builtin-fix-bug 的挂载换成自己的 skill 即可让收件箱一键改bug跑自定义流程）；重建确认弹窗文案改为「恢复出厂版本（覆盖对该 action 的修改）」。
-- **恐龙快跑等待视图（用户拍板「等推进无聊、左侧放个游戏当 loading」）**：GameKit UI 的 dino-runner（shadcn registry 单文件、吸主题色）装到 `src/components/games/`；artifact 面板 toolbar 左侧加「产物 / 等待」视图切换——当前 action 运行中且无产物自动进游戏且**自动开跑**（autoStart、不用先按键）；产物到达的切回策略：没在局中直接自动切回产物、局中不打断（toast 带「立即查看」、Game over 后停 1.5s 自动切回、手动切走则取消）。打磨三轮：主角改像素 T-Rex 剪影 + 障碍改仙人掌（fillRect 点阵、物理零改动）、去容器边框/焦点环与面板融合、`captureGlobalKeys` 全局按键（输入框豁免、切走视图即卸载）。
-- **收件箱「忽略」**：三组条目操作区加「忽略」（EyeOff、二次确认、destructive）——落盘 `mr-inbox-ignored.json`（与 seen 同骨架：canonical 归一 key、promise chain 写互斥、原子写、90 天剪枝）、GET /api/mr-inbox 在 join seen 同层过滤 + 忽略时双剔缓存、角标未读数自然不计；「不需要自己处理的条目」从此可清走。
-- **分支模板占位符校验（同事 `{yyMMdd}` 事故沉淀）**：`findUnknownPlaceholders`（合法 = storyId / taskTitle / username（废弃放行）/ date:FORMAT）、设置页全局模板 + per-repo 模板失焦保存时拦未知占位符 toast 报正确写法、不落盘——从源头堵住「字面花括号分支名」。
-- **仓库改名 fe-ai-flow → Flowship**（github.com/jianger666/Flowship）：GitHub 旧名自动重定向、存量 mac/win 自更新链不受影响；壳内 3 处 URL + electron-builder publish.repo + README 已改；appId / 安装包文件名 / 数据目录名不动（改了断更新链/丢数据）；⚠️ 永远别再建名为 fe-ai-flow 的新仓（顶掉重定向）。
-- 另：设置页「返回 + 标题」sticky 浮顶（长页滚到底也能回去、锚点偏移同步调）；自动更新「发现新版本」弹窗静默化与删 skill 同步删挂载 action（随 v1.1.11 尾批已发、记账归上段）。
 
 ## 关键文件索引
 
