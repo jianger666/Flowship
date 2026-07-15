@@ -287,6 +287,15 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-15 v1.1.13 发版：Agent shell 提速一键优化
+
+> 背景：调研「SDK 比 IDE 慢」——Cursor 官方论坛已确认的性能 bug（agent shell 每条命令「快照恢复→执行→重新序列化 shell 状态」、rc 加载的重型工具函数表让序列化滚雪球、同会话越用越慢直至挂死；官方缓解 = rc 顶部加 `COMPOSER_NO_INTERACTION` 守卫跳过重型初始化）。本机实测：zsh -il 启动 3.0s→1.0s、函数表 -68%；用户今早真实任务实锤退化曲线（10 点 shell 中位 0.56s → 11 点中位 6.18s/p90 84.9s）。出处：forum.cursor.com/t/agent-shell-gets-progressively-slower-then-eventually-hangs/158535（Cursor 员工确认已立项、尚未发布修复）。
+
+- **设置页偏好卡「Agent shell 提速」**：挂载探测各目标 rc（darwin/linux: ~/.zshrc + ~/.bashrc；win32: Git Bash ~/.bashrc；PowerShell 无官方守卫机制不处理）——已存在的 rc 全部含守卫 → 显「已优化 ✓」；否则「一键优化」按钮 → `POST /api/system/shell-boost` 顶部注入守卫两行（注释 + `[[ "$COMPOSER_NO_INTERACTION" == "1" ]] && return`）。
+- **安全三件套**：写前备份 `<file>.bak-YYYYMMDD`（已有不覆盖）、幂等（已含守卫跳过）、保留原文件 mode + tmp/rename 原子写；rc 不存在**不创建**（没 rc 就没重型加载、注入无意义）。
+- 实现：`src/lib/server/shell-boost.ts`（探测/注入纯逻辑可测、4 断言单测）+ `api/system/shell-boost` route（GET 探测 / POST 注入）。
+- 生效范围：新建的 agent 会话；对 rc 干净的用户无感、对装 oh-my-zsh/nvm/rvm 的用户每条 shell 快约 2 秒且防滚雪球挂死。
+
 ### 2026-07-15 v1.1.12 发版：停止竞态修复 + 预置重建防弹化 + 恐龙快跑等待视图 + 仓库改名
 
 > v1.1.11 发出当天下午按用户实测反馈继续打磨的一批。全程 grok 子代理实施、主线验收。
@@ -298,17 +307,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 - **分支模板占位符校验（同事 `{yyMMdd}` 事故沉淀）**：`findUnknownPlaceholders`（合法 = storyId / taskTitle / username（废弃放行）/ date:FORMAT）、设置页全局模板 + per-repo 模板失焦保存时拦未知占位符 toast 报正确写法、不落盘——从源头堵住「字面花括号分支名」。
 - **仓库改名 fe-ai-flow → Flowship**（github.com/jianger666/Flowship）：GitHub 旧名自动重定向、存量 mac/win 自更新链不受影响；壳内 3 处 URL + electron-builder publish.repo + README 已改；appId / 安装包文件名 / 数据目录名不动（改了断更新链/丢数据）；⚠️ 永远别再建名为 fe-ai-flow 的新仓（顶掉重定向）。
 - 另：设置页「返回 + 标题」sticky 浮顶（长页滚到底也能回去、锚点偏移同步调）；自动更新「发现新版本」弹窗静默化与删 skill 同步删挂载 action（随 v1.1.11 尾批已发、记账归上段）。
-
-### 2026-07-14~15 v1.1.11 发版：提测收件箱一~三期落地 + 默认空间 + 改bug 闭环打磨
-
-> 方案设计见下段（07-14 下午拍板）；本段记落地与 07-15 当天按用户实测反馈的打磨。全程 grok 子代理实施、主线验收。
-
-- **收件箱一~三期落地**：顶栏铃铛三分组（待测 MR / 我的 BUG / 待回归）——server 扫描器 `mr-inbox-scanner.ts`（角色分流：fe/be 只扫我的 BUG、qa 扫待测 MR+待回归、未设全扫；10 分钟结果缓存 + single-flight）、已读标记 `mr-inbox-seen.ts`（90 天自动清）、Dock 角标 + 增量系统通知（`use-mr-inbox.tsx` 全局 store）、MR 直接合并、回归通过/打回流转（`bug-transition` route、必填字段盖不住降级 409 + 去飞书）、我的 BUG「改bug」直推（同 story 开发中任务直接推进；无任务 → 引导新建任务预填 bug 上下文、`/workitems/new?fixBug=1` 引流、创建后自动推进）。
-- **两处漏扫根因修复**：① MQL 响应 value 按 value_type 包壳、旧代码当裸值解析 → 状态全空被过滤（`readMoqlFieldValue` 解壳）；② `buildStoryUrlFromBug` 调用方/单测都在但实现没落盘（07-15 晨 typecheck 抓到、补齐）。
-- **默认飞书空间（07-15 用户拍板）**：`settings.meegleProject`（硬编码悟空产研默认、历史用户零迁移自动回落 `DEFAULT_MEEGLE_PROJECT`）；设置页飞书连接卡登录后出「默认空间」下拉；**工作台看板空间切换彻底删除**（`SPACE_KEY` localStorage 退役）、看板/收件箱都只作用于默认空间——bug 扫描 12 次 MQL→1 次（~15s→~2s）；settings PUT 检测 key 变更即作废收件箱缓存。
-- **我的 BUG 就地切状态**：状态 chip 改可点下拉（懒加载 `bug-transitions` API 拉可流转项、选中即流转、`bug-transition` 加 `action:"transition"` 分支）；chip 控件化（边框 + chevron + hover）、与待回归纯展示 chip 区分；行布局 chip 靠右、标题链接点击区收窄到文字。
-- **改bug 预置自建化 + 自愈**：fix-bug skill 从仓库内置改为启动写入 `<dataRoot>/skills/`（模板 `preset-skill-fix-bug.ts`、可删可编辑、删过不重装、与 action 记账独立）；用户可见文案统一「改bug」（已装 action label 一次性校正、常量 id 不变）；点「改bug」时 action/skill 任一缺失 → 弹「重建预置」确认、重装缺失部分后继续推进（替代旧深链降级）；删 action 确认加「同时删除 skill」勾选（`confirmWithCheckbox`）；删 skill 有挂载 action → 确认文案点名并同步删。
-- **自动更新静默化（07-15 用户拍板「一直弹烦了」）**：去掉「发现新版本」原生弹窗、只静默点亮右上角徽标；mac 后台下载暂存 / 退出自动套用 / 点徽标秒装不变；验签失败降级弹窗保留（fail-closed）。
 
 ## 关键文件索引
 

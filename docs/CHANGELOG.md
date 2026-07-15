@@ -15,6 +15,18 @@
 
 ---
 
+### 2026-07-14~15 v1.1.11 发版：提测收件箱一~三期落地 + 默认空间 + 改bug 闭环打磨
+
+> 方案设计见下段（07-14 下午拍板）；本段记落地与 07-15 当天按用户实测反馈的打磨。全程 grok 子代理实施、主线验收。
+
+- **收件箱一~三期落地**：顶栏铃铛三分组（待测 MR / 我的 BUG / 待回归）——server 扫描器 `mr-inbox-scanner.ts`（角色分流：fe/be 只扫我的 BUG、qa 扫待测 MR+待回归、未设全扫；10 分钟结果缓存 + single-flight）、已读标记 `mr-inbox-seen.ts`（90 天自动清）、Dock 角标 + 增量系统通知（`use-mr-inbox.tsx` 全局 store）、MR 直接合并、回归通过/打回流转（`bug-transition` route、必填字段盖不住降级 409 + 去飞书）、我的 BUG「改bug」直推（同 story 开发中任务直接推进；无任务 → 引导新建任务预填 bug 上下文、`/workitems/new?fixBug=1` 引流、创建后自动推进）。
+- **两处漏扫根因修复**：① MQL 响应 value 按 value_type 包壳、旧代码当裸值解析 → 状态全空被过滤（`readMoqlFieldValue` 解壳）；② `buildStoryUrlFromBug` 调用方/单测都在但实现没落盘（07-15 晨 typecheck 抓到、补齐）。
+- **默认飞书空间（07-15 用户拍板）**：`settings.meegleProject`（硬编码悟空产研默认、历史用户零迁移自动回落 `DEFAULT_MEEGLE_PROJECT`）；设置页飞书连接卡登录后出「默认空间」下拉；**工作台看板空间切换彻底删除**（`SPACE_KEY` localStorage 退役）、看板/收件箱都只作用于默认空间——bug 扫描 12 次 MQL→1 次（~15s→~2s）；settings PUT 检测 key 变更即作废收件箱缓存。
+- **我的 BUG 就地切状态**：状态 chip 改可点下拉（懒加载 `bug-transitions` API 拉可流转项、选中即流转、`bug-transition` 加 `action:"transition"` 分支）；chip 控件化（边框 + chevron + hover）、与待回归纯展示 chip 区分；行布局 chip 靠右、标题链接点击区收窄到文字。
+- **改bug 预置自建化 + 自愈**：fix-bug skill 从仓库内置改为启动写入 `<dataRoot>/skills/`（模板 `preset-skill-fix-bug.ts`、可删可编辑、删过不重装、与 action 记账独立）；用户可见文案统一「改bug」（已装 action label 一次性校正、常量 id 不变）；点「改bug」时 action/skill 任一缺失 → 弹「重建预置」确认、重装缺失部分后继续推进（替代旧深链降级）；删 action 确认加「同时删除 skill」勾选（`confirmWithCheckbox`）；删 skill 有挂载 action → 确认文案点名并同步删。
+- **自动更新静默化（07-15 用户拍板「一直弹烦了」）**：去掉「发现新版本」原生弹窗、只静默点亮右上角徽标；mac 后台下载暂存 / 退出自动套用 / 点徽标秒装不变；验签失败降级弹窗保留（fail-closed）。
+- 发版插曲：CI 首跑失败——07-14 安全批把验签改 fail-closed、但 `UPDATE_MANIFEST_PRIVATE_KEY` secret 从没配过（当日私钥没存、不可找回）。重生成密钥对（私钥落 `~/.secrets/` + 写入 GitHub secret、新公钥入库）、本地签名验签闭环验证后删 draft 重打 tag、二次 CI success。
+
 ### 2026-07-14 下午：「提测收件箱」方案拍板（已随 v1.1.11 落地）
 
 > 背景：Meegle 评论 @ 通知的服务端回归仍未修（本日实测：CLI/MCP 同后端、lark_user_id 体系 `cross tenant` 封死、user_key 体系 API 收下但私信不发；评论 HTML 注释会被服务端剥掉、藏结构化标记不可行）。用户拍板：不做 bot IM 绕行、做 app 内拉取式收件箱。

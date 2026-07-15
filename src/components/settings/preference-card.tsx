@@ -96,6 +96,13 @@ export const PreferenceSections = ({
 }: PreferenceSectionsProps) => {
   // 本机探测到的可用 IDE 集合（后端扫安装位置 + PATH）；null = 还没回来（全部可选）
   const [availableIdes, setAvailableIdes] = useState<Set<JumpIde> | null>(null);
+  // Agent shell 提速：各目标 rc 的探测结果；null = 还在请求 / 失败
+  const [shellBoostFiles, setShellBoostFiles] = useState<
+    Array<{ path: string; exists: boolean; boosted: boolean }> | null
+  >(null);
+  // 「一键优化」请求中——防双击、按钮 spinner
+  const [shellBoostBusy, setShellBoostBusy] = useState(false);
+
   useEffect(() => {
     let alive = true;
     void fetch("/api/system/ide-tools")
@@ -113,6 +120,79 @@ export const PreferenceSections = ({
       alive = false;
     };
   }, []);
+
+  // 挂载时探测 shell rc 是否已注入守卫
+  useEffect(() => {
+    let alive = true;
+    void fetch("/api/system/shell-boost")
+      .then((r) => r.json())
+      .then(
+        (data: {
+          files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
+        }) => {
+          if (!alive || !Array.isArray(data.files)) return;
+          setShellBoostFiles(data.files);
+        },
+      )
+      .catch(() => {
+        // 探测失败不挡设置页；保持 null，仍显示一键优化按钮
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 已存在的目标 rc 全部已 boosted → 显示「已优化」、隐藏按钮
+  const shellBoostDone =
+    shellBoostFiles !== null &&
+    shellBoostFiles.some((f) => f.exists) &&
+    shellBoostFiles.filter((f) => f.exists).every((f) => f.boosted);
+
+  const handleShellBoost = async () => {
+    setShellBoostBusy(true);
+    try {
+      const res = await fetch("/api/system/shell-boost", { method: "POST" });
+      const data = (await res.json()) as {
+        results?: Array<{
+          path: string;
+          action: "injected" | "already" | "missing";
+        }>;
+        message?: string;
+      };
+      if (!res.ok) {
+        toast.error(
+          `Agent shell 提速失败：${data.message ?? `HTTP ${res.status}`}`,
+        );
+        return;
+      }
+      const results = data.results ?? [];
+      const injected = results.filter((r) => r.action === "injected");
+      const already = results.filter((r) => r.action === "already");
+      if (injected.length > 0) {
+        toast.success(
+          `已写入 ${injected.map((r) => r.path).join("、")}（原文件已备份）`,
+        );
+      } else if (already.length > 0) {
+        toast.success("已是优化状态");
+      } else {
+        toast.error("Agent shell 提速失败：未找到可优化的 shell rc 文件");
+      }
+      // 刷新探测态（含刚刚注入的）
+      setShellBoostFiles(
+        results.map((r) => ({
+          path: r.path,
+          exists: r.action !== "missing",
+          boosted: r.action === "injected" || r.action === "already",
+        })),
+      );
+    } catch (err) {
+      toast.error(
+        `Agent shell 提速失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setShellBoostBusy(false);
+    }
+  };
 
   // 模板预览：示例变量实时渲染（留空 = 内置兜底）
   const preview = useMemo(
@@ -253,6 +333,28 @@ export const PreferenceSections = ({
           >
             去系统设置
           </Button>
+        }
+      />
+
+      {/* Cursor SDK shell 状态序列化膨胀的官方缓解：rc 顶插非交互守卫 */}
+      <SettingRow
+        label="Agent shell 提速"
+        hint="rc 顶部注入守卫、agent 命令跳过重型 shell 初始化"
+        control={
+          shellBoostDone ? (
+            <span className="text-sm text-muted-foreground">已优化 ✓</span>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={shellBoostBusy}
+              onClick={() => void handleShellBoost()}
+            >
+              {shellBoostBusy ? <Loader2 className="animate-spin" /> : null}
+              一键优化
+            </Button>
+          )
         }
       />
 
