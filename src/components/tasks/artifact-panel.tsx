@@ -370,6 +370,12 @@ export const ArtifactPanel = ({
   const artifactToastShownRef = useRef(false);
   // 上一帧是否已有产物内容，用于检测「从无到有」边沿
   const prevHadArtifactRef = useRef(false);
+  // 小恐龙是否在局中（onStart/onGameOver 维护）——产物到达时据此决定立即切回还是等局末
+  const gamePlayingRef = useRef(false);
+  // 产物到达时正在局中 → 记「局末自动切回」标记、Game over 时消费
+  const pendingReturnRef = useRef(false);
+  // 局末切回的延迟 timer（留 1.5s 看一眼分数）；卸载/手动切走时清理
+  const returnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // artifact 正文（异步加载）+ 文件名
   const [currentArtifact, setCurrentArtifact] = useState<{
     content: string;
@@ -433,7 +439,9 @@ export const ArtifactPanel = ({
     }
   }, [action.status, currentArtifact]);
 
-  // 产物从无到有、且用户还停在游戏视图 → 轻提示可切回（不强制切走，可能正玩得起劲）
+  // 产物从无到有、且用户还停在游戏视图 → 自动切回策略（2026-07-15 用户拍板）：
+  // - 没在局中（Game over / 没开跑）→ 直接自动切回产物
+  // - 正在局中 → 不打断、toast 带「查看产物」按钮；这局 Game over 后停 1.5s（看眼分数）自动切回
   useEffect(() => {
     const hasArtifact = !!currentArtifact;
     if (
@@ -442,11 +450,43 @@ export const ArtifactPanel = ({
       panelView === "game" &&
       !artifactToastShownRef.current
     ) {
-      toast.success("产物已生成、切回「产物」查看");
       artifactToastShownRef.current = true;
+      if (gamePlayingRef.current) {
+        pendingReturnRef.current = true;
+        toast.success("产物已生成、这局结束后自动切回", {
+          duration: 10_000,
+          action: {
+            label: "立即查看",
+            onClick: () => {
+              pendingReturnRef.current = false;
+              setPanelView("artifact");
+            },
+          },
+        });
+      } else {
+        setPanelView("artifact");
+        toast.success("产物已生成");
+      }
     }
     prevHadArtifactRef.current = hasArtifact;
   }, [currentArtifact, panelView]);
+
+  // 手动切走 / 卸载时清掉局末切回的余波（防切走后 timer 又把视图拽回来）
+  useEffect(() => {
+    if (panelView !== "game") {
+      pendingReturnRef.current = false;
+      if (returnTimerRef.current) {
+        clearTimeout(returnTimerRef.current);
+        returnTimerRef.current = null;
+      }
+    }
+  }, [panelView]);
+  useEffect(
+    () => () => {
+      if (returnTimerRef.current) clearTimeout(returnTimerRef.current);
+    },
+    [],
+  );
 
   // filename 上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
   // 卸载（selected 切到空态）时报 null、避免 Header 残留上一个产物的文件名。
@@ -788,7 +828,26 @@ export const ArtifactPanel = ({
           右侧聊天输入不受影响；切走视图组件卸载、监听随之移除 */}
       {showGame ? (
         <div className="flex flex-1 items-center justify-center overflow-y-auto px-2 py-3">
-          <DinoRunner className="w-full max-w-xl" autoFocus />
+          {/* autoStart：进游戏视图就开跑、不用先按键（action 开始即有动静）。
+              onStart/onGameOver 喂局中状态：产物到达时局中不打断、局末 1.5s 后自动切回产物 */}
+          <DinoRunner
+            className="w-full max-w-xl"
+            autoFocus
+            autoStart
+            onStart={() => {
+              gamePlayingRef.current = true;
+            }}
+            onGameOver={() => {
+              gamePlayingRef.current = false;
+              if (pendingReturnRef.current) {
+                pendingReturnRef.current = false;
+                returnTimerRef.current = setTimeout(
+                  () => setPanelView("artifact"),
+                  1500,
+                );
+              }
+            }}
+          />
         </div>
       ) : contentLoading && !currentArtifact ? (
         <LoadingState variant="block" label="加载产物…" />

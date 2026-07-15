@@ -2,12 +2,13 @@
  * GET /api/mr-inbox（?refresh=1 强制重扫）
  *
  * 分组响应：pendingMr / myBugs / pendingRegression（各条带 seenAtMs）。
- * 已读标记不进扫描缓存——每次 GET 现读 seen 文件合并。
+ * 已读 / 忽略不进扫描缓存——每次 GET 现读文件：先滤忽略、再 join seen。
  */
 
 import { NextResponse } from "next/server";
 
 import { getMrInbox } from "@/lib/server/mr-inbox-scanner";
+import { readMrInboxIgnored } from "@/lib/server/mr-inbox-ignored";
 import { readMrInboxSeen } from "@/lib/server/mr-inbox-seen";
 
 export const runtime = "nodejs";
@@ -21,7 +22,13 @@ export const GET = async (req: Request) => {
     if (result.status !== "ok") {
       return NextResponse.json(result);
     }
-    const seen = await readMrInboxSeen();
+    // 读缓存后再滤忽略（双保险：ignore 路由已剔缓存，这里兜住漏网 / 并发窗口）
+    const [seen, ignored] = await Promise.all([
+      readMrInboxSeen(),
+      readMrInboxIgnored(),
+    ]);
+    const notIgnored = <T>(items: T[], keyOf: (it: T) => string): T[] =>
+      items.filter((it) => !ignored[keyOf(it)]);
     const withSeen = <T extends { mrUrl?: string; bugUrl?: string }>(
       items: T[],
       keyOf: (it: T) => string,
@@ -33,9 +40,18 @@ export const GET = async (req: Request) => {
 
     return NextResponse.json({
       status: "ok",
-      pendingMr: withSeen(result.pendingMr, (it) => it.mrUrl),
-      myBugs: withSeen(result.myBugs, (it) => it.bugUrl),
-      pendingRegression: withSeen(result.pendingRegression, (it) => it.bugUrl),
+      pendingMr: withSeen(
+        notIgnored(result.pendingMr, (it) => it.mrUrl),
+        (it) => it.mrUrl,
+      ),
+      myBugs: withSeen(
+        notIgnored(result.myBugs, (it) => it.bugUrl),
+        (it) => it.bugUrl,
+      ),
+      pendingRegression: withSeen(
+        notIgnored(result.pendingRegression, (it) => it.bugUrl),
+        (it) => it.bugUrl,
+      ),
       scannedAt: result.scannedAt,
       gitTokenConfigured: result.gitTokenConfigured,
     });

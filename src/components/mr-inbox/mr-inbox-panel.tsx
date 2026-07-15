@@ -16,6 +16,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ExternalLink,
+  EyeOff,
   GitMerge,
   Inbox,
   RefreshCw,
@@ -170,9 +171,47 @@ const SeenToggle = ({
   </Button>
 );
 
+/** 忽略按钮（与标已读同排同款 ghost；二次确认在调用方） */
+const IgnoreButton = ({ onIgnore }: { onIgnore: () => void }) => (
+  <Button
+    variant="ghost"
+    size="sm"
+    className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+    onClick={onIgnore}
+  >
+    <EyeOff className="size-3" />
+    忽略
+  </Button>
+);
+
+/** 三组行共用：确认 → ignoreItem → toast */
+const useIgnoreHandler = (url: string) => {
+  const { ignoreItem } = useMrInbox();
+  const { confirm } = useDialog();
+  return async () => {
+    const ok = await confirm({
+      title: "忽略此条？",
+      description: "忽略后不再出现在收件箱。",
+      destructive: true,
+      confirmLabel: "忽略",
+    });
+    if (!ok) return;
+    try {
+      await ignoreItem(url);
+      toast.success("已忽略");
+    } catch (err) {
+      toast.error(
+        `忽略失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+};
+
 const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
   const { data, setSeen, mergeMr } = useMrInbox();
   const { confirm } = useDialog();
+  const handleIgnore = useIgnoreHandler(entry.mrUrl);
+  // 合并请求进行中（按钮 disabled + 转圈）
   const [merging, setMerging] = useState(false);
   const unread = entry.seenAtMs === null;
 
@@ -272,6 +311,7 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
           unread={unread}
           onToggle={() => void setSeen(entry.mrUrl, unread)}
         />
+        <IgnoreButton onIgnore={() => void handleIgnore()} />
         {data?.gitTokenConfigured && entry.mr?.mergeable && (
           <Button
             variant="ghost"
@@ -305,6 +345,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const { tasks } = useTaskList();
   const { confirm } = useDialog();
   const router = useRouter();
+  const handleIgnore = useIgnoreHandler(entry.bugUrl);
   // 推进请求进行中（按钮 disabled + 转圈、防双击）
   const [fixing, setFixing] = useState(false);
   // 状态流转进行中（chip 转圈、防双击）
@@ -567,6 +608,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           unread={unread}
           onToggle={() => void setSeen(entry.bugUrl, unread)}
         />
+        <IgnoreButton onIgnore={() => void handleIgnore()} />
       </div>
     </li>
   );
@@ -576,6 +618,8 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
 const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const { setSeen, transitionBug } = useMrInbox();
   const { confirm, prompt } = useDialog();
+  const handleIgnore = useIgnoreHandler(entry.bugUrl);
+  // pass / reject 进行中（哪个按钮 busy）
   const [busy, setBusy] = useState<"pass" | "reject" | null>(null);
   const unread = entry.seenAtMs === null;
 
@@ -700,6 +744,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           unread={unread}
           onToggle={() => void setSeen(entry.bugUrl, unread)}
         />
+        <IgnoreButton onIgnore={() => void handleIgnore()} />
       </div>
     </li>
   );

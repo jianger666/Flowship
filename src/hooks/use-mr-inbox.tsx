@@ -90,6 +90,8 @@ interface MrInboxContextValue {
   /** 标已读（url = mrUrl 或 bugUrl） */
   setSeen: (url: string, seen: boolean) => Promise<void>;
   mergeMr: (mrUrl: string) => Promise<void>;
+  /** 忽略条目（url = mrUrl 或 bugUrl）：从三组永久移除 */
+  ignoreItem: (url: string) => Promise<void>;
   /** 懒加载某 bug 当前可流转目标 */
   listBugTransitions: (input: {
     projectKey: string;
@@ -253,6 +255,37 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
         ? {
             ...prev,
             pendingMr: prev.pendingMr.filter((it) => it.mrUrl !== mrUrl),
+          }
+        : prev,
+    );
+  }, []);
+
+  /** 忽略：POST 成功后从三组都 filter 掉该 url（乐观：先请求再本地移除，对齐 transitionBug） */
+  const ignoreItem = useCallback(async (url: string) => {
+    const res = await fetch("/api/mr-inbox/ignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            pendingMr: prev.pendingMr.filter((it) => it.mrUrl !== url),
+            myBugs: prev.myBugs.filter((it) => it.bugUrl !== url),
+            pendingRegression: prev.pendingRegression.filter(
+              (it) => it.bugUrl !== url,
+            ),
           }
         : prev,
     );
@@ -429,6 +462,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       refresh,
       setSeen,
       mergeMr,
+      ignoreItem,
       listBugTransitions,
       transitionBug,
     }),
@@ -439,6 +473,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       refresh,
       setSeen,
       mergeMr,
+      ignoreItem,
       listBugTransitions,
       transitionBug,
     ],

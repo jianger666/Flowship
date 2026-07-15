@@ -233,6 +233,8 @@ export interface DinoRunnerProps {
    */
   captureGlobalKeys?: boolean;
   persistHighScore?: boolean | string;
+  /** 挂载即自动开跑（等待视图场景：action 一开始游戏就动起来、不用先按键） */
+  autoStart?: boolean;
   onScoreChange?: (score: number) => void;
   onGameOver?: (r: { score: number; won: boolean }) => void;
   onStart?: () => void;
@@ -249,6 +251,7 @@ export function DinoRunner({
   autoFocus = true,
   captureGlobalKeys = true,
   persistHighScore = true,
+  autoStart = false,
   onScoreChange,
   onGameOver,
   onStart,
@@ -704,6 +707,12 @@ export function DinoRunner({
   React.useEffect(() => {
     if (autoFocus) wrapperRef.current?.focus();
   }, [autoFocus]);
+
+  // ---- autostart：挂载即开跑（只在初始 idle 时触发一次、game over 后不自动重开）----
+  React.useEffect(() => {
+    if (autoStart && statusRef.current === "idle") start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载时判断一次、start 引用稳定
+  }, []);
 
   return (
     <div
