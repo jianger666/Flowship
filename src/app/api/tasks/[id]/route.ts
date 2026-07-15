@@ -24,7 +24,10 @@ import {
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
-import { waitForTaskToStop } from "@/lib/server/task-stream";
+import {
+  pendingStopRequests,
+  waitForTaskToStop,
+} from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import type { ModelSelection } from "@/lib/types";
@@ -231,6 +234,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
     await waitForTaskToStop(id, 8000);
     await waitForChatToStop(id, 8000);
+    // 防泄漏：idle 删除时 cancelTaskRun 也会写入 pending（无 runningTasks）、删完清掉
+    pendingStopRequests.delete(id);
     const ok = await deleteTask(id);
     if (!ok) return NextResponse.json({ error: "not_found" }, { status: 404 });
     return NextResponse.json({ ok: true });

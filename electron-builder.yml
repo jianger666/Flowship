@@ -88,8 +88,10 @@ dmg:
 
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
 # releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset
+# 2026-07-15 仓库改名 fe-ai-flow → Flowship（GitHub 对旧名保留重定向、存量老版本自更新不受影响；
+# ⚠️ 永远别再新建名为 fe-ai-flow 的仓库、会顶掉重定向）。appId / artifactName / 数据目录名不跟着改。
 publish:
   provider: github
   owner: jianger666
-  repo: fe-ai-flow
+  repo: Flowship
   releaseType: release

@@ -166,12 +166,13 @@ const SettingsPage = () => {
     return () => observer.disconnect();
   }, [loaded]);
 
-  // 组卡外层包稳定 id + 锚点高亮 ring；scroll-mt 给 sticky 顶栏留出定位余量
+  // 组卡外层包稳定 id + 锚点高亮 ring；scroll-mt 要 ≥ sticky 返回顶栏高度（~7rem）、
+  // 否则锚点定位后卡片标题被浮顶盖住
   const wrapCard = (focus: string, node: ReactNode) => (
     <div
       id={`card-${focus}`}
       className={cn(
-        "scroll-mt-6 rounded-xl transition-shadow duration-300",
+        "scroll-mt-28 rounded-xl transition-shadow duration-300",
         highlightId === `card-${focus}` && "ring-2 ring-primary/60",
       )}
     >
@@ -221,8 +222,10 @@ const SettingsPage = () => {
 
       {/* 右侧内容列（保持长滚动） */}
       <div className="min-w-0 max-w-3xl flex-1 space-y-6">
-        {/* 顶部返回链接 + 页标题 */}
-        <div>
+        {/* 顶部返回链接 + 页标题——sticky 浮顶：长页滚到底也能一眼找到回去的路
+            （2026-07-15 用户反馈「滚到下边不知道怎么回去」）。
+            -mt-8/pt-8 抵消容器 py-8：吸附时盖住上方 32px 滚动区、自然位置不变不跳动 */}
+        <div className="sticky top-0 z-20 -mx-2 -mt-8 bg-background/95 px-2 pb-3 pt-8 backdrop-blur">
           <Button
             variant="ghost"
             size="sm"

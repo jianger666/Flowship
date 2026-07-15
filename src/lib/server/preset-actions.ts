@@ -7,7 +7,7 @@
  * - 未记过且不存在 → 写入预置 + 记装过
  *
  * action / skill 记账互相独立：删 skill 不重装、删 action 不重装。
- * 用户主动点「改bug」发现缺失时走 `reinstallBuiltinFixBugPreset`（跳记账早退）。
+ * 用户主动点「改bug」发现缺失时走 `reinstallBuiltinFixBugPreset`（跳记账早退、恢复出厂）。
  */
 
 import { promises as fs } from "node:fs";
@@ -18,15 +18,17 @@ import {
   BUILTIN_FIX_BUG_SKILL,
   BUILTIN_FIX_BUG_SKILL_PRESET_ID,
 } from "@/lib/mr-inbox";
-import { writeAppSkill } from "./app-skills";
+import { isFixBugPresetUsable } from "@/lib/fix-bug-preset-usable";
+import { listSkillsWithSource, writeAppSkill } from "./app-skills";
 import {
   ensureCustomActionById,
   getCustomAction,
+  removeCustomAction,
   updateCustomAction,
 } from "./custom-action-fs";
 import { dataRoot, writePrivateFileAtomic } from "./data-root";
 import { PRESET_FIX_BUG_SKILL_CONTENT } from "./preset-skill-fix-bug";
-import { getAppSkillsDir } from "./skills-loader";
+import { findSkillByName, getAppSkillsDir } from "./skills-loader";
 
 const presetsFilePath = (): string =>
   path.join(dataRoot(), "presets-installed.json");
@@ -90,6 +92,7 @@ const FIX_BUG_ACTION_INPUT = {
 /**
  * 确保「改bug」skill 已装到 app 自管目录。
  * 默认：记账早退（用户删过不重装）；skipLedger：目录缺失才写模板、已有不覆盖。
+ * （启动路径专用；用户点重建走 `reinstallBuiltinFixBugPreset`，不看目录只看可见性。）
  */
 const ensureBuiltinFixBugSkill = async (
   opts?: EnsureOpts,
@@ -179,10 +182,72 @@ export const ensureBuiltinFixBugPreset = async (): Promise<void> => {
 };
 
 /**
- * 用户主动重装「改bug」预置（跳过记账早退）。
- * skill / action 各自：缺失才写模板、已有不覆盖；装完刷新两条记账时间戳。
+ * 覆盖写出厂「改bug」action 壳。
+ * `ensureCustomActionById` 是「存在即跳过」——重建要覆盖、不能用它当唯一写口；
+ * legacy 也不能走 update（会抛），先删再 ensure。
+ */
+const writeFixBugActionFactoryShell = async (): Promise<void> => {
+  const existing = await getCustomAction(BUILTIN_FIX_BUG_ACTION_ID);
+  if (existing?.legacyPlaybook) {
+    await removeCustomAction(BUILTIN_FIX_BUG_ACTION_ID);
+    await ensureCustomActionById(BUILTIN_FIX_BUG_ACTION_ID, {
+      ...FIX_BUG_ACTION_INPUT,
+    });
+    return;
+  }
+  if (existing) {
+    // 覆盖语义：把 label / skill / placeholder / output 恢复出厂
+    await updateCustomAction(BUILTIN_FIX_BUG_ACTION_ID, {
+      ...FIX_BUG_ACTION_INPUT,
+    });
+    return;
+  }
+  await ensureCustomActionById(BUILTIN_FIX_BUG_ACTION_ID, {
+    ...FIX_BUG_ACTION_INPUT,
+  });
+};
+
+/**
+ * 用户主动重装「改bug」预置（仅 confirm 弹窗确认后调用、覆盖语义成立）。
+ *
+ * 事故背景（Windows 用户诊断日志实锤）：旧逻辑用「目录存在」判 skill 是否装好——
+ * 用户改了 SKILL.md frontmatter name、或删了 SKILL.md 留空目录后，目录仍在 →
+ * 重建跳过不写；但客户端按「列表有 name=fix-bug」判不可用 → 点重建永远无效、死循环。
+ * **目录存在 ≠ skill 可见**——重建必须走 skills 加载链（findSkillByName / listSkillsWithSource）。
+ *
+ * 判定口径与客户端 `isFixBugPresetUsable` / `launchFixBugAdvance` 一致：
+ * - skill：`name=fix-bug` 不可见 → 覆盖写模板（目录在也写 SKILL.md）；可见则尊重用户改过的内容
+ * - action：四条不全满足 → 整体写出厂壳；全满足则保留（含挂自定义 skill 的合法场景）
  */
 export const reinstallBuiltinFixBugPreset = async (): Promise<void> => {
-  await ensureBuiltinFixBugSkill({ skipLedger: true });
-  await ensureBuiltinFixBugAction({ skipLedger: true });
+  // skill：用加载链判可见性，不可见就覆盖写（哪怕空目录还在）
+  const fixBugVisible = await findSkillByName(BUILTIN_FIX_BUG_SKILL);
+  if (!fixBugVisible) {
+    const failure = await writeAppSkill(
+      BUILTIN_FIX_BUG_SKILL,
+      PRESET_FIX_BUG_SKILL_CONTENT,
+    );
+    if (failure) throw new Error(failure);
+    console.log(`[presets] 已恢复出厂 skill：${BUILTIN_FIX_BUG_SKILL}`);
+  }
+
+  // action：与客户端同一套 isFixBugPresetUsable（挂载 skill 必须可见）
+  const existing = await getCustomAction(BUILTIN_FIX_BUG_ACTION_ID);
+  const visibleNames = new Set(
+    (await listSkillsWithSource()).map((s) => s.name),
+  );
+  const usable = isFixBugPresetUsable({
+    action: existing,
+    visibleSkillNames: visibleNames,
+  });
+  if (!usable) {
+    await writeFixBugActionFactoryShell();
+    console.log(
+      `[presets] 已恢复出厂 custom action：${BUILTIN_FIX_BUG_ACTION_ID}`,
+    );
+  }
+
+  // 两条记账时间戳照旧刷新
+  await markPresetInstalled(BUILTIN_FIX_BUG_SKILL_PRESET_ID, { refresh: true });
+  await markPresetInstalled(BUILTIN_FIX_BUG_ACTION_ID, { refresh: true });
 };

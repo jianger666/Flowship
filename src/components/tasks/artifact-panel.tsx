@@ -28,9 +28,11 @@ import {
   ChevronDown,
   ChevronUp,
   FileText,
+  Gamepad2,
   Info,
   Layers,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   Streamdown,
   defaultRemarkPlugins,
@@ -113,6 +115,16 @@ const ArtifactRevisionView = dynamic(
   {
     ssr: false,
     loading: () => <LoadingState variant="block" label="加载修订…" />,
+  },
+);
+
+// 恐龙快跑懒加载：内联 canvas 引擎较重、且只要客户端；不拖任务页首屏
+const DinoRunner = dynamic(
+  () =>
+    import("@/components/games/dino-runner").then((m) => m.DinoRunner),
+  {
+    ssr: false,
+    loading: () => <LoadingState variant="block" label="加载游戏…" />,
   },
 );
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
@@ -348,6 +360,16 @@ export const ArtifactPanel = ({
   );
 
   const [revisionOn, setRevisionOn] = useState(false); // 修订开关：开则正文变内联修订视图
+  // 产物 / 游戏视图：推进中无产物时自动进游戏，也可随时手动切换摸鱼
+  const [panelView, setPanelView] = useState<"artifact" | "game">(() =>
+    action.status === "running" ? "game" : "artifact",
+  );
+  // 本 action 是否已做过「自动进游戏」——用户手动切回产物后不再强拉回游戏
+  const autoGameAppliedRef = useRef(false);
+  // 本 action 是否已提示过「产物已生成」——从无到有只 toast 一次
+  const artifactToastShownRef = useRef(false);
+  // 上一帧是否已有产物内容，用于检测「从无到有」边沿
+  const prevHadArtifactRef = useRef(false);
   // artifact 正文（异步加载）+ 文件名
   const [currentArtifact, setCurrentArtifact] = useState<{
     content: string;
@@ -381,6 +403,9 @@ export const ArtifactPanel = ({
   const hitIndexRef = useRef(-1);
   // 修订正文滚动容器（跳转 scrollIntoView 用）
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 切 action 时读最新 status（不把 status 放进 reset effect 依赖，避免交卷后强切视图）
+  const actionStatusRef = useRef(action.status);
+  actionStatusRef.current = action.status;
 
   // action 维度的「已看」状态：进 action 时读、切 action 时重置
   useEffect(() => {
@@ -390,7 +415,38 @@ export const ArtifactPanel = ({
     setDiffError(null);
     setRevisionStats(null);
     hitIndexRef.current = -1;
+    // 切 action（或 remount）按自动规则重算默认视图：running → 先默认游戏（等待产物）
+    autoGameAppliedRef.current = false;
+    artifactToastShownRef.current = false;
+    prevHadArtifactRef.current = false;
+    const defaultGame = actionStatusRef.current === "running";
+    setPanelView(defaultGame ? "game" : "artifact");
+    if (defaultGame) autoGameAppliedRef.current = true;
   }, [taskId, action.id]);
+
+  // 同 action 内：推进刚变为 running 且还没有产物 → 自动切到游戏（只自动一次）
+  useEffect(() => {
+    if (autoGameAppliedRef.current) return;
+    if (action.status === "running" && !currentArtifact) {
+      setPanelView("game");
+      autoGameAppliedRef.current = true;
+    }
+  }, [action.status, currentArtifact]);
+
+  // 产物从无到有、且用户还停在游戏视图 → 轻提示可切回（不强制切走，可能正玩得起劲）
+  useEffect(() => {
+    const hasArtifact = !!currentArtifact;
+    if (
+      hasArtifact &&
+      !prevHadArtifactRef.current &&
+      panelView === "game" &&
+      !artifactToastShownRef.current
+    ) {
+      toast.success("产物已生成、切回「产物」查看");
+      artifactToastShownRef.current = true;
+    }
+    prevHadArtifactRef.current = hasArtifact;
+  }, [currentArtifact, panelView]);
 
   // filename 上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
   // 卸载（selected 切到空态）时报 null、避免 Header 残留上一个产物的文件名。
@@ -584,37 +640,47 @@ export const ArtifactPanel = ({
   ) : null;
 
   // ---- 渲染 ----
-  if (contentLoading && !currentArtifact) {
+  // 整页 loading：仅「产物」视图且尚无内容、且不是推进中（推进中默认游戏，不挡开玩）
+  if (
+    contentLoading &&
+    !currentArtifact &&
+    panelView === "artifact" &&
+    action.status !== "running"
+  ) {
     return <LoadingState variant="block" label="加载产物…" />;
-  }
-
-  if (!currentArtifact) {
-    return (
-      <div className="flex h-full flex-col">
-        {postCheckBanner && (
-          <div className="shrink-0 px-6 pt-4">{postCheckBanner}</div>
-        )}
-        <div className="flex flex-1 items-center justify-center px-6 text-center">
-          <div className="text-sm text-muted-foreground">
-            <div className="mb-2 flex justify-center">
-              <FileText className="size-8 opacity-40" />
-            </div>
-            {action.status === "running"
-              ? `${actionTitle} 正在生成产物…`
-              : `${actionTitle} 没有产物`}
-          </div>
-        </div>
-      </div>
-    );
   }
 
   const totalRevisions = revisions.length;
   const canRevise = totalRevisions > 0;
+  const showGame = panelView === "game";
 
   return (
     <div className="flex h-full flex-col">
-      {/* toolbar */}
-      <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-b px-4 text-xs">
+      {/* toolbar：左视图切换 / 右修订（跟修订同栏、切换别抢戏） */}
+      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-4 text-xs">
+        <div className="flex items-center gap-0.5">
+          <ChoiceButton
+            shape="tab"
+            selected={panelView === "artifact"}
+            onClick={() => setPanelView("artifact")}
+            title="查看产物"
+            className="inline-flex items-center gap-1"
+          >
+            <FileText className="size-3.5" />
+            产物
+          </ChoiceButton>
+          <ChoiceButton
+            shape="tab"
+            selected={panelView === "game"}
+            onClick={() => setPanelView("game")}
+            title="恐龙快跑"
+            className="inline-flex items-center gap-1"
+          >
+            <Gamepad2 className="size-3.5" />
+            等待
+          </ChoiceButton>
+        </div>
+
         <div className="flex shrink-0 items-center gap-1">
           <ChoiceButton
             shape="tab"
@@ -716,111 +782,141 @@ export const ArtifactPanel = ({
         </div>
       </div>
 
-      {/* content area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto">
-        <div className="px-6 py-4">
-          {/* 有产物时也显示：检查失败可能是必备段缺失等其它原因、不只是「没落盘」 */}
-          {postCheckBanner && <div className="mb-3">{postCheckBanner}</div>}
-          {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
-          {action.type === "plan" &&
-            action.replanMode &&
-            priorPlans &&
-            priorPlans.length > 0 && (
-              <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
-                <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
-                  <Layers className="size-3.5 shrink-0" />
+      {/* 游戏视图：贴面板背景；少 padding 避免再套一层「卡片感」。
+          captureGlobalKeys 默认开：按键不要求焦点停在游戏小框上（点了页面别处也能跳、
+          2026-07-15 用户反馈「焦点只有那么点」）；组件内部已忽略 input/textarea 的按键、
+          右侧聊天输入不受影响；切走视图组件卸载、监听随之移除 */}
+      {showGame ? (
+        <div className="flex flex-1 items-center justify-center overflow-y-auto px-2 py-3">
+          <DinoRunner className="w-full max-w-xl" autoFocus />
+        </div>
+      ) : contentLoading && !currentArtifact ? (
+        <LoadingState variant="block" label="加载产物…" />
+      ) : !currentArtifact ? (
+        <div className="flex flex-1 flex-col">
+          {postCheckBanner && (
+            <div className="shrink-0 px-6 pt-4">{postCheckBanner}</div>
+          )}
+          <div className="flex flex-1 items-center justify-center px-6 text-center">
+            <div className="text-sm text-muted-foreground">
+              <div className="mb-2 flex justify-center">
+                <FileText className="size-8 opacity-40" />
+              </div>
+              {action.status === "running"
+                ? `${actionTitle} 正在生成产物…`
+                : `${actionTitle} 没有产物`}
+            </div>
+          </div>
+        </div>
+      ) : (
+        /* content area */
+        <div ref={scrollRef} className="flex-1 overflow-y-auto">
+          <div className="px-6 py-4">
+            {/* 有产物时也显示：检查失败可能是必备段缺失等其它原因、不只是「没落盘」 */}
+            {postCheckBanner && <div className="mb-3">{postCheckBanner}</div>}
+            {/* V0.8.x：追加 / 重建 plan——顶部给前序方案跳转入口、解决「只见增量、总览难」 */}
+            {action.type === "plan" &&
+              action.replanMode &&
+              priorPlans &&
+              priorPlans.length > 0 && (
+                <div className="mb-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
+                    <Layers className="size-3.5 shrink-0" />
+                    <span>
+                      本方案在以下方案基础上
+                      {action.replanMode === "append"
+                        ? "追加补充需求"
+                        : "重建后续"}
+                      、点开可回看完整方案
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {priorPlans.map((p) => (
+                      <button
+                        key={p.n}
+                        type="button"
+                        onClick={() =>
+                          onArtifactRefClick?.({ n: p.n, type: "plan" })
+                        }
+                        className="rounded border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:border-primary hover:text-primary"
+                      >
+                        方案 #{p.n}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            {/* V0.6.24 (A')：plan 没拆批次时显式提示——这里用全量有效批次判空（不是单 action
+                delta）、避免「追加 plan 自己没上报批次、但 task 其实有批次」时误显示未分批 */}
+            {action.type === "plan" &&
+              (!effectiveBatches || effectiveBatches.length === 0) && (
+                <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
+                  <Info className="size-3.5 shrink-0" />
                   <span>
-                    本方案在以下方案基础上
-                    {action.replanMode === "append" ? "追加补充需求" : "重建后续"}
-                    、点开可回看完整方案
+                    本方案未分批（单次 build）· 大需求可「再聊聊」让 AI 拆批次
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {priorPlans.map((p) => (
-                    <button
-                      key={p.n}
-                      type="button"
-                      onClick={() =>
-                        onArtifactRefClick?.({ n: p.n, type: "plan" })
-                      }
-                      className="rounded border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:border-primary hover:text-primary"
-                    >
-                      方案 #{p.n}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          {/* V0.6.24 (A')：plan 没拆批次时显式提示——这里用全量有效批次判空（不是单 action
-              delta）、避免「追加 plan 自己没上报批次、但 task 其实有批次」时误显示未分批 */}
-          {action.type === "plan" &&
-            (!effectiveBatches || effectiveBatches.length === 0) && (
-              <div className="mb-3 flex items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground">
-                <Info className="size-3.5 shrink-0" />
-                <span>
-                  本方案未分批（单次 build）· 大需求可「再聊聊」让 AI 拆批次
-                </span>
-              </div>
-            )}
+              )}
 
-          {revisionOn ? (
-            diffLoading ? (
-              <LoadingState variant="block" label="加载修订…" />
-            ) : diffError ? (
-              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
-                <p className="text-sm text-muted-foreground">
-                  加载修订失败：{diffError}
-                </p>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleDiffRetry}
-                >
-                  重试
-                </Button>
-              </div>
-            ) : diffData ? (
-              <ArtifactRevisionView
-                oldMd={diffData.from.content}
-                newMd={diffData.to.content}
-                baseComponents={markdownComponents}
-                onStatsChange={handleRevisionStatsChange}
-              />
+            {revisionOn ? (
+              diffLoading ? (
+                <LoadingState variant="block" label="加载修订…" />
+              ) : diffError ? (
+                <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    加载修订失败：{diffError}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleDiffRetry}
+                  >
+                    重试
+                  </Button>
+                </div>
+              ) : diffData ? (
+                <ArtifactRevisionView
+                  oldMd={diffData.from.content}
+                  newMd={diffData.to.content}
+                  baseComponents={markdownComponents}
+                  onStatsChange={handleRevisionStatsChange}
+                />
+              ) : (
+                <LoadingState variant="block" label="加载修订…" />
+              )
             ) : (
-              <LoadingState variant="block" label="加载修订…" />
-            )
-          ) : (
-            <>
-              {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
-                  让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
-                  （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
-              <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
-                <Streamdown
-                  mode="static"
-                  shikiTheme={ARTIFACT_SHIKI_THEME}
-                  plugins={ARTIFACT_STREAMDOWN_PLUGINS}
-                  remarkPlugins={ARTIFACT_REMARK_PLUGINS}
-                  components={markdownComponents}
-                  controls={STREAMDOWN_CONTROLS}
-                >
-                  {currentArtifact.content}
-                </Streamdown>
-              </div>
-              {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
-                  追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
-              {action.type === "plan" &&
-                effectiveBatches &&
-                effectiveBatches.length > 0 && (
-                  <BatchPlanTable
-                    batches={effectiveBatches}
-                    currentActionN={action.n}
-                  />
-                )}
-            </>
-          )}
+              <>
+                {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
+                    让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
+                    （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
+                <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
+                  <Streamdown
+                    mode="static"
+                    shikiTheme={ARTIFACT_SHIKI_THEME}
+                    plugins={ARTIFACT_STREAMDOWN_PLUGINS}
+                    remarkPlugins={ARTIFACT_REMARK_PLUGINS}
+                    components={markdownComponents}
+                    controls={STREAMDOWN_CONTROLS}
+                  >
+                    {currentArtifact.content}
+                  </Streamdown>
+                </div>
+                {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
+                    追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
+                {action.type === "plan" &&
+                  effectiveBatches &&
+                  effectiveBatches.length > 0 && (
+                    <BatchPlanTable
+                      batches={effectiveBatches}
+                      currentActionN={action.n}
+                    />
+                  )}
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/card";
 import { useDialog } from "@/hooks/use-dialog";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
+import { findUnknownPlaceholders } from "@/lib/branch-template";
 import { pickNativePaths } from "@/lib/native-picker";
 import { isAbsolutePathLike, pathBasename } from "@/lib/path-utils";
 
@@ -114,6 +115,20 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
     onChange(repos.map((r) => (r.path === path ? { ...r, [field]: value } : r)));
   };
   const onRepoFieldBlur = () => {
+    onCommit(repos);
+  };
+
+  // 分支模板覆盖：失焦落盘前拦未知占位符（与全局模板同一套规则、输入中不打扰）
+  const onBranchTemplateBlur = (path: string) => {
+    const tpl =
+      repos.find((r) => r.path === path)?.branchTemplate ?? "";
+    const unknown = findUnknownPlaceholders(tpl);
+    if (unknown.length > 0) {
+      toast.error(
+        `模板含未知占位符 ${unknown.join("、")}——日期请用 {date:yyMMdd}`,
+      );
+      return;
+    }
     onCommit(repos);
   };
 
@@ -277,7 +292,7 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         onChange={(e) =>
                           setRepoField(r.path, "branchTemplate", e.target.value)
                         }
-                        onBlur={onRepoFieldBlur}
+                        onBlur={() => onBranchTemplateBlur(r.path)}
                         placeholder="留空用全局默认"
                         title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
                         className="font-mono text-xs"

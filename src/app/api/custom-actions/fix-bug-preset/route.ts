@@ -2,8 +2,9 @@
  * POST /api/custom-actions/fix-bug-preset
  *   → 用户主动重装出厂「改bug」预置（skill + action）
  *
- * 跳过 presets-installed 记账早退：缺失才写、已有不覆盖，然后刷新两条记账时间戳。
- * 给收件箱 / 新建页「改bug」发现预置被删后的二次确认用。
+ * 跳过 presets-installed 记账早退；按「skill 可见 / action 可用」判定，
+ * 不可用则覆盖恢复出厂（目录存在≠可见，见 reinstallBuiltinFixBugPreset 注释）。
+ * 给收件箱 / 新建页「改bug」发现预置不可用后的二次确认用。
  */
 
 import { NextResponse } from "next/server";

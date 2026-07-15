@@ -102,12 +102,19 @@ interface TaskRunnerGlobalState {
   forkPendingTasks: Set<string>;
   // V0.8.18：taskId → 正在后台跑的后置 check（一个 task 同时只一个、新的顶旧的）
   runningChecks: Map<string, RunningCheck>;
+  // 启动窗口「停止」竞态：Agent.create → 首条 send 返回并 runningTasks.set 之前，
+  // cancelTaskRun 查不到活 run（rec.cancel 没人调）、closeTaskSession 也杀不掉飞行中的
+  // send——若不记标记，UI 已标 cancelled/idle 但 agent 仍会注册进 runningTasks 继续跑
+  // （线上实锤停后又跑数分钟）。只在「无 runningTasks entry」时由 cancelTaskRun 写入；
+  // 新推进起跑时清掉（旧停止意图作废）；create 后 / consume 前各查一次消费。
+  pendingStopRequests: Set<string>;
 }
 
+// V5：2026-07-15 加 pendingStopRequests（停止按钮 vs 启动窗口竞态）
 // V4：2026-07-07 V0.11 加 agentSessions（wait 退役、agent 会话跨 run 存活）
 // V3：2026-06-22 V0.8.18 加 runningChecks（后置 check 异步化、bump 防 dev hot reload 拿到旧 state 缺字段）
 // V2：2026-05-27 V0.6 上线、bump 版本号防 dev hot reload 拿到 V0.5 残留 state
-const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV4__";
+const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV5__";
 
 const getRunnerState = (): TaskRunnerGlobalState => {
   const g = globalThis as unknown as Record<
@@ -121,6 +128,7 @@ const getRunnerState = (): TaskRunnerGlobalState => {
       subscribers: new Map(),
       forkPendingTasks: new Set(),
       runningChecks: new Map(),
+      pendingStopRequests: new Set(),
     };
   }
   return g[TASK_RUNNER_GLOBAL_KEY]!;
@@ -131,6 +139,7 @@ export const agentSessions = getRunnerState().agentSessions;
 const subscribers = getRunnerState().subscribers;
 export const forkPendingTasks = getRunnerState().forkPendingTasks;
 export const runningChecks = getRunnerState().runningChecks;
+export const pendingStopRequests = getRunnerState().pendingStopRequests;
 
 // ----------------- publish / subscribe -----------------
 
@@ -212,6 +221,7 @@ export const waitForTaskToStop = async (
 export const forceClearStaleRunnerState = (taskId: string): void => {
   runningTasks.delete(taskId);
   forkPendingTasks.delete(taskId);
+  pendingStopRequests.delete(taskId);
   // V0.11：连会话一起强清（agent close 尽力而为）
   const session = agentSessions.get(taskId);
   if (session) {

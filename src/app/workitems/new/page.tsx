@@ -63,7 +63,8 @@ const ManualLaunchInner = () => {
         if (result.kind === "missing-preset") {
           const ok = await confirm({
             title: "重建「改bug」预置？",
-            description: "改bug 的 action 或 skill 已被删除。重建后继续推进。",
+            description:
+              "改bug 预置不可用。重建将恢复出厂版本（覆盖对该 action 的修改）并继续推进。",
             confirmLabel: "重建并继续",
           });
           if (!ok) {

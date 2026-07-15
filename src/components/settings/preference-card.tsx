@@ -12,6 +12,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +26,10 @@ import {
 } from "@/components/ui/select";
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
-import { renderBranchName } from "@/lib/branch-template";
+import {
+  findUnknownPlaceholders,
+  renderBranchName,
+} from "@/lib/branch-template";
 import { openSystemNotificationSettings } from "@/lib/shell-notify";
 import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
 import {
@@ -268,7 +272,17 @@ export const PreferenceSections = ({
           <Input
             value={branchTemplate}
             onChange={(e) => onBranchTemplateChange(e.target.value)}
-            onBlur={() => onBranchTemplateCommit(branchTemplate)}
+            onBlur={() => {
+              // 失焦才校验：拦 `{yyMMdd}` 这类 typo（正确 `{date:yyMMdd}`），避免落盘后建出字面分支
+              const unknown = findUnknownPlaceholders(branchTemplate);
+              if (unknown.length > 0) {
+                toast.error(
+                  `模板含未知占位符 ${unknown.join("、")}——日期请用 {date:yyMMdd}`,
+                );
+                return;
+              }
+              onBranchTemplateCommit(branchTemplate);
+            }}
             placeholder="留空默认 feature/{storyId}-{taskTitle}（想带名字直接写、如 feature/clj/…）"
             className="font-mono"
           />

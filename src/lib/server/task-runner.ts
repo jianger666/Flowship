@@ -95,6 +95,7 @@ import {
   agentSessions,
   forceClearStaleRunnerState,
   forkPendingTasks,
+  pendingStopRequests,
   publish,
   runningChecks,
   runningTasks,
@@ -242,11 +243,19 @@ const SESSION_SWEEPER_KEY = "__feAiFlowSessionSweeperV1__";
 
 /**
  * 停止 task：取消活 run（如有）+ 关会话。
- * @returns 是否有活的 run / 会话被停掉
+ * 启动窗口（runningTasks 尚未 set）点停止时记入 pendingStopRequests，
+ * 由 internalStartAgent / consumeSessionRun 在 create/send 后自裁——否则
+ * closeTaskSession 杀不掉飞行中的 send，agent 仍会注册并继续跑。
+ * @returns 是否有活的 run / 会话被停掉（pending 标记不计入、语义不变）
  */
 export const cancelTaskRun = (taskId: string): boolean => {
   const rec = runningTasks.get(taskId);
-  if (rec) rec.cancel();
+  if (rec) {
+    rec.cancel();
+  } else {
+    // 无活 run = 可能在 Agent.create→runningTasks.set 窗口；记标记让启动链消费
+    pendingStopRequests.add(taskId);
+  }
   const closed = closeTaskSession(taskId);
   return !!rec || closed;
 };
@@ -689,6 +698,8 @@ const advanceTaskInner = async (
   }
 
   // 2) appendAction：写一条新 ActionRecord、task.runStatus 自动转 running
+  // 新推进 = 新意图：作废上一轮残留的停止请求，避免误杀本次启动
+  pendingStopRequests.delete(task.id);
   const created = await appendAction(task.id, {
     type: actionType,
     userInstruction,
@@ -910,6 +921,9 @@ const resumeCurrentActionInner = async (
 
   // 作废旧 agent 没答完的 ask（返回未答问题、新 agent 断点续传重问）
   const pendingQuestions = await supersedePendingAsks(fresh.id, "输入条唤醒当前 action");
+
+  // 唤醒 = 新启动意图：作废残留停止标记（同 advanceTask appendAction）
+  pendingStopRequests.delete(fresh.id);
 
   const patchedTask = await patchAction(fresh.id, action.id, { status: "running" });
   const patchedAction =
@@ -1583,6 +1597,13 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         `[task-runner] task=${task.id} Agent.create OK agentId=${agent.agentId}`,
       );
 
+      // 启动窗口停止：create 返回后、尚未 register / send——无 run、直接关 agent + 收尾
+      if (await applyPendingStopIfRequested(task, agent)) {
+        unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
+        unsetChatTaskActionHandlerIf(task.id, bridges.taskActionHandler);
+        return;
+      }
+
       // V0.11：注册跨 run 会话——run 自然结束后 agent 不关、用户下一步操作 send 续接。
       // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 无缝接回
       agentSessions.set(task.id, {
@@ -1630,8 +1651,15 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
           `prompt=${perfPromptMs}ms/${Math.round(Buffer.byteLength(superPrompt, "utf-8") / 1024)}KB ` +
           `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
       );
+      // send 返回后的 pending 检查在 consumeSessionRun 入口（runningTasks.set 前）统一做
       await consumeSessionRun(task, agent, run, { errorActionId: action.id });
     } catch (err) {
+      // 启动窗口点停止可能先 close 了会话 → send 抛错；按 cancelled 收尾、别标 error 覆盖
+      if (agent && (await applyPendingStopIfRequested(task, agent))) {
+        unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
+        unsetChatTaskActionHandlerIf(task.id, bridges.taskActionHandler);
+        return;
+      }
       // Agent.create / 首次 send 阶段失败（consumeSessionRun 内部错误它自己处理、不会抛）
       await handleRunFailure(task.id, action.id, err);
       if (agent) {
@@ -1842,6 +1870,43 @@ const clearSubmitWorkFollowupCounts = (taskId: string): void => {
   }
 };
 
+/**
+ * 启动窗口停止请求生效：清标记 + 杀 run（如有）+ 关会话 + 与正常 cancel 一致的收尾。
+ * @returns true = 命中 pending、已收尾，调用方应直接 return、勿进消费循环
+ */
+const applyPendingStopIfRequested = async (
+  task: Task,
+  agent: AgentInstance,
+  run?: SessionRun,
+): Promise<boolean> => {
+  if (!pendingStopRequests.has(task.id)) return false;
+  pendingStopRequests.delete(task.id);
+  if (run) {
+    void run.cancel().catch(() => {
+      /* noop */
+    });
+  }
+  // 有会话走身份门控关；create 后尚未 register 则直接 close agent
+  if (!closeTaskSession(task.id, agent.agentId)) {
+    try {
+      agent.close();
+    } catch {
+      /* noop */
+    }
+    void setTaskSessionAgentId(task.id, undefined);
+  }
+  clearSubmitWorkFollowupCounts(task.id);
+  await finalizeStaleActions(task.id, "cancelled");
+  const updated = await setTaskRunStatus(task.id, "idle");
+  await writeEventAndPublish(task.id, {
+    kind: "info",
+    text: "停止请求已生效（启动期间点击的停止）",
+  });
+  if (updated) publish(task.id, { kind: "task", task: updated });
+  publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+  return true;
+};
+
 const buildSubmitWorkFollowup = (last: {
   id: string;
   type: string;
@@ -1871,6 +1936,22 @@ const consumeSessionRun = async (
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
   try {
+    // 消费循环开始前：启动窗口点的停止在此生效（含 advance 续接 send 路径）
+    if (pendingStopRequests.has(task.id)) {
+      // 问一问 run：不动 action / 不关会话（与下方 cancelled 分支同语义）
+      if (opts.questionRun) {
+        pendingStopRequests.delete(task.id);
+        void run.cancel().catch(() => {
+          /* noop */
+        });
+        await restoreRunStatusAfterQuestion(task.id);
+        const freshQ = await getTask(task.id);
+        publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
+        return;
+      }
+      if (await applyPendingStopIfRequested(task, agent, run)) return;
+    }
+
     runningTasks.set(task.id, {
       agentId: agent.agentId,
       startedAt: Date.now(),
@@ -2463,6 +2544,18 @@ const sendToTaskSession = async (
   try {
     run = await agent.send(text);
   } catch (err) {
+    // 续接 / 问一问 send 期间点停止会先 close 会话 → send 抛错；
+    // 按 pending 收尾并返 true，避免 advanceTask 误判会话失效去 force-new
+    if (pendingStopRequests.has(task.id)) {
+      if (opts.questionRun) {
+        pendingStopRequests.delete(task.id);
+        await restoreRunStatusAfterQuestion(task.id);
+        const freshQ = await getTask(task.id);
+        publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
+        return true;
+      }
+      if (await applyPendingStopIfRequested(task, agent)) return true;
+    }
     // send 失败（会话失效 / SDK 异常）→ 关掉这个坏会话、调用方降级
     console.error(`[task-runner] sendToTaskSession: task=${task.id} send 失败`, err);
     closeTaskSession(task.id, session.agentId);
@@ -2470,6 +2563,7 @@ const sendToTaskSession = async (
   }
   session.lastActiveAt = Date.now();
   // fire-and-forget 消费（跟首个 run 同一管道）；调用方只需要「send 成功已开跑」
+  // pending 停止检查在 consumeSessionRun 入口（runningTasks.set 前）
   void consumeSessionRun(task, agent, run, {
     errorActionId: opts.errorActionId,
     questionRun: opts.questionRun,

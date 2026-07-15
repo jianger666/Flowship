@@ -15,6 +15,33 @@
 
 ---
 
+### 2026-07-14 下午：「提测收件箱」方案拍板（已随 v1.1.11 落地）
+
+> 背景：Meegle 评论 @ 通知的服务端回归仍未修（本日实测：CLI/MCP 同后端、lark_user_id 体系 `cross tenant` 封死、user_key 体系 API 收下但私信不发；评论 HTML 注释会被服务端剥掉、藏结构化标记不可行）。用户拍板：不做 bot IM 绕行、做 app 内拉取式收件箱。
+
+- **数据链**：QA 的 Flowship 扫「自己参与的工作项」中**节点『测试』未完成**的（用户修正：不看前置节点、只看测试节点没完成；`workflow get-node` 查节点状态——注意旧 `fetchWorkitemNodes` 已随 D1 死代码删除、开发时从 git 历史参考重写）→ 逐项拉评论（meegle `comment list`、串行队列）→ **MR 链接正则识别 + URL 去重**（评论可被编辑、链接即主数据、被删=撤回提测；不依赖隐藏标记）。
+- **UI**：全局收件箱主入口（顶栏 badge + 面板：工作项名 + MR 标题/提测描述 + 冲突/可合状态 + 已读/看详情/**直接合并**——QA 也配 GitLab token、走现成 gitlab-client）；绑同 story URL 的任务详情页就地挂提醒条（同一份数据与面板组件）。
+- **存储**：扫描结果不落盘（派生、每轮重建）；只落「已读标记」小 JSON（MR URL → 时间）、**超 90 天自动删**（唯一清理规则、用户拍板其它都不要）。
+- **扫描频率**：前台每 10 分钟一轮 + 启动/唤醒立即扫 + 收件箱与任务内提醒条都带手动刷新按钮 + 看板刷新顺带；后台/最小化不扫（省 meegle 串行队列容量）。节点状态短 TTL 缓存。
+- **开发角色扫 bug（已拍板 B 方案）**：bug 是独立工作项类型（`/wk-dm/bug/detail/<id>`、样本 7042596005）、扫描键 = **「经办人」= 当前登录人 + 状态未关闭**（从 bug 侧直查、不再要求 story 节点时机条件——用户认可「直查更合理」）、**「关联产品需求」字段**对应回本地任务的 story。处理链：收件箱「去修」→ 同 story 有活任务就**直接推进（不弹推进弹窗——点按钮即确认、用户拍板）**：预置修 BUG action + bug 上下文做指令 + 任务上次模型、成功跳任务页；预置 action 被删则降级弹推进弹窗预填；任务 running 则提示等待；**找不到对应任务只提示「找不到对应任务、请确认」不建新的**（用户拍板）→ action 用**出厂预置「修 BUG」custom action 模板**（先复现再修、修完用 meegle CLI 在 bug 工作项回填评论；**流转状态必须 ask_user 问用户确认、AI 不得自行流转**）——不进 ActionType 枚举、用户可改可删。meegle 查询链（bug 类型 api_name / MQL 按经办人过滤 / 状态枚举）调研中。
+- **测试角色扫「待回归 bug」（已拍板）**：开发修完流转 resolved 后、测试侧收件箱加「待回归」分组（resolved 且与我相关的 bug）；回归验证本身是人工操作业务系统、不上 AI action；**收件箱条目上直接给「通过 / 不通过」流转按钮**——通过 = 流转 CLOSED、一键；不通过 = 填原因 → 流转回 OPEN + 评论原因；技术走 meegle `workflow transition-state`（bug 是状态流工作项、`list-state-transitions` 查可流转项、`list-state-required` 查必填字段、有必填字段降级跳飞书处理）。用户点按钮即 HITL 确认。**产品目标：日常操作全部 app 内闭环、不再跳飞书项目**（用户拍板）；唯一例外 = 测试建 bug——那是测试自己写 custom action 的事、平台不内置（平台只内置他们自己做不了的收件箱基建）。
+- **收件箱展示语义**：已读**不消失**——列表展示全部有效条目（未读高亮、badge 只计未读）、条目只在自身失效时移出（MR 已合并/关闭、bug 已关闭）；已读标记只负责消红点、不是删除。
+- **注意力机制（已拍板、三期）**：① **app 图标角标** = 收件箱未处理数（mac `app.setBadgeCount` Dock 角标、Windows `setOverlayIcon` 任务栏覆盖图标——两端都要、「一定要让用户注意到」）；② **新待处理事务出现时发系统通知**（复用现有 task-attention-watcher 通知链路、renderer diff 新旧未读条目触发）。依赖二期的未读数结构、二期完工后做。
+
+### 2026-07-14：双 AI review 修复日——安全/一致性收口 + 三项产品退役 + 大扫除
+
+> 背景：GPT-5.6 出了两份 review（全面 review + 语义僵尸审计）、逐条核验属实后按用户拍板分批修完；全程 grok 子代理实施、主线验收。
+
+- **安全批（P0）**：mac 自更新验签 **fail-closed**——Ed25519 公钥单一源 `electron-app/update-manifest-public-key.pem`（壳 + CI `verify-update-manifest.mjs` 共用）、缺公钥/缺 manifest/验签失败/hash 不符一律拒装降级开下载页；CI 无私钥 secret（`UPDATE_MANIFEST_PRIVATE_KEY`）直接红。秘密文件权限：config.json / mcp-oauth 写入即 0600（目录 0700、tmp+rename 原子、`data-root.ts: writePrivateFileAtomic`）+ 启动幂等迁移；OAuth 读改写加 per-server 互斥。
+- **数据一致性批（P1）**：SSE 建连改「先订阅→再快照→去重回放」封死丢事件窗口；settings 读取三态分流（missing/error/ok、损坏先备份 `config.json.corrupt-<ts>` 再报 500、不再被当首次安装覆盖）+ 客户端 init 失败闸门（拒整对象 PUT）；附件绝对路径校验改判原始串（`isAbsolutePathLike`、原 resolve 后恒真）；答题卡超时解锁 abort 旧请求；问类插话假红点（revisions 展示层滤相同尾部快照）。
+- **事件存储真分页（P1-02）**：`readEventsTail`（尾部反向块读）/ `readEventsBefore`（cursor 流式扫）+ `getTaskWithTailEvents`——`GET ?tail=` 与 watch-task bootstrap 不再全量读；10 万条基准 70ms→1.2ms（58×）；tail≤1000 / page≤500 服务端 clamp；runner/诊断等仍走全量 `getTask`。
+- **三项产品退役（用户拍板）**：① **TaskRole 彻底删除**——`Task.role` 全链清除（类型/UI/PATCH/prompt `{{role}}` 占位/热更快照/LastLaunch 残留）、角色语义只剩设置页 `userRole`（「发起人」行注入）；② **learn action 退役**（颗粒度不可控、要沉淀自己写 custom action）——历史 learn 记录读盘放行（zod type 收字符串）+ 展示查表 miss 回退原始 type；③ **settings.gitHost 隐藏覆盖退役**——host 一律按任务仓 remote 现推（`resolveEffectiveGitHost(repoPaths)`）、多实例不一致 fail-fast。
+- **chat 模式放开 ask_user 答题卡**：删三层禁用（MCP describe / chat prompt / notifier 降级）、chat notifier 写真 `ask_user_request`、ask-reply 在 `mode===chat` 走 `deliverChatAskReply`（send / resume / 新会话）；ask_user 工具描述减量 ~60%。
+- **限时兼容收口（M）**：settings localStorage 迁移链退役（超期半月、cache 以 DEFAULT_SETTINGS 起步、启动清旧 key）；历史 task `repoBranchTemplates` 的 `{username}` 残留启动幂等清除（`migrate-username-templates.ts`）；删 custom action 同步清 actionLayout 残留 id。
+- **死代码大扫除（D）+ 漂移修正（P）**：删 meegle 旧看板链（normalizeWorkitem 等 9 符号）、AiStatusBadge、`action_failed` EventKind、POST events 路由、GET /api/settings 脱敏口、`GitBranchInfo.checkedOut/createdAt`、`MRRecord.mergedAt/createdByActionId`、6 个死 helper、3 个死依赖（react-markdown / @types/mdast / classic-level、按删依赖三件套清 lockfile）；conditional unset 重新接线（`registerSessionBridges` create 失败路径改 `unsetChat*If`、修 force-new race）；action-review/build prompt 旧 ack·CheckRun 语言、context-docs skill 续接承诺、若干退役注释全部对齐现协议。
+- **过期 skill 重写**：chat-attachments（附件标记由服务端拼进用户消息、非 wait 返回值）+ context-docs-handler（V0.6 action 模型）；rules 三处过期修正；README 按现状重写（86 行、git 必需 / 出网边界诚实版 / 五项就绪清单）。
+- 另：设置页存储列表定宽列对齐 + GB 不拆行、仓库块 grid min-width 溢出修复（`*:min-w-0`）、任务工作区操作条按仓分组（每仓 IDE/复制路径/预览一组、任务文件夹置末）、markdown 表格列宽自适应（cell `overflow-wrap:anywhere`、Playwright 实测定稿）。
+
 ### 2026-07-13 深夜 v1.1.10 发版：产出解耦——任务 workspace + 脚本仓标注 + 任务文件夹入口（用户明确授权发版、grok 子代理 review 无 P0）
 
 - **背景（用户复盘设计）**：测试建任务挂前后端只读仓 + 自定义「写测试脚本」action 时、脚本没有合法落点——「仓库挂载」和「产出去处」耦合太死。拍板解法：① 每个 task 一个专属可写 workspace（产出兜底、跟仓库选择解耦）② 仓库可标「脚本仓」（纯性质提示、AI 看仓内约定自己落）——两层提示词**独立注入不做组合逻辑**（用户拍板「更解耦」、只读×脚本仓组合让 AI 自行推导）。

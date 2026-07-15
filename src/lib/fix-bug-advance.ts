@@ -1,20 +1,23 @@
 /**
  * 收件箱「改bug」直接推进（2026-07-14 用户拍板：点按钮即确认、不弹推进弹窗）
  *
- * 链路：查预置「改bug」action + skill 还在 → 拉全量 task → prepareRunArgs 校验 →
+ * 链路：查预置「改bug」action 可用（挂载 skill 可见）→ 拉全量 task → prepareRunArgs 校验 →
  * POST advance（actionType=custom + builtin-fix-bug + bug 上下文指令）。
  *
  * 三种非 started 出口：
- * - missing-preset：action 或 skill 被删 → 调用方 confirm 重建后再重试
+ * - missing-preset：预置不可用 → 调用方 confirm 重建后再重试
  * - aborted：apiKey / model 校验失败（prepareRunArgs 内部已 toast）
  * - 其余错误直接 throw（调用方 toast）
+ *
+ * 可用判定与 server `reinstallBuiltinFixBugPreset` 共用 `isFixBugPresetUsable`
+ *（看实际挂载 skill、不硬编码要求 name=fix-bug）。
  */
 
 import { fetchCustomActions } from "./custom-action-client";
+import { isFixBugPresetUsable } from "./fix-bug-preset-usable";
 import { getSettings } from "./local-store";
 import {
   BUILTIN_FIX_BUG_ACTION_ID,
-  BUILTIN_FIX_BUG_SKILL,
   buildFixBugInstruction,
 } from "./mr-inbox";
 import { prepareRunArgs } from "./run-args";
@@ -52,25 +55,33 @@ export const launchFixBugAdvance = async (
   taskId: string,
   bug: { bugTitle: string; bugUrl: string; storyName?: string },
 ): Promise<FixBugLaunchResult> => {
-  // 1. 预置 action + skill 任一缺失 → missing-preset（比「只查 action」更能拦住 playbook 静默降级）
+  // 1. 预置不可用 → missing-preset（与 server 重建同一套 isFixBugPresetUsable）
+  // 看 action 实际挂载的 skill 是否可见——挂用户自定义 skill 也算可用，不硬编码 fix-bug
   const [defs, skillRes] = await Promise.all([
     fetchCustomActions(),
     fetch("/api/skills"),
   ]);
-  const preset = defs.find(
-    (d) => d.id === BUILTIN_FIX_BUG_ACTION_ID && !d.legacyPlaybook && d.skill,
-  );
-  // 任意 source 命中 name=fix-bug 都算还在（含 disabled；关掉 ≠ 删掉、不触发重建）
   if (!skillRes.ok) {
     throw new Error(`拉取 skill 列表失败（HTTP ${skillRes.status}）`);
   }
   const skillBody = (await skillRes.json().catch(() => ({}))) as {
     skills?: Array<{ name?: string }>;
   };
-  const hasSkill =
-    Array.isArray(skillBody.skills) &&
-    skillBody.skills.some((s) => s.name === BUILTIN_FIX_BUG_SKILL);
-  if (!preset || !hasSkill) return { kind: "missing-preset" };
+  // 含 disabled：关掉 ≠ 删掉、不触发重建（与 findSkillByName 不滤 disabled 一致）
+  const visibleSkillNames = Array.isArray(skillBody.skills)
+    ? skillBody.skills
+        .map((s) => s.name?.trim())
+        .filter((n): n is string => !!n)
+    : [];
+  const preset = defs.find((d) => d.id === BUILTIN_FIX_BUG_ACTION_ID);
+  if (
+    !isFixBugPresetUsable({
+      action: preset,
+      visibleSkillNames,
+    })
+  ) {
+    return { kind: "missing-preset" };
+  }
 
   // 2. 全量 task（要 actions 找上次用的模型；tail=1 不拉整卷 events）
   const task = await fetchTask(taskId, { tail: 1 });

@@ -103,6 +103,50 @@ export const resolveBranchTemplate = (
 ): string =>
   repoTemplate?.trim() || globalTemplate?.trim() || DEFAULT_BRANCH_TEMPLATE;
 
+/** 合法的简单占位符（含已废弃的 username——历史配置可能残留、保存时不拦） */
+const KNOWN_SIMPLE_PLACEHOLDERS = new Set([
+  "storyId",
+  "taskTitle",
+  "username",
+]);
+
+/**
+ * {date:FORMAT} 的 FORMAT 是否合法：非空、去掉 yyyy/yy/MM/dd/HH/mm/ss 后不再含字母。
+ * 分隔符（-/_: 空格等）宽松放行；空格式 `{date:}` 与乱写 `{date:abc}` 拦下。
+ */
+const isValidDateFormat = (fmt: string): boolean => {
+  if (!fmt) return false;
+  let rest = fmt;
+  // 长 token 在前（yyyy 先于 yy），避免 yy 把 yyyy 尾部吃掉后残留字母误判
+  for (const token of ["yyyy", "yy", "MM", "dd", "HH", "mm", "ss"]) {
+    rest = rest.split(token).join("");
+  }
+  return !/[a-zA-Z]/.test(rest);
+};
+
+/**
+ * 找出模板里的未知占位符（返回原文如 "{yyMMdd}"；空数组 = 合法）。
+ * 背景：renderBranchName 对未知占位符原样保留——同事写成 `{yyMMdd}`（正确是
+ * `{date:yyMMdd}`）会建出字面分支名、被当垃圾删后任务卡死；保存入口必须先拦。
+ */
+export const findUnknownPlaceholders = (template: string): string[] => {
+  const unknown: string[] = [];
+  const seen = new Set<string>();
+  for (const m of template.matchAll(/\{[^}]*\}/g)) {
+    const full = m[0];
+    if (seen.has(full)) continue;
+    const inner = full.slice(1, -1);
+    const ok =
+      KNOWN_SIMPLE_PLACEHOLDERS.has(inner) ||
+      (inner.startsWith("date:") && isValidDateFormat(inner.slice("date:".length)));
+    if (!ok) {
+      seen.add(full);
+      unknown.push(full);
+    }
+  }
+  return unknown;
+};
+
 /**
  * 从飞书 story URL 抠 story id（V0.10 从 action-gates 抽出、worktree 分支命名共用）
  * 规则：优先 detail/<digits> 段、兜底最长一段 ≥6 位连续数字；抠不到返 null

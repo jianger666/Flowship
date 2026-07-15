@@ -732,7 +732,7 @@ let updateReadyVersion = null;
 const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 // 退出时正在套用暂存包——before-quit preventDefault 防重入
 let applyingStagedOnQuit = false;
-const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
+const RELEASE_LATEST_URL = "https://github.com/jianger666/Flowship/releases/latest";
 
 // 「该版本是否已弹过错误框」持久化——仅用于 mac 暂存失败的 showErrorBox 去重
 // （发现新版本本身 2026-07-15 起不再弹窗、只静默点亮右上角徽标）
@@ -902,7 +902,7 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
     throw new Error("更新验签公钥为空、已中止替换（fail-closed）");
   }
 
-  const manifestUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/update-manifest.json`;
+  const manifestUrl = `https://github.com/jianger666/Flowship/releases/download/v${version}/update-manifest.json`;
   let res;
   try {
     res = await fetch(manifestUrl);
@@ -990,7 +990,7 @@ const downloadAndStageMacUpdateInner = async (version) => {
   // Intel 包 v1.1.5 起提供、老版本 x64 用户不存在所以不用考虑兼容
   const dmgArch = process.arch === "arm64" ? "arm64" : "x64";
   const assetName = `fe-ai-flow-${version}-mac-${dmgArch}.dmg`;
-  const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/${assetName}`;
+  const dmgUrl = `https://github.com/jianger666/Flowship/releases/download/v${version}/${assetName}`;
   const appPath = runningAppPath();
   if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
     // 非常规安装位置（如直接在 dmg 里跑）——抛给调用方降级开下载页
