@@ -18,9 +18,9 @@
  * 才能正确探出 ok / unauthorized（否则飞书项目永远 401）。
  *
  * v1.1.x 提速：起 agent 前的探测（filterHealthyMcp）走 TTL 缓存——每次推进 / 发消息
- * 都真探一轮（单服超时 6s）是「点推进后半天没动静」的固定成本之一。ok 结果 5 分钟内
- * 复用；fail 结果只缓 30s（授权 / 恢复要尽快被看见）。设置页的 probeMcpHealthAll
- * 保持真探（用户就是来看真值的）、结果写穿缓存——授权完刷新设置页、下次起 agent 即新。
+ * 都真探一轮（单服超时 6s）是「点推进后半天没动静」的固定成本之一。ok / fail 结果均
+ * 5 分钟内复用。设置页的 probeMcpHealthAll 保持真探（用户就是来看真值的）、结果写穿
+ * 缓存——授权完刷新设置页即可清 fail 缓存、下次起 agent 即新。
  * key 含 headers（OAuth token 变了自然失效）。
  */
 
@@ -34,7 +34,8 @@ const PROBE_TIMEOUT_MS = 6000;
 // ----------------- 探测结果 TTL 缓存（仅 http server；stdio 本来就秒回不缓存） -----------------
 
 const PROBE_CACHE_OK_MS = 5 * 60_000;
-const PROBE_CACHE_FAIL_MS = 30_000;
+// fail 也缓 5 分钟：长期 401 等每次推进重探白付 6s；设置页 probeMcpHealthAll 真探且写穿缓存，授权后刷新设置页即可清
+const PROBE_CACHE_FAIL_MS = 5 * 60_000;
 
 // 挂 globalThis：各 route 是不同 chunk、module-level Map 会各持一份（同 runningTasks 老坑）
 const G = globalThis as unknown as {

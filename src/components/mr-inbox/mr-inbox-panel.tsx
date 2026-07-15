@@ -7,7 +7,7 @@
  * 两处复用：顶栏 Popover + 任务详情提醒条（filterWorkItemId 只滤待测 MR）。
  */
 
-import { useMemo, useState, useEffect, type ReactNode } from "react";
+import { useMemo, useRef, useState, useEffect, type ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -45,7 +45,7 @@ import {
 import { useTaskList } from "@/hooks/use-task-list";
 import { extractFeishuStoryId } from "@/lib/branch-template";
 import {
-  launchFixBugAdvance,
+  checkFixBugPreset,
   reinstallFixBugPreset,
 } from "@/lib/fix-bug-advance";
 import { getSettings } from "@/lib/local-store";
@@ -261,7 +261,7 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
             href={entry.workItemUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex w-fit max-w-full min-w-0 truncate hover:text-foreground hover:underline"
+            className="min-w-0 truncate hover:text-foreground hover:underline"
             title={entry.workItemName}
           >
             {entry.workItemName}
@@ -334,10 +334,11 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
 };
 
 /**
- * 我的 BUG 行：「改bug」直接推进（2026-07-14 拍板：点按钮即确认、不弹推进弹窗）。
- * 预置 action / skill 被删 → confirm 重建后再继续推进（不再深链降级）。
+ * 我的 BUG 行：「改bug」跳任务页深链打开推进弹窗（2026-07-15：不再直接 POST advance、
+ * 预填指令 + 预选「改bug」、用户确认后启动）。
+ * 预置 action / skill 被删 → confirm 重建后再继续。
  * 无对应任务（story 已合并 / 从未建过）→ 引导去「新建改bug任务」（预填 bug 上下文、
- * 创建后自动推进、见 /workitems/new 的 fixBug 引流参数）。
+ * 创建后深链打开推进弹窗预选「改bug」、用户确认后启动，见 /workitems/new 的 fixBug 引流参数）。
  * 状态 chip 可点下拉就地流转（懒加载可流转目标）。
  */
 const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
@@ -362,10 +363,43 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const [loadingTransitions, setLoadingTransitions] = useState(false);
   const unread = entry.seenAtMs === null;
 
-  // 状态变了 → 旧可流转列表作废，下次打开重新懒加载
+  // 流转列表请求代数：statusLabel 变化 / 新请求发起时 +1，迟到的过期响应直接丢弃
+  const transitionsReqIdRef = useRef(0);
+
+  const loadTransitions = () => {
+    const reqId = ++transitionsReqIdRef.current;
+    setLoadingTransitions(true);
+    setTransitionsError("");
+    void listBugTransitions({
+      projectKey: entry.projectKey,
+      workItemId: entry.workItemId,
+    })
+      .then((list) => {
+        if (transitionsReqIdRef.current !== reqId) return;
+        setTransitions(list);
+      })
+      .catch((err) => {
+        if (transitionsReqIdRef.current !== reqId) return;
+        // 保持 transitions === null：报错后关掉再开菜单能重试（[] 会被守卫当「已加载」卡死）
+        setTransitionsError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (transitionsReqIdRef.current !== reqId) return;
+        setLoadingTransitions(false);
+      });
+  };
+
+  // 状态变了 → 旧可流转列表作废（含 in-flight 请求），下次打开重新懒加载；
+  // 菜单还开着就立刻按新状态重拉，避免呈现「无 loading 无错误无列表」的空白菜单
   useEffect(() => {
+    transitionsReqIdRef.current += 1;
     setTransitions(null);
     setTransitionsError("");
+    setLoadingTransitions(false);
+    if (menuOpen) loadTransitions();
+    // 只在 statusLabel 变化时跑（menuOpen / loadTransitions 取当次 render 快照）——
+    // menuOpen 进 deps 会让开关菜单误清列表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entry.statusLabel]);
 
   const handleFix = async () => {
@@ -385,7 +419,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
         title: "新建改bug任务？",
         description: `没有找到${
           entry.relatedStoryName ? `「${entry.relatedStoryName}」` : "关联需求"
-        }对应的开发中任务（可能已合并归档）。新建一个任务来改这个 bug、创建后自动开始。`,
+        }对应的开发中任务（可能已合并归档）。新建一个任务来改这个 bug。`,
         confirmLabel: "去新建",
       });
       if (!ok) return;
@@ -411,37 +445,37 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
     }
     setFixing(true);
     try {
-      const bugCtx = {
-        bugTitle: entry.name,
-        bugUrl: entry.bugUrl,
-        storyName: entry.relatedStoryName,
-      };
-      let result = await launchFixBugAdvance(hit.id, bugCtx);
-      // 预置 action / skill 被删：二次确认重建后重试一次（取消则原地不动）
-      if (result.kind === "missing-preset") {
+      // 预置得在推进弹窗可选列表里才有意义——缺失则 confirm 重建后再跳深链
+      let status = await checkFixBugPreset();
+      if (status === "missing") {
         const ok = await confirm({
           title: "重建「改bug」预置？",
           description:
-            "改bug 预置不可用。重建将恢复出厂版本（覆盖对该 action 的修改）并继续推进。",
-          confirmLabel: "重建并继续",
+            "改bug 预置不可用。重建将恢复出厂版本（覆盖对该 action 的修改）。",
+          confirmLabel: "重建",
         });
         if (!ok) return;
         await reinstallFixBugPreset();
-        result = await launchFixBugAdvance(hit.id, bugCtx);
-        if (result.kind === "missing-preset") {
+        status = await checkFixBugPreset();
+        if (status === "missing") {
           toast.error("重建后预置仍缺失、请到能力页检查");
           return;
         }
       }
-      if (result.kind === "started") {
-        void setSeen(entry.bugUrl, true);
-        toast.success("已开始改bug、跳转查看执行");
-        router.push(`/tasks/${hit.id}`);
-      }
-      // aborted（缺 apiKey / 模型）：prepareRunArgs 内部已 toast、原地不动
+      // 点了就算处理中：跳深链前标已读（不再等推进成功）
+      void setSeen(entry.bugUrl, true);
+      const q = new URLSearchParams({
+        advance: "fix-bug",
+        bugTitle: entry.name,
+        bugUrl: entry.bugUrl,
+        ...(entry.relatedStoryName
+          ? { storyName: entry.relatedStoryName }
+          : {}),
+      });
+      router.push(`/tasks/${hit.id}?${q.toString()}`);
     } catch (err) {
       toast.error(
-        `推进失败：${err instanceof Error ? err.message : String(err)}`,
+        `打开改bug失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setFixing(false);
@@ -451,20 +485,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   const handleMenuOpenChange = (open: boolean) => {
     setMenuOpen(open);
     if (!open || transitions !== null || loadingTransitions) return;
-    setLoadingTransitions(true);
-    setTransitionsError("");
-    void listBugTransitions({
-      projectKey: entry.projectKey,
-      workItemId: entry.workItemId,
-    })
-      .then((list) => setTransitions(list))
-      .catch((err) => {
-        setTransitionsError(
-          err instanceof Error ? err.message : String(err),
-        );
-        setTransitions([]);
-      })
-      .finally(() => setLoadingTransitions(false));
+    loadTransitions();
   };
 
   const handlePickTransition = async (opt: BugTransitionOption) => {
@@ -519,13 +540,15 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           className="absolute top-2.5 bottom-2.5 left-0 w-0.5 rounded-full bg-primary"
         />
       )}
-      {/* 标题左、优先级 + 可点状态 chip 靠右（justify-between） */}
+      {/* 标题左、优先级 + 可点状态 chip 靠右（justify-between）。
+          标题作 flex item 参与收缩（min-w-0）才能出省略号——inline-flex w-fit 不收缩、
+          长标题会把右侧 chip 挤扁（2026-07-15 用户反馈）；不 grow、右侧空白仍不可点 */}
       <div className="flex items-center justify-between gap-2">
         <a
           href={entry.bugUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex w-fit max-w-full min-w-0 truncate text-sm font-medium hover:underline"
+          className="min-w-0 truncate text-sm font-medium hover:underline"
           title={entry.name}
         >
           {entry.name}
@@ -691,13 +714,14 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           className="absolute top-2.5 bottom-2.5 left-0 w-0.5 rounded-full bg-primary"
         />
       )}
-      {/* 标题左、状态 chip 靠右；静态无边框（与 MyBugRow 可点控件区分） */}
+      {/* 标题左、状态 chip 靠右；静态无边框（与 MyBugRow 可点控件区分）。
+          min-w-0 让长标题出省略号、不挤扁右侧 chip（同 MyBugRow） */}
       <div className="flex items-center justify-between gap-2">
         <a
           href={entry.bugUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex w-fit max-w-full min-w-0 truncate text-sm font-medium hover:underline"
+          className="min-w-0 truncate text-sm font-medium hover:underline"
           title={entry.name}
         >
           {entry.name}

@@ -147,6 +147,10 @@ export const PreferenceSections = ({
     shellBoostFiles !== null &&
     shellBoostFiles.some((f) => f.exists) &&
     shellBoostFiles.filter((f) => f.exists).every((f) => f.boosted);
+  // 一个目标 rc 都不存在（典型：Windows 无 Git Bash 配置）→ 没有重型 shell 初始化可跳、
+  // 本来就不慢——显示「无需优化」而不是给一个必然失败的按钮（2026-07-15 Windows 同事踩过）
+  const shellBoostNothingToDo =
+    shellBoostFiles !== null && !shellBoostFiles.some((f) => f.exists);
 
   const handleShellBoost = async () => {
     setShellBoostBusy(true);
@@ -175,7 +179,8 @@ export const PreferenceSections = ({
       } else if (already.length > 0) {
         toast.success("已是优化状态");
       } else {
-        toast.error("Agent shell 提速失败：未找到可优化的 shell rc 文件");
+        // 没有 rc 可注入不是失败——本来就没有重型初始化、不需要优化
+        toast.info("未检测到 shell 配置文件、无需优化");
       }
       // 刷新探测态（含刚刚注入的）
       setShellBoostFiles(
@@ -343,6 +348,10 @@ export const PreferenceSections = ({
         control={
           shellBoostDone ? (
             <span className="text-sm text-muted-foreground">已优化 ✓</span>
+          ) : shellBoostNothingToDo ? (
+            <span className="text-sm text-muted-foreground">
+              无需优化（未检测到 shell 配置文件）
+            </span>
           ) : (
             <Button
               type="button"

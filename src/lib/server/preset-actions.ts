@@ -215,7 +215,7 @@ const writeFixBugActionFactoryShell = async (): Promise<void> => {
  * 重建跳过不写；但客户端按「列表有 name=fix-bug」判不可用 → 点重建永远无效、死循环。
  * **目录存在 ≠ skill 可见**——重建必须走 skills 加载链（findSkillByName / listSkillsWithSource）。
  *
- * 判定口径与客户端 `isFixBugPresetUsable` / `launchFixBugAdvance` 一致：
+ * 判定口径与客户端 `isFixBugPresetUsable` / `checkFixBugPreset` 一致：
  * - skill：`name=fix-bug` 不可见 → 覆盖写模板（目录在也写 SKILL.md）；可见则尊重用户改过的内容
  * - action：四条不全满足 → 整体写出厂壳；全满足则保留（含挂自定义 skill 的合法场景）
  */

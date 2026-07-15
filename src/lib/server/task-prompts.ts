@@ -726,7 +726,7 @@ export const buildResumeActionInstruction = (
     "",
     `> ${userMessage.split("\n").join("\n> ")}`,
     "",
-    "   - 纯提问 → 先在事件流里答疑（emit assistant_message）、再继续完成本 action",
+    "   - 纯提问 → 先直接回复答疑、再继续完成本 action",
     "   - 改动 / 继续类指令 → 按它执行",
   );
   step += 1;

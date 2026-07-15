@@ -732,7 +732,7 @@ let updateReadyVersion = null;
 const UPDATE_MODE = process.platform === "win32" ? "install" : "download";
 // 退出时正在套用暂存包——before-quit preventDefault 防重入
 let applyingStagedOnQuit = false;
-const RELEASE_LATEST_URL = "https://github.com/jianger666/Flowship/releases/latest";
+const RELEASE_LATEST_URL = "https://github.com/jianger666/fe-ai-flow/releases/latest";
 
 // 「该版本是否已弹过错误框」持久化——仅用于 mac 暂存失败的 showErrorBox 去重
 // （发现新版本本身 2026-07-15 起不再弹窗、只静默点亮右上角徽标）
@@ -902,7 +902,7 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
     throw new Error("更新验签公钥为空、已中止替换（fail-closed）");
   }
 
-  const manifestUrl = `https://github.com/jianger666/Flowship/releases/download/v${version}/update-manifest.json`;
+  const manifestUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/update-manifest.json`;
   let res;
   try {
     res = await fetch(manifestUrl);
@@ -990,7 +990,7 @@ const downloadAndStageMacUpdateInner = async (version) => {
   // Intel 包 v1.1.5 起提供、老版本 x64 用户不存在所以不用考虑兼容
   const dmgArch = process.arch === "arm64" ? "arm64" : "x64";
   const assetName = `fe-ai-flow-${version}-mac-${dmgArch}.dmg`;
-  const dmgUrl = `https://github.com/jianger666/Flowship/releases/download/v${version}/${assetName}`;
+  const dmgUrl = `https://github.com/jianger666/fe-ai-flow/releases/download/v${version}/${assetName}`;
   const appPath = runningAppPath();
   if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
     // 非常规安装位置（如直接在 dmg 里跑）——抛给调用方降级开下载页
@@ -1209,10 +1209,18 @@ const installUpdateNow = async () => {
 
 // mac：查 GitHub latest release 的版本号——请求 /releases/latest 拿 302 的
 // location（…/releases/tag/vX.Y.Z）抠版本、不走 API 不吃 rate limit
+// ⚠️ 必须重定向安全（2026-07-15 事故）：旧实现 redirect:"manual" 只读第一跳 Location 抠 tag——
+// 仓库改名后第一跳变成「改名重定向」（不含 /tag/）、全体存量客户端「拿不到最新版本号」、更新链断。
+// 现实现：跟随重定向到底、从最终 URL 抠 tag（改名/多级跳都不怕）。
+// 改名 Flowship 的计划：等全员升到本版本之后再改仓库名、届时零影响。
 const fetchLatestVersion = async () => {
-  const res = await fetch(RELEASE_LATEST_URL, { redirect: "manual" });
-  const loc = res.headers.get("location") || "";
-  const m = loc.match(/\/tag\/v(\d+\.\d+\.\d+)/);
+  // 超时必须有：2h 轮询下网络挂起会让 promise 永不收敛、请求堆积（同文件其它网络调用同款）
+  const res = await fetch(RELEASE_LATEST_URL, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) return null;
+  const m = (res.url || "").match(/\/tag\/v(\d+\.\d+\.\d+)/);
   return m ? m[1] : null;
 };
 

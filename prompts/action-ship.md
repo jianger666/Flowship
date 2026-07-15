@@ -403,6 +403,6 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 
 ## 调用礼仪
 
-- 整个流程不在 assistant_message 里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）
-- 调 submit_mr / `meegle comment add` 前**不要**先用 assistant_message 复述参数（agent 倾向于「写出来让用户确认」、但这里入参全在 artifact 里、用户 ack 时一并看）
+- 整个流程不在回复正文里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）
+- 调 submit_mr / `meegle comment add` 前**不要**先用回复文本复述参数（agent 倾向于「写出来让用户确认」、但这里入参全在 artifact 里、用户 ack 时一并看）
 - 拿到 MR url 后**不要**复述「MR 已创建：<url>」、直接落 artifact 即可

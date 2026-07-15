@@ -88,7 +88,7 @@ const buildMcpServer = (): McpServer => {
         "## 硬性规则",
         "",
         "- **完成一个 action（写完 artifact）后必须调一次本工具**——不调 = action 没完成、runner 会把任务标 failed",
-        "- **不要写完 artifact 只发 assistant_message 说「请你确认」就结束**——必须调本工具交卷",
+        "- **不要写完 artifact 只输出一句「请你确认」的回复就结束**——必须调本工具交卷",
         "- **调完本工具后、立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）",
         "- 用户的决定（通过 / 再聊聊 / 推进下一步）会作为**新消息**发给你、你在同一会话里继续",
         "",
@@ -331,7 +331,7 @@ const buildMcpServer = (): McpServer => {
         "",
         "## 调用礼仪",
         "",
-        "- 调用前不发 assistant_message「我要提测了」之类、对用户透明",
+        "- 调用前不输出「我要提测了」之类的回复文本、对用户透明",
         "- 调用后拿到 `mr_url` 直接落到 artifact、ack 时用户能看到 MR 链接",
       ].join("\n"),
       inputSchema: {

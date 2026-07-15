@@ -1,7 +1,7 @@
 /**
  * 「改bug」预置是否可用——纯判定谓词
  *
- * 客户端检查（`launchFixBugAdvance`）与 server 重建（`reinstallBuiltinFixBugPreset`）
+ * 客户端检查（`checkFixBugPreset`）与 server 重建（`reinstallBuiltinFixBugPreset`）
  * **必须用同一套口径**，避免「一边说缺、一边觉得在」的死循环。
  *
  * 口径（四条全满足才可用）：
@@ -26,7 +26,7 @@ export type FixBugPresetActionSnap = {
 
 /**
  * 预置是否处于「可推进」状态。
- * @see launchFixBugAdvance（客户端）
+ * @see checkFixBugPreset（客户端）
  * @see reinstallBuiltinFixBugPreset（重建：不满足则写出厂壳）
  */
 export const isFixBugPresetUsable = (opts: {

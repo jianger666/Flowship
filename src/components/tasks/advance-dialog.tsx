@@ -25,7 +25,8 @@
  * 历史决策：
  *   - V0.6.0.1 中段试过给 ActionTimeline 失败 chip 加 retry 快捷入口（带 `initialActionType` / `retryHint` props）、
  *     用户实测发现「点旧 error chip retry」语义混乱（实际是打断当前 running + 起一个全新 action）、retry chip
- *     整套砍了、本 dialog 入口唯一、不接外部 prefill；同步把 `inferRecommended` 里「last action error → 同 type」
+ *     整套砍了、本 dialog 入口唯一（2026-07 又加回一种受控预填：收件箱「改bug」深链经父组件传 `prefill`
+ *     预填指令 + 预选 action、用户可改可删、不自动提交）；同步把 `inferRecommended` 里「last action error → 同 type」
  *     那一条删了、错误后默认仍走流程顺推（plan→build→review）、用户手动改、跟「没有自动重试」语义一致
  *   - V0.6.0.1 末段把右上角「推荐」微标签删了：那条推荐逻辑本身
  *     只是「流程顺推 + 业务状态映射」、谈不上智能推荐、暗示「我跟你说要走这个」反而误导；改成「打开 dialog 时
@@ -282,11 +283,14 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   task: Task;
   /**
-   * 外部预填（收件箱「改bug」降级：预置 action 被删时只预填指令、action 用户自己选）。
+   * 外部预填（收件箱「改bug」入口深链用）：指令 + 可选预选 custom action。
+   * customActionId 在可选列表里才选中；列表没有（被删/隐藏）则只预填指令。
    * 只用一次——父组件应在关闭后清掉，避免下次手动打开仍带旧预填。
    */
   prefill?: {
     instruction?: string;
+    /** 收件箱改bug入口用：预选 builtin-fix-bug 等 custom action */
+    customActionId?: string;
   } | null;
   onSubmit: (input: {
     actionType: ActionType;
@@ -439,6 +443,11 @@ export const AdvanceDialog = ({
   // 否则父组件清 prefill / 换引用会把用户已改的表单打回。
   const prefillRef = useRef(prefill);
   prefillRef.current = prefill;
+  // 收件箱改bug：预选 customActionId 可能要等异步拉完 custom 列表才落——
+  // open effect 缓存命中则当场清；未命中留给 fetch effect 补一次，避免追改用户手点。
+  const pendingPrefillCustomIdRef = useRef<string | null>(null);
+  // 用户手点过 action chip 后，迟到的 fetch 补选不得再盖回预选（每次打开重置）
+  const userTouchedActionRef = useRef(false);
 
   // dialog 打开时初始化表单 state。
   // 关键：绝不把 availableModels.length 放进依赖——
@@ -446,7 +455,8 @@ export const AdvanceDialog = ({
   //（如「提测」）、指令、开关全部打回默认值（「方案」），这就是「打开弹窗选中会跳一下」的根因。
   useEffect(() => {
     if (!open) return;
-    // 收件箱「改bug」降级深链预填指令；无预填则清空
+    userTouchedActionRef.current = false;
+    // 收件箱「改bug」深链预填指令；无预填则清空
     setInstruction(prefillRef.current?.instruction?.trim() || "");
     setRemoveSourceBranch(defaultRemoveSourceBranch);
     // V0.x：联调推送方式每次打开回到默认「直推」
@@ -495,17 +505,29 @@ export const AdvanceDialog = ({
     // V0.9：读最新布局偏好（顺序 + 显隐）；隐藏项直接不渲染（v0.9.12 删「更多」折叠区、重新启用去 /actions 页）
     const layout = s.actionLayout ?? { order: [], hidden: [] };
     setActionLayout(layout);
-    // v0.9.12 通用化：默认选中 = 混排可见列表第一位（用户自己排的顺序、无业务状态假设——
-    // 原「按 repoStatus / 最近 action 顺推」的 inferDefaultActionType 已删）。
-    // customActions 用 ref 读打开瞬间的缓存：首次打开还没拉到就只在内置里选、
-    // 拉完不追改选中（用户可能已开始操作、追改会跳）；第二次打开起缓存已有、custom 排第一也能选中。
-    const first = arrangeByLayout(
+    // 收件箱改bug：优先预选 customActionId（缓存里已有且可见才当场选；否则挂 pending 等拉列表）
+    const prefillCustomId =
+      prefillRef.current?.customActionId?.trim() || null;
+    pendingPrefillCustomIdRef.current = prefillCustomId;
+    const visibleKeys = arrangeByLayout(
       [
         ...BUILTIN_ADVANCE_ACTIONS,
         ...customActionsRef.current.map((d) => d.id),
       ],
       layout,
-    )[0];
+    );
+    if (prefillCustomId && visibleKeys.includes(prefillCustomId)) {
+      setActionType("custom");
+      setSelectedCustomActionId(prefillCustomId);
+      pendingPrefillCustomIdRef.current = null;
+      return;
+    }
+    // v0.9.12 通用化：默认选中 = 混排可见列表第一位（用户自己排的顺序、无业务状态假设——
+    // 原「按 repoStatus / 最近 action 顺推」的 inferDefaultActionType 已删）。
+    // customActions 用 ref 读打开瞬间的缓存：首次打开还没拉到就只在内置里选、
+    // 拉完不追改选中（用户可能已开始操作、追改会跳）；第二次打开起缓存已有、custom 排第一也能选中。
+    // 例外：上面 pendingPrefillCustomId 仍挂着时、fetch effect 会补一次预选。
+    const first = visibleKeys[0];
     if (first === undefined) {
       // 全部 action 被隐藏（且无自定义）——无选中、chips 区显示空态引导
       setActionType(null);
@@ -530,12 +552,33 @@ export const AdvanceDialog = ({
   }, [open, availableModels.length, fetchModels]);
 
   // dialog 打开时拉自定义 action 列表（供「我的 Action」组渲染）；拉失败静默清空、不挡内置 action。
-  // 旧格式（legacy）已停用、在这个唯一数据源处滤掉——下游 customById / visibleKeys / 默认选中全部跟随
+  // 旧格式（legacy）已停用、在这个唯一数据源处滤掉——下游 customById / visibleKeys / 默认选中全部跟随。
+  // 收件箱改bug：若 open effect 时列表还没缓存、这里补一次 customActionId 预选（仅 pending 未清时）。
   useEffect(() => {
     if (!open) return;
     void fetchCustomActions()
-      .then((defs) => setCustomActions(usableCustomActions(defs)))
-      .catch(() => setCustomActions([]));
+      .then((defs) => {
+        const usable = usableCustomActions(defs);
+        setCustomActions(usable);
+        const pending = pendingPrefillCustomIdRef.current;
+        if (!pending) return;
+        pendingPrefillCustomIdRef.current = null;
+        // 用户已手点过 chip → 补选作废，不追改用户的选择
+        if (userTouchedActionRef.current) return;
+        // 列表没有 / 被隐藏 → 忽略预选、保留 open effect 已选的默认第一位
+        const layout = getSettings().actionLayout ?? { order: [], hidden: [] };
+        const visible = arrangeByLayout(
+          [...BUILTIN_ADVANCE_ACTIONS, ...usable.map((d) => d.id)],
+          layout,
+        );
+        if (!visible.includes(pending)) return;
+        setActionType("custom");
+        setSelectedCustomActionId(pending);
+      })
+      .catch(() => {
+        setCustomActions([]);
+        pendingPrefillCustomIdRef.current = null;
+      });
   }, [open]);
 
   // dialog 关闭时清空附图、下次打开不残留上次的图
@@ -582,6 +625,7 @@ export const AdvanceDialog = ({
               shape="card"
               selected={selected}
               onClick={() => {
+                userTouchedActionRef.current = true;
                 setActionType(type);
                 setSelectedCustomActionId(null);
               }}
@@ -614,6 +658,7 @@ export const AdvanceDialog = ({
             shape="card"
             selected={selected}
             onClick={() => {
+              userTouchedActionRef.current = true;
               setActionType("custom");
               setSelectedCustomActionId(def.id);
             }}

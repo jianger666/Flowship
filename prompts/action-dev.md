@@ -205,5 +205,5 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完调 `submit_
 
 ## 调用礼仪
 
-- 过程中不在 assistant_message 里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）；调 `submit_mr` 前不复述参数、拿到 MR url 不复述「MR 已创建」、直接落 artifact。
+- 过程中不在回复正文里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）；调 `submit_mr` 前不复述参数、拿到 MR url 不复述「MR 已创建」、直接落 artifact。
 - 写完 artifact 后、`submit_work` 前可以流式输出 1-3 句结论（推了哪些仓 / 用哪种方式 / 有无遗留），然后**紧跟** `submit_work`——别只说不调（turn 结束 = run 结束 = task failed）。

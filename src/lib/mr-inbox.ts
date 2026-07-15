@@ -13,11 +13,11 @@ export const MR_INBOX_SEEN_MAX_AGE_DAYS = 90;
 export const MR_INBOX_SEEN_MAX_AGE_MS =
   MR_INBOX_SEEN_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 
-/** 扫描结果内存缓存 TTL */
-export const MR_INBOX_CACHE_TTL_MS = 10 * 60 * 1000;
+/** 扫描结果内存缓存 TTL（2026-07-15 用户拍板 10 分钟 → 5 分钟：默认空间收敛后单轮扫描只 ~2s、扫得起） */
+export const MR_INBOX_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /** 前端前台轮询间隔（与缓存 TTL 对齐） */
-export const MR_INBOX_POLL_INTERVAL_MS = 10 * 60 * 1000;
+export const MR_INBOX_POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 /** 工作项节点（过滤用最小字段） */
 export interface MrInboxNode {
@@ -494,6 +494,7 @@ export const parseMoqlBugQueryResponse = (resp: unknown): ParsedBugRow[] => {
 
 /**
  * 拼「改bug」推进指令预填文本（标题 / 链接 / 关联需求；描述留给 agent 按链接自取）。
+ * 只带 bug 事实信息——行为约束（复现/修复/自检/HITL 流转）在 fix-bug skill 里，不在这重复。
  */
 export const buildFixBugInstruction = (opts: {
   bugTitle: string;
@@ -507,9 +508,6 @@ export const buildFixBugInstruction = (opts: {
   if (opts.storyName?.trim()) {
     lines.push(`关联需求：${opts.storyName.trim()}`);
   }
-  lines.push(
-    "（请按「改bug」action：先复现 → 修复 → 自检 → 写 artifact；状态流转必须 ask_user，不得自行流转）",
-  );
   return lines.join("\n");
 };
 

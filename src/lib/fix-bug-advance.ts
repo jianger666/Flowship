@@ -1,13 +1,8 @@
 /**
- * 收件箱「改bug」直接推进（2026-07-14 用户拍板：点按钮即确认、不弹推进弹窗）
+ * 收件箱「改bug」预置检查（2026-07-15：不再直接 POST advance）
  *
- * 链路：查预置「改bug」action 可用（挂载 skill 可见）→ 拉全量 task → prepareRunArgs 校验 →
- * POST advance（actionType=custom + builtin-fix-bug + bug 上下文指令）。
- *
- * 三种非 started 出口：
- * - missing-preset：预置不可用 → 调用方 confirm 重建后再重试
- * - aborted：apiKey / model 校验失败（prepareRunArgs 内部已 toast）
- * - 其余错误直接 throw（调用方 toast）
+ * 职责收窄为：查预置「改bug」action 是否可用 + 用户确认后重装出厂预置。
+ * 真正推进改走任务页深链 `?advance=fix-bug&…` → 打开推进弹窗预选「改bug」、用户确认后启动。
  *
  * 可用判定与 server `reinstallBuiltinFixBugPreset` 共用 `isFixBugPresetUsable`
  *（看实际挂载 skill、不硬编码要求 name=fix-bug）。
@@ -15,18 +10,10 @@
 
 import { fetchCustomActions } from "./custom-action-client";
 import { isFixBugPresetUsable } from "./fix-bug-preset-usable";
-import { getSettings } from "./local-store";
-import {
-  BUILTIN_FIX_BUG_ACTION_ID,
-  buildFixBugInstruction,
-} from "./mr-inbox";
-import { prepareRunArgs } from "./run-args";
-import { fetchTask } from "./task-store";
+import { BUILTIN_FIX_BUG_ACTION_ID } from "./mr-inbox";
 
-export type FixBugLaunchResult =
-  | { kind: "started" }
-  | { kind: "missing-preset" }
-  | { kind: "aborted" };
+/** 预置可用性：usable 可预选推进；missing 需 confirm 重建 */
+export type FixBugPresetStatus = "usable" | "missing";
 
 /**
  * 用户确认后重装出厂「改bug」预置（skill + action）。
@@ -51,12 +38,11 @@ export const reinstallFixBugPreset = async (): Promise<void> => {
   }
 };
 
-export const launchFixBugAdvance = async (
-  taskId: string,
-  bug: { bugTitle: string; bugUrl: string; storyName?: string },
-): Promise<FixBugLaunchResult> => {
-  // 1. 预置不可用 → missing-preset（与 server 重建同一套 isFixBugPresetUsable）
-  // 看 action 实际挂载的 skill 是否可见——挂用户自定义 skill 也算可用，不硬编码 fix-bug
+/**
+ * 查「改bug」预置是否可用（action 存在 + 挂载 skill 可见）。
+ * 入口在跳深链前调用——预选的 action 得在列表里才有意义。
+ */
+export const checkFixBugPreset = async (): Promise<FixBugPresetStatus> => {
   const [defs, skillRes] = await Promise.all([
     fetchCustomActions(),
     fetch("/api/skills"),
@@ -80,64 +66,7 @@ export const launchFixBugAdvance = async (
       visibleSkillNames,
     })
   ) {
-    return { kind: "missing-preset" };
+    return "missing";
   }
-
-  // 2. 全量 task（要 actions 找上次用的模型；tail=1 不拉整卷 events）
-  const task = await fetchTask(taskId, { tail: 1 });
-  if (!task) throw new Error("任务不存在或已删除");
-
-  // 3. apiKey / model 基线校验（失败内部已 toast、这里直接收手）
-  const args = prepareRunArgs(task);
-  if (!args) return { kind: "aborted" };
-
-  // 模型优先级与推进弹窗一致：本 task 最近 action 实际用的 → task.model → settings 默认
-  const lastUsedModel = [...task.actions]
-    .reverse()
-    .find((a) => a.agentModel?.id?.trim())?.agentModel;
-  const model = lastUsedModel?.id?.trim() ? lastUsedModel : args.model;
-
-  const settings = getSettings();
-  // 设置页最新分支配置快照（与任务页 handleAdvance 同构、server 据此刷新 task 分支快照）
-  const repoBaseBranches: Record<string, string> = {};
-  const repoTestBranches: Record<string, string> = {};
-  const repoDevBranches: Record<string, string> = {};
-  for (const p of task.repoPaths) {
-    const repo = settings.repos.find((r) => r.path === p);
-    if (!repo) continue;
-    const ob = repo.onlineBranch?.trim();
-    if (ob) repoBaseBranches[p] = ob;
-    const tb = repo.testBranch?.trim();
-    if (tb) repoTestBranches[p] = tb;
-    const db = repo.devBranch?.trim();
-    if (db) repoDevBranches[p] = db;
-  }
-
-  const res = await fetch(`/api/tasks/${task.id}/advance`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      actionType: "custom",
-      customActionId: BUILTIN_FIX_BUG_ACTION_ID,
-      userInstruction: buildFixBugInstruction(bug),
-      apiKey: args.apiKey,
-      model,
-      // 按设置页偏好走默认（缺省 false = 起新 agent）、点按钮即确认不再进弹窗改
-      reuseAgent: settings.reuseAgentDefault ?? false,
-      gitToken: settings.gitToken?.trim() || undefined,
-      repoBaseBranches:
-        Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
-      repoTestBranches:
-        Object.keys(repoTestBranches).length > 0 ? repoTestBranches : undefined,
-      repoDevBranches:
-        Object.keys(repoDevBranches).length > 0 ? repoDevBranches : undefined,
-    }),
-  });
-  if (!res.ok) {
-    const data = (await res.json().catch(() => ({}))) as { error?: unknown };
-    throw new Error(
-      typeof data.error === "string" ? data.error : `HTTP ${res.status}`,
-    );
-  }
-  return { kind: "started" };
+  return "usable";
 };

@@ -67,7 +67,10 @@ import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 
 import { getSettings } from "@/lib/local-store";
-import { buildFixBugInstruction } from "@/lib/mr-inbox";
+import {
+  BUILTIN_FIX_BUG_ACTION_ID,
+  buildFixBugInstruction,
+} from "@/lib/mr-inbox";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchTask,
@@ -127,9 +130,10 @@ const TaskDetailPage = () => {
   const [streamingText, setStreamingText] = useState("");
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
-  // 收件箱「改bug」降级深链带来的指令预填（打开 dialog 后消费掉）
+  // 收件箱「改bug」深链带来的指令 + 预选 custom action（打开 dialog 后消费掉）
   const [advancePrefill, setAdvancePrefill] = useState<{
     instruction?: string;
+    customActionId?: string;
   } | null>(null);
   // SSE 重连 epoch：任意「让 agent 又活起来」的路径 ++、useTaskWatch 重连
   const [watchEpoch, setWatchEpoch] = useState(0);
@@ -222,22 +226,48 @@ const TaskDetailPage = () => {
     if (task?.id) markTaskSeen(task.id);
   }, [task?.id, task?.updatedAt]);
 
-  // 收件箱「改bug」降级深链（预置「改bug」action 被删时才走）：
-  // ?advance=fix-bug&bugTitle=&bugUrl=&storyName= → 打开推进 dialog、只预填 bug 指令、
-  // action 让用户自己选；随后清掉 query 防刷新重复弹。正常路径收件箱已直接推进、不经这里。
-  const canOpenFixBugAdvance = !!task && task.mode !== "chat";
+  // 收件箱「改bug」主路径深链（命中开发中任务 / 新建引流都走这里）：
+  // ?advance=fix-bug&bugTitle=&bugUrl=&storyName= → 打开推进 dialog、预填 bug 指令 + 预选「改bug」action；
+  // 随后清掉 query 防刷新重复弹。用户在弹窗里确认 / 调模型后自己启动。
+  // 一次性消费标记：router.replace 清参完成前 effect 可能因 task / searchParams 变化重跑，
+  // 不加标记会重开用户刚关掉的弹窗、冲掉草稿（token 含 id，切 task 自动失效）
+  const fixBugDeepLinkConsumedRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!canOpenFixBugAdvance || !id) return;
-    if (searchParams.get("advance") !== "fix-bug") return;
-    const bugTitle = searchParams.get("bugTitle") ?? "";
-    const bugUrl = searchParams.get("bugUrl") ?? "";
-    const storyName = searchParams.get("storyName") ?? undefined;
-    setAdvancePrefill({
-      instruction: buildFixBugInstruction({ bugTitle, bugUrl, storyName }),
-    });
-    setAdvanceDialogOpen(true);
+    if (!id) return;
+    if (searchParams.get("advance") !== "fix-bug") {
+      // 清参落地后复位：同一 bug 之后再次深链（相同 query）仍能触发
+      fixBugDeepLinkConsumedRef.current = null;
+      return;
+    }
+    const token = `${id}|${searchParams.toString()}`;
+    if (fixBugDeepLinkConsumedRef.current === token) return;
+    // task 未加载完先等（不消费、下轮重试）
+    if (!task) return;
+    fixBugDeepLinkConsumedRef.current = token;
+    // 与「推进」按钮的 canAdvance 口径对齐：chat 模式 / running / 终态不开弹窗（深链不能绕过叠跑推进）
+    const advanceable =
+      task.mode !== "chat" &&
+      task.runStatus !== "running" &&
+      task.repoStatus !== "merged" &&
+      task.repoStatus !== "abandoned";
+    if (advanceable) {
+      const bugTitle = searchParams.get("bugTitle") ?? "";
+      const bugUrl = searchParams.get("bugUrl") ?? "";
+      const storyName = searchParams.get("storyName") ?? undefined;
+      setAdvancePrefill({
+        instruction: buildFixBugInstruction({ bugTitle, bugUrl, storyName }),
+        // 预选出厂「改bug」；弹窗内若列表没有该 id（被删）会忽略、只留指令
+        customActionId: BUILTIN_FIX_BUG_ACTION_ID,
+      });
+      setAdvanceDialogOpen(true);
+    } else if (task.runStatus === "running") {
+      toast.info("任务正在运行中，等它跑完再推进改bug");
+    } else if (task.mode !== "chat") {
+      toast.info("任务已是终态（已合入 / 已放弃），恢复后才能推进");
+    }
+    // 不可推进也清 query：避免 URL 残留 ?advance=fix-bug 之后误触发
     router.replace(`/tasks/${id}`, { scroll: false });
-  }, [canOpenFixBugAdvance, id, searchParams, router]);
+  }, [task, id, searchParams, router]);
 
   // currentActionId 变化时把 selectedActionId 跟到 currentActionId
   // 用户主动切别的 action 后、currentActionId 又变（agent 又推进一步）时不强行带回——
@@ -514,6 +544,9 @@ const TaskDetailPage = () => {
       absorbTask(data.task);
       setSelectedActionId(data.action.id);
       setAdvanceDialogOpen(false);
+      // 程序化关弹窗不触发 onOpenChange，这里显式清预填——
+      // 否则改bug 深链推进成功后，下次手动推进仍会灌入旧 bug 指令
+      setAdvancePrefill(null);
     } catch (err) {
       toast.error(`推进失败：${(err as Error).message}`);
     } finally {

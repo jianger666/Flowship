@@ -433,7 +433,7 @@ describe("buildBugDetailUrl / buildFixBugInstruction / inboxGroupsVisibleForRole
     ).toBe("https://project.feishu.cn/abc/bug/detail/9");
   });
 
-  it("改bug 指令含标题 / 链接 / 关联需求", () => {
+  it("改bug 指令含标题 / 链接 / 关联需求；不带行为约束（约束在 fix-bug skill 里）", () => {
     const text = buildFixBugInstruction({
       bugTitle: "白屏",
       bugUrl: "https://project.feishu.cn/x/bug/detail/1",
@@ -442,7 +442,7 @@ describe("buildBugDetailUrl / buildFixBugInstruction / inboxGroupsVisibleForRole
     expect(text).toContain("改bug：白屏");
     expect(text).toContain("https://project.feishu.cn/x/bug/detail/1");
     expect(text).toContain("关联需求：登录改版");
-    expect(text).toContain("ask_user");
+    expect(text).not.toContain("ask_user");
   });
 
   it("buildStoryUrlFromBug：从 bug URL 推导同空间 story URL", () => {
