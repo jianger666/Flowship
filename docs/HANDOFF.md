@@ -287,6 +287,10 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-16 v1.1.17 发版：后置检查 artifact 读取竞态修复
+
+- **交卷/落盘竞态误报**（用户实测：ship 后置检查红条 ENOENT、但文件几百 ms 后就在、UI 正文正常）：事件流实锤 agent 把「最后一次写 artifact」和「submit_work 交卷」**同一秒并行发**（Cursor agent 支持同批并行工具调用、模型偶尔把收尾动作并发）——后置检查在 submit_work 到达瞬间读 artifact、写盘还在飞行中。修法：`action-checks.ts` 新增 `readArtifactWithRetry`（ENOENT 短退避 0.5/1/2/4s、最多等 ~7.5s；其它错误不重试照旧报）、plan/review/ship/custom/build 五处 artifact 读取全换——与 UI 侧 artifact 面板既有退避重试对齐。不走「prompt 教模型别并行发」路线（靠模型自觉不如 server 确定性兜底）。
+
 ### 2026-07-16 v1.1.16 发版：mac GUI PATH 补全 + Windows 慢 P0（埋点 + PowerShell 提速）+ 修复批
 
 > Windows「执行过程慢」调研见 `docs/cursor-sdk-windows-performance-investigation-2026-07-16.md`（GPT-5.6 初查、主线对 SDK 1.0.23 bundle 逐条核实：Windows 默认 PowerShell 执行器、每条命令冷启动 + 不带 -NoProfile 全量重跑 Profile + 状态 dump 逐环境变量 Add-Content 的 IO 风暴、5s close 兜底、CURSOR_AGENT=1 注入实锤）。强制 Git Bash（设 SHELL 可切）留待埋点数据支撑后再议。
@@ -299,19 +303,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
   - **划除死胡同**：等待回复态（awaiting_user）划除 awaiting_ack action 被 409「请先停止」、但该态顶栏没有停止按钮——/stop 收尾逻辑抽共享 `stop-task.ts:stopTaskAgent`、划除时自动停止收尾（关会话/清 ask/标 cancelled/回 idle、事件文案区分「划除时自动停止」）；agent 真在跑（running）仍 409。
   - **小恐龙吞系统快捷键**：全局键盘监听只看 `e.key`、Cmd+W 的 `w` 命中跳跃键被 preventDefault——带修饰键（Cmd/Ctrl/Alt）组合一律放行（Windows Ctrl 系同理）。
   - **meegle 安装位置写进 prompt**：agent shell PATH 被登录壳/沙箱重置时 `meegle` 报 command not found、agent 会去 app bundle 瞎翻——`buildGitlabAccessDirective` 注入真实绝对路径（`<dataRoot>/tools/bin`）+「找不到就用绝对路径」（task + chat 两链路共用）。
-
-### 2026-07-16 v1.1.15 发版：改bug 流程 v2 + 待回归合并按钮 + 按仓多预览位 + 修复批
-
-> 方案备忘见 `docs/proposal-fix-bug-flow-2026-07-16.md`（收件箱完整页 / 飞书全景页 / glab CLI 留到下一轮）。
-
-- **改bug skill v2**（`preset-skill-fix-bug.ts`）：新流程 = 疑问门（拉详情先自查、有疑问 `ask_user`）→ 复现 / 最小修复 / 自检 → 验收门（`ask_user` 请用户确认、有问题循环改）→ 收尾问「要不要建 MR + 流转 RESOLVED」（要则 push → `submit_mr` 到测试分支 → MR 链接只评论 **bug 工作项** → 流转；不要只写 artifact）。旧出厂原文保留为 `LEGACY_V1`：启动时磁盘内容 trim 精确相等才一次性升级（用户改过不动、幂等、`preset-actions.maybeUpgradeFixBugSkillContent`）；`chat-mcp.ts` submit_mr describe 同步对齐（ship / 改bug 提测 → 测试分支、不探 origin/HEAD）。
-- **待回归 bug+MR 一体（合并按钮）**：扫描器待回归组逐 bug 拉评论抠最新 MR（`pickLatestMrUrlFromComments`、复用 `extractMrUrlsFromText`）、有 gitToken 补 GitLab 详情（merged/closed 当无关联）；行内 MR 状态 chip（与待测组共用 `MrStatusChip`）+「打开 MR」常驻 + 可合时「合并」按钮（与通过/不通过相邻、语义独立、confirm 二次确认）；合并成功待测组整条剔除、bug 行只剥 MR 字段（合并≠回归通过、`stripBugMrFields` 共享单一源）；新增「近期变更补丁」`recentMutations`（10 分钟 TTL）——防扫描 in-flight 期间的合并 / 流转被完成后的整表写回覆盖复活。
-- **按仓多预览位**（`preview-manager.ts`）：单 slot → `Map<repoPath, slot>`——不同仓可同时各跑一个 dev server、同仓仍单位（再起顶掉、toast 提示）；pidfile 数组化（旧单对象格式兼容读、按仓杀残留、exit 回调清理进全局串行队列防读改写交错）；`/api/preview` GET 返 `slots` 数组、DELETE 带 repoPath 停单仓 / 不带全停；删任务 / 终结任务改 `stopPreviewsForTask`（修旧窄语义「只停恰好是当前位的」）；修旧 bug「一仓预览中另一仓预览按钮消失」。
-- **修复批（用户实测）**：
-  - **预览 dev server 被 app 的 PORT 环境变量劫持**（实锤：命令 `--port=8888` 实跑 8877）：壳给内置 Next server 注入的 `PORT=8876` 原封漏给 dev server、umi/webpack 优先读 env 顶掉 `--port`、8876 被 app 自己占着再自动 +1 → 全落 8877。spawn 前剔 `PORT` / `HOSTNAME`。
-  - **「产物已生成」重复弹**：从设置页返回 remount 后把存量产物误判「从无到有」——基线 ref 三态化（null = 初始加载未出结果）、remount 时产物已在则静默显示产物视图、只有挂载后亲眼看到的无→有才 toast。
-  - **复制路径 shell 引号化**（`shellQuotePath`）：worktree 在 `Application Support`（带空格）下、裸粘 `cd` 拆参——POSIX 单引号 + `'\''` 转义、Windows 盘符带空格双引号、纯安全字符原样。
-- 测试：`pickLatestMrUrlFromComments` / `shellQuotePath` / preview-manager 按仓多位（同仓顶掉、异仓并行）三份补齐、全量 387 用例过。
 
 ## 关键文件索引
 

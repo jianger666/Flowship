@@ -15,6 +15,19 @@
 
 ---
 
+### 2026-07-16 v1.1.15 发版：改bug 流程 v2 + 待回归合并按钮 + 按仓多预览位 + 修复批
+
+> 方案备忘见 `docs/proposal-fix-bug-flow-2026-07-16.md`（收件箱完整页 / 飞书全景页 / glab CLI 留到下一轮）。
+
+- **改bug skill v2**（`preset-skill-fix-bug.ts`）：新流程 = 疑问门（拉详情先自查、有疑问 `ask_user`）→ 复现 / 最小修复 / 自检 → 验收门（`ask_user` 请用户确认、有问题循环改）→ 收尾问「要不要建 MR + 流转 RESOLVED」（要则 push → `submit_mr` 到测试分支 → MR 链接只评论 **bug 工作项** → 流转；不要只写 artifact）。旧出厂原文保留为 `LEGACY_V1`：启动时磁盘内容 trim 精确相等才一次性升级（用户改过不动、幂等、`preset-actions.maybeUpgradeFixBugSkillContent`）；`chat-mcp.ts` submit_mr describe 同步对齐（ship / 改bug 提测 → 测试分支、不探 origin/HEAD）。
+- **待回归 bug+MR 一体（合并按钮）**：扫描器待回归组逐 bug 拉评论抠最新 MR（`pickLatestMrUrlFromComments`、复用 `extractMrUrlsFromText`）、有 gitToken 补 GitLab 详情（merged/closed 当无关联）；行内 MR 状态 chip（与待测组共用 `MrStatusChip`）+「打开 MR」常驻 + 可合时「合并」按钮（与通过/不通过相邻、语义独立、confirm 二次确认）；合并成功待测组整条剔除、bug 行只剥 MR 字段（合并≠回归通过、`stripBugMrFields` 共享单一源）；新增「近期变更补丁」`recentMutations`（10 分钟 TTL）——防扫描 in-flight 期间的合并 / 流转被完成后的整表写回覆盖复活。
+- **按仓多预览位**（`preview-manager.ts`）：单 slot → `Map<repoPath, slot>`——不同仓可同时各跑一个 dev server、同仓仍单位（再起顶掉、toast 提示）；pidfile 数组化（旧单对象格式兼容读、按仓杀残留、exit 回调清理进全局串行队列防读改写交错）；`/api/preview` GET 返 `slots` 数组、DELETE 带 repoPath 停单仓 / 不带全停；删任务 / 终结任务改 `stopPreviewsForTask`（修旧窄语义「只停恰好是当前位的」）；修旧 bug「一仓预览中另一仓预览按钮消失」。
+- **修复批（用户实测）**：
+  - **预览 dev server 被 app 的 PORT 环境变量劫持**（实锤：命令 `--port=8888` 实跑 8877）：壳给内置 Next server 注入的 `PORT=8876` 原封漏给 dev server、umi/webpack 优先读 env 顶掉 `--port`、8876 被 app 自己占着再自动 +1 → 全落 8877。spawn 前剔 `PORT` / `HOSTNAME`。
+  - **「产物已生成」重复弹**：从设置页返回 remount 后把存量产物误判「从无到有」——基线 ref 三态化（null = 初始加载未出结果）、remount 时产物已在则静默显示产物视图、只有挂载后亲眼看到的无→有才 toast。
+  - **复制路径 shell 引号化**（`shellQuotePath`）：worktree 在 `Application Support`（带空格）下、裸粘 `cd` 拆参——POSIX 单引号 + `'\''` 转义、Windows 盘符带空格双引号、纯安全字符原样。
+- 测试：`pickLatestMrUrlFromComments` / `shellQuotePath` / preview-manager 按仓多位（同仓顶掉、异仓并行）三份补齐、全量 387 用例过。
+
 ### 2026-07-15 v1.1.14 发版：改bug 走深链推进弹窗 + 更新链重定向安全 + review 修复批
 
 > 用户拍板「改bug 就和推进普通 action 一样」；本批含两轮子代理 review（4+2 个 grok 审查 agent）揪出的 P1 修复。

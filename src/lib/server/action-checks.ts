@@ -56,6 +56,25 @@ export interface ActionCheckResult {
   details: string;
 }
 
+/**
+ * 读 action artifact、对 ENOENT 做短退避重试（2026-07-16 用户实测竞态误报）：
+ * agent 调 submit_work 交卷与 artifact 写盘可能只差一瞬——后置检查立即读会 ENOENT
+ * 挂红条、但几百 ms 后文件就在（UI 侧 artifact 面板早有同款退避重试、这里补齐）。
+ * 只重试 ENOENT（文件还没落盘）；其它错误（权限等）立即抛、按原逻辑报失败。
+ */
+const readArtifactWithRetry = async (absPath: string): Promise<string> => {
+  const delays = [500, 1000, 2000, 4000];
+  for (let i = 0; ; i++) {
+    try {
+      return await fs.readFile(absPath, "utf-8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" || i >= delays.length) throw err;
+      await new Promise((r) => setTimeout(r, delays[i]));
+    }
+  }
+};
+
 export type ReadonlyRepoBaseline = {
   porcelain: string;
   /** null = 无 upstream、跳过 ahead 比对 */
@@ -134,7 +153,7 @@ const checkPlan = async (
   const absPath = getActionArtifactPath(task.id, action.n, action.type);
   let content: string;
   try {
-    content = await fs.readFile(absPath, "utf-8");
+    content = await readArtifactWithRetry(absPath);
   } catch (err) {
     return {
       passed: false,
@@ -179,7 +198,7 @@ const checkReview = async (
   const absPath = getActionArtifactPath(task.id, action.n, action.type);
   let content: string;
   try {
-    content = await fs.readFile(absPath, "utf-8");
+    content = await readArtifactWithRetry(absPath);
   } catch (err) {
     return {
       passed: false,
@@ -312,7 +331,7 @@ const checkShip = async (
   const absPath = getActionArtifactPath(task.id, action.n, action.type);
   let content: string;
   try {
-    content = await fs.readFile(absPath, "utf-8");
+    content = await readArtifactWithRetry(absPath);
   } catch (err) {
     return {
       passed: false,
@@ -478,7 +497,7 @@ const checkCustom = async (
   const absPath = getActionArtifactPath(task.id, action.n, action.type);
   let content: string;
   try {
-    content = await fs.readFile(absPath, "utf-8");
+    content = await readArtifactWithRetry(absPath);
   } catch (err) {
     return {
       passed: false,
@@ -611,9 +630,8 @@ const checkBuild = async (
   // 实装后线上冤枉同事初稿——该段有没有交给人审、不值得机器闸。
   if (action.artifactPath) {
     try {
-      const artifactContent = await fs.readFile(
+      const artifactContent = await readArtifactWithRetry(
         getActionArtifactPath(task.id, action.n, action.type),
-        "utf-8",
       );
       const requiredSections: { name: string; re: RegExp }[] = [
         { name: "全量校验", re: /全量校验/ },
