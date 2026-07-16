@@ -91,7 +91,7 @@ export interface UseSettingsResult {
   saveFieldValue: <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K],
-  ) => void;
+  ) => Promise<boolean>;
 }
 
 // 浅比较 / 深比较都不通用、按字段类型分别比较：
@@ -130,7 +130,7 @@ const isFieldEqual = (
     if (a.repos.length !== b.repos.length) return false;
     return a.repos.every((r, i) => repoConfigEquals(r, b.repos[i]));
   }
-  if (key === "reuseAgentDefault") {
+  if (key === "reuseAgentDefault" || key === "agentShellGitBash") {
     // boolean 字段：缺省视同 false 比较
     return (a[key] ?? false) === (b[key] ?? false);
   }
@@ -221,6 +221,11 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      agentShellGitBash: !isFieldEqual(
+        "agentShellGitBash",
+        settings,
+        savedSettings,
+      ),
       isolateWorktreeDefault: !isFieldEqual(
         "isolateWorktreeDefault",
         settings,
@@ -259,16 +264,17 @@ export const useSettings = (): UseSettingsResult => {
   const saveFieldValue = <K extends SettingsField>(
     key: K,
     value: FeAiFlowSettings[K],
-  ): void => {
+  ): Promise<boolean> => {
     const next: FeAiFlowSettings = { ...getSettings(), [key]: value };
     setSettings((prev) => ({ ...prev, [key]: value }));
-    void saveSettings(next).then((ok) => {
+    return saveSettings(next).then((ok) => {
       if (ok) {
         setSavedSettings((prev) => ({ ...prev, [key]: value }));
       } else {
         // 保存失败：savedSettings 不动 → 字段保持 dirty、离页仍会拦截提示
         toast.error("保存失败：配置没能写入 config.json、请重试");
       }
+      return ok;
     });
   };
 

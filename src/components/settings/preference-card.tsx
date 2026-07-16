@@ -55,11 +55,15 @@ interface PreferenceSectionsProps {
   branchTemplate: string;
   onBranchTemplateChange: (next: string) => void;
   onBranchTemplateCommit: (value: string) => void;
-  // 提交快捷键 / 续用 Agent / 隔离工作区默认值 / 系统通知
+  // 提交快捷键 / 续用 Agent / Agent shell Git Bash / 隔离工作区默认值 / 系统通知
   submitShortcut: SubmitShortcut;
   reuseAgentDefault: boolean;
   onSubmitShortcutChange: (next: SubmitShortcut) => void;
   onReuseAgentDefaultChange: (next: boolean) => void;
+  /** Windows：Agent shell 用 Git Bash（非 win32 不传也无妨、UI 按 platform 隐藏） */
+  agentShellGitBash: boolean;
+  /** 落盘完成后再 resolve，便于拨开关后刷新 agentShellKind */
+  onAgentShellGitBashChange: (next: boolean) => void | Promise<unknown>;
   isolateWorktreeDefault: boolean;
   onIsolateWorktreeDefaultChange: (next: boolean) => void;
   // 默认模型
@@ -84,6 +88,8 @@ export const PreferenceSections = ({
   reuseAgentDefault,
   onSubmitShortcutChange,
   onReuseAgentDefaultChange,
+  agentShellGitBash,
+  onAgentShellGitBashChange,
   isolateWorktreeDefault,
   onIsolateWorktreeDefaultChange,
   models,
@@ -102,8 +108,40 @@ export const PreferenceSections = ({
   >(null);
   // SDK 实际选用的壳类型（GET 一并返回）；null = 尚未拿到
   const [agentShellKind, setAgentShellKind] = useState<string | null>(null);
+  // 服务端 platform（仅 win32 显示「用 Git Bash」行）；null = 尚未拿到
+  const [shellPlatform, setShellPlatform] = useState<string | null>(null);
+  // 本机探测到的 Git Bash 路径；null = 未探测到 / 非 win32；undefined = 尚未请求回来
+  const [gitBashPath, setGitBashPath] = useState<string | null | undefined>(
+    undefined,
+  );
   // 「一键优化」请求中——防双击、按钮 spinner
   const [shellBoostBusy, setShellBoostBusy] = useState(false);
+
+  /** 拉 shell-boost 探测结果（挂载 + 拨 Git Bash 开关后刷新 agentShellKind） */
+  const refreshShellBoost = async (): Promise<void> => {
+    try {
+      const res = await fetch("/api/system/shell-boost");
+      const data = (await res.json()) as {
+        files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
+        agentShellKind?: string;
+        platform?: string;
+        gitBashPath?: string | null;
+      };
+      if (!Array.isArray(data.files)) return;
+      setShellBoostFiles(data.files);
+      if (typeof data.agentShellKind === "string") {
+        setAgentShellKind(data.agentShellKind);
+      }
+      if (typeof data.platform === "string") {
+        setShellPlatform(data.platform);
+      }
+      setGitBashPath(
+        typeof data.gitBashPath === "string" ? data.gitBashPath : null,
+      );
+    } catch {
+      // 探测失败不挡设置页
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -123,26 +161,33 @@ export const PreferenceSections = ({
     };
   }, []);
 
-  // 挂载时探测 shell 配置是否已注入守卫 + 当前 Agent shell 类型
+  // 挂载时探测 shell 配置是否已注入守卫 + 当前 Agent shell 类型 / Git Bash
   useEffect(() => {
     let alive = true;
-    void fetch("/api/system/shell-boost")
-      .then((r) => r.json())
-      .then(
-        (data: {
+    void (async () => {
+      try {
+        const res = await fetch("/api/system/shell-boost");
+        const data = (await res.json()) as {
           files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
           agentShellKind?: string;
-        }) => {
-          if (!alive || !Array.isArray(data.files)) return;
-          setShellBoostFiles(data.files);
-          if (typeof data.agentShellKind === "string") {
-            setAgentShellKind(data.agentShellKind);
-          }
-        },
-      )
-      .catch(() => {
-        // 探测失败不挡设置页；保持 null，仍显示一键优化按钮
-      });
+          platform?: string;
+          gitBashPath?: string | null;
+        };
+        if (!alive || !Array.isArray(data.files)) return;
+        setShellBoostFiles(data.files);
+        if (typeof data.agentShellKind === "string") {
+          setAgentShellKind(data.agentShellKind);
+        }
+        if (typeof data.platform === "string") {
+          setShellPlatform(data.platform);
+        }
+        setGitBashPath(
+          typeof data.gitBashPath === "string" ? data.gitBashPath : null,
+        );
+      } catch {
+        // 探测失败不挡设置页
+      }
+    })();
     return () => {
       alive = false;
     };
@@ -381,6 +426,36 @@ export const PreferenceSections = ({
           )
         }
       />
+
+      {/* 仅 Windows：把 SHELL 指到 Git Bash，绕开 SDK PowerShell 挂死 bug */}
+      {shellPlatform === "win32" ? (
+        <SettingRow
+          label="Agent shell 用 Git Bash"
+          hint={
+            gitBashPath ? (
+              <span className="block min-w-0 truncate" title={gitBashPath}>
+                {gitBashPath}
+              </span>
+            ) : gitBashPath === null ? (
+              "未检测到 Git Bash"
+            ) : (
+              "探测中…"
+            )
+          }
+          control={
+            <Switch
+              checked={agentShellGitBash}
+              disabled={!gitBashPath}
+              onCheckedChange={(v) => {
+                // 等落盘 + server apply SHELL 完成，再刷新「当前 Agent shell」展示
+                void Promise.resolve(onAgentShellGitBashChange(v)).then(() =>
+                  refreshShellBoost(),
+                );
+              }}
+            />
+          }
+        />
+      ) : null}
 
       <SettingRow
         stacked

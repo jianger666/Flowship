@@ -15,6 +15,19 @@
 
 ---
 
+### 2026-07-16 v1.1.16 发版：mac GUI PATH 补全 + Windows 慢 P0（埋点 + PowerShell 提速）+ 修复批
+
+> Windows「执行过程慢」调研见 `docs/cursor-sdk-windows-performance-investigation-2026-07-16.md`（GPT-5.6 初查、主线对 SDK 1.0.23 bundle 逐条核实：Windows 默认 PowerShell 执行器、每条命令冷启动 + 不带 -NoProfile 全量重跑 Profile + 状态 dump 逐环境变量 Add-Content 的 IO 风暴、5s close 兜底、CURSOR_AGENT=1 注入实锤）。强制 Git Bash（设 SHELL 可切）留待埋点数据支撑后再议。
+
+- **mac GUI 启动 PATH 补全**（`login-shell-path.ts`、用户实测 v1.1.15 预览 `yarn: command not found` 根因）：Dock / 自更新重启拉起的 app 继承 launchd 精简 PATH（无 nvm/homebrew/yarn）——启动时异步跑登录 shell（`$SHELL -ilc` + marker 夹取）拿真实 PATH 合并进 `process.env.PATH`（去重保序、失败/超时 10s 保持原值）；tools/bin 注入保持立即执行不等探测（review 揪出的竞态）。仅 darwin（Windows GUI 本来继承完整用户环境）。
+- **SDK run 性能埋点**（`run-perf.ts`、Windows 慢定责用）：消费 SDK 1.0.23 `onDelta/onStep`——tool started/completed 壁钟耗时 + shell `executionTime`、thinking 间隙/时长、step 耗时、turn token 用量（含 cache 读写）、run id / requestId；MCP 工具归一 `mcp:<server>:<tool>`；只记元数据不记内容；全部 9 个 `agent.send` 调用点接入（task 首轮/续接/交卷追问/ask 回复/问一问/重连 + chat 首轮/续聊/重连、各带 runKind）、回调全包 try/catch 零控制流改动。
+- **Agent shell 提速补 PowerShell**（`shell-boost.ts`）：Windows 探测/注入扩展到 PowerShell Profile 4 路径（5.1 / 7+ / 各自 OneDrive 变体、守卫 `if ($env:CURSOR_AGENT -eq "1") { return }`）+ 补 `.bash_profile`（mac/win、login shell 可能不 source .bashrc）；设置页显示「当前 Agent shell：PowerShell/Git Bash/zsh/bash」（`detectAgentShellKind` 复刻 SDK 选壳逻辑简版）；「无需优化」误导文案改中性「未检测到 shell 配置文件、无可注入项」。
+- **收件箱「全部已读」**：头部按钮（有未读才显示、完整面板才出、不弹确认）；`/api/mr-inbox/seen` 支持批量 `{ urls, seen }`（`setMrInboxSeenMany` 一次读写盘）、URL 归一抽 `normalizeInboxSeenUrl` 单一源。
+- **修复批（用户实测）**：
+  - **划除死胡同**：等待回复态（awaiting_user）划除 awaiting_ack action 被 409「请先停止」、但该态顶栏没有停止按钮——/stop 收尾逻辑抽共享 `stop-task.ts:stopTaskAgent`、划除时自动停止收尾（关会话/清 ask/标 cancelled/回 idle、事件文案区分「划除时自动停止」）；agent 真在跑（running）仍 409。
+  - **小恐龙吞系统快捷键**：全局键盘监听只看 `e.key`、Cmd+W 的 `w` 命中跳跃键被 preventDefault——带修饰键（Cmd/Ctrl/Alt）组合一律放行（Windows Ctrl 系同理）。
+  - **meegle 安装位置写进 prompt**：agent shell PATH 被登录壳/沙箱重置时 `meegle` 报 command not found、agent 会去 app bundle 瞎翻——`buildGitlabAccessDirective` 注入真实绝对路径（`<dataRoot>/tools/bin`）+「找不到就用绝对路径」（task + chat 两链路共用）。
+
 ### 2026-07-16 v1.1.15 发版：改bug 流程 v2 + 待回归合并按钮 + 按仓多预览位 + 修复批
 
 > 方案备忘见 `docs/proposal-fix-bug-flow-2026-07-16.md`（收件箱完整页 / 飞书全景页 / glab CLI 留到下一轮）。

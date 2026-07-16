@@ -41,6 +41,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   mcpServers: {},
   actionLayout: { order: [], hidden: [] },
   reuseAgentDefault: false,
+  // Windows Agent shell 用 Git Bash——默认关、非 win32 UI 也不展示
+  agentShellGitBash: false,
   isolateWorktreeDefault: true,
   disabledSkills: [],
   disabledRules: [],
@@ -153,6 +155,8 @@ export const normalizeSettings = (
     actionLayout: normalizeActionLayout(parsed.actionLayout),
     // v0.9.11：推进 dialog「续用当前 Agent」默认勾选、缺省 / 坏值回退 false（每 action 新 agent）
     reuseAgentDefault: parsed.reuseAgentDefault === true,
+    // Windows：Agent shell 用 Git Bash、缺省 / 坏值回退 false（不改 SHELL）
+    agentShellGitBash: parsed.agentShellGitBash === true,
     // v1.1.x：新任务默认隔离工作区、缺省 / 坏值回退 true（只有显式 false 才默认直跑原仓）
     isolateWorktreeDefault: parsed.isolateWorktreeDefault !== false,
     // v1.1.x：禁用 skill / rule 名单、坏值 / 缺省回退空（= 全启用）

@@ -7,6 +7,7 @@
 
 import { NextResponse } from "next/server";
 
+import { detectGitBashPath } from "@/lib/server/agent-shell";
 import {
   detectAgentShellKind,
   injectAllShellBoost,
@@ -15,13 +16,18 @@ import {
 
 export const runtime = "nodejs";
 
-/** 探测各目标配置：存在？已含守卫？附带当前 Agent shell 类型 */
+/** 探测各目标配置：存在？已含守卫？附带当前 Agent shell 类型 + Git Bash 路径 */
 export const GET = async () => {
   try {
-    const files = await probeAllShellBoost();
+    const [files, gitBashPath] = await Promise.all([
+      probeAllShellBoost(),
+      detectGitBashPath(),
+    ]);
     return NextResponse.json({
       files,
       agentShellKind: detectAgentShellKind(),
+      platform: process.platform,
+      gitBashPath,
     });
   } catch (err) {
     console.error("[GET /api/system/shell-boost] failed", err);

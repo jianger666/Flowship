@@ -200,6 +200,11 @@ export interface FeAiFlowSettings {
    */
   reuseAgentDefault?: boolean;
   /**
+   * Windows：Agent shell 改用 Git Bash（写 process.env.SHELL，绕开 SDK PowerShell 执行器挂死 bug）。
+   * 仅 win32 设置页可见；默认 false / 未配 = 不改 SHELL。
+   */
+  agentShellGitBash?: boolean;
+  /**
    * v1.1.x：新任务「隔离工作区」的默认值（默认 true）。只影响新建任务表单
    * 「直接在原仓库运行」的初始勾选（只读型用法如测试团队可默认关隔离）、可在表单临时改。
    */

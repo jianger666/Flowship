@@ -74,4 +74,14 @@ export const register = (): void => {
         err instanceof Error ? err.message : err,
       );
     });
+
+  // Windows：按设置把 SHELL 指到 Git Bash（绕开 SDK PowerShell 挂死 bug）；失败不阻断启动
+  void import("./lib/server/agent-shell")
+    .then((m) => m.applyAgentShellPreference())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 应用 Agent shell 偏好失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
 };

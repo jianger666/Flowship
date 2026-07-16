@@ -85,6 +85,18 @@ export const PUT = async (req: Request): Promise<Response> => {
     }
     // P0-02：0600 + 目录 0700 + tmp/rename（writeSettingsFileAtomic）
     await writeSettingsFileAtomic(guarded);
+    // Windows Agent shell 偏好：落盘后立刻改 process.env.SHELL，用户拨开关不用重启
+    try {
+      const { applyAgentShellPreference } = await import(
+        "@/lib/server/agent-shell"
+      );
+      await applyAgentShellPreference();
+    } catch (err) {
+      console.warn(
+        "[/api/settings] 应用 Agent shell 偏好失败（配置已保存）:",
+        err instanceof Error ? err.message : err,
+      );
+    }
     return NextResponse.json({
       ok: true,
       settings: maskSettingsSecrets(guarded),
