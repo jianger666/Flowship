@@ -53,6 +53,7 @@ import {
   captureReadonlyRepoBaselines,
 } from "./action-checks";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
+import { createRunPerfTracker } from "./run-perf";
 import { getChatMcpUrl } from "./chat-mcp";
 import {
   buildAgentMessage,
@@ -1640,13 +1641,25 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       const perfPromptMs = Date.now() - perfPromptStart;
 
       const perfSendStart = Date.now();
-      const run = await agent.send(superPrompt);
+      const promptBytes = Buffer.byteLength(superPrompt, "utf-8");
+      // SDK onDelta/onStep 细粒度耗时（thinking / tool / step / turn）——与下方 start-chain 汇总互补
+      const perfTracker = createRunPerfTracker({
+        taskId: task.id,
+        agentId: agent.agentId,
+        runKind: "task-first",
+        promptBytes,
+      });
+      const run = await agent.send(superPrompt, {
+        onDelta: perfTracker.onDelta,
+        onStep: perfTracker.onStep,
+      });
+      perfTracker.attachRun(run);
       // 单行汇总（不写 events、纯日志）：workspace=worktree 确保、mcp=健康探测+merge、
       // create=SDK 冷启动、prompt=素材收割+拼装（含首包字节数）、send=Run 受理、total=自点推进起
       console.log(
         `[perf] task=${task.id} action=${action.type} start-chain ` +
           `workspace=${perfWorkspaceMs}ms mcp=${perfMcpMs}ms create=${perfCreateMs}ms ` +
-          `prompt=${perfPromptMs}ms/${Math.round(Buffer.byteLength(superPrompt, "utf-8") / 1024)}KB ` +
+          `prompt=${perfPromptMs}ms/${Math.round(promptBytes / 1024)}KB ` +
           `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
       );
       // send 返回后的 pending 检查在 consumeSessionRun 入口（runningTasks.set 前）统一做
@@ -1763,9 +1776,19 @@ const tryAutoReconnect = async (
   try {
     // AgentSessionRecord.agent 是结构化最小面、这里收窄回完整实例（同 sendToTaskSession 口径）
     const resumedAgent = record.agent as AgentInstance;
-    const run = await resumedAgent.send(
-      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续当前工作——已完成的部分不用重做；处理完按正常流程交卷 / 提问 / 结束回复。）",
-    );
+    const reconnectPrompt =
+      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续当前工作——已完成的部分不用重做；处理完按正常流程交卷 / 提问 / 结束回复。）";
+    const perfTracker = createRunPerfTracker({
+      taskId: fresh.id,
+      agentId: resumedAgent.agentId,
+      runKind: "task-reconnect",
+      promptBytes: Buffer.byteLength(reconnectPrompt, "utf-8"),
+    });
+    const run = await resumedAgent.send(reconnectPrompt, {
+      onDelta: perfTracker.onDelta,
+      onStep: perfTracker.onStep,
+    });
+    perfTracker.attachRun(run);
     await writeEventAndPublish(task.id, {
       kind: "info",
       actionId: opts.errorActionId,
@@ -2115,7 +2138,17 @@ const consumeSessionRun = async (
         }
         let nextRun: SessionRun;
         try {
-          nextRun = await agent.send(followup);
+          const perfTracker = createRunPerfTracker({
+            taskId: task.id,
+            agentId: agent.agentId,
+            runKind: "task-submit-followup",
+            promptBytes: Buffer.byteLength(followup, "utf-8"),
+          });
+          nextRun = await agent.send(followup, {
+            onDelta: perfTracker.onDelta,
+            onStep: perfTracker.onStep,
+          });
+          perfTracker.attachRun(nextRun);
         } catch (err) {
           console.error(
             `[task-runner] task=${task.id} 交卷追问 send 失败`,
@@ -2385,7 +2418,7 @@ export const deliverAskReply = async (
   sendToTaskSession(
     task,
     buildAgentMessage({ kind: "user_reply", text: replyText, imagePaths }),
-    { errorActionId, creds },
+    { errorActionId, creds, runKind: "task-ask-reply" },
   );
 
 /**
@@ -2475,7 +2508,17 @@ export const startOneShotQuestion = (
         "- 大改动（整段功能 / 跨多文件重构）→ 说明建议、引导用户点「推进」走正式阶段（你没有任务链上下文、别硬扛）",
         "- 不要提交 commit / 提 MR、处理完自然结束回复",
       ].join("\n");
-      const run = await agent.send(prompt);
+      const perfTracker = createRunPerfTracker({
+        taskId: task.id,
+        agentId: agent.agentId,
+        runKind: "question",
+        promptBytes: Buffer.byteLength(prompt, "utf-8"),
+      });
+      const run = await agent.send(prompt, {
+        onDelta: perfTracker.onDelta,
+        onStep: perfTracker.onStep,
+      });
+      perfTracker.attachRun(run);
       // questionRun：任何出口（答完 / 被停 / 失败）都不动 action、runStatus 由 consume 统一归位
       await consumeSessionRun(task, agent, run, { questionRun: true });
     } catch (err) {
@@ -2524,7 +2567,13 @@ const waitForRunToDrain = async (
 const sendToTaskSession = async (
   task: Task,
   text: string,
-  opts: { errorActionId?: string; creds?: SessionCreds; questionRun?: boolean } = {},
+  opts: {
+    errorActionId?: string;
+    creds?: SessionCreds;
+    questionRun?: boolean;
+    /** 性能埋点 runKind；默认 questionRun→question，否则 task-followup */
+    runKind?: string;
+  } = {},
 ): Promise<boolean> => {
   if (!(await waitForRunToDrain(task.id))) {
     console.warn(
@@ -2540,7 +2589,19 @@ const sendToTaskSession = async (
   const agent = session.agent as AgentInstance;
   let run: SessionRun;
   try {
-    run = await agent.send(text);
+    const runKind =
+      opts.runKind ?? (opts.questionRun ? "question" : "task-followup");
+    const perfTracker = createRunPerfTracker({
+      taskId: task.id,
+      agentId: agent.agentId,
+      runKind,
+      promptBytes: Buffer.byteLength(text, "utf-8"),
+    });
+    run = await agent.send(text, {
+      onDelta: perfTracker.onDelta,
+      onStep: perfTracker.onStep,
+    });
+    perfTracker.attachRun(run);
   } catch (err) {
     // 续接 / 问一问 send 期间点停止会先 close 会话 → send 抛错；
     // 按 pending 收尾并返 true，避免 advanceTask 误判会话失效去 force-new

@@ -78,10 +78,14 @@ export const buildGitlabAccessDirective = (
     typeof gitHost === "string" && gitHost.trim().length > 0
       ? gitHost.trim()
       : "（host 见仓库 origin）";
+  // 内置 CLI 安装位置写进 prompt：agent shell 是登录壳、PATH 可能被 rc / 沙箱重置——
+  // `meegle` 报 command not found 时 agent 没有回退信息、会去 app bundle 里瞎翻浪费几轮
+  //（2026-07-16 用户实测）。跨平台统一此目录、Windows 下带 .exe 后缀。
+  const toolsBin = path.join(dataRootPath, "tools", "bin");
   return [
     "## GitLab 访问",
     `- 系统已配置 GitLab（host: ${host}）；API 凭证在 \`${dataRootPath}/config.json\` 的 **gitToken 字段**（PRIVATE-TOKEN header）——用 jq/node 只取该字段、**不要 cat 整个文件**（里面还有其它密钥）。`,
-    `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 已安装已登录、直接调、不要先跑 auth status 探测。`,
+    `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 已安装已登录（在 \`${toolsBin}\`）——shell 直调 \`meegle\` 报 command not found 就用该目录下的绝对路径、不要去别处找；不要先跑 auth status 探测。`,
   ].join("\n");
 };
 

@@ -180,6 +180,16 @@ export const parseGitlabMrUrl = (
 };
 
 /**
+ * 已读 key 归一：MR URL → canonical；bug / 其它 URL 原样（parse 认不出就回落 raw）。
+ * 单条 / 批量 /seen 共用，避免两套 key 漂移。
+ */
+export const normalizeInboxSeenUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  return parseGitlabMrUrl(trimmed)?.canonicalUrl ?? trimmed;
+};
+
+/**
  * 按 MR URL 去重：同一 URL 多条评论保留最新 atMs 那条。
  * 泛型：扫描器传带工作项信息的扩展类型、去重后原样保留附加字段。
  */

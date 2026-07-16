@@ -8,17 +8,21 @@
 import { NextResponse } from "next/server";
 
 import {
+  detectAgentShellKind,
   injectAllShellBoost,
   probeAllShellBoost,
 } from "@/lib/server/shell-boost";
 
 export const runtime = "nodejs";
 
-/** 探测各目标 rc：存在？已含守卫？ */
+/** 探测各目标配置：存在？已含守卫？附带当前 Agent shell 类型 */
 export const GET = async () => {
   try {
     const files = await probeAllShellBoost();
-    return NextResponse.json({ files });
+    return NextResponse.json({
+      files,
+      agentShellKind: detectAgentShellKind(),
+    });
   } catch (err) {
     console.error("[GET /api/system/shell-boost] failed", err);
     return NextResponse.json(

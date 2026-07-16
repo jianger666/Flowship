@@ -39,9 +39,16 @@ export const register = (): void => {
     );
   });
 
-  // V0.12：内置飞书 CLI（lark-cli / meegle）的 bin 目录注进 PATH——
-  // SDK agent 是本进程子进程、继承后 shell 直接调两个 CLI（没装时目录不存在、无副作用）
+  // PATH 两步补全：
+  // 1) 内置飞书 CLI（lark-cli / meegle）bin 目录**立即**注入（同以前、零等待）——
+  //    不能排在登录 shell 探测之后：探测最长 10s、期间起的 agent 会缺 meegle（review 竞态）
+  // 2) mac GUI 启动（Dock / 自更新重启）继承 launchd 精简 PATH、缺 nvm/homebrew/yarn——
+  //    异步跑登录 shell 拿真实 PATH 合并进来（预览 dev server exit 127 的根因、2026-07-16）；
+  //    合并是去重保序、不会把已注入的 tools/bin 丢掉
   void import("./lib/server/feishu-cli").then((m) => m.injectFeishuCliPath());
+  void import("./lib/server/login-shell-path").then((m) =>
+    m.mergeLoginShellPath(),
+  );
 
   // P0-02：启动幂等收紧密钥文件权限（config.json 0600 / mcp-oauth 0700+0600）
   // 失败只 warn、不阻断启动；日志不含文件内容

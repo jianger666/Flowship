@@ -287,6 +287,19 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-16 v1.1.16 发版：mac GUI PATH 补全 + Windows 慢 P0（埋点 + PowerShell 提速）+ 修复批
+
+> Windows「执行过程慢」调研见 `docs/cursor-sdk-windows-performance-investigation-2026-07-16.md`（GPT-5.6 初查、主线对 SDK 1.0.23 bundle 逐条核实：Windows 默认 PowerShell 执行器、每条命令冷启动 + 不带 -NoProfile 全量重跑 Profile + 状态 dump 逐环境变量 Add-Content 的 IO 风暴、5s close 兜底、CURSOR_AGENT=1 注入实锤）。强制 Git Bash（设 SHELL 可切）留待埋点数据支撑后再议。
+
+- **mac GUI 启动 PATH 补全**（`login-shell-path.ts`、用户实测 v1.1.15 预览 `yarn: command not found` 根因）：Dock / 自更新重启拉起的 app 继承 launchd 精简 PATH（无 nvm/homebrew/yarn）——启动时异步跑登录 shell（`$SHELL -ilc` + marker 夹取）拿真实 PATH 合并进 `process.env.PATH`（去重保序、失败/超时 10s 保持原值）；tools/bin 注入保持立即执行不等探测（review 揪出的竞态）。仅 darwin（Windows GUI 本来继承完整用户环境）。
+- **SDK run 性能埋点**（`run-perf.ts`、Windows 慢定责用）：消费 SDK 1.0.23 `onDelta/onStep`——tool started/completed 壁钟耗时 + shell `executionTime`、thinking 间隙/时长、step 耗时、turn token 用量（含 cache 读写）、run id / requestId；MCP 工具归一 `mcp:<server>:<tool>`；只记元数据不记内容；全部 9 个 `agent.send` 调用点接入（task 首轮/续接/交卷追问/ask 回复/问一问/重连 + chat 首轮/续聊/重连、各带 runKind）、回调全包 try/catch 零控制流改动。
+- **Agent shell 提速补 PowerShell**（`shell-boost.ts`）：Windows 探测/注入扩展到 PowerShell Profile 4 路径（5.1 / 7+ / 各自 OneDrive 变体、守卫 `if ($env:CURSOR_AGENT -eq "1") { return }`）+ 补 `.bash_profile`（mac/win、login shell 可能不 source .bashrc）；设置页显示「当前 Agent shell：PowerShell/Git Bash/zsh/bash」（`detectAgentShellKind` 复刻 SDK 选壳逻辑简版）；「无需优化」误导文案改中性「未检测到 shell 配置文件、无可注入项」。
+- **收件箱「全部已读」**：头部按钮（有未读才显示、完整面板才出、不弹确认）；`/api/mr-inbox/seen` 支持批量 `{ urls, seen }`（`setMrInboxSeenMany` 一次读写盘）、URL 归一抽 `normalizeInboxSeenUrl` 单一源。
+- **修复批（用户实测）**：
+  - **划除死胡同**：等待回复态（awaiting_user）划除 awaiting_ack action 被 409「请先停止」、但该态顶栏没有停止按钮——/stop 收尾逻辑抽共享 `stop-task.ts:stopTaskAgent`、划除时自动停止收尾（关会话/清 ask/标 cancelled/回 idle、事件文案区分「划除时自动停止」）；agent 真在跑（running）仍 409。
+  - **小恐龙吞系统快捷键**：全局键盘监听只看 `e.key`、Cmd+W 的 `w` 命中跳跃键被 preventDefault——带修饰键（Cmd/Ctrl/Alt）组合一律放行（Windows Ctrl 系同理）。
+  - **meegle 安装位置写进 prompt**：agent shell PATH 被登录壳/沙箱重置时 `meegle` 报 command not found、agent 会去 app bundle 瞎翻——`buildGitlabAccessDirective` 注入真实绝对路径（`<dataRoot>/tools/bin`）+「找不到就用绝对路径」（task + chat 两链路共用）。
+
 ### 2026-07-16 v1.1.15 发版：改bug 流程 v2 + 待回归合并按钮 + 按仓多预览位 + 修复批
 
 > 方案备忘见 `docs/proposal-fix-bug-flow-2026-07-16.md`（收件箱完整页 / 飞书全景页 / glab CLI 留到下一轮）。
@@ -299,18 +312,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
   - **「产物已生成」重复弹**：从设置页返回 remount 后把存量产物误判「从无到有」——基线 ref 三态化（null = 初始加载未出结果）、remount 时产物已在则静默显示产物视图、只有挂载后亲眼看到的无→有才 toast。
   - **复制路径 shell 引号化**（`shellQuotePath`）：worktree 在 `Application Support`（带空格）下、裸粘 `cd` 拆参——POSIX 单引号 + `'\''` 转义、Windows 盘符带空格双引号、纯安全字符原样。
 - 测试：`pickLatestMrUrlFromComments` / `shellQuotePath` / preview-manager 按仓多位（同仓顶掉、异仓并行）三份补齐、全量 387 用例过。
-
-### 2026-07-15 v1.1.14 发版：改bug 走深链推进弹窗 + 更新链重定向安全 + review 修复批
-
-> 用户拍板「改bug 就和推进普通 action 一样」；本批含两轮子代理 review（4+2 个 grok 审查 agent）揪出的 P1 修复。
-
-- **改bug 深链化（替代 2026-07-14「点按钮即确认直接 POST advance」）**：收件箱「改bug」→ 任务页深链 `?advance=fix-bug&bugTitle&bugUrl&storyName` → 打开推进弹窗、指令框预填 bug 事实信息（标题/链接/关联需求，**不带行为约束句**——复现/修复/HITL 流转的约束全在 fix-bug skill 里）、预选出厂「改bug」action、用户确认后启动。`fix-bug-advance.ts` 职责收窄为「查预置可用 + confirm 重建」；服务端零特殊分支、运行链路与普通 custom action 完全一致。
-- **深链防弹（review 揪出）**：一次性消费标记（token=`id|query`、防 replace 清参前 effect 重跑重开弹窗冲掉草稿；URL 无参时复位、同 bug 可再次深链）；与 canAdvance 口径对齐（running / merged / abandoned 不开弹窗、各有 toast、深链不能绕过叠跑推进）；推进成功显式清预填（程序化关弹窗不触发 onOpenChange）。
-- **推进弹窗选中保护**：`userTouchedActionRef`——用户手点过 action chip 后、迟到的自定义列表请求不再把选中盖回预选。
-- **收件箱流转下拉修复**：请求代数 `transitionsReqIdRef` 防竞态（状态变化作废 in-flight、过期响应丢弃）；失败保持 `transitions===null` 可重开重试（原 `[]` 会被守卫当已加载卡死）；菜单开着时状态变化立即按新状态重拉（防空白菜单）。
-- **mac 更新链重定向安全**：`fetchLatestVersion` 改 `redirect:"follow"` 从最终 URL 抠 tag（修 07-15 仓库改名事故——旧 `redirect:"manual"` 只读第一跳、改名重定向不含 /tag/ 导致存量客户端更新链断）+ 补 15s 超时与 `res.ok`。⚠️ 只保护装了本版的客户端：改名 Flowship 须等全员升到 ≥1.1.14 再执行；README / publish.repo 保持 fe-ai-flow。
-- **prompt 与 runtime 文案统一**：prompts/ 全量去「emit assistant_message」教法改「直接回复」（防 agent 把事件名当工具调）；`chat-pending.ts`〈产出审阅中〉注入、`chat-mcp.ts` 交卷/提测礼仪、`task-prompts.ts` 唤醒插话同步改词（〈产出审阅中〉字面量契约保留）。
-- 另：MCP 探测 fail 缓存拉到 5 分钟（与 ok 同、注释写明 401 场景权衡）；设置页 shell 提速卡「无需优化」态；一批过时注释校正（收件箱直推说明 / advance-dialog「不接外部 prefill」/ providers 轮询 10→5 分钟）。
 
 ## 关键文件索引
 

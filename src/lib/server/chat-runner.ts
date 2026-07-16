@@ -54,6 +54,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { dataRoot } from "./data-root";
+import { createRunPerfTracker } from "./run-perf";
 import {
   loadSkills,
   renderSkillsForPrompt,
@@ -758,13 +759,24 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     const perfPromptMs = Date.now() - perfPromptStart;
 
     const perfSendStart = Date.now();
-    run = await agent.send(initialPrompt);
+    const promptBytes = Buffer.byteLength(initialPrompt, "utf-8");
+    const perfTracker = createRunPerfTracker({
+      taskId: task.id,
+      agentId: agent.agentId,
+      runKind: "chat-first",
+      promptBytes,
+    });
+    run = await agent.send(initialPrompt, {
+      onDelta: perfTracker.onDelta,
+      onStep: perfTracker.onStep,
+    });
+    perfTracker.attachRun(run);
     // 单行汇总（不写 events、纯日志）：mcp=探测+merge、create=SDK 冷启动、
     // prompt=素材收割+拼装（含首包字节数）、send=Run 受理、total=自进入本函数起
     console.log(
       `[perf] task=${task.id} chat start-chain ` +
         `mcp=${perfMcpMs}ms create=${perfCreateMs}ms ` +
-        `prompt=${perfPromptMs}ms/${Math.round(Buffer.byteLength(initialPrompt, "utf-8") / 1024)}KB ` +
+        `prompt=${perfPromptMs}ms/${Math.round(promptBytes / 1024)}KB ` +
         `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
     );
 
@@ -965,9 +977,19 @@ const tryChatAutoReconnect = async (
   const rec = runningChats.get(task.id);
   if (!rec?.agent) return false;
   try {
-    const run = await rec.agent.send(
-      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续——已说完的不用重复、接着回答即可。）",
-    );
+    const reconnectPrompt =
+      "（系统消息：刚才网络连接中断、你上一轮回复被打断。请从中断的地方继续——已说完的不用重复、接着回答即可。）";
+    const perfTracker = createRunPerfTracker({
+      taskId: task.id,
+      agentId: rec.agent.agentId,
+      runKind: "chat-reconnect",
+      promptBytes: Buffer.byteLength(reconnectPrompt, "utf-8"),
+    });
+    const run = await rec.agent.send(reconnectPrompt, {
+      onDelta: perfTracker.onDelta,
+      onStep: perfTracker.onStep,
+    });
+    perfTracker.attachRun(run);
     await writeEventAndPublish(task.id, {
       kind: "info",
       text: `重连成功（第 ${attempt} 次）、AI 继续回复`,
@@ -1159,7 +1181,18 @@ export const sendChatMessage = async (
 
   let run: ChatRun;
   try {
-    run = await rec.agent.send(lines.join("\n"));
+    const prompt = lines.join("\n");
+    const perfTracker = createRunPerfTracker({
+      taskId: task.id,
+      agentId: rec.agent.agentId,
+      runKind: "chat-followup",
+      promptBytes: Buffer.byteLength(prompt, "utf-8"),
+    });
+    run = await rec.agent.send(prompt, {
+      onDelta: perfTracker.onDelta,
+      onStep: perfTracker.onStep,
+    });
+    perfTracker.attachRun(run);
   } catch (err) {
     console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
     closeChatSession(task.id);

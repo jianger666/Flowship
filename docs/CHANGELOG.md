@@ -15,6 +15,18 @@
 
 ---
 
+### 2026-07-15 v1.1.14 发版：改bug 走深链推进弹窗 + 更新链重定向安全 + review 修复批
+
+> 用户拍板「改bug 就和推进普通 action 一样」；本批含两轮子代理 review（4+2 个 grok 审查 agent）揪出的 P1 修复。
+
+- **改bug 深链化（替代 2026-07-14「点按钮即确认直接 POST advance」）**：收件箱「改bug」→ 任务页深链 `?advance=fix-bug&bugTitle&bugUrl&storyName` → 打开推进弹窗、指令框预填 bug 事实信息（标题/链接/关联需求，**不带行为约束句**——复现/修复/HITL 流转的约束全在 fix-bug skill 里）、预选出厂「改bug」action、用户确认后启动。`fix-bug-advance.ts` 职责收窄为「查预置可用 + confirm 重建」；服务端零特殊分支、运行链路与普通 custom action 完全一致。
+- **深链防弹（review 揪出）**：一次性消费标记（token=`id|query`、防 replace 清参前 effect 重跑重开弹窗冲掉草稿；URL 无参时复位、同 bug 可再次深链）；与 canAdvance 口径对齐（running / merged / abandoned 不开弹窗、各有 toast、深链不能绕过叠跑推进）；推进成功显式清预填（程序化关弹窗不触发 onOpenChange）。
+- **推进弹窗选中保护**：`userTouchedActionRef`——用户手点过 action chip 后、迟到的自定义列表请求不再把选中盖回预选。
+- **收件箱流转下拉修复**：请求代数 `transitionsReqIdRef` 防竞态（状态变化作废 in-flight、过期响应丢弃）；失败保持 `transitions===null` 可重开重试（原 `[]` 会被守卫当已加载卡死）；菜单开着时状态变化立即按新状态重拉（防空白菜单）。
+- **mac 更新链重定向安全**：`fetchLatestVersion` 改 `redirect:"follow"` 从最终 URL 抠 tag（修 07-15 仓库改名事故——旧 `redirect:"manual"` 只读第一跳、改名重定向不含 /tag/ 导致存量客户端更新链断）+ 补 15s 超时与 `res.ok`。⚠️ 只保护装了本版的客户端：改名 Flowship 须等全员升到 ≥1.1.14 再执行；README / publish.repo 保持 fe-ai-flow。
+- **prompt 与 runtime 文案统一**：prompts/ 全量去「emit assistant_message」教法改「直接回复」（防 agent 把事件名当工具调）；`chat-pending.ts`〈产出审阅中〉注入、`chat-mcp.ts` 交卷/提测礼仪、`task-prompts.ts` 唤醒插话同步改词（〈产出审阅中〉字面量契约保留）。
+- 另：MCP 探测 fail 缓存拉到 5 分钟（与 ok 同、注释写明 401 场景权衡）；设置页 shell 提速卡「无需优化」态；一批过时注释校正（收件箱直推说明 / advance-dialog「不接外部 prefill」/ providers 轮询 10→5 分钟）。
+
 ### 2026-07-15 v1.1.13 发版：Agent shell 提速一键优化
 
 > 背景：调研「SDK 比 IDE 慢」——Cursor 官方论坛已确认的性能 bug（agent shell 每条命令「快照恢复→执行→重新序列化 shell 状态」、rc 加载的重型工具函数表让序列化滚雪球、同会话越用越慢直至挂死；官方缓解 = rc 顶部加 `COMPOSER_NO_INTERACTION` 守卫跳过重型初始化）。本机实测：zsh -il 启动 3.0s→1.0s、函数表 -68%；用户今早真实任务实锤退化曲线（10 点 shell 中位 0.56s → 11 点中位 6.18s/p90 84.9s）。出处：forum.cursor.com/t/agent-shell-gets-progressively-slower-then-eventually-hangs/158535（Cursor 员工确认已立项、尚未发布修复）。

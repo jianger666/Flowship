@@ -631,6 +631,9 @@ export function DinoRunner({
   // ---- keyboard input ----
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // 带修饰键的组合键不归游戏管（Cmd+W 关窗 / Ctrl+R 刷新等）——否则 w/s 命中
+      // 跳跃分支被 preventDefault、系统快捷键全被吞（用户实测 Cmd+W 关不掉 app）
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       // In global mode, ignore keys aimed at form fields / editable content.
       const t = e.target as HTMLElement | null;
       if (t && (t.isContentEditable || /^(input|textarea|select)$/i.test(t.tagName))) return;

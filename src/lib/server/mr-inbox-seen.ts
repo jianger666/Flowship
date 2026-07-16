@@ -82,3 +82,28 @@ export const setMrInboxSeen = (
     await writePrivateFileAtomic(seenFilePath(), JSON.stringify(next, null, 2));
     return next;
   });
+
+/**
+ * 批量标已读 / 取消已读（一次读 + 一次写盘；勿循环调单条造成 N 次写）。
+ * urls 须已归一（canonical MR / 原样 bug URL）。
+ */
+export const setMrInboxSeenMany = (
+  urls: string[],
+  seen: boolean,
+): Promise<Record<string, number>> =>
+  enqueueSeenWrite(async () => {
+    const cur = pruneSeenMap(await readSeenRaw());
+    if (urls.length === 0) return cur;
+    const next = { ...cur };
+    const now = Date.now();
+    for (const url of urls) {
+      if (!url) continue;
+      if (seen) {
+        next[url] = now;
+      } else {
+        delete next[url];
+      }
+    }
+    await writePrivateFileAtomic(seenFilePath(), JSON.stringify(next, null, 2));
+    return next;
+  });

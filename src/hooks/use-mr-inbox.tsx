@@ -88,6 +88,8 @@ interface MrInboxContextValue {
   refresh: (opts?: { force?: boolean }) => Promise<void>;
   /** 标已读（url = mrUrl 或 bugUrl） */
   setSeen: (url: string, seen: boolean) => Promise<void>;
+  /** 批量标已读（POST 成功后再改本地 seenAtMs；失败抛错给调用方 toast） */
+  markAllSeen: (urls: string[]) => Promise<void>;
   mergeMr: (mrUrl: string) => Promise<void>;
   /** 忽略条目（url = mrUrl 或 bugUrl）：从三组永久移除 */
   ignoreItem: (url: string) => Promise<void>;
@@ -231,6 +233,46 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     } catch (err) {
       console.warn("[mr-inbox] 标已读失败:", err);
     }
+  }, []);
+
+  /** 批量标已读：等接口成功再改本地（失败可重试、不乐观误标） */
+  const markAllSeen = useCallback(async (urls: string[]) => {
+    const unique = [...new Set(urls.filter((u) => u.trim().length > 0))];
+    if (unique.length === 0) return;
+    const res = await fetch("/api/mr-inbox/seen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ urls: unique, seen: true }),
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    const now = Date.now();
+    const keySet = new Set(unique);
+    // 分组各用各的 key：MR→mrUrl、bug→bugUrl（bug 行也可能带 mrUrl，不能用 ?? 串）
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            pendingMr: prev.pendingMr.map((it) =>
+              keySet.has(it.mrUrl) ? { ...it, seenAtMs: now } : it,
+            ),
+            myBugs: prev.myBugs.map((it) =>
+              keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
+            ),
+            pendingRegression: prev.pendingRegression.map((it) =>
+              keySet.has(it.bugUrl) ? { ...it, seenAtMs: now } : it,
+            ),
+          }
+        : prev,
+    );
   }, []);
 
   const mergeMr = useCallback(async (mrUrl: string) => {
@@ -465,6 +507,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       unreadCount,
       refresh,
       setSeen,
+      markAllSeen,
       mergeMr,
       ignoreItem,
       listBugTransitions,
@@ -476,6 +519,7 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       unreadCount,
       refresh,
       setSeen,
+      markAllSeen,
       mergeMr,
       ignoreItem,
       listBugTransitions,

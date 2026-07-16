@@ -96,10 +96,12 @@ export const PreferenceSections = ({
 }: PreferenceSectionsProps) => {
   // 本机探测到的可用 IDE 集合（后端扫安装位置 + PATH）；null = 还没回来（全部可选）
   const [availableIdes, setAvailableIdes] = useState<Set<JumpIde> | null>(null);
-  // Agent shell 提速：各目标 rc 的探测结果；null = 还在请求 / 失败
+  // Agent shell 提速：各目标配置的探测结果；null = 还在请求 / 失败
   const [shellBoostFiles, setShellBoostFiles] = useState<
     Array<{ path: string; exists: boolean; boosted: boolean }> | null
   >(null);
+  // SDK 实际选用的壳类型（GET 一并返回）；null = 尚未拿到
+  const [agentShellKind, setAgentShellKind] = useState<string | null>(null);
   // 「一键优化」请求中——防双击、按钮 spinner
   const [shellBoostBusy, setShellBoostBusy] = useState(false);
 
@@ -121,7 +123,7 @@ export const PreferenceSections = ({
     };
   }, []);
 
-  // 挂载时探测 shell rc 是否已注入守卫
+  // 挂载时探测 shell 配置是否已注入守卫 + 当前 Agent shell 类型
   useEffect(() => {
     let alive = true;
     void fetch("/api/system/shell-boost")
@@ -129,9 +131,13 @@ export const PreferenceSections = ({
       .then(
         (data: {
           files?: Array<{ path: string; exists: boolean; boosted: boolean }>;
+          agentShellKind?: string;
         }) => {
           if (!alive || !Array.isArray(data.files)) return;
           setShellBoostFiles(data.files);
+          if (typeof data.agentShellKind === "string") {
+            setAgentShellKind(data.agentShellKind);
+          }
         },
       )
       .catch(() => {
@@ -142,13 +148,13 @@ export const PreferenceSections = ({
     };
   }, []);
 
-  // 已存在的目标 rc 全部已 boosted → 显示「已优化」、隐藏按钮
+  // 已存在的目标配置全部已 boosted → 显示「已优化」、隐藏按钮
   const shellBoostDone =
     shellBoostFiles !== null &&
     shellBoostFiles.some((f) => f.exists) &&
     shellBoostFiles.filter((f) => f.exists).every((f) => f.boosted);
-  // 一个目标 rc 都不存在（典型：Windows 无 Git Bash 配置）→ 没有重型 shell 初始化可跳、
-  // 本来就不慢——显示「无需优化」而不是给一个必然失败的按钮（2026-07-15 Windows 同事踩过）
+  // 目标文件一个都不存在 → 无可注入项（中性文案；别说「无需优化」，
+  // 以前 Windows 没探 PowerShell Profile 时那句会误导）
   const shellBoostNothingToDo =
     shellBoostFiles !== null && !shellBoostFiles.some((f) => f.exists);
 
@@ -179,8 +185,8 @@ export const PreferenceSections = ({
       } else if (already.length > 0) {
         toast.success("已是优化状态");
       } else {
-        // 没有 rc 可注入不是失败——本来就没有重型初始化、不需要优化
-        toast.info("未检测到 shell 配置文件、无需优化");
+        // 没有可注入文件不是失败——中性提示、不暗示「本来就够快」
+        toast.info("未检测到 shell 配置文件、无可注入项");
       }
       // 刷新探测态（含刚刚注入的）
       setShellBoostFiles(
@@ -341,16 +347,25 @@ export const PreferenceSections = ({
         }
       />
 
-      {/* Cursor SDK shell 状态序列化膨胀的官方缓解：rc 顶插非交互守卫 */}
+      {/* Cursor SDK shell 状态序列化膨胀的官方缓解：配置顶插 agent 守卫 */}
       <SettingRow
         label="Agent shell 提速"
-        hint="rc 顶部注入守卫、agent 命令跳过重型 shell 初始化"
+        hint={
+          <>
+            配置顶部注入守卫、agent 命令跳过重型初始化
+            {agentShellKind ? (
+              <span className="block text-muted-foreground">
+                当前 Agent shell：{agentShellKind}
+              </span>
+            ) : null}
+          </>
+        }
         control={
           shellBoostDone ? (
             <span className="text-sm text-muted-foreground">已优化 ✓</span>
           ) : shellBoostNothingToDo ? (
             <span className="text-sm text-muted-foreground">
-              无需优化（未检测到 shell 配置文件）
+              未检测到 shell 配置文件、无可注入项
             </span>
           ) : (
             <Button

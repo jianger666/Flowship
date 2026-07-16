@@ -13,6 +13,7 @@ import { useRouter } from "next/navigation";
 import {
   Bug,
   Check,
+  CheckCheck,
   CheckCircle2,
   ChevronDown,
   ExternalLink,
@@ -847,7 +848,12 @@ export const MrInboxPanel = ({
   filterWorkItemId,
   className,
 }: MrInboxPanelProps) => {
-  const { data, refreshing, refresh } = useMrInbox();
+  const { data, refreshing, refresh, markAllSeen } = useMrInbox();
+  // 「全部已读」请求进行中（按钮 disabled + 转圈、防双击）
+  const [markingAll, setMarkingAll] = useState(false);
+
+  // 完整 Popover 才出「全部已读」；任务详情条（带 filter）不占位
+  const isFullPanel = !filterWorkItemId;
 
   // 角色显隐：读本地 settings（与扫描端一致）；任务条场景强制只看 MR 组
   const visible = useMemo(() => {
@@ -878,6 +884,38 @@ export const MrInboxPanel = ({
     myBugs.filter((it) => it.seenAtMs === null).length +
     pendingRegression.filter((it) => it.seenAtMs === null).length;
 
+  const handleMarkAllSeen = async () => {
+    // 只扫当前角色可见分组里的未读（与 unreadHere 同源）
+    const urls: string[] = [];
+    if (showMr) {
+      for (const it of pendingMr) {
+        if (it.seenAtMs === null) urls.push(it.mrUrl);
+      }
+    }
+    if (showMyBugs) {
+      for (const it of myBugs) {
+        if (it.seenAtMs === null) urls.push(it.bugUrl);
+      }
+    }
+    if (showRegression) {
+      for (const it of pendingRegression) {
+        if (it.seenAtMs === null) urls.push(it.bugUrl);
+      }
+    }
+    if (urls.length === 0) return;
+    setMarkingAll(true);
+    try {
+      await markAllSeen(urls);
+      toast.success("已全部标为已读");
+    } catch (err) {
+      toast.error(
+        `全部已读失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setMarkingAll(false);
+    }
+  };
+
   return (
     <div className={cn("flex w-95 max-w-[92vw] flex-col", className)}>
       <div className="flex items-center justify-between gap-2 px-3 pt-1 pb-2">
@@ -890,16 +928,35 @@ export const MrInboxPanel = ({
             </span>
           )}
         </div>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={() => void refresh({ force: true })}
-          disabled={refreshing}
-          aria-label="刷新收件箱"
-          title="重新扫描"
-        >
-          <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
-        </Button>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {/* 完整面板 + 有未读才出；任务详情条 filter 模式不显示 */}
+          {isFullPanel && unreadHere > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => void handleMarkAllSeen()}
+              disabled={markingAll}
+            >
+              {markingAll ? (
+                <RefreshCw className="size-3.5 animate-spin" />
+              ) : (
+                <CheckCheck className="size-3.5" />
+              )}
+              全部已读
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => void refresh({ force: true })}
+            disabled={refreshing}
+            aria-label="刷新收件箱"
+            title="重新扫描"
+          >
+            <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+          </Button>
+        </div>
       </div>
 
       {data?.status === "ok" && data.gitTokenConfigured === false && showMr && (

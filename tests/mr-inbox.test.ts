@@ -23,6 +23,7 @@ import {
   isWorkitemReadyForQaInbox,
   listUnreadInboxItems,
   MR_INBOX_SEEN_MAX_AGE_MS,
+  normalizeInboxSeenUrl,
   parseGitlabMrUrl,
   parseMoqlBugQueryResponse,
   parseMoqlBugRow,
@@ -158,6 +159,23 @@ describe("parseGitlabMrUrl", () => {
   it("非 MR URL 返回 null", () => {
     expect(parseGitlabMrUrl("https://gitlab.example.com/g/r")).toBeNull();
     expect(parseGitlabMrUrl("not a url")).toBeNull();
+  });
+});
+
+describe("normalizeInboxSeenUrl", () => {
+  it("MR URL 归一到 canonical（去 query / 尾斜杠）", () => {
+    expect(
+      normalizeInboxSeenUrl(
+        "https://gitlab.example.com/g/r/-/merge_requests/7/?tab=diffs",
+      ),
+    ).toBe("https://gitlab.example.com/g/r/-/merge_requests/7");
+  });
+
+  it("非 MR URL（bug 链接）原样保留", () => {
+    const bug =
+      "https://project.feishu.cn/xxx/issue/detail/123456?parentUrl=%2Fwork";
+    expect(normalizeInboxSeenUrl(bug)).toBe(bug);
+    expect(normalizeInboxSeenUrl("  ")).toBe("");
   });
 });
 
