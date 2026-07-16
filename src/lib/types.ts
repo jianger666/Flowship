@@ -61,8 +61,8 @@ export interface ModelSelection {
 }
 
 /**
- * 单预览位状态（V0.10.1、client / server 共用——server 端管理见 preview-manager.ts）
- * 全局最多一个 dev server 在跑、点任务「预览」自动停旧起新
+ * 预览位状态（按仓多位、client / server 共用——server 端管理见 preview-manager.ts）
+ * 不同仓可同时各跑一个；同一仓全局仍只有一个位、再起同仓会顶掉前一个
  */
 export interface PreviewSlotStatus {
   taskId: string;

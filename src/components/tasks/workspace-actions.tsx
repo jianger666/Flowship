@@ -6,7 +6,8 @@
  * 渲染在任务详情页路径行下方：按仓分组（多仓有边框+短名 label、单仓扁平）
  * 1. 在 IDE 打开该仓工作区——cursor:// deep link
  * 2. 复制该仓实际工作目录路径——终端 cd 用
- * 3. 预览（全局单预览位）——设置页配了「预览启动命令」才显示；组内挂载
+ * 3. 预览（按仓多预览位）——设置页配了「预览启动命令」才显示；组内挂载；
+ *    不同仓可同时预览、同仓被别的任务占着时再起会顶掉
  * 4. 「任务文件夹」固定整条末尾
  *
  * 预览状态轮询 /api/preview（仅本组件挂载期间、4s 一次、本地调用很轻）。
@@ -32,7 +33,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { getIdeAnchorProps } from "@/lib/ide-open";
-import { getRepoWorkDirs } from "@/lib/path-utils";
+import { getRepoWorkDirs, shellQuotePath } from "@/lib/path-utils";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
   fetchPreviewStatus,
@@ -54,8 +55,8 @@ export const WorkspaceActions = ({ task }: Props) => {
     jumpIde: JumpIde;
     previewCommands: Record<string, string>;
   } | null>(null);
-  // 预览位全局状态（null = 没人在预览）
-  const [slot, setSlot] = useState<PreviewSlotStatus | null>(null);
+  // 全部预览位（按仓；本组件按 taskId+repoPath 挑「自己的」）
+  const [slots, setSlots] = useState<PreviewSlotStatus[]>([]);
   // 启动 / 停止请求进行中（防双击）
   const [busy, setBusy] = useState(false);
 
@@ -82,9 +83,9 @@ export const WorkspaceActions = ({ task }: Props) => {
     [prefs, task.repoPaths],
   );
 
-  const refreshSlot = useCallback(async () => {
+  const refreshSlots = useCallback(async () => {
     try {
-      setSlot(await fetchPreviewStatus());
+      setSlots(await fetchPreviewStatus());
     } catch {
       // 本地接口偶发失败不打扰、下一轮轮询自纠
     }
@@ -93,10 +94,10 @@ export const WorkspaceActions = ({ task }: Props) => {
   // 有可预览仓才轮询（4s、本地调用很轻）；没配预览命令的任务零开销
   useEffect(() => {
     if (candidates.length === 0) return;
-    void refreshSlot();
-    const timer = setInterval(() => void refreshSlot(), 4000);
+    void refreshSlots();
+    const timer = setInterval(() => void refreshSlots(), 4000);
     return () => clearInterval(timer);
-  }, [candidates.length, refreshSlot]);
+  }, [candidates.length, refreshSlots]);
 
   const workCwd = task.workCwd;
   // 任务数据目录（actions/ artifact + workspace/ 产出）——server hydrate 时算好带下来；
@@ -121,10 +122,11 @@ export const WorkspaceActions = ({ task }: Props) => {
       )
     : [];
 
-  // 按仓复制该仓实际工作目录（与 IDE 打开同源的 workDir），不再复制公共父目录
+  // 按仓复制该仓实际工作目录（与 IDE 打开同源的 workDir），不再复制公共父目录。
+  // shell 引号化：Application Support 带空格、裸粘到 cd 后面会拆参（用户实测踩过）
   const copyPath = async (dir: string) => {
     try {
-      await navigator.clipboard.writeText(dir);
+      await navigator.clipboard.writeText(shellQuotePath(dir));
       toast.success("工作区路径已复制");
     } catch {
       toast.error("复制失败、请手动复制");
@@ -136,9 +138,13 @@ export const WorkspaceActions = ({ task }: Props) => {
     setBusy(true);
     try {
       const res = await startTaskPreview(task.id, repoPath);
-      setSlot(res.slot);
+      // 合并进本地 slots（同仓替换），避免等下一轮轮询
+      setSlots((prev) => [
+        ...prev.filter((s) => s.repoPath !== res.slot.repoPath),
+        res.slot,
+      ]);
       if (res.replacedTaskTitle) {
-        toast.info(`已停掉「${res.replacedTaskTitle}」的预览`);
+        toast.info(`已停掉「${res.replacedTaskTitle}」对该仓的预览`);
       }
       toast.success("预览启动中、探测到地址后可点「打开」");
     } catch (err) {
@@ -148,11 +154,11 @@ export const WorkspaceActions = ({ task }: Props) => {
     }
   };
 
-  const stop = async () => {
+  const stop = async (repoPath: string) => {
     setBusy(true);
     try {
-      await stopTaskPreview();
-      setSlot(null);
+      await stopTaskPreview(repoPath);
+      setSlots((prev) => prev.filter((s) => s.repoPath !== repoPath));
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
@@ -160,17 +166,19 @@ export const WorkspaceActions = ({ task }: Props) => {
     }
   };
 
-  // 预览位属于本任务才展示运行态（别的任务在预览时、本任务仍显示「预览」、点了顶掉）
-  const mine = slot?.taskId === task.id ? slot : null;
   // 多仓才画组边框 + 短名 label；单仓保持扁平、避免无谓加重
   const multi = ideTargets.length > 1;
   const ideRepoSet = new Set(ideTargets.map((t) => t.repoPath));
   // candidates 理论上都挂在 ideTargets 上；对不上的兜底单独放（避免预览按钮消失）
   const orphanCandidates = candidates.filter((c) => !ideRepoSet.has(c.repoPath));
 
-  /** 某仓组内的预览区：未跑→启动钮；本仓在跑→运行态；本仓已退→重试 */
+  /** 某仓组内的预览区：未跑→启动钮；本仓本任务在跑→运行态；本仓本任务已退→重试。
+   *  每仓独立判断、互不隐藏（修旧 bug：一仓预览中另一仓按钮消失）。 */
   const renderPreviewForRepo = (repoPath: string) => {
-    if (mine && mine.repoPath === repoPath && !mine.exited) {
+    const mine = slots.find(
+      (s) => s.repoPath === repoPath && s.taskId === task.id,
+    );
+    if (mine && !mine.exited) {
       return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-muted-foreground">
@@ -203,7 +211,7 @@ export const WorkspaceActions = ({ task }: Props) => {
             size="sm"
             className={BTN_CLS}
             disabled={busy}
-            onClick={() => void stop()}
+            onClick={() => void stop(repoPath)}
             title="停止预览 dev server"
           >
             {busy ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
@@ -212,7 +220,7 @@ export const WorkspaceActions = ({ task }: Props) => {
         </>
       );
     }
-    if (mine && mine.repoPath === repoPath && mine.exited) {
+    if (mine && mine.exited) {
       return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive/80">
@@ -234,30 +242,31 @@ export const WorkspaceActions = ({ task }: Props) => {
         </>
       );
     }
-    // 本任务未占预览位（或占着别的仓）：有命令才显示启动钮；组 label 已表明归属、不再缀短名
-    if (!mine) {
-      const c = candidates.find((x) => x.repoPath === repoPath);
-      if (!c) return null;
-      return (
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          disabled={busy}
-          onClick={() => void start(c.repoPath)}
-          title={
-            `在任务工作区起 dev server：${c.command}` +
-            (slot && !slot.exited && slot.taskId !== task.id
-              ? `\n（会停掉「${slot.taskTitle}」正在跑的预览——全局单预览位）`
-              : "")
-          }
-        >
-          {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
-          预览
-        </Button>
-      );
-    }
-    return null;
+    // 本任务本仓未占预览位：有命令才显示启动钮
+    const c = candidates.find((x) => x.repoPath === repoPath);
+    if (!c) return null;
+    // 同仓被别的任务占着且未退出 → title 提示会顶掉
+    const occupiedByOther = slots.find(
+      (s) => s.repoPath === repoPath && s.taskId !== task.id && !s.exited,
+    );
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        className={BTN_CLS}
+        disabled={busy}
+        onClick={() => void start(c.repoPath)}
+        title={
+          `在任务工作区起 dev server：${c.command}` +
+          (occupiedByOther
+            ? `\n（会停掉「${occupiedByOther.taskTitle}」对该仓的预览）`
+            : "")
+        }
+      >
+        {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
+        预览
+      </Button>
+    );
   };
 
   return (

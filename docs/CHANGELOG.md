@@ -15,6 +15,15 @@
 
 ---
 
+### 2026-07-15 v1.1.13 发版：Agent shell 提速一键优化
+
+> 背景：调研「SDK 比 IDE 慢」——Cursor 官方论坛已确认的性能 bug（agent shell 每条命令「快照恢复→执行→重新序列化 shell 状态」、rc 加载的重型工具函数表让序列化滚雪球、同会话越用越慢直至挂死；官方缓解 = rc 顶部加 `COMPOSER_NO_INTERACTION` 守卫跳过重型初始化）。本机实测：zsh -il 启动 3.0s→1.0s、函数表 -68%；用户今早真实任务实锤退化曲线（10 点 shell 中位 0.56s → 11 点中位 6.18s/p90 84.9s）。出处：forum.cursor.com/t/agent-shell-gets-progressively-slower-then-eventually-hangs/158535（Cursor 员工确认已立项、尚未发布修复）。
+
+- **设置页偏好卡「Agent shell 提速」**：挂载探测各目标 rc（darwin/linux: ~/.zshrc + ~/.bashrc；win32: Git Bash ~/.bashrc；PowerShell 无官方守卫机制不处理）——已存在的 rc 全部含守卫 → 显「已优化 ✓」；否则「一键优化」按钮 → `POST /api/system/shell-boost` 顶部注入守卫两行（注释 + `[[ "$COMPOSER_NO_INTERACTION" == "1" ]] && return`）。
+- **安全三件套**：写前备份 `<file>.bak-YYYYMMDD`（已有不覆盖）、幂等（已含守卫跳过）、保留原文件 mode + tmp/rename 原子写；rc 不存在**不创建**（没 rc 就没重型加载、注入无意义）。
+- 实现：`src/lib/server/shell-boost.ts`（探测/注入纯逻辑可测、4 断言单测）+ `api/system/shell-boost` route（GET 探测 / POST 注入）。
+- 生效范围：新建的 agent 会话；对 rc 干净的用户无感、对装 oh-my-zsh/nvm/rvm 的用户每条 shell 快约 2 秒且防滚雪球挂死。
+
 ### 2026-07-15 v1.1.12 发版：停止竞态修复 + 预置重建防弹化 + 恐龙快跑等待视图 + 仓库改名
 
 > v1.1.11 发出当天下午按用户实测反馈继续打磨的一批。全程 grok 子代理实施、主线验收。

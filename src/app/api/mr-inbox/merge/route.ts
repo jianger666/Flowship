@@ -10,7 +10,10 @@ import { NextResponse } from "next/server";
 
 import { parseGitlabMrUrl } from "@/lib/mr-inbox";
 import { mergeMR } from "@/lib/server/gitlab-client";
-import { removeMrFromInboxCache } from "@/lib/server/mr-inbox-scanner";
+import {
+  markBugMrMergedInCache,
+  removeMrFromInboxCache,
+} from "@/lib/server/mr-inbox-scanner";
 import { errorResponse } from "@/lib/server/route-helpers";
 import { readSettingsFile } from "@/lib/server/settings-fs";
 
@@ -48,8 +51,9 @@ export const POST = async (req: Request) => {
     if (!result.ok) {
       return errorResponse(result.error, 502);
     }
-    // 合并成功：从收件箱缓存立即剔除（state=merged、下轮扫描也不会再出现）
+    // 合并成功：从待测 MR 组剔除；待回归 bug 行只清 MR 关联（bug 本身还在）
     removeMrFromInboxCache(parsed.canonicalUrl);
+    markBugMrMergedInCache(parsed.canonicalUrl);
     return NextResponse.json({ ok: true, mrUrl: parsed.canonicalUrl });
   } catch (err) {
     console.error("[POST /api/mr-inbox/merge] failed", err);

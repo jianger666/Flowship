@@ -15,7 +15,50 @@ import {
   looksLikePath,
   parsePathSegments,
   pathBasename,
+  shellQuotePath,
 } from "@/lib/path-utils";
+
+// 「复制路径」按钮回归：Application Support 带空格、裸粘到 cd 后面拆参（用户实测踩过）
+describe("shellQuotePath（复制路径给终端 cd 用）", () => {
+  it("普通路径原样返回、不加引号", () => {
+    expect(shellQuotePath("/Users/me/work/repo")).toBe("/Users/me/work/repo");
+    expect(shellQuotePath("~/my.repo-2/sub_dir")).toBe("~/my.repo-2/sub_dir");
+  });
+
+  it("带空格用单引号包住", () => {
+    expect(
+      shellQuotePath("/Users/me/Library/Application Support/fe-ai-flow"),
+    ).toBe("'/Users/me/Library/Application Support/fe-ai-flow'");
+  });
+
+  it("内部单引号按 POSIX 惯例转义（' → '\\''）", () => {
+    expect(shellQuotePath("/tmp/it's here")).toBe(`'/tmp/it'\\''s here'`);
+  });
+
+  it("$ / 反引号等特殊字符也走单引号字面化", () => {
+    expect(shellQuotePath("/tmp/a$b`c")).toBe("'/tmp/a$b`c'");
+  });
+
+  it("无空格 Windows 反斜杠路径原样返回（cmd 不认单引号、别乱包）", () => {
+    expect(shellQuotePath("D:\\IdeaProjects\\repo")).toBe("D:\\IdeaProjects\\repo");
+  });
+
+  it("无空格 Windows 正斜杠盘符路径原样返回", () => {
+    expect(shellQuotePath("C:/Users/x/AppData/Roaming/fe")).toBe(
+      "C:/Users/x/AppData/Roaming/fe",
+    );
+  });
+
+  it("带空格 Windows 正斜杠盘符路径用双引号包（cmd / PowerShell 认）", () => {
+    expect(shellQuotePath("C:/Program Files/fe ai/repo")).toBe(
+      '"C:/Program Files/fe ai/repo"',
+    );
+  });
+
+  it("带空格 Windows 反斜杠路径用双引号包", () => {
+    expect(shellQuotePath("D:\\My Docs\\repo")).toBe('"D:\\My Docs\\repo"');
+  });
+});
 
 // CR-11 回归：/api/repo-branches 与设置页手填校验共用的跨平台绝对路径判断——
 // 旧实现只认 `/` 开头、Windows 盘符 / UNC 仓库全被 400 / 拦在手填校验

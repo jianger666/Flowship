@@ -276,7 +276,7 @@ const buildMcpServer = (): McpServer => {
     },
   );
 
-  // ----------------- submit_mr 工具（V0.6.1、ship action 专用、同步调 GitLab API）-----------------
+  // ----------------- submit_mr 工具（V0.6.1、ship / 改bug 等提测建 MR、同步调 GitLab API）-----------------
   //
   // 这是「同步 RPC 工具」、跟 submit_work / ask_user 的「长阻塞 + shell long-poll」完全不同：
   //   - 不需要等用户操作、纯 server-side 调 GitLab REST API、立即返回结果
@@ -289,9 +289,10 @@ const buildMcpServer = (): McpServer => {
   srv.registerTool(
     "submit_mr",
     {
-      title: "提交 GitLab MR（ship 提测 / dev 联调 / custom 自定义 action 用、server 同步调 REST API）",
+      title:
+        "提交 GitLab MR（ship / 改bug 等提测建 MR、dev 联调、custom 自定义 action；server 同步调 REST API）",
       description: [
-        "ship（提测→该仓测试分支）/ dev 联调提 PR（→该仓 dev 分支）/ custom 自定义 action（→target 由该 action 的 playbook 决定）跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
+        "ship / 改bug 等 action 提测建 MR（→该仓测试分支）、dev 联调提 PR（→该仓 dev 分支）、其它 custom action（→target 由该 action 的 playbook 决定）跑通后、调本工具让 server 端用 GitLab REST API 创 MR。",
         "",
         "## 调用前置（agent 自己保证）",
         "",
@@ -336,7 +337,9 @@ const buildMcpServer = (): McpServer => {
       ].join("\n"),
       inputSchema: {
         task_id: z.string().describe("任务 id"),
-        action_id: z.string().describe("当前 ship / dev / custom action 的 id"),
+        action_id: z
+          .string()
+          .describe("当前 ship / 改bug（custom）/ dev / 其它 custom action 的 id"),
         repo_path: z
           .string()
           .describe(
@@ -353,7 +356,7 @@ const buildMcpServer = (): McpServer => {
         target_branch: z
           .string()
           .describe(
-            "MR 目标分支（见 super prompt「## 仓库分支配置」段、不要探 origin/HEAD）：ship 提测填该仓测试分支（没配则 `test`）；dev 联调填该仓 dev 分支；custom 自定义 action 按本 action 的 playbook + 指令决定提哪个分支（不限分支、分支名可参考「仓库分支配置」段）。",
+            "MR 目标分支（见 super prompt「## 仓库分支配置」段、不要探 origin/HEAD）：ship / 改bug 等提测填该仓测试分支（没配则 `test`）；dev 联调填该仓 dev 分支；其它 custom 按本 action 的 playbook + 指令决定（不限分支、分支名可参考「仓库分支配置」段）。",
           ),
         title: z.string().describe("MR 标题（建议格式：`[role] <task.title>`）"),
         description: z

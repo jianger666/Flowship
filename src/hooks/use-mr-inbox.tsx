@@ -25,6 +25,8 @@ import {
   isBugPendingFixStatus,
   listUnreadInboxItems,
   MR_INBOX_POLL_INTERVAL_MS,
+  stripBugMrFields,
+  type MrInboxMrDetail,
 } from "@/lib/mr-inbox";
 import { sendTaskNotification, setInboxBadge } from "@/lib/shell-notify";
 
@@ -44,20 +46,12 @@ export interface MrInboxEntry {
   workItemUrl?: string;
   commentSnippet: string;
   commentAtMs: number;
-  mr: {
-    title: string;
-    sourceBranch: string;
-    targetBranch: string;
-    state: string;
-    detailedMergeStatus: string;
-    hasConflicts: boolean;
-    mergeable: boolean;
-  } | null;
+  mr: MrInboxMrDetail | null;
   mrError?: string;
   seenAtMs: number | null;
 }
 
-/** bug 条目（我的 BUG / 待回归） */
+/** bug 条目（我的 BUG / 待回归；MR 字段仅待回归组会填） */
 export interface BugInboxEntry {
   bugUrl: string;
   workItemId: string;
@@ -67,6 +61,11 @@ export interface BugInboxEntry {
   priorityLabel?: string;
   relatedStoryId?: string;
   relatedStoryName?: string;
+  /** 关联 MR URL（评论里抠到的） */
+  mrUrl?: string;
+  /** GitLab 详情；无 token 时为 null */
+  mr?: MrInboxMrDetail | null;
+  mrError?: string;
   seenAtMs: number | null;
 }
 
@@ -250,11 +249,16 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       }
       throw new Error(message);
     }
+    // 待测 MR：整条剔除；待回归 / 我的 BUG：只清 MR 关联（与 markBugMrMergedInCache 对齐）
+    const clearBugMr = (it: BugInboxEntry): BugInboxEntry =>
+      it.mrUrl === mrUrl ? stripBugMrFields(it) : it;
     setData((prev) =>
       prev
         ? {
             ...prev,
             pendingMr: prev.pendingMr.filter((it) => it.mrUrl !== mrUrl),
+            myBugs: prev.myBugs.map(clearBugMr),
+            pendingRegression: prev.pendingRegression.map(clearBugMr),
           }
         : prev,
     );

@@ -287,6 +287,19 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-16 v1.1.15 发版：改bug 流程 v2 + 待回归合并按钮 + 按仓多预览位 + 修复批
+
+> 方案备忘见 `docs/proposal-fix-bug-flow-2026-07-16.md`（收件箱完整页 / 飞书全景页 / glab CLI 留到下一轮）。
+
+- **改bug skill v2**（`preset-skill-fix-bug.ts`）：新流程 = 疑问门（拉详情先自查、有疑问 `ask_user`）→ 复现 / 最小修复 / 自检 → 验收门（`ask_user` 请用户确认、有问题循环改）→ 收尾问「要不要建 MR + 流转 RESOLVED」（要则 push → `submit_mr` 到测试分支 → MR 链接只评论 **bug 工作项** → 流转；不要只写 artifact）。旧出厂原文保留为 `LEGACY_V1`：启动时磁盘内容 trim 精确相等才一次性升级（用户改过不动、幂等、`preset-actions.maybeUpgradeFixBugSkillContent`）；`chat-mcp.ts` submit_mr describe 同步对齐（ship / 改bug 提测 → 测试分支、不探 origin/HEAD）。
+- **待回归 bug+MR 一体（合并按钮）**：扫描器待回归组逐 bug 拉评论抠最新 MR（`pickLatestMrUrlFromComments`、复用 `extractMrUrlsFromText`）、有 gitToken 补 GitLab 详情（merged/closed 当无关联）；行内 MR 状态 chip（与待测组共用 `MrStatusChip`）+「打开 MR」常驻 + 可合时「合并」按钮（与通过/不通过相邻、语义独立、confirm 二次确认）；合并成功待测组整条剔除、bug 行只剥 MR 字段（合并≠回归通过、`stripBugMrFields` 共享单一源）；新增「近期变更补丁」`recentMutations`（10 分钟 TTL）——防扫描 in-flight 期间的合并 / 流转被完成后的整表写回覆盖复活。
+- **按仓多预览位**（`preview-manager.ts`）：单 slot → `Map<repoPath, slot>`——不同仓可同时各跑一个 dev server、同仓仍单位（再起顶掉、toast 提示）；pidfile 数组化（旧单对象格式兼容读、按仓杀残留、exit 回调清理进全局串行队列防读改写交错）；`/api/preview` GET 返 `slots` 数组、DELETE 带 repoPath 停单仓 / 不带全停；删任务 / 终结任务改 `stopPreviewsForTask`（修旧窄语义「只停恰好是当前位的」）；修旧 bug「一仓预览中另一仓预览按钮消失」。
+- **修复批（用户实测）**：
+  - **预览 dev server 被 app 的 PORT 环境变量劫持**（实锤：命令 `--port=8888` 实跑 8877）：壳给内置 Next server 注入的 `PORT=8876` 原封漏给 dev server、umi/webpack 优先读 env 顶掉 `--port`、8876 被 app 自己占着再自动 +1 → 全落 8877。spawn 前剔 `PORT` / `HOSTNAME`。
+  - **「产物已生成」重复弹**：从设置页返回 remount 后把存量产物误判「从无到有」——基线 ref 三态化（null = 初始加载未出结果）、remount 时产物已在则静默显示产物视图、只有挂载后亲眼看到的无→有才 toast。
+  - **复制路径 shell 引号化**（`shellQuotePath`）：worktree 在 `Application Support`（带空格）下、裸粘 `cd` 拆参——POSIX 单引号 + `'\''` 转义、Windows 盘符带空格双引号、纯安全字符原样。
+- 测试：`pickLatestMrUrlFromComments` / `shellQuotePath` / preview-manager 按仓多位（同仓顶掉、异仓并行）三份补齐、全量 387 用例过。
+
 ### 2026-07-15 v1.1.14 发版：改bug 走深链推进弹窗 + 更新链重定向安全 + review 修复批
 
 > 用户拍板「改bug 就和推进普通 action 一样」；本批含两轮子代理 review（4+2 个 grok 审查 agent）揪出的 P1 修复。
@@ -298,15 +311,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 - **mac 更新链重定向安全**：`fetchLatestVersion` 改 `redirect:"follow"` 从最终 URL 抠 tag（修 07-15 仓库改名事故——旧 `redirect:"manual"` 只读第一跳、改名重定向不含 /tag/ 导致存量客户端更新链断）+ 补 15s 超时与 `res.ok`。⚠️ 只保护装了本版的客户端：改名 Flowship 须等全员升到 ≥1.1.14 再执行；README / publish.repo 保持 fe-ai-flow。
 - **prompt 与 runtime 文案统一**：prompts/ 全量去「emit assistant_message」教法改「直接回复」（防 agent 把事件名当工具调）；`chat-pending.ts`〈产出审阅中〉注入、`chat-mcp.ts` 交卷/提测礼仪、`task-prompts.ts` 唤醒插话同步改词（〈产出审阅中〉字面量契约保留）。
 - 另：MCP 探测 fail 缓存拉到 5 分钟（与 ok 同、注释写明 401 场景权衡）；设置页 shell 提速卡「无需优化」态；一批过时注释校正（收件箱直推说明 / advance-dialog「不接外部 prefill」/ providers 轮询 10→5 分钟）。
-
-### 2026-07-15 v1.1.13 发版：Agent shell 提速一键优化
-
-> 背景：调研「SDK 比 IDE 慢」——Cursor 官方论坛已确认的性能 bug（agent shell 每条命令「快照恢复→执行→重新序列化 shell 状态」、rc 加载的重型工具函数表让序列化滚雪球、同会话越用越慢直至挂死；官方缓解 = rc 顶部加 `COMPOSER_NO_INTERACTION` 守卫跳过重型初始化）。本机实测：zsh -il 启动 3.0s→1.0s、函数表 -68%；用户今早真实任务实锤退化曲线（10 点 shell 中位 0.56s → 11 点中位 6.18s/p90 84.9s）。出处：forum.cursor.com/t/agent-shell-gets-progressively-slower-then-eventually-hangs/158535（Cursor 员工确认已立项、尚未发布修复）。
-
-- **设置页偏好卡「Agent shell 提速」**：挂载探测各目标 rc（darwin/linux: ~/.zshrc + ~/.bashrc；win32: Git Bash ~/.bashrc；PowerShell 无官方守卫机制不处理）——已存在的 rc 全部含守卫 → 显「已优化 ✓」；否则「一键优化」按钮 → `POST /api/system/shell-boost` 顶部注入守卫两行（注释 + `[[ "$COMPOSER_NO_INTERACTION" == "1" ]] && return`）。
-- **安全三件套**：写前备份 `<file>.bak-YYYYMMDD`（已有不覆盖）、幂等（已含守卫跳过）、保留原文件 mode + tmp/rename 原子写；rc 不存在**不创建**（没 rc 就没重型加载、注入无意义）。
-- 实现：`src/lib/server/shell-boost.ts`（探测/注入纯逻辑可测、4 断言单测）+ `api/system/shell-boost` route（GET 探测 / POST 注入）。
-- 生效范围：新建的 agent 会话；对 rc 干净的用户无感、对装 oh-my-zsh/nvm/rvm 的用户每条 shell 快约 2 秒且防滚雪球挂死。
 
 ## 关键文件索引
 

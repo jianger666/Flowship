@@ -67,9 +67,8 @@ import {
 } from "./task-worktrees";
 import { readSettingsFile } from "./settings-fs";
 import {
-  getPreviewStatus,
   killStalePreview,
-  stopPreview,
+  stopPreviewsForTask,
 } from "./preview-manager";
 import {
   DATA_DIR,
@@ -434,8 +433,7 @@ export const deleteTask = async (id: string): Promise<boolean> => {
   // 清 worktree / 删目录前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
   // best-effort：失败不挡删除主流程（跟下面 worktree 清理同口径）。
   try {
-    const slot = getPreviewStatus();
-    if (slot?.taskId === id) await stopPreview();
+    await stopPreviewsForTask(id);
   } catch (err) {
     console.warn(`[task-fs] deleteTask: 停预览失败（忽略）id=${id}`, err);
   }

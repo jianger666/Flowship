@@ -71,8 +71,7 @@ import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
 import {
-  getPreviewStatus,
-  stopPreview,
+  stopPreviewsForTask,
 } from "./preview-manager";
 import {
   ensureTaskWorktrees,
@@ -1077,8 +1076,7 @@ export const finalizeTask = async (
   // 清 worktree 前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
   // best-effort：失败不挡终结主流程。
   try {
-    const slot = getPreviewStatus();
-    if (slot?.taskId === taskId) await stopPreview();
+    await stopPreviewsForTask(taskId);
   } catch (err) {
     console.warn(
       `[task-runner] finalizeTask: 停预览失败（忽略）task=${taskId}`,

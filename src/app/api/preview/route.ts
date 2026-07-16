@@ -1,9 +1,9 @@
 /**
- * /api/preview——单预览位 dev server（V0.10.1）
+ * /api/preview——按仓多预览位 dev server
  *
- *   GET    → 当前预览位状态（null = 没在预览）
- *   POST   → 起预览：{ taskId, repoPath }——自动停掉上一个任务的预览（单位语义）
- *   DELETE → 停预览（幂等）
+ *   GET    → { slots: PreviewSlotStatus[] }（全部预览位）
+ *   POST   → 起预览：{ taskId, repoPath }——只顶掉同仓旧位、其它仓不动
+ *   DELETE → 停预览：body { repoPath? }——带 = 停该仓、不带 = 全停（幂等）
  *
  * workDir 由 server 按 task 算（隔离 task = worktree、否则原仓库）、不信 client 传目录。
  * CR-01：**命令也不信 client**——原来接受任意 command 直接 spawn(shell:true)、
@@ -20,12 +20,13 @@ import { getTaskWorkRepoPaths } from "@/lib/server/task-worktrees";
 import {
   getPreviewStatus,
   startPreview,
+  stopAllPreviews,
   stopPreview,
 } from "@/lib/server/preview-manager";
 
 export const runtime = "nodejs";
 
-export const GET = async () => NextResponse.json({ slot: getPreviewStatus() });
+export const GET = async () => NextResponse.json({ slots: getPreviewStatus() });
 
 export const POST = async (req: Request) => {
   let body: { taskId?: string; repoPath?: string };
@@ -74,7 +75,18 @@ export const POST = async (req: Request) => {
   return NextResponse.json({ slot: status, replacedTaskTitle });
 };
 
-export const DELETE = async () => {
-  await stopPreview();
+export const DELETE = async (req: Request) => {
+  let repoPath: string | undefined;
+  try {
+    const body = (await req.json()) as { repoPath?: string };
+    repoPath = body.repoPath?.trim() || undefined;
+  } catch {
+    // 无 body / 非法 JSON → 全停
+  }
+  if (repoPath) {
+    await stopPreview(repoPath);
+  } else {
+    await stopAllPreviews();
+  }
   return NextResponse.json({ ok: true });
 };

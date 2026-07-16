@@ -78,6 +78,55 @@ export const isWorkitemReadyForQaInbox = (nodes: MrInboxNode[]): boolean => {
 };
 
 /**
+ * GitLab MR 详情摘要（待测 MR 组 / 待回归 bug 关联 MR 共用、单一来源）。
+ * 字段对齐 gitlab-client getMR 的展示子集。
+ */
+export interface MrInboxMrDetail {
+  title: string;
+  sourceBranch: string;
+  targetBranch: string;
+  state: string;
+  detailedMergeStatus: string;
+  hasConflicts: boolean;
+  mergeable: boolean;
+}
+
+/**
+ * 剥掉 bug 条目上的 MR 关联字段（mrUrl / mr / mrError）——合并不等于回归通过、
+ * bug 行本身保留。server 缓存（BugInboxItem）与客户端 state（BugInboxEntry）
+ * 共用单一源，别在两边各手写一份字段重建。
+ */
+export const stripBugMrFields = <
+  T extends { mrUrl?: string; mr?: MrInboxMrDetail | null; mrError?: string },
+>(
+  it: T,
+): T => {
+  const rest = { ...it };
+  delete rest.mrUrl;
+  delete rest.mr;
+  delete rest.mrError;
+  return rest;
+};
+
+/**
+ * 从工作项评论列表挑「关联 MR」：最新评论里最新出现的那一个。
+ * - 评论按 createdAtMs 倒序扫，命中第一条含 MR 的评论即停
+ * - 同评论内多条 MR 取 extract 结果末位（= 文本中最后出现、已对本段去重）
+ * - 无 MR → undefined（调用方当「无关联」）
+ */
+export const pickLatestMrUrlFromComments = (
+  comments: ReadonlyArray<{ content: string; createdAtMs: number }>,
+): string | undefined => {
+  const sorted = [...comments].sort((a, b) => b.createdAtMs - a.createdAtMs);
+  for (const c of sorted) {
+    const urls = extractMrUrlsFromText(c.content);
+    if (urls.length === 0) continue;
+    return urls[urls.length - 1];
+  }
+  return undefined;
+};
+
+/**
  * 从文本挖 GitLab MR 链接（宽松：任意 host，路径含 `/-/merge_requests/<iid>`）。
  * 同一串里可能重复出现（markdown 链 `[url](url)`）——返回前先对本段去重保序。
  */

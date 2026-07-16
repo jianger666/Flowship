@@ -829,17 +829,17 @@ export const fetchActionDiff = async (
   );
 };
 
-// ----------------- 单预览位（V0.10.1）-----------------
+// ----------------- 按仓多预览位 -----------------
 
-export const fetchPreviewStatus = async (): Promise<PreviewSlotStatus | null> => {
-  const data = await handleJson<{ slot: PreviewSlotStatus | null }>(
+export const fetchPreviewStatus = async (): Promise<PreviewSlotStatus[]> => {
+  const data = await handleJson<{ slots: PreviewSlotStatus[] }>(
     await fetch("/api/preview", { cache: "no-store" }),
   );
-  return data.slot;
+  return data.slots;
 };
 
 /**
- * 起预览（单预览位：自动停掉上一个任务的 dev server）。返回被顶掉的任务标题（没有则 null）。
+ * 起预览（按仓单位：只顶掉同仓旧位）。返回被顶掉的同仓别的任务标题（没有则 null）。
  * CR-01：不再传 command——命令由 server 按 repoPath 从权威 config.json 查（防注入）。
  */
 export const startTaskPreview = async (
@@ -854,8 +854,13 @@ export const startTaskPreview = async (
     }),
   );
 
-export const stopTaskPreview = async (): Promise<void> => {
+/** 停预览：带 repoPath = 停该仓、不带 = 全停 */
+export const stopTaskPreview = async (repoPath?: string): Promise<void> => {
   await handleJson<{ ok: true }>(
-    await fetch("/api/preview", { method: "DELETE" }),
+    await fetch("/api/preview", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(repoPath ? { repoPath } : {}),
+    }),
   );
 };

@@ -1,19 +1,19 @@
 /**
- * 单预览位 dev server 管理（V0.10.1、worktree 隔离的配套体验）
+ * 按仓多预览位 dev server 管理（V0.10.1 单预览位 → 按仓多位）
  *
- * 背景：worktree 隔离后每个任务有独立工作区、想看页面效果得手动 cd 深路径起 dev server。
- * 本模块提供「全局唯一预览位」：任何时刻最多一个 dev server 在跑、点任务「预览」自动
- * 停掉上一个（无论属于哪个 task）、在当前任务工作区起新的——体验对齐单分支时代
- * 「永远只有一个本地服务」的心智、端口也不会互撞。
+ * 背景：worktree 隔离后每个任务有独立工作区、想看页面效果得手动 cd 深路径起
+ * dev server。本模块按 repoPath 隔离预览位——不同仓可同时各跑一个（端口天然
+ * 不同、不撞）；同一个仓全局仍只有一个位（同仓同端口会撞），别的任务再起同仓
+ * 预览时顶掉前一个。
  *
  * 设计要点：
  * - app 不理解命令语义：启动命令来自设置页 per-repo 配置（如 `npm run dev`）、只负责执行
  * - 进程组隔离：spawn detached + kill(-pid)——dev server 常拉子进程（node → webpack workers）、
  *   只杀父进程会留孤儿占端口
- * - pidfile 兜底（dataRoot/preview.json）：app 重启 / 崩溃后内存 slot 丢了、但 dev server
- *   还活着占端口——下次 start / boot 时按 pidfile 杀掉残留进程组
+ * - pidfile 兜底（dataRoot/preview.json）：数组记录各仓 pid；app 重启 / 崩溃后内存丢了、
+ *   但 dev server 还活着占端口——下次 start / boot 时按记录杀掉残留进程组
  * - CR-10：start/stop 走全局串行队列（并发不交错）；pidfile 记 command + 随机 token、
- *   杀前核验 PID 归属防误杀、exit 回调按 ref/token 只清自己那份
+ *   杀前核验 PID 归属防误杀、exit 回调按 token 只清自己那条
  * - 日志环形缓冲（最近 200 行）+ URL 探测（dev server 打出的 localhost 地址）、
  *   UI 轮询 status 拿去展示「打开」按钮 / 失败排查
  */
@@ -39,19 +39,16 @@ interface PreviewSlot extends Omit<PreviewSlotStatus, "logTail"> {
 
 // ----------------- 进程级单例（dev hot reload 下不同 chunk 共享） -----------------
 
-const SLOT_KEY = "__feAiFlowPreviewSlotV1__";
-const getSlotRef = (): { current: PreviewSlot | null } => {
-  const g = globalThis as unknown as Record<
-    string,
-    { current: PreviewSlot | null } | undefined
-  >;
-  if (!g[SLOT_KEY]) g[SLOT_KEY] = { current: null };
-  return g[SLOT_KEY]!;
+// V2：按 repoPath 多预览位；换 key 名避免 hot reload 残留 V1 单 slot 结构
+const SLOTS_KEY = "__feAiFlowPreviewSlotsV2__";
+const getSlotsRef = (): Map<string, PreviewSlot> => {
+  const g = globalThis as unknown as Record<string, Map<string, PreviewSlot> | undefined>;
+  if (!g[SLOTS_KEY]) g[SLOTS_KEY] = new Map();
+  return g[SLOTS_KEY]!;
 };
 
 // start / stop 全局串行队列（CR-10）：并发双 start / start+stop 交错会导致
-// 「先起的进程变孤儿没人能停」「stop 停掉的是别人」——所有变更操作排队执行、
-// 任意时刻最多一个在跑、slot 发布不再有竞态
+// 「先起的进程变孤儿没人能停」「stop 停掉的是别人」——所有变更操作排队执行
 const QUEUE_KEY = "__feAiFlowPreviewOpQueueV1__";
 const getQueueRef = (): { current: Promise<void> } => {
   const g = globalThis as unknown as Record<
@@ -77,45 +74,88 @@ const MAX_LOG_LINES = 200;
 
 // ----------------- pidfile（跨进程残留兜底 + 归属核验、CR-10） -----------------
 
-// app 重启后内存 slot 丢、dev server 还占着端口——pidfile 记下 spawn 的进程、
+// app 重启后内存 slot 丢、dev server 还占着端口——pidfile 记下各仓 spawn 的进程、
 // 下次 boot / start 前清残留。CR-10 起额外记 command + 随机 token：
 // - command：杀前对照 ps 输出、PID 被系统复用给无关进程时不误杀
-// - token：exit 回调 / stop 只清「自己写的那份」pidfile、旧进程迟到退出不清新进程的
+// - token：exit 回调 / stop 只清「自己写的那条」、旧进程迟到退出不清新进程的
 interface PidFileRecord {
   pid: number;
   at: number;
   token: string;
   command: string;
+  repoPath: string;
 }
 
 const pidFilePath = (): string => path.join(dataRoot(), "preview.json");
 
-const readPidFile = async (): Promise<Partial<PidFileRecord> | null> => {
+/** 读 pidfile 数组；旧格式单对象包成数组（升级后残留 dev server 还能被杀） */
+const readPidFile = async (): Promise<Partial<PidFileRecord>[]> => {
   try {
-    return JSON.parse(await fs.readFile(pidFilePath(), "utf8")) as Partial<PidFileRecord>;
+    const raw: unknown = JSON.parse(await fs.readFile(pidFilePath(), "utf8"));
+    if (Array.isArray(raw)) return raw as Partial<PidFileRecord>[];
+    if (raw && typeof raw === "object") return [raw as Partial<PidFileRecord>];
+    return [];
   } catch {
-    return null; // 没文件 / 内容坏
+    return [];
   }
 };
 
-const writePidFile = async (rec: PidFileRecord): Promise<void> => {
+const writePidFileAll = async (recs: PidFileRecord[]): Promise<void> => {
   try {
-    await fs.writeFile(pidFilePath(), JSON.stringify(rec));
+    if (recs.length === 0) {
+      await fs.rm(pidFilePath(), { force: true });
+      return;
+    }
+    await fs.writeFile(pidFilePath(), JSON.stringify(recs));
   } catch {
     // 写不进去只是失去崩溃兜底、不挡启动
   }
 };
 
+/** 写入 / 覆盖同仓那条（同仓单位语义） */
+const upsertPidFile = async (rec: PidFileRecord): Promise<void> => {
+  const cur = await readPidFile();
+  const kept: PidFileRecord[] = [];
+  for (const r of cur) {
+    if (typeof r.pid !== "number" || !r.token || !r.command) continue;
+    // 同仓旧记录丢掉（即将被本次覆盖）；无 repoPath 的旧格式也清掉（全局单位时代残留）
+    if (!r.repoPath || r.repoPath === rec.repoPath) continue;
+    kept.push({
+      pid: r.pid,
+      at: typeof r.at === "number" ? r.at : Date.now(),
+      token: r.token,
+      command: r.command,
+      repoPath: r.repoPath,
+    });
+  }
+  kept.push(rec);
+  await writePidFileAll(kept);
+};
+
 /**
- * 清 pidfile。带 token 时只清「token 匹配的那份」——旧进程迟到的 exit 回调
- * 绝不能把新进程刚写的 pidfile 清掉（否则崩溃兜底失效、残留进程没人杀）。
+ * 清 pidfile。带 token 时只删「token 匹配的那条」——旧进程迟到的 exit 回调
+ * 绝不能把新进程刚写的记录清掉（否则崩溃兜底失效、残留进程没人杀）。
+ * 不带 token = 整文件清（killStale 扫完后用）。
  */
 const clearPidFileIf = async (token?: string): Promise<void> => {
-  if (token) {
-    const cur = await readPidFile();
-    if (cur && cur.token !== token) return; // 不是自己写的、不动
+  if (!token) {
+    await fs.rm(pidFilePath(), { force: true }).catch(() => {});
+    return;
   }
-  await fs.rm(pidFilePath(), { force: true }).catch(() => {});
+  const cur = await readPidFile();
+  const next: PidFileRecord[] = [];
+  for (const r of cur) {
+    if (r.token === token) continue; // 自己那条、删
+    if (typeof r.pid !== "number" || !r.token || !r.command || !r.repoPath) continue;
+    next.push({
+      pid: r.pid,
+      at: typeof r.at === "number" ? r.at : Date.now(),
+      token: r.token,
+      command: r.command,
+      repoPath: r.repoPath,
+    });
+  }
+  await writePidFileAll(next);
 };
 
 // 查进程当前命令行（杀前核验用）。进程不存在 / 查不了返 null。
@@ -184,26 +224,57 @@ const killProcessGroup = async (pid: number): Promise<void> => {
   tryKill("SIGKILL");
 };
 
+/** 对单条 pidfile 记录做归属核验后 kill（匹配才杀、不匹配只丢记录） */
+const killOneStaleRecord = async (rec: Partial<PidFileRecord>): Promise<void> => {
+  if (typeof rec.pid !== "number" || rec.pid <= 1) return;
+  const psCommand = await getProcessCommand(rec.pid);
+  if (psCommand === null) {
+    // 进程已不在
+  } else if (typeof rec.command === "string" && rec.command && pidLooksOurs(psCommand, rec.command)) {
+    await killProcessGroup(rec.pid);
+  } else {
+    console.warn(
+      `[preview] pidfile 的 PID ${rec.pid} 命令行对不上（现为「${psCommand}」）、疑似被复用、不发信号只清记录`,
+    );
+  }
+};
+
 /**
- * 清上一次进程遗留的 dev server（pidfile 兜底、boot / 每次 start 前调）。
+ * 清上一次进程遗留的全部 dev server（pidfile 兜底、boot 调）。
  * CR-10：杀前核验 PID 归属——对不上（PID 被复用 / 旧格式 pidfile 无 command）
- * 只清 pidfile 不发信号、绝不误杀无关进程。
+ * 只清记录不发信号、绝不误杀无关进程。
  */
 export const killStalePreview = async (): Promise<void> => {
-  const rec = await readPidFile();
-  if (rec && typeof rec.pid === "number" && rec.pid > 1) {
-    const psCommand = await getProcessCommand(rec.pid);
-    if (psCommand === null) {
-      // 进程已不在、只剩清文件
-    } else if (typeof rec.command === "string" && rec.command && pidLooksOurs(psCommand, rec.command)) {
-      await killProcessGroup(rec.pid);
-    } else {
-      console.warn(
-        `[preview] pidfile 的 PID ${rec.pid} 命令行对不上（现为「${psCommand}」）、疑似被复用、不发信号只清 pidfile`,
-      );
-    }
+  const recs = await readPidFile();
+  for (const rec of recs) {
+    await killOneStaleRecord(rec);
   }
   await clearPidFileIf();
+};
+
+/**
+ * 只清指定仓的 pidfile 残留（start 同仓顶掉前调用、不动其它仓）。
+ * 无 repoPath 的旧格式记录也一并清（全局单位时代残留、归属不明）。
+ */
+const killStalePreviewForRepo = async (repoPath: string): Promise<void> => {
+  const recs = await readPidFile();
+  const keep: PidFileRecord[] = [];
+  for (const rec of recs) {
+    const sameRepo = !rec.repoPath || rec.repoPath === repoPath;
+    if (sameRepo) {
+      await killOneStaleRecord(rec);
+      continue;
+    }
+    if (typeof rec.pid !== "number" || !rec.token || !rec.command || !rec.repoPath) continue;
+    keep.push({
+      pid: rec.pid,
+      at: typeof rec.at === "number" ? rec.at : Date.now(),
+      token: rec.token,
+      command: rec.command,
+      repoPath: rec.repoPath,
+    });
+  }
+  await writePidFileAll(keep);
 };
 
 // 从 dev server 输出探本地访问地址（umi/vite/next 都会打 localhost URL）
@@ -224,21 +295,47 @@ const toStatus = (slot: PreviewSlot): PreviewSlotStatus => ({
 
 // ----------------- 对外 API -----------------
 
-export const getPreviewStatus = (): PreviewSlotStatus | null => {
-  const slot = getSlotRef().current;
-  return slot ? toStatus(slot) : null;
+/** 返回当前全部预览位状态（按仓） */
+export const getPreviewStatus = (): PreviewSlotStatus[] =>
+  [...getSlotsRef().values()].map(toStatus);
+
+/** 停指定仓预览（没有在跑也算成功、幂等）。经全局串行队列。 */
+export const stopPreview = (repoPath: string): Promise<void> =>
+  enqueue(() => doStopPreview(repoPath));
+
+/** 停全部预览位（boot / DELETE 不带 repoPath / 全清用） */
+export const stopAllPreviews = (): Promise<void> => enqueue(doStopAllPreviews);
+
+/** 停掉属于某 task 的所有 slot（删任务 / 终结任务前调用） */
+export const stopPreviewsForTask = (taskId: string): Promise<void> =>
+  enqueue(() => doStopPreviewsForTask(taskId));
+
+const doStopPreview = async (repoPath: string): Promise<void> => {
+  const map = getSlotsRef();
+  const slot = map.get(repoPath);
+  if (!slot) return;
+  map.delete(repoPath);
+  if (slot.proc.pid) await killProcessGroup(slot.proc.pid);
+  // 只清自己那条（token 核验）——理论上串行队列已保证无交错、token 是带子
+  await clearPidFileIf(slot.token);
 };
 
-/** 停当前预览（没有在跑也算成功、幂等）。经全局串行队列、不与 start 交错（CR-10）。 */
-export const stopPreview = (): Promise<void> => enqueue(doStopPreview);
+const doStopAllPreviews = async (): Promise<void> => {
+  const map = getSlotsRef();
+  const paths = [...map.keys()];
+  for (const repoPath of paths) {
+    await doStopPreview(repoPath);
+  }
+};
 
-const doStopPreview = async (): Promise<void> => {
-  const ref = getSlotRef();
-  const slot = ref.current;
-  ref.current = null;
-  if (slot && slot.proc.pid) await killProcessGroup(slot.proc.pid);
-  // 只清自己那份（token 核验）——理论上串行队列已保证无交错、token 是带子
-  await clearPidFileIf(slot?.token);
+const doStopPreviewsForTask = async (taskId: string): Promise<void> => {
+  const map = getSlotsRef();
+  const paths = [...map.values()]
+    .filter((s) => s.taskId === taskId)
+    .map((s) => s.repoPath);
+  for (const repoPath of paths) {
+    await doStopPreview(repoPath);
+  }
 };
 
 export interface StartPreviewInput {
@@ -251,10 +348,9 @@ export interface StartPreviewInput {
 }
 
 /**
- * 起预览（单预览位语义：先停旧、再在 workDir 起 command）。
- * 经全局串行队列（CR-10）：并发双 start 顺序执行、后到的顶掉先到的、
- * 不会出现「两个都 spawn、先者变没人管的孤儿」。
- * @returns 被顶掉的上一个任务标题（UI toast 用、没有则 null）
+ * 起预览（按仓单位：只停同 repoPath 旧位、其它仓不动）。
+ * 经全局串行队列（CR-10）：同仓并发双 start 顺序执行、后到的顶掉先到的。
+ * @returns 被顶掉的同仓别的任务标题（UI toast 用、没有则 null）
  */
 export const startPreview = (
   input: StartPreviewInput,
@@ -264,32 +360,38 @@ export const startPreview = (
 const doStartPreview = async (
   input: StartPreviewInput,
 ): Promise<{ replacedTaskTitle: string | null; status: PreviewSlotStatus }> => {
-  const ref = getSlotRef();
-  const replaced = ref.current;
+  const map = getSlotsRef();
+  const replaced = map.get(input.repoPath) ?? null;
   const replacedTaskTitle =
     replaced && !replaced.exited && replaced.taskId !== input.taskId
       ? replaced.taskTitle
       : null;
 
-  // 停旧（内存 slot）+ 杀跨进程残留（pidfile）——两条都清才能保证端口空出来
+  // 只停同仓旧位（内存）+ 同仓 pidfile 残留——不动其它仓
   //（直接调 do 版本：本函数已在队列内、再 enqueue 会自锁）
-  await doStopPreview();
-  await killStalePreview();
+  await doStopPreview(input.repoPath);
+  await killStalePreviewForRepo(input.repoPath);
 
   // shell 模式跑用户配置的命令串（可能带 && / 环境变量前缀）。
   // - unix：detached 自成进程组、kill(-pid) 整组杀
   // - Windows：detached 会给子进程开独立控制台黑框（用户可见）、而树杀走 taskkill /T
   //   本就不依赖进程组 → 不 detach + windowsHide 压掉窗口
+  // 剔掉 app 自用的 PORT / HOSTNAME（Electron 壳给内置 Next server 注入的）——
+  // 原封漏给 dev server 会被 umi/webpack 等优先读走、顶掉用户 --port 配置，
+  // 再因 8876 被 app 自己占着自动 +1 全跑到 8877（用户实测：--port=8888 实跑 8877）
+  const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "0" };
+  delete env.PORT;
+  delete env.HOSTNAME;
   const proc = spawn(input.command, {
     cwd: input.workDir,
     shell: true,
     detached: process.platform !== "win32",
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, FORCE_COLOR: "0" },
+    env,
   });
 
-  // 随机 ownership token：pidfile 归属核验（exit 回调 / stop 只清自己写的那份）
+  // 随机 ownership token：pidfile 归属核验（exit 回调 / stop 只清自己写的那条）
   const token = randomBytes(8).toString("hex");
   const slot: PreviewSlot = {
     taskId: input.taskId,
@@ -328,22 +430,27 @@ const doStartPreview = async (
   proc.on("exit", (code) => {
     slot.exited = true;
     slot.exitCode = code;
-    // CR-10：只有自己还是「当前预览位」才清 pidfile——被顶掉的旧进程迟到的 exit
-    // 不得清掉新进程刚写的那份（token 双保险）
-    if (ref.current === slot) void clearPidFileIf(token);
+    // CR-10：只有自己还是「该仓当前预览位」才清 pidfile——被顶掉的旧进程迟到的 exit
+    // 不得清掉新进程刚写的那条（token 双保险）。
+    // 必须进串行队列：pidfile 现在是数组读改写、exit 回调裸跑会与别的仓
+    // start 的 upsertPidFile 交错、可能丢掉对方刚写的记录（崩溃兜底失效）
+    if (map.get(input.repoPath) === slot) {
+      void enqueue(() => clearPidFileIf(token));
+    }
   });
   proc.on("error", (err) => {
     slot.exited = true;
     slot.log.push(`spawn 失败：${err.message}`);
   });
 
-  ref.current = slot;
+  map.set(input.repoPath, slot);
   if (proc.pid) {
-    await writePidFile({
+    await upsertPidFile({
       pid: proc.pid,
       at: Date.now(),
       token,
       command: input.command,
+      repoPath: input.repoPath,
     });
   }
 

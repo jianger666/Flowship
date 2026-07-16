@@ -27,7 +27,10 @@ import {
   updateCustomAction,
 } from "./custom-action-fs";
 import { dataRoot, writePrivateFileAtomic } from "./data-root";
-import { PRESET_FIX_BUG_SKILL_CONTENT } from "./preset-skill-fix-bug";
+import {
+  PRESET_FIX_BUG_SKILL_CONTENT,
+  PRESET_FIX_BUG_SKILL_CONTENT_LEGACY_V1,
+} from "./preset-skill-fix-bug";
 import { findSkillByName, getAppSkillsDir } from "./skills-loader";
 
 const presetsFilePath = (): string =>
@@ -143,6 +146,34 @@ const maybeRelabelFixBugAction = async (): Promise<void> => {
 };
 
 /**
+ * 存量出厂 skill 一次性升级到 v2：磁盘内容 trim 后与 LEGACY_V1 精确相等才覆盖。
+ * 用户改过 / 文件不存在 → 不动；升级后内容=新模板，下次自然不再命中（幂等）。
+ */
+const maybeUpgradeFixBugSkillContent = async (): Promise<void> => {
+  const skillPath = path.join(
+    getAppSkillsDir(),
+    BUILTIN_FIX_BUG_SKILL,
+    "SKILL.md",
+  );
+  let raw: string;
+  try {
+    raw = await fs.readFile(skillPath, "utf-8");
+  } catch {
+    return;
+  }
+  if (raw.trim() !== PRESET_FIX_BUG_SKILL_CONTENT_LEGACY_V1.trim()) return;
+  const failure = await writeAppSkill(
+    BUILTIN_FIX_BUG_SKILL,
+    PRESET_FIX_BUG_SKILL_CONTENT,
+  );
+  if (failure) {
+    console.warn(`[presets] 升级出厂 skill fix-bug 失败：${failure}`);
+    return;
+  }
+  console.log(`[presets] 已升级出厂 skill：${BUILTIN_FIX_BUG_SKILL} → v2`);
+};
+
+/**
  * 确保「改bug」预置 custom action 已装。
  * playbook 在 app skill `fix-bug`；本函数只写挂载壳 ACTION.md。
  * 默认记账早退；skipLedger：缺失才写、已有不覆盖。
@@ -174,11 +205,12 @@ const ensureBuiltinFixBugAction = async (
   );
 };
 
-/** 启动入口：skill + action 互相独立记账，再做 label 校正 */
+/** 启动入口：skill + action 互相独立记账，再做 label 校正 + 存量 skill 内容升级 */
 export const ensureBuiltinFixBugPreset = async (): Promise<void> => {
   await ensureBuiltinFixBugSkill();
   await ensureBuiltinFixBugAction();
   await maybeRelabelFixBugAction();
+  await maybeUpgradeFixBugSkillContent();
 };
 
 /**

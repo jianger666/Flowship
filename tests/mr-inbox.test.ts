@@ -26,6 +26,7 @@ import {
   parseGitlabMrUrl,
   parseMoqlBugQueryResponse,
   parseMoqlBugRow,
+  pickLatestMrUrlFromComments,
   pruneSeenMap,
   truncateCommentSnippet,
   type MoqlField,
@@ -78,6 +79,51 @@ describe("extractMrUrlsFromText", () => {
         "https://gitlab.example.com/group/sub/repo/-/merge_requests/99",
       ),
     ).toEqual(["https://gitlab.example.com/group/sub/repo/-/merge_requests/99"]);
+  });
+});
+
+describe("pickLatestMrUrlFromComments", () => {
+  const c = (content: string, createdAtMs: number) => ({ content, createdAtMs });
+
+  it("取最新评论里最新出现的那个 MR", () => {
+    const out = pickLatestMrUrlFromComments([
+      c(
+        "旧 https://gitlab.example.com/a/b/-/merge_requests/1",
+        100,
+      ),
+      c(
+        [
+          "先 https://gitlab.example.com/a/b/-/merge_requests/2",
+          "后 https://gitlab.example.com/a/b/-/merge_requests/3",
+        ].join("\n"),
+        200,
+      ),
+    ]);
+    expect(out).toBe("https://gitlab.example.com/a/b/-/merge_requests/3");
+  });
+
+  it("最新评论无 MR 时回落到更早含 MR 的评论", () => {
+    const out = pickLatestMrUrlFromComments([
+      c("https://gitlab.example.com/a/b/-/merge_requests/9", 50),
+      c("纯文字、没有链接", 300),
+    ]);
+    expect(out).toBe("https://gitlab.example.com/a/b/-/merge_requests/9");
+  });
+
+  it("无 MR 返回 undefined", () => {
+    expect(
+      pickLatestMrUrlFromComments([c("没有链接", 1), c("还是没有", 2)]),
+    ).toBeUndefined();
+    expect(pickLatestMrUrlFromComments([])).toBeUndefined();
+  });
+
+  it("markdown 同串重复链接去重后仍能取到唯一 MR", () => {
+    const url =
+      "https://gitlab.wukongedu.net/frontend/crm-web/-/merge_requests/3968";
+    const out = pickLatestMrUrlFromComments([
+      c(`- crm-web [${url}](${url})`, 10),
+    ]);
+    expect(out).toBe(url);
   });
 });
 

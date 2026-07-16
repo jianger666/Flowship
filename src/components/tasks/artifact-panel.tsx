@@ -368,8 +368,10 @@ export const ArtifactPanel = ({
   const autoGameAppliedRef = useRef(false);
   // 本 action 是否已提示过「产物已生成」——从无到有只 toast 一次
   const artifactToastShownRef = useRef(false);
-  // 上一帧是否已有产物内容，用于检测「从无到有」边沿
-  const prevHadArtifactRef = useRef(false);
+  // 上一次「加载完成后」是否有产物：null = 初始加载还没出结果。
+  // 三态是为了区分「挂载后亲眼看到的从无到有」（该 toast）和「remount 时产物本来
+  // 就在」（静默显示、不打扰）——从设置页返回会 remount、二态版会误弹（用户实测踩过）
+  const prevHadArtifactRef = useRef<boolean | null>(null);
   // 小恐龙是否在局中（onStart/onGameOver 维护）——产物到达时据此决定立即切回还是等局末
   const gamePlayingRef = useRef(false);
   // 产物到达时正在局中 → 记「局末自动切回」标记、Game over 时消费
@@ -424,7 +426,7 @@ export const ArtifactPanel = ({
     // 切 action（或 remount）按自动规则重算默认视图：running → 先默认游戏（等待产物）
     autoGameAppliedRef.current = false;
     artifactToastShownRef.current = false;
-    prevHadArtifactRef.current = false;
+    prevHadArtifactRef.current = null;
     const defaultGame = actionStatusRef.current === "running";
     setPanelView(defaultGame ? "game" : "artifact");
     if (defaultGame) autoGameAppliedRef.current = true;
@@ -442,34 +444,44 @@ export const ArtifactPanel = ({
   // 产物从无到有、且用户还停在游戏视图 → 自动切回策略（2026-07-15 用户拍板）：
   // - 没在局中（Game over / 没开跑）→ 直接自动切回产物
   // - 正在局中 → 不打断、toast 带「查看产物」按钮；这局 Game over 后停 1.5s（看眼分数）自动切回
+  // 只认「挂载后亲眼看到的 无→有」（基线 false → true）；remount 时产物本来就在
+  //（基线 null → true）静默显示产物、不弹 toast——从设置页返回等场景不重复打扰
   useEffect(() => {
+    if (contentLoading) return; // 加载中不动基线：还没出结果、谈不上「无→有」
     const hasArtifact = !!currentArtifact;
-    if (
-      hasArtifact &&
-      !prevHadArtifactRef.current &&
-      panelView === "game" &&
-      !artifactToastShownRef.current
-    ) {
-      artifactToastShownRef.current = true;
-      if (gamePlayingRef.current) {
-        pendingReturnRef.current = true;
-        toast.success("产物已生成、这局结束后自动切回", {
-          duration: 10_000,
-          action: {
-            label: "立即查看",
-            onClick: () => {
-              pendingReturnRef.current = false;
-              setPanelView("artifact");
-            },
-          },
-        });
-      } else {
-        setPanelView("artifact");
-        toast.success("产物已生成");
-      }
-    }
+    const prev = prevHadArtifactRef.current;
     prevHadArtifactRef.current = hasArtifact;
-  }, [currentArtifact, panelView]);
+    if (
+      !hasArtifact ||
+      prev === true ||
+      panelView !== "game" ||
+      artifactToastShownRef.current
+    ) {
+      return;
+    }
+    artifactToastShownRef.current = true;
+    if (prev === null) {
+      // 初始加载就有产物（remount）：游戏是默认视图不是用户选的、直接静默纠正
+      setPanelView("artifact");
+      return;
+    }
+    if (gamePlayingRef.current) {
+      pendingReturnRef.current = true;
+      toast.success("产物已生成、这局结束后自动切回", {
+        duration: 10_000,
+        action: {
+          label: "立即查看",
+          onClick: () => {
+            pendingReturnRef.current = false;
+            setPanelView("artifact");
+          },
+        },
+      });
+    } else {
+      setPanelView("artifact");
+      toast.success("产物已生成");
+    }
+  }, [currentArtifact, panelView, contentLoading]);
 
   // 手动切走 / 卸载时清掉局末切回的余波（防切走后 timer 又把视图拽回来）
   useEffect(() => {

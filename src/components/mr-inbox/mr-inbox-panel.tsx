@@ -53,6 +53,7 @@ import {
   buildStoryUrlFromBug,
   inboxGroupsVisibleForRole,
   type InboxGroupId,
+  type MrInboxMrDetail,
 } from "@/lib/mr-inbox";
 import { formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
@@ -94,20 +95,28 @@ const Chip = ({
   );
 };
 
-const MrStatusChip = ({ entry }: { entry: MrInboxEntry }) => {
-  if (entry.mrError) {
+/**
+ * MR 可合性 chip（待测 MR 行 / 待回归 bug 行共用）。
+ * 入参是 mr 对象本身，避免绑死 MrInboxEntry。
+ */
+const MrStatusChip = ({
+  mr,
+  mrError,
+}: {
+  mr?: MrInboxMrDetail | null;
+  mrError?: string;
+}) => {
+  if (mrError) {
     return (
-      <Chip tone="danger" title={entry.mrError}>
+      <Chip tone="danger" title={mrError}>
         详情获取失败
       </Chip>
     );
   }
-  if (!entry.mr) return null;
-  if (entry.mr.hasConflicts) return <Chip tone="danger">有冲突</Chip>;
-  if (entry.mr.mergeable) return <Chip tone="ok">可合并</Chip>;
-  return (
-    <Chip title={entry.mr.detailedMergeStatus}>检查中</Chip>
-  );
+  if (!mr) return null;
+  if (mr.hasConflicts) return <Chip tone="danger">有冲突</Chip>;
+  if (mr.mergeable) return <Chip tone="ok">可合并</Chip>;
+  return <Chip title={mr.detailedMergeStatus}>检查中</Chip>;
 };
 
 /** 分组标题 + 各自空态 */
@@ -281,7 +290,7 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
           {mrTitle}
         </span>
         <span className="flex shrink-0 items-center gap-1">
-          <MrStatusChip entry={entry} />
+          <MrStatusChip mr={entry.mr} mrError={entry.mrError} />
         </span>
       </div>
       {entry.commentSnippet && (
@@ -637,13 +646,13 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
   );
 };
 
-/** 待回归行：通过 / 不通过 */
+/** 待回归行：通过 / 不通过 + 关联 MR 可合时「合并」（语义独立、不耦合） */
 const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
-  const { setSeen, transitionBug } = useMrInbox();
+  const { data, setSeen, transitionBug, mergeMr } = useMrInbox();
   const { confirm, prompt } = useDialog();
   const handleIgnore = useIgnoreHandler(entry.bugUrl);
-  // pass / reject 进行中（哪个按钮 busy）
-  const [busy, setBusy] = useState<"pass" | "reject" | null>(null);
+  // pass / reject / merge 进行中（哪个按钮 busy）
+  const [busy, setBusy] = useState<"pass" | "reject" | "merge" | null>(null);
   const unread = entry.seenAtMs === null;
 
   const runTransition = async (action: "pass" | "reject", reason?: string) => {
@@ -701,6 +710,28 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
     await runTransition("reject", reason.trim());
   };
 
+  const handleMerge = async () => {
+    if (!entry.mrUrl || !entry.mr) return;
+    const mrTitle = entry.mr.title || entry.mrUrl;
+    const ok = await confirm({
+      title: "合并这个 MR？",
+      description: `${mrTitle}（${entry.mr.sourceBranch} → ${entry.mr.targetBranch}）`,
+      confirmLabel: "合并",
+    });
+    if (!ok) return;
+    setBusy("merge");
+    try {
+      await mergeMr(entry.mrUrl);
+      toast.success("MR 已合并");
+    } catch (err) {
+      toast.error(
+        `合并失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <li
       className={cn(
@@ -714,8 +745,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           className="absolute top-2.5 bottom-2.5 left-0 w-0.5 rounded-full bg-primary"
         />
       )}
-      {/* 标题左、状态 chip 靠右；静态无边框（与 MyBugRow 可点控件区分）。
-          min-w-0 让长标题出省略号、不挤扁右侧 chip（同 MyBugRow） */}
+      {/* 标题左、状态 + MR chip 靠右 */}
       <div className="flex items-center justify-between gap-2">
         <a
           href={entry.bugUrl}
@@ -728,6 +758,7 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
         </a>
         <span className="flex shrink-0 items-center gap-1">
           <Chip tone="ok">{entry.statusLabel || "RESOLVED"}</Chip>
+          <MrStatusChip mr={entry.mr} mrError={entry.mrError} />
         </span>
       </div>
       {entry.relatedStoryName && (
@@ -736,6 +767,27 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
         </p>
       )}
       <div className="mt-0.5 flex items-center gap-1">
+        {/* 有关联 MR 时始终给「打开 MR」——冲突/检查中/无 token 时合并按钮隐藏，QA 仍需跳 GitLab */}
+        {entry.mrUrl && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+            title="在 GitLab 打开 MR"
+            nativeButton={false}
+            render={
+              <a
+                href={entry.mrUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="no-underline"
+              />
+            }
+          >
+            <ExternalLink className="size-3" />
+            打开 MR
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="sm"
@@ -764,6 +816,23 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           )}
           不通过
         </Button>
+        {/* 与通过/不通过相邻、语义独立；仅可合时出按钮（对齐待测 MR 行） */}
+        {data?.gitTokenConfigured && entry.mrUrl && entry.mr?.mergeable && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+            disabled={busy !== null}
+            onClick={() => void handleMerge()}
+          >
+            {busy === "merge" ? (
+              <RefreshCw className="size-3 animate-spin" />
+            ) : (
+              <GitMerge className="size-3" />
+            )}
+            合并
+          </Button>
+        )}
         <SeenToggle
           unread={unread}
           onToggle={() => void setSeen(entry.bugUrl, unread)}
