@@ -18,11 +18,14 @@
  * - 仅 darwin 生效：Windows GUI 进程本来就继承完整用户环境变量（注册表 User env）、
  *   没有这个问题；linux 非交付形态不处理。
  * - 失败兜底：探测超时（5s）/ shell 报错 → 保持原 PATH、只 warn 不阻断启动。
- * - 顺序：instrumentation 里先跑本函数、再 injectFeishuCliPath（tools/bin 保持最前）。
+ * - 顺序：instrumentation 先 injectFeishuCliPath（tools/bin 前置），再异步跑本函数合并
+ *   login PATH；合并时用 pinnedPrefixes 把 tools/bin 重新置顶，避免被 login 段挤到后面。
  */
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+
+import { getToolsBinDir } from "./feishu-cli";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,14 +40,26 @@ export const extractPathFromShellOutput = (
   return value && value.trim().length > 0 ? value.trim() : null;
 };
 
-/** 合并两串 PATH：login 的在前、去重保序、空段丢弃 */
+/**
+ * 合并两串 PATH：login 的在前、当前的追加、去重保序、空段丢弃。
+ * pinnedPrefixes：已出现在合并集合里的前缀重新置顶（审查修复：injectFeishuCliPath 只
+ * 「存在即跳过」、不会重置顶，故不能靠 merge 后再调 inject；在 merge 里显式 pin）。
+ */
 export const mergePathStrings = (
   loginPath: string,
   currentPath: string,
+  pinnedPrefixes: readonly string[] = [],
 ): string => {
+  const segments = [...loginPath.split(":"), ...currentPath.split(":")];
   const merged: string[] = [];
   const seen = new Set<string>();
-  for (const p of [...loginPath.split(":"), ...currentPath.split(":")]) {
+  // 先放仍出现在合并集合里的 pinned（保持调用方给定顺序）
+  for (const p of pinnedPrefixes) {
+    if (!p || seen.has(p) || !segments.includes(p)) continue;
+    seen.add(p);
+    merged.push(p);
+  }
+  for (const p of segments) {
     if (!p || seen.has(p)) continue;
     seen.add(p);
     merged.push(p);
@@ -71,7 +86,13 @@ export const mergeLoginShellPath = async (): Promise<void> => {
       console.warn("[login-shell-path] 登录 shell 未返回 PATH、保持原值");
       return;
     }
-    process.env.PATH = mergePathStrings(loginPath, process.env.PATH ?? "");
+    // tools/bin 必须置顶：否则 login PATH 里同名 lark-cli 会抢先于内置 CLI
+    const toolsBin = getToolsBinDir();
+    process.env.PATH = mergePathStrings(
+      loginPath,
+      process.env.PATH ?? "",
+      [toolsBin],
+    );
     console.log(
       `[login-shell-path] PATH 已合并登录 shell（${shell}）、共 ${process.env.PATH.split(":").length} 段`,
     );

@@ -32,10 +32,22 @@ describe("extractPathFromShellOutput", () => {
 });
 
 describe("mergePathStrings", () => {
-  it("登录 shell 的在前、当前的追加、重复去掉", () => {
+  it("登录 shell 的在前、当前的追加、重复去掉；pinned 前缀保持最前", () => {
+    // 旧语义把 /x/tools/bin 拼到末尾——与「app 注入前缀置顶」相反，login 里同名 CLI 会抢先。
+    // pinnedPrefixes 把仍出现在合并集合里的 tools/bin 重新置顶。
     expect(
-      mergePathStrings("/opt/homebrew/bin:/usr/bin:/bin", "/usr/bin:/bin:/x/tools/bin"),
-    ).toBe("/opt/homebrew/bin:/usr/bin:/bin:/x/tools/bin");
+      mergePathStrings(
+        "/opt/homebrew/bin:/usr/bin:/bin",
+        "/usr/bin:/bin:/x/tools/bin",
+        ["/x/tools/bin"],
+      ),
+    ).toBe("/x/tools/bin:/opt/homebrew/bin:/usr/bin:/bin");
+  });
+
+  it("未 pin 时仍是 login 在前、current 追加（去重保序）", () => {
+    expect(
+      mergePathStrings("/opt/homebrew/bin:/usr/bin:/bin", "/usr/bin:/bin:/extra"),
+    ).toBe("/opt/homebrew/bin:/usr/bin:/bin:/extra");
   });
 
   it("空段丢弃", () => {

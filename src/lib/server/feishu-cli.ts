@@ -826,6 +826,16 @@ const refreshStatusCache = (): Promise<StatusSnapshot> => {
   return flight;
 };
 
+// meegle 身份缓存失效回调（meegle-cli 模块加载时注册；避免 feishu↔meegle 循环 import）
+let meegleIdentityCacheInvalidator: (() => void) | null = null;
+
+/** 供 meegle-cli 注册：登录/登出/卸载清状态缓存时一并清 me/identity */
+export const registerMeegleIdentityCacheInvalidator = (
+  fn: () => void,
+): void => {
+  meegleIdentityCacheInvalidator = fn;
+};
+
 // 安装 / 登录 / 卸载后调：下一次 GET 走真探测（用户正守着设置页、等真值可接受）
 const invalidateStatusCache = (): void => {
   G.__feishuStatusGen = (G.__feishuStatusGen ?? 0) + 1;
@@ -833,6 +843,8 @@ const invalidateStatusCache = (): void => {
   // 放弃 in-flight（其结果代数已过期、落盘会被上面的核对拦住；引用清空让下次真探）
   G.__feishuStatusRefreshing = null;
   void fs.rm(statusCacheFile(), { force: true }).catch(() => {});
+  // 换账号后旧 user_key / 姓名不能继续用（审查发现：只清状态缓存会扫错人）
+  meegleIdentityCacheInvalidator?.();
 };
 
 export const getFeishuCliStatus = async (): Promise<StatusSnapshot> => {

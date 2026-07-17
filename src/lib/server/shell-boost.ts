@@ -27,8 +27,8 @@ export const SHELL_BOOST_GUARD =
   '[[ "$COMPOSER_NO_INTERACTION" == "1" ]] && return';
 
 /**
- * bash/zsh「是否已注入」特征串——用 env 名比整段匹配更稳
- *（用户可能改过注释文案，但守卫条件不会变）
+ * bash/zsh env 名（展示 / 测试辅助用）
+ * ⚠️ 不能当「已注入」判定——rc 里注释、`export COMPOSER_NO_INTERACTION=0` 等提及会误判
  */
 export const SHELL_BOOST_MARKER = "COMPOSER_NO_INTERACTION";
 
@@ -44,7 +44,10 @@ export const PS_SHELL_BOOST_COMMENT =
 export const PS_SHELL_BOOST_GUARD =
   'if ($env:CURSOR_AGENT -eq "1") { return }';
 
-/** PowerShell「是否已注入」特征串 */
+/**
+ * PowerShell env 名（展示 / 测试辅助用）
+ * ⚠️ 同 SHELL_BOOST_MARKER：仅提及不算已注入，判定必须匹配守卫本体
+ */
 export const PS_SHELL_BOOST_MARKER = "CURSOR_AGENT";
 
 /** 生成要顶插的两行（末尾带换行，方便直接拼接原文） */
@@ -55,13 +58,16 @@ export const buildShellBoostBlock = (
     ? `${PS_SHELL_BOOST_COMMENT}\n${PS_SHELL_BOOST_GUARD}\n`
     : `${SHELL_BOOST_COMMENT}\n${SHELL_BOOST_GUARD}\n`;
 
-/** 内容是否已含守卫（按方言特征串判断） */
+/**
+ * 内容是否已含守卫——匹配守卫本体（GUARD），不匹配裸 env 名。
+ * 历史核查：GUARD 字符串自 v1.1.13 / PowerShell 自 v1.1.16 引入后未改过，无需兼容旧守卫行。
+ */
 export const hasShellBoost = (
   content: string,
   kind: ShellBoostFileKind = "posix",
 ): boolean =>
   content.includes(
-    kind === "powershell" ? PS_SHELL_BOOST_MARKER : SHELL_BOOST_MARKER,
+    kind === "powershell" ? PS_SHELL_BOOST_GUARD : SHELL_BOOST_GUARD,
   );
 
 /**
@@ -174,7 +180,7 @@ export type ShellBoostFileStatus = {
   boosted: boolean;
 };
 
-/** 探测单个配置：存在 && 含对应方言特征串 → boosted */
+/** 探测单个配置：存在 && 含对应方言守卫本体 → boosted */
 export const probeShellBoostFile = async (
   absPath: string,
   displayPath: string,

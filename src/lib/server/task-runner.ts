@@ -1045,6 +1045,8 @@ export const finalizeTask = async (
   // V0.11：不再向 agent 发终态信号——finalize 语义就是「关掉这个 task」：
   // 有活 run 直接 cancel、跨 run 会话一并关掉（cancelTaskRun 内部处理）
   const hadLive = cancelTaskRun(taskId);
+  // 同 stopTaskAgent：无活 run 时 cancelTaskRun 会写入 pendingStopRequests，终结后必须清掉
+  pendingStopRequests.delete(taskId);
   console.log(
     `[task-runner] finalizeTask: task=${taskId} ${
       hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"

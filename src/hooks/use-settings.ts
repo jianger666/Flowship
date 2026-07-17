@@ -62,7 +62,15 @@ export const useJumpIde = (): JumpIde => {
   const [ide, setIde] = useState<JumpIde>("cursor");
   useEffect(() => {
     // 先 await 配置初始化（读 config.json）、再读；init 前 cache 是默认值、不空窗
-    void initSettings().then(() => setIde(getSettings().jumpIde ?? "cursor"));
+    // alive 守卫：对齐 useSettings，避免卸载后迟到 then 还 setState
+    let alive = true;
+    void initSettings().then(() => {
+      if (!alive) return;
+      setIde(getSettings().jumpIde ?? "cursor");
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
   return ide;
 };
@@ -71,9 +79,14 @@ export const useSubmitShortcut = (): SubmitShortcut => {
   const [shortcut, setShortcut] = useState<SubmitShortcut>("mod-enter");
   useEffect(() => {
     // 轻量读取个人输入偏好；默认保持旧行为，避免配置初始化前误改 Enter 语义。
-    void initSettings().then(() =>
-      setShortcut(getSettings().submitShortcut ?? "mod-enter"),
-    );
+    let alive = true;
+    void initSettings().then(() => {
+      if (!alive) return;
+      setShortcut(getSettings().submitShortcut ?? "mod-enter");
+    });
+    return () => {
+      alive = false;
+    };
   }, []);
   return shortcut;
 };

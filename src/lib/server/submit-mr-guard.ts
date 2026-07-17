@@ -23,7 +23,8 @@ const execFileAsync = promisify(execFile);
 
 // 从仓库本地 git remote 反解 GitLab project path（如 wkid/crm-web）、跟 agent 上报对账。
 // 解析规则跟 action-ship.md 里 agent 用的 sed 对齐（git@host:group/proj.git / https://host/group/proj.git）。
-// 拿不到（非 git 仓 / 无 origin / 命令失败）返 null、调用方对 null 放行（best-effort、不因临时读不到挡 ship）。
+// 拿不到（非 git 仓 / 无 origin / 命令失败）返 null——调用方必须 fail-closed 拒绝（审查发现：
+//   旧 fail-open 可被弄坏 remote 绕过「防越权提 MR」闸门）。
 export const deriveProjectPathFromRepo = async (
   repoPath: string,
 ): Promise<string | null> => {
@@ -139,8 +140,15 @@ export const validateSubmitMr = async (
     };
   }
   // 5) project_path 必须 == server 从该仓真实 git remote 反解出的（防越权提到任意 project）
+  //    derived 为 null 也拒绝——读不到 remote 时放行 = 闸门可被绕过（审查发现）
   const derived = await deriveProjectPathFromRepo(a.repoPath);
-  if (derived && a.projectPath !== derived) {
+  if (!derived) {
+    return {
+      ok: false,
+      error: `读不到该仓 remote、无法核对 project_path、拒绝（${a.repoPath}）`,
+    };
+  }
+  if (a.projectPath !== derived) {
     return {
       ok: false,
       error: `project_path「${a.projectPath}」跟该仓真实 remote 反解「${derived}」不一致、拒绝（防越权提到其它 GitLab project）`,

@@ -360,7 +360,8 @@ export const ACTION_TYPES = [
 export type DevPushMode = "direct" | "mr";
 
 /**
- * action 中文 label（UI 选 action / timeline 展示用、统一来源）
+ * action 中文 label 单源（UI / server action-gates / stop-task 共用）。
+ * 展示层从 task-display re-export，勿再复制一份。
  */
 export const ACTION_LABEL: Record<ActionType, string> = {
   plan: "出方案",

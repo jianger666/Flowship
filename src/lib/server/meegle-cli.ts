@@ -21,7 +21,10 @@ import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
 
 import { USER_ROLE_LABEL, USER_ROLES, type UserRole } from "@/lib/types";
-import { meegleBin } from "./feishu-cli";
+import {
+  meegleBin,
+  registerMeegleIdentityCacheInvalidator,
+} from "./feishu-cli";
 import { enqueueMeegle } from "./meegle-queue";
 import { readSettingsFile } from "./settings-fs";
 
@@ -269,9 +272,20 @@ export const fetchWorkitemDetail = async (
 // user me 缓存（user_key / 姓名不会变、进程级缓存即可）——**只缓存成功结果**：
 // v1.1.x 修（用户实测「升级重启后首屏授权像没检测到」的隐患之一）：原来失败也缓存 null、
 // server 冷启动首拉赶上 CLI 慢 / 网络抖一次、看板就永远 not_authed 到进程重启
+// ⚠️ 换账号后必须清：登录成功 / 登出 / 卸载走 invalidateMeegleIdentityCaches（审查发现：
+//   旧缓存永不过期 + feishu 只清状态缓存 → 扫错人）
 let meCache: string | undefined;
 /** 身份缓存（姓名 + user_key）；与 meCache 同源、成功后两边一起填 */
 let identityCache: MeegleIdentity | undefined;
+
+/** 清 me / identity 进程内缓存（换账号后必须调；projectsCache 自带 TTL 不在此列） */
+export const invalidateMeegleIdentityCaches = (): void => {
+  meCache = undefined;
+  identityCache = undefined;
+};
+
+// meegle-cli 已依赖 feishu-cli、反向 import 会循环——用注册回调挂到 invalidateStatusCache
+registerMeegleIdentityCacheInvalidator(invalidateMeegleIdentityCaches);
 
 /** meegle `user me` 归一：姓名（name_cn 优先）+ user_key */
 export interface MeegleIdentity {

@@ -19,13 +19,12 @@
  * # 路由职责（V0.11：wait 协议退役、两种模式）
  *
  * 1. **有存活会话（agent 在、无 run 在跑）**（正常对话循环）：
- *    - 写 user_reply 事件（text = 用户原文）
  *    - sendChatMessage（`agent.send` 续同一会话、新 run；text = skill 指引 + 原文）
+ *    - 确定会送达后再写 user_reply 事件（text = 用户原文；对齐 ask-reply「先送达再落事件」）
  *    -（切模型 / 切 MCP 时懒重启：关旧会话、起新会话、这条消息作首条）
  *
  * 2. **无会话（首条 / agent 已关 / 服务重启过）**（自动启动）：
- *    - 写 user_reply 事件（用户立刻看到自己的话 = 原文）
- *    - patch task.runStatus=running
+ *    - 校验 bootArgs → 写 user_reply → patch task.runStatus=running
  *    - fire-and-forget runChatSession(firstMessage=指引+原文) 起新会话
  *    - agent 起手 prompt 已含用户首条、直接回答、答完自然结束回复
  *
@@ -33,7 +32,7 @@
  *
  * - task 不存在 → 404
  * - task.mode !== "chat" → 409（任务模式不走本路由、应走 advance）
- * - run 正在跑（agent 正在回）→ 409
+ * - run 正在跑（agent 正在回）→ 409（不落 user_reply、防假「已发送」）
  * - 模式 2 但缺 bootArgs → 400
  */
 
@@ -171,9 +170,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // 写 user_reply 事件（用户立刻在 event-stream 看到自己的话）
-  // 图片存 meta.images（完整对象数组）——前端 extractUserReplyImages 读的是 meta.images、
-  // 不是 imagePaths（string[]）；写错字段会导致附图在事件流里不显示（V0.6.12 修）。
+  // 准备 user_reply 载荷——审查发现：旧逻辑先 append+publish 再 send，409「agent 正在回」
+  // 时事件流已显示「已发送」。对齐 ask-reply：确定会送达后再落事件（events.jsonl
+  // append-only 不可删、不能先写再回滚）。
   const userReplyMeta: Record<string, unknown> = {};
   if (savedImages && savedImages.length > 0) {
     userReplyMeta.images = savedImages;
@@ -189,19 +188,25 @@ export const POST = async (req: Request, { params }: Ctx) => {
       : "";
   // 事件 = 用户原文；agent = skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
   const agentText = buildSkillDirective(skills) + text;
-  const replyEvent = await appendEvent(task.id, {
-    kind: "user_reply",
-    text: text || fallbackText,
-    meta:
-      Object.keys(userReplyMeta).length > 0 ? userReplyMeta : undefined,
-  });
-  if (replyEvent) {
-    publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
-  }
+
+  // 确定会送达后才写 user_reply（send 续接成功 / 起新会话前各调一次）
+  const persistUserReply = async () => {
+    const replyEvent = await appendEvent(task.id, {
+      kind: "user_reply",
+      text: text || fallbackText,
+      meta:
+        Object.keys(userReplyMeta).length > 0 ? userReplyMeta : undefined,
+    });
+    if (replyEvent) {
+      publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
+    }
+    return replyEvent;
+  };
 
   // 首条消息派生标题：占位「对话 · 时间」被用户首条消息前 ~24 字覆盖（first-message-wins、
-  // 对齐 codex / Cursor Agent Window）。放在写完 user_reply、启 agent 之前——这样后续
-  // setTaskRunStatus 读到的 meta 已是新标题、publish 的 task 一次带上新名、侧栏不闪旧占位。
+  // 对齐 codex / Cursor Agent Window）。放在启 agent 之前——这样后续 setTaskRunStatus
+  // 读到的 meta 已是新标题、publish 的 task 一次带上新名、侧栏不闪旧占位。
+  // （后落后：标题仍在 send / runChatSession 之前更新，与「写完 user_reply 再启 agent」等效。）
   if (text && isPlaceholderChatTitle(task.title)) {
     const derived = deriveChatTitleFromMessage(text);
     if (derived) {
@@ -255,13 +260,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
       );
       if (sent) {
+        // send 已异步起 consumeChatRun；紧接着落 user_reply——通常仍早于 agent 首条事件，
+        // 极端竞态下气泡可能略晚于 assistant delta（可接受、优于 409 假已发）
+        await persistUserReply();
         const fresh = await getTask(task.id);
         return new Response(
           JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: false }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      // send 失败两种情况：run 在跑（agent 正在回）→ 409；会话坏了（已被 close）→ 落到下面起新会话
+      // send 失败两种情况：run 在跑（agent 正在回）→ 409（不落事件）；会话坏了 → 落到下面起新会话
       if (hasChatSession(task.id)) {
         return errorResponse("agent 正在回、等它说完一段再发", 409);
       }
@@ -287,7 +295,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   // 模式 2：起新会话（首条 / 会话已关 / 懒重启后）
-  // 校验 bootArgs
+  // 校验 bootArgs——先于落事件，缺凭据不写假「已发送」
   if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
     return errorResponse("缺 bootArgs.apiKey、起新会话必传");
   }
@@ -303,6 +311,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // V0.10.1：更新就位未重启 → 起新 Run 必挂死、拦在标 running 之前
   const pendingRestartMsg = await checkUpdatePendingRestart();
   if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
+
+  // 确定会起新会话 → 先落 user_reply（runner 要 firstMessageEventId 锚定本轮回答义务）
+  const replyEvent = await persistUserReply();
 
   // 切 task.runStatus=running、fire-and-forget runChatSession
   const runningTask = await setTaskRunStatus(task.id, "running");

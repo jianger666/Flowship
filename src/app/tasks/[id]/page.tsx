@@ -154,13 +154,29 @@ const TaskDetailPage = () => {
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
   const { upsertTask } = useTaskList();
 
+  // 当前路由 id 的 ref——快切时 in-flight refresh / 旧 SSE 回调仍持旧闭包，
+  // 必须用 ref 比对「响应是否仍属当前页」，不能只靠 absorbTask 的 useCallback(id)
+  const routeIdRef = useRef(id);
+  routeIdRef.current = id;
+
+  // 侧栏 A→B 快切：立刻清本地态，避免短暂显示 A 的内容盖在 B 的 URL 上
+  useEffect(() => {
+    setTask(null);
+    setLoaded(false);
+    setStreamingText("");
+    setSelectedActionId(null);
+  }, [id]);
+
   // v1.0.x 事件懒加载：所有「服务端 task 快照 → 本地 state」都走 absorbTask、
   // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
+  // 审查发现快切竞态：丢弃 payload.id !== 当前路由 id 的迟到数据（守卫在组件层，
+  // mergeTaskEvents 在 prev.id!==next.id 时 return next，不能靠它挡串任务）
   const absorbTask = useCallback((next: Task | null) => {
     if (!next) {
       setTask(null);
       return;
     }
+    if (next.id !== routeIdRef.current) return;
     setTask((prev) => mergeTaskEvents(prev, next));
   }, []);
 
@@ -179,13 +195,17 @@ const TaskDetailPage = () => {
   // ---- 拉一次任务详情（只带最近 EVENT_TAIL 条、更早的上拉分页）----
   const refresh = useCallback(async () => {
     if (!id) return;
+    const requestedId = id;
     try {
-      const t = await fetchTask(id, { tail: EVENT_TAIL });
+      const t = await fetchTask(requestedId, { tail: EVENT_TAIL });
+      // 快切后迟到响应：不 absorb、也不把 loaded 置 true（留给当前 id 自己的 refresh）
+      if (routeIdRef.current !== requestedId) return;
       absorbTask(t);
     } catch (err) {
+      if (routeIdRef.current !== requestedId) return;
       toast.error(`加载任务失败：${(err as Error).message}`);
     } finally {
-      setLoaded(true);
+      if (routeIdRef.current === requestedId) setLoaded(true);
     }
   }, [id, absorbTask]);
 
@@ -209,11 +229,6 @@ const TaskDetailPage = () => {
     task?.pinned,
     task?.actions.length,
   ]);
-
-  // task.id 变化时清下 streamingText（防切 task 残留）
-  useEffect(() => {
-    setStreamingText("");
-  }, [task?.id]);
 
   // 记住「最后浏览的对话」（v1.1.x）：胶囊切回「对话」时 /chats 优先落它、不是最近活跃那条
   useEffect(() => {

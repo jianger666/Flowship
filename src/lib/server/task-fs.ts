@@ -428,26 +428,35 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
 };
 
 export const deleteTask = async (id: string): Promise<boolean> => {
-  const dir = taskDir(id);
-  if (!(await exists(dir))) return false;
-  // 清 worktree / 删目录前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
-  // best-effort：失败不挡删除主流程（跟下面 worktree 清理同口径）。
-  try {
-    await stopPreviewsForTask(id);
-  } catch (err) {
-    console.warn(`[task-fs] deleteTask: 停预览失败（忽略）id=${id}`, err);
-  }
-  // V0.10：先清隔离工作区（要读 meta 拿 repoPaths、必须在删 task 目录前）；
-  // 失败不挡删除、boot 孤儿扫描兜底
-  try {
-    const meta = await readMetaV06(id).catch(() => null);
-    if (meta && isWorktreeTask(meta)) await removeTaskWorktrees(meta);
-  } catch (err) {
-    console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
-  }
-  // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
-  await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  return true;
+  // 审查发现：原先无锁 fs.rm，与锁内 writeMeta（会 mkdir）竞态 → 删完被写回「复活」。
+  // 存在检查 + 清理 + rm 整段持锁，与 writeMeta / 其它 meta RMW 互斥。
+  return withTaskLock(id, async () => {
+    const dir = taskDir(id);
+    if (!(await exists(dir))) return false;
+    // 清 worktree / 删目录前先停本任务预览：dev server 还挂着目录就被删 → 进程悬空占端口。
+    // best-effort：失败不挡删除主流程（跟下面 worktree 清理同口径）。
+    try {
+      await stopPreviewsForTask(id);
+    } catch (err) {
+      console.warn(`[task-fs] deleteTask: 停预览失败（忽略）id=${id}`, err);
+    }
+    // V0.10：先清隔离工作区（要读 meta 拿 repoPaths、必须在删 task 目录前）；
+    // 失败不挡删除、boot 孤儿扫描兜底
+    try {
+      const meta = await readMetaV06(id).catch(() => null);
+      if (meta && isWorktreeTask(meta)) await removeTaskWorktrees(meta);
+    } catch (err) {
+      console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
+    }
+    // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
+    await fs.rm(dir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
+    return true;
+  });
 };
 
 // ----------------- 公开 API：appendEvent / context docs / settings 类 patch -----------------

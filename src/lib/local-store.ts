@@ -51,6 +51,29 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   meegleProject: { ...DEFAULT_MEEGLE_PROJECT },
 };
 
+/**
+ * 默认设置的浅拷贝（含嵌套数组 / 对象）。
+ * 失败路径若直接 `return DEFAULT_SETTINGS` / `cache = DEFAULT_SETTINGS`，
+ * 调用方 mutate 会污染共享常量——必须拷贝后再交出去。
+ */
+const cloneDefaultSettings = (): FeAiFlowSettings => ({
+  ...DEFAULT_SETTINGS,
+  defaultModel: { ...DEFAULT_SETTINGS.defaultModel },
+  repos: [...DEFAULT_SETTINGS.repos],
+  disabledMcpServers: [...(DEFAULT_SETTINGS.disabledMcpServers ?? [])],
+  mcpServers: { ...(DEFAULT_SETTINGS.mcpServers ?? {}) },
+  actionLayout: {
+    order: [...(DEFAULT_SETTINGS.actionLayout?.order ?? [])],
+    hidden: [...(DEFAULT_SETTINGS.actionLayout?.hidden ?? [])],
+  },
+  disabledSkills: [...(DEFAULT_SETTINGS.disabledSkills ?? [])],
+  disabledRules: [...(DEFAULT_SETTINGS.disabledRules ?? [])],
+  modelUsage: [...(DEFAULT_SETTINGS.modelUsage ?? [])],
+  meegleProject: DEFAULT_SETTINGS.meegleProject
+    ? { ...DEFAULT_SETTINGS.meegleProject }
+    : undefined,
+});
+
 const isBrowser = (): boolean =>
   typeof window !== "undefined" && typeof window.localStorage !== "undefined";
 
@@ -108,17 +131,20 @@ const normalizeMeegleProject = (
 export const normalizeSettings = (
   parsed: Partial<FeAiFlowSettings> | null,
 ): FeAiFlowSettings => {
-  if (!parsed || typeof parsed !== "object") return DEFAULT_SETTINGS;
+  if (!parsed || typeof parsed !== "object") return cloneDefaultSettings();
 
-  const repos = (Array.isArray(parsed.repos) ? parsed.repos : []).map((r) => {
-    if (!r || typeof r !== "object") return r;
-    // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
-    return {
-      ...r,
-      readonly: r.readonly === true ? true : undefined,
-      scriptRepo: r.scriptRepo === true ? true : undefined,
-    };
-  });
+  // 非对象项过滤掉（脏 config 里可能混进 string / null）
+  const repos = (Array.isArray(parsed.repos) ? parsed.repos : [])
+    .filter((r): r is NonNullable<typeof r> & object => !!r && typeof r === "object")
+    .map((r) => {
+      // 只读 / 脚本仓开关：只认显式 true、其它（缺省 / 脏值）当关
+      const row = r as FeAiFlowSettings["repos"][number];
+      return {
+        ...row,
+        readonly: row.readonly === true ? true : undefined,
+        scriptRepo: row.scriptRepo === true ? true : undefined,
+      };
+    });
   const merged = { ...DEFAULT_SETTINGS, ...parsed };
   // 历史残留键读取时忽略、不落进归一结果
   // username：V0.12.x 已删；gitHost：已退役（host 按任务仓库 remote 现推）
@@ -127,6 +153,8 @@ export const normalizeSettings = (
 
   return {
     ...merged,
+    // 与 gitToken 对称：非 string 脏值回落空串，避免后续当 string 用炸
+    apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
     defaultModel: readDefaultModel(parsed.defaultModel),
     repos,
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor
@@ -185,9 +213,9 @@ export const normalizeSettings = (
   };
 };
 
-// 内存缓存：初值默认；initSettings 成功后被 config.json 覆盖。
+// 内存缓存：初值默认拷贝（勿直接挂 DEFAULT_SETTINGS 引用、防调用方 mutate 污染常量）。
 // getSettings 同步读它——这是「保持同步签名、调用方零改动」的关键。
-let cache: FeAiFlowSettings = DEFAULT_SETTINGS;
+let cache: FeAiFlowSettings = cloneDefaultSettings();
 // initSettings 单飞：多个 hook（providers / use-settings）同时调时共享同一 promise、
 // 都等到 config.json 加载完再读缓存；失败时清空、允许下次重试（SPA 不刷页、bool 标志会永久挡住重试）。
 let initPromise: Promise<void> | null = null;
@@ -272,8 +300,8 @@ export const initSettings = (): Promise<void> => {
         "[local-store] config.json 初始化失败、暂用默认设置、下次再试",
         err,
       );
-      // 失败态：cache 回到默认、拒绝后续整对象 PUT（P1-03）
-      cache = DEFAULT_SETTINGS;
+      // 失败态：cache 回到默认拷贝、拒绝后续整对象 PUT（P1-03）
+      cache = cloneDefaultSettings();
       initSucceeded = false;
       initPromise = null; // 失败清空、允许下次重试
     }
@@ -292,6 +320,8 @@ let writeQueue: Promise<void> = Promise.resolve();
  *          内存 cache 同步更新（乐观、getSettings 立即可读）。
  */
 export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => {
+  // 乐观更新前记下旧 cache；PUT 失败时回滚，避免内存与磁盘分叉
+  const prev = cache;
   cache = next;
   if (!isBrowser()) return false;
   // P1-03：初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返 false，
@@ -303,6 +333,8 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
       console.error(
         "[local-store] saveSettings 拒绝写入：config.json 初始化仍失败、避免用本地缓存覆盖磁盘配置",
       );
+      // 仍是本次乐观值才回滚（并发后续 save 已覆盖则不动）
+      if (cache === next) cache = prev;
       return false;
     }
     // 重试成功后 init 可能用服务端值盖掉了 cache——写回用户本次意图再落盘
@@ -320,6 +352,7 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
     return true;
   } catch (err) {
     console.error("[local-store] 写 config.json 失败", err);
+    if (cache === next) cache = prev;
     return false;
   }
 };

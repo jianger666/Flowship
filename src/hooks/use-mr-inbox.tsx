@@ -154,6 +154,22 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
       const res = await fetch(
         opts?.force ? "/api/mr-inbox?refresh=1" : "/api/mr-inbox",
       );
+      // 审查：HTTP 非 2xx 时 body 可能是 { error }、不能当成功列表写（会把三组清成 []）
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const errBody = (await res.json()) as { error?: string };
+          if (errBody.error) message = errBody.error;
+        } catch {
+          // ignore
+        }
+        setData((prev) =>
+          prev
+            ? { ...prev, status: "error", message }
+            : { status: "error", ...emptyGroups(), message },
+        );
+        return;
+      }
       const body = (await res.json()) as MrInboxData & {
         items?: MrInboxEntry[];
       };
@@ -171,11 +187,17 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
     } catch (err) {
       console.warn("[mr-inbox] 拉取失败:", err);
       setData((prev) =>
-        prev ?? {
-          status: "error",
-          ...emptyGroups(),
-          message: err instanceof Error ? err.message : String(err),
-        },
+        prev
+          ? {
+              ...prev,
+              status: "error",
+              message: err instanceof Error ? err.message : String(err),
+            }
+          : {
+              status: "error",
+              ...emptyGroups(),
+              message: err instanceof Error ? err.message : String(err),
+            },
       );
     } finally {
       refreshingRef.current = false;
@@ -206,31 +228,64 @@ export const MrInboxProvider = ({ children }: { children: ReactNode }) => {
   const setSeen = useCallback(async (url: string, seen: boolean) => {
     const patchSeen = <T extends { mrUrl?: string; bugUrl?: string; seenAtMs: number | null }>(
       list: T[],
+      nextSeenAt: number | null,
     ): T[] =>
       list.map((it) => {
         const key = it.mrUrl ?? it.bugUrl;
-        return key === url
-          ? { ...it, seenAtMs: seen ? Date.now() : null }
-          : it;
+        return key === url ? { ...it, seenAtMs: nextSeenAt } : it;
       });
 
-    setData((prev) =>
-      prev
-        ? {
-            ...prev,
-            pendingMr: patchSeen(prev.pendingMr),
-            myBugs: patchSeen(prev.myBugs),
-            pendingRegression: patchSeen(prev.pendingRegression),
-          }
-        : prev,
-    );
+    // 乐观更新；失败回滚（审查：原实现不查 res.ok、假标已读）
+    let previousSeenAt: number | null | undefined;
+    setData((prev) => {
+      if (!prev) return prev;
+      const hitMr = prev.pendingMr.find((it) => it.mrUrl === url);
+      const hitBug = [...prev.myBugs, ...prev.pendingRegression].find(
+        (it) => it.bugUrl === url,
+      );
+      previousSeenAt = hitMr?.seenAtMs ?? hitBug?.seenAtMs;
+      const nextSeenAt = seen ? Date.now() : null;
+      return {
+        ...prev,
+        pendingMr: patchSeen(prev.pendingMr, nextSeenAt),
+        myBugs: patchSeen(prev.myBugs, nextSeenAt),
+        pendingRegression: patchSeen(prev.pendingRegression, nextSeenAt),
+      };
+    });
+    const rollback = () => {
+      if (previousSeenAt === undefined) return;
+      const old = previousSeenAt;
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              pendingMr: patchSeen(prev.pendingMr, old),
+              myBugs: patchSeen(prev.myBugs, old),
+              pendingRegression: patchSeen(prev.pendingRegression, old),
+            }
+          : prev,
+      );
+    };
     try {
-      await fetch("/api/mr-inbox/seen", {
+      const res = await fetch("/api/mr-inbox/seen", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, seen }),
       });
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const body = (await res.json()) as { error?: string };
+          if (body.error) message = body.error;
+        } catch {
+          // ignore
+        }
+        rollback();
+        console.warn("[mr-inbox] 标已读失败:", message);
+        return;
+      }
     } catch (err) {
+      rollback();
       console.warn("[mr-inbox] 标已读失败:", err);
     }
   }, []);

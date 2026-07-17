@@ -30,7 +30,7 @@ import type {
   TaskMode,
   TaskSummary,
 } from "@/lib/types";
-import { dataRoot } from "./data-root";
+import { dataRoot, renameWithRetry } from "./data-root";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
 import { getTaskCwd } from "./task-worktrees";
 import { z } from "zod";
@@ -335,29 +335,16 @@ export const readMetaV06 = async (id: string): Promise<TaskMetaV06 | null> => {
 
 export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
   const dir = taskDir(meta.id);
+  // createTask 靠这里 mkdir 建任务目录；deleteTask 持 withTaskLock 后与之互斥，不会「删完被写回复活」
   await fs.mkdir(dir, { recursive: true });
   const finalPath = path.join(dir, META_FILE);
-  // 原子写：tmp + rename
+  // 原子写：tmp + rename（Windows 重试逻辑与 writePrivateFileAtomic 共用 renameWithRetry）
   const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
     .toString(36)
     .slice(2, 8)}`;
   try {
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
-    // Windows：目标文件被并发读 / 杀软扫描持有句柄时 rename 会 EPERM（同事线上实测、
-    // mac/linux 无此语义）——短退避重试几轮、基本都能等到句柄释放；重试穿透才抛
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        await fs.rename(tmpPath, finalPath);
-        return;
-      } catch (err) {
-        lastErr = err;
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw err;
-        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
-      }
-    }
-    throw lastErr;
+    await renameWithRetry(tmpPath, finalPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
@@ -519,13 +506,20 @@ export const appendEventLine = async (
   id: string,
   ev: TaskEvent,
 ): Promise<void> => {
-  const dir = taskDir(id);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.appendFile(
-    path.join(dir, EVENTS_FILE),
-    JSON.stringify(ev) + "\n",
-    "utf-8",
-  );
+  // 不再无条件 mkdir：审查发现与 deleteTask 竞态时会把已删目录「复活」。
+  // 调用方约定目录已存在（createTask 先 writeMeta；appendEvent 先查 meta；boot recovery 已有 meta）。
+  // 目录没了 = 任务已删 → ENOENT 静默丢弃该事件（无处落是预期）。
+  try {
+    await fs.appendFile(
+      path.join(taskDir(id), EVENTS_FILE),
+      JSON.stringify(ev) + "\n",
+      "utf-8",
+    );
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    throw err;
+  }
 };
 
 // ----------------- hydrate（meta → Task）-----------------

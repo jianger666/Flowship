@@ -244,6 +244,9 @@ const EventStreamImpl = ({
   // 最新 events 的 ref：分页请求飞行期间可能有新事件 append、算 items 增量要用最新值
   const latestEventsRef = useRef(task.events);
   latestEventsRef.current = task.events;
+  // 当前 task.id 的 ref——上拉分页迟到回调比对用（快切后丢弃串任务的 prepend）
+  const taskIdRef = useRef(task.id);
+  taskIdRef.current = task.id;
 
   // 切 task 重置分页状态 + 换载对应草稿 + 重开滚动恢复闸
   useEffect(() => {
@@ -266,14 +269,17 @@ const EventStreamImpl = ({
     if (loadingEarlierRef.current || !hasMoreEarlier || !onPrependEvents) return;
     const anchor = latestEventsRef.current[0];
     if (!anchor) return;
+    // 闭包捕获当次 task.id；await 后与当前 props 比对，不一致则丢弃（审查：快切串任务）
+    const requestedTaskId = task.id;
     loadingEarlierRef.current = true;
     setLoadingEarlier(true);
     try {
       const { events: older, hasMore } = await fetchEarlierEvents(
-        task.id,
+        requestedTaskId,
         anchor.id,
         EARLIER_PAGE_SIZE,
       );
+      if (taskIdRef.current !== requestedTaskId) return;
       pagedOnceRef.current = true;
       // 先按当前本地事件去重（蓝军 P1：飞行期间本地可能已合入部分重叠事件、
       // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
@@ -292,10 +298,13 @@ const EventStreamImpl = ({
       }
       setHasMoreEarlier(hasMore);
     } catch (err) {
+      if (taskIdRef.current !== requestedTaskId) return;
       toast.error(`加载更早事件失败：${(err as Error).message}`);
     } finally {
-      loadingEarlierRef.current = false;
-      setLoadingEarlier(false);
+      if (taskIdRef.current === requestedTaskId) {
+        loadingEarlierRef.current = false;
+        setLoadingEarlier(false);
+      }
     }
   };
 

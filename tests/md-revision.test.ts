@@ -185,6 +185,55 @@ describe("buildRevisionView", () => {
     expect(new Set(indices).size).toBe(indices.length);
   });
 
+  it("词级内联成功的 modified 也写 blockMarks（角标 / 左边条）", () => {
+    const view = buildRevisionView("今天天气很好。", "今天天气不错。");
+    expect(view.mergedMd).toContain(DEL_OPEN);
+    expect(view.mergedMd).toContain(INS_OPEN);
+    const mod = view.blockMarks.find((m) => m.status === "modified");
+    expect(mod).toBeTruthy();
+    expect(mod!.oldSource).toContain("很好");
+    expect(mod!.index).toBe(0);
+    expect(countTopBlocks(view.mergedMd)).toBe(1);
+  });
+
+  it("fingerprint 区分链接 url / 标题层级 / list 有序性", () => {
+    const linkDiff = buildRevisionView(
+      "[x](https://a.com)",
+      "[x](https://b.com)",
+    );
+    expect(linkDiff.blockMarks.length).toBeGreaterThan(0);
+    expect(linkDiff.stats.ins + linkDiff.stats.del).toBeGreaterThan(0);
+
+    const headingDiff = buildRevisionView("# 标题", "## 标题");
+    expect(headingDiff.blockMarks.length).toBeGreaterThan(0);
+
+    const listDiff = buildRevisionView("- 苹果\n- 香蕉", "1. 苹果\n2. 香蕉");
+    expect(listDiff.blockMarks.length).toBeGreaterThan(0);
+  });
+
+  it("相邻 list remove+add：blockMarks 与渲染顶层块数一致", () => {
+    const oldMd = "- 苹果\n- 香蕉";
+    const newMd = "- 葡萄\n- 西瓜";
+    const view = buildRevisionView(oldMd, newMd);
+    const top = countTopBlocks(view.mergedMd);
+    // 旧实现 \n\n 拼接两段 list → CommonMark 合成 1 块、marks 却占 2 个 index
+    expect(top).toBeGreaterThanOrEqual(2);
+    expect(view.blockMarks.length).toBeGreaterThanOrEqual(2);
+    for (const m of view.blockMarks) {
+      expect(m.index).toBeGreaterThanOrEqual(0);
+      expect(m.index).toBeLessThan(top);
+    }
+    expect(new Set(view.blockMarks.map((m) => m.index)).size).toBe(
+      view.blockMarks.length,
+    );
+    expect(view.blockMarks.some((m) => m.status === "removed")).toBe(true);
+    expect(view.blockMarks.some((m) => m.status === "added")).toBe(true);
+    const plain = stripRevisionSentinels(view.mergedMd);
+    expect(plain).toContain("葡萄");
+    expect(plain).toContain("西瓜");
+    expect(plain).toContain("苹果");
+  });
+
   it("超大文档 → degraded 块级修订、无词级哨兵", () => {
     // 少块 + 大体积：避免数千块 DP 把单测拖慢，只触发长度闸
     const chunk = `${"占位".repeat(40_000)}\n\n`;

@@ -26,8 +26,15 @@ export const checkUpdatePendingRestart = async (): Promise<string | null> => {
   let raw: string;
   try {
     raw = await fs.readFile(markerPath(), "utf8");
-  } catch {
-    return null; // 没 marker、正常放行
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // 只有「文件不存在」才放行；EACCES 等原先 fail-open 会让硬闸失效（审查确认）
+    if (code === "ENOENT") return null;
+    console.warn(
+      "[update-pending] 读更新标记失败（按有 marker 处理）:",
+      err instanceof Error ? err.message : err,
+    );
+    return "读更新标记失败、为安全起见请重启应用";
   }
   let version = "";
   try {

@@ -27,6 +27,7 @@ import {
   supersedePendingAsks,
 } from "@/lib/server/task-runner";
 import {
+  agentSessions,
   publishTaskStreamEvent,
   runningTasks,
   waitForTaskToStop,
@@ -161,6 +162,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
     body.forceModel && typeof body.forceModel.id === "string"
       ? { id: body.forceModel.id, params: body.forceModel.params }
       : undefined;
+  const fallbackModel = forceModel ?? model;
+
+  // 审查发现：awaiting_ack 时先 snapshot、再因缺 bootArgs 400 → 审阅产物版本被白白污染。
+  // 校验提到 snapshot 前：能送达（内存有会话且未 forceModel）或有唤醒凭据；不过直接 400。
+  const canDeliver = !forceModel && agentSessions.has(task.id);
+  const hasWakeCreds = !!apiKey && !!fallbackModel;
+  if (!canDeliver && !hasWakeCreds) {
+    return errorResponse("缺 bootArgs（apiKey / model）、agent 起不来", 400);
+  }
 
   // 当前产出在等审阅（awaiting_ack）= 原「再聊聊」场景：先 snapshot artifact 版本
   //（用户可能要求改、保留改前版本）、消息附「处理完重新交卷」上下文
@@ -217,7 +227,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       // awaiting_ack + 会话断（或显式换模型）：唤醒新 agent 处理这条意见并重新交卷
       currentAction.status === "awaiting_ack");
   const useOneShot = !sent && !canResume;
-  const fallbackModel = forceModel ?? model;
+  // 前置校验已拦「无会话且无凭据」；这里兜底会话在校验后死去的 race
   if (!sent && (!apiKey || !fallbackModel)) {
     return errorResponse("缺 bootArgs（apiKey / model）、agent 起不来", 400);
   }

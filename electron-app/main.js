@@ -51,6 +51,27 @@ const PORT = Number(process.env.FE_AI_FLOW_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
 
+// 站内 URL 必须按 origin 精确比对——`url.startsWith(BASE_URL)` 会被
+// `http://127.0.0.1:8876@evil/` / `:88760/` / `.attacker.tld/` 前缀绕过（审查发现）
+const isAppUrl = (url) => {
+  try {
+    const u = new URL(url);
+    return (
+      u.protocol === "http:" &&
+      u.hostname === HOST &&
+      Number(u.port) === PORT
+    );
+  } catch {
+    return false;
+  }
+};
+
+// 外链白名单：与 IPC open-external 同源——只放行 http(s) + 系统设置深链，
+// 避免 window.open / IPC 成任意协议跳板
+const OPEN_EXTERNAL_ALLOWED = /^(https?:|x-apple\.systempreferences:|ms-settings:)/i;
+const isSafeExternalUrl = (url) =>
+  typeof url === "string" && OPEN_EXTERNAL_ALLOWED.test(url);
+
 // userData 钉死在 fe-ai-flow（默认跟 productName 走）——显示名从「AI工作流」改成
 // 「Flowship」（v1.1.0）或以后再改名、数据目录都不漂移、用户任务数据不丢；测试实例独立目录防污染
 app.setPath(
@@ -544,24 +565,29 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
-  // window.open 一律转系统默认浏览器、零白名单（v0.7.8 用户实测拍板）：
-  // - 外链（飞书 story / MR / GitHub…）、OAuth 授权页 → 系统浏览器（v0.7.4 起）
-  // - 站内 URL（AI 给的 127.0.0.1:8876/... 绝对链接、图片预览）原来 allow 开
-  //   Electron 子窗——用户实测「应用内闪一下」体验差、同样转系统浏览器
+  // window.open 一律 deny + 白名单内转系统浏览器（v0.7.8 拍板转系统浏览器；
+  // 审查后补协议白名单，与 IPC open-external 同源，防任意协议跳板）：
+  // - 外链（飞书 story / MR / GitHub…）、OAuth 授权页 → https、在白名单内
+  // - 站内 URL 也 deny（用户实测「应用内闪一下」差）——若要开外链走 markdown/IPC
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (!isSafeExternalUrl(url)) {
+      console.warn(`[setWindowOpenHandler] 拒绝非白名单 URL：${String(url).slice(0, 80)}`);
+      return { action: "deny" };
+    }
     void shell.openExternal(url);
     return { action: "deny" };
   });
   // 同 frame 导航离开本应用（cursor:// deep link 跳 IDE、或意外的外部 http 链接）
   // → 拦下来交系统处理、窗口永远停在 ai-flow 页面上
   // 特例：app-update://install 是页面「新版本」标识发起的装更新指令、壳自己消费
+  // 主窗不放行 data:——splash 是独立 BrowserWindow 自己 loadURL(data:)，不经此 handler
   mainWindow.webContents.on("will-navigate", (e, url) => {
     if (url.startsWith("app-update://")) {
       e.preventDefault();
       void installUpdateNow();
       return;
     }
-    if (url.startsWith(BASE_URL) || url.startsWith("data:")) return;
+    if (isAppUrl(url)) return;
     e.preventDefault();
     void shell.openExternal(url);
   });
@@ -692,10 +718,9 @@ ipcMain.on("task-notify", (_e, payload) => {
 
 // ---------- 打开系统外链（设置页「系统设置里开启」通知权限等） ----------
 //
-// 只放行系统设置深链 + http(s)——别让页面 IPC 成任意协议跳板。
-const OPEN_EXTERNAL_ALLOWED = /^(https?:|x-apple\.systempreferences:|ms-settings:)/i;
+// 白名单见顶部 isSafeExternalUrl——别让页面 IPC 成任意协议跳板。
 ipcMain.on("open-external", (_e, url) => {
-  if (typeof url !== "string" || !OPEN_EXTERNAL_ALLOWED.test(url)) {
+  if (!isSafeExternalUrl(url)) {
     log(`[open-external] 拒绝非法 URL：${String(url).slice(0, 80)}`);
     return;
   }
@@ -1386,8 +1411,14 @@ if (!app.requestSingleInstanceLock()) {
     // mac 延迟更新：启动早期若有比当前新的暂存 → 立刻套用并 relaunch（窗未开、无感知）
     // 必须在 cleanup 之前——cleanup 会保留有效暂存，但套用失败时也别先误清
     if (await tryApplyStagedUpdateOnLaunch()) return;
-    // 删待重启 marker + 清 updates/ 残留（保留版本仍新于当前的 staged；不阻塞启动、fail-open）
-    void cleanupUpdateLeftovers();
+    // 删待重启 marker + 清 updates/ 残留（保留版本仍新于当前的 staged）
+    // 审查发现：void 不 await 时与 server 读 update-pending-restart.json 有竞态，
+    // 残留 marker 短窗内会误拦新任务——必须先清完再起 server（内部错误已吞、外再包一层）
+    try {
+      await cleanupUpdateLeftovers();
+    } catch (err) {
+      log(`[updater] 启动清扫异常（忽略）${err?.message || err}`);
+    }
     // server 布局缺失（dev 没组包 / 打包配置坏了）直接明错、不静默
     try {
       await fs.access(path.join(serverDir, "server.js"));

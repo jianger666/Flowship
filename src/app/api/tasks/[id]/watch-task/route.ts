@@ -83,19 +83,27 @@ export const GET = async (req: Request, { params }: Ctx) => {
     liveDispatch?.(ev);
   });
 
+  // 幂等清理：ReadableStream.cancel / req.signal abort / closeStream 都可能触发，防 double-clean
+  const cleanup = () => {
+    unsubscribeFn?.();
+    unsubscribeFn = null;
+    liveDispatch = null;
+  };
+
+  // 异常断连（tab 关 / 代理掐流）不一定走 cancel——挂 AbortSignal 兜底退订
+  req.signal.addEventListener("abort", cleanup, { once: true });
+
   // 订阅已挂上：此 await 期间产生的事件进 buffer，不会丢
   // 尾部反向读、不整文件 parse（P1-02）
   let initial: Task | null;
   try {
     initial = await getTaskWithTailEvents(id, tail);
   } catch (err) {
-    unsubscribeFn();
-    unsubscribeFn = null;
+    cleanup();
     throw err;
   }
   if (!initial) {
-    unsubscribeFn();
-    unsubscribeFn = null;
+    cleanup();
     return errorJson("not_found", 404);
   }
 
@@ -103,6 +111,9 @@ export const GET = async (req: Request, { params }: Ctx) => {
   const tailEvents = initial.events;
 
   const encoder = new TextEncoder();
+
+  // 去重 Set 上限：长会话 SSE 挂着只增不减会胀内存；超限丢最老一半（偶发重发可接受）
+  const SENT_EVENT_IDS_MAX = 5000;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -121,10 +132,21 @@ export const GET = async (req: Request, { params }: Ctx) => {
       const sentEventIds = new Set<string>();
       let doneSent = false;
 
+      const rememberEventId = (eventId: string) => {
+        sentEventIds.add(eventId);
+        if (sentEventIds.size <= SENT_EVENT_IDS_MAX) return;
+        // Set 迭代序 = 插入序：删掉最老一半
+        const drop = Math.floor(sentEventIds.size / 2);
+        let i = 0;
+        for (const id of sentEventIds) {
+          if (i++ >= drop) break;
+          sentEventIds.delete(id);
+        }
+      };
+
       const closeStream = () => {
         if (closed) return;
-        unsubscribeFn?.();
-        unsubscribeFn = null;
+        cleanup();
         try {
           controller.close();
         } catch {
@@ -137,7 +159,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
         switch (ev.kind) {
           case "event": {
             if (sentEventIds.has(ev.event.id)) return;
-            sentEventIds.add(ev.event.id);
+            rememberEventId(ev.event.id);
             send({ type: "event", event: ev.event });
             break;
           }
@@ -178,7 +200,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
           task: { ...stripEvents(initial), eventsTruncated: truncated },
         });
         for (const ev of tailEvents) {
-          sentEventIds.add(ev.id);
+          rememberEventId(ev.id);
           send({ type: "event", event: ev });
         }
       } catch (err) {
@@ -205,8 +227,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
       }
     },
     cancel() {
-      unsubscribeFn?.();
-      unsubscribeFn = null;
+      cleanup();
     },
   });
 

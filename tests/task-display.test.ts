@@ -122,4 +122,21 @@ describe("computeBatchProgress 多 plan 派生", () => {
     expect(progress.superseded.map((b) => b.effectiveId)).toEqual(["act_1:b2"]);
     expect(progress.done).toBe(1);
   });
+
+  it("awaiting_ack 的 build 计入已完成（推进窗口期不重复勾选）", () => {
+    const task = taskWithActions([
+      action(1, "plan", {
+        planBatches: [batch("b1", "接口"), batch("b2", "页面")],
+      }),
+      action(2, "build", {
+        status: "awaiting_ack",
+        requestedBatchIds: ["b1"],
+      }),
+    ]);
+
+    const progress = computeBatchProgress(task);
+
+    expect(progress.done).toBe(1);
+    expect(progress.remaining.map((b) => b.rawId)).toEqual(["b2"]);
+  });
 });

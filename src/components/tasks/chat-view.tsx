@@ -203,7 +203,7 @@ export const ChatView = ({
         <div className="flex w-full items-center justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 items-center gap-2">
-              <h1 className="truncate text-sm font-medium tracking-tight">
+              <h1 className="min-w-0 truncate text-sm font-medium tracking-tight">
                 {task.title}
               </h1>
               {/* 重命名：chat 模式没有编辑弹窗、这个铅笔是唯一改名入口 */}

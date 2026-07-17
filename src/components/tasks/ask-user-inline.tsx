@@ -18,7 +18,7 @@
  * event-stream 自动切回放卡——本组件不管关闭。
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Paperclip, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
@@ -323,6 +323,23 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
 
   // 网断时 fetch 可能挂很久不 reject，按钮会永久「提交中…」——超时强制解锁可重试
   const SUBMIT_UNLOCK_MS = 30_000;
+  // 提交成功/超时的 setTimeout：卸载时清掉，避免卸载后 setSubmitting（审查）
+  const submitTimersRef = useRef<number[]>([]);
+  const trackTimer = (id: number) => {
+    submitTimersRef.current.push(id);
+    return id;
+  };
+  const clearTrackedTimer = (id: number) => {
+    window.clearTimeout(id);
+    submitTimersRef.current = submitTimersRef.current.filter((t) => t !== id);
+  };
+  useEffect(
+    () => () => {
+      for (const t of submitTimersRef.current) window.clearTimeout(t);
+      submitTimersRef.current = [];
+    },
+    [],
+  );
 
   // AbortError：超时解锁已 toast + abort，勿再弹一次错误 toast
   const isAbortError = (err: unknown): boolean =>
@@ -352,11 +369,13 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     setSubmitting(true);
     // 超时解锁时 abort 在飞请求，避免迟到响应与用户重试撞成重复回答
     const ac = new AbortController();
-    const unlockTimer = window.setTimeout(() => {
-      ac.abort();
-      setSubmitting(false);
-      toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
-    }, SUBMIT_UNLOCK_MS);
+    const unlockTimer = trackTimer(
+      window.setTimeout(() => {
+        ac.abort();
+        setSubmitting(false);
+        toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
+      }, SUBMIT_UNLOCK_MS),
+    );
     try {
       await submitAskReply(task.id, askId, answers, {
         imagesByQuestion,
@@ -365,10 +384,10 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       // 提交成功：等 SSE 推 ask_user_reply、findPendingAskEvent 变 null、
       // event-stream 自动切回放卡——这里不主动收起、避免 race。
       // SSE 重连间隙另给 15s：卡片可能仍显示「提交中…」
-      window.clearTimeout(unlockTimer);
-      window.setTimeout(() => setSubmitting(false), 15_000);
+      clearTrackedTimer(unlockTimer);
+      trackTimer(window.setTimeout(() => setSubmitting(false), 15_000));
     } catch (err) {
-      window.clearTimeout(unlockTimer);
+      clearTrackedTimer(unlockTimer);
       if (isAbortError(err)) {
         setSubmitting(false);
         return;
@@ -391,20 +410,22 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     if (!ok) return;
     setSubmitting(true);
     const ac = new AbortController();
-    const unlockTimer = window.setTimeout(() => {
-      ac.abort();
-      setSubmitting(false);
-      toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
-    }, SUBMIT_UNLOCK_MS);
+    const unlockTimer = trackTimer(
+      window.setTimeout(() => {
+        ac.abort();
+        setSubmitting(false);
+        toast.error("提交超时，请检查网络后重试，或在底部输入条继续说");
+      }, SUBMIT_UNLOCK_MS),
+    );
     try {
       await submitAskReply(task.id, askId, [], {
         deferred: true,
         signal: ac.signal,
       });
-      window.clearTimeout(unlockTimer);
-      window.setTimeout(() => setSubmitting(false), 15_000);
+      clearTrackedTimer(unlockTimer);
+      trackTimer(window.setTimeout(() => setSubmitting(false), 15_000));
     } catch (err) {
-      window.clearTimeout(unlockTimer);
+      clearTrackedTimer(unlockTimer);
       if (isAbortError(err)) {
         setSubmitting(false);
         return;

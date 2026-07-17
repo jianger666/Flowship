@@ -15,6 +15,10 @@
 
 ---
 
+### 2026-07-16 v1.1.17 发版：后置检查 artifact 读取竞态修复
+
+- **交卷/落盘竞态误报**（用户实测：ship 后置检查红条 ENOENT、但文件几百 ms 后就在、UI 正文正常）：事件流实锤 agent 把「最后一次写 artifact」和「submit_work 交卷」**同一秒并行发**（Cursor agent 支持同批并行工具调用、模型偶尔把收尾动作并发）——后置检查在 submit_work 到达瞬间读 artifact、写盘还在飞行中。修法：`action-checks.ts` 新增 `readArtifactWithRetry`（ENOENT 短退避 0.5/1/2/4s、最多等 ~7.5s；其它错误不重试照旧报）、plan/review/ship/custom/build 五处 artifact 读取全换——与 UI 侧 artifact 面板既有退避重试对齐。不走「prompt 教模型别并行发」路线（靠模型自觉不如 server 确定性兜底）。
+
 ### 2026-07-16 v1.1.16 发版：mac GUI PATH 补全 + Windows 慢 P0（埋点 + PowerShell 提速）+ 修复批
 
 > Windows「执行过程慢」调研见 `docs/cursor-sdk-windows-performance-investigation-2026-07-16.md`（GPT-5.6 初查、主线对 SDK 1.0.23 bundle 逐条核实：Windows 默认 PowerShell 执行器、每条命令冷启动 + 不带 -NoProfile 全量重跑 Profile + 状态 dump 逐环境变量 Add-Content 的 IO 风暴、5s close 兜底、CURSOR_AGENT=1 注入实锤）。强制 Git Bash（设 SHELL 可切）留待埋点数据支撑后再议。

@@ -59,7 +59,10 @@ export const ActionWorkbenchHeader = ({
           {artifactFilename && (
             <>
               <FileText className="size-3.5 shrink-0" />
-              <span className="max-w-[60%] truncate" title={artifactFilename}>
+              <span
+                className="min-w-0 max-w-[60%] truncate"
+                title={artifactFilename}
+              >
                 {artifactFilename}
               </span>
             </>

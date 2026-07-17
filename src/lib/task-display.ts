@@ -10,33 +10,20 @@
 
 import type {
   ActionRecord,
+  ActionStatus,
   PlanBatch,
   ReplanMode,
   RepoStatus,
   RunStatus,
   Task,
 } from "./types";
+// ACTION_LABEL 单源在 types.ts（server action-gates / stop-task 同引）；此处 re-export 供 UI 原路径 import
+export { ACTION_LABEL } from "./types";
+import { ACTION_LABEL } from "./types";
 
 // ===========================================
 // Action 标签（V0.6 替代原 PHASE_LABEL）
 // ===========================================
-
-/**
- * Action 中文长版本（主要展示用：advance dialog 选项 / action timeline 卡片）
- *
- * 用 Record<string,…> 而非 Record<ActionType,…>：历史退役类型（learn / test）读盘后仍可能出现、
- * 查表 miss 时由 actionDisplayLabel 回退到原始 type 字符串、避免 timeline / 事件流崩。
- * types.ts 另有一份 ACTION_LABEL（推进准入文案）；展示层以本文件为准。
- */
-export const ACTION_LABEL: Record<string, string> = {
-  plan: "出方案",
-  build: "改代码",
-  review: "复核",
-  ship: "提测",
-  dev: "联调",
-  // 兜底——custom action 实际展示走定义里的 label（见 actionDisplayLabel），拿不到才回退
-  custom: "自定义",
-};
 
 /** 英文短标、用在 timeline 副标 / event stream inline */
 export const ACTION_LABEL_EN: Record<string, string> = {
@@ -76,7 +63,8 @@ export const actionDisplayLabel = (
   if (action.type === "custom") {
     return action.customLabel?.trim() || ACTION_LABEL.custom;
   }
-  const table =
+  // ACTION_LABEL 来自 types 为 Record<ActionType,…>；历史退役 type 仍可能出现，按 string 查表
+  const table: Record<string, string> =
     variant === "short"
       ? ACTION_LABEL_SHORT
       : variant === "en"
@@ -331,6 +319,14 @@ export interface EffectiveBatchesResult {
 }
 
 /**
+ * build 是否已计入批次进度：completed 或 awaiting_ack。
+ * runner 交卷后是 awaiting_ack、推进时才隐式 completed——窗口期必须算 done，
+ * 否则推进弹窗会把刚交卷的仓当 remaining 重复勾选。error / cancelled 仍不算。
+ */
+const isBuildDoneStatus = (status: ActionStatus): boolean =>
+  status === "completed" || status === "awaiting_ack";
+
+/**
  * 派生当前 task 的有效批次集。
  *
  * 关键约束：
@@ -355,7 +351,8 @@ export const deriveEffectiveBatches = (task: Task): EffectiveBatchesResult => {
     );
     const builtIds = new Set<string>();
     for (const action of task.actions) {
-      if (action.type !== "build" || action.status !== "completed" || action.excluded) {
+      // awaiting_ack：runner 交卷后、用户推进前——已算完成，否则进度窗会把刚交卷的仓当 remaining
+      if (action.type !== "build" || !isBuildDoneStatus(action.status) || action.excluded) {
         continue;
       }
       for (const requestedId of action.requestedBatchIds ?? []) {
@@ -397,7 +394,7 @@ export const deriveEffectiveBatches = (task: Task): EffectiveBatchesResult => {
       continue;
     }
 
-    if (action.type === "build" && action.status === "completed" && !action.excluded) {
+    if (action.type === "build" && isBuildDoneStatus(action.status) && !action.excluded) {
       for (const requestedId of action.requestedBatchIds ?? []) {
         const effectiveId = resolveRequestedBatchId(requestedId, active);
         if (effectiveId) builtIds.add(effectiveId);

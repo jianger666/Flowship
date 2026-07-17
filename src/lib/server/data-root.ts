@@ -42,6 +42,30 @@ export const ensurePrivateDir = async (dir: string): Promise<void> => {
 };
 
 /**
+ * Windows：目标文件被并发读 / 杀软扫描持有句柄时 rename 会 EPERM/EBUSY
+ * （同事线上实测、mac/linux 无此语义）——短退避重试几轮；重试穿透才抛。
+ * writePrivateFileAtomic / writeMeta 共用，避免两处重试策略漂移。
+ */
+export const renameWithRetry = async (
+  tmpPath: string,
+  finalPath: string,
+): Promise<void> => {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await fs.rename(tmpPath, finalPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw err;
+      await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+};
+
+/**
  * 原子写私密文件（0600）：同目录 tmp → rename → chmod。
  * writeFile 的 mode 只对新建生效；rename 覆盖后对最终路径再 chmod 一次兜底。
  * 失败清理 tmp（参考 feishu-cli installBinaryAtomic）。
@@ -60,7 +84,8 @@ export const writePrivateFileAtomic = async (
     } else {
       await fs.writeFile(tmpPath, content, "utf-8");
     }
-    await fs.rename(tmpPath, finalPath);
+    // 审查发现：原先单次 rename，Windows 上 EPERM/EBUSY 直接失败——与 writeMeta 对齐重试
+    await renameWithRetry(tmpPath, finalPath);
     // 覆盖已存在的 0644 文件时，部分平台 rename 可能保留旧 inode 权限——显式收紧
     if (supportsUnixFileMode()) {
       try {

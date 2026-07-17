@@ -1,16 +1,43 @@
 /**
  * 启动窗口「停止」竞态：pendingStopRequests 置 / 清逻辑。
- * 不 mock 整个 Agent SDK——只验 cancelTaskRun 与 Set 的契约。
+ * 不 mock 整个 Agent SDK——只验 cancelTaskRun / stopTaskAgent 与 Set 的契约。
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/server/task-fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/server/task-fs")>();
+  return {
+    ...actual,
+    // stopTaskAgent / closeTaskSession 会碰盘——相关 IO 全桩掉
+    appendEvent: vi.fn(async () => null),
+    getTask: vi.fn(async () => null),
+    patchAction: vi.fn(async () => null),
+    setTaskRunStatus: vi.fn(async () => null),
+    setTaskSessionAgentId: vi.fn(async () => null),
+  };
+});
+
+vi.mock("@/lib/server/kill-orphans", () => ({
+  reapTaskOrphans: vi.fn(),
+}));
+
+vi.mock("@/lib/server/chat-pending", () => ({
+  cleanupChatTaskState: vi.fn(),
+}));
+
+vi.mock("@/lib/server/chat-runner", () => ({
+  cancelChatRun: vi.fn(() => false),
+}));
 
 import { cancelTaskRun } from "@/lib/server/task-runner";
+import { stopTaskAgent } from "@/lib/server/stop-task";
 import {
   forceClearStaleRunnerState,
   pendingStopRequests,
   runningTasks,
   type RunningTaskRecord,
 } from "@/lib/server/task-stream";
+import type { Task } from "@/lib/types";
 
 const makeRec = (cancel: () => void): RunningTaskRecord => ({
   agentId: "agent-test",
@@ -18,6 +45,23 @@ const makeRec = (cancel: () => void): RunningTaskRecord => ({
   startSnapshot: { title: "" },
   cancel,
 });
+
+/** 最小 Task 桩：只供 stopTaskAgent 走过 cancel + 清 pending 路径 */
+const makeIdleTask = (id: string): Task =>
+  ({
+    id,
+    title: "pending-stop-test",
+    mode: "task",
+    repoPaths: [],
+    actions: [],
+    events: [],
+    runStatus: "idle",
+    repoStatus: "active",
+    currentActionId: null,
+    mrs: [],
+    createdAt: 0,
+    updatedAt: 0,
+  }) as unknown as Task;
 
 describe("pendingStopRequests（启动窗口停止）", () => {
   const ids: string[] = [];
@@ -58,6 +102,17 @@ describe("pendingStopRequests（启动窗口停止）", () => {
     const id = allocId();
     pendingStopRequests.add(id);
     forceClearStaleRunnerState(id);
+    expect(pendingStopRequests.has(id)).toBe(false);
+  });
+
+  it("stopTaskAgent 收尾后清除 pendingStopRequests（idle 停止不粘住）", async () => {
+    const id = allocId();
+    // idle 点停止：无活 run → cancelTaskRun 写入 pending（启动窗口自裁）
+    cancelTaskRun(id);
+    expect(pendingStopRequests.has(id)).toBe(true);
+
+    await stopTaskAgent(makeIdleTask(id));
+    // 收尾必须清掉，否则下次 oneshot 答疑会被误杀
     expect(pendingStopRequests.has(id)).toBe(false);
   });
 });

@@ -287,15 +287,25 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-17 v1.1.19 发版：Windows Git Bash 卡死热修 + 全仓审查修复批
+
+- **Windows「Agent shell 用 Git Bash」把 shell 彻底弄挂（v1.1.18 引入的线上事故、多个同事中招）**：v1.1.18 只写了 `process.env.SHELL`，但 SDK（1.0.23）选壳器和执行器是**两套独立逻辑**——选壳器 `vt()` 读 SHELL 命中 git-bash 就选 Bash 执行器（✅ 生效），但 Bash 执行器 `Ue()` 在 win32 下**根本不读 SHELL**、只在 `PATH` 里 `where bash` 找路径像 git-bash 的 bash。用户机器 PATH 只有 `Git\cmd`（装 Git 默认只加这个、里面没 bash.exe）→ 每条 shell 抛 `Can't find Bash` → 在 SDK async generator 里逃逸成 unhandledRejection（被 instrumentation 兜底进程不退）→ 工具调用永不结束 → agent 反复「shell 不可用/卡住」。诊断包 main.log 实锤：`SHELL → Git Bash` 后每条 `[perf-tool] tool=shell phase=start` 都无 `phase=done`、紧跟 `Error: Can't find Bash`；read/glob 正常。修法（`agent-shell.ts`）：开关开且探到 bash.exe 时**除写 SHELL 外把 `Git\bin` 前置注入 PATH**（让执行器 `where bash` 命中）+ 注入后跑 `bash -c echo __shell_ok__` **自检**、失败回滚 SHELL+PATH 退回 PowerShell（防「UI 说优化了、实际全挂」的假成功）；关开关/探测失败/自检失败按 `injectedBinDir` 精确卸载注入段、不碰 PATH 其它段；换 Git 安装路径先卸旧再注新。抽 `injectGitBashBinToPath`/`removeInjectedGitBashBinFromPath`/`verifyGitBashRunnable`/`syncAgentShellEnv` 可单测。
+- **全仓代码审查修复批（安全 / 竞态 / 数据一致性）**：11 个子代理全仓审查后修的一批实锤问题——
+  - **Electron 壳安全**：`will-navigate` 用严格 `new URL` 校验（protocol+hostname+port）替换 `startsWith(BASE_URL)`（防 `127.0.0.1:8876@evil` 等前缀绕过带 preload 进外部页）；去掉主窗 `data:` 放行；`window.open` 的 `openExternal` 补协议白名单（与 IPC 同源）；`await cleanupUpdateLeftovers` 消除与 update-pending marker 的启动竞态。
+  - **运行时停止链**：`stopTaskAgent`/`finalizeTask` 收尾清粘性 `pendingStopRequests`（否则误杀下轮 oneshot 答疑）；chat `closeChatSession` 加 agentId 门控（对齐 task 侧、防切模型强清后旧 run 误关新会话）；`sendChatMessage` 校验后立即占 `runActive`（关 TOCTOU 并发双发）；停止孤儿 reap 改传 `getTaskWorkRepoPaths`（隔离 worktree 任务原先漏杀）。
+  - **数据落盘**：`deleteTask` 持 `withTaskLock` + `appendEventLine` 去掉无条件 mkdir（防删后被并发写「复活」）；`writePrivateFileAtomic` 抽 `renameWithRetry` 补 Windows EPERM 重试；settings PUT 走 globalThis 写链串行 RMW（防并发丢更新）；mr-inbox-seen/ignored 写链挂 globalThis；`update-pending` 读 marker 只 ENOENT 放行、其它错误 fail-closed；custom-action ACTION.md 原子写。
+  - **集成层**：`submit-mr-guard` remote 读不到改 fail-closed（防越权提 MR）；`git-remote` 正确解析 `ssh://`（带端口）；`closeOpenMR` 区分「确认没开」与查询失败（防解冲突后旧 MR 双开）；GitLab fetch 统一 30s 超时；meegle 身份缓存随登录/登出失效。
+  - **API 路由**：chat-reply 改「确定送达后再落 user_reply」（409 不再假「已发送」）；skills POST 类型守卫；question 缺凭据 400 前不做 snapshot；watch-task SSE 挂 `req.signal` 清理 + `sentEventIds` 上限；local-image realpath 后再验扩展名。
+  - **前端**：任务详情页切 id 竞态（routeIdRef 守卫、迟到 fetch/SSE 不覆盖当前任务）；事件上拉分页迟到回调串任务；mr-inbox refresh/setSeen 补 res.ok；MCP 开关连点串行化 + loading 用 LoadingState 不显假空态；一批 min-w-0 / 顶栏胶囊 `bg-selected` / edit-task-dialog `disablePointerDismissal` / 定时器卸载清理。
+  - **共享 lib**：md-revision 三处（词级修订补 blockMarks、fingerprint 纳入 url/depth/ordered、相邻 list 插 HTML 注释分隔防块错位）；批次进度计入 `awaiting_ack`；path-utils UNC 双引号；local-store 浅拷贝/回滚/校验；`ACTION_LABEL` 双源收敛到 types.ts。
+  - **action 闸门**：review/build 必备段正则改 `#{2,3}` 标题锚定（原被总评 bullet 架空）；checkDev 直推路径也读 artifact 验非空。
+  - **shell 环境**：`hasShellBoost` 改匹配守卫本体（原只认 env 名子串、误判「已优化」）；login PATH 合并用 pinnedPrefixes 保 tools/bin 置顶；agent-shell 探测负缓存开关旁路。
+
 ### 2026-07-16 v1.1.18 发版：Windows「Agent shell 用 Git Bash」开关
 
-- **背景**：同事 Windows 上 agent shell 持续挂死/输出为空（SDK PowerShell 执行器官方已认 bug、v1.1.16 调研段）。SDK 选壳逻辑优先读 `process.env.SHELL`、指向 git-bash 即改走 Bash 执行器（bundle 源码实锤）——做成设置页开关免每人手动配环境变量。
+- **背景**：同事 Windows 上 agent shell 持续挂死/输出为空（SDK PowerShell 执行器官方已认 bug、v1.1.16 调研段）。SDK 选壳逻辑优先读 `process.env.SHELL`、指向 git-bash 即改走 Bash 执行器（bundle 源码实锤）——做成设置页开关免每人手动配环境变量。**⚠️ 本版只写 SHELL 未补 PATH、引发 v1.1.19 热修的线上事故**（详见 v1.1.19 段）。
 - **实现**（`agent-shell.ts`）：三层探测 `detectGitBashPath`（注册表 GitForWindows InstallPath → `where git.exe` + `deriveBashFromGitExe` 纯函数推导（cmd/bin/mingw64 三布局）→ 常规路径兜底、60s 缓存、子进程 5s 超时）；`applyAgentShellPreference` 按 settings 写/恢复 `process.env.SHELL`（模块加载时快照原值、关闭恢复、幂等）；调用点 = 启动 instrumentation + settings PUT 落盘后（拨开关即生效不用重启）。
 - **设置链路**：`FeAiFlowSettings.agentShellGitBash`（默认 false）全链路；设置页偏好卡新 SettingRow**仅 win32 渲染**（探测到显示路径、没探测到开关 disabled +「未检测到 Git Bash」）；拨完刷新「当前 Agent shell」展示形成闭环。`saveFieldValue` 顺带改为返回 Promise<boolean>（调用方可等落盘后刷新）。
-
-### 2026-07-16 v1.1.17 发版：后置检查 artifact 读取竞态修复
-
-- **交卷/落盘竞态误报**（用户实测：ship 后置检查红条 ENOENT、但文件几百 ms 后就在、UI 正文正常）：事件流实锤 agent 把「最后一次写 artifact」和「submit_work 交卷」**同一秒并行发**（Cursor agent 支持同批并行工具调用、模型偶尔把收尾动作并发）——后置检查在 submit_work 到达瞬间读 artifact、写盘还在飞行中。修法：`action-checks.ts` 新增 `readArtifactWithRetry`（ENOENT 短退避 0.5/1/2/4s、最多等 ~7.5s；其它错误不重试照旧报）、plan/review/ship/custom/build 五处 artifact 读取全换——与 UI 侧 artifact 面板既有退避重试对齐。不走「prompt 教模型别并行发」路线（靠模型自觉不如 server 确定性兜底）。
 
 ## 关键文件索引
 

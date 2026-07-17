@@ -246,6 +246,11 @@ describe("pruneSeenMap", () => {
     const seen = { bad: Number.NaN, ok: now };
     expect(pruneSeenMap(seen, now)).toEqual({ ok: now });
   });
+
+  it("未来时间戳清掉（旧实现 now-at>maxAge 对 at>now 恒 false）", () => {
+    const seen = { future: now + 60_000, ok: now - 1000 };
+    expect(pruneSeenMap(seen, now)).toEqual({ ok: now - 1000 });
+  });
 });
 
 describe("isNodeStatusDone / findNodeByNamePattern", () => {

@@ -62,8 +62,9 @@ export const POST = async (req: Request) => {
   } catch {
     return errorResponse("body 不是合法 JSON", 400);
   }
-  const name = (body.name ?? "").trim();
-  const content = body.content ?? "";
+  // as 断言挡不住非 string 的 name / content——.trim() 会 TypeError 变 500、显式验类型
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const content = typeof body.content === "string" ? body.content : "";
   const failure = await writeAppSkill(name, content);
   if (failure) return errorResponse(failure, 400);
   return NextResponse.json({ ok: true });

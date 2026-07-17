@@ -90,17 +90,49 @@ export const readSettingsFile = async (): Promise<SettingsReadResult> => {
   }
 };
 
+// 写链挂 globalThis：Next dev 多 chunk 下 module-level Promise 不共享（同 task-fs-core 踩坑）。
+// 审查发现：裸写无互斥时并发 PUT 丢更新——「读盘→合并→写盘」须整段进链。
+const SETTINGS_WRITE_CHAIN_KEY = "__feAiFlowSettingsWriteChainV1__";
+const getSettingsWriteChain = (): { current: Promise<unknown> } => {
+  const g = globalThis as unknown as Record<
+    string,
+    { current: Promise<unknown> } | undefined
+  >;
+  if (!g[SETTINGS_WRITE_CHAIN_KEY]) {
+    g[SETTINGS_WRITE_CHAIN_KEY] = { current: Promise.resolve() };
+  }
+  return g[SETTINGS_WRITE_CHAIN_KEY]!;
+};
+
+/** 串行执行 settings 写侧临界区（RMW / 裸写共用同一条链） */
+export const withSettingsWriteLock = async <T>(
+  fn: () => Promise<T>,
+): Promise<T> => {
+  const chain = getSettingsWriteChain();
+  const run = chain.current.then(fn, fn);
+  // 队列指针只关心「上一个是否结束」、错误由调用方消费、不传染下一个
+  chain.current = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+};
+
 /**
  * 原子写 config.json（0600 + tmp/rename）。
  * 含 API key / GitLab PAT——写入即收紧权限（P0-02）。
+ * 写操作进 globalThis 链；若调用方还要做读改写，请用 withSettingsWriteLock 包住整段 RMW
+ *（勿在锁内再调本函数——会同链嵌套死锁）。
  */
 export const writeSettingsFileAtomic = async (
   settings: Record<string, unknown>,
 ): Promise<void> => {
-  await writePrivateFileAtomic(
-    settingsFilePath(),
-    JSON.stringify(settings, null, 2),
-  );
+  await withSettingsWriteLock(async () => {
+    await writePrivateFileAtomic(
+      settingsFilePath(),
+      JSON.stringify(settings, null, 2),
+    );
+  });
 };
 
 /**
@@ -156,6 +188,36 @@ export const preserveSecretsOnPut = (
   }
   return { settings: out, preserved };
 };
+
+/**
+ * PUT 语义的读改写：读盘 → 掩码兜底合并 → 原子写，整段串行化。
+ * route 侧副作用（收件箱缓存失效 / shell 偏好）放在外层、拿 previous 比对即可。
+ */
+export const putSettingsFile = async (
+  incoming: Record<string, unknown>,
+): Promise<
+  | {
+      status: "ok";
+      settings: Record<string, unknown>;
+      previous: Record<string, unknown> | null;
+    }
+  | { status: "unreadable"; reason: string }
+> =>
+  withSettingsWriteLock(async () => {
+    const currentResult = await readSettingsFile();
+    if (currentResult.status === "error") {
+      return { status: "unreadable" as const, reason: currentResult.reason };
+    }
+    const previous =
+      currentResult.status === "ok" ? currentResult.settings : null;
+    const { settings } = preserveSecretsOnPut(incoming, previous);
+    // 直接写盘、不走 writeSettingsFileAtomic（避免同链嵌套死锁）
+    await writePrivateFileAtomic(
+      settingsFilePath(),
+      JSON.stringify(settings, null, 2),
+    );
+    return { status: "ok" as const, settings, previous };
+  });
 
 /**
  * 按仓库路径查设置页配的「预览启动命令」（CR-01：/api/preview 唯一命令来源）。

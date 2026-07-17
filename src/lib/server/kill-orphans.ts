@@ -10,9 +10,12 @@
  *
  * # 做法
  * 在停止 / 收尾时主动扫一遍系统进程、把满足以下条件的进程连同其子树一起 kill：
- *   - **cwd 落在本 task 的 repoPaths 里**（限定作用域、不波及无关仓库），且
+ *   - **cwd 落在调用方传入的工作目录里**（限定作用域、不波及无关仓库），且
  *   - 带 **Cursor agent shell 签名**（agent 的 shell 工具 wrapper、见下），或
  *   - 已 **orphan（ppid=1）**（父 agent 已死、reparent 到 init）
+ *
+ * 调用方应传 **agent 实际工作目录**（`getTaskWorkRepoPaths(task)`），不是裸 `task.repoPaths`——
+ * 隔离 worktree 任务的 cwd 在 `<dataRoot>/worktrees/<taskId>/...`，传原仓路径会漏杀孤儿。
  *
  * 这样**不会误杀用户在自己终端里手动跑的 dev server / lint**——那些进程的父进程是用户的
  * shell（不是 init）、也没有 agent shell 签名。
@@ -36,7 +39,7 @@ const AGENT_SHELL_SIGNATURE = "command cat <&3";
 
 // orphan(ppid=1) 分支的命令白名单——macOS 下大量系统 daemon 也挂在 launchd(ppid=1) 下、
 // 用这个把候选收窄到「构建 / 脚本 / shell」类、避免对几十个系统进程做 lsof（也防误伤）。
-// cwd 落在 repoPaths 的二次过滤仍在、这里只是减负 + 加一道保险。
+// cwd 落在工作目录的二次过滤仍在、这里只是减负 + 加一道保险。
 const ORPHAN_CMD_HINT =
   /\b(node|npm|pnpm|yarn|npx|deno|bun|ng|vue-cli-service|vite|webpack|rollup|esbuild|jest|vitest|mocha|eslint|tslint|stylelint|tsc|prettier|biome|java|gradlew?|mvn|python\d?|ruby|go|cargo|sh|zsh|bash|fish)\b/;
 
@@ -104,17 +107,18 @@ const collectSubtree = (
 };
 
 /**
- * 扫描并杀掉落在 repoPaths 里的孤儿 / agent-shell 进程树。best-effort、不抛。
+ * 扫描并杀掉落在工作目录里的孤儿 / agent-shell 进程树。best-effort、不抛。
+ * @param workDirs agent 实际 cwd 列表（隔离任务传 worktree 路径，见 reapTaskOrphans 调用方）
  */
 const killOrphansInRepos = async (
-  repoPaths: string[],
+  workDirs: string[],
 ): Promise<void> => {
   // Windows：没有 ps / lsof、这套「按 cwd 扫孤儿」实施不了——直接跳过、
   // 不让每次停止任务都白跑 + 打 error 日志（本保护本就 best-effort、
   // Windows 端 agent 子进程树最终由壳退出时 taskkill /T 兜底）
   if (process.platform === "win32") return;
-  if (!repoPaths || repoPaths.length === 0) return;
-  const repos = repoPaths.map((p) => path.resolve(p));
+  if (!workDirs || workDirs.length === 0) return;
+  const repos = workDirs.map((p) => path.resolve(p));
   const selfPid = process.pid;
 
   try {
@@ -174,10 +178,13 @@ const killOrphansInRepos = async (
  * 停止时调：立即扫一次 + 2.5s 后再扫一次。
  * 第二次为了接住「run.cancel() 后 agent 才慢慢死、子进程刚 reparent 到 init」的漏网。
  * fire-and-forget、调用方 `void` 即可。
+ *
+ * @param workDirs 应传 agent 实际工作目录（`getTaskWorkRepoPaths(task)`），勿传裸 `task.repoPaths`
  */
-export const reapTaskOrphans = (repoPaths: string[]): void => {
-  void killOrphansInRepos(repoPaths);
+export const reapTaskOrphans = (workDirs: string[]): void => {
+  void killOrphansInRepos(workDirs);
+  // unref：别让这 2.5s 定时器拖住进程退出（测试环境 mock 可能无 unref）
   setTimeout(() => {
-    void killOrphansInRepos(repoPaths);
-  }, 2500);
+    void killOrphansInRepos(workDirs);
+  }, 2500).unref?.();
 };

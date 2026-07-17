@@ -58,6 +58,15 @@ describe("shellQuotePath（复制路径给终端 cd 用）", () => {
   it("带空格 Windows 反斜杠路径用双引号包", () => {
     expect(shellQuotePath("D:\\My Docs\\repo")).toBe('"D:\\My Docs\\repo"');
   });
+
+  it("带空格 UNC 走双引号（旧实现误套 POSIX 单引号）", () => {
+    expect(shellQuotePath("\\\\server\\share\\My Docs")).toBe(
+      '"\\\\server\\share\\My Docs"',
+    );
+    expect(shellQuotePath("//server/share/My Docs")).toBe(
+      '"//server/share/My Docs"',
+    );
+  });
 });
 
 // CR-11 回归：/api/repo-branches 与设置页手填校验共用的跨平台绝对路径判断——

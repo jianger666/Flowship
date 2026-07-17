@@ -25,7 +25,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, writePrivateFileAtomic } from "./data-root";
 import { findSkillByName, getAppSkillsDir, parseSkillFile } from "./skills-loader";
 import type { CustomActionDef, CustomActionInput } from "@/lib/types";
 
@@ -150,8 +150,8 @@ const serialize = (def: CustomActionDef): string => {
 };
 
 const writeDef = async (def: CustomActionDef): Promise<void> => {
-  await fs.mkdir(dirOf(def.id), { recursive: true });
-  await fs.writeFile(fileOf(def.id), serialize(def), "utf-8");
+  // 审查发现：裸 writeFile 非原子、写一半崩溃会留下半截 ACTION.md——走 tmp+rename
+  await writePrivateFileAtomic(fileOf(def.id), serialize(def));
 };
 
 // 老平铺文件 → 目录布局（读到旧文件时调、幂等）；目录版已存在则不覆盖、只清平铺

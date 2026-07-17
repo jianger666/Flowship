@@ -40,15 +40,23 @@ export const GET = async (req: Request) => {
   if (!path.isAbsolute(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) {
     return errorJson("path 必须是绝对路径");
   }
+  // 请求路径先过扩展名白名单（快失败）；realpath 后再验一遍——防 symlink 指到非图片
   const ext = path.extname(raw).slice(1).toLowerCase();
-  const mime = EXT_TO_MIME[ext];
-  if (!mime) return errorJson(`不支持的图片类型：.${ext || "(无扩展名)"}`);
+  if (!EXT_TO_MIME[ext]) {
+    return errorJson(`不支持的图片类型：.${ext || "(无扩展名)"}`);
+  }
 
   try {
-    const stat = await fs.stat(raw);
+    // 解 symlink / .. 后再验扩展名（审查发现：旧逻辑只看请求 path 后缀、可指到任意文件）
+    const real = await fs.realpath(raw);
+    const realExt = path.extname(real).slice(1).toLowerCase();
+    const mime = EXT_TO_MIME[realExt];
+    if (!mime) return errorJson("不是文件", 404);
+
+    const stat = await fs.stat(real);
     if (!stat.isFile()) return errorJson("不是文件", 404);
     if (stat.size > MAX_BYTES) return errorJson("文件过大（>30MB）", 413);
-    const buf = await fs.readFile(raw);
+    const buf = await fs.readFile(real);
     return new Response(new Uint8Array(buf), {
       status: 200,
       headers: {

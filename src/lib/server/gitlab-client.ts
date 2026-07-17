@@ -111,10 +111,25 @@ export type MergeMRResult =
   | { ok: true; url: string; iid: number }
   | { ok: false; error: string };
 
+/** GitLab REST 统一超时——无超时会在网络挂死时拖死 ship / 关旧 MR */
+const FETCH_TIMEOUT_MS = 30_000;
+
 const buildBaseUrl = (host: string): string => {
   const trimmed = host.trim().replace(/\/+$/, "").replace(/^https?:\/\//, "");
   if (!trimmed) throw new Error("GitLab host 为空");
   return `https://${trimmed}/api/v4`;
+};
+
+/** fetch 失败文案：TimeoutError / AbortError 也走「网络错误」、给可读 message */
+const formatFetchNetworkError = (err: unknown): string => {
+  if (err instanceof Error) {
+    const name = err.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      return `网络错误：请求超时（${FETCH_TIMEOUT_MS / 1000}s）`;
+    }
+    return `网络错误：${err.message}`;
+  }
+  return `网络错误：${String(err)}`;
 };
 
 const buildHeaders = (token: string): HeadersInit => {
@@ -167,17 +182,26 @@ const formatGitLabError = async (res: Response): Promise<string> => {
 };
 
 /**
+ * findOpenMR 结果：必须区分「确认没有」vs「查询失败」
+ * （旧实现把 401/5xx/网络错误也当 ok:false、closeOpenMR 误当成「本来没开」静默成功——
+ *   解冲突后旧 MR 漏关双开，审查发现）
+ */
+type FindOpenMRResult =
+  | { ok: true; mr: { url: string; iid: number } }
+  | { ok: true; mr: null }
+  | { ok: false; error: string };
+
+/**
  * 查指定 source→target 的 open MR（createMR 撞 409「已有同分支 MR」时复用现有 MR 用）
  *
  * GitLab list MR API、按 source_branch + target_branch + state=opened 过滤、取第一条。
- * 复用 CreateMRResult 类型（拿到的也是 url + iid、跟新建语义对调用方透明）。
  */
 const findOpenMR = async (
   input: Pick<
     CreateMRInput,
     "config" | "projectPath" | "sourceBranch" | "targetBranch"
   >,
-): Promise<CreateMRResult> => {
+): Promise<FindOpenMRResult> => {
   let base: string;
   let headers: HeadersInit;
   try {
@@ -193,7 +217,11 @@ const findOpenMR = async (
   });
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests?${q.toString()}`;
   try {
-    const res = await fetch(url, { method: "GET", headers });
+    const res = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
@@ -204,14 +232,12 @@ const findOpenMR = async (
       typeof first.web_url !== "string" ||
       typeof first.iid !== "number"
     ) {
-      return { ok: false, error: "未查到同 source/target 的 open MR" };
+      // 确认没有同 source/target 的 open MR（空列表 / 缺字段）
+      return { ok: true, mr: null };
     }
-    return { ok: true, url: first.web_url, iid: first.iid };
+    return { ok: true, mr: { url: first.web_url, iid: first.iid } };
   } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
 
@@ -241,6 +267,7 @@ export const createMR = async (
     const res = await fetch(url, {
       method: "POST",
       headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       body: JSON.stringify({
         source_branch: input.sourceBranch,
         target_branch: input.targetBranch,
@@ -256,10 +283,12 @@ export const createMR = async (
     if (!res.ok) {
       // 409 / 422 可能是「已有同分支 open MR」（多次 ship / 解冲突后重跑必经、GitLab 版本差异两种码都出现过）
       // 也可能是别的验证错误（如 source branch 不存在）——先试 findOpenMR 复用、
-      //   查到就视同建好、查不到退回原始错误（不拿「复用失败」掩盖真因）
+      //   查到就视同建好、确认没有 / 查询失败都退回原始错误（不拿「复用失败」掩盖真因）
       if (res.status === 409 || res.status === 422) {
         const existing = await findOpenMR(input);
-        if (existing.ok) return existing;
+        if (existing.ok && existing.mr) {
+          return { ok: true, url: existing.mr.url, iid: existing.mr.iid };
+        }
         return { ok: false, error: await formatGitLabError(res) };
       }
       return { ok: false, error: await formatGitLabError(res) };
@@ -273,10 +302,7 @@ export const createMR = async (
     }
     return { ok: true, url: body.web_url, iid: body.iid };
   } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
 
@@ -304,6 +330,7 @@ const closeMR = async (input: {
     const res = await fetch(url, {
       method: "PUT",
       headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       body: JSON.stringify({ state_event: "close" }),
     });
     if (!res.ok) {
@@ -311,10 +338,7 @@ const closeMR = async (input: {
     }
     return { ok: true };
   } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
 
@@ -324,7 +348,8 @@ const closeMR = async (input: {
  * V0.6.8：AI 智能解冲突时、原 `feature→test` MR 被 `__conflict→test` 新 MR 取代、
  * 调本函数把旧的关掉、避免 GitLab 上留一个废弃的冲突 MR（双 MR 垃圾）。
  *
- * 找不到旧 open MR（已被关 / 从没建）当成功——本函数语义是「确保它不开着」、不是「必须关到一个」。
+ * 仅「确认没有 open MR」才当成功 closed:false——查询失败必须向上返错（审查发现：
+ *   旧逻辑把 401/网络错误当「本来没开」、解冲突后旧 MR 漏关双开）。
  */
 export const closeOpenMR = async (input: {
   config: GitLabConfig;
@@ -340,13 +365,16 @@ export const closeOpenMR = async (input: {
     targetBranch: input.targetBranch,
   });
   if (!found.ok) {
-    // 没查到 open MR → 目标已达成（它本来就没开着）
+    return { ok: false, error: found.error };
+  }
+  if (!found.mr) {
+    // 确认没有 open MR → 目标已达成（它本来就没开着）
     return { ok: true, closed: false };
   }
   const closed = await closeMR({
     config: input.config,
     projectPath: input.projectPath,
-    iid: found.iid,
+    iid: found.mr.iid,
   });
   if (!closed.ok) return { ok: false, error: closed.error };
   return { ok: true, closed: true };
@@ -391,12 +419,13 @@ export const getMRMergeStatus = async (
   for (let attempt = 0; attempt < maxPolls; attempt++) {
     let res: Response;
     try {
-      res = await fetch(url, { method: "GET", headers });
+      res = await fetch(url, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
     } catch (err) {
-      return {
-        ok: false,
-        error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-      };
+      return { ok: false, error: formatFetchNetworkError(err) };
     }
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
@@ -453,7 +482,11 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
   }
   const url = `${base}/projects/${encodeProjectPath(input.projectPath)}/merge_requests/${input.iid}`;
   try {
-    const res = await fetch(url, { method: "GET", headers });
+    const res = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) {
       return { ok: false, error: await formatGitLabError(res) };
     }
@@ -486,10 +519,7 @@ export const getMR = async (input: GetMRInput): Promise<GetMRResult> => {
       mergeable,
     };
   } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };
 
@@ -510,6 +540,7 @@ export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
     const res = await fetch(url, {
       method: "PUT",
       headers,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       body: JSON.stringify({}),
     });
     if (!res.ok) {
@@ -522,9 +553,6 @@ export const mergeMR = async (input: GetMRInput): Promise<MergeMRResult> => {
       url: typeof body?.web_url === "string" ? body.web_url : "",
     };
   } catch (err) {
-    return {
-      ok: false,
-      error: `网络错误：${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: formatFetchNetworkError(err) };
   }
 };

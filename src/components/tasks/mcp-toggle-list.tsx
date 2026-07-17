@@ -16,7 +16,7 @@
  * 设计依赖：调用方负责传入「当前 Cursor 配的所有 MCP 名」、组件不读配置（保持纯展示）。
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, Plug } from "lucide-react";
 import { toast } from "sonner";
 
@@ -145,13 +145,29 @@ export const McpToggleList = ({
 
   const isAutoMode = !onChange && !!taskId;
 
+  // 审查：自管模式整表 PATCH，连点多个 server 时后返回的会覆盖先返回的。
+  // 用 ref 维护最新黑名单 + Promise 链串行化，每次 PATCH 都发 ref 上的最新集合；
+  // viewDisabled 乐观驱动 UI（props 要等 PATCH 回才变）。
+  const disabledRef = useRef(disabled);
+  const patchChainRef = useRef(Promise.resolve());
+  // 在飞 PATCH 计数：>0 时不跟 props 回写，避免迟到 onUpdated 把连点结果打回旧值
+  const inflightRef = useRef(0);
+  const [viewDisabled, setViewDisabled] = useState(disabled);
+  useEffect(() => {
+    if (inflightRef.current === 0) {
+      disabledRef.current = disabled;
+      setViewDisabled(disabled);
+    }
+  }, [disabled]);
+
   // 切换一个 server 的启用状态
   // - 受控模式：直接调 onChange
   // - 自管模式：乐观更新、PATCH 失败 toast 但不回滚（避免抖动、用户重试就行）
   const toggle = async (server: string, enable: boolean) => {
+    const base = isAutoMode ? disabledRef.current : disabled;
     const next = enable
-      ? disabled.filter((s) => s !== server)
-      : [...new Set([...disabled, server])];
+      ? base.filter((s) => s !== server)
+      : [...new Set([...base, server])];
 
     // 关→开：单独探这一个的连通性（对齐 Cursor、打开才连、不触发全量重探）
     if (enable) onEnableProbe?.(server);
@@ -161,37 +177,54 @@ export const McpToggleList = ({
       return;
     }
 
+    disabledRef.current = next;
+    setViewDisabled(next);
     setPending((prev) => new Set(prev).add(server));
-    try {
-      const updated = await setTaskDisabledMcpServers(
-        taskId!,
-        next.length > 0 ? next : null,
-      );
-      // 改黑名单只写 meta、不产生事件、SSE 不会推——必须用 PATCH 返回的 task 回传刷新
-      // （V0.6.29 修「开关点了闪一下弹回」：原来这里丢弃返回值干等 SSE、prop 永远不变）
-      onUpdated?.(updated);
-    } catch (err) {
-      toast.error(
-        `切换失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setPending((prev) => {
-        const next = new Set(prev);
-        next.delete(server);
-        return next;
-      });
-    }
+    inflightRef.current += 1;
+    const run = async () => {
+      try {
+        // 串行链上每次都读最新 ref（中间可能又点了别的 server）
+        const payload = disabledRef.current;
+        const updated = await setTaskDisabledMcpServers(
+          taskId!,
+          payload.length > 0 ? payload : null,
+        );
+        // 改黑名单只写 meta、不产生事件、SSE 不会推——必须用 PATCH 返回的 task 回传刷新
+        // （V0.6.29 修「开关点了闪一下弹回」：原来这里丢弃返回值干等 SSE、prop 永远不变）
+        onUpdated?.(updated);
+      } catch (err) {
+        toast.error(
+          `切换失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        inflightRef.current -= 1;
+        setPending((prev) => {
+          const n = new Set(prev);
+          n.delete(server);
+          return n;
+        });
+      }
+    };
+    const p = patchChainRef.current.then(run, run);
+    patchChainRef.current = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    await p;
   };
 
   if (availableServers.length === 0) {
     return <EmptyHint className={className}>{emptyHint}</EmptyHint>;
   }
 
+  // 自管模式用乐观 viewDisabled；受控模式仍跟 props
+  const displayDisabled = isAutoMode ? viewDisabled : disabled;
+
   return (
     <>
       <ul className={cn("divide-y rounded-md border", className)}>
         {availableServers.map((name) => {
-          const isDisabled = disabled.includes(name);
+          const isDisabled = displayDisabled.includes(name);
           const isPending = pending.has(name);
           return (
             <li
@@ -252,10 +285,12 @@ export const McpToggleList = ({
       >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
+            <DialogTitle className="flex min-w-0 items-center gap-2">
               <span className="size-2 shrink-0 rounded-full bg-red-500" />
-              <span className="truncate font-mono">{logHealth?.name}</span>
-              <span className="text-muted-foreground">连接失败</span>
+              <span className="min-w-0 truncate font-mono">
+                {logHealth?.name}
+              </span>
+              <span className="shrink-0 text-muted-foreground">连接失败</span>
             </DialogTitle>
             <DialogDescription>
               排查后

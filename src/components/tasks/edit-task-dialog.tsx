@@ -163,7 +163,8 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    // disablePointerDismissal：带草稿表单，点外误关会丢编辑内容；Esc / X / 取消仍可关
+    <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>编辑任务</DialogTitle>

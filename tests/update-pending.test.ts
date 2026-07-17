@@ -5,7 +5,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const TMP_DATA = path.join(os.tmpdir(), `fe-update-pending-${Date.now()}`);
 process.env.FE_AI_FLOW_DATA_DIR = TMP_DATA;
@@ -19,6 +19,10 @@ const MARKER = path.join(TMP_DATA, "update-pending-restart.json");
 
 beforeAll(async () => {
   await fs.mkdir(TMP_DATA, { recursive: true });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 afterAll(async () => {
@@ -45,5 +49,20 @@ describe("checkUpdatePendingRestart", () => {
     const msg = await checkUpdatePendingRestart();
     expect(msg).not.toBeNull();
     expect(msg).toContain("重启");
+  });
+
+  it("读 marker 非 ENOENT（如 EACCES）：fail-closed、提示重启", async () => {
+    // 旧行为任何 read 错误都当无 marker 放行 → EACCES 时硬闸失效
+    await fs.rm(MARKER, { force: true });
+    const err = Object.assign(new Error("permission denied"), {
+      code: "EACCES",
+    });
+    // assert 内部再调一次 check——mock 两次，避免落到盘上真实文件
+    vi.spyOn(fs, "readFile")
+      .mockRejectedValueOnce(err)
+      .mockRejectedValueOnce(err);
+    const msg = await checkUpdatePendingRestart();
+    expect(msg).toBe("读更新标记失败、为安全起见请重启应用");
+    await expect(assertNoUpdatePendingRestart()).rejects.toThrow(/读更新标记失败/);
   });
 });

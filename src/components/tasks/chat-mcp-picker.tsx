@@ -26,6 +26,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { EmptyHint } from "@/components/ui/empty-hint";
+import { LoadingState } from "@/components/ui/loading-state";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { cn } from "@/lib/utils";
@@ -110,7 +111,11 @@ export const ChatMcpPicker = ({ task, onTaskUpdate }: Props) => {
           )}
         </div>
 
-        {availableServers.length === 0 ? (
+        {mcpLoading ? (
+          <div className="p-3">
+            <LoadingState variant="inline" />
+          </div>
+        ) : availableServers.length === 0 ? (
           <div className="p-3">
             <EmptyHint>
               Cursor 里没配 MCP server（~/.cursor/mcp.json）

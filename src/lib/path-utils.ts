@@ -475,6 +475,13 @@ export const getRepoShortNames = (
 };
 
 /**
+ * Windows UNC（`\\server\share` 或归一化后 `//server/share`）。
+ * 审查发现：旧 shellQuotePath 只认盘符，带空格 UNC 误走 POSIX 单引号 → Windows cd 失败。
+ */
+const isWindowsUncPath = (p: string): boolean =>
+  /^\\\\[^\\]/.test(p) || /^\/\/[^/]/.test(p);
+
+/**
  * 把路径转成 shell 可直接粘贴的形式（任务页「复制路径」按钮用）
  *
  * 为什么：这个按钮的本意是「终端 cd 用」、而 worktree 路径在
@@ -484,14 +491,14 @@ export const getRepoShortNames = (
  * 分流（含不安全字符时按平台选引号，不能一律单引号）：
  * - 只含安全字符 → 原样返回（含无空格 Windows `D:\...` / `C:/...`；
  *   套单引号 cmd 反而不认——同事 Windows 实用场景）
- * - Windows 盘符路径（`C:\` / `C:/`，见 isWindowsAbsPath）→ **双引号**包：
+ * - Windows 盘符 / UNC（`C:\` / `\\server\share`）→ **双引号**包：
  *   cmd / PowerShell 都认；Windows 文件名本身不允许 `"`，防御性剥掉即可
  * - 其余（POSIX）→ 单引号 + `'\''` 转义（`$` / 反引号 / 空格全部字面化）
  */
 export const shellQuotePath = (p: string): string => {
   if (/^[A-Za-z0-9._\-/~:\\]*$/.test(p)) return p;
   // Windows 带空格路径若套 POSIX 单引号，cmd 里 `cd '...'` 失败
-  if (isWindowsAbsPath(p)) {
+  if (isWindowsAbsPath(p) || isWindowsUncPath(p)) {
     return `"${p.replace(/"/g, "")}"`;
   }
   return `'${p.replace(/'/g, `'\\''`)}'`;

@@ -14,8 +14,19 @@ import { dataRoot, writePrivateFileAtomic } from "./data-root";
 
 const seenFilePath = (): string => path.join(dataRoot(), "mr-inbox-seen.json");
 
-// 读改写互斥链（并发 POST /seen 时串行执行、后写不丢前写）
-let seenWriteChain: Promise<unknown> = Promise.resolve();
+// 读改写互斥链挂 globalThis：Next dev 多 chunk 下 module-level Promise 各持一份、锁失效
+// （同 task-fs-core withTaskLock 踩坑；审查发现本文件原先用 module 级 let）
+const SEEN_WRITE_CHAIN_KEY = "__feAiFlowMrInboxSeenWriteChainV1__";
+const getSeenWriteChain = (): { current: Promise<unknown> } => {
+  const g = globalThis as unknown as Record<
+    string,
+    { current: Promise<unknown> } | undefined
+  >;
+  if (!g[SEEN_WRITE_CHAIN_KEY]) {
+    g[SEEN_WRITE_CHAIN_KEY] = { current: Promise.resolve() };
+  }
+  return g[SEEN_WRITE_CHAIN_KEY]!;
+};
 
 /** 读盘 + 解析容错（缺文件 / 坏 JSON → 空 map） */
 const readSeenRaw = async (): Promise<Record<string, number>> => {
@@ -58,9 +69,10 @@ export const readMrInboxSeen = async (): Promise<Record<string, number>> => {
 
 /** 串行执行一个写任务（读改写整段进链、防交叉覆盖） */
 const enqueueSeenWrite = <T>(job: () => Promise<T>): Promise<T> => {
-  const next = seenWriteChain.then(job, job);
+  const chain = getSeenWriteChain();
+  const next = chain.current.then(job, job);
   // 链上吞掉错误、不让上一个失败传染下一个任务
-  seenWriteChain = next.catch(() => {});
+  chain.current = next.catch(() => {});
   return next;
 };
 

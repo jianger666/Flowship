@@ -145,15 +145,27 @@ const runningChats = getRunnerState().runningChats;
 export const hasChatSession = (taskId: string): boolean =>
   runningChats.has(taskId);
 
-// V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort
-// keepPersisted = 空闲回收用（sessionAgentId 留着、下次消息 Agent.resume 接回）
+/**
+ * V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort。
+ * expectedAgentId 传了就只在「当前会话确实是它」时才关（异步收尾路径防误关新会话）；
+ * 不传 = 关当前的（用户主动 stop / forceClear）。对齐 task-runner.closeTaskSession。
+ * keepPersisted = 空闲回收用（sessionAgentId 留着、下次消息 Agent.resume 接回）
+ * @returns 是否真的关了一个会话
+ */
 const closeChatSession = (
   taskId: string,
+  expectedAgentId?: string,
   opts: { keepPersisted?: boolean } = {},
-): void => {
-  if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+): boolean => {
   const rec = runningChats.get(taskId);
-  if (!rec) return;
+  if (!rec) {
+    if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+    return false;
+  }
+  // 审查发现：旧 run 收尾缺 agentId 门控时，切模型 forceClear 后迟到的 cancelled 分支会误关新会话
+  if (expectedAgentId !== undefined && rec.agentId !== expectedAgentId) {
+    return false;
+  }
   runningChats.delete(taskId);
   setChatAwaitingNotifier(taskId, null);
   if (rec.agent) {
@@ -163,6 +175,8 @@ const closeChatSession = (
       /* noop */
     }
   }
+  if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+  return true;
 };
 
 // V0.11.1：chat 会话空闲回收（同 task-runner sweeper、TTL 2h、resume 兜恢复）
@@ -177,7 +191,7 @@ const CHAT_SWEEPER_KEY = "__feAiFlowChatSweeperV1__";
         if (rec.runActive) continue;
         if (now - rec.lastActiveAt > CHAT_IDLE_TTL_MS) {
           console.log(`[chat-runner] 会话空闲回收 task=${taskId}（可 resume 接回）`);
-          closeChatSession(taskId, { keepPersisted: true });
+          closeChatSession(taskId, rec.agentId, { keepPersisted: true });
         }
       }
     }, 10 * 60 * 1000);
@@ -239,7 +253,7 @@ export const waitForChatToStop = async (
 /**
  * 强清 chat 会话运行时状态。
  * 仅 waitForChatToStop 超时兜底用：旧 Run cancel 卡住没按期退、强清好让新会话起得来。
- * 旧 Run 迟到的收尾再 delete 无害（delete 不存在的 key 不报错）。
+ * 无条件关（用户侧切模型重启意图）；旧 Run 迟到的收尾须带 agentId 门控、不会再误关新会话。
  */
 export const forceClearChatRun = (taskId: string): void => {
   closeChatSession(taskId);
@@ -603,8 +617,11 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
   let cancelled = false;
 
   // cancel 收尾：关会话 + 归位 idle + publish done（不落 info——主动停时 /stop route 已落「用户停止了对话」、避免重复）
+  // 带本 run 的 agentId（占位期为空串）：forceClear 后新会话已就位则门控拒绝且表非空 → 整段跳过
   const finishCancelled = async (): Promise<void> => {
-    closeChatSession(task.id);
+    const myAgentId = agent?.agentId ?? "";
+    const closed = closeChatSession(task.id, myAgentId);
+    if (!closed && runningChats.has(task.id)) return;
     const t = await setTaskRunStatus(task.id, "idle");
     if (t) publish(task.id, { kind: "task", task: t });
     publish(task.id, { kind: "done", task: t ?? task, ok: true });
@@ -799,7 +816,8 @@ export const runChatSession = async (input: RunChatInput): Promise<void> => {
     await consumeChatRun(task, run, () => cancelled);
   } catch (err) {
     // Agent.create / send 阶段失败（consumeChatRun 内部错误它自己处理、不会抛）
-    await handleChatRunFailure(task, err);
+    // 占位期 agentId 可能仍为空串——与 finishCancelled 同口径门控
+    await handleChatRunFailure(task, err, agent?.agentId ?? "");
   }
 };
 
@@ -967,7 +985,8 @@ const tryChatAutoReconnect = async (
     return false;
   }
   // 内存会话关掉、**锚点必须保留**（resumeChatSession 靠 sessionAgentId 接回）
-  closeChatSession(task.id, { keepPersisted: true });
+  const curRec = runningChats.get(task.id);
+  closeChatSession(task.id, curRec?.agentId, { keepPersisted: true });
   const creds = await readServerChatCreds();
   if (!creds) return false;
   const resumed = await resumeChatSession(fresh, creds).catch(() => false);
@@ -1006,12 +1025,19 @@ const tryChatAutoReconnect = async (
 // ----------------- V0.11：chat run 消费管道（首个 run + 后续 send 共用） -----------------
 
 // run 失败的统一收尾：关会话 + 标 error + 事件 + publish
-const handleChatRunFailure = async (task: Task, err: unknown): Promise<void> => {
+// expectedAgentId：旧 run 收尾带上门控；已被新会话顶替则整段 no-op（防误标 error / 误关）
+const handleChatRunFailure = async (
+  task: Task,
+  err: unknown,
+  expectedAgentId?: string,
+): Promise<void> => {
   const message = err instanceof Error ? err.message : String(err);
   console.error("[chat-runner] task", task.id, "failed:", err);
   // run 失败可能是「缓存 ok 期间 MCP 挂了」——清探测缓存、用户重试时必真探（同 task-runner）
   invalidateMcpProbeCache();
-  closeChatSession(task.id);
+  const closed = closeChatSession(task.id, expectedAgentId);
+  // 门控拒绝且新会话已就位 → 跳过；表已空（forceClear 后）→ 仍落 error（旧行为）
+  if (!closed && runningChats.has(task.id)) return;
   // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
   // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
   const failure = summarizeRunFailure(message, err);
@@ -1098,8 +1124,10 @@ const consumeChatRun = async (
 
     if (cancelled || externallyCancelled?.() || result.status === "cancelled") {
       // cancel 收尾：关会话 + 归位 idle + publish done、不落 info——
-      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复
-      closeChatSession(task.id);
+      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复。
+      // 带本 run agentId：切模型 forceClear 后新会话已注册则门控拒绝且表非空 → 跳过
+      const closed = closeChatSession(task.id, rec?.agentId ?? "");
+      if (!closed && runningChats.has(task.id)) return;
       const cancelledTask = await setTaskRunStatus(task.id, "idle");
       if (cancelledTask) publish(task.id, { kind: "task", task: cancelledTask });
       publish(task.id, { kind: "done", task: cancelledTask ?? task, ok: true });
@@ -1140,7 +1168,7 @@ const consumeChatRun = async (
         () => cancelled || !!externallyCancelled?.(),
       ));
     if (!handled) {
-      await handleChatRunFailure(task, err);
+      await handleChatRunFailure(task, err, rec?.agentId ?? "");
     }
   }
 };
@@ -1161,6 +1189,10 @@ export const sendChatMessage = async (
 ): Promise<boolean> => {
   const rec = runningChats.get(task.id);
   if (!rec || !rec.agent || rec.runActive) return false;
+
+  // 审查发现：校验通过到 await send 完成之间有 TOCTOU，并发双发（连点/双标签）都能通过检查 →
+  // 立刻占位；send 抛错时清回 false（consumeChatRun 入口置 true 保持幂等）
+  rec.runActive = true;
 
   // 组消息：正文 + 附件段（图走 read 转 vision、路径自己 read/grep）
   const lines: string[] = [text];
@@ -1194,8 +1226,9 @@ export const sendChatMessage = async (
     });
     perfTracker.attachRun(run);
   } catch (err) {
+    rec.runActive = false;
     console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
-    closeChatSession(task.id);
+    closeChatSession(task.id, rec.agentId);
     return false;
   }
   rec.lastActiveAt = Date.now();

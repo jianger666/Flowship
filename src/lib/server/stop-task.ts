@@ -23,10 +23,11 @@ import {
   cancelTaskRun,
   supersedePendingAsks,
 } from "./task-runner";
-import { publishTaskStreamEvent } from "./task-stream";
+import { pendingStopRequests, publishTaskStreamEvent } from "./task-stream";
 import { cancelChatRun } from "./chat-runner";
 import { reapTaskOrphans } from "./kill-orphans";
 import { cleanupChatTaskState } from "./chat-pending";
+import { getTaskWorkRepoPaths } from "./task-worktrees";
 
 /**
  * 停止 task 的活 agent 并把状态归位到 idle（没有活 agent 也幂等）。
@@ -43,13 +44,17 @@ export const stopTaskAgent = async (
   // chat task 的 run 在 chat-runner 的 runningChats、正经 task 在 task-runner 的 runningTasks、
   // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
   const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
+  // 审查发现：idle/awaiting 点停止时 cancelTaskRun 会写入 pendingStopRequests（启动窗口自裁），
+  // 若此处不清、标记粘住 → 下次 oneshot 答疑被误当「启动期间停止」杀掉。对齐 DELETE 路由。
+  pendingStopRequests.delete(id);
   cleanupChatTaskState(id);
   // V0.8.18：取消正在后台跑的后置 check（杀 lint/typecheck 子进程、丢弃结果、不让它在停止后冒「产出完成」）
   abortRunningCheck(id);
 
   // V0.6.8：run.cancel() 杀不到 agent 用 shell 拉起的孙子进程（如 `npm run lint`=`ng lint --fix`、
-  // 会 orphan 后继续改写整个仓库）。这里主动清理落在本 task repoPaths 里的孤儿 / agent-shell 进程树。
-  reapTaskOrphans(task.repoPaths);
+  // 会 orphan 后继续改写整个仓库）。传实际工作目录（隔离 worktree 任务 cwd 在 worktrees/ 下、
+  // 不是原仓 repoPaths——审查发现 stop 漏杀孤儿）。
+  reapTaskOrphans(getTaskWorkRepoPaths(task));
 
   // 2) 所有卡在非终态（running / awaiting_ack）的 action → 标 cancelled（endedAt 自动落）
   //    不只看 currentActionId——它可能已被清成 null（agent error / abandon 后）、导致漏收尾

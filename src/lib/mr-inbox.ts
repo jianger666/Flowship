@@ -221,7 +221,8 @@ export const pruneSeenMap = (
   let changed = false;
   const out: Record<string, number> = {};
   for (const [url, at] of Object.entries(seen)) {
-    if (typeof at !== "number" || !Number.isFinite(at)) {
+    // 未来时间戳（时钟回拨 / 脏数据）用 `now - at > maxAge` 恒 false、会永不清——一并丢弃
+    if (typeof at !== "number" || !Number.isFinite(at) || at > nowMs) {
       changed = true;
       continue;
     }

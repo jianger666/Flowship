@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { EmptyHint } from "@/components/ui/empty-hint";
+import { LoadingState } from "@/components/ui/loading-state";
 import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useMcpHealth } from "@/hooks/use-mcp-health";
 import { cn } from "@/lib/utils";
@@ -86,7 +87,9 @@ export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
             </DialogDescription>
           </DialogHeader>
 
-          {availableServers.length === 0 ? (
+          {mcpLoading ? (
+            <LoadingState variant="inline" />
+          ) : availableServers.length === 0 ? (
             <EmptyHint>
               Cursor 里没配 MCP server（~/.cursor/mcp.json）
             </EmptyHint>

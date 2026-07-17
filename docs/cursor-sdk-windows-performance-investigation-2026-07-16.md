@@ -15,6 +15,7 @@
 4. **thinking 慢还有 Flowship 自身的放大因素：每轮 prompt 很大。**本机 20 条近期启动日志中，首包 prompt 为 68–109KB，中位数 91KB；每个 action 默认 fresh agent，首轮必须重新注入完整规则、skills、playbook 和上下文。后续每次工具输出又继续扩充模型上下文，因此影响的不只是启动，也包括每个“工具完成 → 下一次 thinking”的模型往返。
 5. **当前日志不足以给 Windows 慢点定责。**现有实现没有记录普通工具成功完成的时间、工具墙钟耗时、shell 自报 `executionTime`、thinking delta、每个 model step 的耗时，也没有保存 SDK `requestId`。当前 `first-event` 计时位置还会系统性得到接近 0ms 的误导结果。
 6. **Windows Defender / 企业 EDR 很可能进一步放大开销，但目前只是高概率假设。**SDK 每条 PowerShell 命令会读写临时脚本和状态文件，SDK 自身还会写 SQLite/WAL；Flowship 又逐事件 append `events.jsonl`。企业 Windows 上的同步文件扫描可能使这些高频小 IO 明显变慢。
+7. **同事截图中的 Clash Verge 故障是本机 Service IPC 失败，不是已经进入 Wintun 驱动安装后失败。**它不能解释本地 `read/shell` 工具为什么慢，但说明这台机器的 TUN 没有生效；如果 Flowship/SDK 与 Cursor IDE 实际走了不同代理路径，可能额外放大 thinking、模型请求或远程 MCP 延迟，需作为独立变量做 A/B。
 
 因此，建议先补齐“模型等待 / 本地工具 / MCP / 事件持久化”四段耗时，再做 PowerShell、Git Bash、Profile、Defender/Dev Drive 的 A/B；不要先凭体感只改 prompt 或只切模型。
 
@@ -448,6 +449,20 @@ if ($env:CURSOR_AGENT -eq "1") { return }
 
 `LocalAgentOptions.enableAgentRetries` 对 headless embedder 默认开启。若出现长时间无事件但最终恢复，需要记录是否发生 SDK 内部重试，避免把重试等待误判为一次正常工具执行。
 
+### 7.7 网络代理路径 A/B
+
+同事的 Clash Verge 截图证明该机 TUN Service 当前不可用。Flowship 仓库没有显式处理 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 或 Windows 系统代理；不能仅凭“Cursor IDE 能用”就假定 SDK 子进程走了完全相同的网络路径。
+
+建议在同一台复现机记录并对齐：
+
+- Cursor IDE 的代理/HTTP2设置；
+- Clash Verge 是系统代理还是 TUN，TUN 是否真的处于开启状态；
+- 启动 Flowship 的进程环境里是否存在代理环境变量，只记录“有/无”，不要把带账号或 token 的代理 URL 写进诊断包；
+- 公司 VPN、PAC、透明代理和 TLS 检查是否开启；
+- 纯 thinking、纯 read、纯 shell、远程 MCP 四组任务在“系统代理 / 可用 TUN / 无代理直连”下的中位数和 P90。
+
+判断方式：如果网络路径只影响 thinking 和远程 MCP，而本地 read/shell 基本不变，说明它是模型/网络侧的附加因素，不是 Windows shell executor 的根因。
+
 ## 8. 修复方向与优先级建议
 
 ### P0：先补可观测性
@@ -554,3 +569,115 @@ if ($env:CURSOR_AGENT -eq "1") { return }
 - 没有拿到 Windows 同事的目标机 perf 数据，因此尚不能量化 PowerShell、Profile、Defender、模型上下文各占多少。
 - 没有通过 patch 修改 `node_modules`；SDK 内部实现只用于定位，不应直接改 vendor bundle。
 
+## 12. 附录：Clash Verge Rev 在 Windows 安装虚拟网卡服务失败
+
+### 12.1 截图判断
+
+截图中的核心错误是：
+
+```text
+Install Service failed: Failed to connect to IPC server:
+Operation 'GET /magic' failed after retries:
+Protocol error: Failed to parse HTTP response: Status timeout
+```
+
+这一步不是在访问订阅网站。Clash Verge 的正常 Windows 日志会先连接本机命名管道 `\\.\pipe\clash-verge-service`，向服务发送 `GET /magic`，健康时收到 `200 OK`。截图表示 GUI 无法从本机 Clash Verge Service 获得有效健康响应；因此失败点在 **Service 启动/状态/IPC**，比真正创建 TUN/Wintun 网卡更早。
+
+支持证据：
+
+- [正常日志：连接 Windows named pipe 后 `GET /magic` 返回 200](https://github.com/clash-verge-rev/clash-verge-rev/issues/6390)
+- [Windows v2.5.1 同类 `IPC path not ready` 问题](https://github.com/clash-verge-rev/clash-verge-rev/issues/7074)
+- [与截图同日附近的 Windows 11 Service Control Manager 7023 问题](https://github.com/clash-verge-rev/clash-verge-rev/issues/7489)
+
+### 12.2 最可能原因
+
+按当前证据排序：
+
+1. **`C:\ProgramData\clash-verge-service\desired-state.json` 损坏或为空。**2026-07-15 的 #7489 使用 2.5.2 AutoBuild，回退 2.5.1 仍失败；手工运行 service 后日志明确报 `failed to parse desired state ... expected value at line 1 column 1`，删除该文件后服务恢复。#7074 也有用户给出相同修复。
+2. **旧 Service/内核进程或 owner 状态残留。**#7489 日志同时出现旧 owner lock；#7074 也有人提到后台旧内核占用 service。升级/降级但没有先卸载旧服务时更容易出现版本与状态不一致。
+3. **企业安全软件、服务权限或安装包被拦截。**这仍需看 Service Control Manager 和安全软件记录；但对该类报错，单纯“以管理员运行安装器”已有用户验证无效，所以不应把提权当成唯一修复。
+4. **Wintun 驱动本身。**当前证据优先级低，因为 `/magic` 健康检查尚未通过，程序还没走到可稳定驱动 TUN 的阶段。
+
+关键评论：
+
+- [#7489：解析 `desired-state.json` 失败，删除后恢复](https://github.com/clash-verge-rev/clash-verge-rev/issues/7489#issuecomment-4979556166)
+- [#7074：删除 `desired-state.json` 后重新安装 Service](https://github.com/clash-verge-rev/clash-verge-rev/issues/7074#issuecomment-4849022147)
+- [#7074：2.5.1 回退 2.4.7 后可安装](https://github.com/clash-verge-rev/clash-verge-rev/issues/7074#issuecomment-4510000817)
+
+### 12.3 推荐修复顺序
+
+先保留订阅与用户配置，只重置 Service 的运行状态：
+
+1. 在托盘中彻底退出 Clash Verge，不只是关闭窗口。
+2. 打开“管理员 PowerShell”，先查看服务和残留进程：
+
+```powershell
+Get-Service | Where-Object {
+  $_.DisplayName -eq 'Clash Verge Service' -or
+  $_.Name -in @('clash-verge-service', 'clash_verge_service')
+} | Format-Table Name, DisplayName, Status, StartType
+
+Get-Process | Where-Object {
+  $_.ProcessName -match 'clash|verge|mihomo'
+} | Select-Object ProcessName, Id, Path
+```
+
+3. 停止 Clash Verge Service，备份并删除损坏的 service state：
+
+```powershell
+$service = Get-Service | Where-Object {
+  $_.DisplayName -eq 'Clash Verge Service' -or
+  $_.Name -in @('clash-verge-service', 'clash_verge_service')
+}
+$service | Stop-Service -Force -ErrorAction SilentlyContinue
+
+$state = 'C:\ProgramData\clash-verge-service\desired-state.json'
+if (Test-Path $state) {
+  $backup = "$state.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+  Copy-Item $state $backup
+  Remove-Item $state -Force
+  Write-Host "Backed up to $backup"
+}
+```
+
+4. 重启 Windows，正常启动 Clash Verge，在设置中重新安装“虚拟网卡服务”，接受 UAC。
+5. 如果仍失败，从 Clash Verge 安装目录的 `resources` 文件夹依次以管理员运行 `clash-verge-service-uninstall.exe` 和 `clash-verge-service-install.exe`，中间确认没有残留的 Clash Verge/mihomo 进程。安装路径可能在 `Program Files` 或 `%LOCALAPPDATA%\Programs`，不要照抄一个固定路径。
+6. 仍失败再试[官方最新 AutoBuild](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/autobuild)。AutoBuild 是预发布版；而且 2026-07-15 的构建仍有人因损坏状态文件失败，所以升级不能替代第 3 步。临时回退 [v2.4.7](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/v2.4.7) 有成功案例，但回退前应先卸载当前 Service，避免跨版本残留。
+
+不建议先做：
+
+- `netsh winsock reset` / `netsh int ip reset`：同类问题已有用户验证无效；
+- 从非官方来源单独下载 Wintun 驱动；
+- 关闭 Defender/EDR；如确实被企业安全软件拦截，应让 IT 对官方签名安装包和 service 做定点放行；
+- 删除 `%APPDATA%\io.github.clash-verge-rev.clash-verge-rev` 整个用户目录，这会扩大数据损失面。
+
+### 12.4 若仍失败，需要回收的证据
+
+请同事提供以下脱敏信息，便于区分“状态损坏 / 服务崩溃 / 安全软件拦截”：
+
+- Clash Verge 精确版本与下载渠道；
+- Windows 版本和 build；
+- Clash Verge 日志页中从 `install service` 开始到报错结束的 `[Service]` 日志；
+- Windows 事件查看器 → Windows 日志 → 系统 → `Service Control Manager` 的相关事件，尤其是 7023；
+- 上述 `Get-Service`、`Get-Process` 的输出；
+- `desired-state.json` 是否为 0 字节、截断或无法解析；不要直接贴可能含敏感路径/配置的完整文件；
+- Windows 安全中心“保护历史记录”或企业 EDR 是否隔离了 `clash-verge-service*.exe`、`mihomo` 或 `wintun` 相关文件。
+
+可用管理员 PowerShell 快速筛选系统事件：
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+  LogName = 'System'
+  ProviderName = 'Service Control Manager'
+} -MaxEvents 100 |
+  Where-Object { $_.Message -match 'Clash Verge' } |
+  Select-Object TimeCreated, Id, LevelDisplayName, Message
+```
+
+### 12.5 与 Cursor SDK 性能问题的关系
+
+这张图本身只能证明 Clash Verge TUN Service 不健康：
+
+- 它**不能**解释为什么本地 read/shell 工具执行慢；这仍优先排查 SDK Windows executor、PowerShell Profile、EDR 和事件持久化。
+- 它**可能**解释该同事的 thinking 或远程 MCP 比 IDE 更慢：TUN 未生效后，Cursor IDE、Flowship/SDK 子进程和 MCP server 未必走同一代理路径。
+- 所以修好 Clash 后应按 7.7 再跑一次同模型、同 prompt 的 A/B；如果只有网络类步骤改善，说明是叠加因素，不应覆盖主结论。

@@ -9,7 +9,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  PS_SHELL_BOOST_GUARD,
   PS_SHELL_BOOST_MARKER,
+  SHELL_BOOST_GUARD,
   SHELL_BOOST_MARKER,
   buildShellBoostBlock,
   detectAgentShellKind,
@@ -27,11 +29,17 @@ describe("hasShellBoost / injectShellBoostContent (posix)", () => {
     expect(hasShellBoost("export PATH=/usr/local/bin:$PATH\n")).toBe(false);
   });
 
-  it("含 COMPOSER_NO_INTERACTION → 已含守卫", () => {
+  it("含守卫本体 → 已含守卫", () => {
     expect(hasShellBoost(buildShellBoostBlock())).toBe(true);
+    expect(hasShellBoost(`${SHELL_BOOST_GUARD}\n`)).toBe(true);
+  });
+
+  it("rc 里仅提及 env 名不算已注入（注释 / export=0）", () => {
+    // 旧判定用 COMPOSER_NO_INTERACTION 子串，会误判「已优化」并跳过注入
     expect(
-      hasShellBoost('[[ "$COMPOSER_NO_INTERACTION" == "1" ]] && return\n'),
-    ).toBe(true);
+      hasShellBoost("# see COMPOSER_NO_INTERACTION in Cursor docs\n"),
+    ).toBe(false);
+    expect(hasShellBoost("export COMPOSER_NO_INTERACTION=0\n")).toBe(false);
   });
 
   it("顶插：守卫块在最前，且幂等", () => {
@@ -46,16 +54,23 @@ describe("hasShellBoost / injectShellBoostContent (posix)", () => {
 });
 
 describe("hasShellBoost / injectShellBoostContent (powershell)", () => {
-  it("普通 Profile → 未含守卫；含 CURSOR_AGENT → 已含", () => {
+  it("普通 Profile → 未含守卫；含守卫本体 → 已含", () => {
     expect(hasShellBoost("Import-Module posh-git\n", "powershell")).toBe(
       false,
     );
     expect(hasShellBoost(buildShellBoostBlock("powershell"), "powershell")).toBe(
       true,
     );
+    expect(hasShellBoost(`${PS_SHELL_BOOST_GUARD}\n`, "powershell")).toBe(true);
+  });
+
+  it("Profile 里仅提及 CURSOR_AGENT 不算已注入", () => {
     expect(
-      hasShellBoost('if ($env:CURSOR_AGENT -eq "1") { return }\n', "powershell"),
-    ).toBe(true);
+      hasShellBoost('Write-Host "CURSOR_AGENT=$env:CURSOR_AGENT"\n', "powershell"),
+    ).toBe(false);
+    expect(
+      hasShellBoost('if ($env:CURSOR_AGENT -eq "0") { return }\n', "powershell"),
+    ).toBe(false);
   });
 
   it("方言互不误判：posix 特征不算 powershell 已优化", () => {

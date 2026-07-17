@@ -12,9 +12,7 @@ import { errorResponse } from "@/lib/server/route-helpers";
 import { invalidateMrInboxCache } from "@/lib/server/mr-inbox-scanner";
 import {
   maskSettingsSecrets,
-  preserveSecretsOnPut,
-  readSettingsFile,
-  writeSettingsFileAtomic,
+  putSettingsFile,
 } from "@/lib/server/settings-fs";
 import { DEFAULT_MEEGLE_PROJECT } from "@/lib/types";
 
@@ -25,18 +23,10 @@ export const runtime = "nodejs";
  * 原子写（tmp + rename）防写一半损坏（沿用 task-fs 的 meta 落盘方式）。
  *
  * CR-01：响应里的 settings 也脱敏。
- * CR-08：写操作串行化（进程级 promise chain）——两个快速 PUT 不会乱序互相覆盖、
- * 后到的请求一定后落盘。
+ * CR-08：读改写串行化在 settings-fs.putSettingsFile（globalThis 写链）——
+ * 两个快速 PUT 不会乱序互相覆盖。
  * P1-04：读失败（error）拒绝写入，避免用客户端缓存覆盖损坏但可能可修复的原文件。
  */
-
-// 写队列单例（dev 多 chunk 共享 globalThis、对齐 preview-manager 的做法）
-const WRITE_QUEUE_KEY = "__feAiFlowSettingsWriteQueueV1__";
-const getWriteQueue = (): { current: Promise<void> } => {
-  const g = globalThis as unknown as Record<string, { current: Promise<void> } | undefined>;
-  if (!g[WRITE_QUEUE_KEY]) g[WRITE_QUEUE_KEY] = { current: Promise.resolve() };
-  return g[WRITE_QUEUE_KEY]!;
-};
 
 /** 从 settings 对象抠 meegleProject.key（缺 / 坏 → 默认悟空 key） */
 const meegleProjectKeyOf = (raw: unknown): string => {
@@ -57,34 +47,23 @@ export const PUT = async (req: Request): Promise<Response> => {
   if (!body || typeof body !== "object") {
     return errorResponse("配置必须是对象", 400);
   }
-  // 串行执行写入：挂到队列尾、前一个写完才轮到自己（失败也不断链）
-  const queue = getWriteQueue();
-  const run = queue.current.then(async (): Promise<Response> => {
-    const currentResult = await readSettingsFile();
-    // 文件损坏 / 权限失败：拒绝覆盖（missing 才允许首次写入）
-    if (currentResult.status === "error") {
+  try {
+    // RMW 整段在 settings-fs 写链内（审查：锁只包 write 锁不住 route 侧合并）
+    const result = await putSettingsFile(body as Record<string, unknown>);
+    if (result.status === "unreadable") {
       console.error(
         "[/api/settings] PUT 拒绝：config.json 不可读:",
-        currentResult.reason,
+        result.reason,
       );
       return errorResponse("settings_unreadable", 500);
     }
-    const current =
-      currentResult.status === "ok" ? currentResult.settings : null;
-    // 掩码值兜底（不是「防清空」守卫——用户拍板「自己清 key 是合法操作、别拦」）：
-    // 只拦「client 误把脱敏展示值当真值回写」这一种明确的坏数据；清空放行
-    const { settings: guarded } = preserveSecretsOnPut(
-      body as Record<string, unknown>,
-      current,
-    );
+    const { settings: guarded, previous } = result;
     // 默认空间 key 变了 → 收件箱缓存作废（否则仍显示旧空间扫到的条目）
-    const oldKey = meegleProjectKeyOf(current?.meegleProject);
+    const oldKey = meegleProjectKeyOf(previous?.meegleProject);
     const newKey = meegleProjectKeyOf(guarded.meegleProject);
     if (oldKey !== newKey) {
       invalidateMrInboxCache();
     }
-    // P0-02：0600 + 目录 0700 + tmp/rename（writeSettingsFileAtomic）
-    await writeSettingsFileAtomic(guarded);
     // Windows Agent shell 偏好：落盘后立刻改 process.env.SHELL，用户拨开关不用重启
     try {
       const { applyAgentShellPreference } = await import(
@@ -101,14 +80,6 @@ export const PUT = async (req: Request): Promise<Response> => {
       ok: true,
       settings: maskSettingsSecrets(guarded),
     });
-  });
-  // 队列指针只关心「上一个写是否结束」、错误在本请求消费、不传染下一个
-  queue.current = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  try {
-    return await run;
   } catch (err) {
     console.error("[/api/settings] 写 config.json 失败:", err);
     const message = err instanceof Error ? err.message : String(err);

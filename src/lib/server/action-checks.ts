@@ -206,15 +206,17 @@ const checkReview = async (
     };
   }
 
-  // 必备段检查（V0.6.9 重校准）
+  // 必备段检查（V0.6.9 重校准；审查加固：标题锚定）
   // 旧版用松散 grep 找「偏差/需求/未实现/额外」4 个词、容忍缺 1——但 review 骨架明确「无内容的差异段
   // 整段省略（不写空标题、不写「无」）」、一份干净 review（无范围偏离 / 无未完成 task / 无超范围）天然
   // 不含这些词、却被误判 ❌（V0.6.9 实测踩到、误判红条会直接打击用户对 review 的信任）。
   // 改为只验骨架里「无省略豁免」的两段：总评 + 跟飞书需求对照（review 的基本盘、任何 review 都该有）。
   // 条件段（范围偏离 / 实现偏差 / 未完成 task）无内容时按骨架省略、不参与本检查。
+  // 「跟飞书需求对照」必须标题锚定：骨架总评里已有「跟飞书 story 原始需求一致性」bullet，
+  // 裸词 /story|飞书需求/ 会被总评架空、整段「## 跟飞书需求对照」省略仍全绿（审查确认弱点）。
   const requiredSections: { name: string; re: RegExp }[] = [
     { name: "总评", re: /总评/ },
-    { name: "跟飞书需求对照", re: /需求对照|飞书需求|需求项|story/i },
+    { name: "跟飞书需求对照", re: /^#{2,3}\s*跟飞书需求对照/m },
   ];
   const missing = requiredSections.filter((s) => !s.re.test(content));
   if (missing.length > 0) {
@@ -227,8 +229,12 @@ const checkReview = async (
   }
 
   // V0.6.9：阶段二「bug 复审」段必须存在——防 fresh agent 跳过 peer bug 复审、退回「只做差值」的鸡肋老路。
-  // 锚点是 artifact 里的「## bug 复审」标题（骨架里恒带、找不到 bug 也写「未发现高置信 bug」）。
-  if (!/bug\s*复审/i.test(content) && !/未发现.{0,12}bug/i.test(content)) {
+  // 标题锚定（骨架 `## bug 复审`）；总评 bullet「bug 复审结论」不再算过。
+  // 兜底句「未发现…bug」保留：没找到 bug 时骨架允许写「未发现高置信 bug」。
+  if (
+    !/^#{2,3}\s*bug\s*复审/im.test(content) &&
+    !/未发现.{0,12}bug/i.test(content)
+  ) {
     return {
       passed: false,
       details:
@@ -421,7 +427,7 @@ const checkShip = async (
 //
 // 联调两种推送方式（action.devPushMode）：
 //   - direct（直推）：本地 merge dev + 推 origin/dev、无 MR。推送 / 流水线结果 ai-flow 不追、
-//     信任 agent 在 artifact 自述——这里不做 MR 维度门禁、只校验有产出（artifactPath）。
+//     信任 agent 在 artifact 自述——无 MR 时仍读一次 artifact，确认真写了内容（非空预填路径不算过）。
 //   - mr（提 PR）：建 feature→dev 的 MR、复用 ship 同款门禁（URL 非空 + 冲突拦），文案换成联调 / dev。
 // 不做 ship 那套「每仓缺 MR 必须写跳过说明」的强校验——联调更轻、不强制覆盖所有仓、避免误拦。
 const checkDev = async (
@@ -433,8 +439,25 @@ const checkDev = async (
   }
   const mrRecords = action.sideEffects?.mrs ?? [];
 
-  // 无 MR：直推模式（或提 PR 模式跳过了所有仓）——无 MR 维度可验、信任 artifact 自述、放行。
+  // 无 MR：直推 / 提 PR 全跳过——读 artifact 确认非空（创建时预填的 artifactPath 形同虚设）。
+  // 长度门槛 50：对齐 checkPlan「过短不像完整产出」思路、比 plan 的 100 更轻（联调 artifact 可较短）。
   if (mrRecords.length === 0) {
+    const absPath = getActionArtifactPath(task.id, action.n, action.type);
+    let content: string;
+    try {
+      content = await readArtifactWithRetry(absPath);
+    } catch {
+      return {
+        passed: false,
+        details: "联调没写 artifact / 内容为空",
+      };
+    }
+    if (content.trim().length < 50) {
+      return {
+        passed: false,
+        details: "联调没写 artifact / 内容为空",
+      };
+    }
     return {
       passed: true,
       details:
@@ -624,17 +647,18 @@ const checkBuild = async (
   const sections: string[] = [];
   let artifactLintPassed = true;
 
-  // V0.6.27 artifact 小节 lint：「全量校验」是 build 骨架铁段。
+  // V0.6.27 artifact 小节 lint：「全量校验」是 build 骨架铁段（独立 `## 全量校验` 标题）。
   // 「修改记录」检查已删（2026-07-13 用户拍板）：骨架本来就允许初稿省略该段、
   // 检查却当铁段必查 → 一次过的正常 build 全被误判「缺必备段」、v1.1.8 红条
   // 实装后线上冤枉同事初稿——该段有没有交给人审、不值得机器闸。
+  // 标题锚定：总览 bullet「- 全量校验：lint=…」不再算过（审查确认弱点）。
   if (action.artifactPath) {
     try {
       const artifactContent = await readArtifactWithRetry(
         getActionArtifactPath(task.id, action.n, action.type),
       );
       const requiredSections: { name: string; re: RegExp }[] = [
-        { name: "全量校验", re: /全量校验/ },
+        { name: "全量校验", re: /^#{2,3}\s*全量校验/m },
       ];
       const missing = requiredSections.filter(
         (s) => !s.re.test(artifactContent),

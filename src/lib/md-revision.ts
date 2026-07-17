@@ -70,6 +70,8 @@ interface MdNode {
   value?: string;
   lang?: string | null;
   depth?: number;
+  /** list 有序 / 无序——指纹必须区分，否则同文字 ul/ol 静默判 equal */
+  ordered?: boolean | null;
   url?: string;
   alt?: string;
   children?: MdNode[];
@@ -131,6 +133,40 @@ const isInlineableBlock = (node: MdNode): boolean => {
 const normalizePlain = (s: string): string =>
   s.replace(/\s+/g, " ").trim();
 
+/**
+ * 收集子树里 link/image 的 url（浅字段、O(节点数)）。
+ * 审查发现：旧指纹只看 type+plain，`[x](a.com)` vs `[x](b.com)` 会静默判 equal。
+ */
+const collectLinkImageUrls = (node: MdNode, acc: string[] = []): string[] => {
+  if (
+    (node.type === "link" || node.type === "image") &&
+    typeof node.url === "string"
+  ) {
+    acc.push(node.url);
+  }
+  for (const c of node.children ?? []) collectLinkImageUrls(c, acc);
+  return acc;
+};
+
+/**
+ * 块指纹：type + plain + 少量结构浅字段（heading.depth / list.ordered / link·image url）。
+ * 只加这几项，避免把整棵 AST 序列化拖慢对齐 DP。
+ */
+const blockFingerprint = (node: MdNode, plain: string): string => {
+  let fp = `${node.type}\0${plain}`;
+  if (node.type === "heading" && typeof node.depth === "number") {
+    fp += `\0d${node.depth}`;
+  }
+  if (node.type === "list") {
+    fp += `\0o${node.ordered === true ? 1 : 0}`;
+  }
+  const urls = collectLinkImageUrls(node);
+  if (urls.length > 0) {
+    fp += `\0u${urls.join("\x01")}`;
+  }
+  return fp;
+};
+
 const parseBlocks = (md: string): ParsedBlock[] => {
   const tree = unified().use(remarkParse).parse(md) as unknown as MdNode;
   const children = tree.children ?? [];
@@ -139,7 +175,7 @@ const parseBlocks = (md: string): ParsedBlock[] => {
     const end = node.position?.end?.offset ?? start;
     const source = md.slice(start, end);
     const plain = normalizePlain(toString(node as never));
-    const fingerprint = `${node.type}\0${plain}`;
+    const fingerprint = blockFingerprint(node, plain);
     return {
       type: node.type,
       source,
@@ -421,16 +457,31 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
   let statsIns = 0;
   let statsDel = 0;
   let outIndex = 0;
+  /** 上一块是否 list——相邻 list 用 \n\n 拼接会被 CommonMark 合成 1 块 */
+  let lastWasList = false;
 
-  const pushPart = (md: string) => {
-    if (mergedParts.length > 0) mergedParts.push("\n\n");
+  /**
+   * 推入一块合并源。相邻 list 之间插 HTML 注释分隔（remark 解析为 html 顶层块、
+   * Streamdown 不显示注释），保证 blockMarks.index 与渲染顶层块序一致。
+   */
+  const pushPart = (md: string, blockType: string) => {
+    const isList = blockType === "list";
+    if (mergedParts.length > 0) {
+      if (lastWasList && isList) {
+        mergedParts.push("\n\n<!--fe-ai-flow-rev-split-->\n\n");
+        outIndex += 1;
+      } else {
+        mergedParts.push("\n\n");
+      }
+    }
     mergedParts.push(md);
     outIndex += 1;
+    lastWasList = isList;
   };
 
   /** 整块替换：旧块 removed + 新块 added（index 各占一格） */
   const pushReplace = (ob: ParsedBlock, nb: ParsedBlock) => {
-    pushPart(ob.source);
+    pushPart(ob.source, ob.type);
     blockMarks.push({
       index: outIndex - 1,
       status: "removed",
@@ -439,7 +490,7 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
     const delWords = tokenize(ob.plain).filter((t) => t.trim().length > 0);
     statsDel += Math.max(delWords.length, 1);
 
-    pushPart(nb.source);
+    pushPart(nb.source, nb.type);
     blockMarks.push({ index: outIndex - 1, status: "added" });
     const insWords = tokenize(nb.plain).filter((t) => t.trim().length > 0);
     statsIns += Math.max(insWords.length, 1);
@@ -447,12 +498,13 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
 
   for (const op of ops) {
     if (op.kind === "equal") {
-      pushPart(newBlocks[op.ni]!.source);
+      const b = newBlocks[op.ni]!;
+      pushPart(b.source, b.type);
       continue;
     }
     if (op.kind === "added") {
       const b = newBlocks[op.ni]!;
-      pushPart(b.source);
+      pushPart(b.source, b.type);
       blockMarks.push({ index: outIndex - 1, status: "added" });
       // 整块新增：按词计一次「大块」增量，避免 stats 全 0
       const words = tokenize(b.plain).filter((t) => t.trim().length > 0);
@@ -461,7 +513,7 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
     }
     if (op.kind === "removed") {
       const b = oldBlocks[op.oi]!;
-      pushPart(b.source);
+      pushPart(b.source, b.type);
       blockMarks.push({
         index: outIndex - 1,
         status: "removed",
@@ -476,7 +528,7 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
     const nb = newBlocks[op.ni]!;
     if (degraded || !ob.inlineable || !nb.inlineable) {
       // 降级 / 复杂块：出新版原文 + 整块 modified 标记（不做词级哨兵）
-      pushPart(nb.source);
+      pushPart(nb.source, nb.type);
       blockMarks.push({
         index: outIndex - 1,
         status: "modified",
@@ -499,7 +551,155 @@ export const buildRevisionView = (oldMd: string, newMd: string): RevisionView =>
       pushReplace(ob, nb);
       continue;
     }
+    pushPart(merged.md, nb.type);
+    // 词级内联成功也要打 modified——否则 UI 角标 / 左边条漏标真修订
+    blockMarks.push({
+      index: outIndex - 1,
+      status: "modified",
+      oldSource: ob.source,
+    });
+    statsIns += merged.ins;
+    statsDel += merged.del;
+  }
+
+  const mergedMd = mergedParts.join("");
+  // 硬校验：解析顶层块数须与 outIndex 一致（注释分隔后应恒成立；失败则降级 list remove+add）
+  if (parseBlocks(mergedMd).length !== outIndex) {
+    return buildRevisionViewWithListCollapse(oldBlocks, newBlocks, ops, degraded);
+  }
+
+  return {
+    mergedMd,
+    blockMarks,
+    stats: {
+      ins: statsIns,
+      del: statsDel,
+      ...(degraded ? { degraded: true } : {}),
+    },
+  };
+};
+
+/**
+ * 硬校验失败时的兜底：相邻 list 的 remove+add 合成单个 modified（不再并排输出两段 list）。
+ */
+const buildRevisionViewWithListCollapse = (
+  oldBlocks: ParsedBlock[],
+  newBlocks: ParsedBlock[],
+  ops: AlignOp[],
+  degraded: boolean,
+): RevisionView => {
+  const mergedParts: string[] = [];
+  const blockMarks: BlockMark[] = [];
+  let statsIns = 0;
+  let statsDel = 0;
+  let outIndex = 0;
+
+  const pushPart = (md: string) => {
+    if (mergedParts.length > 0) mergedParts.push("\n\n");
+    mergedParts.push(md);
+    outIndex += 1;
+  };
+
+  const pushListModified = (ob: ParsedBlock, nb: ParsedBlock) => {
+    pushPart(nb.source);
+    blockMarks.push({
+      index: outIndex - 1,
+      status: "modified",
+      oldSource: ob.source,
+    });
+    const w = mergeWordsWithSentinels(ob.plain, nb.plain);
+    statsIns += Math.max(w.ins, 1);
+    statsDel += Math.max(w.del, 1);
+  };
+
+  for (let opIdx = 0; opIdx < ops.length; opIdx++) {
+    const op = ops[opIdx]!;
+    if (op.kind === "equal") {
+      pushPart(newBlocks[op.ni]!.source);
+      continue;
+    }
+    if (op.kind === "added") {
+      const b = newBlocks[op.ni]!;
+      pushPart(b.source);
+      blockMarks.push({ index: outIndex - 1, status: "added" });
+      const words = tokenize(b.plain).filter((t) => t.trim().length > 0);
+      statsIns += Math.max(words.length, 1);
+      continue;
+    }
+    if (op.kind === "removed") {
+      const b = oldBlocks[op.oi]!;
+      const nxt = ops[opIdx + 1];
+      if (nxt?.kind === "added") {
+        const nb = newBlocks[nxt.ni]!;
+        if (b.type === "list" && nb.type === "list") {
+          pushListModified(b, nb);
+          opIdx += 1;
+          continue;
+        }
+      }
+      pushPart(b.source);
+      blockMarks.push({
+        index: outIndex - 1,
+        status: "removed",
+        oldSource: b.source,
+      });
+      const words = tokenize(b.plain).filter((t) => t.trim().length > 0);
+      statsDel += Math.max(words.length, 1);
+      continue;
+    }
+    const ob = oldBlocks[op.oi]!;
+    const nb = newBlocks[op.ni]!;
+    if (ob.type === "list" && nb.type === "list") {
+      pushListModified(ob, nb);
+      continue;
+    }
+    if (degraded || !ob.inlineable || !nb.inlineable) {
+      pushPart(nb.source);
+      blockMarks.push({
+        index: outIndex - 1,
+        status: "modified",
+        oldSource: ob.source,
+      });
+      if (degraded) {
+        statsIns += 1;
+        statsDel += 1;
+      } else {
+        const w = mergeWordsWithSentinels(ob.plain, nb.plain);
+        statsIns += w.ins;
+        statsDel += w.del;
+      }
+      continue;
+    }
+    const merged = mergeInlineableBlock(ob, nb);
+    if (merged.kind === "replace") {
+      if (ob.type === "list" && nb.type === "list") {
+        pushListModified(ob, nb);
+        continue;
+      }
+      pushPart(ob.source);
+      blockMarks.push({
+        index: outIndex - 1,
+        status: "removed",
+        oldSource: ob.source,
+      });
+      statsDel += Math.max(
+        tokenize(ob.plain).filter((t) => t.trim().length > 0).length,
+        1,
+      );
+      pushPart(nb.source);
+      blockMarks.push({ index: outIndex - 1, status: "added" });
+      statsIns += Math.max(
+        tokenize(nb.plain).filter((t) => t.trim().length > 0).length,
+        1,
+      );
+      continue;
+    }
     pushPart(merged.md);
+    blockMarks.push({
+      index: outIndex - 1,
+      status: "modified",
+      oldSource: ob.source,
+    });
     statsIns += merged.ins;
     statsDel += merged.del;
   }

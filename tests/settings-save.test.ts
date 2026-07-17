@@ -26,7 +26,12 @@ const localStorageStub = {
   localStorage: localStorageStub,
 };
 
-import { DEFAULT_SETTINGS, saveSettings } from "@/lib/local-store";
+import {
+  DEFAULT_SETTINGS,
+  getSettings,
+  normalizeSettings,
+  saveSettings,
+} from "@/lib/local-store";
 import { repoConfigEquals } from "@/hooks/use-settings";
 import type { RepoConfig } from "@/lib/types";
 
@@ -117,6 +122,43 @@ describe("saveSettings（CR-08）", () => {
     pendingCalls[1].resolve(okResponse());
     await expect(p1).resolves.toBe(false);
     await expect(p2).resolves.toBe(true);
+  });
+
+  it("PUT 失败回滚 cache（内存不与磁盘分叉）", async () => {
+    const ok = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "已落盘" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(1));
+    pendingCalls[0].resolve(okResponse());
+    await expect(ok).resolves.toBe(true);
+    expect(getSettings().apiKey).toBe("已落盘");
+
+    const fail = saveSettings({ ...DEFAULT_SETTINGS, apiKey: "写失败" });
+    await vi.waitFor(() => expect(pendingCalls.length).toBe(2));
+    pendingCalls[1].resolve(errResponse());
+    await expect(fail).resolves.toBe(false);
+    expect(getSettings().apiKey).toBe("已落盘");
+  });
+});
+
+describe("normalizeSettings 健壮性", () => {
+  it("失败路径默认值是拷贝、mutate 不污染 DEFAULT_SETTINGS", () => {
+    const a = normalizeSettings(null);
+    a.apiKey = "污染";
+    a.repos.push({ name: "x", path: "/x" });
+    expect(DEFAULT_SETTINGS.apiKey).toBe("");
+    expect(DEFAULT_SETTINGS.repos).toEqual([]);
+  });
+
+  it("apiKey 非 string → 空串；repos 非对象项过滤", () => {
+    const s = normalizeSettings({
+      apiKey: 123 as never,
+      repos: [
+        { name: "ok", path: "/ok" },
+        "坏项" as never,
+        null as never,
+      ],
+    });
+    expect(s.apiKey).toBe("");
+    expect(s.repos).toEqual([{ name: "ok", path: "/ok" }]);
   });
 });
 
