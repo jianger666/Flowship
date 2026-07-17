@@ -287,6 +287,14 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-17 v1.1.20 发版：agent-shell 三轮外审加固（跨 bundle 状态 + 预检前置 + PATH 顺序）
+
+- **背景**：v1.1.19 的 Git Bash 候选修复经外部 AI（GPT-5.6）三轮代码复审、修掉 2 个 P1 + 1 个 P2；复审对照原始证据逐条核过（`docs/windows-slow-rca-2026-07-17.md` 含置信度修订）。
+- **P1 跨 bundle 状态共享**：`ORIGINAL_SHELL`/`injectedBinDir` 原是 module-local，production build 里 instrumentation 与 settings route 是两份模块实例（复审用 `pnpm build` 实证）→ 关开关时 settings 实例把「已注入的 Git Bash」当原始值恢复、PATH 清理 noop。修：三样状态（originalShell+captured 布尔 / injectedBinDir / applyChain）合进 `__feAiFlowAgentShellStateV1__` 单一 globalThis 对象；原始 SHELL 首次 sync 时捕获一次、永不覆盖。配双模块实例回归测试（vi.resetModules + 两次动态 import、修复前红修复后绿）。
+- **P1 预检前置**：旧序「注入 PATH+SHELL → await where 校验（5s 超时）→ 失败回滚」在校验窗口把临时环境暴露给并发创建的 agent。修：①绝对路径自检 → ②候选 PATH（不写 process.env、含模拟卸旧段）带候选 env 跑 `where bash` 链校验（SDK 同款 `/git.*bash/i`、防 WSL bash 抢位）→ ③全过才 `commitShellEnv` 同步一次性提交（无 await 夹缝）；任一预检失败环境从未被本次改动。apply 经 globalThis promise 链串行（启动 fire-and-forget 与设置 PUT 不交错）。
+- **P2 PATH 顺序**：`includes` 判断改「首段判断」——目标 bin 在 PATH 后部时在首位新增一段（不动用户原有段）、只有真正新增才记 `injectedBinDir`、移除只删第一个匹配段；`pathSegmentEquals` 统一 Windows 语义比较（大小写不敏感 + 尾斜杠归一）。
+- 全量 42 文件 468 测试全绿 + `pnpm build` 过；**Windows 真机 SDK smoke 仍未做**（mac mock 不能替代）——发版后需一台中招同事机器验证：开开关 → main.log shell 有 `phase=done status=success`、无 `Can't find Bash`。
+
 ### 2026-07-17 v1.1.19 发版：Windows Git Bash 卡死热修 + 全仓审查修复批
 
 - **Windows「Agent shell 用 Git Bash」把 shell 彻底弄挂（v1.1.18 引入的线上事故、多个同事中招）**：v1.1.18 只写了 `process.env.SHELL`，但 SDK（1.0.23）选壳器和执行器是**两套独立逻辑**——选壳器 `vt()` 读 SHELL 命中 git-bash 就选 Bash 执行器（✅ 生效），但 Bash 执行器 `Ue()` 在 win32 下**根本不读 SHELL**、只在 `PATH` 里 `where bash` 找路径像 git-bash 的 bash。用户机器 PATH 只有 `Git\cmd`（装 Git 默认只加这个、里面没 bash.exe）→ 每条 shell 抛 `Can't find Bash` → 在 SDK async generator 里逃逸成 unhandledRejection（被 instrumentation 兜底进程不退）→ 工具调用永不结束 → agent 反复「shell 不可用/卡住」。诊断包 main.log 实锤：`SHELL → Git Bash` 后每条 `[perf-tool] tool=shell phase=start` 都无 `phase=done`、紧跟 `Error: Can't find Bash`；read/glob 正常。修法（`agent-shell.ts`）：开关开且探到 bash.exe 时**除写 SHELL 外把 `Git\bin` 前置注入 PATH**（让执行器 `where bash` 命中）+ 注入后跑 `bash -c echo __shell_ok__` **自检**、失败回滚 SHELL+PATH 退回 PowerShell（防「UI 说优化了、实际全挂」的假成功）；关开关/探测失败/自检失败按 `injectedBinDir` 精确卸载注入段、不碰 PATH 其它段；换 Git 安装路径先卸旧再注新。抽 `injectGitBashBinToPath`/`removeInjectedGitBashBinFromPath`/`verifyGitBashRunnable`/`syncAgentShellEnv` 可单测。
@@ -300,12 +308,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
   - **共享 lib**：md-revision 三处（词级修订补 blockMarks、fingerprint 纳入 url/depth/ordered、相邻 list 插 HTML 注释分隔防块错位）；批次进度计入 `awaiting_ack`；path-utils UNC 双引号；local-store 浅拷贝/回滚/校验；`ACTION_LABEL` 双源收敛到 types.ts。
   - **action 闸门**：review/build 必备段正则改 `#{2,3}` 标题锚定（原被总评 bullet 架空）；checkDev 直推路径也读 artifact 验非空。
   - **shell 环境**：`hasShellBoost` 改匹配守卫本体（原只认 env 名子串、误判「已优化」）；login PATH 合并用 pinnedPrefixes 保 tools/bin 置顶；agent-shell 探测负缓存开关旁路。
-
-### 2026-07-16 v1.1.18 发版：Windows「Agent shell 用 Git Bash」开关
-
-- **背景**：同事 Windows 上 agent shell 持续挂死/输出为空（SDK PowerShell 执行器官方已认 bug、v1.1.16 调研段）。SDK 选壳逻辑优先读 `process.env.SHELL`、指向 git-bash 即改走 Bash 执行器（bundle 源码实锤）——做成设置页开关免每人手动配环境变量。**⚠️ 本版只写 SHELL 未补 PATH、引发 v1.1.19 热修的线上事故**（详见 v1.1.19 段）。
-- **实现**（`agent-shell.ts`）：三层探测 `detectGitBashPath`（注册表 GitForWindows InstallPath → `where git.exe` + `deriveBashFromGitExe` 纯函数推导（cmd/bin/mingw64 三布局）→ 常规路径兜底、60s 缓存、子进程 5s 超时）；`applyAgentShellPreference` 按 settings 写/恢复 `process.env.SHELL`（模块加载时快照原值、关闭恢复、幂等）；调用点 = 启动 instrumentation + settings PUT 落盘后（拨开关即生效不用重启）。
-- **设置链路**：`FeAiFlowSettings.agentShellGitBash`（默认 false）全链路；设置页偏好卡新 SettingRow**仅 win32 渲染**（探测到显示路径、没探测到开关 disabled +「未检测到 Git Bash」）；拨完刷新「当前 Agent shell」展示形成闭环。`saveFieldValue` 顺带改为返回 Promise<boolean>（调用方可等落盘后刷新）。
 
 ## 关键文件索引
 

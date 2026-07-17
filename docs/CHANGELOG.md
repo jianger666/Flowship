@@ -15,6 +15,12 @@
 
 ---
 
+### 2026-07-16 v1.1.18 发版：Windows「Agent shell 用 Git Bash」开关
+
+- **背景**：同事 Windows 上 agent shell 持续挂死/输出为空（SDK PowerShell 执行器官方已认 bug、v1.1.16 调研段）。SDK 选壳逻辑优先读 `process.env.SHELL`、指向 git-bash 即改走 Bash 执行器（bundle 源码实锤）——做成设置页开关免每人手动配环境变量。**⚠️ 本版只写 SHELL 未补 PATH、引发 v1.1.19 热修的线上事故**（详见 HANDOFF v1.1.19 段）。
+- **实现**（`agent-shell.ts`）：三层探测 `detectGitBashPath`（注册表 GitForWindows InstallPath → `where git.exe` + `deriveBashFromGitExe` 纯函数推导（cmd/bin/mingw64 三布局）→ 常规路径兜底、60s 缓存、子进程 5s 超时）；`applyAgentShellPreference` 按 settings 写/恢复 `process.env.SHELL`（模块加载时快照原值、关闭恢复、幂等）；调用点 = 启动 instrumentation + settings PUT 落盘后（拨开关即生效不用重启）。
+- **设置链路**：`FeAiFlowSettings.agentShellGitBash`（默认 false）全链路；设置页偏好卡新 SettingRow**仅 win32 渲染**（探测到显示路径、没探测到开关 disabled +「未检测到 Git Bash」）；拨完刷新「当前 Agent shell」展示形成闭环。`saveFieldValue` 顺带改为返回 Promise<boolean>（调用方可等落盘后刷新）。
+
 ### 2026-07-16 v1.1.17 发版：后置检查 artifact 读取竞态修复
 
 - **交卷/落盘竞态误报**（用户实测：ship 后置检查红条 ENOENT、但文件几百 ms 后就在、UI 正文正常）：事件流实锤 agent 把「最后一次写 artifact」和「submit_work 交卷」**同一秒并行发**（Cursor agent 支持同批并行工具调用、模型偶尔把收尾动作并发）——后置检查在 submit_work 到达瞬间读 artifact、写盘还在飞行中。修法：`action-checks.ts` 新增 `readArtifactWithRetry`（ENOENT 短退避 0.5/1/2/4s、最多等 ~7.5s；其它错误不重试照旧报）、plan/review/ship/custom/build 五处 artifact 读取全换——与 UI 侧 artifact 面板既有退避重试对齐。不走「prompt 教模型别并行发」路线（靠模型自觉不如 server 确定性兜底）。
