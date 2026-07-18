@@ -84,4 +84,24 @@ export const register = (): void => {
         err instanceof Error ? err.message : err,
       );
     });
+
+  // 飞书 chat 桥接出向：全局 tap 订阅 task-stream（幂等、开关关闭时事件内 no-op）
+  void import("./lib/server/feishu-bridge/outbound")
+    .then((m) => m.ensureFeishuOutboundRegistered())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 飞书桥接 outbound 注册失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
+  // 飞书 chat 桥接入向：event consume + keep-awake（30s 轮询、globalThis 幂等）
+  void import("./lib/server/feishu-bridge/inbound")
+    .then((m) => m.ensureBridgeRuntimePolling())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 飞书桥接 inbound runtime 启动失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
 };

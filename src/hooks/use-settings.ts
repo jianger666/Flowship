@@ -249,6 +249,17 @@ export const useSettings = (): UseSettingsResult => {
       // 模型使用计数：非设置页字段（recordModelUsage 直写）、恒不 dirty
       modelUsage: false,
       meegleProject: !isFieldEqual("meegleProject", settings, savedSettings),
+      // 飞书 chat 桥接全局开关 / 插电防休眠（S1 落 settings、UI 段后续接）
+      feishuChatBridge: !isFieldEqual(
+        "feishuChatBridge",
+        settings,
+        savedSettings,
+      ),
+      feishuBridgeKeepAwake: !isFieldEqual(
+        "feishuBridgeKeepAwake",
+        settings,
+        savedSettings,
+      ),
     }),
     [settings, savedSettings]
   );

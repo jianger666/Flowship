@@ -204,3 +204,58 @@ export const reapTaskOrphans = (
     void killOrphansInRepos(workDirs);
   }, 2500).unref?.();
 };
+
+// ----------------- 长驻子进程登记（飞书桥接 event consume 等） -----------------
+
+/**
+ * 进程级登记表：server 退出时统一优雅停掉，避免 lark-cli consumer 漏退订。
+ * 挂 globalThis 防 dev HMR 丢引用。
+ */
+type ManagedChildEntry = {
+  label: string;
+  /** 优雅停止（stdin EOF / SIGTERM）；勿 kill -9 */
+  stop: () => Promise<void> | void;
+};
+
+const MANAGED_KEY = "__feAiFlowManagedChildrenV1__";
+
+const getManagedMap = (): Map<string, ManagedChildEntry> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, ManagedChildEntry> | undefined
+  >;
+  if (!g[MANAGED_KEY]) g[MANAGED_KEY] = new Map();
+  return g[MANAGED_KEY]!;
+};
+
+/** 登记长驻子进程（幂等按 id 覆盖） */
+export const registerManagedChild = (
+  id: string,
+  entry: ManagedChildEntry,
+): void => {
+  getManagedMap().set(id, entry);
+};
+
+/** 注销（子进程已自行退出时调） */
+export const unregisterManagedChild = (id: string): void => {
+  getManagedMap().delete(id);
+};
+
+/** server 退出前：停掉所有登记的长驻子进程（best-effort） */
+export const stopAllManagedChildren = async (): Promise<void> => {
+  const map = getManagedMap();
+  const entries = [...map.entries()];
+  map.clear();
+  await Promise.all(
+    entries.map(async ([id, e]) => {
+      try {
+        await e.stop();
+      } catch (err) {
+        console.warn(
+          `[kill-orphans] 停止托管子进程失败 id=${id} label=${e.label}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }),
+  );
+};

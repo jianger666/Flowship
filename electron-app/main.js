@@ -4,8 +4,9 @@
  * 职责（保持薄壳、业务全在 Next server 里）：
  * 1. 起内置 Next standalone server（spawn 自带 node 运行时、ELECTRON_RUN_AS_NODE）
  * 2. 等 server 就绪后开 BrowserWindow 指向 http://127.0.0.1:8876
- * 3. 关窗口 → 杀 server 子进程 → 退出（不留后台常驻）
+ * 3. 关窗不退出（Tray 常驻 hide）；真退出走 Tray 菜单 / Cmd+Q → 杀 server
  * 4. win 自动更新（electron-updater + GitHub Releases 的 latest.yml）
+ * 5. 自定义协议深链 flowship://（test 实例 flowship-test://）路由到任务页
  *
  * 关键链路（V0.7-ELECTRON-PLAN §3.2）：
  * - ELECTRON_RUN_AS_NODE=1 让 process.execPath 表现为 node、且被孙进程继承——
@@ -18,10 +19,12 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  Menu,
   nativeImage,
   nativeTheme,
   Notification,
   shell,
+  Tray,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
@@ -46,6 +49,10 @@ import { fileURLToPath } from "node:url";
 const IS_TEST =
   process.env.FE_AI_FLOW_TEST === "1" ||
   path.basename(process.execPath).toLowerCase().includes("test");
+
+// 自定义协议：正式 flowship / test flowship-test——两套 scheme 避免同机正式+test
+// 抢注册（决策 #18）；URL 形如 flowship://tasks/<taskId>
+const PROTOCOL_SCHEME = IS_TEST ? "flowship-test" : "flowship";
 
 const PORT = Number(process.env.FE_AI_FLOW_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
@@ -102,10 +109,14 @@ const serverDir = app.isPackaged
 
 // server 子进程句柄（null = 没起 / 已退）
 let serverProc = null;
-// 主窗口（关窗后置 null）
+// 主窗口（真销毁后置 null；关窗 hide 时仍保留引用）
 let mainWindow = null;
-// 主动退出标记——区分「用户关窗杀 server」和「server 自己崩了」
+// 系统托盘（决策 #19：关窗不退出、驻留菜单栏 / 托盘）
+let appTray = null;
+// 主动退出标记——区分「真退出」和「server 自己崩了」；关窗 hide 不置位
 let quitting = false;
+// 冷启动深链暂存（坑 #15：open-url / argv 可能早于窗口 ready）
+let pendingDeepLinkTaskId = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -522,6 +533,173 @@ const notifyRenameOnce = async () => {
   }).show();
 };
 
+// ---------- 深链 + Tray + 开机自启（决策 #18 / #19 / #22） ----------
+
+/** 从 argv 里抠自定义协议 URL（Windows 深链走 second-instance argv，见 4.6） */
+const findProtocolUrlInArgv = (argv) => {
+  const prefix = `${PROTOCOL_SCHEME}://`;
+  return (argv || []).find((a) => typeof a === "string" && a.startsWith(prefix)) || null;
+};
+
+/**
+ * 解析 flowship://tasks/<taskId>（hostname=tasks、pathname=/<id>）。
+ * 只认本实例 scheme、只带 taskId、不带敏感信息（坑 #15）。
+ */
+const parseDeepLinkTaskId = (url) => {
+  if (typeof url !== "string" || !url) return null;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== `${PROTOCOL_SCHEME}:`) return null;
+    // flowship://tasks/abc → hostname=tasks、pathname=/abc
+    if (u.hostname === "tasks") {
+      const id = u.pathname.replace(/^\//, "").split("/")[0];
+      return id || null;
+    }
+    // 兼容 flowship:///tasks/abc（空 host）
+    const parts = `${u.hostname}${u.pathname}`.split("/").filter(Boolean);
+    if (parts[0] === "tasks" && parts[1]) return parts[1];
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+/** 显示并聚焦主窗（Tray 打开 / 深链 / second-instance / dock activate 共用） */
+const showMainWindow = () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+};
+
+/** 投递深链给 renderer；窗口未就绪则暂存（坑 #15 冷启动） */
+const deliverDeepLink = (taskId) => {
+  if (!taskId) return;
+  if (!mainWindow) {
+    pendingDeepLinkTaskId = taskId;
+    log(`[deep-link] 窗口未就绪、暂存 taskId=${taskId}`);
+    return;
+  }
+  pendingDeepLinkTaskId = null;
+  showMainWindow();
+  mainWindow.webContents.send("deep-link", { taskId });
+  log(`[deep-link] 已投递 taskId=${taskId}`);
+};
+
+const handleDeepLinkUrl = (url) => {
+  const taskId = parseDeepLinkTaskId(url);
+  if (!taskId) {
+    log(`[deep-link] 无法解析 URL：${String(url).slice(0, 120)}`);
+    return;
+  }
+  deliverDeepLink(taskId);
+};
+
+/** 窗口 load 完成后冲刷冷启动暂存 */
+const flushPendingDeepLink = () => {
+  if (!pendingDeepLinkTaskId) return;
+  const id = pendingDeepLinkTaskId;
+  pendingDeepLinkTaskId = null;
+  deliverDeepLink(id);
+};
+
+/**
+ * 注册为默认协议客户端。
+ * Windows / mac 非打包（process.defaultApp）必须带 execPath + 入口脚本，
+ * 否则系统调起时找不到 electron 入口（Electron 官方文档模式）。
+ */
+const registerProtocolClient = () => {
+  try {
+    if (process.defaultApp) {
+      if (process.argv.length >= 2) {
+        app.setAsDefaultProtocolClient(PROTOCOL_SCHEME, process.execPath, [
+          path.resolve(process.argv[1]),
+        ]);
+      }
+    } else {
+      app.setAsDefaultProtocolClient(PROTOCOL_SCHEME);
+    }
+    log(`[deep-link] 已注册协议 ${PROTOCOL_SCHEME}://`);
+  } catch (err) {
+    log(`[deep-link] 注册协议失败（忽略）${err?.message || err}`);
+  }
+};
+
+/** Tray 图标：mac 用 Template（适配菜单栏深浅色）；win 用彩色 png */
+const resolveTrayIcon = () => {
+  const assetsDir = path.join(__dirname, "assets");
+  if (IS_MAC) {
+    // Electron 会按 DPI 自动选 trayTemplate.png / trayTemplate@2x.png
+    const p = path.join(assetsDir, "trayTemplate.png");
+    const img = nativeImage.createFromPath(p);
+    if (!img.isEmpty()) img.setTemplateImage(true);
+    return img;
+  }
+  const winPath = path.join(assetsDir, "tray-win.png");
+  if (existsSync(winPath)) return nativeImage.createFromPath(winPath);
+  // 兜底：通知图标 / packaging
+  const fallback = resolveNotifyIcon();
+  return fallback ? nativeImage.createFromPath(fallback) : nativeImage.createEmpty();
+};
+
+/**
+ * 真退出入口（Tray「退出」）：先置 quitting，避免 close 拦截成 hide，
+ * 再走 app.quit → before-quit（含 mac 暂存更新套用）→ 杀 server。
+ * ⚠️ 自更新 quitAndInstall / applyStagedUpdate 也会先置 quitting=true，同一套门控。
+ */
+const quitAppForReal = () => {
+  quitting = true;
+  app.quit();
+};
+
+const createTray = () => {
+  if (appTray) return;
+  const icon = resolveTrayIcon();
+  if (icon.isEmpty()) {
+    log("[tray] 图标为空、跳过创建 Tray（关窗 hide 仍生效）");
+    return;
+  }
+  appTray = new Tray(icon);
+  const label = IS_TEST ? "FlowshipTest" : "Flowship";
+  appTray.setToolTip(label);
+  const menu = Menu.buildFromTemplate([
+    {
+      label: `打开 ${label}`,
+      click: () => showMainWindow(),
+    },
+    { type: "separator" },
+    {
+      label: "退出",
+      click: () => quitAppForReal(),
+    },
+  ]);
+  appTray.setContextMenu(menu);
+  // Windows：左键单击托盘图标恢复窗口（mac 菜单栏惯例是右键出菜单、不绑 click）
+  if (process.platform === "win32") {
+    appTray.on("click", () => showMainWindow());
+  }
+  log(`[tray] 已创建（${label}）`);
+};
+
+// 开机自启读写（设置页 UI 另代理；API 名 auto-launch-get / set 一字不差）
+ipcMain.handle("auto-launch-get", () => {
+  try {
+    return !!app.getLoginItemSettings().openAtLogin;
+  } catch (err) {
+    log(`[auto-launch] get 失败 ${err?.message || err}`);
+    return false;
+  }
+});
+ipcMain.handle("auto-launch-set", (_e, enabled) => {
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled === true });
+    log(`[auto-launch] set openAtLogin=${enabled === true}`);
+  } catch (err) {
+    log(`[auto-launch] set 失败 ${err?.message || err}`);
+    throw err;
+  }
+});
+
 const createWindow = async () => {
   const st = await loadWindowState();
   // 加载期窗口底色跟随系统深浅、避免浅色系统启动闪黑（app 内主题由 next-themes 接管）
@@ -560,7 +738,18 @@ const createWindow = async () => {
   // v1.1.x「开屏一屏到底」（用户拍板）：ready-to-show（首帧、可能还是页内 loading）
   // 不亮窗——等页面 IPC `app-content-ready`（首页真实内容渲出来：看板 / 就绪清单）
   // 才亮主窗 + 收 splash；见 revealMainWindow / whenReady 里的兜底 timer
-  mainWindow.on("close", () => void saveWindowState());
+  //
+  // 关窗行为（决策 #19）：非真退出 → preventDefault + hide（Tray 常驻）；
+  // 真退出（Tray「退出」/ Cmd+Q / 自更新 quitAndInstall·applyStagedUpdate 已置 quitting）
+  // → 放行 close，配合 before-quit 杀 server + mac 套用暂存更新。
+  mainWindow.on("close", (event) => {
+    void saveWindowState();
+    if (!quitting) {
+      event.preventDefault();
+      mainWindow.hide();
+      log("[main] 关窗 → hide（Tray 常驻；真退出走菜单/Cmd+Q）");
+    }
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -610,6 +799,8 @@ const createWindow = async () => {
       .executeJavaScript(`window.__appVersion=${JSON.stringify(app.getVersion())};`)
       .catch(() => {});
     notifyPageUpdateReady();
+    // 冷启动深链：窗口文档就绪后再投递，避免 send 打进空白页（坑 #15）
+    flushPendingDeepLink();
   });
 
   // v1.0.x：主窗创建后不再加载 splash 文档（splash 是独立小窗）——
@@ -1392,18 +1583,30 @@ ipcMain.handle("check-for-update", () => manualCheckForUpdate());
 
 // ---------- 生命周期 ----------
 
-// 单实例锁：二开时聚焦已有窗口
+// 单实例锁：二开时聚焦已有窗口；Windows 深链会拉起第二实例、URL 在 argv 里（4.6）
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.focus();
+  app.on("second-instance", (_event, argv) => {
+    // 先解析深链再聚焦——用户点 flowship:// 时既要亮窗也要跳任务
+    const url = findProtocolUrlInArgv(argv);
+    if (url) handleDeepLinkUrl(url);
+    showMainWindow();
+  });
+
+  // macOS：深链走 open-url；必须在 ready 前注册，否则冷启动首个 URL 会丢（坑 #15）
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    handleDeepLinkUrl(url);
   });
 
   app.whenReady().then(async () => {
-    log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")}`);
+    log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
+    // 注册自定义协议（正式 flowship / test flowship-test）
+    registerProtocolClient();
+    // Windows 冷启动：深链在首实例 process.argv（不是 open-url）
+    const startupUrl = findProtocolUrlInArgv(process.argv);
+    if (startupUrl) handleDeepLinkUrl(startupUrl);
     // mac 改名自迁移：文件名还是老产品名 → rename + 重启接力、本进程到此为止
     if (await maybeSelfRenameOnMac()) return;
     // 改名接力后的首次启动：提示重新固定 Dock（一次性）
@@ -1439,6 +1642,7 @@ if (!app.requestSingleInstanceLock()) {
     // splash 先亮（boot 期间唯一可见窗口、跟主窗同尺寸同位置）、主窗 hidden 待页面就绪
     createSplashWindow(nativeTheme.shouldUseDarkColors, await loadWindowState());
     await createWindow();
+    createTray();
     startServer();
     void setupAutoUpdate();
 
@@ -1463,7 +1667,17 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
 
-  // 关窗即退（mac 也不留 dock 常驻——服务跟窗口同生共死、行为跨平台一致）
+  // mac：点 Dock 图标时若窗口被 hide，重新 show（决策 #19）
+  app.on("activate", () => {
+    if (mainWindow) {
+      showMainWindow();
+      return;
+    }
+    // 极端：主窗已销毁但仍在跑——不应发生（关窗只 hide）；防守不重建，等用户从 Tray 退
+  });
+
+  // 真退出时所有窗口销毁才走到这（关窗 hide 不会触发）。
+  // 保留：停 server + quit，与 Tray / Cmd+Q / 自更新重启路径一致。
   app.on("window-all-closed", async () => {
     log("[main] 所有窗口关闭、停 server 并退出");
     quitting = true;
@@ -1473,6 +1687,9 @@ if (!app.requestSingleInstanceLock()) {
 
   // 退出路径：杀 server 孤儿 + mac 套用暂存更新（不 relaunch）。
   // ditto 跨卷可能慢 → preventDefault 等替换完再 exit；失败不挡退出（启动兜底再试）。
+  // ⚠️ 必须在此置 quitting=true：Cmd+Q 走 before-quit → 再关窗；close 拦截靠这个 flag
+  // 放行，否则 Cmd+Q 会被 hide 吃掉、退不出去。自更新 quitAndInstall / applyStagedUpdate
+  // 也先置 quitting，同一门控不会误拦。
   app.on("before-quit", (event) => {
     quitting = true;
     if (serverProc) {

@@ -33,6 +33,14 @@ declare global {
       /** 收件箱未读角标（mac Dock / win overlay）；非壳环境无此方法 */
       setInboxBadge?: (payload: { count: number; dataUrl?: string }) => void;
     };
+    /**
+     * 开机自启（决策 #19）：设置页开关用；非桌面端无通道。
+     * API 名与 preload 一字不差：get / set。
+     */
+    __autoLaunch?: {
+      get: () => Promise<boolean>;
+      set: (enabled: boolean) => Promise<void>;
+    };
   }
 }
 

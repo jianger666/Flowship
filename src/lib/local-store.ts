@@ -49,6 +49,9 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   modelUsage: [],
   // 默认悟空产研空间——看板 / 收件箱唯一作用域（历史用户零迁移）
   meegleProject: { ...DEFAULT_MEEGLE_PROJECT },
+  // 飞书消息桥接：默认关（决策 #3）；插电防休眠默认开（决策 #14）
+  feishuChatBridge: false,
+  feishuBridgeKeepAwake: true,
 };
 
 /**
@@ -210,6 +213,10 @@ export const normalizeSettings = (
       : undefined,
     // 默认飞书空间：缺 / 坏 → 悟空产研（看板 + 收件箱唯一作用域）
     meegleProject: normalizeMeegleProject(parsed.meegleProject),
+    // 消息桥接全局开关：只认显式 true（决策 #3）
+    feishuChatBridge: parsed.feishuChatBridge === true,
+    // 插电防休眠：缺省 / 非 false → true（决策 #14）
+    feishuBridgeKeepAwake: parsed.feishuBridgeKeepAwake !== false,
   };
 };
 

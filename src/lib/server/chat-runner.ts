@@ -2170,7 +2170,8 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         // 入队方已落过 user_reply（并发起会话被吞改入队等）→ 跳过重复气泡 / checkpoint
         if (msg.skipPersistEvent) return;
 
-        const meta: Record<string, unknown> = {};
+        // 消息自带的来源标记（如飞书桥接 { source: "feishu" }）合并进 meta
+        const meta: Record<string, unknown> = { ...(msg.extraMeta ?? {}) };
         if (msg.savedImages && msg.savedImages.length > 0) {
           meta.images = msg.savedImages;
         }

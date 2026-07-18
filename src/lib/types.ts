@@ -230,6 +230,16 @@ export interface FeAiFlowSettings {
    * 缺省由 DEFAULT_MEEGLE_PROJECT 兜底（历史用户都是悟空空间、零迁移）。
    */
   meegleProject?: { key: string; name: string; simpleName?: string };
+  /**
+   * 飞书 chat 消息桥接全局开关（决策 #3：只做全局、不做 chat 级）。
+   * 默认关——用户在设置页显式打开后才启 consumer / 出向推送。
+   */
+  feishuChatBridge?: boolean;
+  /**
+   * 桥接开启时「插电防休眠」（决策 #14）。默认开；显式 false 才关。
+   * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
+   */
+  feishuBridgeKeepAwake?: boolean;
 }
 
 /**

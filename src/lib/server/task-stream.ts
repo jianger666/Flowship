@@ -382,14 +382,58 @@ export const revokeTaskOps = (taskId: string): void => {
 
 // ----------------- publish / subscribe -----------------
 
+/**
+ * 全局 tap（飞书桥接 outbound 等旁路用）：publish 时无论有无 per-task SSE 订阅者都会 fanout。
+ * 与 per-task subscribers 分 key 挂 globalThis——热重载不丢、也不污染 TaskRunnerGlobalState 形状。
+ */
+export type AllTaskStreamListener = (
+  taskId: string,
+  ev: TaskStreamEvent,
+) => void;
+
+const ALL_STREAM_LISTENERS_KEY = "__feAiFlowAllTaskStreamListenersV1__";
+
+const getAllStreamListeners = (): Set<AllTaskStreamListener> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Set<AllTaskStreamListener> | undefined
+  >;
+  if (!g[ALL_STREAM_LISTENERS_KEY]) {
+    g[ALL_STREAM_LISTENERS_KEY] = new Set();
+  }
+  return g[ALL_STREAM_LISTENERS_KEY]!;
+};
+
+/** 订阅所有 task 的流事件；返取消函数。dev HMR 下调用方须自做幂等（见 feishu-bridge/outbound）。 */
+export const subscribeAllTaskStreams = (
+  listener: AllTaskStreamListener,
+): (() => void) => {
+  const set = getAllStreamListeners();
+  set.add(listener);
+  return () => {
+    set.delete(listener);
+  };
+};
+
 export const publish = (taskId: string, ev: TaskStreamEvent): void => {
   const set = subscribers.get(taskId);
-  if (!set || set.size === 0) return;
-  for (const listener of set) {
+  if (set && set.size > 0) {
+    for (const listener of set) {
+      try {
+        listener(ev);
+      } catch (err) {
+        console.error("[task-stream] subscriber listener threw:", err);
+      }
+    }
+  }
+  // 全局 tap：无 SSE 订阅时也要喂给旁路（outbound 不能依赖有人开着 watch）
+  const all = getAllStreamListeners();
+  if (all.size === 0) return;
+  for (const listener of all) {
     try {
-      listener(ev);
+      listener(taskId, ev);
     } catch (err) {
-      console.error("[task-stream] subscriber listener threw:", err);
+      console.error("[task-stream] all-stream listener threw:", err);
     }
   }
 };

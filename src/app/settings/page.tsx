@@ -273,6 +273,14 @@ const SettingsPage = () => {
               <FeishuCliSection
                 meegleProject={settings.meegleProject ?? { ...DEFAULT_MEEGLE_PROJECT }}
                 onMeegleProjectChange={(v) => saveFieldValue("meegleProject", v)}
+                feishuChatBridge={settings.feishuChatBridge === true}
+                onFeishuChatBridgeChange={(v) =>
+                  saveFieldValue("feishuChatBridge", v)
+                }
+                feishuBridgeKeepAwake={settings.feishuBridgeKeepAwake !== false}
+                onFeishuBridgeKeepAwakeChange={(v) =>
+                  saveFieldValue("feishuBridgeKeepAwake", v)
+                }
               />
             </CardContent>
           </Card>,

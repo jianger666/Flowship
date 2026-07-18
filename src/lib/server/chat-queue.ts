@@ -36,6 +36,11 @@ export type QueuedChatMsg = {
    * chat-reply 模式 2 已 persistReplyAndCheckpoint）。flush 发出后不要再落一条重复气泡。
    */
   skipPersistEvent?: boolean;
+  /**
+   * 额外并进 user_reply.meta 的字段（如飞书桥接的 `{ source: "feishu" }`）。
+   * flush 落事件时浅合并；缺省 = 不合并、对既有调用方零行为变化。
+   */
+  extraMeta?: Record<string, unknown>;
 };
 
 interface ChatQueueGlobalState {

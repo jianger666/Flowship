@@ -41,6 +41,44 @@ contextBridge.exposeInMainWorld("__notify", {
   },
 });
 
+// 自定义协议深链（flowship://tasks/<id>）：主进程 send「deep-link」→ 这里订阅。
+// 冷启动时主进程可能在 React mount 前就 send——无订阅者时缓冲 latest，
+// 首个 onDeepLink 注册时补投一次，避免丢路由（坑 #15）。
+let __deepLinkBuffered = null;
+/** @type {Set<(payload: { taskId: string }) => void>} */
+const __deepLinkSubs = new Set();
+ipcRenderer.on("deep-link", (_event, payload) => {
+  if (__deepLinkSubs.size > 0) {
+    __deepLinkBuffered = null;
+    for (const cb of __deepLinkSubs) cb(payload);
+  } else {
+    __deepLinkBuffered = payload;
+  }
+});
+contextBridge.exposeInMainWorld("__deepLink", {
+  /**
+   * 订阅深链跳转。返回取消订阅函数。
+   * @param {(payload: { taskId: string }) => void} callback
+   */
+  onDeepLink: (callback) => {
+    __deepLinkSubs.add(callback);
+    if (__deepLinkBuffered?.taskId) {
+      const p = __deepLinkBuffered;
+      __deepLinkBuffered = null;
+      queueMicrotask(() => callback(p));
+    }
+    return () => __deepLinkSubs.delete(callback);
+  },
+});
+
+// 开机自启（决策 #19）：设置页开关调这里；壳只暴露 API、UI 在设置页
+contextBridge.exposeInMainWorld("__autoLaunch", {
+  /** @returns {Promise<boolean>} */
+  get: () => ipcRenderer.invoke("auto-launch-get"),
+  /** @param {boolean} enabled */
+  set: (enabled) => ipcRenderer.invoke("auto-launch-set", enabled === true),
+});
+
 // 壳能力 / 平台信息（自定义标题栏用）
 contextBridge.exposeInMainWorld("__shell", {
   // "darwin" | "win32" | "linux"——页面据此给右侧控件让出 Windows 控制按钮位

@@ -49,6 +49,15 @@ extraResources:
   - from: packaging/icon.png
     to: notify-icon.png
 
+# 自定义协议深链（决策 #18）：写入 mac Info.plist CFBundleURLTypes / win 安装器注册表。
+# 正式 flowship、test flowship-test 都列上——壳运行时按 IS_TEST 只 setAsDefault 自己那份，
+# 避免同机两实例抢同一个 scheme（mac 未声明 scheme 时 open-url 根本收不到）。
+protocols:
+  - name: Flowship
+    schemes:
+      - flowship
+      - flowship-test
+
 # 产物文件名写死 ascii（不跟 productName 走中文）——GitHub asset url 和
 # latest.yml 引用的文件名保持英文、electron-updater 下载链路稳
 artifactName: "fe-ai-flow-${version}-${os}-${arch}.${ext}"

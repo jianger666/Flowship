@@ -27,6 +27,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SettingRow } from "@/components/ui/setting-row";
+import { FeishuBridgeBlock } from "@/components/settings/feishu-bridge-block";
 import type { FeAiFlowSettings } from "@/lib/types";
 
 // 服务端状态形状（/api/system/feishu-cli GET）
@@ -65,10 +66,20 @@ type MeegleProjectSetting = NonNullable<FeAiFlowSettings["meegleProject"]>;
 export const FeishuCliSection = ({
   meegleProject,
   onMeegleProjectChange,
+  feishuChatBridge,
+  onFeishuChatBridgeChange,
+  feishuBridgeKeepAwake,
+  onFeishuBridgeKeepAwakeChange,
 }: {
   meegleProject: MeegleProjectSetting;
   /** 选中即落盘（父级 saveFieldValue） */
   onMeegleProjectChange: (next: MeegleProjectSetting) => void;
+  /** 消息桥接全局开关（决策 #3） */
+  feishuChatBridge: boolean;
+  onFeishuChatBridgeChange: (next: boolean) => void;
+  /** 插电防休眠（决策 #14，默认开） */
+  feishuBridgeKeepAwake: boolean;
+  onFeishuBridgeKeepAwakeChange: (next: boolean) => void;
 }) => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
@@ -345,6 +356,13 @@ export const FeishuCliSection = ({
             }
           />
         )}
+        {/* 消息桥接：全局开关 + 引导检查（提案 4.4b） */}
+        <FeishuBridgeBlock
+          feishuChatBridge={feishuChatBridge}
+          onFeishuChatBridgeChange={onFeishuChatBridgeChange}
+          feishuBridgeKeepAwake={feishuBridgeKeepAwake}
+          onFeishuBridgeKeepAwakeChange={onFeishuBridgeKeepAwakeChange}
+        />
       </div>
     </div>
   );

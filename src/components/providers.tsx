@@ -15,6 +15,7 @@ import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
+import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { MrInboxProvider } from "@/hooks/use-mr-inbox";
@@ -60,6 +61,8 @@ export const Providers = ({ children }: ProvidersProps) => {
             <MrInboxProvider>
               {/* 任务转入「等你回复」且窗口在后台 → 系统通知 + Dock 角标（点通知跳详情页） */}
               <TaskAttentionWatcher />
+              {/* 飞书卡片深链 flowship://tasks/<id> → 路由跳对应任务页 */}
+              <DeepLinkHandler />
               {children}
             </MrInboxProvider>
           </TaskListProvider>

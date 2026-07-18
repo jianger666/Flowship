@@ -41,8 +41,11 @@ export const getToolsDir = (): string => path.join(dataRoot(), "tools");
 export const getToolsBinDir = (): string => path.join(getToolsDir(), "bin");
 export const getToolsSkillsDir = (): string => path.join(getToolsDir(), "skills");
 
-const larkCliBin = (): string =>
+/** lark-cli 二进制路径（`<dataRoot>/tools/bin/lark-cli[.exe]`）——桥接 / 安装链共用 */
+export const getLarkCliBin = (): string =>
   path.join(getToolsBinDir(), isWin ? "lark-cli.exe" : "lark-cli");
+/** @deprecated 用 getLarkCliBin；内部旧调用保留别名避免大面积改名 */
+const larkCliBin = (): string => getLarkCliBin();
 export const meegleBin = (): string =>
   path.join(getToolsBinDir(), isWin ? "meegle.exe" : "meegle");
 
