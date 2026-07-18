@@ -6,7 +6,8 @@
  * ③ post-check 在飞 × submit_mr 入场 → 拒绝且不 abort check
  * ④ 正常路径：两份投影原子可见、mrVersion 一致
  *
- * 屏障语义选择：submit_work **等待** 在飞 submit_mr（~120s deadline、超时 warn 后按现状启 check）。
+ * 屏障语义选择：submit_work **等待** 在飞 submit_mr（R29-C 起 ~200s、超时 fail-closed 拒启 check）。
+ * 超时 fail-closed / begin 互斥见 ownership-r29-taskside.test.ts。
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";

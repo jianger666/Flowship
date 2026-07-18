@@ -30,7 +30,6 @@ import path from "node:path";
 
 import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
 import {
-  appendEvent,
   getTask,
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
@@ -57,6 +56,7 @@ import {
   isTaskOpCurrent,
   publishTaskStreamEvent,
   snapshotTaskOp,
+  writeEventAndPublish,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
@@ -380,7 +380,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
 
     clearPendingAsk(task.id);
-    const replyEv = await appendEvent(task.id, {
+    // R29-1：用户回答事件走 OrderedEventCommit（写+publish 同链），不再 append 后再 publish
+    await writeEventAndPublish(task.id, {
       kind: "ask_user_reply",
       actionId: reqEvent.actionId,
       text: replyText,
@@ -391,7 +392,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
         ...(allSaved.length > 0 ? { images: allSaved } : {}),
       },
     });
-    if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
     console.log(
       `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（${isChat ? "chat 新会话" : "新 agent"}接手、答案随消息带过去）`,
     );
@@ -404,11 +404,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
         boot,
       ).catch(async (err) => {
         console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
-        const ev = await appendEvent(task.id, {
+        await writeEventAndPublish(task.id, {
           kind: "error",
           text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
         });
-        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
       });
     } else {
       void resumeCurrentActionWithMessage({
@@ -421,12 +420,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
         opGen,
       }).catch(async (err) => {
         console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
-        const ev = await appendEvent(task.id, {
+        await writeEventAndPublish(task.id, {
           kind: "error",
           actionId: reqEvent.actionId,
           text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
         });
-        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
       });
     }
     const fresh = await getTask(task.id);
@@ -455,13 +453,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
       console.log(
         `[ask-reply] task=${task.id} askId=${askId} 提问已失效（被顶替 / agent 在跑、runStatus=${fresh.runStatus}）、作废旧弹窗`,
       );
-      const info = await appendEvent(task.id, {
+      // R29-1：作废提示事件写+publish 同链
+      await writeEventAndPublish(task.id, {
         kind: "info",
         actionId: reqEvent.actionId,
         text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
         meta: { supersededAskId: askId },
       });
-      if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
       return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
     }
 
@@ -501,28 +499,26 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
       if (!failedTask) {
         // 后继已接管：本问答失效，不 supersede / 不 clear / 不写断开事件 / 不发 done
-        const info = await appendEvent(task.id, {
+        // R29-1：写+publish 同链
+        await writeEventAndPublish(task.id, {
           kind: "info",
           actionId: reqEvent.actionId,
           text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
           meta: { supersededAskId: askId },
         });
-        if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
         return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
       }
 
       await supersedePendingAsks(task.id, "会话已失效");
       clearPendingAsk(task.id);
-      const errorEvent = await appendEvent(task.id, {
+      // R29-1：断开审计事件写+publish 同链；task/done envelope 仍走 publishTaskStreamEvent
+      await writeEventAndPublish(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
         text: isChat
           ? "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可继续。"
           : "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
       });
-      if (errorEvent) {
-        publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
-      }
       publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
       publishTaskStreamEvent(task.id, {
         kind: "done",
@@ -617,7 +613,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
   clearPendingAsk(task.id);
 
   const actionId = reqEvent.actionId;
-  const replyEvent = await appendEvent(task.id, {
+  // R29-1：已答事件写+publish 同链（用户操作无条件语义）
+  await writeEventAndPublish(task.id, {
     kind: "ask_user_reply",
     actionId,
     text: replyText,
@@ -629,9 +626,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       ...(allSaved.length > 0 ? { images: allSaved } : {}),
     },
   });
-  if (replyEvent) {
-    publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
-  }
 
   // R20-2：删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running

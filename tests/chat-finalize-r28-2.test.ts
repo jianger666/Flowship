@@ -321,8 +321,14 @@ describe("R28-2 finalizeChatRunIfCurrent", () => {
       expect(getChatQueueCount(TASK_ID)).toBe(queueBefore);
       expect(doneEvents.length).toBe(0);
       const meta = await readMetaV06(TASK_ID);
-      // forceClear 会异步清锚点、与 B 回填竞态——以内存会话 + runStatus 为准
+      // R29-3：forceClear 改条件清锚点——不得抹 B 刚落盘的 sessionAgentId（原注释假阴性已补）
       expect(meta?.runStatus).toBe("running");
+      for (let i = 0; i < 40; i++) {
+        const m = await readMetaV06(TASK_ID);
+        if (m?.sessionAgentId === AGENT_B) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect((await readMetaV06(TASK_ID))?.sessionAgentId).toBe(AGENT_B);
 
       // 收尾 B
       clearFailpoints();

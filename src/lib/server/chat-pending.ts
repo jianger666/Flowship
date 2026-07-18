@@ -21,6 +21,8 @@ import type { WebStandardStreamableHTTPServerTransport } from "@modelcontextprot
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
+// R29-3：cleanup 时顺带清事件 seq counter（与 pending/notifier 同生命周期）
+import { clearEventSeqCounter } from "./task-fs-core";
 
 // ----------------- 类型 -----------------
 
@@ -223,6 +225,8 @@ export const cleanupChatTaskState = (taskId: string): void => {
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
   expectedCallerTokens.delete(taskId);
+  // R29-3：DELETE / stop 清理链顺带清 seq，防 counter 泄漏
+  clearEventSeqCounter(taskId);
 };
 
 /** R24-6：MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */
@@ -341,23 +345,30 @@ export const runTaskAction = async (
   }
 };
 
+/** R29：submit_work 通知结果——工具层据此决定返回「已交卷」还是重试错误 */
+export type NotifyAwaitingResult =
+  | { status: "delivered" }
+  | { status: "mismatch" }
+  | { status: "no_notifier" }
+  | { status: "error"; message: string };
+
 export const safeNotifyAwaiting = async (
   taskId: string,
   opts: { actionId?: string; artifactPath?: string; callerToken?: string } = {},
-): Promise<void> => {
+): Promise<NotifyAwaitingResult> => {
   // R24-6：submit_work 路径同样先核对——不匹配静默跳过（不启 postCheck）
   if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
     console.warn(
       `[chat-mcp] safeNotifyAwaiting: caller 不匹配 task=${taskId}、忽略`,
     );
-    return;
+    return { status: "mismatch" };
   }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
       `[chat-mcp] safeNotifyAwaiting: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
     );
-    return;
+    return { status: "no_notifier" };
   }
   try {
     // R25-3：notifier 内部 await 后仍须能复查 caller
@@ -371,11 +382,23 @@ export const safeNotifyAwaiting = async (
       },
       { callerStillValid },
     );
+    return { status: "delivered" };
   } catch (err) {
+    // R29：不再吞错——屏障超时（fail-closed）等 notifier 抛错要传回工具层，
+    // 否则 agent 收到假「已交卷」结束 turn、check 却从未启动
     console.error("[chat-mcp] awaiting notifier failed:", err);
+    return {
+      status: "error",
+      message: err instanceof Error ? err.message : String(err),
+    };
   }
 };
 
+/**
+ * 通知 runner 落 ask_user_request。
+ * @returns R29-2：true=已交给 notifier；false=caller mismatch / 无 notifier / notifier 抛错
+ *   （工具层据此 cancelPendingIf 反登记，避免孤儿 pending + 假 ASK_SUBMITTED）
+ */
 export const safeNotifyAskUserRequest = async (
   taskId: string,
   args: {
@@ -385,20 +408,20 @@ export const safeNotifyAskUserRequest = async (
     actionId?: string;
     callerToken?: string;
   },
-): Promise<void> => {
+): Promise<boolean> => {
   // R24-6：ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
   if (!matchExpectedCallerToken(taskId, args.callerToken)) {
     console.warn(
       `[chat-mcp] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
     );
-    return;
+    return false;
   }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
       `[chat-mcp] safeNotifyAskUserRequest: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
     );
-    return;
+    return false;
   }
   try {
     const callerStillValid = (): boolean =>
@@ -413,8 +436,10 @@ export const safeNotifyAskUserRequest = async (
       },
       { callerStillValid },
     );
+    return true;
   } catch (err) {
     console.error("[chat-mcp] ask_user_request notifier failed:", err);
+    return false;
   }
 };
 

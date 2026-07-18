@@ -407,13 +407,17 @@ export const ensureTaskWorktrees = async (
   task: Task,
   lease: () => boolean,
 ): Promise<EnsureWorktreesResult> => {
-  // R28-1：登记 resource job——finalize join 可等到本 ensure（嵌套调用 refcount 安全）
+  // R28-1：登记 resource job——finalize/stop/DELETE join 可等到本 ensure（嵌套调用 refcount 安全）
   beginResourceJob(task.id);
   try {
     // R28-1：lease 失效即抛（每个不可逆副作用前复用；不再可选）
     const assertLease = (): void => {
       if (!lease()) throw new WorktreeLeaseLostError();
     };
+    // R29-A：入场 ownership 快照——失主补偿比对用。
+    // 动态 import 避 task-worktrees → task-stream → task-fs → task-worktrees 静态环。
+    const { snapshotTaskOp } = await import("./task-stream");
+    const entryHandle = snapshotTaskOp(task.id);
     const infos = planWorktreeBranchInfos(task);
     // 混合隔离后 infos 只含 git 仓、跟 repoPaths 不再 index 对齐——按 repoPath 查
     const infoByRepo = new Map(infos.map((info) => [info.repoPath, info]));
@@ -431,6 +435,7 @@ export const ensureTaskWorktrees = async (
       clonedDeps,
       assertLease,
       lease,
+      entryHandle,
     });
   } finally {
     endResourceJob(task.id);
@@ -438,14 +443,37 @@ export const ensureTaskWorktrees = async (
 };
 
 /**
- * R28-1：失主补偿——尽力移除本轮新建的 worktree（含 git 注册）。
+ * R28-1 / R29-A：失主补偿——尽力移除本轮新建的 worktree（含 git 注册）。
  * copy/clone 段失主也走这里，避免终态任务留下物理工作区。
+ *
+ * R29-A 取舍：补偿前重新 snapshot + 查 runningTasks/agentSessions——
+ * 有后继 claim / 活跃工作区 → **不删**（宁可留孤儿 worktree，幂等 ensure 会复用/重建；
+ * 留给当前 owner / finalize 收），绝不能拆后继的活工作区。
  */
 const compensateRemoveCreatedWorktrees = async (
   task: Task,
   workPaths: string[],
   createdRepos: string[],
+  entryHandle: { opId: number | null; gen: number; claimSeq: number },
 ): Promise<void> => {
+  // R29-A：动态 import 避静态环；比对后继身份后再决定是否 remove
+  const { snapshotTaskOp, runningTasks, agentSessions } = await import(
+    "./task-stream"
+  );
+  const fresh = snapshotTaskOp(task.id);
+  const hasSuccessorClaim =
+    fresh.claimSeq !== entryHandle.claimSeq ||
+    (fresh.opId != null && fresh.opId !== entryHandle.opId);
+  const hasActiveSuccessor =
+    runningTasks.has(task.id) || agentSessions.has(task.id);
+  if (hasSuccessorClaim || hasActiveSuccessor) {
+    console.warn(
+      `[task-worktrees] R29-A：失主补偿跳过——后继已 claim/活跃（task=${task.id} claimSeq ${entryHandle.claimSeq}→${fresh.claimSeq} opId ${entryHandle.opId}→${fresh.opId} running=${runningTasks.has(task.id)} session=${agentSessions.has(task.id)}）、留孤儿 worktree 给当前 owner/finalize`,
+    );
+    createdRepos.length = 0;
+    return;
+  }
+
   for (const repoPath of [...createdRepos]) {
     const idx = task.repoPaths.indexOf(repoPath);
     if (idx < 0) continue;
@@ -480,6 +508,8 @@ const ensureTaskWorktreesInner = async (ctx: {
   clonedDeps: { repoPath: string; dirs: string[] }[];
   assertLease: () => void;
   lease: () => boolean;
+  /** R29-A：ensure 入场 ownership 快照（补偿身份比对） */
+  entryHandle: { opId: number | null; gen: number; claimSeq: number };
 }): Promise<EnsureWorktreesResult> => {
   const {
     task,
@@ -490,6 +520,7 @@ const ensureTaskWorktreesInner = async (ctx: {
     clonedDeps,
     assertLease,
     lease,
+    entryHandle,
   } = ctx;
 
   // R28-1：根目录 mkdir 前插桩 + 验 lease（旧实现 mkdir 在首次 lease 前）
@@ -499,7 +530,12 @@ const ensureTaskWorktreesInner = async (ctx: {
 
   /** 失主：补偿本轮新建后抛让位错 */
   const yieldAfterCompensate = async (): Promise<never> => {
-    await compensateRemoveCreatedWorktrees(task, workPaths, createdRepos);
+    await compensateRemoveCreatedWorktrees(
+      task,
+      workPaths,
+      createdRepos,
+      entryHandle,
+    );
     throw new WorktreeLeaseLostError();
   };
 

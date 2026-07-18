@@ -603,6 +603,24 @@ const nextEventSeq = (taskId: string): number => {
 };
 
 /**
+ * R29-3：appendFile 失败（ENOENT）时回退刚发的号——同步链内无并发，
+ * 仅当 counter 仍等于本次 seq 才回退，避免误伤后续成功写入。
+ */
+const rollbackEventSeq = (taskId: string, seq: number): void => {
+  const counters = getEventSeqCounters();
+  if (counters.get(taskId) !== seq) return;
+  if (seq <= 1) counters.delete(taskId);
+  else counters.set(taskId, seq - 1);
+};
+
+/**
+ * R29-3：任务删除 / cleanup 时清 seq counter，防同 id 复用（极少）或测试泄漏导致空洞错乱。
+ */
+export const clearEventSeqCounter = (taskId: string): void => {
+  getEventSeqCounters().delete(taskId);
+};
+
+/**
  * 实际 append（无串行）。
  * @returns true=已写入；false=ENOENT（任务目录已删、R27-7 透传给上层不 publish）
  */
@@ -650,15 +668,29 @@ export const appendEventLine = async (
   // R26-5：lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
   const run = async (): Promise<boolean> => {
     await failpoint("event.inQueue");
+    // R29-3：lease 拒绝路径不发号（不烧号）；发号紧挨即将 appendFile
     if (lease && !lease()) return false;
-    // R28-5：链内发号——与写盘 / publish 同序，不在入队前抢号
+    // R28-5 / R29-3：链内、lease 通过后发号——与写盘 / publish 同序
     ev.seq = nextEventSeq(id);
     // R27-7：ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
     const ok = await appendEventLineUnlocked(id, ev);
-    if (!ok) return false;
+    if (!ok) {
+      // R29-3：未落盘——回退刚发的号，避免烧号空洞
+      rollbackEventSeq(id, ev.seq);
+      delete ev.seq;
+      return false;
+    }
     // R28-5：写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
     await failpoint("event.beforePublish");
-    onCommitted?.(ev);
+    // R29：onCommitted（通常 publish）抛错不得断 append 链——写盘已成功，吞错继续放链
+    try {
+      onCommitted?.(ev);
+    } catch (err) {
+      console.error(
+        `[task-fs-core] onCommitted 抛错 task=${id} seq=${ev.seq}：`,
+        err,
+      );
+    }
     return true;
   };
   // previous 失败也跑本次写（.then(run, run)）；本次失败仍抛给 await 方

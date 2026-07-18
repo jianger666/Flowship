@@ -39,7 +39,6 @@
 import type { ModelSelection } from "@cursor/sdk";
 
 import {
-  appendEvent,
   getTask,
   setTaskRunStatus,
   updateTaskFields,
@@ -83,7 +82,10 @@ import {
   releaseChatStart,
   tryReserveChatStart,
 } from "@/lib/server/chat-gate";
-import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import {
+  publishTaskStreamEvent,
+  writeEventAndPublish,
+} from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
@@ -246,15 +248,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const persistUserReply = async (checkpointed: boolean) => {
     const meta: Record<string, unknown> = { ...userReplyMeta };
     if (checkpointed) meta.checkpointed = true;
-    const replyEvent = await appendEvent(task.id, {
+    // R29-1：用户回复事件写+publish 同链
+    return writeEventAndPublish(task.id, {
       kind: "user_reply",
       text: text || fallbackText,
       meta: Object.keys(meta).length > 0 ? meta : undefined,
     });
-    if (replyEvent) {
-      publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
-    }
-    return replyEvent;
   };
 
   /** 落 user_reply +（可选）rewind 点；快照须已在 agent 开工前打完 */
@@ -572,7 +571,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
             meta.attachments = head.attachmentMetas;
           }
           if (capture.ok) meta.checkpointed = true;
-          const replyEvent = await appendEvent(task.id, {
+          // R29-1：队列补给 user_reply 写+publish 同链
+          const replyEvent = await writeEventAndPublish(task.id, {
             kind: "user_reply",
             text: head.displayText,
             meta: Object.keys(meta).length > 0 ? meta : undefined,
@@ -581,10 +581,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
             // user_reply 已落盘：后续若 setTaskRunStatus 等失败、塞回时须 skipPersistEvent，
             // 否则 flush 补给会再落一条重复气泡
             replyEventPersisted = true;
-            publishTaskStreamEvent(task.id, {
-              kind: "event",
-              event: replyEvent,
-            });
             if (capture.ok) {
               await persistCheckpointForReply(task.id, replyEvent.id, capture);
             }
@@ -714,13 +710,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
       const n = getChatQueueCount(task.id);
       clearChatQueue(task.id);
       try {
-        const infoEvent = await appendEvent(task.id, {
+        // R29-1：清队系统通知写+publish 同链
+        await writeEventAndPublish(task.id, {
           kind: "info",
           text: `会话未能启动，${n} 条排队消息未送达、请重新发送`,
         });
-        if (infoEvent) {
-          publishTaskStreamEvent(task.id, { kind: "event", event: infoEvent });
-        }
       } catch (logErr) {
         console.warn(
           `[chat-reply] 清队后写 info 失败 task=${task.id}:`,

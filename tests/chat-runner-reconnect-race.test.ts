@@ -172,7 +172,8 @@ describe("自动重连退避 × 用户同 agentId resume 并发（H2/J1）", () 
       expect(await sendChatMessage(task, "触发网络失败的消息")).toBe("sent");
 
       // 等到：重连第 1 次醒来 resume 出 R → R.send(reconnect prompt) 失败 → R 已摘表
-      //（此刻 retry 已带着 R 的 instanceId 进入第 2 次退避）
+      //（此刻 retry 带着 R 的 instanceId 进入第 2 次退避；R29-4：map 空时 attempt≥2
+      // preamble 不落盘，故以「R.send 已失败 + map 空」作进入 4s 退避的信号，不弱化）
       await vi.waitFor(
         () => {
           expect(agentRSend).toHaveBeenCalledTimes(1);
@@ -180,16 +181,13 @@ describe("自动重连退避 × 用户同 agentId resume 并发（H2/J1）", () 
         },
         { timeout: 8_000, interval: 50 },
       );
-
-      // 第 2 次「重连中」落盘 = 已进入 4s 退避窗口（比固定 sleep 更稳）
-      await vi.waitFor(
-        async () => {
-          const events = await readEvents(TASK_ID);
-          expect(hasReconnectingEvent(events, 2)).toBe(true);
-        },
-        { timeout: 8_000, interval: 50 },
-      );
       const secondBackoffAt = Date.now();
+      // R29-4 回归：第 1 次持槽仍落盘；第 2 次 map 空不落盘（防污染 B 时间线）
+      {
+        const events = await readEvents(TASK_ID);
+        expect(hasReconnectingEvent(events, 1)).toBe(true);
+        expect(hasReconnectingEvent(events, 2)).toBe(false);
+      }
 
       // 退避窗口内：用户 chat-reply 用同一持久化 agentId resume 出新实例 U 并启动自己的 run
       //（chat-reply 的 owner 姿势：claimRun + ownerInstanceId）

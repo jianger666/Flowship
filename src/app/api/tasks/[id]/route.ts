@@ -25,6 +25,7 @@ import {
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import {
+  hasResourceJobs,
   isTaskStarting,
   pendingStopRequests,
   revokeTaskOps,
@@ -41,6 +42,7 @@ import {
   isChatRewindInProgress,
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
+import { clearActionSideEffects } from "@/lib/server/action-side-effects";
 import { cleanupCheckpointRefsForTask } from "@/lib/server/chat-checkpoint";
 import type { ModelSelection } from "@/lib/types";
 
@@ -50,6 +52,8 @@ const DELETE_REWIND_WAIT_MS = 30_000;
 /** U1：等 Agent.create/send 飞行窗口退出（waitFor* 只等可见 record） */
 const DELETE_STARTING_POLL_MS = 100;
 const DELETE_STARTING_WAIT_MS = 8_000;
+/** R29-A：等 resourceJobs 归零（与 finalize/stop join 对齐、覆盖 advance 首段 ensure） */
+const DELETE_RESOURCE_WAIT_MS = 30_000;
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -277,6 +281,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // DELETE 到达时 owner 能感知并中止（勿只 release——旧请求无从发现）。
     cancelChatStart(id);
     cleanupChatTaskState(id);
+    // R29-C：清 action 屏障 Map——防 DELETE 后工具 wait 永久挂死泄漏
+    clearActionSideEffects(id);
     // V0.8.18：连带杀掉可能还在后台跑的后置 check 子进程（删 task 后 check 跑完也无处落、防孤儿）
     abortRunningCheck(id);
     // cancel 只是发信号、run 的 finally 还会写 events.jsonl——不等它真退就 rm、
@@ -284,14 +290,16 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
     await waitForTaskToStop(id, 8000);
     await waitForChatToStop(id, 8000);
-    // U1：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
-    // 再轮询等 startingTasks 退出，超时打 warn 继续（pendingStop 仍在、启动链会自裁）
-    if (isTaskStarting(id)) {
-      const deadline = Date.now() + DELETE_STARTING_WAIT_MS;
-      while (isTaskStarting(id)) {
+    // U1 / R29-A：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
+    // 再轮询等 startingTasks **或** resourceJobs 退出（advance 首段 ensure 在
+    // beginTaskStarting 之前、靠 hasResourceJobs 覆盖），超时打 warn 继续。
+    if (isTaskStarting(id) || hasResourceJobs(id)) {
+      const deadline =
+        Date.now() + Math.max(DELETE_STARTING_WAIT_MS, DELETE_RESOURCE_WAIT_MS);
+      while (isTaskStarting(id) || hasResourceJobs(id)) {
         if (Date.now() >= deadline) {
           console.warn(
-            `[DELETE /api/tasks/[id]] startingTasks 等待超时 task=${id}、继续删（pendingStop 仍在、启动链会自裁）`,
+            `[DELETE /api/tasks/[id]] starting/resourceJobs 等待超时 task=${id}、继续删（pendingStop 仍在、启动链会自裁）`,
           );
           break;
         }

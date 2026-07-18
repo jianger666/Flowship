@@ -17,21 +17,19 @@
  */
 
 import { ACTION_LABEL, type Task } from "@/lib/types";
-import {
-  appendEvent,
-  finalizeStaleAndIdleLocked,
-  getTask,
-} from "./task-fs";
+import { finalizeStaleAndIdleLocked, getTask } from "./task-fs";
 import {
   abortRunningCheck,
   cancelTaskRun,
   supersedePendingAsks,
 } from "./task-runner";
 import {
+  hasResourceJobs,
   isTaskStarting,
   pendingStopRequests,
   publishTaskStreamEvent,
   revokeTaskOps,
+  writeEventAndPublish,
 } from "./task-stream";
 import { cancelChatRun } from "./chat-runner";
 import { clearChatQueue } from "./chat-queue";
@@ -47,6 +45,7 @@ import {
   cleanupChatTaskState,
   invalidateCallerToken,
 } from "./chat-pending";
+import { clearActionSideEffects } from "./action-side-effects";
 import { getTaskWorkRepoPaths } from "./task-worktrees";
 
 type StopResult = { hadAgent: boolean; task: Task };
@@ -109,6 +108,20 @@ const runStopTaskAgent = async (
       invalidateCallerToken(id);
     }
 
+    // R29-A：revoke 后 join resourceJobs（对照 finalizeTask）——等在飞 ensure/worktree
+    // 归零再收尾；上限 30s、超时 warn 继续（lease/revoke 已挡后续副作用）。
+    {
+      const deadline = Date.now() + 30_000;
+      while (hasResourceJobs(id) && Date.now() < deadline) {
+        await new Promise<void>((r) => setTimeout(r, 50));
+      }
+      if (hasResourceJobs(id)) {
+        console.warn(
+          `[stop-task] R29-A：task=${id} 等待 resourceJobs 归零超时（~30s）、继续收尾`,
+        );
+      }
+    }
+
     // R23-6 / R25-1：stop.afterGate 保留在 revoke 后、锁内收尾事务前（矩阵依赖此窗口）。
     // 旧实现在此无锁 getTask 重读——可与 append 的 commit rename await 交错漏扫；
     // 现改为 finalizeStaleAndIdleLocked 同把 task lock，见该 helper 线性化注释。
@@ -131,6 +144,8 @@ const runStopTaskAgent = async (
       pendingStopRequests.delete(id);
     }
     cleanupChatTaskState(id);
+    // R29-C：清 action 屏障 Map——防 stop 后 submit_work 永久挂在 wait 上泄漏
+    clearActionSideEffects(id);
     // V0.8.18：取消正在后台跑的后置 check（杀 lint/typecheck 子进程、丢弃结果、不让它在停止后冒「产出完成」）
     abortRunningCheck(id);
 
@@ -170,15 +185,21 @@ const runStopTaskAgent = async (
         : opts.trigger === "exclude"
           ? `划除时自动停止了${actionLabel}（agent 已中断、可重新「推进」）`
           : `用户停止了${actionLabel}（agent 已中断、可重新「推进」）`;
-    const stopEvent = await appendEvent(id, {
+    // R29-P2d：用户 stop 操作——无条件 writeEventAndPublish（不带 lease）
+    // （stop-task 不在 R27-6 no-restricted-syntax 文件名单内，无需 eslint-disable）
+    await writeEventAndPublish(id, {
       kind: "info",
       actionId: current?.id,
       text: stopText,
     });
 
     const fresh = (await getTask(id)) ?? live;
+    // task 快照仍需单独 publish（writeEventAndPublish 只推 event envelope）
     publishTaskStreamEvent(id, { kind: "task", task: fresh });
-    if (stopEvent) publishTaskStreamEvent(id, { kind: "event", event: stopEvent });
+    // R29：stop 作为 lifecycle owner 补发 task 级 done——旧 run 的 cancelled 收尾在
+    // revoke 后被 publishIfCurrent 正确拒发、但前端 streamingText 靠 done 解挂；
+    // 纯 stop（无后继 run）场景没人再发 done、这里由终态 owner 无条件补上。
+    publishTaskStreamEvent(id, { kind: "done", task: fresh, ok: true });
 
     return { hadAgent, task: fresh };
   } finally {

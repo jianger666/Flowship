@@ -951,6 +951,8 @@ const advanceTaskCore = async (
   // V0.10：隔离工作区 task → 推进前确定性建 / 复用 worktree（幂等、已存在秒过）。
   //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
   //   创建失败直接抛（带处置建议）、不带病起 agent。
+  // R29-A：本段在 beginTaskStarting / claim 之前——靠 ensure 内 beginResourceJob
+  // 登记；stop/DELETE join 已扩 hasResourceJobs，无需前移 starting 登记。
   if (isWorktreeTask(task)) {
     // R27-2 / R28-1：advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
     // lease 失效抛 WorktreeLeaseLostError → 转 stale、不得 upsert / 写事件）
@@ -965,10 +967,15 @@ const advanceTaskCore = async (
       throw err;
     }
     // 仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值、跟 build hint 老规则一致）
+    // R29-P2a：finalGuard = admission lease（失主拒写）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
       if (!existingRepos.has(info.repoPath)) {
-        await upsertGitBranch(task.id, info);
+        await upsertGitBranch(
+          task.id,
+          info,
+          () => !isTaskOpStale(task.id, opGen),
+        );
       }
     }
     const cloneNote =
@@ -1428,12 +1435,13 @@ const resumeCurrentActionCore = async (
       }
       throw err;
     }
+    // R29-P2a：resume 链 upsert 带 opHandle finalGuard
     const existingRepos = new Set(
       (startTask.gitBranches ?? []).map((b) => b.repoPath),
     );
     for (const info of ensured.infos) {
       if (!existingRepos.has(info.repoPath)) {
-        await upsertGitBranch(fresh.id, info);
+        await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
       }
     }
     startTask = (await getTask(fresh.id)) ?? startTask;
@@ -1828,8 +1836,13 @@ export const buildSessionBridges = (
         };
       }
 
-      // R28-4：登记 in-flight side effect——submit_work 启动 check 前会等这段结束
-      beginActionSideEffect(task.id, mr.actionId, "submit_mr");
+      // R28-4 / R29-P2c：登记 in-flight side effect——同 action 并行 submit_mr 互斥
+      if (!beginActionSideEffect(task.id, mr.actionId, "submit_mr")) {
+        return {
+          ok: false,
+          error: "同 action 的 MR 提交正在进行、稍后重试",
+        };
+      }
       try {
         // R25-3 / R25-5：host/getTask/校验 await 之后、caller 复查之前插桩——
         // 测试可在此前一个 await 注入换主，断言复查拦住 createMR
@@ -2245,11 +2258,21 @@ export const buildSessionBridges = (
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       // R24-1：postCheck 独立租约、不传 run opHandle
-      // R28-4：同 action 有在飞 submit_mr → 先等其结束再启 check（优先等待、不拒 agent）
+      // R28-4 / R29-C：同 action 有在飞 submit_mr → 先等其结束再启 check；
+      // 超时 fail-closed（拒启 check、工具错误让 agent 重试 submit_work）
       await failpoint("mcp.submitWork.beforeCheckStart");
       if (!callerStillValid()) return;
-      await waitForActionSideEffectClear(task.id, signal.actionId);
+      const barrier = await waitForActionSideEffectClear(
+        task.id,
+        signal.actionId,
+      );
       if (!callerStillValid()) return;
+      if (barrier === "timeout") {
+        // R29-C：不 abort、不 warn 后继续——给 agent 可重试的工具错误
+        throw new Error(
+          "MR 提交仍在进行、稍后重试 submit_work",
+        );
+      }
       // R26-4：abort runningChecks 之前先锁内验 current+running——旧 action 迟到不得杀 B 的 check
       await failpoint("mcp.submitWork.beforeAbortCheck");
       if (!callerStillValid()) return;
@@ -2585,6 +2608,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                 undefined,
                 opGen,
                 action.id,
+                undefined,
+                opHandle,
               )
             ) {
               unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
@@ -2623,7 +2648,15 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               return null;
             }
             // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 无缝接回
-            void setTaskSessionAgentId(task.id, created.agentId);
+            // R29-P2b：finalGuard = 本 session 仍是当前注册（防迟到 set 盖后继锚点）
+            void setTaskSessionAgentId(task.id, created.agentId, () => {
+              const s = agentSessions.get(task.id);
+              return (
+                !!s &&
+                s.agentId === created.agentId &&
+                s.agent === created
+              );
+            });
 
             // 收割 create 前发起的并行加载（见上）——skills 注入 prompt、identity 拼发起人行
             const perfPromptStart = Date.now();
@@ -2664,6 +2697,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                 opGen,
                 action.id,
                 agentSessions.get(task.id)?.instanceId,
+                opHandle,
               )
             ) {
               unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
@@ -2767,6 +2801,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               agentSessions.get(task.id)?.agent === failedAgent
                 ? agentSessions.get(task.id)?.instanceId
                 : undefined,
+              opHandle,
             )
           ) {
             unsetChatAwaitingNotifierIf(task.id, bridges.awaitingNotifier);
@@ -3305,6 +3340,8 @@ const applyPendingStopIfRequested = async (
   /** R18-2：本 run 绑定的 action；只 patch 它，不扫全表 */
   ownActionId?: string,
   expectedSessionInstanceId?: number,
+  /** R29-B：有则 done 走 publishIfCurrent；失主（B takeover）不发 done */
+  opHandle?: TaskOpHandle,
 ): Promise<boolean> => {
   const pending = pendingStopRequests.has(task.id);
   const lifecycle = getChatLifecycle(task.id);
@@ -3319,12 +3356,23 @@ const applyPendingStopIfRequested = async (
     expectedSessionInstanceId,
   );
 
+  /** R29-B：done 门控——有 opHandle 用 isTaskOpCurrent；否则用 gen 未 stale */
+  const stillCurrentForDone = (): boolean =>
+    opHandle
+      ? isTaskOpCurrent(opHandle)
+      : opGen === undefined || getTaskOpGeneration(task.id) === opGen;
+
   // lifecycle 进行中或 gen 已 bump：状态和停止事件由 stop/DELETE owner 写
   if (lifecycle !== null || genStale) {
     // gen 不匹配且 lifecycle 已释放：owner 收尾已写完，只补 done 解挂 UI
+    // R29-B：后继已 claim 则不发（失主不得清 B 的 streamingText）
     if (genStale && lifecycle === null) {
       const fresh = await getTask(task.id);
-      publish(task.id, { kind: "done", task: fresh ?? task, ok: true });
+      publishIfCurrent(task.id, stillCurrentForDone, {
+        kind: "done",
+        task: fresh ?? task,
+        ok: true,
+      });
     }
     return true;
   }
@@ -3337,7 +3385,11 @@ const applyPendingStopIfRequested = async (
   const ownStillOpen =
     !!own && (own.status === "running" || own.status === "awaiting_ack");
   if (fresh?.runStatus === "idle" && !ownStillOpen) {
-    publish(task.id, { kind: "done", task: fresh, ok: true });
+    publishIfCurrent(task.id, stillCurrentForDone, {
+      kind: "done",
+      task: fresh,
+      ok: true,
+    });
     return true;
   }
 
@@ -3356,13 +3408,21 @@ const applyPendingStopIfRequested = async (
         },
       )
     : null;
-  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：用户 stop 操作生效通知
-  await writeEventAndPublish(task.id, {
-    kind: "info",
-    text: "停止请求已生效（启动期间点击的停止）",
-  });
+  // R29-P2e：用户 stop 生效通知——温和门控失主不写（不影响过渡语义）
+  if (stillCurrentForDone()) {
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：用户 stop 操作生效通知
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: "停止请求已生效（启动期间点击的停止）",
+    });
+  }
+  // R29-B：setTaskRunStatusIfRunOwner 返 null 不再兜底 publish(updated ?? task)
   if (updated) publish(task.id, { kind: "task", task: updated });
-  publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+  publishIfCurrent(task.id, stillCurrentForDone, {
+    kind: "done",
+    task: updated ?? fresh ?? task,
+    ok: true,
+  });
   return true;
 };
 
@@ -3513,6 +3573,7 @@ const consumeSessionRun = async (
           opts.opHandle.gen,
           opts.errorActionId,
           mySessionInstanceId,
+          opts.opHandle,
         )
       ) {
         return;
@@ -3599,11 +3660,14 @@ const consumeSessionRun = async (
       if (isForkPending) {
         forkPendingTasks.delete(task.id);
         // 换新 agent：会话由 advance 的 force-new 分支显式关（reap:false）、这里不动
-        // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
-        await writeEventAndPublish(task.id, {
-          kind: "info",
-          text: "旧 agent 已收尾、正在为推进起新 agent...",
-        });
+        // R29-P2e：温和门控——失主不写；forkPending 时 handle 仍 current、不受影响
+        if (isTaskOpCurrent(opts.opHandle)) {
+          // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+          await writeEventAndPublish(task.id, {
+            kind: "info",
+            text: "旧 agent 已收尾、正在为推进起新 agent...",
+          });
+        }
         return;
       }
       // 问一问的 run 被停：只是不想听它说了——action / 会话都不动、runStatus 归回等待位
@@ -3620,11 +3684,16 @@ const consumeSessionRun = async (
         // R25-4：await 后复查再发 done
         await failpoint("question.beforeDone");
         if (lostStartOwner()) return;
-        publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
+        publishIfCurrent(
+          task.id,
+          () => isTaskOpCurrent(opts.opHandle),
+          { kind: "done", task: freshQ ?? task, ok: true },
+        );
         return;
       }
       // 正常 cancel（停止 / 硬超时触发）→ 只收尾本 run 绑定的 action + 关运行时状态 + 关会话
       // R18-2：不得 finalizeStaleActions 全表扫（会把后继 B 的新 action 一并 cancelled）
+      // R29-B：done 走 publishIfCurrent——B takeover 后失主不发 done envelope
       if (yieldIfSuperseded()) return;
       await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
       // R18-3：锁内 instanceId CAS——await 期间被接管则不写 idle
@@ -3634,7 +3703,11 @@ const consumeSessionRun = async (
         () => isTaskOpCurrent(opts.opHandle),
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
-      publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+      publishIfCurrent(
+        task.id,
+        () => isTaskOpCurrent(opts.opHandle),
+        { kind: "done", task: updated ?? task, ok: true },
+      );
       closeMySession();
       return;
     }
@@ -3772,14 +3845,17 @@ const consumeSessionRun = async (
           if (yieldIfSuperseded()) return;
           if (forkPendingTasks.has(task.id)) {
             forkPendingTasks.delete(task.id);
-            // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
-            await writeEventAndPublish(task.id, {
-              kind: "info",
-              text: "旧 agent 已收尾、正在为推进起新 agent...",
-            });
+            // R29-P2e：温和门控——失主不写
+            if (isTaskOpCurrent(opts.opHandle)) {
+              // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+              await writeEventAndPublish(task.id, {
+                kind: "info",
+                text: "旧 agent 已收尾、正在为推进起新 agent...",
+              });
+            }
             return;
           }
-          // R18-2/3：只 patch 本 action + 锁内 owner 写 idle + session instanceId 关门
+          // R18-2/3 / R29-B：只 patch 本 action + 锁内 owner 写 idle；done 走 publishIfCurrent
           await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
           const updated = await setTaskRunStatusIfRunOwner(
             task.id,
@@ -3787,7 +3863,11 @@ const consumeSessionRun = async (
             () => isTaskOpCurrent(opts.opHandle),
           );
           if (updated) publish(task.id, { kind: "task", task: updated });
-          publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+          publishIfCurrent(
+            task.id,
+            () => isTaskOpCurrent(opts.opHandle),
+            { kind: "done", task: updated ?? task, ok: true },
+          );
           closeMySession();
           return;
         }
@@ -3822,11 +3902,14 @@ const consumeSessionRun = async (
             if (yieldIfSuperseded()) return;
             if (forkPendingTasks.has(task.id)) {
               forkPendingTasks.delete(task.id);
-              // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
-              await writeEventAndPublish(task.id, {
-                kind: "info",
-                text: "旧 agent 已收尾、正在为推进起新 agent...",
-              });
+              // R29-P2e：温和门控——失主不写
+              if (isTaskOpCurrent(opts.opHandle)) {
+                // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+                await writeEventAndPublish(task.id, {
+                  kind: "info",
+                  text: "旧 agent 已收尾、正在为推进起新 agent...",
+                });
+              }
               return;
             }
             await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
@@ -3836,7 +3919,11 @@ const consumeSessionRun = async (
               () => isTaskOpCurrent(opts.opHandle),
             );
             if (updated) publish(task.id, { kind: "task", task: updated });
-            publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+            publishIfCurrent(
+              task.id,
+              () => isTaskOpCurrent(opts.opHandle),
+              { kind: "done", task: updated ?? task, ok: true },
+            );
             closeMySession();
             return;
           }
@@ -4032,8 +4119,13 @@ const consumeSessionRun = async (
             "idle",
             () => isTaskOpCurrent(opts.opHandle),
           );
+          // R29-B：返 null 不兜底 publish；done 走 publishIfCurrent
           if (updated) publish(task.id, { kind: "task", task: updated });
-          publish(task.id, { kind: "done", task: updated ?? task, ok: true });
+          publishIfCurrent(
+            task.id,
+            () => isTaskOpCurrent(opts.opHandle),
+            { kind: "done", task: updated ?? task, ok: true },
+          );
           closeMySession();
         }
       } else {
@@ -4763,6 +4855,7 @@ const sendToTaskSessionBody = async (
             opGen,
             opts.errorActionId,
             mySessionInstanceId,
+            entryOpHandle,
           )
         ) {
           return "stale";
@@ -4804,6 +4897,7 @@ const sendToTaskSessionBody = async (
           opGen,
           opts.errorActionId,
           mySessionInstanceId,
+          entryOpHandle,
         )
       ) {
         return "stale";

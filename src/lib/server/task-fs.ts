@@ -743,8 +743,11 @@ export const setTaskRemoveSourceBranchOnMerge = async (
   });
 
 /**
- * V0.11.1：落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
+ * V0.11.1 / R29-P2b：落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
  * 不动 updatedAt（纯运行时锚点、与任务活跃度无关）。best-effort：调用方一般 void 掉。
+ *
+ * R29-P2b：set 与 clear 对称——走 prepareMetaWrite + commit(finalGuard)；
+ * 调用方传「本 session 仍是当前注册」闭包，堵 read/write await 夹缝里被后继覆盖。
  *
  * X4（十七轮）：错误在函数内部消化、绝不 reject——调用方几十处都是 fire-and-forget
  * `void setTaskSessionAgentId(...)`，任一处漏 .catch 都会在「任务目录刚被 DELETE 删掉」
@@ -754,13 +757,27 @@ export const setTaskRemoveSourceBranchOnMerge = async (
 export const setTaskSessionAgentId = async (
   id: string,
   agentId: string | undefined,
+  /** R29-P2b：可选 finalGuard——rename 前同步复查（调用方现查，非入场快照） */
+  finalGuard?: () => boolean,
 ): Promise<void> => {
   try {
     await withTaskLock(id, async () => {
+      if (finalGuard && !finalGuard()) return;
       const meta = await readMetaV06(id);
       if (!meta) return;
       meta.sessionAgentId = agentId;
-      await writeMeta(meta);
+      if (finalGuard) {
+        // R29-P2b：条件事务——与 clearTaskSessionAgentIdIf 对称
+        const prepared = await prepareMetaWrite(meta);
+        const guard = (): boolean => !finalGuard || finalGuard();
+        if (!guard()) {
+          await prepared.abort();
+          return;
+        }
+        await prepared.commit(guard);
+      } else {
+        await writeMeta(meta);
+      }
     });
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
@@ -1606,12 +1623,16 @@ export const setTaskRepoStatus = async (
  *
  * - 按 `repoPath` 匹配：已有同 repoPath 则替换、否则 append
  * - build / worktree 首次建条目时写入；之后可 patch baseBranch
+ * - R29-P2a：可选 isOwner 合进 finalGuard（ensure 成功后的迟到 upsert 不得在失主后落盘）
  */
 export const upsertGitBranch = async (
   taskId: string,
   gitBranch: GitBranchInfo,
+  /** R29-P2a：可选 owner lease——合进 commit(finalGuard) */
+  isOwner?: () => boolean,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
+    if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
     // R26-1：终态拒写——finalize 后 prewarm 迟到不得重建 gitBranches
@@ -1624,9 +1645,10 @@ export const upsertGitBranch = async (
         ? existing.map((b, i) => (i === idx ? gitBranch : b))
         : [...existing, gitBranch];
     meta.updatedAt = Date.now();
-    // R26-1 / R26-5：走 prepare+commit(finalGuard) 体系
+    // R26-1 / R26-5 / R29-P2a：走 prepare+commit(finalGuard) 体系
     const prepared = await prepareMetaWrite(meta);
-    const finalGuard = (): boolean => !isTerminalRepoStatus(meta.repoStatus);
+    const finalGuard = (): boolean =>
+      !isTerminalRepoStatus(meta.repoStatus) && (!isOwner || isOwner());
     if (!finalGuard()) {
       await prepared.abort();
       return null;

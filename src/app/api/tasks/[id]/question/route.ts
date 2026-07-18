@@ -15,7 +15,6 @@
  */
 
 import {
-  appendEvent,
   getTask,
   patchActionAndRunStatusIfOpFresh,
   setTaskRunStatusIfRunOwner,
@@ -39,6 +38,7 @@ import {
   publishTaskStreamEvent,
   runningTasks,
   waitForTaskToStop,
+  writeEventAndPublish,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
@@ -300,7 +300,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
-  const questionEvent = await appendEvent(task.id, {
+  // R29-1：用户提问事件写+publish 同链
+  await writeEventAndPublish(task.id, {
     kind: "user_reply",
     actionId: task.currentActionId ?? undefined,
     text: text || "(用户附了图片 / 文件提问)",
@@ -311,9 +312,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
       ...(attachmentPaths.length > 0 ? { attachments: attachResult.metas } : {}),
     },
   });
-  if (questionEvent) {
-    publishTaskStreamEvent(task.id, { kind: "event", event: questionEvent });
-  }
 
   // send 成功且产出在等审阅：action 回 running（agent 处理完会重新交卷回 awaiting_ack）——
   // 原 revise 的状态机语义、防「artifact 在改、UI 还显示等审阅」
@@ -364,11 +362,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
       opGen,
     }).catch(async (err) => {
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
-      const ev = await appendEvent(task.id, {
+      // R29-1：唤醒失败审计事件写+publish 同链
+      await writeEventAndPublish(task.id, {
         kind: "error",
         text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,
       });
-      if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
     });
     const fresh = await getTask(task.id);
     return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {

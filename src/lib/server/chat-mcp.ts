@@ -30,6 +30,7 @@ import { z } from "zod";
 
 import {
   CALLER_MISMATCH_ERROR,
+  cancelPendingIf,
   matchExpectedCallerToken,
   registerPendingAsk,
   runTaskAction,
@@ -38,6 +39,9 @@ import {
   sessionTransports,
   type AskUserQuestion,
 } from "./chat-pending";
+
+/** R29-2：notify 未送达时工具返回（反登记后、非 ASK_SUBMITTED） */
+const ASK_NOTIFY_FAILED_TEXT = "任务已被接管/通知失败、请重试";
 import { createCustomAction } from "./custom-action-fs";
 import { findSkillByName } from "./skills-loader";
 
@@ -165,11 +169,26 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       }
 
       // 交卷：通知 runner（后台跑 check + 切 awaiting_ack、见 task-runner awaitingNotifier）
-      await safeNotifyAwaiting(task_id, {
+      const notifyResult = await safeNotifyAwaiting(task_id, {
         actionId: action_id,
         artifactPath: artifact_path,
         callerToken,
       });
+      // R29：notifier 抛错（如同 action 的 submit_mr 屏障超时 fail-closed）不再吞——
+      // 返回真实错误让 agent 稍后重试 submit_work，而不是假「已交卷」结束 turn
+      if (notifyResult.status === "error") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `交卷未受理：${notifyResult.message}`,
+            },
+          ],
+        };
+      }
+      if (notifyResult.status === "mismatch") {
+        return callerMismatchContent();
+      }
 
       return {
         content: [{ type: "text" as const, text: submittedText(action_id) }],
@@ -285,13 +304,20 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       );
 
       // 通知 runner 写 ask_user_request 事件 + 切 runStatus = awaiting_user
-      await safeNotifyAskUserRequest(task_id, {
+      // R29-2：notify 早退（mismatch / 无 notifier）→ 反登记、返错误，防孤儿 pending + 假 ASK_SUBMITTED
+      const delivered = await safeNotifyAskUserRequest(task_id, {
         askId,
         token: ask.token,
         questions: normalized,
         actionId: action_id,
         callerToken,
       });
+      if (!delivered) {
+        cancelPendingIf(task_id, askId);
+        return {
+          content: [{ type: "text" as const, text: ASK_NOTIFY_FAILED_TEXT }],
+        };
+      }
 
       return {
         content: [{ type: "text" as const, text: askSubmittedText(askId) }],
@@ -902,13 +928,18 @@ export const dispatchAskUserForTest = async (args: {
     questions: args.questions,
     actionId: args.actionId,
   });
-  await safeNotifyAskUserRequest(args.taskId, {
+  // R29-2：与生产 ask_user 工具同口径——未送达则反登记
+  const delivered = await safeNotifyAskUserRequest(args.taskId, {
     askId,
     token: ask.token,
     questions: args.questions,
     actionId: args.actionId,
     callerToken: args.callerToken,
   });
+  if (!delivered) {
+    cancelPendingIf(args.taskId, askId);
+    return { ok: false, error: ASK_NOTIFY_FAILED_TEXT };
+  }
   return { ok: true, askId };
 };
 
