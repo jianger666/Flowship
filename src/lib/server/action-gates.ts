@@ -13,7 +13,9 @@
 import {
   DEFAULT_BRANCH_TEMPLATE,
   extractFeishuStoryId,
+  isSafeBranchName,
   renderBranchName,
+  sanitizeBranchName,
 } from "@/lib/branch-template";
 import {
   isTaskNonGitRepo,
@@ -26,6 +28,16 @@ import type {
   Task,
 } from "@/lib/types";
 import { ACTION_LABEL } from "@/lib/types";
+
+/** bash 单引号包裹：内部 `'` → `'\''`，防分支名里的 `;` `$()` 反引号等注入 */
+const shellQuoteSingle = (s: string): string =>
+  `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** 分支名清洗 + 白名单：非法则 sanitize；仍不安全则拒（返 null） */
+const safeBranchForHint = (raw: string): string | null => {
+  const cleaned = isSafeBranchName(raw) ? raw : sanitizeBranchName(raw);
+  return isSafeBranchName(cleaned) ? cleaned : null;
+};
 
 // 已实装的 action 类型（advanceTask 准入门槛 1）
 const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set([
@@ -183,20 +195,28 @@ export const planBranchesForBuild = (
   // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch）
   // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建）；否则按模板渲染。
   //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个、自动用对。
+  //   分支名过白名单（非法则清洗）；清洗后仍非法的仓不进 infos / hint（防命令注入）。
   const existing = task.gitBranches ?? [];
-  const infos: GitBranchInfo[] = repoPaths.map((repoPath) => {
+  const infos: GitBranchInfo[] = [];
+  for (const repoPath of repoPaths) {
     const old = existing.find((b) => b.repoPath === repoPath);
-    if (old) return old;
+    if (old) {
+      const safe = safeBranchForHint(old.name);
+      if (!safe) continue;
+      infos.push(safe === old.name ? old : { ...old, name: safe });
+      continue;
+    }
     const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
-    return {
-      repoPath,
-      name: explicitName || renderForRepo(repoPath),
-      baseBranch: "",
-    };
-  });
+    const rawName = explicitName || renderForRepo(repoPath);
+    const name = safeBranchForHint(rawName);
+    if (!name) continue;
+    infos.push({ repoPath, name, baseBranch: "" });
+  }
+  if (infos.length === 0) return null;
 
   // 多仓 hint：逐仓 idempotent checkout（branch 存在则 checkout、不存在则建）
-  const isMultiRepo = repoPaths.length > 1;
+  const hintRepos = infos.map((i) => i.repoPath);
+  const isMultiRepo = hintRepos.length > 1;
   // V0.6.3：每仓实际分支名取自 infos（可能因用户指定「已有工作分支」而各仓不同名）
   const uniqueNames = [...new Set(infos.map((i) => i.name))];
   const lines: string[] = [];
@@ -205,11 +225,11 @@ export const planBranchesForBuild = (
   if (isMultiRepo) {
     if (uniqueNames.length === 1) {
       lines.push(
-        `本 task 涉及 ${repoPaths.length} 个仓、共用同一 branch name：\`${uniqueNames[0]}\``,
+        `本 task 涉及 ${hintRepos.length} 个仓、共用同一 branch name：\`${uniqueNames[0]}\``,
       );
     } else {
       lines.push(
-        `本 task 涉及 ${repoPaths.length} 个仓、各仓 branch name 见下（部分仓指定了已有分支）`,
+        `本 task 涉及 ${hintRepos.length} 个仓、各仓 branch name 见下（部分仓指定了已有分支）`,
       );
     }
   } else {
@@ -221,25 +241,34 @@ export const planBranchesForBuild = (
   );
   lines.push("");
 
-  for (const repoPath of repoPaths) {
-    // V0.6.3：该仓实际分支名（用户指定的已有分支 or 模板渲染名）、下面 checkout 用它
-    const name =
-      infos.find((i) => i.repoPath === repoPath)?.name ??
-      renderForRepo(repoPath);
+  for (const info of infos) {
+    const repoPath = info.repoPath;
+    const name = info.name;
+    const qName = shellQuoteSingle(name);
     if (isMultiRepo) {
       lines.push(`### 仓 \`${repoPath}\``);
       lines.push("");
     }
     lines.push("```bash");
     if (isMultiRepo) {
-      lines.push(`cd ${repoPath}`);
+      lines.push(`cd ${shellQuoteSingle(repoPath)}`);
     }
     // V0.6.3：该仓的线上分支（建 task 时从 settings 快照、per-repo）。配了就用、没配回退探测
     const repoBase = task.repoBaseBranches?.[repoPath]?.trim();
     if (repoBase) {
+      const safeBase = safeBranchForHint(repoBase);
+      if (!safeBase) {
+        lines.push(
+          'echo "[error] 设置页线上分支名非法、放弃 checkout"',
+        );
+        lines.push("exit 1");
+        lines.push("```");
+        lines.push("");
+        continue;
+      }
       // 用户在设置页给这个仓配了线上分支 → 直接用、不探测（后端 develop 默认分支会误判）
       lines.push("# 线上分支由用户在设置页指定（per-repo）、不探测");
-      lines.push(`BASE=${JSON.stringify(repoBase)}`);
+      lines.push(`BASE=${shellQuoteSingle(safeBase)}`);
       lines.push("# 校验该分支在远程存在（防设置里填错名）");
       lines.push(
         'if ! git ls-remote --exit-code --heads origin "$BASE" >/dev/null 2>&1; then',
@@ -265,8 +294,11 @@ export const planBranchesForBuild = (
       lines.push("fi");
     }
     lines.push("# Idempotent：branch 已存在则 checkout、否则基于主分支建");
-    lines.push(`if git show-ref --verify --quiet refs/heads/${name}; then`);
-    lines.push(`  git checkout ${name}`);
+    // 分支名一律单引号包裹（防 ; $() 反引号 / 空格注入）
+    lines.push(
+      `if git show-ref --verify --quiet refs/heads/${qName}; then`,
+    );
+    lines.push(`  git checkout ${qName}`);
     lines.push("else");
     lines.push(
       // --no-track：feature 绝不 track 线上分支。否则 git 默认（autoSetupMerge=true、从 origin/<线上>
@@ -274,7 +306,7 @@ export const planBranchesForBuild = (
       //   误推线上、污染线上分支。--no-track 让新建分支不设 upstream；同名 upstream（origin/feature）
       //   由 ship 首次 `git push -u origin <feature>` 自然建立（-u 会覆盖、连存量脏分支也一并修回同名）。
       //   注：build 故意不主动 unset upstream——保住用户/ship 手动设好的同名 upstream、不打扰人手动推送。
-      `  git fetch origin "$BASE" && git checkout -b ${name} --no-track "origin/$BASE"`,
+      `  git fetch origin "$BASE" && git checkout -b ${qName} --no-track "origin/$BASE"`,
     );
     lines.push("fi");
     // V0.6.20 防御：checkout 后强制 verify 当前分支 == 目标分支。
@@ -282,13 +314,13 @@ export const planBranchesForBuild = (
     //   agent 没切分支直接在别的需求 feature 分支上改、污染了那个分支）。
     lines.push("# 防御：确认确实切到目标分支（不对就停、绝不在错分支改代码）");
     lines.push("CURRENT=$(git rev-parse --abbrev-ref HEAD)");
-    lines.push(`if [ "$CURRENT" != ${JSON.stringify(name)} ]; then`);
+    lines.push(`if [ "$CURRENT" != ${qName} ]; then`);
     lines.push(
-      `  echo "[error] 当前分支 $CURRENT != 目标分支 ${name}、停止 build（不要在错分支改代码、调 ask_user 报告用户等处理）"`,
+      `  echo "[error] 当前分支 $CURRENT != 目标分支 ${qName}、停止 build（不要在错分支改代码、调 ask_user 报告用户等处理）"`,
     );
     lines.push("  exit 1");
     lines.push("fi");
-    lines.push(`echo "[ok] 已在目标分支 ${name}"`);
+    lines.push(`echo "[ok] 已在目标分支 ${qName}"`);
     lines.push("```");
     lines.push("");
   }

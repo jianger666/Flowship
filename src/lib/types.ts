@@ -820,11 +820,66 @@ export type EventKind =
   | "action_start"
   | "action_ack"
   | "tool_call"
+  /**
+   * 工具执行完成结果（与 tool_call 靠 meta.callId 配对）。
+   * 落盘进 events.jsonl。meta 见下方 ToolResultEventMeta。
+   */
+  | "tool_result"
+  /**
+   * shell 输出流式增量（ephemeral）。
+   * **只走 SSE publish、绝不 append 进 events.jsonl**（防日志爆炸）；
+   * 完整输出以同 callId 的 tool_result.meta.output 为准。
+   * meta: { callId: string; chunk: string }
+   */
+  | "tool_output_delta"
   | "user_reply"
   | "assistant_message"
   | "ask_user_request"
   | "ask_user_reply"
+  /**
+   * Chat 长会话压缩后的摘要全文（Phase 4 compact）。
+   * meta: { summary: string }——前端可折叠查看；text 可放一行摘要标题。
+   * 仅 chat 模式写入；压缩会关旧会话并以摘要重建首包。
+   */
+  | "compact_summary"
   | "error";
+
+/**
+ * tool_result 事件的 meta 契约（批 B 前端按此渲染可展开工具结果 / inline diff）。
+ *
+ * | 字段 | 类型 | 说明 |
+ * |---|---|---|
+ * | callId | string | 与 tool_call / tool_output_delta 配对（= SDK call_id） |
+ * | name | string | 归一化工具名；MCP 为 `mcp:<server>:<tool>` |
+ * | status | "success" \| "error" | 完成态 |
+ * | output | string | 结果文本，上限 8KB（UTF-8 字节）；超限截断 |
+ * | truncated | boolean? | output 被截断时为 true |
+ * | fullPath | string? | 截断时全量相对路径 `tool-outputs/<callId>.txt` |
+ * | exitCode | number? | 仅 shell |
+ * | executionTime | number? | 仅 shell，SDK ms |
+ * | filePath | string? | 仅 edit / write |
+ * | diff | string? | 仅 edit（SDK diffString / unified），上限 16KB（UTF-8 字节） |
+ * | diffTruncated | boolean? | diff 被截断 |
+ */
+export type ToolResultEventMeta = {
+  callId: string;
+  name: string;
+  status: "success" | "error";
+  output: string;
+  truncated?: boolean;
+  fullPath?: string;
+  exitCode?: number;
+  executionTime?: number;
+  filePath?: string;
+  diff?: string;
+  diffTruncated?: boolean;
+};
+
+/** tool_output_delta 的 meta（ephemeral SSE only） */
+export type ToolOutputDeltaEventMeta = {
+  callId: string;
+  chunk: string;
+};
 
 // ask_user 单条问题
 export interface AskUserQuestion {

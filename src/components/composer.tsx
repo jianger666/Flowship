@@ -6,26 +6,28 @@
  *
  * - 岛容器：圆角 + focus 高亮 + 拖拽文件落入高亮
  * - 顶边拖柄：往上拉变高（贴底输入条的直觉方向）、高度记全局偏好
- * - skill 内联 token：Lexical SkillTokenNode（品牌色 tag、原子整删）
- * - `/` slash 菜单（浮岛上方）
+ * - skill / 文件内联 token：Lexical SkillTokenNode + FileTokenNode
+ * - `/` slash 菜单 + `@` 文件菜单（浮岛上方）
  * - 附件预览：图缩略（可移除 / 点看大图）+ 文件 / 目录路径 chips
- * - 输入引擎：Lexical PlainText（提交快捷键 + IME 安全 + 拖高滚动）
+ * - 输入引擎：Lexical PlainText（提交快捷键 + IME 安全 + 拖高滚动 + ↑ 历史）
  * - footer：左 slot（模型 / 自定义）+ 右动作组（附图 / 附文件 / 附目录 + 发送）；
  *   运行态原地换成 spinner + 红色停止键（不顶布局）
  *
  * 状态归调用方（草稿 / 附件 hook / slash / 提交逻辑）、本组件只管交互和视觉——
  * 两个调用方各自的业务分支（disabled 判定 / placeholder / 发送通道）不进来。
+ * `@` / 历史 / 未绑仓警示读 ComposerSessionProvider（ChatView / TaskTalk 注入）。
  */
 
 "use client";
 
-import { useRef, useState, type ReactNode, type RefObject } from "react";
+import { useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import {
   ArrowUp,
   File as FileIcon,
   Folder,
   FolderOpen,
   ImagePlus,
+  Info,
   Loader2,
   Square,
   X,
@@ -37,6 +39,8 @@ import {
   type ComposerFocusHandle,
 } from "@/components/composer-editor";
 import { SlashSkillMenu, type SlashSkillsApi } from "@/components/slash-skills";
+import { AtMentionMenu, useAtMention } from "@/components/at-mention";
+import { useComposerSession } from "@/components/composer-session";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
@@ -94,6 +98,14 @@ export interface ComposerProps {
   onStop?: () => void;
   stopping?: boolean;
 
+  /**
+   * chat 排队：运行中仍可发送（footer 同时显示停止 + 发送）。
+   * 不传 / false = 旧行为（运行中只显示停止）。
+   */
+  allowQueueWhileRunning?: boolean;
+  /** 输入区上方排队提示条 */
+  queueBanner?: ReactNode;
+
   /** 岛容器附加 class（如禁用态调暗 opacity-70） */
   className?: string;
 }
@@ -118,6 +130,8 @@ export const Composer = ({
   running,
   onStop,
   stopping,
+  allowQueueWhileRunning,
+  queueBanner,
   className,
 }: ComposerProps) => {
   // 手动拖过的高度（null = 未拖过、编辑器随内容自增）；记全局偏好、跨任务共用
@@ -130,18 +144,39 @@ export const Composer = ({
   // 量高容器：拖柄读 contentEditable 外包一层的高度
   const boxContainerRef = useRef<HTMLDivElement | null>(null);
   const submitShortcut = useSubmitShortcut();
+  const session = useComposerSession();
+
+  // `@` 文件引用：依赖 session（taskId + repoPaths）；无 Provider 则不启用
+  const atApplyDraft = useMemo(
+    () => (next: string, cursor?: number) => {
+      if (cursor != null) focusRef?.current?.prepareCursor(cursor);
+      onChange(next);
+      requestAnimationFrame(() => focusRef?.current?.focus());
+    },
+    [focusRef, onChange],
+  );
+  const atMention = useAtMention({
+    taskId: session?.taskId ?? "",
+    repoPaths: session?.repoPaths ?? [],
+    applyDraft: atApplyDraft,
+  });
+  // 无 session 时仍创建 hook（规则要求）、但不把菜单 / pick 接到编辑器
+  const atForEditor = session ? atMention : undefined;
 
   const images = attach?.images ?? [];
   const pathList = paths ?? [];
   const hasContent =
     value.trim().length > 0 || images.length > 0 || pathList.length > 0;
-  // 上下文行只剩图 / 路径（skill 已内联进文本、不再单独占一行）
+  // 上下文行只剩图 / 路径（skill / @ 已内联进文本、不再单独占一行）
   const hasContextRow = images.length > 0 || pathList.length > 0;
 
   const handleSubmit = () => {
     if (disabled || submitting || !hasContent) return;
     onSubmit();
   };
+
+  const showUnbound =
+    !!session?.showUnboundBanner && (session.repoPaths?.length ?? 0) === 0;
 
   return (
     <div
@@ -155,8 +190,9 @@ export const Composer = ({
       onDragLeave={attach?.onDragLeave}
       onDrop={attach?.onDrop}
     >
-      {/* `/` skill 菜单（浮岛上方） */}
+      {/* `/` skill 与 `@` 文件菜单（浮岛上方；同时最多开一个） */}
       {slash && <SlashSkillMenu slash={slash} />}
+      {atForEditor && <AtMentionMenu at={atForEditor} />}
 
       {/* 顶边拖柄：往上拉变高、往下拉变矮；setPointerCapture 让拖出手柄仍跟手 */}
       <div
@@ -196,6 +232,31 @@ export const Composer = ({
         <div className="h-1 w-10 rounded-full bg-border/60 transition-colors group-hover:bg-muted-foreground/50" />
       </div>
 
+      {/* P1.6：未绑仓轻量提示（对标 Cursor 上下文条——无警示底色、一行融入 composer） */}
+      {showUnbound && (
+        <div className="mx-2.5 mb-1 flex items-center gap-1.5 bg-muted/30 px-1 py-0.5">
+          <Info
+            className="size-3 shrink-0 text-muted-foreground"
+            aria-hidden
+          />
+          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+            未绑定工作目录，AI 将在主目录运行
+          </span>
+          {session?.onBindWorkdir && (
+            <button
+              type="button"
+              className="shrink-0 cursor-pointer text-xs text-primary hover:underline"
+              onClick={session.onBindWorkdir}
+            >
+              绑定
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* P5：排队提示（输入框上方） */}
+      {queueBanner}
+
       {/* 岛顶配置行（工作目录 / 分支等）：恒定一条、不随内容显隐跳动 */}
       {topRow && (
         <div className="flex flex-wrap items-center gap-1.5 border-b border-border/50 px-3 pb-2.5 pt-0.5">
@@ -203,7 +264,7 @@ export const Composer = ({
         </div>
       )}
 
-      {/* 上下文行：图缩略 + 路径 chips（skill 已内联、不在这里） */}
+      {/* 上下文行：图缩略 + 路径 chips（skill / @ 已内联、不在这里） */}
       {hasContextRow && (
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-3.5 pt-1.5">
           {images.map((img, i) => (
@@ -253,10 +314,11 @@ export const Composer = ({
         </div>
       )}
 
-      {/* Lexical 输入区：skill token 原子节点 + slash / 提交 / 粘贴图。
+      {/* Lexical 输入区：skill / file token + slash / @ / 提交 / 粘贴图。
           key=editorKey：切上下文（如换 task）整体重建、撤销栈不跨任务串（Bugbot 揪出） */}
       <ComposerEditor
         key={editorKey}
+        editorKey={editorKey}
         value={value}
         onChange={onChange}
         onSubmit={handleSubmit}
@@ -266,6 +328,7 @@ export const Composer = ({
         boxContainerRef={boxContainerRef}
         boxHeight={boxHeight}
         slash={slash}
+        atMention={atForEditor}
         attach={attach}
       />
 
@@ -290,6 +353,24 @@ export const Composer = ({
                   <Square className="size-3 fill-current" />
                 )}
               </Button>
+              {/* chat 排队：运行中仍可发下一条 */}
+              {allowQueueWhileRunning && (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={disabled || submitting || !hasContent}
+                  onClick={handleSubmit}
+                  className="ml-1 size-7 rounded-lg p-0"
+                  aria-label="排队发送"
+                  title={`排队发送（${getSubmitShortcutTitle(submitShortcut)}）`}
+                >
+                  {submitting ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <ArrowUp className="size-4" />
+                  )}
+                </Button>
+              )}
             </>
           ) : (
             <>

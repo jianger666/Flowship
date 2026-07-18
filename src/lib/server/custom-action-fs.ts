@@ -90,11 +90,52 @@ const genId = async (label: string): Promise<string> => {
   return fallback;
 };
 
-/** 清洗单个必填 skill 名 */
+/**
+ * 清洗单个必填 skill 名（白名单：字母数字中文 + ._-；拒 `.` / `..` / 前导点 / 路径分隔）。
+ * 与 app-skills isSafeSkillName 同构，防 `../evil` 路径穿越。
+ */
 export const sanitizeSkillName = (raw: unknown): string | undefined => {
   if (typeof raw !== "string") return undefined;
   const s = raw.trim();
-  return s.length > 0 ? s : undefined;
+  if (!s || s === "." || s === "..") return undefined;
+  if (s.startsWith(".")) return undefined;
+  if (!/^[a-zA-Z0-9\u4e00-\u9fa5][a-zA-Z0-9\u4e00-\u9fa5._-]{0,63}$/.test(s)) {
+    return undefined;
+  }
+  return s;
+};
+
+/** dest 是否落在 absRoot 之内（含自身）；用 resolve 后再比前缀，防 `..` 穿越 */
+const isPathInside = (absRoot: string, absDest: string): boolean => {
+  const root = path.resolve(absRoot);
+  const dest = path.resolve(absDest);
+  if (dest === root) return true;
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return dest.startsWith(prefix);
+};
+
+/** 递归删除目录树内全部 symlink（导入 bundle 后清仓外链接） */
+const stripSymlinksUnder = async (root: string): Promise<number> => {
+  let removed = 0;
+  const walk = async (dir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isSymbolicLink()) {
+        await fs.rm(full, { force: true });
+        removed += 1;
+        continue;
+      }
+      if (ent.isDirectory()) await walk(full);
+    }
+  };
+  await walk(root);
+  return removed;
 };
 
 // 解析单个 md → CustomActionDef
@@ -253,8 +294,8 @@ export const createCustomAction = async (
 ): Promise<CustomActionDef> => {
   const label = input.label.trim();
   if (!label) throw new Error("label 不能为空");
-  const skill = input.skill.trim();
-  if (!skill) throw new Error("skill 必填");
+  const skill = sanitizeSkillName(input.skill);
+  if (!skill) throw new Error("skill 名非法或为空（只用字母 / 数字 / 中文 / _ - .，不以 . 开头）");
   const now = Date.now();
   const def: CustomActionDef = {
     id: await genId(label),
@@ -280,8 +321,10 @@ export const updateCustomAction = async (
   if (existing.legacyPlaybook) {
     throw new Error("旧格式 action 已停用、不能编辑——把原内容建成 skill 后重新新建挂载");
   }
-  const nextSkill = (patch.skill ?? existing.skill).trim();
-  if (!nextSkill) throw new Error("skill 必填");
+  const nextSkill = sanitizeSkillName(patch.skill ?? existing.skill);
+  if (!nextSkill) {
+    throw new Error("skill 名非法或为空（只用字母 / 数字 / 中文 / _ - .，不以 . 开头）");
+  }
   const next: CustomActionDef = {
     ...existing,
     ...patch,
@@ -323,8 +366,8 @@ export const ensureCustomActionById = async (
   if (existing) return "exists";
   const label = input.label.trim();
   if (!label) throw new Error("label 不能为空");
-  const skill = input.skill.trim();
-  if (!skill) throw new Error("skill 必填");
+  const skill = sanitizeSkillName(input.skill);
+  if (!skill) throw new Error("skill 名非法或为空（只用字母 / 数字 / 中文 / _ - .，不以 . 开头）");
   const now = Date.now();
   await writeDef({
     id,
@@ -393,15 +436,26 @@ export const exportCustomAction = async (
     throw new Error("旧格式 action 已停用、无法导出——把原内容建成 skill 后重新新建挂载");
   }
 
-  const skillEntry = await findSkillByName(def.skill);
+  const skillName = sanitizeSkillName(def.skill);
+  if (!skillName) {
+    throw new Error(`主 skill 名非法「${def.skill}」、拒绝导出`);
+  }
+  const skillEntry = await findSkillByName(skillName);
   if (!skillEntry) {
     throw new Error(
-      `主 skill「${def.skill}」本机找不到、无法导出（先确认 skill 已安装）`,
+      `主 skill「${skillName}」本机找不到、无法导出（先确认 skill 已安装）`,
     );
   }
   // absPath 指向 SKILL.md → 导出整棵 skill 目录（含 scripts 等附属文件）
   const srcSkillDir = path.dirname(skillEntry.absPath);
-  const destSkillDir = path.join(absTarget, def.skill);
+  const destSkillDir = path.join(absTarget, skillName);
+  // 写出前断言 dest 落在 target 内（防历史脏数据里 skill=../evil 穿越）
+  if (!isPathInside(absTarget, destSkillDir)) {
+    console.warn(
+      `[custom-action-fs] 导出跳过：dest 越出 targetDir（skill=${skillName}）`,
+    );
+    throw new Error(`导出路径越界、拒绝写出：${skillName}`);
+  }
 
   await fs.cp(srcSkillDir, destSkillDir, { recursive: true, force: true });
 
@@ -416,7 +470,7 @@ export const exportCustomAction = async (
     `${JSON.stringify(meta, null, 2)}\n`,
     "utf-8",
   );
-  return { skillDir: destSkillDir, skillName: def.skill };
+  return { skillDir: destSkillDir, skillName };
 };
 
 /**
@@ -439,10 +493,10 @@ export const importCustomActionBundle = async (
   }
 
   // 目录名 = skill 名（导出约定；导入方不改名、撞名直接报错）
-  const skillName = path.basename(absSource);
-  if (!isSafeId(skillName)) {
+  const skillName = sanitizeSkillName(path.basename(absSource));
+  if (!skillName) {
     throw new Error(
-      `skill 目录名非法「${skillName}」（只用字母 / 数字 / 中文 / _ - .）`,
+      `skill 目录名非法「${path.basename(absSource)}」（只用字母 / 数字 / 中文 / _ - .，不以 . 开头）`,
     );
   }
 
@@ -471,6 +525,13 @@ export const importCustomActionBundle = async (
 
   await fs.mkdir(getAppSkillsDir(), { recursive: true });
   await fs.cp(absSource, destSkillDir, { recursive: true });
+  // 仓外 symlink 一律删掉（fs.cp 默认会原样带过来、可指向 target 外敏感路径）
+  const nSym = await stripSymlinksUnder(destSkillDir);
+  if (nSym > 0) {
+    console.warn(
+      `[custom-action-fs] 导入已删除 ${nSym} 个 symlink：${skillName}`,
+    );
+  }
 
   // 拷进来的 .flowship-action.json 是挂载参数、不是 skill 内容——读完后从自管目录删掉、
   // 避免以后编辑 skill 时把壳参数误当成 skill 附属文件

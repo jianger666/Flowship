@@ -7,25 +7,34 @@
  * - snapshotActionArtifact：最新一份已相同则跳过写入
  * - shouldPruneIdenticalRevisionsOnList：running 态闸（route 调 prune 前判定；
  *   prune 本身不感知状态——agent 活跃时 route 跳过 prune，只列不清）
+ *
+ * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
+ * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import，否则全量并行时多文件撞 cwd/data/tasks。
  */
-import { promises as fs } from "node:fs";
+import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-const TMP_ROOT = path.join(os.tmpdir(), `fe-task-artifacts-rev-${Date.now()}`);
+import type { ActionRecord, ArtifactRevision, Task } from "@/lib/types";
+import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
+
+// OS 保证唯一；必须在动态 import 之前钉死 env
+const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-task-artifacts-rev-"));
 process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
 
-import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
-import { taskDir, writeMeta } from "@/lib/server/task-fs-core";
-import {
+const { taskDir, writeMeta } = await import("@/lib/server/task-fs-core");
+const {
   filterIdenticalTailRevisionsForDisplay,
   listActionRevisions,
   pruneIdenticalRevisions,
   shouldPruneIdenticalRevisionsOnList,
   snapshotActionArtifact,
-} from "@/lib/server/task-artifacts";
-import type { ActionRecord, ArtifactRevision, Task } from "@/lib/types";
+} = await import("@/lib/server/task-artifacts");
+
+if (!taskDir("probe").startsWith(TMP_ROOT)) {
+  throw new Error(`artifacts-rev DATA_DIR 未隔离到 TMP：${taskDir("probe")}`);
+}
 
 const TASK_ID = "t_rev_test_1";
 const ACTION_ID = "act_1";
@@ -101,10 +110,6 @@ const revExists = async (timestamp: number): Promise<boolean> => {
     return false;
   }
 };
-
-beforeAll(async () => {
-  await fs.mkdir(TMP_ROOT, { recursive: true });
-});
 
 afterAll(async () => {
   await fs.rm(TMP_ROOT, { recursive: true, force: true });

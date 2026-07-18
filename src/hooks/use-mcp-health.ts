@@ -50,18 +50,24 @@ export const useMcpHealth = (
   const [loadingServers, setLoadingServers] = useState<Set<string>>(new Set());
   // 探测错误
   const [error, setError] = useState<string | null>(null);
+  // 卸载 / effect cleanup 后 in-flight probe 不再 setState
+  const aliveRef = useRef(false);
 
   // 探一组 server、结果 merge 进 health（不动其它 server 的旧状态）
   const probe = useCallback(async (servers: string[]) => {
     if (servers.length === 0) return;
+    if (!aliveRef.current) return;
     setLoadingServers((prev) => new Set([...prev, ...servers]));
     try {
       const h = await fetchMcpHealth(servers);
+      if (!aliveRef.current) return;
       setHealth((prev) => ({ ...prev, ...h }));
       setError(null);
     } catch (err) {
+      if (!aliveRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      if (!aliveRef.current) return;
       setLoadingServers((prev) => {
         const next = new Set(prev);
         servers.forEach((s) => next.delete(s));
@@ -90,7 +96,11 @@ export const useMcpHealth = (
   // active 由调用方保证「enabledServers ready 后才 true」（见顶部 V0.6.13 注释、否则探到空集合）
   useEffect(() => {
     if (!active) return;
+    aliveRef.current = true;
     refresh();
+    return () => {
+      aliveRef.current = false;
+    };
   }, [active, refresh]);
 
   return { health, loadingServers, error, refresh, probeOne };

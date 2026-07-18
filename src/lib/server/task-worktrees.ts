@@ -22,13 +22,29 @@ import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 
 import { dataRoot } from "./data-root";
+import { failpoint } from "./failpoints";
 import { getEffectiveCwd, getUniqueRepoDirNames } from "@/lib/path-utils";
 import {
   DEFAULT_BRANCH_TEMPLATE,
   extractFeishuStoryId,
+  isSafeBranchName,
   renderBranchName,
 } from "@/lib/branch-template";
 import type { GitBranchInfo, Task, TaskMode } from "@/lib/types";
+
+/** re-export：调用方 / 单测可从本模块取分支名白名单校验 */
+export { isSafeBranchName };
+
+/**
+ * R27-2：resource lease 失效时 ensureTaskWorktrees 抛此错让位——
+ * 调用方（prewarm / advance / resume 链）catch 后放弃本次资源操作、不带病继续。
+ */
+export class WorktreeLeaseLostError extends Error {
+  constructor(message = "worktree ensure 让位：resource lease 已失效") {
+    super(message);
+    this.name = "WorktreeLeaseLostError";
+  }
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -380,10 +396,21 @@ export interface EnsureWorktreesResult {
  *   4. 拷根目录 `.env*`（gitignore 的本地配置不在检出里、不拷 dev server 起不来）
  *
  * 失败抛错（带仓名 + git stderr + 处置建议）——worktree 是硬前置、创建不了不该带病起 agent。
+ *
+ * @param opts.lease R27-2：resource lease（同步）——fetch 完成后、目录删除/清理前、
+ *   每次 `git worktree add`（含 retry）前复查；失效抛 {@link WorktreeLeaseLostError} 让位。
+ *   add 成功后再验一次、失主立即补偿移除本轮刚创建的 worktree（尽力而为）。
+ *   finalize 终态 owner 的清理调用不传（无条件语义）。
  */
 export const ensureTaskWorktrees = async (
   task: Task,
+  opts?: { lease?: () => boolean },
 ): Promise<EnsureWorktreesResult> => {
+  const lease = opts?.lease;
+  // R27-2：lease 失效即抛（每个不可逆副作用前复用）
+  const assertLease = (): void => {
+    if (lease && !lease()) throw new WorktreeLeaseLostError();
+  };
   const infos = planWorktreeBranchInfos(task);
   // 混合隔离后 infos 只含 git 仓、跟 repoPaths 不再 index 对齐——按 repoPath 查
   const infoByRepo = new Map(infos.map((info) => [info.repoPath, info]));
@@ -411,6 +438,14 @@ export const ensureTaskWorktrees = async (
       continue;
     }
 
+    // 分支名白名单：拒空串 / 前导 - / 空白 / .. / 非法 ref 字符（防 git argv 当 flag）
+    const branch = info.name;
+    if (!isSafeBranchName(branch)) {
+      throw new Error(
+        `仓库 ${repoPath} 任务分支名非法「${branch}」、拒绝创建 / 切换隔离工作区`,
+      );
+    }
+
     // 已存在且是合法工作区 → 复用（幂等热路径、每次推进都会走到）。
     // 必须校验当前分支：用户 / agent 可能在 worktree 里手动 checkout 切走，
     // 旧实现只查 is-inside-work-tree 就 continue，后续推进会静默在错误分支上干活。
@@ -422,17 +457,17 @@ export const ensureTaskWorktrees = async (
         // show-current：detached HEAD 时 stdout 为空，跟任务分支不一致同样要切回
         const show = await runGit(workDir, ["branch", "--show-current"]);
         const currentBranch = show.ok ? show.stdout : "";
-        if (currentBranch !== info.name) {
-          const switched = await runGit(workDir, ["checkout", info.name]);
+        if (currentBranch !== branch) {
+          const switched = await runGit(workDir, ["checkout", branch]);
           if (!switched.ok) {
             // 工作区脏 / 冲突等会导致 checkout 失败——抛清晰提示，让用户先处理，不带病推进
             const where = currentBranch || "detached HEAD";
             throw new Error(
-              `仓库 ${repoPath} 当前在 ${where} 分支、任务分支是 ${info.name}、自动切回失败：${switched.stderr || switched.stdout}`,
+              `仓库 ${repoPath} 当前在 ${where} 分支、任务分支是 ${branch}、自动切回失败：${switched.stderr || switched.stdout}`,
             );
           }
           console.log(
-            `[task-worktrees] worktree 已切回任务分支：${workDir}（${currentBranch || "detached HEAD"} → ${info.name}）`,
+            `[task-worktrees] worktree 已切回任务分支：${workDir}（${currentBranch || "detached HEAD"} → ${branch}）`,
           );
         }
         const dirs = await cloneDepDirs(repoPath, workDir);
@@ -441,6 +476,8 @@ export const ensureTaskWorktrees = async (
       }
     }
 
+    // R27-2：目录删除/清理前验 lease——finalize 已接管则不动盘
+    assertLease();
     // 半截目录（上次创建失败残留 / 非法内容）→ 清掉重来
     if (await pathExists(workDir)) {
       await fs.rm(workDir, { recursive: true, force: true });
@@ -448,7 +485,6 @@ export const ensureTaskWorktrees = async (
     // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）
     await runGit(repoPath, ["worktree", "prune"]);
 
-    const branch = info.name;
     const localBranchExists = (
       await runGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
     ).ok;
@@ -464,6 +500,8 @@ export const ensureTaskWorktrees = async (
       // best-effort、30s 上限：fetch 只是「拿最新」的锦上添花、慢网络 / 被墙远程（github）
       // 挂太久会把整个推进卡住（实测 120s×2 把 advance 拖到 4 分钟+）、超时就用本地现有引用
       await runGit(repoPath, ["fetch", "origin", branch], 30_000);
+      // R27-2：fetch（可达 30s）完成后验 lease——期间 finalize 可已终结任务
+      assertLease();
       const remoteBranchExists = (
         await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `origin/${branch}`])
       ).ok;
@@ -492,7 +530,14 @@ export const ensureTaskWorktrees = async (
             `仓库 ${repoPath} 探不到主分支（origin/HEAD 未设置）——去设置页给该仓配「线上分支」后重试`,
           );
         }
+        if (!isSafeBranchName(base)) {
+          throw new Error(
+            `仓库 ${repoPath} 线上分支名非法「${base}」、拒绝创建隔离工作区`,
+          );
+        }
         await runGit(repoPath, ["fetch", "origin", base], 30_000); // best-effort、同上 30s 上限
+        // R27-2：base fetch 完成后同样验 lease
+        assertLease();
         // 起点优先 origin/<base>（最新）、离线 / 无远程时回退本地 <base>
         const startPoint = (
           await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `origin/${base}`])
@@ -527,11 +572,17 @@ export const ensureTaskWorktrees = async (
       }
     }
 
+    // R27-2：每次 `git worktree add`（含孤儿自愈后的 retry）前验 lease + 插桩
+    await failpoint("worktree.beforeAdd");
+    assertLease();
     let added = await runGit(repoPath, addArgs, 120_000);
     if (!added.ok) {
       // 存量孤儿自愈：老版本删任务时快照失败会 skip 删除，留下 worktree 目录 + 分支占用。
       // 若占用方是「已删任务」的孤儿 → force remove + prune 后重试一次 add。
       if (await tryReleaseDeletedTaskOrphan(repoPath, added.stderr)) {
+        // R27-2：retry 也是一次独立 add——同样验 lease
+        await failpoint("worktree.beforeAdd");
+        assertLease();
         added = await runGit(repoPath, addArgs, 120_000);
       }
     }
@@ -546,6 +597,29 @@ export const ensureTaskWorktrees = async (
       throw new Error(
         `仓库 ${repoPath} 创建隔离工作区失败（分支 ${branch}）：${added.stderr || added.stdout}${hint}`,
       );
+    }
+
+    // R27-2：add 成功后（可达 120s）再验一次——失主立即补偿移除本轮刚创建的
+    // worktree + 注册（尽力而为；merged/abandoned 任务不得留下物理工作区）
+    await failpoint("worktree.afterAdd");
+    if (lease && !lease()) {
+      try {
+        const removed = await runGit(
+          repoPath,
+          ["worktree", "remove", "--force", workDir],
+          60_000,
+        );
+        if (!removed.ok) {
+          await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+          await runGit(repoPath, ["worktree", "prune"]);
+        }
+      } catch (err) {
+        console.warn(
+          `[task-worktrees] R27-2 失主补偿移除 worktree 失败（尽力而为）：${workDir}`,
+          err,
+        );
+      }
+      throw new WorktreeLeaseLostError();
     }
 
     info.baseBranch = resolvedBase;

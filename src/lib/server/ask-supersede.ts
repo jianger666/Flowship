@@ -18,14 +18,21 @@ import { writeEventAndPublish } from "./task-stream";
 /**
  * 作废 task 下「当前还没被回答的 ask_user_request」。
  *
+ * @param lease R26-3：可选；getTask / 写作废事件用 lease 门控——接管发生在其 IO 内时
+ *   旧 A 不再对新世界写作废标记。调用点本波可传 undefined（下一波接线）。
  * @returns 最近一条被作废的 ask 的 questions（供重启时断点续传）、没有则空数组。
  */
 export const supersedePendingAsks = async (
   taskId: string,
   reason: string,
+  lease?: () => boolean,
 ): Promise<AskUserQuestion[]> => {
+  // R26-3：入场前同步 gate——失主直接空返、不读盘不写事件
+  if (lease && !lease()) return [];
   const task = await getTask(taskId);
   if (!task) return [];
+  // getTask await 后复查——接管可落在 IO 内
+  if (lease && !lease()) return [];
   // 最近一条未答 ask 的问题（events 正序遍历、后命中的覆盖前面的 = 时间上最近的那组）
   let latestQuestions: AskUserQuestion[] = [];
   for (const ev of task.events) {
@@ -34,12 +41,18 @@ export const supersedePendingAsks = async (
     if (!askId) continue;
     // 已被回答 / 已被作废过的跳过（幂等：重复重启不重复写标记）
     if (isAskSettled(task.events, askId)) continue;
-    await writeEventAndPublish(taskId, {
-      kind: "info",
-      actionId: ev.actionId,
-      text: `上一组提问因${reason}失效、无需再回答。`,
-      meta: { supersededAskId: askId },
-    });
+    // R26-3：事件写走 appendEventIf（lease 进队内检查）；失主跳过本条及后续
+    const wrote = await writeEventAndPublish(
+      taskId,
+      {
+        kind: "info",
+        actionId: ev.actionId,
+        text: `上一组提问因${reason}失效、无需再回答。`,
+        meta: { supersededAskId: askId },
+      },
+      lease,
+    );
+    if (lease && !wrote) break;
     if (Array.isArray(ev.meta?.questions)) {
       latestQuestions = ev.meta.questions as AskUserQuestion[];
     }

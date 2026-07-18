@@ -4,23 +4,33 @@
  * - 崩溃半行容忍
  * - before 分页与旧 findIndex+slice 语义一致
  * - 空文件 / 单行边界
+ *
+ * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
+ * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import，否则全量并行时多文件撞 cwd/data/tasks。
  */
-import { promises as fs } from "node:fs";
+import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
-const TMP_ROOT = path.join(os.tmpdir(), `fe-events-tail-${Date.now()}`);
+import type { TaskEvent } from "@/lib/types";
+
+// OS 保证唯一；必须在动态 import 之前钉死 env
+const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-events-tail-"));
 process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
 
-import {
+const {
   EVENTS_FILE,
   readEvents,
   readEventsBefore,
   readEventsTail,
   taskDir,
-} from "@/lib/server/task-fs-core";
-import type { TaskEvent } from "@/lib/types";
+} = await import("@/lib/server/task-fs-core");
+
+// 锁死落在 TMP：防 DATA_DIR 误冻到 cwd/data 污染正式数据 / 并行串扰
+if (!taskDir("probe").startsWith(TMP_ROOT)) {
+  throw new Error(`events-tail DATA_DIR 未隔离到 TMP：${taskDir("probe")}`);
+}
 
 const TASK_ID = "t_events_tail_1";
 
@@ -55,10 +65,6 @@ const legacyBefore = async (
   const start = Math.max(0, idx - limit);
   return { events: all.slice(start, idx), hasMore: start > 0 };
 };
-
-beforeAll(async () => {
-  await fs.mkdir(TMP_ROOT, { recursive: true });
-});
 
 afterAll(async () => {
   await fs.rm(TMP_ROOT, { recursive: true, force: true });

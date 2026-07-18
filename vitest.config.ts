@@ -16,5 +16,7 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     environment: "node",
+    // 默认满核并发下 Git 真实 IO / 计时测试会随机超时（T6），固定 maxWorkers 保证门禁可重复
+    maxWorkers: 4,
   },
 });

@@ -48,6 +48,8 @@ import {
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import { advanceTask } from "@/lib/server/task-runner";
 import { getCustomAction } from "@/lib/server/custom-action-fs";
+import { getChatLifecycle } from "@/lib/server/chat-gate";
+import { getTaskOpGeneration } from "@/lib/server/task-stream";
 import {
   ACTION_TYPES,
   type ActionType,
@@ -200,6 +202,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
+  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒推进
+  {
+    const life = getChatLifecycle(id);
+    if (life !== null) {
+      const msg =
+        life === "deleting"
+          ? "任务正在删除"
+          : life === "finalizing"
+            ? "正在终结、请稍后再试"
+            : "正在停止、请稍后再试";
+      return errorResponse(msg, 409);
+    }
+  }
+
+  // W2：lifecycle 闸后立刻同步取 admission——其后有落分支偏好 / 存图等 await
+  const opGen = getTaskOpGeneration(task.id);
+
   // V0.6.0.1：chat 模式 task 不走 advance、应走 /chat-reply
   if (task.mode === "chat") {
     return errorResponse(
@@ -261,6 +280,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       repoDevBranches: sanitizeRepoBranchMap(body.repoDevBranches),
       // V0.9：自定义 action 定义 id（仅 custom、上面已校验定义存在）
       customActionId,
+      opGen,
     });
 
     // 重新读 task（advanceTask 内部已 publish、这里只为返最新 snapshot）

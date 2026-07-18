@@ -20,14 +20,62 @@
  */
 
 import Link from "next/link";
+import { useCallback, useSyncExternalStore, type ReactNode } from "react";
 import { ListTodo, Loader2, MessageCircle, Pin, Trash2 } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
-import { actionDisplayLabel } from "@/lib/task-display";
+import { actionDisplayLabel, formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
+
+/** 同页 markTaskSeen 后派发，驱动侧栏重读 localStorage（storage 事件只跨 tab） */
+export const TASK_SEEN_EVENT = "fe-ai-flow:task-seen";
+
+const subscribeTaskSeen = (onStoreChange: () => void) => {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(TASK_SEEN_EVENT, onStoreChange);
+  window.addEventListener("storage", onStoreChange);
+  return () => {
+    window.removeEventListener(TASK_SEEN_EVENT, onStoreChange);
+    window.removeEventListener("storage", onStoreChange);
+  };
+};
+
+/** 订阅已读时间戳：markTaskSeen 写 localStorage 后侧栏能立刻熄灭琥珀点 */
+const useTaskSeenAt = (taskId: string): number => {
+  const getSnapshot = useCallback(() => getTaskSeenAt(taskId), [taskId]);
+  return useSyncExternalStore(subscribeTaskSeen, getSnapshot, () => 0);
+};
+/**
+ * 标题内匹配段高亮（侧栏搜索用）。
+ * 不引第三方高亮库：大小写不敏感、逐段切分；query 空则原样返回。
+ */
+const highlightTitle = (title: string, query: string): ReactNode => {
+  const q = query.trim();
+  if (!q) return title;
+  const lower = title.toLowerCase();
+  const qLower = q.toLowerCase();
+  const parts: ReactNode[] = [];
+  let start = 0;
+  let idx = lower.indexOf(qLower, start);
+  // 没命中（过滤侧已保证命中，这里兜底防空）
+  if (idx < 0) return title;
+  while (idx >= 0) {
+    if (idx > start) parts.push(title.slice(start, idx));
+    parts.push(
+      // key 用起始下标：同 query 多段命中时唯一；primary 色加粗、不改底色以免截断时发糊
+      <span key={idx} className="font-semibold text-primary">
+        {title.slice(idx, idx + q.length)}
+      </span>,
+    );
+    start = idx + q.length;
+    idx = lower.indexOf(qLower, start);
+  }
+  if (start < title.length) parts.push(title.slice(start));
+  return parts;
+};
 
 // v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
 // **只有活跃态才出第二行**——运行中 / 待确认 / 待回答；空闲 / 静息 / 失败一律单行只标题。
@@ -36,6 +84,7 @@ import type { TaskSummary } from "@/lib/types";
 // 真失败有系统通知 + 打开任务可见）。
 const taskStageLine = (
   task: TaskSummary,
+  seenAt: number,
 ): { stage: string; status: string; tone: "run" | "wait" } | null => {
   if (task.mode === "chat") return null;
   const stage = task.lastActionType
@@ -49,7 +98,7 @@ const taskStageLine = (
     if (task.lastActionStatus === "awaiting_ack") {
       // 已读即清（v1.1.x 用户拍板「点进去看过、状态就该清掉」）：交卷后打开过详情
       //（seenAt 晚于任务最后动静）→ 回归静息单行；再有新交卷 updatedAt 前移、重新亮
-      if (getTaskSeenAt(task.id) >= task.updatedAt) return null;
+      if (seenAt >= task.updatedAt) return null;
       return { stage, status: "待确认", tone: "wait" };
     }
     // 待回答不做已读清除：AI 被阻塞在等答案、不答永远停——必须一直亮
@@ -68,7 +117,13 @@ const TONE_CLASS: Record<"run" | "wait", string> = {
 
 // 行首指示：runStatus 优先（运行 / 等你回复）、否则回退类型图标。
 // 所有形态统一 size-3.5 占位、保证各行标题左缘对齐。
-const LeadingIndicator = ({ task }: { task: TaskSummary }) => {
+const LeadingIndicator = ({
+  task,
+  seenAt,
+}: {
+  task: TaskSummary;
+  seenAt: number;
+}) => {
   // AI 正在跑：转圈
   if (task.runStatus === "running") {
     return (
@@ -85,7 +140,7 @@ const LeadingIndicator = ({ task }: { task: TaskSummary }) => {
     task.runStatus === "awaiting_user" &&
     task.mode !== "chat" &&
     ((task.lastActionStatus === "awaiting_ack" &&
-      getTaskSeenAt(task.id) < task.updatedAt) ||
+      seenAt < task.updatedAt) ||
       task.lastActionStatus === "running");
   if (needsAttention) {
     return (
@@ -115,6 +170,8 @@ interface TaskListItemProps {
   deleteDisabled?: boolean;
   // 传则行尾出置顶按钮（已置顶常显高亮、未置顶 hover 出；切换由调用方处理）
   onPin?: (task: TaskSummary) => void;
+  // 侧栏搜索时传入：标题匹配段加粗变色；空 / 不传 = 原样标题
+  highlightQuery?: string;
 }
 
 export const TaskListItem = ({
@@ -124,10 +181,15 @@ export const TaskListItem = ({
   onDelete,
   deleteDisabled,
   onPin,
+  highlightQuery,
 }: TaskListItemProps) => {
   const hasActions = !!(onPin || onDelete);
-  // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null、只显标题）
-  const stageLine = taskStageLine(task);
+  // 订阅已读：打开详情 markTaskSeen 后本行立刻重算、熄灭琥珀点
+  const seenAt = useTaskSeenAt(task.id);
+  // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null）
+  const stageLine = taskStageLine(task, seenAt);
+  // TaskSummary 无最后消息摘要字段——无摘要时用相对时间作第二行灰字
+  const subtitle = stageLine ? null : formatRelative(task.updatedAt);
   return (
     <div className="group/item relative">
       {/* 当前任务：左侧 2px 强调竖条（对标 Cursor / Linear 的 active 指示） */}
@@ -148,19 +210,29 @@ export const TaskListItem = ({
       >
         {/* 行首指示：runStatus（运行中 / 等你回复）优先、否则类型图标——顶对齐两行 */}
         <span className="mt-0.5">
-          <LeadingIndicator task={task} />
+          <LeadingIndicator task={task} seenAt={seenAt} />
         </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
           <Tooltip content={task.title}>
-            <span className="min-w-0 truncate leading-tight">{task.title}</span>
+            <span className="min-w-0 truncate leading-tight">
+              {highlightQuery
+                ? highlightTitle(task.title, highlightQuery)
+                : task.title}
+            </span>
           </Tooltip>
-          {/* 监控行：阶段 · 状态（task 模式）——侧栏一眼看清每个任务卡在哪一步 */}
-          {stageLine && (
-            <span className="flex items-center gap-1 text-[11px] leading-none">
-              <span className="text-muted-foreground/70">{stageLine.stage}</span>
+          {/* 活跃态：阶段 · 状态；否则相对时间（无最后消息摘要字段） */}
+          {stageLine ? (
+            <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
+              <span className="min-w-0 truncate text-muted-foreground/70">
+                {stageLine.stage}
+              </span>
               <span className="text-muted-foreground/40">·</span>
               <span className={TONE_CLASS[stageLine.tone]}>{stageLine.status}</span>
+            </span>
+          ) : (
+            <span className="min-w-0 truncate text-[11px] leading-none text-muted-foreground/70">
+              {subtitle}
             </span>
           )}
         </span>

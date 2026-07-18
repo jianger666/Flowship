@@ -165,20 +165,20 @@ const AskQuestionItem = ({
   };
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-start gap-2">
-        <span className="shrink-0 rounded-md bg-muted px-2 py-0.5 font-mono text-xs">
+    <div className="flex flex-col gap-2.5">
+      <div className="flex items-start gap-2.5">
+        <span className="mt-0.5 shrink-0 rounded bg-muted/80 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
           Q{index}
         </span>
-        {/* min-w-0：flex item 防长 inline code 撑破容器 */}
-        <div className="min-w-0 flex-1 text-sm leading-relaxed">
+        {/* min-w-0：flex item 防长 inline code 撑破容器；字级略高于选项 */}
+        <div className="min-w-0 flex-1 text-[13px] leading-relaxed text-foreground">
           <MarkdownText text={question.question} />
         </div>
       </div>
 
       {/* 选项区：切到自定义模式后也保留、随时能跳回点选项 */}
       {hasOptions && (
-        <div className="flex flex-col gap-1.5 pl-9">
+        <div className="flex flex-col gap-1.5 pl-8">
           {question.options!.map((opt, optIdx) => {
             const letter = LETTER_PREFIX[optIdx] ?? String(optIdx + 1);
             const selected = optionId === opt.id;
@@ -189,11 +189,11 @@ const AskQuestionItem = ({
                 selected={selected}
                 disabled={submitting}
                 onClick={() => handlePickOption(opt.id)}
-                className="flex items-start gap-3 px-3 py-2 text-xs hover:bg-primary/5"
+                className="flex items-start gap-2.5 px-2.5 py-1.5 text-xs"
               >
                 <span
                   className={cn(
-                    "shrink-0 rounded-md px-1.5 py-0.5 font-mono text-[10px]",
+                    "shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] leading-none",
                     selected
                       ? "bg-primary text-primary-foreground"
                       : "bg-muted text-muted-foreground",
@@ -201,7 +201,7 @@ const AskQuestionItem = ({
                 >
                   {letter}
                 </span>
-                <span className="wrap-break-word">{opt.label}</span>
+                <span className="wrap-break-word pt-px">{opt.label}</span>
               </ChoiceButton>
             );
           })}
@@ -223,7 +223,7 @@ const AskQuestionItem = ({
       {inCustomMode && (
         <div
           className={cn(
-            "flex flex-col gap-2 rounded-md pl-9 transition-colors",
+            "flex flex-col gap-2 rounded-md pl-8 transition-colors",
             isDragging && "bg-primary/5 p-1 ring-1 ring-primary/30 ring-inset",
           )}
           onDragOver={onDragOver}
@@ -439,7 +439,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
 
   return (
     <div
-      className="flex flex-col gap-4 rounded-md border-2 border-amber-500/40 bg-amber-500/10 p-3"
+      className="flex flex-col gap-3 rounded-lg border border-border/70 bg-muted/25 p-3.5"
       onKeyDown={(e) => {
         // 容器级提交快捷键（事件冒泡覆盖 textarea）：
         // - mod-enter（默认）：任意焦点都可提交
@@ -452,9 +452,9 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         }
       }}
     >
-      <div className="flex items-center gap-2 text-xs">
-        <Sparkles className="size-4 animate-pulse text-amber-500" />
-        <span className="font-medium">
+      <div className="flex items-center gap-2">
+        <Sparkles className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="text-xs font-medium text-foreground">
           AI 想跟你确认 {questions.length} 个问题
         </span>
       </div>
@@ -467,28 +467,35 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         </div>
       ) : (
         <>
-          <div className="flex flex-col gap-5">
+          <div className="flex flex-col">
             {questions.map((q, qIdx) => (
-              <AskQuestionItem
+              <div
                 key={`${askId}:${q.id}`}
-                question={q}
-                index={qIdx + 1}
-                submitting={submitting}
-                onChange={handleDraftChange}
-              />
+                className={cn(
+                  qIdx > 0 && "mt-3 border-t border-border/50 pt-3",
+                )}
+              >
+                <AskQuestionItem
+                  question={q}
+                  index={qIdx + 1}
+                  submitting={submitting}
+                  onChange={handleDraftChange}
+                />
+              </div>
             ))}
           </div>
 
-          <div className="flex items-center justify-between gap-2 border-t border-amber-500/20 pt-2 text-xs text-muted-foreground">
-            <span className="shrink-0">
+          <div className="flex items-center justify-between gap-2 border-t border-border/50 pt-2.5 text-xs text-muted-foreground">
+            <span className="shrink-0 tabular-nums">
               已答 {answeredCount} / {questions.length}
             </span>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <Button
                 size="sm"
                 variant="ghost"
                 disabled={submitting}
                 onClick={() => void handleDefer()}
+                className="h-7 text-xs text-muted-foreground"
               >
                 稍后再补充
               </Button>
@@ -496,6 +503,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
                 size="sm"
                 disabled={submitting || !allAnswered}
                 onClick={() => void handleSubmit()}
+                className="h-7 text-xs"
               >
                 {submitting ? "提交中…" : "提交全部回答"}
               </Button>

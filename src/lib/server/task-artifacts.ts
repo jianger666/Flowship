@@ -16,6 +16,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import type { ActionRecord, ArtifactRevision, Task } from "@/lib/types";
+import { getChatLifecycle } from "./chat-gate";
 import { dataRoot } from "./data-root";
 import {
   ACTIONS_DIR,
@@ -64,16 +65,33 @@ export interface ImageAttachmentSaved {
   filename?: string;
 }
 
+/** 锁外校验通过后的待写盘条目（只含内存数据，不占 withTaskLock） */
+interface PreparedImage {
+  buf: Buffer;
+  ext: string;
+  mimeType: string;
+  filename?: string;
+}
+
+/**
+ * 把用户上传的图片落盘到 `data/tasks/<id>/uploads/`。
+ *
+ * U4（验收）：chat-reply / question / ask-reply 的入口检查是一次性的，DELETE
+ * 可在其后发生；本函数若无锁地 `mkdir(..., recursive)`，会在任务目录被 rm
+ * 后重建孤儿 uploads。落盘段必须与 `deleteTask` 共用 `withTaskLock`，并在
+ * 锁内复查 lifecycle + meta——拿到锁时若已删完，复查必失败、绝不 mkdir。
+ *
+ * mime / base64 / 大小校验留在锁外，避免解码大图占锁。
+ */
 export const saveImageAttachments = async (
   taskId: string,
   images: ImageAttachmentInput[],
 ): Promise<ImageAttachmentSaved[]> => {
   if (images.length === 0) return [];
   sanitizeId(taskId);
-  const uploadsDir = path.join(taskDir(taskId), UPLOADS_DIR);
-  await fs.mkdir(uploadsDir, { recursive: true });
 
-  const saved: ImageAttachmentSaved[] = [];
+  // 锁外：纯内存校验，不占 withTaskLock
+  const prepared: PreparedImage[] = [];
   for (const img of images) {
     const ext = ALLOWED_IMAGE_MIME[img.mimeType.toLowerCase()];
     if (!ext) {
@@ -101,20 +119,52 @@ export const saveImageAttachments = async (
         } MB）`,
       );
     }
-    const id = newAttachmentId();
-    const filename = `${id}.${ext}`;
-    const absPath = path.join(uploadsDir, filename);
-    const relPath = path.relative(dataRoot(), absPath);
-    await fs.writeFile(absPath, buf);
-    saved.push({
-      absPath,
-      relPath,
+    prepared.push({
+      buf,
+      ext,
       mimeType: img.mimeType.toLowerCase(),
-      bytes: buf.length,
       filename: img.filename,
     });
   }
-  return saved;
+
+  // 与 deleteTask 互斥：DELETE 在锁内删完后本函数才拿到锁，复查失败则不 mkdir
+  return withTaskLock(taskId, async () => {
+    if (getChatLifecycle(taskId) === "deleting") {
+      throw new Error("任务正在删除、附件未保存");
+    }
+    const meta = await readMetaV06(taskId);
+    if (!meta) {
+      throw new Error("任务不存在或已删除、附件未保存");
+    }
+
+    const uploadsDir = path.join(taskDir(taskId), UPLOADS_DIR);
+    await fs.mkdir(uploadsDir, { recursive: true });
+
+    const saved: ImageAttachmentSaved[] = [];
+    try {
+      for (const item of prepared) {
+        const id = newAttachmentId();
+        const filename = `${id}.${item.ext}`;
+        const absPath = path.join(uploadsDir, filename);
+        const relPath = path.relative(dataRoot(), absPath);
+        await fs.writeFile(absPath, item.buf);
+        saved.push({
+          absPath,
+          relPath,
+          mimeType: item.mimeType,
+          bytes: item.buf.length,
+          filename: item.filename,
+        });
+      }
+      return saved;
+    } catch (err) {
+      // 中途写盘失败：清掉本次已写入的文件，避免半批孤儿附件
+      for (const s of saved) {
+        await fs.unlink(s.absPath).catch(() => {});
+      }
+      throw err;
+    }
+  });
 };
 
 // ----------------- artifact 读 -----------------

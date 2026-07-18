@@ -15,7 +15,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const TMP_ROOT = path.join(os.tmpdir(), `fe-cli-integrity-${Date.now()}`);
 process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
 
-import { verifyNpmTarball } from "@/lib/server/feishu-cli";
+import {
+  isTrustedFeishuAuthUrl,
+  verifyNpmTarball,
+} from "@/lib/server/feishu-cli";
 
 const FILE = path.join(TMP_ROOT, "pkg.tgz");
 const CONTENT = "fake-tgz-bytes-abcdef";
@@ -60,5 +63,41 @@ describe("verifyNpmTarball（CR-05）", () => {
     await expect(
       verifyNpmTarball(FILE, { integrity: "sha256-abc" }, "t"),
     ).rejects.toThrow(/格式不认识/);
+  });
+});
+
+describe("isTrustedFeishuAuthUrl（登录 stdout 自动 open 白名单）", () => {
+  it("飞书 / larksuite / feishu-boe.cn 域放行", () => {
+    expect(
+      isTrustedFeishuAuthUrl("https://accounts.feishu.cn/oauth/authorize?x=1"),
+    ).toBe(true);
+    expect(
+      isTrustedFeishuAuthUrl("https://project.feishu.cn/auth/login"),
+    ).toBe(true);
+    expect(
+      isTrustedFeishuAuthUrl("https://open.larksuite.com/open-apis/authen/v1"),
+    ).toBe(true);
+    expect(isTrustedFeishuAuthUrl("https://feishu-boe.cn/oauth")).toBe(true);
+    expect(
+      isTrustedFeishuAuthUrl("https://foo.feishu-boe.cn/oauth"),
+    ).toBe(true);
+  });
+
+  it("非飞书 https / 非 https → 拒绝", () => {
+    expect(isTrustedFeishuAuthUrl("https://evil.example/phish")).toBe(false);
+    expect(isTrustedFeishuAuthUrl("http://accounts.feishu.cn/x")).toBe(false);
+    expect(isTrustedFeishuAuthUrl("not-a-url")).toBe(false);
+  });
+
+  it("feishu-boe substring / 混淆域 → 拒绝", () => {
+    expect(
+      isTrustedFeishuAuthUrl("https://feishu-boe.evil.example/phish"),
+    ).toBe(false);
+    expect(isTrustedFeishuAuthUrl("https://evilfeishu-boe.cn/oauth")).toBe(
+      false,
+    );
+    expect(
+      isTrustedFeishuAuthUrl("https://feishu-boe.cn.evil.com/oauth"),
+    ).toBe(false);
   });
 });

@@ -10,12 +10,27 @@
 
 import type { ConversationStep, InteractionUpdate, Run } from "@cursor/sdk";
 
+import { normalizeToolName } from "./normalize-tool-name";
+
+export type RunPerfTurnUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens?: number;
+};
+
 export type RunPerfCtx = {
   taskId: string;
   agentId: string;
   /** 调用点语义：task-first / task-followup / question / chat-first 等 */
   runKind: string;
   promptBytes?: number;
+  /**
+   * turn-ended 时可选回调（chat 用：写入内存 token 透视 + 超阈值建议压缩 info）。
+   * 埋点失败绝不能拖垮主流程——回调内异常由本模块吞掉。
+   */
+  onTurnUsage?: (usage: RunPerfTurnUsage) => void;
 };
 
 export type RunPerfTracker = {
@@ -47,19 +62,6 @@ type ToolCallLike = {
       isError?: boolean;
     };
   };
-};
-
-/** 内置工具用 type；MCP 归一为 mcp:<server>:<innerToolName>（防泄密、只记名字） */
-const normalizeToolName = (toolCall: ToolCallLike): string => {
-  if (toolCall.type === "mcp") {
-    const server = toolCall.args?.providerIdentifier;
-    const inner = toolCall.args?.toolName;
-    if (server && inner) return `mcp:${server}:${inner}`;
-    if (inner) return `mcp:?:${inner}`;
-    if (server) return `mcp:${server}:?`;
-    return "mcp";
-  }
-  return toolCall.type || "unknown";
 };
 
 const toolStatus = (toolCall: ToolCallLike): "success" | "error" | "unknown" => {
@@ -159,6 +161,23 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
           `[perf-turn] ${base} inputTokens=${u.inputTokens} outputTokens=${u.outputTokens}` +
             ` cacheReadTokens=${u.cacheReadTokens} cacheWriteTokens=${u.cacheWriteTokens}${reasoning}`,
         );
+        // chat token 透视 / 超阈值提示：只传数字、不碰正文
+        if (ctx.onTurnUsage) {
+          try {
+            ctx.onTurnUsage({
+              inputTokens: u.inputTokens,
+              outputTokens: u.outputTokens,
+              cacheReadTokens: u.cacheReadTokens,
+              cacheWriteTokens: u.cacheWriteTokens,
+              reasoningTokens:
+                typeof u.reasoningTokens === "number"
+                  ? u.reasoningTokens
+                  : undefined,
+            });
+          } catch (cbErr) {
+            console.warn(`[perf] onTurnUsage 回调失败 task=${ctx.taskId}`, cbErr);
+          }
+        }
       }
     } catch (err) {
       // 埋点绝不能拖垮主流程

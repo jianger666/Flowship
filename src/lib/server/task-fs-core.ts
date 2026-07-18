@@ -30,7 +30,8 @@ import type {
   TaskMode,
   TaskSummary,
 } from "@/lib/types";
-import { dataRoot, renameWithRetry } from "./data-root";
+import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
+import { failpoint } from "./failpoints";
 // 只用其纯函数（getTaskCwd 路径计算、零 IO）、task-worktrees 不反向依赖本模块（无环）
 import { getTaskCwd } from "./task-worktrees";
 import { z } from "zod";
@@ -44,12 +45,20 @@ export const ACTIONS_DIR = "actions";
 // 任务专属可写工作目录（V0.x「产出解耦」）：artifact 之外的文件产出（脚本 / 数据 / 中间产物）
 // 没有明确去处时写这里——只读仓 / 无仓任务也永远有合法可写落点。建任务时创建、随任务删除。
 export const WORKSPACE_DIR = "workspace";
+/** 工具超长输出全量落盘目录（Phase 1 tool_result 截断后查看完整输出用、随任务删） */
+export const TOOL_OUTPUTS_DIR = "tool-outputs";
 export const REVISIONS_SUBDIR = ".revisions";
 // 划除（软删）的 artifact 挪进这个隐藏子目录——跟 .revisions / .checks 同风格、
 // agent 的 ls / rg 默认都扫不到、防被按编号拼路径翻出来读（V0.8.16、见 setActionArtifactExcluded）
 export const EXCLUDED_SUBDIR = ".excluded";
 // 单 action 最多保留 10 个 revision、超出 GC 删最早（沿用 V0.5.12 的上限策略）
 export const MAX_REVISIONS_PER_ACTION = 10;
+/**
+ * Windows 上进程持有任务目录句柄时 fs.rm 会 EBUSY（典型：shell 卡死后 cwd 停在 workspace、
+ * kill-orphans 在 win32 是 no-op）。deleteTask 降级写此标记、删掉 meta 让 UI 立刻消失；
+ * boot recovery 只清扫带此标记的目录（绝不动 bench/fixture 等无标记手工目录）。
+ */
+export const DELETED_TOMBSTONE_FILE = ".deleted-tombstone";
 
 // ----------------- id 生成 / 校验 -----------------
 
@@ -333,7 +342,22 @@ export const readMetaV06 = async (id: string): Promise<TaskMetaV06 | null> => {
   return raw;
 };
 
-export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
+/**
+ * R20-3 / R26-5：把序列化 + 写 tmp 与原子 rename 拆开。
+ * prepare 期间脏值只在 tmp、meta.json 未动；commit = rename；abort = unlink tmp。
+ * 条件事务 helper 用「prepare → 同步复查 → commit(finalGuard)」消灭写后回滚窗口。
+ *
+ * R26-5 线性化：finalGuard 在 failpoint await 之后、rename 发起前同步执行——
+ * owner/caller map 不受 task lock 约束，B 可在「prepare 后检查」与 rename 之间接管；
+ * 权威检查必须落在 rename 紧前，否则 A 仍会提交旧值。
+ */
+export const prepareMetaWrite = async (
+  meta: TaskMetaV06,
+): Promise<{
+  /** @returns true=已 rename；false=finalGuard 拒写 / 已 settled（tmp 已清） */
+  commit: (finalGuard?: () => boolean) => Promise<boolean>;
+  abort: () => Promise<void>;
+}> => {
   const dir = taskDir(meta.id);
   // createTask 靠这里 mkdir 建任务目录；deleteTask 持 withTaskLock 后与之互斥，不会「删完被写回复活」
   await fs.mkdir(dir, { recursive: true });
@@ -344,11 +368,47 @@ export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
     .slice(2, 8)}`;
   try {
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
-    await renameWithRetry(tmpPath, finalPath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
   }
+  let settled = false;
+  return {
+    commit: async (finalGuard?: () => boolean) => {
+      if (settled) return false;
+      settled = true;
+      try {
+        // R25-1 / R25-5：rename 已发起未落盘窗口——矩阵可在此注入 stop，
+        // 验证 stop 的锁内收尾必排在本 commit 持锁返回之后（见 finalizeStaleAndIdleLocked）
+        await failpoint("metaCommit.beforeRename");
+        // R26-5：权威 lease——同步、无 await 夹缝；false 则 unlink tmp、不 rename
+        if (finalGuard && !finalGuard()) {
+          await fs.unlink(tmpPath).catch(() => {});
+          return false;
+        }
+        // R27-1：finalGuard 压进 rename retry 循环——每次 fs.rename 前再验；
+        // 首轮失败退避期间换主 → RenameAbortedError → 清 tmp、返 false
+        await renameWithRetry(tmpPath, finalPath, finalGuard);
+        return true;
+      } catch (err) {
+        await fs.unlink(tmpPath).catch(() => {});
+        // R27-1：beforeAttempt 拒写 = 未提交（不是 IO 故障）
+        if (err instanceof RenameAbortedError) return false;
+        throw err;
+      }
+    },
+    abort: async () => {
+      if (settled) return;
+      settled = true;
+      await fs.unlink(tmpPath).catch(() => {});
+    },
+  };
+};
+
+/** 无条件写 meta：prepare + commit（finalGuard 不传、照常 rename） */
+export const writeMeta = async (meta: TaskMetaV06): Promise<void> => {
+  const prepared = await prepareMetaWrite(meta);
+  await prepared.commit();
 };
 
 // ----------------- 事件流 -----------------
@@ -502,23 +562,85 @@ export const readEventsBefore = async (
   return { events: window, hasMore: discarded };
 };
 
-export const appendEventLine = async (
+/**
+ * per-task events.jsonl 追加串行队列。
+ *
+ * Node 文档明确：同一文件并发 appendFile 不安全；且 tool_result 单行常 >8KB，
+ * 超过 POSIX O_APPEND 原子写保证（管道缓冲通常 4KB～PIPE_BUF）。同 task 的写源
+ * 含 run 流 / 后台 post-check / ask notifier 等，必须按 taskId 串行化。
+ * 挂 globalThis：与 withTaskLock 同因——Next.js dev 多 chunk 下 module-level Map 会分裂。
+ */
+const EVENT_APPEND_CHAINS_KEY = "__feAiFlowEventAppendChainsV1__";
+const getEventAppendChains = (): Map<string, Promise<void>> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, Promise<void>> | undefined
+  >;
+  if (!g[EVENT_APPEND_CHAINS_KEY]) g[EVENT_APPEND_CHAINS_KEY] = new Map();
+  return g[EVENT_APPEND_CHAINS_KEY]!;
+};
+
+/**
+ * 实际 append（无串行）。
+ * @returns true=已写入；false=ENOENT（任务目录已删、R27-7 透传给上层不 publish）
+ */
+const appendEventLineUnlocked = async (
   id: string,
   ev: TaskEvent,
-): Promise<void> => {
+): Promise<boolean> => {
   // 不再无条件 mkdir：审查发现与 deleteTask 竞态时会把已删目录「复活」。
   // 调用方约定目录已存在（createTask 先 writeMeta；appendEvent 先查 meta；boot recovery 已有 meta）。
-  // 目录没了 = 任务已删 → ENOENT 静默丢弃该事件（无处落是预期）。
+  // 目录没了 = 任务已删 → ENOENT 返 false（R27-7：上层不构造成功、不 publish 幽灵事件）。
   try {
     await fs.appendFile(
       path.join(taskDir(id), EVENTS_FILE),
       JSON.stringify(ev) + "\n",
       "utf-8",
     );
+    return true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return;
+    if (code === "ENOENT") return false;
     throw err;
+  }
+};
+
+/**
+ * 追加一条事件行（按 taskId 串行）。
+ * 链上单次写入失败会抛给调用方，但不中断后续写入（catch 后继续）。
+ *
+ * @param lease R26-5：可选；在 chain 回调内、appendFile 之前同步执行。
+ *   false → 跳过写盘、返 false（堵死「检查通过后入队、B claim、队列才执行 A」）。
+ * @returns true=已 append；false=lease 拒写或 ENOENT（R27-7）
+ */
+export const appendEventLine = async (
+  id: string,
+  ev: TaskEvent,
+  lease?: () => boolean,
+): Promise<boolean> => {
+  const chains = getEventAppendChains();
+  const previous = chains.get(id) ?? Promise.resolve();
+  // R26-5：lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
+  const run = async (): Promise<boolean> => {
+    await failpoint("event.inQueue");
+    if (lease && !lease()) return false;
+    // R27-7：ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
+    return await appendEventLineUnlocked(id, ev);
+  };
+  // previous 失败也跑本次写（.then(run, run)）；本次失败仍抛给 await 方
+  const next = previous.then(run, run);
+  // 链尾永不 reject，避免一次失败毒死后续排队者
+  const retained = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  chains.set(id, retained);
+  try {
+    return await next;
+  } finally {
+    if (chains.get(id) === retained) {
+      chains.delete(id);
+    }
   }
 };
 

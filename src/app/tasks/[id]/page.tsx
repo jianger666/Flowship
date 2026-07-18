@@ -50,6 +50,7 @@ import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
+import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
@@ -65,6 +66,7 @@ import { Separator } from "@/components/ui/separator";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
 
 import { getSettings } from "@/lib/local-store";
 import {
@@ -238,7 +240,10 @@ const TaskDetailPage = () => {
   // 已读上报（v1.1.x「待确认」已读即清）：正在看这个任务 = 交卷动静都算已读、
   // 侧栏「待确认」标记 / 琥珀点随之熄灭（依赖 updatedAt：页内新交卷也即时算已读）
   useEffect(() => {
-    if (task?.id) markTaskSeen(task.id);
+    if (!task?.id) return;
+    markTaskSeen(task.id);
+    // 同页侧栏靠此事件重读 localStorage（storage 事件不会在本 tab 触发）
+    window.dispatchEvent(new Event(TASK_SEEN_EVENT));
   }, [task?.id, task?.updatedAt]);
 
   // 收件箱「改bug」主路径深链（命中开发中任务 / 新建引流都走这里）：
@@ -314,6 +319,8 @@ const TaskDetailPage = () => {
     task?.id,
     {
       onEvent: (ev) => {
+        // ephemeral tool_output_delta 不进 task.events（task 模式暂不渲染直播，仍要挡落盘）
+        if (isEphemeralToolOutputDelta(ev)) return;
         if (ev.kind === "assistant_message") setStreamingText("");
         setTask((prev) => {
           if (!prev) return prev;
@@ -674,6 +681,8 @@ const TaskDetailPage = () => {
           task={task}
           onTaskUpdate={absorbTask}
           onEventAppend={(ev) => {
+            // 双保险：ChatView 已滤 ephemeral，这里再挡一次防漏进持久 rows
+            if (isEphemeralToolOutputDelta(ev)) return;
             setTask((prev) => {
               if (!prev) return prev;
               if (prev.events.some((e) => e.id === ev.id)) return prev;

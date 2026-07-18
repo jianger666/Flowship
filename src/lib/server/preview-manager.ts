@@ -31,7 +31,8 @@ const execFileAsync = promisify(execFile);
 // ----------------- 类型 -----------------
 
 interface PreviewSlot extends Omit<PreviewSlotStatus, "logTail"> {
-  proc: ChildProcess;
+  /** 存活时持有；进程 exit 后置 null，避免弱泄漏（保留 status / 日志快照） */
+  proc: ChildProcess | null;
   log: string[];
   /** 本次 spawn 的随机 ownership token（pidfile 归属核验用、CR-10） */
   token: string;
@@ -182,16 +183,65 @@ const getProcessCommand = async (pid: number): Promise<string | null> => {
  * 误杀。unix 下 spawn(shell:true) 的子进程命令行是 `/bin/sh -c <command>`（或 sh
  * 直接 exec 成 <command> 本体）、ps 输出应包含记录的 command；win 的 tasklist 只给
  * 映像名、只能弱校验是 shell/node 家族。
+ *
+ * 词边界匹配（禁止纯前缀）：`npm run develop` / `npm run dev:local` 不得命中记录的
+ * `npm run dev`——否则 PID 复用场景会误杀。
  */
 const pidLooksOurs = (psCommand: string, recCommand: string): boolean => {
   if (process.platform === "win32") {
     return /^(cmd\.exe|node\.exe|powershell\.exe)$/i.test(psCommand.trim());
   }
-  return psCommand.includes(recCommand);
+  if (!recCommand) return false;
+  let from = 0;
+  while (from <= psCommand.length) {
+    const idx = psCommand.indexOf(recCommand, from);
+    if (idx === -1) return false;
+    const beforeOk =
+      idx === 0 ||
+      /\s/.test(psCommand.charAt(idx - 1)) ||
+      (idx >= 3 && psCommand.slice(idx - 3, idx) === "-c ");
+    const afterIdx = idx + recCommand.length;
+    const afterOk =
+      afterIdx >= psCommand.length || /[\s;&|]/.test(psCommand.charAt(afterIdx));
+    if (beforeOk && afterOk) return true;
+    from = idx + 1;
+  }
+  return false;
+};
+
+/** 进程是否仍存活（kill(pid,0)；ESRCH = 已退出） */
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 进程组是否仍存在。
+ * shell:true + detached 时组长常是 shell——TERM 后 shell 可能先退，占端口的
+ * 子进程仍在同一组；只查组长 PID 会误判「已清干净」而跳过 SIGKILL。
+ * Unix：kill(-pid,0) 探组；EPERM 也表示组内仍有成员，仅 ESRCH 表示组已空。
+ * 负号语义不可用时回退 processAlive（查组长）。
+ */
+const processGroupAlive = (pid: number): boolean => {
+  if (pid <= 0) return processAlive(pid);
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    return processAlive(pid);
+  }
 };
 
 // 杀整棵进程树。
-// - mac/linux：detached spawn 后 pid = 进程组长、kill(-pid) 杀全组；先 TERM 给优雅退出机会、2s 后 KILL 兜底
+// - mac/linux：detached spawn 后 pid = 进程组长、kill(-pid) 杀全组；先 TERM 给优雅退出机会、
+//   按「进程组是否仍在」轮询最多 2s、超时再对 -pid 发 KILL 兜底（组已空则提前返回）
 // - Windows（V0.11.1）：没有进程组负号语义、kill(-pid) 会抛——用 `taskkill /T /F` 杀整棵树
 //   （dev server 常见 node → webpack workers 多级子进程、只杀父进程会留孤儿占端口）
 const killProcessGroup = async (pid: number): Promise<void> => {
@@ -220,7 +270,12 @@ const killProcessGroup = async (pid: number): Promise<void> => {
     }
   };
   if (!tryKill("SIGTERM")) return;
-  await new Promise((r) => setTimeout(r, 2000));
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (!processGroupAlive(pid)) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!processGroupAlive(pid)) return;
   tryKill("SIGKILL");
 };
 
@@ -315,7 +370,7 @@ const doStopPreview = async (repoPath: string): Promise<void> => {
   const slot = map.get(repoPath);
   if (!slot) return;
   map.delete(repoPath);
-  if (slot.proc.pid) await killProcessGroup(slot.proc.pid);
+  if (slot.proc?.pid) await killProcessGroup(slot.proc.pid);
   // 只清自己那条（token 核验）——理论上串行队列已保证无交错、token 是带子
   await clearPidFileIf(slot.token);
 };
@@ -430,6 +485,8 @@ const doStartPreview = async (
   proc.on("exit", (code) => {
     slot.exited = true;
     slot.exitCode = code;
+    // 自然退出：放下 ChildProcess 引用，保留 status / 日志快照，避免弱泄漏
+    slot.proc = null;
     // CR-10：只有自己还是「该仓当前预览位」才清 pidfile——被顶掉的旧进程迟到的 exit
     // 不得清掉新进程刚写的那条（token 双保险）。
     // 必须进串行队列：pidfile 现在是数组读改写、exit 回调裸跑会与别的仓

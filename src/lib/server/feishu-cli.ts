@@ -25,7 +25,7 @@ import { promises as fs, createReadStream, createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import { dataRoot } from "./data-root";
@@ -60,21 +60,60 @@ export const injectFeishuCliPath = (): void => {
 
 // ----------------- 下载 / 解包工具 -----------------
 
+/** 下载整包超时（二进制 / tarball） */
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+/** registry 元数据超时 */
+const META_FETCH_TIMEOUT_MS = 10_000;
+/** 单次下载体积上限（Content-Length 或累计字节） */
+const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+
 // 私有临时目录（CR-05）：os.tmpdir 是共享可写目录、可预测文件名有 symlink / 抢占
 // 风险——统一用 mkdtemp 拿带随机后缀的私有目录、下载 / 解包全在里面做
 const makePrivateTmpDir = async (label: string): Promise<string> =>
   fs.mkdtemp(path.join(os.tmpdir(), `fe-ai-flow-${label}-`));
 
+/** 流式计数：超 MAX_DOWNLOAD_BYTES 中止（防无 Content-Length 的无限流） */
+const createByteLimitTransform = (): Transform => {
+  let downloaded = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      downloaded += (chunk as Buffer).length;
+      if (downloaded > MAX_DOWNLOAD_BYTES) {
+        cb(
+          new Error(
+            `下载体积超限（累计 ${downloaded} > ${MAX_DOWNLOAD_BYTES} bytes）`,
+          ),
+        );
+        return;
+      }
+      cb(null, chunk);
+    },
+  });
+};
+
 // 下载到文件（跟随重定向；github 或 npm registry 都走这里）
 const downloadTo = async (url: string, dest: string): Promise<void> => {
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetch(url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+  });
   if (!res.ok || !res.body) {
     throw new Error(`下载失败 HTTP ${res.status}：${url}`);
+  }
+  const cl = res.headers.get("content-length");
+  if (cl) {
+    const n = Number(cl);
+    if (Number.isFinite(n) && n > MAX_DOWNLOAD_BYTES) {
+      throw new Error(
+        `下载体积超限（Content-Length ${n} > ${MAX_DOWNLOAD_BYTES}）`,
+      );
+    }
   }
   await fs.mkdir(path.dirname(dest), { recursive: true });
   // Web ReadableStream → Node stream、流式落盘（二进制 10-20MB、不进内存）
   await pipeline(
     Readable.fromWeb(res.body as import("node:stream/web").ReadableStream),
+    createByteLimitTransform(),
     createWriteStream(dest, { flags: "wx" }), // 排他创建：dest 已存在（被抢占）直接失败
   );
 };
@@ -155,7 +194,10 @@ const fetchNpmLatestMeta = async (pkg: string): Promise<NpmLatestMeta> => {
   const encoded = pkg.replace("/", "%2F");
   for (const base of ["https://registry.npmjs.org", "https://registry.npmmirror.com"]) {
     try {
-      const res = await fetch(`${base}/${encoded}/latest`, { redirect: "follow" });
+      const res = await fetch(`${base}/${encoded}/latest`, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(META_FETCH_TIMEOUT_MS),
+      });
       if (!res.ok) continue;
       const meta = (await res.json()) as {
         version?: string;
@@ -452,6 +494,25 @@ export const startInstall = (): boolean => {
 
 // ----------------- 登录（spawn 托管、抓授权 URL 给 UI 兜底） -----------------
 
+/**
+ * 登录 stdout 里抓到的 URL 是否允许自动 open。
+ * 只放行飞书系域名（feishu.cn / larksuite.com / feishu-boe.cn），其余只记录不打开。
+ */
+export const isTrustedFeishuAuthUrl = (url: string): boolean => {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    if (host === "feishu.cn" || host.endsWith(".feishu.cn")) return true;
+    if (host === "larksuite.com" || host.endsWith(".larksuite.com")) return true;
+    // 飞书 BOE / 预发：精确注册域及子域，禁止 substring 匹配
+    if (host === "feishu-boe.cn" || host.endsWith(".feishu-boe.cn")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+};
+
 interface LoginState {
   running: boolean;
   // 输出里抓到的最后一个 https URL（CLI 自己会开浏览器、这里给 UI 兜底展示）
@@ -548,23 +609,32 @@ export const startLogin = async (
         // 打印两个不同 URL——**每个新 URL 都要开**（原来只开第一个、用户卡在第二步
         // 授权不知道要操作、只能靠 AI 聊天时提醒）
         const m = trimmed.match(/https:\/\/\S+/);
-        // 最多自动开 3 个不同 URL（两步流程足够）、防 CLI 输出里夹文档链接开一堆 tab
-        if (m && m[0] !== state.authUrl && (state.openedUrls ?? 0) < 3) {
-          state.openedUrls = (state.openedUrls ?? 0) + 1;
+        // 抓到新 URL 一律记录给 UI；只对已知飞书域自动 open（防 stdout 任意 https 被开浏览器）
+        if (m && m[0] !== state.authUrl) {
           state.authUrl = m[0];
-          const opener =
-            process.platform === "darwin"
-              ? ["open", [m[0]]]
-              : process.platform === "win32"
-                ? ["cmd", ["/c", "start", "", m[0]]]
-                : ["xdg-open", [m[0]]];
-          try {
-            spawn(opener[0] as string, opener[1] as string[], {
-              detached: true,
-              stdio: "ignore",
-            }).unref();
-          } catch {
-            // 打不开就靠 UI 链接 / 二维码
+          if (
+            isTrustedFeishuAuthUrl(m[0]) &&
+            (state.openedUrls ?? 0) < 3
+          ) {
+            state.openedUrls = (state.openedUrls ?? 0) + 1;
+            const opener =
+              process.platform === "darwin"
+                ? ["open", [m[0]]]
+                : process.platform === "win32"
+                  ? ["cmd", ["/c", "start", "", m[0]]]
+                  : ["xdg-open", [m[0]]];
+            try {
+              spawn(opener[0] as string, opener[1] as string[], {
+                detached: true,
+                stdio: "ignore",
+              }).unref();
+            } catch {
+              // 打不开就靠 UI 链接 / 二维码
+            }
+          } else if (!isTrustedFeishuAuthUrl(m[0])) {
+            console.log(
+              `[feishu-cli] 登录输出含非飞书域 URL、仅记录不打开：${m[0]}`,
+            );
           }
         }
       }

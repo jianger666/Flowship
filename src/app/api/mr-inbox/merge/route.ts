@@ -4,13 +4,17 @@
  * body: { mrUrl: string }
  * host / projectPath / iid 全部从 MR URL 解析（不依赖任务仓库推导）；
  * token 用 settings.gitToken。成功后把该 MR 从收件箱缓存剔除（UI 立即一致）。
+ *
+ * 安全：MR host 必须落在 settings.repos 各仓 remote 推导的 allowlist 内，
+ * 否则 4xx、绝不带 PAT 出站（防评论植入 evil host SSRF / 凭证外泄）。
  */
 
 import { NextResponse } from "next/server";
 
-import { parseGitlabMrUrl } from "@/lib/mr-inbox";
+import { parseGitlabMrUrl, shouldAttachGitlabToken } from "@/lib/mr-inbox";
 import { mergeMR } from "@/lib/server/gitlab-client";
 import {
+  collectGitlabHostAllowlist,
   markBugMrMergedInCache,
   removeMrFromInboxCache,
 } from "@/lib/server/mr-inbox-scanner";
@@ -33,13 +37,22 @@ export const POST = async (req: Request) => {
   if (!parsed) return errorResponse("MR URL 无法解析");
 
   const settingsResult = await readSettingsFile();
+  const settings =
+    settingsResult.status === "ok" ? settingsResult.settings : null;
   const gitToken =
-    settingsResult.status === "ok" &&
-    typeof settingsResult.settings.gitToken === "string"
-      ? settingsResult.settings.gitToken.trim()
+    settings && typeof settings.gitToken === "string"
+      ? settings.gitToken.trim()
       : "";
   if (!gitToken) {
     return errorResponse("未配置 GitLab Token、请先到设置页配置", 400);
+  }
+
+  const allowedHosts = await collectGitlabHostAllowlist(settings);
+  if (!shouldAttachGitlabToken(parsed.host, allowedHosts)) {
+    return errorResponse(
+      "MR 所属 GitLab 不在已配置仓库允许列表、拒绝合并",
+      400,
+    );
   }
 
   try {

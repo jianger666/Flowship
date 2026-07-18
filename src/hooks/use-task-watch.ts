@@ -81,6 +81,27 @@ export const useTaskWatch = (
 
     const ctrl = new AbortController();
     let cancelled = false;
+    let backoffTimer: ReturnType<typeof setTimeout> | undefined;
+    let wakeBackoff: (() => void) | null = null;
+
+    const clearBackoff = () => {
+      if (backoffTimer !== undefined) {
+        clearTimeout(backoffTimer);
+        backoffTimer = undefined;
+      }
+      wakeBackoff?.();
+      wakeBackoff = null;
+    };
+
+    const delay = (ms: number) =>
+      new Promise<void>((resolve) => {
+        wakeBackoff = resolve;
+        backoffTimer = setTimeout(() => {
+          backoffTimer = undefined;
+          wakeBackoff = null;
+          resolve();
+        }, ms);
+      });
 
     // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」才停止订阅
     const loop = async () => {
@@ -90,19 +111,32 @@ export const useTaskWatch = (
         // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
         let gotTerminalDone = false;
         const sseCallbacks: TaskStreamCallbacks = {
-          onEvent: (ev) => callbacksRef.current.onEvent?.(ev),
-          onTaskUpdate: (t) => callbacksRef.current.onTaskUpdate?.(t),
-          onActionUpdate: (a) => callbacksRef.current.onActionUpdate?.(a),
-          onAssistantDelta: (text) =>
-            callbacksRef.current.onAssistantDelta?.(text),
+          onEvent: (ev) => {
+            if (cancelled) return;
+            callbacksRef.current.onEvent?.(ev);
+          },
+          onTaskUpdate: (t) => {
+            if (cancelled) return;
+            callbacksRef.current.onTaskUpdate?.(t);
+          },
+          onActionUpdate: (a) => {
+            if (cancelled) return;
+            callbacksRef.current.onActionUpdate?.(a);
+          },
+          onAssistantDelta: (text) => {
+            if (cancelled) return;
+            callbacksRef.current.onAssistantDelta?.(text);
+          },
           onDone: (t, ok) => {
+            if (cancelled) return;
             if (t.repoStatus === "merged" || t.repoStatus === "abandoned") {
               gotTerminalDone = true;
             }
             callbacksRef.current.onDone?.(t, ok);
           },
           onError: (msg) => {
-            if (!cancelled) callbacksRef.current.onErrorMessage?.(msg);
+            if (cancelled) return;
+            callbacksRef.current.onErrorMessage?.(msg);
           },
         };
 
@@ -134,7 +168,8 @@ export const useTaskWatch = (
           failures > 0
             ? Math.min(failures * 1500, 8000)
             : RECONNECT_DELAY_MS;
-        await new Promise((r) => setTimeout(r, backoff));
+        await delay(backoff);
+        if (cancelled) return;
       }
     };
     void loop();
@@ -142,6 +177,7 @@ export const useTaskWatch = (
     return () => {
       cancelled = true;
       ctrl.abort();
+      clearBackoff();
     };
   }, [taskId, enabled, reconnectKey]);
 };

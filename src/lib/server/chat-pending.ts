@@ -59,7 +59,13 @@ export type AwaitingSignal =
       actionId?: string;
     };
 
-export type AwaitingNotifier = (signal: AwaitingSignal) => Promise<void> | void;
+/** R25-3：handler / notifier 内部 await 后复查 caller 是否仍是当前 bridge */
+export type CallerValidityCtx = { callerStillValid: () => boolean };
+
+export type AwaitingNotifier = (
+  signal: AwaitingSignal,
+  ctx: CallerValidityCtx,
+) => Promise<void> | void;
 
 // task-scoped「同步 RPC」action（submit_mr / set_feishu_testers / set_plan_batches）——
 // chat-mcp 工具收到调用后查表找 runner 注册的 handler 执行、拿结构化返回值
@@ -98,6 +104,7 @@ export type ChatTaskActionResult =
 
 export type ChatTaskActionHandler = (
   action: ChatTaskAction,
+  ctx: CallerValidityCtx,
 ) => Promise<ChatTaskActionResult>;
 
 // ----------------- 进程全局状态（挂 globalThis） -----------------
@@ -110,14 +117,20 @@ interface ChatMcpGlobalState {
   pendingAsks: Map<string, PendingAsk>;
   awaitingNotifiers: Map<string, AwaitingNotifier>;
   taskActionHandlers: Map<string, ChatTaskActionHandler>;
+  /**
+   * R24-6：taskId → 当前注册 bridge 期望的 caller token（agent 实例身份）。
+   * MCP 工具执行前核对请求携带的 caller；不匹配则拒副作用。
+   */
+  expectedCallerTokens: Map<string, string>;
   sessionTransports: Map<string, WebStandardStreamableHTTPServerTransport>;
 }
 
+// V14：2026-07-18 R24-6——加 expectedCallerTokens（MCP caller 身份）。
 // V13：2026-07-07 V0.11 wait 协议退役——删 pendingMap / tokenToTask / waitingTasks /
 //      pendingNextActions / unansweredRevises / chatModeTasks / prematureWaitRejects、
 //      新增 pendingAsks（ask 弹窗登记）。bump 强制 dev hot reload 拿全新 state。
 // V12 及更早见 git 历史（wait 协议时代的状态机字段）。
-const GLOBAL_KEY = "__feAiFlowChatStateV13__";
+const GLOBAL_KEY = "__feAiFlowChatStateV14__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -127,6 +140,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
       pendingAsks: new Map(),
       awaitingNotifiers: new Map(),
       taskActionHandlers: new Map(),
+      expectedCallerTokens: new Map(),
       sessionTransports: new Map(),
     };
   }
@@ -136,6 +150,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
 const pendingAsks = getGlobalState().pendingAsks;
 const awaitingNotifiers = getGlobalState().awaitingNotifiers;
 const taskActionHandlers = getGlobalState().taskActionHandlers;
+const expectedCallerTokens = getGlobalState().expectedCallerTokens;
 
 // MCP session 表（sessionId → transport）：chat-mcp.ts handleChatMcpRequest 用
 export const sessionTransports = getGlobalState().sessionTransports;
@@ -171,40 +186,102 @@ export const clearPendingAsk = (taskId: string): void => {
 };
 
 /**
- * 停止 / 重启 / 删除 task 时调：清掉未答的 ask 登记。
+ * 停止 / 重启 / 删除 task 时调：清掉未答的 ask 登记（无条件）。
+ * 失主让位反登记请用 {@link cancelPendingIf}——裸删会误清 B 刚登记的新提问（R26-3）。
  * @returns 是否真的清了（调用方据此决定要不要写「已作废」事件）
  */
 export const cancelPending = (taskId: string): boolean =>
   pendingAsks.delete(taskId);
+
+/**
+ * R26-3：按 askId 条件反登记——当前 pendingAsk 的 askId 匹配才删。
+ * 线性化：同步比对 + delete、无 await；旧 A 失主后不得删掉 B 刚登记的新提问。
+ * @returns true=删了自己的；false=不匹配 / 无 pending（不动）
+ */
+export const cancelPendingIf = (
+  taskId: string,
+  expectedAskId: string,
+): boolean => {
+  const cur = pendingAsks.get(taskId);
+  if (!cur || cur.askId !== expectedAskId) return false;
+  pendingAsks.delete(taskId);
+  return true;
+};
+
+/**
+ * R26-4：同步失效 MCP bridge lease（只删 expectedCallerTokens）。
+ * stop 在首个 await 前调用——旧 agent 的 MCP 立即被 fail-closed 分派拒绝；
+ * handler/notifier 表稍后由 cleanupChatTaskState 一并清。
+ */
+export const invalidateCallerToken = (taskId: string): void => {
+  expectedCallerTokens.delete(taskId);
+};
 
 /** 任务被永久删除时调：清掉所有跟它相关的进程级状态 */
 export const cleanupChatTaskState = (taskId: string): void => {
   pendingAsks.delete(taskId);
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
+  expectedCallerTokens.delete(taskId);
 };
+
+/** R24-6：MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */
+export const CALLER_MISMATCH_ERROR = "任务已被新 agent 接管、本次调用忽略";
+
+/**
+ * R24-6：请求携带的 caller 是否匹配当前注册 bridge。
+ * 无注册 / token 缺失 / 不匹配 → false（fail-closed）。
+ */
+export const matchExpectedCallerToken = (
+  taskId: string,
+  callerToken: string | undefined,
+): boolean =>
+  !!callerToken && expectedCallerTokens.get(taskId) === callerToken;
+
+/** 读当前期望 token（测试 / 调试） */
+export const getExpectedCallerToken = (taskId: string): string | null =>
+  expectedCallerTokens.get(taskId) ?? null;
 
 // ----------------- notifier / handler 注册表（runner ↔ chat-mcp 桥） -----------------
 
+/**
+ * 注册 awaiting notifier。
+ * @param callerToken R24-6：与 handler 共用的 agent 实例身份；同一次 installSessionIfCurrent 必传
+ */
 export const setChatAwaitingNotifier = (
   taskId: string,
   notifier: AwaitingNotifier | null,
+  callerToken?: string,
 ): void => {
   if (notifier) {
     awaitingNotifiers.set(taskId, notifier);
+    if (callerToken !== undefined) {
+      expectedCallerTokens.set(taskId, callerToken);
+    }
   } else {
     awaitingNotifiers.delete(taskId);
+    // handler 也已清 → 一并摘掉期望 token
+    if (!taskActionHandlers.has(taskId)) expectedCallerTokens.delete(taskId);
   }
 };
 
+/**
+ * 注册 task action handler。
+ * @param callerToken R24-6：与 notifier 共用的 agent 实例身份
+ */
 export const setChatTaskActionHandler = (
   taskId: string,
   handler: ChatTaskActionHandler | null,
+  callerToken?: string,
 ): void => {
   if (handler) {
     taskActionHandlers.set(taskId, handler);
+    if (callerToken !== undefined) {
+      expectedCallerTokens.set(taskId, callerToken);
+    }
   } else {
     taskActionHandlers.delete(taskId);
+    if (!awaitingNotifiers.has(taskId)) expectedCallerTokens.delete(taskId);
   }
 };
 
@@ -218,6 +295,7 @@ export const unsetChatTaskActionHandlerIf = (
 ): void => {
   if (taskActionHandlers.get(taskId) === expected) {
     taskActionHandlers.delete(taskId);
+    if (!awaitingNotifiers.has(taskId)) expectedCallerTokens.delete(taskId);
   }
 };
 
@@ -228,14 +306,23 @@ export const unsetChatAwaitingNotifierIf = (
 ): void => {
   if (awaitingNotifiers.get(taskId) === expected) {
     awaitingNotifiers.delete(taskId);
+    if (!taskActionHandlers.has(taskId)) expectedCallerTokens.delete(taskId);
   }
 };
 
-// 跑 task-scoped action handler、序列化结果给 MCP 工具返
+/**
+ * 跑 task-scoped action handler、序列化结果给 MCP 工具返。
+ * @param callerToken R24-6：MCP session 的 caller；不匹配则拒、不进 handler（防 createMR 等副作用）
+ */
 export const runTaskAction = async (
   taskId: string,
   action: ChatTaskAction,
+  callerToken?: string,
 ): Promise<ChatTaskActionResult> => {
+  // R24-6：分派层先核对身份——旧 agent 迟到请求不得借用新 bridge 闭包
+  if (!matchExpectedCallerToken(taskId, callerToken)) {
+    return { ok: false, error: CALLER_MISMATCH_ERROR };
+  }
   const handler = taskActionHandlers.get(taskId);
   if (!handler) {
     return {
@@ -244,7 +331,10 @@ export const runTaskAction = async (
     };
   }
   try {
-    return await handler(action);
+    // R25-3：闭包贯穿 handler——每个外部 await 后、不可逆副作用前可复查
+    const callerStillValid = (): boolean =>
+      matchExpectedCallerToken(taskId, callerToken);
+    return await handler(action, { callerStillValid });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { ok: false, error: `handler 抛错：${msg}` };
@@ -253,8 +343,15 @@ export const runTaskAction = async (
 
 export const safeNotifyAwaiting = async (
   taskId: string,
-  opts: { actionId?: string; artifactPath?: string } = {},
+  opts: { actionId?: string; artifactPath?: string; callerToken?: string } = {},
 ): Promise<void> => {
+  // R24-6：submit_work 路径同样先核对——不匹配静默跳过（不启 postCheck）
+  if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
+    console.warn(
+      `[chat-mcp] safeNotifyAwaiting: caller 不匹配 task=${taskId}、忽略`,
+    );
+    return;
+  }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
@@ -263,11 +360,17 @@ export const safeNotifyAwaiting = async (
     return;
   }
   try {
-    await notifier({
-      kind: "awaiting_start",
-      actionId: opts.actionId,
-      artifactPath: opts.artifactPath,
-    });
+    // R25-3：notifier 内部 await 后仍须能复查 caller
+    const callerStillValid = (): boolean =>
+      matchExpectedCallerToken(taskId, opts.callerToken);
+    await notifier(
+      {
+        kind: "awaiting_start",
+        actionId: opts.actionId,
+        artifactPath: opts.artifactPath,
+      },
+      { callerStillValid },
+    );
   } catch (err) {
     console.error("[chat-mcp] awaiting notifier failed:", err);
   }
@@ -280,8 +383,16 @@ export const safeNotifyAskUserRequest = async (
     token: string;
     questions: AskUserQuestion[];
     actionId?: string;
+    callerToken?: string;
   },
 ): Promise<void> => {
+  // R24-6：ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
+  if (!matchExpectedCallerToken(taskId, args.callerToken)) {
+    console.warn(
+      `[chat-mcp] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
+    );
+    return;
+  }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
@@ -290,13 +401,18 @@ export const safeNotifyAskUserRequest = async (
     return;
   }
   try {
-    await notifier({
-      kind: "ask_user_request",
-      askId: args.askId,
-      token: args.token,
-      questions: args.questions,
-      actionId: args.actionId,
-    });
+    const callerStillValid = (): boolean =>
+      matchExpectedCallerToken(taskId, args.callerToken);
+    await notifier(
+      {
+        kind: "ask_user_request",
+        askId: args.askId,
+        token: args.token,
+        questions: args.questions,
+        actionId: args.actionId,
+      },
+      { callerStillValid },
+    );
   } catch (err) {
     console.error("[chat-mcp] ask_user_request notifier failed:", err);
   }

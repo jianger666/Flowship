@@ -44,18 +44,32 @@ import {
 import type { Task, TaskEvent } from "@/lib/types";
 
 import {
+  isToolBlock,
+  isToolVerbGroup,
+  mergeToolDisplayEvents,
+  type StreamRenderItem,
+} from "@/lib/tool-display";
+import {
+  extractUserReplyAttachments,
+  extractUserReplyImages,
+  isChatStartupNoiseInfo,
   mergeAdjacentThinking,
-  mergeAdjacentToolCall,
 } from "./event-stream/utils";
 import {
   AskUserRequestRow,
   EventRow,
+  PendingLocalReplyRow,
   ReconnectingRow,
   StreamingAssistantRow,
 } from "./event-stream/rows";
+import {
+  ToolBlockRow,
+  ToolVerbGroupRow,
+} from "./event-stream/tool-block";
 import { AskUserInlineCard } from "./ask-user-inline";
+import { pathBasename } from "@/lib/path-utils";
 
-// streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
+  // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
 // kind 用未出现在 EventKind 里的字面量、做 discriminated union 区分
 // 这样 streamingText 不再走 Footer / Component slot、而是直接进 data 数组、
 // followOutput 跟着它的追加触发滚动、不用单独 ref 控制
@@ -72,7 +86,14 @@ interface LoadingItem {
   id: string;
 }
 
-type RenderItem = TaskEvent | StreamingItem | LoadingItem;
+/** P5：本地排队占位（尚未落盘的 user_reply） */
+interface PendingLocalItem {
+  kind: "__pending_local__";
+  id: string;
+  text: string;
+}
+
+type RenderItem = StreamRenderItem | StreamingItem | LoadingItem | PendingLocalItem;
 
 const isStreamingItem = (it: RenderItem): it is StreamingItem =>
   it.kind === "__streaming__";
@@ -80,13 +101,66 @@ const isStreamingItem = (it: RenderItem): it is StreamingItem =>
 const isLoadingItem = (it: RenderItem): it is LoadingItem =>
   it.kind === "__loading__";
 
-// 「发出消息 → 程序受理」空白期的 loading 占位行：小转圈 +「正在响应…」、muted 细行风格
-const PendingRow = () => (
-  <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
-    <Loader2 className="size-3.5 animate-spin" />
-    <span>正在响应…</span>
-  </div>
-);
+const isPendingLocalItem = (it: RenderItem): it is PendingLocalItem =>
+  it.kind === "__pending_local__";
+
+/**
+ * 启动空窗进度（批 B 前端档）：server 暂无分阶段 info 事件时，
+ * 用已等待秒数 + 文案轮换粗估（准备环境→创建会话→发送消息）。
+ */
+const PendingRow = () => {
+  // 挂载起算的已等待秒数
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t0 = Date.now();
+    const id = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - t0) / 1000));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, []);
+  const phase =
+    elapsed < 3 ? "准备环境…" : elapsed < 8 ? "创建会话…" : "发送消息…";
+  return (
+    <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
+      <Loader2 className="size-3.5 animate-spin" />
+      <span>
+        {phase}
+        {elapsed > 0 && (
+          <span className="ml-1.5 opacity-70">已等待 {elapsed}s</span>
+        )}
+      </span>
+    </div>
+  );
+};
+
+/** uploads 文件 → base64 ImagePayload（重发带图） */
+const fetchUploadAsPayload = async (
+  taskId: string,
+  absPath: string,
+  mimeType: string,
+  filename?: string,
+): Promise<ImagePayload | null> => {
+  try {
+    const name = pathBasename(absPath);
+    const res = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/uploads/${encodeURIComponent(name)}`,
+    );
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]!);
+    }
+    return {
+      data: btoa(binary),
+      mimeType,
+      filename,
+    };
+  } catch {
+    return null;
+  }
+};
 
 interface Props {
   task: Task;
@@ -102,7 +176,7 @@ interface Props {
     images?: ImagePayload[],
     attachments?: string[],
     skillRefs?: Array<{ name: string; absPath: string }>,
-  ) => void;
+  ) => boolean | void | Promise<boolean | void>;
   // V0.2 plan workflow 模式下传 true、不渲染底部「自由回复」输入框
   // 因为 plan 模式的 HITL 是 phase ack（通过 / 再聊聊）、不是 free-form 聊天
   // ack 按钮由父组件渲染在顶部 / 详情区其他位置
@@ -112,6 +186,8 @@ interface Props {
   // - 传：父组件决定（chat-view 传：draft / completed / failed / awaiting_user 都可用、running / starting 不可用）
   // 命名上跟 awaiting_user 解耦——父组件知道更多状态（如 starting）、UI 该不该可用归它判
   canReply?: boolean;
+  // 请求飞行中：透传 Composer.submitting（防连点；与 canReply 互补）
+  submitting?: boolean;
   // V0.4：禁用时底部的状态文案（chat 自由化下、文案需要随 task.status / starting 动态变）
   // 不传：用旧 plan 文案「agent 在等待你回复时输入框才会激活」
   disabledHint?: string;
@@ -132,6 +208,20 @@ interface Props {
   // v1.0.x 事件懒加载：上拉到顶自动拉更早分页、拉到的事件通过它插到父组件事件列表头部。
   // 不传 = 不启用分页（task.eventsTruncated 也不看）。
   onPrependEvents?: (events: TaskEvent[]) => void;
+  /** shell 流式输出：callId → 已累积文本（尾部窗口由父组件维护） */
+  liveToolOutputs?: Record<string, string>;
+  /** P3：回退到 checkpointed user_reply */
+  onRewind?: (eventId: string) => void;
+  /** P5：本地排队占位气泡（displayText 与服务端 user_reply 文案对齐） */
+  pendingLocalReplies?: Array<{
+    id: string;
+    text: string;
+    displayText: string;
+  }>;
+  /** P5：排队条文案 / 节点（渲染在 composer 上方） */
+  queueBanner?: ReactNode;
+  /** P5：运行中仍可排队发送 */
+  allowQueueWhileRunning?: boolean;
 }
 
 // 路径附件上限在 use-path-attach hook 内统一管（10 条、跟服务端路由对齐）
@@ -160,12 +250,20 @@ const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) =>
 
 const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
 
+/** chat 渲染管线：与 items / loadEarlier prepend 共用同一过滤，避免 firstItemIndex 与可视条数不一致 */
+const eventsForStreamRender = (
+  events: TaskEvent[],
+  isChat: boolean,
+): TaskEvent[] =>
+  isChat ? events.filter((e) => !isChatStartupNoiseInfo(e)) : events;
+
 const EventStreamImpl = ({
   task,
   streamingText,
   onUserReply,
   hideReplyComposer,
   canReply,
+  submitting,
   disabledHint,
   composerLeading,
   composerTop,
@@ -174,6 +272,11 @@ const EventStreamImpl = ({
   stopping,
   variant = "log",
   onPrependEvents,
+  liveToolOutputs,
+  onRewind,
+  pendingLocalReplies,
+  queueBanner,
+  allowQueueWhileRunning,
 }: Props) => {
   const isChat = variant === "chat";
   // 输入草稿、发送后清空；按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）
@@ -197,31 +300,50 @@ const EventStreamImpl = ({
   const inputRef = useRef<ComposerFocusHandle | null>(null);
 
 
-  // 渲染前两道合并 pass + 拼 streaming placeholder：
-  // 1) thinking 合并：连续相邻 thinking 拼成一条、避免「思考被切碎」
-  // 2) tool_call 合并：同 phase 连续 ≥2 条合一、降密度（review 阶段一连
-  //    十几条 edit artifact 视觉重、合并后变一行 ×N）
-  // 3) streamingText 非空时追加为末尾 `__streaming__` 虚拟 item、跟普通 event
-  //    一起参与虚拟滚动 + followOutput 贴底跟随
+  // 渲染前：thinking 合并 → 滤 chat 启动噪声 → tool 配对 + GB verb-group → streaming/loading/pending
   const items: RenderItem[] = useMemo(() => {
-    const merged = mergeAdjacentToolCall(mergeAdjacentThinking(task.events));
-    // agent 在吐字 → 末尾打字机 item；
-    // 在跑但还没吐字（起手空窗）→ 末尾 loading item；都没有 → 原样
+    const sourceEvents = eventsForStreamRender(task.events, isChat);
+    const merged = mergeToolDisplayEvents(
+      mergeAdjacentThinking(sourceEvents),
+    );
+    const withPending: RenderItem[] = [
+      ...merged,
+      ...(pendingLocalReplies ?? []).map(
+        (p): PendingLocalItem => ({
+          kind: "__pending_local__",
+          id: p.id,
+          text: p.displayText,
+        }),
+      ),
+    ];
     if (streamingText) {
       return [
-        ...merged,
+        ...withPending,
         { kind: "__streaming__", id: "__streaming__", text: streamingText },
       ];
     }
-    // 「发出消息 → 程序受理」空白期：agent 已在跑、但事件流最后一条还是用户刚发的消息
-    // （启动 info / thinking / tool 都还没冒出来）→ 末尾挂一行 loading。
-    // 一旦出现第一个 agent 事件、last 不再是 user_reply、loading 自动消失（不会盖住链路）。
-    const last = merged[merged.length - 1];
-    if (isRunning && last?.kind === "user_reply") {
-      return [...merged, { kind: "__loading__", id: "__loading__" }];
+    // 「发出消息 → 程序受理」空白期：排除本地 pending 占位后看末项，
+    // 避免 pending 压制 loading（二者可并存）
+    let last: RenderItem | undefined;
+    for (let i = withPending.length - 1; i >= 0; i--) {
+      const it = withPending[i]!;
+      if (it.kind !== "__pending_local__") {
+        last = it;
+        break;
+      }
     }
-    return merged;
-  }, [task.events, streamingText, isRunning]);
+    const lastIsUser =
+      !!last &&
+      last.kind !== "__streaming__" &&
+      last.kind !== "__loading__" &&
+      last.kind !== "__tool_block__" &&
+      last.kind !== "__tool_verb_group__" &&
+      last.kind === "user_reply";
+    if (isRunning && lastIsUser) {
+      return [...withPending, { kind: "__loading__", id: "__loading__" }];
+    }
+    return withPending;
+  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies]);
 
   // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
   // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
@@ -287,11 +409,15 @@ const EventStreamImpl = ({
       const known = new Set(cur.map((e) => e.id));
       const fresh = older.filter((e) => !known.has(e.id));
       if (fresh.length > 0) {
-        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool_call 相邻合并、
-        // 拼接边界还可能跨页合并——用同一套纯函数分别算前后 items 数、差值才是真 prepend 数
-        const beforeLen = mergeAdjacentToolCall(mergeAdjacentThinking(cur)).length;
-        const afterLen = mergeAdjacentToolCall(
-          mergeAdjacentThinking([...fresh, ...cur]),
+        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对合并、
+        // 拼接边界还可能跨页合并——用与 items 同一套过滤 + 纯函数算前后条数差值
+        const beforeSrc = eventsForStreamRender(cur, isChat);
+        const afterSrc = eventsForStreamRender([...fresh, ...cur], isChat);
+        const beforeLen = mergeToolDisplayEvents(
+          mergeAdjacentThinking(beforeSrc),
+        ).length;
+        const afterLen = mergeToolDisplayEvents(
+          mergeAdjacentThinking(afterSrc),
         ).length;
         onPrependEvents(fresh);
         setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
@@ -353,8 +479,10 @@ const EventStreamImpl = ({
   const isAwaitingUser = canCompose;
 
   // V0.5.4 图附件管理统一走 hook（v1.1.x 起整个对象直传 <Composer>）
-  // disabled=!isAwaitingUser 时所有 handler 短路、防止 agent 没等待时也能添图
-  const attach = useImageAttach({ disabled: !isAwaitingUser });
+  // disabled 时所有 handler 短路；chat 排队时 running 仍可附图
+  const attach = useImageAttach({
+    disabled: !(isAwaitingUser || (isRunning && !!allowQueueWhileRunning)),
+  });
 
   // 自动聚焦：进入「可输入」时把光标放进输入框、用户立刻可以打字
   // - 解决以前的痛点：agent 回完话、用户得鼠标点输入框才能输入
@@ -383,22 +511,60 @@ const EventStreamImpl = ({
   });
 
   // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
-  // 原消息保留（append-only 事件日志、持久会话没法真 fork）；只有最后一条才给入口（用户拍板：
-  // 早期消息重发有上下文歧义、fork 语义做不了、砍掉）。不带图 / 附件（原消息的附件不重传）。
-  // skillRefs：从重发文本重新解析（气泡只存原文 `/name`、不存 refs）——跟发送路径对齐
+  // 原消息保留（append-only）；重发携带原 meta.images / attachments（批 B 补图）。
+  // 返回 false = 失败（编辑态保持）；true = 成功
+  const resendLockRef = useRef(false);
   const handleResend = useCallback(
-    (text: string) => {
-      void (async () => {
+    async (text: string, sourceEv?: TaskEvent): Promise<boolean> => {
+      if (resendLockRef.current) return false;
+      resendLockRef.current = true;
+      try {
         const skills = await fetchSkills();
         const refs = resolveSkillReferences(text, skills);
         const skillRefs =
           refs.length > 0
             ? refs.map((s) => ({ name: s.name, absPath: s.absPath }))
             : undefined;
-        onUserReply?.(text, undefined, undefined, skillRefs);
-      })();
+
+        let images: ImagePayload[] | undefined;
+        let attachments: string[] | undefined;
+        if (sourceEv) {
+          const imgs = extractUserReplyImages(sourceEv.meta);
+          if (imgs.length > 0) {
+            const payloads = await Promise.all(
+              imgs.map((img) =>
+                fetchUploadAsPayload(
+                  task.id,
+                  img.absPath,
+                  img.mimeType,
+                  img.filename,
+                ),
+              ),
+            );
+            const ok = payloads.filter((p): p is ImagePayload => p != null);
+            if (ok.length > 0) images = ok;
+            if (ok.length < imgs.length) {
+              toast.warning("部分附图未能重发");
+            }
+          }
+          const atts = extractUserReplyAttachments(sourceEv.meta);
+          if (atts.length > 0) {
+            attachments = atts.map((a) => a.absPath);
+          }
+        }
+
+        const result = await onUserReply?.(
+          text,
+          images,
+          attachments,
+          skillRefs,
+        );
+        return result !== false;
+      } finally {
+        resendLockRef.current = false;
+      }
     },
-    [onUserReply],
+    [onUserReply, task.id],
   );
 
   // 最后一条用户消息的 id：只有它 hover 出「重发 / 编辑」两 icon
@@ -409,32 +575,60 @@ const EventStreamImpl = ({
     return undefined;
   }, [task.events]);
 
+  // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
+  const sendingLockRef = useRef(false);
   const handleSend = () => {
+    if (sendingLockRef.current) return;
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
-    if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) return;
+    if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) {
+      return;
+    }
     const images: ImagePayload[] | undefined = attach.toUploadPayload();
-    const attachments = pathAttach.paths.length > 0 ? pathAttach.paths : undefined;
+    const attachments =
+      pathAttach.paths.length > 0 ? pathAttach.paths : undefined;
     // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
     const skillRefs =
       slash.references.length > 0
         ? slash.references.map((s) => ({ name: s.name, absPath: s.absPath }))
         : undefined;
-    onUserReply?.(text, images, attachments, skillRefs);
-    setDraft("");
-    saveDraft("reply", task.id, "");
-    slash.reset();
-    attach.reset();
-    pathAttach.reset();
+    sendingLockRef.current = true;
+    void (async () => {
+      try {
+        const result = await onUserReply?.(
+          text,
+          images,
+          attachments,
+          skillRefs,
+        );
+        // 仅成功（200/202 → true）后清空；prepareRunArgs null / 失败保留草稿+附件
+        if (result === false) return;
+        setDraft("");
+        saveDraft("reply", task.id, "");
+        slash.reset();
+        attach.reset();
+        pathAttach.reset();
+      } finally {
+        sendingLockRef.current = false;
+      }
+    })();
   };
 
   // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
-  // 连续过程行（thinking / tool_call / info…）紧凑堆叠成一组
-  const isConversational = (it: RenderItem) =>
-    isStreamingItem(it) ||
-    it.kind === "assistant_message" ||
-    it.kind === "user_reply" ||
-    it.kind === "ask_user_request";
+  // 连续过程行（thinking / tool / info…）紧凑堆叠成一组
+  const isConversational = (it: RenderItem): boolean => {
+    if (isStreamingItem(it)) return true;
+    if (isLoadingItem(it)) return false;
+    if (isPendingLocalItem(it)) return true;
+    if (it.kind === "__tool_block__" || it.kind === "__tool_verb_group__") {
+      return false;
+    }
+    return (
+      it.kind === "assistant_message" ||
+      it.kind === "user_reply" ||
+      it.kind === "ask_user_request"
+    );
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -545,6 +739,16 @@ const EventStreamImpl = ({
                   <StreamingAssistantRow text={item.text} variant={variant} />
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
+                ) : isPendingLocalItem(item) ? (
+                  <PendingLocalReplyRow text={item.text} />
+                ) : isToolBlock(item) ? (
+                  <ToolBlockRow
+                    block={item}
+                    taskId={task.id}
+                    liveOutput={liveToolOutputs?.[item.callId]}
+                  />
+                ) : isToolVerbGroup(item) ? (
+                  <ToolVerbGroupRow group={item} taskId={task.id} />
                 ) : item.kind === "ask_user_request" ? (
                   // V0.13.x：当前待答的 ask 直接内联答题卡（原模态弹窗淘汰、用户拍板
                   // 「弹窗挡整屏不合理」）；已答 / 已作废走回放卡
@@ -568,6 +772,8 @@ const EventStreamImpl = ({
                         ? handleResend
                         : undefined
                     }
+                    onRewind={isChat ? onRewind : undefined}
+                    runActive={!!isRunning}
                   />
                 )}
               </div>
@@ -589,11 +795,14 @@ const EventStreamImpl = ({
             }}
             onSubmit={handleSend}
             placeholder={
-              isAwaitingUser
+              isAwaitingUser || (isRunning && allowQueueWhileRunning)
                 ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
                 : (disabledHint ?? "agent 当前没有等待你回复")
             }
-            disabled={!isAwaitingUser}
+            disabled={
+              !(isAwaitingUser || (isRunning && !!allowQueueWhileRunning))
+            }
+            submitting={submitting}
             focusRef={inputRef}
             slash={slash}
             attach={attach}
@@ -606,6 +815,8 @@ const EventStreamImpl = ({
             running={isRunning}
             onStop={onStop}
             stopping={stopping}
+            allowQueueWhileRunning={allowQueueWhileRunning}
+            queueBanner={queueBanner}
             className={cn(
               "mx-auto w-full max-w-3xl",
               !isAwaitingUser && !isRunning && "opacity-70",

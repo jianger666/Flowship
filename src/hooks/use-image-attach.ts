@@ -131,20 +131,12 @@ export const useImageAttach = (
 
   // 把 File[] 转成 PendingImage[] 加进 images
   // 校验：mimeType 白名单 / 单图 size / 总张数上限（任何一项失败 → toast + 跳过该图）
+  // 名额在 setImages updater 内按最新 prev 截断——并发粘贴不能靠闭包 images.length
   const addFiles = async (files: File[]) => {
     if (options?.disabled) return;
     if (files.length === 0) return;
-    const remainingSlots = maxImages - images.length;
-    if (remainingSlots <= 0) {
-      toast.error(`最多附 ${maxImages} 张图、先发送 / 移除几张再加`);
-      return;
-    }
-    const toProcess = files.slice(0, remainingSlots);
-    if (files.length > remainingSlots) {
-      toast.warning(
-        `图太多、超出上限 ${maxImages} 张、已截断到 ${remainingSlots} 张`,
-      );
-    }
+    // 软上限：最多读 maxImages 张，真正截断仍在 updater 里按 prev 算
+    const toProcess = files.slice(0, maxImages);
     const additions: PendingImage[] = [];
     for (const file of toProcess) {
       if (!DEFAULT_ALLOWED_MIMES.has(file.type)) {
@@ -174,8 +166,26 @@ export const useImageAttach = (
         );
       }
     }
-    if (additions.length > 0) {
-      setImages((prev) => [...prev, ...additions]);
+    if (additions.length === 0) return;
+
+    let accepted = 0;
+    let wasFull = false;
+    setImages((prev) => {
+      const room = maxImages - prev.length;
+      if (room <= 0) {
+        wasFull = true;
+        return prev;
+      }
+      const kept = additions.slice(0, room);
+      accepted = kept.length;
+      return prev.concat(kept);
+    });
+    if (wasFull) {
+      toast.error(`最多附 ${maxImages} 张图、先发送 / 移除几张再加`);
+    } else if (accepted < additions.length || files.length > accepted) {
+      toast.warning(
+        `图太多、超出上限 ${maxImages} 张、已截断到 ${accepted} 张`,
+      );
     }
   };
 

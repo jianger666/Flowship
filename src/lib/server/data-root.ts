@@ -14,8 +14,21 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { failpoint } from "./failpoints";
+
 export const dataRoot = (): string =>
   process.env.FE_AI_FLOW_DATA_DIR || path.join(process.cwd(), "data");
+
+/**
+ * R27-1：renameWithRetry 在 beforeAttempt 拒写时抛此错——调用方清 tmp、视为「未提交」。
+ * 失败的 syscall 不消费授权；只有成功发起的 rename 才是线性化点。
+ */
+export class RenameAbortedError extends Error {
+  constructor(message = "rename aborted: beforeAttempt returned false") {
+    super(message);
+    this.name = "RenameAbortedError";
+  }
+}
 
 /** win32 上文件权限位不可靠，跳过 mode/chmod */
 export const supportsUnixFileMode = (): boolean => process.platform !== "win32";
@@ -45,13 +58,22 @@ export const ensurePrivateDir = async (dir: string): Promise<void> => {
  * Windows：目标文件被并发读 / 杀软扫描持有句柄时 rename 会 EPERM/EBUSY
  * （同事线上实测、mac/linux 无此语义）——短退避重试几轮；重试穿透才抛。
  * writePrivateFileAtomic / writeMeta 共用，避免两处重试策略漂移。
+ *
+ * @param beforeAttempt R27-1：每次真正调用 fs.rename 前同步验；false → 抛
+ *   {@link RenameAbortedError}（不消费授权）。失败的 syscall 之后仍可换主拒提交。
  */
 export const renameWithRetry = async (
   tmpPath: string,
   finalPath: string,
+  beforeAttempt?: () => boolean,
 ): Promise<void> => {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 5; attempt++) {
+    // R27-1：循环内每次尝试前插桩 + lease——首轮 EPERM 退避期间换主仍拦得住
+    await failpoint("rename.beforeAttempt");
+    if (beforeAttempt && !beforeAttempt()) {
+      throw new RenameAbortedError();
+    }
     try {
       await fs.rename(tmpPath, finalPath);
       return;

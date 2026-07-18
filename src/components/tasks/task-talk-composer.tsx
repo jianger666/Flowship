@@ -8,14 +8,18 @@
  * 上下文；会话断时服务端按 action 状态走唤醒 / 一次性临时 agent、客户端无感。
  *
  * v1.1.x 起视觉 / 交互统一走 <Composer>（chat 输入岛同款）：贴图 / 附文件目录 /
- * `/` 唤起 skill / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定）。
+ * `/` 唤起 skill / `@` 引用文件 / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定）。
  * Cmd/Ctrl+J 聚焦。agent 正在跑时禁用；任务终态整条隐藏。
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Composer, type ComposerFocusHandle } from "@/components/composer";
+import {
+  ComposerSessionProvider,
+  buildInputHistory,
+} from "@/components/composer-session";
 import { useSlashSkills } from "@/components/slash-skills";
 import { ModelSelect } from "@/components/ui/model-select";
 import { useImageAttach } from "@/hooks/use-image-attach";
@@ -78,6 +82,16 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
       });
     },
   });
+
+  // @ / ↑ 历史：task 模式也复用同一 ComposerSession
+  const composerSession = useMemo(
+    () => ({
+      taskId: task.id,
+      repoPaths: task.repoPaths,
+      inputHistory: buildInputHistory(task.events),
+    }),
+    [task.id, task.repoPaths, task.events],
+  );
 
   // 有未答提问 → placeholder 轻提示去答题卡；**不禁输入**（同事踩坑：网断 /
   // 会话死后答题卡变 isStale 引导「用底部输入条唤醒」，但这里曾把 awaitingAnswer
@@ -142,46 +156,49 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
   }
 
   return (
-    <div className="border-t px-3 py-2">
-      <Composer
-        editorKey={task.id}
-        value={draft}
-        onChange={(v) => {
-          setDraft(v);
-          saveDraft("talk", task.id, v);
-        }}
-        onSubmit={() => void handleSubmit()}
-        placeholder={
-          awaitingAnswer
-            ? "可先答上方提问，也可在此继续说"
-            : "想改、想问、贴图、/ 唤起 skill（⌘/Ctrl+J）"
-        }
-        disabled={busy}
-        submitting={submitting}
-        focusRef={focusRef}
-        slash={slash}
-        attach={attach}
-        paths={pathAttach.paths}
-        onRemovePath={pathAttach.removePath}
-        onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
-        picking={pathAttach.picking}
-        leading={
-          <ModelSelect
-            models={models}
-            selection={pickedModel}
-            onChange={setPickedModel}
-            disabled={busy}
-            variant="compact"
-            emptyPlaceholder="模型 · 跟随会话"
-            followOption="跟随会话"
-            onOpenChange={(open) => {
-              if (!open) return;
-              const s = getSettings();
-              if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
-            }}
-          />
-        }
-      />
-    </div>
+    <ComposerSessionProvider value={composerSession}>
+      <div className="border-t px-3 py-2">
+        <Composer
+          editorKey={task.id}
+          value={draft}
+          onChange={(v) => {
+            setDraft(v);
+            saveDraft("talk", task.id, v);
+          }}
+          onSubmit={() => void handleSubmit()}
+          placeholder={
+            awaitingAnswer
+              ? "可先答上方提问，也可在此继续说"
+              : "想改、想问、贴图、/ 唤起 skill、@ 引用文件（⌘/Ctrl+J）"
+          }
+          disabled={busy}
+          submitting={submitting}
+          focusRef={focusRef}
+          slash={slash}
+          attach={attach}
+          paths={pathAttach.paths}
+          onRemovePath={pathAttach.removePath}
+          onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
+          picking={pathAttach.picking}
+          leading={
+            <ModelSelect
+              models={models}
+              selection={pickedModel}
+              onChange={setPickedModel}
+              disabled={busy}
+              variant="compact"
+              emptyPlaceholder="模型 · 跟随会话"
+              followOption="跟随会话"
+              onOpenChange={(open) => {
+                if (!open) return;
+                const s = getSettings();
+                if (s.apiKey?.trim() && models.length === 0)
+                  void fetchModels(s.apiKey);
+              }}
+            />
+          }
+        />
+      </div>
+    </ComposerSessionProvider>
   );
 };

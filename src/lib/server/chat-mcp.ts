@@ -29,6 +29,8 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import {
+  CALLER_MISMATCH_ERROR,
+  matchExpectedCallerToken,
   registerPendingAsk,
   runTaskAction,
   safeNotifyAskUserRequest,
@@ -38,6 +40,11 @@ import {
 } from "./chat-pending";
 import { createCustomAction } from "./custom-action-fs";
 import { findSkillByName } from "./skills-loader";
+
+/** R24-6：caller 不匹配时的 MCP 工具返回（无副作用） */
+const callerMismatchContent = () => ({
+  content: [{ type: "text" as const, text: CALLER_MISMATCH_ERROR }],
+});
 
 // ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
@@ -70,7 +77,12 @@ const askSubmittedText = (askId: string): string =>
 
 // ----------------- McpServer 构造 -----------------
 
-const buildMcpServer = (): McpServer => {
+/**
+ * @param callerToken R24-6：本 MCP session 在 initialize 时从 URL ?caller= 捕获的身份。
+ *   每个 Agent.create/resume 拿独立 URL → 独立 MCP session → 闭包里的 token 不变；
+ *   工具执行前与 chat-pending 注册表的 expectedCallerToken 核对。
+ */
+const buildMcpServer = (callerToken: string | undefined): McpServer => {
   const srv = new McpServer({
     name: "ai-flow-task",
     version: "1.0.0",
@@ -135,13 +147,18 @@ const buildMcpServer = (): McpServer => {
     artifact_path?: string;
   }) => {
       console.log(
-        `[chat-mcp] submit_work 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"}`,
+        `[chat-mcp] submit_work 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"} caller=${callerToken ?? "<none>"}`,
       );
+
+      // R24-6：副作用前核对 caller——旧 agent 迟到交卷不得启后继的 postCheck
+      if (!matchExpectedCallerToken(task_id, callerToken)) {
+        return callerMismatchContent();
+      }
 
       // 不带 action_id（chat 模式旧姿势 / 老 prompt 惯性「待命态」）→ 不需要任何等待、
       // 通知 runner 切 awaiting_user（有 notifier 才生效）、指示 agent 直接结束回复
       if (!action_id) {
-        await safeNotifyAwaiting(task_id, {});
+        await safeNotifyAwaiting(task_id, { callerToken });
         return {
           content: [{ type: "text" as const, text: idleWaitText() }],
         };
@@ -151,6 +168,7 @@ const buildMcpServer = (): McpServer => {
       await safeNotifyAwaiting(task_id, {
         actionId: action_id,
         artifactPath: artifact_path,
+        callerToken,
       });
 
       return {
@@ -243,6 +261,10 @@ const buildMcpServer = (): McpServer => {
       },
     },
     async ({ task_id, action_id, questions }) => {
+      // R24-6：必须在 registerPendingAsk 之前核对——验收点名旧实现先登记再验主
+      if (!matchExpectedCallerToken(task_id, callerToken)) {
+        return callerMismatchContent();
+      }
       const askId = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       // 归一化：清掉空白、补齐 allow_text 默认值
       const normalized: AskUserQuestion[] = questions.map((q) => ({
@@ -259,7 +281,7 @@ const buildMcpServer = (): McpServer => {
         actionId: action_id,
       });
       console.log(
-        `[chat-mcp] ask_user 入参 task=${task_id} action_id=${action_id ?? "<none>"} askId=${askId} token=${ask.token} questions=${normalized.length}`,
+        `[chat-mcp] ask_user 入参 task=${task_id} action_id=${action_id ?? "<none>"} askId=${askId} token=${ask.token} questions=${normalized.length} caller=${callerToken ?? "<none>"}`,
       );
 
       // 通知 runner 写 ask_user_request 事件 + 切 runStatus = awaiting_user
@@ -268,6 +290,7 @@ const buildMcpServer = (): McpServer => {
         token: ask.token,
         questions: normalized,
         actionId: action_id,
+        callerToken,
       });
 
       return {
@@ -381,19 +404,24 @@ const buildMcpServer = (): McpServer => {
       last_commit_hash,
     }) => {
       console.log(
-        `[chat-mcp] submit_mr task=${task_id} action=${action_id} repo=${repo_path} project=${project_path} src=${source_branch}→${target_branch}`,
+        `[chat-mcp] submit_mr task=${task_id} action=${action_id} repo=${repo_path} project=${project_path} src=${source_branch}→${target_branch} caller=${callerToken ?? "<none>"}`,
       );
-      const result = await runTaskAction(task_id, {
-        kind: "submit_mr",
-        actionId: action_id,
-        repoPath: repo_path,
-        projectPath: project_path,
-        sourceBranch: source_branch,
-        targetBranch: target_branch,
-        title,
-        description,
-        lastCommitHash: last_commit_hash,
-      });
+      // R24-6：runTaskAction 入口核 caller——拒则不进 handler、不调 GitLab createMR
+      const result = await runTaskAction(
+        task_id,
+        {
+          kind: "submit_mr",
+          actionId: action_id,
+          repoPath: repo_path,
+          projectPath: project_path,
+          sourceBranch: source_branch,
+          targetBranch: target_branch,
+          title,
+          description,
+          lastCommitHash: last_commit_hash,
+        },
+        callerToken,
+      );
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
@@ -449,13 +477,17 @@ const buildMcpServer = (): McpServer => {
     },
     async ({ task_id, action_id, user_keys }) => {
       console.log(
-        `[chat-mcp] set_feishu_testers task=${task_id} action=${action_id} userKeys=${user_keys.length}`,
+        `[chat-mcp] set_feishu_testers task=${task_id} action=${action_id} userKeys=${user_keys.length} caller=${callerToken ?? "<none>"}`,
       );
-      const result = await runTaskAction(task_id, {
-        kind: "set_feishu_testers",
-        actionId: action_id,
-        userKeys: user_keys,
-      });
+      const result = await runTaskAction(
+        task_id,
+        {
+          kind: "set_feishu_testers",
+          actionId: action_id,
+          userKeys: user_keys,
+        },
+        callerToken,
+      );
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
@@ -657,18 +689,22 @@ const buildMcpServer = (): McpServer => {
     },
     async ({ task_id, action_id, batches }) => {
       console.log(
-        `[chat-mcp] set_plan_batches task=${task_id} action=${action_id} batches=${batches.length}`,
+        `[chat-mcp] set_plan_batches task=${task_id} action=${action_id} batches=${batches.length} caller=${callerToken ?? "<none>"}`,
       );
-      const result = await runTaskAction(task_id, {
-        kind: "set_plan_batches",
-        actionId: action_id,
-        batches: batches.map((b) => ({
-          id: b.id,
-          title: b.title,
-          testStrategy: b.test_strategy,
-          taskRefs: b.task_refs,
-        })),
-      });
+      const result = await runTaskAction(
+        task_id,
+        {
+          kind: "set_plan_batches",
+          actionId: action_id,
+          batches: batches.map((b) => ({
+            id: b.id,
+            title: b.title,
+            testStrategy: b.test_strategy,
+            taskRefs: b.task_refs,
+          })),
+        },
+        callerToken,
+      );
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
@@ -687,8 +723,13 @@ const buildMcpServer = (): McpServer => {
 // 「sessionId → transport」表本体在 chat-pending 的 globalThis 状态里（拆文件不拆状态）、
 // 由 transport 自己的 onsessioninitialized / onsessionclosed 回调维护。
 
-const buildSessionTransport =
-  (): WebStandardStreamableHTTPServerTransport => {
+/**
+ * @param callerToken R24-6：initialize 请求 URL 的 ?caller=；捕获进 MCP server 闭包、
+ *   本 session 后续工具调用都带同一身份（Agent.create 每次新建 MCP session、URL 不同即 session 不同）。
+ */
+const buildSessionTransport = (
+  callerToken: string | undefined,
+): WebStandardStreamableHTTPServerTransport => {
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       // V0.3.5 关键修复：禁 SSE GET 流通道、只用 POST JSON-RPC（短连接 sync request）
@@ -710,7 +751,7 @@ const buildSessionTransport =
         sessionTransports.delete(id);
       },
     });
-    const server = buildMcpServer();
+    const server = buildMcpServer(callerToken);
     void server.connect(transport).catch((err) => {
       console.error("[chat-mcp] server.connect failed:", err);
     });
@@ -728,8 +769,17 @@ const buildSessionTransport =
  */
 export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
   const sessionId = req.headers.get("mcp-session-id");
+  // R24-6：从 URL query 提 caller（Agent.create 时 inline mcpServers URL 带 ?caller=）
+  let callerFromUrl: string | undefined;
+  try {
+    const u = new URL(req.url);
+    const c = u.searchParams.get("caller");
+    if (c && c.trim().length > 0) callerFromUrl = c.trim();
+  } catch {
+    /* noop */
+  }
   console.log(
-    `[chat-mcp] handleChatMcpRequest method=${req.method} sessionId=${sessionId ?? "<none>"} 已有 transport ${sessionTransports.size} 个`,
+    `[chat-mcp] handleChatMcpRequest method=${req.method} sessionId=${sessionId ?? "<none>"} caller=${callerFromUrl ?? "<none>"} 已有 transport ${sessionTransports.size} 个`,
   );
 
   if (sessionId) {
@@ -792,7 +842,8 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
     );
   }
 
-  const transport = buildSessionTransport();
+  // R24-6：initialize 时把 caller 冻进 transport/server 闭包——后续同 session 工具调用复用
+  const transport = buildSessionTransport(callerFromUrl);
   return transport.handleRequest(req, { parsedBody: parsed });
 };
 
@@ -800,27 +851,64 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
 
 /**
  * 推算给 Cursor SDK Agent 用的 chat-tool MCP endpoint URL。
- *
- * 优先级：
- *   1. 显式 env：FE_AI_FLOW_CHAT_MCP_URL
- *   2. 普通 env：FE_AI_FLOW_BASE_URL（拼上 /api/mcp/chat-tool）
- *   3. PORT（Next.js 启动时一般会注入）
- *   4. 兜底 8876（项目固定端口）
- *
- * 注意：必须用 127.0.0.1、agent process 里走的不是浏览器、走的是 node fetch。
+ * 优先级：FE_AI_FLOW_CHAT_MCP_URL → FE_AI_FLOW_BASE_URL → PORT → 8876；必须 127.0.0.1。
+ * @param callerToken R24-6：agent 实例身份，拼到 `?caller=`——每个 Agent.create/resume
+ *   拿独一无二的 URL → SDK 新建独立 MCP session（无老 session 复用问题）。
  */
-export const getChatMcpUrl = (): string => {
+export const getChatMcpUrl = (callerToken?: string): string => {
+  let base: string;
   const explicit = process.env.FE_AI_FLOW_CHAT_MCP_URL;
-  if (explicit && explicit.trim().length > 0) return explicit.trim();
-
-  const base = process.env.FE_AI_FLOW_BASE_URL;
-  if (base && base.trim().length > 0) {
-    return `${base.replace(/\/+$/, "")}/api/mcp/chat-tool`;
+  if (explicit && explicit.trim().length > 0) {
+    base = explicit.trim();
+  } else {
+    const envBase = process.env.FE_AI_FLOW_BASE_URL;
+    if (envBase && envBase.trim().length > 0) {
+      base = `${envBase.replace(/\/+$/, "")}/api/mcp/chat-tool`;
+    } else {
+      const port =
+        process.env.PORT && /^\d+$/.test(process.env.PORT)
+          ? process.env.PORT
+          : "8876";
+      base = `http://127.0.0.1:${port}/api/mcp/chat-tool`;
+    }
   }
+  if (!callerToken) return base;
+  try {
+    const u = new URL(base);
+    u.searchParams.set("caller", callerToken);
+    return u.toString();
+  } catch {
+    const sep = base.includes("?") ? "&" : "?";
+    return `${base}${sep}caller=${encodeURIComponent(callerToken)}`;
+  }
+};
 
-  const port = process.env.PORT && /^\d+$/.test(process.env.PORT)
-    ? process.env.PORT
-    : "8876";
-  return `http://127.0.0.1:${port}/api/mcp/chat-tool`;
+/**
+ * R24-6 测试用：走真实 ask_user 分派路径（核对 caller → 才 registerPendingAsk）。
+ * 不必起 HTTP MCP server；生产路径是工具 handler 内联同款逻辑。
+ */
+export const dispatchAskUserForTest = async (args: {
+  taskId: string;
+  callerToken: string | undefined;
+  actionId?: string;
+  questions: AskUserQuestion[];
+}): Promise<{ ok: true; askId: string } | { ok: false; error: string }> => {
+  if (!matchExpectedCallerToken(args.taskId, args.callerToken)) {
+    return { ok: false, error: CALLER_MISMATCH_ERROR };
+  }
+  const askId = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const ask = registerPendingAsk(args.taskId, {
+    askId,
+    questions: args.questions,
+    actionId: args.actionId,
+  });
+  await safeNotifyAskUserRequest(args.taskId, {
+    askId,
+    token: ask.token,
+    questions: args.questions,
+    actionId: args.actionId,
+    callerToken: args.callerToken,
+  });
+  return { ok: true, askId };
 };
 

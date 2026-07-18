@@ -26,8 +26,9 @@ export const MarkdownLink = ({
   children,
   ...rest
 }: AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) => {
-  // react-markdown 给 components.a 传 AST node、不能透传给 DOM 元素
-  delete rest.node;
+  // react-markdown 给 components.a 传 AST node、不能透传给 DOM 元素；解构剥离、不就地改 props
+  const { node, ...domProps } = rest;
+  void node;
   const { open } = useImagePreview();
   if (href && LOCAL_IMAGE.test(href)) {
     const p = href.startsWith("file://") ? href.slice("file://".length) : href;
@@ -51,7 +52,7 @@ export const MarkdownLink = ({
     );
   }
   return (
-    <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
+    <a href={href} target="_blank" rel="noopener noreferrer" {...domProps}>
       {children}
     </a>
   );

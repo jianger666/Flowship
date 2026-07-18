@@ -23,10 +23,29 @@ const hostnameOf = (host: string): string => {
   return colon >= 0 ? trimmed.slice(0, colon) : trimmed;
 };
 
+// Host 头拆 主机名（去方括号）+ 端口（无端口按 http 默认 80）
+const hostPortOf = (host: string): { name: string; port: string } => {
+  const trimmed = host.trim().toLowerCase();
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    const name = end >= 0 ? trimmed.slice(1, end) : trimmed.slice(1);
+    const rest = end >= 0 ? trimmed.slice(end + 1) : "";
+    return { name, port: rest.startsWith(":") ? rest.slice(1) : "80" };
+  }
+  const colon = trimmed.indexOf(":");
+  return colon >= 0
+    ? { name: trimmed.slice(0, colon), port: trimmed.slice(colon + 1) }
+    : { name: trimmed, port: "80" };
+};
+
 /**
  * 请求是否来自本机页面：
  * - Host 头缺失 / 非 loopback → 拒绝（HTTP/1.1 必带 Host、缺失即异常客户端）
- * - Origin 头存在时（fetch / XHR 必带）其主机名也必须是 loopback；
+ * - Origin 头存在时（fetch / XHR 必带）必须与 Host 同源（主机名 + 端口精确一致）——
+ *   复审（11 轮）：只认 loopback 主机名不够，本机其它端口的 Web 服务（恶意本地页 /
+ *   被投毒的文档站）能以 http://127.0.0.1:任意端口 为 Origin 打进来（本机跨端口
+ *   CSRF：读密钥 / 改 previewCommand → RCE 链）。同源 fetch 的 Origin 恒等于页面
+ *   自身 host，收紧不影响正常前端。
  *   "null" origin（沙箱 iframe 等）拒绝；顶层导航（如 OAuth callback GET）无 Origin、放行
  */
 export const isAllowedLocalRequest = (
@@ -37,9 +56,12 @@ export const isAllowedLocalRequest = (
   if (origin !== null && origin !== "") {
     if (origin === "null") return false;
     try {
-      const originHost = new URL(origin).hostname.toLowerCase();
-      // URL().hostname 对 IPv6 返回带方括号形态（Node/浏览器实现差异都有）、两种都认
-      if (!LOOPBACK_HOSTS.has(originHost) && !LOOPBACK_HOSTS.has(`[${originHost}]`)) {
+      const url = new URL(origin);
+      const originName = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      const originPort =
+        url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
+      const hostPart = hostPortOf(host);
+      if (originName !== hostPart.name || originPort !== hostPart.port) {
         return false;
       }
     } catch {

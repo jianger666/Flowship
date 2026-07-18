@@ -40,6 +40,7 @@ import path from "node:path";
 
 import type {
   ActionRecord,
+  ActionStatus,
   ActionType,
   DevPushMode,
   GitBranchInfo,
@@ -72,6 +73,7 @@ import {
 } from "./preview-manager";
 import {
   DATA_DIR,
+  DELETED_TOMBSTONE_FILE,
   META_FILE,
   actionArtifactRelPath,
   appendEventLine,
@@ -91,9 +93,26 @@ import {
   readMetaV06,
   taskDir,
   withTaskLock,
+  prepareMetaWrite,
   writeMeta,
   type TaskMetaV06,
 } from "./task-fs-core";
+import { failpoint } from "./failpoints";
+
+/** R24-5b：终态 task 上任何旧链的 action/runStatus 条件写都非法（finalize 走裸 set） */
+const isTerminalRepoStatus = (repoStatus: RepoStatus): boolean =>
+  repoStatus === "merged" || repoStatus === "abandoned";
+
+/** Windows 长期句柄锁：fs.rm 的 maxRetries 扛不住，deleteTask 降级走 tombstone */
+const isDeleteBusyError = (err: unknown): boolean => {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return (
+    code === "EBUSY" ||
+    code === "EPERM" ||
+    code === "ENOTEMPTY" ||
+    code === "EACCES"
+  );
+};
 
 // ----------------- 仓库 flag 快照（只读 / 脚本仓）-----------------
 
@@ -134,8 +153,46 @@ const inferContextDocType = (content: string): TaskContextDocType => {
 
 const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
 
+/**
+ * 清扫 deleteTask 降级留下的 tombstone 目录。
+ * 只删带 `.deleted-tombstone` 的——tasks 下 bench/fixture 等手工目录绝不能误删。
+ * 重启后句柄通常已释放，fs.rm 多数能成功；失败 warn 留给下次启动。
+ */
+const cleanupTombstonedTaskDirs = async (): Promise<void> => {
+  let ids: string[];
+  try {
+    const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
+    ids = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch (err) {
+    console.warn("[task-fs] tombstone 清扫: 读 DATA_DIR 失败", err);
+    return;
+  }
+  for (const name of ids) {
+    const dir = path.join(DATA_DIR, name);
+    const tombstone = path.join(dir, DELETED_TOMBSTONE_FILE);
+    if (!(await exists(tombstone))) continue;
+    try {
+      await fs.rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+      console.log(`[task-fs] tombstone 清扫: 已删 id=${name}`);
+    } catch (err) {
+      console.warn(
+        `[task-fs] tombstone 清扫失败（下次启动再试）id=${name}`,
+        err,
+      );
+    }
+  }
+};
+
 const runBootRecovery = async (): Promise<void> => {
   await ensureDataDir();
+  // 先清 tombstone 残留（句柄已随进程重启释放），再扫 zombie runStatus
+  await cleanupTombstonedTaskDirs();
+
   let ids: string[];
   try {
     const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
@@ -148,8 +205,10 @@ const runBootRecovery = async (): Promise<void> => {
   let recovered = 0;
   // V0.10：顺路收集「存活 task」id（meta 读得到、且未终结）——扫完清孤儿 worktree 用。
   // meta 破损的保守当存活（读不出 repoStatus、宁可留着不误删）。
+  // 含 tombstone 的目录一律跳过（清扫失败残留时不能当存活、也不能写 boot-recovery error）。
   const liveTaskIds = new Set<string>();
   for (const id of ids) {
+    if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) continue;
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
@@ -249,6 +308,8 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
 
   const summaries: TaskSummary[] = [];
   for (const id of ids) {
+    // 双保险：tombstone 存在一律 skip（防 deleteTask 降级时 meta unlink 失败、任务还挂在 UI）
+    if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) continue;
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
@@ -268,12 +329,32 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
   return summaries;
 };
 
+/** tombstone 存在 → 视为已删（与 listTasks 一致，防 meta 残留幽灵任务） */
+const isTaskTombstoned = async (id: string): Promise<boolean> =>
+  exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
+
 export const getTask = async (id: string): Promise<Task | null> => {
   await ensureBootRecovery();
+  if (await isTaskTombstoned(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
+  // R25-2 / R25-5：meta 已读、hydrate events 未完成——矩阵可在此注入 finalize，
+  // 验证 route 陈旧 developing 快照 + 裸写 running 窗口已被条件事务 / fresh 终态闸堵住
+  await failpoint("taskread.beforeHydrate");
   return await hydrateTask(raw);
+};
+
+/**
+ * R25-2：轻量读盘上 repoStatus（不 hydrate events）——启动副作用边界 / 准入用，
+ * 避免 getTask 握着旧 meta 在 hydrate await 期间吃到已终态任务。
+ */
+export const readTaskRepoStatusFresh = async (
+  taskId: string,
+): Promise<RepoStatus | null> => {
+  const meta = await readMetaV06(taskId);
+  if (!meta) return null;
+  return meta.repoStatus;
 };
 
 /**
@@ -285,6 +366,7 @@ export const getTaskWithTailEvents = async (
   tail: number,
 ): Promise<Task | null> => {
   await ensureBootRecovery();
+  if (await isTaskTombstoned(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
@@ -300,6 +382,7 @@ export const getTaskEventsBefore = async (
   limit: number,
 ): Promise<{ events: TaskEvent[]; hasMore: boolean } | null> => {
   await ensureBootRecovery();
+  if (await isTaskTombstoned(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
@@ -449,13 +532,35 @@ export const deleteTask = async (id: string): Promise<boolean> => {
       console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
     }
     // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
-    await fs.rm(dir, {
-      recursive: true,
-      force: true,
-      maxRetries: 5,
-      retryDelay: 100,
-    });
-    return true;
+    try {
+      await fs.rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+      return true;
+    } catch (err) {
+      if (!isDeleteBusyError(err)) throw err;
+      // 降级 tombstone（Windows v1.1.20 实锤）：
+      // 根因链——shell 卡死残留子进程 cwd 停在任务 workspace → 目录句柄长期占用 →
+      // fs.rm maxRetries 只能扛瞬时锁；且 kill-orphans.ts 在 win32 是 no-op（无轻量
+      // 可靠的按 cwd 查进程手段、本批不实现 Windows 进程清理），所以这里只能「先让
+      // UI 消失、磁盘残留留给 boot 清扫」。tombstone 写入几乎必成功；meta unlink
+      // best-effort（listTasks 靠 meta 判定，删掉即从列表消失；失败则靠 tombstone skip）。
+      const tombstonePath = path.join(dir, DELETED_TOMBSTONE_FILE);
+      await fs.writeFile(
+        tombstonePath,
+        JSON.stringify({ deletedAt: Date.now() }),
+        "utf-8",
+      );
+      await fs.unlink(path.join(dir, META_FILE)).catch(() => {});
+      console.warn(
+        `[task-fs] deleteTask: 目录被锁，已降级 tombstone id=${id}`,
+        err,
+      );
+      return true;
+    }
   });
 };
 
@@ -471,13 +576,17 @@ const lastMetaTouchAt = new Map<string, number>();
  * 追加一条事件（V0.6.27 重写：轻量路径、返回写入的 event 而不是整个 Task）
  *
  * - task 不存在（已删、agent 残留写入）→ 返 null、不写、不复活目录
- * - 事件行直接 append（O_APPEND 单次 write 原子、无需拿 task 锁）
+ * - 事件行经 appendEventLine 按 taskId 串行 append（同文件并发 appendFile 不安全，
+ *   且超长 tool_result 行超出 POSIX O_APPEND 原子写保证；无需拿 task 锁）
  * - meta.updatedAt 节流落盘（≥5s 才写一次、写时拿锁跟其它 read-modify-write 串行）
  * - 调用方需要完整 Task 的（低频 route 场景）自己再 getTask
+ *
+ * @param lease R26-5：可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
  */
 export const appendEvent = async (
   taskId: string,
   ev: Omit<TaskEvent, "id" | "ts">,
+  lease?: () => boolean,
 ): Promise<TaskEvent | null> => {
   if (!(await exists(path.join(taskDir(taskId), META_FILE)))) return null;
   const event: TaskEvent = {
@@ -485,7 +594,8 @@ export const appendEvent = async (
     ts: Date.now(),
     ...ev,
   };
-  await appendEventLine(taskId, event);
+  const wrote = await appendEventLine(taskId, event, lease);
+  if (!wrote) return null;
 
   const last = lastMetaTouchAt.get(taskId) ?? 0;
   if (event.ts - last >= META_TOUCH_INTERVAL_MS) {
@@ -624,17 +734,63 @@ export const setTaskRemoveSourceBranchOnMerge = async (
 /**
  * V0.11.1：落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
  * 不动 updatedAt（纯运行时锚点、与任务活跃度无关）。best-effort：调用方一般 void 掉。
+ *
+ * X4（十七轮）：错误在函数内部消化、绝不 reject——调用方几十处都是 fire-and-forget
+ * `void setTaskSessionAgentId(...)`，任一处漏 .catch 都会在「任务目录刚被 DELETE 删掉」
+ * 时产生 ENOENT unhandled rejection（高负载全量测试实锤随机红灯）。best-effort 语义
+ * 的单一源就该在这里兜：ENOENT（任务已删、锚点无处可落）静默，其他错误 warn。
  */
 export const setTaskSessionAgentId = async (
   id: string,
   agentId: string | undefined,
 ): Promise<void> => {
-  await withTaskLock(id, async () => {
-    const meta = await readMetaV06(id);
-    if (!meta) return;
-    meta.sessionAgentId = agentId;
-    await writeMeta(meta);
-  });
+  try {
+    await withTaskLock(id, async () => {
+      const meta = await readMetaV06(id);
+      if (!meta) return;
+      meta.sessionAgentId = agentId;
+      await writeMeta(meta);
+    });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(
+        `[task-fs] setTaskSessionAgentId 失败（best-effort、忽略）task=${id}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+};
+
+/**
+ * R27-3：条件清 sessionAgentId——锁内盘上锚点 === expectedAgentId 才清；
+ * extraGuard（同步）失败或锚点已被后继改写则不动。
+ * 用于 Agent.resume 确定性失败 catch：避免迟到 clear 抹掉 B 刚落盘的锚点。
+ * @returns true=已清；false=条件不符 / meta 不存在（best-effort 不抛）
+ */
+export const clearTaskSessionAgentIdIf = async (
+  taskId: string,
+  expectedAgentId: string,
+  extraGuard?: () => boolean,
+): Promise<boolean> => {
+  try {
+    return await withTaskLock(taskId, async () => {
+      // R27-3：同步 guard 先查——B 已装内存 session / 已失主则不清
+      if (extraGuard && !extraGuard()) return false;
+      const meta = await readMetaV06(taskId);
+      if (!meta || meta.sessionAgentId !== expectedAgentId) return false;
+      meta.sessionAgentId = undefined;
+      await writeMeta(meta);
+      return true;
+    });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(
+        `[task-fs] clearTaskSessionAgentIdIf 失败（best-effort、忽略）task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+    return false;
+  }
 };
 
 // V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。不动 updatedAt（置顶与活跃度无关）。
@@ -869,10 +1025,20 @@ export const appendAction = async (
     /** V0.9：自定义 action 展示名快照（仅 type=custom 传） */
     customLabel?: string;
   },
+  /**
+   * R23-1b / R24-4：锁内 prepare → 同步复查 guard → commit。
+   * advance 传 `() => isOpOwner(opHandle)`：claim 后若已被 stop revoke，
+   * 拒绝追加幽灵 action（与 stop 重读收尾形成互斥闭环，见 stop-task R23-6）。
+   */
+  opts?: { guard?: () => boolean },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
   withTaskLock(taskId, async () => {
+    // ① 锁内同步 guard 快查
+    if (opts?.guard && !opts.guard()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
+    // R24-5b：终态 task 上追加 running action 一律非法（finalize 裸写不受影响）
+    if (isTerminalRepoStatus(meta.repoStatus)) return null;
     const now = Date.now();
     const n = meta.actions.length + 1;
     const id = newActionId(n);
@@ -909,10 +1075,38 @@ export const appendAction = async (
     meta.currentActionId = id;
     meta.runStatus = "running";
     meta.updatedAt = now;
-    await writeMeta(meta);
+
+    // ③ prepare：脏值只在 tmp——meta.json 未动
+    const prepared = await prepareMetaWrite(meta);
+    // R24-4 测试插桩：prepare 之后、同步复查之前（故意 await，模拟 IO 间隙）
+    await failpoint("append.afterPrepare");
+    // ④ 提前短路（省 rename）——权威检查在 commit(finalGuard) 内、rename 紧前（R26-5）
+    if (opts?.guard && !opts.guard()) {
+      await prepared.abort();
+      return null;
+    }
+    // R26-5：finalGuard 进 commit——failpoint await 后、rename 前同步验；失主拒写
+    const committed = await prepared.commit(opts?.guard);
+    if (!committed) return null;
     const task = await hydrateTask(meta);
     return { task, action };
   });
+
+/** patchAction / patchActionIfOwner 共用的可改字段 */
+type ActionPatchFields = Partial<
+  Pick<
+    ActionRecord,
+    | "status"
+    | "postCheck"
+    | "sideEffects"
+    | "agentModel"
+    | "excluded"
+    | "artifactUpdatedAt"
+    | "planBatches"
+    | "startBaseline"
+    | "readonlyBaseline"
+  >
+>;
 
 /**
  * patch 单条 action 状态 / 后置检查 / 副作用
@@ -922,20 +1116,7 @@ export const appendAction = async (
 export const patchAction = async (
   taskId: string,
   actionId: string,
-  patch: Partial<
-    Pick<
-      ActionRecord,
-      | "status"
-      | "postCheck"
-      | "sideEffects"
-      | "agentModel"
-      | "excluded"
-      | "artifactUpdatedAt"
-      | "planBatches"
-      | "startBaseline"
-      | "readonlyBaseline"
-    >
-  >,
+  patch: ActionPatchFields,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
@@ -992,8 +1173,11 @@ export const appendActionSideEffectMR = async (
     /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突 */
     hasConflicts?: boolean;
   },
+  /** R25-3：可选锁内 caller 闸（submit_mr 迟到写） */
+  isOwner?: () => boolean,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
+    if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
     const idx = meta.actions.findIndex((a) => a.id === actionId);
@@ -1015,7 +1199,18 @@ export const appendActionSideEffectMR = async (
       ...meta.actions.slice(idx + 1),
     ];
     meta.updatedAt = Date.now();
-    await writeMeta(meta);
+    if (isOwner) {
+      const prepared = await prepareMetaWrite(meta);
+      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
+      if (!isOwner()) {
+        await prepared.abort();
+        return null;
+      }
+      const committed = await prepared.commit(isOwner);
+      if (!committed) return null;
+    } else {
+      await writeMeta(meta);
+    }
     return await hydrateTask(meta);
   });
 
@@ -1037,6 +1232,43 @@ export const setTaskRunStatus = async (
     }
     meta.updatedAt = Date.now();
     await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * R25-1：stop / finalize 的「扫非终态 action + 置 idle」锁内单次事务。
+ *
+ * 线性化：appendAction 持 withTaskLock 直到 `prepared.commit()`（含内部
+ * renameWithRetry await）返回才放锁——本函数同锁排队，必排在 append 提交之后，
+ * 因此必见刚落盘的 running action，不会漏扫成「action=running + task=idle」幽灵。
+ *
+ * @param exceptActionId 排除某 action（advance force-new 不用本函数；预留给对称 API）
+ * @param toStatus       非终态收尾成 cancelled（stop/finalize）或 error
+ * @returns 收尾后 hydrate 的 Task（事件文案 / publish 用）；meta 不存在 → null
+ */
+export const finalizeStaleAndIdleLocked = async (
+  taskId: string,
+  opts?: { exceptActionId?: string; toStatus?: "cancelled" | "error" },
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const toStatus = opts?.toStatus ?? "cancelled";
+    const now = Date.now();
+    meta.actions = meta.actions.map((a) => {
+      if (opts?.exceptActionId && a.id === opts.exceptActionId) return a;
+      if (a.status !== "running" && a.status !== "awaiting_ack") return a;
+      return {
+        ...a,
+        status: toStatus,
+        // running→终态自动落 endedAt；已有 endedAt（少见）保留
+        endedAt: a.endedAt ?? now,
+      };
+    });
+    meta.runStatus = "idle";
+    meta.updatedAt = now;
+    const prepared = await prepareMetaWrite(meta);
+    await prepared.commit();
     return await hydrateTask(meta);
   });
 
@@ -1070,6 +1302,326 @@ export const setTaskAwaitingIfIdle = async (
   });
 
 /**
+ * W3：条件写 runStatus——仅当 `currentActionId` 仍等于本操作的 action 时才改。
+ *
+ * 防 stale owner 清理覆盖后继 B：旧 advance 见 gen stale 想把 running→idle，
+ * 但 B 已 append 并改 currentActionId——CAS 失败则不碰共享状态。
+ * read-compare-set 整段在 withTaskLock 内（同 setTaskAwaitingIfIdle）。
+ *
+ * @returns 写成功 → 新 Task；指针已变 / meta 不存在 → null
+ */
+export const setTaskRunStatusIfCurrentAction = async (
+  taskId: string,
+  expectedCurrentActionId: string,
+  runStatus: RunStatus,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    // 后继 B 已接管（currentActionId 已变）→ 不覆盖其 runStatus
+    if (meta.currentActionId !== expectedCurrentActionId) return null;
+    meta.runStatus = runStatus;
+    meta.updatedAt = Date.now();
+    await writeMeta(meta);
+    return await hydrateTask(meta);
+  });
+
+/**
+ * R19-1：锁内结构条件——同 epoch 的并发 advance 不 bump opGen，仅靠 isFresh 挡不住。
+ * 调用方（如 /question ack）应传入 ack 当时的 currentActionId + 期望的 action status。
+ */
+export type OpFreshExpected = {
+  currentActionId?: string | null;
+  actionStatus?: ActionStatus | readonly ActionStatus[];
+  /** R26-4：可选 action.type 结构条件（如 set_plan_batches 须 plan） */
+  actionType?: ActionType | readonly ActionType[];
+};
+
+/** R19-1：锁内验 expected（读完 meta / 定位 action 后调用） */
+const matchesOpFreshExpected = (
+  meta: TaskMetaV06,
+  action: ActionRecord,
+  expected?: OpFreshExpected,
+): boolean => {
+  if (!expected) return true;
+  if (
+    "currentActionId" in expected &&
+    meta.currentActionId !== expected.currentActionId
+  ) {
+    return false;
+  }
+  if (expected.actionStatus !== undefined) {
+    const allowed = (
+      Array.isArray(expected.actionStatus)
+        ? expected.actionStatus
+        : [expected.actionStatus]
+    ) as readonly ActionStatus[];
+    if (!allowed.includes(action.status)) return false;
+  }
+  // R26-4：action.type 结构条件
+  if (expected.actionType !== undefined) {
+    const allowedTypes = (
+      Array.isArray(expected.actionType)
+        ? expected.actionType
+        : [expected.actionType]
+    ) as readonly ActionType[];
+    if (!allowedTypes.includes(action.type)) return false;
+  }
+  return true;
+};
+
+/**
+ * R26-4：锁内验「actionId === currentActionId 且 status === running」。
+ * submit_work 在 abort runningChecks 之前调用——旧 action 迟到重试不得杀新 action 的 check。
+ */
+export const isCurrentRunningAction = async (
+  taskId: string,
+  actionId: string,
+): Promise<boolean> =>
+  withTaskLock(taskId, async () => {
+    const meta = await readMetaV06(taskId);
+    if (!meta) return false;
+    if (meta.currentActionId !== actionId) return false;
+    const action = meta.actions.find((a) => a.id === actionId);
+    return action?.status === "running";
+  });
+
+/**
+ * R23-1a：锁内条件 patch action（不动 runStatus / currentActionId）。
+ *
+ * 复用 prepare/commit + 锁内复查 isOwner 协议（同 patchActionAndRunStatusIfOpFresh），
+ * 给 claim 前的 auto-approve 等「只改 action、已有 admission gen」路径用——
+ * stop 若已把 awaiting_ack 写成 cancelled，结构条件 / isOwner 失败则拒写、不落「已通过」。
+ *
+ * @returns 写成功 → 新 Task；失主 / 结构不符 / 复查失败 / meta 不存在 → null
+ */
+export const patchActionIfOwner = async (
+  taskId: string,
+  actionId: string,
+  patch: ActionPatchFields,
+  isOwner: () => boolean,
+  expected?: OpFreshExpected,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    // ① 锁内同步 owner 快查
+    if (!isOwner()) return null;
+    // ② readMeta + 结构条件
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    // R24-5b：终态后旧链 action 写非法（finalize 走裸 patchAction）
+    if (isTerminalRepoStatus(meta.repoStatus)) return null;
+    if (
+      expected &&
+      "currentActionId" in expected &&
+      meta.currentActionId !== expected.currentActionId
+    ) {
+      return null;
+    }
+    const idx = meta.actions.findIndex((a) => a.id === actionId);
+    if (idx < 0) return null;
+    const action = meta.actions[idx]!;
+    if (!matchesOpFreshExpected(meta, action, expected)) return null;
+
+    const now = Date.now();
+    const next: ActionRecord = {
+      ...action,
+      ...patch,
+    };
+    if (
+      patch.status &&
+      patch.status !== "running" &&
+      action.status === "running"
+    ) {
+      next.endedAt = now;
+    }
+    if (patch.status === "running") {
+      next.endedAt = null;
+    }
+    meta.actions = [
+      ...meta.actions.slice(0, idx),
+      next,
+      ...meta.actions.slice(idx + 1),
+    ];
+    meta.updatedAt = now;
+
+    // ③ prepare：脏值只在 tmp
+    const prepared = await prepareMetaWrite(meta);
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    const structureStillOk =
+      !expected ||
+      !("currentActionId" in expected) ||
+      expected.currentActionId === actionId;
+    const finalGuard = (): boolean => isOwner() && structureStillOk;
+    if (!finalGuard()) {
+      await prepared.abort();
+      return null;
+    }
+    const committed = await prepared.commit(finalGuard);
+    if (!committed) return null;
+    return await hydrateTask(meta);
+  });
+
+/**
+ * R18-1 / R19-1 / R19-3 / R26-5：op-fresh 条件事务——锁内验 isFresh + 结构条件后，
+ * 一把写 action.status + runStatus + currentActionId；权威检查进 commit(finalGuard)。
+ *
+ * 时序：/question ackContext 分支若先 patchAction 再 setTaskRunStatus，两段 await 之间
+ * stop 可完成并把 idle/cancelled 写回；旧代码无条件第二段写又把 running 盖回去。
+ * 把「确认仍是 op owner + 状态变更」放进同一 withTaskLock 临界区。
+ *
+ * R19-1：generation 只在 stop/DELETE/finalize 时 bump，普通 advance 不 bump——
+ * 同 epoch 后继不是 stale。故额外验 expected.currentActionId / actionStatus，
+ * 防旧 Q 把已 completed 的 A 改回 running、把 currentActionId 从 B 抢回 A。
+ *
+ * R20-3 / R26-5 prepare / 复查 / commit 单次提交的线性化论证：
+ * - prepare 只写 tmp，meta.json 未动——无锁读者（getTask/listTasks）看不到「被拒绝的」新值；
+ * - prepare 后同步复查可提前短路（省 rename）；权威检查在 commit 内、rename 发起前同步执行
+ *   （owner map 不受 task lock 约束——B 可在 failpoint await 期间接管）；
+ * - R21-3 口径保留：换主若落在 rename await 内 ⇒ 线性序等于「A 先提交、B 后接管」；
+ *   R21-1 已保证每个接管者在 claim 之后紧跟一次过同一把 withTaskLock 的状态写——
+ *   本临界区持锁直到 commit 返回，B 的写必然排在 A 的 rename 之后覆盖它。
+ *
+ * 为什么闭包注入而不是直接 import task-stream：task-fs 是底座、不反向依赖 runner 层状态
+ * （opGen / runningTasks 等挂在 task-stream）；调用方传 `() => !isTaskOpStale(taskId, opGen)`。
+ *
+ * @returns 写成功 → 新 Task；已 stale / 结构不符 / 复查失败 abort / meta 不存在 → null
+ */
+export const patchActionAndRunStatusIfOpFresh = async (
+  taskId: string,
+  actionId: string,
+  actionStatus: ActionStatus,
+  runStatus: RunStatus,
+  isFresh: () => boolean,
+  expected?: OpFreshExpected,
+  /**
+   * R23-4a：与 status 同事务写入的附加字段（如 postCheck）。
+   * 不得用二次裸 patch——两写之间 stop 会留下「cancelled 后又写元数据」窗口。
+   */
+  extraPatch?: Partial<Pick<ActionRecord, "postCheck">>,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    // ① 锁内同步快查（内存 owner / epoch）
+    if (!isFresh()) return null;
+    // ② readMeta
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    // R24-5b：终态后旧链 action+runStatus 写非法（finalize 走裸 setTaskRepoStatus/setTaskRunStatus）
+    if (isTerminalRepoStatus(meta.repoStatus)) return null;
+    // R19-1：结构条件——同 epoch 并发 advance 后 currentActionId / action.status 可能已变
+    if (
+      expected &&
+      "currentActionId" in expected &&
+      meta.currentActionId !== expected.currentActionId
+    ) {
+      return null;
+    }
+    const idx = meta.actions.findIndex((a) => a.id === actionId);
+    if (idx < 0) return null;
+    const action = meta.actions[idx]!;
+    if (!matchesOpFreshExpected(meta, action, expected)) return null;
+
+    const now = Date.now();
+    const next: ActionRecord = {
+      ...action,
+      ...(extraPatch ?? {}),
+      status: actionStatus,
+    };
+    if (
+      actionStatus !== "running" &&
+      action.status === "running"
+    ) {
+      next.endedAt = now;
+    }
+    if (actionStatus === "running") {
+      next.endedAt = null;
+    }
+    meta.actions = [
+      ...meta.actions.slice(0, idx),
+      next,
+      ...meta.actions.slice(idx + 1),
+    ];
+    meta.runStatus = runStatus;
+    meta.currentActionId = actionId;
+    meta.updatedAt = now;
+
+    // ③ prepare：脏值只在 tmp
+    const prepared = await prepareMetaWrite(meta);
+
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    // （写后 action.status 已是目标态，结构复查 = expected.currentActionId 仍是本 actionId）
+    const structureStillOk =
+      !expected ||
+      !("currentActionId" in expected) ||
+      expected.currentActionId === actionId;
+    const finalGuard = (): boolean => isFresh() && structureStillOk;
+    if (!finalGuard()) {
+      await prepared.abort();
+      return null;
+    }
+    const committed = await prepared.commit(finalGuard);
+    if (!committed) return null;
+    // 返回的是提交时快照；提交后换主不影响已提交事实（hydrate 只是读、无需再查）
+    return await hydrateTask(meta);
+  });
+
+/**
+ * R18-1 / R18-3 / R20-3：run-owner 条件写 runStatus——prepare / 同步复查 / 单次 commit。
+ *
+ * 锚点应是 runningTasks.instanceId（或 opGen），不能只比 currentActionId：
+ * stop 后 B「唤醒同一 action」时指针可与旧 Q 相同，旧回滚仍会把 B 的 running 写成 idle。
+ * 调用方传 `() => runningTasks.get(taskId)?.instanceId === myInstanceId`。
+ *
+ * R20-3：owner Map（runningTasks）不受 task lock 保护——入口 isOwner 成功后仍可能在
+ * readMeta/prepare 的 await 间被 forceClear + B 换主。prepare 后再同步查 isOwner，
+ * false 则 abort（tmp 丢弃、meta.json 从未出现新值）。线性化论证同
+ * {@link patchActionAndRunStatusIfOpFresh}。
+ *
+ * 闭包注入理由同 {@link patchActionAndRunStatusIfOpFresh}：task-fs 不反向依赖 task-stream。
+ *
+ * R21-4：expectedRunStatus 结构条件——调用方入场读到的盘上状态（如 ask 僵尸兜底的
+ * awaiting_user）在多段 await 后可能已被并发唤醒的后继写成 running；仅靠「无 session」
+ * 挡不住 Agent.create 前窗口。锁内 readMeta 后验证盘上 runStatus 仍是入场值，变了拒写。
+ *
+ * @returns 写成功 → 新 Task；已非 owner / 结构不符 / 复查失败 abort / meta 不存在 → null
+ */
+export const setTaskRunStatusIfRunOwner = async (
+  taskId: string,
+  runStatus: RunStatus,
+  isOwner: () => boolean,
+  currentActionId?: string | null,
+  expectedRunStatus?: RunStatus,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    // ① 同步 isOwner 快查（false 早退）
+    if (!isOwner()) return null;
+    // ② readMeta
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    // R24-5b：终态后旧链 runStatus 写非法（finalize 走裸 setTaskRunStatus）
+    if (isTerminalRepoStatus(meta.repoStatus)) return null;
+    // R21-4：盘上 runStatus 已不是调用方入场看到的值（后继已接管写入）→ 拒写
+    if (expectedRunStatus !== undefined && meta.runStatus !== expectedRunStatus) {
+      return null;
+    }
+    // ③ 构造新值 + prepare（脏值只在 tmp）
+    meta.runStatus = runStatus;
+    if (currentActionId !== undefined) {
+      meta.currentActionId = currentActionId;
+    }
+    meta.updatedAt = Date.now();
+    const prepared = await prepareMetaWrite(meta);
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    if (!isOwner()) {
+      await prepared.abort();
+      return null;
+    }
+    const committed = await prepared.commit(isOwner);
+    if (!committed) return null;
+    // 返回提交时快照；hydrate 只是读
+    return await hydrateTask(meta);
+  });
+
+/**
  * 直接设置 task 级 repoStatus（用户在 ack dialog 选「合入」/「abandon」时）
  */
 export const setTaskRepoStatus = async (
@@ -1098,6 +1650,9 @@ export const upsertGitBranch = async (
   withTaskLock(taskId, async () => {
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
+    // R26-1：终态拒写——finalize 后 prewarm 迟到不得重建 gitBranches
+    // （与 finalize/setTaskRepoStatus 同把 withTaskLock，持锁期间终态不会被并发改）
+    if (isTerminalRepoStatus(meta.repoStatus)) return null;
     const existing = meta.gitBranches ?? [];
     const idx = existing.findIndex((b) => b.repoPath === gitBranch.repoPath);
     meta.gitBranches =
@@ -1105,7 +1660,15 @@ export const upsertGitBranch = async (
         ? existing.map((b, i) => (i === idx ? gitBranch : b))
         : [...existing, gitBranch];
     meta.updatedAt = Date.now();
-    await writeMeta(meta);
+    // R26-1 / R26-5：走 prepare+commit(finalGuard) 体系
+    const prepared = await prepareMetaWrite(meta);
+    const finalGuard = (): boolean => !isTerminalRepoStatus(meta.repoStatus);
+    if (!finalGuard()) {
+      await prepared.abort();
+      return null;
+    }
+    const committed = await prepared.commit(finalGuard);
+    if (!committed) return null;
     return await hydrateTask(meta);
   });
 
@@ -1118,13 +1681,27 @@ export const upsertGitBranch = async (
 export const setFeishuTesterUserKeys = async (
   taskId: string,
   userKeys: string[],
+  /** R25-3：可选锁内 caller 闸 */
+  isOwner?: () => boolean,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
+    if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
     meta.feishuTesterUserKeys = userKeys;
     meta.updatedAt = Date.now();
-    await writeMeta(meta);
+    if (isOwner) {
+      const prepared = await prepareMetaWrite(meta);
+      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
+      if (!isOwner()) {
+        await prepared.abort();
+        return null;
+      }
+      const committed = await prepared.commit(isOwner);
+      if (!committed) return null;
+    } else {
+      await writeMeta(meta);
+    }
     return await hydrateTask(meta);
   });
 
@@ -1198,8 +1775,14 @@ export const upsertMR = async (
     /** V0.6.1.1：GitLab detailed_merge_status 原值 */
     mergeStatus?: string;
   },
+  /**
+   * R25-3：可选锁内 owner 闸（submit_mr 传 callerStillValid）——失主拒写、
+   * createMR 已发生后的迟到落盘不再污染新主时间线。
+   */
+  isOwner?: () => boolean,
 ): Promise<{ task: Task; mr: MRRecord } | null> =>
   withTaskLock(taskId, async () => {
+    if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
     const now = Date.now();
@@ -1248,7 +1831,18 @@ export const upsertMR = async (
       meta.mrs = [...meta.mrs, nextMR];
     }
     meta.updatedAt = now;
-    await writeMeta(meta);
+    if (isOwner) {
+      const prepared = await prepareMetaWrite(meta);
+      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
+      if (!isOwner()) {
+        await prepared.abort();
+        return null;
+      }
+      const committed = await prepared.commit(isOwner);
+      if (!committed) return null;
+    } else {
+      await writeMeta(meta);
+    }
     const task = await hydrateTask(meta);
     return { task, mr: nextMR };
   });

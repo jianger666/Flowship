@@ -150,6 +150,32 @@ export const extractMrUrlsFromText = (text: string): string[] => {
 };
 
 /**
+ * GitLab API host 形态校验：拒空、路径片段、userinfo（含 `@`）等畸形，
+ * 防止评论植入 `https://user:pass@evil/...` 把 PAT 打到攻击者端点。
+ * （gitlab-client buildBaseUrl 侧也应有同等闸门；此处给解析 / allowlist 共用。）
+ */
+export const isSafeGitlabHost = (host: string): boolean => {
+  const h = host.trim();
+  if (!h) return false;
+  // `/`：路径渗入 host；`@` / 含 userinfo 形态：凭证外泄面
+  if (h.includes("/") || h.includes("\\") || h.includes("@")) return false;
+  // 显式拒绝 userinfo 残留（user:pass@host 已被 @ 拦住；再拦以 ":" 开头等畸形）
+  if (h.startsWith(":") || h.endsWith(":")) return false;
+  return true;
+};
+
+/**
+ * 是否允许对某 host 带 gitToken 出站（安全形态 + 在已配置仓库 remote 推导的 allowlist 内）。
+ */
+export const shouldAttachGitlabToken = (
+  host: string,
+  allowedHosts: ReadonlySet<string>,
+): boolean => {
+  if (!isSafeGitlabHost(host)) return false;
+  return allowedHosts.has(host.trim().toLowerCase());
+};
+
+/**
  * 解析 GitLab MR web URL → host / projectPath / iid。
  * 例：`https://gitlab.example.com/group/repo/-/merge_requests/12`
  */
@@ -168,6 +194,7 @@ export const parseGitlabMrUrl = (
   if (!m) return null;
   const protocol = m[1]!.toLowerCase();
   const host = m[2]!;
+  if (!isSafeGitlabHost(host)) return null;
   const projectPath = m[3]!.replace(/\/+$/, "");
   const iid = Number(m[4]);
   if (!projectPath || !Number.isFinite(iid) || iid <= 0) return null;

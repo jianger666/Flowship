@@ -36,6 +36,13 @@ describe("isAllowedLocalRequest", () => {
     expect(isAllowedLocalRequest("localhost:8876", "not-a-url")).toBe(false);
   });
 
+  it("本机跨端口 CSRF：Origin 是 loopback 但端口 / 主机名与 Host 不同 → 拒绝（11 轮收紧）", () => {
+    expect(isAllowedLocalRequest("127.0.0.1:8876", "http://127.0.0.1:3000")).toBe(false);
+    expect(isAllowedLocalRequest("localhost:8876", "http://localhost:9999")).toBe(false);
+    expect(isAllowedLocalRequest("127.0.0.1:8876", "http://localhost:8876")).toBe(false);
+    expect(isAllowedLocalRequest("[::1]:8876", "http://[::1]:3000")).toBe(false);
+  });
+
   it("Host 缺失 → 拒绝", () => {
     expect(isAllowedLocalRequest(null, null)).toBe(false);
     expect(isAllowedLocalRequest("", null)).toBe(false);

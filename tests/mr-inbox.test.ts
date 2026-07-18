@@ -24,11 +24,13 @@ import {
   listUnreadInboxItems,
   MR_INBOX_SEEN_MAX_AGE_MS,
   normalizeInboxSeenUrl,
+  isSafeGitlabHost,
   parseGitlabMrUrl,
   parseMoqlBugQueryResponse,
   parseMoqlBugRow,
   pickLatestMrUrlFromComments,
   pruneSeenMap,
+  shouldAttachGitlabToken,
   truncateCommentSnippet,
   type MoqlField,
   type MrUrlCandidate,
@@ -159,6 +161,31 @@ describe("parseGitlabMrUrl", () => {
   it("非 MR URL 返回 null", () => {
     expect(parseGitlabMrUrl("https://gitlab.example.com/g/r")).toBeNull();
     expect(parseGitlabMrUrl("not a url")).toBeNull();
+  });
+
+  it("含 userinfo / @ 的畸形 host → null", () => {
+    expect(
+      parseGitlabMrUrl(
+        "https://user:token@evil.example/x/y/-/merge_requests/1",
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("isSafeGitlabHost / shouldAttachGitlabToken（PAT 出站闸门）", () => {
+  it("拒空 / 含 / / 含 @", () => {
+    expect(isSafeGitlabHost("")).toBe(false);
+    expect(isSafeGitlabHost("   ")).toBe(false);
+    expect(isSafeGitlabHost("evil.example/path")).toBe(false);
+    expect(isSafeGitlabHost("user@evil.example")).toBe(false);
+    expect(isSafeGitlabHost("gitlab.example.com")).toBe(true);
+  });
+
+  it("evil host 不在 allowlist → 不附带 token", () => {
+    const allowed = new Set(["gitlab.wukongedu.net"]);
+    expect(shouldAttachGitlabToken("evil.example", allowed)).toBe(false);
+    expect(shouldAttachGitlabToken("gitlab.wukongedu.net", allowed)).toBe(true);
+    expect(shouldAttachGitlabToken("GitLab.WukongEdu.net", allowed)).toBe(true);
   });
 });
 

@@ -8,7 +8,7 @@
  * （postMessage）/ 用户切回窗口（focus）时自动刷新状态。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import {
@@ -18,11 +18,15 @@ import {
   type McpOAuthStatus,
 } from "@/lib/task-store";
 
+/** focus 自动刷新最小间隔——频繁切窗别狂刷 */
+const FOCUS_REFRESH_MIN_MS = 5_000;
+
 export const useMcpOAuth = () => {
   // 各 server 的授权状态（key=serverName）
   const [statuses, setStatuses] = useState<Record<string, McpOAuthStatus>>({});
   // 正在授权 / 撤销中的 server 名（禁用按钮、避免重复点）
   const [busy, setBusy] = useState<string | null>(null);
+  const lastFocusRefreshAtRef = useRef(0);
 
   const refresh = useCallback(() => {
     fetchMcpOAuthStatuses()
@@ -44,7 +48,12 @@ export const useMcpOAuth = () => {
         refresh();
       }
     };
-    const onFocus = () => refresh();
+    const onFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusRefreshAtRef.current < FOCUS_REFRESH_MIN_MS) return;
+      lastFocusRefreshAtRef.current = now;
+      refresh();
+    };
     window.addEventListener("message", onMessage);
     window.addEventListener("focus", onFocus);
     return () => {

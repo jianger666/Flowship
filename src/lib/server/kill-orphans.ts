@@ -24,8 +24,9 @@
  * - 仅 best-effort：失败只 log、不抛、不阻断停止流程。
  * - macOS / Linux 通用（依赖 `ps` + `lsof`）；Windows 没有这俩、入口直接跳过
  *   （孤儿风险仍在、但树杀由壳退出时 taskkill /T 兜底、不值得为此接 wmic/CIM）。
- * - **不要在 force-new-agent（换新 agent）场景调**——新 agent 会在同仓拉起带同样签名的 shell、
- *   会被误杀。调用方负责只在「真正停止 / 自然结束 / 报错」时调（见 task-runner stop 路径 + finally 守卫）。
+ * - **不要在 force-new-agent（换新 agent）场景做延迟二次扫**——新 agent 会在同仓拉起带同样签名的 shell、
+ *   会被误杀。调用方应传 `{ delayedRescan: false }` 只做即时扫；真正停止 / 自然结束 / 报错保持默认二次扫
+ *   （见 task-runner resume 路径 + stop / finally）。
  */
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -174,15 +175,30 @@ const killOrphansInRepos = async (
   }
 };
 
+export interface ReapTaskOrphansOptions {
+  /**
+   * 是否在 2.5s 后再扫一次（默认 true）。
+   * 真正 stop / finally 收尾保持二次扫，接住延迟 reparent；
+   * resume / 换新 agent 路径传 false——只做即时扫，避免二次扫误杀新 agent 刚拉的 shell。
+   */
+  delayedRescan?: boolean;
+}
+
 /**
- * 停止时调：立即扫一次 + 2.5s 后再扫一次。
+ * 停止时调：立即扫一次；默认 2.5s 后再扫一次。
  * 第二次为了接住「run.cancel() 后 agent 才慢慢死、子进程刚 reparent 到 init」的漏网。
  * fire-and-forget、调用方 `void` 即可。
  *
  * @param workDirs 应传 agent 实际工作目录（`getTaskWorkRepoPaths(task)`），勿传裸 `task.repoPaths`
+ * @param options.delayedRescan 默认 true；换新 agent / resume 传 false 跳过二次扫
  */
-export const reapTaskOrphans = (workDirs: string[]): void => {
+export const reapTaskOrphans = (
+  workDirs: string[],
+  options: ReapTaskOrphansOptions = {},
+): void => {
+  const delayedRescan = options.delayedRescan !== false;
   void killOrphansInRepos(workDirs);
+  if (!delayedRescan) return;
   // unref：别让这 2.5s 定时器拖住进程退出（测试环境 mock 可能无 unref）
   setTimeout(() => {
     void killOrphansInRepos(workDirs);

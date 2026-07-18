@@ -43,6 +43,7 @@ import {
   getTaskCwd,
   getTaskWorkRepoPaths,
   isGitRepoPath,
+  isSafeBranchName,
   isWorktreeTask,
   parseMainGitDirFromPointer,
   parseOccupyingWorktreePath,
@@ -439,5 +440,15 @@ describe("parseOccupyingWorktreePath（git worktree add 占用路径）", () => 
 
   it("无占用路径文案 → null", () => {
     expect(parseOccupyingWorktreePath("fatal: invalid reference")).toBeNull();
+  });
+});
+
+describe("isSafeBranchName（worktree add / checkout 前白名单）", () => {
+  it("合法分支放行；前导 - / 空白 / .. / 非法字符拒", () => {
+    expect(isSafeBranchName("feature/888888-集成测试")).toBe(true);
+    expect(isSafeBranchName("-rf")).toBe(false);
+    expect(isSafeBranchName("evil;rm")).toBe(false);
+    expect(isSafeBranchName("a b")).toBe(false);
+    expect(isSafeBranchName("")).toBe(false);
   });
 });

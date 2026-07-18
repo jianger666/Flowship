@@ -10,7 +10,7 @@
  * 封装「fetch + loading + error + focus 自动刷新」；focus 刷新兜「设置页改完切回任务页」的同步。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { McpServerConfig } from "@cursor/sdk";
 
 import { fetchCursorMcp } from "@/lib/task-store";
@@ -42,29 +42,40 @@ export const useCursorMcp = (enabled = true): UseCursorMcpResult => {
   const [loading, setLoading] = useState(enabled);
   // 读取错误
   const [error, setError] = useState<string | null>(null);
+  // 卸载 / effect cleanup 后 in-flight 不再 setState
+  const aliveRef = useRef(false);
 
   const refresh = useCallback(() => {
     fetchCursorMcp()
       .then((data) => {
+        if (!aliveRef.current) return;
         setServers(data.servers);
         setCursorServers(data.cursor);
         setDirs(data.dirs);
         setError(null);
       })
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : String(err)),
-      )
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!aliveRef.current) return;
+        setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!aliveRef.current) return;
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
     if (!enabled) return;
+    aliveRef.current = true;
     setLoading(true);
     refresh();
     // 切回窗口时重拉（用户可能在 Cursor 改了 mcp.json）
     const onFocus = () => refresh();
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    return () => {
+      aliveRef.current = false;
+      window.removeEventListener("focus", onFocus);
+    };
   }, [enabled, refresh]);
 
   return {

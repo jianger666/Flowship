@@ -23,7 +23,7 @@
  * 2. 逐题落盘各自的图、拼接 [ASK_USER_REPLY] 文本（每题答案下内联「本题附图：<basename>」做归属）
  * 3. `agent.send([ASK_USER_REPLY]…)` 续同一会话送达答案（deliverAskReply）
  * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred + images 扁平数组给前端渲缩略图）+ publish SSE
- * 5. 切 runStatus = running
+ * 5. 响应里的 task 现读 getTask（R20-2：不再迟到刷 running——deliver/consume 内部已有 owner 门控写）
  */
 
 import path from "node:path";
@@ -32,7 +32,7 @@ import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
 import {
   appendEvent,
   getTask,
-  setTaskRunStatus,
+  setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
 import { saveImageAttachments } from "@/lib/server/task-artifacts";
 import type {
@@ -42,14 +42,23 @@ import type {
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
 import {
   deliverAskReply,
+  isTaskOpStale,
   resumeCurrentActionWithMessage,
   supersedePendingAsks,
+  TASK_OP_STALE_HTTP_MESSAGE,
 } from "@/lib/server/task-runner";
 import {
   deliverChatAskReply,
   hasChatSession,
 } from "@/lib/server/chat-runner";
-import { agentSessions, publishTaskStreamEvent } from "@/lib/server/task-stream";
+import {
+  agentSessions,
+  getTaskOpGeneration,
+  isTaskOpCurrent,
+  publishTaskStreamEvent,
+  snapshotTaskOp,
+} from "@/lib/server/task-stream";
+import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
   errorResponse,
   parseAndValidateImages,
@@ -216,6 +225,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
+  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒送达 / 唤醒
+  {
+    const life = getChatLifecycle(id);
+    if (life !== null) {
+      const msg =
+        life === "deleting"
+          ? "任务正在删除"
+          : life === "finalizing"
+            ? "正在终结、请稍后再试"
+            : "正在停止、请稍后再试";
+      return errorResponse(msg, 409);
+    }
+  }
+
+  // W2：读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 事件等长 await
+  const opGen = getTaskOpGeneration(task.id);
+
   const reqEvent = [...task.events]
     .reverse()
     .find(
@@ -340,6 +366,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
     allAbsPaths: string[],
     reason: string,
   ): Promise<Response | null> => {
+    // X1：wake 前复查——stale 不得清 pending / 记「已答」
+    if (isTaskOpStale(task.id, opGen)) {
+      return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    }
     const boot = parseBootArgs();
     // task 唤醒需要 currentAction；chat 只要有 apiKey+model 就能起新会话
     if (isChat) {
@@ -388,6 +418,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         apiKey: boot.apiKey!,
         fallbackModel: boot.model!,
         gitToken: boot.gitToken,
+        opGen,
       }).catch(async (err) => {
         console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
         const ev = await appendEvent(task.id, {
@@ -438,6 +469,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 旧逻辑当场 410 + 标 error → 答题卡 isStale「用输入条唤醒」+ 输入条因未了结 ask
     // 仍禁用 = 对锁死。有凭据则接受答案并唤醒；没凭据才作废提问 + 标 error 放行输入条。
     if (fresh.runStatus === "awaiting_user") {
+      // R23-3d：入场判定僵尸态处立刻 snapshot——B claim 后（写 running 前）本 observer
+      // 即失效，闭包不再只靠 opGen（同 gen claim 看不见）。
+      const zombieObserver = snapshotTaskOp(task.id);
       console.warn(
         `[ask-reply] task=${task.id} askId=${askId} 僵尸态 runStatus=awaiting_user（pending 已丢）、尝试唤醒兜底`,
       );
@@ -451,6 +485,32 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
       if (woken) return woken;
 
+      // R19 收尾补漏：僵尸兜底前有多段 await（存图 / wake），期间 stop（bump gen）或
+      // 别的入口把任务拉起（session 复活）都可能发生——裸写 error 会覆盖新 owner。
+      // R23-3d：门控 = observer 仍 current + 无存活会话 + expectedRunStatus 结构条件。
+      // R22-6：必须先完成锁内条件写，再决定是否落「Agent 已断开」error 事件——否则后继
+      // 已拉成 running 时 helper 返 null，事件流仍会永久留下假断开。
+      const failedTask = await setTaskRunStatusIfRunOwner(
+        task.id,
+        "error",
+        () =>
+          isTaskOpCurrent(zombieObserver) &&
+          !(isChat ? hasChatSession(task.id) : agentSessions.has(task.id)),
+        undefined,
+        "awaiting_user",
+      );
+      if (!failedTask) {
+        // 后继已接管：本问答失效，不 supersede / 不 clear / 不写断开事件 / 不发 done
+        const info = await appendEvent(task.id, {
+          kind: "info",
+          actionId: reqEvent.actionId,
+          text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
+          meta: { supersededAskId: askId },
+        });
+        if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
+        return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
+      }
+
       await supersedePendingAsks(task.id, "会话已失效");
       clearPendingAsk(task.id);
       const errorEvent = await appendEvent(task.id, {
@@ -463,15 +523,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (errorEvent) {
         publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
       }
-      const failedTask = await setTaskRunStatus(task.id, "error");
-      if (failedTask) {
-        publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
-        publishTaskStreamEvent(task.id, {
-          kind: "done",
-          task: failedTask,
-          ok: false,
-        });
-      }
+      publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
+      publishTaskStreamEvent(task.id, {
+        kind: "done",
+        task: failedTask,
+        ok: false,
+      });
       return errorResponse(
         isChat
           ? "agent 已断开——在底部输入条说句话即可继续"
@@ -494,43 +551,68 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (!assets.ok) return assets.errorResponse;
   const { allSaved, allAbsPaths, replyText } = assets;
 
+  // X1：存图长 await 后复查
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+
   // V0.11：`agent.send` 送达答案——成功了才写「已答」事件 + publish（顺序关键：先送再落
   // 事件、失败不写、防「用户看到已答、agent 没收到」的假已答）。send 成功即清 pendingAsk。
   // chat → deliverChatAskReply（runningChats）；task → deliverAskReply（agentSessions）
   const boot = parseBootArgs();
-  const ok = isChat
-    ? await deliverChatAskReply(
-        task,
-        replyText,
-        allAbsPaths.length > 0 ? allAbsPaths : undefined,
-        boot,
-      )
-    : await deliverAskReply(
-        task,
-        replyText,
-        allAbsPaths.length > 0 ? allAbsPaths : undefined,
-        reqEvent.actionId,
-        boot,
-      );
-  if (!ok) {
-    // V0.14.x（用户点名「AI 断开时提问没法提交」）：会话死不再丢答案 + 报错让用户
-    // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去。
-    const woken = await wakeWithAnswer(
+  if (isChat) {
+    const ok = await deliverChatAskReply(
+      task,
       replyText,
-      allSaved,
-      allAbsPaths,
-      "会话已死",
+      allAbsPaths.length > 0 ? allAbsPaths : undefined,
+      boot,
     );
-    if (woken) return woken;
-    // 没凭据（极端）：维持原作废 + 报错兜底
-    await supersedePendingAsks(task.id, "会话已失效");
-    clearPendingAsk(task.id);
-    return errorResponse(
-      isChat
-        ? "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话即可继续"
-        : "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
-      409,
+    if (!ok) {
+      const woken = await wakeWithAnswer(
+        replyText,
+        allSaved,
+        allAbsPaths,
+        "会话已死",
+      );
+      if (woken) return woken;
+      await supersedePendingAsks(task.id, "会话已失效");
+      clearPendingAsk(task.id);
+      return errorResponse(
+        "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话即可继续",
+        409,
+      );
+    }
+  } else {
+    const deliverResult = await deliverAskReply(
+      task,
+      replyText,
+      allAbsPaths.length > 0 ? allAbsPaths : undefined,
+      reqEvent.actionId,
+      boot,
+      opGen,
     );
+    // X1：stale → 409，不清 pending、不记已答、不走 wake
+    if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
+      return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    }
+    if (deliverResult !== "sent") {
+      // V0.14.x（用户点名「AI 断开时提问没法提交」）：会话死不再丢答案 + 报错让用户
+      // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去。
+      const woken = await wakeWithAnswer(
+        replyText,
+        allSaved,
+        allAbsPaths,
+        "会话已死",
+      );
+      if (woken) return woken;
+      // 没凭据（极端）：维持原作废 + 报错兜底
+      await supersedePendingAsks(task.id, "会话已失效");
+      clearPendingAsk(task.id);
+      return errorResponse(
+        "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
+        409,
+      );
+    }
   }
   clearPendingAsk(task.id);
 
@@ -551,12 +633,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
     publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
   }
 
-  // deliverChatAskReply / deliverAskReply 内部已切 running；再 set 一次幂等、保证 SSE 推到最新
-  const updated = await setTaskRunStatus(task.id, "running");
-  if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
+  // R20-2：删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
+  // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running
+  // （正常结束不 bump gen，旧闭包仍 true）。running 写以 deliver/consume 内部 owner 门控为准。
+  const freshTask = (await getTask(task.id)) ?? task;
 
   return new Response(
-    JSON.stringify({ ok: true, task: updated ?? task }),
+    JSON.stringify({ ok: true, task: freshTask }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

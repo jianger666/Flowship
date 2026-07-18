@@ -11,12 +11,13 @@
  *   - AskUserRequestRow：ask_user 事件历史回放卡（V0.3.2 起交互移到 modal、这里只放历史）
  */
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Ban,
   CheckCircle2,
-  ChevronDown,
   ChevronRight,
+  Clock,
+  Copy,
   File as FileIcon,
   Folder,
   Loader2,
@@ -26,6 +27,7 @@ import {
   Send,
   Sparkles,
 } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -125,6 +127,15 @@ interface ProcessEventRowProps {
  * 过程事件行：thinking / tool_call / 普通 info 等低权重事件统一用 chat 的细行样式。
  * task(log) 会额外传 actionTag 保留归属，chat 不传，避免两种场景丢上下文。
  */
+const CollapseChevron = ({ open }: { open: boolean }) => (
+  <ChevronRight
+    className={cn(
+      "size-3 shrink-0 opacity-50 transition-transform duration-150",
+      open && "rotate-90",
+    )}
+  />
+);
+
 const ProcessEventRow = ({
   ev,
   collapsed,
@@ -141,11 +152,7 @@ const ProcessEventRow = ({
       onClick={onToggle}
       className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
     >
-      {collapsed ? (
-        <ChevronRight className="size-3 shrink-0 opacity-50" />
-      ) : (
-        <ChevronDown className="size-3 shrink-0 opacity-50" />
-      )}
+      <CollapseChevron open={!collapsed} />
       <span className="shrink-0 [&_svg]:size-3">
         {renderEventIcon(ev.kind)}
       </span>
@@ -231,12 +238,27 @@ export const ReconnectingRow = memo(
 );
 ReconnectingRow.displayName = "ReconnectingRow";
 
+/** P5：本地排队占位气泡（半透明 + 时钟；展示用户原文） */
+export const PendingLocalReplyRow = memo(({ text }: { text: string }) => (
+  <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
+    <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+    <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
+      <span className="mb-0.5 block text-[10px] tracking-wide">待发送</span>
+      {/* 原文：SkillTokenText 解析 skill token、正文即用户消息 */}
+      <SkillTokenText text={text} />
+    </div>
+  </div>
+));
+PendingLocalReplyRow.displayName = "PendingLocalReplyRow";
+
 const EventRowImpl = ({
   ev,
   taskId,
   task,
   variant = "log",
   onResend,
+  onRewind,
+  runActive = false,
 }: {
   ev: TaskEvent;
   taskId: string;
@@ -247,7 +269,16 @@ const EventRowImpl = ({
   // v1.0：chat「最后一条用户消息」的重发 / 原地编辑（手动停止 / 断网后想改一下重说）——
   // hover 出两个 icon：↻ 原样重发、✎ 原地编辑后发；都是「发一条新消息到末尾」（架构是
   // 持久会话 append-only、做不了 ChatGPT 那种 fork 截断）；只有最后一条用户消息才传（父组件把关）
-  onResend?: (text: string) => void;
+  // 第二参 sourceEv：重发时带回原 meta.images / attachments（批 B）
+  // 返回 false = 发送失败（编辑态保持）；true / void = 成功可关编辑
+  onResend?: (
+    text: string,
+    sourceEv?: TaskEvent,
+  ) => boolean | void | Promise<boolean | void>;
+  /** chat checkpoint 回退：仅 checkpointed user_reply + 非 running 时传 */
+  onRewind?: (eventId: string) => void;
+  /** agent 正在跑：隐藏回退按钮 */
+  runActive?: boolean;
 }) => {
   // V0.6：用 actionId 查 action 类型、渲染 tag
   const action = ev.actionId
@@ -259,12 +290,29 @@ const EventRowImpl = ({
   // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState("");
+  // 编辑 / 重发飞行锁（防连点；失败时保持 editing）
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const resendLockRef = useRef(false);
   // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、蓝军 P1：别写死）
   const submitShortcut = useSubmitShortcut();
   // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
   useEffect(() => {
     if (!onResend) setEditing(false);
   }, [onResend]);
+
+  const runResend = async (
+    text: string,
+    sourceEv?: TaskEvent,
+  ): Promise<boolean> => {
+    if (!onResend || resendLockRef.current) return false;
+    resendLockRef.current = true;
+    try {
+      const result = await onResend(text, sourceEv);
+      return result !== false;
+    } finally {
+      resendLockRef.current = false;
+    }
+  };
 
   // 附件 chip 的跳转 IDE（设置页可切 Cursor / IDEA）
   const jumpIde = useJumpIde();
@@ -274,14 +322,31 @@ const EventRowImpl = ({
   const hasImageMeta = isUser || ev.kind === "ask_user_reply";
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
+  const isCompactSummary = ev.kind === "compact_summary";
   const isToolCall = ev.kind === "tool_call";
   const isAwaitingAck = ev.meta?.awaitingAck === true;
+  // checkpointed：可回退到这条用户消息
+  const canRewind =
+    variant === "chat" &&
+    isUser &&
+    ev.meta?.checkpointed === true &&
+    !!onRewind &&
+    !runActive;
   // log 形态降权只看默认折叠规则：过程类降噪，HITL / 失败 / 核心对话保持可见。
   const isDefaultVisible = DEFAULT_EXPANDED_KINDS.has(ev.kind) || isAwaitingAck;
   // 是否用 markdown 渲染：仅 AI 回复（用户也可能贴 markdown，但气泡要高亮
   // `/skill-name` token，markdown AST 改太重 → user_reply 走 SkillTokenText 纯文本）
   // thinking / tool_call / info / error 一律纯文本（结构化输出 / 错误消息、markdown 反而碍事）
   const useMarkdown = isAssistant;
+
+  const handleCopyAssistant = async () => {
+    try {
+      await navigator.clipboard.writeText(ev.text);
+      toast.success("已复制");
+    } catch {
+      toast.error("复制失败");
+    }
+  };
 
   // tool_call 合并卡判定（V0.5.13）：mergeAdjacentToolCall 给同 phase + 同 tool name
   // 连续 ≥2 条合一时塞 meta.batch + meta.count、UI 折叠 / 展开走 batch 分支
@@ -339,7 +404,7 @@ const EventRowImpl = ({
       batch={batch}
       actionTag={variant === "log" && actionType ? (ACTION_LABEL_SHORT[actionType] ?? actionType) : undefined}
       isToolCall={isToolCall}
-      isThinking={isThinking}
+      isThinking={isThinking || isCompactSummary}
       onToggle={handleToggle}
     />
   );
@@ -351,10 +416,25 @@ const EventRowImpl = ({
   //   - thinking / tool_call / info：单行细条目（小图标 + 摘要 + 时间）、点击展开、
   //     视觉权重压到最低——过程可查但不抢戏
   if (variant === "chat") {
-    // AI 回复：平铺 prose、不进卡片
+    // 会话压缩摘要：thinking 同款可折叠细行
+    if (isCompactSummary) {
+      return processRow;
+    }
+    // AI 回复：平铺 prose、hover 出「复制」
     if (isAssistant) {
       return (
-        <div className="text-sm leading-relaxed">
+        <div className="group relative text-sm leading-relaxed">
+          <div className="absolute -top-3 right-2 overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+            <button
+              type="button"
+              onClick={() => void handleCopyAssistant()}
+              title="复制原文"
+              aria-label="复制"
+              className="flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            >
+              <Copy className="size-3" />
+            </button>
+          </div>
           <MarkdownText text={ev.text} />
         </div>
       );
@@ -366,9 +446,16 @@ const EventRowImpl = ({
       if (editing && onResend) {
         const trimmed = editDraft.trim();
         const submitEdit = () => {
-          if (!trimmed) return;
-          setEditing(false);
-          onResend(trimmed);
+          if (!trimmed || editSubmitting) return;
+          setEditSubmitting(true);
+          void (async () => {
+            try {
+              const ok = await runResend(trimmed, ev);
+              if (ok) setEditing(false);
+            } finally {
+              setEditSubmitting(false);
+            }
+          })();
         };
         return (
           <div className="rounded-lg border border-ring/60 bg-muted/40 p-2 shadow-sm">
@@ -376,11 +463,12 @@ const EventRowImpl = ({
               value={editDraft}
               onChange={(e) => setEditDraft(e.target.value)}
               autoFocus
+              disabled={editSubmitting}
               className="max-h-64 min-h-[52px] resize-none border-none bg-transparent p-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
               onKeyDown={(e) => {
                 if (e.key === "Escape" && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  setEditing(false);
+                  if (!editSubmitting) setEditing(false);
                   return;
                 }
                 // 提交快捷键跟设置页偏好一致（helper 内部已处理 IME / enter vs mod-enter）
@@ -391,11 +479,26 @@ const EventRowImpl = ({
               }}
             />
             <div className="mt-1 flex items-center justify-end gap-1.5">
-              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setEditing(false)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={editSubmitting}
+                onClick={() => setEditing(false)}
+              >
                 取消
               </Button>
-              <Button size="sm" className="h-7 text-xs" disabled={!trimmed} onClick={submitEdit}>
-                <Send className="size-3" />
+              <Button
+                size="sm"
+                className="h-7 text-xs"
+                disabled={!trimmed || editSubmitting}
+                onClick={submitEdit}
+              >
+                {editSubmitting ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Send className="size-3" />
+                )}
                 发送
               </Button>
             </div>
@@ -404,29 +507,48 @@ const EventRowImpl = ({
       }
       return (
         <div className="group relative rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
-          {onResend && (
+          {(onResend || canRewind) && (
             <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
-              <button
-                type="button"
-                onClick={() => onResend(ev.text)}
-                title="原样重发这条消息"
-                aria-label="重发"
-                className="flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <RotateCcw className="size-3" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditDraft(ev.text);
-                  setEditing(true);
-                }}
-                title="编辑后重发（原消息保留）"
-                aria-label="编辑后重发"
-                className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <PencilLine className="size-3" />
-              </button>
+              {canRewind && (
+                <button
+                  type="button"
+                  onClick={() => onRewind?.(ev.id)}
+                  title="回退到这里"
+                  aria-label="回退到这里"
+                  className="flex cursor-pointer items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                >
+                  <RotateCcw className="size-3" />
+                  回退到这里
+                </button>
+              )}
+              {onResend && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void runResend(ev.text, ev)}
+                    title="原样重发这条消息"
+                    aria-label="重发"
+                    className={cn(
+                      "flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground",
+                      canRewind && "border-l",
+                    )}
+                  >
+                    <RotateCcw className="size-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditDraft(ev.text);
+                      setEditing(true);
+                    }}
+                    title="编辑后重发（原消息保留）"
+                    aria-label="编辑后重发"
+                    className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <PencilLine className="size-3" />
+                  </button>
+                </>
+              )}
             </div>
           )}
           <div className="text-sm leading-relaxed">
@@ -505,11 +627,7 @@ const EventRowImpl = ({
             isDefaultVisible ? "gap-2" : "gap-1.5",
           )}
         >
-          {collapsed ? (
-            <ChevronRight className="size-3 shrink-0 text-muted-foreground" />
-          ) : (
-            <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
-          )}
+          <CollapseChevron open={!collapsed} />
           {actionType && (
             <span
               className={cn(

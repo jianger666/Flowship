@@ -103,8 +103,31 @@ export const FeishuBoard = () => {
   const seqRef = useRef(0);
   // 瞬态失败静默重试余额（成功回满；见 refresh 里的护栏注释）
   const retryLeftRef = useRef(2);
+  // 静默重试 timer：卸载 / 新一轮 refresh 必须清掉，防幽灵 refresh
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 组件挂载态：timer 回调再判一次，避免卸载后仍触发
+  const aliveRef = useRef(true);
   // refresh 的 ref 化（重试 timer 里调最新版、不把自己塞进依赖）
   const refreshRef = useRef<(() => Promise<void>) | null>(null);
+
+  const clearRetryTimer = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleSilentRetry = useCallback(
+    (seq: number) => {
+      clearRetryTimer();
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        if (!aliveRef.current) return;
+        if (seq === seqRef.current) void refreshRef.current?.();
+      }, 5_000);
+    },
+    [clearRetryTimer],
+  );
   // 默认飞书空间（settings.meegleProject；初值硬编码默认、init 后若用户改过会覆盖）
   const [meegleProject, setMeegleProject] = useState<MeegleProjectSetting>(() => ({
     ...DEFAULT_MEEGLE_PROJECT,
@@ -151,6 +174,8 @@ export const FeishuBoard = () => {
   }, [meegleProject.key]);
 
   const refresh = useCallback(async () => {
+    // 新一轮开始先清掉上一轮静默重试，避免叠多个幽灵 timer
+    clearRetryTimer();
     const seq = ++seqRef.current;
     setRefreshing(true);
     try {
@@ -181,9 +206,7 @@ export const FeishuBoard = () => {
         const prev = respRef.current;
         if (data.status !== "ok" && prev?.status === "ok" && retryLeftRef.current > 0) {
           retryLeftRef.current -= 1;
-          setTimeout(() => {
-            if (seq === seqRef.current) void refreshRef.current?.();
-          }, 5_000);
+          scheduleSilentRetry(seq);
           return;
         }
         if (data.status === "ok") retryLeftRef.current = 2;
@@ -196,9 +219,7 @@ export const FeishuBoard = () => {
         const prev = respRef.current;
         if (prev?.status === "ok" && retryLeftRef.current > 0) {
           retryLeftRef.current -= 1;
-          setTimeout(() => {
-            if (seq === seqRef.current) void refreshRef.current?.();
-          }, 5_000);
+          scheduleSilentRetry(seq);
         } else {
           const failed: BoardResp = {
             status: "error",
@@ -211,12 +232,17 @@ export const FeishuBoard = () => {
     } finally {
       if (seq === seqRef.current) setRefreshing(false);
     }
-  }, [meegleProject.key, range]);
+  }, [meegleProject.key, range, clearRetryTimer, scheduleSilentRetry]);
 
   useEffect(() => {
+    aliveRef.current = true;
     refreshRef.current = refresh;
     void refresh();
-  }, [refresh]);
+    return () => {
+      aliveRef.current = false;
+      clearRetryTimer();
+    };
+  }, [refresh, clearRetryTimer]);
 
   // 点击工作项：有「仍存活」的任务直进、否则进预览（不盲信看板缓存里的 it.task）
   const handleOpen = useCallback(

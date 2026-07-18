@@ -31,10 +31,13 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   action_start: "Action 启动",
   action_ack: "Action 确认",
   tool_call: "工具调用",
+  tool_result: "工具结果",
+  tool_output_delta: "工具输出",
   user_reply: "用户回复",
   assistant_message: "AI 回复",
   ask_user_request: "向你提问",
   ask_user_reply: "你的回答",
+  compact_summary: "会话摘要",
   error: "错误",
 };
 
@@ -46,8 +49,14 @@ export const renderEventIcon = (kind: EventKind) => {
       return <CheckCircle2 className="size-4 text-emerald-500" />;
     case "tool_call":
       return <ArrowUpRight className="size-4 text-blue-500" />;
+    case "tool_result":
+      return <CheckCircle2 className="size-4 text-blue-500" />;
+    case "tool_output_delta":
+      return <ArrowUpRight className="size-4 text-muted-foreground" />;
     case "thinking":
       return <Brain className="size-4 text-violet-500" />;
+    case "compact_summary":
+      return <Brain className="size-4 text-violet-500/80" />;
     case "user_reply":
       return <UserCircle2 className="size-4 text-foreground" />;
     case "ask_user_request":
@@ -119,6 +128,17 @@ export const DEFAULT_EXPANDED_KINDS: ReadonlySet<EventKind> = new Set([
   "user_reply",
 ]);
 
+/**
+ * chat 历史噪声：旧版「Chat 任务启动 (model:…)」info。
+ * 勿误伤重连 info（meta.kind=reconnecting / reconnected）。
+ */
+export const isChatStartupNoiseInfo = (ev: TaskEvent): boolean => {
+  if (ev.kind !== "info") return false;
+  const metaKind = ev.meta?.kind;
+  if (metaKind === "reconnecting" || metaKind === "reconnected") return false;
+  return /^Chat 任务启动/.test(ev.text);
+};
+
 // 折叠态摘要：把所有换行 / 多空白压成单空格、再 200 字截
 // 历史方案：取首行 + 80 字。问题：thinking / tool_call 首行常常很短
 // （像「The user wants to」这种 setup 句）、80 字以内不加省略号、用户看不到
@@ -149,19 +169,8 @@ const getToolName = (ev: TaskEvent): string =>
   typeof ev.meta?.name === "string" ? ev.meta.name : "";
 
 /**
- * 合并相邻 tool_call（同 phase、不分 tool 名）
- *
- * V0.5.13 初版要求「同 tool name」连续才合并、但实测 AI 探索式调用经常 read /
- * grep / edit 交错（『read 1.tsx → grep "useMemo" → read 2.tsx → edit ...』）、
- * 严格相邻不触发、压不了几条。
- *
- * 用户拍板放宽到「同 phase 连续 tool_call」、不分 tool 名（Cursor IDE 风格）：
- *   - 折叠态：「工具调用 ×N」+ 最后一条 ev.text 摘要、给用户看「收尾在干嘛」
- *   - 展开态：每条子条带 `[tool name]` prefix、看得清谁是谁
- *   - meta.batch 保留所有子条 + 每条的 tool name、UI 展开时列表展示
- *   - meta.count 给折叠态显示「×N」
- *
- * 不动 events.jsonl 落盘内容（原貌保留、便于复盘）、只在 UI 渲染前合并。
+ * @deprecated Phase 1 批 B 起改用 `mergeToolDisplayEvents`（callId 配对 + GB verb-group）。
+ * 保留给旧测试 / 临时兼容；新代码勿再调。
  */
 export const mergeAdjacentToolCall = (events: TaskEvent[]): TaskEvent[] => {
   const out: TaskEvent[] = [];
@@ -195,9 +204,7 @@ export const mergeAdjacentToolCall = (events: TaskEvent[]): TaskEvent[] => {
           ];
       out[out.length - 1] = {
         ...last,
-        // 显示最后一条作为代表文本（reflect 最新状态）
         text: ev.text,
-        // ts 用最后一条、不然「时间」显示成第一条很奇怪
         ts: ev.ts,
         meta: {
           ...(last.meta ?? {}),

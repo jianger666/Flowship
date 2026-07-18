@@ -75,10 +75,13 @@ const SEEN_CAP = 300;
 
 const readSeenMap = (): Record<string, number> => {
   try {
-    return JSON.parse(localStorage.getItem(SEEN_KEY) ?? "{}") as Record<
-      string,
-      number
-    >;
+    const raw = JSON.parse(localStorage.getItem(SEEN_KEY) ?? "{}") as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
   } catch {
     return {};
   }

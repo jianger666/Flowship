@@ -80,4 +80,37 @@ describe("mergeTaskEvents（事件懒加载：本地事件只增不换）", () =
     const merged = mergeTaskEvents(prev, next);
     expect(merged.events).toBe(prev.events);
   });
+
+  it("过滤非 ephemeral 的 tool_output_delta（不进本地持久 events）", () => {
+    const prev = makeTask([ev("a", 1)]);
+    const next = makeTask([
+      ev("a", 1),
+      {
+        id: "tod_x_1",
+        ts: 2,
+        kind: "tool_output_delta",
+        text: "",
+        meta: { callId: "x", chunk: "hi" },
+      },
+      ev("b", 3),
+    ]);
+    const merged = mergeTaskEvents(prev, next);
+    expect(merged.events.map((e) => e.id)).toEqual(["a", "b"]);
+  });
+
+  it("过滤 ephemeral_boot_* 的 info（不进本地持久 events）", () => {
+    const prev = makeTask([ev("a", 1)]);
+    const next = makeTask([
+      ev("a", 1),
+      {
+        id: "ephemeral_boot_1",
+        ts: 2,
+        kind: "info",
+        text: "boot hint",
+      },
+      ev("b", 3),
+    ]);
+    const merged = mergeTaskEvents(prev, next);
+    expect(merged.events.map((e) => e.id)).toEqual(["a", "b"]);
+  });
 });

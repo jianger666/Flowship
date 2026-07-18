@@ -24,11 +24,13 @@ import {
   inboxGroupsVisibleForRole,
   isBugPendingFixStatus,
   isBugPendingRegressionStatus,
+  isSafeGitlabHost,
   isWorkitemReadyForQaInbox,
   MR_INBOX_CACHE_TTL_MS,
   parseGitlabMrUrl,
   parseMoqlBugQueryResponse,
   pickLatestMrUrlFromComments,
+  shouldAttachGitlabToken,
   stripBugMrFields,
   truncateCommentSnippet,
   type InboxGroupId,
@@ -46,8 +48,58 @@ import {
   queryWorkitemsByMql,
   type MeegleProject,
 } from "./meegle-cli";
-import { getMR } from "./gitlab-client";
+import { getMR, type GetMRResult } from "./gitlab-client";
+import { deriveHostFromRepo } from "./submit-mr-guard";
 import { readSettingsFile } from "./settings-fs";
+
+/**
+ * 从 settings.repos 各仓 origin remote 推导 GitLab host allowlist
+ *（与 resolveEffectiveGitHost / deriveHostFromRepo 同源；多仓可多 host，取并集）。
+ */
+export const collectGitlabHostAllowlist = async (
+  settings: Record<string, unknown> | null,
+): Promise<Set<string>> => {
+  const repos = Array.isArray(settings?.repos) ? settings.repos : [];
+  const hosts = new Set<string>();
+  for (const repo of repos) {
+    if (!repo || typeof repo !== "object") continue;
+    const p = (repo as { path?: unknown }).path;
+    if (typeof p !== "string" || !p.trim()) continue;
+    const h = await deriveHostFromRepo(p.trim());
+    if (h && isSafeGitlabHost(h)) hosts.add(h.trim().toLowerCase());
+  }
+  return hosts;
+};
+
+/**
+ * 带 host allowlist 的 getMR：不在名单 / 畸形 host → 不发起带 token 请求。
+ * export 供单测验证「evil host 不带 PAT 出站」。
+ */
+export const getMRWithHostAllowlist = async (opts: {
+  mrUrl: string;
+  gitToken: string;
+  allowedHosts: ReadonlySet<string>;
+}): Promise<
+  | GetMRResult
+  | { ok: false; error: string; skipped: true }
+> => {
+  const parsed = parseGitlabMrUrl(opts.mrUrl);
+  if (!parsed) {
+    return { ok: false, error: "MR URL 无法解析", skipped: true };
+  }
+  if (!shouldAttachGitlabToken(parsed.host, opts.allowedHosts)) {
+    return {
+      ok: false,
+      error: "MR host 不在已配置仓库允许列表",
+      skipped: true,
+    };
+  }
+  return getMR({
+    config: { host: parsed.host, token: opts.gitToken },
+    projectPath: parsed.projectPath,
+    iid: parsed.iid,
+  });
+};
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -337,6 +389,7 @@ const scanPendingMr = async (
   host: string | undefined,
   simpleNames: Map<string, string>,
   gitToken: string,
+  allowedHosts: ReadonlySet<string>,
 ): Promise<MrInboxItem[]> => {
   const from = Date.now() - 60 * DAY_MS;
   const to = Date.now() + 30 * DAY_MS;
@@ -410,12 +463,21 @@ const scanPendingMr = async (
       deduped.map(async (c) => {
         const parsed = parseGitlabMrUrl(c.mrUrl);
         if (!parsed) return { c, mr: null as null, error: "MR URL 无法解析" };
-        const r = await getMR({
-          config: { host: parsed.host, token: gitToken },
-          projectPath: parsed.projectPath,
-          iid: parsed.iid,
+        // host 不在 allowlist：仅展示纯链接，绝不带 PAT 出站
+        if (!shouldAttachGitlabToken(parsed.host, allowedHosts)) {
+          return { c, mr: null as null, error: undefined };
+        }
+        const r = await getMRWithHostAllowlist({
+          mrUrl: c.mrUrl,
+          gitToken,
+          allowedHosts,
         });
-        if (!r.ok) return { c, mr: null as null, error: r.error };
+        if (!r.ok) {
+          if ("skipped" in r && r.skipped) {
+            return { c, mr: null as null, error: undefined };
+          }
+          return { c, mr: null as null, error: r.error };
+        }
         return { c, mr: r, error: undefined };
       }),
     );
@@ -513,6 +575,7 @@ const scanBugsForRole = async (
 const enrichPendingRegressionWithMr = async (
   bugs: BugInboxItem[],
   gitToken: string,
+  allowedHosts: ReadonlySet<string>,
 ): Promise<BugInboxItem[]> => {
   if (bugs.length === 0) return bugs;
   return Promise.all(
@@ -533,12 +596,19 @@ const enrichPendingRegressionWithMr = async (
         if (!parsed) {
           return { ...bug, mrUrl, mr: null, mrError: "MR URL 无法解析" };
         }
-        const r = await getMR({
-          config: { host: parsed.host, token: gitToken },
-          projectPath: parsed.projectPath,
-          iid: parsed.iid,
+        // host 不在 allowlist：仅展示纯链接，绝不带 PAT 出站
+        if (!shouldAttachGitlabToken(parsed.host, allowedHosts)) {
+          return { ...bug, mrUrl, mr: null };
+        }
+        const r = await getMRWithHostAllowlist({
+          mrUrl,
+          gitToken,
+          allowedHosts,
         });
         if (!r.ok) {
+          if ("skipped" in r && r.skipped) {
+            return { ...bug, mrUrl, mr: null };
+          }
           return { ...bug, mrUrl, mr: null, mrError: r.error };
         }
         // 已合 / 已关：当作无关联（按钮不出现），与 scanPendingMr 滤法一致
@@ -594,6 +664,8 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
       settings && typeof settings.gitToken === "string"
         ? settings.gitToken.trim()
         : "";
+    // 评论可控 MR host → 必须落在已配仓库 remote 推导的 allowlist，否则不带 PAT 出站
+    const allowedHosts = await collectGitlabHostAllowlist(settings);
 
     let pendingMr: MrInboxItem[] = [];
     let myBugs: BugInboxItem[] = [];
@@ -608,6 +680,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
         host,
         simpleNames,
         gitToken,
+        allowedHosts,
       );
     }
     if (need("myBugs")) {
@@ -635,6 +708,7 @@ const scanMrInbox = async (): Promise<MrInboxScanResult> => {
       pendingRegression = await enrichPendingRegressionWithMr(
         pendingRegression,
         gitToken,
+        allowedHosts,
       );
     }
 

@@ -94,7 +94,14 @@ export const mergeTaskEvents = (prev: Task | null, next: Task): Task => {
   const prevIds = new Set(prev.events.map((e) => e.id));
   const lastTs = prev.events[prev.events.length - 1].ts;
   // >=：同毫秒新事件不漏（id 去重兜住同一条）
-  const newer = next.events.filter((e) => !prevIds.has(e.id) && e.ts >= lastTs);
+  // 顺带挡 ephemeral（防御：误写入 next.events 时不进本地持久 rows）
+  const newer = next.events.filter(
+    (e) =>
+      !e.id.startsWith("ephemeral_") &&
+      e.kind !== "tool_output_delta" &&
+      !prevIds.has(e.id) &&
+      e.ts >= lastTs,
+  );
   return {
     ...next,
     events: newer.length > 0 ? [...prev.events, ...newer] : prev.events,
@@ -540,7 +547,10 @@ export const sendChatReply = async (
   bootArgs?: TaskBootArgs,
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
-): Promise<{ task: Task; autoStarted: boolean }> => {
+): Promise<
+  | { task: Task; autoStarted: boolean; queued?: false }
+  | { queued: true; queuedCount: number; task?: Task }
+> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
     {
@@ -556,12 +566,92 @@ export const sendChatReply = async (
       }),
     },
   );
+  // P5：agent 忙时 202 入队（不再 409）
+  if (res.status === 202) {
+    const data = (await res.json()) as {
+      ok?: boolean;
+      queued?: boolean;
+      queuedCount?: number;
+      task?: Task;
+    };
+    return {
+      queued: true,
+      queuedCount:
+        typeof data.queuedCount === "number" ? data.queuedCount : 1,
+      task: data.task,
+    };
+  }
   const data = await handleJson<{
     ok: true;
     task: Task;
     autoStarted?: boolean;
   }>(res);
   return { task: data.task, autoStarted: !!data.autoStarted };
+};
+
+/** P3：回退到带 checkpoint 的 user_reply */
+export const rewindChatToEvent = async (
+  taskId: string,
+  eventId: string,
+): Promise<{ task: Task | null; refreshRequired?: boolean }> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/rewind`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ eventId }),
+    },
+  );
+  const data = await handleJson<{
+    ok: true;
+    task: Task | null;
+    restoredRepos?: number;
+    truncatedEventCount?: number;
+    refreshRequired?: boolean;
+  }>(res);
+  return {
+    task: data.task,
+    ...(data.refreshRequired ? { refreshRequired: true } : {}),
+  };
+};
+
+/** P4：会话 token 透视 */
+export type ChatContextInfo = {
+  totalTokens: number | null;
+  breakdown: Array<{ label: string; tokens: number }>;
+  turnCount: number;
+  lastTurnAt: number | null;
+  compactRecommended: boolean;
+};
+
+export const fetchChatContext = async (
+  taskId: string,
+): Promise<ChatContextInfo> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/context`,
+    { cache: "no-store" },
+  );
+  const data = await handleJson<{ ok: true; context: ChatContextInfo }>(res);
+  return data.context;
+};
+
+/** P4：手动压缩会话 */
+export const compactChatSession = async (
+  taskId: string,
+  keepHints?: string,
+): Promise<Task> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/compact`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        keepHints: keepHints?.trim() ? keepHints.trim() : undefined,
+      }),
+    },
+  );
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return data.task;
 };
 
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道

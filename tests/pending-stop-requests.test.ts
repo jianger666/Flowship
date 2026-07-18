@@ -23,6 +23,7 @@ vi.mock("@/lib/server/kill-orphans", () => ({
 
 vi.mock("@/lib/server/chat-pending", () => ({
   cleanupChatTaskState: vi.fn(),
+  invalidateCallerToken: vi.fn(),
 }));
 
 vi.mock("@/lib/server/chat-runner", () => ({
@@ -40,6 +41,7 @@ import {
 import type { Task } from "@/lib/types";
 
 const makeRec = (cancel: () => void): RunningTaskRecord => ({
+  instanceId: 1,
   agentId: "agent-test",
   startedAt: Date.now(),
   startSnapshot: { title: "" },

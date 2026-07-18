@@ -1,11 +1,12 @@
 /**
- * Composer 输入引擎（Lexical PlainText + SkillTokenNode）
+ * Composer 输入引擎（Lexical PlainText + SkillTokenNode + FileTokenNode）
  *
  * 替换原原生 textarea + mirror overlay + 原子删除拦截：
  * - skill token = TextNode 子类 + token 模式（品牌色 tag、原子整删、caret 前后可见）
- * - 对外仍序列化为纯文本 `/skill-name`，调用方 value/onChange 协议不变
- * - slash 菜单：打 `/xxx` 时复用 useSlashSkills；选中后把 `/partial` 换成 token + 空格
- * - 手打全名 + 空格 / 外部写回草稿：TextNode transform 或整段 parse 转成 token
+ * - file token = 同构 `@rel/path`（amber tag）；行区间 `:10-50` 留在后续纯文本
+ * - 对外仍序列化为纯文本，调用方 value/onChange 协议不变
+ * - slash / @ 菜单：选中后把 partial 换成对应 token + 空格
+ * - 空输入 ↑↓ 翻本会话 user_reply 历史（有菜单时优先菜单）
  */
 
 "use client";
@@ -34,6 +35,8 @@ import {
   $isRangeSelection,
   $isTextNode,
   COMMAND_PRIORITY_HIGH,
+  KEY_ARROW_DOWN_COMMAND,
+  KEY_ARROW_UP_COMMAND,
   KEY_ENTER_COMMAND,
   PASTE_COMMAND,
   TextNode,
@@ -52,6 +55,17 @@ import {
   $isSkillTokenNode,
   SkillTokenNode,
 } from "@/components/composer-skill-token-node";
+import {
+  $createFileTokenNode,
+  $isFileTokenNode,
+  FileTokenNode,
+} from "@/components/composer-file-token-node";
+import {
+  AT_RE,
+  type AtFileHit,
+  type AtMentionApi,
+} from "@/components/at-mention";
+import { useComposerSession } from "@/components/composer-session";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
@@ -65,7 +79,7 @@ export interface ComposerFocusHandle {
   focus: () => void;
   /**
    * 外部即将写回草稿并希望落位时先调：下一帧 sync 用这个纯文本 offset。
-   * token 按序列化长度 `/name` 计（跟旧 textarea 光标语义一致）。
+   * token 按序列化长度 `/name` / `@path` 计（跟旧 textarea 光标语义一致）。
    */
   prepareCursor: (offset: number) => void;
 }
@@ -81,11 +95,46 @@ export interface ComposerEditorProps {
   boxContainerRef?: RefObject<HTMLDivElement | null>;
   boxHeight: number | null;
   slash?: SlashSkillsApi;
+  /** `@` 文件引用（由 Composer 在有 session 时创建） */
+  atMention?: AtMentionApi;
   attach?: UseImageAttachReturn;
   className?: string;
 }
 
 const EMPTY_NAMES: ReadonlySet<string> = new Set();
+
+/**
+ * 从纯文本里切出 `@rel/path`（停在空白或 `:行号` 前）。
+ * 不要求「已知文件清单」——草稿写回 / 历史翻出时靠形态还原 pill。
+ */
+const FILE_TOKEN_RE = /(^|\s)@([^\s:]+)/g;
+
+interface FileTokenMatch {
+  start: number;
+  end: number;
+  path: string;
+}
+
+const parseFileTokens = (line: string): FileTokenMatch[] => {
+  const out: FileTokenMatch[] = [];
+  FILE_TOKEN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = FILE_TOKEN_RE.exec(line)) !== null) {
+    const leading = m[1] ?? "";
+    const filePath = m[2] ?? "";
+    if (!filePath) continue;
+    // 排除裸 `@word`（无 `/` 也无 `.`、也不以 `/` 结尾）——降低误伤普通 @ 提及
+    const looksLikePath =
+      filePath.includes("/") ||
+      filePath.includes(".") ||
+      filePath.endsWith("/");
+    if (!looksLikePath) continue;
+    const start = m.index + leading.length;
+    const end = start + 1 + filePath.length;
+    out.push({ start, end, path: filePath });
+  }
+  return out;
+};
 
 /** 原生 KeyboardEvent 版提交判定（Lexical KEY_ENTER） */
 const shouldSubmitNative = (
@@ -102,24 +151,53 @@ const shouldSubmitNative = (
 };
 
 /**
- * 把一行纯文本拆成 TextNode + SkillTokenNode。
- * 外部写回 / pick 重建时走这里，不依赖「尾随空格」才能认出 token。
+ * 把一行纯文本拆成 TextNode + SkillTokenNode + FileTokenNode。
+ * skill 优先（与 knownNames 对齐）；剩余段再切 file token。
  */
 const $nodesFromPlainLine = (
   line: string,
   knownNames: ReadonlySet<string>,
 ): LexicalNode[] => {
   if (!line) return [];
-  const tokens = parseSkillTokens(line, knownNames);
-  if (tokens.length === 0) return [$createTextNode(line)];
+  const skillTokens = parseSkillTokens(line, knownNames);
+  const fileTokens = parseFileTokens(line);
+
+  // 合并区间，按 start 排序；重叠时 skill 优先（先登记的占坑）
+  type Span =
+    | { kind: "skill"; start: number; end: number; name: string }
+    | { kind: "file"; start: number; end: number; path: string };
+  const spans: Span[] = [
+    ...skillTokens.map(
+      (t): Span => ({
+        kind: "skill",
+        start: t.start,
+        end: t.end,
+        name: t.name,
+      }),
+    ),
+    ...fileTokens.map(
+      (t): Span => ({
+        kind: "file",
+        start: t.start,
+        end: t.end,
+        path: t.path,
+      }),
+    ),
+  ].sort((a, b) => a.start - b.start);
+
   const nodes: LexicalNode[] = [];
   let cursor = 0;
-  for (const t of tokens) {
-    if (t.start > cursor) {
-      nodes.push($createTextNode(line.slice(cursor, t.start)));
+  for (const s of spans) {
+    if (s.start < cursor) continue; // 与已消费区间重叠、跳过
+    if (s.start > cursor) {
+      nodes.push($createTextNode(line.slice(cursor, s.start)));
     }
-    nodes.push($createSkillTokenNode(t.name));
-    cursor = t.end;
+    if (s.kind === "skill") {
+      nodes.push($createSkillTokenNode(s.name));
+    } else {
+      nodes.push($createFileTokenNode(s.path));
+    }
+    cursor = s.end;
   }
   if (cursor < line.length) {
     nodes.push($createTextNode(line.slice(cursor)));
@@ -147,7 +225,7 @@ const $setRootFromPlainText = (
   }
 };
 
-/** 编辑器 → 纯文本（token 序列化为 `/name`，段落之间 `\n`） */
+/** 编辑器 → 纯文本（token 序列化为 `/name` / `@path`，段落之间 `\n`） */
 const $serializeToPlainText = (): string => {
   const root = $getRoot();
   return root
@@ -163,8 +241,8 @@ const $serializeToPlainText = (): string => {
 };
 
 /**
- * 当前选区锚点对应的纯文本 offset（token 按 `/name` 长度计）。
- * slash 菜单用「光标前文本」匹配 `/partial`。
+ * 当前选区锚点对应的纯文本 offset（token 按序列化长度计）。
+ * slash / @ 菜单用「光标前文本」匹配 partial。
  */
 const $getPlainOffset = (): number => {
   const selection = $getSelection();
@@ -186,7 +264,7 @@ const $getPlainOffset = (): number => {
       const children = p.getChildren();
       const childLimit = Math.min(anchor.offset, children.length);
       for (let i = 0; i < childLimit; i++) {
-        total += children[i].getTextContent().length;
+        total += children[i]!.getTextContent().length;
       }
       return total;
     }
@@ -194,10 +272,8 @@ const $getPlainOffset = (): number => {
     for (const child of p.getChildren()) {
       if (child.getKey() === anchorNode.getKey()) {
         if ($isTextNode(child)) {
-          // token 也是 TextNode：光标只会在 0 / len（token 模式进不去内部）
           return total + anchor.offset;
         }
-        // 非文本叶子（LineBreak 等）：offset 0 = 节点前，>0 = 节点后
         return total + (anchor.offset === 0 ? 0 : child.getTextContent().length);
       }
       total += child.getTextContent().length;
@@ -234,8 +310,7 @@ const $setSelectionFromPlainOffset = (offset: number): void => {
     for (const child of children) {
       const len = child.getTextContent().length;
       if (remaining <= len) {
-        // token（也是 TextNode、先判）：不进内部、按半程贴前沿 / 后沿
-        if ($isSkillTokenNode(child)) {
+        if ($isSkillTokenNode(child) || $isFileTokenNode(child)) {
           if (remaining === 0) child.select(0, 0);
           else child.select(len, len);
           return;
@@ -255,21 +330,17 @@ const $setSelectionFromPlainOffset = (offset: number): void => {
 };
 
 /**
- * 手打 `/known-name`（含中文名、可紧贴后续正文）→ 换成 SkillTokenNode。
- *
- * 与 parseSkillTokens 同逻辑：正则粗切 + knownNames 最长前缀命中。
- * 例「/写代码帮我改下」→ token「写代码」+ 正文「帮我改下」；打到一半的 `/写` 不转。
- * 英文行尾 `/name` 同样能转（不再依赖尾随空格），与气泡高亮对齐。
+ * 手打 `/known-name` → SkillTokenNode（与 parseSkillTokens 同逻辑）。
  */
 const $transformSkillTokensInTextNode = (
   node: TextNode,
   knownNames: ReadonlySet<string>,
 ): void => {
   if (!node.isAttached() || !node.isSimpleText()) return;
+  if ($isSkillTokenNode(node) || $isFileTokenNode(node)) return;
   const text = node.getTextContent();
   const tokens = parseSkillTokens(text, knownNames);
   if (tokens.length === 0) return;
-  // 一次只转第一个：split/replace 后节点树变了，交给下次 transform 扫剩余
   const t = tokens[0]!;
   const start = t.start;
   const end = t.end;
@@ -299,9 +370,31 @@ const $replaceSlashPartialWithToken = (
   const before = plain.slice(0, cursor);
   const m = before.match(SLASH_RE);
   if (!m) return null;
-  const partialLen = m[2].length + 1;
+  const partialLen = m[2]!.length + 1;
   const cutStart = cursor - partialLen;
   const token = `/${skillName} `;
+  const next = plain.slice(0, cutStart) + token + plain.slice(cursor);
+  const nextCursor = cutStart + token.length;
+  $setRootFromPlainText(next, knownNames);
+  $setSelectionFromPlainOffset(nextCursor);
+  return { text: next, cursor: nextCursor };
+};
+
+/** 选中 @ 项：切 `@partial` → FileTokenNode + 空格 */
+const $replaceAtPartialWithToken = (
+  hit: AtFileHit,
+  knownNames: ReadonlySet<string>,
+): { text: string; cursor: number } | null => {
+  const selection = $getSelection();
+  if (!$isRangeSelection(selection)) return null;
+  const plain = $serializeToPlainText();
+  const cursor = $getPlainOffset();
+  const before = plain.slice(0, cursor);
+  const m = before.match(AT_RE);
+  if (!m) return null;
+  const partialLen = (m[2]?.length ?? 0) + 1;
+  const cutStart = cursor - partialLen;
+  const token = `@${hit.path} `;
   const next = plain.slice(0, cutStart) + token + plain.slice(cursor);
   const nextCursor = cutStart + token.length;
   $setRootFromPlainText(next, knownNames);
@@ -325,7 +418,6 @@ const ExternalValuePlugin = ({
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
-    // 防回环：编辑器 onChange 推出去的值再流回来、内容相同就不重设
     if (value === lastEmittedRef.current) return;
     lastEmittedRef.current = value;
     const cursor = pendingCursorRef.current;
@@ -359,7 +451,6 @@ const SkillTokenTransformPlugin = ({
   const [editor] = useLexicalComposerContext();
   const namesRef = useRef(knownNames);
   namesRef.current = knownNames;
-  // skills 首次拉齐时做一次全文重建（pending handoff / 草稿里已有 `/name`）
   const rebuiltForNamesRef = useRef(false);
 
   useEffect(() => {
@@ -383,8 +474,9 @@ const SkillTokenTransformPlugin = ({
   return null;
 };
 
-const SlashAndSubmitPlugin = ({
+const SlashAtAndSubmitPlugin = ({
   slash,
+  atMention,
   onSubmit,
   submitShortcut,
   knownNames,
@@ -392,6 +484,7 @@ const SlashAndSubmitPlugin = ({
   onChange,
 }: {
   slash?: SlashSkillsApi;
+  atMention?: AtMentionApi;
   onSubmit: () => void;
   submitShortcut: SubmitShortcut;
   knownNames: ReadonlySet<string>;
@@ -401,6 +494,8 @@ const SlashAndSubmitPlugin = ({
   const [editor] = useLexicalComposerContext();
   const slashRef = useRef(slash);
   slashRef.current = slash;
+  const atRef = useRef(atMention);
+  atRef.current = atMention;
   const onSubmitRef = useRef(onSubmit);
   onSubmitRef.current = onSubmit;
   const shortcutRef = useRef(submitShortcut);
@@ -410,11 +505,9 @@ const SlashAndSubmitPlugin = ({
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
-  // 注入 Lexical 版 pick：菜单选中直接插 token，避免先写字符串再 sync 丢光标
   useEffect(() => {
     if (!slash) return;
     return slash.registerPickHandler((skill) => {
-      // 用数组槽位避开 TS 对闭包赋值的 never 收窄
       const slot: [{ text: string; cursor: number } | null] = [null];
       editor.update(() => {
         slot[0] = $replaceSlashPartialWithToken(skill.name, namesRef.current);
@@ -424,9 +517,27 @@ const SlashAndSubmitPlugin = ({
       lastEmittedRef.current = result.text;
       onChangeRef.current(result.text);
       slash.onDraftChange(result.text, result.cursor);
+      atRef.current?.onDraftChange(result.text, result.cursor);
       return true;
     });
   }, [editor, slash, lastEmittedRef]);
+
+  useEffect(() => {
+    if (!atMention) return;
+    return atMention.registerPickHandler((hit) => {
+      const slot: [{ text: string; cursor: number } | null] = [null];
+      editor.update(() => {
+        slot[0] = $replaceAtPartialWithToken(hit, namesRef.current);
+      });
+      const result = slot[0];
+      if (!result) return false;
+      lastEmittedRef.current = result.text;
+      onChangeRef.current(result.text);
+      atMention.onDraftChange(result.text, result.cursor);
+      slashRef.current?.onDraftChange(result.text, result.cursor);
+      return true;
+    });
+  }, [editor, atMention, lastEmittedRef]);
 
   useEffect(() => {
     return editor.registerCommand(
@@ -439,17 +550,168 @@ const SlashAndSubmitPlugin = ({
           s.pickAt(s.activeIndex);
           return true;
         }
+        const a = atRef.current;
+        if (a?.menuOpen && event) {
+          // 无候选时不吞 Enter（让提交 / 换行走原逻辑）
+          if (a.filtered.length > 0) {
+            event.preventDefault();
+            a.pickAt(a.activeIndex);
+            return true;
+          }
+        }
         if (event && shouldSubmitNative(event, shortcutRef.current)) {
           event.preventDefault();
           onSubmitRef.current();
           return true;
         }
-        // Shift+Enter / 裸 Enter（mod-enter 模式）→ Lexical 默认换行
         return false;
       },
       COMMAND_PRIORITY_HIGH,
     );
   }, [editor]);
+
+  return null;
+};
+
+/**
+ * 空输入框 ↑↓ 翻本会话历史（shell 风）。
+ * 有 slash / @ 菜单时不抢键；非空或光标不在首段起点时保持 Lexical 原生多行行为。
+ */
+const InputHistoryPlugin = ({
+  slash,
+  atMention,
+  knownNames,
+  lastEmittedRef,
+  onChange,
+  editorKey,
+}: {
+  slash?: SlashSkillsApi;
+  atMention?: AtMentionApi;
+  knownNames: ReadonlySet<string>;
+  lastEmittedRef: RefObject<string>;
+  onChange: (value: string) => void;
+  /** 切会话重置游标 */
+  editorKey?: string;
+}) => {
+  const [editor] = useLexicalComposerContext();
+  const session = useComposerSession();
+  // 稳住引用：session 缺失时别每次新建 []，否则 effect 每渲重绑
+  const history = useMemo(
+    () => session?.inputHistory ?? [],
+    [session?.inputHistory],
+  );
+  // -1 = 未在翻历史（显示空或用户正在编辑）；0..n-1 = 历史条目；翻过头再 ↓ 回空
+  const histIndexRef = useRef(-1);
+  // 进入历史前的草稿（通常为空）；↓ 回到 -1 时恢复
+  const stashRef = useRef("");
+
+  useEffect(() => {
+    histIndexRef.current = -1;
+    stashRef.current = "";
+  }, [editorKey, session?.taskId]);
+
+  const applyHistoryText = useCallback(
+    (text: string) => {
+      editor.update(() => {
+        $setRootFromPlainText(text, knownNames);
+        $getRoot().selectEnd();
+      });
+      lastEmittedRef.current = text;
+      onChange(text);
+      const cursor = text.length;
+      slash?.onDraftChange(text, cursor);
+      atMention?.onDraftChange(text, cursor);
+    },
+    [editor, knownNames, lastEmittedRef, onChange, slash, atMention],
+  );
+
+  useEffect(() => {
+    const canTake = (): boolean => {
+      if (slash?.menuOpen || atMention?.menuOpen) return false;
+      if (history.length === 0) return false;
+      let plain = "";
+      let atDocStart = false;
+      editor.getEditorState().read(() => {
+        plain = $serializeToPlainText();
+        const sel = $getSelection();
+        if (!$isRangeSelection(sel) || !sel.isCollapsed()) {
+          atDocStart = false;
+          return;
+        }
+        atDocStart = $getPlainOffset() === 0;
+      });
+      // 已在翻历史：直接放行 ↑（applyHistoryText 后光标在文末，atDocStart 恒为 false，否则无法连续上翻）
+      if (histIndexRef.current >= 0) return true;
+      // 未进入历史且输入非空：不劫持（多行编辑保持原生 ↑↓）
+      if (plain.length > 0) return false;
+      // 空输入时光标必在起点；仍要求 collapsed 在 offset 0
+      return atDocStart;
+    };
+
+    const unUp = editor.registerCommand(
+      KEY_ARROW_UP_COMMAND,
+      (event) => {
+        if (event?.isComposing) return false;
+        if (!canTake()) return false;
+        event?.preventDefault();
+        if (histIndexRef.current < 0) {
+          stashRef.current = "";
+          histIndexRef.current = 0;
+        } else if (histIndexRef.current < history.length - 1) {
+          histIndexRef.current += 1;
+        }
+        applyHistoryText(history[histIndexRef.current] ?? "");
+        return true;
+      },
+      COMMAND_PRIORITY_HIGH,
+    );
+
+    const unDown = editor.registerCommand(
+      KEY_ARROW_DOWN_COMMAND,
+      (event) => {
+        if (event?.isComposing) return false;
+        // 只有已经在翻历史时才接管 ↓（空输入原生 ↓ 无意义，但也不误伤）
+        if (histIndexRef.current < 0) return false;
+        if (slash?.menuOpen || atMention?.menuOpen) return false;
+        event?.preventDefault();
+        if (histIndexRef.current <= 0) {
+          histIndexRef.current = -1;
+          applyHistoryText(stashRef.current);
+          return true;
+        }
+        histIndexRef.current -= 1;
+        applyHistoryText(history[histIndexRef.current] ?? "");
+        return true;
+      },
+      COMMAND_PRIORITY_HIGH,
+    );
+
+    return () => {
+      unUp();
+      unDown();
+    };
+  }, [
+    editor,
+    history,
+    slash?.menuOpen,
+    atMention?.menuOpen,
+    applyHistoryText,
+  ]);
+
+  // 用户开始打字改历史条目 → 脱离历史游标（下次空输入再 ↑ 从最新起）
+  useEffect(() => {
+    return editor.registerUpdateListener(({ editorState, tags }) => {
+      if (tags.has("external-value")) return;
+      if (histIndexRef.current < 0) return;
+      editorState.read(() => {
+        const plain = $serializeToPlainText();
+        const expected = history[histIndexRef.current] ?? "";
+        if (plain !== expected) {
+          histIndexRef.current = -1;
+        }
+      });
+    });
+  }, [editor, history]);
 
   return null;
 };
@@ -470,7 +732,6 @@ const PasteImagePlugin = ({ attach }: { attach?: UseImageAttachReturn }) => {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           if (item && item.kind === "file" && item.type.startsWith("image/")) {
-            // 有图：交给 attach（内部 preventDefault + addFiles）
             a.onPaste(event);
             return true;
           }
@@ -521,43 +782,44 @@ const ComposerEditorInner = ({
   boxContainerRef,
   boxHeight,
   slash,
+  atMention,
   attach,
   className,
   lastEmittedRef,
   pendingCursorRef,
+  editorKey,
 }: ComposerEditorProps & {
   lastEmittedRef: RefObject<string>;
   pendingCursorRef: RefObject<number | null>;
+  editorKey?: string;
 }) => {
   const submitShortcut = useSubmitShortcut();
   const knownNames = slash?.knownNames ?? EMPTY_NAMES;
 
   const handleEditorChange = useCallback(
     (editorState: EditorState, _editor: unknown, tags: Set<string>) => {
-      // 外部写回触发的 update 不再反向 onChange
       if (tags.has("external-value")) return;
       editorState.read(() => {
         const text = $serializeToPlainText();
         const cursor = $getPlainOffset();
-        // 选区变化也要推给 slash（光标挪开 `/partial` 后菜单应关）
         slash?.onDraftChange(text, cursor);
-        // 正文没变就别 setState，避免无谓重渲
+        atMention?.onDraftChange(text, cursor);
         if (text === lastEmittedRef.current) return;
         lastEmittedRef.current = text;
         onChange(text);
       });
     },
-    [onChange, slash, lastEmittedRef],
+    [onChange, slash, atMention, lastEmittedRef],
   );
 
   const onKeyDown = useCallback(
     (e: ReactKeyboardEvent<HTMLDivElement>) => {
-      // ↑↓/Tab/Esc 归 slash；Enter 在 KEY_ENTER_COMMAND 处理，避免重复 pick/提交
-      if (!slash) return;
+      // ↑↓/Tab/Esc：slash 优先，再 @；Enter 在 KEY_ENTER_COMMAND
       if (e.key === "Enter") return;
-      slash.onKeyDown(e);
+      if (slash?.onKeyDown(e)) return;
+      if (atMention?.onKeyDown(e)) return;
     },
-    [slash],
+    [slash, atMention],
   );
 
   const boxStyle = boxHeight != null ? { height: boxHeight } : undefined;
@@ -608,13 +870,22 @@ const ComposerEditorInner = ({
       />
       <EditablePlugin disabled={disabled} />
       <SkillTokenTransformPlugin knownNames={knownNames} />
-      <SlashAndSubmitPlugin
+      <SlashAtAndSubmitPlugin
         slash={slash}
+        atMention={atMention}
         onSubmit={onSubmit}
         submitShortcut={submitShortcut}
         knownNames={knownNames}
         lastEmittedRef={lastEmittedRef}
         onChange={onChange}
+      />
+      <InputHistoryPlugin
+        slash={slash}
+        atMention={atMention}
+        knownNames={knownNames}
+        lastEmittedRef={lastEmittedRef}
+        onChange={onChange}
+        editorKey={editorKey}
       />
       <PasteImagePlugin attach={attach} />
       <FocusHandlePlugin
@@ -625,17 +896,16 @@ const ComposerEditorInner = ({
   );
 };
 
-export const ComposerEditor = (props: ComposerEditorProps) => {
-  // 最近一次从编辑器推给调用方的文本——外部 value 相同则跳过重设
+export const ComposerEditor = (
+  props: ComposerEditorProps & { editorKey?: string },
+) => {
   const lastEmittedRef = useRef(props.value);
-  // applyDraft 希望落位的光标；ExternalValuePlugin 消费一次
   const pendingCursorRef = useRef<number | null>(null);
 
-  // LexicalComposer 的 initialConfig 只在 mount 读一次
   const initialConfig = useMemo(
     () => ({
       namespace: "ComposerEditor",
-      nodes: [SkillTokenNode],
+      nodes: [SkillTokenNode, FileTokenNode],
       onError: (error: Error) => {
         console.error("[ComposerEditor]", error);
       },

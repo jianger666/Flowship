@@ -47,24 +47,12 @@ const readSeenRaw = async (): Promise<Record<string, number>> => {
 };
 
 /**
- * 读已读标记（加载即清 90 天过期条目；有清理就写回盘、失败只 warn 不阻断读）。
+ * 读已读标记（加载时仅内存 prune，不写盘）。
+ * 写回 prune 放在 set* 写锁路径（read→prune→mutate→write），避免读路径
+ * 用陈旧快照覆盖并发 set* 刚写入的标记。
  */
 export const readMrInboxSeen = async (): Promise<Record<string, number>> => {
-  const raw = await readSeenRaw();
-  const pruned = pruneSeenMap(raw);
-  if (pruned !== raw) {
-    void enqueueSeenWrite(async () => {
-      try {
-        await writePrivateFileAtomic(seenFilePath(), JSON.stringify(pruned, null, 2));
-      } catch (err) {
-        console.warn(
-          "[mr-inbox] 已读标记清理写回失败:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-    });
-  }
-  return pruned;
+  return pruneSeenMap(await readSeenRaw());
 };
 
 /** 串行执行一个写任务（读改写整段进链、防交叉覆盖） */

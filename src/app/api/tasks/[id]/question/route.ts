@@ -14,7 +14,12 @@
  * Body: { text, images?, attachments?, skills?, bootArgs?: { apiKey, model }, forceModel? }
  */
 
-import { appendEvent, getTask, patchAction, setTaskRunStatus } from "@/lib/server/task-fs";
+import {
+  appendEvent,
+  getTask,
+  patchActionAndRunStatusIfOpFresh,
+  setTaskRunStatusIfRunOwner,
+} from "@/lib/server/task-fs";
 import {
   saveImageAttachments,
   snapshotActionArtifact,
@@ -22,16 +27,20 @@ import {
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
 import {
   deliverTaskQuestion,
+  isTaskOpStale,
   resumeCurrentActionWithMessage,
   startOneShotQuestion,
   supersedePendingAsks,
+  TASK_OP_STALE_HTTP_MESSAGE,
 } from "@/lib/server/task-runner";
 import {
   agentSessions,
+  getTaskOpGeneration,
   publishTaskStreamEvent,
   runningTasks,
   waitForTaskToStop,
 } from "@/lib/server/task-stream";
+import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
@@ -98,6 +107,25 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   let task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
+
+  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒发送 / 唤醒
+  {
+    const life = getChatLifecycle(id);
+    if (life !== null) {
+      const msg =
+        life === "deleting"
+          ? "任务正在删除"
+          : life === "finalizing"
+            ? "正在终结、请稍后再试"
+            : "正在停止、请稍后再试";
+      return errorResponse(msg, 409);
+    }
+  }
+
+  // W2：读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 等 drain /
+  // supersede 等长 await，再取会被 stop bump 后的新值冒充新意图
+  const opGen = getTaskOpGeneration(task.id);
+
   if (task.mode === "chat") {
     return errorResponse("chat 对话直接在输入框发消息即可", 409);
   }
@@ -153,6 +181,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
+  // X1：长 await（存图）后复查——stop 期间不得继续 fallback / 写 running
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+
   const apiKey = body.bootArgs?.apiKey?.trim() || undefined;
   const model =
     body.bootArgs?.model && typeof body.bootArgs.model.id === "string"
@@ -189,6 +222,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
+  // X1：snapshot 长 await 后再查
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+
   // 有待答提问时用户直接说话 = 跳过提问（下方会作废）——给 agent 显式提示、
   // 别把未答的问题悄悄吞掉：信息仍必要就结合新消息重新提问（用户拍板的护栏）
   const skippedAskHint = getPendingAsk(task.id)
@@ -199,8 +237,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
-  const sent = forceModel
-    ? false
+  // X1：forceModel 视为无会话续接意图（走下方分流），不是 stale
+  const deliverResult = forceModel
+    ? ("no_session" as const)
     : await deliverTaskQuestion(
         task,
         agentText,
@@ -208,7 +247,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
         { apiKey, model },
         ackContext,
         attachmentPaths.length > 0 ? attachmentPaths : undefined,
+        opGen,
       );
+
+  // X1：stale → 409，绝不 fallback one-shot、不写事件、不写 running
+  if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+  const sent = deliverResult === "sent";
 
   // 会话接不回时的分流（V0.11.9 用户拍板「输入条覆盖旧重启、不多一条 action 链」）：
   // - 当前 action 停在半路（error / cancelled / 僵死 running）→ **唤醒模式**：
@@ -236,12 +282,22 @@ export const POST = async (req: Request, { params }: Ctx) => {
     `[question] task=${task.id} text=${text.slice(0, 60)} images=${images.length} mode=${sent ? "send" : canResume ? "resume" : "oneshot"}`,
   );
 
+  // X1：写事件 / supersede / 置 running 前最后复查（含 useOneShot 窗口）
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+
   // 用户绕开 ask 弹窗直接在输入条说话 = 旧弹窗事实作废（send：agent 收到新消息就继续了；
   // oneshot：旧会话已死、答案永远送不到）。不作废的话弹窗永远挂着（用户实测卡死、再答 409）。
   // canResume 分支不用管——resumeCurrentActionWithMessage 内部已 supersede。
   if (sent || useOneShot) {
     await supersedePendingAsks(task.id, "用户已在输入条继续对话");
     clearPendingAsk(task.id);
+  }
+
+  // X1：supersede 是 await——后再查一次再写「已送达」事件
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
   const questionEvent = await appendEvent(task.id, {
@@ -262,16 +318,27 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // send 成功且产出在等审阅：action 回 running（agent 处理完会重新交卷回 awaiting_ack）——
   // 原 revise 的状态机语义、防「artifact 在改、UI 还显示等审阅」
   if (sent && ackContext) {
-    const patched = await patchAction(task.id, ackContext.actionId, {
-      status: "running",
-    });
-    if (patched) {
-      publishTaskStreamEvent(task.id, { kind: "task", task: patched });
-      const a = patched.actions.find((x) => x.id === ackContext.actionId);
+    // R18-1 / R19-1：锁内 op-fresh + 结构条件事务——一次写 action+runStatus，杜绝
+    //「patchAction await → stop 写 idle → setTaskRunStatus 又盖回 running」；
+    // 并挡同 epoch 并发 advance（不 bump gen）已把 A 标 completed / current 推到 B 后旧 Q 抢回。
+    const running = await patchActionAndRunStatusIfOpFresh(
+      task.id,
+      ackContext.actionId,
+      "running",
+      "running",
+      () => !isTaskOpStale(task.id, opGen),
+      {
+        // ack 入场时的指针与状态；advance 自动通过后二者都会变
+        currentActionId: ackContext.actionId,
+        actionStatus: "awaiting_ack",
+      },
+    );
+    if (running) {
+      publishTaskStreamEvent(task.id, { kind: "task", task: running });
+      const a = running.actions.find((x) => x.id === ackContext.actionId);
       if (a) publishTaskStreamEvent(task.id, { kind: "action", action: a });
     }
-    const running = await setTaskRunStatus(task.id, "running", ackContext.actionId);
-    if (running) publishTaskStreamEvent(task.id, { kind: "task", task: running });
+    // 返 null = 已 stale（stop 已接管）——消息已送达 run，task 状态归 stop；仍 200
     const fresh = await getTask(task.id);
     return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
       status: 200,
@@ -280,6 +347,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
   }
 
   if (canResume) {
+    if (isTaskOpStale(task.id, opGen)) {
+      return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+    }
     // 唤醒模式自己管状态（patch action running + runStatus + 事件）；失败标 error 有内部兜底
     void resumeCurrentActionWithMessage({
       task,
@@ -291,6 +361,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       // 用户显式换的模型：唤醒的新 agent 直接用它跑（V0.13.x、不再锁进只读答疑）
       forceModel,
       gitToken: body.bootArgs?.gitToken?.trim() || undefined,
+      opGen,
     }).catch(async (err) => {
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
       const ev = await appendEvent(task.id, {
@@ -306,10 +377,27 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
-  // 回答期间 runStatus=running（保留 currentActionId、进度不动）；
-  // 答完 consumeSessionRun / startOneShotQuestion 按最后 action 状态归位
-  const updated = await setTaskRunStatus(task.id, "running");
-  if (updated) publishTaskStreamEvent(task.id, { kind: "task", task: updated });
+  // X1：one-shot「先写 running 再 start」窗口——写 running 前最后复查
+  if (isTaskOpStale(task.id, opGen)) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+
+  // R25-2：裸 setTaskRunStatus → terminal-aware 条件事务。
+  // expectedRunStatus = route 判定 one-shot 时看到的等待位（idle/awaiting_user/error…）；
+  // isOwner = gen 未 stale + lifecycle 空；终态由 setTaskRunStatusIfRunOwner 内拒。
+  const expectedWaitingStatus = task.runStatus;
+  const updated = await setTaskRunStatusIfRunOwner(
+    task.id,
+    "running",
+    () =>
+      !isTaskOpStale(task.id, opGen) && getChatLifecycle(task.id) === null,
+    undefined,
+    expectedWaitingStatus,
+  );
+  if (!updated) {
+    return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
+  }
+  publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 
   if (useOneShot) {
     startOneShotQuestion(
@@ -318,10 +406,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
       imageAbsPaths,
       { apiKey: apiKey!, model: fallbackModel! },
       attachmentPaths.length > 0 ? attachmentPaths : undefined,
+      opGen,
     );
   }
 
-  return new Response(JSON.stringify({ ok: true, task: updated ?? task }), {
+  return new Response(JSON.stringify({ ok: true, task: updated }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

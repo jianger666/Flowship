@@ -140,7 +140,7 @@ describe("validateSubmitMr", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("gitBranches 没记录该仓 → 退化兜底：非空且 ≠ 目标分支", async () => {
+  it("gitBranches 没记录该仓 → 退化兜底：非空且 ≠ 目标分支，但禁保护分支作 source", async () => {
     const task = baseTask({ gitBranches: [] } as Partial<Task>);
     expect(
       (await validateSubmitMr(task, { ...baseMr(), sourceBranch: "any-branch" }))
@@ -152,6 +152,15 @@ describe("validateSubmitMr", () => {
     expect(
       (await validateSubmitMr(task, { ...baseMr(), sourceBranch: "  " })).ok,
     ).toBe(false);
+    // 保护分支（master/main/develop/release/* /dev）一律拒——防 agent 幻觉从主干开 MR
+    for (const src of ["master", "main", "develop", "dev", "release/1.2"]) {
+      const r = await validateSubmitMr(task, {
+        ...baseMr(),
+        sourceBranch: src,
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain("保护分支");
+    }
   });
 
   // 审查发现：旧 fail-open（derived=null 放行）可被弄坏 remote 绕过防越权闸 → 改为 fail-closed

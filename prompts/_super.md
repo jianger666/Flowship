@@ -62,6 +62,8 @@ ai-flow 通过名为 `aiFlowChat` 的 MCP server 暴露 **6 个工具**：
 
 {{waitDiscipline}}
 
+{{windowsToolDiscipline}}
+
 ## action 收尾时实测踩过的错误推理（看到就撤销）
 
   - 「写完 artifact 发段消息让用户 approve、然后结束回复」← **错在没交卷**：写完 artifact 必须调 `submit_work`（带 action_id + artifact_path）交卷、然后才结束回复。漏调 = 系统判定 action 没完成、任务标 failed

@@ -21,6 +21,13 @@ import type {
 export { ACTION_LABEL } from "./types";
 import { ACTION_LABEL } from "./types";
 
+/**
+ * chat 无文本消息（纯图片 / 附件）落 user_reply 事件时的占位文案。
+ * server（chat-reply route / chat-runner flush）与前端 pending 占位匹配共用——
+ * 前端按事件 text 清本地占位，两边必须字面一致。
+ */
+export const CHAT_ATTACHMENT_ONLY_TEXT = "(用户附了图片 / 文件)";
+
 // ===========================================
 // Action 标签（V0.6 替代原 PHASE_LABEL）
 // ===========================================

@@ -20,6 +20,7 @@ import {
   getCustomAction,
   importCustomActionBundle,
   listCustomActions,
+  sanitizeSkillName,
   updateCustomAction,
 } from "@/lib/server/custom-action-fs";
 import { usableCustomActions } from "@/lib/action-layout";
@@ -418,5 +419,52 @@ describe("custom-action 导出 / 导入（skill 包 + .flowship-action.json）",
     await expect(importCustomActionBundle(pack)).rejects.toThrow(
       /不一致/,
     );
+  });
+
+  it("导入：bundle 内 symlink 一律删除（防仓外链接）", async () => {
+    const pack = path.join(TMP_ROOT, "import-pack", "with-symlink");
+    await fs.mkdir(pack, { recursive: true });
+    await fs.writeFile(
+      path.join(pack, "SKILL.md"),
+      `---\nname: with-symlink\ndescription: 带链\n---\n\n正文\n`,
+      "utf-8",
+    );
+    const outside = path.join(TMP_ROOT, "secret-outside.txt");
+    await fs.writeFile(outside, "secret\n", "utf-8");
+    await fs.symlink(outside, path.join(pack, "leak"));
+    const nested = path.join(pack, "scripts");
+    await fs.mkdir(nested, { recursive: true });
+    await fs.symlink(outside, path.join(nested, "also-leak"));
+
+    const r = await importCustomActionBundle(pack);
+    expect(r.skillName).toBe("with-symlink");
+    const dest = path.join(getAppSkillsDir(), "with-symlink");
+    await expect(fs.lstat(path.join(dest, "leak"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      fs.lstat(path.join(dest, "scripts", "also-leak")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    // 真实文件仍在
+    await expect(fs.access(path.join(dest, "SKILL.md"))).resolves.toBeUndefined();
+  });
+});
+
+describe("sanitizeSkillName（防路径穿越）", () => {
+  it("合法名放行；../ / 前导点 / 空拒", () => {
+    expect(sanitizeSkillName("perf-audit")).toBe("perf-audit");
+    expect(sanitizeSkillName("写代码")).toBe("写代码");
+    expect(sanitizeSkillName("../evil")).toBeUndefined();
+    expect(sanitizeSkillName("..")).toBeUndefined();
+    expect(sanitizeSkillName(".")).toBeUndefined();
+    expect(sanitizeSkillName(".hidden")).toBeUndefined();
+    expect(sanitizeSkillName("a/b")).toBeUndefined();
+    expect(sanitizeSkillName("")).toBeUndefined();
+  });
+
+  it("创建时 skill=../evil → 抛错", async () => {
+    await expect(
+      createCustomAction({ label: "坏", skill: "../evil" }),
+    ).rejects.toThrow(/非法/);
   });
 });

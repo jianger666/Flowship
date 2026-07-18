@@ -21,6 +21,30 @@ export { parseProjectPathFromRemoteUrl };
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * 常见保护分支：无 gitBranches 记录时禁止作 MR source（保守收紧、防幻觉从 master 开 MR）。
+ * 精确名不区分大小写；`release/*` 前缀匹配。
+ */
+const isProtectedSourceBranch = (branch: string): boolean => {
+  const b = branch.trim();
+  if (!b) return false;
+  const lower = b.toLowerCase();
+  const exact = new Set([
+    "master",
+    "main",
+    "develop",
+    "development",
+    "test",
+    "dev",
+    "staging",
+    "production",
+    "release",
+  ]);
+  if (exact.has(lower)) return true;
+  if (lower.startsWith("release/")) return true;
+  return false;
+};
+
 // 从仓库本地 git remote 反解 GitLab project path（如 wkid/crm-web）、跟 agent 上报对账。
 // 解析规则跟 action-ship.md 里 agent 用的 sed 对齐（git@host:group/proj.git / https://host/group/proj.git）。
 // 拿不到（非 git 仓 / 无 origin / 命令失败）返 null——调用方必须 fail-closed 拒绝（审查发现：
@@ -137,6 +161,12 @@ export const validateSubmitMr = async (
     return {
       ok: false,
       error: `source_branch 非法（空 / 等于目标分支）：「${a.sourceBranch}」`,
+    };
+  } else if (isProtectedSourceBranch(a.sourceBranch)) {
+    // 无 gitBranches 时禁止常见保护分支作 source（防 agent 幻觉从 master/main 开 MR）
+    return {
+      ok: false,
+      error: `source_branch 不能是保护分支「${a.sourceBranch}」（无 gitBranches 记录时禁止 master/main/develop/release/* /test/dev 等）`,
     };
   }
   // 5) project_path 必须 == server 从该仓真实 git remote 反解出的（防越权提到任意 project）

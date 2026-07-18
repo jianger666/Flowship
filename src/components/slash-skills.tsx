@@ -63,7 +63,11 @@ export const fetchSkills = async (): Promise<SlashSkill[]> => {
   }
   skillsCache = null;
   skillsInflight ??= fetch("/api/skills", { cache: "no-store" })
-    .then((r) => r.json())
+    .then((r) => {
+      // 5xx / 4xx 不写缓存：否则空数组进 TTL、60s 内菜单一直空
+      if (!r.ok) throw new Error(`skills fetch failed: ${r.status}`);
+      return r.json();
+    })
     .then((d: { skills?: Array<{ name?: string; description?: string; absPath?: string; enabled?: boolean }> }) => {
       // 同名多来源（builtin/app/feishu-cli）按扫描顺序去重取首个——跟 loadSkills 注入优先级一致；
       // v1.1.x：用户关掉的（enabled=false）不进菜单

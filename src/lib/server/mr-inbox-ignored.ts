@@ -48,27 +48,12 @@ const readIgnoredRaw = async (): Promise<Record<string, number>> => {
 };
 
 /**
- * 读忽略名单（加载即清 90 天过期条目；有清理就写回盘、失败只 warn 不阻断读）。
+ * 读忽略名单（加载时仅内存 prune，不写盘）。
+ * 写回 prune 放在 add* 写锁路径（read→prune→mutate→write），避免读路径
+ * 用陈旧快照覆盖并发 add* 刚写入的标记。
  */
 export const readMrInboxIgnored = async (): Promise<Record<string, number>> => {
-  const raw = await readIgnoredRaw();
-  const pruned = pruneSeenMap(raw);
-  if (pruned !== raw) {
-    void enqueueIgnoredWrite(async () => {
-      try {
-        await writePrivateFileAtomic(
-          ignoredFilePath(),
-          JSON.stringify(pruned, null, 2),
-        );
-      } catch (err) {
-        console.warn(
-          "[mr-inbox] 忽略名单清理写回失败:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-    });
-  }
-  return pruned;
+  return pruneSeenMap(await readIgnoredRaw());
 };
 
 /** 串行执行一个写任务（读改写整段进链、防交叉覆盖） */

@@ -18,27 +18,53 @@
  *   - 父组件只负责 task state 同步（onTaskUpdate / onEventAppend）
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Pencil } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Pencil, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
 import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
-import { ChatWorkdirPicker } from "@/components/tasks/chat-workdir-picker";
+import {
+  ChatWorkdirPicker,
+  type ChatWorkdirPickerHandle,
+} from "@/components/tasks/chat-workdir-picker";
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
 import { EventStream } from "@/components/tasks/event-stream";
+import {
+  ComposerSessionProvider,
+  buildInputHistory,
+} from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import { prepareRunArgs } from "@/lib/run-args";
-import { RUN_STATUS_LABEL, RUN_STATUS_VARIANT } from "@/lib/task-display";
 import {
+  CHAT_ATTACHMENT_ONLY_TEXT,
+  RUN_STATUS_LABEL,
+  RUN_STATUS_VARIANT,
+} from "@/lib/task-display";
+import {
+  compactChatSession,
+  fetchChatContext,
+  rewindChatToEvent,
   sendChatReply,
   stopTask,
   updateTaskFields,
+  type ChatContextInfo,
   type ImagePayload,
 } from "@/lib/task-store";
+import {
+  isEphemeralToolOutputDelta,
+  parseToolOutputDelta,
+  trimLiveOutputLines,
+} from "@/lib/tool-display";
 import type { Task, TaskEvent } from "@/lib/types";
 
 interface Props {
@@ -49,6 +75,27 @@ interface Props {
   // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
   onPrependEvents?: (events: TaskEvent[]) => void;
 }
+
+/**
+ * 本地排队占位：与 handleUserReply 参数对齐。
+ * images / attachments / skillRefs 完整 payload 暂无消费方，留待服务端原子
+ * cancel-and-promote 接口落地后恢复「立即发送」（复审 R4）。
+ */
+type PendingLocalReply = {
+  id: string;
+  text: string;
+  /** 与服务端 user_reply 落盘文案一致（空文本附件消息用 CHAT_ATTACHMENT_ONLY_TEXT） */
+  displayText: string;
+  images?: ImagePayload[];
+  attachments?: string[];
+  skillRefs?: Array<{ name: string; absPath: string }>;
+};
+
+const formatTokensWan = (n: number | null): string => {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n < 10000) return `~${Math.round(n)} tokens`;
+  return `~${(n / 10000).toFixed(1)}万 tokens`;
+};
 
 export const ChatView = ({
   task,
@@ -64,9 +111,45 @@ export const ChatView = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+  // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）
+  const [liveToolOutputs, setLiveToolOutputs] = useState<
+    Record<string, string>
+  >({});
+  // P5：排队条（第 N 条）；null = 无排队
+  const [queuedCount, setQueuedCount] = useState<number | null>(null);
+  // P5：本地「待发送」占位（SSE user_reply 按 displayText 匹配后清除）
+  const [pendingLocalReplies, setPendingLocalReplies] = useState<
+    PendingLocalReply[]
+  >([]);
+  // 与 pending 同步：onDone 需读最新值（避免闭包陈旧）
+  const pendingLocalRepliesRef = useRef(pendingLocalReplies);
+  pendingLocalRepliesRef.current = pendingLocalReplies;
+  // P4：上下文透视
+  const [contextOpen, setContextOpen] = useState(false);
+  const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
+  const [contextLoading, setContextLoading] = useState(false);
+  const [keepHints, setKeepHints] = useState("");
+  const [compacting, setCompacting] = useState(false);
 
-  // 全局 prompt 弹窗（重命名对话用）
-  const { prompt } = useDialog();
+  // 全局 prompt / confirm（重命名 / 回退）
+  const { prompt, confirm } = useDialog();
+  // 未绑仓警示「绑定」→ 打开工作目录选择器
+  const workdirPickerRef = useRef<ChatWorkdirPickerHandle | null>(null);
+  const onBindWorkdir = useCallback(() => {
+    workdirPickerRef.current?.open();
+  }, []);
+
+  // Composer session：@ 引用 / ↑ 历史 / 未绑仓警示（不改 event-stream，靠 Context 注入）
+  const composerSession = useMemo(
+    () => ({
+      taskId: task.id,
+      repoPaths: task.repoPaths,
+      inputHistory: buildInputHistory(task.events),
+      showUnboundBanner: true,
+      onBindWorkdir,
+    }),
+    [task.id, task.repoPaths, task.events, onBindWorkdir],
+  );
 
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
@@ -74,22 +157,85 @@ export const ChatView = ({
   onTaskUpdateRef.current = onTaskUpdate;
   onEventAppendRef.current = onEventAppend;
 
-  // 切 task 时把 streaming / submitting / stopping 重置
+  // 切 task 时把 streaming / submitting / stopping / live 输出 / 排队重置
   useEffect(() => {
     setStreamingText("");
     setIsSubmitting(false);
     setStopping(false);
+    setLiveToolOutputs({});
+    setQueuedCount(null);
+    setPendingLocalReplies([]);
+    setContextInfo(null);
+    setKeepHints("");
   }, [task.id]);
 
   useTaskWatch(task.id, {
     onEvent: (ev) => {
+      // ephemeral shell delta：不进持久 events，按 callId 累积到运行中工具块
+      const delta = parseToolOutputDelta(ev);
+      if (delta) {
+        setLiveToolOutputs((prev) => ({
+          ...prev,
+          [delta.callId]: trimLiveOutputLines(
+            `${prev[delta.callId] ?? ""}${delta.chunk}`,
+          ),
+        }));
+        return;
+      }
+      // 双保险：其它 ephemeral 也不落盘
+      if (isEphemeralToolOutputDelta(ev)) return;
+
+      // tool_result 到达 → 清掉该 callId 的直播缓冲（最终 output 在 meta）
+      if (ev.kind === "tool_result") {
+        const cid =
+          typeof ev.meta?.callId === "string" ? ev.meta.callId : "";
+        if (cid) {
+          setLiveToolOutputs((prev) => {
+            if (!(cid in prev)) return prev;
+            const next = { ...prev };
+            delete next[cid];
+            return next;
+          });
+        }
+      }
+
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
+
+      // P5：真实 user_reply 落地 → 按 displayText 清本地占位（附件-only 与服务端占位文案对齐）
+      if (ev.kind === "user_reply") {
+        setPendingLocalReplies((prev) => {
+          const idx = prev.findIndex((p) => p.displayText === ev.text);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next.splice(idx, 1);
+          // 2→1 时也要更新横幅数字（勿只在清空时 set null）
+          setQueuedCount(next.length > 0 ? next.length : null);
+          return next;
+        });
+      }
+
       onEventAppendRef.current(ev);
     },
     onTaskUpdate: (t) => onTaskUpdateRef.current(t),
     onDone: (t) => {
       setStreamingText("");
+      setLiveToolOutputs({});
+      const remaining = pendingLocalRepliesRef.current.length;
+      // idle/error：stop / 失败路径服务端已 clearChatQueue，本地 pending 会成幽灵气泡
+      // awaiting_user：自然回合结束，队可能正在 flush，保留 pending 等 SSE user_reply 对账
+      if (
+        remaining > 0 &&
+        (t.runStatus === "idle" || t.runStatus === "error")
+      ) {
+        setPendingLocalReplies([]);
+        setQueuedCount(null);
+        toast.message(
+          `会话已结束，已清除 ${remaining} 条未确认的排队占位（若仍需发送请重新输入）`,
+        );
+      } else {
+        setQueuedCount(remaining > 0 ? remaining : null);
+      }
       onTaskUpdateRef.current(t);
     },
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
@@ -97,27 +243,21 @@ export const ChatView = ({
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
   }, true);
 
-  // 用户回复：无论 task.runStatus 是什么、统一走 sendChatReply
-  // 后端 chat-reply 路由自己决定（V0.11）：有存活会话 → send 续接；无会话 → bootArgs 起新会话
-  // 前端为最简化、永远附 bootArgs（后端用得上就用、用不上就忽略）
+  // 用户回复：允许 running 时入队（P5）；返回 false = 失败（调用方保留草稿）
   const handleUserReply = useCallback(
     async (
       text: string,
       images?: ImagePayload[],
       attachments?: string[],
       skillRefs?: Array<{ name: string; absPath: string }>,
-    ) => {
-      if (task.runStatus === "running") {
-        toast.warning("agent 正在回、等它先说完一段");
-        return;
-      }
-
+    ): Promise<boolean> => {
       const args = prepareRunArgs(task);
-      if (!args) return;
+      // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
+      if (!args) return false;
 
       setIsSubmitting(true);
       try {
-        const { task: latest } = await sendChatReply(
+        const result = await sendChatReply(
           task.id,
           text,
           images,
@@ -128,9 +268,38 @@ export const ChatView = ({
           },
           skillRefs,
         );
-        onTaskUpdateRef.current(latest);
+        if ("queued" in result && result.queued) {
+          setQueuedCount(result.queuedCount);
+          // 存完整 payload（暂无消费方；R4 移除「立即发送」后仍保留结构）
+          setPendingLocalReplies((prev) => [
+            ...prev,
+            {
+              id: `pending_${Date.now()}_${prev.length}`,
+              text,
+              displayText: text || CHAT_ATTACHMENT_ONLY_TEXT,
+              images,
+              attachments,
+              skillRefs,
+            },
+          ]);
+          if (result.task) onTaskUpdateRef.current(result.task);
+          return true;
+        }
+        // 200 非 queued：同步清掉同文案 pending（若有），避免幽灵占位
+        const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
+        setPendingLocalReplies((prev) => {
+          const idx = prev.findIndex((p) => p.displayText === displayText);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next.splice(idx, 1);
+          setQueuedCount(next.length > 0 ? next.length : null);
+          return next;
+        });
+        onTaskUpdateRef.current(result.task);
+        return true;
       } catch (err) {
         toast.error(`回复失败：${(err as Error).message}`);
+        return false;
       } finally {
         setIsSubmitting(false);
       }
@@ -139,14 +308,19 @@ export const ChatView = ({
   );
 
   // 停止当前正在跑的 chat agent
-  // chat 打断生成是高频低风险操作（chat 不改代码、只聊 / 答疑）、不弹二次确认、即点即停
-  // 走通用 /stop：后端 cancelChatRun 停 runningChats + runStatus 回 idle
   const handleStop = useCallback(async () => {
     setStopping(true);
     try {
+      const discarded = pendingLocalRepliesRef.current.length;
       const latest = await stopTask(task.id);
-      setStreamingText(""); // 清掉打字机 placeholder、避免半截 streaming 残留
+      setStreamingText("");
+      // stop 会清 server 排队——本地占位一并丢掉、避免幽灵气泡
+      setPendingLocalReplies([]);
+      setQueuedCount(null);
       onTaskUpdateRef.current(latest);
+      if (discarded > 0) {
+        toast.message(`已丢弃 ${discarded} 条未发送的排队消息`);
+      }
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
@@ -154,8 +328,7 @@ export const ChatView = ({
     }
   }, [task.id]);
 
-  // 重命名对话：chat 模式去掉了新建弹窗、这个是唯一改名入口
-  // 走通用 prompt 拿新名 → PATCH 落盘 → 回填最新 task（复用 task 模式的 updateTaskFields）
+  // 重命名对话
   const handleRename = useCallback(async () => {
     const next = await prompt({
       title: "重命名对话",
@@ -163,7 +336,6 @@ export const ChatView = ({
       placeholder: "对话名称",
       validate: (v) => (v.trim() ? "" : "名称不能为空"),
     });
-    // null=取消；与原名相同省去一次请求
     if (next === null || next === task.title) return;
     try {
       const updated = await updateTaskFields(task.id, { title: next });
@@ -173,21 +345,91 @@ export const ChatView = ({
     }
   }, [prompt, task.id, task.title]);
 
-  // 输入框可用条件
-  // - running：agent 在说话、disable
-  // - isSubmitting：请求飞行中、disable 防双击
-  // - 其它（idle / awaiting_user / error）：开放
-  const canReply = task.runStatus !== "running" && !isSubmitting;
+  // P3：回退（「回退到这里」按钮保留；会话改动面板已砍）
+  const handleRewind = useCallback(
+    async (eventId: string) => {
+      const ok = await confirm({
+        title: "回退到这里？",
+        description:
+          "将恢复文件到该时刻并删除之后的对话。未提交的改动会被覆盖；原暂存区（staged/unstaged）区分无法恢复，回退后的内容可能全部处于已暂存状态",
+        destructive: true,
+        confirmLabel: "回退",
+      });
+      if (!ok) return;
+      try {
+        const { task: latest, refreshRequired } = await rewindChatToEvent(
+          task.id,
+          eventId,
+        );
+        if (!latest || refreshRequired) {
+          // 回退已提交但服务端读 task 失败：勿 onTaskUpdate(null)，提示用户刷新
+          toast.success("已回退，请刷新查看最新状态");
+          return;
+        }
+        onTaskUpdateRef.current(latest);
+        toast.success("已回退");
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (/跑|running|停止|409/i.test(msg)) {
+          toast.error("请先停止当前回复再回退");
+        } else {
+          toast.error(`回退失败：${msg}`);
+        }
+      }
+    },
+    [confirm, task.id],
+  );
 
-  // disabled 时输入框 placeholder
+  // P4：打开上下文 Popover 时拉一次
+  const handleContextOpenChange = useCallback(
+    async (open: boolean) => {
+      setContextOpen(open);
+      if (!open) return;
+      setContextLoading(true);
+      try {
+        const info = await fetchChatContext(task.id);
+        setContextInfo(info);
+      } catch (err) {
+        toast.error(`拉取上下文失败：${(err as Error).message}`);
+        setContextInfo(null);
+      } finally {
+        setContextLoading(false);
+      }
+    },
+    [task.id],
+  );
+
+  const handleCompact = useCallback(async () => {
+    setCompacting(true);
+    try {
+      const latest = await compactChatSession(
+        task.id,
+        keepHints.trim() || undefined,
+      );
+      onTaskUpdateRef.current(latest);
+      toast.success("会话已压缩");
+      setContextOpen(false);
+      // 刷新透视
+      try {
+        setContextInfo(await fetchChatContext(task.id));
+      } catch {
+        /* ignore */
+      }
+    } catch (err) {
+      toast.error(`压缩失败：${(err as Error).message}`);
+    } finally {
+      setCompacting(false);
+    }
+  }, [keepHints, task.id]);
+
+  // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
+  const canReply = !isSubmitting;
+
   const disabledHint = (() => {
     if (isSubmitting) return "正在发送、稍候";
-    if (task.runStatus === "running") return "agent 正在思考、稍候";
     return undefined;
   })();
 
-  // 顶部状态条文案——只在「异常」时常驻一行（V0.7.21：运行态已收进输入岛的 loading + 红停止键、
-  // 发送态 < 1s、空闲 / 等待是常态、都不值得在标题下常驻占行）
   const statusHint = (() => {
     if (task.runStatus === "error") {
       return "上一轮 agent 异常退出、再发一条可重启新一轮 run";
@@ -195,10 +437,16 @@ export const ChatView = ({
     return null;
   })();
 
+  const queueBanner =
+    queuedCount != null && queuedCount > 0 ? (
+      <div className="mx-2.5 mb-1.5 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
+        已排队，将在当前回复完成后发送（第 {queuedCount} 条）
+      </div>
+    ) : null;
+
   return (
+    <ComposerSessionProvider value={composerSession}>
     <div className="flex h-full min-h-0 w-full flex-col">
-      {/* 顶部 bar：返回 + title + 状态 badge + 进行中转圈、不放任何动作按钮（删除走首页卡片）
-          V0.7.11：轻量化——无底色、状态文案只在异常 / 进行中出现（不常驻占行） */}
       <div className="border-b px-6 py-2.5">
         <div className="flex w-full items-center justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -206,7 +454,6 @@ export const ChatView = ({
               <h1 className="min-w-0 truncate text-sm font-medium tracking-tight">
                 {task.title}
               </h1>
-              {/* 重命名：chat 模式没有编辑弹窗、这个铅笔是唯一改名入口 */}
               <Button
                 variant="ghost"
                 size="icon-xs"
@@ -230,8 +477,79 @@ export const ChatView = ({
               )}
             </div>
           </div>
+
+          {/* 标题行右侧：上下文用量 */}
+          <div className="flex shrink-0 items-center gap-1">
+            <Popover open={contextOpen} onOpenChange={(o) => void handleContextOpenChange(o)}>
+              <PopoverTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+                    title="上下文用量"
+                  >
+                    <Sparkles className="size-3" />
+                    <span className="tabular-nums">
+                      {formatTokensWan(contextInfo?.totalTokens ?? null)}
+                    </span>
+                  </Button>
+                }
+              />
+              <PopoverContent align="end" className="w-72 p-3">
+                <div className="space-y-2.5">
+                  <div className="text-xs font-medium">上下文</div>
+                  {contextLoading ? (
+                    <div className="text-xs text-muted-foreground">加载中…</div>
+                  ) : contextInfo ? (
+                    <>
+                      <div className="text-sm tabular-nums">
+                        {formatTokensWan(contextInfo.totalTokens)}
+                      </div>
+                      {contextInfo.breakdown.length > 0 && (
+                        <ul className="space-y-1 text-[11px] text-muted-foreground">
+                          {contextInfo.breakdown.map((b) => (
+                            <li
+                              key={b.label}
+                              className="flex justify-between gap-2"
+                            >
+                              <span className="min-w-0 truncate">{b.label}</span>
+                              <span className="shrink-0 tabular-nums">
+                                {b.tokens.toLocaleString()}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {contextInfo.compactRecommended && (
+                        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-300">
+                          上下文较大，建议压缩
+                        </div>
+                      )}
+                      <Input
+                        value={keepHints}
+                        onChange={(e) => setKeepHints(e.target.value)}
+                        placeholder="保留要点（可选）"
+                        className="h-7 text-xs"
+                        disabled={compacting}
+                      />
+                      <Button
+                        size="sm"
+                        className="h-7 w-full text-xs"
+                        disabled={compacting || task.runStatus === "running"}
+                        onClick={() => void handleCompact()}
+                      >
+                        {compacting ? "压缩中…" : "压缩会话"}
+                      </Button>
+                    </>
+                  ) : (
+                    <div className="text-xs text-muted-foreground">暂无数据</div>
+                  )}
+                </div>
+              </PopoverContent>
+            </Popover>
+          </div>
         </div>
-        {/* 状态条文案：仅异常 / 发送中显示 */}
         {statusHint && (
           <div className="mt-1 w-full text-xs text-muted-foreground">
             {statusHint}
@@ -239,36 +557,42 @@ export const ChatView = ({
         )}
       </div>
 
-      {/* 中间区：EventStream（chat 形态：窄列对话流 + 圆角输入岛）+ 底部输入框 */}
       <div className="min-h-0 flex-1">
         <EventStream
-          // 切对话时强制重挂（蓝军 P1）：Virtuoso 的 initialTopMostItemIndex 只在 mount
-          // 生效、不重挂则滚动位置记忆恢复失效（task 模式的三栏布局本来就按 task.id 重挂、对齐）
           key={task.id}
           task={task}
           variant="chat"
           streamingText={streamingText}
+          liveToolOutputs={liveToolOutputs}
           onUserReply={handleUserReply}
           canReply={canReply}
+          submitting={isSubmitting}
           disabledHint={disabledHint}
           isRunning={task.runStatus === "running"}
           onStop={handleStop}
           stopping={stopping}
           onPrependEvents={onPrependEvents}
+          onRewind={handleRewind}
+          pendingLocalReplies={pendingLocalReplies}
+          queueBanner={queueBanner}
+          allowQueueWhileRunning
           composerLeading={
             <ChatModelPicker task={task} onTaskUpdate={onTaskUpdate} />
           }
           composerTop={
             <>
-              <ChatWorkdirPicker task={task} onTaskUpdate={onTaskUpdate} />
+              <ChatWorkdirPicker
+                ref={workdirPickerRef}
+                task={task}
+                onTaskUpdate={onTaskUpdate}
+              />
               <ChatBranchPicker task={task} />
               <ChatMcpPicker task={task} onTaskUpdate={onTaskUpdate} />
             </>
           }
         />
       </div>
-
-      {/* ask_user 答题卡：EventStream 内联分流（chat / task 同款、V0.13.x） */}
     </div>
+    </ComposerSessionProvider>
   );
 };

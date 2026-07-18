@@ -30,7 +30,7 @@ import { useCursorMcp } from "@/hooks/use-cursor-mcp";
 import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
-import { getSettings, recordModelUsage } from "@/lib/local-store";
+import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
 import { settingsUrl } from "@/lib/settings-link";
 import { createTask } from "@/lib/task-store";
 
@@ -94,23 +94,31 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const branchMap = useRepoBranches(repoPaths);
   const [submitting, setSubmitting] = useState(false);
 
-  // mount：settings + 上次启动记忆预填
+  // mount：await initSettings 后再读 cache 预填（冷启动同步 getSettings 会拿到 DEFAULT_SETTINGS）
   useEffect(() => {
-    const s = getSettings();
-    setRepos(s.repos);
-    setDisabledMcp(s.disabledMcpServers ?? []);
-    setDefaultModelId(s.defaultModel?.id ?? "");
-    setPickedModel(s.defaultModel?.id?.trim() ? s.defaultModel : { id: "" });
-    // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
-    setRunInRepo(s.isolateWorktreeDefault === false);
-    const last = readLastLaunch();
-    const validPaths = (last.repoPaths ?? []).filter((p) =>
-      s.repos.some((r) => r.path === p),
-    );
-    // 只配了一个仓库时天然零操作：直接选它
-    if (validPaths.length > 0) setRepoPaths(validPaths);
-    else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
-    if (s.apiKey?.trim()) void fetchModels(s.apiKey);
+    let alive = true;
+    void (async () => {
+      await initSettings();
+      if (!alive) return;
+      const s = getSettings();
+      setRepos(s.repos);
+      setDisabledMcp(s.disabledMcpServers ?? []);
+      setDefaultModelId(s.defaultModel?.id ?? "");
+      setPickedModel(s.defaultModel?.id?.trim() ? s.defaultModel : { id: "" });
+      // v1.1.x：隔离工作区默认值走设置页偏好（只读型用法可默认直跑原仓）、表单可临时改
+      setRunInRepo(s.isolateWorktreeDefault === false);
+      const last = readLastLaunch();
+      const validPaths = (last.repoPaths ?? []).filter((p) =>
+        s.repos.some((r) => r.path === p),
+      );
+      // 只配了一个仓库时天然零操作：直接选它
+      if (validPaths.length > 0) setRepoPaths(validPaths);
+      else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
+      if (s.apiKey?.trim()) void fetchModels(s.apiKey);
+    })();
+    return () => {
+      alive = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅 mount 预填一次
   }, []);
 

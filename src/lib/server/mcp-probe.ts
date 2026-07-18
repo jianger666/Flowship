@@ -19,10 +19,13 @@
  *
  * v1.1.x 提速：起 agent 前的探测（filterHealthyMcp）走 TTL 缓存——每次推进 / 发消息
  * 都真探一轮（单服超时 6s）是「点推进后半天没动静」的固定成本之一。ok / fail 结果均
- * 5 分钟内复用。设置页的 probeMcpHealthAll 保持真探（用户就是来看真值的）、结果写穿
- * 缓存——授权完刷新设置页即可清 fail 缓存、下次起 agent 即新。
- * key 含 headers（OAuth token 变了自然失效）。
+ * 5 分钟内复用（远大于「60s 内复用」要求）。设置页的 probeMcpHealthAll 保持真探（用户就是
+ * 来看真值的）、结果写穿缓存——授权完刷新设置页即可清 fail 缓存、下次起 agent 即新。
+ * key 含 headers（OAuth token 变了自然失效）。chat-runner / task-runner 启动链均走
+ * filterHealthyMcp，热路径全命中时 mcp 段≈0。
  */
+
+import { createHash } from "node:crypto";
 
 import type { McpServerConfig } from "@cursor/sdk";
 
@@ -36,6 +39,8 @@ const PROBE_TIMEOUT_MS = 6000;
 const PROBE_CACHE_OK_MS = 5 * 60_000;
 // fail 也缓 5 分钟：长期 401 等每次推进重探白付 6s；设置页 probeMcpHealthAll 真探且写穿缓存，授权后刷新设置页即可清
 const PROBE_CACHE_FAIL_MS = 5 * 60_000;
+/** 缓存条目上限：超出删最旧（Map 插入序） */
+const PROBE_CACHE_MAX_ENTRIES = 200;
 
 // 挂 globalThis：各 route 是不同 chunk、module-level Map 会各持一份（同 runningTasks 老坑）
 const G = globalThis as unknown as {
@@ -43,10 +48,11 @@ const G = globalThis as unknown as {
 };
 const probeCache = (G.__feMcpProbeCache ??= new Map());
 
-// 缓存 key：仅 http server（url + headers 快照——token 换了 key 自然变）；stdio 返 null 不缓存
+// 缓存 key：sha256(name|url|headers)——避免明文 Bearer 进 Map key；token 换了摘要自然变
 const probeCacheKey = (name: string, cfg: McpServerConfig): string | null => {
   if (!("url" in cfg)) return null;
-  return `${name}|${cfg.url}|${JSON.stringify(cfg.headers ?? {})}`;
+  const payload = `${name}|${cfg.url}|${JSON.stringify(cfg.headers ?? {})}`;
+  return createHash("sha256").update(payload).digest("hex");
 };
 
 const readProbeCache = (key: string | null): McpHealth | null => {
@@ -58,7 +64,15 @@ const readProbeCache = (key: string | null): McpHealth | null => {
 };
 
 const writeProbeCache = (key: string | null, health: McpHealth): void => {
-  if (key) probeCache.set(key, { health, at: Date.now() });
+  if (!key) return;
+  // 刷新插入序：先删再设，命中续期后仍算「较新」
+  if (probeCache.has(key)) probeCache.delete(key);
+  probeCache.set(key, { health, at: Date.now() });
+  while (probeCache.size > PROBE_CACHE_MAX_ENTRIES) {
+    const oldest = probeCache.keys().next().value;
+    if (oldest === undefined) break;
+    probeCache.delete(oldest);
+  }
 };
 
 /**
@@ -186,12 +200,20 @@ export const filterHealthyMcp = async (
     Object.entries(servers).map(async ([name, cfg]) => {
       const key = probeCacheKey(name, cfg);
       const cached = readProbeCache(key);
-      if (cached) return [name, cfg, cached] as const;
+      if (cached) return [name, cfg, cached, true] as const;
       const health = await probeMcpHealth(name, cfg);
       writeProbeCache(key, health);
-      return [name, cfg, health] as const;
+      return [name, cfg, health, false] as const;
     }),
   );
+  const total = entries.length;
+  const cacheHits = entries.filter((e) => e[3]).length;
+  // 热路径可观测：全命中时 chat 启动链 mcp≈0（TTL ok/fail 各 5min，远大于 60s 复用要求）
+  if (total > 0) {
+    console.log(
+      `[mcp-probe] filterHealthyMcp cacheHits=${cacheHits}/${total} probed=${total - cacheHits}`,
+    );
+  }
   const kept: Record<string, McpServerConfig> = {};
   const dropped: McpHealth[] = [];
   for (const [name, cfg, h] of entries) {

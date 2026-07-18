@@ -21,7 +21,11 @@
  * 视觉：trigger 复用 ModelSelect compact 同款（边框 + h-7 + text-xs）、跟旁边模型选择器并排齐平。
  */
 
-import { useState } from "react";
+import {
+  forwardRef,
+  useImperativeHandle,
+  useState,
+} from "react";
 import { ChevronDown, Folder, FolderOpen, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -43,6 +47,11 @@ interface Props {
   onTaskUpdate: (next: Task) => void;
 }
 
+/** 警示条「绑定」等外部入口：打开下拉（最近 + 浏览） */
+export interface ChatWorkdirPickerHandle {
+  open: () => void;
+}
+
 // 路径取末段做展示名（去尾部斜杠）、空段兜底原值
 const basename = (p: string): string => {
   const clean = p.replace(/\/+$/, "");
@@ -50,7 +59,8 @@ const basename = (p: string): string => {
   return idx >= 0 ? clean.slice(idx + 1) || clean : clean;
 };
 
-export const ChatWorkdirPicker = ({ task, onTaskUpdate }: Props) => {
+export const ChatWorkdirPicker = forwardRef<ChatWorkdirPickerHandle, Props>(
+  ({ task, onTaskUpdate }, ref) => {
   // popover 开关（受控）
   const [open, setOpen] = useState(false);
   // 持久化飞行中：PATCH 期间禁用、防连点
@@ -72,6 +82,13 @@ export const ChatWorkdirPicker = ({ task, onTaskUpdate }: Props) => {
   const unsetHint = home
     ? `未指定——agent 在主目录运行：${home}`
     : "未指定——agent 在主目录运行";
+
+  useImperativeHandle(ref, () => ({
+    open: () => {
+      setRecent(getRecentWorkdirs());
+      setOpen(true);
+    },
+  }));
 
   // 替换工作目录（空数组 = 改回主目录）、成功后记最近 + 关 popover
   const apply = async (paths: string[]) => {
@@ -205,4 +222,7 @@ export const ChatWorkdirPicker = ({ task, onTaskUpdate }: Props) => {
       </PopoverContent>
     </Popover>
   );
-};
+},
+);
+
+ChatWorkdirPicker.displayName = "ChatWorkdirPicker";

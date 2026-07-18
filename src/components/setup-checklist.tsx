@@ -100,11 +100,13 @@ export const useSetupGate = (): SetupGate => {
       }
     };
     void pull();
-    if (feishuReady) return; // 已就绪：不再轮询
-    const timer = window.setInterval(() => void pull(), 3000);
+    // 已就绪：只拉一次、不轮询；但仍要统一返回 cleanup，否则 in-flight pull 卸载后仍 setState
+    const timer = feishuReady
+      ? undefined
+      : window.setInterval(() => void pull(), 3000);
     return () => {
       stop = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearInterval(timer);
     };
   }, [stickyReady, feishuReady]);
 

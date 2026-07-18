@@ -23,17 +23,46 @@ export const DEFAULT_BRANCH_TEMPLATE = "feature/{storyId}-{taskTitle}";
 
 /**
  * 单段 branch-safe：保留中文 + 字母数字；空白 / 各种括号 / git 非法字符（~ ^ @ : ? * [ \ / < > | "）
- * 统一换 -；连续点折 -（git 禁 ..）；首尾 - 和 . 去掉（git 禁 ref 以 . 结尾）。中间单点保留（如 v1.0）
+ * 以及 shell 元字符（$ ` ; ! &）统一换 -；连续点折 -（git 禁 ..）；首尾 - 和 . 去掉。
+ * 中间单点保留（如 v1.0）。
  *
  * 注意：`/` 也换成 -——变量值不该自带路径层级、层级由模板字面控制。
  */
-const sanitizeBranchSegment = (s: string): string =>
+export const sanitizeBranchSegment = (s: string): string =>
   s
     .trim()
-    .replace(/[\s\\/:*?"<>|~^@【】（）()\[\]{}]+/g, "-")
+    .replace(/[\s\\/:*?"<>|~^@`$!&;【】（）()\[\]{}]+/g, "-")
     .replace(/\.{2,}/g, "-")
     .replace(/-+/g, "-")
     .replace(/^[-.]+|[-.]+$/g, "");
+
+/**
+ * 完整分支名清洗：按 `/` 分段走 sanitizeBranchSegment，保留路径分隔。
+ * 用于模板字面量残留非法字符、或用户手填分支的兜底清洗。
+ */
+export const sanitizeBranchName = (s: string): string =>
+  s
+    .split("/")
+    .map((seg) => sanitizeBranchSegment(seg))
+    .filter((seg) => seg.length > 0)
+    .join("/");
+
+/**
+ * 分支名是否可安全交给 git argv / 拼进 refs（拒空串、前导 -、空白、..、非法 ref 字符）。
+ * worktree add / checkout / show-ref 前统一校验。
+ */
+export const isSafeBranchName = (name: string): boolean => {
+  if (!name || name !== name.trim()) return false;
+  if (name.startsWith("-") || name.endsWith(".lock")) return false;
+  if (name.includes("..") || name.includes("//")) return false;
+  // 与 sanitizeBranchSegment 同级字符集，额外允许 `/` 作层级分隔
+  if (!/^[A-Za-z0-9\u4e00-\u9fa5._/-]+$/.test(name)) return false;
+  // 分段不能为空、不能是 `.`、不能以 `.` 结尾（git 禁）
+  for (const seg of name.split("/")) {
+    if (!seg || seg === "." || seg.endsWith(".")) return false;
+  }
+  return true;
+};
 
 /**
  * 日期格式化：支持 yyyy/yy/MM/dd/HH/mm/ss token（区分大小写、MM=月 mm=分）
@@ -73,25 +102,25 @@ export const renderBranchName = (
   now: Date = new Date(),
 ): string => {
   const tpl = template.trim() || DEFAULT_BRANCH_TEMPLATE;
-  return (
-    tpl
-      // {date:FORMAT} 先处理（FORMAT 里可能含其它字母、不能跟普通占位符正则混）
-      .replace(/\{date:([^}]*)\}/g, (_, fmt: string) =>
-        sanitizeBranchSegment(formatDate(fmt, now)),
-      )
-      .replace(/\{(username|storyId|taskTitle)\}/g, (_, key: string) => {
-        const raw =
-          key === "username"
-            ? vars.username
-            : key === "storyId"
-              ? vars.storyId
-              : vars.taskTitle;
-        return sanitizeBranchSegment(raw ?? "");
-      })
-      // 清理：连续 / 折成单个、去首尾 /（防占位符为空撑出 // 或首尾 /）
-      .replace(/\/{2,}/g, "/")
-      .replace(/^\/+|\/+$/g, "")
-  );
+  const rendered = tpl
+    // {date:FORMAT} 先处理（FORMAT 里可能含其它字母、不能跟普通占位符正则混）
+    .replace(/\{date:([^}]*)\}/g, (_, fmt: string) =>
+      sanitizeBranchSegment(formatDate(fmt, now)),
+    )
+    .replace(/\{(username|storyId|taskTitle)\}/g, (_, key: string) => {
+      const raw =
+        key === "username"
+          ? vars.username
+          : key === "storyId"
+            ? vars.storyId
+            : vars.taskTitle;
+      return sanitizeBranchSegment(raw ?? "");
+    })
+    // 清理：连续 / 折成单个、去首尾 /（防占位符为空撑出 // 或首尾 /）
+    .replace(/\/{2,}/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  // 模板字面量也可能带非法字符（如 `feature$/{storyId}`）——整串再过一遍 branch-safe
+  return sanitizeBranchName(rendered);
 };
 
 /**
