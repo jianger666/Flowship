@@ -1,5 +1,7 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 凌晨：第二十九轮修复（整夜批）已提交、待复审——R28-1～R28-5 全部落地后，自行组织三轮内部交叉审查（独立 reviewer 按 Codex 审法分区蓝军）、审出的 7 个新 P1 + 主要 P2 全部修复、终轮确认 ownership 收敛无可达 P1。门禁 81 文件 / 784 项 0 skipped 多遍全绿。7 个 wip commit 已落本地（未 push）。详见「第二十九轮修复报告」。
+>
 > 2026-07-18 22:21：第二十八轮 Codex 深度复审完成。R27-1、R27-5、R27-7 已成立，R27-2/3/4/6 只关闭了报告描述中的局部窗口；继续确认 **4 个 P1 + 1 个 P2**：worktree 资源租约未贯穿真实启动链，chat 旧 run 的自然/取消/失败收尾仍可在 force-clear 空窗覆盖新会话，resume 条件清锚点没有最终 guard，`submit_mr` 与 `submit_work` 缺 action 级并发屏障且两份 MR 状态非同一事务，事件落盘顺序与 SSE 发布顺序可反转。结论不通过。typecheck、lint、74 文件 / 746 项、build、diff-check 均通过；现有 R27 矩阵中两项明确是降级直测，绿灯没有覆盖上述真实链路。详见「第二十八轮验收」。
 >
 > 2026-07-18 22:00：第二十八轮修复已提交、待复审——R27-1～R27-7 全部处置 + 收敛门槛 5 条落地：lease 进 rename retry 循环与 worktree 资源函数内部、resume reject 条件清锚点、action/ask 身份从 session token 拆出、owned sink 必填化 + ESLint 静态门禁、chat 主消息流接 instanceId lease、ENOENT 不 publish 幽灵事件。门禁 74 文件 / 746 项 0 skipped 两遍全绿。修复期间发生一次 git checkout 数据事故、已从构建缓存完整恢复并保护性提交（详见报告内事故记录）。详见「第二十八轮修复报告」。
@@ -678,6 +680,42 @@ task/chat 两侧 ask notifier 的 lease 增 `getPendingAsk(taskId)?.askId === si
 ### ⚠️ 事故记录（如实、供复审知悉）
 
 R27 修复过程中一个子代理误用 `git checkout` 将从未提交的 `task-runner.ts` / `sdk-message-handler.ts` / `ask-supersede.ts` 回退到 v1.1.20（丢失 27 轮全部实现）。恢复方式：从最后一次全绿 build（20:48）的 webpack 构建缓存提取转译 JS（逻辑/注释 100% 保留）+ 旧版类型骨架与完好依赖签名反推 TS 类型重建三文件；保真度由门禁验证（typecheck 0 错 + 恢复后 734 项测试 731 绿、3 红恰为事故前未完成的 R27-2/3/4）。恢复后已做保护性 git commit（`4c0fbb1`、本地未 push），后续每轮追加 wip commit。复审时若发现「实现与某轮修复报告描述不符」的疑点，优先怀疑恢复保真度、直接点名，我方对照 transcript 核查。
+
+---
+
+## 第二十九轮修复报告（Fable5、2026-07-19 凌晨、整夜批、待复审）
+
+用户授权整夜自主作战：修完 R28-1～R28-5 后**不再等外部复审、自行组织了三轮内部交叉审查**（独立子代理按 Codex 审法：沿真实副作用 sink 反查授权、构造可达时序、检查降级直测缺口），审出的 P1 全部修复、循环到终轮审不出 ownership 类 P1 为止。全程 7 个 wip commit（`8b48954`→`535d162`）、每批过全量门禁。
+
+### R28-1～R28-5 修复（对应第二十八轮验收）
+
+- **R28-1 ResourceJob**：资源租约必填贯穿 `ensureTaskWorktrees` 全生命周期（mkdir / hot checkout / 每次 add 含 retry / .env copy / 每个 dep clone 单元 / 结束复查）+ `ensureWorkspaceReady(task, lease)` 必填、三个真实入口（internalStartAgent / resumeTaskSession / startOneShotQuestion）传真实 handle；让位抛 `WorktreeLeaseLostError` 不吞、调用方不得继续 upsert；prewarm 登记 startingTasks、finalize join 升级为「starting || resourceJobs、30s」；add 后失主补偿移除本轮新建。
+- **R28-2 finalizeChatRunIfCurrent**：chat run 的 status/queue/session/done/error/compact/flush 收尾全部收口到唯一 instance-CAS 入口——**map 空 = 失主 no-op**（forceClear 空窗不再是授权）；natural finished 补上 instance 检查；重连 preamble 授权化。
+- **R28-3 锚点 finalGuard**：`clearTaskSessionAgentIdIf` 改 prepare/commit(finalGuard)——盘上 agentId === expected + extraGuard 在每次 rename attempt 前复查；「B 同 agentId 安装插在 read/commit await 内」的窗口关闭。
+- **R28-4 ActionSideEffectCoordinator**：同 action 的 submit_mr / submit_work 并发屏障（submit_work 等待在飞 MR、post-check 在飞拒 submit_mr、同 kind 双 submit_mr 互斥）；`upsertMRWithActionSideEffect` 一把锁同时写 task.mrs + action.sideEffects.mrs（`appendActionSideEffectMR` 删除）。
+- **R28-5 OrderedEventCommit**：事件写行与 SSE publish 进同一 per-task 有序链（publish 作为链内 onCommitted、meta touch 后台化）；事件加进程内单调 `seq`。
+
+### 内部交叉审查三轮（替代外部复审的循环）
+
+- **第一轮**（三个独立 reviewer 分区：task 生命周期 / chat 生命周期 / MCP+事件管道）：报 6 P1 + 9 P2——stop/DELETE 不 join ResourceJob（失主补偿可拆后继 worktree）、cancel 收尾无条件 publish done、chat ask 裸写 awaiting_user、send 失主回滚跨 await 空窗、close 无条件清锚点、屏障 120s 超时 fail-open。全部修复（commit `57d974d`）+ 主线兜底两处（submit_work notifier 错误传播到工具层不再假交卷、stop 终态 owner 补发 done 解前端 streaming 挂起）。
+- **第二轮**（两个 reviewer 验证第一轮修复闭合性 + 找残余）：R29 七项验证全部闭合；新报 1 P1（交卷追问失败/耗尽收尾的裸 patchAction + 裸 done——改 `patchActionIfOwner` 锁内复查 + `publishIfCurrent`）+ 5 P2（prewarm/build 裸 upsertGitBranch 补 lease、safeNotifyAwaiting 返回前复查 token、no_notifier 不再假交卷、flushChatQueue 气泡与 rewind info 迁 writeEventAndPublish）。全部修复（commit `f8b1665`）。
+- **终轮**（全域收敛确认）：五处新修复闭合验证通过；系统性扫四类 sink 裸调用残留 + 两轮未碰的边角（reopen / action-exclude / mr-inbox / preview-manager / finalize 清理段）——**ownership / 状态机收敛：未发现可达 P1**。唯一新报：finalize 清理窗内 `/api/preview` 无 lifecycle/终态闸（孤儿 dev server、窄窗资源泄漏）——已修（route 拒 lifecycle 非 null / 终态 + finalize remove 后二次停预览、commit `535d162`）。
+
+### 第二十九轮工程门禁
+
+- `pnpm typecheck`：通过
+- `pnpm lint`：通过（0 error / 0 warning、含 R27-6 静态门禁规则）
+- `pnpm test`：**81 文件 / 784 项、0 skipped**——整夜累计跑 10+ 遍；其中一遍出现 1 项偶发失败（输出未捕获到用例名、随后连跑 6 遍未复现）、如实记录
+- `pnpm build`：生产构建通过
+- `git diff --check`：通过
+
+### 遗留（低优、记债不阻塞）
+
+- 双标签 finalize 中途 reopen 的审计文案打架（状态可自愈、低风险）
+- 追问失败路径 getTask 后的 task envelope 裸 publish（纯 UI 闪动、done 已门控）
+- 第二轮交叉审查修复批的部分定向单测未补（终轮 reviewer 判定收敛期可不补）
+- chat-runner 残余裸 `setTaskRunStatus`（send/deliver/summarize/compact 段）——两轮 reviewer 均未证成可达错误覆盖、标注为债务
+- 前端未按 `seq` 重排（服务端同序已保证实时路径、seq 供后续兜底）
 
 ---
 
