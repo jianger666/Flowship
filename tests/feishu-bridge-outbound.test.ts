@@ -20,8 +20,19 @@ const getTask = vi.hoisted(() =>
   })),
 );
 
+const appendEvent = vi.hoisted(() =>
+  vi.fn(async (taskId: string, ev: { kind: string; text?: string }) => ({
+    id: `ev_${ev.kind}_${Date.now()}`,
+    kind: ev.kind,
+    text: ev.text ?? "",
+    createdAt: Date.now(),
+    taskId,
+  })),
+);
+
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
+  appendEvent,
 }));
 
 vi.mock("@/lib/server/feishu-bridge/bridge-config", () => ({
@@ -116,6 +127,7 @@ beforeEach(() => {
     mode: "chat" as const,
     model: { id: "grok-4" },
   }));
+  appendEvent.mockClear();
   uploadImage.mockClear();
   __setCreateCardStreamForTest(
     cardFactory.create as unknown as Parameters<
@@ -522,5 +534,48 @@ describe("turn 状态机", () => {
     publishTaskStreamEvent(taskId, makeEvent("thinking", "y"));
     await flush();
     expect(cardFactory.create).toHaveBeenCalledTimes(1);
+  });
+
+  // review P1#4 / 坑 #10：连续出向失败 app 内可见
+  it("finalize 时 failCount>=3 → appendEvent info 可见提示", async () => {
+    const createWithFails = vi.fn(() => {
+      const card: CardMock = {
+        start: vi.fn(async () => undefined),
+        pushProcess: vi.fn(),
+        pushAnswer: vi.fn(),
+        setHeaderStatus: vi.fn(),
+        appendAskUser: vi.fn(async () => undefined),
+        appendRetryButton: vi.fn(async () => undefined),
+        finalize: vi.fn(async () => undefined),
+        getFailCount: () => 3,
+        getIds: () => ({ messageId: "om_fail", cardId: "card_fail" }),
+      };
+      cardFactory.cards.push(card);
+      return card;
+    });
+    __setCreateCardStreamForTest(
+      createWithFails as unknown as Parameters<
+        typeof __setCreateCardStreamForTest
+      >[0],
+    );
+
+    const taskId = "t_failvis";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "推"));
+    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
+    await flush();
+    publishTaskStreamEvent(taskId, {
+      kind: "done",
+      ok: true,
+      task: { id: taskId, title: "测对话", mode: "chat" } as never,
+    });
+    await flush();
+
+    expect(appendEvent).toHaveBeenCalledWith(
+      taskId,
+      expect.objectContaining({
+        kind: "info",
+        text: expect.stringContaining("飞书卡片推送异常（3 次失败）"),
+      }),
+    );
   });
 });

@@ -100,6 +100,7 @@ import {
   beginChatQueueInFlight,
   clearChatQueue,
   dequeueChatMessage,
+  emitQueuedMessageFlushed,
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
@@ -2166,6 +2167,10 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           return;
         }
         delivered = true;
+
+        // review P0#1：flush 成功后中性钩子（带原条目 extraMeta）；飞书层订阅升级 Typing→Get / 清撤回 Map
+        // chat-runner 不 import feishu-bridge，保持分层
+        emitQueuedMessageFlushed(taskId, msg);
 
         // 入队方已落过 user_reply（并发起会话被吞改入队等）→ 跳过重复气泡 / checkpoint
         if (msg.skipPersistEvent) return;

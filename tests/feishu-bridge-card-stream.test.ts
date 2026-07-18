@@ -48,6 +48,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
 
 const {
   applyPrefixGuard,
+  closeUnclosedCodeFence,
   truncateForCard,
   createCardStream,
   __setCardStreamTimersForTest,
@@ -194,5 +195,85 @@ describe("createCardStream", () => {
     expect(stream.getIds().cardId).toBeUndefined();
     stream.pushAnswer("x");
     expect(updateCardElementContent).not.toHaveBeenCalled();
+  });
+
+  // review P1#5：多题不渲染按钮
+  it("appendAskUser 单题渲染按钮、多题仅 markdown + 文字作答提示", async () => {
+    const stream = createCardStream("task_ask", { title: "t", openId: "ou" });
+    await stream.start();
+    batchUpdateCard.mockClear();
+
+    await stream.appendAskUser({
+      askId: "ask_single",
+      questions: [
+        {
+          id: "q1",
+          question: "选一个？",
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+          ],
+        },
+      ],
+    });
+    const singleEls = (
+      batchUpdateCard.mock.calls[0] as unknown as [
+        string,
+        Array<{ params: { elements: Array<{ tag: string; content?: string }> } }>,
+      ]
+    )[1][0]!.params.elements;
+    expect(singleEls.some((e) => e.tag === "button")).toBe(true);
+
+    batchUpdateCard.mockClear();
+    await stream.appendAskUser({
+      askId: "ask_multi",
+      questions: [
+        { id: "q1", question: "题一？", options: [{ id: "a", label: "A" }] },
+        { id: "q2", question: "题二？", options: [{ id: "b", label: "B" }] },
+      ],
+    });
+    const multiEls = (
+      batchUpdateCard.mock.calls[0] as unknown as [
+        string,
+        Array<{ params: { elements: Array<{ tag: string; content?: string }> } }>,
+      ]
+    )[1][0]!.params.elements;
+    expect(multiEls.every((e) => e.tag !== "button")).toBe(true);
+    expect(
+      multiEls.some((e) => e.content === "请直接回复文字作答"),
+    ).toBe(true);
+  });
+
+  // review P2#6：finalize 补未闭合围栏
+  it("finalize 对未闭合 ``` 围栏补闭合", async () => {
+    expect(closeUnclosedCodeFence("```ts\nconst x = 1")).toBe(
+      "```ts\nconst x = 1\n```",
+    );
+    expect(closeUnclosedCodeFence("```ts\nconst x = 1\n```")).toBe(
+      "```ts\nconst x = 1\n```",
+    );
+
+    const stream = createCardStream("task_fence", { title: "t", openId: "ou" });
+    await stream.start();
+    stream.pushAnswer("```js\nconsole.log(1)");
+    await vi.waitFor(() =>
+      expect(updateCardElementContent).toHaveBeenCalled(),
+    );
+    await stream.finalize({ ok: true, durationMs: 1000 });
+    const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+      [
+        string,
+        {
+          body: {
+            elements: Array<{ element_id?: string; content?: string }>;
+          };
+        },
+      ]
+    >;
+    const cardJson = entityCalls.at(-1)![1];
+    const answer = cardJson.body.elements.find(
+      (e) => e.element_id === "md_answer",
+    );
+    expect(answer?.content).toContain("```js\nconsole.log(1)\n```");
   });
 });

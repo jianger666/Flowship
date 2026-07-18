@@ -346,6 +346,10 @@ const stopChildGracefully = async (child: ChildProcess): Promise<void> => {
 
 // ----------------- 断线补拉 -----------------
 
+/** review P1#3：补拉每页条数 / 总量上限（防爆） */
+const CATCHUP_PAGE_SIZE = 50;
+const CATCHUP_TOTAL_CAP = 200;
+
 /**
  * 补拉：GET /open-apis/im/v1/messages
  * 参数实测（2026-07-18）：
@@ -354,6 +358,8 @@ const stopChildGracefully = async (child: ChildProcess): Promise<void> => {
  *   start_time / end_time = **Unix 秒**（字符串）
  *   page_size、sort_type=ByCreateTimeAsc
  * create_time 在返回里是毫秒字符串。
+ *
+ * review P1#3：跟随 has_more / page_token 翻页；只注入本人 user 消息。
  */
 export const catchUpMissedMessages = async (
   onMessage: (msg: FeishuInboundMessage) => Promise<void> = defaultMessageHandler,
@@ -391,48 +397,86 @@ export const catchUpMissedMessages = async (
     return;
   }
 
+  let ownerOpenId: string;
+  try {
+    ownerOpenId = (await getBotAppInfo()).ownerOpenId;
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/inbound] 补拉跳过：无法获取本人 open_id:",
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+
   const startSec = String(Math.floor(lastMs / 1000));
   const endSec = String(Math.floor(now / 1000));
+  let pageToken: string | undefined;
+  let injected = 0;
   try {
-    const rec = await larkApi("GET", "/open-apis/im/v1/messages", {
-      params: {
+    // review P1#3：翻页直到 !has_more 或总量 cap
+    for (;;) {
+      const params: Record<string, unknown> = {
         container_id_type: "chat",
         container_id: chatId,
         start_time: startSec,
         end_time: endSec,
-        page_size: 50,
+        page_size: CATCHUP_PAGE_SIZE,
         sort_type: "ByCreateTimeAsc",
-      },
-    });
-    const data = (rec.data as Record<string, unknown> | undefined) ?? rec;
-    const items = Array.isArray(data.items) ? data.items : [];
-    for (const item of items) {
-      if (!item || typeof item !== "object") continue;
-      const it = item as Record<string, unknown>;
-      const messageId =
-        typeof it.message_id === "string" ? it.message_id : "";
-      if (!messageId || (await hasProcessedMessageId(messageId))) continue;
-
-      const sender = it.sender as Record<string, unknown> | undefined;
-      const body = it.body as { content?: string } | undefined;
-      const msg: FeishuInboundMessage = {
-        type: "im.message.receive_v1",
-        message_id: messageId,
-        create_time:
-          typeof it.create_time === "string" ? it.create_time : "",
-        chat_id: typeof it.chat_id === "string" ? it.chat_id : chatId,
-        chat_type: "p2p",
-        message_type:
-          (typeof it.msg_type === "string" && it.msg_type) ||
-          (typeof it.message_type === "string" && it.message_type) ||
-          "text",
-        sender_id: typeof sender?.id === "string" ? sender.id : "",
-        content: typeof body?.content === "string" ? body.content : "",
-        root_id: typeof it.root_id === "string" ? it.root_id : undefined,
-        parent_id:
-          typeof it.parent_id === "string" ? it.parent_id : undefined,
       };
-      await onMessage(msg);
+      if (pageToken) params.page_token = pageToken;
+
+      const rec = await larkApi("GET", "/open-apis/im/v1/messages", { params });
+      const data = (rec.data as Record<string, unknown> | undefined) ?? rec;
+      const items = Array.isArray(data.items) ? data.items : [];
+
+      for (const item of items) {
+        if (injected >= CATCHUP_TOTAL_CAP) break;
+        if (!item || typeof item !== "object") continue;
+        const it = item as Record<string, unknown>;
+        const messageId =
+          typeof it.message_id === "string" ? it.message_id : "";
+        if (!messageId || (await hasProcessedMessageId(messageId))) continue;
+
+        const sender = it.sender as Record<string, unknown> | undefined;
+        // 只注入本人用户消息：sender_type=user（缺省当 user）+ id 匹配 owner
+        const senderType =
+          typeof sender?.sender_type === "string" ? sender.sender_type : "user";
+        const senderId = typeof sender?.id === "string" ? sender.id : "";
+        if (senderType !== "user" || senderId !== ownerOpenId) continue;
+
+        const body = it.body as { content?: string } | undefined;
+        const msg: FeishuInboundMessage = {
+          type: "im.message.receive_v1",
+          message_id: messageId,
+          create_time:
+            typeof it.create_time === "string" ? it.create_time : "",
+          chat_id: typeof it.chat_id === "string" ? it.chat_id : chatId,
+          chat_type: "p2p",
+          message_type:
+            (typeof it.msg_type === "string" && it.msg_type) ||
+            (typeof it.message_type === "string" && it.message_type) ||
+            "text",
+          sender_id: senderId,
+          content: typeof body?.content === "string" ? body.content : "",
+          root_id: typeof it.root_id === "string" ? it.root_id : undefined,
+          parent_id:
+            typeof it.parent_id === "string" ? it.parent_id : undefined,
+        };
+        await onMessage(msg);
+        injected += 1;
+      }
+
+      if (injected >= CATCHUP_TOTAL_CAP) {
+        console.warn(
+          `[feishu-bridge/inbound] 补拉已达总量上限 ${CATCHUP_TOTAL_CAP}，停止翻页`,
+        );
+        break;
+      }
+      const hasMore = data.has_more === true;
+      const nextToken =
+        typeof data.page_token === "string" ? data.page_token : "";
+      if (!hasMore || !nextToken) break;
+      pageToken = nextToken;
     }
   } catch (err) {
     console.warn(

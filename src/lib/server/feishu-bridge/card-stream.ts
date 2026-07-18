@@ -42,6 +42,20 @@ const ELEMENT_ANSWER = "md_answer";
 const ELEMENT_FOOTER = "md_footer";
 const ELEMENT_QUOTE = "md_quote";
 
+/**
+ * review P2#6 / 方案坑 #3：检测未闭合 ``` 围栏（以行首 ``` 计数，奇数为未闭合）。
+ *
+ * 取舍：流式期间瞬时半截可接受（再 flush 常会闭合；中途补闭合会破坏打字机前缀条件）。
+ * 仅在 finalize 终态全量 PUT 时补闭合，避免卡片残留半截 raw 围栏。
+ */
+export const closeUnclosedCodeFence = (text: string): string => {
+  if (!text) return text;
+  const fenceLines = text.match(/^```/gm);
+  const count = fenceLines?.length ?? 0;
+  if (count % 2 === 1) return `${text}\n\`\`\``;
+  return text;
+};
+
 // ---------- ask_user 元素 id（与 card-action 共用、必须对偶） ----------
 // CardKit element_id 约束（2026-07-19 冒烟实测报错）：字母开头、仅字母数字下划线、
 // **不超过 20 字符**——askId/questionId/optionId 直拼必超长，改用短哈希；
@@ -420,6 +434,9 @@ export const createCardStream = (
     if (!started || finalized || !cardId) return;
     await enqueueFlush();
     const elements: unknown[] = [];
+    // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
+    // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
+    const singleQuestion = askOpts.questions.length === 1;
     for (const q of askOpts.questions) {
       elements.push({
         tag: "markdown",
@@ -427,7 +444,7 @@ export const createCardStream = (
         element_id: askQuestionElementId(askOpts.askId, q.id),
         content: `**${q.question}**`,
       });
-      if (q.options?.length) {
+      if (singleQuestion && q.options?.length) {
         for (const opt of q.options) {
           const value: CardButtonValue = {
             kind: "ask",
@@ -452,6 +469,13 @@ export const createCardStream = (
           });
         }
       }
+    }
+    if (!singleQuestion) {
+      elements.push({
+        tag: "markdown",
+        element_id: "md_ask_hint",
+        content: "请直接回复文字作答",
+      });
     }
     setHeaderStatus("⏸ 等你回答", "orange");
     headerDirty = false; // 本批 batch 不改 header；单独再刷 header
@@ -539,11 +563,12 @@ export const createCardStream = (
 
     try {
       // footer + header 一次全量 PUT
-      answerFlushed = truncateForCard(
-        applyPrefixGuard(answerFlushed, answerDesired),
+      // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
+      answerFlushed = closeUnclosedCodeFence(
+        truncateForCard(applyPrefixGuard(answerFlushed, answerDesired)),
       );
-      processFlushed = truncateForCard(
-        applyPrefixGuard(processFlushed, processDesired),
+      processFlushed = closeUnclosedCodeFence(
+        truncateForCard(applyPrefixGuard(processFlushed, processDesired)),
       );
       await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
       // 关 streaming_mode

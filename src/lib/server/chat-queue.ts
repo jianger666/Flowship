@@ -237,3 +237,75 @@ export const removeQueuedChatMessages = (
   else map.set(taskId, kept);
   return removed;
 };
+
+// ----------------- review P0#1：队列 flush 成功钩子（中性、chat 层不 import 飞书） -----------------
+
+/** flush 成功 send 后回调：带原队列条目（含 extraMeta，如 feishuMessageId） */
+export type QueuedMessageFlushedCb = (
+  taskId: string,
+  msg: QueuedChatMsg,
+) => void | Promise<void>;
+
+interface QueuedFlushHookState {
+  listeners: Set<QueuedMessageFlushedCb>;
+}
+
+const QUEUED_FLUSH_HOOK_KEY = "__feAiFlowChatQueueFlushHookV1__";
+
+const getFlushHookState = (): QueuedFlushHookState => {
+  const g = globalThis as unknown as Record<
+    string,
+    QueuedFlushHookState | undefined
+  >;
+  if (!g[QUEUED_FLUSH_HOOK_KEY]) {
+    g[QUEUED_FLUSH_HOOK_KEY] = { listeners: new Set() };
+  }
+  return g[QUEUED_FLUSH_HOOK_KEY]!;
+};
+
+/**
+ * 注册「队列消息 flush 成功」回调；返回注销函数。
+ * 飞书 recall / reactions 订阅此钩子升级回执、清 queuedMap——chat-runner 不感知订阅方。
+ */
+export const onQueuedMessageFlushed = (
+  cb: QueuedMessageFlushedCb,
+): (() => void) => {
+  const { listeners } = getFlushHookState();
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+};
+
+/**
+ * flush 成功 send 后调用（chat-runner）。异步 listener 的 reject 只 warn、不阻断排空。
+ */
+export const emitQueuedMessageFlushed = (
+  taskId: string,
+  msg: QueuedChatMsg,
+): void => {
+  const { listeners } = getFlushHookState();
+  for (const cb of listeners) {
+    try {
+      const ret = cb(taskId, msg);
+      if (ret && typeof (ret as Promise<void>).then === "function") {
+        void (ret as Promise<void>).catch((err) => {
+          console.warn(
+            `[chat-queue] onQueuedMessageFlushed listener 失败 task=${taskId}:`,
+            err instanceof Error ? err.message : err,
+          );
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `[chat-queue] onQueuedMessageFlushed listener 同步抛错 task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+};
+
+/** 单测清空 flush 钩子 */
+export const __clearQueuedMessageFlushedListenersForTest = (): void => {
+  getFlushHookState().listeners.clear();
+};

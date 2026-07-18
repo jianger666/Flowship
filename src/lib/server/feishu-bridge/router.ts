@@ -42,6 +42,8 @@ const ACTIVE_CHAT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_IMAGES = 6;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 30 * 1024 * 1024;
+/** review P1#2：入向文件体积上限（方案 4.5 降级「超大 → bot 回提示」） */
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const TITLE_PREFIX_LEN = 20;
 
 // ----------------- 命令扩展点（S3c 注册） -----------------
@@ -342,12 +344,35 @@ export const parseInboundContent = async (
     );
     // 下载产物可能无扩展名——尽量保留原文件名
     const dest = path.join(path.dirname(abs), fileName.replace(/[/\\]/g, "_"));
+    let finalPath = abs;
     try {
       await fs.rename(abs, dest);
-      return { text: "", images: [], attachments: [dest] };
+      finalPath = dest;
     } catch {
-      return { text: "", images: [], attachments: [abs] };
+      finalPath = abs;
     }
+    // review P1#2：超过 50MB → 删临时文件 + unsupported（route 侧 notifyOwnerError）
+    try {
+      const st = await fs.stat(finalPath);
+      if (st.size > MAX_FILE_BYTES) {
+        await fs.unlink(finalPath).catch(() => undefined);
+        return {
+          text: "",
+          images: [],
+          attachments: [],
+          unsupported: "文件超过 50MB 上限",
+        };
+      }
+    } catch (err) {
+      await fs.unlink(finalPath).catch(() => undefined);
+      return {
+        text: "",
+        images: [],
+        attachments: [],
+        unsupported: `文件校验失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    return { text: "", images: [], attachments: [finalPath] };
   }
 
   if (type === "post") {
@@ -777,7 +802,13 @@ export const routeInboundMessage = async (
       skills,
       bootArgs,
     },
-    { userReplyMetaExtra: { source: "feishu" } },
+    // review P0#1：feishuMessageId 进 extraMeta → 入队条目携带 → flush 钩子精确匹配
+    {
+      userReplyMetaExtra: {
+        source: "feishu",
+        feishuMessageId: msg.message_id,
+      },
+    },
   );
   const parsedResp = await parseHttpInject(resp);
   if (!parsedResp.ok) {

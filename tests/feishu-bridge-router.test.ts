@@ -1,6 +1,9 @@
 /**
  * 飞书桥接 router：过滤 / content 形态 / 活跃 chat 分支 / pendingAsk / 命令扩展点
  */
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -8,6 +11,7 @@ import {
   __setRouterDepsForTest,
   isActiveChatTask,
   onInjectResult,
+  parseInboundContent,
   parseTextContent,
   registerBridgeCommand,
   routeInboundMessage,
@@ -172,7 +176,10 @@ describe("routeInboundMessage", () => {
       "task-anchored",
       expect.objectContaining({ text: "续" }),
       expect.objectContaining({
-        userReplyMetaExtra: { source: "feishu" },
+        userReplyMetaExtra: {
+          source: "feishu",
+          feishuMessageId: "om_test_1",
+        },
       }),
     );
   });
@@ -280,5 +287,72 @@ describe("routeInboundMessage", () => {
     const r = await routeInboundMessage(baseMsg({ content: "忙吗" }));
     expect(r.kind).toBe("failed");
     expect(sendText).toHaveBeenCalledWith("ou_owner", "排队已满");
+  });
+
+  // review P1#2：入向文件 >50MB 拒注入
+  it("文件超过 50MB → unsupported + 删临时文件 + 不注入", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "feishu-file-"));
+    const bigPath = path.join(tmpDir, "big.bin");
+    await fs.writeFile(bigPath, "");
+    await fs.truncate(bigPath, 50 * 1024 * 1024 + 1);
+
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => bigPath,
+    });
+
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "file",
+        content: JSON.stringify({ file_key: "fk", file_name: "big.bin" }),
+      }),
+    );
+    expect(parsed.unsupported).toBe("文件超过 50MB 上限");
+    expect(parsed.attachments).toEqual([]);
+    await expect(fs.stat(bigPath)).rejects.toThrow();
+
+    // 再走完整 route：下载另一个超限文件 → 失败回执、不注入
+    const big2 = path.join(tmpDir, "big2.bin");
+    await fs.writeFile(big2, "");
+    await fs.truncate(big2, 50 * 1024 * 1024 + 1);
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => big2,
+      getBotAppInfo: async () => ({
+        appId: "cli_x",
+        ownerOpenId: "ou_owner",
+      }),
+      sendTextMessage: sendText,
+      findTaskByMessageId: findByRoot,
+      listTasks,
+      createTask: async (input) =>
+        ({
+          id: "task-new",
+          title: input.title,
+          mode: "chat",
+        }) as never,
+      getPendingAsk: getPending as never,
+      handleChatReplyInject: handleChat as never,
+      injectPendingAskText: injectAsk as never,
+      readSettingsFile: async () => ({
+        status: "ok" as const,
+        settings: {
+          apiKey: "sk-test",
+          defaultModel: { id: "gpt-5" },
+          repos: [{ path: "/tmp/repo" }],
+        },
+      }),
+      listSkillsWithSource: async () => [],
+      prewarmTaskWorkspace: () => undefined,
+    });
+    const r = await routeInboundMessage(
+      baseMsg({
+        message_type: "file",
+        content: JSON.stringify({ file_key: "fk2", file_name: "x.bin" }),
+        message_id: "om_big2",
+      }),
+    );
+    expect(r.kind).toBe("failed");
+    expect(sendText).toHaveBeenCalledWith("ou_owner", "文件超过 50MB 上限");
+    expect(handleChat).not.toHaveBeenCalled();
+    await fs.rm(tmpDir, { recursive: true, force: true });
   });
 });

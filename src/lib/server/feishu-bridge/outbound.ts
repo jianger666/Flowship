@@ -15,9 +15,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { dataRoot } from "@/lib/server/data-root";
-import { getTask } from "@/lib/server/task-fs";
+import { appendEvent, getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
 import {
+  publishTaskStreamEvent,
   subscribeAllTaskStreams,
   type TaskStreamEvent,
 } from "@/lib/server/task-stream";
@@ -801,6 +802,25 @@ const finalizeTurn = async (
 
     if (!opts.ok) {
       await card.appendRetryButton(turn.lastUserMessage || "");
+    }
+
+    // review P1#4 / 坑 #10：连续出向失败要在 app 内可见（每轮最多一条 info）
+    const fails = card.getFailCount();
+    if (fails >= 3) {
+      try {
+        const infoEvent = await appendEvent(taskId, {
+          kind: "info",
+          text: `飞书卡片推送异常（${fails} 次失败），本轮回复可能未同步到飞书`,
+        });
+        if (infoEvent) {
+          publishTaskStreamEvent(taskId, { kind: "event", event: infoEvent });
+        }
+      } catch (logErr) {
+        console.warn(
+          `[feishu-bridge/outbound] 写失败可见 info 失败 task=${taskId}:`,
+          logErr instanceof Error ? logErr.message : logErr,
+        );
+      }
     }
   } catch (err) {
     console.warn(

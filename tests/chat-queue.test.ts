@@ -10,14 +10,17 @@ import {
   clearChatQueue,
   cleanupChatQueueState,
   dequeueChatMessage,
+  emitQueuedMessageFlushed,
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  onQueuedMessageFlushed,
   removeQueuedChatMessages,
   getChatQueueCount,
   getChatQueueGeneration,
   getChatQueueInFlight,
   tryEnqueueMsg,
+  __clearQueuedMessageFlushedListenersForTest,
   type QueuedChatMsg,
 } from "../src/lib/server/chat-queue";
 import {
@@ -224,6 +227,25 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     const second = dequeueChatMessage(id);
     expect(second?.skipPersistEvent).toBeUndefined();
     expect(second?.displayText).toBe("user-2");
+  });
+
+  // review P0#1：flush 钩子中性签名
+  it("onQueuedMessageFlushed / emitQueuedMessageFlushed 带原条目回调", () => {
+    __clearQueuedMessageFlushedListenersForTest();
+    const seen: Array<{ taskId: string; mid?: unknown }> = [];
+    const unsub = onQueuedMessageFlushed((taskId, m) => {
+      seen.push({ taskId, mid: m.extraMeta?.feishuMessageId });
+    });
+    const m: QueuedChatMsg = {
+      ...msg(1),
+      extraMeta: { feishuMessageId: "om_x" },
+    };
+    emitQueuedMessageFlushed("t_flush", m);
+    expect(seen).toEqual([{ taskId: "t_flush", mid: "om_x" }]);
+    unsub();
+    emitQueuedMessageFlushed("t_flush", m);
+    expect(seen).toHaveLength(1);
+    __clearQueuedMessageFlushedListenersForTest();
   });
 
   it("generation：初始 0；enqueue/dequeue 不变；clear 递增", () => {
