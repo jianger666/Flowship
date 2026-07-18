@@ -414,6 +414,30 @@ assistant 侧事件：`assistant_message/delta` markdown、`tool_call/result`、
 
 S1 可先行；S2/S3 相互独立可并行派两个子代理；S4/S4b/S4c 独立；S3b/S3c 在 S2/S3 汇合后做。
 
+## 六b、S5 真联调实测结论（2026-07-19 凌晨，开发时回写）
+
+冒烟环境：worktree standalone 产物 + 独立 dataRoot（/tmp，端口 4123，不碰正式/test 实例）。
+
+1. **出向全链路真跑通**：chat 消息 → agent 流式回复 → 飞书流式卡片（打字机）→
+   finalize，零失败；ask_user 提问 → 卡片追加按钮成功
+2. **emoji 键名实测**（坑 #14 落定）：`Get`（GET 非法）/ `Typing`（无 Hourglass）/
+   `CrossMark`
+3. **CardKit element_id 硬约束**（新坑，已修）：字母开头、≤20 字符——askId 直拼必超，
+   按钮/问题 element_id 改短哈希（card-stream/card-action 单一来源 helper）
+4. **bootstrap 不能挂 instrumentation**（新坑，已修）：instrumentation 的 webpack
+   bundle 不吃 serverExternalPackages，桥接模块图静态引到 @cursor/sdk 会
+   ModuleParseError 毒化全部路由 → 改挂 /api/tasks 与 /api/feishu-bridge/status
+   route 模块加载
+5. **scope 实况**：lark-cli init 建的应用没有大 `im:message`，只有细分
+   `im:message:readonly` / `im:message.p2p_msg:readonly`——实测收消息可用，
+   探测按等价表放行（cardkit:card:write / im:resource / send_as_bot 都已有，
+   **用户零配置**）
+6. **card.action.trigger 需要一次性订阅回调**：应用后台没订阅时 consumer 退出、
+   CLI 给扫码订阅链接——已做成 `unsupported` 态 + 设置页「去订阅」按钮；
+   订阅完 30s 轮询自动恢复（这是按钮回调唯一的一次性人工步骤）
+7. **im.message.recalled_v1 当前 lark-cli（1.0.68）不支持**：consumer 标记
+   optional + unsupported、优雅降级不拖整体状态；CLI 更新收录后自动恢复
+
 ## 七、范围外（决策 #9：不设二期，一期全量；以下是明确不做/后议的）
 
 - **task 模式接入**：用户明确本期只做 chat；将来接入时直接复用本期的卡片流式 +
