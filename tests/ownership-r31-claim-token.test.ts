@@ -1,11 +1,11 @@
 /**
- * Ownership R30：R29-1 单一 action claim 状态机 + R29-5 notifier 结构化返回
+ * Ownership R31 退出矩阵第 1、5 条：R30-1 claim 唯一 token + R30-5 ask/无 action outcome
  *
- * ① submit_work 停在 barrier 返回后（beforeAbortCheck）× submit_mr 抢入
- *    → 任何时刻最多一类副作用；submit_mr 被 claim 拒
- * ② 同 caller 旧 actionId 重试 submit_work → 工具 stale 文案、非 submitted
- * ③ busy（MR 在飞超时）→ 重试文案
- * ④ 正常链：MR 完成后 submit_work claim 成功启 check、check 结束 release
+ * ① 已有 postcheck 重交卷 → 换 token；旧 check dropSelf（旧 claimId）不删新 claim；期间 submit_mr 拒
+ * ② stop clear → 同 action resume → B claim mr → A 迟到 finally release（旧 handle）→ B 完好
+ * ③ 任意时刻同 action 至多一类副作用（随机交错小压测）
+ * ④ ask notifier 在 mcp.askUser.afterSupersede 注入失主 → stale、pending 已取消、非 ASK_SUBMITTED
+ * ⑤ 无 action submit_work 的 mismatch → 非成功文案（非 NO_WAIT_NEEDED）
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -25,7 +25,9 @@ import {
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { Task } from "@/lib/types";
 
-const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r30-claim-"));
+const TMP_ROOT = mkdtempSync(
+  path.join(os.tmpdir(), "fe-ownership-r31-claim-token-"),
+);
 process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
@@ -86,9 +88,10 @@ const { setFailpoint, clearFailpoints } = await import(
   "@/lib/server/failpoints"
 );
 const {
+  CALLER_MISMATCH_ERROR,
   cleanupChatTaskState,
+  getPendingAsk,
   runTaskAction,
-  safeNotifyAwaiting,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
@@ -97,18 +100,22 @@ const { buildSessionBridges } = await import("@/lib/server/task-runner");
 const { getTask, listTasks } = await import("@/lib/server/task-fs");
 const {
   clearActionSideEffects,
+  getActionSideEffectClaimId,
   getActionSideEffectKind,
   hasActionSideEffect,
   releaseSideEffect,
   tryClaimSideEffect,
+  waitAndClaimPostCheck,
 } = await import("@/lib/server/action-side-effects");
-const { mapSubmitWorkNotifyToToolText } = await import(
-  "@/lib/server/chat-mcp"
-);
+type ClaimHandle = import("@/lib/server/action-side-effects").ClaimHandle;
+const {
+  dispatchAskUserForTest,
+  dispatchSubmitWorkForTest,
+} = await import("@/lib/server/chat-mcp");
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
-    `ownership-r30-claim DATA_DIR 未隔离到 TMP：${taskDir("probe")}`,
+    `ownership-r31-claim-token DATA_DIR 未隔离到 TMP：${taskDir("probe")}`,
   );
 }
 
@@ -119,7 +126,7 @@ const PROJECT_PATH = "group/proj";
 let SUBMIT_REPO = "";
 
 beforeAll(() => {
-  SUBMIT_REPO = mkdtempSync(path.join(os.tmpdir(), "ownership-r30-submit-"));
+  SUBMIT_REPO = mkdtempSync(path.join(os.tmpdir(), "ownership-r31-submit-"));
   execFileSync("git", ["init"], { cwd: SUBMIT_REPO });
   execFileSync("git", ["remote", "add", "origin", REMOTE_URL], {
     cwd: SUBMIT_REPO,
@@ -136,7 +143,7 @@ afterAll(() => {
 const makeMeta = (id: string): TaskMetaV06 =>
   ({
     id,
-    title: `ownership-r30-claim ${id}`,
+    title: `ownership-r31-claim-token ${id}`,
     mode: "task",
     repoStatus: "developing",
     runStatus: "idle",
@@ -249,16 +256,16 @@ const submitMrArgs = () =>
     projectPath: PROJECT_PATH,
     sourceBranch: "feature/me/123-x",
     targetBranch: "test",
-    title: "R30 claim MR",
+    title: "R31 claim MR",
     description: "",
-    lastCommitHash: "hash_r30",
+    lastCommitHash: "hash_r31",
   });
 
-describe("ownership R30 claim + notifier outcome", () => {
+describe("ownership R31 claim token + ask outcome", () => {
   const ids: string[] = [];
 
   const alloc = (): string => {
-    const id = `t_r30c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const id = `t_r31c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     ids.push(id);
     return id;
   };
@@ -302,10 +309,10 @@ describe("ownership R30 claim + notifier outcome", () => {
   });
 
   // ─────────────────────────────────────────────────────────────
-  // ① barrier 返回后 × submit_mr 抢入
+  // ① 重交卷换 token + 旧 dropSelf 不误放 + MR 拒
   // ─────────────────────────────────────────────────────────────
   it(
-    "R30-①：submit_work claim 后（beforeAbortCheck）× submit_mr 抢入 → 拒、最多一类副作用",
+    "R31-①：已有 postcheck 重交卷换 token、旧 dropSelf 不删新 claim、期间 submit_mr 拒",
     async () => {
       const id = alloc();
       await seedShipRunning(id);
@@ -313,12 +320,41 @@ describe("ownership R30 claim + notifier outcome", () => {
       const token = String(allocTaskRunInstanceId());
       const { awaitingNotifier } = registerBridgesForTest(task, {
         callerToken: token,
-        gitToken: "pat-r30-1",
+        gitToken: "pat-r31-1",
       });
 
-      // 停在 claim 之后、runActionPostCheck 之前——旧空窗位置
+      // 挂起首轮 check 本体，制造「旧 P 在飞」
+      let releaseCheckP!: () => void;
+      const checkGateP = new Promise<void>((r) => {
+        releaseCheckP = r;
+      });
+      let checkPEntered = false;
+      mockRunActionCheck.mockImplementation(async () => {
+        checkPEntered = true;
+        await checkGateP;
+        return { passed: true, details: "ok-p" };
+      });
+
+      const pWork1 = Promise.resolve(
+        awaitingNotifier(
+          {
+            kind: "awaiting_start",
+            actionId: "act_ship",
+            artifactPath: "actions/1-ship.md",
+          },
+          { callerStillValid: () => true },
+        ),
+      );
+      await waitUntil(() => checkPEntered, 5000);
+      await raceExpectSettled(pWork1, 12_000);
+      expect(await pWork1).toBe("accepted");
+      const claimIdP = getActionSideEffectClaimId(id, "act_ship");
+      expect(claimIdP).toBeTypeOf("number");
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
+
+      // 重交卷：停在换 token 之后、启新 check 之前
       const hang = installHangingFailpoint("mcp.submitWork.beforeAbortCheck");
-      const pWork = Promise.resolve(
+      const pWork2 = Promise.resolve(
         awaitingNotifier(
           {
             kind: "awaiting_start",
@@ -330,200 +366,229 @@ describe("ownership R30 claim + notifier outcome", () => {
       );
       await hang.waitHit();
 
-      // 已持 postcheck claim；runningChecks 尚未挂（check 未启）
+      const claimIdW = getActionSideEffectClaimId(id, "act_ship");
+      expect(claimIdW).toBeTypeOf("number");
+      expect(claimIdW).not.toBe(claimIdP);
       expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
+      // 换 token 同步段已 abort 旧 check 并摘表
       expect(runningChecks.get(id)).toBeUndefined();
 
-      // 并发 submit_mr 必须被 claim 拒
+      // 期间 submit_mr 必须被拒
       const mrResult = await runTaskAction(id, submitMrArgs(), token);
       expect(mrResult).toMatchObject({ ok: false });
       expect(String((mrResult as { error?: string }).error ?? "")).toMatch(
         /正有其它副作用进行|稍后重试/,
       );
       expect(mockCreateMR).not.toHaveBeenCalled();
-      // 仍只有 postcheck，没有 mr
+
+      // 放行旧 check 收尾（若仍有挂起）——旧 claimId release 不得删新 token
+      releaseCheckP();
+      await sleep(80);
+      expect(getActionSideEffectClaimId(id, "act_ship")).toBe(claimIdW);
       expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
 
-      hang.release();
-      await raceExpectSettled(pWork, 12_000);
-      expect(await pWork).toBe("accepted");
-      await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
-      await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
-      await waitUntil(() => !runningChecks.has(id), 5000);
-      expect(hasActionSideEffect(id, "act_ship")).toBe(false);
+      // 再试 MR 仍拒
+      const mrResult2 = await runTaskAction(id, submitMrArgs(), token);
+      expect(mrResult2).toMatchObject({ ok: false });
+      expect(mockCreateMR).not.toHaveBeenCalled();
 
-      // 未遗留错误 awaiting_ack（check 正常落盘是 awaiting_ack——此处断言无外部 MR 孤儿）
-      const disk = await readMetaV06(id);
-      expect(disk?.mrs ?? []).toHaveLength(0);
-      const ship = disk?.actions.find((a) => a.id === "act_ship");
-      expect(ship?.sideEffects?.mrs ?? []).toHaveLength(0);
-    },
-    25_000,
-  );
-
-  // ─────────────────────────────────────────────────────────────
-  // ② 旧 actionId → stale 文案
-  // ─────────────────────────────────────────────────────────────
-  it(
-    "R30-②：同 caller 旧 actionId 重试 submit_work → stale 文案、非 submitted",
-    async () => {
-      const id = alloc();
-      const meta = makeMeta(id);
-      meta.runStatus = "running";
-      meta.currentActionId = "act_b";
-      meta.repoPaths = [SUBMIT_REPO];
-      meta.actions = [
-        {
-          id: "act_a",
-          n: 1,
-          type: "ship",
-          status: "completed",
-          userInstruction: "",
-          artifactPath: "actions/1-ship.md",
-          startedAt: Date.now() - 1000,
-          endedAt: Date.now() - 500,
-        },
-        {
-          id: "act_b",
-          n: 2,
-          type: "ship",
-          status: "running",
-          userInstruction: "",
-          artifactPath: "actions/2-ship.md",
-          startedAt: Date.now(),
-          endedAt: null,
-        },
-      ] as TaskMetaV06["actions"];
-      await writeMeta(meta);
-
-      const task = (await getTask(id))!;
-      const token = String(allocTaskRunInstanceId());
-      registerBridgesForTest(task, {
-        callerToken: token,
-        gitToken: "pat-r30-2",
-      });
-
-      const notifyResult = await safeNotifyAwaiting(id, {
-        actionId: "act_a",
-        artifactPath: "actions/1-ship.md",
-        callerToken: token,
-      });
-      expect(notifyResult.status).toBe("stale");
-      const toolText = mapSubmitWorkNotifyToToolText(notifyResult, "act_a");
-      expect(toolText).toMatch(/已结束|已被后续操作取代/);
-      expect(toolText).not.toMatch(/\[SUBMITTED\]/);
-      expect(runningChecks.get(id)).toBeUndefined();
-      expect(mockRunActionCheck).not.toHaveBeenCalled();
-    },
-    15_000,
-  );
-
-  // ─────────────────────────────────────────────────────────────
-  // ③ busy 超时 → 重试文案
-  // ─────────────────────────────────────────────────────────────
-  it(
-    "R30-③：MR claim 在飞超时 → busy 重试文案、非 submitted",
-    async () => {
-      const id = alloc();
-      await seedShipRunning(id);
-      const task = (await getTask(id))!;
-      const token = String(allocTaskRunInstanceId());
-      registerBridgesForTest(task, {
-        callerToken: token,
-        gitToken: "pat-r30-3",
-      });
-
-      const mrHandle = tryClaimSideEffect(id, "act_ship", "mr");
-      expect(mrHandle).not.toBeNull();
-      const g = globalThis as unknown as {
-        __feAiFlowActionSideEffectWaitMs?: number;
-      };
-      g.__feAiFlowActionSideEffectWaitMs = 80;
-
-      const notifyResult = await safeNotifyAwaiting(id, {
-        actionId: "act_ship",
-        artifactPath: "actions/1-ship.md",
-        callerToken: token,
-      });
-      expect(notifyResult.status).toBe("busy");
-      if (notifyResult.status !== "busy") throw new Error("expected busy");
-      const toolText = mapSubmitWorkNotifyToToolText(notifyResult, "act_ship");
-      expect(toolText).toMatch(/稍后重试 submit_work|交卷未受理/);
-      expect(toolText).not.toMatch(/\[SUBMITTED\]/);
-      expect(runningChecks.get(id)).toBeUndefined();
-      expect(mockRunActionCheck).not.toHaveBeenCalled();
-
-      releaseSideEffect(mrHandle!);
-    },
-    15_000,
-  );
-
-  // ─────────────────────────────────────────────────────────────
-  // ④ 正常链回归
-  // ─────────────────────────────────────────────────────────────
-  it(
-    "R30-④：MR 完成后 submit_work claim 成功启 check、check 结束 release",
-    async () => {
-      const id = alloc();
-      await seedShipRunning(id);
-      const task = (await getTask(id))!;
-      const token = String(allocTaskRunInstanceId());
-      const { awaitingNotifier } = registerBridgesForTest(task, {
-        callerToken: token,
-        gitToken: "pat-r30-4",
-      });
-
-      // 挂起 check 本体，便于观察 postcheck claim 生命周期
-      let releaseCheck!: () => void;
-      const checkGate = new Promise<void>((r) => {
-        releaseCheck = r;
+      // 放行 W 启新 check
+      let releaseCheckW!: () => void;
+      const checkGateW = new Promise<void>((r) => {
+        releaseCheckW = r;
       });
       mockRunActionCheck.mockImplementation(async () => {
-        await checkGate;
-        return { passed: true, details: "ok" };
+        await checkGateW;
+        return { passed: true, details: "ok-w" };
+      });
+      hang.release();
+      await raceExpectSettled(pWork2, 12_000);
+      expect(await pWork2).toBe("accepted");
+      await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
+      expect(getActionSideEffectClaimId(id, "act_ship")).toBe(claimIdW);
+
+      releaseCheckW();
+      await waitUntil(() => !runningChecks.has(id), 5000);
+      expect(hasActionSideEffect(id, "act_ship")).toBe(false);
+    },
+    30_000,
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // ② stop clear → resume → B claim → A 旧 finally 不误放
+  // ─────────────────────────────────────────────────────────────
+  it(
+    "R31-②：clear 后 B 重新 claim mr、A 迟到 finally（旧 handle）删不掉 B",
+    async () => {
+      const id = alloc();
+      await seedShipRunning(id);
+      const task = (await getTask(id))!;
+      const token = String(allocTaskRunInstanceId());
+      registerBridgesForTest(task, {
+        callerToken: token,
+        gitToken: "pat-r31-2",
       });
 
-      const hangCreate = installHangingFailpoint("mcp.submitMr.beforeCreateMR");
-      const pMr = runTaskAction(id, submitMrArgs(), token);
-      await hangCreate.waitHit();
+      // A：真实 submit_mr 路径 claim 后挂在 createMR 前
+      const hangA = installHangingFailpoint("mcp.submitMr.beforeCreateMR");
+      const pA = runTaskAction(id, submitMrArgs(), token);
+      await hangA.waitHit();
       expect(getActionSideEffectKind(id, "act_ship")).toBe("mr");
+      const claimIdA = getActionSideEffectClaimId(id, "act_ship");
+      expect(claimIdA).toBeTypeOf("number");
 
-      const pWork = Promise.resolve(
-        awaitingNotifier(
-          {
-            kind: "awaiting_start",
-            actionId: "act_ship",
-            artifactPath: "actions/1-ship.md",
-          },
-          { callerStillValid: () => true },
-        ),
-      );
-      // 等 submit_work 进入 wait（mr 仍在）
-      await sleep(80);
-      expect(runningChecks.get(id)).toBeUndefined();
-
-      hangCreate.release();
-      await raceExpectSettled(pMr, 12_000);
-      expect(await pMr).toMatchObject({ ok: true });
-
-      await raceExpectSettled(pWork, 12_000);
-      expect(await pWork).toBe("accepted");
-      await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
-      // getTask await 后才进 runActionCheck——等 mock 真正挂上再断言 claim
-      await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
-      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
-
-      releaseCheck();
-      await waitUntil(() => !runningChecks.has(id), 5000);
-      // check 结束 dropSelf → release postcheck
+      // stop clear（终态 owner）——同 action 可 resume 再 claim
+      clearActionSideEffects(id);
       expect(hasActionSideEffect(id, "act_ship")).toBe(false);
 
-      const disk = await readMetaV06(id);
-      expect(disk?.mrs ?? []).toHaveLength(1);
-      const ship = disk?.actions.find((a) => a.id === "act_ship");
-      expect(ship?.status).toBe("awaiting_ack");
-      expect(ship?.sideEffects?.mrs ?? []).toHaveLength(1);
+      // B：resume 后重新 claim（新 token）
+      const handleB = tryClaimSideEffect(id, "act_ship", "mr");
+      expect(handleB).not.toBeNull();
+      const claimIdB = handleB!.claimId;
+      expect(claimIdB).not.toBe(claimIdA);
+
+      // A 继续：createMR 失败也无所谓，关键是 finally release 旧 handle
+      mockCreateMR.mockResolvedValueOnce({
+        ok: false,
+        error: "r31-a-after-clear",
+      });
+      hangA.release();
+      await raceExpectSettled(pA, 12_000);
+
+      // A 的旧 handle finally 不得删 B
+      expect(getActionSideEffectClaimId(id, "act_ship")).toBe(claimIdB);
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("mr");
+
+      // 第三路 postcheck 不得穿透屏障
+      const claimPc = await waitAndClaimPostCheck(id, "act_ship", {
+        stillValid: () => true,
+        deadlineMs: 80,
+        pollMs: 20,
+      });
+      expect(claimPc.result).toBe("timeout");
+      expect(getActionSideEffectClaimId(id, "act_ship")).toBe(claimIdB);
+
+      releaseSideEffect(handleB!);
     },
     25_000,
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // ③ 不变量：同 action 至多一类副作用
+  // ─────────────────────────────────────────────────────────────
+  it(
+    "R31-③：随机交错 claim/release —— 任意时刻同 action 至多一类副作用",
+    async () => {
+      const id = alloc();
+      const actionId = "act_ship";
+      const handles: ClaimHandle[] = [];
+
+      for (let i = 0; i < 80; i++) {
+        const roll = (i * 7 + 3) % 5;
+        if (roll <= 1) {
+          const h = tryClaimSideEffect(id, actionId, "mr");
+          if (h) handles.push(h);
+        } else if (roll === 2) {
+          const r = await waitAndClaimPostCheck(id, actionId, {
+            stillValid: () => true,
+            deadlineMs: 40,
+            pollMs: 5,
+          });
+          if (r.result === "claimed") handles.push(r.handle);
+        } else if (roll === 3 && handles.length > 0) {
+          const old = handles[Math.floor(Math.random() * handles.length)]!;
+          releaseSideEffect(old);
+        } else {
+          clearActionSideEffects(id, actionId);
+        }
+
+        // 不变量：有 claim 时 kind 唯一；旧 handle release 不得造出双 kind
+        const kind = getActionSideEffectKind(id, actionId);
+        if (kind === undefined) {
+          expect(hasActionSideEffect(id, actionId)).toBe(false);
+        } else {
+          expect(["mr", "postcheck"]).toContain(kind);
+          expect(hasActionSideEffect(id, actionId)).toBe(true);
+        }
+      }
+      clearActionSideEffects(id, actionId);
+    },
+    15_000,
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // ④ ask stale → 非 ASK_SUBMITTED
+  // ─────────────────────────────────────────────────────────────
+  it(
+    "R31-④：ask afterSupersede 失主 → stale、pending 取消、工具不返 ASK_SUBMITTED",
+    async () => {
+      const id = alloc();
+      await seedShipRunning(id);
+      const task = (await getTask(id))!;
+      const tokenA = String(allocTaskRunInstanceId());
+      const tokenB = String(allocTaskRunInstanceId());
+      registerBridgesForTest(task, {
+        callerToken: tokenA,
+        gitToken: "pat-r31-4",
+      });
+
+      const hang = installHangingFailpoint("mcp.askUser.afterSupersede");
+      const pAsk = dispatchAskUserForTest({
+        taskId: id,
+        callerToken: tokenA,
+        actionId: "act_ship",
+        questions: [
+          { id: "q1", question: "R31-4 失主提问？", allowText: true },
+        ],
+      });
+      await hang.waitHit();
+      expect(getPendingAsk(id)).not.toBeNull();
+
+      // 注入失主：B 接管 bridge
+      registerBridgesForTest(task, {
+        callerToken: tokenB,
+        gitToken: "pat-r31-4b",
+      });
+
+      hang.release();
+      const askResult = await pAsk;
+      expect(askResult.ok).toBe(false);
+      if (!askResult.ok) {
+        expect(askResult.error).not.toContain("ASK_SUBMITTED");
+        expect(askResult.error).toBe("任务已被接管/通知失败、请重试");
+      }
+      expect(getPendingAsk(id)).toBeNull();
+
+      const disk = await readMetaV06(id);
+      expect(disk?.runStatus).not.toBe("awaiting_user");
+    },
+    15_000,
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // ⑤ 无 action submit_work mismatch
+  // ─────────────────────────────────────────────────────────────
+  it(
+    "R31-⑤：无 action submit_work mismatch → 非 idle 成功文案",
+    async () => {
+      const id = alloc();
+      await seedShipRunning(id);
+      const task = (await getTask(id))!;
+      const tokenA = String(allocTaskRunInstanceId());
+      const tokenB = String(allocTaskRunInstanceId());
+      registerBridgesForTest(task, {
+        callerToken: tokenA,
+        gitToken: "pat-r31-5",
+      });
+
+      const result = await dispatchSubmitWorkForTest({
+        taskId: id,
+        callerToken: tokenB,
+      });
+      expect(result.text).toBe(CALLER_MISMATCH_ERROR);
+      expect(result.text).not.toMatch(/NO_WAIT_NEEDED/);
+      expect(result.text).not.toMatch(/\[SUBMITTED\]/);
+    },
+    10_000,
   );
 });

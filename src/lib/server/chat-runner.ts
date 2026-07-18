@@ -92,6 +92,7 @@ import {
   stringifyMeta,
   writeEventAndPublish,
   writeOwnedEventAndPublish,
+  writeUserEventAndPublishStrict,
   type TaskStreamEvent,
 } from "./task-stream";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
@@ -1159,7 +1160,7 @@ const registerChatNotifier = (
         await supersedePendingAsks(task.id, "被新提问顶替", askLease);
         await failpoint("mcp.askUser.afterSupersede");
         if (!askLease()) {
-          // R26-3：按本次 askId 反登记——不得裸 cancel 误删 B 的新提问
+          // R26-3 / R30-5：按本次 askId 反登记并返 stale——wrapper 透传后工具不得报 ASK_SUBMITTED
           cancelPendingIf(task.id, signal.askId);
           return "stale";
         }
@@ -2280,10 +2281,12 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         return;
       }
 
-      // 本条是否已送达（send 成功后 appendEvent 等再抛错时，清队文案不应把它算成未送达）
+      // 本条是否已送达（send 成功后后续步骤再抛错时，清队文案不应把它算成未送达）
       let delivered = false;
+      // R30-3：user_reply 是否已落盘——send 失败塞回时必须 skipPersistEvent，防重复气泡
+      let replyPersisted = !!msg.skipPersistEvent;
       try {
-        // checkpoint 与 chat-reply 同口径：绑仓才打
+        // checkpoint 与 chat-reply 同口径：绑仓才打（快照须在 agent 开工前）
         let capture = {
           ok: false as boolean,
           repoSnapshots: [] as Awaited<
@@ -2296,6 +2299,58 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           capture = await captureChatCheckpoint(task.repoPaths);
         }
 
+        // R30-3：先落盘再 send——堵死「agent 已收到、磁盘/UI 无记录」出口。
+        // checkpoint 绑 user_reply 事件 id：先落盘再 persistCheckpoint 反而更正确。
+        // 入队方已落过 user_reply（skipPersistEvent）→ 跳过重复气泡 / checkpoint。
+        if (!msg.skipPersistEvent) {
+          const meta: Record<string, unknown> = {};
+          if (msg.savedImages && msg.savedImages.length > 0) {
+            meta.images = msg.savedImages;
+          }
+          if (msg.attachmentMetas && msg.attachmentMetas.length > 0) {
+            meta.attachments = msg.attachmentMetas;
+          }
+          if (capture.ok) meta.checkpointed = true;
+          let replyEvent;
+          try {
+            replyEvent = await writeUserEventAndPublishStrict(taskId, {
+              kind: "user_reply",
+              text: msg.displayText,
+              meta: Object.keys(meta).length > 0 ? meta : undefined,
+            });
+          } catch (persistErr) {
+            // strict 抛错（EIO 等）→ 不 send；best-effort 警告后丢弃本条（不塞回——
+            // 塞回会经 finally 链式 flush 对持久 EIO 忙等；对齐 route 侧「失败即停」口径）
+            console.error(
+              `[chat-runner] flushChatQueue R30-3 落盘失败 task=${taskId}:`,
+              persistErr,
+            );
+            const preview = msg.displayText.slice(0, 50);
+            try {
+              // eslint-disable-next-line no-restricted-syntax -- R30-3：落盘失败警告（best-effort 吞错）
+              await writeEventAndPublish(taskId, {
+                kind: "info",
+                text: `消息保存失败、未发送：${preview}`,
+              });
+            } catch (warnErr) {
+              console.warn(
+                `[chat-runner] flushChatQueue task=${taskId} 落盘失败警告写失败:`,
+                warnErr,
+              );
+            }
+            return;
+          }
+          if (!replyEvent) {
+            // ENOENT：任务目录已删——清队（没法再送达）
+            clearChatQueue(taskId);
+            return;
+          }
+          replyPersisted = true;
+          if (capture.ok) {
+            await persistCheckpointForReply(taskId, replyEvent.id, capture);
+          }
+        }
+
         const sent = await sendChatMessage(
           task,
           msg.agentText || msg.displayText,
@@ -2303,38 +2358,18 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           msg.attachmentAbsPaths,
         );
         if (sent !== "sent") {
-          requeueIfSameGen(msg, `send 未送达（${sent}）塞回`);
+          // 已落盘则塞回时带 skipPersistEvent，避免二次气泡
+          requeueIfSameGen(
+            replyPersisted ? { ...msg, skipPersistEvent: true } : msg,
+            `send 未送达（${sent}）塞回`,
+          );
           return;
         }
         delivered = true;
-
-        // 入队方已落过 user_reply（并发起会话被吞改入队等）→ 跳过重复气泡 / checkpoint
-        if (msg.skipPersistEvent) return;
-
-        const meta: Record<string, unknown> = {};
-        if (msg.savedImages && msg.savedImages.length > 0) {
-          meta.images = msg.savedImages;
-        }
-        if (msg.attachmentMetas && msg.attachmentMetas.length > 0) {
-          meta.attachments = msg.attachmentMetas;
-        }
-        if (capture.ok) meta.checkpointed = true;
-        // R29-P2：用户气泡改 writeEventAndPublish——publish 走 append 链内 onCommitted、
-        // 磁盘序 = SSE 序（原 append 返回后再 publish、并发系统事件可反序）。
-        // 用户操作事件、无条件语义不带 lease。
-        // eslint-disable-next-line no-restricted-syntax -- 用户消息气泡、无条件写
-        const replyEvent = await writeEventAndPublish(taskId, {
-          kind: "user_reply",
-          text: msg.displayText,
-          meta: Object.keys(meta).length > 0 ? meta : undefined,
-        });
-        if (replyEvent && capture.ok) {
-          await persistCheckpointForReply(taskId, replyEvent.id, capture);
-        }
       } catch (err) {
         console.error(`[chat-runner] flushChatQueue task=${taskId} failed:`, err);
         // 复审（11 轮）：清队不再静默——对齐 F2/N3 口径，先同步清队再 best-effort 写 info。
-        // 本条若已 send 成功（失败发生在落 user_reply 等后置步骤），不计入「未送达」条数。
+        // 本条若已 send 成功（失败发生在后置步骤），不计入「未送达」条数。
         const n = getChatQueueCount(taskId) + (delivered ? 0 : 1);
         clearChatQueue(taskId);
         if (n > 0) {

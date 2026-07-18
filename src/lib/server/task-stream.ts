@@ -286,7 +286,7 @@ export const clearTaskStarting = (taskId: string): void => {
   startingTasksMap().delete(taskId);
 };
 
-// R28-1：resource job 计数实现在 resource-jobs.ts（避环）；此处 re-export 供调用方统一从 stream 取
+// R28-1 / R30-2：resource job + quarantine 实现在 resource-jobs.ts（避环）；此处 re-export
 export {
   beginResourceJob,
   endResourceJob,
@@ -294,8 +294,17 @@ export {
   clearResourceJobs,
   registerJobAbort,
   revokeResourceJobs,
+  joinResourceJobs,
+  markWorkspaceQuarantined,
+  isWorkspaceQuarantined,
+  clearWorkspaceQuarantine,
+  setResourceJoinTimeoutMsForTest,
+  DEFAULT_RESOURCE_JOIN_MS,
 } from "./resource-jobs";
-export type { ResourceJobHandle } from "./resource-jobs";
+export type {
+  ResourceJobHandle,
+  JoinResourceJobsResult,
+} from "./resource-jobs";
 
 /**
  * 准入快照（路由入场同步取；语义 = 旧 getTaskOpGeneration）。

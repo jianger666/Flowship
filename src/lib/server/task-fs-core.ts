@@ -595,38 +595,60 @@ const getEventSeqCounters = (): Map<string, number> => {
 };
 
 /**
- * R29-6：从 events.jsonl 尾部恢复 last seq（读最后 ~64KB、倒扫首条带 seq 的事件）。
+ * R30-4：从 events.jsonl 恢复 durable max seq。
+ *
+ * 旧实现只读固定 64KB 并返回「尾部遇到的第一个 seq」——末条 >64KB 时首行截断
+ * 找不到完整行 → 返 0 重号；历史重号日志尾部 [98,99,100,1] 会恢复成 1 继续冲突。
+ *
+ * 新协议：分块向后扩展读取（64KB 起翻倍、上限 4MB）+ 对所见完整行求 max(seq)。
  * 文件不存在 / 无 seq → 0。仅在 per-task append 链内调用（天然串行）。
  */
+const SEQ_RECOVER_CHUNK_MIN = 64 * 1024;
+const SEQ_RECOVER_CHUNK_MAX = 4 * 1024 * 1024;
+
 const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
   const p = path.join(taskDir(taskId), EVENTS_FILE);
   try {
     const st = await fs.stat(p);
     if (st.size <= 0) return 0;
-    const tailBytes = 64 * 1024;
-    const start = Math.max(0, st.size - tailBytes);
     const fh = await fs.open(p, "r");
     try {
-      const len = st.size - start;
-      const buf = Buffer.alloc(len);
-      await fh.read(buf, 0, len, start);
-      const text = buf.toString("utf-8");
-      const lines = text.split("\n");
-      // 非文件头起读时首行可能被截断，跳过
-      const startIdx = start > 0 ? 1 : 0;
-      for (let i = lines.length - 1; i >= startIdx; i--) {
-        const line = lines[i]?.trim();
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as { seq?: unknown };
-          if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
-            return parsed.seq;
+      // R30-4：64KB 起翻倍扩块；首行截断（start>0）或尚未见到任何 seq 时继续向前读
+      // 上限 4MB——对窗口内所有完整行求 max(seq)，不是「尾部第一个」
+      let chunk = Math.min(SEQ_RECOVER_CHUNK_MIN, st.size);
+      let maxSeq = 0;
+      let foundAny = false;
+      for (;;) {
+        const start = Math.max(0, st.size - chunk);
+        const len = st.size - start;
+        const buf = Buffer.alloc(len);
+        await fh.read(buf, 0, len, start);
+        const text = buf.toString("utf-8");
+        const lines = text.split("\n");
+        // 非文件头起读时首行可能被截断，跳过
+        const startIdx = start > 0 ? 1 : 0;
+        // 每轮重算本窗口 max（扩块后覆盖更大历史）
+        maxSeq = 0;
+        foundAny = false;
+        for (let i = startIdx; i < lines.length; i++) {
+          const line = lines[i]?.trim();
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line) as { seq?: unknown };
+            if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
+              foundAny = true;
+              if (parsed.seq > maxSeq) maxSeq = parsed.seq;
+            }
+          } catch {
+            // 坏行跳过
           }
-        } catch {
-          // 坏行跳过
         }
+        // 已到文件头 / 触顶 → 收工；否则首行仍可能截断（含末条 >64KB）→ 翻倍扩块
+        if (start === 0 || chunk >= SEQ_RECOVER_CHUNK_MAX || chunk >= st.size) {
+          return foundAny ? maxSeq : 0;
+        }
+        chunk = Math.min(chunk * 2, SEQ_RECOVER_CHUNK_MAX, st.size);
       }
-      return 0;
     } finally {
       await fh.close();
     }

@@ -200,7 +200,7 @@ const ActionsPanel = () => {
         return;
       }
 
-      await sendChatReply(
+      const convertResult = await sendChatReply(
         task.id,
         text,
         undefined,
@@ -208,6 +208,12 @@ const ActionsPanel = () => {
         { apiKey: s.apiKey, model: s.defaultModel },
         [{ name: creator.name, absPath: creator.absPath }],
       );
+      // R30-3：send 后落盘失败——不可忽略提示
+      if (convertResult.persistWarning) {
+        toast.error(
+          `消息已送达但记录保存失败：${convertResult.persistWarning}`,
+        );
+      }
       toast.success("已发起转建、AI 正在处理");
       router.push(`/tasks/${task.id}`);
     } catch (err) {

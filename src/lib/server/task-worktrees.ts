@@ -26,6 +26,7 @@ import { failpoint } from "./failpoints";
 import {
   beginResourceJob,
   endResourceJob,
+  isWorkspaceQuarantined,
   registerJobAbort,
   type ResourceJobHandle,
 } from "./resource-jobs";
@@ -449,7 +450,14 @@ export const ensureTaskWorktrees = async (
   task: Task,
   lease: () => boolean,
 ): Promise<EnsureWorktreesResult> => {
+  // R30-2：join 超时后的 quarantine 挡住后继——旧慢清理未退前不得复用同路径
+  if (isWorkspaceQuarantined(task.id)) {
+    throw new WorktreeLeaseLostError(
+      "R30-2：workspace 仍在 quarantine（旧资源事务未退）、拒绝复用同路径",
+    );
+  }
   // R28-1 / R29-2：登记 resource job（带 handle）——finalize/stop/DELETE 可 revoke 子进程后 join
+  // R30-2：job 覆盖完整资源事务（含 abort 后半截 rm / 失主补偿），直到清理完才 end
   const job = beginResourceJob(task.id);
   try {
     // R28-1：lease 失效即抛（每个不可逆副作用前复用；不再可选）
@@ -486,12 +494,14 @@ export const ensureTaskWorktrees = async (
 };
 
 /**
- * R28-1 / R29-A：失主补偿——尽力移除本轮新建的 worktree（含 git 注册）。
+ * R28-1 / R29-A / R30-2：失主补偿——尽力移除本轮新建的 worktree（含 git 注册）。
  * copy/clone 段失主也走这里，避免终态任务留下物理工作区。
  *
- * R29-A 取舍：补偿前重新 snapshot + 查 runningTasks/agentSessions——
- * 有后继 claim / 活跃工作区 → **不删**（宁可留孤儿 worktree，幂等 ensure 会复用/重建；
- * 留给当前 owner / finalize 收），绝不能拆后继的活工作区。
+ * R30-2：
+ * - 单独登记 ResourceJob（**不接 abort**——`git worktree remove` 最长 60s 不可中止；
+ *   终态 owner join 等本 job 归零；超时走 quarantine 而非开闸）。
+ * - 逐仓 remove / fs.rm **紧前**现查 successor（snapshot + runningTasks/agentSessions），
+ *   不再只靠入场一次性快照——避免卡在 remove 期间 B 入场后被误删。
  */
 const compensateRemoveCreatedWorktrees = async (
   task: Task,
@@ -499,46 +509,67 @@ const compensateRemoveCreatedWorktrees = async (
   createdRepos: string[],
   entryHandle: { opId: number | null; gen: number; claimSeq: number },
 ): Promise<void> => {
-  // R29-A：动态 import 避静态环；比对后继身份后再决定是否 remove
-  const { snapshotTaskOp, runningTasks, agentSessions } = await import(
-    "./task-stream"
-  );
-  const fresh = snapshotTaskOp(task.id);
-  const hasSuccessorClaim =
-    fresh.claimSeq !== entryHandle.claimSeq ||
-    (fresh.opId != null && fresh.opId !== entryHandle.opId);
-  const hasActiveSuccessor =
-    runningTasks.has(task.id) || agentSessions.has(task.id);
-  if (hasSuccessorClaim || hasActiveSuccessor) {
-    console.warn(
-      `[task-worktrees] R29-A：失主补偿跳过——后继已 claim/活跃（task=${task.id} claimSeq ${entryHandle.claimSeq}→${fresh.claimSeq} opId ${entryHandle.opId}→${fresh.opId} running=${runningTasks.has(task.id)} session=${agentSessions.has(task.id)}）、留孤儿 worktree 给当前 owner/finalize`,
+  // R30-2：补偿本身是资源事务——登记 job 让 stop/finalize/DELETE join 看得见
+  const compensateJob = beginResourceJob(task.id);
+  try {
+    // R29-A / R30-2：动态 import 避静态环
+    const { snapshotTaskOp, runningTasks, agentSessions } = await import(
+      "./task-stream"
     );
-    createdRepos.length = 0;
-    return;
-  }
 
-  for (const repoPath of [...createdRepos]) {
-    const idx = task.repoPaths.indexOf(repoPath);
-    if (idx < 0) continue;
-    const workDir = workPaths[idx];
-    try {
-      const removed = await runGit(
-        repoPath,
-        ["worktree", "remove", "--force", workDir],
-        60_000,
-      );
-      if (!removed.ok) {
-        await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
-        await runGit(repoPath, ["worktree", "prune"]);
+    /** 现查：后继已 claim / 活跃 → 本仓不得删 */
+    const hasSuccessorNow = (): boolean => {
+      const fresh = snapshotTaskOp(task.id);
+      const hasSuccessorClaim =
+        fresh.claimSeq !== entryHandle.claimSeq ||
+        (fresh.opId != null && fresh.opId !== entryHandle.opId);
+      const hasActiveSuccessor =
+        runningTasks.has(task.id) || agentSessions.has(task.id);
+      return hasSuccessorClaim || hasActiveSuccessor;
+    };
+
+    for (const repoPath of [...createdRepos]) {
+      const idx = task.repoPaths.indexOf(repoPath);
+      if (idx < 0) continue;
+      const workDir = workPaths[idx];
+      try {
+        // R30-2：测试可在此注入后继 B；紧接着现查——过了才 remove
+        await failpoint("compensate.beforeRemove");
+        if (hasSuccessorNow()) {
+          const fresh = snapshotTaskOp(task.id);
+          console.warn(
+            `[task-worktrees] R30-2：失主补偿跳过仓 ${repoPath}——后继已 claim/活跃（task=${task.id} claimSeq ${entryHandle.claimSeq}→${fresh.claimSeq} opId ${entryHandle.opId}→${fresh.opId} running=${runningTasks.has(task.id)} session=${agentSessions.has(task.id)}）、留孤儿给当前 owner/finalize`,
+          );
+          continue;
+        }
+        // 故意不传 ResourceJob / 不接 abort——remove 不可中止；靠 compensateJob + quarantine 兜
+        const removed = await runGit(
+          repoPath,
+          ["worktree", "remove", "--force", workDir],
+          60_000,
+        );
+        if (!removed.ok) {
+          // R30-2：fs.rm 同样紧前现查——remove 失败窗口内 B 可能已入场
+          if (hasSuccessorNow()) {
+            console.warn(
+              `[task-worktrees] R30-2：worktree remove 失败后跳过 fs.rm——后继已入场 workDir=${workDir}`,
+            );
+            continue;
+          }
+          await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+          await runGit(repoPath, ["worktree", "prune"]);
+        }
+      } catch (err) {
+        console.warn(
+          `[task-worktrees] R28-1 失主补偿移除 worktree 失败（尽力而为）：${workDir}`,
+          err,
+        );
       }
-    } catch (err) {
-      console.warn(
-        `[task-worktrees] R28-1 失主补偿移除 worktree 失败（尽力而为）：${workDir}`,
-        err,
-      );
     }
+    createdRepos.length = 0;
+  } finally {
+    endResourceJob(compensateJob);
   }
-  createdRepos.length = 0;
 };
 
 /** R28-1：ensure 主体（lease 检查点贯穿全生命周期） */
@@ -665,11 +696,14 @@ const ensureTaskWorktreesInner = async (ctx: {
     // 矩阵降级用例在此挂起（空仓尚无 base/branch、若放 add 前会被「找不到线上分支」提前抛出）。
     // 真 add / retry 前另有 assertLease + 同名 failpoint。
     await failpoint("ensure.beforeWorktreeAdd");
-    // 目录删除/清理前验 lease——finalize 已接管则不动盘
-    assertLease();
-    // 半截目录（上次创建失败残留 / 非法内容）→ 清掉重来
+    // R30-2：半截目录清掉重来——exists 可 await；删除动作紧前同步重验 lease，
+    // 无 await 夹缝（递归 rm 本身不可中止、靠 ResourceJob + quarantine 兜）。
     if (await pathExists(workDir)) {
+      assertLease();
       await fs.rm(workDir, { recursive: true, force: true });
+    } else {
+      // 无旧目录也要验——与原先「进新建路径必验」对齐（finalize 已接管则让位）
+      assertLease();
     }
     // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）
     await runGit(repoPath, ["worktree", "prune"], 60_000, job);
@@ -907,7 +941,8 @@ const cloneDepDirs = async (
       }
       cloned.push(dir);
     } catch (err) {
-      // 半截残留必须清掉——否则 agent 看到目录存在就不装了、比没有更坑
+      // R30-2：abort 后半截清理仍在同一 ResourceJob 内（外层 ensure finally 才 end）——
+      // 此处先清残留再清 abort 登记；慢 rm 期间 join 仍看见 job，超时走 quarantine。
       await fs.rm(dst, { recursive: true, force: true }).catch(() => {});
       // R28-1 / R29-2：lease 让位 / revoke abort 必须冒泡（不可当 clone 失败静默吞掉）
       if (err instanceof WorktreeLeaseLostError) throw err;

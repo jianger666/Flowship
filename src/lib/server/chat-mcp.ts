@@ -189,8 +189,28 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
 
       // 不带 action_id（chat 模式旧姿势 / 老 prompt 惯性「待命态」）→ 不需要任何等待、
       // 通知 runner 切 awaiting_user（有 notifier 才生效）、指示 agent 直接结束回复
+      // R30-5：消费 outcome——mismatch/stale/error/busy 不得再报 idle 成功文案；
+      // no_notifier 保留成功（chat / 无桥待命是常态，agent 只需结束 turn）
       if (!action_id) {
-        await safeNotifyAwaiting(task_id, { callerToken });
+        const idleNotify = await safeNotifyAwaiting(task_id, { callerToken });
+        if (idleNotify.status === "mismatch") {
+          return callerMismatchContent();
+        }
+        if (
+          idleNotify.status === "stale" ||
+          idleNotify.status === "busy" ||
+          idleNotify.status === "error"
+        ) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: mapSubmitWorkNotifyToToolText(idleNotify, "<idle>"),
+              },
+            ],
+          };
+        }
+        // accepted | no_notifier | delivered
         return {
           content: [{ type: "text" as const, text: idleWaitText() }],
         };
@@ -325,16 +345,20 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       );
 
       // 通知 runner 写 ask_user_request 事件 + 切 runStatus = awaiting_user
-      // R29-2：notify 早退（mismatch / 无 notifier）→ 反登记、返错误，防孤儿 pending + 假 ASK_SUBMITTED
-      const delivered = await safeNotifyAskUserRequest(task_id, {
+      // R29-2 / R30-5：只有 accepted 才报 ASK_SUBMITTED；stale/busy/mismatch 反登记 + 错误文案
+      const askNotify = await safeNotifyAskUserRequest(task_id, {
         askId,
         token: ask.token,
         questions: normalized,
         actionId: action_id,
         callerToken,
       });
-      if (!delivered) {
+      if (askNotify.status !== "accepted") {
+        // notifier stale 内部已 cancelPendingIf；此处再调幂等，覆盖 mismatch/no_notifier/error
         cancelPendingIf(task_id, askId);
+        if (askNotify.status === "mismatch") {
+          return callerMismatchContent();
+        }
         return {
           content: [{ type: "text" as const, text: ASK_NOTIFY_FAILED_TEXT }],
         };
@@ -931,6 +955,50 @@ export const getChatMcpUrl = (callerToken?: string): string => {
 };
 
 /**
+ * R30-5 测试用：走真实 submit_work 分派（含无 action_id 待命分支的 outcome 消费）。
+ * 与生产工具 handler 同口径；不必起 HTTP MCP server。
+ */
+export const dispatchSubmitWorkForTest = async (args: {
+  taskId: string;
+  callerToken: string | undefined;
+  actionId?: string;
+  artifactPath?: string;
+}): Promise<{ text: string }> => {
+  if (!matchExpectedCallerToken(args.taskId, args.callerToken)) {
+    return { text: CALLER_MISMATCH_ERROR };
+  }
+  if (!args.actionId) {
+    const idleNotify = await safeNotifyAwaiting(args.taskId, {
+      callerToken: args.callerToken,
+    });
+    if (idleNotify.status === "mismatch") {
+      return { text: CALLER_MISMATCH_ERROR };
+    }
+    if (
+      idleNotify.status === "stale" ||
+      idleNotify.status === "busy" ||
+      idleNotify.status === "error"
+    ) {
+      return {
+        text: mapSubmitWorkNotifyToToolText(idleNotify, "<idle>"),
+      };
+    }
+    return { text: idleWaitText() };
+  }
+  const notifyResult = await safeNotifyAwaiting(args.taskId, {
+    actionId: args.actionId,
+    artifactPath: args.artifactPath,
+    callerToken: args.callerToken,
+  });
+  if (notifyResult.status === "mismatch") {
+    return { text: CALLER_MISMATCH_ERROR };
+  }
+  return {
+    text: mapSubmitWorkNotifyToToolText(notifyResult, args.actionId),
+  };
+};
+
+/**
  * R24-6 测试用：走真实 ask_user 分派路径（核对 caller → 才 registerPendingAsk）。
  * 不必起 HTTP MCP server；生产路径是工具 handler 内联同款逻辑。
  */
@@ -949,16 +1017,19 @@ export const dispatchAskUserForTest = async (args: {
     questions: args.questions,
     actionId: args.actionId,
   });
-  // R29-2：与生产 ask_user 工具同口径——未送达则反登记
-  const delivered = await safeNotifyAskUserRequest(args.taskId, {
+  // R29-2 / R30-5：与生产 ask_user 工具同口径——只有 accepted 才成功
+  const askNotify = await safeNotifyAskUserRequest(args.taskId, {
     askId,
     token: ask.token,
     questions: args.questions,
     actionId: args.actionId,
     callerToken: args.callerToken,
   });
-  if (!delivered) {
+  if (askNotify.status !== "accepted") {
     cancelPendingIf(args.taskId, askId);
+    if (askNotify.status === "mismatch") {
+      return { ok: false, error: CALLER_MISMATCH_ERROR };
+    }
     return { ok: false, error: ASK_NOTIFY_FAILED_TEXT };
   }
   return { ok: true, askId };

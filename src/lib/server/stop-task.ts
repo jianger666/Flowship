@@ -24,8 +24,8 @@ import {
   supersedePendingAsks,
 } from "./task-runner";
 import {
-  hasResourceJobs,
   isTaskStarting,
+  joinResourceJobs,
   pendingStopRequests,
   publishTaskStreamEvent,
   revokeResourceJobs,
@@ -109,18 +109,15 @@ const runStopTaskAgent = async (
       invalidateCallerToken(id);
     }
 
-    // R29-2：先 revoke（中止 checkout / cp 等已挂 abort 的子进程），再 join 等计数归零。
-    // revoke 后子进程秒退、join 大概率 1-2s 内收敛；30s 上限保留为「abort 都没退干净」
-    // 的极端兜底——超时仍 warn 继续（abort 已发出、残余风险大幅缩小）。
+    // R29-2 / R30-2：先 revoke（中止已挂 abort 的子进程），再 join。
+    // R30-2：超时 **不再开闸**——joinResourceJobs 置 quarantine（fail-closed）；
+    // HTTP 照常返回（用户不无限等），但后继 ensure 被拒直到旧事务 job 归零。
     {
       revokeResourceJobs(id);
-      const deadline = Date.now() + 30_000;
-      while (hasResourceJobs(id) && Date.now() < deadline) {
-        await new Promise<void>((r) => setTimeout(r, 50));
-      }
-      if (hasResourceJobs(id)) {
-        console.warn(
-          `[stop-task] R29-2：task=${id} revoke 后等待 resourceJobs 归零超时（~30s 极端兜底）、继续收尾`,
+      const join = await joinResourceJobs(id);
+      if (join === "timeout") {
+        console.error(
+          `[stop-task] R30-2：task=${id} resourceJobs join 超时、已 quarantine；继续 HTTP 收尾但不放行资源复用`,
         );
       }
     }

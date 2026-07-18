@@ -377,10 +377,16 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }, SUBMIT_UNLOCK_MS),
     );
     try {
-      await submitAskReply(task.id, askId, answers, {
+      const askResult = await submitAskReply(task.id, askId, answers, {
         imagesByQuestion,
         signal: ac.signal,
       });
+      // R30-3：send 后落盘失败——不可忽略提示
+      if (askResult.persistWarning) {
+        toast.error(
+          `消息已送达但记录保存失败：${askResult.persistWarning}`,
+        );
+      }
       // 提交成功：等 SSE 推 ask_user_reply、findPendingAskEvent 变 null、
       // event-stream 自动切回放卡——这里不主动收起、避免 race。
       // SSE 重连间隙另给 15s：卡片可能仍显示「提交中…」
@@ -418,10 +424,16 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }, SUBMIT_UNLOCK_MS),
     );
     try {
-      await submitAskReply(task.id, askId, [], {
+      const deferResult = await submitAskReply(task.id, askId, [], {
         deferred: true,
         signal: ac.signal,
       });
+      // R30-3：send 后落盘失败——不可忽略提示
+      if (deferResult.persistWarning) {
+        toast.error(
+          `消息已送达但记录保存失败：${deferResult.persistWarning}`,
+        );
+      }
       clearTrackedTimer(unlockTimer);
       trackTimer(window.setTimeout(() => setSubmitting(false), 15_000));
     } catch (err) {

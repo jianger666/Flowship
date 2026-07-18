@@ -27,6 +27,8 @@ import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import {
   hasResourceJobs,
   isTaskStarting,
+  joinResourceJobs,
+  markWorkspaceQuarantined,
   pendingStopRequests,
   revokeResourceJobs,
   revokeTaskOps,
@@ -291,21 +293,32 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
     await waitForTaskToStop(id, 8000);
     await waitForChatToStop(id, 8000);
-    // U1 / R29-2：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
-    // 先 revokeResourceJobs 中止 checkout/cp，再 join starting/resourceJobs。
-    // 30s 上限 = abort 后仍未退干净的极端兜底（abort 已发出、残余风险缩小）。
+    // U1 / R29-2 / R30-2：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
+    // 先 revokeResourceJobs，再 join starting + resourceJobs。
+    // R30-2：resourceJobs 超时 → quarantine，目录删除延迟到 job 归零（不再开闸硬删）。
+    let resourceJoinTimedOut = false;
     if (isTaskStarting(id) || hasResourceJobs(id)) {
       revokeResourceJobs(id);
-      const deadline =
-        Date.now() + Math.max(DELETE_STARTING_WAIT_MS, DELETE_RESOURCE_WAIT_MS);
-      while (isTaskStarting(id) || hasResourceJobs(id)) {
-        if (Date.now() >= deadline) {
-          console.warn(
-            `[DELETE /api/tasks/[id]] R29-2：revoke 后 starting/resourceJobs 等待超时 task=${id}、继续删（极端兜底）`,
-          );
-          break;
-        }
+      const startingDeadline = Date.now() + DELETE_STARTING_WAIT_MS;
+      while (isTaskStarting(id) && Date.now() < startingDeadline) {
         await new Promise<void>((r) => setTimeout(r, DELETE_STARTING_POLL_MS));
+      }
+      if (isTaskStarting(id)) {
+        console.warn(
+          `[DELETE /api/tasks/[id]] starting 等待超时 task=${id}、继续（resource 另判）`,
+        );
+      }
+      if (hasResourceJobs(id)) {
+        const join = await joinResourceJobs(id, {
+          timeoutMs: DELETE_RESOURCE_WAIT_MS,
+          pollMs: DELETE_STARTING_POLL_MS,
+        });
+        resourceJoinTimedOut = join === "timeout";
+        if (resourceJoinTimedOut) {
+          console.error(
+            `[DELETE /api/tasks/[id]] R30-2：resourceJobs join 超时 task=${id}、已 quarantine；目录删除延迟到 job 归零`,
+          );
+        }
       }
     }
     // U1：无飞行消费者时才清 pending——飞行中的启动链需要标记自裁
@@ -316,6 +329,45 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 防长跑进程 Map 积键（须在 waitForChatToStop 之后、活跃 drain 已退出）
     cleanupChatQueueState(id);
     clearChatContextUsage(id);
+
+    // R30-2：quarantine 场景——HTTP 先返回，deleting lifecycle 保持到后台删完；
+    // 后台轮询 job 归零后再 cleanupCheckpointRefs + deleteTask + clearChatGate。
+    if (resourceJoinTimedOut || hasResourceJobs(id)) {
+      if (!resourceJoinTimedOut) {
+        // 防御：starting 超时窗口外 resource 又冒出来
+        markWorkspaceQuarantined(id);
+      }
+      void (async () => {
+        try {
+          while (hasResourceJobs(id)) {
+            await new Promise<void>((r) => setTimeout(r, 200));
+          }
+          await cleanupCheckpointRefsForTask(id).catch((err) => {
+            console.warn(
+              `[DELETE /api/tasks/[id]] 延迟 cleanupCheckpointRefs 失败 task=${id}:`,
+              err instanceof Error ? err.message : err,
+            );
+          });
+          const ok = await deleteTask(id);
+          if (!ok) {
+            endChatLifecycle(id, "deleting");
+            console.error(
+              `[DELETE /api/tasks/[id]] R30-2：延迟 deleteTask not_found task=${id}`,
+            );
+            return;
+          }
+          clearChatGate(id);
+        } catch (err) {
+          endChatLifecycle(id, "deleting");
+          console.error(
+            `[DELETE /api/tasks/[id]] R30-2：延迟删除异常 task=${id}`,
+            err,
+          );
+        }
+      })();
+      return NextResponse.json({ ok: true });
+    }
+
     // U2：deleting gate 必须持有到 deleteTask 成功之后——此前 clear 会开闸让
     // chat-reply 在 refs 清理 / 物理删除窗口内重新预约并起新 Agent。
     // 删任务数据目录前清各仓 checkpoint refs；否则被删任务的 tree/blob 会永久留在用户仓

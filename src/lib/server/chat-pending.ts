@@ -422,8 +422,8 @@ export const safeNotifyAwaiting = async (
 
 /**
  * 通知 runner 落 ask_user_request。
- * @returns R29-2：true=已交给 notifier；false=caller mismatch / 无 notifier / notifier 抛错
- *   （工具层据此 cancelPendingIf 反登记，避免孤儿 pending + 假 ASK_SUBMITTED）
+ * R30-5：透传 notifier 的 accepted | stale | busy（不再 await 后无条件 true）。
+ * mismatch / no_notifier / error 与 safeNotifyAwaiting 同形——工具层只有 accepted 才报 ASK_SUBMITTED。
  */
 export const safeNotifyAskUserRequest = async (
   taskId: string,
@@ -434,25 +434,25 @@ export const safeNotifyAskUserRequest = async (
     actionId?: string;
     callerToken?: string;
   },
-): Promise<boolean> => {
+): Promise<NotifyAwaitingResult> => {
   // R24-6：ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
   if (!matchExpectedCallerToken(taskId, args.callerToken)) {
     console.warn(
       `[chat-mcp] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
     );
-    return false;
+    return { status: "mismatch" };
   }
   const notifier = awaitingNotifiers.get(taskId);
   if (!notifier) {
     console.warn(
       `[chat-mcp] safeNotifyAskUserRequest: 没找到 task=${taskId} 的 notifier（已注册 ${awaitingNotifiers.size} 个）`,
     );
-    return false;
+    return { status: "no_notifier" };
   }
   try {
     const callerStillValid = (): boolean =>
       matchExpectedCallerToken(taskId, args.callerToken);
-    await notifier(
+    const outcome = await notifier(
       {
         kind: "ask_user_request",
         askId: args.askId,
@@ -462,10 +462,23 @@ export const safeNotifyAskUserRequest = async (
       },
       { callerStillValid },
     );
-    return true;
+    // R30-5：先透传 notifier 的 stale/busy（失主路径 notifier 已 cancelPendingIf）——
+    // 不能用事后 token 复查盖成 mismatch，否则工具层分不清「受理后失主」与入口拒
+    if (outcome === "stale") return { status: "stale" };
+    if (outcome === "busy") {
+      return { status: "busy", message: BUSY_RETRY_MESSAGE };
+    }
+    // accepted 路径：返回前复查 token——失效不能当 accepted
+    if (!matchExpectedCallerToken(taskId, args.callerToken)) {
+      return { status: "mismatch" };
+    }
+    return { status: "accepted" };
   } catch (err) {
     console.error("[chat-mcp] ask_user_request notifier failed:", err);
-    return false;
+    return {
+      status: "error",
+      message: err instanceof Error ? err.message : String(err),
+    };
   }
 };
 

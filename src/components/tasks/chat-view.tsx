@@ -268,6 +268,12 @@ export const ChatView = ({
           },
           skillRefs,
         );
+        // R30-3：send 后落盘失败——不可忽略提示
+        if (result.persistWarning) {
+          toast.error(
+            `消息已送达但记录保存失败：${result.persistWarning}`,
+          );
+        }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
           // 存完整 payload（暂无消费方；R4 移除「立即发送」后仍保留结构）

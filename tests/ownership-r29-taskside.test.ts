@@ -94,6 +94,7 @@ const {
   endResourceJob,
   getTaskOpGeneration,
   hasResourceJobs,
+  isWorkspaceQuarantined,
   runningChecks,
   runningTasks,
   subscribeTaskStream,
@@ -392,10 +393,10 @@ describe("ownership R29 task-side", () => {
   );
 
   // ─────────────────────────────────────────────────────────────
-  // ② stop join resourceJobs
+  // ② stop join resourceJobs（R30-2：归零才放行；超时则 quarantine 而非开闸继续）
   // ─────────────────────────────────────────────────────────────
   it(
-    "R29-A②：stop join resourceJobs——在飞 job 结束才收尾",
+    "R29-A②：stop join resourceJobs——在飞 job 结束才收尾（无 quarantine 误伤）",
     async () => {
       const id = alloc();
       const meta = makeMeta(id);
@@ -412,15 +413,18 @@ describe("ownership R29 task-side", () => {
         return r;
       });
 
-      // join 窗口内 stop 不得立刻结束
+      // join 窗口内 stop 不得立刻结束（R30-2 加强：未归零不开闸）
       await sleep(120);
       expect(stopDone).toBe(false);
       expect(hasResourceJobs(id)).toBe(true);
+      expect(isWorkspaceQuarantined(id)).toBe(false);
 
       endResourceJob(id);
       await raceExpectSettled(pStop, 10_000);
       expect(stopDone).toBe(true);
       expect(hasResourceJobs(id)).toBe(false);
+      // R30-2：超时前归零 → 不得残留 quarantine（加强，非弱化）
+      expect(isWorkspaceQuarantined(id)).toBe(false);
     },
     20_000,
   );
@@ -505,7 +509,8 @@ describe("ownership R29 task-side", () => {
       });
 
       // 模拟 createMR 仍 pending：占 mr claim + 压短全局 wait deadline
-      expect(tryClaimSideEffect(id, "act_ship", "mr")).toBe(true);
+      const mrHandle = tryClaimSideEffect(id, "act_ship", "mr");
+      expect(mrHandle).not.toBeNull();
       expect(hasActionSideEffect(id, "act_ship")).toBe(true);
       const g = globalThis as unknown as {
         __feAiFlowActionSideEffectWaitMs?: number;
@@ -527,7 +532,7 @@ describe("ownership R29 task-side", () => {
         expect(mockRunActionCheck).not.toHaveBeenCalled();
       } finally {
         delete g.__feAiFlowActionSideEffectWaitMs;
-        releaseSideEffect(id, "act_ship", "mr");
+        releaseSideEffect(mrHandle!);
       }
     },
     15_000,

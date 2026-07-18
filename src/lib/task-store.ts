@@ -548,8 +548,14 @@ export const sendChatReply = async (
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
 ): Promise<
-  | { task: Task; autoStarted: boolean; queued?: false }
-  | { queued: true; queuedCount: number; task?: Task }
+  | {
+      task: Task;
+      autoStarted: boolean;
+      queued?: false;
+      /** R30-3：send 后落盘失败时服务端带回，UI 须 toast 不可忽略 */
+      persistWarning?: string;
+    }
+  | { queued: true; queuedCount: number; task?: Task; persistWarning?: string }
 > => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
@@ -573,20 +579,31 @@ export const sendChatReply = async (
       queued?: boolean;
       queuedCount?: number;
       task?: Task;
+      persistWarning?: string;
     };
     return {
       queued: true,
       queuedCount:
         typeof data.queuedCount === "number" ? data.queuedCount : 1,
       task: data.task,
+      ...(typeof data.persistWarning === "string"
+        ? { persistWarning: data.persistWarning }
+        : {}),
     };
   }
   const data = await handleJson<{
     ok: true;
     task: Task;
     autoStarted?: boolean;
+    persistWarning?: string;
   }>(res);
-  return { task: data.task, autoStarted: !!data.autoStarted };
+  return {
+    task: data.task,
+    autoStarted: !!data.autoStarted,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 /** P3：回退到带 checkpoint 的 user_reply */
@@ -671,7 +688,7 @@ export const submitTaskQuestion = async (
   attachments?: string[],
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
-): Promise<Task> => {
+): Promise<{ task: Task; persistWarning?: string }> => {
   const s = getSettings();
   const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
     method: "POST",
@@ -692,8 +709,18 @@ export const submitTaskQuestion = async (
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
     }),
   });
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
+  // R30-3：透传 persistWarning，调用方 toast（不可静默丢）
+  const data = await handleJson<{
+    ok: true;
+    task: Task;
+    persistWarning?: string;
+  }>(res);
+  return {
+    task: data.task,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 /**
@@ -831,7 +858,7 @@ export const submitAskReply = async (
     imagesByQuestion?: Record<string, ImagePayload[]>;
     signal?: AbortSignal;
   },
-): Promise<{ ok: true }> => {
+): Promise<{ ok: true; persistWarning?: string }> => {
   // 只发非空的题图、避免 body 里塞一堆空数组
   const imagesByQuestion = options?.imagesByQuestion
     ? Object.fromEntries(
@@ -863,7 +890,14 @@ export const submitAskReply = async (
       }),
     },
   );
-  return await handleJson<{ ok: true }>(res);
+  // R30-3：透传 persistWarning
+  const data = await handleJson<{ ok: true; persistWarning?: string }>(res);
+  return {
+    ok: true as const,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 // ----------------- Action Revisions（V0.5.12 → V0.6 action 维度） -----------------

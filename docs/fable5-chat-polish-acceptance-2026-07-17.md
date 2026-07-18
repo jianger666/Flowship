@@ -1,5 +1,9 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 07:50：第三十一轮修复已提交、待复审——R30-1～R30-5 全部处置：claim 唯一 ClaimHandle（两条 ABA 关闭）、资源事务 quarantine fail-closed（超时不放闸、补偿逐仓现查）、strict 端到端（队列先落盘再 send + 前端 persistWarning toast）、seq 扩块求 max 恢复、ask/无 action notifier 消费 outcome。门禁 87 文件 / 817 项 0 skipped 多遍全绿。详见「第三十一轮修复报告」。
+>
+> 2026-07-19 早晨：第三十轮 Codex 深度复审完成。R29 的六项修复均有有效增量：preview 的最终准入已进入 spawn 前后、旧 action `submit_work` 不再假交卷、直接用户输入的 send 前 strict 失败和正常短事件 seq 恢复也已成立；但继续确认 **3 个 P1 + 2 个 P2**：side-effect claim 只有 kind 没有唯一 token，重交卷 / stop-resume 可 ABA 误放新 owner；ResourceJob 只中止当前 git/cp，半截目录清理与失主补偿仍不可中止，30 秒后照旧开闸；strict 协议没有贯穿队列 flush 和前端，持久化失败仍对用户静默。另有 64KB 尾扫在长事件 / 历史重号日志上重新发出重复 seq，ask / 无 action notifier 仍忽略 stale/busy。结论不通过。真实系统权限下 typecheck、lint、84 文件 / 802 项、build、diff-check 全绿；绿灯未覆盖上述交接窗口。详见「第三十轮验收」。
+>
 > 2026-07-19 07:15：第三十轮修复已提交、待复审——R29-1～R29-6 全部处置：side-effect 与 post-check 单一 claim 状态机（同步原子、零 await 空窗）、ResourceJob 接 AbortController 可 revoke 杀子进程、preview 最终准入进 spawn 提交点、strict 用户输入事件（send 前 5xx / send 后 persistWarning）、notifier 结构化返回（stale 不再假交卷）、seq 从 durable 尾部恢复。门禁 84 文件 / 802 项 0 skipped 多遍全绿。详见「第三十轮修复报告」。
 >
 > 2026-07-19 早晨：第二十九轮 Codex 深度复审完成。R28 的五个收口方向并非无效：MR 双投影单事务、session anchor 的 rename finalGuard、事件 append/publish 同链均已成立，原 forceClear 空窗覆盖新 chat session 的主问题也已关闭；但继续确认 **4 个 P1 + 2 个 P2**：ActionSideEffectCoordinator 在“等待清空→登记 post-check”之间仍有双表竞态，ResourceJob 的 30 秒 join 无法约束最长 600 秒的已启动子进程，preview 只做一次陈旧准入检查可在 finalize/DELETE 后重新起进程，用户输入迁移到吞错 helper 后会出现“已送达但未持久化”；另有 submit_work scope no-op 被误报 delivered、stop 后事件 seq 从 1 重号。结论不通过。真实系统权限下 typecheck、lint、81 文件 / 784 项、build、diff-check 全绿；绿灯缺少上述交叉窗口。详见「第二十九轮验收」。
@@ -32,20 +36,20 @@
 
 ## 结论
 
-**第二十九轮验收仍不通过。** 本轮已把 R28 的主要协议骨架落下：资源 lease 已变必填并接入真实入口，chat 新旧 session 的 instance 门控已收口，锚点 clear 进入 `commit(finalGuard)`，MR 两份本地投影成为单事务，事件 append 与 SSE publish 也进入同一有序链。因此不是“整批推翻”。但实现仍在协议交接处留下可达窗口：side-effect 与 post-check 使用两张独立表，ResourceJob 超时后 lifecycle 会开闸而旧 OS 子进程仍在写，preview 准入没有进入最终 spawn 提交点，用户输入又误用了吞错型事件 helper。当前阻塞项为 **4 个 P1 + 2 个 P2**。
+**第三十轮验收仍不通过。** 本轮不是原地踏步：side-effect / post-check 已合并为一张表，当前 git/cp 子进程可 revoke，preview 的最终 spawn 准入已补，直接 route 有了 strict 用户事件，notifier 和 seq 也各关闭了主路径。但协议又停在下一层交接点：claim 表统一了却没有 owner token；子进程能 abort 却没有约束 abort 后的慢清理 / 补偿；server 返回 warning 却没有穿透队列和前端。当前阻塞项为 **3 个 P1 + 2 个 P2**。
 
-第二十九轮 Codex 深度复审门禁（基线 `9ab86ac`，`HEAD 14cb472`）：
+第三十轮 Codex 深度复审门禁（基线 `14cb472`，`HEAD a2aca50`）：
 
 - `pnpm typecheck`：通过
 - `pnpm lint`：通过（0 error / 0 warning）
-- R28/R29 resource/action/chat/pipeline 定向矩阵：6 文件 / 33 项全部通过
-- `pnpm test`：真实系统权限下 **81 文件 / 784 项全部通过**；沙箱内唯一失败是 preview PID 归属用例无法调用 `ps`、沙箱外该文件 9/9，通过后再跑全量 784/784
+- R28～R30 action/resource/strict/queue 定向矩阵：6 文件 / 31 项全部通过
+- `pnpm test`：真实系统权限下 **84 文件 / 802 项全部通过**；沙箱内唯一失败仍是 preview PID 归属用例无法调用 `ps`，沙箱外该文件 9/9、随后全量 802/802
 - `pnpm build`：生产构建通过
 - `git diff --check`：通过
 
 文件读写兜底专项意见继续保持落实：`safe_read`、对应测试和直接依赖已删除，`chat-mcp` 注册已撤回，Windows prompt 收缩为“两次失败后停手”，不再引导 Python/Node 写回。
 
-审查方法：从物理 worktree / dev server、GitLab MR、本地 meta/events、SSE done/event 六类最终副作用反向检查授权和提交点；只找可达 bug，不评价 S8 或功能路线。审查结束前无业务代码改动，本节及「第二十九轮验收」是本轮唯一写入。
+审查方法：从物理 worktree / dev server、GitLab MR、本地 meta/events、SSE done/event 六类最终副作用反向检查授权和提交点；只找可达 bug，不评价 S8 或功能路线。审查结束前无业务代码改动，本节及「第三十轮验收」是本轮唯一写入。
 
 ---
 
@@ -769,6 +773,152 @@ seq counter Map miss 时从 `events.jsonl` 尾部 ~64KB 倒扫恢复 last seq、
 - 前端尚未消费 `persistWarning`（用户暂只见 HTTP 成功、无气泡）——UI 层展示留待后续。
 - `NotifyAwaitingResult` 保留 `delivered` 历史成员（工具层 accepted/delivered 都当成功）。
 - chat-runner 队列 flush 内的 user_reply 落盘仍为吞错版（send 已发生场景、语义与「send 后 persistWarning」一致性留待下轮评估）。
+
+---
+
+## 第三十一轮修复报告（Fable5、2026-07-19 早晨、待复审）
+
+按第三十轮意见修复 R30-1～R30-5，三个代理并行分区：
+
+### R30-1（claim 唯一 token 化、关两条 ABA）
+
+`action-side-effects.ts` entry 改 `{ kind, claimId }`（进程单调发号）：`tryClaimSideEffect` 返回不可复用的 `ClaimHandle { claimId, kind, taskId, actionId }`；`releaseSideEffect(handle)` 只按精确 claimId 删——stop clear 后同 action resume、B 重新 claim、A 迟到 finally release（旧 claimId）匹配不到、B 的 claim 完好（ABA-2 关闭）。重交卷不再无条件返 claimed：`waitAndClaimPostCheck` 发现已有 postcheck 时在**同一同步段** `onReplacePostCheck()`（abort 旧 check + 摘表）+ 换新 claimId 返回新 handle——旧 check 的 dropSelf（旧 claimId）删不掉新 claim（ABA-1 关闭）。`runActionPostCheck` 各出口按自己的 handle release。
+
+### R30-2（资源事务全程闸、超时不放闸）
+
+- ResourceJob 覆盖完整资源事务：`cp` abort 后的半截目录清理、建前旧目录删除留在同一 job 生命周期内；失主补偿也登记 job（不接 abort、终态 owner join 得到它）。
+- **quarantine fail-closed**：stop/finalize/DELETE 的 join 超时不再开闸——`markWorkspaceQuarantined` 置位、`ensureTaskWorktrees` 入口查到即拒（B 不能复用同路径）、旧事务 job 归零时自动解除；finalize 跳过同步清 worktree、DELETE 跳过同步删目录（均后台等 job 归零再清、`deleting` 闸保持到完成）。HTTP 照常返回、资源 gate 不放。
+- 补偿逐仓 remove/rm **紧前**现查 successor（snapshotTaskOp + runningTasks/agentSessions 活跃检查、不再用入场一次性快照）；宁留孤儿不删后继活工作区。插桩 `compensate.beforeRemove`。
+
+### R30-3（strict 端到端）
+
+- 队列 flush 改「**先 strict 落盘再 send**」：`writeUserEventAndPublishStrict` 成功才 `sendChatMessage`——EIO 时不 send、写 best-effort 警告事件、丢弃本条（不塞回、防持久 EIO 忙等）；「agent 已收到、磁盘和 UI 均无记录」出口消除。checkpoint 绑 user_reply 事件 id、先落盘语义更正确。
+- 前端消费 `persistWarning`：task-store 三个客户端函数（sendChatReply / submitTaskQuestion / submitAskReply）响应类型透传、四个调用组件 toast.error「消息已送达但记录保存失败」——send 后持久化失败不再对用户静默。
+
+### R30-4（seq 恢复健壮化）
+
+尾读改「64KB 起翻倍扩块（上限 4MB）+ 窗口内求 **max(seq)**」：末条 >64KB 单行扩块后能读到完整行；历史重号日志（[98,99,100,1]）恢复出 100、新事件从 101——两类重号场景关闭。
+
+### R30-5（ask / 无 action notifier 消费 outcome）
+
+`safeNotifyAskUserRequest` 透传 notifier 的 accepted/stale/busy（不再无条件 true）；ask_user 工具只有 accepted 返 `[ASK_SUBMITTED]`、stale/busy/mismatch 反登记 + 返错误文案；无 action 的 submit_work 分支消费 mismatch/stale/error/busy（不再一律 idle 成功）——no_notifier 对无 action 待命保留成功语义（chat 无桥待命是常态、agent 只需结束 turn、如实记录）。
+
+### 测试
+
+新增 `tests/ownership-r31-claim-token.test.ts`（两条 ABA 定向 + 至多一类副作用不变量 + ask stale + 无 action mismatch）、`tests/ownership-r31-resource-tx.test.ts`（abort 不 settle × join 超时 → quarantine 拒后继 / job 归零解除 / 补偿 remove 前注入 B 不删 B / 快速路径无误伤）、`tests/ownership-r31-strict-e2e.test.ts`（flush EIO 不 send / 先落盘后 send 回归 / 三客户端 persistWarning 透传 / >64KB 恢复 / 历史重号恢复、7 项）——覆盖第三十轮「第 31 轮退出矩阵」五条。
+
+### 第三十一轮工程门禁（修复后）
+
+- `pnpm typecheck`：通过
+- `pnpm lint`：通过（0 error / 0 warning）
+- `pnpm test`：**87 文件 / 817 项全部通过、0 skipped**（三代理各两遍 + 主线合并后再两遍）
+- `pnpm build`：生产构建通过
+- `git diff --check`：通过
+
+### 已知边界（如实记录）
+
+- 磁盘持续 EIO 时警告事件本身（best-effort）也可能写不上——仍保证不 send；「首 append EIO、次 append 放行」场景已测警告可见。
+- seq 恢复扩块上限 4MB——更早历史 max 在 4MB 外仍可能漏（验收点名的两类场景已覆盖；全文件扫描成本不值）。
+- DELETE 延迟删目录期间任务对 UI 仍短暂可见（`deleting` 闸挡操作）；进程崩溃场景靠 boot 孤儿扫描兜底。
+- 补偿的 `git worktree remove` 本身仍不可中止——靠补偿 job + quarantine 兜（验收要求即此取向）。
+
+---
+
+## 第三十轮验收（Codex、2026-07-19、深度收敛复审、纯 bug 范围）
+
+本轮仍只找可达正确性 bug，不评价 S8 或产品功能设计，也没有修改业务代码。审查从外部 / 物理副作用的最后提交点反查：GitLab MR 与 post-check 的互斥 claim、worktree 与依赖目录的真实进程及清理、preview spawn、用户输入从 HTTP 到前端 / 队列的完整持久化链、events.jsonl 的跨重启序号、MCP notifier 的工具返回。除逐条验证 R29-1～R29-6，还专门检查了“修复动作结束、下一 owner 入场”这一段最容易漏测的交接窗口。
+
+### 已确认修复成立
+
+- R29-1 的原始双表 check→register 窗口已关闭：首次 `submit_work` 在 MR 清空后会在同一同步段登记 postcheck，首次 `submit_mr` 也只认同一张 claim 表。剩余问题缩小为 claim 本身没有唯一 owner 身份。
+- R29-2 已能中止当前登记的直接 `git` / `cp -Rc` 子进程，正常 abort 后 ResourceJob 会快速归零；剩余问题是 abort 后慢清理 / 补偿未登记，以及 30 秒超时仍 fail-open。
+- R29-3 成立：preview 在队列 cleanup 后、真实 spawn 前重新读取终态 / lifecycle，spawn 后再复查；finalize 与 DELETE 的定向交叉测试走真实 manager 链，未发现终态后存活的新 pid。
+- R29-4 的直接 route 主路径部分成立：send/start 前 EIO 会 5xx 且不 start/send、不清 pending；send 后会在 HTTP body 返回 `persistWarning`。剩余问题在队列 flush 与前端消费层。
+- R29-5 点名的“同 caller 对旧 actionId 重交卷”已返回 stale 文案，不再出现 `[SUBMITTED]`。
+- R29-6 对正常短行日志成立：普通 stop 不再清 counter；进程内 counter 清空后能从尾部 seq=2 恢复出 seq=3。
+
+### R30-1（P1）单一 claim 表没有唯一 claim token；同 kind 的旧 owner 可 ABA 误放新 owner，MR 与 post-check 仍能并飞
+
+位置：
+
+- `src/lib/server/action-side-effects.ts:64-90`：entry 只有 `{ kind }`；claim 只返回 boolean，release 只比较 kind。
+- `src/lib/server/action-side-effects.ts:104-142`：发现已有 `postcheck` 时直接向第二个调用者返回 `claimed`，没有转移 / 生成 owner 身份。
+- `src/lib/server/task-runner.ts:497-525,2278-2310`：重交卷在真正 `runActionPostCheck` 前仍有 failpoint 和 action 复查；旧 check 的 `dropSelf` 可先释放这份共享 claim。
+- `src/lib/server/task-runner.ts:1857-1868,2107-2110`：MR 的 `finally` 同样只按 kind 释放，不知道当前 `{ kind: "mr" }` 是否已属于后来者。
+
+两条独立可达时序：
+
+1. 同 action 的旧 post-check P 正在跑；新一次 `submit_work` W 看到 `cur.kind === "postcheck"`，未取得新 token 就收到 `claimed`，随后停在 `beforeAbortCheck`。P 此时正常结束并删 claim；并发 `submit_mr` 成功 claim MR。W 恢复后直接启动 post-check，没有再次 claim，MR 与 check 同时在飞。
+2. A 已 claim MR 并卡在真实 `createMR`；用户 stop 会 `clearActionSideEffects`。同一个 cancelled action 可由任务输入条原地 resume，B 再次 claim 同 action 的 MR。A 的外部请求迟到返回后进入 `finally releaseSideEffect(..., "mr")`，会删除 B 的同 kind claim；第三路 MR / post-check 随即可越过屏障。
+
+现有 `ownership-r30-claim` 只测“空表首次 claim 后 MR 抢入”，没有“已有 postcheck 重交卷→旧 check 先结束”或“stop clear→同 action resume→旧 MR finally”两类 ABA。
+
+修复要求：claim API 必须返回不可复用的 `ClaimHandle { claimId, kind, taskId, actionId }`，release / clear / post-check 收尾都只接受精确 handle；已有 postcheck 不能无条件向另一调用者返回 `claimed`，要么 busy，要么在一个同步 coordinator 提交点完成“abort 旧 check + 换 token”。退出测试分别固定上述两个时序，断言旧 release 永远不能删除新 token，且任意时刻同 action 只有一个外部 / 检查副作用。
+
+### R30-2（P1）ResourceJob 只中止当前 child，abort 后的递归清理和失主补偿仍不可中止；30 秒后开闸会让旧清理删除 B 的工作区
+
+位置：
+
+- `src/lib/server/task-worktrees.ts:885-924`：`cp -Rc` 被 abort 后，catch 先 `await fs.rm(dst, recursive)` 清半截目录；这段可能比 cp 本身更慢，且没有新的 abort handle / owner guard。
+- `src/lib/server/task-worktrees.ts:500-539`：失主补偿只在进入函数时检查一次 successor，之后 `git worktree remove` 最长 60 秒且故意不传 ResourceJob；失败后还会无条件 `fs.rm(workDir)`。
+- `src/lib/server/task-worktrees.ts:667-675`：建新 worktree 前的旧目录递归删除同样只在 await 前验一次 lease、不可中止。
+- `src/lib/server/stop-task.ts:112-126`、`src/lib/server/task-runner.ts:1578-1594`、`src/app/api/tasks/[id]/route.ts:294-309`：ResourceJob 仍存在时，30 秒到点后 stop / finalize / DELETE 明确继续并最终释放 lifecycle / 删除资源。
+
+可达时序：A 正在复制大型 `node_modules` → stop abort `cp` → A 转入可能很慢的半截 `fs.rm`（job 仍存在但 abort 回调只会再次 abort 已死的 cp）→ 30 秒后 stop 开闸 → B resume 并复用 / 重建同 worktree → A 的旧 rm 继续删 B 正在用的依赖。失主补偿也一样：它在 B 尚未 claim 时通过一次性快照，卡在 60 秒 remove；闸开后 B 入场，A 返回后再执行 `fs.rm`，前置快照不会重新保护 B。
+
+新增 process 测试中的“超过 join 上限假子进程”实际在 abort 回调触发时立刻 resolve + `endResourceJob`，验证的是正常快速 abort，不是报告要求的“abort 无效 / 慢清理超过 30 秒”路径。
+
+修复要求：ResourceJob 必须覆盖完整资源事务 Promise，包括 abort 后清半截目录和失主补偿；只要旧事务尚能写 / 删共享路径，stop/finalize/DELETE 就不能释放 lifecycle。若必须给 HTTP 设上限，可返回 timeout，但资源 gate 要继续保持 revoked / quarantined，后继不能用同一路径。补偿需要逐仓最终 guard 或基于唯一 workspace generation 的条件删除，不能用 await 前一次性 snapshot。退出测试必须让 abort callback 不结束 job、让 cleanup 跨过 30 秒，再尝试 B，断言 B 不能入场；还要在 compensation 的身份检查后、remove 完成前注入 B，断言 A 不删 B。
+
+### R30-3（P1）strict 用户输入只做到 route 返回体，队列 flush 和前端仍把持久化失败静默吞掉
+
+位置：
+
+- `src/lib/server/chat-runner.ts:2283-2333`：排队消息先 `sendChatMessage`，再用吞错型 `writeEventAndPublish` 写 `user_reply`；EIO 会在 helper 内变成 `null`，本函数既不检查 null，也没有任何 warning/outbox。
+- `src/lib/task-store.ts:545-590,674-696,842-866`：chat-reply / question / ask-reply 的客户端响应类型都没有 `persistWarning`，解析后直接丢弃该字段。
+- `src/app/api/tasks/[id]/chat-reply/route.ts:417-441`、`question/route.ts:310-402`、`ask-reply/route.ts:627-668`：server 确实返回 warning，但代码库中除 route 和单测外没有任何消费点。
+
+可达后果：普通 202 排队消息在 drain 时已送给 AI，但 events.jsonl 写 EIO 后没有用户气泡、没有 checkpoint，也没有 HTTP 响应可再通知原请求；重启 / rewind 永久丢原文。非排队 send 后失败虽然 body 带 warning，前端把它裁掉，用户仍看到普通成功且原文消失——从真实 UI 角度仍是静默数据丢失。
+
+修复要求：strict 语义必须端到端。队列在返回 202 前要有 durable outbox / 用户事件，或用带唯一消息 ID 的“落 pending→send→标 delivered”协议，不能把唯一持久化放到异步 send 之后；所有 send-after warning 必须进入 task-store 返回类型并在 UI 显示不可忽略的持久化失败提示。退出测试要走真实 `sendChatReply` / `submitTaskQuestion` / `submitAskReply` 客户端函数验证 warning 可见，并给 `flushChatQueue` 注入 EIO，断言不存在“agent 已收到、磁盘和 UI 均无记录”的成功出口。
+
+### R30-4（P2）seq 恢复只读固定 64KB 并返回最后一个 seq；长事件或历史重号日志会重新从 1 / 低值发号
+
+位置：`src/lib/server/task-fs-core.ts:597-650`。
+
+- 若最后一条 JSONL 事件本身超过 64KB，尾读从行中间开始，代码跳过截断首行后找不到任何完整 seq，返回 0；重启后的下一条重新得到 seq=1。tool_result 单行超过 64KB 是正常可达输入。
+- 代码返回“从尾部遇到的第一个 seq”，不是 durable max。升级前已经经历 stop 重号的日志可能形如早期 max=100、尾部重置到 1；升级后会从 2 继续，继续与历史冲突。
+
+现有测试只构造两条很短且严格递增的事件。修复可选择持久化独立 high-water mark，或分块向前读取直到拿到完整行并在旧日志迁移时求 durable max。退出测试至少覆盖“末条 >64KB 后模拟重启”和“历史 seq=[98,99,100,1] 后追加”，新序号必须大于整个 durable 历史最大值。
+
+### R30-5（P2）结构化 notifier 结果只在带 action 的 submit_work 被消费；ask_user 与无 action 分支仍把 stale 当成功
+
+位置：
+
+- `src/lib/server/chat-pending.ts:428-465`：`safeNotifyAskUserRequest` await notifier 后忽略其 `accepted | stale | busy` 返回值，无条件 `true`。
+- `src/lib/server/chat-mcp.ts:327-345`：boolean true 直接映射 `[ASK_SUBMITTED]`。
+- `src/lib/server/chat-mcp.ts:190-196`：无 action 的 `submit_work` 完全忽略 `safeNotifyAwaiting` 结果，始终返回 idle/wait 成功文案。
+
+可达时序：ask 已登记 → notifier 卡在 `supersedePendingAsks` / event chain → stop、接管或新 ask 让 lease 失效 → notifier 取消本 ask 并返回 stale → wrapper 仍返回 true，agent 收到 `[ASK_SUBMITTED]` 并结束 turn，但 UI 没有可回答的卡片。修复要求让 ask wrapper 返回同一 outcome union，生产工具与 `dispatchAskUserForTest` 只有 accepted 才成功；无 action 分支也必须消费 mismatch/stale/error。测试在 `mcp.askUser.afterSupersede` 注入失主，断言 pending 被取消且工具绝不返回 ASK_SUBMITTED。
+
+### 工程门禁与第 31 轮退出标准
+
+- 定向：`ownership-r30-claim`、`ownership-r30-process`、`ownership-r30-strict-events`、`ownership-r28-action-barrier`、`ownership-r29-taskside`、`chat-runner-t3-t4-t5`，**6 文件 / 31 项通过**。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过，0 warning。
+- `pnpm test`：沙箱内 83 文件 / 801 项通过，唯一失败是 preview 进程归属测试不能调用系统 `ps`；真实系统权限下 preview **9/9**，随后全量 **84 文件 / 802 项全部通过**。
+- `pnpm build`：通过。
+- `git diff --check`：通过。
+
+为让循环真正收敛，第 31 轮不要再只测“正常释放很快”的 happy path。最低退出矩阵：
+
+1. claim handle ABA：已有 postcheck 重交卷、stop→同 action resume、旧 finally 晚于新 claim；
+2. 资源事务超时：abort 不 settle、半截 rm / compensation 超过 30 秒、B 尝试复用同路径；
+3. strict 端到端：队列 flush EIO + 三个 task-store 客户端对 `persistWarning` 的可见处理；
+4. seq：>64KB 单行与历史重号迁移；
+5. ask notifier：notifier 返回 stale 后工具不得报 ASK_SUBMITTED。
+
+上述测试应走真实 coordinator / route / client 边界，不能用“abort 回调立即 end job”或只断言 HTTP body 存在来替代。
 
 ---
 

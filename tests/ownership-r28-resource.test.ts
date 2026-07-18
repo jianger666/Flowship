@@ -73,6 +73,7 @@ const {
   clearResourceJobs,
   clearTaskStarting,
   hasResourceJobs,
+  isWorkspaceQuarantined,
   runningTasks,
 } = await import("@/lib/server/task-stream");
 const { setFailpoint, clearFailpoints } = await import(
@@ -410,10 +411,10 @@ describe("ownership R28-1 ResourceJob", () => {
   );
 
   // ─────────────────────────────────────────────────────────────
-  // ④ finalize join：resource job 在飞时等待
+  // ④ finalize join：resource job 在飞时等待（R30-2：归零后才清；超时则 quarantine 而非开闸）
   // ─────────────────────────────────────────────────────────────
   it(
-    "R28-1④：resource job 在飞时 finalizeTask join 等待（job 结束后才清目录）",
+    "R28-1④：resource job 在飞时 finalizeTask join 等待（job 结束后才清目录；无 quarantine 误伤）",
     async () => {
       const id = alloc();
       const repo = mkdtempSync(path.join(TMP_ROOT, "r28-join-"));
@@ -440,7 +441,8 @@ describe("ownership R28-1 ResourceJob", () => {
       await hang.waitHit();
       expect(hasResourceJobs(id)).toBe(true);
 
-      // finalize 应卡住直到我们释放 ensure（resource job 归零）
+      // finalize 应卡住直到我们释放 ensure（resource job 归零）——
+      // R30-2 加强：归零前不开闸；本用例在超时前归零，故无 quarantine
       let finalizeDone = false;
       const pFin = finalizeTask(id, "abandoned").then(() => {
         finalizeDone = true;
@@ -453,6 +455,7 @@ describe("ownership R28-1 ResourceJob", () => {
       expect(
         await fs.stat(workDir).then(() => true, () => false),
       ).toBe(true);
+      expect(isWorkspaceQuarantined(id)).toBe(false);
 
       leaseOk = false;
       hang.release();
@@ -460,6 +463,8 @@ describe("ownership R28-1 ResourceJob", () => {
       await raceExpectSettled(pFin, 15_000);
       expect(finalizeDone).toBe(true);
       expect(hasResourceJobs(id)).toBe(false);
+      // R30-2：快速归零路径不得残留 quarantine（加强，非弱化）
+      expect(isWorkspaceQuarantined(id)).toBe(false);
     },
     40_000,
   );

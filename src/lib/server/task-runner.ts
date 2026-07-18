@@ -56,7 +56,15 @@ import {
   releaseSideEffect,
   tryClaimSideEffect,
   waitAndClaimPostCheck,
+  type ClaimHandle,
 } from "./action-side-effects";
+
+/**
+ * R30-1：runningChecks 条目对应的 postcheck ClaimHandle。
+ * abortRunningCheck / 跨 action 顶替时按精确 handle release，避免只比 kind 的 ABA。
+ * （不改 task-stream.RunningCheck 形状，副作用身份仍归 action-side-effects。）
+ */
+const runningCheckClaims = new Map<string, ClaimHandle>();
 import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
 import {
   runActionCheck,
@@ -121,6 +129,8 @@ import {
   hasResourceJobs,
   isTaskOpCurrent,
   isTaskStarting,
+  isWorkspaceQuarantined,
+  markWorkspaceQuarantined,
   pendingStopRequests,
   publish,
   publishIfCurrent,
@@ -498,31 +508,39 @@ const runActionPostCheck = (
   taskId: string,
   actionId: string,
   artifactPath: string | undefined,
+  /** R30-1：本轮 waitAndClaimPostCheck 拿到的唯一 handle；各出口只 release 本 handle */
+  claimHandle: ClaimHandle,
 ): void => {
   // 顶替：同 task 已有在跑的 check（agent 反复 wait、或换了 action）→ abort 旧的、本轮用最新代码重跑
   const prev = runningChecks.get(taskId);
   prev?.controller.abort();
-  // R29-1：顶替不同 action 的 check 时释放旧 action 的 postcheck claim；
-  // 同 action 重交卷保留 claim（waitAndClaimPostCheck 已持有 / 重入）
+  // R30-1：顶替不同 action 时按旧 handle 精确 release；同 action 重交卷时
+  // waitAndClaimPostCheck 已换 token 并摘掉旧 runningChecks，此处 prev 通常已空
   if (prev && prev.actionId !== actionId) {
-    releaseSideEffect(taskId, prev.actionId, "postcheck");
+    const prevHandle = runningCheckClaims.get(taskId);
+    if (prevHandle) releaseSideEffect(prevHandle);
   }
-  if (prev) runningChecks.delete(taskId);
+  if (prev) {
+    runningChecks.delete(taskId);
+    runningCheckClaims.delete(taskId);
+  }
 
   const controller = new AbortController();
   const self: RunningCheck = { actionId, controller };
   runningChecks.set(taskId, self);
+  runningCheckClaims.set(taskId, claimHandle);
   // R24-1：启动时快照 gen——resume/advance 会 abortRunningCheck；stop/DELETE 会 revoke bump gen
   const checkGen = getTaskOpGeneration(taskId);
 
   /**
    * R24-1 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验）。
-   * R29-1：真正摘掉自己时同步 release postcheck claim（防 stop/作废泄漏）。
+   * R29-1 / R30-1：真正摘掉自己时按本轮 claimHandle release（旧 claimId 删不掉新 token）。
    */
   const dropSelf = (): void => {
     if (runningChecks.get(taskId) !== self) return;
     runningChecks.delete(taskId);
-    releaseSideEffect(taskId, actionId, "postcheck");
+    runningCheckClaims.delete(taskId);
+    releaseSideEffect(claimHandle);
   };
 
   void (async () => {
@@ -646,8 +664,10 @@ export const abortRunningCheck = (taskId: string): void => {
   if (!cur) return;
   cur.controller.abort();
   runningChecks.delete(taskId);
-  // R29-1：stop/advance 中止 check 时释放 postcheck claim，防泄漏挡后续 submit_mr
-  releaseSideEffect(taskId, cur.actionId, "postcheck");
+  // R30-1：按启动时绑定的 handle 精确 release（stop 随后 clear 也会全清；旧 handle 变 no-op）
+  const handle = runningCheckClaims.get(taskId);
+  runningCheckClaims.delete(taskId);
+  if (handle) releaseSideEffect(handle);
   console.log(
     `[task-runner] abortRunningCheck task=${taskId} action=${cur.actionId}`,
   );
@@ -1575,8 +1595,8 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // R29-2：先 revokeResourceJobs（中止在跑 checkout/cp），再 join starting + resourceJobs。
-    // revoke 后子进程秒退、join 大概率速收敛；30s = abort 后仍未退干净的极端兜底。
+    // R29-2 / R30-2：先 revoke，再 join starting + resourceJobs。
+    // R30-2：resourceJobs 超时 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
     {
       revokeResourceJobs(taskId);
       const deadline = Date.now() + 30_000;
@@ -1586,9 +1606,17 @@ export const finalizeTask = async (
       ) {
         await new Promise<void>((r) => setTimeout(r, 50));
       }
-      if (isTaskStarting(taskId) || hasResourceJobs(taskId)) {
+      // starting 单独 warn（非 workspace 路径占用）；resource 超时 → quarantine
+      if (isTaskStarting(taskId)) {
         console.warn(
-          `[task-runner] finalizeTask: task=${taskId} revoke 后等待 starting/resourceJobs 归零超时（~30s 极端兜底）、继续终结`,
+          `[task-runner] finalizeTask: task=${taskId} starting 等待超时、继续终结（resource 另判）`,
+        );
+      }
+      if (hasResourceJobs(taskId)) {
+        // R30-2：已等满 30s 仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
+        markWorkspaceQuarantined(taskId);
+        console.error(
+          `[task-runner] finalizeTask: task=${taskId} resourceJobs join 超时、已 quarantine；跳过同步清 worktree`,
         );
       }
     }
@@ -1629,38 +1657,73 @@ export const finalizeTask = async (
     // V0.10：终结即清隔离工作区（feature 分支保留在原仓库、随时可 reopen 重建 worktree 续推；
     // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
     // best-effort：失败只 log、boot 孤儿扫描兜底。
+    // R30-2：quarantine / 仍有 resourceJobs → 不得同步删（旧慢清理可能仍占路径）；
+    // 挂后台轮询、job 归零后再 remove（quarantine 由 endResourceJob 清）。
     if (isWorktreeTask(task)) {
-      const removed = await removeTaskWorktrees(task).catch((err) => {
-        console.warn(`[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`, err);
-        return null;
-      });
-      if (
-        removed?.removedAny ||
-        (removed?.snapshotFailedRepos.length ?? 0) > 0
-      ) {
-        const repoTail = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
-        const snapshotNote =
-          removed && removed.snapshotRepos.length > 0
-            ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
-            : "";
-        // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
-        const failedNote =
-          removed && removed.snapshotFailedRepos.length > 0
-            ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
-            : "";
-        // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
-        await writeEventAndPublish(taskId, {
-          kind: "info",
-          text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
+      const deferWorktreeCleanup =
+        isWorkspaceQuarantined(taskId) || hasResourceJobs(taskId);
+      if (deferWorktreeCleanup) {
+        const taskSnap = task;
+        void (async () => {
+          try {
+            while (hasResourceJobs(taskId)) {
+              await new Promise<void>((r) => setTimeout(r, 200));
+            }
+            await removeTaskWorktrees(taskSnap).catch((err) => {
+              console.warn(
+                `[task-runner] finalizeTask: 延迟清理 worktree 失败 task=${taskId}`,
+                err,
+              );
+            });
+            try {
+              await stopPreviewsForTask(taskId);
+            } catch {
+              /* best-effort */
+            }
+          } catch (err) {
+            console.error(
+              `[task-runner] finalizeTask: 延迟清 worktree 异常 task=${taskId}`,
+              err,
+            );
+          }
+        })();
+      } else {
+        const removed = await removeTaskWorktrees(task).catch((err) => {
+          console.warn(
+            `[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`,
+            err,
+          );
+          return null;
         });
-      }
-      // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
-      // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
-      // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
-      try {
-        await stopPreviewsForTask(taskId);
-      } catch {
-        /* best-effort */
+        if (
+          removed?.removedAny ||
+          (removed?.snapshotFailedRepos.length ?? 0) > 0
+        ) {
+          const repoTail = (p: string) =>
+            p.split("/").filter(Boolean).pop() ?? p;
+          const snapshotNote =
+            removed && removed.snapshotRepos.length > 0
+              ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
+              : "";
+          // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
+          const failedNote =
+            removed && removed.snapshotFailedRepos.length > 0
+              ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
+              : "";
+          // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
+          await writeEventAndPublish(taskId, {
+            kind: "info",
+            text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
+          });
+        }
+        // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
+        // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
+        // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
+        try {
+          await stopPreviewsForTask(taskId);
+        } catch {
+          /* best-effort */
+        }
       }
     }
 
@@ -1854,8 +1917,9 @@ export const buildSessionBridges = (
         };
       }
 
-      // R29-1：单一 claim 状态机——已有 mr/postcheck claim 一律拒入（不再查 runningChecks）
-      if (!tryClaimSideEffect(task.id, mr.actionId, "mr")) {
+      // R29-1 / R30-1：单一 claim 状态机——已有 mr/postcheck claim 一律拒入；拿到唯一 handle
+      const mrClaim = tryClaimSideEffect(task.id, mr.actionId, "mr");
+      if (!mrClaim) {
         return {
           ok: false,
           error:
@@ -2105,8 +2169,8 @@ export const buildSessionBridges = (
           },
         };
       } finally {
-        // R29-1：无论成功 / skipped_local / 拒写，都要 release mr claim
-        releaseSideEffect(task.id, mr.actionId, "mr");
+        // R30-1：只 release 本轮 mrClaim——stop clear 后同 action resume 的新 claim 不受影响
+        releaseSideEffect(mrClaim);
       }
     }
 
@@ -2238,7 +2302,7 @@ export const buildSessionBridges = (
       // R25-3 / R25-5：supersede await 后、落 ask event 前复查；失主反登记防孤儿弹窗
       await failpoint("mcp.askUser.afterSupersede");
       if (!askLease()) {
-        // R26-3：按本次 askId 反登记——不得裸 cancel 误删 B 刚登记的新提问
+        // R26-3 / R30-5：按本次 askId 反登记并返 stale——wrapper 透传后工具不得报 ASK_SUBMITTED
         cancelPendingIf(task.id, signal.askId);
         return "stale";
       }
@@ -2281,7 +2345,7 @@ export const buildSessionBridges = (
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       // R24-1：postCheck 独立租约、不传 run opHandle
-      // R29-1：waitAndClaimPostCheck 等 mr 清空后同 tick claim postcheck——关交接空窗
+      // R29-1 / R30-1：waitAndClaimPostCheck 等 mr 清空后同 tick claim / 换 token——关交接空窗与 ABA
       await failpoint("mcp.submitWork.beforeCheckStart");
       if (!callerStillValid()) return "stale";
       const claim = await waitAndClaimPostCheck(task.id, signal.actionId, {
@@ -2289,24 +2353,38 @@ export const buildSessionBridges = (
           callerStillValid() &&
           getChatLifecycle(task.id) === null &&
           (await isCurrentRunningAction(task.id, signal.actionId!)),
+        // R30-1：重交卷换 token 前同步 abort 旧 check（摘表、不 release——随即换新 claimId）
+        onReplacePostCheck: () => {
+          const prev = runningChecks.get(task.id);
+          if (!prev) return;
+          prev.controller.abort();
+          runningChecks.delete(task.id);
+          runningCheckClaims.delete(task.id);
+        },
       });
-      if (claim === "timeout") {
+      if (claim.result === "timeout") {
         // R29-5：busy（非 throw）——工具层返回重试文案，不再假「已交卷」
         return "busy";
       }
-      if (claim === "invalid") return "stale";
+      if (claim.result === "invalid") return "stale";
+      const postCheckHandle = claim.handle;
       // claimed：R26-4 failpoint 窗口内 submit_mr 必被 postcheck claim 拒
       await failpoint("mcp.submitWork.beforeAbortCheck");
       if (!callerStillValid()) {
-        releaseSideEffect(task.id, signal.actionId, "postcheck");
+        releaseSideEffect(postCheckHandle);
         return "stale";
       }
       const scopeOk = await isCurrentRunningAction(task.id, signal.actionId);
       if (!scopeOk || !callerStillValid()) {
-        releaseSideEffect(task.id, signal.actionId, "postcheck");
+        releaseSideEffect(postCheckHandle);
         return "stale";
       }
-      runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
+      runActionPostCheck(
+        task.id,
+        signal.actionId,
+        signal.artifactPath,
+        postCheckHandle,
+      );
       return "accepted";
     }
 

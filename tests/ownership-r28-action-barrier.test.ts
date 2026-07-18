@@ -447,7 +447,7 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
         await waitAndClaimPostCheck(id, "act_ship", {
           stillValid: () => true,
         }),
-      ).toBe("claimed");
+      ).toMatchObject({ result: "claimed" });
       expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
 
       const abortSpy = vi.fn();
