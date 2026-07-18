@@ -4,8 +4,8 @@
  * ① 失主补偿 × 后继活跃 worktree → 不删（留孤儿）
  * ② stop join resourceJobs（在飞 job 结束才收尾）
  * ③ cancel done × B takeover → 无 done envelope
- * ④ 屏障超时 × createMR 仍 pending → check 不启动、agent 收到重试错误
- * ⑤ begin 互斥：双 submit_mr 第二路拒
+ * ④ 屏障超时 × createMR 仍 pending → check 不启动、notifier 返 busy
+ * ⑤ claim 互斥：双 submit_mr 第二路拒（R29-1 tryClaimSideEffect）
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, promises as fs, rmSync, writeFileSync } from "node:fs";
@@ -113,10 +113,10 @@ const { buildSessionBridges, deliverAskReply } = await import(
 );
 const { getTask, listTasks } = await import("@/lib/server/task-fs");
 const {
-  beginActionSideEffect,
   clearActionSideEffects,
-  endActionSideEffect,
   hasActionSideEffect,
+  releaseSideEffect,
+  tryClaimSideEffect,
 } = await import("@/lib/server/action-side-effects");
 const {
   ensureTaskWorktrees,
@@ -493,7 +493,7 @@ describe("ownership R29 task-side", () => {
   // ④ 屏障超时 fail-closed
   // ─────────────────────────────────────────────────────────────
   it(
-    "R29-C④：屏障超时 × createMR 仍 pending → check 不启动、收到重试错误",
+    "R29-C④：屏障超时 × createMR 仍 pending → check 不启动、notifier 返 busy",
     async () => {
       const id = alloc();
       await seedShipRunning(id);
@@ -504,8 +504,8 @@ describe("ownership R29 task-side", () => {
         gitToken: "pat-r29-4",
       });
 
-      // 模拟 createMR 仍 pending：占屏障 + 压短全局 wait deadline
-      expect(beginActionSideEffect(id, "act_ship", "submit_mr")).toBe(true);
+      // 模拟 createMR 仍 pending：占 mr claim + 压短全局 wait deadline
+      expect(tryClaimSideEffect(id, "act_ship", "mr")).toBe(true);
       expect(hasActionSideEffect(id, "act_ship")).toBe(true);
       const g = globalThis as unknown as {
         __feAiFlowActionSideEffectWaitMs?: number;
@@ -513,35 +513,31 @@ describe("ownership R29 task-side", () => {
       g.__feAiFlowActionSideEffectWaitMs = 80;
 
       try {
-        const pWork = Promise.resolve(
-          awaitingNotifier(
-            {
-              kind: "awaiting_start",
-              actionId: "act_ship",
-              artifactPath: "actions/1-ship.md",
-            },
-            { callerStillValid: () => true },
-          ),
+        const outcome = await awaitingNotifier(
+          {
+            kind: "awaiting_start",
+            actionId: "act_ship",
+            artifactPath: "actions/1-ship.md",
+          },
+          { callerStillValid: () => true },
         );
-
-        await expect(raceExpectSettled(pWork, 5_000)).rejects.toThrow(
-          /MR 提交仍在进行|稍后重试 submit_work/,
-        );
+        // R29-5：timeout → busy（不再 throw）
+        expect(outcome).toBe("busy");
         expect(runningChecks.get(id)).toBeUndefined();
         expect(mockRunActionCheck).not.toHaveBeenCalled();
       } finally {
         delete g.__feAiFlowActionSideEffectWaitMs;
-        endActionSideEffect(id, "act_ship", "submit_mr");
+        releaseSideEffect(id, "act_ship", "mr");
       }
     },
     15_000,
   );
 
   // ─────────────────────────────────────────────────────────────
-  // ⑤ begin 互斥
+  // ⑤ claim 互斥（R29-1 tryClaimSideEffect）
   // ─────────────────────────────────────────────────────────────
   it(
-    "R29-P2c⑤：双 submit_mr 第二路拒（同 action 互斥）",
+    "R29-P2c⑤：双 submit_mr 第二路拒（同 action claim 互斥）",
     async () => {
       const id = alloc();
       await seedShipRunning(id);
@@ -560,7 +556,7 @@ describe("ownership R29 task-side", () => {
       const r2 = await runTaskAction(id, submitMrArgs(), token);
       expect(r2).toMatchObject({ ok: false });
       expect(String((r2 as { error?: string }).error ?? "")).toMatch(
-        /同 action 的 MR 提交正在进行/,
+        /正有其它副作用进行|稍后重试/,
       );
       expect(mockCreateMR).not.toHaveBeenCalled();
 

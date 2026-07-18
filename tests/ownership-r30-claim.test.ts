@@ -1,14 +1,11 @@
 /**
- * Ownership R28-4：ActionSideEffectCoordinator——同 action 并发屏障 + MR 双投影单事务
+ * Ownership R30：R29-1 单一 action claim 状态机 + R29-5 notifier 结构化返回
  *
- * ① createMR pending × submit_work → check 等待、submit_mr 完成后才启动
- * ② beforeLocalCommit 挂起 × action 切换 → 两份投影都不落（无半状态）
- * ③ postcheck claim 在飞 × submit_mr 入场 → 拒绝且不 abort check（R29-1 单一 claim）
- * ④ 正常路径：两份投影原子可见、mrVersion 一致
- *
- * 屏障语义（R29-1）：单一 per-action claim（mr | postcheck）；
- * submit_work 经 waitAndClaimPostCheck 等 mr 清空后同 tick claim postcheck；
- * 超时 fail-closed / claim 互斥见 ownership-r29-taskside / ownership-r30-claim。
+ * ① submit_work 停在 barrier 返回后（beforeAbortCheck）× submit_mr 抢入
+ *    → 任何时刻最多一类副作用；submit_mr 被 claim 拒
+ * ② 同 caller 旧 actionId 重试 submit_work → 工具 stale 文案、非 submitted
+ * ③ busy（MR 在飞超时）→ 重试文案
+ * ④ 正常链：MR 完成后 submit_work claim 成功启 check、check 结束 release
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -28,7 +25,7 @@ import {
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { Task } from "@/lib/types";
 
-const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r28-barrier-"));
+const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r30-claim-"));
 process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
@@ -82,16 +79,16 @@ vi.mock("@/lib/server/action-checks", () => ({
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { readMetaV06, taskDir, writeMeta } = taskFsCore;
-const {
-  allocTaskRunInstanceId,
-  runningChecks,
-} = await import("@/lib/server/task-stream");
+const { allocTaskRunInstanceId, runningChecks } = await import(
+  "@/lib/server/task-stream"
+);
 const { setFailpoint, clearFailpoints } = await import(
   "@/lib/server/failpoints"
 );
 const {
   cleanupChatTaskState,
   runTaskAction,
+  safeNotifyAwaiting,
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
@@ -100,12 +97,18 @@ const { buildSessionBridges } = await import("@/lib/server/task-runner");
 const { getTask, listTasks } = await import("@/lib/server/task-fs");
 const {
   clearActionSideEffects,
+  getActionSideEffectKind,
   hasActionSideEffect,
+  releaseSideEffect,
+  tryClaimSideEffect,
 } = await import("@/lib/server/action-side-effects");
+const { mapSubmitWorkNotifyToToolText } = await import(
+  "@/lib/server/chat-mcp"
+);
 
 if (!taskDir("probe").startsWith(TMP_ROOT)) {
   throw new Error(
-    `ownership-r28-action-barrier DATA_DIR 未隔离到 TMP：${taskDir("probe")}`,
+    `ownership-r30-claim DATA_DIR 未隔离到 TMP：${taskDir("probe")}`,
   );
 }
 
@@ -116,7 +119,7 @@ const PROJECT_PATH = "group/proj";
 let SUBMIT_REPO = "";
 
 beforeAll(() => {
-  SUBMIT_REPO = mkdtempSync(path.join(os.tmpdir(), "ownership-r28-submit-"));
+  SUBMIT_REPO = mkdtempSync(path.join(os.tmpdir(), "ownership-r30-submit-"));
   execFileSync("git", ["init"], { cwd: SUBMIT_REPO });
   execFileSync("git", ["remote", "add", "origin", REMOTE_URL], {
     cwd: SUBMIT_REPO,
@@ -133,7 +136,7 @@ afterAll(() => {
 const makeMeta = (id: string): TaskMetaV06 =>
   ({
     id,
-    title: `ownership-r28-barrier ${id}`,
+    title: `ownership-r30-claim ${id}`,
     mode: "task",
     repoStatus: "developing",
     runStatus: "idle",
@@ -145,7 +148,6 @@ const makeMeta = (id: string): TaskMetaV06 =>
     updatedAt: Date.now(),
   }) as unknown as TaskMetaV06;
 
-/** ship + running：submit_mr / submit_work 真链用 */
 const seedShipRunning = async (id: string): Promise<void> => {
   const meta = makeMeta(id);
   meta.runStatus = "running";
@@ -247,16 +249,16 @@ const submitMrArgs = () =>
     projectPath: PROJECT_PATH,
     sourceBranch: "feature/me/123-x",
     targetBranch: "test",
-    title: "R28-4 MR",
+    title: "R30 claim MR",
     description: "",
-    lastCommitHash: "hash_r28_4",
+    lastCommitHash: "hash_r30",
   });
 
-describe("ownership R28-4 ActionSideEffectCoordinator", () => {
+describe("ownership R30 claim + notifier outcome", () => {
   const ids: string[] = [];
 
   const alloc = (): string => {
-    const id = `t_r28b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const id = `t_r30c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     ids.push(id);
     return id;
   };
@@ -286,6 +288,10 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
 
   afterEach(async () => {
     clearFailpoints();
+    const g = globalThis as unknown as {
+      __feAiFlowActionSideEffectWaitMs?: number;
+    };
+    delete g.__feAiFlowActionSideEffectWaitMs;
     for (const id of ids) {
       clearActionSideEffects(id);
       runningChecks.delete(id);
@@ -296,10 +302,10 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
   });
 
   // ─────────────────────────────────────────────────────────────
-  // ① createMR pending × submit_work → check 等待
+  // ① barrier 返回后 × submit_mr 抢入
   // ─────────────────────────────────────────────────────────────
   it(
-    "R28-4 屏障：createMR pending × submit_work → check 等待、完成后启动",
+    "R30-①：submit_work claim 后（beforeAbortCheck）× submit_mr 抢入 → 拒、最多一类副作用",
     async () => {
       const id = alloc();
       await seedShipRunning(id);
@@ -307,19 +313,11 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
       const token = String(allocTaskRunInstanceId());
       const { awaitingNotifier } = registerBridgesForTest(task, {
         callerToken: token,
-        gitToken: "pat-r28-1",
+        gitToken: "pat-r30-1",
       });
 
-      const hangCreate = installHangingFailpoint("mcp.submitMr.beforeCreateMR");
-      const pMr = runTaskAction(id, submitMrArgs(), token);
-      await hangCreate.waitHit();
-      // begin 已登记、createMR 未调
-      expect(hasActionSideEffect(id, "act_ship")).toBe(true);
-      expect(mockCreateMR).not.toHaveBeenCalled();
-
-      const hangCheckStart = installHangingFailpoint(
-        "mcp.submitWork.beforeCheckStart",
-      );
+      // 停在 claim 之后、runActionPostCheck 之前——旧空窗位置
+      const hang = installHangingFailpoint("mcp.submitWork.beforeAbortCheck");
       const pWork = Promise.resolve(
         awaitingNotifier(
           {
@@ -330,152 +328,101 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
           { callerStillValid: () => true },
         ),
       );
-      await hangCheckStart.waitHit();
-      // 屏障检查前：check 尚未启动
+      await hang.waitHit();
+
+      // 已持 postcheck claim；runningChecks 尚未挂（check 未启）
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
       expect(runningChecks.get(id)).toBeUndefined();
-      expect(mockRunActionCheck).not.toHaveBeenCalled();
 
-      // 放行屏障检查入口 → 进入 waitAndClaimPostCheck（createMR 仍挂、mr claim 在）
-      hangCheckStart.release();
-      await sleep(80);
-      expect(runningChecks.get(id)).toBeUndefined();
-      expect(mockRunActionCheck).not.toHaveBeenCalled();
-      expect(hasActionSideEffect(id, "act_ship")).toBe(true);
+      // 并发 submit_mr 必须被 claim 拒
+      const mrResult = await runTaskAction(id, submitMrArgs(), token);
+      expect(mrResult).toMatchObject({ ok: false });
+      expect(String((mrResult as { error?: string }).error ?? "")).toMatch(
+        /正有其它副作用进行|稍后重试/,
+      );
+      expect(mockCreateMR).not.toHaveBeenCalled();
+      // 仍只有 postcheck，没有 mr
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
 
-      // 放行 createMR → submit_mr 完成 → release mr → waitAndClaim 同 tick claim postcheck → check 启动
-      hangCreate.release();
-      await raceExpectSettled(pMr, 12_000);
-      const mrResult = await pMr;
-      expect(mrResult).toMatchObject({ ok: true });
-      expect((mrResult as { data?: { skipped_local?: boolean } }).data?.skipped_local).toBeFalsy();
-
+      hang.release();
       await raceExpectSettled(pWork, 12_000);
       expect(await pWork).toBe("accepted");
-      // runActionPostCheck 同步挂 runningChecks，runActionCheck 在 getTask await 后才调
       await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
       await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
-      // check 跑完后 dropSelf 会 release postcheck；等 check 落完再断言无 claim
       await waitUntil(() => !runningChecks.has(id), 5000);
       expect(hasActionSideEffect(id, "act_ship")).toBe(false);
 
-      // 双投影已落（check 读到的应有 MR）
+      // 未遗留错误 awaiting_ack（check 正常落盘是 awaiting_ack——此处断言无外部 MR 孤儿）
       const disk = await readMetaV06(id);
-      expect(disk?.mrs ?? []).toHaveLength(1);
-      const sideMrs =
-        disk?.actions.find((a) => a.id === "act_ship")?.sideEffects?.mrs ?? [];
-      expect(sideMrs).toHaveLength(1);
-      expect(sideMrs[0]?.mrVersion).toBe(disk?.mrs?.[0]?.version);
+      expect(disk?.mrs ?? []).toHaveLength(0);
+      const ship = disk?.actions.find((a) => a.id === "act_ship");
+      expect(ship?.sideEffects?.mrs ?? []).toHaveLength(0);
     },
     25_000,
   );
 
   // ─────────────────────────────────────────────────────────────
-  // ② beforeLocalCommit × action 切换 → 无半状态
+  // ② 旧 actionId → stale 文案
   // ─────────────────────────────────────────────────────────────
   it(
-    "R28-4 单事务：beforeLocalCommit 挂起 × action 切换 → 两份投影都不落",
+    "R30-②：同 caller 旧 actionId 重试 submit_work → stale 文案、非 submitted",
     async () => {
       const id = alloc();
-      await seedShipRunning(id);
-      const task = (await getTask(id))!;
-      const token = String(allocTaskRunInstanceId());
-      registerBridgesForTest(task, {
-        callerToken: token,
-        gitToken: "pat-r28-2",
-      });
-
-      const hang = installHangingFailpoint("mcp.submitMr.beforeLocalCommit");
-      const pMr = runTaskAction(id, submitMrArgs(), token);
-      await hang.waitHit();
-      // createMR 已成功、本地尚未写——挂起窗口内两份投影都无
-      expect(mockCreateMR).toHaveBeenCalled();
-      let disk = await readMetaV06(id);
-      expect(disk?.mrs ?? []).toHaveLength(0);
-      expect(
-        disk?.actions.find((a) => a.id === "act_ship")?.sideEffects?.mrs ?? [],
-      ).toHaveLength(0);
-
-      // 注入 action 切换（模拟 stop/advance 把 ship 切出 running）
-      const meta = (await readMetaV06(id))!;
-      meta.actions = meta.actions.map((a) =>
-        a.id === "act_ship"
-          ? { ...a, status: "awaiting_ack" as const, endedAt: Date.now() }
-          : a,
-      );
-      meta.updatedAt = Date.now();
+      const meta = makeMeta(id);
+      meta.runStatus = "running";
+      meta.currentActionId = "act_b";
+      meta.repoPaths = [SUBMIT_REPO];
+      meta.actions = [
+        {
+          id: "act_a",
+          n: 1,
+          type: "ship",
+          status: "completed",
+          userInstruction: "",
+          artifactPath: "actions/1-ship.md",
+          startedAt: Date.now() - 1000,
+          endedAt: Date.now() - 500,
+        },
+        {
+          id: "act_b",
+          n: 2,
+          type: "ship",
+          status: "running",
+          userInstruction: "",
+          artifactPath: "actions/2-ship.md",
+          startedAt: Date.now(),
+          endedAt: null,
+        },
+      ] as TaskMetaV06["actions"];
       await writeMeta(meta);
 
-      hang.release();
-      await raceExpectSettled(pMr, 12_000);
-      const result = await pMr;
-      expect(result).toMatchObject({
-        ok: true,
-        data: { skipped_local: true },
-      });
-
-      disk = await readMetaV06(id);
-      // 无半状态：task.mrs 与 action.sideEffects.mrs 都无
-      expect(disk?.mrs ?? []).toHaveLength(0);
-      expect(
-        disk?.actions.find((a) => a.id === "act_ship")?.sideEffects?.mrs ?? [],
-      ).toHaveLength(0);
-      expect(hasActionSideEffect(id, "act_ship")).toBe(false);
-    },
-    20_000,
-  );
-
-  // ─────────────────────────────────────────────────────────────
-  // ③ postcheck claim 在飞 × submit_mr → 拒、不 abort check（R29-1）
-  // ─────────────────────────────────────────────────────────────
-  it(
-    "R28-4 反向屏障：postcheck claim 在飞 × submit_mr → 拒绝且不 abort check",
-    async () => {
-      const id = alloc();
-      await seedShipRunning(id);
       const task = (await getTask(id))!;
       const token = String(allocTaskRunInstanceId());
       registerBridgesForTest(task, {
         callerToken: token,
-        gitToken: "pat-r28-3",
+        gitToken: "pat-r30-2",
       });
 
-      // R29-1：准入看 claim 表，不再看 runningChecks——先占 postcheck claim
-      const { waitAndClaimPostCheck, getActionSideEffectKind } = await import(
-        "@/lib/server/action-side-effects"
-      );
-      expect(
-        await waitAndClaimPostCheck(id, "act_ship", {
-          stillValid: () => true,
-        }),
-      ).toBe("claimed");
-      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
-
-      const abortSpy = vi.fn();
-      const controller = {
-        abort: abortSpy,
-        signal: { aborted: false },
-      } as unknown as AbortController;
-      const checkSelf = { actionId: "act_ship", controller };
-      runningChecks.set(id, checkSelf);
-
-      const result = await runTaskAction(id, submitMrArgs(), token);
-      expect(result).toMatchObject({ ok: false });
-      expect(String((result as { error?: string }).error ?? "")).toMatch(
-        /正有其它副作用进行|稍后重试/,
-      );
-      expect(mockCreateMR).not.toHaveBeenCalled();
-      expect(abortSpy).not.toHaveBeenCalled();
-      expect(runningChecks.get(id)).toBe(checkSelf);
-      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
+      const notifyResult = await safeNotifyAwaiting(id, {
+        actionId: "act_a",
+        artifactPath: "actions/1-ship.md",
+        callerToken: token,
+      });
+      expect(notifyResult.status).toBe("stale");
+      const toolText = mapSubmitWorkNotifyToToolText(notifyResult, "act_a");
+      expect(toolText).toMatch(/已结束|已被后续操作取代/);
+      expect(toolText).not.toMatch(/\[SUBMITTED\]/);
+      expect(runningChecks.get(id)).toBeUndefined();
+      expect(mockRunActionCheck).not.toHaveBeenCalled();
     },
     15_000,
   );
 
   // ─────────────────────────────────────────────────────────────
-  // ④ 正常路径回归：双投影原子可见、mrVersion 一致
+  // ③ busy 超时 → 重试文案
   // ─────────────────────────────────────────────────────────────
   it(
-    "R28-4 正常路径：submit_mr 成功后两份投影原子可见、mrVersion 一致",
+    "R30-③：MR claim 在飞超时 → busy 重试文案、非 submitted",
     async () => {
       const id = alloc();
       await seedShipRunning(id);
@@ -483,47 +430,99 @@ describe("ownership R28-4 ActionSideEffectCoordinator", () => {
       const token = String(allocTaskRunInstanceId());
       registerBridgesForTest(task, {
         callerToken: token,
-        gitToken: "pat-r28-4",
+        gitToken: "pat-r30-3",
       });
 
-      const result = await runTaskAction(id, submitMrArgs(), token);
-      expect(result).toMatchObject({
-        ok: true,
-        data: {
-          mr_url: "https://git.corp.com/group/proj/-/merge_requests/42",
-          mr_iid: 42,
-          mr_version: 1,
-          has_conflicts: false,
-        },
+      expect(tryClaimSideEffect(id, "act_ship", "mr")).toBe(true);
+      const g = globalThis as unknown as {
+        __feAiFlowActionSideEffectWaitMs?: number;
+      };
+      g.__feAiFlowActionSideEffectWaitMs = 80;
+
+      const notifyResult = await safeNotifyAwaiting(id, {
+        actionId: "act_ship",
+        artifactPath: "actions/1-ship.md",
+        callerToken: token,
       });
-      expect(
-        (result as { data?: { skipped_local?: boolean } }).data?.skipped_local,
-      ).toBeFalsy();
+      expect(notifyResult.status).toBe("busy");
+      if (notifyResult.status !== "busy") throw new Error("expected busy");
+      const toolText = mapSubmitWorkNotifyToToolText(notifyResult, "act_ship");
+      expect(toolText).toMatch(/稍后重试 submit_work|交卷未受理/);
+      expect(toolText).not.toMatch(/\[SUBMITTED\]/);
+      expect(runningChecks.get(id)).toBeUndefined();
+      expect(mockRunActionCheck).not.toHaveBeenCalled();
+
+      releaseSideEffect(id, "act_ship", "mr");
+    },
+    15_000,
+  );
+
+  // ─────────────────────────────────────────────────────────────
+  // ④ 正常链回归
+  // ─────────────────────────────────────────────────────────────
+  it(
+    "R30-④：MR 完成后 submit_work claim 成功启 check、check 结束 release",
+    async () => {
+      const id = alloc();
+      await seedShipRunning(id);
+      const task = (await getTask(id))!;
+      const token = String(allocTaskRunInstanceId());
+      const { awaitingNotifier } = registerBridgesForTest(task, {
+        callerToken: token,
+        gitToken: "pat-r30-4",
+      });
+
+      // 挂起 check 本体，便于观察 postcheck claim 生命周期
+      let releaseCheck!: () => void;
+      const checkGate = new Promise<void>((r) => {
+        releaseCheck = r;
+      });
+      mockRunActionCheck.mockImplementation(async () => {
+        await checkGate;
+        return { passed: true, details: "ok" };
+      });
+
+      const hangCreate = installHangingFailpoint("mcp.submitMr.beforeCreateMR");
+      const pMr = runTaskAction(id, submitMrArgs(), token);
+      await hangCreate.waitHit();
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("mr");
+
+      const pWork = Promise.resolve(
+        awaitingNotifier(
+          {
+            kind: "awaiting_start",
+            actionId: "act_ship",
+            artifactPath: "actions/1-ship.md",
+          },
+          { callerStillValid: () => true },
+        ),
+      );
+      // 等 submit_work 进入 wait（mr 仍在）
+      await sleep(80);
+      expect(runningChecks.get(id)).toBeUndefined();
+
+      hangCreate.release();
+      await raceExpectSettled(pMr, 12_000);
+      expect(await pMr).toMatchObject({ ok: true });
+
+      await raceExpectSettled(pWork, 12_000);
+      expect(await pWork).toBe("accepted");
+      await waitUntil(() => runningChecks.get(id)?.actionId === "act_ship", 5000);
+      // getTask await 后才进 runActionCheck——等 mock 真正挂上再断言 claim
+      await waitUntil(() => mockRunActionCheck.mock.calls.length > 0, 5000);
+      expect(getActionSideEffectKind(id, "act_ship")).toBe("postcheck");
+
+      releaseCheck();
+      await waitUntil(() => !runningChecks.has(id), 5000);
+      // check 结束 dropSelf → release postcheck
+      expect(hasActionSideEffect(id, "act_ship")).toBe(false);
 
       const disk = await readMetaV06(id);
-      expect(disk?.mrs).toHaveLength(1);
-      expect(disk?.mrs?.[0]).toMatchObject({
-        repoPath: SUBMIT_REPO,
-        targetBranch: "test",
-        url: "https://git.corp.com/group/proj/-/merge_requests/42",
-        version: 1,
-        branch: "feature/me/123-x",
-      });
-      const sideMrs =
-        disk?.actions.find((a) => a.id === "act_ship")?.sideEffects?.mrs ?? [];
-      expect(sideMrs).toHaveLength(1);
-      expect(sideMrs[0]).toMatchObject({
-        repoPath: SUBMIT_REPO,
-        targetBranch: "test",
-        mrUrl: "https://git.corp.com/group/proj/-/merge_requests/42",
-        mrVersion: 1,
-        branch: "feature/me/123-x",
-        commitHash: "hash_r28_4",
-      });
-      // mrVersion 与 task.mrs.version 一致（单事务同源）
-      expect(sideMrs[0]?.mrVersion).toBe(disk?.mrs?.[0]?.version);
-      expect(hasActionSideEffect(id, "act_ship")).toBe(false);
+      expect(disk?.mrs ?? []).toHaveLength(1);
+      const ship = disk?.actions.find((a) => a.id === "act_ship");
+      expect(ship?.status).toBe("awaiting_ack");
+      expect(ship?.sideEffects?.mrs ?? []).toHaveLength(1);
     },
-    15_000,
+    25_000,
   );
 });

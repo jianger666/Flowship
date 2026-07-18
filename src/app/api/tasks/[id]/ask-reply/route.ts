@@ -54,9 +54,12 @@ import {
   agentSessions,
   getTaskOpGeneration,
   isTaskOpCurrent,
+  PERSIST_FAIL_RETRY_MESSAGE,
+  PERSIST_WARNING_DELIVERED,
   publishTaskStreamEvent,
   snapshotTaskOp,
   writeEventAndPublish,
+  writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
@@ -379,19 +382,30 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (!currentAction || !boot.apiKey || !boot.model) return null;
     }
 
+    // R29-4：唤醒 = send/start 前落盘——先 strict 写用户回答，成功后再清 pending
+    try {
+      const wrote = await writeUserEventAndPublishStrict(task.id, {
+        kind: "ask_user_reply",
+        actionId: reqEvent.actionId,
+        text: replyText,
+        meta: {
+          askId,
+          answers,
+          ...(deferred ? { deferred: true } : {}),
+          ...(allSaved.length > 0 ? { images: allSaved } : {}),
+        },
+      });
+      if (!wrote) {
+        return errorResponse("not_found", 404);
+      }
+    } catch (persistErr) {
+      console.error(
+        `[ask-reply] R29-4 唤醒前落盘失败 task=${task.id}:`,
+        persistErr,
+      );
+      return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
+    }
     clearPendingAsk(task.id);
-    // R29-1：用户回答事件走 OrderedEventCommit（写+publish 同链），不再 append 后再 publish
-    await writeEventAndPublish(task.id, {
-      kind: "ask_user_reply",
-      actionId: reqEvent.actionId,
-      text: replyText,
-      meta: {
-        askId,
-        answers,
-        ...(deferred ? { deferred: true } : {}),
-        ...(allSaved.length > 0 ? { images: allSaved } : {}),
-      },
-    });
     console.log(
       `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（${isChat ? "chat 新会话" : "新 agent"}接手、答案随消息带过去）`,
     );
@@ -610,22 +624,37 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
     }
   }
+  // R29-4：答案已送达 → 照常清 pending；落盘失败带 persistWarning，不伪装未发送
   clearPendingAsk(task.id);
 
   const actionId = reqEvent.actionId;
-  // R29-1：已答事件写+publish 同链（用户操作无条件语义）
-  await writeEventAndPublish(task.id, {
-    kind: "ask_user_reply",
-    actionId,
-    text: replyText,
-    meta: {
-      askId,
-      answers,
-      ...(deferred ? { deferred: true } : {}),
-      // 扁平图数组、前端 extractUserReplyImages 读 meta.images 渲缩略图（同 user_reply 通道）
-      ...(allSaved.length > 0 ? { images: allSaved } : {}),
-    },
-  });
+  let persistWarning: string | undefined;
+  try {
+    const wrote = await writeUserEventAndPublishStrict(task.id, {
+      kind: "ask_user_reply",
+      actionId,
+      text: replyText,
+      meta: {
+        askId,
+        answers,
+        ...(deferred ? { deferred: true } : {}),
+        // 扁平图数组、前端 extractUserReplyImages 读 meta.images 渲缩略图（同 user_reply 通道）
+        ...(allSaved.length > 0 ? { images: allSaved } : {}),
+      },
+    });
+    if (!wrote) {
+      persistWarning = PERSIST_WARNING_DELIVERED;
+      console.error(
+        `[ask-reply] R29-4 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+      );
+    }
+  } catch (persistErr) {
+    console.error(
+      `[ask-reply] R29-4 已送达但持久化失败 task=${task.id}:`,
+      persistErr,
+    );
+    persistWarning = PERSIST_WARNING_DELIVERED;
+  }
 
   // R20-2：删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running
@@ -633,7 +662,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const freshTask = (await getTask(task.id)) ?? task;
 
   return new Response(
-    JSON.stringify({ ok: true, task: freshTask }),
+    JSON.stringify({
+      ok: true,
+      task: freshTask,
+      ...(persistWarning ? { persistWarning } : {}),
+    }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

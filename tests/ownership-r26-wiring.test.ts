@@ -443,21 +443,16 @@ describe("ownership R26 wiring", () => {
       };
       runningChecks.set(id, checkB);
 
-      const hang = installHangingFailpoint("mcp.submitWork.beforeAbortCheck");
-      const p = Promise.resolve(
-        awaitingNotifier(
-          {
-            kind: "awaiting_start",
-            actionId: "act_a",
-            artifactPath: "actions/1-plan.md",
-          },
-          { callerStillValid: () => true },
-        ),
+      // R29-1：旧 action 在 waitAndClaimPostCheck 的 lease 检查处即 stale，不启 check、不 abort B
+      const outcome = await awaitingNotifier(
+        {
+          kind: "awaiting_start",
+          actionId: "act_a",
+          artifactPath: "actions/1-plan.md",
+        },
+        { callerStillValid: () => true },
       );
-      await hang.waitHit();
-      expect(abortSpy).not.toHaveBeenCalled();
-      hang.release();
-      await raceExpectSettled(p, 8000);
+      expect(outcome).toBe("stale");
       expect(abortSpy).not.toHaveBeenCalled();
       expect(runningChecks.get(id)?.actionId).toBe("act_b");
     },

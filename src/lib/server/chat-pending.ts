@@ -21,8 +21,6 @@ import type { WebStandardStreamableHTTPServerTransport } from "@modelcontextprot
 
 import type { ActionType, PlanBatch } from "../types";
 import { SIGNALS, buildNextActionHead } from "../protocol-signals";
-// R29-3：cleanup 时顺带清事件 seq counter（与 pending/notifier 同生命周期）
-import { clearEventSeqCounter } from "./task-fs-core";
 
 // ----------------- 类型 -----------------
 
@@ -64,10 +62,20 @@ export type AwaitingSignal =
 /** R25-3：handler / notifier 内部 await 后复查 caller 是否仍是当前 bridge */
 export type CallerValidityCtx = { callerStillValid: () => boolean };
 
+/**
+ * R29-5：notifier 结构化结果——区分真受理 / scope 失效 / 副作用忙。
+ * - accepted：已启动 post-check / 已切 awaiting / ask 已落盘
+ * - stale：非当前 running action / caller 失效等，工具不得报「已交卷」
+ * - busy：waitAndClaimPostCheck 超时等，工具返回重试文案
+ */
+export type AwaitingNotifyOutcome = "accepted" | "stale" | "busy";
+
 export type AwaitingNotifier = (
   signal: AwaitingSignal,
   ctx: CallerValidityCtx,
-) => Promise<void> | void;
+) =>
+  | Promise<AwaitingNotifyOutcome>
+  | AwaitingNotifyOutcome;
 
 // task-scoped「同步 RPC」action（submit_mr / set_feishu_testers / set_plan_batches）——
 // chat-mcp 工具收到调用后查表找 runner 注册的 handler 执行、拿结构化返回值
@@ -219,14 +227,16 @@ export const invalidateCallerToken = (taskId: string): void => {
   expectedCallerTokens.delete(taskId);
 };
 
-/** 任务被永久删除时调：清掉所有跟它相关的进程级状态 */
+/**
+ * 任务 stop / 清理进程级桥接态时调。
+ * R29-6：不再清 seq counter——events.jsonl 仍在，counter 保持才单调；
+ * 仅 deleteTask（文件真删）才 clearEventSeqCounter。
+ */
 export const cleanupChatTaskState = (taskId: string): void => {
   pendingAsks.delete(taskId);
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
   expectedCallerTokens.delete(taskId);
-  // R29-3：DELETE / stop 清理链顺带清 seq，防 counter 泄漏
-  clearEventSeqCounter(taskId);
 };
 
 /** R24-6：MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */
@@ -345,12 +355,19 @@ export const runTaskAction = async (
   }
 };
 
-/** R29：submit_work 通知结果——工具层据此决定返回「已交卷」还是重试错误 */
+/** R29 / R29-5：submit_work 通知结果——工具层据此决定返回「已交卷」还是重试/失效文案 */
 export type NotifyAwaitingResult =
   | { status: "delivered" }
+  | { status: "accepted" }
+  | { status: "stale" }
+  | { status: "busy"; message: string }
   | { status: "mismatch" }
   | { status: "no_notifier" }
   | { status: "error"; message: string };
+
+/** R29-5：busy 默认重试文案（与 waitAndClaimPostCheck timeout / claim 互斥对齐） */
+const BUSY_RETRY_MESSAGE =
+  "MR 提交仍在进行、稍后重试 submit_work";
 
 export const safeNotifyAwaiting = async (
   taskId: string,
@@ -374,7 +391,7 @@ export const safeNotifyAwaiting = async (
     // R25-3：notifier 内部 await 后仍须能复查 caller
     const callerStillValid = (): boolean =>
       matchExpectedCallerToken(taskId, opts.callerToken);
-    await notifier(
+    const outcome = await notifier(
       {
         kind: "awaiting_start",
         actionId: opts.actionId,
@@ -382,15 +399,19 @@ export const safeNotifyAwaiting = async (
       },
       { callerStillValid },
     );
-    // R29-2A-P2：notifier 内部因 caller 失效会静默让位（不 throw）——返回前复查 token、
-    // 失效不能当 delivered（stop 清屏障解阻 wait 后正是这条路、假 delivered = 假交卷）
+    // R29-2A-P2：返回前复查 token——失效不能当 delivered
     if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
       return { status: "mismatch" };
     }
-    return { status: "delivered" };
+    // R29-5：透传 notifier 结构化结果
+    if (outcome === "stale") return { status: "stale" };
+    if (outcome === "busy") {
+      return { status: "busy", message: BUSY_RETRY_MESSAGE };
+    }
+    // accepted（及历史 void 不应再出现——两侧 notifier 已显式返回）
+    return { status: "accepted" };
   } catch (err) {
-    // R29：不再吞错——屏障超时（fail-closed）等 notifier 抛错要传回工具层，
-    // 否则 agent 收到假「已交卷」结束 turn、check 却从未启动
+    // 兜底：未预期抛错仍传回工具层，避免假「已交卷」
     console.error("[chat-mcp] awaiting notifier failed:", err);
     return {
       status: "error",

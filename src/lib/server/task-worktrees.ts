@@ -23,7 +23,12 @@ import path from "node:path";
 
 import { dataRoot } from "./data-root";
 import { failpoint } from "./failpoints";
-import { beginResourceJob, endResourceJob } from "./resource-jobs";
+import {
+  beginResourceJob,
+  endResourceJob,
+  registerJobAbort,
+  type ResourceJobHandle,
+} from "./resource-jobs";
 import { getEffectiveCwd, getUniqueRepoDirNames } from "@/lib/path-utils";
 import {
   DEFAULT_BRANCH_TEMPLATE,
@@ -48,6 +53,23 @@ export class WorktreeLeaseLostError extends Error {
 }
 
 const execFileAsync = promisify(execFile);
+
+/** R29-2：Node execFile 被 AbortSignal 杀掉时的错误识别 */
+const isExecAborted = (err: unknown, signal?: AbortSignal): boolean => {
+  if (signal?.aborted) return true;
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; code?: string; message?: string };
+  if (e.name === "AbortError") return true;
+  if (e.code === "ABORT_ERR") return true;
+  // Node 杀子进程时常见：killed + signal SIGTERM
+  if (
+    (err as { killed?: boolean; signal?: string }).killed === true &&
+    signal
+  ) {
+    return true;
+  }
+  return false;
+};
 
 /**
  * 目录是否为 git 仓（同步 existsSync）。
@@ -274,25 +296,45 @@ interface GitResult {
   stderr: string;
 }
 
+/**
+ * 跑一条 git 子命令。
+ * @param job R29-2：传入则把 AbortController 挂到该 resource job——revoke 可中止；
+ *   被 abort 抛 {@link WorktreeLeaseLostError}（走让位/补偿路径）。补偿路径勿传 job。
+ */
 const runGit = async (
   repoPath: string,
   args: string[],
   timeoutMs = 60_000,
+  job?: ResourceJobHandle,
 ): Promise<GitResult> => {
+  // R29-2：长命令（checkout / worktree add / fetch）可被终态 owner revoke
+  const ac = job ? new AbortController() : null;
+  if (job && ac) {
+    registerJobAbort(job.taskId, job.jobId, () => ac.abort());
+  }
   try {
     const { stdout, stderr } = await execFileAsync("git", args, {
       cwd: repoPath,
       timeout: timeoutMs,
       maxBuffer: 4 * 1024 * 1024,
+      ...(ac ? { signal: ac.signal } : {}),
     });
     return { ok: true, stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (err) {
+    // R29-2：revoke / abort → 让位（不吞成 ok:false）
+    if (job && isExecAborted(err, ac?.signal)) {
+      throw new WorktreeLeaseLostError(
+        "R29-2：git 子进程被 revoke 中止、资源操作让位",
+      );
+    }
     const e = err as Error & { stdout?: string; stderr?: string };
     return {
       ok: false,
       stdout: (e.stdout ?? "").trim(),
       stderr: (e.stderr ?? e.message ?? "").trim(),
     };
+  } finally {
+    if (job) registerJobAbort(job.taskId, job.jobId, null);
   }
 };
 
@@ -407,8 +449,8 @@ export const ensureTaskWorktrees = async (
   task: Task,
   lease: () => boolean,
 ): Promise<EnsureWorktreesResult> => {
-  // R28-1：登记 resource job——finalize/stop/DELETE join 可等到本 ensure（嵌套调用 refcount 安全）
-  beginResourceJob(task.id);
+  // R28-1 / R29-2：登记 resource job（带 handle）——finalize/stop/DELETE 可 revoke 子进程后 join
+  const job = beginResourceJob(task.id);
   try {
     // R28-1：lease 失效即抛（每个不可逆副作用前复用；不再可选）
     const assertLease = (): void => {
@@ -436,9 +478,10 @@ export const ensureTaskWorktrees = async (
       assertLease,
       lease,
       entryHandle,
+      job,
     });
   } finally {
-    endResourceJob(task.id);
+    endResourceJob(job);
   }
 };
 
@@ -510,6 +553,8 @@ const ensureTaskWorktreesInner = async (ctx: {
   lease: () => boolean;
   /** R29-A：ensure 入场 ownership 快照（补偿身份比对） */
   entryHandle: { opId: number | null; gen: number; claimSeq: number };
+  /** R29-2：resource job——长 git / cp 子进程挂 abort */
+  job: ResourceJobHandle;
 }): Promise<EnsureWorktreesResult> => {
   const {
     task,
@@ -521,6 +566,7 @@ const ensureTaskWorktreesInner = async (ctx: {
     assertLease,
     lease,
     entryHandle,
+    job,
   } = ctx;
 
   // R28-1：根目录 mkdir 前插桩 + 验 lease（旧实现 mkdir 在首次 lease 前）
@@ -571,16 +617,32 @@ const ensureTaskWorktreesInner = async (ctx: {
     // 顺手补克隆依赖目录（老 worktree 建于克隆功能上线前 / 上次克隆失败）——
     // 缺依赖会连锁炸 pre-commit hook / lint / typecheck（实测：dev 联调 agent 被迫 --no-verify）
     if (await pathExists(path.join(workDir, ".git"))) {
-      const check = await runGit(workDir, ["rev-parse", "--is-inside-work-tree"]);
+      const check = await runGit(
+        workDir,
+        ["rev-parse", "--is-inside-work-tree"],
+        60_000,
+        job,
+      );
       if (check.ok) {
         // show-current：detached HEAD 时 stdout 为空，跟任务分支不一致同样要切回
-        const show = await runGit(workDir, ["branch", "--show-current"]);
+        const show = await runGit(
+          workDir,
+          ["branch", "--show-current"],
+          60_000,
+          job,
+        );
         const currentBranch = show.ok ? show.stdout : "";
         if (currentBranch !== branch) {
           // R28-1：已有 worktree 的 hot checkout 前插桩 + 验 lease
           await failpoint("ensure.beforeHotCheckout");
           assertLease();
-          const switched = await runGit(workDir, ["checkout", branch]);
+          // R29-2：hot checkout 挂 abort——stop/finalize revoke 可中止
+          const switched = await runGit(
+            workDir,
+            ["checkout", branch],
+            60_000,
+            job,
+          );
           if (!switched.ok) {
             // 工作区脏 / 冲突等会导致 checkout 失败——抛清晰提示，让用户先处理，不带病推进
             const where = currentBranch || "detached HEAD";
@@ -593,7 +655,7 @@ const ensureTaskWorktreesInner = async (ctx: {
           );
         }
         // 热路径 dep clone：逐单元验 lease（不补偿移除已有 worktree）
-        const dirs = await cloneDepDirs(repoPath, workDir, assertLease);
+        const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
         if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
         continue;
       }
@@ -610,10 +672,15 @@ const ensureTaskWorktreesInner = async (ctx: {
       await fs.rm(workDir, { recursive: true, force: true });
     }
     // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）
-    await runGit(repoPath, ["worktree", "prune"]);
+    await runGit(repoPath, ["worktree", "prune"], 60_000, job);
 
     const localBranchExists = (
-      await runGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
+      await runGit(
+        repoPath,
+        ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+        60_000,
+        job,
+      )
     ).ok;
 
     // addArgs 存下来：撞「已删任务孤儿占用」时可 force-remove 后原样重试一次
@@ -626,11 +693,17 @@ const ensureTaskWorktreesInner = async (ctx: {
       // 远程可能有同名分支（用户在别的机器 / 之前推过）→ fetch 后基于它建本地。
       // best-effort、30s 上限：fetch 只是「拿最新」的锦上添花、慢网络 / 被墙远程（github）
       // 挂太久会把整个推进卡住（实测 120s×2 把 advance 拖到 4 分钟+）、超时就用本地现有引用
-      await runGit(repoPath, ["fetch", "origin", branch], 30_000);
+      // R29-2：fetch 挂 abort（可达 30s）
+      await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
       // fetch（可达 30s）完成后验 lease——期间 finalize 可已终结任务
       assertLease();
       const remoteBranchExists = (
-        await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `origin/${branch}`])
+        await runGit(
+          repoPath,
+          ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
+          60_000,
+          job,
+        )
       ).ok;
       if (remoteBranchExists) {
         addArgs = [
@@ -646,10 +719,12 @@ const ensureTaskWorktreesInner = async (ctx: {
         // 全新分支：基于线上分支建。base = 设置页快照、缺省探 origin/HEAD
         let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";
         if (!base) {
-          const head = await runGit(repoPath, [
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-          ]);
+          const head = await runGit(
+            repoPath,
+            ["symbolic-ref", "refs/remotes/origin/HEAD"],
+            60_000,
+            job,
+          );
           base = head.ok ? head.stdout.replace("refs/remotes/origin/", "") : "";
         }
         if (!base) {
@@ -662,21 +737,27 @@ const ensureTaskWorktreesInner = async (ctx: {
             `仓库 ${repoPath} 线上分支名非法「${base}」、拒绝创建隔离工作区`,
           );
         }
-        await runGit(repoPath, ["fetch", "origin", base], 30_000); // best-effort、同上 30s 上限
+        // R29-2：base fetch 挂 abort
+        await runGit(repoPath, ["fetch", "origin", base], 30_000, job);
         // base fetch 完成后同样验 lease
         assertLease();
         // 起点优先 origin/<base>（最新）、离线 / 无远程时回退本地 <base>
         const startPoint = (
-          await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `origin/${base}`])
+          await runGit(
+            repoPath,
+            ["rev-parse", "--verify", "--quiet", `origin/${base}`],
+            60_000,
+            job,
+          )
         ).ok
           ? `origin/${base}`
           : (
-                await runGit(repoPath, [
-                  "show-ref",
-                  "--verify",
-                  "--quiet",
-                  `refs/heads/${base}`,
-                ])
+                await runGit(
+                  repoPath,
+                  ["show-ref", "--verify", "--quiet", `refs/heads/${base}`],
+                  60_000,
+                  job,
+                )
               ).ok
             ? base
             : "";
@@ -703,7 +784,8 @@ const ensureTaskWorktreesInner = async (ctx: {
     // 测试矩阵按此名注入（ensure.beforeWorktreeAdd）
     await failpoint("ensure.beforeWorktreeAdd");
     assertLease();
-    let added = await runGit(repoPath, addArgs, 120_000);
+    // R29-2：worktree add（可达 120s）挂 abort
+    let added = await runGit(repoPath, addArgs, 120_000, job);
     if (!added.ok) {
       // 存量孤儿自愈：老版本删任务时快照失败会 skip 删除，留下 worktree 目录 + 分支占用。
       // 若占用方是「已删任务」的孤儿 → force remove + prune 后重试一次 add。
@@ -711,7 +793,7 @@ const ensureTaskWorktreesInner = async (ctx: {
         // retry 也是一次独立 add——同样验 lease
         await failpoint("ensure.beforeWorktreeAdd");
         assertLease();
-        added = await runGit(repoPath, addArgs, 120_000);
+        added = await runGit(repoPath, addArgs, 120_000, job);
       }
     }
     if (!added.ok) {
@@ -742,7 +824,7 @@ const ensureTaskWorktreesInner = async (ctx: {
       assertLease();
       await copyRootEnvFiles(repoPath, workDir);
       // dep clone：每单元前验 lease（600s 大头）；失主走外层补偿
-      const dirs = await cloneDepDirs(repoPath, workDir, assertLease);
+      const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
       if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
     } catch (err) {
       if (err instanceof WorktreeLeaseLostError) {
@@ -791,6 +873,8 @@ const cloneDepDirs = async (
   workDir: string,
   /** R28-1：每个 dep 单元真正开 clone 前验 lease（必填由调用方传入） */
   assertLease: () => void,
+  /** R29-2：resource job——`cp -Rc`（可达 600s）挂 abort */
+  job: ResourceJobHandle,
 ): Promise<string[]> => {
   const cloned: string[] = [];
   for (const dir of CLONABLE_DEP_DIRS) {
@@ -803,9 +887,15 @@ const cloneDepDirs = async (
     await failpoint("ensure.beforeDepClone");
     assertLease();
     if (process.platform !== "darwin") continue; // clonefile 仅 APFS、其它平台回退 agent 自装
+    // R29-2：cp -Rc 挂 AbortController——revoke 中止后清半截残留并让位
+    const ac = new AbortController();
+    registerJobAbort(job.taskId, job.jobId, () => ac.abort());
     try {
       // -c = clonefile；大目录（几十万文件）逐文件克隆也只是元数据操作、给足超时
-      await execFileAsync("cp", ["-Rc", src, dst], { timeout: 600_000 });
+      await execFileAsync("cp", ["-Rc", src, dst], {
+        timeout: 600_000,
+        signal: ac.signal,
+      });
       // 构建工具缓存必须删（V0.13.x、用户实测「worktree 里 dev server 热更新极慢 /
       // 刷新一直 loading」）：webpack / babel / vue-cli 等的 node_modules/.cache 里
       // 记录的是**原仓库的绝对路径**、克隆过来后路径全错——dev server 每次都缓存
@@ -819,12 +909,19 @@ const cloneDepDirs = async (
     } catch (err) {
       // 半截残留必须清掉——否则 agent 看到目录存在就不装了、比没有更坑
       await fs.rm(dst, { recursive: true, force: true }).catch(() => {});
-      // R28-1：lease 让位错误必须冒泡（不可当 clone 失败静默吞掉）
+      // R28-1 / R29-2：lease 让位 / revoke abort 必须冒泡（不可当 clone 失败静默吞掉）
       if (err instanceof WorktreeLeaseLostError) throw err;
+      if (isExecAborted(err, ac.signal)) {
+        throw new WorktreeLeaseLostError(
+          "R29-2：依赖克隆 cp 子进程被 revoke 中止、资源操作让位",
+        );
+      }
       console.warn(
         `[task-worktrees] 依赖目录 ${dir} 克隆失败（回退 agent 自装）repo=${repoPath}：`,
         err,
       );
+    } finally {
+      registerJobAbort(job.taskId, job.jobId, null);
     }
   }
   return cloned;

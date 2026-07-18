@@ -8,15 +8,27 @@
  * - 被顶掉的旧进程迟到 exit 不清新进程的 pidfile（旧实现 exit 回调无条件清）
  * - killStalePreview 杀前核验 PID 归属：pidfile 记的命令跟实际进程对不上（PID
  *   被复用）时不发信号（旧实现盲杀）
+ *
+ * R29-3 适配：spawn 前最终准入读盘 repoStatus——本文件无真实 task meta，
+ * mock readTaskRepoStatusFresh 恒返 developing（断言不弱化、只补准入前置）。
  */
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const TMP_ROOT = path.join(os.tmpdir(), `fe-preview-it-${Date.now()}`);
 process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
+
+// R29-3：准入查盘——集成测无 meta，mock 成 developing 以保留原 spawn/pidfile 回归
+vi.mock("@/lib/server/task-fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/server/task-fs")>();
+  return {
+    ...actual,
+    readTaskRepoStatusFresh: async () => "developing" as const,
+  };
+});
 
 import {
   getPreviewStatus,

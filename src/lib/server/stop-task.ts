@@ -28,6 +28,7 @@ import {
   isTaskStarting,
   pendingStopRequests,
   publishTaskStreamEvent,
+  revokeResourceJobs,
   revokeTaskOps,
   writeEventAndPublish,
 } from "./task-stream";
@@ -108,16 +109,18 @@ const runStopTaskAgent = async (
       invalidateCallerToken(id);
     }
 
-    // R29-A：revoke 后 join resourceJobs（对照 finalizeTask）——等在飞 ensure/worktree
-    // 归零再收尾；上限 30s、超时 warn 继续（lease/revoke 已挡后续副作用）。
+    // R29-2：先 revoke（中止 checkout / cp 等已挂 abort 的子进程），再 join 等计数归零。
+    // revoke 后子进程秒退、join 大概率 1-2s 内收敛；30s 上限保留为「abort 都没退干净」
+    // 的极端兜底——超时仍 warn 继续（abort 已发出、残余风险大幅缩小）。
     {
+      revokeResourceJobs(id);
       const deadline = Date.now() + 30_000;
       while (hasResourceJobs(id) && Date.now() < deadline) {
         await new Promise<void>((r) => setTimeout(r, 50));
       }
       if (hasResourceJobs(id)) {
         console.warn(
-          `[stop-task] R29-A：task=${id} 等待 resourceJobs 归零超时（~30s）、继续收尾`,
+          `[stop-task] R29-2：task=${id} revoke 后等待 resourceJobs 归零超时（~30s 极端兜底）、继续收尾`,
         );
       }
     }

@@ -74,14 +74,24 @@ export const POST = async (req: Request) => {
     );
   }
 
-  const { replacedTaskTitle, status } = await startPreview({
+  const started = await startPreview({
     taskId,
     taskTitle: task.title,
     repoPath,
     workDir,
     command,
   });
-  return NextResponse.json({ slot: status, replacedTaskTitle });
+  // R29-3：队列内最终准入拒绝（finalize/DELETE 已完成）→ 409，无新 pid
+  if (started.yielded) {
+    return errorResponse(
+      started.yieldReason ?? "任务已终结或正在停止、不能起预览",
+      409,
+    );
+  }
+  return NextResponse.json({
+    slot: started.status,
+    replacedTaskTitle: started.replacedTaskTitle,
+  });
 };
 
 export const DELETE = async (req: Request) => {

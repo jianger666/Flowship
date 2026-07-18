@@ -38,6 +38,7 @@ import {
   safeNotifyAwaiting,
   sessionTransports,
   type AskUserQuestion,
+  type NotifyAwaitingResult,
 } from "./chat-pending";
 
 /** R29-2：notify 未送达时工具返回（反登记后、非 ASK_SUBMITTED） */
@@ -62,6 +63,33 @@ const submittedText = (actionId: string): string =>
     "- 不要输出总结（用户在看板看 timeline 就够）",
     "- 用户的决定（通过 / 再聊聊 / 推进下一步）之后会作为**新消息**发给你、你会在同一会话里继续",
   ].join("\n");
+
+/**
+ * R29-5：把 safeNotifyAwaiting 结果映射为 submit_work 工具文案。
+ * 导出供 ownership-r30 断言「stale/busy 不是 submitted」。
+ */
+export const mapSubmitWorkNotifyToToolText = (
+  notifyResult: NotifyAwaitingResult,
+  actionId: string,
+): string => {
+  if (notifyResult.status === "error") {
+    return `交卷未受理：${notifyResult.message}`;
+  }
+  if (notifyResult.status === "busy") {
+    return `交卷未受理：${notifyResult.message}`;
+  }
+  if (notifyResult.status === "stale") {
+    return "该 action 已结束/已被后续操作取代、请结束本轮回复";
+  }
+  if (notifyResult.status === "mismatch") {
+    return CALLER_MISMATCH_ERROR;
+  }
+  if (notifyResult.status === "no_notifier") {
+    return "交卷未受理：任务当前没有活跃会话桥（可能已被停止/接管）、请结束本轮回复";
+  }
+  // accepted | delivered
+  return submittedText(actionId);
+};
 
 // 旧「待命态」姿势（不带 action_id）兜底：告诉 agent 直接结束回复
 const idleWaitText = (): string =>
@@ -174,36 +202,17 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         artifactPath: artifact_path,
         callerToken,
       });
-      // R29：notifier 抛错（如同 action 的 submit_mr 屏障超时 fail-closed）不再吞——
-      // 返回真实错误让 agent 稍后重试 submit_work，而不是假「已交卷」结束 turn
-      if (notifyResult.status === "error") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `交卷未受理：${notifyResult.message}`,
-            },
-          ],
-        };
-      }
+      // R29 / R29-5：只有 accepted/delivered 才报「已交卷」；stale/busy 走 mapSubmitWorkNotifyToToolText
       if (notifyResult.status === "mismatch") {
         return callerMismatchContent();
       }
-      // R29-2B-P2：无活跃 bridge（notifier 已注销、agent 是孤儿）不得宣告交卷成功——
-      // postCheck 永不会启动、假「已交卷」会让 agent 结束 turn 留僵尸 running
-      if (notifyResult.status === "no_notifier") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "交卷未受理：任务当前没有活跃会话桥（可能已被停止/接管）、请结束本轮回复",
-            },
-          ],
-        };
-      }
-
       return {
-        content: [{ type: "text" as const, text: submittedText(action_id) }],
+        content: [
+          {
+            type: "text" as const,
+            text: mapSubmitWorkNotifyToToolText(notifyResult, action_id),
+          },
+        ],
       };
     };
 

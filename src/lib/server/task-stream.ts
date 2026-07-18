@@ -292,7 +292,10 @@ export {
   endResourceJob,
   hasResourceJobs,
   clearResourceJobs,
+  registerJobAbort,
+  revokeResourceJobs,
 } from "./resource-jobs";
+export type { ResourceJobHandle } from "./resource-jobs";
 
 /**
  * 准入快照（路由入场同步取；语义 = 旧 getTaskOpGeneration）。
@@ -469,6 +472,32 @@ export const writeEventAndPublish = async (
     return null;
   }
 };
+
+/**
+ * R29-4：用户输入落盘（correctness-critical）——append 失败不得伪装成功。
+ *
+ * - ENOENT / 任务已删 / lease 拒写 → 返 null（调用方按 404/410 处理）
+ * - 其它 IO 错误（EIO / ENOSPC / EACCES…）→ **抛错**，由 route 决定 5xx 或 persistWarning
+ *
+ * best-effort 日志 / 系统提示继续用 {@link writeEventAndPublish}（吞错返 null）。
+ */
+export const writeUserEventAndPublishStrict = async (
+  taskId: string,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
+  lease?: () => boolean,
+): Promise<TaskEvent | null> => {
+  // 不吞错：appendEvent 已对非 ENOENT 透传 throw
+  return await appendEvent(taskId, ev, lease, (event) => {
+    publish(taskId, { kind: "event", event });
+  });
+};
+
+/** R29-4：send 后落盘失败时 HTTP body 用的固定文案 */
+export const PERSIST_WARNING_DELIVERED =
+  "已送达但持久化失败" as const;
+
+/** R29-4：send 前落盘失败时 HTTP 错误文案 */
+export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as const;
 
 /**
  * R27-6：owned 事件 sink——lease 必填，缺省即编译失败。

@@ -53,9 +53,9 @@ import {
   patchActionAndRunStatusIfOpFresh,
 } from "./task-fs";
 import {
-  beginActionSideEffect,
-  endActionSideEffect,
-  waitForActionSideEffectClear,
+  releaseSideEffect,
+  tryClaimSideEffect,
+  waitAndClaimPostCheck,
 } from "./action-side-effects";
 import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
 import {
@@ -125,6 +125,7 @@ import {
   publish,
   publishIfCurrent,
   releaseTaskOpIf,
+  revokeResourceJobs,
   revokeTaskOps,
   runningChecks,
   runningTasks,
@@ -499,7 +500,14 @@ const runActionPostCheck = (
   artifactPath: string | undefined,
 ): void => {
   // 顶替：同 task 已有在跑的 check（agent 反复 wait、或换了 action）→ abort 旧的、本轮用最新代码重跑
-  runningChecks.get(taskId)?.controller.abort();
+  const prev = runningChecks.get(taskId);
+  prev?.controller.abort();
+  // R29-1：顶替不同 action 的 check 时释放旧 action 的 postcheck claim；
+  // 同 action 重交卷保留 claim（waitAndClaimPostCheck 已持有 / 重入）
+  if (prev && prev.actionId !== actionId) {
+    releaseSideEffect(taskId, prev.actionId, "postcheck");
+  }
+  if (prev) runningChecks.delete(taskId);
 
   const controller = new AbortController();
   const self: RunningCheck = { actionId, controller };
@@ -507,9 +515,14 @@ const runActionPostCheck = (
   // R24-1：启动时快照 gen——resume/advance 会 abortRunningCheck；stop/DELETE 会 revoke bump gen
   const checkGen = getTaskOpGeneration(taskId);
 
-  /** R24-1 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验） */
+  /**
+   * R24-1 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验）。
+   * R29-1：真正摘掉自己时同步 release postcheck claim（防 stop/作废泄漏）。
+   */
   const dropSelf = (): void => {
-    if (runningChecks.get(taskId) === self) runningChecks.delete(taskId);
+    if (runningChecks.get(taskId) !== self) return;
+    runningChecks.delete(taskId);
+    releaseSideEffect(taskId, actionId, "postcheck");
   };
 
   void (async () => {
@@ -633,6 +646,8 @@ export const abortRunningCheck = (taskId: string): void => {
   if (!cur) return;
   cur.controller.abort();
   runningChecks.delete(taskId);
+  // R29-1：stop/advance 中止 check 时释放 postcheck claim，防泄漏挡后续 submit_mr
+  releaseSideEffect(taskId, cur.actionId, "postcheck");
   console.log(
     `[task-runner] abortRunningCheck task=${taskId} action=${cur.actionId}`,
   );
@@ -1560,10 +1575,10 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // R28-1：写终态前轮询等在飞 create/resume（isTaskStarting）与 resource job 归零——
-    // revoke/lifecycle/lease 已让它们自然让位；join 只缩窗（资源操作可比启动长）。
-    // 正确性不依赖超时——超时 warn 后继续（revoke + lease 已挡后续副作用）。
+    // R29-2：先 revokeResourceJobs（中止在跑 checkout/cp），再 join starting + resourceJobs。
+    // revoke 后子进程秒退、join 大概率速收敛；30s = abort 后仍未退干净的极端兜底。
     {
+      revokeResourceJobs(taskId);
       const deadline = Date.now() + 30_000;
       while (
         (isTaskStarting(taskId) || hasResourceJobs(taskId)) &&
@@ -1573,7 +1588,7 @@ export const finalizeTask = async (
       }
       if (isTaskStarting(taskId) || hasResourceJobs(taskId)) {
         console.warn(
-          `[task-runner] finalizeTask: task=${taskId} 等待 starting/resourceJobs 归零超时（~30s）、继续终结`,
+          `[task-runner] finalizeTask: task=${taskId} revoke 后等待 starting/resourceJobs 归零超时（~30s 极端兜底）、继续终结`,
         );
       }
     }
@@ -1839,20 +1854,12 @@ export const buildSessionBridges = (
         };
       }
 
-      // R28-4：反向屏障——同 action 的 post-check 在飞时拒入场、不 abort check（R24-6 语义保留）
-      const inFlightCheck = runningChecks.get(task.id);
-      if (inFlightCheck?.actionId === mr.actionId) {
+      // R29-1：单一 claim 状态机——已有 mr/postcheck claim 一律拒入（不再查 runningChecks）
+      if (!tryClaimSideEffect(task.id, mr.actionId, "mr")) {
         return {
           ok: false,
-          error: "正在收尾检查、稍后重试",
-        };
-      }
-
-      // R28-4 / R29-P2c：登记 in-flight side effect——同 action 并行 submit_mr 互斥
-      if (!beginActionSideEffect(task.id, mr.actionId, "submit_mr")) {
-        return {
-          ok: false,
-          error: "同 action 的 MR 提交正在进行、稍后重试",
+          error:
+            "该 action 正有其它副作用进行（MR 提交或收尾检查）、稍后重试",
         };
       }
       try {
@@ -2098,8 +2105,8 @@ export const buildSessionBridges = (
           },
         };
       } finally {
-        // R28-4：无论成功 / skipped_local / 拒写，都要摘掉 in-flight 登记
-        endActionSideEffect(task.id, mr.actionId, "submit_mr");
+        // R29-1：无论成功 / skipped_local / 拒写，都要 release mr claim
+        releaseSideEffect(task.id, mr.actionId, "mr");
       }
     }
 
@@ -2207,10 +2214,13 @@ export const buildSessionBridges = (
   };
 
   // 具名化：create 失败 / 旧会话迟到清理走 conditional unset，防 force-new-agent race 误清新 handler
+  // R29-5：结构化返回 accepted | stale | busy——scope no-op 不再被工具层当「已交卷」
   const awaitingNotifier: AwaitingNotifier = async (signal, ctx) => {
     const { callerStillValid } = ctx;
     // R24-2 / R25-3：bridge 有效期 = callerToken 仍匹配；lifecycle 进行中拒写
-    if (!callerStillValid() || getChatLifecycle(task.id) !== null) return;
+    if (!callerStillValid() || getChatLifecycle(task.id) !== null) {
+      return "stale";
+    }
 
     if (signal.kind === "ask_user_request") {
       // R27-5：ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
@@ -2230,7 +2240,7 @@ export const buildSessionBridges = (
       if (!askLease()) {
         // R26-3：按本次 askId 反登记——不得裸 cancel 误删 B 刚登记的新提问
         cancelPendingIf(task.id, signal.askId);
-        return;
+        return "stale";
       }
       const previewText = signal.questions
         .map((q, idx) => `Q${idx + 1}: ${q.question}`)
@@ -2251,7 +2261,7 @@ export const buildSessionBridges = (
     );
       if (!askLease()) {
         cancelPendingIf(task.id, signal.askId);
-        return;
+        return "stale";
       }
       const updated = await setTaskRunStatusIfRunOwner(
         task.id,
@@ -2259,7 +2269,8 @@ export const buildSessionBridges = (
         askLease,
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
-      return;
+      // R29-5：ask 成功路径显式 accepted
+      return "accepted";
     }
 
     // awaiting_start：agent 完成一个 action 调 submit_work(action_id) → 后台跑 check + 切 awaiting_ack
@@ -2270,36 +2281,45 @@ export const buildSessionBridges = (
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       // R24-1：postCheck 独立租约、不传 run opHandle
-      // R28-4 / R29-C：同 action 有在飞 submit_mr → 先等其结束再启 check；
-      // 超时 fail-closed（拒启 check、工具错误让 agent 重试 submit_work）
+      // R29-1：waitAndClaimPostCheck 等 mr 清空后同 tick claim postcheck——关交接空窗
       await failpoint("mcp.submitWork.beforeCheckStart");
-      if (!callerStillValid()) return;
-      const barrier = await waitForActionSideEffectClear(
-        task.id,
-        signal.actionId,
-      );
-      if (!callerStillValid()) return;
-      if (barrier === "timeout") {
-        // R29-C：不 abort、不 warn 后继续——给 agent 可重试的工具错误
-        throw new Error(
-          "MR 提交仍在进行、稍后重试 submit_work",
-        );
+      if (!callerStillValid()) return "stale";
+      const claim = await waitAndClaimPostCheck(task.id, signal.actionId, {
+        stillValid: async () =>
+          callerStillValid() &&
+          getChatLifecycle(task.id) === null &&
+          (await isCurrentRunningAction(task.id, signal.actionId!)),
+      });
+      if (claim === "timeout") {
+        // R29-5：busy（非 throw）——工具层返回重试文案，不再假「已交卷」
+        return "busy";
       }
-      // R26-4：abort runningChecks 之前先锁内验 current+running——旧 action 迟到不得杀 B 的 check
+      if (claim === "invalid") return "stale";
+      // claimed：R26-4 failpoint 窗口内 submit_mr 必被 postcheck claim 拒
       await failpoint("mcp.submitWork.beforeAbortCheck");
-      if (!callerStillValid()) return;
+      if (!callerStillValid()) {
+        releaseSideEffect(task.id, signal.actionId, "postcheck");
+        return "stale";
+      }
       const scopeOk = await isCurrentRunningAction(task.id, signal.actionId);
-      if (!scopeOk || !callerStillValid()) return;
+      if (!scopeOk || !callerStillValid()) {
+        releaseSideEffect(task.id, signal.actionId, "postcheck");
+        return "stale";
+      }
       runActionPostCheck(task.id, signal.actionId, signal.artifactPath);
-    } else {
-      // 待命态：agent ack 完、调 submit_work(空 action_id) 等下一 action 指令 → 切 awaiting_user。
-      // 用 setTaskAwaitingIfIdle（锁内 compare-set）防 force-new 秒推 race：approve 后用户秒推下一 action、
-      //   advanceTask 已把 runStatus 设 running 且新 action 在跑时、此处被取消的旧 agent 迟到的待命通知
-      //   不能把 running 覆盖回 awaiting_user（否则新 action 在跑却显示「等待回复」、推进按钮误亮、僵尸组合）。
-      if (!callerStillValid() || getChatLifecycle(task.id) !== null) return;
-      const updated = await setTaskAwaitingIfIdle(task.id);
-      if (updated) publish(task.id, { kind: "task", task: updated });
+      return "accepted";
     }
+
+    // 待命态：agent ack 完、调 submit_work(空 action_id) 等下一 action 指令 → 切 awaiting_user。
+    // 用 setTaskAwaitingIfIdle（锁内 compare-set）防 force-new 秒推 race：approve 后用户秒推下一 action、
+    //   advanceTask 已把 runStatus 设 running 且新 action 在跑时、此处被取消的旧 agent 迟到的待命通知
+    //   不能把 running 覆盖回 awaiting_user（否则新 action 在跑却显示「等待回复」、推进按钮误亮、僵尸组合）。
+    if (!callerStillValid() || getChatLifecycle(task.id) !== null) {
+      return "stale";
+    }
+    const updated = await setTaskAwaitingIfIdle(task.id);
+    if (updated) publish(task.id, { kind: "task", task: updated });
+    return "accepted";
   };
   return { taskActionHandler, awaitingNotifier };
 };

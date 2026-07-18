@@ -77,6 +77,7 @@ import {
   META_FILE,
   actionArtifactRelPath,
   appendEventLine,
+  clearEventSeqCounter,
   ensureDataDir,
   exists,
   getTaskWorkspaceDir,
@@ -540,6 +541,8 @@ export const deleteTask = async (id: string): Promise<boolean> => {
         maxRetries: 5,
         retryDelay: 100,
       });
+      // R29-6：文件真删后才清 seq——stop/cleanup 不再清
+      clearEventSeqCounter(id);
       return true;
     } catch (err) {
       if (!isDeleteBusyError(err)) throw err;
@@ -556,6 +559,8 @@ export const deleteTask = async (id: string): Promise<boolean> => {
         "utf-8",
       );
       await fs.unlink(path.join(dir, META_FILE)).catch(() => {});
+      // R29-6：tombstone 后 events 不再作为合法日志——一并清 counter
+      clearEventSeqCounter(id);
       console.warn(
         `[task-fs] deleteTask: 目录被锁，已降级 tombstone id=${id}`,
         err,
@@ -585,6 +590,11 @@ const lastMetaTouchAt = new Map<string, number>();
  *
  * @param lease R26-5：可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
  * @param onCommitted R28-5：可选；链内写行成功后同步回调（writeEventAndPublish 传 publish）
+ *
+ * R29-4 错误语义（调用方零影响、透传已存在）：
+ * - ENOENT / lease 拒写 → 返 null（不抛）
+ * - 其它 IO 错误（EIO / ENOSPC / EACCES…）→ 向上抛，由 writeEventAndPublish 吞、
+ *   或由 writeUserEventAndPublishStrict 交给 route 处理
  */
 export const appendEvent = async (
   taskId: string,
@@ -599,6 +609,7 @@ export const appendEvent = async (
     ...ev,
   };
   // R28-5：写行 + onCommitted（publish）同进 per-task append 链
+  // R29-4：非 ENOENT 错误由 appendEventLineUnlocked 原样抛出（透传、不吞）
   const wrote = await appendEventLine(taskId, event, lease, onCommitted);
   if (!wrote) return null;
 

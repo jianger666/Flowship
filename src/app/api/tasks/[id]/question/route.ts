@@ -35,10 +35,13 @@ import {
 import {
   agentSessions,
   getTaskOpGeneration,
+  PERSIST_FAIL_RETRY_MESSAGE,
+  PERSIST_WARNING_DELIVERED,
   publishTaskStreamEvent,
   runningTasks,
   waitForTaskToStop,
   writeEventAndPublish,
+  writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { buildSkillDirective } from "@/lib/protocol-signals";
@@ -290,7 +293,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 用户绕开 ask 弹窗直接在输入条说话 = 旧弹窗事实作废（send：agent 收到新消息就继续了；
   // oneshot：旧会话已死、答案永远送不到）。不作废的话弹窗永远挂着（用户实测卡死、再答 409）。
   // canResume 分支不用管——resumeCurrentActionWithMessage 内部已 supersede。
-  if (sent || useOneShot) {
+  // R29-4：send 后可先清 pending；send 前（oneshot）须等用户原文落盘成功再清
+  if (sent) {
     await supersedePendingAsks(task.id, "用户已在输入条继续对话");
     clearPendingAsk(task.id);
   }
@@ -300,18 +304,55 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
-  // R29-1：用户提问事件写+publish 同链
-  await writeEventAndPublish(task.id, {
-    kind: "user_reply",
-    actionId: task.currentActionId ?? undefined,
-    text: text || "(用户附了图片 / 文件提问)",
-    meta: {
-      kind: "question",
-      ...(savedImages && savedImages.length > 0 ? { images: savedImages } : {}),
-      // 前端 extractUserReplyAttachments 读 meta.attachments（对象数组）渲染路径 chips
-      ...(attachmentPaths.length > 0 ? { attachments: attachResult.metas } : {}),
-    },
-  });
+  // R29-4：用户原文 strict 落盘
+  // - sent（send 后）：失败 → 200 + persistWarning，不伪装未发送
+  // - !sent（resume/oneshot、start 前）：失败 → 5xx、不继续、不清 pending
+  let persistWarning: string | undefined;
+  try {
+    const wrote = await writeUserEventAndPublishStrict(task.id, {
+      kind: "user_reply",
+      actionId: task.currentActionId ?? undefined,
+      text: text || "(用户附了图片 / 文件提问)",
+      meta: {
+        kind: "question",
+        ...(savedImages && savedImages.length > 0 ? { images: savedImages } : {}),
+        // 前端 extractUserReplyAttachments 读 meta.attachments（对象数组）渲染路径 chips
+        ...(attachmentPaths.length > 0
+          ? { attachments: attachResult.metas }
+          : {}),
+      },
+    });
+    if (!wrote) {
+      if (sent) {
+        persistWarning = PERSIST_WARNING_DELIVERED;
+        console.error(
+          `[question] R29-4 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+        );
+      } else {
+        return errorResponse("not_found", 404);
+      }
+    }
+  } catch (persistErr) {
+    if (sent) {
+      console.error(
+        `[question] R29-4 已送达但持久化失败 task=${task.id}:`,
+        persistErr,
+      );
+      persistWarning = PERSIST_WARNING_DELIVERED;
+    } else {
+      console.error(
+        `[question] R29-4 start 前落盘失败 task=${task.id}:`,
+        persistErr,
+      );
+      return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
+    }
+  }
+
+  // oneshot：落盘成功后再作废旧 ask（R29-4：失败路径不得清 pending）
+  if (!sent && useOneShot) {
+    await supersedePendingAsks(task.id, "用户已在输入条继续对话");
+    clearPendingAsk(task.id);
+  }
 
   // send 成功且产出在等审阅：action 回 running（agent 处理完会重新交卷回 awaiting_ack）——
   // 原 revise 的状态机语义、防「artifact 在改、UI 还显示等审阅」
@@ -338,10 +379,33 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
     // 返 null = 已 stale（stop 已接管）——消息已送达 run，task 状态归 stop；仍 200
     const fresh = await getTask(task.id);
-    return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        task: fresh ?? task,
+        ...(persistWarning ? { persistWarning } : {}),
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  }
+
+  // send 成功且无需改 ack 状态——直接 200（勿落入下方 one-shot 写 running）
+  if (sent) {
+    const fresh = await getTask(task.id);
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        task: fresh ?? task,
+        ...(persistWarning ? { persistWarning } : {}),
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
   }
 
   if (canResume) {
@@ -362,7 +426,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       opGen,
     }).catch(async (err) => {
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
-      // R29-1：唤醒失败审计事件写+publish 同链
+      // R29-1：唤醒失败审计事件写+publish 同链（best-effort 吞错）
       await writeEventAndPublish(task.id, {
         kind: "error",
         text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,

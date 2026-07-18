@@ -28,6 +28,7 @@ import {
   hasResourceJobs,
   isTaskStarting,
   pendingStopRequests,
+  revokeResourceJobs,
   revokeTaskOps,
   waitForTaskToStop,
 } from "@/lib/server/task-stream";
@@ -290,16 +291,17 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
     await waitForTaskToStop(id, 8000);
     await waitForChatToStop(id, 8000);
-    // U1 / R29-A：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
-    // 再轮询等 startingTasks **或** resourceJobs 退出（advance 首段 ensure 在
-    // beginTaskStarting 之前、靠 hasResourceJobs 覆盖），超时打 warn 继续。
+    // U1 / R29-2：waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
+    // 先 revokeResourceJobs 中止 checkout/cp，再 join starting/resourceJobs。
+    // 30s 上限 = abort 后仍未退干净的极端兜底（abort 已发出、残余风险缩小）。
     if (isTaskStarting(id) || hasResourceJobs(id)) {
+      revokeResourceJobs(id);
       const deadline =
         Date.now() + Math.max(DELETE_STARTING_WAIT_MS, DELETE_RESOURCE_WAIT_MS);
       while (isTaskStarting(id) || hasResourceJobs(id)) {
         if (Date.now() >= deadline) {
           console.warn(
-            `[DELETE /api/tasks/[id]] starting/resourceJobs 等待超时 task=${id}、继续删（pendingStop 仍在、启动链会自裁）`,
+            `[DELETE /api/tasks/[id]] R29-2：revoke 后 starting/resourceJobs 等待超时 task=${id}、继续删（极端兜底）`,
           );
           break;
         }

@@ -83,8 +83,11 @@ import {
   tryReserveChatStart,
 } from "@/lib/server/chat-gate";
 import {
+  PERSIST_FAIL_RETRY_MESSAGE,
+  PERSIST_WARNING_DELIVERED,
   publishTaskStreamEvent,
   writeEventAndPublish,
+  writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { buildSkillDirective } from "@/lib/protocol-signals";
@@ -245,11 +248,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 确定会送达后才写 user_reply（send 续接成功 / 起新会话前各调一次）
   // checkpointed:true → 批 B 前端据此显示「回退到这里」
+  // R29-4：用户原文走 strict——IO 失败抛错，不得吞成「成功但无气泡」
   const persistUserReply = async (checkpointed: boolean) => {
     const meta: Record<string, unknown> = { ...userReplyMeta };
     if (checkpointed) meta.checkpointed = true;
-    // R29-1：用户回复事件写+publish 同链
-    return writeEventAndPublish(task.id, {
+    return writeUserEventAndPublishStrict(task.id, {
       kind: "user_reply",
       text: text || fallbackText,
       meta: Object.keys(meta).length > 0 ? meta : undefined,
@@ -411,15 +414,31 @@ export const POST = async (req: Request, { params }: Ctx) => {
         );
         if (sent === "sent") {
           sentOk = true;
-          // send 已异步起 consumeChatRun；紧接着落 user_reply——通常仍早于 agent 首条事件，
-          // 极端竞态下气泡可能略晚于 assistant delta（可接受、优于假已发）
-          await persistReplyAndCheckpoint(capture);
+          // R29-4：send 后落盘——失败不能伪装未发送；带 persistWarning
+          let persistWarning: string | undefined;
+          try {
+            const replyEvent = await persistReplyAndCheckpoint(capture);
+            if (!replyEvent) {
+              // ENOENT（任务已删）→ 原文未落盘，但消息已送达
+              persistWarning = PERSIST_WARNING_DELIVERED;
+              console.error(
+                `[chat-reply] R29-4 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+              );
+            }
+          } catch (persistErr) {
+            console.error(
+              `[chat-reply] R29-4 已送达但持久化失败 task=${task.id}:`,
+              persistErr,
+            );
+            persistWarning = PERSIST_WARNING_DELIVERED;
+          }
           const fresh = await getTask(task.id);
           return new Response(
             JSON.stringify({
               ok: true,
               task: fresh ?? task,
               autoStarted: false,
+              ...(persistWarning ? { persistWarning } : {}),
             }),
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
@@ -571,21 +590,33 @@ export const POST = async (req: Request, { params }: Ctx) => {
             meta.attachments = head.attachmentMetas;
           }
           if (capture.ok) meta.checkpointed = true;
-          // R29-1：队列补给 user_reply 写+publish 同链
-          const replyEvent = await writeEventAndPublish(task.id, {
-            kind: "user_reply",
-            text: head.displayText,
-            meta: Object.keys(meta).length > 0 ? meta : undefined,
-          });
-          if (replyEvent) {
-            // user_reply 已落盘：后续若 setTaskRunStatus 等失败、塞回时须 skipPersistEvent，
-            // 否则 flush 补给会再落一条重复气泡
-            replyEventPersisted = true;
-            if (capture.ok) {
-              await persistCheckpointForReply(task.id, replyEvent.id, capture);
-            }
-            firstMessageEventId = replyEvent.id;
+          // R29-4：队列补给 user_reply——send/start 前 strict；失败 5xx、塞回队首、不起 session
+          let replyEvent;
+          try {
+            replyEvent = await writeUserEventAndPublishStrict(task.id, {
+              kind: "user_reply",
+              text: head.displayText,
+              meta: Object.keys(meta).length > 0 ? meta : undefined,
+            });
+          } catch (persistErr) {
+            console.error(
+              `[chat-reply] R29-4 队列补给落盘失败 task=${task.id}:`,
+              persistErr,
+            );
+            enqueueChatMessageFront(task.id, head);
+            return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
           }
+          if (!replyEvent) {
+            // ENOENT：任务已删——塞回并按 lease 失效收敛（abort 内会 enqueueFront）
+            return abortLeaseAndRequeue();
+          }
+          // user_reply 已落盘：后续若 setTaskRunStatus 等失败、塞回时须 skipPersistEvent，
+          // 否则 flush 补给会再落一条重复气泡
+          replyEventPersisted = true;
+          if (capture.ok) {
+            await persistCheckpointForReply(task.id, replyEvent.id, capture);
+          }
+          firstMessageEventId = replyEvent.id;
         }
 
         // S1：置 running / 起 session 前最后复查
@@ -650,7 +681,21 @@ export const POST = async (req: Request, { params }: Ctx) => {
     if (!isChatStartLeaseValid(task.id, startToken)) {
       return leaseAbortedResponse();
     }
-    const replyEvent = await persistReplyAndCheckpoint(capture);
+    // R29-4：start 前落盘失败 → 5xx、不起 session
+    let replyEvent;
+    try {
+      replyEvent = await persistReplyAndCheckpoint(capture);
+    } catch (persistErr) {
+      console.error(
+        `[chat-reply] R29-4 起会话前落盘失败 task=${task.id}:`,
+        persistErr,
+      );
+      return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
+    }
+    if (!replyEvent) {
+      // ENOENT：任务已删
+      return leaseAbortedResponse();
+    }
 
     // S1：置 running 前复查
     if (!isChatStartLeaseValid(task.id, startToken)) {

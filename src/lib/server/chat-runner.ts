@@ -1141,7 +1141,8 @@ const registerChatNotifier = (
     task.id,
     async (signal, ctx) => {
       // R25-3：chat 模式同样贯穿 caller 复查（签名对齐 task-runner）
-      if (!ctx.callerStillValid()) return;
+      // R29-5：显式返回 accepted | stale（不再 void 被工具层当 delivered）
+      if (!ctx.callerStillValid()) return "stale";
       // R29-1：本 run 实例仍 current（对齐 task 侧 setTaskRunStatusIfRunOwner(askLease)）
       const instanceStillCurrent = (): boolean =>
         runningChats.get(task.id)?.instanceId === instanceId;
@@ -1160,7 +1161,7 @@ const registerChatNotifier = (
         if (!askLease()) {
           // R26-3：按本次 askId 反登记——不得裸 cancel 误删 B 的新提问
           cancelPendingIf(task.id, signal.askId);
-          return;
+          return "stale";
         }
         const previewText = signal.questions
           .map((q, idx) => `Q${idx + 1}: ${q.question}`)
@@ -1183,7 +1184,7 @@ const registerChatNotifier = (
         );
         if (!askLease()) {
           cancelPendingIf(task.id, signal.askId);
-          return;
+          return "stale";
         }
         const updated = await setTaskRunStatusIfRunOwner(
           task.id,
@@ -1191,18 +1192,19 @@ const registerChatNotifier = (
           askLease,
         );
         if (updated) publish(task.id, { kind: "task", task: updated });
-        return;
+        return "accepted";
       }
       // submit_work 等非 ask 信号：chat 不用交卷、只切 awaiting_user（条件写）
       const submitOwner = (): boolean =>
         ctx.callerStillValid() && instanceStillCurrent();
-      if (!submitOwner()) return;
+      if (!submitOwner()) return "stale";
       const updated = await setTaskRunStatusIfRunOwner(
         task.id,
         "awaiting_user",
         submitOwner,
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
+      return "accepted";
     },
     callerToken,
   );

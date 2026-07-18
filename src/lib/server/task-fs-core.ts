@@ -594,7 +594,63 @@ const getEventSeqCounters = (): Map<string, number> => {
   return g[EVENT_SEQ_COUNTERS_KEY]!;
 };
 
-/** R28-5：为 task 发下一个单调 seq（1-based） */
+/**
+ * R29-6：从 events.jsonl 尾部恢复 last seq（读最后 ~64KB、倒扫首条带 seq 的事件）。
+ * 文件不存在 / 无 seq → 0。仅在 per-task append 链内调用（天然串行）。
+ */
+const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
+  const p = path.join(taskDir(taskId), EVENTS_FILE);
+  try {
+    const st = await fs.stat(p);
+    if (st.size <= 0) return 0;
+    const tailBytes = 64 * 1024;
+    const start = Math.max(0, st.size - tailBytes);
+    const fh = await fs.open(p, "r");
+    try {
+      const len = st.size - start;
+      const buf = Buffer.alloc(len);
+      await fh.read(buf, 0, len, start);
+      const text = buf.toString("utf-8");
+      const lines = text.split("\n");
+      // 非文件头起读时首行可能被截断，跳过
+      const startIdx = start > 0 ? 1 : 0;
+      for (let i = lines.length - 1; i >= startIdx; i--) {
+        const line = lines[i]?.trim();
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as { seq?: unknown };
+          if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
+            return parsed.seq;
+          }
+        } catch {
+          // 坏行跳过
+        }
+      }
+      return 0;
+    } finally {
+      await fh.close();
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+};
+
+/**
+ * R29-6：Map miss 时先从 durable 尾部灌入 counter，再发号。
+ * 必须在 append 链内 await——恢复与发号同序、无并发。
+ */
+const ensureEventSeqCounter = async (taskId: string): Promise<void> => {
+  const counters = getEventSeqCounters();
+  if (counters.has(taskId)) return;
+  const restored = await readMaxSeqFromDurableTail(taskId);
+  // 链内串行：await 后仍 miss 才写入（防极端重复 ensure）
+  if (!counters.has(taskId)) {
+    counters.set(taskId, restored);
+  }
+};
+
+/** R28-5：为 task 发下一个单调 seq（1-based）；调用前须 ensureEventSeqCounter */
 const nextEventSeq = (taskId: string): number => {
   const counters = getEventSeqCounters();
   const n = (counters.get(taskId) ?? 0) + 1;
@@ -614,7 +670,8 @@ const rollbackEventSeq = (taskId: string, seq: number): void => {
 };
 
 /**
- * R29-3：任务删除 / cleanup 时清 seq counter，防同 id 复用（极少）或测试泄漏导致空洞错乱。
+ * R29-6：仅在 events 文件真删（deleteTask）时清 seq counter。
+ * stop / cleanupChatTaskState 不再清——文件还在、counter 保持才单调。
  */
 export const clearEventSeqCounter = (taskId: string): void => {
   getEventSeqCounters().delete(taskId);
@@ -670,6 +727,8 @@ export const appendEventLine = async (
     await failpoint("event.inQueue");
     // R29-3：lease 拒绝路径不发号（不烧号）；发号紧挨即将 appendFile
     if (lease && !lease()) return false;
+    // R29-6：Map miss（stop 后 / 进程重启）→ 先从 durable 尾部恢复再发号
+    await ensureEventSeqCounter(id);
     // R28-5 / R29-3：链内、lease 通过后发号——与写盘 / publish 同序
     ev.seq = nextEventSeq(id);
     // R27-7：ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish

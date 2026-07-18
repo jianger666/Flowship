@@ -215,7 +215,7 @@ describe("ownership-r29-pipeline（事件 publish / ask 反登记 / seq）", () 
       async () => ({ ok: true as const }),
       tokenA,
     );
-    setChatAwaitingNotifier(id, async () => {}, tokenA);
+    setChatAwaitingNotifier(id, async () => "accepted" as const, tokenA);
 
     // 入口 mismatch：不登记 pending（R24-6 既有）
     const rejected = await dispatchAskUserForTest({
@@ -274,21 +274,21 @@ describe("ownership-r29-pipeline（事件 publish / ask 反登记 / seq）", () 
     expect(marked.map((e) => e.seq)).toEqual([1, 2]);
   });
 
-  it("R29-3：cleanupChatTaskState 清 seq counter", async () => {
+  it("R29-6：cleanupChatTaskState 后 seq 严格递增（不再重号）", async () => {
     const id = alloc();
     await writeMeta(makeMeta(id));
     const e1 = await writeEventAndPublish(id, {
       kind: "info",
-      text: "r29-3-before-cleanup",
+      text: "r29-6-before-cleanup",
     });
     expect(e1?.seq).toBe(1);
     cleanupChatTaskState(id);
-    // 同 id 再写——counter 已清，应从 1 重新发号
+    // R29-6：stop/cleanup 不清 counter——下一条必须严格大于 durable 尾
     const e2 = await writeEventAndPublish(id, {
       kind: "info",
-      text: "r29-3-after-cleanup",
+      text: "r29-6-after-cleanup",
     });
-    expect(e2?.seq).toBe(1);
+    expect(e2?.seq).toBeGreaterThan(e1!.seq!);
   });
 
   // ─────────────────────────────────────────────────────────────
