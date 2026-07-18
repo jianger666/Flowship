@@ -105,7 +105,7 @@ export const dispatchCardActionEvent = async (event: unknown): Promise<void> => 
   await cardActionHandler(event);
 };
 
-// ----------------- 注入结果钩子（S3c 接 reaction） -----------------
+// ----------------- 注入结果钩子（S3c：reaction + 撤回出队多订阅） -----------------
 
 export type InjectResultKind = "sent" | "queued" | "failed" | "skipped";
 
@@ -114,28 +114,60 @@ export type InjectResultPayload = {
   messageId: string;
   taskId?: string;
   error?: string;
+  /** 入队/注入时的用户文本（撤回出队按文本匹配用；可选） */
+  text?: string;
 };
 
 type InjectResultCb = (payload: InjectResultPayload) => void | Promise<void>;
 
-let injectResultCb: InjectResultCb | null = null;
+/** 多订阅者：reactions + recall 各自 listen，互不覆盖 */
+const injectResultListeners = new Set<InjectResultCb>();
 
-/** 注入结果钩子；S3c 用来点 GET/⏳/❌ */
+/**
+ * 追加注入结果监听；返回注销函数。
+ * S3c reactions / recall 用这个，避免单回调互相踩。
+ */
+export const addInjectResultListener = (
+  cb: InjectResultCb,
+): (() => void) => {
+  injectResultListeners.add(cb);
+  return () => {
+    injectResultListeners.delete(cb);
+  };
+};
+
+/**
+ * 兼容旧单测：传 cb 则清空后只挂这一个；传 null 清空全部。
+ * 生产代码请用 addInjectResultListener。
+ */
 export const onInjectResult = (cb: InjectResultCb | null): void => {
-  injectResultCb = cb;
+  injectResultListeners.clear();
+  if (cb) injectResultListeners.add(cb);
+};
+
+/** 单测清空监听 */
+export const __clearInjectResultListenersForTest = (): void => {
+  injectResultListeners.clear();
 };
 
 const emitInjectResult = async (payload: InjectResultPayload): Promise<void> => {
-  if (!injectResultCb) return;
-  try {
-    await injectResultCb(payload);
-  } catch (err) {
-    console.warn(
-      "[feishu-bridge/router] onInjectResult 回调失败:",
-      err instanceof Error ? err.message : err,
-    );
+  if (injectResultListeners.size === 0) return;
+  for (const cb of [...injectResultListeners]) {
+    try {
+      await cb(payload);
+    } catch (err) {
+      console.warn(
+        "[feishu-bridge/router] injectResult 回调失败:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 };
+
+/** 单测触发注入结果钩子（reactions / recall） */
+export const __emitInjectResultForTest = (
+  payload: InjectResultPayload,
+): Promise<void> => emitInjectResult(payload);
 
 // ----------------- 可注入依赖（单测 mock） -----------------
 
@@ -442,7 +474,8 @@ export const loadBridgeBootContext = async (): Promise<{
   return { apiKey, model, repoPaths };
 };
 
-const createChatTaskForBridge = async (
+/** 桥接侧建新 chat（/new 与 0 活跃自动建共用）；不改逻辑，仅导出给 commands */
+export const createChatTaskForBridge = async (
   title: string,
 ): Promise<{ taskId: string; title: string } | { error: string }> => {
   const boot = await loadBridgeBootContext();
@@ -762,6 +795,8 @@ export const routeInboundMessage = async (
     kind: parsedResp.queued ? "queued" : "sent",
     messageId: msg.message_id,
     taskId,
+    // 撤回出队：queued 时 recall 用 text 匹配队列条目
+    text: text || undefined,
   };
   await emitInjectResult(payload);
   return payload;

@@ -85,22 +85,13 @@ export const register = (): void => {
       );
     });
 
-  // 飞书 chat 桥接出向：全局 tap 订阅 task-stream（幂等、开关关闭时事件内 no-op）
-  void import("./lib/server/feishu-bridge/outbound")
-    .then((m) => m.ensureFeishuOutboundRegistered())
+  // 飞书 chat 桥接：出向 tap / 按钮回调 / 命令词 / 回执 / 撤回 / consumer 守护，
+  // 统一走 bootstrap 一处调齐（各模块 globalThis 幂等、开关关闭时全部 no-op）
+  void import("./lib/server/feishu-bridge/bootstrap")
+    .then((m) => m.ensureFeishuBridgeBootstrapped())
     .catch((err) => {
       console.warn(
-        "[instrumentation] 飞书桥接 outbound 注册失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
-
-  // 飞书 chat 桥接入向：event consume + keep-awake（30s 轮询、globalThis 幂等）
-  void import("./lib/server/feishu-bridge/inbound")
-    .then((m) => m.ensureBridgeRuntimePolling())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] 飞书桥接 inbound runtime 启动失败（不阻断启动）:",
+        "[instrumentation] 飞书桥接启动失败（不阻断启动）:",
         err instanceof Error ? err.message : err,
       );
     });

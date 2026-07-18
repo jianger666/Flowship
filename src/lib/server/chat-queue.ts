@@ -213,3 +213,27 @@ export const cleanupChatQueueState = (taskId: string): void => {
   generations().delete(taskId);
   endChatQueueInFlight(taskId);
 };
+
+/**
+ * 按谓词移除排队中的消息（飞书撤回同步出队）。
+ * 不碰 in-flight / generation——只删还在队列里、尚未 dequeue 的条目。
+ * @returns 被移除的消息列表（可能为空）
+ */
+export const removeQueuedChatMessages = (
+  taskId: string,
+  predicate: (m: QueuedChatMsg) => boolean,
+): QueuedChatMsg[] => {
+  const map = queues();
+  const cur = map.get(taskId);
+  if (!cur || cur.length === 0) return [];
+  const kept: QueuedChatMsg[] = [];
+  const removed: QueuedChatMsg[] = [];
+  for (const m of cur) {
+    if (predicate(m)) removed.push(m);
+    else kept.push(m);
+  }
+  if (removed.length === 0) return [];
+  if (kept.length === 0) map.delete(taskId);
+  else map.set(taskId, kept);
+  return removed;
+};

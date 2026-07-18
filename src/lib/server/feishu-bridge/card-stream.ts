@@ -9,6 +9,7 @@
 
 import { getDeepLink } from "./bridge-config";
 import { rememberCardMessage } from "./card-map";
+import { nextCardSequence } from "./card-seq";
 import {
   batchUpdateCard,
   createCardEntity,
@@ -175,8 +176,6 @@ export const createCardStream = (
   let cardId: string | undefined;
   /** 发出的 interactive 消息 id */
   let messageId: string | undefined;
-  /** 单调递增 sequence（同卡所有更新共用） */
-  let sequence = 0;
   /** lark 调用失败累计 */
   let failCount = 0;
   /** 是否已 start / finalize */
@@ -207,10 +206,9 @@ export const createCardStream = (
   /** flush 互斥——避免重叠 PUT */
   let flushing: Promise<void> = Promise.resolve();
 
-  const nextSeq = (): number => {
-    sequence += 1;
-    return sequence;
-  };
+  // sequence 走按卡共享分配器（card-seq）——card-action 按钮终态与流式共用一张卡，
+  // 各自计数会撞序号（飞书 300317 拒绝），统一分配才能交错更新
+  const nextSeq = (): number => nextCardSequence(cardId ?? `pending_${taskId}`);
 
   const warnFail = (label: string, err: unknown): void => {
     failCount += 1;

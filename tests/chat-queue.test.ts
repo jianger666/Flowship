@@ -13,6 +13,7 @@ import {
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  removeQueuedChatMessages,
   getChatQueueCount,
   getChatQueueGeneration,
   getChatQueueInFlight,
@@ -171,6 +172,21 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     clearChatQueue(id);
     expect(getChatQueueCount(id)).toBe(0);
     expect(dequeueChatMessage(id)).toBeNull();
+  });
+
+  it("removeQueuedChatMessages 按谓词移除、保留其余", () => {
+    const id = alloc();
+    enqueueChatMessage(id, msg(1));
+    enqueueChatMessage(id, msg(2));
+    enqueueChatMessage(id, msg(3));
+    const removed = removeQueuedChatMessages(
+      id,
+      (m) => m.displayText === "user-2",
+    );
+    expect(removed.map((m) => m.displayText)).toEqual(["user-2"]);
+    expect(getChatQueueCount(id)).toBe(2);
+    expect(dequeueChatMessage(id)?.displayText).toBe("user-1");
+    expect(dequeueChatMessage(id)?.displayText).toBe("user-3");
   });
 
   it("compact 期间入队语义：send 返 false 后仍可 enqueue、完成后 FIFO 发出", () => {

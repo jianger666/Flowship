@@ -206,10 +206,14 @@ describe("bridge runtime 生命周期（mock spawn）", () => {
     expect(getBridgeRuntimeStatus().overall).toBe("stopped");
   });
 
-  it("开关开 → 按声明式列表 spawn 两个 consumer（stdin=pipe 语义由 stop 验证）", async () => {
+  it("开关开 → 按声明式列表 spawn 三个 consumer（含撤回）", async () => {
     await startBridge();
     const keys = spawned.map((s) => s.args[2]).sort();
-    expect(keys).toEqual(["card.action.trigger", "im.message.receive_v1"]);
+    expect(keys).toEqual([
+      "card.action.trigger",
+      "im.message.recalled_v1",
+      "im.message.receive_v1",
+    ]);
     // 参数形状：event consume <key> --as bot
     expect(spawned[0]!.args.slice(0, 2)).toEqual(["event", "consume"]);
     expect(spawned[0]!.args).toContain("--as");

@@ -42,6 +42,7 @@ import {
   runLark,
   sendTextMessage,
 } from "./lark-api";
+import { handleRecallEvent } from "./recall";
 import {
   bridgeHostname,
   dispatchCardActionEvent,
@@ -171,7 +172,7 @@ const defaultCardActionHandler = async (raw: unknown): Promise<void> => {
   await dispatchCardActionEvent(raw);
 };
 
-/** 声明式列表——S3c 追加 recalled */
+/** 声明式列表：消息 + 卡片按钮 + 撤回出队（决策 #20） */
 export const CONSUMER_SPECS: ConsumerSpec[] = [
   {
     eventKey: "im.message.receive_v1",
@@ -180,6 +181,10 @@ export const CONSUMER_SPECS: ConsumerSpec[] = [
   {
     eventKey: "card.action.trigger",
     onEvent: defaultCardActionHandler,
+  },
+  {
+    eventKey: "im.message.recalled_v1",
+    onEvent: handleRecallEvent,
   },
 ];
 
