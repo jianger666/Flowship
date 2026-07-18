@@ -382,6 +382,11 @@ export const safeNotifyAwaiting = async (
       },
       { callerStillValid },
     );
+    // R29-2A-P2：notifier 内部因 caller 失效会静默让位（不 throw）——返回前复查 token、
+    // 失效不能当 delivered（stop 清屏障解阻 wait 后正是这条路、假 delivered = 假交卷）
+    if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
+      return { status: "mismatch" };
+    }
     return { status: "delivered" };
   } catch (err) {
     // R29：不再吞错——屏障超时（fail-closed）等 notifier 抛错要传回工具层，

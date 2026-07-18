@@ -822,12 +822,14 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
       if (!(await stillPrewarm())) return;
 
       // 同 advanceTaskInner：仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值）
+      // R29-2A-P2：prewarm 的 upsert 也带 lease finalGuard——stillPrewarm 检查后
+      // 的 await 期间 revoke/接管时提交点拒写
       const existingRepos = new Set(
         (task.gitBranches ?? []).map((b) => b.repoPath),
       );
       for (const info of ensured.infos) {
         if (!existingRepos.has(info.repoPath)) {
-          await upsertGitBranch(task.id, info);
+          await upsertGitBranch(task.id, info, lease);
         }
       }
       if (ensured.createdRepos.length > 0) {
@@ -1156,12 +1158,13 @@ const advanceTaskCore = async (
     const planned = planBranchesForBuild(taskAfterAppend);
     if (planned) {
       // 仅新仓 upsert（已存在的保留 baseBranch 历史值、不覆盖）
+      // R29-2A-P2：非 worktree build 的 upsert 同样带 admission lease finalGuard
       const existingRepos = new Set(
         (taskAfterAppend.gitBranches ?? []).map((b) => b.repoPath),
       );
       for (const info of planned.infos) {
         if (!existingRepos.has(info.repoPath)) {
-          await upsertGitBranch(task.id, info);
+          await upsertGitBranch(task.id, info, () => isOpOwner(opHandle));
         }
       }
       branchCheckoutHint = planned.promptHint;
@@ -1457,7 +1460,8 @@ const resumeCurrentActionCore = async (
       );
       for (const info of planned.infos) {
         if (!existingRepos.has(info.repoPath)) {
-          await upsertGitBranch(fresh.id, info);
+          // R29-2A-P2：resume 的非 worktree build upsert 同样带 opHandle finalGuard
+          await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
         }
       }
       branchCheckoutHint = planned.promptHint;
@@ -3932,7 +3936,15 @@ const consumeSessionRun = async (
           if (yieldIfSuperseded()) return;
           // R22-4：同 action 后继已 claim → 不得把共享 action 标 error
           if (lostStartOwner()) return;
-          await patchAction(task.id, lastAction.id, { status: "error" });
+          // R29-2A-P1：入口查过 lostStartOwner 但 patch 是 await——owner 闭包进锁内/
+          // finalGuard 复查（B 在 await 期间 claim 时不标共享 action error）
+          await patchActionIfOwner(
+            task.id,
+            lastAction.id,
+            { status: "error" },
+            () => isTaskOpCurrent(opts.opHandle),
+            { actionStatus: "running" },
+          );
           await setTaskRunStatusIfRunOwner(
             task.id,
             "error",
@@ -3955,7 +3967,12 @@ const consumeSessionRun = async (
           );
           const updated = await getTask(task.id);
           if (updated) publish(task.id, { kind: "task", task: updated });
-          publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+          // R29-2A-P1：迟到 done(ok=false) 不得清后继 B 的 streaming——publishIfCurrent
+          publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
+            kind: "done",
+            task: updated ?? task,
+            ok: false,
+          });
           closeMySession();
           return;
         }
@@ -3968,7 +3985,14 @@ const consumeSessionRun = async (
       if (yieldIfSuperseded()) return;
       // R22-4：同 action 后继已 claim → 不得把共享 action 标 error
       if (lostStartOwner()) return;
-      await patchAction(task.id, lastAction.id, { status: "error" });
+      // R29-2A-P1：同上——owner 闭包进锁内复查、不靠入口一次性检查
+      await patchActionIfOwner(
+        task.id,
+        lastAction.id,
+        { status: "error" },
+        () => isTaskOpCurrent(opts.opHandle),
+        { actionStatus: "running" },
+      );
       await setTaskRunStatusIfRunOwner(
         task.id,
         "error",
@@ -3991,7 +4015,12 @@ const consumeSessionRun = async (
       );
       const updated = await getTask(task.id);
       if (updated) publish(task.id, { kind: "task", task: updated });
-      publish(task.id, { kind: "done", task: updated ?? task, ok: false });
+      // R29-2A-P1：同上——迟到 done(ok=false) 门控
+      publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
+        kind: "done",
+        task: updated ?? task,
+        ok: false,
+      });
       closeMySession();
       return;
     }

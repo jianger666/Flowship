@@ -30,7 +30,6 @@ import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
-  appendEvent,
   clearTaskSessionAgentIdIf,
   getTask,
   setTaskRunStatus,
@@ -2318,16 +2317,17 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           meta.attachments = msg.attachmentMetas;
         }
         if (capture.ok) meta.checkpointed = true;
-        const replyEvent = await appendEvent(taskId, {
+        // R29-P2：用户气泡改 writeEventAndPublish——publish 走 append 链内 onCommitted、
+        // 磁盘序 = SSE 序（原 append 返回后再 publish、并发系统事件可反序）。
+        // 用户操作事件、无条件语义不带 lease。
+        // eslint-disable-next-line no-restricted-syntax -- 用户消息气泡、无条件写
+        const replyEvent = await writeEventAndPublish(taskId, {
           kind: "user_reply",
           text: msg.displayText,
           meta: Object.keys(meta).length > 0 ? meta : undefined,
         });
-        if (replyEvent) {
-          publish(taskId, { kind: "event", event: replyEvent });
-          if (capture.ok) {
-            await persistCheckpointForReply(taskId, replyEvent.id, capture);
-          }
+        if (replyEvent && capture.ok) {
+          await persistCheckpointForReply(taskId, replyEvent.id, capture);
         }
       } catch (err) {
         console.error(`[chat-runner] flushChatQueue task=${taskId} failed:`, err);

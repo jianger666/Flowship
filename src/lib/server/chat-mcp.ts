@@ -189,6 +189,18 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       if (notifyResult.status === "mismatch") {
         return callerMismatchContent();
       }
+      // R29-2B-P2：无活跃 bridge（notifier 已注销、agent 是孤儿）不得宣告交卷成功——
+      // postCheck 永不会启动、假「已交卷」会让 agent 结束 turn 留僵尸 running
+      if (notifyResult.status === "no_notifier") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "交卷未受理：任务当前没有活跃会话桥（可能已被停止/接管）、请结束本轮回复",
+            },
+          ],
+        };
+      }
 
       return {
         content: [{ type: "text" as const, text: submittedText(action_id) }],
