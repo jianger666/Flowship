@@ -4177,9 +4177,9 @@ export const resumeTaskSession = async (
       `[task-runner] task=${task.id} Agent.resume 失败（条件清锚点、降级 fresh agent）`,
       err,
     );
-    // R27-3：条件清——锁内盘上锚点仍是本次尝试 resume 的 agentId、本 op 未失主、
-    // 且 B 未装内存 session 才清；A 的迟到 reject 不得抹掉 B 刚落盘的恢复锚点
-    // （B resume 的新内存实例可复用同一 agentId、仅比较 agentId 不够——guard 同验 session 表）
+    // R27-3 / R28-3：条件清——finalGuard 每次 rename 前复查本闭包。
+    // 必须现查（非入场快照）：本链 lease 仍 current + 内存无后继 session。
+    // B 可复用同一 agentId 装新实例——只比盘上 agentId 不够。
     if (task.sessionAgentId) {
       void clearTaskSessionAgentIdIf(
         task.id,

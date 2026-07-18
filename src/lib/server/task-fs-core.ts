@@ -12,7 +12,7 @@
  * 数据布局说明见 task-fs.ts 顶部注释。
  */
 
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
@@ -581,6 +581,28 @@ const getEventAppendChains = (): Map<string, Promise<void>> => {
 };
 
 /**
+ * R28-5：per-task 进程内事件单调序号（与 append 链同挂 globalThis，防 chunk 分裂）。
+ * 只在链内写行前发号，保证 seq 与磁盘 / publish 顺序一致。
+ */
+const EVENT_SEQ_COUNTERS_KEY = "__feAiFlowEventSeqCountersV1__";
+const getEventSeqCounters = (): Map<string, number> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, number> | undefined
+  >;
+  if (!g[EVENT_SEQ_COUNTERS_KEY]) g[EVENT_SEQ_COUNTERS_KEY] = new Map();
+  return g[EVENT_SEQ_COUNTERS_KEY]!;
+};
+
+/** R28-5：为 task 发下一个单调 seq（1-based） */
+const nextEventSeq = (taskId: string): number => {
+  const counters = getEventSeqCounters();
+  const n = (counters.get(taskId) ?? 0) + 1;
+  counters.set(taskId, n);
+  return n;
+};
+
+/**
  * 实际 append（无串行）。
  * @returns true=已写入；false=ENOENT（任务目录已删、R27-7 透传给上层不 publish）
  */
@@ -609,14 +631,19 @@ const appendEventLineUnlocked = async (
  * 追加一条事件行（按 taskId 串行）。
  * 链上单次写入失败会抛给调用方，但不中断后续写入（catch 后继续）。
  *
+ * R28-5 OrderedEventCommit：写行成功后、链内同步调用 onCommitted（通常 = publish），
+ * 再释放链——杜绝「A 写完等 meta touch、B 先 publish」的 SSE/磁盘反序。
+ *
  * @param lease R26-5：可选；在 chain 回调内、appendFile 之前同步执行。
  *   false → 跳过写盘、返 false（堵死「检查通过后入队、B claim、队列才执行 A」）。
+ * @param onCommitted R28-5：可选；写行成功且 failpoint 通过后、仍在链内同步调用。
  * @returns true=已 append；false=lease 拒写或 ENOENT（R27-7）
  */
 export const appendEventLine = async (
   id: string,
   ev: TaskEvent,
   lease?: () => boolean,
+  onCommitted?: (event: TaskEvent) => void,
 ): Promise<boolean> => {
   const chains = getEventAppendChains();
   const previous = chains.get(id) ?? Promise.resolve();
@@ -624,8 +651,15 @@ export const appendEventLine = async (
   const run = async (): Promise<boolean> => {
     await failpoint("event.inQueue");
     if (lease && !lease()) return false;
+    // R28-5：链内发号——与写盘 / publish 同序，不在入队前抢号
+    ev.seq = nextEventSeq(id);
     // R27-7：ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
-    return await appendEventLineUnlocked(id, ev);
+    const ok = await appendEventLineUnlocked(id, ev);
+    if (!ok) return false;
+    // R28-5：写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
+    await failpoint("event.beforePublish");
+    onCommitted?.(ev);
+    return true;
   };
   // previous 失败也跑本次写（.then(run, run)）；本次失败仍抛给 await 方
   const next = previous.then(run, run);
@@ -641,6 +675,23 @@ export const appendEventLine = async (
     if (chains.get(id) === retained) {
       chains.delete(id);
     }
+  }
+};
+
+/**
+ * R28-3：同步读盘上 sessionAgentId（finalGuard 用、无 await 夹缝）。
+ * 读失败 / 缺字段 → undefined。
+ */
+export const readSessionAgentIdSync = (taskId: string): string | undefined => {
+  try {
+    const raw = JSON.parse(
+      readFileSync(path.join(taskDir(taskId), META_FILE), "utf-8"),
+    ) as { sessionAgentId?: unknown };
+    return typeof raw.sessionAgentId === "string"
+      ? raw.sessionAgentId
+      : undefined;
+  } catch {
+    return undefined;
   }
 };
 

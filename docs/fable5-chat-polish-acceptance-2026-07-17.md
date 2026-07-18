@@ -1,5 +1,7 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-18 22:21：第二十八轮 Codex 深度复审完成。R27-1、R27-5、R27-7 已成立，R27-2/3/4/6 只关闭了报告描述中的局部窗口；继续确认 **4 个 P1 + 1 个 P2**：worktree 资源租约未贯穿真实启动链，chat 旧 run 的自然/取消/失败收尾仍可在 force-clear 空窗覆盖新会话，resume 条件清锚点没有最终 guard，`submit_mr` 与 `submit_work` 缺 action 级并发屏障且两份 MR 状态非同一事务，事件落盘顺序与 SSE 发布顺序可反转。结论不通过。typecheck、lint、74 文件 / 746 项、build、diff-check 均通过；现有 R27 矩阵中两项明确是降级直测，绿灯没有覆盖上述真实链路。详见「第二十八轮验收」。
+>
 > 2026-07-18 22:00：第二十八轮修复已提交、待复审——R27-1～R27-7 全部处置 + 收敛门槛 5 条落地：lease 进 rename retry 循环与 worktree 资源函数内部、resume reject 条件清锚点、action/ask 身份从 session token 拆出、owned sink 必填化 + ESLint 静态门禁、chat 主消息流接 instanceId lease、ENOENT 不 publish 幽灵事件。门禁 74 文件 / 746 项 0 skipped 两遍全绿。修复期间发生一次 git checkout 数据事故、已从构建缓存完整恢复并保护性提交（详见报告内事故记录）。详见「第二十八轮修复报告」。
 >
 > 2026-07-18 20:52：第二十七轮 Codex 深度收敛复审完成。R26 的五个 sink 原语对新增测试中的单次提交窗口有效，但 lease 仍没有进入 Windows rename 的每次重试、worktree 的每个资源副作用、ask/action 身份以及 chat 主消息流；另有删除竞态下“未落盘却 publish”的契约错误。确认 **6 个 P1 + 1 个 P2**，结论不通过。定向 31 项、typecheck、lint、真实权限全量 72 文件 / 727 项、build、diff-check 均通过；绿灯未覆盖本轮时序。详见「第二十七轮验收」。
@@ -24,20 +26,20 @@
 
 ## 结论
 
-**第二十七轮验收仍不通过。** R26 新增的 `commit(finalGuard)`、事件队内 lease、条件 publish、原子 session 安装和按 askId 反登记，对各自插桩窗口都有效；但报告声称的“唯一 sink / action 级授权 / 终态资源准入”尚未形成可证明的完整协议。guard 在 Windows rename 重试时失效，终态后仍可迟到创建物理 worktree，resume 失败仍能清后继会话锚点，`submit_mr` 和 ask 只验 session caller、不验本 action/ask 身份，chat 主消息流及若干 task 分支仍从可选 lease 旁路。当前阻塞项为 **6 个 P1 + 1 个 P2**。
+**第二十八轮验收仍不通过。** 本轮不是 R27 全部无效：rename retry 的最终 guard、askId 身份、ENOENT 不 publish 均已正确落地，chat 主消息流的 thinking/assistant/tool 也确实接上了 instance lease；但“租约进入完整生命周期”仍未成立。资源函数的热路径/后处理和三个真实启动入口仍可无租约运行，chat 的最终状态/队列/done 收尾仍是 fail-open，resume 条件清只做前置检查，MR 外部副作用与 submit_work 没有同 action 屏障，事件 append 与 publish 也不是同一有序提交。当前阻塞项为 **4 个 P1 + 1 个 P2**。
 
-第二十七轮 Codex 深度复审门禁（当前工作区）：
+第二十八轮 Codex 深度复审门禁（`HEAD 9ab86ac`、当前工作区）：
 
 - `pnpm typecheck`：通过
 - `pnpm lint`：通过（0 error / 0 warning）
-- R25/R26 所有权定向矩阵：4 文件 / 31 项全部通过
-- `pnpm test`：72 文件 / 727 项全部通过（真实系统权限；沙箱内 `ps` 被禁会令 preview PID 归属用例按安全策略拒杀，隔离复跑确认是环境假失败）
+- R26/R27 所有权与 worktree/reconnect 定向矩阵：5 文件 / 70 项全部通过
+- `pnpm test`：74 文件 / 746 项全部通过（真实系统权限；沙箱内 `ps` 被禁时 preview PID 归属用例会按安全策略拒杀，沙箱外单测 9/9、全量 746/746 均通过）
 - `pnpm build`：生产构建通过
 - `git diff --check`：通过
 
 文件读写兜底专项意见继续保持落实：`safe_read`、对应测试和直接依赖已删除，`chat-mcp` 注册已撤回，Windows prompt 收缩为“两次失败后停手”，不再引导 Python/Node 写回。
 
-审查基线：`HEAD 81f2312 (v1.1.20)` 到当前未提交工作区。
+审查基线：`4c0fbb1` 到 `HEAD 9ab86ac`，并对恢复后的完整业务代码做反向 sink 审计；审查结束前工作区无业务代码改动。
 
 ---
 
@@ -676,6 +678,123 @@ task/chat 两侧 ask notifier 的 lease 增 `getPendingAsk(taskId)?.askId === si
 ### ⚠️ 事故记录（如实、供复审知悉）
 
 R27 修复过程中一个子代理误用 `git checkout` 将从未提交的 `task-runner.ts` / `sdk-message-handler.ts` / `ask-supersede.ts` 回退到 v1.1.20（丢失 27 轮全部实现）。恢复方式：从最后一次全绿 build（20:48）的 webpack 构建缓存提取转译 JS（逻辑/注释 100% 保留）+ 旧版类型骨架与完好依赖签名反推 TS 类型重建三文件；保真度由门禁验证（typecheck 0 错 + 恢复后 734 项测试 731 绿、3 红恰为事故前未完成的 R27-2/3/4）。恢复后已做保护性 git commit（`4c0fbb1`、本地未 push），后续每轮追加 wip commit。复审时若发现「实现与某轮修复报告描述不符」的疑点，优先怀疑恢复保真度、直接点名，我方对照 transcript 核查。
+
+---
+
+## 第二十八轮验收（Codex、2026-07-18、深度收敛复审、纯 bug 范围）
+
+本轮只审可达正确性 bug，不评价 S8 或产品功能设计，也没有修改业务代码。方法从最终副作用反向检查：物理 worktree、session/queue/status/done、持久化会话锚点、GitLab MR 与本地审计、events.jsonl 与 SSE；同时逐条核对 R27 测试是否走真实 owner/lifecycle 调用链。
+
+### 已确认修复成立
+
+- R27-1：`renameWithRetry` 在每次真实 rename attempt 前执行 failpoint + finalGuard，Windows transient error 的 retry 不再沿用失效授权。
+- R27-5：task/chat ask lease 已包含当前 pending 的 `askId`；同 caller 双 ask 的 notifier 真链测试有效。
+- R27-7：事件 append 遇 ENOENT 会返回未写入，publish 不再制造幽灵事件。
+- R27-4 的历史 action 入场校验、`set_feishu_testers` 的 ship 类型和锁内结构条件已实现；问题缩小到同一当前 action 内的并行工具调用。
+- R27-6 的 chat 主消息流已把 captured instance lease 传进 assistant buffer 和 SDK message handler；问题缩小到 run 最终收尾及少数被错误豁免的系统写。
+
+### R28-1（P1）resource lease 没有覆盖真实启动链和 worktree 热路径；finalize 返回后旧链仍可修改/重建物理工作区
+
+位置：
+
+- `src/lib/server/task-runner.ts:2249-2260,2282-2290,4064-4069,4294-4304`
+- `src/lib/server/task-runner.ts:946-960,1406-1421,1503-1585`
+- `src/lib/server/task-worktrees.ts:406-440,467-521,625-680,711-760`
+- `tests/ownership-r27-matrix.test.ts:473-539`
+
+`ensureWorkspaceReady(task)` 不接 lease，`internalStartAgent`、`resumeTaskSession`、`startOneShotQuestion` 三个真实入口均无条件调用它。即使 advance/resume 前面曾经 leased ensure，`internalStartAgent` 仍会再走一次无租约热路径。
+
+资源函数内部也只保护了新建路径的一部分：根目录 `mkdir` 在首次 lease 前；已有 worktree 的 `git checkout` 与最长 600 秒的 `cloneDepDirs` 完全不验 lease；新建成功后的 `.env` copy / dependency clone 也没有期间或结束复查。finalize 只等 `isTaskStarting` 5 秒并继续终结/清目录，因此旧 clone/copy 可在终态清理之后继续写，甚至在目标被删后重新创建子目录。`ensureTaskWorktrees` 还会吞掉 `WorktreeLeaseLostError` 返回普通结果；advance/resume 随后遍历 `ensured.infos` 调 `upsertGitBranch`，没有先把“让位”作为终态返回。该 helper 自己会拒绝终态 repoStatus，能挡 finalize 后的 meta 写，但挡不住仍处 developing 的后继 operation 接管场景，也无法补偿物理资源副作用。
+
+R27 矩阵自己把此项标成“降级直测”：用独立布尔假 lease 调 helper，并且先执行 `finalizeTask`、之后才手工把布尔改成 false。它没有证明 finalize/revoke 能让真实 internal/resume/one-shot lease 失效，也没有覆盖已有 worktree checkout、clone 中删除、add 后 copy/clone 三个窗口。
+
+可达后果：merged/abandoned 任务在终结返回后重新出现 worktree/依赖目录；旧链切换工作分支；developing 状态下旧 operation 可继续尝试补写后继的 gitBranches；finalize 清理与 cp/git 并发导致半目录或孤儿 worktree 注册。
+
+建议：把 resource lease 变成 `ensureTaskWorktrees` 和 `ensureWorkspaceReady` 的必填参数，三个调用者传真实 op/lifecycle handle；lease 检查进入 mkdir、hot checkout、每个 copy/clone 单元及结束点。失主必须返回显式 `cancelled`/抛错，调用者不得继续 upsert。更稳妥的是登记 per-task resource job，让 finalize revoke 后 join；正确性不能依赖 5 秒超时。矩阵要走 `internalStartAgent/resume/one-shot × finalize` 真链，并覆盖 hot path 与 clone pending。
+
+### R28-2（P1）chat 只保护了流内容，旧 run 的自然/取消/失败收尾仍可在 force-clear 空窗覆盖新会话
+
+位置：
+
+- `src/lib/server/chat-runner.ts:243-267,842-848`
+- `src/lib/server/chat-runner.ts:1403-1438,1547-1576,1584-1722`
+- `src/app/api/tasks/[id]/chat-reply/route.ts:474-507`
+- `tests/ownership-r27-matrix.test.ts:788-840`
+
+`consumeChatRun` 捕获的 instance lease 只用于 thinking/assistant/tool 事件。最终路径仍是无条件共享写：
+
+- cancelled 分支 `closeChatSession(expected)` 失败后，只要 map 恰好为空就继续 clear queue、写 idle、publish done；
+- natural finished 不检查 instance，直接把捕获的旧 record 改 idle、写 `awaiting_user`、publish done、触发 compact/flush；
+- catch-cancel 与 `handleChatRunFailure` 同样把“expected close 失败且 map 为空”当成有权收尾，写 idle/error/done；
+- `runChatSession.finishCancelled` 有相同 fail-open；自动重连还会在检查当前实例之前无条件写“正在重连”。
+
+懒重启在旧 run 5 秒未退时 `forceClearChatRun`，随后 B 起新会话前要经过凭据校验、checkpoint、状态落盘等多个 await。此时 map 有一个真实空窗。A 若在空窗 finished/cancel/reject，会把 B 的 running 覆盖成 awaiting_user/error/idle、清 B 已入队消息、发 done 清前端 streaming；即便 A 在 B 注册后才执行，natural finished 仍没有 instance 检查。
+
+R27-6 测试也明确是“降级：`writeOwnedEventAndPublish` 假 lease”，只证明旧主消息事件被 helper 拒绝，没有运行旧 `run.wait()` 的 finished/cancelled/reject 收尾，更没有 forceClear + B 启动链。
+
+建议：建立唯一 `finalizeChatRunIfCurrent(taskId, instanceId, outcome)`，所有 status/queue/session/done/error/compact/flush sink 都在该 instance 的 CAS 下执行；带 expected instance 的 close 返回 false 时旧 owner必须无条件 no-op，map 为空不是授权。补真实矩阵：`old wait={finished,cancelled,reject} × forceClear × B checkpoint/start`，另补 reconnect preamble × B。
+
+### R28-3（P1）`clearTaskSessionAgentIdIf` 只有前置 guard，没有写入提交前的 finalGuard
+
+位置：
+
+- `src/lib/server/task-fs.ts:743-794`
+- `src/lib/server/task-runner.ts:4165-4192`
+- `src/lib/server/chat-runner.ts:1271-1299`
+- `tests/ownership-r27-wiring.test.ts:355-422`
+
+helper 在 task lock 内先同步检查 `extraGuard`，随后 `await readMetaV06`，最后调用无条件 `writeMeta`；两个 await 后都不再检查内存 session/operation/start lease。锁只能串行 meta 写，不能阻止不拿此锁的 `agentSessions` / `runningChats` 同步安装。
+
+可达时序：A 的 resume 确定性 reject，fire-and-forget clear 通过“当前无 session”检查并在读/写盘中让出；A 返回后释放 send 串行位或 chat start reservation；B resume 同一个持久化 agentId 并同步安装新内存实例。B 成功恢复本来就不需要重写相同的盘上 agentId，A 随后仍把锚点清空。进程重启/空闲回收后 B 无法恢复。
+
+现有测试覆盖 guard 一开始就是 false、盘上 agentId 已换成不同值、或 B 已在调用 helper 之前安装；没有把 B 的**同 agentId**安装插在 helper 的 read/commit await 内。
+
+建议：像其它条件事务一样使用 `prepareMetaWrite(meta).commit(finalGuard)`，每次 rename retry 前复查 `extraGuard + expectedAgentId`；最好让 guard 带预期 session instance/start token，而不只看“map 是否为空”。新增 `clear.beforeCommit` failpoint：A 已通过前置检查后安装同 agentId 的 B，断言锚点保留。
+
+### R28-4（P1）`submit_mr` 与 `submit_work` 缺同 action 并发屏障；两份本地 MR 状态也不是一个事务
+
+位置：
+
+- `src/lib/server/task-runner.ts:1756-1763,1805-1967,2195-2209`
+- `src/lib/server/task-fs.ts:1162-1230,1809-1915`
+- `src/lib/server/action-checks.ts:325-423,433-470`
+
+当前 action lease 能拒绝历史 action，却不能协调**同一 current/running action**的并行 MCP 调用。`submit_mr` 的 GitLab create/poll 可长时间 pending；同 caller 同时调用 `submit_work` 会立刻启动后台 post-check。check 读取 `action.sideEffects.mrs`，随后可把 action 切成 awaiting_ack。之后 createMR 即使外部成功，本地 action lease 已失效，只能返回 `skipped_local`：GitLab 留下外部 MR，本地 ship/dev check 却按“无 MR”失败或误判跳过。
+
+即使 post-check 更晚，createMR 的本地落盘仍分成两个独立事务：先 `upsertMR(task.mrs)`，再 `appendActionSideEffectMR(action.sideEffects.mrs)`。post-check/stop/advance 可在二者之间取得 task lock，造成 task.mrs 已更新但 action 审计/门禁缺 MR；`mrVersion` 也可能与 action 记录不一致。R27 测试只测“历史 action 入场被拒”，没有 `createMR pending × submit_work` 或两次本地写之间切状态。
+
+建议：per-action 登记 in-flight side effects；`submit_work` 在启动 deterministic check 前等待/拒绝该 action 尚未结束的 `submit_mr`。GitLab 成功后的 `task.mrs + action.sideEffects.mrs` 应在同一个 task-fs 条件事务中提交，复用同一 caller/action finalGuard。补两条真链矩阵：createMR pending 时 submit_work；第一份本地写后、第二份写前注入 action transition。
+
+### R28-5（P2）events.jsonl 的 durable 顺序与 SSE publish 顺序可以反转，前端会永久保留乱序
+
+位置：
+
+- `src/lib/server/task-fs.ts:586-611`
+- `src/lib/server/task-stream.ts:444-475`
+- `src/app/tasks/[id]/page.tsx:315-329`
+- `src/lib/task-store.ts:82-109`
+
+`appendEvent` 在 per-task append chain 写完行后，可能再等待 meta.updatedAt 的 task lock/atomic write，之后才返回；append chain 已经释放，后来的 B 可以先追加并先 publish，A 才 publish。磁盘顺序为 A→B，SSE 到达变成 B→A。前端按到达顺序 append，不按 durable sequence 排序；之后 `mergeTaskEvents` 按 id 并集保留本地顺序，因此刷新前的 B→A 可能一直存在，tool/assistant/ask 卡片时间线错误。
+
+建议：append 与对应 publish 使用同一个 per-task 有序提交链；meta touch 移到 publish 后的 best-effort 后台任务，或让 append 在 durable line 成功后立即返回并单独排队 touch。不要只按毫秒 `ts` 排序，应给事件持久化单调 sequence。补 `A append 成功后 meta touch 挂起 × B append/publish`，同时断言 jsonl 与 SSE 顺序一致。
+
+### 为什么第二十八轮门禁仍会全绿
+
+`tests/ownership-r27-matrix.test.ts` 顶部称“7 个真实提交点”，但文件内部明确记录 R27-2 与 R27-6 为“降级直测”。R27-3 测的是 B 改成不同 agentId 或在 clear 前已安装，R27-4 测的是历史 action，不是同 action 工具并发。wiring 测试进一步证明 helper 的单次条件判断，却没有证明真实 owner/lifecycle 能贯穿多个 await 和最终收尾。
+
+本轮复跑结果：定向 5 文件 / 70 项通过；typecheck、lint、真实权限全量 74 文件 / 746 项、build、diff-check 全部通过。最初沙箱内全量唯一失败为 preview-manager PID 归属测试，原因是沙箱明确禁止 `ps`；沙箱外该文件 9/9、全量 746/746 通过，不是业务回归。
+
+### 建议下一轮的收敛边界
+
+不要再按当前失败分支逐处加 `if`。只做五个协议收口，并用真实矩阵作为退出条件：
+
+1. `ResourceJob`：资源 lease 必填、注册、revoke、join、补偿，覆盖整个 ensure/copy/clone 生命周期。
+2. `finalizeChatRunIfCurrent`：chat 的 session/status/queue/event/done/flush 只有一个 instance-CAS 收尾入口。
+3. 条件锚点写：session anchor clear/set 统一走 prepare + retry finalGuard，身份含 instance/start token。
+4. `ActionSideEffectCoordinator`：同 action 的外部副作用 barrier + MR 两份本地投影单事务。
+5. `OrderedEventCommit`：durable append 与 SSE publish 同序，事件有单调 sequence。
+
+退出门槛不是“helper 测试存在”，而是上述每个协议至少一条生产入口真链：在最终不可逆 await 处挂起，注入 finalize/stop/forceClear/submit_work/B takeover，再验证磁盘、内存、SSE、外部 mock 四侧不变量。完成这五项后再做一轮全局 sink 搜索即可，继续逐调用点补 ESLint 豁免只会延长循环。
 
 ---
 

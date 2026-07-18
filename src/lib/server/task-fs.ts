@@ -94,6 +94,7 @@ import {
   taskDir,
   withTaskLock,
   prepareMetaWrite,
+  readSessionAgentIdSync,
   writeMeta,
   type TaskMetaV06,
 } from "./task-fs-core";
@@ -578,15 +579,18 @@ const lastMetaTouchAt = new Map<string, number>();
  * - task 不存在（已删、agent 残留写入）→ 返 null、不写、不复活目录
  * - 事件行经 appendEventLine 按 taskId 串行 append（同文件并发 appendFile 不安全，
  *   且超长 tool_result 行超出 POSIX O_APPEND 原子写保证；无需拿 task 锁）
- * - meta.updatedAt 节流落盘（≥5s 才写一次、写时拿锁跟其它 read-modify-write 串行）
+ * - R28-5：onCommitted（通常 publish）在 append 链内、写行成功后同步调用——
+ *   与落盘同序提交；meta.updatedAt 节流 touch 移出关键路径（fire-and-forget）
  * - 调用方需要完整 Task 的（低频 route 场景）自己再 getTask
  *
  * @param lease R26-5：可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
+ * @param onCommitted R28-5：可选；链内写行成功后同步回调（writeEventAndPublish 传 publish）
  */
 export const appendEvent = async (
   taskId: string,
-  ev: Omit<TaskEvent, "id" | "ts">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
   lease?: () => boolean,
+  onCommitted?: (event: TaskEvent) => void,
 ): Promise<TaskEvent | null> => {
   if (!(await exists(path.join(taskDir(taskId), META_FILE)))) return null;
   const event: TaskEvent = {
@@ -594,17 +598,24 @@ export const appendEvent = async (
     ts: Date.now(),
     ...ev,
   };
-  const wrote = await appendEventLine(taskId, event, lease);
+  // R28-5：写行 + onCommitted（publish）同进 per-task append 链
+  const wrote = await appendEventLine(taskId, event, lease, onCommitted);
   if (!wrote) return null;
 
+  // R28-5：meta.updatedAt 移出关键路径——列表排序 5s 粒度足够；失败只 warn
   const last = lastMetaTouchAt.get(taskId) ?? 0;
   if (event.ts - last >= META_TOUCH_INTERVAL_MS) {
     lastMetaTouchAt.set(taskId, event.ts);
-    await withTaskLock(taskId, async () => {
+    void withTaskLock(taskId, async () => {
       const meta = await readMetaV06(taskId).catch(() => null);
       if (!meta) return;
       meta.updatedAt = event.ts;
       await writeMeta(meta);
+    }).catch((err) => {
+      console.warn(
+        `[task-fs] appendEvent meta touch 失败（best-effort）task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
     });
   }
   return event;
@@ -762,9 +773,11 @@ export const setTaskSessionAgentId = async (
 };
 
 /**
- * R27-3：条件清 sessionAgentId——锁内盘上锚点 === expectedAgentId 才清；
- * extraGuard（同步）失败或锚点已被后继改写则不动。
- * 用于 Agent.resume 确定性失败 catch：避免迟到 clear 抹掉 B 刚落盘的锚点。
+ * R27-3 / R28-3：条件清 sessionAgentId。
+ * 前置：锁内同步 extraGuard + 盘上锚点 === expectedAgentId；
+ * 提交：prepareMetaWrite + commit(finalGuard)——每次 rename attempt 前复查
+ * 「盘上仍是 expectedAgentId && extraGuard() 仍 true」（R27-1 beforeAttempt）。
+ * 用于 Agent.resume 确定性失败 catch：避免迟到 clear 抹掉 B 同 agentId 新装的锚点。
  * @returns true=已清；false=条件不符 / meta 不存在（best-effort 不抛）
  */
 export const clearTaskSessionAgentIdIf = async (
@@ -779,8 +792,22 @@ export const clearTaskSessionAgentIdIf = async (
       const meta = await readMetaV06(taskId);
       if (!meta || meta.sessionAgentId !== expectedAgentId) return false;
       meta.sessionAgentId = undefined;
-      await writeMeta(meta);
-      return true;
+      // R28-3：条件事务——prepare 后 finalGuard 进 commit，堵 read/write await 夹缝
+      const prepared = await prepareMetaWrite(meta);
+      // R28-3：矩阵在此注入同 agentId 的 B 安装，断言锚点保留
+      await failpoint("clear.beforeCommit");
+      const finalGuard = (): boolean => {
+        // 盘上仍是本次要清的锚点（同步读、无 await）
+        if (readSessionAgentIdSync(taskId) !== expectedAgentId) return false;
+        // 内存无后继 / lease 仍 current——调用方闭包现查，不是入场快照
+        if (extraGuard && !extraGuard()) return false;
+        return true;
+      };
+      if (!finalGuard()) {
+        await prepared.abort();
+        return false;
+      }
+      return await prepared.commit(finalGuard);
     });
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {

@@ -904,6 +904,11 @@ export interface AskUserAnswer {
 export interface TaskEvent {
   id: string;
   ts: number;
+  /**
+   * R28-5：per-task 进程内单调序号（写 jsonl 时在 append 链内发号）。
+   * 旧事件无此字段；读取端容忍 undefined。前端本轮不排序、供后续兜底。
+   */
+  seq?: number;
   kind: EventKind;
   actionId?: string;
   text: string;

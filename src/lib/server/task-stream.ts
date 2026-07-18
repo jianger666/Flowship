@@ -440,17 +440,19 @@ export const subscribeTaskStream = (
  * R27-6：owner 语境请改用 {@link writeOwnedEventAndPublish}（lease 必填）。
  * 本函数保留可选 lease 以兼容存量接线；无 lease = 用户操作 / 终态 owner 无条件语义。
  * R27-7：append 返 null（含 ENOENT）时不 publish。
+ * R28-5：publish 作为 onCommitted 进 append 链——写行成功后、链释放前同步推送，
+ * 与磁盘顺序一致（不再等 meta.updatedAt touch 返回后才 publish）。
  */
 export const writeEventAndPublish = async (
   taskId: string,
-  ev: Omit<TaskEvent, "id" | "ts">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
   lease?: () => boolean,
 ): Promise<TaskEvent | null> => {
   try {
-    const event = await appendEvent(taskId, ev, lease);
-    // R27-7：null = 未写入（lease 拒 / ENOENT）→ 不向 SSE 发幽灵事件
-    if (event) publish(taskId, { kind: "event", event });
-    return event;
+    // R28-5：publish 进 OrderedEventCommit 链，不再在 await append 之后另推
+    return await appendEvent(taskId, ev, lease, (event) => {
+      publish(taskId, { kind: "event", event });
+    });
   } catch (err) {
     console.warn(
       `[task-stream] writeEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
@@ -463,16 +465,17 @@ export const writeEventAndPublish = async (
 /**
  * R27-6：owned 事件 sink——lease 必填，缺省即编译失败。
  * 内部走带 lease 的 appendEvent；失主 / ENOENT 不写盘、不 publish。
+ * R28-5：publish 同样进 append 链（与 writeEventAndPublish 同序协议）。
  */
 export const writeOwnedEventAndPublish = async (
   taskId: string,
   lease: () => boolean,
-  ev: Omit<TaskEvent, "id" | "ts">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
 ): Promise<TaskEvent | null> => {
   try {
-    const event = await appendEvent(taskId, ev, lease);
-    if (event) publish(taskId, { kind: "event", event });
-    return event;
+    return await appendEvent(taskId, ev, lease, (event) => {
+      publish(taskId, { kind: "event", event });
+    });
   } catch (err) {
     console.warn(
       `[task-stream] writeOwnedEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
