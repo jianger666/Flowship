@@ -1176,86 +1176,7 @@ export const patchAction = async (
     return await hydrateTask(meta);
   });
 
-/**
- * 原子地往 action.sideEffects.mrs[] 追加一条 MR 记录（V0.6.1 ship、防并发 submit_mr 丢更新）
- *
- * 按 repoPath 去重（同仓重试覆盖最新一条）、保留 sideEffects 其他字段（如 feishuCommentId）。
- * read-modify-write 整段在 withTaskLock 内完成——替代 task-runner 里「getTask → filter → patchAction」
- *   两段非原子写法（agent 串行不出问题、但接口被并行调时会丢 MR）。
- *
- * 跟 upsertMR 的区别：upsertMR 写 task.mrs[]（task 维度「当前最新 MR」）、本函数写
- *   action.sideEffects.mrs[]（action 维度「本次 ship 产出」、审计用）。
- */
-export const appendActionSideEffectMR = async (
-  taskId: string,
-  actionId: string,
-  mr: {
-    repoPath: string;
-    /** V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支） */
-    targetBranch?: string;
-    mrUrl: string;
-    mrVersion: number;
-    branch: string;
-    commitHash: string;
-    /** V0.6.1.1：本次 ship 该仓 MR 跟 test 是否有冲突 */
-    hasConflicts?: boolean;
-  },
-  /** R25-3：可选锁内 caller 闸（submit_mr 迟到写） */
-  isOwner?: () => boolean,
-  /** R27-4：可选锁内结构条件——该 action 必须仍是 currentActionId 且 running（action lease） */
-  requireCurrentRunning?: boolean,
-): Promise<Task | null> =>
-  withTaskLock(taskId, async () => {
-    if (isOwner && !isOwner()) return null;
-    const meta = await readMetaV06(taskId);
-    if (!meta) return null;
-    const idx = meta.actions.findIndex((a) => a.id === actionId);
-    if (idx < 0) return null;
-    const action = meta.actions[idx]!;
-    // R27-4：历史 action 的迟到 submit_mr 不得把 MR 记录挂回已结束的 action
-    if (
-      requireCurrentRunning &&
-      (meta.currentActionId !== actionId || action.status !== "running")
-    ) {
-      return null;
-    }
-    const existingMrs = action.sideEffects?.mrs ?? [];
-    // 同 repoPath 已记录（重试 / 重复 ship）则去重、用最新这条覆盖
-    const filtered = existingMrs.filter((m) => m.repoPath !== mr.repoPath);
-    const nextAction: ActionRecord = {
-      ...action,
-      sideEffects: {
-        ...(action.sideEffects ?? {}),
-        mrs: [...filtered, mr],
-      },
-    };
-    meta.actions = [
-      ...meta.actions.slice(0, idx),
-      nextAction,
-      ...meta.actions.slice(idx + 1),
-    ];
-    meta.updatedAt = Date.now();
-    if (isOwner || requireCurrentRunning) {
-      const prepared = await prepareMetaWrite(meta);
-      // R27-4：finalGuard = caller + 结构条件（锁内 meta 写锁互斥 = 最新盘上状态）
-      const structureOk = (): boolean => {
-        if (!requireCurrentRunning) return true;
-        const a = meta.actions.find((x) => x.id === actionId);
-        return meta.currentActionId === actionId && a?.status === "running";
-      };
-      const finalGuard = (): boolean =>
-        (!isOwner || isOwner()) && structureOk();
-      if (!finalGuard()) {
-        await prepared.abort();
-        return null;
-      }
-      const committed = await prepared.commit(finalGuard);
-      if (!committed) return null;
-    } else {
-      await writeMeta(meta);
-    }
-    return await hydrateTask(meta);
-  });
+// R28-4：appendActionSideEffectMR 已删——MR 双投影改走 upsertMRWithActionSideEffect 单事务
 
 /**
  * 直接设置 task 级 runStatus / currentActionId（runner 用）
@@ -1832,6 +1753,9 @@ export const refreshRepoBranches = async (
  * 注意：本表 `task.mrs[]` 是 task 维度的「当前最新 MR」、跟 `action.sideEffects.mrs[]` 是 action 维度的「本次 ship 产出」不同——
  *   - task.mrs：每仓 1 条、查最新状态用
  *   - action.sideEffects.mrs：每次 ship action 落几条、审计用
+ *
+ * submit_mr 本地落盘请用 {@link upsertMRWithActionSideEffect}（双投影单事务）；
+ * 本函数保留给 mr-inbox 等只改 task.mrs 的路径。
  */
 export const upsertMR = async (
   taskId: string,
@@ -1938,6 +1862,144 @@ export const upsertMR = async (
     } else {
       await writeMeta(meta);
     }
+    const task = await hydrateTask(meta);
+    return { task, mr: nextMR };
+  });
+
+/**
+ * R28-4：MR 双投影单事务——一把 task lock 内同时更新
+ *   `task.mrs[]`（upsertMR 语义、含 mrVersion 推进）与
+ *   `action.sideEffects.mrs[]`（原 appendActionSideEffectMR 语义）。
+ *
+ * 关闭「两写之间被 post-check/stop/advance 插队 → task.mrs 有、action 审计缺、
+ * mrVersion 不一致」的半状态窗口。caller/action lease 合进 finalGuard。
+ */
+export const upsertMRWithActionSideEffect = async (
+  taskId: string,
+  actionId: string,
+  mr: {
+    repoPath: string;
+    /** V0.x：MR 目标分支（提测=测试分支 / 联调=dev 分支） */
+    targetBranch: string;
+    url: string;
+    title: string;
+    branch: string;
+    status: MRRecord["status"];
+    lastCommitHash?: string;
+    hasConflicts?: boolean;
+    mergeStatus?: string;
+  },
+  /** R25-3 / R28-4：锁内 caller 闸 */
+  isOwner?: () => boolean,
+  /**
+   * R28-4：结构条件——默认要求该 action 仍是 current + running。
+   * 传 `requireCurrentRunning: false` 仅测试旁路（生产 submit_mr 不传）。
+   */
+  expected?: { requireCurrentRunning?: boolean },
+): Promise<{ task: Task; mr: MRRecord } | null> =>
+  withTaskLock(taskId, async () => {
+    if (isOwner && !isOwner()) return null;
+    const meta = await readMetaV06(taskId);
+    if (!meta) return null;
+    const requireCurrentRunning = expected?.requireCurrentRunning !== false;
+    const actionIdx = meta.actions.findIndex((a) => a.id === actionId);
+    if (actionIdx < 0) return null;
+    const action = meta.actions[actionIdx]!;
+    // R27-4 / R28-4：历史 / 已切 action 的迟到写拒
+    if (
+      requireCurrentRunning &&
+      (meta.currentActionId !== actionId || action.status !== "running")
+    ) {
+      return null;
+    }
+
+    const now = Date.now();
+    const { repoPath } = mr;
+    // ── ① task.mrs upsert（与 upsertMR 同语义）──
+    const mrIdx = meta.mrs.findIndex(
+      (m) =>
+        m.repoPath === repoPath &&
+        mrTargetBranchOf(m, meta.repoTestBranches) === mr.targetBranch,
+    );
+    let nextMR: MRRecord;
+    if (mrIdx >= 0) {
+      const old = meta.mrs[mrIdx]!;
+      nextMR = {
+        ...old,
+        targetBranch: mr.targetBranch,
+        url: mr.url,
+        title: mr.title,
+        branch: mr.branch,
+        status: mr.status,
+        lastCommitHash: mr.lastCommitHash ?? old.lastCommitHash,
+        hasConflicts: mr.hasConflicts ?? old.hasConflicts,
+        mergeStatus: mr.mergeStatus ?? old.mergeStatus,
+        version: old.version + 1,
+      };
+      meta.mrs = [
+        ...meta.mrs.slice(0, mrIdx),
+        nextMR,
+        ...meta.mrs.slice(mrIdx + 1),
+      ];
+    } else {
+      nextMR = {
+        repoPath,
+        targetBranch: mr.targetBranch,
+        url: mr.url,
+        title: mr.title,
+        branch: mr.branch,
+        status: mr.status,
+        lastCommitHash: mr.lastCommitHash,
+        hasConflicts: mr.hasConflicts,
+        mergeStatus: mr.mergeStatus,
+        version: 1,
+        createdAt: now,
+      };
+      meta.mrs = [...meta.mrs, nextMR];
+    }
+
+    // ── ② action.sideEffects.mrs 追加（同 repoPath 去重覆盖、mrVersion 用刚算的 version）──
+    const existingMrs = action.sideEffects?.mrs ?? [];
+    const filtered = existingMrs.filter((m) => m.repoPath !== repoPath);
+    const nextAction: ActionRecord = {
+      ...action,
+      sideEffects: {
+        ...(action.sideEffects ?? {}),
+        mrs: [
+          ...filtered,
+          {
+            repoPath,
+            targetBranch: mr.targetBranch,
+            mrUrl: mr.url,
+            mrVersion: nextMR.version,
+            branch: mr.branch,
+            commitHash: mr.lastCommitHash ?? "",
+            hasConflicts: mr.hasConflicts,
+          },
+        ],
+      },
+    };
+    meta.actions = [
+      ...meta.actions.slice(0, actionIdx),
+      nextAction,
+      ...meta.actions.slice(actionIdx + 1),
+    ];
+    meta.updatedAt = now;
+
+    const prepared = await prepareMetaWrite(meta);
+    // R28-4：finalGuard = caller + 结构条件（rename 前同步复查）
+    const structureOk = (): boolean => {
+      if (!requireCurrentRunning) return true;
+      const a = meta.actions.find((x) => x.id === actionId);
+      return meta.currentActionId === actionId && a?.status === "running";
+    };
+    const finalGuard = (): boolean => (!isOwner || isOwner()) && structureOk();
+    if (!finalGuard()) {
+      await prepared.abort();
+      return null;
+    }
+    const committed = await prepared.commit(finalGuard);
+    if (!committed) return null;
     const task = await hydrateTask(meta);
     return { task, mr: nextMR };
   });

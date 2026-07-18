@@ -35,7 +35,6 @@ import { dataRoot } from "./data-root";
 
 import {
   appendAction,
-  appendActionSideEffectMR,
   finalizeStaleAndIdleLocked,
   getTask,
   isCurrentRunningAction,
@@ -46,13 +45,18 @@ import {
   clearTaskSessionAgentIdIf,
   setFeishuTesterUserKeys,
   upsertGitBranch,
-  upsertMR,
+  upsertMRWithActionSideEffect,
   setTaskRepoStatus,
   setTaskRunStatus,
   setTaskAwaitingIfIdle,
   setTaskRunStatusIfRunOwner,
   patchActionAndRunStatusIfOpFresh,
 } from "./task-fs";
+import {
+  beginActionSideEffect,
+  endActionSideEffect,
+  waitForActionSideEffectClear,
+} from "./action-side-effects";
 import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
 import {
   runActionCheck,
@@ -1807,12 +1811,6 @@ export const buildSessionBridges = (
           ? false
           : (fresh.removeSourceBranchOnMerge ?? false);
 
-      // R25-3 / R25-5：host/getTask/校验 await 之后、caller 复查之前插桩——
-      // 测试可在此前一个 await 注入换主，断言复查拦住 createMR
-      await failpoint("mcp.submitMr.beforeCreateMR");
-      if (!callerStillValid()) {
-        return { ok: false, error: CALLER_MISMATCH_ERROR };
-      }
       // R27-4：createMR（不可逆外部副作用）前验 action lease——历史 action 的迟到/重试拒
       if (!(await actionLeaseValid())) {
         return {
@@ -1821,235 +1819,263 @@ export const buildSessionBridges = (
         };
       }
 
-      const result = await createMR({
-        config: { host: gitHost, token: gitToken },
-        projectPath: mr.projectPath,
-        sourceBranch: mr.sourceBranch,
-        targetBranch: mr.targetBranch,
-        title: mr.title,
-        description: mr.description,
-        removeSourceBranch,
-      });
-      if (!result.ok) {
-        if (!callerStillValid()) {
-          return { ok: false, error: CALLER_MISMATCH_ERROR };
-        }
-        await writeOwnedEventAndPublish(
-          task.id,
-          callerStillValid,
-          {
-            kind: "error",
-            actionId: mr.actionId,
-            text: `提 MR 失败（${mr.repoPath}）：${result.error}`,
-            meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
-          },
-    );
-        return { ok: false, error: result.error };
-      }
-
-      // R26-4：createMR 成功后、closeOpenMR / 本地写之前复查——
-      // MR 已建不可撤销，但关旧 MR + 本地落盘仍是可阻止的副作用
-      await failpoint("mcp.submitMr.beforeCloseOpenMR");
-      // R27-4：升级为 caller + action lease——action 已切换也跳过 closeOpenMR 及后续本地写
-      if (!(await actionLeaseValid())) {
+      // R28-4：反向屏障——同 action 的 post-check 在飞时拒入场、不 abort check（R24-6 语义保留）
+      const inFlightCheck = runningChecks.get(task.id);
+      if (inFlightCheck?.actionId === mr.actionId) {
         return {
-          ok: true,
-          data: {
-            mr_url: result.url,
-            mr_iid: result.iid,
-            mr_version: 1,
-            has_conflicts: false,
-            merge_status: "unknown",
-            merge_undetermined: true,
-            skipped_local: true,
-          },
+          ok: false,
+          error: "正在收尾检查、稍后重试",
         };
       }
 
-      // 新 MR 建好后、若 source 分支跟上一次不同（= 走了 __conflict 智能解冲突流程）、
-      // 把被取代的旧 `<旧分支>→test` MR 关掉。失败只记日志、不阻塞 ship（新 MR 已建好、旧的留着也只是脏）。
-      if (prevMrBranch && prevMrBranch !== mr.sourceBranch) {
-        const closed = await closeOpenMR({
+      // R28-4：登记 in-flight side effect——submit_work 启动 check 前会等这段结束
+      beginActionSideEffect(task.id, mr.actionId, "submit_mr");
+      try {
+        // R25-3 / R25-5：host/getTask/校验 await 之后、caller 复查之前插桩——
+        // 测试可在此前一个 await 注入换主，断言复查拦住 createMR
+        await failpoint("mcp.submitMr.beforeCreateMR");
+        if (!callerStillValid()) {
+          return { ok: false, error: CALLER_MISMATCH_ERROR };
+        }
+        if (!(await actionLeaseValid())) {
+          return {
+            ok: false,
+            error: `该 action 已结束（不是当前 running action）、不能再提 MR：${mr.actionId}`,
+          };
+        }
+
+        const result = await createMR({
           config: { host: gitHost, token: gitToken },
           projectPath: mr.projectPath,
-          sourceBranch: prevMrBranch,
+          sourceBranch: mr.sourceBranch,
           targetBranch: mr.targetBranch,
+          title: mr.title,
+          description: mr.description,
+          removeSourceBranch,
         });
-        if (!closed.ok) {
-          console.warn(
-            `[task-runner] 关旧 MR 失败（${mr.projectPath} ${prevMrBranch}→${mr.targetBranch}）：${closed.error}`,
+        if (!result.ok) {
+          if (!callerStillValid()) {
+            return { ok: false, error: CALLER_MISMATCH_ERROR };
+          }
+          await writeOwnedEventAndPublish(
+            task.id,
+            callerStillValid,
+            {
+              kind: "error",
+              actionId: mr.actionId,
+              text: `提 MR 失败（${mr.repoPath}）：${result.error}`,
+              meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
+            },
           );
-        } else if (closed.closed && callerStillValid()) {
+          return { ok: false, error: result.error };
+        }
+
+        // R26-4：createMR 成功后、closeOpenMR / 本地写之前复查——
+        // MR 已建不可撤销，但关旧 MR + 本地落盘仍是可阻止的副作用
+        await failpoint("mcp.submitMr.beforeCloseOpenMR");
+        // R27-4：升级为 caller + action lease——action 已切换也跳过 closeOpenMR 及后续本地写
+        if (!(await actionLeaseValid())) {
+          return {
+            ok: true,
+            data: {
+              mr_url: result.url,
+              mr_iid: result.iid,
+              mr_version: 1,
+              has_conflicts: false,
+              merge_status: "unknown",
+              merge_undetermined: true,
+              skipped_local: true,
+            },
+          };
+        }
+
+        // 新 MR 建好后、若 source 分支跟上一次不同（= 走了 __conflict 智能解冲突流程）、
+        // 把被取代的旧 `<旧分支>→test` MR 关掉。失败只记日志、不阻塞 ship（新 MR 已建好、旧的留着也只是脏）。
+        if (prevMrBranch && prevMrBranch !== mr.sourceBranch) {
+          const closed = await closeOpenMR({
+            config: { host: gitHost, token: gitToken },
+            projectPath: mr.projectPath,
+            sourceBranch: prevMrBranch,
+            targetBranch: mr.targetBranch,
+          });
+          if (!closed.ok) {
+            console.warn(
+              `[task-runner] 关旧 MR 失败（${mr.projectPath} ${prevMrBranch}→${mr.targetBranch}）：${closed.error}`,
+            );
+          } else if (closed.closed && callerStillValid()) {
+            await writeOwnedEventAndPublish(
+              task.id,
+              callerStillValid,
+              {
+                kind: "info",
+                actionId: mr.actionId,
+                text: `已关闭被取代的旧 MR（${prevMrBranch} → ${mr.targetBranch}、冲突废弃）`,
+                meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
+              },
+            );
+          }
+        }
+
+        // R26-4 / R27-4：merge-status 轮询前再复查（caller + action lease、各段重新授权）
+        if (!(await actionLeaseValid())) {
+          return {
+            ok: true,
+            data: {
+              mr_url: result.url,
+              mr_iid: result.iid,
+              mr_version: 1,
+              has_conflicts: false,
+              merge_status: "unknown",
+              merge_undetermined: true,
+              skipped_local: true,
+            },
+          };
+        }
+
+        // V0.6.1.1：MR 建好后 poll GitLab 可合性、检测 feature↔test 冲突
+        // GitLab 建 MR 不管有没有冲突都返回成功、冲突要单独查 detailed_merge_status；
+        // 且 GitLab 异步算 mergeability、刚建完可能还在 checking、getMRMergeStatus 内部 poll 到稳定
+        const mergeStatus = await getMRMergeStatus({
+          config: { host: gitHost, token: gitToken },
+          projectPath: mr.projectPath,
+          iid: result.iid,
+        });
+        // poll 失败 / 超时未定时、保守按「无冲突」处理（不误拦 ship、detailed 记 unknown 供审计）
+        const hasConflicts = mergeStatus.ok ? mergeStatus.hasConflicts : false;
+        const detailedStatus = mergeStatus.ok
+          ? mergeStatus.detailedStatus
+          : "unknown";
+        const mergeUndetermined = mergeStatus.ok
+          ? mergeStatus.undetermined
+          : true;
+
+        // R26-4 / R27-4：poll 返回后、本地写前再复查（caller + action lease）
+        if (!(await actionLeaseValid())) {
+          return {
+            ok: true,
+            data: {
+              mr_url: result.url,
+              mr_iid: result.iid,
+              mr_version: 1,
+              has_conflicts: hasConflicts,
+              merge_status: detailedStatus,
+              merge_undetermined: mergeUndetermined,
+              skipped_local: true,
+            },
+          };
+        }
+
+        // R28-4：单事务提交前插桩——测试可在此注入 stop/action 切换，断言双投影都不落
+        await failpoint("mcp.submitMr.beforeLocalCommit");
+        if (!(await actionLeaseValid())) {
+          return {
+            ok: true,
+            data: {
+              mr_url: result.url,
+              mr_iid: result.iid,
+              mr_version: 1,
+              has_conflicts: hasConflicts,
+              merge_status: detailedStatus,
+              merge_undetermined: mergeUndetermined,
+              skipped_local: true,
+            },
+          };
+        }
+
+        // R28-4：task.mrs + action.sideEffects.mrs 同一条件事务（关半状态窗口）
+        const upserted = await upsertMRWithActionSideEffect(
+          task.id,
+          mr.actionId,
+          {
+            repoPath: mr.repoPath,
+            targetBranch: mr.targetBranch,
+            url: result.url,
+            title: mr.title,
+            branch: mr.sourceBranch,
+            status: "open",
+            lastCommitHash: mr.lastCommitHash,
+            hasConflicts,
+            mergeStatus: detailedStatus,
+          },
+          callerStillValid,
+          { requireCurrentRunning: true },
+        );
+        const mrVersion = upserted?.mr.version ?? 1;
+        if (upserted) {
+          publish(task.id, { kind: "task", task: upserted.task });
+          const a = upserted.task.actions.find((x) => x.id === mr.actionId);
+          if (a) publish(task.id, { kind: "action", action: a });
+        }
+
+        // 有冲突走 error 事件（红、醒目）、无冲突走 info——用户在事件流一眼看到「这条 MR 合不了」
+        // 失主则跳过事件（MR 已在 GitLab、本地审计留给新主）
+        if (!callerStillValid()) {
+          return {
+            ok: true,
+            data: {
+              mr_url: result.url,
+              mr_iid: result.iid,
+              mr_version: mrVersion,
+              has_conflicts: hasConflicts,
+              merge_status: detailedStatus,
+              merge_undetermined: mergeUndetermined,
+            },
+          };
+        }
+        const mrVerb = mrVersion > 1 ? `推送（v${mrVersion}）` : "创建";
+        if (hasConflicts) {
+          await writeOwnedEventAndPublish(
+            task.id,
+            callerStillValid,
+            {
+              kind: "error",
+              actionId: mr.actionId,
+              text: `MR 已${mrVerb}、但跟 ${mr.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
+              meta: {
+                repoPath: mr.repoPath,
+                projectPath: mr.projectPath,
+                mrUrl: result.url,
+                mrIid: result.iid,
+                mrVersion,
+                mergeStatus: detailedStatus,
+              },
+            },
+          );
+        } else {
           await writeOwnedEventAndPublish(
             task.id,
             callerStillValid,
             {
               kind: "info",
               actionId: mr.actionId,
-              text: `已关闭被取代的旧 MR（${prevMrBranch} → ${mr.targetBranch}、冲突废弃）`,
-              meta: { repoPath: mr.repoPath, projectPath: mr.projectPath },
+              text: `MR 已${mrVerb}：${result.url}`,
+              meta: {
+                repoPath: mr.repoPath,
+                projectPath: mr.projectPath,
+                mrUrl: result.url,
+                mrIid: result.iid,
+                mrVersion,
+                mergeStatus: detailedStatus,
+              },
             },
-    );
+          );
         }
-      }
-
-      // R26-4 / R27-4：merge-status 轮询前再复查（caller + action lease、各段重新授权）
-      if (!(await actionLeaseValid())) {
-        return {
-          ok: true,
-          data: {
-            mr_url: result.url,
-            mr_iid: result.iid,
-            mr_version: 1,
-            has_conflicts: false,
-            merge_status: "unknown",
-            merge_undetermined: true,
-            skipped_local: true,
-          },
-        };
-      }
-
-      // V0.6.1.1：MR 建好后 poll GitLab 可合性、检测 feature↔test 冲突
-      // GitLab 建 MR 不管有没有冲突都返回成功、冲突要单独查 detailed_merge_status；
-      // 且 GitLab 异步算 mergeability、刚建完可能还在 checking、getMRMergeStatus 内部 poll 到稳定
-      const mergeStatus = await getMRMergeStatus({
-        config: { host: gitHost, token: gitToken },
-        projectPath: mr.projectPath,
-        iid: result.iid,
-      });
-      // poll 失败 / 超时未定时、保守按「无冲突」处理（不误拦 ship、detailed 记 unknown 供审计）
-      const hasConflicts = mergeStatus.ok ? mergeStatus.hasConflicts : false;
-      const detailedStatus = mergeStatus.ok ? mergeStatus.detailedStatus : "unknown";
-      const mergeUndetermined = mergeStatus.ok ? mergeStatus.undetermined : true;
-
-      // R26-4 / R27-4：poll 返回后、本地写前再复查（caller + action lease）
-      if (!(await actionLeaseValid())) {
-        return {
-          ok: true,
-          data: {
-            mr_url: result.url,
-            mr_iid: result.iid,
-            mr_version: 1,
-            has_conflicts: hasConflicts,
-            merge_status: detailedStatus,
-            merge_undetermined: mergeUndetermined,
-            skipped_local: true,
-          },
-        };
-      }
-
-      // R25-3：createMR 已发生后的落盘仍绑 caller——失主拒写、不污染新主
-      const upserted = await upsertMR(
-        task.id,
-        mr.repoPath,
-        {
-          targetBranch: mr.targetBranch,
-          url: result.url,
-          title: mr.title,
-          branch: mr.sourceBranch,
-          status: "open",
-          lastCommitHash: mr.lastCommitHash,
-          hasConflicts,
-          mergeStatus: detailedStatus,
-        },
-        callerStillValid,
-        // R27-4：条件事务带同一结构条件（锁内验 currentActionId/status）
-        mr.actionId,
-      );
-      const mrVersion = upserted?.mr.version ?? 1;
-      if (upserted) {
-        publish(task.id, { kind: "task", task: upserted.task });
-      }
-
-      // 把本次 MR 原子追加到 action.sideEffects.mrs[]（多仓 task 一次 ship 可能落 N 条）
-      // 走 task-fs 原子函数（withTaskLock 包 read-modify-write）、不在这里 getTask→patchAction 两段非原子
-      const patched = await appendActionSideEffectMR(
-        task.id,
-        mr.actionId,
-        {
-          repoPath: mr.repoPath,
-          targetBranch: mr.targetBranch,
-          mrUrl: result.url,
-          mrVersion,
-          branch: mr.sourceBranch,
-          commitHash: mr.lastCommitHash,
-          hasConflicts,
-        },
-        callerStillValid,
-        // R27-4：条件事务带同一结构条件（锁内验 currentActionId/status）
-        true,
-      );
-      if (patched) {
-        publish(task.id, { kind: "task", task: patched });
-        const a = patched.actions.find((x) => x.id === mr.actionId);
-        if (a) publish(task.id, { kind: "action", action: a });
-      }
-
-      // 有冲突走 error 事件（红、醒目）、无冲突走 info——用户在事件流一眼看到「这条 MR 合不了」
-      // 失主则跳过事件（MR 已在 GitLab、本地审计留给新主）
-      if (!callerStillValid()) {
         return {
           ok: true,
           data: {
             mr_url: result.url,
             mr_iid: result.iid,
             mr_version: mrVersion,
+            // agent 据此决策：true → ask_user 让用户解冲突、且本仓「不」发飞书评论
             has_conflicts: hasConflicts,
             merge_status: detailedStatus,
             merge_undetermined: mergeUndetermined,
           },
         };
+      } finally {
+        // R28-4：无论成功 / skipped_local / 拒写，都要摘掉 in-flight 登记
+        endActionSideEffect(task.id, mr.actionId, "submit_mr");
       }
-      const mrVerb = mrVersion > 1 ? `推送（v${mrVersion}）` : "创建";
-      if (hasConflicts) {
-        await writeOwnedEventAndPublish(
-          task.id,
-          callerStillValid,
-          {
-            kind: "error",
-            actionId: mr.actionId,
-            text: `MR 已${mrVerb}、但跟 ${mr.targetBranch} 有冲突、需用户手动解决后才能合：${result.url}`,
-            meta: {
-              repoPath: mr.repoPath,
-              projectPath: mr.projectPath,
-              mrUrl: result.url,
-              mrIid: result.iid,
-              mrVersion,
-              mergeStatus: detailedStatus,
-            },
-          },
-    );
-      } else {
-        await writeOwnedEventAndPublish(
-          task.id,
-          callerStillValid,
-          {
-            kind: "info",
-            actionId: mr.actionId,
-            text: `MR 已${mrVerb}：${result.url}`,
-            meta: {
-              repoPath: mr.repoPath,
-              projectPath: mr.projectPath,
-              mrUrl: result.url,
-              mrIid: result.iid,
-              mrVersion,
-              mergeStatus: detailedStatus,
-            },
-          },
-    );
-      }
-      return {
-        ok: true,
-        data: {
-          mr_url: result.url,
-          mr_iid: result.iid,
-          mr_version: mrVersion,
-          // agent 据此决策：true → ask_user 让用户解冲突、且本仓「不」发飞书评论
-          has_conflicts: hasConflicts,
-          merge_status: detailedStatus,
-          merge_undetermined: mergeUndetermined,
-        },
-      };
     }
 
     if (taskAction.kind === "set_feishu_testers") {
@@ -2219,6 +2245,11 @@ export const buildSessionBridges = (
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
       // R24-1：postCheck 独立租约、不传 run opHandle
+      // R28-4：同 action 有在飞 submit_mr → 先等其结束再启 check（优先等待、不拒 agent）
+      await failpoint("mcp.submitWork.beforeCheckStart");
+      if (!callerStillValid()) return;
+      await waitForActionSideEffectClear(task.id, signal.actionId);
+      if (!callerStillValid()) return;
       // R26-4：abort runningChecks 之前先锁内验 current+running——旧 action 迟到不得杀 B 的 check
       await failpoint("mcp.submitWork.beforeAbortCheck");
       if (!callerStillValid()) return;
