@@ -63,6 +63,11 @@ type ConsumerSpec = {
   eventKey: ConsumerEventKey;
   /** 收到一条 NDJSON 后的处理 */
   onEvent: (raw: unknown) => Promise<void>;
+  /**
+   * 可选能力：CLI 不支持 / 未订阅时整体状态不受它拖累（overall 计算时忽略），
+   * 功能优雅降级。如撤回同步出队——lark-cli 1.0.68 尚未收录 recalled_v1。
+   */
+  optional?: boolean;
 };
 
 /** 归一化 im.message.receive_v1 NDJSON → FeishuInboundMessage */
@@ -185,6 +190,9 @@ export const CONSUMER_SPECS: ConsumerSpec[] = [
   {
     eventKey: "im.message.recalled_v1",
     onEvent: handleRecallEvent,
+    // lark-cli 1.0.68 尚未收录该 EventKey（unknown EventKey 退 2）——撤回出队
+    // 属锦上添花，CLI 支持前优雅降级、不拖 overall
+    optional: true,
   },
 ];
 
@@ -192,11 +200,21 @@ export const CONSUMER_SPECS: ConsumerSpec[] = [
 
 export type ConsumerRuntimeState = {
   eventKey: ConsumerEventKey;
-  status: "stopped" | "starting" | "ready" | "backoff" | "conflict" | "error";
+  /** unsupported：CLI 不认该 EventKey / 后台未订阅回调（exit 2），不做快速重试 */
+  status:
+    | "stopped"
+    | "starting"
+    | "ready"
+    | "backoff"
+    | "conflict"
+    | "error"
+    | "unsupported";
   pid?: number;
   lastError?: string;
   restartCount: number;
   conflictDetail?: string;
+  /** unsupported 时若 CLI 给了「扫码订阅回调」链接，透出给设置页 */
+  subscribeUrl?: string;
 };
 
 export type BridgeRuntimeStatus = {
@@ -233,6 +251,8 @@ type ConsumerHandle = {
   restartTimer: ReturnType<typeof setTimeout> | null;
   backoffMs: number;
   startedAt: number;
+  /** 最近 stderr 尾巴（exit 后判 unsupported 用） */
+  stderrTail: string[];
   /** 本进程自己的 consumer pid，冲突检查时排除 */
   ourPid: number | null;
 };
@@ -465,6 +485,7 @@ const ensureHandle = (spec: ConsumerSpec): ConsumerHandle => {
       backoffMs: 1000,
       startedAt: 0,
       ourPid: null,
+      stderrTail: [],
     };
     rt.consumers.set(spec.eventKey, h);
   }
@@ -500,10 +521,13 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
     },
   });
 
-  // stderr：ready 标记
+  // stderr：ready 标记 + 尾巴缓存（exit 后判 unsupported 用）
+  h.stderrTail = [];
   if (child.stderr) {
     const rlErr = createInterface({ input: child.stderr });
     rlErr.on("line", (line) => {
+      h.stderrTail.push(line);
+      if (h.stderrTail.length > 20) h.stderrTail.shift();
       const m = line.match(READY_RE);
       if (m && m[1] === h.spec.eventKey) {
         h.state.status = "ready";
@@ -520,7 +544,7 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
     });
   }
 
-  // stdout：NDJSON
+  // stdout：NDJSON（CLI 的 ok:false 错误 envelope 也可能走 stdout——缓存进尾巴判 unsupported）
   if (child.stdout) {
     const rlOut = createInterface({ input: child.stdout });
     rlOut.on("line", (line) => {
@@ -534,6 +558,15 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
           `[feishu-bridge/inbound] NDJSON 解析失败 event_key=${h.spec.eventKey}:`,
           t.slice(0, 200),
         );
+        return;
+      }
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        (parsed as { ok?: unknown }).ok === false
+      ) {
+        h.stderrTail.push(t);
+        if (h.stderrTail.length > 20) h.stderrTail.shift();
         return;
       }
       void h.spec.onEvent(parsed).catch((err) => {
@@ -560,6 +593,33 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
       h.state.status = "stopped";
       return;
     }
+
+    // unsupported 判定（2026-07-19 冒烟实测两种真实形态）：
+    // - 「unknown EventKey」——CLI 版本没收录该 key（如 recalled_v1）
+    // - 「requires callbacks not subscribed」——后台没订阅回调（如 card.action.trigger），
+    //   hint 里带扫码订阅链接、透出给设置页引导
+    const tail = h.stderrTail.join("\n");
+    if (
+      code === 2 &&
+      (tail.includes("unknown EventKey") ||
+        tail.includes("requires callbacks not subscribed"))
+    ) {
+      h.state.status = "unsupported";
+      h.state.lastError = tail.includes("unknown EventKey")
+        ? "当前 lark-cli 版本不支持该事件"
+        : "应用后台未订阅该回调（点「去订阅」扫码开通）";
+      const urlMatch = tail.match(/https:\/\/open\.feishu\.cn\/\S+/);
+      if (urlMatch) {
+        h.state.subscribeUrl = urlMatch[0].replace(/["',)\]}]+$/, "");
+      }
+      // 不做快速重试循环——等 30s 的 syncBridgeRuntime 轮询再探（订阅完自动恢复）
+      h.backoffMs = BACKOFF_CAP_MS;
+      console.warn(
+        `[feishu-bridge/inbound] consumer 不可用 event_key=${h.spec.eventKey}：${h.state.lastError}`,
+      );
+      return;
+    }
+
     // 存活 ≥5 分钟 → 重置退避
     if (Date.now() - h.startedAt >= HEALTHY_RESET_MS) {
       h.backoffMs = 1000;
@@ -660,11 +720,12 @@ export const syncBridgeRuntime = async (): Promise<void> => {
     for (const spec of CONSUMER_SPECS) {
       const h = ensureHandle(spec);
       h.stopping = false;
-      // conflict 态：每次 sync 再探一次（对端可能已关）
+      // conflict / unsupported 态：每次 sync 再探一次（对端可能已关 / 用户可能已订阅回调）
       if (
         h.state.status === "conflict" ||
         h.state.status === "stopped" ||
-        h.state.status === "error"
+        h.state.status === "error" ||
+        h.state.status === "unsupported"
       ) {
         if (!h.child) await startConsumer(h);
       } else if (!h.child && h.state.status !== "backoff") {
@@ -683,21 +744,33 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
     const h = rt.consumers.get(spec.eventKey);
     return h ? { ...h.state } : makeConsumerState(spec.eventKey);
   });
-  const enabled = consumers.some((c) => c.status !== "stopped");
-  const anyConflict = consumers.some((c) => c.status === "conflict");
-  const anyError = consumers.some((c) => c.status === "error");
-  const anyReady = consumers.some((c) => c.status === "ready");
-  const anyStarting = consumers.some(
-    (c) => c.status === "starting" || c.status === "backoff",
+  // overall 计算口径：optional consumer 的 unsupported 不拖累整体（优雅降级，
+  // 如 recalled_v1 在旧 CLI 上不可用）；非 optional 的 unsupported 算 partial
+  const significant = consumers.filter((c, i) => {
+    const spec = CONSUMER_SPECS[i]!;
+    return !(spec.optional && c.status === "unsupported");
+  });
+  const enabled = significant.some((c) => c.status !== "stopped");
+  const anyConflict = significant.some((c) => c.status === "conflict");
+  const anyError = significant.some((c) => c.status === "error");
+  const anyReady = significant.some((c) => c.status === "ready");
+  const anyDegraded = significant.some(
+    (c) =>
+      c.status === "starting" ||
+      c.status === "backoff" ||
+      c.status === "unsupported",
   );
 
   let overall: BridgeRuntimeStatus["overall"] = "stopped";
   if (anyConflict) overall = "conflict";
   else if (anyError && !anyReady) overall = "error";
-  else if (anyReady && (anyError || anyStarting || consumers.some((c) => c.status === "stopped")))
+  else if (
+    anyReady &&
+    (anyError || anyDegraded || significant.some((c) => c.status === "stopped"))
+  )
     overall = "partial";
   else if (anyReady) overall = "running";
-  else if (anyStarting) overall = "partial";
+  else if (anyDegraded) overall = "partial";
   else if (enabled) overall = "partial";
 
   return {

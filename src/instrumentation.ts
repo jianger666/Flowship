@@ -85,14 +85,11 @@ export const register = (): void => {
       );
     });
 
-  // 飞书 chat 桥接：出向 tap / 按钮回调 / 命令词 / 回执 / 撤回 / consumer 守护，
-  // 统一走 bootstrap 一处调齐（各模块 globalThis 幂等、开关关闭时全部 no-op）
-  void import("./lib/server/feishu-bridge/bootstrap")
-    .then((m) => m.ensureFeishuBridgeBootstrapped())
-    .catch((err) => {
-      console.warn(
-        "[instrumentation] 飞书桥接启动失败（不阻断启动）:",
-        err instanceof Error ? err.message : err,
-      );
-    });
+  // ⚠️ 飞书桥接 bootstrap **不能**挂这里（2026-07-19 dev 冒烟踩过）：
+  // bridge 模块图经 router/card-action → chat-inject → chat-runner 静态引到 @cursor/sdk，
+  // 而 instrumentation 的 webpack bundle 不吃 serverExternalPackages——SDK 的
+  // `lazy ^./` 动态导入会让 webpack 去解析 dist 里的 .d.ts.map、ModuleParseError
+  // 毒化整个 server 编译（所有路由 500、build 同挂）。
+  // → bootstrap 改挂在 route 模块加载时（见 /api/tasks 与 /api/feishu-bridge/status），
+  //   route bundle 吃 serverExternalPackages、SDK 保持 external。
 };

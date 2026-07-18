@@ -42,6 +42,33 @@ const ELEMENT_ANSWER = "md_answer";
 const ELEMENT_FOOTER = "md_footer";
 const ELEMENT_QUOTE = "md_quote";
 
+// ---------- ask_user 元素 id（与 card-action 共用、必须对偶） ----------
+// CardKit element_id 约束（2026-07-19 冒烟实测报错）：字母开头、仅字母数字下划线、
+// **不超过 20 字符**——askId/questionId/optionId 直拼必超长，改用短哈希；
+// 真实 id 走按钮 value 回传，element_id 只用于卡片布局定位。
+
+/** djb2 → base36，约 7 字符 */
+const shortHash = (s: string): string => {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36);
+};
+
+/** 问题 markdown 的 element_id（q + hash ≤ 20 字符） */
+export const askQuestionElementId = (
+  askId: string,
+  questionId: string,
+): string => `q${shortHash(`${askId}|${questionId}`)}`;
+
+/** 选项按钮的 element_id（b + hash ≤ 20 字符） */
+export const askOptionElementId = (
+  askId: string,
+  questionId: string,
+  optionId: string,
+): string => `b${shortHash(`${askId}|${questionId}|${optionId}`)}`;
+
 /** 可注入计时器（单测加速） */
 type TimerFn = (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
 let scheduleTimer: TimerFn = (cb, ms) => setTimeout(cb, ms);
@@ -396,7 +423,8 @@ export const createCardStream = (
     for (const q of askOpts.questions) {
       elements.push({
         tag: "markdown",
-        element_id: `md_ask_${q.id}`,
+        // element_id ≤20 字符硬约束 → 短哈希（真实 id 走按钮 value 回传）
+        element_id: askQuestionElementId(askOpts.askId, q.id),
         content: `**${q.question}**`,
       });
       if (q.options?.length) {
@@ -410,7 +438,7 @@ export const createCardStream = (
           };
           elements.push({
             tag: "button",
-            element_id: `btn_ask_${q.id}_${opt.id}`,
+            element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
             text: { tag: "plain_text", content: opt.label },
             type: "primary",
             width: "default",

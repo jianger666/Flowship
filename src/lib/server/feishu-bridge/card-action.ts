@@ -23,6 +23,7 @@ import { publishTaskStreamEvent } from "@/lib/server/task-stream";
 
 import { findTaskByMessageId } from "./card-map";
 import { nextCardSequence } from "./card-seq";
+import { askOptionElementId, askQuestionElementId } from "./card-stream";
 import {
   batchUpdateCard,
   getBotAppInfo,
@@ -218,15 +219,19 @@ const resolveCardId = async (
 
 /**
  * 把某题的选项按钮组换成一句 markdown（delete_elements + update_element 问题区）。
- * element_id 规律与 card-stream.appendAskUser 对偶：md_ask_<qid> / btn_ask_<qid>_<optId>
+ * element_id 与 card-stream.appendAskUser 严格对偶：短哈希 helper 单一来源
+ * （CardKit element_id ≤20 字符硬约束、不能直拼 askId/qid/optId）。
  */
 const patchAskQuestionAnswered = async (
   cardId: string,
+  askId: string,
   questionId: string,
   optionIds: string[],
   statusMarkdown: string,
 ): Promise<void> => {
-  const btnIds = optionIds.map((oid) => `btn_ask_${questionId}_${oid}`);
+  const btnIds = optionIds.map((oid) =>
+    askOptionElementId(askId, questionId, oid),
+  );
   const actions: unknown[] = [];
   if (btnIds.length > 0) {
     actions.push({
@@ -234,14 +239,15 @@ const patchAskQuestionAnswered = async (
       params: { element_ids: btnIds },
     });
   }
+  const qid = askQuestionElementId(askId, questionId);
   // 问题标题 markdown → 附上已选/失效文案（全量替换该 element）
   actions.push({
     action: "update_element",
     params: {
-      element_id: `md_ask_${questionId}`,
+      element_id: qid,
       element: {
         tag: "markdown",
-        element_id: `md_ask_${questionId}`,
+        element_id: qid,
         content: statusMarkdown,
       },
     },
@@ -252,19 +258,21 @@ const patchAskQuestionAnswered = async (
 /** 无 pending 时只知道被点的那颗按钮——把它换成失效提示 */
 const patchSingleButtonStale = async (
   cardId: string,
+  askId: string,
   questionId: string,
   optionId: string,
 ): Promise<void> => {
+  const bid = askOptionElementId(askId, questionId, optionId);
   await batchUpdateCard(
     cardId,
     [
       {
         action: "update_element",
         params: {
-          element_id: `btn_ask_${questionId}_${optionId}`,
+          element_id: bid,
           element: {
             tag: "markdown",
-            element_id: `btn_ask_${questionId}_${optionId}`,
+            element_id: bid,
             content: "⚠️ 该问题已失效或已回答",
           },
         },
@@ -355,6 +363,7 @@ const handleAskAction = async (
       try {
         await patchSingleButtonStale(
           cardId,
+          value.askId,
           value.questionId,
           value.optionId,
         );
@@ -478,6 +487,7 @@ const handleAskAction = async (
             : `**${question.question}**\n\n（未回答）`;
         await patchAskQuestionAnswered(
           cardId,
+          value.askId,
           question.id,
           optIds.length > 0 ? optIds : [value.optionId],
           status,

@@ -49,9 +49,24 @@ interface BridgeStatusPayload {
     detail?: string;
     error?: string;
   };
-  runtime?: null;
+  runtime?: {
+    overall: string;
+    consumers: Array<{
+      eventKey: string;
+      status: string;
+      lastError?: string;
+      subscribeUrl?: string;
+    }>;
+  } | null;
   error?: string;
 }
+
+/** consumer 事件 key → 人话 */
+const CONSUMER_LABEL: Record<string, string> = {
+  "im.message.receive_v1": "收消息",
+  "card.action.trigger": "卡片按钮",
+  "im.message.recalled_v1": "撤回同步",
+};
 
 const CheckRow = ({
   ok,
@@ -86,8 +101,8 @@ const CheckRow = ({
   </div>
 );
 
-/** 外链「去开通」——base-ui Button 无 asChild，用 buttonVariants 套 a */
-const OpenAuthLink = ({ href }: { href: string }) => (
+/** 外链「去开通 / 去订阅」——base-ui Button 无 asChild，用 buttonVariants 套 a */
+const OpenAuthLink = ({ href, label = "去开通" }: { href: string; label?: string }) => (
   <a
     href={href}
     target="_blank"
@@ -97,7 +112,7 @@ const OpenAuthLink = ({ href }: { href: string }) => (
       "no-underline",
     )}
   >
-    去开通
+    {label}
     <ExternalLink className="size-3" />
   </a>
 );
@@ -257,6 +272,19 @@ export const FeishuBridgeBlock = ({
                     ) : undefined
                   }
                 />
+                {(status?.runtime?.consumers ?? []).map((c) => (
+                  <CheckRow
+                    key={c.eventKey}
+                    ok={c.status === "ready"}
+                    title={`${CONSUMER_LABEL[c.eventKey] ?? c.eventKey}（${c.status}）`}
+                    detail={c.status === "ready" ? undefined : c.lastError}
+                    action={
+                      c.subscribeUrl ? (
+                        <OpenAuthLink href={c.subscribeUrl} label="去订阅" />
+                      ) : undefined
+                    }
+                  />
+                ))}
               </>
             )}
           </div>

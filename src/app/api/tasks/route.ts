@@ -14,9 +14,16 @@
 
 import { NextResponse } from "next/server";
 import { createTask, listTasks } from "@/lib/server/task-fs";
+import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
 import type { NewTaskInput, TaskMode } from "@/lib/types";
+
+// 飞书桥接 bootstrap 锚点：任务列表是 app 启动后最早被请求的 API 之一，
+// 挂这里保证 server 起来后桥接 consumer/出向 tap 尽快就位
+//（不能挂 instrumentation：该 bundle 不吃 serverExternalPackages、会把
+// @cursor/sdk 拖进 webpack 编译炸掉全部路由，2026-07-19 dev 冒烟踩过）
+ensureFeishuBridgeBootstrapped();
 
 const isNonEmptyString = (v: unknown): v is string =>
   typeof v === "string" && v.trim().length > 0;

@@ -34,6 +34,17 @@ const SEND_SCOPE_EQUIVALENTS = [
   "im:message:send",
 ] as const;
 
+/**
+ * `im:message`（收消息）的等价写法。2026-07-19 冒烟实测：lark-cli init 建的应用
+ * 只有细分 readonly scope、没有大 `im:message`，但 event consume 收 p2p 消息可用——
+ * 细分任一命中即视为满足，避免误报红灯。
+ */
+const RECEIVE_SCOPE_EQUIVALENTS = [
+  "im:message",
+  "im:message:readonly",
+  "im:message.p2p_msg:readonly",
+] as const;
+
 /** 探测用最小 JSON 2.0 卡（只建实体不发送，验证 cardkit:card:write） */
 const PROBE_CARD_JSON = {
   schema: "2.0",
@@ -137,6 +148,9 @@ export const isScopeSatisfied = (
 ): boolean => {
   if (required === "im:message:send_as_bot") {
     return SEND_SCOPE_EQUIVALENTS.some((s) => granted.has(s));
+  }
+  if (required === "im:message") {
+    return RECEIVE_SCOPE_EQUIVALENTS.some((s) => granted.has(s));
   }
   return granted.has(required);
 };

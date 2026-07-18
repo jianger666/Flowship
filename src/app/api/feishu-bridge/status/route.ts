@@ -11,6 +11,11 @@ import {
   getBridgeRuntimeStatus,
   syncBridgeRuntime,
 } from "@/lib/server/feishu-bridge/inbound";
+import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
+
+// 桥接 bootstrap 挂 route 模块加载（不能挂 instrumentation：那个 bundle 不吃
+// serverExternalPackages、会把 @cursor/sdk 拖进 webpack 编译炸掉全部路由）
+ensureFeishuBridgeBootstrapped();
 import {
   probeBridgeStatus,
   sendWelcomeMessage,
