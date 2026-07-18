@@ -100,7 +100,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
 
   it("首次 ensure：建 worktree + 基于 base 检出新任务分支 + 拷 .env* + 克隆依赖目录", async () => {
     await markTaskAlive(task.id);
-    const res = await ensureTaskWorktrees(task);
+    const res = await ensureTaskWorktrees(task, () => true);
     expect(res.createdRepos).toEqual([REPO]);
     expect(res.infos[0].name).toBe("feature/888888-集成测试");
     expect(res.infos[0].baseBranch).toBe("main");
@@ -136,7 +136,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("二次 ensure 幂等：复用现成 worktree、createdRepos 为空", async () => {
-    const res = await ensureTaskWorktrees(task);
+    const res = await ensureTaskWorktrees(task, () => true);
     expect(res.createdRepos).toEqual([]);
   });
 
@@ -146,7 +146,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await markTaskAlive(task.id);
     const other = makeTask({ id: "t_1700000000002_it" });
     await markTaskAlive(other.id);
-    await expect(ensureTaskWorktrees(other)).rejects.toThrow(
+    await expect(ensureTaskWorktrees(other, () => true)).rejects.toThrow(
       /创建隔离工作区失败/,
     );
   });
@@ -156,7 +156,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await markTaskDeleted(task.id);
     const other = makeTask({ id: "t_1700000000006_orphan_heal" });
     await markTaskAlive(other.id);
-    const res = await ensureTaskWorktrees(other);
+    const res = await ensureTaskWorktrees(other, () => true);
     expect(res.createdRepos).toEqual([REPO]);
     const otherWork = getTaskWorkRepoPaths(other)[0];
     expect(git(otherWork, "branch", "--show-current")).toBe(
@@ -168,7 +168,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await removeTaskWorktrees(other);
     await markTaskDeleted(other.id);
     await markTaskAlive(task.id);
-    await ensureTaskWorktrees(task);
+    await ensureTaskWorktrees(task, () => true);
   });
 
   it("remove：脏工作区先自动 commit WIP 快照、目录删掉、任务分支保留在原仓库", async () => {
@@ -202,7 +202,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("移除后可重建（reopen 场景）：分支已存在 → 直接挂载、WIP 快照内容还在", async () => {
-    const res = await ensureTaskWorktrees(task);
+    const res = await ensureTaskWorktrees(task, () => true);
     expect(res.createdRepos).toEqual([REPO]);
     expect(git(workDir, "branch", "--show-current")).toBe(
       "feature/888888-集成测试",
@@ -218,14 +218,14 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
   });
 
   it("复用热路径：worktree 里手动 checkout 切走 → ensure 自动切回任务分支", async () => {
-    await ensureTaskWorktrees(task);
+    await ensureTaskWorktrees(task, () => true);
     const taskBranch = "feature/888888-集成测试";
     // main 在原仓检出、不能在 worktree 再切；另建旁路分支模拟用户 / agent 手动切走
     git(REPO, "branch", "side-detour", "main");
     git(workDir, "checkout", "side-detour");
     expect(git(workDir, "branch", "--show-current")).toBe("side-detour");
 
-    const res = await ensureTaskWorktrees(task);
+    const res = await ensureTaskWorktrees(task, () => true);
     expect(res.createdRepos).toEqual([]);
     expect(git(workDir, "branch", "--show-current")).toBe(taskBranch);
   });
@@ -249,7 +249,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999999",
     });
     await markTaskAlive(task2.id);
-    await ensureTaskWorktrees(task2);
+    await ensureTaskWorktrees(task2, () => true);
     const workDir2 = getTaskWorkRepoPaths(task2)[0];
     // 工作区留未提交改动
     await fs.writeFile(path.join(workDir2, "uncommitted.txt"), "precious\n");
@@ -327,7 +327,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(workPaths[1]).toBe(scriptsDir);
 
     // ensure 平安走完：只建 git 仓的 worktree、非 git 跳过不抛
-    const res = await ensureTaskWorktrees(mixed);
+    const res = await ensureTaskWorktrees(mixed, () => true);
     expect(res.createdRepos).toEqual([REPO]);
     // 分支记录只有 git 仓（非 git 无分支概念、不进 gitBranches）
     expect(res.infos.map((i) => i.repoPath)).toEqual([REPO]);
@@ -340,7 +340,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     ).resolves.toContain("echo ok");
 
     // 二次 ensure 幂等（非 git 跳过路径也幂等）
-    const again = await ensureTaskWorktrees(mixed);
+    const again = await ensureTaskWorktrees(mixed, () => true);
     expect(again.createdRepos).toEqual([]);
 
     // remove：只清 git 仓 worktree、绝不碰非 git 原目录
@@ -365,7 +365,7 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     });
     expect(getTaskWorkRepoPaths(t)).toEqual([onlyScripts]);
 
-    const res = await ensureTaskWorktrees(t);
+    const res = await ensureTaskWorktrees(t, () => true);
     expect(res.createdRepos).toEqual([]);
     expect(res.infos).toEqual([]);
 

@@ -529,10 +529,15 @@ describe("ownership R26 真实 sink 窗口矩阵", () => {
       // 挂起点在 worktree add 前 → ensure 尚未被调
       expect(mockEnsureTaskWorktrees).not.toHaveBeenCalled();
 
-      await finalizeTask(id, "abandoned");
+      // R28-1：finalize 先占 finalizing + revoke，再 join starting。
+      // 等 lifecycle 已 finalizing 再 release——prewarm 的 stillPrewarm 必假、不调 ensure；
+      // 同时 starting 随后归零，join 不会空等到 30s。
+      const pFin = finalizeTask(id, "abandoned");
+      await waitUntil(() => getChatLifecycle(id) === "finalizing", 5000);
+      hang.release();
+      await pFin;
       expect((await readMetaV06(id))?.repoStatus).toBe("abandoned");
 
-      hang.release();
       // prewarm 是 fire-and-forget：deadline 内轮询确认 ensure 始终不被调（不裸 sleep 当收敛）
       await waitUntil(async () => {
         const m = await readMetaV06(id);

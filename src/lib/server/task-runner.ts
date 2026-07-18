@@ -114,6 +114,7 @@ import {
   forceClearStaleRunnerState,
   forkPendingTasks,
   getTaskOpGeneration,
+  hasResourceJobs,
   isTaskOpCurrent,
   isTaskStarting,
   pendingStopRequests,
@@ -810,8 +811,8 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
       await failpoint("prewarm.beforeWorktreeAdd");
       if (!(await stillPrewarm())) return;
 
-      // R27-2：lease 进资源函数内部——失效抛 WorktreeLeaseLostError 让位
-      const ensured = await ensureTaskWorktrees(task, { lease });
+      // R27-2 / R28-1：lease 进资源函数内部——失效抛 WorktreeLeaseLostError 让位（不吞）
+      const ensured = await ensureTaskWorktrees(task, lease);
 
       // worktree add 返回后再复查——终态后不 upsert、不写 info
       if (!(await stillPrewarm())) return;
@@ -947,11 +948,18 @@ const advanceTaskCore = async (
   //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
   //   创建失败直接抛（带处置建议）、不带病起 agent。
   if (isWorktreeTask(task)) {
-    // R27-2：advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
-    // lease 失效抛 WorktreeLeaseLostError、外层路由 catch 报「推进中止」）
-    const ensured = await ensureTaskWorktrees(task, {
-      lease: () => !isTaskOpStale(task.id, opGen),
-    });
+    // R27-2 / R28-1：advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
+    // lease 失效抛 WorktreeLeaseLostError → 转 stale、不得 upsert / 写事件）
+    let ensured;
+    try {
+      ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen));
+    } catch (err) {
+      // R28-1：让位不吞——显式终态，不继续 upsertGitBranch / info
+      if (err instanceof WorktreeLeaseLostError) {
+        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+      }
+      throw err;
+    }
     // 仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值、跟 build hint 老规则一致）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
@@ -1405,10 +1413,17 @@ const resumeCurrentActionCore = async (
 
   // 隔离工作区 task → 确保 worktree 在（可能被手删过）
   if (isWorktreeTask(startTask)) {
-    // R27-2：resume 链已 claim——resource lease 用 opHandle
-    const ensured = await ensureTaskWorktrees(startTask, {
-      lease: () => isOpOwner(opHandle),
-    });
+    // R27-2 / R28-1：resume 链已 claim——resource lease 用 opHandle；让位不吞
+    let ensured;
+    try {
+      ensured = await ensureTaskWorktrees(startTask, () => isOpOwner(opHandle));
+    } catch (err) {
+      if (err instanceof WorktreeLeaseLostError) {
+        releaseTaskOpIf(opHandle);
+        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+      }
+      throw err;
+    }
     const existingRepos = new Set(
       (startTask.gitBranches ?? []).map((b) => b.repoPath),
     );
@@ -1529,16 +1544,20 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // R26-1：写终态前轮询等在飞 create/resume（isTaskStarting）归零——
-    // revoke/lifecycle 已让它们自然让位，join 只缩窗；超时照常继续。
+    // R28-1：写终态前轮询等在飞 create/resume（isTaskStarting）与 resource job 归零——
+    // revoke/lifecycle/lease 已让它们自然让位；join 只缩窗（资源操作可比启动长）。
+    // 正确性不依赖超时——超时 warn 后继续（revoke + lease 已挡后续副作用）。
     {
-      const deadline = Date.now() + 5000;
-      while (isTaskStarting(taskId) && Date.now() < deadline) {
+      const deadline = Date.now() + 30_000;
+      while (
+        (isTaskStarting(taskId) || hasResourceJobs(taskId)) &&
+        Date.now() < deadline
+      ) {
         await new Promise<void>((r) => setTimeout(r, 50));
       }
-      if (isTaskStarting(taskId)) {
+      if (isTaskStarting(taskId) || hasResourceJobs(taskId)) {
         console.warn(
-          `[task-runner] finalizeTask: task=${taskId} 等待 isTaskStarting 归零超时（~5s）、继续终结`,
+          `[task-runner] finalizeTask: task=${taskId} 等待 starting/resourceJobs 归零超时（~30s）、继续终结`,
         );
       }
     }
@@ -2245,8 +2264,15 @@ export const installSessionIfCurrent = (
  * 2. 隔离 task 的 worktree——reopen 不重建、finalize 清过再问一问、用户手删 worktree
  *    都会让 cwd 指到不存在的路径；ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
  *    失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
+ *
+ * @param lease R28-1：**必填**——mkdir 前验、透传给 ensureTaskWorktrees；失主抛 WorktreeLeaseLostError
  */
-const ensureWorkspaceReady = async (task: Task): Promise<void> => {
+const ensureWorkspaceReady = async (
+  task: Task,
+  lease: () => boolean,
+): Promise<void> => {
+  // R28-1：workspace mkdir 前验 lease（与 worktree ensure 共用同一租约）
+  if (!lease()) throw new WorktreeLeaseLostError();
   // chat 不建 workspace 目录（跟 createTask 口径一致）；当前 chat 不走本 runner、纯防御
   if (task.mode !== "chat") {
     await fs
@@ -2256,7 +2282,7 @@ const ensureWorkspaceReady = async (task: Task): Promise<void> => {
       );
   }
   if (!isWorktreeTask(task)) return;
-  await ensureTaskWorktrees(task);
+  await ensureTaskWorktrees(task, lease);
 };
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
@@ -2275,6 +2301,11 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   } = input;
   // V1：调用方传入场快照；没传则入口自取（其它入口路径）
   const opGen = input.opGen ?? getTaskOpGeneration(task.id);
+  // R28-1：真实启动链 lease——有 opHandle 用 isOpOwner；否则退 admission gen
+  const workspaceLease = (): boolean =>
+    input.opHandle
+      ? isOpOwner(input.opHandle)
+      : !isTaskOpStale(task.id, opGen);
 
   // 打点（v1.1.x「SDK 比 IDE 慢」排查）：启动链路各段耗时、[perf] 前缀统一可 grep 统计
   const perfStart = Date.now();
@@ -2285,7 +2316,18 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   let handedOffToRunner = false;
   try {
     // 兜底：调用方约定已 ensure，但 resume / 问一问 / 手删 worktree 等路径可能漏——入口再保证一次
-    await ensureWorkspaceReady(task);
+    try {
+      await ensureWorkspaceReady(task, workspaceLease);
+    } catch (err) {
+      // R28-1：让位 → 抛 stale（advance / resume 调用方不得当作启动成功）
+      if (err instanceof WorktreeLeaseLostError) {
+        console.log(
+          `[task-runner] internalStartAgent: task=${task.id} 工作区 ensure 让位（lease 失效）`,
+        );
+        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+      }
+      throw err;
+    }
     // V1：ensure 可能用 stale task 重建了已删目录——立刻发现作废则不再 create
     await abortIfTaskOpStale(task.id, opGen);
     const perfWorkspaceMs = Date.now() - perfStart;
@@ -4065,7 +4107,19 @@ export const resumeTaskSession = async (
   if (!(await mayResume())) return null;
 
   // 放 try 外：ensure 失败（分支被占等）应冒泡给调用方；try 只兜 Agent.resume 失败降级
-  await ensureWorkspaceReady(task);
+  // R28-1：resume 传 opHandle 闭包（无 handle 时退 lifecycle + 终态）
+  const resumeLease = (): boolean => {
+    if (opts?.opHandle && !isTaskOpCurrent(opts.opHandle)) return false;
+    if (getChatLifecycle(task.id) !== null) return false;
+    return true;
+  };
+  try {
+    await ensureWorkspaceReady(task, resumeLease);
+  } catch (err) {
+    // R28-1：让位 → 静默 return null（不起 session）
+    if (err instanceof WorktreeLeaseLostError) return null;
+    throw err;
+  }
   if (!(await mayResume())) return null;
 
   try {
@@ -4295,7 +4349,17 @@ export const startOneShotQuestion = (
       // R24-3b 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
       await failpoint("oneshot.beforeEnsure");
       // finalize / 手删后 worktree 可能已不在——起兜底 agent 前先保证目录存在
-      await ensureWorkspaceReady(task);
+      // R28-1：one-shot 传 observer 闭包
+      try {
+        await ensureWorkspaceReady(task, () => isTaskOpCurrent(oneshotOpHandle));
+      } catch (err) {
+        // R28-1：让位 → 静默 return（不起 agent）
+        if (err instanceof WorktreeLeaseLostError) {
+          abortStaleQuietly();
+          return;
+        }
+        throw err;
+      }
       if (
         isTaskOpStale(task.id, admissionOpGen) ||
         !isTaskOpCurrent(oneshotOpHandle)

@@ -286,6 +286,14 @@ export const clearTaskStarting = (taskId: string): void => {
   startingTasksMap().delete(taskId);
 };
 
+// R28-1：resource job 计数实现在 resource-jobs.ts（避环）；此处 re-export 供调用方统一从 stream 取
+export {
+  beginResourceJob,
+  endResourceJob,
+  hasResourceJobs,
+  clearResourceJobs,
+} from "./resource-jobs";
+
 /**
  * 准入快照（路由入场同步取；语义 = 旧 getTaskOpGeneration）。
  * 无记录返 0——与 revoke 写入的进程单调 token（≥1）永不相等（W1 防 ABA）。
