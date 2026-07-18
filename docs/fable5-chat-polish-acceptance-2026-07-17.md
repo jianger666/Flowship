@@ -1,5 +1,7 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-18 22:00：第二十八轮修复已提交、待复审——R27-1～R27-7 全部处置 + 收敛门槛 5 条落地：lease 进 rename retry 循环与 worktree 资源函数内部、resume reject 条件清锚点、action/ask 身份从 session token 拆出、owned sink 必填化 + ESLint 静态门禁、chat 主消息流接 instanceId lease、ENOENT 不 publish 幽灵事件。门禁 74 文件 / 746 项 0 skipped 两遍全绿。修复期间发生一次 git checkout 数据事故、已从构建缓存完整恢复并保护性提交（详见报告内事故记录）。详见「第二十八轮修复报告」。
+>
 > 2026-07-18 20:52：第二十七轮 Codex 深度收敛复审完成。R26 的五个 sink 原语对新增测试中的单次提交窗口有效，但 lease 仍没有进入 Windows rename 的每次重试、worktree 的每个资源副作用、ask/action 身份以及 chat 主消息流；另有删除竞态下“未落盘却 publish”的契约错误。确认 **6 个 P1 + 1 个 P2**，结论不通过。定向 31 项、typecheck、lint、真实权限全量 72 文件 / 727 项、build、diff-check 均通过；绿灯未覆盖本轮时序。详见「第二十七轮验收」。
 >
 > 2026-07-18 20:30：第二十七轮修复已提交、待复审——按第二十六轮「一次性收敛建议」实施授权层 + sink 层收口：五个唯一入口（`commit(finalGuard)` / `appendEventIf` / `publishIfCurrent` / `installSessionIfCurrent` / `cancelPendingIf`）全部落地，终态准入下沉到 resume/prewarm 资源 sink，MCP action 级授权（session token 只认证 agent）+ stop 同步失效 bridge，R26-7 点名的 9 个真实 sink 窗口全部有挂起 failpoint 矩阵。门禁 72 文件 / 727 项 0 skipped 四遍全绿。详见「第二十七轮修复报告」。
@@ -620,6 +622,60 @@ consume 链 flush、sdk-message-handler、notifier、post-check、reconnect、pr
 - SSE/event 带 `operationId/runId` + 前端 reducer 双层拒绝（收敛建议第 4 条后半）未实施——服务端 sink 层已在提交点拒绝旧写、前端层作为纵深防御留待后续；若复审认定仍有服务端拦不住的窗口再上。
 - createMR 已成功但失主：返回 `ok:true + skipped_local`（GitLab 侧不可撤销、本地不落）——agent 侧提示词未特别教育该字段、依赖 agent 读返回文本。
 - resume 的 install 同步 lease 只验 opHandle + lifecycle；终态由 failpoint 后的 fresh 读覆盖（finalize 持 lifecycle 期间主窗口已被 lifecycle 检查挡住）。
+
+---
+
+## 第二十八轮修复报告（Fable5、2026-07-18 夜、待复审）
+
+按第二十七轮意见修复 R27-1～R27-7 + 落地「收敛门槛」5 条。**修复过程中发生一次数据事故并已完整恢复**（见文末事故记录）。
+
+### R27-1（finalGuard 进 rename retry 循环）
+
+`renameWithRetry` 增 `beforeAttempt` 同步钩子——**每次** `fs.rename` 发起前验 guard、失败抛 `RenameAbortedError` 清 tmp 不提交；`commit(finalGuard)` 把 guard 传入。Windows EPERM/EACCES/EBUSY 退避重试期间换主不再提交旧 meta。失败的 syscall 不消费授权、成功发起的 rename 是线性化点。插桩 `rename.beforeAttempt`。
+
+### R27-2（resource lease 进 ensureTaskWorktrees 内部）
+
+`ensureTaskWorktrees(task, { lease })`：fetch 后、目录清理前、每次 worktree add 前同步验 lease（插桩 `ensure.beforeWorktreeAdd`）；失主让位（对外空 `createdRepos`、不 upsert 不写事件）；add 成功后复查、失主补偿移除本轮新建 worktree。prewarm 传 `stillPrewarm`、advance/resume 传 opHandle、finalize 清理不传；prewarm 登记 `beginTaskStarting`（finalize 的 join 轮询可等到它）。
+
+### R27-3（resume reject 条件清锚点）
+
+`clearTaskSessionAgentIdIf(taskId, expectedAgentId, extraGuard)`——task/chat 两侧 `Agent.resume` 确定性失败 catch 不再裸清 `sessionAgentId`：锁内验盘上仍是本次尝试的 agentId + 本链 lease 仍 current + 内存无后继 session。B 已装会话/已落新锚点时绝不清。
+
+### R27-4（action lease：submit_mr / set_feishu_testers）
+
+- `validateSubmitMr`：action 必须 `currentActionId === actionId && status === "running"`——同 session（caller token 不变）的历史 action 迟到/重试 submit_mr 拒。
+- handler 内每个外部副作用（createMR / closeOpenMR / 轮询各段）前 `actionLeaseValid`（caller + 锁内 fresh 结构）复查；本地 MR 落盘条件事务带同一结构条件。
+- `set_feishu_testers` 补 type === "ship"、结构条件进 `setFeishuTesterUserKeys` 锁内 finalGuard。
+
+### R27-5（ask lease 含 askId）
+
+task/chat 两侧 ask notifier 的 lease 增 `getPendingAsk(taskId)?.askId === signal.askId`——同 caller 并发/重试的旧 ask 在 supersede/event/status/publish 每个 sink 被拦，UI 与 pending map 不再分裂。
+
+### R27-6（owned sink 必填化 + chat 主消息流 + 静态门禁）
+
+- `writeOwnedEventAndPublish(taskId, lease, ev)`（lease 必填）；owner 语境调用点全部迁移，用户操作/终态 owner 保留无条件版。
+- chat 主消息流（assistant buffer flush + `handleSdkMessage`）接 run instanceId lease——force-clear 后旧 run 迟到输出不再污染新会话历史；chat-runner 本地第二套事件写实现删除。
+- **ESLint 静态门禁**：`no-restricted-syntax` 禁止 task-runner / chat-runner / sdk-message-handler 内裸调 `writeEventAndPublish`（缺第三参 lease 报 error）；无条件语义调用点逐处 disable + 中文理由注释——后续新增分支不能绕开协议。
+
+### R27-7（append ENOENT 透传）
+
+`appendEventLineUnlocked` ENOENT 返 false 一路透传，`writeEventAndPublish` 不再 publish 磁盘上不存在的幽灵事件。
+
+### 测试
+
+新增 `tests/ownership-r27-matrix.test.ts`（收敛门槛点名的 7 个真实提交点：rename 首败重试 × 换主、ensure 进入后 × finalize、resume reject × B 落盘、同 caller 历史 action、同 caller 双 ask、chat force-clear 迟到流、delete × ENOENT）+ `tests/ownership-r27-wiring.test.ts`（接线定向）。
+
+### 第二十八轮工程门禁（修复后）
+
+- `pnpm typecheck`：通过
+- `pnpm lint`：通过（0 error / 0 warning、含新静态门禁规则）
+- `pnpm test`：74 文件 / 746 项全部通过、0 skipped、连跑两遍
+- `pnpm build`：生产构建通过
+- `git diff --check`：通过
+
+### ⚠️ 事故记录（如实、供复审知悉）
+
+R27 修复过程中一个子代理误用 `git checkout` 将从未提交的 `task-runner.ts` / `sdk-message-handler.ts` / `ask-supersede.ts` 回退到 v1.1.20（丢失 27 轮全部实现）。恢复方式：从最后一次全绿 build（20:48）的 webpack 构建缓存提取转译 JS（逻辑/注释 100% 保留）+ 旧版类型骨架与完好依赖签名反推 TS 类型重建三文件；保真度由门禁验证（typecheck 0 错 + 恢复后 734 项测试 731 绿、3 红恰为事故前未完成的 R27-2/3/4）。恢复后已做保护性 git commit（`4c0fbb1`、本地未 push），后续每轮追加 wip commit。复审时若发现「实现与某轮修复报告描述不符」的疑点，优先怀疑恢复保真度、直接点名，我方对照 transcript 核查。
 
 ---
 

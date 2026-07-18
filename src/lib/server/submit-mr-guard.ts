@@ -119,6 +119,15 @@ export const validateSubmitMr = async (
       error: `action_id ${a.actionId} 不是本 task 的 ship / dev / custom action`,
     };
   }
+  // 2b) R27-4：action lease——session caller 只认证 agent，action 权限单独验：
+  //     必须仍是 currentActionId 且 running。同一跨 action session 长期复用 caller token、
+  //     历史 action A 的迟到/重试 submit_mr 在当前已切到 B 时全部拒绝。
+  if (task.currentActionId !== a.actionId || action.status !== "running") {
+    return {
+      ok: false,
+      error: `该 action 已结束（不是当前 running action）、不能再提 MR：${a.actionId}`,
+    };
+  }
   // 3) target_branch 校验：ship / dev 写死「该仓对应那一个分支」、custom 完全放开（任意分支）。
   //    - 提测（ship）→ 该仓测试分支（默认 test）
   //    - 联调（dev）→ 该仓 dev 分支（必须显式配）

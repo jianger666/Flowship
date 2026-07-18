@@ -921,6 +921,7 @@ export const runChatSession = async (
 
     // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
     if (droppedMcp.length > 0) {
+      // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：chat 启动段（会话尚未注册、无实例可绑）、用户发消息的直接结果
       await writeEventAndPublish(task.id, {
         kind: "info",
         text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
@@ -1407,6 +1408,7 @@ const runReconnectAttempt = async (
   staleInstanceId: number | undefined,
 ): Promise<boolean> => {
   const task = fresh;
+  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：重连系统通知（旧实例已摘、新实例未生）
   await writeEventAndPublish(task.id, {
     kind: "info",
     text: `连接中断、正在自动重连（第 ${attempt}/${RECONNECT_MAX} 次）…`,
@@ -1506,11 +1508,16 @@ const runReconnectAttempt = async (
       );
       return true;
     }
-    await writeEventAndPublish(task.id, {
-      kind: "info",
-      text: `重连成功（第 ${attempt} 次）、AI 继续回复`,
-      meta: { kind: "reconnected", attempt },
-    });
+    // R27-6：owner 语境（重连链、send 后已验实例）——claimedInstanceId lease
+    await writeOwnedEventAndPublish(
+      task.id,
+      () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+      {
+        kind: "info",
+        text: `重连成功（第 ${attempt} 次）、AI 继续回复`,
+        meta: { kind: "reconnected", attempt },
+      },
+    );
     await consumeChatRun(fresh, run, undefined, attempt);
     return true;
   } catch (sendErr) {
@@ -1555,6 +1562,7 @@ const handleChatRunFailure = async (
   const eventText = failure.isConnectionDrop
     ? failure.text
     : `Chat agent 异常：${failure.text}`;
+  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：失败收尾（上方 closeChatSession instanceId 门控已保证不误伤新会话、会话已摘无实例可绑）
   await writeEventAndPublish(task.id, {
     kind: "error",
     text: eventText,
@@ -2113,6 +2121,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         const n = getChatQueueCount(taskId) + 1;
         clearChatQueue(taskId);
         try {
+          // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
           await writeEventAndPublish(taskId, {
             kind: "info",
             text: `会话已关闭，${n} 条排队消息未送达、请重新发送`,
@@ -2188,6 +2197,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         clearChatQueue(taskId);
         if (n > 0) {
           try {
+            // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
             await writeEventAndPublish(taskId, {
               kind: "info",
               text: `排队消息处理失败，${n} 条排队消息未送达、请重新发送`,
@@ -2335,6 +2345,7 @@ const maybeAutoCompactThenFlush = async (taskId: string): Promise<void> => {
     const msg =
       err instanceof Error ? err.message : String(err);
     console.warn(`[chat-runner] 自动 compact 失败 task=${taskId}:`, err);
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 系统通知
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: "上下文过大，自动压缩失败，可手动压缩会话",
@@ -2626,6 +2637,7 @@ export const compactChatSession = async (
       reason === "auto"
         ? `上下文过大，已自动压缩会话（摘要 ${summary.length} 字）`
         : `已压缩会话（摘要 ${summary.length} 字）`;
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 完成通知（重建确认成功后写、用户操作链）
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: doneText,
@@ -2635,6 +2647,7 @@ export const compactChatSession = async (
         reason,
       },
     });
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 完成通知（重建确认成功后写、用户操作链）
     await writeEventAndPublish(taskId, {
       kind: "compact_summary",
       text: `会话摘要（${summary.length} 字）`,

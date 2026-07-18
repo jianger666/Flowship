@@ -609,17 +609,18 @@ describe("ownership R27 真实提交点矩阵", () => {
       await seedHistoryShipAndCurrentBuild(id);
       const token = String(allocTaskRunInstanceId());
 
-      // 生产 registerSessionBridges 未传 callerToken 时，补上测试 token 以便 runTaskAction 过身份闸
+      // 强制用测试 token 注册——R27-4 测的是「同 caller × 历史 action」的 action lease，
+      // 不是 session caller 换主；生产 install 会另 alloc callerToken，这里钉死测试侧身份。
       const actualSetHandler = chatPending.setChatTaskActionHandler;
       const actualSetNotifier = chatPending.setChatAwaitingNotifier;
       vi.spyOn(chatPending, "setChatTaskActionHandler").mockImplementation(
-        (taskId, handler, callerToken?) => {
-          actualSetHandler(taskId, handler, callerToken ?? token);
+        (taskId, handler) => {
+          actualSetHandler(taskId, handler, token);
         },
       );
       vi.spyOn(chatPending, "setChatAwaitingNotifier").mockImplementation(
-        (taskId, notifier, callerToken?) => {
-          actualSetNotifier(taskId, notifier, callerToken ?? token);
+        (taskId, notifier) => {
+          actualSetNotifier(taskId, notifier, token);
         },
       );
 

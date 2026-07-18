@@ -969,15 +969,24 @@ const advanceTaskCore = async (
             .join("、")}）、不需要重新下载`
         : "";
     if (ensured.createdRepos.length > 0) {
-      await writeEventAndPublish(task.id, {
-        kind: "info",
-        text: `已创建任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
-          .map((p) => p.split("/").filter(Boolean).pop() ?? p)
-          .join("、")}${cloneNote ? `；${cloneNote}` : ""}`,
-      });
+      // R27-6：owner 语境（advance 启动链、claim 前）——admission lease
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        {
+          kind: "info",
+          text: `已创建任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
+            .map((p) => p.split("/").filter(Boolean).pop() ?? p)
+            .join("、")}${cloneNote ? `；${cloneNote}` : ""}`,
+        },
+      );
     } else if (cloneNote) {
       // 复用已有 worktree 时补克隆（老 worktree 建于克隆功能上线前）也要让用户知道
-      await writeEventAndPublish(task.id, { kind: "info", text: cloneNote });
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        { kind: "info", text: cloneNote },
+      );
     }
     task = (await getTask(task.id)) ?? task;
   }
@@ -1012,12 +1021,17 @@ const advanceTaskCore = async (
       publish(task.id, { kind: "task", task: patched });
       const a = patched.actions.find((x) => x.id === pendingAck.id);
       if (a) publish(task.id, { kind: "action", action: a });
-      await writeEventAndPublish(task.id, {
-        kind: "action_ack",
-        actionId: pendingAck.id,
-        text: `Action ${pendingAck.type} n=${pendingAck.n} 已通过（推进时自动认可）`,
-        meta: { decision: "approve" },
-      });
+      // R27-6：owner 语境（advance 启动链、claim 前）——admission lease
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        {
+          kind: "action_ack",
+          actionId: pendingAck.id,
+          text: `Action ${pendingAck.type} n=${pendingAck.n} 已通过（推进时自动认可）`,
+          meta: { decision: "approve" },
+        },
+      );
     }
     // 条件失败（stop 已 cancelled / 并发处理）或成功：都重读最新 task 继续
     task = (await getTask(task.id)) ?? task;
@@ -1100,14 +1114,19 @@ const advanceTaskCore = async (
       action.readonlyBaseline = readonlyBaseline;
     }
   }
-  await writeEventAndPublish(task.id, {
+  // R27-6：owner 语境（已 claim）——opHandle lease
+  await writeOwnedEventAndPublish(
+    task.id,
+    () => isOpOwner(opHandle),
+    {
     kind: "action_start",
     actionId: action.id,
     text: `开始 ${actionDisplayLabel(action)}（${action.type}）n=${action.n}${
       userInstruction.trim().length > 0 ? `\n用户指令：${truncate(userInstruction, 200)}` : ""
     }`,
     meta: { type: actionType, n: action.n, artifactPath: action.artifactPath },
-  });
+    },
+  );
   await abortIfTaskOpStale(task.id, opGen);
 
   // 3) branch checkout 挂接（仅 build action、V0.6.1 每次都 inject 多仓 idempotent hint）
@@ -1371,12 +1390,17 @@ const resumeCurrentActionCore = async (
   publish(fresh.id, { kind: "action", action: patchedAction });
   let startTask = patchedTask;
 
-  await writeEventAndPublish(fresh.id, {
-    kind: "info",
-    actionId: action.id,
-    text: `已唤醒当前 ${actionDisplayLabel(action)} 阶段（n=${action.n}）、新 agent 接手继续`,
-    meta: { resumedActionId: action.id, actionType: action.type, n: action.n },
-  });
+  // R27-6：owner 语境（resume 链已 claim）——opHandle lease
+  await writeOwnedEventAndPublish(
+    fresh.id,
+    () => isOpOwner(opHandle),
+    {
+      kind: "info",
+      actionId: action.id,
+      text: `已唤醒当前 ${actionDisplayLabel(action)} 阶段（n=${action.n}）、新 agent 接手继续`,
+      meta: { resumedActionId: action.id, actionType: action.type, n: action.n },
+    },
+  );
   await abortIfTaskOpStale(fresh.id, opGen);
 
   // 隔离工作区 task → 确保 worktree 在（可能被手删过）
@@ -1574,6 +1598,7 @@ export const finalizeTask = async (
           removed && removed.snapshotFailedRepos.length > 0
             ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
             : "";
+        // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
         await writeEventAndPublish(taskId, {
           kind: "info",
           text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
@@ -1581,6 +1606,7 @@ export const finalizeTask = async (
       }
     }
 
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
     await writeEventAndPublish(taskId, {
       kind: "info",
       text:
@@ -1608,6 +1634,7 @@ export const reopenTask = async (taskId: string): Promise<void> => {
   }
   const patched = await setTaskRepoStatus(taskId, "developing");
   if (patched) publish(taskId, { kind: "task", task: patched });
+  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：reopenTask 用户直接操作
   await writeEventAndPublish(taskId, {
     kind: "info",
     text: "任务已恢复（→ 开发中）、可继续推进",
@@ -1729,6 +1756,12 @@ export const buildSessionBridges = (
         return { ok: false, error: valid.error };
       }
 
+      // R27-4：action lease——session caller 只认证 agent、action 权限单独验。
+      // 每个外部副作用前复查 = callerStillValid && 锁内 fresh 读 currentActionId/status 仍匹配
+      const actionLeaseValid = async (): Promise<boolean> =>
+        callerStillValid() &&
+        (await isCurrentRunningAction(task.id, mr.actionId));
+
       // V0.x：submit_mr 共用 ship / dev / custom（dev = 联调提 PR→dev 分支、custom = 自定义 action、target 由 playbook 决定）、下面按 action 类型分流。
       const submitAction = fresh.actions.find((x) => x.id === mr.actionId);
       const isDevSubmit = submitAction?.type === "dev";
@@ -1761,6 +1794,13 @@ export const buildSessionBridges = (
       if (!callerStillValid()) {
         return { ok: false, error: CALLER_MISMATCH_ERROR };
       }
+      // R27-4：createMR（不可逆外部副作用）前验 action lease——历史 action 的迟到/重试拒
+      if (!(await actionLeaseValid())) {
+        return {
+          ok: false,
+          error: `该 action 已结束（不是当前 running action）、不能再提 MR：${mr.actionId}`,
+        };
+      }
 
       const result = await createMR({
         config: { host: gitHost, token: gitToken },
@@ -1791,7 +1831,8 @@ export const buildSessionBridges = (
       // R26-4：createMR 成功后、closeOpenMR / 本地写之前复查——
       // MR 已建不可撤销，但关旧 MR + 本地落盘仍是可阻止的副作用
       await failpoint("mcp.submitMr.beforeCloseOpenMR");
-      if (!callerStillValid()) {
+      // R27-4：升级为 caller + action lease——action 已切换也跳过 closeOpenMR 及后续本地写
+      if (!(await actionLeaseValid())) {
         return {
           ok: true,
           data: {
@@ -1833,8 +1874,8 @@ export const buildSessionBridges = (
         }
       }
 
-      // R26-4：merge-status 轮询前再复查（各段副作用之间重新授权）
-      if (!callerStillValid()) {
+      // R26-4 / R27-4：merge-status 轮询前再复查（caller + action lease、各段重新授权）
+      if (!(await actionLeaseValid())) {
         return {
           ok: true,
           data: {
@@ -1862,8 +1903,8 @@ export const buildSessionBridges = (
       const detailedStatus = mergeStatus.ok ? mergeStatus.detailedStatus : "unknown";
       const mergeUndetermined = mergeStatus.ok ? mergeStatus.undetermined : true;
 
-      // R26-4：poll 返回后、本地写前再复查
-      if (!callerStillValid()) {
+      // R26-4 / R27-4：poll 返回后、本地写前再复查（caller + action lease）
+      if (!(await actionLeaseValid())) {
         return {
           ok: true,
           data: {
@@ -1893,6 +1934,8 @@ export const buildSessionBridges = (
           mergeStatus: detailedStatus,
         },
         callerStillValid,
+        // R27-4：条件事务带同一结构条件（锁内验 currentActionId/status）
+        mr.actionId,
       );
       const mrVersion = upserted?.mr.version ?? 1;
       if (upserted) {
@@ -1914,6 +1957,8 @@ export const buildSessionBridges = (
           hasConflicts,
         },
         callerStillValid,
+        // R27-4：条件事务带同一结构条件（锁内验 currentActionId/status）
+        true,
       );
       if (patched) {
         publish(task.id, { kind: "task", task: patched });
@@ -2008,10 +2053,19 @@ export const buildSessionBridges = (
           error: "当前 action 状态不允许设置飞书测试人员（须为 current + running）",
         };
       }
+      // R27-4：外层 fresh 检查补 type === "ship"（非 ship 明确拒，文案含类型语义）
+      if (feishuAction.type !== "ship") {
+        return {
+          ok: false,
+          error: `set_feishu_testers 只允许 ship 类型（当前 ${feishuAction.type} 不允许）`,
+        };
+      }
+      // R27-4：结构条件真正进锁内 expected/finalGuard（外层检查与拿锁之间可切 action）
       const patched = await setFeishuTesterUserKeys(
         task.id,
         taskAction.userKeys,
         callerStillValid,
+        { actionId: taskAction.actionId, types: ["ship"] },
       );
       // R26-4：patched===null 返失败、不写「已记忆」成功事件
       if (!patched) {
@@ -2270,21 +2324,31 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
     }`;
 
-    await writeEventAndPublish(task.id, {
-      kind: "info",
-      actionId: action.id,
-      text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
-    });
+    // R27-6：owner 语境（启动链、claim 前）——admission lease
+    await writeOwnedEventAndPublish(
+      task.id,
+      () => !isTaskOpStale(task.id, opGen),
+      {
+        kind: "info",
+        actionId: action.id,
+        text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
+      },
+    );
 
     // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
     if (droppedMcp.length > 0) {
-      await writeEventAndPublish(task.id, {
-        kind: "info",
-        actionId: action.id,
-        text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
-          .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
-          .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
-      });
+      // R27-6：owner 语境（启动链、claim 前）——admission lease
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        {
+          kind: "info",
+          actionId: action.id,
+          text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
+            .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
+            .join("、")}——相关能力本次不可用、去设置页检查 / 授权`,
+        },
+      );
     }
 
     // 2) R26-2：只构造 bridge 闭包——注册延到 create 后 installSessionIfCurrent
@@ -2934,6 +2998,7 @@ export const handleRunFailure = async (
   // 入口快查——已失去 owner → 旧启动只写事件，绝不碰 action / task 状态
   if (!isOwner()) {
     // R20-1 / R20-4：只落绑定 actionId 的 error 事件（writeEventAndPublish = event envelope）
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：R20-1/R20-4 语义——失主 A 仍落绑定自己 actionId 的失败审计事件、不碰共享状态
     await writeEventAndPublish(taskId, {
       kind: "error",
       actionId: errorActionId,
@@ -3000,6 +3065,7 @@ export const handleRunFailure = async (
     wroteTaskLevel = true;
   }
 
+  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：R20-1/R21-2 语义——失败审计事件绑定自己 actionId、途中失主也要落（共享状态与 envelope 另有 owner 门控）
   await writeEventAndPublish(taskId, {
     kind: "error",
     actionId: errorActionId,
@@ -3217,6 +3283,7 @@ const applyPendingStopIfRequested = async (
         },
       )
     : null;
+  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：用户 stop 操作生效通知
   await writeEventAndPublish(task.id, {
     kind: "info",
     text: "停止请求已生效（启动期间点击的停止）",
@@ -3459,6 +3526,7 @@ const consumeSessionRun = async (
       if (isForkPending) {
         forkPendingTasks.delete(task.id);
         // 换新 agent：会话由 advance 的 force-new 分支显式关（reap:false）、这里不动
+        // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
         await writeEventAndPublish(task.id, {
           kind: "info",
           text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -3602,11 +3670,16 @@ const consumeSessionRun = async (
         console.log(
           `[task-runner] task=${task.id} action#${lastAction.n}(${lastAction.type}) 未交卷 → send 追问 ${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}`,
         );
-        await writeEventAndPublish(task.id, {
-          kind: "info",
-          actionId: lastAction.id,
-          text: `未交卷，正在追问 agent 补调 submit_work（${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}）…`,
-        });
+        // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+        await writeOwnedEventAndPublish(
+          task.id,
+          () => isTaskOpCurrent(opts.opHandle),
+          {
+            kind: "info",
+            actionId: lastAction.id,
+            text: `未交卷，正在追问 agent 补调 submit_work（${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}）…`,
+          },
+        );
         // 写事件 ↔ send 之间有 1~3s 窗口：用户此刻点「停止」会 closeTaskSession，
         // 推进 force-new 会换 agentId / session instanceId。
         const stillOwnSession = (() => {
@@ -3626,6 +3699,7 @@ const consumeSessionRun = async (
           if (yieldIfSuperseded()) return;
           if (forkPendingTasks.has(task.id)) {
             forkPendingTasks.delete(task.id);
+            // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
             await writeEventAndPublish(task.id, {
               kind: "info",
               text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -3675,6 +3749,7 @@ const consumeSessionRun = async (
             if (yieldIfSuperseded()) return;
             if (forkPendingTasks.has(task.id)) {
               forkPendingTasks.delete(task.id);
+              // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：force-new 换主过渡通知（语义上发生在让位后）
               await writeEventAndPublish(task.id, {
                 kind: "info",
                 text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -3704,15 +3779,20 @@ const consumeSessionRun = async (
             () => isTaskOpCurrent(opts.opHandle),
             lastAction.id,
           );
-          await writeEventAndPublish(task.id, {
-            kind: "error",
-            actionId: lastAction.id,
-            text: [
-              `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷就结束了，且追问失败`,
-              "",
-              "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
-            ].join("\n"),
-          });
+          // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+          await writeOwnedEventAndPublish(
+            task.id,
+            () => isTaskOpCurrent(opts.opHandle),
+            {
+              kind: "error",
+              actionId: lastAction.id,
+              text: [
+                `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷就结束了，且追问失败`,
+                "",
+                "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
+              ].join("\n"),
+            },
+          );
           const updated = await getTask(task.id);
           if (updated) publish(task.id, { kind: "task", task: updated });
           publish(task.id, { kind: "done", task: updated ?? task, ok: false });
@@ -3735,15 +3815,20 @@ const consumeSessionRun = async (
         () => isTaskOpCurrent(opts.opHandle),
         lastAction.id,
       );
-      await writeEventAndPublish(task.id, {
-        kind: "error",
-        actionId: lastAction.id,
-        text: [
-          `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 submit_work）就结束了回复`,
-          "",
-          "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
-        ].join("\n"),
-      });
+      // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(opts.opHandle),
+        {
+          kind: "error",
+          actionId: lastAction.id,
+          text: [
+            `agent 在 action ${lastAction.type} n=${lastAction.n} 没交卷（没调 submit_work）就结束了回复`,
+            "",
+            "下一步：在底部输入条说句话即可唤醒本阶段继续、或重新「推进」",
+          ].join("\n"),
+        },
+      );
       const updated = await getTask(task.id);
       if (updated) publish(task.id, { kind: "task", task: updated });
       publish(task.id, { kind: "done", task: updated ?? task, ok: false });
@@ -3826,10 +3911,15 @@ const consumeSessionRun = async (
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[task-runner] task=${task.id} 问一问 run 失败：`, err);
       if (lostStartOwner()) return;
-      await writeEventAndPublish(task.id, {
-        kind: "error",
-        text: `答疑失败：${summarizeRunFailure(message, err).text}`,
-      });
+      // R27-6：owner 语境（questionRun 收尾）——opHandle lease（验收点名残留）
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(opts.opHandle),
+        {
+          kind: "error",
+          text: `答疑失败：${summarizeRunFailure(message, err).text}`,
+        },
+      );
       // W3 / R18-2：失败收尾同答完——gen stale / 非 owner 跳过
       if (shouldRestoreAfterQuestion(opts.opHandle)) {
         await restoreRunStatusAfterQuestion(task.id, () =>
@@ -4363,10 +4453,15 @@ export const startOneShotQuestion = (
         return;
       }
       console.error(`[task-runner] task=${task.id} 问一问兜底失败：`, err);
-      await writeEventAndPublish(task.id, {
-        kind: "error",
-        text: `答疑 agent 启动失败：${err instanceof Error ? err.message : String(err)}`,
-      });
+      // R27-6：owner 语境（oneshot 链、上方已验 current）——oneshot observer lease
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(oneshotOpHandle),
+        {
+          kind: "error",
+          text: `答疑 agent 启动失败：${err instanceof Error ? err.message : String(err)}`,
+        },
+      );
       // R23-3b：restore 前复查 handle；instanceId 用本地变量（不从全局表读 B）
       if (
         !isTaskOpCurrent(oneshotOpHandle) ||

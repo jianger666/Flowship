@@ -1175,6 +1175,8 @@ export const appendActionSideEffectMR = async (
   },
   /** R25-3：可选锁内 caller 闸（submit_mr 迟到写） */
   isOwner?: () => boolean,
+  /** R27-4：可选锁内结构条件——该 action 必须仍是 currentActionId 且 running（action lease） */
+  requireCurrentRunning?: boolean,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     if (isOwner && !isOwner()) return null;
@@ -1183,6 +1185,13 @@ export const appendActionSideEffectMR = async (
     const idx = meta.actions.findIndex((a) => a.id === actionId);
     if (idx < 0) return null;
     const action = meta.actions[idx]!;
+    // R27-4：历史 action 的迟到 submit_mr 不得把 MR 记录挂回已结束的 action
+    if (
+      requireCurrentRunning &&
+      (meta.currentActionId !== actionId || action.status !== "running")
+    ) {
+      return null;
+    }
     const existingMrs = action.sideEffects?.mrs ?? [];
     // 同 repoPath 已记录（重试 / 重复 ship）则去重、用最新这条覆盖
     const filtered = existingMrs.filter((m) => m.repoPath !== mr.repoPath);
@@ -1199,14 +1208,21 @@ export const appendActionSideEffectMR = async (
       ...meta.actions.slice(idx + 1),
     ];
     meta.updatedAt = Date.now();
-    if (isOwner) {
+    if (isOwner || requireCurrentRunning) {
       const prepared = await prepareMetaWrite(meta);
-      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
-      if (!isOwner()) {
+      // R27-4：finalGuard = caller + 结构条件（锁内 meta 写锁互斥 = 最新盘上状态）
+      const structureOk = (): boolean => {
+        if (!requireCurrentRunning) return true;
+        const a = meta.actions.find((x) => x.id === actionId);
+        return meta.currentActionId === actionId && a?.status === "running";
+      };
+      const finalGuard = (): boolean =>
+        (!isOwner || isOwner()) && structureOk();
+      if (!finalGuard()) {
         await prepared.abort();
         return null;
       }
-      const committed = await prepared.commit(isOwner);
+      const committed = await prepared.commit(finalGuard);
       if (!committed) return null;
     } else {
       await writeMeta(meta);
@@ -1683,21 +1699,52 @@ export const setFeishuTesterUserKeys = async (
   userKeys: string[],
   /** R25-3：可选锁内 caller 闸 */
   isOwner?: () => boolean,
+  /**
+   * R27-4：可选锁内结构条件（action lease）——该 action 必须仍是 currentActionId、
+   * status running、且类型在允许集内（set_feishu_testers 语义 = ship 流程记忆）。
+   * 结构条件真正进锁内 expected + finalGuard（验收点名「报告声称进了锁内、实际没有」）。
+   */
+  expectedAction?: { actionId: string; types: readonly ActionType[] },
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
+    // R27-4：锁内验结构条件——外层 fresh 检查后、拿锁前 action 可能已切换
+    if (expectedAction) {
+      const a = meta.actions.find((x) => x.id === expectedAction.actionId);
+      if (
+        meta.currentActionId !== expectedAction.actionId ||
+        !a ||
+        a.status !== "running" ||
+        !expectedAction.types.includes(a.type)
+      ) {
+        return null;
+      }
+    }
     meta.feishuTesterUserKeys = userKeys;
     meta.updatedAt = Date.now();
-    if (isOwner) {
+    if (isOwner || expectedAction) {
       const prepared = await prepareMetaWrite(meta);
+      // R27-4：finalGuard = caller 闸 + 结构条件（结构基于锁内 meta——写锁互斥、即最新盘上状态）
+      const structureOk = (): boolean => {
+        if (!expectedAction) return true;
+        const a = meta.actions.find((x) => x.id === expectedAction.actionId);
+        return (
+          meta.currentActionId === expectedAction.actionId &&
+          !!a &&
+          a.status === "running" &&
+          expectedAction.types.includes(a.type)
+        );
+      };
+      const finalGuard = (): boolean =>
+        (!isOwner || isOwner()) && structureOk();
       // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
-      if (!isOwner()) {
+      if (!finalGuard()) {
         await prepared.abort();
         return null;
       }
-      const committed = await prepared.commit(isOwner);
+      const committed = await prepared.commit(finalGuard);
       if (!committed) return null;
     } else {
       await writeMeta(meta);
@@ -1780,11 +1827,23 @@ export const upsertMR = async (
    * createMR 已发生后的迟到落盘不再污染新主时间线。
    */
   isOwner?: () => boolean,
+  /** R27-4：可选锁内结构条件——该 action 必须仍是 currentActionId 且 running（action lease） */
+  expectedActionId?: string,
 ): Promise<{ task: Task; mr: MRRecord } | null> =>
   withTaskLock(taskId, async () => {
     if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
+    // R27-4：action lease 锁内验——action 已切换/结束则拒写（历史 action 迟到 submit_mr）
+    if (expectedActionId !== undefined) {
+      const a = meta.actions.find((x) => x.id === expectedActionId);
+      if (
+        meta.currentActionId !== expectedActionId ||
+        a?.status !== "running"
+      ) {
+        return null;
+      }
+    }
     const now = Date.now();
     // 去重键 = repoPath + 目标分支：同仓提测 MR（→test）和联调 MR（→dev）各记各的、各自累计 version。
     // 老记录缺 targetBranch（历史只有提测）→ mrTargetBranchOf 兜底成该仓测试分支、跟新提测 MR 正确合并、不跟联调 MR 撞。
@@ -1831,14 +1890,23 @@ export const upsertMR = async (
       meta.mrs = [...meta.mrs, nextMR];
     }
     meta.updatedAt = now;
-    if (isOwner) {
+    if (isOwner || expectedActionId !== undefined) {
       const prepared = await prepareMetaWrite(meta);
-      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
-      if (!isOwner()) {
+      // R27-4：finalGuard = caller + action lease 结构条件
+      const structureOk = (): boolean => {
+        if (expectedActionId === undefined) return true;
+        const a = meta.actions.find((x) => x.id === expectedActionId);
+        return (
+          meta.currentActionId === expectedActionId && a?.status === "running"
+        );
+      };
+      const finalGuard = (): boolean =>
+        (!isOwner || isOwner()) && structureOk();
+      if (!finalGuard()) {
         await prepared.abort();
         return null;
       }
-      const committed = await prepared.commit(isOwner);
+      const committed = await prepared.commit(finalGuard);
       if (!committed) return null;
     } else {
       await writeMeta(meta);
