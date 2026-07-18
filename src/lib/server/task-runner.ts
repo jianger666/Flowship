@@ -1639,6 +1639,14 @@ export const finalizeTask = async (
           text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
         });
       }
+      // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
+      // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
+      // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
+      try {
+        await stopPreviewsForTask(taskId);
+      } catch {
+        /* best-effort */
+      }
     }
 
     // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
