@@ -28,7 +28,12 @@ import {
   meegleAuthStatus,
   MeegleError,
 } from "@/lib/server/meegle-cli";
-import { listTasks } from "@/lib/server/task-fs";
+import {
+  assertTaskReadable,
+  filterCommittedReads,
+  listTasks,
+} from "@/lib/server/task-fs";
+import { failpoint } from "@/lib/server/failpoints";
 
 export const runtime = "nodejs";
 
@@ -75,8 +80,11 @@ export const GET = async (req: Request) => {
 
     // join 本地任务：feishuStoryUrl 抠出的 story id 精确等于工作项 id → 已有任务
     const tasks = await listTasks();
+    // R34-3：list helper 与 Response 之间可插入删除——提交前再 filter
+    await failpoint("httpRead.afterHelper");
+    const readableTasks = filterCommittedReads(tasks);
     const linked = items.map((it) => {
-      const t = tasks.find(
+      const t = readableTasks.find(
         (task) =>
           task.mode !== "chat" &&
           extractFeishuStoryId(task.feishuStoryUrl) === it.id,
@@ -84,15 +92,16 @@ export const GET = async (req: Request) => {
       return {
         ...it,
         raw: undefined,
-        task: t
-          ? {
-              id: t.id,
-              repoStatus: t.repoStatus,
-              runStatus: t.runStatus,
-              lastActionType: t.lastActionType,
-              lastActionStatus: t.lastActionStatus,
-            }
-          : null,
+        task:
+          t && assertTaskReadable(t.id)
+            ? {
+                id: t.id,
+                repoStatus: t.repoStatus,
+                runStatus: t.runStatus,
+                lastActionType: t.lastActionType,
+                lastActionStatus: t.lastActionStatus,
+              }
+            : null,
       };
     });
     console.log(

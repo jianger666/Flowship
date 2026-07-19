@@ -154,12 +154,25 @@ const TaskDetailPage = () => {
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
-  const { upsertTask } = useTaskList();
+  const { upsertTask, removeTask } = useTaskList();
 
   // 当前路由 id 的 ref——快切时 in-flight refresh / 旧 SSE 回调仍持旧闭包，
   // 必须用 ref 比对「响应是否仍属当前页」，不能只靠 absorbTask 的 useCallback(id)
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
+
+  // R34-5：统一 terminal sink——task_deleted 帧 / watch 404·410
+  // （chat 模式由 ChatView 清 pending 后回调；task 模式本页 watcher 直调）
+  const handleTaskDeleted = useCallback(
+    (deletedId: string) => {
+      if (deletedId !== routeIdRef.current) return;
+      setStreamingText("");
+      setTask(null);
+      removeTask(deletedId);
+      toast.message("任务已被删除");
+    },
+    [removeTask],
+  );
 
   // 侧栏 A→B 快切：立刻清本地态，避免短暂显示 A 的内容盖在 B 的 URL 上
   useEffect(() => {
@@ -349,6 +362,7 @@ const TaskDetailPage = () => {
       onAssistantDelta: (text) => setStreamingText((p) => p + text),
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
+      onTaskDeleted: handleTaskDeleted,
     },
     !!task && task.mode !== "chat",
     watchEpoch,
@@ -690,6 +704,7 @@ const TaskDetailPage = () => {
             });
           }}
           onPrependEvents={handlePrependEvents}
+          onTaskDeleted={handleTaskDeleted}
         />
       </div>
     );

@@ -238,17 +238,21 @@ export const ReconnectingRow = memo(
 );
 ReconnectingRow.displayName = "ReconnectingRow";
 
-/** P5：本地排队占位气泡（半透明 + 时钟；展示用户原文） */
-export const PendingLocalReplyRow = memo(({ text }: { text: string }) => (
-  <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
-    <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-    <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
-      <span className="mb-0.5 block text-[10px] tracking-wide">待发送</span>
-      {/* 原文：SkillTokenText 解析 skill token、正文即用户消息 */}
-      <SkillTokenText text={text} />
+/** P5 / R34-4：本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中） */
+export const PendingLocalReplyRow = memo(
+  ({ text, uncertain }: { text: string; uncertain?: boolean }) => (
+    <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
+      <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
+        <span className="mb-0.5 block text-[10px] tracking-wide">
+          {uncertain ? "发送状态未知、正在确认…" : "待发送"}
+        </span>
+        {/* 原文：SkillTokenText 解析 skill token、正文即用户消息 */}
+        <SkillTokenText text={text} />
+      </div>
     </div>
-  </div>
-));
+  ),
+);
 PendingLocalReplyRow.displayName = "PendingLocalReplyRow";
 
 const EventRowImpl = ({

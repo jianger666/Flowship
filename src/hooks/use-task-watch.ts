@@ -44,7 +44,11 @@
 
 import { useEffect, useRef } from "react";
 
-import { watchTaskStream, type TaskStreamCallbacks } from "@/lib/task-store";
+import {
+  ApiRequestError,
+  watchTaskStream,
+  type TaskStreamCallbacks,
+} from "@/lib/task-store";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
 
 // 被动断流后重连退避：干净结束（maxDuration 到点）等这么久再连
@@ -174,15 +178,28 @@ export const useTaskWatch = (
           ) {
             return;
           }
-          failures += 1;
-          if (failures >= MAX_CONSECUTIVE_FAILURES) {
-            if (!cancelled) callbacksRef.current.onWatchException?.(err as Error);
-            return;
+          // R34-5：404/410 = 任务已删 → 与 task_deleted 帧同一 deletion sink，不重试
+          const status =
+            err instanceof ApiRequestError
+              ? err.status
+              : (err as { status?: number }).status;
+          if (status === 404 || status === 410) {
+            gotTaskDeleted = true;
+            if (!cancelled) {
+              callbacksRef.current.onTaskDeleted?.(taskId);
+            }
+          } else {
+            failures += 1;
+            if (failures >= MAX_CONSECUTIVE_FAILURES) {
+              if (!cancelled)
+                callbacksRef.current.onWatchException?.(err as Error);
+              return;
+            }
+            // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
           }
-          // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
         }
 
-        // 终态 done / task_deleted（服务端已关流）→ 停止订阅；卸载 / 切 task 也停
+        // 终态 done / task_deleted / 404·410（服务端已关流）→ 停止订阅
         if (cancelled || gotTerminalDone || gotTaskDeleted) return;
 
         // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连

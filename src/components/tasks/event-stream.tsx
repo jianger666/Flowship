@@ -91,6 +91,8 @@ interface PendingLocalItem {
   kind: "__pending_local__";
   id: string;
   text: string;
+  /** R34-4 */
+  uncertain?: boolean;
 }
 
 type RenderItem = StreamRenderItem | StreamingItem | LoadingItem | PendingLocalItem;
@@ -217,6 +219,8 @@ interface Props {
     id: string;
     text: string;
     displayText: string;
+    /** R34-4：HTTP 不确定 */
+    uncertain?: boolean;
   }>;
   /** P5：排队条文案 / 节点（渲染在 composer 上方） */
   queueBanner?: ReactNode;
@@ -313,6 +317,7 @@ const EventStreamImpl = ({
           kind: "__pending_local__",
           id: p.id,
           text: p.displayText,
+          uncertain: p.uncertain,
         }),
       ),
     ];
@@ -740,7 +745,10 @@ const EventStreamImpl = ({
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
                 ) : isPendingLocalItem(item) ? (
-                  <PendingLocalReplyRow text={item.text} />
+                  <PendingLocalReplyRow
+                    text={item.text}
+                    uncertain={item.uncertain}
+                  />
                 ) : isToolBlock(item) ? (
                   <ToolBlockRow
                     block={item}

@@ -28,6 +28,18 @@ import type {
   TaskSummary,
 } from "./types";
 
+/**
+ * R34-4：带 HTTP status 的业务拒绝——客户端据此区分「明确 4xx」与网络不确定。
+ */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
+
 const handleJson = async <T>(res: Response): Promise<T> => {
   const data = await res.json();
   if (!res.ok) {
@@ -38,7 +50,7 @@ const handleJson = async <T>(res: Response): Promise<T> => {
       typeof (data as { error: unknown }).error === "string"
         ? (data as { error: string }).error
         : `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw new ApiRequestError(msg, res.status);
   }
   return data as T;
 };
@@ -480,7 +492,8 @@ export const watchTaskStream = async (
       typeof data === "object" && data && "error" in data
         ? String((data as { error: unknown }).error)
         : `HTTP ${res.status}`;
-    throw new Error(msg);
+    // R34-5：带 status，hook 对 404/410 走 deletion sink（不再当普通异常重试）
+    throw new ApiRequestError(msg, res.status);
   }
   if (!res.body) {
     throw new Error("响应体缺失（不支持流式？）");
@@ -626,8 +639,19 @@ export const sendChatReply = async (
       queuedCount: number;
       /** R31-1：与服务端 queue item 对账的稳定 id */
       itemId: string;
+      /** R34-4：同 id 幂等命中 active */
+      alreadyAccepted?: boolean;
       task?: Task;
       persistWarning?: string;
+    }
+  | {
+      /** R34-4：同 id 已在 recentSettled → 终态幂等 */
+      settled: true;
+      itemId: string;
+      outcome: string;
+      task?: Task;
+      /** 与其它分支对齐，settled 路径不会带此字段 */
+      persistWarning?: undefined;
     }
 > => {
   const res = await fetch(
@@ -654,6 +678,7 @@ export const sendChatReply = async (
       queued?: boolean;
       queuedCount?: number;
       itemId?: string;
+      alreadyAccepted?: boolean;
       task?: Task;
       persistWarning?: string;
     };
@@ -666,18 +691,45 @@ export const sendChatReply = async (
         typeof data.itemId === "string" && data.itemId
           ? data.itemId
           : `pending_local_${Date.now()}`,
+      ...(data.alreadyAccepted ? { alreadyAccepted: true } : {}),
       task: data.task,
       ...(typeof data.persistWarning === "string"
         ? { persistWarning: data.persistWarning }
         : {}),
     };
   }
-  const data = await handleJson<{
-    ok: true;
-    task: Task;
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg =
+      typeof data === "object" &&
+      data &&
+      "error" in data &&
+      typeof (data as { error: unknown }).error === "string"
+        ? (data as { error: string }).error
+        : `HTTP ${res.status}`;
+    throw new ApiRequestError(msg, res.status);
+  }
+  const data = (await res.json()) as {
+    ok?: true;
+    settled?: boolean;
+    itemId?: string;
+    outcome?: string;
+    task?: Task;
     autoStarted?: boolean;
     persistWarning?: string;
-  }>(res);
+  };
+  // R34-4：幂等终态（同 id 已 settled）
+  if (data.settled === true && typeof data.itemId === "string") {
+    return {
+      settled: true,
+      itemId: data.itemId,
+      outcome: typeof data.outcome === "string" ? data.outcome : "delivered",
+      task: data.task,
+    };
+  }
+  if (!data.task) {
+    throw new ApiRequestError("响应缺少 task", res.status || 500);
+  }
   return {
     task: data.task,
     autoStarted: !!data.autoStarted,

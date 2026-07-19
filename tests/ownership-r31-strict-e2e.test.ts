@@ -357,6 +357,12 @@ describe("R31 / R30-3：task-store 客户端透传 persistWarning", () => {
     if ("queued" in result && result.queued) {
       throw new Error("不应走 queued 分支");
     }
+    if ("settled" in result && result.settled) {
+      throw new Error("不应走 settled 分支");
+    }
+    if (!("task" in result) || !result.task) {
+      throw new Error("应返回 task");
+    }
     expect(result.task.id).toBe("t1");
   });
 

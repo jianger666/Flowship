@@ -197,10 +197,69 @@ export const listRecentSettled = (taskId: string): RecentSettledEntry[] => [
   ...(recentSettledMap().get(taskId) ?? []),
 ];
 
-/** 入队结果：ok + 当前条数 + itemId；满了返回 full */
+/**
+ * 入队结果：ok + 当前条数 + itemId；满了返回 full。
+ * R34-4：同 (taskId, clientItemId) 幂等——已 active 返 alreadyAccepted；
+ * 已在 recentSettled 返 already_settled（调用方映射终态 JSON，禁止再 append）。
+ */
 export type EnqueueResult =
-  | { ok: true; queuedCount: number; itemId: string }
-  | { ok: false; reason: "full"; queuedCount: number };
+  | {
+      ok: true;
+      queuedCount: number;
+      itemId: string;
+      /** R34-4：同 id 已在队内/in-flight，幂等命中未再 append */
+      alreadyAccepted?: boolean;
+    }
+  | { ok: false; reason: "full"; queuedCount: number }
+  | {
+      ok: false;
+      reason: "already_settled";
+      itemId: string;
+      outcome: QueueItemSettleOutcome;
+      queuedCount: number;
+    };
+
+/** R34-4：查 recentSettled 中某 item 的终态（无则 undefined） */
+export const findRecentSettledEntry = (
+  taskId: string,
+  itemId: string,
+): RecentSettledEntry | undefined =>
+  recentSettledMap()
+    .get(taskId)
+    ?.find((e) => e.itemId === itemId);
+
+/**
+ * R34-4：按 (taskId, clientItemId) 查幂等受理态（route 入口 / enqueue 共用）。
+ * - active：队内或 in-flight
+ * - settled：recentSettled 有终态
+ * - absent：可新鲜受理
+ */
+export const lookupQueueItemAcceptance = (
+  taskId: string,
+  itemId: string,
+):
+  | { status: "active"; queuedCount: number }
+  | { status: "settled"; outcome: QueueItemSettleOutcome; queuedCount: number }
+  | { status: "absent" } => {
+  if (!itemId) return { status: "absent" };
+  const qLen = queues().get(taskId)?.length ?? 0;
+  const inflight = inFlightMap().get(taskId) ?? 0;
+  const queuedCount = qLen + inflight;
+  const inFlightId = inFlightItemIdsMap().get(taskId);
+  const inQueue = (queues().get(taskId) ?? []).some((m) => m.itemId === itemId);
+  if (inQueue || inFlightId === itemId) {
+    return { status: "active", queuedCount };
+  }
+  const settled = findRecentSettledEntry(taskId, itemId);
+  if (settled) {
+    return {
+      status: "settled",
+      outcome: settled.outcome,
+      queuedCount,
+    };
+  }
+  return { status: "absent" };
+};
 
 /**
  * 纯函数：在现有列表上尝试追加（不碰 Map）。
@@ -247,17 +306,48 @@ export const enqueueChatMessage = (
   const map = queues();
   const cur = map.get(taskId) ?? [];
   const inflight = getChatQueueInFlight(taskId);
+  const activeCount = cur.length + inflight;
+
+  // R34-4：客户端预生成 id → 先查 active（队内+in-flight）/ recentSettled，禁止重复 append
+  const clientId =
+    typeof msg.itemId === "string" && msg.itemId.trim()
+      ? msg.itemId.trim()
+      : undefined;
+  if (clientId) {
+    const inFlightId = inFlightItemIdsMap().get(taskId);
+    const alreadyActive =
+      cur.some((m) => m.itemId === clientId) || inFlightId === clientId;
+    if (alreadyActive) {
+      return {
+        ok: true,
+        queuedCount: activeCount,
+        itemId: clientId,
+        alreadyAccepted: true,
+      };
+    }
+    const settled = findRecentSettledEntry(taskId, clientId);
+    if (settled) {
+      return {
+        ok: false,
+        reason: "already_settled",
+        itemId: clientId,
+        outcome: settled.outcome,
+        queuedCount: activeCount,
+      };
+    }
+  }
+
   // S4（十二轮）：in-flight 占容量，dequeue 窗口内新消息诚实 409，不靠塞回丢尾
   if (cur.length + inflight >= CHAT_QUEUE_MAX) {
     return {
       ok: false,
       reason: "full",
-      queuedCount: cur.length + inflight,
+      queuedCount: activeCount,
     };
   }
   const result = tryEnqueueMsg(cur, msg);
   if (!result.ok) {
-    return { ok: false, reason: "full", queuedCount: cur.length + inflight };
+    return { ok: false, reason: "full", queuedCount: activeCount };
   }
   map.set(taskId, result.next);
   const itemId = result.next[result.next.length - 1]!.itemId;

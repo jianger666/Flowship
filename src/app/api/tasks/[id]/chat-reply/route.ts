@@ -69,11 +69,17 @@ import {
   type CaptureCheckpointResult,
 } from "@/lib/server/chat-checkpoint";
 import {
+  beginChatQueueInFlight,
   dequeueChatMessage,
+  endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
   failQueuedItems,
   getChatQueueCount,
+  getChatQueueGeneration,
+  listRecentSettled,
+  lookupQueueItemAcceptance,
+  recordQueueItemSettled,
 } from "@/lib/server/chat-queue";
 import { failpoint } from "@/lib/server/failpoints";
 import {
@@ -206,6 +212,39 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("任务正在删除", 409);
   }
 
+  // R34-4：入口幂等——同 clientItemId 已 active → 202；已 settled → 终态 JSON
+  // （不用等到 enqueue：idle 会话会走 direct send，必须在此收口）
+  if (clientItemId) {
+    const acceptance = lookupQueueItemAcceptance(id, clientItemId);
+    if (acceptance.status === "active") {
+      const freshActive = await getTask(id);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          queued: true,
+          queuedCount: acceptance.queuedCount,
+          itemId: clientItemId,
+          alreadyAccepted: true,
+          task: freshActive ?? task,
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (acceptance.status === "settled") {
+      const freshSettled = await getTask(id);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          settled: true,
+          itemId: clientItemId,
+          outcome: acceptance.outcome,
+          task: freshSettled ?? task,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  }
+
   // 落盘图片：
   // - imageAbsPaths：给 agent prompt / submitUserMessage 用（只要绝对路径）
   // - savedImages：完整 meta（absPath/relPath/mimeType/bytes/filename）、写进事件给前端渲染缩略图
@@ -261,9 +300,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 确定会送达后才写 user_reply（send 续接成功 / 起新会话前各调一次）
   // checkpointed:true → 批 B 前端据此显示「回退到这里」
   // R29-4：用户原文走 strict——IO 失败抛错，不得吞成「成功但无气泡」
+  // R34-6：direct 路径也写 meta.queueItemId（与 queued 同字段、前端 id 对账）
   const persistUserReply = async (checkpointed: boolean) => {
     const meta: Record<string, unknown> = { ...userReplyMeta };
     if (checkpointed) meta.checkpointed = true;
+    if (clientItemId) meta.queueItemId = clientItemId;
     return writeUserEventAndPublishStrict(task.id, {
       kind: "user_reply",
       text: text || fallbackText,
@@ -319,12 +360,29 @@ export const POST = async (req: Request, { params }: Ctx) => {
       enqueuedAt: Date.now(),
     });
     if (!queued.ok) {
+      // R34-4：同 id 已在 recentSettled → 终态 JSON（禁止再 append）
+      if (queued.reason === "already_settled") {
+        const freshSettled = await getTask(task.id);
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            settled: true,
+            itemId: queued.itemId,
+            outcome: queued.outcome,
+            task: freshSettled ?? task,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return errorResponse("排队已满", 409);
     }
     // R31-1：记下当前条 itemId（队列优先启动路径稍后原样回给客户端）
     lastEnqueuedItemId = queued.itemId;
-    // R33-1：测试可在入队后、202 返回前挂起（模拟 getTask/网络慢于 stop 终态）
-    await failpoint("chatReply.afterEnqueue");
+    // R34-4：幂等命中（已 active）→ 直接同语义 202，不再挂 afterEnqueue
+    if (!queued.alreadyAccepted) {
+      // R33-1：测试可在入队后、202 返回前挂起（模拟 getTask/网络慢于 stop 终态）
+      await failpoint("chatReply.afterEnqueue");
+    }
     const fresh = await getTask(task.id);
     return new Response(
       JSON.stringify({
@@ -333,6 +391,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
         queuedCount: queued.queuedCount,
         // R31-1：稳定 itemId，前端 pending 对账用
         itemId: queued.itemId,
+        // R34-4：同 id 重试命中 active 时标 alreadyAccepted（与新受理区分）
+        ...(queued.alreadyAccepted ? { alreadyAccepted: true } : {}),
         task: fresh ?? task,
       }),
       { status: 202, headers: { "Content-Type": "application/json" } },
@@ -585,22 +645,43 @@ export const POST = async (req: Request, { params }: Ctx) => {
         throw new Error("队列优先启动：dequeue 得到空队首");
       }
 
-      // N3-2：head 已出队；到 runChatSession 置 agentStarted 之前任一步抛错 / lease 失效，
-      // 须塞回队首，否则已 202 的那条静默丢失、提示数量还少一条。
+      // R34-8：dequeue 后立即登记 in-flight——checkpoint/落盘/启动全程 active
+      beginChatQueueInFlight(task.id, head.itemId);
+      const genAtDequeue = getChatQueueGeneration(task.id);
+
+      // N3-2 / R34-8：head 已出队；抛错 / lease 失效须塞回，但 generation 变了
+      //（failQueuedItems 已清）不得复活。
       let replyEventPersisted = false;
-      /** S1：lease 失效时塞回队首再 409（与 catch 同口径） */
-      const abortLeaseAndRequeue = (): Response => {
+      const requeueHeadIfSameGen = (): void => {
+        if (getChatQueueGeneration(task.id) !== genAtDequeue) {
+          // 已被 stop/DELETE 等 sink 清掉——只收尾 in-flight，禁止 enqueueFront 复活
+          endChatQueueInFlight(task.id);
+          return;
+        }
+        if (listRecentSettled(task.id).some((e) => e.itemId === head.itemId)) {
+          endChatQueueInFlight(task.id);
+          return;
+        }
         if (replyEventPersisted) head.skipPersistEvent = true;
         enqueueChatMessageFront(task.id, head);
+        endChatQueueInFlight(task.id);
+      };
+      /** S1：lease 失效时塞回队首再 409（与 catch 同口径） */
+      const abortLeaseAndRequeue = (): Response => {
+        requeueHeadIfSameGen();
         return leaseAbortedResponse();
       };
       try {
         let firstMessageEventId: string | undefined;
         if (head.skipPersistEvent) {
           // 入队方已落过 user_reply：不落事件、不打 checkpoint，直接以其内容起会话
+          // R34-8：skip 路径也记 delivered（与 flush 同契约）
+          recordQueueItemSettled(task.id, head.itemId, "delivered");
         } else {
           // 队首尚未落事件 → 先快照再按队首字段写 user_reply（形状对齐 persistUserReply）
           const capture = await tryCaptureCheckpoint();
+          // R34-8：测试可在 checkpoint 后挂起——此时 queue_state 必须仍含 head id
+          await failpoint("chatReply.afterQueuePriorityCheckpoint");
           // S1：checkpoint 可能很慢——落 user_reply 之前必须复查，绝不为已删任务写气泡
           if (!isChatStartLeaseValid(task.id, startToken)) {
             return abortLeaseAndRequeue();
@@ -628,7 +709,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
               `[chat-reply] R29-4 队列补给落盘失败 task=${task.id}:`,
               persistErr,
             );
-            enqueueChatMessageFront(task.id, head);
+            requeueHeadIfSameGen();
             return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
           }
           if (!replyEvent) {
@@ -638,6 +719,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
           // user_reply 已落盘：后续若 setTaskRunStatus 等失败、塞回时须 skipPersistEvent，
           // 否则 flush 补给会再落一条重复气泡
           replyEventPersisted = true;
+          // R34-8：落盘即 delivered 终态（重连可对账；与 flush 同 API）
+          recordQueueItemSettled(task.id, head.itemId, "delivered");
           if (capture.ok) {
             await persistCheckpointForReply(task.id, replyEvent.id, capture);
           }
@@ -678,12 +761,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
         });
         // 同步 prologue 已注册 runningChats，此后队列可由 flush 消费
         agentStarted = true;
+        // R34-8：head 已出路（delivered）→ 释放 in-flight（不再占 active）
+        endChatQueueInFlight(task.id);
       } catch (innerErr) {
         // 塞回前：若本分支已成功落过 user_reply，标记 skipPersistEvent 防重复气泡
-        if (replyEventPersisted) {
-          head.skipPersistEvent = true;
-        }
-        enqueueChatMessageFront(task.id, head);
+        requeueHeadIfSameGen();
         throw innerErr;
       }
 

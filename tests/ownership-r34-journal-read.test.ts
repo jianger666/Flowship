@@ -259,30 +259,33 @@ describe("R34 DeleteJournal + read commit guard", () => {
     ).toBe(true);
   });
 
-  it("② fast journal + deleteTask 抛错 → 非 2xx、重启任务仍在", async () => {
+  it("② fast journal committed 后 deleteTask 抛错 → recoveryPending、任务不可读、boot 前滚完成", async () => {
+    // R34-1：commit 后只前滚——不再期望 4xx + 任务复活（旧语义已废）
     const id = alloc();
     await writeMeta(makeMeta(id));
     await fs.mkdir(path.join(taskDir(id), "workspace"), { recursive: true });
     writeFileSync(path.join(taskDir(id), "workspace", "keep.txt"), "y");
 
     setFailpoint("deleteTask.beforeRm", async () => {
-      throw new Error("R33-5 probe: deleteTask beforeRm");
+      throw new Error("R34-1 probe: deleteTask beforeRm after commit");
     });
 
     const res = await DELETE(new Request("http://local/api/tasks/" + id), {
       params: Promise.resolve({ id }),
     });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(await readDeletionJournal(id)).toBeNull();
-    expect(assertTaskReadable(id)).toBe(true);
+    expect([200, 202]).toContain(res.status);
+    const body = (await res.json()) as { recoveryPending?: boolean };
+    expect(body.recoveryPending).toBe(true);
+    expect(assertTaskReadable(id)).toBe(false);
+    const journal = await readDeletionJournal(id);
+    expect(journal?.phase).toBe("committed");
 
     resetBootRecovery();
     const list = await listTasks();
     skipBootRecovery();
-    expect(list.some((t) => t.id === id)).toBe(true);
-    expect(
-      await dirExists(path.join(taskDir(id), "workspace", "keep.txt")),
-    ).toBe(true);
+    expect(list.some((t) => t.id === id)).toBe(false);
+    expect(await dirExists(taskDir(id))).toBe(false);
+    expect(await readDeletionJournal(id)).toBeNull();
   });
 
   it("③ committed journal → boot 完成删除", async () => {

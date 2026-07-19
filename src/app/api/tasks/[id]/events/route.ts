@@ -9,7 +9,11 @@
  */
 
 import { NextResponse } from "next/server";
-import { getTaskEventsBefore } from "@/lib/server/task-fs";
+import {
+  commitReadableTaskResponse,
+  getTaskEventsBefore,
+} from "@/lib/server/task-fs";
+import { failpoint } from "@/lib/server/failpoints";
 import { MAX_EVENTS_PAGE } from "@/lib/server/task-fs-core";
 
 const DEFAULT_PAGE = 300;
@@ -35,8 +39,12 @@ export const GET = async (req: Request, { params }: Ctx) => {
 
     // 流式向前扫到 cursor、只留一页窗口——不整文件 parse 进内存
     const page = await getTaskEventsBefore(id, before, limit);
-    if (!page) return NextResponse.json({ error: "not_found" }, { status: 404 });
-    return NextResponse.json(page);
+    // R34-3：HTTP 提交点同步复查
+    await failpoint("httpRead.afterHelper");
+    if (!page) {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+    return commitReadableTaskResponse(id, () => page);
   } catch (err) {
     console.error("[GET /api/tasks/[id]/events] failed", err);
     return NextResponse.json({ error: "bad_request" }, { status: 400 });

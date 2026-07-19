@@ -50,6 +50,7 @@ import {
   applyQueueFailedTerminal,
   applyUserReplyTerminal,
   dropPendingByItemId,
+  markPendingUncertain,
   reconcilePendingWithQueueState,
   shouldInsertPendingAfter202,
 } from "@/lib/chat-pending-reconcile";
@@ -60,6 +61,7 @@ import {
   RUN_STATUS_VARIANT,
 } from "@/lib/task-display";
 import {
+  ApiRequestError,
   compactChatSession,
   fetchChatContext,
   rewindChatToEvent,
@@ -83,6 +85,8 @@ interface Props {
   onEventAppend: (ev: TaskEvent) => void;
   // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
   onPrependEvents?: (events: TaskEvent[]) => void;
+  /** R34-5：task_deleted / watch 404 → 清本地态后通知父级（setTask null + 侧栏失效） */
+  onTaskDeleted?: (taskId: string) => void;
 }
 
 /**
@@ -97,6 +101,8 @@ type PendingLocalReply = {
   text: string;
   /** 与服务端 user_reply 落盘文案一致（空文本附件消息用 CHAT_ATTACHMENT_ONLY_TEXT） */
   displayText: string;
+  /** R34-4：HTTP 不确定结果——占位保留，同 id 可重试 */
+  uncertain?: boolean;
   images?: ImagePayload[];
   attachments?: string[];
   skillRefs?: Array<{ name: string; absPath: string }>;
@@ -113,6 +119,7 @@ export const ChatView = ({
   onTaskUpdate,
   onEventAppend,
   onPrependEvents,
+  onTaskDeleted,
 }: Props) => {
   // 流式打字态：SDK 推 assistant chunk → 累加到这；收到正式 assistant_message → 清空
   // 切 task.id 也要清、避免上个任务的 streaming 串到新任务
@@ -168,8 +175,10 @@ export const ChatView = ({
   // 把 callback ref 化、避免 SSE effect 因为父组件 re-render 反复重连
   const onTaskUpdateRef = useRef(onTaskUpdate);
   const onEventAppendRef = useRef(onEventAppend);
+  const onTaskDeletedRef = useRef(onTaskDeleted);
   onTaskUpdateRef.current = onTaskUpdate;
   onEventAppendRef.current = onEventAppend;
+  onTaskDeletedRef.current = onTaskDeleted;
 
   // 切 task 时把 streaming / submitting / stopping / live 输出 / 排队重置
   useEffect(() => {
@@ -305,6 +314,15 @@ export const ChatView = ({
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
+    // R34-5：task_deleted / watch 404 → 清 pending/streaming，再交给父级 terminal sink
+    onTaskDeleted: (deletedId) => {
+      setStreamingText("");
+      setLiveToolOutputs({});
+      setPendingLocalReplies([]);
+      setQueuedCount(null);
+      settledItemIdsRef.current = [];
+      onTaskDeletedRef.current?.(deletedId);
+    },
   }, true);
 
   // 用户回复：允许 running 时入队（P5）；返回 false = 失败（调用方保留草稿）
@@ -319,22 +337,28 @@ export const ChatView = ({
       // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
       if (!args) return false;
 
-      // R33-1：请求前生成 itemId 并登记 pending——终态/done 先到也有 id 可记
-      const clientItemId = allocClientChatQueueItemId();
+      // R33-1 / R34-4：请求前生成 itemId 并登记 pending；uncertain 同文案重发复用 id
       const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
-      setPendingLocalReplies((prev) => [
-        ...prev,
-        {
-          id: clientItemId,
-          itemId: clientItemId,
-          text,
-          displayText,
-          images,
-          attachments,
-          skillRefs,
-        },
-      ]);
-      setQueuedCount((prev) => (prev == null ? 1 : prev + 1));
+      const reuseUncertain = pendingLocalRepliesRef.current.find(
+        (p) => p.uncertain && p.displayText === displayText,
+      );
+      const clientItemId =
+        reuseUncertain?.itemId ?? allocClientChatQueueItemId();
+      if (!reuseUncertain) {
+        setPendingLocalReplies((prev) => [
+          ...prev,
+          {
+            id: clientItemId,
+            itemId: clientItemId,
+            text,
+            displayText,
+            images,
+            attachments,
+            skillRefs,
+          },
+        ]);
+        setQueuedCount((prev) => (prev == null ? 1 : prev + 1));
+      }
 
       setIsSubmitting(true);
       try {
@@ -351,13 +375,35 @@ export const ChatView = ({
           clientItemId,
         );
         // R30-3：send 后落盘失败——不可忽略提示
-        if (result.persistWarning) {
+        if ("persistWarning" in result && result.persistWarning) {
           toast.error(
             `消息已送达但记录保存失败：${result.persistWarning}`,
           );
         }
+        // R34-4：同 id 已 settled → 清 pending + 记终态
+        if ("settled" in result && result.settled) {
+          setPendingLocalReplies((prev) => {
+            const { pending: next, settled } = dropPendingByItemId(
+              prev,
+              settledItemIdsRef.current,
+              result.itemId,
+              { rememberSettled: true },
+            );
+            settledItemIdsRef.current = settled;
+            setQueuedCount(next.length > 0 ? next.length : null);
+            return next;
+          });
+          if (result.task) onTaskUpdateRef.current(result.task);
+          return true;
+        }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
+          // R34-4：幂等 202 / 新受理 → 清 uncertain
+          setPendingLocalReplies((prev) =>
+            prev.map((p) =>
+              p.itemId === result.itemId ? { ...p, uncertain: false } : p,
+            ),
+          );
           // R33-1：已在请求前登记；终态早到则摘掉 pending（不得保留幽灵）
           if (
             !shouldInsertPendingAfter202(
@@ -390,21 +436,34 @@ export const ChatView = ({
           setQueuedCount(next.length > 0 ? next.length : null);
           return next;
         });
-        onTaskUpdateRef.current(result.task);
+        if ("task" in result && result.task) {
+          onTaskUpdateRef.current(result.task);
+        }
         return true;
       } catch (err) {
-        // 请求失败：摘掉预登记 pending（不记 settled——用户可重发同文案）
-        setPendingLocalReplies((prev) => {
-          const { pending: next, settled } = dropPendingByItemId(
-            prev,
-            settledItemIdsRef.current,
-            clientItemId,
-          );
-          settledItemIdsRef.current = settled;
-          setQueuedCount(next.length > 0 ? next.length : null);
-          return next;
-        });
-        toast.error(`回复失败：${(err as Error).message}`);
+        // R34-4：仅明确 4xx/业务拒绝才删 pending 恢复草稿；网络/5xx 标 uncertain
+        const status =
+          err instanceof ApiRequestError ? err.status : undefined;
+        const isBizReject =
+          typeof status === "number" && status >= 400 && status < 500;
+        if (isBizReject) {
+          setPendingLocalReplies((prev) => {
+            const { pending: next, settled } = dropPendingByItemId(
+              prev,
+              settledItemIdsRef.current,
+              clientItemId,
+            );
+            settledItemIdsRef.current = settled;
+            setQueuedCount(next.length > 0 ? next.length : null);
+            return next;
+          });
+          toast.error(`回复失败：${(err as Error).message}`);
+          return false;
+        }
+        setPendingLocalReplies((prev) =>
+          markPendingUncertain(prev, clientItemId),
+        );
+        toast.message("发送状态未知、正在确认…");
         return false;
       } finally {
         setIsSubmitting(false);

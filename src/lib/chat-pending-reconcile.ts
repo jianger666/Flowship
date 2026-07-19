@@ -6,6 +6,11 @@
 export type PendingLocalReplyLike = {
   itemId: string;
   displayText: string;
+  /**
+   * R34-4：HTTP 结果不确定（网络断开 / 响应丢失）——保留占位，
+   * 等 bootstrap active+recentSettled 对账或同 id 重试。
+   */
+  uncertain?: boolean;
 };
 
 /** R32-1：早到终态记账上限（FIFO 淘汰最老） */
@@ -47,13 +52,17 @@ export const isItemSettled = (
   itemId: string,
 ): boolean => settled.includes(itemId);
 
-/** 收到落盘 user_reply → 按 meta.queueItemId 清 pending；无 id 时按 displayText 兜底 */
+/**
+ * 收到落盘 user_reply → 按 meta.queueItemId 清 pending。
+ * R34-6：有 queueItemId 只走 id 对账；displayText 仅留给无 id 的旧历史事件。
+ */
 export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
   prev: T[],
   ev: { text: string; meta?: Record<string, unknown> | null },
 ): T[] => {
   const qid =
     typeof ev.meta?.queueItemId === "string" ? ev.meta.queueItemId : null;
+  // R34-6：新协议事件必带 id；无 id 才按文案兜底（旧历史），避免两 tab 同文案误清
   const idx = qid
     ? prev.findIndex((p) => p.itemId === qid)
     : prev.findIndex((p) => p.displayText === ev.text);
@@ -62,6 +71,15 @@ export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
   next.splice(idx, 1);
   return next;
 };
+
+/** R34-4：网络不确定 → 标 uncertain，不删 pending */
+export const markPendingUncertain = <T extends PendingLocalReplyLike>(
+  pending: T[],
+  itemId: string,
+): T[] =>
+  pending.map((p) =>
+    p.itemId === itemId ? { ...p, uncertain: true } : p,
+  );
 
 /**
  * R32-1：user_reply 终态对账——清 pending；无论命中与否都把 queueItemId 记入 settled。
@@ -163,17 +181,26 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   let nextSettled = rememberSettledItemIds(settled, ledgerIds);
   const settledSet = new Set(nextSettled);
   const ghostIds: string[] = [];
-  const nextPending = pending.filter((p) => {
-    // 仍在服务端存活集合 → 保留
-    if (serverSet.has(p.itemId)) return true;
+  const nextPending: T[] = [];
+  for (const p of pending) {
+    // 仍在服务端存活集合 → 保留；R34-4：曾 uncertain 则确认已受理
+    if (serverSet.has(p.itemId)) {
+      nextPending.push(p.uncertain ? { ...p, uncertain: false } : p);
+      continue;
+    }
     // R33-1：ledger / 本地已 settled → 清 pending（终态可重放）
     if (ledgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
-      return false;
+      continue;
+    }
+    // R34-4：uncertain 且服务端重启后既无 active 也无 ledger →
+    // 保留占位让用户同 id 重试（不得当幽灵清掉）
+    if (p.uncertain) {
+      nextPending.push(p);
+      continue;
     }
     // 真幽灵（断线丢终态且 ledger 也无）
     ghostIds.push(p.itemId);
-    return false;
-  });
+  }
   nextSettled = rememberSettledItemIds(nextSettled, ghostIds);
   return {
     pending: nextPending,
