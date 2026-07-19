@@ -35,7 +35,7 @@
  * - 本文件保留：boot recovery + 公开 CRUD（list / get / create / delete）+ 各类 meta patch API
  */
 
-import { existsSync, promises as fs } from "node:fs";
+import { existsSync, readFileSync, promises as fs } from "node:fs";
 import path from "node:path";
 
 import type {
@@ -163,14 +163,17 @@ const inferContextDocType = (content: string): TaskContextDocType => {
 const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
 
 /**
- * R32-6：deletion journal 目录（taskDir 外）。
+ * R32-6 / R33-5：deletion journal 目录（taskDir 外）。
  * tombstone 在 taskDir 内，rm 后会丢——refs 清单必须落盘在 dataRoot 下独立目录，
  * 崩溃任意点重启都能按 journal 完成遗留清理。
  *
- * 协议（崩溃最终一致）：
- * 1. 写 journal（含 checkpointRefs）→ 2. 写 tombstone → 3. 清 refs →
- * 4. rm taskDir → 5. 删 journal
- * boot：扫 journal 目录优先；再扫残留 tombstone（无 journal 的遗留 / 写 journal 失败）。
+ * R33-5 状态机（崩溃最终一致、每阶段可重入）：
+ * 1. 写 journal phase=prepared（含 checkpointRefs）
+ * 2. tombstone rename 成功 / 快速路径进入不可逆前 → 原子推进 phase=committed
+ * 3. 清 refs（失败项写回 refsPending，不删 journal）
+ * 4. rm taskDir（逻辑删除已 committed，目录可先删）
+ * 5. refs 全部确认成功后才删 journal
+ * boot：只执行 committed；prepared → 删 journal + warn（任务保留）。
  */
 const DELETION_JOURNAL_DIR = "deletion-journal";
 
@@ -201,8 +204,8 @@ export const readDeletionJournal = async (
 };
 
 /**
- * R32-6：原子写 deletion journal（同目录 tmp+rename）。
- * 须在写 tombstone / 清 refs / rm taskDir 之前调用。
+ * R32-6 / R33-5：原子写 deletion journal（同目录 tmp+rename）。
+ * 须在写 tombstone / 清 refs / rm taskDir 之前调用；默认 phase=prepared。
  */
 export const writeDeletionJournal = async (
   taskId: string,
@@ -218,6 +221,11 @@ export const writeDeletionJournal = async (
   const body = JSON.stringify({
     deletedAt: manifest.deletedAt,
     checkpointRefs: manifest.checkpointRefs,
+    // R33-5：缺省 prepared——未显式 commit 前 boot 不得执行删除
+    phase: manifest.phase ?? "prepared",
+    ...(manifest.refsPending && manifest.refsPending.length > 0
+      ? { refsPending: manifest.refsPending }
+      : {}),
   });
   await fs.writeFile(tmpPath, body, "utf-8");
   try {
@@ -228,34 +236,78 @@ export const writeDeletionJournal = async (
   }
 };
 
-/** R32-6：物理删完成后移除 journal（幂等） */
+/**
+ * R33-5：原子推进 journal → committed（重写文件、tmp+rename）。
+ * 快速物理删路径须在进入不可逆 refs/rm 之前调用。
+ */
+export const commitDeletionJournal = async (taskId: string): Promise<void> => {
+  const journal = await readDeletionJournal(taskId);
+  if (!journal) {
+    throw new Error(
+      `[task-fs] R33-5 commitDeletionJournal: journal 不存在 id=${taskId}`,
+    );
+  }
+  await writeDeletionJournal(taskId, { ...journal, phase: "committed" });
+};
+
+/** R32-6：物理删 + refs 全确认后移除 journal（幂等） */
 export const removeDeletionJournal = async (taskId: string): Promise<void> => {
   await fs.unlink(getDeletionJournalPath(taskId)).catch(() => {});
 };
 
 /**
- * R32-6：按 journal（优先）或 rewind_points 清 checkpoint refs，再 rm taskDir，最后删 journal。
+ * R33-5：回滚未提交 / 未向用户确认的删除意图。
+ * taskDir 仍在时才删 journal——已 rm 的 committed 留给 boot，禁止「假成功又复活」。
+ */
+export const rollbackDeletionJournalIfTaskDirRemains = async (
+  taskId: string,
+): Promise<void> => {
+  if (await exists(taskDir(taskId))) {
+    await removeDeletionJournal(taskId);
+  }
+};
+
+/**
+ * R32-6 / R33-6：按 journal（优先）或 rewind_points 清 checkpoint refs，再 rm taskDir；
+ * refs 未全成功则写回 refsPending 并保留 journal（taskDir 仍可删——逻辑删除已 committed）。
  * boot recovery / DELETE 后台共用——任意崩溃点重启后重入仍最终一致。
  */
 export const recoverDeletedTaskArtifacts = async (
   taskId: string,
 ): Promise<void> => {
   const journal = await readDeletionJournal(taskId);
+  let refsAllOk = true;
   if (journal) {
-    await cleanupCheckpointRefsFromManifest(taskId, journal).catch((err) => {
+    try {
+      const result = await cleanupCheckpointRefsFromManifest(taskId, journal);
+      refsAllOk = result.allSucceeded;
+      if (!result.allSucceeded) {
+        // R33-6：失败项写回 journal，禁止 catch 后假成功删清单
+        await writeDeletionJournal(taskId, {
+          ...journal,
+          phase: "committed",
+          refsPending: result.pending,
+        });
+      }
+    } catch (err) {
+      refsAllOk = false;
       console.warn(
-        `[task-fs] R32-6 recover: journal 清 refs 失败 id=${taskId}`,
+        `[task-fs] R33-6 recover: journal 清 refs 失败 id=${taskId}`,
         err,
       );
-    });
+    }
   } else {
     // 无 journal（旧 tombstone / journal 写失败）：趁 taskDir 还在读 rewind_points
-    await cleanupCheckpointRefsForTask(taskId).catch((err) => {
+    try {
+      const result = await cleanupCheckpointRefsForTask(taskId);
+      refsAllOk = result.allSucceeded;
+    } catch (err) {
+      refsAllOk = false;
       console.warn(
         `[task-fs] R32-6 recover: rewind_points 清 refs 失败 id=${taskId}`,
         err,
       );
-    });
+    }
   }
   const dir = taskDir(taskId);
   if (await exists(dir)) {
@@ -266,11 +318,14 @@ export const recoverDeletedTaskArtifacts = async (
       retryDelay: 100,
     });
   }
-  await removeDeletionJournal(taskId);
+  // R33-6：refs 未全确认成功 → 保留 journal 供二次 boot 重试
+  if (refsAllOk) {
+    await removeDeletionJournal(taskId);
+  }
 };
 
 /**
- * R32-6：扫 deletion-journal/——进程在 tombstone 与 rm 之间退出时的主恢复路径。
+ * R32-6 / R33-5：扫 deletion-journal/——只执行 committed；prepared 丢弃并保留任务。
  */
 const recoverDeletionJournals = async (): Promise<void> => {
   const journalDir = getDeletionJournalDir();
@@ -287,8 +342,25 @@ const recoverDeletionJournals = async (): Promise<void> => {
   }
   for (const taskId of names) {
     try {
+      const journal = await readDeletionJournal(taskId);
+      if (!journal) continue;
+      // R33-5：prepared = 删除从未提交——丢弃 journal，任务 meta/worktree 保留
+      if (journal.phase !== "committed") {
+        console.warn(
+          `[task-fs] R33-5 prepared journal 未提交、丢弃 id=${taskId}`,
+        );
+        await removeDeletionJournal(taskId);
+        continue;
+      }
       await recoverDeletedTaskArtifacts(taskId);
-      console.log(`[task-fs] R32-6 journal 清扫: 已完成 id=${taskId}`);
+      const still = await readDeletionJournal(taskId);
+      if (still) {
+        console.warn(
+          `[task-fs] R33-6 journal 清扫: refs 仍有 pending、下次再试 id=${taskId}`,
+        );
+      } else {
+        console.log(`[task-fs] R32-6 journal 清扫: 已完成 id=${taskId}`);
+      }
     } catch (err) {
       console.warn(
         `[task-fs] R32-6 journal 清扫失败（下次启动再试）id=${taskId}`,
@@ -452,6 +524,33 @@ const ensureBootRecovery = async (): Promise<void> => {
 const isTaskTombstonedSync = (id: string): boolean =>
   existsSync(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
 
+/**
+ * R33-4 / R33-5：同步查 committed journal（快速路径可不写 tombstone、仍须对读路径隐藏）。
+ * prepared journal 不算逻辑删除——任务仍可读。
+ */
+const isCommittedDeletionJournalSync = (id: string): boolean => {
+  const p = getDeletionJournalPath(id);
+  if (!existsSync(p)) return false;
+  try {
+    const parsed = JSON.parse(readFileSync(p, "utf-8")) as CheckpointRefManifest;
+    return parsed.phase === "committed";
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * R33-4：统一读提交闸（同步）——tombstone 或 committed journal → 不可读。
+ * list / get-tail / events / watch bootstrap 在最后一个 await 后、返回前调用。
+ */
+export const assertTaskReadable = (taskId: string): boolean =>
+  !isTaskTombstonedSync(taskId) && !isCommittedDeletionJournalSync(taskId);
+
+/** R33-4：list 循环结束后最终过滤（防 A push 后 await B 期间 A 被删仍回灌） */
+export const filterCommittedReads = <T extends { id: string }>(
+  items: T[],
+): T[] => items.filter((item) => assertTaskReadable(item.id));
+
 export const listTasks = async (): Promise<TaskSummary[]> => {
   await ensureBootRecovery();
   await ensureDataDir();
@@ -460,8 +559,8 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
 
   const summaries: TaskSummary[] = [];
   for (const id of ids) {
-    // 双保险：tombstone 存在一律 skip（防 deleteTask 降级时 meta unlink 失败、任务还挂在 UI）
-    if (await exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE))) continue;
+    // 双保险：tombstone / committed journal 存在一律 skip
+    if (!assertTaskReadable(id)) continue;
     let raw: unknown | null;
     try {
       raw = await readMetaRaw(id);
@@ -479,10 +578,11 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
 
     const summary = hydrateTaskSummary(raw);
     // R32-5：push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
-    if (isTaskTombstonedSync(id)) continue;
+    if (!assertTaskReadable(id)) continue;
     summaries.push(summary);
   }
-  return summaries;
+  // R33-4：循环结束后最终过滤——A 已 push 后仍可能 await B/C，期间 A 被删须剔除
+  return filterCommittedReads(summaries);
 };
 
 /** tombstone 存在 → 视为已删（与 listTasks 一致，防 meta 残留幽灵任务） */
@@ -490,9 +590,11 @@ export const isTaskTombstoned = async (id: string): Promise<boolean> =>
   exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
 
 /**
- * R31-3 / R32-6：durable logical delete——
- * 1) 先写 taskDir 外 deletion journal（checkpointRefs 清单，rm 后仍可恢复清 refs）
- * 2) 再原子写 `.deleted-tombstone`（含同份清单；list/get/boot 见标记即不暴露）
+ * R31-3 / R32-6 / R33-5：durable logical delete——
+ * 1) 先写 taskDir 外 deletion journal phase=prepared
+ * 2) 再原子写 `.deleted-tombstone`
+ * 3) tombstone rename 成功后原子推进 journal → committed
+ * tombstone 失败 → 回滚 prepared journal（任务仍可见、无删除意图残留）
  * DELETE 延迟分支须在返回 200 **之前**调用，否则 refresh / 重启会把任务「复活」。
  */
 export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
@@ -508,10 +610,11 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
     return {
       deletedAt: Date.now(),
       checkpointRefs: [],
+      phase: "prepared" as const,
     } satisfies CheckpointRefManifest;
   });
   try {
-    await writeDeletionJournal(taskId, manifest);
+    await writeDeletionJournal(taskId, { ...manifest, phase: "prepared" });
   } catch (err) {
     // journal 失败不挡 tombstone——boot 仍可趁 taskDir 在读 rewind_points
     console.warn(
@@ -535,16 +638,29 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
   });
   await fs.writeFile(tmpPath, payload, "utf-8");
   try {
+    // R33-5 测试：rename 前可注入失败，验证 prepared 回滚
+    await failpoint("deleteTombstone.beforeRename");
     await fs.rename(tmpPath, tombstonePath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
+    // R33-5：tombstone 未提交 → 回滚 prepared journal，任务保持可见
+    await removeDeletionJournal(taskId);
     throw err;
   }
+  // R33-5：tombstone 成功后原子推进 committed（无 journal 则补写）
+  const existing = await readDeletionJournal(taskId);
+  await writeDeletionJournal(taskId, {
+    ...(existing ?? { ...manifest, checkpointRefs: manifest.checkpointRefs }),
+    deletedAt: manifest.deletedAt,
+    checkpointRefs: (existing ?? manifest).checkpointRefs,
+    phase: "committed",
+  });
 };
 
 export const getTask = async (id: string): Promise<Task | null> => {
   await ensureBootRecovery();
-  if (await isTaskTombstoned(id)) return null;
+  // R33-4：统一闸——tombstone 或 committed journal
+  if (!assertTaskReadable(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
@@ -552,8 +668,8 @@ export const getTask = async (id: string): Promise<Task | null> => {
   // 验证 route 陈旧 developing 快照 + 裸写 running 窗口已被条件事务 / fresh 终态闸堵住
   await failpoint("taskread.beforeHydrate");
   const task = await hydrateTask(raw);
-  // R32-5：返回前同步复查 tombstone——防提交前入场的 get 在 DELETE 后回灌详情
-  if (isTaskTombstonedSync(id)) return null;
+  // R33-4：返回前同步复查
+  if (!assertTaskReadable(id)) return null;
   return task;
 };
 
@@ -578,11 +694,15 @@ export const getTaskWithTailEvents = async (
   tail: number,
 ): Promise<Task | null> => {
   await ensureBootRecovery();
-  if (await isTaskTombstoned(id)) return null;
+  if (!assertTaskReadable(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
-  return await hydrateTaskWithTailEvents(raw, tail);
+  const task = await hydrateTaskWithTailEvents(raw, tail);
+  // R33-4：hydrate 后可挂起——矩阵在此注入删除，验证不发 stale
+  await failpoint("getTaskWithTailEvents.afterHydrate");
+  if (!assertTaskReadable(id)) return null;
+  return task;
 };
 
 /**
@@ -594,11 +714,15 @@ export const getTaskEventsBefore = async (
   limit: number,
 ): Promise<{ events: TaskEvent[]; hasMore: boolean } | null> => {
   await ensureBootRecovery();
-  if (await isTaskTombstoned(id)) return null;
+  if (!assertTaskReadable(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
-  return await readEventsBefore(id, beforeId, limit);
+  const page = await readEventsBefore(id, beforeId, limit);
+  // R33-4：分页读完后复查
+  await failpoint("getTaskEventsBefore.afterRead");
+  if (!assertTaskReadable(id)) return null;
+  return page;
 };
 
 /**
@@ -743,6 +867,8 @@ export const deleteTask = async (id: string): Promise<boolean> => {
     } catch (err) {
       console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
     }
+    // R33-5 测试：不可逆 rm 前可注入抛错，验证 DELETE 回滚 journal
+    await failpoint("deleteTask.beforeRm");
     // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
     try {
       await fs.rm(dir, {

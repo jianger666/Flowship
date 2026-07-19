@@ -44,6 +44,7 @@ export const stringifyMeta = (v: unknown): string => {
 //   - error: 顶层错误（用于显示 toast）
 //   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
 //   - queue_failed: R31-1 队列整队失败控制帧（纯内存、不落盘）
+//   - task_deleted: R33-4 DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
 export type TaskStreamEvent =
   | { kind: "event"; event: TaskEvent }
   | { kind: "task"; task: Task }
@@ -51,7 +52,8 @@ export type TaskStreamEvent =
   | { kind: "done"; task: Task; ok: boolean }
   | { kind: "error"; message: string }
   | { kind: "assistant_delta"; text: string }
-  | { kind: "queue_failed"; itemIds: string[]; reason: string };
+  | { kind: "queue_failed"; itemIds: string[]; reason: string }
+  | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
 
@@ -308,11 +310,13 @@ export {
   markWorkspaceQuarantined,
   isWorkspaceQuarantined,
   clearWorkspaceQuarantine,
+  acquireTerminalCleanup,
   holdTerminalCleanup,
   releaseTerminalCleanup,
   hasTerminalCleanup,
   getTerminalCleanupPhase,
   isTerminalCleanupGenValid,
+  isTerminalCleanupHandleValid,
   markTerminalCleanupExecuting,
   invalidateTerminalCleanupForReopen,
   waitUntilResourceJobsCleared,
@@ -325,6 +329,8 @@ export type {
   JoinResourceJobsResult,
   InvalidateCleanupResult,
   TerminalCleanupPhase,
+  TerminalCleanupHandle,
+  AcquireTerminalCleanupResult,
 } from "./resource-jobs";
 
 /**

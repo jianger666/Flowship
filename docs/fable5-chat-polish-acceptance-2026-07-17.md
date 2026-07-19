@@ -1,5 +1,9 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 10:00：第三十四轮修复已提交、待复审——**用户拍板停止补丁循环**，本轮严格按第三十三轮四条收敛建议做集中式重构：QueueOperation（客户端预生成 itemId + recentSettled ledger + failQueuedItems 唯一 sink、含 DELETE/rewind 遗留直调清零）、TerminalCleanupCoordinator（唯一 handle + join、同步 remove 同互斥、reopen 原子占相位）、DeleteJournal 状态机（prepared→committed + refsPending 重试）、Read Commit Guard（四类读入口统一闸 + task_deleted 帧）。门禁 96 文件 / 889 项 0 skipped 多遍全绿。详见「第三十四轮修复报告」。
+>
+> 2026-07-19 09:22：第三十三轮 Codex 深度复审完成。R32-1～R32-7 的点名 happy path 均有有效增量，R32-4 的全局发号器与 R32-7 的长事件 seq 恢复本轮未发现新反例；但真实提交链仍确认 **5 个 P1 + 2 个 P2**：stop/启动补偿等清队路径仍无 itemId 终态，202 晚到可重新插入幽灵 pending；terminal cleanup reservation 可被重复 finalize 复用同一 gen、降级 executing 或被任一 holder 提前释放，且同步 remove 分支完全未持 reservation；多任务 list 与 tail/watch 读仍可在 tombstone 后回灌；未提交 tombstone 的 prepared journal 会在重启时直接删除仍可见任务。另有 refs 删除失败仍 rm taskDir 并删 journal、queue item 发号器仍是模块局部可跨 route/HMR 撞号。结论不通过。5 个临时反例探针全部实证后撤回，业务代码未改；typecheck、lint、R33 定向 31 项、真实权限全量 93 文件 / 863 项、build、diff-check 全绿。详见「第三十三轮验收」。
+>
 > 2026-07-19 09:00：第三十三轮修复已提交、待复审——R32-1～R32-7 全部处置：settledItemIds 挡终态先于 202、failQueuedItems 唯一清队入口 + bootstrap queue_state 对账、cleanup reservation 分 waiting/executing（executing 期间 reopen 409）、发号器挂 globalThis 关 ABA、tombstone 读后复查 + 前端 epoch、deletion journal 可恢复清 checkpoint refs、seq 尾窗空强制全量扫 + sidecar 只升不降。门禁 93 文件 / 863 项 0 skipped 多遍全绿。详见「第三十三轮修复报告」。
 >
 > 2026-07-19 08:45：第三十二轮 Codex 深度复审完成。R31-1～R31-5 的点名 happy path 均有有效修复，尤其 strict EIO 整队失败、quarantine cleanup reservation、DELETE 返回前 tombstone、旧日志 sidecar 迁移以及全局 RunningCheck/ClaimHandle 都已成立；但跨真实提交点继续确认 **5 个 P1 + 2 个 P2**：202 响应与 SSE 终态可反序，导致终态先到而 pending 后插入；非 EIO 清队与 queue-priority 启动仍未贯穿 itemId 终态协议；deferred remove 在最终代际检查后的第一个 await 仍可被 reopen 穿越；quarantine generation 是模块局部计数、跨 route/HMR 可 ABA 复用；tombstone 之前启动的 refresh 可在 DELETE 成功后回灌旧任务。另有重启 tombstone 清扫永久遗留 checkpoint refs，以及单条超 4MB 事件在合法落后 sidecar 下仍会 seq 重号。结论不通过。真实权限下 90 文件 / 832 项、typecheck、lint、build、diff-check 全绿；4 个临时反例探针全部实证后已撤回，业务代码未改。详见「第三十二轮验收」。
@@ -3933,3 +3937,176 @@ cache 只在一次 `scanRoot()` 完成后写入。大仓首次扫描未完成时
 3. 对 P1 #3 做双树快照；若明确延期，至少把确认文案改成真实语义。
 4. 对 P1 #5 做 Windows 大仓 P50/P95 基准，再决定 checkpoint 方案。
 5. 清理 task 删除后的 checkpoint refs，复核全量 preview-manager 门禁，并正式更新路线图 scope。
+
+---
+
+## 第三十四轮修复报告（Fable5、2026-07-19 上午、待复审）
+
+**用户已拍板停止补丁循环**——本轮严格按第三十三轮「一次性收敛建议」四条做集中式重构（非逐分支补），R33-1～R33-7 全部由协议收口覆盖：
+
+### 1. QueueOperation（R33-1 + R33-7）
+
+- **itemId 客户端 POST 前预生成 + 先登记 pending**——「202 晚到插幽灵」从根上消除（登记永远先于一切服务端事件）；服务端优先用 client id、兜底发号器挂 globalThis（R33-7 撞号关闭）。
+- **active + bounded recentSettled ledger**（上限 50）：delivered / failed 都记；watch bootstrap 的 `queue_state` 带 recentSettled——SSE 断线错过控制帧后重连可重放对账。
+- **所有清队只走 `failQueuedItems` 唯一 sink**：验收点名的 stop / cancelled / error / 启动补偿全部接入；主线复核又补齐 DELETE（reason:"deleted"）与 rewind（chat-checkpoint、reason:"rewound"）两处遗留直调——业务路径裸 `clearChatQueue` 清零。
+- 前端 `onDone` 清 pending 时把 itemId 记入 settledItemIds（pending 登记先于请求、done 到达时必有账可记）。
+
+### 2. TerminalCleanupCoordinator（R33-2 + R33-3）
+
+- per-task 唯一 cleanup handle（全局 token）+ **join 语义**：重复 finalize 只 join 现有 promise、绝不重写 phase / 复用 gen / 提前 release（R33-2 两条破坏序列关闭）。
+- **同步 remove 分支同样进 coordinator**（R33-3 主洞、Codex 探针场景）：无 ResourceJob 的快速 finalize 也 acquire + markExecuting + release、与 deferred 同一互斥。
+- reopen 原子占 `reopening` lifecycle（chat-gate 新相位）：finalizing / deleting / stopping / executing cleanup 在飞一律 409；waiting 作废让位语义保留。
+
+### 3. DeleteJournal 状态机（R33-5 + R33-6）
+
+- journal 带 `phase: prepared → committed`（tombstone rename 成功后原子推进）；DELETE 失败路径回滚 prepared journal 并返非 2xx——「未提交删除被 boot 误执行」关闭（boot 只执行 committed、prepared 丢弃保留任务）。
+- 快速物理删路径进入不可逆动作前先推进 committed。
+- **refs 删除失败保留 `refsPending` 清单**、不删 journal（taskDir 可先删——逻辑删除已 committed）；boot 重试直到全部确认成功才删 journal——恢复信息不再永久丢失（R33-6）。
+
+### 4. Read Commit Guard（R33-4）
+
+统一同步闸 `assertTaskReadable` / `filterCommittedReads`（tombstone + committed journal）：`listTasks` 循环结束后**最终过滤**（双任务探针场景关闭）、`getTaskWithTailEvents` / `getTaskEventsBefore` / watch bootstrap 读完复查；DELETE 提交后向既有 watcher publish `task_deleted` 帧 + 关流、前端收到后停止重连。
+
+### 测试
+
+新增 `tests/ownership-r34-queue-op.test.ts`（挂起 202 × stop/cancelled/error/启动补偿、断线 recentSettled 对账、两 tab 同文案、resetModules 同毫秒唯一）、`tests/ownership-r34-cleanup-coord.test.ts`（waiting/executing 双 finalize join、同步 remove × reopen 409、DELETE × reopen 409）、`tests/ownership-r34-journal-read.test.ts`（prepared 回滚 / committed 执行 / refs 逐段失败重试 / 双任务 list / tail·events·watch 挂起后删除 / task_deleted 帧、12 项）——覆盖第三十三轮最低退出矩阵四组。
+
+### 第三十四轮工程门禁（修复后）
+
+- `pnpm typecheck`：通过
+- `pnpm lint`：通过（0 error / 0 warning）
+- `pnpm test`：**96 文件 / 889 项全部通过、0 skipped**（三代理各两遍 + 主线合并后再两遍）
+- `pnpm build`：生产构建通过
+- `git diff --check`：通过
+
+### 已知边界（如实记录）
+
+- coordinator 的 acquire 时机在终态状态提交之后、remove 之前（同步路径另有 finalizing lifecycle 挡 reopen）；若复审要求「提交前」acquire 再前移一拍。
+- 同步 finalize 路径现在也会短暂 quarantine（acquire 的副作用、release 后即清）——与旧「同步从不 quarantine」有行为差异、但关闭了探针窗口。
+- 快速 DELETE 在 committed 后、rm 中途崩溃 → boot 完成删除（有意为之：逻辑删除已提交）。
+- 他 tab 的侧栏清理靠 SSE 关流 + 下次 list 过滤（未加主动推送清单）。
+
+---
+
+## 第三十三轮验收（Codex、2026-07-19、深度收敛复审、纯 bug 范围）
+
+### 结论
+
+**第三十三轮验收仍不通过。** R32-1～R32-7 不是无效修改：终态确实送达时 `settledItemIds` 能挡住晚到 202，flush 内点名的 no-session / strict EIO / task-gone 分支已统一发 `queue_failed`；deferred cleanup 的单 holder happy path、全局 resource counter、单次 list/get 读后复查、journal 成功恢复、超长单事件 seq 恢复也都成立。
+
+但这轮新增的测试仍把“终态已送达”“只有一个 cleanup holder”“journal 清理全成功”当成前提，没有覆盖清队/HTTP/SSE 三方乱序、重复 finalize、同步 remove、prepared journal 和 ref 删除失败。沿真实提交点继续验证，确认 **5 个 P1 + 2 个 P2**。本轮不评价 S8 或功能路线，不修改业务代码。
+
+第三十三轮门禁（基线 `dedf910`，`HEAD 4828eec`）：
+
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过，0 warning。
+- R33 三个新增测试文件：31/31 通过。
+- `pnpm test`：沙箱内仅 `preview-manager` 的真实杀进程用例因权限超时，切到真实系统权限复跑 **93 文件 / 863 项全部通过，0 skipped**。
+- `pnpm build`：通过。
+- `git diff --check`：通过。
+- 另写 5 个临时反例探针：queue allocator 跨模块撞号、prepared journal 重启误删、ref 清理失败仍销毁 journal、双任务 list 迟到回灌、同步 finalize/remove 被 reopen 穿越，全部稳定命中；探针已撤回，工作树恢复为仅本文档变化。
+
+### R33-1（P1）队列终态协议仍依赖“终态帧一定被当前 tab 收到”，stop/启动补偿与 202 晚到仍会制造永久 pending
+
+`enqueueOrReject` 在队列写入后还会 `await getTask`，再返回 202（`src/app/api/tasks/[id]/chat-reply/route.ts:296-323`）。这给清队留下了真实窗口。新增 `failQueuedItems` 只覆盖了部分 flush 分支；以下生产路径仍直接 `clearChatQueue`：
+
+- stop：`src/lib/server/stop-task.ts:130-146`，随后只发普通 `done`；
+- chat run cancelled/error：`src/lib/server/chat-runner.ts:1673-1725`；
+- 新会话启动失败补偿：`src/app/api/tasks/[id]/chat-reply/route.ts:756-779`，只发无 itemId 的 info；
+- rewind/DELETE 的部分路径虽然通常由其它门闩限制，但仍没有统一的“已接受 item 必有终态”静态约束。
+
+前端 `onDone` 只清当前已存在的 pending，不把 itemId 记入 `settledItemIds`（`src/components/tasks/chat-view.tsx:275-294`）。可达时序：A 已入队 → A 的 HTTP 202 响应卡在 `getTask`/网络 → 另一 tab stop → 服务端 clear + done → 本 tab 此时尚无 pending，done 无 id 可记 → 202 晚到，`shouldInsertPendingAfter202` 返回 true → A 作为幽灵占位永久插入。启动失败补偿同理，而且连 done 都没有。
+
+`queue_state` 也不能封住断线窗口：queue_failed 在 SSE 断线期间丢失 → 重连先收到空 queue_state，但 202 尚未返回、当前没有 pending 可被记 settled → 随后 202 返回仍会插入幽灵。现有测试把 reducer 与 server 事件拆开，未覆盖这个真实 HTTP/SSE 交叉，修复报告也已如实承认。
+
+修复要求：任何已返回/将返回 202 的 item 都必须有可重放终态，禁止直接 clear。推荐由客户端在 POST 前生成稳定 `itemId` 并立即登记 outstanding，服务端原样使用；所有 stop/error/startup-compensation/DELETE 清队都经唯一 terminal sink。若终态仍是内存 SSE，则 bootstrap 还必须带有界 recent-settled ledger，而不只是 active queue_state；或者 202 返回前原子复查 item 仍 active 并返回最终结果。仅在 `onDone` 多 clear 一次不能覆盖“未知 itemId + 断线 + 晚到 202”。
+
+最低退出测试：真实挂起 chat-reply Response，分别注入 stop、cancelled、error、startup compensation 和 SSE 断线重连；让 terminal/queue_state 先到、202 最后到，断言 pending=0、每个已接受 item 恰有一个可重放终态，两 tab 同文案互不误清。
+
+### R33-2（P1）terminal cleanup reservation 不是独占句柄；重复 finalize 会复用同一 gen、降级 executing 或被另一 holder 提前 release
+
+`holdTerminalCleanup` 发现已有条目时仍复用 `cur.generation`，并无条件把 phase 重写为 `waiting`（`src/lib/server/resource-jobs.ts:242-255`）；`markTerminalCleanupExecuting` 对已经 executing 的同 gen 返回 true（`:271-285`）；`releaseTerminalCleanup` 也只按这个共享 gen 清 reservation（`:293-303`）。finalize route 没有拒绝已终态 task，deferred 分支每次都会新起一个后台 cleanup（`src/lib/server/task-runner.ts:1661-1707`）。
+
+因此有两条可达破坏序列：
+
+1. A cleanup 已 executing；重复 finalize B 调 hold，把同一条 reservation 从 executing 改回 waiting；此时 reopen 可 invalidate，A 已进入的 remove 不再复查，继续删除恢复后的工作区。
+2. A/B 在 waiting 期拿到同一个 gen，各自启动 remove；任一 holder 先完成并 release，就会清掉共享 reservation/quarantine，另一个 remove 仍在运行，reopen/prewarm 随即穿入。
+
+这不是 generation ABA，而是同一 generation 被多个 owner 同时持有。R33 的 ABA 测试只验证 resetModules 后号码不同，没有验证 reservation 的唯一所有权。
+
+修复要求：`holdTerminalCleanup` 必须是 try-acquire，已有 waiting/executing 时返回 busy/现有 promise，绝不能重写 phase；每次真正 cleanup 使用唯一 handle/token，mark/release 都精确匹配该 handle。更简单的是 per-task 单一 cleanup coordinator/promise，重复 finalize 只 join，不再创建第二个后台 remove。
+
+最低退出测试：在 waiting 和 executing 两个点分别并发第二次 finalize，断言 remove 只调用一次、phase 不倒退、第二个调用不能提前 release；第一 holder 未完成前 reopen/prewarm 始终 409。
+
+### R33-3（P1）waiting/executing 只包住 deferred 分支；无 ResourceJob 的同步 remove 完全裸奔，reopen/DELETE 生命周期也未原子互斥
+
+正常无 resource job 时，finalize 走 `src/lib/server/task-runner.ts:1708-1745` 的同步 `removeTaskWorktrees`，没有 hold、没有 waiting→executing，也没有 quarantine。`reopenTask` 只查 `hasTerminalCleanup`，不参与 chat lifecycle/互斥（`:1786-1815`）。
+
+临时真实 worktree 探针已实证：在 `removeTaskWorktrees.afterPathExists` 挂住同步 finalize → `hasTerminalCleanup=false` → `reopenTask` 成功把 repoStatus 写回 developing → 放行旧 finalize → 旧 remove 删除了刚恢复任务的 worktree；探针 1/1 通过后已撤回。相同缺口也允许 DELETE 已占 `deleting` lifecycle 时另一请求执行 reopen，后者可能先回 200/写 developing，随后目录仍被 DELETE 删除。
+
+修复要求：同步和 deferred remove 必须进入同一个独占 cleanup coordinator；reservation 应在终态状态提交前/同时建立，而不是只在判断 defer 后才建立。reopen 自身也必须原子占 `reopening`（或同一 per-task coordinator），与 finalizing/deleting 互斥，不能靠一次只读 lifecycle 检查。
+
+最低退出测试：无 ResourceJob 的 finalize 在 remove 内挂起时 reopen 必须 409；remove 完成并释放后再 reopen 才成功。另加 DELETE 已占 deleting 后并发 reopen，断言不写 developing、不 prewarm、不返回旧 task 200。
+
+### R33-4（P1）tombstone 读后复查只修了单条 happy path；多任务 list、tail GET、watch bootstrap 与事件分页仍能在 DELETE 成功后提交旧数据
+
+`getTask` 的最终同步 tombstone 复查有效；但其它生产读入口不完整：
+
+- `listTasks` 对 A 检查后立即 push，随后还会 await B/C；函数返回前没有对已 push summaries 做最终复查（`src/lib/server/task-fs.ts:455-485`）。
+- `getTaskWithTailEvents` hydrate 后直接返回（`:576-585`），它正被详情 `GET ?tail` 和 watch bootstrap 使用。
+- `getTaskEventsBefore` 读完分页也无最终复查（`:591-602`）。
+- watch route 先 subscribe，再 await 上述 tail read；因此 tombstone 前入场的 watch 可在 DELETE 后仍返回 200、发 stale task/events 并保持流存活（`src/app/api/tasks/[id]/watch-task/route.ts:74-109`）。
+
+临时双任务探针已实证：list 先 push A → 在读取 B 时挂起 → tombstone A → 放行 → 返回结果仍包含 A。R33 正式测试只有一个 task，A push 后没有后续 await，所以没有覆盖。前端 refresh epoch/successfulDeletedIds 仅保护发起删除的当前 tab，无法保护另一个 tab 或直接 API 消费者。
+
+修复要求：抽一个统一“读结果提交闸”，所有 list/detail-tail/events/watch bootstrap 在最后一个 await 后、Response/stream 首帧前同步复查 tombstone。list 要在整个循环结束后最终过滤，而非只在每项 push 前检查；DELETE 最好再向既有 watcher 发布明确 task_deleted/关闭流。
+
+最低退出测试：A 已 push 后挂 B、删除 A，list 不含 A；tail hydrate、events page 和 watch bootstrap 分别挂起后删除，必须 404/不发 stale task；在非删除发起 tab 验证不会回灌侧栏/详情。
+
+### R33-5（P1）deletion journal 没有 prepared/committed 状态；tombstone 未提交或 DELETE 已报错，重启仍会删除尚可见任务
+
+`writeDeleteTombstone` 先写外部 journal，再写/rename tombstone（`src/lib/server/task-fs.ts:498-542`）。若 tombstone 写入/rename 失败，DELETE 外层返回错误并释放 deleting，但 prepared journal 没有回滚。快速路径同样先写 journal，后续 cleanup/deleteTask 任一步异常都会留下 journal（`src/app/api/tasks/[id]/route.ts:399-434`）。
+
+boot 却无条件把 journal 当成已提交删除：`recoverDeletionJournals` 不检查 tombstone/commit phase，直接调用 `recoverDeletedTaskArtifacts`，后者 rm taskDir（`src/lib/server/task-fs.ts:236-299`）。临时探针写入 journal 但不写 tombstone：当前进程 `getTask` 仍能读到任务；模拟重启后第一次 list 直接删掉目录，探针稳定命中。
+
+这意味着用户看到 DELETE 4xx/失败、任务仍可见，却可能在下一次启动时被后台永久删除。
+
+修复要求：明确唯一 durable commit point。建议 journal 带 `phase: prepared|committed`：manifest 落 prepared，tombstone 成功后原子推进 committed；boot 只执行 committed，prepared 要么回滚/保留任务并报警。快速物理删除若不写 tombstone，也必须在进入不可逆 refs/rm 前原子 commit journal，并让 list/get 同样把 committed journal 视为逻辑删除；commit 之后就不能再向用户伪装为可回滚失败。
+
+最低退出测试：prepared journal 后 tombstone rename 失败、以及 fast journal 后 deleteTask 抛错，DELETE 返回非 2xx；模拟重启后 task/meta/worktree 均仍存在。committed journal 的对应用例才允许 boot 完成删除。
+
+### R33-6（P2）checkpoint ref 删除失败仍继续 rm taskDir 并删除 journal，恢复信息永久丢失
+
+`cleanupCheckpointRefsFromManifest` 对 `for-each-ref` / `update-ref -d` 失败只 warn/continue；`recoverDeletedTaskArtifacts` 又 catch 清理错误后无条件 rm taskDir、remove journal（`src/lib/server/task-fs.ts:240-270`）。DELETE 的 fast/deferred 路由也 catch cleanup 后继续 `deleteTask`（`src/app/api/tasks/[id]/route.ts:366-384, 412-424`）。
+
+临时探针用不可访问 repo 注入真实 git 清理失败，日志明确出现 for-each-ref/update-ref 失败，但函数仍删除 taskDir 和 journal；后续 repo 恢复可用时已无 ref 清单可重试。R33 的崩溃测试只覆盖“每次 update-ref 都成功”的中途挂起，不覆盖失败结果。
+
+修复要求：清 ref API 返回逐仓/逐 ref 结果；未确认成功的条目保留在 journal，不能删 journal。逻辑任务目录是否先 rm 可另行决定，但恢复清单必须独立保留并在 boot 重试；不要把真实失败吞成事务成功。
+
+最低退出测试：首个/中间/全部 update-ref 失败时 journal 保留失败项；第二次恢复成功后才删 journal，并验证其它 task 的共享 treeOid ref 不受影响。
+
+### R33-7（P2）resource generation 已全局化，但 chat queue item 发号器仍是模块局部，跨 route chunk/HMR 可撞号
+
+队列/代际/in-flight 状态挂在 globalThis，item 发号器却仍是模块局部 `let nextChatQueueItemSeq = 1`，id 是 `Date.now()+seq`（`src/lib/server/chat-queue.ts:35-43`）。chat-reply route 与 chat-runner 都可 enqueue；模块重载/route chunk 各自从 1 开始时，同毫秒生成即可碰撞。
+
+临时探针固定 Date：模块 A 入队得到 id X → `vi.resetModules()` → 模块 B 在仍存活的 global queue 入队 → 再得到同一个 X，`listChatQueueItemIds` 返回 `[X, X]`。之后任一 user_reply/queue_failed 都会误清两个 tab 的占位，settled ledger 也无法区分。
+
+修复要求：发号器与 queue state 同挂 globalThis，或直接使用客户端生成的 UUID/itemId（也可顺带关闭 R33-1 的未知 id 窗口）。
+
+最低退出测试：global queue 保留期间 resetModules/两个独立 import 实例同毫秒并发 enqueue，所有 itemId 仍唯一；同文案终态只影响目标 item。
+
+### 本轮确认通过的部分
+
+- R32-4 的 resource job/quarantine counter 已与 Map 同寿命；单 holder 的 resetModules ABA 用例成立。
+- R32-7 对 4MB−1、4MB+1、8MB 单事件和 sidecar 反序写的恢复成立，本轮未构造出新的可达 seq 重号窗口。
+- strict EIO、no-session、task-gone 等 R33 点名 flush 分支已能发 id 化终态；问题是协议尚未覆盖所有 clear 与断线重放，不是这些分支本身回归。
+- `getTask` 单条全量读取的最终 tombstone 复查成立；问题集中在 list 的后续 await 和其它读入口。
+
+### 一次性收敛建议（只针对上述 bug，不扩功能）
+
+1. **QueueOperation**：itemId 在请求前生成；server 维护 active + bounded terminal ledger；所有 clear 只能走一个 finalizeItems sink。这样 HTTP、SSE、重连和两 tab 只认同一个 id/终态。
+2. **TerminalCleanupCoordinator**：per-task 只允许一个 cleanup handle/promise，覆盖同步与 deferred remove；重复 finalize join，reopen/delete 原子 claim 同一 coordinator。不要让多个闭包共享一个 gen。
+3. **DeleteJournal 状态机**：prepared manifest → durable committed logical delete → refs confirmed → taskDir removed → journal removed。每一阶段可重入，失败只能停在当前阶段，不能 catch 后假成功推进。
+4. **统一 read commit guard**：list/get-tail/events/watch 在最后一个 await 后用同一同步 tombstone/journal guard；禁止每个入口各补一半。
+
+以上四个入口收口后，再跑矩阵而不是继续逐分支打补丁：`{HTTP before/after terminal, SSE connected/disconnected} × {stop/error/start failure}`、`{sync/deferred/duplicate finalize} × {reopen/delete}`、`{prepared/committed/refs partial failure} × {restart}`、`{list/tail/events/watch} × {tombstone before/after final await}`。

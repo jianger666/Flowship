@@ -69,12 +69,13 @@ import {
   type CaptureCheckpointResult,
 } from "@/lib/server/chat-checkpoint";
 import {
-  clearChatQueue,
   dequeueChatMessage,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  failQueuedItems,
   getChatQueueCount,
 } from "@/lib/server/chat-queue";
+import { failpoint } from "@/lib/server/failpoints";
 import {
   getChatLifecycle,
   isChatRewindInProgress,
@@ -118,6 +119,11 @@ interface PostBody {
     apiKey?: string;
     model?: ModelSelection;
   };
+  /**
+   * R33-1：客户端预生成的 queue itemId；服务端优先采用（无则退回发号）。
+   * 消除「202 晚到、终态已到」时前端尚无 id 可记的窗口。
+   */
+  clientItemId?: string;
 }
 
 const MAX_IMAGES_PER_REPLY = 6;
@@ -160,6 +166,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const skillsResult = parseAndValidateSkills(body.skills, MAX_SKILLS_PER_REPLY);
   if (!skillsResult.ok) return skillsResult.errorResponse;
   const skills = skillsResult.skills;
+
+  // R33-1：客户端预生成 itemId（可选；无则服务端兜底发号）
+  const clientItemId =
+    typeof body.clientItemId === "string" && body.clientItemId.trim()
+      ? body.clientItemId.trim()
+      : undefined;
 
   // 必须 text / images / attachments 至少一项
   if (
@@ -294,6 +306,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       return errorResponse("任务正在删除", 409);
     }
     const queued = enqueueChatMessage(task.id, {
+      // R33-1：优先用客户端预生成 id（兼容无 clientItemId 的旧入口 / task 侧）
+      itemId: clientItemId,
       agentText: agentText || fallbackText,
       displayText: text || fallbackText,
       imageAbsPaths,
@@ -309,6 +323,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
     // R31-1：记下当前条 itemId（队列优先启动路径稍后原样回给客户端）
     lastEnqueuedItemId = queued.itemId;
+    // R33-1：测试可在入队后、202 返回前挂起（模拟 getTask/网络慢于 stop 终态）
+    await failpoint("chatReply.afterEnqueue");
     const fresh = await getTask(task.id);
     return new Response(
       JSON.stringify({
@@ -755,7 +771,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
     // N3：补偿统一放 finally（覆盖 throw 与所有 early return，含 409 pendingRestart）。
     // 条件：会话没真正起来、队列非空、且尚无存活会话 → 否则滞留队列无人消费。
-    // 顺序：先同步 clearChatQueue（不可被阻断），再 best-effort 落 info——
+    // R33-1：先同步 failQueuedItems（唯一 sink、不可被阻断），再 best-effort 落 info——
     // 复审 N3-3：补偿不能排在可失败的日志后面。
     if (
       !skipQueueCompensation &&
@@ -763,19 +779,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
       getChatQueueCount(task.id) > 0 &&
       !hasChatSession(task.id)
     ) {
-      const n = getChatQueueCount(task.id);
-      clearChatQueue(task.id);
-      try {
-        // R29-1：清队系统通知写+publish 同链
-        await writeEventAndPublish(task.id, {
-          kind: "info",
-          text: `会话未能启动，${n} 条排队消息未送达、请重新发送`,
-        });
-      } catch (logErr) {
-        console.warn(
-          `[chat-reply] 清队后写 info 失败 task=${task.id}:`,
-          logErr,
-        );
+      const failedIds = failQueuedItems(task.id, {
+        reason: "startup_failed",
+      });
+      const n = failedIds.length;
+      if (n > 0) {
+        try {
+          // R29-1：清队系统通知写+publish 同链
+          await writeEventAndPublish(task.id, {
+            kind: "info",
+            text: `会话未能启动，${n} 条排队消息未送达、请重新发送`,
+          });
+        } catch (logErr) {
+          console.warn(
+            `[chat-reply] 清队后写 info 失败 task=${task.id}:`,
+            logErr,
+          );
+        }
       }
     }
   }

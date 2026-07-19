@@ -859,12 +859,15 @@ export type QueueFailedSseEnvelope = {
 };
 
 /**
- * R32-2：watch bootstrap 轻量信封——当前服务端 queue 存活 itemIds（队内 + in-flight）。
- * 纯内存快照、不落盘；前端用来清断连期间漏掉的终态留下的幽灵 pending。
+ * R32-2 / R33-1：watch bootstrap 轻量信封——当前服务端 queue 存活 itemIds（队内 + in-flight）
+ * + 有界 recentSettled ledger（断线错过 queue_failed 时可重放对账）。
+ * 纯内存快照、不落盘。
  */
 export type QueueStateSseEnvelope = {
   type: "queue_state";
   itemIds: string[];
+  /** R33-1：有界终态 ledger，重连 bootstrap 重放 */
+  recentSettled?: Array<{ itemId: string; outcome: string }>;
 };
 
 /**

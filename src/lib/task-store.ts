@@ -385,7 +385,9 @@ interface SSEEnvelope {
     /** R31-1：队列整队失败控制帧 */
     | "queue_failed"
     /** R32-2：bootstrap 队列存活快照 */
-    | "queue_state";
+    | "queue_state"
+    /** R33-4：任务已逻辑删除，客户端应停订阅、勿重连 */
+    | "task_deleted";
   event?: TaskEvent;
   content?: string;
   task?: Task;
@@ -395,6 +397,9 @@ interface SSEEnvelope {
   text?: string;
   itemIds?: string[];
   reason?: string;
+  /** R33-1：bootstrap queue_state 有界终态 ledger */
+  recentSettled?: Array<{ itemId: string; outcome: string }>;
+  taskId?: string;
 }
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
@@ -439,9 +444,16 @@ export interface TaskStreamCallbacks {
    */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
   /**
-   * R32-2：watch bootstrap 的 queue_state——按服务端存活 itemIds 对账幽灵 pending
+   * R32-2 / R33-1：watch bootstrap 的 queue_state——按存活 itemIds + recentSettled 对账
    */
-  onQueueState?: (itemIds: string[]) => void;
+  onQueueState?: (
+    itemIds: string[],
+    recentSettled?: Array<{ itemId: string; outcome: string }>,
+  ) => void;
+  /**
+   * R33-4：task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
+   */
+  onTaskDeleted?: (taskId: string) => void;
 }
 
 /**
@@ -521,11 +533,25 @@ export const watchTaskStream = async (
             env.type === "queue_state" &&
             Array.isArray(env.itemIds)
           ) {
-            // R32-2：bootstrap 队列快照
+            // R32-2 / R33-1：bootstrap 队列快照 + recentSettled ledger
             const ids = env.itemIds.filter(
               (id): id is string => typeof id === "string",
             );
-            callbacks.onQueueState?.(ids);
+            const recentSettled = Array.isArray(env.recentSettled)
+              ? env.recentSettled.filter(
+                  (e): e is { itemId: string; outcome: string } =>
+                    !!e &&
+                    typeof e.itemId === "string" &&
+                    typeof e.outcome === "string",
+                )
+              : undefined;
+            callbacks.onQueueState?.(ids, recentSettled);
+          } else if (
+            env.type === "task_deleted" &&
+            typeof env.taskId === "string"
+          ) {
+            // R33-4：逻辑删除已提交——转发后流会由服务端关闭
+            callbacks.onTaskDeleted?.(env.taskId);
           }
         }
         sepIdx = buffer.indexOf("\n\n");
@@ -582,6 +608,11 @@ export const sendChatReply = async (
   bootArgs?: TaskBootArgs,
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
+  /**
+   * R33-1：客户端预生成的 queue itemId（POST 前登记 pending 用）。
+   * 服务端原样采用；缺省时服务端兜底发号。
+   */
+  clientItemId?: string,
 ): Promise<
   | {
       task: Task;
@@ -611,6 +642,8 @@ export const sendChatReply = async (
           attachments && attachments.length > 0 ? attachments : undefined,
         bootArgs,
         skills: skills && skills.length > 0 ? skills : undefined,
+        // R33-1：客户端预生成 id，服务端优先采用
+        clientItemId: clientItemId || undefined,
       }),
     },
   );

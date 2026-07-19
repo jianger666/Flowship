@@ -99,7 +99,6 @@ import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { Task } from "@/lib/types";
 import {
   beginChatQueueInFlight,
-  clearChatQueue,
   dequeueChatMessage,
   endChatQueueInFlight,
   enqueueChatMessage,
@@ -107,6 +106,7 @@ import {
   failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
+  recordQueueItemSettled,
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
@@ -390,7 +390,8 @@ export const forceClearChatRun = (taskId: string): void => {
  * 同时清排队（P5.1：rewind 后积压消息不应再发）。
  */
 export const closeChatSessionUnconditional = (taskId: string): void => {
-  clearChatQueue(taskId);
+  // R33-1：rewind 关会话清队走唯一 sink（有门闩路径也统一）
+  failQueuedItems(taskId, { reason: "rewound" });
   closeChatSession(taskId);
 };
 
@@ -1678,7 +1679,8 @@ const finalizeChatRunIfCurrent = async (
       isCurrent,
     );
     if (!isCurrent()) return false;
-    clearChatQueue(taskId);
+    // R33-1：cancelled 清队走唯一 sink（queue_failed + recentSettled）
+    failQueuedItems(taskId, { reason: "cancelled" });
     const closed = closeChatSession(taskId, instanceId);
     if (!closed) return false;
     if (cancelledTask) publish(taskId, { kind: "task", task: cancelledTask });
@@ -1712,7 +1714,8 @@ const finalizeChatRunIfCurrent = async (
     isCurrent,
   );
   if (!isCurrent()) return false;
-  clearChatQueue(taskId);
+  // R33-1：error 清队走唯一 sink（queue_failed + recentSettled）
+  failQueuedItems(taskId, { reason: "error" });
   const closed = closeChatSession(taskId, instanceId);
   if (!closed) return false;
   // 关会话后不再 await getTask——避免空窗里 B 已启动却仍 publish done 清其 streaming
@@ -2364,9 +2367,14 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
             return;
           }
           replyPersisted = true;
+          // R33-1：user_reply 落盘 = delivered 终态，记入 recentSettled（重连可对账）
+          recordQueueItemSettled(taskId, msg.itemId, "delivered");
           if (capture.ok) {
             await persistCheckpointForReply(taskId, replyEvent.id, capture);
           }
+        } else if (msg.itemId) {
+          // skipPersistEvent：入队方已落盘 → 同样记 delivered
+          recordQueueItemSettled(taskId, msg.itemId, "delivered");
         }
 
         const sent = await sendChatMessage(

@@ -65,8 +65,13 @@ export interface UseTaskWatchCallbacks {
   onWatchException?: (err: Error) => void;
   /** R31-1：queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
-  /** R32-2：bootstrap queue_state → 对账清幽灵 pending */
-  onQueueState?: (itemIds: string[]) => void;
+  /** R32-2 / R33-1：bootstrap queue_state → 对账清幽灵 pending（含 recentSettled） */
+  onQueueState?: (
+    itemIds: string[],
+    recentSettled?: Array<{ itemId: string; outcome: string }>,
+  ) => void;
+  /** R33-4：task_deleted → 停重连（他 tab DELETE 后本 tab 勿刷 stale） */
+  onTaskDeleted?: (taskId: string) => void;
 }
 
 export const useTaskWatch = (
@@ -114,6 +119,8 @@ export const useTaskWatch = (
         // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
         // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
         let gotTerminalDone = false;
+        // R33-4：收到 task_deleted 后不再重连（任务已逻辑删除）
+        let gotTaskDeleted = false;
         const sseCallbacks: TaskStreamCallbacks = {
           onEvent: (ev) => {
             if (cancelled) return;
@@ -146,9 +153,14 @@ export const useTaskWatch = (
             if (cancelled) return;
             callbacksRef.current.onQueueFailed?.(itemIds, reason);
           },
-          onQueueState: (itemIds) => {
+          onQueueState: (itemIds, recentSettled) => {
             if (cancelled) return;
-            callbacksRef.current.onQueueState?.(itemIds);
+            callbacksRef.current.onQueueState?.(itemIds, recentSettled);
+          },
+          onTaskDeleted: (deletedId) => {
+            if (cancelled) return;
+            gotTaskDeleted = true;
+            callbacksRef.current.onTaskDeleted?.(deletedId);
           },
         };
 
@@ -170,9 +182,8 @@ export const useTaskWatch = (
           // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
         }
 
-        // 终态 done（merged/abandoned、服务端已关流）→ 停止订阅（reopen 走 reconnectKey）；
-        // 卸载 / 切 task 也停
-        if (cancelled || gotTerminalDone) return;
+        // 终态 done / task_deleted（服务端已关流）→ 停止订阅；卸载 / 切 task 也停
+        if (cancelled || gotTerminalDone || gotTaskDeleted) return;
 
         // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连
         // 重连时服务端 bootstrap 会重发当前 task 快照、把断连期间漏掉的更新对齐回来

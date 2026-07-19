@@ -1,5 +1,5 @@
 /**
- * R31-1 / R32-1：前端 pending 对账纯函数（按 queue itemId，displayText 仅兜底旧事件）。
+ * R31-1 / R32-1 / R33-1：前端 pending 对账纯函数（按 queue itemId，displayText 仅兜底旧事件）。
  * 抽出来便于单测，避免拉 chat-view 客户端组件进 node 环境。
  */
 
@@ -10,6 +10,15 @@ export type PendingLocalReplyLike = {
 
 /** R32-1：早到终态记账上限（FIFO 淘汰最老） */
 export const SETTLED_ITEM_IDS_MAX = 200;
+
+/**
+ * R33-1：客户端预生成短 itemId（crypto.randomUUID 去横线后取前 12）。
+ * 在 POST 前登记 pending，消除「202 晚到插入幽灵」。
+ */
+export const allocClientChatQueueItemId = (): string => {
+  const raw = crypto.randomUUID().replace(/-/g, "");
+  return `cq_${raw.slice(0, 12)}`;
+};
 
 /**
  * R32-1：把 itemIds 记入 settled（已有则跳过）；超 max 时 FIFO 丢最老。
@@ -96,6 +105,7 @@ export const applyQueueFailedTerminal = <T extends PendingLocalReplyLike>(
 
 /**
  * R32-1：202 返回后是否允许插入 pending——已 settled 则禁止（终态已早到）。
+ * R33-1：请求前已登记时，202 只做「是否保留」判定（不应再插第二条）。
  */
 export const shouldInsertPendingAfter202 = (
   settled: readonly string[],
@@ -103,25 +113,71 @@ export const shouldInsertPendingAfter202 = (
 ): boolean => !isItemSettled(settled, itemId);
 
 /**
- * R32-2：SSE 重连 bootstrap 的 queue_state 对账。
- * 本地 pending 不在 server 存活集合、且无终态 → 幽灵，清除并记入 settled（防迟到 202 再插）。
+ * R33-1：onDone(idle/error) 清 pending 时把清掉的 itemId 记入 settled，
+ * 堵住「done 无 id 可记 → 晚到 202 插幽灵」（现 pending 登记先于请求，done 必有 id）。
+ */
+export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
+  pending: T[],
+  settled: readonly string[],
+): { pending: T[]; settled: string[]; clearedIds: string[] } => {
+  const clearedIds = pending.map((p) => p.itemId).filter(Boolean);
+  return {
+    pending: [],
+    settled: rememberSettledItemIds(settled, clearedIds),
+    clearedIds,
+  };
+};
+
+/**
+ * R33-1：HTTP 失败 / 非排队 200 时摘掉请求前登记的 pending（可记 settled 防迟到对账）。
+ */
+export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
+  pending: T[],
+  settled: readonly string[],
+  itemId: string,
+  options?: { rememberSettled?: boolean },
+): { pending: T[]; settled: string[] } => {
+  const nextPending = pending.filter((p) => p.itemId !== itemId);
+  const nextSettled = options?.rememberSettled
+    ? rememberSettledItemIds(settled, [itemId])
+    : [...settled];
+  return { pending: nextPending, settled: nextSettled };
+};
+
+/**
+ * R32-2 / R33-1：SSE 重连 bootstrap 的 queue_state 对账。
+ *
+ * - serverItemIds：仍存活（队内 + in-flight）→ 保留 pending
+ * - recentSettled：可重放终态 → 清 pending + 记 settled（关闭「重连空 state、202 未返」窗口）
+ * - 既不在 server 也不在终态 → 幽灵，清除并记 settled（防迟到 202 再插）
  */
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
   settled: readonly string[],
   serverItemIds: readonly string[],
+  recentSettled: readonly { itemId: string; outcome?: string }[] = [],
 ): { pending: T[]; settled: string[]; ghostIds: string[] } => {
   const serverSet = new Set(serverItemIds);
-  const settledSet = new Set(settled);
+  const ledgerIds = recentSettled.map((e) => e.itemId).filter(Boolean);
+  const ledgerSet = new Set(ledgerIds);
+  let nextSettled = rememberSettledItemIds(settled, ledgerIds);
+  const settledSet = new Set(nextSettled);
   const ghostIds: string[] = [];
   const nextPending = pending.filter((p) => {
-    if (serverSet.has(p.itemId) || settledSet.has(p.itemId)) return true;
+    // 仍在服务端存活集合 → 保留
+    if (serverSet.has(p.itemId)) return true;
+    // R33-1：ledger / 本地已 settled → 清 pending（终态可重放）
+    if (ledgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
+      return false;
+    }
+    // 真幽灵（断线丢终态且 ledger 也无）
     ghostIds.push(p.itemId);
     return false;
   });
+  nextSettled = rememberSettledItemIds(nextSettled, ghostIds);
   return {
     pending: nextPending,
-    settled: rememberSettledItemIds(settled, ghostIds),
+    settled: nextSettled,
     ghostIds,
   };
 };

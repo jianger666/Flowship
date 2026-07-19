@@ -120,13 +120,14 @@ import {
   forkPendingTasks,
   getTaskOpGeneration,
   getResourceJoinTimeoutMs,
+  acquireTerminalCleanup,
+  getTerminalCleanupPhase,
   hasResourceJobs,
   hasTerminalCleanup,
-  holdTerminalCleanup,
   invalidateTerminalCleanupForReopen,
   isTaskOpCurrent,
   isTaskStarting,
-  isTerminalCleanupGenValid,
+  isTerminalCleanupHandleValid,
   isWorkspaceQuarantined,
   markTerminalCleanupExecuting,
   markWorkspaceQuarantined,
@@ -1655,31 +1656,40 @@ export const finalizeTask = async (
     // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
     // best-effort：失败只 log、boot 孤儿扫描兜底。
     // R30-2 / R31-2：quarantine / 仍有 resourceJobs → 不得同步删；
-    // 挂后台等 jobs 归零后再 remove——持有独立 terminal cleanup reservation（代际），
+    // 挂后台等 jobs 归零后再 remove——持有独立 terminal cleanup reservation，
     // quarantine 在 cleanup 完成（或 reopen 作废）前不解除；endResourceJob 只通知 waiter。
+    // R33-2 / R33-3：同步与 deferred 都走 TerminalCleanupCoordinator——
+    // 重复 finalize 只 join、绝不重写 phase / 再起第二个 remove；reservation 在终态提交后、
+    // remove 前立刻建立（含无 ResourceJob 的同步快速路径）。
     if (isWorktreeTask(task)) {
       const deferWorktreeCleanup =
         isWorkspaceQuarantined(taskId) || hasResourceJobs(taskId);
-      if (deferWorktreeCleanup) {
+      // R33-2：try-acquire——已有在飞则 join，不拿 handle、不能提前 release
+      const acq = acquireTerminalCleanup(taskId);
+      if (acq.busy) {
+        console.log(
+          `[task-runner] finalizeTask: R33-2 已有 terminal cleanup 在飞、join 不重入 remove task=${taskId}`,
+        );
+        await acq.promise;
+      } else if (deferWorktreeCleanup) {
         const taskSnap = task;
-        // R31-2：deferred 分支入口立刻 hold——与 jobs 归零解耦
-        const cleanupGen = holdTerminalCleanup(taskId);
+        const handle = acq.handle;
         void (async () => {
           try {
             await waitUntilResourceJobsCleared(taskId);
-            // R31-2：提交删除前验证 cleanup gen——reopen 作废 waiting 后让位
-            if (!isTerminalCleanupGenValid(taskId, cleanupGen)) {
+            // R31-2 / R33-2：提交删除前验证 handle——reopen 作废 waiting 后让位
+            if (!isTerminalCleanupHandleValid(handle)) {
               console.log(
-                `[task-runner] finalizeTask: R31-2 旧 cleanup 代际已失效、让位 task=${taskId} gen=${cleanupGen}`,
+                `[task-runner] finalizeTask: R31-2 旧 cleanup 已失效、让位 task=${taskId} token=${handle.token}`,
               );
               return;
             }
             // 测试挂点：delayed remove 转 executing 前（waiting 阶段 reopen 仍可作废）
             await failpoint("finalize.beforeDeferredRemove");
-            // R32-3：原子 waiting→executing；转失败 = 已被 reopen 作废、让位（不再二次 gen 检查后裸 await）
-            if (!markTerminalCleanupExecuting(taskId, cleanupGen)) {
+            // R32-3：原子 waiting→executing；转失败 = 已被 reopen 作废、让位
+            if (!markTerminalCleanupExecuting(handle)) {
               console.log(
-                `[task-runner] finalizeTask: R32-3 转 executing 失败（已被 reopen 作废）、让位 task=${taskId} gen=${cleanupGen}`,
+                `[task-runner] finalizeTask: R32-3 转 executing 失败（已被 reopen 作废）、让位 task=${taskId} token=${handle.token}`,
               );
               return;
             }
@@ -1701,46 +1711,58 @@ export const finalizeTask = async (
               err,
             );
           } finally {
-            // R31-2：无论成败都 release——gen 不匹配时 release 内部 no-op
-            releaseTerminalCleanup(taskId, cleanupGen);
+            // R33-2：仅本 handle.token 能 release；不匹配 no-op
+            releaseTerminalCleanup(handle);
           }
         })();
       } else {
-        const removed = await removeTaskWorktrees(task).catch((err) => {
-          console.warn(
-            `[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`,
-            err,
-          );
-          return null;
-        });
-        if (
-          removed?.removedAny ||
-          (removed?.snapshotFailedRepos.length ?? 0) > 0
-        ) {
-          const repoTail = (p: string) =>
-            p.split("/").filter(Boolean).pop() ?? p;
-          const snapshotNote =
-            removed && removed.snapshotRepos.length > 0
-              ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
-              : "";
-          // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
-          const failedNote =
-            removed && removed.snapshotFailedRepos.length > 0
-              ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
-              : "";
-          // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
-          await writeEventAndPublish(taskId, {
-            kind: "info",
-            text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
-          });
-        }
-        // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
-        // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
-        // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
+        // R33-3：同步 remove 同样进 coordinator（关 Codex 探针：裸 remove × reopen 穿越）
+        const handle = acq.handle;
         try {
-          await stopPreviewsForTask(taskId);
-        } catch {
-          /* best-effort */
+          if (!markTerminalCleanupExecuting(handle)) {
+            console.log(
+              `[task-runner] finalizeTask: R33-3 同步路径转 executing 失败、跳过 remove task=${taskId} token=${handle.token}`,
+            );
+          } else {
+            const removed = await removeTaskWorktrees(task).catch((err) => {
+              console.warn(
+                `[task-runner] finalizeTask: 清理 worktree 失败 task=${taskId}`,
+                err,
+              );
+              return null;
+            });
+            if (
+              removed?.removedAny ||
+              (removed?.snapshotFailedRepos.length ?? 0) > 0
+            ) {
+              const repoTail = (p: string) =>
+                p.split("/").filter(Boolean).pop() ?? p;
+              const snapshotNote =
+                removed && removed.snapshotRepos.length > 0
+                  ? `；未提交改动已自动 commit 到任务分支（${removed.snapshotRepos.map(repoTail).join("、")}）`
+                  : "";
+              // 快照落不了仍强制删：提醒用户未提交改动可能已丢（已 commit 的仍在分支上）
+              const failedNote =
+                removed && removed.snapshotFailedRepos.length > 0
+                  ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
+                  : "";
+              // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
+              await writeEventAndPublish(taskId, {
+                kind: "info",
+                text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
+              });
+            }
+            // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
+            // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
+            // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
+            try {
+              await stopPreviewsForTask(taskId);
+            } catch {
+              /* best-effort */
+            }
+          }
+        } finally {
+          releaseTerminalCleanup(handle);
         }
       }
     }
@@ -1760,9 +1782,10 @@ export const finalizeTask = async (
 };
 
 /**
- * R31-2 / R32-3：terminal cleanup 与 reopen 冲突时拒绝。
+ * R31-2 / R32-3 / R33-3：terminal cleanup / lifecycle 与 reopen 冲突时拒绝。
+ * - finalizing/deleting/stopping 在飞（begin reopening 失败）→ 409
  * - waiting + jobs 未退完 → 409
- * - executing（已入 remove）→ 409「任务清理中、稍后再试」（用户重试、不阻塞 HTTP）
+ * - executing（已入 remove）→ 409「任务清理中、稍后再试」
  * route 映射 409。
  */
 export class TaskCleanupInProgressError extends Error {
@@ -1778,10 +1801,11 @@ export class TaskCleanupInProgressError extends Error {
  * 误 abandon、或想把已终结的 task 重新捡起来继续时用。只翻 repoStatus、
  * runStatus 保持 idle（没有活 agent、用户后续点「推进」才起新 Run）。
  *
- * R31-2 / R32-3：若有在飞 terminal cleanup——
- * - executing：抛 TaskCleanupInProgressError（409）；remove 全程受 reservation 保护
+ * R31-2 / R32-3 / R33-3：
+ * - 原子占 `reopening` lifecycle——与 finalizing/deleting/stopping 互斥（begin 失败 → 409）
+ * - executing cleanup：抛 TaskCleanupInProgressError（409）；remove 全程受 reservation 保护
  * - waiting + jobs 仍非零：抛 409（旧事务未退完）
- * - waiting + jobs 归零：invalidate 作废旧 cleanup + 立即解除 quarantine
+ * - waiting + jobs 归零：invalidate 作废旧 cleanup + 立即解除 quarantine（让位语义保留）
  */
 export const reopenTask = async (taskId: string): Promise<void> => {
   const task = await getTask(taskId);
@@ -1789,30 +1813,48 @@ export const reopenTask = async (taskId: string): Promise<void> => {
   if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
     throw new Error("只有已合入 / 已放弃的任务才能恢复");
   }
-  // R31-2 / R32-3：终态 cleanup 与 reopen 互斥窗口
-  if (hasTerminalCleanup(taskId)) {
-    if (hasResourceJobs(taskId)) {
-      // ① 兜底：旧事务未退完，拒绝 reopen（避免与慢清理并发写同路径）
-      throw new TaskCleanupInProgressError();
-    }
-    // R32-3：invalidate 只取消 waiting；executing → busy → 409
-    const inv = invalidateTerminalCleanupForReopen(taskId);
-    if (inv === "busy") {
-      throw new TaskCleanupInProgressError();
-    }
-    if (inv === "invalidated") {
-      console.log(
-        `[task-runner] reopenTask: R32-3 作废 waiting terminal cleanup、解除 quarantine task=${taskId}`,
-      );
-    }
+  // R33-3：原子占 reopening——DELETE 已占 deleting / finalize 在飞 → begin 失败 → 409
+  const beganReopening = beginChatLifecycle(taskId, "reopening");
+  if (!beganReopening) {
+    const life = getChatLifecycle(taskId);
+    throw new TaskCleanupInProgressError(
+      life === "deleting"
+        ? "任务正在删除、请稍后再试"
+        : "任务清理中、稍后再试",
+    );
   }
-  const patched = await setTaskRepoStatus(taskId, "developing");
-  if (patched) publish(taskId, { kind: "task", task: patched });
-  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：reopenTask 用户直接操作
-  await writeEventAndPublish(taskId, {
-    kind: "info",
-    text: "任务已恢复（→ 开发中）、可继续推进",
-  });
+  try {
+    // R31-2 / R32-3 / R33-3：终态 cleanup 与 reopen 互斥窗口
+    if (hasTerminalCleanup(taskId)) {
+      // R33-3：executing 期间恒 409（含同步 remove 挂在 afterPathExists）
+      if (getTerminalCleanupPhase(taskId) === "executing") {
+        throw new TaskCleanupInProgressError();
+      }
+      if (hasResourceJobs(taskId)) {
+        // ① 兜底：旧事务未退完，拒绝 reopen（避免与慢清理并发写同路径）
+        throw new TaskCleanupInProgressError();
+      }
+      // R32-3：invalidate 只取消 waiting；executing → busy → 409
+      const inv = invalidateTerminalCleanupForReopen(taskId);
+      if (inv === "busy") {
+        throw new TaskCleanupInProgressError();
+      }
+      if (inv === "invalidated") {
+        console.log(
+          `[task-runner] reopenTask: R32-3 作废 waiting terminal cleanup、解除 quarantine task=${taskId}`,
+        );
+      }
+    }
+    const patched = await setTaskRepoStatus(taskId, "developing");
+    if (patched) publish(taskId, { kind: "task", task: patched });
+    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：reopenTask 用户直接操作
+    await writeEventAndPublish(taskId, {
+      kind: "info",
+      text: "任务已恢复（→ 开发中）、可继续推进",
+    });
+  } finally {
+    endChatLifecycle(taskId, "reopening");
+  }
 };
 
 // ----------------- 内部：起新 Agent + 消息循环 -----------------

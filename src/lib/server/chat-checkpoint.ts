@@ -34,7 +34,7 @@ import {
   hasChatStartReservation,
   tryBeginChatRewind,
 } from "./chat-gate";
-import { clearChatQueue, getChatQueueCount } from "./chat-queue";
+import { failQueuedItems, getChatQueueCount } from "./chat-queue";
 import { failpoint } from "./failpoints";
 import {
   EVENTS_FILE,
@@ -457,12 +457,29 @@ export interface CheckpointRefManifestEntry {
 }
 
 /**
- * R32-6：可恢复删除事务的 refs 清单。
+ * R32-6 / R33-5：可恢复删除事务的 refs 清单。
  * 写 tombstone / journal 时从 rewind_points 提取；rm taskDir 后仍可凭 journal 重试。
+ *
+ * R33-5 phase：
+ * - prepared：manifest 已落盘、逻辑删除尚未提交（boot 必须丢弃、不得 rm）
+ * - committed：tombstone rename 成功或快速路径进入不可逆 refs/rm 前已原子推进
+ *
+ * R33-6 refsPending：update-ref / for-each-ref 未确认成功的子集；有则 boot 只重试这些、成功前不删 journal。
  */
 export interface CheckpointRefManifest {
   deletedAt: number;
   checkpointRefs: CheckpointRefManifestEntry[];
+  /** R33-5：删除事务阶段 */
+  phase?: "prepared" | "committed";
+  /** R33-6：尚未确认清掉的 refs（子集）；缺省表示按 checkpointRefs 全量清 */
+  refsPending?: CheckpointRefManifestEntry[];
+}
+
+/** R33-6：按清单清 refs 的逐仓/逐 ref 结果 */
+export interface CheckpointRefCleanupResult {
+  /** 未确认成功、须写回 journal 的失败项 */
+  pending: CheckpointRefManifestEntry[];
+  allSucceeded: boolean;
 }
 
 /**
@@ -525,19 +542,27 @@ export const buildCheckpointRefManifest = async (
 };
 
 /**
- * R32-6：按清单删 checkpoint refs（幂等）。
+ * R32-6 / R33-6：按清单删 checkpoint refs（幂等）。
  * 先删清单内 refs，再 for-each-ref 扫前缀兜底（防清单不全）。
+ * R33-6：返回逐仓失败项——调用方必须写回 journal.refsPending，不能假成功删 journal。
  * 测试挂点：首个成功 delete 后可注入崩溃。
  */
 export const cleanupCheckpointRefsFromManifest = async (
   taskId: string,
   manifest: CheckpointRefManifest,
-): Promise<void> => {
+): Promise<CheckpointRefCleanupResult> => {
   const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
   let deletedOnce = false;
-  for (const entry of manifest.checkpointRefs) {
+  // R33-6：优先只清 refsPending（boot 重试）；否则清全量 checkpointRefs
+  const entries =
+    manifest.refsPending && manifest.refsPending.length > 0
+      ? manifest.refsPending
+      : manifest.checkpointRefs;
+  const pending: CheckpointRefManifestEntry[] = [];
+  for (const entry of entries) {
     const { repoPath } = entry;
     const toDelete = new Set(entry.refs.filter(Boolean));
+    let forEachOk = true;
     // 再扫一遍前缀——崩溃重试 / 清单落后时补漏
     const listed = await runGit(repoPath, [
       "for-each-ref",
@@ -550,16 +575,19 @@ export const cleanupCheckpointRefsFromManifest = async (
         if (name) toDelete.add(name);
       }
     } else {
+      forEachOk = false;
       console.warn(
         `[chat-checkpoint] cleanupCheckpointRefs for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
       );
     }
+    const failedRefs: string[] = [];
     for (const name of toDelete) {
       const del = await runGit(repoPath, ["update-ref", "-d", name]);
       if (!del.ok) {
         console.warn(
           `[chat-checkpoint] cleanupCheckpointRefs 删 ref 失败 task=${taskId} repo=${repoPath} ref=${name}: ${del.stderr}`,
         );
+        failedRefs.push(name);
         continue;
       }
       // R32-6 测试：首个成功删后可挂起，模拟「清到一半崩溃」
@@ -568,22 +596,32 @@ export const cleanupCheckpointRefsFromManifest = async (
         await failpoint("checkpointRefs.afterFirstDelete");
       }
     }
+    // for-each-ref 失败时无法确认前缀扫干净——整仓 refs 留 pending 给 boot 重试
+    if (!forEachOk || failedRefs.length > 0) {
+      pending.push({
+        repoPath,
+        refs: !forEachOk ? [...toDelete] : failedRefs,
+      });
+    }
   }
+  return { pending, allSucceeded: pending.length === 0 };
 };
 
 /**
  * 删除任务前清理各仓里该 task 的 checkpoint refs。
  * 不清理会让被删任务的历史 tree/blob 永久保留在用户仓里（refs 保活对象）。
  * 须在 deleteTask 之前调用（还要能读到 rewind_points），或传入已落盘的 journal 清单。
- * 全程 best-effort。
+ * R33-6：返回逐项结果，不再吞成 void 成功。
  */
 export const cleanupCheckpointRefsForTask = async (
   taskId: string,
   manifest?: CheckpointRefManifest,
-): Promise<void> => {
+): Promise<CheckpointRefCleanupResult> => {
   const m = manifest ?? (await buildCheckpointRefManifest(taskId));
-  if (m.checkpointRefs.length === 0) return;
-  await cleanupCheckpointRefsFromManifest(taskId, m);
+  if (m.checkpointRefs.length === 0 && !m.refsPending?.length) {
+    return { pending: [], allSucceeded: true };
+  }
+  return cleanupCheckpointRefsFromManifest(taskId, m);
 };
 
 /**
@@ -907,7 +945,9 @@ export const executeChatRewind = async (
         );
       }
       // 复查通过：清掉排队（防竞态下刚入队的旧上下文消息在回退后幽灵发送）
-      clearChatQueue(taskId);
+      // R33-1：走唯一终态 sink——复查后到清队之间若有消息挤入（202 已返回）、
+      // 它必须收到 queue_failed 终态、不能被裸 clear 静默丢
+      failQueuedItems(taskId, { reason: "rewound" });
 
       // —— preflight：确认目标 tree 仍在、events 里确有该 eventId ——
       for (const s of lockedTarget.repoSnapshots) {

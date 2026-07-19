@@ -30,8 +30,14 @@
  *   也预先写入 sentEventIds，保证不丢不重。
  */
 
-import { listChatQueueItemIds } from "@/lib/server/chat-queue";
-import { getTaskWithTailEvents } from "@/lib/server/task-fs";
+import {
+  listChatQueueItemIds,
+  listRecentSettled,
+} from "@/lib/server/chat-queue";
+import {
+  assertTaskReadable,
+  getTaskWithTailEvents,
+} from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import {
   type TaskStreamEvent,
@@ -103,7 +109,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
     cleanup();
     throw err;
   }
-  if (!initial) {
+  // R33-4：bootstrap tail 读完后同步复查——已删 → 404、不发 stale task/events
+  if (!initial || !assertTaskReadable(id)) {
     cleanup();
     return errorJson("not_found", 404);
   }
@@ -195,6 +202,11 @@ export const GET = async (req: Request, { params }: Ctx) => {
               reason: ev.reason,
             });
             break;
+          // R33-4：DELETE 逻辑删除提交 → 通知客户端并关流
+          case "task_deleted":
+            send({ type: "task_deleted", taskId: ev.taskId });
+            closeStream();
+            break;
         }
       };
 
@@ -212,11 +224,12 @@ export const GET = async (req: Request, { params }: Ctx) => {
           rememberEventId(ev.id);
           send({ type: "event", event: ev });
         }
-        // R32-2：bootstrap 一次性附带当前 server queue 快照（含 in-flight），
-        // 前端对账清断连期间漏掉的 queue_failed 留下的幽灵 pending——不做轮询。
+        // R32-2 / R33-1：bootstrap 附带 active queue + recentSettled ledger，
+        // 前端对账清断连期间漏掉的 queue_failed / 挡住晚到 202 幽灵——不做轮询。
         send({
           type: "queue_state",
           itemIds: listChatQueueItemIds(id),
+          recentSettled: listRecentSettled(id),
         });
       } catch (err) {
         console.error("[watch-task] bootstrap failed:", err);

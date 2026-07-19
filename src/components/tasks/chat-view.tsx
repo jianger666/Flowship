@@ -45,10 +45,12 @@ import {
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import {
+  allocClientChatQueueItemId,
+  applyDoneClearPending,
   applyQueueFailedTerminal,
   applyUserReplyTerminal,
+  dropPendingByItemId,
   reconcilePendingWithQueueState,
-  removePendingByUserReply,
   shouldInsertPendingAfter202,
 } from "@/lib/chat-pending-reconcile";
 import { prepareRunArgs } from "@/lib/run-args";
@@ -253,21 +255,24 @@ export const ChatView = ({
         );
       }
     },
-    // R32-2：重连 bootstrap 的 queue_state——清不在 server 存活集合的幽灵 pending
-    onQueueState: (serverItemIds) => {
+    // R32-2 / R33-1：重连 bootstrap——active + recentSettled 对账清幽灵 / 挡晚到 202
+    onQueueState: (serverItemIds, recentSettled) => {
       setPendingLocalReplies((prev) => {
+        const before = prev.length;
         const { pending: next, settled, ghostIds } =
           reconcilePendingWithQueueState(
             prev,
             settledItemIdsRef.current,
             serverItemIds,
+            recentSettled,
           );
         settledItemIdsRef.current = settled;
-        if (ghostIds.length === 0) return prev;
+        if (next.length === before && ghostIds.length === 0) return prev;
         setQueuedCount(next.length > 0 ? next.length : null);
-        toast.message(
-          `已清除 ${ghostIds.length} 条失效的排队占位`,
-        );
+        const cleared = before - next.length;
+        if (cleared > 0) {
+          toast.message(`已清除 ${cleared} 条失效的排队占位`);
+        }
         return next;
       });
     },
@@ -276,16 +281,21 @@ export const ChatView = ({
       setStreamingText("");
       setLiveToolOutputs({});
       const remaining = pendingLocalRepliesRef.current.length;
-      // idle/error：stop / 失败路径服务端已 clearChatQueue，本地 pending 会成幽灵气泡
+      // R33-1：idle/error 清 pending 时把 itemId 记入 settled（pending 登记先于请求，done 必有 id）
       // awaiting_user：自然回合结束，队可能正在 flush，保留 pending 等 SSE user_reply 对账
       if (
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
       ) {
+        const { settled, clearedIds } = applyDoneClearPending(
+          pendingLocalRepliesRef.current,
+          settledItemIdsRef.current,
+        );
+        settledItemIdsRef.current = settled;
         setPendingLocalReplies([]);
         setQueuedCount(null);
         toast.message(
-          `会话已结束，已清除 ${remaining} 条未确认的排队占位（若仍需发送请重新输入）`,
+          `会话已结束，已清除 ${clearedIds.length} 条未确认的排队占位（若仍需发送请重新输入）`,
         );
       } else {
         setQueuedCount(remaining > 0 ? remaining : null);
@@ -309,6 +319,23 @@ export const ChatView = ({
       // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
       if (!args) return false;
 
+      // R33-1：请求前生成 itemId 并登记 pending——终态/done 先到也有 id 可记
+      const clientItemId = allocClientChatQueueItemId();
+      const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
+      setPendingLocalReplies((prev) => [
+        ...prev,
+        {
+          id: clientItemId,
+          itemId: clientItemId,
+          text,
+          displayText,
+          images,
+          attachments,
+          skillRefs,
+        },
+      ]);
+      setQueuedCount((prev) => (prev == null ? 1 : prev + 1));
+
       setIsSubmitting(true);
       try {
         const result = await sendChatReply(
@@ -321,6 +348,7 @@ export const ChatView = ({
             model: args.model,
           },
           skillRefs,
+          clientItemId,
         );
         // R30-3：send 后落盘失败——不可忽略提示
         if (result.persistWarning) {
@@ -330,43 +358,52 @@ export const ChatView = ({
         }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
-          // R32-1：终态若已早于 202 到达（settled），不得再插永久 pending
+          // R33-1：已在请求前登记；终态早到则摘掉 pending（不得保留幽灵）
           if (
             !shouldInsertPendingAfter202(
               settledItemIdsRef.current,
               result.itemId,
             )
           ) {
-            if (result.task) onTaskUpdateRef.current(result.task);
-            return true;
+            setPendingLocalReplies((prev) => {
+              const { pending: next, settled } = dropPendingByItemId(
+                prev,
+                settledItemIdsRef.current,
+                result.itemId,
+              );
+              settledItemIdsRef.current = settled;
+              setQueuedCount(next.length > 0 ? next.length : null);
+              return next;
+            });
           }
-          // R31-1：pending 绑服务端 itemId（图 / 附件 / skill 同一机制）
-          setPendingLocalReplies((prev) => [
-            ...prev,
-            {
-              id: result.itemId,
-              itemId: result.itemId,
-              text,
-              displayText: text || CHAT_ATTACHMENT_ONLY_TEXT,
-              images,
-              attachments,
-              skillRefs,
-            },
-          ]);
           if (result.task) onTaskUpdateRef.current(result.task);
           return true;
         }
-        // 200 非 queued：同步清掉同文案 pending（若有），避免幽灵占位
-        const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
+        // 200 非 queued：摘掉本条预登记 pending（真实气泡走 SSE user_reply）
         setPendingLocalReplies((prev) => {
-          const next = removePendingByUserReply(prev, { text: displayText });
-          if (next === prev) return prev;
+          const { pending: next, settled } = dropPendingByItemId(
+            prev,
+            settledItemIdsRef.current,
+            clientItemId,
+          );
+          settledItemIdsRef.current = settled;
           setQueuedCount(next.length > 0 ? next.length : null);
           return next;
         });
         onTaskUpdateRef.current(result.task);
         return true;
       } catch (err) {
+        // 请求失败：摘掉预登记 pending（不记 settled——用户可重发同文案）
+        setPendingLocalReplies((prev) => {
+          const { pending: next, settled } = dropPendingByItemId(
+            prev,
+            settledItemIdsRef.current,
+            clientItemId,
+          );
+          settledItemIdsRef.current = settled;
+          setQueuedCount(next.length > 0 ? next.length : null);
+          return next;
+        });
         toast.error(`回复失败：${(err as Error).message}`);
         return false;
       } finally {
@@ -380,15 +417,19 @@ export const ChatView = ({
   const handleStop = useCallback(async () => {
     setStopping(true);
     try {
-      const discarded = pendingLocalRepliesRef.current.length;
       const latest = await stopTask(task.id);
       setStreamingText("");
-      // stop 会清 server 排队——本地占位一并丢掉、避免幽灵气泡
+      // R33-1：stop 清队；本地 pending 记入 settled（挡晚到 202），不只丢占位
+      const { clearedIds, settled } = applyDoneClearPending(
+        pendingLocalRepliesRef.current,
+        settledItemIdsRef.current,
+      );
+      settledItemIdsRef.current = settled;
       setPendingLocalReplies([]);
       setQueuedCount(null);
       onTaskUpdateRef.current(latest);
-      if (discarded > 0) {
-        toast.message(`已丢弃 ${discarded} 条未发送的排队消息`);
+      if (clearedIds.length > 0) {
+        toast.message(`已丢弃 ${clearedIds.length} 条未发送的排队消息`);
       }
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);

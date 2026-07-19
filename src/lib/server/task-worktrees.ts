@@ -1071,8 +1071,9 @@ export const removeTaskWorktrees = async (
     return { removedAny: false, snapshotRepos: [], snapshotFailedRepos: [] };
   }
 
-  // R32-3 测试挂点：pathExists 之后、第一次 git status / snapshot 之前——
-  // 验证 reservation 已转 executing 时 reopen 409、旧 remove 不得删 B。
+  // R32-3 / R33-3 测试挂点：pathExists 之后、第一次 git status / snapshot 之前——
+  // 验证 reservation 已转 executing 时 reopen 409（含无 ResourceJob 的同步 finalize）；
+  // 旧 remove 不得与 reopen/prewarm 并发写同路径。
   await failpoint("removeTaskWorktrees.afterPathExists");
 
   // 不走 getTaskWorkRepoPaths：那个映射按 nonGitRepoPaths 快照分流、非 git 返回原路径——

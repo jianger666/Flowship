@@ -1,5 +1,5 @@
 /**
- * R28-1 / R29-2 / R30-2 / R31-2 / R32-3 / R32-4：per-task resource job 登记
+ * R28-1 / R29-2 / R30-2 / R31-2 / R32-3 / R32-4 / R33-2 / R33-3：per-task resource job 登记
  * （与 startingTasks 同形、独立模块避环）。
  *
  * R29-2：每个 job 可挂「当前在跑子进程」的 abort；stop/finalize/DELETE 终态 owner
@@ -10,7 +10,7 @@
  *
  * R31-2 quarantine 双条件契约（jobs==0 ≠ terminal cleanup 完成）：
  * - `resourceJobs==0`：旧资源事务已退出，**可以开始**终态 cleanup，但不等于 cleanup 已完成
- * - `terminalCleanup` reservation：finalize 延迟 `removeTaskWorktrees` 的独立代际持有
+ * - `terminalCleanup` reservation：finalize `removeTaskWorktrees` 的独立持有（含同步/deferred）
  * - quarantine **仅当**「jobs 归零」且「无在飞 terminal cleanup」两者都满足时才解除
  * - `endResourceJob` 归零时只通知 waiter + 尝试 maybeClear；**不得**无条件清 quarantine
  *
@@ -20,6 +20,12 @@
  *
  * R32-4：generation / job 发号器与 Map 同挂 globalThis——防 route-chunk / HMR /
  * `vi.resetModules` 后模块局部计数从零复用旧代际（ABA）。
+ *
+ * R33-2 / R33-3：TerminalCleanupCoordinator——per-task 单一 cleanup handle/promise：
+ * - `acquireTerminalCleanup`：无在飞 → 唯一 token + 独占 promise；已有在飞 → `{ busy, promise }`
+ *   （调用方 join、绝不重写 phase / 复用 token——关重复 finalize 双 holder 破坏序列）
+ * - `markExecuting` / `release` 精确匹配 handle.token；任一 join 方拿不到 handle、不能提前 release
+ * - 同步 remove 与 deferred 同一互斥；invalidate(waiting) 同时 resolve joiners
  *
  * 正确性：lease 让位路径只抛错、不 abort 别人的 job；每个 job 只 abort 自己登记的。
  */
@@ -39,15 +45,30 @@ interface JobEntry {
 export type TerminalCleanupPhase = "waiting" | "executing";
 
 /**
- * R31-2 / R32-3：quarantine 条目——带单调代际 + 可选的终态 cleanup reservation。
- * generation 在 mark 时分配；cleanup 持有时记下当时的 gen + phase，提交前校验。
+ * R33-2：唯一 cleanup 句柄——token 全局单调、与 mark/release 精确匹配。
+ * 注意：token ≠ quarantine.generation（后者是隔离代际；前者是 cleanup 所有权）。
+ */
+export interface TerminalCleanupHandle {
+  taskId: string;
+  /** 全局唯一 cleanup token（globalThis 发号） */
+  token: number;
+}
+
+/** R33-2：acquire 结果——busy 时调用方只能 join，拿不到可 release 的 handle */
+export type AcquireTerminalCleanupResult =
+  | { busy: false; handle: TerminalCleanupHandle; promise: Promise<void> }
+  | { busy: true; promise: Promise<void> };
+
+/**
+ * R31-2 / R32-3 / R33-2：quarantine 条目——带单调代际 + 可选的终态 cleanup reservation。
+ * generation 在 mark 时分配；cleanup 持有唯一 token + phase，提交前校验 token。
  */
 interface QuarantineEntry {
   /** 进程单调代际（本 task 内） */
   generation: number;
   /**
-   * 终态 cleanup 持有的 generation；null = 无在飞 terminal cleanup。
-   * 与 generation 相等时 reservation 有效；reopen 作废 waiting 后旧 gen 失效。
+   * R33-2：终态 cleanup 持有的唯一 token；null = 无在飞 terminal cleanup。
+   * reopen 作废 waiting 后旧 token 失效（不再与 generation 相等）。
    */
   terminalCleanupGen: number | null;
   /**
@@ -57,20 +78,36 @@ interface QuarantineEntry {
   terminalCleanupPhase: TerminalCleanupPhase | null;
 }
 
+/**
+ * R33-2：per-task 单一 cleanup coordinator——与 quarantine reservation 同步寿命。
+ * 重复 finalize join 同一 promise；invalidate(waiting) 时 resolve 并摘条目。
+ */
+interface TerminalCleanupCoordEntry {
+  token: number;
+  phase: TerminalCleanupPhase;
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
 /** R32-4：发号器与 Map 同寿命（换 key 防 hot-reload 读到旧形状） */
 const RESOURCE_JOBS_GLOBAL_KEY = "__feAiFlowResourceJobsV2__";
 const QUARANTINE_GLOBAL_KEY = "__feAiFlowQuarantinedWorkspacesV3__";
 const JOB_CLEARED_WAITERS_KEY = "__feAiFlowResourceJobClearedWaitersV1__";
-/** R32-4：jobSeq + quarantineGen 单调计数器（与 Map 同挂 globalThis） */
+/** R32-4 / R33-2：jobSeq + quarantineGen + cleanupToken 单调计数器 */
 const RESOURCE_COUNTERS_GLOBAL_KEY = "__feAiFlowResourceCountersV1__";
+/** R33-2：TerminalCleanupCoordinator 条目（与 quarantine 同寿命语义） */
+const TERMINAL_CLEANUP_COORD_KEY = "__feAiFlowTerminalCleanupCoordV1__";
 
 type JobsByTask = Map<string, Map<string, JobEntry>>;
 type QuarantineByTask = Map<string, QuarantineEntry>;
 type JobClearedWaiters = Map<string, Set<() => void>>;
+type CleanupCoordByTask = Map<string, TerminalCleanupCoordEntry>;
 
 interface ResourceCounters {
   nextJobSeq: number;
   nextQuarantineGen: number;
+  /** R33-2：cleanup handle token 发号（与 Map 同挂、防 ABA） */
+  nextCleanupToken: number;
 }
 
 const getResourceJobsMap = (): JobsByTask => {
@@ -103,7 +140,7 @@ const getJobClearedWaiters = (): JobClearedWaiters => {
   return g[JOB_CLEARED_WAITERS_KEY]!;
 };
 
-/** R32-4：取（或初始化）全局单调发号器 */
+/** R32-4 / R33-2：取（或初始化）全局单调发号器 */
 const getResourceCounters = (): ResourceCounters => {
   const g = globalThis as unknown as Record<
     string,
@@ -113,9 +150,27 @@ const getResourceCounters = (): ResourceCounters => {
     g[RESOURCE_COUNTERS_GLOBAL_KEY] = {
       nextJobSeq: 0,
       nextQuarantineGen: 0,
+      nextCleanupToken: 0,
     };
   }
-  return g[RESOURCE_COUNTERS_GLOBAL_KEY]!;
+  const counters = g[RESOURCE_COUNTERS_GLOBAL_KEY]!;
+  // hot-reload / 旧 chunk 缺字段时补齐——避免 NaN token
+  if (typeof counters.nextCleanupToken !== "number") {
+    counters.nextCleanupToken = 0;
+  }
+  return counters;
+};
+
+/** R33-2：per-task cleanup coordinator Map */
+const getCleanupCoordMap = (): CleanupCoordByTask => {
+  const g = globalThis as unknown as Record<
+    string,
+    CleanupCoordByTask | undefined
+  >;
+  if (!g[TERMINAL_CLEANUP_COORD_KEY]) {
+    g[TERMINAL_CLEANUP_COORD_KEY] = new Map();
+  }
+  return g[TERMINAL_CLEANUP_COORD_KEY]!;
 };
 
 /** R30-2：生产默认 30s；单测可 `setResourceJoinTimeoutMsForTest` 缩短 */
@@ -236,26 +291,67 @@ export const getTerminalCleanupPhase = (
 };
 
 /**
- * R31-2 / R32-3：终态 owner 进入 deferred cleanup 时持有 reservation（phase=waiting）。
- * 若尚未 quarantine 则先 mark；返回 cleanup gen（转 executing / 提交删除前必须仍 valid）。
+ * R33-2 / R33-3：try-acquire per-task 单一 TerminalCleanupCoordinator。
+ *
+ * - 无在飞 → 发唯一 token、phase=waiting、建独占 promise；同步/deferred remove 共用
+ * - 已有在飞 → `{ busy: true, promise }`——调用方 join，**绝不**重写 phase / 复用 token
+ *   （关 R33-2：重复 finalize 复用 gen 降级 executing、或另一 holder 提前 release）
  */
-export const holdTerminalCleanup = (taskId: string): number => {
+export const acquireTerminalCleanup = (
+  taskId: string,
+): AcquireTerminalCleanupResult => {
+  const coords = getCleanupCoordMap();
+  const existing = coords.get(taskId);
+  if (existing) {
+    return { busy: true, promise: existing.promise };
+  }
+
+  const counters = getResourceCounters();
+  const token = ++counters.nextCleanupToken;
   const m = getQuarantineMap();
   let cur = m.get(taskId);
   if (!cur) {
     markWorkspaceQuarantined(taskId);
     cur = m.get(taskId)!;
   }
-  const gen = cur.generation;
   m.set(taskId, {
-    generation: gen,
-    terminalCleanupGen: gen,
+    generation: cur.generation,
+    terminalCleanupGen: token,
     terminalCleanupPhase: "waiting",
   });
-  return gen;
+
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  coords.set(taskId, {
+    token,
+    phase: "waiting",
+    promise,
+    resolve,
+  });
+  return {
+    busy: false,
+    handle: { taskId, token },
+    promise,
+  };
 };
 
-/** R31-2：cleanup gen 是否仍是当前有效 reservation（reopen 作废 waiting 后为 false） */
+/**
+ * R31-2 / R33-2 兼容包装：无在飞时等价 acquire；已有在飞时抛错（禁止复用 token）。
+ * 新代码请直接 `acquireTerminalCleanup`。
+ */
+export const holdTerminalCleanup = (taskId: string): number => {
+  const acq = acquireTerminalCleanup(taskId);
+  if (acq.busy) {
+    throw new Error(
+      "R33-2: terminal cleanup already in flight; use acquireTerminalCleanup to join",
+    );
+  }
+  return acq.handle.token;
+};
+
+/** R31-2 / R33-2：cleanup token 是否仍是当前有效 reservation（reopen 作废 waiting 后为 false） */
 export const isTerminalCleanupGenValid = (
   taskId: string,
   gen: number,
@@ -264,41 +360,69 @@ export const isTerminalCleanupGenValid = (
   return cur?.terminalCleanupGen === gen;
 };
 
+/** R33-2：handle 是否仍持有有效 reservation */
+export const isTerminalCleanupHandleValid = (
+  handle: TerminalCleanupHandle,
+): boolean => isTerminalCleanupGenValid(handle.taskId, handle.token);
+
 /**
- * R32-3：原子将 reservation 从 waiting → executing（gen 匹配才转）。
- * @returns true=已持有 executing（含幂等已 executing）；false=已被 reopen 作废 / gen 不匹配
+ * R32-3 / R33-2：原子将 reservation 从 waiting → executing（token 精确匹配）。
+ * 支持 `(handle)` 或旧 `(taskId, gen)` 签名。
+ * @returns true=已持有 executing（含同 token 幂等）；false=已被 reopen 作废 / token 不匹配
  */
 export const markTerminalCleanupExecuting = (
-  taskId: string,
-  gen: number,
+  taskIdOrHandle: string | TerminalCleanupHandle,
+  gen?: number,
 ): boolean => {
+  const taskId =
+    typeof taskIdOrHandle === "string" ? taskIdOrHandle : taskIdOrHandle.taskId;
+  const token =
+    typeof taskIdOrHandle === "string" ? gen! : taskIdOrHandle.token;
   const m = getQuarantineMap();
   const cur = m.get(taskId);
-  if (!cur || cur.terminalCleanupGen !== gen) return false;
+  if (!cur || cur.terminalCleanupGen !== token) return false;
   if (cur.terminalCleanupPhase === "executing") return true;
   if (cur.terminalCleanupPhase !== "waiting") return false;
   m.set(taskId, {
     generation: cur.generation,
-    terminalCleanupGen: gen,
+    terminalCleanupGen: token,
     terminalCleanupPhase: "executing",
   });
+  const coord = getCleanupCoordMap().get(taskId);
+  if (coord && coord.token === token) {
+    coord.phase = "executing";
+  }
   return true;
 };
 
 /**
- * R31-2：terminal cleanup 完成 → 释放 reservation；
+ * R31-2 / R33-2：terminal cleanup 完成 → 释放 reservation + resolve joiners；
  * 若 jobs 已归零则解除 quarantine（双条件第二段）。
- * gen 不匹配（已被 reopen 作废）→ no-op。
+ * token 不匹配（已被 reopen 作废 / 非本 handle）→ no-op（关 R33-2 提前 release）。
+ * 支持 `(handle)` 或旧 `(taskId, gen)` 签名。
  */
-export const releaseTerminalCleanup = (taskId: string, gen: number): void => {
+export const releaseTerminalCleanup = (
+  taskIdOrHandle: string | TerminalCleanupHandle,
+  gen?: number,
+): void => {
+  const taskId =
+    typeof taskIdOrHandle === "string" ? taskIdOrHandle : taskIdOrHandle.taskId;
+  const token =
+    typeof taskIdOrHandle === "string" ? gen! : taskIdOrHandle.token;
   const m = getQuarantineMap();
   const cur = m.get(taskId);
-  if (!cur || cur.terminalCleanupGen !== gen) return;
+  if (!cur || cur.terminalCleanupGen !== token) return;
   m.set(taskId, {
     generation: cur.generation,
     terminalCleanupGen: null,
     terminalCleanupPhase: null,
   });
+  const coords = getCleanupCoordMap();
+  const coord = coords.get(taskId);
+  if (coord && coord.token === token) {
+    coords.delete(taskId);
+    coord.resolve();
+  }
   maybeClearQuarantine(taskId);
 };
 
@@ -306,8 +430,8 @@ export const releaseTerminalCleanup = (taskId: string, gen: number): void => {
 export type InvalidateCleanupResult = "invalidated" | "busy" | "none";
 
 /**
- * R31-2 / R32-3：reopen 作废在飞 terminal cleanup——
- * - waiting：删掉 reservation + 立即解除 quarantine（旧后台转 executing 失败让位）
+ * R31-2 / R32-3 / R33-2：reopen 作废在飞 terminal cleanup——
+ * - waiting：删掉 reservation + 立即解除 quarantine + resolve joiners（旧后台转 executing 失败让位）
  * - executing：返 busy（贯穿 remove，不得放行 prewarm）
  * @returns invalidated | busy | none
  */
@@ -319,8 +443,16 @@ export const invalidateTerminalCleanupForReopen = (
   if (!cur || cur.terminalCleanupGen == null) return "none";
   // R32-3：executing 期间 reopen 进不来——返回 busy，由 route 映射 409
   if (cur.terminalCleanupPhase === "executing") return "busy";
-  // waiting：整条删掉 = 立即解除 quarantine；旧 gen 再也 valid 不了
+  const token = cur.terminalCleanupGen;
+  // waiting：整条删掉 = 立即解除 quarantine；旧 token 再也 valid 不了
   m.delete(taskId);
+  // R33-2：作废时 resolve joiners，避免重复 finalize 永远挂在 promise 上
+  const coords = getCleanupCoordMap();
+  const coord = coords.get(taskId);
+  if (coord && coord.token === token) {
+    coords.delete(taskId);
+    coord.resolve();
+  }
   return "invalidated";
 };
 
@@ -430,9 +562,16 @@ export const joinResourceJobs = async (
   return "cleared";
 };
 
-/** 测试 / 异常清理：强制清零某 task 的 resource job + quarantine + waiter */
+/** 测试 / 异常清理：强制清零某 task 的 resource job + quarantine + waiter + cleanup coord */
 export const clearResourceJobs = (taskId: string): void => {
   getResourceJobsMap().delete(taskId);
   clearWorkspaceQuarantine(taskId);
+  // R33-2：顺带清 coordinator，避免测试残留 promise 挂死后续用例
+  const coords = getCleanupCoordMap();
+  const coord = coords.get(taskId);
+  if (coord) {
+    coords.delete(taskId);
+    coord.resolve();
+  }
   notifyResourceJobsCleared(taskId);
 };

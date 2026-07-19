@@ -5,6 +5,13 @@ alwaysApply: true
 
 # 编码约定
 
+## 并发/竞态类 bug：同族问题复现 ≥2 轮就收敛重构、不再逐分支打补丁（2026-07-19 用户拍板）
+
+- **背景**：fable5 chat 打磨验收打了 33 轮（R18~R33）、教训实证——并发所有权类 bug 逐分支加 `if (owner)` 补丁**不收敛**：每修一层暴露下一层同族窗口（review 组合近似爆炸）；而两次「集中式协议重构」（V12 单一 TaskOpHandle、sink 层唯一入口）之后对应问题族真正停了。
+- **判断闸门**：同一族问题（同一根因的不同投影）在 review/验收中**连续两轮**以「更细窗口」形式重现 → 停止补丁、把该族收敛成单一协议/coordinator/唯一入口（参考已落地的：TaskOpHandle、commit(finalGuard)、failQueuedItems、TerminalCleanupCoordinator、DeleteJournal 状态机、Read Commit Guard）。
+- **原则**：「完成信号只能由最终提交者发出」「授权检查必须在真实提交点（rename/spawn/appendFile/外部调用）紧前同步执行」「身份用不可复用 token 不用 kind/gen 数字比对」「发号器/状态 Map 一律挂 globalThis 防 route-chunk/HMR 分裂」。
+- 用户原话：「补丁走不长远的、重构效果更好就重构」——成本评估时长期可维护性权重高于单轮改动量。
+
 ## 开发任务交子代理、主线只聊天 + 验收（2026-07-12 用户拍板、覆盖旧「永远不要启动 Subagent」全局规则）
 
 - **用户想法多、等不了主线串行改代码**——后续开发任务（写代码 / 修 bug / 重构）一律派给 subagent 做、模型用 **grok-4.5-fast-xhigh**（用户指定「grok4.5 fast 就行」）。

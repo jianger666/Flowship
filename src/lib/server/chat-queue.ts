@@ -11,6 +11,12 @@
  *   - in-flight = flush 已 dequeue、尚未 send 成功 / 塞回 / 作废丢弃的那条
  *   - enqueue 判满：length + inflight >= MAX → full（HTTP 409，诚实拒绝新消息）
  *   - 已 202 的消息绝不因塞回超限被丢队尾；理论短暂 MAX+1 可接受（打 error 日志）
+ *
+ * # R33-1 QueueOperation 契约
+ *
+ * - itemId：客户端可预生成（clientItemId）；服务端无则兜底发号
+ * - active（队内 + in-flight）+ bounded recentSettled ledger
+ * - 所有清队终态只走 failQueuedItems（禁止业务路径直调 clearChatQueue）
  */
 
 import type { ImageAttachmentSaved } from "./task-artifacts";
@@ -19,26 +25,45 @@ import { publish } from "./task-stream";
 
 export const CHAT_QUEUE_MAX = 5;
 
+/** R33-1：recentSettled FIFO 上限（断线重连可重放对账） */
+export const RECENT_SETTLED_MAX = 50;
+
 /**
- * R32-2：清队终态 reason（机器可读，经 queue_failed 下发前端）。
+ * R32-2 / R33-1：清队终态 reason（机器可读，经 queue_failed 下发前端）。
  * - persist_failed：strict 落盘 EIO 等
  * - no_session：会话消失、无法按序送达
  * - task_gone：任务目录消失 / 非 chat
  * - flush_error：checkpoint / send / 后置步骤抛错
+ * - stopped / cancelled / error / startup_failed / rewound：旁路清队统一 sink
  */
 export type FailQueuedItemsReason =
   | "persist_failed"
   | "no_session"
   | "task_gone"
-  | "flush_error";
+  | "flush_error"
+  | "stopped"
+  | "cancelled"
+  | "error"
+  | "startup_failed"
+  | "rewound"
+  | "deleted";
+
+/** R33-1：ledger 终态 outcome（delivered = user_reply 已落盘） */
+export type QueueItemSettleOutcome = "delivered" | FailQueuedItemsReason;
+
+export type RecentSettledEntry = {
+  itemId: string;
+  outcome: QueueItemSettleOutcome;
+};
 
 /**
- * R31-1：进程内单调短 id，供 202 响应 ↔ 前端 pending ↔ queue_failed 对账。
- * 不落盘、不跨进程；同进程内唯一即可。
+ * R31-1 / R33-7：进程内单调短 id，供 202 ↔ pending ↔ queue_failed 对账。
+ * 发号器挂 globalThis（与 queue state 同对象），防 route-chunk / HMR 撞号。
+ * 客户端预生成 UUID 后此发号器只剩兜底。
  */
-let nextChatQueueItemSeq = 1;
 export const allocChatQueueItemId = (): string => {
-  const seq = nextChatQueueItemSeq++;
+  const state = getQueueState();
+  const seq = state.nextItemSeq++;
   return `cq_${Date.now().toString(36)}_${seq.toString(36)}`;
 };
 
@@ -74,7 +99,10 @@ export type QueuedChatMsgInput = Omit<QueuedChatMsg, "itemId"> & {
 
 const withItemId = (msg: QueuedChatMsgInput): QueuedChatMsg => ({
   ...msg,
-  itemId: msg.itemId || allocChatQueueItemId(),
+  itemId:
+    typeof msg.itemId === "string" && msg.itemId.trim()
+      ? msg.itemId.trim()
+      : allocChatQueueItemId(),
 });
 
 interface ChatQueueGlobalState {
@@ -97,10 +125,17 @@ interface ChatQueueGlobalState {
    * 否则重连会把正当 in-flight 误判成幽灵 pending。
    */
   inFlightItemIds: Map<string, string>;
+  /**
+   * R33-1：per-task 有界终态 ledger（FIFO）。
+   * failQueuedItems / user_reply delivered 都记；watch bootstrap 重放对账。
+   */
+  recentSettled: Map<string, RecentSettledEntry[]>;
+  /** R33-7：全局 item 发号器（与 Map 同寿命，防 resetModules 撞号） */
+  nextItemSeq: number;
 }
 
-// V4：相对 V3 增 inFlightItemIds（R32-2 bootstrap 对账）；换 key 防 hot-reload 缺字段分裂
-const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV4__";
+// V5：相对 V4 增 recentSettled + nextItemSeq（R33-1 / R33-7）；换 key 防 hot-reload 缺字段分裂
+const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV5__";
 
 const getQueueState = (): ChatQueueGlobalState => {
   const g = globalThis as unknown as Record<
@@ -113,25 +148,54 @@ const getQueueState = (): ChatQueueGlobalState => {
       generations: new Map(),
       inFlight: new Map(),
       inFlightItemIds: new Map(),
+      recentSettled: new Map(),
+      nextItemSeq: 1,
     };
   }
-  // hot-reload：旧 state 可能缺 generations / inFlight / inFlightItemIds
-  if (!g[CHAT_QUEUE_GLOBAL_KEY]!.generations) {
-    g[CHAT_QUEUE_GLOBAL_KEY]!.generations = new Map();
+  const state = g[CHAT_QUEUE_GLOBAL_KEY]!;
+  // hot-reload：旧 state 可能缺字段
+  if (!state.generations) state.generations = new Map();
+  if (!state.inFlight) state.inFlight = new Map();
+  if (!state.inFlightItemIds) state.inFlightItemIds = new Map();
+  if (!state.recentSettled) state.recentSettled = new Map();
+  if (typeof state.nextItemSeq !== "number" || state.nextItemSeq < 1) {
+    state.nextItemSeq = 1;
   }
-  if (!g[CHAT_QUEUE_GLOBAL_KEY]!.inFlight) {
-    g[CHAT_QUEUE_GLOBAL_KEY]!.inFlight = new Map();
-  }
-  if (!g[CHAT_QUEUE_GLOBAL_KEY]!.inFlightItemIds) {
-    g[CHAT_QUEUE_GLOBAL_KEY]!.inFlightItemIds = new Map();
-  }
-  return g[CHAT_QUEUE_GLOBAL_KEY]!;
+  return state;
 };
 
 const queues = () => getQueueState().queues;
 const generations = () => getQueueState().generations;
 const inFlightMap = () => getQueueState().inFlight;
 const inFlightItemIdsMap = () => getQueueState().inFlightItemIds;
+const recentSettledMap = () => getQueueState().recentSettled;
+
+/**
+ * R33-1：把 item 记入 per-task recentSettled（已有则跳过；超上限 FIFO 丢最老）。
+ * delivered（user_reply 落盘）与 failQueuedItems 共用。
+ */
+export const recordQueueItemSettled = (
+  taskId: string,
+  itemId: string,
+  outcome: QueueItemSettleOutcome,
+): void => {
+  if (!itemId) return;
+  const map = recentSettledMap();
+  const cur = map.get(taskId) ?? [];
+  if (cur.some((e) => e.itemId === itemId)) return;
+  const next = [...cur, { itemId, outcome }];
+  map.set(
+    taskId,
+    next.length > RECENT_SETTLED_MAX
+      ? next.slice(next.length - RECENT_SETTLED_MAX)
+      : next,
+  );
+};
+
+/** R33-1：只读快照——bootstrap queue_state.recentSettled */
+export const listRecentSettled = (taskId: string): RecentSettledEntry[] => [
+  ...(recentSettledMap().get(taskId) ?? []),
+];
 
 /** 入队结果：ok + 当前条数 + itemId；满了返回 full */
 export type EnqueueResult =
@@ -257,14 +321,15 @@ export const listChatQueueItemIds = (taskId: string): string[] => {
 };
 
 /**
- * R32-2：唯一清队终态提交入口。
+ * R32-2 / R33-1：唯一清队终态提交入口（QueueOperation sink）。
  *
  * 契约：
- * 1. 取出剩余队内 itemIds，再 clearChatQueue（+generation、清 in-flight）
+ * 1. 取出剩余队内 itemIds + in-flight（未显式传 currentItemId 时自动纳入）
  * 2. 可选 currentItemId：已 dequeue 的当前条；若 currentReplyPersisted=true
- *    （user_reply 已落盘 → 已有终态）则不计入 failed，只 fail 剩余
- * 3. failedIds 非空时纯内存 publish `queue_failed`（不落盘）
- * 4. 返回实际 failed 的 itemIds（供调用方写 info 文案）
+ *    （user_reply 已落盘 → 已有终态）则记 delivered，不进 failed
+ * 3. clear（+generation、清 in-flight）——业务路径禁止直调 clearChatQueue
+ * 4. failedIds 记入 recentSettled 并纯内存 publish `queue_failed`
+ * 5. 返回实际 failed 的 itemIds（供调用方写 info 文案）
  */
 export const failQueuedItems = (
   taskId: string,
@@ -276,17 +341,27 @@ export const failQueuedItems = (
   },
 ): string[] => {
   const remaining = takeRemainingChatQueueItemIds(taskId);
+  // R33-1：stop/cancelled 等旁路常不传 currentItemId——自动纳入 in-flight
+  const inflightId = inFlightItemIdsMap().get(taskId);
+  const currentId = options.currentItemId ?? inflightId;
+
   const failedIds: string[] = [];
-  if (
-    options.currentItemId &&
-    !options.currentReplyPersisted
-  ) {
-    failedIds.push(options.currentItemId);
+  if (currentId && !options.currentReplyPersisted) {
+    failedIds.push(currentId);
+  } else if (currentId && options.currentReplyPersisted) {
+    // 当前条已有 user_reply 终态 → ledger 记 delivered（重连可对账）
+    recordQueueItemSettled(taskId, currentId, "delivered");
   }
   for (const id of remaining) {
     if (!failedIds.includes(id)) failedIds.push(id);
   }
+
+  // R33-1：clear 仅允许经本 sink（内部私有语义；导出留给 DELETE/测试）
   clearChatQueue(taskId);
+
+  for (const id of failedIds) {
+    recordQueueItemSettled(taskId, id, options.reason);
+  }
   if (failedIds.length > 0) {
     publish(taskId, {
       kind: "queue_failed",
@@ -309,10 +384,12 @@ export const getChatQueueGeneration = (taskId: string): number =>
   generations().get(taskId) ?? 0;
 
 /**
- * stop / 删任务 / rewind 时清队列，并递增 generation。
- * generation +1 = 一次「作废整队」事件：已 dequeue、尚在 checkpoint/send 途中的消息
- * 不得再被 flush 塞回队首（否则消息「复活」）。
- * 同时清零 in-flight，避免占位残留导致后续误判满。
+ * 清空队列 + 递增 generation（不做终态 publish / 不写 ledger）。
+ *
+ * ⚠️ R33-1：业务清队必须走 failQueuedItems。本函数仅供：
+ * - failQueuedItems 内部
+ * - DELETE / rewind 门闩路径（另代理范围或已有门闩、评估清单见验收报告）
+ * - 单测清理
  */
 export const clearChatQueue = (taskId: string): void => {
   queues().delete(taskId);
@@ -322,11 +399,13 @@ export const clearChatQueue = (taskId: string): void => {
 };
 
 /**
- * 删任务收尾：队列 + generation + in-flight 记录一起清（复审 11 轮：generations 只增不删、
- * 长跑进程积键）。必须在 clearChatQueue（作废在途 drain）且活跃 drain 退出后调用。
+ * 删任务收尾：队列 + generation + in-flight + recentSettled 一起清（复审 11 轮：
+ * generations 只增不删、长跑进程积键）。必须在 clearChatQueue（作废在途 drain）
+ * 且活跃 drain 退出后调用。
  */
 export const cleanupChatQueueState = (taskId: string): void => {
   queues().delete(taskId);
   generations().delete(taskId);
   endChatQueueInFlight(taskId);
+  recentSettledMap().delete(taskId);
 };
