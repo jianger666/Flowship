@@ -82,7 +82,9 @@ type EvidenceKind =
   | "message_op_unknown"
   | "user_reply_persisted"
   | "http_reject_network"
-  | "queue_state_unknown";
+  | "queue_state_unknown"
+  /** R41-1：active bootstrap 只贡献单调 join（可升 persistence），无格外 clear */
+  | "queue_state_active";
 
 const evidenceToState = (kind: EvidenceKind): PendingProductState => {
   switch (kind) {
@@ -104,6 +106,13 @@ const evidenceToState = (kind: EvidenceKind): PendingProductState => {
         persistence: "sending",
         terminalKnowledge: "none",
         networkUncertain: true,
+      };
+    case "queue_state_active":
+      // 无因果版本的 active：格上最多升 persistence；OR/max 不会擦 network/unknown
+      return {
+        persistence: "persisted",
+        terminalKnowledge: "none",
+        networkUncertain: false,
       };
   }
 };
@@ -193,12 +202,13 @@ describe("R41-① product-state join 律（交换 / 结合 / 幂等）", () => {
     }
   });
 
-  it("evidence 两两 / 三三排列：fold join 与顺序无关", () => {
+  it("evidence 两两 / 三三排列：fold join 与顺序无关（含 queue_state_active）", () => {
     const kinds: EvidenceKind[] = [
       "message_op_unknown",
       "user_reply_persisted",
       "http_reject_network",
       "queue_state_unknown",
+      "queue_state_active",
     ];
     let pairCount = 0;
     let tripleCount = 0;
@@ -212,6 +222,16 @@ describe("R41-① product-state join 律（交换 / 结合 / 幂等）", () => {
           .map(evidenceToState)
           .reduce((acc, s) => joinProductState(acc, s));
         expect(got, order.join(">")).toEqual(expected);
+        // active 进格 join 不得擦掉 network / unknown（格外 destructive 不在此路径）
+        if (order.includes("http_reject_network")) {
+          expect(got.networkUncertain, order.join(">")).toBe(true);
+        }
+        if (
+          order.includes("message_op_unknown") ||
+          order.includes("queue_state_unknown")
+        ) {
+          expect(got.terminalKnowledge, order.join(">")).toBe("unknown");
+        }
         pairCount += 1;
       }
     }
@@ -225,13 +245,22 @@ describe("R41-① product-state join 律（交换 / 结合 / 幂等）", () => {
           .map(evidenceToState)
           .reduce((acc, s) => joinProductState(acc, s));
         expect(got, order.join(">")).toEqual(expected);
+        if (order.includes("http_reject_network")) {
+          expect(got.networkUncertain, order.join(">")).toBe(true);
+        }
+        if (
+          order.includes("message_op_unknown") ||
+          order.includes("queue_state_unknown")
+        ) {
+          expect(got.terminalKnowledge, order.join(">")).toBe("unknown");
+        }
         tripleCount += 1;
       }
     }
 
-    // C(4,2)*2! = 12；C(4,3)*3! = 24
-    expect(pairCount).toBe(12);
-    expect(tripleCount).toBe(24);
+    // C(5,2)*2! = 20；C(5,3)*3! = 60
+    expect(pairCount).toBe(20);
+    expect(tripleCount).toBe(60);
   });
 
   it("transport ack 定向清 network：不碰 persistence / terminalKnowledge", () => {

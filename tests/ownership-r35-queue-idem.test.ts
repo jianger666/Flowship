@@ -791,14 +791,14 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     expect(net.shouldRetry).toBe(true);
   });
 
-  it("⑤ uncertain pending：bootstrap 见 active 则清除 uncertain；见 ledger 则终态", () => {
+  it("⑤ uncertain pending：bootstrap active 保留 uncertain（R41-1 fail-closed）；见 ledger 则终态", () => {
     const itemId = "cq_uncert_1";
     let pending = [
       { itemId, displayText: "u", uncertain: true },
     ];
     const settled: string[] = [];
 
-    // 仍在 active → 确认受理
+    // 仍在 active → 只单调 join，不得清 uncertain（无因果版本）
     const alive = reconcilePendingWithQueueState(
       pending,
       settled,
@@ -807,7 +807,8 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
       [],
     );
     expect(alive.pending).toHaveLength(1);
-    expect(alive.pending[0]?.uncertain).toBe(false);
+    expect(alive.pending[0]?.uncertain).toBe(true);
+    // applyProductJoin 会写入三轴；此处用投影字段 uncertain 断言 fail-closed
 
     // ledger 终态 → 清
     pending = [{ itemId, displayText: "u", uncertain: true }];

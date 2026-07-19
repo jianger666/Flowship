@@ -26,9 +26,16 @@
  *   reject **故意不交换**——注释与 permutation 测试对此分账：格 join 测三轴单调 OR/max；
  *   ack 清除单独测「当前位 → false，且不碰 persistence / terminalKnowledge」。
  *
+ * R41-1：bootstrap queue_state / operationSnapshot **没有** attempt generation / wire seq，
+ * 不能证明比本地 http_reject_network / unknown terminal 更新——故只能单调 join
+ * （可升 persistence、可重建 active），**禁止** clearAllUncertainty / 清 network 位。
+ * 本地仍 uncertain 时 UI 继续「发送状态未知」是 fail-closed：无因果版本的 snapshot
+ * 不能反驳本地证据；否则 draft 保留 + retry identity 被擦 → 同 payload 换新 id 双送。
+ *
  * 四个消费者统一走同一 join：
- *   1) live message_op（unknown → terminalKnowledge；known → 摘 pending）
- *   2) bootstrap queue_state（unknown recentSettled 走 join，禁止硬写降 persistence）
+ *   1) live message_op（unknown → terminalKnowledge；known → 摘 pending；
+ *      accepting/persisted 可 clearAllUncertainty——同流 live 证据）
+ *   2) bootstrap queue_state（只单调 join；unknown recentSettled 升 terminalKnowledge）
  *   3) HTTP commitHttpChatReply（清草稿看 terminalKnowledge；ack 只清 network）
  *   4) findReusableUncertainOperation（networkUncertain | terminalKnowledge=unknown）
  */
@@ -265,8 +272,9 @@ export const joinProductState = (
 /**
  * 把增量证据合入当前 product-state。
  * - 轴提升走格 join
- * - clearNetworkUncertain：定向清 network 位（transport ack）
- * - clearAllUncertainty：server active / known accepting 正证据，清两不确定轴
+ * - clearNetworkUncertain：定向清 network 位（仅同一次 HTTP queued/direct ack）
+ * - clearAllUncertainty：仅 live message_op accepting/persisted（同流正证据）；
+ *   bootstrap queue_state **不得**走此入口（无因果版本，见模块顶 R41-1）
  */
 export type ProductStateIncoming = {
   persistence?: PersistenceAxis;
@@ -489,8 +497,9 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-2 / R33-1 / R36-4 / R40-1：SSE 重连 bootstrap 对账。
+ * R32-2 / R33-1 / R36-4 / R40-1 / R41-1：SSE 重连 bootstrap 对账。
  * unknown recentSettled 走同一 product join——不得硬写降 persistence。
+ * active 分支只单调 join：可升 persistence，不得清 network / unknown（无因果版本）。
  */
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -539,20 +548,14 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
 
   for (const p of pending) {
     const cur = readProduct(p);
-    // 仍在服务端存活集合 → 保留；snapshot 可提升 persistence；active 正证据清不确定轴
+    // 仍在服务端存活集合 → 保留；snapshot 只可提升 persistence（单调 join）。
+    // R41-1：不得 clearAllUncertainty——bootstrap 无 attempt generation，不能反驳
+    // 本地 network reject / unknown terminal；保留 uncertain 投影是 fail-closed。
     if (serverSet.has(p.itemId)) {
       const snap = snapshotById.get(p.itemId);
       let next = applyProductJoin(p, {});
       if (snap?.phase === "persisted") {
         next = applyProductJoin(next, { persistence: "persisted" });
-      }
-      // 仍在 server active → 正证据覆盖旧 network / unknown_terminal
-      const nextProduct = readProduct(next);
-      if (
-        nextProduct.networkUncertain ||
-        nextProduct.terminalKnowledge === "unknown"
-      ) {
-        next = applyProductJoin(next, { clearAllUncertainty: true });
       }
       nextPending.push(next);
       seenPending.add(p.itemId);
@@ -736,7 +739,8 @@ export const reduceChatOperation = (
       const { itemId } = action;
       if (!itemId) return { state };
 
-      // 非终态 phase：提升 persistence；正证据清不确定轴
+      // live message_op 非终态：同流正证据——可升 persistence 并清不确定轴
+      // （与 bootstrap queue_state 不同：live 有因果次序，bootstrap 没有）
       if (action.phase === "accepting" || action.phase === "persisted") {
         const pending = state.pending.map((p) => {
           if (p.itemId !== itemId) return p;

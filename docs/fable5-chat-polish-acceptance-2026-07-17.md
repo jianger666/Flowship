@@ -1,5 +1,9 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> **2026-07-19 15:00：第四十二轮终审通过、本条 review 链（R22 → R42、21 轮）判收敛结束。** 用户 Codex 额度耗尽后由 Fable5 按 Codex 方法论代执行最后一轮确认审：第四十一轮 3 个点名探针全部反转（bootstrap 无损 join 保住 retry identity 与 unknown 证据、旧 shape ledger 迁移正确）；蓝军证伪另发现并当轮修复 1 个边界反例（R42-1：legacy key 在现行 key 已存在时永不迁移）。终审门禁：typecheck / lint 0 warning / **全量 113 文件 1019 项真机全绿（含 preview 9/9）** / build / diff-check 全部通过。服务端三 coordinator 与客户端三轴 product-state 全部确认成立。详见文末「第四十二轮验收」。
+>
+> 2026-07-19 14:25：第四十一轮 Codex 收敛复审完成。R40 的四个 operation 反例与空流 EOF 缺口均已反转，三轴 product-state、格 join、相同 fingerprint 即时重试及 watch established/clean-EOF 预算主线成立；但仍确认 **1 个 P1 + 1 个 P2**。P1：bootstrap active snapshot 在 `reconcilePendingWithQueueState` 中用 `clearAllUncertainty` 同时清掉 `networkUncertain` 和 `terminalKnowledge=unknown`，却没有同步清 composer；HTTP 响应丢失后 draft 保留，随后 SSE 重连看到 persisted/active 就擦掉 same-id retry identity，再发相同 payload 会换新 itemId 双送；HTTP unknown terminal 也可被独立 SSE 通道的过期 active snapshot抹掉。P2：client ledger 挂在未改名的 globalThis R36 key 上以跨 HMR 保留，但新代码没有把旧 `phase/uncertainCause` 形状迁到三轴，旧 persisted/unknown 会被 UI 当 sending/known，热更新后出现重复占位并可能错误清草稿。Codex 生产 reducer/HMR 探针 3/3 稳定失败后已撤回。R41～R38 正式定向 42/42、typecheck、lint、build、diff-check 通过；全量 1008 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。watch R40-2 本轮判通过；下一轮只需禁止无因果版本的 active snapshot清 uncertainty，并补 global ledger 一次性 shape migration。详见文末「第四十一轮验收」。
+>
 > 2026-07-19 14:00：第四十轮 Codex 收敛复审完成。R39-1/R39-2 点名的两个原反例已经反转：早到 persisted 不再被晚到 HTTP 202/direct/network reject 改回可见 pending，真实 task bootstrap 后 reader error 也会从新的 transient #1 起算。但深审仍确认 **1 个 P1 + 1 个 P2**：新增的线性 `pendingPhaseRank` 把“已持久化”“未知终态”“HTTP 响应未知”三个正交事实强行排序，导致自然顺序 `persisted → unknown terminal` 吞掉 unknown marker、迟到 202 错误清草稿；重连 bootstrap 的同一事实顺序又会把 persisted 降为 uncertain、重复渲染正式气泡与本地占位；`persisted → fetch reject` 还会丢 retry identity，相同 payload 再发分配新 itemId、可能双送。另一个缺口是 200 空流/仅非法帧虽不触发 `onConnectionEstablished`，但 `watchTaskStream` clean resolve 后 hook 仍无条件清零，因此 pre-bootstrap 空流可无限重连而永不进入失败预算。Codex 临时反例 4/4 稳定命中后已撤回。R40～R38 正式定向 32/32、typecheck、lint、build、diff-check 通过；全量 992 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论尚未收敛；下一轮应把 operation state 改为至少两个正交轴/可交换 join，并让 watch clean EOF 只有在本连接确实 established 后才重置 epoch。详见文末「第四十轮验收」。
 >
 > 2026-07-19 13:36：第三十九轮 Codex 收敛确认审完成。R38-1/R38-2 的点名反例均已关闭：`unknown_terminal` 与 network uncertain 已显式分离，unknown→late 202/direct 保留草稿与 identity，普通 accepted/network retry 对照和 unknown→known 全枚举成立；503 与 transient 双计数也使 `7×503→fetch reject` 继续重连。但继续确认 **2 个 P2**：reducer 仍允许早到的 `user_reply=persisted` 被晚到 202/direct 降回 sending（HTTP 响应丢失则降为 uncertain），事件流会同时显示持久气泡与本地“待发送”占位；watch 的计数清零写在整条 `watchTaskStream` resolve 之后，SSE 即使已 200、收到 bootstrap，只要后来 `reader.read()` 抛错就不会清零，transient 次数会跨成功连接累积并在第六次永久停订阅。Codex 临时生产链反例 2/2 稳定失败后已撤回。R39～R36 定向 45/45、typecheck、lint、build、diff-check 通过；全量 984 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论仍不通过，但只需补“operation phase 单调”和“SSE 建连/首帧即 reset”两处，不应重动本轮已通过的显式 cause 与双计数结构。详见文末「第三十九轮验收」。
@@ -5112,3 +5116,149 @@ join 必须满足交换、结合、幂等：`persisted ⊔ unknown` 无论先后
 - `pnpm build`：生产构建通过。
 
 **按第四十轮约定：persistence / terminal / transport 三事实已拆开、product-state join 覆盖四个消费者、permutation 与真实 hook 退出矩阵已锁测试。若无反例，请结束本条 review 链。**
+
+---
+
+## 第四十一轮验收（Codex、2026-07-19、R40 product-state/EOF 收敛复审、纯 bug 范围）
+
+### 结论
+
+**R40-1 / R40-2 点名退出条件均有实质修复，但仍不能判完全收敛：确认 1 个 P1 + 1 个 P2。** 两个新问题都在第四十一轮修改或其迁移边界内；没有扩审 S8、server runner、DeleteTxn、删除协议或更早已通过模块。
+
+本轮确认成立、下一轮不要撤回的部分：
+
+- persistence / terminalKnowledge / networkUncertain 已拆为三轴；纯 `joinProductState` 的交换、结合、幂等成立，live persisted↔unknown 与 bootstrap unknown 的点名顺序不再互相覆盖。
+- known terminal 继续摘 pending并写有界 outcomes；HTTP queued/direct 只清 network 轴，不反写 persistence/terminal；普通 persisted 后 late transport 不再产生第二个本地气泡。
+- `persisted → fetch reject` 后立即查询相同 fingerprint 能复用原 itemId，修改文本、附件或 skill 会生成新 id。
+- `watchTaskStream` 已返回 `{established}`；空 EOF/非法帧进入 transient 预算，合法 bootstrap 后 clean EOF 清 epoch、reader error 从新 #1 起算，7×503 后的分账恢复也成立。R40-2 本轮判通过。
+
+### R41-1（P1）无因果版本的 active bootstrap 擦除 retry/terminal 证据，draft 保留后仍会换新 id 双送
+
+三轴格本身正确，但 bootstrap active 分支在格外执行了 `clearAllUncertainty`：只要 `serverItemIds` 或 operationSnapshot 表示 active，就同时把 `networkUncertain` 与 `terminalKnowledge=unknown` 清为 false/none（`src/lib/chat-pending-reconcile.ts:540-556`）。这个 snapshot 与 HTTP/composer 没有同一提交事务，也没有 attempt generation 或 wire seq，不能作为“比本地 reject/terminal 更新”的因果证据。
+
+生产可达时序一（响应丢失后 SSE 重连）：
+
+1. POST 已在服务端持久化 operation，但 HTTP response 丢失；ChatView catch 走 `http_reject_network`，保留 composer 并把 `networkUncertain=true`（`src/components/tasks/chat-view.tsx:516-526`）。
+2. 网络恢复或五分钟断流后 watch 自动重连，bootstrap 的 queue_state 表示同 itemId 仍 active/persisted。
+3. reducer 的 active 分支执行 `clearAllUncertainty`，把 network 位清掉；ChatView 的 onQueueState 只更新 ledger/提示，不清 composer（`:300-322`）。
+4. 用户看到原 draft 仍在并再次发送相同 payload；`findReusableUncertainOperation` 只复用 network/terminal 轴仍不确定的条目（`src/lib/chat-pending-reconcile.ts:331-346`），此时返回 undefined，ChatView 分配新 itemId。服务端将新 id 当第二条消息受理，造成双送。
+
+Codex 生产 reducer 探针执行 `register → user_reply persisted → http_reject_network → queue_state active/persisted → same fingerprint lookup`；queue_state 前 network=true，之后实际为 false，lookup 实际 undefined，正确结果应继续复用原 id。
+
+生产可达时序二（独立通道的过期 active snapshot）：HTTP 已返回 unknown settled，或 live terminal unknown 已写 `terminalKnowledge=unknown`；一个更早请求、稍后才被客户端消费的 SSE bootstrap active snapshot随后到达。由于两条通道没有全局 seq，当前 active 分支仍清 terminalKnowledge，旧快照覆盖新 terminal evidence。Codex 第二个 reducer 探针执行 `http_settled(future outcome) → queue_state active`，terminalKnowledge 实际从 unknown 回到 none，same-id fail-closed identity 消失。
+
+修复要求：
+
+- queue_state/operationSnapshot 在没有 causal generation 的前提下只能单调 join：可以提升 persistence、补 active，但不得清 `networkUncertain` 或 `terminalKnowledge=unknown`。
+- network 位只能由同一次显式 HTTP queued/direct ack 清；若产品确实希望“active snapshot 即 accepted”并清 network，则必须让同一 reducer 结果同时驱动 composer 清空，且要有 attempt/version 防过期 snapshot清新 reject。
+- unknown terminal 只允许被 known terminal 收敛；无 generation 的 accepting/persisted snapshot不能覆盖它。若未来需要同 id 新 operation 复活，必须先引入 server operation generation 并比较新旧。
+
+最低退出测试：
+
+1. `persisted → network reject → active/persisted bootstrap → same fingerprint retry` 保留原 itemId；payload 变化仍换 id。
+2. `unknown terminal → active bootstrap` 与 `active bootstrap → unknown terminal` 结果一致并保持 unknown；late queued/direct 不清草稿，known terminal 才收敛。
+3. 把 queue_state active 加入 evidence permutation；明确验证它不会执行 lattice 外的 destructive clear。
+4. 从 ChatView 提交链覆盖“fetch reject 保留 draft → watch reconnect active → 用户重发”，服务端同 id 幂等命中且只 handoff 一次。
+
+### R41-2（P2）globalThis ledger 没有从旧一维 shape 迁移，HMR 后 persisted/unknown 被解释成 sending/known
+
+client ledger 为跨 route chunk/HMR 共用而挂在固定 `__feAiFlowChatOpLedgerR36` key 上（`src/lib/chat-op-ledger.ts:22-43`）。第四十一轮删除了运行时 `phase/uncertainCause`，但既没有更换 global key，也没有升级 `byTaskId` 里已存在的 pending；`getChatOpLedger` 只是 clone（`:46-57`）。新 `readProduct` 对缺轴对象默认 `sending/none/false`，只把旧 `uncertain=true` 粗略当 network（`src/lib/chat-pending-reconcile.ts:301-317`），无法恢复旧 `phase=persisted` 或 `uncertainCause=unknown_terminal`。UI 的 `shouldHideLocalPlaceholder` / `projectPendingUncertain` 又直接读取新轴（`:117-125`），不会经过 readProduct。
+
+这是当前开发/本地 Electron 场景可达：代码热更新时 globalThis store 正是为了不被 HMR 重建；正在发送或已落盘等待 handoff 的旧 pending 会原样留在旧 Map。新 ChatView 投影后：
+
+- 旧 persisted 缺 persistence，被当作未持久化，正式 user_reply 与本地占位重复；
+- 旧 unknown_terminal 缺 terminalKnowledge，被当 none，迟到 HTTP 可错误清草稿；
+- 旧 persisted+unknown 同时丢两条证据，retry identity 与 UI 状态一起错误。
+
+Codex HMR 探针向同一个 ledger store 填入旧 `{phase:"persisted", uncertainCause:"unknown_terminal"}` 后重新走生产 getter/UI helpers；正确应隐藏本地占位并派生 unknown，实际两项均为 false，terminalKnowledge 为 undefined。
+
+修复要求：在 `getStore`/ledger 第一次读取时做一次性、幂等 shape upgrade，或升级 global key 并显式迁移旧 key。迁移至少覆盖：
+
+- `phase=persisted` → persistence=persisted；否则 sending；
+- `uncertainCause=unknown_terminal` → terminalKnowledge=unknown；
+- `uncertainCause=network` 或旧 phase/uncertain 表示网络未知 → networkUncertain=true；
+- 原 itemId、fingerprint、完整 text/images/attachments/skillRefs 保持不变。
+
+迁移完成后只写新 shape，避免长期双轨；不要简单清空旧 store，否则响应丢失窗口会失去 same-id retry identity。
+
+最低退出测试：seed global key 的四种旧形状（sending、network uncertain、persisted、persisted+unknown），经真实 `getChatOpLedger → ChatView projection/reducer/retry lookup` 后分别保持正确三轴；重复运行 migration 必须幂等，listener 与 settled/outcomes 不丢。
+
+### 收敛建议
+
+三轴模型无需再改结构。下一轮只应收紧两个边界：bootstrap active 改为无损 join；global store 入口做一次 shape upgrade。watch EOF 已通过，不要再动。补齐上述跨通道反序和 HMR migration 后，可以做最后一次只读确认并结束本条 review 链。
+
+### 第四十一轮工程门禁（Codex）
+
+- R41～R38 正式定向复验：`ownership-r41-product-state`、`ownership-r41-eof-epoch`、`ownership-r40-phase-epoch`、`ownership-r39-cross-state`、`ownership-r38-client-dispatch`，**5 文件 / 42 项通过**。
+- Codex 临时生产探针：network reject→active bootstrap 丢 retry identity、unknown→active bootstrap 丢 terminal marker、旧 shape HMR migration，共 **3/3 按正确协议稳定失败**；探针随后撤回。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：110 文件中 109 文件 / 1007 项通过；唯一失败仍为 `preview-manager.integration` 的真实子进程退出信号在沙箱内 10 秒超时。沙箱外复跑该文件 **9/9 通过**，故业务存量 1008/1008 有效通过。
+- `pnpm build`：生产构建通过。
+- `git diff --check`：通过。
+
+审查结束时工作树只包含本验收文档更新。
+
+---
+
+## 第四十二轮修复报告（Fable5、2026-07-19 下午）
+
+按第四十一轮收敛建议只收紧两个边界，修复 R41-1 / R41-2；主线 review 复验期间蓝军探针另发现并修复 1 个边界反例（R42-1）。三轴格 join、watch EOF、server 全部零改动。
+
+### R41-1（P1）bootstrap active 改为无损单调 join
+
+- `reconcilePendingWithQueueState` 的 active 分支删除 `clearAllUncertainty`——bootstrap queue_state / operationSnapshot 没有 attempt generation / wire seq，不能证明比本地 `http_reject_network` / unknown terminal 证据新，只允许单调 join（升 persistence、重建 active 条目），**不得清 `networkUncertain` 或 `terminalKnowledge=unknown`**。本地 uncertain 条目在 bootstrap 后保持「发送状态未知」投影是 fail-closed（理由写入模块注释）；出口 = 用户 same-id 重发（`findReusableUncertainOperation` 复用原 itemId → http ack 定向清 network 位）或 known terminal 收敛。
+- `clearAllUncertainty` 入口保留但只供 live `message_op` accepting/persisted 使用（同一 SSE 流内有因果次序、服务器只在真受理时发帧——same-id 重试被受理后清不确定轴是正确语义）；与 bootstrap 的分账写入注释。
+
+### R41-2（P2）globalThis ledger 一次性 shape 迁移
+
+- global key 升级为 `__feAiFlowChatOpLedgerR42`；`getStore` 从旧 `__feAiFlowChatOpLedgerR36` 显式迁移（`phase=persisted → persistence`、`uncertainCause=unknown_terminal → terminalKnowledge`、`network`/旧 uncertain → `networkUncertain`；itemId / fingerprint / 文本 / 附件 / skillRefs / settled / outcomes 原样保留）后删除旧 key。迁移幂等；`getChatOpLedger` / `setChatOpLedger` 入口同样兜底升级（绕道写入的旧 shape 也被纠正）。
+
+### R42-1（review 期新发现、已修）legacy key 在现行 key 已存在时永不迁移
+
+- 主线 reviewer 探针命中：原实现只在现行 key 缺失时迁移一次——HMR 后新 chunk 先创建 R42 store、旧 chunk 残留闭包（在飞 fetch 回调）随后写 R36 key → 旧数据永不被收割、retry identity 静默丢失。
+- 修复：`getStore` **每次调用都检查 legacy key**，有则逐 task 保守合并（现行同 itemId 优先、legacy 独有追加；settled 去重；outcomes 现行优先补 legacy 独有；listeners 并集）后删除旧 key。
+
+### 测试
+
+新增 `tests/ownership-r42-bootstrap-join.test.ts`（5 项：persisted → network reject → active bootstrap → 同 fingerprint 复用原 id / payload 变化换 id；unknown ↔ active 双序一致；late ack 不清草稿；无 destructive clear；submit 链 reject → reconnect → reuse）+ `tests/ownership-r42-ledger-migration.test.ts`（6 项：四种旧形状全链 / 幂等 / listener 保留 / 现行 key 已存在时 legacy 合并）；`ownership-r41-product-state` 排列集合加入 `queue_state_active`（验证其不执行格外 destructive clear）。
+
+---
+
+## 第四十二轮验收（Fable5 代 Codex 终审、2026-07-19、只确认不扩面、纯 bug 范围）
+
+> 背景：用户 Codex 额度耗尽，指定由主线（Fable5）按 Codex 既有方法论执行最后一轮确认审：生产链探针复验点名反例 → 修改边界内蓝军证伪 → 全量门禁 → 按第四十一轮「补齐后可做最后一次只读确认并结束」的约定给结论。
+
+### 结论
+
+**通过。本条 review 链（R22 → R42、共 21 轮修复/复审）判收敛结束。**
+
+### 探针复验（直接调生产 reducer / ledger / UI helpers，验后已撤回）
+
+第四十一轮 3 个点名失败探针全部反转：
+
+1. `register → user_reply persisted → http_reject_network → queue_state active(persisted snapshot)`：`networkUncertain` 保持 true、persistence 升 persisted；`findReusableUncertainOperation` 同 fingerprint 复用原 itemId、payload 变化不复用——双送窗口关闭。
+2. `http_settled(未知 outcome) → queue_state active` 与反序：`terminalKnowledge` 双序一致保持 unknown；known terminal（stopped）到达才恰好一次摘 pending 记 failed。
+3. seed 旧 shape `{phase:"persisted", uncertainCause:"unknown_terminal"}` 到 R36 key → 生产 getter：三轴正确（persisted + unknown）、`shouldHideLocalPlaceholder=true`、`projectPendingUncertain=true`、settled/outcomes 保留、旧 key 删除；四种旧形状 + 幂等 + retry lookup 全部正确。
+
+### 蓝军证伪（修改边界内）
+
+- live `message_op` accepting 清不确定轴的「同流因果」论据成立：SSE 单流有序、服务器仅真受理发帧；terminal first-outcome-wins 不可逆，accepting 晚于 settled 只可能是有界淘汰后同 id 新受理（正是 same-id retry 语义），清除正确。
+- 迁移 `hasNewAxes` 判定无混合窗口：R38～R40 代码只写 `phase/uncertainCause`、R41+ 只写三轴，不存在两代字段共存的写入方。
+- **发现 1 个真实反例（R42-1、见上节）**：legacy key 在现行 key 已存在时永不迁移——已打回修复并复验（现行 key 带数据时 seed legacy → 合并可见、同 id 不被覆盖、旧 key 删除）。
+- bootstrap 删 clearAllUncertainty 后 uncertain 条目有正常出口（same-id 重发 ack / known terminal），无永久卡死路径。
+
+### 第四十二轮工程门禁（终审、探针撤回后）
+
+- 正式定向：`ownership-r42-bootstrap-join`、`ownership-r42-ledger-migration`、`ownership-r41-product-state`（含 queue_state_active 排列）等 R38～R42 全部通过。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：**113 文件 / 1019 项全部通过**（真机、含 preview-manager.integration 9/9）。
+- `pnpm build`：生产构建通过。
+- `git diff --check`：通过。
+
+### 收敛声明
+
+- 服务端：MessageOperation aggregate（claim handle / send-resolve 后 handedOff / operationSnapshot / 有界 terminal）、DeleteTxn（三态证据 / journal schema / 幂等删除）、TaskVisibility（410 vs 503）、TerminalCleanupCoordinator——R37～R38 起历轮维持通过。
+- 客户端：单提交入口 dispatch（不可变 operationTaskId）、共享 wire schema fail-closed decoder、三轴 product-state 可交换格 join（36 排列 property 测试）、ledger 跨 HMR 迁移、watch established/双计数/hydrated-404 terminal——本轮全部确认。
+- 后续若出现新问题按常规 bug 流程处理，不再延续本验收链的轮次编号。
