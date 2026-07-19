@@ -165,7 +165,8 @@ const TaskDetailPage = () => {
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
 
-  // R35-5：统一 terminal sink——SSE task_deleted / watch 404·410 只调 commitTaskDeleted
+  // R35-5 / R37-3：统一 terminal sink——SSE task_deleted / watch 410 / 已 hydrate 的 404
+  // 只调 commitTaskDeleted（503 unavailable 不进此 sink）
   // （列表 epoch / sticky 由 coordinator 通知；本页清 state；chat pending 由 ChatView 先清）
   const handleTaskDeleted = useCallback((deletedId: string) => {
     commitTaskDeleted(deletedId);

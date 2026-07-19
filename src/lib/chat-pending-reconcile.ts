@@ -10,6 +10,7 @@
 
 import type { ChatSkillRef } from "@/lib/chat-payload-fingerprint";
 import {
+  decodeMessageOpOutcome,
   isMessageOpActivePhase,
   normalizeWireOutcomeToLedger,
   type ClientLedgerOutcome,
@@ -77,6 +78,7 @@ export const allocClientChatQueueItemId = (): string => {
 /**
  * R32-1：把 itemIds 记入 settled（已有则跳过）；超 max 时 FIFO 丢最老。
  * 用于 SSE 终态早于 202、202 回来时禁止再插 pending。
+ * R37-5：仅裁 settled 数组；需要同步裁 outcomes 时走 rememberKnownTerminals。
  */
 export const rememberSettledItemIds = (
   settled: readonly string[],
@@ -95,6 +97,82 @@ export const rememberSettledItemIds = (
   return next.slice(next.length - max);
 };
 
+/** R37-5：outcomes 只保留仍在 settled 索引内的 key（与 FIFO 淘汰同一事务） */
+const pruneOutcomesToSettled = (
+  outcomes: Record<string, OpTerminalOutcome>,
+  settled: readonly string[],
+): Record<string, OpTerminalOutcome> => {
+  const keep = new Set(settled);
+  let changed = false;
+  const next: Record<string, OpTerminalOutcome> = {};
+  for (const [id, outcome] of Object.entries(outcomes)) {
+    if (!keep.has(id)) {
+      changed = true;
+      continue;
+    }
+    // R37-4：unknown 从不进 outcomes；防御性清掉历史脏值
+    if (outcome !== "delivered" && outcome !== "failed") {
+      changed = true;
+      continue;
+    }
+    next[id] = outcome;
+  }
+  return changed ? next : outcomes;
+};
+
+/**
+ * R37-4 / R37-5：只接受 known terminal（delivered/failed）进 settled + outcomes。
+ * unknown 调用方不得传入；first-outcome-wins；裁 settled 时同步删 outcomes key。
+ */
+export const rememberKnownTerminals = (
+  settled: readonly string[],
+  outcomes: Record<string, OpTerminalOutcome>,
+  entries: readonly { itemId: string; outcome: "delivered" | "failed" }[],
+  max = SETTLED_ITEM_IDS_MAX,
+): { settled: string[]; outcomes: Record<string, OpTerminalOutcome> } => {
+  if (entries.length === 0) {
+    return {
+      settled: [...settled],
+      outcomes: pruneOutcomesToSettled(outcomes, settled),
+    };
+  }
+  const seen = new Set(settled);
+  const nextSettled = [...settled];
+  const nextOutcomes = { ...outcomes };
+  for (const e of entries) {
+    if (!e.itemId) continue;
+    // R37-4：仅 known 终态占坑；已有 known 不覆盖（first-outcome-wins）
+    if (
+      nextOutcomes[e.itemId] !== "delivered" &&
+      nextOutcomes[e.itemId] !== "failed"
+    ) {
+      nextOutcomes[e.itemId] = e.outcome;
+    }
+    if (!seen.has(e.itemId)) {
+      seen.add(e.itemId);
+      nextSettled.push(e.itemId);
+    }
+  }
+  const trimmed =
+    nextSettled.length <= max
+      ? nextSettled
+      : nextSettled.slice(nextSettled.length - max);
+  return {
+    settled: trimmed,
+    outcomes: pruneOutcomesToSettled(nextOutcomes, trimmed),
+  };
+};
+
+/** R37-4：wire raw → known ledger outcome；未知/缺失 → null（不占终态） */
+export const decodeKnownLedgerOutcome = (
+  raw: string | undefined,
+): "delivered" | "failed" | null => {
+  if (raw == null || raw === "") return null;
+  const decoded = decodeMessageOpOutcome(raw);
+  if (!decoded.known) return null;
+  return decoded.outcome === "delivered" ? "delivered" : "failed";
+};
+
 /** R32-1：itemId 是否已有终态（user_reply / queue_failed / queue_state 幽灵清除） */
 export const isItemSettled = (
   settled: readonly string[],
@@ -106,29 +184,6 @@ export const getOpTerminalOutcome = (
   outcomes: Record<string, OpTerminalOutcome>,
   itemId: string,
 ): OpTerminalOutcome | undefined => outcomes[itemId];
-
-const rememberOutcome = (
-  outcomes: Record<string, OpTerminalOutcome>,
-  itemId: string,
-  outcome: OpTerminalOutcome,
-): Record<string, OpTerminalOutcome> => {
-  if (!itemId) return outcomes;
-  // first-outcome-wins：已有终态不覆盖（与 server ledger 对齐）
-  // R36-2：persisted 不是 outcome，不会占坑——后到的 failed 能生效
-  if (outcomes[itemId]) return outcomes;
-  return { ...outcomes, [itemId]: outcome };
-};
-
-const rememberOutcomes = (
-  outcomes: Record<string, OpTerminalOutcome>,
-  entries: readonly { itemId: string; outcome: OpTerminalOutcome }[],
-): Record<string, OpTerminalOutcome> => {
-  let next = outcomes;
-  for (const e of entries) {
-    next = rememberOutcome(next, e.itemId, e.outcome);
-  }
-  return next;
-};
 
 /**
  * R36-3：表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown。
@@ -313,10 +368,16 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
   settled: readonly string[],
+  outcomes: Record<string, OpTerminalOutcome>,
   serverItemIds: readonly string[],
   recentSettled: readonly { itemId: string; outcome?: string }[] = [],
   operationSnapshot: readonly MessageOpSnapshotEntry[] = [],
-): { pending: T[]; settled: string[]; ghostIds: string[] } => {
+): {
+  pending: T[];
+  settled: string[];
+  outcomes: Record<string, OpTerminalOutcome>;
+  ghostIds: string[];
+} => {
   const activeFromSnapshot = operationSnapshot
     .filter((e) => e.itemId && isMessageOpActivePhase(e.phase))
     .map((e) => e.itemId);
@@ -326,9 +387,25 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       .filter((e) => e.itemId)
       .map((e) => [e.itemId, e] as const),
   );
-  const ledgerIds = recentSettled.map((e) => e.itemId).filter(Boolean);
-  const ledgerSet = new Set(ledgerIds);
-  const nextSettled = rememberSettledItemIds(settled, ledgerIds);
+
+  // R37-4：只有 known outcome 才进 terminal；unknown recentSettled 不摘 pending、不占 outcomes
+  const knownTerminalEntries: {
+    itemId: string;
+    outcome: "delivered" | "failed";
+  }[] = [];
+  const unknownLedgerIds = new Set<string>();
+  for (const e of recentSettled) {
+    if (!e.itemId) continue;
+    const known = decodeKnownLedgerOutcome(e.outcome);
+    if (known) {
+      knownTerminalEntries.push({ itemId: e.itemId, outcome: known });
+    } else {
+      unknownLedgerIds.add(e.itemId);
+    }
+  }
+  const { settled: nextSettled, outcomes: nextOutcomes } =
+    rememberKnownTerminals(settled, outcomes, knownTerminalEntries);
+  const knownLedgerSet = new Set(knownTerminalEntries.map((e) => e.itemId));
   const settledSet = new Set(nextSettled);
   const ghostIds: string[] = [];
   const nextPending: T[] = [];
@@ -357,8 +434,18 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       seenPending.add(p.itemId);
       continue;
     }
-    // R33-1：ledger / 本地已 settled → 清 pending（终态可重放）
-    if (ledgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
+    // R33-1 / R37-4：仅 known ledger / 本地已 settled → 清 pending
+    if (knownLedgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
+      seenPending.add(p.itemId);
+      continue;
+    }
+    // R37-4：unknown recentSettled → 保留 pending 标 uncertain（可被后到 known 纠正）
+    if (unknownLedgerIds.has(p.itemId)) {
+      nextPending.push({
+        ...p,
+        uncertain: true,
+        phase: "uncertain" as const,
+      });
       seenPending.add(p.itemId);
       continue;
     }
@@ -368,7 +455,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       seenPending.add(p.itemId);
       continue;
     }
-    // R36-4：真幽灵——无 snapshot 证据也无终态 → uncertain/unknown，绝不 delivered
+    // R36-4：真幽灵——无 snapshot 证据也无终态 → uncertain，绝不 delivered
     ghostIds.push(p.itemId);
     nextPending.push({
       ...p,
@@ -382,7 +469,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   for (const snap of operationSnapshot) {
     if (!snap.itemId || !isMessageOpActivePhase(snap.phase)) continue;
     if (seenPending.has(snap.itemId) || settledSet.has(snap.itemId)) continue;
-    if (ledgerSet.has(snap.itemId)) continue;
+    if (knownLedgerSet.has(snap.itemId)) continue;
     nextPending.push({
       itemId: snap.itemId,
       displayText: "",
@@ -396,6 +483,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   return {
     pending: nextPending,
     settled: nextSettled,
+    outcomes: nextOutcomes,
     ghostIds,
   };
 };
@@ -504,17 +592,16 @@ export const reduceChatOperation = (
       return { state: { ...state, pending } };
     }
     case "queue_failed": {
-      const { pending, settled } = applyQueueFailedTerminal(
+      const pending = removePendingByQueueFailed(
         state.pending,
-        state.settled,
         action.itemIds,
       );
-      const outcomes = rememberOutcomes(
+      const { settled, outcomes } = rememberKnownTerminals(
+        state.settled,
         state.outcomes,
-        action.itemIds.map((itemId) => ({
-          itemId,
-          outcome: "failed" as const,
-        })),
+        action.itemIds
+          .filter(Boolean)
+          .map((itemId) => ({ itemId, outcome: "failed" as const })),
       );
       return { state: { pending, settled, outcomes } };
     }
@@ -541,44 +628,45 @@ export const reduceChatOperation = (
         return { state: { ...state, pending } };
       }
 
-      // handedOff 或 outcome → 终态
+      // handedOff 或 outcome → 终态；R37-4：unknown 不进 settled/outcomes
       const rawOutcome =
         action.outcome ??
         (action.phase === "handedOff" ? "delivered" : undefined);
       if (rawOutcome == null && action.phase !== "handedOff") {
         return { state };
       }
-      const outcome = normalizeLedgerOutcome(
-        rawOutcome ?? "delivered",
+      const known = decodeKnownLedgerOutcome(
+        rawOutcome ?? (action.phase === "handedOff" ? "delivered" : undefined),
       );
-      const { pending, settled } = dropPendingByItemId(
-        state.pending,
+      if (!known) {
+        // 未知 wire：保持/标 uncertain，允许后到 known 纠正
+        return {
+          state: {
+            ...state,
+            pending: markPendingUncertain(state.pending, itemId),
+          },
+        };
+      }
+      const pending = state.pending.filter((p) => p.itemId !== itemId);
+      const { settled, outcomes } = rememberKnownTerminals(
         state.settled,
-        itemId,
-        { rememberSettled: true },
+        state.outcomes,
+        [{ itemId, outcome: known }],
       );
-      const outcomes = rememberOutcome(state.outcomes, itemId, outcome);
       return { state: { pending, settled, outcomes } };
     }
     case "queue_state": {
-      const { pending, settled, ghostIds } = reconcilePendingWithQueueState(
-        state.pending,
-        state.settled,
-        action.serverItemIds,
-        action.recentSettled,
-        action.operationSnapshot,
-      );
-      let outcomes = state.outcomes;
-      for (const e of action.recentSettled ?? []) {
-        if (!e.itemId) continue;
-        outcomes = rememberOutcome(
-          outcomes,
-          e.itemId,
-          normalizeLedgerOutcome(e.outcome),
+      // R37-4/5：known recentSettled 与 outcomes 在 reconcile 内同一事务写入/淘汰
+      const { pending, settled, outcomes, ghostIds } =
+        reconcilePendingWithQueueState(
+          state.pending,
+          state.settled,
+          state.outcomes,
+          action.serverItemIds,
+          action.recentSettled,
+          action.operationSnapshot,
         );
-      }
-      // R36-4：ghost 只标 uncertain（上面 reconcile 已做），不写 outcomes——
-      // 避免 unknown 占坑挡后到的真终态；绝不写 delivered
+      // R36-4：ghost 只标 uncertain，不写 outcomes——绝不 delivered
       return { state: { pending, settled, outcomes }, ghostIds };
     }
     case "http_queued": {
@@ -617,17 +705,21 @@ export const reduceChatOperation = (
       };
     }
     case "http_settled": {
-      const outcome = normalizeLedgerOutcome(action.outcome);
-      const { pending, settled } = dropPendingByItemId(
-        state.pending,
+      // R37-1/4：缺失/未知 outcome 不合成 delivered、不进 settled；标 uncertain 可纠正
+      const known = decodeKnownLedgerOutcome(action.outcome);
+      if (!known) {
+        return {
+          state: {
+            ...state,
+            pending: markPendingUncertain(state.pending, action.itemId),
+          },
+        };
+      }
+      const pending = state.pending.filter((p) => p.itemId !== action.itemId);
+      const { settled, outcomes } = rememberKnownTerminals(
         state.settled,
-        action.itemId,
-        { rememberSettled: true },
-      );
-      const outcomes = rememberOutcome(
         state.outcomes,
-        action.itemId,
-        outcome,
+        [{ itemId: action.itemId, outcome: known }],
       );
       return { state: { pending, settled, outcomes } };
     }
@@ -681,8 +773,14 @@ export const reduceChatOperation = (
         state.settled,
         state.outcomes,
       );
+      // R37-5：settled FIFO 裁剪时同步 outcomes key
+      const { settled: nextSettled, outcomes } = rememberKnownTerminals(
+        settled,
+        state.outcomes,
+        [],
+      );
       return {
-        state: { ...state, pending, settled },
+        state: { pending, settled: nextSettled, outcomes },
         clearedIds,
       };
     }

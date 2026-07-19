@@ -525,7 +525,8 @@ export const watchTaskStream = async (
       typeof data === "object" && data && "error" in data
         ? String((data as { error: unknown }).error)
         : `HTTP ${res.status}`;
-    // R36-7：带 status；hook 仅对 410 走 deletion sink，503/404 当 unavailable 重试
+    // R36-7 / R37-3：带 status；hook 对 410 与已 hydrate 的 404 走 deletion sink，
+    // 503（证据 unknown）当 unavailable 持续重试、不 commit
     throw new ApiRequestError(msg, res.status);
   }
   if (!res.body) {
@@ -711,7 +712,11 @@ export const sendChatReply = async (
       /** R34-4：同 id 已在 recentSettled → 终态幂等 */
       settled: true;
       itemId: string;
-      outcome: string;
+      /**
+       * R37-1：缺失时保持 undefined（unknown），绝不合成 delivered。
+       * 调用方按 ledger / decoder 仲裁清草稿。
+       */
+      outcome?: string;
       task?: Task;
       /** 与其它分支对齐，settled 路径不会带此字段 */
       persistWarning?: undefined;
@@ -797,11 +802,12 @@ export const sendChatReply = async (
     persistWarning?: string;
   };
   // R34-4：幂等终态（同 id 已 settled）
+  // R37-1：缺失 / 非字符串 outcome 不得合成 delivered——保持 undefined → unknown
   if (data.settled === true && typeof data.itemId === "string") {
     return {
       settled: true,
       itemId: data.itemId,
-      outcome: typeof data.outcome === "string" ? data.outcome : "delivered",
+      ...(typeof data.outcome === "string" ? { outcome: data.outcome } : {}),
       task: data.task,
     };
   }

@@ -40,6 +40,7 @@
  *   done——旧「收到 done 就不再重连」会让页面在任意一轮后断流、后续 send 起的新 run 事件
  *   全收不到（实测：ask 弹窗答完永远卡「提交中」）。现在只有 done 里的 task 是业务终态
  *   （merged / abandoned、服务端也只在这种情况关流）才停止订阅、其余照常保持 / 重连。
+ * - **R37-3 / R37-6**：已 hydrate watcher 的 404→deleted；503 unavailable 持续重试（不终止）。
  */
 
 import { useEffect, useRef } from "react";
@@ -49,15 +50,21 @@ import {
   watchTaskStream,
   type TaskStreamCallbacks,
 } from "@/lib/task-store";
-import { classifyWatchHttpStatus } from "@/lib/task-terminal";
+import {
+  classifyWatchHttpStatus,
+  isTaskTerminalDeleted,
+  resolveWatchReconnectPolicy,
+  WATCH_CLEAN_RECONNECT_DELAY_MS,
+} from "@/lib/task-terminal";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
 
-export { classifyWatchHttpStatus };
-
-// 被动断流后重连退避：干净结束（maxDuration 到点）等这么久再连
-const RECONNECT_DELAY_MS = 1000;
-// 连续报错（网络断 / 服务端没起来）最多重试几次、超了才弹 onWatchException、避免无限刷
-const MAX_CONSECUTIVE_FAILURES = 6;
+export {
+  classifyWatchHttpStatus,
+  resolveWatchReconnectPolicy,
+  WATCH_CLEAN_RECONNECT_DELAY_MS,
+  WATCH_MAX_TRANSIENT_FAILURES,
+  WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
+} from "@/lib/task-terminal";
 
 export interface UseTaskWatchCallbacks {
   onEvent?: (ev: TaskEvent) => void;
@@ -91,8 +98,8 @@ export interface UseTaskWatchCallbacks {
     outcome?: string;
   }) => void;
   /**
-   * R33-4 / R35-5 / R36-7：task_deleted / watch 410 → 停重连。
-   * 调用方接到 `commitTaskDeleted`；503/404 不可走此 sink。
+   * R33-4 / R35-5 / R37-3：task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
+   * 调用方接到后 `commitTaskDeleted`；503 unavailable 不可走此 sink。
    */
   onTaskDeleted?: (taskId: string) => void;
 }
@@ -135,14 +142,16 @@ export const useTaskWatch = (
         }, ms);
       });
 
-    // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」才停止订阅
+    // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」/ deleted 才停
+    // enabled=true 隐含已 hydrate——404 可安全当物理删除完成（R37-3）
     const loop = async () => {
-      let failures = 0; // 连续报错次数、用于退避 + 兜底放弃
+      let failures = 0; // 连续报错次数、用于退避 + retryable 上限
+      let unavailableNotified = false; // unavailable 达阈值后只 toast 一次
       while (!cancelled) {
         // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
         // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
         let gotTerminalDone = false;
-        // R33-4：收到 task_deleted 后不再重连（任务已逻辑删除）
+        // R33-4 / R37-3：收到 task_deleted / 410 / hydrated-404 后不再重连
         let gotTaskDeleted = false;
         const sseCallbacks: TaskStreamCallbacks = {
           onEvent: (ev) => {
@@ -191,13 +200,17 @@ export const useTaskWatch = (
           onTaskDeleted: (deletedId) => {
             if (cancelled) return;
             gotTaskDeleted = true;
-            callbacksRef.current.onTaskDeleted?.(deletedId);
+            // 已 sticky 则不再回调，保证恰好一次进入 terminal / toast
+            if (!isTaskTerminalDeleted(deletedId)) {
+              callbacksRef.current.onTaskDeleted?.(deletedId);
+            }
           },
         };
 
         try {
           await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
           failures = 0; // 成功连过一次、清零退避
+          unavailableNotified = false;
         } catch (err) {
           if (
             (err as { name?: string }).name === "AbortError" ||
@@ -205,41 +218,50 @@ export const useTaskWatch = (
           ) {
             return;
           }
-          // R36-7：仅 410 = deleted → commit；503/404 = unavailable → 重试不 commit
+          // R37-3：本 hook 仅在 enabled（已 hydrate）时运行 → 404 可 commit deleted
           const status =
             err instanceof ApiRequestError
               ? err.status
               : (err as { status?: number }).status;
           const kind =
             typeof status === "number"
-              ? classifyWatchHttpStatus(status)
+              ? classifyWatchHttpStatus(status, { hydratedWatcher: true })
               : "retryable";
-          if (kind === "deleted") {
+
+          const decision = resolveWatchReconnectPolicy({
+            kind,
+            consecutiveFailures: failures,
+            unavailableNotified,
+          });
+
+          if (decision.action === "terminate_deleted") {
             gotTaskDeleted = true;
-            if (!cancelled) {
+            if (!cancelled && !isTaskTerminalDeleted(taskId)) {
               callbacksRef.current.onTaskDeleted?.(taskId);
             }
-          } else {
-            failures += 1;
-            if (failures >= MAX_CONSECUTIVE_FAILURES) {
-              if (!cancelled)
-                callbacksRef.current.onWatchException?.(err as Error);
-              return;
+          } else if (decision.action === "terminate_exhausted") {
+            if (!cancelled && decision.notifyException) {
+              callbacksRef.current.onWatchException?.(err as Error);
             }
-            // unavailable / 网络错：静默重试（不弹 toast、不 commit deleted）
+            return;
+          } else {
+            failures = decision.nextConsecutiveFailures;
+            unavailableNotified = decision.nextUnavailableNotified;
+            if (!cancelled && decision.notifyException) {
+              callbacksRef.current.onWatchException?.(err as Error);
+            }
+            // unavailable / 未达上限的 retryable：静默退避后继续 loop
+            await delay(decision.delayMs);
+            if (cancelled) return;
+            continue;
           }
         }
 
-        // 终态 done / task_deleted / 410（服务端已关流）→ 停止订阅
+        // 终态 done / task_deleted / 410 / hydrated-404 → 停止订阅
         if (cancelled || gotTerminalDone || gotTaskDeleted) return;
 
-        // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连
-        // 重连时服务端 bootstrap 会重发当前 task 快照、把断连期间漏掉的更新对齐回来
-        const backoff =
-          failures > 0
-            ? Math.min(failures * 1500, 8000)
-            : RECONNECT_DELAY_MS;
-        await delay(backoff);
+        // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 干净重连
+        await delay(WATCH_CLEAN_RECONNECT_DELAY_MS);
         if (cancelled) return;
       }
     };

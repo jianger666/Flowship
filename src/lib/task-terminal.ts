@@ -1,12 +1,13 @@
 /**
- * R35-5 / R36-7：client TaskTerminalCoordinator（sticky deleted）
+ * R35-5 / R36-7 / R37-3：client TaskTerminalCoordinator（sticky deleted）
  *
  * 进程内唯一 terminal identity：同 taskId 一旦 deleted，迟到的 detail / list /
  * chat mutation 200 一律不得复活 UI。挂 globalThis 防 route-chunk / HMR 分裂。
  *
  * 三个入口只调 `commitTaskDeleted`：
  * 1) SSE `task_deleted` 帧
- * 2) watch 410（明确 committed delete；503/404 unavailable 不得走此 sink）
+ * 2) watch 410，以及「已 hydrate watcher」的 404 not_found（完整物理删除后
+ *    journal 已清；证据 unknown 由 server 独立编码为 503，不得走此 sink）
  * 3) 本 tab DELETE 成功
  */
 
@@ -40,18 +41,109 @@ const getStore = (): TaskTerminalStore => {
   return g[GLOBAL_KEY];
 };
 
+/** watch HTTP → visibility 的三类结果 */
+export type WatchHttpVisibility = "deleted" | "unavailable" | "retryable";
+
 /**
- * R36-7：watch HTTP 状态 → visibility。
+ * R37-3：分类上下文——404→deleted 只对「已成功 hydrate 的 watcher」安全。
+ * 非 watch / 未 hydrate 的 404 仍按 unavailable（不 commit）。
+ */
+export type ClassifyWatchHttpContext = {
+  /** 当前订阅是否从已 hydrate 的 task 启动（useTaskWatch enabled 时恒为 true） */
+  hydratedWatcher: boolean;
+};
+
+/**
+ * R36-7 / R37-3：watch HTTP 状态 → visibility。
  * - 410 = 明确 deleted（可 commit sticky）
- * - 503 / 404 = unavailable（旧 404 过渡语义；重试、不 commit）
- * - 其它 = 可重试
+ * - 503 = unavailable（journal/tombstone I/O 证据未知；重试、不 commit）
+ * - 404 = 已 hydrate watcher → deleted（物理删完 journal 已清）；否则 unavailable
+ * - 其它 = 可重试（含 5xx 非 503）
  */
 export const classifyWatchHttpStatus = (
   status: number,
-): "deleted" | "unavailable" | "retryable" => {
+  context: ClassifyWatchHttpContext,
+): WatchHttpVisibility => {
   if (status === 410) return "deleted";
-  if (status === 503 || status === 404) return "unavailable";
+  if (status === 503) return "unavailable";
+  if (status === 404) {
+    // 已 hydrate：任务曾存在；server 把证据 unknown 编成 503，故此处 404 = 删干净
+    return context.hydratedWatcher ? "deleted" : "unavailable";
+  }
   return "retryable";
+};
+
+/** 普通网络错 / 非 HTTP 失败的连续重试上限（达则终止 loop） */
+export const WATCH_MAX_TRANSIENT_FAILURES = 6;
+/** unavailable（503）退避上限——持续重试，不因次数终止 */
+export const WATCH_UNAVAILABLE_BACKOFF_CAP_MS = 12_000;
+/** 干净断流（无失败）后的重连间隔 */
+export const WATCH_CLEAN_RECONNECT_DELAY_MS = 1_000;
+
+/**
+ * R37-6：watch 失败后的重连策略（纯函数）。
+ *
+ * - deleted → 立即终止（由调用方 commit terminal）
+ * - unavailable → 有上限间隔的持续重试；达阈值可提示一次但不终止
+ * - retryable（fetch reject 等）→ 保留旧语义：连续失败达上限后终止并提示
+ */
+export type WatchReconnectDecision =
+  | { action: "terminate_deleted" }
+  | {
+      action: "terminate_exhausted";
+      /** 是否回调 onWatchException */
+      notifyException: true;
+    }
+  | {
+      action: "retry";
+      delayMs: number;
+      nextConsecutiveFailures: number;
+      notifyException: boolean;
+      nextUnavailableNotified: boolean;
+    };
+
+export const resolveWatchReconnectPolicy = (input: {
+  kind: WatchHttpVisibility;
+  /** 进入本次失败前的连续失败次数 */
+  consecutiveFailures: number;
+  /** unavailable 是否已提示过一次（避免 toast 刷屏） */
+  unavailableNotified: boolean;
+}): WatchReconnectDecision => {
+  if (input.kind === "deleted") {
+    return { action: "terminate_deleted" };
+  }
+
+  const nextConsecutiveFailures = input.consecutiveFailures + 1;
+  const delayMs = Math.min(
+    nextConsecutiveFailures * 1500,
+    WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
+  );
+
+  if (input.kind === "unavailable") {
+    // R37-6：503 等证据不可用必须活着重试到恢复或 terminal；阈值只提示一次
+    const notifyException =
+      nextConsecutiveFailures >= WATCH_MAX_TRANSIENT_FAILURES &&
+      !input.unavailableNotified;
+    return {
+      action: "retry",
+      delayMs,
+      nextConsecutiveFailures,
+      notifyException,
+      nextUnavailableNotified: input.unavailableNotified || notifyException,
+    };
+  }
+
+  // 普通网络错 / 其它 retryable：达上限终止，避免永久挂着刷异常
+  if (nextConsecutiveFailures >= WATCH_MAX_TRANSIENT_FAILURES) {
+    return { action: "terminate_exhausted", notifyException: true };
+  }
+  return {
+    action: "retry",
+    delayMs,
+    nextConsecutiveFailures,
+    notifyException: false,
+    nextUnavailableNotified: input.unavailableNotified,
+  };
 };
 
 /** R35-5：同 id 是否已进入 deleted terminal（sticky） */

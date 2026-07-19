@@ -4753,3 +4753,36 @@ Codex 临时容量反例写入 500 条 delivered 后，settled 正确为 200，o
 - `git diff --check`：通过。
 
 审查结束时所有临时反例均已撤回，未修改任何业务代码或正式测试；本节与文首摘要是 Codex 本轮唯一持久改动。
+
+---
+
+## 第三十八轮修复报告（Fable5、2026-07-19 下午、待复审）
+
+按第三十七轮「收敛建议」只动两块（client operation 单提交入口 + 删除终态补齐离线观察者），修复 R37-1～R37-6。已通过的 server runner / DeleteTxn / MessageOp aggregate 主体零改动（server 文件本轮只读）。
+
+### 块一：client operation 单提交入口（R37-1 / R37-2 / R37-4 / R37-5）
+
+- **HTTP 解码不再合成 delivered**（R37-1，`task-store.ts`）：`sendChatReply` settled 分支对缺失 / 非字符串 outcome 保持 `undefined`（→ decoder unknown），「硬补 delivered」已删。
+- **清草稿契约按 ledger 最终 outcome 仲裁**（R37-1，新 `src/lib/chat-submit-controller.ts`）：`commitHttpChatReply` 把 HTTP 结果提交进 reducer 后，只有 ledger 最终为明确 `delivered` 才返回 true（composer 清草稿）；failed / unknown 返回 false 保留草稿。反序场景（失败 `message_op` SSE 先到、202/200 HTTP 晚到）同样先查 ledger 已有终态、不凭 HTTP 2xx 返回 true。
+- **operation owner 不可变**（R37-2，`chat-op-ledger.ts` + `chat-view.tsx`）：ledger 升级为单提交入口 `dispatchChatOp(taskId, action)`（内部调纯 reducer、原子写回 per-task Map）+ `subscribeChatOp(taskId, listener)` 订阅；ChatView 不再自己拼 refs/outcomes。发请求时捕获不可变 `operationTaskId`，迟到回调只更新该 task 的 ledger；仅 `currentTaskId === operationTaskId` 才更新组件 UI / 调 `onTaskUpdate`（`shouldApplyTaskUpdateForOperation`）——A 的迟到响应不再把 B 页面切回 A；提交锁绑定 request token，A 的 finally 不释放 B 的锁。HTTP / SSE（user_reply / queue_failed / message_op / queue_state / done_clear）全走同一入口。
+- **unknown 不是终态**（R37-4，`chat-pending-reconcile.ts`）：只有 exhaustive decoder 的 known outcome（delivered / 失败枚举）才进 settled / 摘 pending / 占 first-outcome-wins；unknown（message_op 未知值、HTTP 缺 outcome、queue_state 未知 recentSettled）保留 pending 标 uncertain、不占 outcomes——后到的真实 stopped / delivered 恰好一次收敛。`rememberOutcome` 防御性清历史脏 unknown 值。
+- **outcomes 与 settled 同界**（R37-5）：`rememberKnownTerminals` 单一事务——裁 settled 到 200 条时同步删对应 outcomes key；active/persisted 不淘汰。
+
+### 块二：删除终态补齐离线观察者（R37-3 / R37-6）
+
+- **已 hydrate watcher 的 404 → deleted**（R37-3，`task-terminal.ts` + `use-task-watch.ts`）：`classifyWatchHttpStatus(status, { hydratedWatcher })`——watcher 从已成功 hydrate 的 task 启动（任务确实存在过）、server 已把证据 unknown 独立编码为 503，故该上下文的明确 404 只剩「物理删除完成、journal 已 GC」一种解释 → 恰好一次进入 `task_deleted` terminal（移除详情与侧栏）。503（journal/tombstone EIO）仍 unavailable、不 commit deleted；未 hydrate 上下文的 404 保持 unavailable。未引入 immortal receipt——server 零改动。
+- **503 持续重试**（R37-6，`resolveWatchReconnectPolicy` 纯函数）：`unavailable` 不再计入 6 次上限——持续重试（退避 cap 12s），达阈值只 toast 提示一次不终止 loop；只有组件卸载（abort）或 terminal（410 / task_deleted / hydrated-404）退出。普通网络错（fetch reject 等 retryable）保留 6 次上限语义（避免永久刷 toast；R36-7 恢复退出条件只要求证据 I/O 故障场景活着）。retry policy 抽成纯状态函数单独可测。
+
+### 测试
+
+新增 `tests/ownership-r38-client-dispatch.test.ts`（生产 `sendChatReply` mock Response：settled delivered / 10 个失败枚举 / 缺 outcome / 未知 outcome → 仅 delivered 清草稿；message_op failed 先到 × 202 晚到；A fetch deferred → 切 B → A→B / B→A 两序 resolve——ledger / pending / isSubmitting / task detail 全不串、切回 A 复用原 id；unknown → delivered / unknown → 每个失败枚举恰一次收敛；500 条 terminal 后 settled 与 outcomes key 集同为 200 且一致，9 项）+ `tests/ownership-r38-offline-terminal.test.ts`（真实 DELETE 清干净 taskDir/journal 后 hydrated-404 → 恰好一次 terminal + 清详情/侧栏；journal EIO 503 不 commit；fake timers 7×503 后 bootstrap 恢复、单 loop、toast 一次；普通网络错 6 次终止对照；410 立即 sticky，6 项）——第三十七轮 4 组失败反例全部反转。
+
+### 第三十八轮工程门禁（修复后，两代理合并主线复验）
+
+- `pnpm vitest run tests/ownership-r38-client-dispatch.test.ts tests/ownership-r38-offline-terminal.test.ts`：2 文件 / 15 项通过。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：**106 文件 / 975 项全部通过**（合并后全量）。
+- `pnpm build`：生产构建通过。
+
+**按第三十七轮收敛建议：只动了 client dispatch 与离线删除终态两块、server 已通过主体零改动；4 组失败反例已反转并锁测试。请下一轮做只确认、不扩面的收敛审。**

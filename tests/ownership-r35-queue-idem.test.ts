@@ -30,6 +30,7 @@ import {
   shouldInsertPendingAfter202,
 } from "@/lib/chat-pending-reconcile";
 import { ApiRequestError } from "@/lib/task-store";
+import { classifyWatchHttpStatus } from "@/lib/task-terminal";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r35-qi-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
@@ -246,20 +247,25 @@ const readWatchQueueState = async (
 };
 
 /**
- * R36-7：模拟 useTaskWatch catch——仅 410 → deletion sink；404/503 = unavailable 重试。
- * （hook 本身依赖 React；此处锁定与实现一致的决策契约）
+ * R36-7 / R37-3：模拟 useTaskWatch catch——410 与已 hydrate 的 404 → deletion sink；
+ * 503 = unavailable 重试。hook 本身依赖 React；此处锁定与实现一致的决策契约。
  */
 const resolveWatchCatchAsDeletion = (
   err: unknown,
+  hydratedWatcher: boolean = true,
 ): { deleted: boolean; shouldRetry: boolean } => {
   const status =
     err instanceof ApiRequestError
       ? err.status
       : (err as { status?: number }).status;
-  if (status === 410) {
+  if (typeof status !== "number") {
+    return { deleted: false, shouldRetry: true };
+  }
+  const kind = classifyWatchHttpStatus(status, { hydratedWatcher });
+  if (kind === "deleted") {
     return { deleted: true, shouldRetry: false };
   }
-  // 404/503/网络错 → 重试，不 commit deleted
+  // unavailable / retryable → 重试，不 commit deleted
   return { deleted: false, shouldRetry: true };
 };
 
@@ -375,6 +381,7 @@ describe("R34-4：QueueOperation 幂等受理", () => {
     const r = reconcilePendingWithQueueState(
       pending,
       settled,
+      {},
       listChatQueueItemIds(TASK_ID),
       listRecentSettled(TASK_ID),
     );
@@ -606,6 +613,7 @@ describe("R34-8：queue-priority head 全程 in-flight", () => {
     const recon = reconcilePendingWithQueueState(
       pending,
       settled,
+      {},
       qs.itemIds,
       qs.recentSettled,
     );
@@ -741,8 +749,8 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     expect(streaming).toBe("");
   });
 
-  it("⑤ 断线错过帧 → watch 404 unavailable 可重试；410 才 deletion sink", async () => {
-    // 先删任务目录模拟不可读（当前 server 仍可能回 404；client 按 unavailable）
+  it("⑤ 断线错过帧 → 已 hydrate 的 404 / 410 进 deletion sink；503 可重试", async () => {
+    // 先删任务目录模拟不可读（完整物理删除后 server 回 404）
     await fs.rm(taskDir(TASK_ID), { recursive: true, force: true });
 
     const res = await watchTaskGet(
@@ -753,11 +761,19 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     );
     expect(res.status).toBe(404);
 
-    // R36-7：404 → unavailable、可重试、不 commit deleted
+    // R37-3：已 hydrate watcher 的 404 → deleted（journal 已清的唯一解释）
     const decision = resolveWatchCatchAsDeletion(
       new ApiRequestError("not_found", 404),
+      true,
     );
-    expect(decision).toEqual({ deleted: false, shouldRetry: true });
+    expect(decision).toEqual({ deleted: true, shouldRetry: false });
+
+    // 未 hydrate 仍 unavailable
+    const cold = resolveWatchCatchAsDeletion(
+      new ApiRequestError("not_found", 404),
+      false,
+    );
+    expect(cold).toEqual({ deleted: false, shouldRetry: true });
 
     const d410 = resolveWatchCatchAsDeletion(
       new ApiRequestError("gone", 410),
@@ -765,7 +781,11 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     expect(d410.deleted).toBe(true);
     expect(d410.shouldRetry).toBe(false);
 
-    // 普通网络错仍可重试
+    // 503 / 普通网络错仍可重试、不 commit
+    const d503 = resolveWatchCatchAsDeletion(
+      new ApiRequestError("unavailable", 503),
+    );
+    expect(d503).toEqual({ deleted: false, shouldRetry: true });
     const net = resolveWatchCatchAsDeletion(new Error("fetch failed"));
     expect(net.deleted).toBe(false);
     expect(net.shouldRetry).toBe(true);
@@ -782,6 +802,7 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     const alive = reconcilePendingWithQueueState(
       pending,
       settled,
+      {},
       [itemId],
       [],
     );
@@ -793,6 +814,7 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     const done = reconcilePendingWithQueueState(
       pending,
       settled,
+      {},
       [],
       [{ itemId, outcome: "stopped" }],
     );
@@ -801,7 +823,7 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
 
     // 重启后空账本 → uncertain 保留（可同 id 重试），不当 ghost
     pending = [{ itemId, displayText: "u", uncertain: true }];
-    const empty = reconcilePendingWithQueueState(pending, [], [], []);
+    const empty = reconcilePendingWithQueueState(pending, [], {}, [], []);
     expect(empty.pending).toHaveLength(1);
     expect(empty.ghostIds).toEqual([]);
   });

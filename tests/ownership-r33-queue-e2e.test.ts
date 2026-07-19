@@ -583,7 +583,7 @@ describe("R32-2：SSE bootstrap queue_state 对账", () => {
       { itemId: "alive", displayText: "ok" },
       { itemId: "ghost", displayText: "gone" },
     ];
-    const r = reconcilePendingWithQueueState(pending, [], ["alive"]);
+    const r = reconcilePendingWithQueueState(pending, [], {}, ["alive"]);
     expect(r.pending.map((p) => p.itemId)).toEqual(["alive", "ghost"]);
     expect(r.pending.find((p) => p.itemId === "ghost")?.phase).toBe(
       "uncertain",

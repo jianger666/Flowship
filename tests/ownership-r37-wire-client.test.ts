@@ -7,7 +7,7 @@
  * ④ claim/persisted/handoff 前重连 → 保持 active（不 ghost 不 delivered）
  * ⑤ server 重启丢 ledger → uncertain 不 clearDraft
  * ⑥ 切 A→B→A 后同 payload 重试复用原 id
- * ⑦ watch 503/404 不 commit deleted；410/task_deleted 才 sticky
+ * ⑦ watch 503 / 未 hydrate 的 404 不 commit；410 / hydrated-404 / task_deleted 才 sticky
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -363,24 +363,31 @@ describe("R37-⑥ 跨路由 ledger 存活", () => {
 });
 
 describe("R37-⑦ watch 410 vs 503/404", () => {
-  it("503/404 不 commit；410/task_deleted 才 sticky", () => {
-    expect(classifyWatchHttpStatus(503)).toBe("unavailable");
-    expect(classifyWatchHttpStatus(404)).toBe("unavailable");
-    expect(classifyWatchHttpStatus(410)).toBe("deleted");
-    expect(classifyWatchHttpStatus(500)).toBe("retryable");
+  it("503 / 未 hydrate 的 404 不 commit；410 与 hydrated-404 / task_deleted 才 sticky", () => {
+    const hydrated = { hydratedWatcher: true };
+    const cold = { hydratedWatcher: false };
+
+    expect(classifyWatchHttpStatus(503, hydrated)).toBe("unavailable");
+    expect(classifyWatchHttpStatus(503, cold)).toBe("unavailable");
+    // 未 hydrate：404 仍 unavailable（避免冷启动误删）
+    expect(classifyWatchHttpStatus(404, cold)).toBe("unavailable");
+    // R37-3：已 hydrate watcher 的 404 = 物理删除完成
+    expect(classifyWatchHttpStatus(404, hydrated)).toBe("deleted");
+    expect(classifyWatchHttpStatus(410, hydrated)).toBe("deleted");
+    expect(classifyWatchHttpStatus(500, hydrated)).toBe("retryable");
 
     const taskId = "t_r37_watch";
     // 模拟 unavailable：不调用 commit
-    if (classifyWatchHttpStatus(404) === "deleted") {
+    if (classifyWatchHttpStatus(404, cold) === "deleted") {
       commitTaskDeleted(taskId);
     }
-    if (classifyWatchHttpStatus(503) === "deleted") {
+    if (classifyWatchHttpStatus(503, hydrated) === "deleted") {
       commitTaskDeleted(taskId);
     }
     expect(isTaskTerminalDeleted(taskId)).toBe(false);
 
     // 410 → sticky
-    if (classifyWatchHttpStatus(410) === "deleted") {
+    if (classifyWatchHttpStatus(410, hydrated) === "deleted") {
       commitTaskDeleted(taskId);
     }
     expect(isTaskTerminalDeleted(taskId)).toBe(true);

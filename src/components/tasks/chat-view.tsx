@@ -46,18 +46,23 @@ import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import {
   clearChatOpLedger,
+  dispatchChatOp,
   getChatOpLedger,
-  setChatOpLedger,
+  subscribeChatOp,
 } from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
   allocClientChatQueueItemId,
-  emptyChatOpState,
   findReusableUncertainOperation,
-  reduceChatOperation,
   type ChatOpState,
   type ChatOperation,
 } from "@/lib/chat-pending-reconcile";
+import {
+  commitHttpChatReject,
+  commitHttpChatReply,
+  shouldApplyTaskUpdateForOperation,
+  shouldReleaseSubmitLock,
+} from "@/lib/chat-submit-controller";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
   CHAT_ATTACHMENT_ONLY_TEXT,
@@ -126,6 +131,8 @@ export const ChatView = ({
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // R37-2：提交锁绑定 request token——旧 A finally 不得释放 B 的锁
+  const submitTokenRef = useRef<string | null>(null);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
   // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）
@@ -182,53 +189,14 @@ export const ChatView = ({
   onEventAppendRef.current = onEventAppend;
   onTaskDeletedRef.current = onTaskDeleted;
 
-  /** R35-2 / R36-10：reducer 结果写回 state/ref + per-task 共享 store */
-  const commitOpResult = useCallback(
-    (result: ReturnType<typeof reduceChatOperation>): typeof result => {
-      opSettledRef.current = result.state.settled;
-      opOutcomesRef.current = result.state.outcomes;
-      // uncertain 派生自 phase；persisted 仍留 ledger，UI 层过滤（见 pendingForStream）
-      const nextPending: PendingLocalReply[] = result.state.pending.map((p) => ({
-        ...p,
-        id: p.id ?? p.itemId,
-        uncertain: p.phase === "uncertain",
-      })) as PendingLocalReply[];
-      pendingLocalRepliesRef.current = nextPending;
-      setPendingLocalReplies(nextPending);
-      // 排队条只计 sending/uncertain（persisted 已有持久气泡）
-      const activeCount = nextPending.filter(
-        (p) => p.phase !== "persisted",
-      ).length;
-      setQueuedCount(activeCount > 0 ? activeCount : null);
-      // R36-10：跨路由存活
-      setChatOpLedger(taskIdRef.current, result.state);
-      return result;
-    },
-    [],
-  );
-
-  const readOpState = useCallback(
-    (): ChatOpState => ({
-      pending: pendingLocalRepliesRef.current,
-      settled: opSettledRef.current,
-      outcomes: opOutcomesRef.current,
-    }),
-    [],
-  );
-
-  // 切 task：清 streaming 等 UI 态；ledger 从共享 store 恢复（R36-10）
-  useEffect(() => {
-    setStreamingText("");
-    setIsSubmitting(false);
-    setStopping(false);
-    setLiveToolOutputs({});
-    setContextInfo(null);
-    setKeepHints("");
-    // R36-10：不 wipe ledger——从 per-task store 恢复 retry identity
-    const restored = getChatOpLedger(task.id);
-    opSettledRef.current = restored.settled;
-    opOutcomesRef.current = restored.outcomes;
-    const nextPending: PendingLocalReply[] = restored.pending.map((p) => ({
+  /**
+   * R37-2：把 ledger state 投影到组件 UI（仅当前订阅的 task）。
+   * 离屏 task 的 dispatch 不会打进这里——subscribe 按 taskId 隔离。
+   */
+  const applyLedgerToUi = useCallback((state: ChatOpState) => {
+    opSettledRef.current = state.settled;
+    opOutcomesRef.current = state.outcomes;
+    const nextPending: PendingLocalReply[] = state.pending.map((p) => ({
       ...p,
       id: p.id ?? p.itemId,
       uncertain: p.phase === "uncertain",
@@ -239,7 +207,22 @@ export const ChatView = ({
       (p) => p.phase !== "persisted",
     ).length;
     setQueuedCount(activeCount > 0 ? activeCount : null);
-  }, [task.id]);
+  }, []);
+
+  // 切 task：清 streaming 等 UI 态；订阅当前 task ledger（R36-10 / R37-2）
+  useEffect(() => {
+    setStreamingText("");
+    // R37-2：切走时作废旧提交锁，避免 A finally 误清 B、也避免 UI 锁残留
+    submitTokenRef.current = null;
+    setIsSubmitting(false);
+    setStopping(false);
+    setLiveToolOutputs({});
+    setContextInfo(null);
+    setKeepHints("");
+    // 立即投影当前 ledger，再订阅后续 dispatch
+    applyLedgerToUi(getChatOpLedger(task.id));
+    return subscribeChatOp(task.id, applyLedgerToUi);
+  }, [task.id, applyLedgerToUi]);
 
   // R36-2：persisted 已有持久气泡，不再渲染本地占位
   const pendingForStream = useMemo(
@@ -281,22 +264,16 @@ export const ChatView = ({
       if (ev.kind === "assistant_message") setStreamingText("");
 
       // R36-2：user_reply → 标 persisted（非终态），不写 delivered
+      // R37-2：SSE 绑当前 watch task.id，显式传入（不靠可变 ref 推断）
       if (ev.kind === "user_reply") {
-        commitOpResult(
-          reduceChatOperation(readOpState(), { type: "user_reply", ev }),
-        );
+        dispatchChatOp(task.id, { type: "user_reply", ev });
       }
 
       onEventAppendRef.current(ev);
     },
     // R35-2：整队作废 → reducer 记 failed
     onQueueFailed: (itemIds, reason) => {
-      commitOpResult(
-        reduceChatOperation(readOpState(), {
-          type: "queue_failed",
-          itemIds,
-        }),
-      );
+      dispatchChatOp(task.id, { type: "queue_failed", itemIds });
       if (itemIds.length > 0) {
         // R32-2：reason 不止 persist_failed——文案按语义区分
         toast.error(
@@ -308,28 +285,24 @@ export const ChatView = ({
     },
     // R36-2：message_op 成功/失败终态
     onMessageOp: ({ itemId, phase, outcome }) => {
-      commitOpResult(
-        reduceChatOperation(readOpState(), {
-          type: "message_op",
-          itemId,
-          phase,
-          outcome,
-        }),
-      );
+      dispatchChatOp(task.id, {
+        type: "message_op",
+        itemId,
+        phase,
+        outcome,
+      });
     },
     // R36-2/4：重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
     onQueueState: (serverItemIds, recentSettled, operationSnapshot) => {
       const before = pendingLocalRepliesRef.current.filter(
         (p) => p.phase !== "persisted",
       ).length;
-      const result = commitOpResult(
-        reduceChatOperation(readOpState(), {
-          type: "queue_state",
-          serverItemIds,
-          recentSettled,
-          operationSnapshot,
-        }),
-      );
+      const result = dispatchChatOp(task.id, {
+        type: "queue_state",
+        serverItemIds,
+        recentSettled,
+        operationSnapshot,
+      });
       const after = result.state.pending.filter(
         (p) => p.phase !== "persisted" && p.phase !== "uncertain",
       ).length;
@@ -352,9 +325,7 @@ export const ChatView = ({
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
       ) {
-        const result = commitOpResult(
-          reduceChatOperation(readOpState(), { type: "done_clear" }),
-        );
+        const result = dispatchChatOp(task.id, { type: "done_clear" });
         const n = (result.clearedIds ?? []).length;
         if (n > 0) {
           toast.message(
@@ -377,10 +348,8 @@ export const ChatView = ({
     onTaskDeleted: (deletedId) => {
       setStreamingText("");
       setLiveToolOutputs({});
+      dispatchChatOp(deletedId, { type: "clear_all" });
       clearChatOpLedger(deletedId);
-      commitOpResult(
-        reduceChatOperation(emptyChatOpState(), { type: "clear_all" }),
-      );
       // 父级会再调 commitTaskDeleted；此处先清本地，父级负责 sticky + 列表
       // 若父级未挂 onTaskDeleted，本处仍保证 sticky（双保险）
       if (onTaskDeletedRef.current) {
@@ -399,8 +368,10 @@ export const ChatView = ({
       attachments?: string[],
       skillRefs?: Array<{ name: string; absPath: string }>,
     ): Promise<boolean> => {
+      // R37-2：请求发起时捕获不可变 owner——迟到回调禁止读 taskIdRef.current 定账
+      const operationTaskId = task.id;
       // R35-5：已 deleted → 丢弃（含卸载后在飞 async）
-      if (!canCommitTaskSnapshot(taskIdRef.current)) return false;
+      if (!canCommitTaskSnapshot(operationTaskId)) return false;
 
       const args = prepareRunArgs(task);
       // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
@@ -414,30 +385,29 @@ export const ChatView = ({
         attachments,
         skills: skillRefs,
       });
+      // 从该 task 的 ledger 读（可能离屏后仍有 uncertain）
       const reuseUncertain = findReusableUncertainOperation(
-        pendingLocalRepliesRef.current,
+        getChatOpLedger(operationTaskId).pending,
         payloadFingerprint,
       );
       let clientItemId =
         reuseUncertain?.itemId ?? allocClientChatQueueItemId();
 
       const registerOp = (itemId: string) => {
-        commitOpResult(
-          reduceChatOperation(readOpState(), {
-            type: "register",
-            op: {
-              id: itemId,
-              itemId,
-              payloadFingerprint,
-              phase: "sending",
-              text,
-              displayText,
-              images,
-              attachments,
-              skillRefs,
-            },
-          }),
-        );
+        dispatchChatOp(operationTaskId, {
+          type: "register",
+          op: {
+            id: itemId,
+            itemId,
+            payloadFingerprint,
+            phase: "sending",
+            text,
+            displayText,
+            images,
+            attachments,
+            skillRefs,
+          },
+        });
       };
 
       if (!reuseUncertain) {
@@ -447,7 +417,7 @@ export const ChatView = ({
       /** 单次 POST；payload_mismatch 时外层转新 id 重试一次 */
       const postOnce = async (itemId: string): Promise<boolean> => {
         const result = await sendChatReply(
-          taskIdRef.current,
+          operationTaskId,
           text,
           images,
           attachments,
@@ -459,59 +429,38 @@ export const ChatView = ({
           itemId,
           payloadFingerprint,
         );
-        // R35-5：响应到达时 task 可能已删——不复活 UI
-        if (!canCommitTaskSnapshot(taskIdRef.current)) {
+        // R35-5：operation 所属 task 已删——不复活；草稿可丢
+        if (!canCommitTaskSnapshot(operationTaskId)) {
           return true;
         }
-        // R30-3：send 后落盘失败——不可忽略提示
-        if ("persistWarning" in result && result.persistWarning) {
+        // R37-1/2：HTTP → ledger 仲裁清草稿；owner=operationTaskId
+        const committed = commitHttpChatReply({
+          operationTaskId,
+          clientItemId: itemId,
+          result,
+        });
+        if (committed.persistWarning) {
           toast.error(
-            `消息已送达但记录保存失败：${result.persistWarning}`,
+            `消息已送达但记录保存失败：${committed.persistWarning}`,
           );
         }
-        if ("settled" in result && result.settled) {
-          commitOpResult(
-            reduceChatOperation(readOpState(), {
-              type: "http_settled",
-              itemId: result.itemId,
-              outcome: result.outcome,
-            }),
-          );
-          if (result.task && canCommitTaskSnapshot(result.task.id)) {
-            onTaskUpdateRef.current(result.task);
-          }
-          return true;
-        }
-        if ("queued" in result && result.queued) {
-          setQueuedCount(result.queuedCount);
-          commitOpResult(
-            reduceChatOperation(readOpState(), {
-              type: "http_queued",
-              itemId: result.itemId,
-            }),
-          );
-          if (result.task && canCommitTaskSnapshot(result.task.id)) {
-            onTaskUpdateRef.current(result.task);
-          }
-          return true;
-        }
-        // 200 非 queued：摘掉本条预登记 pending（真实气泡走 SSE user_reply）
-        commitOpResult(
-          reduceChatOperation(readOpState(), {
-            type: "http_direct_ok",
-            itemId,
-          }),
-        );
+        // R37-2：只有当前页仍是 A 才推父级 task 快照（防止把 B 切回 A）
         if (
-          "task" in result &&
-          result.task &&
-          canCommitTaskSnapshot(result.task.id)
+          committed.task &&
+          canCommitTaskSnapshot(committed.task.id) &&
+          shouldApplyTaskUpdateForOperation(
+            taskIdRef.current,
+            operationTaskId,
+          )
         ) {
-          onTaskUpdateRef.current(result.task);
+          onTaskUpdateRef.current(committed.task);
         }
-        return true;
+        return committed.clearDraft;
       };
 
+      // R37-2：锁绑定本请求 token
+      const submitToken = allocClientChatQueueItemId();
+      submitTokenRef.current = submitToken;
       setIsSubmitting(true);
       try {
         try {
@@ -523,12 +472,10 @@ export const ChatView = ({
             err.code === "payload_mismatch"
           ) {
             toast.message("上一条同 id 消息内容不同，已改用新 id 重发");
-            commitOpResult(
-              reduceChatOperation(readOpState(), {
-                type: "payload_mismatch",
-                itemId: clientItemId,
-              }),
-            );
+            dispatchChatOp(operationTaskId, {
+              type: "payload_mismatch",
+              itemId: clientItemId,
+            });
             clientItemId = allocClientChatQueueItemId();
             registerOp(clientItemId);
             try {
@@ -538,7 +485,7 @@ export const ChatView = ({
             }
           }
 
-          if (!canCommitTaskSnapshot(taskIdRef.current)) {
+          if (!canCommitTaskSnapshot(operationTaskId)) {
             // 已删：不保留草稿打扰
             return true;
           }
@@ -549,21 +496,19 @@ export const ChatView = ({
           const isBizReject =
             typeof status === "number" && status >= 400 && status < 500;
           if (isBizReject) {
-            commitOpResult(
-              reduceChatOperation(readOpState(), {
-                type: "http_reject_biz",
-                itemId: clientItemId,
-              }),
-            );
+            commitHttpChatReject({
+              operationTaskId,
+              clientItemId,
+              kind: "biz",
+            });
             toast.error(`回复失败：${(err as Error).message}`);
             return false;
           }
-          const net = commitOpResult(
-            reduceChatOperation(readOpState(), {
-              type: "http_reject_network",
-              itemId: clientItemId,
-            }),
-          );
+          const net = commitHttpChatReject({
+            operationTaskId,
+            clientItemId,
+            kind: "network",
+          });
           // SSE 终态先到 → clearDraft=true，视为已接受
           if (net.clearDraft) {
             return true;
@@ -572,10 +517,14 @@ export const ChatView = ({
           return false;
         }
       } finally {
-        setIsSubmitting(false);
+        // R37-2：只有本 token 仍是当前锁才释放——旧 A 不得解开 B
+        if (shouldReleaseSubmitLock(submitTokenRef.current, submitToken)) {
+          submitTokenRef.current = null;
+          setIsSubmitting(false);
+        }
       }
     },
-    [task, commitOpResult, readOpState],
+    [task],
   );
 
   // 停止当前正在跑的 chat agent
@@ -585,9 +534,7 @@ export const ChatView = ({
       const latest = await stopTask(task.id);
       setStreamingText("");
       // R36-2：stop 后只清已有明确终态；其余等 queue_failed / message_op
-      const result = commitOpResult(
-        reduceChatOperation(readOpState(), { type: "done_clear" }),
-      );
+      const result = dispatchChatOp(task.id, { type: "done_clear" });
       if (canCommitTaskSnapshot(latest.id)) {
         onTaskUpdateRef.current(latest);
       }
@@ -601,7 +548,7 @@ export const ChatView = ({
     } finally {
       setStopping(false);
     }
-  }, [task.id, commitOpResult, readOpState]);
+  }, [task.id]);
 
   // 重命名对话
   const handleRename = useCallback(async () => {

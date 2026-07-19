@@ -437,6 +437,7 @@ describe("R33-1：SSE 断线 + recentSettled bootstrap", () => {
     const r = reconcilePendingWithQueueState(
       pending,
       settled,
+      {},
       queueState!.itemIds ?? [],
       queueState!.recentSettled ?? [],
     );
@@ -452,6 +453,7 @@ describe("R33-1：SSE 断线 + recentSettled bootstrap", () => {
     const r = reconcilePendingWithQueueState(
       [],
       [],
+      {},
       [],
       [{ itemId: "cq_early", outcome: "stopped" }],
     );
