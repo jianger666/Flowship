@@ -32,7 +32,7 @@ const execFileAsync = promisify(execFile);
 
 // ----------------- per-task「启动中」计数（入队 → spawn 完成） -----------------
 
-const PREVIEW_STARTING_KEY = "__feAiFlowPreviewStartingV1__";
+const PREVIEW_STARTING_KEY = "__flowshipPreviewStartingV1__";
 const getPreviewStartingMap = (): Map<string, number> => {
   const g = globalThis as unknown as Record<
     string,
@@ -108,7 +108,7 @@ interface PreviewSlot extends Omit<PreviewSlotStatus, "logTail"> {
 // ----------------- 进程级单例（dev hot reload 下不同 chunk 共享） -----------------
 
 // V2：按 repoPath 多预览位；换 key 名避免 hot reload 残留 V1 单 slot 结构
-const SLOTS_KEY = "__feAiFlowPreviewSlotsV2__";
+const SLOTS_KEY = "__flowshipPreviewSlotsV2__";
 const getSlotsRef = (): Map<string, PreviewSlot> => {
   const g = globalThis as unknown as Record<string, Map<string, PreviewSlot> | undefined>;
   if (!g[SLOTS_KEY]) g[SLOTS_KEY] = new Map();
@@ -117,7 +117,7 @@ const getSlotsRef = (): Map<string, PreviewSlot> => {
 
 // start / stop 全局串行队列（CR-10）：并发双 start / start+stop 交错会导致
 // 「先起的进程变孤儿没人能停」「stop 停掉的是别人」——所有变更操作排队执行
-const QUEUE_KEY = "__feAiFlowPreviewOpQueueV1__";
+const QUEUE_KEY = "__flowshipPreviewOpQueueV1__";
 const getQueueRef = (): { current: Promise<void> } => {
   const g = globalThis as unknown as Record<
     string,

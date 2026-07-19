@@ -488,7 +488,7 @@ type RuntimeSingleton = {
   exitHooked: boolean;
 };
 
-const RUNTIME_KEY = "__feAiFlowFeishuBridgeRuntimeV1__";
+const RUNTIME_KEY = "__flowshipFeishuBridgeRuntimeV1__";
 
 const getRuntime = (): RuntimeSingleton => {
   const g = globalThis as unknown as Record<

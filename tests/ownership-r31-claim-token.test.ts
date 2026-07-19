@@ -28,7 +28,7 @@ import type { Task } from "@/lib/types";
 const TMP_ROOT = mkdtempSync(
   path.join(os.tmpdir(), "fe-ownership-r31-claim-token-"),
 );
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();
@@ -296,9 +296,9 @@ describe("ownership R31 claim token + ask outcome", () => {
   afterEach(async () => {
     clearFailpoints();
     const g = globalThis as unknown as {
-      __feAiFlowActionSideEffectWaitMs?: number;
+      __flowshipActionSideEffectWaitMs?: number;
     };
-    delete g.__feAiFlowActionSideEffectWaitMs;
+    delete g.__flowshipActionSideEffectWaitMs;
     for (const id of ids) {
       clearActionSideEffects(id);
       runningChecks.delete(id);

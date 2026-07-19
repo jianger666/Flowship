@@ -30,7 +30,7 @@ alwaysApply: true
     2. `node scripts/assemble-electron-server.mjs`——从 standalone 重组 `dist/app-server`（内部先 rm 再 cp + 补 SDK 平台包）
     3. `pnpm electron:dist:test`——afterPack（`scripts/electron-after-pack.mjs`）把 `dist/app-server` 拷进「FlowshipTest.app」（productName 带 test）+ ad-hoc 签名
     ⚠️ `electron:dist:test` **只拷不组**：afterPack 源固定是 `dist/app-server`、自己不 build / 不 assemble。漏掉第 1、2 步 → 打进包的是上一次的旧 `dist/app-server`（产物 mtime 会骗你说是新的、但内容是旧的）。核验：`grep -c <本次新增/删除的文案> "dist/electron/mac-arm64/FlowshipTest.app/Contents/Resources/app-server/.next/server/app/index.html"`。
-  - 壳探测到名字带 test（或 env `FE_AI_FLOW_TEST=1`）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**、单实例锁天然独立（按 userData 算）
+  - 壳探测到名字带 test（或 env `FLOWSHIP_TEST=1`、旧名 FE_AI_FLOW_TEST 已改）自动切：端口 **8776**、数据目录 **fe-ai-flow-test**（目录名不改、用户数据在里面）、单实例锁天然独立（按 userData 算）
   - 要关 / 删的话（用户主动说时）动的也是「FlowshipTest」（名字带 test）、不会误伤正式应用
 - 验证写法：`open dist/electron/mac-arm64/FlowshipTest.app` + `curl 127.0.0.1:8776/...`。**验完默认不关窗、不删包**（见下条）。
 - **⚠️ 重打包后 TCC 文件权限会重置、锁屏时验 task 模式必假卡死（2026-07-07 踩过、排查 1 小时）**：ad-hoc 签名每次重打都变、macOS 把新包当新 app、agent 子进程首次访问 `~/Documents` 下的仓库要重新弹「文件与文件夹」授权——**用户不在电脑前 / 锁屏时弹窗出不来、系统调用直接永久挂起**（采样实锤：git 挂在 `getcwd→open` 内核调用、Agent.create 卡 20 分钟无报错）。表现三件套：chat 模式正常（cwd=home 不受限）、独立终端跑 SDK 正常（终端有权限）、只有 app 里 task 模式挂。规避：① 冒烟 task 模式必须屏幕解锁、人在电脑前点掉授权弹窗；② 一劳永逸——系统设置→隐私与安全→完全磁盘访问 给「AI工作流test」勾上；③ 绕开法：用 `/tmp` 下的临时仓验链路（不触发 TCC）、但 skills 在 app bundle（Documents 下）里、agent 读 skill 仍会卡——治标不治本、优先 ②（给「FlowshipTest」勾完全磁盘访问）。

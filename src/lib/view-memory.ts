@@ -19,7 +19,7 @@ const ss = (): Storage | null => {
 
 // ---------- 最后浏览的对话（胶囊切回「对话」时优先落它、不是最近活跃那条） ----------
 
-const LAST_CHAT_KEY = "fe-ai-flow:last-chat-id";
+const LAST_CHAT_KEY = "flowship:last-chat-id";
 
 export const rememberLastChat = (taskId: string) => {
   ss()?.setItem(LAST_CHAT_KEY, taskId);
@@ -32,7 +32,7 @@ export const getLastChatId = (): string | null =>
 
 // scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条）
 const draftKey = (scope: string, taskId: string) =>
-  `fe-ai-flow:draft:${scope}:${taskId}`;
+  `flowship:draft:${scope}:${taskId}`;
 
 export const loadDraft = (scope: string, taskId: string): string =>
   ss()?.getItem(draftKey(scope, taskId)) ?? "";
@@ -69,7 +69,7 @@ export const getScrollAnchor = (taskId: string): ScrollAnchor | undefined =>
 // localStorage（跨重启保留、丢了会重新全亮很烦）：{ [taskId]: 最后打开详情的时间戳 }。
 // 判定在消费方：seenAt >= task.updatedAt = 已读（交卷后没再有新动静）。
 
-const SEEN_KEY = "fe-ai-flow:task-seen";
+const SEEN_KEY = "flowship:task-seen";
 // 防无限膨胀：只保留最近 300 个任务的记录
 const SEEN_CAP = 300;
 
@@ -110,7 +110,7 @@ export const getTaskSeenAt = (taskId: string): number =>
 
 // ---------- 输入条拖过的高度（全局偏好、跨任务共用） ----------
 
-const BOX_HEIGHT_KEY = "fe-ai-flow:talk-box-height";
+const BOX_HEIGHT_KEY = "flowship:talk-box-height";
 
 export const loadBoxHeight = (): number | null => {
   try {
@@ -131,7 +131,7 @@ export const saveBoxHeight = (h: number) => {
 
 // ---------- 看板时间范围（会话级：改过区间切页不重置、重启回默认防陈旧日期） ----------
 
-const BOARD_RANGE_KEY = "fe-ai-flow:board-range";
+const BOARD_RANGE_KEY = "flowship:board-range";
 
 export const loadBoardRange = (): { from: number; to: number } | null => {
   try {

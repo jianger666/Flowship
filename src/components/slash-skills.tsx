@@ -113,7 +113,7 @@ export const resolveSkillReferences = (
 
 // 跨页 handoff：别处（如设置页「对话创建 skill」）跳转进对话前写入、
 // 输入框 mount 时消费一次——往草稿头部插入 `/skill-name `（用完即删、不残留）
-const PENDING_KEY = "fe-ai-flow:pending-slash-skill";
+const PENDING_KEY = "flowship:pending-slash-skill";
 
 /** 跳转到对话页前调：让目标页输入框自动带上指定 skill 的内联 token */
 export const setPendingSlashSkill = (name: string) => {

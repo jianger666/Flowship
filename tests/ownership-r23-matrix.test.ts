@@ -25,7 +25,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { AwaitingNotifier } from "@/lib/server/chat-pending";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r23-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();
@@ -273,7 +273,7 @@ const installHangingFailpoint = (name: string) => {
 
 /** 给 reconnect 路径准备 dataRoot/config.json（readServerCreds） */
 const writeServerCreds = async (): Promise<void> => {
-  const dataDir = process.env.FE_AI_FLOW_DATA_DIR!;
+  const dataDir = process.env.FLOWSHIP_DATA_DIR!;
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(
     path.join(dataDir, "config.json"),

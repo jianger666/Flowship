@@ -105,7 +105,7 @@ const sendInitialize = async (
         params: {
           protocolVersion: "2025-06-18",
           capabilities: {},
-          clientInfo: { name: "ai-flow", version: "0" },
+          clientInfo: { name: "flowship", version: "0" },
         },
       }),
       redirect: "manual",

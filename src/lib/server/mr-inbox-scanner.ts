@@ -190,7 +190,7 @@ interface MrInboxGlobalState {
   };
 }
 
-const MR_INBOX_GLOBAL_KEY = "__feAiFlowMrInbox__";
+const MR_INBOX_GLOBAL_KEY = "__flowshipMrInbox__";
 
 const getGlobalState = (): MrInboxGlobalState => {
   const g = globalThis as unknown as Record<string, MrInboxGlobalState | undefined>;

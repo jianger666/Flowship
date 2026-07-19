@@ -41,14 +41,14 @@ import {
 // ---- 路径 / 常量 ----
 
 // OAuth 凭证落盘目录（每个 server 一个 json）。惰性求值——模块加载时
-// FE_AI_FLOW_DATA_DIR 可能还没注入（测试 / 特殊启动顺序）、跟 data-root 用法对齐
+// FLOWSHIP_DATA_DIR 可能还没注入（测试 / 特殊启动顺序）、跟 data-root 用法对齐
 const oauthDir = (): string => path.join(dataRoot(), "mcp-oauth");
 
 // fe 自身的 base url——**必须端口感知**（V0.13 验收踩过：硬编码 8876 时、test 实例
 // （8776）发起授权、回调被打到正式实例（8876）、state 对不上直接「校验失败」）。
 // 壳启动 server 时传了 PORT（正式 8876 / test 8776）、dev 兜底 8876；env 可整体覆盖。
 const getBaseUrl = (): string =>
-  process.env.FE_AI_FLOW_BASE_URL ??
+  process.env.FLOWSHIP_BASE_URL ??
   `http://localhost:${process.env.PORT ?? "8876"}`;
 const getRedirectUri = (): string => `${getBaseUrl()}/api/mcp-oauth/callback`;
 
@@ -57,7 +57,7 @@ const EXPIRY_BUFFER_MS = 60_000;
 
 // ---- 按 server 串行：同进程内同一 server 的读-改-写互斥 ----
 // 挂 globalThis：dev HMR / 多 chunk 各持一份 module 变量会让串行化失效
-const OAUTH_LOCKS_KEY = "__feAiFlowMcpOAuthLocksV1__";
+const OAUTH_LOCKS_KEY = "__flowshipMcpOAuthLocksV1__";
 type OAuthLockMap = Map<string, Promise<void>>;
 
 const getOAuthLocks = (): OAuthLockMap => {
@@ -236,7 +236,7 @@ class FileOAuthClientProvider implements OAuthClientProvider {
 
   get clientMetadata(): OAuthClientMetadata {
     return {
-      client_name: "ai-flow",
+      client_name: "flowship",
       redirect_uris: [getRedirectUri()],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -485,7 +485,7 @@ const probeOAuthRequired = async (
         params: {
           protocolVersion: "2025-06-18",
           capabilities: {},
-          clientInfo: { name: "ai-flow", version: "0" },
+          clientInfo: { name: "flowship", version: "0" },
         },
       }),
       redirect: "manual",

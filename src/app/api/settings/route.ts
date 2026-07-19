@@ -1,7 +1,7 @@
 /**
  * 配置文件写 route（V0.7.16）—— 配置从 localStorage 迁到 data/config.json
  *
- * 落 `dataRoot()/config.json`（跟 FE_AI_FLOW_DATA_DIR、Electron 下在 userData/data）：
+ * 落 `dataRoot()/config.json`（跟 FLOWSHIP_DATA_DIR、Electron 下在 userData/data）：
  * 明文 JSON、不绑 origin、主进程也能读、备份 / 同步 test 直接拷文件。
  *
  * 读配置走 `/api/settings/full`（仅 loopback、拿真值）；本 route 只保留 PUT。

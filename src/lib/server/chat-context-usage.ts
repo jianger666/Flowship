@@ -42,7 +42,7 @@ interface ChatUsageGlobalState {
   byTask: Map<string, ChatContextUsageRecord>;
 }
 
-const CHAT_USAGE_GLOBAL_KEY = "__feAiFlowChatContextUsageV1__";
+const CHAT_USAGE_GLOBAL_KEY = "__flowshipChatContextUsageV1__";
 
 const getUsageState = (): ChatUsageGlobalState => {
   const g = globalThis as unknown as Record<

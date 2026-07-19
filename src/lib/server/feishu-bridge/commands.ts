@@ -24,6 +24,8 @@ import {
   registerBridgeCommand,
   type BridgeCommandContext,
   type BridgeCommandHandler,
+  resolveReplyAnchorIds,
+  sendTaskBoundText,
 } from "./router";
 
 /** 与设置页欢迎语一致的静态清单 */
@@ -33,7 +35,7 @@ const HELP_TEXT =
 const HISTORY_TEXT_MAX = 200;
 const HISTORY_DEFAULT_ROUNDS = 3;
 
-const REG_KEY = "__feAiFlowFeishuBridgeCommandsV1__";
+const REG_KEY = "__flowshipFeishuBridgeCommandsV1__";
 
 type CommandsGlobal = { registered: boolean };
 
@@ -57,6 +59,10 @@ type CommandsDeps = {
   getTask: typeof getTask;
   stopTaskAgent: typeof stopTaskAgent;
   compactChatSession: typeof compactChatSession;
+  /** 回复锚定解析（事件缺 root/parent 时 REST 反查）——与 router 注入侧同源 */
+  resolveReplyAnchorIds: typeof resolveReplyAnchorIds;
+  /** task 绑定类回执（记 card-map、回复它可锚定）——与 router 同源 */
+  sendTaskBoundText: typeof sendTaskBoundText;
 };
 
 let deps: CommandsDeps = {
@@ -71,6 +77,8 @@ let deps: CommandsDeps = {
   getTask,
   stopTaskAgent,
   compactChatSession,
+  resolveReplyAnchorIds,
+  sendTaskBoundText,
 };
 
 /** 单测替换；传 null 恢复 */
@@ -90,6 +98,8 @@ export const __setCommandsDepsForTest = (
       getTask,
       stopTaskAgent,
       compactChatSession,
+      resolveReplyAnchorIds,
+      sendTaskBoundText,
     };
     return;
   }
@@ -142,8 +152,10 @@ const taskToSummary = (full: Task): TaskSummary => {
 export const resolveCommandTargetTask = async (
   msg: BridgeCommandContext["msg"],
 ): Promise<ResolveTargetResult> => {
-  if (msg.root_id) {
-    const hit = await deps.findTaskByMessageId(msg.root_id);
+  // 与注入侧同源的锚定解析：事件流 NDJSON 不带 root/parent（实证见 router），
+  // 缺失时 REST 反查——否则「回复卡片发命令」永远 miss
+  for (const anchorId of await deps.resolveReplyAnchorIds(msg)) {
+    const hit = await deps.findTaskByMessageId(anchorId);
     if (hit) {
       const full = await deps.getTask(hit.taskId);
       if (full) return { ok: true, task: taskToSummary(full) };
@@ -254,7 +266,8 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
   }
 
   if (!first) {
-    await replyOwner(
+    await deps.sendTaskBoundText(
+      created.taskId,
       `已开新对话：${created.title}，直接发消息开聊`,
     );
     return "handled";
@@ -262,7 +275,8 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
 
   const boot = await deps.loadBridgeBootContext();
   if (!boot) {
-    await replyOwner(
+    await deps.sendTaskBoundText(
+      created.taskId,
       `已开新对话：${created.title}，但缺少 API Key/模型，首条未注入`,
     );
     return "handled";
@@ -284,12 +298,13 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
     } catch {
       // ignore
     }
-    await replyOwner(
+    await deps.sendTaskBoundText(
+      created.taskId,
       `已开新对话：${created.title}，首条注入失败：${err}`,
     );
     return "handled";
   }
-  await replyOwner(`已开新对话：${created.title}`);
+  await deps.sendTaskBoundText(created.taskId, `已开新对话：${created.title}`);
   return "handled";
 };
 

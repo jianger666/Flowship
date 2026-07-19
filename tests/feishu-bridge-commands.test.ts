@@ -253,6 +253,7 @@ describe("ensureBridgeCommandsRegistered", () => {
         apiKey: "sk-test",
         model: { id: "gpt-5" } as never,
         repoPaths: ["/tmp/repo"],
+        disabledMcpServers: [],
       }),
       handleChatReplyInject: handleChat as never,
       getTask: getTask as never,

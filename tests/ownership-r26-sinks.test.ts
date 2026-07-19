@@ -22,7 +22,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { InteractionUpdate } from "@cursor/sdk";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r26-sinks-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { appendEventLine, prepareMetaWrite, readEvents, readMetaV06, writeMeta } =

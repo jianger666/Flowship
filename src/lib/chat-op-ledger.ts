@@ -8,8 +8,8 @@
  * taskIdRef 给迟到 HTTP 定 owner；离屏 A 的结果只写 A ledger。
  * 挂 globalThis 防 route-chunk / HMR 分裂。
  *
- * key 决策：现行 `__feAiFlowChatOpLedgerR42`；旧
- * `__feAiFlowChatOpLedgerR36` 在 getStore **每次**检查——存在则合并进现行后
+ * key 决策：现行 `__flowshipChatOpLedgerR42`；旧
+ * `__flowshipChatOpLedgerR36` 在 getStore **每次**检查——存在则合并进现行后
  * delete。为何每次而非「仅现行 key 缺失时」：HMR 后新 chunk 先任何 dispatch/get
  * 就会建空现行 store；旧 chunk 残留闭包（pending fetch .then）仍可能随后写 legacy——
  * 若只在现行 key 缺失时迁一次，晚到的 legacy 写入永远收不回，响应丢失窗口的 retry
@@ -38,9 +38,9 @@ type ChatOpLedgerStore = {
 };
 
 /** 三轴 shape 的现行 key（与旧 legacy key 并存窗口只做单向迁移） */
-const GLOBAL_KEY = "__feAiFlowChatOpLedgerR42" as const;
+const GLOBAL_KEY = "__flowshipChatOpLedgerR42" as const;
 /** 旧 shape 时代的 key——getStore 读到后迁完即删，防止新旧代码互污染 */
-const LEGACY_GLOBAL_KEY = "__feAiFlowChatOpLedgerR36" as const;
+const LEGACY_GLOBAL_KEY = "__flowshipChatOpLedgerR36" as const;
 
 type GlobalLedgerBag = typeof globalThis & {
   [GLOBAL_KEY]?: ChatOpLedgerStore;

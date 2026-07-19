@@ -246,7 +246,7 @@ export const setTaskModel = async (
 /**
  * V0.8：chat 模式「选工作目录」——替换 task.repoPaths（PATCH /api/tasks/[id]）
  *
- * 自由对话用原生 picker 选文件夹当 agent cwd、重选即替换、空数组 = 不绑（agent 起在 ai-flow 项目本身）。
+ * 自由对话用原生 picker 选文件夹当 agent cwd、重选即替换、空数组 = 不绑（agent 起在 Flowship 项目本身）。
  * 跟切模型同款：下一个 run 启动生效、不影响正在跑的 run、调用方 running 时禁用入口。
  */
 export const setTaskRepoPaths = async (

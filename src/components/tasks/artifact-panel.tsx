@@ -165,7 +165,7 @@ const ARTIFACT_LOAD_MAX_MS = 5000; // 单次退避上限（指数增长封顶、
 
 // localStorage key：分 task × actionId 维度
 const seenStorageKey = (taskId: string, actionId: string) =>
-  `fe-ai-flow:artifact-revisions-seen:${taskId}:${actionId}`;
+  `flowship:artifact-revisions-seen:${taskId}:${actionId}`;
 
 const readSeenTs = (taskId: string, actionId: string): number => {
   if (typeof window === "undefined") return 0;

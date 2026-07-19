@@ -307,7 +307,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 
 ## 方案
 
-<最新 plan artifact 的摘要 / 直接链接到 ai-flow 详情页>
+<最新 plan artifact 的摘要 / 直接链接到 Flowship 详情页>
 
 ## 改动概览
 

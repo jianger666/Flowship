@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getRepoFileIndex } from "../src/lib/server/repo-files";
 
-const CACHE_KEY = "__feAiFlowRepoFilesCacheV2__";
+const CACHE_KEY = "__flowshipRepoFilesCacheV2__";
 
 const clearCache = (): void => {
   const g = globalThis as unknown as Record<string, unknown>;

@@ -16,7 +16,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 const TMP_ROOT = mkdtempSync(
   path.join(os.tmpdir(), "fe-ownership-r28-order-anchor-"),
 );
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const { readEvents, readMetaV06, taskDir, writeMeta } = await import(
   "@/lib/server/task-fs-core"

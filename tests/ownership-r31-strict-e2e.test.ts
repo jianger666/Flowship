@@ -25,7 +25,7 @@ import type { Task } from "@/lib/types";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r31-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
-process.env.FE_AI_FLOW_DATA_DIR = DATA_DIR;
+process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();

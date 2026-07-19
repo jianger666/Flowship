@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const TMP = path.join(os.tmpdir(), `feishu-bridge-map-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 
 const {
   __setCardMapMaxForTest,

@@ -688,7 +688,7 @@ export interface MRRecord {
   targetBranch?: string;
   /**
    * 本仓累计 push 次数（首次 createMR 时 = 1、之后每次 ship 都 ++）
-   * 跟 GitLab MR ID（iid）没关系、只是 ai-flow 内部计数
+   * 跟 GitLab MR ID（iid）没关系、只是 Flowship 内部计数
    */
   version: number;
   url: string;

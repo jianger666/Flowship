@@ -245,7 +245,9 @@ describe("turn 状态机", () => {
     const card = cardFactory.cards[0]!;
     expect(card.pushProcess).toHaveBeenCalled();
     const processText = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
-    expect(processText).toContain("🧠 分析需求");
+    // Hermes timeline：思考条目标题 + 正文
+    expect(processText).toContain("**思考 1**");
+    expect(processText).toContain("分析需求");
 
     publishTaskStreamEvent(
       taskId,
@@ -257,12 +259,15 @@ describe("turn 状态机", () => {
     );
     await flush();
     const process2 = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
-    expect(process2).toContain("🔧 Shell：");
+    // 工具行：引用块 + `Shell` · running
+    expect(process2).toContain("`Shell` · running");
+    expect(process2).toContain("> ");
+    expect(process2).toContain("pnpm lint");
     expect(card.setHeaderStatus).toHaveBeenCalled();
     const header = String(card.setHeaderStatus.mock.calls.at(-1)?.[0] ?? "");
-    expect(header).toContain("执行工具(1)");
-    expect(header).toContain("Shell");
-    expect(header).toContain("已运行");
+    // Hermes 式实时动作：正在执行终端：pnpm lint
+    expect(header).toContain("正在执行终端");
+    expect(header).toContain("pnpm lint");
 
     publishTaskStreamEvent(
       taskId,
@@ -274,7 +279,7 @@ describe("turn 状态机", () => {
     );
     await flush();
     const process3 = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
-    expect(process3).toContain("✓");
+    expect(process3).toContain("`Shell` · completed");
 
     publishTaskStreamEvent(taskId, {
       kind: "assistant_delta",

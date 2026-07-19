@@ -90,13 +90,13 @@ interface TerminalCleanupCoordEntry {
 }
 
 /** 发号器与 Map 同寿命（换 key 防 hot-reload 读到旧形状） */
-const RESOURCE_JOBS_GLOBAL_KEY = "__feAiFlowResourceJobsV2__";
-const QUARANTINE_GLOBAL_KEY = "__feAiFlowQuarantinedWorkspacesV3__";
-const JOB_CLEARED_WAITERS_KEY = "__feAiFlowResourceJobClearedWaitersV1__";
+const RESOURCE_JOBS_GLOBAL_KEY = "__flowshipResourceJobsV2__";
+const QUARANTINE_GLOBAL_KEY = "__flowshipQuarantinedWorkspacesV3__";
+const JOB_CLEARED_WAITERS_KEY = "__flowshipResourceJobClearedWaitersV1__";
 /** jobSeq + quarantineGen + cleanupToken 单调计数器 */
-const RESOURCE_COUNTERS_GLOBAL_KEY = "__feAiFlowResourceCountersV1__";
+const RESOURCE_COUNTERS_GLOBAL_KEY = "__flowshipResourceCountersV1__";
 /** TerminalCleanupCoordinator 条目（与 quarantine 同寿命语义） */
-const TERMINAL_CLEANUP_COORD_KEY = "__feAiFlowTerminalCleanupCoordV1__";
+const TERMINAL_CLEANUP_COORD_KEY = "__flowshipTerminalCleanupCoordV1__";
 
 type JobsByTask = Map<string, Map<string, JobEntry>>;
 type QuarantineByTask = Map<string, QuarantineEntry>;

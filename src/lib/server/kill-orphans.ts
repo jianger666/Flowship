@@ -2,7 +2,7 @@
  * 杀掉 agent 通过 shell 工具拉起、停止后没被回收的孤儿进程（V0.6.8）
  *
  * # 背景（一次真实事故）
- * ai-flow 的 agent 跑在 Cursor.app 底下的 `agent-exec`、**不是本服务器的子进程**。
+ * Flowship 的 agent 跑在 Cursor.app 底下的 `agent-exec`、**不是本服务器的子进程**。
  * 停止 task 时 `run.cancel()` 只能停 agent 本体、**杀不到 agent 用 shell 工具拉起的孙子进程**。
  * 典型事故：agent 在 build 里跑 `cd <repo> && npm run lint`、而该仓的 `lint` = `ng lint --fix=true`
  *（Angular 自动改写）；用户「停止」后 agent 死了、但这个 lint 子进程 reparent 到 init 继续 `--fix`
@@ -217,7 +217,7 @@ type ManagedChildEntry = {
   stop: () => Promise<void> | void;
 };
 
-const MANAGED_KEY = "__feAiFlowManagedChildrenV1__";
+const MANAGED_KEY = "__flowshipManagedChildrenV1__";
 
 const getManagedMap = (): Map<string, ManagedChildEntry> => {
   const g = globalThis as unknown as Record<

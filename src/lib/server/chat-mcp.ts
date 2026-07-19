@@ -116,7 +116,7 @@ const askSubmittedText = (askId: string): string =>
  */
 const buildMcpServer = (callerToken: string | undefined): McpServer => {
   const srv = new McpServer({
-    name: "ai-flow-task",
+    name: "flowship-task",
     version: "1.0.0",
   });
 
@@ -808,7 +808,7 @@ const buildSessionTransport = (
       // 背景：MCP StreamableHTTP transport 默认 client 启 transport 后会建一条 GET SSE
       // 长连接接 server push notification。但我们业务上：
       //   - submit_work / ask_user 都是立即返回 SHELL_WAIT_GUIDE、不走 SSE stream
-      //   - UI 事件流推送走 ai-flow 自己的 /api/tasks/[id]/events 端点、不走 MCP push
+      //   - UI 事件流推送走 Flowship 自己的 /api/tasks/[id]/events 端点、不走 MCP push
       //
       // 空挂着的 GET 在 Next.js dev / 中间层会被 idle 5 分钟超时砍、
       // SDK MCP client 检测到 transport 不健康 → 7-8 分钟后整个 run 标 error。
@@ -922,17 +922,17 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
 
 /**
  * 推算给 Cursor SDK Agent 用的 chat-tool MCP endpoint URL。
- * 优先级：FE_AI_FLOW_CHAT_MCP_URL → FE_AI_FLOW_BASE_URL → PORT → 8876；必须 127.0.0.1。
+ * 优先级：FLOWSHIP_CHAT_MCP_URL → FLOWSHIP_BASE_URL → PORT → 8876；必须 127.0.0.1。
  * @param callerToken agent 实例身份，拼到 `?caller=`——每个 Agent.create/resume
  *   拿独一无二的 URL → SDK 新建独立 MCP session（无老 session 复用问题）。
  */
 export const getChatMcpUrl = (callerToken?: string): string => {
   let base: string;
-  const explicit = process.env.FE_AI_FLOW_CHAT_MCP_URL;
+  const explicit = process.env.FLOWSHIP_CHAT_MCP_URL;
   if (explicit && explicit.trim().length > 0) {
     base = explicit.trim();
   } else {
-    const envBase = process.env.FE_AI_FLOW_BASE_URL;
+    const envBase = process.env.FLOWSHIP_BASE_URL;
     if (envBase && envBase.trim().length > 0) {
       base = `${envBase.replace(/\/+$/, "")}/api/mcp/chat-tool`;
     } else {

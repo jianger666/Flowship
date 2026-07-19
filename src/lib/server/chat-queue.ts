@@ -282,7 +282,7 @@ interface ChatQueueGlobalState {
 }
 
 // V6：相对 V5 增 messageOps；换 key 防 hot-reload 缺字段分裂
-const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV6__";
+const CHAT_QUEUE_GLOBAL_KEY = "__flowshipChatQueueV6__";
 
 const getQueueState = (): ChatQueueGlobalState => {
   const g = globalThis as unknown as Record<
@@ -1032,7 +1032,7 @@ interface QueuedFlushHookState {
   listeners: Set<QueuedMessageFlushedCb>;
 }
 
-const QUEUED_FLUSH_HOOK_KEY = "__feAiFlowChatQueueFlushHookV1__";
+const QUEUED_FLUSH_HOOK_KEY = "__flowshipChatQueueFlushHookV1__";
 
 const getFlushHookState = (): QueuedFlushHookState => {
   const g = globalThis as unknown as Record<

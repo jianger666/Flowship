@@ -66,7 +66,7 @@ interface ChatGateGlobalState {
 }
 
 // V5：加 reopening；换 key 防 hot-reload 读到不知 reopening 的旧 V4 state
-const CHAT_GATE_GLOBAL_KEY = "__feAiFlowChatGateV5__";
+const CHAT_GATE_GLOBAL_KEY = "__flowshipChatGateV5__";
 
 const getState = (): ChatGateGlobalState => {
   const g = globalThis as unknown as Record<

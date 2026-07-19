@@ -26,7 +26,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { Task } from "@/lib/types";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r30-claim-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();
@@ -289,9 +289,9 @@ describe("ownership R30 claim + notifier outcome", () => {
   afterEach(async () => {
     clearFailpoints();
     const g = globalThis as unknown as {
-      __feAiFlowActionSideEffectWaitMs?: number;
+      __flowshipActionSideEffectWaitMs?: number;
     };
-    delete g.__feAiFlowActionSideEffectWaitMs;
+    delete g.__flowshipActionSideEffectWaitMs;
     for (const id of ids) {
       clearActionSideEffects(id);
       runningChecks.delete(id);
@@ -436,9 +436,9 @@ describe("ownership R30 claim + notifier outcome", () => {
       const mrHandle = tryClaimSideEffect(id, "act_ship", "mr");
       expect(mrHandle).not.toBeNull();
       const g = globalThis as unknown as {
-        __feAiFlowActionSideEffectWaitMs?: number;
+        __flowshipActionSideEffectWaitMs?: number;
       };
-      g.__feAiFlowActionSideEffectWaitMs = 80;
+      g.__flowshipActionSideEffectWaitMs = 80;
 
       const notifyResult = await safeNotifyAwaiting(id, {
         actionId: "act_ship",

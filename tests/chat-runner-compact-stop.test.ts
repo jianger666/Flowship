@@ -7,7 +7,7 @@
  * 2) 摘要成功后重建前置窗口 abort → 不写 compact 事件、不重建
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
- * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import。
+ * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -28,7 +28,7 @@ import { MIN_COMPACT_SUMMARY_CHARS } from "@/lib/server/chat-compact-prompt";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-compact-stop-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
-process.env.FE_AI_FLOW_DATA_DIR = DATA_DIR;
+process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();

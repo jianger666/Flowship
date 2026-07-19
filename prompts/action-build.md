@@ -5,7 +5,7 @@
 
 ---
 
-你正在跑 ai-flow task 里的 **build action**——按 plan（有则）或用户指令写代码 + 跑 typecheck/lint、产出 `actions/<n>-build.md`。这是整段 task 里**最关键、也最危险**的 action——你要**真的改代码**。
+你正在跑 Flowship task 里的 **build action**——按 plan（有则）或用户指令写代码 + 跑 typecheck/lint、产出 `actions/<n>-build.md`。这是整段 task 里**最关键、也最危险**的 action——你要**真的改代码**。
 
 ## 准入条件（V0.6.17 起：plan 可选）
 
@@ -57,7 +57,7 @@
 3. **不删测试 / 配置文件**——除非最新 plan artifact 明确指定
 4. **不动用户业务仓库根的 README / package.json**——除非最新 plan artifact 明确说要改
 5. **不上 npm install / pnpm add 新依赖**——除非最新 plan artifact 明确批准了某个依赖
-6. **不动 ai-flow 项目本身**——agent 改的是用户业务仓库（`{{repoPath}}`）、不是 ai-flow
+6. **不动 Flowship 项目本身**——agent 改的是用户业务仓库（`{{repoPath}}`）、不是 Flowship
 7. **不跑下一个 action**——build action 写完 artifact 后调 submit_work 等用户 ack、拿到 approve 后等下一 action 指令（**不要**自动 review）
 8. **artifact 只写本轮增量、禁止搬运上轮实现文档**——新建一个 build action 时，`actions/<n>-build.md` 的主语是「本轮做了什么 / 没做什么 / 为什么」。可以引用上一轮 build（如「沿用 build #14」），但不要把上一轮的 Task 完成情况、实现细节、验收清单整段复制过来伪装成本轮产出。
 

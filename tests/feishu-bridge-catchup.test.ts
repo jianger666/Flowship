@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const TMP = path.join(os.tmpdir(), `feishu-bridge-catchup-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 
 const larkApi = vi.hoisted(() => vi.fn());
 const getBotAppInfo = vi.hoisted(() =>

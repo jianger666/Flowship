@@ -48,7 +48,7 @@ const GIT_BASH_PATH_RE = /git.*bash/i;
  * production build 里 instrumentation / settings route 各有一份模块实例，
  * module-local 的 ORIGINAL_SHELL / injectedBinDir 互不可见。
  */
-const AGENT_SHELL_STATE_KEY = "__feAiFlowAgentShellStateV1__";
+const AGENT_SHELL_STATE_KEY = "__flowshipAgentShellStateV1__";
 
 type AgentShellGlobalState = {
   /**

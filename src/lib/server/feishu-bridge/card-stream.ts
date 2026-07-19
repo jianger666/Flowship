@@ -41,6 +41,21 @@ const ELEMENT_PROCESS = "md_process";
 const ELEMENT_ANSWER = "md_answer";
 const ELEMENT_FOOTER = "md_footer";
 const ELEMENT_QUOTE = "md_quote";
+/** Hermes 同款正文 / timeline / footer 之间的分割线 */
+const ELEMENT_DIVIDER = "main_divider";
+
+/** Hermes footer 旋转 spinner 帧（流式期间） */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+
+/** 模型名 → 飞书 markdown `<font color>`（对齐 Hermes MODEL_COLOR_PREFIXES） */
+const MODEL_COLOR_PREFIXES: Array<{ prefixes: string[]; color: string }> = [
+  { prefixes: ["gpt-", "o1", "o3"], color: "blue" },
+  { prefixes: ["claude-"], color: "orange" },
+  { prefixes: ["deepseek-", "deepseek/"], color: "indigo" },
+  { prefixes: ["kimi-", "kimi/", "moonshot-"], color: "purple" },
+  { prefixes: ["glm-"], color: "green" },
+  { prefixes: ["hy3", "tencent/", "hunyuan"], color: "teal" },
+];
 
 /**
  * review P2#6 / 方案坑 #3：检测未闭合 ``` 围栏（以行首 ``` 计数，奇数为未闭合）。
@@ -124,13 +139,47 @@ const formatDuration = (ms: number): string => {
   return s ? `${m}m${s}s` : `${m}m`;
 };
 
+/** Hermes 同款：模型名着色（未知型号转义后原样输出） */
+export const coloredModelLabel = (model: string): string => {
+  const text = model.trim();
+  if (!text) return "";
+  const safe = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+  const lower = text.toLowerCase();
+  for (const { prefixes, color } of MODEL_COLOR_PREFIXES) {
+    if (prefixes.some((p) => lower.startsWith(p))) {
+      return `<font color="${color}">${safe}</font>`;
+    }
+  }
+  return safe;
+};
+
+/** 流式 footer：⠋ 生成中（帧随时间转，与 Hermes `_spinner_text` 同款） */
+export const streamingFooterSpinner = (label = "生成中"): string => {
+  const frame =
+    SPINNER_FRAMES[Math.floor(Date.now() * 8) % SPINNER_FRAMES.length] ?? "⠋";
+  return `${frame} ${label}`;
+};
+
+/**
+ * 从过程区 markdown 数工具行（Hermes timeline 工具块以 `> \`name\` ·` 起行）。
+ * 用于折叠面板标题「思考与工具 · N 次工具调用」。
+ */
+const countToolsInProcess = (processText: string): number => {
+  const matches = processText.match(/^> `[^`]+` · /gm);
+  return matches?.length ?? 0;
+};
+
 const buildQuoteMarkdown = (
   echoText?: string,
   echoImageKeys?: string[],
 ): string => {
   const lines: string[] = [];
   if (echoText?.trim()) {
-    // 引用块：多行前缀 >
+    // 引用块：多行前缀 >（我们相对 Hermes 多保留的 app 回显）
     for (const line of echoText.trim().split("\n")) {
       lines.push(`> 💬 你在 app：${line}`);
     }
@@ -143,7 +192,13 @@ const buildQuoteMarkdown = (
   return lines.join("\n");
 };
 
-/** 组装方案 4.1 的卡片 JSON 2.0 */
+/**
+ * 组装飞书卡片 JSON 2.0——分区 / 样式对齐 Hermes `render_card`：
+ * quote（我们独有）→ 正文 md_answer → 思考与工具折叠面板 → hr → footer(x-small)
+ *
+ * ⚠️ 打字机约束：md_process / md_answer 仍是流式全量 PUT 的唯一目标 element，
+ * 不做 Hermes 那套「按结构边界拆多块 main_content_N」（会破坏前缀守卫）。
+ */
 export const buildStreamingCardJson = (opts: {
   title: string;
   subtitle: string;
@@ -153,6 +208,13 @@ export const buildStreamingCardJson = (opts: {
   answerText?: string;
   footerText?: string;
 }): Record<string, unknown> => {
+  const processText = opts.processText ?? "";
+  const toolCount = countToolsInProcess(processText);
+  const panelTitle =
+    toolCount > 0
+      ? `思考与工具 · ${toolCount} 次工具调用`
+      : "思考与工具";
+
   const elements: unknown[] = [];
   if (opts.quoteMd) {
     elements.push({
@@ -161,49 +223,76 @@ export const buildStreamingCardJson = (opts: {
       content: opts.quoteMd,
     });
   }
+  // 正文在前（Hermes main_content 优先），过程区折叠在后
   elements.push(
-    {
-      tag: "collapsible_panel",
-      element_id: "panel_process",
-      expanded: false,
-      header: {
-        title: { tag: "markdown", content: "🧠 思考与工具" },
-      },
-      elements: [
-        {
-          tag: "markdown",
-          element_id: ELEMENT_PROCESS,
-          content: opts.processText ?? "",
-        },
-      ],
-    },
     {
       tag: "markdown",
       element_id: ELEMENT_ANSWER,
       content: opts.answerText ?? "",
     },
     {
+      tag: "collapsible_panel",
+      element_id: "panel_process",
+      expanded: false,
+      header: {
+        // Hermes 用 plain_text + vertical_align，不用 markdown 标题
+        title: { tag: "plain_text", content: panelTitle },
+        vertical_align: "center",
+      },
+      border: { color: "grey", corner_radius: "5px" },
+      padding: "8px 8px 8px 8px",
+      elements: [
+        {
+          tag: "markdown",
+          element_id: ELEMENT_PROCESS,
+          content: processText,
+          // Hermes reasoning 默认 small；单 element 混排时取 reasoning 档
+          text_size: "small",
+        },
+      ],
+    },
+    { tag: "hr", element_id: ELEMENT_DIVIDER },
+    {
       tag: "markdown",
       element_id: ELEMENT_FOOTER,
       content: opts.footerText ?? "",
+      text_size: "x-small",
     },
   );
+
+  // 空 subtitle 省略（Hermes 思考中无 subtitle，只靠 footer spinner）
+  const header: Record<string, unknown> = {
+    title: { tag: "plain_text", content: opts.title },
+    template: opts.template,
+  };
+  if (opts.subtitle.trim()) {
+    header.subtitle = { tag: "plain_text", content: opts.subtitle };
+  }
+
   return {
     schema: "2.0",
     config: {
       streaming_mode: true,
       update_multi: true,
+      // 通知摘要：有 subtitle 用它，否则按模板给中性文案（对齐 Hermes config.summary）
+      summary: {
+        content:
+          opts.subtitle.trim() ||
+          (opts.template === "green"
+            ? "已完成"
+            : opts.template === "red"
+              ? "处理失败"
+              : opts.template === "orange"
+                ? "等待选择"
+                : "生成中"),
+      },
       streaming_config: {
         print_frequency_ms: { default: 70 },
         print_step: { default: 1 },
         print_strategy: "fast",
       },
     },
-    header: {
-      title: { tag: "plain_text", content: opts.title },
-      subtitle: { tag: "plain_text", content: opts.subtitle },
-      template: opts.template,
-    },
+    header,
     body: { elements },
   };
 };
@@ -225,7 +314,8 @@ export const createCardStream = (
 
   /** 当前标题 / header */
   const title = opts.title;
-  let subtitle = "🤔 思考中…";
+  /** 运行中默认空——Hermes 把状态放 footer spinner / 工具 subtitle，不写「思考中」 */
+  let subtitle = "";
   let template: CardHeaderTemplate = "blue";
   /** header 脏标记——下次 flush 走全量 PUT */
   let headerDirty = false;
@@ -237,7 +327,10 @@ export const createCardStream = (
   let answerFlushed = "";
   /** 引用块（start 时定稿，不再改） */
   let quoteMd = "";
-  /** footer（finalize 填充） */
+  /**
+   * footer 终态文案；空串表示流式中——每次 rebuild 用 spinner「生成中」。
+   * ask 等待 / finalize 后写入固定文案，不再转 spinner。
+   */
   let footerText = "";
 
   /** 自 start 后未 flush 的新增字符数（过程+正文合计增量） */
@@ -293,7 +386,8 @@ export const createCardStream = (
       quoteMd: quoteMd || undefined,
       processText: processFlushed,
       answerText: answerFlushed,
-      footerText,
+      // 流式中 footer 空 → spinner；等待/完成由 footerText 定稿
+      footerText: footerText || streamingFooterSpinner(),
     });
 
   const doFlush = async (): Promise<void> => {
@@ -360,12 +454,8 @@ export const createCardStream = (
   const start = async (startOpts: CardStreamStartOpts = {}): Promise<void> => {
     if (started || finalized) return;
     quoteMd = buildQuoteMarkdown(startOpts.echoText, startOpts.echoImageKeys);
-    const cardJson = buildStreamingCardJson({
-      title,
-      subtitle,
-      template,
-      quoteMd: quoteMd || undefined,
-    });
+    // 走 rebuild：footer 带 spinner、分区样式与后续 flush 一致
+    const cardJson = rebuildCardJson();
     try {
       const created = await createCardEntity(cardJson);
       cardId = created.card_id;
@@ -458,6 +548,8 @@ export const createCardStream = (
             element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
             text: { tag: "plain_text", content: opt.label },
             type: "primary",
+            // Hermes interaction 按钮同款 size
+            size: "medium",
             width: "default",
             // 飞书 JSON 2.0：behaviors 触发回调，value 原样回传
             behaviors: [
@@ -477,7 +569,10 @@ export const createCardStream = (
         content: "请直接回复文字作答",
       });
     }
-    setHeaderStatus("⏸ 等你回答", "orange");
+    // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
+    subtitle = "";
+    template = "orange";
+    footerText = "等待选择";
     headerDirty = false; // 本批 batch 不改 header；单独再刷 header
     try {
       await batchUpdateCard(
@@ -487,14 +582,15 @@ export const createCardStream = (
             action: "add_elements",
             params: {
               type: "insert_before",
-              target_element_id: ELEMENT_FOOTER,
+              // 插在分割线前，按钮落在正文区与 footer 之间（对齐 Hermes interaction 位置）
+              target_element_id: ELEMENT_DIVIDER,
               elements,
             },
           },
         ],
         nextSeq(),
       );
-      // header 状态单独全量 PUT
+      // header / footer 状态单独全量 PUT
       headerDirty = true;
       await enqueueFlush();
     } catch (err) {
@@ -518,13 +614,14 @@ export const createCardStream = (
             action: "add_elements",
             params: {
               type: "insert_before",
-              target_element_id: ELEMENT_FOOTER,
+              target_element_id: ELEMENT_DIVIDER,
               elements: [
                 {
                   tag: "button",
                   element_id: "btn_retry",
                   text: { tag: "plain_text", content: "重试" },
                   type: "danger",
+                  size: "medium",
                   behaviors: [{ type: "callback", value }],
                 },
               ],
@@ -550,16 +647,30 @@ export const createCardStream = (
     // 先刷完过程/正文
     await enqueueFlush();
 
-    subtitle = fin.ok ? "✅ 完成" : `❌ ${fin.error?.trim() || "出错"}`;
-    template = fin.ok ? "green" : "red";
-    const parts: string[] = [];
-    if (fin.durationMs != null) {
-      const d = formatDuration(fin.durationMs);
-      if (d) parts.push(`耗时 ${d}`);
+    const deepLink = `[在 app 中打开](${getDeepLink(taskId)})`;
+    if (fin.ok) {
+      // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型 · 深链
+      subtitle = "已完成";
+      template = "green";
+      const parts: string[] = [];
+      if (fin.durationMs != null) {
+        const d = formatDuration(fin.durationMs);
+        if (d) parts.push(d);
+      }
+      if (fin.model) parts.push(coloredModelLabel(fin.model));
+      parts.push(deepLink);
+      footerText = parts.join(" · ");
+    } else {
+      // Hermes failed：保留运行中工具 subtitle（不覆盖）、red；footer「已停止」
+      template = "red";
+      // 无工具预览时用简短失败摘要，避免 header 完全空白
+      if (!subtitle.trim()) {
+        subtitle = fin.error?.trim()
+          ? truncateForCard(fin.error.trim()).slice(0, 120)
+          : "处理失败";
+      }
+      footerText = `已停止 · ${deepLink}`;
     }
-    if (fin.model) parts.push(fin.model);
-    parts.push(`[在 app 中打开](${getDeepLink(taskId)})`);
-    footerText = parts.join(" · ");
 
     try {
       // footer + header 一次全量 PUT

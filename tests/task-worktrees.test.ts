@@ -18,9 +18,9 @@ import type { Task } from "@/lib/types";
 // dataRoot 读环境变量、先钉死再 import 被测模块（模块内是调用时求值、这里保险起见前置）
 const DATA = "/tmp/fe-ai-flow-test-data";
 beforeAll(() => {
-  process.env.FE_AI_FLOW_DATA_DIR = DATA;
+  process.env.FLOWSHIP_DATA_DIR = DATA;
 });
-process.env.FE_AI_FLOW_DATA_DIR = DATA;
+process.env.FLOWSHIP_DATA_DIR = DATA;
 
 // fixture：git 仓 = 带 .git 子目录的临时目录；非 git = 裸目录（算快照用）
 const FIXTURE = path.join(os.tmpdir(), `fe-wt-unit-${process.pid}`);

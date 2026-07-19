@@ -13,7 +13,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const TMP_ROOT = path.join(os.tmpdir(), `fe-cli-integrity-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 import {
   isTrustedFeishuAuthUrl,

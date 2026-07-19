@@ -1,9 +1,9 @@
 {
-  "name": "ai-flow",
+  "name": "flowship",
   "productName": "Flowship",
   "version": "0.0.0-dev",
   "private": true,
-  "description": "ai-flow 桌面端（Electron 壳、CI 发版时 version 会被改写成 tag 版本）",
+  "description": "Flowship 桌面端（Electron 壳、CI 发版时 version 会被改写成 tag 版本）",
   "main": "main.js",
   "type": "module",
   "dependencies": {

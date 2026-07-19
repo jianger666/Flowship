@@ -12,7 +12,7 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 const TMP_ROOT = path.join(os.tmpdir(), `fe-custom-action-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
+process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;
 
 import {
   createCustomAction,

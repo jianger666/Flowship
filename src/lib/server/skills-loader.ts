@@ -1,10 +1,10 @@
 /**
- * ai-flow Skills Loader
+ * Flowship Skills Loader
  *
  * 加载 SKILL.md 风格的能力扩展（Anthropic Agent Skills 标准）。
  *
  * 设计要点（settingSources:[] 后全部 fe 自管注入 prompt）：
- *   - **只读平台自管三源**：`<ai-flow>/skills/`（随包发布）+ `<dataRoot>/skills/`（能力页管理）
+ *   - **只读平台自管三源**：`<Flowship>/skills/`（随包发布）+ `<dataRoot>/skills/`（能力页管理）
  *     + 飞书 CLI skills（`<dataRoot>/tools/skills/`）。
  *   - **不扫 `~/.cursor/skills/`**：Cursor 全局不再注入；要从 IDE 带过来用能力页「从 Cursor 导入」拷成自管副本。
  *   - **不读 repo `.cursor/skills/`**：SDK 已不再加载 project 层；仓库级 skill 若要用、
@@ -33,10 +33,10 @@ import { readSettingsFile } from "./settings-fs";
 /** app 自管 skills 目录（V0.13 独立化、设置页可视化管理、随 data 目录走） */
 export const getAppSkillsDir = (): string => path.join(dataRoot(), "skills");
 
-// ai-flow 平台自身 skills 目录的相对路径
+// Flowship 平台自身 skills 目录的相对路径
 // V0.3 起：从 `.ai-flow/skills/` 挪到顶级 `skills/`、跟 `prompts/` 平级、
-// 命名直白、避免「ai-flow inside ai-flow」的冗余目录层
-const FE_AI_FLOW_OWN_SKILLS_DIR = "skills";
+// 命名直白、避免「Flowship inside Flowship」的冗余目录层
+const FLOWSHIP_OWN_SKILLS_DIR = "skills";
 
 // 递归深度上限：防止 skills 嵌套过深、扫描爆栈 / 卡 IO
 // 实际 SKILL.md 一般 2~3 层（category/skill-name/SKILL.md）、5 层够用
@@ -161,7 +161,7 @@ export const parseSkillFile = async (absPath: string): Promise<SkillEntry | null
  * 加载本次 agent 可用的 skills：平台自带 + app 自管 + 飞书 CLI
  *
  * 来源（都由 fe 注入 prompt、`settingSources:[]` 不靠 SDK 加载 .cursor）：
- *   1. **平台自带** `<ai-flow>/skills/`（跟 git 仓库发布、所有用户共享）
+ *   1. **平台自带** `<Flowship>/skills/`（跟 git 仓库发布、所有用户共享）
  *   2. **app 自管** `<dataRoot>/skills/`（V0.13 独立化：设置页可视化增删改、见 app-skills.ts）
  *   3. **飞书 CLI 官方** `<dataRoot>/tools/skills/`（V0.12 一键安装时落盘）
  *
@@ -188,7 +188,7 @@ export const readDisabledSkills = async (): Promise<Set<string>> => {
 
 export const loadSkills = async (): Promise<SkillEntry[]> => {
   const own = await scanSkillsDir(
-    path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
+    path.join(process.cwd(), FLOWSHIP_OWN_SKILLS_DIR),
   );
   // app 自管 <dataRoot>/skills/（V0.13、设置页管理）
   const app = await scanSkillsDir(getAppSkillsDir());
@@ -221,7 +221,7 @@ export const findSkillByName = async (
   if (!needle) return null;
   const sources = [
     getAppSkillsDir(),
-    path.join(process.cwd(), FE_AI_FLOW_OWN_SKILLS_DIR),
+    path.join(process.cwd(), FLOWSHIP_OWN_SKILLS_DIR),
     getToolsSkillsDir(),
   ];
   for (const dir of sources) {
@@ -261,7 +261,7 @@ export const readSkillBodyByName = async (
  */
 export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
-    return "（当前没有可用 skill。平台 skill 放在 ai-flow `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 Cursor 导入为自管副本。）";
+    return "（当前没有可用 skill。平台 skill 放在 Flowship `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 Cursor 导入为自管副本。）";
   }
   const lines: string[] = [];
   for (const s of skills) {

@@ -18,11 +18,11 @@ export const getBridgeDataDir = async (): Promise<string> => {
 
 /**
  * 是否 test 实例——与 electron-app/main.js 对齐：
- * env `FE_AI_FLOW_TEST=1`，或 dataDir 指向 `fe-ai-flow-test`。
+ * env `FLOWSHIP_TEST=1`，或 dataDir 指向 `fe-ai-flow-test`。
  */
 export const isBridgeTestInstance = (): boolean => {
-  if (process.env.FE_AI_FLOW_TEST === "1") return true;
-  const dir = process.env.FE_AI_FLOW_DATA_DIR ?? "";
+  if (process.env.FLOWSHIP_TEST === "1") return true;
+  const dir = process.env.FLOWSHIP_DATA_DIR ?? "";
   return dir.includes("fe-ai-flow-test");
 };
 

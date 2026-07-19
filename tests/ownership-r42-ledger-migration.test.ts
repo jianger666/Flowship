@@ -1,7 +1,7 @@
 /**
  * R42 / R41-2 / R42-1：globalThis ledger 旧一维 shape → 三轴迁移。
  *
- * 决策：key 升为 `__feAiFlowChatOpLedgerR42`；getStore 每次收割 R36 并合并后删旧 key。
+ * 决策：key 升为 `__flowshipChatOpLedgerR42`；getStore 每次收割 R36 并合并后删旧 key。
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -23,8 +23,8 @@ import {
   type PendingProductState,
 } from "@/lib/chat-pending-reconcile";
 
-const LEGACY_KEY = "__feAiFlowChatOpLedgerR36";
-const CURRENT_KEY = "__feAiFlowChatOpLedgerR42";
+const LEGACY_KEY = "__flowshipChatOpLedgerR36";
+const CURRENT_KEY = "__flowshipChatOpLedgerR42";
 
 type LegacyStore = {
   byTaskId: Map<string, ChatOpState>;

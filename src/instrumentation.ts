@@ -27,10 +27,10 @@ export const register = (): void => {
   // 防重复注册：dev HMR / 多次 register 时 listener 会累积、触发 MaxListenersExceededWarning
   // 跟 chat-mcp 一样用 globalThis 挂单例标记
   const g = globalThis as typeof globalThis & {
-    __feAiFlowGlobalHandlers?: boolean;
+    __flowshipGlobalHandlers?: boolean;
   };
-  if (g.__feAiFlowGlobalHandlers) return;
-  g.__feAiFlowGlobalHandlers = true;
+  if (g.__flowshipGlobalHandlers) return;
+  g.__flowshipGlobalHandlers = true;
 
   process.on("unhandledRejection", (reason) => {
     console.error(

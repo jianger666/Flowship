@@ -1,5 +1,5 @@
 /**
- * ai-flow Electron 壳（V0.7.0）
+ * Flowship Electron 壳（V0.7.0）
  *
  * 职责（保持薄壳、业务全在 Next server 里）：
  * 1. 起内置 Next standalone server（spawn 自带 node 运行时、ELECTRON_RUN_AS_NODE）
@@ -11,8 +11,8 @@
  * 关键链路（V0.7-ELECTRON-PLAN §3.2）：
  * - ELECTRON_RUN_AS_NODE=1 让 process.execPath 表现为 node、且被孙进程继承——
  *   打包后的 server / 子进程以 node 模式跑、不会弹出新的 app 窗口
- * - FE_AI_FLOW_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
- *   更新 / 卸载重装都不丢
+ * - FLOWSHIP_DATA_DIR 指向系统 userData——数据不落只读的 resources 目录、
+ *   更新 / 卸载重装都不丢（目录名仍是 fe-ai-flow、只是 env 改名、用户数据不动）
  */
 import {
   app,
@@ -47,14 +47,14 @@ import { fileURLToPath } from "node:url";
 // ⚠️ 探测不能用 app.getName()：-c.productName 只改包名 / Info.plist、不改 asar 内
 // package.json、getName() 拿到的还是正式名（实测踩坑）——看可执行文件名最可靠
 const IS_TEST =
-  process.env.FE_AI_FLOW_TEST === "1" ||
+  process.env.FLOWSHIP_TEST === "1" ||
   path.basename(process.execPath).toLowerCase().includes("test");
 
 // 自定义协议：正式 flowship / test flowship-test——两套 scheme 避免同机正式+test
 // 抢注册（决策 #18）；URL 形如 flowship://tasks/<taskId>
 const PROTOCOL_SCHEME = IS_TEST ? "flowship-test" : "flowship";
 
-const PORT = Number(process.env.FE_AI_FLOW_PORT) || (IS_TEST ? 8776 : 8876);
+const PORT = Number(process.env.FLOWSHIP_PORT) || (IS_TEST ? 8776 : 8876);
 const HOST = "127.0.0.1";
 const BASE_URL = `http://${HOST}:${PORT}`;
 
@@ -267,7 +267,7 @@ const startServer = () => {
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(PORT),
       HOSTNAME: HOST,
-      FE_AI_FLOW_DATA_DIR: path.join(app.getPath("userData"), "data"),
+      FLOWSHIP_DATA_DIR: path.join(app.getPath("userData"), "data"),
     },
     // cwd 不用管：standalone server.js 启动时自己 process.chdir(__dirname)
     stdio: ["ignore", "pipe", "pipe"],
@@ -767,7 +767,7 @@ const createWindow = async () => {
     return { action: "deny" };
   });
   // 同 frame 导航离开本应用（cursor:// deep link 跳 IDE、或意外的外部 http 链接）
-  // → 拦下来交系统处理、窗口永远停在 ai-flow 页面上
+  // → 拦下来交系统处理、窗口永远停在 Flowship 页面上
   // 特例：app-update://install 是页面「新版本」标识发起的装更新指令、壳自己消费
   // 主窗不放行 data:——splash 是独立 BrowserWindow 自己 loadURL(data:)，不经此 handler
   mainWindow.webContents.on("will-navigate", (e, url) => {

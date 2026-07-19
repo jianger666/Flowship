@@ -26,7 +26,7 @@ const LARK_MAX_BUFFER = 16 * 1024 * 1024;
 
 // ----------------- 串行队列（挂 globalThis，dev 多 chunk 共享） -----------------
 
-const LARK_CHAIN_KEY = "__feAiFlowLarkBridgeChainV1__";
+const LARK_CHAIN_KEY = "__flowshipLarkBridgeChainV1__";
 
 type LarkChainState = { current: Promise<void> };
 

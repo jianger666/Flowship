@@ -89,7 +89,7 @@ export const taskDir = (id: string): string =>
 
 /**
  * events.jsonl 的绝对路径
- * agent cwd 是用户业务仓库、不是 ai-flow 本身、所以必须用绝对路径
+ * agent cwd 是用户业务仓库、不是 Flowship 本身、所以必须用绝对路径
  */
 export const getEventsLogPath = (taskId: string): string =>
   path.join(taskDir(taskId), EVENTS_FILE);
@@ -277,7 +277,7 @@ export const isValidMetaShape = (raw: unknown): raw is TaskMetaV06 => {
 // V0.6.27 改挂 globalThis：本模块被十几个 route import、Next.js dev 下不同 route
 // 是不同 webpack chunk、module-level Map 会各持一份（chat-mcp V0.3.3 实测踩过）——
 // 锁不共享 = withTaskLock 跨 route 不互斥、并发 patch meta.json 可能丢更新。
-const TASK_LOCKS_KEY = "__feAiFlowTaskFsLocksV1__";
+const TASK_LOCKS_KEY = "__flowshipTaskFsLocksV1__";
 const getTaskLocks = (): Map<string, Promise<unknown>> => {
   const g = globalThis as unknown as Record<
     string,
@@ -649,7 +649,7 @@ export const readEventsBefore = async (
  * 含 run 流 / 后台 post-check / ask notifier 等，必须按 taskId 串行化。
  * 挂 globalThis：与 withTaskLock 同因——Next.js dev 多 chunk 下 module-level Map 会分裂。
  */
-const EVENT_APPEND_CHAINS_KEY = "__feAiFlowEventAppendChainsV1__";
+const EVENT_APPEND_CHAINS_KEY = "__flowshipEventAppendChainsV1__";
 const getEventAppendChains = (): Map<string, Promise<void>> => {
   const g = globalThis as unknown as Record<
     string,
@@ -663,7 +663,7 @@ const getEventAppendChains = (): Map<string, Promise<void>> => {
  * per-task 进程内事件单调序号（与 append 链同挂 globalThis，防 chunk 分裂）。
  * 只在链内写行前发号，保证 seq 与磁盘 / publish 顺序一致。
  */
-const EVENT_SEQ_COUNTERS_KEY = "__feAiFlowEventSeqCountersV1__";
+const EVENT_SEQ_COUNTERS_KEY = "__flowshipEventSeqCountersV1__";
 const getEventSeqCounters = (): Map<string, number> => {
   const g = globalThis as unknown as Record<
     string,
@@ -705,7 +705,7 @@ export const EVENT_SEQ_SIDECAR_FILE = ".event-seq";
 const SEQ_SIDECAR_FLUSH_EVERY = 16;
 
 /** 进程内「已调度/已确认写入 sidecar」水位（与 counter 同挂 globalThis） */
-const EVENT_SEQ_SIDECAR_WRITTEN_KEY = "__feAiFlowEventSeqSidecarWrittenV1__";
+const EVENT_SEQ_SIDECAR_WRITTEN_KEY = "__flowshipEventSeqSidecarWrittenV1__";
 const getEventSeqSidecarWritten = (): Map<string, number> => {
   const g = globalThis as unknown as Record<
     string,
@@ -719,7 +719,7 @@ const getEventSeqSidecarWritten = (): Map<string, number> => {
 
 /** per-task sidecar 写串行链（挂 globalThis，与 HMR 寿命对齐） */
 const EVENT_SEQ_SIDECAR_WRITE_CHAIN_KEY =
-  "__feAiFlowEventSeqSidecarWriteChainV1__";
+  "__flowshipEventSeqSidecarWriteChainV1__";
 const getEventSeqSidecarWriteChains = (): Map<string, Promise<void>> => {
   const g = globalThis as unknown as Record<
     string,

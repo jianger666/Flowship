@@ -24,10 +24,11 @@ import { isValidModel } from "@/lib/server/route-helpers";
 import type { TaskSummary } from "@/lib/types";
 
 import { injectPendingAskText } from "./ask-inject";
-import { findTaskByMessageId } from "./card-map";
+import { findTaskByMessageId, rememberCardMessage } from "./card-map";
 import {
   downloadMessageResource,
   getBotAppInfo,
+  larkApi,
   sendTextMessage,
 } from "./lark-api";
 import type { FeishuInboundMessage } from "./types";
@@ -178,6 +179,8 @@ type RouterDeps = {
   sendTextMessage: typeof sendTextMessage;
   downloadMessageResource: typeof downloadMessageResource;
   findTaskByMessageId: typeof findTaskByMessageId;
+  rememberCardMessage: typeof rememberCardMessage;
+  larkApi: typeof larkApi;
   listTasks: typeof listTasks;
   createTask: typeof createTask;
   getPendingAsk: typeof getPendingAsk;
@@ -193,6 +196,8 @@ let deps: RouterDeps = {
   sendTextMessage,
   downloadMessageResource,
   findTaskByMessageId,
+  rememberCardMessage,
+  larkApi,
   listTasks,
   createTask,
   getPendingAsk,
@@ -213,6 +218,8 @@ export const __setRouterDepsForTest = (
       sendTextMessage,
       downloadMessageResource,
       findTaskByMessageId,
+      rememberCardMessage,
+      larkApi,
       listTasks,
       createTask,
       getPendingAsk,
@@ -476,11 +483,13 @@ const titleFromMessage = (text: string): string => {
     : t;
 };
 
-/** 从 settings 读 bootArgs + 默认 workdir */
+/** 从 settings 读 bootArgs + 默认 workdir + MCP 黑名单 */
 export const loadBridgeBootContext = async (): Promise<{
   apiKey: string;
   model: ModelSelection;
   repoPaths: string[];
+  /** 设置页「默认禁用 MCP」黑名单（与 app 内新建对话同源） */
+  disabledMcpServers: string[];
 } | null> => {
   const result = await deps.readSettingsFile();
   if (result.status !== "ok") return null;
@@ -496,10 +505,19 @@ export const loadBridgeBootContext = async (): Promise<{
       if (p) repoPaths.push(p);
     }
   }
-  return { apiKey, model, repoPaths };
+  const disabledMcpServers = Array.isArray(s.disabledMcpServers)
+    ? s.disabledMcpServers.filter((x): x is string => typeof x === "string")
+    : [];
+  return { apiKey, model, repoPaths, disabledMcpServers };
 };
 
-/** 桥接侧建新 chat（/new 与 0 活跃自动建共用）；不改逻辑，仅导出给 commands */
+/**
+ * 桥接侧建新 chat（/new 与 0 活跃自动建共用）。
+ *
+ * 参数对齐 app 内一键新建对话（use-new-chat.ts）：不绑工作目录（repoPaths 空）、
+ * MCP 黑名单跟设置页「默认禁用 MCP」（不传 = 全开、错）。
+ * 差异仅标题：app 是空标题占位，飞书场景取消息前缀更好认（多对话列表里可辨）。
+ */
 export const createChatTaskForBridge = async (
   title: string,
 ): Promise<{ taskId: string; title: string } | { error: string }> => {
@@ -510,8 +528,10 @@ export const createChatTaskForBridge = async (
   const task = await deps.createTask({
     title,
     mode: "chat",
-    repoPaths: boot.repoPaths.slice(0, 1),
+    repoPaths: [],
     model: boot.model,
+    disabledMcpServers:
+      boot.disabledMcpServers.length > 0 ? boot.disabledMcpServers : undefined,
   });
   deps.prewarmTaskWorkspace(task.id);
   return { taskId: task.id, title: task.title };
@@ -597,6 +617,84 @@ const notifyOwnerError = async (text: string): Promise<void> => {
       "[feishu-bridge/router] 错误回执发送失败:",
       err instanceof Error ? err.message : err,
     );
+  }
+};
+
+/**
+ * 发一条「与具体 task 绑定」的文本提示（如「已开新对话：xxx」），
+ * 成功后把 message_id 记进 card-map——用户回复这条提示即可锚定到该 task。
+ * cardId 空串 = 纯文本提示（无卡片实体）；card-map 读盘校验只要求 string、兼容既有数据。
+ * 「多对话列表」这类不绑定 task 的提示不要走本函数（继续 notifyOwnerError）。
+ */
+export const sendTaskBoundText = async (
+  taskId: string,
+  text: string,
+): Promise<void> => {
+  const info = await deps.getBotAppInfo();
+  const sent = await deps.sendTextMessage(info.ownerOpenId, text);
+  try {
+    await deps.rememberCardMessage({
+      messageId: sent.message_id,
+      cardId: "",
+      taskId,
+      createdAt: Date.now(),
+    });
+  } catch (err) {
+    // 记录失败只影响「回复这条提示」的锚定、不影响消息本身——降级 warn
+    console.warn(
+      "[feishu-bridge/router] 提示消息记 card-map 失败:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+};
+
+/**
+ * 解析「回复」锚定 id：优先事件自带的 root_id / parent_id；两者都缺时按
+ * message_id 反查一次 REST 消息详情补齐。
+ *
+ * 实证（2026-07-19、真实消息 om_x100b6afcc99c68a0b2a3e1bca85c0ce）：
+ * - lark-cli `event consume im.message.receive_v1` 的 NDJSON schema **不含**
+ *   root_id / parent_id（`event schema` 输出可证）——事件路径拿不到被回复消息 id、
+ *   这是「回复卡片仍提示多对话」的根因；
+ * - REST `GET /open-apis/im/v1/messages/:message_id` 两个字段都有：
+ *   直接回复时 root_id === parent_id === 被回复消息 id、可对上 card-map。
+ * 反查失败静默返回空（走活跃 chat 兜底），不阻断注入。
+ */
+export const resolveReplyAnchorIds = async (
+  msg: FeishuInboundMessage,
+): Promise<string[]> => {
+  // 直接回复时 root_id === parent_id——去重避免同一 id 查两次盘
+  const own = [
+    ...new Set(
+      [msg.root_id, msg.parent_id].filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      ),
+    ),
+  ];
+  if (own.length > 0) return own;
+  try {
+    const rec = await deps.larkApi(
+      "GET",
+      `/open-apis/im/v1/messages/${msg.message_id}`,
+    );
+    const data = (rec.data as Record<string, unknown> | undefined) ?? rec;
+    const items = Array.isArray(data.items) ? data.items : [];
+    const first = items[0];
+    if (!first || typeof first !== "object") return [];
+    const it = first as Record<string, unknown>;
+    return [
+      ...new Set(
+        [it.root_id, it.parent_id].filter(
+          (v): v is string => typeof v === "string" && v.length > 0,
+        ),
+      ),
+    ];
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/router] 反查消息 parent/root 失败（忽略、走活跃兜底）:",
+      err instanceof Error ? err.message : err,
+    );
+    return [];
   }
 };
 
@@ -692,11 +790,14 @@ export const routeInboundMessage = async (
     return { kind: "skipped", messageId: msg.message_id, error: "空消息" };
   }
 
-  // 4) 定位 taskId
+  // 4) 定位 taskId：回复锚定（root_id / parent_id 依次查 card-map）优先于活跃 chat 分支
   let taskId: string | undefined;
-  if (msg.root_id) {
-    const hit = await deps.findTaskByMessageId(msg.root_id);
-    if (hit) taskId = hit.taskId;
+  for (const anchorId of await resolveReplyAnchorIds(msg)) {
+    const hit = await deps.findTaskByMessageId(anchorId);
+    if (hit) {
+      taskId = hit.taskId;
+      break;
+    }
   }
 
   if (!taskId) {
@@ -716,11 +817,8 @@ export const routeInboundMessage = async (
       }
       taskId = created.taskId;
       try {
-        const info = await deps.getBotAppInfo();
-        await deps.sendTextMessage(
-          info.ownerOpenId,
-          `已开新对话：${created.title}`,
-        );
+        // task 绑定类提示：记 card-map、用户回复这条「已开新对话」也能锚定
+        await sendTaskBoundText(created.taskId, `已开新对话：${created.title}`);
       } catch {
         // 提示失败不阻断注入
       }

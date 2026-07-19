@@ -31,7 +31,7 @@ import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
 
 /** 同页 markTaskSeen 后派发，驱动侧栏重读 localStorage（storage 事件只跨 tab） */
-export const TASK_SEEN_EVENT = "fe-ai-flow:task-seen";
+export const TASK_SEEN_EVENT = "flowship:task-seen";
 
 const subscribeTaskSeen = (onStoreChange: () => void) => {
   if (typeof window === "undefined") return () => {};

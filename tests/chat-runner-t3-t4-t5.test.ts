@@ -26,7 +26,7 @@ import { MIN_COMPACT_SUMMARY_CHARS } from "@/lib/server/chat-compact-prompt";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-t3-t4-t5-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
-process.env.FE_AI_FLOW_DATA_DIR = DATA_DIR;
+process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();

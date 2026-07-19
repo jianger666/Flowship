@@ -73,7 +73,7 @@ const PROBE_TIMEOUT_MS = 10_000;
 export const mergeLoginShellPath = async (): Promise<void> => {
   if (process.platform !== "darwin") return;
   const shell = process.env.SHELL || "/bin/zsh";
-  const marker = "__FE_AI_FLOW_PATH_MARKER__";
+  const marker = "__FLOWSHIP_PATH_MARKER__";
   try {
     // -ilc：interactive + login——.zprofile/.zshrc（nvm/homebrew 常写在这）都会被 source
     const { stdout } = await execFileAsync(

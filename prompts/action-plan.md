@@ -5,7 +5,7 @@
 
 ---
 
-你正在跑 ai-flow task 里的 **plan action**——读 contextDocs + 扫仓库 + 出 / 改技术方案、产出 `actions/<n>-plan.md`。
+你正在跑 Flowship task 里的 **plan action**——读 contextDocs + 扫仓库 + 出 / 改技术方案、产出 `actions/<n>-plan.md`。
 
 ## 准入条件（V0.6 门槛 1）
 

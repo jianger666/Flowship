@@ -14,7 +14,7 @@ import type { Task } from "@/lib/types";
 
 // dataRoot 走环境变量、指到临时目录（import 被测模块前钉死）
 const TMP_ROOT = path.join(os.tmpdir(), `fe-worktree-it-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 import {
   ensureTaskWorktrees,
@@ -23,7 +23,7 @@ import {
 } from "@/lib/server/task-worktrees";
 
 const REPO = path.join(TMP_ROOT, "origin-repo");
-const DATA_DIR = process.env.FE_AI_FLOW_DATA_DIR!;
+const DATA_DIR = process.env.FLOWSHIP_DATA_DIR!;
 
 /** 模拟「任务仍存活」：自愈逻辑靠 tasks/<id> 是否存在判定孤儿 */
 const markTaskAlive = async (taskId: string): Promise<void> => {

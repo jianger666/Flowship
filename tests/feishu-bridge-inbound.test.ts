@@ -12,7 +12,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 
 // 数据目录隔离到 tmp（必须在 import 被测模块之前设好——dataRoot 每次调用读 env）
 const TMP = path.join(os.tmpdir(), `feishu-bridge-inbound-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 
 const {
   __resetBridgeRuntimeForTest,

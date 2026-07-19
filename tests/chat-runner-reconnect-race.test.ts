@@ -11,7 +11,7 @@
  * 醒来会误关用户刚恢复的实例。本测试用「三次 resume 全部返回同一 AGENT_ID」钉死该场景。
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
- * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import。
+ * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -31,7 +31,7 @@ import type { Task, TaskEvent } from "@/lib/types";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-reconnect-race-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
-process.env.FE_AI_FLOW_DATA_DIR = DATA_DIR;
+process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
 
 const mockResume = vi.fn();
 vi.mock("@cursor/sdk", () => ({

@@ -73,7 +73,7 @@ const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 // 私有临时目录（CR-05）：os.tmpdir 是共享可写目录、可预测文件名有 symlink / 抢占
 // 风险——统一用 mkdtemp 拿带随机后缀的私有目录、下载 / 解包全在里面做
 const makePrivateTmpDir = async (label: string): Promise<string> =>
-  fs.mkdtemp(path.join(os.tmpdir(), `fe-ai-flow-${label}-`));
+  fs.mkdtemp(path.join(os.tmpdir(), `flowship-${label}-`));
 
 /** 流式计数：超 MAX_DOWNLOAD_BYTES 中止（防无 Content-Length 的无限流） */
 const createByteLimitTransform = (): Transform => {

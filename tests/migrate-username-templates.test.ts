@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 const TMP_DATA = path.join(os.tmpdir(), `fe-migrate-username-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = TMP_DATA;
+process.env.FLOWSHIP_DATA_DIR = TMP_DATA;
 
 import {
   migrateUsernameBranchTemplates,

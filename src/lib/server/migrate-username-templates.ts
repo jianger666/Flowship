@@ -9,7 +9,7 @@
  * 幂等：第二次启动扫不到残留 → 零写盘。
  *
  * 写盘不用 writeMeta：task-fs-core 的 DATA_DIR 在模块加载时冻结，
- * 测试 / 动态 FE_AI_FLOW_DATA_DIR 场景会写错目录；这里全程走运行时 dataRoot()。
+ * 测试 / 动态 FLOWSHIP_DATA_DIR 场景会写错目录；这里全程走运行时 dataRoot()。
  */
 
 import { promises as fs } from "node:fs";

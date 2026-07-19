@@ -9,7 +9,7 @@
  *   prune 本身不感知状态——agent 活跃时 route 跳过 prune，只列不清）
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
- * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import，否则全量并行时多文件撞 cwd/data/tasks。
+ * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import，否则全量并行时多文件撞 cwd/data/tasks。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -21,7 +21,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
 // OS 保证唯一；必须在动态 import 之前钉死 env
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-task-artifacts-rev-"));
-process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
+process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;
 
 const { taskDir, writeMeta } = await import("@/lib/server/task-fs-core");
 const {

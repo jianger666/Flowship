@@ -16,7 +16,7 @@ const seenFilePath = (): string => path.join(dataRoot(), "mr-inbox-seen.json");
 
 // 读改写互斥链挂 globalThis：Next dev 多 chunk 下 module-level Promise 各持一份、锁失效
 // （同 task-fs-core withTaskLock 踩坑；审查发现本文件原先用 module 级 let）
-const SEEN_WRITE_CHAIN_KEY = "__feAiFlowMrInboxSeenWriteChainV1__";
+const SEEN_WRITE_CHAIN_KEY = "__flowshipMrInboxSeenWriteChainV1__";
 const getSeenWriteChain = (): { current: Promise<unknown> } => {
   const g = globalThis as unknown as Record<
     string,

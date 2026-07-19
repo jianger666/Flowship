@@ -7,7 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const TMP = path.join(os.tmpdir(), `feishu-bridge-stream-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 
 const {
   updateCardElementContent,
@@ -50,6 +50,8 @@ const {
   applyPrefixGuard,
   closeUnclosedCodeFence,
   truncateForCard,
+  buildStreamingCardJson,
+  coloredModelLabel,
   createCardStream,
   __setCardStreamTimersForTest,
 } = await import("@/lib/server/feishu-bridge/card-stream");
@@ -86,6 +88,70 @@ describe("prefix / truncate helpers", () => {
     const out = truncateForCard(long);
     expect(out.length).toBeLessThan(long.length);
     expect(out.endsWith("内容过长，完整回复在 app 内查看")).toBe(true);
+  });
+});
+
+describe("buildStreamingCardJson Hermes 样式", () => {
+  it("分区顺序：quote → answer → panel → hr → footer；面板带边框", () => {
+    const card = buildStreamingCardJson({
+      title: "聊",
+      subtitle: "正在执行终端：pnpm lint",
+      template: "blue",
+      quoteMd: "> 💬 你在 app：hi",
+      processText: "> `Shell` · running\n> pnpm lint",
+      answerText: "正文",
+      footerText: "3s · smoke",
+    });
+    const ids = (
+      card.body as { elements: Array<{ element_id?: string; tag?: string }> }
+    ).elements.map((e) => e.element_id ?? e.tag);
+    expect(ids).toEqual([
+      "md_quote",
+      "md_answer",
+      "panel_process",
+      "main_divider",
+      "md_footer",
+    ]);
+    const panel = (
+      card.body as {
+        elements: Array<{
+          element_id?: string;
+          header?: { title?: { tag?: string; content?: string } };
+          border?: { color?: string };
+          padding?: string;
+        }>;
+      }
+    ).elements.find((e) => e.element_id === "panel_process");
+    expect(panel?.header?.title?.tag).toBe("plain_text");
+    expect(panel?.header?.title?.content).toContain("思考与工具 · 1 次工具调用");
+    expect(panel?.border?.color).toBe("grey");
+    expect(panel?.padding).toBe("8px 8px 8px 8px");
+    const footer = (
+      card.body as {
+        elements: Array<{ element_id?: string; text_size?: string }>;
+      }
+    ).elements.find((e) => e.element_id === "md_footer");
+    expect(footer?.text_size).toBe("x-small");
+    // 有 subtitle 才挂 header.subtitle
+    expect(
+      (card.header as { subtitle?: { content: string } }).subtitle?.content,
+    ).toBe("正在执行终端：pnpm lint");
+  });
+
+  it("空 subtitle 不写 header.subtitle；模型着色", () => {
+    const card = buildStreamingCardJson({
+      title: "聊",
+      subtitle: "",
+      template: "blue",
+      answerText: "x",
+    });
+    expect(
+      (card.header as { subtitle?: unknown }).subtitle,
+    ).toBeUndefined();
+    expect(coloredModelLabel("gpt-5.5")).toBe(
+      '<font color="blue">gpt-5.5</font>',
+    );
+    expect(coloredModelLabel("MiniMax M2.7")).toBe("MiniMax M2.7");
   });
 });
 
@@ -154,7 +220,7 @@ describe("createCardStream", () => {
   });
 
   it("finalize：刷余量 + 关 streaming + header/footer", async () => {
-    process.env.FE_AI_FLOW_TEST = "1";
+    process.env.FLOWSHIP_TEST = "1";
     const stream = createCardStream("task_fin", { title: "聊", openId: "ou" });
     await stream.start();
     stream.pushAnswer("最终回复");
@@ -174,17 +240,20 @@ describe("createCardStream", () => {
       }, number]
     >;
     const cardJson = entityCalls.at(-1)![1];
-    expect(cardJson.header.subtitle.content).toBe("✅ 完成");
+    expect(cardJson.header.subtitle.content).toBe("已完成");
     expect(cardJson.header.template).toBe("green");
     const footer = cardJson.body.elements.find((e) => e.element_id === "md_footer");
     expect(footer?.content).toContain("flowship-test://tasks/task_fin");
     expect(footer?.content).toContain("composer");
+    // Hermes 完成 footer：耗时裸数字（无「耗时」前缀）+ · 分隔
+    expect(footer?.content).toMatch(/2m5s/);
+    expect(footer?.content).not.toContain("耗时 ");
     expect(patchCardSettings).toHaveBeenCalled();
     const settingsCalls = patchCardSettings.mock.calls as unknown as Array<
       [string, { config: { streaming_mode: boolean } }, number]
     >;
     expect(settingsCalls[0]![1].config.streaming_mode).toBe(false);
-    delete process.env.FE_AI_FLOW_TEST;
+    delete process.env.FLOWSHIP_TEST;
   });
 
   it("lark 失败静默降级、failCount 递增", async () => {

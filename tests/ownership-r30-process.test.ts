@@ -25,7 +25,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 const TMP_ROOT = mkdtempSync(
   path.join(os.tmpdir(), "fe-ownership-r30-process-"),
 );
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();

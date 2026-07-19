@@ -25,7 +25,7 @@ type TaskTerminalStore = {
   listListeners: Set<(taskId: string) => void>;
 };
 
-const GLOBAL_KEY = "__feAiFlowTaskTerminalR35" as const;
+const GLOBAL_KEY = "__flowshipTaskTerminalR35" as const;
 
 const getStore = (): TaskTerminalStore => {
   const g = globalThis as typeof globalThis & {

@@ -212,7 +212,7 @@ export interface TaskOpHandle {
 // V4：2026-07-07 V0.11 加 agentSessions（wait 退役、agent 会话跨 run 存活）
 // V3：2026-06-22 V0.8.18 加 runningChecks（后置 check 异步化、bump 防 dev hot reload 拿到旧 state 缺字段）
 // V2：2026-05-27 V0.6 上线、bump 版本号防 dev hot reload 拿到 V0.5 残留 state
-const TASK_RUNNER_GLOBAL_KEY = "__feAiFlowTaskRunnerStateV12__";
+const TASK_RUNNER_GLOBAL_KEY = "__flowshipTaskRunnerStateV12__";
 
 const coerceStartingMap = (
   raw: Map<string, number> | Set<string> | undefined,
@@ -440,7 +440,7 @@ export type AllTaskStreamListener = (
   ev: TaskStreamEvent,
 ) => void;
 
-const ALL_STREAM_LISTENERS_KEY = "__feAiFlowAllTaskStreamListenersV1__";
+const ALL_STREAM_LISTENERS_KEY = "__flowshipAllTaskStreamListenersV1__";
 
 const getAllStreamListeners = (): Set<AllTaskStreamListener> => {
   const g = globalThis as unknown as Record<

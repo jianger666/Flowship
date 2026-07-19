@@ -7,7 +7,7 @@
  * 语义：push 最新选的目录到队首、去重、最多留 MAX 个。
  */
 
-const KEY = "fe-ai-flow:recent-workdirs";
+const KEY = "flowship:recent-workdirs";
 // 最多记几个最近目录（够覆盖「几个项目间来回切」、再多下拉就太长）
 const MAX = 5;
 

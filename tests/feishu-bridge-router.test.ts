@@ -82,13 +82,19 @@ describe("routeInboundMessage", () => {
       }),
   );
   const injectAsk = vi.fn(async () => ({ ok: true as const }));
-  const findByRoot = vi.fn(
-    async (): Promise<{
+  const findByRoot = vi.fn<
+    (id: string) => Promise<{
       messageId: string;
       cardId: string;
       taskId: string;
       createdAt: number;
-    } | null> => null,
+    } | null>
+  >(async () => null);
+  // bot 提示消息记 card-map（「已开新对话」记 / 多对话列表不记）
+  const remember = vi.fn(async () => undefined);
+  // REST 反查消息详情（事件缺 root_id/parent_id 时补齐锚定）；默认查无此消息
+  const larkApiMock = vi.fn(
+    async (): Promise<Record<string, unknown>> => ({ data: { items: [] } }),
   );
   const listTasks = vi.fn(async () => [mockTask()]);
   const getPending = vi.fn(
@@ -106,6 +112,9 @@ describe("routeInboundMessage", () => {
     handleChat.mockClear();
     injectAsk.mockClear();
     findByRoot.mockClear();
+    remember.mockClear();
+    larkApiMock.mockClear();
+    larkApiMock.mockResolvedValue({ data: { items: [] } });
     listTasks.mockClear();
     listTasks.mockResolvedValue([mockTask()]);
     getPending.mockClear();
@@ -123,6 +132,8 @@ describe("routeInboundMessage", () => {
       sendTextMessage: sendText,
       downloadMessageResource: async () => "/tmp/x",
       findTaskByMessageId: findByRoot,
+      rememberCardMessage: remember,
+      larkApi: larkApiMock as never,
       listTasks,
       createTask: async (input) =>
         ({
@@ -182,9 +193,109 @@ describe("routeInboundMessage", () => {
         },
       }),
     );
+    // 事件自带锚定 id 时不反查 REST
+    expect(larkApiMock).not.toHaveBeenCalled();
   });
 
-  it("0 个活跃 → 自动新建", async () => {
+  it("只有 parent_id 也能锚定（root_id 缺失）", async () => {
+    findByRoot.mockImplementation(async (id: string) =>
+      id === "om_parent"
+        ? {
+            messageId: "om_parent",
+            cardId: "c2",
+            taskId: "task-parent",
+            createdAt: Date.now(),
+          }
+        : null,
+    );
+    await routeInboundMessage(
+      baseMsg({ parent_id: "om_parent", content: "回父" }),
+    );
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-parent",
+      expect.objectContaining({ text: "回父" }),
+      expect.anything(),
+    );
+    findByRoot.mockReset();
+    findByRoot.mockResolvedValue(null);
+  });
+
+  // 实证：event consume 的 NDJSON 不含 root_id/parent_id——缺字段时按 message_id 反查 REST 补齐
+  it("事件缺 root_id/parent_id → REST 反查补齐后锚定", async () => {
+    larkApiMock.mockResolvedValueOnce({
+      data: {
+        items: [
+          {
+            message_id: "om_test_1",
+            root_id: "om_card_rest",
+            parent_id: "om_card_rest",
+          },
+        ],
+      },
+    });
+    findByRoot.mockImplementation(async (id: string) =>
+      id === "om_card_rest"
+        ? {
+            messageId: "om_card_rest",
+            cardId: "c3",
+            taskId: "task-rest",
+            createdAt: Date.now(),
+          }
+        : null,
+    );
+    await routeInboundMessage(baseMsg({ content: "我回复" }));
+    expect(larkApiMock).toHaveBeenCalledWith(
+      "GET",
+      "/open-apis/im/v1/messages/om_test_1",
+    );
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-rest",
+      expect.objectContaining({ text: "我回复" }),
+      expect.anything(),
+    );
+    // root_id === parent_id 去重、card-map 只查一次
+    expect(findByRoot).toHaveBeenCalledTimes(1);
+    findByRoot.mockReset();
+    findByRoot.mockResolvedValue(null);
+  });
+
+  it("REST 反查失败 → 静默走活跃兜底、不炸", async () => {
+    larkApiMock.mockRejectedValueOnce(new Error("boom"));
+    await routeInboundMessage(baseMsg({ content: "普通消息" }));
+    // 唯一活跃 → 正常注入
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ text: "普通消息" }),
+      expect.anything(),
+    );
+  });
+
+  it("0 个活跃 → 自动新建（对齐 useNewChat：repoPaths 空 + 带 MCP 黑名单）+「已开新对话」记 card-map", async () => {
+    const createTaskSpy = vi.fn(
+      async (input: {
+        title: string;
+        repoPaths?: string[];
+        disabledMcpServers?: string[];
+      }) =>
+        ({
+          id: "task-new",
+          title: input.title,
+          mode: "chat",
+        }) as never,
+    );
+    sendText.mockResolvedValueOnce({ chat_id: "c", message_id: "om_bot_tip" });
+    __setRouterDepsForTest({
+      createTask: createTaskSpy as never,
+      readSettingsFile: async () => ({
+        status: "ok" as const,
+        settings: {
+          apiKey: "sk-test",
+          defaultModel: { id: "gpt-5" },
+          repos: [{ path: "/tmp/repo" }],
+          disabledMcpServers: ["mcp-a", "mcp-b"],
+        },
+      }),
+    });
     listTasks.mockResolvedValueOnce([]);
     await routeInboundMessage(baseMsg({ content: "开个新话题吧朋友们" }));
     expect(handleChat).toHaveBeenCalledWith(
@@ -196,9 +307,41 @@ describe("routeInboundMessage", () => {
       "ou_owner",
       expect.stringContaining("已开新对话"),
     );
+    // 对齐 app 内一键新建：不绑工作目录、MCP 黑名单来自 settings
+    expect(createTaskSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoPaths: [],
+        disabledMcpServers: ["mcp-a", "mcp-b"],
+      }),
+    );
+    // task 绑定类提示 → 回复它可锚定
+    expect(remember).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "om_bot_tip",
+        cardId: "",
+        taskId: "task-new",
+      }),
+    );
   });
 
-  it("≥2 个活跃 → 提示并丢弃", async () => {
+  it("settings 无 MCP 黑名单 → 不传 disabledMcpServers（不显式传空数组）", async () => {
+    const createTaskSpy = vi.fn(
+      async (input: { title: string }) =>
+        ({
+          id: "task-new",
+          title: input.title,
+          mode: "chat",
+        }) as never,
+    );
+    __setRouterDepsForTest({ createTask: createTaskSpy as never });
+    listTasks.mockResolvedValueOnce([]);
+    await routeInboundMessage(baseMsg({ content: "新话题" }));
+    expect(createTaskSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ repoPaths: [], disabledMcpServers: undefined }),
+    );
+  });
+
+  it("≥2 个活跃 → 提示并丢弃、提示消息不记 card-map", async () => {
     listTasks.mockResolvedValueOnce([
       mockTask({ id: "a", title: "A" }),
       mockTask({ id: "b", title: "B" }),
@@ -210,6 +353,8 @@ describe("routeInboundMessage", () => {
       "ou_owner",
       expect.stringContaining("进行中的对话"),
     );
+    // 多对话列表不绑定 task → 不记 card-map
+    expect(remember).not.toHaveBeenCalled();
   });
 
   it("pendingAsk → ask 分流", async () => {

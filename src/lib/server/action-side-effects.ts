@@ -31,8 +31,8 @@ export type ClaimHandle = {
   actionId: string;
 };
 
-const ACTION_SIDE_EFFECTS_GLOBAL_KEY = "__feAiFlowActionSideEffectsV3__";
-const CLAIM_SEQ_GLOBAL_KEY = "__feAiFlowActionSideEffectClaimSeq__";
+const ACTION_SIDE_EFFECTS_GLOBAL_KEY = "__flowshipActionSideEffectsV3__";
+const CLAIM_SEQ_GLOBAL_KEY = "__flowshipActionSideEffectClaimSeq__";
 
 /**
  * 与 gitlab-client FETCH_TIMEOUT_MS(30s) × getMRMergeStatus maxPolls(5)
@@ -161,8 +161,8 @@ export const waitAndClaimPostCheck = async (
 ): Promise<WaitAndClaimPostCheckResult> => {
   // 测试可经 globalThis 压短 deadline（避免单测真等 200s）
   const testOverride = (
-    globalThis as unknown as { __feAiFlowActionSideEffectWaitMs?: number }
-  ).__feAiFlowActionSideEffectWaitMs;
+    globalThis as unknown as { __flowshipActionSideEffectWaitMs?: number }
+  ).__flowshipActionSideEffectWaitMs;
   const deadlineMs =
     opts?.deadlineMs ?? testOverride ?? ACTION_SIDE_EFFECT_WAIT_MS;
   const pollMs = opts?.pollMs ?? 50;

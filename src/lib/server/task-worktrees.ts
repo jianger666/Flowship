@@ -1028,9 +1028,9 @@ const snapshotDirtyWorktree = async (workDir: string): Promise<SnapshotResult> =
   // 本地快照 commit：绕过业务仓库自己的 hooks（可能装了 lint-staged 等、失败会挡快照）；
   // 用户没配 git 身份时给个兜底身份、保证「能 commit 的场景」一定能落。
   const committed = await runGit(workDir, [
-    "-c", "user.name=fe-ai-flow",
-    "-c", "user.email=fe-ai-flow@local",
-    "commit", "--no-verify", "-m", "WIP：任务终结前自动快照（fe-ai-flow）",
+    "-c", "user.name=flowship",
+    "-c", "user.email=flowship@local",
+    "commit", "--no-verify", "-m", "WIP：任务终结前自动快照（Flowship）",
   ]);
   if (!committed.ok) {
     console.warn(

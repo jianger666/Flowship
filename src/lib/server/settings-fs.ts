@@ -92,7 +92,7 @@ export const readSettingsFile = async (): Promise<SettingsReadResult> => {
 
 // 写链挂 globalThis：Next dev 多 chunk 下 module-level Promise 不共享（同 task-fs-core 踩坑）。
 // 审查发现：裸写无互斥时并发 PUT 丢更新——「读盘→合并→写盘」须整段进链。
-const SETTINGS_WRITE_CHAIN_KEY = "__feAiFlowSettingsWriteChainV1__";
+const SETTINGS_WRITE_CHAIN_KEY = "__flowshipSettingsWriteChainV1__";
 const getSettingsWriteChain = (): { current: Promise<unknown> } => {
   const g = globalThis as unknown as Record<
     string,

@@ -33,7 +33,7 @@ import {
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-ownership-r34-qo-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
-process.env.FE_AI_FLOW_DATA_DIR = DATA_DIR;
+process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
 
 const mockCreate = vi.fn();
 const mockResume = vi.fn();

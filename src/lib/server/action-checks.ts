@@ -426,7 +426,7 @@ const checkShip = async (
 // ----------------- dev（联调、V0.x）-----------------
 //
 // 联调两种推送方式（action.devPushMode）：
-//   - direct（直推）：本地 merge dev + 推 origin/dev、无 MR。推送 / 流水线结果 ai-flow 不追、
+//   - direct（直推）：本地 merge dev + 推 origin/dev、无 MR。推送 / 流水线结果 Flowship 不追、
 //     信任 agent 在 artifact 自述——无 MR 时仍读一次 artifact，确认真写了内容（非空预填路径不算过）。
 //   - mr（提 PR）：建 feature→dev 的 MR、复用 ship 同款门禁（URL 非空 + 冲突拦），文案换成联调 / dev。
 // 不做 ship 那套「每仓缺 MR 必须写跳过说明」的强校验——联调更轻、不强制覆盖所有仓、避免误拦。

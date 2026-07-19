@@ -10,7 +10,7 @@ import {
   mergePathStrings,
 } from "@/lib/server/login-shell-path";
 
-const M = "__FE_AI_FLOW_PATH_MARKER__";
+const M = "__FLOWSHIP_PATH_MARKER__";
 
 describe("extractPathFromShellOutput", () => {
   it("干净输出直接夹取", () => {

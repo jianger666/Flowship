@@ -62,12 +62,12 @@ export const stopTaskAgent = (
   const id = task.id;
   const inflightMap = (() => {
     const g = globalThis as unknown as {
-      __feAiFlowStopInflightV1__?: Map<string, Promise<StopResult>>;
+      __flowshipStopInflightV1__?: Map<string, Promise<StopResult>>;
     };
-    if (!g.__feAiFlowStopInflightV1__) {
-      g.__feAiFlowStopInflightV1__ = new Map();
+    if (!g.__flowshipStopInflightV1__) {
+      g.__flowshipStopInflightV1__ = new Map();
     }
-    return g.__feAiFlowStopInflightV1__;
+    return g.__flowshipStopInflightV1__;
   })();
   const existing = inflightMap.get(id);
   if (existing) return existing;

@@ -140,7 +140,7 @@ interface ChatMcpGlobalState {
 //      pendingNextActions / unansweredRevises / chatModeTasks / prematureWaitRejects、
 //      新增 pendingAsks（ask 弹窗登记）。bump 强制 dev hot reload 拿全新 state。
 // V12 及更早见 git 历史（wait 协议时代的状态机字段）。
-const GLOBAL_KEY = "__feAiFlowChatStateV14__";
+const GLOBAL_KEY = "__flowshipChatStateV14__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;

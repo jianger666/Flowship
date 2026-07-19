@@ -3,7 +3,7 @@
  * 起 next（dev 或 start）、并在 server ready 后自动开浏览器
  *
  * 使用方法：
- *   - `pnpm start`：起 next dev（热更、改 ai-flow 代码时用、但按需编译会抖 chat-mcp globalThis 状态）
+ *   - `pnpm start`：起 next dev（热更、改 Flowship 代码时用、但按需编译会抖 chat-mcp globalThis 状态）
  *   - `pnpm serve`：先 next build 再起 next start（生产、跑真实大需求用、单一模块树、状态稳）
  *
  * 参数：argv[2] = "start" → 生产模式（next start）；其它 / 缺省 → dev 模式（next dev）

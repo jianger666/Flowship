@@ -80,7 +80,7 @@ interface BoardResp {
   projects?: Array<{ key: string; name: string; simpleName?: string }>;
 }
 
-const CACHE_KEY = "feaiflow.board.cache.v3";
+const CACHE_KEY = "flowship.board.cache.v3";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // ---------- 主组件 ----------

@@ -46,7 +46,7 @@ const MAX_ENTRIES_PER_ROOT = 20_000;
 
 const CACHE_TTL_MS = 60_000;
 /** V2：加 inFlight，避免首次扫描未完成时并发重复扫仓；挂 globalThis 防 Next dev 多 chunk 分裂 */
-const CACHE_KEY = "__feAiFlowRepoFilesCacheV2__";
+const CACHE_KEY = "__flowshipRepoFilesCacheV2__";
 
 export interface RepoFileEntry {
   /** 插入 `@` token 的相对路径；目录以 `/` 结尾 */

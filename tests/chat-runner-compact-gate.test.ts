@@ -6,7 +6,7 @@
  * chat-reply 白白入队再被 flush 静默清掉。
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
- * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import。
+ * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -24,7 +24,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
 // OS 保证唯一；必须在动态 import 之前钉死 env
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-compact-gate-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 // @cursor/sdk 在 vitest 里可能拖进原生/重依赖；门闩测试不需要真实 Agent
 vi.mock("@cursor/sdk", () => ({

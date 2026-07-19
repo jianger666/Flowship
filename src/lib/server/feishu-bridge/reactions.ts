@@ -40,7 +40,7 @@ const reactionByMessageId = new Map<string, ReactionEntry>();
 /** FIFO 顺序，超上限淘汰最旧 */
 const reactionOrder: string[] = [];
 
-const REG_KEY = "__feAiFlowFeishuReactionReceiptsV1__";
+const REG_KEY = "__flowshipFeishuReactionReceiptsV1__";
 
 type ReactionsGlobal = {
   registered: boolean;

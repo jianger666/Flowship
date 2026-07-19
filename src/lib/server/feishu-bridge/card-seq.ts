@@ -12,7 +12,7 @@
  * - 进程内单调：同秒多次更新靠 last+1 保证严格递增
  */
 
-const SEQ_KEY = "__feAiFlowFeishuCardSeqV1__";
+const SEQ_KEY = "__flowshipFeishuCardSeqV1__";
 
 /** cardId → 上次分配的 sequence（挂 globalThis，dev HMR 不丢） */
 const getSeqMap = (): Map<string, number> => {

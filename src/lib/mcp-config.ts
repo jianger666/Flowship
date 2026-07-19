@@ -5,4 +5,4 @@
  * Cursor mcp.json 仅作能力页「从 Cursor 导入」源、不再做隐式合并。
  */
 /** runtime 强制注入、不允许用户占用 */
-export const RESERVED_MCP_NAMES = new Set(["aiFlowChat"]);
+export const RESERVED_MCP_NAMES = new Set(["flowshipChat"]);

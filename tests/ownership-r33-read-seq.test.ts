@@ -27,7 +27,7 @@ import type { TaskSummary } from "@/lib/types";
 const TMP_ROOT = mkdtempSync(
   path.join(os.tmpdir(), "fe-ownership-r33-read-seq-"),
 );
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 vi.mock("@cursor/sdk", () => ({
   Agent: {
@@ -86,7 +86,7 @@ if (!taskDir("probe").startsWith(TMP_ROOT)) {
   );
 }
 
-const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
+const RECOVERY_FLAG = "__flowshipBootRecoveryPromiseV2__";
 
 const skipBootRecovery = (): void => {
   const g = globalThis as unknown as Record<string, Promise<void> | undefined>;

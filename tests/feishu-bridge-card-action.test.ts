@@ -248,7 +248,7 @@ describe("handleCardActionEvent", () => {
     );
     expect(batchUpdateCard).toHaveBeenCalled();
     const actionsJson = JSON.stringify(batchUpdateCard.mock.calls);
-    expect(actionsJson).toContain("✅ 已选：方案 A");
+    expect(actionsJson).toContain("已选择：方案 A");
     expect(actionsJson).toContain("delete_elements");
   });
 

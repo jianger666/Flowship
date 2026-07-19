@@ -172,6 +172,8 @@ type TurnState = {
   toolCount: number;
   /** 当前工具名（header 用） */
   currentToolName: string;
+  /** 当前工具参数摘要（Hermes 式 subtitle「正在Xxx：target」用） */
+  currentToolArgs: string;
   /** 卡片句柄；首个 assistant 活动后才有 */
   card: CardStreamHandle | null;
   /** start() 进行中的 Promise——后续 push 排队等它 */
@@ -205,7 +207,7 @@ type OutboundGlobal = {
   chains: Map<string, Promise<void>>;
 };
 
-const OUTBOUND_GLOBAL_KEY = "__feAiFlowFeishuOutboundV1__";
+const OUTBOUND_GLOBAL_KEY = "__flowshipFeishuOutboundV1__";
 
 const getOutboundGlobal = (): OutboundGlobal => {
   const g = globalThis as unknown as Record<
@@ -258,15 +260,155 @@ export const formatElapsed = (ms: number): string => {
   return s ? `${m}m${s}s` : `${m}m`;
 };
 
-const renderProcess = (parts: ProcessPart[]): string =>
-  parts
-    .map((p) => {
-      if (p.kind === "thinking") return `🧠 ${p.text}`;
-      const mark =
-        p.status === "ok" ? " ✓" : p.status === "err" ? " ✗" : "";
-      return `🔧 ${p.name}：${p.argsSummary}${mark}`;
+/** Hermes runtime header 上限 */
+const RUNTIME_HEADER_MAX_CHARS = 120;
+
+/**
+ * 从工具 args JSON / 摘要里抽出展示用 target（command / path / query…）。
+ * 解析失败则退回原摘要单行。
+ */
+const extractToolPreviewTarget = (argsSummary: string): string => {
+  const text = argsSummary.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const o = parsed as Record<string, unknown>;
+      for (const key of [
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "file",
+        "target_file",
+        "query",
+        "url",
+        "pattern",
+        "glob_pattern",
+      ]) {
+        const v = o[key];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+    }
+  } catch {
+    // 非 JSON——下文按纯文本 target 处理
+  }
+  // 去掉「参数:」前缀（Hermes 会丢弃这类噪声）
+  if (/^(参数[:：]|args?:|arguments:)/i.test(text)) return "";
+  return text;
+};
+
+/**
+ * Hermes `_runtime_tool_summary` 同款：把工具名 + 摘要收成单行 subtitle。
+ * 例：正在执行终端：pnpm lint / 正在读取：foo.ts / 正在使用 shell
+ */
+export const formatToolRuntimePreview = (
+  name: string,
+  argsSummary: string,
+): string => {
+  const raw = argsSummary.replace(/\s+/g, " ").trim();
+  if (raw.startsWith("正在")) {
+    return raw.length <= RUNTIME_HEADER_MAX_CHARS
+      ? raw
+      : `${raw.slice(0, RUNTIME_HEADER_MAX_CHARS - 1).trimEnd()}…`;
+  }
+
+  const toolName = (name || "").trim().toLowerCase();
+  const preview = extractToolPreviewTarget(raw);
+  const isUrl = /^https?:\/\//i.test(preview);
+  const looksSearch =
+    /\bsite:\S+/i.test(preview) ||
+    toolName.includes("search") ||
+    toolName.includes("query");
+
+  let action: string;
+  if (looksSearch) {
+    action = "正在搜索";
+  } else if (
+    isUrl ||
+    ["browser", "fetch", "web", "http"].some((m) => toolName.includes(m))
+  ) {
+    action = "正在浏览";
+  } else if (
+    ["terminal", "shell", "exec", "command", "bash", "zsh"].some((m) =>
+      toolName.includes(m),
+    )
+  ) {
+    action = "正在执行终端";
+  } else if (
+    ["write", "edit", "patch", "replace", "strreplace"].some((m) =>
+      toolName.includes(m),
+    )
+  ) {
+    action = "正在编辑";
+  } else if (
+    ["read", "open", "list", "glob", "grep"].some((m) => toolName.includes(m))
+  ) {
+    action = "正在读取";
+  } else {
+    const readable = toolName.replace(/_/g, " ").trim() || "工具";
+    const fallback = `正在使用 ${readable}`;
+    return fallback.length <= RUNTIME_HEADER_MAX_CHARS
+      ? fallback
+      : `${fallback.slice(0, RUNTIME_HEADER_MAX_CHARS - 1).trimEnd()}…`;
+  }
+
+  let target = preview;
+  if (isUrl) {
+    try {
+      const u = new URL(preview);
+      const host = u.hostname.replace(/^www\./, "");
+      const p = u.pathname.replace(/\/$/, "");
+      target = host ? `${host}${p}` : "";
+    } catch {
+      target = preview;
+    }
+  } else if (
+    (action === "正在读取" || action === "正在编辑") &&
+    (target.startsWith("/") || target.startsWith("~/"))
+  ) {
+    const pathOnly = target.split(/\s/, 1)[0] ?? target;
+    target = pathOnly.replace(/\/$/, "").split("/").pop() ?? pathOnly;
+  }
+
+  const line = target ? `${action}：${target}` : action;
+  if (line.length <= RUNTIME_HEADER_MAX_CHARS) return line;
+  return `${line.slice(0, RUNTIME_HEADER_MAX_CHARS - 1).trimEnd()}…`;
+};
+
+/**
+ * Hermes timeline 呈现：
+ * - 思考：`**思考 N** · running|completed` + 正文
+ * - 工具：引用块 `` `name` · status `` + 参数摘要行
+ * （折叠面板 chrome 在 card-stream；这里只拼 md_process 内容）
+ */
+const renderProcess = (parts: ProcessPart[]): string => {
+  let thinkingIdx = 0;
+  const openThinkingIdx =
+    parts.length > 0 && parts[parts.length - 1]!.kind === "thinking"
+      ? parts.length - 1
+      : -1;
+
+  return parts
+    .map((p, i) => {
+      if (p.kind === "thinking") {
+        thinkingIdx += 1;
+        const status = i === openThinkingIdx ? "running" : "completed";
+        return `**思考 ${thinkingIdx}** · ${status}\n${p.text}`;
+      }
+      const status =
+        p.status === "ok"
+          ? "completed"
+          : p.status === "err"
+            ? "failed"
+            : "running";
+      const lines = [`\`${p.name}\` · ${status}`];
+      if (p.argsSummary.trim()) lines.push(p.argsSummary.trim());
+      // Hermes `_quote_markdown`：整块工具条目包进引用
+      return lines.map((line) => (line ? `> ${line}` : ">")).join("\n");
     })
     .join("\n\n");
+};
 
 const isLocalImageSrc = (src: string): boolean => {
   const t = src.trim();
@@ -381,7 +523,9 @@ const toolNameFromMeta = (meta: TaskEvent["meta"], fallback = "tool"): string =>
 
 const argsSummaryFromMeta = (meta: TaskEvent["meta"], text: string): string => {
   if (meta && typeof meta.args === "string" && meta.args) {
-    return truncateOneLine(meta.args, 80);
+    // 优先抽 command/path 等关键字段，timeline / subtitle 更干净
+    const extracted = extractToolPreviewTarget(meta.args);
+    return truncateOneLine(extracted || meta.args, 80);
   }
   // tool_call 的 text 形如「调用 Shell:…」——去掉前缀当摘要
   const stripped = text.replace(/^调用\s+\S+:?\s*/i, "").trim();
@@ -438,6 +582,7 @@ const getOrCreateTurn = (
       turnStartedAt: Date.now(),
       toolCount: 0,
       currentToolName: "",
+      currentToolArgs: "",
       card: null,
       startPromise: null,
       started: false,
@@ -594,11 +739,14 @@ const pushProcessUpdate = (taskId: string, turn: TurnState): void => {
 };
 
 const updateToolHeader = (taskId: string, turn: TurnState): void => {
-  const elapsed = formatElapsed(Date.now() - turn.turnStartedAt);
-  const name = turn.currentToolName || "…";
-  const subtitle = `🔧 执行工具(${turn.toolCount})：${name}·已运行 ${elapsed}`;
+  // Hermes：subtitle 只承载当前动作预览（正在Xxx：target），耗时进 footer
+  const preview = formatToolRuntimePreview(
+    turn.currentToolName,
+    turn.currentToolArgs,
+  );
+  if (!preview) return;
   withCard(taskId, turn, (card) => {
-    card.setHeaderStatus(subtitle);
+    card.setHeaderStatus(preview, "blue");
   });
 };
 
@@ -654,8 +802,9 @@ const handleThinking = (taskId: string, event: TaskEvent, turn: TurnState): void
   if (!text) return;
   turn.processParts.push({ kind: "thinking", text });
   pushProcessUpdate(taskId, turn);
+  // Hermes：思考阶段不写 header subtitle（状态靠 footer spinner「生成中」）
   withCard(taskId, turn, (card) => {
-    card.setHeaderStatus("🤔 思考中…");
+    card.setHeaderStatus("", "blue");
   });
 };
 
@@ -694,6 +843,7 @@ const handleToolCall = (
     indexes.set(callId, idx);
   }
   turn.currentToolName = name;
+  turn.currentToolArgs = argsSummary;
   pushProcessUpdate(taskId, turn);
   updateToolHeader(taskId, turn);
 };
@@ -709,6 +859,7 @@ const handleToolResult = (
   const statusRaw = meta && typeof meta.status === "string" ? meta.status : "";
   const ok = statusRaw !== "error";
   const name = toolNameFromMeta(meta, turn.currentToolName || "tool");
+  const argsSummary = argsSummaryFromMeta(meta, event.text ?? "");
   const indexes = getOutboundGlobal().toolIndexes.get(taskId) ?? new Map();
 
   const idx = callId ? indexes.get(callId) : undefined;
@@ -717,6 +868,10 @@ const handleToolResult = (
     if (part && part.kind === "tool") {
       part.status = ok ? "ok" : "err";
       if (!part.name) part.name = name;
+      // result 常不带 args——保留 call 时摘要作 header 预览
+      if (argsSummary && argsSummary !== "…") {
+        part.argsSummary = argsSummary;
+      }
     }
   } else {
     // 没见过 running（偶发只落 result）→ 直接追加完成行
@@ -725,11 +880,21 @@ const handleToolResult = (
       kind: "tool",
       callId: callId || `result_${turn.toolCount}`,
       name,
-      argsSummary: argsSummaryFromMeta(meta, event.text ?? ""),
+      argsSummary,
       status: ok ? "ok" : "err",
     });
   }
   turn.currentToolName = name;
+  if (argsSummary && argsSummary !== "…") {
+    turn.currentToolArgs = argsSummary;
+  } else {
+    // 沿用 processParts 里该工具的摘要
+    const partIdx = callId ? indexes.get(callId) : undefined;
+    const part = partIdx != null ? turn.processParts[partIdx] : undefined;
+    if (part && part.kind === "tool" && part.argsSummary) {
+      turn.currentToolArgs = part.argsSummary;
+    }
+  }
   pushProcessUpdate(taskId, turn);
   updateToolHeader(taskId, turn);
 };

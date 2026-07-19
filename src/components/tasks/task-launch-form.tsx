@@ -41,7 +41,7 @@ import {
 } from "@/lib/types";
 
 // 上次启动配置的记忆 key（仓库组合——下次预填、零操作启动）
-const LAST_LAUNCH_KEY = "feaiflow.lastLaunch.v1";
+const LAST_LAUNCH_KEY = "flowship.lastLaunch.v1";
 
 interface LastLaunch {
   repoPaths?: string[];

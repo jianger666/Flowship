@@ -19,7 +19,7 @@ import { useTaskList } from "@/hooks/use-task-list";
 
 export type AppMode = "work" | "chat";
 
-const MODE_STORAGE_KEY = "fe-ai-flow:app-mode";
+const MODE_STORAGE_KEY = "flowship:app-mode";
 
 export const useAppMode = (): AppMode => {
   const pathname = usePathname();

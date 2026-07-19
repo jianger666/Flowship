@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const TMP_DATA = path.join(os.tmpdir(), `fe-update-pending-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = TMP_DATA;
+process.env.FLOWSHIP_DATA_DIR = TMP_DATA;
 
 import {
   assertNoUpdatePendingRestart,

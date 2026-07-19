@@ -312,7 +312,7 @@ const finalizeFailedStartIntent = async (
 interface TaskSendQueueState {
   tails: Map<string, Promise<unknown>>;
 }
-const TASK_SEND_QUEUE_KEY = "__feAiFlowTaskSendQueueV1__";
+const TASK_SEND_QUEUE_KEY = "__flowshipTaskSendQueueV1__";
 const getTaskSendQueue = (): TaskSendQueueState => {
   const g = globalThis as unknown as Record<
     string,
@@ -345,7 +345,7 @@ export const runWithTaskSendSerial = <T>(
 const TASK_HARD_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 // chat-mcp 在 Agent.mcpServers 里的注册名（agent prompt 里得点明、跟 V0.5 沿用）
-const TASK_TOOL_MCP_NAME = "aiFlowChat";
+const TASK_TOOL_MCP_NAME = "flowshipChat";
 
 /** 对外保持 task-runner 原路径可 import（实现在 ask-supersede.ts） */
 export { supersedePendingAsks };
@@ -441,7 +441,7 @@ export const closeTaskSession = (
 // sessionAgentId 还在、用户下次操作 Agent.resume 无缝接回、体感无差）。
 const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
-const SESSION_SWEEPER_KEY = "__feAiFlowSessionSweeperV1__";
+const SESSION_SWEEPER_KEY = "__flowshipSessionSweeperV1__";
 {
   const g = globalThis as unknown as Record<string, NodeJS.Timeout | undefined>;
   if (!g[SESSION_SWEEPER_KEY]) {
@@ -775,7 +775,7 @@ const finalizeOwnAction = async (
 //
 // V0.6.27 改挂 globalThis：advance route 和 restart-action route 是不同 chunk、
 // module-level Map 各持一份会让这道串行化跨 route 失效（同 runningTasks 的老坑）。
-const ADVANCE_CHAINS_KEY = "__feAiFlowAdvanceChainsV1__";
+const ADVANCE_CHAINS_KEY = "__flowshipAdvanceChainsV1__";
 const getAdvanceChains = (): Map<string, Promise<void>> => {
   const g = globalThis as unknown as Record<
     string,
@@ -3455,7 +3455,7 @@ const shouldRestoreAfterQuestion = (handle: TaskOpHandle): boolean =>
 // 每 action 追问交卷次数（防 agent 反复空跑死循环；key = `${taskId}:${actionId}`）
 // 挂 globalThis：跟 advanceChains 同构——dev 下不同 route chunk 各持一份 module Map
 // 会让计数失效 / 追问上限形同虚设（V0.6.27 踩过）
-const SUBMIT_WORK_FOLLOWUP_COUNTS_KEY = "__feAiFlowSubmitWorkFollowupCountsV1__";
+const SUBMIT_WORK_FOLLOWUP_COUNTS_KEY = "__flowshipSubmitWorkFollowupCountsV1__";
 const getSubmitWorkFollowupCounts = (): Map<string, number> => {
   const g = globalThis as unknown as Record<
     string,
@@ -3638,7 +3638,7 @@ const buildSubmitWorkFollowup = (last: {
   artifactPath?: string | null;
 }): string =>
   [
-    "[ai-flow] 你还没对当前 action 交卷——不要结束本次回复。",
+    "[Flowship] 你还没对当前 action 交卷——不要结束本次回复。",
     `当前 action：id=${last.id}、type=${last.type}、n=${last.n}。`,
     last.artifactPath ? `artifact 路径：${last.artifactPath}。` : "",
     "请完成收尾并调用 submit_work（传 task_id / action_id / artifact_path）交卷；若卡在某处、如实说明卡在哪。",

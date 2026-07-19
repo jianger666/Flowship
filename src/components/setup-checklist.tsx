@@ -22,7 +22,7 @@ import { settingsUrl } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
 
 /** 曾经全部就绪过就记一笔——回工作台不再因飞书 CLI 瞬态失败闪清单 */
-const SETUP_READY_SEEN_KEY = "fe-ai-flow:setup-ready-seen";
+const SETUP_READY_SEEN_KEY = "flowship:setup-ready-seen";
 
 // /api/system/feishu-cli 的状态形状（跟 feishu-cli-card 同源、这里只取就绪判定要的字段）
 interface FeishuCliStatus {

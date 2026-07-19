@@ -41,7 +41,7 @@ import type { CardButtonValue } from "./types";
 const LOG = "[feishu-bridge/card-action]";
 
 /** globalThis 幂等注册键（dev HMR 不双挂） */
-const CARD_ACTION_REG_KEY = "__feAiFlowFeishuCardActionRegisteredV1__";
+const CARD_ACTION_REG_KEY = "__flowshipFeishuCardActionRegisteredV1__";
 
 // ----------------- 事件宽容解析（对齐 inbound.normalizeInboundEvent 风格） -----------------
 
@@ -482,7 +482,7 @@ const handleAskAction = async (
     warnLark("writeUserEventAndPublishStrict(ask_user_reply)", err);
   }
 
-  // 卡片置已答：被点题「✅ 已选」、其余题「（未回答）」+ 删按钮
+  // 卡片置已答：被点题「已选择：」（Hermes interaction_result 同款）、其余题「（未回答）」+ 删按钮
   // header 恢复：出卡句柄不可达，且 updateCardEntity 需全量 card JSON——本路径只改按钮区
   if (cardId) {
     try {
@@ -490,7 +490,7 @@ const handleAskAction = async (
         const optIds = question.options?.map((o) => o.id) ?? [];
         const status =
           question.id === value.questionId
-            ? `**${question.question}**\n\n✅ 已选：${built.label}`
+            ? `**${question.question}**\n\n已选择：${built.label}`
             : `**${question.question}**\n\n（未回答）`;
         await patchAskQuestionAnswered(
           cardId,

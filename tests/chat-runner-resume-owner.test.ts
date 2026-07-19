@@ -10,7 +10,7 @@
  * H1 故障注入：claim 释放 + 队列非空 + rewind 结束后 B 被消费。
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
- * 必须先钉 FE_AI_FLOW_DATA_DIR 再动态 import。
+ * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -29,7 +29,7 @@ import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { Task } from "@/lib/types";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-resume-owner-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const mockResume = vi.fn();
 vi.mock("@cursor/sdk", () => ({

@@ -28,7 +28,7 @@ export interface UseModelsResult {
   fetchModels: (apiKey: string) => Promise<void>;
 }
 
-const CACHE_KEY = "fe-ai-flow:models-cache";
+const CACHE_KEY = "flowship:models-cache";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // apiKey 摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）

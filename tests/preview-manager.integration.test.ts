@@ -19,7 +19,7 @@ import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const TMP_ROOT = path.join(os.tmpdir(), `fe-preview-it-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
+process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;
 
 // R29-3：准入查盘——集成测无 meta，mock 成 developing 以保留原 spawn/pidfile 回归
 vi.mock("@/lib/server/task-fs", async (importOriginal) => {

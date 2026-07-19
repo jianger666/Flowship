@@ -9,7 +9,7 @@
  *（同 task-runner 的 advanceChains / submitWorkFollowupCounts）。
  */
 
-const MEEGLE_CHAIN_KEY = "__feAiFlowMeegleChainV1__";
+const MEEGLE_CHAIN_KEY = "__flowshipMeegleChainV1__";
 
 type MeegleChainState = { current: Promise<void> };
 

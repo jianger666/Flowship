@@ -162,7 +162,7 @@ const inferContextDocType = (content: string): TaskContextDocType => {
 // V0.6 改：扫 task 时按 runStatus 判 zombie（运行时状态、不是业务状态）。
 // runStatus in (running, awaiting_user) 时进程重启 = agent 上下文丢、标 error。
 
-const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
+const RECOVERY_FLAG = "__flowshipBootRecoveryPromiseV2__";
 
 /**
  * deletion journal 目录（taskDir 外）。
@@ -1878,7 +1878,7 @@ export const setTaskModel = async (
  * V0.8：chat 模式「选工作目录」——替换 meta.repoPaths（区别于 updateTaskFields 的追加语义）。
  *
  * 自由对话直接用原生 picker 选文件夹当 agent cwd（对齐 codex / Cursor Agent Window）、重选即替换、
- * 空数组 = 不绑（agent 起在 ai-flow 项目本身、getEffectiveCwd fallback process.cwd()）。
+ * 空数组 = 不绑（agent 起在 Flowship 项目本身、getEffectiveCwd fallback process.cwd()）。
  * 跟切模型同款硬约束：cwd 在 SDK run 启动时绑死、改了下一轮 agent 启动才生效（调用方 running 时禁用入口）。
  */
 export const setTaskRepoPaths = async (

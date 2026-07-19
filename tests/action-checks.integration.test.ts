@@ -7,7 +7,7 @@
  *    干净仓稳定、tracked 改动 / untracked 新增 / untracked 内容变化都要引起指纹变化。
  * 2) 必备段标题锚定 + checkDev 直推读 artifact（审查加固）
  *
- * ⚠️ FE_AI_FLOW_DATA_DIR 必须在 import task-fs-core 之前设好：DATA_DIR =
+ * ⚠️ FLOWSHIP_DATA_DIR 必须在 import task-fs-core 之前设好：DATA_DIR =
  * path.join(dataRoot(), "tasks") 在模块加载时冻结。用动态 import 保证隔离到 TMP。
  */
 import { promises as fs } from "node:fs";
@@ -19,7 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ActionRecord, Task } from "@/lib/types";
 
 const TMP_ROOT = path.join(os.tmpdir(), `fe-fingerprint-it-${Date.now()}`);
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 // 动态 import：等 DATA_DIR 冻结到 TMP 后再加载
 const { computeWorktreeFingerprint, runActionCheck } = await import(

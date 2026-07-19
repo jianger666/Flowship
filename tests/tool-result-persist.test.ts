@@ -11,7 +11,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-tool-result-persist-"));
-process.env.FE_AI_FLOW_DATA_DIR = TMP_ROOT;
+process.env.FLOWSHIP_DATA_DIR = TMP_ROOT;
 
 const {
   persistTruncatedOutput,

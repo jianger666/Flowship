@@ -8,7 +8,7 @@
  * - 写盘中途失败时清理本次已写入文件
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；必须先钉
- * FE_AI_FLOW_DATA_DIR 再动态 import。
+ * FLOWSHIP_DATA_DIR 再动态 import。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -26,7 +26,7 @@ import {
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-save-img-u4-"));
-process.env.FE_AI_FLOW_DATA_DIR = path.join(TMP_ROOT, "data");
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
 
 const { taskDir, withTaskLock, writeMeta } = await import(
   "@/lib/server/task-fs-core"
