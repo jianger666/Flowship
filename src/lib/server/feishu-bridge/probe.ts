@@ -189,9 +189,9 @@ const probeCli = async (): Promise<ProbeCliCheck> => {
       detail: ok
         ? snap.larkCli.authDetail
           ? `已登录：${snap.larkCli.authDetail}`
-          : "已安装已登录"
+          : "已安装并登录"
         : !installed
-          ? "未安装 lark-cli"
+          ? "未安装飞书命令行工具"
           : "未登录",
     };
   } catch (err) {
@@ -252,7 +252,7 @@ const probeCardkit = async (): Promise<ProbeCardkitCheck> => {
     return {
       ok: true,
       cardId: card_id,
-      detail: "cardkit 可用",
+      detail: "支持流式卡片",
     };
   } catch (err) {
     if (err instanceof LarkApiError) {

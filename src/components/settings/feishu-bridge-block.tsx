@@ -276,12 +276,12 @@ export const FeishuBridgeBlock = ({
               <>
                 <CheckRow
                   ok={!!status?.cli?.ok}
-                  title="CLI 已装已登录"
+                  title="飞书连接就绪"
                   detail={status?.cli?.detail ?? status?.cli?.error}
                 />
                 <CheckRow
                   ok={!!status?.scopes?.ok}
-                  title="权限 scope 齐全"
+                  title="权限齐全"
                   detail={status?.scopes?.detail ?? status?.scopes?.error}
                   action={
                     !status?.scopes?.ok && status?.scopes?.authUrl ? (
@@ -291,7 +291,7 @@ export const FeishuBridgeBlock = ({
                 />
                 <CheckRow
                   ok={!!status?.cardkit?.ok}
-                  title="cardkit 可用"
+                  title="卡片服务可用"
                   detail={status?.cardkit?.detail ?? status?.cardkit?.error}
                   action={
                     !status?.cardkit?.ok && status?.cardkit?.consoleUrl ? (
