@@ -225,4 +225,40 @@ f)【已修】feishu-bridge-block mountedRef 守卫三个 async handler。
 
 ---
 
-**状态：待复审（R1 已处理，等 reviewer 复审）**
+### R2（复审，2026-07-19 20:45，reviewer：Fable5-reviewer）
+
+> 复审方式：R1 全部 17 条 + 2 询问逐条读修复后代码核实（非只读回复文本）；门禁独立复跑：`pnpm typecheck` ✅ / `pnpm lint` ✅ / `pnpm vitest run` **1163 passed / 1 skipped** ✅（20:36 实跑，与你声明一致）。
+
+#### 逐条核实结论（全部销项）
+
+- **R1-1 ✅**：`appendedElements` 快照进 `buildStreamingCardJson.extraElements`（插回 hr 前、与 batch insert_before 位置一致）；`finalize` 的 stopped / pendingAsk-orange / green 三态分支正确（stopped 优先于 orange，语义对）；`enqueueCardOp` 互斥链覆盖 flush/append/finalize 全部写路径，`appendAskUser` 链内先 `doFlush()` 不自嵌套、无死锁。三条新用例 + 真机 cardId 佐证，收。
+  - 顺带蓝军过「答题 patch 删按钮后全量 PUT 复活僵尸按钮」场景：不可达——done 前 `deliverChatAskReply` 必 busy 失败不 patch，done 后 `finalized=true` 不再 PUT。无需处理。
+- **R1-2 ✅**：`enqueueInboundMessage` 全局单链（live + catchup 同链，check→route→mark 原子）；card-map / bridge-state 各自 RMW 写队列挂 globalThis。`tests/feishu-bridge-r1-inbound.test.ts` 四组用例齐。收。
+- **R1-3 ✅**：card-seq 独立落盘（写队列自持、不碰 card-map 族）+ hydrate（内存值优先，正确）+ 冷 miss floor=sec+7200。核过「两进程接力、第一个没来得及落盘」的边界：第二进程 floor 必然更大，安全。finalize 强制 `flushCardSeqToDisk` ✓。收。
+- **R1-4 ✅**：以 `runStatus !== "awaiting_user"` 判 stopped，与 chat-runner cancelled=idle / finished=awaiting_user 的实况吻合；灰卡「已停止」+ summary 分支补齐。收。
+- **R1-5 ✅**：`injectPendingAskText` 收 images → `saveImageAttachments` 落盘 → `deliverChatAskReply` 第三参；事件 meta 带 images；router 穿透 `parsed.images`。收。
+- **R1-6 ✅**：`retryable` 标注点（getBotAppInfo / parse 抛错 / 5xx）与不标点（unsupported、图超限、空消息、多活跃、409 队满、命令失败）口径清楚；handler 侧 retryable 不 mark 不推游标。三条用例含 409 反例。收。
+- **R1-7 ✅**：`Promise.allSettled` 按位序收集。收。
+- **R1-8 ✅**：exit/error handler 首行 `if (this.child !== child) return`。用例覆盖快切。收。
+- **R1-9 ✅**：`handled_failed` 贯通 commands（withCommandError + /new /stop /compact /history 各失败分支）→ router emit failed（不 retryable，口径对）。收。
+- **R1-10 ✅**：`pageLoaded` 门控（did-start-loading 复位 / did-finish-load 置位 + flush / closed 复位 / loadURL 前显式复位双保险），`deliverDeepLink` 未就绪只存 pending 不清。收。
+- **R1-11 ✅**：`FIELD_EQ_KIND` 表驱动 + `satisfies Record<SettingsField, FieldEqKind>` 编译期锁新字段，根治 fall-through 族。`saveFieldValue` 不回滚乐观值的现状我接受：dirty 修好后失败路径 = toast + 字段保持 dirty + 离页拦截，已从「假开无感知」变为「可感知未保存」，不再要求回滚。收。
+- **R1-12 ✅**：查证属实（壳优雅路径确是 SIGTERM）；「once → await 清理（2s 上限）→ 重发原信号走默认退出」是标准信号礼仪，beforeExit 分支保留合理。收。
+- **R1-13 ✅**：a `chat-queue-flush-hook.test.ts`（真 flushChatQueue 链）/ b ledger settle 断言 / c `task-stream-all-tap.test.ts` 三用例 / d 三通道 sequence + finalize 交错 / e 并入 R1-2 用例——五个缺口全补。收。
+- **R1-14 ✅**：壳 `waitForReady` 成功后 fire-and-forget GET status + bootstrap 注释更新。收。
+- **R1-15 / R1-17c / R1-17d ✅（接受不修理由）**：均成立——TOCTOU fail-open 是记录过的有意取舍；/history 轮次语义重做 ROI 低；多题同答案是 [ASK_USER_REPLY] 协议约束。收。
+- **R1-16 ✅**：reactions 状态挂 `__flowshipFeishuReactionStateV1__`。收。
+- **R1-17 a/b/f ✅**（注释 / 中文映射 / mountedRef 均核实）；**e ✅**（设计表态收录：「问题行」口径指 runtime 监听器行，CLI/scope/cardkit 三项常显为拍板现状）；**g** 视同 e 的同批表态。收。
+- **R1-Q1 / Q2 ✅**：答复成立。Q1 维持现状 + 注释的取舍我同意（「先送达再落事件」的 409 语义优先级更高）；Q2 有真机 PUT 成功佐证。
+
+#### 遗留注记（P3 信息级，无需行动、随笔记录）
+
+1. done 事件 fallback：自然 finished 且 `setTaskRunStatusIfRunOwner` 写盘失败时 `ev.task` 是 stale ctx.task（runStatus=running）→ outbound 会误判 stopped、灰卡文案。触发要求 task meta 写盘失败，极低频、影响仅文案，接受。
+2. 入向全局单链：一条消息的完整注入（含大文件下载）会顺延后续消息处理。单用户 p2p 场景量级下可接受；若将来观察到延迟，可降级为 per-chat 链。
+3. `saveFieldValue` 保留乐观值不回滚（见 R1-11 收条说明），行为已可感知，接受。
+
+#### 结论
+
+R1 全部条目销项、门禁独立复核通过、关键修复均有测试锁定 + 真机佐证。
+
+**状态：收敛 ✅（等用户二次验收）**
