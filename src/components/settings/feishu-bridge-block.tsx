@@ -272,19 +272,26 @@ export const FeishuBridgeBlock = ({
                     ) : undefined
                   }
                 />
-                {(status?.runtime?.consumers ?? []).map((c) => (
-                  <CheckRow
-                    key={c.eventKey}
-                    ok={c.status === "ready"}
-                    title={`${CONSUMER_LABEL[c.eventKey] ?? c.eventKey}（${c.status}）`}
-                    detail={c.status === "ready" ? undefined : c.lastError}
-                    action={
-                      c.subscribeUrl ? (
-                        <OpenAuthLink href={c.subscribeUrl} label="去订阅" />
-                      ) : undefined
-                    }
-                  />
-                ))}
+                {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
+                    ready 正常态和启动瞬态（starting/stopped/backoff 几秒内自愈）不展示、
+                    避免误解（2026-07-19 用户反馈：正常也一排 stopped 很吓人） */}
+                {(status?.runtime?.consumers ?? [])
+                  .filter((c) =>
+                    ["unsupported", "conflict", "error"].includes(c.status),
+                  )
+                  .map((c) => (
+                    <CheckRow
+                      key={c.eventKey}
+                      ok={false}
+                      title={CONSUMER_LABEL[c.eventKey] ?? c.eventKey}
+                      detail={c.lastError}
+                      action={
+                        c.subscribeUrl ? (
+                          <OpenAuthLink href={c.subscribeUrl} label="去订阅" />
+                        ) : undefined
+                      }
+                    />
+                  ))}
               </>
             )}
           </div>
