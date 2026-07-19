@@ -107,82 +107,113 @@ export interface UseSettingsResult {
   ) => Promise<boolean>;
 }
 
-// 浅比较 / 深比较都不通用、按字段类型分别比较：
-// - apiKey / gitToken：字符串直接 ===
-// - defaultModel：嵌套对象、id + params 数组按位比较
-// - repos：数组、长度 + 每项 path/name 比较
-const isFieldEqual = (
+/**
+ * 字段 → 比较器种类（表驱动，R1-11）。
+ * 新增 FeAiFlowSettings 字段时必须在此表登记——`satisfies Record<keyof …>`
+ * 漏配会在编译期报错，避免再 fall-through 到错误比较器（同族已第三次）。
+ *
+ * - stringEmpty：缺省视同 ""
+ * - boolFalse / boolTrue：缺省视同 false / true
+ * - stringSet：字符串集合（排序后比，顺序无关）
+ * - ignore：非设置页编辑字段（如 modelUsage），恒视为相等（dirty 由调用方硬编码 false）
+ */
+type FieldEqKind =
+  | "stringEmpty"
+  | "boolFalse"
+  | "boolTrue"
+  | "repos"
+  | "stringSet"
+  | "mcpServers"
+  | "actionLayout"
+  | "defaultModel"
+  | "meegleProject"
+  | "ignore";
+
+const FIELD_EQ_KIND = {
+  apiKey: "stringEmpty",
+  gitToken: "stringEmpty",
+  branchTemplate: "stringEmpty",
+  jumpIde: "stringEmpty",
+  submitShortcut: "stringEmpty",
+  userRole: "stringEmpty",
+  reuseAgentDefault: "boolFalse",
+  agentShellGitBash: "boolFalse",
+  feishuChatBridge: "boolFalse",
+  isolateWorktreeDefault: "boolTrue",
+  feishuBridgeKeepAwake: "boolTrue",
+  repos: "repos",
+  disabledMcpServers: "stringSet",
+  disabledSkills: "stringSet",
+  disabledRules: "stringSet",
+  mcpServers: "mcpServers",
+  actionLayout: "actionLayout",
+  defaultModel: "defaultModel",
+  meegleProject: "meegleProject",
+  modelUsage: "ignore",
+} as const satisfies Record<SettingsField, FieldEqKind>;
+
+const eqStringSet = (x: string[] | undefined, y: string[] | undefined): boolean => {
+  const a = [...(x ?? [])].sort();
+  const b = [...(y ?? [])].sort();
+  if (a.length !== b.length) return false;
+  return a.every((s, i) => s === b[i]);
+};
+
+/** 导出供单测锁定 dirty 比较（settings-save / 桥接开关回归） */
+export const isFieldEqual = (
   key: SettingsField,
   a: FeAiFlowSettings,
-  b: FeAiFlowSettings
+  b: FeAiFlowSettings,
 ): boolean => {
-  if (
-    key === "apiKey" ||
-    key === "gitToken" ||
-    key === "branchTemplate" ||
-    key === "jumpIde" ||
-    key === "submitShortcut" ||
-    // 终审 P3：漏了 userRole 分支会 fall-through 到末尾的 defaultModel 比较、dirty 失真
-    key === "userRole"
-  ) {
-    return (a[key] ?? "") === (b[key] ?? "");
+  switch (FIELD_EQ_KIND[key]) {
+    case "stringEmpty":
+      return (a[key] ?? "") === (b[key] ?? "");
+    case "boolFalse":
+      return (a[key] ?? false) === (b[key] ?? false);
+    case "boolTrue":
+      return (a[key] ?? true) === (b[key] ?? true);
+    case "repos": {
+      // CR-09：完整比较 RepoConfig 全部持久字段（稳定序列化、undefined 归一空串）
+      if (a.repos.length !== b.repos.length) return false;
+      return a.repos.every((r, i) => repoConfigEquals(r, b.repos[i]));
+    }
+    case "stringSet":
+      return eqStringSet(
+        a[key] as string[] | undefined,
+        b[key] as string[] | undefined,
+      );
+    case "mcpServers":
+      return (
+        JSON.stringify(a.mcpServers ?? {}) === JSON.stringify(b.mcpServers ?? {})
+      );
+    case "actionLayout": {
+      const ax = a.actionLayout ?? { order: [], hidden: [] };
+      const bx = b.actionLayout ?? { order: [], hidden: [] };
+      const eqArr = (m: string[], n: string[]) =>
+        m.length === n.length && m.every((v, i) => v === n[i]);
+      return eqArr(ax.order, bx.order) && eqArr(ax.hidden, bx.hidden);
+    }
+    case "defaultModel": {
+      const x = a.defaultModel;
+      const y = b.defaultModel;
+      if (x.id !== y.id) return false;
+      const xp = x.params ?? [];
+      const yp = y.params ?? [];
+      if (xp.length !== yp.length) return false;
+      return xp.every((p, i) => p.id === yp[i].id && p.value === yp[i].value);
+    }
+    case "meegleProject": {
+      const ax = a.meegleProject;
+      const bx = b.meegleProject;
+      return (
+        (ax?.key ?? "") === (bx?.key ?? "") &&
+        (ax?.name ?? "") === (bx?.name ?? "") &&
+        (ax?.simpleName ?? "") === (bx?.simpleName ?? "")
+      );
+    }
+    case "ignore":
+      return true;
   }
-  if (key === "meegleProject") {
-    // 默认飞书空间：比 key/name/simpleName（缺省视同空串）
-    const ax = a.meegleProject;
-    const bx = b.meegleProject;
-    return (
-      (ax?.key ?? "") === (bx?.key ?? "") &&
-      (ax?.name ?? "") === (bx?.name ?? "") &&
-      (ax?.simpleName ?? "") === (bx?.simpleName ?? "")
-    );
-  }
-  if (key === "repos") {
-    // CR-09：完整比较 RepoConfig 全部持久字段（稳定序列化、undefined 归一空串）——
-    // 原实现只比 path/name、编辑分支 / 模板 / 预览命令时 dirty 恒 false、离页不提示
-    if (a.repos.length !== b.repos.length) return false;
-    return a.repos.every((r, i) => repoConfigEquals(r, b.repos[i]));
-  }
-  if (key === "reuseAgentDefault" || key === "agentShellGitBash") {
-    // boolean 字段：缺省视同 false 比较
-    return (a[key] ?? false) === (b[key] ?? false);
-  }
-  if (key === "isolateWorktreeDefault") {
-    // boolean 字段：缺省视同 true 比较（默认隔离）
-    return (a[key] ?? true) === (b[key] ?? true);
-  }
-  if (
-    key === "disabledMcpServers" ||
-    key === "disabledSkills" ||
-    key === "disabledRules"
-  ) {
-    // 黑名单是集合、顺序无关——排序后逐项比
-    const x = [...(a[key] ?? [])].sort();
-    const y = [...(b[key] ?? [])].sort();
-    if (x.length !== y.length) return false;
-    return x.every((s, i) => s === y[i]);
-  }
-  if (key === "mcpServers") {
-    return (
-      JSON.stringify(a.mcpServers ?? {}) === JSON.stringify(b.mcpServers ?? {})
-    );
-  }
-  if (key === "actionLayout") {
-    // order 是排序、顺序有意义——逐位比；hidden 同样逐位比
-    const ax = a.actionLayout ?? { order: [], hidden: [] };
-    const bx = b.actionLayout ?? { order: [], hidden: [] };
-    const eqArr = (m: string[], n: string[]) =>
-      m.length === n.length && m.every((v, i) => v === n[i]);
-    return eqArr(ax.order, bx.order) && eqArr(ax.hidden, bx.hidden);
-  }
-  // defaultModel：浅比较 id + params 数组
-  const x = a.defaultModel;
-  const y = b.defaultModel;
-  if (x.id !== y.id) return false;
-  const xp = x.params ?? [];
-  const yp = y.params ?? [];
-  if (xp.length !== yp.length) return false;
-  return xp.every((p, i) => p.id === yp[i].id && p.value === yp[i].value);
 };
 
 export const useSettings = (): UseSettingsResult => {

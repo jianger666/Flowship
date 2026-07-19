@@ -590,4 +590,92 @@ describe("turn 状态机", () => {
       }),
     );
   });
+
+  // R1-7：多图回显按位序，慢的先完成也不打乱
+  it("echo 多图按原 paths 位序收集 image_key", async () => {
+    uploadImage.mockImplementation(async (p: string) => {
+      const name = p.split("/").pop() ?? p;
+      // 第二张更快完成——旧实现会先 push 乱序
+      const delay = name === "b.png" ? 5 : 40;
+      await new Promise((r) => setTimeout(r, delay));
+      return `key_${name}`;
+    });
+    const taskId = "t_img_order";
+    publishTaskStreamEvent(
+      taskId,
+      makeEvent("user_reply", "多图", {
+        images: [
+          { absPath: "/tmp/a.png", relPath: "uploads/a.png" },
+          { absPath: "/tmp/b.png", relPath: "uploads/b.png" },
+          { absPath: "/tmp/c.png", relPath: "uploads/c.png" },
+        ],
+      }),
+    );
+    await flush();
+    publishTaskStreamEvent(taskId, makeEvent("thinking", "看图"));
+    await flush();
+    const card = cardFactory.cards[0]!;
+    await vi.waitFor(() => expect(card.start).toHaveBeenCalled());
+    const startArg = card.start.mock.calls[0]?.[0] as {
+      echoImageKeys?: string[];
+    };
+    expect(startArg.echoImageKeys).toEqual([
+      "key_a.png",
+      "key_b.png",
+      "key_c.png",
+    ]);
+  });
+
+  // R1-4：stop → runStatus idle → finalize outcome=stopped
+  it("done ok=true 且 runStatus≠awaiting_user → finalize outcome=stopped", async () => {
+    const taskId = "t_stopped";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "停我"));
+    publishTaskStreamEvent(taskId, {
+      kind: "assistant_delta",
+      text: "半截",
+    });
+    await flush();
+    const card = cardFactory.cards[0]!;
+    publishTaskStreamEvent(taskId, {
+      kind: "done",
+      ok: true,
+      task: {
+        id: taskId,
+        title: "测对话",
+        mode: "chat",
+        runStatus: "idle",
+      } as never,
+    });
+    await flush();
+    expect(card.finalize).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: true, outcome: "stopped" }),
+    );
+  });
+
+  it("done ok=true 且 runStatus=awaiting_user → 不传 outcome stopped", async () => {
+    const taskId = "t_natural";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "正常"));
+    publishTaskStreamEvent(taskId, {
+      kind: "assistant_delta",
+      text: "完",
+    });
+    await flush();
+    const card = cardFactory.cards[0]!;
+    publishTaskStreamEvent(taskId, {
+      kind: "done",
+      ok: true,
+      task: {
+        id: taskId,
+        title: "测对话",
+        mode: "chat",
+        runStatus: "awaiting_user",
+      } as never,
+    });
+    await flush();
+    expect(card.finalize).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: true }),
+    );
+    const arg = card.finalize.mock.calls[0]?.[0] as { outcome?: string };
+    expect(arg.outcome).toBeUndefined();
+  });
 });

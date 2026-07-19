@@ -32,8 +32,8 @@ import {
   normalizeSettings,
   saveSettings,
 } from "@/lib/local-store";
-import { repoConfigEquals } from "@/hooks/use-settings";
-import type { RepoConfig } from "@/lib/types";
+import { isFieldEqual, repoConfigEquals } from "@/hooks/use-settings";
+import type { FeAiFlowSettings, RepoConfig } from "@/lib/types";
 
 // 可控 fetch stub：记录调用、由测试手动放行响应
 interface PendingCall {
@@ -193,5 +193,59 @@ describe("repoConfigEquals（CR-09）", () => {
     ["path", { path: "/repo/web2" }],
   ] as const)("%s 单独改动 → 不相等（旧实现漏比五个字段）", (_field, patch) => {
     expect(repoConfigEquals(base, { ...base, ...patch })).toBe(false);
+  });
+});
+
+describe("isFieldEqual 桥接 boolean（R1-11）", () => {
+  const base: FeAiFlowSettings = { ...DEFAULT_SETTINGS };
+
+  it("feishuChatBridge 切换 → 不相等（旧实现 fall-through 到 defaultModel 恒相等）", () => {
+    expect(
+      isFieldEqual(
+        "feishuChatBridge",
+        { ...base, feishuChatBridge: false },
+        { ...base, feishuChatBridge: false },
+      ),
+    ).toBe(true);
+    expect(
+      isFieldEqual(
+        "feishuChatBridge",
+        { ...base, feishuChatBridge: true },
+        { ...base, feishuChatBridge: false },
+      ),
+    ).toBe(false);
+    // undefined 与 false 视同（缺省关）
+    expect(
+      isFieldEqual(
+        "feishuChatBridge",
+        { ...base, feishuChatBridge: undefined },
+        { ...base, feishuChatBridge: false },
+      ),
+    ).toBe(true);
+  });
+
+  it("feishuBridgeKeepAwake 切换 → 不相等（缺省 true）", () => {
+    expect(
+      isFieldEqual(
+        "feishuBridgeKeepAwake",
+        { ...base, feishuBridgeKeepAwake: true },
+        { ...base, feishuBridgeKeepAwake: true },
+      ),
+    ).toBe(true);
+    expect(
+      isFieldEqual(
+        "feishuBridgeKeepAwake",
+        { ...base, feishuBridgeKeepAwake: false },
+        { ...base, feishuBridgeKeepAwake: true },
+      ),
+    ).toBe(false);
+    // undefined 与 true 视同（缺省开）
+    expect(
+      isFieldEqual(
+        "feishuBridgeKeepAwake",
+        { ...base, feishuBridgeKeepAwake: undefined },
+        { ...base, feishuBridgeKeepAwake: true },
+      ),
+    ).toBe(true);
   });
 });

@@ -124,10 +124,31 @@ const withCommandError = (
       } catch {
         // 回执本身失败不再抛
       }
-      return "handled";
+      // R1-9：异常吞掉后回 handled_failed，避免 reactions 误点 ✅
+      return "handled_failed";
     }
   };
 };
+
+/** runStatus → 中文（/list） */
+const RUN_STATUS_ZH: Record<string, string> = {
+  running: "跑步中",
+  awaiting_user: "等你回复",
+  idle: "空闲",
+  error: "出错",
+};
+
+/** bridge overall → 中文（/status） */
+const OVERALL_ZH: Record<string, string> = {
+  running: "运行中",
+  partial: "部分可用",
+  conflict: "冲突",
+  stopped: "已停止",
+  error: "出错",
+};
+
+const zhRunStatus = (s: string): string => RUN_STATUS_ZH[s] ?? s;
+const zhOverall = (s: string): string => OVERALL_ZH[s] ?? s;
 
 // ----------------- 定位目标 chat（与 router 注入语义对齐） -----------------
 
@@ -232,7 +253,7 @@ const cmdList: BridgeCommandHandler = async () => {
     return "handled";
   }
   const lines = active.map(
-    (t, i) => `${i + 1}. ${t.title || t.id}（${t.runStatus}）`,
+    (t, i) => `${i + 1}. ${t.title || t.id}（${zhRunStatus(t.runStatus)}）`,
   );
   await replyOwner(lines.join("\n"));
   return "handled";
@@ -241,7 +262,7 @@ const cmdList: BridgeCommandHandler = async () => {
 const cmdStatus: BridgeCommandHandler = async () => {
   const st = deps.getBridgeRuntimeStatus();
   const lines = [
-    `桥接：${st.overall}${st.enabled ? "" : "（开关关）"}`,
+    `桥接：${zhOverall(st.overall)}${st.enabled ? "" : "（开关关）"}`,
     `主机：${st.hostname}`,
     `防睡眠：${st.keepAwake ? "开" : "关"}`,
     ...st.consumers.map((c) => `· ${c.eventKey}：${c.status}`),
@@ -262,7 +283,7 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
   const created = await deps.createChatTaskForBridge(title);
   if ("error" in created) {
     await replyOwner(`命令执行失败：${created.error}`);
-    return "handled";
+    return "handled_failed";
   }
 
   if (!first) {
@@ -279,7 +300,7 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
       created.taskId,
       `已开新对话：${created.title}，但缺少 API Key/模型，首条未注入`,
     );
-    return "handled";
+    return "handled_failed";
   }
 
   const resp = await deps.handleChatReplyInject(
@@ -302,7 +323,7 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
       created.taskId,
       `已开新对话：${created.title}，首条注入失败：${err}`,
     );
-    return "handled";
+    return "handled_failed";
   }
   await deps.sendTaskBoundText(created.taskId, `已开新对话：${created.title}`);
   return "handled";
@@ -317,7 +338,7 @@ const cmdStop: BridgeCommandHandler = async (ctx) => {
   const full = await deps.getTask(target.task.id);
   if (!full) {
     await replyOwner("命令执行失败：任务不存在");
-    return "handled";
+    return "handled_failed";
   }
   await deps.stopTaskAgent(full as Task);
   await replyOwner(`已停止：${target.task.title || target.task.id}`);
@@ -336,7 +357,7 @@ const cmdCompact: BridgeCommandHandler = async (ctx) => {
   } catch (err) {
     if (err instanceof CompactChatError) {
       await replyOwner(`命令执行失败：${err.message}`);
-      return "handled";
+      return "handled_failed";
     }
     throw err;
   }
@@ -354,14 +375,14 @@ const cmdHistory: BridgeCommandHandler = async (ctx) => {
     const parsed = Number.parseInt(ctx.args.trim(), 10);
     if (!Number.isFinite(parsed) || parsed < 1) {
       await replyOwner("命令执行失败：/history 参数应为正整数");
-      return "handled";
+      return "handled_failed";
     }
     n = Math.min(parsed, 20);
   }
   const full = await deps.getTask(target.task.id);
   if (!full) {
     await replyOwner("命令执行失败：任务不存在");
-    return "handled";
+    return "handled_failed";
   }
   const rounds = buildHistoryRounds(full.events ?? [], n);
   await replyOwner(formatHistory(rounds));

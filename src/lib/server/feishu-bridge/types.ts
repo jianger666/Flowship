@@ -97,6 +97,11 @@ export interface CardStreamFinalizeOpts {
   durationMs?: number;
   model?: string;
   error?: string;
+  /**
+   * 终态样式扩展：用户 stop 等非自然完成（ok 仍可为 true）。
+   * 与 pending ask 等待态互斥——outbound 按 runStatus 判定后传入。
+   */
+  outcome?: "stopped";
 }
 
 /** 单轮卡片句柄（card-stream 返回） */

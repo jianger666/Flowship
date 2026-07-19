@@ -7,7 +7,13 @@
  * 开机自启走 window.__autoLaunch（系统层），不进 settings。
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   CheckCircle2,
   ExternalLink,
@@ -143,23 +149,34 @@ export const FeishuBridgeBlock = ({
   const [autoLaunch, setAutoLaunch] = useState<boolean | undefined>(undefined);
   // 自启读写飞行中
   const [autoLaunchBusy, setAutoLaunchBusy] = useState(false);
+  // 卸载守卫：async setState 前检查（对齐 use-settings alive 惯例，R1-17f）
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
+    if (!mountedRef.current) return;
     setLoading(true);
     try {
       const res = await fetch("/api/feishu-bridge/status", { cache: "no-store" });
       const data = (await res.json()) as BridgeStatusPayload;
+      if (!mountedRef.current) return;
       if (!res.ok) {
         toast.error(data.error ?? "桥接探测失败");
         return;
       }
       setStatus(data);
     } catch (err) {
+      if (!mountedRef.current) return;
       toast.error(
         `桥接探测失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
   }, []);
 
@@ -188,6 +205,7 @@ export const FeishuBridgeBlock = ({
   }, []);
 
   const handleWelcome = async () => {
+    if (!mountedRef.current) return;
     setWelcomeBusy(true);
     try {
       const res = await fetch("/api/feishu-bridge/status", {
@@ -196,33 +214,37 @@ export const FeishuBridgeBlock = ({
         body: JSON.stringify({ action: "welcome" }),
       });
       const data = (await res.json()) as { error?: string };
+      if (!mountedRef.current) return;
       if (!res.ok) {
         toast.error(data.error ?? "发送欢迎消息失败");
         return;
       }
       toast.success("已发送，去飞书看机器人私聊");
     } catch (err) {
+      if (!mountedRef.current) return;
       toast.error(
         `发送欢迎消息失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      setWelcomeBusy(false);
+      if (mountedRef.current) setWelcomeBusy(false);
     }
   };
 
   const handleAutoLaunch = async (next: boolean) => {
     const api = window.__autoLaunch;
-    if (!api) return;
+    if (!api || !mountedRef.current) return;
     setAutoLaunchBusy(true);
     try {
       await api.set(next);
+      if (!mountedRef.current) return;
       setAutoLaunch(next);
     } catch (err) {
+      if (!mountedRef.current) return;
       toast.error(
         `设置开机自启动失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      setAutoLaunchBusy(false);
+      if (mountedRef.current) setAutoLaunchBusy(false);
     }
   };
 

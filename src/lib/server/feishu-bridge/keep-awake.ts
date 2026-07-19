@@ -81,11 +81,15 @@ export class KeepAwake {
     this.child = child;
     log(`防睡眠已启动: pid=${child.pid}（仅接电源时阻止系统睡眠）`);
 
+    // R1-8：exit/error 必须校验身份——stop→start 快切后旧 child 的迟到
+    // exit 不得清掉新 child、也不得再排一次重启（否则双 caffeinate）
     child.on("error", (err) => {
+      if (this.child !== child) return;
       log(`防睡眠子进程出错: ${err}`);
       this.child = null;
     });
     child.on("exit", () => {
+      if (this.child !== child) return;
       this.child = null;
       // 意外退出自动重启；主动 stop 不重启
       if (!this.stopped) {

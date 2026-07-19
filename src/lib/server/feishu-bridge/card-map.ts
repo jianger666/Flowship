@@ -3,6 +3,8 @@
  *
  * 路径：`<dataRoot>/feishu-bridge/card-map.json`
  * 原子写（tmp + rename）；条目上限 500 FIFO，供飞书「回复」锚定。
+ *
+ * R1-2c：所有「读改写」经进程级串行队列，避免与游标写并发互相覆盖。
  */
 
 import { promises as fs } from "node:fs";
@@ -22,6 +24,31 @@ let cardMapMaxRuntime = CARD_MAP_MAX;
 /** 单测改上限；传 null 恢复 */
 export const __setCardMapMaxForTest = (n: number | null): void => {
   cardMapMaxRuntime = n == null ? CARD_MAP_MAX : n;
+};
+
+// ----------------- 写队列（挂 globalThis，对齐 enqueueLark） -----------------
+
+const CARD_MAP_CHAIN_KEY = "__flowshipFeishuCardMapWriteChainV1__";
+
+type WriteChainState = { current: Promise<void> };
+
+const getCardMapWriteChain = (): WriteChainState => {
+  const g = globalThis as unknown as Record<string, WriteChainState | undefined>;
+  if (!g[CARD_MAP_CHAIN_KEY]) {
+    g[CARD_MAP_CHAIN_KEY] = { current: Promise.resolve() };
+  }
+  return g[CARD_MAP_CHAIN_KEY]!;
+};
+
+/** 整段 RMW 入队；读操作不排队 */
+const enqueueCardMapWrite = <T>(run: () => Promise<T>): Promise<T> => {
+  const state = getCardMapWriteChain();
+  const result = state.current.then(run, run);
+  state.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
 };
 
 const mapFilePath = async (): Promise<string> =>
@@ -63,22 +90,28 @@ export const readCardMapStore = async (): Promise<CardMapStore> => {
   }
 };
 
-/** 原子写整份 store */
-export const writeCardMapStore = async (store: CardMapStore): Promise<void> => {
-  const file = await mapFilePath();
-  await writePrivateFileAtomic(file, JSON.stringify(store, null, 2));
-};
+/** 原子写整份 store（经写队列，与 RMW 互斥） */
+export const writeCardMapStore = async (store: CardMapStore): Promise<void> =>
+  enqueueCardMapWrite(async () => {
+    const file = await mapFilePath();
+    await writePrivateFileAtomic(file, JSON.stringify(store, null, 2));
+  });
 
 /**
  * 记录发出的卡片消息。同 messageId 覆盖；超出 CARD_MAP_MAX 从头部淘汰。
  */
-export const rememberCardMessage = async (entry: CardMapEntry): Promise<void> => {
-  const store = await readCardMapStore();
-  const next = store.entries.filter((e) => e.messageId !== entry.messageId);
-  next.push(entry);
-  while (next.length > cardMapMaxRuntime) next.shift();
-  await writeCardMapStore({ ...store, entries: next });
-};
+export const rememberCardMessage = async (entry: CardMapEntry): Promise<void> =>
+  enqueueCardMapWrite(async () => {
+    const store = await readCardMapStore();
+    const next = store.entries.filter((e) => e.messageId !== entry.messageId);
+    next.push(entry);
+    while (next.length > cardMapMaxRuntime) next.shift();
+    const file = await mapFilePath();
+    await writePrivateFileAtomic(
+      file,
+      JSON.stringify({ ...store, entries: next }, null, 2),
+    );
+  });
 
 /** 按飞书 root_id / message_id 反查 taskId */
 export const findTaskByMessageId = async (
@@ -100,7 +133,12 @@ export const getLastProcessedTs = async (): Promise<string> => {
   return store.lastProcessedTs;
 };
 
-export const setLastProcessedTs = async (ts: string): Promise<void> => {
-  const store = await readCardMapStore();
-  await writeCardMapStore({ ...store, lastProcessedTs: ts });
-};
+export const setLastProcessedTs = async (ts: string): Promise<void> =>
+  enqueueCardMapWrite(async () => {
+    const store = await readCardMapStore();
+    const file = await mapFilePath();
+    await writePrivateFileAtomic(
+      file,
+      JSON.stringify({ ...store, lastProcessedTs: ts }, null, 2),
+    );
+  });

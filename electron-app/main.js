@@ -117,6 +117,8 @@ let appTray = null;
 let quitting = false;
 // 冷启动深链暂存（坑 #15：open-url / argv 可能早于窗口 ready）
 let pendingDeepLinkTaskId = null;
+// 主窗目标页是否已 load 完（R1-10：mainWindow 非 null 但 loadURL 前/中 send 会丢）
+let pageLoaded = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -572,12 +574,18 @@ const showMainWindow = () => {
   mainWindow.focus();
 };
 
-/** 投递深链给 renderer；窗口未就绪则暂存（坑 #15 冷启动） */
+/**
+ * 投递深链给 renderer。
+ * 窗口未建、或目标页尚未 did-finish-load → 只写 pending（不清），等 flush。
+ * 否则会 send 进即将被 loadURL 换掉的空白上下文、pending 又已清 → 丢链（R1-10）。
+ */
 const deliverDeepLink = (taskId) => {
   if (!taskId) return;
-  if (!mainWindow) {
+  if (!mainWindow || !pageLoaded) {
     pendingDeepLinkTaskId = taskId;
-    log(`[deep-link] 窗口未就绪、暂存 taskId=${taskId}`);
+    log(
+      `[deep-link] ${!mainWindow ? "窗口" : "页面"}未就绪、暂存 taskId=${taskId}`,
+    );
     return;
   }
   pendingDeepLinkTaskId = null;
@@ -595,12 +603,14 @@ const handleDeepLinkUrl = (url) => {
   deliverDeepLink(taskId);
 };
 
-/** 窗口 load 完成后冲刷冷启动暂存 */
+/**
+ * 页面就绪后冲刷暂存。
+ * 仍未 pageLoaded 时不抢清 pending——留给下一次 did-finish-load。
+ */
 const flushPendingDeepLink = () => {
   if (!pendingDeepLinkTaskId) return;
-  const id = pendingDeepLinkTaskId;
-  pendingDeepLinkTaskId = null;
-  deliverDeepLink(id);
+  if (!mainWindow || !pageLoaded) return;
+  deliverDeepLink(pendingDeepLinkTaskId);
 };
 
 /**
@@ -752,6 +762,7 @@ const createWindow = async () => {
   });
   mainWindow.on("closed", () => {
     mainWindow = null;
+    pageLoaded = false;
   });
 
   // window.open 一律 deny + 白名单内转系统浏览器（v0.7.8 拍板转系统浏览器；
@@ -792,17 +803,22 @@ const createWindow = async () => {
     if (isReload) e.preventDefault();
   });
 
+  // pageLoaded 复位：loadURL / reload / 同窗导航一开始就把页面上下文作废，
+  // 此窗口内 send 必丢——只靠 did-finish-load 再置 true（中间态一律走 pending）。
+  mainWindow.webContents.on("did-start-loading", () => {
+    pageLoaded = false;
+  });
   // 页面每次加载完成（首次加载 / 更新后重载）重注入版本号 + 更新标识、不丢状态
   mainWindow.webContents.on("did-finish-load", () => {
+    pageLoaded = true;
     // 版本号给设置页显示（用户要能确认「装的是不是最新版」）；web 版没壳、不显示
     mainWindow?.webContents
       .executeJavaScript(`window.__appVersion=${JSON.stringify(app.getVersion())};`)
       .catch(() => {});
     notifyPageUpdateReady();
-    // 冷启动深链：窗口文档就绪后再投递，避免 send 打进空白页（坑 #15）
+    // 冷启动 / boot 窗口深链：文档就绪后再投递（坑 #15 + R1-10）
     flushPendingDeepLink();
   });
-
   // v1.0.x：主窗创建后不再加载 splash 文档（splash 是独立小窗）——
   // 等 server 就绪后由启动流程直接 loadURL(BASE_URL)、ready-to-show 才亮窗
 };
@@ -1647,8 +1663,14 @@ if (!app.requestSingleInstanceLock()) {
     void setupAutoUpdate();
 
     if (await waitForReady()) {
+      // R1-14：兜底触发飞书桥接 bootstrap（依赖 route 模块加载副作用）。
+      // 壳 ready 后主动 GET 一次 status；首页未请求 /api/tasks 的 headless/Tray
+      // 静默场景也能起 consumer。失败静默——桥接探测失败不影响开窗。
+      void fetch(`${BASE_URL}/api/feishu-bridge/status`).catch(() => {});
       // 等待期间用户可能已手动关窗（关 splash = 全窗关闭 = 走退出流程）
       if (mainWindow) {
+        // loadURL 前显式复位；did-start-loading 也会再置 false（双保险）
+        pageLoaded = false;
         await mainWindow.loadURL(BASE_URL);
         // 兜底：页面没调 app-content-ready（老缓存页 / 页面异常 / 直落非首页路由）
         // 也不能永远黑着——加载完成 8s 内没收到信号就强制亮

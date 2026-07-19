@@ -671,21 +671,19 @@ const ensureCardStarted = async (
     const card = createCardStreamImpl(taskId, { title: turn.title });
     turn.card = card;
 
-    // echo 图：失败降级「📎 N 张图」进文本、不阻塞 start
+    // echo 图：按位序收集（R1-7）；单张失败不拖垮整批，失败位只计入降级文案
     let echoImageKeys: string[] = [];
     let echoText = turn.echoText;
     if (turn.echoImageAbsPaths.length > 0) {
+      const settled = await Promise.allSettled(
+        turn.echoImageAbsPaths.map((abs) => uploadImageImpl(abs)),
+      );
       const keys: string[] = [];
       let failCount = 0;
-      await Promise.all(
-        turn.echoImageAbsPaths.map(async (abs) => {
-          try {
-            keys.push(await uploadImageImpl(abs));
-          } catch {
-            failCount += 1;
-          }
-        }),
-      );
+      for (const r of settled) {
+        if (r.status === "fulfilled") keys.push(r.value);
+        else failCount += 1;
+      }
       echoImageKeys = keys;
       if (failCount > 0) {
         const hint = `📎 ${failCount} 张图`;
@@ -928,7 +926,7 @@ const handleAskUser = (
 const finalizeTurn = async (
   taskId: string,
   turn: TurnState,
-  opts: { ok: boolean; error?: string },
+  opts: { ok: boolean; error?: string; outcome?: "stopped" },
 ): Promise<void> => {
   if (turn.finalized) return;
   turn.finalized = true;
@@ -963,6 +961,7 @@ const finalizeTurn = async (
       durationMs: Date.now() - turn.turnStartedAt,
       model: turn.modelId,
       error: opts.error,
+      outcome: opts.outcome,
     });
 
     if (!opts.ok) {
@@ -1054,10 +1053,17 @@ export const handleFeishuOutboundEvent = async (
     }
 
     if (ev.kind === "done") {
+      // R1-4：cancelled 出口 runStatus=idle，自然 finished=awaiting_user（chat-runner 已核实）。
+      // ok=true 且非 awaiting_user → 用户 stop / 异常收尾，飞书示「已停止」而非绿「已完成」。
+      const stopped =
+        ev.ok &&
+        !!ev.task?.runStatus &&
+        ev.task.runStatus !== "awaiting_user";
       await finalizeTurn(taskId, turn, {
         ok: ev.ok,
         // 失败时用本轮最近落盘的 error 事件文案（handleChatRunFailure 先写事件再发 done）
         error: ev.ok ? undefined : turn.lastError || "出错",
+        outcome: stopped ? "stopped" : undefined,
       });
       return;
     }

@@ -14,6 +14,8 @@ import {
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  findRecentSettledEntry,
+  getMessageOperation,
   onQueuedMessageFlushed,
   removeQueuedChatMessages,
   getChatQueueCount,
@@ -191,6 +193,26 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     expect(getChatQueueCount(id)).toBe(2);
     expect(dequeueChatMessage(id)?.displayText).toBe("user-1");
     expect(dequeueChatMessage(id)?.displayText).toBe("user-3");
+  });
+
+  // R1-13b：选择性出队必须闭环 op ledger（cancelled）
+  it("removeQueuedChatMessages 对移除条目 settle cancelled", () => {
+    const id = alloc();
+    const r1 = enqueueChatMessage(id, msg(1));
+    const r2 = enqueueChatMessage(id, msg(2));
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!r1.ok || !r2.ok) return;
+    const removed = removeQueuedChatMessages(
+      id,
+      (m) => m.itemId === r2.itemId,
+    );
+    expect(removed).toHaveLength(1);
+    expect(findRecentSettledEntry(id, r2.itemId)?.outcome).toBe("cancelled");
+    const op = getMessageOperation(id, r2.itemId);
+    expect(op?.phase).toBe("cancelled");
+    // 未移除的仍在队、未终态
+    expect(findRecentSettledEntry(id, r1.itemId)).toBeUndefined();
+    expect(getChatQueueCount(id)).toBe(1);
   });
 
   it("compact 期间入队语义：send 返 false 后仍可 enqueue、完成后 FIFO 发出", () => {

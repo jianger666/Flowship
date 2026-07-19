@@ -1,5 +1,13 @@
 /**
- * 飞书桥接统一启动入口（instrumentation 调用）
+ * 飞书桥接统一启动入口
+ *
+ * 挂载方式（S5 坑 #4 之后的现状，勿再改回 instrumentation）：
+ * - 由 `/api/tasks`、`/api/feishu-bridge/status`、`chat-reply` 等 route 模块加载时
+ *   副作用调用 `ensureFeishuBridgeBootstrapped()`（webpack 吃 serverExternalPackages
+ *   会炸 instrumentation，故不能挂那里——见提案 S5 实录 #4）
+ * - Electron 壳 waitForReady 成功后会 fire-and-forget GET
+ *   `/api/feishu-bridge/status` 一次，兜底 headless / Tray 静默启动无人发 HTTP
+ *   时也能起 consumer（R1-14）
  *
  * 各模块自带 globalThis 幂等，这里只负责「一处调齐」：
  * - outbound：全局 tap 订阅 chat 事件流 → 流式卡片

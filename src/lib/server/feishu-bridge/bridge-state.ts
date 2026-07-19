@@ -3,6 +3,8 @@
  *
  * 与 card-map 分文件——S1 card-map 只负责卡片锚定 + lastProcessedTs 游标，
  * 入向补拉需要的 chatId / 去重集合放这里，避免改 S1 契约。
+ *
+ * R1-2c：所有「读改写」经进程级串行队列，避免并发 RMW 互相覆盖。
  */
 
 import { promises as fs } from "node:fs";
@@ -26,6 +28,31 @@ const emptyStore = (): BridgeStateStore => ({
   lastP2pChatId: "",
   processedMessageIds: [],
 });
+
+// ----------------- 写队列（挂 globalThis，对齐 enqueueLark） -----------------
+
+const BRIDGE_STATE_CHAIN_KEY = "__flowshipFeishuBridgeStateWriteChainV1__";
+
+type WriteChainState = { current: Promise<void> };
+
+const getBridgeStateWriteChain = (): WriteChainState => {
+  const g = globalThis as unknown as Record<string, WriteChainState | undefined>;
+  if (!g[BRIDGE_STATE_CHAIN_KEY]) {
+    g[BRIDGE_STATE_CHAIN_KEY] = { current: Promise.resolve() };
+  }
+  return g[BRIDGE_STATE_CHAIN_KEY]!;
+};
+
+/** 整段 RMW 入队；读操作不排队 */
+const enqueueBridgeStateWrite = <T>(run: () => Promise<T>): Promise<T> => {
+  const state = getBridgeStateWriteChain();
+  const result = state.current.then(run, run);
+  state.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
 
 const stateFilePath = async (): Promise<string> =>
   path.join(await getBridgeDataDir(), "bridge-state.json");
@@ -63,9 +90,11 @@ const writeStore = async (store: BridgeStateStore): Promise<void> => {
 /** 记下 p2p chat_id（补拉需要） */
 export const rememberP2pChatId = async (chatId: string): Promise<void> => {
   if (!chatId) return;
-  const store = await readStore();
-  if (store.lastP2pChatId === chatId) return;
-  await writeStore({ ...store, lastP2pChatId: chatId });
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    if (store.lastP2pChatId === chatId) return;
+    await writeStore({ ...store, lastP2pChatId: chatId });
+  });
 };
 
 export const getLastP2pChatId = async (): Promise<string> => {
@@ -87,11 +116,13 @@ export const markProcessedMessageId = async (
   messageId: string,
 ): Promise<void> => {
   if (!messageId) return;
-  const store = await readStore();
-  const next = store.processedMessageIds.filter((id) => id !== messageId);
-  next.push(messageId);
-  while (next.length > PROCESSED_IDS_MAX) next.shift();
-  await writeStore({ ...store, processedMessageIds: next });
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    const next = store.processedMessageIds.filter((id) => id !== messageId);
+    next.push(messageId);
+    while (next.length > PROCESSED_IDS_MAX) next.shift();
+    await writeStore({ ...store, processedMessageIds: next });
+  });
 };
 
 /** 单测清状态文件 */

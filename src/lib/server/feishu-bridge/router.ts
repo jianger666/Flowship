@@ -60,12 +60,13 @@ export type BridgeCommandContext = {
 };
 
 /**
- * handled = 已处理完、router 不再注入；
+ * handled = 已处理完、router 记 sent；
+ * handled_failed = 命令已处理但失败（用户已收失败文本）、router 记 failed（不 retryable）；
  * passthrough = 未吃掉、继续当普通文本（或 skill）走。
  */
 export type BridgeCommandHandler = (
   ctx: BridgeCommandContext,
-) => Promise<"handled" | "passthrough">;
+) => Promise<"handled" | "handled_failed" | "passthrough">;
 
 const commandHandlers = new Map<string, BridgeCommandHandler>();
 
@@ -119,6 +120,11 @@ export type InjectResultPayload = {
   error?: string;
   /** 入队/注入时的用户文本（撤回出队按文本匹配用；可选） */
   text?: string;
+  /**
+   * R1-6：基础设施类失败可重试——inbound 不 markProcessed，等补拉重投。
+   * 内容终态（unsupported / 图超限 / 空消息 / 队满 409 / 命令失败文案）不标。
+   */
+  retryable?: boolean;
 };
 
 type InjectResultCb = (payload: InjectResultPayload) => void | Promise<void>;
@@ -544,6 +550,7 @@ const tryCommandOrSkill = async (
   text: string,
 ): Promise<
   | { kind: "handled" }
+  | { kind: "handled_failed" }
   | { kind: "skill"; text: string; skills: Array<{ name: string; absPath: string }> }
   | { kind: "text"; text: string }
 > => {
@@ -562,6 +569,7 @@ const tryCommandOrSkill = async (
   if (handler) {
     const result = await handler({ msg, command, args, text: trimmed });
     if (result === "handled") return { kind: "handled" };
+    if (result === "handled_failed") return { kind: "handled_failed" };
     // passthrough → 继续 skill / 普通文本
   }
 
@@ -589,7 +597,10 @@ const tryCommandOrSkill = async (
 
 const parseHttpInject = async (
   resp: Response,
-): Promise<{ ok: true; queued: boolean } | { ok: false; error: string }> => {
+): Promise<
+  | { ok: true; queued: boolean }
+  | { ok: false; error: string; retryable: boolean }
+> => {
   let data: { error?: string; queued?: boolean } = {};
   try {
     data = (await resp.json()) as { error?: string; queued?: boolean };
@@ -599,12 +610,14 @@ const parseHttpInject = async (
   if (resp.status === 200 || resp.status === 202) {
     return { ok: true, queued: data.queued === true || resp.status === 202 };
   }
+  // 5xx = 基础设施抖动可重试；4xx（含队满 409）= 内容/业务终态，用户已见提示
   return {
     ok: false,
     error:
       typeof data.error === "string" && data.error
         ? data.error
         : `注入失败（HTTP ${resp.status}）`,
+    retryable: resp.status >= 500,
   };
 };
 
@@ -713,8 +726,14 @@ export const routeInboundMessage = async (
     ownerOpenId = (await deps.getBotAppInfo()).ownerOpenId;
   } catch (err) {
     const error = `无法获取 bot 身份：${err instanceof Error ? err.message : String(err)}`;
-    await emitInjectResult({ kind: "failed", messageId: msg.message_id, error });
-    return { kind: "failed", messageId: msg.message_id, error };
+    const payload: InjectResultPayload = {
+      kind: "failed",
+      messageId: msg.message_id,
+      error,
+      retryable: true,
+    };
+    await emitInjectResult(payload);
+    return payload;
   }
   if (msg.sender_id !== ownerOpenId) {
     return { kind: "skipped", messageId: msg.message_id, error: SKIP_NOT_OWNER };
@@ -727,8 +746,14 @@ export const routeInboundMessage = async (
   } catch (err) {
     const error = `解析消息失败：${err instanceof Error ? err.message : String(err)}`;
     await notifyOwnerError(error);
-    await emitInjectResult({ kind: "failed", messageId: msg.message_id, error });
-    return { kind: "failed", messageId: msg.message_id, error };
+    const payload: InjectResultPayload = {
+      kind: "failed",
+      messageId: msg.message_id,
+      error,
+      retryable: true,
+    };
+    await emitInjectResult(payload);
+    return payload;
   }
   if (parsed.unsupported) {
     await notifyOwnerError(parsed.unsupported);
@@ -758,6 +783,16 @@ export const routeInboundMessage = async (
         messageId: msg.message_id,
       });
       return { kind: "sent", messageId: msg.message_id };
+    }
+    // R1-9：命令失败 → failed（不 retryable，用户已收到失败文本）
+    if (cmdResult.kind === "handled_failed") {
+      const payload: InjectResultPayload = {
+        kind: "failed",
+        messageId: msg.message_id,
+        error: "命令执行失败",
+      };
+      await emitInjectResult(payload);
+      return payload;
     }
     if (cmdResult.kind === "skill") {
       text = cmdResult.text;
@@ -849,10 +884,12 @@ export const routeInboundMessage = async (
 
   const pending = deps.getPendingAsk(taskId);
   if (pending) {
+    // R1-5：pendingAsk 分支穿透附图（落盘在 ask-inject 内）
     const askResult = await deps.injectPendingAskText(
       taskId,
       text || "(附图/附件)",
       bootArgs,
+      parsed.images.length > 0 ? parsed.images : undefined,
     );
     if (askResult.ok) {
       const payload: InjectResultPayload = {
@@ -890,24 +927,40 @@ export const routeInboundMessage = async (
     return payload;
   }
 
-  const resp = await deps.handleChatReplyInject(
-    taskId,
-    {
-      text,
-      images: parsed.images.length > 0 ? parsed.images : undefined,
-      attachments:
-        parsed.attachments.length > 0 ? parsed.attachments : undefined,
-      skills,
-      bootArgs,
-    },
-    // review P0#1：feishuMessageId 进 extraMeta → 入队条目携带 → flush 钩子精确匹配
-    {
-      userReplyMetaExtra: {
-        source: "feishu",
-        feishuMessageId: msg.message_id,
+  let resp: Response;
+  try {
+    resp = await deps.handleChatReplyInject(
+      taskId,
+      {
+        text,
+        images: parsed.images.length > 0 ? parsed.images : undefined,
+        attachments:
+          parsed.attachments.length > 0 ? parsed.attachments : undefined,
+        skills,
+        bootArgs,
       },
-    },
-  );
+      // review P0#1：feishuMessageId 进 extraMeta → 入队条目携带 → flush 钩子精确匹配
+      {
+        userReplyMetaExtra: {
+          source: "feishu",
+          feishuMessageId: msg.message_id,
+        },
+      },
+    );
+  } catch (err) {
+    // 网络 / 未捕获异常 = 基础设施失败，可重试
+    const error = `注入异常：${err instanceof Error ? err.message : String(err)}`;
+    await notifyOwnerError(error);
+    const payload: InjectResultPayload = {
+      kind: "failed",
+      messageId: msg.message_id,
+      taskId,
+      error,
+      retryable: true,
+    };
+    await emitInjectResult(payload);
+    return payload;
+  }
   const parsedResp = await parseHttpInject(resp);
   if (!parsedResp.ok) {
     await notifyOwnerError(parsedResp.error);
@@ -916,6 +969,7 @@ export const routeInboundMessage = async (
       messageId: msg.message_id,
       taskId,
       error: parsedResp.error,
+      ...(parsedResp.retryable ? { retryable: true } : {}),
     };
     await emitInjectResult(payload);
     return payload;

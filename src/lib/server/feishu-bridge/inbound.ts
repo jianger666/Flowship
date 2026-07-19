@@ -151,23 +151,60 @@ export const normalizeInboundEvent = (
   };
 };
 
-const defaultMessageHandler = async (raw: unknown): Promise<void> => {
-  const msg = normalizeInboundEvent(raw);
-  if (!msg) return;
-  if (await hasProcessedMessageId(msg.message_id)) return;
-  const result = await routeInboundMessage(msg);
-  await markProcessedMessageId(msg.message_id);
-  // 仅「本人 p2p」消息推进补拉状态——群聊 / 他人私聊不得污染 chatId 与游标
-  //（否则补拉窗口会指向错误会话、漏掉 owner 的离线消息）
-  const identityOk =
-    result.error !== SKIP_NOT_P2P && result.error !== SKIP_NOT_OWNER;
-  if (msg.chat_type === "p2p" && identityOk) {
-    await rememberP2pChatId(msg.chat_id);
-    if (msg.create_time) {
-      await setLastProcessedTs(msg.create_time);
-    }
+// ----------------- 入向单链（R1-2：消顺序反转 + 去重 TOCTOU） -----------------
+
+const INBOUND_CHAIN_KEY = "__flowshipFeishuInboundChainV1__";
+
+type InboundChainState = { current: Promise<void> };
+
+const getInboundChain = (): InboundChainState => {
+  const g = globalThis as unknown as Record<string, InboundChainState | undefined>;
+  if (!g[INBOUND_CHAIN_KEY]) {
+    g[INBOUND_CHAIN_KEY] = { current: Promise.resolve() };
   }
+  return g[INBOUND_CHAIN_KEY]!;
 };
+
+/**
+ * 进程级串行：live consumer 与 catchup 共用。
+ * check → route → mark 在链内原子，消灭双注入与顺序反转。
+ */
+export const enqueueInboundMessage = <T>(run: () => Promise<T>): Promise<T> => {
+  const state = getInboundChain();
+  const result = state.current.then(run, run);
+  state.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
+
+/**
+ * 入向消息默认处理：去重 → 路由 →（非 retryable）标记已处理 + 推进游标。
+ * live stdout 与 catchUpMissedMessages 都走这里（同链）。
+ */
+export const defaultMessageHandler = async (raw: unknown): Promise<void> =>
+  enqueueInboundMessage(async () => {
+    const msg = normalizeInboundEvent(raw);
+    if (!msg) return;
+    if (await hasProcessedMessageId(msg.message_id)) return;
+    const result = await routeInboundMessage(msg);
+    // R1-6：基础设施类 retryable 失败不 mark、不推进游标——等补拉重投
+    if (result.kind === "failed" && result.retryable) {
+      return;
+    }
+    await markProcessedMessageId(msg.message_id);
+    // 仅「本人 p2p」消息推进补拉状态——群聊 / 他人私聊不得污染 chatId 与游标
+    //（否则补拉窗口会指向错误会话、漏掉 owner 的离线消息）
+    const identityOk =
+      result.error !== SKIP_NOT_P2P && result.error !== SKIP_NOT_OWNER;
+    if (msg.chat_type === "p2p" && identityOk) {
+      await rememberP2pChatId(msg.chat_id);
+      if (msg.create_time) {
+        await setLastProcessedTs(msg.create_time);
+      }
+    }
+  });
 
 const defaultCardActionHandler = async (raw: unknown): Promise<void> => {
   await dispatchCardActionEvent(raw);
@@ -604,6 +641,7 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
         if (h.stderrTail.length > 20) h.stderrTail.shift();
         return;
       }
+      // 消息 consumer：onEvent 内部已挂入向单链；card.action 仍 fire-and-forget
       void h.spec.onEvent(parsed).catch((err) => {
         console.error(
           `[feishu-bridge/inbound] onEvent 失败 event_key=${h.spec.eventKey}:`,
@@ -818,17 +856,35 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
   };
 };
 
+/**
+ * 进程退出时停 consumer / keep-awake / 托管子进程（R1-12）。
+ *
+ * 信号礼仪：once 注册 → handler 内 await 清理（上限 2s）→ 重发原信号走默认退出。
+ * 仅注册 once 且不 process.exit 会吞掉 SIGTERM 默认行为——Electron 壳停 server
+ * 的优雅路径就是 SIGTERM（2s 后 SIGKILL 兜底，见 electron-app/main.js stopServer）。
+ * beforeExit 无「默认退出可重发」语义，保持 fire-and-forget 清理即可。
+ */
 const ensureExitHook = (): void => {
   const rt = getRuntime();
   if (rt.exitHooked) return;
   rt.exitHooked = true;
-  const stop = () => {
+  const stopQuiet = (): void => {
     void stopBridgeRuntime();
     void stopAllManagedChildren();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  process.once("beforeExit", stop);
+  const onSignal = (signal: NodeJS.Signals): void => {
+    void (async () => {
+      await Promise.race([
+        Promise.all([stopBridgeRuntime(), stopAllManagedChildren()]),
+        new Promise<void>((r) => setTimeout(r, 2000)),
+      ]);
+      // once 已卸；重发原信号 → Node 默认退出（壳侧 2s SIGKILL 兜底仍有效）
+      process.kill(process.pid, signal);
+    })();
+  };
+  process.once("SIGTERM", () => onSignal("SIGTERM"));
+  process.once("SIGINT", () => onSignal("SIGINT"));
+  process.once("beforeExit", stopQuiet);
 };
 
 /** 全停（测试 / 进程退出） */

@@ -277,11 +277,11 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("/list 有活跃时列标题+runStatus", async () => {
+  it("/list 有活跃时列标题+runStatus（中文）", async () => {
     await runCmd("list");
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      "1. 测试对话（idle）",
+      "1. 测试对话（空闲）",
     );
   });
 
@@ -294,11 +294,11 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("/status 紧凑几行", async () => {
+  it("/status 紧凑几行（overall 中文）", async () => {
     await runCmd("status");
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      expect.stringMatching(/桥接：running[\s\S]*host-a[\s\S]*im\.message\.receive_v1：ready/),
+      expect.stringMatching(/桥接：运行中[\s\S]*host-a[\s\S]*im\.message\.receive_v1：ready/),
     );
   });
 
@@ -361,13 +361,63 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("异常 → 命令执行失败", async () => {
+  it("异常 → 命令执行失败 + inject 记 failed（非 sent）", async () => {
+    const { onInjectResult, __clearInjectResultListenersForTest } =
+      await import("@/lib/server/feishu-bridge/router");
+    const results: Array<{ kind: string }> = [];
+    onInjectResult((p) => {
+      results.push(p);
+    });
     stopAgent.mockRejectedValueOnce(new Error("boom"));
     await runCmd("stop");
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
       "命令执行失败：boom",
     );
+    expect(results.at(-1)?.kind).toBe("failed");
+    __clearInjectResultListenersForTest();
+  });
+
+  it("/new 注入失败 → handled_failed（inject 记 failed）", async () => {
+    const { onInjectResult, __clearInjectResultListenersForTest } =
+      await import("@/lib/server/feishu-bridge/router");
+    const results: Array<{ kind: string }> = [];
+    onInjectResult((p) => {
+      results.push(p);
+    });
+    handleChat.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "忙" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await runCmd("new", "首条");
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("首条注入失败"),
+    );
+    expect(results.at(-1)?.kind).toBe("failed");
+    __clearInjectResultListenersForTest();
+  });
+
+  it("/compact 失败 → handled_failed", async () => {
+    const { onInjectResult, __clearInjectResultListenersForTest } =
+      await import("@/lib/server/feishu-bridge/router");
+    const { CompactChatError } = await import("@/lib/server/chat-runner");
+    const results: Array<{ kind: string }> = [];
+    onInjectResult((p) => {
+      results.push(p);
+    });
+    compact.mockRejectedValueOnce(
+      new CompactChatError("no_session", "无可用会话或 agent 正在回", 400),
+    );
+    await runCmd("compact");
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      "命令执行失败：无可用会话或 agent 正在回",
+    );
+    expect(results.at(-1)?.kind).toBe("failed");
+    __clearInjectResultListenersForTest();
   });
 
   it("ensure 幂等：二次调用不抛", () => {

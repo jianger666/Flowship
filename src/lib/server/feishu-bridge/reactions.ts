@@ -35,17 +35,21 @@ type ReactionEntry = {
   emojiType: string;
 };
 
-/** messageId → 最近一次 bot 点的表情（撤回时撤 Typing 用） */
-const reactionByMessageId = new Map<string, ReactionEntry>();
-/** FIFO 顺序，超上限淘汰最旧 */
-const reactionOrder: string[] = [];
-
 const REG_KEY = "__flowshipFeishuReactionReceiptsV1__";
+/** R1-16：内存表挂 globalThis，避免 dev HMR 后「已注册但表空」、Typing→Get 丢上下文 */
+const STATE_KEY = "__flowshipFeishuReactionStateV1__";
 
 type ReactionsGlobal = {
   registered: boolean;
   unsubInject: (() => void) | null;
   unsubFlush: (() => void) | null;
+};
+
+type ReactionsState = {
+  /** messageId → 最近一次 bot 点的表情（撤回时撤 Typing 用） */
+  byMessageId: Map<string, ReactionEntry>;
+  /** FIFO 顺序，超上限淘汰最旧 */
+  order: string[];
 };
 
 const getReg = (): ReactionsGlobal => {
@@ -56,35 +60,48 @@ const getReg = (): ReactionsGlobal => {
   return g[REG_KEY]!;
 };
 
+const getState = (): ReactionsState => {
+  const g = globalThis as unknown as Record<string, ReactionsState | undefined>;
+  if (!g[STATE_KEY]) {
+    g[STATE_KEY] = {
+      byMessageId: new Map(),
+      order: [],
+    };
+  }
+  return g[STATE_KEY]!;
+};
+
 const rememberReaction = (
   messageId: string,
   reactionId: string,
   emojiType: string,
 ): void => {
   if (!messageId || !reactionId) return;
-  if (reactionByMessageId.has(messageId)) {
+  const { byMessageId, order } = getState();
+  if (byMessageId.has(messageId)) {
     // 同 message 覆盖：从 FIFO 里摘掉旧位
-    const idx = reactionOrder.indexOf(messageId);
-    if (idx >= 0) reactionOrder.splice(idx, 1);
+    const idx = order.indexOf(messageId);
+    if (idx >= 0) order.splice(idx, 1);
   }
-  reactionByMessageId.set(messageId, { messageId, reactionId, emojiType });
-  reactionOrder.push(messageId);
-  while (reactionOrder.length > REACTION_MAP_MAX) {
-    const old = reactionOrder.shift();
-    if (old) reactionByMessageId.delete(old);
+  byMessageId.set(messageId, { messageId, reactionId, emojiType });
+  order.push(messageId);
+  while (order.length > REACTION_MAP_MAX) {
+    const old = order.shift();
+    if (old) byMessageId.delete(old);
   }
 };
 
 /** 查内存里 bot 点过的 reaction（Typing→Get 升级时撤旧表情用） */
 export const getStoredReaction = (
   messageId: string,
-): ReactionEntry | null => reactionByMessageId.get(messageId) ?? null;
+): ReactionEntry | null => getState().byMessageId.get(messageId) ?? null;
 
 /** 从内存忘掉（撤表情成功后 / 单测清理） */
 export const forgetStoredReaction = (messageId: string): void => {
-  if (!reactionByMessageId.delete(messageId)) return;
-  const idx = reactionOrder.indexOf(messageId);
-  if (idx >= 0) reactionOrder.splice(idx, 1);
+  const { byMessageId, order } = getState();
+  if (!byMessageId.delete(messageId)) return;
+  const idx = order.indexOf(messageId);
+  if (idx >= 0) order.splice(idx, 1);
 };
 
 /** 尝试撤掉 bot 点过的表情；失败静默 */
@@ -174,9 +191,10 @@ export const __resetReactionsForTest = (): void => {
   reg.unsubFlush?.();
   reg.unsubFlush = null;
   reg.registered = false;
-  reactionByMessageId.clear();
-  reactionOrder.length = 0;
+  const state = getState();
+  state.byMessageId.clear();
+  state.order.length = 0;
 };
 
 /** 单测窥探 FIFO 顺序 */
-export const __reactionOrderForTest = (): string[] => [...reactionOrder];
+export const __reactionOrderForTest = (): string[] => [...getState().order];

@@ -59,13 +59,26 @@ const {
 beforeEach(async () => {
   await fs.rm(TMP, { recursive: true, force: true });
   await fs.mkdir(path.join(TMP, "data"), { recursive: true });
-  updateCardElementContent.mockClear();
-  updateCardEntity.mockClear();
-  patchCardSettings.mockClear();
-  createCardEntity.mockClear();
-  sendCardMessage.mockClear();
-  batchUpdateCard.mockClear();
+  updateCardElementContent.mockReset();
+  updateCardEntity.mockReset();
+  patchCardSettings.mockReset();
+  createCardEntity.mockReset();
+  sendCardMessage.mockReset();
+  batchUpdateCard.mockReset();
+  getBotAppInfo.mockReset();
+  updateCardElementContent.mockResolvedValue(undefined);
+  updateCardEntity.mockResolvedValue(undefined);
+  patchCardSettings.mockResolvedValue(undefined);
+  batchUpdateCard.mockResolvedValue(undefined);
   createCardEntity.mockResolvedValue({ card_id: "card_test" });
+  sendCardMessage.mockResolvedValue({
+    chat_id: "oc_test",
+    message_id: "om_test",
+  });
+  getBotAppInfo.mockResolvedValue({
+    appId: "cli_test",
+    ownerOpenId: "ou_test",
+  });
   __setCardStreamTimersForTest((cb) => {
     cb();
     return 0 as unknown as ReturnType<typeof setTimeout>;
@@ -311,6 +324,263 @@ describe("createCardStream", () => {
     expect(
       multiEls.some((e) => e.content === "请直接回复文字作答"),
     ).toBe(true);
+  });
+
+  // R1-1a：全量 PUT 必须带回 ask 元素
+  it("全量 PUT（headerDirty）保留已追加的 ask 按钮元素", async () => {
+    const stream = createCardStream("task_ask_put", { title: "t", openId: "ou" });
+    await stream.start();
+    await stream.appendAskUser({
+      askId: "ask_keep",
+      questions: [
+        {
+          id: "q1",
+          question: "选？",
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+          ],
+        },
+      ],
+    });
+    expect(updateCardEntity).toHaveBeenCalled();
+    const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+      [
+        string,
+        {
+          body: {
+            elements: Array<{ tag?: string; element_id?: string }>;
+          };
+          header: { template: string };
+        },
+      ]
+    >;
+    const cardJson = entityCalls.at(-1)![1];
+    expect(cardJson.body.elements.some((e) => e.tag === "button")).toBe(true);
+    const hrIdx = cardJson.body.elements.findIndex(
+      (e) => e.element_id === "main_divider",
+    );
+    const btnIdx = cardJson.body.elements.findIndex((e) => e.tag === "button");
+    expect(btnIdx).toBeGreaterThanOrEqual(0);
+    expect(btnIdx).toBeLessThan(hrIdx);
+    expect(cardJson.header.template).toBe("orange");
+  });
+
+  // R1-1b：pending ask 未清时 finalize 保持等待态
+  it("pending 未清时 finalize 保持 orange「等待选择」、仍关 streaming", async () => {
+    const { registerPendingAsk, clearPendingAsk } = await import(
+      "@/lib/server/chat-pending"
+    );
+    const taskId = "task_ask_pend";
+    registerPendingAsk(taskId, {
+      askId: "ask_p",
+      questions: [
+        {
+          id: "q1",
+          question: "？",
+          options: [{ id: "a", label: "A" }],
+          allowText: true,
+        },
+      ],
+    });
+    try {
+      const stream = createCardStream(taskId, { title: "t", openId: "ou" });
+      await stream.start();
+      await stream.appendAskUser({
+        askId: "ask_p",
+        questions: [
+          {
+            id: "q1",
+            question: "？",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      });
+      updateCardEntity.mockClear();
+      await stream.finalize({
+        ok: true,
+        durationMs: 3000,
+        model: "gpt-5.5",
+      });
+      const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+        [
+          string,
+          {
+            header: { subtitle?: { content: string }; template: string };
+            body: {
+              elements: Array<{
+                tag?: string;
+                element_id?: string;
+                content?: string;
+              }>;
+            };
+          },
+        ]
+      >;
+      const cardJson = entityCalls.at(-1)![1];
+      expect(cardJson.header.template).toBe("orange");
+      expect(cardJson.header.subtitle?.content).toBe("等待选择");
+      expect(cardJson.body.elements.some((e) => e.tag === "button")).toBe(true);
+      const footer = cardJson.body.elements.find(
+        (e) => e.element_id === "md_footer",
+      );
+      expect(footer?.content).toContain("flowship");
+      expect(patchCardSettings).toHaveBeenCalled();
+    } finally {
+      clearPendingAsk(taskId);
+    }
+  });
+
+  // R1-4：stopped 终态灰卡
+  it("finalize outcome=stopped → grey「已停止」", async () => {
+    const stream = createCardStream("task_stop", { title: "t", openId: "ou" });
+    await stream.start();
+    stream.pushAnswer("半截");
+    await vi.waitFor(() =>
+      expect(updateCardElementContent).toHaveBeenCalled(),
+    );
+    await stream.finalize({
+      ok: true,
+      outcome: "stopped",
+      durationMs: 1000,
+    });
+    const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+      [
+        string,
+        { header: { subtitle?: { content: string }; template: string } },
+      ]
+    >;
+    const cardJson = entityCalls.at(-1)![1];
+    expect(cardJson.header.template).toBe("grey");
+    expect(cardJson.header.subtitle?.content).toBe("已停止");
+  });
+
+  // R1-1c + R1-13d：append 与 finalize 交错按链序
+  it("appendAskUser 与 finalize 交错时按链序执行（finalize 在 append 后）", async () => {
+    const order: string[] = [];
+    batchUpdateCard.mockImplementation(async () => {
+      order.push("batch");
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    updateCardEntity.mockImplementation(async () => {
+      order.push("entity");
+    });
+    patchCardSettings.mockImplementation(async () => {
+      order.push("settings");
+    });
+
+    const stream = createCardStream("task_race", { title: "t", openId: "ou" });
+    await stream.start();
+    const askP = stream.appendAskUser({
+      askId: "ask_r",
+      questions: [
+        {
+          id: "q1",
+          question: "？",
+          options: [{ id: "a", label: "A" }],
+        },
+      ],
+    });
+    const finP = stream.finalize({ ok: true, durationMs: 100 });
+    await Promise.all([askP, finP]);
+
+    expect(order[0]).toBe("batch");
+    expect(order.at(-1)).toBe("settings");
+    const batchIdx = order.indexOf("batch");
+    const settingsIdx = order.lastIndexOf("settings");
+    expect(batchIdx).toBeLessThan(settingsIdx);
+  });
+
+  // R1-13d：三通道交错同卡 sequence 严格递增
+  it("process/answer/header 三通道交错时同卡 sequence 严格递增", async () => {
+    const pending: Array<() => void> = [];
+    __setCardStreamTimersForTest((cb) => {
+      pending.push(cb);
+      return pending.length as unknown as ReturnType<typeof setTimeout>;
+    });
+    const stream = createCardStream("task_seq3", { title: "t", openId: "ou" });
+    await stream.start();
+
+    stream.pushProcess("> `Shell` · running\n> x");
+    stream.pushAnswer("正文一段");
+    stream.setHeaderStatus("正在执行终端：x", "blue");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+
+    updateCardElementContent.mockClear();
+    updateCardEntity.mockClear();
+    stream.pushProcess("> `Shell` · completed\n> x");
+    stream.pushAnswer("正文一段续");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() =>
+      expect(updateCardElementContent.mock.calls.length).toBeGreaterThan(0),
+    );
+
+    const contentSeqs = (
+      updateCardElementContent.mock.calls as unknown as Array<
+        [string, string, string, number]
+      >
+    ).map((c) => c[3]);
+    for (let i = 1; i < contentSeqs.length; i++) {
+      expect(contentSeqs[i]!).toBeGreaterThan(contentSeqs[i - 1]!);
+    }
+
+    stream.setHeaderStatus("收尾", "blue");
+    stream.pushAnswer("正文一段续完");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+    const allSeqs = [
+      ...(
+        updateCardEntity.mock.calls as unknown as Array<[string, unknown, number]>
+      ).map((c) => c[2]),
+      ...(
+        updateCardElementContent.mock.calls as unknown as Array<
+          [string, string, string, number]
+        >
+      ).map((c) => c[3]),
+    ];
+    expect(new Set(allSeqs).size).toBe(allSeqs.length);
+    expect(Math.max(...allSeqs)).toBeGreaterThan(Math.min(...allSeqs));
+  });
+
+  // R1-13d：finalize 与在途 flush 不乱序
+  it("finalize 与在途 flush 交错不乱序（链上互斥）", async () => {
+    const order: string[] = [];
+    let flushGate: (() => void) | null = null;
+    updateCardElementContent.mockImplementation(async () => {
+      order.push("flush");
+      await new Promise<void>((resolve) => {
+        flushGate = resolve;
+      });
+    });
+    updateCardEntity.mockImplementation(async () => {
+      order.push("finalize-entity");
+    });
+    patchCardSettings.mockImplementation(async () => {
+      order.push("finalize-settings");
+    });
+
+    const pending: Array<() => void> = [];
+    __setCardStreamTimersForTest((cb) => {
+      pending.push(cb);
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+
+    const stream = createCardStream("task_fin_race", {
+      title: "t",
+      openId: "ou",
+    });
+    await stream.start();
+    stream.pushAnswer("在途文本");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(flushGate).toBeTruthy());
+
+    const finP = stream.finalize({ ok: true, durationMs: 10 });
+    flushGate!();
+    await finP;
+
+    expect(order[0]).toBe("flush");
+    expect(order.slice(1)).toEqual(["finalize-entity", "finalize-settings"]);
   });
 
   // review P2#6：finalize 补未闭合围栏

@@ -7,9 +7,11 @@
  * - 接近 10 万字符截断（坑 #13）；lark 失败 console.warn 不抛（坑 #10）
  */
 
+import { getPendingAsk } from "@/lib/server/chat-pending";
+
 import { getDeepLink } from "./bridge-config";
 import { rememberCardMessage } from "./card-map";
-import { nextCardSequence } from "./card-seq";
+import { flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
   batchUpdateCard,
   createCardEntity,
@@ -207,6 +209,11 @@ export const buildStreamingCardJson = (opts: {
   processText?: string;
   answerText?: string;
   footerText?: string;
+  /**
+   * ask / retry 等已 batch 追加的元素——全量 PUT 时插回 hr 之前，
+   * 避免 headerDirty / finalize 的 updateCardEntity 抹掉按钮（R1-1）。
+   */
+  extraElements?: unknown[];
 }): Record<string, unknown> => {
   const processText = opts.processText ?? "";
   const toolCount = countToolsInProcess(processText);
@@ -251,6 +258,12 @@ export const buildStreamingCardJson = (opts: {
         },
       ],
     },
+  );
+  // ask/retry 插在分割线前（与 batch_update insert_before hr 位置一致）
+  if (opts.extraElements?.length) {
+    elements.push(...opts.extraElements);
+  }
+  elements.push(
     { tag: "hr", element_id: ELEMENT_DIVIDER },
     {
       tag: "markdown",
@@ -284,7 +297,9 @@ export const buildStreamingCardJson = (opts: {
               ? "处理失败"
               : opts.template === "orange"
                 ? "等待选择"
-                : "生成中"),
+                : opts.template === "grey"
+                  ? "已停止"
+                  : "生成中"),
       },
       streaming_config: {
         print_frequency_ms: { default: 70 },
@@ -332,12 +347,20 @@ export const createCardStream = (
    * ask 等待 / finalize 后写入固定文案，不再转 spinner。
    */
   let footerText = "";
+  /**
+   * 已通过 batch_update 插入的 ask/retry 元素快照。
+   * 全量 PUT（headerDirty / finalize）必须带上，否则飞书会抹掉按钮（R1-1）。
+   */
+  let appendedElements: unknown[] = [];
 
   /** 自 start 后未 flush 的新增字符数（过程+正文合计增量） */
   let pendingChars = 0;
   /** 节流定时器 */
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
-  /** flush 互斥——避免重叠 PUT */
+  /**
+   * 卡片写操作互斥链——flush / appendAskUser / appendRetryButton / finalize
+   * 全部排进同一链，避免 ask 按钮与 done finalize 交错（R1-1c）。
+   */
   let flushing: Promise<void> = Promise.resolve();
 
   // sequence 走按卡共享分配器（card-seq）——card-action 按钮终态与流式共用一张卡，
@@ -359,23 +382,24 @@ export const createCardStream = (
     }
   };
 
+  /** 任意卡片写操作进互斥链（吞错，不打断后续） */
+  const enqueueCardOp = (op: () => Promise<void>): Promise<void> => {
+    flushing = flushing.then(op).catch(() => undefined);
+    return flushing;
+  };
+
   const scheduleFlush = (): void => {
     if (finalized || !started || !cardId) return;
     if (pendingChars >= FLUSH_CHAR_THRESHOLD) {
       clearFlushTimer();
-      void enqueueFlush();
+      void enqueueCardOp(() => doFlush());
       return;
     }
     if (flushTimer !== null) return;
     flushTimer = scheduleTimer(() => {
       flushTimer = null;
-      void enqueueFlush();
+      void enqueueCardOp(() => doFlush());
     }, FLUSH_INTERVAL_MS);
-  };
-
-  const enqueueFlush = (): Promise<void> => {
-    flushing = flushing.then(() => doFlush()).catch(() => undefined);
-    return flushing;
   };
 
   const rebuildCardJson = (): Record<string, unknown> =>
@@ -388,6 +412,7 @@ export const createCardStream = (
       answerText: answerFlushed,
       // 流式中 footer 空 → spinner；等待/完成由 footerText 定稿
       footerText: footerText || streamingFooterSpinner(),
+      extraElements: appendedElements.length > 0 ? appendedElements : undefined,
     });
 
   const doFlush = async (): Promise<void> => {
@@ -521,180 +546,206 @@ export const createCardStream = (
   const appendAskUser = async (
     askOpts: CardStreamAppendAskOpts,
   ): Promise<void> => {
-    if (!started || finalized || !cardId) return;
-    await enqueueFlush();
-    const elements: unknown[] = [];
-    // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
-    // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
-    const singleQuestion = askOpts.questions.length === 1;
-    for (const q of askOpts.questions) {
-      elements.push({
-        tag: "markdown",
-        // element_id ≤20 字符硬约束 → 短哈希（真实 id 走按钮 value 回传）
-        element_id: askQuestionElementId(askOpts.askId, q.id),
-        content: `**${q.question}**`,
-      });
-      if (singleQuestion && q.options?.length) {
-        for (const opt of q.options) {
-          const value: CardButtonValue = {
-            kind: "ask",
-            taskId,
-            askId: askOpts.askId,
-            questionId: q.id,
-            optionId: opt.id,
-          };
-          elements.push({
-            tag: "button",
-            element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
-            text: { tag: "plain_text", content: opt.label },
-            type: "primary",
-            // Hermes interaction 按钮同款 size
-            size: "medium",
-            width: "default",
-            // 飞书 JSON 2.0：behaviors 触发回调，value 原样回传
-            behaviors: [
-              {
-                type: "callback",
-                value,
-              },
-            ],
-          });
+    // 整段进 flushing 链：先刷余量 → batch 插按钮 → 记快照 → 全量 PUT header
+    // （旧实现 batch 在链外，与 finalize 交错不确定——R1-1c）
+    return enqueueCardOp(async () => {
+      if (!started || finalized || !cardId) return;
+      // 链上先刷过程/正文，避免随后全量 PUT 丢未推文本
+      await doFlush();
+      const elements: unknown[] = [];
+      // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
+      // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
+      const singleQuestion = askOpts.questions.length === 1;
+      for (const q of askOpts.questions) {
+        elements.push({
+          tag: "markdown",
+          // element_id ≤20 字符硬约束 → 短哈希（真实 id 走按钮 value 回传）
+          element_id: askQuestionElementId(askOpts.askId, q.id),
+          content: `**${q.question}**`,
+        });
+        if (singleQuestion && q.options?.length) {
+          for (const opt of q.options) {
+            const value: CardButtonValue = {
+              kind: "ask",
+              taskId,
+              askId: askOpts.askId,
+              questionId: q.id,
+              optionId: opt.id,
+            };
+            elements.push({
+              tag: "button",
+              element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
+              text: { tag: "plain_text", content: opt.label },
+              type: "primary",
+              // Hermes interaction 按钮同款 size
+              size: "medium",
+              width: "default",
+              // 飞书 JSON 2.0：behaviors 触发回调，value 原样回传
+              behaviors: [
+                {
+                  type: "callback",
+                  value,
+                },
+              ],
+            });
+          }
         }
       }
-    }
-    if (!singleQuestion) {
-      elements.push({
-        tag: "markdown",
-        element_id: "md_ask_hint",
-        content: "请直接回复文字作答",
-      });
-    }
-    // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
-    subtitle = "";
-    template = "orange";
-    footerText = "等待选择";
-    headerDirty = false; // 本批 batch 不改 header；单独再刷 header
-    try {
-      await batchUpdateCard(
-        cardId,
-        [
-          {
-            action: "add_elements",
-            params: {
-              type: "insert_before",
-              // 插在分割线前，按钮落在正文区与 footer 之间（对齐 Hermes interaction 位置）
-              target_element_id: ELEMENT_DIVIDER,
-              elements,
+      if (!singleQuestion) {
+        elements.push({
+          tag: "markdown",
+          element_id: "md_ask_hint",
+          content: "请直接回复文字作答",
+        });
+      }
+      // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
+      subtitle = "";
+      template = "orange";
+      footerText = "等待选择";
+      try {
+        await batchUpdateCard(
+          cardId,
+          [
+            {
+              action: "add_elements",
+              params: {
+                type: "insert_before",
+                // 插在分割线前，按钮落在正文区与 footer 之间（对齐 Hermes interaction 位置）
+                target_element_id: ELEMENT_DIVIDER,
+                elements,
+              },
             },
-          },
-        ],
-        nextSeq(),
-      );
-      // header / footer 状态单独全量 PUT
-      headerDirty = true;
-      await enqueueFlush();
-    } catch (err) {
-      warnFail("appendAskUser", err);
-    }
+          ],
+          nextSeq(),
+        );
+        // 记住元素：后续任何全量 PUT 都带上（R1-1a）
+        appendedElements = [...appendedElements, ...elements];
+        // header / footer 状态全量 PUT（rebuild 已含 appendedElements）
+        headerDirty = false;
+        await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+      } catch (err) {
+        warnFail("appendAskUser", err);
+        // batch 成功但 header PUT 失败时仍保留快照，下次 finalize/flush 可补
+        headerDirty = true;
+      }
+    });
   };
 
   const appendRetryButton = async (lastUserMessage: string): Promise<void> => {
-    if (!started || !cardId) return;
-    await enqueueFlush();
-    const value: CardButtonValue = {
-      kind: "retry",
-      taskId,
-      lastUserMessage,
-    };
-    try {
-      await batchUpdateCard(
-        cardId,
-        [
-          {
-            action: "add_elements",
-            params: {
-              type: "insert_before",
-              target_element_id: ELEMENT_DIVIDER,
-              elements: [
-                {
-                  tag: "button",
-                  element_id: "btn_retry",
-                  text: { tag: "plain_text", content: "重试" },
-                  type: "danger",
-                  size: "medium",
-                  behaviors: [{ type: "callback", value }],
-                },
-              ],
+    return enqueueCardOp(async () => {
+      if (!started || !cardId) return;
+      await doFlush();
+      const value: CardButtonValue = {
+        kind: "retry",
+        taskId,
+        lastUserMessage,
+      };
+      const elements: unknown[] = [
+        {
+          tag: "button",
+          element_id: "btn_retry",
+          text: { tag: "plain_text", content: "重试" },
+          type: "danger",
+          size: "medium",
+          behaviors: [{ type: "callback", value }],
+        },
+      ];
+      try {
+        await batchUpdateCard(
+          cardId,
+          [
+            {
+              action: "add_elements",
+              params: {
+                type: "insert_before",
+                target_element_id: ELEMENT_DIVIDER,
+                elements,
+              },
             },
-          },
-        ],
-        nextSeq(),
-      );
-    } catch (err) {
-      warnFail("appendRetryButton", err);
-    }
+          ],
+          nextSeq(),
+        );
+        appendedElements = [...appendedElements, ...elements];
+      } catch (err) {
+        warnFail("appendRetryButton", err);
+      }
+    });
   };
 
   const finalize = async (
     fin: CardStreamFinalizeOpts,
   ): Promise<void> => {
-    if (!started || finalized || !cardId) {
-      finalized = true;
-      clearFlushTimer();
-      return;
-    }
     clearFlushTimer();
-    // 先刷完过程/正文
-    await enqueueFlush();
+    return enqueueCardOp(async () => {
+      if (!started || finalized || !cardId) {
+        finalized = true;
+        return;
+      }
+      // 链上刷完过程/正文（与在途 flush 互斥，R1-13d）
+      await doFlush();
 
-    const deepLink = `[在 app 中打开](${getDeepLink(taskId)})`;
-    if (fin.ok) {
-      // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型 · 深链
-      subtitle = "已完成";
-      template = "green";
-      const parts: string[] = [];
+      const deepLink = `[在 app 中打开](${getDeepLink(taskId)})`;
+      const statsParts: string[] = [];
       if (fin.durationMs != null) {
         const d = formatDuration(fin.durationMs);
-        if (d) parts.push(d);
+        if (d) statsParts.push(d);
       }
-      if (fin.model) parts.push(coloredModelLabel(fin.model));
-      parts.push(deepLink);
-      footerText = parts.join(" · ");
-    } else {
-      // Hermes failed：保留运行中工具 subtitle（不覆盖）、red；footer「已停止」
-      template = "red";
-      // 无工具预览时用简短失败摘要，避免 header 完全空白
-      if (!subtitle.trim()) {
-        subtitle = fin.error?.trim()
-          ? truncateForCard(fin.error.trim()).slice(0, 120)
-          : "处理失败";
+      if (fin.model) statsParts.push(coloredModelLabel(fin.model));
+      statsParts.push(deepLink);
+      const statsFooter = statsParts.join(" · ");
+
+      // R1-4：用户 stop → 灰卡「已停止」（与自然完成 / ask 等待互斥）
+      if (fin.outcome === "stopped") {
+        subtitle = "已停止";
+        template = "grey";
+        footerText = statsFooter;
+      } else if (fin.ok && getPendingAsk(taskId)) {
+        // R1-1b：pending ask 未清 → 保持 orange「等待选择」；footer 仍换统计+深链、关 streaming
+        subtitle = "等待选择";
+        template = "orange";
+        footerText = statsFooter;
+      } else if (fin.ok) {
+        // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型 · 深链
+        subtitle = "已完成";
+        template = "green";
+        footerText = statsFooter;
+      } else {
+        // Hermes failed：保留运行中工具 subtitle（不覆盖）、red；footer「已停止」
+        template = "red";
+        // 无工具预览时用简短失败摘要，避免 header 完全空白
+        if (!subtitle.trim()) {
+          subtitle = fin.error?.trim()
+            ? truncateForCard(fin.error.trim()).slice(0, 120)
+            : "处理失败";
+        }
+        footerText = `已停止 · ${deepLink}`;
       }
-      footerText = `已停止 · ${deepLink}`;
-    }
 
-    try {
-      // footer + header 一次全量 PUT
-      // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
-      answerFlushed = closeUnclosedCodeFence(
-        truncateForCard(applyPrefixGuard(answerFlushed, answerDesired)),
-      );
-      processFlushed = closeUnclosedCodeFence(
-        truncateForCard(applyPrefixGuard(processFlushed, processDesired)),
-      );
-      await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
-      // 关 streaming_mode
-      await patchCardSettings(
-        cardId,
-        { config: { streaming_mode: false, update_multi: true } },
-        nextSeq(),
-      );
-    } catch (err) {
-      warnFail("finalize", err);
-    } finally {
-      finalized = true;
-      headerDirty = false;
-    }
-
+      try {
+        // footer + header 一次全量 PUT（含 appendedElements，按钮不丢）
+        // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
+        answerFlushed = closeUnclosedCodeFence(
+          truncateForCard(applyPrefixGuard(answerFlushed, answerDesired)),
+        );
+        processFlushed = closeUnclosedCodeFence(
+          truncateForCard(applyPrefixGuard(processFlushed, processDesired)),
+        );
+        await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+        // 关 streaming_mode
+        await patchCardSettings(
+          cardId,
+          { config: { streaming_mode: false, update_multi: true } },
+          nextSeq(),
+        );
+        // R1-3：finalize 后立即刷 seq，避免进程随后退出丢高水位
+        await flushCardSeqToDisk();
+      } catch (err) {
+        warnFail("finalize", err);
+      } finally {
+        finalized = true;
+        headerDirty = false;
+      }
+    });
   };
 
   return {

@@ -81,7 +81,14 @@ describe("routeInboundMessage", () => {
         headers: { "Content-Type": "application/json" },
       }),
   );
-  const injectAsk = vi.fn(async () => ({ ok: true as const }));
+  const injectAsk = vi.fn<
+    (
+      taskId: string,
+      text: string,
+      boot?: unknown,
+      images?: Array<{ data: string; mimeType: string; filename?: string }>,
+    ) => Promise<{ ok: true }>
+  >(async () => ({ ok: true as const }));
   const findByRoot = vi.fn<
     (id: string) => Promise<{
       messageId: string;
@@ -368,6 +375,54 @@ describe("routeInboundMessage", () => {
     expect(injectAsk).toHaveBeenCalled();
     expect(handleChat).not.toHaveBeenCalled();
     expect(results.at(-1)?.kind).toBe("sent");
+  });
+
+  // R1-5：带图答 ask → images 穿透到 injectPendingAskText
+  it("pendingAsk 带图 → images 穿透给 injectPendingAskText", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "feishu-ask-img-"));
+    const imgPath = path.join(tmpDir, "a.png");
+    // 最小合法 PNG 头 + 几字节（fileToBase64Image 只看体积与扩展名）
+    await fs.writeFile(imgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+    getPending.mockReturnValue({
+      askId: "ask-img",
+      token: "t",
+      questions: [{ id: "q1", question: "看图？", allowText: true }],
+      createdAt: Date.now(),
+    });
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => imgPath,
+    });
+
+    await routeInboundMessage(
+      baseMsg({
+        message_id: "om_ask_img",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_k1" }),
+      }),
+    );
+    expect(injectAsk).toHaveBeenCalled();
+    const args = injectAsk.mock.calls.at(-1)!;
+    expect(args[0]).toBe("task-1");
+    // 纯图无正文 → router 垫 "(附图/附件)"
+    expect(args[1]).toBe("(附图/附件)");
+    expect(Array.isArray(args[3])).toBe(true);
+    expect(args[3]!.length).toBe(1);
+    expect(args[3]![0]).toMatchObject({
+      mimeType: expect.stringMatching(/image\//),
+      data: expect.any(String),
+    });
+    expect(handleChat).not.toHaveBeenCalled();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("命令 handled_failed → emit failed（不 retryable）", async () => {
+    registerBridgeCommand("boom", async () => "handled_failed");
+    const r = await routeInboundMessage(baseMsg({ content: "/boom" }));
+    expect(r.kind).toBe("failed");
+    expect(r.retryable).toBeFalsy();
+    expect(handleChat).not.toHaveBeenCalled();
+    expect(results.at(-1)?.kind).toBe("failed");
   });
 
   it("命令 handler 注册后可 handled 短路", async () => {
