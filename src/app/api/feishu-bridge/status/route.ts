@@ -9,6 +9,7 @@ import { NextResponse } from "next/server";
 
 import {
   getBridgeRuntimeStatus,
+  hydrateBridgeInboundAt,
   syncBridgeRuntime,
 } from "@/lib/server/feishu-bridge/inbound";
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
@@ -29,6 +30,8 @@ export const GET = async () => {
   try {
     // 先按当前开关同步一次 runtime（用户刚切开关就点重试时立即生效、不等 30s 轮询）
     await syncBridgeRuntime();
+    // 重启后「最近收到」从盘上回填（收消息自检不因重启归零）
+    await hydrateBridgeInboundAt();
     const status = await probeBridgeStatus();
     return NextResponse.json({
       ok: true,

@@ -26,8 +26,10 @@ import {
 } from "./bridge-config";
 import {
   getLastP2pChatId,
+  getPersistedLastInboundAt,
   hasProcessedMessageId,
   markProcessedMessageId,
+  rememberInboundReceivedAt,
   rememberP2pChatId,
 } from "./bridge-state";
 import {
@@ -259,9 +261,24 @@ export type BridgeRuntimeStatus = {
   lastInboundAt?: number;
 };
 
-/** 入向链路收到任意消息时打点（router 入口调）——设置页「收消息自检」数据源 */
+/** 入向链路收到任意消息时打点——设置页「收消息自检」数据源（内存 + 节流落盘） */
 export const markBridgeInboundReceived = (): void => {
-  getRuntime().lastInboundAt = Date.now();
+  const ts = Date.now();
+  getRuntime().lastInboundAt = ts;
+  // 落盘失败不影响消息处理（自检只是展示信号）
+  void rememberInboundReceivedAt(ts).catch(() => undefined);
+};
+
+/** 重启后从盘上回填「最近收到」时刻（只在内存值为空时补、幂等） */
+export const hydrateBridgeInboundAt = async (): Promise<void> => {
+  const rt = getRuntime();
+  if (rt.lastInboundAt) return;
+  try {
+    const persisted = await getPersistedLastInboundAt();
+    if (persisted && !rt.lastInboundAt) rt.lastInboundAt = persisted;
+  } catch {
+    // 读盘失败当从未收到
+  }
 };
 
 // ----------------- spawn 可注入 -----------------

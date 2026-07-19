@@ -254,6 +254,16 @@ export const FeishuBridgeBlock = ({
   const allGreen =
     !!status?.cli?.ok && !!status?.scopes?.ok && !!status?.cardkit?.ok;
 
+  // 监听器里需要用户处理的问题行（unsupported/conflict/error）
+  const problemConsumers = (status?.runtime?.consumers ?? []).filter((c) =>
+    ["unsupported", "conflict", "error"].includes(c.status),
+  );
+  // 全绿（含收到过消息、无问题监听器）→ 检查区收成一行（用户反馈：四行占空间）
+  const allChecksOk =
+    allGreen &&
+    !!status?.runtime?.lastInboundAt &&
+    problemConsumers.length === 0;
+
   return (
     <div className="space-y-1 border-t pt-3">
       <SettingRow
@@ -275,6 +285,17 @@ export const FeishuBridgeBlock = ({
               <div className="py-3">
                 <LoadingState variant="inline" />
               </div>
+            ) : allChecksOk ? (
+              // 全绿收成一行（2026-07-19 用户反馈：四行占空间）；任一有问题才展开逐项
+              <CheckRow
+                ok
+                title="前置检查全部通过"
+                detail={`连接 / 权限 / 卡片 / 收消息${
+                  status?.runtime?.lastInboundAt
+                    ? `（最近收到：${formatRelative(status.runtime.lastInboundAt)}）`
+                    : ""
+                }`}
+              />
             ) : (
               <>
                 <CheckRow

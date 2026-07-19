@@ -22,11 +22,14 @@ interface BridgeStateStore {
   lastP2pChatId: string;
   /** 近期已注入的 message_id（FIFO） */
   processedMessageIds: string[];
+  /** 最近收到入向消息的时刻（收消息自检；0 = 从未）——跨重启保留 */
+  lastInboundAt: number;
 }
 
 const emptyStore = (): BridgeStateStore => ({
   lastP2pChatId: "",
   processedMessageIds: [],
+  lastInboundAt: 0,
 });
 
 // ----------------- 写队列（挂 globalThis，对齐 enqueueLark） -----------------
@@ -67,6 +70,8 @@ const readStore = async (): Promise<BridgeStateStore> => {
       processedMessageIds: Array.isArray(parsed.processedMessageIds)
         ? parsed.processedMessageIds.filter((x): x is string => typeof x === "string")
         : [],
+      lastInboundAt:
+        typeof parsed.lastInboundAt === "number" ? parsed.lastInboundAt : 0,
     };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
@@ -85,6 +90,24 @@ const writeStore = async (store: BridgeStateStore): Promise<void> => {
     await stateFilePath(),
     JSON.stringify(store, null, 2),
   );
+};
+
+/** 收消息打点节流：60s 内不重复写盘（时间精度对自检展示够用） */
+const INBOUND_AT_WRITE_THROTTLE_MS = 60_000;
+
+/** 记「最近收到入向消息」时刻（节流写盘、跨重启保留） */
+export const rememberInboundReceivedAt = async (ts: number): Promise<void> => {
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    if (ts - store.lastInboundAt < INBOUND_AT_WRITE_THROTTLE_MS) return;
+    store.lastInboundAt = ts;
+    await writeStore(store);
+  });
+};
+
+/** 读盘上的「最近收到入向消息」时刻（0 = 从未）——重启后自检回填用 */
+export const getPersistedLastInboundAt = async (): Promise<number> => {
+  return (await readStore()).lastInboundAt;
 };
 
 /** 记下 p2p chat_id（补拉需要） */
