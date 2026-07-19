@@ -21,6 +21,7 @@ import {
   setTaskRepoPaths,
   setTaskUiLayout,
   updateTaskFields,
+  writeDeleteTombstone,
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
@@ -55,8 +56,6 @@ const DELETE_REWIND_WAIT_MS = 30_000;
 /** U1：等 Agent.create/send 飞行窗口退出（waitFor* 只等可见 record） */
 const DELETE_STARTING_POLL_MS = 100;
 const DELETE_STARTING_WAIT_MS = 8_000;
-/** R29-A：等 resourceJobs 归零（与 finalize/stop join 对齐、覆盖 advance 首段 ensure） */
-const DELETE_RESOURCE_WAIT_MS = 30_000;
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -309,8 +308,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
         );
       }
       if (hasResourceJobs(id)) {
+        // 省略 timeoutMs → 与 finalize/stop 共用 getResourceJoinTimeoutMs / 测试 override
         const join = await joinResourceJobs(id, {
-          timeoutMs: DELETE_RESOURCE_WAIT_MS,
           pollMs: DELETE_STARTING_POLL_MS,
         });
         resourceJoinTimedOut = join === "timeout";
@@ -330,13 +329,16 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     cleanupChatQueueState(id);
     clearChatContextUsage(id);
 
-    // R30-2：quarantine 场景——HTTP 先返回，deleting lifecycle 保持到后台删完；
-    // 后台轮询 job 归零后再 cleanupCheckpointRefs + deleteTask + clearChatGate。
+    // R30-2 / R31-3：quarantine 场景——先 durable tombstone（逻辑删除成立），再 HTTP 200；
+    // deleting lifecycle 保持到后台物理删完；job 归零后再 cleanupCheckpointRefs + deleteTask。
     if (resourceJoinTimedOut || hasResourceJobs(id)) {
       if (!resourceJoinTimedOut) {
         // 防御：starting 超时窗口外 resource 又冒出来
         markWorkspaceQuarantined(id);
       }
+      // R31-3：返回 200 之前必须先形成 durable logical delete（list/get 立刻不可见；
+      // 进程退出后 boot 见 tombstone 继续物理删——不再靠内存 lifecycle）
+      await writeDeleteTombstone(id);
       void (async () => {
         try {
           while (hasResourceJobs(id)) {

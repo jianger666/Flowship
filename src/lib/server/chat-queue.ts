@@ -18,8 +18,23 @@ import type { AttachmentMeta } from "./route-helpers";
 
 export const CHAT_QUEUE_MAX = 5;
 
+/**
+ * R31-1：进程内单调短 id，供 202 响应 ↔ 前端 pending ↔ queue_failed 对账。
+ * 不落盘、不跨进程；同进程内唯一即可。
+ */
+let nextChatQueueItemSeq = 1;
+export const allocChatQueueItemId = (): string => {
+  const seq = nextChatQueueItemSeq++;
+  return `cq_${Date.now().toString(36)}_${seq.toString(36)}`;
+};
+
 /** 队列里暂存的待发消息（纯文本 + 已落盘的图 / 附件路径） */
 export type QueuedChatMsg = {
+  /**
+   * R31-1：稳定队列项 id（入队时分配；202 / pending / queue_failed 对账用）。
+   * 调用方可不传——enqueue / enqueueFront 会自动补。
+   */
+  itemId: string;
   /** 进 agent 的文本（可含 skill 指引） */
   agentText: string;
   /** 落 user_reply 气泡的用户原文 */
@@ -37,6 +52,16 @@ export type QueuedChatMsg = {
    */
   skipPersistEvent?: boolean;
 };
+
+/** 入队入参：itemId 可选（缺则自动分配） */
+export type QueuedChatMsgInput = Omit<QueuedChatMsg, "itemId"> & {
+  itemId?: string;
+};
+
+const withItemId = (msg: QueuedChatMsgInput): QueuedChatMsg => ({
+  ...msg,
+  itemId: msg.itemId || allocChatQueueItemId(),
+});
 
 interface ChatQueueGlobalState {
   queues: Map<string, QueuedChatMsg[]>;
@@ -83,9 +108,9 @@ const queues = () => getQueueState().queues;
 const generations = () => getQueueState().generations;
 const inFlightMap = () => getQueueState().inFlight;
 
-/** 入队结果：ok + 当前条数；满了返回 full */
+/** 入队结果：ok + 当前条数 + itemId；满了返回 full */
 export type EnqueueResult =
-  | { ok: true; queuedCount: number }
+  | { ok: true; queuedCount: number; itemId: string }
   | { ok: false; reason: "full"; queuedCount: number };
 
 /**
@@ -95,11 +120,11 @@ export type EnqueueResult =
  */
 export const tryEnqueueMsg = (
   current: QueuedChatMsg[],
-  msg: QueuedChatMsg,
+  msg: QueuedChatMsgInput,
   max = CHAT_QUEUE_MAX,
 ): { ok: true; next: QueuedChatMsg[] } | { ok: false; reason: "full" } => {
   if (current.length >= max) return { ok: false, reason: "full" };
-  return { ok: true, next: [...current, msg] };
+  return { ok: true, next: [...current, withItemId(msg)] };
 };
 
 /** 当前 task 的 in-flight 占位数（无记录返 0） */
@@ -122,7 +147,7 @@ export const endChatQueueInFlight = (taskId: string): void => {
 /** 入队；超上限返 full（调用方 409「排队已满」）。容量 = 队列长 + in-flight */
 export const enqueueChatMessage = (
   taskId: string,
-  msg: QueuedChatMsg,
+  msg: QueuedChatMsgInput,
 ): EnqueueResult => {
   const map = queues();
   const cur = map.get(taskId) ?? [];
@@ -140,7 +165,8 @@ export const enqueueChatMessage = (
     return { ok: false, reason: "full", queuedCount: cur.length + inflight };
   }
   map.set(taskId, result.next);
-  return { ok: true, queuedCount: result.next.length };
+  const itemId = result.next[result.next.length - 1]!.itemId;
+  return { ok: true, queuedCount: result.next.length, itemId };
 };
 
 /** 取出队首；空队列返 null */
@@ -161,11 +187,11 @@ export const dequeueChatMessage = (taskId: string): QueuedChatMsg | null => {
  */
 export const enqueueChatMessageFront = (
   taskId: string,
-  msg: QueuedChatMsg,
+  msg: QueuedChatMsgInput,
 ): void => {
   const map = queues();
   const cur = map.get(taskId) ?? [];
-  const next = [msg, ...cur];
+  const next = [withItemId(msg), ...cur];
   if (next.length > CHAT_QUEUE_MAX) {
     console.error(
       `[chat-queue] task=${taskId} 塞回队首后短暂超上限（${next.length} > ${CHAT_QUEUE_MAX}）、` +
@@ -173,6 +199,17 @@ export const enqueueChatMessageFront = (
     );
   }
   map.set(taskId, next);
+};
+
+/**
+ * R31-1：同步取出并清空剩余排队条目的 itemId（不含已 dequeue 的 in-flight 条）。
+ * 不碰 generation / in-flight——调用方随后 clearChatQueue 统一收尾。
+ */
+export const takeRemainingChatQueueItemIds = (taskId: string): string[] => {
+  const map = queues();
+  const cur = map.get(taskId) ?? [];
+  map.delete(taskId);
+  return cur.map((m) => m.itemId);
 };
 
 /** 当前排队条数（不含 in-flight） */

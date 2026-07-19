@@ -106,6 +106,7 @@ import {
   enqueueChatMessageFront,
   getChatQueueCount,
   getChatQueueGeneration,
+  takeRemainingChatQueueItemIds,
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
@@ -2311,23 +2312,36 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
             meta.attachments = msg.attachmentMetas;
           }
           if (capture.ok) meta.checkpointed = true;
+          // R31-1：落盘 meta 带 queueItemId，前端 pending 按 id 对账（不靠文案猜）
+          meta.queueItemId = msg.itemId;
           let replyEvent;
           try {
             replyEvent = await writeUserEventAndPublishStrict(taskId, {
               kind: "user_reply",
               text: msg.displayText,
-              meta: Object.keys(meta).length > 0 ? meta : undefined,
+              meta,
             });
           } catch (persistErr) {
-            // strict 抛错（EIO 等）→ 不 send；best-effort 警告后丢弃本条（不塞回——
-            // 塞回会经 finally 链式 flush 对持久 EIO 忙等；对齐 route 侧「失败即停」口径）
+            // R31-1：strict 抛错（EIO 等）→ 不 send、不自旋；清整队（当前条 + 剩余）
+            // 并纯内存 publish queue_failed，让前端按 itemId 终态对账。
+            // durable 警告可能与原 append 同盘失败——控制帧不依赖落盘。
             console.error(
-              `[chat-runner] flushChatQueue R30-3 落盘失败 task=${taskId}:`,
+              `[chat-runner] flushChatQueue R31-1 落盘失败 task=${taskId}:`,
               persistErr,
             );
+            const failedItemIds = [
+              msg.itemId,
+              ...takeRemainingChatQueueItemIds(taskId),
+            ];
+            clearChatQueue(taskId);
+            publish(taskId, {
+              kind: "queue_failed",
+              itemIds: failedItemIds,
+              reason: "persist_failed",
+            });
             const preview = msg.displayText.slice(0, 50);
             try {
-              // eslint-disable-next-line no-restricted-syntax -- R30-3：落盘失败警告（best-effort 吞错）
+              // eslint-disable-next-line no-restricted-syntax -- R31-1：落盘失败警告（best-effort 吞错）
               await writeEventAndPublish(taskId, {
                 kind: "info",
                 text: `消息保存失败、未发送：${preview}`,

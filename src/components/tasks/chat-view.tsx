@@ -44,6 +44,10 @@ import {
 } from "@/components/ui/popover";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
+import {
+  removePendingByQueueFailed,
+  removePendingByUserReply,
+} from "@/lib/chat-pending-reconcile";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
   CHAT_ATTACHMENT_ONLY_TEXT,
@@ -83,6 +87,8 @@ interface Props {
  */
 type PendingLocalReply = {
   id: string;
+  /** R31-1：与服务端 queue itemId 对齐，pending / queue_failed / user_reply 对账 */
+  itemId: string;
   text: string;
   /** 与服务端 user_reply 落盘文案一致（空文本附件消息用 CHAT_ATTACHMENT_ONLY_TEXT） */
   displayText: string;
@@ -117,7 +123,7 @@ export const ChatView = ({
   >({});
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
-  // P5：本地「待发送」占位（SSE user_reply 按 displayText 匹配后清除）
+  // P5 / R31-1：本地「待发送」占位（按 itemId 对账；旧事件无 id 时 displayText 兜底）
   const [pendingLocalReplies, setPendingLocalReplies] = useState<
     PendingLocalReply[]
   >([]);
@@ -202,20 +208,28 @@ export const ChatView = ({
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
 
-      // P5：真实 user_reply 落地 → 按 displayText 清本地占位（附件-only 与服务端占位文案对齐）
+      // R31-1：真实 user_reply 落地 → 优先按 meta.queueItemId 清 pending
       if (ev.kind === "user_reply") {
         setPendingLocalReplies((prev) => {
-          const idx = prev.findIndex((p) => p.displayText === ev.text);
-          if (idx < 0) return prev;
-          const next = [...prev];
-          next.splice(idx, 1);
-          // 2→1 时也要更新横幅数字（勿只在清空时 set null）
+          const next = removePendingByUserReply(prev, ev);
+          if (next === prev) return prev;
           setQueuedCount(next.length > 0 ? next.length : null);
           return next;
         });
       }
 
       onEventAppendRef.current(ev);
+    },
+    // R31-1：strict 落盘失败整队作废 → 按 itemIds 精确清 pending
+    onQueueFailed: (itemIds) => {
+      setPendingLocalReplies((prev) => {
+        const next = removePendingByQueueFailed(prev, itemIds);
+        setQueuedCount(next.length > 0 ? next.length : null);
+        return next;
+      });
+      if (itemIds.length > 0) {
+        toast.error(`${itemIds.length} 条消息因磁盘写入失败未发送`);
+      }
     },
     onTaskUpdate: (t) => onTaskUpdateRef.current(t),
     onDone: (t) => {
@@ -276,11 +290,12 @@ export const ChatView = ({
         }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
-          // 存完整 payload（暂无消费方；R4 移除「立即发送」后仍保留结构）
+          // R31-1：pending 绑服务端 itemId（图 / 附件 / skill 同一机制）
           setPendingLocalReplies((prev) => [
             ...prev,
             {
-              id: `pending_${Date.now()}_${prev.length}`,
+              id: result.itemId,
+              itemId: result.itemId,
               text,
               displayText: text || CHAT_ATTACHMENT_ONLY_TEXT,
               images,
@@ -294,10 +309,8 @@ export const ChatView = ({
         // 200 非 queued：同步清掉同文案 pending（若有），避免幽灵占位
         const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
         setPendingLocalReplies((prev) => {
-          const idx = prev.findIndex((p) => p.displayText === displayText);
-          if (idx < 0) return prev;
-          const next = [...prev];
-          next.splice(idx, 1);
+          const next = removePendingByUserReply(prev, { text: displayText });
+          if (next === prev) return prev;
           setQueuedCount(next.length > 0 ? next.length : null);
           return next;
         });

@@ -332,8 +332,36 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
 };
 
 /** tombstone 存在 → 视为已删（与 listTasks 一致，防 meta 残留幽灵任务） */
-const isTaskTombstoned = async (id: string): Promise<boolean> =>
+export const isTaskTombstoned = async (id: string): Promise<boolean> =>
   exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
+
+/**
+ * R31-3：durable logical delete——在 task 目录写 `.deleted-tombstone`（原子 rename）。
+ * listTasks / getTask / boot recovery 见标记即不暴露；boot 会 best-effort 物理 rm。
+ * DELETE 延迟分支须在返回 200 **之前**调用，否则 refresh / 重启会把任务「复活」。
+ */
+export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
+  const dir = taskDir(taskId);
+  await fs.mkdir(dir, { recursive: true });
+  const tombstonePath = path.join(dir, DELETED_TOMBSTONE_FILE);
+  // 同目录 tmp + rename = 同文件系统原子提交（写半截不会被 list 当成有效 tombstone）
+  const tmpPath = path.join(
+    dir,
+    `.${DELETED_TOMBSTONE_FILE}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const payload = JSON.stringify({
+    deletedAt: Date.now(),
+    // R31-3：区分 Windows EBUSY 降级 vs DELETE 延迟分支的逻辑删除
+    reason: "logical-delete",
+  });
+  await fs.writeFile(tmpPath, payload, "utf-8");
+  try {
+    await fs.rename(tmpPath, tombstonePath);
+  } catch (err) {
+    await fs.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+};
 
 export const getTask = async (id: string): Promise<Task | null> => {
   await ensureBootRecovery();
@@ -552,12 +580,8 @@ export const deleteTask = async (id: string): Promise<boolean> => {
       // 可靠的按 cwd 查进程手段、本批不实现 Windows 进程清理），所以这里只能「先让
       // UI 消失、磁盘残留留给 boot 清扫」。tombstone 写入几乎必成功；meta unlink
       // best-effort（listTasks 靠 meta 判定，删掉即从列表消失；失败则靠 tombstone skip）。
-      const tombstonePath = path.join(dir, DELETED_TOMBSTONE_FILE);
-      await fs.writeFile(
-        tombstonePath,
-        JSON.stringify({ deletedAt: Date.now() }),
-        "utf-8",
-      );
+      // R31-3：复用 writeDeleteTombstone（与 DELETE 延迟分支同一协议）
+      await writeDeleteTombstone(id);
       await fs.unlink(path.join(dir, META_FILE)).catch(() => {});
       // R29-6：tombstone 后 events 不再作为合法日志——一并清 counter
       clearEventSeqCounter(id);

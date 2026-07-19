@@ -54,9 +54,10 @@ export const EXCLUDED_SUBDIR = ".excluded";
 // 单 action 最多保留 10 个 revision、超出 GC 删最早（沿用 V0.5.12 的上限策略）
 export const MAX_REVISIONS_PER_ACTION = 10;
 /**
- * Windows 上进程持有任务目录句柄时 fs.rm 会 EBUSY（典型：shell 卡死后 cwd 停在 workspace、
- * kill-orphans 在 win32 是 no-op）。deleteTask 降级写此标记、删掉 meta 让 UI 立刻消失；
- * boot recovery 只清扫带此标记的目录（绝不动 bench/fixture 等无标记手工目录）。
+ * 逻辑删除标记（R31-3 扩展协议）：
+ * - Windows EBUSY：deleteTask 降级写此标记、卸 meta，UI 立刻消失
+ * - DELETE 延迟分支：HTTP 200 前先写此标记（durable logical delete），list/get 不暴露；
+ *   boot recovery 见标记继续物理 rm（绝不动 bench/fixture 等无标记手工目录）
  */
 export const DELETED_TOMBSTONE_FILE = ".deleted-tombstone";
 
@@ -595,16 +596,147 @@ const getEventSeqCounters = (): Map<string, number> => {
 };
 
 /**
- * R30-4：从 events.jsonl 恢复 durable max seq。
+ * R30-4 / R31-4：从 events.jsonl **尾部窗口**求 max(seq)（sidecar 的近期兜底）。
  *
- * 旧实现只读固定 64KB 并返回「尾部遇到的第一个 seq」——末条 >64KB 时首行截断
- * 找不到完整行 → 返 0 重号；历史重号日志尾部 [98,99,100,1] 会恢复成 1 继续冲突。
- *
- * 新协议：分块向后扩展读取（64KB 起翻倍、上限 4MB）+ 对所见完整行求 max(seq)。
+ * 分块向后扩展（64KB 起翻倍、上限 4MB）+ 对所见完整行求 max。
+ *  alone 不足以覆盖 >4MB 历史高水位——见 sidecar 协议。
  * 文件不存在 / 无 seq → 0。仅在 per-task append 链内调用（天然串行）。
  */
 const SEQ_RECOVER_CHUNK_MIN = 64 * 1024;
 const SEQ_RECOVER_CHUNK_MAX = 4 * 1024 * 1024;
+
+/**
+ * R31-4：per-task seq high-water sidecar（task 目录下 `.event-seq`、内容 = 数字）。
+ *
+ * ## 恢复不变量（必须：restored ≥ durable 历史 max）
+ *
+ * - 内存 counter 在进程内精确；sidecar **批量推进**：成功 append 后若
+ *   `seq - lastPersisted ≥ SEQ_SIDECAR_FLUSH_EVERY`（16）才异步原子写盘（tmp+rename、
+ *   best-effort）。故 crash 时 sidecar ≤ durable max，且落后至多 15 条。
+ * - 恢复：`max(sidecar, 尾部 4MB 扫描 max)`。论证：sidecar ≥ durableMax−15，
+ *   且尾窗覆盖最近 ≤15 条所在区间 → 两者取 max = durable max。
+ * - N=16 权衡：单条 ~256KB 时 16 条仍 ≤4MB 尾窗；若极端更大事件使 16 条撑破尾窗，
+ *   可能低估——此时缺/坏 sidecar 路径的全量流式扫描仍正确；正常会话单条远小于此。
+ * - 缺 sidecar / 内容损坏：一次性**全文件流式**扫 max 并写回 sidecar（旧数据迁移）。
+ * - DELETE：sidecar 随 task 目录删（天然，无需单独清理）。
+ */
+export const EVENT_SEQ_SIDECAR_FILE = ".event-seq";
+/** R31-4：sidecar 落后上限（条）；须保证典型事件下 N 条落在 SEQ_RECOVER_CHUNK_MAX 内 */
+const SEQ_SIDECAR_FLUSH_EVERY = 16;
+
+/** R31-4：进程内「已调度/已确认写入 sidecar」水位（与 counter 同挂 globalThis） */
+const EVENT_SEQ_SIDECAR_WRITTEN_KEY = "__feAiFlowEventSeqSidecarWrittenV1__";
+const getEventSeqSidecarWritten = (): Map<string, number> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, number> | undefined
+  >;
+  if (!g[EVENT_SEQ_SIDECAR_WRITTEN_KEY]) {
+    g[EVENT_SEQ_SIDECAR_WRITTEN_KEY] = new Map();
+  }
+  return g[EVENT_SEQ_SIDECAR_WRITTEN_KEY]!;
+};
+
+const parseSeqNumber = (raw: string): number | null => {
+  const t = raw.trim();
+  if (!t) return null;
+  // 只认纯整数字面（拒 "11abc" / 科学计数）
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isSafeInteger(n) || n < 0) return null;
+  return n;
+};
+
+/** R31-4：读 sidecar；缺文件 / 损坏 / 非数字 → null（调用方走全量扫描） */
+const readSeqSidecar = async (taskId: string): Promise<number | null> => {
+  const p = path.join(taskDir(taskId), EVENT_SEQ_SIDECAR_FILE);
+  try {
+    const raw = await fs.readFile(p, "utf-8");
+    return parseSeqNumber(raw);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    // 其它读错当损坏——不抛、走全量扫描
+    console.warn(
+      `[task-fs-core] R31-4 读 seq sidecar 失败 task=${taskId}，fallback 全量扫描：`,
+      err,
+    );
+    return null;
+  }
+};
+
+/** R31-4：原子写 sidecar（tmp+rename、best-effort，失败只打日志） */
+const persistSeqSidecar = async (
+  taskId: string,
+  seq: number,
+): Promise<void> => {
+  const finalPath = path.join(taskDir(taskId), EVENT_SEQ_SIDECAR_FILE);
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  try {
+    await fs.writeFile(tmpPath, String(seq), "utf-8");
+    await renameWithRetry(tmpPath, finalPath);
+  } catch (err) {
+    await fs.unlink(tmpPath).catch(() => {});
+    console.warn(
+      `[task-fs-core] R31-4 写 seq sidecar 失败（best-effort）task=${taskId} seq=${seq}：`,
+      err,
+    );
+  }
+};
+
+/**
+ * R31-4：批量推进 sidecar——seq 相对 lastPersisted 跨过 N 才 fire-and-forget。
+ * 乐观记水位防 stampede；写失败则 sidecar 更旧，恢复靠尾扫兜住。
+ */
+const maybeFlushSeqSidecar = (taskId: string, seq: number): void => {
+  const written = getEventSeqSidecarWritten();
+  const last = written.get(taskId) ?? 0;
+  if (seq - last < SEQ_SIDECAR_FLUSH_EVERY) return;
+  written.set(taskId, seq);
+  void persistSeqSidecar(taskId, seq);
+};
+
+/** 从一行 JSON 抽 seq（坏行 / 无字段 → 忽略） */
+const seqFromEventLine = (line: string): number | null => {
+  const t = line.trim();
+  if (!t) return null;
+  try {
+    const parsed = JSON.parse(t) as { seq?: unknown };
+    if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
+      return parsed.seq;
+    }
+  } catch {
+    // 坏行
+  }
+  return null;
+};
+
+/**
+ * R31-4：全文件流式扫 max(seq)——旧数据缺 sidecar / sidecar 损坏时用；
+ * 逐行 readline，不整读进内存。
+ */
+const scanMaxSeqFullFile = async (taskId: string): Promise<number> => {
+  const p = path.join(taskDir(taskId), EVENTS_FILE);
+  try {
+    const stream = createReadStream(p, { encoding: "utf-8" });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    let maxSeq = 0;
+    try {
+      for await (const line of rl) {
+        const s = seqFromEventLine(line);
+        if (s !== null && s > maxSeq) maxSeq = s;
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+    return maxSeq;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+};
 
 const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
   const p = path.join(taskDir(taskId), EVENTS_FILE);
@@ -613,7 +745,7 @@ const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
     if (st.size <= 0) return 0;
     const fh = await fs.open(p, "r");
     try {
-      // R30-4：64KB 起翻倍扩块；首行截断（start>0）或尚未见到任何 seq 时继续向前读
+      // R30-4：64KB 起翻倍扩块；首行截断（start>0）时跳过残行
       // 上限 4MB——对窗口内所有完整行求 max(seq)，不是「尾部第一个」
       let chunk = Math.min(SEQ_RECOVER_CHUNK_MIN, st.size);
       let maxSeq = 0;
@@ -631,16 +763,10 @@ const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
         maxSeq = 0;
         foundAny = false;
         for (let i = startIdx; i < lines.length; i++) {
-          const line = lines[i]?.trim();
-          if (!line) continue;
-          try {
-            const parsed = JSON.parse(line) as { seq?: unknown };
-            if (typeof parsed.seq === "number" && Number.isFinite(parsed.seq)) {
-              foundAny = true;
-              if (parsed.seq > maxSeq) maxSeq = parsed.seq;
-            }
-          } catch {
-            // 坏行跳过
+          const s = seqFromEventLine(lines[i] ?? "");
+          if (s !== null) {
+            foundAny = true;
+            if (s > maxSeq) maxSeq = s;
           }
         }
         // 已到文件头 / 触顶 → 收工；否则首行仍可能截断（含末条 >64KB）→ 翻倍扩块
@@ -659,17 +785,32 @@ const readMaxSeqFromDurableTail = async (taskId: string): Promise<number> => {
 };
 
 /**
- * R29-6：Map miss 时先从 durable 尾部灌入 counter，再发号。
+ * R29-6 / R31-4：Map miss 时恢复 durable max 灌入 counter，再发号。
  * 必须在 append 链内 await——恢复与发号同序、无并发。
+ *
+ * 恢复顺序：有合法 sidecar → max(sidecar, 尾扫)；否则全量流式扫描并写 sidecar。
  */
 const ensureEventSeqCounter = async (taskId: string): Promise<void> => {
   const counters = getEventSeqCounters();
   if (counters.has(taskId)) return;
-  const restored = await readMaxSeqFromDurableTail(taskId);
+
+  const sidecar = await readSeqSidecar(taskId);
+  let restored: number;
+  if (sidecar === null) {
+    // R31-4：缺 / 坏 sidecar → 一次性全文件流式扫（旧数据迁移 / 损坏兜底）
+    restored = await scanMaxSeqFullFile(taskId);
+  } else {
+    const tailMax = await readMaxSeqFromDurableTail(taskId);
+    restored = Math.max(sidecar, tailMax);
+  }
+
   // 链内串行：await 后仍 miss 才写入（防极端重复 ensure）
   if (!counters.has(taskId)) {
     counters.set(taskId, restored);
   }
+  // 懒恢复后立刻对齐 sidecar（异步 best-effort；内存水位同步记上）
+  getEventSeqSidecarWritten().set(taskId, restored);
+  void persistSeqSidecar(taskId, restored);
 };
 
 /** R28-5：为 task 发下一个单调 seq（1-based）；调用前须 ensureEventSeqCounter */
@@ -694,9 +835,11 @@ const rollbackEventSeq = (taskId: string, seq: number): void => {
 /**
  * R29-6：仅在 events 文件真删（deleteTask）时清 seq counter。
  * stop / cleanupChatTaskState 不再清——文件还在、counter 保持才单调。
+ * R31-4：同时清 sidecar 内存水位（盘上 sidecar 随目录删 / 模拟重启时保留）。
  */
 export const clearEventSeqCounter = (taskId: string): void => {
   getEventSeqCounters().delete(taskId);
+  getEventSeqSidecarWritten().delete(taskId);
 };
 
 /**
@@ -761,6 +904,8 @@ export const appendEventLine = async (
       delete ev.seq;
       return false;
     }
+    // R31-4：落盘成功后批量推进 sidecar（每 N 条异步原子写，非每条同步）
+    maybeFlushSeqSidecar(id, ev.seq);
     // R28-5：写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
     await failpoint("event.beforePublish");
     // R29：onCommitted（通常 publish）抛错不得断 append 链——写盘已成功，吞错继续放链

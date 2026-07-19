@@ -845,6 +845,18 @@ export type EventKind =
   | "error";
 
 /**
+ * R31-1：SSE 控制帧（纯内存 publish、不落 events.jsonl）。
+ * 队首 strict 落盘失败时整队作废；前端按 itemIds 精确清除 / 标错 pending。
+ * wire 形态：`{ type: "queue_failed", itemIds, reason }`（watch-task 外发）。
+ */
+export type QueueFailedSseEnvelope = {
+  type: "queue_failed";
+  itemIds: string[];
+  /** 机器可读原因，当前：persist_failed（strict append EIO 等） */
+  reason: string;
+};
+
+/**
  * tool_result 事件的 meta 契约（批 B 前端按此渲染可展开工具结果 / inline diff）。
  *
  * | 字段 | 类型 | 说明 |

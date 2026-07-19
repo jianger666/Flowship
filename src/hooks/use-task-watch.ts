@@ -63,6 +63,8 @@ export interface UseTaskWatchCallbacks {
   // watchTaskStream 自己 throw 出来的异常（HTTP 4xx / 网络断 / 解析错）
   // AbortError 已被 hook 内部吞掉、不会触发这个回调
   onWatchException?: (err: Error) => void;
+  /** R31-1：queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
+  onQueueFailed?: (itemIds: string[], reason: string) => void;
 }
 
 export const useTaskWatch = (
@@ -137,6 +139,10 @@ export const useTaskWatch = (
           onError: (msg) => {
             if (cancelled) return;
             callbacksRef.current.onErrorMessage?.(msg);
+          },
+          onQueueFailed: (itemIds, reason) => {
+            if (cancelled) return;
+            callbacksRef.current.onQueueFailed?.(itemIds, reason);
           },
         };
 

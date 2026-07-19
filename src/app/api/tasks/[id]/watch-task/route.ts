@@ -186,6 +186,14 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "assistant_delta":
             send({ type: "assistant_delta", text: ev.text });
             break;
+          // R31-1：队列整队失败控制帧（纯内存、不落盘）
+          case "queue_failed":
+            send({
+              type: "queue_failed",
+              itemIds: ev.itemIds,
+              reason: ev.reason,
+            });
+            break;
         }
       };
 

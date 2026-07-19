@@ -58,13 +58,6 @@ import {
   waitAndClaimPostCheck,
   type ClaimHandle,
 } from "./action-side-effects";
-
-/**
- * R30-1：runningChecks 条目对应的 postcheck ClaimHandle。
- * abortRunningCheck / 跨 action 顶替时按精确 handle release，避免只比 kind 的 ABA。
- * （不改 task-stream.RunningCheck 形状，副作用身份仍归 action-side-effects。）
- */
-const runningCheckClaims = new Map<string, ClaimHandle>();
 import { getActionsDir, getEventsLogPath, getTaskWorkspaceDir } from "./task-fs-core";
 import {
   runActionCheck,
@@ -126,17 +119,24 @@ import {
   forceClearStaleRunnerState,
   forkPendingTasks,
   getTaskOpGeneration,
+  getResourceJoinTimeoutMs,
   hasResourceJobs,
+  hasTerminalCleanup,
+  holdTerminalCleanup,
+  invalidateTerminalCleanupForReopen,
   isTaskOpCurrent,
   isTaskStarting,
+  isTerminalCleanupGenValid,
   isWorkspaceQuarantined,
   markWorkspaceQuarantined,
   pendingStopRequests,
   publish,
   publishIfCurrent,
   releaseTaskOpIf,
+  releaseTerminalCleanup,
   revokeResourceJobs,
   revokeTaskOps,
+  waitUntilResourceJobsCleared,
   runningChecks,
   runningTasks,
   snapshotTaskOp,
@@ -514,32 +514,29 @@ const runActionPostCheck = (
   // 顶替：同 task 已有在跑的 check（agent 反复 wait、或换了 action）→ abort 旧的、本轮用最新代码重跑
   const prev = runningChecks.get(taskId);
   prev?.controller.abort();
-  // R30-1：顶替不同 action 时按旧 handle 精确 release；同 action 重交卷时
+  // R30-1 / R31-5：顶替不同 action 时按旧 entry.claimHandle 精确 release；同 action 重交卷时
   // waitAndClaimPostCheck 已换 token 并摘掉旧 runningChecks，此处 prev 通常已空
-  if (prev && prev.actionId !== actionId) {
-    const prevHandle = runningCheckClaims.get(taskId);
-    if (prevHandle) releaseSideEffect(prevHandle);
+  if (prev && prev.actionId !== actionId && prev.claimHandle) {
+    releaseSideEffect(prev.claimHandle);
   }
   if (prev) {
     runningChecks.delete(taskId);
-    runningCheckClaims.delete(taskId);
   }
 
   const controller = new AbortController();
-  const self: RunningCheck = { actionId, controller };
+  // R31-5：ClaimHandle 挂 RunningCheck 同 global entry（不再 module-local companion Map）
+  const self: RunningCheck = { actionId, controller, claimHandle };
   runningChecks.set(taskId, self);
-  runningCheckClaims.set(taskId, claimHandle);
   // R24-1：启动时快照 gen——resume/advance 会 abortRunningCheck；stop/DELETE 会 revoke bump gen
   const checkGen = getTaskOpGeneration(taskId);
 
   /**
    * R24-1 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验）。
-   * R29-1 / R30-1：真正摘掉自己时按本轮 claimHandle release（旧 claimId 删不掉新 token）。
+   * R29-1 / R30-1 / R31-5：真正摘掉自己时按本轮 claimHandle release（旧 claimId 删不掉新 token）。
    */
   const dropSelf = (): void => {
     if (runningChecks.get(taskId) !== self) return;
     runningChecks.delete(taskId);
-    runningCheckClaims.delete(taskId);
     releaseSideEffect(claimHandle);
   };
 
@@ -664,10 +661,8 @@ export const abortRunningCheck = (taskId: string): void => {
   if (!cur) return;
   cur.controller.abort();
   runningChecks.delete(taskId);
-  // R30-1：按启动时绑定的 handle 精确 release（stop 随后 clear 也会全清；旧 handle 变 no-op）
-  const handle = runningCheckClaims.get(taskId);
-  runningCheckClaims.delete(taskId);
-  if (handle) releaseSideEffect(handle);
+  // R31-5：handle 与 check 同条目——跨 route/HMR 模块实例 abort 也能精确 release，防 claim 泄漏
+  if (cur.claimHandle) releaseSideEffect(cur.claimHandle);
   console.log(
     `[task-runner] abortRunningCheck task=${taskId} action=${cur.actionId}`,
   );
@@ -1595,11 +1590,12 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // R29-2 / R30-2：先 revoke，再 join starting + resourceJobs。
+    // R29-2 / R30-2 / R31-2：先 revoke，再 join starting + resourceJobs。
     // R30-2：resourceJobs 超时 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
+    // 超时与 joinResourceJobs / DELETE 共用 getResourceJoinTimeoutMs（单测可缩短）。
     {
       revokeResourceJobs(taskId);
-      const deadline = Date.now() + 30_000;
+      const deadline = Date.now() + getResourceJoinTimeoutMs();
       while (
         (isTaskStarting(taskId) || hasResourceJobs(taskId)) &&
         Date.now() < deadline
@@ -1613,7 +1609,7 @@ export const finalizeTask = async (
         );
       }
       if (hasResourceJobs(taskId)) {
-        // R30-2：已等满 30s 仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
+        // R30-2：已等满仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
         markWorkspaceQuarantined(taskId);
         console.error(
           `[task-runner] finalizeTask: task=${taskId} resourceJobs join 超时、已 quarantine；跳过同步清 worktree`,
@@ -1657,17 +1653,33 @@ export const finalizeTask = async (
     // V0.10：终结即清隔离工作区（feature 分支保留在原仓库、随时可 reopen 重建 worktree 续推；
     // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
     // best-effort：失败只 log、boot 孤儿扫描兜底。
-    // R30-2：quarantine / 仍有 resourceJobs → 不得同步删（旧慢清理可能仍占路径）；
-    // 挂后台轮询、job 归零后再 remove（quarantine 由 endResourceJob 清）。
+    // R30-2 / R31-2：quarantine / 仍有 resourceJobs → 不得同步删；
+    // 挂后台等 jobs 归零后再 remove——持有独立 terminal cleanup reservation（代际），
+    // quarantine 在 cleanup 完成（或 reopen 作废）前不解除；endResourceJob 只通知 waiter。
     if (isWorktreeTask(task)) {
       const deferWorktreeCleanup =
         isWorkspaceQuarantined(taskId) || hasResourceJobs(taskId);
       if (deferWorktreeCleanup) {
         const taskSnap = task;
+        // R31-2：deferred 分支入口立刻 hold——与 jobs 归零解耦
+        const cleanupGen = holdTerminalCleanup(taskId);
         void (async () => {
           try {
-            while (hasResourceJobs(taskId)) {
-              await new Promise<void>((r) => setTimeout(r, 200));
+            await waitUntilResourceJobsCleared(taskId);
+            // R31-2：提交删除前验证 cleanup gen——reopen 作废后让位，不删 B 的活 worktree
+            if (!isTerminalCleanupGenValid(taskId, cleanupGen)) {
+              console.log(
+                `[task-runner] finalizeTask: R31-2 旧 cleanup 代际已失效、让位 task=${taskId} gen=${cleanupGen}`,
+              );
+              return;
+            }
+            // 测试挂点：delayed remove 真实提交点（验收要求挂在此、非「job 归零后 quarantine=false」）
+            await failpoint("finalize.beforeDeferredRemove");
+            if (!isTerminalCleanupGenValid(taskId, cleanupGen)) {
+              console.log(
+                `[task-runner] finalizeTask: R31-2 failpoint 后 cleanup 代际已失效、让位 task=${taskId} gen=${cleanupGen}`,
+              );
+              return;
             }
             await removeTaskWorktrees(taskSnap).catch((err) => {
               console.warn(
@@ -1685,6 +1697,9 @@ export const finalizeTask = async (
               `[task-runner] finalizeTask: 延迟清 worktree 异常 task=${taskId}`,
               err,
             );
+          } finally {
+            // R31-2：无论成败都 release——gen 不匹配时 release 内部 no-op
+            releaseTerminalCleanup(taskId, cleanupGen);
           }
         })();
       } else {
@@ -1742,16 +1757,44 @@ export const finalizeTask = async (
 };
 
 /**
+ * R31-2 ① 兜底：旧 resource job 未退完且 terminal cleanup 在飞时拒绝 reopen。
+ * route 映射 409「任务清理中、稍后再试」。主路径优先 ②（作废旧 cleanup）。
+ */
+export class TaskCleanupInProgressError extends Error {
+  constructor(message = "任务清理中、稍后再试") {
+    super(message);
+    this.name = "TaskCleanupInProgressError";
+  }
+}
+
+/**
  * 恢复终态 task（merged / abandoned → developing）、让它能重新推进（V0.6.12）
  *
  * 误 abandon、或想把已终结的 task 重新捡起来继续时用。只翻 repoStatus、
  * runStatus 保持 idle（没有活 agent、用户后续点「推进」才起新 Run）。
+ *
+ * R31-2：若有在飞 terminal cleanup——
+ * - ②（倾向）：jobs 已归零 → 作废旧 cleanup（invalidate）+ 立即解除 quarantine，
+ *   旧后台 remove 提交前发现 gen 失效让位；
+ * - ①（兜底）：jobs 仍非零 → 抛 TaskCleanupInProgressError，route 回 409。
  */
 export const reopenTask = async (taskId: string): Promise<void> => {
   const task = await getTask(taskId);
   if (!task) throw new Error("task 不存在、无法恢复");
   if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
     throw new Error("只有已合入 / 已放弃的任务才能恢复");
+  }
+  // R31-2：终态 cleanup 与 reopen 互斥窗口
+  if (hasTerminalCleanup(taskId)) {
+    if (hasResourceJobs(taskId)) {
+      // ① 兜底：旧事务未退完，拒绝 reopen（避免与慢清理并发写同路径）
+      throw new TaskCleanupInProgressError();
+    }
+    // ②：作废旧 cleanup + 立即解除 quarantine（旧 remove 见 gen 失效让位）
+    invalidateTerminalCleanupForReopen(taskId);
+    console.log(
+      `[task-runner] reopenTask: R31-2 作废在飞 terminal cleanup、解除 quarantine task=${taskId}`,
+    );
   }
   const patched = await setTaskRepoStatus(taskId, "developing");
   if (patched) publish(taskId, { kind: "task", task: patched });
@@ -2353,13 +2396,13 @@ export const buildSessionBridges = (
           callerStillValid() &&
           getChatLifecycle(task.id) === null &&
           (await isCurrentRunningAction(task.id, signal.actionId!)),
-        // R30-1：重交卷换 token 前同步 abort 旧 check（摘表、不 release——随即换新 claimId）
+        // R30-1 / R31-5：重交卷换 token 前同步 abort 旧 check（摘表、不 release——随即换新 claimId；
+        // claimHandle 随 entry 摘掉，旧 dropSelf 因 runningChecks 已无 self 而 no-op）
         onReplacePostCheck: () => {
           const prev = runningChecks.get(task.id);
           if (!prev) return;
           prev.controller.abort();
           runningChecks.delete(task.id);
-          runningCheckClaims.delete(task.id);
         },
       });
       if (claim.result === "timeout") {

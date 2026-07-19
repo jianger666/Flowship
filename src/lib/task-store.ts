@@ -381,7 +381,9 @@ interface SSEEnvelope {
     | "action"
     | "done"
     | "error"
-    | "assistant_delta";
+    | "assistant_delta"
+    /** R31-1：队列整队失败控制帧 */
+    | "queue_failed";
   event?: TaskEvent;
   content?: string;
   task?: Task;
@@ -389,6 +391,8 @@ interface SSEEnvelope {
   ok?: boolean;
   message?: string;
   text?: string;
+  itemIds?: string[];
+  reason?: string;
 }
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
@@ -428,6 +432,10 @@ export interface TaskStreamCallbacks {
    * 上层维护「当前 streaming text」、收到本回调时累加、收到 onEvent(assistant_message) 时清空
    */
   onAssistantDelta?: (text: string) => void;
+  /**
+   * R31-1：队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
+   */
+  onQueueFailed?: (itemIds: string[], reason: string) => void;
 }
 
 /**
@@ -491,6 +499,18 @@ export const watchTaskStream = async (
             typeof env.text === "string"
           ) {
             callbacks.onAssistantDelta?.(env.text);
+          } else if (
+            env.type === "queue_failed" &&
+            Array.isArray(env.itemIds)
+          ) {
+            // R31-1：控制帧——只转发 string[] itemIds
+            const ids = env.itemIds.filter(
+              (id): id is string => typeof id === "string",
+            );
+            callbacks.onQueueFailed?.(
+              ids,
+              typeof env.reason === "string" ? env.reason : "persist_failed",
+            );
           }
         }
         sepIdx = buffer.indexOf("\n\n");
@@ -555,7 +575,14 @@ export const sendChatReply = async (
       /** R30-3：send 后落盘失败时服务端带回，UI 须 toast 不可忽略 */
       persistWarning?: string;
     }
-  | { queued: true; queuedCount: number; task?: Task; persistWarning?: string }
+  | {
+      queued: true;
+      queuedCount: number;
+      /** R31-1：与服务端 queue item 对账的稳定 id */
+      itemId: string;
+      task?: Task;
+      persistWarning?: string;
+    }
 > => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
@@ -578,6 +605,7 @@ export const sendChatReply = async (
       ok?: boolean;
       queued?: boolean;
       queuedCount?: number;
+      itemId?: string;
       task?: Task;
       persistWarning?: string;
     };
@@ -585,6 +613,11 @@ export const sendChatReply = async (
       queued: true,
       queuedCount:
         typeof data.queuedCount === "number" ? data.queuedCount : 1,
+      // R31-1：缺 itemId 时本地兜底（旧服务端兼容；正常路径服务端必返）
+      itemId:
+        typeof data.itemId === "string" && data.itemId
+          ? data.itemId
+          : `pending_local_${Date.now()}`,
       task: data.task,
       ...(typeof data.persistWarning === "string"
         ? { persistWarning: data.persistWarning }

@@ -271,6 +271,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return replyEvent;
   };
 
+  /** R31-1：队列优先启动路径复用「刚入队的当前条」itemId */
+  let lastEnqueuedItemId: string | undefined;
+
   /**
    * R1：rewind 门闩下不得入队。入队是同步内存操作，检查与 enqueue 之间无 await 即原子；
    * rewind 占门闩后会复查 queueCount>0 并拒绝回退——两边交叉闭合。
@@ -304,12 +307,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
     if (!queued.ok) {
       return errorResponse("排队已满", 409);
     }
+    // R31-1：记下当前条 itemId（队列优先启动路径稍后原样回给客户端）
+    lastEnqueuedItemId = queued.itemId;
     const fresh = await getTask(task.id);
     return new Response(
       JSON.stringify({
         ok: true,
         queued: true,
         queuedCount: queued.queuedCount,
+        // R31-1：稳定 itemId，前端 pending 对账用
+        itemId: queued.itemId,
         task: fresh ?? task,
       }),
       { status: 202, headers: { "Content-Type": "application/json" } },
@@ -669,6 +676,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
           ok: true,
           queued: true,
           queuedCount: getChatQueueCount(task.id),
+          // R31-1：回传当前条 itemId（enqueueOrReject 时记下）
+          itemId: lastEnqueuedItemId,
           task: fresh ?? task,
         }),
         { status: 202, headers: { "Content-Type": "application/json" } },

@@ -15,6 +15,8 @@
 import { appendEvent } from "./task-fs";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
 import type { TaskFieldsSnapshot } from "./task-prompts";
+// R31-5：仅 type-only——action-side-effects 不反向依赖本模块，无运行时环
+import type { ClaimHandle } from "./action-side-effects";
 
 // ----------------- 工具截断 -----------------
 
@@ -41,13 +43,15 @@ export const stringifyMeta = (v: unknown): string => {
 //   - done: agent run 终止（运行时层、跟 task 业务终态独立）
 //   - error: 顶层错误（用于显示 toast）
 //   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
+//   - queue_failed: R31-1 队列整队失败控制帧（纯内存、不落盘）
 export type TaskStreamEvent =
   | { kind: "event"; event: TaskEvent }
   | { kind: "task"; task: Task }
   | { kind: "action"; action: ActionRecord }
   | { kind: "done"; task: Task; ok: boolean }
   | { kind: "error"; message: string }
-  | { kind: "assistant_delta"; text: string };
+  | { kind: "assistant_delta"; text: string }
+  | { kind: "queue_failed"; itemIds: string[]; reason: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
 
@@ -105,6 +109,12 @@ export interface RunningCheck {
   actionId: string;
   // 停止 / 推进新 action / 被新一轮 wait 顶替时 abort、杀 lint/typecheck 子进程
   controller: AbortController;
+  /**
+   * R31-5：与本 check 同寿命的 postcheck claim——挂在 globalThis.runningChecks 同条目上，
+   * 不再另开 module-local companion Map（Next route chunk / HMR 下会与 runningChecks 分裂，
+   * abort 找不到 handle → claim 泄漏 busy）。
+   */
+  claimHandle?: ClaimHandle;
 }
 
 interface TaskRunnerGlobalState {
@@ -298,6 +308,13 @@ export {
   markWorkspaceQuarantined,
   isWorkspaceQuarantined,
   clearWorkspaceQuarantine,
+  holdTerminalCleanup,
+  releaseTerminalCleanup,
+  hasTerminalCleanup,
+  isTerminalCleanupGenValid,
+  invalidateTerminalCleanupForReopen,
+  waitUntilResourceJobsCleared,
+  getResourceJoinTimeoutMs,
   setResourceJoinTimeoutMsForTest,
   DEFAULT_RESOURCE_JOIN_MS,
 } from "./resource-jobs";

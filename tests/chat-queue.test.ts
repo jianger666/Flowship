@@ -30,6 +30,7 @@ import {
 } from "../src/lib/server/tool-result-persist";
 
 const msg = (n: number): QueuedChatMsg => ({
+  itemId: `item_${n}`,
   agentText: `agent-${n}`,
   displayText: `user-${n}`,
   enqueuedAt: n,
@@ -70,16 +71,16 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
 
   it("入队递增 queuedCount、dequeue FIFO", () => {
     const id = alloc();
-    expect(enqueueChatMessage(id, msg(1))).toEqual({
-      ok: true,
-      queuedCount: 1,
-    });
-    expect(enqueueChatMessage(id, msg(2))).toEqual({
-      ok: true,
-      queuedCount: 2,
-    });
+    const r1 = enqueueChatMessage(id, msg(1));
+    expect(r1).toMatchObject({ ok: true, queuedCount: 1 });
+    if (r1.ok) expect(r1.itemId).toBeTruthy();
+    const r2 = enqueueChatMessage(id, msg(2));
+    expect(r2).toMatchObject({ ok: true, queuedCount: 2 });
+    if (r2.ok) expect(r2.itemId).toBeTruthy();
     expect(getChatQueueCount(id)).toBe(2);
-    expect(dequeueChatMessage(id)?.displayText).toBe("user-1");
+    const d1 = dequeueChatMessage(id);
+    expect(d1?.displayText).toBe("user-1");
+    expect(d1?.itemId).toBeTruthy();
     expect(dequeueChatMessage(id)?.displayText).toBe("user-2");
     expect(dequeueChatMessage(id)).toBeNull();
     expect(getChatQueueCount(id)).toBe(0);

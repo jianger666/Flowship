@@ -19,7 +19,11 @@
 
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getTask } from "@/lib/server/task-fs";
-import { prewarmTaskWorkspace, reopenTask } from "@/lib/server/task-runner";
+import {
+  prewarmTaskWorkspace,
+  reopenTask,
+  TaskCleanupInProgressError,
+} from "@/lib/server/task-runner";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -36,6 +40,10 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   try {
     await reopenTask(task.id);
   } catch (err) {
+    // R31-2 ① 兜底：terminal cleanup + 旧 job 未退 → 409
+    if (err instanceof TaskCleanupInProgressError) {
+      return errorResponse(err.message, 409);
+    }
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(message, 400);
   }
