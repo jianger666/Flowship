@@ -32,10 +32,11 @@
 
 import {
   listChatQueueItemIds,
+  listMessageOperationSnapshot,
   listRecentSettled,
 } from "@/lib/server/chat-queue";
 import {
-  assertTaskReadable,
+  getTaskVisibility,
   getTaskWithTailEvents,
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
@@ -44,6 +45,9 @@ import {
   subscribeTaskStream,
 } from "@/lib/server/task-stream";
 import type { Task } from "@/lib/types";
+
+// R36-7（主线合并）：内联临时实现已删——统一走 task-fs 的正式 getTaskVisibility
+// （同步、含 journal schema 校验与 meta unknown 口径、与 detail/events route 同源）
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -109,8 +113,17 @@ export const GET = async (req: Request, { params }: Ctx) => {
     cleanup();
     throw err;
   }
-  // R33-4：bootstrap tail 读完后同步复查——已删 → 404、不发 stale task/events
-  if (!initial || !assertTaskReadable(id)) {
+  // R36-7：可读性三态——deleted→410+task_deleted；unavailable→503（不发 task_deleted）
+  const visibility = getTaskVisibility(id);
+  if (visibility === "deleted") {
+    cleanup();
+    return errorJson("task_deleted", 410);
+  }
+  if (visibility === "unavailable") {
+    cleanup();
+    return errorJson("temporarily_unavailable", 503);
+  }
+  if (!initial) {
     cleanup();
     return errorJson("not_found", 404);
   }
@@ -202,6 +215,15 @@ export const GET = async (req: Request, { params }: Ctx) => {
               reason: ev.reason,
             });
             break;
+          // R36-2：MessageOperation 终态帧（handedOff=delivered / failed 家族）
+          case "message_op":
+            send({
+              type: "message_op",
+              itemId: ev.itemId,
+              phase: ev.phase,
+              outcome: ev.outcome,
+            });
+            break;
           // R33-4：DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
@@ -224,11 +246,13 @@ export const GET = async (req: Request, { params }: Ctx) => {
           rememberEventId(ev.id);
           send({ type: "event", event: ev });
         }
-        // R32-2 / R33-1：bootstrap 附带 active queue + recentSettled ledger，
-        // 前端对账清断连期间漏掉的 queue_failed / 挡住晚到 202 幽灵——不做轮询。
+        // R32-2 / R33-1 / R36-4：bootstrap 附带 queue itemIds（旧字段兼容）+
+        // 完整 operationSnapshot（含 accepting/persisted，关闭 ghost→delivered 窗口）+
+        // recentSettled ledger。
         send({
           type: "queue_state",
           itemIds: listChatQueueItemIds(id),
+          operationSnapshot: listMessageOperationSnapshot(id),
           recentSettled: listRecentSettled(id),
         });
       } catch (err) {

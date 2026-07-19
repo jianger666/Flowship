@@ -344,6 +344,84 @@ export const readMetaV06 = async (id: string): Promise<TaskMetaV06 | null> => {
 };
 
 /**
+ * R36-6：meta 删除证据三态——absent | valid | unknown。
+ * 不用 exists() 预探（EACCES 会假 absent）；直接 readFile，仅 ENOENT → absent。
+ */
+export type MetaEvidenceRead =
+  | { kind: "absent" }
+  | { kind: "valid"; value: TaskMetaV06 }
+  | { kind: "unknown"; error: unknown };
+
+type MetaEvidenceReadOp = "metaSync" | "metaAsync";
+let metaEvidenceReadInjector:
+  | ((op: MetaEvidenceReadOp, filePath: string) => void)
+  | null = null;
+
+/** R36-6 测试注入：模拟 meta EACCES/EIO */
+export const setMetaEvidenceReadInjectorForTest = (
+  fn: ((op: MetaEvidenceReadOp, filePath: string) => void) | null,
+): void => {
+  metaEvidenceReadInjector = fn;
+};
+
+const isMetaEnoent = (err: unknown): boolean =>
+  (err as NodeJS.ErrnoException)?.code === "ENOENT";
+
+const parseMetaEvidence = (raw: string, id: string): MetaEvidenceRead => {
+  if (raw.trim().length === 0) {
+    return {
+      kind: "unknown",
+      error: new Error(`meta.json 为空 taskId=${id}`),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return { kind: "unknown", error: e };
+  }
+  if (!isValidMetaShape(parsed)) {
+    return {
+      kind: "unknown",
+      error: new Error(
+        `任务 ${id} meta.json schema 不匹配 V0.6（可能 V0.5 残留 / 文件破损）`,
+      ),
+    };
+  }
+  return { kind: "valid", value: parsed };
+};
+
+/** R36-6：异步三态读 meta（DELETE / manifest 构建用） */
+export const readMetaV06Evidence = async (
+  id: string,
+): Promise<MetaEvidenceRead> => {
+  const p = path.join(taskDir(id), META_FILE);
+  try {
+    metaEvidenceReadInjector?.("metaAsync", p);
+    const raw = await fs.readFile(p, "utf-8");
+    return parseMetaEvidence(raw, id);
+  } catch (err) {
+    if (isMetaEnoent(err)) return { kind: "absent" };
+    console.error(`[task-fs-core] R36-6 读 meta 未知错误 id=${id}`, err);
+    return { kind: "unknown", error: err };
+  }
+};
+
+/** R36-7：同步三态读 meta（TaskVisibility 用） */
+export const readMetaV06EvidenceSync = (id: string): MetaEvidenceRead => {
+  const p = path.join(taskDir(id), META_FILE);
+  try {
+    metaEvidenceReadInjector?.("metaSync", p);
+    const raw = readFileSync(p, "utf-8");
+    return parseMetaEvidence(raw, id);
+  } catch (err) {
+    if (isMetaEnoent(err)) return { kind: "absent" };
+    console.error(`[task-fs-core] R36-6 sync 读 meta 未知错误 id=${id}`, err);
+    return { kind: "unknown", error: err };
+  }
+};
+
+/**
  * R20-3 / R26-5：把序列化 + 写 tmp 与原子 rename 拆开。
  * prepare 期间脏值只在 tmp、meta.json 未动；commit = rename；abort = unlink tmp。
  * 条件事务 helper 用「prepare → 同步复查 → commit(finalGuard)」消灭写后回滚窗口。

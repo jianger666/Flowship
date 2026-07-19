@@ -787,6 +787,12 @@ export interface RunChatInput {
    * 有则入口同步校验 lease，失效不注册 runningChats。
    */
   startToken?: number;
+  /**
+   * R36-1：首条消息的 MessageOperation itemId。
+   * runningChats 占位只表示 starting；仅 `agent.send` resolve 后由本 runner 提交 handedOff；
+   * create/send/lease/stop/DELETE 失败由同一 handle 提交 failed（或 already_running 时入队）。
+   */
+  clientItemId?: string;
 }
 
 /**
@@ -808,8 +814,22 @@ export const runChatSession = async (
     firstMessageEventId: _firstMessageEventId,
     continuationSummary,
     startToken,
+    clientItemId,
   } = input;
   void _firstMessageEventId;
+
+  /** R36-1：首条 operation 终态提交（first-outcome-wins；无 id 则 no-op） */
+  const settleFirstOp = (
+    outcome: "delivered" | Parameters<typeof settleMessageFailed>[2],
+  ): void => {
+    if (!clientItemId) return;
+    if (isMessageOperationTerminal(task.id, clientItemId)) return;
+    if (outcome === "delivered") {
+      settleMessageHandedOff(task.id, clientItemId);
+    } else {
+      settleMessageFailed(task.id, clientItemId, outcome);
+    }
+  };
 
   // S1：带 token 时入口同步校验 lease——失效绝不注册 runningChats / 不创建 agent
   if (
@@ -819,6 +839,8 @@ export const runChatSession = async (
     console.warn(
       `[chat-runner] runChatSession task=${task.id} 启动 lease 已失效（token=${startToken}）、拒绝启动`,
     );
+    // R36-1：lease 失效 → 同 handle 明确 failed（禁止占位即 handedOff）
+    settleFirstOp("stopped");
     return "lease_cancelled";
   }
 
@@ -828,6 +850,8 @@ export const runChatSession = async (
     // flush 时 skipPersistEvent 避免重复气泡。
     if (firstMessage) {
       enqueueChatMessage(task.id, {
+        // R36-1：带上 operation id，queue/flush 继续同一 aggregate
+        itemId: clientItemId,
         agentText: firstMessage.text,
         displayText: firstMessage.text,
         imageAbsPaths: firstMessage.imagePaths,
@@ -866,6 +890,7 @@ export const runChatSession = async (
 
   // 进入即占位注册：任何时刻（含 create/send/MCP 探测冷启动期）点停止、cancelChatRun 都能命中、
   // 置 cancelled（有 run 时一并真取消 SDK run）；agentId 先空、send 出来再回填。
+  // R36-1：此处 runActive 只表示 starting，绝不等于消息已 handedOff。
   runningChats.set(task.id, {
     agentId: "",
     instanceId: myInstanceId,
@@ -895,6 +920,8 @@ export const runChatSession = async (
       console.warn(
         `[chat-runner] runChatSession task=${task.id} 任务已删除/tombstone、放弃启动`,
       );
+      // R36-1：任务已删 → 首条 op 明确 failed
+      settleFirstOp("deleted");
       closeChatSession(task.id, myInstanceId);
       return "lease_cancelled";
     }
@@ -911,7 +938,12 @@ export const runChatSession = async (
     );
     if (!isStartCurrent()) {
       // 写盘 await 期间已被摘 / 替换——不继续 MCP / create（finishCancelled 对失主 no-op）
-      if (cancelled) await finishCancelled();
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        settleFirstOp("startup_failed");
+      }
       return "started";
     }
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
@@ -944,7 +976,13 @@ export const runChatSession = async (
     // MCP 健康探测也要数秒、探测期间被停 / 换主 → 别再往下跑
     // （原「Chat 任务启动」info 已去掉：用户嫌吵，模型信息输入框下方已有）
     if (cancelled || !isStartCurrent()) {
-      if (cancelled) await finishCancelled();
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        // R36-1：实例被替换、首条未 send → failed
+        settleFirstOp("startup_failed");
+      }
       return "started";
     }
 
@@ -1024,7 +1062,13 @@ export const runChatSession = async (
         void Promise.resolve(agent.close()).catch(() => {});
         // cancelled：走既有 finishCancelled；instanceGone 而非 cancelled 时不要动 B
         //（finishCancelled 按 myInstanceId 门控对 B 是 no-op，但仍避免多余写盘）
-        if (cancelled) await finishCancelled();
+        if (cancelled) {
+          await finishCancelled();
+          settleFirstOp("stopped");
+        } else {
+          // R36-1：create 后窗口 stop/DELETE/换实例 → 首条未送达
+          settleFirstOp("startup_failed");
+        }
         return "started";
       }
     }
@@ -1054,7 +1098,12 @@ export const runChatSession = async (
         !curBeforeSend || curBeforeSend.instanceId !== myInstanceId;
       if (cancelled || instanceGoneBeforeSend) {
         void Promise.resolve(agent.close()).catch(() => {});
-        if (cancelled) await finishCancelled();
+        if (cancelled) {
+          await finishCancelled();
+          settleFirstOp("stopped");
+        } else {
+          settleFirstOp("startup_failed");
+        }
         return "started";
       }
     }
@@ -1102,10 +1151,18 @@ export const runChatSession = async (
       void run.cancel().catch(() => {});
       // 本地 agent 未挂到当前实例：显式 close，避免泄漏（finishCancelled 只关 record.agent）
       void Promise.resolve(agent.close()).catch(() => {});
-      if (cancelled) await finishCancelled();
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        settleFirstOp("startup_failed");
+      }
       // instanceGone：finishCancelled 按 myInstanceId 门控对 B 是 no-op，此处不调用以免多余写盘
       return "started";
     }
+
+    // R36-1：仅在 agent.send 成功返回 run 且实例仍 current 后提交 handedOff
+    settleFirstOp("delivered");
 
     // 回填真实 agentId / agent 实例（占位注册时是空串 / null）——从此会话可被 send 续接。
     // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 接回
@@ -1126,8 +1183,11 @@ export const runChatSession = async (
         void Promise.resolve(agent.close()).catch(() => {});
       }
       await finishCancelled();
+      settleFirstOp("stopped");
       return "started";
     }
+    // R36-1：Agent.create reject / send reject → startup_failed（禁止留下 handedOff）
+    settleFirstOp("startup_failed");
     await handleChatRunFailure(task, err, myInstanceId);
   }
   return "started";

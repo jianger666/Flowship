@@ -1,11 +1,11 @@
 /**
- * R35-2：chat 消息 payload 指纹（client / server 共享契约）
+ * R35-2 / R36：chat 消息 payload 指纹（client / server 唯一契约）
  *
- * 算法：`JSON.stringify([text, imagePaths, attachmentPaths, skills])` → 短 hash。
+ * 算法：`JSON.stringify([text, imagePaths, attachmentPaths, skills])` → FNV-1a 短 hash。
  * 身份仲裁只认 itemId + fingerprint，文案不参与。
  *
- * 依赖对齐：server claim 侧并行实现同一函数；imagePaths 在 client 用
- * `imageKeysFromPayloads`（filename 或 mime+len），server 对请求体用同一键规则。
+ * imagePaths：两端统一 `imageKeysFromPayloads`（filename 或 mime+len）；
+ * server claim 优先信 client POST 的 `payloadFingerprint`，缺失时用本函数兜底。
  */
 
 export type ChatSkillRef = { name: string; absPath: string };

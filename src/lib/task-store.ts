@@ -406,6 +406,8 @@ interface SSEEnvelope {
     | "queue_failed"
     /** R32-2：bootstrap 队列存活快照 */
     | "queue_state"
+    /** R36-2：MessageOperation phase / terminal 帧 */
+    | "message_op"
     /** R33-4：任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
@@ -419,6 +421,16 @@ interface SSEEnvelope {
   reason?: string;
   /** R33-1：bootstrap queue_state 有界终态 ledger */
   recentSettled?: Array<{ itemId: string; outcome: string }>;
+  /** R36-4：完整 operation snapshot（含 accepting/persisted） */
+  operationSnapshot?: Array<{
+    itemId: string;
+    phase: string;
+    fingerprint?: string;
+  }>;
+  /** R36-2：message_op 帧字段 */
+  itemId?: string;
+  phase?: string;
+  outcome?: string;
   taskId?: string;
 }
 
@@ -464,12 +476,25 @@ export interface TaskStreamCallbacks {
    */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
   /**
-   * R32-2 / R33-1：watch bootstrap 的 queue_state——按存活 itemIds + recentSettled 对账
+   * R32-2 / R33-1 / R36-4：watch bootstrap queue_state + operationSnapshot
    */
   onQueueState?: (
     itemIds: string[],
     recentSettled?: Array<{ itemId: string; outcome: string }>,
+    operationSnapshot?: Array<{
+      itemId: string;
+      phase: string;
+      fingerprint?: string;
+    }>,
   ) => void;
+  /**
+   * R36-2：message_op——显式 phase / outcome（handedOff=delivered）
+   */
+  onMessageOp?: (payload: {
+    itemId: string;
+    phase?: string;
+    outcome?: string;
+  }) => void;
   /**
    * R33-4：task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
@@ -500,7 +525,7 @@ export const watchTaskStream = async (
       typeof data === "object" && data && "error" in data
         ? String((data as { error: unknown }).error)
         : `HTTP ${res.status}`;
-    // R34-5：带 status，hook 对 404/410 走 deletion sink（不再当普通异常重试）
+    // R36-7：带 status；hook 仅对 410 走 deletion sink，503/404 当 unavailable 重试
     throw new ApiRequestError(msg, res.status);
   }
   if (!res.body) {
@@ -554,7 +579,7 @@ export const watchTaskStream = async (
             env.type === "queue_state" &&
             Array.isArray(env.itemIds)
           ) {
-            // R32-2 / R33-1：bootstrap 队列快照 + recentSettled ledger
+            // R32-2 / R33-1 / R36-4：队列快照 + recentSettled + operationSnapshot
             const ids = env.itemIds.filter(
               (id): id is string => typeof id === "string",
             );
@@ -566,7 +591,32 @@ export const watchTaskStream = async (
                     typeof e.outcome === "string",
                 )
               : undefined;
-            callbacks.onQueueState?.(ids, recentSettled);
+            const operationSnapshot = Array.isArray(env.operationSnapshot)
+              ? env.operationSnapshot.filter(
+                  (
+                    e,
+                  ): e is {
+                    itemId: string;
+                    phase: string;
+                    fingerprint?: string;
+                  } =>
+                    !!e &&
+                    typeof e.itemId === "string" &&
+                    typeof e.phase === "string",
+                )
+              : undefined;
+            callbacks.onQueueState?.(ids, recentSettled, operationSnapshot);
+          } else if (
+            env.type === "message_op" &&
+            typeof env.itemId === "string"
+          ) {
+            // R36-2：显式 operation phase / terminal
+            callbacks.onMessageOp?.({
+              itemId: env.itemId,
+              phase: typeof env.phase === "string" ? env.phase : undefined,
+              outcome:
+                typeof env.outcome === "string" ? env.outcome : undefined,
+            });
           } else if (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"

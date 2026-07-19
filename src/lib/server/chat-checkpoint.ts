@@ -38,9 +38,9 @@ import { failQueuedItems, getChatQueueCount } from "./chat-queue";
 import { failpoint } from "./failpoints";
 import {
   EVENTS_FILE,
-  exists,
   readEvents,
   readMetaV06,
+  readMetaV06Evidence,
   taskDir,
   withTaskLock,
   writeMeta,
@@ -550,8 +550,10 @@ export const scanCheckpointRefsFromRepoPaths = async (
 };
 
 /**
- * R32-6 / R34-7：从 rewind_points + for-each-ref 提取本 task 的 checkpoint refs 清单。
- * rewind 读失败 → ok:false（绝不降级空清单）；空清单仅在相关仓全部扫成功且无 ref 时合法。
+ * R32-6 / R34-7 / R36-6：从 rewind_points + for-each-ref 提取本 task 的 checkpoint refs 清单。
+ * rewind 读失败 → ok:false（绝不降级空清单）。
+ * R36-6：meta 三态——只有 valid meta 显式 repoPaths=[] 且 rewind 成功且相关扫描成功
+ * 才 confirmedEmpty；meta unknown/损坏 → ok:false（manifestPending），「目录存在」不再当零仓证据。
  */
 export const buildCheckpointRefManifest = async (
   taskId: string,
@@ -584,22 +586,37 @@ export const buildCheckpointRefManifest = async (
       set.add(checkpointRefName(taskId, s.treeOid));
     }
   }
-  // R34-7：合并 meta.repoPaths，防 rewind 漏记仓导致漏扫
-  const meta = await readMetaV06(taskId).catch(() => null);
-  for (const p of meta?.repoPaths ?? []) {
-    if (p) repoPaths.add(p);
+  // R36-6：meta 三态合并 repoPaths——unknown 不得折叠成「无仓」
+  const metaRead = await readMetaV06Evidence(taskId);
+  if (metaRead.kind === "valid") {
+    for (const p of metaRead.value.repoPaths ?? []) {
+      if (p) repoPaths.add(p);
+    }
+  } else if (metaRead.kind === "unknown") {
+    console.warn(
+      `[chat-checkpoint] R36-6 buildManifest meta 未知 task=${taskId}`,
+      metaRead.error,
+    );
   }
 
-  // R35-3：无任何仓——仅当 taskDir 仍在（恢复源可及）才确认合法空清单；
-  // taskDir 已 rm 时空结果是 unknown，绝不能当 ok-empty（Codex 反例 2）
+  // R36-6：零仓仅当 valid meta 显式 [] + rewind 已成功构建（走到这里）
   if (repoPaths.size === 0) {
-    if (!(await exists(taskDir(taskId)))) {
+    if (metaRead.kind === "unknown") {
       return {
         ok: false,
         error:
-          "R35-3: taskDir missing and no repoPaths — cannot confirm empty manifest",
+          "R36-6: meta unknown with empty rewind repos — cannot confirm empty manifest",
       };
     }
+    if (metaRead.kind !== "valid") {
+      // meta absent：没有「显式 repoPaths=[]」证据，不得 confirmedEmpty（目录存在也不算）
+      return {
+        ok: false,
+        error:
+          "R36-6: meta absent with empty rewind repos — cannot confirm empty manifest",
+      };
+    }
+    // valid meta + 显式空仓（repoPaths 合并后仍空）+ rewind 成功 → 合法零清单
     return {
       ok: true,
       manifest: {
@@ -642,6 +659,7 @@ export const buildCheckpointRefManifest = async (
       error: "for-each-ref failed and no expected refs from rewind_points",
     };
   }
+  // R36-6：meta unknown 但 rewind 带了仓路径——可扫则返回清单，绝不标 confirmedEmpty
   return {
     ok: true,
     manifest: {
@@ -679,23 +697,33 @@ export const resolveCheckpointRefManifestForDelete = async (
 
   const primary = await buildCheckpointRefManifest(taskId);
   if (primary.ok) return primary;
-  const meta = await readMetaV06(taskId).catch(() => null);
-  const repos = (meta?.repoPaths ?? []).filter(
-    (p): p is string => typeof p === "string" && p.length > 0,
-  );
+  // R36-6：meta 三态——unknown 不得当「无仓」去碰 taskDir 假成功
+  const metaRead = await readMetaV06Evidence(taskId);
+  if (metaRead.kind === "unknown") {
+    console.error(
+      `[chat-checkpoint] R36-6 resolveManifest：meta 未知、keep pending task=${taskId}`,
+      metaRead.error,
+    );
+    return {
+      ok: false,
+      error: `R36-6: meta unknown — ${String(metaRead.error)}`,
+    };
+  }
+  const repos =
+    metaRead.kind === "valid"
+      ? (metaRead.value.repoPaths ?? []).filter(
+          (p): p is string => typeof p === "string" && p.length > 0,
+        )
+      : [];
   if (repos.length === 0) {
-    // R35-3：无 fallback、无 meta 仓路径——若 taskDir 也不在，明确 unknown（非空成功）
-    if (!(await exists(taskDir(taskId)))) {
-      console.error(
-        `[chat-checkpoint] R35-3 resolveManifest：manifestPending unknown（空 repoPaths + taskDir 已消失）task=${taskId}`,
-      );
-      return {
-        ok: false,
-        error:
-          "R35-3: empty repoPaths and taskDir missing — keep pending, never ok-empty",
-      };
-    }
-    return { ok: false, error: primary.error };
+    // R35-3 / R36-6：无 fallback、无可信 meta 仓路径 → unknown（非空成功）
+    console.error(
+      `[chat-checkpoint] R36-6 resolveManifest：manifestPending unknown（无可信 repoPaths）task=${taskId}`,
+    );
+    return {
+      ok: false,
+      error: primary.error,
+    };
   }
   console.warn(
     `[chat-checkpoint] R34-7 resolveManifest：rewind 失败、改扫 meta.repoPaths task=${taskId} repos=${repos.length}`,

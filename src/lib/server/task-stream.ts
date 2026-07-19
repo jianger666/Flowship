@@ -53,6 +53,8 @@ export type TaskStreamEvent =
   | { kind: "error"; message: string }
   | { kind: "assistant_delta"; text: string }
   | { kind: "queue_failed"; itemIds: string[]; reason: string }
+  // R36-2：MessageOperation 终态帧（纯内存、不落盘）——client ledger 成功/失败终态的实时来源
+  | { kind: "message_op"; itemId: string; phase?: string; outcome?: string }
   | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;

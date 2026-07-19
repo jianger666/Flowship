@@ -20,6 +20,7 @@ import {
   getTaskWithTailEvents,
   hasDurableDeleteDescriptor,
   probeDeleteTombstone,
+  probeTaskDurablePresence,
   readDeletionJournal,
   recoverDeletedTaskArtifacts,
   removeDeletionJournal,
@@ -29,11 +30,16 @@ import {
   setTaskPinned,
   setTaskRepoPaths,
   setTaskUiLayout,
+  taskVisibilityErrorResponse,
   updateTaskFields,
   writeDeleteTombstone,
   writeDeletionJournal,
 } from "@/lib/server/task-fs";
-import { MAX_EVENTS_TAIL, readMetaV06, taskDir } from "@/lib/server/task-fs-core";
+import {
+  MAX_EVENTS_TAIL,
+  readMetaV06Evidence,
+  taskDir,
+} from "@/lib/server/task-fs-core";
 import { failpoint } from "@/lib/server/failpoints";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import {
@@ -108,17 +114,21 @@ const recoveryPendingResponse = () =>
   );
 
 /**
- * R34-7 / R35-3：解析删除用 manifest。
+ * R34-7 / R35-3 / R36-6：解析删除用 manifest。
  * 可信任务快照（入场读到的 meta.repoPaths）在 commit 前写入 journal——durable descriptor 核心。
+ * R36-6：禁止用空 repoPaths 推断 confirmedEmpty——只信构建结果显式标志。
  */
 const prepareDeleteManifest = async (
   taskId: string,
 ): Promise<CheckpointRefManifest> => {
-  // R35-3：DELETE 入场尽早读可信快照，供 manifestPending 时持久化
-  const meta = await readMetaV06(taskId).catch(() => null);
-  const snapshotRepoPaths = (meta?.repoPaths ?? []).filter(
-    (p): p is string => typeof p === "string" && p.length > 0,
-  );
+  // R36-6：meta 三态快照——unknown 不得折叠成「无仓」
+  const metaRead = await readMetaV06Evidence(taskId);
+  const snapshotRepoPaths =
+    metaRead.kind === "valid"
+      ? (metaRead.value.repoPaths ?? []).filter(
+          (p): p is string => typeof p === "string" && p.length > 0,
+        )
+      : [];
   // 不传 fallback——有 meta 时先 rewind 构建；fallback 仅留给 journal 恢复（taskDir 已 rm）
   const resolved = await resolveCheckpointRefManifestForDelete(taskId);
   if (resolved.ok) {
@@ -130,9 +140,8 @@ const prepareDeleteManifest = async (
       ...resolved.manifest,
       phase: "prepared",
       repoPaths,
-      ...(resolved.manifest.confirmedEmpty || repoPaths.length === 0
-        ? { confirmedEmpty: true }
-        : {}),
+      // R36-6：只传播构建侧 confirmedEmpty，禁止空数组推断
+      ...(resolved.manifest.confirmedEmpty ? { confirmedEmpty: true } : {}),
     };
   }
   console.warn(
@@ -143,7 +152,7 @@ const prepareDeleteManifest = async (
     checkpointRefs: [],
     phase: "prepared",
     manifestPending: true,
-    // R35-3：快照拿得到就写入；拿不到 = unknown（空），禁止随后 rm 最后恢复源
+    // R35-3 / R36-6：仅 valid meta 快照可写入；unknown/absent = 空，禁止随后 rm 最后恢复源
     repoPaths: snapshotRepoPaths,
   };
 };
@@ -165,7 +174,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
       // R34-3：helper 与 Response 之间可插入删除——failpoint + 提交点同步复查
       await failpoint("httpRead.afterHelper");
       if (!task) {
-        return NextResponse.json({ error: "not_found" }, { status: 404 });
+        // R36-7：deleted→410 / unavailable→503 / 其余 404
+        return taskVisibilityErrorResponse(id);
       }
       return commitReadableTaskResponse(id, () => ({ task }));
     }
@@ -173,7 +183,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
     const task = await getTask(id);
     await failpoint("httpRead.afterHelper");
     if (!task) {
-      return NextResponse.json({ error: "not_found" }, { status: 404 });
+      return taskVisibilityErrorResponse(id);
     }
     return commitReadableTaskResponse(id, () => ({ task }));
   } catch (err) {
@@ -353,6 +363,61 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
   }
 
   try {
+    // R36-7 / R36-8：事务入场前三态检查——unknown 不得发布不可逆终态；双 absent 幂等不建 journal
+    const priorJournal = await readDeletionJournal(id);
+    const priorTomb = await probeDeleteTombstone(id);
+    if (priorJournal.kind === "unknown" || priorTomb.kind === "unknown") {
+      endChatLifecycle(id, "deleting");
+      console.error(
+        `[DELETE /api/tasks/[id]] R36-7 入场证据读未知、503 不进删除 task=${id}`,
+        priorJournal.kind === "unknown"
+          ? priorJournal.error
+          : priorTomb.kind === "unknown"
+            ? priorTomb.error
+            : undefined,
+      );
+      return NextResponse.json(
+        { error: "删除证据暂不可读、稍后重试" },
+        { status: 503 },
+      );
+    }
+    if (
+      (priorJournal.kind === "present" &&
+        priorJournal.value.phase === "committed") ||
+      priorTomb.kind === "present"
+    ) {
+      // 已提交：只前滚，不重写 journal
+      publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
+      clearChatGate(id);
+      void recoverDeletedTaskArtifacts(id).catch((e) =>
+        console.error(
+          `[DELETE /api/tasks/[id]] R35-4 已提交重入 recovery 失败 task=${id}`,
+          e,
+        ),
+      );
+      return recoveryPendingResponse();
+    }
+    const taskPresence = await probeTaskDurablePresence(id);
+    if (taskPresence === "unknown") {
+      endChatLifecycle(id, "deleting");
+      console.error(
+        `[DELETE /api/tasks/[id]] R36-8 任务存在性未知、503 不进删除 task=${id}`,
+      );
+      return NextResponse.json(
+        { error: "删除证据暂不可读、稍后重试" },
+        { status: 503 },
+      );
+    }
+    if (
+      taskPresence === "absent" &&
+      priorJournal.kind === "absent" &&
+      priorTomb.kind === "absent"
+    ) {
+      // R36-8：从未存在 / 已完全收尾 → 幂等 200，不创建 immortal journal
+      endChatLifecycle(id, "deleting");
+      return NextResponse.json({ ok: true });
+    }
+
     // V12：立刻 revoke——已入场的 advance/one-shot 在目录被删后不得继续 ensureWorkspace/create
     revokeTaskOps(id);
     // T2：等 rewind 事务退出后再 clearChatGate / 清 refs / 删目录，
@@ -429,38 +494,6 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     cleanupChatQueueState(id);
     clearChatContextUsage(id);
 
-    // R35-4：进入写 journal / tombstone 前探针——已提交或证据读未知 → 只前滚、禁止重写 prepared
-    const priorJournal = await readDeletionJournal(id);
-    const priorTomb = await probeDeleteTombstone(id);
-    if (priorJournal.kind === "unknown" || priorTomb.kind === "unknown") {
-      publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
-      clearChatGate(id);
-      console.error(
-        `[DELETE /api/tasks/[id]] R35-4 入场证据读未知、recoveryPending task=${id}`,
-        priorJournal.kind === "unknown"
-          ? priorJournal.error
-          : priorTomb.kind === "unknown"
-            ? priorTomb.error
-            : undefined,
-      );
-      return recoveryPendingResponse();
-    }
-    if (
-      (priorJournal.kind === "present" &&
-        priorJournal.value.phase === "committed") ||
-      priorTomb.kind === "present"
-    ) {
-      publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
-      clearChatGate(id);
-      void recoverDeletedTaskArtifacts(id).catch((e) =>
-        console.error(
-          `[DELETE /api/tasks/[id]] R35-4 已提交重入 recovery 失败 task=${id}`,
-          e,
-        ),
-      );
-      return recoveryPendingResponse();
-    }
-
     // R30-2 / R31-3 / R32-6 / R33-5：quarantine 场景——先 prepared→tombstone→committed，再 HTTP 200；
     // deleting lifecycle 保持到后台物理删完；job 归零后再清 refs + deleteTask（refs 失败留 journal）。
     if (resourceJoinTimedOut || hasResourceJobs(id)) {
@@ -501,15 +534,17 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // R33-5：进入不可逆 refs/rm 前原子推进 committed
     await commitDeletionJournal(id);
     const committedRead = await readDeletionJournal(id);
-    // R35-4：committed 后读未知 → 保持 recoveryPending，不 rm、不释放可见
+    // R36-7：committed 后读未知 → 503、不 publish 不可逆终态（磁盘可能已 committed，读闸会 unavailable）
     if (committedRead.kind === "unknown") {
       console.error(
-        `[DELETE /api/tasks/[id]] R35-4 committed 后 journal 读未知 task=${id}`,
+        `[DELETE /api/tasks/[id]] R36-7 committed 后 journal 读未知 task=${id}`,
         committedRead.error,
       );
-      publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
-      clearChatGate(id);
-      return recoveryPendingResponse();
+      endChatLifecycle(id, "deleting");
+      return NextResponse.json(
+        { error: "删除证据暂不可读、稍后重试" },
+        { status: 503 },
+      );
     }
     const committedJournal =
       committedRead.kind === "present" ? committedRead.value : null;
@@ -549,12 +584,14 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     }
     const ok = await deleteTask(id);
     if (!ok) {
-      // R34-1 / R35-4：已 committed → 任务逻辑已隐藏，目录缺失也走前滚而非 404 回滚
+      // R34-1 / R36-7：已 committed → 前滚；unknown → 503 不 publish
       const still = await readDeletionJournal(id);
       if (still.kind === "unknown") {
-        publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
-        clearChatGate(id);
-        return recoveryPendingResponse();
+        endChatLifecycle(id, "deleting");
+        return NextResponse.json(
+          { error: "删除证据暂不可读、稍后重试" },
+          { status: 503 },
+        );
       }
       if (still.kind === "present" && still.value.phase === "committed") {
         publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
@@ -591,16 +628,13 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     }
     return NextResponse.json({ ok: true });
   } catch (err) {
-    // R34-1 / R34-2 / R35-4：committed / tombstone / 读未知 → 只前滚，返 recoveryPending
-    // 禁止 unknown 走「未提交」分支返 400 释放 gate
+    // R34-1 / R36-7：committed / tombstone → 前滚 + publish；unknown → 503 不 publish
     const journal = await readDeletionJournal(id);
     const tomb = await probeDeleteTombstone(id);
     if (journal.kind === "unknown" || tomb.kind === "unknown") {
       endChatLifecycle(id, "deleting");
-      publishTaskStreamEvent(id, { kind: "task_deleted", taskId: id });
-      clearChatGate(id);
       console.error(
-        "[DELETE /api/tasks/[id]] R35-4 证据读未知、保持 recoveryPending",
+        "[DELETE /api/tasks/[id]] R36-7 证据读未知、503 不发布 task_deleted",
         err,
         journal.kind === "unknown"
           ? journal.error
@@ -608,7 +642,10 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
             ? tomb.error
             : undefined,
       );
-      return recoveryPendingResponse();
+      return NextResponse.json(
+        { error: "删除证据暂不可读、稍后重试" },
+        { status: 503 },
+      );
     }
     if (
       (journal.kind === "present" && journal.value.phase === "committed") ||

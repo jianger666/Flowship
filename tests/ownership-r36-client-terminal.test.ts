@@ -4,7 +4,7 @@
  * ① SSE 终态先到、fetch 后 reject → 视为已接受、清草稿、不生成新 id
  * ② 空文本不同附件 / 同文案不同 skill → 不复用旧 operation
  * ③ detail/list/chat mutation 200 在 task_deleted 后到达 → 不得复活
- * ④ 在线帧与重连 404 走同一 commitTaskDeleted
+ * ④ 在线帧与重连 410 走同一 commitTaskDeleted
  * ⑤ 同 id 已 deleted 后切到其它 task 再切回 → 仍 sticky deleted
  */
 import { afterEach, describe, expect, it } from "vitest";
@@ -49,7 +49,8 @@ const op = (
 });
 
 describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
-  it("① server 已写 user_reply、SSE 终态先到、fetch 随后 reject → 清草稿、不标 uncertain", () => {
+  it("① server 已 handedOff、SSE 终态先到、fetch 随后 reject → 清草稿、不标 uncertain", () => {
+    // R36-2：user_reply 仅 persisted；成功终态来自 message_op handedOff/delivered
     const itemId = "cq_r36_sse_first";
     const fp = fingerprintFromChatSendArgs({ text: "hello" });
     let state = emptyChatOpState();
@@ -66,10 +67,19 @@ describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
     }).state;
     expect(state.pending).toHaveLength(1);
 
-    // SSE user_reply 先到 → delivered
+    // SSE user_reply → persisted（非终态）
     state = reduceChatOperation(state, {
       type: "user_reply",
       ev: { text: "hello", meta: { queueItemId: itemId } },
+    }).state;
+    expect(state.pending[0]?.phase).toBe("persisted");
+    expect(state.outcomes[itemId]).toBeUndefined();
+
+    // message_op handedOff → delivered
+    state = reduceChatOperation(state, {
+      type: "message_op",
+      itemId,
+      phase: "handedOff",
     }).state;
     expect(state.pending).toHaveLength(0);
     expect(state.outcomes[itemId]).toBe("delivered");
@@ -254,7 +264,7 @@ describe("R35-5：TaskTerminalCoordinator（sticky deleted）", () => {
     unsub();
   });
 
-  it("④ 在线帧与重连 404 走同一 commitTaskDeleted", () => {
+  it("④ 在线帧与重连 410 走同一 commitTaskDeleted", () => {
     const taskId = "t_r36_same_sink";
     let commits = 0;
     const unsub = subscribeTaskTerminalList(() => {
@@ -264,7 +274,7 @@ describe("R35-5：TaskTerminalCoordinator（sticky deleted）", () => {
     // 在线帧
     commitTaskDeleted(taskId);
     const gen1 = getTaskTerminalGeneration(taskId);
-    // 重连 404（同一 sink，幂等 sticky）
+    // 重连 410（同一 sink，幂等 sticky；R36-7：404 不再走此 sink）
     commitTaskDeleted(taskId);
     const gen2 = getTaskTerminalGeneration(taskId);
 

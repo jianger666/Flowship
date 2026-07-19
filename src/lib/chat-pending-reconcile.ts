@@ -1,12 +1,20 @@
 /**
- * R31-1 / R32-1 / R33-1 / R35-2：前端 pending / Operation 对账纯函数。
+ * R31-1 / R32-1 / R33-1 / R35-2 / R36-2/3/4：前端 pending / Operation 对账纯函数。
  * 抽出来便于单测，避免拉 chat-view 客户端组件进 node 环境。
  *
  * R35-2：pending 升级为完整 Operation（itemId + payloadFingerprint + phase）；
- * HTTP resolve/reject、user_reply、queue_failed、queue_state 走同一 reducer。
+ * R36-2：只消费明确 phase——user_reply=persisted（非终态）；成功终态仅 handedOff/delivered；
+ * R36-3：outcome 走 message-op-schema 表驱动 decoder，未知 fail-closed；
+ * R36-4：ghost → uncertain/unknown，绝不写 delivered。
  */
 
 import type { ChatSkillRef } from "@/lib/chat-payload-fingerprint";
+import {
+  isMessageOpActivePhase,
+  normalizeWireOutcomeToLedger,
+  type ClientLedgerOutcome,
+  type MessageOpSnapshotEntry,
+} from "@/lib/message-op-schema";
 
 export type PendingLocalReplyLike = {
   itemId: string;
@@ -19,18 +27,22 @@ export type PendingLocalReplyLike = {
   uncertain?: boolean;
   /** R35-2：payload 指纹（retry identity，不靠文案） */
   payloadFingerprint?: string;
-  /** R35-2：sending | uncertain（terminal 进 settled/outcomes，不留 pending） */
-  phase?: "sending" | "uncertain";
+  /**
+   * R35-2 / R36-2：sending | uncertain | persisted。
+   * persisted = 已有持久气泡、非终态（等待 handedOff / failed）。
+   */
+  phase?: "sending" | "uncertain" | "persisted";
 };
 
 /**
- * R35-2：完整 client Operation（pending 条目）
+ * R35-2 / R36-2：完整 client Operation（pending 条目）
  * terminal 不在 pending 内——记入 settled + outcomes。
+ * persisted 仍留 pending（ledger 跟踪），UI 层过滤不渲染占位。
  */
 export type ChatOperation = {
   itemId: string;
   payloadFingerprint: string;
-  phase: "sending" | "uncertain";
+  phase: "sending" | "uncertain" | "persisted";
   displayText: string;
   text: string;
   images?: unknown[];
@@ -40,7 +52,8 @@ export type ChatOperation = {
   id?: string;
 };
 
-export type OpTerminalOutcome = "delivered" | "failed";
+/** R36-3：client ledger 终态（unknown = 未知 wire / ghost，可同 id 重试） */
+export type OpTerminalOutcome = ClientLedgerOutcome;
 
 /** R35-2：Operation ledger——pending + 终态 id + outcome */
 export type ChatOpState = {
@@ -101,6 +114,7 @@ const rememberOutcome = (
 ): Record<string, OpTerminalOutcome> => {
   if (!itemId) return outcomes;
   // first-outcome-wins：已有终态不覆盖（与 server ledger 对齐）
+  // R36-2：persisted 不是 outcome，不会占坑——后到的 failed 能生效
   if (outcomes[itemId]) return outcomes;
   return { ...outcomes, [itemId]: outcome };
 };
@@ -116,23 +130,13 @@ const rememberOutcomes = (
   return next;
 };
 
-const normalizeLedgerOutcome = (
+/**
+ * R36-3：表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown。
+ * （旧字符串启发式已删除）
+ */
+export const normalizeLedgerOutcome = (
   raw: string | undefined,
-): OpTerminalOutcome => {
-  if (!raw) return "delivered";
-  const lower = raw.toLowerCase();
-  if (
-    lower === "failed" ||
-    lower === "fail" ||
-    lower.includes("fail") ||
-    lower === "cancelled" ||
-    lower === "canceled" ||
-    lower === "rejected"
-  ) {
-    return "failed";
-  }
-  return "delivered";
-};
+): OpTerminalOutcome => normalizeWireOutcomeToLedger(raw);
 
 /** R35-2：uncertain 同 fingerprint 才复用 id（改附件/skill/文案 → 新 id） */
 export const findReusableUncertainOperation = <T extends PendingLocalReplyLike>(
@@ -150,6 +154,7 @@ export const findReusableUncertainOperation = <T extends PendingLocalReplyLike>(
 /**
  * 收到落盘 user_reply → 按 meta.queueItemId 清 pending。
  * R34-6：有 queueItemId 只走 id 对账；displayText 仅留给无 id 的旧历史事件。
+ * @deprecated R36-2：user_reply 非终态，请用 markPendingPersistedByUserReply
  */
 export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
   prev: T[],
@@ -167,6 +172,29 @@ export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
   return next;
 };
 
+/**
+ * R36-2：user_reply = persisted 非终态——占位换持久气泡语义，不写 delivered、不进 settled。
+ */
+export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>(
+  prev: T[],
+  ev: { text: string; meta?: Record<string, unknown> | null },
+): T[] => {
+  const qid =
+    typeof ev.meta?.queueItemId === "string" ? ev.meta.queueItemId : null;
+  const idx = qid
+    ? prev.findIndex((p) => p.itemId === qid)
+    : prev.findIndex((p) => p.displayText === ev.text);
+  if (idx < 0) return prev;
+  const next = [...prev];
+  const cur = next[idx]!;
+  next[idx] = {
+    ...cur,
+    phase: "persisted" as const,
+    uncertain: false,
+  };
+  return next;
+};
+
 /** R34-4：网络不确定 → 标 uncertain，不删 pending */
 export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -179,22 +207,18 @@ export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   );
 
 /**
- * R32-1：user_reply 终态对账——清 pending；无论命中与否都把 queueItemId 记入 settled。
- * 未命中（终态早于 202）靠 settled 挡住后续插 pending。
+ * R32-1 / R36-2：user_reply 对账——标 persisted，不记 settled / delivered。
+ * （函数名保留兼容旧测试 import；语义已改为非终态）
  */
 export const applyUserReplyTerminal = <T extends PendingLocalReplyLike>(
   pending: T[],
   settled: readonly string[],
   ev: { text: string; meta?: Record<string, unknown> | null },
-): { pending: T[]; settled: string[] } => {
-  const qid =
-    typeof ev.meta?.queueItemId === "string" ? ev.meta.queueItemId : null;
-  const nextPending = removePendingByUserReply(pending, ev);
-  const nextSettled = qid
-    ? rememberSettledItemIds(settled, [qid])
-    : [...settled];
-  return { pending: nextPending, settled: nextSettled };
-};
+): { pending: T[]; settled: string[] } => ({
+  pending: markPendingPersistedByUserReply(pending, ev),
+  // R36-2：persisted 不是终态，不进 settled（避免占坑挡后到 failed）
+  settled: [...settled],
+});
 
 /** 收到 queue_failed 控制帧 → 按 itemIds 精确清除对应 pending */
 export const removePendingByQueueFailed = <T extends PendingLocalReplyLike>(
@@ -228,16 +252,36 @@ export const shouldInsertPendingAfter202 = (
 ): boolean => !isItemSettled(settled, itemId);
 
 /**
- * R33-1：onDone(idle/error) 清 pending 时把清掉的 itemId 记入 settled，
- * 堵住「done 无 id 可记 → 晚到 202 插幽灵」（现 pending 登记先于请求，done 必有 id）。
+ * R33-1 / R36-2：onDone 清 pending——只清「已有明确终态」的条目；
+ * 无终态的保持 / 标 uncertain（不再按 runStatus 猜成功）。
  */
 export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
   pending: T[],
   settled: readonly string[],
+  outcomes: Record<string, OpTerminalOutcome> = {},
 ): { pending: T[]; settled: string[]; clearedIds: string[] } => {
-  const clearedIds = pending.map((p) => p.itemId).filter(Boolean);
+  const clearedIds: string[] = [];
+  const nextPending: T[] = [];
+  for (const p of pending) {
+    const outcome = outcomes[p.itemId];
+    // R36-2：仅明确终态（delivered/failed）才清；unknown 与无 outcome 保留
+    if (outcome === "delivered" || outcome === "failed") {
+      clearedIds.push(p.itemId);
+      continue;
+    }
+    // 无终态：保持 persisted 或标 uncertain（可同 id 对账/重试）
+    if (p.phase === "persisted") {
+      nextPending.push(p);
+    } else {
+      nextPending.push({
+        ...p,
+        uncertain: true,
+        phase: "uncertain" as const,
+      });
+    }
+  }
   return {
-    pending: [],
+    pending: nextPending,
     settled: rememberSettledItemIds(settled, clearedIds),
     clearedIds,
   };
@@ -260,50 +304,95 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-2 / R33-1：SSE 重连 bootstrap 的 queue_state 对账。
+ * R32-2 / R33-1 / R36-4：SSE 重连 bootstrap 对账。
  *
- * - serverItemIds：仍存活（队内 + in-flight）→ 保留 pending
- * - recentSettled：可重放终态 → 清 pending + 记 settled（关闭「重连空 state、202 未返」窗口）
- * - 既不在 server 也不在终态 → 幽灵，清除并记 settled（防迟到 202 再插）
+ * - serverItemIds ∪ operationSnapshot(accepting|persisted) → 存活，保留
+ * - recentSettled：可重放终态 → 清 pending + 记 settled
+ * - 既不在 snapshot 也不在终态 → ghost → uncertain/unknown（绝不 delivered）
  */
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
   settled: readonly string[],
   serverItemIds: readonly string[],
   recentSettled: readonly { itemId: string; outcome?: string }[] = [],
+  operationSnapshot: readonly MessageOpSnapshotEntry[] = [],
 ): { pending: T[]; settled: string[]; ghostIds: string[] } => {
-  const serverSet = new Set(serverItemIds);
+  const activeFromSnapshot = operationSnapshot
+    .filter((e) => e.itemId && isMessageOpActivePhase(e.phase))
+    .map((e) => e.itemId);
+  const serverSet = new Set([...serverItemIds, ...activeFromSnapshot]);
+  const snapshotById = new Map(
+    operationSnapshot
+      .filter((e) => e.itemId)
+      .map((e) => [e.itemId, e] as const),
+  );
   const ledgerIds = recentSettled.map((e) => e.itemId).filter(Boolean);
   const ledgerSet = new Set(ledgerIds);
-  let nextSettled = rememberSettledItemIds(settled, ledgerIds);
+  const nextSettled = rememberSettledItemIds(settled, ledgerIds);
   const settledSet = new Set(nextSettled);
   const ghostIds: string[] = [];
   const nextPending: T[] = [];
+  const seenPending = new Set<string>();
+
   for (const p of pending) {
     const phase = p.phase ?? (p.uncertain ? "uncertain" : "sending");
-    // 仍在服务端存活集合 → 保留；R34-4：曾 uncertain 则确认已受理
+    // 仍在服务端存活集合 → 保留；snapshot phase 可升级为 persisted
     if (serverSet.has(p.itemId)) {
+      const snap = snapshotById.get(p.itemId);
+      let nextPhase = phase;
+      if (snap?.phase === "persisted") {
+        nextPhase = "persisted";
+      } else if (phase === "uncertain") {
+        nextPhase = "sending";
+      }
       nextPending.push(
-        phase === "uncertain"
-          ? { ...p, uncertain: false, phase: "sending" as const }
+        nextPhase !== phase || phase === "uncertain"
+          ? {
+              ...p,
+              uncertain: nextPhase === "uncertain",
+              phase: nextPhase as "sending" | "uncertain" | "persisted",
+            }
           : p,
       );
+      seenPending.add(p.itemId);
       continue;
     }
     // R33-1：ledger / 本地已 settled → 清 pending（终态可重放）
     if (ledgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
+      seenPending.add(p.itemId);
       continue;
     }
-    // R34-4：uncertain 且服务端重启后既无 active 也无 ledger →
-    // 保留占位让用户同 id 重试（不得当幽灵清掉）
+    // R34-4 / R36-4：uncertain 且服务端重启丢 ledger → 保留可同 id 重试
     if (phase === "uncertain") {
       nextPending.push(p);
+      seenPending.add(p.itemId);
       continue;
     }
-    // 真幽灵（断线丢终态且 ledger 也无）
+    // R36-4：真幽灵——无 snapshot 证据也无终态 → uncertain/unknown，绝不 delivered
     ghostIds.push(p.itemId);
+    nextPending.push({
+      ...p,
+      uncertain: true,
+      phase: "uncertain" as const,
+    });
+    seenPending.add(p.itemId);
   }
-  nextSettled = rememberSettledItemIds(nextSettled, ghostIds);
+
+  // R36-10：bootstrap snapshot 重建本地没有的 active/persisted 条目
+  for (const snap of operationSnapshot) {
+    if (!snap.itemId || !isMessageOpActivePhase(snap.phase)) continue;
+    if (seenPending.has(snap.itemId) || settledSet.has(snap.itemId)) continue;
+    if (ledgerSet.has(snap.itemId)) continue;
+    nextPending.push({
+      itemId: snap.itemId,
+      displayText: "",
+      payloadFingerprint: snap.fingerprint ?? "",
+      phase: snap.phase === "persisted" ? "persisted" : "sending",
+      uncertain: false,
+    } as T);
+  }
+
+  // R36-4：ghost 不进 settled（settled 曾被当 delivered 证据）
   return {
     pending: nextPending,
     settled: nextSettled,
@@ -312,7 +401,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
 };
 
 // ---------------------------------------------------------------------------
-// R35-2：统一 Operation reducer
+// R35-2 / R36-2：统一 Operation reducer
 // ---------------------------------------------------------------------------
 
 export type ChatOpAction =
@@ -326,6 +415,15 @@ export type ChatOpAction =
       type: "queue_state";
       serverItemIds: readonly string[];
       recentSettled?: readonly { itemId: string; outcome?: string }[];
+      /** R36-4：完整 operation snapshot（含 accepting/persisted） */
+      operationSnapshot?: readonly MessageOpSnapshotEntry[];
+    }
+  /** R36-2：显式 operation phase / terminal 帧（成功终态唯一来源之一） */
+  | {
+      type: "message_op";
+      itemId: string;
+      phase?: string;
+      outcome?: string;
     }
   | { type: "http_queued"; itemId: string }
   | { type: "http_direct_ok"; itemId: string }
@@ -344,7 +442,7 @@ export type ChatOpReduceResult = {
   /**
    * R35-2：http_reject_network 仲裁——
    * true = 已 delivered，调用方清草稿返回 true；
-   * false = failed / uncertain，保留草稿。
+   * false = failed / uncertain / unknown，保留草稿。
    */
   clearDraft?: boolean;
   ghostIds?: string[];
@@ -364,15 +462,18 @@ const asOperations = <T extends PendingLocalReplyLike>(
     itemId: p.itemId,
     payloadFingerprint: p.payloadFingerprint ?? "",
     phase: (p.phase ??
-      (p.uncertain ? "uncertain" : "sending")) as "sending" | "uncertain",
+      (p.uncertain ? "uncertain" : "sending")) as
+      | "sending"
+      | "uncertain"
+      | "persisted",
     displayText: p.displayText,
     text: p.displayText,
     id: p.itemId,
   }));
 
 /**
- * R35-2：HTTP / SSE / queue 全量提交到同一 reducer。
- * fetch reject 时查终态：delivered → clearDraft；failed → 保留草稿；无 → uncertain。
+ * R35-2 / R36-2：HTTP / SSE / queue 全量提交到同一 reducer。
+ * fetch reject 时查终态：仅明确 delivered → clearDraft；其余保留草稿。
  */
 export const reduceChatOperation = (
   state: ChatOpState,
@@ -395,19 +496,12 @@ export const reduceChatOperation = (
       };
     }
     case "user_reply": {
-      const qid =
-        typeof action.ev.meta?.queueItemId === "string"
-          ? action.ev.meta.queueItemId
-          : null;
-      const { pending, settled } = applyUserReplyTerminal(
+      // R36-2：只标 persisted，不写 delivered、不进 settled
+      const pending = markPendingPersistedByUserReply(
         state.pending,
-        state.settled,
         action.ev,
       );
-      const outcomes = qid
-        ? rememberOutcome(state.outcomes, qid, "delivered")
-        : state.outcomes;
-      return { state: { pending, settled, outcomes } };
+      return { state: { ...state, pending } };
     }
     case "queue_failed": {
       const { pending, settled } = applyQueueFailedTerminal(
@@ -417,8 +511,53 @@ export const reduceChatOperation = (
       );
       const outcomes = rememberOutcomes(
         state.outcomes,
-        action.itemIds.map((itemId) => ({ itemId, outcome: "failed" as const })),
+        action.itemIds.map((itemId) => ({
+          itemId,
+          outcome: "failed" as const,
+        })),
       );
+      return { state: { pending, settled, outcomes } };
+    }
+    case "message_op": {
+      // R36-2：显式 phase / outcome 帧
+      const { itemId } = action;
+      if (!itemId) return { state };
+
+      // 非终态 phase
+      if (action.phase === "accepting" || action.phase === "persisted") {
+        const pending = state.pending.map((p) =>
+          p.itemId === itemId
+            ? {
+                ...p,
+                phase:
+                  action.phase === "persisted"
+                    ? ("persisted" as const)
+                    : ("sending" as const),
+                uncertain: false,
+              }
+            : p,
+        );
+        // 本地尚无条目时（跨路由恢复前）——仅 phase 更新不凭空建（等 snapshot）
+        return { state: { ...state, pending } };
+      }
+
+      // handedOff 或 outcome → 终态
+      const rawOutcome =
+        action.outcome ??
+        (action.phase === "handedOff" ? "delivered" : undefined);
+      if (rawOutcome == null && action.phase !== "handedOff") {
+        return { state };
+      }
+      const outcome = normalizeLedgerOutcome(
+        rawOutcome ?? "delivered",
+      );
+      const { pending, settled } = dropPendingByItemId(
+        state.pending,
+        state.settled,
+        itemId,
+        { rememberSettled: true },
+      );
+      const outcomes = rememberOutcome(state.outcomes, itemId, outcome);
       return { state: { pending, settled, outcomes } };
     }
     case "queue_state": {
@@ -427,6 +566,7 @@ export const reduceChatOperation = (
         state.settled,
         action.serverItemIds,
         action.recentSettled,
+        action.operationSnapshot,
       );
       let outcomes = state.outcomes;
       for (const e of action.recentSettled ?? []) {
@@ -437,10 +577,8 @@ export const reduceChatOperation = (
           normalizeLedgerOutcome(e.outcome),
         );
       }
-      // 幽灵按 delivered 记（挡迟到 202；与旧 rememberSettled 语义一致）
-      for (const id of ghostIds) {
-        outcomes = rememberOutcome(outcomes, id, "delivered");
-      }
+      // R36-4：ghost 只标 uncertain（上面 reconcile 已做），不写 outcomes——
+      // 避免 unknown 占坑挡后到的真终态；绝不写 delivered
       return { state: { pending, settled, outcomes }, ghostIds };
     }
     case "http_queued": {
@@ -457,19 +595,26 @@ export const reduceChatOperation = (
         state: {
           ...state,
           pending: state.pending.map((p) =>
-            p.itemId === action.itemId ? { ...p, phase: "sending" as const } : p,
+            p.itemId === action.itemId
+              ? { ...p, phase: "sending" as const, uncertain: false }
+              : p,
           ),
         },
       };
     }
     case "http_direct_ok": {
-      // 200 非 queued：摘预登记；真实气泡走 SSE（可能已 settled）
-      const { pending, settled } = dropPendingByItemId(
-        state.pending,
-        state.settled,
-        action.itemId,
-      );
-      return { state: { ...state, pending, settled } };
+      // R36-2：200 非 queued 仅表示受理中——保留 pending 等 user_reply/message_op
+      // （旧逻辑摘 pending 会丢 ledger，导致 persisted 无法对账）
+      return {
+        state: {
+          ...state,
+          pending: state.pending.map((p) =>
+            p.itemId === action.itemId
+              ? { ...p, phase: "sending" as const, uncertain: false }
+              : p,
+          ),
+        },
+      };
     }
     case "http_settled": {
       const outcome = normalizeLedgerOutcome(action.outcome);
@@ -498,23 +643,17 @@ export const reduceChatOperation = (
       };
     }
     case "http_reject_network": {
-      // R35-2：SSE 终态先到时不得误标 uncertain / 保留草稿
+      // R36-2/3：仅明确 delivered 才清草稿；settled 无 outcome / unknown 不得当成功
       const outcome = state.outcomes[action.itemId];
-      if (outcome === "failed") {
+      if (outcome === "failed" || outcome === "unknown") {
         return { state, clearDraft: false };
       }
-      if (outcome === "delivered" || isItemSettled(state.settled, action.itemId)) {
-        // settled 但无显式 outcome → 按 delivered（user_reply / ghost）
-        const outcomes = rememberOutcome(
-          state.outcomes,
-          action.itemId,
-          "delivered",
-        );
+      if (outcome === "delivered") {
         const pending = state.pending.filter(
           (p) => p.itemId !== action.itemId,
         );
         return {
-          state: { ...state, pending, outcomes },
+          state: { ...state, pending },
           clearDraft: true,
         };
       }
@@ -536,15 +675,16 @@ export const reduceChatOperation = (
       return { state: { ...state, pending, settled }, clearDraft: false };
     }
     case "done_clear": {
+      // R36-2：按已有 outcome 对账，不猜每条成功
       const { pending, settled, clearedIds } = applyDoneClearPending(
         state.pending,
         state.settled,
+        state.outcomes,
       );
-      let outcomes = state.outcomes;
-      for (const id of clearedIds) {
-        outcomes = rememberOutcome(outcomes, id, "delivered");
-      }
-      return { state: { pending, settled, outcomes }, clearedIds };
+      return {
+        state: { ...state, pending, settled },
+        clearedIds,
+      };
     }
     case "clear_all": {
       return { state: emptyChatOpState() };

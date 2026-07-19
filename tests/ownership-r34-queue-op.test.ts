@@ -332,16 +332,22 @@ describe("R33-1：挂起 202 × 旁路终态", () => {
     }
   });
 
-  it("① onDone 清 pending 记 settled → 晚到 202 不插幽灵", () => {
+  it("① onDone 无终态 → 标 uncertain（不猜 delivered）", () => {
+    // R36-2：done_clear 只清已有明确终态；无 outcome 保持可对账
     const itemId = "cq_done_settle";
-    let pending = [{ itemId, displayText: "x" }];
+    let pending: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId, displayText: "x" }];
     let settled: string[] = [];
-    const done = applyDoneClearPending(pending, settled);
+    const done = applyDoneClearPending(pending, settled, {});
     pending = done.pending;
     settled = done.settled;
-    expect(pending).toHaveLength(0);
-    expect(settled).toContain(itemId);
-    expect(shouldInsertPendingAfter202(settled, itemId)).toBe(false);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.phase).toBe("uncertain");
+    expect(done.clearedIds).toHaveLength(0);
+    expect(settled).not.toContain(itemId);
   });
 });
 
@@ -456,15 +462,23 @@ describe("R33-1：SSE 断线 + recentSettled bootstrap", () => {
 });
 
 describe("R33-1：两 tab 同文案 id 化", () => {
-  it("③ 同 displayText → user_reply / queue_failed 只清目标 item", () => {
-    const tabA = [{ itemId: "tab_a", displayText: "same" }];
-    const tabB = [{ itemId: "tab_b", displayText: "same" }];
-    expect(
-      applyUserReplyTerminal(tabA, [], {
-        text: "same",
-        meta: { queueItemId: "tab_a" },
-      }).pending,
-    ).toEqual([]);
+  it("③ 同 displayText → user_reply / queue_failed 只动目标 item", () => {
+    // R36-2：user_reply → persisted；queue_failed 才摘 pending
+    const tabA: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: "tab_a", displayText: "same" }];
+    const tabB: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: "tab_b", displayText: "same" }];
+    const aUr = applyUserReplyTerminal(tabA, [], {
+      text: "same",
+      meta: { queueItemId: "tab_a" },
+    }).pending;
+    expect(aUr[0]?.phase).toBe("persisted");
     expect(
       applyUserReplyTerminal(tabB, [], {
         text: "same",

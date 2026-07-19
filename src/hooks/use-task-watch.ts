@@ -49,7 +49,10 @@ import {
   watchTaskStream,
   type TaskStreamCallbacks,
 } from "@/lib/task-store";
+import { classifyWatchHttpStatus } from "@/lib/task-terminal";
 import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
+
+export { classifyWatchHttpStatus };
 
 // 被动断流后重连退避：干净结束（maxDuration 到点）等这么久再连
 const RECONNECT_DELAY_MS = 1000;
@@ -69,14 +72,27 @@ export interface UseTaskWatchCallbacks {
   onWatchException?: (err: Error) => void;
   /** R31-1：queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
-  /** R32-2 / R33-1：bootstrap queue_state → 对账清幽灵 pending（含 recentSettled） */
+  /** R32-2 / R33-1 / R36-4：bootstrap queue_state + operationSnapshot */
   onQueueState?: (
     itemIds: string[],
     recentSettled?: Array<{ itemId: string; outcome: string }>,
+    operationSnapshot?: Array<{
+      itemId: string;
+      phase: string;
+      fingerprint?: string;
+    }>,
   ) => void;
   /**
-   * R33-4 / R35-5：task_deleted → 停重连。
-   * 调用方必须把此回调接到 `commitTaskDeleted`（与 404/410 同一 sink）。
+   * R36-2：显式 message_op 帧（phase / outcome）——成功终态唯一来源之一。
+   */
+  onMessageOp?: (payload: {
+    itemId: string;
+    phase?: string;
+    outcome?: string;
+  }) => void;
+  /**
+   * R33-4 / R35-5 / R36-7：task_deleted / watch 410 → 停重连。
+   * 调用方接到 `commitTaskDeleted`；503/404 不可走此 sink。
    */
   onTaskDeleted?: (taskId: string) => void;
 }
@@ -160,9 +176,17 @@ export const useTaskWatch = (
             if (cancelled) return;
             callbacksRef.current.onQueueFailed?.(itemIds, reason);
           },
-          onQueueState: (itemIds, recentSettled) => {
+          onQueueState: (itemIds, recentSettled, operationSnapshot) => {
             if (cancelled) return;
-            callbacksRef.current.onQueueState?.(itemIds, recentSettled);
+            callbacksRef.current.onQueueState?.(
+              itemIds,
+              recentSettled,
+              operationSnapshot,
+            );
+          },
+          onMessageOp: (payload) => {
+            if (cancelled) return;
+            callbacksRef.current.onMessageOp?.(payload);
           },
           onTaskDeleted: (deletedId) => {
             if (cancelled) return;
@@ -181,12 +205,16 @@ export const useTaskWatch = (
           ) {
             return;
           }
-          // R35-5：404/410 = 任务已删 → 与在线 task_deleted 帧同一 onTaskDeleted → commitTaskDeleted
+          // R36-7：仅 410 = deleted → commit；503/404 = unavailable → 重试不 commit
           const status =
             err instanceof ApiRequestError
               ? err.status
               : (err as { status?: number }).status;
-          if (status === 404 || status === 410) {
+          const kind =
+            typeof status === "number"
+              ? classifyWatchHttpStatus(status)
+              : "retryable";
+          if (kind === "deleted") {
             gotTaskDeleted = true;
             if (!cancelled) {
               callbacksRef.current.onTaskDeleted?.(taskId);
@@ -198,11 +226,11 @@ export const useTaskWatch = (
                 callbacksRef.current.onWatchException?.(err as Error);
               return;
             }
-            // 否则静默重试（不弹 toast、避免抖一下就报错刷屏）
+            // unavailable / 网络错：静默重试（不弹 toast、不 commit deleted）
           }
         }
 
-        // 终态 done / task_deleted / 404·410（服务端已关流）→ 停止订阅
+        // 终态 done / task_deleted / 410（服务端已关流）→ 停止订阅
         if (cancelled || gotTerminalDone || gotTaskDeleted) return;
 
         // 被动断流（maxDuration 到点 / 网络抖 / 服务端重启）→ 退避后重连

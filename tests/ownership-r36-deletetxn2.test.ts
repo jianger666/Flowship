@@ -333,7 +333,10 @@ describe("R36 DeleteTxn durable descriptor + 三态读", () => {
     const rebuilt = await resolveCheckpointRefManifestForDelete(id, []);
     expect(rebuilt.ok).toBe(false);
     if (rebuilt.ok) throw new Error("must not return ok-empty");
-    expect(rebuilt.error).toMatch(/R35-3|empty repoPaths|taskDir missing/i);
+    // R36-6：meta absent + 空 rewind → 不得 confirmedEmpty（文案含 R36-6 / empty rewind）
+    expect(rebuilt.error).toMatch(
+      /R35-3|R36-6|empty repoPaths|taskDir missing|empty rewind/i,
+    );
 
     // recover 路径：journal committed+manifestPending+空 repoPaths、无 taskDir
     await writeDeletionJournal(id, {
@@ -366,7 +369,7 @@ describe("R36 DeleteTxn durable descriptor + 三态读", () => {
       // 保留 taskDir（不写 tombstone），模拟 fast path committed 后证据读失败
       expect(assertTaskReadable(id)).toBe(false);
 
-      // 同步 journal read → EACCES：detail/list 隐藏
+      // R36-7：同步 journal EACCES → unavailable → detail 503（非 410 sticky deleted）
       setDeletionEvidenceReadInjectorForTest((op) => {
         if (op === "journalSync") throw errno("EACCES");
       });
@@ -375,22 +378,20 @@ describe("R36 DeleteTxn durable descriptor + 三态读", () => {
         new Request(`http://local/api/tasks/${id}`),
         { params: Promise.resolve({ id }) },
       );
-      expect(detail.status).toBe(404);
+      expect(detail.status).toBe(503);
       const listRes = await GET_LIST();
       expect(listRes.status).toBe(200);
       const listBody = (await listRes.json()) as { tasks: { id: string }[] };
       expect(listBody.tasks.some((t) => t.id === id)).toBe(false);
 
-      // 异步 journal read → EIO：DELETE catch / phase 判断走 recoveryPending
+      // R36-7：入场 journal EIO → 503、不进删除、phase 不倒退
       setDeletionEvidenceReadInjectorForTest((op) => {
         if (op === "journalAsync") throw errno("EIO");
       });
       const del1 = await DELETE(new Request("http://local/api/tasks/" + id), {
         params: Promise.resolve({ id }),
       });
-      expect(del1.status).toBe(202);
-      const del1Body = (await del1.json()) as { recoveryPending?: boolean };
-      expect(del1Body.recoveryPending).toBe(true);
+      expect(del1.status).toBe(503);
 
       // 关闭注入后 phase 仍为 committed（未倒退到 prepared / 未删 journal）
       setDeletionEvidenceReadInjectorForTest(null);
@@ -399,7 +400,7 @@ describe("R36 DeleteTxn durable descriptor + 三态读", () => {
       if (jAfter.kind !== "present") throw new Error("expected present");
       expect(jAfter.value.phase).toBe("committed");
 
-      // tombstone access → EACCES：同步闸隐藏；DELETE 仍 recoveryPending
+      // tombstone access → EACCES：同步闸隐藏；DELETE 入场 503
       await fs.writeFile(
         path.join(taskDir(id), ".deleted-tombstone"),
         JSON.stringify({ deletedAt: Date.now() }),
@@ -414,7 +415,7 @@ describe("R36 DeleteTxn durable descriptor + 三态读", () => {
       const del2 = await DELETE(new Request("http://local/api/tasks/" + id), {
         params: Promise.resolve({ id }),
       });
-      expect(del2.status).toBe(202);
+      expect(del2.status).toBe(503);
       setDeletionEvidenceReadInjectorForTest(null);
       const jFinal = await readDeletionJournal(id);
       expect(jFinal.kind).toBe("present");

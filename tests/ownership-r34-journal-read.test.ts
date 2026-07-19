@@ -479,7 +479,7 @@ describe("R34 DeleteJournal + read commit guard", () => {
     expect(await p).toBeNull();
   });
 
-  it("⑥c watch bootstrap 挂起后删除 → 404", async () => {
+  it("⑥c watch bootstrap 挂起后删除 → 410", async () => {
     const id = alloc();
     await writeMeta(makeMeta(id));
     const hang = installHangingFailpoint("getTaskWithTailEvents.afterHydrate");
@@ -493,7 +493,8 @@ describe("R34 DeleteJournal + read commit guard", () => {
     await writeDeleteTombstone(id);
     hang.release();
     const res = await p;
-    expect(res.status).toBe(404);
+    // R36-7：committed/tombstone → 410 task_deleted（非 404）
+    expect(res.status).toBe(410);
   });
 
   it("⑦ DELETE 后既有 watcher 收到 task_deleted 并关流", async () => {

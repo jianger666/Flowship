@@ -1,12 +1,12 @@
 /**
- * R35-5：client TaskTerminalCoordinator（sticky deleted）
+ * R35-5 / R36-7：client TaskTerminalCoordinator（sticky deleted）
  *
  * 进程内唯一 terminal identity：同 taskId 一旦 deleted，迟到的 detail / list /
  * chat mutation 200 一律不得复活 UI。挂 globalThis 防 route-chunk / HMR 分裂。
  *
  * 三个入口只调 `commitTaskDeleted`：
  * 1) SSE `task_deleted` 帧
- * 2) watch 初次/重连 404/410
+ * 2) watch 410（明确 committed delete；503/404 unavailable 不得走此 sink）
  * 3) 本 tab DELETE 成功
  */
 
@@ -38,6 +38,20 @@ const getStore = (): TaskTerminalStore => {
     };
   }
   return g[GLOBAL_KEY];
+};
+
+/**
+ * R36-7：watch HTTP 状态 → visibility。
+ * - 410 = 明确 deleted（可 commit sticky）
+ * - 503 / 404 = unavailable（旧 404 过渡语义；重试、不 commit）
+ * - 其它 = 可重试
+ */
+export const classifyWatchHttpStatus = (
+  status: number,
+): "deleted" | "unavailable" | "retryable" => {
+  if (status === 410) return "deleted";
+  if (status === 503 || status === 404) return "unavailable";
+  return "retryable";
 };
 
 /** R35-5：同 id 是否已进入 deleted terminal（sticky） */

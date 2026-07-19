@@ -526,7 +526,8 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       });
       hang.release();
       const res = await p;
-      expect(res.status).toBe(404);
+      // R36-7：committed → 410（非 404）
+      expect(res.status).toBe(410);
       await fs.unlink(getDeletionJournalPath(id)).catch(() => {});
     }
 
@@ -568,7 +569,8 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       });
       hang.release();
       const res = await p;
-      expect(res.status).toBe(404);
+      // R36-7：committed → 410
+      expect(res.status).toBe(410);
       await fs.unlink(getDeletionJournalPath(id)).catch(() => {});
     }
   });

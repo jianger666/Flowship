@@ -246,7 +246,7 @@ const readWatchQueueState = async (
 };
 
 /**
- * R34-5：模拟 useTaskWatch catch 分支——404/410 → deletion sink，不累计 failures。
+ * R36-7：模拟 useTaskWatch catch——仅 410 → deletion sink；404/503 = unavailable 重试。
  * （hook 本身依赖 React；此处锁定与实现一致的决策契约）
  */
 const resolveWatchCatchAsDeletion = (
@@ -256,9 +256,10 @@ const resolveWatchCatchAsDeletion = (
     err instanceof ApiRequestError
       ? err.status
       : (err as { status?: number }).status;
-  if (status === 404 || status === 410) {
+  if (status === 410) {
     return { deleted: true, shouldRetry: false };
   }
+  // 404/503/网络错 → 重试，不 commit deleted
   return { deleted: false, shouldRetry: true };
 };
 
@@ -492,8 +493,16 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
     }
 
     // 前端两 tab pending
-    let pendingA = [{ itemId: tabA, displayText: sameText }];
-    let pendingB = [{ itemId: tabB, displayText: sameText }];
+    let pendingA: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: tabA, displayText: sameText }];
+    let pendingB: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: tabB, displayText: sameText }];
     let settledA: string[] = [];
     let settledB: string[] = [];
 
@@ -508,20 +517,28 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
     const b1 = applyUserReplyTerminal(pendingB, settledB, ev);
     pendingB = b1.pending;
     settledB = b1.settled;
-    expect(pendingA).toHaveLength(0);
+    // R36-2：user_reply → 标 persisted，不摘 pending / 不记 settled
+    expect(pendingA).toHaveLength(1);
+    expect(pendingA[0]?.phase).toBe("persisted");
+    expect(settledA).not.toContain(tabA);
     expect(pendingB).toEqual([{ itemId: tabB, displayText: sameText }]);
 
-    // B 自己的终态
+    // B 自己的 user_reply → 同样 persisted
     const b2 = applyUserReplyTerminal(pendingB, settledB, {
       text: sameText,
       meta: { queueItemId: tabB },
     });
-    expect(b2.pending).toHaveLength(0);
-    expect(b2.settled).toContain(tabB);
+    expect(b2.pending).toHaveLength(1);
+    expect(b2.pending[0]?.phase).toBe("persisted");
+    expect(b2.settled).not.toContain(tabB);
   });
 
   it("③ 无 id 旧事件仍可按 displayText 兜底（兼容）", () => {
-    const prev = [
+    const prev: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [
       { itemId: "old_1", displayText: "legacy" },
       { itemId: "old_2", displayText: "legacy" },
     ];
@@ -529,8 +546,13 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
       text: "legacy",
       meta: null,
     });
-    // 只清第一条文案匹配
-    expect(next.pending).toEqual([{ itemId: "old_2", displayText: "legacy" }]);
+    // R36-2：只把第一条文案匹配标为 persisted
+    expect(next.pending[0]?.phase).toBe("persisted");
+    expect(next.pending[0]?.itemId).toBe("old_1");
+    expect(next.pending[1]).toEqual({
+      itemId: "old_2",
+      displayText: "legacy",
+    });
   });
 });
 
@@ -719,8 +741,8 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     expect(streaming).toBe("");
   });
 
-  it("⑤ 断线错过帧 → watch 404 走同一 deletion sink（不重试）", async () => {
-    // 先删任务目录模拟不可读
+  it("⑤ 断线错过帧 → watch 404 unavailable 可重试；410 才 deletion sink", async () => {
+    // 先删任务目录模拟不可读（当前 server 仍可能回 404；client 按 unavailable）
     await fs.rm(taskDir(TASK_ID), { recursive: true, force: true });
 
     const res = await watchTaskGet(
@@ -731,11 +753,11 @@ describe("R34-5：task_deleted 统一 terminal reducer", () => {
     );
     expect(res.status).toBe(404);
 
-    // hook 决策：404 → deleted、不重试
+    // R36-7：404 → unavailable、可重试、不 commit deleted
     const decision = resolveWatchCatchAsDeletion(
       new ApiRequestError("not_found", 404),
     );
-    expect(decision).toEqual({ deleted: true, shouldRetry: false });
+    expect(decision).toEqual({ deleted: false, shouldRetry: true });
 
     const d410 = resolveWatchCatchAsDeletion(
       new ApiRequestError("gone", 410),

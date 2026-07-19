@@ -12,6 +12,7 @@ import { NextResponse } from "next/server";
 import {
   commitReadableTaskResponse,
   getTaskEventsBefore,
+  taskVisibilityErrorResponse,
 } from "@/lib/server/task-fs";
 import { failpoint } from "@/lib/server/failpoints";
 import { MAX_EVENTS_PAGE } from "@/lib/server/task-fs-core";
@@ -42,7 +43,8 @@ export const GET = async (req: Request, { params }: Ctx) => {
     // R34-3：HTTP 提交点同步复查
     await failpoint("httpRead.afterHelper");
     if (!page) {
-      return NextResponse.json({ error: "not_found" }, { status: 404 });
+      // R36-7：deleted→410 / unavailable→503 / 其余 404
+      return taskVisibilityErrorResponse(id);
     }
     return commitReadableTaskResponse(id, () => page);
   } catch (err) {

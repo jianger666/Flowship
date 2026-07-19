@@ -260,13 +260,15 @@ const setupIdleSession = async () => {
 };
 
 describe("R32-1：SSE 终态早于 202 → settledItemIds 不插永久 pending", () => {
-  it("① success：user_reply 先到 → 202 后到 → pending=0", () => {
+  it("① success：user_reply 先到 → 非终态（persisted）；queue_failed 仍可终态清零", () => {
+    // R36-2：user_reply 不再记 settled/delivered；仅 queue_failed 等真终态挡 202
     const { pending, settled } = simulateSseThen202("cq_success", {
       kind: "user_reply",
       text: "hello",
     });
-    expect(settled).toContain("cq_success");
-    expect(pending).toHaveLength(0);
+    // 空 pending 上 user_reply 无法标 persisted；settled 也不占坑 → 202 仍可插
+    expect(settled).not.toContain("cq_success");
+    expect(pending).toHaveLength(1);
   });
 
   it("① EIO：queue_failed 先到 → 202 后到 → pending=0", () => {
@@ -485,14 +487,26 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
 });
 
 describe("R32-2：两 tab 同文案 + queue-priority head 带 id", () => {
-  it("③ 前端：同 displayText 两条 → user_reply 带 id 只清精确那条", () => {
-    const tabA = [{ itemId: "tab_a", displayText: "same-text" }];
-    const tabB = [{ itemId: "tab_b", displayText: "same-text" }];
+  it("③ 前端：同 displayText 两条 → user_reply 带 id 只标精确那条 persisted", () => {
+    // R36-2：user_reply 非终态——标 persisted，不摘 pending
+    const tabA: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: "tab_a", displayText: "same-text" }];
+    const tabB: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [{ itemId: "tab_b", displayText: "same-text" }];
     const ev = {
       text: "same-text",
       meta: { queueItemId: "tab_a" },
     };
-    expect(applyUserReplyTerminal(tabA, [], ev).pending).toEqual([]);
+    const a = applyUserReplyTerminal(tabA, [], ev).pending;
+    expect(a).toHaveLength(1);
+    expect(a[0]?.itemId).toBe("tab_a");
+    expect(a[0]?.phase).toBe("persisted");
     expect(applyUserReplyTerminal(tabB, [], ev).pending).toEqual(tabB);
   });
 
@@ -559,17 +573,23 @@ describe("R32-2：SSE bootstrap queue_state 对账", () => {
     clearChatQueue(TASK_ID);
   });
 
-  it("④ reconcile：不在 server 集合且无终态 → 幽灵清除并记 settled", () => {
-    const pending = [
+  it("④ reconcile：不在 server 集合且无终态 → ghost 标 uncertain（不写 delivered）", () => {
+    // R36-4：无 snapshot 证据不得推导 delivered / settled
+    const pending: Array<{
+      itemId: string;
+      displayText: string;
+      phase?: "sending" | "uncertain" | "persisted";
+    }> = [
       { itemId: "alive", displayText: "ok" },
       { itemId: "ghost", displayText: "gone" },
     ];
     const r = reconcilePendingWithQueueState(pending, [], ["alive"]);
-    expect(r.pending).toEqual([{ itemId: "alive", displayText: "ok" }]);
+    expect(r.pending.map((p) => p.itemId)).toEqual(["alive", "ghost"]);
+    expect(r.pending.find((p) => p.itemId === "ghost")?.phase).toBe(
+      "uncertain",
+    );
     expect(r.ghostIds).toEqual(["ghost"]);
-    expect(r.settled).toContain("ghost");
-    // 迟到 202 不得再插幽灵
-    expect(shouldInsertPendingAfter202(r.settled, "ghost")).toBe(false);
+    expect(r.settled).not.toContain("ghost");
   });
 
   it("④ watch-task bootstrap 发出 queue_state", async () => {

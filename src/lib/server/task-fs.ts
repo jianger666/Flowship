@@ -100,6 +100,7 @@ import {
   readEventsBefore,
   readMetaRaw,
   readMetaV06,
+  readMetaV06EvidenceSync,
   taskDir,
   withTaskLock,
   prepareMetaWrite,
@@ -221,7 +222,80 @@ export const setDeletionEvidenceReadInjectorForTest = (
 const isEnoent = (err: unknown): boolean =>
   (err as NodeJS.ErrnoException)?.code === "ENOENT";
 
-/** R35-4：异步读 deletion journal（三态） */
+/**
+ * R36-9：deletion journal 完整 runtime schema——不用 TS cast 代替磁盘校验。
+ * phase ∈ {prepared,committed}；checkpointRefs 元素须有 repoPath+refs[]；
+ * repoPaths 须字符串数组；manifestPending/confirmedEmpty 类型正确。
+ * 任何未知 phase / 字段形状 → null（调用方返 unknown、fail-closed）。
+ */
+const isJournalRefEntry = (e: unknown): boolean => {
+  if (!e || typeof e !== "object") return false;
+  const o = e as Record<string, unknown>;
+  return (
+    typeof o.repoPath === "string" &&
+    Array.isArray(o.refs) &&
+    o.refs.every((r) => typeof r === "string")
+  );
+};
+
+const parseDeletionJournalValue = (
+  parsed: unknown,
+): CheckpointRefManifest | null => {
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.deletedAt !== "number" || !Number.isFinite(o.deletedAt)) {
+    return null;
+  }
+  if (!Array.isArray(o.checkpointRefs) || !o.checkpointRefs.every(isJournalRefEntry)) {
+    return null;
+  }
+  // R36-9：phase 必须显式且合法——缺省 / typo（commited）一律非法
+  if (o.phase !== "prepared" && o.phase !== "committed") return null;
+  if (
+    o.manifestPending !== undefined &&
+    typeof o.manifestPending !== "boolean"
+  ) {
+    return null;
+  }
+  if (
+    o.confirmedEmpty !== undefined &&
+    typeof o.confirmedEmpty !== "boolean"
+  ) {
+    return null;
+  }
+  if (o.repoPaths !== undefined) {
+    if (
+      !Array.isArray(o.repoPaths) ||
+      !o.repoPaths.every((p) => typeof p === "string")
+    ) {
+      return null;
+    }
+  }
+  if (o.refsPending !== undefined) {
+    if (
+      !Array.isArray(o.refsPending) ||
+      !o.refsPending.every(isJournalRefEntry)
+    ) {
+      return null;
+    }
+  }
+  return {
+    deletedAt: o.deletedAt,
+    checkpointRefs: o.checkpointRefs as CheckpointRefManifest["checkpointRefs"],
+    phase: o.phase,
+    ...(o.refsPending
+      ? {
+          refsPending:
+            o.refsPending as CheckpointRefManifest["refsPending"],
+        }
+      : {}),
+    ...(o.manifestPending === true ? { manifestPending: true } : {}),
+    ...(Array.isArray(o.repoPaths) ? { repoPaths: o.repoPaths as string[] } : {}),
+    ...(o.confirmedEmpty === true ? { confirmedEmpty: true } : {}),
+  };
+};
+
+/** R35-4 / R36-9：异步读 deletion journal（三态 + 完整 schema） */
 export const readDeletionJournal = async (
   taskId: string,
 ): Promise<DeletionEvidenceRead<CheckpointRefManifest>> => {
@@ -229,16 +303,26 @@ export const readDeletionJournal = async (
   try {
     deletionEvidenceReadInjector?.("journalAsync", p);
     const raw = await fs.readFile(p, "utf-8");
-    const parsed = JSON.parse(raw) as CheckpointRefManifest;
-    if (!parsed || !Array.isArray(parsed.checkpointRefs)) {
-      const err = new Error("invalid deletion journal shape");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
       console.error(
-        `[task-fs] R35-4 读 deletion journal 形状非法 id=${taskId}`,
+        `[task-fs] R36-9 读 deletion journal JSON 损坏 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
     }
-    return { kind: "present", value: parsed };
+    const value = parseDeletionJournalValue(parsed);
+    if (!value) {
+      const err = new Error("invalid deletion journal schema");
+      console.error(
+        `[task-fs] R36-9 读 deletion journal schema 非法 id=${taskId}`,
+        err,
+      );
+      return { kind: "unknown", error: err };
+    }
+    return { kind: "present", value };
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
@@ -249,7 +333,7 @@ export const readDeletionJournal = async (
   }
 };
 
-/** R35-4：同步读 deletion journal（三态；HTTP 读闸用） */
+/** R35-4 / R36-9：同步读 deletion journal（三态 + 完整 schema；HTTP 读闸用） */
 const readDeletionJournalSync = (
   taskId: string,
 ): DeletionEvidenceRead<CheckpointRefManifest> => {
@@ -258,16 +342,26 @@ const readDeletionJournalSync = (
     deletionEvidenceReadInjector?.("journalSync", p);
     // 不用 existsSync：它对 EACCES 常返回 false（fail-open）
     const raw = readFileSync(p, "utf-8");
-    const parsed = JSON.parse(raw) as CheckpointRefManifest;
-    if (!parsed || !Array.isArray(parsed.checkpointRefs)) {
-      const err = new Error("invalid deletion journal shape");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
       console.error(
-        `[task-fs] R35-4 sync 读 journal 形状非法 id=${taskId}`,
+        `[task-fs] R36-9 sync 读 journal JSON 损坏 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
     }
-    return { kind: "present", value: parsed };
+    const value = parseDeletionJournalValue(parsed);
+    if (!value) {
+      const err = new Error("invalid deletion journal schema");
+      console.error(
+        `[task-fs] R36-9 sync 读 journal schema 非法 id=${taskId}`,
+        err,
+      );
+      return { kind: "unknown", error: err };
+    }
+    return { kind: "present", value };
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
@@ -777,36 +871,55 @@ const ensureBootRecovery = async (): Promise<void> => {
 // ----------------- 公开 API：list / get / create / delete -----------------
 
 /**
- * R33-4 / R35-4：统一读提交闸（同步）——三态 fail-closed。
- * - tombstone/journal unknown → 隐藏任务 + 诊断
- * - present(tombstone) 或 present(committed journal) → 隐藏
- * - absent（仅 ENOENT）→ 可读；prepared journal 仍可读
- * list / get-tail / events / watch bootstrap 在最后一个 await 后、返回前调用。
+ * R36-7：TaskVisibility——DeleteEvidence 与对外可见性分离。
+ * - deleted：committed journal / tombstone present（不可逆终态）
+ * - unavailable：证据 unknown（EACCES/EIO/schema 非法）或 meta 读未知
+ * - readable：删除证据明确非终态，且 meta 非 unknown
+ * list/detail 对 deleted/unavailable 均 fail-closed 隐藏；HTTP 语义再分流 410 vs 503。
  */
-export const assertTaskReadable = (taskId: string): boolean => {
+export type TaskVisibility = "readable" | "deleted" | "unavailable";
+
+export const getTaskVisibility = (taskId: string): TaskVisibility => {
   const tomb = probeDeleteTombstoneSync(taskId);
   if (tomb.kind === "unknown") {
     console.error(
-      `[task-fs] R35-4 assertTaskReadable: tombstone 未知、fail-closed 隐藏 id=${taskId}`,
+      `[task-fs] R36-7 getTaskVisibility: tombstone 未知 → unavailable id=${taskId}`,
       tomb.error,
     );
-    return false;
+    return "unavailable";
   }
-  if (tomb.kind === "present") return false;
+  if (tomb.kind === "present") return "deleted";
 
   const journal = readDeletionJournalSync(taskId);
   if (journal.kind === "unknown") {
     console.error(
-      `[task-fs] R35-4 assertTaskReadable: journal 未知、fail-closed 隐藏 id=${taskId}`,
+      `[task-fs] R36-7 getTaskVisibility: journal 未知 → unavailable id=${taskId}`,
       journal.error,
     );
-    return false;
+    return "unavailable";
   }
   if (journal.kind === "present" && journal.value.phase === "committed") {
-    return false;
+    return "deleted";
   }
-  return true;
+
+  // R36-7：删除证据 absent（或 prepared）时，meta unknown → unavailable（临时 I/O / schema）
+  const meta = readMetaV06EvidenceSync(taskId);
+  if (meta.kind === "unknown") {
+    console.error(
+      `[task-fs] R36-7 getTaskVisibility: meta 未知 → unavailable id=${taskId}`,
+      meta.error,
+    );
+    return "unavailable";
+  }
+  return "readable";
 };
+
+/**
+ * R33-4 / R35-4 / R36-7：统一读提交闸（同步）——visibility !== readable 即隐藏。
+ * list / get-tail / events / watch bootstrap 在最后一个 await 后、返回前调用。
+ */
+export const assertTaskReadable = (taskId: string): boolean =>
+  getTaskVisibility(taskId) === "readable";
 
 /** R33-4：list 循环结束后最终过滤（防 A push 后 await B 期间 A 被删仍回灌） */
 export const filterCommittedReads = <T extends { id: string }>(
@@ -814,17 +927,56 @@ export const filterCommittedReads = <T extends { id: string }>(
 ): T[] => items.filter((item) => assertTaskReadable(item.id));
 
 /**
- * R34-3：HTTP 提交点同步可读性复查——async helper 返回后、NextResponse.json 之前调用。
+ * R36-7：按 TaskVisibility 映射 HTTP——deleted→410、unavailable→503、其余 not_found→404。
+ */
+export const taskVisibilityErrorResponse = (taskId: string): NextResponse => {
+  const v = getTaskVisibility(taskId);
+  if (v === "deleted") {
+    return NextResponse.json({ error: "task_deleted" }, { status: 410 });
+  }
+  if (v === "unavailable") {
+    return NextResponse.json(
+      { error: "temporarily_unavailable" },
+      { status: 503 },
+    );
+  }
+  return NextResponse.json({ error: "not_found" }, { status: 404 });
+};
+
+/**
+ * R34-3 / R36-7：HTTP 提交点同步可读性复查——async helper 返回后、NextResponse.json 之前调用。
  * helper 内 guard 是防御层；此处才是对外线性化点（防 helper resolve → route continuation 空隙）。
  */
 export const commitReadableTaskResponse = (
   taskId: string,
   buildJson: () => unknown,
 ): NextResponse => {
-  if (!assertTaskReadable(taskId)) {
-    return NextResponse.json({ error: "not_found" }, { status: 404 });
+  const v = getTaskVisibility(taskId);
+  if (v !== "readable") {
+    return taskVisibilityErrorResponse(taskId);
   }
   return NextResponse.json(buildJson());
+};
+
+/**
+ * R36-8：taskDir 存在性三态——仅明确 ENOENT 为 absent。
+ * 目录在即 present（即使 meta 损坏/unknown——R36-6 仍须进事务并 keep pending）。
+ * meta 可读性由 prepareDeleteManifest / buildCheckpointRefManifest 三态处理。
+ */
+export const probeTaskDurablePresence = async (
+  taskId: string,
+): Promise<"absent" | "present" | "unknown"> => {
+  try {
+    await fs.access(taskDir(taskId));
+    return "present";
+  } catch (err) {
+    if (isEnoent(err)) return "absent";
+    console.error(
+      `[task-fs] R36-8 probeTaskDurablePresence: taskDir 未知 id=${taskId}`,
+      err,
+    );
+    return "unknown";
+  }
 };
 
 /**

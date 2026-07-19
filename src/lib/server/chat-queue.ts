@@ -1,5 +1,5 @@
 /**
- * Chat 运行中消息排队（P5.1）+ MessageOperationCoordinator（R35-1 / R35-6）
+ * Chat 运行中消息排队（P5.1）+ MessageOperation aggregate（R35-1 / R35-6 / R36）
  *
  * agent 正在回时 chat-reply 不再 409，消息入 per-task 队列；
  * consumeChatRun 自然结束后 dequeue 依序 send（user_reply 在实际发送时才落）。
@@ -18,15 +18,26 @@
  * - active（队内 + in-flight）+ bounded recentSettled ledger
  * - 所有清队终态只走 failQueuedItems（禁止业务路径直调 clearChatQueue）
  *
- * # R35-1 / R35-6 MessageOperationCoordinator
+ * # R35-1 / R35-6 / R36 MessageOperation aggregate
  *
- * - 同步原子 claim(taskId, clientItemId, payloadFingerprint)——附件落盘前
+ * - 同步原子 claim → 唯一 handle（staged attachments + transfer/settle/release）
  * - phase：accepting → persisted → handedOff（成功终态）| failed 家族（失败终态）
- * - user_reply 落盘只到 persisted；send/firstMessage 接管后才 settle handedOff（对外 delivered）
- * - recordQueueItemSettled 只接受真终态；进程重启不持久化 ledger（与旧约定一致）
+ * - user_reply 落盘只到 persisted；runner 在 SDK send resolve 后才 settle handedOff
+ * - terminal 与 recentSettled 同界淘汰（RECENT_SETTLED_MAX）；淘汰后同 id = absent 新受理
+ * - fingerprint 唯一契约：共享 lib `computeChatPayloadFingerprint`（FNV + imageKeys）
  */
 
-import { createHash } from "node:crypto";
+import { unlinkSync } from "node:fs";
+
+import {
+  computeChatPayloadFingerprint,
+  imageKeysFromPayloads,
+  type ChatSkillRef,
+} from "@/lib/chat-payload-fingerprint";
+import type {
+  MessageOpFailureOutcome,
+  MessageOpOutcome as WireMessageOpOutcome,
+} from "@/lib/message-op-schema";
 
 import type { ImageAttachmentSaved } from "./task-artifacts";
 import type { AttachmentMeta } from "./route-helpers";
@@ -38,30 +49,22 @@ export const CHAT_QUEUE_MAX = 5;
 export const RECENT_SETTLED_MAX = 50;
 
 /**
- * R32-2 / R33-1：清队终态 reason（机器可读，经 queue_failed 下发前端）。
+ * R32-2 / R33-1 / R36-3：清队终态 reason（机器可读，经 queue_failed / message_op 下发前端）。
+ * 单一来源 = 共享 wire schema（`@/lib/message-op-schema`）——client exhaustive decoder
+ * 与 server 枚举编译期绑定，新增失败值只改 schema 一处。
  * - persist_failed：strict 落盘 EIO 等
  * - no_session：会话消失、无法按序送达
  * - task_gone：任务目录消失 / 非 chat
  * - flush_error：checkpoint / send / 后置步骤抛错
- * - stopped / cancelled / error / startup_failed / rewound：旁路清队统一 sink
+ * - stopped / cancelled / error / startup_failed / rewound / deleted：旁路清队统一 sink
  */
-export type FailQueuedItemsReason =
-  | "persist_failed"
-  | "no_session"
-  | "task_gone"
-  | "flush_error"
-  | "stopped"
-  | "cancelled"
-  | "error"
-  | "startup_failed"
-  | "rewound"
-  | "deleted";
+export type FailQueuedItemsReason = MessageOpFailureOutcome;
 
 /**
- * R33-1 / R35-6：ledger 终态 outcome。
+ * R33-1 / R35-6：ledger 终态 outcome（= 共享 schema MessageOpOutcome）。
  * delivered = handedOff（agent 已真正接管），绝不是「仅有 user_reply 气泡」。
  */
-export type QueueItemSettleOutcome = "delivered" | FailQueuedItemsReason;
+export type QueueItemSettleOutcome = WireMessageOpOutcome;
 
 export type RecentSettledEntry = {
   itemId: string;
@@ -69,7 +72,7 @@ export type RecentSettledEntry = {
 };
 
 /**
- * R35-1 / R35-6：单条消息受理状态机 phase。
+ * R35-1 / R35-6 / R36：单条消息受理状态机 phase（wire 可复用）。
  * - accepting / persisted：非终态（active）
  * - handedOff：成功终态（对外 outcome=delivered）
  * - FailQueuedItemsReason：失败终态
@@ -80,13 +83,48 @@ export type MessageOpPhase =
   | "handedOff"
   | FailQueuedItemsReason;
 
+/** R36：wire 终态 outcome（= 共享 schema，经 QueueItemSettleOutcome 别名） */
+export type MessageOpOutcome = QueueItemSettleOutcome;
+
 export type MessageOperation = {
   itemId: string;
   fingerprint: string;
   phase: MessageOpPhase;
+  /**
+   * R36-12：claim 后落盘、尚未 transfer 的附件绝对路径。
+   * release / failed-before-persist 时尽力删除；transfer 成功后清空清单（文件归 queue/事件持有）。
+   */
+  stagedAttachmentPaths?: string[];
 };
 
-/** R35-1：payload 指纹输入（text + 图/附件/skill；落盘前即可算） */
+/**
+ * R36-5：claim 赢家持有的唯一 handle——route 外层 finally 只认三种出口：
+ * transfer（queue/runner 接管）/ settle terminal（phase 已终态）/ release（仍 accepting）。
+ */
+export type MessageOpHandle = {
+  readonly itemId: string;
+  readonly taskId: string;
+  /** R36-5：queue / runner 已接管——finally 不再 release */
+  transfer: () => void;
+  /** R36-12：登记本批 staged 附件（仅 accepting 有效） */
+  stageAttachments: (absPaths: readonly string[]) => void;
+  /**
+   * R36-5：finally 出口。
+   * - 已 transfer → no-op
+   * - 已终态 → no-op
+   * - accepting → release + 回滚 staged
+   * - persisted 仍挂着（异常漏 settle）→ settleFailed(flush_error)
+   */
+  finalize: () => void;
+};
+
+/** R36-4：watch bootstrap 完整 operation snapshot 条目 */
+export type MessageOpSnapshotEntry = {
+  itemId: string;
+  phase: MessageOpPhase;
+};
+
+/** payload 指纹输入（与共享 lib 对齐；落盘前即可算） */
 export type MessagePayloadForFingerprint = {
   text: string;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
@@ -95,40 +133,28 @@ export type MessagePayloadForFingerprint = {
 };
 
 /**
- * R35-1：稳定 payload 指纹（JSON stringify + 短 sha256）。
- * 同 id 不同 text/图/附件/skill → claim 返 payload_mismatch。
+ * R36：稳定 payload 指纹——委托共享 `computeChatPayloadFingerprint`
+ *（FNV + imageKeysFromPayloads 的 filename / mime+len 键，不再 SHA-256 图内容）。
  */
-export const computeMessagePayloadFingerprint = (
+export const fingerprintFromMessagePayload = (
   payload: MessagePayloadForFingerprint,
-): string => {
-  const images = (payload.images ?? []).map((img) => ({
-    mimeType: img.mimeType ?? "",
-    filename: img.filename ?? "",
-    bytes: img.data?.length ?? 0,
-    sha: img.data
-      ? createHash("sha256").update(img.data).digest("hex").slice(0, 16)
-      : "",
-  }));
-  const attachments = [...(payload.attachmentPaths ?? [])].sort();
-  const skills = (payload.skills ?? [])
-    .map((s) => ({ name: s.name, absPath: s.absPath }))
-    .sort((a, b) =>
-      a.absPath === b.absPath
-        ? a.name.localeCompare(b.name)
-        : a.absPath.localeCompare(b.absPath),
-    );
-  const stable = JSON.stringify({
+): string =>
+  computeChatPayloadFingerprint({
     text: payload.text,
-    images,
-    attachments,
-    skills,
+    imagePaths: imageKeysFromPayloads(
+      (payload.images ?? []).map((img) => ({
+        data: img.data ?? "",
+        mimeType: img.mimeType ?? "application/octet-stream",
+        filename: img.filename,
+      })),
+    ),
+    attachmentPaths: [...(payload.attachmentPaths ?? [])],
+    skills: (payload.skills ?? []) as ChatSkillRef[],
   });
-  return createHash("sha256").update(stable).digest("hex").slice(0, 32);
-};
 
-/** R35-1：claim 结果（route 入口映射 HTTP） */
+/** R35-1 / R36-5：claim 结果（claimed 时带唯一 handle） */
 export type ClaimMessageOperationResult =
-  | { status: "claimed"; itemId: string }
+  | { status: "claimed"; itemId: string; handle: MessageOpHandle }
   | {
       status: "active";
       phase: "accepting" | "persisted";
@@ -142,6 +168,18 @@ export type ClaimMessageOperationResult =
       queuedCount: number;
     }
   | { status: "payload_mismatch"; itemId: string };
+
+/** R36-12：尽力删除 staged 附件（release 补偿；失败吞掉） */
+const rollbackStagedFiles = (paths: readonly string[]): void => {
+  for (const p of paths) {
+    if (!p) continue;
+    try {
+      unlinkSync(p);
+    } catch {
+      /* 尽力而为：文件可能已被删 / 权限瞬断 */
+    }
+  }
+};
 
 const isMessageOpTerminal = (phase: MessageOpPhase): boolean =>
   phase !== "accepting" && phase !== "persisted";
@@ -291,9 +329,10 @@ const activeQueuedCount = (taskId: string): number =>
   (queues().get(taskId)?.length ?? 0) + (inFlightMap().get(taskId) ?? 0);
 
 /**
- * R33-1 / R35-6：把 item 记入 per-task recentSettled（已有则跳过；超上限 FIFO 丢最老）。
+ * R33-1 / R35-6 / R36-11：把 item 记入 per-task recentSettled（已有则跳过；超上限 FIFO 丢最老）。
  * first-outcome-wins：只接受真终态（delivered=handedOff / failed 家族）。
- * 同步推进 messageOps phase（旁路 settle 无 fingerprint 时用空串占位）。
+ * 同步推进 messageOps phase；淘汰的 terminal 条目从 messageOps 同步删除
+ *（active/persisted 绝不淘汰；淘汰后同 id 重试语义 = absent 新受理）。
  */
 export const recordQueueItemSettled = (
   taskId: string,
@@ -305,22 +344,41 @@ export const recordQueueItemSettled = (
   const cur = map.get(taskId) ?? [];
   if (cur.some((e) => e.itemId === itemId)) return;
   const next = [...cur, { itemId, outcome }];
-  map.set(
-    taskId,
-    next.length > RECENT_SETTLED_MAX
-      ? next.slice(next.length - RECENT_SETTLED_MAX)
-      : next,
-  );
-  // R35-1：ledger 与 operation 同推进
   const ops = taskMessageOps(taskId);
+  if (next.length > RECENT_SETTLED_MAX) {
+    const dropped = next.slice(0, next.length - RECENT_SETTLED_MAX);
+    const kept = next.slice(next.length - RECENT_SETTLED_MAX);
+    map.set(taskId, kept);
+    // R36-11：与 recentSettled 同一有界索引淘汰 terminal messageOps
+    for (const e of dropped) {
+      const op = ops.get(e.itemId);
+      if (op && isMessageOpTerminal(op.phase)) {
+        ops.delete(e.itemId);
+      }
+    }
+  } else {
+    map.set(taskId, next);
+  }
+  // R35-1：ledger 与 operation 同推进（保留 staged 清单直至终态）
   const existing = ops.get(itemId);
   if (!existing || !isMessageOpTerminal(existing.phase)) {
     ops.set(itemId, {
       itemId,
       fingerprint: existing?.fingerprint ?? "",
       phase: outcome === "delivered" ? "handedOff" : outcome,
+      // 终态不再需要回滚清单
+      stagedAttachmentPaths: undefined,
     });
   }
+  // R36-2：终态实时下发（纯内存帧）——成功终态（delivered）此前只有 recentSettled
+  // 重放可见、在线 client 无法实时清 pending；失败侧与 queue_failed 双发无害
+  //（client reducer first-outcome-wins 幂等）。
+  publish(taskId, {
+    kind: "message_op",
+    itemId,
+    phase: outcome === "delivered" ? "handedOff" : outcome,
+    outcome,
+  });
 };
 
 /** R33-1：只读快照——bootstrap queue_state.recentSettled */
@@ -366,11 +424,92 @@ export const getMessageOperation = (
 ): MessageOperation | undefined => taskMessageOps(taskId).get(itemId);
 
 /**
- * R35-1：同步原子 claim——必须在任何附件落盘 / checkpoint / send 之前调用。
+ * R36-4：完整 MessageOperation aggregate 快照（含 accepting/persisted/handedOff/failed）。
+ * 供 watch bootstrap——不再用 queue+in-flight 子集冒充全部 active。
+ */
+export const listMessageOperationSnapshot = (
+  taskId: string,
+): MessageOpSnapshotEntry[] => {
+  const ops = messageOpsMap().get(taskId);
+  if (!ops || ops.size === 0) return [];
+  return [...ops.values()].map((op) => ({
+    itemId: op.itemId,
+    phase: op.phase,
+  }));
+};
+
+/** R36-12：把本批落盘附件挂到 accepting op（transfer 前可回滚） */
+export const stageMessageAttachments = (
+  taskId: string,
+  itemId: string,
+  absPaths: readonly string[],
+): void => {
+  if (!itemId || absPaths.length === 0) return;
+  const ops = taskMessageOps(taskId);
+  const cur = ops.get(itemId);
+  if (!cur || cur.phase !== "accepting") return;
+  ops.set(itemId, {
+    ...cur,
+    stagedAttachmentPaths: [
+      ...(cur.stagedAttachmentPaths ?? []),
+      ...absPaths.filter(Boolean),
+    ],
+  });
+};
+
+/**
+ * R36-12：transfer 成功——清空回滚清单（文件已归 queue / user_reply 持有，不再随 release 删）。
+ */
+export const commitMessageStagedAttachments = (
+  taskId: string,
+  itemId: string,
+): void => {
+  if (!itemId) return;
+  const ops = taskMessageOps(taskId);
+  const cur = ops.get(itemId);
+  if (!cur?.stagedAttachmentPaths?.length) return;
+  ops.set(itemId, { ...cur, stagedAttachmentPaths: undefined });
+};
+
+/** R36-5：构造 claim 赢家 handle */
+const createMessageOpHandle = (
+  taskId: string,
+  itemId: string,
+): MessageOpHandle => {
+  let transferred = false;
+  return {
+    itemId,
+    taskId,
+    transfer: () => {
+      transferred = true;
+      // R36-12：接管成功 → 提交 staged（保留磁盘文件）
+      commitMessageStagedAttachments(taskId, itemId);
+    },
+    stageAttachments: (absPaths) => {
+      stageMessageAttachments(taskId, itemId, absPaths);
+    },
+    finalize: () => {
+      if (transferred) return;
+      const op = taskMessageOps(taskId).get(itemId);
+      if (!op) return;
+      if (isMessageOpTerminal(op.phase)) return;
+      if (op.phase === "accepting") {
+        releaseMessageOperation(taskId, itemId);
+        return;
+      }
+      // R36-5：persisted 却未 transfer/settle → 明确失败终态，禁止幽灵 active
+      settleMessageFailed(taskId, itemId, "flush_error");
+    },
+  };
+};
+
+/**
+ * R35-1 / R36-5：同步原子 claim——必须在任何附件落盘 / checkpoint / send 之前调用。
  *
- * - absent → 登记 accepting，返 claimed
+ * - absent → 登记 accepting，返 claimed + handle
  * - 同 id + 同 fingerprint → 返当前 active / settled（绝不再次受理）
  * - 同 id + 不同 fingerprint → payload_mismatch（409，不静默吞新内容）
+ * - R36-11：terminal 已被有界淘汰后 → 视作 absent，允许同 id 新受理
  */
 export const claimMessageOperation = (
   taskId: string,
@@ -378,7 +517,12 @@ export const claimMessageOperation = (
   payloadFingerprint: string,
 ): ClaimMessageOperationResult => {
   if (!clientItemId) {
-    return { status: "claimed", itemId: clientItemId };
+    // 无 id 不建 op——返回空 handle 占位（route 不应走到 claim）
+    return {
+      status: "claimed",
+      itemId: clientItemId,
+      handle: createMessageOpHandle(taskId, clientItemId),
+    };
   }
   const queuedCount = activeQueuedCount(taskId);
   const ops = taskMessageOps(taskId);
@@ -452,7 +596,11 @@ export const claimMessageOperation = (
     fingerprint: payloadFingerprint,
     phase: "accepting",
   });
-  return { status: "claimed", itemId: clientItemId };
+  return {
+    status: "claimed",
+    itemId: clientItemId,
+    handle: createMessageOpHandle(taskId, clientItemId),
+  };
 };
 
 /**
@@ -494,7 +642,8 @@ export const settleMessageFailed = (
 };
 
 /**
- * R35-1：受理后、persisted 前的软失败（409 停止 / 队满等）→ 释放 claim，允许同 id 重试。
+ * R35-1 / R36-12：受理后、persisted 前的软失败（409 停止 / 队满等）→ 释放 claim，
+ * 允许同 id 重试；同步尽力回滚本批 staged 附件。
  * 已 persisted / 终态不得释放（应走 settleFailed 或 skipPersist 重排）。
  */
 export const releaseMessageOperation = (
@@ -505,7 +654,9 @@ export const releaseMessageOperation = (
   const ops = taskMessageOps(taskId);
   const cur = ops.get(itemId);
   if (!cur || cur.phase !== "accepting") return false;
+  const staged = cur.stagedAttachmentPaths ?? [];
   ops.delete(itemId);
+  rollbackStagedFiles(staged);
   return true;
 };
 

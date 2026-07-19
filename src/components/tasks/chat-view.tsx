@@ -44,6 +44,11 @@ import {
 } from "@/components/ui/popover";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
+import {
+  clearChatOpLedger,
+  getChatOpLedger,
+  setChatOpLedger,
+} from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
   allocClientChatQueueItemId,
@@ -85,7 +90,7 @@ interface Props {
   onEventAppend: (ev: TaskEvent) => void;
   // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
   onPrependEvents?: (events: TaskEvent[]) => void;
-  /** R34-5：task_deleted / watch 404 → 清本地态后通知父级（setTask null + 侧栏失效） */
+  /** R36-7：task_deleted / watch 410 → 清本地态后通知父级（setTask null + 侧栏失效） */
   onTaskDeleted?: (taskId: string) => void;
 }
 
@@ -177,12 +182,12 @@ export const ChatView = ({
   onEventAppendRef.current = onEventAppend;
   onTaskDeletedRef.current = onTaskDeleted;
 
-  /** R35-2：把 reducer 结果写回 state/ref，并同步 queuedCount */
+  /** R35-2 / R36-10：reducer 结果写回 state/ref + per-task 共享 store */
   const commitOpResult = useCallback(
     (result: ReturnType<typeof reduceChatOperation>): typeof result => {
       opSettledRef.current = result.state.settled;
       opOutcomesRef.current = result.state.outcomes;
-      // uncertain 派生自 phase，供 event-stream 占位行（未改其 props 契约）
+      // uncertain 派生自 phase；persisted 仍留 ledger，UI 层过滤（见 pendingForStream）
       const nextPending: PendingLocalReply[] = result.state.pending.map((p) => ({
         ...p,
         id: p.id ?? p.itemId,
@@ -190,7 +195,13 @@ export const ChatView = ({
       })) as PendingLocalReply[];
       pendingLocalRepliesRef.current = nextPending;
       setPendingLocalReplies(nextPending);
-      setQueuedCount(nextPending.length > 0 ? nextPending.length : null);
+      // 排队条只计 sending/uncertain（persisted 已有持久气泡）
+      const activeCount = nextPending.filter(
+        (p) => p.phase !== "persisted",
+      ).length;
+      setQueuedCount(activeCount > 0 ? activeCount : null);
+      // R36-10：跨路由存活
+      setChatOpLedger(taskIdRef.current, result.state);
       return result;
     },
     [],
@@ -205,20 +216,36 @@ export const ChatView = ({
     [],
   );
 
-  // 切 task 时把 streaming / submitting / stopping / live 输出 / 排队重置
+  // 切 task：清 streaming 等 UI 态；ledger 从共享 store 恢复（R36-10）
   useEffect(() => {
     setStreamingText("");
     setIsSubmitting(false);
     setStopping(false);
     setLiveToolOutputs({});
-    setQueuedCount(null);
-    setPendingLocalReplies([]);
-    pendingLocalRepliesRef.current = [];
-    opSettledRef.current = [];
-    opOutcomesRef.current = {};
     setContextInfo(null);
     setKeepHints("");
+    // R36-10：不 wipe ledger——从 per-task store 恢复 retry identity
+    const restored = getChatOpLedger(task.id);
+    opSettledRef.current = restored.settled;
+    opOutcomesRef.current = restored.outcomes;
+    const nextPending: PendingLocalReply[] = restored.pending.map((p) => ({
+      ...p,
+      id: p.id ?? p.itemId,
+      uncertain: p.phase === "uncertain",
+    })) as PendingLocalReply[];
+    pendingLocalRepliesRef.current = nextPending;
+    setPendingLocalReplies(nextPending);
+    const activeCount = nextPending.filter(
+      (p) => p.phase !== "persisted",
+    ).length;
+    setQueuedCount(activeCount > 0 ? activeCount : null);
   }, [task.id]);
+
+  // R36-2：persisted 已有持久气泡，不再渲染本地占位
+  const pendingForStream = useMemo(
+    () => pendingLocalReplies.filter((p) => p.phase !== "persisted"),
+    [pendingLocalReplies],
+  );
 
   useTaskWatch(task.id, {
     onEvent: (ev) => {
@@ -253,7 +280,7 @@ export const ChatView = ({
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
 
-      // R35-2：user_reply → 同一 Operation reducer（记 delivered）
+      // R36-2：user_reply → 标 persisted（非终态），不写 delivered
       if (ev.kind === "user_reply") {
         commitOpResult(
           reduceChatOperation(readOpState(), { type: "user_reply", ev }),
@@ -279,17 +306,34 @@ export const ChatView = ({
         );
       }
     },
-    // R35-2：重连 bootstrap → 同一 reducer
-    onQueueState: (serverItemIds, recentSettled) => {
-      const before = pendingLocalRepliesRef.current.length;
+    // R36-2：message_op 成功/失败终态
+    onMessageOp: ({ itemId, phase, outcome }) => {
+      commitOpResult(
+        reduceChatOperation(readOpState(), {
+          type: "message_op",
+          itemId,
+          phase,
+          outcome,
+        }),
+      );
+    },
+    // R36-2/4：重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
+    onQueueState: (serverItemIds, recentSettled, operationSnapshot) => {
+      const before = pendingLocalRepliesRef.current.filter(
+        (p) => p.phase !== "persisted",
+      ).length;
       const result = commitOpResult(
         reduceChatOperation(readOpState(), {
           type: "queue_state",
           serverItemIds,
           recentSettled,
+          operationSnapshot,
         }),
       );
-      const cleared = before - result.state.pending.length;
+      const after = result.state.pending.filter(
+        (p) => p.phase !== "persisted" && p.phase !== "uncertain",
+      ).length;
+      const cleared = before - after;
       if (cleared > 0) {
         toast.message(`已清除 ${cleared} 条失效的排队占位`);
       }
@@ -303,8 +347,7 @@ export const ChatView = ({
       setStreamingText("");
       setLiveToolOutputs({});
       const remaining = pendingLocalRepliesRef.current.length;
-      // R33-1：idle/error 清 pending 时把 itemId 记入 settled（pending 登记先于请求，done 必有 id）
-      // awaiting_user：自然回合结束，队可能正在 flush，保留 pending 等 SSE user_reply 对账
+      // R36-2：done_clear 只清已有明确终态；无终态保持 uncertain/persisted
       if (
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
@@ -312,11 +355,17 @@ export const ChatView = ({
         const result = commitOpResult(
           reduceChatOperation(readOpState(), { type: "done_clear" }),
         );
-        toast.message(
-          `会话已结束，已清除 ${(result.clearedIds ?? []).length} 条未确认的排队占位（若仍需发送请重新输入）`,
-        );
+        const n = (result.clearedIds ?? []).length;
+        if (n > 0) {
+          toast.message(
+            `会话已结束，已清除 ${n} 条已确认终态的排队占位`,
+          );
+        }
       } else {
-        setQueuedCount(remaining > 0 ? remaining : null);
+        const active = pendingLocalRepliesRef.current.filter(
+          (p) => p.phase !== "persisted",
+        ).length;
+        setQueuedCount(active > 0 ? active : null);
       }
       if (!canCommitTaskSnapshot(t.id)) return;
       onTaskUpdateRef.current(t);
@@ -324,10 +373,11 @@ export const ChatView = ({
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
-    // R35-5：task_deleted / watch 404 → 清 pending/streaming，再走统一 sink
+    // R36-7：task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
       setStreamingText("");
       setLiveToolOutputs({});
+      clearChatOpLedger(deletedId);
       commitOpResult(
         reduceChatOperation(emptyChatOpState(), { type: "clear_all" }),
       );
@@ -534,7 +584,7 @@ export const ChatView = ({
     try {
       const latest = await stopTask(task.id);
       setStreamingText("");
-      // R35-2：stop 清队走同一 reducer
+      // R36-2：stop 后只清已有明确终态；其余等 queue_failed / message_op
       const result = commitOpResult(
         reduceChatOperation(readOpState(), { type: "done_clear" }),
       );
@@ -543,7 +593,7 @@ export const ChatView = ({
       }
       if ((result.clearedIds ?? []).length > 0) {
         toast.message(
-          `已丢弃 ${(result.clearedIds ?? []).length} 条未发送的排队消息`,
+          `已确认 ${(result.clearedIds ?? []).length} 条消息终态`,
         );
       }
     } catch (err) {
@@ -798,7 +848,7 @@ export const ChatView = ({
           stopping={stopping}
           onPrependEvents={onPrependEvents}
           onRewind={handleRewind}
-          pendingLocalReplies={pendingLocalReplies}
+          pendingLocalReplies={pendingForStream}
           queueBanner={queueBanner}
           allowQueueWhileRunning
           composerLeading={
