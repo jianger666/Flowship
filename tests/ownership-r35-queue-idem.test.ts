@@ -503,12 +503,12 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
     let pendingA: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: tabA, displayText: sameText }];
     let pendingB: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: tabB, displayText: sameText }];
     let settledA: string[] = [];
     let settledB: string[] = [];
@@ -526,7 +526,7 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
     settledB = b1.settled;
     // R36-2：user_reply → 标 persisted，不摘 pending / 不记 settled
     expect(pendingA).toHaveLength(1);
-    expect(pendingA[0]?.phase).toBe("persisted");
+    expect(pendingA[0]?.persistence).toBe("persisted");
     expect(settledA).not.toContain(tabA);
     expect(pendingB).toEqual([{ itemId: tabB, displayText: sameText }]);
 
@@ -536,7 +536,7 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
       meta: { queueItemId: tabB },
     });
     expect(b2.pending).toHaveLength(1);
-    expect(b2.pending[0]?.phase).toBe("persisted");
+    expect(b2.pending[0]?.persistence).toBe("persisted");
     expect(b2.settled).not.toContain(tabB);
   });
 
@@ -544,7 +544,7 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
     const prev: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [
       { itemId: "old_1", displayText: "legacy" },
       { itemId: "old_2", displayText: "legacy" },
@@ -554,7 +554,7 @@ describe("R34-6：direct user_reply 带 clientItemId", () => {
       meta: null,
     });
     // R36-2：只把第一条文案匹配标为 persisted
-    expect(next.pending[0]?.phase).toBe("persisted");
+    expect(next.pending[0]?.persistence).toBe("persisted");
     expect(next.pending[0]?.itemId).toBe("old_1");
     expect(next.pending[1]).toEqual({
       itemId: "old_2",

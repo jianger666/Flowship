@@ -157,6 +157,50 @@ export const resolveWatchReconnectPolicy = (input: {
   };
 };
 
+/**
+ * R40-2：watch 流 clean resolve 后的 epoch 处理（hook 与单测共用）。
+ *
+ * - established=true → 清零两类计数（与 onConnectionEstablished 幂等）
+ * - established=false（bootstrap 前空 EOF / 仅非法帧）→ 记一次 retryable，
+ *   走既有 policy，**禁止**当成功清零
+ */
+export type WatchCleanEofDecision =
+  | {
+      kind: "epoch_reset";
+      nextUnavailableAttempts: 0;
+      nextTransientFailures: 0;
+      nextUnavailableNotified: false;
+    }
+  | {
+      kind: "retryable_failure";
+      decision: WatchReconnectDecision;
+    };
+
+export const resolveWatchCleanEof = (input: {
+  established: boolean;
+  unavailableAttempts: number;
+  transientFailures: number;
+  unavailableNotified: boolean;
+}): WatchCleanEofDecision => {
+  if (input.established) {
+    return {
+      kind: "epoch_reset",
+      nextUnavailableAttempts: 0,
+      nextTransientFailures: 0,
+      nextUnavailableNotified: false,
+    };
+  }
+  return {
+    kind: "retryable_failure",
+    decision: resolveWatchReconnectPolicy({
+      kind: "retryable",
+      unavailableAttempts: input.unavailableAttempts,
+      transientFailures: input.transientFailures,
+      unavailableNotified: input.unavailableNotified,
+    }),
+  };
+};
+
 /** R35-5：同 id 是否已进入 deleted terminal（sticky） */
 export const isTaskTerminalDeleted = (taskId: string): boolean =>
   getStore().deletedIds.has(taskId);

@@ -44,7 +44,9 @@ const op = (
     Pick<ChatOperation, "itemId" | "payloadFingerprint" | "displayText">,
 ): ChatOperation => ({
   text: partial.text ?? partial.displayText,
-  phase: partial.phase ?? "sending",
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
   ...partial,
 });
 
@@ -247,7 +249,7 @@ describe("R38-③ 跨任务 dispatch / 提交锁 / task 快照隔离", () => {
         itemId: itemA,
         payloadFingerprint: fpA,
         displayText: "from-A",
-        phase: "uncertain",
+        persistence: "sending", terminalKnowledge: "none", networkUncertain: true,
       }),
     });
 
@@ -341,7 +343,7 @@ describe("R38-③ 跨任务 dispatch / 提交锁 / task 快照隔离", () => {
           itemId: itemA,
           payloadFingerprint: fpA,
           displayText: "from-A",
-          phase: "uncertain",
+          persistence: "sending", terminalKnowledge: "none", networkUncertain: true,
         }),
       });
       dispatchChatOp(taskB, {
@@ -432,9 +434,10 @@ describe("R38-④ unknown → known 可纠正", () => {
       }).state;
       expect(state.outcomes[itemId], known).toBeUndefined();
       expect(state.settled, known).not.toContain(itemId);
-      expect(state.pending.find((p) => p.itemId === itemId)?.phase, known).toBe(
-        "uncertain",
-      );
+      expect(
+        state.pending.find((p) => p.itemId === itemId)?.terminalKnowledge,
+        known,
+      ).toBe("unknown");
       expect(
         findReusableUncertainOperation(state.pending, fp)?.itemId,
         known,
@@ -483,7 +486,8 @@ describe("R38-④ unknown → known 可纠正", () => {
       // 缺失
     }).state;
     expect(state.outcomes[itemId]).toBeUndefined();
-    expect(state.pending[0]?.phase).toBe("uncertain");
+    expect(state.pending[0]?.terminalKnowledge).toBe("unknown");
+    expect(state.pending[0]?.networkUncertain).toBe(false);
 
     state = reduceChatOperation(state, {
       type: "http_settled",
@@ -509,7 +513,8 @@ describe("R38-④ unknown → known 可纠正", () => {
     }).state;
     expect(qs.outcomes[item2]).toBeUndefined();
     expect(qs.settled).not.toContain(item2);
-    expect(qs.pending[0]?.phase).toBe("uncertain");
+    expect(qs.pending[0]?.terminalKnowledge).toBe("unknown");
+    expect(qs.pending[0]?.networkUncertain).toBe(false);
 
     qs = reduceChatOperation(qs, {
       type: "queue_state",
@@ -534,7 +539,7 @@ describe("R38-⑤ settled 与 outcomes 同界淘汰", () => {
         itemId: activeId,
         payloadFingerprint: "fp_a",
         displayText: "active",
-        phase: "sending",
+        persistence: "sending", terminalKnowledge: "none", networkUncertain: false,
       }),
     });
     dispatchChatOp(taskA, {
@@ -543,7 +548,7 @@ describe("R38-⑤ settled 与 outcomes 同界淘汰", () => {
         itemId: persistedId,
         payloadFingerprint: "fp_p",
         displayText: "persisted",
-        phase: "persisted",
+        persistence: "persisted", terminalKnowledge: "none", networkUncertain: false,
       }),
     });
 
@@ -574,12 +579,10 @@ describe("R38-⑤ settled 与 outcomes 同界淘汰", () => {
     expect(state.settled.every((k) => k in state.outcomes)).toBe(true);
 
     // active/persisted 不淘汰
-    expect(state.pending.find((p) => p.itemId === activeId)?.phase).toBe(
+    expect(state.pending.find((p) => p.itemId === activeId)?.persistence).toBe(
       "sending",
     );
-    expect(state.pending.find((p) => p.itemId === persistedId)?.phase).toBe(
-      "persisted",
-    );
+    expect(state.pending.find((p) => p.itemId === persistedId)?.persistence).toBe("persisted");
 
     // 切 A→B→A 边界不变
     setChatOpLedger(taskB, emptyChatOpState());

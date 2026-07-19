@@ -48,7 +48,9 @@ const op = (
     Pick<ChatOperation, "itemId" | "payloadFingerprint" | "displayText">,
 ): ChatOperation => ({
   text: partial.text ?? partial.displayText,
-  phase: partial.phase ?? "sending",
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
   ...partial,
 });
 
@@ -170,9 +172,7 @@ describe("R37-② user_reply 后失败可纠正", () => {
       type: "user_reply",
       ev: { text: "hello", meta: { queueItemId: itemId } },
     }).state;
-    expect(state.pending.find((p) => p.itemId === itemId)?.phase).toBe(
-      "persisted",
-    );
+    expect(state.pending.find((p) => p.itemId === itemId)?.persistence).toBe("persisted");
     expect(state.outcomes[itemId]).toBeUndefined();
     expect(state.settled).not.toContain(itemId);
 
@@ -228,7 +228,7 @@ describe("R37-③ 只有 handedOff/delivered 清成功", () => {
     // idle done_clear：无终态 → 保留 persisted
     const afterDone = reduceChatOperation(state, { type: "done_clear" });
     expect(afterDone.clearedIds ?? []).toHaveLength(0);
-    expect(afterDone.state.pending[0]?.phase).toBe("persisted");
+    expect(afterDone.state.pending[0]?.persistence).toBe("persisted");
     expect(afterDone.state.outcomes[itemId]).toBeUndefined();
 
     // 成功终态唯一来源：message_op handedOff / delivered
@@ -287,7 +287,7 @@ describe("R37-④ claim/persisted 重连保持 active", () => {
         { itemId, phase: "persisted", fingerprint: "fp_snap" },
       ],
     }).state;
-    expect(state.pending[0]?.phase).toBe("persisted");
+    expect(state.pending[0]?.persistence).toBe("persisted");
     expect(state.outcomes[itemId]).toBeUndefined();
   });
 });
@@ -312,7 +312,7 @@ describe("R37-⑤ server 重启丢 ledger → uncertain", () => {
       recentSettled: [],
       operationSnapshot: [],
     });
-    expect(recon.state.pending[0]?.phase).toBe("uncertain");
+    expect(recon.state.pending[0]?.networkUncertain).toBe(true);
     // ghost 不写 outcomes（避免占坑挡后到真终态）
     expect(recon.state.outcomes[itemId]).toBeUndefined();
     expect(recon.state.settled).not.toContain(itemId);
@@ -342,7 +342,7 @@ describe("R37-⑥ 跨路由 ledger 存活", () => {
         itemId,
         payloadFingerprint: fp,
         displayText: "retry-me",
-        phase: "uncertain",
+        persistence: "sending", terminalKnowledge: "none", networkUncertain: true,
       }),
     }).state;
     setChatOpLedger(taskA, stateA);

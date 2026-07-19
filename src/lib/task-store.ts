@@ -507,15 +507,23 @@ export interface TaskStreamCallbacks {
   onConnectionEstablished?: () => void;
 }
 
+/** R40-2：watch 流结束时是否曾建立（首个合法 task 帧） */
+export type WatchTaskStreamResult = {
+  established: boolean;
+};
+
 /**
  * 订阅任务 SSE（v1.0.x 起 bootstrap 只带尾部 tail 条事件、不是全部历史——
  * 更早的走 fetchEarlierEvents 上拉分页；中途 task/done 帧不带 events）
+ *
+ * R40-2：返回 `{ established }`——bootstrap 前 clean EOF 时 established=false，
+ * hook 不得把它当成功清零 epoch。
  */
 export const watchTaskStream = async (
   taskId: string,
   callbacks: TaskStreamCallbacks = {},
   signal?: AbortSignal,
-): Promise<void> => {
+): Promise<WatchTaskStreamResult> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/watch-task`,
     {
@@ -649,6 +657,7 @@ export const watchTaskStream = async (
       /* noop */
     }
   }
+  return { established: connectionEstablished };
 };
 
 // ----------------- 图片附件入参 -----------------

@@ -338,14 +338,14 @@ describe("R33-1：挂起 202 × 旁路终态", () => {
     let pending: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId, displayText: "x" }];
     let settled: string[] = [];
     const done = applyDoneClearPending(pending, settled, {});
     pending = done.pending;
     settled = done.settled;
     expect(pending).toHaveLength(1);
-    expect(pending[0]?.phase).toBe("uncertain");
+    expect(pending[0]?.networkUncertain).toBe(true);
     expect(done.clearedIds).toHaveLength(0);
     expect(settled).not.toContain(itemId);
   });
@@ -469,18 +469,18 @@ describe("R33-1：两 tab 同文案 id 化", () => {
     const tabA: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: "tab_a", displayText: "same" }];
     const tabB: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: "tab_b", displayText: "same" }];
     const aUr = applyUserReplyTerminal(tabA, [], {
       text: "same",
       meta: { queueItemId: "tab_a" },
     }).pending;
-    expect(aUr[0]?.phase).toBe("persisted");
+    expect(aUr[0]?.persistence).toBe("persisted");
     expect(
       applyUserReplyTerminal(tabB, [], {
         text: "same",

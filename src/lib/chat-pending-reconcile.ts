@@ -1,11 +1,36 @@
 /**
- * R31-1 / R32-1 / R33-1 / R35-2 / R36-2/3/4：前端 pending / Operation 对账纯函数。
- * 抽出来便于单测，避免拉 chat-view 客户端组件进 node 环境。
+ * R31-1 / R32-1 / R33-1 / R35-2 / R36-2/3/4 / R40-1：前端 pending / Operation 对账纯函数。
  *
- * R35-2：pending 升级为完整 Operation（itemId + payloadFingerprint + phase）；
- * R36-2：只消费明确 phase——user_reply=persisted（非终态）；成功终态仅 handedOff/delivered；
- * R36-3：outcome 走 message-op-schema 表驱动 decoder，未知 fail-closed；
- * R36-4：ghost → uncertain/unknown，绝不写 delivered。
+ * ---------------------------------------------------------------------------
+ * R40-1：正交 product-state（取代一维 phase rank）
+ * ---------------------------------------------------------------------------
+ *
+ * 三个事实轴互相独立，禁止再排成线性优先级（persisted > unknown > network）：
+ *
+ *   persistence:        "sending" | "persisted"
+ *     —— 用户气泡是否已落盘（UI 是否隐藏本地占位只看此轴）
+ *   terminalKnowledge:  "none" | "unknown"
+ *     —— 终态是否可识别；known terminal 直接摘 pending，不进此轴
+ *   networkUncertain:   boolean
+ *     —— HTTP 响应是否丢失（same-id retry 的依据之一）
+ *
+ * join 律（`joinProductState` / `joinPendingProductState`）：
+ *   - persistence：sending → persisted 只升不降（max）
+ *   - terminalKnowledge：none → unknown 只升不降（max）；known 由 reducer 摘除
+ *   - networkUncertain：格上为 OR（只升不降）——交换 / 结合 / 幂等
+ *
+ * networkUncertain 的「清除」不在格 join 内：
+ *   同 id 收到新 transport ack（http_queued / http_direct_ok）是**定向**清除当前位，
+ *   不是历史证据的交换律运算。原因：新一轮 HTTP 尝试可以再次置位；若把「曾经 ack」
+ *   与「后来 reject」做成集合上 clear-wins，会错误吞掉重试失败。故 ack 清除与后续
+ *   reject **故意不交换**——注释与 permutation 测试对此分账：格 join 测三轴单调 OR/max；
+ *   ack 清除单独测「当前位 → false，且不碰 persistence / terminalKnowledge」。
+ *
+ * 四个消费者统一走同一 join：
+ *   1) live message_op（unknown → terminalKnowledge；known → 摘 pending）
+ *   2) bootstrap queue_state（unknown recentSettled 走 join，禁止硬写降 persistence）
+ *   3) HTTP commitHttpChatReply（清草稿看 terminalKnowledge；ack 只清 network）
+ *   4) findReusableUncertainOperation（networkUncertain | terminalKnowledge=unknown）
  */
 
 import type { ChatSkillRef } from "@/lib/chat-payload-fingerprint";
@@ -17,42 +42,49 @@ import {
   type MessageOpSnapshotEntry,
 } from "@/lib/message-op-schema";
 
-/**
- * R38-1：uncertain 成因——禁止再用 outcomes 缺键同时表达「没见过」与「见过未知终态」。
- * - network：响应丢失 / fetch reject，晚到 202 可回 sending
- * - unknown_terminal：已见未知 wire 终态，晚到 202/direct 不得清草稿、不得抹 uncertain
- */
+/** 气泡是否已落盘 */
+export type PersistenceAxis = "sending" | "persisted";
+
+/** 终态知识：known 不进轴（直接摘 pending） */
+export type TerminalKnowledgeAxis = "none" | "unknown";
+
+/** 三轴 product-state（单一事实源） */
+export type PendingProductState = {
+  persistence: PersistenceAxis;
+  terminalKnowledge: TerminalKnowledgeAxis;
+  networkUncertain: boolean;
+};
+
+/** @deprecated R40-1 起改用 terminalKnowledge / networkUncertain；保留类型别名供迁移阅读 */
 export type UncertainCause = "network" | "unknown_terminal";
 
 export type PendingLocalReplyLike = {
   itemId: string;
   displayText: string;
+  payloadFingerprint?: string;
+  /** 缺省按 sending / none / false 归一（测试构造可省略） */
+  persistence?: PersistenceAxis;
+  terminalKnowledge?: TerminalKnowledgeAxis;
+  networkUncertain?: boolean;
   /**
-   * R34-4：HTTP 结果不确定（网络断开 / 响应丢失）——保留占位，
-   * 等 bootstrap active+recentSettled 对账或同 id 重试。
-   * @deprecated R35-2 起用 phase；保留以兼容旧测试 / event-stream
+   * UI 投影用（event-stream 占位行）——派生自 networkUncertain | terminalKnowledge，
+   * 不是事实源；写入方应走 product-state。
+   * 读取时若三轴皆缺且 uncertain=true → 当作 networkUncertain（旧测试构造）。
    */
   uncertain?: boolean;
-  /** R35-2：payload 指纹（retry identity，不靠文案） */
-  payloadFingerprint?: string;
-  /**
-   * R35-2 / R36-2：sending | uncertain | persisted。
-   * persisted = 已有持久气泡、非终态（等待 handedOff / failed）。
-   */
-  phase?: "sending" | "uncertain" | "persisted";
-  /** R38-1：uncertain 成因 marker（known terminal 收敛时随 pending 移除一并清掉） */
-  uncertainCause?: UncertainCause;
 };
 
 /**
- * R35-2 / R36-2：完整 client Operation（pending 条目）
+ * 完整 client Operation（pending 条目）
  * terminal 不在 pending 内——记入 settled + outcomes。
- * persisted 仍留 pending（ledger 跟踪），UI 层过滤不渲染占位。
+ * persisted 仍留 pending（ledger 跟踪），UI 层按 persistence 过滤不渲染占位。
  */
 export type ChatOperation = {
   itemId: string;
   payloadFingerprint: string;
-  phase: "sending" | "uncertain" | "persisted";
+  persistence: PersistenceAxis;
+  terminalKnowledge: TerminalKnowledgeAxis;
+  networkUncertain: boolean;
   displayText: string;
   text: string;
   images?: unknown[];
@@ -60,14 +92,12 @@ export type ChatOperation = {
   skillRefs?: ChatSkillRef[];
   /** 与 itemId 对齐的 UI 行 key */
   id?: string;
-  /** R38-1：见 UncertainCause */
-  uncertainCause?: UncertainCause;
 };
 
 /** R36-3：client ledger 终态（unknown = 未知 wire / ghost，可同 id 重试） */
 export type OpTerminalOutcome = ClientLedgerOutcome;
 
-/** R35-2：Operation ledger——pending + 终态 id + outcome */
+/** Operation ledger——pending + 终态 id + outcome */
 export type ChatOpState = {
   pending: ChatOperation[];
   settled: string[];
@@ -76,6 +106,23 @@ export type ChatOpState = {
 
 /** R32-1：早到终态记账上限（FIFO 淘汰最老） */
 export const SETTLED_ITEM_IDS_MAX = 200;
+
+/** 初始 product-state（新登记） */
+export const initialProductState = (): PendingProductState => ({
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
+});
+
+/** UI：是否渲染「发送状态未知」占位样式 */
+export const projectPendingUncertain = (
+  p: Pick<PendingProductState, "networkUncertain" | "terminalKnowledge">,
+): boolean => p.networkUncertain || p.terminalKnowledge === "unknown";
+
+/** UI：persisted 后隐藏本地占位（正式气泡已在事件流） */
+export const shouldHideLocalPlaceholder = (
+  p: Pick<PendingProductState, "persistence">,
+): boolean => p.persistence === "persisted";
 
 /**
  * R33-1：客户端预生成短 itemId（crypto.randomUUID 去横线后取前 12）。
@@ -88,8 +135,6 @@ export const allocClientChatQueueItemId = (): string => {
 
 /**
  * R32-1：把 itemIds 记入 settled（已有则跳过）；超 max 时 FIFO 丢最老。
- * 用于 SSE 终态早于 202、202 回来时禁止再插 pending。
- * R37-5：仅裁 settled 数组；需要同步裁 outcomes 时走 rememberKnownTerminals。
  */
 export const rememberSettledItemIds = (
   settled: readonly string[],
@@ -108,7 +153,7 @@ export const rememberSettledItemIds = (
   return next.slice(next.length - max);
 };
 
-/** R37-5：outcomes 只保留仍在 settled 索引内的 key（与 FIFO 淘汰同一事务） */
+/** R37-5：outcomes 只保留仍在 settled 索引内的 key */
 const pruneOutcomesToSettled = (
   outcomes: Record<string, OpTerminalOutcome>,
   settled: readonly string[],
@@ -121,7 +166,6 @@ const pruneOutcomesToSettled = (
       changed = true;
       continue;
     }
-    // R37-4：unknown 从不进 outcomes；防御性清掉历史脏值
     if (outcome !== "delivered" && outcome !== "failed") {
       changed = true;
       continue;
@@ -133,7 +177,6 @@ const pruneOutcomesToSettled = (
 
 /**
  * R37-4 / R37-5：只接受 known terminal（delivered/failed）进 settled + outcomes。
- * unknown 调用方不得传入；first-outcome-wins；裁 settled 时同步删 outcomes key。
  */
 export const rememberKnownTerminals = (
   settled: readonly string[],
@@ -152,7 +195,6 @@ export const rememberKnownTerminals = (
   const nextOutcomes = { ...outcomes };
   for (const e of entries) {
     if (!e.itemId) continue;
-    // R37-4：仅 known 终态占坑；已有 known 不覆盖（first-outcome-wins）
     if (
       nextOutcomes[e.itemId] !== "delivered" &&
       nextOutcomes[e.itemId] !== "failed"
@@ -174,7 +216,7 @@ export const rememberKnownTerminals = (
   };
 };
 
-/** R37-4：wire raw → known ledger outcome；未知/缺失 → null（不占终态） */
+/** R37-4：wire raw → known ledger outcome；未知/缺失 → null */
 export const decodeKnownLedgerOutcome = (
   raw: string | undefined,
 ): "delivered" | "failed" | null => {
@@ -184,42 +226,127 @@ export const decodeKnownLedgerOutcome = (
   return decoded.outcome === "delivered" ? "delivered" : "failed";
 };
 
-/** R32-1：itemId 是否已有终态（user_reply / queue_failed / queue_state 幽灵清除） */
+/** R32-1：itemId 是否已有终态 */
 export const isItemSettled = (
   settled: readonly string[],
   itemId: string,
 ): boolean => settled.includes(itemId);
 
-/** R35-2：读取终态 outcome（无则 undefined） */
+/** R35-2：读取终态 outcome */
 export const getOpTerminalOutcome = (
   outcomes: Record<string, OpTerminalOutcome>,
   itemId: string,
 ): OpTerminalOutcome | undefined => outcomes[itemId];
 
-/**
- * R36-3：表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown。
- * （旧字符串启发式已删除）
- */
+/** R36-3：表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown */
 export const normalizeLedgerOutcome = (
   raw: string | undefined,
 ): OpTerminalOutcome => normalizeWireOutcomeToLedger(raw);
 
-/** R35-2：uncertain 同 fingerprint 才复用 id（改附件/skill/文案 → 新 id） */
+/**
+ * 纯格 join：三轴各自单调，交换 / 结合 / 幂等。
+ * 不含 transport-ack 清除（见模块顶注释）。
+ */
+export const joinProductState = (
+  a: PendingProductState,
+  b: PendingProductState,
+): PendingProductState => ({
+  persistence:
+    a.persistence === "persisted" || b.persistence === "persisted"
+      ? "persisted"
+      : "sending",
+  terminalKnowledge:
+    a.terminalKnowledge === "unknown" || b.terminalKnowledge === "unknown"
+      ? "unknown"
+      : "none",
+  networkUncertain: a.networkUncertain || b.networkUncertain,
+});
+
+/**
+ * 把增量证据合入当前 product-state。
+ * - 轴提升走格 join
+ * - clearNetworkUncertain：定向清 network 位（transport ack）
+ * - clearAllUncertainty：server active / known accepting 正证据，清两不确定轴
+ */
+export type ProductStateIncoming = {
+  persistence?: PersistenceAxis;
+  terminalKnowledge?: TerminalKnowledgeAxis;
+  networkUncertain?: boolean;
+  clearNetworkUncertain?: boolean;
+  clearAllUncertainty?: boolean;
+};
+
+export const joinPendingProductState = (
+  current: PendingProductState,
+  incoming: ProductStateIncoming,
+): PendingProductState => {
+  let next = joinProductState(current, {
+    persistence: incoming.persistence ?? "sending",
+    terminalKnowledge: incoming.terminalKnowledge ?? "none",
+    networkUncertain: incoming.networkUncertain ?? false,
+  });
+  // 定向清除：不进入格 join，避免与「后到的新一轮 reject」伪交换
+  if (incoming.clearAllUncertainty) {
+    next = {
+      ...next,
+      terminalKnowledge: "none",
+      networkUncertain: false,
+    };
+  } else if (incoming.clearNetworkUncertain) {
+    next = { ...next, networkUncertain: false };
+  }
+  return next;
+};
+
+const readProduct = (
+  p: Pick<
+    PendingLocalReplyLike,
+    "persistence" | "terminalKnowledge" | "networkUncertain" | "uncertain"
+  >,
+): PendingProductState => ({
+  persistence: p.persistence ?? "sending",
+  terminalKnowledge: p.terminalKnowledge ?? "none",
+  // 旧测试只写 uncertain:true 时当作 network 轴置位
+  networkUncertain:
+    p.networkUncertain ??
+    (p.persistence == null &&
+    p.terminalKnowledge == null &&
+    p.uncertain === true
+      ? true
+      : false),
+});
+
+const applyProductJoin = <T extends PendingLocalReplyLike>(
+  p: T,
+  incoming: ProductStateIncoming,
+): T => {
+  const joined = joinPendingProductState(readProduct(p), incoming);
+  return {
+    ...p,
+    ...joined,
+    uncertain: projectPendingUncertain(joined),
+  };
+};
+
+/**
+ * uncertain / unknown 同 fingerprint 才复用 id（改附件/skill/文案 → 新 id）。
+ * R40-1：覆盖 persisted-but-response-lost（persistence=persisted 且 networkUncertain）。
+ */
 export const findReusableUncertainOperation = <T extends PendingLocalReplyLike>(
   pending: readonly T[],
   payloadFingerprint: string,
 ): T | undefined =>
   pending.find((p) => {
-    const phase = p.phase ?? (p.uncertain ? "uncertain" : "sending");
-    if (phase !== "uncertain") return false;
-    // 无指纹的旧条目：不猜文案，绝不复用
+    const product = readProduct(p);
+    const retryable =
+      product.networkUncertain || product.terminalKnowledge === "unknown";
+    if (!retryable) return false;
     if (!p.payloadFingerprint) return false;
     return p.payloadFingerprint === payloadFingerprint;
   });
 
 /**
  * 收到落盘 user_reply → 按 meta.queueItemId 清 pending。
- * R34-6：有 queueItemId 只走 id 对账；displayText 仅留给无 id 的旧历史事件。
  * @deprecated R36-2：user_reply 非终态，请用 markPendingPersistedByUserReply
  */
 export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
@@ -228,7 +355,6 @@ export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
 ): T[] => {
   const qid =
     typeof ev.meta?.queueItemId === "string" ? ev.meta.queueItemId : null;
-  // R34-6：新协议事件必带 id；无 id 才按文案兜底（旧历史），避免两 tab 同文案误清
   const idx = qid
     ? prev.findIndex((p) => p.itemId === qid)
     : prev.findIndex((p) => p.displayText === ev.text);
@@ -239,7 +365,8 @@ export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R36-2：user_reply = persisted 非终态——占位换持久气泡语义，不写 delivered、不进 settled。
+ * R36-2 / R40-1：user_reply = persistence 提升为 persisted，不写 delivered、不进 settled。
+ * 经 join：不降级、不吞 terminalKnowledge / networkUncertain。
  */
 export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>(
   prev: T[],
@@ -252,107 +379,28 @@ export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>
     : prev.findIndex((p) => p.displayText === ev.text);
   if (idx < 0) return prev;
   const next = [...prev];
-  const cur = next[idx]!;
-  next[idx] = {
-    ...cur,
-    phase: "persisted" as const,
-    uncertain: false,
-  };
+  next[idx] = applyProductJoin(next[idx]!, { persistence: "persisted" });
   return next;
 };
 
 /**
- * R39-1：operation phase 单调优先级（高 → 低）。
- *
- *   known terminal（摘 pending，不走本 helper）
- *   > persisted
- *   > uncertain(unknown_terminal)
- *   > uncertain(network)
- *   > sending
- *
- * 「HTTP 是否清 composer 草稿」与 ledger phase 正交——本表只约束 phase/marker，
- * 不决定 clearDraft。known terminal 仍唯一收敛（从 pending 摘除）。
- */
-export type PendingPhaseIncoming = {
-  phase: "sending" | "uncertain" | "persisted";
-  uncertain?: boolean;
-  uncertainCause?: UncertainCause;
-};
-
-/** 数值越大证据越强；known terminal 不进表（由 reducer 直接摘 pending） */
-export const pendingPhaseRank = (
-  p: Pick<PendingLocalReplyLike, "phase" | "uncertainCause" | "uncertain">,
-): number => {
-  const phase =
-    p.phase ?? (p.uncertain ? ("uncertain" as const) : ("sending" as const));
-  if (phase === "persisted") return 40;
-  if (phase === "uncertain") {
-    // unknown_terminal 强于 network：fail-closed 证据不可被普通 transport 抹掉
-    return p.uncertainCause === "unknown_terminal" ? 30 : 20;
-  }
-  return 10; // sending
-};
-
-/**
- * R39-1：phase 单调 join——拒绝把更强证据降为更弱 transport 态。
- *
- * transportAck=true（http_queued / http_direct_ok）：incoming=sending 可覆盖
- * network-uncertain（同 id 重试受理），但仍不可覆盖 persisted / unknown_terminal。
- * 普通路径（含 markPendingUncertain）：只升不降。
- */
-export const joinPendingPhase = <T extends PendingLocalReplyLike>(
-  current: T,
-  incoming: PendingPhaseIncoming,
-  opts?: { transportAck?: boolean },
-): T => {
-  const curRank = pendingPhaseRank(current);
-  const inRank = pendingPhaseRank(incoming);
-
-  // 202/direct：允许 sending 清掉 network uncertain；persisted / unknown 不动
-  if (opts?.transportAck && incoming.phase === "sending") {
-    if (curRank >= 30) return current;
-    return {
-      ...current,
-      phase: "sending",
-      uncertain: false,
-      uncertainCause: undefined,
-    };
-  }
-
-  // 更弱 → 拒绝降级（persisted 不被 network/sending；unknown 不被 network）
-  if (inRank < curRank) return current;
-
-  return {
-    ...current,
-    phase: incoming.phase,
-    uncertain: incoming.uncertain,
-    uncertainCause: incoming.uncertainCause,
-  };
-};
-
-/**
- * R34-4 / R38-1 / R39-1：标 uncertain，不删 pending。
- * cause 默认 network（fetch reject / 响应丢失）；未知 wire 终态传 unknown_terminal。
- * 经 joinPendingPhase：不得把 persisted 降为 uncertain。
+ * 标 network / unknown_terminal 不确定——走 product-state join，不硬写、不降 persistence。
  */
 export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   pending: T[],
   itemId: string,
   cause: UncertainCause = "network",
 ): T[] =>
-  pending.map((p) =>
-    p.itemId === itemId
-      ? joinPendingPhase(p, {
-          phase: "uncertain",
-          uncertain: true,
-          uncertainCause: cause,
-        })
-      : p,
-  );
+  pending.map((p) => {
+    if (p.itemId !== itemId) return p;
+    if (cause === "unknown_terminal") {
+      return applyProductJoin(p, { terminalKnowledge: "unknown" });
+    }
+    return applyProductJoin(p, { networkUncertain: true });
+  });
 
 /**
  * R32-1 / R36-2：user_reply 对账——标 persisted，不记 settled / delivered。
- * （函数名保留兼容旧测试 import；语义已改为非终态）
  */
 export const applyUserReplyTerminal = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -360,7 +408,6 @@ export const applyUserReplyTerminal = <T extends PendingLocalReplyLike>(
   ev: { text: string; meta?: Record<string, unknown> | null },
 ): { pending: T[]; settled: string[] } => ({
   pending: markPendingPersistedByUserReply(pending, ev),
-  // R36-2：persisted 不是终态，不进 settled（避免占坑挡后到 failed）
   settled: [...settled],
 });
 
@@ -375,7 +422,7 @@ export const removePendingByQueueFailed = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-1：queue_failed 终态对账——清 pending + 全量记入 settled（含未命中的早到 id）。
+ * R32-1：queue_failed 终态对账——清 pending + 全量记入 settled。
  */
 export const applyQueueFailedTerminal = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -387,8 +434,7 @@ export const applyQueueFailedTerminal = <T extends PendingLocalReplyLike>(
 });
 
 /**
- * R32-1：202 返回后是否允许插入 pending——已 settled 则禁止（终态已早到）。
- * R33-1：请求前已登记时，202 只做「是否保留」判定（不应再插第二条）。
+ * R32-1：202 返回后是否允许插入 pending——已 settled 则禁止。
  */
 export const shouldInsertPendingAfter202 = (
   settled: readonly string[],
@@ -397,7 +443,7 @@ export const shouldInsertPendingAfter202 = (
 
 /**
  * R33-1 / R36-2：onDone 清 pending——只清「已有明确终态」的条目；
- * 无终态的保持 / 标 uncertain（不再按 runStatus 猜成功）。
+ * 无终态的保持 / 标 networkUncertain（不再按 runStatus 猜成功）。
  */
 export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -408,20 +454,15 @@ export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
   const nextPending: T[] = [];
   for (const p of pending) {
     const outcome = outcomes[p.itemId];
-    // R36-2：仅明确终态（delivered/failed）才清；unknown 与无 outcome 保留
     if (outcome === "delivered" || outcome === "failed") {
       clearedIds.push(p.itemId);
       continue;
     }
-    // 无终态：保持 persisted 或标 uncertain（可同 id 对账/重试）
-    if (p.phase === "persisted") {
+    // 无终态：persisted 保持；否则标 network uncertain 可同 id 对账/重试
+    if (readProduct(p).persistence === "persisted") {
       nextPending.push(p);
     } else {
-      nextPending.push({
-        ...p,
-        uncertain: true,
-        phase: "uncertain" as const,
-      });
+      nextPending.push(applyProductJoin(p, { networkUncertain: true }));
     }
   }
   return {
@@ -432,7 +473,7 @@ export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R33-1：HTTP 失败 / 非排队 200 时摘掉请求前登记的 pending（可记 settled 防迟到对账）。
+ * R33-1：HTTP 失败 / 非排队 200 时摘掉请求前登记的 pending。
  */
 export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -448,11 +489,8 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-2 / R33-1 / R36-4：SSE 重连 bootstrap 对账。
- *
- * - serverItemIds ∪ operationSnapshot(accepting|persisted) → 存活，保留
- * - recentSettled：可重放终态 → 清 pending + 记 settled
- * - 既不在 snapshot 也不在终态 → ghost → uncertain/unknown（绝不 delivered）
+ * R32-2 / R33-1 / R36-4 / R40-1：SSE 重连 bootstrap 对账。
+ * unknown recentSettled 走同一 product join——不得硬写降 persistence。
  */
 export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -477,7 +515,6 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       .map((e) => [e.itemId, e] as const),
   );
 
-  // R37-4：只有 known outcome 才进 terminal；unknown recentSettled 不摘 pending、不占 outcomes
   const knownTerminalEntries: {
     itemId: string;
     outcome: "delivered" | "failed";
@@ -501,80 +538,69 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   const seenPending = new Set<string>();
 
   for (const p of pending) {
-    const phase = p.phase ?? (p.uncertain ? "uncertain" : "sending");
-    // 仍在服务端存活集合 → 保留；snapshot phase 可升级为 persisted
+    const cur = readProduct(p);
+    // 仍在服务端存活集合 → 保留；snapshot 可提升 persistence；active 正证据清不确定轴
     if (serverSet.has(p.itemId)) {
       const snap = snapshotById.get(p.itemId);
-      let nextPhase = phase;
+      let next = applyProductJoin(p, {});
       if (snap?.phase === "persisted") {
-        nextPhase = "persisted";
-      } else if (phase === "uncertain") {
-        // 仍在 server active → 正证据覆盖旧 uncertain（含 unknown_terminal）
-        nextPhase = "sending";
+        next = applyProductJoin(next, { persistence: "persisted" });
       }
-      nextPending.push(
-        nextPhase !== phase || phase === "uncertain"
-          ? {
-              ...p,
-              uncertain: nextPhase === "uncertain",
-              phase: nextPhase as "sending" | "uncertain" | "persisted",
-              // 回 sending 时清 marker，避免后续 HTTP 误判
-              ...(nextPhase === "sending"
-                ? { uncertainCause: undefined }
-                : {}),
-            }
-          : p,
-      );
+      // 仍在 server active → 正证据覆盖旧 network / unknown_terminal
+      const nextProduct = readProduct(next);
+      if (
+        nextProduct.networkUncertain ||
+        nextProduct.terminalKnowledge === "unknown"
+      ) {
+        next = applyProductJoin(next, { clearAllUncertainty: true });
+      }
+      nextPending.push(next);
       seenPending.add(p.itemId);
       continue;
     }
-    // R33-1 / R37-4：仅 known ledger / 本地已 settled → 清 pending
     if (knownLedgerSet.has(p.itemId) || settledSet.has(p.itemId)) {
       seenPending.add(p.itemId);
       continue;
     }
-    // R37-4 / R38-1：unknown recentSettled → uncertain + unknown_terminal（可被后到 known 纠正）
+    // R40-1：unknown recentSettled → join terminalKnowledge，不硬写、不降 persistence
     if (unknownLedgerIds.has(p.itemId)) {
-      nextPending.push({
-        ...p,
-        uncertain: true,
-        phase: "uncertain" as const,
-        uncertainCause: "unknown_terminal" as const,
-      });
+      nextPending.push(
+        applyProductJoin(p, { terminalKnowledge: "unknown" }),
+      );
       seenPending.add(p.itemId);
       continue;
     }
-    // R34-4 / R36-4：uncertain 且服务端重启丢 ledger → 保留可同 id 重试
-    if (phase === "uncertain") {
-      nextPending.push(p);
+    // uncertain 且服务端重启丢 ledger → 保留可同 id 重试
+    if (cur.networkUncertain || cur.terminalKnowledge === "unknown") {
+      nextPending.push(applyProductJoin(p, {}));
       seenPending.add(p.itemId);
       continue;
     }
-    // R36-4：真幽灵——无 snapshot 证据也无终态 → uncertain，绝不 delivered
+    // 真幽灵——无 snapshot 证据也无终态 → networkUncertain，绝不 delivered
     ghostIds.push(p.itemId);
-    nextPending.push({
-      ...p,
-      uncertain: true,
-      phase: "uncertain" as const,
-    });
+    nextPending.push(applyProductJoin(p, { networkUncertain: true }));
     seenPending.add(p.itemId);
   }
 
-  // R36-10：bootstrap snapshot 重建本地没有的 active/persisted 条目
+  // bootstrap snapshot 重建本地没有的 active/persisted 条目
   for (const snap of operationSnapshot) {
     if (!snap.itemId || !isMessageOpActivePhase(snap.phase)) continue;
     if (seenPending.has(snap.itemId) || settledSet.has(snap.itemId)) continue;
     if (knownLedgerSet.has(snap.itemId)) continue;
+    const product = initialProductState();
+    const withPers =
+      snap.phase === "persisted"
+        ? joinPendingProductState(product, { persistence: "persisted" })
+        : product;
     nextPending.push({
       itemId: snap.itemId,
       displayText: "",
       payloadFingerprint: snap.fingerprint ?? "",
-      phase: snap.phase === "persisted" ? "persisted" : "sending",
-      uncertain: false,
+      ...withPers,
+      uncertain: projectPendingUncertain(withPers),
     } as T);
   }
 
-  // R36-4：ghost 不进 settled（settled 曾被当 delivered 证据）
   return {
     pending: nextPending,
     settled: nextSettled,
@@ -584,7 +610,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
 };
 
 // ---------------------------------------------------------------------------
-// R35-2 / R36-2：统一 Operation reducer
+// 统一 Operation reducer
 // ---------------------------------------------------------------------------
 
 export type ChatOpAction =
@@ -598,10 +624,8 @@ export type ChatOpAction =
       type: "queue_state";
       serverItemIds: readonly string[];
       recentSettled?: readonly { itemId: string; outcome?: string }[];
-      /** R36-4：完整 operation snapshot（含 accepting/persisted） */
       operationSnapshot?: readonly MessageOpSnapshotEntry[];
     }
-  /** R36-2：显式 operation phase / terminal 帧（成功终态唯一来源之一） */
   | {
       type: "message_op";
       itemId: string;
@@ -623,7 +647,7 @@ export type ChatOpAction =
 export type ChatOpReduceResult = {
   state: ChatOpState;
   /**
-   * R35-2：http_reject_network 仲裁——
+   * http_reject_network 仲裁——
    * true = 已 delivered，调用方清草稿返回 true；
    * false = failed / uncertain / unknown，保留草稿。
    */
@@ -641,22 +665,20 @@ export const emptyChatOpState = (): ChatOpState => ({
 const asOperations = <T extends PendingLocalReplyLike>(
   pending: T[],
 ): ChatOperation[] =>
-  pending.map((p) => ({
-    itemId: p.itemId,
-    payloadFingerprint: p.payloadFingerprint ?? "",
-    phase: (p.phase ??
-      (p.uncertain ? "uncertain" : "sending")) as
-      | "sending"
-      | "uncertain"
-      | "persisted",
-    displayText: p.displayText,
-    text: p.displayText,
-    id: p.itemId,
-    uncertainCause: p.uncertainCause,
-  }));
+  pending.map((p) => {
+    const product = readProduct(p);
+    return {
+      itemId: p.itemId,
+      payloadFingerprint: p.payloadFingerprint ?? "",
+      ...product,
+      displayText: p.displayText,
+      text: p.displayText,
+      id: p.itemId,
+    };
+  });
 
 /**
- * R35-2 / R36-2：HTTP / SSE / queue 全量提交到同一 reducer。
+ * HTTP / SSE / queue 全量提交到同一 reducer。
  * fetch reject 时查终态：仅明确 delivered → clearDraft；其余保留草稿。
  */
 export const reduceChatOperation = (
@@ -665,22 +687,31 @@ export const reduceChatOperation = (
 ): ChatOpReduceResult => {
   switch (action.type) {
     case "register": {
-      // 已有同 id pending → 替换；否则追加
       const without = state.pending.filter(
         (p) => p.itemId !== action.op.itemId,
       );
+      const base = initialProductState();
+      const product = {
+        persistence: action.op.persistence ?? base.persistence,
+        terminalKnowledge:
+          action.op.terminalKnowledge ?? base.terminalKnowledge,
+        networkUncertain:
+          action.op.networkUncertain ?? base.networkUncertain,
+      };
       return {
         state: {
           ...state,
           pending: [
             ...without,
-            { ...action.op, phase: action.op.phase ?? "sending" },
+            {
+              ...action.op,
+              ...product,
+            },
           ],
         },
       };
     }
     case "user_reply": {
-      // R36-2：只标 persisted，不写 delivered、不进 settled
       const pending = markPendingPersistedByUserReply(
         state.pending,
         action.ev,
@@ -702,31 +733,23 @@ export const reduceChatOperation = (
       return { state: { pending, settled, outcomes } };
     }
     case "message_op": {
-      // R36-2：显式 phase / outcome 帧
       const { itemId } = action;
       if (!itemId) return { state };
 
-      // 非终态 phase
+      // 非终态 phase：提升 persistence；正证据清不确定轴
       if (action.phase === "accepting" || action.phase === "persisted") {
-        const pending = state.pending.map((p) =>
-          p.itemId === itemId
-            ? {
-                ...p,
-                phase:
-                  action.phase === "persisted"
-                    ? ("persisted" as const)
-                    : ("sending" as const),
-                uncertain: false,
-                // 正证据覆盖：清 unknown_terminal / network marker
-                uncertainCause: undefined,
-              }
-            : p,
-        );
-        // 本地尚无条目时（跨路由恢复前）——仅 phase 更新不凭空建（等 snapshot）
+        const pending = state.pending.map((p) => {
+          if (p.itemId !== itemId) return p;
+          return applyProductJoin(p, {
+            ...(action.phase === "persisted"
+              ? { persistence: "persisted" as const }
+              : {}),
+            clearAllUncertainty: true,
+          });
+        });
         return { state: { ...state, pending } };
       }
 
-      // handedOff 或 outcome → 终态；R37-4：unknown 不进 settled/outcomes
       const rawOutcome =
         action.outcome ??
         (action.phase === "handedOff" ? "delivered" : undefined);
@@ -737,7 +760,6 @@ export const reduceChatOperation = (
         rawOutcome ?? (action.phase === "handedOff" ? "delivered" : undefined),
       );
       if (!known) {
-        // R38-1：未知 wire → unknown_terminal；outcomes 缺键不再兼表「见过未知」
         return {
           state: {
             ...state,
@@ -758,7 +780,6 @@ export const reduceChatOperation = (
       return { state: { pending, settled, outcomes } };
     }
     case "queue_state": {
-      // R37-4/5：known recentSettled 与 outcomes 在 reconcile 内同一事务写入/淘汰
       const { pending, settled, outcomes, ghostIds } =
         reconcilePendingWithQueueState(
           state.pending,
@@ -768,12 +789,10 @@ export const reduceChatOperation = (
           action.recentSettled,
           action.operationSnapshot,
         );
-      // R36-4：ghost 只标 uncertain，不写 outcomes——绝不 delivered
       return { state: { pending, settled, outcomes }, ghostIds };
     }
     case "http_queued": {
-      // 幂等 202：清 network-uncertain；若终态已早到则摘掉 pending
-      // R39-1：phase 经 join——persisted / unknown_terminal 不被 late 202 降为 sending
+      // transport ack：只清 networkUncertain；persisted / unknown 不动
       if (!shouldInsertPendingAfter202(state.settled, action.itemId)) {
         const { pending, settled } = dropPendingByItemId(
           state.pending,
@@ -785,51 +804,32 @@ export const reduceChatOperation = (
       return {
         state: {
           ...state,
-          pending: state.pending.map((p) => {
-            if (p.itemId !== action.itemId) return p;
-            return joinPendingPhase(
-              p,
-              {
-                phase: "sending",
-                uncertain: false,
-                uncertainCause: undefined,
-              },
-              { transportAck: true },
-            );
-          }),
+          pending: state.pending.map((p) =>
+            p.itemId === action.itemId
+              ? applyProductJoin(p, { clearNetworkUncertain: true })
+              : p,
+          ),
         },
       };
     }
     case "http_direct_ok": {
-      // R36-2：200 非 queued 仅表示受理中——保留 pending 等 user_reply/message_op
-      // （旧逻辑摘 pending 会丢 ledger，导致 persisted 无法对账）
-      // R39-1：同上——transport ack 不降级 persisted / unknown_terminal
       return {
         state: {
           ...state,
-          pending: state.pending.map((p) => {
-            if (p.itemId !== action.itemId) return p;
-            return joinPendingPhase(
-              p,
-              {
-                phase: "sending",
-                uncertain: false,
-                uncertainCause: undefined,
-              },
-              { transportAck: true },
-            );
-          }),
+          pending: state.pending.map((p) =>
+            p.itemId === action.itemId
+              ? applyProductJoin(p, { clearNetworkUncertain: true })
+              : p,
+          ),
         },
       };
     }
     case "http_settled": {
-      // R37-1/4：缺失/未知 outcome 不合成 delivered、不进 settled；标 uncertain 可纠正
       const known = decodeKnownLedgerOutcome(action.outcome);
       if (!known) {
         return {
           state: {
             ...state,
-            // R38-1：HTTP settled 未知 outcome 同属 unknown_terminal
             pending: markPendingUncertain(
               state.pending,
               action.itemId,
@@ -858,7 +858,6 @@ export const reduceChatOperation = (
       };
     }
     case "http_reject_network": {
-      // R36-2/3：仅明确 delivered 才清草稿；settled 无 outcome / unknown 不得当成功
       const outcome = state.outcomes[action.itemId];
       if (outcome === "failed" || outcome === "unknown") {
         return { state, clearDraft: false };
@@ -881,7 +880,6 @@ export const reduceChatOperation = (
       };
     }
     case "payload_mismatch": {
-      // R35-2：同 id 内容不同 → 丢掉旧 pending，调用方转新 id 重发
       const { pending, settled } = dropPendingByItemId(
         state.pending,
         state.settled,
@@ -890,13 +888,11 @@ export const reduceChatOperation = (
       return { state: { ...state, pending, settled }, clearDraft: false };
     }
     case "done_clear": {
-      // R36-2：按已有 outcome 对账，不猜每条成功
       const { pending, settled, clearedIds } = applyDoneClearPending(
         state.pending,
         state.settled,
         state.outcomes,
       );
-      // R37-5：settled FIFO 裁剪时同步 outcomes key
       const { settled: nextSettled, outcomes } = rememberKnownTerminals(
         settled,
         state.outcomes,
@@ -917,7 +913,7 @@ export const reduceChatOperation = (
 };
 
 /**
- * R35-2：从旧 pending + settled 拼 ledger（chat-view 迁移期便利）。
+ * 从旧 pending + settled 拼 ledger（chat-view 迁移期便利）。
  */
 export const ledgerFromParts = <T extends PendingLocalReplyLike>(
   pending: T[],

@@ -104,12 +104,12 @@ export const commitHttpChatReply = (args: {
 
   if ("queued" in result && result.queued) {
     // R37-1：失败 message_op 先到 → 不得因 202 清草稿
-    // R38-1：unknown_terminal marker 先到 → 同样保留草稿（outcomes 缺键不再兼表）
+    // R40-1：terminalKnowledge=unknown → 同样保留草稿（与 persistence 正交）
     const ledgerBefore = getChatOpLedger(operationTaskId);
     const prior = ledgerBefore.outcomes[result.itemId];
     const unknownTerminalBefore =
       ledgerBefore.pending.find((p) => p.itemId === result.itemId)
-        ?.uncertainCause === "unknown_terminal";
+        ?.terminalKnowledge === "unknown";
     const reduceResult = dispatchChatOp(operationTaskId, {
       type: "http_queued",
       itemId: result.itemId,
@@ -118,7 +118,7 @@ export const commitHttpChatReply = (args: {
       reduceResult.state.outcomes[result.itemId] ?? prior;
     const unknownTerminalAfter =
       reduceResult.state.pending.find((p) => p.itemId === result.itemId)
-        ?.uncertainCause === "unknown_terminal";
+        ?.terminalKnowledge === "unknown";
     if (unknownTerminalBefore || unknownTerminalAfter) {
       return {
         clearDraft: false,
@@ -136,12 +136,12 @@ export const commitHttpChatReply = (args: {
     };
   }
 
-  // direct 200：受理中，非终态；若 SSE 终态已失败 / unknown_terminal 则保留草稿
+  // direct 200：受理中，非终态；若 SSE 终态已失败 / unknown 则保留草稿
   const ledgerBefore = getChatOpLedger(operationTaskId);
   const prior = ledgerBefore.outcomes[clientItemId];
   const unknownTerminalBefore =
     ledgerBefore.pending.find((p) => p.itemId === clientItemId)
-      ?.uncertainCause === "unknown_terminal";
+      ?.terminalKnowledge === "unknown";
   const reduceResult = dispatchChatOp(operationTaskId, {
     type: "http_direct_ok",
     itemId: clientItemId,
@@ -150,7 +150,7 @@ export const commitHttpChatReply = (args: {
     reduceResult.state.outcomes[clientItemId] ?? prior;
   const unknownTerminalAfter =
     reduceResult.state.pending.find((p) => p.itemId === clientItemId)
-      ?.uncertainCause === "unknown_terminal";
+      ?.terminalKnowledge === "unknown";
   if (unknownTerminalBefore || unknownTerminalAfter) {
     return {
       clearDraft: false,

@@ -44,7 +44,9 @@ const op = (
     Pick<ChatOperation, "itemId" | "payloadFingerprint" | "displayText">,
 ): ChatOperation => ({
   text: partial.text ?? partial.displayText,
-  phase: partial.phase ?? "sending",
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
   ...partial,
 });
 
@@ -72,7 +74,7 @@ describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
       type: "user_reply",
       ev: { text: "hello", meta: { queueItemId: itemId } },
     }).state;
-    expect(state.pending[0]?.phase).toBe("persisted");
+    expect(state.pending[0]?.persistence).toBe("persisted");
     expect(state.outcomes[itemId]).toBeUndefined();
 
     // message_op handedOff → delivered
@@ -143,7 +145,7 @@ describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
       itemId,
     });
     expect(rejected.clearDraft).toBe(false);
-    expect(rejected.state.pending[0]?.phase).toBe("uncertain");
+    expect(rejected.state.pending[0]?.networkUncertain).toBe(true);
   });
 
   it("② 两条空文本不同附件 → 不复用旧 operation", () => {
@@ -162,7 +164,7 @@ describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
         itemId: "cq_att_a",
         payloadFingerprint: fpA,
         displayText: "[附件]",
-        phase: "uncertain",
+        persistence: "sending", terminalKnowledge: "none", networkUncertain: true,
         attachments: ["/tmp/a.png"],
       }),
     ];
@@ -188,7 +190,7 @@ describe("R35-2：Operation reducer（HTTP ↔ SSE 仲裁）", () => {
         itemId: "cq_skill_a",
         payloadFingerprint: fpA,
         displayText: "跑一下",
-        phase: "uncertain",
+        persistence: "sending", terminalKnowledge: "none", networkUncertain: true,
       }),
     ];
     expect(findReusableUncertainOperation(pending, fpB)).toBeUndefined();

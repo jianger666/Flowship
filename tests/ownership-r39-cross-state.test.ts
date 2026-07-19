@@ -37,7 +37,9 @@ const op = (
     Pick<ChatOperation, "itemId" | "payloadFingerprint" | "displayText">,
 ): ChatOperation => ({
   text: partial.text ?? partial.displayText,
-  phase: partial.phase ?? "sending",
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
   ...partial,
 });
 
@@ -85,8 +87,9 @@ describe("R39-① unknown_terminal → late 202/direct 保留草稿", () => {
     const before = getChatOpLedger(taskId).pending.find(
       (p) => p.itemId === itemId,
     );
-    expect(before?.phase).toBe("uncertain");
-    expect(before?.uncertainCause).toBe("unknown_terminal");
+    expect(before?.terminalKnowledge).toBe("unknown");
+    expect(before?.networkUncertain).toBe(false);
+    expect(before?.persistence).toBe("sending");
 
     const committed = commitHttpChatReply({
       operationTaskId: taskId,
@@ -102,8 +105,9 @@ describe("R39-① unknown_terminal → late 202/direct 保留草稿", () => {
     const after = committed.reduceResult.state.pending.find(
       (p) => p.itemId === itemId,
     );
-    expect(after?.phase).toBe("uncertain");
-    expect(after?.uncertainCause).toBe("unknown_terminal");
+    expect(after?.terminalKnowledge).toBe("unknown");
+    expect(after?.networkUncertain).toBe(false);
+    expect(after?.persistence).toBe("sending");
     expect(after?.payloadFingerprint).toBe(fp);
     expect(after?.itemId).toBe(itemId);
     expect(after?.attachments).toEqual(["/tmp/a.txt"]);
@@ -130,8 +134,9 @@ describe("R39-① unknown_terminal → late 202/direct 保留草稿", () => {
     const after = committed.reduceResult.state.pending.find(
       (p) => p.itemId === itemId,
     );
-    expect(after?.phase).toBe("uncertain");
-    expect(after?.uncertainCause).toBe("unknown_terminal");
+    expect(after?.terminalKnowledge).toBe("unknown");
+    expect(after?.networkUncertain).toBe(false);
+    expect(after?.persistence).toBe("sending");
     expect(after?.payloadFingerprint).toBe(fp);
     expect(
       findReusableUncertainOperation(
@@ -154,8 +159,8 @@ describe("R39-① unknown_terminal → late 202/direct 保留草稿", () => {
       });
       expect(
         getChatOpLedger(taskId).pending.find((p) => p.itemId === itemId)
-          ?.uncertainCause,
-      ).toBe("unknown_terminal");
+          ?.terminalKnowledge,
+      ).toBe("unknown");
 
       const committed = commitHttpChatReply({
         operationTaskId: taskId,
@@ -174,8 +179,8 @@ describe("R39-① unknown_terminal → late 202/direct 保留草稿", () => {
       const after = committed.reduceResult.state.pending.find(
         (p) => p.itemId === itemId,
       );
-      expect(after?.phase, mode).toBe("uncertain");
-      expect(after?.uncertainCause, mode).toBe("unknown_terminal");
+      expect(after?.terminalKnowledge, mode).toBe("unknown");
+      expect(after?.networkUncertain, mode).toBe(false);
       expect(after?.payloadFingerprint, mode).toBe(fp);
     }
   });
@@ -205,8 +210,8 @@ describe("R39-② 对照：普通 accepted / network-uncertain 重试", () => {
       const after = committed.reduceResult.state.pending.find(
         (p) => p.itemId === itemId,
       );
-      expect(after?.phase, mode).toBe("sending");
-      expect(after?.uncertainCause, mode).toBeUndefined();
+      expect(after?.persistence, mode).toBe("sending");
+      expect(after?.networkUncertain, mode).toBe(false);
     }
   });
 
@@ -222,8 +227,8 @@ describe("R39-② 对照：普通 accepted / network-uncertain 重试", () => {
     const mid = getChatOpLedger(taskId).pending.find(
       (p) => p.itemId === itemId,
     );
-    expect(mid?.phase).toBe("uncertain");
-    expect(mid?.uncertainCause).toBe("network");
+    expect(mid?.networkUncertain).toBe(true);
+    expect(mid?.networkUncertain).toBe(true);
 
     const committed = commitHttpChatReply({
       operationTaskId: taskId,
@@ -239,8 +244,8 @@ describe("R39-② 对照：普通 accepted / network-uncertain 重试", () => {
     const after = committed.reduceResult.state.pending.find(
       (p) => p.itemId === itemId,
     );
-    expect(after?.phase).toBe("sending");
-    expect(after?.uncertainCause).toBeUndefined();
+    expect(after?.persistence).toBe("sending");
+    expect(after?.networkUncertain).toBe(false);
     expect(after?.payloadFingerprint).toBe(fp);
   });
 });
@@ -269,21 +274,19 @@ describe("R39-③ unknown → known 恰好一次收敛并清 marker", () => {
         itemId,
         outcome: "future_failure_reason",
       }).state;
-      expect(state.pending.find((p) => p.itemId === itemId)?.uncertainCause).toBe(
-        "unknown_terminal",
-      );
+      expect(state.pending.find((p) => p.itemId === itemId)?.terminalKnowledge).toBe("unknown");
 
       // late 202 不得抹 marker
       state = reduceChatOperation(state, {
         type: "http_queued",
         itemId,
       }).state;
-      expect(state.pending.find((p) => p.itemId === itemId)?.phase).toBe(
-        "uncertain",
-      );
       expect(
-        state.pending.find((p) => p.itemId === itemId)?.uncertainCause,
-      ).toBe("unknown_terminal");
+        state.pending.find((p) => p.itemId === itemId)?.terminalKnowledge,
+      ).toBe("unknown");
+      expect(
+        state.pending.find((p) => p.itemId === itemId)?.networkUncertain,
+      ).toBe(false);
 
       state = reduceChatOperation(state, {
         type: "message_op",

@@ -54,6 +54,9 @@ import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
   allocClientChatQueueItemId,
   findReusableUncertainOperation,
+  initialProductState,
+  projectPendingUncertain,
+  shouldHideLocalPlaceholder,
   type ChatOpState,
   type ChatOperation,
 } from "@/lib/chat-pending-reconcile";
@@ -100,12 +103,13 @@ interface Props {
 }
 
 /**
- * R35-2：本地 Operation 占位（完整 payload + fingerprint，文案不参与 retry identity）。
+ * R35-2 / R40-1：本地 Operation 占位（完整 payload + fingerprint）。
  * images / attachments / skillRefs 供 uncertain 同 fingerprint 重发复用。
+ * 是否隐藏占位只看 persistence；uncertain 样式派生自 network/terminal 轴。
  */
 type PendingLocalReply = ChatOperation & {
   id: string;
-  /** 派生自 phase，给 event-stream 占位行用 */
+  /** 派生投影，给 event-stream 占位行用（非事实源） */
   uncertain?: boolean;
   images?: ImagePayload[];
   attachments?: string[];
@@ -199,12 +203,13 @@ export const ChatView = ({
     const nextPending: PendingLocalReply[] = state.pending.map((p) => ({
       ...p,
       id: p.id ?? p.itemId,
-      uncertain: p.phase === "uncertain",
+      uncertain: projectPendingUncertain(p),
     })) as PendingLocalReply[];
     pendingLocalRepliesRef.current = nextPending;
     setPendingLocalReplies(nextPending);
+    // 排队条：未落盘的本地占位数（persisted 已有正式气泡，不计）
     const activeCount = nextPending.filter(
-      (p) => p.phase !== "persisted",
+      (p) => !shouldHideLocalPlaceholder(p),
     ).length;
     setQueuedCount(activeCount > 0 ? activeCount : null);
   }, []);
@@ -224,9 +229,9 @@ export const ChatView = ({
     return subscribeChatOp(task.id, applyLedgerToUi);
   }, [task.id, applyLedgerToUi]);
 
-  // R36-2：persisted 已有持久气泡，不再渲染本地占位
+  // R40-1：是否渲染本地占位只看 persistence（与 terminal/network 轴正交）
   const pendingForStream = useMemo(
-    () => pendingLocalReplies.filter((p) => p.phase !== "persisted"),
+    () => pendingLocalReplies.filter((p) => !shouldHideLocalPlaceholder(p)),
     [pendingLocalReplies],
   );
 
@@ -295,7 +300,7 @@ export const ChatView = ({
     // R36-2/4：重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
     onQueueState: (serverItemIds, recentSettled, operationSnapshot) => {
       const before = pendingLocalRepliesRef.current.filter(
-        (p) => p.phase !== "persisted",
+        (p) => !shouldHideLocalPlaceholder(p),
       ).length;
       const result = dispatchChatOp(task.id, {
         type: "queue_state",
@@ -303,8 +308,12 @@ export const ChatView = ({
         recentSettled,
         operationSnapshot,
       });
+      // 仍算「活跃排队」：未 persisted 且非 retryable uncertain
       const after = result.state.pending.filter(
-        (p) => p.phase !== "persisted" && p.phase !== "uncertain",
+        (p) =>
+          !shouldHideLocalPlaceholder(p) &&
+          !p.networkUncertain &&
+          p.terminalKnowledge !== "unknown",
       ).length;
       const cleared = before - after;
       if (cleared > 0) {
@@ -334,7 +343,7 @@ export const ChatView = ({
         }
       } else {
         const active = pendingLocalRepliesRef.current.filter(
-          (p) => p.phase !== "persisted",
+          (p) => !shouldHideLocalPlaceholder(p),
         ).length;
         setQueuedCount(active > 0 ? active : null);
       }
@@ -400,7 +409,7 @@ export const ChatView = ({
             id: itemId,
             itemId,
             payloadFingerprint,
-            phase: "sending",
+            ...initialProductState(),
             text,
             displayText,
             images,

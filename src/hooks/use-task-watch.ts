@@ -53,6 +53,7 @@ import {
 import {
   classifyWatchHttpStatus,
   isTaskTerminalDeleted,
+  resolveWatchCleanEof,
   resolveWatchReconnectPolicy,
   WATCH_CLEAN_RECONNECT_DELAY_MS,
 } from "@/lib/task-terminal";
@@ -60,6 +61,7 @@ import type { ActionRecord, Task, TaskEvent } from "@/lib/types";
 
 export {
   classifyWatchHttpStatus,
+  resolveWatchCleanEof,
   resolveWatchReconnectPolicy,
   WATCH_CLEAN_RECONNECT_DELAY_MS,
   WATCH_MAX_TRANSIENT_FAILURES,
@@ -217,11 +219,42 @@ export const useTaskWatch = (
         };
 
         try {
-          await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
-          // 流 clean resolve：再清一次（幂等；建连时多半已清过）
-          unavailableAttempts = 0;
-          transientFailures = 0;
-          unavailableNotified = false;
+          const { established } = await watchTaskStream(
+            taskId,
+            sseCallbacks,
+            ctrl.signal,
+          );
+          // R40-2：只有 established 后 clean EOF 才清 epoch；
+          // bootstrap 前空流走 retryable 预算（与 fetch reject 同账）
+          const eof = resolveWatchCleanEof({
+            established,
+            unavailableAttempts,
+            transientFailures,
+            unavailableNotified,
+          });
+          if (eof.kind === "epoch_reset") {
+            unavailableAttempts = eof.nextUnavailableAttempts;
+            transientFailures = eof.nextTransientFailures;
+            unavailableNotified = eof.nextUnavailableNotified;
+          } else {
+            const decision = eof.decision;
+            if (decision.action === "terminate_exhausted") {
+              if (!cancelled && decision.notifyException) {
+                callbacksRef.current.onWatchException?.(
+                  new Error("SSE 流在建立前关闭"),
+                );
+              }
+              return;
+            }
+            if (decision.action === "retry") {
+              unavailableAttempts = decision.nextUnavailableAttempts;
+              transientFailures = decision.nextTransientFailures;
+              unavailableNotified = decision.nextUnavailableNotified;
+              await delay(decision.delayMs);
+              if (cancelled) return;
+              continue;
+            }
+          }
         } catch (err) {
           if (
             (err as { name?: string }).name === "AbortError" ||

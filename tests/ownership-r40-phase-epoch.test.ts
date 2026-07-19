@@ -15,10 +15,11 @@ import {
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
   emptyChatOpState,
-  joinPendingPhase,
-  pendingPhaseRank,
+  joinPendingProductState,
+  joinProductState,
   reduceChatOperation,
   type ChatOperation,
+  type PendingProductState,
 } from "@/lib/chat-pending-reconcile";
 import {
   commitHttpChatReject,
@@ -46,7 +47,9 @@ const op = (
     Pick<ChatOperation, "itemId" | "payloadFingerprint" | "displayText">,
 ): ChatOperation => ({
   text: partial.text ?? partial.displayText,
-  phase: partial.phase ?? "sending",
+  persistence: "sending",
+  terminalKnowledge: "none",
+  networkUncertain: false,
   ...partial,
 });
 
@@ -99,69 +102,53 @@ const streamBootstrapThenError = (task: Task, errMsg = "stream dropped") => {
   });
 };
 
-describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
-  it("precedence 表：known 外 persisted > unknown_terminal > network > sending", () => {
-    expect(pendingPhaseRank({ phase: "persisted" })).toBeGreaterThan(
-      pendingPhaseRank({
-        phase: "uncertain",
-        uncertainCause: "unknown_terminal",
-      }),
-    );
-    expect(
-      pendingPhaseRank({
-        phase: "uncertain",
-        uncertainCause: "unknown_terminal",
-      }),
-    ).toBeGreaterThan(
-      pendingPhaseRank({ phase: "uncertain", uncertainCause: "network" }),
-    );
-    expect(
-      pendingPhaseRank({ phase: "uncertain", uncertainCause: "network" }),
-    ).toBeGreaterThan(pendingPhaseRank({ phase: "sending" }));
+describe("R40-① R39-1：product-state 正交 join（persisted 不被 transport 降级）", () => {
+  it("格 join：persisted ⊔ unknown 交换；transport ack 只清 network", () => {
+    const persisted: PendingProductState = {
+      persistence: "persisted",
+      terminalKnowledge: "none",
+      networkUncertain: false,
+    };
+    const unknown: PendingProductState = {
+      persistence: "sending",
+      terminalKnowledge: "unknown",
+      networkUncertain: false,
+    };
+    const joined = joinProductState(persisted, unknown);
+    expect(joinProductState(unknown, persisted)).toEqual(joined);
+    expect(joined).toEqual({
+      persistence: "persisted",
+      terminalKnowledge: "unknown",
+      networkUncertain: false,
+    });
 
-    // transportAck：sending 可清 network，不可清 persisted / unknown
-    const persisted = {
-      itemId: "a",
-      displayText: "x",
-      phase: "persisted" as const,
-    };
     expect(
-      joinPendingPhase(
-        persisted,
-        { phase: "sending", uncertain: false },
-        { transportAck: true },
-      ).phase,
-    ).toBe("persisted");
-    const unknown = {
-      itemId: "b",
-      displayText: "x",
-      phase: "uncertain" as const,
-      uncertainCause: "unknown_terminal" as const,
-    };
+      joinPendingProductState(
+        { ...persisted, networkUncertain: true },
+        { clearNetworkUncertain: true },
+      ),
+    ).toEqual({
+      persistence: "persisted",
+      terminalKnowledge: "none",
+      networkUncertain: false,
+    });
     expect(
-      joinPendingPhase(
-        unknown,
-        { phase: "sending", uncertain: false },
-        { transportAck: true },
-      ).uncertainCause,
-    ).toBe("unknown_terminal");
-    const network = {
-      itemId: "c",
-      displayText: "x",
-      phase: "uncertain" as const,
-      uncertainCause: "network" as const,
-      uncertain: true,
-    };
+      joinPendingProductState(unknown, { clearNetworkUncertain: true })
+        .terminalKnowledge,
+    ).toBe("unknown");
     expect(
-      joinPendingPhase(
-        network,
-        { phase: "sending", uncertain: false },
-        { transportAck: true },
-      ).phase,
-    ).toBe("sending");
+      joinPendingProductState(
+        {
+          persistence: "sending",
+          terminalKnowledge: "none",
+          networkUncertain: true,
+        },
+        { clearNetworkUncertain: true },
+      ).networkUncertain,
+    ).toBe(false);
   });
 
-  it("user_reply persisted → late 202 / direct / fetch reject：phase 保持 persisted", () => {
+  it("user_reply persisted → late 202 / direct / fetch reject：persistence 保持", () => {
     for (const mode of ["queued", "direct", "reject"] as const) {
       const taskId = `r40_pers_${mode}`;
       const itemId = `cq_r40_pers_${mode}`;
@@ -173,7 +160,7 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
       });
       expect(
         getChatOpLedger(taskId).pending.find((p) => p.itemId === itemId)
-          ?.phase,
+          ?.persistence,
       ).toBe("persisted");
 
       if (mode === "reject") {
@@ -182,13 +169,13 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
           clientItemId: itemId,
           kind: "network",
         });
-        // 清草稿契约：无 delivered → false；phase 不回 uncertain
         expect(committed.clearDraft, mode).toBe(false);
         const after = committed.reduceResult.state.pending.find(
           (p) => p.itemId === itemId,
         );
-        expect(after?.phase, mode).toBe("persisted");
-        expect(after?.uncertainCause, mode).toBeUndefined();
+        expect(after?.persistence, mode).toBe("persisted");
+        // R40-1：response-lost 置位 network，供 same-id 重试
+        expect(after?.networkUncertain, mode).toBe(true);
       } else {
         const committed = commitHttpChatReply({
           operationTaskId: taskId,
@@ -203,12 +190,11 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
                 }
               : { task: stubTask(taskId), autoStarted: false },
         });
-        // 清草稿契约：普通 accepted 仍清（与 phase 正交）
         expect(committed.clearDraft, mode).toBe(true);
         const after = committed.reduceResult.state.pending.find(
           (p) => p.itemId === itemId,
         );
-        expect(after?.phase, mode).toBe("persisted");
+        expect(after?.persistence, mode).toBe("persisted");
       }
     }
   });
@@ -222,8 +208,8 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
       dispatchChatOp(taskId, { type: "http_reject_network", itemId });
       expect(
         getChatOpLedger(taskId).pending.find((p) => p.itemId === itemId)
-          ?.phase,
-      ).toBe("uncertain");
+          ?.networkUncertain,
+      ).toBe(true);
 
       dispatchChatOp(taskId, {
         type: "user_reply",
@@ -232,10 +218,11 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
           meta: { queueItemId: itemId },
         },
       });
-      expect(
-        getChatOpLedger(taskId).pending.find((p) => p.itemId === itemId)
-          ?.phase,
-      ).toBe("persisted");
+      const mid = getChatOpLedger(taskId).pending.find(
+        (p) => p.itemId === itemId,
+      );
+      expect(mid?.persistence).toBe("persisted");
+      expect(mid?.networkUncertain).toBe(true);
 
       if (mode === "queued") {
         const committed = commitHttpChatReply({
@@ -249,10 +236,11 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
           },
         });
         expect(committed.clearDraft).toBe(true);
-        expect(
-          committed.reduceResult.state.pending.find((p) => p.itemId === itemId)
-            ?.phase,
-        ).toBe("persisted");
+        const after = committed.reduceResult.state.pending.find(
+          (p) => p.itemId === itemId,
+        );
+        expect(after?.persistence).toBe("persisted");
+        expect(after?.networkUncertain).toBe(false);
       } else {
         const committed = commitHttpChatReject({
           operationTaskId: taskId,
@@ -262,13 +250,13 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
         expect(committed.clearDraft).toBe(false);
         expect(
           committed.reduceResult.state.pending.find((p) => p.itemId === itemId)
-            ?.phase,
+            ?.persistence,
         ).toBe("persisted");
       }
     }
   });
 
-  it("unknown_terminal → user_reply persisted → late HTTP → known terminal：证据保留且恰好一次收敛", () => {
+  it("unknown → user_reply persisted → late HTTP → known terminal：证据保留且恰好一次收敛", () => {
     const itemId = "cq_r40_unk_pers";
     const fp = fingerprintFromChatSendArgs({ text: "unk-pers" });
     let state = emptyChatOpState();
@@ -286,41 +274,37 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
       itemId,
       outcome: "future_failure_reason",
     }).state;
-    expect(state.pending.find((p) => p.itemId === itemId)?.uncertainCause).toBe(
-      "unknown_terminal",
-    );
+    expect(
+      state.pending.find((p) => p.itemId === itemId)?.terminalKnowledge,
+    ).toBe("unknown");
 
     state = reduceChatOperation(state, {
       type: "user_reply",
       ev: { text: "unk-pers", meta: { queueItemId: itemId } },
     }).state;
     const mid = state.pending.find((p) => p.itemId === itemId);
-    expect(mid?.phase).toBe("persisted");
-    // user_reply 不抹 unknown marker（spread 保留）；fail-closed 证据仍在
-    expect(mid?.uncertainCause).toBe("unknown_terminal");
+    expect(mid?.persistence).toBe("persisted");
+    expect(mid?.terminalKnowledge).toBe("unknown");
 
-    // late 202：不得降为 sending、不得抹 unknown
     state = reduceChatOperation(state, {
       type: "http_queued",
       itemId,
     }).state;
     const afterHttp = state.pending.find((p) => p.itemId === itemId);
-    expect(afterHttp?.phase).toBe("persisted");
-    expect(afterHttp?.uncertainCause).toBe("unknown_terminal");
+    expect(afterHttp?.persistence).toBe("persisted");
+    expect(afterHttp?.terminalKnowledge).toBe("unknown");
 
-    // late reject：同样不降级
     state = reduceChatOperation(state, {
       type: "http_reject_network",
       itemId,
     }).state;
-    expect(state.pending.find((p) => p.itemId === itemId)?.phase).toBe(
-      "persisted",
-    );
     expect(
-      state.pending.find((p) => p.itemId === itemId)?.uncertainCause,
-    ).toBe("unknown_terminal");
+      state.pending.find((p) => p.itemId === itemId)?.persistence,
+    ).toBe("persisted");
+    expect(
+      state.pending.find((p) => p.itemId === itemId)?.terminalKnowledge,
+    ).toBe("unknown");
 
-    // known terminal 恰好一次收敛
     state = reduceChatOperation(state, {
       type: "message_op",
       itemId,
@@ -330,7 +314,6 @@ describe("R40-① R39-1：persisted 不被 late transport 降级", () => {
     expect(state.settled).toContain(itemId);
     expect(state.pending.find((p) => p.itemId === itemId)).toBeUndefined();
 
-    // first-outcome-wins
     state = reduceChatOperation(state, {
       type: "message_op",
       itemId,
@@ -569,18 +552,31 @@ describe("R40-② R39-2：connection-established 重置 retry epoch", () => {
     let done = false;
     while (!done) {
       try {
-        await watchTaskStream(taskId, {
+        const { established } = await watchTaskStream(taskId, {
           onConnectionEstablished: () => {
             unavailableAttempts = 0;
             transientFailures = 0;
             unavailableNotified = false;
           },
         });
-        // clean resolve
-        unavailableAttempts = 0;
-        transientFailures = 0;
-        unavailableNotified = false;
-        done = true;
+        // R40-2：仅 established 后 clean EOF 清 epoch
+        if (established) {
+          unavailableAttempts = 0;
+          transientFailures = 0;
+          unavailableNotified = false;
+          done = true;
+        } else {
+          const d = resolveWatchReconnectPolicy({
+            kind: "retryable",
+            unavailableAttempts,
+            transientFailures,
+            unavailableNotified,
+          });
+          if (d.action === "retry") {
+            transientFailures = d.nextTransientFailures;
+            unavailableAttempts = d.nextUnavailableAttempts;
+          }
+        }
       } catch (err) {
         const status =
           err instanceof ApiRequestError

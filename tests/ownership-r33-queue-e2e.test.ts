@@ -492,12 +492,12 @@ describe("R32-2：两 tab 同文案 + queue-priority head 带 id", () => {
     const tabA: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: "tab_a", displayText: "same-text" }];
     const tabB: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [{ itemId: "tab_b", displayText: "same-text" }];
     const ev = {
       text: "same-text",
@@ -506,7 +506,7 @@ describe("R32-2：两 tab 同文案 + queue-priority head 带 id", () => {
     const a = applyUserReplyTerminal(tabA, [], ev).pending;
     expect(a).toHaveLength(1);
     expect(a[0]?.itemId).toBe("tab_a");
-    expect(a[0]?.phase).toBe("persisted");
+    expect(a[0]?.persistence).toBe("persisted");
     expect(applyUserReplyTerminal(tabB, [], ev).pending).toEqual(tabB);
   });
 
@@ -578,16 +578,14 @@ describe("R32-2：SSE bootstrap queue_state 对账", () => {
     const pending: Array<{
       itemId: string;
       displayText: string;
-      phase?: "sending" | "uncertain" | "persisted";
+      persistence?: "sending" | "persisted"; terminalKnowledge?: "none" | "unknown"; networkUncertain?: boolean;
     }> = [
       { itemId: "alive", displayText: "ok" },
       { itemId: "ghost", displayText: "gone" },
     ];
     const r = reconcilePendingWithQueueState(pending, [], {}, ["alive"]);
     expect(r.pending.map((p) => p.itemId)).toEqual(["alive", "ghost"]);
-    expect(r.pending.find((p) => p.itemId === "ghost")?.phase).toBe(
-      "uncertain",
-    );
+    expect(r.pending.find((p) => p.itemId === "ghost")?.networkUncertain).toBe(true);
     expect(r.ghostIds).toEqual(["ghost"]);
     expect(r.settled).not.toContain("ghost");
   });
