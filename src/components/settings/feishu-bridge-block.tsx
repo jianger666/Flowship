@@ -299,6 +299,22 @@ export const FeishuBridgeBlock = ({
                     ) : undefined
                   }
                 />
+                {/* 新机器人首次接入：权限没开齐时补「消息订阅」入口——
+                    订阅状态探测不到（CLI 连上了也可能没配订阅）、跟权限同批配置最顺手；
+                    权限齐了就收起、不常驻打扰 */}
+                {!status?.scopes?.ok && status?.scopes?.appId && (
+                  <CheckRow
+                    ok={false}
+                    title="消息订阅"
+                    detail="在「事件与回调」里添加：事件 im.message.receive_v1、回调 card.action.trigger（长连接），配完发布版本"
+                    action={
+                      <OpenAuthLink
+                        href={`https://open.feishu.cn/app/${status.scopes.appId}/event`}
+                        label="去配置"
+                      />
+                    }
+                  />
+                )}
                 {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
                     ready 正常态和启动瞬态（starting/stopped/backoff 几秒内自愈）不展示、
                     避免误解（2026-07-19 用户反馈：正常也一排 stopped 很吓人） */}

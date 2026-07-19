@@ -228,12 +228,24 @@ const probeScopes = async (): Promise<ProbeScopesCheck> => {
           }),
     };
   } catch (err) {
+    // 查询本身挂了（如新机器人还没开「获取应用信息」权限）也要给一键开通链接——
+    // 尽力拿 appId 兜底构造预填深链（用户点开就是勾好的权限列表）
+    let appId = "";
+    try {
+      appId = (await getBotAppInfo()).appId;
+    } catch {
+      // getBotAppInfo 也挂——真拿不到 appId、不给链接
+    }
+    const fallbackAuth = appId
+      ? { appId, authUrl: buildScopeAuthUrl(appId, REQUIRED_BRIDGE_SCOPES) }
+      : {};
     if (err instanceof LarkApiError) {
       return {
         ok: false,
         granted: [],
         missing: [...REQUIRED_BRIDGE_SCOPES],
         error: err.message,
+        ...fallbackAuth,
         ...(err.consoleUrl ? { authUrl: err.consoleUrl } : {}),
       };
     }
@@ -242,6 +254,7 @@ const probeScopes = async (): Promise<ProbeScopesCheck> => {
       granted: [],
       missing: [...REQUIRED_BRIDGE_SCOPES],
       error: err instanceof Error ? err.message : String(err),
+      ...fallbackAuth,
     };
   }
 };
