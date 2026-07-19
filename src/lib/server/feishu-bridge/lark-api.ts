@@ -425,18 +425,27 @@ export const patchCardSettings = async (
 
 /**
  * 上传图片 → image_key。
- * CLI：`im images create --data '{"image_type":"message"}' --file image=<path>`
+ * CLI：`im images create --data '{"image_type":"message"}' --file image=<相对名>`
+ *
+ * ⚠️ lark-cli 的 `--file` **只接受 cwd 相对路径**——传绝对路径会报
+ * `cannot open file` / `unsafe file path`（对齐 downloadMessageResource 的相对路径 + cwd 手法）。
  */
 export const uploadImage = async (filePath: string): Promise<string> => {
-  const rec = await runLark([
-    "im",
-    "images",
-    "create",
-    "--data",
-    JSON.stringify({ image_type: "message" }),
-    "--file",
-    `image=${filePath}`,
-  ]);
+  const abs = path.resolve(filePath);
+  const cwd = path.dirname(abs);
+  const base = path.basename(abs);
+  const rec = await runLark(
+    [
+      "im",
+      "images",
+      "create",
+      "--data",
+      JSON.stringify({ image_type: "message" }),
+      "--file",
+      `image=${base}`,
+    ],
+    { cwd },
+  );
   const data = asRecord(rec.data) ?? rec;
   const key =
     (typeof data.image_key === "string" && data.image_key) ||

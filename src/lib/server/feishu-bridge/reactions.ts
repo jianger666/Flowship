@@ -2,19 +2,15 @@
  * 飞书注入结果 emoji 回执（决策 #16）
  *
  * - sent → Get（用户指定 GET；实测键名大小写敏感，GET 非法）
- * - queued → Typing（⏳ 无官方键；Typing = 等待中最接近）
+ * - queued → Get（T8 用户拍板：不要 Typing 敲键盘动画、两态统一 Get）
  * - failed → CrossMark（❌）
  * - skipped → 不点
  *
  * reaction 失败静默降级（锦上添花、不影响注入）。
  *
- * review P0#1：订阅队列 flush 钩子——queued 条目 flush 成功后撤 Typing、改点 Get。
+ * queued/sent 两态同表情后 flush 升级逻辑已删（无需换表情）；
+ * rememberReaction / tryRemoveStoredReaction 保留——撤回同步恢复时按 messageId 撤表情用。
  */
-
-import {
-  onQueuedMessageFlushed,
-  type QueuedChatMsg,
-} from "@/lib/server/chat-queue";
 
 import {
   addInjectResultListener,
@@ -24,7 +20,7 @@ import { addReaction, removeReaction } from "./lark-api";
 
 /** 实测可用的 emoji_type（2026-07-18 lark-cli 试点） */
 export const EMOJI_SENT = "Get";
-export const EMOJI_QUEUED = "Typing";
+export const EMOJI_QUEUED = "Get";
 export const EMOJI_FAILED = "CrossMark";
 
 const REACTION_MAP_MAX = 500;
@@ -42,7 +38,6 @@ const STATE_KEY = "__flowshipFeishuReactionStateV1__";
 type ReactionsGlobal = {
   registered: boolean;
   unsubInject: (() => void) | null;
-  unsubFlush: (() => void) | null;
 };
 
 type ReactionsState = {
@@ -55,7 +50,7 @@ type ReactionsState = {
 const getReg = (): ReactionsGlobal => {
   const g = globalThis as unknown as Record<string, ReactionsGlobal | undefined>;
   if (!g[REG_KEY]) {
-    g[REG_KEY] = { registered: false, unsubInject: null, unsubFlush: null };
+    g[REG_KEY] = { registered: false, unsubInject: null };
   }
   return g[REG_KEY]!;
 };
@@ -146,39 +141,12 @@ const handleInjectResult = async (
   }
 };
 
-/**
- * review P0#1 / 决策 #16：队列 flush 成功 → Typing 升级为 Get。
- * 仅当内存里仍记着该 message 的 Typing 时升级（已 sent/撤回则跳过）。
- */
-const upgradeTypingOnFlush = async (
-  _taskId: string,
-  msg: QueuedChatMsg,
-): Promise<void> => {
-  const mid = msg.extraMeta?.feishuMessageId;
-  if (typeof mid !== "string" || !mid) return;
-  const stored = getStoredReaction(mid);
-  if (!stored || stored.emojiType !== EMOJI_QUEUED) return;
-  await tryRemoveStoredReaction(mid);
-  try {
-    const { reaction_id } = await addReaction(mid, EMOJI_SENT);
-    rememberReaction(mid, reaction_id, EMOJI_SENT);
-  } catch (err) {
-    console.warn(
-      "[feishu-bridge/reactions] flush 后点 Get 失败:",
-      err instanceof Error ? err.message : err,
-    );
-  }
-};
-
-/** 挂上 inject + flush 监听（globalThis 幂等）；启动链由主线调 */
+/** 挂上 inject 监听（globalThis 幂等）；启动链由主线调 */
 export const ensureReactionReceiptsRegistered = (): void => {
   const reg = getReg();
   if (reg.registered) return;
   reg.unsubInject = addInjectResultListener((p) => {
     void handleInjectResult(p);
-  });
-  reg.unsubFlush = onQueuedMessageFlushed((taskId, msg) => {
-    void upgradeTypingOnFlush(taskId, msg);
   });
   reg.registered = true;
 };
@@ -188,8 +156,6 @@ export const __resetReactionsForTest = (): void => {
   const reg = getReg();
   reg.unsubInject?.();
   reg.unsubInject = null;
-  reg.unsubFlush?.();
-  reg.unsubFlush = null;
   reg.registered = false;
   const state = getState();
   state.byMessageId.clear();

@@ -105,7 +105,7 @@ describe("prefix / truncate helpers", () => {
 });
 
 describe("buildStreamingCardJson Hermes 样式", () => {
-  it("分区顺序：quote → answer → panel → hr → footer；面板带边框", () => {
+  it("分区顺序：quote → panel → answer → hr → footer；面板带边框", () => {
     const card = buildStreamingCardJson({
       title: "聊",
       subtitle: "正在执行终端：pnpm lint",
@@ -120,8 +120,8 @@ describe("buildStreamingCardJson Hermes 样式", () => {
     ).elements.map((e) => e.element_id ?? e.tag);
     expect(ids).toEqual([
       "md_quote",
-      "md_answer",
       "panel_process",
+      "md_answer",
       "main_divider",
       "md_footer",
     ]);
@@ -166,6 +166,27 @@ describe("buildStreamingCardJson Hermes 样式", () => {
     );
     expect(coloredModelLabel("MiniMax M2.7")).toBe("MiniMax M2.7");
   });
+
+  it("面板标题恒带工具次数（0 次也显示、Hermes 同款）；indigo summary 思考中", () => {
+    const card = buildStreamingCardJson({
+      title: "聊",
+      subtitle: "",
+      template: "indigo",
+      processText: "**思考 1** · running\n想",
+    });
+    const panel = (
+      card.body as {
+        elements: Array<{
+          element_id?: string;
+          header?: { title?: { content?: string } };
+        }>;
+      }
+    ).elements.find((e) => e.element_id === "panel_process");
+    expect(panel?.header?.title?.content).toBe("思考与工具 · 0 次工具调用");
+    expect(
+      (card.config as { summary: { content: string } }).summary.content,
+    ).toBe("思考中");
+  });
 });
 
 describe("createCardStream", () => {
@@ -188,7 +209,12 @@ describe("createCardStream", () => {
       cardId: "card_test",
     });
 
+    // 首次正文 flush：indigo→blue 转 header → 全量 PUT（内容随卡带上）
     stream.pushAnswer("A");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+
+    // 后续 flush 走 element 流式 PUT
     stream.pushAnswer("AB");
     stream.pushAnswer("ABC");
     while (pending.length) pending.shift()!();
@@ -202,17 +228,52 @@ describe("createCardStream", () => {
       expect(seqs[i]!).toBeGreaterThan(seqs[i - 1]!);
     }
     expect(calls.at(-1)?.[2]).toBe("ABC");
+    // 全量 PUT 的 seq 也在同一分配器：element seq 必大于 entity seq
+    const entitySeq = (
+      updateCardEntity.mock.calls[0] as unknown as [string, unknown, number]
+    )[2];
+    expect(Math.min(...seqs)).toBeGreaterThan(entitySeq);
+  });
+
+  // Hermes 全态：thinking indigo → 正文开始 in_progress blue
+  it("start 时 header indigo「思考中」、正文一开始转 blue", async () => {
+    const stream = createCardStream("task_tmpl", { title: "t", openId: "ou" });
+    await stream.start();
+    const createJson = createCardEntity.mock.calls[0]![0] as {
+      header: { template: string };
+      config: { summary: { content: string } };
+    };
+    expect(createJson.header.template).toBe("indigo");
+    expect(createJson.config.summary.content).toBe("思考中");
+
+    stream.pushAnswer("正文来了");
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+    const entity = updateCardEntity.mock.calls.at(-1)![1] as {
+      header: { template: string };
+    };
+    expect(entity.header.template).toBe("blue");
   });
 
   it("push 缩短文本不会回改已推前缀", async () => {
+    const pending: Array<() => void> = [];
+    __setCardStreamTimersForTest((cb) => {
+      pending.push(cb);
+      return pending.length as unknown as ReturnType<typeof setTimeout>;
+    });
     const stream = createCardStream("task_2", { title: "t", openId: "ou" });
     await stream.start();
+    // 先消化 indigo→blue 的首刷全量 PUT
+    stream.pushAnswer("hello");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
     stream.pushAnswer("hello world");
+    while (pending.length) pending.shift()!();
     await vi.waitFor(() =>
       expect(updateCardElementContent).toHaveBeenCalled(),
     );
     updateCardElementContent.mockClear();
     stream.pushAnswer("hello");
+    while (pending.length) pending.shift()!();
     await new Promise((r) => setTimeout(r, 5));
     expect(updateCardElementContent).not.toHaveBeenCalled();
   });
@@ -226,9 +287,8 @@ describe("createCardStream", () => {
     const stream = createCardStream("task_3", { title: "t", openId: "ou" });
     await stream.start();
     stream.pushAnswer("x".repeat(600));
-    await vi.waitFor(() =>
-      expect(updateCardElementContent).toHaveBeenCalled(),
-    );
+    // 未经 timer 直接 flush（首刷带 indigo→blue header → 全量 PUT）
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
     expect(pending.length).toBe(0);
   });
 
@@ -237,9 +297,7 @@ describe("createCardStream", () => {
     const stream = createCardStream("task_fin", { title: "聊", openId: "ou" });
     await stream.start();
     stream.pushAnswer("最终回复");
-    await vi.waitFor(() =>
-      expect(updateCardElementContent).toHaveBeenCalled(),
-    );
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
     await stream.finalize({
       ok: true,
       durationMs: 125000,
@@ -256,7 +314,8 @@ describe("createCardStream", () => {
     expect(cardJson.header.subtitle.content).toBe("已完成");
     expect(cardJson.header.template).toBe("green");
     const footer = cardJson.body.elements.find((e) => e.element_id === "md_footer");
-    expect(footer?.content).toContain("flowship-test://tasks/task_fin");
+    // 深链改跳板方案：卡片里是本机 http 中转页（飞书不放行自定义协议链接）
+    expect(footer?.content).toContain("/open/task/task_fin");
     expect(footer?.content).toContain("composer");
     // Hermes 完成 footer：耗时裸数字（无「耗时」前缀）+ · 分隔
     expect(footer?.content).toMatch(/2m5s/);
@@ -321,8 +380,9 @@ describe("createCardStream", () => {
       ]
     )[1][0]!.params.elements;
     expect(multiEls.every((e) => e.tag !== "button")).toBe(true);
+    // T7：提示文案带灰字包装
     expect(
-      multiEls.some((e) => e.content === "请直接回复文字作答"),
+      multiEls.some((e) => e.content?.includes("请直接回复文字作答")),
     ).toBe(true);
   });
 
@@ -424,7 +484,7 @@ describe("createCardStream", () => {
       const footer = cardJson.body.elements.find(
         (e) => e.element_id === "md_footer",
       );
-      expect(footer?.content).toContain("flowship");
+      expect(footer?.content).toContain("/open/task/");
       expect(patchCardSettings).toHaveBeenCalled();
     } finally {
       clearPendingAsk(taskId);
@@ -436,9 +496,7 @@ describe("createCardStream", () => {
     const stream = createCardStream("task_stop", { title: "t", openId: "ou" });
     await stream.start();
     stream.pushAnswer("半截");
-    await vi.waitFor(() =>
-      expect(updateCardElementContent).toHaveBeenCalled(),
-    );
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
     await stream.finalize({
       ok: true,
       outcome: "stopped",
@@ -508,21 +566,46 @@ describe("createCardStream", () => {
     await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
 
     updateCardElementContent.mockClear();
+    batchUpdateCard.mockClear();
     updateCardEntity.mockClear();
     stream.pushProcess("> `Shell` · completed\n> x");
     stream.pushAnswer("正文一段续");
     while (pending.length) pending.shift()!();
-    await vi.waitFor(() =>
-      expect(updateCardElementContent.mock.calls.length).toBeGreaterThan(0),
-    );
+    // 思考区走 batch update_element；正文仍走流式 content PUT
+    await vi.waitFor(() => {
+      expect(batchUpdateCard.mock.calls.length).toBeGreaterThan(0);
+      expect(updateCardElementContent.mock.calls.length).toBeGreaterThan(0);
+    });
 
-    const contentSeqs = (
+    // 前缀分叉（running→completed）仍会推送：batch 的 content 含 completed
+    const processBatch = batchUpdateCard.mock.calls[0] as unknown as [
+      string,
+      Array<{
+        action: string;
+        params: { element: { content?: string } };
+      }>,
+      number,
+    ];
+    expect(processBatch[1][0]?.action).toBe("update_element");
+    expect(processBatch[1][0]?.params.element.content).toContain("completed");
+
+    const answerSeqs = (
       updateCardElementContent.mock.calls as unknown as Array<
         [string, string, string, number]
       >
     ).map((c) => c[3]);
-    for (let i = 1; i < contentSeqs.length; i++) {
-      expect(contentSeqs[i]!).toBeGreaterThan(contentSeqs[i - 1]!);
+    const processSeqs = (
+      batchUpdateCard.mock.calls as unknown as Array<[string, unknown, number]>
+    ).map((c) => c[2]);
+    const flushSeqs = [...processSeqs, ...answerSeqs].sort((a, b) => a - b);
+    for (let i = 1; i < flushSeqs.length; i++) {
+      expect(flushSeqs[i]!).toBeGreaterThan(flushSeqs[i - 1]!);
+    }
+    // 正文打字机仍只打 md_answer
+    for (const c of updateCardElementContent.mock.calls as unknown as Array<
+      [string, string, string, number]
+    >) {
+      expect(c[1]).toBe("md_answer");
     }
 
     stream.setHeaderStatus("收尾", "blue");
@@ -538,13 +621,60 @@ describe("createCardStream", () => {
           [string, string, string, number]
         >
       ).map((c) => c[3]),
+      ...(
+        batchUpdateCard.mock.calls as unknown as Array<[string, unknown, number]>
+      ).map((c) => c[2]),
     ];
     expect(new Set(allSeqs).size).toBe(allSeqs.length);
     expect(Math.max(...allSeqs)).toBeGreaterThan(Math.min(...allSeqs));
   });
 
+  it("思考区 flush 走 batch update_element，不走嵌套流式 PUT", async () => {
+    const stream = createCardStream("task_proc_batch", {
+      title: "t",
+      openId: "ou",
+    });
+    await stream.start();
+    batchUpdateCard.mockClear();
+    updateCardElementContent.mockClear();
+    stream.pushProcess("**思考 1** · running\n先想一步");
+    await vi.waitFor(() => expect(batchUpdateCard).toHaveBeenCalled());
+    expect(updateCardElementContent).not.toHaveBeenCalled();
+    const call = batchUpdateCard.mock.calls[0] as unknown as [
+      string,
+      Array<{
+        action: string;
+        params: {
+          element_id: string;
+          element: { tag: string; content: string; text_size?: string };
+        };
+      }>,
+      number,
+    ];
+    expect(call[1][0]?.action).toBe("update_element");
+    expect(call[1][0]?.params.element_id).toBe("md_process");
+    expect(call[1][0]?.params.element.content).toContain("先想一步");
+    expect(call[1][0]?.params.element.text_size).toBe("small");
+  });
+
   // R1-13d：finalize 与在途 flush 不乱序
   it("finalize 与在途 flush 交错不乱序（链上互斥）", async () => {
+    const pending: Array<() => void> = [];
+    __setCardStreamTimersForTest((cb) => {
+      pending.push(cb);
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+
+    const stream = createCardStream("task_fin_race", {
+      title: "t",
+      openId: "ou",
+    });
+    await stream.start();
+    // 先消化首刷（indigo→blue header 全量 PUT），让在途 flush 走 element PUT
+    stream.pushAnswer("在途");
+    while (pending.length) pending.shift()!();
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+
     const order: string[] = [];
     let flushGate: (() => void) | null = null;
     updateCardElementContent.mockImplementation(async () => {
@@ -560,17 +690,6 @@ describe("createCardStream", () => {
       order.push("finalize-settings");
     });
 
-    const pending: Array<() => void> = [];
-    __setCardStreamTimersForTest((cb) => {
-      pending.push(cb);
-      return 1 as unknown as ReturnType<typeof setTimeout>;
-    });
-
-    const stream = createCardStream("task_fin_race", {
-      title: "t",
-      openId: "ou",
-    });
-    await stream.start();
     stream.pushAnswer("在途文本");
     while (pending.length) pending.shift()!();
     await vi.waitFor(() => expect(flushGate).toBeTruthy());
@@ -595,9 +714,7 @@ describe("createCardStream", () => {
     const stream = createCardStream("task_fence", { title: "t", openId: "ou" });
     await stream.start();
     stream.pushAnswer("```js\nconsole.log(1)");
-    await vi.waitFor(() =>
-      expect(updateCardElementContent).toHaveBeenCalled(),
-    );
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
     await stream.finalize({ ok: true, durationMs: 1000 });
     const entityCalls = updateCardEntity.mock.calls as unknown as Array<
       [

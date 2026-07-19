@@ -269,12 +269,38 @@ describe("ensureBridgeCommandsRegistered", () => {
     __resetCommandsRegisteredForTest();
   });
 
-  it("/help 回静态清单", async () => {
+  it("/help 回逐行带说明的清单", async () => {
     await runCmd("help");
+    // T8：每个命令一行、带一句说明
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      expect.stringContaining("/stop"),
+      expect.stringContaining("命令清单："),
     );
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringMatching(/\/new \[消息\] — .+\n/),
+    );
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringMatching(/\/stop — .+/),
+    );
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringMatching(/\/history \[n\] — .+/),
+    );
+  });
+
+  // T8 用户拍板：Get = 消息真进了 AI——命令 handled 只回文本、不点表情
+  it("命令 handled → inject 记 skipped（不点 Get）", async () => {
+    const { onInjectResult, __clearInjectResultListenersForTest } =
+      await import("@/lib/server/feishu-bridge/router");
+    const results: Array<{ kind: string }> = [];
+    onInjectResult((p) => {
+      results.push(p);
+    });
+    await runCmd("help");
+    expect(results.at(-1)?.kind).toBe("skipped");
+    __clearInjectResultListenersForTest();
   });
 
   it("/list 有活跃时列标题+runStatus（中文）", async () => {
@@ -322,12 +348,26 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("/stop 定位后调用 stopTaskAgent", async () => {
+  it("/stop 运行中：停止并提示对话可继续", async () => {
+    // 默认 mock runStatus=idle——本用例覆盖成 running 走真停止分支
+    getTask.mockResolvedValueOnce({
+      ...(await getTask()),
+      runStatus: "running",
+    } as never);
     await runCmd("stop");
     expect(stopAgent).toHaveBeenCalled();
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      "已停止：测试对话",
+      expect.stringContaining("已停止当前运行：测试对话"),
+    );
+  });
+
+  it("/stop 空闲：不调 stopTaskAgent、回「没有在运行」", async () => {
+    await runCmd("stop");
+    expect(stopAgent).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("没有在运行的回复"),
     );
   });
 
@@ -357,7 +397,7 @@ describe("ensureBridgeCommandsRegistered", () => {
     expect(stopAgent).not.toHaveBeenCalled();
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      expect.stringContaining("请回复对应卡片"),
+      expect.stringContaining("回复对应对话的卡片"),
     );
   });
 
@@ -368,6 +408,11 @@ describe("ensureBridgeCommandsRegistered", () => {
     onInjectResult((p) => {
       results.push(p);
     });
+    // idle 会在 stopAgent 之前短路——覆盖成 running 才走到异常分支
+    getTask.mockResolvedValueOnce({
+      ...(await getTask()),
+      runStatus: "running",
+    } as never);
     stopAgent.mockRejectedValueOnce(new Error("boom"));
     await runCmd("stop");
     expect(sendText).toHaveBeenCalledWith(

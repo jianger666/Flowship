@@ -312,6 +312,49 @@ describe("turn 状态机", () => {
     expect(card.appendRetryButton).not.toHaveBeenCalled();
   });
 
+  // 2026-07-19 用户实测：SDK 拆多条 thinking 事件 → 不被工具隔开就合并同一段
+  it("连续 thinking 合并进同一「思考 1」段（空行分隔）", async () => {
+    const taskId = "t_think_merge";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "想想"));
+    await flush();
+    publishTaskStreamEvent(taskId, makeEvent("thinking", "第一段思路"));
+    publishTaskStreamEvent(taskId, makeEvent("thinking", "第二段思路"));
+    await flush();
+    const card = cardFactory.cards[0]!;
+    const text = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
+    expect(text).toContain("**思考 1**");
+    expect(text).not.toContain("**思考 2**");
+    expect(text).toContain("第一段思路\n\n第二段思路");
+  });
+
+  it("thinking→tool→thinking 被工具隔开拆成思考 1 / 思考 2", async () => {
+    const taskId = "t_think_split";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "拆段"));
+    await flush();
+    publishTaskStreamEvent(taskId, makeEvent("thinking", "先想一步"));
+    publishTaskStreamEvent(
+      taskId,
+      makeEvent("tool_call", "调用 Shell:ls", {
+        callId: "c_split",
+        name: "Shell",
+        args: JSON.stringify({ command: "ls" }),
+      }),
+    );
+    publishTaskStreamEvent(taskId, makeEvent("thinking", "再想一步"));
+    await flush();
+    const card = cardFactory.cards[0]!;
+    const text = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
+    // Hermes timeline：工具隔开 → 新开思考段；最后一段 running、更早的 completed
+    expect(text).toContain("**思考 1** · completed\n先想一步");
+    expect(text).toContain("**思考 2** · running\n再想一步");
+
+    // Hermes record_answer_started：正文开始后开放思考收敛 completed
+    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
+    await flush();
+    const after = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
+    expect(after).toContain("**思考 2** · completed");
+  });
+
   it("error / done ok=false 加重试按钮", async () => {
     const taskId = "t_err";
     publishTaskStreamEvent(taskId, makeEvent("user_reply", "重试我"));

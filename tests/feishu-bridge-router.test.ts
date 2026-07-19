@@ -56,6 +56,243 @@ describe("parseTextContent", () => {
   });
 });
 
+describe("parseInboundContent markdown 图提取", () => {
+  const tmpFiles: string[] = [];
+
+  afterEach(async () => {
+    __setRouterDepsForTest(null);
+    for (const p of tmpFiles.splice(0)) {
+      await fs.unlink(p).catch(() => undefined);
+    }
+  });
+
+  const makePng = async (bytes = 64): Promise<string> => {
+    const p = path.join(
+      os.tmpdir(),
+      `feishu-md-img-${Date.now()}-${Math.random().toString(36).slice(2)}.png`,
+    );
+    // 最小可辨 PNG 头 + 填充（不必真解码）
+    const buf = Buffer.alloc(bytes, 1);
+    buf.write("\x89PNG\r\n\x1a\n", 0);
+    await fs.writeFile(p, buf);
+    tmpFiles.push(p);
+    return p;
+  };
+
+  it("post markdown 图文混排 → images 提取 + 文本剥离", async () => {
+    const png = await makePng();
+    const downloaded: string[] = [];
+    __setRouterDepsForTest({
+      downloadMessageResource: async (_mid, key) => {
+        downloaded.push(key);
+        return png;
+      },
+    });
+    const content =
+      "![Image](img_v3_0213o_2b0d4c5b-4df7-4440-9058-a784d363914g)\n我再试试";
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "post",
+        message_id: "om_md_mix",
+        content,
+      }),
+    );
+    expect(parsed.text).toBe("我再试试");
+    expect(parsed.images).toHaveLength(1);
+    expect(parsed.images[0]?.mimeType).toBe("image/png");
+    expect(downloaded).toEqual([
+      "img_v3_0213o_2b0d4c5b-4df7-4440-9058-a784d363914g",
+    ]);
+  });
+
+  it("纯 markdown 图无文字 → text 空 + 1 张图", async () => {
+    const png = await makePng();
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => png,
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "post",
+        content: "![Image](img_v2_abc123_xyz)",
+      }),
+    );
+    expect(parsed.text).toBe("");
+    expect(parsed.images).toHaveLength(1);
+  });
+
+  it("text 类型带 markdown 图同样提取", async () => {
+    const png = await makePng();
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => png,
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "text",
+        content: "看这张 ![图](img_v3_hello_world) 谢谢",
+      }),
+    );
+    expect(parsed.text).toBe("看这张 谢谢");
+    expect(parsed.images).toHaveLength(1);
+  });
+
+  it("超过 6 张图只下载前 6 张（超限降级）", async () => {
+    const png = await makePng();
+    const keys: string[] = [];
+    __setRouterDepsForTest({
+      downloadMessageResource: async (_mid, key) => {
+        keys.push(key);
+        return png;
+      },
+    });
+    const parts = Array.from(
+      { length: 8 },
+      (_, i) => `![Image](img_v3_key_${i}_abcdef)`,
+    );
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "post",
+        content: `${parts.join("\n")}\n说明`,
+      }),
+    );
+    expect(parsed.images).toHaveLength(6);
+    expect(keys).toHaveLength(6);
+    expect(parsed.text).toBe("说明");
+  });
+
+  it("post JSON 节点树路径仍可用（兼容官方形态）", async () => {
+    const png = await makePng();
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => png,
+    });
+    const content = JSON.stringify({
+      title: "",
+      content: [
+        [{ tag: "img", image_key: "img_v3_json_tree_key" }],
+        [{ tag: "text", text: "节点树正文" }],
+      ],
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({ message_type: "post", content }),
+    );
+    expect(parsed.text).toBe("节点树正文");
+    expect(parsed.images).toHaveLength(1);
+  });
+});
+
+// T4：飞书文件消息——consumer enrichment 渲染 `<file .../>` 而非 JSON content
+describe("parseInboundContent 文件消息双形态", () => {
+  const tmpFiles: string[] = [];
+
+  afterEach(async () => {
+    __setRouterDepsForTest(null);
+    for (const p of tmpFiles.splice(0)) {
+      await fs.unlink(p).catch(() => undefined);
+    }
+  });
+
+  const makeTmpFile = async (): Promise<string> => {
+    const p = path.join(
+      os.tmpdir(),
+      `feishu-file-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`,
+    );
+    await fs.writeFile(p, "file-content");
+    tmpFiles.push(p);
+    return p;
+  };
+
+  it("enrichment `<file key name/>` 形态 → 提取 file_key + 保留原文件名", async () => {
+    const tmp = await makeTmpFile();
+    const downloaded: Array<{ key: string; type: string }> = [];
+    __setRouterDepsForTest({
+      downloadMessageResource: async (_mid, key, type) => {
+        downloaded.push({ key, type });
+        return tmp;
+      },
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "file",
+        content:
+          '<file key="file_v3_0013o_63f1ec89-ded1-48d8-869a-8f9d24204b3g" name="报告 v2.pdf"/>',
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(downloaded).toEqual([
+      { key: "file_v3_0013o_63f1ec89-ded1-48d8-869a-8f9d24204b3g", type: "file" },
+    ]);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(path.basename(parsed.attachments[0]!)).toBe("报告 v2.pdf");
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("markdown `[名称](file_key)` 链接形态同样提取", async () => {
+    const tmp = await makeTmpFile();
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => tmp,
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "file",
+        content: "[notes.txt](file_v3_abc_def123)",
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.attachments).toHaveLength(1);
+    expect(path.basename(parsed.attachments[0]!)).toBe("notes.txt");
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("JSON content 形态（补拉路径）不回归", async () => {
+    const tmp = await makeTmpFile();
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => tmp,
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "file",
+        content: JSON.stringify({
+          file_key: "file_v3_json_key",
+          file_name: "data.csv",
+        }),
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.attachments).toHaveLength(1);
+    expect(path.basename(parsed.attachments[0]!)).toBe("data.csv");
+    tmpFiles.push(parsed.attachments[0]!);
+  });
+
+  it("content 无 file_key（任意文本）→ unsupported", async () => {
+    const parsed = await parseInboundContent(
+      baseMsg({ message_type: "file", content: "什么都不是" }),
+    );
+    expect(parsed.unsupported).toBe("文件消息缺少 file_key");
+  });
+
+  it("image 消息 enrichment `![Image](img_xxx)` 形态兜底提取", async () => {
+    // 复用 markdown 图 fixture 的最小 PNG
+    const p = path.join(
+      os.tmpdir(),
+      `feishu-img-fallback-${Date.now()}.png`,
+    );
+    const buf = Buffer.alloc(64, 1);
+    buf.write("\x89PNG\r\n\x1a\n", 0);
+    await fs.writeFile(p, buf);
+    tmpFiles.push(p);
+    __setRouterDepsForTest({
+      downloadMessageResource: async () => p,
+    });
+    const parsed = await parseInboundContent(
+      baseMsg({
+        message_type: "image",
+        content: "![Image](img_v3_fallback_key)",
+      }),
+    );
+    expect(parsed.unsupported).toBeUndefined();
+    expect(parsed.images).toHaveLength(1);
+  });
+});
+
 describe("isActiveChatTask", () => {
   it("mode=chat + developing + 24h 内 = 活跃", () => {
     const t = mockTask();

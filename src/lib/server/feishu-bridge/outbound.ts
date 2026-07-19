@@ -376,38 +376,111 @@ export const formatToolRuntimePreview = (
   return `${line.slice(0, RUNTIME_HEADER_MAX_CHARS - 1).trimEnd()}…`;
 };
 
+// ---- Hermes timeline 渲染参数（对齐 render_card 默认值） ----
+/** Hermes max_timeline_items：最多渲染 12 条、更早的折叠成计数行 */
+const MAX_TIMELINE_ITEMS = 12;
+/** Hermes max_reasoning_chars：单条思考截断上限 */
+const MAX_REASONING_CHARS = 1200;
+/** Hermes max_tool_result_chars：单条工具 detail 截断上限 */
+const MAX_TOOL_DETAIL_CHARS = 600;
+
+/** Hermes `_limit_text`：超限截断 + `\n> label` 提示尾 */
+const limitText = (
+  text: string,
+  limit: number,
+  overflowLabel: string,
+): string => {
+  if (limit <= 0 || text.length <= limit) return text;
+  const suffix = `\n> ${overflowLabel}`;
+  return text.slice(0, Math.max(0, limit - suffix.length)).trimEnd() + suffix;
+};
+
 /**
- * Hermes timeline 呈现：
- * - 思考：`**思考 N** · running|completed` + 正文
- * - 工具：引用块 `` `name` · status `` + 参数摘要行
+ * Hermes `_select_timeline_entries`：只渲染尾部 N 条；
+ * 若窗口内没有思考条目、用最近一条思考顶换窗口首位（保证思考不整体消失）。
+ */
+const selectTimelineParts = (
+  parts: ProcessPart[],
+): { selected: Array<{ part: ProcessPart; index: number }>; folded: number } => {
+  const withIndex = parts.map((part, index) => ({ part, index }));
+  if (parts.length <= MAX_TIMELINE_ITEMS) {
+    return { selected: withIndex, folded: 0 };
+  }
+  let indexes = withIndex.slice(parts.length - MAX_TIMELINE_ITEMS).map((e) => e.index);
+  if (!indexes.some((i) => parts[i]!.kind === "thinking")) {
+    let latestThinking = -1;
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (parts[i]!.kind === "thinking") {
+        latestThinking = i;
+        break;
+      }
+    }
+    if (latestThinking >= 0) {
+      indexes = [...new Set([latestThinking, ...indexes.slice(1)])].sort(
+        (a, b) => a - b,
+      );
+    }
+  }
+  return {
+    selected: indexes.map((i) => ({ part: parts[i]!, index: i })),
+    folded: parts.length - indexes.length,
+  };
+};
+
+/**
+ * Hermes timeline 呈现（对齐 `_render_timeline_elements`）：
+ * - 思考：`**思考 N** · running|completed` + 正文（超 1200 字截断）
+ * - 工具：引用块 `` `name` · status `` + detail 行（超 600 字截断）
+ * - 超 12 条折叠：顶部计数行「> 已折叠 N 条早期思考/工具记录」
+ * - 正文一旦开始、开放思考立即置 completed（Hermes record_answer_started）
  * （折叠面板 chrome 在 card-stream；这里只拼 md_process 内容）
  */
-const renderProcess = (parts: ProcessPart[]): string => {
+const renderProcess = (parts: ProcessPart[], answerStarted: boolean): string => {
+  // 思考编号按全量 parts 计（折叠不重排「思考 N」序号，与 Hermes 记录期编号一致）
+  const thinkingNo = new Map<number, number>();
   let thinkingIdx = 0;
+  parts.forEach((p, i) => {
+    if (p.kind === "thinking") {
+      thinkingIdx += 1;
+      thinkingNo.set(i, thinkingIdx);
+    }
+  });
   const openThinkingIdx =
-    parts.length > 0 && parts[parts.length - 1]!.kind === "thinking"
+    !answerStarted &&
+    parts.length > 0 &&
+    parts[parts.length - 1]!.kind === "thinking"
       ? parts.length - 1
       : -1;
 
-  return parts
-    .map((p, i) => {
-      if (p.kind === "thinking") {
-        thinkingIdx += 1;
-        const status = i === openThinkingIdx ? "running" : "completed";
-        return `**思考 ${thinkingIdx}** · ${status}\n${p.text}`;
-      }
-      const status =
-        p.status === "ok"
-          ? "completed"
-          : p.status === "err"
-            ? "failed"
-            : "running";
-      const lines = [`\`${p.name}\` · ${status}`];
-      if (p.argsSummary.trim()) lines.push(p.argsSummary.trim());
-      // Hermes `_quote_markdown`：整块工具条目包进引用
-      return lines.map((line) => (line ? `> ${line}` : ">")).join("\n");
-    })
-    .join("\n\n");
+  const { selected, folded } = selectTimelineParts(parts);
+  const blocks: string[] = [];
+  if (folded > 0) {
+    blocks.push(`> 已折叠 ${folded} 条早期思考/工具记录`);
+  }
+  for (const { part: p, index: i } of selected) {
+    if (p.kind === "thinking") {
+      const status = i === openThinkingIdx ? "running" : "completed";
+      const content = limitText(p.text, MAX_REASONING_CHARS, "思考内容过长，已截断");
+      blocks.push(`**思考 ${thinkingNo.get(i)}** · ${status}\n${content}`);
+      continue;
+    }
+    const status =
+      p.status === "ok"
+        ? "completed"
+        : p.status === "err"
+          ? "failed"
+          : "running";
+    const lines = [`\`${p.name}\` · ${status}`];
+    const detail = limitText(
+      p.argsSummary.trim(),
+      MAX_TOOL_DETAIL_CHARS,
+      "工具详情过长，已截断",
+    );
+    if (detail) lines.push(...detail.split("\n"));
+    // Hermes `_quote_markdown`：整块工具条目包进引用
+    blocks.push(lines.map((line) => (line ? `> ${line}` : ">")).join("\n"));
+  }
+  return blocks.join("\n\n");
 };
 
 const isLocalImageSrc = (src: string): boolean => {
@@ -730,7 +803,10 @@ const ensureCardStarted = async (
 };
 
 const pushProcessUpdate = (taskId: string, turn: TurnState): void => {
-  const full = renderProcess(turn.processParts);
+  const full = renderProcess(
+    turn.processParts,
+    turn.answerText.trim().length > 0,
+  );
   withCard(taskId, turn, (card) => {
     card.pushProcess(full);
   });
@@ -743,8 +819,9 @@ const updateToolHeader = (taskId: string, turn: TurnState): void => {
     turn.currentToolArgs,
   );
   if (!preview) return;
+  // 不传 template——header 配色由 card-stream 按 Hermes 全态自动推（thinking indigo / 正文 blue）
   withCard(taskId, turn, (card) => {
-    card.setHeaderStatus(preview, "blue");
+    card.setHeaderStatus(preview);
   });
 };
 
@@ -798,12 +875,17 @@ const handleUserReply = async (
 const handleThinking = (taskId: string, event: TaskEvent, turn: TurnState): void => {
   const text = (event.text ?? "").trim();
   if (!text) return;
-  turn.processParts.push({ kind: "thinking", text });
+  // SDK 会把一次连贯思考拆成多条 thinking 事件——中间没有工具调用就合并进同一
+  // 「思考 N」段（空行分隔），只有被工具隔开才新开段（用户 2026-07-19 实测反馈）
+  const last = turn.processParts.at(-1);
+  if (last?.kind === "thinking") {
+    last.text = `${last.text}\n\n${text}`;
+  } else {
+    turn.processParts.push({ kind: "thinking", text });
+  }
   pushProcessUpdate(taskId, turn);
-  // Hermes：思考阶段不写 header subtitle（状态靠 footer spinner「生成中」）
-  withCard(taskId, turn, (card) => {
-    card.setHeaderStatus("", "blue");
-  });
+  // Hermes：思考阶段不动 header——subtitle 保留最近一次工具预览（latest_tool_preview 语义）、
+  // 配色由 card-stream 按「正文是否开始」自动推 indigo/blue
 };
 
 const handleToolCall = (
@@ -903,12 +985,17 @@ const handleAssistantDelta = (
   turn: TurnState,
 ): void => {
   if (!text) return;
+  const wasEmpty = turn.answerText.trim().length === 0;
   // sdk-message-handler：assistant_delta.text 是增量 chunk，不是全量快照
   turn.answerText += text;
   const snapshot = turn.answerText;
   withCard(taskId, turn, (card) => {
     card.pushAnswer(snapshot);
   });
+  // Hermes record_answer_started：正文一开始、开放思考段收敛成 completed
+  if (wasEmpty && turn.processParts.at(-1)?.kind === "thinking") {
+    pushProcessUpdate(taskId, turn);
+  }
 };
 
 const handleAskUser = (

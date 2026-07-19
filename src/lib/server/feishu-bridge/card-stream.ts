@@ -132,13 +132,17 @@ export const truncateForCard = (text: string): string => {
   return text.slice(0, Math.max(0, budget)) + TRUNCATE_HINT;
 };
 
+/** Hermes `_format_duration`：h/m/s 三段、分档始终带秒（2m0s 而非 2m） */
 const formatDuration = (ms: number): string => {
   if (!Number.isFinite(ms) || ms < 0) return "";
-  const sec = Math.round(ms / 1000);
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return s ? `${m}m${s}s` : `${m}m`;
+  const total = Math.round(ms / 1000);
+  const s = total % 60;
+  const minutes = Math.floor(total / 60);
+  const m = minutes % 60;
+  const h = Math.floor(minutes / 60);
+  if (h) return `${h}h${m}m${s}s`;
+  if (minutes) return `${m}m${s}s`;
+  return `${s}s`;
 };
 
 /** Hermes 同款：模型名着色（未知型号转义后原样输出） */
@@ -159,10 +163,10 @@ export const coloredModelLabel = (model: string): string => {
   return safe;
 };
 
-/** 流式 footer：⠋ 生成中（帧随时间转，与 Hermes `_spinner_text` 同款） */
+/** 流式 footer：⠋ 生成中（Hermes `_spinner_text`：每 1/8 秒转一帧） */
 export const streamingFooterSpinner = (label = "生成中"): string => {
   const frame =
-    SPINNER_FRAMES[Math.floor(Date.now() * 8) % SPINNER_FRAMES.length] ?? "⠋";
+    SPINNER_FRAMES[Math.floor(Date.now() / 125) % SPINNER_FRAMES.length] ?? "⠋";
   return `${frame} ${label}`;
 };
 
@@ -195,11 +199,13 @@ const buildQuoteMarkdown = (
 };
 
 /**
- * 组装飞书卡片 JSON 2.0——分区 / 样式对齐 Hermes `render_card`：
- * quote（我们独有）→ 正文 md_answer → 思考与工具折叠面板 → hr → footer(x-small)
+ * 组装飞书卡片 JSON 2.0——分区对齐 app 事件流（先过程后正文）：
+ * quote（我们独有）→ 思考与工具折叠面板 → 正文 md_answer → hr → footer(x-small)
  *
- * ⚠️ 打字机约束：md_process / md_answer 仍是流式全量 PUT 的唯一目标 element，
- * 不做 Hermes 那套「按结构边界拆多块 main_content_N」（会破坏前缀守卫）。
+ * ⚠️ 打字机约束：仅 md_answer 走流式 content PUT（打字机）；
+ * md_process 在 collapsible_panel 内嵌，流式 PUT 对嵌套 element 可能静默不生效
+ * （见 doFlush 注释），思考区改走 batch update_element 全量替换。
+ * 不做 Hermes 那套「按结构边界拆多块 main_content_N」（会破坏正文前缀守卫）。
  */
 export const buildStreamingCardJson = (opts: {
   title: string;
@@ -217,10 +223,8 @@ export const buildStreamingCardJson = (opts: {
 }): Record<string, unknown> => {
   const processText = opts.processText ?? "";
   const toolCount = countToolsInProcess(processText);
-  const panelTitle =
-    toolCount > 0
-      ? `思考与工具 · ${toolCount} 次工具调用`
-      : "思考与工具";
+  // Hermes 面板标题恒带次数（0 次也显示）
+  const panelTitle = `思考与工具 · ${toolCount} 次工具调用`;
 
   const elements: unknown[] = [];
   if (opts.quoteMd) {
@@ -230,13 +234,8 @@ export const buildStreamingCardJson = (opts: {
       content: opts.quoteMd,
     });
   }
-  // 正文在前（Hermes main_content 优先），过程区折叠在后
+  // 思考在正文前（与 app 事件流一致；用户 2026-07-19 拍板）
   elements.push(
-    {
-      tag: "markdown",
-      element_id: ELEMENT_ANSWER,
-      content: opts.answerText ?? "",
-    },
     {
       tag: "collapsible_panel",
       element_id: "panel_process",
@@ -257,6 +256,11 @@ export const buildStreamingCardJson = (opts: {
           text_size: "small",
         },
       ],
+    },
+    {
+      tag: "markdown",
+      element_id: ELEMENT_ANSWER,
+      content: opts.answerText ?? "",
     },
   );
   // ask/retry 插在分割线前（与 batch_update insert_before hr 位置一致）
@@ -299,7 +303,9 @@ export const buildStreamingCardJson = (opts: {
                 ? "等待选择"
                 : opts.template === "grey"
                   ? "已停止"
-                  : "生成中"),
+                  : opts.template === "indigo"
+                    ? "思考中"
+                    : "生成中"),
       },
       streaming_config: {
         print_frequency_ms: { default: 70 },
@@ -331,7 +337,8 @@ export const createCardStream = (
   const title = opts.title;
   /** 运行中默认空——Hermes 把状态放 footer spinner / 工具 subtitle，不写「思考中」 */
   let subtitle = "";
-  let template: CardHeaderTemplate = "blue";
+  // Hermes 全态：正文未开始 = thinking（indigo）、正文开始 = in_progress（blue）
+  let template: CardHeaderTemplate = "indigo";
   /** header 脏标记——下次 flush 走全量 PUT */
   let headerDirty = false;
 
@@ -447,11 +454,28 @@ export const createCardStream = (
         // 全量 PUT 已带上 process/answer，无需再 element content
         return;
       }
+      // 为什么思考区不走流式 PUT：
+      // CardKit `PUT .../elements/:id/content` 文档面向「普通文本 / 富文本」打字机；
+      // md_process 挂在 collapsible_panel.elements 内，真机实证该 PUT 返回 ok 但面板内容
+      // 可仍空白（静默无效）。思考区无需打字机 → 改用 batch_update update_element 全量替换。
+      // md_answer 仍走流式 content PUT，打字机绝不能动。
       if (processChanged) {
-        await updateCardElementContent(
+        await batchUpdateCard(
           cardId,
-          ELEMENT_PROCESS,
-          processFlushed,
+          [
+            {
+              action: "update_element",
+              params: {
+                element_id: ELEMENT_PROCESS,
+                element: {
+                  tag: "markdown",
+                  element_id: ELEMENT_PROCESS,
+                  content: processFlushed,
+                  text_size: "small",
+                },
+              },
+            },
+          ],
           nextSeq(),
         );
       }
@@ -520,6 +544,11 @@ export const createCardStream = (
     const grew = Math.max(0, guarded.length - answerDesired.length);
     answerDesired = guarded;
     pendingChars += grew;
+    // Hermes resolve_display_status：正文一出现 thinking → in_progress（indigo → blue）
+    if (template === "indigo" && guarded.trim()) {
+      template = "blue";
+      headerDirty = true;
+    }
     scheduleFlush();
   };
 
@@ -576,7 +605,8 @@ export const createCardStream = (
               tag: "button",
               element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
               text: { tag: "plain_text", content: opt.label },
-              type: "primary",
+              // Hermes `_button_type` 无 style 时落 default（非 primary）
+              type: "default",
               // Hermes interaction 按钮同款 size
               size: "medium",
               width: "default",
@@ -591,13 +621,14 @@ export const createCardStream = (
           }
         }
       }
-      if (!singleQuestion) {
-        elements.push({
-          tag: "markdown",
-          element_id: "md_ask_hint",
-          content: "请直接回复文字作答",
-        });
-      }
+      // T7 用户反馈：按钮之外也提示可直接打字答（单题按钮下同样给一行小字）
+      elements.push({
+        tag: "markdown",
+        element_id: "md_ask_hint",
+        content: singleQuestion
+          ? "<font color='grey'>没有合适选项？直接回复消息作答也行</font>"
+          : "<font color='grey'>请直接回复文字作答</font>",
+      });
       // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
       subtitle = "";
       template = "orange";

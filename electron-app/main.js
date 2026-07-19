@@ -566,12 +566,25 @@ const parseDeepLinkTaskId = (url) => {
   }
 };
 
+// mac 全屏窗口 hide 的补偿状态（2026-07-19 用户实测踩坑）：
+// 全屏窗直接 hide 会被系统踢出它的 Space、再 show 变回非全屏——
+// 关窗时先退全屏再 hide、show 时按记录恢复全屏。
+/** close 拦截时窗口处于全屏 → 等 leave-full-screen 后再 hide */
+let hideAfterLeaveFullScreen = false;
+/** hide 前是全屏 → 下次 show 恢复 */
+let wasFullScreenBeforeHide = false;
+
 /** 显示并聚焦主窗（Tray 打开 / 深链 / second-instance / dock activate 共用） */
 const showMainWindow = () => {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  // 关窗前是全屏 → 恢复（放在 show 之后、系统才会把它放回独立 Space）
+  if (wasFullScreenBeforeHide) {
+    wasFullScreenBeforeHide = false;
+    mainWindow.setFullScreen(true);
+  }
 };
 
 /**
@@ -756,8 +769,25 @@ const createWindow = async () => {
     void saveWindowState();
     if (!quitting) {
       event.preventDefault();
+      // 全屏窗不能直接 hide（会被系统踢出 Space、再 show 变非全屏）——
+      // 先退全屏、等 leave-full-screen 事件里再 hide，并记录以便 show 时恢复
+      if (mainWindow.isFullScreen()) {
+        wasFullScreenBeforeHide = true;
+        hideAfterLeaveFullScreen = true;
+        mainWindow.setFullScreen(false);
+        log("[main] 关窗（全屏）→ 先退全屏再 hide");
+        return;
+      }
       mainWindow.hide();
       log("[main] 关窗 → hide（Tray 常驻；真退出走菜单/Cmd+Q）");
+    }
+  });
+  // 全屏退出动画结束后补 hide（close 拦截的全屏分支）
+  mainWindow.on("leave-full-screen", () => {
+    if (hideAfterLeaveFullScreen) {
+      hideAfterLeaveFullScreen = false;
+      mainWindow?.hide();
+      log("[main] 全屏已退 → hide（Tray 常驻）");
     }
   });
   mainWindow.on("closed", () => {

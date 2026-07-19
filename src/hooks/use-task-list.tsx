@@ -38,6 +38,7 @@ import {
   type ReactNode,
 } from "react";
 
+import { getSettings } from "@/lib/local-store";
 import {
   deleteTask as deleteTaskApi,
   fetchTasks,
@@ -176,12 +177,18 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     [tasks],
   );
 
-  // 条件轮询：仅当存在 running 任务时定时刷新、抓后台任务的状态变化（跑完 / 转等你回复）
+  // 飞书桥接开启时：服务端可能随时被飞书消息唤醒（新建对话 / 注入消息），
+  // 客户端没有任何触发点——窗口不聚焦列表就一直陈旧（2026-07-19 用户双屏实测）。
+  // 桥接用户常态轮询兜底；未开桥接保持原「仅 running 时轮询」的省电策略。
+  // getSettings 是同步缓存读，每次渲染取一次即可（开关切换后 focus/refresh 自然带动重渲染）
+  const bridgeOn = getSettings().feishuChatBridge === true;
+
+  // 条件轮询：存在 running 任务、或飞书桥接开启时定时刷新
   useEffect(() => {
-    if (!hasRunning) return;
+    if (!hasRunning && !bridgeOn) return;
     const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [hasRunning, refresh]);
+  }, [hasRunning, bridgeOn, refresh]);
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);

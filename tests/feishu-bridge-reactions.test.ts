@@ -1,5 +1,5 @@
 /**
- * 飞书注入结果 emoji 回执：四种 kind 映射 + FIFO 上限 + flush Typing→Get
+ * 飞书注入结果 emoji 回执：四种 kind 映射 + FIFO 上限（queued/sent 两态统一 Get）
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,10 +15,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", async (importOriginal) => {
   };
 });
 
-import {
-  emitQueuedMessageFlushed,
-  __clearQueuedMessageFlushedListenersForTest,
-} from "@/lib/server/chat-queue";
+import { emitQueuedMessageFlushed } from "@/lib/server/chat-queue";
 import {
   addReaction,
   removeReaction,
@@ -41,7 +38,6 @@ describe("feishu-bridge reactions", () => {
   beforeEach(() => {
     __resetReactionsForTest();
     __clearInjectResultListenersForTest();
-    __clearQueuedMessageFlushedListenersForTest();
     vi.mocked(addReaction).mockClear();
     vi.mocked(removeReaction).mockClear();
     vi.mocked(addReaction).mockImplementation(async (mid, emoji) => ({
@@ -53,7 +49,6 @@ describe("feishu-bridge reactions", () => {
   afterEach(() => {
     __resetReactionsForTest();
     __clearInjectResultListenersForTest();
-    __clearQueuedMessageFlushedListenersForTest();
   });
 
   it("sent → Get", async () => {
@@ -62,7 +57,8 @@ describe("feishu-bridge reactions", () => {
     expect(getStoredReaction("om_sent")?.emojiType).toBe(EMOJI_SENT);
   });
 
-  it("queued → Typing", async () => {
+  // T8 用户拍板：queued 也点 Get（不要 Typing 敲键盘动画）
+  it("queued → Get（与 sent 同表情）", async () => {
     await __emitInjectResultForTest({
       kind: "queued",
       messageId: "om_q",
@@ -70,6 +66,7 @@ describe("feishu-bridge reactions", () => {
       text: "hi",
     });
     expect(addReaction).toHaveBeenCalledWith("om_q", EMOJI_QUEUED);
+    expect(EMOJI_QUEUED).toBe(EMOJI_SENT);
   });
 
   it("failed → CrossMark", async () => {
@@ -108,8 +105,8 @@ describe("feishu-bridge reactions", () => {
     expect(addReaction).toHaveBeenCalledTimes(1);
   });
 
-  // review P0#1 / 决策 #16：flush 后 Typing → Get
-  it("队列 flush 成功 → Typing 升级为 Get", async () => {
+  // T8：两态同表情后升级逻辑已删——flush 后不撤旧表情、不重复点
+  it("队列 flush 后不重复点表情（升级逻辑已删）", async () => {
     await __emitInjectResultForTest({
       kind: "queued",
       messageId: "om_upgrade",
@@ -127,10 +124,10 @@ describe("feishu-bridge reactions", () => {
       enqueuedAt: Date.now(),
       extraMeta: { feishuMessageId: "om_upgrade" },
     });
-    await vi.waitFor(() => {
-      expect(removeReaction).toHaveBeenCalled();
-      expect(addReaction).toHaveBeenCalledWith("om_upgrade", EMOJI_SENT);
-    });
-    expect(getStoredReaction("om_upgrade")?.emojiType).toBe(EMOJI_SENT);
+    // flush 事件发出后给回调机会执行——期望完全无表情操作
+    await new Promise((r) => setTimeout(r, 50));
+    expect(removeReaction).not.toHaveBeenCalled();
+    expect(addReaction).not.toHaveBeenCalled();
+    expect(getStoredReaction("om_upgrade")?.emojiType).toBe(EMOJI_QUEUED);
   });
 });

@@ -1,6 +1,7 @@
 /**
  * lark-api：错误归一化（permission_violations / console_url）+ 队列串行
  */
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -9,6 +10,7 @@ import {
   larkApi,
   normalizeLarkError,
   runLark,
+  uploadImage,
 } from "@/lib/server/feishu-bridge/lark-api";
 import { LarkApiError } from "@/lib/server/feishu-bridge/types";
 
@@ -115,5 +117,33 @@ describe("runLark / larkApi（mock exec）", () => {
     release();
     await Promise.all([p1, p2]);
     expect(order).toEqual([1, 2]);
+  });
+});
+
+describe("uploadImage", () => {
+  it("绝对路径 → cwd=dirname + --file image=<basename>（lark-cli 拒绝对路径）", async () => {
+    const abs = "/tmp/feishu-upload-fixture/att_demo.png";
+    const calls: Array<{
+      args: string[];
+      cwd?: string;
+    }> = [];
+    __setLarkExecForTest(async (_bin, args, opts) => {
+      calls.push({ args, cwd: opts.cwd });
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          data: { image_key: "img_v3_test_key" },
+        }),
+        stderr: "",
+      };
+    });
+    const key = await uploadImage(abs);
+    expect(key).toBe("img_v3_test_key");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.cwd).toBe(path.dirname(abs));
+    expect(calls[0]?.args).toContain("--file");
+    expect(calls[0]?.args).toContain("image=att_demo.png");
+    // 绝不能把绝对路径塞进 --file
+    expect(calls[0]?.args.some((a) => a.includes("/tmp/"))).toBe(false);
   });
 });

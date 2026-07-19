@@ -5,8 +5,8 @@
  * 卡片按钮 value 走结构化对象（飞书回调原样回传）。
  */
 
-/** 卡片 header 配色模板（流式中 blue、成功 green、失败 red） */
-export type CardHeaderTemplate = "blue" | "green" | "red" | "orange" | "purple" | "wathet" | "turquoise" | "yellow" | "grey";
+/** 卡片 header 配色模板（Hermes 全态：思考 indigo、生成 blue、成功 green、失败 red、等待 orange、停止 grey） */
+export type CardHeaderTemplate = "blue" | "green" | "red" | "orange" | "purple" | "indigo" | "wathet" | "turquoise" | "yellow" | "grey";
 
 /** ask_user 选项按钮 / 错误重试按钮内嵌的 value 结构 */
 export type CardButtonValue =

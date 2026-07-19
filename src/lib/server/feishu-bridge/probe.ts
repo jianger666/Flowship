@@ -64,9 +64,9 @@ const PROBE_CARD_JSON = {
   },
 };
 
-/** 欢迎语（一段式）：绑定确认 + 命令清单 */
+/** 欢迎语（一段式）：绑定确认 + 指到 /help（清单注释在 /help 里、不重复整段） */
 export const WELCOME_TEXT =
-  "Flowship 消息桥接已就绪。直接发消息续聊；命令：/stop /compact /new /list /history /status /help";
+  "Flowship 消息桥接已就绪。直接发消息续聊；发 /help 看命令清单";
 
 // ----------------- 返回形状 -----------------
 

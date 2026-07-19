@@ -26,10 +26,22 @@ export const isBridgeTestInstance = (): boolean => {
   return dir.includes("fe-ai-flow-test");
 };
 
-/** chat 深链：正式 `flowship://`、test `flowship-test://` */
-export const getDeepLink = (taskId: string): string => {
+/** 自定义协议深链：正式 `flowship://`、test `flowship-test://`（壳注册的 scheme） */
+export const getProtocolDeepLink = (taskId: string): string => {
   const scheme = isBridgeTestInstance() ? "flowship-test" : "flowship";
   return `${scheme}://tasks/${encodeURIComponent(taskId)}`;
+};
+
+/**
+ * 飞书卡片用的深链（2026-07-19 用户实测踩坑后改跳板方案）：
+ * 飞书客户端不放行卡片里的自定义协议链接（点了毫无反应）——改为本机 http 跳板页
+ * `http://127.0.0.1:<本实例端口>/open/task/<id>`，页面里再跳 flowship[-test]:// 唤起壳。
+ * 端口按本实例 PORT 环境变量生成（test 8776 / 正式 8876），天然区分环境不串台。
+ */
+export const getDeepLink = (taskId: string): string => {
+  const port =
+    Number(process.env.PORT) || (isBridgeTestInstance() ? 8776 : 8876);
+  return `http://127.0.0.1:${port}/open/task/${encodeURIComponent(taskId)}`;
 };
 
 /** 全局桥接开关（默认关——用户在设置页显式打开） */

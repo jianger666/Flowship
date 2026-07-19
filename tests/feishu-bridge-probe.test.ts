@@ -193,8 +193,9 @@ describe("sendWelcomeMessage", () => {
       "ou_owner_1",
       WELCOME_TEXT,
     );
-    expect(WELCOME_TEXT).toMatch(/\/stop/);
+    // T8：欢迎语只指到 /help、不重复整段命令清单
     expect(WELCOME_TEXT).toMatch(/\/help/);
+    expect(WELCOME_TEXT).not.toMatch(/\/stop/);
   });
 
   it("失败：透传 LarkApiError", async () => {

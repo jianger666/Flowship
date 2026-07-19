@@ -28,9 +28,17 @@ import {
   sendTaskBoundText,
 } from "./router";
 
-/** 与设置页欢迎语一致的静态清单 */
-const HELP_TEXT =
-  "命令：/stop /compact /new /list /history /status /help";
+/** T8 用户点名：逐行带一句说明（欢迎语只指到 /help、不重复整段） */
+const HELP_TEXT = [
+  "命令清单：",
+  "/new [消息] — 开新对话（可带首条消息）",
+  "/list — 列出进行中的对话",
+  "/history [n] — 最近 n 轮对话摘要（默认 3）",
+  "/stop — 停止当前对话的运行（回复卡片可指定）",
+  "/compact — 压缩会话上下文",
+  "/status — 桥接运行状态",
+  "/help — 本清单",
+].join("\n");
 
 const HISTORY_TEXT_MAX = 200;
 const HISTORY_DEFAULT_ROUNDS = 3;
@@ -188,10 +196,12 @@ export const resolveCommandTargetTask = async (
   if (active.length === 0) {
     return { ok: false, message: "没有进行中的对话" };
   }
-  const lines = active.map((t, i) => `${i + 1}. ${t.title || t.id}`);
+  // 不带编号：编号会误导用户「回个数字」（序号选择已拍板不做）——
+  // 正确操作是长按/右键对应对话的卡片用「回复」再发命令
+  const lines = active.map((t) => `· ${t.title || t.id}`);
   return {
     ok: false,
-    message: `有 ${active.length} 个进行中的对话，请回复对应卡片再执行命令：\n${lines.join("\n")}`,
+    message: `有 ${active.length} 个进行中的对话。请用「回复」功能回复对应对话的卡片，再发命令：\n${lines.join("\n")}`,
   };
 };
 
@@ -340,8 +350,15 @@ const cmdStop: BridgeCommandHandler = async (ctx) => {
     await replyOwner("命令执行失败：任务不存在");
     return "handled_failed";
   }
+  // T10 用户反馈：/stop 语义是「停正在运行的那次回复」——idle 时没东西可停，
+  // 回「已停止」会误导成对话被关了；明确区分两种回执
+  const name = target.task.title || target.task.id;
+  if ((full as Task).runStatus !== "running") {
+    await replyOwner(`「${name}」当前没有在运行的回复，无需停止`);
+    return "handled";
+  }
   await deps.stopTaskAgent(full as Task);
-  await replyOwner(`已停止：${target.task.title || target.task.id}`);
+  await replyOwner(`已停止当前运行：${name}（对话仍在，发消息可继续）`);
   return "handled";
 };
 

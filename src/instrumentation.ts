@@ -39,6 +39,22 @@ export const register = (): void => {
     );
   });
 
+  // test 实例的 lark-cli 配置隔离（2026-07-19 用户拍板）：
+  // lark-cli 默认读全局 ~/.lark-cli/config.json——test 和正式会绑同一个飞书机器人、
+  // 事件互抢。test 实例把配置目录指到自己的数据目录下（绑独立机器人）；
+  // 正式实例不动（继续用全局配置）。放 instrumentation 最早期、先于一切 lark-cli spawn。
+  {
+    const dataDir = process.env.FLOWSHIP_DATA_DIR ?? "";
+    const isTest =
+      process.env.FLOWSHIP_TEST === "1" || dataDir.includes("fe-ai-flow-test");
+    if (isTest && dataDir && !process.env.LARKSUITE_CLI_CONFIG_DIR) {
+      process.env.LARKSUITE_CLI_CONFIG_DIR = `${dataDir}/lark-cli`;
+      console.log(
+        `[instrumentation] test 实例 lark-cli 配置隔离 → ${process.env.LARKSUITE_CLI_CONFIG_DIR}`,
+      );
+    }
+  }
+
   // PATH 两步补全：
   // 1) 内置飞书 CLI（lark-cli / meegle）bin 目录**立即**注入（同以前、零等待）——
   //    不能排在登录 shell 探测之后：探测最长 10s、期间起的 agent 会缺 meegle（review 竞态）

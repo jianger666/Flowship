@@ -21,6 +21,7 @@ import {
   File as FileIcon,
   Folder,
   Loader2,
+  MessageSquareText,
   PencilLine,
   Plug,
   RotateCcw,
@@ -553,6 +554,13 @@ const EventRowImpl = ({
                   </button>
                 </>
               )}
+            </div>
+          )}
+          {/* 飞书桥接来的消息带来源标（方案决策 #1 回显细节：一眼区分「在外面发的」） */}
+          {ev.meta?.source === "feishu" && (
+            <div className="mb-1 flex items-center gap-1 text-[11px] text-muted-foreground">
+              <MessageSquareText className="size-3" />
+              来自飞书
             </div>
           )}
           <div className="text-sm leading-relaxed">

@@ -294,6 +294,162 @@ const fileToBase64Image = async (
 };
 
 /**
+ * lark-cli event/mget enrichment（convertlib Process hook）把 content 预渲染成
+ * 人类可读文本、不是官方 OpenAPI 的 JSON（实证 2026-07-19）：
+ * - post 图文混排 → `![Image](img_v3_xxx)\n正文`
+ * - file 消息 → `<file key="file_v3_xxx" name="report.pdf"/>`
+ * - image 消息 → `![Image](img_xxx)`
+ * 所以各分支都要「JSON 优先、渲染文本兜底」双形态兼容。
+ */
+const MD_IMAGE_RE = /!\[[^\]]*\]\((img_[A-Za-z0-9_-]+)\)/g;
+/** enrichment 渲染的文件标记：`<file key="file_xxx" name="…"/>`（name 可缺省） */
+const FILE_TAG_RE =
+  /<file\s+key="(file_[A-Za-z0-9_-]+)"(?:\s+name="([^"]*)")?\s*\/>/;
+/** markdown 链接形态的文件引用：`[report.pdf](file_xxx)`（不含 `!` 前缀、以免吃掉图占位） */
+const MD_FILE_LINK_RE = /(?<!!)\[([^\]]*)\]\((file_[A-Za-z0-9_-]+)\)/;
+
+/** 从 enrichment 渲染文本里提取文件引用（两种形态）；提不到返 null */
+const extractFileRef = (
+  content: string,
+): { fileKey: string; fileName: string } | null => {
+  const tag = FILE_TAG_RE.exec(content);
+  if (tag?.[1]) {
+    return { fileKey: tag[1], fileName: tag[2] || "file" };
+  }
+  const link = MD_FILE_LINK_RE.exec(content);
+  if (link?.[2]) {
+    return { fileKey: link[2], fileName: link[1] || "file" };
+  }
+  return null;
+};
+
+/**
+ * 下载文件 key → 落盘为附件路径（改回原文件名 + 50MB 校验）。
+ * file 分支与 text/post 的 markdown 文件链接共用。
+ */
+const downloadFileAttachment = async (
+  messageId: string,
+  fileKey: string,
+  fileName: string,
+): Promise<{ path: string } | { error: string }> => {
+  const abs = await deps.downloadMessageResource(messageId, fileKey, "file");
+  // 下载产物可能无扩展名——尽量保留原文件名
+  const dest = path.join(path.dirname(abs), fileName.replace(/[/\\]/g, "_"));
+  let finalPath = abs;
+  try {
+    await fs.rename(abs, dest);
+    finalPath = dest;
+  } catch {
+    finalPath = abs;
+  }
+  // review P1#2：超过 50MB → 删临时文件 + 错误文案（route 侧 notifyOwnerError）
+  try {
+    const st = await fs.stat(finalPath);
+    if (st.size > MAX_FILE_BYTES) {
+      await fs.unlink(finalPath).catch(() => undefined);
+      return { error: "文件超过 50MB 上限" };
+    }
+  } catch (err) {
+    await fs.unlink(finalPath).catch(() => undefined);
+    return {
+      error: `文件校验失败：${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  return { path: finalPath };
+};
+
+/** text/post 正文里的 markdown 文件链接 → 下载进 attachments、剥掉占位 */
+const extractMarkdownFiles = async (
+  messageId: string,
+  text: string,
+): Promise<{ text: string; attachments: string[] }> => {
+  const attachments: string[] = [];
+  const re = new RegExp(MD_FILE_LINK_RE.source, "g");
+  const refs: Array<{ fileKey: string; fileName: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[2]) refs.push({ fileKey: m[2], fileName: m[1] || "file" });
+  }
+  if (refs.length === 0) return { text, attachments };
+  const stripped = text
+    .replace(new RegExp(MD_FILE_LINK_RE.source, "g"), "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  for (const ref of refs) {
+    try {
+      const r = await downloadFileAttachment(
+        messageId,
+        ref.fileKey,
+        ref.fileName,
+      );
+      if ("path" in r) attachments.push(r.path);
+      else console.warn("[feishu-bridge/router] markdown 文件跳过:", r.error);
+    } catch (err) {
+      console.warn(
+        "[feishu-bridge/router] markdown 文件下载失败:",
+        ref.fileKey,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  return { text: stripped, attachments };
+};
+
+const extractMarkdownImages = async (
+  messageId: string,
+  text: string,
+  seed: {
+    images: ParsedInboundContent["images"];
+    totalBytes: number;
+  } = { images: [], totalBytes: 0 },
+): Promise<{
+  text: string;
+  images: ParsedInboundContent["images"];
+  totalBytes: number;
+}> => {
+  const images = [...seed.images];
+  let totalBytes = seed.totalBytes;
+  const keys: string[] = [];
+  const re = new RegExp(MD_IMAGE_RE.source, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[1]) keys.push(m[1]);
+  }
+  if (keys.length === 0) {
+    return { text, images, totalBytes };
+  }
+  // 剥掉图占位，保留其余文字；行内多余空格 / 空行压一下
+  const stripped = text
+    .replace(new RegExp(MD_IMAGE_RE.source, "g"), "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  for (const key of keys) {
+    if (images.length >= MAX_IMAGES) break;
+    try {
+      const abs = await deps.downloadMessageResource(messageId, key, "image");
+      const img = await fileToBase64Image(abs);
+      if (!img) continue;
+      const approx = Math.floor((img.data.length * 3) / 4);
+      if (totalBytes + approx > MAX_TOTAL_IMAGE_BYTES) continue;
+      totalBytes += approx;
+      images.push(img);
+    } catch (err) {
+      console.warn(
+        "[feishu-bridge/router] markdown 图下载失败:",
+        key,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+  return { text: stripped, images, totalBytes };
+};
+
+/**
  * 按 message_type 解析为 chat-inject 可用载荷。
  * 不支持的类型设 unsupported 文案（调用方 bot 回执）。
  */
@@ -302,15 +458,21 @@ export const parseInboundContent = async (
 ): Promise<ParsedInboundContent> => {
   const type = msg.message_type;
   if (type === "text") {
-    return { text: parseTextContent(msg.content), images: [], attachments: [] };
+    // text 也可能被 enrichment 成带 ![Image](img_…) / [名称](file_…) 的 markdown
+    const rawText = parseTextContent(msg.content);
+    const md = await extractMarkdownImages(msg.message_id, rawText);
+    const mf = await extractMarkdownFiles(msg.message_id, md.text);
+    return { text: mf.text, images: md.images, attachments: mf.attachments };
   }
 
   if (type === "image") {
     const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
+    // enrichment 渲染形态兜底：content 是 `![Image](img_xxx)` 而非 JSON
+    const mdKey = new RegExp(MD_IMAGE_RE.source).exec(msg.content)?.[1] || "";
     const imageKey =
       (obj && typeof obj.image_key === "string" && obj.image_key) ||
       (obj && typeof obj.file_key === "string" && obj.file_key) ||
-      "";
+      mdKey;
     if (!imageKey) {
       return {
         text: "",
@@ -338,10 +500,18 @@ export const parseInboundContent = async (
 
   if (type === "file") {
     const obj = tryParseJson(msg.content) as Record<string, unknown> | null;
+    // enrichment 渲染形态兜底（T4 实证根因）：consumer 下发的 content 是
+    // `<file key="file_v3_xxx" name="…"/>` 而非 JSON → tryParseJson 必 null、
+    // 旧逻辑直接 unsupported「缺少 file_key」、附件永远注入不了
+    const ref = extractFileRef(msg.content);
     const fileKey =
-      (obj && typeof obj.file_key === "string" && obj.file_key) || "";
+      (obj && typeof obj.file_key === "string" && obj.file_key) ||
+      ref?.fileKey ||
+      "";
     const fileName =
-      (obj && typeof obj.file_name === "string" && obj.file_name) || "file";
+      (obj && typeof obj.file_name === "string" && obj.file_name) ||
+      ref?.fileName ||
+      "file";
     if (!fileKey) {
       return {
         text: "",
@@ -350,46 +520,17 @@ export const parseInboundContent = async (
         unsupported: "文件消息缺少 file_key",
       };
     }
-    const abs = await deps.downloadMessageResource(
-      msg.message_id,
-      fileKey,
-      "file",
-    );
-    // 下载产物可能无扩展名——尽量保留原文件名
-    const dest = path.join(path.dirname(abs), fileName.replace(/[/\\]/g, "_"));
-    let finalPath = abs;
-    try {
-      await fs.rename(abs, dest);
-      finalPath = dest;
-    } catch {
-      finalPath = abs;
+    const r = await downloadFileAttachment(msg.message_id, fileKey, fileName);
+    if ("error" in r) {
+      return { text: "", images: [], attachments: [], unsupported: r.error };
     }
-    // review P1#2：超过 50MB → 删临时文件 + unsupported（route 侧 notifyOwnerError）
-    try {
-      const st = await fs.stat(finalPath);
-      if (st.size > MAX_FILE_BYTES) {
-        await fs.unlink(finalPath).catch(() => undefined);
-        return {
-          text: "",
-          images: [],
-          attachments: [],
-          unsupported: "文件超过 50MB 上限",
-        };
-      }
-    } catch (err) {
-      await fs.unlink(finalPath).catch(() => undefined);
-      return {
-        text: "",
-        images: [],
-        attachments: [],
-        unsupported: `文件校验失败：${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    return { text: "", images: [], attachments: [finalPath] };
+    return { text: "", images: [], attachments: [r.path] };
   }
 
   if (type === "post") {
-    // post：官方 content 可能是 JSON 富文本；尽量抽 text + image_key
+    // post 两种形态都要兼容：
+    // 1) 官方 OpenAPI：JSON 节点树（tag=img + image_key）
+    // 2) lark-cli enrichment：markdown 字符串 `![Image](img_v3_…)\n正文`
     const textParts: string[] = [];
     const images: ParsedInboundContent["images"] = [];
     let totalBytes = 0;
@@ -435,21 +576,35 @@ export const parseInboundContent = async (
         }
       }
       if (o.content !== undefined) await walk(o.content);
-      // zh_cn / en_us 等语言块
+      // zh_cn / en_us 等语言块（content 已单独 walk，勿重复）
       for (const [k, v] of Object.entries(o)) {
-        if (k === "text" || k === "tag" || k === "image_key" || k === "file_key")
+        if (
+          k === "text" ||
+          k === "tag" ||
+          k === "image_key" ||
+          k === "file_key" ||
+          k === "content"
+        )
           continue;
         if (typeof v === "object") await walk(v);
       }
     };
     const parsed = tryParseJson(msg.content);
-    if (parsed) await walk(parsed);
-    else textParts.push(msg.content);
-    return {
-      text: textParts.join("").trim(),
-      images,
-      attachments: [],
-    };
+    if (parsed) {
+      await walk(parsed);
+      // JSON 树已抽过 img 节点；正文里若仍残留 markdown 图/文件引用再补一轮
+      const md = await extractMarkdownImages(
+        msg.message_id,
+        textParts.join("").trim(),
+        { images, totalBytes },
+      );
+      const mf = await extractMarkdownFiles(msg.message_id, md.text);
+      return { text: mf.text, images: md.images, attachments: mf.attachments };
+    }
+    // enrichment markdown 字符串路径（真机验收实证形态）
+    const md = await extractMarkdownImages(msg.message_id, msg.content);
+    const mf = await extractMarkdownFiles(msg.message_id, md.text);
+    return { text: mf.text, images: md.images, attachments: mf.attachments };
   }
 
   return {
@@ -778,11 +933,13 @@ export const routeInboundMessage = async (
   if (text.trim().startsWith("/")) {
     const cmdResult = await tryCommandOrSkill(msg, text);
     if (cmdResult.kind === "handled") {
+      // T8 用户拍板：Get 语义 = 消息真进了 AI——命令词只有 bot 文本回执、
+      // 不点表情（skipped 在 reactions 侧本来就不点）
       await emitInjectResult({
-        kind: "sent",
+        kind: "skipped",
         messageId: msg.message_id,
       });
-      return { kind: "sent", messageId: msg.message_id };
+      return { kind: "skipped", messageId: msg.message_id };
     }
     // R1-9：命令失败 → failed（不 retryable，用户已收到失败文本）
     if (cmdResult.kind === "handled_failed") {
@@ -858,10 +1015,9 @@ export const routeInboundMessage = async (
         // 提示失败不阻断注入
       }
     } else {
-      const lines = active.map(
-        (t, i) => `${i + 1}. ${t.title || t.id}`,
-      );
-      const tip = `有 ${active.length} 个进行中的对话，请回复对应卡片来指定：\n${lines.join("\n")}`;
+      // 不带编号：编号会误导用户「回个数字」（序号选择已拍板不做）
+      const lines = active.map((t) => `· ${t.title || t.id}`);
+      const tip = `有 ${active.length} 个进行中的对话。请用「回复」功能回复对应对话的卡片，来指定发给谁：\n${lines.join("\n")}`;
       await notifyOwnerError(tip);
       await emitInjectResult({
         kind: "skipped",
