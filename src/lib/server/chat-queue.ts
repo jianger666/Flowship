@@ -1,5 +1,5 @@
 /**
- * Chat 运行中消息排队（P5.1）
+ * Chat 运行中消息排队（P5.1）+ MessageOperationCoordinator（R35-1 / R35-6）
  *
  * agent 正在回时 chat-reply 不再 409，消息入 per-task 队列；
  * consumeChatRun 自然结束后 dequeue 依序 send（user_reply 在实际发送时才落）。
@@ -17,7 +17,16 @@
  * - itemId：客户端可预生成（clientItemId）；服务端无则兜底发号
  * - active（队内 + in-flight）+ bounded recentSettled ledger
  * - 所有清队终态只走 failQueuedItems（禁止业务路径直调 clearChatQueue）
+ *
+ * # R35-1 / R35-6 MessageOperationCoordinator
+ *
+ * - 同步原子 claim(taskId, clientItemId, payloadFingerprint)——附件落盘前
+ * - phase：accepting → persisted → handedOff（成功终态）| failed 家族（失败终态）
+ * - user_reply 落盘只到 persisted；send/firstMessage 接管后才 settle handedOff（对外 delivered）
+ * - recordQueueItemSettled 只接受真终态；进程重启不持久化 ledger（与旧约定一致）
  */
+
+import { createHash } from "node:crypto";
 
 import type { ImageAttachmentSaved } from "./task-artifacts";
 import type { AttachmentMeta } from "./route-helpers";
@@ -48,12 +57,101 @@ export type FailQueuedItemsReason =
   | "rewound"
   | "deleted";
 
-/** R33-1：ledger 终态 outcome（delivered = user_reply 已落盘） */
+/**
+ * R33-1 / R35-6：ledger 终态 outcome。
+ * delivered = handedOff（agent 已真正接管），绝不是「仅有 user_reply 气泡」。
+ */
 export type QueueItemSettleOutcome = "delivered" | FailQueuedItemsReason;
 
 export type RecentSettledEntry = {
   itemId: string;
   outcome: QueueItemSettleOutcome;
+};
+
+/**
+ * R35-1 / R35-6：单条消息受理状态机 phase。
+ * - accepting / persisted：非终态（active）
+ * - handedOff：成功终态（对外 outcome=delivered）
+ * - FailQueuedItemsReason：失败终态
+ */
+export type MessageOpPhase =
+  | "accepting"
+  | "persisted"
+  | "handedOff"
+  | FailQueuedItemsReason;
+
+export type MessageOperation = {
+  itemId: string;
+  fingerprint: string;
+  phase: MessageOpPhase;
+};
+
+/** R35-1：payload 指纹输入（text + 图/附件/skill；落盘前即可算） */
+export type MessagePayloadForFingerprint = {
+  text: string;
+  images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
+  attachmentPaths?: string[];
+  skills?: Array<{ name: string; absPath: string }>;
+};
+
+/**
+ * R35-1：稳定 payload 指纹（JSON stringify + 短 sha256）。
+ * 同 id 不同 text/图/附件/skill → claim 返 payload_mismatch。
+ */
+export const computeMessagePayloadFingerprint = (
+  payload: MessagePayloadForFingerprint,
+): string => {
+  const images = (payload.images ?? []).map((img) => ({
+    mimeType: img.mimeType ?? "",
+    filename: img.filename ?? "",
+    bytes: img.data?.length ?? 0,
+    sha: img.data
+      ? createHash("sha256").update(img.data).digest("hex").slice(0, 16)
+      : "",
+  }));
+  const attachments = [...(payload.attachmentPaths ?? [])].sort();
+  const skills = (payload.skills ?? [])
+    .map((s) => ({ name: s.name, absPath: s.absPath }))
+    .sort((a, b) =>
+      a.absPath === b.absPath
+        ? a.name.localeCompare(b.name)
+        : a.absPath.localeCompare(b.absPath),
+    );
+  const stable = JSON.stringify({
+    text: payload.text,
+    images,
+    attachments,
+    skills,
+  });
+  return createHash("sha256").update(stable).digest("hex").slice(0, 32);
+};
+
+/** R35-1：claim 结果（route 入口映射 HTTP） */
+export type ClaimMessageOperationResult =
+  | { status: "claimed"; itemId: string }
+  | {
+      status: "active";
+      phase: "accepting" | "persisted";
+      itemId: string;
+      queuedCount: number;
+    }
+  | {
+      status: "settled";
+      itemId: string;
+      outcome: QueueItemSettleOutcome;
+      queuedCount: number;
+    }
+  | { status: "payload_mismatch"; itemId: string };
+
+const isMessageOpTerminal = (phase: MessageOpPhase): boolean =>
+  phase !== "accepting" && phase !== "persisted";
+
+const terminalPhaseToOutcome = (
+  phase: MessageOpPhase,
+): QueueItemSettleOutcome | null => {
+  if (phase === "handedOff") return "delivered";
+  if (phase === "accepting" || phase === "persisted") return null;
+  return phase;
 };
 
 /**
@@ -127,15 +225,21 @@ interface ChatQueueGlobalState {
   inFlightItemIds: Map<string, string>;
   /**
    * R33-1：per-task 有界终态 ledger（FIFO）。
-   * failQueuedItems / user_reply delivered 都记；watch bootstrap 重放对账。
+   * failQueuedItems / handedOff(delivered) 都记；watch bootstrap 重放对账。
+   * R35-6：只含真终态，不含 persisted。
    */
   recentSettled: Map<string, RecentSettledEntry[]>;
+  /**
+   * R35-1：per-task MessageOperation 表（itemId → op）。
+   * direct / firstMessage / queued / queue-priority / flush 共用；挂 globalThis 防分裂。
+   */
+  messageOps: Map<string, Map<string, MessageOperation>>;
   /** R33-7：全局 item 发号器（与 Map 同寿命，防 resetModules 撞号） */
   nextItemSeq: number;
 }
 
-// V5：相对 V4 增 recentSettled + nextItemSeq（R33-1 / R33-7）；换 key 防 hot-reload 缺字段分裂
-const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV5__";
+// V6：相对 V5 增 messageOps（R35-1）；换 key 防 hot-reload 缺字段分裂
+const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV6__";
 
 const getQueueState = (): ChatQueueGlobalState => {
   const g = globalThis as unknown as Record<
@@ -149,6 +253,7 @@ const getQueueState = (): ChatQueueGlobalState => {
       inFlight: new Map(),
       inFlightItemIds: new Map(),
       recentSettled: new Map(),
+      messageOps: new Map(),
       nextItemSeq: 1,
     };
   }
@@ -158,6 +263,7 @@ const getQueueState = (): ChatQueueGlobalState => {
   if (!state.inFlight) state.inFlight = new Map();
   if (!state.inFlightItemIds) state.inFlightItemIds = new Map();
   if (!state.recentSettled) state.recentSettled = new Map();
+  if (!state.messageOps) state.messageOps = new Map();
   if (typeof state.nextItemSeq !== "number" || state.nextItemSeq < 1) {
     state.nextItemSeq = 1;
   }
@@ -169,10 +275,25 @@ const generations = () => getQueueState().generations;
 const inFlightMap = () => getQueueState().inFlight;
 const inFlightItemIdsMap = () => getQueueState().inFlightItemIds;
 const recentSettledMap = () => getQueueState().recentSettled;
+const messageOpsMap = () => getQueueState().messageOps;
+
+const taskMessageOps = (taskId: string): Map<string, MessageOperation> => {
+  const map = messageOpsMap();
+  let ops = map.get(taskId);
+  if (!ops) {
+    ops = new Map();
+    map.set(taskId, ops);
+  }
+  return ops;
+};
+
+const activeQueuedCount = (taskId: string): number =>
+  (queues().get(taskId)?.length ?? 0) + (inFlightMap().get(taskId) ?? 0);
 
 /**
- * R33-1：把 item 记入 per-task recentSettled（已有则跳过；超上限 FIFO 丢最老）。
- * delivered（user_reply 落盘）与 failQueuedItems 共用。
+ * R33-1 / R35-6：把 item 记入 per-task recentSettled（已有则跳过；超上限 FIFO 丢最老）。
+ * first-outcome-wins：只接受真终态（delivered=handedOff / failed 家族）。
+ * 同步推进 messageOps phase（旁路 settle 无 fingerprint 时用空串占位）。
  */
 export const recordQueueItemSettled = (
   taskId: string,
@@ -190,6 +311,16 @@ export const recordQueueItemSettled = (
       ? next.slice(next.length - RECENT_SETTLED_MAX)
       : next,
   );
+  // R35-1：ledger 与 operation 同推进
+  const ops = taskMessageOps(taskId);
+  const existing = ops.get(itemId);
+  if (!existing || !isMessageOpTerminal(existing.phase)) {
+    ops.set(itemId, {
+      itemId,
+      fingerprint: existing?.fingerprint ?? "",
+      phase: outcome === "delivered" ? "handedOff" : outcome,
+    });
+  }
 };
 
 /** R33-1：只读快照——bootstrap queue_state.recentSettled */
@@ -228,10 +359,177 @@ export const findRecentSettledEntry = (
     .get(taskId)
     ?.find((e) => e.itemId === itemId);
 
+/** R35-1：只读某条 MessageOperation（测试 / 诊断） */
+export const getMessageOperation = (
+  taskId: string,
+  itemId: string,
+): MessageOperation | undefined => taskMessageOps(taskId).get(itemId);
+
 /**
- * R34-4：按 (taskId, clientItemId) 查幂等受理态（route 入口 / enqueue 共用）。
- * - active：队内或 in-flight
- * - settled：recentSettled 有终态
+ * R35-1：同步原子 claim——必须在任何附件落盘 / checkpoint / send 之前调用。
+ *
+ * - absent → 登记 accepting，返 claimed
+ * - 同 id + 同 fingerprint → 返当前 active / settled（绝不再次受理）
+ * - 同 id + 不同 fingerprint → payload_mismatch（409，不静默吞新内容）
+ */
+export const claimMessageOperation = (
+  taskId: string,
+  clientItemId: string,
+  payloadFingerprint: string,
+): ClaimMessageOperationResult => {
+  if (!clientItemId) {
+    return { status: "claimed", itemId: clientItemId };
+  }
+  const queuedCount = activeQueuedCount(taskId);
+  const ops = taskMessageOps(taskId);
+  const existing = ops.get(clientItemId);
+
+  if (existing) {
+    // 旁路 settle 可能留下空 fingerprint——仅当双方都非空且不同才 mismatch
+    if (
+      existing.fingerprint &&
+      payloadFingerprint &&
+      existing.fingerprint !== payloadFingerprint
+    ) {
+      return { status: "payload_mismatch", itemId: clientItemId };
+    }
+    if (isMessageOpTerminal(existing.phase)) {
+      return {
+        status: "settled",
+        itemId: clientItemId,
+        outcome: terminalPhaseToOutcome(existing.phase)!,
+        queuedCount,
+      };
+    }
+    // 非终态只可能是 accepting | persisted（供 ClaimMessageOperationResult.active 收窄）
+    const activePhase =
+      existing.phase === "persisted" ? "persisted" : "accepting";
+    return {
+      status: "active",
+      phase: activePhase,
+      itemId: clientItemId,
+      queuedCount,
+    };
+  }
+
+  // 兼容：仅有 recentSettled、尚无 op（旧路径 / 测试直调 record）
+  const settled = findRecentSettledEntry(taskId, clientItemId);
+  if (settled) {
+    ops.set(clientItemId, {
+      itemId: clientItemId,
+      fingerprint: payloadFingerprint,
+      phase: settled.outcome === "delivered" ? "handedOff" : settled.outcome,
+    });
+    return {
+      status: "settled",
+      itemId: clientItemId,
+      outcome: settled.outcome,
+      queuedCount,
+    };
+  }
+
+  // 队内 / in-flight 但无 op（未走 claim 的旧入队）→ 视作 active，补登记
+  const inFlightId = inFlightItemIdsMap().get(taskId);
+  const inQueue = (queues().get(taskId) ?? []).some(
+    (m) => m.itemId === clientItemId,
+  );
+  if (inQueue || inFlightId === clientItemId) {
+    ops.set(clientItemId, {
+      itemId: clientItemId,
+      fingerprint: payloadFingerprint,
+      phase: "accepting",
+    });
+    return {
+      status: "active",
+      phase: "accepting",
+      itemId: clientItemId,
+      queuedCount,
+    };
+  }
+
+  ops.set(clientItemId, {
+    itemId: clientItemId,
+    fingerprint: payloadFingerprint,
+    phase: "accepting",
+  });
+  return { status: "claimed", itemId: clientItemId };
+};
+
+/**
+ * R35-6：user_reply 落盘后推进到 persisted（非终态）。
+ * 已终态则 no-op；无 op 时补登记（flush 旧条无 claim 的兜底）。
+ */
+export const markMessagePersisted = (taskId: string, itemId: string): void => {
+  if (!itemId) return;
+  const ops = taskMessageOps(taskId);
+  const cur = ops.get(itemId);
+  if (cur && isMessageOpTerminal(cur.phase)) return;
+  ops.set(itemId, {
+    itemId,
+    fingerprint: cur?.fingerprint ?? "",
+    phase: "persisted",
+  });
+};
+
+/**
+ * R35-6：agent 真正接管后 settle handedOff（ledger outcome=delivered）。
+ * first-outcome-wins：已有真终态则跳过。
+ */
+export const settleMessageHandedOff = (
+  taskId: string,
+  itemId: string,
+): void => {
+  recordQueueItemSettled(taskId, itemId, "delivered");
+};
+
+/**
+ * R35-6：明确失败终态 + ledger（queue_failed 由 failQueuedItems 统一 publish）。
+ */
+export const settleMessageFailed = (
+  taskId: string,
+  itemId: string,
+  reason: FailQueuedItemsReason,
+): void => {
+  recordQueueItemSettled(taskId, itemId, reason);
+};
+
+/**
+ * R35-1：受理后、persisted 前的软失败（409 停止 / 队满等）→ 释放 claim，允许同 id 重试。
+ * 已 persisted / 终态不得释放（应走 settleFailed 或 skipPersist 重排）。
+ */
+export const releaseMessageOperation = (
+  taskId: string,
+  itemId: string,
+): boolean => {
+  if (!itemId) return false;
+  const ops = taskMessageOps(taskId);
+  const cur = ops.get(itemId);
+  if (!cur || cur.phase !== "accepting") return false;
+  ops.delete(itemId);
+  return true;
+};
+
+/** R35-6：是否已 handedOff（重排闸门） */
+export const isMessageHandedOff = (taskId: string, itemId: string): boolean => {
+  const phase = taskMessageOps(taskId).get(itemId)?.phase;
+  if (phase === "handedOff") return true;
+  return findRecentSettledEntry(taskId, itemId)?.outcome === "delivered";
+};
+
+/** R35-6：是否已是真终态（handedOff / failed）——禁止再重排 */
+export const isMessageOperationTerminal = (
+  taskId: string,
+  itemId: string,
+): boolean => {
+  const phase = taskMessageOps(taskId).get(itemId)?.phase;
+  if (phase && isMessageOpTerminal(phase)) return true;
+  return !!findRecentSettledEntry(taskId, itemId);
+};
+
+/**
+ * R34-4 / R35-1：按 (taskId, clientItemId) 查幂等受理态（enqueue 防御 / 只读）。
+ * - active：operation 非终态，或队内 / in-flight
+ * - settled：真终态
  * - absent：可新鲜受理
  */
 export const lookupQueueItemAcceptance = (
@@ -242,9 +540,18 @@ export const lookupQueueItemAcceptance = (
   | { status: "settled"; outcome: QueueItemSettleOutcome; queuedCount: number }
   | { status: "absent" } => {
   if (!itemId) return { status: "absent" };
-  const qLen = queues().get(taskId)?.length ?? 0;
-  const inflight = inFlightMap().get(taskId) ?? 0;
-  const queuedCount = qLen + inflight;
+  const queuedCount = activeQueuedCount(taskId);
+  const op = taskMessageOps(taskId).get(itemId);
+  if (op) {
+    if (isMessageOpTerminal(op.phase)) {
+      return {
+        status: "settled",
+        outcome: terminalPhaseToOutcome(op.phase)!,
+        queuedCount,
+      };
+    }
+    return { status: "active", queuedCount };
+  }
   const inFlightId = inFlightItemIdsMap().get(taskId);
   const inQueue = (queues().get(taskId) ?? []).some((m) => m.itemId === itemId);
   if (inQueue || inFlightId === itemId) {
@@ -308,30 +615,33 @@ export const enqueueChatMessage = (
   const inflight = getChatQueueInFlight(taskId);
   const activeCount = cur.length + inflight;
 
-  // R34-4：客户端预生成 id → 先查 active（队内+in-flight）/ recentSettled，禁止重复 append
+  // R34-4 / R35-1：客户端预生成 id → 先查 operation / 队内+in-flight / recentSettled
   const clientId =
     typeof msg.itemId === "string" && msg.itemId.trim()
       ? msg.itemId.trim()
       : undefined;
   if (clientId) {
-    const inFlightId = inFlightItemIdsMap().get(taskId);
-    const alreadyActive =
-      cur.some((m) => m.itemId === clientId) || inFlightId === clientId;
-    if (alreadyActive) {
-      return {
-        ok: true,
-        queuedCount: activeCount,
-        itemId: clientId,
-        alreadyAccepted: true,
-      };
-    }
-    const settled = findRecentSettledEntry(taskId, clientId);
-    if (settled) {
+    const acceptance = lookupQueueItemAcceptance(taskId, clientId);
+    if (acceptance.status === "active") {
+      // 已 claim 尚未入队（accepting）→ 本调用负责 append；已在队内则幂等
+      const inFlightId = inFlightItemIdsMap().get(taskId);
+      const alreadyInQueue =
+        cur.some((m) => m.itemId === clientId) || inFlightId === clientId;
+      if (alreadyInQueue) {
+        return {
+          ok: true,
+          queuedCount: activeCount,
+          itemId: clientId,
+          alreadyAccepted: true,
+        };
+      }
+      // accepting 且未入队：继续下面 append（claim 赢家的首次 enqueue）
+    } else if (acceptance.status === "settled") {
       return {
         ok: false,
         reason: "already_settled",
         itemId: clientId,
-        outcome: settled.outcome,
+        outcome: acceptance.outcome,
         queuedCount: activeCount,
       };
     }
@@ -411,12 +721,14 @@ export const listChatQueueItemIds = (taskId: string): string[] => {
 };
 
 /**
- * R32-2 / R33-1：唯一清队终态提交入口（QueueOperation sink）。
+ * R32-2 / R33-1 / R35-6：唯一清队终态提交入口（QueueOperation sink）。
  *
  * 契约：
  * 1. 取出剩余队内 itemIds + in-flight（未显式传 currentItemId 时自动纳入）
- * 2. 可选 currentItemId：已 dequeue 的当前条；若 currentReplyPersisted=true
- *    （user_reply 已落盘 → 已有终态）则记 delivered，不进 failed
+ * 2. 可选 currentItemId：已 dequeue 的当前条
+ *    - currentHandedOff=true → 已真正交给 agent，不进 failed（确保 delivered ledger）
+ *    - 仅 persisted（有气泡未 handoff）→ 进 failed + queue_failed（R35-6：禁止当 delivered）
+ *    - 兼容旧名 currentReplyPersisted：现等价于「未 handoff 仍失败」（语义已纠正）
  * 3. clear（+generation、清 in-flight）——业务路径禁止直调 clearChatQueue
  * 4. failedIds 记入 recentSettled 并纯内存 publish `queue_failed`
  * 5. 返回实际 failed 的 itemIds（供调用方写 info 文案）
@@ -426,7 +738,15 @@ export const failQueuedItems = (
   options: {
     reason: FailQueuedItemsReason;
     currentItemId?: string;
-    /** 当前条 user_reply 已落盘 → 不算 failed */
+    /**
+     * R35-6：当前条已 handedOff（send===sent / run owner 接管）。
+     * 仅此时不算 failed；「有气泡」不够。
+     */
+    currentHandedOff?: boolean;
+    /**
+     * @deprecated R35-6：旧名误把 persisted 当 delivered。
+     * 仍接受以防漏改调用方，但不再豁免失败——请改用 currentHandedOff。
+     */
     currentReplyPersisted?: boolean;
   },
 ): string[] => {
@@ -434,13 +754,16 @@ export const failQueuedItems = (
   // R33-1：stop/cancelled 等旁路常不传 currentItemId——自动纳入 in-flight
   const inflightId = inFlightItemIdsMap().get(taskId);
   const currentId = options.currentItemId ?? inflightId;
+  // R35-6：只有真 handoff 才豁免；persisted 旧标志不再当 delivered
+  const handedOff =
+    options.currentHandedOff === true ||
+    (!!currentId && isMessageHandedOff(taskId, currentId));
 
   const failedIds: string[] = [];
-  if (currentId && !options.currentReplyPersisted) {
+  if (currentId && !handedOff) {
     failedIds.push(currentId);
-  } else if (currentId && options.currentReplyPersisted) {
-    // 当前条已有 user_reply 终态 → ledger 记 delivered（重连可对账）
-    recordQueueItemSettled(taskId, currentId, "delivered");
+  } else if (currentId && handedOff) {
+    settleMessageHandedOff(taskId, currentId);
   }
   for (const id of remaining) {
     if (!failedIds.includes(id)) failedIds.push(id);
@@ -450,7 +773,7 @@ export const failQueuedItems = (
   clearChatQueue(taskId);
 
   for (const id of failedIds) {
-    recordQueueItemSettled(taskId, id, options.reason);
+    settleMessageFailed(taskId, id, options.reason);
   }
   if (failedIds.length > 0) {
     publish(taskId, {
@@ -498,4 +821,6 @@ export const cleanupChatQueueState = (taskId: string): void => {
   generations().delete(taskId);
   endChatQueueInFlight(taskId);
   recentSettledMap().delete(taskId);
+  // R35-1：operation 表一并清（与 ledger 同寿命）
+  messageOpsMap().delete(taskId);
 };

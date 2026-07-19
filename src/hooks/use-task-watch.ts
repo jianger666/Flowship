@@ -74,7 +74,10 @@ export interface UseTaskWatchCallbacks {
     itemIds: string[],
     recentSettled?: Array<{ itemId: string; outcome: string }>,
   ) => void;
-  /** R33-4：task_deleted → 停重连（他 tab DELETE 后本 tab 勿刷 stale） */
+  /**
+   * R33-4 / R35-5：task_deleted → 停重连。
+   * 调用方必须把此回调接到 `commitTaskDeleted`（与 404/410 同一 sink）。
+   */
   onTaskDeleted?: (taskId: string) => void;
 }
 
@@ -178,7 +181,7 @@ export const useTaskWatch = (
           ) {
             return;
           }
-          // R34-5：404/410 = 任务已删 → 与 task_deleted 帧同一 deletion sink，不重试
+          // R35-5：404/410 = 任务已删 → 与在线 task_deleted 帧同一 onTaskDeleted → commitTaskDeleted
           const status =
             err instanceof ApiRequestError
               ? err.status

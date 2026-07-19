@@ -22,6 +22,9 @@
  *
  * R32-5：refresh 请求 epoch + successfulDeletedIds——DELETE 200 后迟到的旧 refresh
  * 不得整表覆盖回灌；pendingDeletes 在 unmark 后为空，单靠它挡不住交叉时序。
+ *
+ * R35-5：订阅 TaskTerminalCoordinator——SSE task_deleted / watch 404·410 /
+ * 本 tab DELETE 成功都走 commitTaskDeleted，推进 epoch + 记 sticky id。
  */
 
 import {
@@ -45,6 +48,12 @@ import {
   filterTaskListAfterRefresh,
   rememberSuccessfulDeletedId,
 } from "@/lib/task-list-refresh";
+import {
+  canCommitTaskSnapshot,
+  commitTaskDeleted,
+  isTaskTerminalDeleted,
+  subscribeTaskTerminalList,
+} from "@/lib/task-terminal";
 import type { Task, TaskSummary } from "@/lib/types";
 
 interface TaskListContextValue {
@@ -119,12 +128,13 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       if (!canCommitTaskListRefresh(startEpoch, refreshEpochRef.current)) {
         return;
       }
+      // R35-5：再滤 sticky terminal（跨 tab task_deleted 与 epoch 双保险）
       setTasks(
         filterTaskListAfterRefresh(
           list,
           pendingDeletesRef.current,
           successfulDeletedIdsRef.current,
-        ),
+        ).filter((t) => !isTaskTerminalDeleted(t.id)),
       );
     } catch (err) {
       // 侧栏静默（不 toast 刷屏）；首页 / 详情页自己的拉取会暴露错误
@@ -138,6 +148,20 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // R35-5：统一 terminal sink 的列表侧——推进 epoch、记 successfulDeletedId、移除行
+  useEffect(() => {
+    return subscribeTaskTerminalList((id) => {
+      refreshEpochRef.current += 1;
+      rememberSuccessfulDeletedId(successfulDeletedIdsRef.current, id);
+      setTasks((prev) => prev.filter((t) => t.id !== id));
+      // DELETE 进行中时一并解除 pending 锁（幂等）
+      if (pendingDeletesRef.current.has(id)) {
+        pendingDeletesRef.current.delete(id);
+        setDeletingIds(new Set(pendingDeletesRef.current));
+      }
+    });
+  }, []);
 
   // 窗口重新聚焦时同步一次（切回 app 拿其它任务的最新状态）
   useEffect(() => {
@@ -161,7 +185,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);
-    // 删除中 / 已成功删除：禁止详情页 / 其它路径回灌
+    // R35-5：sticky terminal / 删除中 / 已成功删除——禁止回灌复活
+    if (!canCommitTaskSnapshot(summary.id)) return;
     if (pendingDeletesRef.current.has(summary.id)) return;
     if (successfulDeletedIdsRef.current.has(summary.id)) return;
     setTasks((prev) => {
@@ -184,6 +209,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     ): Promise<DeleteTaskResult> => {
       // 已在删：幂等短路，避免双击连发两次 DELETE
       if (pendingDeletesRef.current.has(id)) return "ok";
+      // R35-5：已 sticky deleted → 幂等成功
+      if (isTaskTerminalDeleted(id)) return "ok";
       markDeleting(id);
       removeTask(id);
       // 锁定后立刻回调（侧栏用来离开当前详情，避免 upsertTask 回灌）
@@ -191,9 +218,8 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       try {
         const result = await deleteTaskApi(id);
         // ok / not_found 都算成功
-        // R32-5：推进 epoch——任何早于本 DELETE 的在飞 refresh 都不得 setTasks
-        refreshEpochRef.current += 1;
-        rememberSuccessfulDeletedId(successfulDeletedIdsRef.current, id);
+        // R35-5：走统一 sink（推进 epoch + sticky + 列表移除）
+        commitTaskDeleted(id);
         unmarkDeleting(id);
         return result;
       } catch (err) {

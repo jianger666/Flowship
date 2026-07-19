@@ -106,7 +106,10 @@ import {
   failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
-  recordQueueItemSettled,
+  isMessageOperationTerminal,
+  markMessagePersisted,
+  settleMessageFailed,
+  settleMessageHandedOff,
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
@@ -2057,7 +2060,18 @@ export const sendChatMessage = async (
 
   // 切 running + fire-and-forget 消费
   //（此 await 期间若 stop：共享取消闭包已持 acceptedRun、会直接 cancel run）
-  const runningTask = await setTaskRunStatus(task.id, "running");
+  // R35-6：agent.send 已成功 = 消息已交给 agent；status 写失败不得让 flush 把本条当未送达
+  let runningTask: Task | null = null;
+  try {
+    runningTask = await setTaskRunStatus(task.id, "running");
+  } catch (statusErr) {
+    console.error(
+      `[chat-runner] sendChatMessage: task=${task.id} 置 running 失败（agent 已受理）:`,
+      statusErr,
+    );
+    void consumeChatRun(task, run);
+    return "sent";
+  }
   // M1 补丁（11 轮复审）：上面 await 期间 stop / forceClear 仍可到达——此时
   // consumeChatRun 尚未接管（rec.cancel 还是共享闭包），若不复查就 return "sent"，
   // 会出现「已停止仍落已发送气泡」且刚写入的 running 覆盖 stop 的 idle。
@@ -2241,6 +2255,21 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           `[chat-runner] flushChatQueue task=${taskId} 丢弃已作废消息（${reason}）：` +
             `generation 已变 ${genAtDequeue}→${getChatQueueGeneration(taskId)}`,
         );
+        // R35-6：generation 已变且仅 persisted → 补明确 failed（禁止 delivered 假账）
+        if (
+          msg.itemId &&
+          msg.skipPersistEvent &&
+          !isMessageOperationTerminal(taskId, msg.itemId)
+        ) {
+          settleMessageFailed(taskId, msg.itemId, "stopped");
+        }
+        return;
+      }
+      // R35-6：已 handedOff/failed 不得重排
+      if (msg.itemId && isMessageOperationTerminal(taskId, msg.itemId)) {
+        console.warn(
+          `[chat-runner] flushChatQueue task=${taskId} 跳过重排（已终态）：${reason}`,
+        );
         return;
       }
       enqueueChatMessageFront(taskId, msg);
@@ -2367,15 +2396,18 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
             return;
           }
           replyPersisted = true;
-          // R33-1：user_reply 落盘 = delivered 终态，记入 recentSettled（重连可对账）
-          recordQueueItemSettled(taskId, msg.itemId, "delivered");
+          // R35-6：落盘只到 persisted；handoff（send===sent）后才 delivered
+          if (msg.itemId) markMessagePersisted(taskId, msg.itemId);
           if (capture.ok) {
             await persistCheckpointForReply(taskId, replyEvent.id, capture);
           }
         } else if (msg.itemId) {
-          // skipPersistEvent：入队方已落盘 → 同样记 delivered
-          recordQueueItemSettled(taskId, msg.itemId, "delivered");
+          // skipPersistEvent：入队方已落盘 → 仍是 persisted
+          markMessagePersisted(taskId, msg.itemId);
         }
+
+        // R35-6：测试可在 persisted 后、send 前挂起（注入 stop / owner 失效）
+        await failpoint("flushChatQueue.afterPersist");
 
         const sent = await sendChatMessage(
           task,
@@ -2384,7 +2416,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           msg.attachmentAbsPaths,
         );
         if (sent !== "sent") {
-          // 已落盘则塞回时带 skipPersistEvent，避免二次气泡
+          // R35-6：未 handoff → skipPersist 重排（禁止先记 delivered）
           requeueIfSameGen(
             replyPersisted ? { ...msg, skipPersistEvent: true } : msg,
             `send 未送达（${sent}）塞回`,
@@ -2392,14 +2424,16 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           return;
         }
         delivered = true;
+        // R35-6：send===sent 才 settle handedOff（对外 delivered）
+        if (msg.itemId) settleMessageHandedOff(taskId, msg.itemId);
       } catch (err) {
         console.error(`[chat-runner] flushChatQueue task=${taskId} failed:`, err);
-        // R32-2：checkpoint/send/后置异常统一走 failQueuedItems。
-        // 当前条若 user_reply 已落盘（含已 send）→ 不算 failed，只 fail 尾队列。
+        // R32-2 / R35-6：checkpoint/send/后置异常统一走 failQueuedItems。
+        // 仅已 handedOff 的当前条不算 failed；仅 persisted → queue_failed。
         const failedIds = failQueuedItems(taskId, {
           reason: "flush_error",
           currentItemId: msg.itemId,
-          currentReplyPersisted: replyPersisted || delivered,
+          currentHandedOff: delivered,
         });
         if (failedIds.length > 0) {
           try {

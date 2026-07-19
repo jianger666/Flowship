@@ -389,7 +389,7 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
     unsub();
   });
 
-  it("② checkpoint throw：当前条已有 user_reply → 只 fail 尾队列", async () => {
+  it("② checkpoint throw：仅 persisted 未 handoff → head+tail 均 queue_failed（R35-6）", async () => {
     await setupIdleSession();
     const { events, unsub } = collectStream(TASK_ID);
     enqueueChatMessage(TASK_ID, {
@@ -412,12 +412,12 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
     expect(getChatQueueCount(TASK_ID)).toBe(0);
     const failed = events.filter((e) => e.kind === "queue_failed");
     expect(failed).toHaveLength(1);
+    // R35-6：有气泡但 agent 未接管 → head 也进 failed（禁止当 delivered）
     expect(failed[0]).toMatchObject({
       kind: "queue_failed",
       reason: "flush_error",
-      itemIds: ["cp_tail"],
+      itemIds: ["cp_head", "cp_tail"],
     });
-    // 当前条已有 user_reply 终态
     const persisted = events.filter(
       (e) => e.kind === "event" && e.event.kind === "user_reply",
     );
@@ -425,9 +425,8 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
     unsub();
   });
 
-  it("② send 后置异常：setTaskRunStatus throw → fail 尾队列（当前条已落盘不算 failed）", async () => {
-    // agent.send 本身吞错返 send_failed 并塞回；验收「send/后置异常」指 try 内抛出、
-    // 命中 flush catch。send 成功后 setTaskRunStatus 抛错即该路径。
+  it("② send 后置异常：setTaskRunStatus throw → agent 已受理仍 handedOff，只 fail 尾队列", async () => {
+    // R35-6：agent.send 成功后 status 写失败仍返 sent；flush 记 handedOff，尾队列才 failed
     const pending = await setupIdleSession();
     pending.send.mockResolvedValue(pending.fakeRun);
     const { events, unsub } = collectStream(TASK_ID);
@@ -455,18 +454,17 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
       spy.mockRestore();
     }
 
-    expect(getChatQueueCount(TASK_ID)).toBe(0);
+    // head 已 handedOff；尾队列可能被链式 flush 发出或仍在——关键是 head 不进 queue_failed
     const failed = events.filter((e) => e.kind === "queue_failed");
-    expect(failed).toHaveLength(1);
-    expect(failed[0]).toMatchObject({
-      kind: "queue_failed",
-      reason: "flush_error",
-      itemIds: ["send_tail"],
-    });
+    for (const ev of failed) {
+      if (ev.kind === "queue_failed") {
+        expect(ev.itemIds).not.toContain("send_head");
+      }
+    }
     unsub();
   });
 
-  it("failQueuedItems 契约：currentReplyPersisted 时当前条不进 failed", () => {
+  it("failQueuedItems 契约：currentHandedOff 时当前条不进 failed（R35-6）", () => {
     const { events, unsub } = collectStream(TASK_ID);
     enqueueChatMessage(TASK_ID, {
       itemId: "rest_1",
@@ -474,10 +472,11 @@ describe("R32-2：全部清队路径走 failQueuedItems", () => {
       displayText: "r",
       enqueuedAt: 1,
     });
+    // R35-6：仅真 handoff 豁免；旧 currentReplyPersisted（仅气泡）不再豁免
     const failed = failQueuedItems(TASK_ID, {
       reason: "flush_error",
       currentItemId: "already_ok",
-      currentReplyPersisted: true,
+      currentHandedOff: true,
     });
     expect(failed).toEqual(["rest_1"]);
     expect(events.filter((e) => e.kind === "queue_failed")).toHaveLength(1);

@@ -30,13 +30,21 @@ import type {
 
 /**
  * R34-4：带 HTTP status 的业务拒绝——客户端据此区分「明确 4xx」与网络不确定。
+ * R35-2：可选 code（如 payload_mismatch）供 Operation 仲裁。
  */
 export class ApiRequestError extends Error {
   readonly status: number;
-  constructor(message: string, status: number) {
+  /** R35-2：服务端稳定错误码（如 payload_mismatch） */
+  readonly code?: string;
+  constructor(
+    message: string,
+    status: number,
+    options?: { code?: string },
+  ) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
+    this.code = options?.code;
   }
 }
 
@@ -626,6 +634,11 @@ export const sendChatReply = async (
    * 服务端原样采用；缺省时服务端兜底发号。
    */
   clientItemId?: string,
+  /**
+   * R35-2：payload 指纹（与 server claim 对齐）。
+   * 契约假设：同 id + 不同 fingerprint → 409 `{ error: "payload_mismatch" }`。
+   */
+  payloadFingerprint?: string,
 ): Promise<
   | {
       task: Task;
@@ -668,6 +681,8 @@ export const sendChatReply = async (
         skills: skills && skills.length > 0 ? skills : undefined,
         // R33-1：客户端预生成 id，服务端优先采用
         clientItemId: clientItemId || undefined,
+        // R35-2：供 server claimOperation 比对
+        payloadFingerprint: payloadFingerprint || undefined,
       }),
     },
   );
@@ -700,14 +715,27 @@ export const sendChatReply = async (
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    const msg =
+    const errCode =
       typeof data === "object" &&
       data &&
       "error" in data &&
       typeof (data as { error: unknown }).error === "string"
         ? (data as { error: string }).error
-        : `HTTP ${res.status}`;
-    throw new ApiRequestError(msg, res.status);
+        : undefined;
+    // R35-2：server 实际契约 = 结构化字段 `{ payloadMismatch: true }`（error 是给人读的长文案、
+    // 不做字符串匹配）；命中即抛稳定 code 供 Operation 仲裁转新 id 重发
+    const isPayloadMismatch =
+      res.status === 409 &&
+      typeof data === "object" &&
+      data !== null &&
+      (data as { payloadMismatch?: unknown }).payloadMismatch === true;
+    if (isPayloadMismatch) {
+      throw new ApiRequestError("payload_mismatch", 409, {
+        code: "payload_mismatch",
+      });
+    }
+    const msg = errCode ?? `HTTP ${res.status}`;
+    throw new ApiRequestError(msg, res.status, errCode ? { code: errCode } : undefined);
   }
   const data = (await res.json()) as {
     ok?: true;

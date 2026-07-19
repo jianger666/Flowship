@@ -38,6 +38,7 @@ import { failQueuedItems, getChatQueueCount } from "./chat-queue";
 import { failpoint } from "./failpoints";
 import {
   EVENTS_FILE,
+  exists,
   readEvents,
   readMetaV06,
   taskDir,
@@ -469,6 +470,9 @@ export interface CheckpointRefManifestEntry {
  * R34-7 manifestPending：清单本身未能确认（rewind 读失败且仓扫也失败）——
  * 不得当「零 ref」完成删除；boot 凭 repoPaths 重试构建。
  *
+ * R35-3：manifestPending 携带 unknown 语义——无完整 repoPaths 时不得 rm 最后恢复源；
+ * 空 repoPaths + 恢复源已消失绝不能解释成合法零清单。真正零仓须显式 confirmedEmpty。
+ *
  * 最终口径（R34-2）：journal 是删除事务唯一真相；tombstone 是物理/Windows EBUSY 辅助。
  * 实现上「journal.committed 或 tombstone 任一证据在 → 只前滚、绝不回滚」。
  */
@@ -483,6 +487,11 @@ export interface CheckpointRefManifest {
   manifestPending?: boolean;
   /** R34-7：manifestPending 时快照的仓路径，供 taskDir 已 rm 后 boot 重扫 */
   repoPaths?: string[];
+  /**
+   * R35-3：构建成功路径写入——确认本 task 确实零仓/零 ref。
+   * 缺省 + 空 repoPaths ≠ 合法空；只有本标志才允许前滚完成空清单。
+   */
+  confirmedEmpty?: boolean;
 }
 
 /** R33-6：按清单清 refs 的逐仓/逐 ref 结果 */
@@ -581,9 +590,25 @@ export const buildCheckpointRefManifest = async (
     if (p) repoPaths.add(p);
   }
 
-  // 无任何仓 → 合法空清单（无处挂 checkpoint ref）
+  // R35-3：无任何仓——仅当 taskDir 仍在（恢复源可及）才确认合法空清单；
+  // taskDir 已 rm 时空结果是 unknown，绝不能当 ok-empty（Codex 反例 2）
   if (repoPaths.size === 0) {
-    return { ok: true, manifest: { deletedAt, checkpointRefs: [] } };
+    if (!(await exists(taskDir(taskId)))) {
+      return {
+        ok: false,
+        error:
+          "R35-3: taskDir missing and no repoPaths — cannot confirm empty manifest",
+      };
+    }
+    return {
+      ok: true,
+      manifest: {
+        deletedAt,
+        checkpointRefs: [],
+        repoPaths: [],
+        confirmedEmpty: true,
+      },
+    };
   }
 
   const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
@@ -628,10 +653,12 @@ export const buildCheckpointRefManifest = async (
 };
 
 /**
- * R34-7：删除路径统一解析 manifest。
+ * R34-7 / R35-3：删除路径统一解析 manifest。
  * - 若调用方已给 fallbackRepoPaths（journal 快照）→ **优先扫仓**（taskDir / rewind 可能已 rm，
  *   build 会误得「合法空清单」导致 ref 泄漏）。
  * - 否则先 rewind 构建，失败再按 meta.repoPaths 扫前缀。
+ * - R35-3：fallback 为空且 taskDir/meta/rewind 恢复源已不存在 → ok:false（unknown），
+ *   绝不返回 ok-empty。
  */
 export const resolveCheckpointRefManifestForDelete = async (
   taskId: string,
@@ -657,6 +684,17 @@ export const resolveCheckpointRefManifestForDelete = async (
     (p): p is string => typeof p === "string" && p.length > 0,
   );
   if (repos.length === 0) {
+    // R35-3：无 fallback、无 meta 仓路径——若 taskDir 也不在，明确 unknown（非空成功）
+    if (!(await exists(taskDir(taskId)))) {
+      console.error(
+        `[chat-checkpoint] R35-3 resolveManifest：manifestPending unknown（空 repoPaths + taskDir 已消失）task=${taskId}`,
+      );
+      return {
+        ok: false,
+        error:
+          "R35-3: empty repoPaths and taskDir missing — keep pending, never ok-empty",
+      };
+    }
     return { ok: false, error: primary.error };
   }
   console.warn(

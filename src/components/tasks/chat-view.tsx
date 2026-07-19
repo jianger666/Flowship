@@ -44,15 +44,14 @@ import {
 } from "@/components/ui/popover";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
+import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
 import {
   allocClientChatQueueItemId,
-  applyDoneClearPending,
-  applyQueueFailedTerminal,
-  applyUserReplyTerminal,
-  dropPendingByItemId,
-  markPendingUncertain,
-  reconcilePendingWithQueueState,
-  shouldInsertPendingAfter202,
+  emptyChatOpState,
+  findReusableUncertainOperation,
+  reduceChatOperation,
+  type ChatOpState,
+  type ChatOperation,
 } from "@/lib/chat-pending-reconcile";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
@@ -71,6 +70,7 @@ import {
   type ChatContextInfo,
   type ImagePayload,
 } from "@/lib/task-store";
+import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
 import {
   isEphemeralToolOutputDelta,
   parseToolOutputDelta,
@@ -90,18 +90,12 @@ interface Props {
 }
 
 /**
- * 本地排队占位：与 handleUserReply 参数对齐。
- * images / attachments / skillRefs 完整 payload 暂无消费方，留待服务端原子
- * cancel-and-promote 接口落地后恢复「立即发送」（复审 R4）。
+ * R35-2：本地 Operation 占位（完整 payload + fingerprint，文案不参与 retry identity）。
+ * images / attachments / skillRefs 供 uncertain 同 fingerprint 重发复用。
  */
-type PendingLocalReply = {
+type PendingLocalReply = ChatOperation & {
   id: string;
-  /** R31-1：与服务端 queue itemId 对齐，pending / queue_failed / user_reply 对账 */
-  itemId: string;
-  text: string;
-  /** 与服务端 user_reply 落盘文案一致（空文本附件消息用 CHAT_ATTACHMENT_ONLY_TEXT） */
-  displayText: string;
-  /** R34-4：HTTP 不确定结果——占位保留，同 id 可重试 */
+  /** 派生自 phase，给 event-stream 占位行用 */
   uncertain?: boolean;
   images?: ImagePayload[];
   attachments?: string[];
@@ -135,16 +129,19 @@ export const ChatView = ({
   >({});
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
-  // P5 / R31-1：本地「待发送」占位（按 itemId 对账；旧事件无 id 时 displayText 兜底）
+  // P5 / R35-2：Operation ledger（pending + settled + outcomes）——HTTP/SSE 同一 reducer
   const [pendingLocalReplies, setPendingLocalReplies] = useState<
     PendingLocalReply[]
   >([]);
   // 与 pending 同步：onDone 需读最新值（避免闭包陈旧）
   const pendingLocalRepliesRef = useRef(pendingLocalReplies);
   pendingLocalRepliesRef.current = pendingLocalReplies;
-  // R32-1：早到终态（user_reply / queue_failed）记账；202 回来时已 settled 则不插 pending
-  // 用 ref：不触发渲染，bounded FIFO 由 rememberSettledItemIds 维护
-  const settledItemIdsRef = useRef<string[]>([]);
+  // R35-2：settled / outcomes 用 ref（不触发渲染）；与 pending 组成完整 ledger
+  const opSettledRef = useRef<string[]>([]);
+  const opOutcomesRef = useRef<ChatOpState["outcomes"]>({});
+  // 闭包捕获的 taskId——卸载后异步回调先验 terminal
+  const taskIdRef = useRef(task.id);
+  taskIdRef.current = task.id;
   // P4：上下文透视
   const [contextOpen, setContextOpen] = useState(false);
   const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
@@ -180,6 +177,34 @@ export const ChatView = ({
   onEventAppendRef.current = onEventAppend;
   onTaskDeletedRef.current = onTaskDeleted;
 
+  /** R35-2：把 reducer 结果写回 state/ref，并同步 queuedCount */
+  const commitOpResult = useCallback(
+    (result: ReturnType<typeof reduceChatOperation>): typeof result => {
+      opSettledRef.current = result.state.settled;
+      opOutcomesRef.current = result.state.outcomes;
+      // uncertain 派生自 phase，供 event-stream 占位行（未改其 props 契约）
+      const nextPending: PendingLocalReply[] = result.state.pending.map((p) => ({
+        ...p,
+        id: p.id ?? p.itemId,
+        uncertain: p.phase === "uncertain",
+      })) as PendingLocalReply[];
+      pendingLocalRepliesRef.current = nextPending;
+      setPendingLocalReplies(nextPending);
+      setQueuedCount(nextPending.length > 0 ? nextPending.length : null);
+      return result;
+    },
+    [],
+  );
+
+  const readOpState = useCallback(
+    (): ChatOpState => ({
+      pending: pendingLocalRepliesRef.current,
+      settled: opSettledRef.current,
+      outcomes: opOutcomesRef.current,
+    }),
+    [],
+  );
+
   // 切 task 时把 streaming / submitting / stopping / live 输出 / 排队重置
   useEffect(() => {
     setStreamingText("");
@@ -188,7 +213,9 @@ export const ChatView = ({
     setLiveToolOutputs({});
     setQueuedCount(null);
     setPendingLocalReplies([]);
-    settledItemIdsRef.current = [];
+    pendingLocalRepliesRef.current = [];
+    opSettledRef.current = [];
+    opOutcomesRef.current = {};
     setContextInfo(null);
     setKeepHints("");
   }, [task.id]);
@@ -226,35 +253,23 @@ export const ChatView = ({
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
 
-      // R31-1 / R32-1：真实 user_reply 落地 → 清 pending；未命中也记 settled（终态可早于 202）
+      // R35-2：user_reply → 同一 Operation reducer（记 delivered）
       if (ev.kind === "user_reply") {
-        setPendingLocalReplies((prev) => {
-          const { pending: next, settled } = applyUserReplyTerminal(
-            prev,
-            settledItemIdsRef.current,
-            ev,
-          );
-          settledItemIdsRef.current = settled;
-          if (next === prev) return prev;
-          setQueuedCount(next.length > 0 ? next.length : null);
-          return next;
-        });
+        commitOpResult(
+          reduceChatOperation(readOpState(), { type: "user_reply", ev }),
+        );
       }
 
       onEventAppendRef.current(ev);
     },
-    // R31-1 / R32-1：整队作废 → 清 pending + 记 settled（含未命中的早到 id）
+    // R35-2：整队作废 → reducer 记 failed
     onQueueFailed: (itemIds, reason) => {
-      setPendingLocalReplies((prev) => {
-        const { pending: next, settled } = applyQueueFailedTerminal(
-          prev,
-          settledItemIdsRef.current,
+      commitOpResult(
+        reduceChatOperation(readOpState(), {
+          type: "queue_failed",
           itemIds,
-        );
-        settledItemIdsRef.current = settled;
-        setQueuedCount(next.length > 0 ? next.length : null);
-        return next;
-      });
+        }),
+      );
       if (itemIds.length > 0) {
         // R32-2：reason 不止 persist_failed——文案按语义区分
         toast.error(
@@ -264,28 +279,26 @@ export const ChatView = ({
         );
       }
     },
-    // R32-2 / R33-1：重连 bootstrap——active + recentSettled 对账清幽灵 / 挡晚到 202
+    // R35-2：重连 bootstrap → 同一 reducer
     onQueueState: (serverItemIds, recentSettled) => {
-      setPendingLocalReplies((prev) => {
-        const before = prev.length;
-        const { pending: next, settled, ghostIds } =
-          reconcilePendingWithQueueState(
-            prev,
-            settledItemIdsRef.current,
-            serverItemIds,
-            recentSettled,
-          );
-        settledItemIdsRef.current = settled;
-        if (next.length === before && ghostIds.length === 0) return prev;
-        setQueuedCount(next.length > 0 ? next.length : null);
-        const cleared = before - next.length;
-        if (cleared > 0) {
-          toast.message(`已清除 ${cleared} 条失效的排队占位`);
-        }
-        return next;
-      });
+      const before = pendingLocalRepliesRef.current.length;
+      const result = commitOpResult(
+        reduceChatOperation(readOpState(), {
+          type: "queue_state",
+          serverItemIds,
+          recentSettled,
+        }),
+      );
+      const cleared = before - result.state.pending.length;
+      if (cleared > 0) {
+        toast.message(`已清除 ${cleared} 条失效的排队占位`);
+      }
     },
-    onTaskUpdate: (t) => onTaskUpdateRef.current(t),
+    // R35-5：task 快照提交前验 sticky terminal（卸载后迟到回调也不复活）
+    onTaskUpdate: (t) => {
+      if (!canCommitTaskSnapshot(t.id)) return;
+      onTaskUpdateRef.current(t);
+    },
     onDone: (t) => {
       setStreamingText("");
       setLiveToolOutputs({});
@@ -296,32 +309,35 @@ export const ChatView = ({
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
       ) {
-        const { settled, clearedIds } = applyDoneClearPending(
-          pendingLocalRepliesRef.current,
-          settledItemIdsRef.current,
+        const result = commitOpResult(
+          reduceChatOperation(readOpState(), { type: "done_clear" }),
         );
-        settledItemIdsRef.current = settled;
-        setPendingLocalReplies([]);
-        setQueuedCount(null);
         toast.message(
-          `会话已结束，已清除 ${clearedIds.length} 条未确认的排队占位（若仍需发送请重新输入）`,
+          `会话已结束，已清除 ${(result.clearedIds ?? []).length} 条未确认的排队占位（若仍需发送请重新输入）`,
         );
       } else {
         setQueuedCount(remaining > 0 ? remaining : null);
       }
+      if (!canCommitTaskSnapshot(t.id)) return;
       onTaskUpdateRef.current(t);
     },
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
-    // R34-5：task_deleted / watch 404 → 清 pending/streaming，再交给父级 terminal sink
+    // R35-5：task_deleted / watch 404 → 清 pending/streaming，再走统一 sink
     onTaskDeleted: (deletedId) => {
       setStreamingText("");
       setLiveToolOutputs({});
-      setPendingLocalReplies([]);
-      setQueuedCount(null);
-      settledItemIdsRef.current = [];
-      onTaskDeletedRef.current?.(deletedId);
+      commitOpResult(
+        reduceChatOperation(emptyChatOpState(), { type: "clear_all" }),
+      );
+      // 父级会再调 commitTaskDeleted；此处先清本地，父级负责 sticky + 列表
+      // 若父级未挂 onTaskDeleted，本处仍保证 sticky（双保险）
+      if (onTaskDeletedRef.current) {
+        onTaskDeletedRef.current(deletedId);
+      } else {
+        commitTaskDeleted(deletedId);
+      }
     },
   }, true);
 
@@ -333,37 +349,55 @@ export const ChatView = ({
       attachments?: string[],
       skillRefs?: Array<{ name: string; absPath: string }>,
     ): Promise<boolean> => {
+      // R35-5：已 deleted → 丢弃（含卸载后在飞 async）
+      if (!canCommitTaskSnapshot(taskIdRef.current)) return false;
+
       const args = prepareRunArgs(task);
       // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
       if (!args) return false;
 
-      // R33-1 / R34-4：请求前生成 itemId 并登记 pending；uncertain 同文案重发复用 id
+      // R35-2：fingerprint 判定 retry identity；改 payload → 新 id
       const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
-      const reuseUncertain = pendingLocalRepliesRef.current.find(
-        (p) => p.uncertain && p.displayText === displayText,
+      const payloadFingerprint = fingerprintFromChatSendArgs({
+        text,
+        images,
+        attachments,
+        skills: skillRefs,
+      });
+      const reuseUncertain = findReusableUncertainOperation(
+        pendingLocalRepliesRef.current,
+        payloadFingerprint,
       );
-      const clientItemId =
+      let clientItemId =
         reuseUncertain?.itemId ?? allocClientChatQueueItemId();
+
+      const registerOp = (itemId: string) => {
+        commitOpResult(
+          reduceChatOperation(readOpState(), {
+            type: "register",
+            op: {
+              id: itemId,
+              itemId,
+              payloadFingerprint,
+              phase: "sending",
+              text,
+              displayText,
+              images,
+              attachments,
+              skillRefs,
+            },
+          }),
+        );
+      };
+
       if (!reuseUncertain) {
-        setPendingLocalReplies((prev) => [
-          ...prev,
-          {
-            id: clientItemId,
-            itemId: clientItemId,
-            text,
-            displayText,
-            images,
-            attachments,
-            skillRefs,
-          },
-        ]);
-        setQueuedCount((prev) => (prev == null ? 1 : prev + 1));
+        registerOp(clientItemId);
       }
 
-      setIsSubmitting(true);
-      try {
+      /** 单次 POST；payload_mismatch 时外层转新 id 重试一次 */
+      const postOnce = async (itemId: string): Promise<boolean> => {
         const result = await sendChatReply(
-          task.id,
+          taskIdRef.current,
           text,
           images,
           attachments,
@@ -372,104 +406,126 @@ export const ChatView = ({
             model: args.model,
           },
           skillRefs,
-          clientItemId,
+          itemId,
+          payloadFingerprint,
         );
+        // R35-5：响应到达时 task 可能已删——不复活 UI
+        if (!canCommitTaskSnapshot(taskIdRef.current)) {
+          return true;
+        }
         // R30-3：send 后落盘失败——不可忽略提示
         if ("persistWarning" in result && result.persistWarning) {
           toast.error(
             `消息已送达但记录保存失败：${result.persistWarning}`,
           );
         }
-        // R34-4：同 id 已 settled → 清 pending + 记终态
         if ("settled" in result && result.settled) {
-          setPendingLocalReplies((prev) => {
-            const { pending: next, settled } = dropPendingByItemId(
-              prev,
-              settledItemIdsRef.current,
-              result.itemId,
-              { rememberSettled: true },
-            );
-            settledItemIdsRef.current = settled;
-            setQueuedCount(next.length > 0 ? next.length : null);
-            return next;
-          });
-          if (result.task) onTaskUpdateRef.current(result.task);
+          commitOpResult(
+            reduceChatOperation(readOpState(), {
+              type: "http_settled",
+              itemId: result.itemId,
+              outcome: result.outcome,
+            }),
+          );
+          if (result.task && canCommitTaskSnapshot(result.task.id)) {
+            onTaskUpdateRef.current(result.task);
+          }
           return true;
         }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
-          // R34-4：幂等 202 / 新受理 → 清 uncertain
-          setPendingLocalReplies((prev) =>
-            prev.map((p) =>
-              p.itemId === result.itemId ? { ...p, uncertain: false } : p,
-            ),
+          commitOpResult(
+            reduceChatOperation(readOpState(), {
+              type: "http_queued",
+              itemId: result.itemId,
+            }),
           );
-          // R33-1：已在请求前登记；终态早到则摘掉 pending（不得保留幽灵）
-          if (
-            !shouldInsertPendingAfter202(
-              settledItemIdsRef.current,
-              result.itemId,
-            )
-          ) {
-            setPendingLocalReplies((prev) => {
-              const { pending: next, settled } = dropPendingByItemId(
-                prev,
-                settledItemIdsRef.current,
-                result.itemId,
-              );
-              settledItemIdsRef.current = settled;
-              setQueuedCount(next.length > 0 ? next.length : null);
-              return next;
-            });
+          if (result.task && canCommitTaskSnapshot(result.task.id)) {
+            onTaskUpdateRef.current(result.task);
           }
-          if (result.task) onTaskUpdateRef.current(result.task);
           return true;
         }
         // 200 非 queued：摘掉本条预登记 pending（真实气泡走 SSE user_reply）
-        setPendingLocalReplies((prev) => {
-          const { pending: next, settled } = dropPendingByItemId(
-            prev,
-            settledItemIdsRef.current,
-            clientItemId,
-          );
-          settledItemIdsRef.current = settled;
-          setQueuedCount(next.length > 0 ? next.length : null);
-          return next;
-        });
-        if ("task" in result && result.task) {
+        commitOpResult(
+          reduceChatOperation(readOpState(), {
+            type: "http_direct_ok",
+            itemId,
+          }),
+        );
+        if (
+          "task" in result &&
+          result.task &&
+          canCommitTaskSnapshot(result.task.id)
+        ) {
           onTaskUpdateRef.current(result.task);
         }
         return true;
-      } catch (err) {
-        // R34-4：仅明确 4xx/业务拒绝才删 pending 恢复草稿；网络/5xx 标 uncertain
-        const status =
-          err instanceof ApiRequestError ? err.status : undefined;
-        const isBizReject =
-          typeof status === "number" && status >= 400 && status < 500;
-        if (isBizReject) {
-          setPendingLocalReplies((prev) => {
-            const { pending: next, settled } = dropPendingByItemId(
-              prev,
-              settledItemIdsRef.current,
-              clientItemId,
+      };
+
+      setIsSubmitting(true);
+      try {
+        try {
+          return await postOnce(clientItemId);
+        } catch (err) {
+          // R35-2：同 id payload 不同 → 提示并转新 id 重发一次
+          if (
+            err instanceof ApiRequestError &&
+            err.code === "payload_mismatch"
+          ) {
+            toast.message("上一条同 id 消息内容不同，已改用新 id 重发");
+            commitOpResult(
+              reduceChatOperation(readOpState(), {
+                type: "payload_mismatch",
+                itemId: clientItemId,
+              }),
             );
-            settledItemIdsRef.current = settled;
-            setQueuedCount(next.length > 0 ? next.length : null);
-            return next;
-          });
-          toast.error(`回复失败：${(err as Error).message}`);
+            clientItemId = allocClientChatQueueItemId();
+            registerOp(clientItemId);
+            try {
+              return await postOnce(clientItemId);
+            } catch (retryErr) {
+              err = retryErr;
+            }
+          }
+
+          if (!canCommitTaskSnapshot(taskIdRef.current)) {
+            // 已删：不保留草稿打扰
+            return true;
+          }
+
+          // R35-2：4xx 业务拒绝 / 网络不确定都走同一 reducer
+          const status =
+            err instanceof ApiRequestError ? err.status : undefined;
+          const isBizReject =
+            typeof status === "number" && status >= 400 && status < 500;
+          if (isBizReject) {
+            commitOpResult(
+              reduceChatOperation(readOpState(), {
+                type: "http_reject_biz",
+                itemId: clientItemId,
+              }),
+            );
+            toast.error(`回复失败：${(err as Error).message}`);
+            return false;
+          }
+          const net = commitOpResult(
+            reduceChatOperation(readOpState(), {
+              type: "http_reject_network",
+              itemId: clientItemId,
+            }),
+          );
+          // SSE 终态先到 → clearDraft=true，视为已接受
+          if (net.clearDraft) {
+            return true;
+          }
+          toast.message("发送状态未知、正在确认…");
           return false;
         }
-        setPendingLocalReplies((prev) =>
-          markPendingUncertain(prev, clientItemId),
-        );
-        toast.message("发送状态未知、正在确认…");
-        return false;
       } finally {
         setIsSubmitting(false);
       }
     },
-    [task],
+    [task, commitOpResult, readOpState],
   );
 
   // 停止当前正在跑的 chat agent
@@ -478,24 +534,24 @@ export const ChatView = ({
     try {
       const latest = await stopTask(task.id);
       setStreamingText("");
-      // R33-1：stop 清队；本地 pending 记入 settled（挡晚到 202），不只丢占位
-      const { clearedIds, settled } = applyDoneClearPending(
-        pendingLocalRepliesRef.current,
-        settledItemIdsRef.current,
+      // R35-2：stop 清队走同一 reducer
+      const result = commitOpResult(
+        reduceChatOperation(readOpState(), { type: "done_clear" }),
       );
-      settledItemIdsRef.current = settled;
-      setPendingLocalReplies([]);
-      setQueuedCount(null);
-      onTaskUpdateRef.current(latest);
-      if (clearedIds.length > 0) {
-        toast.message(`已丢弃 ${clearedIds.length} 条未发送的排队消息`);
+      if (canCommitTaskSnapshot(latest.id)) {
+        onTaskUpdateRef.current(latest);
+      }
+      if ((result.clearedIds ?? []).length > 0) {
+        toast.message(
+          `已丢弃 ${(result.clearedIds ?? []).length} 条未发送的排队消息`,
+        );
       }
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
     } finally {
       setStopping(false);
     }
-  }, [task.id]);
+  }, [task.id, commitOpResult, readOpState]);
 
   // 重命名对话
   const handleRename = useCallback(async () => {

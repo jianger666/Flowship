@@ -57,6 +57,7 @@ import {
   hasChatSession,
   isChatCompactInProgress,
   isChatQueueDraining,
+  isChatRunActive,
   releaseChatRunClaim,
   resumeChatSession,
   runChatSession,
@@ -70,6 +71,8 @@ import {
 } from "@/lib/server/chat-checkpoint";
 import {
   beginChatQueueInFlight,
+  claimMessageOperation,
+  computeMessagePayloadFingerprint,
   dequeueChatMessage,
   endChatQueueInFlight,
   enqueueChatMessage,
@@ -77,9 +80,11 @@ import {
   failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
-  listRecentSettled,
-  lookupQueueItemAcceptance,
-  recordQueueItemSettled,
+  isMessageOperationTerminal,
+  markMessagePersisted,
+  releaseMessageOperation,
+  settleMessageFailed,
+  settleMessageHandedOff,
 } from "@/lib/server/chat-queue";
 import { failpoint } from "@/lib/server/failpoints";
 import {
@@ -212,38 +217,65 @@ export const POST = async (req: Request, { params }: Ctx) => {
     return errorResponse("任务正在删除", 409);
   }
 
-  // R34-4：入口幂等——同 clientItemId 已 active → 202；已 settled → 终态 JSON
-  // （不用等到 enqueue：idle 会话会走 direct send，必须在此收口）
+  // R35-1：同步原子 claim——必须在 saveImageAttachments / checkpoint / send 之前。
+  // direct / firstMessage / queued 共用同一 MessageOperation；并发同 id 第二个在此被挡。
+  const payloadFingerprint = clientItemId
+    ? computeMessagePayloadFingerprint({
+        text,
+        images,
+        attachmentPaths: attachmentAbsPaths,
+        skills,
+      })
+    : "";
+  /** 本请求是否赢得 claim（失败者早退；赢家失败路径须 release / settle） */
+  let claimedThisRequest = false;
   if (clientItemId) {
-    const acceptance = lookupQueueItemAcceptance(id, clientItemId);
-    if (acceptance.status === "active") {
+    const claim = claimMessageOperation(id, clientItemId, payloadFingerprint);
+    if (claim.status === "payload_mismatch") {
+      // R35-1：结构化 409，供 client 区分「队满」与 payload 冲突
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "payloadMismatch：同 clientItemId 已受理其它内容，请生成新 id 重发",
+          payloadMismatch: true,
+          itemId: clientItemId,
+        }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (claim.status === "active") {
       const freshActive = await getTask(id);
       return new Response(
         JSON.stringify({
           ok: true,
           queued: true,
-          queuedCount: acceptance.queuedCount,
+          queuedCount: claim.queuedCount,
           itemId: clientItemId,
           alreadyAccepted: true,
+          phase: claim.phase,
           task: freshActive ?? task,
         }),
         { status: 202, headers: { "Content-Type": "application/json" } },
       );
     }
-    if (acceptance.status === "settled") {
+    if (claim.status === "settled") {
       const freshSettled = await getTask(id);
       return new Response(
         JSON.stringify({
           ok: true,
           settled: true,
           itemId: clientItemId,
-          outcome: acceptance.outcome,
+          outcome: claim.outcome,
           task: freshSettled ?? task,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
+    claimedThisRequest = true;
   }
+
+  // R35-1：测试可在 claim 后、附件落盘前挂起——并发同 id 第二个应已在 claim 被挡
+  await failpoint("chatReply.afterClaim");
 
   // 落盘图片：
   // - imageAbsPaths：给 agent prompt / submitUserMessage 用（只要绝对路径）
@@ -257,6 +289,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
       savedImages = await saveImageAttachments(task.id, images);
       imageAbsPaths = savedImages.map((s) => s.absPath);
     } catch (err) {
+      // R35-1：附件落盘失败 → 释放 claim，允许同 id 重试
+      if (claimedThisRequest && clientItemId) {
+        releaseMessageOperation(id, clientItemId);
+      }
       return errorResponse(
         `图片处理失败：${err instanceof Error ? err.message : String(err)}`,
       );
@@ -332,18 +368,29 @@ export const POST = async (req: Request, { params }: Ctx) => {
    * rewind 占门闩后会复查 queueCount>0 并拒绝回退——两边交叉闭合。
    * 统一「检查门闩 → enqueue → 满则 409 → 202」消掉 5 处复制粘贴。
    */
+  /** R35-1：claim 后、未 persisted 的软拒绝 → 释放以便同 id 重试 */
+  const releaseClaimIfNeeded = (): void => {
+    if (claimedThisRequest && clientItemId) {
+      releaseMessageOperation(task.id, clientItemId);
+      claimedThisRequest = false;
+    }
+  };
+
   const enqueueOrReject = async (): Promise<Response> => {
     // 与 rewind 占门闩后复查 queueCount 交叉闭合：门闩已占则绝不入队
     //（否则 202 后 rewind 清队列，消息静默消失）
     if (isChatRewindInProgress(task.id)) {
+      releaseClaimIfNeeded();
       return errorResponse("正在回退到检查点、请稍后重发", 409);
     }
     // T1：与 rewind 同款交叉闭合——stop 收尾期间入队会在 clearChatQueue 时静默丢
     const life = getChatLifecycle(task.id);
     if (life === "stopping") {
+      releaseClaimIfNeeded();
       return errorResponse("正在停止对话、请稍后重发", 409);
     }
     if (life === "deleting") {
+      releaseClaimIfNeeded();
       return errorResponse("任务正在删除", 409);
     }
     const queued = enqueueChatMessage(task.id, {
@@ -374,10 +421,14 @@ export const POST = async (req: Request, { params }: Ctx) => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      // 队满：释放 claim，允许稍后同 id 重试
+      releaseClaimIfNeeded();
       return errorResponse("排队已满", 409);
     }
     // R31-1：记下当前条 itemId（队列优先启动路径稍后原样回给客户端）
     lastEnqueuedItemId = queued.itemId;
+    // 入队成功 → claim 由队列持有，不再 release
+    claimedThisRequest = false;
     // R34-4：幂等命中（已 active）→ 直接同语义 202，不再挂 afterEnqueue
     if (!queued.alreadyAccepted) {
       // R33-1：测试可在入队后、202 返回前挂起（模拟 getTask/网络慢于 stop 终态）
@@ -497,10 +548,18 @@ export const POST = async (req: Request, { params }: Ctx) => {
         );
         if (sent === "sent") {
           sentOk = true;
+          // R35-6：send===sent 即 handedOff（agent 已接管）；落盘失败仍算已送达
+          if (clientItemId) {
+            settleMessageHandedOff(task.id, clientItemId);
+            claimedThisRequest = false;
+          }
           // R29-4：send 后落盘——失败不能伪装未发送；带 persistWarning
           let persistWarning: string | undefined;
           try {
             const replyEvent = await persistReplyAndCheckpoint(capture);
+            if (replyEvent && clientItemId) {
+              markMessagePersisted(task.id, clientItemId);
+            }
             if (!replyEvent) {
               // ENOENT（任务已删）→ 原文未落盘，但消息已送达
               persistWarning = PERSIST_WARNING_DELIVERED;
@@ -521,6 +580,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
               ok: true,
               task: fresh ?? task,
               autoStarted: false,
+              // R35-1：direct 也回 itemId，便于 client 对账 / 同 id 重试命中 settled
+              ...(clientItemId ? { itemId: clientItemId, settled: true, outcome: "delivered" } : {}),
               ...(persistWarning ? { persistWarning } : {}),
             }),
             { status: 200, headers: { "Content-Type": "application/json" } },
@@ -529,11 +590,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
         // L2/K1：owner claim 在 checkpoint 窗口被用户 stop 摘除 → 明确 409 终止，
         // 绝不落到下面「起新会话」把这条消息重放出去（AI 在「已停止」后又启动）
         if (sent === "cancelled") {
+          releaseClaimIfNeeded();
           return errorResponse("对话已被停止、本条消息未发送，请重新发送", 409);
         }
         // L2：owner 实例被替换（懒重启 forceClear 等）→ 同样终止，
         // 不得把消息发给新实例、也不得入 mode 2 重放
         if (sent === "owner_invalid") {
+          releaseClaimIfNeeded();
           return errorResponse(
             "会话已被重启、本条消息未发送，请重新发送",
             409,
@@ -591,9 +654,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 模式 2：起新会话（首条 / 会话已关 / 懒重启后）
   // 校验 bootArgs——先于落事件，缺凭据不写假「已发送」
   if (!bootArgs?.apiKey || typeof bootArgs.apiKey !== "string") {
+    releaseClaimIfNeeded();
     return errorResponse("缺 bootArgs.apiKey、起新会话必传");
   }
   if (!isValidModel(bootArgs.model)) {
+    releaseClaimIfNeeded();
     return errorResponse("bootArgs.model 非法");
   }
 
@@ -626,9 +691,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
     const pendingRestartMsg = await checkUpdatePendingRestart();
     // S1：await 后复查 lease（stop/DELETE 可能发生在 pendingRestart 检查期间）
     if (!isChatStartLeaseValid(task.id, startToken)) {
+      releaseClaimIfNeeded();
       return leaseAbortedResponse();
     }
-    if (pendingRestartMsg) return errorResponse(pendingRestartMsg, 409);
+    if (pendingRestartMsg) {
+      releaseClaimIfNeeded();
+      return errorResponse(pendingRestartMsg, 409);
+    }
 
     // R3：队列优先启动——预约赢家失败后滞留 / 并发输家入队时，不得用当前消息插队作 firstMessage
     if (getChatQueueCount(task.id) > 0) {
@@ -649,8 +718,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       beginChatQueueInFlight(task.id, head.itemId);
       const genAtDequeue = getChatQueueGeneration(task.id);
 
-      // N3-2 / R34-8：head 已出队；抛错 / lease 失效须塞回，但 generation 变了
-      //（failQueuedItems 已清）不得复活。
+      // N3-2 / R34-8 / R35-6：head 已出队；抛错 / lease 失效须塞回，但 generation 变了
+      // 或已真终态（handedOff/failed）不得复活。persisted 非终态 → 允许 skipPersist 重排。
       let replyEventPersisted = false;
       const requeueHeadIfSameGen = (): void => {
         if (getChatQueueGeneration(task.id) !== genAtDequeue) {
@@ -658,7 +727,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
           endChatQueueInFlight(task.id);
           return;
         }
-        if (listRecentSettled(task.id).some((e) => e.itemId === head.itemId)) {
+        // R35-6：仅真终态拒绝重排（不再用 recentSettled delivered 误挡 persisted）
+        if (isMessageOperationTerminal(task.id, head.itemId)) {
           endChatQueueInFlight(task.id);
           return;
         }
@@ -671,12 +741,28 @@ export const POST = async (req: Request, { params }: Ctx) => {
         requeueHeadIfSameGen();
         return leaseAbortedResponse();
       };
+      /**
+       * R35-6：persisted 后无法重排时提交明确 failed（UI 未送达），禁止留下 delivered 假账。
+       */
+      const failHeadIfPersistedOrRequeue = (): void => {
+        if (replyEventPersisted && getChatQueueGeneration(task.id) !== genAtDequeue) {
+          // generation 已变 = sink 已处理；若尚未终态则补 failed
+          if (!isMessageOperationTerminal(task.id, head.itemId)) {
+            settleMessageFailed(task.id, head.itemId, "stopped");
+          }
+          endChatQueueInFlight(task.id);
+          return;
+        }
+        requeueHeadIfSameGen();
+      };
       try {
         let firstMessageEventId: string | undefined;
         if (head.skipPersistEvent) {
           // 入队方已落过 user_reply：不落事件、不打 checkpoint，直接以其内容起会话
-          // R34-8：skip 路径也记 delivered（与 flush 同契约）
-          recordQueueItemSettled(task.id, head.itemId, "delivered");
+          // R35-6：仍是 persisted，handoff 成功后才 settle delivered
+          markMessagePersisted(task.id, head.itemId);
+          replyEventPersisted = true;
+          await failpoint("chatReply.afterQueuePriorityPersist");
         } else {
           // 队首尚未落事件 → 先快照再按队首字段写 user_reply（形状对齐 persistUserReply）
           const capture = await tryCaptureCheckpoint();
@@ -716,33 +802,37 @@ export const POST = async (req: Request, { params }: Ctx) => {
             // ENOENT：任务已删——塞回并按 lease 失效收敛（abort 内会 enqueueFront）
             return abortLeaseAndRequeue();
           }
-          // user_reply 已落盘：后续若 setTaskRunStatus 等失败、塞回时须 skipPersistEvent，
-          // 否则 flush 补给会再落一条重复气泡
+          // R35-6：user_reply 落盘 → persisted（非终态）；handoff 前可 skipPersist 重排
           replyEventPersisted = true;
-          // R34-8：落盘即 delivered 终态（重连可对账；与 flush 同 API）
-          recordQueueItemSettled(task.id, head.itemId, "delivered");
+          markMessagePersisted(task.id, head.itemId);
           if (capture.ok) {
             await persistCheckpointForReply(task.id, replyEvent.id, capture);
           }
           firstMessageEventId = replyEvent.id;
+          // R35-6：测试可在 persisted 后、handoff 前挂起（注入 stop/DELETE）
+          await failpoint("chatReply.afterQueuePriorityPersist");
         }
 
         // S1：置 running / 起 session 前最后复查
         if (!isChatStartLeaseValid(task.id, startToken)) {
-          return abortLeaseAndRequeue();
+          failHeadIfPersistedOrRequeue();
+          return leaseAbortedResponse();
         }
         const runningTask = await setTaskRunStatus(task.id, "running");
         // meta 已删 → 不得用内存 stale task 启动
         if (!runningTask || !isChatStartLeaseValid(task.id, startToken)) {
-          return abortLeaseAndRequeue();
+          failHeadIfPersistedOrRequeue();
+          return leaseAbortedResponse();
         }
         publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
 
         // S1：fire 前最后一道 lease 校验
         if (!isChatStartLeaseValid(task.id, startToken)) {
-          return abortLeaseAndRequeue();
+          failHeadIfPersistedOrRequeue();
+          return leaseAbortedResponse();
         }
-        void runChatSession({
+        // R35-6：fire 后等同步 prologue（注册 runningChats）再判定 handoff
+        const sessionPromise = runChatSession({
           task: runningTask,
           apiKey: bootArgs.apiKey,
           model: bootArgs.model,
@@ -753,19 +843,28 @@ export const POST = async (req: Request, { params }: Ctx) => {
           },
           firstMessageEventId,
           startToken,
-        }).catch((err) => {
+        });
+        sessionPromise.catch((err) => {
           console.error(
             `[chat-reply] runChatSession task=${task.id} failed:`,
             err,
           );
         });
-        // 同步 prologue 已注册 runningChats，此后队列可由 flush 消费
-        agentStarted = true;
-        // R34-8：head 已出路（delivered）→ 释放 in-flight（不再占 active）
-        endChatQueueInFlight(task.id);
+        // 让出 microtask：跑完第一个 await 前的同步占位注册 / 早退
+        await Promise.resolve();
+        if (isChatRunActive(task.id)) {
+          // R35-6：有效 run owner 已接管 → handedOff（对外 delivered）
+          settleMessageHandedOff(task.id, head.itemId);
+          agentStarted = true;
+          endChatQueueInFlight(task.id);
+        } else {
+          // lease_cancelled 等：未接管 → 重排或明确失败
+          failHeadIfPersistedOrRequeue();
+          return leaseAbortedResponse();
+        }
       } catch (innerErr) {
         // 塞回前：若本分支已成功落过 user_reply，标记 skipPersistEvent 防重复气泡
-        requeueHeadIfSameGen();
+        failHeadIfPersistedOrRequeue();
         throw innerErr;
       }
 
@@ -788,6 +887,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     const capture = await tryCaptureCheckpoint();
     // S1：checkpoint 窗口是 stop/DELETE 高频命中区——落 user_reply 前必须复查
     if (!isChatStartLeaseValid(task.id, startToken)) {
+      releaseClaimIfNeeded();
       return leaseAbortedResponse();
     }
     // R29-4：start 前落盘失败 → 5xx、不起 session
@@ -799,30 +899,49 @@ export const POST = async (req: Request, { params }: Ctx) => {
         `[chat-reply] R29-4 起会话前落盘失败 task=${task.id}:`,
         persistErr,
       );
+      releaseClaimIfNeeded();
       return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
     }
     if (!replyEvent) {
       // ENOENT：任务已删
+      releaseClaimIfNeeded();
       return leaseAbortedResponse();
+    }
+    // R35-6：firstMessage 落盘 → persisted（非终态）
+    if (clientItemId) {
+      markMessagePersisted(task.id, clientItemId);
     }
 
     // S1：置 running 前复查
     if (!isChatStartLeaseValid(task.id, startToken)) {
+      // R35-6：已有气泡但未 handoff → 明确 failed，禁止静默丢失
+      if (clientItemId) {
+        settleMessageFailed(task.id, clientItemId, "stopped");
+        claimedThisRequest = false;
+      }
       return leaseAbortedResponse();
     }
     // 切 task.runStatus=running、fire-and-forget runChatSession
     const runningTask = await setTaskRunStatus(task.id, "running");
     // S1：meta 已删时 setTaskRunStatus 返 null——绝不能 `runningTask ?? task` 用 stale 启动
     if (!runningTask || !isChatStartLeaseValid(task.id, startToken)) {
+      if (clientItemId) {
+        settleMessageFailed(task.id, clientItemId, "stopped");
+        claimedThisRequest = false;
+      }
       return leaseAbortedResponse();
     }
     publishTaskStreamEvent(task.id, { kind: "task", task: runningTask });
 
     // S1：runChatSession 前最后一道校验
     if (!isChatStartLeaseValid(task.id, startToken)) {
+      if (clientItemId) {
+        settleMessageFailed(task.id, clientItemId, "stopped");
+        claimedThisRequest = false;
+      }
       return leaseAbortedResponse();
     }
-    void runChatSession({
+    const sessionPromise = runChatSession({
       task: runningTask,
       apiKey: bootArgs.apiKey,
       model: bootArgs.model,
@@ -836,14 +955,36 @@ export const POST = async (req: Request, { params }: Ctx) => {
       // 兜底 A 据此精确定位本轮回答义务、不靠位置巧合
       firstMessageEventId: replyEvent?.id,
       startToken,
-    }).catch((err) => {
+    });
+    sessionPromise.catch((err) => {
       console.error(`[chat-reply] runChatSession task=${task.id} failed:`, err);
     });
+    // R35-6：同步 prologue 注册后才 settle handedOff
+    await Promise.resolve();
+    if (!isChatRunActive(task.id)) {
+      if (clientItemId) {
+        settleMessageFailed(task.id, clientItemId, "startup_failed");
+        claimedThisRequest = false;
+      }
+      return leaseAbortedResponse();
+    }
+    if (clientItemId) {
+      settleMessageHandedOff(task.id, clientItemId);
+      claimedThisRequest = false;
+    }
     agentStarted = true;
 
     const fresh = await getTask(task.id);
     return new Response(
-      JSON.stringify({ ok: true, task: fresh ?? task, autoStarted: true }),
+      JSON.stringify({
+        ok: true,
+        task: fresh ?? task,
+        autoStarted: true,
+        // R35-1：firstMessage 成功也回 itemId + settled，同 id 重试命中原终态
+        ...(clientItemId
+          ? { itemId: clientItemId, settled: true, outcome: "delivered" }
+          : {}),
+      }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
   } finally {

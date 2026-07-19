@@ -306,7 +306,9 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       expect(await getTask(id)).toBeNull();
 
       const journal = await readDeletionJournal(id);
-      expect(journal?.phase).toBe("committed");
+      expect(journal.kind).toBe("present");
+      if (journal.kind !== "present") throw new Error("expected present");
+      expect(journal.value.phase).toBe("committed");
       // 关键：绝无「4xx + 任务可见 + ref 已少」——此处已是非 4xx 且不可读
       expect(refExists(repo, refA) && refExists(repo, refB)).toBe(false);
 
@@ -349,7 +351,7 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       expect(res.status).not.toBeGreaterThanOrEqual(400);
       const goneCount = [refA, refB].filter((r) => !refExists(repo, r)).length;
       expect(goneCount).toBeGreaterThanOrEqual(1);
-      expect(await readDeletionJournal(id)).not.toBeNull();
+      expect((await readDeletionJournal(id)).kind).toBe("present");
 
       clearFailpoints();
       resetBootRecovery();
@@ -380,7 +382,7 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
     });
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(assertTaskReadable(id)).toBe(true);
-    expect(await readDeletionJournal(id)).toBeNull();
+    expect((await readDeletionJournal(id)).kind).toBe("absent");
     expect(
       await dirExists(path.join(taskDir(id), "workspace", "keep.txt")),
     ).toBe(true);
@@ -405,7 +407,7 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
     });
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(assertTaskReadable(id)).toBe(true);
-    expect(await readDeletionJournal(id)).toBeNull();
+    expect((await readDeletionJournal(id)).kind).toBe("absent");
   });
 
   it("②c tombstone 成功后 committed journal 写失败 → accepted、重启完成、非 4xx", async () => {
@@ -459,7 +461,7 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       expect(resOk.status).toBeLessThan(400);
       expect(refExists(repo, refA)).toBe(false);
       expect(refExists(repo, refB)).toBe(false);
-      expect(await readDeletionJournal(id)).toBeNull();
+      expect((await readDeletionJournal(id)).kind).toBe("absent");
 
       // 路径 B：rewind 坏 + .git 藏起 → 无法确认 → manifestPending
       const id2 = alloc();
@@ -478,8 +480,10 @@ describe("R35 DeleteTxn 只前滚 + HTTP Guard", () => {
       );
       expect(resPending.status).toBeLessThan(400);
       const j = await readDeletionJournal(id2);
-      expect(j?.phase).toBe("committed");
-      expect(j?.manifestPending).toBe(true);
+      expect(j.kind).toBe("present");
+      if (j.kind !== "present") throw new Error("expected present");
+      expect(j.value.phase).toBe("committed");
+      expect(j.value.manifestPending).toBe(true);
       // refs 仍在（.git 藏起时无法删）
       await fs.rename(
         path.join(seeded.repo, ".git.hide"),

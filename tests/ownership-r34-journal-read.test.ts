@@ -243,7 +243,7 @@ describe("R34 DeleteJournal + read commit guard", () => {
       params: Promise.resolve({ id }),
     });
     expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(await readDeletionJournal(id)).toBeNull();
+    expect((await readDeletionJournal(id)).kind).toBe("absent");
     expect(assertTaskReadable(id)).toBe(true);
 
     clearResourceJobs(id);
@@ -278,14 +278,16 @@ describe("R34 DeleteJournal + read commit guard", () => {
     expect(body.recoveryPending).toBe(true);
     expect(assertTaskReadable(id)).toBe(false);
     const journal = await readDeletionJournal(id);
-    expect(journal?.phase).toBe("committed");
+    expect(journal.kind).toBe("present");
+    if (journal.kind !== "present") throw new Error("expected present");
+    expect(journal.value.phase).toBe("committed");
 
     resetBootRecovery();
     const list = await listTasks();
     skipBootRecovery();
     expect(list.some((t) => t.id === id)).toBe(false);
     expect(await dirExists(taskDir(id))).toBe(false);
-    expect(await readDeletionJournal(id)).toBeNull();
+    expect((await readDeletionJournal(id)).kind).toBe("absent");
   });
 
   it("③ committed journal → boot 完成删除", async () => {
@@ -340,9 +342,10 @@ describe("R34 DeleteJournal + read commit guard", () => {
       await recoverDeletedTaskArtifacts(id);
       expect(await dirExists(taskDir(id))).toBe(false);
       const journalAfter = await readDeletionJournal(id);
-      expect(journalAfter).not.toBeNull();
-      expect(journalAfter!.phase).toBe("committed");
-      expect(journalAfter!.refsPending?.length).toBeGreaterThan(0);
+      expect(journalAfter.kind).toBe("present");
+      if (journalAfter.kind !== "present") throw new Error("expected present");
+      expect(journalAfter.value.phase).toBe("committed");
+      expect(journalAfter.value.refsPending?.length).toBeGreaterThan(0);
 
       // 恢复 git，二次 boot 重试
       await fs.rename(gitHide, gitDir);
@@ -396,8 +399,10 @@ describe("R34 DeleteJournal + read commit guard", () => {
       await recoverDeletedTaskArtifacts(id);
       expect(await dirExists(taskDir(id))).toBe(false);
       const j = await readDeletionJournal(id);
-      expect(j?.refsPending?.length).toBe(1);
-      expect(j?.refsPending?.[0]?.repoPath).toBe(repoBad);
+      expect(j.kind).toBe("present");
+      if (j.kind !== "present") throw new Error("expected present");
+      expect(j.value.refsPending?.length).toBe(1);
+      expect(j.value.refsPending?.[0]?.repoPath).toBe(repoBad);
       expect(refExists(repoOk, refOk)).toBe(false);
 
       await fs.rename(
@@ -537,7 +542,7 @@ describe("R34 DeleteJournal + read commit guard", () => {
     const list = await listTasks();
     skipBootRecovery();
     expect(list.some((t) => t.id === id)).toBe(true);
-    expect(await readDeletionJournal(id)).toBeNull();
+    expect((await readDeletionJournal(id)).kind).toBe("absent");
   });
 
   it("R33-5：commitDeletionJournal 后 assertTaskReadable=false", async () => {

@@ -85,6 +85,10 @@ import {
   type ImagePayload,
 } from "@/lib/task-store";
 import {
+  canCommitTaskSnapshot,
+  commitTaskDeleted,
+} from "@/lib/task-terminal";
+import {
   actionDisplayLabel,
   MR_KIND_LABEL,
   REPO_STATUS_LABEL,
@@ -154,25 +158,22 @@ const TaskDetailPage = () => {
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
-  const { upsertTask, removeTask } = useTaskList();
+  const { upsertTask } = useTaskList();
 
   // 当前路由 id 的 ref——快切时 in-flight refresh / 旧 SSE 回调仍持旧闭包，
   // 必须用 ref 比对「响应是否仍属当前页」，不能只靠 absorbTask 的 useCallback(id)
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
 
-  // R34-5：统一 terminal sink——task_deleted 帧 / watch 404·410
-  // （chat 模式由 ChatView 清 pending 后回调；task 模式本页 watcher 直调）
-  const handleTaskDeleted = useCallback(
-    (deletedId: string) => {
-      if (deletedId !== routeIdRef.current) return;
-      setStreamingText("");
-      setTask(null);
-      removeTask(deletedId);
-      toast.message("任务已被删除");
-    },
-    [removeTask],
-  );
+  // R35-5：统一 terminal sink——SSE task_deleted / watch 404·410 只调 commitTaskDeleted
+  // （列表 epoch / sticky 由 coordinator 通知；本页清 state；chat pending 由 ChatView 先清）
+  const handleTaskDeleted = useCallback((deletedId: string) => {
+    commitTaskDeleted(deletedId);
+    if (deletedId !== routeIdRef.current) return;
+    setStreamingText("");
+    setTask(null);
+    toast.message("任务已被删除");
+  }, []);
 
   // 侧栏 A→B 快切：立刻清本地态，避免短暂显示 A 的内容盖在 B 的 URL 上
   useEffect(() => {
@@ -186,11 +187,13 @@ const TaskDetailPage = () => {
   // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
   // 审查发现快切竞态：丢弃 payload.id !== 当前路由 id 的迟到数据（守卫在组件层，
   // mergeTaskEvents 在 prev.id!==next.id 时 return next，不能靠它挡串任务）
+  // R35-5：sticky deleted → 丢弃迟到 detail / chat mutation 200，禁止复活
   const absorbTask = useCallback((next: Task | null) => {
     if (!next) {
       setTask(null);
       return;
     }
+    if (!canCommitTaskSnapshot(next.id)) return;
     if (next.id !== routeIdRef.current) return;
     setTask((prev) => mergeTaskEvents(prev, next));
   }, []);
@@ -233,7 +236,8 @@ const TaskDetailPage = () => {
   //  2) 让 useTaskList「知道」有任务在跑 → 触发它的条件轮询去刷后台其它任务
   // 仅依赖影响侧栏展示 / 轮询触发的关键字段、不随 events 高频 setState 全列表重渲染
   useEffect(() => {
-    if (task) upsertTask(task);
+    // R35-5：deleted terminal 后不得把侧栏回灌
+    if (task && canCommitTaskSnapshot(task.id)) upsertTask(task);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     task?.id,
