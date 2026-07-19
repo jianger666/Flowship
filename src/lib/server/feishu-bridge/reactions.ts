@@ -75,7 +75,7 @@ const rememberReaction = (
   }
 };
 
-/** 查内存里 bot 点过的 reaction（recall 撤 Typing 用） */
+/** 查内存里 bot 点过的 reaction（Typing→Get 升级时撤旧表情用） */
 export const getStoredReaction = (
   messageId: string,
 ): ReactionEntry | null => reactionByMessageId.get(messageId) ?? null;

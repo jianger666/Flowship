@@ -61,11 +61,16 @@ interface BridgeStatusPayload {
   error?: string;
 }
 
-/** consumer 事件 key → 人话 */
+/** consumer 事件 key → 人话标题 */
 const CONSUMER_LABEL: Record<string, string> = {
   "im.message.receive_v1": "收消息",
   "card.action.trigger": "卡片按钮",
-  "im.message.recalled_v1": "撤回同步",
+};
+
+/** 问题行的说明：讲作用、不讲技术细节（2026-07-19 用户反馈） */
+const CONSUMER_HINT: Record<string, string> = {
+  "im.message.receive_v1": "恢复后才能在飞书里回消息",
+  "card.action.trigger": "开通后可直接点卡片按钮答题",
 };
 
 const CheckRow = ({
@@ -284,7 +289,7 @@ export const FeishuBridgeBlock = ({
                       key={c.eventKey}
                       ok={false}
                       title={CONSUMER_LABEL[c.eventKey] ?? c.eventKey}
-                      detail={c.lastError}
+                      detail={CONSUMER_HINT[c.eventKey] ?? c.lastError}
                       action={
                         c.subscribeUrl ? (
                           <OpenAuthLink href={c.subscribeUrl} label="去订阅" />

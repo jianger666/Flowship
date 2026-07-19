@@ -122,12 +122,12 @@ export type InjectResultPayload = {
 
 type InjectResultCb = (payload: InjectResultPayload) => void | Promise<void>;
 
-/** 多订阅者：reactions + recall 各自 listen，互不覆盖 */
+/** 多订阅者：reactions 等各自 listen，互不覆盖 */
 const injectResultListeners = new Set<InjectResultCb>();
 
 /**
  * 追加注入结果监听；返回注销函数。
- * S3c reactions / recall 用这个，避免单回调互相踩。
+ * reactions 等订阅方用这个，避免单回调互相踩。
  */
 export const addInjectResultListener = (
   cb: InjectResultCb,
@@ -166,7 +166,7 @@ const emitInjectResult = async (payload: InjectResultPayload): Promise<void> => 
   }
 };
 
-/** 单测触发注入结果钩子（reactions / recall） */
+/** 单测触发注入结果钩子（reactions 等） */
 export const __emitInjectResultForTest = (
   payload: InjectResultPayload,
 ): Promise<void> => emitInjectResult(payload);
@@ -826,7 +826,6 @@ export const routeInboundMessage = async (
     kind: parsedResp.queued ? "queued" : "sent",
     messageId: msg.message_id,
     taskId,
-    // 撤回出队：queued 时 recall 用 text 匹配队列条目
     text: text || undefined,
   };
   await emitInjectResult(payload);

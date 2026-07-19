@@ -7,7 +7,7 @@
  * - 崩溃指数退避；单实例守卫（event status 查同 key 异进程）
  * - keep-awake + 断线补拉
  *
- * S3c 会往 CONSUMER_SPECS 加 `im.message.recalled_v1`。
+ * consumer 按 CONSUMER_SPECS 声明式管理，新增事件只需加一项。
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -42,7 +42,6 @@ import {
   runLark,
   sendTextMessage,
 } from "./lark-api";
-import { handleRecallEvent } from "./recall";
 import {
   bridgeHostname,
   dispatchCardActionEvent,
@@ -54,10 +53,7 @@ import type { FeishuInboundMessage } from "./types";
 
 // ----------------- 声明式 consumer 列表 -----------------
 
-export type ConsumerEventKey =
-  | "im.message.receive_v1"
-  | "card.action.trigger"
-  | "im.message.recalled_v1";
+export type ConsumerEventKey = "im.message.receive_v1" | "card.action.trigger";
 
 type ConsumerSpec = {
   eventKey: ConsumerEventKey;
@@ -65,7 +61,7 @@ type ConsumerSpec = {
   onEvent: (raw: unknown) => Promise<void>;
   /**
    * 可选能力：CLI 不支持 / 未订阅时整体状态不受它拖累（overall 计算时忽略），
-   * 功能优雅降级。如撤回同步出队——lark-cli 1.0.68 尚未收录 recalled_v1。
+   * 功能优雅降级。
    */
   optional?: boolean;
 };
@@ -187,13 +183,8 @@ export const CONSUMER_SPECS: ConsumerSpec[] = [
     eventKey: "card.action.trigger",
     onEvent: defaultCardActionHandler,
   },
-  {
-    eventKey: "im.message.recalled_v1",
-    onEvent: handleRecallEvent,
-    // lark-cli 1.0.68 尚未收录该 EventKey（unknown EventKey 退 2）——撤回出队
-    // 属锦上添花，CLI 支持前优雅降级、不拖 overall
-    optional: true,
-  },
+  // 撤回同步（im.message.recalled_v1）已下线（2026-07-19 用户拍板）：
+  // lark-cli 尚未收录该 EventKey、支持情况不确定——等 CLI 官方支持后再恢复
 ];
 
 // ----------------- 状态类型 -----------------
@@ -639,7 +630,7 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
     }
 
     // unsupported 判定（2026-07-19 冒烟实测两种真实形态）：
-    // - 「unknown EventKey」——CLI 版本没收录该 key（如 recalled_v1）
+    // - 「unknown EventKey」——CLI 版本没收录该 key
     // - 「requires callbacks not subscribed」——后台没订阅回调（如 card.action.trigger），
     //   hint 里带扫码订阅链接、透出给设置页引导
     const tail = h.stderrTail.join("\n");
@@ -789,7 +780,7 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
     return h ? { ...h.state } : makeConsumerState(spec.eventKey);
   });
   // overall 计算口径：optional consumer 的 unsupported 不拖累整体（优雅降级，
-  // 如 recalled_v1 在旧 CLI 上不可用）；非 optional 的 unsupported 算 partial
+  // 旧 CLI 上不可用的事件）；非 optional 的 unsupported 算 partial
   const significant = consumers.filter((c, i) => {
     const spec = CONSUMER_SPECS[i]!;
     return !(spec.optional && c.status === "unsupported");
