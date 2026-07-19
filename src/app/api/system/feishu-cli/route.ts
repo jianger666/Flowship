@@ -1,5 +1,5 @@
 /**
- * 飞书 CLI 集成状态 / 操作（V0.12 P0）
+ * 飞书 CLI 集成状态 / 操作（V0.12）
  *
  * GET    → { larkCli, meegle, install, logins }（设置页轮询）
  * POST   → { action: "install" } 一键安装两个 CLI + 官方 skills

@@ -242,7 +242,7 @@ const checkReview = async (
     };
   }
 
-  // 基底 commit 一致性检查（V0.6 门槛 2、P1-2 修复）
+  // 基底 commit 一致性检查（V0.6 门槛 2）
   // V0.10：隔离 task 的 cwd = worktree（agent 实际干活的地方、HEAD 在这里才是对的）
   const cwd = getTaskCwd(task);
   try {
@@ -256,7 +256,7 @@ const checkReview = async (
 
   // review 骨架「总评」段要求 agent 写「- **基底 commit**：`<git rev-parse HEAD 真值>`」、
   // runner 在此 re-run git rev-parse HEAD、跟 artifact 声明的基底比对（防 agent 拿错 checkout / 编造基底）。
-  // ⚠️ 旧正则找的是「git rev-parse hash: <x>」这种字面、跟骨架「基底 commit：`<x>`」对不上 = 死代码、从不命中（P1-2）。
+  // ⚠️ 旧正则找的是「git rev-parse hash: <x>」这种字面、跟骨架「基底 commit：`<x>`」对不上 = 死代码、从不命中。
   // 注：review 不动工作树、不做 `git diff | sha256sum`（骨架无 diff hash 字段、强加 = prompt↔code 漂移）。
   const baseMatch = content.match(/基底\s*commit[^\n]*?([0-9a-f]{7,40})/i);
   if (!baseMatch) {

@@ -1,5 +1,5 @@
 /**
- * R37-1 / R37-2：Chat 提交控制器（纯函数，可单测、不拉 React）
+ * Chat 提交控制器（纯函数，可单测、不拉 React）
  *
  * - 清草稿只认 ledger 最终 known delivered
  * - HTTP 2xx 落地前先仲裁 SSE 已到的 failed（反序）
@@ -38,7 +38,7 @@ export type ChatHttpReplyResult =
     };
 
 /**
- * R37-1：仅明确 delivered 才清草稿。
+ * 仅明确 delivered 才清草稿。
  * failed / unknown / 无 outcome → 保留草稿。
  */
 export const shouldClearDraftForOutcome = (
@@ -46,7 +46,7 @@ export const shouldClearDraftForOutcome = (
 ): boolean => outcome === "delivered";
 
 /**
- * R37-2：迟到 HTTP 的 task 快照只在「当前页仍是 operation 所属 task」时推父级。
+ * 迟到 HTTP 的 task 快照只在「当前页仍是 operation 所属 task」时推父级。
  */
 export const shouldApplyTaskUpdateForOperation = (
   currentTaskId: string,
@@ -57,7 +57,7 @@ export const shouldApplyTaskUpdateForOperation = (
   currentTaskId === operationTaskId;
 
 /**
- * R37-2：提交锁绑定 request token——旧 A 的 finally 不得释放 B 的锁。
+ * 提交锁绑定 request token——旧 A 的 finally 不得释放 B 的锁。
  */
 export const shouldReleaseSubmitLock = (
   currentToken: string | null,
@@ -65,7 +65,7 @@ export const shouldReleaseSubmitLock = (
 ): boolean => currentToken === finishingToken;
 
 /**
- * R37-1 / R37-2：把 HTTP 响应提交进指定 task 的 ledger，返回是否清草稿。
+ * 把 HTTP 响应提交进指定 task 的 ledger，返回是否清草稿。
  * 调用方必须传入请求发起时捕获的 operationTaskId（不可变）。
  */
 export const commitHttpChatReply = (args: {
@@ -92,7 +92,7 @@ export const commitHttpChatReply = (args: {
       outcome: result.outcome,
     });
     return {
-      // R37-1：仅 ledger 最终 delivered；缺/未知 outcome 不会写入 delivered
+      // 仅 ledger 最终 delivered；缺/未知 outcome 不会写入 delivered
       clearDraft: shouldClearDraftForOutcome(
         reduceResult.state.outcomes[result.itemId],
       ),
@@ -103,8 +103,8 @@ export const commitHttpChatReply = (args: {
   }
 
   if ("queued" in result && result.queued) {
-    // R37-1：失败 message_op 先到 → 不得因 202 清草稿
-    // R40-1：terminalKnowledge=unknown → 同样保留草稿（与 persistence 正交）
+    // 失败 message_op 先到 → 不得因 202 清草稿
+    // terminalKnowledge=unknown → 同样保留草稿（与 persistence 正交）
     const ledgerBefore = getChatOpLedger(operationTaskId);
     const prior = ledgerBefore.outcomes[result.itemId];
     const unknownTerminalBefore =
@@ -169,7 +169,7 @@ export const commitHttpChatReply = (args: {
 };
 
 /**
- * R37-1：网络/业务 reject 后的清草稿仲裁（走同一 ledger）。
+ * 网络/业务 reject 后的清草稿仲裁（走同一 ledger）。
  */
 export const commitHttpChatReject = (args: {
   operationTaskId: string;

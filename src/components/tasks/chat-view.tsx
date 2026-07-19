@@ -98,12 +98,12 @@ interface Props {
   onEventAppend: (ev: TaskEvent) => void;
   // v1.0.x 事件懒加载：上拉分页拉到的更早事件、插到父组件事件列表头部
   onPrependEvents?: (events: TaskEvent[]) => void;
-  /** R36-7：task_deleted / watch 410 → 清本地态后通知父级（setTask null + 侧栏失效） */
+  /** task_deleted / watch 410 → 清本地态后通知父级（setTask null + 侧栏失效） */
   onTaskDeleted?: (taskId: string) => void;
 }
 
 /**
- * R35-2 / R40-1：本地 Operation 占位（完整 payload + fingerprint）。
+ * 本地 Operation 占位（完整 payload + fingerprint）。
  * images / attachments / skillRefs 供 uncertain 同 fingerprint 重发复用。
  * 是否隐藏占位只看 persistence；uncertain 样式派生自 network/terminal 轴。
  */
@@ -135,7 +135,7 @@ export const ChatView = ({
   // 本地「提交中」标记：sendChatReply 飞行期间 disable 输入框、防双击
   // 区别于 task.runStatus="running"（agent 在说话）、这个是请求飞行中、通常 < 1s
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // R37-2：提交锁绑定 request token——旧 A finally 不得释放 B 的锁
+  // 提交锁绑定 request token——旧 A finally 不得释放 B 的锁
   const submitTokenRef = useRef<string | null>(null);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
@@ -145,14 +145,14 @@ export const ChatView = ({
   >({});
   // P5：排队条（第 N 条）；null = 无排队
   const [queuedCount, setQueuedCount] = useState<number | null>(null);
-  // P5 / R35-2：Operation ledger（pending + settled + outcomes）——HTTP/SSE 同一 reducer
+  // Operation ledger（pending + settled + outcomes）——HTTP/SSE 同一 reducer
   const [pendingLocalReplies, setPendingLocalReplies] = useState<
     PendingLocalReply[]
   >([]);
   // 与 pending 同步：onDone 需读最新值（避免闭包陈旧）
   const pendingLocalRepliesRef = useRef(pendingLocalReplies);
   pendingLocalRepliesRef.current = pendingLocalReplies;
-  // R35-2：settled / outcomes 用 ref（不触发渲染）；与 pending 组成完整 ledger
+  // settled / outcomes 用 ref（不触发渲染）；与 pending 组成完整 ledger
   const opSettledRef = useRef<string[]>([]);
   const opOutcomesRef = useRef<ChatOpState["outcomes"]>({});
   // 闭包捕获的 taskId——卸载后异步回调先验 terminal
@@ -194,7 +194,7 @@ export const ChatView = ({
   onTaskDeletedRef.current = onTaskDeleted;
 
   /**
-   * R37-2：把 ledger state 投影到组件 UI（仅当前订阅的 task）。
+   * 把 ledger state 投影到组件 UI（仅当前订阅的 task）。
    * 离屏 task 的 dispatch 不会打进这里——subscribe 按 taskId 隔离。
    */
   const applyLedgerToUi = useCallback((state: ChatOpState) => {
@@ -214,10 +214,10 @@ export const ChatView = ({
     setQueuedCount(activeCount > 0 ? activeCount : null);
   }, []);
 
-  // 切 task：清 streaming 等 UI 态；订阅当前 task ledger（R36-10 / R37-2）
+  // 切 task：清 streaming 等 UI 态；订阅当前 task ledger
   useEffect(() => {
     setStreamingText("");
-    // R37-2：切走时作废旧提交锁，避免 A finally 误清 B、也避免 UI 锁残留
+    // 切走时作废旧提交锁，避免 A finally 误清 B、也避免 UI 锁残留
     submitTokenRef.current = null;
     setIsSubmitting(false);
     setStopping(false);
@@ -229,7 +229,7 @@ export const ChatView = ({
     return subscribeChatOp(task.id, applyLedgerToUi);
   }, [task.id, applyLedgerToUi]);
 
-  // R40-1：是否渲染本地占位只看 persistence（与 terminal/network 轴正交）
+  // 是否渲染本地占位只看 persistence（与 terminal/network 轴正交）
   const pendingForStream = useMemo(
     () => pendingLocalReplies.filter((p) => !shouldHideLocalPlaceholder(p)),
     [pendingLocalReplies],
@@ -268,19 +268,19 @@ export const ChatView = ({
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
 
-      // R36-2：user_reply → 标 persisted（非终态），不写 delivered
-      // R37-2：SSE 绑当前 watch task.id，显式传入（不靠可变 ref 推断）
+      // user_reply → 标 persisted（非终态），不写 delivered
+      // SSE 绑当前 watch task.id，显式传入（不靠可变 ref 推断）
       if (ev.kind === "user_reply") {
         dispatchChatOp(task.id, { type: "user_reply", ev });
       }
 
       onEventAppendRef.current(ev);
     },
-    // R35-2：整队作废 → reducer 记 failed
+    // 整队作废 → reducer 记 failed
     onQueueFailed: (itemIds, reason) => {
       dispatchChatOp(task.id, { type: "queue_failed", itemIds });
       if (itemIds.length > 0) {
-        // R32-2：reason 不止 persist_failed——文案按语义区分
+        // reason 不止 persist_failed——文案按语义区分
         toast.error(
           reason === "persist_failed"
             ? `${itemIds.length} 条消息因磁盘写入失败未发送`
@@ -288,7 +288,7 @@ export const ChatView = ({
         );
       }
     },
-    // R36-2：message_op 成功/失败终态
+    // message_op 成功/失败终态
     onMessageOp: ({ itemId, phase, outcome }) => {
       dispatchChatOp(task.id, {
         type: "message_op",
@@ -297,7 +297,7 @@ export const ChatView = ({
         outcome,
       });
     },
-    // R36-2/4：重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
+    // 重连 bootstrap → 含 operationSnapshot，ghost 不写 delivered
     onQueueState: (serverItemIds, recentSettled, operationSnapshot) => {
       const before = pendingLocalRepliesRef.current.filter(
         (p) => !shouldHideLocalPlaceholder(p),
@@ -320,7 +320,7 @@ export const ChatView = ({
         toast.message(`已清除 ${cleared} 条失效的排队占位`);
       }
     },
-    // R35-5：task 快照提交前验 sticky terminal（卸载后迟到回调也不复活）
+    // task 快照提交前验 sticky terminal（卸载后迟到回调也不复活）
     onTaskUpdate: (t) => {
       if (!canCommitTaskSnapshot(t.id)) return;
       onTaskUpdateRef.current(t);
@@ -329,7 +329,7 @@ export const ChatView = ({
       setStreamingText("");
       setLiveToolOutputs({});
       const remaining = pendingLocalRepliesRef.current.length;
-      // R36-2：done_clear 只清已有明确终态；无终态保持 uncertain/persisted
+      // done_clear 只清已有明确终态；无终态保持 uncertain/persisted
       if (
         remaining > 0 &&
         (t.runStatus === "idle" || t.runStatus === "error")
@@ -353,7 +353,7 @@ export const ChatView = ({
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
     onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
-    // R36-7：task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
+    // task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
       setStreamingText("");
       setLiveToolOutputs({});
@@ -377,16 +377,16 @@ export const ChatView = ({
       attachments?: string[],
       skillRefs?: Array<{ name: string; absPath: string }>,
     ): Promise<boolean> => {
-      // R37-2：请求发起时捕获不可变 owner——迟到回调禁止读 taskIdRef.current 定账
+      // 请求发起时捕获不可变 owner——迟到回调禁止读 taskIdRef.current 定账
       const operationTaskId = task.id;
-      // R35-5：已 deleted → 丢弃（含卸载后在飞 async）
+      // 已 deleted → 丢弃（含卸载后在飞 async）
       if (!canCommitTaskSnapshot(operationTaskId)) return false;
 
       const args = prepareRunArgs(task);
       // prepareRunArgs 已 toast；返回 false 让调用方保留草稿+附件
       if (!args) return false;
 
-      // R35-2：fingerprint 判定 retry identity；改 payload → 新 id
+      // fingerprint 判定 retry identity；改 payload → 新 id
       const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
       const payloadFingerprint = fingerprintFromChatSendArgs({
         text,
@@ -438,11 +438,11 @@ export const ChatView = ({
           itemId,
           payloadFingerprint,
         );
-        // R35-5：operation 所属 task 已删——不复活；草稿可丢
+        // operation 所属 task 已删——不复活；草稿可丢
         if (!canCommitTaskSnapshot(operationTaskId)) {
           return true;
         }
-        // R37-1/2：HTTP → ledger 仲裁清草稿；owner=operationTaskId
+        // HTTP → ledger 仲裁清草稿；owner=operationTaskId
         const committed = commitHttpChatReply({
           operationTaskId,
           clientItemId: itemId,
@@ -453,7 +453,7 @@ export const ChatView = ({
             `消息已送达但记录保存失败：${committed.persistWarning}`,
           );
         }
-        // R37-2：只有当前页仍是 A 才推父级 task 快照（防止把 B 切回 A）
+        // 只有当前页仍是 A 才推父级 task 快照（防止把 B 切回 A）
         if (
           committed.task &&
           canCommitTaskSnapshot(committed.task.id) &&
@@ -467,7 +467,7 @@ export const ChatView = ({
         return committed.clearDraft;
       };
 
-      // R37-2：锁绑定本请求 token
+      // 锁绑定本请求 token
       const submitToken = allocClientChatQueueItemId();
       submitTokenRef.current = submitToken;
       setIsSubmitting(true);
@@ -475,7 +475,7 @@ export const ChatView = ({
         try {
           return await postOnce(clientItemId);
         } catch (err) {
-          // R35-2：同 id payload 不同 → 提示并转新 id 重发一次
+          // 同 id payload 不同 → 提示并转新 id 重发一次
           if (
             err instanceof ApiRequestError &&
             err.code === "payload_mismatch"
@@ -499,7 +499,7 @@ export const ChatView = ({
             return true;
           }
 
-          // R35-2：4xx 业务拒绝 / 网络不确定都走同一 reducer
+          // 4xx 业务拒绝 / 网络不确定都走同一 reducer
           const status =
             err instanceof ApiRequestError ? err.status : undefined;
           const isBizReject =
@@ -526,7 +526,7 @@ export const ChatView = ({
           return false;
         }
       } finally {
-        // R37-2：只有本 token 仍是当前锁才释放——旧 A 不得解开 B
+        // 只有本 token 仍是当前锁才释放——旧 A 不得解开 B
         if (shouldReleaseSubmitLock(submitTokenRef.current, submitToken)) {
           submitTokenRef.current = null;
           setIsSubmitting(false);
@@ -542,7 +542,7 @@ export const ChatView = ({
     try {
       const latest = await stopTask(task.id);
       setStreamingText("");
-      // R36-2：stop 后只清已有明确终态；其余等 queue_failed / message_op
+      // stop 后只清已有明确终态；其余等 queue_failed / message_op
       const result = dispatchChatOp(task.id, { type: "done_clear" });
       if (canCommitTaskSnapshot(latest.id)) {
         onTaskUpdateRef.current(latest);

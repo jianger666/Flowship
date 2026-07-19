@@ -52,7 +52,7 @@ const sanitizeRepoBranchMap = (
 export const GET = async () => {
   try {
     const tasks = await listTasks();
-    // R34-3：helper 与 Response 之间可插入删除——提交点再 filter
+    // helper 与 Response 之间可插入删除——提交点再 filter
     await failpoint("httpRead.afterHelper");
     return commitReadableTaskListResponse(tasks, (filtered) => ({
       tasks: filtered,

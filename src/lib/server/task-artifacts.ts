@@ -76,7 +76,7 @@ interface PreparedImage {
 /**
  * 把用户上传的图片落盘到 `data/tasks/<id>/uploads/`。
  *
- * U4（验收）：chat-reply / question / ask-reply 的入口检查是一次性的，DELETE
+ * chat-reply / question / ask-reply 的入口检查是一次性的，DELETE
  * 可在其后发生；本函数若无锁地 `mkdir(..., recursive)`，会在任务目录被 rm
  * 后重建孤儿 uploads。落盘段必须与 `deleteTask` 共用 `withTaskLock`，并在
  * 锁内复查 lifecycle + meta——拿到锁时若已删完，复查必失败、绝不 mkdir。

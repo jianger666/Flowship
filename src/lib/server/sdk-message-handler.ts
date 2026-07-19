@@ -57,7 +57,7 @@ const SUBMIT_TOOL_NAMES = new Set([
 const emitToolResult = async (
   taskId: string,
   msg: Extract<SDKMessage, { type: "tool_call" }>,
-  /** R25-4：await 后写前复查 */
+  /** await 后写前复查 */
   stillCurrent: () => boolean,
 ): Promise<void> => {
   try {
@@ -69,7 +69,7 @@ const emitToolResult = async (
       result: msg.result,
       msgStatus: msg.status,
     });
-    // R25-4 / R25-5：代表性插桩——tool_result 构建 await 之后、写事件复查之前
+    // 代表性插桩——tool_result 构建 await 之后、写事件复查之前
     await failpoint("sdkmsg.beforeEventWrite");
     if (!stillCurrent()) return;
     const summary =
@@ -94,7 +94,7 @@ const emitToolResult = async (
 };
 
 /**
- * R27-6：lease 改必传——task consume 传 opHandle 闭包（`() => isTaskOpCurrent(h)`）、
+ * lease 改必传——task consume 传 opHandle 闭包（`() => isTaskOpCurrent(h)`）、
  * chat consume 传 instanceId 闭包（本 run 仍是 runningChats 当前实例才写）。
  * 旧签名「chat 缺省 opHandle = 永远 current」的 fail-open 语义删除。
  */
@@ -103,12 +103,12 @@ export const handleSdkMessage = async (
   msg: SDKMessage,
   assistantCtx: AssistantBufferCtx,
   /**
-   * R23-4c / R24-7 / R27-6：失主则整条消息丢弃（含 thinking /
+   * 失主则整条消息丢弃（含 thinking /
    * assistant / tool / error / tool_result + publish）。
    */
   lease: () => boolean,
 ): Promise<void> => {
-  // R25-4：入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
+  // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;
 
@@ -205,7 +205,7 @@ export const handleSdkMessage = async (
             if (!stillCurrent()) return;
             const target = fresh?.actions.find((a) => a.n === n);
             if (target) {
-              // R23-4c：旧 stream 的 artifact 元数据写必须绑 operation；失主拒写
+              // 旧 stream 的 artifact 元数据写必须绑 operation；失主拒写
               const patched = await patchActionIfOwner(
                 taskId,
                 target.id,
@@ -293,7 +293,7 @@ export const handleSdkMessage = async (
       if (text.length > 0) {
         if (!stillCurrent()) return;
         assistantCtx.buffer += text;
-        // R26-5：streaming delta 也走 publishIfCurrent——失主不清 B 的 UI
+        // streaming delta 也走 publishIfCurrent——失主不清 B 的 UI
         publishIfCurrent(taskId, stillCurrent, {
           kind: "assistant_delta",
           text,

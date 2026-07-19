@@ -20,10 +20,10 @@
  * 这样切到 B 时、后台还在跑的 A 跑完几秒内侧栏就更新（停转圈 / 变成等你回复点）。
  * 没有任务在跑时不轮询、不浪费。
  *
- * R32-5：refresh 请求 epoch + successfulDeletedIds——DELETE 200 后迟到的旧 refresh
+ * refresh 请求 epoch + successfulDeletedIds——DELETE 200 后迟到的旧 refresh
  * 不得整表覆盖回灌；pendingDeletes 在 unmark 后为空，单靠它挡不住交叉时序。
  *
- * R35-5：订阅 TaskTerminalCoordinator——SSE task_deleted / watch 404·410 /
+ * 订阅 TaskTerminalCoordinator——SSE task_deleted / watch 404·410 /
  * 本 tab DELETE 成功都走 commitTaskDeleted，推进 epoch + 记 sticky id。
  */
 
@@ -105,9 +105,9 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   );
   // pendingDeletes：DELETE 等待窗口内（running 可等 8s）refresh 不得把任务加回
   const pendingDeletesRef = useRef<Set<string>>(new Set());
-  // R32-5：refresh 请求世代——DELETE 成功时推进，作废任何更早启动的在飞 refresh
+  // refresh 请求世代——DELETE 成功时推进，作废任何更早启动的在飞 refresh
   const refreshEpochRef = useRef(0);
-  // R32-5：已成功删除 id（进程内有界 Set）——过滤迟到 refresh 里残留的已删任务
+  // 已成功删除 id（进程内有界 Set）——过滤迟到 refresh 里残留的已删任务
   const successfulDeletedIdsRef = useRef<Set<string>>(new Set());
 
   const markDeleting = useCallback((id: string) => {
@@ -121,14 +121,14 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const refresh = useCallback(async () => {
-    // R32-5：捕获发起时 epoch；响应到达时若已推进则整响应丢弃
+    // 捕获发起时 epoch；响应到达时若已推进则整响应丢弃
     const startEpoch = refreshEpochRef.current;
     try {
       const list = await fetchTasks();
       if (!canCommitTaskListRefresh(startEpoch, refreshEpochRef.current)) {
         return;
       }
-      // R35-5：再滤 sticky terminal（跨 tab task_deleted 与 epoch 双保险）
+      // 再滤 sticky terminal（跨 tab task_deleted 与 epoch 双保险）
       setTasks(
         filterTaskListAfterRefresh(
           list,
@@ -149,7 +149,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     void refresh();
   }, [refresh]);
 
-  // R35-5：统一 terminal sink 的列表侧——推进 epoch、记 successfulDeletedId、移除行
+  // 统一 terminal sink 的列表侧——推进 epoch、记 successfulDeletedId、移除行
   useEffect(() => {
     return subscribeTaskTerminalList((id) => {
       refreshEpochRef.current += 1;
@@ -185,7 +185,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);
-    // R35-5：sticky terminal / 删除中 / 已成功删除——禁止回灌复活
+    // sticky terminal / 删除中 / 已成功删除——禁止回灌复活
     if (!canCommitTaskSnapshot(summary.id)) return;
     if (pendingDeletesRef.current.has(summary.id)) return;
     if (successfulDeletedIdsRef.current.has(summary.id)) return;
@@ -209,7 +209,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
     ): Promise<DeleteTaskResult> => {
       // 已在删：幂等短路，避免双击连发两次 DELETE
       if (pendingDeletesRef.current.has(id)) return "ok";
-      // R35-5：已 sticky deleted → 幂等成功
+      // 已 sticky deleted → 幂等成功
       if (isTaskTerminalDeleted(id)) return "ok";
       markDeleting(id);
       removeTask(id);
@@ -218,7 +218,7 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       try {
         const result = await deleteTaskApi(id);
         // ok / not_found 都算成功
-        // R35-5：走统一 sink（推进 epoch + sticky + 列表移除）
+        // 走统一 sink（推进 epoch + sticky + 列表移除）
         commitTaskDeleted(id);
         unmarkDeleting(id);
         return result;

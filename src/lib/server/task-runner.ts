@@ -199,20 +199,20 @@ import { supersedePendingAsks } from "./ask-supersede";
 /**
  * V1：在途请求是否已因 stop/DELETE/finalize 作废。
  * gen 不匹配 = 取消方已 revoke（即使 lifecycle 已释放）；lifecycle 非空 = 取消进行中。
- * export 供单测钉扎 W1 ABA / W2 deferred 时序。路由准入仍用 gen 快照比对。
+ * export 供单测钉扎 ABA / deferred 时序。路由准入仍用 gen 快照比对。
  */
 export const isTaskOpStale = (taskId: string, opGen: number): boolean =>
   getTaskOpGeneration(taskId) !== opGen || getChatLifecycle(taskId) !== null;
 
 /**
- * V12 唯一 owner 判定入口（R22-x 收敛）：op 仍是当前 + lifecycle 无 stop/DELETE 在飞。
+ * V12 唯一 owner 判定入口：op 仍是当前 + lifecycle 无 stop/DELETE 在飞。
  * 全文件所有共享状态写门控只允许经由它（可加盘上结构条件、不可再加别的维度子集）。
  */
 const isOpOwner = (h: TaskOpHandle): boolean =>
   isTaskOpCurrent(h) && getChatLifecycle(h.taskId) === null;
 
 /**
- * X1：对齐 chat-runner 的 SendChatMessageResult——调用方必须区分
+ * 对齐 chat-runner 的 SendChatMessageResult——调用方必须区分
  * 「本请求已被 stop 作废」与「无会话 / send 失败」，不得把 stale 当 false 去 fallback。
  */
 export type SendTaskSessionResult =
@@ -221,13 +221,13 @@ export type SendTaskSessionResult =
   | "no_session"
   | "send_failed";
 
-/** X1：路由文案单一来源（question / ask-reply 409） */
+/** 路由文案单一来源（question / ask-reply 409） */
 export const TASK_OP_STALE_HTTP_MESSAGE = "正在停止/任务已变更、请重发";
 
 /**
- * R23-2：advance / resume 在关键 await 后复查——stale 方**只抛错让位**，不再补偿写
+ * advance / resume 在关键 await 后复查——stale 方**只抛错让位**，不再补偿写
  * cancelled/idle（旧补偿会误伤 stop 后同 actionId 的后继 B）。
- * 终态收尾由 stop/revoke owner 在锁内重读负责（R23-6）。
+ * 终态收尾由 stop/revoke owner 在锁内重读负责。
  */
 const abortIfTaskOpStale = async (
   taskId: string,
@@ -242,7 +242,7 @@ const abortIfTaskOpStale = async (
 };
 
 /**
- * R23-7c / R25-2：终态 repoStatus 拒推进——用盘上 fresh 值，
+ * 终态 repoStatus 拒推进——用盘上 fresh 值，
  * 不吃 hydrate 前陈旧 developing 快照（action-gates 无此闸、core 入口硬拦）。
  */
 const assertTaskNotTerminalForAdvance = async (taskId: string): Promise<void> => {
@@ -256,7 +256,7 @@ const assertTaskNotTerminalForAdvance = async (taskId: string): Promise<void> =>
 };
 
 /**
- * R22-1：启动意图上下文——inner 在 claim / append 后回填，导出入口的 catch 据此收尾。
+ * 启动意图上下文——inner 在 claim / append 后回填，导出入口的 catch 据此收尾。
  * claim 之后、internalStartAgent handoff 之前的任何 await 抛错（appendAction / baseline /
  * worktree / 分支 / supersede / workspace / MCP …）都会走 finalizeFailedStartIntent；
  * handoff 之后（fire-and-forget IIFE）的失败由 handleRunFailure / consume finally 负责。
@@ -268,7 +268,7 @@ interface StartIntentCtx {
 }
 
 /**
- * R22-1：未完成 handoff 的启动意图失败收尾——
+ * 未完成 handoff 的启动意图失败收尾——
  * - 仍是完整 owner（isOpOwner）且已有绑定 action → 条件事务把
  *   action+task 收成 error（结构条件：currentActionId 仍指向自己、action 仍 running），
  *   不留「盘上 running、实际无 owner」的僵尸；
@@ -284,7 +284,7 @@ const finalizeFailedStartIntent = async (
   // 还没 claim 就抛（准入 / auto-approve 段）——没有接管副作用要收
   if (!handle) return;
   try {
-    // R22-1：唯一组合判定——op 仍 current + 无 lifecycle
+    // 唯一组合判定——op 仍 current + 无 lifecycle
     const isOwner = (): boolean => isOpOwner(handle);
     if (isOwner() && ctx.actionId) {
       const updated = await patchActionAndRunStatusIfOpFresh(
@@ -370,10 +370,10 @@ export interface SessionCreds {
  * V0.11：关掉某 task 的跨 run agent 会话（agent close + 注销 notifier/handler + 清孤儿进程）。
  * agentId 传了就只在「当前会话确实是它」时才关（异步收尾路径防误关新会话）、不传 = 关当前的。
  *
- * R18-3：`expectedSessionInstanceId` 传了则必须与 session.instanceId 精确匹配才关——
+ * `expectedSessionInstanceId` 传了则必须与 session.instanceId 精确匹配才关——
  * Agent.resume 恢复同一持久化 agentId 时，旧 A 仅靠 agentId 会误关后继 B 的新内存实例。
  *
- * R19-4 契约（fail-closed）：
+ * 契约（fail-closed）：
  * - `expectedSessionInstanceId` 是精确实例门禁；异步旧 owner 拿不到精确实例号时必须
  *   no-op / 只关本地 agent 对象，绝不能传 `undefined` 退化成「按 agentId 关当前」。
  * - `undefined` 仅限用户主动关「当前会话」的同步调用方（cancelTaskRun / force-new 等）。
@@ -390,13 +390,13 @@ export const closeTaskSession = (
   opts: {
     reap?: boolean;
     keepPersisted?: boolean;
-    /** R18-3 / R19-4：会话内存实例号；传了则精确匹配才关（fail-closed） */
+    /** 会话内存实例号；传了则精确匹配才关（fail-closed） */
     expectedSessionInstanceId?: number;
   } = {},
 ): boolean => {
   const session = agentSessions.get(taskId);
   if (!session) {
-    // R19-4c：带了精确实例号却找不到内存会话 → 已被接管/清理，锚点归当前 owner
+    // 带了精确实例号却找不到内存会话 → 已被接管/清理，锚点归当前 owner
     if (opts.expectedSessionInstanceId !== undefined) {
       return false;
     }
@@ -405,7 +405,7 @@ export const closeTaskSession = (
     return false;
   }
   if (agentId && session.agentId !== agentId) return false;
-  // R18-3：resume 同 agentId 时只能靠 instanceId 区分新旧内存实例
+  // resume 同 agentId 时只能靠 instanceId 区分新旧内存实例
   if (
     opts.expectedSessionInstanceId !== undefined &&
     session.instanceId !== opts.expectedSessionInstanceId
@@ -502,7 +502,7 @@ export const cancelTaskRun = (taskId: string): boolean => {
  * （否则会出现「旧 action 的 check 跑完后在新 action 运行期间冒出『产出完成』事件」的交错、线上踩过）。
  */
 /**
- * R24-1：后置 check 独立租约——不再借用会在 consume finally 释放的 run opHandle。
+ * 后置 check 独立租约——不再借用会在 consume finally 释放的 run opHandle。
  * 存活凭据三件：① runningChecks 仍是 self；② 启动时快照的 opGen 未变（stop/DELETE revoke）；
  * ③ lifecycle === null。落状态仍走条件事务（awaiting_ack + awaiting_user + 结构条件）。
  */
@@ -510,13 +510,13 @@ const runActionPostCheck = (
   taskId: string,
   actionId: string,
   artifactPath: string | undefined,
-  /** R30-1：本轮 waitAndClaimPostCheck 拿到的唯一 handle；各出口只 release 本 handle */
+  /** 本轮 waitAndClaimPostCheck 拿到的唯一 handle；各出口只 release 本 handle */
   claimHandle: ClaimHandle,
 ): void => {
   // 顶替：同 task 已有在跑的 check（agent 反复 wait、或换了 action）→ abort 旧的、本轮用最新代码重跑
   const prev = runningChecks.get(taskId);
   prev?.controller.abort();
-  // R30-1 / R31-5：顶替不同 action 时按旧 entry.claimHandle 精确 release；同 action 重交卷时
+  // 顶替不同 action 时按旧 entry.claimHandle 精确 release；同 action 重交卷时
   // waitAndClaimPostCheck 已换 token 并摘掉旧 runningChecks，此处 prev 通常已空
   if (prev && prev.actionId !== actionId && prev.claimHandle) {
     releaseSideEffect(prev.claimHandle);
@@ -526,15 +526,15 @@ const runActionPostCheck = (
   }
 
   const controller = new AbortController();
-  // R31-5：ClaimHandle 挂 RunningCheck 同 global entry（不再 module-local companion Map）
+  // ClaimHandle 挂 RunningCheck 同 global entry（不再 module-local companion Map）
   const self: RunningCheck = { actionId, controller, claimHandle };
   runningChecks.set(taskId, self);
-  // R24-1：启动时快照 gen——resume/advance 会 abortRunningCheck；stop/DELETE 会 revoke bump gen
+  // 启动时快照 gen——resume/advance 会 abortRunningCheck；stop/DELETE 会 revoke bump gen
   const checkGen = getTaskOpGeneration(taskId);
 
   /**
-   * R24-1 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验）。
-   * R29-1 / R30-1 / R31-5：真正摘掉自己时按本轮 claimHandle release（旧 claimId 删不掉新 token）。
+   * 僵尸修复：每个失败/收尾出口都要摘掉自己（带身份校验）。
+   * 真正摘掉自己时按本轮 claimHandle release（旧 claimId 删不掉新 token）。
    */
   const dropSelf = (): void => {
     if (runningChecks.get(taskId) !== self) return;
@@ -546,7 +546,7 @@ const runActionPostCheck = (
     // check 句柄身份：被新一轮 check 顶替 / 被 abort（停止 / 推进）→ 不该写状态
     const stillCheckOwner = () =>
       !controller.signal.aborted && runningChecks.get(taskId) === self;
-    // R24-1：三件凭据（不借 run opHandle）
+    // 三件凭据（不借 run opHandle）
     const stillOwner = () =>
       stillCheckOwner() &&
       getTaskOpGeneration(taskId) === checkGen &&
@@ -599,7 +599,7 @@ const runActionPostCheck = (
       return;
     }
 
-    // R23-4a / M5：两段裸写合一前插 failpoint——矩阵在此注入 stop；
+    // 两段裸写合一前插 failpoint——矩阵在此注入 stop；
     // 随后条件事务锁内复查 owner，拒绝 cancelled→awaiting_ack / idle→awaiting_user。
     await failpoint("postcheck.betweenWrites");
     if (!stillOwner()) {
@@ -622,7 +622,7 @@ const runActionPostCheck = (
       publish(taskId, { kind: "task", task: patched });
       const a = patched.actions.find((x) => x.id === actionId);
       if (a) publish(taskId, { kind: "action", action: a });
-      // R26-5/6：post-check 事件写带 check 租约
+      // post-check 事件写带 check 租约
       await writeOwnedEventAndPublish(
         taskId,
         () => stillOwner(),
@@ -663,7 +663,7 @@ export const abortRunningCheck = (taskId: string): void => {
   if (!cur) return;
   cur.controller.abort();
   runningChecks.delete(taskId);
-  // R31-5：handle 与 check 同条目——跨 route/HMR 模块实例 abort 也能精确 release，防 claim 泄漏
+  // handle 与 check 同条目——跨 route/HMR 模块实例 abort 也能精确 release，防 claim 泄漏
   if (cur.claimHandle) releaseSideEffect(cur.claimHandle);
   console.log(
     `[task-runner] abortRunningCheck task=${taskId} action=${cur.actionId}`,
@@ -714,7 +714,7 @@ export interface AdvanceTaskInput {
   // V0.9：自定义 action 指向的定义 id（仅 actionType="custom" 传）
   customActionId?: string;
   /**
-   * W2：路由入场时同步捕获的 admission token。
+   * 路由入场时同步捕获的 admission token。
    * 缺省则 advanceTask 导出入口在进串行队列前同步取。
    */
   opGen?: number;
@@ -724,7 +724,7 @@ export interface AdvanceTaskInput {
 /**
  * 收尾 task 里所有「卡在非终态」（running / awaiting_ack）的 action（V0.6.12）
  *
- * R18-2：全表扫语义**只保留给 stop/DELETE/finalize owner**（finalizeTask、advance
+ * 全表扫语义**只保留给 stop/DELETE/finalize owner**（finalizeTask、advance
  * force-new 显式排除后继 actionId）。consumeSessionRun / 启动链收尾不得再调本函数——
  * 前驱 cancelled 时全表扫会把后继 B 刚 append 的 running action 一并 cancelled。
  *
@@ -732,7 +732,7 @@ export interface AdvanceTaskInput {
  * （单 Run 多 action 时代）。advance force-new 仍用本函数 + exceptActionId 排除新 action；
  * 普通 cancel/error 改为 {@link finalizeOwnAction} 只 patch 本 run 绑定的那一个。
  *
- * @param status         收尾成的终态：agent 异常退出 → error；用户主动停 / 换 agent / abandon → cancelled
+ * @param status 收尾成的终态：agent 异常退出 → error；用户主动停 / 换 agent / abandon → cancelled
  * @param exceptActionId 排除某个 action（force-new-agent 时刚 appendAction 的新 action 还要继续跑、别误伤）
  */
 const finalizeStaleActions = async (
@@ -753,7 +753,7 @@ const finalizeStaleActions = async (
 };
 
 /**
- * R18-2：前驱收尾只碰自己绑定的 action（errorActionId / action.id）。
+ * 前驱收尾只碰自己绑定的 action（errorActionId / action.id）。
  * 无绑定 action（one-shot questionRun）→ 不碰任何 action。
  */
 const finalizeOwnAction = async (
@@ -765,7 +765,7 @@ const finalizeOwnAction = async (
   await patchAction(taskId, actionId, { status });
 };
 
-// ----------------- P1-3：同一 task 的 advanceTask 串行化 -----------------
+// ----------------- 同一 task 的 advanceTask 串行化 -----------------
 //
 // advanceTask 全程 async（appendAction → 路由决策 → internalStartAgent 里 Agent.create/send）、
 // 中间多个 await。并发触发（双击「推进」/ 多标签页同时推进同一 task）会踩两个坑：
@@ -822,9 +822,9 @@ const runAdvanceExclusive = async <T>(
  */
 export const prewarmTaskWorkspace = (taskId: string): void => {
   void runAdvanceExclusive(taskId, async () => {
-    // R26-1：入场拍 observer + fresh 终态——finalize 后不得重建 worktree / 写 gitBranches
+    // 入场拍 observer + fresh 终态——finalize 后不得重建 worktree / 写 gitBranches
     const opHandle = snapshotTaskOp(taskId);
-    // R27-2：prewarm 全程登记 starting——finalize 的 5s join 轮询只等 startingTasks、
+    // prewarm 全程登记 starting——finalize 的 5s join 轮询只等 startingTasks、
     // 不登记就 join 不到本预热；登记后 join 覆盖预热主窗口（lease 仍是权威闸）
     beginTaskStarting(taskId);
     try {
@@ -835,7 +835,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
       const st = await readTaskRepoStatusFresh(taskId);
       return st !== null && st !== "merged" && st !== "abandoned";
     };
-    // R27-2：同步 resource lease——传进 ensureTaskWorktrees 内部（fetch 后 / rm 前 / add 前后）
+    // 同步 resource lease——传进 ensureTaskWorktrees 内部（fetch 后 / rm 前 / add 前后）
     const lease = (): boolean =>
       isTaskOpCurrent(opHandle) && getChatLifecycle(taskId) === null;
     if (!(await stillPrewarm())) return;
@@ -843,18 +843,18 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
     if (!task || !isWorktreeTask(task)) return;
     if (!(await stillPrewarm())) return;
     try {
-      // R26-1：worktree add 前插桩 + 复查（finalize 期间/之后放弃预热）
+      // worktree add 前插桩 + 复查（finalize 期间/之后放弃预热）
       await failpoint("prewarm.beforeWorktreeAdd");
       if (!(await stillPrewarm())) return;
 
-      // R27-2 / R28-1：lease 进资源函数内部——失效抛 WorktreeLeaseLostError 让位（不吞）
+      // lease 进资源函数内部——失效抛 WorktreeLeaseLostError 让位（不吞）
       const ensured = await ensureTaskWorktrees(task, lease);
 
       // worktree add 返回后再复查——终态后不 upsert、不写 info
       if (!(await stillPrewarm())) return;
 
       // 同 advanceTaskInner：仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值）
-      // R29-2A-P2：prewarm 的 upsert 也带 lease finalGuard——stillPrewarm 检查后
+      // prewarm 的 upsert 也带 lease finalGuard——stillPrewarm 检查后
       // 的 await 期间 revoke/接管时提交点拒写
       const existingRepos = new Set(
         (task.gitBranches ?? []).map((b) => b.repoPath),
@@ -874,7 +874,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
                 )
                 .join("、")}）`
             : "";
-        // R26-5/6：事件写带 lease——失主不落盘
+        // 事件写带 lease——失主不落盘
         await writeOwnedEventAndPublish(
           task.id,
           lease,
@@ -887,7 +887,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
     );
       }
     } catch (err) {
-      // R27-2：lease 失效让位是预期路径（finalize/stop 接管）、静默即可
+      // lease 失效让位是预期路径（finalize/stop 接管）、静默即可
       if (err instanceof WorktreeLeaseLostError) {
         console.log(`[task-runner] task=${taskId} 预热让位（lease 失效）`);
         return;
@@ -898,7 +898,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
       );
     }
     } finally {
-      // R27-2：与 beginTaskStarting 配对（任何出口都归零）
+      // 与 beginTaskStarting 配对（任何出口都归零）
       endTaskStarting(taskId);
     }
   });
@@ -907,7 +907,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
 export const advanceTask = async (
   input: AdvanceTaskInput,
 ): Promise<{ action: ActionRecord }> => {
-  // W2：admission token 在进任何 promise chain（含 runAdvanceExclusive 排队）之前同步捕获——
+  // admission token 在进任何 promise chain（含 runAdvanceExclusive 排队）之前同步捕获——
   // 否则 A2 排队期间 stop bump，出队后才取会拍到新值、冒充 stop 后的新意图
   const opGen = input.opGen ?? getTaskOpGeneration(input.task.id);
   return runAdvanceExclusive(input.task.id, () =>
@@ -918,7 +918,7 @@ export const advanceTask = async (
 const advanceTaskInner = async (
   input: AdvanceTaskInput,
 ): Promise<{ action: ActionRecord }> => {
-  // R22-1：claim 之后、handoff 之前的任何 await 抛错都要收尾自己的启动意图
+  // claim 之后、handoff 之前的任何 await 抛错都要收尾自己的启动意图
   // （已 append 的 action 不留僵尸 running、token 匹配才 release），否则
   // 「盘上 running、实际无 owner、token 无人释放」。
   const ctx: StartIntentCtx = {};
@@ -953,7 +953,7 @@ const advanceTaskCore = async (
   } = input;
   // task 用 let：去掉「通过」后、推进开头会隐式认可当前 awaiting_ack action、之后重读最新 task 供准入 / appendAction 用
   let task = input.task;
-  // W2：由 advanceTask 导出入口传入（禁止在此自取——出队后取会踩 W2）
+  // 由 advanceTask 导出入口传入（禁止在此自取——出队后取会踩）
   const opGen = input.opGen!;
 
   // V0.10.1：壳自更新就位但用户没重启 → 老进程起新 run 必挂死（shell 永久卡住）、入口硬拦
@@ -985,23 +985,23 @@ const advanceTaskCore = async (
   // V0.10：隔离工作区 task → 推进前确定性建 / 复用 worktree（幂等、已存在秒过）。
   //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
   //   创建失败直接抛（带处置建议）、不带病起 agent。
-  // R29-A：本段在 beginTaskStarting / claim 之前——靠 ensure 内 beginResourceJob
+  // 本段在 beginTaskStarting / claim 之前——靠 ensure 内 beginResourceJob
   // 登记；stop/DELETE join 已扩 hasResourceJobs，无需前移 starting 登记。
   if (isWorktreeTask(task)) {
-    // R27-2 / R28-1：advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
+    // advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
     // lease 失效抛 WorktreeLeaseLostError → 转 stale、不得 upsert / 写事件）
     let ensured;
     try {
       ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen));
     } catch (err) {
-      // R28-1：让位不吞——显式终态，不继续 upsertGitBranch / info
+      // 让位不吞——显式终态，不继续 upsertGitBranch / info
       if (err instanceof WorktreeLeaseLostError) {
         throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
       }
       throw err;
     }
     // 仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值、跟 build hint 老规则一致）
-    // R29-P2a：finalGuard = admission lease（失主拒写）
+    // finalGuard = admission lease（失主拒写）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
       if (!existingRepos.has(info.repoPath)) {
@@ -1022,7 +1022,7 @@ const advanceTaskCore = async (
             .join("、")}）、不需要重新下载`
         : "";
     if (ensured.createdRepos.length > 0) {
-      // R27-6：owner 语境（advance 启动链、claim 前）——admission lease
+      // owner 语境（advance 启动链、claim 前）——admission lease
       await writeOwnedEventAndPublish(
         task.id,
         () => !isTaskOpStale(task.id, opGen),
@@ -1055,7 +1055,7 @@ const advanceTaskCore = async (
   //   放在准入之前 + 认可后重读 task：下面 checkActionPrerequisites 看到的就是
   //   「认可后」状态（当前 action 已 completed）、原准入逻辑一行不用动。
   // V0.11：approve 纯服务端落状态（agent 不需要收信号）、续接 / force-new 同一条路径。
-  // R23-1a：锁内条件写——admission gen + lifecycle + 结构条件；stop 已 cancelled 则拒写、不落「已通过」。
+  // 锁内条件写——admission gen + lifecycle + 结构条件；stop 已 cancelled 则拒写、不落「已通过」。
   const pendingAck = task.actions.find(
     (a) => a.id === task.currentActionId && a.status === "awaiting_ack",
   );
@@ -1074,7 +1074,7 @@ const advanceTaskCore = async (
       publish(task.id, { kind: "task", task: patched });
       const a = patched.actions.find((x) => x.id === pendingAck.id);
       if (a) publish(task.id, { kind: "action", action: a });
-      // R27-6：owner 语境（advance 启动链、claim 前）——admission lease
+      // owner 语境（advance 启动链、claim 前）——admission lease
       await writeOwnedEventAndPublish(
         task.id,
         () => !isTaskOpStale(task.id, opGen),
@@ -1090,7 +1090,7 @@ const advanceTaskCore = async (
     task = (await getTask(task.id)) ?? task;
   }
 
-  // R23-7c / R25-2：终态 repoStatus 拒推进（须在准入前；盘上 fresh）
+  // 终态 repoStatus 拒推进（须在准入前；盘上 fresh）
   await assertTaskNotTerminalForAdvance(task.id);
 
   // 1) 准入条件（V0.6 门槛 1）：host 按任务仓库 remote 现推（多实例不一致会 throw）
@@ -1108,10 +1108,10 @@ const advanceTaskCore = async (
   // 新推进 = 新意图：作废上一轮残留的停止请求，避免误杀本次启动。
   // V1：lifecycle 进行中或 gen 已 bump（stop 已完成）都不得继续 append。
   await abortIfTaskOpStale(task.id, opGen);
-  // R21-1 / R21-3：owner 在第一个接管副作用（appendAction 写 running）之前
+  // owner 在第一个接管副作用（appendAction 写 running）之前
   // 同步 claim——覆盖前任 = 换主，在飞旧启动链的中间检查点会发现失主让位。
   // claim 失败（admissionGen 已被 revoke）= stop 已 bump、语义同 abortIfTaskOpStale。
-  // R21-3 的线性化前提「claimant 在 claim 之后必有过锁状态写」由紧随的 appendAction
+  // 的线性化前提「claimant 在 claim 之后必有过锁状态写」由紧随的 appendAction
   // （withTaskLock 内写 running）保证：即使前任的 commit rename 落在 claim 之后，
   // 本次 appendAction 的写也排在同一把锁之后覆盖它。
   const opHandle = claimTaskOp(task.id, opGen);
@@ -1119,8 +1119,8 @@ const advanceTaskCore = async (
   ctx.opHandle = opHandle;
   await failpoint("advance.afterClaim");
   pendingStopRequests.delete(task.id);
-  // R23-1b / R23-8 P2：锁内 guard=isOpOwner——claim 后、拿锁前若 stop 已 revoke，
-  // 拒写、不产生幽灵 action（与 stop 重读收尾互斥闭环，见 stop-task R23-6）。
+  // P2：锁内 guard=isOpOwner——claim 后、拿锁前若 stop 已 revoke，
+  // 拒写、不产生幽灵 action（与 stop 重读收尾互斥闭环，见 stop-task）。
   const created = await appendAction(
     task.id,
     {
@@ -1139,11 +1139,11 @@ const advanceTaskCore = async (
     { guard: () => isOpOwner(opHandle) },
   );
   if (!created) {
-    // R23-1b：guard 拒写 / task 不存在 → 统一按 stale 让位
+    // guard 拒写 / task 不存在 → 统一按 stale 让位
     throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
   }
   const { task: taskAfterAppend, action } = created;
-  // R22-1：action 已落盘——此后任何抛错由 finalizeFailedStartIntent 收尾
+  // action 已落盘——此后任何抛错由 finalizeFailedStartIntent 收尾
   ctx.actionId = action.id;
   await failpoint("advance.afterAppend");
   publish(task.id, { kind: "task", task: taskAfterAppend });
@@ -1167,7 +1167,7 @@ const advanceTaskCore = async (
       action.readonlyBaseline = readonlyBaseline;
     }
   }
-  // R27-6：owner 语境（已 claim）——opHandle lease
+  // owner 语境（已 claim）——opHandle lease
   await writeOwnedEventAndPublish(
     task.id,
     () => isOpOwner(opHandle),
@@ -1190,7 +1190,7 @@ const advanceTaskCore = async (
     const planned = planBranchesForBuild(taskAfterAppend);
     if (planned) {
       // 仅新仓 upsert（已存在的保留 baseBranch 历史值、不覆盖）
-      // R29-2A-P2：非 worktree build 的 upsert 同样带 admission lease finalGuard
+      // 非 worktree build 的 upsert 同样带 admission lease finalGuard
       const existingRepos = new Set(
         (taskAfterAppend.gitBranches ?? []).map((b) => b.repoPath),
       );
@@ -1263,9 +1263,9 @@ const advanceTaskCore = async (
       }),
       { errorActionId: action.id, creds: { apiKey, gitToken }, opGen },
     );
-    // X1：stale ≠ 无会话——绝不能降级 force-new（会再起一个 agent 覆盖后继）
+    // stale ≠ 无会话——绝不能降级 force-new（会再起一个 agent 覆盖后继）
     if (sendResult === "sent") {
-      // R23-8：续接 run 的共享写由 consume 的 observer handle 门控；
+      // 续接 run 的共享写由 consume 的 observer handle 门控；
       // owner 号立即释放——不许挂着违反 I4（owner 要么属活 op、要么 null）。
       releaseTaskOpIf(opHandle);
       return { action };
@@ -1344,7 +1344,7 @@ export interface ResumeCurrentActionInput {
   forceModel?: ModelSelection;
   gitToken?: string;
   /**
-   * W2：路由入场时同步捕获的 admission token。
+   * 路由入场时同步捕获的 admission token。
    * 缺省则导出入口在进串行队列前同步取。
    */
   opGen?: number;
@@ -1353,7 +1353,7 @@ export interface ResumeCurrentActionInput {
 export const resumeCurrentActionWithMessage = async (
   input: ResumeCurrentActionInput,
 ): Promise<void> => {
-  // W2：同 advance——进 runAdvanceExclusive 排队前同步捕获 admission token
+  // 同 advance——进 runAdvanceExclusive 排队前同步捕获 admission token
   const opGen = input.opGen ?? getTaskOpGeneration(input.task.id);
   return runAdvanceExclusive(input.task.id, () =>
     resumeCurrentActionInner({ ...input, opGen }),
@@ -1363,7 +1363,7 @@ export const resumeCurrentActionWithMessage = async (
 const resumeCurrentActionInner = async (
   input: ResumeCurrentActionInput,
 ): Promise<void> => {
-  // R22-1：同 advance——claim 后、handoff 前抛错要收尾启动意图
+  // 同 advance——claim 后、handoff 前抛错要收尾启动意图
   const ctx: StartIntentCtx = {};
   try {
     return await resumeCurrentActionCore(input, ctx);
@@ -1377,20 +1377,20 @@ const resumeCurrentActionCore = async (
   input: ResumeCurrentActionInput,
   ctx: StartIntentCtx,
 ): Promise<void> => {
-  // W2：由导出入口传入（禁止出队后自取）
+  // 由导出入口传入（禁止出队后自取）
   const opGen = input.opGen!;
   await assertNoUpdatePendingRestart();
   abortRunningCheck(input.task.id);
   const fresh = await getTask(input.task.id);
   if (!fresh) throw new Error("task 不存在、无法唤醒当前 action");
-  // R23-7c / R25-2：终态拒唤醒（盘上 fresh）
+  // 终态拒唤醒（盘上 fresh）
   await assertTaskNotTerminalForAdvance(fresh.id);
 
   const actionId = fresh.currentActionId;
   const action = fresh.actions.find((a) => a.id === actionId);
   if (!action) throw new Error("当前没有可唤醒的 action");
 
-  // R21-1：owner 必须在**第一个接管副作用之前**取得（同步、无 await）——
+  // owner 必须在**第一个接管副作用之前**取得（同步、无 await）——
   // 下面马上要关旧会话 / 写 running；claim 太晚（旧实现在 create/send 串行段才领）
   // 会留下「本唤醒已接管改状态、owner 仍是前任」的长窗口：前任 create/send
   // 失败的 catch 仍认为自己是 owner、把共用 action/task 写成 error。
@@ -1425,7 +1425,7 @@ const resumeCurrentActionCore = async (
   pendingStopRequests.delete(fresh.id);
 
   await failpoint("resume.beforeStatusWrite");
-  // R23-1c：两段裸写合一——锁内条件事务复查 isOpOwner；返 null = 让位（不留 running 复活窗）
+  // 两段裸写合一——锁内条件事务复查 isOpOwner；返 null = 让位（不留 running 复活窗）
   const patchedTask = await patchActionAndRunStatusIfOpFresh(
     fresh.id,
     action.id,
@@ -1444,7 +1444,7 @@ const resumeCurrentActionCore = async (
   publish(fresh.id, { kind: "action", action: patchedAction });
   let startTask = patchedTask;
 
-  // R27-6：owner 语境（resume 链已 claim）——opHandle lease
+  // owner 语境（resume 链已 claim）——opHandle lease
   await writeOwnedEventAndPublish(
     fresh.id,
     () => isOpOwner(opHandle),
@@ -1459,7 +1459,7 @@ const resumeCurrentActionCore = async (
 
   // 隔离工作区 task → 确保 worktree 在（可能被手删过）
   if (isWorktreeTask(startTask)) {
-    // R27-2 / R28-1：resume 链已 claim——resource lease 用 opHandle；让位不吞
+    // resume 链已 claim——resource lease 用 opHandle；让位不吞
     let ensured;
     try {
       ensured = await ensureTaskWorktrees(startTask, () => isOpOwner(opHandle));
@@ -1470,7 +1470,7 @@ const resumeCurrentActionCore = async (
       }
       throw err;
     }
-    // R29-P2a：resume 链 upsert 带 opHandle finalGuard
+    // resume 链 upsert 带 opHandle finalGuard
     const existingRepos = new Set(
       (startTask.gitBranches ?? []).map((b) => b.repoPath),
     );
@@ -1492,7 +1492,7 @@ const resumeCurrentActionCore = async (
       );
       for (const info of planned.infos) {
         if (!existingRepos.has(info.repoPath)) {
-          // R29-2A-P2：resume 的非 worktree build upsert 同样带 opHandle finalGuard
+          // resume 的非 worktree build upsert 同样带 opHandle finalGuard
           await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
         }
       }
@@ -1573,7 +1573,7 @@ export const finalizeTask = async (
     throw new Error("task 不存在、无法 finalize");
   }
 
-  // R23-7：占 finalizing lifecycle——期间 isOpOwner 全 false，新 advance 不得合法 claim；
+  // 占 finalizing lifecycle——期间 isOpOwner 全 false，新 advance 不得合法 claim；
   // 占不到 = stop/DELETE 在飞，让用户稍后重试。
   const beganFinalizing = beginChatLifecycle(taskId, "finalizing");
   if (!beganFinalizing) {
@@ -1592,8 +1592,8 @@ export const finalizeTask = async (
         hadLive ? "已停掉运行中的 agent / 会话" : "没有活 agent"
       }、patch repoStatus=${finalStatus}`,
     );
-    // R29-2 / R30-2 / R31-2：先 revoke，再 join starting + resourceJobs。
-    // R30-2：resourceJobs 超时 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
+    // 先 revoke，再 join starting + resourceJobs。
+    // resourceJobs 超时 → quarantine（fail-closed），不得在旧事务仍可写盘时清 worktree。
     // 超时与 joinResourceJobs / DELETE 共用 getResourceJoinTimeoutMs（单测可缩短）。
     {
       revokeResourceJobs(taskId);
@@ -1611,7 +1611,7 @@ export const finalizeTask = async (
         );
       }
       if (hasResourceJobs(taskId)) {
-        // R30-2：已等满仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
+        // 已等满仍未归零 → fail-closed 隔离（与 joinResourceJobs 超时同契约）
         markWorkspaceQuarantined(taskId);
         console.error(
           `[task-runner] finalizeTask: task=${taskId} resourceJobs join 超时、已 quarantine；跳过同步清 worktree`,
@@ -1634,7 +1634,7 @@ export const finalizeTask = async (
         if (patched) publish(taskId, { kind: "task", task: patched });
       }
     }
-    // R25-1：兜底收尾遗留非终态 action + idle——与 append 共享锁内事务（原无锁扫+裸写可漏）
+    // 兜底收尾遗留非终态 action + idle——与 append 共享锁内事务（原无锁扫+裸写可漏）
     await finalizeStaleAndIdleLocked(taskId, { toStatus: "cancelled" });
 
     // 业务状态 patch（repoStatus；runStatus 已在上一步置 idle）
@@ -1655,20 +1655,20 @@ export const finalizeTask = async (
     // V0.10：终结即清隔离工作区（feature 分支保留在原仓库、随时可 reopen 重建 worktree 续推；
     // 未提交改动删前自动 commit WIP 快照到任务分支、不销毁未 ship 的 build 产物）。
     // best-effort：失败只 log、boot 孤儿扫描兜底。
-    // R30-2 / R31-2：quarantine / 仍有 resourceJobs → 不得同步删；
+    // quarantine / 仍有 resourceJobs → 不得同步删；
     // 挂后台等 jobs 归零后再 remove——持有独立 terminal cleanup reservation，
     // quarantine 在 cleanup 完成（或 reopen 作废）前不解除；endResourceJob 只通知 waiter。
-    // R33-2 / R33-3：同步与 deferred 都走 TerminalCleanupCoordinator——
+    // 同步与 deferred 都走 TerminalCleanupCoordinator——
     // 重复 finalize 只 join、绝不重写 phase / 再起第二个 remove；reservation 在终态提交后、
     // remove 前立刻建立（含无 ResourceJob 的同步快速路径）。
     if (isWorktreeTask(task)) {
       const deferWorktreeCleanup =
         isWorkspaceQuarantined(taskId) || hasResourceJobs(taskId);
-      // R33-2：try-acquire——已有在飞则 join，不拿 handle、不能提前 release
+      // try-acquire——已有在飞则 join，不拿 handle、不能提前 release
       const acq = acquireTerminalCleanup(taskId);
       if (acq.busy) {
         console.log(
-          `[task-runner] finalizeTask: R33-2 已有 terminal cleanup 在飞、join 不重入 remove task=${taskId}`,
+          `[task-runner] finalizeTask: 已有 terminal cleanup 在飞、join 不重入 remove task=${taskId}`,
         );
         await acq.promise;
       } else if (deferWorktreeCleanup) {
@@ -1677,19 +1677,19 @@ export const finalizeTask = async (
         void (async () => {
           try {
             await waitUntilResourceJobsCleared(taskId);
-            // R31-2 / R33-2：提交删除前验证 handle——reopen 作废 waiting 后让位
+            // 提交删除前验证 handle——reopen 作废 waiting 后让位
             if (!isTerminalCleanupHandleValid(handle)) {
               console.log(
-                `[task-runner] finalizeTask: R31-2 旧 cleanup 已失效、让位 task=${taskId} token=${handle.token}`,
+                `[task-runner] finalizeTask: 旧 cleanup 已失效、让位 task=${taskId} token=${handle.token}`,
               );
               return;
             }
             // 测试挂点：delayed remove 转 executing 前（waiting 阶段 reopen 仍可作废）
             await failpoint("finalize.beforeDeferredRemove");
-            // R32-3：原子 waiting→executing；转失败 = 已被 reopen 作废、让位
+            // 原子 waiting→executing；转失败 = 已被 reopen 作废、让位
             if (!markTerminalCleanupExecuting(handle)) {
               console.log(
-                `[task-runner] finalizeTask: R32-3 转 executing 失败（已被 reopen 作废）、让位 task=${taskId} token=${handle.token}`,
+                `[task-runner] finalizeTask: 转 executing 失败（已被 reopen 作废）、让位 task=${taskId} token=${handle.token}`,
               );
               return;
             }
@@ -1711,17 +1711,17 @@ export const finalizeTask = async (
               err,
             );
           } finally {
-            // R33-2：仅本 handle.token 能 release；不匹配 no-op
+            // 仅本 handle.token 能 release；不匹配 no-op
             releaseTerminalCleanup(handle);
           }
         })();
       } else {
-        // R33-3：同步 remove 同样进 coordinator（关 Codex 探针：裸 remove × reopen 穿越）
+        // 同步 remove 同样进 coordinator（裸 remove × reopen 穿越）
         const handle = acq.handle;
         try {
           if (!markTerminalCleanupExecuting(handle)) {
             console.log(
-              `[task-runner] finalizeTask: R33-3 同步路径转 executing 失败、跳过 remove task=${taskId} token=${handle.token}`,
+              `[task-runner] finalizeTask: 同步路径转 executing 失败、跳过 remove task=${taskId} token=${handle.token}`,
             );
           } else {
             const removed = await removeTaskWorktrees(task).catch((err) => {
@@ -1746,13 +1746,13 @@ export const finalizeTask = async (
                 removed && removed.snapshotFailedRepos.length > 0
                   ? `；⚠️ ${removed.snapshotFailedRepos.map(repoTail).join("、")} 有无法自动保存的未提交改动、工作区已强制删除（未提交改动可能已丢）`
                   : "";
-              // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
+              // eslint-disable-next-line no-restricted-syntax -- 豁免：finalize 终态 owner 无条件语义
               await writeEventAndPublish(taskId, {
                 kind: "info",
                 text: `已清理任务隔离工作区（feature 分支保留在原仓库、恢复任务后下次推进会自动重建${snapshotNote}${failedNote}）`,
               });
             }
-            // R29-3：remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
+            // remove 后再 best-effort 停一次预览——首次 stop 与 remove 之间的窗口里
             // 用户可能又点了「预览」（route 层已加 lifecycle/终态闸、这里是纵深兜底：
             // 闸检查过后 lifecycle 才 begin 的极窄交错仍可能漏进一个新 dev server）
             try {
@@ -1767,7 +1767,7 @@ export const finalizeTask = async (
       }
     }
 
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：finalize 终态 owner 无条件语义
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：finalize 终态 owner 无条件语义
     await writeEventAndPublish(taskId, {
       kind: "info",
       text:
@@ -1782,7 +1782,7 @@ export const finalizeTask = async (
 };
 
 /**
- * R31-2 / R32-3 / R33-3：terminal cleanup / lifecycle 与 reopen 冲突时拒绝。
+ * terminal cleanup / lifecycle 与 reopen 冲突时拒绝。
  * - finalizing/deleting/stopping 在飞（begin reopening 失败）→ 409
  * - waiting + jobs 未退完 → 409
  * - executing（已入 remove）→ 409「任务清理中、稍后再试」
@@ -1801,7 +1801,7 @@ export class TaskCleanupInProgressError extends Error {
  * 误 abandon、或想把已终结的 task 重新捡起来继续时用。只翻 repoStatus、
  * runStatus 保持 idle（没有活 agent、用户后续点「推进」才起新 Run）。
  *
- * R31-2 / R32-3 / R33-3：
+ * TerminalCleanupCoordinator：finalize / reopen 互斥，防止裸 remove 与 reopen 交叉。
  * - 原子占 `reopening` lifecycle——与 finalizing/deleting/stopping 互斥（begin 失败 → 409）
  * - executing cleanup：抛 TaskCleanupInProgressError（409）；remove 全程受 reservation 保护
  * - waiting + jobs 仍非零：抛 409（旧事务未退完）
@@ -1813,7 +1813,7 @@ export const reopenTask = async (taskId: string): Promise<void> => {
   if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
     throw new Error("只有已合入 / 已放弃的任务才能恢复");
   }
-  // R33-3：原子占 reopening——DELETE 已占 deleting / finalize 在飞 → begin 失败 → 409
+  // 原子占 reopening——DELETE 已占 deleting / finalize 在飞 → begin 失败 → 409
   const beganReopening = beginChatLifecycle(taskId, "reopening");
   if (!beganReopening) {
     const life = getChatLifecycle(taskId);
@@ -1824,9 +1824,9 @@ export const reopenTask = async (taskId: string): Promise<void> => {
     );
   }
   try {
-    // R31-2 / R32-3 / R33-3：终态 cleanup 与 reopen 互斥窗口
+    // 终态 cleanup 与 reopen 互斥窗口
     if (hasTerminalCleanup(taskId)) {
-      // R33-3：executing 期间恒 409（含同步 remove 挂在 afterPathExists）
+      // executing 期间恒 409（含同步 remove 挂在 afterPathExists）
       if (getTerminalCleanupPhase(taskId) === "executing") {
         throw new TaskCleanupInProgressError();
       }
@@ -1834,20 +1834,20 @@ export const reopenTask = async (taskId: string): Promise<void> => {
         // ① 兜底：旧事务未退完，拒绝 reopen（避免与慢清理并发写同路径）
         throw new TaskCleanupInProgressError();
       }
-      // R32-3：invalidate 只取消 waiting；executing → busy → 409
+      // invalidate 只取消 waiting；executing → busy → 409
       const inv = invalidateTerminalCleanupForReopen(taskId);
       if (inv === "busy") {
         throw new TaskCleanupInProgressError();
       }
       if (inv === "invalidated") {
         console.log(
-          `[task-runner] reopenTask: R32-3 作废 waiting terminal cleanup、解除 quarantine task=${taskId}`,
+          `[task-runner] reopenTask: 作废 waiting terminal cleanup、解除 quarantine task=${taskId}`,
         );
       }
     }
     const patched = await setTaskRepoStatus(taskId, "developing");
     if (patched) publish(taskId, { kind: "task", task: patched });
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：reopenTask 用户直接操作
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：reopenTask 用户直接操作
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: "任务已恢复（→ 开发中）、可继续推进",
@@ -1878,7 +1878,7 @@ interface StartAgentInput {
   /** V1：调用方入场时的 opGen 快照；缺省则在本函数入口取一次 */
   opGen?: number;
   /**
-   * R21-1 / V12：调用方（advance / resume 唤醒）在第一个接管副作用之前 claim 的
+   * / V12：调用方（advance / resume 唤醒）在第一个接管副作用之前 claim 的
    * owner handle——贯穿整条启动链；缺省则受理段自 claim（其它入口路径）。
    */
   opHandle?: TaskOpHandle;
@@ -1891,14 +1891,14 @@ interface StartAgentInput {
 // 的内联闭包；V0.11.1 抽出来：Agent.resume 恢复会话时也必须重注册这两座桥、否则恢复后的
 // agent 调 submit_mr / submit_work 全部落空。闭包持 gitToken 快照（会话期不可变）；
 // host 在 submit_mr 时按 task.repoPaths 现推（不吃历史 settings.gitHost）。
-/** R26-2：session bridge 闭包对（构造与注册分离；安装走 installSessionIfCurrent） */
+/** session bridge 闭包对（构造与注册分离；安装走 installSessionIfCurrent） */
 export type SessionBridges = {
   taskActionHandler: ChatTaskActionHandler;
   awaitingNotifier: AwaitingNotifier;
 };
 
 /**
- * R26-2：只构造 bridge 闭包、不注册——注册延到 {@link installSessionIfCurrent}
+ * 只构造 bridge 闭包、不注册——注册延到 {@link installSessionIfCurrent}
  * （与 agentSessions.set 同点原子安装，堵死「bridge 已装、session 未装」半状态）。
  * create 期间 agent 尚未跑起来不会调 MCP，确认可挪注册到 create 后。
  */
@@ -1907,7 +1907,7 @@ export const buildSessionBridges = (
   opts: {
     gitToken?: string;
     /**
-     * R24-6：agent 实例身份（create/resume 前分配）。写入 chat-pending 注册表的
+     * agent 实例身份（create/resume 前分配）。写入 chat-pending 注册表的
      * expectedCallerToken；MCP 工具执行前核对。必传（缺省仅防御路径）。
      */
     callerToken: string;
@@ -1927,7 +1927,7 @@ export const buildSessionBridges = (
           error: err instanceof Error ? err.message : String(err),
         };
       }
-      // R25-3：每个外部 await 后复查——host 解析期间 B 可换主
+      // 每个外部 await 后复查——host 解析期间 B 可换主
       if (!callerStillValid()) {
         return { ok: false, error: CALLER_MISMATCH_ERROR };
       }
@@ -1937,7 +1937,7 @@ export const buildSessionBridges = (
           error: "task 启动时没拿到 GitLab Host / Token、ship 准入应该已被拦、不应该走到这里",
         };
       }
-      // P0-2：起 createMR 前、server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报。
+      // 起 createMR 前、server 端按 task 权威数据 + 该仓真实 git remote 校验 agent 上报。
       // agent 幻觉 / prompt 被污染 / remote 解析出错时、防它用 server PAT 给越权 project 提 MR。
       // 读 fresh task（闭包 task 是启动时快照、不含本轮 ship 刚 upsert 的 MR、且校验要最新 gitBranches）。
       const fresh = await getTask(task.id);
@@ -1972,7 +1972,7 @@ export const buildSessionBridges = (
         return { ok: false, error: valid.error };
       }
 
-      // R27-4：action lease——session caller 只认证 agent、action 权限单独验。
+      // action lease——session caller 只认证 agent、action 权限单独验。
       // 每个外部副作用前复查 = callerStillValid && 锁内 fresh 读 currentActionId/status 仍匹配
       const actionLeaseValid = async (): Promise<boolean> =>
         callerStillValid() &&
@@ -2004,7 +2004,7 @@ export const buildSessionBridges = (
           ? false
           : (fresh.removeSourceBranchOnMerge ?? false);
 
-      // R27-4：createMR（不可逆外部副作用）前验 action lease——历史 action 的迟到/重试拒
+      // createMR（不可逆外部副作用）前验 action lease——历史 action 的迟到/重试拒
       if (!(await actionLeaseValid())) {
         return {
           ok: false,
@@ -2012,7 +2012,7 @@ export const buildSessionBridges = (
         };
       }
 
-      // R29-1 / R30-1：单一 claim 状态机——已有 mr/postcheck claim 一律拒入；拿到唯一 handle
+      // 单一 claim 状态机——已有 mr/postcheck claim 一律拒入；拿到唯一 handle
       const mrClaim = tryClaimSideEffect(task.id, mr.actionId, "mr");
       if (!mrClaim) {
         return {
@@ -2022,7 +2022,7 @@ export const buildSessionBridges = (
         };
       }
       try {
-        // R25-3 / R25-5：host/getTask/校验 await 之后、caller 复查之前插桩——
+        // host/getTask/校验 await 之后、caller 复查之前插桩——
         // 测试可在此前一个 await 注入换主，断言复查拦住 createMR
         await failpoint("mcp.submitMr.beforeCreateMR");
         if (!callerStillValid()) {
@@ -2061,10 +2061,10 @@ export const buildSessionBridges = (
           return { ok: false, error: result.error };
         }
 
-        // R26-4：createMR 成功后、closeOpenMR / 本地写之前复查——
+        // createMR 成功后、closeOpenMR / 本地写之前复查——
         // MR 已建不可撤销，但关旧 MR + 本地落盘仍是可阻止的副作用
         await failpoint("mcp.submitMr.beforeCloseOpenMR");
-        // R27-4：升级为 caller + action lease——action 已切换也跳过 closeOpenMR 及后续本地写
+        // 升级为 caller + action lease——action 已切换也跳过 closeOpenMR 及后续本地写
         if (!(await actionLeaseValid())) {
           return {
             ok: true,
@@ -2107,7 +2107,7 @@ export const buildSessionBridges = (
           }
         }
 
-        // R26-4 / R27-4：merge-status 轮询前再复查（caller + action lease、各段重新授权）
+        // merge-status 轮询前再复查（caller + action lease、各段重新授权）
         if (!(await actionLeaseValid())) {
           return {
             ok: true,
@@ -2140,7 +2140,7 @@ export const buildSessionBridges = (
           ? mergeStatus.undetermined
           : true;
 
-        // R26-4 / R27-4：poll 返回后、本地写前再复查（caller + action lease）
+        // poll 返回后、本地写前再复查（caller + action lease）
         if (!(await actionLeaseValid())) {
           return {
             ok: true,
@@ -2156,7 +2156,7 @@ export const buildSessionBridges = (
           };
         }
 
-        // R28-4：单事务提交前插桩——测试可在此注入 stop/action 切换，断言双投影都不落
+        // 单事务提交前插桩——测试可在此注入 stop/action 切换，断言双投影都不落
         await failpoint("mcp.submitMr.beforeLocalCommit");
         if (!(await actionLeaseValid())) {
           return {
@@ -2173,7 +2173,7 @@ export const buildSessionBridges = (
           };
         }
 
-        // R28-4：task.mrs + action.sideEffects.mrs 同一条件事务（关半状态窗口）
+        // task.mrs + action.sideEffects.mrs 同一条件事务（关半状态窗口）
         const upserted = await upsertMRWithActionSideEffect(
           task.id,
           mr.actionId,
@@ -2264,13 +2264,13 @@ export const buildSessionBridges = (
           },
         };
       } finally {
-        // R30-1：只 release 本轮 mrClaim——stop clear 后同 action resume 的新 claim 不受影响
+        // 只 release 本轮 mrClaim——stop clear 后同 action resume 的新 claim 不受影响
         releaseSideEffect(mrClaim);
       }
     }
 
     if (taskAction.kind === "set_feishu_testers") {
-      // R24-6：结构条件——须是当前 running action（ship 进行中）；验收点名原先无此闸
+      // 结构条件——须是当前 running action（ship 进行中）；验收点名原先无此闸
       const freshFeishu = await getTask(task.id);
       if (!callerStillValid()) {
         return { ok: false, error: CALLER_MISMATCH_ERROR };
@@ -2289,21 +2289,21 @@ export const buildSessionBridges = (
           error: "当前 action 状态不允许设置飞书测试人员（须为 current + running）",
         };
       }
-      // R27-4：外层 fresh 检查补 type === "ship"（非 ship 明确拒，文案含类型语义）
+      // 外层 fresh 检查补 type === "ship"（非 ship 明确拒，文案含类型语义）
       if (feishuAction.type !== "ship") {
         return {
           ok: false,
           error: `set_feishu_testers 只允许 ship 类型（当前 ${feishuAction.type} 不允许）`,
         };
       }
-      // R27-4：结构条件真正进锁内 expected/finalGuard（外层检查与拿锁之间可切 action）
+      // 结构条件真正进锁内 expected/finalGuard（外层检查与拿锁之间可切 action）
       const patched = await setFeishuTesterUserKeys(
         task.id,
         taskAction.userKeys,
         callerStillValid,
         { actionId: taskAction.actionId, types: ["ship"] },
       );
-      // R26-4：patched===null 返失败、不写「已记忆」成功事件
+      // patched===null 返失败、不写「已记忆」成功事件
       if (!patched) {
         return {
           ok: false,
@@ -2329,7 +2329,7 @@ export const buildSessionBridges = (
     if (taskAction.kind === "set_plan_batches") {
       // V0.6.23：plan agent 上报拆出的批次 → 落到该 plan action 的 planBatches 字段
       // build 选批 + 进度推导都读「最新 completed plan 的 planBatches」（见 task-display.computeBatchProgress）
-      // R26-4：锁内结构条件 = current + running + type plan；null → 返失败不写成功事件
+      // 锁内结构条件 = current + running + type plan；null → 返失败不写成功事件
       const patched = await patchActionIfOwner(
         task.id,
         taskAction.actionId,
@@ -2373,16 +2373,16 @@ export const buildSessionBridges = (
   };
 
   // 具名化：create 失败 / 旧会话迟到清理走 conditional unset，防 force-new-agent race 误清新 handler
-  // R29-5：结构化返回 accepted | stale | busy——scope no-op 不再被工具层当「已交卷」
+  // 结构化返回 accepted | stale | busy——scope no-op 不再被工具层当「已交卷」
   const awaitingNotifier: AwaitingNotifier = async (signal, ctx) => {
     const { callerStillValid } = ctx;
-    // R24-2 / R25-3：bridge 有效期 = callerToken 仍匹配；lifecycle 进行中拒写
+    // bridge 有效期 = callerToken 仍匹配；lifecycle 进行中拒写
     if (!callerStillValid() || getChatLifecycle(task.id) !== null) {
       return "stale";
     }
 
     if (signal.kind === "ask_user_request") {
-      // R27-5：ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
+      // ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
       // 新 ask 顶掉）在 supersede/event/status/publish 每个 sink 都被拦，
       // 关闭「UI 最新卡片是 A、pending map 指向 B、答 A 必失败」的分裂路径
       const askLease = (): boolean =>
@@ -2392,12 +2392,12 @@ export const buildSessionBridges = (
       // 新提问落盘前、先作废旧的未了结提问（同事踩坑根因）：
       //   agent 重问 / 断线重挂时 pendingMap 单例被新 ask 顶掉、旧 ask 的 token 已死——
       //   不补作废标记、前端答完新弹窗后旧弹窗会复活、答了必失败（严重时误标任务 error）。
-      // R26-5/6：supersede 带 lease——接管发生在其 IO 内时旧 A 不再对新世界写作废标记
+      // supersede 带 lease——接管发生在其 IO 内时旧 A 不再对新世界写作废标记
       await supersedePendingAsks(task.id, "被新提问顶替", askLease);
-      // R25-3 / R25-5：supersede await 后、落 ask event 前复查；失主反登记防孤儿弹窗
+      // supersede await 后、落 ask event 前复查；失主反登记防孤儿弹窗
       await failpoint("mcp.askUser.afterSupersede");
       if (!askLease()) {
-        // R26-3 / R30-5：按本次 askId 反登记并返 stale——wrapper 透传后工具不得报 ASK_SUBMITTED
+        // 按本次 askId 反登记并返 stale——wrapper 透传后工具不得报 ASK_SUBMITTED
         cancelPendingIf(task.id, signal.askId);
         return "stale";
       }
@@ -2428,7 +2428,7 @@ export const buildSessionBridges = (
         askLease,
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
-      // R29-5：ask 成功路径显式 accepted
+      // ask 成功路径显式 accepted
       return "accepted";
     }
 
@@ -2439,8 +2439,8 @@ export const buildSessionBridges = (
       // 这样 notifier 立即返回、agent 的 submit_work 工具秒回引导、第一时间挂上 curl long-poll 等 ack
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
       // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
-      // R24-1：postCheck 独立租约、不传 run opHandle
-      // R29-1 / R30-1：waitAndClaimPostCheck 等 mr 清空后同 tick claim / 换 token——关交接空窗与 ABA
+      // postCheck 独立租约、不传 run opHandle
+      // waitAndClaimPostCheck 等 mr 清空后同 tick claim / 换 token——关交接空窗与 ABA
       await failpoint("mcp.submitWork.beforeCheckStart");
       if (!callerStillValid()) return "stale";
       const claim = await waitAndClaimPostCheck(task.id, signal.actionId, {
@@ -2448,7 +2448,7 @@ export const buildSessionBridges = (
           callerStillValid() &&
           getChatLifecycle(task.id) === null &&
           (await isCurrentRunningAction(task.id, signal.actionId!)),
-        // R30-1 / R31-5：重交卷换 token 前同步 abort 旧 check（摘表、不 release——随即换新 claimId；
+        // 重交卷换 token 前同步 abort 旧 check（摘表、不 release——随即换新 claimId；
         // claimHandle 随 entry 摘掉，旧 dropSelf 因 runningChecks 已无 self 而 no-op）
         onReplacePostCheck: () => {
           const prev = runningChecks.get(task.id);
@@ -2458,12 +2458,12 @@ export const buildSessionBridges = (
         },
       });
       if (claim.result === "timeout") {
-        // R29-5：busy（非 throw）——工具层返回重试文案，不再假「已交卷」
+        // busy（非 throw）——工具层返回重试文案，不再假「已交卷」
         return "busy";
       }
       if (claim.result === "invalid") return "stale";
       const postCheckHandle = claim.handle;
-      // claimed：R26-4 failpoint 窗口内 submit_mr 必被 postcheck claim 拒
+      // claimed： failpoint 窗口内 submit_mr 必被 postcheck claim 拒
       await failpoint("mcp.submitWork.beforeAbortCheck");
       if (!callerStillValid()) {
         releaseSideEffect(postCheckHandle);
@@ -2498,7 +2498,7 @@ export const buildSessionBridges = (
 };
 
 /**
- * R26-2：session record + bridge + caller token 的唯一原子安装点（同步、无 await）。
+ * session record + bridge + caller token 的唯一原子安装点（同步、无 await）。
  * lease 失效则什么都不装、返 false（调用方自己关 agent）。
  * 线性化：同步验 lease → set session + 两座 bridge 一次完成，无「bridge 已装、session 未装」半状态。
  */
@@ -2524,13 +2524,13 @@ export const installSessionIfCurrent = (
  *    都会让 cwd 指到不存在的路径；ensureTaskWorktrees 幂等、热路径秒过；非隔离 task 直接 noop。
  *    失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
  *
- * @param lease R28-1：**必填**——mkdir 前验、透传给 ensureTaskWorktrees；失主抛 WorktreeLeaseLostError
+ * @param lease **必填**——mkdir 前验、透传给 ensureTaskWorktrees；失主抛 WorktreeLeaseLostError
  */
 const ensureWorkspaceReady = async (
   task: Task,
   lease: () => boolean,
 ): Promise<void> => {
-  // R28-1：workspace mkdir 前验 lease（与 worktree ensure 共用同一租约）
+  // workspace mkdir 前验 lease（与 worktree ensure 共用同一租约）
   if (!lease()) throw new WorktreeLeaseLostError();
   // chat 不建 workspace 目录（跟 createTask 口径一致）；当前 chat 不走本 runner、纯防御
   if (task.mode !== "chat") {
@@ -2560,7 +2560,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   } = input;
   // V1：调用方传入场快照；没传则入口自取（其它入口路径）
   const opGen = input.opGen ?? getTaskOpGeneration(task.id);
-  // R28-1：真实启动链 lease——有 opHandle 用 isOpOwner；否则退 admission gen
+  // 真实启动链 lease——有 opHandle 用 isOpOwner；否则退 admission gen
   const workspaceLease = (): boolean =>
     input.opHandle
       ? isOpOwner(input.opHandle)
@@ -2578,7 +2578,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     try {
       await ensureWorkspaceReady(task, workspaceLease);
     } catch (err) {
-      // R28-1：让位 → 抛 stale（advance / resume 调用方不得当作启动成功）
+      // 让位 → 抛 stale（advance / resume 调用方不得当作启动成功）
       if (err instanceof WorktreeLeaseLostError) {
         console.log(
           `[task-runner] internalStartAgent: task=${task.id} 工作区 ensure 让位（lease 失效）`,
@@ -2595,7 +2595,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     const effectiveGitHost =
       (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
 
-    // R22-5：advance 在步骤 4 只 snapshot 一次 activeRun——one-shot 可能在
+    // advance 在步骤 4 只 snapshot 一次 activeRun——one-shot 可能在
     // 那之后、走到这里之前才完成 send 预登记。持 opHandle 的正式启动意图
     // **不得**在此按「幂等」吞掉（会让新 action 永不启动、one-shot 结束后还把
     // task 恢复成 idle）：迟到的 record 交给串行受理段的 predecessor handoff
@@ -2613,7 +2613,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       );
     }
 
-    // R24-6：create 前发 caller token（寿命 = agent 实例、跨多轮 send 复用）
+    // create 前发 caller token（寿命 = agent 实例、跨多轮 send 复用）
     const callerToken = String(allocTaskRunInstanceId());
 
     // 1) merge MCP（V0.11.1 抽成共用 helper、resume 会话时也要重传 inline MCP）
@@ -2625,7 +2625,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       cursorMcpNames.length > 0 ? ` + cursor MCP: ${cursorMcpNames.join(", ")}` : ""
     }`;
 
-    // R27-6：owner 语境（启动链、claim 前）——admission lease
+    // owner 语境（启动链、claim 前）——admission lease
     await writeOwnedEventAndPublish(
       task.id,
       () => !isTaskOpStale(task.id, opGen),
@@ -2638,7 +2638,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
 
     // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
     if (droppedMcp.length > 0) {
-      // R27-6：owner 语境（启动链、claim 前）——admission lease
+      // owner 语境（启动链、claim 前）——admission lease
       await writeOwnedEventAndPublish(
         task.id,
         () => !isTaskOpStale(task.id, opGen),
@@ -2652,7 +2652,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       );
     }
 
-    // 2) R26-2：只构造 bridge 闭包——注册延到 create 后 installSessionIfCurrent
+    // 2) 只构造 bridge 闭包——注册延到 create 后 installSessionIfCurrent
     //    （create 期间 agent 未跑、不会调 MCP；半状态根源是「create 前注册 + create 后 set session」分步）
     const bridges = buildSessionBridges(task, {
       gitToken,
@@ -2683,7 +2683,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         const identityPromise = resolveUserIdentityForPrompt();
         identityPromise.catch(() => {});
 
-        // X2：create→send 受理段进 per-task 串行链（与 one-shot / follow-up send 互斥）。
+        // create→send 受理段进 per-task 串行链（与 one-shot / follow-up send 互斥）。
         // stream 消费（consumeSessionRun）留链外——否则 follow-up send 全排到整轮 run 结束。
         // ⚠️ 死锁自查：本回调绝不嵌套 runWithTaskSendSerial / sendToTaskSession
         // （internalStartAgent 本身也不调 sendToTaskSession）。
@@ -2691,7 +2691,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         const admitted = await runWithTaskSendSerial(
           task.id,
           async (): Promise<AdmitOk | null> => {
-            // R20-1 / R21-1 / V12：优先沿用调用方在接管副作用前 claim 的 handle（advance /
+            // / V12：优先沿用调用方在接管副作用前 claim 的 handle（advance /
             // resume 唤醒都已前移）；无调用方 handle 的入口才在此自 claim。
             // claim 返 null / handle 已失主 → 本启动链在开工前就让位。
             if (input.opHandle) {
@@ -2706,24 +2706,24 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               }
               opHandle = claimed;
             }
-            // R21-1：传入 handle 已被更晚的接管者覆盖 → 开工前让位
+            // 传入 handle 已被更晚的接管者覆盖 → 开工前让位
             if (!isOpOwner(opHandle)) {
               console.warn(
                 `[task-runner] internalStartAgent: task=${task.id} op owner 已被后继接管（受理段入口）、让位`,
               );
               return null;
             }
-            // R26-2：不再 create 前重注册桥——installSessionIfCurrent 在 create 后与 session 同点安装
+            // 不再 create 前重注册桥——installSessionIfCurrent 在 create 后与 session 同点安装
             await abortIfTaskOpStale(task.id, opGen);
 
-            // X2：出队后若前驱（常是 one-shot question run）仍占 runningTasks——
+            // 出队后若前驱（常是 one-shot question run）仍占 runningTasks——
             // 推进意图优先：取消前驱、等其清表，再起正式 agent（不可「幂等跳过」把新 action 晾着）。
             const predecessor = runningTasks.get(task.id);
             if (predecessor) {
               console.warn(
                 `[task-runner] internalStartAgent: task=${task.id} 链上已有 run（agentId=${predecessor.agentId}）、取消前驱再起正式 agent`,
               );
-              // R18-2：cancel 前先建 fork handoff——对齐 advanceTaskInner force-new。
+              // cancel 前先建 fork handoff——对齐 advanceTaskInner force-new。
               // 否则前驱 cancelled 分支看不见 forkPendingTasks，会走「普通停止收尾」
               // 把后继刚 append 的 action 一并 cancelled + 写 idle。
               forkPendingTasks.add(task.id);
@@ -2740,7 +2740,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               }
             }
 
-            // R25-2：Agent.create 前再验盘上终态——route/core 陈旧快照不能冒充 developing
+            // Agent.create 前再验盘上终态——route/core 陈旧快照不能冒充 developing
             {
               const repoStatus = await readTaskRepoStatusFresh(task.id);
               if (repoStatus === "merged" || repoStatus === "abandoned") {
@@ -2768,14 +2768,14 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               `[task-runner] task=${task.id} Agent.create OK agentId=${created.agentId}`,
             );
 
-            // R21-1：让位 helper——失去 op owner（后继在接管副作用前已 claim 覆盖）时
+            // 让位 helper——失去 op owner（后继在接管副作用前已 claim 覆盖）时
             // 只关本地资源：自己注册的会话按 instanceId 精确关、未注册则裸 close agent；
             // 绝不碰 pendingStopRequests（那可能是用户发给后继的停止信号）、不写任何共享状态。
             // 锚点：super prompt 已送达 → keepPersisted（会话可被后继 resume 续用）；
             // 未送达 → 连锚点一起清——留着会让后继续接 resume 到一个没收过 prompt 的裸 agent。
             let promptDelivered = false;
             const yieldStartIfLostOwner = (): boolean => {
-              // R21-1 / V12：唯一组合判定——失主即让位
+              // / V12：唯一组合判定——失主即让位
               if (!opHandle || isOpOwner(opHandle)) {
                 return false;
               }
@@ -2801,7 +2801,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               return true;
             };
 
-            // R21-1：create await 期间后继可能已接管（claim 已前移到接管副作用之前）
+            // create await 期间后继可能已接管（claim 已前移到接管副作用之前）
             if (yieldStartIfLostOwner()) return null;
 
             // 启动窗口停止：create 返回后、尚未 register / send——无 run、直接关 agent + 收尾
@@ -2822,7 +2822,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               return null;
             }
 
-            // R26-2：session + bridge 原子安装（同步 CAS）；插桩在调用方 install 之前
+            // session + bridge 原子安装（同步 CAS）；插桩在调用方 install 之前
             await failpoint("session.beforeInstall");
             const sessionRecord: AgentSessionRecord = {
               instanceId: allocTaskRunInstanceId(),
@@ -2853,7 +2853,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               return null;
             }
             // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 无缝接回
-            // R29-P2b：finalGuard = 本 session 仍是当前注册（防迟到 set 盖后继锚点）
+            // finalGuard = 本 session 仍是当前注册（防迟到 set 盖后继锚点）
             void setTaskSessionAgentId(task.id, created.agentId, () => {
               const s = agentSessions.get(task.id);
               return (
@@ -2890,7 +2890,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             await failpoint("start.afterPrompt");
             const perfPromptMs = Date.now() - perfPromptStart;
 
-            // R21-1：prompt 素材 await 期间后继可能已接管
+            // prompt 素材 await 期间后继可能已接管
             if (yieldStartIfLostOwner()) return null;
 
             // V1：prompt await 后再查一次——此间 stop 完成则不得 send
@@ -2922,7 +2922,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             const run = await created.send(superPrompt, {
               onDelta: composeOnDelta(
                 perfTracker.onDelta,
-                // R26-6：shell delta 绑本启动链 op lease——失主迟到 flush 丢弃
+                // shell delta 绑本启动链 op lease——失主迟到 flush 丢弃
                 createShellOutputDeltaPublisher(
                   task.id,
                   () => !!opHandle && isTaskOpCurrent(opHandle),
@@ -2935,7 +2935,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             const perfSendMs = Date.now() - perfSendStart;
             promptDelivered = true;
 
-            // R21-1：send await 期间后继接管 → cancel 刚受理的 run 再让位，
+            // send await 期间后继接管 → cancel 刚受理的 run 再让位，
             // 绝不预登记 runningTasks（会把后继的 record 覆盖 / 干扰其可见性）
             if (opHandle && !isOpOwner(opHandle)) {
               void run.cancel().catch(() => {
@@ -2945,7 +2945,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               return null;
             }
 
-            // X2：send 受理成功后、出链前预登记 runningTasks（带 instanceId）——
+            // send 受理成功后、出链前预登记 runningTasks（带 instanceId）——
             // 否则出链→consume.set 窗口内另一入口仍看不到本 run。
             // consumeSessionRun 入口会复用同 agentId 的 instanceId 并换上带 cancelled 闭包的 cancel。
             const instanceId = allocTaskRunInstanceId();
@@ -3015,10 +3015,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
             return;
           }
           // Agent.create / 首次 send 阶段失败（consumeSessionRun 内部错误它自己处理、不会抛）
-          // R20-1 / R22-2 / V12：传 opHandle——失主或 stop revoke 则不得伤共用状态
+          // / V12：传 opHandle——失主或 stop revoke 则不得伤共用状态
           await handleRunFailure(task.id, action.id, err, { opHandle });
           if (opHandle) releaseTaskOpIf(opHandle);
-          // R19-4a：当前 session 不是 failedAgent → 只关本地对象，绝不调 closeTaskSession
+          // 当前 session 不是 failedAgent → 只关本地对象，绝不调 closeTaskSession
           // （旧代码传 undefined =「不校验实例」，同 agentId 的 B 会被误关）
           const failedSess = agentSessions.get(task.id);
           if (failedSess?.agent === failedAgent) {
@@ -3111,7 +3111,7 @@ const tryAutoReconnect = async (
     /** V12：透传给递归 consume——状态写门控仍认同一把 handle */
     opHandle: TaskOpHandle;
     /**
-     * R23-5：首轮入场捕获的会话 instanceId——递归退避不得重抓（否则可能抓到 B）。
+     * 首轮入场捕获的会话 instanceId——递归退避不得重抓（否则可能抓到 B）。
      */
     reconnectSessionInstanceId?: number;
   },
@@ -3122,7 +3122,7 @@ const tryAutoReconnect = async (
   const msg = err instanceof Error ? err.message : String(err);
   if (!isRetryableRunError(msg, err)) return "give-up";
   if (isCancelled()) return "cancelled";
-  // R23-5：只认首轮入场的自己会话号——close 必须带号，绝不 undefined 关「当前」
+  // 只认首轮入场的自己会话号——close 必须带号，绝不 undefined 关「当前」
   const myReconnectSessionId =
     opts.reconnectSessionInstanceId ?? agentSessions.get(task.id)?.instanceId;
   const nextOpts = {
@@ -3165,7 +3165,7 @@ const tryAutoReconnect = async (
     const y = yieldIfOpLost();
     if (y) return y;
   }
-  // R23-5 / M7：退避结束、close/resume 之前插桩——矩阵在此注入 advance claim
+  // 退避结束、close/resume 之前插桩——矩阵在此注入 advance claim
   await failpoint("reconnect.beforeResume");
   {
     const y = yieldIfOpLost();
@@ -3180,7 +3180,7 @@ const tryAutoReconnect = async (
     });
   }
   const creds = await readServerCreds();
-  // R24-3c：透传入场 opHandle——resume 禁止自行重拍 identity
+  // 透传入场 opHandle——resume 禁止自行重拍 identity
   const record = await resumeTaskSession(fresh, creds, {
     closedSessionInstanceId: myReconnectSessionId,
     opHandle: opts.opHandle,
@@ -3188,7 +3188,7 @@ const tryAutoReconnect = async (
   {
     const y = yieldIfOpLost();
     if (y) {
-      // R26-2：失主必须关掉刚 resume 出的 agent/record——旧实现只 return 会泄漏 A
+      // 失主必须关掉刚 resume 出的 agent/record——旧实现只 return 会泄漏 A
       if (record) {
         const closed = closeTaskSession(task.id, undefined, {
           reap: false,
@@ -3224,7 +3224,7 @@ const tryAutoReconnect = async (
     const run = await resumedAgent.send(reconnectPrompt, {
       onDelta: composeOnDelta(
         perfTracker.onDelta,
-        // R26-6：重连 send 绑入场 opHandle
+        // 重连 send 绑入场 opHandle
         createShellOutputDeltaPublisher(task.id, () =>
           isTaskOpCurrent(opts.opHandle),
         ),
@@ -3273,10 +3273,10 @@ const tryAutoReconnect = async (
 /**
  * run 失败（SDK 抛错 / status=error）的统一收尾：标 error + 事件 + publish。
  *
- * R19-2：不同 action 时 currentActionId 已是 B → 不写 task 级 error，只精确标自己 action。
- * R20-1 / V12：同 action 双唤醒时 actionId 不是 operation 身份——必须校验 opHandle；
+ * 不同 action 时 currentActionId 已是 B → 不写 task 级 error，只精确标自己 action。
+ * / V12：同 action 双唤醒时 actionId 不是 operation 身份——必须校验 opHandle；
  *   已失去 op owner → 只落绑定 actionId 的 error 事件，不 patch action、不碰 task 状态。
- * R20-4：失去 owner（opHandle 或条件写返 null）时不发 task 级 done(false)/error envelope，
+ * 失去 owner（opHandle 或条件写返 null）时不发 task 级 done(false)/error envelope，
  *   否则前端会清后继 B 的 streamingText 并弹整任务失败 toast。
  * V12：runningTasks.instanceId 不再参与状态写门控（接管者必 claim、opHandle 已覆盖）。
  */
@@ -3300,7 +3300,7 @@ export const handleRunFailure = async (
     ? failure.text
     : `Task agent 失败：${failure.text}`;
 
-  // R21-2 / R22-2 / R22-3 / V12：**唯一**的复合 owner 闭包——只认 isOpOwner(opHandle)；
+  // / V12：**唯一**的复合 owner 闭包——只认 isOpOwner(opHandle)；
   // 无 handle 时退化为「无 lifecycle」（兼容旧测试直接调无 opts 的路径）。
   // 条件事务锁内复查、null 分类、每个全局 envelope 的最后一步都只用它。
   const isOwner = (): boolean =>
@@ -3310,8 +3310,8 @@ export const handleRunFailure = async (
 
   // 入口快查——已失去 owner → 旧启动只写事件，绝不碰 action / task 状态
   if (!isOwner()) {
-    // R20-1 / R20-4：只落绑定 actionId 的 error 事件（writeEventAndPublish = event envelope）
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：R20-1/R20-4 语义——失主 A 仍落绑定自己 actionId 的失败审计事件、不碰共享状态
+    // 只落绑定 actionId 的 error 事件（writeEventAndPublish = event envelope）
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：/ 语义——失主 A 仍落绑定自己 actionId 的失败审计事件、不碰共享状态
     await writeEventAndPublish(taskId, {
       kind: "error",
       actionId: errorActionId,
@@ -3323,12 +3323,12 @@ export const handleRunFailure = async (
 
   await failpoint("failure.beforePrepare");
 
-  // R20-4：是否仍持有 task 级写权限（条件写成功才发 done/error envelope）
+  // 是否仍持有 task 级写权限（条件写成功才发 done/error envelope）
   let wroteTaskLevel = false;
 
   if (errorActionId) {
-    // R19-2：一把条件写 action+runStatus；currentActionId 已是 B → 返 null，再精确 patch 自己
-    // R22-2：expected 除 currentActionId 外再验 actionStatus=running——stop 已把 action
+    // 一把条件写 action+runStatus；currentActionId 已是 B → 返 null，再精确 patch 自己
+    // expected 除 currentActionId 外再验 actionStatus=running——stop 已把 action
     // 标 cancelled 时结构条件直接拒绝，A 不会把用户停止改写成 error。
     const updated = await patchActionAndRunStatusIfOpFresh(
       taskId,
@@ -3339,7 +3339,7 @@ export const handleRunFailure = async (
       { currentActionId: errorActionId, actionStatus: "running" },
     );
     if (!updated) {
-      // R21-2 / R22-3：null 分类必须用同一复合 isOwner——
+      // null 分类必须用同一复合 isOwner——
       // ① 仍是完整 owner（结构条件不符：currentActionId 已指向不同 action 的后继、
       //    或 action 已非 running）：只在「action 仍挂 running 且不是共享指针」时
       //    精确标自己 error（A 独占旧 action、安全）；
@@ -3378,7 +3378,7 @@ export const handleRunFailure = async (
     wroteTaskLevel = true;
   }
 
-  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：R20-1/R21-2 语义——失败审计事件绑定自己 actionId、途中失主也要落（共享状态与 envelope 另有 owner 门控）
+  // eslint-disable-next-line no-restricted-syntax -- 豁免：/ 语义——失败审计事件绑定自己 actionId、途中失主也要落（共享状态与 envelope 另有 owner 门控）
   await writeEventAndPublish(taskId, {
     kind: "error",
     actionId: errorActionId,
@@ -3387,8 +3387,8 @@ export const handleRunFailure = async (
     meta: { detail: failure.detail },
   });
 
-  // R20-4：失去 task owner → 不发 done(false) / error envelope（事件已挂自己的 actionId）
-  // R21-2 / R22-3：写盘成功 ≠ 现在还是 owner——event/getTask 每个 await 后都用
+  // 失去 task owner → 不发 done(false) / error envelope（事件已挂自己的 actionId）
+  // 写盘成功 ≠ 现在还是 owner——event/getTask 每个 await 后都用
   // 同一复合 isOwner 重验。
   if (!wroteTaskLevel || !isOwner()) return;
 
@@ -3405,10 +3405,10 @@ export const handleRunFailure = async (
  * （awaiting_ack → awaiting_user、error → error、其余 → idle）。
  * 只在 runStatus 还挂 running 时动手（compare-set、不覆盖 notifier 已落的状态）。
  *
- * W3：调用方须先过 `shouldRestoreAfterQuestion`——gen stale / lifecycle 进行中时
+ * 调用方须先过 `shouldRestoreAfterQuestion`——gen stale / lifecycle 进行中时
  * 禁止调用（stop/DELETE 已归位；裸 restore 会把后继 B 的 running 打回 idle）。
  *
- * R18-2：再加 isOwner（runningTasks.instanceId）锁内条件写——前驱 one-shot 被接管后
+ * 再加 isOwner（runningTasks.instanceId）锁内条件写——前驱 one-shot 被接管后
  * 不得按最新 action B 把 task 写成 idle。
  */
 const restoreRunStatusAfterQuestion = async (
@@ -3434,7 +3434,7 @@ const restoreRunStatusAfterQuestion = async (
 };
 
 /**
- * W3 / V12：question stale 场景是否允许 restore。
+ * V12：question stale 场景是否允许 restore。
  * 唯一入口 isOpOwner——失主（后继 claim / stop revoke / lifecycle）一律 false。
  */
 const shouldRestoreAfterQuestion = (handle: TaskOpHandle): boolean =>
@@ -3480,7 +3480,7 @@ const clearSubmitWorkFollowupCounts = (taskId: string): void => {
  * 关启动链资源（杀 run / 关会话 / 摘 agent）——pending 与 lifecycle 两支共用。
  * 不写 action 状态 / runStatus / 停止事件（那部分看谁是收尾 owner）。
  *
- * @param expectedSessionInstanceId R18-3：关会话时精确匹配；缺省则仅当
+ * @param expectedSessionInstanceId 关会话时精确匹配；缺省则仅当
  *   agentSessions 里的 agent 对象仍是本实例时才取号关（防 resume 同 agentId 误关 B）
  */
 const closeStartChainResourcesForStop = (
@@ -3496,7 +3496,7 @@ const closeStartChainResourcesForStop = (
     });
   }
   const sess = agentSessions.get(task.id);
-  // R18-3：会话已被后继替换（同 agentId 不同对象 / 不同 instanceId）→ 只关本地 agent
+  // 会话已被后继替换（同 agentId 不同对象 / 不同 instanceId）→ 只关本地 agent
   const sid =
     expectedSessionInstanceId ??
     (sess && sess.agent === agent ? sess.instanceId : undefined);
@@ -3516,7 +3516,7 @@ const closeStartChainResourcesForStop = (
     } catch {
       /* noop */
     }
-    // R19-4：关失败且带了精确实例号（或会话已被替换）→ 锚点归当前 owner，不得清
+    // 关失败且带了精确实例号（或会话已被替换）→ 锚点归当前 owner，不得清
     // 仅「无会话且未要求精确 instance」才清（create 后尚未 register 的真结束路径）
     if (sid === undefined && !agentSessions.get(task.id)) {
       void setTaskSessionAgentId(task.id, undefined);
@@ -3528,7 +3528,7 @@ const closeStartChainResourcesForStop = (
 /**
  * 启动窗口停止请求生效。
  *
- * 命中条件：pendingStopRequests 或 getChatLifecycle !== null（U1）
+ * 命中条件：pendingStopRequests 或 getChatLifecycle !== null
  *   或 opGen 与当前 generation 不匹配（V1：stop 已完成并释放 lifecycle 的场景）。
  * - lifecycle 进行中 / gen 不匹配：只关资源，勿重复收尾（状态/事件归 stop/DELETE owner；
  *   gen 不匹配时 lifecycle 已空，补发 done 让 UI 解挂）
@@ -3542,10 +3542,10 @@ const applyPendingStopIfRequested = async (
   agent: AgentInstance,
   run?: SessionRun,
   opGen?: number,
-  /** R18-2：本 run 绑定的 action；只 patch 它，不扫全表 */
+  /** 本 run 绑定的 action；只 patch 它，不扫全表 */
   ownActionId?: string,
   expectedSessionInstanceId?: number,
-  /** R29-B：有则 done 走 publishIfCurrent；失主（B takeover）不发 done */
+  /** 有则 done 走 publishIfCurrent；失主（B takeover）不发 done */
   opHandle?: TaskOpHandle,
 ): Promise<boolean> => {
   const pending = pendingStopRequests.has(task.id);
@@ -3561,7 +3561,7 @@ const applyPendingStopIfRequested = async (
     expectedSessionInstanceId,
   );
 
-  /** R29-B：done 门控——有 opHandle 用 isTaskOpCurrent；否则用 gen 未 stale */
+  /** done 门控——有 opHandle 用 isTaskOpCurrent；否则用 gen 未 stale */
   const stillCurrentForDone = (): boolean =>
     opHandle
       ? isTaskOpCurrent(opHandle)
@@ -3570,7 +3570,7 @@ const applyPendingStopIfRequested = async (
   // lifecycle 进行中或 gen 已 bump：状态和停止事件由 stop/DELETE owner 写
   if (lifecycle !== null || genStale) {
     // gen 不匹配且 lifecycle 已释放：owner 收尾已写完，只补 done 解挂 UI
-    // R29-B：后继已 claim 则不发（失主不得清 B 的 streamingText）
+    // 后继已 claim 则不发（失主不得清 B 的 streamingText）
     if (genStale && lifecycle === null) {
       const fresh = await getTask(task.id);
       publishIfCurrent(task.id, stillCurrentForDone, {
@@ -3598,7 +3598,7 @@ const applyPendingStopIfRequested = async (
     return true;
   }
 
-  // R18-2：只收尾本 run 的 action（启动窗口停止 = 本 agent 自己的启动意图）
+  // 只收尾本 run 的 action（启动窗口停止 = 本 agent 自己的启动意图）
   await finalizeOwnAction(task.id, ownActionId, "cancelled");
   const sess = agentSessions.get(task.id);
   const stillMine =
@@ -3613,15 +3613,15 @@ const applyPendingStopIfRequested = async (
         },
       )
     : null;
-  // R29-P2e：用户 stop 生效通知——温和门控失主不写（不影响过渡语义）
+  // 用户 stop 生效通知——温和门控失主不写（不影响过渡语义）
   if (stillCurrentForDone()) {
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：用户 stop 操作生效通知
+    // eslint-disable-next-line no-restricted-syntax -- 用户 stop 操作生效通知
     await writeEventAndPublish(task.id, {
       kind: "info",
       text: "停止请求已生效（启动期间点击的停止）",
     });
   }
-  // R29-B：setTaskRunStatusIfRunOwner 返 null 不再兜底 publish(updated ?? task)
+  // setTaskRunStatusIfRunOwner 返 null 不再兜底 publish(updated ?? task)
   if (updated) publish(task.id, { kind: "task", task: updated });
   publishIfCurrent(task.id, stillCurrentForDone, {
     kind: "done",
@@ -3664,14 +3664,14 @@ const consumeSessionRun = async (
 ): Promise<void> => {
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
-  // X3：复用链内预登记的 instanceId（X2 one-shot / internalStart 出链前已 set）；
+  // 复用链内预登记的 instanceId（one-shot / internalStart 出链前已 set）；
   // 无预登记则稍后 alloc。比 agentId 精确——resume 同持久化 agent 时 agentId 相同。
   const preRegistered = runningTasks.get(task.id);
   let myInstanceId: number | undefined =
     preRegistered?.agentId === agent.agentId
       ? preRegistered.instanceId
       : undefined;
-  // R19-4b：按 agent 对象引用捕获 session instanceId——仅 agentId 会在 resume 同号时
+  // 按 agent 对象引用捕获 session instanceId——仅 agentId 会在 resume 同号时
   // 误抓到 B 的 instanceId，随后 closeMySession 反而精确关掉 B。
   const sessionAtStart = agentSessions.get(task.id);
   const mySessionInstanceId: number | undefined =
@@ -3687,15 +3687,15 @@ const consumeSessionRun = async (
   };
 
   /**
-   * R22-4 / V12：op 是否已被后继 claim / revoke 覆盖。同 action 的 resume 接管时
-   * actionId / currentActionId 全都不变（R21-5 的全局 lastAction 比对识别不了），
+   * / V12：op 是否已被后继 claim / revoke 覆盖。同 action 的 resume 接管时
+   * actionId / currentActionId 全都不变（的全局 lastAction 比对识别不了），
    * 自然结束后的追问 / error 收尾必须靠 isTaskOpCurrent 区分新旧启动意图。
    * 注意：此处不含 lifecycle（入口 stop-signal 用 isOpOwner）；失主 = 换主语义。
    */
   const lostStartOwner = (): boolean => !isTaskOpCurrent(opts.opHandle);
 
   /**
-   * R18-3 / R19-4：按 session instanceId 关自己的会话。
+   * 按 session instanceId 关自己的会话。
    * 入场时拿不到精确实例号（session 已不是本 agent 对象）→ fail-closed 只关本地，
    * 绝不把 undefined 传给 closeTaskSession（那会退化成按 agentId 关当前）。
    */
@@ -3714,7 +3714,7 @@ const consumeSessionRun = async (
   };
 
   /**
-   * X3 / R18-2/3：已被 forceClear + 后继 B 接管时，只 cancel/close 自己的 run/agent，
+   * 已被 forceClear + 后继 B 接管时，只 cancel/close 自己的 run/agent，
    * 绝不 finalize 全表 / 裸写 idle / 无 instanceId 门控 closeTaskSession。
    * @returns true = 已让位、调用方应立即 return
    */
@@ -3733,7 +3733,7 @@ const consumeSessionRun = async (
   };
 
   try {
-    // R23-3c：同 gen claim（B 尚未登记 runner）时 isTaskOpCurrent=false——
+    // 同 gen claim（B 尚未登记 runner）时 isTaskOpCurrent=false——
     // 必须纯让位（cancel + 只关自己 session），绝不 restore / applyPendingStop 走共享写。
     if (!isTaskOpCurrent(opts.opHandle)) {
       void run.cancel().catch(() => {
@@ -3747,7 +3747,7 @@ const consumeSessionRun = async (
     const stopSignal =
       pendingStopRequests.has(task.id) || !isOpOwner(opts.opHandle);
     if (stopSignal) {
-      // X3：若预登记已被强清换主，只关自己
+      // 若预登记已被强清换主，只关自己
       if (yieldIfSuperseded()) return;
       // 问一问 run：不动 action / 不关会话（与下方 cancelled 分支同语义）
       if (opts.questionRun) {
@@ -3755,16 +3755,16 @@ const consumeSessionRun = async (
         void run.cancel().catch(() => {
           /* noop */
         });
-        // R24-7：失主纯让位——不 restore、不发 done
+        // 失主纯让位——不 restore、不发 done
         if (lostStartOwner()) return;
-        // W3 / R18-2 / R23-3c：共享状态门控走 handle；iOwnRunner 只删自己记录
+        // 共享状态门控走 handle；iOwnRunner 只删自己记录
         if (shouldRestoreAfterQuestion(opts.opHandle)) {
           await restoreRunStatusAfterQuestion(task.id, () =>
             isTaskOpCurrent(opts.opHandle),
           );
         }
         const freshQ = await getTask(task.id);
-        // R25-4：restore/getTask await 后、publish done 前复查
+        // restore/getTask await 后、publish done 前复查
         await failpoint("question.beforeDone");
         if (lostStartOwner()) return;
         publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
@@ -3815,7 +3815,7 @@ const consumeSessionRun = async (
         const trimmed = assistantCtx.buffer.trim();
         assistantCtx.buffer = "";
         if (trimmed.length === 0) return;
-        // R26-5/6 / R27-6：flush 走 owned sink——opHandle lease 必填、失主不落盘
+        // flush 走 owned sink——opHandle lease 必填、失主不落盘
         await writeOwnedEventAndPublish(
           task.id,
           () => isTaskOpCurrent(opts.opHandle),
@@ -3838,12 +3838,12 @@ const consumeSessionRun = async (
           `[perf] task=${task.id} first-event ms=${Date.now() - perfStreamStart}`,
         );
       }
-      // R23-4c / R27-6：流回调绑 operation——lease 必传、失主整条消息丢弃
+      // 流回调绑 operation——lease 必传、失主整条消息丢弃
       await handleSdkMessage(task.id, msg, assistantCtx, () =>
         isTaskOpCurrent(opts.opHandle),
       );
     }
-    // R25-4：stream 结束后 flush 也绑 op——失主跳过，避免迟到 assistant_message
+    // stream 结束后 flush 也绑 op——失主跳过，避免迟到 assistant_message
     if (!lostStartOwner()) {
       await assistantCtx.flush();
     }
@@ -3857,7 +3857,7 @@ const consumeSessionRun = async (
     await failpoint("consume.afterWait");
 
     if (cancelled || result.status === "cancelled") {
-      // X3：5s 强清后 B 已接管——不得 finalize / 写 idle / 关 B 的会话
+      // 5s 强清后 B 已接管——不得 finalize / 写 idle / 关 B 的会话
       if (yieldIfSuperseded()) return;
       // 停止 / 推进：追问计数一并清掉，避免下次同 action 续跑还背着旧计数
       clearSubmitWorkFollowupCounts(task.id);
@@ -3865,9 +3865,9 @@ const consumeSessionRun = async (
       if (isForkPending) {
         forkPendingTasks.delete(task.id);
         // 换新 agent：会话由 advance 的 force-new 分支显式关（reap:false）、这里不动
-        // R29-P2e：温和门控——失主不写；forkPending 时 handle 仍 current、不受影响
+        // 温和门控——失主不写；forkPending 时 handle 仍 current、不受影响
         if (isTaskOpCurrent(opts.opHandle)) {
-          // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+          // eslint-disable-next-line no-restricted-syntax -- force-new 换主过渡通知
           await writeEventAndPublish(task.id, {
             kind: "info",
             text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -3876,9 +3876,9 @@ const consumeSessionRun = async (
         return;
       }
       // 问一问的 run 被停：只是不想听它说了——action / 会话都不动、runStatus 归回等待位
-      // W3 / R18-2：gen stale 或已非 owner 时勿 restore
+      // gen stale 或已非 owner 时勿 restore
       if (opts.questionRun) {
-        // R24-7：失主不 restore、不发 done（前端收 done 会清后继 streamingText）
+        // 失主不 restore、不发 done（前端收 done 会清后继 streamingText）
         if (lostStartOwner()) return;
         if (shouldRestoreAfterQuestion(opts.opHandle)) {
           await restoreRunStatusAfterQuestion(task.id, () =>
@@ -3886,7 +3886,7 @@ const consumeSessionRun = async (
           );
         }
         const freshQ = await getTask(task.id);
-        // R25-4：await 后复查再发 done
+        // await 后复查再发 done
         await failpoint("question.beforeDone");
         if (lostStartOwner()) return;
         publishIfCurrent(
@@ -3897,11 +3897,11 @@ const consumeSessionRun = async (
         return;
       }
       // 正常 cancel（停止 / 硬超时触发）→ 只收尾本 run 绑定的 action + 关运行时状态 + 关会话
-      // R18-2：不得 finalizeStaleActions 全表扫（会把后继 B 的新 action 一并 cancelled）
-      // R29-B：done 走 publishIfCurrent——B takeover 后失主不发 done envelope
+      // 不得 finalizeStaleActions 全表扫（会把后继 B 的新 action 一并 cancelled）
+      // done 走 publishIfCurrent——B takeover 后失主不发 done envelope
       if (yieldIfSuperseded()) return;
       await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
-      // R18-3：锁内 instanceId CAS——await 期间被接管则不写 idle
+      // 锁内 instanceId CAS——await 期间被接管则不写 idle
       const updated = await setTaskRunStatusIfRunOwner(
         task.id,
         "idle",
@@ -3941,11 +3941,11 @@ const consumeSessionRun = async (
     //     追问仍不交卷 → 标 error + 关会话（语义对齐原 stop-check）
     await failpoint("consume.beforeFinalize");
     const fresh = await getTask(task.id);
-    // R22-4：同 action 的后继（resume 双唤醒）接管时 actionId 完全相同、下面的
+    // 同 action 的后继（resume 双唤醒）接管时 actionId 完全相同、下面的
     // 全局 lastAction 比对识别不了——wait/getTask 的 await 期间 startToken 被
     // 覆盖 → 本 run 的自然结束不做任何业务收尾（不追问、不标 error、不写状态），
     // 直接让位给新启动意图。
-    // R24-7：questionRun 也让位（不 restore、不发 done）——旧实现被 !questionRun 排除
+    // questionRun 也让位（不 restore、不发 done）——旧实现被 !questionRun 排除
     if (lostStartOwner()) {
       console.warn(
         `[task-runner] task=${task.id} run finished 但 start owner 已被后继接管、让位（不追问 / 不收尾${opts.questionRun ? " / 不发 done" : ""}）`,
@@ -3953,7 +3953,7 @@ const consumeSessionRun = async (
       return;
     }
     const globalLastAction = fresh?.actions[fresh.actions.length - 1];
-    // R21-5：业务收尾只认入场绑定的 opts.errorActionId，不认全局 actions.at(-1)——
+    // 业务收尾只认入场绑定的 opts.errorActionId，不认全局 actions.at(-1)——
     // advance B 先 append 新 action、之后才 cancel 旧 run A；A 在这个窗口自然 finished
     // 时全局最后一条已是 B，旧逻辑会拿 B 当「自己的 lastAction」：用 A 的旧 session
     // 追问「为 B 交卷」、追问失败还把 B patch 成 error + 关会话。
@@ -4006,7 +4006,7 @@ const consumeSessionRun = async (
       const followupKey = `${task.id}:${lastAction.id}`;
       const used = submitWorkFollowupCounts.get(followupKey) ?? 0;
       // 会话还活着才追问（被关则走下面的 error 收尾）
-      // R18-3：按 session instanceId 判活——resume 同 agentId 的后继不算本会话
+      // 按 session instanceId 判活——resume 同 agentId 的后继不算本会话
       const sessionAlive = (() => {
         const s = agentSessions.get(task.id);
         if (!s) return false;
@@ -4021,7 +4021,7 @@ const consumeSessionRun = async (
         console.log(
           `[task-runner] task=${task.id} action#${lastAction.n}(${lastAction.type}) 未交卷 → send 追问 ${used + 1}/${SUBMIT_WORK_FOLLOWUP_MAX}`,
         );
-        // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+        // owner 语境（consume 链）——opHandle lease（验收点名残留）
         await writeOwnedEventAndPublish(
           task.id,
           () => isTaskOpCurrent(opts.opHandle),
@@ -4041,18 +4041,18 @@ const consumeSessionRun = async (
           }
           return s.agentId === agent.agentId;
         })();
-        // R22-4：同 action 后继在写事件的 await 期间 claim——session/actionId 都
+        // 同 action 后继在写事件的 await 期间 claim——session/actionId 都
         // 分不出新旧，追问前一并验 startToken、失主即让位
         if (lostStartOwner()) return;
         if (cancelled || !stillOwnSession) {
           submitWorkFollowupCounts.delete(followupKey);
-          // X3：强清换主后不得走普通停止收尾
+          // 强清换主后不得走普通停止收尾
           if (yieldIfSuperseded()) return;
           if (forkPendingTasks.has(task.id)) {
             forkPendingTasks.delete(task.id);
-            // R29-P2e：温和门控——失主不写
+            // 温和门控——失主不写
             if (isTaskOpCurrent(opts.opHandle)) {
-              // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+              // eslint-disable-next-line no-restricted-syntax -- force-new 换主过渡通知
               await writeEventAndPublish(task.id, {
                 kind: "info",
                 text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -4060,7 +4060,7 @@ const consumeSessionRun = async (
             }
             return;
           }
-          // R18-2/3 / R29-B：只 patch 本 action + 锁内 owner 写 idle；done 走 publishIfCurrent
+          // 只 patch 本 action + 锁内 owner 写 idle；done 走 publishIfCurrent
           await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
           const updated = await setTaskRunStatusIfRunOwner(
             task.id,
@@ -4087,7 +4087,7 @@ const consumeSessionRun = async (
           nextRun = await agent.send(followup, {
             onDelta: composeOnDelta(
               perfTracker.onDelta,
-              // R26-6：交卷追问绑 consume 的 opHandle
+              // 交卷追问绑 consume 的 opHandle
               createShellOutputDeltaPublisher(task.id, () =>
                 isTaskOpCurrent(opts.opHandle),
               ),
@@ -4103,13 +4103,13 @@ const consumeSessionRun = async (
           // stop / force-new 导致的 send 失败：按 cancelled 收尾，绝不能标 error 覆盖
           if (cancelled || forkPendingTasks.has(task.id)) {
             submitWorkFollowupCounts.delete(followupKey);
-            // X3：强清换主后不得走普通停止收尾
+            // 强清换主后不得走普通停止收尾
             if (yieldIfSuperseded()) return;
             if (forkPendingTasks.has(task.id)) {
               forkPendingTasks.delete(task.id);
-              // R29-P2e：温和门控——失主不写
+              // 温和门控——失主不写
               if (isTaskOpCurrent(opts.opHandle)) {
-                // eslint-disable-next-line no-restricted-syntax -- R27-6 / R29-P2e：force-new 换主过渡通知
+                // eslint-disable-next-line no-restricted-syntax -- force-new 换主过渡通知
                 await writeEventAndPublish(task.id, {
                   kind: "info",
                   text: "旧 agent 已收尾、正在为推进起新 agent...",
@@ -4135,9 +4135,9 @@ const consumeSessionRun = async (
           // 真·网络 / SDK 失败 → 跟追问耗尽一样收尾
           submitWorkFollowupCounts.delete(followupKey);
           if (yieldIfSuperseded()) return;
-          // R22-4：同 action 后继已 claim → 不得把共享 action 标 error
+          // 同 action 后继已 claim → 不得把共享 action 标 error
           if (lostStartOwner()) return;
-          // R29-2A-P1：入口查过 lostStartOwner 但 patch 是 await——owner 闭包进锁内/
+          // 入口查过 lostStartOwner 但 patch 是 await——owner 闭包进锁内/
           // finalGuard 复查（B 在 await 期间 claim 时不标共享 action error）
           await patchActionIfOwner(
             task.id,
@@ -4152,7 +4152,7 @@ const consumeSessionRun = async (
             () => isTaskOpCurrent(opts.opHandle),
             lastAction.id,
           );
-          // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+          // owner 语境（consume 链）——opHandle lease（验收点名残留）
           await writeOwnedEventAndPublish(
             task.id,
             () => isTaskOpCurrent(opts.opHandle),
@@ -4168,7 +4168,7 @@ const consumeSessionRun = async (
           );
           const updated = await getTask(task.id);
           if (updated) publish(task.id, { kind: "task", task: updated });
-          // R29-2A-P1：迟到 done(ok=false) 不得清后继 B 的 streaming——publishIfCurrent
+          // 迟到 done(ok=false) 不得清后继 B 的 streaming——publishIfCurrent
           publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
             kind: "done",
             task: updated ?? task,
@@ -4184,9 +4184,9 @@ const consumeSessionRun = async (
       // 追问次数用尽 / 会话已死 → 标 error + 关会话
       submitWorkFollowupCounts.delete(followupKey);
       if (yieldIfSuperseded()) return;
-      // R22-4：同 action 后继已 claim → 不得把共享 action 标 error
+      // 同 action 后继已 claim → 不得把共享 action 标 error
       if (lostStartOwner()) return;
-      // R29-2A-P1：同上——owner 闭包进锁内复查、不靠入口一次性检查
+      // 同上——owner 闭包进锁内复查、不靠入口一次性检查
       await patchActionIfOwner(
         task.id,
         lastAction.id,
@@ -4200,7 +4200,7 @@ const consumeSessionRun = async (
         () => isTaskOpCurrent(opts.opHandle),
         lastAction.id,
       );
-      // R27-6：owner 语境（consume 链）——opHandle lease（验收点名残留）
+      // owner 语境（consume 链）——opHandle lease（验收点名残留）
       await writeOwnedEventAndPublish(
         task.id,
         () => isTaskOpCurrent(opts.opHandle),
@@ -4216,7 +4216,7 @@ const consumeSessionRun = async (
       );
       const updated = await getTask(task.id);
       if (updated) publish(task.id, { kind: "task", task: updated });
-      // R29-2A-P1：同上——迟到 done(ok=false) 门控
+      // 同上——迟到 done(ok=false) 门控
       publishIfCurrent(task.id, () => isTaskOpCurrent(opts.opHandle), {
         kind: "done",
         task: updated ?? task,
@@ -4231,9 +4231,9 @@ const consumeSessionRun = async (
     }
 
     // 问一问 run 答完：按当前 action 状态归回等待位（含 error 位、比下面的通用兜底全）
-    // W3 / R18-2：答完期间若 stop bump 或已被接管 → 跳过 restore
+    // 答完期间若 stop bump 或已被接管 → 跳过 restore
     if (opts.questionRun) {
-      // R24-7：失主不发 done（正常结束路径；lostStartOwner 早退已覆盖、此处双保险）
+      // 失主不发 done（正常结束路径；lostStartOwner 早退已覆盖、此处双保险）
       if (lostStartOwner()) return;
       if (shouldRestoreAfterQuestion(opts.opHandle)) {
         await restoreRunStatusAfterQuestion(task.id, () =>
@@ -4241,7 +4241,7 @@ const consumeSessionRun = async (
         );
       }
       const freshQ = await getTask(task.id);
-      // R25-4：await 后复查再发 done
+      // await 后复查再发 done
       await failpoint("question.beforeDone");
       if (lostStartOwner()) return;
       publish(task.id, { kind: "done", task: freshQ ?? task, ok: true });
@@ -4251,8 +4251,8 @@ const consumeSessionRun = async (
     // 正常结束：交卷已入 check 管道（awaiting_ack / awaiting_user 由 check、notifier 落）、
     // 或 ask 在等答案。会话保留、用户下一步操作 send 续接。
     // 兜底：最后 action 已终态（completed / cancelled / error）而 runStatus 还挂 running → 归 idle
-    // R18-3：共享状态写一律锁内 owner 条件写
-    // R22-4：同 action 后继已 claim → 兜底写也让位（iOwnRunner 在接管早期分不出）
+    // 共享状态写一律锁内 owner 条件写
+    // 同 action 后继已 claim → 兜底写也让位（iOwnRunner 在接管早期分不出）
     if (lostStartOwner()) return;
     if (
       !lastAction ||
@@ -4283,7 +4283,7 @@ const consumeSessionRun = async (
         if (updated) publish(task.id, { kind: "task", task: updated });
       }
     }
-    // R26-5：普通 consume done——getTask/条件写 await 后复查再发；A 的迟到 done 不得清 B 的 streamingText
+    // 普通 consume done——getTask/条件写 await 后复查再发；A 的迟到 done 不得清 B 的 streamingText
     await failpoint("consume.beforeDone");
     const freshDone = await getTask(task.id);
     publishIfCurrent(
@@ -4294,14 +4294,14 @@ const consumeSessionRun = async (
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
     if (opts.questionRun) {
-      // R24-7 / R25-4：失主不发「答疑失败」error / done envelope；写前再复查
+      // 失主不发「答疑失败」error / done envelope；写前再复查
       if (lostStartOwner()) return;
       // 问一问失败（网络抖动 / SDK 报错）：只报错误事件 + 归位 runStatus——
       // 绝不把 awaiting_ack 审阅位 / 半路 action 打成 error（答疑失败不该伤任务本体）
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[task-runner] task=${task.id} 问一问 run 失败：`, err);
       if (lostStartOwner()) return;
-      // R27-6：owner 语境（questionRun 收尾）——opHandle lease（验收点名残留）
+      // owner 语境（questionRun 收尾）——opHandle lease（验收点名残留）
       await writeOwnedEventAndPublish(
         task.id,
         () => isTaskOpCurrent(opts.opHandle),
@@ -4310,7 +4310,7 @@ const consumeSessionRun = async (
           text: `答疑失败：${summarizeRunFailure(message, err).text}`,
         },
       );
-      // W3 / R18-2：失败收尾同答完——gen stale / 非 owner 跳过
+      // 失败收尾同答完——gen stale / 非 owner 跳过
       if (shouldRestoreAfterQuestion(opts.opHandle)) {
         await restoreRunStatusAfterQuestion(task.id, () =>
           isTaskOpCurrent(opts.opHandle),
@@ -4332,7 +4332,7 @@ const consumeSessionRun = async (
         // 重连成功、新 run 已在递归调用里消费完毕——这里什么都不用做
       } else if (outcome === "cancelled") {
         clearSubmitWorkFollowupCounts(task.id);
-        // X3：强清后 B 已接管——只关自己，绝不 finalize 全表 / 裸 close
+        // 强清后 B 已接管——只关自己，绝不 finalize 全表 / 裸 close
         if (yieldIfSuperseded()) {
           /* 已让位 */
         } else if (forkPendingTasks.has(task.id)) {
@@ -4341,7 +4341,7 @@ const consumeSessionRun = async (
           forkPendingTasks.delete(task.id);
         } else {
           // 用户在重连期间点了停止：按停止语义收尾（不标 error）。
-          // R18-2/3：只 patch 本 action + 锁内 owner 写 + session instanceId 关
+          // 只 patch 本 action + 锁内 owner 写 + session instanceId 关
           if (yieldIfSuperseded()) return;
           await finalizeOwnAction(task.id, opts.errorActionId, "cancelled");
           const updated = await setTaskRunStatusIfRunOwner(
@@ -4349,7 +4349,7 @@ const consumeSessionRun = async (
             "idle",
             () => isTaskOpCurrent(opts.opHandle),
           );
-          // R29-B：返 null 不兜底 publish；done 走 publishIfCurrent
+          // 返 null 不兜底 publish；done 走 publishIfCurrent
           if (updated) publish(task.id, { kind: "task", task: updated });
           publishIfCurrent(
             task.id,
@@ -4359,7 +4359,7 @@ const consumeSessionRun = async (
           closeMySession();
         }
       } else {
-        // X3 / R18-3 / V12：error 收尾按 opHandle 门控（不再传 iOwnRunner 作状态写门控）
+        // / V12：error 收尾按 opHandle 门控（不再传 iOwnRunner 作状态写门控）
         if (yieldIfSuperseded()) return;
         await handleRunFailure(task.id, opts.errorActionId, err, {
           opHandle: opts.opHandle,
@@ -4368,14 +4368,14 @@ const consumeSessionRun = async (
       }
     }
   } finally {
-    // X3：按 instanceId 删——forceClear 后 B 换了新号，旧 finally 不得抹掉 B
+    // 按 instanceId 删——forceClear 后 B 换了新号，旧 finally 不得抹掉 B
     if (iOwnRunner()) {
       runningTasks.delete(task.id);
     }
     // V12：正常 / 失败收尾都 release——owner 匹配才删；observer 内部 no-op
     releaseTaskOpIf(opts.opHandle);
     // 会话活跃时间戳（空闲回收 TTL 从「最后一个 run 结束」起算）
-    // R18-3：按 session instanceId 刷——同 agentId 的后继会话不碰
+    // 按 session instanceId 刷——同 agentId 的后继会话不碰
     const session = agentSessions.get(task.id);
     if (
       session &&
@@ -4395,7 +4395,7 @@ const consumeSessionRun = async (
  */
 const buildMergedMcpForTask = async (
   task: Task,
-  /** R24-6：agent 实例 caller——拼进 chat-tool URL ?caller= */
+  /** agent 实例 caller——拼进 chat-tool URL ?caller= */
   callerToken: string,
 ): Promise<{
   mergedMcp: Record<string, McpServerConfig>;
@@ -4411,7 +4411,7 @@ const buildMergedMcpForTask = async (
     ...cursorMcp,
     [TASK_TOOL_MCP_NAME]: {
       type: "http",
-      // R24-6：每 agent 独立 URL → SDK 新建独立 MCP session（无老 session 复用）
+      // 每 agent 独立 URL → SDK 新建独立 MCP session（无老 session 复用）
       url: getChatMcpUrl(callerToken),
     },
   };
@@ -4425,16 +4425,16 @@ const buildMergedMcpForTask = async (
  * V0.11.1：从落盘的 sessionAgentId 恢复会话（服务重启 / 空闲回收后）。
  * 成功 = agent 接回 + 桥重注册 + 会话表就位；失败 = 清锚点返 null（调用方降级 fresh agent）。
  *
- * R26-1 / R26-2：终态/lifecycle 准入下沉到本 sink；session+bridge 走
+ * 终态/lifecycle 准入下沉到本 sink；session+bridge 走
  * {@link installSessionIfCurrent} 原子安装；失主必须 close 刚 resume 出的 agent。
  */
 export const resumeTaskSession = async (
   task: Task,
   creds: SessionCreds,
   /**
-   * R23-5：调用方刚 close 掉的会话 instanceId——set 前若表里已有**别的**
+   * 调用方刚 close 掉的会话 instanceId——set 前若表里已有**别的**
    * instance（B 已登记）→ CAS 让位返 null，绝不覆盖。
-   * R24-3c：opHandle 必须由 caller 入场快照透传——本函数禁止自行 snapshotTaskOp
+   * opHandle 必须由 caller 入场快照透传——本函数禁止自行 snapshotTaskOp
    * （重拍会在 Agent.resume await 期间拍成后继 B 的 observer、把 A 的 agent 绑到 B）。
    */
   opts?: { closedSessionInstanceId?: number; opHandle?: TaskOpHandle },
@@ -4448,7 +4448,7 @@ export const resumeTaskSession = async (
     creds.model;
   if (!model) return null;
 
-  /** R26-1：终态 / lifecycle / opHandle 综合准入（每个 await 后复用） */
+  /** 终态 / lifecycle / opHandle 综合准入（每个 await 后复用） */
   const mayResume = async (): Promise<boolean> => {
     if (opts?.opHandle && !isTaskOpCurrent(opts.opHandle)) return false;
     if (getChatLifecycle(task.id) !== null) return false;
@@ -4456,11 +4456,11 @@ export const resumeTaskSession = async (
     return st !== null && st !== "merged" && st !== "abandoned";
   };
 
-  // R26-1：入口拒——finalize 后不得复活 session / 重建 worktree
+  // 入口拒——finalize 后不得复活 session / 重建 worktree
   if (!(await mayResume())) return null;
 
   // 放 try 外：ensure 失败（分支被占等）应冒泡给调用方；try 只兜 Agent.resume 失败降级
-  // R28-1：resume 传 opHandle 闭包（无 handle 时退 lifecycle + 终态）
+  // resume 传 opHandle 闭包（无 handle 时退 lifecycle + 终态）
   const resumeLease = (): boolean => {
     if (opts?.opHandle && !isTaskOpCurrent(opts.opHandle)) return false;
     if (getChatLifecycle(task.id) !== null) return false;
@@ -4469,14 +4469,14 @@ export const resumeTaskSession = async (
   try {
     await ensureWorkspaceReady(task, resumeLease);
   } catch (err) {
-    // R28-1：让位 → 静默 return null（不起 session）
+    // 让位 → 静默 return null（不起 session）
     if (err instanceof WorktreeLeaseLostError) return null;
     throw err;
   }
   if (!(await mayResume())) return null;
 
   try {
-    // R24-6：resume 也发新 caller（新内存 agent 实例 = 新 MCP 身份）
+    // resume 也发新 caller（新内存 agent 实例 = 新 MCP 身份）
     const callerToken = String(allocTaskRunInstanceId());
     const { mergedMcp } = await buildMergedMcpForTask(task, callerToken);
     if (!(await mayResume())) return null;
@@ -4497,13 +4497,13 @@ export const resumeTaskSession = async (
       }
     };
 
-    // R26-1：Agent.resume 返回后复查 opHandle + fresh 终态——失效则关 agent
+    // Agent.resume 返回后复查 opHandle + fresh 终态——失效则关 agent
     if (!(await mayResume())) {
       closeLocal();
       return null;
     }
 
-    // R23-5：Agent.resume await 期间 B 可能已登记会话——CAS：表里已有且不是自己刚关的 → 让位
+    // Agent.resume await 期间 B 可能已登记会话——CAS：表里已有且不是自己刚关的 → 让位
     const existing = agentSessions.get(task.id);
     if (
       existing &&
@@ -4517,12 +4517,12 @@ export const resumeTaskSession = async (
       return null;
     }
 
-    // R26-2：只构造 bridge——注册延到 installSessionIfCurrent
+    // 只构造 bridge——注册延到 installSessionIfCurrent
     const bridges = buildSessionBridges(task, {
       gitToken: creds.gitToken,
       callerToken,
     });
-    // R18-3：resume 出的新内存实例拿新 instanceId（持久化 agentId 可能与旧 A 相同）
+    // resume 出的新内存实例拿新 instanceId（持久化 agentId 可能与旧 A 相同）
     const record: AgentSessionRecord = {
       instanceId: allocTaskRunInstanceId(),
       agent,
@@ -4533,7 +4533,7 @@ export const resumeTaskSession = async (
       startSnapshot: captureTaskFieldsSnapshot(task),
     };
 
-    // R26-1 / R26-2：install 前插桩；lease = handle current + 非终态（lifecycle）
+    // install 前插桩；lease = handle current + 非终态（lifecycle）
     await failpoint("resume.beforeInstall");
     if (!(await mayResume())) {
       closeLocal();
@@ -4584,7 +4584,7 @@ export const resumeTaskSession = async (
       `[task-runner] task=${task.id} Agent.resume 失败（条件清锚点、降级 fresh agent）`,
       err,
     );
-    // R27-3 / R28-3：条件清——finalGuard 每次 rename 前复查本闭包。
+    // 条件清——finalGuard 每次 rename 前复查本闭包。
     // 必须现查（非入场快照）：本链 lease 仍 current + 内存无后继 session。
     // B 可复用同一 agentId 装新实例——只比盘上 agentId 不够。
     if (task.sessionAgentId) {
@@ -4610,7 +4610,7 @@ export const deliverAskReply = async (
   imagePaths?: string[],
   errorActionId?: string,
   creds?: SessionCreds,
-  /** W2：路由入场 admission token；缺省则 send 入口同步取 */
+  /** 路由入场 admission token；缺省则 send 入口同步取 */
   opGen?: number,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
@@ -4634,7 +4634,7 @@ export const deliverTaskQuestion = async (
   creds?: SessionCreds,
   ackContext?: { actionId: string; artifactPath?: string },
   attachmentPaths?: string[],
-  /** W2：路由入场 admission token；缺省则 send 入口同步取 */
+  /** 路由入场 admission token；缺省则 send 入口同步取 */
   opGen?: number,
 ): Promise<SendTaskSessionResult> =>
   sendToTaskSession(
@@ -4668,26 +4668,26 @@ export const startOneShotQuestion = (
   imagePaths: string[] | undefined,
   creds: { apiKey: string; model: ModelSelection },
   attachmentPaths?: string[],
-  /** W2：路由入场 admission token；缺省则本函数入口同步取（须在任何 await 前） */
+  /** 路由入场 admission token；缺省则本函数入口同步取（须在任何 await 前） */
   opGen?: number,
 ): void => {
   const prevRunStatus = task.runStatus === "running" ? "idle" : task.runStatus;
-  // W2：同步捕获（路由可提前传入）；V2：纳入 startingTasks
+  // 同步捕获（路由可提前传入）；V2：纳入 startingTasks
   const admissionOpGen = opGen ?? getTaskOpGeneration(task.id);
-  // R24-3b：observer 在公共入口、任何 await（含 ensureWorkspaceReady）之前同步拍——
+  // observer 在公共入口、任何 await（含 ensureWorkspaceReady）之前同步拍——
   // ensure / 串行排队期间同 gen claim 会变 claimSeq，出队后 isTaskOpCurrent 即 false
   const oneshotOpHandle = snapshotTaskOp(task.id);
   beginTaskStarting(task.id);
   void (async () => {
     // box：串行回调内赋值不被 TS CFA 当成「外层 let 从未赋值」
     const agentBox: { current: AgentInstance | null } = { current: null };
-    // R23-3b：instanceId 在受理段分配，catch/consume 共用——
+    // instanceId 在受理段分配，catch/consume 共用——
     // 绝不再从全局 runningTasks 读（表已被 B 换掉时会误拿 B 的号）
     let oneshotInstanceId: number | undefined;
     /**
-     * W3：stale 中止只关自己的 agent / 飞行窗——不写 task 级 runStatus。
+     * stale 中止只关自己的 agent / 飞行窗——不写 task 级 runStatus。
      * 状态归 bump 方（stop/DELETE）收尾；旧 one-shot 无条件恢复 prevRunStatus
-     * 会覆盖后继 B 刚置的 running（验收 W3 时序）。
+     * 会覆盖后继 B 刚置的 running（验收 时序）。
      */
     const abortStaleQuietly = (): void => {
       const a = agentBox.current;
@@ -4699,14 +4699,14 @@ export const startOneShotQuestion = (
       }
     };
     try {
-      // R24-3b 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
+      // 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
       await failpoint("oneshot.beforeEnsure");
       // finalize / 手删后 worktree 可能已不在——起兜底 agent 前先保证目录存在
-      // R28-1：one-shot 传 observer 闭包
+      // one-shot 传 observer 闭包
       try {
         await ensureWorkspaceReady(task, () => isTaskOpCurrent(oneshotOpHandle));
       } catch (err) {
-        // R28-1：让位 → 静默 return（不起 agent）
+        // 让位 → 静默 return（不起 agent）
         if (err instanceof WorktreeLeaseLostError) {
           abortStaleQuietly();
           return;
@@ -4721,13 +4721,13 @@ export const startOneShotQuestion = (
         return;
       }
 
-      // X2：create→send 受理进串行链（与 advance / follow-up send 互斥）；consume 留链外。
+      // create→send 受理进串行链（与 advance / follow-up send 互斥）；consume 留链外。
       // ⚠️ 死锁自查：本回调绝不嵌套 runWithTaskSendSerial / sendToTaskSession。
       type AdmitOk = { run: SessionRun };
       const admitted = await runWithTaskSendSerial(
         task.id,
         async (): Promise<AdmitOk | null> => {
-          // R24-3b：沿用入口 oneshotOpHandle——受理段禁止重拍 snapshot
+          // 沿用入口 oneshotOpHandle——受理段禁止重拍 snapshot
           oneshotInstanceId = allocTaskRunInstanceId();
           if (
             isTaskOpStale(task.id, admissionOpGen) ||
@@ -4743,7 +4743,7 @@ export const startOneShotQuestion = (
             return null;
           }
 
-          // R25-2：启动副作用边界——盘上终态让位，不 Agent.create
+          // 启动副作用边界——盘上终态让位，不 Agent.create
           {
             const repoStatus = await readTaskRepoStatusFresh(task.id);
             if (repoStatus === "merged" || repoStatus === "abandoned") {
@@ -4764,7 +4764,7 @@ export const startOneShotQuestion = (
           console.log(
             `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${created.agentId}`,
           );
-          // V1 / R23-3b：create 返回后复查——stop / 同 gen claim 都不得 send
+          // V1 / create 返回后复查——stop / 同 gen claim 都不得 send
           if (
             isTaskOpStale(task.id, admissionOpGen) ||
             !isTaskOpCurrent(oneshotOpHandle)
@@ -4811,7 +4811,7 @@ export const startOneShotQuestion = (
           const run = await created.send(prompt, {
             onDelta: composeOnDelta(
               perfTracker.onDelta,
-              // R26-6：one-shot 绑 observer handle
+              // one-shot 绑 observer handle
               createShellOutputDeltaPublisher(task.id, () =>
                 isTaskOpCurrent(oneshotOpHandle),
               ),
@@ -4820,7 +4820,7 @@ export const startOneShotQuestion = (
           });
           perfTracker.attachRun(run);
 
-          // R23-3b / M4：send resolve 后插桩；失主则 cancel + 关本地、不注册 runningTasks
+          // send resolve 后插桩；失主则 cancel + 关本地、不注册 runningTasks
           await failpoint("oneshot.afterSend");
           if (
             isTaskOpStale(task.id, admissionOpGen) ||
@@ -4833,7 +4833,7 @@ export const startOneShotQuestion = (
             return null;
           }
 
-          // X2：出链前预登记——堵住「出链→consume.set」窗口，让并发 advance 看见本 run
+          // 出链前预登记——堵住「出链→consume.set」窗口，让并发 advance 看见本 run
           runningTasks.set(task.id, {
             instanceId: oneshotInstanceId,
             agentId: created.agentId,
@@ -4870,7 +4870,7 @@ export const startOneShotQuestion = (
         return;
       }
       console.error(`[task-runner] task=${task.id} 问一问兜底失败：`, err);
-      // R27-6：owner 语境（oneshot 链、上方已验 current）——oneshot observer lease
+      // owner 语境（oneshot 链、上方已验 current）——oneshot observer lease
       await writeOwnedEventAndPublish(
         task.id,
         () => isTaskOpCurrent(oneshotOpHandle),
@@ -4879,7 +4879,7 @@ export const startOneShotQuestion = (
           text: `答疑 agent 启动失败：${err instanceof Error ? err.message : String(err)}`,
         },
       );
-      // R23-3b：restore 前复查 handle；instanceId 用本地变量（不从全局表读 B）
+      // restore 前复查 handle；instanceId 用本地变量（不从全局表读 B）
       if (
         !isTaskOpCurrent(oneshotOpHandle) ||
         oneshotInstanceId === undefined
@@ -4912,7 +4912,7 @@ export const startOneShotQuestion = (
  * V0.11.7：入口先等在飞 run 排空（几秒级协议间隙、见 waitForRunToDrain）再 send、
  * 不再直接拒——用户秒答 ask 弹窗撞上「run 还没 finished」曾被误报「没有活跃会话」。
  *
- * X1：@returns 结构化结果——`stale` 绝不能被调用方当成「无会话」去 fallback / 写 running。
+ * @returns 结构化结果——`stale` 绝不能被调用方当成「无会话」去 fallback / 写 running。
  */
 // 等 task 的在飞 run 自然结束（V0.11.7）。返回 false = 超时还在跑。
 // 场景：ask_user 弹窗在 agent 调工具的瞬间就弹给用户、但本回合 run 要再过几秒才 finished
@@ -4939,17 +4939,17 @@ const sendToTaskSession = async (
     questionRun?: boolean;
     /** 性能埋点 runKind；默认 questionRun→question，否则 task-followup */
     runKind?: string;
-    /** W2：调用方入场 opGen；缺省则本函数在进串行队列前同步取 */
+    /** 调用方入场 opGen；缺省则本函数在进串行队列前同步取 */
     opGen?: number;
   } = {},
 ): Promise<SendTaskSessionResult> => {
-  // W2：admission 在进 runWithTaskSendSerial 之前同步捕获——
-  // 否则 S2 排队期间 stop bump，出队后才取会拍到新值、冒充 stop 后新请求
+  // admission 在进 runWithTaskSendSerial 之前同步捕获——
+  // 否则 排队期间 stop bump，出队后才取会拍到新值、冒充 stop 后新请求
   const opGen = opts.opGen ?? getTaskOpGeneration(task.id);
-  // R24-3a：observer 与 opGen 同位置同步拍——排队期间同 gen claim 变 claimSeq，
+  // observer 与 opGen 同位置同步拍——排队期间同 gen claim 变 claimSeq，
   // 出队后 isTaskOpCurrent(entryOpHandle) 即 false，不得伪装成 B 的合法 observer
   const entryOpHandle = snapshotTaskOp(task.id);
-  // V2 / X2：同步 check-and-chain——并发 send 与 one-shot/advance 启动受理串行化
+  // V2 / 同步 check-and-chain——并发 send 与 one-shot/advance 启动受理串行化
   return runWithTaskSendSerial(task.id, () =>
     sendToTaskSessionBody(task, text, { ...opts, opGen, entryOpHandle }),
   );
@@ -4964,16 +4964,16 @@ const sendToTaskSessionBody = async (
     questionRun?: boolean;
     runKind?: string;
     opGen?: number;
-    /** R24-3a：由导出入口在进串行队列前拍好，禁止出队后自取 */
+    /** 由导出入口在进串行队列前拍好，禁止出队后自取 */
     entryOpHandle: TaskOpHandle;
   },
 ): Promise<SendTaskSessionResult> => {
-  // W2 / R24-3a：由 sendToTaskSession 入口传入（禁止出队后自取 opGen / observer）
+  // 由 sendToTaskSession 入口传入（禁止出队后自取 opGen / observer）
   const opGen = opts.opGen!;
   const entryOpHandle = opts.entryOpHandle;
   beginTaskStarting(task.id);
   try {
-    // X1：每处 stale 显式返 "stale"，不得折叠成 false/no_session
+    // 每处 stale 显式返 "stale"，不得折叠成 false/no_session
     if (isTaskOpStale(task.id, opGen)) return "stale";
     /** gen stale 或同 gen claim（claimSeq 变）都算失效 */
     const entryLost = (): boolean =>
@@ -4985,10 +4985,10 @@ const sendToTaskSessionBody = async (
       );
       return "no_session";
     }
-    // R23-3a：drain 期间同 gen claim 也要让位（纯 gen 比对看不见）
+    // drain 期间同 gen claim 也要让位（纯 gen 比对看不见）
     if (entryLost()) return "stale";
     let session = agentSessions.get(task.id) ?? null;
-    // R24-3c：记下是否本轮 resume 刚登记——失主时必须按 instance 清掉，给 B 干净位子
+    // 记下是否本轮 resume 刚登记——失主时必须按 instance 清掉，给 B 干净位子
     let resumedThisCall = false;
     if (!session && opts.creds) {
       session = await resumeTaskSession(task, opts.creds, {
@@ -4997,13 +4997,13 @@ const sendToTaskSessionBody = async (
       resumedThisCall = !!session;
     }
     if (!session) {
-      // R26-1/R26-2：resume 因失主 / 终态返 null 时，resume 内部已 close agent。
-      // 失主不得折叠成 no_session（调用方会误当「无会话」再 force-new）——对齐 R24-3c。
+      // resume 因失主 / 终态返 null 时，resume 内部已 close agent。
+      // 失主不得折叠成 no_session（调用方会误当「无会话」再 force-new）——对齐既有口径。
       if (entryLost()) return "stale";
       return "no_session";
     }
     if (entryLost()) {
-      // R24-3c：不能只 return "stale"——resume 刚写入的 session/bridge 会占住位子挡 B
+      // 不能只 return "stale"——resume 刚写入的 session/bridge 会占住位子挡 B
       if (resumedThisCall) {
         closeTaskSession(task.id, session.agentId, {
           expectedSessionInstanceId: session.instanceId,
@@ -5012,13 +5012,13 @@ const sendToTaskSessionBody = async (
       return "stale";
     }
     const agent = session.agent as AgentInstance;
-    // R18-3：受理时记下 session instanceId——后续关会话 / restore 按号门控
+    // 受理时记下 session instanceId——后续关会话 / restore 按号门控
     const mySessionInstanceId = session.instanceId;
     const isSendSessionOwner = (): boolean => {
       const s = agentSessions.get(task.id);
       return !!s && s.instanceId === mySessionInstanceId;
     };
-    /** R23-3a：失效让位——cancel 刚受理的 run、只关自己 session、return stale */
+    /** 失效让位——cancel 刚受理的 run、只关自己 session、return stale */
     const yieldStale = async (run?: SessionRun): Promise<"stale"> => {
       if (run) {
         void run.cancel().catch(() => {
@@ -5046,7 +5046,7 @@ const sendToTaskSessionBody = async (
       run = await agent.send(text, {
         onDelta: composeOnDelta(
           perfTracker.onDelta,
-          // R26-6：续接 / 问一问 send 绑入场 opHandle
+          // 续接 / 问一问 send 绑入场 opHandle
           createShellOutputDeltaPublisher(task.id, () =>
             isTaskOpCurrent(entryOpHandle),
           ),
@@ -5056,13 +5056,13 @@ const sendToTaskSessionBody = async (
       perfTracker.attachRun(run);
     } catch (err) {
       // 续接 / 问一问 send 期间点停止会先 close 会话 → send 抛错；
-      // X1：返 "stale" 而非 true——避免 route 当成已送达去写事件 / advance 降级 force-new
+      // 返 "stale" 而非 true——避免 route 当成已送达去写事件 / advance 降级 force-new
       const stopSignal =
         pendingStopRequests.has(task.id) ||
         getChatLifecycle(task.id) !== null ||
         entryLost();
       if (stopSignal) {
-        // R23-3a：同 gen claim 失主 → 纯让位（不走 applyPendingStop 共享写）
+        // 同 gen claim 失主 → 纯让位（不走 applyPendingStop 共享写）
         if (!isTaskOpCurrent(entryOpHandle)) {
           return yieldStale();
         }
@@ -5098,7 +5098,7 @@ const sendToTaskSessionBody = async (
       });
       return "send_failed";
     }
-    // R23-3a / M3：send resolve 后插桩再复查——同 gen claim 必须让位，永不重拍 snapshot
+    // send resolve 后插桩再复查——同 gen claim 必须让位，永不重拍 snapshot
     await failpoint("send.afterSend");
     if (entryLost()) {
       // 同 gen claim：纯让位；stop（gen/lifecycle）：可走 pending 收尾
@@ -5138,7 +5138,7 @@ const sendToTaskSessionBody = async (
       return "stale";
     }
     session.lastActiveAt = Date.now();
-    // R23-3a：consume 直接用入场 entryOpHandle——禁止 send 后再 snapshotTaskOp
+    // consume 直接用入场 entryOpHandle——禁止 send 后再 snapshotTaskOp
     void consumeSessionRun(task, agent, run, {
       errorActionId: opts.errorActionId,
       questionRun: opts.questionRun,

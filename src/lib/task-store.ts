@@ -29,12 +29,12 @@ import type {
 } from "./types";
 
 /**
- * R34-4：带 HTTP status 的业务拒绝——客户端据此区分「明确 4xx」与网络不确定。
- * R35-2：可选 code（如 payload_mismatch）供 Operation 仲裁。
+ * 带 HTTP status 的业务拒绝——客户端据此区分「明确 4xx」与网络不确定。
+ * 可选 code（如 payload_mismatch）供 Operation 仲裁。
  */
 export class ApiRequestError extends Error {
   readonly status: number;
-  /** R35-2：服务端稳定错误码（如 payload_mismatch） */
+  /** 服务端稳定错误码（如 payload_mismatch） */
   readonly code?: string;
   constructor(
     message: string,
@@ -402,13 +402,13 @@ interface SSEEnvelope {
     | "done"
     | "error"
     | "assistant_delta"
-    /** R31-1：队列整队失败控制帧 */
+    /** 队列整队失败控制帧 */
     | "queue_failed"
-    /** R32-2：bootstrap 队列存活快照 */
+    /** bootstrap 队列存活快照 */
     | "queue_state"
-    /** R36-2：MessageOperation phase / terminal 帧 */
+    /** MessageOperation phase / terminal 帧 */
     | "message_op"
-    /** R33-4：任务已逻辑删除，客户端应停订阅、勿重连 */
+    /** 任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
   content?: string;
@@ -419,15 +419,15 @@ interface SSEEnvelope {
   text?: string;
   itemIds?: string[];
   reason?: string;
-  /** R33-1：bootstrap queue_state 有界终态 ledger */
+  /** bootstrap queue_state 有界终态 ledger */
   recentSettled?: Array<{ itemId: string; outcome: string }>;
-  /** R36-4：完整 operation snapshot（含 accepting/persisted） */
+  /** 完整 operation snapshot（含 accepting/persisted） */
   operationSnapshot?: Array<{
     itemId: string;
     phase: string;
     fingerprint?: string;
   }>;
-  /** R36-2：message_op 帧字段 */
+  /** message_op 帧字段 */
   itemId?: string;
   phase?: string;
   outcome?: string;
@@ -472,11 +472,11 @@ export interface TaskStreamCallbacks {
    */
   onAssistantDelta?: (text: string) => void;
   /**
-   * R31-1：队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
+   * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
   /**
-   * R32-2 / R33-1 / R36-4：watch bootstrap queue_state + operationSnapshot
+   * watch bootstrap queue_state + operationSnapshot
    */
   onQueueState?: (
     itemIds: string[],
@@ -488,7 +488,7 @@ export interface TaskStreamCallbacks {
     }>,
   ) => void;
   /**
-   * R36-2：message_op——显式 phase / outcome（handedOff=delivered）
+   * message_op——显式 phase / outcome（handedOff=delivered）
    */
   onMessageOp?: (payload: {
     itemId: string;
@@ -496,18 +496,18 @@ export interface TaskStreamCallbacks {
     outcome?: string;
   }) => void;
   /**
-   * R33-4：task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
+   * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
   onTaskDeleted?: (taskId: string) => void;
   /**
-   * R39-2：连接已建立——首个合法 bootstrap `task` 帧解析成功时回调一次。
+   * 连接已建立——首个合法 bootstrap `task` 帧解析成功时回调一次。
    * hook 用它在长连接尚未结束时清零 transient/unavailable 计数（不等流 EOF）。
    * 200 空流 / 协议解析前失败不得触发；每次连接至多一次。
    */
   onConnectionEstablished?: () => void;
 }
 
-/** R40-2：watch 流结束时是否曾建立（首个合法 task 帧） */
+/** watch 流结束时是否曾建立（首个合法 task 帧） */
 export type WatchTaskStreamResult = {
   established: boolean;
 };
@@ -516,7 +516,7 @@ export type WatchTaskStreamResult = {
  * 订阅任务 SSE（v1.0.x 起 bootstrap 只带尾部 tail 条事件、不是全部历史——
  * 更早的走 fetchEarlierEvents 上拉分页；中途 task/done 帧不带 events）
  *
- * R40-2：返回 `{ established }`——bootstrap 前 clean EOF 时 established=false，
+ * 返回 `{ established }`——bootstrap 前 clean EOF 时 established=false，
  * hook 不得把它当成功清零 epoch。
  */
 export const watchTaskStream = async (
@@ -539,7 +539,7 @@ export const watchTaskStream = async (
       typeof data === "object" && data && "error" in data
         ? String((data as { error: unknown }).error)
         : `HTTP ${res.status}`;
-    // R36-7 / R37-3：带 status；hook 对 410 与已 hydrate 的 404 走 deletion sink，
+    // 带 status；hook 对 410 与已 hydrate 的 404 走 deletion sink，
     // 503（证据 unknown）当 unavailable 持续重试、不 commit
     throw new ApiRequestError(msg, res.status);
   }
@@ -550,7 +550,7 @@ export const watchTaskStream = async (
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  // R39-2：首个合法 task 帧才算建连成功；每连接至多通知一次
+  // 首个合法 task 帧才算建连成功；每连接至多通知一次
   let connectionEstablished = false;
 
   try {
@@ -589,7 +589,7 @@ export const watchTaskStream = async (
             env.type === "queue_failed" &&
             Array.isArray(env.itemIds)
           ) {
-            // R31-1：控制帧——只转发 string[] itemIds
+            // 控制帧——只转发 string[] itemIds
             const ids = env.itemIds.filter(
               (id): id is string => typeof id === "string",
             );
@@ -601,7 +601,7 @@ export const watchTaskStream = async (
             env.type === "queue_state" &&
             Array.isArray(env.itemIds)
           ) {
-            // R32-2 / R33-1 / R36-4：队列快照 + recentSettled + operationSnapshot
+            // 队列快照 + recentSettled + operationSnapshot
             const ids = env.itemIds.filter(
               (id): id is string => typeof id === "string",
             );
@@ -632,7 +632,7 @@ export const watchTaskStream = async (
             env.type === "message_op" &&
             typeof env.itemId === "string"
           ) {
-            // R36-2：显式 operation phase / terminal
+            // 显式 operation phase / terminal
             callbacks.onMessageOp?.({
               itemId: env.itemId,
               phase: typeof env.phase === "string" ? env.phase : undefined,
@@ -643,7 +643,7 @@ export const watchTaskStream = async (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"
           ) {
-            // R33-4：逻辑删除已提交——转发后流会由服务端关闭
+            // 逻辑删除已提交——转发后流会由服务端关闭
             callbacks.onTaskDeleted?.(env.taskId);
           }
         }
@@ -703,12 +703,12 @@ export const sendChatReply = async (
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
   /**
-   * R33-1：客户端预生成的 queue itemId（POST 前登记 pending 用）。
+   * 客户端预生成的 queue itemId（POST 前登记 pending 用）。
    * 服务端原样采用；缺省时服务端兜底发号。
    */
   clientItemId?: string,
   /**
-   * R35-2：payload 指纹（与 server claim 对齐）。
+   * payload 指纹（与 server claim 对齐）。
    * 契约假设：同 id + 不同 fingerprint → 409 `{ error: "payload_mismatch" }`。
    */
   payloadFingerprint?: string,
@@ -717,25 +717,25 @@ export const sendChatReply = async (
       task: Task;
       autoStarted: boolean;
       queued?: false;
-      /** R30-3：send 后落盘失败时服务端带回，UI 须 toast 不可忽略 */
+      /** send 后落盘失败时服务端带回，UI 须 toast 不可忽略 */
       persistWarning?: string;
     }
   | {
       queued: true;
       queuedCount: number;
-      /** R31-1：与服务端 queue item 对账的稳定 id */
+      /** 与服务端 queue item 对账的稳定 id */
       itemId: string;
-      /** R34-4：同 id 幂等命中 active */
+      /** 同 id 幂等命中 active */
       alreadyAccepted?: boolean;
       task?: Task;
       persistWarning?: string;
     }
   | {
-      /** R34-4：同 id 已在 recentSettled → 终态幂等 */
+      /** 同 id 已在 recentSettled → 终态幂等 */
       settled: true;
       itemId: string;
       /**
-       * R37-1：缺失时保持 undefined（unknown），绝不合成 delivered。
+       * 缺失时保持 undefined（unknown），绝不合成 delivered。
        * 调用方按 ledger / decoder 仲裁清草稿。
        */
       outcome?: string;
@@ -756,9 +756,9 @@ export const sendChatReply = async (
           attachments && attachments.length > 0 ? attachments : undefined,
         bootArgs,
         skills: skills && skills.length > 0 ? skills : undefined,
-        // R33-1：客户端预生成 id，服务端优先采用
+        // 客户端预生成 id，服务端优先采用
         clientItemId: clientItemId || undefined,
-        // R35-2：供 server claimOperation 比对
+        // 供 server claimOperation 比对
         payloadFingerprint: payloadFingerprint || undefined,
       }),
     },
@@ -778,7 +778,7 @@ export const sendChatReply = async (
       queued: true,
       queuedCount:
         typeof data.queuedCount === "number" ? data.queuedCount : 1,
-      // R31-1：缺 itemId 时本地兜底（旧服务端兼容；正常路径服务端必返）
+      // 缺 itemId 时本地兜底（旧服务端兼容；正常路径服务端必返）
       itemId:
         typeof data.itemId === "string" && data.itemId
           ? data.itemId
@@ -799,7 +799,7 @@ export const sendChatReply = async (
       typeof (data as { error: unknown }).error === "string"
         ? (data as { error: string }).error
         : undefined;
-    // R35-2：server 实际契约 = 结构化字段 `{ payloadMismatch: true }`（error 是给人读的长文案、
+    // server 实际契约 = 结构化字段 `{ payloadMismatch: true }`（error 是给人读的长文案、
     // 不做字符串匹配）；命中即抛稳定 code 供 Operation 仲裁转新 id 重发
     const isPayloadMismatch =
       res.status === 409 &&
@@ -823,8 +823,8 @@ export const sendChatReply = async (
     autoStarted?: boolean;
     persistWarning?: string;
   };
-  // R34-4：幂等终态（同 id 已 settled）
-  // R37-1：缺失 / 非字符串 outcome 不得合成 delivered——保持 undefined → unknown
+  // 幂等终态（同 id 已 settled）
+  // 缺失 / 非字符串 outcome 不得合成 delivered——保持 undefined → unknown
   if (data.settled === true && typeof data.itemId === "string") {
     return {
       settled: true,
@@ -948,7 +948,7 @@ export const submitTaskQuestion = async (
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
     }),
   });
-  // R30-3：透传 persistWarning，调用方 toast（不可静默丢）
+  // 透传 persistWarning，调用方 toast（不可静默丢）
   const data = await handleJson<{
     ok: true;
     task: Task;
@@ -1129,7 +1129,7 @@ export const submitAskReply = async (
       }),
     },
   );
-  // R30-3：透传 persistWarning
+  // 透传 persistWarning
   const data = await handleJson<{ ok: true; persistWarning?: string }>(res);
   return {
     ok: true as const,

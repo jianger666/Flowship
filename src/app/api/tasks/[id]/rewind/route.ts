@@ -65,7 +65,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       isRunActive: isChatRunActive,
       isCompactInProgress: isChatCompactInProgress,
       isQueueDraining: isChatQueueDraining,
-      // R29-P2：rewind info 改 writeEventAndPublish——磁盘序 = SSE 序（用户操作、无条件语义）
+      // rewind info 改 writeEventAndPublish——磁盘序 = SSE 序（用户操作、无条件语义）
       appendInfoEvent: async (taskId, text) =>
         writeEventAndPublish(taskId, { kind: "info", text }),
       getTask,

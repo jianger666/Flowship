@@ -40,7 +40,7 @@
  *   done——旧「收到 done 就不再重连」会让页面在任意一轮后断流、后续 send 起的新 run 事件
  *   全收不到（实测：ask 弹窗答完永远卡「提交中」）。现在只有 done 里的 task 是业务终态
  *   （merged / abandoned、服务端也只在这种情况关流）才停止订阅、其余照常保持 / 重连。
- * - **R37-3 / R37-6**：已 hydrate watcher 的 404→deleted；503 unavailable 持续重试（不终止）。
+ * - 已 hydrate watcher 的 404→deleted；503 unavailable 持续重试（不终止）。
  */
 
 import { useEffect, useRef } from "react";
@@ -79,9 +79,9 @@ export interface UseTaskWatchCallbacks {
   // watchTaskStream 自己 throw 出来的异常（HTTP 4xx / 网络断 / 解析错）
   // AbortError 已被 hook 内部吞掉、不会触发这个回调
   onWatchException?: (err: Error) => void;
-  /** R31-1：queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
+  /** queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
-  /** R32-2 / R33-1 / R36-4：bootstrap queue_state + operationSnapshot */
+  /** bootstrap queue_state + operationSnapshot */
   onQueueState?: (
     itemIds: string[],
     recentSettled?: Array<{ itemId: string; outcome: string }>,
@@ -92,7 +92,7 @@ export interface UseTaskWatchCallbacks {
     }>,
   ) => void;
   /**
-   * R36-2：显式 message_op 帧（phase / outcome）——成功终态唯一来源之一。
+   * 显式 message_op 帧（phase / outcome）——成功终态唯一来源之一。
    */
   onMessageOp?: (payload: {
     itemId: string;
@@ -100,7 +100,7 @@ export interface UseTaskWatchCallbacks {
     outcome?: string;
   }) => void;
   /**
-   * R33-4 / R35-5 / R37-3：task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
+   * task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
    * 调用方接到后 `commitTaskDeleted`；503 unavailable 不可走此 sink。
    */
   onTaskDeleted?: (taskId: string) => void;
@@ -145,9 +145,9 @@ export const useTaskWatch = (
       });
 
     // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」/ deleted 才停
-    // enabled=true 隐含已 hydrate——404 可安全当物理删除完成（R37-3）
+    // enabled=true 隐含已 hydrate——404 可安全当物理删除完成
     const loop = async () => {
-      // R38-2：两类计数独立——503 不兑换成一次即终止的网络错误预算
+      // 两类计数独立——503 不兑换成一次即终止的网络错误预算
       let unavailableAttempts = 0;
       let transientFailures = 0;
       let unavailableNotified = false; // unavailable 达阈值后只 toast 一次
@@ -155,7 +155,7 @@ export const useTaskWatch = (
         // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
         // 回合级 done（V0.11 每轮 run 结束都发）不算、流保持 / 断了照常重连
         let gotTerminalDone = false;
-        // R33-4 / R37-3：收到 task_deleted / 410 / hydrated-404 后不再重连
+        // 收到 task_deleted / 410 / hydrated-404 后不再重连
         let gotTaskDeleted = false;
         const sseCallbacks: TaskStreamCallbacks = {
           onEvent: (ev) => {
@@ -209,7 +209,7 @@ export const useTaskWatch = (
               callbacksRef.current.onTaskDeleted?.(deletedId);
             }
           },
-          // R39-2：首个合法 bootstrap task 帧即清零——不等流 EOF；
+          // 首个合法 bootstrap task 帧即清零——不等流 EOF；
           // 否则「成功建连后 reader 抛错」会把上轮 transient 累加到本轮
           onConnectionEstablished: () => {
             unavailableAttempts = 0;
@@ -224,7 +224,7 @@ export const useTaskWatch = (
             sseCallbacks,
             ctrl.signal,
           );
-          // R40-2：只有 established 后 clean EOF 才清 epoch；
+          // 只有 established 后 clean EOF 才清 epoch；
           // bootstrap 前空流走 retryable 预算（与 fetch reject 同账）
           const eof = resolveWatchCleanEof({
             established,
@@ -262,7 +262,7 @@ export const useTaskWatch = (
           ) {
             return;
           }
-          // R37-3：本 hook 仅在 enabled（已 hydrate）时运行 → 404 可 commit deleted
+          // 本 hook 仅在 enabled（已 hydrate）时运行 → 404 可 commit deleted
           const status =
             err instanceof ApiRequestError
               ? err.status

@@ -40,10 +40,10 @@ export const GET = async (req: Request, { params }: Ctx) => {
 
     // 流式向前扫到 cursor、只留一页窗口——不整文件 parse 进内存
     const page = await getTaskEventsBefore(id, before, limit);
-    // R34-3：HTTP 提交点同步复查
+    // HTTP 提交点同步复查
     await failpoint("httpRead.afterHelper");
     if (!page) {
-      // R36-7：deleted→410 / unavailable→503 / 其余 404
+      // deleted→410 / unavailable→503 / 其余 404
       return taskVisibilityErrorResponse(id);
     }
     return commitReadableTaskResponse(id, () => page);

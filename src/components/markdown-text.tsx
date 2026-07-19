@@ -45,7 +45,7 @@ const STREAMDOWN_PLUGINS = { code, mermaid, math, cjk };
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
 // remark 插件：**必须带上 Streamdown 内置的 defaultRemarkPlugins（含 remark-gfm）**——
 // 直接传 remarkPlugins 是整表替换、不追加、漏了 gfm 表格/删除线/autolink 全失效
-//（审计 P1 实锤）；我们三个自定义插件跟在其后
+//（已实测）；我们三个自定义插件跟在其后
 const REMARK_PLUGINS = [
   ...Object.values(defaultRemarkPlugins),
   remarkCodeReference,
@@ -85,7 +85,7 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
     <Streamdown
       mode={streaming ? "streaming" : "static"}
       isAnimating={streaming}
-      // 流式末尾闪烁光标（审计 P1：caret 无默认、不显式传就没光标）
+      // 流式末尾闪烁光标（caret 无默认、不显式传就没光标）
       caret={streaming ? "block" : undefined}
       shikiTheme={SHIKI_THEME}
       plugins={STREAMDOWN_PLUGINS}

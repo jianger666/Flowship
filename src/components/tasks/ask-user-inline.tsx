@@ -381,7 +381,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         imagesByQuestion,
         signal: ac.signal,
       });
-      // R30-3：send 后落盘失败——不可忽略提示
+      // send 后落盘失败——不可忽略提示
       if (askResult.persistWarning) {
         toast.error(
           `消息已送达但记录保存失败：${askResult.persistWarning}`,
@@ -428,7 +428,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         deferred: true,
         signal: ac.signal,
       });
-      // R30-3：send 后落盘失败——不可忽略提示
+      // send 后落盘失败——不可忽略提示
       if (deferResult.persistWarning) {
         toast.error(
           `消息已送达但记录保存失败：${deferResult.persistWarning}`,

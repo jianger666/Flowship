@@ -1,18 +1,18 @@
 /**
- * R36-10 / R37-2 / R41-2 / R42-1：client MessageOperation ledger（per-task 进程内共享）
+ * client MessageOperation ledger（per-task 进程内共享）
  *
  * 从 ChatView 组件 state 提升到此处：路由切换 / 卸载不丢 retry identity
  * （clientItemId + fingerprint）。terminal（task deleted）或明确 clear_all 才清。
  *
- * R37-2：唯一提交入口 `dispatchChatOp(taskId, action)`——禁止组件用 current
+ * 唯一提交入口 `dispatchChatOp(taskId, action)`——禁止组件用 current
  * taskIdRef 给迟到 HTTP 定 owner；离屏 A 的结果只写 A ledger。
  * 挂 globalThis 防 route-chunk / HMR 分裂。
  *
- * R41-2 / R42-1 key 决策：现行 `__feAiFlowChatOpLedgerR42`；旧
+ * key 决策：现行 `__feAiFlowChatOpLedgerR42`；旧
  * `__feAiFlowChatOpLedgerR36` 在 getStore **每次**检查——存在则合并进现行后
- * delete。为何每次而非「仅 R42 缺失时」：HMR 后新 chunk 先任何 dispatch/get
- * 就会建空 R42；旧 chunk 残留闭包（pending fetch .then）仍可能随后写 R36——
- * 若只在 R42 缺失时迁一次，晚到的 R36 永远收不回，响应丢失窗口的 retry
+ * delete。为何每次而非「仅现行 key 缺失时」：HMR 后新 chunk 先任何 dispatch/get
+ * 就会建空现行 store；旧 chunk 残留闭包（pending fetch .then）仍可能随后写 legacy——
+ * 若只在现行 key 缺失时迁一次，晚到的 legacy 写入永远收不回，响应丢失窗口的 retry
  * identity 静默丢。合并保守：现行同 id 优先、legacy 独有补入；迁完即删旧
  * key，正常路径只发生一次，混跑窗口每次写入后再收割一次（幂等）。
  */
@@ -33,13 +33,13 @@ type ChatOpListener = (state: ChatOpState) => void;
 
 type ChatOpLedgerStore = {
   byTaskId: Map<string, ChatOpState>;
-  /** R37-2：按 taskId 订阅；切任务后旧 listener 应已 unsubscribe */
+  /** 按 taskId 订阅；切任务后旧 listener 应已 unsubscribe */
   listeners: Map<string, Set<ChatOpListener>>;
 };
 
-/** R41-2：三轴 shape 的现行 key（与旧 R36 并存窗口只做单向迁移） */
+/** 三轴 shape 的现行 key（与旧 legacy key 并存窗口只做单向迁移） */
 const GLOBAL_KEY = "__feAiFlowChatOpLedgerR42" as const;
-/** R36～R40 时代的 key——getStore 读到后迁完即删，防止新旧代码互污染 */
+/** 旧 shape 时代的 key——getStore 读到后迁完即删，防止新旧代码互污染 */
 const LEGACY_GLOBAL_KEY = "__feAiFlowChatOpLedgerR36" as const;
 
 type GlobalLedgerBag = typeof globalThis & {
@@ -191,7 +191,7 @@ const mergeListenersInto = (
 };
 
 /**
- * R42-1：每次 getStore 收割 legacy key——合并进现行后 delete。
+ * 每次 getStore 收割 legacy key——合并进现行后 delete。
  * 现行无该 task → 整份迁入；两边都有 → mergeChatOpStates。
  */
 const harvestLegacyInto = (current: ChatOpLedgerStore): void => {
@@ -222,7 +222,7 @@ const getStore = (): ChatOpLedgerStore => {
   }
 
   upgradeStoreInPlace(g[GLOBAL_KEY]);
-  // 每次检查 legacy（见模块顶 R42-1：HMR 残留闭包可晚写 R36）
+  // 每次检查 legacy（见模块顶：HMR 残留闭包可晚写 legacy key）
   harvestLegacyInto(g[GLOBAL_KEY]);
   return g[GLOBAL_KEY];
 };
@@ -233,7 +233,7 @@ const cloneState = (state: ChatOpState): ChatOpState => ({
   outcomes: { ...state.outcomes },
 });
 
-/** R36-10：读 per-task ledger（无则空态，不写 Map）；入口触发 shape upgrade */
+/** 读 per-task ledger（无则空态，不写 Map）；入口触发 shape upgrade */
 export const getChatOpLedger = (taskId: string): ChatOpState => {
   if (!taskId) return emptyChatOpState();
   const existing = getStore().byTaskId.get(taskId);
@@ -245,7 +245,7 @@ export const getChatOpLedger = (taskId: string): ChatOpState => {
 };
 
 /**
- * R36-10：写回 per-task ledger（测试 / 迁移便利）。
+ * 写回 per-task ledger（测试 / 迁移便利）。
  * 生产路径请走 dispatchChatOp，避免绕过订阅通知。
  */
 export const setChatOpLedger = (taskId: string, state: ChatOpState): void => {
@@ -261,7 +261,7 @@ export const setChatOpLedger = (taskId: string, state: ChatOpState): void => {
 };
 
 /**
- * R37-2：单提交入口——显式 taskId + action，原子 reduce 写回并通知订阅者。
+ * 单提交入口——显式 taskId + action，原子 reduce 写回并通知订阅者。
  * ChatView / HTTP / SSE 全部走这里，不再自己拼 refs。
  */
 export const dispatchChatOp = (
@@ -278,7 +278,7 @@ export const dispatchChatOp = (
 };
 
 /**
- * R37-2：订阅某 task 的 ledger 变更（当前页 ChatView 用）。
+ * 订阅某 task 的 ledger 变更（当前页 ChatView 用）。
  * 返回 unsubscribe；切 task 时必须解绑，避免把 A 的更新刷进 B UI。
  */
 export const subscribeChatOp = (
@@ -302,7 +302,7 @@ export const subscribeChatOp = (
 };
 
 /**
- * R36-10：terminal / 明确放弃时清该 task 的 ledger。
+ * terminal / 明确放弃时清该 task 的 ledger。
  * 切路由不得调用——否则丢 retry identity。
  */
 export const clearChatOpLedger = (taskId: string): void => {
@@ -316,7 +316,7 @@ export const clearChatOpLedger = (taskId: string): void => {
   }
 };
 
-/** 测试专用：清空全部 ledger + 订阅（含遗留 R36 key，避免用例串味） */
+/** 测试专用：清空全部 ledger + 订阅（含遗留 legacy key，避免用例串味） */
 export const __resetChatOpLedgerForTests = (): void => {
   const g = globalThis as GlobalLedgerBag;
   if (g[GLOBAL_KEY]) {

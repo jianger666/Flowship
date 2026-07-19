@@ -57,7 +57,7 @@ const ARTIFACT_SHIKI_THEME: [ThemeInput, ThemeInput] = [
   "github-light",
   "github-dark",
 ];
-// remark 插件：带上 defaultRemarkPlugins（含 gfm）再追加自定义（审计 P1、同 markdown-text）
+// remark 插件：带上 defaultRemarkPlugins（含 gfm）再追加自定义（同 markdown-text）
 const ARTIFACT_REMARK_PLUGINS = [
   ...Object.values(defaultRemarkPlugins),
   remarkCodeReference,
@@ -200,7 +200,7 @@ const buildMarkdownComponents = (
   a: MarkdownLink,
   // markdown 内嵌图（![]()）走统一组件、点击站内看大图（V0.8.8）
   img: MarkdownImage,
-  // 只覆盖 **inline code**（走 Streamdown 的 inlineCode 槽、审计 P1：原来覆盖 code
+  // 只覆盖 **inline code**（走 Streamdown 的 inlineCode 槽、原来覆盖 code
   // 会连 fenced 一起接管、fenced 失去 Shiki 高亮）——fenced 交给 code 插件的 CodeBlock。
   // inline code 里识别文件路径 / artifact 引用、转可点跳转（跳 IDE / 跳 action）
   inlineCode: ({

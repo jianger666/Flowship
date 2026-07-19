@@ -30,7 +30,7 @@ import type { PreviewSlotStatus } from "@/lib/types";
 
 const execFileAsync = promisify(execFile);
 
-// ----------------- R29-3：per-task「启动中」计数（入队 → spawn 完成） -----------------
+// ----------------- per-task「启动中」计数（入队 → spawn 完成） -----------------
 
 const PREVIEW_STARTING_KEY = "__feAiFlowPreviewStartingV1__";
 const getPreviewStartingMap = (): Map<string, number> => {
@@ -59,7 +59,7 @@ export const hasPreviewStarting = (taskId: string): boolean =>
   (getPreviewStartingMap().get(taskId) ?? 0) > 0;
 
 /**
- * R29-3：等「启动中」归零（上限 ms）。
+ * 等「启动中」归零（上限 ms）。
  * lifecycle 已占时 in-flight start 会在 spawn 前 admission 自退，短等即可，
  * 避免与卡在 preview.beforeSpawn 的 start 空耗满 10s。
  */
@@ -74,7 +74,7 @@ const waitPreviewStartingClear = async (
 };
 
 /**
- * R29-3：spawn 前最终准入——fresh 读盘 repoStatus + lifecycle。
+ * spawn 前最终准入——fresh 读盘 repoStatus + lifecycle。
  * 用 readTaskRepoStatusFresh（轻量、不 hydrate）避 preview-manager ↔ task-fs 环，
  * 且不踩 getTask 的 hydrate failpoint。
  */
@@ -430,7 +430,7 @@ export const stopAllPreviews = (): Promise<void> => enqueue(doStopAllPreviews);
 
 /**
  * 停掉属于某 task 的所有 slot（删任务 / 终结任务前调用）。
- * R29-3：先等「启动中」归零（覆盖已过 route 闸、还在队列里的 start），再停已有 slot。
+ * 先等「启动中」归零（覆盖已过 route 闸、还在队列里的 start），再停已有 slot。
  * 不经全局 start 队列直接停——避免与卡在 preview.beforeSpawn 的 doStartPreview 死锁；
  * spawn 后另有终态复查自停孤儿。
  */
@@ -482,7 +482,7 @@ export interface StartPreviewInput {
 export interface StartPreviewResult {
   replacedTaskTitle: string | null;
   status: PreviewSlotStatus;
-  /** R29-3：spawn 前最终准入失败 */
+  /** spawn 前最终准入失败 */
   yielded?: boolean;
   yieldReason?: string;
 }
@@ -490,12 +490,12 @@ export interface StartPreviewResult {
 /**
  * 起预览（按仓单位：只停同 repoPath 旧位、其它仓不动）。
  * 经全局串行队列（CR-10）：同仓并发双 start 顺序执行、后到的顶掉先到的。
- * R29-3：入队起登记「启动中」，cleanup 后、spawn 前最终准入复查。
+ * 入队起登记「启动中」，cleanup 后、spawn 前最终准入复查。
  */
 export const startPreview = (
   input: StartPreviewInput,
 ): Promise<StartPreviewResult> => {
-  // R29-3：入队即登记——stopPreviewsForTask 可等「还在队列里」的窗口
+  // 入队即登记——stopPreviewsForTask 可等「还在队列里」的窗口
   beginPreviewStarting(input.taskId);
   return enqueue(() => doStartPreview(input)).finally(() => {
     endPreviewStarting(input.taskId);
@@ -517,7 +517,7 @@ const doStartPreview = async (
   await doStopPreview(input.repoPath);
   await killStalePreviewForRepo(input.repoPath);
 
-  // R29-3：cleanup 之后、紧贴 spawn 前——插桩 + 最终准入（fresh task + lifecycle）
+  // cleanup 之后、紧贴 spawn 前——插桩 + 最终准入（fresh task + lifecycle）
   await failpoint("preview.beforeSpawn");
   const admission = await admitPreviewSpawn(input.taskId);
   if (!admission.ok) {
@@ -532,7 +532,7 @@ const doStartPreview = async (
       url: null,
       exited: true,
       exitCode: null,
-      logTail: [`R29-3：最终准入拒绝——${admission.reason}`],
+      logTail: [`最终准入拒绝——${admission.reason}`],
     };
     return {
       replacedTaskTitle: null,
@@ -626,7 +626,7 @@ const doStartPreview = async (
     });
   }
 
-  // R29-3：spawn 后终态复查——stopPreviewsForTask 可能已在 admission~map.set 窗口跑过
+  // spawn 后终态复查——stopPreviewsForTask 可能已在 admission~map.set 窗口跑过
   const post = await admitPreviewSpawn(input.taskId);
   if (!post.ok) {
     map.delete(input.repoPath);
@@ -637,7 +637,7 @@ const doStartPreview = async (
       status: {
         ...toStatus(slot),
         exited: true,
-        logTail: [`R29-3：spawn 后复查拒绝——${post.reason}`],
+        logTail: [`spawn 后复查拒绝——${post.reason}`],
       },
       yielded: true,
       yieldReason: post.reason,

@@ -41,12 +41,12 @@ import {
   type NotifyAwaitingResult,
 } from "./chat-pending";
 
-/** R29-2：notify 未送达时工具返回（反登记后、非 ASK_SUBMITTED） */
+/** notify 未送达时工具返回（反登记后、非 ASK_SUBMITTED） */
 const ASK_NOTIFY_FAILED_TEXT = "任务已被接管/通知失败、请重试";
 import { createCustomAction } from "./custom-action-fs";
 import { findSkillByName } from "./skills-loader";
 
-/** R24-6：caller 不匹配时的 MCP 工具返回（无副作用） */
+/** caller 不匹配时的 MCP 工具返回（无副作用） */
 const callerMismatchContent = () => ({
   content: [{ type: "text" as const, text: CALLER_MISMATCH_ERROR }],
 });
@@ -65,7 +65,7 @@ const submittedText = (actionId: string): string =>
   ].join("\n");
 
 /**
- * R29-5：把 safeNotifyAwaiting 结果映射为 submit_work 工具文案。
+ * 把 safeNotifyAwaiting 结果映射为 submit_work 工具文案。
  * 导出供 ownership-r30 断言「stale/busy 不是 submitted」。
  */
 export const mapSubmitWorkNotifyToToolText = (
@@ -110,7 +110,7 @@ const askSubmittedText = (askId: string): string =>
 // ----------------- McpServer 构造 -----------------
 
 /**
- * @param callerToken R24-6：本 MCP session 在 initialize 时从 URL ?caller= 捕获的身份。
+ * @param callerToken 本 MCP session 在 initialize 时从 URL ?caller= 捕获的身份。
  *   每个 Agent.create/resume 拿独立 URL → 独立 MCP session → 闭包里的 token 不变；
  *   工具执行前与 chat-pending 注册表的 expectedCallerToken 核对。
  */
@@ -182,14 +182,14 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         `[chat-mcp] submit_work 交卷 task_id=${task_id} message=${message ? `${message.trim().length}字` : "<无>"} action_id=${action_id ?? "<无>"} artifact_path=${artifact_path ?? "<none>"} caller=${callerToken ?? "<none>"}`,
       );
 
-      // R24-6：副作用前核对 caller——旧 agent 迟到交卷不得启后继的 postCheck
+      // 副作用前核对 caller——旧 agent 迟到交卷不得启后继的 postCheck
       if (!matchExpectedCallerToken(task_id, callerToken)) {
         return callerMismatchContent();
       }
 
       // 不带 action_id（chat 模式旧姿势 / 老 prompt 惯性「待命态」）→ 不需要任何等待、
       // 通知 runner 切 awaiting_user（有 notifier 才生效）、指示 agent 直接结束回复
-      // R30-5：消费 outcome——mismatch/stale/error/busy 不得再报 idle 成功文案；
+      // 消费 outcome——mismatch/stale/error/busy 不得再报 idle 成功文案；
       // no_notifier 保留成功（chat / 无桥待命是常态，agent 只需结束 turn）
       if (!action_id) {
         const idleNotify = await safeNotifyAwaiting(task_id, { callerToken });
@@ -222,7 +222,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         artifactPath: artifact_path,
         callerToken,
       });
-      // R29 / R29-5：只有 accepted/delivered 才报「已交卷」；stale/busy 走 mapSubmitWorkNotifyToToolText
+      // 只有 accepted/delivered 才报「已交卷」；stale/busy 走 mapSubmitWorkNotifyToToolText
       if (notifyResult.status === "mismatch") {
         return callerMismatchContent();
       }
@@ -321,7 +321,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       },
     },
     async ({ task_id, action_id, questions }) => {
-      // R24-6：必须在 registerPendingAsk 之前核对——验收点名旧实现先登记再验主
+      // 必须在 registerPendingAsk 之前核对——验收点名旧实现先登记再验主
       if (!matchExpectedCallerToken(task_id, callerToken)) {
         return callerMismatchContent();
       }
@@ -345,7 +345,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       );
 
       // 通知 runner 写 ask_user_request 事件 + 切 runStatus = awaiting_user
-      // R29-2 / R30-5：只有 accepted 才报 ASK_SUBMITTED；stale/busy/mismatch 反登记 + 错误文案
+      // 只有 accepted 才报 ASK_SUBMITTED；stale/busy/mismatch 反登记 + 错误文案
       const askNotify = await safeNotifyAskUserRequest(task_id, {
         askId,
         token: ask.token,
@@ -477,7 +477,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
       console.log(
         `[chat-mcp] submit_mr task=${task_id} action=${action_id} repo=${repo_path} project=${project_path} src=${source_branch}→${target_branch} caller=${callerToken ?? "<none>"}`,
       );
-      // R24-6：runTaskAction 入口核 caller——拒则不进 handler、不调 GitLab createMR
+      // runTaskAction 入口核 caller——拒则不进 handler、不调 GitLab createMR
       const result = await runTaskAction(
         task_id,
         {
@@ -795,7 +795,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
 // 由 transport 自己的 onsessioninitialized / onsessionclosed 回调维护。
 
 /**
- * @param callerToken R24-6：initialize 请求 URL 的 ?caller=；捕获进 MCP server 闭包、
+ * @param callerToken initialize 请求 URL 的 ?caller=；捕获进 MCP server 闭包、
  *   本 session 后续工具调用都带同一身份（Agent.create 每次新建 MCP session、URL 不同即 session 不同）。
  */
 const buildSessionTransport = (
@@ -840,7 +840,7 @@ const buildSessionTransport = (
  */
 export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
   const sessionId = req.headers.get("mcp-session-id");
-  // R24-6：从 URL query 提 caller（Agent.create 时 inline mcpServers URL 带 ?caller=）
+  // 从 URL query 提 caller（Agent.create 时 inline mcpServers URL 带 ?caller=）
   let callerFromUrl: string | undefined;
   try {
     const u = new URL(req.url);
@@ -913,7 +913,7 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
     );
   }
 
-  // R24-6：initialize 时把 caller 冻进 transport/server 闭包——后续同 session 工具调用复用
+  // initialize 时把 caller 冻进 transport/server 闭包——后续同 session 工具调用复用
   const transport = buildSessionTransport(callerFromUrl);
   return transport.handleRequest(req, { parsedBody: parsed });
 };
@@ -923,7 +923,7 @@ export const handleChatMcpRequest = async (req: Request): Promise<Response> => {
 /**
  * 推算给 Cursor SDK Agent 用的 chat-tool MCP endpoint URL。
  * 优先级：FE_AI_FLOW_CHAT_MCP_URL → FE_AI_FLOW_BASE_URL → PORT → 8876；必须 127.0.0.1。
- * @param callerToken R24-6：agent 实例身份，拼到 `?caller=`——每个 Agent.create/resume
+ * @param callerToken agent 实例身份，拼到 `?caller=`——每个 Agent.create/resume
  *   拿独一无二的 URL → SDK 新建独立 MCP session（无老 session 复用问题）。
  */
 export const getChatMcpUrl = (callerToken?: string): string => {
@@ -955,7 +955,7 @@ export const getChatMcpUrl = (callerToken?: string): string => {
 };
 
 /**
- * R30-5 测试用：走真实 submit_work 分派（含无 action_id 待命分支的 outcome 消费）。
+ * 测试用：走真实 submit_work 分派（含无 action_id 待命分支的 outcome 消费）。
  * 与生产工具 handler 同口径；不必起 HTTP MCP server。
  */
 export const dispatchSubmitWorkForTest = async (args: {
@@ -999,7 +999,7 @@ export const dispatchSubmitWorkForTest = async (args: {
 };
 
 /**
- * R24-6 测试用：走真实 ask_user 分派路径（核对 caller → 才 registerPendingAsk）。
+ * 测试用：走真实 ask_user 分派路径（核对 caller → 才 registerPendingAsk）。
  * 不必起 HTTP MCP server；生产路径是工具 handler 内联同款逻辑。
  */
 export const dispatchAskUserForTest = async (args: {
@@ -1017,7 +1017,7 @@ export const dispatchAskUserForTest = async (args: {
     questions: args.questions,
     actionId: args.actionId,
   });
-  // R29-2 / R30-5：与生产 ask_user 工具同口径——只有 accepted 才成功
+  // 与生产 ask_user 工具同口径——只有 accepted 才成功
   const askNotify = await safeNotifyAskUserRequest(args.taskId, {
     askId,
     token: ask.token,

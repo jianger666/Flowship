@@ -49,7 +49,7 @@ export interface SlashSkill {
 }
 
 // 模块级缓存：skills 列表全局一份、多个输入框 / 反复挂载不重复拉。
-// TTL 60s（审计 P1：永不失效会让「对话创建」刚建好的 skill 唤不起）——过期后
+// TTL 60s（永不失效会让「对话创建」刚建好的 skill 唤不起）——过期后
 // 下一个输入框 mount 时重拉
 const SKILLS_CACHE_TTL_MS = 60_000;
 let skillsCache: SlashSkill[] | null = null;
@@ -288,7 +288,7 @@ export const useSlashSkills = (opts: {
   const onKeyDown = useCallback(
     (e: KeyboardEvent): boolean => {
       if (!menuOpen) return false;
-      // IME 组合输入中（中文选词的 Enter / ↑↓）不归菜单——否则输入法候选操作被吞（审计 P1）
+      // IME 组合输入中（中文选词的 Enter / ↑↓）不归菜单——否则输入法候选操作被吞
       if ((e.nativeEvent as globalThis.KeyboardEvent).isComposing) return false;
       if (e.key === "ArrowDown") {
         e.preventDefault();

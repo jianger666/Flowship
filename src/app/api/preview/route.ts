@@ -44,7 +44,7 @@ export const POST = async (req: Request) => {
 
   const task = await getTask(taskId);
   if (!task) return errorResponse("task 不存在", 404);
-  // R29-3：finalize 清理窗内 / 终态任务拒起预览——finalize 会 stopPreviews 后
+  // finalize 清理窗内 / 终态任务拒起预览——finalize 会 stopPreviews 后
   // removeTaskWorktrees，此窗口起的新 dev server 会变成 cwd 已删的孤儿进程
   if (getChatLifecycle(taskId) !== null) {
     return errorResponse("任务正在停止/终结、暂不能起预览", 409);
@@ -81,7 +81,7 @@ export const POST = async (req: Request) => {
     workDir,
     command,
   });
-  // R29-3：队列内最终准入拒绝（finalize/DELETE 已完成）→ 409，无新 pid
+  // 队列内最终准入拒绝（finalize/DELETE 已完成）→ 409，无新 pid
   if (started.yielded) {
     return errorResponse(
       started.yieldReason ?? "任务已终结或正在停止、不能起预览",

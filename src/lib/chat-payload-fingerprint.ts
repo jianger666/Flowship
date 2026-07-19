@@ -1,5 +1,5 @@
 /**
- * R35-2 / R36：chat 消息 payload 指纹（client / server 唯一契约）
+ * chat 消息 payload 指纹（client / server 唯一契约）
  *
  * 算法：`JSON.stringify([text, imagePaths, attachmentPaths, skills])` → FNV-1a 短 hash。
  * 身份仲裁只认 itemId + fingerprint，文案不参与。
@@ -28,14 +28,14 @@ export const shortStableHash = (input: string): string => {
 };
 
 /**
- * R35-2：规范化 skills（固定键序），避免 JSON key 顺序漂移导致指纹不一致。
+ * 规范化 skills（固定键序），避免 JSON key 顺序漂移导致指纹不一致。
  */
 export const normalizeSkillsForFingerprint = (
   skills: readonly ChatSkillRef[],
 ): Array<{ name: string; absPath: string }> =>
   skills.map((s) => ({ name: s.name, absPath: s.absPath }));
 
-/** R35-2：与 server 对齐的 payload 指纹 */
+/** 与 server 对齐的 payload 指纹 */
 export const computeChatPayloadFingerprint = (
   input: ChatPayloadFingerprintInput,
 ): string => {
@@ -49,7 +49,7 @@ export const computeChatPayloadFingerprint = (
 };
 
 /**
- * R35-2：ImagePayload → imagePaths 键（发送前尚无落盘 path）。
+ * ImagePayload → imagePaths 键（发送前尚无落盘 path）。
  * 优先 filename；否则 mimeType + data 长度（不把整段 base64 打进指纹）。
  */
 export const imageKeysFromPayloads = (

@@ -18,7 +18,7 @@ import { writeEventAndPublish } from "./task-stream";
 /**
  * 作废 task 下「当前还没被回答的 ask_user_request」。
  *
- * @param lease R26-3：可选；getTask / 写作废事件用 lease 门控——接管发生在其 IO 内时
+ * @param lease 可选；getTask / 写作废事件用 lease 门控——接管发生在其 IO 内时
  *   旧 A 不再对新世界写作废标记。调用点本波可传 undefined（下一波接线）。
  * @returns 最近一条被作废的 ask 的 questions（供重启时断点续传）、没有则空数组。
  */
@@ -27,7 +27,7 @@ export const supersedePendingAsks = async (
   reason: string,
   lease?: () => boolean,
 ): Promise<AskUserQuestion[]> => {
-  // R26-3：入场前同步 gate——失主直接空返、不读盘不写事件
+  // 入场前同步 gate——失主直接空返、不读盘不写事件
   if (lease && !lease()) return [];
   const task = await getTask(taskId);
   if (!task) return [];
@@ -41,7 +41,7 @@ export const supersedePendingAsks = async (
     if (!askId) continue;
     // 已被回答 / 已被作废过的跳过（幂等：重复重启不重复写标记）
     if (isAskSettled(task.events, askId)) continue;
-    // R26-3：事件写走 appendEventIf（lease 进队内检查）；失主跳过本条及后续
+    // 事件写走 appendEventIf（lease 进队内检查）；失主跳过本条及后续
     const wrote = await writeEventAndPublish(
       taskId,
       {

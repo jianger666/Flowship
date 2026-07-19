@@ -80,7 +80,7 @@ export const GET = async (req: Request) => {
 
     // join 本地任务：feishuStoryUrl 抠出的 story id 精确等于工作项 id → 已有任务
     const tasks = await listTasks();
-    // R34-3：list helper 与 Response 之间可插入删除——提交前再 filter
+    // list helper 与 Response 之间可插入删除——提交前再 filter
     await failpoint("httpRead.afterHelper");
     const readableTasks = filterCommittedReads(tasks);
     const linked = items.map((it) => {

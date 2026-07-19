@@ -59,11 +59,11 @@ export type AwaitingSignal =
       actionId?: string;
     };
 
-/** R25-3：handler / notifier 内部 await 后复查 caller 是否仍是当前 bridge */
+/** handler / notifier 内部 await 后复查 caller 是否仍是当前 bridge */
 export type CallerValidityCtx = { callerStillValid: () => boolean };
 
 /**
- * R29-5：notifier 结构化结果——区分真受理 / scope 失效 / 副作用忙。
+ * notifier 结构化结果——区分真受理 / scope 失效 / 副作用忙。
  * - accepted：已启动 post-check / 已切 awaiting / ask 已落盘
  * - stale：非当前 running action / caller 失效等，工具不得报「已交卷」
  * - busy：waitAndClaimPostCheck 超时等，工具返回重试文案
@@ -128,14 +128,14 @@ interface ChatMcpGlobalState {
   awaitingNotifiers: Map<string, AwaitingNotifier>;
   taskActionHandlers: Map<string, ChatTaskActionHandler>;
   /**
-   * R24-6：taskId → 当前注册 bridge 期望的 caller token（agent 实例身份）。
+   * taskId → 当前注册 bridge 期望的 caller token（agent 实例身份）。
    * MCP 工具执行前核对请求携带的 caller；不匹配则拒副作用。
    */
   expectedCallerTokens: Map<string, string>;
   sessionTransports: Map<string, WebStandardStreamableHTTPServerTransport>;
 }
 
-// V14：2026-07-18 R24-6——加 expectedCallerTokens（MCP caller 身份）。
+// V14：2026-07-18——加 expectedCallerTokens（MCP caller 身份）。
 // V13：2026-07-07 V0.11 wait 协议退役——删 pendingMap / tokenToTask / waitingTasks /
 //      pendingNextActions / unansweredRevises / chatModeTasks / prematureWaitRejects、
 //      新增 pendingAsks（ask 弹窗登记）。bump 强制 dev hot reload 拿全新 state。
@@ -197,14 +197,14 @@ export const clearPendingAsk = (taskId: string): void => {
 
 /**
  * 停止 / 重启 / 删除 task 时调：清掉未答的 ask 登记（无条件）。
- * 失主让位反登记请用 {@link cancelPendingIf}——裸删会误清 B 刚登记的新提问（R26-3）。
+ * 失主让位反登记请用 {@link cancelPendingIf}——裸删会误清 B 刚登记的新提问。
  * @returns 是否真的清了（调用方据此决定要不要写「已作废」事件）
  */
 export const cancelPending = (taskId: string): boolean =>
   pendingAsks.delete(taskId);
 
 /**
- * R26-3：按 askId 条件反登记——当前 pendingAsk 的 askId 匹配才删。
+ * 按 askId 条件反登记——当前 pendingAsk 的 askId 匹配才删。
  * 线性化：同步比对 + delete、无 await；旧 A 失主后不得删掉 B 刚登记的新提问。
  * @returns true=删了自己的；false=不匹配 / 无 pending（不动）
  */
@@ -219,7 +219,7 @@ export const cancelPendingIf = (
 };
 
 /**
- * R26-4：同步失效 MCP bridge lease（只删 expectedCallerTokens）。
+ * 同步失效 MCP bridge lease（只删 expectedCallerTokens）。
  * stop 在首个 await 前调用——旧 agent 的 MCP 立即被 fail-closed 分派拒绝；
  * handler/notifier 表稍后由 cleanupChatTaskState 一并清。
  */
@@ -229,7 +229,7 @@ export const invalidateCallerToken = (taskId: string): void => {
 
 /**
  * 任务 stop / 清理进程级桥接态时调。
- * R29-6：不再清 seq counter——events.jsonl 仍在，counter 保持才单调；
+ * 不再清 seq counter——events.jsonl 仍在，counter 保持才单调；
  * 仅 deleteTask（文件真删）才 clearEventSeqCounter。
  */
 export const cleanupChatTaskState = (taskId: string): void => {
@@ -239,11 +239,11 @@ export const cleanupChatTaskState = (taskId: string): void => {
   expectedCallerTokens.delete(taskId);
 };
 
-/** R24-6：MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */
+/** MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */
 export const CALLER_MISMATCH_ERROR = "任务已被新 agent 接管、本次调用忽略";
 
 /**
- * R24-6：请求携带的 caller 是否匹配当前注册 bridge。
+ * 请求携带的 caller 是否匹配当前注册 bridge。
  * 无注册 / token 缺失 / 不匹配 → false（fail-closed）。
  */
 export const matchExpectedCallerToken = (
@@ -260,7 +260,7 @@ export const getExpectedCallerToken = (taskId: string): string | null =>
 
 /**
  * 注册 awaiting notifier。
- * @param callerToken R24-6：与 handler 共用的 agent 实例身份；同一次 installSessionIfCurrent 必传
+ * @param callerToken 与 handler 共用的 agent 实例身份；同一次 installSessionIfCurrent 必传
  */
 export const setChatAwaitingNotifier = (
   taskId: string,
@@ -281,7 +281,7 @@ export const setChatAwaitingNotifier = (
 
 /**
  * 注册 task action handler。
- * @param callerToken R24-6：与 notifier 共用的 agent 实例身份
+ * @param callerToken 与 notifier 共用的 agent 实例身份
  */
 export const setChatTaskActionHandler = (
   taskId: string,
@@ -326,14 +326,14 @@ export const unsetChatAwaitingNotifierIf = (
 
 /**
  * 跑 task-scoped action handler、序列化结果给 MCP 工具返。
- * @param callerToken R24-6：MCP session 的 caller；不匹配则拒、不进 handler（防 createMR 等副作用）
+ * @param callerToken MCP session 的 caller；不匹配则拒、不进 handler（防 createMR 等副作用）
  */
 export const runTaskAction = async (
   taskId: string,
   action: ChatTaskAction,
   callerToken?: string,
 ): Promise<ChatTaskActionResult> => {
-  // R24-6：分派层先核对身份——旧 agent 迟到请求不得借用新 bridge 闭包
+  // 分派层先核对身份——旧 agent 迟到请求不得借用新 bridge 闭包
   if (!matchExpectedCallerToken(taskId, callerToken)) {
     return { ok: false, error: CALLER_MISMATCH_ERROR };
   }
@@ -345,7 +345,7 @@ export const runTaskAction = async (
     };
   }
   try {
-    // R25-3：闭包贯穿 handler——每个外部 await 后、不可逆副作用前可复查
+    // 闭包贯穿 handler——每个外部 await 后、不可逆副作用前可复查
     const callerStillValid = (): boolean =>
       matchExpectedCallerToken(taskId, callerToken);
     return await handler(action, { callerStillValid });
@@ -355,7 +355,7 @@ export const runTaskAction = async (
   }
 };
 
-/** R29 / R29-5：submit_work 通知结果——工具层据此决定返回「已交卷」还是重试/失效文案 */
+/** submit_work 通知结果——工具层据此决定返回「已交卷」还是重试/失效文案 */
 export type NotifyAwaitingResult =
   | { status: "delivered" }
   | { status: "accepted" }
@@ -365,7 +365,7 @@ export type NotifyAwaitingResult =
   | { status: "no_notifier" }
   | { status: "error"; message: string };
 
-/** R29-5：busy 默认重试文案（与 waitAndClaimPostCheck timeout / claim 互斥对齐） */
+/** busy 默认重试文案（与 waitAndClaimPostCheck timeout / claim 互斥对齐） */
 const BUSY_RETRY_MESSAGE =
   "MR 提交仍在进行、稍后重试 submit_work";
 
@@ -373,7 +373,7 @@ export const safeNotifyAwaiting = async (
   taskId: string,
   opts: { actionId?: string; artifactPath?: string; callerToken?: string } = {},
 ): Promise<NotifyAwaitingResult> => {
-  // R24-6：submit_work 路径同样先核对——不匹配静默跳过（不启 postCheck）
+  // submit_work 路径同样先核对——不匹配静默跳过（不启 postCheck）
   if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
     console.warn(
       `[chat-mcp] safeNotifyAwaiting: caller 不匹配 task=${taskId}、忽略`,
@@ -388,7 +388,7 @@ export const safeNotifyAwaiting = async (
     return { status: "no_notifier" };
   }
   try {
-    // R25-3：notifier 内部 await 后仍须能复查 caller
+    // notifier 内部 await 后仍须能复查 caller
     const callerStillValid = (): boolean =>
       matchExpectedCallerToken(taskId, opts.callerToken);
     const outcome = await notifier(
@@ -399,11 +399,11 @@ export const safeNotifyAwaiting = async (
       },
       { callerStillValid },
     );
-    // R29-2A-P2：返回前复查 token——失效不能当 delivered
+    // 返回前复查 token——失效不能当 delivered
     if (!matchExpectedCallerToken(taskId, opts.callerToken)) {
       return { status: "mismatch" };
     }
-    // R29-5：透传 notifier 结构化结果
+    // 透传 notifier 结构化结果
     if (outcome === "stale") return { status: "stale" };
     if (outcome === "busy") {
       return { status: "busy", message: BUSY_RETRY_MESSAGE };
@@ -422,7 +422,7 @@ export const safeNotifyAwaiting = async (
 
 /**
  * 通知 runner 落 ask_user_request。
- * R30-5：透传 notifier 的 accepted | stale | busy（不再 await 后无条件 true）。
+ * 透传 notifier 的 accepted | stale | busy（不再 await 后无条件 true）。
  * mismatch / no_notifier / error 与 safeNotifyAwaiting 同形——工具层只有 accepted 才报 ASK_SUBMITTED。
  */
 export const safeNotifyAskUserRequest = async (
@@ -435,7 +435,7 @@ export const safeNotifyAskUserRequest = async (
     callerToken?: string;
   },
 ): Promise<NotifyAwaitingResult> => {
-  // R24-6：ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
+  // ask 通知同样核对（登记 pendingAsk 已在工具层先挡）
   if (!matchExpectedCallerToken(taskId, args.callerToken)) {
     console.warn(
       `[chat-mcp] safeNotifyAskUserRequest: caller 不匹配 task=${taskId}、忽略`,
@@ -462,7 +462,7 @@ export const safeNotifyAskUserRequest = async (
       },
       { callerStillValid },
     );
-    // R30-5：先透传 notifier 的 stale/busy（失主路径 notifier 已 cancelPendingIf）——
+    // 先透传 notifier 的 stale/busy（失主路径 notifier 已 cancelPendingIf）——
     // 不能用事后 token 复查盖成 mismatch，否则工具层分不清「受理后失主」与入口拒
     if (outcome === "stale") return { status: "stale" };
     if (outcome === "busy") {

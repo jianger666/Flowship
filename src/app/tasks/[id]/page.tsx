@@ -165,7 +165,7 @@ const TaskDetailPage = () => {
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
 
-  // R35-5 / R37-3：统一 terminal sink——SSE task_deleted / watch 410 / 已 hydrate 的 404
+  // 统一 terminal sink——SSE task_deleted / watch 410 / 已 hydrate 的 404
   // 只调 commitTaskDeleted（503 unavailable 不进此 sink）
   // （列表 epoch / sticky 由 coordinator 通知；本页清 state；chat pending 由 ChatView 先清）
   const handleTaskDeleted = useCallback((deletedId: string) => {
@@ -188,7 +188,7 @@ const TaskDetailPage = () => {
   // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
   // 审查发现快切竞态：丢弃 payload.id !== 当前路由 id 的迟到数据（守卫在组件层，
   // mergeTaskEvents 在 prev.id!==next.id 时 return next，不能靠它挡串任务）
-  // R35-5：sticky deleted → 丢弃迟到 detail / chat mutation 200，禁止复活
+  // sticky deleted → 丢弃迟到 detail / chat mutation 200，禁止复活
   const absorbTask = useCallback((next: Task | null) => {
     if (!next) {
       setTask(null);
@@ -237,7 +237,7 @@ const TaskDetailPage = () => {
   //  2) 让 useTaskList「知道」有任务在跑 → 触发它的条件轮询去刷后台其它任务
   // 仅依赖影响侧栏展示 / 轮询触发的关键字段、不随 events 高频 setState 全列表重渲染
   useEffect(() => {
-    // R35-5：deleted terminal 后不得把侧栏回灌
+    // deleted terminal 后不得把侧栏回灌
     if (task && canCommitTaskSnapshot(task.id)) upsertTask(task);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -1073,7 +1073,7 @@ const TaskDetailPage = () => {
         submitting={starting}
       />
 
-      {/* V0.6.6 编辑任务 dialog；onSaved 走 absorbTask（发版前蓝军 P1：直接 setTask 会被
+      {/* V0.6.6 编辑任务 dialog；onSaved 走 absorbTask（直接 setTask 会被
           PATCH 响应的全量 events 冲掉已分页历史、懒加载契约打穿） */}
       <EditTaskDialog
         open={editDialogOpen}

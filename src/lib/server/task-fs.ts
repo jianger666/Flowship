@@ -6,19 +6,19 @@
  *   data/
  *     tasks/
  *       <taskId>/
- *         meta.json          ← 任务元信息、含 actions[] / mrs[] / gitBranches[]
- *         events.jsonl       ← 事件流、每行一条 JSON、追加写
- *         actions/           ← 每条 action 一个 artifact
+ *         meta.json ← 任务元信息、含 actions[] / mrs[] / gitBranches[]
+ *         events.jsonl ← 事件流、每行一条 JSON、追加写
+ *         actions/ ← 每条 action 一个 artifact
  *           1-plan.md
  *           2-build.md
  *           3-review.md
  *           4-ship.md
- *           5-build.md       ← 测试报 bug 后再次 build
+ *           5-build.md ← 测试报 bug 后再次 build
  *           ...
- *           .revisions/      ← V0.5.12 「再聊聊」前的 snapshot、V0.6 按 actionId 分目录
+ *           .revisions/ ← V0.5.12 「再聊聊」前的 snapshot、V0.6 按 actionId 分目录
  *             act_2/
- *               2026-05-25T05-44-39-123Z.md
- *         uploads/           ← 用户粘贴 / 拖的图片
+ *               2026-05-25.md
+ *         uploads/ ← 用户粘贴 / 拖的图片
  *           att_xxx.png
  *
  * V0.5 → V0.6 关键变化（不写 migration、老数据直接清空）：
@@ -110,7 +110,7 @@ import {
 } from "./task-fs-core";
 import { failpoint } from "./failpoints";
 
-/** R24-5b：终态 task 上任何旧链的 action/runStatus 条件写都非法（finalize 走裸 set） */
+/** 终态 task 上任何旧链的 action/runStatus 条件写都非法（finalize 走裸 set） */
 const isTerminalRepoStatus = (repoStatus: RepoStatus): boolean =>
   repoStatus === "merged" || repoStatus === "abandoned";
 
@@ -165,11 +165,11 @@ const inferContextDocType = (content: string): TaskContextDocType => {
 const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
 
 /**
- * R32-6 / R33-5：deletion journal 目录（taskDir 外）。
+ * deletion journal 目录（taskDir 外）。
  * tombstone 在 taskDir 内，rm 后会丢——refs 清单必须落盘在 dataRoot 下独立目录，
  * 崩溃任意点重启都能按 journal 完成遗留清理。
  *
- * R33-5 状态机（崩溃最终一致、每阶段可重入）：
+ * 状态机（崩溃最终一致、每阶段可重入）：
  * 1. 写 journal phase=prepared（含 checkpointRefs）
  * 2. tombstone rename 成功 / 快速路径进入不可逆前 → 原子推进 phase=committed
  * 3. 清 refs（失败项写回 refsPending，不删 journal）
@@ -186,7 +186,7 @@ export const getDeletionJournalPath = (taskId: string): string =>
   path.join(getDeletionJournalDir(), `${taskId}.json`);
 
 /**
- * R35-4：删除证据三态读——只有明确 ENOENT 才是 absent。
+ * 删除证据三态读——只有明确 ENOENT 才是 absent。
  * JSON 损坏 / EACCES / EBUSY / EIO → unknown（fail-closed，禁止当「不存在」）。
  */
 export type DeletionEvidenceRead<T> =
@@ -194,14 +194,14 @@ export type DeletionEvidenceRead<T> =
   | { kind: "present"; value: T }
   | { kind: "unknown"; error: unknown };
 
-/** R35-3：journal 是否已有可前滚的完整恢复描述（非空 repoPaths 或确认零仓） */
+/** journal 是否已有可前滚的完整恢复描述（非空 repoPaths 或确认零仓） */
 export const hasDurableDeleteDescriptor = (
   manifest: CheckpointRefManifest,
 ): boolean =>
   (manifest.repoPaths?.length ?? 0) > 0 || manifest.confirmedEmpty === true;
 
 /**
- * R35-4 测试注入：在真实 I/O 前抛错，模拟 journal/tombstone 的 EACCES/EIO。
+ * 测试注入：在真实 I/O 前抛错，模拟 journal/tombstone 的 EACCES/EIO。
  * 生产路径保持 null、零开销。
  */
 type DeletionEvidenceReadOp =
@@ -223,7 +223,7 @@ const isEnoent = (err: unknown): boolean =>
   (err as NodeJS.ErrnoException)?.code === "ENOENT";
 
 /**
- * R36-9：deletion journal 完整 runtime schema——不用 TS cast 代替磁盘校验。
+ * deletion journal 完整 runtime schema——不用 TS cast 代替磁盘校验。
  * phase ∈ {prepared,committed}；checkpointRefs 元素须有 repoPath+refs[]；
  * repoPaths 须字符串数组；manifestPending/confirmedEmpty 类型正确。
  * 任何未知 phase / 字段形状 → null（调用方返 unknown、fail-closed）。
@@ -249,7 +249,7 @@ const parseDeletionJournalValue = (
   if (!Array.isArray(o.checkpointRefs) || !o.checkpointRefs.every(isJournalRefEntry)) {
     return null;
   }
-  // R36-9：phase 必须显式且合法——缺省 / typo（commited）一律非法
+  // phase 必须显式且合法——缺省 / typo（commited）一律非法
   if (o.phase !== "prepared" && o.phase !== "committed") return null;
   if (
     o.manifestPending !== undefined &&
@@ -295,7 +295,7 @@ const parseDeletionJournalValue = (
   };
 };
 
-/** R35-4 / R36-9：异步读 deletion journal（三态 + 完整 schema） */
+/** 异步读 deletion journal（三态 + 完整 schema） */
 export const readDeletionJournal = async (
   taskId: string,
 ): Promise<DeletionEvidenceRead<CheckpointRefManifest>> => {
@@ -308,7 +308,7 @@ export const readDeletionJournal = async (
       parsed = JSON.parse(raw);
     } catch (err) {
       console.error(
-        `[task-fs] R36-9 读 deletion journal JSON 损坏 id=${taskId}`,
+        `[task-fs] 读 deletion journal JSON 损坏 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
@@ -317,7 +317,7 @@ export const readDeletionJournal = async (
     if (!value) {
       const err = new Error("invalid deletion journal schema");
       console.error(
-        `[task-fs] R36-9 读 deletion journal schema 非法 id=${taskId}`,
+        `[task-fs] 读 deletion journal schema 非法 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
@@ -326,14 +326,14 @@ export const readDeletionJournal = async (
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
-      `[task-fs] R35-4 读 deletion journal 未知错误 id=${taskId}`,
+      `[task-fs] 读 deletion journal 未知错误 id=${taskId}`,
       err,
     );
     return { kind: "unknown", error: err };
   }
 };
 
-/** R35-4 / R36-9：同步读 deletion journal（三态 + 完整 schema；HTTP 读闸用） */
+/** 同步读 deletion journal（三态 + 完整 schema；HTTP 读闸用） */
 const readDeletionJournalSync = (
   taskId: string,
 ): DeletionEvidenceRead<CheckpointRefManifest> => {
@@ -347,7 +347,7 @@ const readDeletionJournalSync = (
       parsed = JSON.parse(raw);
     } catch (err) {
       console.error(
-        `[task-fs] R36-9 sync 读 journal JSON 损坏 id=${taskId}`,
+        `[task-fs] sync 读 journal JSON 损坏 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
@@ -356,7 +356,7 @@ const readDeletionJournalSync = (
     if (!value) {
       const err = new Error("invalid deletion journal schema");
       console.error(
-        `[task-fs] R36-9 sync 读 journal schema 非法 id=${taskId}`,
+        `[task-fs] sync 读 journal schema 非法 id=${taskId}`,
         err,
       );
       return { kind: "unknown", error: err };
@@ -365,14 +365,14 @@ const readDeletionJournalSync = (
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
-      `[task-fs] R35-4 sync 读 journal 未知错误 id=${taskId}`,
+      `[task-fs] sync 读 journal 未知错误 id=${taskId}`,
       err,
     );
     return { kind: "unknown", error: err };
   }
 };
 
-/** R35-4：异步探针 tombstone（三态；仅 ENOENT → absent） */
+/** 异步探针 tombstone（三态；仅 ENOENT → absent） */
 export const probeDeleteTombstone = async (
   taskId: string,
 ): Promise<DeletionEvidenceRead<true>> => {
@@ -384,14 +384,14 @@ export const probeDeleteTombstone = async (
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
-      `[task-fs] R35-4 tombstone access 未知错误 id=${taskId}`,
+      `[task-fs] tombstone access 未知错误 id=${taskId}`,
       err,
     );
     return { kind: "unknown", error: err };
   }
 };
 
-/** R35-4：同步探针 tombstone（三态） */
+/** 同步探针 tombstone（三态） */
 const probeDeleteTombstoneSync = (
   taskId: string,
 ): DeletionEvidenceRead<true> => {
@@ -403,7 +403,7 @@ const probeDeleteTombstoneSync = (
   } catch (err) {
     if (isEnoent(err)) return { kind: "absent" };
     console.error(
-      `[task-fs] R35-4 sync tombstone access 未知错误 id=${taskId}`,
+      `[task-fs] sync tombstone access 未知错误 id=${taskId}`,
       err,
     );
     return { kind: "unknown", error: err };
@@ -411,7 +411,7 @@ const probeDeleteTombstoneSync = (
 };
 
 /**
- * R32-6 / R33-5 / R34-x：原子写 deletion journal（同目录 tmp+rename）。
+ * 原子写 deletion journal（同目录 tmp+rename）。
  * 须在写 tombstone / 清 refs / rm taskDir 之前调用；默认 phase=prepared。
  */
 export const writeDeletionJournal = async (
@@ -429,23 +429,23 @@ export const writeDeletionJournal = async (
   const body = JSON.stringify({
     deletedAt: manifest.deletedAt,
     checkpointRefs: manifest.checkpointRefs,
-    // R33-5：缺省 prepared——未显式 commit 前 boot 不得执行删除
+    // 缺省 prepared——未显式 commit 前 boot 不得执行删除
     phase,
     ...(manifest.refsPending && manifest.refsPending.length > 0
       ? { refsPending: manifest.refsPending }
       : {}),
-    // R34-7：清单未确认 / 仓路径快照——boot 前滚重建用
+    // 清单未确认 / 仓路径快照——boot 前滚重建用
     ...(manifest.manifestPending ? { manifestPending: true } : {}),
-    // R35-3：完整描述须在 commit 前持久化；非空才写入（空 = unknown）
+    // 完整描述须在 commit 前持久化；非空才写入（空 = unknown）
     ...(manifest.repoPaths && manifest.repoPaths.length > 0
       ? { repoPaths: manifest.repoPaths }
       : {}),
-    // R35-3：构建成功确认的零仓——与「空未知」区分
+    // 构建成功确认的零仓——与「空未知」区分
     ...(manifest.confirmedEmpty ? { confirmedEmpty: true } : {}),
   });
   await fs.writeFile(tmpPath, body, "utf-8");
   try {
-    // R34-2 测试：prepared / committed 写失败可分别注入
+    // 测试：prepared / committed 写失败可分别注入
     await failpoint(
       phase === "committed"
         ? "deletionJournal.commit.beforeRename"
@@ -459,20 +459,20 @@ export const writeDeletionJournal = async (
 };
 
 /**
- * R33-5：原子推进 journal → committed（重写文件、tmp+rename）。
+ * 原子推进 journal → committed（重写文件、tmp+rename）。
  * 快速物理删路径须在进入不可逆 refs/rm 之前调用。
  */
 export const commitDeletionJournal = async (taskId: string): Promise<void> => {
   const journal = await readDeletionJournal(taskId);
   if (journal.kind === "absent") {
     throw new Error(
-      `[task-fs] R33-5 commitDeletionJournal: journal 不存在 id=${taskId}`,
+      `[task-fs] commitDeletionJournal: journal 不存在 id=${taskId}`,
     );
   }
-  // R35-4：unknown 禁止覆盖推进
+  // unknown 禁止覆盖推进
   if (journal.kind === "unknown") {
     throw new Error(
-      `[task-fs] R35-4 commitDeletionJournal: journal 读未知 id=${taskId}`,
+      `[task-fs] commitDeletionJournal: journal 读未知 id=${taskId}`,
     );
   }
   await writeDeletionJournal(taskId, {
@@ -481,45 +481,45 @@ export const commitDeletionJournal = async (taskId: string): Promise<void> => {
   });
 };
 
-/** R32-6：物理删 + refs 全确认后移除 journal（幂等） */
+/** 物理删 + refs 全确认后移除 journal（幂等） */
 export const removeDeletionJournal = async (taskId: string): Promise<void> => {
   await fs.unlink(getDeletionJournalPath(taskId)).catch(() => {});
 };
 
 /**
- * R33-5 / R34-1：回滚未提交的删除意图——**只许删 prepared**。
+ * 回滚未提交的删除意图——**只许删 prepared**。
  * committed journal 或 tombstone 任一证据在 → 保留、只前滚；绝不能因 taskDir 仍在就清掉 committed。
  */
 export const rollbackDeletionJournalIfTaskDirRemains = async (
   taskId: string,
 ): Promise<void> => {
   if (!(await exists(taskDir(taskId)))) return;
-  // R34-2 / R35-4：tombstone 三态——unknown 禁止回滚（可能已提交）
+  // tombstone 三态——unknown 禁止回滚（可能已提交）
   const tomb = await probeDeleteTombstone(taskId);
   if (tomb.kind === "unknown") {
     console.error(
-      `[task-fs] R35-4 rollback: tombstone 读未知、跳过回滚 id=${taskId}`,
+      `[task-fs] rollback: tombstone 读未知、跳过回滚 id=${taskId}`,
       tomb.error,
     );
     return;
   }
   if (tomb.kind === "present") return;
   const journal = await readDeletionJournal(taskId);
-  // R35-4：unknown → 不删 journal（可能已 committed）
+  // unknown → 不删 journal（可能已 committed）
   if (journal.kind === "unknown") {
     console.error(
-      `[task-fs] R35-4 rollback: journal 读未知、跳过回滚 id=${taskId}`,
+      `[task-fs] rollback: journal 读未知、跳过回滚 id=${taskId}`,
       journal.error,
     );
     return;
   }
-  // R34-1：phase 单调——committed 永不回滚；absent 无事可做
+  // phase 单调——committed 永不回滚；absent 无事可做
   if (journal.kind === "absent" || journal.value.phase === "committed") return;
   await removeDeletionJournal(taskId);
 };
 
 /**
- * R32-6 / R33-6 / R34-7：按 journal（优先）或 rewind_points 清 checkpoint refs，再 rm taskDir；
+ * 按 journal（优先）或 rewind_points 清 checkpoint refs，再 rm taskDir；
  * refs 未全成功 / manifestPending → 写回 pending 并保留 journal（只前滚）。
  * boot recovery / DELETE 后台共用——任意崩溃点重启后重入仍最终一致。
  */
@@ -527,10 +527,10 @@ export const recoverDeletedTaskArtifacts = async (
   taskId: string,
 ): Promise<void> => {
   const journalRead = await readDeletionJournal(taskId);
-  // R35-4：journal 读未知 → 本轮跳过，下次重试（不误删不误放）
+  // journal 读未知 → 本轮跳过，下次重试（不误删不误放）
   if (journalRead.kind === "unknown") {
     console.error(
-      `[task-fs] R35-4 recover: journal 读未知、本轮跳过 id=${taskId}`,
+      `[task-fs] recover: journal 读未知、本轮跳过 id=${taskId}`,
       journalRead.error,
     );
     return;
@@ -539,7 +539,7 @@ export const recoverDeletedTaskArtifacts = async (
     journalRead.kind === "present" ? journalRead.value : null;
   let refsAllOk = true;
 
-  // R34-7 / R35-3：清单未确认 → 先重建；无完整描述则停 pending，绝不 ok-empty
+  // 清单未确认 → 先重建；无完整描述则停 pending，绝不 ok-empty
   if (journal?.manifestPending) {
     const rebuilt = await resolveCheckpointRefManifestForDelete(
       taskId,
@@ -547,15 +547,15 @@ export const recoverDeletedTaskArtifacts = async (
     );
     if (!rebuilt.ok) {
       console.error(
-        `[task-fs] R35-3 recover: manifest 仍 unknown/失败、继续 pending id=${taskId}: ${rebuilt.error}`,
+        `[task-fs] recover: manifest 仍 unknown/失败、继续 pending id=${taskId}: ${rebuilt.error}`,
       );
       // taskDir 若仍在则保留（meta/rewind 恢复源）；已 rm 则靠 journal.repoPaths
       return;
     }
-    // R35-3：重建结果必须带完整描述（非空 repoPaths 或 confirmedEmpty）
+    // 重建结果必须带完整描述（非空 repoPaths 或 confirmedEmpty）
     if (!hasDurableDeleteDescriptor(rebuilt.manifest)) {
       console.error(
-        `[task-fs] R35-3 recover: 重建结果无完整描述、继续 pending id=${taskId}`,
+        `[task-fs] recover: 重建结果无完整描述、继续 pending id=${taskId}`,
       );
       return;
     }
@@ -575,7 +575,7 @@ export const recoverDeletedTaskArtifacts = async (
       const result = await cleanupCheckpointRefsFromManifest(taskId, journal);
       refsAllOk = result.allSucceeded;
       if (!result.allSucceeded) {
-        // R33-6：失败项写回 journal，禁止 catch 后假成功删清单
+        // 失败项写回 journal，禁止 catch 后假成功删清单
         await writeDeletionJournal(taskId, {
           ...journal,
           phase: "committed",
@@ -585,7 +585,7 @@ export const recoverDeletedTaskArtifacts = async (
     } catch (err) {
       refsAllOk = false;
       console.warn(
-        `[task-fs] R33-6 recover: journal 清 refs 失败 id=${taskId}`,
+        `[task-fs] recover: journal 清 refs 失败 id=${taskId}`,
         err,
       );
     }
@@ -594,7 +594,7 @@ export const recoverDeletedTaskArtifacts = async (
     try {
       const result = await cleanupCheckpointRefsForTask(taskId);
       refsAllOk = result.allSucceeded;
-      // R34-2：tombstone 在而 journal 缺——清 refs 失败也不得「假装完成」
+      // tombstone 在而 journal 缺——清 refs 失败也不得「假装完成」
       if (!result.allSucceeded) {
         const meta = await readMetaV06(taskId).catch(() => null);
         await writeDeletionJournal(taskId, {
@@ -608,7 +608,7 @@ export const recoverDeletedTaskArtifacts = async (
     } catch (err) {
       refsAllOk = false;
       console.warn(
-        `[task-fs] R32-6 recover: rewind_points 清 refs 失败 id=${taskId}`,
+        `[task-fs] recover: rewind_points 清 refs 失败 id=${taskId}`,
         err,
       );
     }
@@ -622,12 +622,12 @@ export const recoverDeletedTaskArtifacts = async (
       retryDelay: 100,
     });
   }
-  // R33-6 / R34-7：refs 未全确认或 manifest 未确认 → 保留 journal 供二次 boot 重试
+  // refs 未全确认或 manifest 未确认 → 保留 journal 供二次 boot 重试
   if (refsAllOk) {
     const still = await readDeletionJournal(taskId);
     if (still.kind === "unknown") {
       console.error(
-        `[task-fs] R35-4 recover: 收尾读 journal 未知、保留 id=${taskId}`,
+        `[task-fs] recover: 收尾读 journal 未知、保留 id=${taskId}`,
         still.error,
       );
       return;
@@ -639,7 +639,7 @@ export const recoverDeletedTaskArtifacts = async (
 };
 
 /**
- * R32-6 / R33-5 / R34-2：扫 deletion-journal/——执行 committed；
+ * 扫 deletion-journal/——执行 committed；
  * prepared + 无 tombstone → 丢弃；prepared + tombstone 在 → 按 committed 前滚（tombstone rename 即提交点）。
  */
 const recoverDeletionJournals = async (): Promise<void> => {
@@ -652,16 +652,16 @@ const recoverDeletionJournals = async (): Promise<void> => {
       .map((e) => e.name.replace(/\.json$/, ""));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
-    console.warn("[task-fs] R32-6 journal 清扫: 读目录失败", err);
+    console.warn("[task-fs] journal 清扫: 读目录失败", err);
     return;
   }
   for (const taskId of names) {
     try {
       const journalRead = await readDeletionJournal(taskId);
-      // R35-4：unknown → 本轮跳过该 task，下次重试
+      // unknown → 本轮跳过该 task，下次重试
       if (journalRead.kind === "unknown") {
         console.error(
-          `[task-fs] R35-4 journal 清扫: 读未知、本轮跳过 id=${taskId}`,
+          `[task-fs] journal 清扫: 读未知、本轮跳过 id=${taskId}`,
           journalRead.error,
         );
         continue;
@@ -672,22 +672,22 @@ const recoverDeletionJournals = async (): Promise<void> => {
         const tomb = await probeDeleteTombstone(taskId);
         if (tomb.kind === "unknown") {
           console.error(
-            `[task-fs] R35-4 journal 清扫: tombstone 读未知、本轮跳过 id=${taskId}`,
+            `[task-fs] journal 清扫: tombstone 读未知、本轮跳过 id=${taskId}`,
             tomb.error,
           );
           continue;
         }
         if (tomb.kind === "present") {
-          // R34-2：tombstone rename 即提交点——journal 仍 prepared / 缺 committed 补写 → 前滚
+          // tombstone rename 即提交点——journal 仍 prepared / 缺 committed 补写 → 前滚
           console.warn(
-            `[task-fs] R34-2 prepared journal + tombstone → 按 committed 前滚 id=${taskId}`,
+            `[task-fs] prepared journal + tombstone → 按 committed 前滚 id=${taskId}`,
           );
           journal = { ...journal, phase: "committed" };
           await writeDeletionJournal(taskId, journal);
         } else {
-          // R33-5：prepared 且无 tombstone = 删除从未提交——丢弃 journal，任务保留
+          // prepared 且无 tombstone = 删除从未提交——丢弃 journal，任务保留
           console.warn(
-            `[task-fs] R33-5 prepared journal 未提交、丢弃 id=${taskId}`,
+            `[task-fs] prepared journal 未提交、丢弃 id=${taskId}`,
           );
           await removeDeletionJournal(taskId);
           continue;
@@ -697,19 +697,19 @@ const recoverDeletionJournals = async (): Promise<void> => {
       const still = await readDeletionJournal(taskId);
       if (still.kind === "unknown") {
         console.error(
-          `[task-fs] R35-4 journal 清扫: 收尾读未知 id=${taskId}`,
+          `[task-fs] journal 清扫: 收尾读未知 id=${taskId}`,
           still.error,
         );
       } else if (still.kind === "present") {
         console.warn(
-          `[task-fs] R33-6 journal 清扫: refs/manifest 仍 pending、下次再试 id=${taskId}`,
+          `[task-fs] journal 清扫: refs/manifest 仍 pending、下次再试 id=${taskId}`,
         );
       } else {
-        console.log(`[task-fs] R32-6 journal 清扫: 已完成 id=${taskId}`);
+        console.log(`[task-fs] journal 清扫: 已完成 id=${taskId}`);
       }
     } catch (err) {
       console.warn(
-        `[task-fs] R32-6 journal 清扫失败（下次启动再试）id=${taskId}`,
+        `[task-fs] journal 清扫失败（下次启动再试）id=${taskId}`,
         err,
       );
     }
@@ -719,11 +719,11 @@ const recoverDeletionJournals = async (): Promise<void> => {
 /**
  * 清扫 deleteTask 降级留下的 tombstone 目录。
  * 只删带 `.deleted-tombstone` 的——tasks 下 bench/fixture 等手工目录绝不能误删。
- * R32-6：rm 前先清 checkpoint refs（journal 优先，否则 rewind_points）。
+ * rm 前先清 checkpoint refs（journal 优先，否则 rewind_points）。
  * 重启后句柄通常已释放，fs.rm 多数能成功；失败 warn 留给下次启动。
  */
 const cleanupTombstonedTaskDirs = async (): Promise<void> => {
-  // R32-6：先扫 taskDir 外的 journal（覆盖「tombstone 已写、refs 未清、进程退出」）
+  // 先扫 taskDir 外的 journal（覆盖「tombstone 已写、refs 未清、进程退出」）
   await recoverDeletionJournals();
 
   let ids: string[];
@@ -736,10 +736,10 @@ const cleanupTombstonedTaskDirs = async (): Promise<void> => {
   }
   for (const name of ids) {
     const tomb = await probeDeleteTombstone(name);
-    // R35-4：unknown → 跳过本轮（不误删）
+    // unknown → 跳过本轮（不误删）
     if (tomb.kind === "unknown") {
       console.error(
-        `[task-fs] R35-4 tombstone 清扫: access 未知、本轮跳过 id=${name}`,
+        `[task-fs] tombstone 清扫: access 未知、本轮跳过 id=${name}`,
         tomb.error,
       );
       continue;
@@ -871,7 +871,7 @@ const ensureBootRecovery = async (): Promise<void> => {
 // ----------------- 公开 API：list / get / create / delete -----------------
 
 /**
- * R36-7：TaskVisibility——DeleteEvidence 与对外可见性分离。
+ * TaskVisibility——DeleteEvidence 与对外可见性分离。
  * - deleted：committed journal / tombstone present（不可逆终态）
  * - unavailable：证据 unknown（EACCES/EIO/schema 非法）或 meta 读未知
  * - readable：删除证据明确非终态，且 meta 非 unknown
@@ -883,7 +883,7 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
   const tomb = probeDeleteTombstoneSync(taskId);
   if (tomb.kind === "unknown") {
     console.error(
-      `[task-fs] R36-7 getTaskVisibility: tombstone 未知 → unavailable id=${taskId}`,
+      `[task-fs] getTaskVisibility: tombstone 未知 → unavailable id=${taskId}`,
       tomb.error,
     );
     return "unavailable";
@@ -893,7 +893,7 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
   const journal = readDeletionJournalSync(taskId);
   if (journal.kind === "unknown") {
     console.error(
-      `[task-fs] R36-7 getTaskVisibility: journal 未知 → unavailable id=${taskId}`,
+      `[task-fs] getTaskVisibility: journal 未知 → unavailable id=${taskId}`,
       journal.error,
     );
     return "unavailable";
@@ -902,11 +902,11 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
     return "deleted";
   }
 
-  // R36-7：删除证据 absent（或 prepared）时，meta unknown → unavailable（临时 I/O / schema）
+  // 删除证据 absent（或 prepared）时，meta unknown → unavailable（临时 I/O / schema）
   const meta = readMetaV06EvidenceSync(taskId);
   if (meta.kind === "unknown") {
     console.error(
-      `[task-fs] R36-7 getTaskVisibility: meta 未知 → unavailable id=${taskId}`,
+      `[task-fs] getTaskVisibility: meta 未知 → unavailable id=${taskId}`,
       meta.error,
     );
     return "unavailable";
@@ -915,19 +915,19 @@ export const getTaskVisibility = (taskId: string): TaskVisibility => {
 };
 
 /**
- * R33-4 / R35-4 / R36-7：统一读提交闸（同步）——visibility !== readable 即隐藏。
+ * 统一读提交闸（同步）——visibility !== readable 即隐藏。
  * list / get-tail / events / watch bootstrap 在最后一个 await 后、返回前调用。
  */
 export const assertTaskReadable = (taskId: string): boolean =>
   getTaskVisibility(taskId) === "readable";
 
-/** R33-4：list 循环结束后最终过滤（防 A push 后 await B 期间 A 被删仍回灌） */
+/** list 循环结束后最终过滤（防 A push 后 await B 期间 A 被删仍回灌） */
 export const filterCommittedReads = <T extends { id: string }>(
   items: T[],
 ): T[] => items.filter((item) => assertTaskReadable(item.id));
 
 /**
- * R36-7：按 TaskVisibility 映射 HTTP——deleted→410、unavailable→503、其余 not_found→404。
+ * 按 TaskVisibility 映射 HTTP——deleted→410、unavailable→503、其余 not_found→404。
  */
 export const taskVisibilityErrorResponse = (taskId: string): NextResponse => {
   const v = getTaskVisibility(taskId);
@@ -944,7 +944,7 @@ export const taskVisibilityErrorResponse = (taskId: string): NextResponse => {
 };
 
 /**
- * R34-3 / R36-7：HTTP 提交点同步可读性复查——async helper 返回后、NextResponse.json 之前调用。
+ * HTTP 提交点同步可读性复查——async helper 返回后、NextResponse.json 之前调用。
  * helper 内 guard 是防御层；此处才是对外线性化点（防 helper resolve → route continuation 空隙）。
  */
 export const commitReadableTaskResponse = (
@@ -959,8 +959,8 @@ export const commitReadableTaskResponse = (
 };
 
 /**
- * R36-8：taskDir 存在性三态——仅明确 ENOENT 为 absent。
- * 目录在即 present（即使 meta 损坏/unknown——R36-6 仍须进事务并 keep pending）。
+ * taskDir 存在性三态——仅明确 ENOENT 为 absent。
+ * 目录在即 present（即使 meta 损坏/unknown——仍须进事务并 keep pending）。
  * meta 可读性由 prepareDeleteManifest / buildCheckpointRefManifest 三态处理。
  */
 export const probeTaskDurablePresence = async (
@@ -972,7 +972,7 @@ export const probeTaskDurablePresence = async (
   } catch (err) {
     if (isEnoent(err)) return "absent";
     console.error(
-      `[task-fs] R36-8 probeTaskDurablePresence: taskDir 未知 id=${taskId}`,
+      `[task-fs] probeTaskDurablePresence: taskDir 未知 id=${taskId}`,
       err,
     );
     return "unknown";
@@ -980,7 +980,7 @@ export const probeTaskDurablePresence = async (
 };
 
 /**
- * R34-3：list / board 最终数组在 Response 前再 filter 一次（同步、无 await）。
+ * list / board 最终数组在 Response 前再 filter 一次（同步、无 await）。
  */
 export const commitReadableTaskListResponse = <T extends { id: string }>(
   items: T[],
@@ -1004,7 +1004,7 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
       console.warn(`[task-fs] listTasks: 读 meta 失败 id=${id}`, err);
       continue;
     }
-    // R32-5：读 meta 后可挂起——矩阵在此注入 tombstone，验证 push 前复查生效
+    // 读 meta 后可挂起——矩阵在此注入 tombstone，验证 push 前复查生效
     await failpoint("listTasks.afterReadMeta");
     if (!raw) continue;
     if (!isValidMetaShape(raw)) {
@@ -1013,17 +1013,17 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
     }
 
     const summary = hydrateTaskSummary(raw);
-    // R32-5：push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
+    // push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
     if (!assertTaskReadable(id)) continue;
     summaries.push(summary);
   }
-  // R33-4：循环结束后最终过滤——A 已 push 后仍可能 await B/C，期间 A 被删须剔除
+  // 循环结束后最终过滤——A 已 push 后仍可能 await B/C，期间 A 被删须剔除
   return filterCommittedReads(summaries);
 };
 
 /**
  * tombstone 存在 → 视为已删（与 listTasks 一致）。
- * R35-4：仅 present 为 true；unknown/absent 均为 false（调用方若需 fail-closed 请用 probeDeleteTombstone）。
+ * 仅 present 为 true；unknown/absent 均为 false（调用方若需 fail-closed 请用 probeDeleteTombstone）。
  */
 export const isTaskTombstoned = async (id: string): Promise<boolean> => {
   const r = await probeDeleteTombstone(id);
@@ -1031,7 +1031,7 @@ export const isTaskTombstoned = async (id: string): Promise<boolean> => {
 };
 
 /**
- * R31-3 / R32-6 / R33-5 / R34-2 / R35-4：durable logical delete——
+ * durable logical delete——
  * 1) 先写 taskDir 外 deletion journal phase=prepared（**失败则中止、不写 tombstone**）
  * 2) 再原子写 `.deleted-tombstone`——**rename 成功即视为 committed**（提交点）
  * 3) journal → committed 补写 best-effort：失败只前滚（保留 tombstone、不抛给 catch 回滚）
@@ -1039,7 +1039,7 @@ export const isTaskTombstoned = async (id: string): Promise<boolean> => {
  * 口径：journal 是删除事务唯一真相；tombstone 是物理辅助。
  * 读闸认「tombstone ∪ committed journal」；boot 见 tombstone 而 journal 缺/仍 prepared → 按 committed 前滚。
  * DELETE 延迟分支须在返回 200 **之前**调用，否则 refresh / 重启会把任务「复活」。
- * R35-4：journal/tombstone 读 unknown → 中止本次操作（不重写 prepared、不推进 rename）。
+ * journal/tombstone 读 unknown → 中止本次操作（不重写 prepared、不推进 rename）。
  */
 export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
   const dir = taskDir(taskId);
@@ -1047,22 +1047,22 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
 
   const tombstonePath = path.join(dir, DELETED_TOMBSTONE_FILE);
   const existingJournal = await readDeletionJournal(taskId);
-  // R35-4：unknown → 中止，禁止把 journal 重写回 prepared / 推进 rename
+  // unknown → 中止，禁止把 journal 重写回 prepared / 推进 rename
   if (existingJournal.kind === "unknown") {
     throw new Error(
-      `[task-fs] R35-4 writeDeleteTombstone: journal 读未知、中止 id=${taskId}`,
+      `[task-fs] writeDeleteTombstone: journal 读未知、中止 id=${taskId}`,
     );
   }
   const tombProbe = await probeDeleteTombstone(taskId);
   if (tombProbe.kind === "unknown") {
     throw new Error(
-      `[task-fs] R35-4 writeDeleteTombstone: tombstone 读未知、中止 id=${taskId}`,
+      `[task-fs] writeDeleteTombstone: tombstone 读未知、中止 id=${taskId}`,
     );
   }
   const existingValue =
     existingJournal.kind === "present" ? existingJournal.value : null;
   const tombstoneExists = tombProbe.kind === "present";
-  // R34-1：已 committed（快速路径后 EBUSY 降级）→ 禁止把 phase 写回 prepared
+  // 已 committed（快速路径后 EBUSY 降级）→ 禁止把 phase 写回 prepared
   const alreadyCommitted =
     existingValue?.phase === "committed" || tombstoneExists;
 
@@ -1079,14 +1079,14 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
       });
     } catch (err) {
       console.warn(
-        `[task-fs] R34-2 writeDeleteTombstone: tombstone 已在、committed 补写失败前滚 id=${taskId}`,
+        `[task-fs] writeDeleteTombstone: tombstone 已在、committed 补写失败前滚 id=${taskId}`,
         err,
       );
     }
     return;
   }
 
-  // R34-7：manifest Result——失败则带 manifestPending，绝不降级「零 ref 成功」
+  // manifest Result——失败则带 manifestPending，绝不降级「零 ref 成功」
   const resolved = await resolveCheckpointRefManifestForDelete(taskId);
   const meta = await readMetaV06(taskId).catch(() => null);
   const manifest: CheckpointRefManifest =
@@ -1099,16 +1099,16 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
             checkpointRefs: [],
             phase: "prepared",
             manifestPending: true,
-            // R35-3：可信快照优先写入 journal（commit 前持久化）
+            // 可信快照优先写入 journal（commit 前持久化）
             repoPaths: meta?.repoPaths ?? [],
           };
   if (!resolved.ok && !alreadyCommitted) {
     console.warn(
-      `[task-fs] R34-7 writeDeleteTombstone: manifest 未确认 id=${taskId}: ${resolved.error}`,
+      `[task-fs] writeDeleteTombstone: manifest 未确认 id=${taskId}: ${resolved.error}`,
     );
   }
 
-  // R34-2：prepared journal 写失败 → 中止（任务完整可见、无 tombstone）
+  // prepared journal 写失败 → 中止（任务完整可见、无 tombstone）
   // 已 committed 则跳过 prepared 写，避免 phase 倒退导致短暂可读
   if (!alreadyCommitted) {
     await writeDeletionJournal(taskId, { ...manifest, phase: "prepared" });
@@ -1120,31 +1120,31 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
   );
   const payload = JSON.stringify({
     deletedAt: manifest.deletedAt,
-    // R31-3：区分 Windows EBUSY 降级 vs DELETE 延迟分支的逻辑删除
+    // 区分 Windows EBUSY 降级 vs DELETE 延迟分支的逻辑删除
     reason: "logical-delete",
-    // R32-6：tombstone 内冗余清单（taskDir 未 rm 前可读；真正 durable 靠 journal）
+    // tombstone 内冗余清单（taskDir 未 rm 前可读；真正 durable 靠 journal）
     checkpointRefs: manifest.checkpointRefs,
   });
   await fs.writeFile(tmpPath, payload, "utf-8");
   try {
-    // R33-5 测试：rename 前可注入失败，验证 prepared 回滚
+    // 测试：rename 前可注入失败，验证 prepared 回滚
     await failpoint("deleteTombstone.beforeRename");
     await fs.rename(tmpPath, tombstonePath);
   } catch (err) {
     await fs.unlink(tmpPath).catch(() => {});
-    // R33-5 / R34-2：tombstone 未提交 → 仅回滚 prepared；已 committed 绝不动 journal
+    // tombstone 未提交 → 仅回滚 prepared；已 committed 绝不动 journal
     if (!alreadyCommitted) {
       await removeDeletionJournal(taskId);
     }
     throw err;
   }
-  // R34-2：tombstone rename = 提交点；committed journal 补写失败只前滚、不抛
+  // tombstone rename = 提交点；committed journal 补写失败只前滚、不抛
   try {
     const existing = await readDeletionJournal(taskId);
-    // R35-4：补写时读 unknown → 不覆盖（tombstone 已提交，只前滚）
+    // 补写时读 unknown → 不覆盖（tombstone 已提交，只前滚）
     if (existing.kind === "unknown") {
       console.warn(
-        `[task-fs] R35-4 writeDeleteTombstone: committed 补写前 journal 读未知、前滚 id=${taskId}`,
+        `[task-fs] writeDeleteTombstone: committed 补写前 journal 读未知、前滚 id=${taskId}`,
         existing.error,
       );
       return;
@@ -1169,7 +1169,7 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
     });
   } catch (err) {
     console.warn(
-      `[task-fs] R34-2 writeDeleteTombstone: committed journal 补写失败、tombstone 已提交前滚 id=${taskId}`,
+      `[task-fs] writeDeleteTombstone: committed journal 补写失败、tombstone 已提交前滚 id=${taskId}`,
       err,
     );
   }
@@ -1177,22 +1177,22 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
 
 export const getTask = async (id: string): Promise<Task | null> => {
   await ensureBootRecovery();
-  // R33-4：统一闸——tombstone 或 committed journal
+  // 统一闸——tombstone 或 committed journal
   if (!assertTaskReadable(id)) return null;
   const raw = await readMetaRaw(id);
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
-  // R25-2 / R25-5：meta 已读、hydrate events 未完成——矩阵可在此注入 finalize，
+  // meta 已读、hydrate events 未完成——矩阵可在此注入 finalize，
   // 验证 route 陈旧 developing 快照 + 裸写 running 窗口已被条件事务 / fresh 终态闸堵住
   await failpoint("taskread.beforeHydrate");
   const task = await hydrateTask(raw);
-  // R33-4：返回前同步复查
+  // 返回前同步复查
   if (!assertTaskReadable(id)) return null;
   return task;
 };
 
 /**
- * R25-2：轻量读盘上 repoStatus（不 hydrate events）——启动副作用边界 / 准入用，
+ * 轻量读盘上 repoStatus（不 hydrate events）——启动副作用边界 / 准入用，
  * 避免 getTask 握着旧 meta 在 hydrate await 期间吃到已终态任务。
  */
 export const readTaskRepoStatusFresh = async (
@@ -1217,7 +1217,7 @@ export const getTaskWithTailEvents = async (
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
   const task = await hydrateTaskWithTailEvents(raw, tail);
-  // R33-4：hydrate 后可挂起——矩阵在此注入删除，验证不发 stale
+  // hydrate 后可挂起——矩阵在此注入删除，验证不发 stale
   await failpoint("getTaskWithTailEvents.afterHydrate");
   if (!assertTaskReadable(id)) return null;
   return task;
@@ -1237,7 +1237,7 @@ export const getTaskEventsBefore = async (
   if (!raw) return null;
   if (!isValidMetaShape(raw)) return null;
   const page = await readEventsBefore(id, beforeId, limit);
-  // R33-4：分页读完后复查
+  // 分页读完后复查
   await failpoint("getTaskEventsBefore.afterRead");
   if (!assertTaskReadable(id)) return null;
   return page;
@@ -1385,7 +1385,7 @@ export const deleteTask = async (id: string): Promise<boolean> => {
     } catch (err) {
       console.warn(`[task-fs] deleteTask: 清理 worktree 失败（忽略）id=${id}`, err);
     }
-    // R33-5 测试：不可逆 rm 前可注入抛错，验证 DELETE 回滚 journal
+    // 测试：不可逆 rm 前可注入抛错，验证 DELETE 回滚 journal
     await failpoint("deleteTask.beforeRm");
     // maxRetries：防「迟到的 events.jsonl 写入」跟递归删除撞车（ENOTEMPTY/EBUSY 短暂重试即过）
     try {
@@ -1395,7 +1395,7 @@ export const deleteTask = async (id: string): Promise<boolean> => {
         maxRetries: 5,
         retryDelay: 100,
       });
-      // R29-6：文件真删后才清 seq——stop/cleanup 不再清
+      // 文件真删后才清 seq——stop/cleanup 不再清
       clearEventSeqCounter(id);
       return true;
     } catch (err) {
@@ -1406,10 +1406,10 @@ export const deleteTask = async (id: string): Promise<boolean> => {
       // 可靠的按 cwd 查进程手段、本批不实现 Windows 进程清理），所以这里只能「先让
       // UI 消失、磁盘残留留给 boot 清扫」。tombstone 写入几乎必成功；meta unlink
       // best-effort（listTasks 靠 meta 判定，删掉即从列表消失；失败则靠 tombstone skip）。
-      // R31-3：复用 writeDeleteTombstone（与 DELETE 延迟分支同一协议）
+      // 复用 writeDeleteTombstone（与 DELETE 延迟分支同一协议）
       await writeDeleteTombstone(id);
       await fs.unlink(path.join(dir, META_FILE)).catch(() => {});
-      // R29-6：tombstone 后 events 不再作为合法日志——一并清 counter
+      // tombstone 后 events 不再作为合法日志——一并清 counter
       clearEventSeqCounter(id);
       console.warn(
         `[task-fs] deleteTask: 目录被锁，已降级 tombstone id=${id}`,
@@ -1434,14 +1434,14 @@ const lastMetaTouchAt = new Map<string, number>();
  * - task 不存在（已删、agent 残留写入）→ 返 null、不写、不复活目录
  * - 事件行经 appendEventLine 按 taskId 串行 append（同文件并发 appendFile 不安全，
  *   且超长 tool_result 行超出 POSIX O_APPEND 原子写保证；无需拿 task 锁）
- * - R28-5：onCommitted（通常 publish）在 append 链内、写行成功后同步调用——
+ * - onCommitted（通常 publish）在 append 链内、写行成功后同步调用——
  *   与落盘同序提交；meta.updatedAt 节流 touch 移出关键路径（fire-and-forget）
  * - 调用方需要完整 Task 的（低频 route 场景）自己再 getTask
  *
- * @param lease R26-5：可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
- * @param onCommitted R28-5：可选；链内写行成功后同步回调（writeEventAndPublish 传 publish）
+ * @param lease 可选；透传到 appendEventLine 队内检查（false → 不写盘、返 null）
+ * @param onCommitted 可选；链内写行成功后同步回调（writeEventAndPublish 传 publish）
  *
- * R29-4 错误语义（调用方零影响、透传已存在）：
+ * 错误语义（调用方零影响、透传已存在）：
  * - ENOENT / lease 拒写 → 返 null（不抛）
  * - 其它 IO 错误（EIO / ENOSPC / EACCES…）→ 向上抛，由 writeEventAndPublish 吞、
  *   或由 writeUserEventAndPublishStrict 交给 route 处理
@@ -1458,12 +1458,12 @@ export const appendEvent = async (
     ts: Date.now(),
     ...ev,
   };
-  // R28-5：写行 + onCommitted（publish）同进 per-task append 链
-  // R29-4：非 ENOENT 错误由 appendEventLineUnlocked 原样抛出（透传、不吞）
+  // 写行 + onCommitted（publish）同进 per-task append 链
+  // 非 ENOENT 错误由 appendEventLineUnlocked 原样抛出（透传、不吞）
   const wrote = await appendEventLine(taskId, event, lease, onCommitted);
   if (!wrote) return null;
 
-  // R28-5：meta.updatedAt 移出关键路径——列表排序 5s 粒度足够；失败只 warn
+  // meta.updatedAt 移出关键路径——列表排序 5s 粒度足够；失败只 warn
   const last = lastMetaTouchAt.get(taskId) ?? 0;
   if (event.ts - last >= META_TOUCH_INTERVAL_MS) {
     lastMetaTouchAt.set(taskId, event.ts);
@@ -1604,13 +1604,13 @@ export const setTaskRemoveSourceBranchOnMerge = async (
   });
 
 /**
- * V0.11.1 / R29-P2b：落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
+ * V0.11.1 / 落 / 清「最近会话 agentId」（会话持久化、服务重启后 Agent.resume 续会话用）。
  * 不动 updatedAt（纯运行时锚点、与任务活跃度无关）。best-effort：调用方一般 void 掉。
  *
- * R29-P2b：set 与 clear 对称——走 prepareMetaWrite + commit(finalGuard)；
+ * set 与 clear 对称——走 prepareMetaWrite + commit(finalGuard)；
  * 调用方传「本 session 仍是当前注册」闭包，堵 read/write await 夹缝里被后继覆盖。
  *
- * X4（十七轮）：错误在函数内部消化、绝不 reject——调用方几十处都是 fire-and-forget
+ * 错误在函数内部消化、绝不 reject——调用方几十处都是 fire-and-forget
  * `void setTaskSessionAgentId(...)`，任一处漏 .catch 都会在「任务目录刚被 DELETE 删掉」
  * 时产生 ENOENT unhandled rejection（高负载全量测试实锤随机红灯）。best-effort 语义
  * 的单一源就该在这里兜：ENOENT（任务已删、锚点无处可落）静默，其他错误 warn。
@@ -1618,7 +1618,7 @@ export const setTaskRemoveSourceBranchOnMerge = async (
 export const setTaskSessionAgentId = async (
   id: string,
   agentId: string | undefined,
-  /** R29-P2b：可选 finalGuard——rename 前同步复查（调用方现查，非入场快照） */
+  /** 可选 finalGuard——rename 前同步复查（调用方现查，非入场快照） */
   finalGuard?: () => boolean,
 ): Promise<void> => {
   try {
@@ -1628,7 +1628,7 @@ export const setTaskSessionAgentId = async (
       if (!meta) return;
       meta.sessionAgentId = agentId;
       if (finalGuard) {
-        // R29-P2b：条件事务——与 clearTaskSessionAgentIdIf 对称
+        // 条件事务——与 clearTaskSessionAgentIdIf 对称
         const prepared = await prepareMetaWrite(meta);
         const guard = (): boolean => !finalGuard || finalGuard();
         if (!guard()) {
@@ -1651,10 +1651,10 @@ export const setTaskSessionAgentId = async (
 };
 
 /**
- * R27-3 / R28-3：条件清 sessionAgentId。
+ * 条件清 sessionAgentId。
  * 前置：锁内同步 extraGuard + 盘上锚点 === expectedAgentId；
  * 提交：prepareMetaWrite + commit(finalGuard)——每次 rename attempt 前复查
- * 「盘上仍是 expectedAgentId && extraGuard() 仍 true」（R27-1 beforeAttempt）。
+ * 「盘上仍是 expectedAgentId && extraGuard 仍 true」（beforeAttempt）。
  * 用于 Agent.resume 确定性失败 catch：避免迟到 clear 抹掉 B 同 agentId 新装的锚点。
  * @returns true=已清；false=条件不符 / meta 不存在（best-effort 不抛）
  */
@@ -1665,14 +1665,14 @@ export const clearTaskSessionAgentIdIf = async (
 ): Promise<boolean> => {
   try {
     return await withTaskLock(taskId, async () => {
-      // R27-3：同步 guard 先查——B 已装内存 session / 已失主则不清
+      // 同步 guard 先查——B 已装内存 session / 已失主则不清
       if (extraGuard && !extraGuard()) return false;
       const meta = await readMetaV06(taskId);
       if (!meta || meta.sessionAgentId !== expectedAgentId) return false;
       meta.sessionAgentId = undefined;
-      // R28-3：条件事务——prepare 后 finalGuard 进 commit，堵 read/write await 夹缝
+      // 条件事务——prepare 后 finalGuard 进 commit，堵 read/write await 夹缝
       const prepared = await prepareMetaWrite(meta);
-      // R28-3：矩阵在此注入同 agentId 的 B 安装，断言锚点保留
+      // 矩阵在此注入同 agentId 的 B 安装，断言锚点保留
       await failpoint("clear.beforeCommit");
       const finalGuard = (): boolean => {
         // 盘上仍是本次要清的锚点（同步读、无 await）
@@ -1931,9 +1931,9 @@ export const appendAction = async (
     customLabel?: string;
   },
   /**
-   * R23-1b / R24-4：锁内 prepare → 同步复查 guard → commit。
+   * 锁内 prepare → 同步复查 guard → commit。
    * advance 传 `() => isOpOwner(opHandle)`：claim 后若已被 stop revoke，
-   * 拒绝追加幽灵 action（与 stop 重读收尾形成互斥闭环，见 stop-task R23-6）。
+   * 拒绝追加幽灵 action（与 stop 重读收尾形成互斥闭环，见 stop-task）。
    */
   opts?: { guard?: () => boolean },
 ): Promise<{ task: Task; action: ActionRecord } | null> =>
@@ -1942,7 +1942,7 @@ export const appendAction = async (
     if (opts?.guard && !opts.guard()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R24-5b：终态 task 上追加 running action 一律非法（finalize 裸写不受影响）
+    // 终态 task 上追加 running action 一律非法（finalize 裸写不受影响）
     if (isTerminalRepoStatus(meta.repoStatus)) return null;
     const now = Date.now();
     const n = meta.actions.length + 1;
@@ -1983,14 +1983,14 @@ export const appendAction = async (
 
     // ③ prepare：脏值只在 tmp——meta.json 未动
     const prepared = await prepareMetaWrite(meta);
-    // R24-4 测试插桩：prepare 之后、同步复查之前（故意 await，模拟 IO 间隙）
+    // 测试插桩：prepare 之后、同步复查之前（故意 await，模拟 IO 间隙）
     await failpoint("append.afterPrepare");
-    // ④ 提前短路（省 rename）——权威检查在 commit(finalGuard) 内、rename 紧前（R26-5）
+    // ④ 提前短路（省 rename）——权威检查在 commit(finalGuard) 内、rename 紧前
     if (opts?.guard && !opts.guard()) {
       await prepared.abort();
       return null;
     }
-    // R26-5：finalGuard 进 commit——failpoint await 后、rename 前同步验；失主拒写
+    // finalGuard 进 commit——failpoint await 后、rename 前同步验；失主拒写
     const committed = await prepared.commit(opts?.guard);
     if (!committed) return null;
     const task = await hydrateTask(meta);
@@ -2054,7 +2054,7 @@ export const patchAction = async (
     return await hydrateTask(meta);
   });
 
-// R28-4：appendActionSideEffectMR 已删——MR 双投影改走 upsertMRWithActionSideEffect 单事务
+// appendActionSideEffectMR 已删——MR 双投影改走 upsertMRWithActionSideEffect 单事务
 
 /**
  * 直接设置 task 级 runStatus / currentActionId（runner 用）
@@ -2078,14 +2078,14 @@ export const setTaskRunStatus = async (
   });
 
 /**
- * R25-1：stop / finalize 的「扫非终态 action + 置 idle」锁内单次事务。
+ * stop / finalize 的「扫非终态 action + 置 idle」锁内单次事务。
  *
  * 线性化：appendAction 持 withTaskLock 直到 `prepared.commit()`（含内部
  * renameWithRetry await）返回才放锁——本函数同锁排队，必排在 append 提交之后，
  * 因此必见刚落盘的 running action，不会漏扫成「action=running + task=idle」幽灵。
  *
  * @param exceptActionId 排除某 action（advance force-new 不用本函数；预留给对称 API）
- * @param toStatus       非终态收尾成 cancelled（stop/finalize）或 error
+ * @param toStatus 非终态收尾成 cancelled（stop/finalize）或 error
  * @returns 收尾后 hydrate 的 Task（事件文案 / publish 用）；meta 不存在 → null
  */
 export const finalizeStaleAndIdleLocked = async (
@@ -2144,7 +2144,7 @@ export const setTaskAwaitingIfIdle = async (
   });
 
 /**
- * W3：条件写 runStatus——仅当 `currentActionId` 仍等于本操作的 action 时才改。
+ * 条件写 runStatus——仅当 `currentActionId` 仍等于本操作的 action 时才改。
  *
  * 防 stale owner 清理覆盖后继 B：旧 advance 见 gen stale 想把 running→idle，
  * 但 B 已 append 并改 currentActionId——CAS 失败则不碰共享状态。
@@ -2169,17 +2169,17 @@ export const setTaskRunStatusIfCurrentAction = async (
   });
 
 /**
- * R19-1：锁内结构条件——同 epoch 的并发 advance 不 bump opGen，仅靠 isFresh 挡不住。
+ * 锁内结构条件——同 epoch 的并发 advance 不 bump opGen，仅靠 isFresh 挡不住。
  * 调用方（如 /question ack）应传入 ack 当时的 currentActionId + 期望的 action status。
  */
 export type OpFreshExpected = {
   currentActionId?: string | null;
   actionStatus?: ActionStatus | readonly ActionStatus[];
-  /** R26-4：可选 action.type 结构条件（如 set_plan_batches 须 plan） */
+  /** 可选 action.type 结构条件（如 set_plan_batches 须 plan） */
   actionType?: ActionType | readonly ActionType[];
 };
 
-/** R19-1：锁内验 expected（读完 meta / 定位 action 后调用） */
+/** 锁内验 expected（读完 meta / 定位 action 后调用） */
 const matchesOpFreshExpected = (
   meta: TaskMetaV06,
   action: ActionRecord,
@@ -2200,7 +2200,7 @@ const matchesOpFreshExpected = (
     ) as readonly ActionStatus[];
     if (!allowed.includes(action.status)) return false;
   }
-  // R26-4：action.type 结构条件
+  // action.type 结构条件
   if (expected.actionType !== undefined) {
     const allowedTypes = (
       Array.isArray(expected.actionType)
@@ -2213,7 +2213,7 @@ const matchesOpFreshExpected = (
 };
 
 /**
- * R26-4：锁内验「actionId === currentActionId 且 status === running」。
+ * 锁内验「actionId === currentActionId 且 status === running」。
  * submit_work 在 abort runningChecks 之前调用——旧 action 迟到重试不得杀新 action 的 check。
  */
 export const isCurrentRunningAction = async (
@@ -2229,7 +2229,7 @@ export const isCurrentRunningAction = async (
   });
 
 /**
- * R23-1a：锁内条件 patch action（不动 runStatus / currentActionId）。
+ * 锁内条件 patch action（不动 runStatus / currentActionId）。
  *
  * 复用 prepare/commit + 锁内复查 isOwner 协议（同 patchActionAndRunStatusIfOpFresh），
  * 给 claim 前的 auto-approve 等「只改 action、已有 admission gen」路径用——
@@ -2250,7 +2250,7 @@ export const patchActionIfOwner = async (
     // ② readMeta + 结构条件
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R24-5b：终态后旧链 action 写非法（finalize 走裸 patchAction）
+    // 终态后旧链 action 写非法（finalize 走裸 patchAction）
     if (isTerminalRepoStatus(meta.repoStatus)) return null;
     if (
       expected &&
@@ -2288,7 +2288,7 @@ export const patchActionIfOwner = async (
 
     // ③ prepare：脏值只在 tmp
     const prepared = await prepareMetaWrite(meta);
-    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内
     const structureStillOk =
       !expected ||
       !("currentActionId" in expected) ||
@@ -2304,23 +2304,23 @@ export const patchActionIfOwner = async (
   });
 
 /**
- * R18-1 / R19-1 / R19-3 / R26-5：op-fresh 条件事务——锁内验 isFresh + 结构条件后，
+ * op-fresh 条件事务——锁内验 isFresh + 结构条件后，
  * 一把写 action.status + runStatus + currentActionId；权威检查进 commit(finalGuard)。
  *
  * 时序：/question ackContext 分支若先 patchAction 再 setTaskRunStatus，两段 await 之间
  * stop 可完成并把 idle/cancelled 写回；旧代码无条件第二段写又把 running 盖回去。
  * 把「确认仍是 op owner + 状态变更」放进同一 withTaskLock 临界区。
  *
- * R19-1：generation 只在 stop/DELETE/finalize 时 bump，普通 advance 不 bump——
+ * generation 只在 stop/DELETE/finalize 时 bump，普通 advance 不 bump——
  * 同 epoch 后继不是 stale。故额外验 expected.currentActionId / actionStatus，
  * 防旧 Q 把已 completed 的 A 改回 running、把 currentActionId 从 B 抢回 A。
  *
- * R20-3 / R26-5 prepare / 复查 / commit 单次提交的线性化论证：
+ * prepare / 复查 / commit 单次提交的线性化论证：
  * - prepare 只写 tmp，meta.json 未动——无锁读者（getTask/listTasks）看不到「被拒绝的」新值；
  * - prepare 后同步复查可提前短路（省 rename）；权威检查在 commit 内、rename 发起前同步执行
  *   （owner map 不受 task lock 约束——B 可在 failpoint await 期间接管）；
- * - R21-3 口径保留：换主若落在 rename await 内 ⇒ 线性序等于「A 先提交、B 后接管」；
- *   R21-1 已保证每个接管者在 claim 之后紧跟一次过同一把 withTaskLock 的状态写——
+ * - 口径保留：换主若落在 rename await 内 ⇒ 线性序等于「A 先提交、B 后接管」；
+ *   已保证每个接管者在 claim 之后紧跟一次过同一把 withTaskLock 的状态写——
  *   本临界区持锁直到 commit 返回，B 的写必然排在 A 的 rename 之后覆盖它。
  *
  * 为什么闭包注入而不是直接 import task-stream：task-fs 是底座、不反向依赖 runner 层状态
@@ -2336,7 +2336,7 @@ export const patchActionAndRunStatusIfOpFresh = async (
   isFresh: () => boolean,
   expected?: OpFreshExpected,
   /**
-   * R23-4a：与 status 同事务写入的附加字段（如 postCheck）。
+   * 与 status 同事务写入的附加字段（如 postCheck）。
    * 不得用二次裸 patch——两写之间 stop 会留下「cancelled 后又写元数据」窗口。
    */
   extraPatch?: Partial<Pick<ActionRecord, "postCheck">>,
@@ -2347,9 +2347,9 @@ export const patchActionAndRunStatusIfOpFresh = async (
     // ② readMeta
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R24-5b：终态后旧链 action+runStatus 写非法（finalize 走裸 setTaskRepoStatus/setTaskRunStatus）
+    // 终态后旧链 action+runStatus 写非法（finalize 走裸 setTaskRepoStatus/setTaskRunStatus）
     if (isTerminalRepoStatus(meta.repoStatus)) return null;
-    // R19-1：结构条件——同 epoch 并发 advance 后 currentActionId / action.status 可能已变
+    // 结构条件——同 epoch 并发 advance 后 currentActionId / action.status 可能已变
     if (
       expected &&
       "currentActionId" in expected &&
@@ -2389,7 +2389,7 @@ export const patchActionAndRunStatusIfOpFresh = async (
     // ③ prepare：脏值只在 tmp
     const prepared = await prepareMetaWrite(meta);
 
-    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内
     // （写后 action.status 已是目标态，结构复查 = expected.currentActionId 仍是本 actionId）
     const structureStillOk =
       !expected ||
@@ -2407,20 +2407,20 @@ export const patchActionAndRunStatusIfOpFresh = async (
   });
 
 /**
- * R18-1 / R18-3 / R20-3：run-owner 条件写 runStatus——prepare / 同步复查 / 单次 commit。
+ * run-owner 条件写 runStatus——prepare / 同步复查 / 单次 commit。
  *
  * 锚点应是 runningTasks.instanceId（或 opGen），不能只比 currentActionId：
  * stop 后 B「唤醒同一 action」时指针可与旧 Q 相同，旧回滚仍会把 B 的 running 写成 idle。
  * 调用方传 `() => runningTasks.get(taskId)?.instanceId === myInstanceId`。
  *
- * R20-3：owner Map（runningTasks）不受 task lock 保护——入口 isOwner 成功后仍可能在
+ * owner Map（runningTasks）不受 task lock 保护——入口 isOwner 成功后仍可能在
  * readMeta/prepare 的 await 间被 forceClear + B 换主。prepare 后再同步查 isOwner，
  * false 则 abort（tmp 丢弃、meta.json 从未出现新值）。线性化论证同
  * {@link patchActionAndRunStatusIfOpFresh}。
  *
  * 闭包注入理由同 {@link patchActionAndRunStatusIfOpFresh}：task-fs 不反向依赖 task-stream。
  *
- * R21-4：expectedRunStatus 结构条件——调用方入场读到的盘上状态（如 ask 僵尸兜底的
+ * expectedRunStatus 结构条件——调用方入场读到的盘上状态（如 ask 僵尸兜底的
  * awaiting_user）在多段 await 后可能已被并发唤醒的后继写成 running；仅靠「无 session」
  * 挡不住 Agent.create 前窗口。锁内 readMeta 后验证盘上 runStatus 仍是入场值，变了拒写。
  *
@@ -2439,9 +2439,9 @@ export const setTaskRunStatusIfRunOwner = async (
     // ② readMeta
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R24-5b：终态后旧链 runStatus 写非法（finalize 走裸 setTaskRunStatus）
+    // 终态后旧链 runStatus 写非法（finalize 走裸 setTaskRunStatus）
     if (isTerminalRepoStatus(meta.repoStatus)) return null;
-    // R21-4：盘上 runStatus 已不是调用方入场看到的值（后继已接管写入）→ 拒写
+    // 盘上 runStatus 已不是调用方入场看到的值（后继已接管写入）→ 拒写
     if (expectedRunStatus !== undefined && meta.runStatus !== expectedRunStatus) {
       return null;
     }
@@ -2452,7 +2452,7 @@ export const setTaskRunStatusIfRunOwner = async (
     }
     meta.updatedAt = Date.now();
     const prepared = await prepareMetaWrite(meta);
-    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内（R26-5）
+    // ④ 提前短路（省 rename）；权威检查在 commit(finalGuard) 内
     if (!isOwner()) {
       await prepared.abort();
       return null;
@@ -2484,19 +2484,19 @@ export const setTaskRepoStatus = async (
  *
  * - 按 `repoPath` 匹配：已有同 repoPath 则替换、否则 append
  * - build / worktree 首次建条目时写入；之后可 patch baseBranch
- * - R29-P2a：可选 isOwner 合进 finalGuard（ensure 成功后的迟到 upsert 不得在失主后落盘）
+ * - 可选 isOwner 合进 finalGuard（ensure 成功后的迟到 upsert 不得在失主后落盘）
  */
 export const upsertGitBranch = async (
   taskId: string,
   gitBranch: GitBranchInfo,
-  /** R29-P2a：可选 owner lease——合进 commit(finalGuard) */
+  /** 可选 owner lease——合进 commit(finalGuard) */
   isOwner?: () => boolean,
 ): Promise<Task | null> =>
   withTaskLock(taskId, async () => {
     if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R26-1：终态拒写——finalize 后 prewarm 迟到不得重建 gitBranches
+    // 终态拒写——finalize 后 prewarm 迟到不得重建 gitBranches
     // （与 finalize/setTaskRepoStatus 同把 withTaskLock，持锁期间终态不会被并发改）
     if (isTerminalRepoStatus(meta.repoStatus)) return null;
     const existing = meta.gitBranches ?? [];
@@ -2506,7 +2506,7 @@ export const upsertGitBranch = async (
         ? existing.map((b, i) => (i === idx ? gitBranch : b))
         : [...existing, gitBranch];
     meta.updatedAt = Date.now();
-    // R26-1 / R26-5 / R29-P2a：走 prepare+commit(finalGuard) 体系
+    // 走 prepare+commit(finalGuard) 体系
     const prepared = await prepareMetaWrite(meta);
     const finalGuard = (): boolean =>
       !isTerminalRepoStatus(meta.repoStatus) && (!isOwner || isOwner());
@@ -2528,10 +2528,10 @@ export const upsertGitBranch = async (
 export const setFeishuTesterUserKeys = async (
   taskId: string,
   userKeys: string[],
-  /** R25-3：可选锁内 caller 闸 */
+  /** 可选锁内 caller 闸 */
   isOwner?: () => boolean,
   /**
-   * R27-4：可选锁内结构条件（action lease）——该 action 必须仍是 currentActionId、
+   * 可选锁内结构条件（action lease）——该 action 必须仍是 currentActionId、
    * status running、且类型在允许集内（set_feishu_testers 语义 = ship 流程记忆）。
    * 结构条件真正进锁内 expected + finalGuard（验收点名「报告声称进了锁内、实际没有」）。
    */
@@ -2541,7 +2541,7 @@ export const setFeishuTesterUserKeys = async (
     if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R27-4：锁内验结构条件——外层 fresh 检查后、拿锁前 action 可能已切换
+    // 锁内验结构条件——外层 fresh 检查后、拿锁前 action 可能已切换
     if (expectedAction) {
       const a = meta.actions.find((x) => x.id === expectedAction.actionId);
       if (
@@ -2557,7 +2557,7 @@ export const setFeishuTesterUserKeys = async (
     meta.updatedAt = Date.now();
     if (isOwner || expectedAction) {
       const prepared = await prepareMetaWrite(meta);
-      // R27-4：finalGuard = caller 闸 + 结构条件（结构基于锁内 meta——写锁互斥、即最新盘上状态）
+      // finalGuard = caller 闸 + 结构条件（结构基于锁内 meta——写锁互斥、即最新盘上状态）
       const structureOk = (): boolean => {
         if (!expectedAction) return true;
         const a = meta.actions.find((x) => x.id === expectedAction.actionId);
@@ -2570,7 +2570,7 @@ export const setFeishuTesterUserKeys = async (
       };
       const finalGuard = (): boolean =>
         (!isOwner || isOwner()) && structureOk();
-      // 提前短路（省 rename）；权威检查在 commit 内（R26-5）
+      // 提前短路（省 rename）；权威检查在 commit 内
       if (!finalGuard()) {
         await prepared.abort();
         return null;
@@ -2657,18 +2657,18 @@ export const upsertMR = async (
     mergeStatus?: string;
   },
   /**
-   * R25-3：可选锁内 owner 闸（submit_mr 传 callerStillValid）——失主拒写、
+   * 可选锁内 owner 闸（submit_mr 传 callerStillValid）——失主拒写、
    * createMR 已发生后的迟到落盘不再污染新主时间线。
    */
   isOwner?: () => boolean,
-  /** R27-4：可选锁内结构条件——该 action 必须仍是 currentActionId 且 running（action lease） */
+  /** 可选锁内结构条件——该 action 必须仍是 currentActionId 且 running（action lease） */
   expectedActionId?: string,
 ): Promise<{ task: Task; mr: MRRecord } | null> =>
   withTaskLock(taskId, async () => {
     if (isOwner && !isOwner()) return null;
     const meta = await readMetaV06(taskId);
     if (!meta) return null;
-    // R27-4：action lease 锁内验——action 已切换/结束则拒写（历史 action 迟到 submit_mr）
+    // action lease 锁内验——action 已切换/结束则拒写（历史 action 迟到 submit_mr）
     if (expectedActionId !== undefined) {
       const a = meta.actions.find((x) => x.id === expectedActionId);
       if (
@@ -2726,7 +2726,7 @@ export const upsertMR = async (
     meta.updatedAt = now;
     if (isOwner || expectedActionId !== undefined) {
       const prepared = await prepareMetaWrite(meta);
-      // R27-4：finalGuard = caller + action lease 结构条件
+      // finalGuard = caller + action lease 结构条件
       const structureOk = (): boolean => {
         if (expectedActionId === undefined) return true;
         const a = meta.actions.find((x) => x.id === expectedActionId);
@@ -2750,7 +2750,7 @@ export const upsertMR = async (
   });
 
 /**
- * R28-4：MR 双投影单事务——一把 task lock 内同时更新
+ * MR 双投影单事务——一把 task lock 内同时更新
  *   `task.mrs[]`（upsertMR 语义、含 mrVersion 推进）与
  *   `action.sideEffects.mrs[]`（原 appendActionSideEffectMR 语义）。
  *
@@ -2772,10 +2772,10 @@ export const upsertMRWithActionSideEffect = async (
     hasConflicts?: boolean;
     mergeStatus?: string;
   },
-  /** R25-3 / R28-4：锁内 caller 闸 */
+  /** 锁内 caller 闸 */
   isOwner?: () => boolean,
   /**
-   * R28-4：结构条件——默认要求该 action 仍是 current + running。
+   * 结构条件——默认要求该 action 仍是 current + running。
    * 传 `requireCurrentRunning: false` 仅测试旁路（生产 submit_mr 不传）。
    */
   expected?: { requireCurrentRunning?: boolean },
@@ -2788,7 +2788,7 @@ export const upsertMRWithActionSideEffect = async (
     const actionIdx = meta.actions.findIndex((a) => a.id === actionId);
     if (actionIdx < 0) return null;
     const action = meta.actions[actionIdx]!;
-    // R27-4 / R28-4：历史 / 已切 action 的迟到写拒
+    // 历史 / 已切 action 的迟到写拒
     if (
       requireCurrentRunning &&
       (meta.currentActionId !== actionId || action.status !== "running")
@@ -2870,7 +2870,7 @@ export const upsertMRWithActionSideEffect = async (
     meta.updatedAt = now;
 
     const prepared = await prepareMetaWrite(meta);
-    // R28-4：finalGuard = caller + 结构条件（rename 前同步复查）
+    // finalGuard = caller + 结构条件（rename 前同步复查）
     const structureOk = (): boolean => {
       if (!requireCurrentRunning) return true;
       const a = meta.actions.find((x) => x.id === actionId);

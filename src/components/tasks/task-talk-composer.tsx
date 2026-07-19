@@ -137,7 +137,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         pathAttach.paths,
         skillRefs,
       );
-      // R30-3：send 后落盘失败——不可忽略提示
+      // send 后落盘失败——不可忽略提示
       if (result.persistWarning) {
         toast.error(
           `消息已送达但记录保存失败：${result.persistWarning}`,

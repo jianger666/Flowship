@@ -54,7 +54,7 @@ export const EXCLUDED_SUBDIR = ".excluded";
 // 单 action 最多保留 10 个 revision、超出 GC 删最早（沿用 V0.5.12 的上限策略）
 export const MAX_REVISIONS_PER_ACTION = 10;
 /**
- * 逻辑删除标记（R31-3 扩展协议）：
+ * 逻辑删除标记：
  * - Windows EBUSY：deleteTask 降级写此标记、卸 meta，UI 立刻消失
  * - DELETE 延迟分支：HTTP 200 前先写此标记（durable logical delete），list/get 不暴露；
  *   boot recovery 见标记继续物理 rm（绝不动 bench/fixture 等无标记手工目录）
@@ -344,7 +344,7 @@ export const readMetaV06 = async (id: string): Promise<TaskMetaV06 | null> => {
 };
 
 /**
- * R36-6：meta 删除证据三态——absent | valid | unknown。
+ * meta 删除证据三态——absent | valid | unknown。
  * 不用 exists() 预探（EACCES 会假 absent）；直接 readFile，仅 ENOENT → absent。
  */
 export type MetaEvidenceRead =
@@ -357,7 +357,7 @@ let metaEvidenceReadInjector:
   | ((op: MetaEvidenceReadOp, filePath: string) => void)
   | null = null;
 
-/** R36-6 测试注入：模拟 meta EACCES/EIO */
+/** 测试注入：模拟 meta EACCES/EIO */
 export const setMetaEvidenceReadInjectorForTest = (
   fn: ((op: MetaEvidenceReadOp, filePath: string) => void) | null,
 ): void => {
@@ -391,7 +391,7 @@ const parseMetaEvidence = (raw: string, id: string): MetaEvidenceRead => {
   return { kind: "valid", value: parsed };
 };
 
-/** R36-6：异步三态读 meta（DELETE / manifest 构建用） */
+/** 异步三态读 meta（DELETE / manifest 构建用） */
 export const readMetaV06Evidence = async (
   id: string,
 ): Promise<MetaEvidenceRead> => {
@@ -402,12 +402,12 @@ export const readMetaV06Evidence = async (
     return parseMetaEvidence(raw, id);
   } catch (err) {
     if (isMetaEnoent(err)) return { kind: "absent" };
-    console.error(`[task-fs-core] R36-6 读 meta 未知错误 id=${id}`, err);
+    console.error(`[task-fs-core] 读 meta 未知错误 id=${id}`, err);
     return { kind: "unknown", error: err };
   }
 };
 
-/** R36-7：同步三态读 meta（TaskVisibility 用） */
+/** 同步三态读 meta（TaskVisibility 用） */
 export const readMetaV06EvidenceSync = (id: string): MetaEvidenceRead => {
   const p = path.join(taskDir(id), META_FILE);
   try {
@@ -416,17 +416,17 @@ export const readMetaV06EvidenceSync = (id: string): MetaEvidenceRead => {
     return parseMetaEvidence(raw, id);
   } catch (err) {
     if (isMetaEnoent(err)) return { kind: "absent" };
-    console.error(`[task-fs-core] R36-6 sync 读 meta 未知错误 id=${id}`, err);
+    console.error(`[task-fs-core] sync 读 meta 未知错误 id=${id}`, err);
     return { kind: "unknown", error: err };
   }
 };
 
 /**
- * R20-3 / R26-5：把序列化 + 写 tmp 与原子 rename 拆开。
+ * 把序列化 + 写 tmp 与原子 rename 拆开。
  * prepare 期间脏值只在 tmp、meta.json 未动；commit = rename；abort = unlink tmp。
  * 条件事务 helper 用「prepare → 同步复查 → commit(finalGuard)」消灭写后回滚窗口。
  *
- * R26-5 线性化：finalGuard 在 failpoint await 之后、rename 发起前同步执行——
+ * 线性化：finalGuard 在 failpoint await 之后、rename 发起前同步执行——
  * owner/caller map 不受 task lock 约束，B 可在「prepare 后检查」与 rename 之间接管；
  * 权威检查必须落在 rename 紧前，否则 A 仍会提交旧值。
  */
@@ -457,21 +457,21 @@ export const prepareMetaWrite = async (
       if (settled) return false;
       settled = true;
       try {
-        // R25-1 / R25-5：rename 已发起未落盘窗口——矩阵可在此注入 stop，
+        // rename 已发起未落盘窗口——矩阵可在此注入 stop，
         // 验证 stop 的锁内收尾必排在本 commit 持锁返回之后（见 finalizeStaleAndIdleLocked）
         await failpoint("metaCommit.beforeRename");
-        // R26-5：权威 lease——同步、无 await 夹缝；false 则 unlink tmp、不 rename
+        // 权威 lease——同步、无 await 夹缝；false 则 unlink tmp、不 rename
         if (finalGuard && !finalGuard()) {
           await fs.unlink(tmpPath).catch(() => {});
           return false;
         }
-        // R27-1：finalGuard 压进 rename retry 循环——每次 fs.rename 前再验；
+        // finalGuard 压进 rename retry 循环——每次 fs.rename 前再验；
         // 首轮失败退避期间换主 → RenameAbortedError → 清 tmp、返 false
         await renameWithRetry(tmpPath, finalPath, finalGuard);
         return true;
       } catch (err) {
         await fs.unlink(tmpPath).catch(() => {});
-        // R27-1：beforeAttempt 拒写 = 未提交（不是 IO 故障）
+        // beforeAttempt 拒写 = 未提交（不是 IO 故障）
         if (err instanceof RenameAbortedError) return false;
         throw err;
       }
@@ -660,7 +660,7 @@ const getEventAppendChains = (): Map<string, Promise<void>> => {
 };
 
 /**
- * R28-5：per-task 进程内事件单调序号（与 append 链同挂 globalThis，防 chunk 分裂）。
+ * per-task 进程内事件单调序号（与 append 链同挂 globalThis，防 chunk 分裂）。
  * 只在链内写行前发号，保证 seq 与磁盘 / publish 顺序一致。
  */
 const EVENT_SEQ_COUNTERS_KEY = "__feAiFlowEventSeqCountersV1__";
@@ -674,37 +674,37 @@ const getEventSeqCounters = (): Map<string, number> => {
 };
 
 /**
- * R30-4 / R31-4 / R32-7：从 events.jsonl **尾部窗口**求 max(seq)（近期兜底）。
+ * 从 events.jsonl **尾部窗口**求 max(seq)（近期兜底）。
  *
  * 分块向后扩展（64KB 起翻倍、上限 4MB）+ 对所见完整行求 max。
- *  alone 不足以覆盖「末条 >4MB」——见 R32-7：尾窗无完整行时强制全量扫。
+ * 尾窗 alone 不足以覆盖「末条 >4MB」——无完整行时强制全量扫。
  * 文件不存在 / 无 seq → foundAny=false。仅在 per-task append 链内调用（天然串行）。
  */
 const SEQ_RECOVER_CHUNK_MIN = 64 * 1024;
 const SEQ_RECOVER_CHUNK_MAX = 4 * 1024 * 1024;
 
 /**
- * R31-4 / R32-7：per-task seq high-water sidecar（task 目录下 `.event-seq`、内容 = 数字）。
+ * per-task seq high-water sidecar（task 目录下 `.event-seq`、内容 = 数字）。
  *
  * ## 恢复不变量（断言：任意恢复路径 restored ≥ durable 历史 max）
  *
  * - 内存 counter 在进程内精确；sidecar **批量推进**：成功 append 后若
  *   `seq - lastPersisted ≥ SEQ_SIDECAR_FLUSH_EVERY`（16）才异步原子写盘（tmp+rename、
  *   best-effort）。故 crash 时 sidecar ≤ durable max，且协议上落后至多 15 条。
- * - R32-7 恢复：`restored = max(sidecar ?? 全量扫, scanResult)`。
+ * - 恢复：`restored = max(sidecar ?? 全量扫, scanResult)`。
  *   - 缺 / 坏 sidecar → scanResult = 全量流式扫。
  *   - 有合法 sidecar → 先尾扫；若尾窗无任何完整 seq（含「文件 > 尾窗上限且窗口
  *     全是残行」——单条 assistant_message >4MB）→ **强制全量扫**，不再信 sidecar
  *     单独兜底（sidecar=0 合法落后时旧逻辑会重号）。
  *   - 统一 `restored = max(sidecar, scanResult)`：sidecar 只在 ≥ 扫描结果时抬水位。
- * - R32-7 写入：per-task promise 链串行 + 写前读盘只升不降（防两路异步 rename 反序回退）。
+ * - 写入：per-task promise 链串行 + 写前读盘只升不降（防两路异步 rename 反序回退）。
  * - DELETE：sidecar 随 task 目录删（天然，无需单独清理）。
  */
 export const EVENT_SEQ_SIDECAR_FILE = ".event-seq";
-/** R31-4：sidecar 落后上限（条）；典型事件下 N 条落在 SEQ_RECOVER_CHUNK_MAX 内 */
+/** sidecar 落后上限（条）；典型事件下 N 条落在 SEQ_RECOVER_CHUNK_MAX 内 */
 const SEQ_SIDECAR_FLUSH_EVERY = 16;
 
-/** R31-4：进程内「已调度/已确认写入 sidecar」水位（与 counter 同挂 globalThis） */
+/** 进程内「已调度/已确认写入 sidecar」水位（与 counter 同挂 globalThis） */
 const EVENT_SEQ_SIDECAR_WRITTEN_KEY = "__feAiFlowEventSeqSidecarWrittenV1__";
 const getEventSeqSidecarWritten = (): Map<string, number> => {
   const g = globalThis as unknown as Record<
@@ -717,7 +717,7 @@ const getEventSeqSidecarWritten = (): Map<string, number> => {
   return g[EVENT_SEQ_SIDECAR_WRITTEN_KEY]!;
 };
 
-/** R32-7：per-task sidecar 写串行链（挂 globalThis，与 HMR 寿命对齐） */
+/** per-task sidecar 写串行链（挂 globalThis，与 HMR 寿命对齐） */
 const EVENT_SEQ_SIDECAR_WRITE_CHAIN_KEY =
   "__feAiFlowEventSeqSidecarWriteChainV1__";
 const getEventSeqSidecarWriteChains = (): Map<string, Promise<void>> => {
@@ -741,7 +741,7 @@ const parseSeqNumber = (raw: string): number | null => {
   return n;
 };
 
-/** R31-4：读 sidecar；缺文件 / 损坏 / 非数字 → null（调用方走全量扫描） */
+/** 读 sidecar；缺文件 / 损坏 / 非数字 → null（调用方走全量扫描） */
 export const readSeqSidecar = async (
   taskId: string,
 ): Promise<number | null> => {
@@ -753,7 +753,7 @@ export const readSeqSidecar = async (
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     // 其它读错当损坏——不抛、走全量扫描
     console.warn(
-      `[task-fs-core] R31-4 读 seq sidecar 失败 task=${taskId}，fallback 全量扫描：`,
+      `[task-fs-core] 读 seq sidecar 失败 task=${taskId}，fallback 全量扫描：`,
       err,
     );
     return null;
@@ -761,9 +761,9 @@ export const readSeqSidecar = async (
 };
 
 /**
- * R31-4 / R32-7：原子写 sidecar（tmp+rename、best-effort）。
+ * 原子写 sidecar（tmp+rename、best-effort）。
  * per-task 串行 + 写前读盘只升不降——两路异步 rename 反序也不得把水位打退。
- * 导出供 R32-7 反序写测试直接调度。
+ * 导出供 反序写测试直接调度。
  */
 export const persistSeqSidecar = async (
   taskId: string,
@@ -772,7 +772,7 @@ export const persistSeqSidecar = async (
   const chains = getEventSeqSidecarWriteChains();
   const prev = chains.get(taskId) ?? Promise.resolve();
   const run = prev.catch(() => {}).then(async () => {
-    // R32-7：只升不降——盘上已有更大值则跳过本次写
+    // 只升不降——盘上已有更大值则跳过本次写
     const current = await readSeqSidecar(taskId);
     if (current !== null && current >= seq) return;
 
@@ -786,7 +786,7 @@ export const persistSeqSidecar = async (
     } catch (err) {
       await fs.unlink(tmpPath).catch(() => {});
       console.warn(
-        `[task-fs-core] R31-4 写 seq sidecar 失败（best-effort）task=${taskId} seq=${seq}：`,
+        `[task-fs-core] 写 seq sidecar 失败（best-effort）task=${taskId} seq=${seq}：`,
         err,
       );
     }
@@ -803,7 +803,7 @@ export const persistSeqSidecar = async (
 };
 
 /**
- * R31-4：批量推进 sidecar——seq 相对 lastPersisted 跨过 N 才 fire-and-forget。
+ * 批量推进 sidecar——seq 相对 lastPersisted 跨过 N 才 fire-and-forget。
  * 乐观记水位防 stampede；写失败则 sidecar 更旧，恢复靠尾扫 / 全量扫兜住。
  */
 const maybeFlushSeqSidecar = (taskId: string, seq: number): void => {
@@ -830,7 +830,7 @@ const seqFromEventLine = (line: string): number | null => {
 };
 
 /**
- * R31-4：全文件流式扫 max(seq)——旧数据缺 sidecar / sidecar 损坏 / R32-7 尾窗空时用；
+ * 全文件流式扫 max(seq)——旧数据缺 sidecar / sidecar 损坏 / 尾窗空时用；
  * 逐行 readline，不整读进内存。
  */
 const scanMaxSeqFullFile = async (taskId: string): Promise<number> => {
@@ -855,7 +855,7 @@ const scanMaxSeqFullFile = async (taskId: string): Promise<number> => {
   }
 };
 
-/** R32-7：尾扫结果——带 foundAny / fileSize，供「无完整行 → 强制全量扫」判定 */
+/** 尾扫结果——带 foundAny / fileSize，供「无完整行 → 强制全量扫」判定 */
 type TailSeqScan = {
   maxSeq: number;
   foundAny: boolean;
@@ -873,7 +873,7 @@ const readMaxSeqFromDurableTail = async (
     }
     const fh = await fs.open(p, "r");
     try {
-      // R30-4：64KB 起翻倍扩块；首行截断（start>0）时跳过残行
+      // 64KB 起翻倍扩块；首行截断（start>0）时跳过残行
       // 上限 4MB——对窗口内所有完整行求 max(seq)，不是「尾部第一个」
       let chunk = Math.min(SEQ_RECOVER_CHUNK_MIN, st.size);
       let maxSeq = 0;
@@ -919,7 +919,7 @@ const readMaxSeqFromDurableTail = async (
 };
 
 /**
- * R29-6 / R31-4 / R32-7：Map miss 时恢复 durable max 灌入 counter，再发号。
+ * Map miss 时恢复 durable max 灌入 counter，再发号。
  * 必须在 append 链内 await——恢复与发号同序、无并发。
  *
  * ## 不变量（任何恢复路径）
@@ -933,12 +933,12 @@ const ensureEventSeqCounter = async (taskId: string): Promise<void> => {
   const sidecar = await readSeqSidecar(taskId);
   let restored: number;
   if (sidecar === null) {
-    // R31-4：缺 / 坏 sidecar → 一次性全文件流式扫（旧数据迁移 / 损坏兜底）
+    // 缺 / 坏 sidecar → 一次性全文件流式扫（旧数据迁移 / 损坏兜底）
     restored = await scanMaxSeqFullFile(taskId);
   } else {
     const tail = await readMaxSeqFromDurableTail(taskId);
     let scanResult = tail.maxSeq;
-    // R32-7：尾窗无完整 seq → 强制全量扫。
+    // 尾窗无完整 seq → 强制全量扫。
     // 主触发面：fileSize > SEQ_RECOVER_CHUNK_MAX（4MB）且窗口全是残行（末条超窗）；
     // 同时覆盖「sidecar 合法但尾窗空」——不再用 sidecar 单独把 restored 定成 0。
     if (!tail.foundAny) {
@@ -957,7 +957,7 @@ const ensureEventSeqCounter = async (taskId: string): Promise<void> => {
   void persistSeqSidecar(taskId, restored);
 };
 
-/** R28-5：为 task 发下一个单调 seq（1-based）；调用前须 ensureEventSeqCounter */
+/** 为 task 发下一个单调 seq（1-based）；调用前须 ensureEventSeqCounter */
 const nextEventSeq = (taskId: string): number => {
   const counters = getEventSeqCounters();
   const n = (counters.get(taskId) ?? 0) + 1;
@@ -966,7 +966,7 @@ const nextEventSeq = (taskId: string): number => {
 };
 
 /**
- * R29-3：appendFile 失败（ENOENT）时回退刚发的号——同步链内无并发，
+ * appendFile 失败（ENOENT）时回退刚发的号——同步链内无并发，
  * 仅当 counter 仍等于本次 seq 才回退，避免误伤后续成功写入。
  */
 const rollbackEventSeq = (taskId: string, seq: number): void => {
@@ -977,10 +977,10 @@ const rollbackEventSeq = (taskId: string, seq: number): void => {
 };
 
 /**
- * R29-6：仅在 events 文件真删（deleteTask）时清 seq counter。
+ * 仅在 events 文件真删（deleteTask）时清 seq counter。
  * stop / cleanupChatTaskState 不再清——文件还在、counter 保持才单调。
- * R31-4：同时清 sidecar 内存水位（盘上 sidecar 随目录删 / 模拟重启时保留）。
- * R32-7：顺带摘掉写链入口（进行中的写仍会跑完；新写重新挂链）。
+ * 同时清 sidecar 内存水位（盘上 sidecar 随目录删 / 模拟重启时保留）。
+ * 顺带摘掉写链入口（进行中的写仍会跑完；新写重新挂链）。
  */
 export const clearEventSeqCounter = (taskId: string): void => {
   getEventSeqCounters().delete(taskId);
@@ -990,7 +990,7 @@ export const clearEventSeqCounter = (taskId: string): void => {
 
 /**
  * 实际 append（无串行）。
- * @returns true=已写入；false=ENOENT（任务目录已删、R27-7 透传给上层不 publish）
+ * @returns true=已写入；false=ENOENT（任务目录已删、透传给上层不 publish）
  */
 const appendEventLineUnlocked = async (
   id: string,
@@ -998,7 +998,7 @@ const appendEventLineUnlocked = async (
 ): Promise<boolean> => {
   // 不再无条件 mkdir：审查发现与 deleteTask 竞态时会把已删目录「复活」。
   // 调用方约定目录已存在（createTask 先 writeMeta；appendEvent 先查 meta；boot recovery 已有 meta）。
-  // 目录没了 = 任务已删 → ENOENT 返 false（R27-7：上层不构造成功、不 publish 幽灵事件）。
+  // 目录没了 = 任务已删 → ENOENT 返 false（上层不构造成功、不 publish 幽灵事件）。
   try {
     await fs.appendFile(
       path.join(taskDir(id), EVENTS_FILE),
@@ -1017,13 +1017,13 @@ const appendEventLineUnlocked = async (
  * 追加一条事件行（按 taskId 串行）。
  * 链上单次写入失败会抛给调用方，但不中断后续写入（catch 后继续）。
  *
- * R28-5 OrderedEventCommit：写行成功后、链内同步调用 onCommitted（通常 = publish），
+ * OrderedEventCommit：写行成功后、链内同步调用 onCommitted（通常 = publish），
  * 再释放链——杜绝「A 写完等 meta touch、B 先 publish」的 SSE/磁盘反序。
  *
- * @param lease R26-5：可选；在 chain 回调内、appendFile 之前同步执行。
+ * @param lease 可选；在 chain 回调内、appendFile 之前同步执行。
  *   false → 跳过写盘、返 false（堵死「检查通过后入队、B claim、队列才执行 A」）。
- * @param onCommitted R28-5：可选；写行成功且 failpoint 通过后、仍在链内同步调用。
- * @returns true=已 append；false=lease 拒写或 ENOENT（R27-7）
+ * @param onCommitted 可选；写行成功且 failpoint 通过后、仍在链内同步调用。
+ * @returns true=已 append；false=lease 拒写或 ENOENT
  */
 export const appendEventLine = async (
   id: string,
@@ -1033,28 +1033,28 @@ export const appendEventLine = async (
 ): Promise<boolean> => {
   const chains = getEventAppendChains();
   const previous = chains.get(id) ?? Promise.resolve();
-  // R26-5：lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
+  // lease 必须在 chain 内、appendFile 前同步验——入队后失主则拒写
   const run = async (): Promise<boolean> => {
     await failpoint("event.inQueue");
-    // R29-3：lease 拒绝路径不发号（不烧号）；发号紧挨即将 appendFile
+    // lease 拒绝路径不发号（不烧号）；发号紧挨即将 appendFile
     if (lease && !lease()) return false;
-    // R29-6：Map miss（stop 后 / 进程重启）→ 先从 durable 尾部恢复再发号
+    // Map miss（stop 后 / 进程重启）→ 先从 durable 尾部恢复再发号
     await ensureEventSeqCounter(id);
-    // R28-5 / R29-3：链内、lease 通过后发号——与写盘 / publish 同序
+    // 链内、lease 通过后发号——与写盘 / publish 同序
     ev.seq = nextEventSeq(id);
-    // R27-7：ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
+    // ENOENT 透传 false——上层 appendEvent 返 null、write* 不 publish
     const ok = await appendEventLineUnlocked(id, ev);
     if (!ok) {
-      // R29-3：未落盘——回退刚发的号，避免烧号空洞
+      // 未落盘——回退刚发的号，避免烧号空洞
       rollbackEventSeq(id, ev.seq);
       delete ev.seq;
       return false;
     }
-    // R31-4：落盘成功后批量推进 sidecar（每 N 条异步原子写，非每条同步）
+    // 落盘成功后批量推进 sidecar（每 N 条异步原子写，非每条同步）
     maybeFlushSeqSidecar(id, ev.seq);
-    // R28-5：写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
+    // 写行成功后、publish 前——矩阵可挂起证明 B 不能插队 publish
     await failpoint("event.beforePublish");
-    // R29：onCommitted（通常 publish）抛错不得断 append 链——写盘已成功，吞错继续放链
+    // onCommitted（通常 publish）抛错不得断 append 链——写盘已成功，吞错继续放链
     try {
       onCommitted?.(ev);
     } catch (err) {
@@ -1083,7 +1083,7 @@ export const appendEventLine = async (
 };
 
 /**
- * R28-3：同步读盘上 sessionAgentId（finalGuard 用、无 await 夹缝）。
+ * 同步读盘上 sessionAgentId（finalGuard 用、无 await 夹缝）。
  * 读失败 / 缺字段 → undefined。
  */
 export const readSessionAgentIdSync = (taskId: string): string | undefined => {

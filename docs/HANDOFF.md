@@ -281,11 +281,31 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 `src/lib/server/skills-loader.ts` 加载三源注入 prompt：平台自带 `<app>/skills/` + app 自管 `<dataRoot>/skills/` + 飞书 CLI `<dataRoot>/tools/skills/`。**不扫** `~/.cursor/skills/`（Cursor 全局只作能力页「从 Cursor 导入」源、拷成自管副本后才注入）。同名优先级：自管 > 平台 > 飞书 CLI。
 
+### 并发所有权与消息投递协议（2026-07-19 收敛）
+
+> 21 轮 adversarial review（外部 AI 深审 + 生产链反例）后收敛的并发模型。核心原则：**一个 owner、一套状态迁移、状态类别不共用空值/计数器**。动这些模块前先读本节；改并发/竞态 bug 优先收敛模型、不打局部补丁（learned-conventions 有对应条目）。
+
+| 层 | 协议 | 位置 |
+|---|---|---|
+| **task 操作所有权** | 统一 `TaskOpHandle`（`claimTaskOp` / `snapshotTaskOp` / `releaseTaskOpIf` / `revokeTaskOps`、owner CAS 单一判定入口）；start / send / consume / failure / stop 由 coordinator 统一收尾、禁止调用链外围补写 | `task-stream.ts` + `task-runner.ts` + `stop-task.ts` |
+| **消息受理 aggregate** | claim 返回唯一 handle、route 外层 finally 只认三出口（transfer 给 queue/runner、settle terminal、release+回滚 staged 附件）；phase = accepting → persisted →（**仅 runner 在 `agent.send` resolve 后**提交）handedOff \| 失败枚举族；terminal 与 recentSettled 同一 50 条有界淘汰、淘汰后同 id = 新受理 | `chat-queue.ts` + `chat-runner.ts` + `chat-reply/route.ts` |
+| **wire schema** | phase / outcome 只定义一次、client 表驱动 exhaustive decoder、未知值 fail-closed 为 unknown（绝不默认 delivered）；fingerprint 单一契约（共享 FNV） | `message-op-schema.ts` + `chat-payload-fingerprint.ts` |
+| **删除证据与可见性** | deletion journal 完整 runtime schema 校验、三态读（absent / present / unknown）；TaskVisibility = readable / deleted / unavailable——410 + `task_deleted` 只来自 committed 证据、unknown → 503（不 commit 删除）；删不存在任务幂等、不建 journal | `task-fs.ts` + 各 detail/list/watch route |
+| **client 消息状态** | 三个正交轴：`persistence`（气泡是否落盘、UI 占位只看它）/ `terminalKnowledge`（none \| unknown、known 直接摘 pending）/ `networkUncertain`（HTTP 响应丢失、same-id retry 依据）；可交换格 join（permutation 测试锁死）；bootstrap snapshot 无因果版本**只能单调 join**、不得清本地不确定证据；ledger 单提交入口 `dispatchChatOp(taskId, action)`（请求发起时捕获不可变 operationTaskId）、挂 globalThis 跨 HMR、带旧 shape 迁移 | `chat-pending-reconcile.ts` + `chat-op-ledger.ts` + `chat-submit-controller.ts` |
+| **watch SSE 重连** | `unavailableAttempts` 与 `transientFailures` 双计数（503 不吃普通网络错 6 次预算、持续有界重试）；首个合法 bootstrap 帧 established 即清 epoch、未 established 的 200 空流 EOF 记失败预算；已 hydrate watcher 的 404 = 物理删除完成 → deleted terminal（server 已把证据 unknown 独立编码为 503、此 404 无歧义） | `use-task-watch.ts` + `task-terminal.ts` + `task-store.ts: watchTaskStream` |
+| **failpoint 测试法** | 关键 await 后注入 stop / resume / advance / I/O 错验固定不变量；测试必须走真实 route/reducer 生产链、不许「预摆好状态调 helper」自证 | `failpoints.ts` + `tests/ownership-*.test.ts` |
+
 ---
 
 ## 最近演进（窗口式、保留 2 个子版本）
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
+
+### 2026-07-19 并发收敛重构（chat 打磨验收链完结、未发版）
+
+- **背景**：chat 打磨批次的验收由外部 AI 连审 21 轮、每轮 4-12 个并发/竞态 P1——根因是任务启动/接管、消息受理、删除证据、client 状态各自没有单一 owner 状态机、局部补丁组合爆炸。用户拍板停止打补丁、做收敛重构。
+- **落地**：见「当前架构快照 → 并发所有权与消息投递协议」一节（7 层协议：TaskOpHandle / MessageOperation aggregate / 共享 wire schema / 删除三态 / client 三轴格 join / watch 双计数 + established epoch / failpoint 测试法）。
+- **验收**：终轮生产链探针全部反转、蓝军证伪通过；门禁 typecheck / lint 0 warning / **全量 113 文件 1019 项测试全绿** / build。review 过程文档已清理、注释已脱敏（轮次编号全部改为自解释描述）。
 
 ### 2026-07-17 v1.1.20 发版：agent-shell 三轮外审加固（跨 bundle 状态 + 预检前置 + PATH 顺序）
 
@@ -294,20 +314,6 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 - **P1 预检前置**：旧序「注入 PATH+SHELL → await where 校验（5s 超时）→ 失败回滚」在校验窗口把临时环境暴露给并发创建的 agent。修：①绝对路径自检 → ②候选 PATH（不写 process.env、含模拟卸旧段）带候选 env 跑 `where bash` 链校验（SDK 同款 `/git.*bash/i`、防 WSL bash 抢位）→ ③全过才 `commitShellEnv` 同步一次性提交（无 await 夹缝）；任一预检失败环境从未被本次改动。apply 经 globalThis promise 链串行（启动 fire-and-forget 与设置 PUT 不交错）。
 - **P2 PATH 顺序**：`includes` 判断改「首段判断」——目标 bin 在 PATH 后部时在首位新增一段（不动用户原有段）、只有真正新增才记 `injectedBinDir`、移除只删第一个匹配段；`pathSegmentEquals` 统一 Windows 语义比较（大小写不敏感 + 尾斜杠归一）。
 - 全量 42 文件 468 测试全绿 + `pnpm build` 过；**Windows 真机 SDK smoke 仍未做**（mac mock 不能替代）——发版后需一台中招同事机器验证：开开关 → main.log shell 有 `phase=done status=success`、无 `Can't find Bash`。
-
-### 2026-07-17 v1.1.19 发版：Windows Git Bash 卡死热修 + 全仓审查修复批
-
-- **Windows「Agent shell 用 Git Bash」把 shell 彻底弄挂（v1.1.18 引入的线上事故、多个同事中招）**：v1.1.18 只写了 `process.env.SHELL`，但 SDK（1.0.23）选壳器和执行器是**两套独立逻辑**——选壳器 `vt()` 读 SHELL 命中 git-bash 就选 Bash 执行器（✅ 生效），但 Bash 执行器 `Ue()` 在 win32 下**根本不读 SHELL**、只在 `PATH` 里 `where bash` 找路径像 git-bash 的 bash。用户机器 PATH 只有 `Git\cmd`（装 Git 默认只加这个、里面没 bash.exe）→ 每条 shell 抛 `Can't find Bash` → 在 SDK async generator 里逃逸成 unhandledRejection（被 instrumentation 兜底进程不退）→ 工具调用永不结束 → agent 反复「shell 不可用/卡住」。诊断包 main.log 实锤：`SHELL → Git Bash` 后每条 `[perf-tool] tool=shell phase=start` 都无 `phase=done`、紧跟 `Error: Can't find Bash`；read/glob 正常。修法（`agent-shell.ts`）：开关开且探到 bash.exe 时**除写 SHELL 外把 `Git\bin` 前置注入 PATH**（让执行器 `where bash` 命中）+ 注入后跑 `bash -c echo __shell_ok__` **自检**、失败回滚 SHELL+PATH 退回 PowerShell（防「UI 说优化了、实际全挂」的假成功）；关开关/探测失败/自检失败按 `injectedBinDir` 精确卸载注入段、不碰 PATH 其它段；换 Git 安装路径先卸旧再注新。抽 `injectGitBashBinToPath`/`removeInjectedGitBashBinFromPath`/`verifyGitBashRunnable`/`syncAgentShellEnv` 可单测。
-- **全仓代码审查修复批（安全 / 竞态 / 数据一致性）**：11 个子代理全仓审查后修的一批实锤问题——
-  - **Electron 壳安全**：`will-navigate` 用严格 `new URL` 校验（protocol+hostname+port）替换 `startsWith(BASE_URL)`（防 `127.0.0.1:8876@evil` 等前缀绕过带 preload 进外部页）；去掉主窗 `data:` 放行；`window.open` 的 `openExternal` 补协议白名单（与 IPC 同源）；`await cleanupUpdateLeftovers` 消除与 update-pending marker 的启动竞态。
-  - **运行时停止链**：`stopTaskAgent`/`finalizeTask` 收尾清粘性 `pendingStopRequests`（否则误杀下轮 oneshot 答疑）；chat `closeChatSession` 加 agentId 门控（对齐 task 侧、防切模型强清后旧 run 误关新会话）；`sendChatMessage` 校验后立即占 `runActive`（关 TOCTOU 并发双发）；停止孤儿 reap 改传 `getTaskWorkRepoPaths`（隔离 worktree 任务原先漏杀）。
-  - **数据落盘**：`deleteTask` 持 `withTaskLock` + `appendEventLine` 去掉无条件 mkdir（防删后被并发写「复活」）；`writePrivateFileAtomic` 抽 `renameWithRetry` 补 Windows EPERM 重试；settings PUT 走 globalThis 写链串行 RMW（防并发丢更新）；mr-inbox-seen/ignored 写链挂 globalThis；`update-pending` 读 marker 只 ENOENT 放行、其它错误 fail-closed；custom-action ACTION.md 原子写。
-  - **集成层**：`submit-mr-guard` remote 读不到改 fail-closed（防越权提 MR）；`git-remote` 正确解析 `ssh://`（带端口）；`closeOpenMR` 区分「确认没开」与查询失败（防解冲突后旧 MR 双开）；GitLab fetch 统一 30s 超时；meegle 身份缓存随登录/登出失效。
-  - **API 路由**：chat-reply 改「确定送达后再落 user_reply」（409 不再假「已发送」）；skills POST 类型守卫；question 缺凭据 400 前不做 snapshot；watch-task SSE 挂 `req.signal` 清理 + `sentEventIds` 上限；local-image realpath 后再验扩展名。
-  - **前端**：任务详情页切 id 竞态（routeIdRef 守卫、迟到 fetch/SSE 不覆盖当前任务）；事件上拉分页迟到回调串任务；mr-inbox refresh/setSeen 补 res.ok；MCP 开关连点串行化 + loading 用 LoadingState 不显假空态；一批 min-w-0 / 顶栏胶囊 `bg-selected` / edit-task-dialog `disablePointerDismissal` / 定时器卸载清理。
-  - **共享 lib**：md-revision 三处（词级修订补 blockMarks、fingerprint 纳入 url/depth/ordered、相邻 list 插 HTML 注释分隔防块错位）；批次进度计入 `awaiting_ack`；path-utils UNC 双引号；local-store 浅拷贝/回滚/校验；`ACTION_LABEL` 双源收敛到 types.ts。
-  - **action 闸门**：review/build 必备段正则改 `#{2,3}` 标题锚定（原被总评 bullet 架空）；checkDev 直推路径也读 artifact 验非空。
-  - **shell 环境**：`hasShellBoost` 改匹配守卫本体（原只认 env 名子串、误判「已优化」）；login PATH 合并用 pinnedPrefixes 保 tools/bin 置顶；agent-shell 探测负缓存开关旁路。
 
 ## 关键文件索引
 

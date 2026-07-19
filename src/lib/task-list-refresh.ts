@@ -1,5 +1,5 @@
 /**
- * R32-5：任务列表 refresh 提交闸（纯函数）
+ * 任务列表 refresh 提交闸（纯函数）
  *
  * 从 use-task-list 抽出，便于 Node 侧单测（vitest 不解析 hook 的 JSX）。
  * DELETE 200 推进 epoch 后，任何更早启动的 refresh 不得 setTasks；

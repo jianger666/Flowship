@@ -238,7 +238,7 @@ export const ReconnectingRow = memo(
 );
 ReconnectingRow.displayName = "ReconnectingRow";
 
-/** P5 / R34-4：本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中） */
+/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中） */
 export const PendingLocalReplyRow = memo(
   ({ text, uncertain }: { text: string; uncertain?: boolean }) => (
     <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
@@ -297,7 +297,7 @@ const EventRowImpl = ({
   // 编辑 / 重发飞行锁（防连点；失败时保持 editing）
   const [editSubmitting, setEditSubmitting] = useState(false);
   const resendLockRef = useRef(false);
-  // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、蓝军 P1：别写死）
+  // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、别写死）
   const submitShortcut = useSubmitShortcut();
   // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
   useEffect(() => {

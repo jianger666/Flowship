@@ -249,7 +249,7 @@ export const FeishuBoard = () => {
     (it: BoardItem) => {
       // localStorage / 内存缓存里的 task id 删任务后不失效——用侧栏实时列表校验；
       // 列表还没加载完（loaded=false、tasks 空）时回退信任缓存映射——否则秒开缓存
-      // 期间点已有任务会被误导去预览页、可能重复建任务（蓝军 P1）
+      // 期间点已有任务会被误导去预览页、可能重复建任务
       if (it.task && (!tasksLoaded || liveTaskIds.has(it.task.id))) {
         router.push(`/tasks/${it.task.id}`);
         return;

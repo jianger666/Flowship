@@ -111,7 +111,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   let task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒发送 / 唤醒
+  // lifecycle 非 null（stopping/deleting/finalizing）一律拒发送 / 唤醒
   {
     const life = getChatLifecycle(id);
     if (life !== null) {
@@ -125,7 +125,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // W2：读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 等 drain /
+  // 读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 等 drain /
   // supersede 等长 await，再取会被 stop bump 后的新值冒充新意图
   const opGen = getTaskOpGeneration(task.id);
 
@@ -151,7 +151,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       }
       const fresh = await getTask(id);
       if (!fresh) return errorResponse("not_found", 404);
-      // 等待期间用户可能点了「推进」起了新 action / 新 run（蓝军 P1）：
+      // 等待期间用户可能点了「推进」起了新 action / 新 run：
       // 世界已变、这条消息的语境失效——再校验一次、不满足就让用户重发
       const freshCurrent = fresh.actions.find(
         (a) => a.id === fresh.currentActionId,
@@ -184,7 +184,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // X1：长 await（存图）后复查——stop 期间不得继续 fallback / 写 running
+  // 长 await（存图）后复查——stop 期间不得继续 fallback / 写 running
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
@@ -225,7 +225,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
-  // X1：snapshot 长 await 后再查
+  // snapshot 长 await 后再查
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
@@ -240,7 +240,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 用户显式选了模型 → 不续会话（会话模型锁死换不了）；
   // 否则先送达存活会话（同 ask-reply 顺序约定：送不到不写事件、防假已发）、接不回走下面分流
-  // X1：forceModel 视为无会话续接意图（走下方分流），不是 stale
+  // forceModel 视为无会话续接意图（走下方分流），不是 stale
   const deliverResult = forceModel
     ? ("no_session" as const)
     : await deliverTaskQuestion(
@@ -253,7 +253,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         opGen,
       );
 
-  // X1：stale → 409，绝不 fallback one-shot、不写事件、不写 running
+  // stale → 409，绝不 fallback one-shot、不写事件、不写 running
   if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
@@ -285,7 +285,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     `[question] task=${task.id} text=${text.slice(0, 60)} images=${images.length} mode=${sent ? "send" : canResume ? "resume" : "oneshot"}`,
   );
 
-  // X1：写事件 / supersede / 置 running 前最后复查（含 useOneShot 窗口）
+  // 写事件 / supersede / 置 running 前最后复查（含 useOneShot 窗口）
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
@@ -293,18 +293,18 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 用户绕开 ask 弹窗直接在输入条说话 = 旧弹窗事实作废（send：agent 收到新消息就继续了；
   // oneshot：旧会话已死、答案永远送不到）。不作废的话弹窗永远挂着（用户实测卡死、再答 409）。
   // canResume 分支不用管——resumeCurrentActionWithMessage 内部已 supersede。
-  // R29-4：send 后可先清 pending；send 前（oneshot）须等用户原文落盘成功再清
+  // send 后可先清 pending；send 前（oneshot）须等用户原文落盘成功再清
   if (sent) {
     await supersedePendingAsks(task.id, "用户已在输入条继续对话");
     clearPendingAsk(task.id);
   }
 
-  // X1：supersede 是 await——后再查一次再写「已送达」事件
+  // supersede 是 await——后再查一次再写「已送达」事件
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
-  // R29-4：用户原文 strict 落盘
+  // 用户原文 strict 落盘
   // - sent（send 后）：失败 → 200 + persistWarning，不伪装未发送
   // - !sent（resume/oneshot、start 前）：失败 → 5xx、不继续、不清 pending
   let persistWarning: string | undefined;
@@ -326,7 +326,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (sent) {
         persistWarning = PERSIST_WARNING_DELIVERED;
         console.error(
-          `[question] R29-4 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+          `[question] 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
         );
       } else {
         return errorResponse("not_found", 404);
@@ -335,20 +335,20 @@ export const POST = async (req: Request, { params }: Ctx) => {
   } catch (persistErr) {
     if (sent) {
       console.error(
-        `[question] R29-4 已送达但持久化失败 task=${task.id}:`,
+        `[question] 已送达但持久化失败 task=${task.id}:`,
         persistErr,
       );
       persistWarning = PERSIST_WARNING_DELIVERED;
     } else {
       console.error(
-        `[question] R29-4 start 前落盘失败 task=${task.id}:`,
+        `[question] start 前落盘失败 task=${task.id}:`,
         persistErr,
       );
       return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
     }
   }
 
-  // oneshot：落盘成功后再作废旧 ask（R29-4：失败路径不得清 pending）
+  // oneshot：落盘成功后再作废旧 ask（失败路径不得清 pending）
   if (!sent && useOneShot) {
     await supersedePendingAsks(task.id, "用户已在输入条继续对话");
     clearPendingAsk(task.id);
@@ -357,7 +357,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // send 成功且产出在等审阅：action 回 running（agent 处理完会重新交卷回 awaiting_ack）——
   // 原 revise 的状态机语义、防「artifact 在改、UI 还显示等审阅」
   if (sent && ackContext) {
-    // R18-1 / R19-1：锁内 op-fresh + 结构条件事务——一次写 action+runStatus，杜绝
+    // 锁内 op-fresh + 结构条件事务——一次写 action+runStatus，杜绝
     //「patchAction await → stop 写 idle → setTaskRunStatus 又盖回 running」；
     // 并挡同 epoch 并发 advance（不 bump gen）已把 A 标 completed / current 推到 B 后旧 Q 抢回。
     const running = await patchActionAndRunStatusIfOpFresh(
@@ -426,7 +426,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       opGen,
     }).catch(async (err) => {
       console.error(`[question] task=${task.id} 唤醒当前 action 失败：`, err);
-      // R29-1：唤醒失败审计事件写+publish 同链（best-effort 吞错）
+      // 唤醒失败审计事件写+publish 同链（best-effort 吞错）
       await writeEventAndPublish(task.id, {
         kind: "error",
         text: `唤醒当前阶段失败：${err instanceof Error ? err.message : String(err)}`,
@@ -439,12 +439,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
     });
   }
 
-  // X1：one-shot「先写 running 再 start」窗口——写 running 前最后复查
+  // one-shot「先写 running 再 start」窗口——写 running 前最后复查
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
-  // R25-2：裸 setTaskRunStatus → terminal-aware 条件事务。
+  // 裸 setTaskRunStatus → terminal-aware 条件事务。
   // expectedRunStatus = route 判定 one-shot 时看到的等待位（idle/awaiting_user/error…）；
   // isOwner = gen 未 stale + lifecycle 空；终态由 setTaskRunStatusIfRunOwner 内拒。
   const expectedWaitingStatus = task.runStatus;

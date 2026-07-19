@@ -6,7 +6,7 @@
  * 访问面收敛：服务端只绑 127.0.0.1（启动脚本 -H / Electron HOSTNAME）+
  * middleware 校验 Host/Origin 是 loopback、非本机页面拿不到。
  *
- * P1-04：config 损坏 / 权限失败 → 500 settings_unreadable（不得当 exists:false 首次迁移）。
+ * config 损坏 / 权限失败 → 500 settings_unreadable（不得当 exists:false 首次迁移）。
  */
 import { NextResponse } from "next/server";
 

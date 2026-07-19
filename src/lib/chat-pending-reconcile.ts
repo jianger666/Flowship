@@ -1,8 +1,8 @@
 /**
- * R31-1 / R32-1 / R33-1 / R35-2 / R36-2/3/4 / R40-1：前端 pending / Operation 对账纯函数。
+ * 前端 pending / Operation 对账纯函数。
  *
  * ---------------------------------------------------------------------------
- * R40-1：正交 product-state（取代一维 phase rank）
+ * 正交 product-state（取代一维 phase rank）
  * ---------------------------------------------------------------------------
  *
  * 三个事实轴互相独立，禁止再排成线性优先级（persisted > unknown > network）：
@@ -26,7 +26,7 @@
  *   reject **故意不交换**——注释与 permutation 测试对此分账：格 join 测三轴单调 OR/max；
  *   ack 清除单独测「当前位 → false，且不碰 persistence / terminalKnowledge」。
  *
- * R41-1：bootstrap queue_state / operationSnapshot **没有** attempt generation / wire seq，
+ * bootstrap queue_state / operationSnapshot **没有** attempt generation / wire seq，
  * 不能证明比本地 http_reject_network / unknown terminal 更新——故只能单调 join
  * （可升 persistence、可重建 active），**禁止** clearAllUncertainty / 清 network 位。
  * 本地仍 uncertain 时 UI 继续「发送状态未知」是 fail-closed：无因果版本的 snapshot
@@ -62,7 +62,7 @@ export type PendingProductState = {
   networkUncertain: boolean;
 };
 
-/** @deprecated R40-1 起改用 terminalKnowledge / networkUncertain；保留类型别名供迁移阅读 */
+/** @deprecated 改用 terminalKnowledge / networkUncertain；保留类型别名供迁移阅读 */
 export type UncertainCause = "network" | "unknown_terminal";
 
 export type PendingLocalReplyLike = {
@@ -101,7 +101,7 @@ export type ChatOperation = {
   id?: string;
 };
 
-/** R36-3：client ledger 终态（unknown = 未知 wire / ghost，可同 id 重试） */
+/** client ledger 终态（unknown = 未知 wire / ghost，可同 id 重试） */
 export type OpTerminalOutcome = ClientLedgerOutcome;
 
 /** Operation ledger——pending + 终态 id + outcome */
@@ -111,7 +111,7 @@ export type ChatOpState = {
   outcomes: Record<string, OpTerminalOutcome>;
 };
 
-/** R32-1：早到终态记账上限（FIFO 淘汰最老） */
+/** 早到终态记账上限（FIFO 淘汰最老） */
 export const SETTLED_ITEM_IDS_MAX = 200;
 
 /** 初始 product-state（新登记） */
@@ -132,7 +132,7 @@ export const shouldHideLocalPlaceholder = (
 ): boolean => p.persistence === "persisted";
 
 /**
- * R33-1：客户端预生成短 itemId（crypto.randomUUID 去横线后取前 12）。
+ * 客户端预生成短 itemId（crypto.randomUUID 去横线后取前 12）。
  * 在 POST 前登记 pending，消除「202 晚到插入幽灵」。
  */
 export const allocClientChatQueueItemId = (): string => {
@@ -141,7 +141,7 @@ export const allocClientChatQueueItemId = (): string => {
 };
 
 /**
- * R32-1：把 itemIds 记入 settled（已有则跳过）；超 max 时 FIFO 丢最老。
+ * 把 itemIds 记入 settled（已有则跳过）；超 max 时 FIFO 丢最老。
  */
 export const rememberSettledItemIds = (
   settled: readonly string[],
@@ -160,7 +160,7 @@ export const rememberSettledItemIds = (
   return next.slice(next.length - max);
 };
 
-/** R37-5：outcomes 只保留仍在 settled 索引内的 key */
+/** outcomes 只保留仍在 settled 索引内的 key */
 const pruneOutcomesToSettled = (
   outcomes: Record<string, OpTerminalOutcome>,
   settled: readonly string[],
@@ -183,7 +183,7 @@ const pruneOutcomesToSettled = (
 };
 
 /**
- * R37-4 / R37-5：只接受 known terminal（delivered/failed）进 settled + outcomes。
+ * 只接受 known terminal（delivered/failed）进 settled + outcomes。
  */
 export const rememberKnownTerminals = (
   settled: readonly string[],
@@ -223,7 +223,7 @@ export const rememberKnownTerminals = (
   };
 };
 
-/** R37-4：wire raw → known ledger outcome；未知/缺失 → null */
+/** wire raw → known ledger outcome；未知/缺失 → null */
 export const decodeKnownLedgerOutcome = (
   raw: string | undefined,
 ): "delivered" | "failed" | null => {
@@ -233,19 +233,19 @@ export const decodeKnownLedgerOutcome = (
   return decoded.outcome === "delivered" ? "delivered" : "failed";
 };
 
-/** R32-1：itemId 是否已有终态 */
+/** itemId 是否已有终态 */
 export const isItemSettled = (
   settled: readonly string[],
   itemId: string,
 ): boolean => settled.includes(itemId);
 
-/** R35-2：读取终态 outcome */
+/** 读取终态 outcome */
 export const getOpTerminalOutcome = (
   outcomes: Record<string, OpTerminalOutcome>,
   itemId: string,
 ): OpTerminalOutcome | undefined => outcomes[itemId];
 
-/** R36-3：表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown */
+/** 表驱动归一——只认精确 delivered / failure 枚举；未知 → unknown */
 export const normalizeLedgerOutcome = (
   raw: string | undefined,
 ): OpTerminalOutcome => normalizeWireOutcomeToLedger(raw);
@@ -274,7 +274,7 @@ export const joinProductState = (
  * - 轴提升走格 join
  * - clearNetworkUncertain：定向清 network 位（仅同一次 HTTP queued/direct ack）
  * - clearAllUncertainty：仅 live message_op accepting/persisted（同流正证据）；
- *   bootstrap queue_state **不得**走此入口（无因果版本，见模块顶 R41-1）
+ *   bootstrap queue_state **不得**走此入口（无因果版本，见模块顶：bootstrap 无 attempt generation）
  */
 export type ProductStateIncoming = {
   persistence?: PersistenceAxis;
@@ -338,7 +338,7 @@ const applyProductJoin = <T extends PendingLocalReplyLike>(
 
 /**
  * uncertain / unknown 同 fingerprint 才复用 id（改附件/skill/文案 → 新 id）。
- * R40-1：覆盖 persisted-but-response-lost（persistence=persisted 且 networkUncertain）。
+ * 覆盖 persisted-but-response-lost（persistence=persisted 且 networkUncertain）。
  */
 export const findReusableUncertainOperation = <T extends PendingLocalReplyLike>(
   pending: readonly T[],
@@ -355,7 +355,7 @@ export const findReusableUncertainOperation = <T extends PendingLocalReplyLike>(
 
 /**
  * 收到落盘 user_reply → 按 meta.queueItemId 清 pending。
- * @deprecated R36-2：user_reply 非终态，请用 markPendingPersistedByUserReply
+ * @deprecated user_reply 非终态，请用 markPendingPersistedByUserReply
  */
 export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
   prev: T[],
@@ -373,7 +373,7 @@ export const removePendingByUserReply = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R36-2 / R40-1：user_reply = persistence 提升为 persisted，不写 delivered、不进 settled。
+ * user_reply = persistence 提升为 persisted，不写 delivered、不进 settled。
  * 经 join：不降级、不吞 terminalKnowledge / networkUncertain。
  */
 export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>(
@@ -408,7 +408,7 @@ export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   });
 
 /**
- * R32-1 / R36-2：user_reply 对账——标 persisted，不记 settled / delivered。
+ * user_reply 对账——标 persisted，不记 settled / delivered。
  */
 export const applyUserReplyTerminal = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -430,7 +430,7 @@ export const removePendingByQueueFailed = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-1：queue_failed 终态对账——清 pending + 全量记入 settled。
+ * queue_failed 终态对账——清 pending + 全量记入 settled。
  */
 export const applyQueueFailedTerminal = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -442,7 +442,7 @@ export const applyQueueFailedTerminal = <T extends PendingLocalReplyLike>(
 });
 
 /**
- * R32-1：202 返回后是否允许插入 pending——已 settled 则禁止。
+ * 202 返回后是否允许插入 pending——已 settled 则禁止。
  */
 export const shouldInsertPendingAfter202 = (
   settled: readonly string[],
@@ -450,7 +450,7 @@ export const shouldInsertPendingAfter202 = (
 ): boolean => !isItemSettled(settled, itemId);
 
 /**
- * R33-1 / R36-2：onDone 清 pending——只清「已有明确终态」的条目；
+ * onDone 清 pending——只清「已有明确终态」的条目；
  * 无终态的保持 / 标 networkUncertain（不再按 runStatus 猜成功）。
  */
 export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
@@ -481,7 +481,7 @@ export const applyDoneClearPending = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R33-1：HTTP 失败 / 非排队 200 时摘掉请求前登记的 pending。
+ * HTTP 失败 / 非排队 200 时摘掉请求前登记的 pending。
  */
 export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -497,7 +497,7 @@ export const dropPendingByItemId = <T extends PendingLocalReplyLike>(
 };
 
 /**
- * R32-2 / R33-1 / R36-4 / R40-1 / R41-1：SSE 重连 bootstrap 对账。
+ * SSE 重连 bootstrap 对账。
  * unknown recentSettled 走同一 product join——不得硬写降 persistence。
  * active 分支只单调 join：可升 persistence，不得清 network / unknown（无因果版本）。
  */
@@ -549,7 +549,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
   for (const p of pending) {
     const cur = readProduct(p);
     // 仍在服务端存活集合 → 保留；snapshot 只可提升 persistence（单调 join）。
-    // R41-1：不得 clearAllUncertainty——bootstrap 无 attempt generation，不能反驳
+    // 不得 clearAllUncertainty——bootstrap 无 attempt generation，不能反驳
     // 本地 network reject / unknown terminal；保留 uncertain 投影是 fail-closed。
     if (serverSet.has(p.itemId)) {
       const snap = snapshotById.get(p.itemId);
@@ -565,7 +565,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       seenPending.add(p.itemId);
       continue;
     }
-    // R40-1：unknown recentSettled → join terminalKnowledge，不硬写、不降 persistence
+    // unknown recentSettled → join terminalKnowledge，不硬写、不降 persistence
     if (unknownLedgerIds.has(p.itemId)) {
       nextPending.push(
         applyProductJoin(p, { terminalKnowledge: "unknown" }),

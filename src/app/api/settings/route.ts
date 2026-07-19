@@ -25,7 +25,7 @@ export const runtime = "nodejs";
  * CR-01：响应里的 settings 也脱敏。
  * CR-08：读改写串行化在 settings-fs.putSettingsFile（globalThis 写链）——
  * 两个快速 PUT 不会乱序互相覆盖。
- * P1-04：读失败（error）拒绝写入，避免用客户端缓存覆盖损坏但可能可修复的原文件。
+ * 读失败（error）拒绝写入，避免用客户端缓存覆盖损坏但可能可修复的原文件。
  */
 
 /** 从 settings 对象抠 meegleProject.key（缺 / 坏 → 默认悟空 key） */

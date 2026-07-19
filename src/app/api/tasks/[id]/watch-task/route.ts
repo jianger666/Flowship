@@ -23,7 +23,7 @@
  *   - 客户端断开 → unsubscribe + close、agent 不受影响
  *   - 多个 tab 同时 watch 同一个任务 → 各自一份 fanout、互不干扰
  *
- * race 处理（P1-01）：
+ * race 处理：
  *   必须「先 subscribe → 再 getTask 快照」——订阅期间事件一律进 buffer，
  *   否则 getTask 到 subscribe 之间产生的事件既不在快照里、也进不了 buffer（真丢）。
  *   快照发完后用 sentEventIds 去重回放 buffer，再转直通；快照 tail 的 event id
@@ -46,7 +46,7 @@ import {
 } from "@/lib/server/task-stream";
 import type { Task } from "@/lib/types";
 
-// R36-7（主线合并）：内联临时实现已删——统一走 task-fs 的正式 getTaskVisibility
+// 内联临时实现已删——统一走 task-fs 的正式 getTaskVisibility
 // （同步、含 journal schema 校验与 meta unknown 口径、与 detail/events route 同源）
 
 interface Ctx {
@@ -81,7 +81,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
     MAX_EVENTS_TAIL,
   );
 
-  // P1-01：订阅必须先于快照读取——controller 尚未 ready 时事件只能进 buffer。
+  // 订阅必须先于快照读取——controller 尚未 ready 时事件只能进 buffer。
   // liveDispatch 在 ReadableStream start 里装上后才转直通。
   const buffered: TaskStreamEvent[] = [];
   let bootstrapping = true;
@@ -105,7 +105,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
   req.signal.addEventListener("abort", cleanup, { once: true });
 
   // 订阅已挂上：此 await 期间产生的事件进 buffer，不会丢
-  // 尾部反向读、不整文件 parse（P1-02）
+  // 尾部反向读、不整文件 parse
   let initial: Task | null;
   try {
     initial = await getTaskWithTailEvents(id, tail);
@@ -113,7 +113,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
     cleanup();
     throw err;
   }
-  // R36-7：可读性三态——deleted→410+task_deleted；unavailable→503（不发 task_deleted）
+  // 可读性三态——deleted→410+task_deleted；unavailable→503（不发 task_deleted）
   const visibility = getTaskVisibility(id);
   if (visibility === "deleted") {
     cleanup();
@@ -207,7 +207,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
           case "assistant_delta":
             send({ type: "assistant_delta", text: ev.text });
             break;
-          // R31-1：队列整队失败控制帧（纯内存、不落盘）
+          // 队列整队失败控制帧（纯内存、不落盘）
           case "queue_failed":
             send({
               type: "queue_failed",
@@ -215,7 +215,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
               reason: ev.reason,
             });
             break;
-          // R36-2：MessageOperation 终态帧（handedOff=delivered / failed 家族）
+          // MessageOperation 终态帧（handedOff=delivered / failed 家族）
           case "message_op":
             send({
               type: "message_op",
@@ -224,7 +224,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
               outcome: ev.outcome,
             });
             break;
-          // R33-4：DELETE 逻辑删除提交 → 通知客户端并关流
+          // DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
             closeStream();
@@ -246,7 +246,7 @@ export const GET = async (req: Request, { params }: Ctx) => {
           rememberEventId(ev.id);
           send({ type: "event", event: ev });
         }
-        // R32-2 / R33-1 / R36-4：bootstrap 附带 queue itemIds（旧字段兼容）+
+        // bootstrap 附带 queue itemIds（旧字段兼容）+
         // 完整 operationSnapshot（含 accepting/persisted，关闭 ghost→delivered 窗口）+
         // recentSettled ledger。
         send({
