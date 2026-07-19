@@ -27,6 +27,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/loading-state";
 import { SettingRow } from "@/components/ui/setting-row";
 import { Switch } from "@/components/ui/switch";
+import { formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 
 /** GET /api/feishu-bridge/status 响应（与 probe.ts 对齐） */
@@ -63,6 +64,8 @@ interface BridgeStatusPayload {
       lastError?: string;
       subscribeUrl?: string;
     }>;
+    /** 最近收到飞书消息的时刻（undefined = 本次启动后从未）——收消息自检 */
+    lastInboundAt?: number;
   } | null;
   error?: string;
 }
@@ -315,6 +318,17 @@ export const FeishuBridgeBlock = ({
                     }
                   />
                 )}
+                {/* 收消息自检：订阅配没配对后台探测不到，用「实际收到过消息」当端到端信号。
+                    从未收到时给操作指引（发一句→点刷新验证）；收到过就绿灯不啰嗦 */}
+                <CheckRow
+                  ok={!!status?.runtime?.lastInboundAt}
+                  title="收消息自检"
+                  detail={
+                    status?.runtime?.lastInboundAt
+                      ? `最近收到：${formatRelative(status.runtime.lastInboundAt)}`
+                      : "在飞书给机器人发一句，然后点刷新——收到即通"
+                  }
+                />
                 {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
                     ready 正常态和启动瞬态（starting/stopped/backoff 几秒内自愈）不展示、
                     避免误解（2026-07-19 用户反馈：正常也一排 stopped 很吓人） */}

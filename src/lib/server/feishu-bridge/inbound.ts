@@ -187,6 +187,9 @@ export const defaultMessageHandler = async (raw: unknown): Promise<void> =>
   enqueueInboundMessage(async () => {
     const msg = normalizeInboundEvent(raw);
     if (!msg) return;
+    // 收消息自检打点：只要链路收到过任何入向消息就记（早于去重/过滤，
+    // 语义是「订阅通了」而不是「消息被处理了」）
+    markBridgeInboundReceived();
     if (await hasProcessedMessageId(msg.message_id)) return;
     const result = await routeInboundMessage(msg);
     // R1-6：基础设施类 retryable 失败不 mark、不推进游标——等补拉重投
@@ -252,6 +255,13 @@ export type BridgeRuntimeStatus = {
   hostname: string;
   consumers: ConsumerRuntimeState[];
   lastError?: string;
+  /** 最近收到飞书消息的时刻（undefined = 本次启动后从未收到）——收消息自检 */
+  lastInboundAt?: number;
+};
+
+/** 入向链路收到任意消息时打点（router 入口调）——设置页「收消息自检」数据源 */
+export const markBridgeInboundReceived = (): void => {
+  getRuntime().lastInboundAt = Date.now();
 };
 
 // ----------------- spawn 可注入 -----------------
@@ -523,6 +533,8 @@ type RuntimeSingleton = {
   syncing: boolean;
   lastOverallError?: string;
   exitHooked: boolean;
+  /** 最近一次收到飞书入向消息的时刻——设置页「收消息自检」用（0 = 本次启动后从未） */
+  lastInboundAt?: number;
 };
 
 const RUNTIME_KEY = "__flowshipFeishuBridgeRuntimeV1__";
@@ -853,6 +865,7 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
     hostname: os.hostname(),
     consumers,
     lastError: rt.lastOverallError,
+    lastInboundAt: rt.lastInboundAt,
   };
 };
 
