@@ -81,11 +81,13 @@ export const WATCH_UNAVAILABLE_BACKOFF_CAP_MS = 12_000;
 export const WATCH_CLEAN_RECONNECT_DELAY_MS = 1_000;
 
 /**
- * R37-6：watch 失败后的重连策略（纯函数）。
+ * R37-6 / R38-2：watch 失败后的重连策略（纯函数）。
  *
  * - deleted → 立即终止（由调用方 commit terminal）
- * - unavailable → 有上限间隔的持续重试；达阈值可提示一次但不终止
- * - retryable（fetch reject 等）→ 保留旧语义：连续失败达上限后终止并提示
+ * - unavailable → 只推进 unavailableAttempts（退避 + 只 toast 一次）；不占 transient 预算
+ * - retryable（fetch reject 等）→ 只推进 transientFailures；连续达上限后终止
+ *
+ * R38-2：两类计数独立——长期 503 后一次 fetch reject 不得立刻 terminate_exhausted。
  */
 export type WatchReconnectDecision =
   | { action: "terminate_deleted" }
@@ -97,15 +99,18 @@ export type WatchReconnectDecision =
   | {
       action: "retry";
       delayMs: number;
-      nextConsecutiveFailures: number;
+      nextUnavailableAttempts: number;
+      nextTransientFailures: number;
       notifyException: boolean;
       nextUnavailableNotified: boolean;
     };
 
 export const resolveWatchReconnectPolicy = (input: {
   kind: WatchHttpVisibility;
-  /** 进入本次失败前的连续失败次数 */
-  consecutiveFailures: number;
+  /** 连续 unavailable（503）次数——仅用于退避与 toast 节流 */
+  unavailableAttempts: number;
+  /** 连续 transient/retryable 次数——达上限才 terminate_exhausted */
+  transientFailures: number;
   /** unavailable 是否已提示过一次（避免 toast 刷屏） */
   unavailableNotified: boolean;
 }): WatchReconnectDecision => {
@@ -113,34 +118,40 @@ export const resolveWatchReconnectPolicy = (input: {
     return { action: "terminate_deleted" };
   }
 
-  const nextConsecutiveFailures = input.consecutiveFailures + 1;
-  const delayMs = Math.min(
-    nextConsecutiveFailures * 1500,
-    WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
-  );
-
   if (input.kind === "unavailable") {
-    // R37-6：503 等证据不可用必须活着重试到恢复或 terminal；阈值只提示一次
+    // R37-6 / R38-2：503 活着重试；不推进 transientFailures
+    const nextUnavailableAttempts = input.unavailableAttempts + 1;
+    const delayMs = Math.min(
+      nextUnavailableAttempts * 1500,
+      WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
+    );
     const notifyException =
-      nextConsecutiveFailures >= WATCH_MAX_TRANSIENT_FAILURES &&
+      nextUnavailableAttempts >= WATCH_MAX_TRANSIENT_FAILURES &&
       !input.unavailableNotified;
     return {
       action: "retry",
       delayMs,
-      nextConsecutiveFailures,
+      nextUnavailableAttempts,
+      nextTransientFailures: input.transientFailures,
       notifyException,
       nextUnavailableNotified: input.unavailableNotified || notifyException,
     };
   }
 
-  // 普通网络错 / 其它 retryable：达上限终止，避免永久挂着刷异常
-  if (nextConsecutiveFailures >= WATCH_MAX_TRANSIENT_FAILURES) {
+  // 普通网络错 / 其它 retryable：只计 transient；达上限终止
+  const nextTransientFailures = input.transientFailures + 1;
+  const delayMs = Math.min(
+    nextTransientFailures * 1500,
+    WATCH_UNAVAILABLE_BACKOFF_CAP_MS,
+  );
+  if (nextTransientFailures >= WATCH_MAX_TRANSIENT_FAILURES) {
     return { action: "terminate_exhausted", notifyException: true };
   }
   return {
     action: "retry",
     delayMs,
-    nextConsecutiveFailures,
+    nextUnavailableAttempts: input.unavailableAttempts,
+    nextTransientFailures,
     notifyException: false,
     nextUnavailableNotified: input.unavailableNotified,
   };

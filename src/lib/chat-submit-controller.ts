@@ -104,13 +104,29 @@ export const commitHttpChatReply = (args: {
 
   if ("queued" in result && result.queued) {
     // R37-1：失败 message_op 先到 → 不得因 202 清草稿
-    const prior = getChatOpLedger(operationTaskId).outcomes[result.itemId];
+    // R38-1：unknown_terminal marker 先到 → 同样保留草稿（outcomes 缺键不再兼表）
+    const ledgerBefore = getChatOpLedger(operationTaskId);
+    const prior = ledgerBefore.outcomes[result.itemId];
+    const unknownTerminalBefore =
+      ledgerBefore.pending.find((p) => p.itemId === result.itemId)
+        ?.uncertainCause === "unknown_terminal";
     const reduceResult = dispatchChatOp(operationTaskId, {
       type: "http_queued",
       itemId: result.itemId,
     });
     const finalOutcome =
       reduceResult.state.outcomes[result.itemId] ?? prior;
+    const unknownTerminalAfter =
+      reduceResult.state.pending.find((p) => p.itemId === result.itemId)
+        ?.uncertainCause === "unknown_terminal";
+    if (unknownTerminalBefore || unknownTerminalAfter) {
+      return {
+        clearDraft: false,
+        reduceResult,
+        task: result.task,
+        persistWarning,
+      };
+    }
     return {
       clearDraft:
         finalOutcome !== "failed" && finalOutcome !== "unknown",
@@ -120,14 +136,29 @@ export const commitHttpChatReply = (args: {
     };
   }
 
-  // direct 200：受理中，非终态；若 SSE 终态已失败则保留草稿
-  const prior = getChatOpLedger(operationTaskId).outcomes[clientItemId];
+  // direct 200：受理中，非终态；若 SSE 终态已失败 / unknown_terminal 则保留草稿
+  const ledgerBefore = getChatOpLedger(operationTaskId);
+  const prior = ledgerBefore.outcomes[clientItemId];
+  const unknownTerminalBefore =
+    ledgerBefore.pending.find((p) => p.itemId === clientItemId)
+      ?.uncertainCause === "unknown_terminal";
   const reduceResult = dispatchChatOp(operationTaskId, {
     type: "http_direct_ok",
     itemId: clientItemId,
   });
   const finalOutcome =
     reduceResult.state.outcomes[clientItemId] ?? prior;
+  const unknownTerminalAfter =
+    reduceResult.state.pending.find((p) => p.itemId === clientItemId)
+      ?.uncertainCause === "unknown_terminal";
+  if (unknownTerminalBefore || unknownTerminalAfter) {
+    return {
+      clearDraft: false,
+      reduceResult,
+      task: "task" in result ? result.task : undefined,
+      persistWarning,
+    };
+  }
   return {
     clearDraft:
       finalOutcome !== "failed" && finalOutcome !== "unknown",

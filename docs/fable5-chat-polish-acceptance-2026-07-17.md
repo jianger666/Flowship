@@ -1,5 +1,7 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 13:11：第三十八轮 Codex 收敛确认审完成。R37 的六项主修复大部成立：settled 缺/未知 outcome 不再合成 delivered，known failure 与晚到 HTTP 的 first-outcome 仲裁、不可变 operationTaskId / request token、unknown→known 可纠正、settled/outcomes 同界 200 条、真实完整 DELETE 后 hydrated watcher 的 404 terminal 均通过；连续 7 次 503 后直接恢复也能重连。但交叉链仍确认 **1 个 P1 + 1 个 P2**：unknown `message_op` / `queue_state` 先把 pending 标为 uncertain 后，晚到 202/direct 仍因 outcomes 无记录而返回成功、把 uncertain 改回 sending 并清草稿；连续 503 的次数仍写进普通网络错误计数，恢复途中只要先出现一次 fetch reject 就立刻 `terminate_exhausted`，并没有真正做到“503 不计入六次上限”。Codex 临时反例 3/3 稳定失败后已撤回。R38/R37 定向 36/36、typecheck、lint、build、diff-check 通过；全量 975 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论不通过但已接近收敛，下一轮只修这两个状态交叉，不应重动已通过的主线。详见文末「第三十八轮验收」。
+>
 > 2026-07-19 12:30：第三十七轮 Codex 收敛复审完成。R36 的服务端主问题已明显收敛：firstMessage 已把 itemId 交给 runner，真实 `agent.send` resolve 后才 handedOff；create/send/stop 反例、accepting/persisted snapshot、claim finalizer、staged 图片补偿、meta 三态与真实 checkpoint ref 泄漏反例均通过。但客户端提交边界仍确认 **3 个 P1 + 3 个 P2**：HTTP 已返回 failed/unknown terminal 时 ChatView 仍 `return true` 清草稿，缺 outcome 还在解码层补成 delivered；A 任务的迟到 HTTP 回调会用当前 `taskIdRef=B` 把 A operation 写进 B ledger、甚至用 A task 响应覆盖 B 页面；完整物理删除会同步删掉外部 journal，断线 tab 随后只收 404，而 client 把 404 当 unavailable，错过 `task_deleted` 后无法收敛。另有 unknown outcome 被当终态摘 pending并锁死后到真终态、共享 client outcomes 无界增长、503 连败 6 次后永久停重连。Codex 临时反例 4 组均稳定失败后撤回；R37/旧退出测试 43/43、typecheck、lint、build、diff-check 通过；全量 960 项唯一 preview 进程信号在沙箱内假失败，沙箱外 9/9。结论仍不通过，但下一轮不应再动已通过的 server runner/DeleteTxn 主体，只收口 client operation dispatch 与“物理删除后离线重连”终态。详见文末「第三十七轮验收」。
 >
 > 2026-07-19 11:16：第三十六轮 Codex 深度复审完成。三组 coordinator 都有有效增量：direct/queued 的同步 claim、真实 `send===sent` 后提交、DeleteTxn prepared/committed happy path、三态证据读、sticky client guard 均成立；但生产链仍确认 **7 个 P1 + 5 个 P2**。核心 P1 是：firstMessage 只注册 `runningChats` 占位就提前报 delivered，真实 `Agent.create` 失败仍返回 200；客户端仍把仅落盘的 user_reply、ghost 与 6 种失败 reason 记成 delivered；accepting/persisted operation 不进 reconnect active snapshot；懒重启 pending-update 409 泄漏 claim；meta 不可读但空 rewind 被误判 confirmedEmpty，实测 DELETE 200、taskDir/journal 删除而真实 checkpoint ref 泄漏；删除证据 unknown 返回的 404 又会被客户端永久 commit 为 deleted。Codex 临时反例共 10 个失败断言，另一个真实 git 观察用例稳定复现 ref 泄漏；探针均已撤回。R36 正式 22/22、typecheck、lint、build、diff-check 通过；全量 932 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论不通过，详见文末「第三十六轮验收」。
@@ -4786,3 +4788,101 @@ Codex 临时容量反例写入 500 条 delivered 后，settled 正确为 200，o
 - `pnpm build`：生产构建通过。
 
 **按第三十七轮收敛建议：只动了 client dispatch 与离线删除终态两块、server 已通过主体零改动；4 组失败反例已反转并锁测试。请下一轮做只确认、不扩面的收敛审。**
+
+---
+
+## 第三十八轮验收（Codex、2026-07-19、R37 退出条件确认审、纯 bug 范围）
+
+### 结论
+
+**不通过，但已从六项问题收敛到两个交叉窗口：1 个 P1 + 1 个 P2。** 本轮严格只验 R37-1～R37-6，没有扩审 S8、功能设计或已通过的 server runner / DeleteTxn 主体。
+
+以下修复已用生产 helper、真实 route 或现有定向测试确认，下一轮不要撤回：
+
+- `sendChatReply` 的 settled 缺失/非字符串 outcome 保持 `undefined`，明确 delivered 与 10 个 failure 枚举解码正确；明确 failed 先到再遇 202/direct/settled delivered 时，first-outcome 仍为 failed、不会清草稿。
+- HTTP dispatch 已显式绑定不可变 `operationTaskId`，task 快照只在当前页仍属于该 operation 时提交；request token 也能阻止旧请求释放新锁。
+- unknown outcome 不再进入 settled/outcomes，不摘 pending；后到 delivered 或任一 failure 枚举可以恰好一次纠正。
+- settled 与 outcomes 已由同一事务裁到 200 条，key 集一致；active/persisted 不被终态容量淘汰。
+- 真实完整 DELETE 清掉 taskDir/journal 后，已 hydrate watcher 的 404 会进入 deleted terminal；503 仍 classified unavailable，不 sticky。
+- 纯 503 连续超过 6 次后若下一次直接成功，loop 可以恢复；正式 R38/R37 定向测试均通过。
+
+### R38-1（P1）unknown 终态先到、202/direct 后到时仍清草稿，并把 uncertain 重新升级成 sending
+
+`message_op` 的未知 outcome 会正确地把 pending 标成 `uncertain` 且不占 outcomes（`src/lib/chat-pending-reconcile.ts:631-648`），这是 R37-4 的正确修复。但 `commitHttpChatReply` 的 queued/direct 分支只看 `outcomes[itemId]`；unknown 有意不写 outcomes，因此 `finalOutcome` 为 `undefined`，条件 `finalOutcome !== "failed" && finalOutcome !== "unknown"` 反而返回 `true`（`src/lib/chat-submit-controller.ts:105-120,123-137`）。随后 `http_queued` / `http_direct_ok` 又无条件把该 pending 从 uncertain 改回 sending（`src/lib/chat-pending-reconcile.ts:672-705`）。
+
+可达时序：client POST 已发出；server 先通过 SSE 或 reconnect `recentSettled` 给出未来版本的失败 outcome，client 按 fail-closed 标 uncertain；原 HTTP 202/direct 响应随后才到。当前实现把“unknown 终态”与“从未见过终态”都表示为 outcomes 缺键，晚到 HTTP 因此清掉文本、图片、附件和 skill 草稿，并抹掉 unknown 的 uncertain 证据。消息可能已经以客户端未知的失败原因终止，用户却失去直接重发载荷。
+
+Codex 临时生产 helper 反例分别执行 `register → message_op(future_failure_reason) → late queued` 与 `→ late direct`；正确断言要求 `clearDraft=false` 且 pending 仍 uncertain，两个用例均实际得到 `clearDraft=true`，随后探针已撤回。
+
+修复要求：不要再用 `outcomes` 缺键同时表达“没有终态”和“见过未知终态”。可给 pending 增加明确的 uncertainty cause / unknown-terminal marker，或让 HTTP 仲裁保留 unknown 证据。初次正常 202/direct 仍可按 accepted 清草稿；但 unknown terminal 先到的晚响应必须返回 false、保持可重发 identity，不能把 uncertain 重置为 sending。`queue_state recentSettled=unknown` 也须走同一规则。
+
+最低退出测试：
+
+1. `message_op unknown → late 202`、`message_op unknown → late direct`、`queue_state unknown → late 202/direct` 均保留草稿、附件、skill 和原 itemId，phase 不离开 uncertain。
+2. 普通首次 202/direct 仍按既有 accepted 语义工作；网络响应丢失后同 id 重试获得正常 active/202 的行为需单独明确，不能靠与 unknown 共用一个空值猜测。
+3. 上述 unknown 序列后再到 delivered / 10 个 failure 枚举，仍恰好一次收敛。
+
+### R38-2（P2）503 次数仍污染普通网络错误预算，恢复过渡期一次 fetch reject 就永久停重连
+
+`resolveWatchReconnectPolicy` 对 unavailable 的确不直接终止，但仍返回递增的 `nextConsecutiveFailures`（`src/lib/task-terminal.ts:116-133`）；hook 又把它写回唯一的 `failures` 变量（`src/hooks/use-task-watch.ts:147-149,231-249`）。因此 503 并没有真正“不计入六次上限”，只是在当前 kind 为 unavailable 时暂缓检查；下一次 kind 变成 retryable，已有的 6+ 次计数会立刻命中 `terminate_exhausted`（`src/lib/task-terminal.ts:136-146`）。
+
+可达时序：删除证据 I/O 故障持续产生 7 次 503；磁盘/服务开始恢复时连接先经历一次进程重启或网络抖动（fetch reject），下一次本应继续重连并拿到 200/SSE 或删除后的 404。当前 policy 在这一次 fetch reject 上立即退出 loop，之后即使恢复也不会再自动连接，仍需刷新页面。
+
+Codex 临时反例执行 `7 × unavailable → 1 × retryable`，正确断言应继续 retry，实际得到 `terminate_exhausted`；探针已撤回。
+
+修复要求：unavailable 与 transient/retryable 使用独立计数，或至少 unavailable 不推进 transient failure budget。提示节流也应跟 unavailable 自己的计数走。成功连接再统一清零；不要让类别切换把长期 503 兑换成一次即终止的网络错误。
+
+最低退出测试：fake timer / hook 级状态序列至少覆盖 `7×503 → fetch reject → 503 → 200 bootstrap`、`7×503 → fetch reject → hydrated 404`，均不得产生并行 loop，最终分别恢复或恰好一次 deleted；纯连续 retryable 仍可保持原 6 次上限。
+
+### 收敛建议
+
+下一轮只需要补两个“状态类别不能共用空值/计数器”的缺口：
+
+1. client operation 把 `unknown terminal observed` 与普通 network uncertain 分开表示，HTTP/SSE/queue_state 继续共用现有 dispatch，不再新增旁路判断。
+2. watch policy 拆 unavailableAttempts 与 transientFailures，保持现有 404/410/503 分类和单 loop 结构不变。
+
+这两处修复后，先跑上述交叉序列；如果没有新反例，应停止继续扩面，不再重构已经通过的 coordinator。
+
+### 第三十八轮工程门禁（Codex）
+
+- R38/R37 定向复验：`ownership-r38-client-dispatch`、`ownership-r38-offline-terminal`、`ownership-r37-wire-client`、`ownership-r36-client-terminal`，**4 文件 / 36 项通过**。
+- Codex 临时反例：unknown→late queued、unknown→late direct、7×503→retryable，共 **3/3 按正确协议稳定失败**；探针随后全部撤回，业务代码与正式测试未修改。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：106 文件中 105 文件 / 974 项通过；唯一失败仍为 `preview-manager.integration` 的真实子进程退出信号在沙箱内 10 秒超时。沙箱外复跑该文件 **9/9 通过**，故业务存量 975/975 有效通过。
+- `pnpm build`：生产构建通过。
+- `git diff --check`：通过。
+
+审查结束时工作树只包含本验收文档更新；未修改业务代码或正式测试。
+
+---
+
+## 第三十九轮修复报告（Fable5、2026-07-19 下午、待复审）
+
+按第三十八轮收敛建议只补两个「状态类别不能共用空值/计数器」的缺口，修复 R38-1 / R38-2。已通过主线（client dispatch、hydrated-404 terminal、server 全部）零改动。
+
+### R38-1（P1）unknown 终态标记与 network uncertain 分离
+
+- pending 条目新增 `uncertainCause?: "network" | "unknown_terminal"`——不再用 outcomes 缺键同时表达「没见过终态」和「见过未知终态」：
+  - `unknown_terminal`：`message_op` 未知 outcome、`queue_state` 未知 recentSettled、`http_settled` 缺/未知 outcome（与 message_op 同语义、一并对齐）。
+  - `network`：`http_reject_network` / 网络不确定（既有 `markPendingUncertain`）。
+- `commitHttpChatReply`（queued 与 direct 两分支）在 dispatch 前后任一时刻见到该 pending 带 `unknown_terminal` → 返回 `clearDraft:false`（保留草稿、附件、skill、原 itemId）；reducer 的 `http_queued` / `http_direct_ok` 对带 marker 的条目不把 phase 从 uncertain 重置回 sending。
+- 普通首次 202/direct（无 marker）仍按 accepted 语义清草稿；`network` cause 的同 id 重试拿到 202 照旧回 sending——这正是两个 cause 分离的意义。unknown 序列后再到 delivered / 任一失败枚举：known terminal 摘 pending 时 marker 一并消失、恰好一次收敛。
+
+### R38-2（P2）watch 重连双计数分离
+
+- `resolveWatchReconnectPolicy` / `useTaskWatch` 拆成两个独立计数：`unavailableAttempts`（503——驱动退避 cap 与「只 toast 一次」节流）与 `transientFailures`（fetch reject 等 retryable——保持 6 次上限终止）。503 不再推进 transient 预算；成功连接统一清零两者。`7×503 → 1×fetch reject` 后继续重连，不再 `terminate_exhausted`。
+
+### 测试
+
+新增 `tests/ownership-r39-cross-state.test.ts`（9 项）：`message_op unknown → late 202 / late direct`、`queue_state unknown recentSettled → late 202/direct` 均保留草稿与原 identity、phase 不离开 uncertain；普通首次 202/direct accepted 对照；network-uncertain 同 id 重试回 sending 对照；unknown → delivered / 10 个失败枚举恰好一次收敛；policy 交叉序列 `7×unavailable → 1×retryable → unavailable → 成功`（恢复、单 loop）、`7×unavailable → 1×retryable → hydrated 404`（恰好一次 deleted）、纯 `6×retryable`（terminate_exhausted 保持）——第三十八轮 3/3 失败反例全部反转。
+
+### 第三十九轮工程门禁（修复后）
+
+- `pnpm vitest run tests/ownership-r39-cross-state.test.ts tests/ownership-r38-client-dispatch.test.ts tests/ownership-r38-offline-terminal.test.ts tests/ownership-r37-wire-client.test.ts`：4 文件 / 35 项通过。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：**107 文件 / 984 项全部通过**（主线复验）。
+- `pnpm build`：生产构建通过。
+
+**两个交叉缺口已按建议以「显式类别」方式收口、未新增旁路判断、未动已通过主线。按第三十八轮约定：交叉序列已全部反转，若无新反例请判收敛、停止扩面。**

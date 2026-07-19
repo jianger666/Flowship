@@ -17,6 +17,13 @@ import {
   type MessageOpSnapshotEntry,
 } from "@/lib/message-op-schema";
 
+/**
+ * R38-1：uncertain 成因——禁止再用 outcomes 缺键同时表达「没见过」与「见过未知终态」。
+ * - network：响应丢失 / fetch reject，晚到 202 可回 sending
+ * - unknown_terminal：已见未知 wire 终态，晚到 202/direct 不得清草稿、不得抹 uncertain
+ */
+export type UncertainCause = "network" | "unknown_terminal";
+
 export type PendingLocalReplyLike = {
   itemId: string;
   displayText: string;
@@ -33,6 +40,8 @@ export type PendingLocalReplyLike = {
    * persisted = 已有持久气泡、非终态（等待 handedOff / failed）。
    */
   phase?: "sending" | "uncertain" | "persisted";
+  /** R38-1：uncertain 成因 marker（known terminal 收敛时随 pending 移除一并清掉） */
+  uncertainCause?: UncertainCause;
 };
 
 /**
@@ -51,6 +60,8 @@ export type ChatOperation = {
   skillRefs?: ChatSkillRef[];
   /** 与 itemId 对齐的 UI 行 key */
   id?: string;
+  /** R38-1：见 UncertainCause */
+  uncertainCause?: UncertainCause;
 };
 
 /** R36-3：client ledger 终态（unknown = 未知 wire / ghost，可同 id 重试） */
@@ -250,14 +261,23 @@ export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>
   return next;
 };
 
-/** R34-4：网络不确定 → 标 uncertain，不删 pending */
+/**
+ * R34-4 / R38-1：标 uncertain，不删 pending。
+ * cause 默认 network（fetch reject / 响应丢失）；未知 wire 终态传 unknown_terminal。
+ */
 export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   pending: T[],
   itemId: string,
+  cause: UncertainCause = "network",
 ): T[] =>
   pending.map((p) =>
     p.itemId === itemId
-      ? { ...p, uncertain: true, phase: "uncertain" as const }
+      ? {
+          ...p,
+          uncertain: true,
+          phase: "uncertain" as const,
+          uncertainCause: cause,
+        }
       : p,
   );
 
@@ -420,6 +440,7 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       if (snap?.phase === "persisted") {
         nextPhase = "persisted";
       } else if (phase === "uncertain") {
+        // 仍在 server active → 正证据覆盖旧 uncertain（含 unknown_terminal）
         nextPhase = "sending";
       }
       nextPending.push(
@@ -428,6 +449,10 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
               ...p,
               uncertain: nextPhase === "uncertain",
               phase: nextPhase as "sending" | "uncertain" | "persisted",
+              // 回 sending 时清 marker，避免后续 HTTP 误判
+              ...(nextPhase === "sending"
+                ? { uncertainCause: undefined }
+                : {}),
             }
           : p,
       );
@@ -439,12 +464,13 @@ export const reconcilePendingWithQueueState = <T extends PendingLocalReplyLike>(
       seenPending.add(p.itemId);
       continue;
     }
-    // R37-4：unknown recentSettled → 保留 pending 标 uncertain（可被后到 known 纠正）
+    // R37-4 / R38-1：unknown recentSettled → uncertain + unknown_terminal（可被后到 known 纠正）
     if (unknownLedgerIds.has(p.itemId)) {
       nextPending.push({
         ...p,
         uncertain: true,
         phase: "uncertain" as const,
+        uncertainCause: "unknown_terminal" as const,
       });
       seenPending.add(p.itemId);
       continue;
@@ -557,6 +583,7 @@ const asOperations = <T extends PendingLocalReplyLike>(
     displayText: p.displayText,
     text: p.displayText,
     id: p.itemId,
+    uncertainCause: p.uncertainCause,
   }));
 
 /**
@@ -621,6 +648,8 @@ export const reduceChatOperation = (
                     ? ("persisted" as const)
                     : ("sending" as const),
                 uncertain: false,
+                // 正证据覆盖：清 unknown_terminal / network marker
+                uncertainCause: undefined,
               }
             : p,
         );
@@ -639,11 +668,15 @@ export const reduceChatOperation = (
         rawOutcome ?? (action.phase === "handedOff" ? "delivered" : undefined),
       );
       if (!known) {
-        // 未知 wire：保持/标 uncertain，允许后到 known 纠正
+        // R38-1：未知 wire → unknown_terminal；outcomes 缺键不再兼表「见过未知」
         return {
           state: {
             ...state,
-            pending: markPendingUncertain(state.pending, itemId),
+            pending: markPendingUncertain(
+              state.pending,
+              itemId,
+              "unknown_terminal",
+            ),
           },
         };
       }
@@ -670,7 +703,7 @@ export const reduceChatOperation = (
       return { state: { pending, settled, outcomes }, ghostIds };
     }
     case "http_queued": {
-      // 幂等 202：清 uncertain；若终态已早到则摘掉 pending
+      // 幂等 202：清 network-uncertain；若终态已早到则摘掉 pending
       if (!shouldInsertPendingAfter202(state.settled, action.itemId)) {
         const { pending, settled } = dropPendingByItemId(
           state.pending,
@@ -682,11 +715,17 @@ export const reduceChatOperation = (
       return {
         state: {
           ...state,
-          pending: state.pending.map((p) =>
-            p.itemId === action.itemId
-              ? { ...p, phase: "sending" as const, uncertain: false }
-              : p,
-          ),
+          pending: state.pending.map((p) => {
+            if (p.itemId !== action.itemId) return p;
+            // R38-1：已见 unknown 终态 → 晚到 202 不得把 uncertain 重置为 sending
+            if (p.uncertainCause === "unknown_terminal") return p;
+            return {
+              ...p,
+              phase: "sending" as const,
+              uncertain: false,
+              uncertainCause: undefined,
+            };
+          }),
         },
       };
     }
@@ -696,11 +735,17 @@ export const reduceChatOperation = (
       return {
         state: {
           ...state,
-          pending: state.pending.map((p) =>
-            p.itemId === action.itemId
-              ? { ...p, phase: "sending" as const, uncertain: false }
-              : p,
-          ),
+          pending: state.pending.map((p) => {
+            if (p.itemId !== action.itemId) return p;
+            // R38-1：同上——unknown_terminal 证据不被 late direct 抹掉
+            if (p.uncertainCause === "unknown_terminal") return p;
+            return {
+              ...p,
+              phase: "sending" as const,
+              uncertain: false,
+              uncertainCause: undefined,
+            };
+          }),
         },
       };
     }
@@ -711,7 +756,12 @@ export const reduceChatOperation = (
         return {
           state: {
             ...state,
-            pending: markPendingUncertain(state.pending, action.itemId),
+            // R38-1：HTTP settled 未知 outcome 同属 unknown_terminal
+            pending: markPendingUncertain(
+              state.pending,
+              action.itemId,
+              "unknown_terminal",
+            ),
           },
         };
       }

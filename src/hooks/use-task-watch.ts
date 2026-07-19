@@ -145,7 +145,9 @@ export const useTaskWatch = (
     // 自动重连循环：被动断流就退避后重连；只有「任务业务终态的 done」/ deleted 才停
     // enabled=true 隐含已 hydrate——404 可安全当物理删除完成（R37-3）
     const loop = async () => {
-      let failures = 0; // 连续报错次数、用于退避 + retryable 上限
+      // R38-2：两类计数独立——503 不兑换成一次即终止的网络错误预算
+      let unavailableAttempts = 0;
+      let transientFailures = 0;
       let unavailableNotified = false; // unavailable 达阈值后只 toast 一次
       while (!cancelled) {
         // 本次连接是否收到「终态 done」（task merged/abandoned、服务端随即关流）——
@@ -209,7 +211,9 @@ export const useTaskWatch = (
 
         try {
           await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
-          failures = 0; // 成功连过一次、清零退避
+          // 成功连过一次：两类计数与 toast 节流一并清零
+          unavailableAttempts = 0;
+          transientFailures = 0;
           unavailableNotified = false;
         } catch (err) {
           if (
@@ -230,7 +234,8 @@ export const useTaskWatch = (
 
           const decision = resolveWatchReconnectPolicy({
             kind,
-            consecutiveFailures: failures,
+            unavailableAttempts,
+            transientFailures,
             unavailableNotified,
           });
 
@@ -245,7 +250,8 @@ export const useTaskWatch = (
             }
             return;
           } else {
-            failures = decision.nextConsecutiveFailures;
+            unavailableAttempts = decision.nextUnavailableAttempts;
+            transientFailures = decision.nextTransientFailures;
             unavailableNotified = decision.nextUnavailableNotified;
             if (!cancelled && decision.notifyException) {
               callbacksRef.current.onWatchException?.(err as Error);
