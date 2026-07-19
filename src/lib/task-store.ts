@@ -499,6 +499,12 @@ export interface TaskStreamCallbacks {
    * R33-4：task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
   onTaskDeleted?: (taskId: string) => void;
+  /**
+   * R39-2：连接已建立——首个合法 bootstrap `task` 帧解析成功时回调一次。
+   * hook 用它在长连接尚未结束时清零 transient/unavailable 计数（不等流 EOF）。
+   * 200 空流 / 协议解析前失败不得触发；每次连接至多一次。
+   */
+  onConnectionEstablished?: () => void;
 }
 
 /**
@@ -536,6 +542,8 @@ export const watchTaskStream = async (
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // R39-2：首个合法 task 帧才算建连成功；每连接至多通知一次
+  let connectionEstablished = false;
 
   try {
     while (true) {
@@ -552,6 +560,11 @@ export const watchTaskStream = async (
           if (env.type === "event" && env.event) {
             callbacks.onEvent?.(env.event);
           } else if (env.type === "task" && env.task) {
+            // 合法 bootstrap task 帧：先发 connection-established，再转发 task
+            if (!connectionEstablished) {
+              connectionEstablished = true;
+              callbacks.onConnectionEstablished?.();
+            }
             callbacks.onTaskUpdate?.(env.task);
           } else if (env.type === "action" && env.action) {
             callbacks.onActionUpdate?.(env.action);

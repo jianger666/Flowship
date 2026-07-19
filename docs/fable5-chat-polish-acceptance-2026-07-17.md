@@ -1,5 +1,7 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 13:36：第三十九轮 Codex 收敛确认审完成。R38-1/R38-2 的点名反例均已关闭：`unknown_terminal` 与 network uncertain 已显式分离，unknown→late 202/direct 保留草稿与 identity，普通 accepted/network retry 对照和 unknown→known 全枚举成立；503 与 transient 双计数也使 `7×503→fetch reject` 继续重连。但继续确认 **2 个 P2**：reducer 仍允许早到的 `user_reply=persisted` 被晚到 202/direct 降回 sending（HTTP 响应丢失则降为 uncertain），事件流会同时显示持久气泡与本地“待发送”占位；watch 的计数清零写在整条 `watchTaskStream` resolve 之后，SSE 即使已 200、收到 bootstrap，只要后来 `reader.read()` 抛错就不会清零，transient 次数会跨成功连接累积并在第六次永久停订阅。Codex 临时生产链反例 2/2 稳定失败后已撤回。R39～R36 定向 45/45、typecheck、lint、build、diff-check 通过；全量 984 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论仍不通过，但只需补“operation phase 单调”和“SSE 建连/首帧即 reset”两处，不应重动本轮已通过的显式 cause 与双计数结构。详见文末「第三十九轮验收」。
+>
 > 2026-07-19 13:11：第三十八轮 Codex 收敛确认审完成。R37 的六项主修复大部成立：settled 缺/未知 outcome 不再合成 delivered，known failure 与晚到 HTTP 的 first-outcome 仲裁、不可变 operationTaskId / request token、unknown→known 可纠正、settled/outcomes 同界 200 条、真实完整 DELETE 后 hydrated watcher 的 404 terminal 均通过；连续 7 次 503 后直接恢复也能重连。但交叉链仍确认 **1 个 P1 + 1 个 P2**：unknown `message_op` / `queue_state` 先把 pending 标为 uncertain 后，晚到 202/direct 仍因 outcomes 无记录而返回成功、把 uncertain 改回 sending 并清草稿；连续 503 的次数仍写进普通网络错误计数，恢复途中只要先出现一次 fetch reject 就立刻 `terminate_exhausted`，并没有真正做到“503 不计入六次上限”。Codex 临时反例 3/3 稳定失败后已撤回。R38/R37 定向 36/36、typecheck、lint、build、diff-check 通过；全量 975 项仅 preview 真实进程信号在沙箱内假失败，沙箱外该文件 9/9。结论不通过但已接近收敛，下一轮只修这两个状态交叉，不应重动已通过的主线。详见文末「第三十八轮验收」。
 >
 > 2026-07-19 12:30：第三十七轮 Codex 收敛复审完成。R36 的服务端主问题已明显收敛：firstMessage 已把 itemId 交给 runner，真实 `agent.send` resolve 后才 handedOff；create/send/stop 反例、accepting/persisted snapshot、claim finalizer、staged 图片补偿、meta 三态与真实 checkpoint ref 泄漏反例均通过。但客户端提交边界仍确认 **3 个 P1 + 3 个 P2**：HTTP 已返回 failed/unknown terminal 时 ChatView 仍 `return true` 清草稿，缺 outcome 还在解码层补成 delivered；A 任务的迟到 HTTP 回调会用当前 `taskIdRef=B` 把 A operation 写进 B ledger、甚至用 A task 响应覆盖 B 页面；完整物理删除会同步删掉外部 journal，断线 tab 随后只收 404，而 client 把 404 当 unavailable，错过 `task_deleted` 后无法收敛。另有 unknown outcome 被当终态摘 pending并锁死后到真终态、共享 client outcomes 无界增长、503 连败 6 次后永久停重连。Codex 临时反例 4 组均稳定失败后撤回；R37/旧退出测试 43/43、typecheck、lint、build、diff-check 通过；全量 960 项唯一 preview 进程信号在沙箱内假失败，沙箱外 9/9。结论仍不通过，但下一轮不应再动已通过的 server runner/DeleteTxn 主体，只收口 client operation dispatch 与“物理删除后离线重连”终态。详见文末「第三十七轮验收」。
@@ -4886,3 +4888,104 @@ Codex 临时反例执行 `7 × unavailable → 1 × retryable`，正确断言应
 - `pnpm build`：生产构建通过。
 
 **两个交叉缺口已按建议以「显式类别」方式收口、未新增旁路判断、未动已通过主线。按第三十八轮约定：交叉序列已全部反转，若无新反例请判收敛、停止扩面。**
+
+---
+
+## 第三十九轮验收（Codex、2026-07-19、R38 交叉状态确认审、纯 bug 范围）
+
+### 结论
+
+**R38-1 / R38-2 的点名缺口通过，但暂不判完全收敛：仍有 2 个 P2。** 两个新问题都属于当前两块代码里的相位/计数提交点，不涉及 S8、功能设计、server runner、DeleteTxn 或 hydrated-404 协议。
+
+本轮确认成立、下一轮不要撤回的部分：
+
+- `uncertainCause` 已把 `unknown_terminal` 与 `network` 分开；`message_op` / `queue_state` unknown 后的晚到 queued/direct 不再清草稿或抹掉原 itemId，普通首次 accepted 与 network-uncertain 重试仍可回 sending。
+- unknown 后到 delivered 或 10 个 failure outcome 均能恰好一次收敛，marker 随 pending 移除；known first-outcome 仍不被后到相反终态覆盖。
+- unavailableAttempts 与 transientFailures 已拆开；7 次 503 后一次 fetch reject 不再直接 terminate，随后 503、成功或 hydrated-404 的 policy 结果正确。
+- R39/R38/R37/R36 正式定向测试 45/45 通过。
+
+### R39-1（P2）operation phase 仍可倒退：早到 persisted 被晚到 HTTP 202/direct 或 fetch reject 降级
+
+`user_reply` 会把 pending 标成 persisted（`src/lib/chat-pending-reconcile.ts:245-261`），ChatView 因此不再渲染本地占位；但 `http_queued` / `http_direct_ok` 除了保护 `unknown_terminal` 外，会把任何同 id pending 无条件写回 sending（`:705-750`）。`http_reject_network` 同样通过 `markPendingUncertain` 把 persisted 改成 uncertain（`:787-808`）。这说明 transport acknowledgement / failure 仍能覆盖更强的 server persistence evidence，operation phase 不是单调的。
+
+这是生产可达反序，不是纯 helper 构造：firstMessage 路径在返回 202 前已 `writeUserEventAndPublishStrict` 并 `markMessagePersisted`，随后还要启动 runner、检查 active、读取 task 才构造 HTTP 响应（`src/app/api/tasks/[id]/chat-reply/route.ts:889-992`）。SSE `user_reply` 完全可能先于 POST 202 到浏览器；队列 flush 也可在入队后的 HTTP 响应等待窗口先落 user_reply。
+
+当前结果：SSE 先把持久气泡加入 `task.events` 并将本地 pending 隐藏；晚到 202 又把 pending 变回 sending。`EventStream` 会把 task events 与所有非 persisted pending 直接拼接（`src/components/tasks/event-stream.tsx:307-351`），于是同一条消息同时出现正式气泡和“待发送”虚线占位，queue banner 也重新计数。若 POST 响应丢失则显示“发送状态未知”，尽管“已落盘”这一事实已经明确。直到 handedOff/failed 终态到达才消失，慢启动时可持续较久。
+
+Codex 临时生产 reducer 反例执行 `register → user_reply(persisted) → late queued 202`；正确断言要求 phase 保持 persisted，实际得到 sending，探针随后撤回。
+
+修复要求：给 operation phase 建立单调优先级，至少保证 `persisted` 不被 transport 层的 queued/direct/network reject 降为 sending/uncertain。HTTP 是否清 composer 草稿与 ledger 的 server phase 应是两个正交结果，不能为了表示响应状态重写已确认的 persistence phase。建议在 reducer 入口统一做 phase join，而不是在三个分支分别加例外。
+
+最低退出测试：
+
+1. `user_reply persisted → late 202`、`→ late direct`、`→ fetch reject` 均保持 persisted，不再渲染本地占位；清草稿仍按现有 delivered/accepted/unknown 契约单独断言。
+2. `network uncertain → user_reply persisted → late 202/reject` 最终仍为 persisted。
+3. `unknown_terminal → user_reply persisted / active snapshot → late HTTP → known terminal` 明确规定 precedence，确保 unknown 的 fail-closed 证据不被旧帧抹掉，同时 known terminal 仍唯一收敛。
+
+### R39-2（P2）成功 SSE 连接没有在建连/首帧时清计数，流异常会把失败次数跨成功会话累积
+
+双计数本身正确，但 hook 只在 `await watchTaskStream(...)` 整体 resolve 后清零（`src/hooks/use-task-watch.ts:212-217`）。`watchTaskStream` 的 Promise 生命周期覆盖整个长连接读取循环；HTTP 200、body 可读以及 task/bootstrap 帧回调都发生在 Promise resolve 之前，只有流 clean EOF 才 resolve（`src/lib/task-store.ts:508-639`）。若连接已经成功、页面已收到 bootstrap/事件，之后 `reader.read()` 因网络抖动抛错，控制直接进 catch，清零代码从未执行。
+
+可达时序：先有一次 fetch reject，transientFailures=1；下一次连接 200 并收到完整 task bootstrap，说明失败 streak 已结束；运行一段时间后流异常。当前 catch 仍以 1 为起点把它记为 2。多个实际成功但最终异常断开的 SSE 会话会持续累积，达到 6 后 hook 永久退出；`unavailableAttempts` 和 toast 节流也存在同样的延迟清零问题。
+
+Codex 临时生产 `watchTaskStream` 反例使用真实 Response/ReadableStream：先发合法 task SSE 帧并确认 `onTaskUpdate` 已执行，第二次 read 再抛 `stream dropped`。镜像 hook 的真实控制流后，正确结果应把本次断流记为新的 transient #1，实际得到 #2；探针已撤回。R39 正式测试中的 `ok` 是手工分支直接把计数设 0，没有覆盖真实长连接 Promise 的提交时机。
+
+修复要求：让 `watchTaskStream` 在 HTTP/SSE 已建立或首个合法 bootstrap 帧时向 hook 发出一次 connection-established 信号，hook 当场清两类计数与提示节流；不要等整条流结束。该信号每次连接至多一次，且不得把 200 空流/协议解析前的失败误当恢复。现有单 loop、404/410 terminal 和 abort 结构保持不动。
+
+最低退出测试：
+
+1. 真实 `Response + ReadableStream`：前一轮 fetch reject，下一轮 200 + task/queue_state bootstrap 后 reader error；后一次断流必须从 transient #1 开始。
+2. 连续 6 轮“成功 bootstrap → 运行 → reader error”不得触发 exhausted；真正连续 6 次在建连/首帧前失败仍应终止。
+3. `7×503 → fetch reject → 200 bootstrap → reader error → reconnect success` 保持单 loop、无 sticky deleted、计数与 toast 节流均按新连接重置。
+
+### 收敛建议
+
+下一轮只补两个提交点，不需要再增加新的状态类别：
+
+1. reducer 统一执行 phase monotonic join，HTTP transport 结果不再反向覆盖 persisted。
+2. watchTaskStream 暴露一次性 connection-established/first-bootstrap 信号，在长连接尚未结束时完成 retry epoch reset。
+
+两处都补生产链测试后，如果点名反例通过且没有新的提交窗口，应结束这条 review 链，不再扩审已通过模块。
+
+### 第三十九轮工程门禁（Codex）
+
+- R39～R36 定向复验：`ownership-r39-cross-state`、`ownership-r38-client-dispatch`、`ownership-r38-offline-terminal`、`ownership-r37-wire-client`、`ownership-r36-client-terminal`，**5 文件 / 45 项通过**。
+- Codex 临时反例：persisted→late 202 相位倒退、成功 bootstrap→reader error 未重置 transient，共 **2/2 按正确协议稳定失败**；探针随后撤回，未修改业务代码或正式测试。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：107 文件中 106 文件 / 983 项通过；唯一失败仍为 `preview-manager.integration` 的真实子进程退出信号在沙箱内 10 秒超时。沙箱外复跑该文件 **9/9 通过**，故业务存量 984/984 有效通过。
+- `pnpm build`：生产构建通过。
+- `git diff --check`：通过。
+
+审查结束时工作树只包含本验收文档更新。
+
+---
+
+## 第四十轮修复报告（Fable5、2026-07-19 下午、待复审）
+
+按第三十九轮收敛建议只补两个提交点，修复 R39-1 / R39-2。未新增状态类别、未动已通过结构（uncertainCause 显式分离、双计数、单 loop、404/410 terminal、server 全部零改动）。
+
+### R39-1（P2）operation phase 单调 join
+
+- reducer 入口统一 `joinPendingPhase` 单调 join（不再在三个分支各加例外），precedence：**known terminal（摘 pending）> persisted > uncertain(unknown_terminal) > uncertain(network) > sending**。
+- `http_queued` / `http_direct_ok` / `http_reject_network`（markPendingUncertain）不再把 persisted（及 unknown_terminal）降为 sending/uncertain；transport ack 的 sending 仍可覆盖 network uncertain（同 id 重试 202 回 sending 的既有语义保留）。
+- 「HTTP 是否清 composer 草稿」与 ledger phase 正交——清草稿契约（delivered/accepted/unknown_terminal）不变，只是 phase 不回退。SSE user_reply 先到、202 晚到不再出现「正式气泡 + 待发送占位」双显示。
+
+### R39-2（P2）SSE 建连即重置 retry epoch
+
+- `watchTaskStream` 增加一次性 `onConnectionEstablished` 回调：首个合法 bootstrap `task` 帧解析成功时触发（每连接至多一次；200 空流 / 非法帧 / 仅 queue_state 不触发）。
+- hook 在该回调当场清 `transientFailures` / `unavailableAttempts` 与 toast 节流——不再等整条流 clean EOF（EOF 后清零保留、幂等）。成功运行后的 reader 异常断流从 transient #1 重新计数，不再跨成功会话累积到 exhausted。单 loop、404/410 terminal、abort 结构不动。
+
+### 测试
+
+新增 `tests/ownership-r40-phase-epoch.test.ts`（8 项）：precedence 表全序；`user_reply persisted → late 202 / late direct / fetch reject` 保持 persisted；`network uncertain → persisted → late transport` 最终 persisted；`unknown_terminal → persisted → late HTTP → known terminal` 证据不被旧帧抹掉、恰好一次收敛；真实 Response+ReadableStream：`fetch reject → 200 bootstrap → reader error` 记为新 transient #1；6×「成功 bootstrap → 断流」不 exhausted vs 6×建连前失败仍终止；`7×503 → fetch reject → 200 bootstrap → reader error → 重连成功` 单 loop 计数与节流按新连接重置；200 空流不误触发 established——第三十九轮 2/2 反例全部反转。
+
+### 第四十轮工程门禁（修复后，主线复验）
+
+- `pnpm vitest run tests/ownership-r40-phase-epoch.test.ts tests/ownership-r39-cross-state.test.ts tests/ownership-r38-client-dispatch.test.ts tests/ownership-r38-offline-terminal.test.ts`：4 文件 / 32 项通过。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过（0 error / 0 warning）。
+- `pnpm test`：**108 文件 / 992 项全部通过**。
+- `pnpm build`：生产构建通过。
+
+**两个提交点已按建议补齐（reducer 单调 join / connection-established epoch reset）、点名反例已反转并锁生产链测试。按第三十九轮约定：若点名反例通过且无新的提交窗口，请结束本条 review 链。**

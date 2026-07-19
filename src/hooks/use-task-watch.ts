@@ -207,11 +207,18 @@ export const useTaskWatch = (
               callbacksRef.current.onTaskDeleted?.(deletedId);
             }
           },
+          // R39-2：首个合法 bootstrap task 帧即清零——不等流 EOF；
+          // 否则「成功建连后 reader 抛错」会把上轮 transient 累加到本轮
+          onConnectionEstablished: () => {
+            unavailableAttempts = 0;
+            transientFailures = 0;
+            unavailableNotified = false;
+          },
         };
 
         try {
           await watchTaskStream(taskId, sseCallbacks, ctrl.signal);
-          // 成功连过一次：两类计数与 toast 节流一并清零
+          // 流 clean resolve：再清一次（幂等；建连时多半已清过）
           unavailableAttempts = 0;
           transientFailures = 0;
           unavailableNotified = false;

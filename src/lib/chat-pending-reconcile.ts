@@ -262,8 +262,78 @@ export const markPendingPersistedByUserReply = <T extends PendingLocalReplyLike>
 };
 
 /**
- * R34-4 / R38-1：标 uncertain，不删 pending。
+ * R39-1：operation phase 单调优先级（高 → 低）。
+ *
+ *   known terminal（摘 pending，不走本 helper）
+ *   > persisted
+ *   > uncertain(unknown_terminal)
+ *   > uncertain(network)
+ *   > sending
+ *
+ * 「HTTP 是否清 composer 草稿」与 ledger phase 正交——本表只约束 phase/marker，
+ * 不决定 clearDraft。known terminal 仍唯一收敛（从 pending 摘除）。
+ */
+export type PendingPhaseIncoming = {
+  phase: "sending" | "uncertain" | "persisted";
+  uncertain?: boolean;
+  uncertainCause?: UncertainCause;
+};
+
+/** 数值越大证据越强；known terminal 不进表（由 reducer 直接摘 pending） */
+export const pendingPhaseRank = (
+  p: Pick<PendingLocalReplyLike, "phase" | "uncertainCause" | "uncertain">,
+): number => {
+  const phase =
+    p.phase ?? (p.uncertain ? ("uncertain" as const) : ("sending" as const));
+  if (phase === "persisted") return 40;
+  if (phase === "uncertain") {
+    // unknown_terminal 强于 network：fail-closed 证据不可被普通 transport 抹掉
+    return p.uncertainCause === "unknown_terminal" ? 30 : 20;
+  }
+  return 10; // sending
+};
+
+/**
+ * R39-1：phase 单调 join——拒绝把更强证据降为更弱 transport 态。
+ *
+ * transportAck=true（http_queued / http_direct_ok）：incoming=sending 可覆盖
+ * network-uncertain（同 id 重试受理），但仍不可覆盖 persisted / unknown_terminal。
+ * 普通路径（含 markPendingUncertain）：只升不降。
+ */
+export const joinPendingPhase = <T extends PendingLocalReplyLike>(
+  current: T,
+  incoming: PendingPhaseIncoming,
+  opts?: { transportAck?: boolean },
+): T => {
+  const curRank = pendingPhaseRank(current);
+  const inRank = pendingPhaseRank(incoming);
+
+  // 202/direct：允许 sending 清掉 network uncertain；persisted / unknown 不动
+  if (opts?.transportAck && incoming.phase === "sending") {
+    if (curRank >= 30) return current;
+    return {
+      ...current,
+      phase: "sending",
+      uncertain: false,
+      uncertainCause: undefined,
+    };
+  }
+
+  // 更弱 → 拒绝降级（persisted 不被 network/sending；unknown 不被 network）
+  if (inRank < curRank) return current;
+
+  return {
+    ...current,
+    phase: incoming.phase,
+    uncertain: incoming.uncertain,
+    uncertainCause: incoming.uncertainCause,
+  };
+};
+
+/**
+ * R34-4 / R38-1 / R39-1：标 uncertain，不删 pending。
  * cause 默认 network（fetch reject / 响应丢失）；未知 wire 终态传 unknown_terminal。
+ * 经 joinPendingPhase：不得把 persisted 降为 uncertain。
  */
 export const markPendingUncertain = <T extends PendingLocalReplyLike>(
   pending: T[],
@@ -272,12 +342,11 @@ export const markPendingUncertain = <T extends PendingLocalReplyLike>(
 ): T[] =>
   pending.map((p) =>
     p.itemId === itemId
-      ? {
-          ...p,
+      ? joinPendingPhase(p, {
+          phase: "uncertain",
           uncertain: true,
-          phase: "uncertain" as const,
           uncertainCause: cause,
-        }
+        })
       : p,
   );
 
@@ -704,6 +773,7 @@ export const reduceChatOperation = (
     }
     case "http_queued": {
       // 幂等 202：清 network-uncertain；若终态已早到则摘掉 pending
+      // R39-1：phase 经 join——persisted / unknown_terminal 不被 late 202 降为 sending
       if (!shouldInsertPendingAfter202(state.settled, action.itemId)) {
         const { pending, settled } = dropPendingByItemId(
           state.pending,
@@ -717,14 +787,15 @@ export const reduceChatOperation = (
           ...state,
           pending: state.pending.map((p) => {
             if (p.itemId !== action.itemId) return p;
-            // R38-1：已见 unknown 终态 → 晚到 202 不得把 uncertain 重置为 sending
-            if (p.uncertainCause === "unknown_terminal") return p;
-            return {
-              ...p,
-              phase: "sending" as const,
-              uncertain: false,
-              uncertainCause: undefined,
-            };
+            return joinPendingPhase(
+              p,
+              {
+                phase: "sending",
+                uncertain: false,
+                uncertainCause: undefined,
+              },
+              { transportAck: true },
+            );
           }),
         },
       };
@@ -732,19 +803,21 @@ export const reduceChatOperation = (
     case "http_direct_ok": {
       // R36-2：200 非 queued 仅表示受理中——保留 pending 等 user_reply/message_op
       // （旧逻辑摘 pending 会丢 ledger，导致 persisted 无法对账）
+      // R39-1：同上——transport ack 不降级 persisted / unknown_terminal
       return {
         state: {
           ...state,
           pending: state.pending.map((p) => {
             if (p.itemId !== action.itemId) return p;
-            // R38-1：同上——unknown_terminal 证据不被 late direct 抹掉
-            if (p.uncertainCause === "unknown_terminal") return p;
-            return {
-              ...p,
-              phase: "sending" as const,
-              uncertain: false,
-              uncertainCause: undefined,
-            };
+            return joinPendingPhase(
+              p,
+              {
+                phase: "sending",
+                uncertain: false,
+                uncertainCause: undefined,
+              },
+              { transportAck: true },
+            );
           }),
         },
       };
