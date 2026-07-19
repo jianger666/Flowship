@@ -852,8 +852,19 @@ export type EventKind =
 export type QueueFailedSseEnvelope = {
   type: "queue_failed";
   itemIds: string[];
-  /** 机器可读原因，当前：persist_failed（strict append EIO 等） */
+  /**
+   * 机器可读原因：persist_failed / no_session / task_gone / flush_error（R32-2）
+   */
   reason: string;
+};
+
+/**
+ * R32-2：watch bootstrap 轻量信封——当前服务端 queue 存活 itemIds（队内 + in-flight）。
+ * 纯内存快照、不落盘；前端用来清断连期间漏掉的终态留下的幽灵 pending。
+ */
+export type QueueStateSseEnvelope = {
+  type: "queue_state";
+  itemIds: string[];
 };
 
 /**

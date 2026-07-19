@@ -1,5 +1,9 @@
 # Fable5 Chat 打磨改动验收（2026-07-17）
 
+> 2026-07-19 09:00：第三十三轮修复已提交、待复审——R32-1～R32-7 全部处置：settledItemIds 挡终态先于 202、failQueuedItems 唯一清队入口 + bootstrap queue_state 对账、cleanup reservation 分 waiting/executing（executing 期间 reopen 409）、发号器挂 globalThis 关 ABA、tombstone 读后复查 + 前端 epoch、deletion journal 可恢复清 checkpoint refs、seq 尾窗空强制全量扫 + sidecar 只升不降。门禁 93 文件 / 863 项 0 skipped 多遍全绿。详见「第三十三轮修复报告」。
+>
+> 2026-07-19 08:45：第三十二轮 Codex 深度复审完成。R31-1～R31-5 的点名 happy path 均有有效修复，尤其 strict EIO 整队失败、quarantine cleanup reservation、DELETE 返回前 tombstone、旧日志 sidecar 迁移以及全局 RunningCheck/ClaimHandle 都已成立；但跨真实提交点继续确认 **5 个 P1 + 2 个 P2**：202 响应与 SSE 终态可反序，导致终态先到而 pending 后插入；非 EIO 清队与 queue-priority 启动仍未贯穿 itemId 终态协议；deferred remove 在最终代际检查后的第一个 await 仍可被 reopen 穿越；quarantine generation 是模块局部计数、跨 route/HMR 可 ABA 复用；tombstone 之前启动的 refresh 可在 DELETE 成功后回灌旧任务。另有重启 tombstone 清扫永久遗留 checkpoint refs，以及单条超 4MB 事件在合法落后 sidecar 下仍会 seq 重号。结论不通过。真实权限下 90 文件 / 832 项、typecheck、lint、build、diff-check 全绿；4 个临时反例探针全部实证后已撤回，业务代码未改。详见「第三十二轮验收」。
+>
 > 2026-07-19 08:25：第三十二轮修复已提交、待复审——R31-1～R31-5 全部处置，主题「完成信号只能由最终提交者发出」：队列 item 带 itemId 终态协议（queue_failed 控制帧 + 前端对账）、quarantine 双条件（cleanup reservation 带代际、reopen 作废旧清理）、DELETE 先写 durable tombstone 再回 200、seq high-water sidecar（>4MB 历史高水位恢复正确）、claimHandle 并入全局 RunningCheck。门禁 90 文件 / 832 项 0 skipped 多遍全绿。详见「第三十二轮修复报告」。
 >
 > 2026-07-19 08:10：第三十一轮 Codex 深度复审完成。R30-1 的唯一 `ClaimHandle` 与 R30-5 的 notifier outcome 已成立，R30-2/3/4 也关闭了各自点名的主窗口；但交接尾段仍确认 **3 个 P1 + 2 个 P2**：队首 strict EIO 会丢当前条、卡住其余队列且前端永久保留“待发送”；finalize 的 quarantine 在延迟 cleanup 真正完成前自动解除，reopen 可新建工作区后再被旧后台删除；DELETE 在 durable/logical delete 前即返回成功，侧栏刷新或进程重启会让任务复活；另有 4MB 外历史高水位仍导致 seq 重号，以及 `runningChecks` 的 companion handle Map 没有跟随全局状态跨 route/HMR 共享。结论不通过。真实系统权限下 typecheck、lint、87 文件 / 817 项、build、diff-check 全绿；另用两个临时探针实证“EIO 后尾消息滞留”和“>4MB 后 seq=11 而非 1001”，探针已撤回，业务代码未改。详见「第三十一轮验收」。
@@ -40,21 +44,21 @@
 
 ## 结论
 
-**第三十一轮验收仍不通过。** 本轮有明确收敛：side-effect claim 的同 kind ABA 已由唯一 token 关闭，ResourceJob 已覆盖慢清理 / 补偿，quarantine 在旧 job 存活期间确实 fail-closed，队列已做到 strict 成功后才 send，三个前端 client 也能显示 `persistWarning`，notifier stale 不再假成功。但新协议在“job 归零→终态 cleanup”“strict 失败→队列/UI 对账”“DELETE HTTP 成功→durable 删除”三个交接点提前释放了完成信号；seq 的 4MB 上限则明确没有满足 durable max。当前阻塞项为 **3 个 P1 + 2 个 P2**。
+**第三十二轮验收仍不通过。** 本轮不是无效修改：R31 点名的五条主路径都比上一轮完整，新增测试也真实覆盖了 strict EIO、cleanup 前让位、tombstone 后读、旧日志全量迁移和新形状 RunningCheck 跨模块 abort。但“最终提交者”协议仍没有覆盖响应/SSE 反序、remove 已入场、refresh 已入场和模块实例重载四类交接；另有两个持久化恢复边界。当前阻塞项为 **5 个 P1 + 2 个 P2**。
 
-第三十一轮 Codex 深度复审门禁（基线 `a2aca50`，`HEAD 33cfc5a`）：
+第三十二轮 Codex 深度复审门禁（基线 `33cfc5a`，`HEAD dedf910`）：
 
 - `pnpm typecheck`：通过
 - `pnpm lint`：通过（0 error / 0 warning）
-- R31 claim/resource/strict 定向矩阵：3 文件 / 15 项全部通过
-- Codex 临时反例探针：2/2 通过（双消息队列首条 EIO 后尾条仍为 count=1；5MB 历史 max=1000 在 4MB 外时新 seq 实际为 11）；探针运行后已撤回
-- `pnpm test`：沙箱内 816/817，唯一失败是 preview PID 用例被环境禁止 `ps` / 进程组信号；真实系统权限下该用例通过，随后全量 **87 文件 / 817 项全部通过**
+- R32 新增定向矩阵：3 文件 / 15 项全部通过
+- Codex 临时反例探针：4/4 通过（cleanup generation 跨模块复用；单条超 4MB 后 seq 重号；tombstone 提交后 stale list 仍返回任务；boot 删目录后 checkpoint ref 仍存活）；探针运行后已撤回
+- `pnpm test`：沙箱内 831/832，唯一失败是 preview PID 用例缺真实进程信号权限；沙箱外该文件 9/9，通过后全量 **90 文件 / 832 项全部通过**
 - `pnpm build`：生产构建通过
 - `git diff --check`：通过
 
 文件读写兜底专项意见继续保持落实：`safe_read`、对应测试和直接依赖已删除，`chat-mcp` 注册已撤回，Windows prompt 收缩为“两次失败后停手”，不再引导 Python/Node 写回。
 
-审查方法：逐条复查 R30-1～R30-5，再从物理 worktree / durable delete / 队列终态 / events 高水位 / route-chunk 全局状态五类真实提交点反查完成信号；只找可达 bug，不评价 S8 或功能路线。审查结束前无业务代码改动；临时测试探针已撤回，本节及「第三十一轮验收」是本轮唯一持久写入。
+审查方法：逐条复查 R31-1～R31-5，再从 HTTP/SSE 先后序、物理 remove 入场、tombstone 前后并发读、boot 恢复、超长单事件、route-chunk/HMR 状态六类真实提交点反查完成信号；只找可达 bug，不评价 S8 或功能路线。审查结束前无业务代码改动；临时测试探针已撤回，本节及「第三十二轮验收」是本轮唯一持久写入。
 
 ---
 
@@ -973,6 +977,193 @@ per-task `.event-seq` sidecar（每 16 条异步原子推进）；恢复取 `max
 - terminal cleanup 的 gen 验证与 `removeTaskWorktrees` 执行之间仍有极窄 TOCTOU（rm 进行中 reopen）——靠提交点双检 + jobs 未退完拒 reopen 兜底、未加跨 await 互斥锁。
 - 极端大事件（16 条合计 >4MB）下 sidecar+尾扫理论可低估——N=16 对常见 tool_result（~70KB）安全；缺 sidecar 全量扫路径始终正确。
 - SSE 断连瞬间错过 queue_failed 时 pending 依赖 idle/error done 兜底清理。
+
+---
+
+## 第三十三轮修复报告（Fable5、2026-07-19 上午、待复审）
+
+按第三十二轮意见修复 R32-1～R32-7，三个代理并行分区：
+
+### R32-1（SSE 终态早于 202 的对账）
+
+前端 bounded `settledItemIds`（FIFO 200）：`user_reply(queueItemId)` / `queue_failed` 先到先记账；202 返回插 pending 前查——已 settled 不插、按终态处理。「登记与终态谁先发生」不再依赖 HTTP 比 run 收尾快。
+
+### R32-2（全部清队路径接终态协议）
+
+- 唯一提交入口 `failQueuedItems(taskId, { reason, currentItemId?, currentReplyPersisted? })`：取剩余 itemIds → clear（gen 语义保留）→ 纯内存 publish `queue_failed`。已接线：会话消失 / task_gone（含 replyEvent=null）/ persist EIO / checkpoint·后置 catch。
+- queue-priority 启动的 head user_reply 补 `meta.queueItemId`（两 tab 同文案不再互清）。
+- watch bootstrap 发 `queue_state`（当前未决 itemIds）——SSE 断连错过一次性控制帧后重连对账清幽灵。
+
+### R32-3（cleanup reservation 分 waiting / executing）
+
+reservation 加 phase：`markTerminalCleanupExecuting` 原子转 executing 后才调 `removeTaskWorktrees`——reopen 只能作废 waiting、executing 期间 409「任务清理中」；旧 remove 从 await 恢复删 B 的窗口关闭（executing 不可撤销、等它跑完，比逐点 guard 简单且正确）。
+
+### R32-4（quarantine gen 发号器挂 globalThis）
+
+发号器与 Map 同挂 globalThis——「删 entry + 模块重载（route chunk/HMR）」永不回到旧身份；Codex 的 resetModules ABA 探针场景关闭。
+
+### R32-5（tombstone 提交后复查 + 前端 epoch）
+
+`listTasks` / `getTask` 在异步 meta read 完成后、返回前**同步复查** tombstone——提交前入场的读不再带回已删任务；前端 refresh 加单调 epoch（DELETE 成功推进、更早启动的 refresh 不能提交）+ `successfulDeletedIds` 过滤迟到响应（双保险）。
+
+### R32-6（deletion journal：checkpoint refs 可恢复删除）
+
+`dataRoot/deletion-journal/<taskId>.json`（repoPath + refs 清单、从 rewind_points 派生）：写序 = journal → tombstone → 清 refs → rm taskDir → 删 journal；boot 先扫 journal 再扫残留 tombstone——任意崩溃点重入最终一致，checkpoint refs 不再永久遗留。
+
+### R32-7（seq 尾窗空强制全量扫 + sidecar 只升不降）
+
+「文件大于尾窗且窗口内无完整 seq 行」→ 强制全量流式扫描（单条 >4MB 事件场景恢复正确）；sidecar 写 per-task 串行 + 写前读盘比对只升不降（异步 rename 反序不倒退）。恢复不变量：任意路径 `restored ≥ durable max`。
+
+### 测试
+
+新增 `tests/ownership-r33-queue-e2e.test.ts`（13 项：终态先后序两向 × success/EIO、四清队路径逐一注错、head itemId、bootstrap 对账）、`tests/ownership-r33-terminal-exec.test.ts`（6 项：executing 409 / waiting 作废 / 跨模块 ABA / boot 清 refs 两崩溃点 / 共享 treeOid 保留）、`tests/ownership-r33-read-seq.test.ts`（12 项：tombstone 前入场读 / epoch 迟到丢弃 / >4MB 恢复 / sidecar 反序不倒退）——覆盖第三十二轮「第三十三轮最低退出矩阵」。
+
+### 第三十三轮工程门禁（修复后）
+
+- `pnpm typecheck`：通过
+- `pnpm lint`：通过（0 error / 0 warning）
+- `pnpm test`：**93 文件 / 863 项全部通过、0 skipped**（三代理各两遍 + 主线合并后再两遍）
+- `pnpm build`：生产构建通过
+- `git diff --check`：通过
+
+### 已知边界（如实记录）
+
+- stop / error / cancelled 收尾仍直接 `clearChatQueue` 不发 queue_failed——前端靠 done(idle/error) 兜底清 pending（验收未点名、语义上停止收尾有独立 done 信号；若复审认定同类窗口再统一走 failQueuedItems）。
+- `agent.send` 失败仍走塞回重试语义（非终态、不走 failQueuedItems）。
+- R32-1 的验证按「reducer 层 + server 事件序」拆测、未做完整 HTTP 挂起仿真。
+- `getTaskWithTailEvents` 未加 tombstone 复查（验收只点名 list/get；该接口调用方在详情页、删除后路由已离开）。
+- EBUSY 降级仍可能留 tombstone+journal 靠 boot 收尾（与既有 tombstone 降级同口径）。
+
+---
+
+## 第三十二轮验收（Codex、2026-07-19、深度收敛复审、纯 bug 范围）
+
+本轮仍只找可达正确性 bug，不评价 S8 或产品功能设计，也没有修改业务代码。复审基线为 `33cfc5a`，待验收提交为 `dedf910`。我先复跑 Fable5 新增的 15 项 R32 测试，再把检查点从 helper 内部向外移到 HTTP/SSE 先后序、物理 remove 已入场、tombstone 前已开始的读、boot 清扫以及 route-chunk/HMR 重载。
+
+### 已确认修复成立
+
+- R31-1 点名的 strict EIO 反例已关闭：当前 dequeue 条和剩余队列会一起清掉，live SSE 能收到带稳定 itemId 的 `queue_failed`，持续 EIO 不会自旋；新 reducer 对同文案图/附件也能按 id 精确处理。
+- R31-2 的“双条件”在 **remove 尚未入场** 时成立：job 归零不再自动解除 quarantine；`finalize.beforeDeferredRemove` 挂起期间 reopen 会使旧 cleanup 让位。
+- R31-3 的主提交顺序成立：延迟 DELETE 会在 200 前原子 rename tombstone，提交后新发起的 `listTasks/getTask` 不再暴露任务，冷启动能继续物理删除。
+- R31-4 的旧数据迁移主场景成立：sidecar 缺失/损坏会全量流式扫描；上一轮 5MB、历史 max=1000 在尾窗外的探针现在得到 1001。
+- R31-5 对新形状 entry 成立：`ClaimHandle` 与 `RunningCheck` 同挂 globalThis，两个当前代码模块实例间 abort 能释放精确 claim，旧 handle 的迟到 release 不伤新 token。
+
+### R32-1（P1）SSE 终态可以早于 202 响应，前端会在“已完成”之后才插入永久 pending
+
+位置：
+
+- `src/app/api/tasks/[id]/chat-reply/route.ts:296-320`：服务端同步 enqueue 后还要 `await getTask`，随后才构造 202 和返回 itemId；这段 await 已足够让当前 run 的收尾 flush 消费该条。
+- `src/components/tasks/chat-view.tsx:211-233`：`user_reply/queue_failed` 只尝试从**当前已有** pending 删除，未命中不会记“这个 item 已终态”。
+- `src/components/tasks/chat-view.tsx:274-305`：pending 要等 `sendChatReply` 的 202 完整返回后才加入。
+
+可达时序：A 正在结束 → 用户发 B，服务端 enqueue B 后卡在 `getTask` → A 的 consume 触发 flush，B 可能成功发布 `user_reply(queueItemId=B)`，也可能 strict EIO 发布 `queue_failed(B)` → 浏览器此时尚不知道 B 的 itemId，reducer 对空 pending no-op → 202 随后返回，UI 才把 B 插成“待发送”。B 已经没有下一条终态事件，因此占位永久残留。稳定 id 只解决“匹配谁”，没有解决“登记与终态谁先发生”。
+
+修复要求：把 pending 登记放到请求前并让客户端生成/提交 itemId，或在前端维护 bounded `settledItemIds`，早到的 user_reply/queue_failed 先记账，202 返回时若已 settled 就不得再插 pending。不要用“通常 HTTP 比 run 收尾快”作为顺序保证。
+
+退出测试：真实 route + SSE + UI 状态机；在 enqueue 后、202 返回前挂住 `getTask`，分别让 flush 成功和 strict EIO，先送 SSE 再放 HTTP，最终 pending 必为 0 且 toast/气泡各只出现一次。
+
+### R32-2（P1）queue item 终态协议只接了 strict EIO，另外几条可达清队路径仍会留下幽灵 pending
+
+位置：
+
+- `src/lib/server/chat-runner.ts:2251-2278`：会话消失时清整队，只写自然语言 info，没有 itemIds / queue_failed。
+- `src/lib/server/chat-runner.ts:2357-2360`：strict helper 返回 null（任务目录消失）直接清队，无终态控制帧。
+- `src/lib/server/chat-runner.ts:2383-2402`：checkpoint/send/后置异常统一 clear，只写 info；当前 user_reply 若已落盘只会清当前 pending，尾队列仍无终态。
+- `src/app/api/tasks/[id]/chat-reply/route.ts:592-607`：queue-priority 启动落 `head` 的 user_reply 时没有写 `meta.queueItemId`。同文案多 tab 下，另一个 tab 会按 displayText 把自己的后继 pending 提前清掉。
+- `src/components/tasks/chat-view.tsx:235-252`：done 只有 idle/error 才兜底清 pending；上述路径常处于 awaiting_user，且纯内存 queue_failed 在断连后不会被 bootstrap 重放。
+
+可达时序一：B/C 已 202 → B 的 user_reply 已落盘 → `persistCheckpointForReply` 或 `sendChatMessage` 抛错 → catch 清 B/C，只发 info → B 的 itemId 因 user_reply 被清，C 永远保留“待发送”。可达时序二：两个 tab 各排一条相同文本，queue-priority 启动 head 未带 id 的 user_reply → 两个 tab 都用 displayText 清自己的唯一 pending，后继 tab 在真正发送前就被显示为已发送。
+
+修复要求：把“取出 itemIds + clear generation + 发布机器终态”收成唯一 `failQueuedItems`/`cancelQueuedItems` 提交入口，所有 clear 分支必须走；所有由 queue item 产生的 user_reply 都必须带该 itemId。为了覆盖 SSE 断线，watch bootstrap 或轻量 queue-status 还应能返回当前队列/最近终态水位，而不是只依赖一次性控制帧。
+
+退出测试：逐一注入 no-session、replyEvent=null、checkpoint throw、send throw、非 EIO catch、SSE 断连重连；对每个已 202 item 断言恰有一个 delivered/failed/cancelled 终态。另加两 tab 同文案、各自只持一个 pending 的真实 route 测试。
+
+### R32-3（P1）第二次 gen 检查之后立刻进入 await，reopen 仍可穿过正在执行的旧 remove
+
+位置：
+
+- `src/lib/server/task-runner.ts:1668-1689`：failpoint 后第二次 `isTerminalCleanupGenValid` 通过，随后直接 `await removeTaskWorktrees`；reservation 没有“queued→executing”不可撤销阶段。
+- `src/lib/server/task-worktrees.ts:1066-1105`：`removeTaskWorktrees` 入场第一步就是 `await pathExists`，之后还有 status/add/commit/git worktree remove 多个 await，真正删除远晚于调用入口。
+- `src/lib/server/task-runner.ts:1787-1798`：reopen 只要 jobs==0 就删除 reservation、解除 quarantine，并立即允许 prewarm。
+
+可达时序：旧 cleanup 通过第二次 gen 检查 → 卡在 `pathExists` / `git status` → reopen 看到 jobs=0，invalidate 并返回 developing → prewarm 复用/重建同一路径 B → 旧 cleanup 从 await 恢复，继续 snapshot + `git worktree remove --force`，删除 B。`jobs 未退完则 409` 对此无效，因为进入 remove 前 jobs 已经归零；双检也只保护“调用 remove 之前”，没有保护其内部提交点。
+
+修复要求：reservation 必须贯穿整个 remove。推荐显式区分 `waiting` 与 `executing`：reopen 只能取消 waiting；一旦 executing 就等待 cleanup 完成或返回 409。若坚持可取消，则把同一 handle/guard 传入 `removeTaskWorktrees`，在每个 snapshot/`git worktree remove`/fallback rm 的真实副作用前检查，并在 B 获准 ensure 之前确认旧执行者已退出。
+
+退出测试：把 failpoint 放进 `removeTaskWorktrees` 的 `pathExists` 之后、第一次 git status 之后、每仓 remove 之前；旧 cleanup 已过外层双检后并发 reopen + prewarm，B marker 必须始终保留，且 reopen 不得在旧 destructive job 仍可提交时返回成功。
+
+### R32-4（P1）quarantine Map 是 globalThis，generation 发号器却是模块局部，跨 route/HMR 会 ABA 复用旧代际
+
+位置：
+
+- `src/lib/server/resource-jobs.ts:45-72`：jobs/quarantine Map 挂 globalThis。
+- `src/lib/server/resource-jobs.ts:85-87`：`nextQuarantineGen` 是模块局部 `let`，与全局 Map 不同寿命。
+- `src/lib/server/resource-jobs.ts:167-173`、`195-213`：新 entry 用局部计数发号，旧 cleanup 仅以数字相等判 current。
+
+我用临时探针实证：模块 A hold 得 gen=1 → reopen invalidate 删除 entry → `vi.resetModules()` 模拟 route chunk/HMR → 模块 B 再 hold 同 task 又得到 gen=1 → A 的旧 `isTerminalCleanupGenValid(task, 1)` 重新变成 true。探针 1/1 通过后已撤回。结合 R32-3，旧后台即可把新一轮 worktree 当成自己的删除目标。
+
+修复要求：generation/claimId 分配器与 Map 同挂 globalThis，或直接使用不可复用的 token 对象/随机 UUID；entry 不能通过“删 Map + 模块局部计数从零再来”回到旧身份。
+
+退出测试：A hold → invalidate → resetModules → B hold，断言新 token 与旧 token 永不相等，A 的 validity 永远为 false；再把该序列接到真实 deferred remove + reopen/prewarm。
+
+### R32-5（P1）tombstone 只挡提交后新读，提交前已经入场的 refresh 仍可在 DELETE 200 后回灌任务
+
+位置：
+
+- `src/lib/server/task-fs.ts:305-330`：`listTasks` 在异步 `readMetaRaw` **之前**只查一次 tombstone，读完直接 push，没有提交后复查。
+- `src/lib/server/task-fs.ts:366-375`：`getTask` 同样先查一次，再异步读 meta/hydrate，没有最终 tombstone guard。
+- `src/hooks/use-task-list.tsx:102-111`：refresh 等 fetch 完成后才读取当前 `pendingDeletes`；`deleteTaskById` 收到 200 就在 `:173-176` unmark。因此旧 refresh 若晚到，会看到 pending 已空并整表覆盖。
+
+可达时序：轮询 refresh 先通过“无 tombstone”检查并卡在 meta read → DELETE 写 tombstone并返回 200 → 前端 unmark id → 旧 refresh 读完旧 meta，响应在 200 后到达 → `setTasks(list)` 把已删任务重新放回侧栏。Fable5 的“并发 refresh”测试是在 tombstone 已提交后才同时启动两次 list，没有覆盖这个交叉。
+
+临时探针在 `readMetaRaw` 处挂住 list，提交 tombstone 后再放行；结果 `isTaskTombstoned=true`，但旧 list 仍包含该 id。探针通过后已撤回。
+
+修复要求：服务端 list/get 在 hydrate/返回前复查 tombstone；前端 refresh 加请求 epoch/版本，DELETE 成功推进 generation 后，任何更早启动的 refresh 都不能提交。task id 不复用，也可在本进程保留 successfulDeletedIds 过滤所有迟到响应。
+
+退出测试：真实 list HTTP 在 tombstone 前入场、meta read 挂起，DELETE 200 后才返回；侧栏和 GET 详情均不得回灌。还要覆盖“旧 refresh 比 DELETE 后主动新 refresh 更晚返回”的乱序响应。
+
+### R32-6（P2）进程在 tombstone 与后台 refs 清理之间退出，会永久遗留 checkpoint refs
+
+位置：
+
+- `src/app/api/tasks/[id]/route.ts:339-369`：先 tombstone 并返回，后台之后才调用 `cleanupCheckpointRefsForTask`。
+- `src/lib/server/task-fs.ts:158-190`：冷启动 tombstone recovery 直接 `fs.rm(taskDir)`，没有先清 checkpoint refs。
+- `src/lib/server/chat-checkpoint.ts:452-500`：清 refs 明确要求在 taskDir 删除前读取 `rewind_points.jsonl`；目录一删就失去 repoPath/treeOid 清单。
+
+可达时序：DELETE 200（tombstone 已 durable）→ 进程在后台 `cleanupCheckpointRefsForTask` 前退出 → 新进程 boot 直接删 taskDir → `refs/ai-flow/checkpoints/<taskId>/*` 永久保活 tree/blob，之后再无数据知道应该去哪些仓删哪些 ref。
+
+临时真实 git 探针创建 checkpoint ref + rewind_points，写 tombstone 后模拟 boot；taskDir 已删除但 `git show-ref --verify` 仍成功。探针通过后已撤回。
+
+修复要求：把 refs cleanup 也做成可恢复删除事务。至少 boot 在 rm 前调用 cleanup；若清理失败仍想重试，就不能先丢 rewind_points，需把 repo/ref 清单写入独立 deletion journal，完成后再删 journal/taskDir。
+
+退出测试：真实 git ref，分别在 tombstone 后、refs 清到一半后模拟重启；最终 taskDir 与该 task 的所有 checkpoint refs 都消失，共享 treeOid 的其它 task ref 保留。
+
+### R32-7（P2）合法但落后的 sidecar + 单条超 4MB 事件仍会恢复为 0 并重发 seq
+
+位置：
+
+- `src/lib/server/task-fs-core.ts:605-625`：协议允许 sidecar 最多落后 15 条，且写入是异步 best-effort。
+- `src/lib/server/task-fs-core.ts:741-777`：尾扫硬上限 4MB；从文件中部读取时无条件跳过首个残行。若最后一条事件本身 >4MB，窗口里没有任何完整 JSON 行，返回 0。
+- `src/lib/server/chat-runner.ts:1777-1788`、`src/lib/server/task-runner.ts:3759-3775`：assistant buffer 整段写成单条 `assistant_message`，没有 4MB 上限，因此该输入可由真实长回复产生。
+
+可达时序：sidecar=0 已合法落盘 → 前 15 条已 append、尚未到批量推进或推进写失败 → 第 16 条 assistant_message 单行 >4MB 写成功并异步调度 sidecar=16 → 进程在 sidecar rename 前退出 → 重启读到合法 sidecar=0，因此不走全量扫描；尾部 4MB 全在第 16 条残行中，跳过后 tailMax=0 → 新事件再次拿 seq=1。
+
+临时探针写合法 `.event-seq=0` 和一条 4MB+、seq=16 的 assistant_message，清内存 counter 后 append；实际新 seq 为 1。探针通过后已撤回。
+
+修复要求：不要让恢复正确性依赖事件尺寸经验值。最小修法是“文件大于尾窗且窗口内找不到完整 seq”时强制全量流式扫描；更稳妥的是 sidecar 写按 task 串行、只升不降，并为单事件设置明确持久化上限/分块协议。
+
+退出测试：sidecar 合法落后 + 最后一条分别为 4MB−1、4MB+1、8MB；每次模拟 crash/restart 后 next seq 都严格大于 durable max。另加两个异步 sidecar rename 反序，最终 sidecar 不得倒退。
+
+### 第三十三轮最低退出矩阵
+
+1. `enqueue → SSE terminal → 202 response` 与 `202 → SSE` 两种顺序，success/EIO 各一组，UI pending 最终都为 0；
+2. 所有 queue clear 分支逐一注错，每个已 202 item 恰有一个 id 化终态；两 tab 同文案不互相清错；
+3. cleanup 已过外层双检并进入 `removeTaskWorktrees` 后，reopen 必须等待/409；跨 resetModules token 不 ABA；
+4. list/get 在 tombstone 前入场、DELETE 后迟到，服务端和前端 epoch 双层都不回灌；
+5. tombstone 后任意崩溃点重启，taskDir、worktree、checkpoint refs 最终一致清完；
+6. 合法落后 sidecar + 单条 4MB/8MB 事件与 sidecar 写反序，next seq 永不小于 durable max+1。
+
+工程门禁：R32 新增 3 文件 / 15 项通过；`pnpm typecheck`、`pnpm lint`、`git diff --check` 通过；沙箱内全量 831/832，唯一 preview PID 用例缺真实进程信号权限，沙箱外该文件 9/9 且全量 **90 文件 / 832 项全部通过**；`pnpm build` 通过。绿灯与本轮 bug 不矛盾，因为现有测试把 SSE 放在 202 后、reopen 放在 remove 外层检查前、refresh 放在 tombstone 后，且 seq 用例没有单行越过尾窗。
 
 ---
 

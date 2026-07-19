@@ -10,11 +10,14 @@
  * Next.js 15 的 dynamic route params 是 Promise、要 await
  */
 
+import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 import {
   deleteTask,
   getTask,
   getTaskWithTailEvents,
+  readDeletionJournal,
+  removeDeletionJournal,
   setTaskDisabledMcpServers,
   setTaskModel,
   setTaskPinned,
@@ -22,8 +25,9 @@ import {
   setTaskUiLayout,
   updateTaskFields,
   writeDeleteTombstone,
+  writeDeletionJournal,
 } from "@/lib/server/task-fs";
-import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
+import { MAX_EVENTS_TAIL, taskDir } from "@/lib/server/task-fs-core";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import {
   hasResourceJobs,
@@ -47,7 +51,10 @@ import {
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
 import { clearActionSideEffects } from "@/lib/server/action-side-effects";
-import { cleanupCheckpointRefsForTask } from "@/lib/server/chat-checkpoint";
+import {
+  buildCheckpointRefManifest,
+  cleanupCheckpointRefsForTask,
+} from "@/lib/server/chat-checkpoint";
 import type { ModelSelection } from "@/lib/types";
 
 /** DELETE 等 rewind 退出的轮询间隔 / 上限（T2） */
@@ -56,6 +63,18 @@ const DELETE_REWIND_WAIT_MS = 30_000;
 /** U1：等 Agent.create/send 飞行窗口退出（waitFor* 只等可见 record） */
 const DELETE_STARTING_POLL_MS = 100;
 const DELETE_STARTING_WAIT_MS = 8_000;
+
+/** R32-6：仅物理目录已消失时才删 journal（EBUSY 降级留 tombstone+journal 给 boot） */
+const removeDeletionJournalIfPhysicallyGone = async (
+  taskId: string,
+): Promise<void> => {
+  try {
+    await fs.access(taskDir(taskId));
+    // 目录仍在（典型：Windows EBUSY 降级 tombstone）→ 保留 journal
+  } catch {
+    await removeDeletionJournal(taskId);
+  }
+};
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -329,27 +348,31 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     cleanupChatQueueState(id);
     clearChatContextUsage(id);
 
-    // R30-2 / R31-3：quarantine 场景——先 durable tombstone（逻辑删除成立），再 HTTP 200；
-    // deleting lifecycle 保持到后台物理删完；job 归零后再 cleanupCheckpointRefs + deleteTask。
+    // R30-2 / R31-3 / R32-6：quarantine 场景——先 journal+tombstone（逻辑删除成立），再 HTTP 200；
+    // deleting lifecycle 保持到后台物理删完；job 归零后再清 refs + deleteTask + 删 journal。
     if (resourceJoinTimedOut || hasResourceJobs(id)) {
       if (!resourceJoinTimedOut) {
         // 防御：starting 超时窗口外 resource 又冒出来
         markWorkspaceQuarantined(id);
       }
-      // R31-3：返回 200 之前必须先形成 durable logical delete（list/get 立刻不可见；
-      // 进程退出后 boot 见 tombstone 继续物理删——不再靠内存 lifecycle）
+      // R31-3 / R32-6：返回 200 之前必须先形成 durable logical delete + journal
+      // （list/get 立刻不可见；进程退出后 boot 见 journal/tombstone 继续物理删）
       await writeDeleteTombstone(id);
       void (async () => {
         try {
           while (hasResourceJobs(id)) {
             await new Promise<void>((r) => setTimeout(r, 200));
           }
-          await cleanupCheckpointRefsForTask(id).catch((err) => {
-            console.warn(
-              `[DELETE /api/tasks/[id]] 延迟 cleanupCheckpointRefs 失败 task=${id}:`,
-              err instanceof Error ? err.message : err,
-            );
-          });
+          // R32-6：先 refs 后 rm——优先 journal（taskDir 删后仍可重试）
+          const journal = await readDeletionJournal(id);
+          await cleanupCheckpointRefsForTask(id, journal ?? undefined).catch(
+            (err) => {
+              console.warn(
+                `[DELETE /api/tasks/[id]] 延迟 cleanupCheckpointRefs 失败 task=${id}:`,
+                err instanceof Error ? err.message : err,
+              );
+            },
+          );
           const ok = await deleteTask(id);
           if (!ok) {
             endChatLifecycle(id, "deleting");
@@ -358,6 +381,7 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
             );
             return;
           }
+          await removeDeletionJournalIfPhysicallyGone(id);
           clearChatGate(id);
         } catch (err) {
           endChatLifecycle(id, "deleting");
@@ -372,8 +396,20 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
 
     // U2：deleting gate 必须持有到 deleteTask 成功之后——此前 clear 会开闸让
     // chat-reply 在 refs 清理 / 物理删除窗口内重新预约并起新 Agent。
-    // 删任务数据目录前清各仓 checkpoint refs；否则被删任务的 tree/blob 会永久留在用户仓
-    await cleanupCheckpointRefsForTask(id).catch((err) => {
+    // R32-6：快速路径同样 journal → refs → rm → 删 journal（崩溃可恢复）
+    const fastManifest = await buildCheckpointRefManifest(id).catch(() => ({
+      deletedAt: Date.now(),
+      checkpointRefs: [],
+    }));
+    try {
+      await writeDeletionJournal(id, fastManifest);
+    } catch (err) {
+      console.warn(
+        `[DELETE /api/tasks/[id]] R32-6 写 journal 失败 task=${id}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+    await cleanupCheckpointRefsForTask(id, fastManifest).catch((err) => {
       console.warn(
         `[DELETE /api/tasks/[id]] cleanupCheckpointRefs 失败 task=${id}:`,
         err instanceof Error ? err.message : err,
@@ -385,6 +421,7 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
       endChatLifecycle(id, "deleting");
       return NextResponse.json({ error: "not_found" }, { status: 404 });
     }
+    await removeDeletionJournalIfPhysicallyGone(id);
     // 出口 success：物理删完才清全部门闩（含 deleting / cancelled lease / rewind 键）
     clearChatGate(id);
     // W1：故意不 clear generation——保留 tombstone 防 ABA（无键默认 0 会让旧 snap 复活）；

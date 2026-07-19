@@ -1071,6 +1071,10 @@ export const removeTaskWorktrees = async (
     return { removedAny: false, snapshotRepos: [], snapshotFailedRepos: [] };
   }
 
+  // R32-3 测试挂点：pathExists 之后、第一次 git status / snapshot 之前——
+  // 验证 reservation 已转 executing 时 reopen 409、旧 remove 不得删 B。
+  await failpoint("removeTaskWorktrees.afterPathExists");
+
   // 不走 getTaskWorkRepoPaths：那个映射按 nonGitRepoPaths 快照分流、非 git 返回原路径——
   // 删除逻辑绝不能对原路径下手（会毁掉用户目录）。
   // 这里独立算「worktree 候选路径」（容器目录 + 仓短名）、只对真实存在的候选目录操作：

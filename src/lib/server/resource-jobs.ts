@@ -1,5 +1,6 @@
 /**
- * R28-1 / R29-2 / R30-2 / R31-2：per-task resource job 登记（与 startingTasks 同形、独立模块避环）。
+ * R28-1 / R29-2 / R30-2 / R31-2 / R32-3 / R32-4：per-task resource job 登记
+ * （与 startingTasks 同形、独立模块避环）。
  *
  * R29-2：每个 job 可挂「当前在跑子进程」的 abort；stop/finalize/DELETE 终态 owner
  * 调 revokeResourceJobs 主动终止，再 join 等计数归零。
@@ -12,7 +13,13 @@
  * - `terminalCleanup` reservation：finalize 延迟 `removeTaskWorktrees` 的独立代际持有
  * - quarantine **仅当**「jobs 归零」且「无在飞 terminal cleanup」两者都满足时才解除
  * - `endResourceJob` 归零时只通知 waiter + 尝试 maybeClear；**不得**无条件清 quarantine
- * - reopen 作废旧 cleanup（bump gen）后立即解除 quarantine（旧后台提交前发现 gen 失效让位）
+ *
+ * R32-3：reservation 分 `waiting | executing` 两阶段——
+ * - waiting：reopen 可 invalidate 作废（旧 cleanup 让位）
+ * - executing：贯穿整个 `removeTaskWorktrees`；reopen 只能 409 busy，不得解除 quarantine
+ *
+ * R32-4：generation / job 发号器与 Map 同挂 globalThis——防 route-chunk / HMR /
+ * `vi.resetModules` 后模块局部计数从零复用旧代际（ABA）。
  *
  * 正确性：lease 让位路径只抛错、不 abort 别人的 job；每个 job 只 abort 自己登记的。
  */
@@ -28,29 +35,43 @@ interface JobEntry {
   abort: (() => void) | null;
 }
 
+/** R32-3：终态 cleanup reservation 阶段 */
+export type TerminalCleanupPhase = "waiting" | "executing";
+
 /**
- * R31-2：quarantine 条目——带单调代际 + 可选的终态 cleanup reservation。
- * generation 在 mark / invalidate 时递增；cleanup 持有时记下当时的 gen，提交前校验。
+ * R31-2 / R32-3：quarantine 条目——带单调代际 + 可选的终态 cleanup reservation。
+ * generation 在 mark 时分配；cleanup 持有时记下当时的 gen + phase，提交前校验。
  */
 interface QuarantineEntry {
   /** 进程单调代际（本 task 内） */
   generation: number;
   /**
    * 终态 cleanup 持有的 generation；null = 无在飞 terminal cleanup。
-   * 与 generation 相等时 reservation 有效；reopen bump 后旧 gen 失效。
+   * 与 generation 相等时 reservation 有效；reopen 作废 waiting 后旧 gen 失效。
    */
   terminalCleanupGen: number | null;
+  /**
+   * R32-3：waiting=可被 reopen 作废；executing=已入 remove、reopen 只能 busy。
+   * 无 reservation 时为 null。
+   */
+  terminalCleanupPhase: TerminalCleanupPhase | null;
 }
 
+/** R32-4：发号器与 Map 同寿命（换 key 防 hot-reload 读到旧形状） */
 const RESOURCE_JOBS_GLOBAL_KEY = "__feAiFlowResourceJobsV2__";
-/** R31-2：从 Set 升级为带代际的 Map（换 key 防 hot-reload 读到旧 Set） */
-const QUARANTINE_GLOBAL_KEY = "__feAiFlowQuarantinedWorkspacesV2__";
-/** R31-2：jobs 归零 waiter（deferred cleanup / 测试可 await，不必盲轮询） */
+const QUARANTINE_GLOBAL_KEY = "__feAiFlowQuarantinedWorkspacesV3__";
 const JOB_CLEARED_WAITERS_KEY = "__feAiFlowResourceJobClearedWaitersV1__";
+/** R32-4：jobSeq + quarantineGen 单调计数器（与 Map 同挂 globalThis） */
+const RESOURCE_COUNTERS_GLOBAL_KEY = "__feAiFlowResourceCountersV1__";
 
 type JobsByTask = Map<string, Map<string, JobEntry>>;
 type QuarantineByTask = Map<string, QuarantineEntry>;
 type JobClearedWaiters = Map<string, Set<() => void>>;
+
+interface ResourceCounters {
+  nextJobSeq: number;
+  nextQuarantineGen: number;
+}
 
 const getResourceJobsMap = (): JobsByTask => {
   const g = globalThis as unknown as Record<string, JobsByTask | undefined>;
@@ -82,14 +103,25 @@ const getJobClearedWaiters = (): JobClearedWaiters => {
   return g[JOB_CLEARED_WAITERS_KEY]!;
 };
 
-let nextJobSeq = 0;
-/** R31-2：quarantine generation 进程单调（跨 task 也递增，避免 ABA 误认） */
-let nextQuarantineGen = 0;
+/** R32-4：取（或初始化）全局单调发号器 */
+const getResourceCounters = (): ResourceCounters => {
+  const g = globalThis as unknown as Record<
+    string,
+    ResourceCounters | undefined
+  >;
+  if (!g[RESOURCE_COUNTERS_GLOBAL_KEY]) {
+    g[RESOURCE_COUNTERS_GLOBAL_KEY] = {
+      nextJobSeq: 0,
+      nextQuarantineGen: 0,
+    };
+  }
+  return g[RESOURCE_COUNTERS_GLOBAL_KEY]!;
+};
 
 /** R30-2：生产默认 30s；单测可 `setResourceJoinTimeoutMsForTest` 缩短 */
 export const DEFAULT_RESOURCE_JOIN_MS = 30_000;
 
-/** 测试专用：覆盖 join 超时；传 null 恢复默认 */
+/** 测试专用：覆盖 join 超时；传 null 恢复默认（模块局部即可，不进全局） */
 let joinTimeoutOverrideMs: number | null = null;
 
 export const setResourceJoinTimeoutMsForTest = (
@@ -119,7 +151,8 @@ export const beginResourceJob = (taskId: string): ResourceJobHandle => {
     jobs = new Map();
     m.set(taskId, jobs);
   }
-  const jobId = `rj-${++nextJobSeq}-${Date.now().toString(36)}`;
+  const counters = getResourceCounters();
+  const jobId = `rj-${++counters.nextJobSeq}-${Date.now().toString(36)}`;
   jobs.set(jobId, { abort: null });
   return { taskId, jobId };
 };
@@ -168,8 +201,13 @@ export const markWorkspaceQuarantined = (taskId: string): number => {
   const m = getQuarantineMap();
   const prev = m.get(taskId);
   if (prev) return prev.generation;
-  const generation = ++nextQuarantineGen;
-  m.set(taskId, { generation, terminalCleanupGen: null });
+  const counters = getResourceCounters();
+  const generation = ++counters.nextQuarantineGen;
+  m.set(taskId, {
+    generation,
+    terminalCleanupGen: null,
+    terminalCleanupPhase: null,
+  });
   return generation;
 };
 
@@ -188,9 +226,18 @@ export const hasTerminalCleanup = (taskId: string): boolean => {
   return cur?.terminalCleanupGen != null;
 };
 
+/** R32-3：当前 cleanup 阶段；无 reservation → null */
+export const getTerminalCleanupPhase = (
+  taskId: string,
+): TerminalCleanupPhase | null => {
+  const cur = getQuarantineMap().get(taskId);
+  if (cur?.terminalCleanupGen == null) return null;
+  return cur.terminalCleanupPhase;
+};
+
 /**
- * R31-2：终态 owner 进入 deferred cleanup 时持有 reservation。
- * 若尚未 quarantine 则先 mark；返回 cleanup gen（提交删除前必须仍 valid）。
+ * R31-2 / R32-3：终态 owner 进入 deferred cleanup 时持有 reservation（phase=waiting）。
+ * 若尚未 quarantine 则先 mark；返回 cleanup gen（转 executing / 提交删除前必须仍 valid）。
  */
 export const holdTerminalCleanup = (taskId: string): number => {
   const m = getQuarantineMap();
@@ -200,17 +247,42 @@ export const holdTerminalCleanup = (taskId: string): number => {
     cur = m.get(taskId)!;
   }
   const gen = cur.generation;
-  m.set(taskId, { generation: gen, terminalCleanupGen: gen });
+  m.set(taskId, {
+    generation: gen,
+    terminalCleanupGen: gen,
+    terminalCleanupPhase: "waiting",
+  });
   return gen;
 };
 
-/** R31-2：cleanup gen 是否仍是当前有效 reservation（reopen 作废后为 false） */
+/** R31-2：cleanup gen 是否仍是当前有效 reservation（reopen 作废 waiting 后为 false） */
 export const isTerminalCleanupGenValid = (
   taskId: string,
   gen: number,
 ): boolean => {
   const cur = getQuarantineMap().get(taskId);
   return cur?.terminalCleanupGen === gen;
+};
+
+/**
+ * R32-3：原子将 reservation 从 waiting → executing（gen 匹配才转）。
+ * @returns true=已持有 executing（含幂等已 executing）；false=已被 reopen 作废 / gen 不匹配
+ */
+export const markTerminalCleanupExecuting = (
+  taskId: string,
+  gen: number,
+): boolean => {
+  const m = getQuarantineMap();
+  const cur = m.get(taskId);
+  if (!cur || cur.terminalCleanupGen !== gen) return false;
+  if (cur.terminalCleanupPhase === "executing") return true;
+  if (cur.terminalCleanupPhase !== "waiting") return false;
+  m.set(taskId, {
+    generation: cur.generation,
+    terminalCleanupGen: gen,
+    terminalCleanupPhase: "executing",
+  });
+  return true;
 };
 
 /**
@@ -222,23 +294,34 @@ export const releaseTerminalCleanup = (taskId: string, gen: number): void => {
   const m = getQuarantineMap();
   const cur = m.get(taskId);
   if (!cur || cur.terminalCleanupGen !== gen) return;
-  m.set(taskId, { generation: cur.generation, terminalCleanupGen: null });
+  m.set(taskId, {
+    generation: cur.generation,
+    terminalCleanupGen: null,
+    terminalCleanupPhase: null,
+  });
   maybeClearQuarantine(taskId);
 };
 
+/** R32-3：reopen 尝试作废 cleanup 的结果 */
+export type InvalidateCleanupResult = "invalidated" | "busy" | "none";
+
 /**
- * R31-2 ②：reopen 作废在飞 terminal cleanup——bump 语义上使旧 gen 失效 +
- * 立即解除 quarantine，让预热/推进可重建工作区。
- * 旧后台 remove 提交前 `isTerminalCleanupGenValid` 为 false 即让位。
- * @returns 是否确实作废了在飞 cleanup
+ * R31-2 / R32-3：reopen 作废在飞 terminal cleanup——
+ * - waiting：删掉 reservation + 立即解除 quarantine（旧后台转 executing 失败让位）
+ * - executing：返 busy（贯穿 remove，不得放行 prewarm）
+ * @returns invalidated | busy | none
  */
-export const invalidateTerminalCleanupForReopen = (taskId: string): boolean => {
+export const invalidateTerminalCleanupForReopen = (
+  taskId: string,
+): InvalidateCleanupResult => {
   const m = getQuarantineMap();
   const cur = m.get(taskId);
-  if (!cur || cur.terminalCleanupGen == null) return false;
-  // 整条删掉 = 立即解除 quarantine；旧 gen 再也 valid 不了
+  if (!cur || cur.terminalCleanupGen == null) return "none";
+  // R32-3：executing 期间 reopen 进不来——返回 busy，由 route 映射 409
+  if (cur.terminalCleanupPhase === "executing") return "busy";
+  // waiting：整条删掉 = 立即解除 quarantine；旧 gen 再也 valid 不了
   m.delete(taskId);
-  return true;
+  return "invalidated";
 };
 
 /**

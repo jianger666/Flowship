@@ -128,6 +128,7 @@ import {
   isTaskStarting,
   isTerminalCleanupGenValid,
   isWorkspaceQuarantined,
+  markTerminalCleanupExecuting,
   markWorkspaceQuarantined,
   pendingStopRequests,
   publish,
@@ -1666,21 +1667,23 @@ export const finalizeTask = async (
         void (async () => {
           try {
             await waitUntilResourceJobsCleared(taskId);
-            // R31-2：提交删除前验证 cleanup gen——reopen 作废后让位，不删 B 的活 worktree
+            // R31-2：提交删除前验证 cleanup gen——reopen 作废 waiting 后让位
             if (!isTerminalCleanupGenValid(taskId, cleanupGen)) {
               console.log(
                 `[task-runner] finalizeTask: R31-2 旧 cleanup 代际已失效、让位 task=${taskId} gen=${cleanupGen}`,
               );
               return;
             }
-            // 测试挂点：delayed remove 真实提交点（验收要求挂在此、非「job 归零后 quarantine=false」）
+            // 测试挂点：delayed remove 转 executing 前（waiting 阶段 reopen 仍可作废）
             await failpoint("finalize.beforeDeferredRemove");
-            if (!isTerminalCleanupGenValid(taskId, cleanupGen)) {
+            // R32-3：原子 waiting→executing；转失败 = 已被 reopen 作废、让位（不再二次 gen 检查后裸 await）
+            if (!markTerminalCleanupExecuting(taskId, cleanupGen)) {
               console.log(
-                `[task-runner] finalizeTask: R31-2 failpoint 后 cleanup 代际已失效、让位 task=${taskId} gen=${cleanupGen}`,
+                `[task-runner] finalizeTask: R32-3 转 executing 失败（已被 reopen 作废）、让位 task=${taskId} gen=${cleanupGen}`,
               );
               return;
             }
+            // executing 期间 reopen 只能 409——remove 内部多 await 全程受 reservation 保护
             await removeTaskWorktrees(taskSnap).catch((err) => {
               console.warn(
                 `[task-runner] finalizeTask: 延迟清理 worktree 失败 task=${taskId}`,
@@ -1757,8 +1760,10 @@ export const finalizeTask = async (
 };
 
 /**
- * R31-2 ① 兜底：旧 resource job 未退完且 terminal cleanup 在飞时拒绝 reopen。
- * route 映射 409「任务清理中、稍后再试」。主路径优先 ②（作废旧 cleanup）。
+ * R31-2 / R32-3：terminal cleanup 与 reopen 冲突时拒绝。
+ * - waiting + jobs 未退完 → 409
+ * - executing（已入 remove）→ 409「任务清理中、稍后再试」（用户重试、不阻塞 HTTP）
+ * route 映射 409。
  */
 export class TaskCleanupInProgressError extends Error {
   constructor(message = "任务清理中、稍后再试") {
@@ -1773,10 +1778,10 @@ export class TaskCleanupInProgressError extends Error {
  * 误 abandon、或想把已终结的 task 重新捡起来继续时用。只翻 repoStatus、
  * runStatus 保持 idle（没有活 agent、用户后续点「推进」才起新 Run）。
  *
- * R31-2：若有在飞 terminal cleanup——
- * - ②（倾向）：jobs 已归零 → 作废旧 cleanup（invalidate）+ 立即解除 quarantine，
- *   旧后台 remove 提交前发现 gen 失效让位；
- * - ①（兜底）：jobs 仍非零 → 抛 TaskCleanupInProgressError，route 回 409。
+ * R31-2 / R32-3：若有在飞 terminal cleanup——
+ * - executing：抛 TaskCleanupInProgressError（409）；remove 全程受 reservation 保护
+ * - waiting + jobs 仍非零：抛 409（旧事务未退完）
+ * - waiting + jobs 归零：invalidate 作废旧 cleanup + 立即解除 quarantine
  */
 export const reopenTask = async (taskId: string): Promise<void> => {
   const task = await getTask(taskId);
@@ -1784,17 +1789,22 @@ export const reopenTask = async (taskId: string): Promise<void> => {
   if (task.repoStatus !== "merged" && task.repoStatus !== "abandoned") {
     throw new Error("只有已合入 / 已放弃的任务才能恢复");
   }
-  // R31-2：终态 cleanup 与 reopen 互斥窗口
+  // R31-2 / R32-3：终态 cleanup 与 reopen 互斥窗口
   if (hasTerminalCleanup(taskId)) {
     if (hasResourceJobs(taskId)) {
       // ① 兜底：旧事务未退完，拒绝 reopen（避免与慢清理并发写同路径）
       throw new TaskCleanupInProgressError();
     }
-    // ②：作废旧 cleanup + 立即解除 quarantine（旧 remove 见 gen 失效让位）
-    invalidateTerminalCleanupForReopen(taskId);
-    console.log(
-      `[task-runner] reopenTask: R31-2 作废在飞 terminal cleanup、解除 quarantine task=${taskId}`,
-    );
+    // R32-3：invalidate 只取消 waiting；executing → busy → 409
+    const inv = invalidateTerminalCleanupForReopen(taskId);
+    if (inv === "busy") {
+      throw new TaskCleanupInProgressError();
+    }
+    if (inv === "invalidated") {
+      console.log(
+        `[task-runner] reopenTask: R32-3 作废 waiting terminal cleanup、解除 quarantine task=${taskId}`,
+      );
+    }
   }
   const patched = await setTaskRepoStatus(taskId, "developing");
   if (patched) publish(taskId, { kind: "task", task: patched });

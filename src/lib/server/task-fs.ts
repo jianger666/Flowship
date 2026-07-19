@@ -35,7 +35,7 @@
  * - 本文件保留：boot recovery + 公开 CRUD（list / get / create / delete）+ 各类 meta patch API
  */
 
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 
 import type {
@@ -66,6 +66,13 @@ import {
   isWorktreeTask,
   removeTaskWorktrees,
 } from "./task-worktrees";
+import {
+  buildCheckpointRefManifest,
+  cleanupCheckpointRefsForTask,
+  cleanupCheckpointRefsFromManifest,
+  type CheckpointRefManifest,
+} from "./chat-checkpoint";
+import { dataRoot } from "./data-root";
 import { readSettingsFile } from "./settings-fs";
 import {
   killStalePreview,
@@ -156,11 +163,151 @@ const inferContextDocType = (content: string): TaskContextDocType => {
 const RECOVERY_FLAG = "__feAiFlowBootRecoveryPromiseV2__";
 
 /**
+ * R32-6：deletion journal 目录（taskDir 外）。
+ * tombstone 在 taskDir 内，rm 后会丢——refs 清单必须落盘在 dataRoot 下独立目录，
+ * 崩溃任意点重启都能按 journal 完成遗留清理。
+ *
+ * 协议（崩溃最终一致）：
+ * 1. 写 journal（含 checkpointRefs）→ 2. 写 tombstone → 3. 清 refs →
+ * 4. rm taskDir → 5. 删 journal
+ * boot：扫 journal 目录优先；再扫残留 tombstone（无 journal 的遗留 / 写 journal 失败）。
+ */
+const DELETION_JOURNAL_DIR = "deletion-journal";
+
+export const getDeletionJournalDir = (): string =>
+  path.join(dataRoot(), DELETION_JOURNAL_DIR);
+
+export const getDeletionJournalPath = (taskId: string): string =>
+  path.join(getDeletionJournalDir(), `${taskId}.json`);
+
+/** R32-6：读 journal；不存在 / 损坏 → null */
+export const readDeletionJournal = async (
+  taskId: string,
+): Promise<CheckpointRefManifest | null> => {
+  const p = getDeletionJournalPath(taskId);
+  try {
+    const raw = await fs.readFile(p, "utf-8");
+    const parsed = JSON.parse(raw) as CheckpointRefManifest;
+    if (!parsed || !Array.isArray(parsed.checkpointRefs)) return null;
+    return parsed;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    console.warn(
+      `[task-fs] R32-6 读 deletion journal 失败 id=${taskId}`,
+      err,
+    );
+    return null;
+  }
+};
+
+/**
+ * R32-6：原子写 deletion journal（同目录 tmp+rename）。
+ * 须在写 tombstone / 清 refs / rm taskDir 之前调用。
+ */
+export const writeDeletionJournal = async (
+  taskId: string,
+  manifest: CheckpointRefManifest,
+): Promise<void> => {
+  const dir = getDeletionJournalDir();
+  await fs.mkdir(dir, { recursive: true });
+  const finalPath = getDeletionJournalPath(taskId);
+  const tmpPath = path.join(
+    dir,
+    `.${taskId}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const body = JSON.stringify({
+    deletedAt: manifest.deletedAt,
+    checkpointRefs: manifest.checkpointRefs,
+  });
+  await fs.writeFile(tmpPath, body, "utf-8");
+  try {
+    await fs.rename(tmpPath, finalPath);
+  } catch (err) {
+    await fs.unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+};
+
+/** R32-6：物理删完成后移除 journal（幂等） */
+export const removeDeletionJournal = async (taskId: string): Promise<void> => {
+  await fs.unlink(getDeletionJournalPath(taskId)).catch(() => {});
+};
+
+/**
+ * R32-6：按 journal（优先）或 rewind_points 清 checkpoint refs，再 rm taskDir，最后删 journal。
+ * boot recovery / DELETE 后台共用——任意崩溃点重启后重入仍最终一致。
+ */
+export const recoverDeletedTaskArtifacts = async (
+  taskId: string,
+): Promise<void> => {
+  const journal = await readDeletionJournal(taskId);
+  if (journal) {
+    await cleanupCheckpointRefsFromManifest(taskId, journal).catch((err) => {
+      console.warn(
+        `[task-fs] R32-6 recover: journal 清 refs 失败 id=${taskId}`,
+        err,
+      );
+    });
+  } else {
+    // 无 journal（旧 tombstone / journal 写失败）：趁 taskDir 还在读 rewind_points
+    await cleanupCheckpointRefsForTask(taskId).catch((err) => {
+      console.warn(
+        `[task-fs] R32-6 recover: rewind_points 清 refs 失败 id=${taskId}`,
+        err,
+      );
+    });
+  }
+  const dir = taskDir(taskId);
+  if (await exists(dir)) {
+    await fs.rm(dir, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
+  }
+  await removeDeletionJournal(taskId);
+};
+
+/**
+ * R32-6：扫 deletion-journal/——进程在 tombstone 与 rm 之间退出时的主恢复路径。
+ */
+const recoverDeletionJournals = async (): Promise<void> => {
+  const journalDir = getDeletionJournalDir();
+  let names: string[];
+  try {
+    const entries = await fs.readdir(journalDir, { withFileTypes: true });
+    names = entries
+      .filter((e) => e.isFile() && e.name.endsWith(".json"))
+      .map((e) => e.name.replace(/\.json$/, ""));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    console.warn("[task-fs] R32-6 journal 清扫: 读目录失败", err);
+    return;
+  }
+  for (const taskId of names) {
+    try {
+      await recoverDeletedTaskArtifacts(taskId);
+      console.log(`[task-fs] R32-6 journal 清扫: 已完成 id=${taskId}`);
+    } catch (err) {
+      console.warn(
+        `[task-fs] R32-6 journal 清扫失败（下次启动再试）id=${taskId}`,
+        err,
+      );
+    }
+  }
+};
+
+/**
  * 清扫 deleteTask 降级留下的 tombstone 目录。
  * 只删带 `.deleted-tombstone` 的——tasks 下 bench/fixture 等手工目录绝不能误删。
+ * R32-6：rm 前先清 checkpoint refs（journal 优先，否则 rewind_points）。
  * 重启后句柄通常已释放，fs.rm 多数能成功；失败 warn 留给下次启动。
  */
 const cleanupTombstonedTaskDirs = async (): Promise<void> => {
+  // R32-6：先扫 taskDir 外的 journal（覆盖「tombstone 已写、refs 未清、进程退出」）
+  await recoverDeletionJournals();
+
   let ids: string[];
   try {
     const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
@@ -173,13 +320,9 @@ const cleanupTombstonedTaskDirs = async (): Promise<void> => {
     const dir = path.join(DATA_DIR, name);
     const tombstone = path.join(dir, DELETED_TOMBSTONE_FILE);
     if (!(await exists(tombstone))) continue;
+    // journal 路径已在 recoverDeletionJournals 处理过则目录应已消失；残留 = 无 journal 遗留
     try {
-      await fs.rm(dir, {
-        recursive: true,
-        force: true,
-        maxRetries: 5,
-        retryDelay: 100,
-      });
+      await recoverDeletedTaskArtifacts(name);
       console.log(`[task-fs] tombstone 清扫: 已删 id=${name}`);
     } catch (err) {
       console.warn(
@@ -302,6 +445,13 @@ const ensureBootRecovery = async (): Promise<void> => {
 
 // ----------------- 公开 API：list / get / create / delete -----------------
 
+/**
+ * R32-5：同步复查 tombstone（list/get 在异步读 meta / hydrate 后、提交结果前调用）。
+ * 异步 exists 在 await 间隙会被 DELETE 抢先落盘——必须用 existsSync 再挡一道。
+ */
+const isTaskTombstonedSync = (id: string): boolean =>
+  existsSync(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
+
 export const listTasks = async (): Promise<TaskSummary[]> => {
   await ensureBootRecovery();
   await ensureDataDir();
@@ -319,6 +469,8 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
       console.warn(`[task-fs] listTasks: 读 meta 失败 id=${id}`, err);
       continue;
     }
+    // R32-5：读 meta 后可挂起——矩阵在此注入 tombstone，验证 push 前复查生效
+    await failpoint("listTasks.afterReadMeta");
     if (!raw) continue;
     if (!isValidMetaShape(raw)) {
       // V0.5 残留 / schema 破损 → 不显示
@@ -326,6 +478,8 @@ export const listTasks = async (): Promise<TaskSummary[]> => {
     }
 
     const summary = hydrateTaskSummary(raw);
+    // R32-5：push 前同步复查——防「无 tombstone 入场 → 读 meta 挂起 → DELETE 200」回灌
+    if (isTaskTombstonedSync(id)) continue;
     summaries.push(summary);
   }
   return summaries;
@@ -336,13 +490,36 @@ export const isTaskTombstoned = async (id: string): Promise<boolean> =>
   exists(path.join(taskDir(id), DELETED_TOMBSTONE_FILE));
 
 /**
- * R31-3：durable logical delete——在 task 目录写 `.deleted-tombstone`（原子 rename）。
- * listTasks / getTask / boot recovery 见标记即不暴露；boot 会 best-effort 物理 rm。
+ * R31-3 / R32-6：durable logical delete——
+ * 1) 先写 taskDir 外 deletion journal（checkpointRefs 清单，rm 后仍可恢复清 refs）
+ * 2) 再原子写 `.deleted-tombstone`（含同份清单；list/get/boot 见标记即不暴露）
  * DELETE 延迟分支须在返回 200 **之前**调用，否则 refresh / 重启会把任务「复活」。
  */
 export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
   const dir = taskDir(taskId);
   await fs.mkdir(dir, { recursive: true });
+
+  // R32-6：journal 在 tombstone 之前——崩溃后 boot 凭 journal 清 refs，不依赖 taskDir
+  const manifest = await buildCheckpointRefManifest(taskId).catch((err) => {
+    console.warn(
+      `[task-fs] R32-6 writeDeleteTombstone: buildManifest 失败 id=${taskId}`,
+      err,
+    );
+    return {
+      deletedAt: Date.now(),
+      checkpointRefs: [],
+    } satisfies CheckpointRefManifest;
+  });
+  try {
+    await writeDeletionJournal(taskId, manifest);
+  } catch (err) {
+    // journal 失败不挡 tombstone——boot 仍可趁 taskDir 在读 rewind_points
+    console.warn(
+      `[task-fs] R32-6 writeDeleteTombstone: 写 journal 失败 id=${taskId}`,
+      err,
+    );
+  }
+
   const tombstonePath = path.join(dir, DELETED_TOMBSTONE_FILE);
   // 同目录 tmp + rename = 同文件系统原子提交（写半截不会被 list 当成有效 tombstone）
   const tmpPath = path.join(
@@ -350,9 +527,11 @@ export const writeDeleteTombstone = async (taskId: string): Promise<void> => {
     `.${DELETED_TOMBSTONE_FILE}.${process.pid}.${Date.now()}.tmp`,
   );
   const payload = JSON.stringify({
-    deletedAt: Date.now(),
+    deletedAt: manifest.deletedAt,
     // R31-3：区分 Windows EBUSY 降级 vs DELETE 延迟分支的逻辑删除
     reason: "logical-delete",
+    // R32-6：tombstone 内冗余清单（taskDir 未 rm 前可读；真正 durable 靠 journal）
+    checkpointRefs: manifest.checkpointRefs,
   });
   await fs.writeFile(tmpPath, payload, "utf-8");
   try {
@@ -372,7 +551,10 @@ export const getTask = async (id: string): Promise<Task | null> => {
   // R25-2 / R25-5：meta 已读、hydrate events 未完成——矩阵可在此注入 finalize，
   // 验证 route 陈旧 developing 快照 + 裸写 running 窗口已被条件事务 / fresh 终态闸堵住
   await failpoint("taskread.beforeHydrate");
-  return await hydrateTask(raw);
+  const task = await hydrateTask(raw);
+  // R32-5：返回前同步复查 tombstone——防提交前入场的 get 在 DELETE 后回灌详情
+  if (isTaskTombstonedSync(id)) return null;
+  return task;
 };
 
 /**

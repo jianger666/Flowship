@@ -35,6 +35,7 @@ import {
   tryBeginChatRewind,
 } from "./chat-gate";
 import { clearChatQueue, getChatQueueCount } from "./chat-queue";
+import { failpoint } from "./failpoints";
 import {
   EVENTS_FILE,
   readEvents,
@@ -449,57 +450,140 @@ export const writeRewindPoints = async (
   }
 };
 
+/** R32-6：单仓 checkpoint ref 清单（deletion journal / tombstone 共用） */
+export interface CheckpointRefManifestEntry {
+  repoPath: string;
+  refs: string[];
+}
+
 /**
- * 删除任务前清理各仓里该 task 的 checkpoint refs。
- * 不清理会让被删任务的历史 tree/blob 永久保留在用户仓里（refs 保活对象）。
- * 须在 deleteTask 之前调用（还要能读到 rewind_points）。全程 best-effort。
+ * R32-6：可恢复删除事务的 refs 清单。
+ * 写 tombstone / journal 时从 rewind_points 提取；rm taskDir 后仍可凭 journal 重试。
  */
-export const cleanupCheckpointRefsForTask = async (
+export interface CheckpointRefManifest {
+  deletedAt: number;
+  checkpointRefs: CheckpointRefManifestEntry[];
+}
+
+/**
+ * R32-6：从 rewind_points + for-each-ref 提取本 task 的 checkpoint refs 清单。
+ * taskDir 已删或 rewind 读失败 → 返空清单（调用方应已有 journal 兜底）。
+ */
+export const buildCheckpointRefManifest = async (
   taskId: string,
-): Promise<void> => {
+): Promise<CheckpointRefManifest> => {
+  const deletedAt = Date.now();
   let points: RewindPoint[];
   try {
     points = await readRewindPoints(taskId);
   } catch (err) {
     console.warn(
-      `[chat-checkpoint] cleanupCheckpointRefs 读 rewind_points 失败 task=${taskId}:`,
+      `[chat-checkpoint] R32-6 buildManifest 读 rewind_points 失败 task=${taskId}:`,
       err instanceof Error ? err.message : err,
     );
-    return;
+    return { deletedAt, checkpointRefs: [] };
   }
-  if (points.length === 0) return;
-
   const repoPaths = new Set<string>();
+  // JSONL 里记下的 treeOid → 期望 ref 名（for-each-ref 失败时仍有显式清单）
+  const expectedByRepo = new Map<string, Set<string>>();
   for (const p of points) {
     for (const s of p.repoSnapshots) {
-      if (s.repoPath) repoPaths.add(s.repoPath);
+      if (!s.repoPath) continue;
+      repoPaths.add(s.repoPath);
+      if (!s.treeOid) continue;
+      let set = expectedByRepo.get(s.repoPath);
+      if (!set) {
+        set = new Set();
+        expectedByRepo.set(s.repoPath, set);
+      }
+      set.add(checkpointRefName(taskId, s.treeOid));
     }
   }
 
   const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
+  const checkpointRefs: CheckpointRefManifestEntry[] = [];
   for (const repoPath of repoPaths) {
+    const refs = new Set<string>(expectedByRepo.get(repoPath) ?? []);
     const listed = await runGit(repoPath, [
       "for-each-ref",
       "--format=%(refname)",
       refPrefix,
     ]);
-    if (!listed.ok) {
+    if (listed.ok) {
+      for (const line of listed.stdout.split("\n")) {
+        const name = line.trim();
+        if (name) refs.add(name);
+      }
+    } else {
+      console.warn(
+        `[chat-checkpoint] R32-6 buildManifest for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
+      );
+    }
+    checkpointRefs.push({ repoPath, refs: [...refs] });
+  }
+  return { deletedAt, checkpointRefs };
+};
+
+/**
+ * R32-6：按清单删 checkpoint refs（幂等）。
+ * 先删清单内 refs，再 for-each-ref 扫前缀兜底（防清单不全）。
+ * 测试挂点：首个成功 delete 后可注入崩溃。
+ */
+export const cleanupCheckpointRefsFromManifest = async (
+  taskId: string,
+  manifest: CheckpointRefManifest,
+): Promise<void> => {
+  const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
+  let deletedOnce = false;
+  for (const entry of manifest.checkpointRefs) {
+    const { repoPath } = entry;
+    const toDelete = new Set(entry.refs.filter(Boolean));
+    // 再扫一遍前缀——崩溃重试 / 清单落后时补漏
+    const listed = await runGit(repoPath, [
+      "for-each-ref",
+      "--format=%(refname)",
+      refPrefix,
+    ]);
+    if (listed.ok) {
+      for (const line of listed.stdout.split("\n")) {
+        const name = line.trim();
+        if (name) toDelete.add(name);
+      }
+    } else {
       console.warn(
         `[chat-checkpoint] cleanupCheckpointRefs for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
       );
-      continue;
     }
-    for (const ref of listed.stdout.split("\n")) {
-      const name = ref.trim();
-      if (!name) continue;
+    for (const name of toDelete) {
       const del = await runGit(repoPath, ["update-ref", "-d", name]);
       if (!del.ok) {
         console.warn(
           `[chat-checkpoint] cleanupCheckpointRefs 删 ref 失败 task=${taskId} repo=${repoPath} ref=${name}: ${del.stderr}`,
         );
+        continue;
+      }
+      // R32-6 测试：首个成功删后可挂起，模拟「清到一半崩溃」
+      if (!deletedOnce) {
+        deletedOnce = true;
+        await failpoint("checkpointRefs.afterFirstDelete");
       }
     }
   }
+};
+
+/**
+ * 删除任务前清理各仓里该 task 的 checkpoint refs。
+ * 不清理会让被删任务的历史 tree/blob 永久保留在用户仓里（refs 保活对象）。
+ * 须在 deleteTask 之前调用（还要能读到 rewind_points），或传入已落盘的 journal 清单。
+ * 全程 best-effort。
+ */
+export const cleanupCheckpointRefsForTask = async (
+  taskId: string,
+  manifest?: CheckpointRefManifest,
+): Promise<void> => {
+  const m = manifest ?? (await buildCheckpointRefManifest(taskId));
+  if (m.checkpointRefs.length === 0) return;
+  await cleanupCheckpointRefsFromManifest(taskId, m);
 };
 
 /**

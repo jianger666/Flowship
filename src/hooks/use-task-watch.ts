@@ -65,6 +65,8 @@ export interface UseTaskWatchCallbacks {
   onWatchException?: (err: Error) => void;
   /** R31-1：queue_failed 控制帧 → 按 itemIds 清 / 标错 pending */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
+  /** R32-2：bootstrap queue_state → 对账清幽灵 pending */
+  onQueueState?: (itemIds: string[]) => void;
 }
 
 export const useTaskWatch = (
@@ -143,6 +145,10 @@ export const useTaskWatch = (
           onQueueFailed: (itemIds, reason) => {
             if (cancelled) return;
             callbacksRef.current.onQueueFailed?.(itemIds, reason);
+          },
+          onQueueState: (itemIds) => {
+            if (cancelled) return;
+            callbacksRef.current.onQueueState?.(itemIds);
           },
         };
 

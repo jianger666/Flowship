@@ -30,6 +30,7 @@
  *   也预先写入 sentEventIds，保证不丢不重。
  */
 
+import { listChatQueueItemIds } from "@/lib/server/chat-queue";
 import { getTaskWithTailEvents } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import {
@@ -211,6 +212,12 @@ export const GET = async (req: Request, { params }: Ctx) => {
           rememberEventId(ev.id);
           send({ type: "event", event: ev });
         }
+        // R32-2：bootstrap 一次性附带当前 server queue 快照（含 in-flight），
+        // 前端对账清断连期间漏掉的 queue_failed 留下的幽灵 pending——不做轮询。
+        send({
+          type: "queue_state",
+          itemIds: listChatQueueItemIds(id),
+        });
       } catch (err) {
         console.error("[watch-task] bootstrap failed:", err);
       }

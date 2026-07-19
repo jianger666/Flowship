@@ -311,7 +311,9 @@ export {
   holdTerminalCleanup,
   releaseTerminalCleanup,
   hasTerminalCleanup,
+  getTerminalCleanupPhase,
   isTerminalCleanupGenValid,
+  markTerminalCleanupExecuting,
   invalidateTerminalCleanupForReopen,
   waitUntilResourceJobsCleared,
   getResourceJoinTimeoutMs,
@@ -321,6 +323,8 @@ export {
 export type {
   ResourceJobHandle,
   JoinResourceJobsResult,
+  InvalidateCleanupResult,
+  TerminalCleanupPhase,
 } from "./resource-jobs";
 
 /**

@@ -383,7 +383,9 @@ interface SSEEnvelope {
     | "error"
     | "assistant_delta"
     /** R31-1：队列整队失败控制帧 */
-    | "queue_failed";
+    | "queue_failed"
+    /** R32-2：bootstrap 队列存活快照 */
+    | "queue_state";
   event?: TaskEvent;
   content?: string;
   task?: Task;
@@ -436,6 +438,10 @@ export interface TaskStreamCallbacks {
    * R31-1：队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
    */
   onQueueFailed?: (itemIds: string[], reason: string) => void;
+  /**
+   * R32-2：watch bootstrap 的 queue_state——按服务端存活 itemIds 对账幽灵 pending
+   */
+  onQueueState?: (itemIds: string[]) => void;
 }
 
 /**
@@ -511,6 +517,15 @@ export const watchTaskStream = async (
               ids,
               typeof env.reason === "string" ? env.reason : "persist_failed",
             );
+          } else if (
+            env.type === "queue_state" &&
+            Array.isArray(env.itemIds)
+          ) {
+            // R32-2：bootstrap 队列快照
+            const ids = env.itemIds.filter(
+              (id): id is string => typeof id === "string",
+            );
+            callbacks.onQueueState?.(ids);
           }
         }
         sepIdx = buffer.indexOf("\n\n");

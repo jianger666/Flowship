@@ -597,13 +597,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
             meta.attachments = head.attachmentMetas;
           }
           if (capture.ok) meta.checkpointed = true;
+          // R32-2：queue-priority head 落盘必须带 queueItemId——两 tab 同文案时按 id 对账、互不清错
+          meta.queueItemId = head.itemId;
           // R29-4：队列补给 user_reply——send/start 前 strict；失败 5xx、塞回队首、不起 session
           let replyEvent;
           try {
             replyEvent = await writeUserEventAndPublishStrict(task.id, {
               kind: "user_reply",
               text: head.displayText,
-              meta: Object.keys(meta).length > 0 ? meta : undefined,
+              meta,
             });
           } catch (persistErr) {
             console.error(

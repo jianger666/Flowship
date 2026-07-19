@@ -19,6 +19,9 @@
  * 外加「条件轮询」：仅当列表里存在 running 任务时、每 POLL_INTERVAL_MS 刷一次、全跑完即停。
  * 这样切到 B 时、后台还在跑的 A 跑完几秒内侧栏就更新（停转圈 / 变成等你回复点）。
  * 没有任务在跑时不轮询、不浪费。
+ *
+ * R32-5：refresh 请求 epoch + successfulDeletedIds——DELETE 200 后迟到的旧 refresh
+ * 不得整表覆盖回灌；pendingDeletes 在 unmark 后为空，单靠它挡不住交叉时序。
  */
 
 import {
@@ -37,6 +40,11 @@ import {
   fetchTasks,
   type DeleteTaskResult,
 } from "@/lib/task-store";
+import {
+  canCommitTaskListRefresh,
+  filterTaskListAfterRefresh,
+  rememberSuccessfulDeletedId,
+} from "@/lib/task-list-refresh";
 import type { Task, TaskSummary } from "@/lib/types";
 
 interface TaskListContextValue {
@@ -88,6 +96,10 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   );
   // pendingDeletes：DELETE 等待窗口内（running 可等 8s）refresh 不得把任务加回
   const pendingDeletesRef = useRef<Set<string>>(new Set());
+  // R32-5：refresh 请求世代——DELETE 成功时推进，作废任何更早启动的在飞 refresh
+  const refreshEpochRef = useRef(0);
+  // R32-5：已成功删除 id（进程内有界 Set）——过滤迟到 refresh 里残留的已删任务
+  const successfulDeletedIdsRef = useRef<Set<string>>(new Set());
 
   const markDeleting = useCallback((id: string) => {
     pendingDeletesRef.current.add(id);
@@ -100,19 +112,25 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const refresh = useCallback(async () => {
+    // R32-5：捕获发起时 epoch；响应到达时若已推进则整响应丢弃
+    const startEpoch = refreshEpochRef.current;
     try {
       const list = await fetchTasks();
-      // 过滤删除中的 id——乐观移除后磁盘任务还在，2s 轮询会把它们「回魂」
-      const pending = pendingDeletesRef.current;
+      if (!canCommitTaskListRefresh(startEpoch, refreshEpochRef.current)) {
+        return;
+      }
       setTasks(
-        pending.size === 0
-          ? list
-          : list.filter((t) => !pending.has(t.id)),
+        filterTaskListAfterRefresh(
+          list,
+          pendingDeletesRef.current,
+          successfulDeletedIdsRef.current,
+        ),
       );
     } catch (err) {
       // 侧栏静默（不 toast 刷屏）；首页 / 详情页自己的拉取会暴露错误
       console.warn("[task-list] 刷新失败", err);
     } finally {
+      // 过期 refresh 仍可标记 loaded（首次 mount 不应被 DELETE 卡死）
       setLoaded(true);
     }
   }, []);
@@ -143,8 +161,9 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
 
   const upsertTask = useCallback((task: Task | TaskSummary) => {
     const summary = toSummary(task);
-    // 删除中禁止详情页 / 其它路径回灌（否则乐观移除会被 upsert 顶回来）
+    // 删除中 / 已成功删除：禁止详情页 / 其它路径回灌
     if (pendingDeletesRef.current.has(summary.id)) return;
+    if (successfulDeletedIdsRef.current.has(summary.id)) return;
     setTasks((prev) => {
       const idx = prev.findIndex((t) => t.id === summary.id);
       if (idx < 0) return [summary, ...prev];
@@ -171,7 +190,10 @@ export const TaskListProvider = ({ children }: { children: ReactNode }) => {
       options?.onLocked?.();
       try {
         const result = await deleteTaskApi(id);
-        // ok / not_found 都算成功；解锁（服务端已无此任务，refresh 不会再带回）
+        // ok / not_found 都算成功
+        // R32-5：推进 epoch——任何早于本 DELETE 的在飞 refresh 都不得 setTasks
+        refreshEpochRef.current += 1;
+        rememberSuccessfulDeletedId(successfulDeletedIdsRef.current, id);
         unmarkDeleting(id);
         return result;
       } catch (err) {

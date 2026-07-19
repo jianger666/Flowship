@@ -45,8 +45,11 @@ import {
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import {
-  removePendingByQueueFailed,
+  applyQueueFailedTerminal,
+  applyUserReplyTerminal,
+  reconcilePendingWithQueueState,
   removePendingByUserReply,
+  shouldInsertPendingAfter202,
 } from "@/lib/chat-pending-reconcile";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
@@ -130,6 +133,9 @@ export const ChatView = ({
   // 与 pending 同步：onDone 需读最新值（避免闭包陈旧）
   const pendingLocalRepliesRef = useRef(pendingLocalReplies);
   pendingLocalRepliesRef.current = pendingLocalReplies;
+  // R32-1：早到终态（user_reply / queue_failed）记账；202 回来时已 settled 则不插 pending
+  // 用 ref：不触发渲染，bounded FIFO 由 rememberSettledItemIds 维护
+  const settledItemIdsRef = useRef<string[]>([]);
   // P4：上下文透视
   const [contextOpen, setContextOpen] = useState(false);
   const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
@@ -171,6 +177,7 @@ export const ChatView = ({
     setLiveToolOutputs({});
     setQueuedCount(null);
     setPendingLocalReplies([]);
+    settledItemIdsRef.current = [];
     setContextInfo(null);
     setKeepHints("");
   }, [task.id]);
@@ -208,10 +215,15 @@ export const ChatView = ({
       // 收到正式 assistant_message 事件：清掉 streaming placeholder、避免「placeholder + 正式卡片」重影
       if (ev.kind === "assistant_message") setStreamingText("");
 
-      // R31-1：真实 user_reply 落地 → 优先按 meta.queueItemId 清 pending
+      // R31-1 / R32-1：真实 user_reply 落地 → 清 pending；未命中也记 settled（终态可早于 202）
       if (ev.kind === "user_reply") {
         setPendingLocalReplies((prev) => {
-          const next = removePendingByUserReply(prev, ev);
+          const { pending: next, settled } = applyUserReplyTerminal(
+            prev,
+            settledItemIdsRef.current,
+            ev,
+          );
+          settledItemIdsRef.current = settled;
           if (next === prev) return prev;
           setQueuedCount(next.length > 0 ? next.length : null);
           return next;
@@ -220,16 +232,44 @@ export const ChatView = ({
 
       onEventAppendRef.current(ev);
     },
-    // R31-1：strict 落盘失败整队作废 → 按 itemIds 精确清 pending
-    onQueueFailed: (itemIds) => {
+    // R31-1 / R32-1：整队作废 → 清 pending + 记 settled（含未命中的早到 id）
+    onQueueFailed: (itemIds, reason) => {
       setPendingLocalReplies((prev) => {
-        const next = removePendingByQueueFailed(prev, itemIds);
+        const { pending: next, settled } = applyQueueFailedTerminal(
+          prev,
+          settledItemIdsRef.current,
+          itemIds,
+        );
+        settledItemIdsRef.current = settled;
         setQueuedCount(next.length > 0 ? next.length : null);
         return next;
       });
       if (itemIds.length > 0) {
-        toast.error(`${itemIds.length} 条消息因磁盘写入失败未发送`);
+        // R32-2：reason 不止 persist_failed——文案按语义区分
+        toast.error(
+          reason === "persist_failed"
+            ? `${itemIds.length} 条消息因磁盘写入失败未发送`
+            : `${itemIds.length} 条排队消息未送达、请重新发送`,
+        );
       }
+    },
+    // R32-2：重连 bootstrap 的 queue_state——清不在 server 存活集合的幽灵 pending
+    onQueueState: (serverItemIds) => {
+      setPendingLocalReplies((prev) => {
+        const { pending: next, settled, ghostIds } =
+          reconcilePendingWithQueueState(
+            prev,
+            settledItemIdsRef.current,
+            serverItemIds,
+          );
+        settledItemIdsRef.current = settled;
+        if (ghostIds.length === 0) return prev;
+        setQueuedCount(next.length > 0 ? next.length : null);
+        toast.message(
+          `已清除 ${ghostIds.length} 条失效的排队占位`,
+        );
+        return next;
+      });
     },
     onTaskUpdate: (t) => onTaskUpdateRef.current(t),
     onDone: (t) => {
@@ -290,6 +330,16 @@ export const ChatView = ({
         }
         if ("queued" in result && result.queued) {
           setQueuedCount(result.queuedCount);
+          // R32-1：终态若已早于 202 到达（settled），不得再插永久 pending
+          if (
+            !shouldInsertPendingAfter202(
+              settledItemIdsRef.current,
+              result.itemId,
+            )
+          ) {
+            if (result.task) onTaskUpdateRef.current(result.task);
+            return true;
+          }
           // R31-1：pending 绑服务端 itemId（图 / 附件 / skill 同一机制）
           setPendingLocalReplies((prev) => [
             ...prev,

@@ -104,9 +104,9 @@ import {
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
-  takeRemainingChatQueueItemIds,
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
@@ -2246,11 +2246,16 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
     const msg = dequeueChatMessage(taskId);
     if (!msg) return;
     // S4（十二轮）：dequeue 后立即占 in-flight，直到本条出路（成功/塞回/作废/清队）
-    beginChatQueueInFlight(taskId);
+    // R32-2：挂 itemId，bootstrap queue_state 不把正当 in-flight 误判成幽灵
+    beginChatQueueInFlight(taskId, msg.itemId);
     try {
       const task = await getTask(taskId);
       if (!task || task.mode !== "chat") {
-        clearChatQueue(taskId);
+        // R32-2：任务消失 / 非 chat → 唯一入口 failQueuedItems（queue_failed）
+        failQueuedItems(taskId, {
+          reason: "task_gone",
+          currentItemId: msg.itemId,
+        });
         return;
       }
       // 无存活会话 → 清队列（没法按序送达）；compact 窗口例外：塞回队首等 compact 完再 flush
@@ -2259,21 +2264,24 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           requeueIfSameGen(msg, "compact 例外塞回");
           return;
         }
-        // 复审 F2：compact 中途失败（重建会话失败等）导致会话消失时，清队不再静默——
-        // 至少写一条 info，让用户知道排队消息未送达。+1 含本轮已 dequeue 的这条。
-        const n = getChatQueueCount(taskId) + 1;
-        clearChatQueue(taskId);
-        try {
-          // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
-          await writeEventAndPublish(taskId, {
-            kind: "info",
-            text: `会话已关闭，${n} 条排队消息未送达、请重新发送`,
-          });
-        } catch (err) {
-          console.warn(
-            `[chat-runner] flushChatQueue task=${taskId} 清队通知失败:`,
-            err,
-          );
+        // R32-2：会话消失清整队走 failQueuedItems（带 itemIds 终态），info 仍 best-effort
+        const failedIds = failQueuedItems(taskId, {
+          reason: "no_session",
+          currentItemId: msg.itemId,
+        });
+        if (failedIds.length > 0) {
+          try {
+            // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
+            await writeEventAndPublish(taskId, {
+              kind: "info",
+              text: `会话已关闭，${failedIds.length} 条排队消息未送达、请重新发送`,
+            });
+          } catch (err) {
+            console.warn(
+              `[chat-runner] flushChatQueue task=${taskId} 清队通知失败:`,
+              err,
+            );
+          }
         }
         return;
       }
@@ -2322,22 +2330,15 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
               meta,
             });
           } catch (persistErr) {
-            // R31-1：strict 抛错（EIO 等）→ 不 send、不自旋；清整队（当前条 + 剩余）
-            // 并纯内存 publish queue_failed，让前端按 itemId 终态对账。
+            // R31-1 / R32-2：strict 抛错（EIO 等）→ 不 send、不自旋；走唯一入口 failQueuedItems
             // durable 警告可能与原 append 同盘失败——控制帧不依赖落盘。
             console.error(
               `[chat-runner] flushChatQueue R31-1 落盘失败 task=${taskId}:`,
               persistErr,
             );
-            const failedItemIds = [
-              msg.itemId,
-              ...takeRemainingChatQueueItemIds(taskId),
-            ];
-            clearChatQueue(taskId);
-            publish(taskId, {
-              kind: "queue_failed",
-              itemIds: failedItemIds,
+            failQueuedItems(taskId, {
               reason: "persist_failed",
+              currentItemId: msg.itemId,
             });
             const preview = msg.displayText.slice(0, 50);
             try {
@@ -2355,8 +2356,11 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
             return;
           }
           if (!replyEvent) {
-            // ENOENT：任务目录已删——清队（没法再送达）
-            clearChatQueue(taskId);
+            // R32-2：ENOENT（任务目录已删）→ failQueuedItems，尾队列也有 id 化终态
+            failQueuedItems(taskId, {
+              reason: "task_gone",
+              currentItemId: msg.itemId,
+            });
             return;
           }
           replyPersisted = true;
@@ -2382,16 +2386,19 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         delivered = true;
       } catch (err) {
         console.error(`[chat-runner] flushChatQueue task=${taskId} failed:`, err);
-        // 复审（11 轮）：清队不再静默——对齐 F2/N3 口径，先同步清队再 best-effort 写 info。
-        // 本条若已 send 成功（失败发生在后置步骤），不计入「未送达」条数。
-        const n = getChatQueueCount(taskId) + (delivered ? 0 : 1);
-        clearChatQueue(taskId);
-        if (n > 0) {
+        // R32-2：checkpoint/send/后置异常统一走 failQueuedItems。
+        // 当前条若 user_reply 已落盘（含已 send）→ 不算 failed，只 fail 尾队列。
+        const failedIds = failQueuedItems(taskId, {
+          reason: "flush_error",
+          currentItemId: msg.itemId,
+          currentReplyPersisted: replyPersisted || delivered,
+        });
+        if (failedIds.length > 0) {
           try {
             // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
             await writeEventAndPublish(taskId, {
               kind: "info",
-              text: `排队消息处理失败，${n} 条排队消息未送达、请重新发送`,
+              text: `排队消息处理失败，${failedIds.length} 条排队消息未送达、请重新发送`,
             });
           } catch (logErr) {
             console.warn(

@@ -15,8 +15,22 @@
 
 import type { ImageAttachmentSaved } from "./task-artifacts";
 import type { AttachmentMeta } from "./route-helpers";
+import { publish } from "./task-stream";
 
 export const CHAT_QUEUE_MAX = 5;
+
+/**
+ * R32-2：清队终态 reason（机器可读，经 queue_failed 下发前端）。
+ * - persist_failed：strict 落盘 EIO 等
+ * - no_session：会话消失、无法按序送达
+ * - task_gone：任务目录消失 / 非 chat
+ * - flush_error：checkpoint / send / 后置步骤抛错
+ */
+export type FailQueuedItemsReason =
+  | "persist_failed"
+  | "no_session"
+  | "task_gone"
+  | "flush_error";
 
 /**
  * R31-1：进程内单调短 id，供 202 响应 ↔ 前端 pending ↔ queue_failed 对账。
@@ -77,10 +91,16 @@ interface ChatQueueGlobalState {
    * 计入容量，避免 dequeue 空出窗口时新消息 202 再塞满、塞回时静默丢已接受消息。
    */
   inFlight: Map<string, number>;
+  /**
+   * R32-2：in-flight 条的 itemId（与 inFlight 同步寿命）。
+   * watch bootstrap 的 queue_state 需把「已 dequeue、尚未出路」的条算进服务端存活集合，
+   * 否则重连会把正当 in-flight 误判成幽灵 pending。
+   */
+  inFlightItemIds: Map<string, string>;
 }
 
-// V3：相对 V2 增 inFlight；换 key 避免 hot-reload 后读到缺字段的旧 state 分裂
-const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV3__";
+// V4：相对 V3 增 inFlightItemIds（R32-2 bootstrap 对账）；换 key 防 hot-reload 缺字段分裂
+const CHAT_QUEUE_GLOBAL_KEY = "__feAiFlowChatQueueV4__";
 
 const getQueueState = (): ChatQueueGlobalState => {
   const g = globalThis as unknown as Record<
@@ -92,14 +112,18 @@ const getQueueState = (): ChatQueueGlobalState => {
       queues: new Map(),
       generations: new Map(),
       inFlight: new Map(),
+      inFlightItemIds: new Map(),
     };
   }
-  // hot-reload：旧 state 可能缺 generations / inFlight
+  // hot-reload：旧 state 可能缺 generations / inFlight / inFlightItemIds
   if (!g[CHAT_QUEUE_GLOBAL_KEY]!.generations) {
     g[CHAT_QUEUE_GLOBAL_KEY]!.generations = new Map();
   }
   if (!g[CHAT_QUEUE_GLOBAL_KEY]!.inFlight) {
     g[CHAT_QUEUE_GLOBAL_KEY]!.inFlight = new Map();
+  }
+  if (!g[CHAT_QUEUE_GLOBAL_KEY]!.inFlightItemIds) {
+    g[CHAT_QUEUE_GLOBAL_KEY]!.inFlightItemIds = new Map();
   }
   return g[CHAT_QUEUE_GLOBAL_KEY]!;
 };
@@ -107,6 +131,7 @@ const getQueueState = (): ChatQueueGlobalState => {
 const queues = () => getQueueState().queues;
 const generations = () => getQueueState().generations;
 const inFlightMap = () => getQueueState().inFlight;
+const inFlightItemIdsMap = () => getQueueState().inFlightItemIds;
 
 /** 入队结果：ok + 当前条数 + itemId；满了返回 full */
 export type EnqueueResult =
@@ -134,14 +159,20 @@ export const getChatQueueInFlight = (taskId: string): number =>
 /**
  * flush 成功 dequeue 后占位：计入容量，直到 send 成功 / 塞回 / 作废丢弃。
  * 幂等设为 1（同 task 同时只会有一条 in-flight）。
+ * R32-2：可选 itemId 一并挂上，供 queue_state bootstrap 对账。
  */
-export const beginChatQueueInFlight = (taskId: string): void => {
+export const beginChatQueueInFlight = (
+  taskId: string,
+  itemId?: string,
+): void => {
   inFlightMap().set(taskId, 1);
+  if (itemId) inFlightItemIdsMap().set(taskId, itemId);
 };
 
 /** 清零 in-flight 占位（send 出路 / finally / clear 共用） */
 export const endChatQueueInFlight = (taskId: string): void => {
   inFlightMap().delete(taskId);
+  inFlightItemIdsMap().delete(taskId);
 };
 
 /** 入队；超上限返 full（调用方 409「排队已满」）。容量 = 队列长 + in-flight */
@@ -210,6 +241,60 @@ export const takeRemainingChatQueueItemIds = (taskId: string): string[] => {
   const cur = map.get(taskId) ?? [];
   map.delete(taskId);
   return cur.map((m) => m.itemId);
+};
+
+/**
+ * R32-2：只读快照——当前服务端仍「存活」的 queue itemId（队内 + in-flight）。
+ * 供 watch-task bootstrap 的 queue_state；不改 generation / 不消费队列。
+ */
+export const listChatQueueItemIds = (taskId: string): string[] => {
+  const queued = (queues().get(taskId) ?? []).map((m) => m.itemId);
+  const inflightId = inFlightItemIdsMap().get(taskId);
+  if (inflightId && !queued.includes(inflightId)) {
+    return [inflightId, ...queued];
+  }
+  return queued;
+};
+
+/**
+ * R32-2：唯一清队终态提交入口。
+ *
+ * 契约：
+ * 1. 取出剩余队内 itemIds，再 clearChatQueue（+generation、清 in-flight）
+ * 2. 可选 currentItemId：已 dequeue 的当前条；若 currentReplyPersisted=true
+ *    （user_reply 已落盘 → 已有终态）则不计入 failed，只 fail 剩余
+ * 3. failedIds 非空时纯内存 publish `queue_failed`（不落盘）
+ * 4. 返回实际 failed 的 itemIds（供调用方写 info 文案）
+ */
+export const failQueuedItems = (
+  taskId: string,
+  options: {
+    reason: FailQueuedItemsReason;
+    currentItemId?: string;
+    /** 当前条 user_reply 已落盘 → 不算 failed */
+    currentReplyPersisted?: boolean;
+  },
+): string[] => {
+  const remaining = takeRemainingChatQueueItemIds(taskId);
+  const failedIds: string[] = [];
+  if (
+    options.currentItemId &&
+    !options.currentReplyPersisted
+  ) {
+    failedIds.push(options.currentItemId);
+  }
+  for (const id of remaining) {
+    if (!failedIds.includes(id)) failedIds.push(id);
+  }
+  clearChatQueue(taskId);
+  if (failedIds.length > 0) {
+    publish(taskId, {
+      kind: "queue_failed",
+      itemIds: failedIds,
+      reason: options.reason,
+    });
+  }
+  return failedIds;
 };
 
 /** 当前排队条数（不含 in-flight） */
