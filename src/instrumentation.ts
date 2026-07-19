@@ -41,17 +41,26 @@ export const register = (): void => {
 
   // test 实例的 lark-cli 配置隔离（2026-07-19 用户拍板）：
   // lark-cli 默认读全局 ~/.lark-cli/config.json——test 和正式会绑同一个飞书机器人、
-  // 事件互抢。test 实例把配置目录指到自己的数据目录下（绑独立机器人）；
+  // 事件互抢。test 实例把配置目录指到独立目录（绑独立机器人）；
   // 正式实例不动（继续用全局配置）。放 instrumentation 最早期、先于一切 lark-cli spawn。
+  //
+  // ⚠️ 目录不能放数据目录（Application Support）下：路径带空格会触发 lark-cli
+  // 1.0.68 event bus daemon fork bug（daemon 秒挂、bus.log 空、consume 报
+  // 「bus did not become ready within 3s」——2026-07-19 无空格路径对照实验实锤），
+  // 所以放 home 下无空格的 ~/.lark-cli-flowship-test。
   {
     const dataDir = process.env.FLOWSHIP_DATA_DIR ?? "";
     const isTest =
       process.env.FLOWSHIP_TEST === "1" || dataDir.includes("fe-ai-flow-test");
-    if (isTest && dataDir && !process.env.LARKSUITE_CLI_CONFIG_DIR) {
-      process.env.LARKSUITE_CLI_CONFIG_DIR = `${dataDir}/lark-cli`;
-      console.log(
-        `[instrumentation] test 实例 lark-cli 配置隔离 → ${process.env.LARKSUITE_CLI_CONFIG_DIR}`,
-      );
+    if (isTest && !process.env.LARKSUITE_CLI_CONFIG_DIR) {
+      // HOME 在 mac/linux 恒有；兜底 USERPROFILE 兼容 Windows
+      const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+      if (home) {
+        process.env.LARKSUITE_CLI_CONFIG_DIR = `${home}/.lark-cli-flowship-test`;
+        console.log(
+          `[instrumentation] test 实例 lark-cli 配置隔离 → ${process.env.LARKSUITE_CLI_CONFIG_DIR}`,
+        );
+      }
     }
   }
 
