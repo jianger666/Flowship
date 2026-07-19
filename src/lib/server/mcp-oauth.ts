@@ -55,7 +55,7 @@ const getRedirectUri = (): string => `${getBaseUrl()}/api/mcp-oauth/callback`;
 // access token 过期前多久就提前续期（避免临界过期、起 agent 时刚好失效）
 const EXPIRY_BUFFER_MS = 60_000;
 
-// ---- 按 server 串行（P1-07）：同进程内同一 server 的读-改-写互斥 ----
+// ---- 按 server 串行：同进程内同一 server 的读-改-写互斥 ----
 // 挂 globalThis：dev HMR / 多 chunk 各持一份 module 变量会让串行化失效
 const OAUTH_LOCKS_KEY = "__feAiFlowMcpOAuthLocksV1__";
 type OAuthLockMap = Map<string, Promise<void>>;

@@ -13,8 +13,13 @@
  */
 
 import { NextResponse } from "next/server";
-import { createTask, listTasks } from "@/lib/server/task-fs";
+import {
+  commitReadableTaskListResponse,
+  createTask,
+  listTasks,
+} from "@/lib/server/task-fs";
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
+import { failpoint } from "@/lib/server/failpoints";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
 import type { NewTaskInput, TaskMode } from "@/lib/types";
@@ -54,7 +59,11 @@ const sanitizeRepoBranchMap = (
 export const GET = async () => {
   try {
     const tasks = await listTasks();
-    return NextResponse.json({ tasks });
+    // helper 与 Response 之间可插入删除——提交点再 filter
+    await failpoint("httpRead.afterHelper");
+    return commitReadableTaskListResponse(tasks, (filtered) => ({
+      tasks: filtered,
+    }));
   } catch (err) {
     console.error("[GET /api/tasks] failed", err);
     return NextResponse.json({ error: "list_failed" }, { status: 500 });

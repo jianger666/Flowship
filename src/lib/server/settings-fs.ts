@@ -10,7 +10,7 @@
  * 读 config.json 的其它模块（cursor-config / task-runner…）各有自己的窄读取、
  * 这里只收「settings 路由 + preview 命令」这两处新需求、不做大一统重构。
  *
- * P1-04：读结果三态分流——ok / missing（仅 ENOENT）/ error（损坏 / 权限等），
+ * 读结果三态分流——ok / missing（仅 ENOENT）/ error（损坏 / 权限等），
  * 避免把「可读失败」当成「首次安装」去 PUT 覆盖。
  */
 
@@ -120,7 +120,7 @@ export const withSettingsWriteLock = async <T>(
 
 /**
  * 原子写 config.json（0600 + tmp/rename）。
- * 含 API key / GitLab PAT——写入即收紧权限（P0-02）。
+ * 含 API key / GitLab PAT——写入即收紧权限。
  * 写操作进 globalThis 链；若调用方还要做读改写，请用 withSettingsWriteLock 包住整段 RMW
  *（勿在锁内再调本函数——会同链嵌套死锁）。
  */

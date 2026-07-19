@@ -121,6 +121,7 @@ describe("feishu-bridge reactions", () => {
     vi.mocked(removeReaction).mockClear();
 
     emitQueuedMessageFlushed("t1", {
+      itemId: "cq_test_upgrade",
       agentText: "hi",
       displayText: "hi",
       enqueuedAt: Date.now(),

@@ -246,7 +246,7 @@ describe("ownership-r26-sinks", () => {
   it("R26-2 installSessionIfCurrent：lease false → session/bridge 都不装", () => {
     const id = alloc();
     const handler = vi.fn(async () => ({ ok: true as const }));
-    const notifier = vi.fn(async () => {});
+    const notifier = vi.fn(async () => "accepted" as const);
     const token = String(allocTaskRunInstanceId());
     const record = {
       instanceId: allocTaskRunInstanceId(),

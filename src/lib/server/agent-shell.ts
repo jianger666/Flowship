@@ -11,11 +11,11 @@
  * 默认只把 `Git\cmd` 加进 PATH（无 bash.exe），只写 SHELL 会选中 Bash 执行器却抛
  * `Can't find Bash`，工具调用永不结束。因此开关打开时必须同时把 `Git\bin` 前置进 PATH。
  *
- * ⚠️ 同步顺序（v1.1.19 复审 P1-2）：所有异步验证在改环境之前完成——先验绝对路径可启动、
+ * ⚠️ 同步顺序（v1.1.19）：所有异步验证在改环境之前完成——先验绝对路径可启动、
  * 再在候选 PATH（不写 process.env）上 where bash 链校验，两项都过才同步一次性提交
  * PATH+SHELL。旧实现「注入后再 where」在最多 5s 窗口里把临时环境暴露给并发 agent。
  *
- * ⚠️ 跨 bundle 共享状态（v1.1.19 复审 P1-1）：production build 里 instrumentation 与
+ * ⚠️ 跨 bundle 共享状态（v1.1.19）：production build 里 instrumentation 与
  * settings route 各自打出一份 agent-shell 模块实例。ORIGINAL_SHELL / injectedBinDir 若
  * 仍 module-local，关开关时 settings 实例会把「已注入的 Git Bash」当原始值恢复、PATH
  * 清理因 injectedBinDir=null 变成 noop。三样状态必须挂同一 globalThis 对象。
@@ -46,7 +46,7 @@ const GIT_BASH_PATH_RE = /git.*bash/i;
 /**
  * 跨 webpack chunk 共享的环境状态。
  * production build 里 instrumentation / settings route 各有一份模块实例，
- * module-local 的 ORIGINAL_SHELL / injectedBinDir 互不可见（复审 P1-1）。
+ * module-local 的 ORIGINAL_SHELL / injectedBinDir 互不可见。
  */
 const AGENT_SHELL_STATE_KEY = "__feAiFlowAgentShellStateV1__";
 
@@ -60,7 +60,7 @@ type AgentShellGlobalState = {
   /** 首次 sync 时捕获的原始 SHELL；undefined = 启动时本就没有 */
   originalShell: string | undefined;
   /**
-   * 本程序在 PATH 首位新增的那一段 Git Bash bin 目录（复审 P2）。
+   * 本程序在 PATH 首位新增的那一段 Git Bash bin 目录。
    * null = 当前没有由我们新增（关开关只删这一条首位新增段，不动用户原有同名段）。
    */
   injectedBinDir: string | null;
@@ -266,7 +266,7 @@ const WIN_PATH_DELIM = path.win32.delimiter;
 
 /**
  * Windows PATH 段相等：大小写不敏感 + 尾部斜杠归一化。
- * `C:\Git\bin\` == `c:\git\bin`（复审 P2）。
+ * `C:\Git\bin\` == `c:\git\bin`。
  */
 const pathSegmentEquals = (a: string, b: string): boolean => {
   const norm = (s: string) =>
@@ -289,7 +289,7 @@ const removeFirstMatchingSegment = (
 
 /**
  * 构造「把 binDir 前置进 basePath」的候选 PATH 字符串，不写 process.env。
- * 仅当首段已是目标 binDir 时 noop；后部已有同目录仍要再前置一段（复审 P2），
+ * 仅当首段已是目标 binDir 时 noop；后部已有同目录仍要再前置一段，
  * 否则 where 会先命中 System32\WSL bash，造成安全但不必要的功能失败。
  */
 const buildCandidatePath = (
@@ -342,7 +342,7 @@ export const injectGitBashBinToPath = (binDir: string): void => {
 
 /**
  * 仅移除本模块在首位新增的那一条 bin 段。
- * 用「删第一个匹配段」而非 filter 全删——用户 PATH 后部同名段必须保留（复审 P2）。
+ * 用「删第一个匹配段」而非 filter 全删——用户 PATH 后部同名段必须保留。
  * injectedBinDir 为 null 时 noop。
  */
 export const removeInjectedGitBashBinFromPath = (): void => {
@@ -385,7 +385,7 @@ let verifyGitBashImpl: typeof verifyGitBashRunnable = verifyGitBashRunnable;
 
 /**
  * 在候选 PATH 环境里跑 `where bash`，取 stdout 首个非空行。
- * 不改 process.env——预检用（复审 P1-2）。失败 / 超时返 null。
+ * 不改 process.env——预检用。失败 / 超时返 null。
  */
 const resolveWhereBashFirstHit = async (
   candidatePath: string,
@@ -456,7 +456,7 @@ const commitShellEnv = (gitBash: string, binDir: string): void => {
 /**
  * 按开关状态同步 SHELL + PATH（幂等、可单测）。
  *
- * 开启且有 bash 路径时的顺序（复审 P1-2「全部预检后再提交」）：
+ * 开启且有 bash 路径时的顺序（全部预检后再提交）：
  * ① 捕获原始 SHELL（仅首次）
  * ② 绝对路径自检（注入前主闸）
  * ③ 构造候选 PATH（不写 process.env）+ where bash 链校验

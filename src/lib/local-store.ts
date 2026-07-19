@@ -4,7 +4,7 @@
  * - 内存缓存 cache：初值 DEFAULT_SETTINGS；initSettings() 成功后用 config.json 覆盖
  * - getSettings()：同步读 cache（签名不变、调用方零改动）
  * - saveSettings()：写 cache + 串行队列 await 落 config.json（CR-08）
- * - P1-03：init 未成功前拒绝整对象 PUT，避免用默认/脏缓存覆盖磁盘有效配置
+ * - init 未成功前拒绝整对象 PUT，避免用默认/脏缓存覆盖磁盘有效配置
  *
  * 历史：曾从 localStorage 无感迁移到 config.json（截止 2026-06-28）；迁移链已退役。
  * 纯 UI 偏好类 localStorage（recent-workdirs / 视图记忆等）不走本文件。
@@ -226,7 +226,7 @@ let cache: FeAiFlowSettings = cloneDefaultSettings();
 // initSettings 单飞：多个 hook（providers / use-settings）同时调时共享同一 promise、
 // 都等到 config.json 加载完再读缓存；失败时清空、允许下次重试（SPA 不刷页、bool 标志会永久挡住重试）。
 let initPromise: Promise<void> | null = null;
-// P1-03：最近一次 init 是否成功灌过权威 config.json。
+// 最近一次 init 是否成功灌过权威 config.json。
 // 失败时 cache 保持 DEFAULT_SETTINGS——禁止用它整对象 PUT 覆盖磁盘。
 let initSucceeded = false;
 
@@ -260,7 +260,7 @@ const putSettings = async (body: FeAiFlowSettings): Promise<void> => {
  *
  * 读 config.json：文件在 → 用文件覆盖缓存（权威源）；文件不在 → 用 DEFAULT_SETTINGS
  * 写进文件起步。文件链路挂了不阻塞、cache 保持 DEFAULT、下次启动再试；
- * P1-03 闸门禁止失败态整对象 PUT。
+ * 闸门禁止失败态整对象 PUT。
  */
 export const initSettings = (): Promise<void> => {
   if (!isBrowser()) return Promise.resolve();
@@ -307,7 +307,7 @@ export const initSettings = (): Promise<void> => {
         "[local-store] config.json 初始化失败、暂用默认设置、下次再试",
         err,
       );
-      // 失败态：cache 回到默认拷贝、拒绝后续整对象 PUT（P1-03）
+      // 失败态：cache 回到默认拷贝、拒绝后续整对象 PUT
       cache = cloneDefaultSettings();
       initSucceeded = false;
       initPromise = null; // 失败清空、允许下次重试
@@ -331,7 +331,7 @@ export const saveSettings = async (next: FeAiFlowSettings): Promise<boolean> => 
   const prev = cache;
   cache = next;
   if (!isBrowser()) return false;
-  // P1-03：初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返 false，
+  // 初始化未成功时先重试一次真实 GET；仍失败则拒绝 PUT（返 false，
   // 调用方如 use-settings 已有 toast.error——保持 Promise<boolean> 签名、不抛错）
   if (!initSucceeded) {
     await initSettings();
@@ -385,7 +385,7 @@ const MODEL_USAGE_CAP = 20;
  */
 export const recordModelUsage = (sel: ModelSelection): void => {
   if (!sel.id?.trim()) return;
-  // P1-03：必须等 init 成功后再整对象落盘。init 失败时 cache 是默认值——
+  // 必须等 init 成功后再整对象落盘。init 失败时 cache 是默认值——
   // 直接 save 会覆盖磁盘有效配置（模型计数是增强数据、丢一次无妨）
   void initSettings().then(() => {
     if (!initSucceeded) {

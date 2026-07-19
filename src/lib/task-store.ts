@@ -28,6 +28,26 @@ import type {
   TaskSummary,
 } from "./types";
 
+/**
+ * 带 HTTP status 的业务拒绝——客户端据此区分「明确 4xx」与网络不确定。
+ * 可选 code（如 payload_mismatch）供 Operation 仲裁。
+ */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  /** 服务端稳定错误码（如 payload_mismatch） */
+  readonly code?: string;
+  constructor(
+    message: string,
+    status: number,
+    options?: { code?: string },
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = options?.code;
+  }
+}
+
 const handleJson = async <T>(res: Response): Promise<T> => {
   const data = await res.json();
   if (!res.ok) {
@@ -38,7 +58,7 @@ const handleJson = async <T>(res: Response): Promise<T> => {
       typeof (data as { error: unknown }).error === "string"
         ? (data as { error: string }).error
         : `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw new ApiRequestError(msg, res.status);
   }
   return data as T;
 };
@@ -381,7 +401,15 @@ interface SSEEnvelope {
     | "action"
     | "done"
     | "error"
-    | "assistant_delta";
+    | "assistant_delta"
+    /** 队列整队失败控制帧 */
+    | "queue_failed"
+    /** bootstrap 队列存活快照 */
+    | "queue_state"
+    /** MessageOperation phase / terminal 帧 */
+    | "message_op"
+    /** 任务已逻辑删除，客户端应停订阅、勿重连 */
+    | "task_deleted";
   event?: TaskEvent;
   content?: string;
   task?: Task;
@@ -389,6 +417,21 @@ interface SSEEnvelope {
   ok?: boolean;
   message?: string;
   text?: string;
+  itemIds?: string[];
+  reason?: string;
+  /** bootstrap queue_state 有界终态 ledger */
+  recentSettled?: Array<{ itemId: string; outcome: string }>;
+  /** 完整 operation snapshot（含 accepting/persisted） */
+  operationSnapshot?: Array<{
+    itemId: string;
+    phase: string;
+    fingerprint?: string;
+  }>;
+  /** message_op 帧字段 */
+  itemId?: string;
+  phase?: string;
+  outcome?: string;
+  taskId?: string;
 }
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
@@ -428,17 +471,59 @@ export interface TaskStreamCallbacks {
    * 上层维护「当前 streaming text」、收到本回调时累加、收到 onEvent(assistant_message) 时清空
    */
   onAssistantDelta?: (text: string) => void;
+  /**
+   * 队列整队失败控制帧（strict 落盘 EIO 等）——按 itemIds 清 pending
+   */
+  onQueueFailed?: (itemIds: string[], reason: string) => void;
+  /**
+   * watch bootstrap queue_state + operationSnapshot
+   */
+  onQueueState?: (
+    itemIds: string[],
+    recentSettled?: Array<{ itemId: string; outcome: string }>,
+    operationSnapshot?: Array<{
+      itemId: string;
+      phase: string;
+      fingerprint?: string;
+    }>,
+  ) => void;
+  /**
+   * message_op——显式 phase / outcome（handedOff=delivered）
+   */
+  onMessageOp?: (payload: {
+    itemId: string;
+    phase?: string;
+    outcome?: string;
+  }) => void;
+  /**
+   * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
+   */
+  onTaskDeleted?: (taskId: string) => void;
+  /**
+   * 连接已建立——首个合法 bootstrap `task` 帧解析成功时回调一次。
+   * hook 用它在长连接尚未结束时清零 transient/unavailable 计数（不等流 EOF）。
+   * 200 空流 / 协议解析前失败不得触发；每次连接至多一次。
+   */
+  onConnectionEstablished?: () => void;
 }
+
+/** watch 流结束时是否曾建立（首个合法 task 帧） */
+export type WatchTaskStreamResult = {
+  established: boolean;
+};
 
 /**
  * 订阅任务 SSE（v1.0.x 起 bootstrap 只带尾部 tail 条事件、不是全部历史——
  * 更早的走 fetchEarlierEvents 上拉分页；中途 task/done 帧不带 events）
+ *
+ * 返回 `{ established }`——bootstrap 前 clean EOF 时 established=false，
+ * hook 不得把它当成功清零 epoch。
  */
 export const watchTaskStream = async (
   taskId: string,
   callbacks: TaskStreamCallbacks = {},
   signal?: AbortSignal,
-): Promise<void> => {
+): Promise<WatchTaskStreamResult> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/watch-task`,
     {
@@ -454,7 +539,9 @@ export const watchTaskStream = async (
       typeof data === "object" && data && "error" in data
         ? String((data as { error: unknown }).error)
         : `HTTP ${res.status}`;
-    throw new Error(msg);
+    // 带 status；hook 对 410 与已 hydrate 的 404 走 deletion sink，
+    // 503（证据 unknown）当 unavailable 持续重试、不 commit
+    throw new ApiRequestError(msg, res.status);
   }
   if (!res.body) {
     throw new Error("响应体缺失（不支持流式？）");
@@ -463,6 +550,8 @@ export const watchTaskStream = async (
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // 首个合法 task 帧才算建连成功；每连接至多通知一次
+  let connectionEstablished = false;
 
   try {
     while (true) {
@@ -479,6 +568,11 @@ export const watchTaskStream = async (
           if (env.type === "event" && env.event) {
             callbacks.onEvent?.(env.event);
           } else if (env.type === "task" && env.task) {
+            // 合法 bootstrap task 帧：先发 connection-established，再转发 task
+            if (!connectionEstablished) {
+              connectionEstablished = true;
+              callbacks.onConnectionEstablished?.();
+            }
             callbacks.onTaskUpdate?.(env.task);
           } else if (env.type === "action" && env.action) {
             callbacks.onActionUpdate?.(env.action);
@@ -491,6 +585,66 @@ export const watchTaskStream = async (
             typeof env.text === "string"
           ) {
             callbacks.onAssistantDelta?.(env.text);
+          } else if (
+            env.type === "queue_failed" &&
+            Array.isArray(env.itemIds)
+          ) {
+            // 控制帧——只转发 string[] itemIds
+            const ids = env.itemIds.filter(
+              (id): id is string => typeof id === "string",
+            );
+            callbacks.onQueueFailed?.(
+              ids,
+              typeof env.reason === "string" ? env.reason : "persist_failed",
+            );
+          } else if (
+            env.type === "queue_state" &&
+            Array.isArray(env.itemIds)
+          ) {
+            // 队列快照 + recentSettled + operationSnapshot
+            const ids = env.itemIds.filter(
+              (id): id is string => typeof id === "string",
+            );
+            const recentSettled = Array.isArray(env.recentSettled)
+              ? env.recentSettled.filter(
+                  (e): e is { itemId: string; outcome: string } =>
+                    !!e &&
+                    typeof e.itemId === "string" &&
+                    typeof e.outcome === "string",
+                )
+              : undefined;
+            const operationSnapshot = Array.isArray(env.operationSnapshot)
+              ? env.operationSnapshot.filter(
+                  (
+                    e,
+                  ): e is {
+                    itemId: string;
+                    phase: string;
+                    fingerprint?: string;
+                  } =>
+                    !!e &&
+                    typeof e.itemId === "string" &&
+                    typeof e.phase === "string",
+                )
+              : undefined;
+            callbacks.onQueueState?.(ids, recentSettled, operationSnapshot);
+          } else if (
+            env.type === "message_op" &&
+            typeof env.itemId === "string"
+          ) {
+            // 显式 operation phase / terminal
+            callbacks.onMessageOp?.({
+              itemId: env.itemId,
+              phase: typeof env.phase === "string" ? env.phase : undefined,
+              outcome:
+                typeof env.outcome === "string" ? env.outcome : undefined,
+            });
+          } else if (
+            env.type === "task_deleted" &&
+            typeof env.taskId === "string"
+          ) {
+            // 逻辑删除已提交——转发后流会由服务端关闭
+            callbacks.onTaskDeleted?.(env.taskId);
           }
         }
         sepIdx = buffer.indexOf("\n\n");
@@ -503,6 +657,7 @@ export const watchTaskStream = async (
       /* noop */
     }
   }
+  return { established: connectionEstablished };
 };
 
 // ----------------- 图片附件入参 -----------------
@@ -547,9 +702,47 @@ export const sendChatReply = async (
   bootArgs?: TaskBootArgs,
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
+  /**
+   * 客户端预生成的 queue itemId（POST 前登记 pending 用）。
+   * 服务端原样采用；缺省时服务端兜底发号。
+   */
+  clientItemId?: string,
+  /**
+   * payload 指纹（与 server claim 对齐）。
+   * 契约假设：同 id + 不同 fingerprint → 409 `{ error: "payload_mismatch" }`。
+   */
+  payloadFingerprint?: string,
 ): Promise<
-  | { task: Task; autoStarted: boolean; queued?: false }
-  | { queued: true; queuedCount: number; task?: Task }
+  | {
+      task: Task;
+      autoStarted: boolean;
+      queued?: false;
+      /** send 后落盘失败时服务端带回，UI 须 toast 不可忽略 */
+      persistWarning?: string;
+    }
+  | {
+      queued: true;
+      queuedCount: number;
+      /** 与服务端 queue item 对账的稳定 id */
+      itemId: string;
+      /** 同 id 幂等命中 active */
+      alreadyAccepted?: boolean;
+      task?: Task;
+      persistWarning?: string;
+    }
+  | {
+      /** 同 id 已在 recentSettled → 终态幂等 */
+      settled: true;
+      itemId: string;
+      /**
+       * 缺失时保持 undefined（unknown），绝不合成 delivered。
+       * 调用方按 ledger / decoder 仲裁清草稿。
+       */
+      outcome?: string;
+      task?: Task;
+      /** 与其它分支对齐，settled 路径不会带此字段 */
+      persistWarning?: undefined;
+    }
 > => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-reply`,
@@ -563,6 +756,10 @@ export const sendChatReply = async (
           attachments && attachments.length > 0 ? attachments : undefined,
         bootArgs,
         skills: skills && skills.length > 0 ? skills : undefined,
+        // 客户端预生成 id，服务端优先采用
+        clientItemId: clientItemId || undefined,
+        // 供 server claimOperation 比对
+        payloadFingerprint: payloadFingerprint || undefined,
       }),
     },
   );
@@ -572,21 +769,80 @@ export const sendChatReply = async (
       ok?: boolean;
       queued?: boolean;
       queuedCount?: number;
+      itemId?: string;
+      alreadyAccepted?: boolean;
       task?: Task;
+      persistWarning?: string;
     };
     return {
       queued: true,
       queuedCount:
         typeof data.queuedCount === "number" ? data.queuedCount : 1,
+      // 缺 itemId 时本地兜底（旧服务端兼容；正常路径服务端必返）
+      itemId:
+        typeof data.itemId === "string" && data.itemId
+          ? data.itemId
+          : `pending_local_${Date.now()}`,
+      ...(data.alreadyAccepted ? { alreadyAccepted: true } : {}),
+      task: data.task,
+      ...(typeof data.persistWarning === "string"
+        ? { persistWarning: data.persistWarning }
+        : {}),
+    };
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const errCode =
+      typeof data === "object" &&
+      data &&
+      "error" in data &&
+      typeof (data as { error: unknown }).error === "string"
+        ? (data as { error: string }).error
+        : undefined;
+    // server 实际契约 = 结构化字段 `{ payloadMismatch: true }`（error 是给人读的长文案、
+    // 不做字符串匹配）；命中即抛稳定 code 供 Operation 仲裁转新 id 重发
+    const isPayloadMismatch =
+      res.status === 409 &&
+      typeof data === "object" &&
+      data !== null &&
+      (data as { payloadMismatch?: unknown }).payloadMismatch === true;
+    if (isPayloadMismatch) {
+      throw new ApiRequestError("payload_mismatch", 409, {
+        code: "payload_mismatch",
+      });
+    }
+    const msg = errCode ?? `HTTP ${res.status}`;
+    throw new ApiRequestError(msg, res.status, errCode ? { code: errCode } : undefined);
+  }
+  const data = (await res.json()) as {
+    ok?: true;
+    settled?: boolean;
+    itemId?: string;
+    outcome?: string;
+    task?: Task;
+    autoStarted?: boolean;
+    persistWarning?: string;
+  };
+  // 幂等终态（同 id 已 settled）
+  // 缺失 / 非字符串 outcome 不得合成 delivered——保持 undefined → unknown
+  if (data.settled === true && typeof data.itemId === "string") {
+    return {
+      settled: true,
+      itemId: data.itemId,
+      ...(typeof data.outcome === "string" ? { outcome: data.outcome } : {}),
       task: data.task,
     };
   }
-  const data = await handleJson<{
-    ok: true;
-    task: Task;
-    autoStarted?: boolean;
-  }>(res);
-  return { task: data.task, autoStarted: !!data.autoStarted };
+  if (!data.task) {
+    throw new ApiRequestError("响应缺少 task", res.status || 500);
+  }
+  return {
+    task: data.task,
+    autoStarted: !!data.autoStarted,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 /** P3：回退到带 checkpoint 的 user_reply */
@@ -671,7 +927,7 @@ export const submitTaskQuestion = async (
   attachments?: string[],
   // skill 引用：服务端拼进 agent 消息、不进 user_reply 事件气泡
   skills?: Array<{ name: string; absPath: string }>,
-): Promise<Task> => {
+): Promise<{ task: Task; persistWarning?: string }> => {
   const s = getSettings();
   const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/question`, {
     method: "POST",
@@ -692,8 +948,18 @@ export const submitTaskQuestion = async (
       forceModel: forceModel?.id?.trim() ? forceModel : undefined,
     }),
   });
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
+  // 透传 persistWarning，调用方 toast（不可静默丢）
+  const data = await handleJson<{
+    ok: true;
+    task: Task;
+    persistWarning?: string;
+  }>(res);
+  return {
+    task: data.task,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 /**
@@ -831,7 +1097,7 @@ export const submitAskReply = async (
     imagesByQuestion?: Record<string, ImagePayload[]>;
     signal?: AbortSignal;
   },
-): Promise<{ ok: true }> => {
+): Promise<{ ok: true; persistWarning?: string }> => {
   // 只发非空的题图、避免 body 里塞一堆空数组
   const imagesByQuestion = options?.imagesByQuestion
     ? Object.fromEntries(
@@ -863,7 +1129,14 @@ export const submitAskReply = async (
       }),
     },
   );
-  return await handleJson<{ ok: true }>(res);
+  // 透传 persistWarning
+  const data = await handleJson<{ ok: true; persistWarning?: string }>(res);
+  return {
+    ok: true as const,
+    ...(typeof data.persistWarning === "string"
+      ? { persistWarning: data.persistWarning }
+      : {}),
+  };
 };
 
 // ----------------- Action Revisions（V0.5.12 → V0.6 action 维度） -----------------

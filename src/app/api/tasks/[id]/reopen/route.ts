@@ -15,11 +15,17 @@
  *
  * - task 不存在 → 404
  * - task 不是终态（developing）→ 400（非终态没有「恢复」一说）
+ * - finalizing/deleting/stopping 在飞、或 terminal cleanup executing → 409
+ *   （route 不写 developing、不 prewarm）
  */
 
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getTask } from "@/lib/server/task-fs";
-import { prewarmTaskWorkspace, reopenTask } from "@/lib/server/task-runner";
+import {
+  prewarmTaskWorkspace,
+  reopenTask,
+  TaskCleanupInProgressError,
+} from "@/lib/server/task-runner";
 
 interface Ctx {
   params: Promise<{ id: string }>;
@@ -36,11 +42,17 @@ export const POST = async (_req: Request, { params }: Ctx) => {
   try {
     await reopenTask(task.id);
   } catch (err) {
+    // terminal cleanup executing、或 lifecycle 互斥（含 DELETE deleting）→ 409
+    // 注意：此处直接 return，下方 prewarm / 写 developing 都不会执行
+    if (err instanceof TaskCleanupInProgressError) {
+      return errorResponse(err.message, 409);
+    }
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(message, 400);
   }
 
   // v1.1.x 提速：终结时 worktree 已清、重开后首推进要付重建成本——后台预热（fire-and-forget）
+  // 仅 reopenTask 成功后才走；409 路径绝不 prewarm
   prewarmTaskWorkspace(task.id);
 
   const fresh = await getTask(task.id);

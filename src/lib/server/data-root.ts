@@ -8,7 +8,7 @@
  * 所有要落 data/ 的模块（task-fs / mcp-oauth / uploads route）一律走这里、
  * 不要再各自拼 process.cwd()/data。
  *
- * P0-02：含密钥的目录 / 文件统一 0700 / 0600；win32 上 mode/chmod 是 no-op 或近似，
+ * 含密钥的目录 / 文件统一 0700 / 0600；win32 上 mode/chmod 是 no-op 或近似，
  * 统一跳过避免抛错。
  */
 import { promises as fs } from "node:fs";
@@ -20,7 +20,7 @@ export const dataRoot = (): string =>
   process.env.FE_AI_FLOW_DATA_DIR || path.join(process.cwd(), "data");
 
 /**
- * R27-1：renameWithRetry 在 beforeAttempt 拒写时抛此错——调用方清 tmp、视为「未提交」。
+ * renameWithRetry 在 beforeAttempt 拒写时抛此错——调用方清 tmp、视为「未提交」。
  * 失败的 syscall 不消费授权；只有成功发起的 rename 才是线性化点。
  */
 export class RenameAbortedError extends Error {
@@ -59,7 +59,7 @@ export const ensurePrivateDir = async (dir: string): Promise<void> => {
  * （同事线上实测、mac/linux 无此语义）——短退避重试几轮；重试穿透才抛。
  * writePrivateFileAtomic / writeMeta 共用，避免两处重试策略漂移。
  *
- * @param beforeAttempt R27-1：每次真正调用 fs.rename 前同步验；false → 抛
+ * @param beforeAttempt 每次真正调用 fs.rename 前同步验；false → 抛
  *   {@link RenameAbortedError}（不消费授权）。失败的 syscall 之后仍可换主拒提交。
  */
 export const renameWithRetry = async (
@@ -69,7 +69,7 @@ export const renameWithRetry = async (
 ): Promise<void> => {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 5; attempt++) {
-    // R27-1：循环内每次尝试前插桩 + lease——首轮 EPERM 退避期间换主仍拦得住
+    // 循环内每次尝试前插桩 + lease——首轮 EPERM 退避期间换主仍拦得住
     await failpoint("rename.beforeAttempt");
     if (beforeAttempt && !beforeAttempt()) {
       throw new RenameAbortedError();

@@ -16,9 +16,9 @@
  *
  * # 状态机
  *
- *   running        → run 在跑（agent 正在答）
- *   awaiting_user  → 会话在、等用户下一条
- *   idle / error   → 停止 / 出错（会话已关、下一条消息起新会话、靠 events.jsonl 恢复上下文）
+ *   running → run 在跑（agent 正在答）
+ *   awaiting_user → 会话在、等用户下一条
+ *   idle / error → 停止 / 出错（会话已关、下一条消息起新会话、靠 events.jsonl 恢复上下文）
  *
  * # 跟 task-runner 的区别（避免误用）
  *
@@ -30,10 +30,10 @@ import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
-  appendEvent,
   clearTaskSessionAgentIdIf,
   getTask,
   setTaskRunStatus,
+  setTaskRunStatusIfRunOwner,
   setTaskSessionAgentId,
 } from "./task-fs";
 import { getEventsLogPath } from "./task-fs-core";
@@ -92,20 +92,25 @@ import {
   stringifyMeta,
   writeEventAndPublish,
   writeOwnedEventAndPublish,
+  writeUserEventAndPublishStrict,
   type TaskStreamEvent,
 } from "./task-stream";
 import { MCP_HEALTH_LABEL } from "@/lib/types";
 import type { Task } from "@/lib/types";
 import {
   beginChatQueueInFlight,
-  clearChatQueue,
   dequeueChatMessage,
   emitQueuedMessageFlushed,
   endChatQueueInFlight,
   enqueueChatMessage,
   enqueueChatMessageFront,
+  failQueuedItems,
   getChatQueueCount,
   getChatQueueGeneration,
+  isMessageOperationTerminal,
+  markMessagePersisted,
+  settleMessageFailed,
+  settleMessageHandedOff,
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
@@ -150,7 +155,7 @@ interface RunningChatRecord {
   agentId: string;
   /**
    * 内存实例代际（每次 runningChats.set 分配、进程内单调递增、永不复用）。
-   * 复审 J1：Agent.resume 恢复同一持久化 agent 时 agentId 相同，agentId 无法区分
+   * Agent.resume 恢复同一持久化 agent 时 agentId 相同，agentId 无法区分
    * 「退避前的坏实例」和「退避期间用户 resume 出的新实例」——所有异步收尾 / 重连
    * 让位判断必须按 instanceId 门控，不能按 agentId。
    */
@@ -180,7 +185,7 @@ interface ChatRunnerGlobalState {
   runningChats: Map<string, RunningChatRecord>;
   /**
    * flushChatQueue 正在 drain 的 taskId（dequeue → send 整段）。
-   * 解决 P2 #8：run 结束后 async drain 真正 send 前，新 chat-reply 看到 idle
+   * 解决 run 结束后 async drain 真正 send 前，新 chat-reply 看到 idle
    * 会话直接 send，新消息 C 越过已排队的 B。chat-reply 见此标记则入队保 FIFO。
    */
   drainingQueues: Set<string>;
@@ -236,9 +241,12 @@ export const hasChatSession = (taskId: string): boolean =>
  * V0.11：关掉一个 chat 会话（agent close + 删记录）、best-effort。
  * expectedInstanceId 传了就只在「当前会话确实是那个内存实例」时才关（异步收尾路径防误关新会话）；
  * 不传 = 关当前的（用户主动 stop / forceClear）。对齐 task-runner.closeTaskSession。
- * 复审 J1：门控键从 agentId 改为 instanceId——Agent.resume 恢复同一持久化 agent 时
+ * 门控键从 agentId 改为 instanceId——Agent.resume 恢复同一持久化 agent 时
  * agentId 相同，旧 retry / 迟到收尾按 agentId 会误关退避期间用户恢复的新实例。
  * keepPersisted = 空闲回收用（sessionAgentId 留着、下次消息 Agent.resume 接回）
+ *
+ * 落盘锚点改条件清（clearTaskSessionAgentIdIf）——expected=本次关的 agentId，
+ * extraGuard=内存无后继 chat 会话；`!rec` 禁止裸清（迟到 fire-and-forget 不得抹 B 锚点）。
  * @returns 是否真的关了一个会话
  */
 const closeChatSession = (
@@ -248,13 +256,15 @@ const closeChatSession = (
 ): boolean => {
   const rec = runningChats.get(taskId);
   if (!rec) {
-    if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+    // 表内已无会话 → 禁止裸清盘上锚点（forceClear 空窗后 A 迟到清会抹 B）
     return false;
   }
   // 审查发现：旧 run 收尾缺门控时，切模型 forceClear 后迟到的 cancelled 分支会误关新会话
   if (expectedInstanceId !== undefined && rec.instanceId !== expectedInstanceId) {
     return false;
   }
+  // 摘表前记下本次要关的 agentId（占位期为空串 → 条件清 naturally no-op）
+  const agentIdToClear = rec.agentId;
   runningChats.delete(taskId);
   setChatAwaitingNotifier(taskId, null);
   if (rec.agent) {
@@ -264,7 +274,14 @@ const closeChatSession = (
       /* noop */
     }
   }
-  if (!opts.keepPersisted) void setTaskSessionAgentId(taskId, undefined);
+  if (!opts.keepPersisted && agentIdToClear) {
+    // 条件清——finalGuard 现查「盘上仍是本 agentId + 内存无后继」
+    void clearTaskSessionAgentIdIf(
+      taskId,
+      agentIdToClear,
+      () => !runningChats.has(taskId),
+    );
+  }
   return true;
 };
 
@@ -297,14 +314,14 @@ const CHAT_SWEEPER_KEY = "__feAiFlowChatSweeperV1__";
  *
  * V0.11：run 在跑 → cancel（run 收尾分支会关会话）；idle 会话 → 直接关。
  *
- * M1 延伸：自动重连的「backoff → resume → send」窗口内表里可能没有 record，
+ * 自动重连的「backoff → resume → send」窗口内表里可能没有 record，
  * 此时用户 stop 也必须让重连停下——先给 reconnect 停止闭包发信号（有 record 时
  * 同样发：reconnect 的 claim record cancel 只摘实例、不通知在退避里的重试者）。
  */
 export const cancelChatRun = (taskId: string): boolean => {
   const reconnectStop = getReconnectStops().get(taskId);
   if (reconnectStop) reconnectStop();
-  // S3（十二轮）：compact 进行中 → 置事务级 abort，阻止摘要重试与重建「复活」AI
+  // compact 进行中 → 置事务级 abort，阻止摘要重试与重建「复活」AI
   let compactAborted = false;
   if (isChatCompactInProgress(taskId)) {
     markChatCompactAborted(taskId);
@@ -365,7 +382,7 @@ export const waitForChatToStop = async (
  */
 export const forceClearChatRun = (taskId: string): void => {
   closeChatSession(taskId);
-  // 复审（11 轮）：cancelled 槽只在被 owner 消费时删——forceClear（懒重启换新）后
+  // cancelled 槽只在被 owner 消费时删——forceClear（懒重启换新）后
   // 旧 claim 的标记已无消费者，顺手清防泄漏；旧 owner 迟到 send 会按实例不匹配
   // 收敛为 owner_invalid（同为终态 409、语义仍正确）
   getCancelledClaims().delete(taskId);
@@ -377,7 +394,8 @@ export const forceClearChatRun = (taskId: string): void => {
  * 同时清排队（P5.1：rewind 后积压消息不应再发）。
  */
 export const closeChatSessionUnconditional = (taskId: string): void => {
-  clearChatQueue(taskId);
+  // rewind 关会话清队走唯一 sink（有门闩路径也统一）
+  failQueuedItems(taskId, { reason: "rewound" });
   closeChatSession(taskId);
 };
 
@@ -390,16 +408,16 @@ export const isChatRunActive = (taskId: string): boolean =>
  * 认领态下没有真 run，直接把 runActive 复位 false；无会话时幂等 no-op。
  * why：认领不释放 = 会话永远假 busy、所有消息只进队无人消费。
  *
- * 复审 K1：claim 绑定实例——必须带 expectedInstanceId。当前 record 已不是原 claim
+ * claim 绑定实例——必须带 expectedInstanceId。当前 record 已不是原 claim
  * 实例（stop 摘除 / forceClear 换新）时整段 no-op，绝不把新实例的 runActive 误清成
  * false（旧 owner 的迟到 release 会给并发 send 开口子）。
  *
- * 复审 H1：释放认领 = 接管排队消息的调度义务。不能留下
+ * 释放认领 = 接管排队消息的调度义务。不能留下
  * `session idle && queue>0 && !draining` 的死局（owner 撞 rewind 门闩释放后，
  * B 已 202 入队却无人 flush）。门闩仍在时 flush 入口会直接 return，故走
  * scheduleQueueDrainAfterGate 等门闩解除后再补 drain。
  *
- * 复审 L3：H1 的 handoff 义务仅在「当前 record 就是本 claim 实例」时成立。
+ * H1 的 handoff 义务仅在「当前 record 就是本 claim 实例」时成立。
  * record 不存在（claim 已被 stop/forceClear 摘除）或实例不匹配都整段 no-op——
  * 此刻队列可能属于正在 startup reservation 的新 owner，迟到 release 若仍调度
  * drain，会在无会话时清掉已 202 的队列、或抢在新 owner 前发送队首破坏顺序。
@@ -417,7 +435,7 @@ export const releaseChatRunClaim = (
   }
 };
 
-// ----------------- 复审 K1：claim 实例被 stop 摘除的标记 -----------------
+// ----------------- claim 实例被 stop 摘除的标记 -----------------
 
 /**
  * taskId → 被 cancelChatRun（用户停止）摘除的 claim instanceId。
@@ -446,7 +464,7 @@ export const consumeChatClaimCancelled = (
   return false;
 };
 
-// ----------------- M1 延伸：自动重连期间的 stop 信号 -----------------
+// ----------------- 自动重连期间的 stop 信号 -----------------
 
 /**
  * taskId → 正在退避/恢复中的 reconnect 的停止闭包。
@@ -470,7 +488,7 @@ const getReconnectStops = (): Map<string, () => void> => {
 interface ChatCompactGlobalState {
   inProgress: Set<string>;
   /**
-   * S3（十二轮）：compact 事务级 abort。cancelChatRun / stop 在 compact 窗口置位，
+   * compact 事务级 abort。cancelChatRun / stop 在 compact 窗口置位，
    * compactChatSession 在摘要重试与重建序列检查点命中后停止后续副作用。
    */
   aborted: Set<string>;
@@ -545,7 +563,7 @@ const publishBootProgress = (
   });
 };
 
-// R27-6：本地第二套 writeEventAndPublish 实现已删——统一走 task-stream 的
+// 本地第二套 writeEventAndPublish 实现已删——统一走 task-stream 的
 // writeEventAndPublish（用户操作/系统通知语义）与 writeOwnedEventAndPublish（owner 语境、lease 必填）。
 
 /**
@@ -766,10 +784,16 @@ export interface RunChatInput {
   /** P4.2 压缩续接：关旧会话后新会话首包注入的摘要 */
   continuationSummary?: string;
   /**
-   * S1：chat-reply / deliverChatAskReply 启动预约 token。
+   * chat-reply / deliverChatAskReply 启动预约 token。
    * 有则入口同步校验 lease，失效不注册 runningChats。
    */
   startToken?: number;
+  /**
+   * 首条消息的 MessageOperation itemId。
+   * runningChats 占位只表示 starting；仅 `agent.send` resolve 后由本 runner 提交 handedOff；
+   * create/send/lease/stop/DELETE 失败由同一 handle 提交 failed（或 already_running 时入队）。
+   */
+  clientItemId?: string;
 }
 
 /**
@@ -791,10 +815,24 @@ export const runChatSession = async (
     firstMessageEventId: _firstMessageEventId,
     continuationSummary,
     startToken,
+    clientItemId,
   } = input;
   void _firstMessageEventId;
 
-  // S1：带 token 时入口同步校验 lease——失效绝不注册 runningChats / 不创建 agent
+  /** 首条 operation 终态提交（first-outcome-wins；无 id 则 no-op） */
+  const settleFirstOp = (
+    outcome: "delivered" | Parameters<typeof settleMessageFailed>[2],
+  ): void => {
+    if (!clientItemId) return;
+    if (isMessageOperationTerminal(task.id, clientItemId)) return;
+    if (outcome === "delivered") {
+      settleMessageHandedOff(task.id, clientItemId);
+    } else {
+      settleMessageFailed(task.id, clientItemId, outcome);
+    }
+  };
+
+  // 带 token 时入口同步校验 lease——失效绝不注册 runningChats / 不创建 agent
   if (
     startToken !== undefined &&
     !isChatStartLeaseValid(task.id, startToken)
@@ -802,15 +840,19 @@ export const runChatSession = async (
     console.warn(
       `[chat-runner] runChatSession task=${task.id} 启动 lease 已失效（token=${startToken}）、拒绝启动`,
     );
+    // lease 失效 → 同 handle 明确 failed（禁止占位即 handedOff）
+    settleFirstOp("stopped");
     return "lease_cancelled";
   }
 
   if (runningChats.has(task.id)) {
-    // P1 #6：并发首条都被过 hasChatSession===false 后各自 fire runChatSession，
+    // 并发首条都被过 hasChatSession===false 后各自 fire runChatSession，
     // 后者若静默 return → 气泡已落盘但 agent 永远收不到。有 firstMessage 就入队、
     // flush 时 skipPersistEvent 避免重复气泡。
     if (firstMessage) {
       enqueueChatMessage(task.id, {
+        // 带上 operation id，queue/flush 继续同一 aggregate
+        itemId: clientItemId,
         agentText: firstMessage.text,
         displayText: firstMessage.text,
         imageAbsPaths: firstMessage.imagePaths,
@@ -840,17 +882,16 @@ export const runChatSession = async (
   // 收尾门控一律用它——forceClear 后新会话（新号）已就位则门控拒绝、整段跳过。
   const myInstanceId = allocChatInstanceId();
 
-  // cancel 收尾：关会话 + 归位 idle + publish done（不落 info——主动停时 /stop route 已落「用户停止了对话」、避免重复）
+  // cancel 收尾：统一走 finalize（失主 / forceClear 空窗一律 no-op）
   const finishCancelled = async (): Promise<void> => {
-    const closed = closeChatSession(task.id, myInstanceId);
-    if (!closed && runningChats.has(task.id)) return;
-    const t = await setTaskRunStatus(task.id, "idle");
-    if (t) publish(task.id, { kind: "task", task: t });
-    publish(task.id, { kind: "done", task: t ?? task, ok: true });
+    await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+      task,
+    });
   };
 
   // 进入即占位注册：任何时刻（含 create/send/MCP 探测冷启动期）点停止、cancelChatRun 都能命中、
   // 置 cancelled（有 run 时一并真取消 SDK run）；agentId 先空、send 出来再回填。
+  // 此处 runActive 只表示 starting，绝不等于消息已 handedOff。
   runningChats.set(task.id, {
     agentId: "",
     instanceId: myInstanceId,
@@ -873,19 +914,39 @@ export const runChatSession = async (
   releaseChatStart(task.id, startToken);
 
   try {
-    // S1 兜底：注册占位后、Agent.create 前复查任务是否仍存在（DELETE 可能已 tombstone）。
+    // 兜底：注册占位后、Agent.create 前复查任务是否仍存在（DELETE 可能已 tombstone）。
     // 放在 await 点而非入口同步段——保持「进入即占位」语义，cancelChatRun 仍能命中。
     const aliveTask = await getTask(task.id);
     if (!aliveTask) {
       console.warn(
         `[chat-runner] runChatSession task=${task.id} 任务已删除/tombstone、放弃启动`,
       );
+      // 任务已删 → 首条 op 明确 failed
+      settleFirstOp("deleted");
       closeChatSession(task.id, myInstanceId);
       return "lease_cancelled";
     }
 
-    // 1) 切到 running、写一条 info event
-    const startedTask = await setTaskRunStatus(task.id, "running");
+    // 启动段 isCurrent——forceClear + B 接管后迟到的 running / dropped-MCP 写被拒
+    const isStartCurrent = (): boolean =>
+      runningChats.get(task.id)?.instanceId === myInstanceId;
+
+    // 1) 切到 running（条件写：失主 / 空窗不盖 B）
+    const startedTask = await setTaskRunStatusIfRunOwner(
+      task.id,
+      "running",
+      isStartCurrent,
+    );
+    if (!isStartCurrent()) {
+      // 写盘 await 期间已被摘 / 替换——不继续 MCP / create（finishCancelled 对失主 no-op）
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        settleFirstOp("startup_failed");
+      }
+      return "started";
+    }
     if (startedTask) publish(task.id, { kind: "task", task: startedTask });
 
     // 2) 拼 mcpServers：fe 自管 MCP（按 task 黑名单过滤）+ 我们自己的 chat-tool
@@ -903,7 +964,7 @@ export const runChatSession = async (
     const { servers: cursorMcp, dropped: droppedMcp } =
       await filterHealthyMcp(enrichedMcp);
     const perfMcpMs = Date.now() - perfMcpStart;
-    // R24-6：chat agent 同样带 caller 身份（ask_user 分派层要核）
+    // chat agent 同样带 caller 身份（ask_user 分派层要核）
     const callerToken = String(allocTaskRunInstanceId());
     const mergedMcp: Record<string, McpServerConfig> = {
       ...cursorMcp,
@@ -913,17 +974,22 @@ export const runChatSession = async (
       },
     };
 
-    // MCP 健康探测也要数秒、探测期间被停 → 别再往下跑、直接收尾
+    // MCP 健康探测也要数秒、探测期间被停 / 换主 → 别再往下跑
     // （原「Chat 任务启动」info 已去掉：用户嫌吵，模型信息输入框下方已有）
-    if (cancelled) {
-      await finishCancelled();
+    if (cancelled || !isStartCurrent()) {
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        // 实例被替换、首条未 send → failed
+        settleFirstOp("startup_failed");
+      }
       return "started";
     }
 
-    // V0.6.11：有被剔除的 MCP → 写一条提示、让用户知道为什么少了能力（不再「莫名其妙报错」）
+    // V0.6.11：有被剔除的 MCP → 写一条提示（owned sink，失主不落盘）
     if (droppedMcp.length > 0) {
-      // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：chat 启动段（会话尚未注册、无实例可绑）、用户发消息的直接结果
-      await writeEventAndPublish(task.id, {
+      await writeOwnedEventAndPublish(task.id, isStartCurrent, {
         kind: "info",
         text: `⚠️ 已跳过 ${droppedMcp.length} 个不可用的 MCP：${droppedMcp
           .map((d) => `${d.name}（${d.detail?.split("\n")[0] ?? MCP_HEALTH_LABEL[d.status]}）`)
@@ -932,7 +998,8 @@ export const runChatSession = async (
     }
 
     // 3) 注入 awaiting notifier（V0.11.1 抽成共用、resume 时也要重注册）
-    registerChatNotifier(task, callerToken);
+    // 绑本实例 instanceId，ask/submit_work 状态写带 isCurrent
+    registerChatNotifier(task, callerToken, myInstanceId);
 
     // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills / rules 读盘、identity 走
     // meegle CLI、gitlab 段读 settings + 推 remote host——都不依赖 agent、重叠后首 token 提前。
@@ -984,7 +1051,7 @@ export const runChatSession = async (
     });
     const perfCreateMs = Date.now() - perfCreateStart;
 
-    // S2 / T3：Agent.create 冷启动也要数秒——期间可能被 stop（cancelled）或
+    // Agent.create 冷启动也要数秒——期间可能被 stop（cancelled）或
     // forceClear+新实例 B 替换（instanceGone）。本地 agent 尚未挂到 record，须显式
     // close 防泄漏；绝不能继续拼 prompt / send（旧 run 一旦受理可能改仓）。
     // SDK close 类型为 void，用 Promise.resolve 吞同步/异步异常（对齐 resume 放弃挂载）。
@@ -996,7 +1063,13 @@ export const runChatSession = async (
         void Promise.resolve(agent.close()).catch(() => {});
         // cancelled：走既有 finishCancelled；instanceGone 而非 cancelled 时不要动 B
         //（finishCancelled 按 myInstanceId 门控对 B 是 no-op，但仍避免多余写盘）
-        if (cancelled) await finishCancelled();
+        if (cancelled) {
+          await finishCancelled();
+          settleFirstOp("stopped");
+        } else {
+          // create 后窗口 stop/DELETE/换实例 → 首条未送达
+          settleFirstOp("startup_failed");
+        }
         return "started";
       }
     }
@@ -1018,7 +1091,7 @@ export const runChatSession = async (
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 
-    // T3：素材收割四个 await 期间同样可能被 forceClear 换实例 / stop——send 前再复查一次。
+    // 素材收割四个 await 期间同样可能被 forceClear 换实例 / stop——send 前再复查一次。
     // 命中则 close 本地 agent、绝不能 agent.send（对齐上面 create 后与 send 后复查口径）。
     {
       const curBeforeSend = runningChats.get(task.id);
@@ -1026,7 +1099,12 @@ export const runChatSession = async (
         !curBeforeSend || curBeforeSend.instanceId !== myInstanceId;
       if (cancelled || instanceGoneBeforeSend) {
         void Promise.resolve(agent.close()).catch(() => {});
-        if (cancelled) await finishCancelled();
+        if (cancelled) {
+          await finishCancelled();
+          settleFirstOp("stopped");
+        } else {
+          settleFirstOp("startup_failed");
+        }
         return "started";
       }
     }
@@ -1048,7 +1126,7 @@ export const runChatSession = async (
     run = await agent.send(initialPrompt, {
       onDelta: composeOnDelta(
         perfTracker.onDelta,
-        // R26-6：chat shell delta 绑本实例 instanceId——失主丢弃迟到输出
+        // chat shell delta 绑本实例 instanceId——失主丢弃迟到输出
         createShellOutputDeltaPublisher(
           task.id,
           () => runningChats.get(task.id)?.instanceId === myInstanceId,
@@ -1066,7 +1144,7 @@ export const runChatSession = async (
         `send=${Date.now() - perfSendStart}ms total=${Date.now() - perfStart}ms`,
     );
 
-    // S2（十二轮）/ 对齐 M1（第十轮复审）：send resolve 后、任何写 record / 落盘之前，
+    // send resolve 后、任何写 record / 落盘之前，
     // 复查 cancelled + instanceId——stop / forceClear+新实例 B 可发生在上面 await 期间。
     // 命中则丢弃迟到 run，绝不能把 B 的 record 覆盖成 A 的 agent / 落盘 A 的 sessionAgentId。
     const cur = runningChats.get(task.id);
@@ -1074,10 +1152,18 @@ export const runChatSession = async (
       void run.cancel().catch(() => {});
       // 本地 agent 未挂到当前实例：显式 close，避免泄漏（finishCancelled 只关 record.agent）
       void Promise.resolve(agent.close()).catch(() => {});
-      if (cancelled) await finishCancelled();
+      if (cancelled) {
+        await finishCancelled();
+        settleFirstOp("stopped");
+      } else {
+        settleFirstOp("startup_failed");
+      }
       // instanceGone：finishCancelled 按 myInstanceId 门控对 B 是 no-op，此处不调用以免多余写盘
       return "started";
     }
+
+    // 仅在 agent.send 成功返回 run 且实例仍 current 后提交 handedOff
+    settleFirstOp("delivered");
 
     // 回填真实 agentId / agent 实例（占位注册时是空串 / null）——从此会话可被 send 续接。
     // agentId 同步落盘（V0.11.1 会话持久化）：服务重启后 Agent.resume 接回
@@ -1088,7 +1174,7 @@ export const runChatSession = async (
     await consumeChatRun(task, run, () => cancelled);
   } catch (err) {
     // Agent.create / send 阶段失败（consumeChatRun 内部错误它自己处理、不会抛）
-    // S2：stop 导致 create/send reject 时走 finishCancelled 口径（idle、不落 error），
+    // stop 导致 create/send reject 时走 finishCancelled 口径（idle、不落 error），
     // 对齐 consumeChatRun 的 cancelled 分流；cancelled=false 才走 handleChatRunFailure。
     if (cancelled) {
       const cur = runningChats.get(task.id);
@@ -1098,8 +1184,11 @@ export const runChatSession = async (
         void Promise.resolve(agent.close()).catch(() => {});
       }
       await finishCancelled();
+      settleFirstOp("stopped");
       return "started";
     }
+    // Agent.create reject / send reject → startup_failed（禁止留下 handedOff）
+    settleFirstOp("startup_failed");
     await handleChatRunFailure(task, err, myInstanceId);
   }
   return "started";
@@ -1109,31 +1198,42 @@ export const runChatSession = async (
 
 // chat 的 awaiting notifier：ask_user 写真实 ask_user_request 事件（与 task-runner 对齐）；
 // submit_work 误调仍只切 awaiting_user（chat 不用交卷）
-const registerChatNotifier = (task: Task, callerToken: string): void => {
+// instanceId 绑入 isOwner——stop 已 idle / forceClear 后 B running 时迟到裸写不得盖 awaiting_user
+const registerChatNotifier = (
+  task: Task,
+  callerToken: string,
+  instanceId: number,
+): void => {
   setChatAwaitingNotifier(
     task.id,
     async (signal, ctx) => {
-      // R25-3：chat 模式同样贯穿 caller 复查（签名对齐 task-runner）
-      if (!ctx.callerStillValid()) return;
+      // chat 模式同样贯穿 caller 复查（签名对齐 task-runner）
+      // 显式返回 accepted | stale（不再 void 被工具层当 delivered）
+      if (!ctx.callerStillValid()) return "stale";
+      // 本 run 实例仍 current（对齐 task 侧 setTaskRunStatusIfRunOwner(askLease)）
+      const instanceStillCurrent = (): boolean =>
+        runningChats.get(task.id)?.instanceId === instanceId;
       if (signal.kind === "ask_user_request") {
-        // R27-5：ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
+        // ask lease 含 askId——同 caller 并发/重试的旧 ask（pending map 已被
         // 新 ask 顶掉）在 supersede/event/status 每个 sink 都被拦、UI 与 pending map 不分裂
+        // + 本 instance 仍 current（stop 摘表 / B 换号后拒写 awaiting_user）
         const askLease = (): boolean =>
           ctx.callerStillValid() &&
-          getPendingAsk(task.id)?.askId === signal.askId;
+          getPendingAsk(task.id)?.askId === signal.askId &&
+          instanceStillCurrent();
         // 新提问落盘前作废旧的未了结提问（同 task-runner：防旧答题卡复活）
-        // R26-5/6：supersede 带 caller lease
+        // supersede 带 caller lease
         await supersedePendingAsks(task.id, "被新提问顶替", askLease);
         await failpoint("mcp.askUser.afterSupersede");
         if (!askLease()) {
-          // R26-3：按本次 askId 反登记——不得裸 cancel 误删 B 的新提问
+          // 按本次 askId 反登记并返 stale——wrapper 透传后工具不得报 ASK_SUBMITTED
           cancelPendingIf(task.id, signal.askId);
-          return;
+          return "stale";
         }
         const previewText = signal.questions
           .map((q, idx) => `Q${idx + 1}: ${q.question}`)
           .join("\n");
-        // R27-6：owned sink——lease 必填
+        // owned sink——lease 必填
         await writeOwnedEventAndPublish(
           task.id,
           askLease,
@@ -1151,16 +1251,27 @@ const registerChatNotifier = (task: Task, callerToken: string): void => {
         );
         if (!askLease()) {
           cancelPendingIf(task.id, signal.askId);
-          return;
+          return "stale";
         }
-        const updated = await setTaskRunStatus(task.id, "awaiting_user");
+        const updated = await setTaskRunStatusIfRunOwner(
+          task.id,
+          "awaiting_user",
+          askLease,
+        );
         if (updated) publish(task.id, { kind: "task", task: updated });
-        return;
+        return "accepted";
       }
-      // submit_work 等非 ask 信号：chat 不用交卷、只切 awaiting_user
-      if (!ctx.callerStillValid()) return;
-      const updated = await setTaskRunStatus(task.id, "awaiting_user");
+      // submit_work 等非 ask 信号：chat 不用交卷、只切 awaiting_user（条件写）
+      const submitOwner = (): boolean =>
+        ctx.callerStillValid() && instanceStillCurrent();
+      if (!submitOwner()) return "stale";
+      const updated = await setTaskRunStatusIfRunOwner(
+        task.id,
+        "awaiting_user",
+        submitOwner,
+      );
       if (updated) publish(task.id, { kind: "task", task: updated });
+      return "accepted";
     },
     callerToken,
   );
@@ -1177,11 +1288,11 @@ const registerChatNotifier = (task: Task, callerToken: string): void => {
  * 并发两个 resume：第二个 tryReserveChatStart 失败，避免后到覆盖先到。
  *
  * @param opts.claimRun owner 在注册瞬间同步认领首个 run（runActive=true）。
- *   复审 G1：三个调用方（chat-reply / deliverChatAskReply / tryChatAutoReconnect）
+ *   三个调用方（chat-reply / deliverChatAskReply / tryChatAutoReconnect）
  *   resume 后都要自己先发第一条；认领消掉「注册→owner send」窗口里的并发 send 与顺序反转。
  *   通用 resume 不再无条件 drain——后续队列等 owner run 结束后由统一 flush 排出。
  *   调用方若在 send 前失败必须 releaseChatRunClaim(taskId, instanceId)。
- * @returns 复审 K1：claim 是实例化 token——成功返回注册的 instanceId，owner 后续
+ * @returns claim 是实例化 token——成功返回注册的 instanceId，owner 后续
  *   send/release 必须带它做精确匹配；失败返 null。不再返布尔，防止旧 owner 越权
  *   操作 stop/forceClear 之后换上来的新实例。
  */
@@ -1202,7 +1313,7 @@ export const resumeChatSession = async (
       await resolveTaskMcpServers(task.disabledMcpServers),
     );
     const { servers: cursorMcp } = await filterHealthyMcp(enrichedMcp);
-    // R24-6：resume 发新 caller + 重注册 notifier
+    // resume 发新 caller + 重注册 notifier
     const callerToken = String(allocTaskRunInstanceId());
     const mergedMcp: Record<string, McpServerConfig> = {
       ...cursorMcp,
@@ -1242,7 +1353,7 @@ export const resumeChatSession = async (
       return null;
     }
     // claimRun：从注册那一刻起没有任何第三方能抢发（send / flush 见 runActive 即停）
-    // 复审 J1：resume 同一持久化 agent 得到相同 agentId，但内存实例必须换新号
+    // resume 同一持久化 agent 得到相同 agentId，但内存实例必须换新号
     const instanceId = allocChatInstanceId();
     runningChats.set(task.id, {
       agentId: agent.agentId,
@@ -1254,7 +1365,7 @@ export const resumeChatSession = async (
       model: bootArgs.model,
       disabledMcpServers: task.disabledMcpServers ?? [],
       repoPaths: [...(task.repoPaths ?? [])],
-      // 复审 K1：claim 态没有真 run，stop（cancelChatRun 见 runActive 走 cancel）
+      // claim 态没有真 run，stop（cancelChatRun 见 runActive 走 cancel）
       // 必须真正摘除本实例并记录 cancelled——owner 稍后 send 因 instanceId 不匹配
       // 整段 no-op，路由凭 cancelled 标记识别「用户已停止」、不再降级起新会话重放消息，
       // 不会出现「已中断」之后 AI 又开始跑。consumeChatRun 起真 run 后会覆盖此 cancel。
@@ -1264,7 +1375,7 @@ export const resumeChatSession = async (
         }
       },
     });
-    registerChatNotifier(task, callerToken);
+    registerChatNotifier(task, callerToken, instanceId);
     console.log(
       `[chat-runner] task=${task.id} 会话已恢复（Agent.resume agentId=${agent.agentId}、instance=#${instanceId}${opts.claimRun ? "、已认领首发" : ""}）`,
     );
@@ -1283,8 +1394,8 @@ export const resumeChatSession = async (
       `[chat-runner] task=${task.id} Agent.resume 失败（条件清锚点、降级新会话）`,
       err,
     );
-    // R27-3：条件清（chat 侧等价 guard）——B 已装内存 session（runningChats 非空）
-    // 或本次 start lease 已被 stop/rewind 抢占则不清；盘上锚点必须仍是本次尝试的 agentId
+    // 条件清（chat 侧）——finalGuard 每次 rename 前复查本闭包。
+    // 必须现查（非入场快照）：内存无后继 session + 本链 start lease 仍 valid。
     if (task.sessionAgentId) {
       void clearTaskSessionAgentIdIf(
         task.id,
@@ -1341,9 +1452,9 @@ const sleepWithCancel = async (
  * send 系统提示继续 → 递归消费新 run。返回 true = 已接管（无论最终成败、后续都在递归里处理）。
  *
  * @param staleInstanceId 要重连替换的坏会话内存实例号（consumeChatRun 失败分支传入；
- *   send 失败递归时传本轮 rec.instanceId）。复审 H2：退避窗口内不得留下可被第三方
+ *   send 失败递归时传本轮 rec.instanceId）。退避窗口内不得留下可被第三方
  *   当 idle 用的旧会话；醒来后只按 staleInstanceId 门控关闭，绝不误关用户新起的 run。
- *   复审 J1：门控键必须是 instanceId 而非 agentId——退避期间用户 chat-reply 会
+ *   门控键必须是 instanceId 而非 agentId——退避期间用户 chat-reply 会
  *   `Agent.resume(task.sessionAgentId)` 恢复同一持久化 agent，新实例 agentId 与
  *   stale 相同；instanceId 每次注册都换新号，才能区分「坏实例」和「用户新恢复的实例」。
  */
@@ -1362,7 +1473,7 @@ const tryChatAutoReconnect = async (
   if (!fresh || fresh.repoStatus === "merged" || fresh.repoStatus === "abandoned") {
     return false;
   }
-  // M1 延伸：重连的 backoff/resume/send 大部分时间表内没有 record，cancelChatRun
+  // 重连的 backoff/resume/send 大部分时间表内没有 record，cancelChatRun
   // 摸不到 cancel 入口——注册停止闭包，让用户 stop 能立刻打进本轮（及递归后续轮）。
   // isCancelled 只能感知「旧 run 的 cancel」，感知不到 stop 对已摘除实例的操作。
   let stoppedByUser = false;
@@ -1409,16 +1520,42 @@ const runReconnectAttempt = async (
   staleInstanceId: number | undefined,
 ): Promise<boolean> => {
   const task = fresh;
-  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：重连系统通知（旧实例已摘、新实例未生）
-  await writeEventAndPublish(task.id, {
-    kind: "info",
-    text: `连接中断、正在自动重连（第 ${attempt}/${RECONNECT_MAX} 次）…`,
-    meta: { kind: "reconnecting", attempt, max: RECONNECT_MAX },
-  });
+  // preamble 授权收紧——仅「map 里仍是本 stale instance」才落盘；
+  // map 空（forceClear / B checkpoint 半程 / 本轮已自摘）无干净判据区分「重连空窗」与
+  // 「B 启动空窗」，降级 console.log 不污染 B 时间线（持槽才落盘；map 空/失主则降级日志）。
+  const curBeforePreamble = runningChats.get(task.id);
+  const stillOwnsSlot =
+    staleInstanceId !== undefined &&
+    !!curBeforePreamble &&
+    curBeforePreamble.instanceId === staleInstanceId;
+  if (
+    curBeforePreamble &&
+    staleInstanceId !== undefined &&
+    curBeforePreamble.instanceId !== staleInstanceId
+  ) {
+    console.warn(
+      `[chat-runner] task=${task.id} 自动重连 preamble 让位：表内已是新会话实例` +
+        `（stale=#${staleInstanceId}、current=#${curBeforePreamble.instanceId}）`,
+    );
+    return true;
+  }
+  if (stillOwnsSlot) {
+    // eslint-disable-next-line no-restricted-syntax -- 持槽才落盘的重连系统通知
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      text: `连接中断、正在自动重连（第 ${attempt}/${RECONNECT_MAX} 次）…`,
+      meta: { kind: "reconnecting", attempt, max: RECONNECT_MAX },
+    });
+  } else {
+    console.log(
+      `[chat-runner] task=${task.id} 自动重连（第 ${attempt}/${RECONNECT_MAX} 次）` +
+        `——map 空/失主，preamble 不落盘`,
+    );
+  }
   if (await sleepWithCancel(RECONNECT_BACKOFF_MS[attempt - 1], isCancelled)) {
     return false;
   }
-  // 复审 H2/J1：退避醒来后用户可能已另起新会话（resume 同持久化 agent 时 agentId
+  // /J1：退避醒来后用户可能已另起新会话（resume 同持久化 agent 时 agentId
   // 相同、instanceId 必不同）——让位，绝不 close 别人的会话
   // （return true = 已接管善后，consumeChatRun 不再走 handleChatRunFailure）
   const cur = runningChats.get(task.id);
@@ -1439,7 +1576,7 @@ const runReconnectAttempt = async (
   }
   const creds = await readServerChatCreds();
   if (!creds) return false;
-  // 复审 G1：重连方是 reconnect prompt 的 owner——认领首发，排队消息等本 run 结束后统一 flush
+  // 重连方是 reconnect prompt 的 owner——认领首发，排队消息等本 run 结束后统一 flush
   const claimedInstanceId = await resumeChatSession(fresh, creds, {
     claimRun: true,
   }).catch(() => null);
@@ -1453,10 +1590,10 @@ const runReconnectAttempt = async (
     );
   }
   const rec = runningChats.get(task.id);
-  // 复审 K1：owner 只操作自己 claim 的实例——注册后若已被替换（同 tick 内理论不可能、
+  // owner 只操作自己 claim 的实例——注册后若已被替换（同 tick 内理论不可能、
   // 防御性校验），绝不向别人的实例发 reconnect prompt。无 rec 则无认领泄漏。
   if (!rec?.agent || rec.instanceId !== claimedInstanceId) return false;
-  // M1 延伸：stop 到达于 Agent.resume await 期间（当时表内无 record、只有停止闭包
+  // stop 到达于 Agent.resume await 期间（当时表内无 record、只有停止闭包
   // 能收到信号）→ 刚注册出的 claim 是僵尸（runActive=true 永久假 busy）——
   // 立即关闭让 stop 生效，绝不发 reconnect prompt。
   if (isCancelled()) {
@@ -1477,11 +1614,11 @@ const runReconnectAttempt = async (
       promptBytes: Buffer.byteLength(reconnectPrompt, "utf-8"),
     });
     // 认领已在 resume 注册时完成（runActive=true），勿等 send 后再置——
-    // 否则 flush / 并发 send 可插在 reconnect prompt 之前（复审 G1 点名的晚置位窗口）
+    // 否则 flush / 并发 send 可插在 reconnect prompt 之前（ 点名的晚置位窗口）
     const run = await rec.agent.send(reconnectPrompt, {
       onDelta: composeOnDelta(
         perfTracker.onDelta,
-        // R26-6：重连 shell delta 绑 claimedInstanceId
+        // 重连 shell delta 绑 claimedInstanceId
         createShellOutputDeltaPublisher(
           task.id,
           () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
@@ -1490,7 +1627,7 @@ const runReconnectAttempt = async (
       onStep: perfTracker.onStep,
     });
     perfTracker.attachRun(run);
-    // M1（第十轮复审）：send pending 期间用户 stop（claim cancel 已摘表）或实例被
+    // send pending 期间用户 stop（claim cancel 已摘表）或实例被
     // forceClear 替换 → 丢弃迟到 run，绝不写「重连成功」再把 AI 拉起来。
     // stop 方 / 新实例已各自负责收尾，返 true 跳过失败路径。
     const curAfterSend = runningChats.get(task.id);
@@ -1509,7 +1646,7 @@ const runReconnectAttempt = async (
       );
       return true;
     }
-    // R27-6：owner 语境（重连链、send 后已验实例）——claimedInstanceId lease
+    // owner 语境（重连链、send 后已验实例）——claimedInstanceId lease
     await writeOwnedEventAndPublish(
       task.id,
       () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
@@ -1522,12 +1659,12 @@ const runReconnectAttempt = async (
     await consumeChatRun(fresh, run, undefined, attempt);
     return true;
   } catch (sendErr) {
-    // M1：send pending 期间被用户 stop（claim cancel 已摘表 + 落标记）、随后 send
+    // send pending 期间被用户 stop（claim cancel 已摘表 + 落标记）、随后 send
     // 抛错 → 不得再退避重试把会话复活；stop 方已收尾，直接接管返 true。
     if (consumeChatClaimCancelled(task.id, claimedInstanceId)) {
       return true;
     }
-    // 复审 H2：勿只清 runActive 留下 idle 会话进退避——第三方 chat-reply 会当可用会话
+    // 勿只清 runActive 留下 idle 会话进退避——第三方 chat-reply 会当可用会话
     // 起 run，重试醒来再无条件 close「当前会话」会把用户刚起的 run 关掉。
     // 立即按 instanceId 摘出表（keepPersisted 留锚点），退避窗口内无可被占用的 idle 会话。
     closeChatSession(task.id, rec.instanceId, { keepPersisted: true });
@@ -1543,38 +1680,130 @@ const runReconnectAttempt = async (
 
 // ----------------- V0.11：chat run 消费管道（首个 run + 后续 send 共用） -----------------
 
-// run 失败的统一收尾：关会话 + 标 error + 事件 + publish
-// expectedInstanceId：旧 run 收尾带上实例门控；已被新会话顶替则整段 no-op（防误标 error / 误关）
+/** finalize 收尾 outcome */
+type FinalizeChatOutcome = "finished" | "cancelled" | "error";
+
+/** finalize 上下文（error 携带原始异常） */
+type FinalizeChatRunCtx = {
+  task: Task;
+  err?: unknown;
+};
+
+/**
+ * chat run 收尾唯一入口——所有 status/queue/session/done/error/compact/flush
+ * 共享写只有在「runningChats 当前记录仍是本 instanceId」的 CAS 下执行；
+ * 失主（含 map 为空——forceClear 空窗不是授权）一律 no-op 只清本地。
+ *
+ * @returns true = 本实例仍是当前主并完成收尾；false = 失主 no-op
+ */
+const finalizeChatRunIfCurrent = async (
+  taskId: string,
+  instanceId: number,
+  outcome: FinalizeChatOutcome,
+  ctx: FinalizeChatRunCtx,
+): Promise<boolean> => {
+  // 插桩在 CAS 之前：测试按此名注入 forceClear + B 启动
+  await failpoint("chat.beforeFinalize");
+
+  const rec = runningChats.get(taskId);
+  // map 为空返回 false——旧代码把「close 失败且 map 空」当有权收尾，正是 fail-open
+  if (!rec || rec.instanceId !== instanceId) {
+    return false;
+  }
+
+  const isCurrent = (): boolean =>
+    runningChats.get(taskId)?.instanceId === instanceId;
+
+  if (outcome === "finished") {
+    // 自然结束：会话保留，只归位 awaiting_user + done + compact/flush
+    rec.runActive = false;
+    rec.lastActiveAt = Date.now();
+    const doneTask = await setTaskRunStatusIfRunOwner(
+      taskId,
+      "awaiting_user",
+      isCurrent,
+    );
+    // 写盘 await 后失主 → 不 publish / 不 compact（避免清 B 前端 streaming）
+    if (!isCurrent()) return false;
+    if (doneTask) publish(taskId, { kind: "task", task: doneTask });
+    publish(taskId, {
+      kind: "done",
+      task: doneTask ?? ctx.task,
+      ok: true,
+    });
+    void maybeAutoCompactThenFlush(taskId);
+    return true;
+  }
+
+  if (outcome === "cancelled") {
+    // 先条件写 idle（仍持 map 条目供 isOwner），再清队 / 关会话 / publish
+    const cancelledTask = await setTaskRunStatusIfRunOwner(
+      taskId,
+      "idle",
+      isCurrent,
+    );
+    if (!isCurrent()) return false;
+    // cancelled 清队走唯一 sink（queue_failed + recentSettled）
+    failQueuedItems(taskId, { reason: "cancelled" });
+    const closed = closeChatSession(taskId, instanceId);
+    if (!closed) return false;
+    if (cancelledTask) publish(taskId, { kind: "task", task: cancelledTask });
+    publish(taskId, {
+      kind: "done",
+      task: cancelledTask ?? ctx.task,
+      ok: true,
+    });
+    return true;
+  }
+
+  // outcome === "error"
+  // run 失败可能是「缓存 ok 期间 MCP 挂了」——清探测缓存、用户重试时必真探
+  invalidateMcpProbeCache();
+  const message =
+    ctx.err instanceof Error ? ctx.err.message : String(ctx.err ?? "");
+  const failure = summarizeRunFailure(message, ctx.err);
+  const eventText = failure.isConnectionDrop
+    ? failure.text
+    : `Chat agent 异常：${failure.text}`;
+  // 失败事件走 owned sink——失主不落盘不 publish
+  await writeOwnedEventAndPublish(taskId, isCurrent, {
+    kind: "error",
+    text: eventText,
+    meta: { detail: failure.detail },
+  });
+  if (!isCurrent()) return false;
+  const errorTask = await setTaskRunStatusIfRunOwner(
+    taskId,
+    "error",
+    isCurrent,
+  );
+  if (!isCurrent()) return false;
+  // error 清队走唯一 sink（queue_failed + recentSettled）
+  failQueuedItems(taskId, { reason: "error" });
+  const closed = closeChatSession(taskId, instanceId);
+  if (!closed) return false;
+  // 关会话后不再 await getTask——避免空窗里 B 已启动却仍 publish done 清其 streaming
+  if (errorTask) publish(taskId, { kind: "task", task: errorTask });
+  publish(taskId, {
+    kind: "done",
+    task: errorTask ?? ctx.task,
+    ok: false,
+  });
+  publish(taskId, { kind: "error", message: eventText });
+  return true;
+};
+
+// run 失败的统一收尾：收口到 finalizeChatRunIfCurrent
+// expectedInstanceId：旧 run 收尾带上实例门控；失主（含 map 空）整段 no-op
 const handleChatRunFailure = async (
   task: Task,
   err: unknown,
   expectedInstanceId?: number,
 ): Promise<void> => {
-  const message = err instanceof Error ? err.message : String(err);
   console.error("[chat-runner] task", task.id, "failed:", err);
-  // run 失败可能是「缓存 ok 期间 MCP 挂了」——清探测缓存、用户重试时必真探（同 task-runner）
-  invalidateMcpProbeCache();
-  const closed = closeChatSession(task.id, expectedInstanceId);
-  // 门控拒绝且新会话已就位 → 跳过；表已空（forceClear 后）→ 仍落 error（旧行为）
-  if (!closed && runningChats.has(task.id)) return;
-  // 归一成给用户看的文案：长连接被断（最常见）→ 友好一句话、不加吓人前缀；
-  // 其它有诊断的错 → 带详情、加「异常」前缀（跟 task-runner 对齐）。原始 err 已 console.error。
-  const failure = summarizeRunFailure(message, err);
-  const eventText = failure.isConnectionDrop
-    ? failure.text
-    : `Chat agent 异常：${failure.text}`;
-  // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：失败收尾（上方 closeChatSession instanceId 门控已保证不误伤新会话、会话已摘无实例可绑）
-  await writeEventAndPublish(task.id, {
-    kind: "error",
-    text: eventText,
-    // 原始诊断落 meta（UI 不展示、事后从 events.jsonl 定位额度 vs 连接断）
-    meta: { detail: failure.detail },
-  });
-  const errorTask = await setTaskRunStatus(task.id, "error");
-  if (errorTask) publish(task.id, { kind: "task", task: errorTask });
-  const finalTask = await getTask(task.id);
-  publish(task.id, { kind: "done", task: finalTask ?? task, ok: false });
-  publish(task.id, { kind: "error", message: eventText });
+  // 无 instance 哨兵 -1：CAS 永不匹配，避免无门控裸收尾
+  const instanceId = expectedInstanceId ?? -1;
+  await finalizeChatRunIfCurrent(task.id, instanceId, "error", { task, err });
 };
 
 /**
@@ -1592,7 +1821,7 @@ const consumeChatRun = async (
   let cancelled = false;
   let hardTimer: NodeJS.Timeout | null = null;
   const rec = runningChats.get(task.id);
-  // R27-6：捕获本 run 的 instanceId lease——forceClear/懒重启换新会话后，
+  // 捕获本 run 的 instanceId lease——forceClear/懒重启换新会话后，
   // 旧 run 迟到 yield 的主消息流（thinking/assistant/tool/flush）全部被拦、
   // 不再 append/publish 污染 B 的 events.jsonl（rec 缺失用 -1 哨兵 = 永不匹配）。
   const myInstanceId = rec ? rec.instanceId : -1;
@@ -1619,7 +1848,7 @@ const consumeChatRun = async (
         const trimmed = ctx.buffer.trim();
         ctx.buffer = "";
         if (trimmed.length === 0) return;
-        // R27-6：flush 走 owned sink——本实例已被摘除/替换则不落盘
+        // flush 走 owned sink——本实例已被摘除/替换则不落盘
         await writeOwnedEventAndPublish(task.id, chatLease, {
           kind: "assistant_message",
           text: trimmed,
@@ -1638,7 +1867,7 @@ const consumeChatRun = async (
         );
       }
       // handleSdkMessage 内部已在 thinking / tool_call case 自己 flush buffer
-      // R27-6：chat 主消息流接 instanceId lease（缺省 opHandle ≠ 永远 current 的语义已删）
+      // chat 主消息流接 instanceId lease（缺省 opHandle ≠ 永远 current 的语义已删）
       await handleSdkMessage(task.id, msg, ctx, chatLease);
     }
     await ctx.flush();
@@ -1651,18 +1880,10 @@ const consumeChatRun = async (
     const result = await run.wait();
 
     if (cancelled || externallyCancelled?.() || result.status === "cancelled") {
-      // cancel 收尾：关会话 + 归位 idle + publish done、不落 info——
-      // 用户主动停时 /stop route 已落「用户停止了对话」、这里再落会重复。
-      // 带本 run 实例号：切模型 forceClear 后新会话已注册则门控拒绝且表非空 → 跳过
-      // （rec 缺失时传 -1 = 永不匹配的哨兵，绝不无门控关别人的会话）
-      // 复审（11 轮）：clearChatQueue 必须在实例门控之后——迟到的旧 run 收尾
-      // 不得清掉新会话（forceClear 换新后）刚积累的队列。
-      const closed = closeChatSession(task.id, rec ? rec.instanceId : -1);
-      if (!closed && runningChats.has(task.id)) return;
-      clearChatQueue(task.id);
-      const cancelledTask = await setTaskRunStatus(task.id, "idle");
-      if (cancelledTask) publish(task.id, { kind: "task", task: cancelledTask });
-      publish(task.id, { kind: "done", task: cancelledTask ?? task, ok: true });
+      // cancel 收尾唯一入口——失主（含 forceClear 空窗）no-op
+      await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+        task,
+      });
       return;
     }
 
@@ -1679,47 +1900,32 @@ const consumeChatRun = async (
       );
     }
 
-    // 自然 finished：agent 答完这轮、等用户下一条（会话保留、send 续接）
-    if (rec) {
-      rec.runActive = false;
-      rec.lastActiveAt = Date.now();
-    }
-    const doneTask = await setTaskRunStatus(task.id, "awaiting_user");
-    if (doneTask) publish(task.id, { kind: "task", task: doneTask });
-    publish(task.id, { kind: "done", task: doneTask ?? task, ok: true });
-
-    // 超阈值 → 自动 compact（期间消息进队列）；否则直接 dequeue
-    void maybeAutoCompactThenFlush(task.id);
+    // 自然 finished 也必须查 instance——旧实现完全不查、空窗可覆盖 B
+    await finalizeChatRunIfCurrent(task.id, myInstanceId, "finished", {
+      task,
+    });
   } catch (err) {
     if (hardTimer) clearTimeout(hardTimer);
-    // 失败路径清排队，避免会话已死后积压消息幽灵发送。
-    // 复审（11 轮）：带实例门控——表内已是新实例（forceClear 换新等）时，
-    // 迟到的旧 run 失败收尾不得清新会话的队列。
-    const curOnFail = runningChats.get(task.id);
-    if (!curOnFail || (rec && curOnFail.instanceId === rec.instanceId)) {
-      clearChatQueue(task.id);
-    }
-    // 复审（11 轮）：用户 stop 后 stream 以异常收场（abort 类）→ 走 cancel 收尾，
+    // 用户 stop 后 stream 以异常收场（abort 类）→ 走 cancel 收尾，
     // 绝不落 error 事件 / error 状态覆盖 stop 路由已写的 idle +「用户停止了对话」。
     if (cancelled || externallyCancelled?.()) {
-      const closed = closeChatSession(task.id, rec ? rec.instanceId : -1);
-      if (!closed && runningChats.has(task.id)) return;
-      const cancelledTask = await setTaskRunStatus(task.id, "idle");
-      if (cancelledTask) publish(task.id, { kind: "task", task: cancelledTask });
-      publish(task.id, { kind: "done", task: cancelledTask ?? task, ok: true });
+      await finalizeChatRunIfCurrent(task.id, myInstanceId, "cancelled", {
+        task,
+      });
       return;
     }
     // V0.13.x：网络类失败先自动重连（重试 5 次、事件流显示「重连中」）
-    // 复审 H2/J1：传入本 run 的 instanceId 作 staleInstanceId（rec 可能已不在表，用入口捕获的）
+    // /J1：传入本 run 的 instanceId 作 staleInstanceId
+    // 清队挪进 finalize error/cancelled——重连路径不再 fail-open 清队
     const handled = await tryChatAutoReconnect(
       task,
       err,
       reconnectAttempt + 1,
       () => cancelled || !!externallyCancelled?.(),
-      rec?.instanceId,
+      myInstanceId >= 0 ? myInstanceId : undefined,
     );
     if (!handled) {
-      await handleChatRunFailure(task, err, rec ? rec.instanceId : -1);
+      await handleChatRunFailure(task, err, myInstanceId);
     }
   }
 };
@@ -1727,7 +1933,7 @@ const consumeChatRun = async (
 // ----------------- V0.11：sendChatMessage（续接存活会话） -----------------
 
 /**
- * sendChatMessage 的结构化结果（复审 L2）。
+ * sendChatMessage 的结构化结果（）。
  * why 不是布尔：owner claim 被 stop 摘除 / 实例被替换时，send 返 false 会被
  * chat-reply 当「普通无会话故障」降级到 mode 2 起新会话——AI 在「用户已停止」
  * 之后又开始跑。取消必须是不可降级重试的终态，调用方要能区分：
@@ -1750,7 +1956,7 @@ export type SendChatMessageResult =
  * 把用户新消息发给存活的 chat 会话（`agent.send`）、消费产生的新 run。
  *
  * @param opts.ownerInstanceId resume(claimRun) 的 owner 所持 claim 绑定的实例号。
- *   复审 K1：claim 是实例化 token，不是布尔——传入后要求当前 record.instanceId
+ *   claim 是实例化 token，不是布尔——传入后要求当前 record.instanceId
  *   精确匹配才允许跳过 runActive 早退；不匹配（claim 实例已被 stop 摘除 /
  *   forceClear 换新）时整段 no-op：不 send、不碰当前 record、也没有可
  *   释放的 claim。匹配场景下所有非 sent 的早退路径必须先释放认领，
@@ -1766,10 +1972,10 @@ export const sendChatMessage = async (
 ): Promise<SendChatMessageResult> => {
   const ownerInstanceId = opts?.ownerInstanceId;
   const rec = runningChats.get(task.id);
-  // 复审 K1：owner 的实例校验放在一切副作用之前——当前 record 不是原 claim 实例
+  // owner 的实例校验放在一切副作用之前——当前 record 不是原 claim 实例
   //（stop 已摘除 / 懒重启 forceClear 后换成新实例）时，旧 owner 不得越权发送、
   // 不得动新实例的任何状态；claim 已随原实例消亡，无需也不能 release。
-  // 复审 L2：区分「用户 stop」（cancelled 标记命中）与「实例被替换」——两者对
+  // 区分「用户 stop」（cancelled 标记命中）与「实例被替换」——两者对
   // 调用方都是终态，但文案 / 语义不同。
   if (
     ownerInstanceId !== undefined &&
@@ -1790,7 +1996,7 @@ export const sendChatMessage = async (
   const isOwner = ownerInstanceId !== undefined; // 至此已通过实例精确匹配
 
   /** owner 认领释放：仅非 sent 早退路径；send 抛错会 close 会话无需额外处理。
-   * 统一走 releaseChatRunClaim（复审 H1 handoff：释放 = 接管排队 drain 义务）。 */
+   * 统一走 releaseChatRunClaim（ handoff：释放 = 接管排队 drain 义务）。 */
   const releaseOwnerClaimIfNeeded = (): void => {
     if (ownerInstanceId === undefined) return;
     releaseChatRunClaim(task.id, ownerInstanceId);
@@ -1820,7 +2026,7 @@ export const sendChatMessage = async (
   // owner 认领场景：已是 true，再赋一次幂等
   rec.runActive = true;
 
-  // M1（第十轮复审）：`agent.send()` 是 await 点——用户可在 promise pending 期间 stop。
+  // `agent.send()` 是 await 点——用户可在 promise pending 期间 stop。
   // claim 型 record 的 cancel 会摘除实例（resolve 后表复查可见）；但普通 record 的
   // cancel 只是上一轮 run 的旧闭包，record 仍在表内、表复查捕捉不到——必须在这里
   // 接力：包装 cancel 记录取消信号，run 一旦可用立即补 cancel，保证 stop 发生在
@@ -1867,7 +2073,7 @@ export const sendChatMessage = async (
     run = await rec.agent.send(prompt, {
       onDelta: composeOnDelta(
         perfTracker.onDelta,
-        // R26-6：follow-up shell delta 绑 rec.instanceId
+        // follow-up shell delta 绑 rec.instanceId
         createShellOutputDeltaPublisher(
           task.id,
           () => runningChats.get(task.id)?.instanceId === rec.instanceId,
@@ -1882,7 +2088,7 @@ export const sendChatMessage = async (
     rec.runActive = false;
     console.error(`[chat-runner] sendChatMessage: task=${task.id} send 失败`, err);
     closeChatSession(task.id, rec.instanceId);
-    // M1：send pending 期间被用户 stop、随后 send 又抛错 → 终态 cancelled，
+    // send pending 期间被用户 stop、随后 send 又抛错 → 终态 cancelled，
     // 绝不能返 send_failed 让 chat-reply 落 mode 2 把消息重放出去
     if (cancelledDuringSend) {
       consumeChatClaimCancelled(task.id, rec.instanceId);
@@ -1891,7 +2097,7 @@ export const sendChatMessage = async (
     return "send_failed";
   }
 
-  // M1（第十轮复审）：send resolve 后、任何 task 状态 / consume 副作用之前，
+  // send resolve 后、任何 task 状态 / consume 副作用之前，
   // 复查取消信号与内存实例——stop / forceClear 可发生在上面 await 期间。
   // 命中则丢弃迟到 run（best-effort cancel），绝不能把 runStatus 重新置 running。
   const curAfterSend = runningChats.get(task.id);
@@ -1915,8 +2121,19 @@ export const sendChatMessage = async (
 
   // 切 running + fire-and-forget 消费
   //（此 await 期间若 stop：共享取消闭包已持 acceptedRun、会直接 cancel run）
-  const runningTask = await setTaskRunStatus(task.id, "running");
-  // M1 补丁（11 轮复审）：上面 await 期间 stop / forceClear 仍可到达——此时
+  // agent.send 已成功 = 消息已交给 agent；status 写失败不得让 flush 把本条当未送达
+  let runningTask: Task | null = null;
+  try {
+    runningTask = await setTaskRunStatus(task.id, "running");
+  } catch (statusErr) {
+    console.error(
+      `[chat-runner] sendChatMessage: task=${task.id} 置 running 失败（agent 已受理）:`,
+      statusErr,
+    );
+    void consumeChatRun(task, run);
+    return "sent";
+  }
+  // 上面 await 期间 stop / forceClear 仍可到达——此时
   // consumeChatRun 尚未接管（rec.cancel 还是共享闭包），若不复查就 return "sent"，
   // 会出现「已停止仍落已发送气泡」且刚写入的 running 覆盖 stop 的 idle。
   const curAfterStatus = runningChats.get(task.id);
@@ -1927,11 +2144,14 @@ export const sendChatMessage = async (
     if (!goneAfterStatus) closeChatSession(task.id, rec.instanceId);
     const wasCancelled =
       consumeChatClaimCancelled(task.id, rec.instanceId) || cancelledDuringSend;
-    // 撤销刚写入的 running（可能盖掉了 stop 落的 idle）；有新实例接管则不动它的状态
-    if (!runningChats.has(task.id)) {
-      const idleTask = await setTaskRunStatus(task.id, "idle");
-      if (idleTask) publish(task.id, { kind: "task", task: idleTask });
-    }
+    // 回滚 idle 与 finalize 同口径——条件进锁内/finalGuard，提交瞬间复查 map 仍空；
+    // 跨 await 空窗里 B 已写 running 则拒写（旧实现快照 !has 后再 await 会盖掉 B）
+    const idleTask = await setTaskRunStatusIfRunOwner(
+      task.id,
+      "idle",
+      () => !runningChats.has(task.id),
+    );
+    if (idleTask) publish(task.id, { kind: "task", task: idleTask });
     console.warn(
       `[chat-runner] sendChatMessage: task=${task.id} 置 running 期间实例 #${rec.instanceId} 已被${wasCancelled ? "停止" : "替换"}、丢弃迟到 run`,
     );
@@ -1958,7 +2178,7 @@ export const deliverChatAskReply = async (
   imagePaths?: string[],
   bootArgs?: { apiKey?: string; model?: ModelSelection },
 ): Promise<boolean> => {
-  // 复审（11 轮）：compact / rewind 窗口内会话可能刚被关（重建中）——此时绝不能
+  // compact / rewind 窗口内会话可能刚被关（重建中）——此时绝不能
   // 走下面 resume / 起新会话与 compact 重建打架，直接返 false 让用户稍后用输入条答复
   if (isChatCompactInProgress(task.id) || isChatRewindInProgress(task.id)) {
     return false;
@@ -1967,10 +2187,10 @@ export const deliverChatAskReply = async (
   if (hasChatSession(task.id)) {
     const sent = await sendChatMessage(task, replyText, imagePaths);
     if (sent === "sent") return true;
-    // M1/L2：send pending 期间被 stop / 实例被替换 → 终态，
+    // send pending 期间被 stop / 实例被替换 → 终态，
     // 不得落到下面 resume / 新会话把答案在「已停止」之后重放
     if (sent === "cancelled" || sent === "owner_invalid") return false;
-    // 复审（11 轮）：busy（run 在跑）→ 终止而非降级，防答案绕过在跑的 run 干扰会话；
+    // busy（run 在跑）→ 终止而非降级，防答案绕过在跑的 run 干扰会话；
     // 用户可等本轮结束后重发（ask 卡片仍在）
     if (sent === "busy") return false;
     // send_failed（已 close 会话）/ no_session → 落到下面 resume / 新会话
@@ -1983,7 +2203,7 @@ export const deliverChatAskReply = async (
       : undefined;
 
   // 2) 服务重启 / 空闲回收后：Agent.resume 接回再 send
-  // 复审 G1：本路径是 ask 答案的 owner——claimRun + ownerInstanceId，先发答案再 flush 队列
+  // 本路径是 ask 答案的 owner——claimRun + ownerInstanceId，先发答案再 flush 队列
   if (task.sessionAgentId && apiKey && model && !hasChatSession(task.id)) {
     const claimedInstanceId = await resumeChatSession(task, { apiKey, model }, {
       claimRun: true,
@@ -2011,7 +2231,7 @@ export const deliverChatAskReply = async (
     return (await sendChatMessage(task, replyText, imagePaths)) === "sent";
   }
 
-  // P1 #6 / S1：与 chat-reply 模式 2 同口径——起新会话前同步占启动 lease，
+  // 与 chat-reply 模式 2 同口径——起新会话前同步占启动 lease，
   // 失败则复查会话再试 send（别处可能刚起完）、仍失败返 false
   const startToken = tryReserveChatStart(task.id);
   if (startToken === null) {
@@ -2022,7 +2242,7 @@ export const deliverChatAskReply = async (
   }
 
   try {
-    // S1：await 后复查 lease（stop 可能发生在 setTaskRunStatus 之前）
+    // await 后复查 lease（stop 可能发生在 setTaskRunStatus 之前）
     if (!isChatStartLeaseValid(task.id, startToken)) return false;
     const runningTask = await setTaskRunStatus(task.id, "running");
     if (!runningTask || !isChatStartLeaseValid(task.id, startToken)) {
@@ -2066,18 +2286,18 @@ export const deliverChatAskReply = async (
  * 入口先查 rewind 门闩、再置 drainingQueues（在 dequeue 之前）——与 rewind 侧
  *「begin 门闩后复查 draining」交叉闭合：要么 flush 先置 draining（rewind 复查看到、
  * 拒绝回退），要么 rewind 先占门闩（本入口看到、不启动 drain）。chat-reply 见
- * draining 标记则入队，保证已排队消息不被新消息插队（P2 #8）。
+ * draining 标记则入队，保证已排队消息不被新消息插队。
  * 「塞回队首 + return」也经 finally 清位；塞回前比对 generation，防 stop/rewind
  * 清队后旧消息复活。
  *
- * export for tests：T4 single-flight / FIFO 定向测试直接调此入口。
+ * export for tests： single-flight / FIFO 定向测试直接调此入口。
  */
 export const flushChatQueue = async (taskId: string): Promise<void> => {
   // 与 rewind begin→复查 draining 配对：门闩已占则绝不 dequeue，避免「队列已空
   // → rewind 复查放行」与随后 checkpoint/send 并发
   if (isChatRewindInProgress(taskId)) return;
 
-  // T4：per-task 单 owner drain——非 owner 直接返回，防双 drain 并发 dequeue
+  // per-task 单 owner drain——非 owner 直接返回，防双 drain 并发 dequeue
   // 破坏 FIFO / 两个 finally 提前清 draining 标记。Node 单线程：同步
   // check-and-set（第一个 await 之前）即原子。
   // 配套：compact finally 的 void flush 与 maybeAutoCompactThenFlush catch 的
@@ -2096,6 +2316,21 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           `[chat-runner] flushChatQueue task=${taskId} 丢弃已作废消息（${reason}）：` +
             `generation 已变 ${genAtDequeue}→${getChatQueueGeneration(taskId)}`,
         );
+        // generation 已变且仅 persisted → 补明确 failed（禁止 delivered 假账）
+        if (
+          msg.itemId &&
+          msg.skipPersistEvent &&
+          !isMessageOperationTerminal(taskId, msg.itemId)
+        ) {
+          settleMessageFailed(taskId, msg.itemId, "stopped");
+        }
+        return;
+      }
+      // 已 handedOff/failed 不得重排
+      if (msg.itemId && isMessageOperationTerminal(taskId, msg.itemId)) {
+        console.warn(
+          `[chat-runner] flushChatQueue task=${taskId} 跳过重排（已终态）：${reason}`,
+        );
         return;
       }
       enqueueChatMessageFront(taskId, msg);
@@ -2103,12 +2338,17 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
 
     const msg = dequeueChatMessage(taskId);
     if (!msg) return;
-    // S4（十二轮）：dequeue 后立即占 in-flight，直到本条出路（成功/塞回/作废/清队）
-    beginChatQueueInFlight(taskId);
+    // dequeue 后立即占 in-flight，直到本条出路（成功/塞回/作废/清队）
+    // 挂 itemId，bootstrap queue_state 不把正当 in-flight 误判成幽灵
+    beginChatQueueInFlight(taskId, msg.itemId);
     try {
       const task = await getTask(taskId);
       if (!task || task.mode !== "chat") {
-        clearChatQueue(taskId);
+        // 任务消失 / 非 chat → 唯一入口 failQueuedItems（queue_failed）
+        failQueuedItems(taskId, {
+          reason: "task_gone",
+          currentItemId: msg.itemId,
+        });
         return;
       }
       // 无存活会话 → 清队列（没法按序送达）；compact 窗口例外：塞回队首等 compact 完再 flush
@@ -2117,21 +2357,24 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           requeueIfSameGen(msg, "compact 例外塞回");
           return;
         }
-        // 复审 F2：compact 中途失败（重建会话失败等）导致会话消失时，清队不再静默——
-        // 至少写一条 info，让用户知道排队消息未送达。+1 含本轮已 dequeue 的这条。
-        const n = getChatQueueCount(taskId) + 1;
-        clearChatQueue(taskId);
-        try {
-          // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
-          await writeEventAndPublish(taskId, {
-            kind: "info",
-            text: `会话已关闭，${n} 条排队消息未送达、请重新发送`,
-          });
-        } catch (err) {
-          console.warn(
-            `[chat-runner] flushChatQueue task=${taskId} 清队通知失败:`,
-            err,
-          );
+        // 会话消失清整队走 failQueuedItems（带 itemIds 终态），info 仍 best-effort
+        const failedIds = failQueuedItems(taskId, {
+          reason: "no_session",
+          currentItemId: msg.itemId,
+        });
+        if (failedIds.length > 0) {
+          try {
+            // eslint-disable-next-line no-restricted-syntax -- 豁免：清队系统通知（会话已关、无实例可绑）
+            await writeEventAndPublish(taskId, {
+              kind: "info",
+              text: `会话已关闭，${failedIds.length} 条排队消息未送达、请重新发送`,
+            });
+          } catch (err) {
+            console.warn(
+              `[chat-runner] flushChatQueue task=${taskId} 清队通知失败:`,
+              err,
+            );
+          }
         }
         return;
       }
@@ -2140,10 +2383,12 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         return;
       }
 
-      // 本条是否已送达（send 成功后 appendEvent 等再抛错时，清队文案不应把它算成未送达）
+      // 本条是否已送达（send 成功后后续步骤再抛错时，清队文案不应把它算成未送达）
       let delivered = false;
+      // user_reply 是否已落盘——send 失败塞回时必须 skipPersistEvent，防重复气泡
+      let replyPersisted = !!msg.skipPersistEvent;
       try {
-        // checkpoint 与 chat-reply 同口径：绑仓才打
+        // checkpoint 与 chat-reply 同口径：绑仓才打（快照须在 agent 开工前）
         let capture = {
           ok: false as boolean,
           repoSnapshots: [] as Awaited<
@@ -2156,6 +2401,76 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           capture = await captureChatCheckpoint(task.repoPaths);
         }
 
+        // 先落盘再 send——堵死「agent 已收到、磁盘/UI 无记录」出口。
+        // checkpoint 绑 user_reply 事件 id：先落盘再 persistCheckpoint 反而更正确。
+        // 入队方已落过 user_reply（skipPersistEvent）→ 跳过重复气泡 / checkpoint。
+        if (!msg.skipPersistEvent) {
+          // extraMeta（飞书 source / feishuMessageId）浅合并进 user_reply.meta
+          const meta: Record<string, unknown> = { ...(msg.extraMeta ?? {}) };
+          if (msg.savedImages && msg.savedImages.length > 0) {
+            meta.images = msg.savedImages;
+          }
+          if (msg.attachmentMetas && msg.attachmentMetas.length > 0) {
+            meta.attachments = msg.attachmentMetas;
+          }
+          if (capture.ok) meta.checkpointed = true;
+          // 落盘 meta 带 queueItemId，前端 pending 按 id 对账（不靠文案猜）
+          meta.queueItemId = msg.itemId;
+          let replyEvent;
+          try {
+            replyEvent = await writeUserEventAndPublishStrict(taskId, {
+              kind: "user_reply",
+              text: msg.displayText,
+              meta,
+            });
+          } catch (persistErr) {
+            // strict 抛错（EIO 等）→ 不 send、不自旋；走唯一入口 failQueuedItems
+            // durable 警告可能与原 append 同盘失败——控制帧不依赖落盘。
+            console.error(
+              `[chat-runner] flushChatQueue 落盘失败 task=${taskId}:`,
+              persistErr,
+            );
+            failQueuedItems(taskId, {
+              reason: "persist_failed",
+              currentItemId: msg.itemId,
+            });
+            const preview = msg.displayText.slice(0, 50);
+            try {
+              // eslint-disable-next-line no-restricted-syntax -- 落盘失败警告（best-effort 吞错）
+              await writeEventAndPublish(taskId, {
+                kind: "info",
+                text: `消息保存失败、未发送：${preview}`,
+              });
+            } catch (warnErr) {
+              console.warn(
+                `[chat-runner] flushChatQueue task=${taskId} 落盘失败警告写失败:`,
+                warnErr,
+              );
+            }
+            return;
+          }
+          if (!replyEvent) {
+            // ENOENT（任务目录已删）→ failQueuedItems，尾队列也有 id 化终态
+            failQueuedItems(taskId, {
+              reason: "task_gone",
+              currentItemId: msg.itemId,
+            });
+            return;
+          }
+          replyPersisted = true;
+          // 落盘只到 persisted；handoff（send===sent）后才 delivered
+          if (msg.itemId) markMessagePersisted(taskId, msg.itemId);
+          if (capture.ok) {
+            await persistCheckpointForReply(taskId, replyEvent.id, capture);
+          }
+        } else if (msg.itemId) {
+          // skipPersistEvent：入队方已落盘 → 仍是 persisted
+          markMessagePersisted(taskId, msg.itemId);
+        }
+
+        // 测试可在 persisted 后、send 前挂起（注入 stop / owner 失效）
+        await failpoint("flushChatQueue.afterPersist");
+
         const sent = await sendChatMessage(
           task,
           msg.agentText || msg.displayText,
@@ -2163,50 +2478,36 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
           msg.attachmentAbsPaths,
         );
         if (sent !== "sent") {
-          requeueIfSameGen(msg, `send 未送达（${sent}）塞回`);
+          // 未 handoff → skipPersist 重排（禁止先记 delivered）
+          requeueIfSameGen(
+            replyPersisted ? { ...msg, skipPersistEvent: true } : msg,
+            `send 未送达（${sent}）塞回`,
+          );
           return;
         }
         delivered = true;
+        // send===sent 才 settle handedOff（对外 delivered）
+        if (msg.itemId) settleMessageHandedOff(taskId, msg.itemId);
 
-        // review P0#1：flush 成功后中性钩子（带原条目 extraMeta）；飞书层订阅升级 Typing→Get / 清撤回 Map
-        // chat-runner 不 import feishu-bridge，保持分层
+        // 飞书桥接（review P0#1）：flush 成功后中性钩子（带原条目 extraMeta）；
+        // 飞书层订阅它升级 Typing→Get 回执 / 清撤回 Map。chat-runner 不 import
+        // feishu-bridge，保持分层。
         emitQueuedMessageFlushed(taskId, msg);
-
-        // 入队方已落过 user_reply（并发起会话被吞改入队等）→ 跳过重复气泡 / checkpoint
-        if (msg.skipPersistEvent) return;
-
-        // 消息自带的来源标记（如飞书桥接 { source: "feishu" }）合并进 meta
-        const meta: Record<string, unknown> = { ...(msg.extraMeta ?? {}) };
-        if (msg.savedImages && msg.savedImages.length > 0) {
-          meta.images = msg.savedImages;
-        }
-        if (msg.attachmentMetas && msg.attachmentMetas.length > 0) {
-          meta.attachments = msg.attachmentMetas;
-        }
-        if (capture.ok) meta.checkpointed = true;
-        const replyEvent = await appendEvent(taskId, {
-          kind: "user_reply",
-          text: msg.displayText,
-          meta: Object.keys(meta).length > 0 ? meta : undefined,
-        });
-        if (replyEvent) {
-          publish(taskId, { kind: "event", event: replyEvent });
-          if (capture.ok) {
-            await persistCheckpointForReply(taskId, replyEvent.id, capture);
-          }
-        }
       } catch (err) {
         console.error(`[chat-runner] flushChatQueue task=${taskId} failed:`, err);
-        // 复审（11 轮）：清队不再静默——对齐 F2/N3 口径，先同步清队再 best-effort 写 info。
-        // 本条若已 send 成功（失败发生在落 user_reply 等后置步骤），不计入「未送达」条数。
-        const n = getChatQueueCount(taskId) + (delivered ? 0 : 1);
-        clearChatQueue(taskId);
-        if (n > 0) {
+        // checkpoint/send/后置异常统一走 failQueuedItems。
+        // 仅已 handedOff 的当前条不算 failed；仅 persisted → queue_failed。
+        const failedIds = failQueuedItems(taskId, {
+          reason: "flush_error",
+          currentItemId: msg.itemId,
+          currentHandedOff: delivered,
+        });
+        if (failedIds.length > 0) {
           try {
-            // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：清队系统通知（会话已关、无实例可绑）
+            // eslint-disable-next-line no-restricted-syntax -- 豁免：清队系统通知（会话已关、无实例可绑）
             await writeEventAndPublish(taskId, {
               kind: "info",
-              text: `排队消息处理失败，${n} 条排队消息未送达、请重新发送`,
+              text: `排队消息处理失败，${failedIds.length} 条排队消息未送达、请重新发送`,
             });
           } catch (logErr) {
             console.warn(
@@ -2223,7 +2524,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
   } finally {
     drainingQueues.delete(taskId);
   }
-  // T4 配套：single-flight 下，consume 收尾的链式 flush 可能撞上「本轮仍 draining」
+  // 配套：single-flight 下，consume 收尾的链式 flush 可能撞上「本轮仍 draining」
   // 而空 return，队内后续消息会滞留。本轮 finally 清位后：若队列非空且会话空闲
   //（无 run / compact / rewind），再续一次 drain。run 仍活跃时不续——等 consume
   // 自己的链式 flush，避免「dequeue → 见 busy → 塞回 → 再 flush」忙等。
@@ -2238,7 +2539,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
   }
 };
 
-// ----------------- 复审 H1：释放认领后等 rewind 门闩再补 drain -----------------
+// ----------------- 释放认领后等 rewind 门闩再补 drain -----------------
 
 /**
  * flushChatQueue 入口见 rewind 门闩会直接 return，所以释放认领当下 flush 无用，
@@ -2301,7 +2602,7 @@ export type CompactChatErrorCode =
   | "run_active"
   | "no_session"
   | "summarize_failed"
-  /** S3（十二轮）：用户 stop / compact 事务 abort——不重试、不重建 */
+  /** 用户 stop / compact 事务 abort——不重试、不重建 */
   | "summarize_cancelled"
   | "restart_failed"
   | "compact_busy";
@@ -2344,14 +2645,14 @@ const maybeAutoCompactThenFlush = async (taskId: string): Promise<void> => {
     // compactChatSession 成功后会自己 flush
     await compactChatSession(taskId, { reason: "auto" });
   } catch (err) {
-    // S3（十二轮）：用户主动取消不算失败提示，compact finally 已 flush
+    // 用户主动取消不算失败提示，compact finally 已 flush
     if (err instanceof CompactChatError && err.code === "summarize_cancelled") {
       return;
     }
     const msg =
       err instanceof Error ? err.message : String(err);
     console.warn(`[chat-runner] 自动 compact 失败 task=${taskId}:`, err);
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 系统通知
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 系统通知
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: "上下文过大，自动压缩失败，可手动压缩会话",
@@ -2362,7 +2663,7 @@ const maybeAutoCompactThenFlush = async (taskId: string): Promise<void> => {
         detail: msg.slice(0, 200),
       },
     });
-    // T4：compact finally 已 void flush；此处再 await 是失败路径兜底。
+    // compact finally 已 void flush；此处再 await 是失败路径兜底。
     // single-flight 下若 finally 已抢成 owner，本调用直接 return——无消息滞留
     //（owner 会把队首发出去，后续消息靠 run 结束后的链式 flush）。
     await flushChatQueue(taskId);
@@ -2387,7 +2688,7 @@ const runChatSummarizeOnesHot = async (
   }
   rec.runActive = true;
   let collected = "";
-  // M1 同款：agent.send 是 await 点，stop 可发生在 pending 期间——共享取消闭包
+  // agent.send 是 await 点，stop 可发生在 pending 期间——共享取消闭包
   // 记录信号、run 一旦可用立即补 cancel，摘要绝不能在「已停止」之后继续跑。
   let cancelledDuringSend = false;
   let summarizeRun: ChatRun | undefined;
@@ -2412,7 +2713,7 @@ const runChatSummarizeOnesHot = async (
       void run.cancel().catch(() => {});
       cancelBeforeSend();
     };
-    // S3（十二轮）：取消走专用码，compact 重试循环不得当普通失败再试一次
+    // 取消走专用码，compact 重试循环不得当普通失败再试一次
     if (cancelledDuringSend) {
       void run.cancel().catch(() => {});
       throw new CompactChatError(
@@ -2485,7 +2786,7 @@ export const compactChatSession = async (
 
   // 前置校验（只读、不占位）：注定失败时不要先置 compact，否则 chat-reply 在
   // await getTask 窗口里看到标记会白白入队，compact 再抛 no_session 时 finally
-  // flush 无会话会清队——复审 F2 静默丢消息。
+  // flush 无会话会清队—— 静默丢消息。
   const task = await getTask(taskId);
   if (!task) {
     throw new CompactChatError("not_found", "task 不存在", 404);
@@ -2525,7 +2826,7 @@ export const compactChatSession = async (
     );
   }
 
-  /** S3（十二轮）：abort 命中 → 专用码抛出，调用方不得再产生重建副作用 */
+  /** abort 命中 → 专用码抛出，调用方不得再产生重建副作用 */
   const throwIfCompactAborted = (): void => {
     if (isChatCompactAborted(taskId)) {
       throw new CompactChatError(
@@ -2600,7 +2901,7 @@ export const compactChatSession = async (
     // 此后旧会话可能已关——abort 只阻止后续副作用（running / 重建 / 写成功事件）
     throwIfCompactAborted();
 
-    // T5：先置 running 再重建。若重建 await 期间用户 stop，abort 已置位且
+    // 先置 running 再重建。若重建 await 期间用户 stop，abort 已置位且
     // cancelChatRun 会取消重建 run；stop 路由自己会把 runStatus 归 idle——
     // 此处不必额外回写（避免与 stop 收尾竞态双写）。
     const runningTask = await setTaskRunStatus(taskId, "running");
@@ -2622,11 +2923,11 @@ export const compactChatSession = async (
         500,
       );
     }
-    // T5：重建返回后先查 abort——用户 stop 命中重建阶段应抛 summarize_cancelled
+    // 重建返回后先查 abort——用户 stop 命中重建阶段应抛 summarize_cancelled
     //（上层 maybeAutoCompactThenFlush 对该 code 静默分流），绝不能落成 restart_failed
     // 再追加「自动压缩失败」。
     throwIfCompactAborted();
-    // 复审（11 轮）：runChatSession 内部 Agent.create/send 失败走 handleChatRunFailure
+    // runChatSession 内部 Agent.create/send 失败走 handleChatRunFailure
     // 不抛错（上面 catch 是死代码兜底）——重建失败必须显式报错，绝不能 200 假成功
     if (!hasChatSession(taskId)) {
       throw new CompactChatError(
@@ -2636,14 +2937,14 @@ export const compactChatSession = async (
       );
     }
 
-    // T5：compact_done / compact_summary 挪到重建确认成功之后再写。
+    // compact_done / compact_summary 挪到重建确认成功之后再写。
     // 取舍：续接 turn 的 prompt 已要求 agent 直接结束不输出正文，通常无 assistant
     // 事件；即使有，「事件顺序小瑕疵」也好过「假成功」（事件流已显示已压缩但无可用会话）。
     const doneText =
       reason === "auto"
         ? `上下文过大，已自动压缩会话（摘要 ${summary.length} 字）`
         : `已压缩会话（摘要 ${summary.length} 字）`;
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 完成通知（重建确认成功后写、用户操作链）
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 完成通知（重建确认成功后写、用户操作链）
     await writeEventAndPublish(taskId, {
       kind: "info",
       text: doneText,
@@ -2653,7 +2954,7 @@ export const compactChatSession = async (
         reason,
       },
     });
-    // eslint-disable-next-line no-restricted-syntax -- R27-6 豁免：compact 完成通知（重建确认成功后写、用户操作链）
+    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 完成通知（重建确认成功后写、用户操作链）
     await writeEventAndPublish(taskId, {
       kind: "compact_summary",
       text: `会话摘要（${summary.length} 字）`,

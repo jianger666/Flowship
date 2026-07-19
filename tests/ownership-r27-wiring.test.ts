@@ -295,14 +295,15 @@ describe("ownership R27 wiring", () => {
       let leaseOk = true;
       // 与矩阵同名：ensure.beforeWorktreeAdd（新建路径入口，add 前）
       const hang = installHangingFailpoint("ensure.beforeWorktreeAdd");
-      const p = ensureTaskWorktrees(task, { lease: () => leaseOk });
+      // R28-1：lease 必填函数形参；让位抛 WorktreeLeaseLostError（不吞）
+      const p = ensureTaskWorktrees(task, () => leaseOk);
       await hang.waitHit();
       // add 尚未发起——此刻 finalize 接管
       leaseOk = false;
       hang.release();
-      // 外层 catch WorktreeLeaseLostError → 返空 createdRepos（矩阵同口径）
-      const result = await raceExpectSettled(p, 20_000);
-      expect(result.createdRepos).toHaveLength(0);
+      await expect(raceExpectSettled(p, 20_000)).rejects.toBeInstanceOf(
+        WorktreeLeaseLostError,
+      );
       // worktree 未创建
       const list = execFileSync("git", ["-C", repo, "worktree", "list"], {
         encoding: "utf-8",
@@ -333,14 +334,15 @@ describe("ownership R27 wiring", () => {
 
       let leaseOk = true;
       const hang = installHangingFailpoint("worktree.afterAdd");
-      const p = ensureTaskWorktrees(task, { lease: () => leaseOk });
+      // R28-1：lease 必填；add 后失主抛错 + 补偿移除
+      const p = ensureTaskWorktrees(task, () => leaseOk);
       await hang.waitHit();
       // add 已成功、复验前失主——补偿必须移除刚创建的 worktree
       leaseOk = false;
       hang.release();
-      const result = await raceExpectSettled(p, 20_000);
-      expect(result.createdRepos).toHaveLength(0);
-      // 确认内部确曾抛过让位错（外层收口为结果）；类型仍可引用
+      await expect(raceExpectSettled(p, 20_000)).rejects.toBeInstanceOf(
+        WorktreeLeaseLostError,
+      );
       expect(WorktreeLeaseLostError).toBeTruthy();
       const list = execFileSync("git", ["-C", repo, "worktree", "list"], {
         encoding: "utf-8",

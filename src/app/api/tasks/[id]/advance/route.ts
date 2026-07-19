@@ -202,7 +202,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒推进
+  // lifecycle 非 null（stopping/deleting/finalizing）一律拒推进
   {
     const life = getChatLifecycle(id);
     if (life !== null) {
@@ -216,7 +216,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // W2：lifecycle 闸后立刻同步取 admission——其后有落分支偏好 / 存图等 await
+  // lifecycle 闸后立刻同步取 admission——其后有落分支偏好 / 存图等 await
   const opGen = getTaskOpGeneration(task.id);
 
   // V0.6.0.1：chat 模式 task 不走 advance、应走 /chat-reply

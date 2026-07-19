@@ -111,7 +111,7 @@ const {
   setChatAwaitingNotifier,
   setChatTaskActionHandler,
 } = await import("@/lib/server/chat-pending");
-const { clearChatGate } = await import("@/lib/server/chat-gate");
+const { clearChatGate, getChatLifecycle } = await import("@/lib/server/chat-gate");
 const { stopTaskAgent } = await import("@/lib/server/stop-task");
 const {
   buildSessionBridges,
@@ -186,6 +186,18 @@ const makeMeta = (id: string): TaskMetaV06 =>
   }) as unknown as TaskMetaV06;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+const waitUntil = async (
+  pred: () => boolean | Promise<boolean>,
+  ms = 5000,
+): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await pred()) return;
+    await sleep(20);
+  }
+  throw new Error(`waitUntil 超时 ${ms}ms`);
+};
 
 const raceExpectSettled = async <T>(
   p: Promise<T>,
@@ -326,8 +338,11 @@ describe("ownership R26 wiring", () => {
       await hang.waitHit();
       expect(mockEnsureTaskWorktrees).not.toHaveBeenCalled();
 
-      await finalizeTask(id, "abandoned", "r26w prewarm");
+      // R28-1：等 finalizing 再 release——stillPrewarm 必假；starting 随后归零、join 不空等
+      const pFin = finalizeTask(id, "abandoned", "r26w prewarm");
+      await waitUntil(() => getChatLifecycle(id) === "finalizing", 5000);
       hang.release();
+      await pFin;
       await sleep(200);
       expect(mockEnsureTaskWorktrees).not.toHaveBeenCalled();
       const events = await readEvents(id);
@@ -428,21 +443,16 @@ describe("ownership R26 wiring", () => {
       };
       runningChecks.set(id, checkB);
 
-      const hang = installHangingFailpoint("mcp.submitWork.beforeAbortCheck");
-      const p = Promise.resolve(
-        awaitingNotifier(
-          {
-            kind: "awaiting_start",
-            actionId: "act_a",
-            artifactPath: "actions/1-plan.md",
-          },
-          { callerStillValid: () => true },
-        ),
+      // R29-1：旧 action 在 waitAndClaimPostCheck 的 lease 检查处即 stale，不启 check、不 abort B
+      const outcome = await awaitingNotifier(
+        {
+          kind: "awaiting_start",
+          actionId: "act_a",
+          artifactPath: "actions/1-plan.md",
+        },
+        { callerStillValid: () => true },
       );
-      await hang.waitHit();
-      expect(abortSpy).not.toHaveBeenCalled();
-      hang.release();
-      await raceExpectSettled(p, 8000);
+      expect(outcome).toBe("stale");
       expect(abortSpy).not.toHaveBeenCalled();
       expect(runningChecks.get(id)?.actionId).toBe("act_b");
     },

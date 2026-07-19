@@ -1,13 +1,12 @@
 /**
- * Ownership failpoint 矩阵（ownership-refactor-2026-07-18）
+ * Ownership failpoint 矩阵（并发所有权收敛重构配套、协议见 docs/HANDOFF.md「并发所有权与消息投递协议」）
  *
- * 面向设计文档 API 契约：claimTaskOp / snapshotTaskOp / isTaskOpCurrent /
+ * 面向所有权 API 契约：claimTaskOp / snapshotTaskOp / isTaskOpCurrent /
  * releaseTaskOpIf / revokeTaskOps + 12 个固定插桩点名 + 不变量 I1～I5。
- * 核心重构并行落地前本文件预期编译不过——主线统一跑通后按下方「API 假设」核对漂移。
  *
  * 结构：
  *   1. failpoint × 注入动作矩阵（真实调用链 + setFailpoint，不预摆 token 直测 helper）
- *   2. R22-5 / R22-6 定向补充
+ *   2. ask 应答所有权 / 僵尸会话定向补充
  *   3. 新 API 协议层小用例
  */
 import { mkdtempSync, promises as fs } from "node:fs";

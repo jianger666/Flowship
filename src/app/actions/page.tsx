@@ -162,7 +162,7 @@ const ActionsPanel = () => {
     const text = `把下面这个旧版自定义 action 转建成新版（skill + 挂载壳）。原 label：「${def.label}」。原 playbook 内容如下、提炼成纯方法论 skill（英文 kebab-case 目录名）并用 create_custom_action 挂壳（产出要求放 output 参数）：\n\n${def.legacyPlaybook}`;
 
     setConvertingLegacyId(def.id);
-    // 终审 P3：createTask 成功但 sendChatReply 失败（409 等）时别只 toast——
+    // createTask 成功但 sendChatReply 失败（409 等）时别只 toast——
     // 任务已建成、降级为草稿 + 导航过去让用户手动重发、不留孤儿空对话
     let createdTaskId: string | null = null;
     try {
@@ -200,7 +200,7 @@ const ActionsPanel = () => {
         return;
       }
 
-      await sendChatReply(
+      const convertResult = await sendChatReply(
         task.id,
         text,
         undefined,
@@ -208,6 +208,12 @@ const ActionsPanel = () => {
         { apiKey: s.apiKey, model: s.defaultModel },
         [{ name: creator.name, absPath: creator.absPath }],
       );
+      // send 后落盘失败——不可忽略提示
+      if (convertResult.persistWarning) {
+        toast.error(
+          `消息已送达但记录保存失败：${convertResult.persistWarning}`,
+        );
+      }
       toast.success("已发起转建、AI 正在处理");
       router.push(`/tasks/${task.id}`);
     } catch (err) {
@@ -294,7 +300,7 @@ const ActionsPanel = () => {
 
     try {
       await deleteCustomActionReq(def.id);
-      // D10：同步清 actionLayout 里该 id 的 order/hidden 残留（不等拖拽时才 prune）
+      // 同步清 actionLayout 里该 id 的 order/hidden 残留（不等拖拽时才 prune）
       const s = getSettings();
       const layout = s.actionLayout ?? { order: [], hidden: [] };
       const pruned = removeActionLayoutId(layout, def.id);

@@ -166,6 +166,7 @@ describe("handleRecallEvent", () => {
   // review P0#1：flush 后清 Map，撤回不误报
   it("flush 成功后撤回 → 不误报「已撤回」", async () => {
     const msg = {
+      itemId: "cq_test_flushed",
       agentText: "已注入的话",
       displayText: "已注入的话",
       enqueuedAt: Date.now(),

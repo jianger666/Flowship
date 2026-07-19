@@ -39,7 +39,7 @@ const extractShellChunk = (update: InteractionUpdate): string | null => {
  * 返回可塞进 SendOptions.onDelta 的 handler。
  * 与 createRunPerfTracker().onDelta 用 composeOnDelta 串联。
  *
- * @param lease R26-6：可选；每次 flush/publish 前同步 gate，失效则丢弃（旧 run 迟到 delta 不混入新 run）
+ * @param lease 可选；每次 flush/publish 前同步 gate，失效则丢弃（旧 run 迟到 delta 不混入新 run）
  */
 export const createShellOutputDeltaPublisher = (
   taskId: string,
@@ -50,7 +50,7 @@ export const createShellOutputDeltaPublisher = (
   const buffers = new Map<string, Buf>();
 
   const publishChunk = (callId: string, chunk: string): void => {
-    // R26-6：publish 紧前同步 gate——无 await 夹缝；失主丢弃
+    // publish 紧前同步 gate——无 await 夹缝；失主丢弃
     if (lease && !lease()) return;
     // ephemeral：伪造 TaskEvent 形态走既有 event SSE 帧，但不 appendEvent
     publish(taskId, {
@@ -66,7 +66,7 @@ export const createShellOutputDeltaPublisher = (
   };
 
   const flush = (callId: string): void => {
-    // R26-6：flush 入口再 gate 一次——缓冲期间失主则清缓冲不 publish
+    // flush 入口再 gate 一次——缓冲期间失主则清缓冲不 publish
     if (lease && !lease()) {
       buffers.delete(callId);
       return;

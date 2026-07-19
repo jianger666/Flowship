@@ -85,6 +85,10 @@ import {
   type ImagePayload,
 } from "@/lib/task-store";
 import {
+  canCommitTaskSnapshot,
+  commitTaskDeleted,
+} from "@/lib/task-terminal";
+import {
   actionDisplayLabel,
   MR_KIND_LABEL,
   REPO_STATUS_LABEL,
@@ -161,6 +165,17 @@ const TaskDetailPage = () => {
   const routeIdRef = useRef(id);
   routeIdRef.current = id;
 
+  // 统一 terminal sink——SSE task_deleted / watch 410 / 已 hydrate 的 404
+  // 只调 commitTaskDeleted（503 unavailable 不进此 sink）
+  // （列表 epoch / sticky 由 coordinator 通知；本页清 state；chat pending 由 ChatView 先清）
+  const handleTaskDeleted = useCallback((deletedId: string) => {
+    commitTaskDeleted(deletedId);
+    if (deletedId !== routeIdRef.current) return;
+    setStreamingText("");
+    setTask(null);
+    toast.message("任务已被删除");
+  }, []);
+
   // 侧栏 A→B 快切：立刻清本地态，避免短暂显示 A 的内容盖在 B 的 URL 上
   useEffect(() => {
     setTask(null);
@@ -173,11 +188,13 @@ const TaskDetailPage = () => {
   // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
   // 审查发现快切竞态：丢弃 payload.id !== 当前路由 id 的迟到数据（守卫在组件层，
   // mergeTaskEvents 在 prev.id!==next.id 时 return next，不能靠它挡串任务）
+  // sticky deleted → 丢弃迟到 detail / chat mutation 200，禁止复活
   const absorbTask = useCallback((next: Task | null) => {
     if (!next) {
       setTask(null);
       return;
     }
+    if (!canCommitTaskSnapshot(next.id)) return;
     if (next.id !== routeIdRef.current) return;
     setTask((prev) => mergeTaskEvents(prev, next));
   }, []);
@@ -220,7 +237,8 @@ const TaskDetailPage = () => {
   //  2) 让 useTaskList「知道」有任务在跑 → 触发它的条件轮询去刷后台其它任务
   // 仅依赖影响侧栏展示 / 轮询触发的关键字段、不随 events 高频 setState 全列表重渲染
   useEffect(() => {
-    if (task) upsertTask(task);
+    // deleted terminal 后不得把侧栏回灌
+    if (task && canCommitTaskSnapshot(task.id)) upsertTask(task);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     task?.id,
@@ -349,6 +367,7 @@ const TaskDetailPage = () => {
       onAssistantDelta: (text) => setStreamingText((p) => p + text),
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
+      onTaskDeleted: handleTaskDeleted,
     },
     !!task && task.mode !== "chat",
     watchEpoch,
@@ -690,6 +709,7 @@ const TaskDetailPage = () => {
             });
           }}
           onPrependEvents={handlePrependEvents}
+          onTaskDeleted={handleTaskDeleted}
         />
       </div>
     );
@@ -1053,7 +1073,7 @@ const TaskDetailPage = () => {
         submitting={starting}
       />
 
-      {/* V0.6.6 编辑任务 dialog；onSaved 走 absorbTask（发版前蓝军 P1：直接 setTask 会被
+      {/* V0.6.6 编辑任务 dialog；onSaved 走 absorbTask（直接 setTask 会被
           PATCH 响应的全量 events 冲掉已分页历史、懒加载契约打穿） */}
       <EditTaskDialog
         open={editDialogOpen}

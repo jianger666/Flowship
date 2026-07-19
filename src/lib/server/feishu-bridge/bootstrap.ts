@@ -24,6 +24,11 @@ export const ensureFeishuBridgeBootstrapped = (): void => {
   ensureBridgeCommandsRegistered();
   ensureReactionReceiptsRegistered();
   ensureRecallHandlingRegistered();
+  // vitest：ownership 等测会 import chat-reply /tasks 路由触发本函数；
+  // 那些用例常只 mock kill-orphans.reapTaskOrphans，sync→stopConsumer 调
+  // unregisterManagedChild 会炸成 unhandled rejection。桥接单测自行调
+  // ensureBridgeRuntimePolling / syncBridgeRuntime，不依赖本锚点起 consumer。
+  if (process.env.VITEST) return;
   // 放最后：consumer 起来时上面的 handler / 命令表已就位
   ensureBridgeRuntimePolling();
 };

@@ -100,7 +100,7 @@ export const recordChatTurnUsage = (
   return next;
 };
 
-/** 删任务收尾：清 usage 记录（复审 11 轮：byTask 只增不删、长跑进程积键） */
+/** 删任务收尾：清 usage 记录（byTask 只增不删、长跑进程积键） */
 export const clearChatContextUsage = (taskId: string): void => {
   getUsageState().byTask.delete(taskId);
 };

@@ -15,6 +15,8 @@
 import { appendEvent } from "./task-fs";
 import type { Task, TaskEvent, ActionRecord } from "@/lib/types";
 import type { TaskFieldsSnapshot } from "./task-prompts";
+// 仅 type-only——action-side-effects 不反向依赖本模块，无运行时环
+import type { ClaimHandle } from "./action-side-effects";
 
 // ----------------- 工具截断 -----------------
 
@@ -41,13 +43,19 @@ export const stringifyMeta = (v: unknown): string => {
 //   - done: agent run 终止（运行时层、跟 task 业务终态独立）
 //   - error: 顶层错误（用于显示 toast）
 //   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
+//   - queue_failed: 队列整队失败控制帧（纯内存、不落盘）
+//   - task_deleted: DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
 export type TaskStreamEvent =
   | { kind: "event"; event: TaskEvent }
   | { kind: "task"; task: Task }
   | { kind: "action"; action: ActionRecord }
   | { kind: "done"; task: Task; ok: boolean }
   | { kind: "error"; message: string }
-  | { kind: "assistant_delta"; text: string };
+  | { kind: "assistant_delta"; text: string }
+  | { kind: "queue_failed"; itemIds: string[]; reason: string }
+  // MessageOperation 终态帧（纯内存、不落盘）——client ledger 成功/失败终态的实时来源
+  | { kind: "message_op"; itemId: string; phase?: string; outcome?: string }
+  | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
 
@@ -55,7 +63,7 @@ export type TaskStreamListener = (ev: TaskStreamEvent) => void;
 
 export interface RunningTaskRecord {
   /**
-   * X3：本 run 登记的进程内实例号（单调发号）。
+   * 本 run 登记的进程内实例号（单调发号）。
    * forceClear 后后继 B 会换新 record——旧 consume 收尾必须按 instanceId 门控，
    * 不能只靠 agentId（Agent.resume 可能复用同一持久化 agentId）。
    */
@@ -75,7 +83,7 @@ export interface RunningTaskRecord {
  */
 export interface AgentSessionRecord {
   /**
-   * R18-3：本会话内存实例号（进程内单调、与 RunningTaskRecord.instanceId 共用发号器）。
+   * 本会话内存实例号（进程内单调、与 RunningTaskRecord.instanceId 共用发号器）。
    * Agent.resume 会恢复同一持久化 agentId——只靠 agentId 关会话会误关后继 B；
    * 旧 run 收尾必须按 instanceId 精确匹配才 close。
    */
@@ -88,7 +96,7 @@ export interface AgentSessionRecord {
   };
   agentId: string;
   /**
-   * R24-6：本 agent 实例的 MCP caller token（create/resume 前分配、跨多轮 send 不变）。
+   * 本 agent 实例的 MCP caller token（create/resume 前分配、跨多轮 send 不变）。
    * bridge / MCP URL 用它做身份；B 起新 agent 发新 token 覆盖注册后，旧 A 迟到请求被拒。
    */
   callerToken?: string;
@@ -105,6 +113,12 @@ export interface RunningCheck {
   actionId: string;
   // 停止 / 推进新 action / 被新一轮 wait 顶替时 abort、杀 lint/typecheck 子进程
   controller: AbortController;
+  /**
+   * 与本 check 同寿命的 postcheck claim——挂在 globalThis.runningChecks 同条目上，
+   * 不再另开 module-local companion Map（Next route chunk / HMR 下会与 runningChecks 分裂，
+   * abort 找不到 handle → claim 泄漏 busy）。
+   */
+  claimHandle?: ClaimHandle;
 }
 
 interface TaskRunnerGlobalState {
@@ -133,19 +147,19 @@ interface TaskRunnerGlobalState {
   startingTasks: Map<string, number>;
   /**
    * V12：per-task ownership（gen + currentOpId 合并）。
-   * - gen：stop / DELETE / finalize 的 revoke 写入进程单调号（tombstone 不清除、W1 防 ABA）
+   * - gen：stop / DELETE / finalize 的 revoke 写入进程单调号（tombstone 不清除、 防 ABA）
    * - currentOpId：当前启动/运行链的 owner op id；后继 claim 覆盖 = 换主；null = 无人持有
    *
    * 旧 taskOpGenerations / taskStartOwners 两字段已删（gen 迁入本结构）。
    */
   taskOwnership: Map<string, TaskOwnershipState>;
   /**
-   * W1：进程级单调 token（从 1 起）。revoke 时分配给 gen、永不重复、永不回到 0。
+   * 进程级单调 token（从 1 起）。revoke 时分配给 gen、永不重复、永不回到 0。
    * 与「无键默认 0」永远不相等 → DELETE 后旧 snap=0 恒 stale。
    */
   nextTaskOpToken: number;
   /**
-   * X3 / R18-3：RunningTaskRecord + AgentSessionRecord.instanceId 共用发号器（进程内单调）。
+   * RunningTaskRecord + AgentSessionRecord.instanceId 共用发号器（进程内单调）。
    * 每次 runningTasks.set / agentSessions.set 取号；旧 run 被强清后后继 B 拿新号，
    * 迟到收尾靠号比对让位（resume 同 agentId 时只能靠 instanceId 区分）。
    *
@@ -158,7 +172,7 @@ interface TaskRunnerGlobalState {
  * V12：单个 task 的 ownership 内存态（不持久化——Electron 单进程内权威源）。
  */
 export interface TaskOwnershipState {
-  /** 进程单调 generation：revoke 作废所有在飞 op 的准入；tombstone 语义保留（W1） */
+  /** 进程单调 generation：revoke 作废所有在飞 op 的准入；tombstone 语义保留 */
   gen: number;
   /** 当前启动/运行链的 owner op id；后继 claim 覆盖 = 换主；null = 无人持有 */
   currentOpId: number | null;
@@ -188,10 +202,10 @@ export interface TaskOpHandle {
 }
 
 // V12：2026-07-18 ownership 收敛——taskOpGenerations + taskStartOwners → taskOwnership
-// V11：2026-07-18 R20-1——taskStartOwners（per-start owner token，同 action 双唤醒）
-// V10：2026-07-18 R18-3——AgentSessionRecord.instanceId（与 run 共用发号器）
-// V9：2026-07-18 X3——nextTaskRunInstanceId（run owner 门控）
-// V8：2026-07-18 W1——nextTaskOpToken 进程级单调 + 删 clear（tombstone 防 ABA）
+// V11：2026-07-18——taskStartOwners（per-start owner token，同 action 双唤醒）
+// V10：2026-07-18——AgentSessionRecord.instanceId（与 run 共用发号器）
+// V9：2026-07-18——nextTaskRunInstanceId（run owner 门控）
+// V8：2026-07-18 ——nextTaskOpToken 进程级单调 + 删 clear（tombstone 防 ABA）
 // V7：2026-07-18 加 taskOpGenerations + startingTasks 改 refcount Map（V1/V2）
 // V6：2026-07-18 加 startingTasks Set（stop/DELETE 与 Agent.create 飞行窗口竞态）
 // V5：2026-07-15 加 pendingStopRequests（停止按钮 vs 启动窗口竞态）
@@ -286,15 +300,50 @@ export const clearTaskStarting = (taskId: string): void => {
   startingTasksMap().delete(taskId);
 };
 
+// resource job + quarantine 实现在 resource-jobs.ts（避环）；此处 re-export
+export {
+  beginResourceJob,
+  endResourceJob,
+  hasResourceJobs,
+  clearResourceJobs,
+  registerJobAbort,
+  revokeResourceJobs,
+  joinResourceJobs,
+  markWorkspaceQuarantined,
+  isWorkspaceQuarantined,
+  clearWorkspaceQuarantine,
+  acquireTerminalCleanup,
+  holdTerminalCleanup,
+  releaseTerminalCleanup,
+  hasTerminalCleanup,
+  getTerminalCleanupPhase,
+  isTerminalCleanupGenValid,
+  isTerminalCleanupHandleValid,
+  markTerminalCleanupExecuting,
+  invalidateTerminalCleanupForReopen,
+  waitUntilResourceJobsCleared,
+  getResourceJoinTimeoutMs,
+  setResourceJoinTimeoutMsForTest,
+  DEFAULT_RESOURCE_JOIN_MS,
+} from "./resource-jobs";
+export type {
+  ResourceJobHandle,
+  JoinResourceJobsResult,
+  InvalidateCleanupResult,
+  TerminalCleanupPhase,
+  TerminalCleanupHandle,
+  AcquireTerminalCleanupResult,
+} from "./resource-jobs";
+
 /**
  * 准入快照（路由入场同步取；语义 = 旧 getTaskOpGeneration）。
- * 无记录返 0——与 revoke 写入的进程单调 token（≥1）永不相等（W1 防 ABA）。
+ * 无记录返 0——与 revoke 写入的进程单调 token（≥1）永不相等。
  */
 export const getTaskOpGeneration = (taskId: string): number =>
   taskOwnershipMap().get(taskId)?.gen ?? 0;
 
 /**
- * X3 / R18-3：为 RunningTaskRecord / AgentSessionRecord / TaskOpHandle.opId
+ * 为 RunningTaskRecord / AgentSessionRecord / TaskOpHandle.opId
  * 分配进程内唯一 instanceId。共用发号器——resume 同 agentId 时靠号区分新旧。
  */
 export const allocTaskRunInstanceId = (): number => {
@@ -368,7 +417,7 @@ export const releaseTaskOpIf = (h: TaskOpHandle): void => {
 
 /**
  * V12 stop/DELETE/finalize：bump gen + currentOpId 置 null
- * （所有在飞 op / 快照立即失效）。W1：tombstone 保留、永不 clear 键。
+ * （所有在飞 op / 快照立即失效）。：tombstone 保留、永不 clear 键。
  */
 export const revokeTaskOps = (taskId: string): void => {
   const s = getRunnerState();
@@ -439,7 +488,7 @@ export const publish = (taskId: string, ev: TaskStreamEvent): void => {
 };
 
 /**
- * R26-5：envelope sink 唯一入口——同步执行 lease，true 才 publish。
+ * envelope sink 唯一入口——同步执行 lease，true 才 publish。
  * 线性化：无 await；失主不得清掉新主的 streaming UI / 发迟到 envelope。
  * 本波先导出 + 单测；下一波业务调用点接线。
  */
@@ -481,20 +530,22 @@ export const subscribeTaskStream = (
 /**
  * 持久化 + publish 一体（防御性吞错）。
  *
- * R27-6：owner 语境请改用 {@link writeOwnedEventAndPublish}（lease 必填）。
+ * owner 语境请改用 {@link writeOwnedEventAndPublish}（lease 必填）。
  * 本函数保留可选 lease 以兼容存量接线；无 lease = 用户操作 / 终态 owner 无条件语义。
- * R27-7：append 返 null（含 ENOENT）时不 publish。
+ * append 返 null（含 ENOENT）时不 publish。
+ * publish 作为 onCommitted 进 append 链——写行成功后、链释放前同步推送，
+ * 与磁盘顺序一致（不再等 meta.updatedAt touch 返回后才 publish）。
  */
 export const writeEventAndPublish = async (
   taskId: string,
-  ev: Omit<TaskEvent, "id" | "ts">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
   lease?: () => boolean,
 ): Promise<TaskEvent | null> => {
   try {
-    const event = await appendEvent(taskId, ev, lease);
-    // R27-7：null = 未写入（lease 拒 / ENOENT）→ 不向 SSE 发幽灵事件
-    if (event) publish(taskId, { kind: "event", event });
-    return event;
+    // publish 进 OrderedEventCommit 链，不再在 await append 之后另推
+    return await appendEvent(taskId, ev, lease, (event) => {
+      publish(taskId, { kind: "event", event });
+    });
   } catch (err) {
     console.warn(
       `[task-stream] writeEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
@@ -505,18 +556,45 @@ export const writeEventAndPublish = async (
 };
 
 /**
- * R27-6：owned 事件 sink——lease 必填，缺省即编译失败。
+ * 用户输入落盘（correctness-critical）——append 失败不得伪装成功。
+ *
+ * - ENOENT / 任务已删 / lease 拒写 → 返 null（调用方按 404/410 处理）
+ * - 其它 IO 错误（EIO / ENOSPC / EACCES…）→ **抛错**，由 route 决定 5xx 或 persistWarning
+ *
+ * best-effort 日志 / 系统提示继续用 {@link writeEventAndPublish}（吞错返 null）。
+ */
+export const writeUserEventAndPublishStrict = async (
+  taskId: string,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
+  lease?: () => boolean,
+): Promise<TaskEvent | null> => {
+  // 不吞错：appendEvent 已对非 ENOENT 透传 throw
+  return await appendEvent(taskId, ev, lease, (event) => {
+    publish(taskId, { kind: "event", event });
+  });
+};
+
+/** send 后落盘失败时 HTTP body 用的固定文案 */
+export const PERSIST_WARNING_DELIVERED =
+  "已送达但持久化失败" as const;
+
+/** send 前落盘失败时 HTTP 错误文案 */
+export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as const;
+
+/**
+ * owned 事件 sink——lease 必填，缺省即编译失败。
  * 内部走带 lease 的 appendEvent；失主 / ENOENT 不写盘、不 publish。
+ * publish 同样进 append 链（与 writeEventAndPublish 同序协议）。
  */
 export const writeOwnedEventAndPublish = async (
   taskId: string,
   lease: () => boolean,
-  ev: Omit<TaskEvent, "id" | "ts">,
+  ev: Omit<TaskEvent, "id" | "ts" | "seq">,
 ): Promise<TaskEvent | null> => {
   try {
-    const event = await appendEvent(taskId, ev, lease);
-    if (event) publish(taskId, { kind: "event", event });
-    return event;
+    return await appendEvent(taskId, ev, lease, (event) => {
+      publish(taskId, { kind: "event", event });
+    });
   } catch (err) {
     console.warn(
       `[task-stream] writeOwnedEventAndPublish 失败 task=${taskId} kind=${ev.kind}：`,
@@ -547,7 +625,7 @@ export const waitForTaskToStop = async (
  * V0.5.7 沿用：强制清除 in-memory runner state（dev hot reload / 手改 meta.json 后用）
  * 调用方负责对 task 当前是否真的活做判断、本函数不验证。
  *
- * X3：仍删 forkPendingTasks——强清的调用方（advance 等满 5s）紧接着起 B，
+ * 仍删 forkPendingTasks——强清的调用方（advance 等满 5s）紧接着起 B，
  * 「B 等 A」标记语义已耗尽。旧 A 迟到收尾不再依赖 fork 标记识别后继，
  * 改靠 RunningTaskRecord.instanceId 门控（见 consumeSessionRun）。
  */

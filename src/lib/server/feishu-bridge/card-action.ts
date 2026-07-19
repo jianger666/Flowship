@@ -18,8 +18,11 @@ import {
   deliverChatAskReply,
   hasChatSession,
 } from "@/lib/server/chat-runner";
-import { appendEvent, getTask } from "@/lib/server/task-fs";
-import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import { getTask } from "@/lib/server/task-fs";
+import {
+  PERSIST_WARNING_DELIVERED,
+  writeUserEventAndPublishStrict,
+} from "@/lib/server/task-stream";
 
 import { findTaskByMessageId } from "./card-map";
 import { nextCardSequence } from "./card-seq";
@@ -457,8 +460,9 @@ const handleAskAction = async (
         typeof ev.meta?.askId === "string" &&
         ev.meta.askId === pending.askId,
     );
+  // 对齐 ask-reply：已送达后 strict 落盘（写+publish 同链）
   try {
-    const replyEvent = await appendEvent(value.taskId, {
+    const replyEvent = await writeUserEventAndPublishStrict(value.taskId, {
       kind: "ask_user_reply",
       actionId: reqEvent?.actionId,
       text: built.replyText,
@@ -468,11 +472,14 @@ const handleAskAction = async (
         source: "feishu",
       },
     });
-    if (replyEvent) {
-      publishTaskStreamEvent(value.taskId, { kind: "event", event: replyEvent });
+    if (!replyEvent) {
+      warnLark(
+        "writeUserEventAndPublishStrict(ask_user_reply)",
+        new Error(PERSIST_WARNING_DELIVERED),
+      );
     }
   } catch (err) {
-    warnLark("appendEvent(ask_user_reply)", err);
+    warnLark("writeUserEventAndPublishStrict(ask_user_reply)", err);
   }
 
   // 卡片置已答：被点题「✅ 已选」、其余题「（未回答）」+ 删按钮

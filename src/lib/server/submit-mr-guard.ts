@@ -1,5 +1,5 @@
 /**
- * submit_mr server 端范围校验（P0-2 harness、V0.6.27 从 task-runner 拆出）
+ * submit_mr server 端范围校验（harness、V0.6.27 从 task-runner 拆出）
  *
  * 背景：submit_mr 的 repo_path / project_path / source / target 都由 agent 传入、
  *   早期 handler 直接拿去 createMR()。agent 幻觉 / prompt 被污染 / remote 解析出错时、
@@ -119,7 +119,7 @@ export const validateSubmitMr = async (
       error: `action_id ${a.actionId} 不是本 task 的 ship / dev / custom action`,
     };
   }
-  // 2b) R27-4：action lease——session caller 只认证 agent，action 权限单独验：
+  // 2b) action lease——session caller 只认证 agent，action 权限单独验：
   //     必须仍是 currentActionId 且 running。同一跨 action session 长期复用 caller token、
   //     历史 action A 的迟到/重试 submit_mr 在当前已切到 B 时全部拒绝。
   if (task.currentActionId !== a.actionId || action.status !== "running") {

@@ -9,8 +9,11 @@ import type { ModelSelection } from "@cursor/sdk";
 
 import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
 import { deliverChatAskReply, hasChatSession } from "@/lib/server/chat-runner";
-import { appendEvent, getTask } from "@/lib/server/task-fs";
-import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import { getTask } from "@/lib/server/task-fs";
+import {
+  PERSIST_WARNING_DELIVERED,
+  writeUserEventAndPublishStrict,
+} from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 
 export type AskInjectResult =
@@ -90,18 +93,28 @@ export const injectPendingAskText = async (
         ev.meta.askId === pending.askId,
     );
 
-  const replyEvent = await appendEvent(taskId, {
-    kind: "ask_user_reply",
-    actionId: reqEvent?.actionId,
-    text: replyText,
-    meta: {
-      askId: pending.askId,
-      answers,
-      source: "feishu",
-    },
-  });
-  if (replyEvent) {
-    publishTaskStreamEvent(taskId, { kind: "event", event: replyEvent });
+  // 对齐 ask-reply：已送达后 strict 落盘；失败只记 warning，不伪装未发送
+  try {
+    const replyEvent = await writeUserEventAndPublishStrict(taskId, {
+      kind: "ask_user_reply",
+      actionId: reqEvent?.actionId,
+      text: replyText,
+      meta: {
+        askId: pending.askId,
+        answers,
+        source: "feishu",
+      },
+    });
+    if (!replyEvent) {
+      console.error(
+        `[feishu-bridge/ask-inject] 已送达但持久化失败（ENOENT）task=${taskId} warning=${PERSIST_WARNING_DELIVERED}`,
+      );
+    }
+  } catch (persistErr) {
+    console.error(
+      `[feishu-bridge/ask-inject] 已送达但持久化失败 task=${taskId}:`,
+      persistErr,
+    );
   }
 
   return { ok: true };

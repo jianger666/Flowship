@@ -34,11 +34,13 @@ import {
   hasChatStartReservation,
   tryBeginChatRewind,
 } from "./chat-gate";
-import { clearChatQueue, getChatQueueCount } from "./chat-queue";
+import { failQueuedItems, getChatQueueCount } from "./chat-queue";
+import { failpoint } from "./failpoints";
 import {
   EVENTS_FILE,
   readEvents,
   readMetaV06,
+  readMetaV06Evidence,
   taskDir,
   withTaskLock,
   writeMeta,
@@ -449,35 +451,77 @@ export const writeRewindPoints = async (
   }
 };
 
+/** 单仓 checkpoint ref 清单（deletion journal / tombstone 共用） */
+export interface CheckpointRefManifestEntry {
+  repoPath: string;
+  refs: string[];
+}
+
 /**
- * 删除任务前清理各仓里该 task 的 checkpoint refs。
- * 不清理会让被删任务的历史 tree/blob 永久保留在用户仓里（refs 保活对象）。
- * 须在 deleteTask 之前调用（还要能读到 rewind_points）。全程 best-effort。
+ * 可恢复删除事务的 refs 清单。
+ * 写 tombstone / journal 时从 rewind_points 提取；rm taskDir 后仍可凭 journal 重试。
+ *
+ * phase：
+ * - prepared：manifest 已落盘、逻辑删除尚未提交（boot 必须丢弃、不得 rm）
+ * - committed：tombstone rename 成功或快速路径进入不可逆 refs/rm 前已原子推进
+ *
+ * refsPending：update-ref / for-each-ref 未确认成功的子集；有则 boot 只重试这些、成功前不删 journal。
+ *
+ * manifestPending：清单本身未能确认（rewind 读失败且仓扫也失败）——
+ * 不得当「零 ref」完成删除；boot 凭 repoPaths 重试构建。
+ *
+ * manifestPending 携带 unknown 语义——无完整 repoPaths 时不得 rm 最后恢复源；
+ * 空 repoPaths + 恢复源已消失绝不能解释成合法零清单。真正零仓须显式 confirmedEmpty。
+ *
+ * 最终口径：journal 是删除事务唯一真相；tombstone 是物理/Windows EBUSY 辅助。
+ * 实现上「journal.committed 或 tombstone 任一证据在 → 只前滚、绝不回滚」。
  */
-export const cleanupCheckpointRefsForTask = async (
+export interface CheckpointRefManifest {
+  deletedAt: number;
+  checkpointRefs: CheckpointRefManifestEntry[];
+  /** 删除事务阶段 */
+  phase?: "prepared" | "committed";
+  /** 尚未确认清掉的 refs（子集）；缺省表示按 checkpointRefs 全量清 */
+  refsPending?: CheckpointRefManifestEntry[];
+  /** 清单未确认，禁止当零 ref 收尾 */
+  manifestPending?: boolean;
+  /** manifestPending 时快照的仓路径，供 taskDir 已 rm 后 boot 重扫 */
+  repoPaths?: string[];
+  /**
+   * 构建成功路径写入——确认本 task 确实零仓/零 ref。
+   * 缺省 + 空 repoPaths ≠ 合法空；只有本标志才允许前滚完成空清单。
+   */
+  confirmedEmpty?: boolean;
+}
+
+/** 按清单清 refs 的逐仓/逐 ref 结果 */
+export interface CheckpointRefCleanupResult {
+  /** 未确认成功、须写回 journal 的失败项 */
+  pending: CheckpointRefManifestEntry[];
+  allSucceeded: boolean;
+}
+
+/** manifest 构建显式 Result——读失败不得降级为空成功 */
+export type BuildCheckpointRefManifestResult =
+  | { ok: true; manifest: CheckpointRefManifest }
+  | { ok: false; error: string };
+
+/**
+ * 按给定仓路径 for-each-ref 扫 task 前缀。
+ * 任一仓扫失败 → ok:false（无法确认空清单）；全成功才允许空清单。
+ */
+export const scanCheckpointRefsFromRepoPaths = async (
   taskId: string,
-): Promise<void> => {
-  let points: RewindPoint[];
-  try {
-    points = await readRewindPoints(taskId);
-  } catch (err) {
-    console.warn(
-      `[chat-checkpoint] cleanupCheckpointRefs 读 rewind_points 失败 task=${taskId}:`,
-      err instanceof Error ? err.message : err,
-    );
-    return;
+  repoPaths: string[],
+): Promise<BuildCheckpointRefManifestResult> => {
+  const deletedAt = Date.now();
+  const paths = [...new Set(repoPaths.filter((p) => typeof p === "string" && p))];
+  if (paths.length === 0) {
+    return { ok: false, error: "no repoPaths to scan" };
   }
-  if (points.length === 0) return;
-
-  const repoPaths = new Set<string>();
-  for (const p of points) {
-    for (const s of p.repoSnapshots) {
-      if (s.repoPath) repoPaths.add(s.repoPath);
-    }
-  }
-
   const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
-  for (const repoPath of repoPaths) {
+  const checkpointRefs: CheckpointRefManifestEntry[] = [];
+  for (const repoPath of paths) {
     const listed = await runGit(repoPath, [
       "for-each-ref",
       "--format=%(refname)",
@@ -485,21 +529,300 @@ export const cleanupCheckpointRefsForTask = async (
     ]);
     if (!listed.ok) {
       console.warn(
+        `[chat-checkpoint] scanManifest for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
+      );
+      return {
+        ok: false,
+        error: `for-each-ref failed: ${repoPath}: ${listed.stderr || listed.ok}`,
+      };
+    }
+    const refs: string[] = [];
+    for (const line of listed.stdout.split("\n")) {
+      const name = line.trim();
+      if (name) refs.push(name);
+    }
+    checkpointRefs.push({ repoPath, refs });
+  }
+  return {
+    ok: true,
+    manifest: { deletedAt, checkpointRefs, repoPaths: paths },
+  };
+};
+
+/**
+ * 从 rewind_points + for-each-ref 提取本 task 的 checkpoint refs 清单。
+ * rewind 读失败 → ok:false（绝不降级空清单）。
+ * meta 三态——只有 valid meta 显式 repoPaths=[] 且 rewind 成功且相关扫描成功
+ * 才 confirmedEmpty；meta unknown/损坏 → ok:false（manifestPending），「目录存在」不再当零仓证据。
+ */
+export const buildCheckpointRefManifest = async (
+  taskId: string,
+): Promise<BuildCheckpointRefManifestResult> => {
+  const deletedAt = Date.now();
+  let points: RewindPoint[];
+  try {
+    points = await readRewindPoints(taskId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[chat-checkpoint] buildManifest 读 rewind_points 失败 task=${taskId}:`,
+      msg,
+    );
+    return { ok: false, error: `readRewindPoints: ${msg}` };
+  }
+  const repoPaths = new Set<string>();
+  // JSONL 里记下的 treeOid → 期望 ref 名（for-each-ref 失败时仍有显式清单）
+  const expectedByRepo = new Map<string, Set<string>>();
+  for (const p of points) {
+    for (const s of p.repoSnapshots) {
+      if (!s.repoPath) continue;
+      repoPaths.add(s.repoPath);
+      if (!s.treeOid) continue;
+      let set = expectedByRepo.get(s.repoPath);
+      if (!set) {
+        set = new Set();
+        expectedByRepo.set(s.repoPath, set);
+      }
+      set.add(checkpointRefName(taskId, s.treeOid));
+    }
+  }
+  // meta 三态合并 repoPaths——unknown 不得折叠成「无仓」
+  const metaRead = await readMetaV06Evidence(taskId);
+  if (metaRead.kind === "valid") {
+    for (const p of metaRead.value.repoPaths ?? []) {
+      if (p) repoPaths.add(p);
+    }
+  } else if (metaRead.kind === "unknown") {
+    console.warn(
+      `[chat-checkpoint] buildManifest meta 未知 task=${taskId}`,
+      metaRead.error,
+    );
+  }
+
+  // 零仓仅当 valid meta 显式 [] + rewind 已成功构建（走到这里）
+  if (repoPaths.size === 0) {
+    if (metaRead.kind === "unknown") {
+      return {
+        ok: false,
+        error:
+          "meta unknown with empty rewind repos — cannot confirm empty manifest",
+      };
+    }
+    if (metaRead.kind !== "valid") {
+      // meta absent：没有「显式 repoPaths=[]」证据，不得 confirmedEmpty（目录存在也不算）
+      return {
+        ok: false,
+        error:
+          "meta absent with empty rewind repos — cannot confirm empty manifest",
+      };
+    }
+    // valid meta + 显式空仓（repoPaths 合并后仍空）+ rewind 成功 → 合法零清单
+    return {
+      ok: true,
+      manifest: {
+        deletedAt,
+        checkpointRefs: [],
+        repoPaths: [],
+        confirmedEmpty: true,
+      },
+    };
+  }
+
+  const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
+  const checkpointRefs: CheckpointRefManifestEntry[] = [];
+  let anyScanFailed = false;
+  for (const repoPath of repoPaths) {
+    const refs = new Set<string>(expectedByRepo.get(repoPath) ?? []);
+    const listed = await runGit(repoPath, [
+      "for-each-ref",
+      "--format=%(refname)",
+      refPrefix,
+    ]);
+    if (listed.ok) {
+      for (const line of listed.stdout.split("\n")) {
+        const name = line.trim();
+        if (name) refs.add(name);
+      }
+    } else {
+      anyScanFailed = true;
+      console.warn(
+        `[chat-checkpoint] buildManifest for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
+      );
+    }
+    checkpointRefs.push({ repoPath, refs: [...refs] });
+  }
+  const totalRefs = checkpointRefs.reduce((n, e) => n + e.refs.length, 0);
+  // 扫失败且无任何已知 ref → 不能宣称「零 ref」
+  if (totalRefs === 0 && anyScanFailed) {
+    return {
+      ok: false,
+      error: "for-each-ref failed and no expected refs from rewind_points",
+    };
+  }
+  // meta unknown 但 rewind 带了仓路径——可扫则返回清单，绝不标 confirmedEmpty
+  return {
+    ok: true,
+    manifest: {
+      deletedAt,
+      checkpointRefs,
+      repoPaths: [...repoPaths],
+    },
+  };
+};
+
+/**
+ * 删除路径统一解析 manifest。
+ * - 若调用方已给 fallbackRepoPaths（journal 快照）→ **优先扫仓**（taskDir / rewind 可能已 rm，
+ *   build 会误得「合法空清单」导致 ref 泄漏）。
+ * - 否则先 rewind 构建，失败再按 meta.repoPaths 扫前缀。
+ * - fallback 为空且 taskDir/meta/rewind 恢复源已不存在 → ok:false（unknown），
+ *   绝不返回 ok-empty。
+ */
+export const resolveCheckpointRefManifestForDelete = async (
+  taskId: string,
+  fallbackRepoPaths?: string[],
+): Promise<BuildCheckpointRefManifestResult> => {
+  const fallback = (fallbackRepoPaths ?? []).filter(
+    (p): p is string => typeof p === "string" && p.length > 0,
+  );
+  // journal 带来的仓路径：taskDir 已删时唯一可信来源，禁止先走 build 吃到空成功
+  if (fallback.length > 0) {
+    const scanned = await scanCheckpointRefsFromRepoPaths(taskId, fallback);
+    if (scanned.ok) return scanned;
+    console.warn(
+      `[chat-checkpoint] resolveManifest：journal.repoPaths 扫失败 task=${taskId}: ${scanned.error}`,
+    );
+    return scanned;
+  }
+
+  const primary = await buildCheckpointRefManifest(taskId);
+  if (primary.ok) return primary;
+  // meta 三态——unknown 不得当「无仓」去碰 taskDir 假成功
+  const metaRead = await readMetaV06Evidence(taskId);
+  if (metaRead.kind === "unknown") {
+    console.error(
+      `[chat-checkpoint] resolveManifest：meta 未知、keep pending task=${taskId}`,
+      metaRead.error,
+    );
+    return {
+      ok: false,
+      error: `meta unknown — ${String(metaRead.error)}`,
+    };
+  }
+  const repos =
+    metaRead.kind === "valid"
+      ? (metaRead.value.repoPaths ?? []).filter(
+          (p): p is string => typeof p === "string" && p.length > 0,
+        )
+      : [];
+  if (repos.length === 0) {
+    // 无 fallback、无可信 meta 仓路径 → unknown（非空成功）
+    console.error(
+      `[chat-checkpoint] resolveManifest：manifestPending unknown（无可信 repoPaths）task=${taskId}`,
+    );
+    return {
+      ok: false,
+      error: primary.error,
+    };
+  }
+  console.warn(
+    `[chat-checkpoint] resolveManifest：rewind 失败、改扫 meta.repoPaths task=${taskId} repos=${repos.length}`,
+  );
+  return scanCheckpointRefsFromRepoPaths(taskId, repos);
+};
+
+/**
+ * 按清单删 checkpoint refs（幂等）。
+ * 先删清单内 refs，再 for-each-ref 扫前缀兜底（防清单不全）。
+ * 返回逐仓失败项——调用方必须写回 journal.refsPending，不能假成功删 journal。
+ * 测试挂点：首个成功 delete 后可注入崩溃。
+ */
+export const cleanupCheckpointRefsFromManifest = async (
+  taskId: string,
+  manifest: CheckpointRefManifest,
+): Promise<CheckpointRefCleanupResult> => {
+  const refPrefix = `${CHECKPOINT_REF_PREFIX}/${taskId}/`;
+  let deletedOnce = false;
+  // 优先只清 refsPending（boot 重试）；否则清全量 checkpointRefs
+  const entries =
+    manifest.refsPending && manifest.refsPending.length > 0
+      ? manifest.refsPending
+      : manifest.checkpointRefs;
+  const pending: CheckpointRefManifestEntry[] = [];
+  for (const entry of entries) {
+    const { repoPath } = entry;
+    const toDelete = new Set(entry.refs.filter(Boolean));
+    let forEachOk = true;
+    // 再扫一遍前缀——崩溃重试 / 清单落后时补漏
+    const listed = await runGit(repoPath, [
+      "for-each-ref",
+      "--format=%(refname)",
+      refPrefix,
+    ]);
+    if (listed.ok) {
+      for (const line of listed.stdout.split("\n")) {
+        const name = line.trim();
+        if (name) toDelete.add(name);
+      }
+    } else {
+      forEachOk = false;
+      console.warn(
         `[chat-checkpoint] cleanupCheckpointRefs for-each-ref 失败 task=${taskId} repo=${repoPath}: ${listed.stderr}`,
       );
-      continue;
     }
-    for (const ref of listed.stdout.split("\n")) {
-      const name = ref.trim();
-      if (!name) continue;
+    const failedRefs: string[] = [];
+    for (const name of toDelete) {
       const del = await runGit(repoPath, ["update-ref", "-d", name]);
       if (!del.ok) {
         console.warn(
           `[chat-checkpoint] cleanupCheckpointRefs 删 ref 失败 task=${taskId} repo=${repoPath} ref=${name}: ${del.stderr}`,
         );
+        failedRefs.push(name);
+        continue;
+      }
+      // 测试：首个成功删后可挂起，模拟「清到一半崩溃」
+      if (!deletedOnce) {
+        deletedOnce = true;
+        await failpoint("checkpointRefs.afterFirstDelete");
       }
     }
+    // for-each-ref 失败时无法确认前缀扫干净——整仓 refs 留 pending 给 boot 重试
+    if (!forEachOk || failedRefs.length > 0) {
+      pending.push({
+        repoPath,
+        refs: !forEachOk ? [...toDelete] : failedRefs,
+      });
+    }
   }
+  return { pending, allSucceeded: pending.length === 0 };
+};
+
+/**
+ * 删除任务前清理各仓里该 task 的 checkpoint refs。
+ * 不清理会让被删任务的历史 tree/blob 永久保留在用户仓里（refs 保活对象）。
+ * 须在 deleteTask 之前调用（还要能读到 rewind_points），或传入已落盘的 journal 清单。
+ * 返回逐项结果，不再吞成 void 成功。
+ * 无传入 manifest 时走 resolve；构建失败 → allSucceeded:false（禁止当零 ref）。
+ */
+export const cleanupCheckpointRefsForTask = async (
+  taskId: string,
+  manifest?: CheckpointRefManifest,
+): Promise<CheckpointRefCleanupResult> => {
+  let m = manifest;
+  if (!m) {
+    const resolved = await resolveCheckpointRefManifestForDelete(taskId);
+    if (!resolved.ok) {
+      return { pending: [], allSucceeded: false };
+    }
+    m = resolved.manifest;
+  }
+  if (m.manifestPending) {
+    return { pending: [], allSucceeded: false };
+  }
+  if (m.checkpointRefs.length === 0 && !m.refsPending?.length) {
+    return { pending: [], allSucceeded: true };
+  }
+  return cleanupCheckpointRefsFromManifest(taskId, m);
 };
 
 /**
@@ -698,7 +1021,7 @@ const formatRollbackNote = (
  * 尽量回到 rewind 前文件状态；安全点已先落盘，用户仍有恢复入口。
  * 后置写盘失败时还会尽量恢复 events.jsonl 原文，并把 rewind_points 恢复为
  * lockedPoints + safetyPoint（安全点保留——真实存在的安全快照，留着无害且有用）。
- * pruneCheckpointRefs 必须在 writeMeta 等最后一个可失败的提交写之后（复审 N4）：
+ * pruneCheckpointRefs 必须在 writeMeta 等最后一个可失败的提交写之后（）：
  * 否则 writeMeta 失败时 catch 能恢复 JSONL 引用，但 refs 已被删，随后 git gc 会清掉对象。
  */
 export const executeChatRewind = async (
@@ -712,7 +1035,7 @@ export const executeChatRewind = async (
   }
 
   try {
-    // T2：占位后立刻查 stop/DELETE lifecycle——闭合「rewind 刚起步、DELETE 已在收尾」
+    // 占位后立刻查 stop/DELETE lifecycle——闭合「rewind 刚起步、DELETE 已在收尾」
     // 反向竞态；抛错走 finally endChatRewind，勿与删除交叉改仓
     const lifecycle = getChatLifecycle(taskId);
     if (lifecycle === "stopping" || lifecycle === "deleting") {
@@ -823,7 +1146,9 @@ export const executeChatRewind = async (
         );
       }
       // 复查通过：清掉排队（防竞态下刚入队的旧上下文消息在回退后幽灵发送）
-      clearChatQueue(taskId);
+      // 走唯一终态 sink——复查后到清队之间若有消息挤入（202 已返回）、
+      // 它必须收到 queue_failed 终态、不能被裸 clear 静默丢
+      failQueuedItems(taskId, { reason: "rewound" });
 
       // —— preflight：确认目标 tree 仍在、events 里确有该 eventId ——
       for (const s of lockedTarget.repoSnapshots) {
@@ -928,7 +1253,7 @@ export const executeChatRewind = async (
 
       // 3–5) 截断 / 裁剪 rewind_points / 写 meta；失败则回滚仓 + 尽量恢复 events / points
       // closeSession 挪到写盘成功之后（纯内存、不会失败；门闩已挡新消息，无并发风险）
-      // 复审（11 轮）：truncate 成功 = 「仓库 + 对话」双双到位、rewind 实质已提交；
+      // truncate 成功 = 「仓库 + 对话」双双到位、rewind 实质已提交；
       // 此后的失败只能前滚（记账 best-effort），绝不能回滚仓库 / 写回 events——
       // 单侧补偿失败会留下契约禁止的半完成态（如仓库回退了、对话没恢复）。
       let truncateDone = false;
@@ -972,7 +1297,7 @@ export const executeChatRewind = async (
         freshMeta.updatedAt = Date.now();
         await writeMeta(freshMeta);
 
-        // prune 必须在最后一个可失败的提交写之后（复审 N4）：
+        // prune 必须在最后一个可失败的提交写之后（）：
         // writeMeta 成功 = 事务提交点；此前失败 catch 会恢复 points，refs 尚未动过无需重建。
         // best-effort：refs 多留无害，下次裁剪还会再删。
         if (discardedPoints.length > 0) {
@@ -996,7 +1321,7 @@ export const executeChatRewind = async (
           checkpointAt: lockedTarget.createdAt,
         };
       } catch (err) {
-        // 复审（11 轮）：truncate 已成功 → rewind 实质提交，只能前滚。
+        // truncate 已成功 → rewind 实质提交，只能前滚。
         // 失败的只是 rewind_points / meta 记账——best-effort 补写、关会话、按成功返回。
         // 绝不回滚仓库 / 写回 events（单侧补偿失败会制造「仓库回退了、对话没恢复」
         // 或反向的半完成态）；也绝不 5xx 诱导客户端重试破坏性 rewind。

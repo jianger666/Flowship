@@ -10,18 +10,14 @@
  *   - /api/tasks/[id]/action-exclude（awaiting_user 态划除时自动收尾——该态顶栏
  *     没有「停止」按钮、409 让用户先停止是死胡同、划除即隐含「这个 action 不要了」）
  *
- * R24-5c 调用方分析（未加 allowWithinLifecycle）：
+ * 调用方分析（未加 allowWithinLifecycle）：
  *   - DELETE / finalizeTask **不**调 stopTaskAgent——各自 begin deleting/finalizing + 自管收尾
  *   - 故 begin("stopping") 在 deleting/finalizing 下返 false → 直接 join 返回即可，
  *     无需 opts.allowWithinLifecycle 给 owner 显式委托
  */
 
 import { ACTION_LABEL, type Task } from "@/lib/types";
-import {
-  appendEvent,
-  finalizeStaleAndIdleLocked,
-  getTask,
-} from "./task-fs";
+import { finalizeStaleAndIdleLocked, getTask } from "./task-fs";
 import {
   abortRunningCheck,
   cancelTaskRun,
@@ -29,12 +25,15 @@ import {
 } from "./task-runner";
 import {
   isTaskStarting,
+  joinResourceJobs,
   pendingStopRequests,
   publishTaskStreamEvent,
+  revokeResourceJobs,
   revokeTaskOps,
+  writeEventAndPublish,
 } from "./task-stream";
 import { cancelChatRun } from "./chat-runner";
-import { clearChatQueue } from "./chat-queue";
+import { failQueuedItems } from "./chat-queue";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -47,6 +46,7 @@ import {
   cleanupChatTaskState,
   invalidateCallerToken,
 } from "./chat-pending";
+import { clearActionSideEffects } from "./action-side-effects";
 import { getTaskWorkRepoPaths } from "./task-worktrees";
 
 type StopResult = { hadAgent: boolean; task: Task };
@@ -86,8 +86,8 @@ const runStopTaskAgent = async (
 ): Promise<StopResult> => {
   const id = task.id;
 
-  // T1：收尾有多段 await——先占 stopping，挡住窗口内覆盖 cancelled lease 起新 Agent。
-  // R24-5c：lifecycle 排他——begin 失败且当前是 deleting/finalizing → join 让位，
+  // 收尾有多段 await——先占 stopping，挡住窗口内覆盖 cancelled lease 起新 Agent。
+  // lifecycle 排他——begin 失败且当前是 deleting/finalizing → join 让位，
   // 不 revoke、不写任何状态（terminal owner 负责收尾）。调用方分析见本文件顶注释。
   const beganStopping = beginChatLifecycle(id, "stopping");
   if (!beganStopping) {
@@ -102,14 +102,27 @@ const runStopTaskAgent = async (
     // 即使本 stop 稍后释放 lifecycle、pending 也被清掉，旧请求仍不得继续 Agent.create/send。
     revokeTaskOps(id);
 
-    // R26-4：begin("stopping") 成功后、首个 await 前同步失效 bridge lease——
+    // begin("stopping") 成功后、首个 await 前同步失效 bridge lease——
     // 旧 agent 的 MCP 立即被分派层拒（不等到 cleanupChatTaskState）。
     // join 分支（上面对 deleting/finalizing 直接 return）不走这里。
     if (beganStopping) {
       invalidateCallerToken(id);
     }
 
-    // R23-6 / R25-1：stop.afterGate 保留在 revoke 后、锁内收尾事务前（矩阵依赖此窗口）。
+    // 先 revoke（中止已挂 abort 的子进程），再 join。
+    // 超时 **不再开闸**——joinResourceJobs 置 quarantine（fail-closed）；
+    // HTTP 照常返回（用户不无限等），但后继 ensure 被拒直到旧事务 job 归零。
+    {
+      revokeResourceJobs(id);
+      const join = await joinResourceJobs(id);
+      if (join === "timeout") {
+        console.error(
+          `[stop-task] task=${id} resourceJobs join 超时、已 quarantine；继续 HTTP 收尾但不放行资源复用`,
+        );
+      }
+    }
+
+    // stop.afterGate 保留在 revoke 后、锁内收尾事务前（矩阵依赖此窗口）。
     // 旧实现在此无锁 getTask 重读——可与 append 的 commit rename await 交错漏扫；
     // 现改为 finalizeStaleAndIdleLocked 同把 task lock，见该 helper 线性化注释。
     await failpoint("stop.afterGate");
@@ -118,19 +131,21 @@ const runStopTaskAgent = async (
     // chat task 的 run 在 chat-runner 的 runningChats、正经 task 在 task-runner 的 runningTasks、
     // 一个 task 只落其一、两个都试、命中即停（cancelTaskRun 命中即短路、不会误触发 cancelChatRun）
     const hadAgent = cancelTaskRun(id) || cancelChatRun(id);
-    // P5.1：停止时清 chat 排队（积压消息不应在 stop 后再自动发）
-    clearChatQueue(id);
-    // S1：撤销启动 lease（标 cancelled），owner 在 checkpoint 窗口内复查失效后中止；
+    // 停止清队走唯一 sink（queue_failed + recentSettled），禁止直调 clear
+    failQueuedItems(id, { reason: "stopped" });
+    // 撤销启动 lease（标 cancelled），owner 在 checkpoint 窗口内复查失效后中止；
     // 不用 clearChatGate——不能清正在进行的 rewind 门闩（rewind 侧 finally 自己 endChatRewind）
     cancelChatStart(id);
-    // U1：idle 点停止时 cancelTaskRun 会写入 pendingStopRequests（防下次 oneshot 误杀），
+    // idle 点停止时 cancelTaskRun 会写入 pendingStopRequests（防下次 oneshot 误杀），
     // 无飞行消费者时才清。飞行中的启动链（Agent.create 窗口）需要这个标记自裁——
-    // 清了它 agent 就会在 create 返回后照常注册（U1 可复现时序）。
+    // 清了它 agent 就会在 create 返回后照常注册。
     // V2：startingTasks 已改 refcount——isTaskStarting 在任一 owner 仍飞行时为 true。
     if (!isTaskStarting(id)) {
       pendingStopRequests.delete(id);
     }
     cleanupChatTaskState(id);
+    // 清 action 屏障 Map——防 stop 后 submit_work 永久挂在 wait 上泄漏
+    clearActionSideEffects(id);
     // V0.8.18：取消正在后台跑的后置 check（杀 lint/typecheck 子进程、丢弃结果、不让它在停止后冒「产出完成」）
     abortRunningCheck(id);
 
@@ -140,7 +155,7 @@ const runStopTaskAgent = async (
     // worktree 路径仍可从入场快照取（目录结构不依赖 action 列表）
     reapTaskOrphans(getTaskWorkRepoPaths(task));
 
-    // 2+3) R25-1：非终态 action → cancelled + runStatus idle，同锁单次事务
+    // 2+3) 非终态 action → cancelled + runStatus idle，同锁单次事务
     // （与 appendAction 的 prepare→commit 共享 withTaskLock，必见刚提交的 running action）
     const live =
       (await finalizeStaleAndIdleLocked(id, { toStatus: "cancelled" })) ?? task;
@@ -170,15 +185,21 @@ const runStopTaskAgent = async (
         : opts.trigger === "exclude"
           ? `划除时自动停止了${actionLabel}（agent 已中断、可重新「推进」）`
           : `用户停止了${actionLabel}（agent 已中断、可重新「推进」）`;
-    const stopEvent = await appendEvent(id, {
+    // 用户 stop 操作——无条件 writeEventAndPublish（不带 lease）
+    // （stop-task 不在 no-restricted-syntax 文件名单内，无需 eslint-disable）
+    await writeEventAndPublish(id, {
       kind: "info",
       actionId: current?.id,
       text: stopText,
     });
 
     const fresh = (await getTask(id)) ?? live;
+    // task 快照仍需单独 publish（writeEventAndPublish 只推 event envelope）
     publishTaskStreamEvent(id, { kind: "task", task: fresh });
-    if (stopEvent) publishTaskStreamEvent(id, { kind: "event", event: stopEvent });
+    // stop 作为 lifecycle owner 补发 task 级 done——旧 run 的 cancelled 收尾在
+    // revoke 后被 publishIfCurrent 正确拒发、但前端 streamingText 靠 done 解挂；
+    // 纯 stop（无后继 run）场景没人再发 done、这里由终态 owner 无条件补上。
+    publishTaskStreamEvent(id, { kind: "done", task: fresh, ok: true });
 
     return { hadAgent, task: fresh };
   } finally {

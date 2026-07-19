@@ -855,6 +855,32 @@ export type EventKind =
   | "error";
 
 /**
+ * SSE 控制帧（纯内存 publish、不落 events.jsonl）。
+ * 队首 strict 落盘失败时整队作废；前端按 itemIds 精确清除 / 标错 pending。
+ * wire 形态：`{ type: "queue_failed", itemIds, reason }`（watch-task 外发）。
+ */
+export type QueueFailedSseEnvelope = {
+  type: "queue_failed";
+  itemIds: string[];
+  /**
+   * 机器可读原因：persist_failed / no_session / task_gone / flush_error
+   */
+  reason: string;
+};
+
+/**
+ * watch bootstrap 轻量信封——当前服务端 queue 存活 itemIds（队内 + in-flight）
+ * + 有界 recentSettled ledger（断线错过 queue_failed 时可重放对账）。
+ * 纯内存快照、不落盘。
+ */
+export type QueueStateSseEnvelope = {
+  type: "queue_state";
+  itemIds: string[];
+  /** 有界终态 ledger，重连 bootstrap 重放 */
+  recentSettled?: Array<{ itemId: string; outcome: string }>;
+};
+
+/**
  * tool_result 事件的 meta 契约（批 B 前端按此渲染可展开工具结果 / inline diff）。
  *
  * | 字段 | 类型 | 说明 |
@@ -914,6 +940,11 @@ export interface AskUserAnswer {
 export interface TaskEvent {
   id: string;
   ts: number;
+  /**
+   * per-task 进程内单调序号（写 jsonl 时在 append 链内发号）。
+   * 旧事件无此字段；读取端容忍 undefined。前端本轮不排序、供后续兜底。
+   */
+  seq?: number;
   kind: EventKind;
   actionId?: string;
   text: string;

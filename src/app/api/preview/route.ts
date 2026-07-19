@@ -13,6 +13,7 @@
 import { promises as fs } from "node:fs";
 import { NextResponse } from "next/server";
 
+import { getChatLifecycle } from "@/lib/server/chat-gate";
 import { errorResponse } from "@/lib/server/route-helpers";
 import { getRepoPreviewCommand } from "@/lib/server/settings-fs";
 import { getTask } from "@/lib/server/task-fs";
@@ -43,6 +44,14 @@ export const POST = async (req: Request) => {
 
   const task = await getTask(taskId);
   if (!task) return errorResponse("task 不存在", 404);
+  // finalize 清理窗内 / 终态任务拒起预览——finalize 会 stopPreviews 后
+  // removeTaskWorktrees，此窗口起的新 dev server 会变成 cwd 已删的孤儿进程
+  if (getChatLifecycle(taskId) !== null) {
+    return errorResponse("任务正在停止/终结、暂不能起预览", 409);
+  }
+  if (task.repoStatus === "merged" || task.repoStatus === "abandoned") {
+    return errorResponse("任务已终结、不能起预览", 409);
+  }
   const idx = task.repoPaths.indexOf(repoPath);
   if (idx < 0) {
     return errorResponse(`repoPath 不属于该任务：${repoPath}`);
@@ -65,14 +74,24 @@ export const POST = async (req: Request) => {
     );
   }
 
-  const { replacedTaskTitle, status } = await startPreview({
+  const started = await startPreview({
     taskId,
     taskTitle: task.title,
     repoPath,
     workDir,
     command,
   });
-  return NextResponse.json({ slot: status, replacedTaskTitle });
+  // 队列内最终准入拒绝（finalize/DELETE 已完成）→ 409，无新 pid
+  if (started.yielded) {
+    return errorResponse(
+      started.yieldReason ?? "任务已终结或正在停止、不能起预览",
+      409,
+    );
+  }
+  return NextResponse.json({
+    slot: started.status,
+    replacedTaskTitle: started.replacedTaskTitle,
+  });
 };
 
 export const DELETE = async (req: Request) => {

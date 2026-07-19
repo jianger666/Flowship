@@ -101,7 +101,7 @@ const {
   runTaskAction,
 } = chatPending;
 const { dispatchAskUserForTest } = await import("@/lib/server/chat-mcp");
-const { clearChatGate, endChatLifecycle } = await import(
+const { clearChatGate, endChatLifecycle, getChatLifecycle } = await import(
   "@/lib/server/chat-gate"
 );
 const { deliverTaskQuestion, finalizeTask } = await import(
@@ -494,13 +494,14 @@ describe("ownership R27 真实提交点矩阵", () => {
 
       type EnsureWithLease = (
         t: Task,
-        lease?: () => boolean,
+        lease: () => boolean,
       ) => Promise<{
         infos: unknown[];
         createdRepos: string[];
         clonedDeps: unknown[];
       }>;
       const ensure = ensureTaskWorktrees as EnsureWithLease;
+      // R28-1：让位抛错（不吞）——catch 收成 Error 断言
       const pEnsure = ensure(task, () => leaseOk).catch((err: unknown) => err);
 
       try {
@@ -514,16 +515,17 @@ describe("ownership R27 真实提交点矩阵", () => {
             "ensure.beforeWorktreeAdd 未接线（R27-2 依赖修复代理在 ensureTaskWorktrees 内插桩）",
           );
         }
-        await finalizeTask(id, "abandoned");
+        // R28-1：finalize 先占 finalizing，再翻 lease + release（防 join 死锁 + 保证失主）
+        const pFin = finalizeTask(id, "abandoned");
+        await waitUntil(() => getChatLifecycle(id) === "finalizing", 5000);
         leaseOk = false;
         hang.release();
+        await raceExpectSettled(pFin, 20_000);
         await raceExpectSettled(pEnsure, 15_000);
         const ensured = await pEnsure;
-        expect(ensured).not.toBeInstanceOf(Error);
-        const result = ensured as {
-          createdRepos: string[];
-        };
-        expect(result.createdRepos ?? []).toHaveLength(0);
+        // R28-1：让位必须是显式错误（不再吞成空 createdRepos）
+        expect(ensured).toBeInstanceOf(Error);
+        expect((ensured as Error).name).toBe("WorktreeLeaseLostError");
         const wtRoot = getTaskWorktreesDir(id);
         if (await dirExists(wtRoot)) {
           expect(await fs.readdir(wtRoot)).toHaveLength(0);

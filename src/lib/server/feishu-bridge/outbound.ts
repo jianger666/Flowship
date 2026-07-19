@@ -15,11 +15,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import { dataRoot } from "@/lib/server/data-root";
-import { appendEvent, getTask } from "@/lib/server/task-fs";
+import { getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
 import {
-  publishTaskStreamEvent,
   subscribeAllTaskStreams,
+  writeEventAndPublish,
   type TaskStreamEvent,
 } from "@/lib/server/task-stream";
 import type { Task, TaskEvent } from "@/lib/types";
@@ -808,13 +808,11 @@ const finalizeTurn = async (
     const fails = card.getFailCount();
     if (fails >= 3) {
       try {
-        const infoEvent = await appendEvent(taskId, {
+        // 系统 info：写+publish 同链（对齐 chat-reply 清队通知写法）
+        await writeEventAndPublish(taskId, {
           kind: "info",
           text: `飞书卡片推送异常（${fails} 次失败），本轮回复可能未同步到飞书`,
         });
-        if (infoEvent) {
-          publishTaskStreamEvent(taskId, { kind: "event", event: infoEvent });
-        }
       } catch (logErr) {
         console.warn(
           `[feishu-bridge/outbound] 写失败可见 info 失败 task=${taskId}:`,

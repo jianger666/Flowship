@@ -129,7 +129,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         slash.references.length > 0
           ? slash.references.map((s) => ({ name: s.name, absPath: s.absPath }))
           : undefined;
-      const updated = await submitTaskQuestion(
+      const result = await submitTaskQuestion(
         task.id,
         text,
         images,
@@ -137,7 +137,13 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
         pathAttach.paths,
         skillRefs,
       );
-      onTaskUpdate(updated);
+      // send 后落盘失败——不可忽略提示
+      if (result.persistWarning) {
+        toast.error(
+          `消息已送达但记录保存失败：${result.persistWarning}`,
+        );
+      }
+      onTaskUpdate(result.task);
       setDraft("");
       saveDraft("talk", task.id, "");
       slash.reset();

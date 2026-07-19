@@ -51,6 +51,8 @@ vi.mock("@/lib/server/chat-pending", () => ({
 }));
 
 vi.mock("@/lib/server/chat-queue", () => ({
+  // R33-1：stop 走 failQueuedItems（不再直调 clearChatQueue）
+  failQueuedItems: vi.fn(() => []),
   clearChatQueue: vi.fn(),
 }));
 

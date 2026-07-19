@@ -15,8 +15,7 @@ const {
   loadBridgeBootContext,
   findTaskByMessageId,
   getTask,
-  appendEvent,
-  publishTaskStreamEvent,
+  writeUserEventAndPublishStrict,
   getChatLifecycle,
   registerCardActionHandler,
 } = vi.hoisted(() => {
@@ -36,8 +35,7 @@ const {
     loadBridgeBootContext: vi.fn<AnyFn>(),
     findTaskByMessageId: vi.fn<AnyFn>(),
     getTask: vi.fn<AnyFn>(),
-    appendEvent: vi.fn<AnyFn>(),
-    publishTaskStreamEvent: vi.fn<AnyFn>(),
+    writeUserEventAndPublishStrict: vi.fn<AnyFn>(),
     getChatLifecycle: vi.fn<AnyFn>(() => null),
     registerCardActionHandler: vi.fn<AnyFn>(),
   };
@@ -74,11 +72,11 @@ vi.mock("@/lib/server/feishu-bridge/card-map", () => ({
 
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
-  appendEvent,
 }));
 
 vi.mock("@/lib/server/task-stream", () => ({
-  publishTaskStreamEvent,
+  writeUserEventAndPublishStrict,
+  PERSIST_WARNING_DELIVERED: "已送达但持久化失败",
 }));
 
 vi.mock("@/lib/server/chat-gate", () => ({
@@ -162,7 +160,7 @@ beforeEach(() => {
     model: { id: "composer-2" },
     repoPaths: [],
   });
-  appendEvent.mockResolvedValue({
+  writeUserEventAndPublishStrict.mockResolvedValue({
     id: "ev_reply",
     kind: "ask_user_reply",
     createdAt: Date.now(),
@@ -238,7 +236,7 @@ describe("handleCardActionEvent", () => {
     expect(String(replyText)).toContain("答：（未回答）");
 
     expect(clearPendingAsk).toHaveBeenCalledWith("task-1");
-    expect(appendEvent).toHaveBeenCalledWith(
+    expect(writeUserEventAndPublishStrict).toHaveBeenCalledWith(
       "task-1",
       expect.objectContaining({
         kind: "ask_user_reply",
@@ -300,7 +298,7 @@ describe("handleCardActionEvent", () => {
       model: { id: "composer-2" },
       repoPaths: [],
     });
-    appendEvent.mockResolvedValue({
+    writeUserEventAndPublishStrict.mockResolvedValue({
       id: "ev_reply",
       kind: "ask_user_reply",
       createdAt: Date.now(),

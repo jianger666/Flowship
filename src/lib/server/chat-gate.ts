@@ -1,7 +1,7 @@
 /**
  * Chat per-task 破坏性操作门闩 + 新会话启动占位（进程内原子状态）
  *
- * 解决两类竞态（2026-07-17 验收 P1 #1 / #6）：
+ * 解决两类竞态：
  *
  * 1. rewind（破坏性恢复仓库文件）与 chat-reply 启动新 run 并发：
  *    rewind 先 `tryBeginChatRewind` 占门闩，再复查「无运行中 / 无启动占位」；
@@ -12,18 +12,21 @@
  *    改为路由在决定起新会话前 `tryReserveChatStart` 同步占位（Node 单线程、
  *    check-and-set 原子），失败方转入队。
  *
- * S1（十二轮）：启动预约改为可取消 lease（token + cancelled）。
+ * 启动预约改为可取消 lease（token + cancelled）。
  * stop/DELETE 在 checkpoint 长窗口内到达时 `cancelChatStart` 标取消，
  * owner 在每个 await 后用 `isChatStartLeaseValid` 发现并中止，避免为已删任务
  * 落 user_reply / 置 running / 起 SDK agent。
  *
- * T1（十三轮）：stop/DELETE 收尾有多段 await，仅 cancel 一次不够——cancelled
+ * stop/DELETE 收尾有多段 await，仅 cancel 一次不够——cancelled
  * lease 曾允许立刻被新请求覆盖并起新 Agent。增加 per-task lifecycle
  *（stopping / deleting）：进行中一律拒绝 tryReserve / 使 lease 失效；
  * stop 完成后才放开「立刻重发」。
  *
- * R23-7：finalize 也占 lifecycle（finalizing）——与 stopping 同级、deleting 可从二者升级；
+ * finalize 也占 lifecycle（finalizing）——与 stopping 同级、deleting 可从二者升级；
  * 终结窗口内 isOpOwner 全 false，新 advance 不得合法 claim。
+ *
+ * reopen 原子占 `reopening`——与 finalizing/deleting/stopping 互斥；
+ * DELETE 已占 deleting 时 reopen begin 失败 → 409（关并发穿越写 developing）。
  *
  * 状态挂 globalThis：Next dev 多 chunk 下纯模块级 Map 会分裂（同 chat-queue）。
  * 纯同步、无 IO——调用方必须在「检查 → 动作」之间不让出事件循环，才有原子性。
@@ -35,10 +38,15 @@ interface StartLease {
 }
 
 /**
- * stop / DELETE / finalize 收尾窗口的生命周期相位。
- * 优先级：deleting > stopping = finalizing（后两者互不覆盖、deleting 可从二者升级）。
+ * stop / DELETE / finalize / reopen 收尾窗口的生命周期相位。
+ * 优先级：deleting > stopping = finalizing = reopening
+ * （后三者互不覆盖；deleting 可从 stopping/finalizing/reopening 升级）。
  */
-export type ChatLifecyclePhase = "stopping" | "deleting" | "finalizing";
+export type ChatLifecyclePhase =
+  | "stopping"
+  | "deleting"
+  | "finalizing"
+  | "reopening";
 
 interface ChatGateGlobalState {
   /** rewind 进行中的 taskId */
@@ -51,14 +59,14 @@ interface ChatGateGlobalState {
   /** 下一枚启动预约 token（模块级单调） */
   nextStartToken: number;
   /**
-   * stop / DELETE / finalize 收尾进行中——此窗口内禁止覆盖 cancelled lease、禁止新预约。
-   * deleting 优先于 stopping / finalizing（可升级、不可降级）。
+   * stop / DELETE / finalize / reopen 收尾进行中——此窗口内禁止覆盖 cancelled lease、禁止新预约。
+   * deleting 优先于 stopping / finalizing / reopening（可升级、不可降级）。
    */
   lifecycle: Map<string, ChatLifecyclePhase>;
 }
 
-// V4：加 finalizing；换 key 防 hot-reload 读到只知 stopping/deleting 的旧 V3 state
-const CHAT_GATE_GLOBAL_KEY = "__feAiFlowChatGateV4__";
+// V5：加 reopening；换 key 防 hot-reload 读到不知 reopening 的旧 V4 state
+const CHAT_GATE_GLOBAL_KEY = "__feAiFlowChatGateV5__";
 
 const getState = (): ChatGateGlobalState => {
   const g = globalThis as unknown as Record<
@@ -102,20 +110,20 @@ export const isChatRewindInProgress = (taskId: string): boolean =>
 
 // ----------------- stop / DELETE / finalize 生命周期 -----------------
 //
-// T1/U1：lifecycle 是 task-wide 操作门——不止 chat-reply，task 模式的
+// lifecycle 是 task-wide 操作门——不止 chat-reply，task 模式的
 // /advance、/question、/ask-reply 与 internalStartAgent / sendToTaskSession
 // 也在关键点读 getChatLifecycle；进行中一律拒绝新启动/作废 pendingStop。
-// R23-7：finalizing 与 stopping 同级——finalize 期间新 advance 的 isOpOwner 失败。
+// finalizing 与 stopping 同级——finalize 期间新 advance 的 isOpOwner 失败。
 
 /**
- * 进入 stop / DELETE / finalize 收尾窗口。
+ * 进入 stop / DELETE / finalize / reopen 收尾窗口。
  *
- * 语义（R23-7）：
+ * 语义：
  * - 无相位 → 写入 phase、返 true（调用方拥有、负责 end）
  * - 同 phase 重入 → 返 false（勿 end，避免清掉进行中的同相位 owner）
- * - 已是 deleting → begin 任何相位返 false（deleting 优先、不可降级）
- * - 已是 stopping / finalizing → begin("deleting") 升级并返 true；
- *   begin("stopping") 在 finalizing 时返 false、反之亦然（同级互不覆盖）
+ * - 已是 deleting → begin 任何相位返 false（deleting 优先、不可降级；reopen 一律 409）
+ * - 已是 stopping / finalizing / reopening → begin("deleting") 升级并返 true；
+ *   begin("stopping"|"finalizing"|"reopening") 在其它同级相位时返 false（互不覆盖）
  */
 export const beginChatLifecycle = (
   taskId: string,
@@ -128,17 +136,19 @@ export const beginChatLifecycle = (
     return true;
   }
   if (current === phase) return false;
-  // deleting 优先：不可被 stopping / finalizing 覆盖
+  // deleting 优先：不可被 stopping / finalizing / reopening 覆盖
   if (current === "deleting") return false;
-  // stopping / finalizing → deleting 可升级（DELETE 在收尾窗口到达）
+  // stopping / finalizing / reopening → deleting 可升级（DELETE 在收尾窗口到达）
   if (
-    (current === "stopping" || current === "finalizing") &&
+    (current === "stopping" ||
+      current === "finalizing" ||
+      current === "reopening") &&
     phase === "deleting"
   ) {
     s.lifecycle.set(taskId, phase);
     return true;
   }
-  // stopping ↔ finalizing 同级：互不覆盖
+  // stopping ↔ finalizing ↔ reopening 同级：互不覆盖
   return false;
 };
 
@@ -171,12 +181,12 @@ export const getChatLifecycle = (
  *
  * 已取消（cancelled）的旧 lease：仅在无 lifecycle 时允许新请求覆盖——
  * 允许 stop **完成**后立刻重发；stop/DELETE 收尾 await 期间由 lifecycle 挡住，
- * 避免「停止成功但新 Agent 已起」（T1）。
+ * 避免「停止成功但新 Agent 已起」。
  */
 export const tryReserveChatStart = (taskId: string): number | null => {
   const s = getState();
   if (s.rewinding.has(taskId)) return null;
-  // T1：stopping/deleting/finalizing 收尾窗口内禁止新预约（含覆盖 cancelled）
+  // stopping/deleting/finalizing/reopening 收尾窗口内禁止新预约（含覆盖 cancelled）
   if (s.lifecycle.has(taskId)) return null;
   const existing = s.startReservations.get(taskId);
   if (existing && !existing.cancelled) return null;
@@ -232,7 +242,7 @@ export const hasChatStartReservation = (taskId: string): boolean =>
 /**
  * 测试 / 删任务收尾用：清某 task 的全部门闩状态（含 lifecycle）。
  * 只能在确认 rewind 已退出、所有 owner 已终止后调用——DELETE 须先等待
- * rewind 结束，再 clear（否则会替仍在跑的 rewind「释放」门闩，见 T2）。
+ * rewind 结束，再 clear（否则会替仍在跑的 rewind「释放」门闩，见）。
  */
 export const clearChatGate = (taskId: string): void => {
   const s = getState();

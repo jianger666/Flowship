@@ -91,6 +91,8 @@ interface PendingLocalItem {
   kind: "__pending_local__";
   id: string;
   text: string;
+  /** HTTP 不确定时为 true（与 network 轴对齐） */
+  uncertain?: boolean;
 }
 
 type RenderItem = StreamRenderItem | StreamingItem | LoadingItem | PendingLocalItem;
@@ -217,6 +219,8 @@ interface Props {
     id: string;
     text: string;
     displayText: string;
+    /** HTTP 不确定 */
+    uncertain?: boolean;
   }>;
   /** P5：排队条文案 / 节点（渲染在 composer 上方） */
   queueBanner?: ReactNode;
@@ -313,6 +317,7 @@ const EventStreamImpl = ({
           kind: "__pending_local__",
           id: p.id,
           text: p.displayText,
+          uncertain: p.uncertain,
         }),
       ),
     ];
@@ -359,7 +364,7 @@ const EventStreamImpl = ({
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   // 拉取飞行中（顶部小 spinner、渲染用）
   const [loadingEarlier, setLoadingEarlier] = useState(false);
-  // 同步重入闸（蓝军 P1：state 版有一帧延迟、startReached 同帧可双进 → firstItemIndex 多减）
+  // 同步重入闸（state 版有一帧延迟、startReached 同帧可双进 → firstItemIndex 多减）
   const loadingEarlierRef = useRef(false);
   // 是否已经拉过至少一页（防 SSE 重连把 eventsTruncated 重新置 true 时误重开分页）
   const pagedOnceRef = useRef(false);
@@ -403,7 +408,7 @@ const EventStreamImpl = ({
       );
       if (taskIdRef.current !== requestedTaskId) return;
       pagedOnceRef.current = true;
-      // 先按当前本地事件去重（蓝军 P1：飞行期间本地可能已合入部分重叠事件、
+      // 先按当前本地事件去重（飞行期间本地可能已合入部分重叠事件、
       // 用原始 older 算差值会虚高 → firstItemIndex 多减 → 滚动错位）
       const cur = latestEventsRef.current;
       const known = new Set(cur.map((e) => e.id));
@@ -740,7 +745,10 @@ const EventStreamImpl = ({
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
                 ) : isPendingLocalItem(item) ? (
-                  <PendingLocalReplyRow text={item.text} />
+                  <PendingLocalReplyRow
+                    text={item.text}
+                    uncertain={item.uncertain}
+                  />
                 ) : isToolBlock(item) ? (
                   <ToolBlockRow
                     block={item}

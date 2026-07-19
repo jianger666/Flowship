@@ -529,10 +529,15 @@ describe("ownership R26 真实 sink 窗口矩阵", () => {
       // 挂起点在 worktree add 前 → ensure 尚未被调
       expect(mockEnsureTaskWorktrees).not.toHaveBeenCalled();
 
-      await finalizeTask(id, "abandoned");
+      // R28-1：finalize 先占 finalizing + revoke，再 join starting。
+      // 等 lifecycle 已 finalizing 再 release——prewarm 的 stillPrewarm 必假、不调 ensure；
+      // 同时 starting 随后归零，join 不会空等到 30s。
+      const pFin = finalizeTask(id, "abandoned");
+      await waitUntil(() => getChatLifecycle(id) === "finalizing", 5000);
+      hang.release();
+      await pFin;
       expect((await readMetaV06(id))?.repoStatus).toBe("abandoned");
 
-      hang.release();
       // prewarm 是 fire-and-forget：deadline 内轮询确认 ensure 始终不被调（不裸 sleep 当收敛）
       await waitUntil(async () => {
         const m = await readMetaV06(id);
@@ -959,34 +964,21 @@ describe("ownership R26 真实 sink 窗口矩阵", () => {
       const checkB = { actionId: "act_b", controller };
       runningChecks.set(id, checkB);
 
-      const hang = installHangingFailpoint("mcp.submitWork.beforeAbortCheck");
-      // 管道适配：AwaitingNotifier 返回 void | Promise<void>——包成 Promise 供 raceExpectSettled
-      const pNotify = Promise.resolve(
-        awaitingNotifier(
-          {
-            kind: "awaiting_start",
-            actionId: "act_a",
-            artifactPath: "actions/1-plan.md",
-          },
-          { callerStillValid: () => true },
-        ),
+      // R29-1：waitAndClaimPostCheck 每轮验 action lease——旧 A 直接 invalid/stale，
+      // 不再走到 beforeAbortCheck；语义不变：不得 abort B、不得登记 A 的 check
+      const outcome = await awaitingNotifier(
+        {
+          kind: "awaiting_start",
+          actionId: "act_a",
+          artifactPath: "actions/1-plan.md",
+        },
+        { callerStillValid: () => true },
       );
-      await hang.waitHit();
-
-      // 挂起期间 B 的 check 仍在
-      expect(runningChecks.get(id)).toBe(checkB);
-      expect(abortSpy).not.toHaveBeenCalled();
-
-      hang.release();
-      await raceExpectSettled(pNotify, 8000);
-      await sleep(40);
-
-      // B 的 check 不被 abort；runningChecks 仍是 B（或至少 abort spy 未调）
+      expect(outcome).toBe("stale");
       expect(abortSpy).not.toHaveBeenCalled();
       const still = runningChecks.get(id);
+      expect(still).toBe(checkB);
       expect(still?.actionId).toBe("act_b");
-      // A 不得把自己登记成新 check
-      expect(still?.actionId).not.toBe("act_a");
     },
     15_000,
   );

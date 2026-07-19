@@ -17,7 +17,7 @@
  * - 500 文件恢复失败
  */
 
-import { appendEvent, getTask } from "@/lib/server/task-fs";
+import { getTask } from "@/lib/server/task-fs";
 import {
   closeChatSessionUnconditional,
   isChatCompactInProgress,
@@ -28,7 +28,10 @@ import {
   executeChatRewind,
   RewindError,
 } from "@/lib/server/chat-checkpoint";
-import { publishTaskStreamEvent } from "@/lib/server/task-stream";
+import {
+  publishTaskStreamEvent,
+  writeEventAndPublish,
+} from "@/lib/server/task-stream";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -62,13 +65,9 @@ export const POST = async (req: Request, { params }: Ctx) => {
       isRunActive: isChatRunActive,
       isCompactInProgress: isChatCompactInProgress,
       isQueueDraining: isChatQueueDraining,
-      appendInfoEvent: async (taskId, text) => {
-        const ev = await appendEvent(taskId, { kind: "info", text });
-        if (ev) {
-          publishTaskStreamEvent(taskId, { kind: "event", event: ev });
-        }
-        return ev;
-      },
+      // rewind info 改 writeEventAndPublish——磁盘序 = SSE 序（用户操作、无条件语义）
+      appendInfoEvent: async (taskId, text) =>
+        writeEventAndPublish(taskId, { kind: "info", text }),
       getTask,
     });
 

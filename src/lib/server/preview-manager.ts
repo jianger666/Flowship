@@ -24,9 +24,76 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { dataRoot } from "./data-root";
+import { getChatLifecycle } from "./chat-gate";
+import { failpoint } from "./failpoints";
 import type { PreviewSlotStatus } from "@/lib/types";
 
 const execFileAsync = promisify(execFile);
+
+// ----------------- per-task「启动中」计数（入队 → spawn 完成） -----------------
+
+const PREVIEW_STARTING_KEY = "__feAiFlowPreviewStartingV1__";
+const getPreviewStartingMap = (): Map<string, number> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, number> | undefined
+  >;
+  if (!g[PREVIEW_STARTING_KEY]) g[PREVIEW_STARTING_KEY] = new Map();
+  return g[PREVIEW_STARTING_KEY]!;
+};
+
+const beginPreviewStarting = (taskId: string): void => {
+  const m = getPreviewStartingMap();
+  m.set(taskId, (m.get(taskId) ?? 0) + 1);
+};
+
+const endPreviewStarting = (taskId: string): void => {
+  const m = getPreviewStartingMap();
+  const n = (m.get(taskId) ?? 0) - 1;
+  if (n <= 0) m.delete(taskId);
+  else m.set(taskId, n);
+};
+
+/** 测试可见：某 task 是否仍有 startPreview 在「入队→spawn 完成」窗口 */
+export const hasPreviewStarting = (taskId: string): boolean =>
+  (getPreviewStartingMap().get(taskId) ?? 0) > 0;
+
+/**
+ * 等「启动中」归零（上限 ms）。
+ * lifecycle 已占时 in-flight start 会在 spawn 前 admission 自退，短等即可，
+ * 避免与卡在 preview.beforeSpawn 的 start 空耗满 10s。
+ */
+const waitPreviewStartingClear = async (
+  taskId: string,
+  maxMs: number,
+): Promise<void> => {
+  const deadline = Date.now() + maxMs;
+  while (hasPreviewStarting(taskId) && Date.now() < deadline) {
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+};
+
+/**
+ * spawn 前最终准入——fresh 读盘 repoStatus + lifecycle。
+ * 用 readTaskRepoStatusFresh（轻量、不 hydrate）避 preview-manager ↔ task-fs 环，
+ * 且不踩 getTask 的 hydrate failpoint。
+ */
+const admitPreviewSpawn = async (
+  taskId: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> => {
+  if (getChatLifecycle(taskId) !== null) {
+    return { ok: false, reason: "任务正在停止/终结、暂不能起预览" };
+  }
+  const { readTaskRepoStatusFresh } = await import("./task-fs");
+  const status = await readTaskRepoStatusFresh(taskId);
+  if (status === null) {
+    return { ok: false, reason: "task 不存在" };
+  }
+  if (status === "merged" || status === "abandoned") {
+    return { ok: false, reason: "任务已终结、不能起预览" };
+  }
+  return { ok: true };
+};
 
 // ----------------- 类型 -----------------
 
@@ -361,9 +428,18 @@ export const stopPreview = (repoPath: string): Promise<void> =>
 /** 停全部预览位（boot / DELETE 不带 repoPath / 全清用） */
 export const stopAllPreviews = (): Promise<void> => enqueue(doStopAllPreviews);
 
-/** 停掉属于某 task 的所有 slot（删任务 / 终结任务前调用） */
-export const stopPreviewsForTask = (taskId: string): Promise<void> =>
-  enqueue(() => doStopPreviewsForTask(taskId));
+/**
+ * 停掉属于某 task 的所有 slot（删任务 / 终结任务前调用）。
+ * 先等「启动中」归零（覆盖已过 route 闸、还在队列里的 start），再停已有 slot。
+ * 不经全局 start 队列直接停——避免与卡在 preview.beforeSpawn 的 doStartPreview 死锁；
+ * spawn 后另有终态复查自停孤儿。
+ */
+export const stopPreviewsForTask = async (taskId: string): Promise<void> => {
+  // lifecycle 已占（finalize/DELETE）→ admission 会挡 spawn，短等；否则最多 ~10s
+  const cap = getChatLifecycle(taskId) !== null ? 500 : 10_000;
+  await waitPreviewStartingClear(taskId, cap);
+  await doStopPreviewsForTask(taskId);
+};
 
 const doStopPreview = async (repoPath: string): Promise<void> => {
   const map = getSlotsRef();
@@ -402,19 +478,33 @@ export interface StartPreviewInput {
   command: string;
 }
 
+/** startPreview 返回值；yielded=true 表示最终准入拒绝、未 spawn（route → 409） */
+export interface StartPreviewResult {
+  replacedTaskTitle: string | null;
+  status: PreviewSlotStatus;
+  /** spawn 前最终准入失败 */
+  yielded?: boolean;
+  yieldReason?: string;
+}
+
 /**
  * 起预览（按仓单位：只停同 repoPath 旧位、其它仓不动）。
  * 经全局串行队列（CR-10）：同仓并发双 start 顺序执行、后到的顶掉先到的。
- * @returns 被顶掉的同仓别的任务标题（UI toast 用、没有则 null）
+ * 入队起登记「启动中」，cleanup 后、spawn 前最终准入复查。
  */
 export const startPreview = (
   input: StartPreviewInput,
-): Promise<{ replacedTaskTitle: string | null; status: PreviewSlotStatus }> =>
-  enqueue(() => doStartPreview(input));
+): Promise<StartPreviewResult> => {
+  // 入队即登记——stopPreviewsForTask 可等「还在队列里」的窗口
+  beginPreviewStarting(input.taskId);
+  return enqueue(() => doStartPreview(input)).finally(() => {
+    endPreviewStarting(input.taskId);
+  });
+};
 
 const doStartPreview = async (
   input: StartPreviewInput,
-): Promise<{ replacedTaskTitle: string | null; status: PreviewSlotStatus }> => {
+): Promise<StartPreviewResult> => {
   const map = getSlotsRef();
   const replaced = map.get(input.repoPath) ?? null;
   const replacedTaskTitle =
@@ -426,6 +516,31 @@ const doStartPreview = async (
   //（直接调 do 版本：本函数已在队列内、再 enqueue 会自锁）
   await doStopPreview(input.repoPath);
   await killStalePreviewForRepo(input.repoPath);
+
+  // cleanup 之后、紧贴 spawn 前——插桩 + 最终准入（fresh task + lifecycle）
+  await failpoint("preview.beforeSpawn");
+  const admission = await admitPreviewSpawn(input.taskId);
+  if (!admission.ok) {
+    // 让位：不 spawn；合成已退出 status 给调用方（无 pid）
+    const yieldedStatus: PreviewSlotStatus = {
+      taskId: input.taskId,
+      taskTitle: input.taskTitle,
+      repoPath: input.repoPath,
+      workDir: input.workDir,
+      command: input.command,
+      startedAt: Date.now(),
+      url: null,
+      exited: true,
+      exitCode: null,
+      logTail: [`最终准入拒绝——${admission.reason}`],
+    };
+    return {
+      replacedTaskTitle: null,
+      status: yieldedStatus,
+      yielded: true,
+      yieldReason: admission.reason,
+    };
+  }
 
   // shell 模式跑用户配置的命令串（可能带 && / 环境变量前缀）。
   // - unix：detached 自成进程组、kill(-pid) 整组杀
@@ -509,6 +624,24 @@ const doStartPreview = async (
       command: input.command,
       repoPath: input.repoPath,
     });
+  }
+
+  // spawn 后终态复查——stopPreviewsForTask 可能已在 admission~map.set 窗口跑过
+  const post = await admitPreviewSpawn(input.taskId);
+  if (!post.ok) {
+    map.delete(input.repoPath);
+    if (proc.pid) await killProcessGroup(proc.pid);
+    await clearPidFileIf(token);
+    return {
+      replacedTaskTitle: null,
+      status: {
+        ...toStatus(slot),
+        exited: true,
+        logTail: [`spawn 后复查拒绝——${post.reason}`],
+      },
+      yielded: true,
+      yieldReason: post.reason,
+    };
   }
 
   return { replacedTaskTitle, status: toStatus(slot) };

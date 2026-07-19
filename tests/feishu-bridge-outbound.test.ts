@@ -20,7 +20,7 @@ const getTask = vi.hoisted(() =>
   })),
 );
 
-const appendEvent = vi.hoisted(() =>
+const writeEventAndPublish = vi.hoisted(() =>
   vi.fn(async (taskId: string, ev: { kind: string; text?: string }) => ({
     id: `ev_${ev.kind}_${Date.now()}`,
     kind: ev.kind,
@@ -32,8 +32,15 @@ const appendEvent = vi.hoisted(() =>
 
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
-  appendEvent,
 }));
+
+vi.mock("@/lib/server/task-stream", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/server/task-stream")>();
+  return {
+    ...actual,
+    writeEventAndPublish,
+  };
+});
 
 vi.mock("@/lib/server/feishu-bridge/bridge-config", () => ({
   isFeishuChatBridgeEnabled: vi.fn(async () => true),
@@ -127,7 +134,7 @@ beforeEach(() => {
     mode: "chat" as const,
     model: { id: "grok-4" },
   }));
-  appendEvent.mockClear();
+  writeEventAndPublish.mockClear();
   uploadImage.mockClear();
   __setCreateCardStreamForTest(
     cardFactory.create as unknown as Parameters<
@@ -537,7 +544,7 @@ describe("turn 状态机", () => {
   });
 
   // review P1#4 / 坑 #10：连续出向失败 app 内可见
-  it("finalize 时 failCount>=3 → appendEvent info 可见提示", async () => {
+  it("finalize 时 failCount>=3 → writeEventAndPublish info 可见提示", async () => {
     const createWithFails = vi.fn(() => {
       const card: CardMock = {
         start: vi.fn(async () => undefined),
@@ -570,7 +577,7 @@ describe("turn 状态机", () => {
     });
     await flush();
 
-    expect(appendEvent).toHaveBeenCalledWith(
+    expect(writeEventAndPublish).toHaveBeenCalledWith(
       taskId,
       expect.objectContaining({
         kind: "info",

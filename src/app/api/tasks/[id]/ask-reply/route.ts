@@ -23,14 +23,13 @@
  * 2. 逐题落盘各自的图、拼接 [ASK_USER_REPLY] 文本（每题答案下内联「本题附图：<basename>」做归属）
  * 3. `agent.send([ASK_USER_REPLY]…)` 续同一会话送达答案（deliverAskReply）
  * 4. 写 ask_user_reply 事件（meta 带 askId + answers + deferred + images 扁平数组给前端渲缩略图）+ publish SSE
- * 5. 响应里的 task 现读 getTask（R20-2：不再迟到刷 running——deliver/consume 内部已有 owner 门控写）
+ * 5. 响应里的 task 现读 getTask（不再迟到刷 running——deliver/consume 内部已有 owner 门控写）
  */
 
 import path from "node:path";
 
 import type { AskUserAnswer, AskUserQuestion } from "@/lib/types";
 import {
-  appendEvent,
   getTask,
   setTaskRunStatusIfRunOwner,
 } from "@/lib/server/task-fs";
@@ -55,8 +54,12 @@ import {
   agentSessions,
   getTaskOpGeneration,
   isTaskOpCurrent,
+  PERSIST_FAIL_RETRY_MESSAGE,
+  PERSIST_WARNING_DELIVERED,
   publishTaskStreamEvent,
   snapshotTaskOp,
+  writeEventAndPublish,
+  writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
 import {
@@ -225,7 +228,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const task = await getTask(id);
   if (!task) return errorResponse("not_found", 404);
 
-  // U1 / R24-5a：lifecycle 非 null（stopping/deleting/finalizing）一律拒送达 / 唤醒
+  // lifecycle 非 null（stopping/deleting/finalizing）一律拒送达 / 唤醒
   {
     const life = getChatLifecycle(id);
     if (life !== null) {
@@ -239,7 +242,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
-  // W2：读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 事件等长 await
+  // 读完 task + lifecycle 闸后立刻同步取 admission——其后有存图 / 事件等长 await
   const opGen = getTaskOpGeneration(task.id);
 
   const reqEvent = [...task.events]
@@ -366,7 +369,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     allAbsPaths: string[],
     reason: string,
   ): Promise<Response | null> => {
-    // X1：wake 前复查——stale 不得清 pending / 记「已答」
+    // wake 前复查——stale 不得清 pending / 记「已答」
     if (isTaskOpStale(task.id, opGen)) {
       return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
     }
@@ -379,19 +382,30 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (!currentAction || !boot.apiKey || !boot.model) return null;
     }
 
+    // 唤醒 = send/start 前落盘——先 strict 写用户回答，成功后再清 pending
+    try {
+      const wrote = await writeUserEventAndPublishStrict(task.id, {
+        kind: "ask_user_reply",
+        actionId: reqEvent.actionId,
+        text: replyText,
+        meta: {
+          askId,
+          answers,
+          ...(deferred ? { deferred: true } : {}),
+          ...(allSaved.length > 0 ? { images: allSaved } : {}),
+        },
+      });
+      if (!wrote) {
+        return errorResponse("not_found", 404);
+      }
+    } catch (persistErr) {
+      console.error(
+        `[ask-reply] 唤醒前落盘失败 task=${task.id}:`,
+        persistErr,
+      );
+      return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
+    }
     clearPendingAsk(task.id);
-    const replyEv = await appendEvent(task.id, {
-      kind: "ask_user_reply",
-      actionId: reqEvent.actionId,
-      text: replyText,
-      meta: {
-        askId,
-        answers,
-        ...(deferred ? { deferred: true } : {}),
-        ...(allSaved.length > 0 ? { images: allSaved } : {}),
-      },
-    });
-    if (replyEv) publishTaskStreamEvent(task.id, { kind: "event", event: replyEv });
     console.log(
       `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（${isChat ? "chat 新会话" : "新 agent"}接手、答案随消息带过去）`,
     );
@@ -404,11 +418,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
         boot,
       ).catch(async (err) => {
         console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
-        const ev = await appendEvent(task.id, {
+        await writeEventAndPublish(task.id, {
           kind: "error",
           text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
         });
-        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
       });
     } else {
       void resumeCurrentActionWithMessage({
@@ -421,12 +434,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
         opGen,
       }).catch(async (err) => {
         console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
-        const ev = await appendEvent(task.id, {
+        await writeEventAndPublish(task.id, {
           kind: "error",
           actionId: reqEvent.actionId,
           text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
         });
-        if (ev) publishTaskStreamEvent(task.id, { kind: "event", event: ev });
       });
     }
     const fresh = await getTask(task.id);
@@ -455,13 +467,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
       console.log(
         `[ask-reply] task=${task.id} askId=${askId} 提问已失效（被顶替 / agent 在跑、runStatus=${fresh.runStatus}）、作废旧弹窗`,
       );
-      const info = await appendEvent(task.id, {
+      // 作废提示事件写+publish 同链
+      await writeEventAndPublish(task.id, {
         kind: "info",
         actionId: reqEvent.actionId,
         text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
         meta: { supersededAskId: askId },
       });
-      if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
       return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
     }
 
@@ -469,7 +481,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 旧逻辑当场 410 + 标 error → 答题卡 isStale「用输入条唤醒」+ 输入条因未了结 ask
     // 仍禁用 = 对锁死。有凭据则接受答案并唤醒；没凭据才作废提问 + 标 error 放行输入条。
     if (fresh.runStatus === "awaiting_user") {
-      // R23-3d：入场判定僵尸态处立刻 snapshot——B claim 后（写 running 前）本 observer
+      // 入场判定僵尸态处立刻 snapshot——B claim 后（写 running 前）本 observer
       // 即失效，闭包不再只靠 opGen（同 gen claim 看不见）。
       const zombieObserver = snapshotTaskOp(task.id);
       console.warn(
@@ -485,10 +497,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
       if (woken) return woken;
 
-      // R19 收尾补漏：僵尸兜底前有多段 await（存图 / wake），期间 stop（bump gen）或
+      // 收尾补漏：僵尸兜底前有多段 await（存图 / wake），期间 stop（bump gen）或
       // 别的入口把任务拉起（session 复活）都可能发生——裸写 error 会覆盖新 owner。
-      // R23-3d：门控 = observer 仍 current + 无存活会话 + expectedRunStatus 结构条件。
-      // R22-6：必须先完成锁内条件写，再决定是否落「Agent 已断开」error 事件——否则后继
+      // 门控 = observer 仍 current + 无存活会话 + expectedRunStatus 结构条件。
+      // 必须先完成锁内条件写，再决定是否落「Agent 已断开」error 事件——否则后继
       // 已拉成 running 时 helper 返 null，事件流仍会永久留下假断开。
       const failedTask = await setTaskRunStatusIfRunOwner(
         task.id,
@@ -501,28 +513,26 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
       if (!failedTask) {
         // 后继已接管：本问答失效，不 supersede / 不 clear / 不写断开事件 / 不发 done
-        const info = await appendEvent(task.id, {
+        // 写+publish 同链
+        await writeEventAndPublish(task.id, {
           kind: "info",
           actionId: reqEvent.actionId,
           text: "上一组提问已失效（AI 已继续工作）、本次回答未送达、无需再回答。",
           meta: { supersededAskId: askId },
         });
-        if (info) publishTaskStreamEvent(task.id, { kind: "event", event: info });
         return errorResponse("这组提问已失效、AI 已继续工作，无需再回答", 409);
       }
 
       await supersedePendingAsks(task.id, "会话已失效");
       clearPendingAsk(task.id);
-      const errorEvent = await appendEvent(task.id, {
+      // 断开审计事件写+publish 同链；task/done envelope 仍走 publishTaskStreamEvent
+      await writeEventAndPublish(task.id, {
         kind: "error",
         actionId: reqEvent.actionId,
         text: isChat
           ? "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可继续。"
           : "Agent 已断开（进程重启或异常退出）、本次问答没送到。在底部输入条说句话即可唤醒，或重新「推进」。",
       });
-      if (errorEvent) {
-        publishTaskStreamEvent(task.id, { kind: "event", event: errorEvent });
-      }
       publishTaskStreamEvent(task.id, { kind: "task", task: failedTask });
       publishTaskStreamEvent(task.id, {
         kind: "done",
@@ -551,7 +561,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (!assets.ok) return assets.errorResponse;
   const { allSaved, allAbsPaths, replyText } = assets;
 
-  // X1：存图长 await 后复查
+  // 存图长 await 后复查
   if (isTaskOpStale(task.id, opGen)) {
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
@@ -591,7 +601,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       boot,
       opGen,
     );
-    // X1：stale → 409，不清 pending、不记已答、不走 wake
+    // stale → 409，不清 pending、不记已答、不走 wake
     if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
       return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
     }
@@ -614,32 +624,49 @@ export const POST = async (req: Request, { params }: Ctx) => {
       );
     }
   }
+  // 答案已送达 → 照常清 pending；落盘失败带 persistWarning，不伪装未发送
   clearPendingAsk(task.id);
 
   const actionId = reqEvent.actionId;
-  const replyEvent = await appendEvent(task.id, {
-    kind: "ask_user_reply",
-    actionId,
-    text: replyText,
-    meta: {
-      askId,
-      answers,
-      ...(deferred ? { deferred: true } : {}),
-      // 扁平图数组、前端 extractUserReplyImages 读 meta.images 渲缩略图（同 user_reply 通道）
-      ...(allSaved.length > 0 ? { images: allSaved } : {}),
-    },
-  });
-  if (replyEvent) {
-    publishTaskStreamEvent(task.id, { kind: "event", event: replyEvent });
+  let persistWarning: string | undefined;
+  try {
+    const wrote = await writeUserEventAndPublishStrict(task.id, {
+      kind: "ask_user_reply",
+      actionId,
+      text: replyText,
+      meta: {
+        askId,
+        answers,
+        ...(deferred ? { deferred: true } : {}),
+        // 扁平图数组、前端 extractUserReplyImages 读 meta.images 渲缩略图（同 user_reply 通道）
+        ...(allSaved.length > 0 ? { images: allSaved } : {}),
+      },
+    });
+    if (!wrote) {
+      persistWarning = PERSIST_WARNING_DELIVERED;
+      console.error(
+        `[ask-reply] 已送达但持久化失败（ENOENT/未写）task=${task.id}`,
+      );
+    }
+  } catch (persistErr) {
+    console.error(
+      `[ask-reply] 已送达但持久化失败 task=${task.id}:`,
+      persistErr,
+    );
+    persistWarning = PERSIST_WARNING_DELIVERED;
   }
 
-  // R20-2：删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
+  // 删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running
   // （正常结束不 bump gen，旧闭包仍 true）。running 写以 deliver/consume 内部 owner 门控为准。
   const freshTask = (await getTask(task.id)) ?? task;
 
   return new Response(
-    JSON.stringify({ ok: true, task: freshTask }),
+    JSON.stringify({
+      ok: true,
+      task: freshTask,
+      ...(persistWarning ? { persistWarning } : {}),
+    }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 };

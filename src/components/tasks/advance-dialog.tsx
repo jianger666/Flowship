@@ -337,7 +337,7 @@ export const AdvanceDialog = ({
   //（沿用我在这个任务一直用的模型、不必每次推进都重挑 opus）、再回退 task.model；都没有返 undefined、
   // 由 open-effect 当次再读最新 settings.defaultModel 兜底。只是 UI 默认值、不回写任何持久字段。
   // settings 兜底放 effect 不放这里：getSettings 不是响应式、塞进 memo([task]) 会用到 stale settings
-  //（开 dialog 只触发 render、task 引用不一定变 → 拿不到刚改的设置页默认模型）（reviewAI P2）。
+  //（开 dialog 只触发 render、task 引用不一定变 → 拿不到刚改的设置页默认模型）。
   const defaultPickedModel = useMemo<ModelSelection | undefined>(() => {
     const lastWithModel = [...task.actions]
       .reverse()
@@ -347,7 +347,7 @@ export const AdvanceDialog = ({
     return undefined;
   }, [task]);
   // 用 ref 持最新默认值：open-effect 只在「打开瞬间」读它、不进 effect 依赖——
-  // 否则 SSE 推 task（每次新引用）会让这个 memo 变、连带打回用户已改的表单（reviewAI 提醒）。
+  // 否则 SSE 推 task（每次新引用）会让这个 memo 变、连带打回用户已改的表单。
   const defaultPickedModelRef = useRef(defaultPickedModel);
   defaultPickedModelRef.current = defaultPickedModel;
 
