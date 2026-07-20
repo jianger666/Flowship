@@ -217,6 +217,7 @@ describe("parseTaskToolArgs", () => {
     expect(parseTaskToolArgs(args)).toEqual({
       description: "修登录态",
       prompt: "请排查 auth cookie\n第二行",
+      model: "fast",
     });
   });
 
@@ -226,7 +227,7 @@ describe("parseTaskToolArgs", () => {
         description: "读代码",
         prompt: "扫 src/",
       }),
-    ).toEqual({ description: "读代码", prompt: "扫 src/" });
+    ).toEqual({ description: "读代码", prompt: "扫 src/", model: null });
   });
 
   it("残缺流式 JSON 前缀安全抠字段", () => {
@@ -242,6 +243,7 @@ describe("parseTaskToolArgs", () => {
     expect(parseTaskToolArgs('{"description":"半成品任务"')).toEqual({
       description: "半成品任务",
       prompt: null,
+      model: null,
     });
   });
 

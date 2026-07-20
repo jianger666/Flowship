@@ -110,6 +110,8 @@ export const parseToolArgsJson = (
 export type TaskToolArgs = {
   description: string | null;
   prompt: string | null;
+  /** 子代理指定模型（args.model，未指定 = 跟随主线） */
+  model: string | null;
 };
 
 /** 从残缺 JSON 流式前缀里抠 string 字段（键完整、值可能未闭合） */
@@ -146,12 +148,15 @@ export const parseTaskToolArgs = (
 
   let description: string | null = null;
   let prompt: string | null = null;
+  let model: string | null = null;
 
   if (typeof args === "object" && !Array.isArray(args)) {
     const d = args.description;
     const p = args.prompt;
+    const m = args.model;
     if (typeof d === "string" && d.trim()) description = d.trim();
     if (typeof p === "string" && p.trim()) prompt = p.trim();
+    if (typeof m === "string" && m.trim()) model = m.trim();
   } else if (typeof args === "string") {
     const cleaned = args.replace(/…\(truncated \d+ chars\)$/, "").trim();
     if (!cleaned) return null;
@@ -159,19 +164,22 @@ export const parseTaskToolArgs = (
     if (parsed) {
       const d = parsed.description;
       const p = parsed.prompt;
+      const m = parsed.model;
       if (typeof d === "string" && d.trim()) description = d.trim();
       if (typeof p === "string" && p.trim()) prompt = p.trim();
+      if (typeof m === "string" && m.trim()) model = m.trim();
     } else {
       // 残缺流式 JSON：尽量抠已写出的字段，抠不到就 null
       description = extractPartialJsonStringField(cleaned, "description");
       prompt = extractPartialJsonStringField(cleaned, "prompt");
+      model = extractPartialJsonStringField(cleaned, "model");
     }
   } else {
     return null;
   }
 
   if (!description && !prompt) return null;
-  return { description, prompt };
+  return { description, prompt, model };
 };
 
 const pickStr = (

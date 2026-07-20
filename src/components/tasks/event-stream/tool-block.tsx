@@ -268,6 +268,12 @@ const TaskSubagentBlock = ({
         <span className="min-w-0 shrink truncate font-medium text-[11px] text-foreground/90">
           {title}
         </span>
+        {/* 子代理模型徽标（args.model 指定时才显示；未指定 = 跟随主线、不标） */}
+        {taskArgs?.model && (
+          <span className="shrink-0 rounded bg-muted/60 px-1 py-px font-mono text-[10px] text-muted-foreground">
+            {taskArgs.model}
+          </span>
+        )}
         {statusIcon}
         {collapsed && liveTail && (
           <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
