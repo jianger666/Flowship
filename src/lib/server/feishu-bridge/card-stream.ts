@@ -9,7 +9,6 @@
 
 import { getPendingAsk } from "@/lib/server/chat-pending";
 
-import { getDeepLink } from "./bridge-config";
 import { rememberCardMessage } from "./card-map";
 import { flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
@@ -757,14 +756,13 @@ export const createCardStream = (
       // 链上刷完过程/正文（与在途 flush 互斥，R1-13d）
       await doFlush();
 
-      const deepLink = `[在 app 中打开](${getDeepLink(taskId)})`;
+      // 深链入口已砍（2026-07-20 用户拍板：浏览器中转体验差、不要了）
       const statsParts: string[] = [];
       if (fin.durationMs != null) {
         const d = formatDuration(fin.durationMs);
         if (d) statsParts.push(d);
       }
       if (fin.model) statsParts.push(coloredModelLabel(fin.model));
-      statsParts.push(deepLink);
       const statsFooter = statsParts.join(" · ");
 
       // R1-4：用户 stop → 灰卡「已停止」（与自然完成 / ask 等待互斥）
@@ -778,15 +776,15 @@ export const createCardStream = (
         template = "orange";
         footerText = statsFooter;
       } else if (fin.ok) {
-        // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型 · 深链
+        // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型
         subtitle = "已完成";
         template = "green";
         footerText = statsFooter;
       } else {
-        // Hermes failed：subtitle 空、summary「处理失败」、red；footer「已停止」+ 深链（我们保留）
+        // Hermes failed：subtitle 空、summary「处理失败」、red
         subtitle = "";
         template = "red";
-        footerText = `已停止 · ${deepLink}`;
+        footerText = "已停止";
       }
 
       try {

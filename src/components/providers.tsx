@@ -15,6 +15,7 @@ import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
+import { CloseConfirmHandler } from "@/components/close-confirm-handler";
 import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
@@ -63,6 +64,7 @@ export const Providers = ({ children }: ProvidersProps) => {
               <TaskAttentionWatcher />
               {/* 飞书卡片深链 flowship://tasks/<id> → 路由跳对应任务页 */}
               <DeepLinkHandler />
+              <CloseConfirmHandler />
               {children}
             </MrInboxProvider>
           </TaskListProvider>

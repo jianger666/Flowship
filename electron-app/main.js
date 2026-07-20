@@ -566,44 +566,22 @@ const parseDeepLinkTaskId = (url) => {
   }
 };
 
-// mac 全屏窗口 hide 的补偿状态（2026-07-19 用户实测踩坑）：
-// 全屏窗直接 hide 会被系统踢出它的 Space、再 show 变回非全屏——
-// 关窗时先退全屏再 hide、show 时按记录恢复全屏。
-/** close 拦截时窗口处于全屏 → 等 leave-full-screen 后再 hide */
-let hideAfterLeaveFullScreen = false;
-/** hide 前是全屏 → 下次 show 恢复 */
-let wasFullScreenBeforeHide = false;
-
 /** 显示并聚焦主窗（Tray 打开 / 深链 / second-instance / dock activate 共用） */
 const showMainWindow = () => {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
-  // 关窗前是全屏 → 恢复（show 之后延迟一拍再全屏：立即调用系统还没把窗口放回
-  // 普通 Space、setFullScreen 会被吞——2026-07-20 用户实测恢复失败的修正）
-  if (wasFullScreenBeforeHide) {
-    wasFullScreenBeforeHide = false;
-    setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setFullScreen(true);
-    }, 300);
-  }
 };
 
 /**
- * 收进托盘（Cmd/Ctrl+W 专用；2026-07-20 用户拍板与「点 X」分家）：
- * 全屏窗先退全屏、等 leave-full-screen 再 hide（直接 hide 会被系统踢出 Space）。
+ * 收进托盘（Cmd/Ctrl+W 专用；2026-07-20 用户拍板与「点 X」分家）。
+ * 全屏窗直接 hide 会被系统收掉它的 Space、再 show 变回非全屏——
+ * 用户确认这是 mac 前台调度的系统级行为（飞书同样如此）、不做补偿逻辑。
  */
 const hideMainWindowToTray = () => {
   if (!mainWindow) return;
   void saveWindowState();
-  if (mainWindow.isFullScreen()) {
-    wasFullScreenBeforeHide = true;
-    hideAfterLeaveFullScreen = true;
-    mainWindow.setFullScreen(false);
-    log("[main] Cmd/Ctrl+W（全屏）→ 先退全屏再 hide");
-    return;
-  }
   mainWindow.hide();
   log("[main] Cmd/Ctrl+W → hide（Tray 常驻）");
 };
@@ -795,37 +773,31 @@ const createWindow = async () => {
     event.preventDefault();
     hideMainWindowToTray();
   });
+  // 确认弹窗走 renderer 的 useDialog（app 内风格、红色确认键——原生 dialog 做不了红按钮）；
+  // 页面没就绪（白屏/崩溃）时没 UI 可确认 → 直接放行退出
   let closeConfirmShowing = false;
   mainWindow.on("close", (event) => {
     void saveWindowState();
     if (quitting) return;
     event.preventDefault();
+    if (!pageLoaded) {
+      quitAppForReal();
+      return;
+    }
     if (closeConfirmShowing) return;
     closeConfirmShowing = true;
-    void dialog
-      .showMessageBox(mainWindow, {
-        type: "question",
-        buttons: ["关闭", "取消"],
-        defaultId: 1,
-        cancelId: 1,
-        message: `确定关闭 ${IS_TEST ? "FlowshipTest" : "Flowship"} 吗？`,
-        detail: "后台任务与飞书桥接会一并退出；想保留后台请用 Cmd/Ctrl+W 收进托盘。",
-      })
-      .then(({ response }) => {
-        closeConfirmShowing = false;
-        if (response === 0) quitAppForReal();
-      })
-      .catch(() => {
-        closeConfirmShowing = false;
-      });
-  });
-  // 全屏退出动画结束后补 hide（close 拦截的全屏分支）
-  mainWindow.on("leave-full-screen", () => {
-    if (hideAfterLeaveFullScreen) {
-      hideAfterLeaveFullScreen = false;
-      mainWindow?.hide();
-      log("[main] 全屏已退 → hide（Tray 常驻）");
-    }
+    // 30s 无响应自动解锁（renderer 卡死时允许再点 X 重试）
+    const unlockTimer = setTimeout(() => {
+      closeConfirmShowing = false;
+    }, 30_000);
+    ipcMain.once("app-close-confirm-result", (_e, confirmed) => {
+      clearTimeout(unlockTimer);
+      closeConfirmShowing = false;
+      if (confirmed === true) quitAppForReal();
+    });
+    mainWindow.webContents.send("app-close-confirm", {
+      appName: IS_TEST ? "FlowshipTest" : "Flowship",
+    });
   });
   mainWindow.on("closed", () => {
     mainWindow = null;

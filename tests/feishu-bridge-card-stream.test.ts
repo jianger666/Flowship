@@ -314,8 +314,8 @@ describe("createCardStream", () => {
     expect(cardJson.header.subtitle.content).toBe("已完成");
     expect(cardJson.header.template).toBe("green");
     const footer = cardJson.body.elements.find((e) => e.element_id === "md_footer");
-    // 深链改跳板方案：卡片里是本机 http 中转页（飞书不放行自定义协议链接）
-    expect(footer?.content).toContain("/open/task/task_fin");
+    // 深链入口已砍（2026-07-20 用户拍板）：footer 只剩耗时 · 模型
+    expect(footer?.content).not.toContain("在 app 中打开");
     expect(footer?.content).toContain("composer");
     // Hermes 完成 footer：耗时裸数字（无「耗时」前缀）+ · 分隔
     expect(footer?.content).toMatch(/2m5s/);
@@ -489,7 +489,7 @@ describe("createCardStream", () => {
       const footer = cardJson.body.elements.find(
         (e) => e.element_id === "md_footer",
       );
-      expect(footer?.content).toContain("/open/task/");
+      expect(footer?.content).toContain("gpt-5.5");
       expect(patchCardSettings).toHaveBeenCalled();
     } finally {
       clearPendingAsk(taskId);

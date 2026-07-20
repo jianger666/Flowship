@@ -51,7 +51,6 @@ vi.mock("@/lib/server/task-stream", async (importOriginal) => {
 
 vi.mock("@/lib/server/feishu-bridge/bridge-config", () => ({
   isFeishuChatBridgeEnabled: vi.fn(async () => true),
-  getDeepLink: (taskId: string) => `flowship://tasks/${taskId}`,
   getBridgeDataDir: async () => "/tmp/feishu-bridge-test",
   isBridgeTestInstance: () => true,
   isFeishuBridgeKeepAwakeEnabled: async () => true,

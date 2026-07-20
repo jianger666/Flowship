@@ -71,6 +71,22 @@ contextBridge.exposeInMainWorld("__deepLink", {
   },
 });
 
+// 点 X 关闭的二次确认（2026-07-20 用户拍板）：主进程拦 close → 这里转 renderer
+// 弹 app 内 confirm（红色确认键）→ 结果回传主进程决定是否真退出
+contextBridge.exposeInMainWorld("__closeConfirm", {
+  /**
+   * 订阅关闭确认请求。返回取消订阅函数。
+   * @param {(payload: { appName: string }) => void} callback
+   */
+  onRequest: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("app-close-confirm", listener);
+    return () => ipcRenderer.removeListener("app-close-confirm", listener);
+  },
+  /** @param {boolean} confirmed */
+  respond: (confirmed) => ipcRenderer.send("app-close-confirm-result", confirmed === true),
+});
+
 // 开机自启（决策 #19）：设置页开关调这里；壳只暴露 API、UI 在设置页
 contextBridge.exposeInMainWorld("__autoLaunch", {
   /** @returns {Promise<boolean>} */
