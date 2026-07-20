@@ -18,11 +18,11 @@
  * 现在只有「需要你行动」才亮：等你审阅（awaiting_ack）或 agent 提问等答案（action 还 running）。
  * chat 静息（你一句我一句的正常状态）不亮。
  *
- * 2026-07-20 grok 化：可选重命名（双击标题 / 菜单）、置顶区上/下移、正文搜索摘要行。
+ * 2026-07-20 grok 化：可选重命名（双击标题 / 菜单）、置顶区上/下移。
  */
 
 import Link from "next/link";
-import { useCallback, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -65,35 +65,6 @@ const subscribeTaskSeen = (onStoreChange: () => void) => {
 const useTaskSeenAt = (taskId: string): number => {
   const getSnapshot = useCallback(() => getTaskSeenAt(taskId), [taskId]);
   return useSyncExternalStore(subscribeTaskSeen, getSnapshot, () => 0);
-};
-
-/**
- * 标题内匹配段高亮（侧栏搜索用）。
- * 不引第三方高亮库：大小写不敏感、逐段切分；query 空则原样返回。
- */
-const highlightTitle = (title: string, query: string): ReactNode => {
-  const q = query.trim();
-  if (!q) return title;
-  const lower = title.toLowerCase();
-  const qLower = q.toLowerCase();
-  const parts: ReactNode[] = [];
-  let start = 0;
-  let idx = lower.indexOf(qLower, start);
-  // 没命中（过滤侧已保证命中，这里兜底防空）
-  if (idx < 0) return title;
-  while (idx >= 0) {
-    if (idx > start) parts.push(title.slice(start, idx));
-    parts.push(
-      // key 用起始下标：同 query 多段命中时唯一；primary 色加粗、不改底色以免截断时发糊
-      <span key={idx} className="font-semibold text-primary">
-        {title.slice(idx, idx + q.length)}
-      </span>,
-    );
-    start = idx + q.length;
-    idx = lower.indexOf(qLower, start);
-  }
-  if (start < title.length) parts.push(title.slice(start));
-  return parts;
 };
 
 // v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
@@ -197,14 +168,10 @@ interface TaskListItemProps {
   deleteDisabled?: boolean;
   // 传则行尾出置顶按钮（已置顶常显高亮、未置顶 hover 出；切换由调用方处理）
   onPin?: (task: TaskSummary) => void;
-  // 侧栏搜索时传入：标题匹配段加粗变色；空 / 不传 = 原样标题
-  highlightQuery?: string;
   // 侧栏重命名（双击标题 / 菜单「重命名」）；不传则无入口
   onRename?: (task: TaskSummary) => void;
   // 置顶区内上/下移；仅置顶组分发
   pinReorder?: PinReorderControls;
-  // 正文搜索命中摘要（替换相对时间次行）
-  contentSnippet?: string;
 }
 
 export const TaskListItem = ({
@@ -214,10 +181,8 @@ export const TaskListItem = ({
   onDelete,
   deleteDisabled,
   onPin,
-  highlightQuery,
   onRename,
   pinReorder,
-  contentSnippet,
 }: TaskListItemProps) => {
   const hasMenu = !!onRename;
   const hasActions = !!(onPin || onDelete || hasMenu || pinReorder);
@@ -225,12 +190,8 @@ export const TaskListItem = ({
   const seenAt = useTaskSeenAt(task.id);
   // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null）
   const stageLine = taskStageLine(task, seenAt);
-  // 正文命中优先；否则活跃态监控行；否则相对时间
-  const subtitle = contentSnippet
-    ? contentSnippet
-    : stageLine
-      ? null
-      : formatRelative(task.updatedAt);
+  // 活跃态监控行；否则相对时间
+  const subtitle = stageLine ? null : formatRelative(task.updatedAt);
 
   // 行尾按钮数决定右 padding（避免标题被盖）
   const actionCount =
@@ -276,14 +237,10 @@ export const TaskListItem = ({
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
           <Tooltip content={task.title}>
-            <span className="min-w-0 truncate leading-tight">
-              {highlightQuery
-                ? highlightTitle(task.title, highlightQuery)
-                : task.title}
-            </span>
+            <span className="min-w-0 truncate leading-tight">{task.title}</span>
           </Tooltip>
-          {/* 活跃态：阶段 · 状态；正文摘要；否则相对时间 */}
-          {stageLine && !contentSnippet ? (
+          {/* 活跃态：阶段 · 状态；否则相对时间 */}
+          {stageLine ? (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
               <span className="min-w-0 truncate text-muted-foreground/70">
                 {stageLine.stage}

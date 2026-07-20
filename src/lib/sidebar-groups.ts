@@ -1,26 +1,17 @@
 /**
- * 侧栏会话列表分组 / 置顶重排 / 搜索合并（纯函数）
+ * 侧栏会话列表分组 / 置顶重排（纯函数）
  *
- * 对标 grok-build 会话组织语义（按 cwd/repo 分组 + 可选按状态 + 置顶手动序）：
- * - chat 默认按仓库组；task 模式仍走时间桶（不经本模块）
- * - 组内 updatedAt 倒序；仓库组间按「组内最新 updatedAt」倒序；「未绑定」恒最后
+ * 对标 grok-build 会话组织语义（按 cwd/repo 分组 + 置顶手动序）：
+ * - chat 按仓库组；task 模式仍走时间桶（不经本模块）
+ * - 组内 updatedAt 倒序；仓库组间按「组内最新 updatedAt」倒序；Home（未绑仓）恒最后
  * - 置顶序存在 view-memory（不污染 task meta）
  */
 
 import { pathBasename } from "@/lib/path-utils";
 import type { TaskSummary } from "@/lib/types";
 
-/** 侧栏分组视图：按仓（默认）/ 按状态 */
-export type SidebarGroupMode = "repo" | "status";
-
-/** 置顶组 / 未绑定 / 仓库路径 / 状态桶 */
-export type SidebarGroupKey =
-  | "pinned"
-  | "unbound"
-  | `repo:${string}`
-  | "status:awaiting"
-  | "status:running"
-  | "status:idle";
+/** 置顶组 / Home（未绑仓）/ 仓库路径 */
+export type SidebarGroupKey = "pinned" | "unbound" | `repo:${string}`;
 
 export type SidebarGroup = {
   key: SidebarGroupKey;
@@ -31,30 +22,8 @@ export type SidebarGroup = {
 /** settings.repos 里用于解析组头的最小字段（name = 展示名） */
 export type RepoNameLookup = ReadonlyArray<{ path: string; name: string }>;
 
-/** 正文搜索命中（API 返回形态） */
-export type ContentSearchHit = {
-  taskId: string;
-  /** 命中附近摘要片段 */
-  snippet: string;
-};
-
-/** 搜索结果分节：标题命中 / 内容命中 */
-export type SidebarSearchSection = {
-  key: "title" | "content";
-  label: string;
-  items: Array<TaskSummary & { contentSnippet?: string }>;
-};
-
-export const UNBOUND_GROUP_LABEL = "未绑定工作目录";
-
-const STATUS_GROUP_ORDER: Array<{
-  key: Extract<SidebarGroupKey, `status:${string}`>;
-  label: string;
-}> = [
-  { key: "status:awaiting", label: "等你回复" },
-  { key: "status:running", label: "运行中" },
-  { key: "status:idle", label: "空闲" },
-];
+/** Home 组展示名（repoPaths 空）；排序 key 仍用 unbound */
+export const HOME_GROUP_LABEL = "Home";
 
 /** 组内按 updatedAt 倒序 */
 export const sortByUpdatedAtDesc = <T extends { updatedAt: number }>(
@@ -73,7 +42,7 @@ export const resolveRepoGroupLabel = (
   const hit = repos.find((r) => normalizeRepoPath(r.path) === norm);
   const name = hit?.name?.trim();
   if (name) return name;
-  return pathBasename(repoPath) || repoPath || UNBOUND_GROUP_LABEL;
+  return pathBasename(repoPath) || repoPath || HOME_GROUP_LABEL;
 };
 
 export const normalizeRepoPath = (p: string): string =>
@@ -85,24 +54,10 @@ export const normalizeRepoPath = (p: string): string =>
  */
 export const repoGroupKeyFor = (
   task: Pick<TaskSummary, "repoPaths">,
-): Exclude<SidebarGroupKey, "pinned" | `status:${string}`> => {
+): Exclude<SidebarGroupKey, "pinned"> => {
   const first = task.repoPaths?.[0]?.trim();
   if (!first) return "unbound";
   return `repo:${normalizeRepoPath(first)}`;
-};
-
-/**
- * 按状态分桶（chat 侧栏「按状态」视图）。
- * - running → 运行中
- * - awaiting_user → 等你回复（含 ask / wait 交卷后等你）
- * - 其余（idle / error）→ 空闲
- */
-export const statusBucketFor = (
-  task: Pick<TaskSummary, "runStatus">,
-): "awaiting" | "running" | "idle" => {
-  if (task.runStatus === "running") return "running";
-  if (task.runStatus === "awaiting_user") return "awaiting";
-  return "idle";
 };
 
 /**
@@ -153,7 +108,7 @@ export const movePinnedId = (
 };
 
 /**
- * 构建「按仓库」分组：置顶 → 仓库组（组内最新 updatedAt 倒序）→ 未绑定。
+ * 构建「按仓库」分组：置顶 → 仓库组（组内最新 updatedAt 倒序）→ Home。
  */
 export const buildRepoGroups = (
   tasks: TaskSummary[],
@@ -216,7 +171,7 @@ export const buildRepoGroups = (
   if (unbound.length > 0) {
     groups.push({
       key: "unbound",
-      label: UNBOUND_GROUP_LABEL,
+      label: HOME_GROUP_LABEL,
       items: sortByUpdatedAtDesc(unbound),
     });
   }
@@ -225,102 +180,16 @@ export const buildRepoGroups = (
 };
 
 /**
- * 构建「按状态」分组：置顶 → 等你回复 → 运行中 → 空闲。
- * 空节不渲染（filter length）。
+ * 组头「+」预绑工作目录：
+ * - 仓组 → [该组路径]（取组内首条的 repoPaths[0]）
+ * - Home → []（不绑）
+ * - 置顶 → null（不展示「+」、无单一 cwd）
  */
-export const buildStatusGroups = (
-  tasks: TaskSummary[],
-  pinnedOrder: readonly string[] = [],
-): SidebarGroup[] => {
-  const pinned: TaskSummary[] = [];
-  const buckets: Record<"awaiting" | "running" | "idle", TaskSummary[]> = {
-    awaiting: [],
-    running: [],
-    idle: [],
-  };
-
-  for (const t of tasks) {
-    if (t.pinned) {
-      pinned.push(t);
-      continue;
-    }
-    buckets[statusBucketFor(t)].push(t);
-  }
-
-  const groups: SidebarGroup[] = [];
-  if (pinned.length > 0) {
-    groups.push({
-      key: "pinned",
-      label: "置顶",
-      items: applyPinnedOrder(pinned, pinnedOrder),
-    });
-  }
-
-  for (const { key, label } of STATUS_GROUP_ORDER) {
-    const bucket = key.replace("status:", "") as "awaiting" | "running" | "idle";
-    const items = sortByUpdatedAtDesc(buckets[bucket]);
-    if (items.length === 0) continue;
-    groups.push({ key, label, items });
-  }
-
-  return groups;
-};
-
-/**
- * 合并标题命中与正文命中：两节；标题已命中的不再进内容节（避免重复行）。
- * titleHits / contentHits 均保持调用方传入顺序。
- */
-export const mergeSidebarSearchSections = (
-  titleHits: TaskSummary[],
-  contentHits: ContentSearchHit[],
-  tasksById: Map<string, TaskSummary>,
-): SidebarSearchSection[] => {
-  const titleIds = new Set(titleHits.map((t) => t.id));
-  const sections: SidebarSearchSection[] = [];
-
-  if (titleHits.length > 0) {
-    sections.push({
-      key: "title",
-      label: "标题命中",
-      items: titleHits,
-    });
-  }
-
-  const contentItems: Array<TaskSummary & { contentSnippet?: string }> = [];
-  for (const hit of contentHits) {
-    if (titleIds.has(hit.taskId)) continue;
-    const task = tasksById.get(hit.taskId);
-    if (!task) continue;
-    contentItems.push({ ...task, contentSnippet: hit.snippet });
-  }
-  if (contentItems.length > 0) {
-    sections.push({
-      key: "content",
-      label: "内容命中",
-      items: contentItems,
-    });
-  }
-
-  return sections;
-};
-
-/**
- * 从正文抽摘要片段：命中处前后各 pad 字符；超出加省略号。
- * 大小写不敏感定位。
- */
-export const buildSearchSnippet = (
-  text: string,
-  query: string,
-  pad = 36,
-): string => {
-  const q = query.trim();
-  if (!q || !text) return text.slice(0, pad * 2);
-  const lower = text.toLowerCase();
-  const idx = lower.indexOf(q.toLowerCase());
-  if (idx < 0) return text.slice(0, pad * 2);
-  const start = Math.max(0, idx - pad);
-  const end = Math.min(text.length, idx + q.length + pad);
-  const prefix = start > 0 ? "…" : "";
-  const suffix = end < text.length ? "…" : "";
-  return `${prefix}${text.slice(start, end)}${suffix}`;
+export const repoPathsForGroupCreate = (
+  group: Pick<SidebarGroup, "key" | "items">,
+): string[] | null => {
+  if (group.key === "pinned") return null;
+  if (group.key === "unbound") return [];
+  const path = group.items[0]?.repoPaths?.[0]?.trim();
+  return path ? [path] : [];
 };

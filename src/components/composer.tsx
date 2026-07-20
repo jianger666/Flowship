@@ -247,7 +247,7 @@ export const Composer = ({
         <div className="h-1 w-10 rounded-full bg-border/60 transition-colors group-hover:bg-muted-foreground/50" />
       </div>
 
-      {/* P1.6：未绑仓轻量提示（对标 Cursor 上下文条——无警示底色、一行融入 composer） */}
+      {/* P1.6：Home（未绑仓）轻量提示（对标 Cursor 上下文条——无警示底色、一行融入 composer） */}
       {showUnbound && (
         <div className="mx-2.5 mb-1 flex items-center gap-1.5 bg-muted/30 px-1 py-0.5">
           <Info
@@ -255,7 +255,7 @@ export const Composer = ({
             aria-hidden
           />
           <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-            未绑定工作目录，AI 将在主目录运行
+            Home，AI 将在主目录运行
           </span>
           {session?.onBindWorkdir && (
             <button

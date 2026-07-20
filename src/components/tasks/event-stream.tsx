@@ -867,12 +867,17 @@ const EventStreamImpl = ({
                 {isChat &&
                   item.kind === "user_reply" &&
                   shouldShowTurnDivider(itemKinds, idx) && (
-                    <div className="mb-4 flex items-center gap-3" aria-hidden>
-                      <div className="h-px flex-1 bg-border/60" />
-                      <span className="text-[10px] tabular-nums text-muted-foreground/60">
+                    // 轮次分割改「居中时间胶囊 + 两侧渐隐短线」——与 AI 回复正文里的
+                    // markdown hr（整宽实线）视觉区分（2026-07-20 用户实测太像）
+                    <div
+                      className="mb-5 mt-1 flex items-center justify-center gap-2"
+                      aria-hidden
+                    >
+                      <div className="h-px w-16 bg-gradient-to-r from-transparent to-border" />
+                      <span className="rounded-full bg-muted/50 px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground/70">
                         {formatTs(item.ts)}
                       </span>
-                      <div className="h-px flex-1 bg-border/60" />
+                      <div className="h-px w-16 bg-gradient-to-l from-transparent to-border" />
                     </div>
                   )}
                 {isStreamingItem(item) ? (

@@ -7,7 +7,7 @@
  * Chat 打磨：shell 默认折叠、摘要绝不 dump args JSON；运行中直播输出、完成后收起。
  */
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   Check,
   ChevronRight,
@@ -82,114 +82,6 @@ const InlineDiff = ({
   );
 };
 
-// ---------- 完整输出 Dialog ----------
-
-const FullOutputDialog = ({
-  open,
-  onOpenChange,
-  taskId,
-  callId,
-  title,
-}: {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  taskId: string;
-  callId: string;
-  title: string;
-}) => {
-  // loading / 正文 / 错误——Dialog 打开才拉
-  const [loading, setLoading] = useState(false);
-  const [text, setText] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setText("");
-    void (async () => {
-      try {
-        const res = await fetch(
-          `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(callId)}`,
-        );
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          const msg =
-            typeof body === "object" && body && "error" in body
-              ? String((body as { error: unknown }).error)
-              : `HTTP ${res.status}`;
-          throw new Error(msg === "not_found" ? "完整输出不存在" : msg);
-        }
-        const body = await res.text();
-        if (!cancelled) setText(body);
-      } catch (err) {
-        if (!cancelled) setError((err as Error).message);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open, taskId, callId]);
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      toast.success("已复制");
-    } catch {
-      toast.error("复制失败");
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle className="min-w-0 truncate font-mono text-sm">
-            {title}
-          </DialogTitle>
-        </DialogHeader>
-        <div className="max-h-[60vh] min-h-[8rem] overflow-y-auto rounded-md border bg-muted/30 p-3">
-          {loading ? (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" />
-              加载中…
-            </div>
-          ) : error ? (
-            <div className="text-xs text-destructive">{error}</div>
-          ) : (
-            <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">
-              {text || "（空）"}
-            </pre>
-          )}
-        </div>
-        <DialogFooter className="mx-0 mb-0 gap-2 sm:justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={!text || loading}
-            onClick={() => void handleCopy()}
-          >
-            <Copy className="size-3.5" />
-            复制
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => onOpenChange(false)}
-          >
-            关闭
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-};
-
 // ---------- chevron：统一旋转动效 ----------
 
 const CollapseChevron = ({ open }: { open: boolean }) => (
@@ -255,7 +147,9 @@ const ToolBlockRowImpl = ({
   const [outputOpen, setOutputOpen] = useState(false);
   // edit diff：默认展开（collapsed_edit_blocks=OFF）
   const [diffCollapsed, setDiffCollapsed] = useState(false);
-  const [fullOpen, setFullOpen] = useState(false);
+  // 截断输出的完整内容（2026-07-20 用户拍板去弹窗：点「加载完整输出」就地替换进滚动框）
+  const [fullText, setFullText] = useState<string | null>(null);
+  const [fullLoading, setFullLoading] = useState(false);
 
   // 原「运行中自动展开、完成自动收起」已删（2026-07-20 用户实测「图标像反了」）：
   // running 强制展开（v）但 task 子代理等工具展开区无内容、空撑一块；完成行反而
@@ -389,31 +283,43 @@ const ToolBlockRowImpl = ({
               )}
               {(block.status === "running" || outputOpen) && (
                 <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                  {displayOutput}
+                  {fullText ?? displayOutput}
                 </pre>
               )}
-              {/* 仅 truncated+fullPath 都有才出按钮；写盘失败只有 truncated、点开会 404 */}
-              {block.result?.truncated && block.result?.fullPath && (
-                <button
-                  type="button"
-                  onClick={() => setFullOpen(true)}
-                  className="mt-1 cursor-pointer text-[11px] text-primary hover:underline"
-                >
-                  已截断 · 查看完整输出
-                </button>
-              )}
+              {/* 仅 truncated+fullPath 都有才出按钮；写盘失败只有 truncated、点开会 404。
+                  点击就地拉全量替换进上面的滚动框（不再弹 Dialog——用户嫌重） */}
+              {block.result?.truncated &&
+                block.result?.fullPath &&
+                fullText === null && (
+                  <button
+                    type="button"
+                    disabled={fullLoading}
+                    onClick={() => {
+                      setFullLoading(true);
+                      setOutputOpen(true);
+                      void (async () => {
+                        try {
+                          const res = await fetch(
+                            `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(block.callId)}`,
+                          );
+                          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                          setFullText(await res.text());
+                        } catch {
+                          toast.error("完整输出加载失败");
+                        } finally {
+                          setFullLoading(false);
+                        }
+                      })();
+                    }}
+                    className="mt-1 cursor-pointer text-[11px] text-primary hover:underline disabled:opacity-50"
+                  >
+                    {fullLoading ? "加载中…" : "已截断 · 加载完整输出"}
+                  </button>
+                )}
             </div>
           )}
         </div>
       )}
-
-      <FullOutputDialog
-        open={fullOpen}
-        onOpenChange={setFullOpen}
-        taskId={taskId}
-        callId={block.callId}
-        title={`${block.name} · ${block.callId}`}
-      />
     </div>
   );
 };

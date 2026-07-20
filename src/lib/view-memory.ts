@@ -8,8 +8,6 @@
  * - 模块级内存 Map：事件流滚动锚点——SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
  */
 
-import type { SidebarGroupMode } from "@/lib/sidebar-groups";
-
 // SSR / 存储被禁时兜底 null（客户端组件在 server 也会跑一遍首渲）
 const ss = (): Storage | null => {
   try {
@@ -159,30 +157,13 @@ export const saveBoardRange = (range: { from: number; to: number }) => {
 
 // ---------- 侧栏 chat 分组视图（跨重启保留、localStorage） ----------
 //
-// 对标 grok Dashboard 的 grouping / pin reorder / 折叠态——不进 task meta，避免污染业务数据。
+// 对标 grok Dashboard 的 pin reorder / 折叠态——不进 task meta，避免污染业务数据。
+// 分组轴固定按仓（不再记「按状态」模式）。
 
-const SIDEBAR_GROUP_MODE_KEY = "flowship:sidebar-group-mode";
 const SIDEBAR_COLLAPSED_KEY = "flowship:sidebar-collapsed-groups";
 const SIDEBAR_PINNED_ORDER_KEY = "flowship:sidebar-pinned-order";
 
-export const loadSidebarGroupMode = (): SidebarGroupMode => {
-  try {
-    const v = localStorage.getItem(SIDEBAR_GROUP_MODE_KEY);
-    return v === "status" ? "status" : "repo";
-  } catch {
-    return "repo";
-  }
-};
-
-export const saveSidebarGroupMode = (mode: SidebarGroupMode) => {
-  try {
-    localStorage.setItem(SIDEBAR_GROUP_MODE_KEY, mode);
-  } catch {
-    /* 存储被禁忽略 */
-  }
-};
-
-/** 折叠中的组 key 集合（repo:… / unbound / status:…；置顶一般不折叠但仍可记） */
+/** 折叠中的组 key 集合（repo:… / unbound；置顶一般不折叠但仍可记） */
 export const loadSidebarCollapsedGroups = (): Set<string> => {
   try {
     const raw = JSON.parse(

@@ -59,7 +59,7 @@ const ChatsPage = () => {
           自由提问、临时 bug、代码探索都可以开一个对话
         </div>
       </div>
-      <Button onClick={createChat} disabled={creating}>
+      <Button onClick={() => void createChat()} disabled={creating}>
         {creating ? <Loader2 className="animate-spin" /> : <Plus />}
         新建对话
       </Button>

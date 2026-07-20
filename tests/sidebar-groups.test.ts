@@ -1,19 +1,16 @@
 /**
- * 侧栏分组 / 置顶重排 / 搜索合并 单测
+ * 侧栏分组 / 置顶重排 单测
  */
 import { describe, expect, it } from "vitest";
 
 import {
   applyPinnedOrder,
   buildRepoGroups,
-  buildSearchSnippet,
-  buildStatusGroups,
-  mergeSidebarSearchSections,
+  HOME_GROUP_LABEL,
   movePinnedId,
   normalizeRepoPath,
+  repoPathsForGroupCreate,
   resolveRepoGroupLabel,
-  statusBucketFor,
-  UNBOUND_GROUP_LABEL,
 } from "@/lib/sidebar-groups";
 import type { TaskSummary } from "@/lib/types";
 
@@ -53,7 +50,7 @@ describe("resolveRepoGroupLabel / normalizeRepoPath", () => {
 });
 
 describe("buildRepoGroups", () => {
-  it("置顶 → 仓组（按组内最新 updatedAt）→ 未绑定", () => {
+  it("置顶 → 仓组（按组内最新 updatedAt）→ Home", () => {
     const groups = buildRepoGroups(
       [
         task({
@@ -104,8 +101,9 @@ describe("buildRepoGroups", () => {
     expect(groups[1]!.label).toBe("仓 A");
     expect(groups[1]!.items.map((t) => t.id)).toEqual(["a2", "a1"]);
     expect(groups[2]!.label).toBe("仓 B");
-    expect(groups[3]!.label).toBe(UNBOUND_GROUP_LABEL);
-    // 未绑定即使 updatedAt 最大也恒最后
+    expect(groups[3]!.label).toBe(HOME_GROUP_LABEL);
+    expect(groups[3]!.label).toBe("Home");
+    // Home 即使 updatedAt 最大也恒最后
     expect(groups[3]!.items[0]!.id).toBe("u1");
   });
 
@@ -123,37 +121,26 @@ describe("buildRepoGroups", () => {
   });
 });
 
-describe("buildStatusGroups / statusBucketFor", () => {
-  it("状态映射与节序：等你回复 → 运行中 → 空闲", () => {
-    expect(statusBucketFor({ runStatus: "awaiting_user" })).toBe("awaiting");
-    expect(statusBucketFor({ runStatus: "running" })).toBe("running");
-    expect(statusBucketFor({ runStatus: "idle" })).toBe("idle");
-    expect(statusBucketFor({ runStatus: "error" })).toBe("idle");
-
-    const groups = buildStatusGroups([
-      task({ id: "r", title: "跑", runStatus: "running", updatedAt: 2 }),
-      task({
-        id: "w",
-        title: "等",
-        runStatus: "awaiting_user",
-        updatedAt: 3,
+describe("repoPathsForGroupCreate", () => {
+  it("仓组预绑路径；Home 空数组；置顶 null", () => {
+    expect(
+      repoPathsForGroupCreate({
+        key: "repo:/repos/a",
+        items: [task({ id: "a", title: "a", repoPaths: ["/repos/a"] })],
       }),
-      task({ id: "i", title: "闲", runStatus: "idle", updatedAt: 1 }),
-      task({
-        id: "p",
-        title: "顶",
-        pinned: true,
-        runStatus: "running",
-        updatedAt: 9,
+    ).toEqual(["/repos/a"]);
+    expect(
+      repoPathsForGroupCreate({
+        key: "unbound",
+        items: [task({ id: "u", title: "u", repoPaths: [] })],
       }),
-    ]);
-    expect(groups.map((g) => g.key)).toEqual([
-      "pinned",
-      "status:awaiting",
-      "status:running",
-      "status:idle",
-    ]);
-    expect(groups[0]!.items[0]!.id).toBe("p");
+    ).toEqual([]);
+    expect(
+      repoPathsForGroupCreate({
+        key: "pinned",
+        items: [task({ id: "p", title: "p", pinned: true, repoPaths: ["/x"] })],
+      }),
+    ).toBeNull();
   });
 });
 
@@ -177,37 +164,5 @@ describe("applyPinnedOrder / movePinnedId", () => {
     expect(movePinnedId(ids, ids, "b", "down")).toEqual(["a", "c", "b"]);
     expect(movePinnedId(ids, ids, "a", "up")).toEqual(["a", "b", "c"]);
     expect(movePinnedId(ids, ids, "c", "down")).toEqual(["a", "b", "c"]);
-  });
-});
-
-describe("mergeSidebarSearchSections / buildSearchSnippet", () => {
-  it("标题命中优先，内容节去重", () => {
-    const t1 = task({ id: "1", title: "登录 bug" });
-    const t2 = task({ id: "2", title: "别的" });
-    const byId = new Map([
-      ["1", t1],
-      ["2", t2],
-    ]);
-    const sections = mergeSidebarSearchSections(
-      [t1],
-      [
-        { taskId: "1", snippet: "…登录…" },
-        { taskId: "2", snippet: "…正文命中…" },
-      ],
-      byId,
-    );
-    expect(sections).toHaveLength(2);
-    expect(sections[0]!.key).toBe("title");
-    expect(sections[0]!.items.map((t) => t.id)).toEqual(["1"]);
-    expect(sections[1]!.key).toBe("content");
-    expect(sections[1]!.items.map((t) => t.id)).toEqual(["2"]);
-    expect(sections[1]!.items[0]!.contentSnippet).toBe("…正文命中…");
-  });
-
-  it("摘要截取命中上下文", () => {
-    const text = "前面一堆字" + "目标关键词" + "后面一堆字";
-    const snip = buildSearchSnippet(text, "关键词", 4);
-    expect(snip).toContain("关键词");
-    expect(snip.startsWith("…") || snip.includes("目标")).toBe(true);
   });
 });

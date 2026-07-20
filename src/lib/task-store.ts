@@ -154,25 +154,6 @@ export const deleteTask = async (id: string): Promise<DeleteTaskResult> => {
   return "ok";
 };
 
-/**
- * 侧栏正文搜索（GET /api/tasks/search?q=）
- * q 少于 2 字服务端直接返空；仅扫 chat 的 user_reply / assistant_message。
- */
-export const searchTaskContents = async (
-  q: string,
-): Promise<Array<{ taskId: string; snippet: string }>> => {
-  const query = q.trim();
-  if (query.length < 2) return [];
-  const res = await fetch(
-    `/api/tasks/search?q=${encodeURIComponent(query)}`,
-    { cache: "no-store" },
-  );
-  const data = await handleJson<{ hits: Array<{ taskId: string; snippet: string }> }>(
-    res,
-  );
-  return data.hits ?? [];
-};
-
 // V0.8 侧栏：置顶 / 取消置顶（PATCH /api/tasks/[id]）
 export const setTaskPinned = async (
   id: string,

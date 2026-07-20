@@ -451,7 +451,9 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
 
   return (
     <div
-      className="flex flex-col gap-3 rounded-lg border border-border/70 bg-muted/25 p-3.5"
+      // amber 强调（2026-07-20 用户实测：中性灰不够醒目、看不出「等你答题」）——
+      // 与「AI 在等你回答」浮标同色系、一眼锁定
+      className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/[0.06] p-3.5"
       onKeyDown={(e) => {
         // 容器级提交快捷键（事件冒泡覆盖 textarea）：
         // - mod-enter（默认）：任意焦点都可提交
@@ -465,7 +467,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }}
     >
       <div className="flex items-center gap-2">
-        <Sparkles className="size-3.5 shrink-0 text-muted-foreground" />
+        <Sparkles className="size-3.5 shrink-0 text-amber-500" />
         <span className="text-xs font-medium text-foreground">
           AI 想跟你确认 {questions.length} 个问题
         </span>
