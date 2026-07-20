@@ -605,6 +605,28 @@ const EventRowImpl = ({
         </div>
       );
     }
+    // ask 答题带图：过程行下挂缩略图（2026-07-20 用户实测：飞书答题贴图 app 里看不见——
+    // chat 形态 ask_user_reply 走过程行、原图渲染只在 log 形态有）
+    if (ev.kind === "ask_user_reply" && images.length > 0) {
+      return (
+        <div>
+          {processRow}
+          <div className="mt-1.5 flex flex-wrap gap-2 pl-6">
+            {imageGroup.map((g, i) => (
+              <ImageThumb
+                key={images[i].absPath}
+                src={g.src}
+                alt={g.alt}
+                title={g.title}
+                className="size-16"
+                group={imageGroup}
+                index={i}
+              />
+            ))}
+          </div>
+        </div>
+      );
+    }
     // 过程行（thinking / tool_call / info / error…）：单行细条目、可展开
     return processRow;
   }
