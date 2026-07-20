@@ -259,6 +259,8 @@ export type BridgeRuntimeStatus = {
   lastError?: string;
   /** 最近收到飞书消息的时刻（undefined = 本次启动后从未收到）——收消息自检 */
   lastInboundAt?: number;
+  /** 历史上收到过（时间未知、老版本收的）——自检按通过展示 */
+  everInbound?: boolean;
 };
 
 /** 入向链路收到任意消息时打点——设置页「收消息自检」数据源（内存 + 节流落盘） */
@@ -272,10 +274,18 @@ export const markBridgeInboundReceived = (): void => {
 /** 重启后从盘上回填「最近收到」时刻（只在内存值为空时补、幂等） */
 export const hydrateBridgeInboundAt = async (): Promise<void> => {
   const rt = getRuntime();
-  if (rt.lastInboundAt) return;
+  if (rt.lastInboundAt || rt.everInbound) return;
   try {
     const persisted = await getPersistedLastInboundAt();
-    if (persisted && !rt.lastInboundAt) rt.lastInboundAt = persisted;
+    if (persisted && !rt.lastInboundAt) {
+      rt.lastInboundAt = persisted;
+      return;
+    }
+    // 时间戳没落过盘（老版本收的消息）——lastP2pChatId 只会被入向 p2p 消息写入，
+    // 有值即证明「历史上收到过」，自检不该判红（2026-07-20 用户反馈冷启动误红）
+    if (!rt.lastInboundAt && (await getLastP2pChatId())) {
+      rt.everInbound = true;
+    }
   } catch {
     // 读盘失败当从未收到
   }
@@ -552,6 +562,8 @@ type RuntimeSingleton = {
   exitHooked: boolean;
   /** 最近一次收到飞书入向消息的时刻——设置页「收消息自检」用（0 = 本次启动后从未） */
   lastInboundAt?: number;
+  /** 历史上收到过消息但时间未知（老版本收的、时间戳没落盘）——自检不判红 */
+  everInbound?: boolean;
 };
 
 const RUNTIME_KEY = "__flowshipFeishuBridgeRuntimeV1__";
@@ -883,6 +895,7 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
     consumers,
     lastError: rt.lastOverallError,
     lastInboundAt: rt.lastInboundAt,
+    everInbound: rt.everInbound,
   };
 };
 

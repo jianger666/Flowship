@@ -66,6 +66,8 @@ interface BridgeStatusPayload {
     }>;
     /** 最近收到飞书消息的时刻（undefined = 本次启动后从未）——收消息自检 */
     lastInboundAt?: number;
+    /** 历史上收到过（时间未知）——自检按通过展示 */
+    everInbound?: boolean;
   } | null;
   error?: string;
 }
@@ -219,14 +221,14 @@ export const FeishuBridgeBlock = ({
       const data = (await res.json()) as { error?: string };
       if (!mountedRef.current) return;
       if (!res.ok) {
-        toast.error(data.error ?? "发送欢迎消息失败");
+        toast.error(data.error ?? "发送失败");
         return;
       }
       toast.success("已发送，去飞书看机器人私聊");
     } catch (err) {
       if (!mountedRef.current) return;
       toast.error(
-        `发送欢迎消息失败：${err instanceof Error ? err.message : String(err)}`,
+        `发送失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       if (mountedRef.current) setWelcomeBusy(false);
@@ -261,7 +263,7 @@ export const FeishuBridgeBlock = ({
   // 全绿（含收到过消息、无问题监听器）→ 检查区收成一行（用户反馈：四行占空间）
   const allChecksOk =
     allGreen &&
-    !!status?.runtime?.lastInboundAt &&
+    (!!status?.runtime?.lastInboundAt || !!status?.runtime?.everInbound) &&
     problemConsumers.length === 0;
 
   return (
@@ -340,14 +342,19 @@ export const FeishuBridgeBlock = ({
                   />
                 )}
                 {/* 收消息自检：订阅配没配对后台探测不到，用「实际收到过消息」当端到端信号。
-                    从未收到时给操作指引（发一句→点刷新验证）；收到过就绿灯不啰嗦 */}
+                    从未收到 = 初次绑定还没完成，给操作指引；收到过就绿灯不啰嗦 */}
                 <CheckRow
-                  ok={!!status?.runtime?.lastInboundAt}
+                  ok={
+                    !!status?.runtime?.lastInboundAt ||
+                    !!status?.runtime?.everInbound
+                  }
                   title="收消息自检"
                   detail={
                     status?.runtime?.lastInboundAt
                       ? `最近收到：${formatRelative(status.runtime.lastInboundAt)}`
-                      : "在飞书给机器人发一句，然后点刷新——收到即通"
+                      : status?.runtime?.everInbound
+                        ? "曾收到过消息"
+                        : "初次绑定：在飞书给机器人发一句，点刷新验证"
                   }
                 />
                 {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
@@ -397,7 +404,7 @@ export const FeishuBridgeBlock = ({
               onClick={() => void handleWelcome()}
             >
               {welcomeBusy ? <Loader2 className="animate-spin" /> : null}
-              发送欢迎消息
+              让机器人私聊我
             </Button>
           </div>
 
