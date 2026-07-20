@@ -332,7 +332,8 @@ export const handleChatReplyInject = async (
     if (clientItemId) meta.queueItemId = clientItemId;
     return writeUserEventAndPublishStrict(task.id, {
       kind: "user_reply",
-      text: text || fallbackText,
+      // 纯附件消息气泡不放占位文案（2026-07-20 用户拍板）——缩略图/chip 本身就是内容
+      text,
       meta: Object.keys(meta).length > 0 ? meta : undefined,
     });
   };
@@ -376,7 +377,8 @@ export const handleChatReplyInject = async (
       // 优先用客户端预生成 id（兼容无 clientItemId 的旧入口 / task 侧）
       itemId: clientItemId,
       agentText: agentText || fallbackText,
-      displayText: text || fallbackText,
+      // 排队气泡同样不放占位文案（缩略图/chip 就是内容）
+      displayText: text,
       imageAbsPaths,
       savedImages,
       attachmentAbsPaths:

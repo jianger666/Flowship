@@ -68,7 +68,6 @@ import {
 } from "@/lib/chat-submit-controller";
 import { prepareRunArgs } from "@/lib/run-args";
 import {
-  CHAT_ATTACHMENT_ONLY_TEXT,
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
 } from "@/lib/task-display";
@@ -387,7 +386,8 @@ export const ChatView = ({
       if (!args) return false;
 
       // fingerprint 判定 retry identity；改 payload → 新 id
-      const displayText = text || CHAT_ATTACHMENT_ONLY_TEXT;
+      // 纯附件消息不放占位文案（2026-07-20 用户拍板）——缩略图/chip 本身就是内容
+      const displayText = text;
       const payloadFingerprint = fingerprintFromChatSendArgs({
         text,
         images,
