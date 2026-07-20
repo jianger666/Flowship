@@ -231,21 +231,10 @@ export const TaskListItem = ({
           <LeadingIndicator task={task} seenAt={seenAt} />
         </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <span className="flex min-w-0 items-baseline gap-1.5">
-            {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
-            <Tooltip content={task.title}>
-              <span className="min-w-0 flex-1 truncate leading-tight">
-                {task.title}
-              </span>
-            </Tooltip>
-            {/* chat 相对时间：与标题同行靠右（2026-07-20 用户拍板——副行太占高度）；
-                hover 时行尾按钮浮现、时间让位隐藏 */}
-            {subtitle && (
-              <span className="shrink-0 text-[10px] leading-none text-muted-foreground/60 transition-opacity group-hover/item:opacity-0">
-                {subtitle}
-              </span>
-            )}
-          </span>
+          {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
+          <Tooltip content={task.title}>
+            <span className="min-w-0 truncate leading-tight">{task.title}</span>
+          </Tooltip>
           {/* task 活跃态：阶段 · 状态；其余单行只标题 */}
           {stageLine && (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
@@ -258,6 +247,13 @@ export const TaskListItem = ({
           )}
         </span>
       </Link>
+      {/* chat 相对时间：吸行尾右侧（与 hover 按钮同槽——hover 时按钮浮现、时间隐去），
+          不挤标题宽度（标题的右 padding 本来就为按钮槽留好了） */}
+      {subtitle && (
+        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[10px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0">
+          {subtitle}
+        </span>
+      )}
       {hasActions && (
         <div className="absolute inset-y-0 right-1 my-auto flex h-6 items-center gap-0.5">
           {pinReorder && (

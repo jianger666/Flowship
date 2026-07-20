@@ -321,7 +321,7 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
               <button
                 type="button"
                 onClick={() => toggleCollapsed(group.key)}
-                className="flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 pt-1 pb-0.5 text-left text-[11px] text-muted-foreground hover:text-foreground"
+                className="flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 pt-1 pb-0.5 text-left text-xs font-medium text-muted-foreground hover:text-foreground"
                 aria-expanded={!collapsed}
               >
                 {collapsed ? (
