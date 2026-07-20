@@ -190,8 +190,8 @@ export const TaskListItem = ({
   const seenAt = useTaskSeenAt(task.id);
   // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null）
   const stageLine = taskStageLine(task, seenAt);
-  // 活跃态监控行；否则相对时间
-  const subtitle = stageLine ? null : formatRelative(task.updatedAt);
+  // 相对时间副行仅 chat 行（grok 化）；task 行保持工作台原样——静息单行只标题、不占空间
+  const subtitle = task.mode === "chat" ? formatRelative(task.updatedAt) : null;
 
   // 行尾按钮数决定右 padding（避免标题被盖）
   const actionCount =
@@ -239,7 +239,7 @@ export const TaskListItem = ({
           <Tooltip content={task.title}>
             <span className="min-w-0 truncate leading-tight">{task.title}</span>
           </Tooltip>
-          {/* 活跃态：阶段 · 状态；否则相对时间 */}
+          {/* task 活跃态：阶段 · 状态；chat：相对时间；其余单行只标题 */}
           {stageLine ? (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
               <span className="min-w-0 truncate text-muted-foreground/70">
@@ -248,11 +248,11 @@ export const TaskListItem = ({
               <span className="text-muted-foreground/40">·</span>
               <span className={TONE_CLASS[stageLine.tone]}>{stageLine.status}</span>
             </span>
-          ) : (
+          ) : subtitle ? (
             <span className="min-w-0 truncate text-[11px] leading-none text-muted-foreground/70">
               {subtitle}
             </span>
-          )}
+          ) : null}
         </span>
       </Link>
       {hasActions && (

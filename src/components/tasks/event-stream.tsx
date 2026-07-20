@@ -132,6 +132,73 @@ const isBootStageItem = (it: RenderItem): it is BootStageItem =>
   it.kind === "__boot_stage__";
 
 /** 启动进度渐进单行：同一时刻只有最新阶段（正在检查 MCP → 创建会话 → 发送首包） */
+/** boot 阶段行最小停留时长——快阶段也能被看见（挨个切换、不闪跳） */
+const BOOT_STAGE_MIN_MS = 700;
+
+/**
+ * boot 进度「最小停留」缓冲：新阶段到达时若上一阶段停留不足 BOOT_STAGE_MIN_MS
+ * 则排队按序补播；latest=null（agent 真活动到达）立即清空、不拖住真内容。
+ */
+const useStagedBootDisplay = (
+  latest: { id: string; text: string } | null,
+): { id: string; text: string } | null => {
+  // 当前展示的阶段（滞后于 latest、保证每阶段可见）
+  const [shown, setShown] = useState<{ id: string; text: string } | null>(null);
+  // 待播队列 / 当前展示起始时刻 / 播报定时器 / shown 的 ref 镜像（effect 内读最新值）
+  const queueRef = useRef<Array<{ id: string; text: string }>>([]);
+  const shownAtRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shownRef = useRef<typeof shown>(null);
+  shownRef.current = shown;
+  const latestRef = useRef(latest);
+  latestRef.current = latest;
+
+  useEffect(() => {
+    const cur = latestRef.current;
+    if (cur === null) {
+      queueRef.current = [];
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
+      setShown(null);
+      return;
+    }
+    if (shownRef.current?.id === cur.id) return;
+    if (!queueRef.current.some((q) => q.id === cur.id)) {
+      queueRef.current.push(cur);
+    }
+    const advance = () => {
+      timerRef.current = null;
+      const next = queueRef.current.shift();
+      if (!next) return;
+      shownAtRef.current = Date.now();
+      setShown(next);
+      // 播完当前后若队列还有排队阶段、按最小停留继续推进
+      timerRef.current = setTimeout(advance, BOOT_STAGE_MIN_MS);
+    };
+    if (!shownRef.current) {
+      advance();
+      return;
+    }
+    if (!timerRef.current) {
+      const elapsed = Date.now() - shownAtRef.current;
+      timerRef.current = setTimeout(
+        advance,
+        Math.max(0, BOOT_STAGE_MIN_MS - elapsed),
+      );
+    }
+  }, [latest?.id]);
+
+  // 卸载清定时器
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
+  return shown;
+};
+
 const BootStageRow = ({ text }: { text: string }) => (
   <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
     <Loader2 className="size-3.5 animate-spin" />
@@ -350,6 +417,14 @@ const EventStreamImpl = ({
   // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
   const inputRef = useRef<ComposerFocusHandle | null>(null);
 
+  // 启动进度渐进单行的「最小停留」缓冲（2026-07-20 用户实测：MCP/建会话两阶段
+  // 太快、一闪而过像丢了——每个阶段至少停 BOOT_STAGE_MIN_MS、按序补播；
+  // agent 真活动到达（activeBoot=null）时立即清、不为动画拖住真内容）
+  const activeBoot = useMemo(
+    () => (isChat ? extractActiveBootStage(task.events) : null),
+    [isChat, task.events],
+  );
+  const displayedBoot = useStagedBootDisplay(activeBoot);
 
   // 渲染前：thinking 合并 → 滤 chat 启动噪声 → tool 配对 + GB verb-group → streaming/loading/pending
   const items: RenderItem[] = useMemo(() => {
@@ -375,20 +450,17 @@ const EventStreamImpl = ({
       ];
     }
     // F 批次：启动链进度（正在检查 MCP / 创建会话 / 发送首包）——
-    // 只显示最新一条（渐进单行）；有 agent 活动后 extractActiveBootStage 返 null、整组消失。
+    // 渐进单行（经最小停留缓冲挨个切换）；agent 活动后整组消失。
     // 有活跃 boot 行时它就是进度指示、压制通用 __loading__ 占位。
-    if (isChat) {
-      const activeBoot = extractActiveBootStage(task.events);
-      if (activeBoot) {
-        return [
-          ...withPending,
-          {
-            kind: "__boot_stage__",
-            id: activeBoot.id,
-            text: activeBoot.text,
-          },
-        ];
-      }
+    if (isChat && displayedBoot) {
+      return [
+        ...withPending,
+        {
+          kind: "__boot_stage__",
+          id: displayedBoot.id,
+          text: displayedBoot.text,
+        },
+      ];
     }
     // 「发出消息 → 程序受理」空白期：排除本地 pending 占位后看末项，
     // 避免 pending 压制 loading（二者可并存）
@@ -411,7 +483,7 @@ const EventStreamImpl = ({
       return [...withPending, { kind: "__loading__", id: "__loading__" }];
     }
     return withPending;
-  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies]);
+  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies, displayedBoot]);
 
   // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
   // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
