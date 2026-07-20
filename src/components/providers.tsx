@@ -17,6 +17,7 @@ import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
 import { CloseConfirmHandler } from "@/components/close-confirm-handler";
 import { DeepLinkHandler } from "@/components/deep-link-handler";
+import { GlobalShortcuts } from "@/components/global-shortcuts";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { MrInboxProvider } from "@/hooks/use-mr-inbox";
@@ -65,6 +66,8 @@ export const Providers = ({ children }: ProvidersProps) => {
               {/* 飞书卡片深链 flowship://tasks/<id> → 路由跳对应任务页 */}
               <DeepLinkHandler />
               <CloseConfirmHandler />
+              {/* 全局快捷键统一注册（Cmd+K 命令面板 / Cmd+N 新建对话） */}
+              <GlobalShortcuts />
               {children}
             </MrInboxProvider>
           </TaskListProvider>

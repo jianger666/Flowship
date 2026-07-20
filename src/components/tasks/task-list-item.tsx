@@ -17,14 +17,32 @@
  * task 交卷等 ack 都停在 awaiting_user——老条件下侧栏几乎满屏常亮黄点、失去注意力信号价值。
  * 现在只有「需要你行动」才亮：等你审阅（awaiting_ack）或 agent 提问等答案（action 还 running）。
  * chat 静息（你一句我一句的正常状态）不亮。
+ *
+ * 2026-07-20 grok 化：可选重命名（双击标题 / 菜单）、置顶区上/下移、正文搜索摘要行。
  */
 
 import Link from "next/link";
 import { useCallback, useSyncExternalStore, type ReactNode } from "react";
-import { ListTodo, Loader2, MessageCircle, Pin, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  ListTodo,
+  Loader2,
+  MessageCircle,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  Trash2,
+} from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { actionDisplayLabel, formatRelative } from "@/lib/task-display";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
@@ -48,6 +66,7 @@ const useTaskSeenAt = (taskId: string): number => {
   const getSnapshot = useCallback(() => getTaskSeenAt(taskId), [taskId]);
   return useSyncExternalStore(subscribeTaskSeen, getSnapshot, () => 0);
 };
+
 /**
  * 标题内匹配段高亮（侧栏搜索用）。
  * 不引第三方高亮库：大小写不敏感、逐段切分；query 空则原样返回。
@@ -159,6 +178,14 @@ const LeadingIndicator = ({
   );
 };
 
+/** 置顶区手动重排（按钮式、不引拖拽库） */
+export type PinReorderControls = {
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+};
+
 interface TaskListItemProps {
   task: TaskSummary;
   active?: boolean;
@@ -172,6 +199,12 @@ interface TaskListItemProps {
   onPin?: (task: TaskSummary) => void;
   // 侧栏搜索时传入：标题匹配段加粗变色；空 / 不传 = 原样标题
   highlightQuery?: string;
+  // 侧栏重命名（双击标题 / 菜单「重命名」）；不传则无入口
+  onRename?: (task: TaskSummary) => void;
+  // 置顶区内上/下移；仅置顶组分发
+  pinReorder?: PinReorderControls;
+  // 正文搜索命中摘要（替换相对时间次行）
+  contentSnippet?: string;
 }
 
 export const TaskListItem = ({
@@ -182,14 +215,37 @@ export const TaskListItem = ({
   deleteDisabled,
   onPin,
   highlightQuery,
+  onRename,
+  pinReorder,
+  contentSnippet,
 }: TaskListItemProps) => {
-  const hasActions = !!(onPin || onDelete);
+  const hasMenu = !!onRename;
+  const hasActions = !!(onPin || onDelete || hasMenu || pinReorder);
   // 订阅已读：打开详情 markTaskSeen 后本行立刻重算、熄灭琥珀点
   const seenAt = useTaskSeenAt(task.id);
   // v1.0：task 行的「阶段 · 状态」监控行（chat 行为 null）
   const stageLine = taskStageLine(task, seenAt);
-  // TaskSummary 无最后消息摘要字段——无摘要时用相对时间作第二行灰字
-  const subtitle = stageLine ? null : formatRelative(task.updatedAt);
+  // 正文命中优先；否则活跃态监控行；否则相对时间
+  const subtitle = contentSnippet
+    ? contentSnippet
+    : stageLine
+      ? null
+      : formatRelative(task.updatedAt);
+
+  // 行尾按钮数决定右 padding（避免标题被盖）
+  const actionCount =
+    (pinReorder ? 2 : 0) + (onPin ? 1 : 0) + (hasMenu ? 1 : 0) + (onDelete ? 1 : 0);
+  const prClass =
+    actionCount >= 5
+      ? "pr-28"
+      : actionCount >= 4
+        ? "pr-24"
+        : actionCount >= 3
+          ? "pr-20"
+          : hasActions
+            ? "pr-14"
+            : "pr-2";
+
   return (
     <div className="group/item relative">
       {/* 当前任务：左侧 2px 强调竖条（对标 Cursor / Linear 的 active 指示） */}
@@ -199,10 +255,15 @@ export const TaskListItem = ({
       <Link
         href={`/tasks/${task.id}`}
         onClick={onNavigate}
+        onDoubleClick={(e) => {
+          // 双击标题区重命名：仍会先导航一次，对话框叠在详情上可接受
+          if (!onRename) return;
+          e.preventDefault();
+          onRename(task);
+        }}
         className={cn(
           "flex min-w-0 items-start gap-2 rounded-md py-1.5 pl-3 text-sm no-underline transition-colors",
-          // 有操作按钮时给行尾留白、避免标题被盖
-          hasActions ? "pr-14" : "pr-2",
+          prClass,
           active
             ? "bg-selected font-medium text-selected-foreground"
             : "text-foreground/75 hover:bg-muted/50 hover:text-foreground",
@@ -221,8 +282,8 @@ export const TaskListItem = ({
                 : task.title}
             </span>
           </Tooltip>
-          {/* 活跃态：阶段 · 状态；否则相对时间（无最后消息摘要字段） */}
-          {stageLine ? (
+          {/* 活跃态：阶段 · 状态；正文摘要；否则相对时间 */}
+          {stageLine && !contentSnippet ? (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
               <span className="min-w-0 truncate text-muted-foreground/70">
                 {stageLine.stage}
@@ -239,6 +300,32 @@ export const TaskListItem = ({
       </Link>
       {hasActions && (
         <div className="absolute inset-y-0 right-1 my-auto flex h-6 items-center gap-0.5">
+          {pinReorder && (
+            <>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={pinReorder.onMoveUp}
+                disabled={!pinReorder.canMoveUp}
+                title="上移"
+                aria-label={`上移 ${task.title}`}
+                className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
+              >
+                <ChevronUp className="size-3.5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={pinReorder.onMoveDown}
+                disabled={!pinReorder.canMoveDown}
+                title="下移"
+                aria-label={`下移 ${task.title}`}
+                className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
+              >
+                <ChevronDown className="size-3.5" />
+              </Button>
+            </>
+          )}
           {onPin && (
             <Button
               variant="ghost"
@@ -257,6 +344,30 @@ export const TaskListItem = ({
             >
               <Pin className={cn("size-3.5", task.pinned && "fill-current")} />
             </Button>
+          )}
+          {hasMenu && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                title="更多"
+                aria-label={`更多操作 ${task.title}`}
+                className={cn(
+                  "inline-flex size-6 items-center justify-center rounded-md text-muted-foreground outline-none transition-opacity",
+                  "opacity-0 hover:bg-accent hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring",
+                  "data-popup-open:opacity-100",
+                )}
+              >
+                <MoreHorizontal className="size-3.5" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" side="bottom" className="min-w-28">
+                <DropdownMenuItem
+                  onClick={() => onRename?.(task)}
+                  className="gap-2"
+                >
+                  <Pencil className="size-3.5" />
+                  重命名
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
           {onDelete && (
             <Button

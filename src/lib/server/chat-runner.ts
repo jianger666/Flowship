@@ -558,7 +558,8 @@ const publishBootProgress = (
       ts: Date.now(),
       kind: "info",
       text,
-      meta: { stage },
+      // bootStage：前端「渐进单行」判定标（lib/chat-stream-display.isBootStageInfo）
+      meta: { stage, bootStage: true },
     },
   });
 };

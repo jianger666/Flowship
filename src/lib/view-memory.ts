@@ -4,9 +4,11 @@
  * 三档存储、按「该记多久」选：
  * - sessionStorage：最后浏览的对话 / 输入草稿 / 看板时间范围——重启 app 即忘（符合预期、
  *   不产生陈旧状态）；Electron 单窗口、session 生命周期 = app 生命周期
- * - localStorage：输入条拖过的高度——用户的全局偏好、跨重启保留
+ * - localStorage：输入条拖过的高度 / 侧栏分组折叠与置顶序——用户的全局偏好、跨重启保留
  * - 模块级内存 Map：事件流滚动锚点——SPA 路由切换组件会卸载、但模块常驻；reload 即忘无妨
  */
+
+import type { SidebarGroupMode } from "@/lib/sidebar-groups";
 
 // SSR / 存储被禁时兜底 null（客户端组件在 server 也会跑一遍首渲）
 const ss = (): Storage | null => {
@@ -153,4 +155,73 @@ export const loadBoardRange = (): { from: number; to: number } | null => {
 
 export const saveBoardRange = (range: { from: number; to: number }) => {
   ss()?.setItem(BOARD_RANGE_KEY, JSON.stringify(range));
+};
+
+// ---------- 侧栏 chat 分组视图（跨重启保留、localStorage） ----------
+//
+// 对标 grok Dashboard 的 grouping / pin reorder / 折叠态——不进 task meta，避免污染业务数据。
+
+const SIDEBAR_GROUP_MODE_KEY = "flowship:sidebar-group-mode";
+const SIDEBAR_COLLAPSED_KEY = "flowship:sidebar-collapsed-groups";
+const SIDEBAR_PINNED_ORDER_KEY = "flowship:sidebar-pinned-order";
+
+export const loadSidebarGroupMode = (): SidebarGroupMode => {
+  try {
+    const v = localStorage.getItem(SIDEBAR_GROUP_MODE_KEY);
+    return v === "status" ? "status" : "repo";
+  } catch {
+    return "repo";
+  }
+};
+
+export const saveSidebarGroupMode = (mode: SidebarGroupMode) => {
+  try {
+    localStorage.setItem(SIDEBAR_GROUP_MODE_KEY, mode);
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+/** 折叠中的组 key 集合（repo:… / unbound / status:…；置顶一般不折叠但仍可记） */
+export const loadSidebarCollapsedGroups = (): Set<string> => {
+  try {
+    const raw = JSON.parse(
+      localStorage.getItem(SIDEBAR_COLLAPSED_KEY) ?? "[]",
+    ) as unknown;
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(
+      raw.filter((x): x is string => typeof x === "string" && x.length > 0),
+    );
+  } catch {
+    return new Set();
+  }
+};
+
+export const saveSidebarCollapsedGroups = (keys: Iterable<string>) => {
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify([...keys]));
+  } catch {
+    /* 存储被禁忽略 */
+  }
+};
+
+/** 置顶区手动序（task id 数组）；未出现的 pinned 追加到末尾 */
+export const loadSidebarPinnedOrder = (): string[] => {
+  try {
+    const raw = JSON.parse(
+      localStorage.getItem(SIDEBAR_PINNED_ORDER_KEY) ?? "[]",
+    ) as unknown;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((x): x is string => typeof x === "string" && x.length > 0);
+  } catch {
+    return [];
+  }
+};
+
+export const saveSidebarPinnedOrder = (ids: readonly string[]) => {
+  try {
+    localStorage.setItem(SIDEBAR_PINNED_ORDER_KEY, JSON.stringify([...ids]));
+  } catch {
+    /* 存储被禁忽略 */
+  }
 };

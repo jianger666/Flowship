@@ -9,7 +9,6 @@
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
 import { stopTaskAgent } from "@/lib/server/stop-task";
 import { getTask } from "@/lib/server/task-fs";
-import type { Task } from "@/lib/types";
 
 import { getCurrentChatTaskId } from "./bridge-state";
 import { findTaskByMessageId, rememberCardMessage } from "./card-map";
@@ -28,7 +27,6 @@ import {
   listActiveChatTasks,
   loadBridgeBootContext,
   registerBridgeCommand,
-  type BridgeCommandContext,
   type BridgeCommandHandler,
   resolveReplyAnchorIds,
   reviveChatByAnchor,

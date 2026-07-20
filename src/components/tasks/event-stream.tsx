@@ -50,10 +50,17 @@ import {
   type StreamRenderItem,
 } from "@/lib/tool-display";
 import {
+  extractActiveBootStage,
+  isBootStageInfo,
+  shouldShowTurnDivider,
+} from "@/lib/chat-stream-display";
+import {
   extractUserReplyAttachments,
   extractUserReplyImages,
+  formatTs,
   isChatStartupNoiseInfo,
   mergeAdjacentThinking,
+  summarize,
 } from "./event-stream/utils";
 import {
   AskUserRequestRow,
@@ -95,7 +102,22 @@ interface PendingLocalItem {
   uncertain?: boolean;
 }
 
-type RenderItem = StreamRenderItem | StreamingItem | LoadingItem | PendingLocalItem;
+/**
+ * 启动进度虚拟项（F 批次）：boot stage info 不逐条渲染、
+ * 只在末尾挂「最新一条 + spinner」的渐进单行；agent 活动出现后整组消失。
+ */
+interface BootStageItem {
+  kind: "__boot_stage__";
+  id: string;
+  text: string;
+}
+
+type RenderItem =
+  | StreamRenderItem
+  | StreamingItem
+  | LoadingItem
+  | PendingLocalItem
+  | BootStageItem;
 
 const isStreamingItem = (it: RenderItem): it is StreamingItem =>
   it.kind === "__streaming__";
@@ -105,6 +127,17 @@ const isLoadingItem = (it: RenderItem): it is LoadingItem =>
 
 const isPendingLocalItem = (it: RenderItem): it is PendingLocalItem =>
   it.kind === "__pending_local__";
+
+const isBootStageItem = (it: RenderItem): it is BootStageItem =>
+  it.kind === "__boot_stage__";
+
+/** 启动进度渐进单行：同一时刻只有最新阶段（正在检查 MCP → 创建会话 → 发送首包） */
+const BootStageRow = ({ text }: { text: string }) => (
+  <div className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground">
+    <Loader2 className="size-3.5 animate-spin" />
+    <span>{text}</span>
+  </div>
+);
 
 /**
  * 启动空窗进度（批 B 前端档）：server 暂无分阶段 info 事件时，
@@ -174,6 +207,16 @@ interface Props {
   // [ATTACHED_PATHS] 段、agent 用 `read` 工具自己读
   // skillRefs：选中的 skill（name + absPath）、后端拼进 agent 消息、不进 user_reply 气泡
   onUserReply?: (
+    text: string,
+    images?: ImagePayload[],
+    attachments?: string[],
+    skillRefs?: Array<{ name: string; absPath: string }>,
+  ) => boolean | void | Promise<boolean | void>;
+  /**
+   * B 批次「立即发送」通道：agent 运行中打断当前回复后立刻发这条
+   * （chat-view 实现 = 先 stopTask 等停止、再走常规发送）。不传 = 运行中只能排队。
+   */
+  onUserReplyNow?: (
     text: string,
     images?: ImagePayload[],
     attachments?: string[],
@@ -254,17 +297,21 @@ const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) =>
 
 const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
 
-/** chat 渲染管线：与 items / loadEarlier prepend 共用同一过滤，避免 firstItemIndex 与可视条数不一致 */
+/** chat 渲染管线：与 items / loadEarlier prepend 共用同一过滤，避免 firstItemIndex 与可视条数不一致
+ *  boot stage info 也在这滤掉（F 批次）——它们只以末尾渐进单行呈现、历史回看无价值 */
 const eventsForStreamRender = (
   events: TaskEvent[],
   isChat: boolean,
 ): TaskEvent[] =>
-  isChat ? events.filter((e) => !isChatStartupNoiseInfo(e)) : events;
+  isChat
+    ? events.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
+    : events;
 
 const EventStreamImpl = ({
   task,
   streamingText,
   onUserReply,
+  onUserReplyNow,
   hideReplyComposer,
   canReply,
   submitting,
@@ -327,6 +374,22 @@ const EventStreamImpl = ({
         { kind: "__streaming__", id: "__streaming__", text: streamingText },
       ];
     }
+    // F 批次：启动链进度（正在检查 MCP / 创建会话 / 发送首包）——
+    // 只显示最新一条（渐进单行）；有 agent 活动后 extractActiveBootStage 返 null、整组消失。
+    // 有活跃 boot 行时它就是进度指示、压制通用 __loading__ 占位。
+    if (isChat) {
+      const activeBoot = extractActiveBootStage(task.events);
+      if (activeBoot) {
+        return [
+          ...withPending,
+          {
+            kind: "__boot_stage__",
+            id: activeBoot.id,
+            text: activeBoot.text,
+          },
+        ];
+      }
+    }
     // 「发出消息 → 程序受理」空白期：排除本地 pending 占位后看末项，
     // 避免 pending 压制 loading（二者可并存）
     let last: RenderItem | undefined;
@@ -357,6 +420,24 @@ const EventStreamImpl = ({
     [task.events],
   );
 
+  // 轮次分割判定用的 kind 序列（与 items 对齐；shouldShowTurnDivider 纯函数吃它）
+  const itemKinds = useMemo(() => items.map((it) => it.kind), [items]);
+
+  // E1 sticky 轮次头：当前轮的用户消息句（滚出视口上沿后粘顶、点击回滚到该轮头部）。
+  // Virtuoso 无逐组 sticky API（GroupedVirtuoso 要整体重构数据形状）——用
+  // rangeChanged 维护「视口顶上方最近一条 user_reply」+ 绝对定位 overlay 实现。
+  const [stickyTurn, setStickyTurn] = useState<{
+    id: string;
+    text: string;
+  } | null>(null);
+  // 上次 sticky id（ref 比对、避免滚动中重复 setState）
+  const stickyTurnIdRef = useRef<string | null>(null);
+  const updateStickyTurn = (next: { id: string; text: string } | null) => {
+    if ((next?.id ?? null) === stickyTurnIdRef.current) return;
+    stickyTurnIdRef.current = next?.id ?? null;
+    setStickyTurn(next);
+  };
+
   // ---------- v1.0.x 事件懒加载（上拉分页） ----------
   // firstItemIndex：Virtuoso prepend 保滚动位置的官方机制——头部插 N 个 item 就减 N
   const [firstItemIndex, setFirstItemIndex] = useState(FIRST_INDEX_BASE);
@@ -375,7 +456,7 @@ const EventStreamImpl = ({
   const taskIdRef = useRef(task.id);
   taskIdRef.current = task.id;
 
-  // 切 task 重置分页状态 + 换载对应草稿 + 重开滚动恢复闸
+  // 切 task 重置分页状态 + 换载对应草稿 + 重开滚动恢复闸 + 清 sticky 轮次头
   useEffect(() => {
     pagedOnceRef.current = false;
     loadingEarlierRef.current = false;
@@ -384,6 +465,8 @@ const EventStreamImpl = ({
     setLoadingEarlier(false);
     setDraft(loadDraft("reply", task.id));
     initialTopRef.current = null;
+    stickyTurnIdRef.current = null;
+    setStickyTurn(null);
   }, [task.id]);
   // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
   // 已经拉过页就不再被它改（本地分页状态才是准的）
@@ -582,8 +665,9 @@ const EventStreamImpl = ({
 
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
   const sendingLockRef = useRef(false);
-  const handleSend = () => {
-    if (sendingLockRef.current) return;
+  // 排队 / 立即发送共用同一套「取草稿 → 发送 → 成功清空」流程、只有发送通道不同
+  const submitVia = (send: typeof onUserReply) => {
+    if (!send || sendingLockRef.current) return;
     const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
     if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) {
@@ -600,12 +684,7 @@ const EventStreamImpl = ({
     sendingLockRef.current = true;
     void (async () => {
       try {
-        const result = await onUserReply?.(
-          text,
-          images,
-          attachments,
-          skillRefs,
-        );
+        const result = await send(text, images, attachments, skillRefs);
         // 仅成功（200/202 → true）后清空；prepareRunArgs null / 失败保留草稿+附件
         if (result === false) return;
         setDraft("");
@@ -618,6 +697,9 @@ const EventStreamImpl = ({
       }
     })();
   };
+  const handleSend = () => submitVia(onUserReply);
+  // 立即发送（打断当前回复）：仅运行中且父组件给了通道时 Composer 才会暴露入口
+  const handleSendNow = () => submitVia(onUserReplyNow);
 
   // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
   // 连续过程行（thinking / tool / info…）紧凑堆叠成一组
@@ -646,6 +728,32 @@ const EventStreamImpl = ({
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
           relative：给「AI 在等你回答」悬浮条定位 */}
       <div className="relative min-h-0 flex-1">
+        {/* E1 sticky 轮次头：当前轮用户消息滚出视口后粘顶（低调 backdrop-blur）、点击回该轮头部 */}
+        {isChat && stickyTurn && (
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-10">
+            <div className="mx-auto w-full max-w-3xl px-6">
+              <button
+                type="button"
+                onClick={() => {
+                  const idx = items.findIndex((it) => it.id === stickyTurn.id);
+                  if (idx >= 0) {
+                    virtuosoRef.current?.scrollToIndex({
+                      index: idx,
+                      align: "start",
+                      behavior: "smooth",
+                    });
+                  }
+                }}
+                title="回到本轮开头"
+                className="pointer-events-auto flex w-full cursor-pointer items-center rounded-b-md border-x border-b border-border/40 bg-background/75 px-3 py-1.5 text-left text-xs text-muted-foreground backdrop-blur transition-colors hover:text-foreground"
+              >
+                <span className="min-w-0 flex-1 truncate">
+                  {summarize(stickyTurn.text)}
+                </span>
+              </button>
+            </div>
+          </div>
+        )}
         {/* V0.13.x 注意力悬浮条（用户拍板「事件流太弱、怕注意不到」）：
             有未答提问且用户滚在历史里（不贴底）时、底部悬浮提示、点击滚到答题卡 */}
         {pendingAskEvent && !atBottomState && (
@@ -703,6 +811,21 @@ const EventStreamImpl = ({
             // 切走再切回按它恢复（虚拟 item __streaming__/__loading__ 不作锚点）
             rangeChanged={(range) => {
               const localIdx = range.startIndex - firstItemIndex;
+              // E1 sticky 轮次头：往上找「视口顶或其上方」最近一条 user_reply；
+              // 它正好就是顶部第一条（自身还看得见）时不粘、滚过去了才粘
+              if (isChat) {
+                let sticky: { id: string; text: string } | null = null;
+                for (let i = Math.min(localIdx, items.length - 1); i >= 0; i--) {
+                  const it = items[i];
+                  if (it && it.kind === "user_reply") {
+                    if (i < localIdx) {
+                      sticky = { id: it.id, text: it.text };
+                    }
+                    break;
+                  }
+                }
+                updateStickyTurn(sticky);
+              }
               const top = items[localIdx];
               if (!top || top.id.startsWith("__")) return;
               saveScrollAnchor(task.id, {
@@ -740,10 +863,24 @@ const EventStreamImpl = ({
                   idx === items.length - 1 && (isChat ? "pb-6" : "pb-4"),
                 )}
               >
+                {/* A3 每轮分割线：用户消息 = 新一轮开始、上方细线 + 轮次时间（第一轮不画） */}
+                {isChat &&
+                  item.kind === "user_reply" &&
+                  shouldShowTurnDivider(itemKinds, idx) && (
+                    <div className="mb-4 flex items-center gap-3" aria-hidden>
+                      <div className="h-px flex-1 bg-border/60" />
+                      <span className="text-[10px] tabular-nums text-muted-foreground/60">
+                        {formatTs(item.ts)}
+                      </span>
+                      <div className="h-px flex-1 bg-border/60" />
+                    </div>
+                  )}
                 {isStreamingItem(item) ? (
                   <StreamingAssistantRow text={item.text} variant={variant} />
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
+                ) : isBootStageItem(item) ? (
+                  <BootStageRow text={item.text} />
                 ) : isPendingLocalItem(item) ? (
                   <PendingLocalReplyRow
                     text={item.text}
@@ -802,6 +939,7 @@ const EventStreamImpl = ({
               saveDraft("reply", task.id, v);
             }}
             onSubmit={handleSend}
+            onSubmitNow={onUserReplyNow ? handleSendNow : undefined}
             placeholder={
               isAwaitingUser || (isRunning && allowQueueWhileRunning)
                 ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`

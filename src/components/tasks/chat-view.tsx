@@ -29,6 +29,7 @@ import {
   type ChatWorkdirPickerHandle,
 } from "@/components/tasks/chat-workdir-picker";
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
+import { ChatQueueBanner } from "@/components/tasks/chat-queue-banner";
 import { EventStream } from "@/components/tasks/event-stream";
 import {
   ComposerSessionProvider,
@@ -278,7 +279,8 @@ export const ChatView = ({
     // 整队作废 → reducer 记 failed
     onQueueFailed: (itemIds, reason) => {
       dispatchChatOp(task.id, { type: "queue_failed", itemIds });
-      if (itemIds.length > 0) {
+      // cancelled = 用户主动操作（队列面板删除 / 停止取消）——不是事故、不弹 error
+      if (itemIds.length > 0 && reason !== "cancelled") {
         // reason 不止 persist_failed——文案按语义区分
         toast.error(
           reason === "persist_failed"
@@ -536,8 +538,8 @@ export const ChatView = ({
     [task],
   );
 
-  // 停止当前正在跑的 chat agent
-  const handleStop = useCallback(async () => {
+  // 停止当前正在跑的 chat agent；返回是否成功（「立即发送」要据此决定发不发）
+  const stopAgentCore = useCallback(async (): Promise<boolean> => {
     setStopping(true);
     try {
       const latest = await stopTask(task.id);
@@ -552,12 +554,35 @@ export const ChatView = ({
           `已确认 ${(result.clearedIds ?? []).length} 条消息终态`,
         );
       }
+      return true;
     } catch (err) {
       toast.error(`停止失败：${(err as Error).message}`);
+      return false;
     } finally {
       setStopping(false);
     }
   }, [task.id]);
+
+  const handleStop = useCallback(async () => {
+    await stopAgentCore();
+  }, [stopAgentCore]);
+
+  // B 批次「立即发送」：先停止当前回复（等停止落定）、再走常规发送——
+  // 停止后 runStatus 归 idle、handleUserReply 走直发通道开新一轮
+  const handleUserReplyNow = useCallback(
+    async (
+      text: string,
+      images?: ImagePayload[],
+      attachments?: string[],
+      skillRefs?: Array<{ name: string; absPath: string }>,
+    ): Promise<boolean> => {
+      const stopped = await stopAgentCore();
+      // 停止失败保留草稿（返回 false 调用方不清空）、不发这条
+      if (!stopped) return false;
+      return handleUserReply(text, images, attachments, skillRefs);
+    },
+    [stopAgentCore, handleUserReply],
+  );
 
   // 重命名对话
   const handleRename = useCallback(async () => {
@@ -668,11 +693,10 @@ export const ChatView = ({
     return null;
   })();
 
+  // D 批次：排队条可点开小面板（列排队消息 + 行内删除）、组件见 chat-queue-banner
   const queueBanner =
     queuedCount != null && queuedCount > 0 ? (
-      <div className="mx-2.5 mb-1.5 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
-        已排队，将在当前回复完成后发送（第 {queuedCount} 条）
-      </div>
+      <ChatQueueBanner taskId={task.id} queuedCount={queuedCount} />
     ) : null;
 
   return (
@@ -796,6 +820,7 @@ export const ChatView = ({
           streamingText={streamingText}
           liveToolOutputs={liveToolOutputs}
           onUserReply={handleUserReply}
+          onUserReplyNow={handleUserReplyNow}
           canReply={canReply}
           submitting={isSubmitting}
           disabledHint={disabledHint}

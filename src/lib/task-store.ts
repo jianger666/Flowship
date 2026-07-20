@@ -154,6 +154,25 @@ export const deleteTask = async (id: string): Promise<DeleteTaskResult> => {
   return "ok";
 };
 
+/**
+ * 侧栏正文搜索（GET /api/tasks/search?q=）
+ * q 少于 2 字服务端直接返空；仅扫 chat 的 user_reply / assistant_message。
+ */
+export const searchTaskContents = async (
+  q: string,
+): Promise<Array<{ taskId: string; snippet: string }>> => {
+  const query = q.trim();
+  if (query.length < 2) return [];
+  const res = await fetch(
+    `/api/tasks/search?q=${encodeURIComponent(query)}`,
+    { cache: "no-store" },
+  );
+  const data = await handleJson<{ hits: Array<{ taskId: string; snippet: string }> }>(
+    res,
+  );
+  return data.hits ?? [];
+};
+
 // V0.8 侧栏：置顶 / 取消置顶（PATCH /api/tasks/[id]）
 export const setTaskPinned = async (
   id: string,
@@ -869,6 +888,43 @@ export const rewindChatToEvent = async (
     task: data.task,
     ...(data.refreshRequired ? { refreshRequired: true } : {}),
   };
+};
+
+// ----------------- chat 排队可视化（D 批次） -----------------
+
+/** 排队中消息（GET /chat-queue 条目、与 server ChatQueueItemSnapshot 同形） */
+export interface ChatQueueItem {
+  itemId: string;
+  displayText: string;
+  enqueuedAt: number;
+}
+
+export const fetchChatQueue = async (
+  taskId: string,
+): Promise<ChatQueueItem[]> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/chat-queue`,
+    { cache: "no-store" },
+  );
+  const data = await handleJson<{ items: ChatQueueItem[] }>(res);
+  return data.items;
+};
+
+/** 删除排队中的消息；返回实际被移除的 itemIds（已发出的删不到） */
+export const removeChatQueueItems = async (
+  taskId: string,
+  itemIds: string[],
+): Promise<string[]> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/chat-queue`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemIds }),
+    },
+  );
+  const data = await handleJson<{ ok: true; removedIds: string[] }>(res);
+  return data.removedIds;
 };
 
 /** P4：会话 token 透视 */

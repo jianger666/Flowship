@@ -863,6 +863,26 @@ export const takeRemainingChatQueueItemIds = (taskId: string): string[] => {
   return cur.map((m) => m.itemId);
 };
 
+/** 队列面板展示用的最小条目形状（GET /chat-queue 返回体） */
+export type ChatQueueItemSnapshot = {
+  itemId: string;
+  displayText: string;
+  enqueuedAt: number;
+};
+
+/**
+ * 只读快照——排队中消息的展示信息（队列可视化面板用）。
+ * 不含 in-flight（已交给发送流程、删除无意义）；不改 generation / 不消费队列。
+ */
+export const listQueuedChatMessages = (
+  taskId: string,
+): ChatQueueItemSnapshot[] =>
+  (queues().get(taskId) ?? []).map((m) => ({
+    itemId: m.itemId,
+    displayText: m.displayText,
+    enqueuedAt: m.enqueuedAt,
+  }));
+
 /**
  * 只读快照——当前服务端仍「存活」的 queue itemId（队内 + in-flight）。
  * 供 watch-task bootstrap 的 queue_state；不改 generation / 不消费队列。

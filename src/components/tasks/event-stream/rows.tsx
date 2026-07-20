@@ -15,6 +15,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Ban,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   Clock,
   Copy,
@@ -39,6 +40,7 @@ import {
   type PreviewImage,
 } from "@/components/ui/image-preview";
 import { isAskSuperseded } from "@/lib/ask-pending";
+import { shouldCollapseUserMessage } from "@/lib/chat-stream-display";
 import { getIdeAnchorProps } from "@/lib/ide-open";
 import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
@@ -239,10 +241,10 @@ export const ReconnectingRow = memo(
 );
 ReconnectingRow.displayName = "ReconnectingRow";
 
-/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中） */
+/** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐 */
 export const PendingLocalReplyRow = memo(
   ({ text, uncertain }: { text: string; uncertain?: boolean }) => (
-    <div className="flex items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
+    <div className="ml-auto flex w-fit max-w-[85%] items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
       <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
         <span className="mb-0.5 block text-[10px] tracking-wide">
@@ -295,6 +297,8 @@ const EventRowImpl = ({
   // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState("");
+  // 超长用户消息折叠展开态（Codex「显示更多」同款）：组件内 state、默认折叠
+  const [userExpanded, setUserExpanded] = useState(false);
   // 编辑 / 重发飞行锁（防连点；失败时保持 editing）
   const [editSubmitting, setEditSubmitting] = useState(false);
   const resendLockRef = useRef(false);
@@ -510,8 +514,12 @@ const EventRowImpl = ({
           </div>
         );
       }
+      // 折叠判定纯逻辑在 lib/chat-stream-display（可单测）；行数阈值与 line-clamp-8 对应
+      const userCollapsible = shouldCollapseUserMessage(ev.text);
       return (
-        <div className="group relative rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
+        // 右对齐收窄块（Codex 风、A1）：ml-auto + w-fit 右浮、max-w 85% 收窄，
+        // 与 AI 左侧平铺拉开、扫一眼分清谁说的
+        <div className="group relative ml-auto w-fit max-w-[85%] rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
           {(onResend || canRewind) && (
             <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
               {canRewind && (
@@ -566,9 +574,29 @@ const EventRowImpl = ({
               </span>
             </div>
           )}
-          <div className="text-sm leading-relaxed">
+          <div
+            className={cn(
+              "text-sm leading-relaxed",
+              userCollapsible && !userExpanded && "line-clamp-8",
+            )}
+          >
             <SkillTokenText text={ev.text} />
           </div>
+          {userCollapsible && (
+            <button
+              type="button"
+              onClick={() => setUserExpanded((v) => !v)}
+              className="mt-1 flex cursor-pointer items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground"
+            >
+              {userExpanded ? "收起" : "显示更多"}
+              <ChevronDown
+                className={cn(
+                  "size-3 transition-transform",
+                  userExpanded && "rotate-180",
+                )}
+              />
+            </button>
+          )}
           {images.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
               {imageGroup.map((g, i) => (

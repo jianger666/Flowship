@@ -67,6 +67,10 @@ import {
 } from "@/components/at-mention";
 import { useComposerSession } from "@/components/composer-session";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import {
+  isDoubleEsc,
+  resolveRunningSubmitAction,
+} from "@/lib/keyboard-shortcuts";
 import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 
@@ -88,6 +92,11 @@ export interface ComposerEditorProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  /**
+   * B 批次「立即发送」（运行中打断当前回复）：命中提交偏好的对位组合时触发
+   * （enter 偏好 → Cmd/Ctrl+Enter；mod-enter 偏好 → 裸 Enter）。不传 = 无此通道。
+   */
+  onSubmitNow?: () => void;
   placeholder?: string;
   disabled?: boolean;
   focusRef?: RefObject<ComposerFocusHandle | null>;
@@ -478,6 +487,7 @@ const SlashAtAndSubmitPlugin = ({
   slash,
   atMention,
   onSubmit,
+  onSubmitNow,
   submitShortcut,
   knownNames,
   lastEmittedRef,
@@ -486,6 +496,7 @@ const SlashAtAndSubmitPlugin = ({
   slash?: SlashSkillsApi;
   atMention?: AtMentionApi;
   onSubmit: () => void;
+  onSubmitNow?: () => void;
   submitShortcut: SubmitShortcut;
   knownNames: ReadonlySet<string>;
   lastEmittedRef: RefObject<string>;
@@ -498,6 +509,8 @@ const SlashAtAndSubmitPlugin = ({
   atRef.current = atMention;
   const onSubmitRef = useRef(onSubmit);
   onSubmitRef.current = onSubmit;
+  const onSubmitNowRef = useRef(onSubmitNow);
+  onSubmitNowRef.current = onSubmitNow;
   const shortcutRef = useRef(submitShortcut);
   shortcutRef.current = submitShortcut;
   const namesRef = useRef(knownNames);
@@ -562,6 +575,18 @@ const SlashAtAndSubmitPlugin = ({
         if (event && shouldSubmitNative(event, shortcutRef.current)) {
           event.preventDefault();
           onSubmitRef.current();
+          return true;
+        }
+        // 运行中「立即发送」通道（onSubmitNow 仅 running 时由 Composer 传入）：
+        // 命中提交偏好的对位组合 → 打断当前回复立刻发（B 批次）
+        const sendNow = onSubmitNowRef.current;
+        if (
+          event &&
+          sendNow &&
+          resolveRunningSubmitAction(event, shortcutRef.current) === "sendNow"
+        ) {
+          event.preventDefault();
+          sendNow();
           return true;
         }
         return false;
@@ -776,6 +801,7 @@ const ComposerEditorInner = ({
   value,
   onChange,
   onSubmit,
+  onSubmitNow,
   placeholder,
   disabled,
   focusRef,
@@ -795,6 +821,8 @@ const ComposerEditorInner = ({
 }) => {
   const submitShortcut = useSubmitShortcut();
   const knownNames = slash?.knownNames ?? EMPTY_NAMES;
+  // E2 双击 Esc 清空草稿：上次 Esc 的时间戳（窗口判定在 lib/keyboard-shortcuts）
+  const lastEscTsRef = useRef<number | null>(null);
 
   const handleEditorChange = useCallback(
     (editorState: EditorState, _editor: unknown, tags: Set<string>) => {
@@ -818,8 +846,22 @@ const ComposerEditorInner = ({
       if (e.key === "Enter") return;
       if (slash?.onKeyDown(e)) return;
       if (atMention?.onKeyDown(e)) return;
+      // E2 双击 Esc 清空草稿（有内容时）；单 Esc 不动现有行为（菜单关闭已在上面消费）
+      if (e.key === "Escape" && !e.nativeEvent.isComposing) {
+        const now = Date.now();
+        if (
+          lastEmittedRef.current &&
+          isDoubleEsc(lastEscTsRef.current, now)
+        ) {
+          lastEscTsRef.current = null;
+          // 走 onChange("")：父级草稿清空 → ExternalValuePlugin 同步清编辑器
+          onChange("");
+        } else {
+          lastEscTsRef.current = now;
+        }
+      }
     },
-    [slash, atMention],
+    [slash, atMention, lastEmittedRef, onChange],
   );
 
   const boxStyle = boxHeight != null ? { height: boxHeight } : undefined;
@@ -874,6 +916,7 @@ const ComposerEditorInner = ({
         slash={slash}
         atMention={atMention}
         onSubmit={onSubmit}
+        onSubmitNow={onSubmitNow}
         submitShortcut={submitShortcut}
         knownNames={knownNames}
         lastEmittedRef={lastEmittedRef}
