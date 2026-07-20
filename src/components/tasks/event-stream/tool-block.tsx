@@ -257,23 +257,9 @@ const ToolBlockRowImpl = ({
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [fullOpen, setFullOpen] = useState(false);
 
-  // 运行中自动展开直播；完成后（running→success/error）自动收起为摘要行
-  const prevStatusRef = useRef<ToolBlock["status"]>(block.status);
-  useEffect(() => {
-    const prev = prevStatusRef.current;
-    prevStatusRef.current = block.status;
-    if (block.status === "running") {
-      setCollapsed(false);
-      return;
-    }
-    // 刚从 running 切到完成态 → shell / 默认折叠类收起
-    if (prev === "running") {
-      const n = block.name.toLowerCase();
-      if (n === "shell" || toolBlockDefaultCollapsed(block.name, nested)) {
-        setCollapsed(true);
-      }
-    }
-  }, [block.status, block.name, nested]);
+  // 原「运行中自动展开、完成自动收起」已删（2026-07-20 用户实测「图标像反了」）：
+  // running 强制展开（v）但 task 子代理等工具展开区无内容、空撑一块；完成行反而
+  // 折叠（>）带摘要——观感颠倒。折叠行内 liveTail 实时滚动已够看，想看全点开即可。
 
   const summary = toolBlockSummary(block);
   const detailLine = toolBlockDetailLine(block);
