@@ -50,6 +50,12 @@ alwaysApply: true
 - **禁 placeholder-only 输入**：并排多个同类输入（如三个分支框）必须带迷你 label（`text-[11px] text-muted-foreground`）——有值后 placeholder 消失、用户就不知道哪个框是啥了（ui-ux-pro-max 规范同款）。
 - 设置分组按「用户心智」不按实现：连接（外部服务凭据）/ 偏好（个人习惯）/ 仓库 / 存储；能力类（Action / Skill / MCP）在 /actions 能力页。
 
+## 确认弹窗统一样式（2026-07-20 用户拍板）
+
+- **所有确认/二次确认弹窗一律走 `useDialog().confirm`**（底层 AlertDialog）——包括 Electron 主进程发起的确认（如点 X 关闭），走 IPC 转 renderer 弹（`close-confirm-handler.tsx` 模式），不要用原生 `dialog.showMessageBox`（样式违和、做不了红色按钮；仅页面崩溃时作兜底）。
+- **操作条已定型为「无灰底通栏的紧凑右对齐按钮行」**（alert-dialog.tsx 已改）——不要改回 base-nova 默认的 `-mx-4 border-t bg-muted/50 p-4` 灰底通栏（小弹窗里占近半高度、用户实测嫌丑）。
+- 危险操作确认键 `destructive: true`（红色）；文案一行说明、不写第二句教程。
+
 ## 操作反馈（已有约定、汇总）
 
 - 加载中 → `LoadingState`；空态 → `EmptyHint`；选中卡片 → `ChoiceButton`（见 learned-conventions）
