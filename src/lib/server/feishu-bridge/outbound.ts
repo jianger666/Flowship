@@ -14,6 +14,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { isChatCompactInProgress } from "@/lib/server/chat-runner";
 import { dataRoot } from "@/lib/server/data-root";
 import { getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
@@ -1208,6 +1209,12 @@ export const handleFeishuOutboundEvent = async (
       await handleUserReply(taskId, ev.event, info);
       return;
     }
+
+    // 压缩窗口内的 agent 活动全部不进卡片（2026-07-20 用户实测「一次回复拆成两张卡」）：
+    // auto-compact 的续接首包 turn 被要求「直接结束不输出正文」，但模型偶尔不听话
+    // 输出 recap → 没有 user_reply 却有 assistant 活动 → 误开第二张卡。
+    // user_reply 在上面已处理（compact 期间排队消息的回显不受影响）。
+    if (isChatCompactInProgress(taskId)) return;
 
     const g = getOutboundGlobal();
     let turn = g.turns.get(taskId);
