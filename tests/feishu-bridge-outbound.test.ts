@@ -95,6 +95,7 @@ const {
   handleFeishuOutboundEvent,
   formatElapsed,
   replaceLocalImagesInMarkdown,
+  redactToolDetail,
 } = await import("@/lib/server/feishu-bridge/outbound");
 
 const { publishTaskStreamEvent } = await import("@/lib/server/task-stream");
@@ -353,6 +354,86 @@ describe("turn 状态机", () => {
     await flush();
     const after = String(card.pushProcess.mock.calls.at(-1)?.[0] ?? "");
     expect(after).toContain("**思考 2** · completed");
+  });
+
+  // P0：start 未完成时 done 抢跑——pending 思考不得因 turn.finalized 被丢弃
+  it("start 未完成时 done 到达：pending 思考仍在 finalize 前推上", async () => {
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((r) => {
+      releaseStart = r;
+    });
+    __setCreateCardStreamForTest((() => {
+      const card: CardMock = {
+        start: vi.fn(async () => {
+          await startGate;
+        }),
+        pushProcess: vi.fn(),
+        pushAnswer: vi.fn(),
+        setHeaderStatus: vi.fn(),
+        appendAskUser: vi.fn(async () => undefined),
+        appendRetryButton: vi.fn(async () => undefined),
+        finalize: vi.fn(async () => undefined),
+        getFailCount: () => 0,
+        getIds: () => ({ messageId: "om_race", cardId: "card_race" }),
+      };
+      cardFactory.cards.push(card);
+      return card;
+    }) as unknown as Parameters<typeof __setCreateCardStreamForTest>[0]);
+
+    const taskId = "t_pending_race";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "hello啊"));
+    await flush();
+    publishTaskStreamEvent(
+      taskId,
+      makeEvent(
+        "thinking",
+        "用户在 Flowship Chat 任务中问候。我将用中文自然回复。",
+      ),
+    );
+    publishTaskStreamEvent(taskId, {
+      kind: "assistant_delta",
+      text: "你好！",
+    });
+    // 不等 start 完成就 done（finalizeTurn 先标 finalized）
+    publishTaskStreamEvent(taskId, {
+      kind: "done",
+      ok: true,
+      task: {
+        id: taskId,
+        title: "测对话",
+        mode: "chat",
+        runStatus: "awaiting_user",
+      } as never,
+    });
+    await flush();
+    expect(cardFactory.cards.length).toBe(1);
+    const card = cardFactory.cards[0]!;
+    // start 还卡着 → pending 尚未排空
+    expect(card.pushProcess).not.toHaveBeenCalled();
+
+    releaseStart();
+    await flush();
+    await flush();
+
+    expect(card.pushProcess).toHaveBeenCalled();
+    const processTexts = card.pushProcess.mock.calls.map((c) =>
+      String(c[0] ?? ""),
+    );
+    expect(
+      processTexts.some((t) =>
+        t.includes("用户在 Flowship Chat 任务中问候"),
+      ),
+    ).toBe(true);
+    expect(card.finalize).toHaveBeenCalled();
+  });
+
+  it("redactToolDetail 脱敏 token/secret", () => {
+    expect(
+      redactToolDetail(
+        JSON.stringify({ command: "echo", token: "secret-value" }),
+      ),
+    ).toContain("[REDACTED]");
+    expect(redactToolDetail("password=abc123 foo")).toContain("[REDACTED]");
   });
 
   it("error / done ok=false 加重试按钮", async () => {

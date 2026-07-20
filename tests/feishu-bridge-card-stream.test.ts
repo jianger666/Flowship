@@ -479,7 +479,12 @@ describe("createCardStream", () => {
       >;
       const cardJson = entityCalls.at(-1)![1];
       expect(cardJson.header.template).toBe("orange");
-      expect(cardJson.header.subtitle?.content).toBe("等待选择");
+      // Hermes waiting：subtitle 空，summary「等待选择」靠 template/config.summary
+      expect(cardJson.header.subtitle).toBeUndefined();
+      expect(
+        (cardJson as { config?: { summary?: { content?: string } } }).config
+          ?.summary?.content,
+      ).toBe("等待选择");
       expect(cardJson.body.elements.some((e) => e.tag === "button")).toBe(true);
       const footer = cardJson.body.elements.find(
         (e) => e.element_id === "md_footer",
@@ -655,6 +660,76 @@ describe("createCardStream", () => {
     expect(call[1][0]?.params.element_id).toBe("md_process");
     expect(call[1][0]?.params.element.content).toContain("先想一步");
     expect(call[1][0]?.params.element.text_size).toBe("small");
+  });
+
+  // P0：纯思考轮（无工具）finalize 后 process 内容必须保留
+  it("纯思考轮 finalize 后 process 内容保留（全量 PUT + batch 回写同源）", async () => {
+    const pending: Array<() => void> = [];
+    __setCardStreamTimersForTest((cb) => {
+      pending.push(cb);
+      return pending.length as unknown as ReturnType<typeof setTimeout>;
+    });
+
+    const thinking =
+      "**思考 1** · completed\n用户在 Flowship Chat 任务中问候。我将用中文自然回复。";
+    const stream = createCardStream("task_pure_think", {
+      title: "纯思考轮",
+      openId: "ou",
+    });
+    await stream.start();
+
+    // 模拟真机时序：思考进节流窗 → 正文触发 indigo→blue 全量 PUT → finalize 抢在 timer 前
+    stream.pushProcess(thinking);
+    stream.pushAnswer("hello啊，有什么我可以帮你的？");
+    // 不消化 timer——直接 finalize（复现「节流窗内 finalize 抢跑」）
+    await stream.finalize({
+      ok: true,
+      durationMs: 1800,
+      model: "composer-2",
+    });
+
+    const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+      [
+        string,
+        {
+          body: {
+            elements: Array<{
+              element_id?: string;
+              elements?: Array<{ element_id?: string; content?: string }>;
+              content?: string;
+            }>;
+          };
+        },
+      ]
+    >;
+    const finalCard = entityCalls.at(-1)![1];
+    const panel = finalCard.body.elements.find(
+      (e) => e.element_id === "panel_process",
+    );
+    const processMd = panel?.elements?.find((e) => e.element_id === "md_process");
+    expect(processMd?.content).toContain("用户在 Flowship Chat 任务中问候");
+    expect(processMd?.content).toContain("**思考 1**");
+
+    // finalize 后必须 batch 回写 md_process（防 CardKit 全量 PUT 抹嵌套 content）
+    const processBatches = (
+      batchUpdateCard.mock.calls as unknown as Array<
+        [
+          string,
+          Array<{
+            action: string;
+            params: { element_id?: string; element?: { content?: string } };
+          }>,
+        ]
+      >
+    ).filter((c) =>
+      c[1]?.some(
+        (a) =>
+          a.action === "update_element" &&
+          a.params.element_id === "md_process" &&
+          (a.params.element?.content ?? "").includes("用户在 Flowship Chat"),
+      ),
+    );
+    expect(processBatches.length).toBeGreaterThan(0);
   });
 
   // R1-13d：finalize 与在途 flush 不乱序

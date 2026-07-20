@@ -8,7 +8,8 @@
 import { describe, expect, it } from "vitest";
 
 const LIVE = process.env.FEISHU_BRIDGE_LIVE === "1";
-const OPEN_ID = "ou_965d86010f477fe5b3cca0e7e33665a2";
+/** cli_aac269da35399cf9（test 实例）应用 owner；发卡前 getBotAppInfo 再核一次 */
+const OPEN_ID = "ou_40832fc8084baf7cb7730a443c70aec2";
 
 describe.skipIf(!LIVE)("feishu-bridge live smoke", () => {
   it(
@@ -183,3 +184,163 @@ describe.skipIf(!LIVE)("feishu-bridge live smoke", () => {
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
+
+describe.skipIf(!LIVE)("Hermes 三卡验收", () => {
+  it(
+    "①纯思考 ②带工具 ③ask：全流程发卡",
+    async () => {
+      const { createCardStream } = await import(
+        "@/lib/server/feishu-bridge/card-stream"
+      );
+      const { getBotAppInfo } = await import(
+        "@/lib/server/feishu-bridge/lark-api"
+      );
+      const { registerPendingAsk, clearPendingAsk } = await import(
+        "@/lib/server/chat-pending"
+      );
+
+      const info = await getBotAppInfo();
+      expect(info.appId).toBeTruthy();
+      expect(info.ownerOpenId).toBe(OPEN_ID);
+
+      const report: Array<{
+        kind: string;
+        taskId: string;
+        cardId?: string;
+        messageId?: string;
+        failCount: number;
+        note: string;
+      }> = [];
+
+      // ① 纯思考轮：短间隔逼节流窗内 finalize（复现 P0）
+      {
+        const taskId = `smoke-pure-think-${Date.now()}`;
+        const stream = createCardStream(taskId, {
+          title: "①纯思考轮验收",
+          openId: OPEN_ID,
+        });
+        await stream.start({ echoText: "hello啊" });
+        expect(stream.getIds().cardId, `pure start fail=${stream.getFailCount()}`).toBeTruthy();
+
+        const thinking =
+          "**思考 1** · completed\n用户在 Flowship Chat 任务中问候。我将用中文自然回复…";
+        stream.pushProcess(thinking);
+        await sleep(80);
+        stream.pushAnswer("你好啊！有什么我可以帮你的吗？");
+        await sleep(80);
+        await stream.finalize({
+          ok: true,
+          durationMs: 1600,
+          model: "composer-2",
+        });
+        report.push({
+          kind: "pure-think",
+          taskId,
+          ...stream.getIds(),
+          failCount: stream.getFailCount(),
+          note: "展开「思考与工具 · 0 次」应见思考正文",
+        });
+        expect(stream.getFailCount()).toBe(0);
+      }
+
+      // ② 带工具轮
+      {
+        const taskId = `smoke-with-tool-${Date.now()}`;
+        const stream = createCardStream(taskId, {
+          title: "②带工具轮验收",
+          openId: OPEN_ID,
+        });
+        await stream.start({ echoText: "跑一下 lint" });
+        stream.pushProcess("**思考 1** · completed\n先检查仓库脚本。");
+        await sleep(200);
+        stream.setHeaderStatus("正在执行终端：pnpm lint");
+        stream.pushProcess(
+          "**思考 1** · completed\n先检查仓库脚本。\n\n> `Shell` · running\n> pnpm lint",
+        );
+        await sleep(250);
+        stream.pushProcess(
+          "**思考 1** · completed\n先检查仓库脚本。\n\n> `Shell` · completed\n> pnpm lint",
+        );
+        stream.pushAnswer("lint 已通过，没有新增问题。");
+        await sleep(300);
+        await stream.finalize({
+          ok: true,
+          durationMs: 4200,
+          model: "gpt-5.5",
+        });
+        report.push({
+          kind: "with-tool",
+          taskId,
+          ...stream.getIds(),
+          failCount: stream.getFailCount(),
+          note: "展开应见思考 + Shell",
+        });
+        expect(stream.getFailCount()).toBe(0);
+      }
+
+      // ③ ask 按钮卡
+      {
+        const taskId = `smoke-ask-hermes-${Date.now()}`;
+        registerPendingAsk(taskId, {
+          askId: "smoke_ask",
+          questions: [
+            {
+              id: "q1",
+              question: "要继续吗？",
+              options: [
+                { id: "yes", label: "继续" },
+                { id: "no", label: "停" },
+              ],
+              allowText: true,
+            },
+          ],
+        });
+        try {
+          const stream = createCardStream(taskId, {
+            title: "③ask 按钮验收",
+            openId: OPEN_ID,
+          });
+          await stream.start({ echoText: "问你一件事" });
+          stream.pushAnswer("请选择：");
+          await sleep(250);
+          await stream.appendAskUser({
+            askId: "smoke_ask",
+            questions: [
+              {
+                id: "q1",
+                question: "要继续吗？",
+                options: [
+                  { id: "yes", label: "继续" },
+                  { id: "no", label: "停" },
+                ],
+              },
+            ],
+          });
+          await stream.finalize({
+            ok: true,
+            durationMs: 2000,
+            model: "composer-2",
+          });
+          report.push({
+            kind: "ask",
+            taskId,
+            ...stream.getIds(),
+            failCount: stream.getFailCount(),
+            note: "orange + 按钮；subtitle 空",
+          });
+          expect(stream.getFailCount()).toBe(0);
+        } finally {
+          clearPendingAsk(taskId);
+        }
+      }
+
+      const failTotal = report.reduce((n, r) => n + r.failCount, 0);
+      console.log(
+        "[smoke-hermes-roundtrip]",
+        JSON.stringify({ owner: info.ownerOpenId, failTotal, cards: report }, null, 2),
+      );
+      expect(failTotal).toBe(0);
+    },
+    120_000,
+  );
+});

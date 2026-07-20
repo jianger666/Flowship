@@ -395,9 +395,71 @@ const limitText = (
   return text.slice(0, Math.max(0, limit - suffix.length)).trimEnd() + suffix;
 };
 
+/** Hermes `_REDACTABLE_TOOL_DETAIL_KEYS` 敏感字段（工具 detail / runtime header） */
+const REDACTABLE_TOOL_DETAIL_KEYS = [
+  "tenant_access_token",
+  "app_secret",
+  "chat_id",
+  "open_id",
+  "message_id",
+  "password",
+  "token",
+  "secret",
+] as const;
+
+const TOOL_DETAIL_KEY_PATTERN = `[A-Za-z0-9_]*(?:${REDACTABLE_TOOL_DETAIL_KEYS.join("|")})[A-Za-z0-9_]*`;
+const TOOL_DETAIL_REDACTION_RE = new RegExp(
+  `(["']?${TOOL_DETAIL_KEY_PATTERN}["']?\\s*[:=]\\s*)([^\\s,;&}\\]]+)`,
+  "gi",
+);
+const TOOL_DETAIL_QUOTED_REDACTION_RE = new RegExp(
+  `(["']?${TOOL_DETAIL_KEY_PATTERN}["']?\\s*[:=]\\s*)(["'])(.*?)(\\2)`,
+  "gis",
+);
+
+const isSensitiveToolDetailKey = (key: string): boolean => {
+  const lowered = key.toLowerCase();
+  return REDACTABLE_TOOL_DETAIL_KEYS.some((part) => lowered.includes(part));
+};
+
+const redactToolDetailValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(redactToolDetailValue);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = isSensitiveToolDetailKey(k)
+        ? "[REDACTED]"
+        : redactToolDetailValue(v);
+    }
+    return out;
+  }
+  return value;
+};
+
+/**
+ * Hermes `_redact_tool_detail`：JSON 结构化脱敏优先，失败再走 key=value 正则。
+ * 避免工具 args 里的 token/secret 进飞书卡片。
+ */
+export const redactToolDetail = (text: string): string => {
+  if (!text) return text;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    // 结构化脱敏优先（Hermes `_redact_tool_detail`）
+    return JSON.stringify(redactToolDetailValue(parsed));
+  } catch {
+    // 非 JSON → 正则
+  }
+  const quoted = text.replace(
+    TOOL_DETAIL_QUOTED_REDACTION_RE,
+    "$1$2[REDACTED]$4",
+  );
+  return quoted.replace(TOOL_DETAIL_REDACTION_RE, "$1[REDACTED]");
+};
+
 /**
  * Hermes `_select_timeline_entries`：只渲染尾部 N 条；
  * 若窗口内没有思考条目、用最近一条思考顶换窗口首位（保证思考不整体消失）。
+ * 对齐 Python `sorted(dict.fromkeys(...))`：去重保序后再按 index 排序。
  */
 const selectTimelineParts = (
   parts: ProcessPart[],
@@ -406,7 +468,18 @@ const selectTimelineParts = (
   if (parts.length <= MAX_TIMELINE_ITEMS) {
     return { selected: withIndex, folded: 0 };
   }
-  let indexes = withIndex.slice(parts.length - MAX_TIMELINE_ITEMS).map((e) => e.index);
+  if (MAX_TIMELINE_ITEMS <= 1) {
+    const indexes = withIndex
+      .slice(parts.length - MAX_TIMELINE_ITEMS)
+      .map((e) => e.index);
+    return {
+      selected: indexes.map((i) => ({ part: parts[i]!, index: i })),
+      folded: parts.length - indexes.length,
+    };
+  }
+  let indexes = withIndex
+    .slice(parts.length - MAX_TIMELINE_ITEMS)
+    .map((e) => e.index);
   if (!indexes.some((i) => parts[i]!.kind === "thinking")) {
     let latestThinking = -1;
     for (let i = parts.length - 1; i >= 0; i--) {
@@ -416,9 +489,16 @@ const selectTimelineParts = (
       }
     }
     if (latestThinking >= 0) {
-      indexes = [...new Set([latestThinking, ...indexes.slice(1)])].sort(
-        (a, b) => a - b,
-      );
+      // dict.fromkeys([latest, ...window[1:]]) 保序去重，再 sort
+      const ordered = [latestThinking, ...indexes.slice(1)];
+      const seen = new Set<number>();
+      indexes = [];
+      for (const i of ordered) {
+        if (seen.has(i)) continue;
+        seen.add(i);
+        indexes.push(i);
+      }
+      indexes.sort((a, b) => a - b);
     }
   }
   return {
@@ -472,7 +552,7 @@ const renderProcess = (parts: ProcessPart[], answerStarted: boolean): string => 
           : "running";
     const lines = [`\`${p.name}\` · ${status}`];
     const detail = limitText(
-      p.argsSummary.trim(),
+      redactToolDetail(p.argsSummary.trim()),
       MAX_TOOL_DETAIL_CHARS,
       "工具详情过长，已截断",
     );
@@ -725,7 +805,10 @@ const withCard = (
     return;
   }
   turn.pendingOps.push(async () => {
-    if (turn.finalized || !turn.card) return;
+    // ⚠️ 不能因 turn.finalized 跳过：finalizeTurn 会先标 finalized 再 await startPromise，
+    // 若此处跳过，start 完成前缓冲的 pushProcess/pushAnswer 永不执行 → 纯思考轮思考区空白
+    // （正文仍可能被 finalizeTurn 里的 pushAnswer 补上，恰好匹配「有正文无思考」真机现象）
+    if (!turn.card) return;
     await op(turn.card);
   });
   void ensureCardStarted(taskId, turn);
@@ -1032,6 +1115,12 @@ const finalizeTurn = async (
       return;
     }
 
+    // Hermes timeline.complete()：终态强制开放思考 → completed（answerStarted=true）
+    // 并在 finalize 前再推一次——兜底 pendingOps 竞态 / 漏推，保证思考区不空
+    if (turn.processParts.length > 0) {
+      card.pushProcess(renderProcess(turn.processParts, true));
+    }
+
     // 决策 #12 简化：流式期间本地图路径原样；finalize 前一次性换 image_key 再全量 PUT
     if (turn.answerText) {
       const replaced = await replaceLocalImagesInMarkdown(
@@ -1193,6 +1282,10 @@ export const handleFeishuOutboundEvent = async (
           withCard(taskId, turn, (card) => {
             card.pushAnswer(event.text);
           });
+          // Hermes record_answer_started：正文出现 → 开放思考收敛 completed
+          if (turn.processParts.at(-1)?.kind === "thinking") {
+            pushProcessUpdate(taskId, turn);
+          }
         }
         break;
       default:

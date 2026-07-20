@@ -235,6 +235,7 @@ export const buildStreamingCardJson = (opts: {
     });
   }
   // 思考在正文前（与 app 事件流一致；用户 2026-07-19 拍板）
+  // Hermes timeline_expanded 默认 false：运行中 / 完成后均折叠，由用户手动展开
   elements.push(
     {
       tag: "collapsible_panel",
@@ -409,28 +410,78 @@ export const createCardStream = (
     }, FLUSH_INTERVAL_MS);
   };
 
+  /**
+   * 从单一状态源（desired）算出「应上屏」的 process/answer。
+   * ⚠️ 禁止 rebuild / 全量 PUT 直接读 processFlushed——若 doFlush 的 batch 写出去后
+   * flushed 未同步、或节流窗内 finalize 抢跑，全量 PUT 会用旧空串把思考区抹掉（P0 真机）。
+   */
+  const canonicalProcess = (): string =>
+    truncateForCard(applyPrefixGuard(processFlushed, processDesired));
+  const canonicalAnswer = (): string =>
+    truncateForCard(applyPrefixGuard(answerFlushed, answerDesired));
+
+  /** 把 desired 同步进 flushed（全量 PUT / finalize 前必调，保证写出去 = 内部态） */
+  const syncFlushedFromDesired = (): void => {
+    processFlushed = canonicalProcess();
+    answerFlushed = canonicalAnswer();
+  };
+
   const rebuildCardJson = (): Record<string, unknown> =>
     buildStreamingCardJson({
       title,
       subtitle,
       template,
       quoteMd: quoteMd || undefined,
-      processText: processFlushed,
-      answerText: answerFlushed,
+      // 永远从 desired 渲染（Hermes：单一 render ← 单一状态）
+      processText: canonicalProcess(),
+      answerText: canonicalAnswer(),
       // 流式中 footer 空 → spinner；等待/完成由 footerText 定稿
       footerText: footerText || streamingFooterSpinner(),
       extraElements: appendedElements.length > 0 ? appendedElements : undefined,
     });
 
+  /** 嵌套 panel 内 md_process：batch update_element 全量替换（流式 PUT 对嵌套静默无效） */
+  const batchPutProcess = async (content: string): Promise<void> => {
+    if (!cardId) return;
+    await batchUpdateCard(
+      cardId,
+      [
+        {
+          action: "update_element",
+          params: {
+            element_id: ELEMENT_PROCESS,
+            element: {
+              tag: "markdown",
+              element_id: ELEMENT_PROCESS,
+              content,
+              text_size: "small",
+            },
+          },
+        },
+      ],
+      nextSeq(),
+    );
+  };
+
+  /**
+   * 全量 PUT 实体后，再用 batch 回写思考区。
+   * 真机：CardKit 全量 PUT 在 streaming_mode 下可能丢 collapsible_panel 嵌套 content，
+   * 只靠 JSON 里带 processText 不够；batch 是嵌套区唯一可靠写入通道。
+   */
+  const putEntityThenReassertProcess = async (): Promise<void> => {
+    if (!cardId) return;
+    syncFlushedFromDesired();
+    await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+    if (processFlushed) {
+      await batchPutProcess(processFlushed);
+    }
+  };
+
   const doFlush = async (): Promise<void> => {
     if (!cardId || finalized) return;
 
-    const nextProcess = truncateForCard(
-      applyPrefixGuard(processFlushed, processDesired),
-    );
-    const nextAnswer = truncateForCard(
-      applyPrefixGuard(answerFlushed, answerDesired),
-    );
+    const nextProcess = canonicalProcess();
+    const nextAnswer = canonicalAnswer();
     const processChanged = nextProcess !== processFlushed;
     const answerChanged = nextAnswer !== answerFlushed;
     const needHeader = headerDirty;
@@ -448,10 +499,18 @@ export const createCardStream = (
 
     try {
       if (needHeader) {
-        // header 不在 batch_update 能力面 → 全量 PUT 卡片实体
+        // header 不在 batch_update 能力面 → 全量 PUT；随后 batch 回写思考区防抹掉
         headerDirty = false;
-        await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
-        // 全量 PUT 已带上 process/answer，无需再 element content
+        await putEntityThenReassertProcess();
+        // 正文若也变了：全量 PUT 已带 canonical answer；再走打字机 PUT 推进前缀
+        if (answerChanged) {
+          await updateCardElementContent(
+            cardId,
+            ELEMENT_ANSWER,
+            answerFlushed,
+            nextSeq(),
+          );
+        }
         return;
       }
       // 为什么思考区不走流式 PUT：
@@ -460,24 +519,7 @@ export const createCardStream = (
       // 可仍空白（静默无效）。思考区无需打字机 → 改用 batch_update update_element 全量替换。
       // md_answer 仍走流式 content PUT，打字机绝不能动。
       if (processChanged) {
-        await batchUpdateCard(
-          cardId,
-          [
-            {
-              action: "update_element",
-              params: {
-                element_id: ELEMENT_PROCESS,
-                element: {
-                  tag: "markdown",
-                  element_id: ELEMENT_PROCESS,
-                  content: processFlushed,
-                  text_size: "small",
-                },
-              },
-            },
-          ],
-          nextSeq(),
-        );
+        await batchPutProcess(processFlushed);
       }
       if (answerChanged) {
         await updateCardElementContent(
@@ -626,7 +668,7 @@ export const createCardStream = (
         tag: "markdown",
         element_id: "md_ask_hint",
         content: singleQuestion
-          ? "<font color='grey'>没有合适选项？直接回复消息作答也行</font>"
+          ? "<font color='grey'>没有合适选项？直接回复消息作答</font>"
           : "<font color='grey'>请直接回复文字作答</font>",
       });
       // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
@@ -651,9 +693,9 @@ export const createCardStream = (
         );
         // 记住元素：后续任何全量 PUT 都带上（R1-1a）
         appendedElements = [...appendedElements, ...elements];
-        // header / footer 状态全量 PUT（rebuild 已含 appendedElements）
+        // header / footer 状态全量 PUT + batch 回写思考区（防嵌套 content 被抹）
         headerDirty = false;
-        await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+        await putEntityThenReassertProcess();
       } catch (err) {
         warnFail("appendAskUser", err);
         // batch 成功但 header PUT 失败时仍保留快照，下次 finalize/flush 可补
@@ -731,8 +773,8 @@ export const createCardStream = (
         template = "grey";
         footerText = statsFooter;
       } else if (fin.ok && getPendingAsk(taskId)) {
-        // R1-1b：pending ask 未清 → 保持 orange「等待选择」；footer 仍换统计+深链、关 streaming
-        subtitle = "等待选择";
+        // Hermes waiting：subtitle 空、summary「等待选择」靠 template=orange；footer 换统计+深链
+        subtitle = "";
         template = "orange";
         footerText = statsFooter;
       } else if (fin.ok) {
@@ -741,27 +783,20 @@ export const createCardStream = (
         template = "green";
         footerText = statsFooter;
       } else {
-        // Hermes failed：保留运行中工具 subtitle（不覆盖）、red；footer「已停止」
+        // Hermes failed：subtitle 空、summary「处理失败」、red；footer「已停止」+ 深链（我们保留）
+        subtitle = "";
         template = "red";
-        // 无工具预览时用简短失败摘要，避免 header 完全空白
-        if (!subtitle.trim()) {
-          subtitle = fin.error?.trim()
-            ? truncateForCard(fin.error.trim()).slice(0, 120)
-            : "处理失败";
-        }
         footerText = `已停止 · ${deepLink}`;
       }
 
       try {
-        // footer + header 一次全量 PUT（含 appendedElements，按钮不丢）
         // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）
-        answerFlushed = closeUnclosedCodeFence(
-          truncateForCard(applyPrefixGuard(answerFlushed, answerDesired)),
-        );
-        processFlushed = closeUnclosedCodeFence(
-          truncateForCard(applyPrefixGuard(processFlushed, processDesired)),
-        );
-        await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+        // 先写回 desired，再 sync——保证 finalize 全量 PUT / batch 回写同源
+        answerDesired = closeUnclosedCodeFence(canonicalAnswer());
+        processDesired = closeUnclosedCodeFence(canonicalProcess());
+        syncFlushedFromDesired();
+        // footer + header 全量 PUT + batch 回写思考区（纯思考轮 P0：防嵌套 content 被抹）
+        await putEntityThenReassertProcess();
         // 关 streaming_mode
         await patchCardSettings(
           cardId,
