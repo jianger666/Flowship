@@ -89,13 +89,26 @@ export interface ProbeScopesCheck extends ProbeCheckItem {
   missing: string[];
   /** 缺 scope 时的权限预填深链 */
   authUrl?: string;
+  /** 网络类失败（EOF/超时/断连）——不是权限问题、UI 不给「去开通」误导 */
+  networkError?: boolean;
 }
 
 export interface ProbeCardkitCheck extends ProbeCheckItem {
   cardId?: string;
   /** LarkApiError.consoleUrl 透出 */
   consoleUrl?: string;
+  /** 网络类失败——同上 */
+  networkError?: boolean;
 }
+
+/**
+ * 网络类错误判定（2026-07-20 同事实测：公司网络下 accounts.feishu.cn EOF 被
+ * 渲染成「权限缺失 + 去开通」、纯误导）——这类失败只提示重试/查网络。
+ */
+const isNetworkErrorMessage = (msg: string): boolean =>
+  /EOF|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed|timeout|network|socket hang up/i.test(
+    msg,
+  );
 
 export interface BridgeProbeStatus {
   cli: ProbeCliCheck;
@@ -228,6 +241,17 @@ const probeScopes = async (): Promise<ProbeScopesCheck> => {
           }),
     };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // 网络类失败 ≠ 权限缺失：不给「去开通」、不触发首次接入引导（同事实测被误导）
+    if (isNetworkErrorMessage(msg)) {
+      return {
+        ok: false,
+        granted: [],
+        missing: [],
+        networkError: true,
+        error: "网络异常（飞书接口不可达），点重试；持续失败请检查代理/VPN",
+      };
+    }
     // 查询本身挂了（如新机器人还没开「获取应用信息」权限）也要给一键开通链接——
     // 尽力拿 appId 兜底构造预填深链（用户点开就是勾好的权限列表）
     let appId = "";
@@ -253,7 +277,7 @@ const probeScopes = async (): Promise<ProbeScopesCheck> => {
       ok: false,
       granted: [],
       missing: [...REQUIRED_BRIDGE_SCOPES],
-      error: err instanceof Error ? err.message : String(err),
+      error: msg,
       ...fallbackAuth,
     };
   }
@@ -268,6 +292,14 @@ const probeCardkit = async (): Promise<ProbeCardkitCheck> => {
       detail: "支持流式卡片",
     };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isNetworkErrorMessage(msg)) {
+      return {
+        ok: false,
+        networkError: true,
+        error: "网络异常（飞书接口不可达），点重试；持续失败请检查代理/VPN",
+      };
+    }
     if (err instanceof LarkApiError) {
       return {
         ok: false,
@@ -277,7 +309,7 @@ const probeCardkit = async (): Promise<ProbeCardkitCheck> => {
     }
     return {
       ok: false,
-      error: err instanceof Error ? err.message : String(err),
+      error: msg,
     };
   }
 };

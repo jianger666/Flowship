@@ -48,6 +48,8 @@ interface BridgeStatusPayload {
     authUrl?: string;
     detail?: string;
     error?: string;
+    /** 网络类失败——不是权限问题、不渲染「去开通」/首次接入引导 */
+    networkError?: boolean;
   };
   cardkit?: {
     ok: boolean;
@@ -55,6 +57,7 @@ interface BridgeStatusPayload {
     consoleUrl?: string;
     detail?: string;
     error?: string;
+    networkError?: boolean;
   };
   runtime?: {
     overall: string;
@@ -332,19 +335,21 @@ export const FeishuBridgeBlock = ({
                 {/* 新机器人首次接入：权限没开齐时补「消息订阅」入口——
                     订阅状态探测不到（CLI 连上了也可能没配订阅）、跟权限同批配置最顺手；
                     权限齐了就收起、不常驻打扰 */}
-                {!status?.scopes?.ok && status?.scopes?.appId && (
-                  <CheckRow
-                    ok={false}
-                    title="消息订阅"
-                    detail="在「事件与回调」里添加：事件 im.message.receive_v1、回调 card.action.trigger（长连接），配完发布版本"
-                    action={
-                      <OpenAuthLink
-                        href={`https://open.feishu.cn/app/${status.scopes.appId}/event`}
-                        label="去配置"
-                      />
-                    }
-                  />
-                )}
+                {!status?.scopes?.ok &&
+                  !status?.scopes?.networkError &&
+                  status?.scopes?.appId && (
+                    <CheckRow
+                      ok={false}
+                      title="消息订阅"
+                      detail="在「事件与回调」里添加：事件 im.message.receive_v1、回调 card.action.trigger（长连接），配完发布版本"
+                      action={
+                        <OpenAuthLink
+                          href={`https://open.feishu.cn/app/${status.scopes.appId}/event`}
+                          label="去配置"
+                        />
+                      }
+                    />
+                  )}
                 {/* 收消息自检：订阅配没配对后台探测不到，用「实际收到过消息」当端到端信号。
                     从未收到 = 初次绑定还没完成，给操作指引；收到过就绿灯不啰嗦 */}
                 <CheckRow
