@@ -808,3 +808,197 @@ describe("createCardStream", () => {
     expect(answer?.content).toContain("```js\nconsole.log(1)\n```");
   });
 });
+
+describe("createCardStream 非流式（streaming: false）", () => {
+  it("全程零中间态 API，finalize 一次性建普通卡", async () => {
+    const stream = createCardStream("task_ns", {
+      title: "聊",
+      openId: "ou_ns",
+      streaming: false,
+    });
+    await stream.start({ echoText: "你好" });
+    // start 不建卡、不发消息
+    expect(createCardEntity).not.toHaveBeenCalled();
+    expect(sendCardMessage).not.toHaveBeenCalled();
+    expect(stream.getIds()).toEqual({
+      messageId: undefined,
+      cardId: undefined,
+    });
+
+    stream.pushProcess("**思考 1** · completed\n想一下");
+    stream.pushAnswer("完整回复正文");
+    stream.setHeaderStatus("正在执行终端：x");
+    // 节流 / flush 全短路
+    await new Promise((r) => setTimeout(r, 10));
+    expect(createCardEntity).not.toHaveBeenCalled();
+    expect(updateCardElementContent).not.toHaveBeenCalled();
+    expect(updateCardEntity).not.toHaveBeenCalled();
+    expect(batchUpdateCard).not.toHaveBeenCalled();
+
+    await stream.finalize({
+      ok: true,
+      durationMs: 3200,
+      model: "composer-2",
+    });
+
+    expect(createCardEntity).toHaveBeenCalledOnce();
+    expect(sendCardMessage).toHaveBeenCalledOnce();
+    expect(sendCardMessage).toHaveBeenCalledWith("ou_ns", "card_test");
+    // 非流式从未开 streaming_mode → 不必 patch 关流
+    expect(patchCardSettings).not.toHaveBeenCalled();
+    expect(updateCardElementContent).not.toHaveBeenCalled();
+
+    const cardJson = createCardEntity.mock.calls[0]![0] as {
+      config: {
+        streaming_mode: boolean;
+        streaming_config?: unknown;
+        summary: { content: string };
+      };
+      header: { subtitle?: { content: string }; template: string };
+      body: {
+        elements: Array<{
+          element_id?: string;
+          content?: string;
+          elements?: Array<{ element_id?: string; content?: string }>;
+        }>;
+      };
+    };
+    expect(cardJson.config.streaming_mode).toBe(false);
+    expect(cardJson.config.streaming_config).toBeUndefined();
+    expect(cardJson.header.template).toBe("green");
+    expect(cardJson.header.subtitle?.content).toBe("已完成");
+    expect(cardJson.config.summary.content).toBe("已完成");
+    // 引用块保留
+    const quote = cardJson.body.elements.find((e) => e.element_id === "md_quote");
+    expect(quote?.content).toContain("你好");
+    const panel = cardJson.body.elements.find(
+      (e) => e.element_id === "panel_process",
+    );
+    expect(
+      panel?.elements?.find((e) => e.element_id === "md_process")?.content,
+    ).toContain("想一下");
+    const answer = cardJson.body.elements.find(
+      (e) => e.element_id === "md_answer",
+    );
+    expect(answer?.content).toBe("完整回复正文");
+    const footer = cardJson.body.elements.find(
+      (e) => e.element_id === "md_footer",
+    );
+    expect(footer?.content).toContain("composer-2");
+    expect(stream.getIds()).toEqual({
+      messageId: "om_test",
+      cardId: "card_test",
+    });
+  });
+
+  it("非流式 appendAskUser 记入状态，finalize 整卡带按钮", async () => {
+    const { registerPendingAsk, clearPendingAsk } = await import(
+      "@/lib/server/chat-pending"
+    );
+    const taskId = "task_ns_ask";
+    registerPendingAsk(taskId, {
+      askId: "ask_ns",
+      questions: [
+        {
+          id: "q1",
+          question: "选？",
+          options: [{ id: "a", label: "A" }],
+          allowText: true,
+        },
+      ],
+    });
+    try {
+      const stream = createCardStream(taskId, {
+        title: "t",
+        openId: "ou",
+        streaming: false,
+      });
+      await stream.start();
+      stream.pushAnswer("问你个事");
+      await stream.appendAskUser({
+        askId: "ask_ns",
+        questions: [
+          {
+            id: "q1",
+            question: "选？",
+            options: [
+              { id: "a", label: "A" },
+              { id: "b", label: "B" },
+            ],
+          },
+        ],
+      });
+      // append 不触发任何 lark 写
+      expect(createCardEntity).not.toHaveBeenCalled();
+      expect(batchUpdateCard).not.toHaveBeenCalled();
+
+      await stream.finalize({
+        ok: true,
+        durationMs: 1000,
+        model: "gpt-5.5",
+      });
+      expect(createCardEntity).toHaveBeenCalledOnce();
+      const cardJson = createCardEntity.mock.calls[0]![0] as {
+        header: { template: string; subtitle?: unknown };
+        config: { streaming_mode: boolean; summary: { content: string } };
+        body: {
+          elements: Array<{ tag?: string; element_id?: string }>;
+        };
+      };
+      expect(cardJson.config.streaming_mode).toBe(false);
+      expect(cardJson.header.template).toBe("orange");
+      expect(cardJson.header.subtitle).toBeUndefined();
+      expect(cardJson.config.summary.content).toBe("等待选择");
+      expect(cardJson.body.elements.some((e) => e.tag === "button")).toBe(true);
+      const hrIdx = cardJson.body.elements.findIndex(
+        (e) => e.element_id === "main_divider",
+      );
+      const btnIdx = cardJson.body.elements.findIndex((e) => e.tag === "button");
+      expect(btnIdx).toBeGreaterThanOrEqual(0);
+      expect(btnIdx).toBeLessThan(hrIdx);
+    } finally {
+      clearPendingAsk(taskId);
+    }
+  });
+
+  it("非流式 appendRetryButton 并入 finalize 整卡", async () => {
+    const stream = createCardStream("task_ns_retry", {
+      title: "t",
+      openId: "ou",
+      streaming: false,
+    });
+    await stream.start();
+    stream.pushAnswer("失败了");
+    await stream.appendRetryButton("上一句用户消息");
+    expect(createCardEntity).not.toHaveBeenCalled();
+    await stream.finalize({ ok: false, error: "boom" });
+    const cardJson = createCardEntity.mock.calls[0]![0] as {
+      header: { template: string };
+      body: { elements: Array<{ tag?: string; element_id?: string }> };
+    };
+    expect(cardJson.header.template).toBe("red");
+    expect(
+      cardJson.body.elements.some((e) => e.element_id === "btn_retry"),
+    ).toBe(true);
+  });
+
+  it("流式已 start 的 turn 不受「事后 streaming:false」影响（opts 创建时定稿）", async () => {
+    // 模拟：turn 开始时流式开 → 已建卡；中途设置关掉也不该改本轮句柄行为
+    const stream = createCardStream("task_freeze", {
+      title: "t",
+      openId: "ou",
+      streaming: true,
+    });
+    await stream.start();
+    expect(createCardEntity).toHaveBeenCalledOnce();
+    stream.pushAnswer("还在流式");
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+    // 若误把开关当成可变全局、关流后应零中间态——这里仍应有流式 PUT
+    expect(
+      updateCardEntity.mock.calls.length +
+        updateCardElementContent.mock.calls.length,
+    ).toBeGreaterThan(0);
+    await stream.finalize({ ok: true, durationMs: 100 });
+    expect(patchCardSettings).toHaveBeenCalled();
+  });
+});

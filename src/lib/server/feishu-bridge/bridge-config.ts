@@ -45,3 +45,12 @@ export const isFeishuBridgeKeepAwakeEnabled = async (): Promise<boolean> => {
   // 缺省 / 非 false → true（决策 #14）
   return v !== false;
 };
+
+/** 流式回复子开关（默认开；关则 finalize 一次性发整卡） */
+export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> => {
+  const result = await readSettingsFile();
+  if (result.status !== "ok") return true;
+  const v = result.settings.feishuBridgeStreaming;
+  // 缺省 / 非 false → true
+  return v !== false;
+};

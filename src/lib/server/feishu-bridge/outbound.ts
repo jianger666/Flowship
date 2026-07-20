@@ -25,7 +25,10 @@ import {
 } from "@/lib/server/task-stream";
 import type { Task, TaskEvent } from "@/lib/types";
 
-import { isFeishuChatBridgeEnabled } from "./bridge-config";
+import {
+  isFeishuBridgeStreamingEnabled,
+  isFeishuChatBridgeEnabled,
+} from "./bridge-config";
 import {
   createCardStream as defaultCreateCardStream,
 } from "./card-stream";
@@ -189,6 +192,11 @@ type TurnState = {
   title: string;
   /** finalize 带模型名 */
   modelId?: string;
+  /**
+   * 本轮是否流式回复（ensureCardStarted 时读一次 settings 定稿）。
+   * undefined = 尚未读；中途改设置不影响本轮。
+   */
+  streaming?: boolean;
 };
 
 /** callId → processParts 下标（tool_result 回填 ✓/✗） */
@@ -825,7 +833,14 @@ const ensureCardStarted = async (
     return;
   }
   turn.startPromise = (async () => {
-    const card = createCardStreamImpl(taskId, { title: turn.title });
+    // 开关只在本轮首次建卡时读一次——turn 内不变（中途切设置不影响跑完）
+    if (turn.streaming === undefined) {
+      turn.streaming = await isFeishuBridgeStreamingEnabled();
+    }
+    const card = createCardStreamImpl(taskId, {
+      title: turn.title,
+      streaming: turn.streaming,
+    });
     turn.card = card;
 
     // echo 图：按位序收集（R1-7）；单张失败不拖垮整批，失败位只计入降级文案

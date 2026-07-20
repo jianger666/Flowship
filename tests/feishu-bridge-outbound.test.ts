@@ -54,7 +54,12 @@ vi.mock("@/lib/server/feishu-bridge/bridge-config", () => ({
   getBridgeDataDir: async () => "/tmp/feishu-bridge-test",
   isBridgeTestInstance: () => true,
   isFeishuBridgeKeepAwakeEnabled: async () => true,
+  isFeishuBridgeStreamingEnabled: vi.fn(async () => true),
 }));
+
+const { isFeishuBridgeStreamingEnabled } = await import(
+  "@/lib/server/feishu-bridge/bridge-config"
+);
 
 type CardMock = {
   start: ReturnType<typeof vi.fn>;
@@ -143,6 +148,8 @@ beforeEach(() => {
   }));
   writeEventAndPublish.mockClear();
   uploadImage.mockClear();
+  vi.mocked(isFeishuBridgeStreamingEnabled).mockReset();
+  vi.mocked(isFeishuBridgeStreamingEnabled).mockResolvedValue(true);
   __setCreateCardStreamForTest(
     cardFactory.create as unknown as Parameters<
       typeof __setCreateCardStreamForTest
@@ -206,6 +213,7 @@ describe("turn 状态机", () => {
     expect(cardFactory.create).toHaveBeenCalledTimes(1);
     expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
       title: "测对话",
+      streaming: true,
     });
     const card = cardFactory.cards[0]!;
     expect(card.start).toHaveBeenCalled();
@@ -836,5 +844,25 @@ describe("compact 窗口守卫", () => {
     publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "好的" });
     await flush();
     expect(cardFactory.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("流式开关本轮定稿：中途改 settings 不影响本轮 create opts", async () => {
+    const taskId = "t_stream_freeze";
+    publishTaskStreamEvent(taskId, makeEvent("user_reply", "hi"));
+    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "答" });
+    await flush();
+    expect(cardFactory.create).toHaveBeenCalledWith(taskId, {
+      title: "测对话",
+      streaming: true,
+    });
+    expect(isFeishuBridgeStreamingEnabled).toHaveBeenCalledTimes(1);
+
+    // 中途关掉流式——本轮已 started，不应再读盘 / 重建句柄
+    vi.mocked(isFeishuBridgeStreamingEnabled).mockResolvedValue(false);
+    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "续" });
+    await flush();
+    expect(cardFactory.create).toHaveBeenCalledTimes(1);
+    expect(isFeishuBridgeStreamingEnabled).toHaveBeenCalledTimes(1);
+    expect(cardFactory.cards[0]!.pushAnswer).toHaveBeenCalled();
   });
 });

@@ -281,6 +281,10 @@ const SettingsPage = () => {
                 onFeishuBridgeKeepAwakeChange={(v) =>
                   saveFieldValue("feishuBridgeKeepAwake", v)
                 }
+                feishuBridgeStreaming={settings.feishuBridgeStreaming !== false}
+                onFeishuBridgeStreamingChange={(v) =>
+                  saveFieldValue("feishuBridgeStreaming", v)
+                }
               />
             </CardContent>
           </Card>,

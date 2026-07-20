@@ -5,6 +5,8 @@
  * - 节流：250ms 或攒 600 字符先到先 flush
  * - 同卡单调递增 sequence；PUT 全量文本且绝不回改已推前缀（坑 #2）
  * - 接近 10 万字符截断（坑 #13）；lark 失败 console.warn 不抛（坑 #10）
+ * - streaming:false（设置「流式回复」关）：start 只定稿引用、中间态零 API，
+ *   finalize 复用 buildStreamingCardJson 一次性发普通卡（streaming_mode 关）
  */
 
 import { getPendingAsk } from "@/lib/server/chat-pending";
@@ -219,6 +221,11 @@ export const buildStreamingCardJson = (opts: {
    * 避免 headerDirty / finalize 的 updateCardEntity 抹掉按钮（R1-1）。
    */
   extraElements?: unknown[];
+  /**
+   * 是否开 CardKit streaming_mode。默认 true（流式打字机）；
+   * 非流式整卡 finalize 传 false，且不带 streaming_config。
+   */
+  streamingMode?: boolean;
 }): Record<string, unknown> => {
   const processText = opts.processText ?? "";
   const toolCount = countToolsInProcess(processText);
@@ -286,33 +293,38 @@ export const buildStreamingCardJson = (opts: {
     header.subtitle = { tag: "plain_text", content: opts.subtitle };
   }
 
+  const streamingMode = opts.streamingMode !== false;
+  const config: Record<string, unknown> = {
+    streaming_mode: streamingMode,
+    update_multi: true,
+    // 通知摘要：有 subtitle 用它，否则按模板给中性文案（对齐 Hermes config.summary）
+    summary: {
+      content:
+        opts.subtitle.trim() ||
+        (opts.template === "green"
+          ? "已完成"
+          : opts.template === "red"
+            ? "处理失败"
+            : opts.template === "orange"
+              ? "等待选择"
+              : opts.template === "grey"
+                ? "已停止"
+                : opts.template === "indigo"
+                  ? "思考中"
+                  : "生成中"),
+    },
+  };
+  if (streamingMode) {
+    config.streaming_config = {
+      print_frequency_ms: { default: 70 },
+      print_step: { default: 1 },
+      print_strategy: "fast",
+    };
+  }
+
   return {
     schema: "2.0",
-    config: {
-      streaming_mode: true,
-      update_multi: true,
-      // 通知摘要：有 subtitle 用它，否则按模板给中性文案（对齐 Hermes config.summary）
-      summary: {
-        content:
-          opts.subtitle.trim() ||
-          (opts.template === "green"
-            ? "已完成"
-            : opts.template === "red"
-              ? "处理失败"
-              : opts.template === "orange"
-                ? "等待选择"
-                : opts.template === "grey"
-                  ? "已停止"
-                  : opts.template === "indigo"
-                    ? "思考中"
-                    : "生成中"),
-      },
-      streaming_config: {
-        print_frequency_ms: { default: 70 },
-        print_step: { default: 1 },
-        print_strategy: "fast",
-      },
-    },
+    config,
     header,
     body: { elements },
   };
@@ -323,6 +335,8 @@ export const createCardStream = (
   opts: CardStreamOptions,
 ): CardStreamHandle => {
   // —— 句柄内部状态 ——
+  /** 本轮是否流式（create 时定稿，中途改设置不影响） */
+  const streamingEnabled = opts.streaming !== false;
   /** 飞书卡片实体 id */
   let cardId: string | undefined;
   /** 发出的 interactive 消息 id */
@@ -357,6 +371,7 @@ export const createCardStream = (
   /**
    * 已通过 batch_update 插入的 ask/retry 元素快照。
    * 全量 PUT（headerDirty / finalize）必须带上，否则飞书会抹掉按钮（R1-1）。
+   * 非流式模式下 append 只记入此处，finalize 并入整卡。
    */
   let appendedElements: unknown[] = [];
 
@@ -396,7 +411,8 @@ export const createCardStream = (
   };
 
   const scheduleFlush = (): void => {
-    if (finalized || !started || !cardId) return;
+    // 非流式：不发中间态；流式且卡未建：等 start 成功后再刷
+    if (finalized || !started || !streamingEnabled || !cardId) return;
     if (pendingChars >= FLUSH_CHAR_THRESHOLD) {
       clearFlushTimer();
       void enqueueCardOp(() => doFlush());
@@ -425,7 +441,7 @@ export const createCardStream = (
     answerFlushed = canonicalAnswer();
   };
 
-  const rebuildCardJson = (): Record<string, unknown> =>
+  const rebuildCardJson = (streamingMode = true): Record<string, unknown> =>
     buildStreamingCardJson({
       title,
       subtitle,
@@ -434,9 +450,11 @@ export const createCardStream = (
       // 永远从 desired 渲染（Hermes：单一 render ← 单一状态）
       processText: canonicalProcess(),
       answerText: canonicalAnswer(),
-      // 流式中 footer 空 → spinner；等待/完成由 footerText 定稿
-      footerText: footerText || streamingFooterSpinner(),
+      // 流式中 footer 空 → spinner；等待/完成 / 非流式终态由 footerText 定稿
+      footerText:
+        footerText || (streamingMode ? streamingFooterSpinner() : ""),
       extraElements: appendedElements.length > 0 ? appendedElements : undefined,
+      streamingMode,
     });
 
   /** 嵌套 panel 内 md_process：batch update_element 全量替换（流式 PUT 对嵌套静默无效） */
@@ -470,14 +488,14 @@ export const createCardStream = (
   const putEntityThenReassertProcess = async (): Promise<void> => {
     if (!cardId) return;
     syncFlushedFromDesired();
-    await updateCardEntity(cardId, rebuildCardJson(), nextSeq());
+    await updateCardEntity(cardId, rebuildCardJson(true), nextSeq());
     if (processFlushed) {
       await batchPutProcess(processFlushed);
     }
   };
 
   const doFlush = async (): Promise<void> => {
-    if (!cardId || finalized) return;
+    if (!cardId || finalized || !streamingEnabled) return;
 
     const nextProcess = canonicalProcess();
     const nextAnswer = canonicalAnswer();
@@ -541,11 +559,104 @@ export const createCardStream = (
     return info.ownerOpenId;
   };
 
+  /** 组装 ask_user 元素（流式 batch / 非流式 finalize 共用） */
+  const buildAskElements = (
+    askOpts: CardStreamAppendAskOpts,
+  ): unknown[] => {
+    const elements: unknown[] = [];
+    // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
+    // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
+    const singleQuestion = askOpts.questions.length === 1;
+    for (const q of askOpts.questions) {
+      elements.push({
+        tag: "markdown",
+        // element_id ≤20 字符硬约束 → 短哈希（真实 id 走按钮 value 回传）
+        element_id: askQuestionElementId(askOpts.askId, q.id),
+        content: `**${q.question}**`,
+      });
+      if (singleQuestion && q.options?.length) {
+        for (const opt of q.options) {
+          const value: CardButtonValue = {
+            kind: "ask",
+            taskId,
+            askId: askOpts.askId,
+            questionId: q.id,
+            optionId: opt.id,
+          };
+          elements.push({
+            tag: "button",
+            element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
+            text: { tag: "plain_text", content: opt.label },
+            // Hermes `_button_type` 无 style 时落 default（非 primary）
+            type: "default",
+            // Hermes interaction 按钮同款 size
+            size: "medium",
+            width: "default",
+            // 飞书 JSON 2.0：behaviors 触发回调，value 原样回传
+            behaviors: [
+              {
+                type: "callback",
+                value,
+              },
+            ],
+          });
+        }
+      }
+    }
+    // T7 用户反馈：按钮之外也提示可直接打字答（单题按钮下同样给一行小字）
+    elements.push({
+      tag: "markdown",
+      element_id: "md_ask_hint",
+      content: singleQuestion
+        ? "<font color='grey'>没有合适选项？直接回复消息作答</font>"
+        : "<font color='grey'>请直接回复文字作答</font>",
+    });
+    return elements;
+  };
+
+  /** 按 finalize 入参写终态 header / footer（流式 PUT 与非流式整卡共用） */
+  const applyFinalizeVisual = (fin: CardStreamFinalizeOpts): void => {
+    const statsParts: string[] = [];
+    if (fin.durationMs != null) {
+      const d = formatDuration(fin.durationMs);
+      if (d) statsParts.push(d);
+    }
+    if (fin.model) statsParts.push(coloredModelLabel(fin.model));
+    const statsFooter = statsParts.join(" · ");
+
+    // R1-4：用户 stop → 灰卡「已停止」（与自然完成 / ask 等待互斥）
+    if (fin.outcome === "stopped") {
+      subtitle = "已停止";
+      template = "grey";
+      footerText = statsFooter;
+    } else if (fin.ok && getPendingAsk(taskId)) {
+      // Hermes waiting：subtitle 空、summary「等待选择」靠 template=orange
+      subtitle = "";
+      template = "orange";
+      footerText = statsFooter;
+    } else if (fin.ok) {
+      // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型
+      subtitle = "已完成";
+      template = "green";
+      footerText = statsFooter;
+    } else {
+      // Hermes failed：subtitle 空、summary「处理失败」、red
+      subtitle = "";
+      template = "red";
+      footerText = "已停止";
+    }
+  };
+
   const start = async (startOpts: CardStreamStartOpts = {}): Promise<void> => {
     if (started || finalized) return;
     quoteMd = buildQuoteMarkdown(startOpts.echoText, startOpts.echoImageKeys);
+    // 非流式：只定稿引用块，延到 finalize 一次性建普通卡（省中间 API、无打字机抖动）
+    if (!streamingEnabled) {
+      started = true;
+      return;
+    }
     // 走 rebuild：footer 带 spinner、分区样式与后续 flush 一致
-    const cardJson = rebuildCardJson();
+    const cardJson = rebuildCardJson(true);
     try {
       const created = await createCardEntity(cardJson);
       cardId = created.card_id;
@@ -569,7 +680,9 @@ export const createCardStream = (
   };
 
   const pushProcess = (fullText: string): void => {
-    if (!started || finalized || !cardId) return;
+    // 流式需卡已建；非流式只累积 desired，finalize 再发
+    if (!started || finalized) return;
+    if (streamingEnabled && !cardId) return;
     const guarded = applyPrefixGuard(processFlushed, fullText);
     if (guarded === processDesired) return;
     const grew = Math.max(0, guarded.length - processDesired.length);
@@ -579,7 +692,8 @@ export const createCardStream = (
   };
 
   const pushAnswer = (fullText: string): void => {
-    if (!started || finalized || !cardId) return;
+    if (!started || finalized) return;
+    if (streamingEnabled && !cardId) return;
     const guarded = applyPrefixGuard(answerFlushed, fullText);
     if (guarded === answerDesired) return;
     const grew = Math.max(0, guarded.length - answerDesired.length);
@@ -619,61 +733,21 @@ export const createCardStream = (
     // 整段进 flushing 链：先刷余量 → batch 插按钮 → 记快照 → 全量 PUT header
     // （旧实现 batch 在链外，与 finalize 交错不确定——R1-1c）
     return enqueueCardOp(async () => {
-      if (!started || finalized || !cardId) return;
-      // 链上先刷过程/正文，避免随后全量 PUT 丢未推文本
-      await doFlush();
-      const elements: unknown[] = [];
-      // review P1#5：一点即整组提交、未点题填「（未回答）」会误推进——
-      // 仅单题渲染选项按钮；多题只列 markdown + 提示走入向文字 ask-reply
-      const singleQuestion = askOpts.questions.length === 1;
-      for (const q of askOpts.questions) {
-        elements.push({
-          tag: "markdown",
-          // element_id ≤20 字符硬约束 → 短哈希（真实 id 走按钮 value 回传）
-          element_id: askQuestionElementId(askOpts.askId, q.id),
-          content: `**${q.question}**`,
-        });
-        if (singleQuestion && q.options?.length) {
-          for (const opt of q.options) {
-            const value: CardButtonValue = {
-              kind: "ask",
-              taskId,
-              askId: askOpts.askId,
-              questionId: q.id,
-              optionId: opt.id,
-            };
-            elements.push({
-              tag: "button",
-              element_id: askOptionElementId(askOpts.askId, q.id, opt.id),
-              text: { tag: "plain_text", content: opt.label },
-              // Hermes `_button_type` 无 style 时落 default（非 primary）
-              type: "default",
-              // Hermes interaction 按钮同款 size
-              size: "medium",
-              width: "default",
-              // 飞书 JSON 2.0：behaviors 触发回调，value 原样回传
-              behaviors: [
-                {
-                  type: "callback",
-                  value,
-                },
-              ],
-            });
-          }
-        }
-      }
-      // T7 用户反馈：按钮之外也提示可直接打字答（单题按钮下同样给一行小字）
-      elements.push({
-        tag: "markdown",
-        element_id: "md_ask_hint",
-        content: singleQuestion
-          ? "<font color='grey'>没有合适选项？直接回复消息作答</font>"
-          : "<font color='grey'>请直接回复文字作答</font>",
-      });
+      if (!started || finalized) return;
+      const elements = buildAskElements(askOpts);
       // Hermes waiting：orange + footer「等待选择」；subtitle 空（交互说明在正文按钮区）
       subtitle = "";
       template = "orange";
       footerText = "等待选择";
+      // 记住元素：后续全量 PUT / 非流式 finalize 整卡都带上（R1-1a）
+      appendedElements = [...appendedElements, ...elements];
+
+      // 非流式：只记状态，finalize 并入整卡
+      if (!streamingEnabled) return;
+      if (!cardId) return;
+
+      // 链上先刷过程/正文，避免随后全量 PUT 丢未推文本
+      await doFlush();
       try {
         await batchUpdateCard(
           cardId,
@@ -690,8 +764,6 @@ export const createCardStream = (
           ],
           nextSeq(),
         );
-        // 记住元素：后续任何全量 PUT 都带上（R1-1a）
-        appendedElements = [...appendedElements, ...elements];
         // header / footer 状态全量 PUT + batch 回写思考区（防嵌套 content 被抹）
         headerDirty = false;
         await putEntityThenReassertProcess();
@@ -705,8 +777,7 @@ export const createCardStream = (
 
   const appendRetryButton = async (lastUserMessage: string): Promise<void> => {
     return enqueueCardOp(async () => {
-      if (!started || !cardId) return;
-      await doFlush();
+      if (!started || finalized) return;
       const value: CardButtonValue = {
         kind: "retry",
         taskId,
@@ -722,6 +793,13 @@ export const createCardStream = (
           behaviors: [{ type: "callback", value }],
         },
       ];
+      appendedElements = [...appendedElements, ...elements];
+
+      // 非流式：只记状态，finalize 并入整卡
+      if (!streamingEnabled) return;
+      if (!cardId) return;
+
+      await doFlush();
       try {
         await batchUpdateCard(
           cardId,
@@ -737,7 +815,6 @@ export const createCardStream = (
           ],
           nextSeq(),
         );
-        appendedElements = [...appendedElements, ...elements];
       } catch (err) {
         warnFail("appendRetryButton", err);
       }
@@ -749,43 +826,49 @@ export const createCardStream = (
   ): Promise<void> => {
     clearFlushTimer();
     return enqueueCardOp(async () => {
-      if (!started || finalized || !cardId) {
+      if (!started || finalized) {
+        finalized = true;
+        return;
+      }
+
+      applyFinalizeVisual(fin);
+
+      // —— 非流式：一次性建普通卡（引用+思考+正文+ask/retry+footer）——
+      if (!streamingEnabled) {
+        try {
+          answerDesired = closeUnclosedCodeFence(canonicalAnswer());
+          processDesired = closeUnclosedCodeFence(canonicalProcess());
+          syncFlushedFromDesired();
+          const cardJson = rebuildCardJson(false);
+          const created = await createCardEntity(cardJson);
+          cardId = created.card_id;
+          const openId = await resolveOpenId();
+          const sent = await sendCardMessage(openId, cardId);
+          messageId = sent.message_id;
+          await rememberCardMessage({
+            messageId,
+            cardId,
+            taskId,
+            createdAt: Date.now(),
+          });
+          // 非流式从未开 streaming_mode，无需 patch 关流；仍刷 seq 盘水位（card-action 可能后续 patch）
+          await flushCardSeqToDisk();
+        } catch (err) {
+          warnFail("finalize(non-streaming)", err);
+        } finally {
+          finalized = true;
+          headerDirty = false;
+        }
+        return;
+      }
+
+      // —— 流式路径：需卡已建 ——
+      if (!cardId) {
         finalized = true;
         return;
       }
       // 链上刷完过程/正文（与在途 flush 互斥，R1-13d）
       await doFlush();
-
-      // 深链入口已砍（2026-07-20 用户拍板：浏览器中转体验差、不要了）
-      const statsParts: string[] = [];
-      if (fin.durationMs != null) {
-        const d = formatDuration(fin.durationMs);
-        if (d) statsParts.push(d);
-      }
-      if (fin.model) statsParts.push(coloredModelLabel(fin.model));
-      const statsFooter = statsParts.join(" · ");
-
-      // R1-4：用户 stop → 灰卡「已停止」（与自然完成 / ask 等待互斥）
-      if (fin.outcome === "stopped") {
-        subtitle = "已停止";
-        template = "grey";
-        footerText = statsFooter;
-      } else if (fin.ok && getPendingAsk(taskId)) {
-        // Hermes waiting：subtitle 空、summary「等待选择」靠 template=orange；footer 换统计+深链
-        subtitle = "";
-        template = "orange";
-        footerText = statsFooter;
-      } else if (fin.ok) {
-        // Hermes completed：subtitle「已完成」、green；footer = 耗时 · 着色模型
-        subtitle = "已完成";
-        template = "green";
-        footerText = statsFooter;
-      } else {
-        // Hermes failed：subtitle 空、summary「处理失败」、red
-        subtitle = "";
-        template = "red";
-        footerText = "已停止";
-      }
 
       try {
         // review P2#6：终态才补未闭合围栏（流式期间不补，避免破坏前缀守卫打字机）

@@ -240,6 +240,11 @@ export interface FeAiFlowSettings {
    * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
    */
   feishuBridgeKeepAwake?: boolean;
+  /**
+   * 桥接「流式回复」（CardKit 打字机）。默认开；显式 false → AI 完成后一次性发整卡。
+   * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
+   */
+  feishuBridgeStreaming?: boolean;
 }
 
 /**

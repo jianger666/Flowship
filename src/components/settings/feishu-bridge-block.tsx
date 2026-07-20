@@ -138,11 +138,15 @@ export const FeishuBridgeBlock = ({
   onFeishuChatBridgeChange,
   feishuBridgeKeepAwake,
   onFeishuBridgeKeepAwakeChange,
+  feishuBridgeStreaming,
+  onFeishuBridgeStreamingChange,
 }: {
   feishuChatBridge: boolean;
   onFeishuChatBridgeChange: (next: boolean) => void;
   feishuBridgeKeepAwake: boolean;
   onFeishuBridgeKeepAwakeChange: (next: boolean) => void;
+  feishuBridgeStreaming: boolean;
+  onFeishuBridgeStreamingChange: (next: boolean) => void;
 }) => {
   // 探测结果快照（null = 尚未拉到）
   const [status, setStatus] = useState<BridgeStatusPayload | null>(null);
@@ -409,6 +413,16 @@ export const FeishuBridgeBlock = ({
           </div>
 
           <div className="divide-y">
+            <SettingRow
+              label="流式回复"
+              className="py-2"
+              control={
+                <Switch
+                  checked={feishuBridgeStreaming}
+                  onCheckedChange={onFeishuBridgeStreamingChange}
+                />
+              }
+            />
             <SettingRow
               label="插电时防休眠"
               className="py-2"

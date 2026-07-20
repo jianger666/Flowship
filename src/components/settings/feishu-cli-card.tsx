@@ -70,6 +70,8 @@ export const FeishuCliSection = ({
   onFeishuChatBridgeChange,
   feishuBridgeKeepAwake,
   onFeishuBridgeKeepAwakeChange,
+  feishuBridgeStreaming,
+  onFeishuBridgeStreamingChange,
 }: {
   meegleProject: MeegleProjectSetting;
   /** 选中即落盘（父级 saveFieldValue） */
@@ -80,6 +82,9 @@ export const FeishuCliSection = ({
   /** 插电防休眠（决策 #14，默认开） */
   feishuBridgeKeepAwake: boolean;
   onFeishuBridgeKeepAwakeChange: (next: boolean) => void;
+  /** 流式回复（默认开；关则一次性整卡） */
+  feishuBridgeStreaming: boolean;
+  onFeishuBridgeStreamingChange: (next: boolean) => void;
 }) => {
   const { confirm } = useDialog();
   // 服务端状态快照（轮询）
@@ -362,6 +367,8 @@ export const FeishuCliSection = ({
           onFeishuChatBridgeChange={onFeishuChatBridgeChange}
           feishuBridgeKeepAwake={feishuBridgeKeepAwake}
           onFeishuBridgeKeepAwakeChange={onFeishuBridgeKeepAwakeChange}
+          feishuBridgeStreaming={feishuBridgeStreaming}
+          onFeishuBridgeStreamingChange={onFeishuBridgeStreamingChange}
         />
       </div>
     </div>

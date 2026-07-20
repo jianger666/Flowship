@@ -86,6 +86,12 @@ export interface CardStreamOptions {
   title: string;
   /** 接收人 open_id；省略则用 getBotAppInfo() 的 ownerOpenId */
   openId?: string;
+  /**
+   * 是否走 CardKit 流式打字机（设置页「流式回复」）。默认 true。
+   * false = turn 内只累积状态，finalize 一次性发普通卡（streaming_mode 关）。
+   * 在 create 时定稿，turn 中途改设置不影响本轮。
+   */
+  streaming?: boolean;
 }
 
 /** start() 时可选的 app 侧回显 */
