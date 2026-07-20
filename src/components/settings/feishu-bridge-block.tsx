@@ -404,7 +404,7 @@ export const FeishuBridgeBlock = ({
               onClick={() => void handleWelcome()}
             >
               {welcomeBusy ? <Loader2 className="animate-spin" /> : null}
-              让机器人私聊我
+              机器人打招呼
             </Button>
           </div>
 
