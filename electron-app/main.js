@@ -777,13 +777,10 @@ const createWindow = async () => {
   // 页面没就绪（白屏/崩溃）时没 UI 可确认 → 直接放行退出
   let closeConfirmShowing = false;
   mainWindow.on("close", (event) => {
+    log(`[close] close 事件 quitting=${quitting} pageLoaded=${pageLoaded} showing=${closeConfirmShowing}`);
     void saveWindowState();
     if (quitting) return;
     event.preventDefault();
-    if (!pageLoaded) {
-      quitAppForReal();
-      return;
-    }
     if (closeConfirmShowing) return;
     closeConfirmShowing = true;
     // 30s 无响应自动解锁（renderer 卡死时允许再点 X 重试）
@@ -791,10 +788,33 @@ const createWindow = async () => {
       closeConfirmShowing = false;
     }, 30_000);
     ipcMain.once("app-close-confirm-result", (_e, confirmed) => {
+      log(`[close] renderer 回复 confirmed=${confirmed}`);
       clearTimeout(unlockTimer);
       closeConfirmShowing = false;
       if (confirmed === true) quitAppForReal();
     });
+    // 页面没就绪（白屏/崩溃）时 renderer 弹不了——原生弹窗兜底（不再直接退出）
+    if (!pageLoaded) {
+      log("[close] 页面未就绪 → 原生确认兜底");
+      void dialog
+        .showMessageBox(mainWindow, {
+          type: "question",
+          buttons: ["关闭", "取消"],
+          defaultId: 1,
+          cancelId: 1,
+          message: `确定关闭 ${IS_TEST ? "FlowshipTest" : "Flowship"} 吗？`,
+          detail: "后台任务与飞书桥接会一并退出",
+        })
+        .then(({ response }) => {
+          clearTimeout(unlockTimer);
+          closeConfirmShowing = false;
+          if (response === 0) quitAppForReal();
+        })
+        .catch(() => {
+          closeConfirmShowing = false;
+        });
+      return;
+    }
     mainWindow.webContents.send("app-close-confirm", {
       appName: IS_TEST ? "FlowshipTest" : "Flowship",
     });
@@ -842,13 +862,20 @@ const createWindow = async () => {
     if (isReload) e.preventDefault();
   });
 
-  // pageLoaded 复位：loadURL / reload / 同窗导航一开始就把页面上下文作废，
-  // 此窗口内 send 必丢——只靠 did-finish-load 再置 true（中间态一律走 pending）。
-  mainWindow.webContents.on("did-start-loading", () => {
-    pageLoaded = false;
+  // pageLoaded 复位：仅「主框架真导航」（loadURL / 跨文档跳转）才作废页面上下文。
+  // ⚠️ 不能用 did-start-loading——它是「tab 转圈」信号、页面任何子资源/fetch 都会触发，
+  // 把 pageLoaded 永久打回 false（2026-07-20 实测：点 X 走了「页面未就绪」兜底、
+  // 深链 pending 也永远不投）。
+  // Electron 42：事件对象自带 isMainFrame / isSameDocument（结构化 details 形态）
+  mainWindow.webContents.on("did-start-navigation", (details) => {
+    if (details.isMainFrame && !details.isSameDocument) {
+      log(`[close] 主框架导航（pageLoaded ${pageLoaded} → false）`);
+      pageLoaded = false;
+    }
   });
   // 页面每次加载完成（首次加载 / 更新后重载）重注入版本号 + 更新标识、不丢状态
   mainWindow.webContents.on("did-finish-load", () => {
+    log("[close] did-finish-load（pageLoaded → true）");
     pageLoaded = true;
     // 版本号给设置页显示（用户要能确认「装的是不是最新版」）；web 版没壳、不显示
     mainWindow?.webContents
