@@ -5,8 +5,10 @@ import {
   isEphemeralToolOutputDelta,
   isVerbGroupMember,
   mergeToolDisplayEvents,
+  parseTaskToolArgs,
   parseToolArgsJson,
   toolBlockDefaultCollapsed,
+  toolBlockExpandedArgsPreview,
   toolBlockSummary,
   type ToolBlock,
   type ToolVerbGroup,
@@ -202,5 +204,91 @@ describe("toolBlockSummary 人类可读解析", () => {
     expect(
       toolBlockSummary(block({ name: "unknown", args: "plain text cmd" })),
     ).toBe("plain text cmd");
+  });
+});
+
+describe("parseTaskToolArgs", () => {
+  it("完整 JSON 字符串解析 description + prompt", () => {
+    const args = JSON.stringify({
+      description: "修登录态",
+      prompt: "请排查 auth cookie\n第二行",
+      model: "fast",
+    });
+    expect(parseTaskToolArgs(args)).toEqual({
+      description: "修登录态",
+      prompt: "请排查 auth cookie\n第二行",
+    });
+  });
+
+  it("接受已解析对象", () => {
+    expect(
+      parseTaskToolArgs({
+        description: "读代码",
+        prompt: "扫 src/",
+      }),
+    ).toEqual({ description: "读代码", prompt: "扫 src/" });
+  });
+
+  it("残缺流式 JSON 前缀安全抠字段", () => {
+    const partial =
+      '{"description":"调研库","prompt":"去 github 找找有什么库、我们直接';
+    const got = parseTaskToolArgs(partial);
+    expect(got).not.toBeNull();
+    expect(got?.description).toBe("调研库");
+    expect(got?.prompt?.startsWith("去 github")).toBe(true);
+  });
+
+  it("只有 description 的残缺前缀也可", () => {
+    expect(parseTaskToolArgs('{"description":"半成品任务"')).toEqual({
+      description: "半成品任务",
+      prompt: null,
+    });
+  });
+
+  it("完全无法解析时返 null", () => {
+    expect(parseTaskToolArgs("")).toBeNull();
+    expect(parseTaskToolArgs(undefined)).toBeNull();
+    expect(parseTaskToolArgs("{")).toBeNull();
+    expect(parseTaskToolArgs('{"foo":1}')).toBeNull();
+  });
+
+  it("非 task 形态 args（无 description/prompt）返 null", () => {
+    expect(
+      parseTaskToolArgs(JSON.stringify({ command: "ls -la", path: "/tmp" })),
+    ).toBeNull();
+  });
+});
+
+describe("toolBlockExpandedArgsPreview", () => {
+  it("task 工具展示 description + prompt 前几行", () => {
+    const preview = toolBlockExpandedArgsPreview(
+      block({
+        name: "task",
+        status: "running",
+        args: JSON.stringify({
+          description: "子代理修 bug",
+          prompt: "第一行\n第二行\n第三行\n第四行不该出现",
+        }),
+      }),
+    );
+    expect(preview).toContain("子代理修 bug");
+    expect(preview).toContain("第一行");
+    expect(preview).toContain("第三行");
+    expect(preview?.includes("第四行")).toBe(false);
+  });
+
+  it("无 detailLine 时截断 args JSON 单行兜底", () => {
+    const args = JSON.stringify({ weird_field: "x".repeat(80) });
+    // text 含 { 且等于 summary → detailLine 返 null，走 args 截断
+    const preview = toolBlockExpandedArgsPreview(
+      block({
+        name: "obscure_tool",
+        args,
+        text: `调用 obscure_tool:${args}`,
+      }),
+    );
+    expect(preview).toBeTruthy();
+    expect(preview!.includes("weird_field")).toBe(true);
+    expect(preview!.endsWith("…") || preview!.length <= 160).toBe(true);
   });
 });

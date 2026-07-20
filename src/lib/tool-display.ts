@@ -106,6 +106,74 @@ export const parseToolArgsJson = (
   return null;
 };
 
+/** Task 子代理工具 args（description + prompt） */
+export type TaskToolArgs = {
+  description: string | null;
+  prompt: string | null;
+};
+
+/** 从残缺 JSON 流式前缀里抠 string 字段（键完整、值可能未闭合） */
+const extractPartialJsonStringField = (
+  raw: string,
+  key: string,
+): string | null => {
+  // "key": "value… 或 "key":"value…
+  const re = new RegExp(
+    `"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"?`,
+    "s",
+  );
+  const m = raw.match(re);
+  if (!m?.[1]) return null;
+  // 反解常见转义，残缺前缀不追求完备
+  const unescaped = m[1]
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+  const trimmed = unescaped.trim();
+  return trimmed || null;
+};
+
+/**
+ * 解析 name=task 子代理工具的 args。
+ * 容忍：JSON 字符串 / 已解析对象 / running 时残缺流式前缀。
+ * 拿不到 description 且拿不到 prompt → 返 null（安全降级）。
+ */
+export const parseTaskToolArgs = (
+  args: string | Record<string, unknown> | null | undefined,
+): TaskToolArgs | null => {
+  if (args == null) return null;
+
+  let description: string | null = null;
+  let prompt: string | null = null;
+
+  if (typeof args === "object" && !Array.isArray(args)) {
+    const d = args.description;
+    const p = args.prompt;
+    if (typeof d === "string" && d.trim()) description = d.trim();
+    if (typeof p === "string" && p.trim()) prompt = p.trim();
+  } else if (typeof args === "string") {
+    const cleaned = args.replace(/…\(truncated \d+ chars\)$/, "").trim();
+    if (!cleaned) return null;
+    const parsed = parseToolArgsJson(cleaned);
+    if (parsed) {
+      const d = parsed.description;
+      const p = parsed.prompt;
+      if (typeof d === "string" && d.trim()) description = d.trim();
+      if (typeof p === "string" && p.trim()) prompt = p.trim();
+    } else {
+      // 残缺流式 JSON：尽量抠已写出的字段，抠不到就 null
+      description = extractPartialJsonStringField(cleaned, "description");
+      prompt = extractPartialJsonStringField(cleaned, "prompt");
+    }
+  } else {
+    return null;
+  }
+
+  if (!description && !prompt) return null;
+  return { description, prompt };
+};
+
 const pickStr = (
   obj: Record<string, unknown>,
   keys: string[],
@@ -455,6 +523,40 @@ export const toolBlockDetailLine = (block: ToolBlock): string | null => {
   if (!summary) return null;
   if (summary === block.text && /\{/.test(block.text)) return null;
   return summary;
+};
+
+/**
+ * 展开区 args 可读摘要：优先 detailLine；否则截断 args JSON 单行。
+ * task 工具：description + prompt 前几行。无内容返 null（调用方走占位文案）。
+ */
+export const toolBlockExpandedArgsPreview = (
+  block: ToolBlock,
+): string | null => {
+  // task 子代理：description + prompt 前几行（卡片有专属区，这里供通用兜底）
+  if (block.name.toLowerCase() === "task") {
+    const taskArgs = parseTaskToolArgs(block.args);
+    if (taskArgs) {
+      const bits: string[] = [];
+      if (taskArgs.description) bits.push(taskArgs.description);
+      if (taskArgs.prompt) {
+        const preview = taskArgs.prompt
+          .split("\n")
+          .slice(0, 3)
+          .join("\n")
+          .trim();
+        if (preview) bits.push(preview);
+      }
+      if (bits.length > 0) return bits.join("\n");
+    }
+  }
+
+  const detail = toolBlockDetailLine(block);
+  if (detail) return detail;
+
+  if (block.args?.trim()) {
+    return clipOneLine(block.args.replace(/\s+/g, " ").trim(), 160);
+  }
+  return null;
 };
 
 /** verb group 文案（对标 GB「Read N files」） */

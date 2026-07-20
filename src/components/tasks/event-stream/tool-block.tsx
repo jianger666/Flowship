@@ -5,10 +5,12 @@
  *
  * 视觉：图标 + 名称 + 摘要一行；展开区缩进 + 左边线；token 用 muted/border。
  * Chat 打磨：shell 默认折叠、摘要绝不 dump args JSON；运行中直播输出、完成后收起。
+ * task 工具：专属「子代理」卡片（Bot 图标 + 任务书 / 产出分区）。
  */
 
 import { memo, useMemo, useState } from "react";
 import {
+  Bot,
   Check,
   ChevronRight,
   FileCode2,
@@ -21,8 +23,10 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
   countDiffStats,
+  parseTaskToolArgs,
   toolBlockDefaultCollapsed,
   toolBlockDetailLine,
+  toolBlockExpandedArgsPreview,
   toolBlockSummary,
   verbGroupLabel,
   type ToolBlock,
@@ -115,6 +119,9 @@ const formatDuration = (ms?: number): string | null => {
   return `${(ms / 1000).toFixed(1)}s`;
 };
 
+/** 任务书截断阈值（展开区「显示更多」） */
+const TASK_PROMPT_PREVIEW_CHARS = 400;
+
 interface ToolBlockRowProps {
   block: ToolBlock;
   taskId: string;
@@ -124,7 +131,229 @@ interface ToolBlockRowProps {
   nested?: boolean;
 }
 
-const ToolBlockRowImpl = ({
+/** 展开区底部：加载完整输出按钮（truncated + fullPath） */
+const LoadFullOutputButton = ({
+  block,
+  taskId,
+  fullText,
+  fullLoading,
+  onLoaded,
+  onLoadingChange,
+  onEnsureOpen,
+}: {
+  block: ToolBlock;
+  taskId: string;
+  fullText: string | null;
+  fullLoading: boolean;
+  onLoaded: (text: string) => void;
+  onLoadingChange: (v: boolean) => void;
+  onEnsureOpen: () => void;
+}) => {
+  if (
+    !block.result?.truncated ||
+    !block.result?.fullPath ||
+    fullText !== null
+  ) {
+    return null;
+  }
+  return (
+    <button
+      type="button"
+      disabled={fullLoading}
+      onClick={() => {
+        onLoadingChange(true);
+        onEnsureOpen();
+        void (async () => {
+          try {
+            const res = await fetch(
+              `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(block.callId)}`,
+            );
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            onLoaded(await res.text());
+          } catch {
+            toast.error("完整输出加载失败");
+          } finally {
+            onLoadingChange(false);
+          }
+        })();
+      }}
+      className="mt-1 cursor-pointer text-[11px] text-primary hover:underline disabled:opacity-50"
+    >
+      {fullLoading ? "加载中…" : "已截断 · 加载完整输出"}
+    </button>
+  );
+};
+
+/** 展开区空态：running → 等待输出；完成 → 无输出 */
+const ExpandedEmptyPlaceholder = ({
+  status,
+}: {
+  status: ToolBlock["status"];
+}) => {
+  if (status === "running") {
+    return (
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
+        <Loader2 className="size-3 shrink-0 animate-spin" />
+        <span>等待输出…</span>
+      </div>
+    );
+  }
+  return (
+    <div className="text-[11px] text-muted-foreground/70">无输出</div>
+  );
+};
+
+/** name=task 子代理专属卡片 */
+const TaskSubagentBlock = ({
+  block,
+  taskId,
+  liveOutput,
+  nested,
+}: ToolBlockRowProps) => {
+  const [collapsed, setCollapsed] = useState(() =>
+    toolBlockDefaultCollapsed(block.name, nested),
+  );
+  // 任务书超长：点「显示更多」内联展开全文
+  const [promptExpanded, setPromptExpanded] = useState(false);
+  // 产出区第二层折叠（完成态）
+  const [outputOpen, setOutputOpen] = useState(false);
+  const [fullText, setFullText] = useState<string | null>(null);
+  const [fullLoading, setFullLoading] = useState(false);
+
+  const taskArgs = useMemo(
+    () => parseTaskToolArgs(block.args),
+    [block.args],
+  );
+  const title = taskArgs?.description?.trim() || "子代理任务";
+  const prompt = taskArgs?.prompt ?? "";
+  const promptLong = prompt.length > TASK_PROMPT_PREVIEW_CHARS;
+  const promptShown =
+    promptExpanded || !promptLong
+      ? prompt
+      : `${prompt.slice(0, TASK_PROMPT_PREVIEW_CHARS)}…`;
+
+  const displayOutput =
+    block.status === "running" && liveOutput
+      ? liveOutput
+      : block.result?.output;
+
+  const liveTail =
+    collapsed &&
+    block.status === "running" &&
+    liveOutput
+      ? liveOutput.trim().split("\n").filter(Boolean).slice(-1)[0]
+      : null;
+
+  const statusIcon =
+    block.status === "running" ? (
+      <Loader2 className="size-3.5 shrink-0 animate-spin text-blue-500" />
+    ) : block.status === "error" ? (
+      <X className="size-3.5 shrink-0 text-destructive" />
+    ) : (
+      <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+    );
+
+  return (
+    <div className={cn("group/tool", nested && "pl-0")}>
+      <button
+        type="button"
+        onClick={() => setCollapsed((c) => !c)}
+        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+      >
+        <CollapseChevron open={!collapsed} />
+        <Bot className="size-3.5 shrink-0 text-violet-600 dark:text-violet-400" />
+        <span className="shrink-0 rounded bg-violet-500/10 px-1 py-px text-[10px] font-medium text-violet-700 dark:text-violet-300">
+          子代理
+        </span>
+        <span className="min-w-0 shrink truncate font-medium text-[11px] text-foreground/90">
+          {title}
+        </span>
+        {statusIcon}
+        {collapsed && liveTail && (
+          <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
+            {liveTail}
+          </span>
+        )}
+        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+          {formatTs(block.ts)}
+        </span>
+      </button>
+
+      {!collapsed && (
+        <div className="ml-5 mt-1 space-y-2 border-l border-border/50 pl-3">
+          {/* 任务书 */}
+          <div className="space-y-1">
+            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+              任务书
+            </div>
+            {prompt ? (
+              <div className="space-y-1">
+                <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/20 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {promptShown}
+                </pre>
+                {promptLong && (
+                  <button
+                    type="button"
+                    onClick={() => setPromptExpanded((v) => !v)}
+                    className="cursor-pointer text-[11px] text-primary hover:underline"
+                  >
+                    {promptExpanded ? "收起" : "显示更多"}
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="text-[11px] text-muted-foreground/70">无任务书</div>
+            )}
+          </div>
+
+          {/* 产出 */}
+          <div className="space-y-1">
+            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+              产出
+            </div>
+            {block.status === "running" && !displayOutput ? (
+              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
+                <Loader2 className="size-3 shrink-0 animate-spin" />
+                <span>子代理运行中…</span>
+              </div>
+            ) : displayOutput ? (
+              <div>
+                {block.status !== "running" && (
+                  <button
+                    type="button"
+                    onClick={() => setOutputOpen((o) => !o)}
+                    className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    <CollapseChevron open={outputOpen} />
+                    输出
+                  </button>
+                )}
+                {(block.status === "running" || outputOpen) && (
+                  <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                    {fullText ?? displayOutput}
+                  </pre>
+                )}
+                <LoadFullOutputButton
+                  block={block}
+                  taskId={taskId}
+                  fullText={fullText}
+                  fullLoading={fullLoading}
+                  onLoaded={setFullText}
+                  onLoadingChange={setFullLoading}
+                  onEnsureOpen={() => setOutputOpen(true)}
+                />
+              </div>
+            ) : (
+              <ExpandedEmptyPlaceholder status={block.status} />
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const RegularToolBlockRow = ({
   block,
   taskId,
   liveOutput,
@@ -148,6 +377,7 @@ const ToolBlockRowImpl = ({
 
   const summary = toolBlockSummary(block);
   const detailLine = toolBlockDetailLine(block);
+  const argsPreview = toolBlockExpandedArgsPreview(block);
   const diff = block.result?.diff;
   const diffStats = useMemo(
     () => (diff ? countDiffStats(diff) : null),
@@ -175,6 +405,11 @@ const ToolBlockRowImpl = ({
     liveOutput
       ? liveOutput.trim().split("\n").filter(Boolean).slice(-1)[0]
       : null;
+
+  // 展开区是否已有实质内容（detail / args 兜底 / diff / output）
+  const hasExpandedBody = Boolean(
+    detailLine || argsPreview || diff || displayOutput,
+  );
 
   return (
     <div className={cn("group/tool", nested && "pl-0")}>
@@ -220,10 +455,17 @@ const ToolBlockRowImpl = ({
 
       {!collapsed && (
         <div className="ml-5 mt-1 space-y-1.5 border-l border-border/50 pl-3">
-          {/* 一层：可读命令 / 路径（绝不 dump args JSON） */}
-          {detailLine && (
-            <div className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
-              {detailLine}
+          {/* 一层：可读命令 / 路径；无 detailLine 时用 args 截断兜底 */}
+          {(detailLine || (!displayOutput && !diff && argsPreview)) && (
+            <div
+              className={cn(
+                "min-w-0 text-[11px] text-muted-foreground",
+                detailLine
+                  ? "truncate font-mono"
+                  : "whitespace-pre-wrap break-all font-mono",
+              )}
+            >
+              {detailLine ?? argsPreview}
             </div>
           )}
 
@@ -279,40 +521,34 @@ const ToolBlockRowImpl = ({
               )}
               {/* 仅 truncated+fullPath 都有才出按钮；写盘失败只有 truncated、点开会 404。
                   点击就地拉全量替换进上面的滚动框（不再弹 Dialog——用户嫌重） */}
-              {block.result?.truncated &&
-                block.result?.fullPath &&
-                fullText === null && (
-                  <button
-                    type="button"
-                    disabled={fullLoading}
-                    onClick={() => {
-                      setFullLoading(true);
-                      setOutputOpen(true);
-                      void (async () => {
-                        try {
-                          const res = await fetch(
-                            `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(block.callId)}`,
-                          );
-                          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                          setFullText(await res.text());
-                        } catch {
-                          toast.error("完整输出加载失败");
-                        } finally {
-                          setFullLoading(false);
-                        }
-                      })();
-                    }}
-                    className="mt-1 cursor-pointer text-[11px] text-primary hover:underline disabled:opacity-50"
-                  >
-                    {fullLoading ? "加载中…" : "已截断 · 加载完整输出"}
-                  </button>
-                )}
+              <LoadFullOutputButton
+                block={block}
+                taskId={taskId}
+                fullText={fullText}
+                fullLoading={fullLoading}
+                onLoaded={setFullText}
+                onLoadingChange={setFullLoading}
+                onEnsureOpen={() => setOutputOpen(true)}
+              />
             </div>
+          )}
+
+          {/* 仍无内容：running 等输出 / 完成态无输出 */}
+          {!hasExpandedBody && (
+            <ExpandedEmptyPlaceholder status={block.status} />
           )}
         </div>
       )}
     </div>
   );
+};
+
+const ToolBlockRowImpl = (props: ToolBlockRowProps) => {
+  // task 子代理：走专属卡片（独立组件，避免 hooks 条件分支）
+  if (props.block.name.toLowerCase() === "task") {
+    return <TaskSubagentBlock {...props} />;
+  }
+  return <RegularToolBlockRow {...props} />;
 };
 
 export const ToolBlockRow = memo(ToolBlockRowImpl);
