@@ -7,17 +7,26 @@ const {
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
+  updateCardEntity,
   getPendingAsk,
   clearPendingAsk,
   deliverChatAskReply,
   hasChatSession,
   handleChatReplyInject,
   loadBridgeBootContext,
+  listActiveChatTasks,
   findTaskByMessageId,
   getTask,
+  stopTaskAgent,
   writeUserEventAndPublishStrict,
   getChatLifecycle,
   registerCardActionHandler,
+  setCurrentChatTaskId,
+  getCurrentChatTaskId,
+  addEndedChatTaskId,
+  execNewChatNoArgs,
+  execCleanupCard,
+  execStatusText,
 } = vi.hoisted(() => {
   type AnyFn = (...args: never[]) => unknown;
   return {
@@ -27,17 +36,26 @@ const {
       chat_id: "oc",
       message_id: "om",
     })),
+    updateCardEntity: vi.fn<AnyFn>(async () => undefined),
     getPendingAsk: vi.fn<AnyFn>(),
     clearPendingAsk: vi.fn<AnyFn>(),
     deliverChatAskReply: vi.fn<AnyFn>(),
     hasChatSession: vi.fn<AnyFn>(() => true),
     handleChatReplyInject: vi.fn<AnyFn>(),
     loadBridgeBootContext: vi.fn<AnyFn>(),
+    listActiveChatTasks: vi.fn<AnyFn>(async () => []),
     findTaskByMessageId: vi.fn<AnyFn>(),
     getTask: vi.fn<AnyFn>(),
+    stopTaskAgent: vi.fn<AnyFn>(async () => undefined),
     writeUserEventAndPublishStrict: vi.fn<AnyFn>(),
     getChatLifecycle: vi.fn<AnyFn>(() => null),
     registerCardActionHandler: vi.fn<AnyFn>(),
+    setCurrentChatTaskId: vi.fn<AnyFn>(async () => undefined),
+    getCurrentChatTaskId: vi.fn<AnyFn>(async () => ""),
+    addEndedChatTaskId: vi.fn<AnyFn>(async () => undefined),
+    execNewChatNoArgs: vi.fn<AnyFn>(async () => "handled"),
+    execCleanupCard: vi.fn<AnyFn>(async () => "handled"),
+    execStatusText: vi.fn<AnyFn>(async () => "handled"),
   };
 });
 
@@ -45,6 +63,7 @@ vi.mock("@/lib/server/feishu-bridge/lark-api", () => ({
   getBotAppInfo,
   batchUpdateCard,
   sendTextMessage,
+  updateCardEntity,
 }));
 
 vi.mock("@/lib/server/chat-pending", () => ({
@@ -64,6 +83,24 @@ vi.mock("@/lib/server/chat-inject", () => ({
 vi.mock("@/lib/server/feishu-bridge/router", () => ({
   loadBridgeBootContext,
   registerCardActionHandler,
+  listActiveChatTasks,
+}));
+
+vi.mock("@/lib/server/feishu-bridge/bridge-state", () => ({
+  setCurrentChatTaskId,
+  getCurrentChatTaskId,
+  addEndedChatTaskId,
+}));
+
+// 面板按钮 cmd 分发目标（commands 的共用执行体）——只验分发、不跑真实流程
+vi.mock("@/lib/server/feishu-bridge/commands", () => ({
+  execNewChatNoArgs,
+  execCleanupCard,
+  execStatusText,
+}));
+
+vi.mock("@/lib/server/stop-task", () => ({
+  stopTaskAgent,
 }));
 
 vi.mock("@/lib/server/feishu-bridge/card-map", () => ({
@@ -170,6 +207,12 @@ beforeEach(() => {
   );
   getChatLifecycle.mockReturnValue(null);
   hasChatSession.mockReturnValue(true);
+  listActiveChatTasks.mockResolvedValue([]);
+  getCurrentChatTaskId.mockResolvedValue("");
+  setCurrentChatTaskId.mockResolvedValue(undefined);
+  addEndedChatTaskId.mockResolvedValue(undefined);
+  stopTaskAgent.mockResolvedValue(undefined);
+  updateCardEntity.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -208,6 +251,21 @@ describe("normalize / parse helpers", () => {
   it("非法 value 返回 null", () => {
     expect(parseCardButtonValue("not-json")).toBeNull();
     expect(parseCardButtonValue({ kind: "ask", taskId: "x" })).toBeNull();
+  });
+
+  it("end_chat / end_all / cmd 三类新 value 解析", () => {
+    expect(
+      parseCardButtonValue({ kind: "end_chat", taskId: "task-9" }),
+    ).toEqual({ kind: "end_chat", taskId: "task-9" });
+    expect(parseCardButtonValue({ kind: "end_chat" })).toBeNull();
+    expect(parseCardButtonValue({ kind: "end_all" })).toEqual({
+      kind: "end_all",
+    });
+    expect(parseCardButtonValue({ kind: "cmd", command: "clean" })).toEqual({
+      kind: "cmd",
+      command: "clean",
+    });
+    expect(parseCardButtonValue({ kind: "cmd", command: "hack" })).toBeNull();
   });
 });
 
@@ -356,6 +414,125 @@ describe("handleCardActionEvent", () => {
         action_value: askValue,
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("清理卡 / 控制面板按钮", () => {
+  /** 清理卡在 card-map 里的条目：taskId 空串（不参与锚定）、只供反查 cardId */
+  const cleanupCardEntry = {
+    messageId: "om_cleanup",
+    cardId: "card_cleanup",
+    taskId: "",
+    createdAt: Date.now(),
+  };
+
+  it("end_chat：停运行 + 出局 + 清指针 + patch 行「已结束」", async () => {
+    getTask.mockResolvedValue({
+      id: "task-9",
+      mode: "chat",
+      title: "要结束的对话",
+      runStatus: "running",
+      events: [],
+    });
+    // 指针正指向被结束的对话 → 应清空
+    getCurrentChatTaskId.mockResolvedValue("task-9");
+    findTaskByMessageId.mockResolvedValue(cleanupCardEntry);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_cleanup",
+      action_value: { kind: "end_chat", taskId: "task-9" },
+    });
+
+    expect(stopTaskAgent).toHaveBeenCalledTimes(1);
+    expect(addEndedChatTaskId).toHaveBeenCalledWith("task-9");
+    expect(setCurrentChatTaskId).toHaveBeenCalledWith("");
+    const actionsJson = JSON.stringify(batchUpdateCard.mock.calls);
+    expect(actionsJson).toContain("已结束：要结束的对话");
+    expect(actionsJson).toContain("delete_elements");
+  });
+
+  it("end_chat 空闲对话：不停运行、仍出局；指针指向别处不清", async () => {
+    getTask.mockResolvedValue({
+      id: "task-9",
+      mode: "chat",
+      title: "空闲对话",
+      runStatus: "idle",
+      events: [],
+    });
+    getCurrentChatTaskId.mockResolvedValue("task-other");
+    findTaskByMessageId.mockResolvedValue(cleanupCardEntry);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_cleanup",
+      action_value: { kind: "end_chat", taskId: "task-9" },
+    });
+
+    expect(stopTaskAgent).not.toHaveBeenCalled();
+    expect(addEndedChatTaskId).toHaveBeenCalledWith("task-9");
+    expect(setCurrentChatTaskId).not.toHaveBeenCalled();
+  });
+
+  it("end_all：点击时重算活跃、逐个出局、整卡换「已全部结束（N 个）」", async () => {
+    listActiveChatTasks.mockResolvedValue([
+      { id: "task-a", title: "A", runStatus: "idle" },
+      { id: "task-b", title: "B", runStatus: "running" },
+    ]);
+    getTask.mockImplementation(async (id: unknown) => ({
+      id,
+      mode: "chat",
+      title: String(id).toUpperCase(),
+      runStatus: id === "task-b" ? "running" : "idle",
+      events: [],
+    }));
+    findTaskByMessageId.mockResolvedValue(cleanupCardEntry);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_cleanup",
+      action_value: { kind: "end_all" },
+    });
+
+    expect(addEndedChatTaskId).toHaveBeenCalledWith("task-a");
+    expect(addEndedChatTaskId).toHaveBeenCalledWith("task-b");
+    // 只有 running 的 B 需要停
+    expect(stopTaskAgent).toHaveBeenCalledTimes(1);
+    expect(updateCardEntity).toHaveBeenCalledTimes(1);
+    const cardJson = JSON.stringify(updateCardEntity.mock.calls);
+    expect(cardJson).toContain("已全部结束（2 个）");
+  });
+
+  it("cmd 三连：new / clean / status 分发到对应命令流程", async () => {
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_panel",
+      action_value: { kind: "cmd", command: "new" },
+    });
+    expect(execNewChatNoArgs).toHaveBeenCalledTimes(1);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_panel",
+      action_value: { kind: "cmd", command: "clean" },
+    });
+    expect(execCleanupCard).toHaveBeenCalledTimes(1);
+
+    await handleCardActionEvent({
+      operator_id: OWNER,
+      message_id: "om_panel",
+      action_value: { kind: "cmd", command: "status" },
+    });
+    expect(execStatusText).toHaveBeenCalledTimes(1);
+  });
+
+  it("cmd 按钮非本人点击 → 丢弃不分发", async () => {
+    await handleCardActionEvent({
+      operator_id: OTHER,
+      message_id: "om_panel",
+      action_value: { kind: "cmd", command: "new" },
+    });
+    expect(execNewChatNoArgs).not.toHaveBeenCalled();
   });
 });
 

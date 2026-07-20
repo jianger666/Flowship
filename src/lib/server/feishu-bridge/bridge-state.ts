@@ -17,6 +17,9 @@ import { getBridgeDataDir } from "./bridge-config";
 /** 去重集合上限——防膨胀；超出淘汰最旧 */
 const PROCESSED_IDS_MAX = 2000;
 
+/** 「已结束」对话集合上限（FIFO 淘汰最旧——被淘汰的对话大概率早过了活跃窗、不会复现） */
+const ENDED_CHAT_IDS_MAX = 200;
+
 interface BridgeStateStore {
   /** 最近处理过的 p2p chat_id（补拉用） */
   lastP2pChatId: string;
@@ -24,12 +27,24 @@ interface BridgeStateStore {
   processedMessageIds: string[];
   /** 最近收到入向消息的时刻（收消息自检；0 = 从未）——跨重启保留 */
   lastInboundAt: number;
+  /**
+   * 当前对话指针：直发消息默认进这个 chat（不看活跃时间窗）。
+   * 空串 = 无指针；失效时由路由侧清掉再走活跃数兜底。
+   */
+  currentChatTaskId: string;
+  /**
+   * 飞书侧「已结束」的对话（清理卡「结束」按钮点过的；app 数据不动）。
+   * listActiveChatTasks 会过滤掉这些；回复其旧卡片（锚定命中）= 复活（移出集合）。
+   */
+  endedChatTaskIds: string[];
 }
 
 const emptyStore = (): BridgeStateStore => ({
   lastP2pChatId: "",
   processedMessageIds: [],
   lastInboundAt: 0,
+  currentChatTaskId: "",
+  endedChatTaskIds: [],
 });
 
 // ----------------- 写队列（挂 globalThis，对齐 enqueueLark） -----------------
@@ -72,6 +87,15 @@ const readStore = async (): Promise<BridgeStateStore> => {
         : [],
       lastInboundAt:
         typeof parsed.lastInboundAt === "number" ? parsed.lastInboundAt : 0,
+      currentChatTaskId:
+        typeof parsed.currentChatTaskId === "string"
+          ? parsed.currentChatTaskId
+          : "",
+      endedChatTaskIds: Array.isArray(parsed.endedChatTaskIds)
+        ? parsed.endedChatTaskIds.filter(
+            (x): x is string => typeof x === "string",
+          )
+        : [],
     };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
@@ -123,6 +147,57 @@ export const rememberP2pChatId = async (chatId: string): Promise<void> => {
 export const getLastP2pChatId = async (): Promise<string> => {
   const store = await readStore();
   return store.lastP2pChatId;
+};
+
+/**
+ * 记下「当前对话」指针（空串 = 清除）。
+ * 走写队列 RMW；同值幂等跳过写盘。
+ */
+export const setCurrentChatTaskId = async (taskId: string): Promise<void> => {
+  const next = typeof taskId === "string" ? taskId : "";
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    if (store.currentChatTaskId === next) return;
+    await writeStore({ ...store, currentChatTaskId: next });
+  });
+};
+
+/** 读当前对话指针（空串 = 无） */
+export const getCurrentChatTaskId = async (): Promise<string> => {
+  return (await readStore()).currentChatTaskId;
+};
+
+/** 标记对话为飞书侧「已结束」；去重 + FIFO 淘汰 */
+export const addEndedChatTaskId = async (taskId: string): Promise<void> => {
+  if (!taskId) return;
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    const next = store.endedChatTaskIds.filter((id) => id !== taskId);
+    next.push(taskId);
+    while (next.length > ENDED_CHAT_IDS_MAX) next.shift();
+    await writeStore({ ...store, endedChatTaskIds: next });
+  });
+};
+
+/**
+ * 复活：把对话移出「已结束」集合（回复旧卡片锚定命中时调）。
+ * 不在集合内则幂等跳过写盘。
+ */
+export const removeEndedChatTaskId = async (taskId: string): Promise<void> => {
+  if (!taskId) return;
+  return enqueueBridgeStateWrite(async () => {
+    const store = await readStore();
+    if (!store.endedChatTaskIds.includes(taskId)) return;
+    await writeStore({
+      ...store,
+      endedChatTaskIds: store.endedChatTaskIds.filter((id) => id !== taskId),
+    });
+  });
+};
+
+/** 读「已结束」对话集合 */
+export const getEndedChatTaskIds = async (): Promise<string[]> => {
+  return (await readStore()).endedChatTaskIds;
 };
 
 /** 是否已处理过该 message_id */

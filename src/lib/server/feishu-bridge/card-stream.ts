@@ -77,8 +77,8 @@ export const closeUnclosedCodeFence = (text: string): string => {
 // **不超过 20 字符**——askId/questionId/optionId 直拼必超长，改用短哈希；
 // 真实 id 走按钮 value 回传，element_id 只用于卡片布局定位。
 
-/** djb2 → base36，约 7 字符 */
-const shortHash = (s: string): string => {
+/** djb2 → base36，约 7 字符（element_id ≤20 字符基建、清理卡等静态卡共用） */
+export const shortHash = (s: string): string => {
   let h = 5381;
   for (let i = 0; i < s.length; i++) {
     h = ((h << 5) + h + s.charCodeAt(i)) | 0;

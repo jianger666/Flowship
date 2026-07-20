@@ -4,6 +4,8 @@
  * 处理 card.action.trigger：
  * - kind=ask → 选项答题（对齐 ask-inject / ask-reply chat 分支）
  * - kind=retry → 重发上一条用户消息（handleChatReplyInject）
+ * - kind=end_chat / end_all → 清理卡「结束」（飞书侧出局、app 数据不动）
+ * - kind=cmd → 控制面板快捷按钮（等价 /new 无参 / 直发 /stop / /status）
  *
  * 坑 #11：lark-cli 长连接由 SDK 自动 ack（见报告）；本模块只做业务 + 卡片终态 PATCH。
  * 坑 #12：operator 必须是应用 owner（本人），他人点转发卡片一律丢弃。
@@ -18,21 +20,39 @@ import {
   deliverChatAskReply,
   hasChatSession,
 } from "@/lib/server/chat-runner";
+import { stopTaskAgent } from "@/lib/server/stop-task";
 import { getTask } from "@/lib/server/task-fs";
 import {
   PERSIST_WARNING_DELIVERED,
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 
+import {
+  addEndedChatTaskId,
+  getCurrentChatTaskId,
+  setCurrentChatTaskId,
+} from "./bridge-state";
 import { findTaskByMessageId } from "./card-map";
 import { nextCardSequence } from "./card-seq";
 import { askOptionElementId, askQuestionElementId } from "./card-stream";
 import {
+  execCleanupCard,
+  execNewChatNoArgs,
+  execStatusText,
+} from "./commands";
+import {
+  buildCleanupCardEndedAllJson,
+  endChatButtonElementId,
+  endChatRowElementId,
+} from "./control-cards";
+import {
   batchUpdateCard,
   getBotAppInfo,
   sendTextMessage,
+  updateCardEntity,
 } from "./lark-api";
 import {
+  listActiveChatTasks,
   loadBridgeBootContext,
   registerCardActionHandler,
 } from "./router";
@@ -179,6 +199,19 @@ export const parseCardButtonValue = (raw: unknown): CardButtonValue | null => {
         : {}),
     };
   }
+  if (v.kind === "end_chat") {
+    if (typeof v.taskId !== "string") return null;
+    return { kind: "end_chat", taskId: v.taskId };
+  }
+  if (v.kind === "end_all") {
+    return { kind: "end_all" };
+  }
+  if (v.kind === "cmd") {
+    if (v.command !== "new" && v.command !== "clean" && v.command !== "status") {
+      return null;
+    }
+    return { kind: "cmd", command: v.command };
+  }
   return null;
 };
 
@@ -310,6 +343,8 @@ const patchRetryDone = async (cardId: string): Promise<void> => {
 
 type AskValue = Extract<CardButtonValue, { kind: "ask" }>;
 type RetryValue = Extract<CardButtonValue, { kind: "retry" }>;
+type EndChatValue = Extract<CardButtonValue, { kind: "end_chat" }>;
+type CmdValue = Extract<CardButtonValue, { kind: "cmd" }>;
 
 /**
  * 多题语义（对齐 ask-reply）：answers 必须覆盖全部 questionId，一次投递清 pending。
@@ -450,6 +485,8 @@ const handleAskAction = async (
   }
 
   clearPendingAsk(value.taskId);
+  // 卡片答题成功 → 当前对话指针切到该卡 task（直发后续消息进同一对话）
+  void setCurrentChatTaskId(value.taskId);
 
   // 落 ask_user_reply（meta 对齐 ask-inject：askId / answers / source:"feishu"）
   const reqEvent = [...task.events]
@@ -564,6 +601,114 @@ const handleRetryAction = async (
   }
 };
 
+// ----------------- 清理卡「结束」/「全部结束」 -----------------
+
+/**
+ * 结束单个对话（飞书侧口径、app 数据不动）：
+ * 运行中先停 → 记 endedChatTaskIds（listActiveChatTasks 出局）→ 指针指向它则清。
+ * 返回标题（patch 行文案用）；task 已删也照常出局（幂等）。
+ */
+const endOneChat = async (taskId: string): Promise<string> => {
+  let title = taskId;
+  try {
+    const task = await getTask(taskId);
+    if (task) {
+      title = task.title || taskId;
+      if (task.runStatus === "running") {
+        await stopTaskAgent(task);
+      }
+    }
+  } catch (err) {
+    // 停失败不阻断出局——用户意图是「别再进这个对话」
+    warnLark("endOneChat stop", err);
+  }
+  try {
+    await addEndedChatTaskId(taskId);
+  } catch (err) {
+    warnLark("addEndedChatTaskId", err);
+  }
+  try {
+    if ((await getCurrentChatTaskId()) === taskId) {
+      await setCurrentChatTaskId("");
+    }
+  } catch (err) {
+    warnLark("clearPointer(endOneChat)", err);
+  }
+  return title;
+};
+
+/** 「结束」按钮：出局 + 该行 patch 成「已结束：xxx」（删按钮、行文案替换） */
+const handleEndChatAction = async (
+  value: EndChatValue,
+  messageId: string,
+): Promise<void> => {
+  const title = await endOneChat(value.taskId);
+  // 清理卡出卡时以 taskId 空串记了 card-map——按 messageId 反查 cardId
+  const cardId = await resolveCardId(messageId);
+  if (!cardId) return;
+  const rowId = endChatRowElementId(value.taskId);
+  try {
+    await batchUpdateCard(
+      cardId,
+      [
+        {
+          action: "delete_elements",
+          params: { element_ids: [endChatButtonElementId(value.taskId)] },
+        },
+        {
+          action: "update_element",
+          params: {
+            element_id: rowId,
+            element: {
+              tag: "markdown",
+              element_id: rowId,
+              content: `已结束：${title}`,
+            },
+          },
+        },
+      ],
+      nextOutOfBandSeq(cardId),
+    );
+  } catch (err) {
+    warnLark("patchEndChat", err);
+  }
+};
+
+/** 「全部结束」：点击时重算活跃集合逐个出局，整卡换成「已全部结束（N 个）」 */
+const handleEndAllAction = async (messageId: string): Promise<void> => {
+  // 不吃卡片快照：出卡后可能又有新对话活跃，以点击时口径为准
+  const active = await listActiveChatTasks();
+  for (const t of active) {
+    await endOneChat(t.id);
+  }
+  const cardId = await resolveCardId(messageId);
+  if (!cardId) return;
+  try {
+    await updateCardEntity(
+      cardId,
+      buildCleanupCardEndedAllJson(active.length),
+      nextOutOfBandSeq(cardId),
+    );
+  } catch (err) {
+    warnLark("patchEndAll", err);
+  }
+};
+
+// ----------------- 控制面板快捷按钮 -----------------
+
+/** 面板按钮 → 等价命令流程（commands 导出的共用执行体） */
+const handleCmdAction = async (value: CmdValue): Promise<void> => {
+  if (value.command === "new") {
+    await execNewChatNoArgs();
+    return;
+  }
+  if (value.command === "clean") {
+    await execCleanupCard();
+    return;
+  }
+  await execStatusText();
+};
+
 // ----------------- 入口 -----------------
 
 /**
@@ -605,6 +750,18 @@ export const handleCardActionEvent = async (raw: unknown): Promise<void> => {
     }
     if (value.kind === "retry") {
       await handleRetryAction(value, norm.messageId);
+      return;
+    }
+    if (value.kind === "end_chat") {
+      await handleEndChatAction(value, norm.messageId);
+      return;
+    }
+    if (value.kind === "end_all") {
+      await handleEndAllAction(norm.messageId);
+      return;
+    }
+    if (value.kind === "cmd") {
+      await handleCmdAction(value);
     }
   } catch (err) {
     console.warn(

@@ -310,6 +310,19 @@ export const sendCardMessage = async (
   return extractSendResult(rec);
 };
 
+/**
+ * 发一张静态交互卡（清理卡 / 控制面板卡）：建卡实体 → 发 interactive 消息。
+ * 与流式卡（card-stream）不同：一次成型、不开 streaming_mode。
+ */
+export const sendInteractiveCard = async (
+  openId: string,
+  cardJson: unknown,
+): Promise<SendMessageResult & { card_id: string }> => {
+  const created = await createCardEntity(cardJson);
+  const sent = await sendCardMessage(openId, created.card_id);
+  return { ...sent, card_id: created.card_id };
+};
+
 const extractSendResult = (rec: JsonRecord): SendMessageResult => {
   const data = asRecord(rec.data) ?? rec;
   const chatId =

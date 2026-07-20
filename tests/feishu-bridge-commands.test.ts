@@ -1,18 +1,30 @@
 /**
- * 飞书桥接命令词：定位分支 / 回执文案 / 异常
+ * 飞书桥接命令词：/help 面板卡 / /stop 双语义（锚定停运行、直发清理卡）/ 回执文案 / 异常
  */
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   __resetCommandsRegisteredForTest,
   __setCommandsDepsForTest,
-  buildHistoryRounds,
   ensureBridgeCommandsRegistered,
-  resolveCommandTargetTask,
 } from "@/lib/server/feishu-bridge/commands";
+import {
+  buildCleanupCardJson,
+  buildHelpPanelCardJson,
+} from "@/lib/server/feishu-bridge/control-cards";
 import { __clearBridgeCommandsForTest } from "@/lib/server/feishu-bridge/router";
 import type { FeishuInboundMessage } from "@/lib/server/feishu-bridge/types";
-import type { TaskEvent, TaskSummary } from "@/lib/types";
+import type { TaskSummary } from "@/lib/types";
+
+// runCmd 走 routeInboundMessage、指针层会读写真实 bridge-state 文件——隔离到独立 tmp。
+// bridge-state 的数据目录在每次调用时才解析 env、import 后再设也生效。
+process.env.FLOWSHIP_DATA_DIR = path.join(
+  os.tmpdir(),
+  `feishu-bridge-commands-${Date.now()}`,
+  "data",
+);
 
 const baseMsg = (
   overrides: Partial<FeishuInboundMessage> = {},
@@ -44,99 +56,57 @@ const mockTask = (overrides: Partial<TaskSummary> = {}): TaskSummary =>
     ...overrides,
   }) as TaskSummary;
 
-describe("buildHistoryRounds", () => {
-  it("按 user_reply→assistant_message 成轮并取最近 n", () => {
-    const events: TaskEvent[] = [
-      { id: "1", ts: 1, kind: "user_reply", text: "u1" },
-      { id: "2", ts: 2, kind: "assistant_message", text: "a1" },
-      { id: "3", ts: 3, kind: "user_reply", text: "u2" },
-      { id: "4", ts: 4, kind: "assistant_message", text: "a2" },
-      { id: "5", ts: 5, kind: "user_reply", text: "u3" },
-      { id: "6", ts: 6, kind: "assistant_message", text: "a3" },
-    ];
-    expect(buildHistoryRounds(events, 2)).toEqual([
-      { user: "u2", assistant: "a2" },
-      { user: "u3", assistant: "a3" },
-    ]);
-  });
-});
+// ----------------- 静态卡构建（纯函数、无 mock） -----------------
 
-describe("resolveCommandTargetTask", () => {
-  const findByRoot = vi.fn();
-  const listActive = vi.fn();
-  const getTask = vi.fn();
-
-  beforeEach(() => {
-    findByRoot.mockReset();
-    listActive.mockReset();
-    getTask.mockReset();
-    __setCommandsDepsForTest({
-      findTaskByMessageId: findByRoot,
-      listActiveChatTasks: listActive,
-      getTask,
-    });
-  });
-
-  afterEach(() => {
-    __setCommandsDepsForTest(null);
-  });
-
-  it("root_id 命中 card-map → 该 task", async () => {
-    findByRoot.mockResolvedValue({
-      messageId: "om_card",
-      cardId: "c1",
-      taskId: "task-anchored",
-      createdAt: Date.now(),
-    });
-    getTask.mockResolvedValue({
-      id: "task-anchored",
-      title: "锚定对话",
-      mode: "chat",
-      repoStatus: "developing",
-      runStatus: "running",
-      updatedAt: Date.now(),
-      createdAt: Date.now(),
-      repoPaths: [],
-      currentActionId: null,
-      mrs: [],
-      actions: [],
-      events: [],
-    });
-    const r = await resolveCommandTargetTask(
-      baseMsg({ root_id: "om_card" }),
+describe("control-cards 构建", () => {
+  it("清理卡：每行标题+状态、当前指针标注、结束/全部结束按钮协议", () => {
+    const card = buildCleanupCardJson(
+      [
+        { id: "task-a", title: "对话 A", runStatus: "idle" },
+        { id: "task-b", title: "对话 B", runStatus: "running" },
+      ],
+      "task-b",
     );
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.task.id).toBe("task-anchored");
+    const json = JSON.stringify(card);
+    expect(json).toContain("**对话 A**（空闲）");
+    // 当前指针对话标「← 当前」
+    expect(json).toContain("**对话 B**（跑步中） ← 当前");
+    expect(json).toContain('{"kind":"end_chat","taskId":"task-a"}');
+    expect(json).toContain('{"kind":"end_chat","taskId":"task-b"}');
+    expect(json).toContain('{"kind":"end_all"}');
+    expect(json).toContain("全部结束");
+    // 静态卡不开流式
+    expect(json).not.toContain("streaming_mode");
   });
 
-  it("无 root、活跃唯一 → 直接用", async () => {
-    findByRoot.mockResolvedValue(null);
-    listActive.mockResolvedValue([mockTask()]);
-    const r = await resolveCommandTargetTask(baseMsg());
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.task.id).toBe("task-1");
-  });
-
-  it("多个活跃 → 提示回复卡片", async () => {
-    listActive.mockResolvedValue([
-      mockTask({ id: "a", title: "A" }),
-      mockTask({ id: "b", title: "B" }),
-    ]);
-    const r = await resolveCommandTargetTask(baseMsg());
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.message).toContain("进行中的对话");
-  });
-
-  it("零活跃 → 没有进行中的对话", async () => {
-    listActive.mockResolvedValue([]);
-    const r = await resolveCommandTargetTask(baseMsg());
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.message).toBe("没有进行中的对话");
+  it("控制面板卡：命令说明 + 三颗 cmd 快捷按钮", () => {
+    const card = buildHelpPanelCardJson("/new — 开新对话");
+    const json = JSON.stringify(card);
+    expect(json).toContain("/new — 开新对话");
+    expect(json).toContain('{"kind":"cmd","command":"new"}');
+    expect(json).toContain('{"kind":"cmd","command":"clean"}');
+    expect(json).toContain('{"kind":"cmd","command":"status"}');
+    expect(json).toContain("开新对话");
+    expect(json).toContain("清理对话");
+    expect(json).toContain("桥接状态");
   });
 });
+
+// ----------------- 命令注册 + 行为 -----------------
 
 describe("ensureBridgeCommandsRegistered", () => {
   const sendText = vi.fn(async () => ({ chat_id: "c", message_id: "m" }));
+  const sendCard = vi.fn<
+    (
+      openId: string,
+      cardJson: unknown,
+    ) => Promise<{ chat_id: string; message_id: string; card_id: string }>
+  >(async () => ({
+    chat_id: "c",
+    message_id: "om_card_sent",
+    card_id: "card_sent",
+  }));
+  const rememberCard = vi.fn(async () => undefined);
   const listActive = vi.fn(async () => [mockTask()]);
   const getStatus = vi.fn(() => ({
     overall: "running" as const,
@@ -173,20 +143,26 @@ describe("ensureBridgeCommandsRegistered", () => {
     currentActionId: null,
     mrs: [],
     actions: [],
-    events: [
-      { id: "1", ts: 1, kind: "user_reply" as const, text: "你好" },
-      { id: "2", ts: 2, kind: "assistant_message" as const, text: "你好呀" },
-    ],
+    events: [],
   }));
   const stopAgent = vi.fn(async () => ({
     hadAgent: true,
     task: {} as never,
   }));
-  const compact = vi.fn(async () => ({} as never));
   const findByRoot = vi.fn(async () => null);
+  const getPointer = vi.fn(async () => "");
+  const revive = vi.fn(async () => undefined);
+  // 锚定解析：直接取消息自带 root_id（避免真实实现的 REST 反查）
+  const resolveAnchors = vi.fn(async (msg: FeishuInboundMessage) =>
+    msg.root_id ? [msg.root_id] : [],
+  );
 
   /** 经 routeInboundMessage 走命令扩展点（handler 已 ensure 注册） */
-  const runCmd = async (command: string, args = "") => {
+  const runCmd = async (
+    command: string,
+    args = "",
+    msgOverrides: Partial<FeishuInboundMessage> = {},
+  ) => {
     const { routeInboundMessage, __setRouterDepsForTest } = await import(
       "@/lib/server/feishu-bridge/router"
     );
@@ -220,22 +196,30 @@ describe("ensureBridgeCommandsRegistered", () => {
       prewarmTaskWorkspace: () => undefined,
     });
     await routeInboundMessage(
-      baseMsg({ content: `/${command}${args ? ` ${args}` : ""}` }),
+      baseMsg({
+        content: `/${command}${args ? ` ${args}` : ""}`,
+        ...msgOverrides,
+      }),
     );
     __setRouterDepsForTest(null);
   };
 
   beforeEach(() => {
     sendText.mockClear();
+    sendCard.mockClear();
+    rememberCard.mockClear();
     listActive.mockClear();
     getStatus.mockClear();
     createChat.mockClear();
     handleChat.mockClear();
     getTask.mockClear();
     stopAgent.mockClear();
-    compact.mockClear();
     findByRoot.mockClear();
     findByRoot.mockResolvedValue(null);
+    getPointer.mockClear();
+    getPointer.mockResolvedValue("");
+    revive.mockClear();
+    resolveAnchors.mockClear();
     listActive.mockResolvedValue([mockTask()]);
     __clearBridgeCommandsForTest();
     __resetCommandsRegisteredForTest();
@@ -245,6 +229,8 @@ describe("ensureBridgeCommandsRegistered", () => {
         ownerOpenId: "ou_owner",
       }),
       sendTextMessage: sendText,
+      sendInteractiveCard: sendCard as never,
+      rememberCardMessage: rememberCard,
       listActiveChatTasks: listActive,
       getBridgeRuntimeStatus: getStatus,
       findTaskByMessageId: findByRoot,
@@ -258,7 +244,9 @@ describe("ensureBridgeCommandsRegistered", () => {
       handleChatReplyInject: handleChat as never,
       getTask: getTask as never,
       stopTaskAgent: stopAgent as never,
-      compactChatSession: compact as never,
+      resolveReplyAnchorIds: resolveAnchors,
+      reviveChatByAnchor: revive,
+      getCurrentChatTaskId: getPointer,
     });
     ensureBridgeCommandsRegistered();
   });
@@ -269,28 +257,27 @@ describe("ensureBridgeCommandsRegistered", () => {
     __resetCommandsRegisteredForTest();
   });
 
-  it("/help 回逐行带说明的清单", async () => {
+  it("/help 发控制面板卡（命令说明 + 三颗快捷按钮）", async () => {
     await runCmd("help");
-    // T8：每个命令一行、带一句说明
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringContaining("命令清单："),
-    );
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringMatching(/\/new \[消息\] — .+\n/),
-    );
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringMatching(/\/stop — .+/),
-    );
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringMatching(/\/history \[n\] — .+/),
-    );
+    expect(sendCard).toHaveBeenCalledTimes(1);
+    const [openId, cardJson] = sendCard.mock.calls[0]!;
+    expect(openId).toBe("ou_owner");
+    const json = JSON.stringify(cardJson);
+    expect(json).toMatch(/\/new \[消息\] — /);
+    expect(json).toMatch(/\/stop — /);
+    expect(json).toMatch(/\/status — /);
+    // /history /compact /list 已砍——面板不再出现
+    expect(json).not.toContain("/history");
+    expect(json).not.toContain("/compact");
+    expect(json).not.toContain("/list");
+    expect(json).toContain('{"kind":"cmd","command":"new"}');
+    expect(json).toContain('{"kind":"cmd","command":"clean"}');
+    expect(json).toContain('{"kind":"cmd","command":"status"}');
+    // 面板卡不记 card-map
+    expect(rememberCard).not.toHaveBeenCalled();
   });
 
-  // T8 用户拍板：Get = 消息真进了 AI——命令 handled 只回文本、不点表情
+  // T8 用户拍板：Get = 消息真进了 AI——命令 handled 只回文本/卡片、不点表情
   it("命令 handled → inject 记 skipped（不点 Get）", async () => {
     const { onInjectResult, __clearInjectResultListenersForTest } =
       await import("@/lib/server/feishu-bridge/router");
@@ -301,23 +288,6 @@ describe("ensureBridgeCommandsRegistered", () => {
     await runCmd("help");
     expect(results.at(-1)?.kind).toBe("skipped");
     __clearInjectResultListenersForTest();
-  });
-
-  it("/list 有活跃时列标题+runStatus（中文）", async () => {
-    await runCmd("list");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      "1. 测试对话（空闲）",
-    );
-  });
-
-  it("/list 空 → 没有进行中的对话", async () => {
-    listActive.mockResolvedValueOnce([]);
-    await runCmd("list");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      "没有进行中的对话",
-    );
   });
 
   it("/status 紧凑几行（overall 中文）", async () => {
@@ -348,22 +318,37 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("/stop 运行中：停止并提示对话可继续", async () => {
-    // 默认 mock runStatus=idle——本用例覆盖成 running 走真停止分支
+  it("回复锚定 + /stop 运行中：停止那个对话 + 触发复活语义", async () => {
+    findByRoot.mockResolvedValue({
+      messageId: "om_old_card",
+      cardId: "c1",
+      taskId: "task-1",
+      createdAt: Date.now(),
+    } as never);
     getTask.mockResolvedValueOnce({
       ...(await getTask()),
       runStatus: "running",
     } as never);
-    await runCmd("stop");
+    await runCmd("stop", "", { root_id: "om_old_card" });
     expect(stopAgent).toHaveBeenCalled();
+    // 锚定命中 → 复活 + 指针切换（reviveChatByAnchor 同源语义）
+    expect(revive).toHaveBeenCalledWith("task-1");
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
       expect.stringContaining("已停止当前运行：测试对话"),
     );
+    // 有锚定不发清理卡
+    expect(sendCard).not.toHaveBeenCalled();
   });
 
-  it("/stop 空闲：不调 stopTaskAgent、回「没有在运行」", async () => {
-    await runCmd("stop");
+  it("回复锚定 + /stop 空闲：不调 stopTaskAgent、回「没有在运行」", async () => {
+    findByRoot.mockResolvedValue({
+      messageId: "om_old_card",
+      cardId: "c1",
+      taskId: "task-1",
+      createdAt: Date.now(),
+    } as never);
+    await runCmd("stop", "", { root_id: "om_old_card" });
     expect(stopAgent).not.toHaveBeenCalled();
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
@@ -371,34 +356,53 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("/compact 调用 compactChatSession", async () => {
-    await runCmd("compact");
-    expect(compact).toHaveBeenCalledWith("task-1");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      "已压缩：测试对话",
-    );
-  });
-
-  it("/history 发轮次摘要", async () => {
-    await runCmd("history");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringMatching(/你：你好[\s\S]*AI：你好呀/),
-    );
-  });
-
-  it("多活跃时 /stop 提示而非执行", async () => {
+  it("直发 /stop（无锚定）→ 发对话清理卡 + 记 card-map（taskId 空串）", async () => {
+    getPointer.mockResolvedValue("task-1");
     listActive.mockResolvedValueOnce([
-      mockTask({ id: "a", title: "A" }),
-      mockTask({ id: "b", title: "B" }),
+      mockTask(),
+      mockTask({ id: "task-2", title: "另一个" }),
     ]);
     await runCmd("stop");
     expect(stopAgent).not.toHaveBeenCalled();
+    expect(sendCard).toHaveBeenCalledTimes(1);
+    const json = JSON.stringify(sendCard.mock.calls[0]![1]);
+    expect(json).toContain("测试对话");
+    expect(json).toContain("另一个");
+    // 当前指针对话标注
+    expect(json).toContain("← 当前");
+    expect(json).toContain('{"kind":"end_all"}');
+    // 记 card-map：taskId 空串（只供 card-action 反查 cardId、不参与锚定路由）
+    expect(rememberCard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "om_card_sent",
+        cardId: "card_sent",
+        taskId: "",
+      }),
+    );
+  });
+
+  it("直发 /stop 零活跃 → 文本「没有进行中的对话」", async () => {
+    listActive.mockResolvedValueOnce([]);
+    await runCmd("stop");
+    expect(sendCard).not.toHaveBeenCalled();
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
-      expect.stringContaining("回复对应对话的卡片"),
+      "没有进行中的对话",
     );
+  });
+
+  // /history /compact /list 已砍——未注册命令 + 非本机 skill → 当普通文本放行（走注入主路径）
+  it("/compact /history /list 不再注册为命令、按普通文本处理", async () => {
+    await runCmd("compact");
+    await runCmd("history");
+    await runCmd("list");
+    for (const text of ["/compact", "/history", "/list"]) {
+      expect(handleChat).toHaveBeenCalledWith(
+        "task-1",
+        expect.objectContaining({ text }),
+        expect.anything(),
+      );
+    }
   });
 
   it("异常 → 命令执行失败 + inject 记 failed（非 sent）", async () => {
@@ -408,13 +412,19 @@ describe("ensureBridgeCommandsRegistered", () => {
     onInjectResult((p) => {
       results.push(p);
     });
-    // idle 会在 stopAgent 之前短路——覆盖成 running 才走到异常分支
+    // 锚定 + running 才走到 stopAgent 异常分支
+    findByRoot.mockResolvedValue({
+      messageId: "om_old_card",
+      cardId: "c1",
+      taskId: "task-1",
+      createdAt: Date.now(),
+    } as never);
     getTask.mockResolvedValueOnce({
       ...(await getTask()),
       runStatus: "running",
     } as never);
     stopAgent.mockRejectedValueOnce(new Error("boom"));
-    await runCmd("stop");
+    await runCmd("stop", "", { root_id: "om_old_card" });
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
       "命令执行失败：boom",
@@ -440,26 +450,6 @@ describe("ensureBridgeCommandsRegistered", () => {
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
       expect.stringContaining("首条注入失败"),
-    );
-    expect(results.at(-1)?.kind).toBe("failed");
-    __clearInjectResultListenersForTest();
-  });
-
-  it("/compact 失败 → handled_failed", async () => {
-    const { onInjectResult, __clearInjectResultListenersForTest } =
-      await import("@/lib/server/feishu-bridge/router");
-    const { CompactChatError } = await import("@/lib/server/chat-runner");
-    const results: Array<{ kind: string }> = [];
-    onInjectResult((p) => {
-      results.push(p);
-    });
-    compact.mockRejectedValueOnce(
-      new CompactChatError("no_session", "无可用会话或 agent 正在回", 400),
-    );
-    await runCmd("compact");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      "命令执行失败：无可用会话或 agent 正在回",
     );
     expect(results.at(-1)?.kind).toBe("failed");
     __clearInjectResultListenersForTest();

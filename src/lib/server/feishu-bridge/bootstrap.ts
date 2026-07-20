@@ -12,7 +12,7 @@
  * 各模块自带 globalThis 幂等，这里只负责「一处调齐」：
  * - outbound：全局 tap 订阅 chat 事件流 → 流式卡片
  * - card-action：卡片按钮回调（ask 答题 / 错误重试）
- * - commands：/stop /compact /new /list /history /status /help
+ * - commands：/stop /new /list /status /help
  * - reactions：注入结果 emoji 回执（Get / Typing / CrossMark）
  * - inbound runtime：consumer 守护 + keep-awake + 30s 开关轮询
  *

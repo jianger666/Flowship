@@ -8,7 +8,10 @@
 /** 卡片 header 配色模板（Hermes 全态：思考 indigo、生成 blue、成功 green、失败 red、等待 orange、停止 grey） */
 export type CardHeaderTemplate = "blue" | "green" | "red" | "orange" | "purple" | "indigo" | "wathet" | "turquoise" | "yellow" | "grey";
 
-/** ask_user 选项按钮 / 错误重试按钮内嵌的 value 结构 */
+/** 控制面板卡快捷按钮对应的命令（等价文本命令：/new 无参 / 直发 /stop / /status） */
+export type PanelCommand = "new" | "clean" | "status";
+
+/** ask_user 选项 / 重试 / 清理卡 / 控制面板按钮内嵌的 value 结构 */
 export type CardButtonValue =
   | {
       /** 答题卡选项 */
@@ -24,6 +27,20 @@ export type CardButtonValue =
       taskId: string;
       /** 可选：便于回调侧拼提示，不依赖也可重发 */
       lastUserMessage?: string;
+    }
+  | {
+      /** 清理卡「结束」——该对话飞书侧出局（app 数据不动） */
+      kind: "end_chat";
+      taskId: string;
+    }
+  | {
+      /** 清理卡「全部结束」——点击时重算活跃集合、全部出局 */
+      kind: "end_all";
+    }
+  | {
+      /** 控制面板快捷按钮——按 command 分发到对应命令流程 */
+      kind: "cmd";
+      command: PanelCommand;
     };
 
 /** 入向 im.message.receive_v1 精简后的消息（consumer 解析 NDJSON 后的形态） */

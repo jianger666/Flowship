@@ -1,22 +1,28 @@
 /**
  * 飞书侧命令词全套（决策 #13 / #17 / #21 + 矩阵命令行）
  *
- * /help /list /status /new /stop /compact /history
- * 回执一律 sendTextMessage(owner)；文案一句话 / 简洁列表。
+ * /help（控制面板卡）/new /stop（直发 = 清理卡、回复锚定 = 停运行）/status
+ * （/history /compact /list 已砍——使用频率极低、清理入口并进 /stop 卡、2026-07-20 用户拍板）
+ * 文本回执走 sendTextMessage(owner)；清理卡 / 面板卡走 sendInteractiveCard。
  */
 
 import { handleChatReplyInject } from "@/lib/server/chat-inject";
-import {
-  compactChatSession,
-  CompactChatError,
-} from "@/lib/server/chat-runner";
 import { stopTaskAgent } from "@/lib/server/stop-task";
 import { getTask } from "@/lib/server/task-fs";
-import type { Task, TaskEvent, TaskSummary } from "@/lib/types";
+import type { Task } from "@/lib/types";
 
-import { findTaskByMessageId } from "./card-map";
+import { getCurrentChatTaskId } from "./bridge-state";
+import { findTaskByMessageId, rememberCardMessage } from "./card-map";
+import {
+  buildCleanupCardJson,
+  buildHelpPanelCardJson,
+} from "./control-cards";
 import { getBridgeRuntimeStatus } from "./inbound";
-import { getBotAppInfo, sendTextMessage } from "./lark-api";
+import {
+  getBotAppInfo,
+  sendInteractiveCard,
+  sendTextMessage,
+} from "./lark-api";
 import {
   createChatTaskForBridge,
   listActiveChatTasks,
@@ -25,23 +31,20 @@ import {
   type BridgeCommandContext,
   type BridgeCommandHandler,
   resolveReplyAnchorIds,
+  reviveChatByAnchor,
   sendTaskBoundText,
 } from "./router";
 
-/** T8 用户点名：逐行带一句说明（欢迎语只指到 /help、不重复整段） */
+/**
+ * 命令清单文本版（控制面板卡正文；欢迎语只指到 /help、不重复整段）。
+ * T8 用户点名：逐行带一句说明。
+ */
 const HELP_TEXT = [
-  "命令清单：",
   "/new [消息] — 开新对话（可带首条消息）",
-  "/list — 列出进行中的对话",
-  "/history [n] — 最近 n 轮对话摘要（默认 3）",
-  "/stop — 停止当前对话的运行（回复卡片可指定）",
-  "/compact — 压缩会话上下文",
+  "/stop — 直发弹对话清理卡；回复卡片则停那个对话的运行",
   "/status — 桥接运行状态",
-  "/help — 本清单",
+  "/help — 本面板",
 ].join("\n");
-
-const HISTORY_TEXT_MAX = 200;
-const HISTORY_DEFAULT_ROUNDS = 3;
 
 const REG_KEY = "__flowshipFeishuBridgeCommandsV1__";
 
@@ -58,35 +61,43 @@ const getReg = (): CommandsGlobal => {
 type CommandsDeps = {
   getBotAppInfo: typeof getBotAppInfo;
   sendTextMessage: typeof sendTextMessage;
+  sendInteractiveCard: typeof sendInteractiveCard;
   listActiveChatTasks: typeof listActiveChatTasks;
   getBridgeRuntimeStatus: typeof getBridgeRuntimeStatus;
   findTaskByMessageId: typeof findTaskByMessageId;
+  /** 清理卡出卡后记 card-map（taskId 空串、仅供 card-action 反查 cardId patch） */
+  rememberCardMessage: typeof rememberCardMessage;
   createChatTaskForBridge: typeof createChatTaskForBridge;
   loadBridgeBootContext: typeof loadBridgeBootContext;
   handleChatReplyInject: typeof handleChatReplyInject;
   getTask: typeof getTask;
   stopTaskAgent: typeof stopTaskAgent;
-  compactChatSession: typeof compactChatSession;
   /** 回复锚定解析（事件缺 root/parent 时 REST 反查）——与 router 注入侧同源 */
   resolveReplyAnchorIds: typeof resolveReplyAnchorIds;
   /** task 绑定类回执（记 card-map、回复它可锚定）——与 router 同源 */
   sendTaskBoundText: typeof sendTaskBoundText;
+  /** 锚定命中的复活 + 指针切换——与 router 同源 */
+  reviveChatByAnchor: typeof reviveChatByAnchor;
+  getCurrentChatTaskId: typeof getCurrentChatTaskId;
 };
 
 let deps: CommandsDeps = {
   getBotAppInfo,
   sendTextMessage,
+  sendInteractiveCard,
   listActiveChatTasks,
   getBridgeRuntimeStatus,
   findTaskByMessageId,
+  rememberCardMessage,
   createChatTaskForBridge,
   loadBridgeBootContext,
   handleChatReplyInject,
   getTask,
   stopTaskAgent,
-  compactChatSession,
   resolveReplyAnchorIds,
   sendTaskBoundText,
+  reviveChatByAnchor,
+  getCurrentChatTaskId,
 };
 
 /** 单测替换；传 null 恢复 */
@@ -97,17 +108,20 @@ export const __setCommandsDepsForTest = (
     deps = {
       getBotAppInfo,
       sendTextMessage,
+      sendInteractiveCard,
       listActiveChatTasks,
       getBridgeRuntimeStatus,
       findTaskByMessageId,
+      rememberCardMessage,
       createChatTaskForBridge,
       loadBridgeBootContext,
       handleChatReplyInject,
       getTask,
       stopTaskAgent,
-      compactChatSession,
       resolveReplyAnchorIds,
       sendTaskBoundText,
+      reviveChatByAnchor,
+      getCurrentChatTaskId,
     };
     return;
   }
@@ -138,14 +152,6 @@ const withCommandError = (
   };
 };
 
-/** runStatus → 中文（/list） */
-const RUN_STATUS_ZH: Record<string, string> = {
-  running: "跑步中",
-  awaiting_user: "等你回复",
-  idle: "空闲",
-  error: "出错",
-};
-
 /** bridge overall → 中文（/status） */
 const OVERALL_ZH: Record<string, string> = {
   running: "运行中",
@@ -155,121 +161,94 @@ const OVERALL_ZH: Record<string, string> = {
   error: "出错",
 };
 
-const zhRunStatus = (s: string): string => RUN_STATUS_ZH[s] ?? s;
 const zhOverall = (s: string): string => OVERALL_ZH[s] ?? s;
 
-// ----------------- 定位目标 chat（与 router 注入语义对齐） -----------------
-
-export type ResolveTargetResult =
-  | { ok: true; task: TaskSummary }
-  | { ok: false; message: string };
-
-/** Task → 列表摘要（命令定位用，不暴露 events） */
-const taskToSummary = (full: Task): TaskSummary => {
-  const { events, actions, ...rest } = full;
-  void events;
-  return {
-    ...rest,
-    actionCount: actions?.length ?? 0,
-  };
-};
+// ----------------- 回复锚定定位（/stop 保留原语义用） -----------------
 
 /**
- * 回复锚定 root_id → 活跃唯一 → 多个提示 / 零个提示。
- * router 里同款逻辑是内联的；命令侧抽 helper 复用 card-map + listActive。
+ * 只按「回复锚定」定位目标对话；命中即触发复活语义（出 ended 集合 + 指针切过去）。
+ * 无锚定返 null——直发 /stop 走清理卡、不再做指针 / 活跃数兜底定位。
  */
-export const resolveCommandTargetTask = async (
+const resolveReplyAnchoredTask = async (
   msg: BridgeCommandContext["msg"],
-): Promise<ResolveTargetResult> => {
+): Promise<Task | null> => {
   // 与注入侧同源的锚定解析：事件流 NDJSON 不带 root/parent（实证见 router），
   // 缺失时 REST 反查——否则「回复卡片发命令」永远 miss
   for (const anchorId of await deps.resolveReplyAnchorIds(msg)) {
     const hit = await deps.findTaskByMessageId(anchorId);
-    if (hit) {
-      const full = await deps.getTask(hit.taskId);
-      if (full) return { ok: true, task: taskToSummary(full) };
+    // 清理卡等「非 task 绑定」条目 taskId 为空串——不当锚定
+    if (!hit?.taskId) continue;
+    const full = await deps.getTask(hit.taskId);
+    if (full) {
+      await deps.reviveChatByAnchor(full.id);
+      return full;
     }
   }
-
-  const active = await deps.listActiveChatTasks();
-  if (active.length === 1) return { ok: true, task: active[0]! };
-  if (active.length === 0) {
-    return { ok: false, message: "没有进行中的对话" };
-  }
-  // 不带编号：编号会误导用户「回个数字」（序号选择已拍板不做）——
-  // 正确操作是长按/右键对应对话的卡片用「回复」再发命令
-  const lines = active.map((t) => `· ${t.title || t.id}`);
-  return {
-    ok: false,
-    message: `有 ${active.length} 个进行中的对话。请用「回复」功能回复对应对话的卡片，再发命令：\n${lines.join("\n")}`,
-  };
+  return null;
 };
 
-// ----------------- /history 摘要 -----------------
-
-const truncate = (s: string, max: number): string => {
-  const t = s.replace(/\s+/g, " ").trim();
-  if (t.length <= max) return t;
-  return `${t.slice(0, max)}…`;
-};
+// ----------------- 共用执行流程（命令词与面板按钮共用） -----------------
 
 /**
- * 一轮 = user_reply 起，到下一条 user_reply 前的最后一条 assistant_message。
- * 取最近 n 轮。
+ * /new 无参 = 面板「开新对话」：新建 chat（createChatTaskForBridge 内已把指针切过去）+ 回执。
  */
-export const buildHistoryRounds = (
-  events: TaskEvent[],
-  n: number,
-): Array<{ user: string; assistant: string }> => {
-  const rounds: Array<{ user: string; assistant: string }> = [];
-  let cur: { user: string; assistant: string } | null = null;
-  for (const e of events) {
-    if (e.kind === "user_reply") {
-      if (cur) rounds.push(cur);
-      cur = { user: e.text || "", assistant: "" };
-    } else if (e.kind === "assistant_message" && cur) {
-      cur.assistant = e.text || "";
-    }
+export const execNewChatNoArgs = async (): Promise<
+  "handled" | "handled_failed"
+> => {
+  const title = `飞书对话 ${new Date().toLocaleString("zh-CN")}`;
+  const created = await deps.createChatTaskForBridge(title);
+  if ("error" in created) {
+    await replyOwner(`命令执行失败：${created.error}`);
+    return "handled_failed";
   }
-  if (cur) rounds.push(cur);
-  const take = Math.max(1, n);
-  return rounds.slice(-take);
-};
-
-const formatHistory = (
-  rounds: Array<{ user: string; assistant: string }>,
-): string => {
-  if (rounds.length === 0) return "暂无对话记录";
-  return rounds
-    .map((r, i) => {
-      const u = truncate(r.user || "（空）", HISTORY_TEXT_MAX);
-      const a = truncate(r.assistant || "（尚未回复）", HISTORY_TEXT_MAX);
-      return `${i + 1}. 你：${u}\n   AI：${a}`;
-    })
-    .join("\n");
-};
-
-// ----------------- 各命令 -----------------
-
-const cmdHelp: BridgeCommandHandler = async () => {
-  await replyOwner(HELP_TEXT);
+  await deps.sendTaskBoundText(
+    created.taskId,
+    `已开新对话：${created.title}，直接发消息开聊`,
+  );
   return "handled";
 };
 
-const cmdList: BridgeCommandHandler = async () => {
+/**
+ * 直发 /stop = 面板「清理对话」：发对话清理卡（每行「结束」+ 底部「全部结束」）。
+ * 没有进行中对话时回文本。
+ */
+export const execCleanupCard = async (): Promise<"handled"> => {
   const active = await deps.listActiveChatTasks();
   if (active.length === 0) {
     await replyOwner("没有进行中的对话");
     return "handled";
   }
-  const lines = active.map(
-    (t, i) => `${i + 1}. ${t.title || t.id}（${zhRunStatus(t.runStatus)}）`,
+  let currentId = "";
+  try {
+    currentId = await deps.getCurrentChatTaskId();
+  } catch {
+    // 读指针失败 → 不标「当前」、卡片仍可用
+  }
+  const info = await deps.getBotAppInfo();
+  const sent = await deps.sendInteractiveCard(
+    info.ownerOpenId,
+    buildCleanupCardJson(active, currentId),
   );
-  await replyOwner(lines.join("\n"));
+  // taskId 空串 = 不参与回复锚定路由；只为 card-action 按 messageId 反查 cardId 做 patch
+  try {
+    await deps.rememberCardMessage({
+      messageId: sent.message_id,
+      cardId: sent.card_id,
+      taskId: "",
+      createdAt: Date.now(),
+    });
+  } catch (err) {
+    // 记录失败只影响按钮点击后的卡片 patch（结束动作本身仍会执行）——降级 warn
+    console.warn(
+      "[feishu-bridge/commands] 清理卡记 card-map 失败:",
+      err instanceof Error ? err.message : err,
+    );
+  }
   return "handled";
 };
 
-const cmdStatus: BridgeCommandHandler = async () => {
+/** /status = 面板「桥接状态」：状态文本回执 */
+export const execStatusText = async (): Promise<"handled"> => {
   const st = deps.getBridgeRuntimeStatus();
   const lines = [
     `桥接：${zhOverall(st.overall)}${st.enabled ? "" : "（开关关）"}`,
@@ -282,26 +261,30 @@ const cmdStatus: BridgeCommandHandler = async () => {
   return "handled";
 };
 
+// ----------------- 各命令 -----------------
+
+/** /help → 控制面板卡（命令说明 + 开新对话 / 清理对话 / 桥接状态三颗快捷按钮） */
+const cmdHelp: BridgeCommandHandler = async () => {
+  const info = await deps.getBotAppInfo();
+  // 面板卡不需要 patch 终态、也无路由意义——不记 card-map
+  await deps.sendInteractiveCard(
+    info.ownerOpenId,
+    buildHelpPanelCardJson(HELP_TEXT),
+  );
+  return "handled";
+};
+
+const cmdStatus: BridgeCommandHandler = async () => execStatusText();
+
 const cmdNew: BridgeCommandHandler = async (ctx) => {
   const first = ctx.args.trim();
-  const title = first
-    ? first.length > 20
-      ? `${first.slice(0, 20)}…`
-      : first
-    : `飞书对话 ${new Date().toLocaleString("zh-CN")}`;
+  if (!first) return execNewChatNoArgs();
 
+  const title = first.length > 20 ? `${first.slice(0, 20)}…` : first;
   const created = await deps.createChatTaskForBridge(title);
   if ("error" in created) {
     await replyOwner(`命令执行失败：${created.error}`);
     return "handled_failed";
-  }
-
-  if (!first) {
-    await deps.sendTaskBoundText(
-      created.taskId,
-      `已开新对话：${created.title}，直接发消息开聊`,
-    );
-    return "handled";
   }
 
   const boot = await deps.loadBridgeBootContext();
@@ -339,84 +322,35 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
   return "handled";
 };
 
+/**
+ * /stop 双语义（2026-07-20 用户拍板）：
+ * - 回复某卡片 + /stop → 停那个对话正在跑的回复（原语义）
+ * - 直发 /stop → 对话清理卡（结束/全部结束按钮、飞书侧出局）
+ */
 const cmdStop: BridgeCommandHandler = async (ctx) => {
-  const target = await resolveCommandTargetTask(ctx.msg);
-  if (!target.ok) {
-    await replyOwner(target.message);
-    return "handled";
-  }
-  const full = await deps.getTask(target.task.id);
-  if (!full) {
-    await replyOwner("命令执行失败：任务不存在");
-    return "handled_failed";
-  }
+  const anchored = await resolveReplyAnchoredTask(ctx.msg);
+  if (!anchored) return execCleanupCard();
+
   // T10 用户反馈：/stop 语义是「停正在运行的那次回复」——idle 时没东西可停，
   // 回「已停止」会误导成对话被关了；明确区分两种回执
-  const name = target.task.title || target.task.id;
-  if ((full as Task).runStatus !== "running") {
+  const name = anchored.title || anchored.id;
+  if (anchored.runStatus !== "running") {
     await replyOwner(`「${name}」当前没有在运行的回复，无需停止`);
     return "handled";
   }
-  await deps.stopTaskAgent(full as Task);
+  await deps.stopTaskAgent(anchored);
   await replyOwner(`已停止当前运行：${name}（对话仍在，发消息可继续）`);
-  return "handled";
-};
-
-const cmdCompact: BridgeCommandHandler = async (ctx) => {
-  const target = await resolveCommandTargetTask(ctx.msg);
-  if (!target.ok) {
-    await replyOwner(target.message);
-    return "handled";
-  }
-  try {
-    await deps.compactChatSession(target.task.id);
-    await replyOwner(`已压缩：${target.task.title || target.task.id}`);
-  } catch (err) {
-    if (err instanceof CompactChatError) {
-      await replyOwner(`命令执行失败：${err.message}`);
-      return "handled_failed";
-    }
-    throw err;
-  }
-  return "handled";
-};
-
-const cmdHistory: BridgeCommandHandler = async (ctx) => {
-  const target = await resolveCommandTargetTask(ctx.msg);
-  if (!target.ok) {
-    await replyOwner(target.message);
-    return "handled";
-  }
-  let n = HISTORY_DEFAULT_ROUNDS;
-  if (ctx.args.trim()) {
-    const parsed = Number.parseInt(ctx.args.trim(), 10);
-    if (!Number.isFinite(parsed) || parsed < 1) {
-      await replyOwner("命令执行失败：/history 参数应为正整数");
-      return "handled_failed";
-    }
-    n = Math.min(parsed, 20);
-  }
-  const full = await deps.getTask(target.task.id);
-  if (!full) {
-    await replyOwner("命令执行失败：任务不存在");
-    return "handled_failed";
-  }
-  const rounds = buildHistoryRounds(full.events ?? [], n);
-  await replyOwner(formatHistory(rounds));
   return "handled";
 };
 
 const COMMANDS: Array<[string, BridgeCommandHandler]> = [
   ["help", cmdHelp],
-  ["list", cmdList],
   ["status", cmdStatus],
   ["new", cmdNew],
   ["stop", cmdStop],
-  ["compact", cmdCompact],
-  ["history", cmdHistory],
 ];
 
-/** 注册七个命令（globalThis 幂等）；启动链由主线调 */
+/** 注册四个命令（globalThis 幂等）；启动链由主线调 */
 export const ensureBridgeCommandsRegistered = (): void => {
   const reg = getReg();
   if (reg.registered) return;

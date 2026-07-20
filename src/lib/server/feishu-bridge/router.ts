@@ -24,6 +24,12 @@ import { isValidModel } from "@/lib/server/route-helpers";
 import type { TaskSummary } from "@/lib/types";
 
 import { injectPendingAskText } from "./ask-inject";
+import {
+  getCurrentChatTaskId,
+  getEndedChatTaskIds,
+  removeEndedChatTaskId,
+  setCurrentChatTaskId,
+} from "./bridge-state";
 import { findTaskByMessageId, rememberCardMessage } from "./card-map";
 import {
   downloadMessageResource,
@@ -39,7 +45,11 @@ import type { FeishuInboundMessage } from "./types";
 export const SKIP_NOT_P2P = "非 p2p";
 export const SKIP_NOT_OWNER = "非本人消息";
 
-const ACTIVE_CHAT_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * 「进行中」活跃窗（仅 /list 展示 + 指针失效后的活跃数兜底）。
+ * 直发路由优先走「当前对话指针」，不受本窗限制——上午聊的下午直发仍进指针对话。
+ */
+const ACTIVE_CHAT_WINDOW_MS = 2 * 60 * 60 * 1000;
 const MAX_IMAGES = 6;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 30 * 1024 * 1024;
@@ -615,25 +625,101 @@ export const parseInboundContent = async (
   };
 };
 
-// ----------------- 活跃 chat / 新建 -----------------
+// ----------------- 活跃 chat / 新建 / 当前对话指针 -----------------
 
-/** 活跃 chat：mode=chat、非终态（merged/abandoned）、24h 内有更新 */
+/**
+ * 可路由的 chat（指针校验用）：mode=chat、非终态。
+ * 与 isActiveChatTask 的差别：不看活跃时间窗。
+ */
+export const isRoutableChatTask = (t: TaskSummary): boolean => {
+  if (t.mode !== "chat") return false;
+  if (t.repoStatus === "merged" || t.repoStatus === "abandoned") return false;
+  return true;
+};
+
+/**
+ * 「进行中」活跃 chat：可路由 + 活跃窗内有更新。
+ * 仅影响 /list 与指针失效后的活跃数兜底；指针直发不走本判定。
+ */
 export const isActiveChatTask = (
   t: TaskSummary,
   now = Date.now(),
 ): boolean => {
-  if (t.mode !== "chat") return false;
-  if (t.repoStatus === "merged" || t.repoStatus === "abandoned") return false;
+  if (!isRoutableChatTask(t)) return false;
   const updated = typeof t.updatedAt === "number" ? t.updatedAt : 0;
   return now - updated <= ACTIVE_CHAT_WINDOW_MS;
 };
 
 export const listActiveChatTasks = async (): Promise<TaskSummary[]> => {
   const all = await deps.listTasks();
+  // 飞书侧「已结束」的对话（清理卡按过「结束」）不算进行中——app 数据不动、只影响桥接口径
+  const ended = new Set(await getEndedChatTaskIds());
   const now = Date.now();
   return all
-    .filter((t) => isActiveChatTask(t, now))
+    .filter((t) => isActiveChatTask(t, now) && !ended.has(t.id))
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+};
+
+/** 刷当前对话指针；失败静默（不影响注入主路径） */
+const touchCurrentChatPointer = async (taskId: string): Promise<void> => {
+  if (!taskId) return;
+  try {
+    await setCurrentChatTaskId(taskId);
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/router] 刷当前对话指针失败:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+};
+
+/**
+ * 回复锚定命中 = 用户明确指回该对话——**复活语义**：
+ * 若对话曾被清理卡「结束」（进了 endedChatTaskIds），回复它的旧卡片即重新激活
+ * （移出 ended 集合）+ 当前指针切过去。router 直发与命令锚定共用。
+ */
+export const reviveChatByAnchor = async (taskId: string): Promise<void> => {
+  if (!taskId) return;
+  try {
+    await removeEndedChatTaskId(taskId);
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/router] 复活 ended 对话失败:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  await touchCurrentChatPointer(taskId);
+};
+
+/**
+ * 读指针并校验 task 仍可路由；失效则清指针后返 undefined。
+ * 不看活跃时间窗——上午指针对下午直发仍有效。
+ */
+const resolveCurrentChatPointer = async (): Promise<string | undefined> => {
+  let pointerId = "";
+  try {
+    pointerId = await getCurrentChatTaskId();
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/router] 读当前对话指针失败:",
+      err instanceof Error ? err.message : err,
+    );
+    return undefined;
+  }
+  if (!pointerId) return undefined;
+  const all = await deps.listTasks();
+  const hit = all.find((t) => t.id === pointerId);
+  if (hit && isRoutableChatTask(hit)) return hit.id;
+  // 删了 / 终态 → 清指针再走活跃数兜底
+  try {
+    await setCurrentChatTaskId("");
+  } catch (err) {
+    console.warn(
+      "[feishu-bridge/router] 清失效指针失败:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return undefined;
 };
 
 const titleFromMessage = (text: string): string => {
@@ -695,6 +781,8 @@ export const createChatTaskForBridge = async (
       boot.disabledMcpServers.length > 0 ? boot.disabledMcpServers : undefined,
   });
   deps.prewarmTaskWorkspace(task.id);
+  // /new 与 0 活跃自动建：新对话立刻成为当前指针
+  await touchCurrentChatPointer(task.id);
   return { taskId: task.id, title: task.title };
 };
 
@@ -982,14 +1070,21 @@ export const routeInboundMessage = async (
     return { kind: "skipped", messageId: msg.message_id, error: "空消息" };
   }
 
-  // 4) 定位 taskId：回复锚定（root_id / parent_id 依次查 card-map）优先于活跃 chat 分支
+  // 4) 定位 taskId：回复锚定 > 当前对话指针（不看活跃窗）> 活跃数兜底
   let taskId: string | undefined;
   for (const anchorId of await resolveReplyAnchorIds(msg)) {
     const hit = await deps.findTaskByMessageId(anchorId);
-    if (hit) {
+    // 清理卡等「非 task 绑定」提示的 card-map 条目 taskId 为空串——不当锚定
+    if (hit?.taskId) {
       taskId = hit.taskId;
+      // 锚定命中：被「结束」过的对话回复旧卡片即复活 + 指针切过去
+      await reviveChatByAnchor(taskId);
       break;
     }
+  }
+
+  if (!taskId) {
+    taskId = await resolveCurrentChatPointer();
   }
 
   if (!taskId) {
@@ -1031,6 +1126,9 @@ export const routeInboundMessage = async (
       };
     }
   }
+
+  // 直发进某对话（含回复锚定 / 指针 / 活跃兜底 / 新建）→ 刷指针（幂等）
+  await touchCurrentChatPointer(taskId);
 
   // 5) 注入
   const boot = await loadBridgeBootContext();

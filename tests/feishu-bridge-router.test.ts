@@ -7,6 +7,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  __resetBridgeStateForTest,
+  addEndedChatTaskId,
+  getCurrentChatTaskId,
+  getEndedChatTaskIds,
+  setCurrentChatTaskId,
+} from "@/lib/server/feishu-bridge/bridge-state";
+import {
   __clearBridgeCommandsForTest,
   __setRouterDepsForTest,
   isActiveChatTask,
@@ -18,6 +25,14 @@ import {
 } from "@/lib/server/feishu-bridge/router";
 import type { FeishuInboundMessage } from "@/lib/server/feishu-bridge/types";
 import type { TaskSummary } from "@/lib/types";
+
+// 指针路由读写真实 bridge-state 文件——隔离到独立 tmp、避免污染 cwd/data。
+// bridge-state 的数据目录在每次调用时才解析 env、import 后再设也生效。
+process.env.FLOWSHIP_DATA_DIR = path.join(
+  os.tmpdir(),
+  `feishu-bridge-router-${Date.now()}`,
+  "data",
+);
 
 const baseMsg = (
   overrides: Partial<FeishuInboundMessage> = {},
@@ -294,16 +309,17 @@ describe("parseInboundContent 文件消息双形态", () => {
 });
 
 describe("isActiveChatTask", () => {
-  it("mode=chat + developing + 24h 内 = 活跃", () => {
+  it("mode=chat + developing + 2h 内 = 活跃", () => {
     const t = mockTask();
     expect(isActiveChatTask(t)).toBe(true);
   });
   it("终态 / 过期 / 非 chat 不活跃", () => {
     expect(isActiveChatTask(mockTask({ repoStatus: "abandoned" }))).toBe(false);
     expect(isActiveChatTask(mockTask({ mode: "task" }))).toBe(false);
+    // 活跃窗已缩到 2h：3h 前更新不再算「进行中」（指针路由仍可进）
     expect(
       isActiveChatTask(
-        mockTask({ updatedAt: Date.now() - 25 * 60 * 60 * 1000 }),
+        mockTask({ updatedAt: Date.now() - 3 * 60 * 60 * 1000 }),
       ),
     ).toBe(false);
   });
@@ -351,7 +367,8 @@ describe("routeInboundMessage", () => {
   );
   const results: Array<{ kind: string }> = [];
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await __resetBridgeStateForTest();
     sendText.mockClear();
     handleChat.mockClear();
     injectAsk.mockClear();
@@ -401,10 +418,11 @@ describe("routeInboundMessage", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     __setRouterDepsForTest(null);
     onInjectResult(null);
     __clearBridgeCommandsForTest();
+    await __resetBridgeStateForTest();
   });
 
   it("非 p2p / 非本人 → skipped", async () => {
@@ -439,6 +457,140 @@ describe("routeInboundMessage", () => {
     );
     // 事件自带锚定 id 时不反查 REST
     expect(larkApiMock).not.toHaveBeenCalled();
+  });
+
+  it("回复锚定命中 → 刷新当前对话指针", async () => {
+    findByRoot.mockResolvedValueOnce({
+      messageId: "om_card",
+      cardId: "c1",
+      taskId: "task-anchored",
+      createdAt: Date.now(),
+    });
+    await routeInboundMessage(baseMsg({ root_id: "om_card", content: "续" }));
+    expect(await getCurrentChatTaskId()).toBe("task-anchored");
+  });
+
+  it("直发走当前对话指针 → 多活跃也不提示", async () => {
+    // 指针指向超过 2h 的对话仍可直进（不看活跃窗）
+    await setCurrentChatTaskId("task-stale");
+    listTasks.mockResolvedValue([
+      mockTask({ id: "task-other", title: "另一个" }),
+      mockTask({
+        id: "task-stale",
+        title: "过期但仍可指针",
+        updatedAt: Date.now() - 3 * 60 * 60 * 1000,
+      }),
+      mockTask({ id: "task-third", title: "第三个" }),
+    ]);
+    const r = await routeInboundMessage(baseMsg({ content: "下午继续" }));
+    expect(r.kind).toBe("sent");
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-stale",
+      expect.objectContaining({ text: "下午继续" }),
+      expect.anything(),
+    );
+    expect(sendText).not.toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("进行中的对话"),
+    );
+    expect(await getCurrentChatTaskId()).toBe("task-stale");
+  });
+
+  it("指针失效（删了/终态）→ 清指针后走活跃数兜底", async () => {
+    await setCurrentChatTaskId("task-gone");
+    listTasks.mockResolvedValue([
+      mockTask({ id: "a", title: "A" }),
+      mockTask({ id: "b", title: "B" }),
+    ]);
+    const r = await routeInboundMessage(baseMsg({ content: "哪一个" }));
+    expect(r.kind).toBe("skipped");
+    expect(handleChat).not.toHaveBeenCalled();
+    expect(await getCurrentChatTaskId()).toBe("");
+    expect(sendText).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("进行中的对话"),
+    );
+  });
+
+  it("指针指向终态 task → 清指针后走兜底", async () => {
+    await setCurrentChatTaskId("task-dead");
+    listTasks.mockResolvedValue([
+      mockTask({
+        id: "task-dead",
+        title: "已弃",
+        repoStatus: "abandoned",
+      }),
+      mockTask({ id: "task-only", title: "唯一活跃" }),
+    ]);
+    await routeInboundMessage(baseMsg({ content: "继续" }));
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-only",
+      expect.objectContaining({ text: "继续" }),
+      expect.anything(),
+    );
+    expect(await getCurrentChatTaskId()).toBe("task-only");
+  });
+
+  it("0 活跃自动新建 → 指针指向新对话", async () => {
+    listTasks.mockResolvedValueOnce([]);
+    await routeInboundMessage(baseMsg({ content: "全新话题" }));
+    expect(await getCurrentChatTaskId()).toBe("task-new");
+  });
+
+  it("ended 对话不算进行中：直发走剩余唯一活跃、不提示多对话", async () => {
+    // 清理卡「结束」过 task-ended → 活跃口径出局，剩 task-live 唯一
+    await addEndedChatTaskId("task-ended");
+    listTasks.mockResolvedValue([
+      mockTask({ id: "task-ended", title: "已结束的" }),
+      mockTask({ id: "task-live", title: "还活着的" }),
+    ]);
+    const r = await routeInboundMessage(baseMsg({ content: "继续聊" }));
+    expect(r.kind).toBe("sent");
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-live",
+      expect.objectContaining({ text: "继续聊" }),
+      expect.anything(),
+    );
+  });
+
+  it("ended 对话复活：回复旧卡片锚定命中 → 出 ended 集合 + 指针切换", async () => {
+    await addEndedChatTaskId("task-revive");
+    findByRoot.mockResolvedValueOnce({
+      messageId: "om_old_card",
+      cardId: "c9",
+      taskId: "task-revive",
+      createdAt: Date.now(),
+    });
+    const r = await routeInboundMessage(
+      baseMsg({ root_id: "om_old_card", content: "再聊聊这个" }),
+    );
+    expect(r.kind).toBe("sent");
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-revive",
+      expect.objectContaining({ text: "再聊聊这个" }),
+      expect.anything(),
+    );
+    // 复活：移出 ended + 指针切过去
+    expect(await getEndedChatTaskIds()).not.toContain("task-revive");
+    expect(await getCurrentChatTaskId()).toBe("task-revive");
+  });
+
+  it("回复清理卡（card-map taskId 空串）→ 不当锚定、走兜底", async () => {
+    findByRoot.mockResolvedValueOnce({
+      messageId: "om_cleanup_card",
+      cardId: "card_cleanup",
+      taskId: "",
+      createdAt: Date.now(),
+    });
+    // 唯一活跃 task-1 → 兜底直进
+    await routeInboundMessage(
+      baseMsg({ root_id: "om_cleanup_card", content: "回在清理卡上" }),
+    );
+    expect(handleChat).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ text: "回在清理卡上" }),
+      expect.anything(),
+    );
   });
 
   it("只有 parent_id 也能锚定（root_id 缺失）", async () => {
