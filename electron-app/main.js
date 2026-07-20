@@ -1701,9 +1701,10 @@ if (!app.requestSingleInstanceLock()) {
               },
             ],
           },
-          { role: "editMenu" },
-          { role: "viewMenu" },
-          { role: "windowMenu" },
+          // role 菜单默认英文、覆盖中文 label（子项仍是系统行为）
+          { role: "editMenu", label: "编辑" },
+          { role: "viewMenu", label: "显示" },
+          { role: "windowMenu", label: "窗口" },
         ]),
       );
     }
