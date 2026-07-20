@@ -18,8 +18,9 @@
  * 现在只有「需要你行动」才亮：等你审阅（awaiting_ack）或 agent 提问等答案（action 还 running）。
  * chat 静息（你一句我一句的正常状态）不亮。
  *
- * 2026-07-20 grok 化（chat 行专属、task 行不回归）：可选重命名（双击标题 / 菜单）、
- * 置顶区上/下移、相对时间副行。task（工作台）行保持原样：静息单行只标题、活跃才出监控行。
+ * 2026-07-20 grok 化（chat 行专属、task 行不回归）：可选重命名（菜单）、
+ * 置顶区上/下移、相对时间（标题同行靠右、hover 让位给按钮——副行占高被用户否）。
+ * task（工作台）行保持原样：静息单行只标题、活跃才出监控行。
  */
 
 import Link from "next/link";
@@ -169,7 +170,7 @@ interface TaskListItemProps {
   deleteDisabled?: boolean;
   // 传则行尾出置顶按钮（已置顶常显高亮、未置顶 hover 出；切换由调用方处理）
   onPin?: (task: TaskSummary) => void;
-  // 侧栏重命名（双击标题 / 菜单「重命名」）；不传则无入口
+  // 侧栏重命名（菜单「重命名」；双击入口已砍——误触且会先导航）；不传则无入口
   onRename?: (task: TaskSummary) => void;
   // 置顶区内上/下移；仅置顶组分发
   pinReorder?: PinReorderControls;
@@ -217,12 +218,6 @@ export const TaskListItem = ({
       <Link
         href={`/tasks/${task.id}`}
         onClick={onNavigate}
-        onDoubleClick={(e) => {
-          // 双击标题区重命名：仍会先导航一次，对话框叠在详情上可接受
-          if (!onRename) return;
-          e.preventDefault();
-          onRename(task);
-        }}
         className={cn(
           "flex min-w-0 items-start gap-2 rounded-md py-1.5 pl-3 text-sm no-underline transition-colors",
           prClass,
@@ -236,12 +231,23 @@ export const TaskListItem = ({
           <LeadingIndicator task={task} seenAt={seenAt} />
         </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-          {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
-          <Tooltip content={task.title}>
-            <span className="min-w-0 truncate leading-tight">{task.title}</span>
-          </Tooltip>
-          {/* task 活跃态：阶段 · 状态；chat：相对时间；其余单行只标题 */}
-          {stageLine ? (
+          <span className="flex min-w-0 items-baseline gap-1.5">
+            {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
+            <Tooltip content={task.title}>
+              <span className="min-w-0 flex-1 truncate leading-tight">
+                {task.title}
+              </span>
+            </Tooltip>
+            {/* chat 相对时间：与标题同行靠右（2026-07-20 用户拍板——副行太占高度）；
+                hover 时行尾按钮浮现、时间让位隐藏 */}
+            {subtitle && (
+              <span className="shrink-0 text-[10px] leading-none text-muted-foreground/60 transition-opacity group-hover/item:opacity-0">
+                {subtitle}
+              </span>
+            )}
+          </span>
+          {/* task 活跃态：阶段 · 状态；其余单行只标题 */}
+          {stageLine && (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">
               <span className="min-w-0 truncate text-muted-foreground/70">
                 {stageLine.stage}
@@ -249,11 +255,7 @@ export const TaskListItem = ({
               <span className="text-muted-foreground/40">·</span>
               <span className={TONE_CLASS[stageLine.tone]}>{stageLine.status}</span>
             </span>
-          ) : subtitle ? (
-            <span className="min-w-0 truncate text-[11px] leading-none text-muted-foreground/70">
-              {subtitle}
-            </span>
-          ) : null}
+          )}
         </span>
       </Link>
       {hasActions && (
