@@ -22,3 +22,6 @@ __pycache__/
 
 .DS_Store
 *.log
+
+# 真机冒烟调试产物（含真实 openId/chat_id 等标识、公开仓不入库）
+scripts/.smoke-*.json
