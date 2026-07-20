@@ -225,12 +225,12 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
     [sorted, pinnedOrder],
   );
 
-  // 侧栏重命名：复用 chat-view 同源 updateTaskFields + prompt
+  // 侧栏重命名（仅 chat 行有入口）：复用 chat-view 同源 updateTaskFields + prompt
   const handleRename = async (task: TaskSummary) => {
     const next = await prompt({
-      title: mode === "chat" ? "重命名对话" : "重命名任务",
+      title: "重命名对话",
       defaultValue: task.title,
-      placeholder: mode === "chat" ? "对话名称" : "任务名称",
+      placeholder: "对话名称",
       validate: (v) => (v.trim() ? "" : "名称不能为空"),
     });
     if (next === null || next.trim() === task.title) return;
@@ -290,7 +290,8 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
       active={t.id === activeId}
       onPin={handlePin}
       onDelete={handleDelete}
-      onRename={handleRename}
+      // 重命名是 grok 化的 chat 专属入口；task（工作台）行保持改造前无菜单
+      onRename={mode === "chat" ? handleRename : undefined}
       deleteDisabled={deletingIds.has(t.id)}
       pinReorder={
         opts?.pinReorder &&

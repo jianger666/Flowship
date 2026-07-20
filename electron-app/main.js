@@ -695,9 +695,14 @@ const createTray = () => {
       click: () => quitAppForReal(),
     },
   ]);
-  appTray.setContextMenu(menu);
-  // Windows：左键单击托盘图标恢复窗口（mac 菜单栏惯例是右键出菜单、不绑 click）
-  if (process.platform === "win32") {
+  // 左键单击 = 直接打开主窗（2026-07-20 用户拍板「点击就打开、不要下拉」）；
+  // 菜单挂右键：mac 不能 setContextMenu（设了左键也弹菜单）、手动 popUpContextMenu
+  if (IS_MAC) {
+    appTray.on("click", () => showMainWindow());
+    appTray.on("right-click", () => appTray?.popUpContextMenu(menu));
+  } else {
+    // Windows：setContextMenu 只响应右键、左键 click 事件独立可用
+    appTray.setContextMenu(menu);
     appTray.on("click", () => showMainWindow());
   }
   log(`[tray] 已创建（${label}）`);
