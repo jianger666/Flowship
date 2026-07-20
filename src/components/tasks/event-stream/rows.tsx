@@ -556,11 +556,14 @@ const EventRowImpl = ({
               )}
             </div>
           )}
-          {/* 飞书桥接来的消息带来源标（方案决策 #1 回显细节：一眼区分「在外面发的」） */}
+          {/* 飞书桥接来的消息带来源标（方案决策 #1 回显细节：一眼区分「在外面发的」）
+              带飞书品牌蓝底衬（2026-07-20 用户反馈灰字太弱） */}
           {ev.meta?.source === "feishu" && (
-            <div className="mb-1 flex items-center gap-1 text-[11px] text-muted-foreground">
-              <MessageSquareText className="size-3" />
-              来自飞书
+            <div className="mb-1.5">
+              <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-1.5 py-0.5 text-[11px] font-medium text-sky-600 dark:text-sky-400">
+                <MessageSquareText className="size-3" />
+                来自飞书
+              </span>
             </div>
           )}
           <div className="text-sm leading-relaxed">
