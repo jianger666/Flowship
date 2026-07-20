@@ -318,30 +318,7 @@ describe("ensureBridgeCommandsRegistered", () => {
     );
   });
 
-  it("回复锚定 + /stop 运行中：停止那个对话 + 触发复活语义", async () => {
-    findByRoot.mockResolvedValue({
-      messageId: "om_old_card",
-      cardId: "c1",
-      taskId: "task-1",
-      createdAt: Date.now(),
-    } as never);
-    getTask.mockResolvedValueOnce({
-      ...(await getTask()),
-      runStatus: "running",
-    } as never);
-    await runCmd("stop", "", { root_id: "om_old_card" });
-    expect(stopAgent).toHaveBeenCalled();
-    // 锚定命中 → 复活 + 指针切换（reviveChatByAnchor 同源语义）
-    expect(revive).toHaveBeenCalledWith("task-1");
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringContaining("已停止当前运行：测试对话"),
-    );
-    // 有锚定不发清理卡
-    expect(sendCard).not.toHaveBeenCalled();
-  });
-
-  it("回复锚定 + /stop 空闲：不调 stopTaskAgent、回「没有在运行」", async () => {
+  it("回复锚定 + /stop → 同样出清理卡（单语义、锚定停运行分支已砍）", async () => {
     findByRoot.mockResolvedValue({
       messageId: "om_old_card",
       cardId: "c1",
@@ -349,11 +326,9 @@ describe("ensureBridgeCommandsRegistered", () => {
       createdAt: Date.now(),
     } as never);
     await runCmd("stop", "", { root_id: "om_old_card" });
+    // 不再走锚定停运行——一律清理卡
     expect(stopAgent).not.toHaveBeenCalled();
-    expect(sendText).toHaveBeenCalledWith(
-      "ou_owner",
-      expect.stringContaining("没有在运行的回复"),
-    );
+    expect(sendCard).toHaveBeenCalledTimes(1);
   });
 
   it("直发 /stop（无锚定）→ 发对话清理卡 + 记 card-map（taskId 空串）", async () => {
@@ -412,19 +387,9 @@ describe("ensureBridgeCommandsRegistered", () => {
     onInjectResult((p) => {
       results.push(p);
     });
-    // 锚定 + running 才走到 stopAgent 异常分支
-    findByRoot.mockResolvedValue({
-      messageId: "om_old_card",
-      cardId: "c1",
-      taskId: "task-1",
-      createdAt: Date.now(),
-    } as never);
-    getTask.mockResolvedValueOnce({
-      ...(await getTask()),
-      runStatus: "running",
-    } as never);
-    stopAgent.mockRejectedValueOnce(new Error("boom"));
-    await runCmd("stop", "", { root_id: "om_old_card" });
+    // /stop 现在只有清理卡路径——用列活跃对话抛错触发异常分支
+    listActive.mockRejectedValueOnce(new Error("boom"));
+    await runCmd("stop");
     expect(sendText).toHaveBeenCalledWith(
       "ou_owner",
       "命令执行失败：boom",

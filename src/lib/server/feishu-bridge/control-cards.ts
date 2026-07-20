@@ -140,7 +140,8 @@ export const buildHelpPanelCardJson = (
       content: helpText,
     },
     { tag: "hr", element_id: "hr_help" },
-    panelButton("new", "开新对话"),
-    panelButton("clean", "清理对话"),
-    panelButton("status", "桥接状态"),
+    // 按钮文案带指令词（2026-07-20 用户拍板）——顺带教用户下次直接打命令
+    panelButton("new", "开新对话 /new"),
+    panelButton("clean", "清理对话 /stop"),
+    panelButton("status", "桥接状态 /status"),
   ]);

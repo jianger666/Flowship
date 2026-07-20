@@ -41,7 +41,7 @@ import {
  */
 const HELP_TEXT = [
   "/new [消息] — 开新对话（可带首条消息）",
-  "/stop — 直发弹对话清理卡；回复卡片则停那个对话的运行",
+  "/stop — 弹对话清理卡（结束不要的对话）",
   "/status — 桥接运行状态",
   "/help — 本面板",
 ].join("\n");
@@ -162,30 +162,6 @@ const OVERALL_ZH: Record<string, string> = {
 };
 
 const zhOverall = (s: string): string => OVERALL_ZH[s] ?? s;
-
-// ----------------- 回复锚定定位（/stop 保留原语义用） -----------------
-
-/**
- * 只按「回复锚定」定位目标对话；命中即触发复活语义（出 ended 集合 + 指针切过去）。
- * 无锚定返 null——直发 /stop 走清理卡、不再做指针 / 活跃数兜底定位。
- */
-const resolveReplyAnchoredTask = async (
-  msg: BridgeCommandContext["msg"],
-): Promise<Task | null> => {
-  // 与注入侧同源的锚定解析：事件流 NDJSON 不带 root/parent（实证见 router），
-  // 缺失时 REST 反查——否则「回复卡片发命令」永远 miss
-  for (const anchorId of await deps.resolveReplyAnchorIds(msg)) {
-    const hit = await deps.findTaskByMessageId(anchorId);
-    // 清理卡等「非 task 绑定」条目 taskId 为空串——不当锚定
-    if (!hit?.taskId) continue;
-    const full = await deps.getTask(hit.taskId);
-    if (full) {
-      await deps.reviveChatByAnchor(full.id);
-      return full;
-    }
-  }
-  return null;
-};
 
 // ----------------- 共用执行流程（命令词与面板按钮共用） -----------------
 
@@ -323,25 +299,10 @@ const cmdNew: BridgeCommandHandler = async (ctx) => {
 };
 
 /**
- * /stop 双语义（2026-07-20 用户拍板）：
- * - 回复某卡片 + /stop → 停那个对话正在跑的回复（原语义）
- * - 直发 /stop → 对话清理卡（结束/全部结束按钮、飞书侧出局）
+ * /stop 单语义（2026-07-20 用户二次拍板：锚定「停运行」分支砍掉、不留双语义）：
+ * 无论直发还是回复卡片，一律出对话清理卡；清理卡的「结束」本身会先停运行。
  */
-const cmdStop: BridgeCommandHandler = async (ctx) => {
-  const anchored = await resolveReplyAnchoredTask(ctx.msg);
-  if (!anchored) return execCleanupCard();
-
-  // T10 用户反馈：/stop 语义是「停正在运行的那次回复」——idle 时没东西可停，
-  // 回「已停止」会误导成对话被关了；明确区分两种回执
-  const name = anchored.title || anchored.id;
-  if (anchored.runStatus !== "running") {
-    await replyOwner(`「${name}」当前没有在运行的回复，无需停止`);
-    return "handled";
-  }
-  await deps.stopTaskAgent(anchored);
-  await replyOwner(`已停止当前运行：${name}（对话仍在，发消息可继续）`);
-  return "handled";
-};
+const cmdStop: BridgeCommandHandler = async () => execCleanupCard();
 
 const COMMANDS: Array<[string, BridgeCommandHandler]> = [
   ["help", cmdHelp],
