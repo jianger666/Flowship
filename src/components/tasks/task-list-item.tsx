@@ -250,7 +250,7 @@ export const TaskListItem = ({
       {/* chat 相对时间：吸行尾右侧（与 hover 按钮同槽——hover 时按钮浮现、时间隐去），
           不挤标题宽度（标题的右 padding 本来就为按钮槽留好了） */}
       {subtitle && (
-        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[10px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0">
+        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[10px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0 group-has-[[data-popup-open]]/item:opacity-0">
           {subtitle}
         </span>
       )}
