@@ -255,7 +255,7 @@ export const Composer = ({
             aria-hidden
           />
           <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-            Home，AI 将在主目录运行
+            AI 将在 Home 目录运行
           </span>
           {session?.onBindWorkdir && (
             <button
