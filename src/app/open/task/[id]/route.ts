@@ -1,11 +1,37 @@
 /**
- * 深链跳板页：`GET /open/task/<id>`
+ * 深链跳板：`GET /open/task/<id>`
  *
- * 飞书卡片不放行自定义协议链接（flowship:// 点了没反应）——卡片里放的是本机
- * http 链接，浏览器打开本页后立即跳 flowship[-test]://tasks/<id> 唤起壳。
- * 壳已在跑 → 聚焦主窗并路由到对应对话；未跑 → 系统按协议注册拉起 app。
+ * 飞书卡片不放行自定义协议链接、Chrome 又拦「无手势的外部协议跳转」——
+ * 但本路由就跑在 app 自己的 server 进程里（同机同实例），直接由服务端执行
+ * 系统级唤起（mac `open` / win `start`）触发 flowship[-test]:// 协议，
+ * 单实例锁会聚焦已运行的壳并路由到对应对话；浏览器侧只留一个兜底按钮。
  */
+import { spawn } from "node:child_process";
+
 import { getProtocolDeepLink } from "@/lib/server/feishu-bridge/bridge-config";
+
+export const runtime = "nodejs";
+
+/** 服务端直接唤起协议 URL（分平台；失败不抛、由页面按钮兜底） */
+const openProtocolUrl = (url: string): boolean => {
+  try {
+    if (process.platform === "darwin") {
+      spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+    } else if (process.platform === "win32") {
+      // start 的第一个引号参数是窗口标题占位、URL 必须放第二个
+      spawn("cmd", ["/c", "start", "", url], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      }).unref();
+    } else {
+      spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 export const GET = async (
   _req: Request,
@@ -13,10 +39,7 @@ export const GET = async (
 ): Promise<Response> => {
   const { id } = await ctx.params;
   const target = getProtocolDeepLink(id);
-  // 中转页：自动尝试跳协议 + 大按钮兜底。
-  // Chrome 拦截「无用户手势的外部协议跳转」（静默不弹，2026-07-20 用户实测点了没反应）——
-  // 页内点击 = 新手势，按钮必达；Safari 等不拦的浏览器自动跳直接生效。
-  const targetJson = JSON.stringify(target);
+  const opened = openProtocolUrl(target);
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -29,9 +52,8 @@ a.btn:active{opacity:.8}
 </style>
 </head>
 <body>
+<p>${opened ? "已为你打开 Flowship，可关闭本页。" : "自动打开失败，点下方按钮。"}</p>
 <a class="btn" href="${target}">打开 Flowship</a>
-<p>点按钮直达对话；打开后可关闭本页。</p>
-<script>location.href=${targetJson};</script>
 </body>
 </html>`;
   return new Response(html, {
