@@ -303,12 +303,32 @@
   }
 }
 
-/* 代码块内层（padding 在 code-block-body 包裹层上、不在 pre 上）：p-4 → 收一档、
-   字号跟聊天正文对齐 */
+/* 代码块内层（padding 在 code-block-body 包裹层上、不在 pre 上）：
+   2026-07-20 用户实测再调：字号提到与聊天正文一致（0.875rem）、行距收紧、
+   内衬上下收一档（之前「字小 + 间距大」观感差） */
 .prose [data-streamdown="code-block-body"] {
-  padding: 0.75rem;
-  font-size: 0.8125rem;
-  line-height: 1.6;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+/* typography 的 .prose pre 自带 padding（≈0.857em）、与 code-block-body 的内衬叠加成
+   双层留白（用户实测「间距太大」的另一半来源）——归零、留白单源在 body 上 */
+.prose [data-streamdown="code-block"] pre {
+  padding: 0;
+  margin: 0;
+}
+/* 复制按钮悬浮行：上游按 gap-2(0.5rem) 设计 -mt-10(-2.5rem) 让它精确盖在 header 行上；
+   我们把外壳 gap 收成 0.25rem 后偏移失配 0.25rem → 按钮行连带 body 一起上移、
+   代码体顶边框被按钮压住（2026-07-20 用户实测）。按新 gap 重算：h-8(2rem)+gap(0.25rem) */
+.prose [data-streamdown="code-block"] > div:has(> [data-streamdown="code-block-actions"]) {
+  margin-top: -2.25rem;
+}
+/* 按钮药丸收紧：单按钮不需要大内衬和边框底衬 */
+.prose [data-streamdown="code-block-actions"] {
+  border: none;
+  background: transparent;
+  padding: 0.125rem;
+  gap: 0.25rem;
 }
 /* Streamdown + Shiki 双主题接法（防回归）：
  * @tailwindcss/typography 的 `.prose pre` 默认是深底浅字（--tw-prose-pre-bg ≈ gray-800），
