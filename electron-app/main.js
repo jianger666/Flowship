@@ -580,11 +580,32 @@ const showMainWindow = () => {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
-  // 关窗前是全屏 → 恢复（放在 show 之后、系统才会把它放回独立 Space）
+  // 关窗前是全屏 → 恢复（show 之后延迟一拍再全屏：立即调用系统还没把窗口放回
+  // 普通 Space、setFullScreen 会被吞——2026-07-20 用户实测恢复失败的修正）
   if (wasFullScreenBeforeHide) {
     wasFullScreenBeforeHide = false;
-    mainWindow.setFullScreen(true);
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setFullScreen(true);
+    }, 300);
   }
+};
+
+/**
+ * 收进托盘（Cmd/Ctrl+W 专用；2026-07-20 用户拍板与「点 X」分家）：
+ * 全屏窗先退全屏、等 leave-full-screen 再 hide（直接 hide 会被系统踢出 Space）。
+ */
+const hideMainWindowToTray = () => {
+  if (!mainWindow) return;
+  void saveWindowState();
+  if (mainWindow.isFullScreen()) {
+    wasFullScreenBeforeHide = true;
+    hideAfterLeaveFullScreen = true;
+    mainWindow.setFullScreen(false);
+    log("[main] Cmd/Ctrl+W（全屏）→ 先退全屏再 hide");
+    return;
+  }
+  mainWindow.hide();
+  log("[main] Cmd/Ctrl+W → hide（Tray 常驻）");
 };
 
 /**
@@ -762,25 +783,41 @@ const createWindow = async () => {
   // 不亮窗——等页面 IPC `app-content-ready`（首页真实内容渲出来：看板 / 就绪清单）
   // 才亮主窗 + 收 splash；见 revealMainWindow / whenReady 里的兜底 timer
   //
-  // 关窗行为（决策 #19）：非真退出 → preventDefault + hide（Tray 常驻）；
-  // 真退出（Tray「退出」/ Cmd+Q / 自更新 quitAndInstall·applyStagedUpdate 已置 quitting）
-  // → 放行 close，配合 before-quit 杀 server + mac 套用暂存更新。
+  // 关窗行为（2026-07-20 用户拍板改版、mac/win 同款）：
+  // - Cmd/Ctrl+W → 收进托盘（mac 走自定义菜单加速键、win 走 before-input-event）
+  // - 点 X / Alt+F4（close 事件）→ 二次确认、确认后真退出
+  // - 真退出（Tray「退出」/ Cmd+Q / 自更新，quitting 已置位）→ 放行 close
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (process.platform === "darwin") return; // mac 由应用菜单接管 Cmd+W
+    if (input.type !== "keyDown") return;
+    if ((input.key || "").toLowerCase() !== "w") return;
+    if (!input.control || input.alt || input.shift || input.meta) return;
+    event.preventDefault();
+    hideMainWindowToTray();
+  });
+  let closeConfirmShowing = false;
   mainWindow.on("close", (event) => {
     void saveWindowState();
-    if (!quitting) {
-      event.preventDefault();
-      // 全屏窗不能直接 hide（会被系统踢出 Space、再 show 变非全屏）——
-      // 先退全屏、等 leave-full-screen 事件里再 hide，并记录以便 show 时恢复
-      if (mainWindow.isFullScreen()) {
-        wasFullScreenBeforeHide = true;
-        hideAfterLeaveFullScreen = true;
-        mainWindow.setFullScreen(false);
-        log("[main] 关窗（全屏）→ 先退全屏再 hide");
-        return;
-      }
-      mainWindow.hide();
-      log("[main] 关窗 → hide（Tray 常驻；真退出走菜单/Cmd+Q）");
-    }
+    if (quitting) return;
+    event.preventDefault();
+    if (closeConfirmShowing) return;
+    closeConfirmShowing = true;
+    void dialog
+      .showMessageBox(mainWindow, {
+        type: "question",
+        buttons: ["关闭", "取消"],
+        defaultId: 1,
+        cancelId: 1,
+        message: `确定关闭 ${IS_TEST ? "FlowshipTest" : "Flowship"} 吗？`,
+        detail: "后台任务与飞书桥接会一并退出；想保留后台请用 Cmd/Ctrl+W 收进托盘。",
+      })
+      .then(({ response }) => {
+        closeConfirmShowing = false;
+        if (response === 0) quitAppForReal();
+      })
+      .catch(() => {
+        closeConfirmShowing = false;
+      });
   });
   // 全屏退出动画结束后补 hide（close 拦截的全屏分支）
   mainWindow.on("leave-full-screen", () => {
@@ -1648,6 +1685,29 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     log(`[main] app 启动 version=${app.getVersion()} packaged=${app.isPackaged} userData=${app.getPath("userData")} protocol=${PROTOCOL_SCHEME}`);
+    // mac 自定义应用菜单：默认菜单的 File→Close（Cmd+W）走 close 事件、会撞上
+    // 「点 X = 二次确认退出」——把 Cmd+W 改绑「收进托盘」；其余菜单保留系统 role
+    //（editMenu 必须保留、否则 Cmd+C/V 全失效）
+    if (process.platform === "darwin") {
+      Menu.setApplicationMenu(
+        Menu.buildFromTemplate([
+          { role: "appMenu" },
+          {
+            label: "文件",
+            submenu: [
+              {
+                label: "关闭窗口",
+                accelerator: "Cmd+W",
+                click: () => hideMainWindowToTray(),
+              },
+            ],
+          },
+          { role: "editMenu" },
+          { role: "viewMenu" },
+          { role: "windowMenu" },
+        ]),
+      );
+    }
     // 注册自定义协议（正式 flowship / test flowship-test）
     registerProtocolClient();
     // Windows 冷启动：深链在首实例 process.argv（不是 open-url）
