@@ -30,6 +30,86 @@ export interface AssistantBufferCtx {
   sdkErrorMessage?: string;
 }
 
+// ----------------- tool_call running 去重（同 callId 只落一条） -----------------
+// SDK 对长 args 工具（task / edit）会流式补全 args、对同一 call_id 发多次 status=running；
+// 若不挡、events.jsonl 双写 → UI 渲染成对工具块（线上「子代理成对出现」根因）。
+const TOOL_CALL_RUNNING_SEEN_KEY = "__flowshipToolCallRunningSeenV1__";
+/** 长跑进程防无界；超限 FIFO 淘汰最旧 callId */
+const TOOL_CALL_RUNNING_SEEN_MAX = 2000;
+
+type ToolCallRunningSeen = {
+  set: Set<string>;
+  /** FIFO 插入序，与 set 同步 */
+  order: string[];
+};
+
+const getToolCallRunningSeen = (): ToolCallRunningSeen => {
+  const g = globalThis as unknown as Record<
+    string,
+    ToolCallRunningSeen | undefined
+  >;
+  if (!g[TOOL_CALL_RUNNING_SEEN_KEY]) {
+    g[TOOL_CALL_RUNNING_SEEN_KEY] = { set: new Set(), order: [] };
+  }
+  return g[TOOL_CALL_RUNNING_SEEN_KEY]!;
+};
+
+/**
+ * 标记 callId 已写过 running；返回 false = 本条应跳过写盘。
+ * completed / error 不走此门。
+ */
+const tryMarkToolCallRunningSeen = (callId: string): boolean => {
+  if (!callId) return true;
+  const state = getToolCallRunningSeen();
+  if (state.set.has(callId)) return false;
+  state.set.add(callId);
+  state.order.push(callId);
+  while (state.order.length > TOOL_CALL_RUNNING_SEEN_MAX) {
+    const oldest = state.order.shift();
+    if (oldest) state.set.delete(oldest);
+  }
+  return true;
+};
+
+/** 单测清空去重表（避免用例互相污染） */
+export const __resetToolCallRunningSeenForTest = (): void => {
+  const g = globalThis as unknown as Record<
+    string,
+    ToolCallRunningSeen | undefined
+  >;
+  g[TOOL_CALL_RUNNING_SEEN_KEY] = { set: new Set(), order: [] };
+};
+
+/** task 工具 args 默认上限放宽——短字段前置后仍要给 prompt 留展示空间 */
+const TASK_TOOL_ARGS_TRUNCATE_MAX = 2000;
+
+/**
+ * task 工具：短字段（description / model / subagentType）前置再 stringify。
+ * 原始键序常是 description→prompt→subagentType→model，prompt 动辄 500+，
+ * 默认 truncate(500) 会把尾部 model 永久截掉 → 前端徽标永远拿不到。
+ */
+const stringifyToolCallArgs = (
+  name: string,
+  args: unknown,
+): { argsStr: string; truncateMax: number } => {
+  if (
+    name === "task" &&
+    args != null &&
+    typeof args === "object" &&
+    !Array.isArray(args)
+  ) {
+    const raw = args as Record<string, unknown>;
+    const { description, model, subagentType, prompt, ...rest } = raw;
+    // JSON.stringify 按插入序；undefined 值的键自动跳过
+    const reordered = { description, model, subagentType, prompt, ...rest };
+    return {
+      argsStr: stringifyMeta(reordered),
+      truncateMax: TASK_TOOL_ARGS_TRUNCATE_MAX,
+    };
+  }
+  return { argsStr: stringifyMeta(args), truncateMax: 500 };
+};
+
 // 「写文件」类工具名白名单——只有这些工具命中 actions/ 路径才算「在写 artifact」。
 // SDK 的 read（读）和 edit（写）都用 path 参数、无法靠 args 区分读写、只能靠工具名。
 // 宁可漏标（某写工具不在表里 → 降级成「调用 X」、无害）、不可错标（read 标成「在写」= 误导）。
@@ -158,6 +238,8 @@ export const handleSdkMessage = async (
           normalizedTarget.startsWith("actions/"))
       ) {
         if (msg.status === "running") {
+          // 同 callId 的二次 running（SDK 流式补 args）跳过，避免双工具块
+          if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
           const argsStr = stringifyMeta(msg.args);
           if (!stillCurrent()) return;
           await writeOwnedEventAndPublish(
@@ -238,7 +320,12 @@ export const handleSdkMessage = async (
       }
 
       if (msg.status === "running") {
-        const argsStr = stringifyMeta(msg.args);
+        // 同 callId 的二次 running（SDK 流式补 args）跳过，避免双工具块
+        if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
+        const { argsStr, truncateMax } = stringifyToolCallArgs(
+          msg.name,
+          msg.args,
+        );
         if (!stillCurrent()) return;
         await writeOwnedEventAndPublish(
           taskId,
@@ -252,7 +339,7 @@ export const handleSdkMessage = async (
               callId: msg.call_id,
               name: msg.name,
               innerToolName: innerToolName || undefined,
-              args: argsStr ? truncate(argsStr) : undefined,
+              args: argsStr ? truncate(argsStr, truncateMax) : undefined,
             },
           },
     );

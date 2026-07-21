@@ -77,6 +77,54 @@ describe("tool-display merge / GB 折叠规则", () => {
     });
   });
 
+  it("同 callId 多条 tool_call 去重：args 取更长、id/ts 留第一条并配对 result", () => {
+    // 历史双写：SDK 对同一 call 发两次 running，落盘成两条 tool_call
+    const shortArgs = JSON.stringify({ description: "扫代码" });
+    const longArgs = JSON.stringify({
+      description: "扫代码找 bug",
+      prompt: "请完整排查 auth 相关路径",
+      model: "fast",
+    });
+    const call1 = ev({
+      id: "tc_first",
+      kind: "tool_call",
+      text: "调用 task",
+      ts: 10,
+      meta: { callId: "dup1", name: "task", args: shortArgs },
+    });
+    const call2 = ev({
+      id: "tc_second",
+      kind: "tool_call",
+      text: "调用 task",
+      ts: 11,
+      meta: { callId: "dup1", name: "task", args: longArgs },
+    });
+    const result = ev({
+      id: "tr1",
+      kind: "tool_result",
+      text: "工具完成 task",
+      ts: 20,
+      meta: {
+        callId: "dup1",
+        name: "task",
+        status: "success",
+        output: "## 结论\n已修好",
+      },
+    });
+    const out = mergeToolDisplayEvents([call1, call2, result]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: "__tool_block__",
+      id: "tc_first",
+      callId: "dup1",
+      name: "task",
+      status: "success",
+      args: longArgs,
+    });
+    // ts 用第一条 tool_call 的 id 锚定位置；配对后 result 的 ts 覆盖（与单条配对一致）
+    expect((out[0] as ToolBlock).ts).toBe(20);
+  });
+
   it("连续 read/grep 收成 verb group", () => {
     const mk = (id: string, callId: string, name: string): TaskEvent[] => [
       ev({

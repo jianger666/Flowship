@@ -286,6 +286,9 @@ const toolCallToBlock = (
  * 把 tool_call + tool_result 按 callId 配对，再对连续 verb-group 成员收组。
  * tool_result 单独出现（历史缺 running）→ 合成 completed 块。
  * tool_output_delta 应在进本函数前已滤掉。
+ *
+ * 历史双写兜底：同 callId 多条 tool_call 只出一块——args 取更长、id/ts 留第一条
+ * （服务端新数据已修、已落盘历史仍可能双条，渲染层必须去重）。
  */
 export const mergeToolDisplayEvents = (
   events: TaskEvent[],
@@ -299,17 +302,36 @@ export const mergeToolDisplayEvents = (
 
   const consumedResults = new Set<string>();
   const raw: StreamRenderItem[] = [];
+  // callId → raw 里首次 tool_call 块下标（同 callId 后续只合并 args）
+  const firstBlockIndexByCallId = new Map<string, number>();
 
   for (const ev of events) {
     if (isEphemeralToolOutputDelta(ev)) continue;
 
     if (ev.kind === "tool_call") {
       const cid = getCallId(ev);
+
+      // 同 callId 已有块：只升级更长的 args，不另 push（保持流位置 = 第一条）
+      if (cid && firstBlockIndexByCallId.has(cid)) {
+        const idx = firstBlockIndexByCallId.get(cid)!;
+        const existing = raw[idx];
+        if (isToolBlock(existing)) {
+          const nextArgs = getArgs(ev);
+          if ((nextArgs?.length ?? 0) > (existing.args?.length ?? 0)) {
+            existing.args = nextArgs;
+          }
+        }
+        const resultEv = resultsByCallId.get(cid);
+        if (resultEv) consumedResults.add(resultEv.id);
+        continue;
+      }
+
       const resultEv = cid ? resultsByCallId.get(cid) : undefined;
       const resultMeta = resultEv
         ? asToolResultMeta(resultEv.meta)
         : undefined;
       if (resultEv) consumedResults.add(resultEv.id);
+      if (cid) firstBlockIndexByCallId.set(cid, raw.length);
       raw.push(toolCallToBlock(ev, resultMeta, resultEv?.ts));
       continue;
     }

@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { MarkdownText } from "@/components/markdown-text";
 import { cn } from "@/lib/utils";
 import {
   countDiffStats,
@@ -203,13 +204,18 @@ const ExpandedEmptyPlaceholder = ({
   );
 };
 
-/** name=task 子代理专属卡片 */
+/**
+ * name=task 子代理专属迷你卡。
+ * 与普通工具行拉开层次：左侧紫轨 + 浅紫渐变底 + 圆角边框；
+ * 完成态产出走 MarkdownText（running 仍用 pre，避免流式 markdown 闪烁）。
+ */
 const TaskSubagentBlock = ({
   block,
   taskId,
   liveOutput,
   nested,
 }: ToolBlockRowProps) => {
+  // 默认折叠（与 toolBlockDefaultCollapsed 一致）
   const [collapsed, setCollapsed] = useState(() =>
     toolBlockDefaultCollapsed(block.name, nested),
   );
@@ -217,7 +223,9 @@ const TaskSubagentBlock = ({
   const [promptExpanded, setPromptExpanded] = useState(false);
   // 产出区第二层折叠（完成态）
   const [outputOpen, setOutputOpen] = useState(false);
+  // 截断输出就地加载后的全文
   const [fullText, setFullText] = useState<string | null>(null);
+  // 「加载完整输出」请求中
   const [fullLoading, setFullLoading] = useState(false);
 
   const taskArgs = useMemo(
@@ -237,6 +245,8 @@ const TaskSubagentBlock = ({
       ? liveOutput
       : block.result?.output;
 
+  const outputBody = fullText ?? displayOutput;
+
   const liveTail =
     collapsed &&
     block.status === "running" &&
@@ -246,7 +256,7 @@ const TaskSubagentBlock = ({
 
   const statusIcon =
     block.status === "running" ? (
-      <Loader2 className="size-3.5 shrink-0 animate-spin text-blue-500" />
+      <Loader2 className="size-3.5 shrink-0 animate-spin text-violet-500" />
     ) : block.status === "error" ? (
       <X className="size-3.5 shrink-0 text-destructive" />
     ) : (
@@ -254,110 +264,131 @@ const TaskSubagentBlock = ({
     );
 
   return (
-    <div className={cn("group/tool", nested && "pl-0")}>
-      <button
-        type="button"
-        onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
-      >
-        <CollapseChevron open={!collapsed} />
-        <Bot className="size-3.5 shrink-0 text-violet-600 dark:text-violet-400" />
-        <span className="shrink-0 rounded bg-violet-500/10 px-1 py-px text-[10px] font-medium text-violet-700 dark:text-violet-300">
-          子代理
-        </span>
-        <span className="min-w-0 shrink truncate font-medium text-[11px] text-foreground/90">
-          {title}
-        </span>
-        {/* 子代理模型徽标（args.model 指定时才显示；未指定 = 跟随主线、不标） */}
-        {taskArgs?.model && (
-          <span className="shrink-0 rounded bg-muted/60 px-1 py-px font-mono text-[10px] text-muted-foreground">
-            {taskArgs.model}
-          </span>
-        )}
-        {statusIcon}
-        {collapsed && liveTail && (
-          <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
-            {liveTail}
-          </span>
-        )}
-        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
-          {formatTs(block.ts)}
-        </span>
-      </button>
-
-      {!collapsed && (
-        <div className="ml-5 mt-1 space-y-2 border-l border-border/50 pl-3">
-          {/* 任务书 */}
-          <div className="space-y-1">
-            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
-              任务书
-            </div>
-            {prompt ? (
-              <div className="space-y-1">
-                <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/20 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                  {promptShown}
-                </pre>
-                {promptLong && (
-                  <button
-                    type="button"
-                    onClick={() => setPromptExpanded((v) => !v)}
-                    className="cursor-pointer text-[11px] text-primary hover:underline"
-                  >
-                    {promptExpanded ? "收起" : "显示更多"}
-                  </button>
-                )}
-              </div>
-            ) : (
-              <div className="text-[11px] text-muted-foreground/70">无任务书</div>
-            )}
-          </div>
-
-          {/* 产出 */}
-          <div className="space-y-1">
-            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
-              产出
-            </div>
-            {block.status === "running" && !displayOutput ? (
-              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
-                <Loader2 className="size-3 shrink-0 animate-spin" />
-                <span>子代理运行中…</span>
-              </div>
-            ) : displayOutput ? (
-              <div>
-                {block.status !== "running" && (
-                  <button
-                    type="button"
-                    onClick={() => setOutputOpen((o) => !o)}
-                    className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
-                  >
-                    <CollapseChevron open={outputOpen} />
-                    输出
-                  </button>
-                )}
-                {(block.status === "running" || outputOpen) && (
-                  <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                    {fullText ?? displayOutput}
-                  </pre>
-                )}
-                <LoadFullOutputButton
-                  block={block}
-                  taskId={taskId}
-                  fullText={fullText}
-                  fullLoading={fullLoading}
-                  onLoaded={setFullText}
-                  onLoadingChange={setFullLoading}
-                  onEnsureOpen={() => setOutputOpen(true)}
-                />
-              </div>
-            ) : (
-              <ExpandedEmptyPlaceholder status={block.status} />
-            )}
-          </div>
-        </div>
+    <div
+      className={cn(
+        // 迷你卡：与普通工具行拉开层次（边框 + 渐变底 + 左侧紫轨）
+        "group/tool overflow-hidden rounded-lg border border-violet-500/20",
+        "bg-gradient-to-br from-violet-500/[0.08] via-violet-500/[0.02] to-transparent",
+        "dark:border-violet-400/25 dark:from-violet-400/15 dark:via-violet-500/[0.04]",
+        nested && "pl-0",
       )}
+    >
+      <div className="border-l-[3px] border-l-violet-500/70 dark:border-l-violet-400/55">
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-violet-500/[0.06] hover:text-foreground dark:hover:bg-violet-400/10"
+        >
+          <CollapseChevron open={!collapsed} />
+          <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-violet-500/15 dark:bg-violet-400/20">
+            <Bot className="size-3.5 text-violet-600 dark:text-violet-300" />
+          </span>
+          <span className="shrink-0 rounded-md bg-violet-500/15 px-1.5 py-px text-[10px] font-semibold tracking-wide text-violet-700 dark:bg-violet-400/20 dark:text-violet-200">
+            子代理
+          </span>
+          <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground/90">
+            {title}
+          </span>
+          {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造 */}
+          {taskArgs?.model && (
+            <span className="shrink-0 rounded border border-violet-500/20 bg-background/60 px-1 py-px font-mono text-[10px] text-violet-700/80 dark:border-violet-400/25 dark:bg-violet-950/40 dark:text-violet-300/90">
+              {taskArgs.model}
+            </span>
+          )}
+          {statusIcon}
+          {collapsed && liveTail && (
+            <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
+              {liveTail}
+            </span>
+          )}
+          <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+            {formatTs(block.ts)}
+          </span>
+        </button>
+
+        {!collapsed && (
+          <div className="space-y-2.5 px-3 pb-3 pt-0.5">
+            {/* 任务书 */}
+            <div className="space-y-1">
+              <div className="text-[10px] font-medium tracking-wide text-violet-700/70 dark:text-violet-300/60">
+                任务书
+              </div>
+              {prompt ? (
+                <div className="space-y-1">
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-violet-500/15 bg-background/70 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground dark:border-violet-400/15 dark:bg-background/40">
+                    {promptShown}
+                  </pre>
+                  {promptLong && (
+                    <button
+                      type="button"
+                      onClick={() => setPromptExpanded((v) => !v)}
+                      className="cursor-pointer text-[11px] text-violet-700 hover:underline dark:text-violet-300"
+                    >
+                      {promptExpanded ? "收起" : "显示更多"}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="text-[11px] text-muted-foreground/70">无任务书</div>
+              )}
+            </div>
+
+            {/* 产出：完成态 markdown；running 用 pre 防流式闪烁 */}
+            <div className="space-y-1">
+              <div className="text-[10px] font-medium tracking-wide text-violet-700/70 dark:text-violet-300/60">
+                产出
+              </div>
+              {block.status === "running" && !displayOutput ? (
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
+                  <Loader2 className="size-3 shrink-0 animate-spin text-violet-500" />
+                  <span>运行中…</span>
+                </div>
+              ) : displayOutput ? (
+                <div>
+                  {block.status !== "running" && (
+                    <button
+                      type="button"
+                      onClick={() => setOutputOpen((o) => !o)}
+                      className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                    >
+                      <CollapseChevron open={outputOpen} />
+                      输出
+                    </button>
+                  )}
+                  {(block.status === "running" || outputOpen) && (
+                    <div className="mt-1 max-h-64 overflow-y-auto rounded-md border border-violet-500/15 bg-background/80 p-2 dark:border-violet-400/15 dark:bg-background/40">
+                      {block.status === "running" ? (
+                        <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                          {outputBody}
+                        </pre>
+                      ) : (
+                        <div className="text-[12px] leading-relaxed text-foreground/90 [&_.prose]:text-[12px]">
+                          <MarkdownText text={outputBody ?? ""} />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <LoadFullOutputButton
+                    block={block}
+                    taskId={taskId}
+                    fullText={fullText}
+                    fullLoading={fullLoading}
+                    onLoaded={setFullText}
+                    onLoadingChange={setFullLoading}
+                    onEnsureOpen={() => setOutputOpen(true)}
+                  />
+                </div>
+              ) : (
+                <ExpandedEmptyPlaceholder status={block.status} />
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
+
 
 const RegularToolBlockRow = ({
   block,
