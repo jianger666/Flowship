@@ -36,10 +36,11 @@ export const shouldCollapseUserMessage = (
  * 渲染项 idx 上方是否画轮次分割线。
  *
  * 语义：user_reply = 新一轮开始；「第一轮」（此前没有任何对话轮）不画——
- * 判定「此前有轮」= 前面出现过 user_reply / assistant_message（boot info、
- * 过程行不算轮、避免首条消息前的杂项误触发分割线）。
+ * 判定「此前有轮」= 前面出现过 user_reply / assistant_message / __work_group__
+ * （正文被吸进工作组时整轮可能只剩组；boot info、过程行不算轮）。
  *
- * @param kinds 渲染项 kind 序列（与 items 对齐；虚拟项 kind 以 __ 开头、天然不命中）
+ * @param kinds 渲染项 kind 序列（与 items 对齐；虚拟项 kind 以 __ 开头、天然不命中，
+ *   例外：`__work_group__` 是 chat 分组产物、算「此前有轮」）
  */
 export const shouldShowTurnDivider = (
   kinds: readonly string[],
@@ -47,7 +48,11 @@ export const shouldShowTurnDivider = (
 ): boolean => {
   if (kinds[idx] !== "user_reply") return false;
   for (let i = 0; i < idx; i++) {
-    if (kinds[i] === "user_reply" || kinds[i] === "assistant_message") {
+    if (
+      kinds[i] === "user_reply" ||
+      kinds[i] === "assistant_message" ||
+      kinds[i] === "__work_group__"
+    ) {
       return true;
     }
   }

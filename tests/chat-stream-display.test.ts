@@ -89,6 +89,12 @@ describe("shouldShowTurnDivider（每轮分割线）", () => {
     const kinds = ["user_reply", "user_reply"];
     expect(shouldShowTurnDivider(kinds, 1)).toBe(true);
   });
+
+  // Batch C：turn 无正文时整轮只有工作组，下一轮 user_reply 仍应画分割线
+  it("此前只有 __work_group__（正文被吸组）→ 画", () => {
+    const kinds = ["user_reply", "__work_group__", "user_reply"];
+    expect(shouldShowTurnDivider(kinds, 2)).toBe(true);
+  });
 });
 
 describe("isBootStageInfo（启动进度行识别）", () => {

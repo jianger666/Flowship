@@ -301,19 +301,19 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-21 chat 消息流大重构（回复优先）+ 压缩改挂 SDK + 飞书完成通知（未发版）
+
+- **chat 信息架构重构（`docs/CHAT-REDESIGN.md`）**：事件流从「run log 平铺」改「回复优先、过程按需」——turn 内 thinking / 工具 / 中间旁白收进「工作过程」折叠组（`chat-turns.ts` 纯函数分组 + `work-group.tsx`；running 自动展开、完成自动收起、手动优先），正文（turn 末段 assistant）全宽平铺 15px；running 时 Composer 上方粘性 shimmer 状态行（`deriveActiveStatus` + `active-status-line.tsx`）；info 细线化。分页 prepend 差值与 items 共用 `buildStreamItems` 管线（跨页组合并不跳滚动）。task(log) 形态零变化。
+- **砍自建上下文压缩、改挂 SDK 自带 summarization**：turn-ended usage 是 turn 内累计（官方确认不能当上下文大小、单 turn 实测 554 万 tokens）→ 26 万阈值频繁误触发。自动/手动 compact 全删（净 -1250 行）；`createSdkSummaryDeltaPublisher` 监听 `summary-completed` 落「SDK 已自动压缩」info。
+- **工具事件双写去重 + 子代理卡重做**：SDK 对长 args 工具（task/edit）双发 running → 同 callId 只落盘一条 + 渲染层去重兜底；task args 短字段前置 + 截断 2000（model 徽标不再被吃）；子代理卡升级紫轨渐变迷你卡、产出 markdown 渲染。
+- **飞书桥完成通知**：流式卡 finalize 后耗时 >30s 追发短文本（✅/🙋/❌）触发飞书推送——解决「切走后答完了不知道」（通知时机长在开始不在完成）。
+- 教训入 rules：并行子代理任务书必须禁 git stash/checkout（本批事故：子代理 stash 骚操作弄丢并行改动、靠上下文重建）。
+
 ### 2026-07-19 并发收敛重构（chat 打磨验收链完结、未发版）
 
 - **背景**：chat 打磨批次的验收由外部 AI 连审 21 轮、每轮 4-12 个并发/竞态 P1——根因是任务启动/接管、消息受理、删除证据、client 状态各自没有单一 owner 状态机、局部补丁组合爆炸。用户拍板停止打补丁、做收敛重构。
 - **落地**：见「当前架构快照 → 并发所有权与消息投递协议」一节（7 层协议：TaskOpHandle / MessageOperation aggregate / 共享 wire schema / 删除三态 / client 三轴格 join / watch 双计数 + established epoch / failpoint 测试法）。
 - **验收**：终轮生产链探针全部反转、蓝军证伪通过；门禁 typecheck / lint 0 warning / **全量 113 文件 1019 项测试全绿** / build。review 过程文档已清理、注释已脱敏（轮次编号全部改为自解释描述）。
-
-### 2026-07-17 v1.1.20 发版：agent-shell 三轮外审加固（跨 bundle 状态 + 预检前置 + PATH 顺序）
-
-- **背景**：v1.1.19 的 Git Bash 候选修复经外部 AI（GPT-5.6）三轮代码复审、修掉 2 个 P1 + 1 个 P2；复审对照原始证据逐条核过（`docs/windows-slow-rca-2026-07-17.md` 含置信度修订）。
-- **P1 跨 bundle 状态共享**：`ORIGINAL_SHELL`/`injectedBinDir` 原是 module-local，production build 里 instrumentation 与 settings route 是两份模块实例（复审用 `pnpm build` 实证）→ 关开关时 settings 实例把「已注入的 Git Bash」当原始值恢复、PATH 清理 noop。修：三样状态（originalShell+captured 布尔 / injectedBinDir / applyChain）合进 `__feAiFlowAgentShellStateV1__` 单一 globalThis 对象；原始 SHELL 首次 sync 时捕获一次、永不覆盖。配双模块实例回归测试（vi.resetModules + 两次动态 import、修复前红修复后绿）。
-- **P1 预检前置**：旧序「注入 PATH+SHELL → await where 校验（5s 超时）→ 失败回滚」在校验窗口把临时环境暴露给并发创建的 agent。修：①绝对路径自检 → ②候选 PATH（不写 process.env、含模拟卸旧段）带候选 env 跑 `where bash` 链校验（SDK 同款 `/git.*bash/i`、防 WSL bash 抢位）→ ③全过才 `commitShellEnv` 同步一次性提交（无 await 夹缝）；任一预检失败环境从未被本次改动。apply 经 globalThis promise 链串行（启动 fire-and-forget 与设置 PUT 不交错）。
-- **P2 PATH 顺序**：`includes` 判断改「首段判断」——目标 bin 在 PATH 后部时在首位新增一段（不动用户原有段）、只有真正新增才记 `injectedBinDir`、移除只删第一个匹配段；`pathSegmentEquals` 统一 Windows 语义比较（大小写不敏感 + 尾斜杠归一）。
-- 全量 42 文件 468 测试全绿 + `pnpm build` 过；**Windows 真机 SDK smoke 仍未做**（mac mock 不能替代）——发版后需一台中招同事机器验证：开开关 → main.log shell 有 `phase=done status=success`、无 `Can't find Bash`。
 
 ## 关键文件索引
 

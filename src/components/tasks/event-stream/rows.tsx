@@ -424,10 +424,10 @@ const EventRowImpl = ({
   //   - thinking / tool_call / info：单行细条目（小图标 + 摘要 + 时间）、点击展开、
   //     视觉权重压到最低——过程可查但不抢戏
   if (variant === "chat") {
-    // AI 回复：平铺 prose、hover 出「复制」
+    // AI 回复：平铺 prose、hover 出「复制」；字号略大于过程行、长文可读性优先
     if (isAssistant) {
       return (
-        <div className="group relative text-sm leading-relaxed">
+        <div className="group relative text-[15px] leading-7">
           <div className="absolute -top-3 right-2 overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
             <button
               type="button"
@@ -650,7 +650,26 @@ const EventRowImpl = ({
         </div>
       );
     }
-    // 过程行（thinking / tool_call / info / error…）：单行细条目、可展开
+    // info 细线化（Batch C）：普通系统提示降权成居中短线 + 小字；
+    // awaitingAck 里程碑仍走 processRow（要可见）；reconnecting / boot 已在上层分流 / 过滤
+    if (ev.kind === "info" && !isAwaitingAck) {
+      return (
+        <div
+          className="group/info flex items-center justify-center gap-2 py-0.5"
+          title={ev.text}
+        >
+          <div className="h-px w-12 shrink bg-gradient-to-r from-transparent to-border" />
+          <span className="max-w-[70%] truncate text-[11px] text-muted-foreground/60">
+            {ev.text}
+          </span>
+          <span className="shrink-0 text-[10px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/info:opacity-100">
+            {formatTs(ev.ts)}
+          </span>
+          <div className="h-px w-12 shrink bg-gradient-to-l from-transparent to-border" />
+        </div>
+      );
+    }
+    // 过程行（thinking / tool_call / error / awaitingAck info…）：单行细条目、可展开
     return processRow;
   }
 

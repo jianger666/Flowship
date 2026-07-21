@@ -44,6 +44,11 @@ import {
 import type { Task, TaskEvent } from "@/lib/types";
 
 import {
+  deriveActiveStatus,
+  groupChatRenderItems,
+  type WorkGroupItem,
+} from "@/lib/chat-turns";
+import {
   isToolBlock,
   isToolVerbGroup,
   mergeToolDisplayEvents,
@@ -73,6 +78,8 @@ import {
   ToolBlockRow,
   ToolVerbGroupRow,
 } from "./event-stream/tool-block";
+import { ActiveStatusLine } from "./event-stream/active-status-line";
+import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
 import { pathBasename } from "@/lib/path-utils";
 
@@ -114,6 +121,7 @@ interface BootStageItem {
 
 type RenderItem =
   | StreamRenderItem
+  | WorkGroupItem
   | StreamingItem
   | LoadingItem
   | PendingLocalItem
@@ -374,6 +382,21 @@ const eventsForStreamRender = (
     ? events.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
     : events;
 
+/**
+ * 共用纯管线：过滤 → thinking 合并 → tool 配对 →（仅 chat）工作过程分组。
+ * items useMemo 与 loadEarlier 的 beforeLen/afterLen 必须走同一函数，
+ * 否则跨页组合并时 firstItemIndex 差值不准、滚动会跳。
+ * pending / streaming / loading / boot 虚拟项在分组之后追加、不进本函数。
+ */
+const buildStreamItems = (
+  events: TaskEvent[],
+  isChat: boolean,
+): Array<StreamRenderItem | WorkGroupItem> => {
+  const src = eventsForStreamRender(events, isChat);
+  const merged = mergeToolDisplayEvents(mergeAdjacentThinking(src));
+  return isChat ? groupChatRenderItems(merged) : merged;
+};
+
 const EventStreamImpl = ({
   task,
   streamingText,
@@ -426,12 +449,10 @@ const EventStreamImpl = ({
   );
   const displayedBoot = useStagedBootDisplay(activeBoot);
 
-  // 渲染前：thinking 合并 → 滤 chat 启动噪声 → tool 配对 + GB verb-group → streaming/loading/pending
+  // 渲染前：buildStreamItems（滤噪声 → thinking → tool → chat 分组）→
+  // 再追加 pending / streaming / loading / boot 虚拟项（不参与分组）
   const items: RenderItem[] = useMemo(() => {
-    const sourceEvents = eventsForStreamRender(task.events, isChat);
-    const merged = mergeToolDisplayEvents(
-      mergeAdjacentThinking(sourceEvents),
-    );
+    const merged = buildStreamItems(task.events, isChat);
     const withPending: RenderItem[] = [
       ...merged,
       ...(pendingLocalReplies ?? []).map(
@@ -463,7 +484,8 @@ const EventStreamImpl = ({
       ];
     }
     // 「发出消息 → 程序受理」空白期：排除本地 pending 占位后看末项，
-    // 避免 pending 压制 loading（二者可并存）
+    // 避免 pending 压制 loading（二者可并存）。分组后 user_reply 仍独立，
+    // last.kind === "user_reply" 判定不变。
     let last: RenderItem | undefined;
     for (let i = withPending.length - 1; i >= 0; i--) {
       const it = withPending[i]!;
@@ -478,12 +500,32 @@ const EventStreamImpl = ({
       last.kind !== "__loading__" &&
       last.kind !== "__tool_block__" &&
       last.kind !== "__tool_verb_group__" &&
+      last.kind !== "__work_group__" &&
       last.kind === "user_reply";
     if (isRunning && lastIsUser) {
       return [...withPending, { kind: "__loading__", id: "__loading__" }];
     }
     return withPending;
   }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies, displayedBoot]);
+
+  // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）
+  const lastGroupId = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]!;
+      // 用 kind 判别收窄（RenderItem 比 ChatRenderItem 宽，不能直接调 isWorkGroup）
+      if (it.kind === "__work_group__") return it.id;
+    }
+    return null;
+  }, [items]);
+
+  // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
+  const activeStatus = useMemo(
+    () =>
+      isChat && isRunning
+        ? deriveActiveStatus(task.events, liveToolOutputs)
+        : null,
+    [isChat, isRunning, task.events, liveToolOutputs],
+  );
 
   // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
   // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
@@ -569,16 +611,10 @@ const EventStreamImpl = ({
       const known = new Set(cur.map((e) => e.id));
       const fresh = older.filter((e) => !known.has(e.id));
       if (fresh.length > 0) {
-        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对合并、
-        // 拼接边界还可能跨页合并——用与 items 同一套过滤 + 纯函数算前后条数差值
-        const beforeSrc = eventsForStreamRender(cur, isChat);
-        const afterSrc = eventsForStreamRender([...fresh, ...cur], isChat);
-        const beforeLen = mergeToolDisplayEvents(
-          mergeAdjacentThinking(beforeSrc),
-        ).length;
-        const afterLen = mergeToolDisplayEvents(
-          mergeAdjacentThinking(afterSrc),
-        ).length;
+        // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
+        // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
+        const beforeLen = buildStreamItems(cur, isChat).length;
+        const afterLen = buildStreamItems([...fresh, ...cur], isChat).length;
         onPrependEvents(fresh);
         setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
       }
@@ -774,11 +810,13 @@ const EventStreamImpl = ({
   const handleSendNow = () => submitVia(onUserReplyNow);
 
   // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
-  // 连续过程行（thinking / tool / info…）紧凑堆叠成一组
+  // 连续过程行（thinking / tool / info / 工作组）紧凑堆叠成一组
   const isConversational = (it: RenderItem): boolean => {
     if (isStreamingItem(it)) return true;
     if (isLoadingItem(it)) return false;
     if (isPendingLocalItem(it)) return true;
+    // 工作过程组走紧凑间距，不与正文抢段落感
+    if (it.kind === "__work_group__") return false;
     if (it.kind === "__tool_block__" || it.kind === "__tool_verb_group__") {
       return false;
     }
@@ -963,6 +1001,14 @@ const EventStreamImpl = ({
                     text={item.text}
                     uncertain={item.uncertain}
                   />
+                ) : item.kind === "__work_group__" ? (
+                  <WorkGroupRow
+                    group={item}
+                    taskId={task.id}
+                    task={task}
+                    liveToolOutputs={liveToolOutputs}
+                    isRunningTail={item.id === lastGroupId && !!isRunning}
+                  />
                 ) : isToolBlock(item) ? (
                   <ToolBlockRow
                     block={item}
@@ -1008,6 +1054,12 @@ const EventStreamImpl = ({
           TaskTalkComposer 替代；chat 形态渲染统一输入岛 <Composer>（v1.1.x 收口） */}
       {hideReplyComposer || !isChat ? null : (
         <div className="shrink-0 px-6 pb-5 pt-1">
+          {/* 运行中粘性状态行：挂 Composer 上方，turn 结束（非 running）自然消失 */}
+          {activeStatus && (
+            <div className="mx-auto w-full max-w-3xl">
+              <ActiveStatusLine status={activeStatus} />
+            </div>
+          )}
           <Composer
             editorKey={task.id}
             value={draft}
