@@ -25,33 +25,57 @@ import { cn } from "@/lib/utils";
 import {
   countDiffStats,
   parseTaskToolArgs,
+  parseUnifiedDiff,
   toolBlockDefaultCollapsed,
   toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
   verbGroupLabel,
+  type DiffViewLine,
   type ToolBlock,
   type ToolVerbGroup,
 } from "@/lib/tool-display";
 import { formatTs } from "./utils";
 
-// ---------- 轻量 unified diff（不引新依赖；±3 上下文由 SDK diffString 自带）----------
+// ---------- 干净 diff 视图（解析层 parseUnifiedDiff；双列行号 + 无 @@ 原文）----------
 
-const DiffLine = ({ line }: { line: string }) => {
-  const isAdd = line.startsWith("+") && !line.startsWith("+++");
-  const isDel = line.startsWith("-") && !line.startsWith("---");
-  const isHunk = line.startsWith("@@");
+const DiffLineNum = ({ n }: { n?: number }) => (
+  <span className="w-8 shrink-0 select-none pr-1 text-right tabular-nums text-muted-foreground/50">
+    {n ?? ""}
+  </span>
+);
+
+const DiffLine = ({ line }: { line: DiffViewLine }) => {
+  // hunk：极细分隔，不回显 @@ 原文（文件名已在标题行）
+  if (line.kind === "hunk") {
+    return (
+      <div className="flex select-none items-center gap-2 px-2 py-1">
+        <div className="h-px flex-1 border-t border-dashed border-border/60" />
+        <span className="text-[10px] leading-none text-muted-foreground/50">
+          ⋯
+        </span>
+        <div className="h-px flex-1 border-t border-dashed border-border/60" />
+      </div>
+    );
+  }
+
   return (
     <div
       className={cn(
-        "whitespace-pre-wrap break-all px-2 py-px font-mono text-[11px] leading-relaxed",
-        isAdd && "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
-        isDel && "bg-red-500/10 text-red-700 dark:text-red-400",
-        isHunk && "bg-muted/50 text-muted-foreground",
-        !isAdd && !isDel && !isHunk && "text-muted-foreground",
+        "flex font-mono text-[11px] leading-relaxed",
+        line.kind === "add" &&
+          "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+        line.kind === "del" &&
+          "bg-red-500/10 text-red-700 dark:text-red-400",
+        line.kind === "context" && "text-muted-foreground",
       )}
     >
-      {line || " "}
+      <DiffLineNum n={line.oldLine} />
+      <DiffLineNum n={line.newLine} />
+      {/* whitespace-pre + 外层横滚：折行会打乱双列行号对齐 */}
+      <span className="min-w-0 flex-1 whitespace-pre px-2 py-px">
+        {line.text || " "}
+      </span>
     </div>
   );
 };
@@ -63,9 +87,9 @@ const InlineDiff = ({
   diff: string;
   truncated?: boolean;
 }) => {
-  const lines = useMemo(() => diff.split("\n"), [diff]);
+  const lines = useMemo(() => parseUnifiedDiff(diff), [diff]);
   return (
-    <div className="mt-1.5 max-h-64 overflow-y-auto rounded-md border border-border/60 bg-muted/20">
+    <div className="mt-1.5 max-h-64 overflow-x-auto overflow-y-auto rounded-md border border-border/60 bg-muted/20">
       {lines.map((line, i) => (
         <DiffLine key={i} line={line} />
       ))}

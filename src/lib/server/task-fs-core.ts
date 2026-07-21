@@ -155,6 +155,11 @@ export const exists = async (p: string): Promise<boolean> => {
 export interface TaskMetaV06 {
   id: string;
   title: string;
+  /**
+   * chat 首轮后待 SDK 自动生成标题（详见 types.ts Task.titleAutoPending）。
+   * 仅 chat 建任务时写 true；手动改名 / 生成完成 / 超时放弃时删掉。
+   */
+  titleAutoPending?: boolean;
   mode?: TaskMode;
   repoStatus: RepoStatus;
   runStatus: RunStatus;
@@ -1108,6 +1113,7 @@ export const assembleTask = (
 ): Task => ({
   id: meta.id,
   title: meta.title,
+  titleAutoPending: meta.titleAutoPending,
   mode: meta.mode,
   repoStatus: meta.repoStatus,
   runStatus: meta.runStatus,
@@ -1177,6 +1183,7 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
   return {
     id: meta.id,
     title: meta.title,
+    titleAutoPending: meta.titleAutoPending,
     mode: meta.mode,
     repoStatus: meta.repoStatus,
     runStatus: meta.runStatus,

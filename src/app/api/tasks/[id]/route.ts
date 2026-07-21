@@ -326,6 +326,10 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       }
       const task = await updateTaskFields(id, {
         title: body.title,
+        // 用户手动改名 → 清掉自动标题挂起，避免 SDK 结果事后覆盖用户起的名
+        ...(typeof body.title === "string"
+          ? { titleAutoPending: false }
+          : {}),
         feishuStoryUrl: body.feishuStoryUrl,
         repoFeatureBranches: body.repoFeatureBranches,
         addRepoPaths: body.addRepoPaths,

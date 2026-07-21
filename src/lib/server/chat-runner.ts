@@ -38,6 +38,7 @@ import {
 } from "./task-fs";
 import { getEventsLogPath } from "./task-fs-core";
 import { getChatMcpUrl } from "./chat-mcp";
+import { maybeGenerateChatTitle } from "./chat-title";
 import {
   cancelPendingIf,
   getPendingAsk,
@@ -1070,6 +1071,12 @@ export const runChatSession = async (
     cur.agentId = agent.agentId;
     cur.agent = agent;
     void setTaskSessionAgentId(task.id, agent.agentId);
+
+    // 首轮成功后 fire-and-forget 用 SDK auto 生成短标题（搭车本轮 apiKey；
+    // 内部查 titleAutoPending 幂等、不阻塞主对话 consume）
+    if (firstMessage?.text.trim()) {
+      maybeGenerateChatTitle(task.id, apiKey, firstMessage.text);
+    }
 
     await consumeChatRun(task, run, () => cancelled);
   } catch (err) {

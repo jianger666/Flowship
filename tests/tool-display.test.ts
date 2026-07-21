@@ -7,6 +7,7 @@ import {
   mergeToolDisplayEvents,
   parseTaskToolArgs,
   parseToolArgsJson,
+  parseUnifiedDiff,
   toolBlockDefaultCollapsed,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
@@ -340,5 +341,96 @@ describe("toolBlockExpandedArgsPreview", () => {
     expect(preview).toBeTruthy();
     expect(preview!.includes("weird_field")).toBe(true);
     expect(preview!.endsWith("…") || preview!.length <= 160).toBe(true);
+  });
+});
+
+describe("parseUnifiedDiff", () => {
+  it("标准 diff：剥 ---/+++ 头、递推行号、剥 +/- 前缀", () => {
+    const diff = [
+      "--- a/src/foo.ts",
+      "+++ b/src/foo.ts",
+      "@@ -7,5 +7,5 @@ function demo() {",
+      "   keep",
+      "-  old",
+      "+  new",
+      "   tail",
+    ].join("\n");
+
+    const lines = parseUnifiedDiff(diff);
+    expect(lines.some((l) => l.text.includes("---") || l.text.includes("+++"))).toBe(
+      false,
+    );
+    expect(lines[0]).toEqual({ kind: "hunk", text: "" });
+    expect(lines[1]).toEqual({
+      kind: "context",
+      oldLine: 7,
+      newLine: 7,
+      text: "  keep",
+    });
+    expect(lines[2]).toEqual({ kind: "del", oldLine: 8, text: "  old" });
+    expect(lines[3]).toEqual({ kind: "add", newLine: 8, text: "  new" });
+    expect(lines[4]).toEqual({
+      kind: "context",
+      oldLine: 9,
+      newLine: 9,
+      text: "  tail",
+    });
+  });
+
+  it("多 hunk：第二个 hunk 行号从新起点重置", () => {
+    const diff = [
+      "diff --git a/a.ts b/a.ts",
+      "index 111..222 100644",
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1,3 +1,3 @@",
+      " a",
+      "-b",
+      "+B",
+      "@@ -20,2 +20,3 @@",
+      " x",
+      "+y",
+    ].join("\n");
+
+    const lines = parseUnifiedDiff(diff);
+    const hunks = lines.filter((l) => l.kind === "hunk");
+    expect(hunks).toHaveLength(2);
+
+    const secondHunkIdx = lines.findIndex(
+      (l, i) => l.kind === "hunk" && i > 0,
+    );
+    expect(lines[secondHunkIdx + 1]).toEqual({
+      kind: "context",
+      oldLine: 20,
+      newLine: 20,
+      text: "x",
+    });
+    expect(lines[secondHunkIdx + 2]).toEqual({
+      kind: "add",
+      newLine: 21,
+      text: "y",
+    });
+  });
+
+  it("截断残行 / 空输入容错", () => {
+    expect(parseUnifiedDiff("")).toEqual([]);
+    expect(parseUnifiedDiff("@@ -1,2 +1,2 @@")).toEqual([
+      { kind: "hunk", text: "" },
+    ]);
+
+    // 残缺 @@ 与无前缀残行：当 context、行号缺省
+    const truncated = parseUnifiedDiff(
+      ["@@ broken hunk header", "\\ No newline at end of file", "orphan"].join(
+        "\n",
+      ),
+    );
+    expect(truncated[0]).toEqual({ kind: "hunk", text: "" });
+    expect(truncated[1]).toEqual({
+      kind: "context",
+      text: "\\ No newline at end of file",
+    });
+    expect(truncated[2]).toEqual({ kind: "context", text: "orphan" });
+    expect(truncated[1].oldLine).toBeUndefined();
+    expect(truncated[2].newLine).toBeUndefined();
   });
 });

@@ -264,6 +264,7 @@ const EventRowImpl = ({
   task,
   variant = "log",
   onResend,
+  onRegenerate,
   onRewind,
   runActive = false,
 }: {
@@ -282,6 +283,9 @@ const EventRowImpl = ({
     text: string,
     sourceEv?: TaskEvent,
   ) => boolean | void | Promise<boolean | void>;
+  // chat「最后一条 AI 回复」的重新生成：等价于把最后一条用户消息原样再发一遍
+  // （append-only、历史保留、不做 fork）；父组件只给最后一条 assistant 传、内部复用 handleResend
+  onRegenerate?: () => void | Promise<void>;
   /** chat checkpoint 回退：仅 checkpointed user_reply + 非 running 时传 */
   onRewind?: (eventId: string) => void;
   /** agent 正在跑：隐藏回退按钮 */
@@ -424,11 +428,12 @@ const EventRowImpl = ({
   //   - thinking / tool_call / info：单行细条目（小图标 + 摘要 + 时间）、点击展开、
   //     视觉权重压到最低——过程可查但不抢戏
   if (variant === "chat") {
-    // AI 回复：平铺 prose、hover 出「复制」；字号略大于过程行、长文可读性优先
+    // AI 回复：平铺 prose、hover 出「复制」；最后一条还可「重新生成」（与复制并排）
+    // 字号略大于过程行、长文可读性优先
     if (isAssistant) {
       return (
         <div className="group relative text-[15px] leading-7">
-          <div className="absolute -top-3 right-2 overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+          <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
             <button
               type="button"
               onClick={() => void handleCopyAssistant()}
@@ -438,6 +443,20 @@ const EventRowImpl = ({
             >
               <Copy className="size-3" />
             </button>
+            {onRegenerate && (
+              <button
+                type="button"
+                onClick={() => {
+                  // 防连点走父组件 handleResend 的 resendLockRef（与用户消息「重发」同锁）
+                  void onRegenerate();
+                }}
+                title="重新生成回答"
+                aria-label="重新生成"
+                className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <RotateCcw className="size-3" />
+              </button>
+            )}
           </div>
           <MarkdownText text={ev.text} />
         </div>

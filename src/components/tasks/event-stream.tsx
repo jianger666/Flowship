@@ -764,13 +764,28 @@ const EventStreamImpl = ({
     [onUserReply, task.id],
   );
 
-  // 最后一条用户消息的 id：只有它 hover 出「重发 / 编辑」两 icon
-  const lastUserReplyId = useMemo(() => {
+  // 最后一条用户消息：重发入口挂它；「重新生成」也复用它的原文 + 图/附件
+  const lastUserReply = useMemo(() => {
     for (let i = task.events.length - 1; i >= 0; i--) {
-      if (task.events[i].kind === "user_reply") return task.events[i].id;
+      if (task.events[i]!.kind === "user_reply") return task.events[i]!;
     }
     return undefined;
   }, [task.events]);
+  const lastUserReplyId = lastUserReply?.id;
+
+  // 最后一条 AI 回复：只有它 hover 出「重新生成」（其后没有更新的 assistant / 等价于尾部往前第一条）
+  const lastAssistantId = useMemo(() => {
+    for (let i = task.events.length - 1; i >= 0; i--) {
+      if (task.events[i]!.kind === "assistant_message") return task.events[i]!.id;
+    }
+    return undefined;
+  }, [task.events]);
+
+  // 重新生成 = 把最后一条用户消息原样再发一遍（append-only、历史保留、不弹确认）
+  const handleRegenerate = useCallback(async () => {
+    if (!lastUserReply) return;
+    await handleResend(lastUserReply.text, lastUserReply);
+  }, [handleResend, lastUserReply]);
 
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
   const sendingLockRef = useRef(false);
@@ -1040,6 +1055,16 @@ const EventStreamImpl = ({
                     onResend={
                       isChat && canCompose && item.id === lastUserReplyId
                         ? handleResend
+                        : undefined
+                    }
+                    // chat 最后一条 AI 回复：hover 出「重新生成」（可发 + 有用户消息 + 非 running）
+                    onRegenerate={
+                      isChat &&
+                      canCompose &&
+                      !isRunning &&
+                      !!lastUserReply &&
+                      item.id === lastAssistantId
+                        ? handleRegenerate
                         : undefined
                     }
                     onRewind={isChat ? onRewind : undefined}

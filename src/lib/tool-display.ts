@@ -421,6 +421,101 @@ export const countDiffStats = (
 };
 
 /**
+ * 干净 diff 视图的一行（对齐 Cursor IDE：双列行号 + 无文件头/@@ 原文）。
+ * text 不含 +/- 前缀；hunk 仅作分隔标记，text 恒为空串。
+ */
+export type DiffViewLine = {
+  kind: "add" | "del" | "context" | "hunk";
+  /** 旧文件行号（add 行无） */
+  oldLine?: number;
+  /** 新文件行号（del 行无） */
+  newLine?: number;
+  /** 行内容（不含 +/- 前缀；hunk 行为空串） */
+  text: string;
+};
+
+/** @@ -a,b +c,d @@ … —— 后面函数上下文忽略；b/d 可省略（默认 1） */
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
+/**
+ * 把 SDK unified diff 解析成可渲染行：剥文件头、递推行号、hunk 只留分隔标记。
+ * 容错：非法行当 context（行号缺省、不递推）；空输入返 []。
+ */
+export const parseUnifiedDiff = (diff: string): DiffViewLine[] => {
+  if (!diff) return [];
+
+  const out: DiffViewLine[] = [];
+  // 当前 hunk 内下一行应对齐的旧/新行号；尚未遇到合法 @@ 时为 undefined
+  let oldLine: number | undefined;
+  let newLine: number | undefined;
+
+  for (const raw of diff.split("\n")) {
+    // 文件头 / git 元信息：文件名已在 UI 标题展示，这里纯重复 → 跳过
+    if (
+      raw.startsWith("--- ") ||
+      raw.startsWith("+++ ") ||
+      raw.startsWith("diff --git") ||
+      raw.startsWith("index ")
+    ) {
+      continue;
+    }
+
+    if (raw.startsWith("@@")) {
+      const m = raw.match(HUNK_HEADER_RE);
+      if (m) {
+        oldLine = Number(m[1]);
+        newLine = Number(m[2]);
+      } else {
+        // 残缺 @@（截断尾部常见）→ 后续变更行不再瞎编行号
+        oldLine = undefined;
+        newLine = undefined;
+      }
+      out.push({ kind: "hunk", text: "" });
+      continue;
+    }
+
+    if (raw.startsWith("+")) {
+      const entry: DiffViewLine = { kind: "add", text: raw.slice(1) };
+      if (newLine !== undefined) {
+        entry.newLine = newLine;
+        newLine += 1;
+      }
+      out.push(entry);
+      continue;
+    }
+
+    if (raw.startsWith("-")) {
+      const entry: DiffViewLine = { kind: "del", text: raw.slice(1) };
+      if (oldLine !== undefined) {
+        entry.oldLine = oldLine;
+        oldLine += 1;
+      }
+      out.push(entry);
+      continue;
+    }
+
+    // 合法上下文以空格开头；其余（\ No newline…、截断残行等）当非法 → 行号缺省、不递推
+    if (raw.startsWith(" ")) {
+      const entry: DiffViewLine = { kind: "context", text: raw.slice(1) };
+      if (oldLine !== undefined) {
+        entry.oldLine = oldLine;
+        oldLine += 1;
+      }
+      if (newLine !== undefined) {
+        entry.newLine = newLine;
+        newLine += 1;
+      }
+      out.push(entry);
+      continue;
+    }
+
+    out.push({ kind: "context", text: raw });
+  }
+
+  return out;
+};
+
+/**
  * 折叠摘要一行：人类可读，绝不 dump args JSON。
  *
  * 解析优先级：

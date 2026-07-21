@@ -35,7 +35,7 @@ export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
   );
 
   const rows: Array<{ label: string; keys: string[] }> = [
-    { label: "命令面板", keys: ["Cmd/Ctrl+K"] },
+    { label: "搜索对话", keys: ["Cmd/Ctrl+K"] },
     { label: "新建对话", keys: ["Cmd/Ctrl+N"] },
     { label: "切换侧栏", keys: ["Cmd/Ctrl+B"] },
     { label: "聚焦输入框（任务页）", keys: ["Cmd/Ctrl+J"] },

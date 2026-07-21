@@ -985,6 +985,13 @@ export interface Task {
   title: string;
 
   /**
+   * chat 首轮后 SDK auto 生成标题的挂起标记。
+   * - 仅 chat 创建时置 true；用户手动改名 / 自动生成成功或超时放弃时清掉
+   * - task 模式不设；undefined / false = 不再自动覆盖标题
+   */
+  titleAutoPending?: boolean;
+
+  /**
    * V0.6.0.1：task 模式（"task" / "chat"）
    * 默认 "task"、决定 runner / API / 详情页 UI 走哪套。详见 TaskMode 定义。
    */

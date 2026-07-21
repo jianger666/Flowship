@@ -899,11 +899,8 @@ const TaskDetailPage = () => {
             )}
             {task.runStatus === "running" && !canAck && (
               <>
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Loader2 className="size-3.5 animate-spin" />
-                  agent 正在跑
-                  {currentAction && ` ${actionDisplayLabel(currentAction)}`}
-                </div>
+                {/* 只留 spinner 示意运行中（2026-07-21 用户拍板去掉「agent 正在跑 …」文字、顶栏减噪） */}
+                <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
                 <Button
                   variant="ghost"
                   size="sm"
