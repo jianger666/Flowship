@@ -60,11 +60,14 @@ const WorkGroupMember = ({
   member,
   taskId,
   task,
+  variant,
   liveToolOutputs,
 }: {
   member: StreamRenderItem;
   taskId: string;
   task: Task;
+  /** 跟随宿主形态：chat 细行 / log 卡片行（task 模式也走分组、2026-07-21 用户拍板） */
+  variant: "log" | "chat";
   liveToolOutputs?: Record<string, string>;
 }) => {
   if (isToolBlock(member)) {
@@ -79,13 +82,13 @@ const WorkGroupMember = ({
   if (isToolVerbGroup(member)) {
     return <ToolVerbGroupRow group={member} taskId={taskId} />;
   }
-  // thinking / error（assistant 插话不进组、独立平铺）→ EventRow chat 细行分支
+  // thinking / error（assistant 插话不进组、独立平铺）→ EventRow 细行分支
   return (
     <EventRow
       ev={member as TaskEvent}
       taskId={taskId}
       task={task}
-      variant="chat"
+      variant={variant}
     />
   );
 };
@@ -107,12 +110,15 @@ const WorkGroupRowImpl = ({
   group,
   taskId,
   task,
+  variant = "chat",
   liveToolOutputs,
   isRunningTail,
 }: {
   group: WorkGroupItem;
   taskId: string;
   task: Task;
+  /** 宿主形态（成员 EventRow 渲染跟随；组头样式两形态同款） */
+  variant?: "log" | "chat";
   /** callId → 直播输出（透传给成员 ToolBlockRow） */
   liveToolOutputs?: Record<string, string>;
   /** 本组是全流最后一个组且 agent 正在 running（展开判定用） */
@@ -168,6 +174,7 @@ const WorkGroupRowImpl = ({
               member={m}
               taskId={taskId}
               task={task}
+              variant={variant}
               liveToolOutputs={liveToolOutputs}
             />
           ))}

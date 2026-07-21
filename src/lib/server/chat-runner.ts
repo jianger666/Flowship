@@ -115,10 +115,6 @@ import {
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
-  recordChatFirstPromptBytes,
-  recordChatTurnUsage,
-} from "./chat-context-usage";
-import {
   captureChatCheckpoint,
   persistCheckpointForReply,
 } from "./chat-checkpoint";
@@ -499,25 +495,6 @@ const publishBootProgress = (
 
 // 本地第二套 writeEventAndPublish 实现已删——统一走 task-stream 的
 // writeEventAndPublish（用户操作/系统通知语义）与 writeOwnedEventAndPublish（owner 语境、lease 必填）。
-
-/**
- * chat turn-ended usage → 只写内存透视（供 /context 面板）。
- * 注意：SDK 累计 inputTokens 不能当真实上下文窗口占用。
- */
-const handleChatTurnUsage = (
-  taskId: string,
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-  },
-): void => {
-  recordChatTurnUsage(taskId, {
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    cacheReadTokens: usage.cacheReadTokens,
-  });
-};
 
 // ----------------- prompt -----------------
 
@@ -1034,17 +1011,12 @@ export const runChatSession = async (
 
     const perfSendStart = Date.now();
     const promptBytes = Buffer.byteLength(initialPrompt, "utf-8");
-    // 首包字节进 token 透视（会话关闭仍保留，供 /context breakdown）
-    recordChatFirstPromptBytes(task.id, promptBytes);
     publishBootProgress(task.id, "send", "正在发送首包…");
     const perfTracker = createRunPerfTracker({
       taskId: task.id,
       agentId: agent.agentId,
       runKind: "chat-first",
       promptBytes,
-      onTurnUsage: (usage) => {
-        handleChatTurnUsage(task.id, usage);
-      },
     });
     run = await agent.send(initialPrompt, {
       onDelta: composeOnDelta(
@@ -1993,9 +1965,6 @@ export const sendChatMessage = async (
       agentId: rec.agent.agentId,
       runKind: "chat-followup",
       promptBytes: Buffer.byteLength(prompt, "utf-8"),
-      onTurnUsage: (usage) => {
-        handleChatTurnUsage(task.id, usage);
-      },
     });
     run = await rec.agent.send(prompt, {
       onDelta: composeOnDelta(

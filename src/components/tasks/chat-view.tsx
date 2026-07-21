@@ -19,7 +19,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pencil, Sparkles } from "lucide-react";
+import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
@@ -37,11 +37,6 @@ import {
 } from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import {
@@ -73,12 +68,10 @@ import {
 } from "@/lib/task-display";
 import {
   ApiRequestError,
-  fetchChatContext,
   rewindChatToEvent,
   sendChatReply,
   stopTask,
   updateTaskFields,
-  type ChatContextInfo,
   type ImagePayload,
 } from "@/lib/task-store";
 import { canCommitTaskSnapshot, commitTaskDeleted } from "@/lib/task-terminal";
@@ -112,12 +105,6 @@ type PendingLocalReply = ChatOperation & {
   images?: ImagePayload[];
   attachments?: string[];
   skillRefs?: Array<{ name: string; absPath: string }>;
-};
-
-const formatTokensWan = (n: number | null): string => {
-  if (n == null || !Number.isFinite(n)) return "—";
-  if (n < 10000) return `~${Math.round(n)} tokens`;
-  return `~${(n / 10000).toFixed(1)}万 tokens`;
 };
 
 export const ChatView = ({
@@ -156,10 +143,6 @@ export const ChatView = ({
   // 闭包捕获的 taskId——卸载后异步回调先验 terminal
   const taskIdRef = useRef(task.id);
   taskIdRef.current = task.id;
-  // P4：上下文透视
-  const [contextOpen, setContextOpen] = useState(false);
-  const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
-  const [contextLoading, setContextLoading] = useState(false);
 
   // 全局 prompt / confirm（重命名 / 回退）
   const { prompt, confirm } = useDialog();
@@ -218,7 +201,6 @@ export const ChatView = ({
     setIsSubmitting(false);
     setStopping(false);
     setLiveToolOutputs({});
-    setContextInfo(null);
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
     return subscribeChatOp(task.id, applyLedgerToUi);
@@ -631,26 +613,6 @@ export const ChatView = ({
     [confirm, task.id],
   );
 
-  // P4：打开上下文 Popover 时拉一次
-  const handleContextOpenChange = useCallback(
-    async (open: boolean) => {
-      setContextOpen(open);
-      if (!open) return;
-      setContextLoading(true);
-      try {
-        const info = await fetchChatContext(task.id);
-        setContextInfo(info);
-      } catch (err) {
-        toast.error(`拉取上下文失败：${(err as Error).message}`);
-        setContextInfo(null);
-      } finally {
-        setContextLoading(false);
-      }
-    },
-    [task.id],
-  );
-
-
   // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
   const canReply = !isSubmitting;
 
@@ -704,58 +666,6 @@ export const ChatView = ({
                 </Badge>
               )}
             </div>
-          </div>
-
-          {/* 标题行右侧：上下文用量 */}
-          <div className="flex shrink-0 items-center gap-1">
-            <Popover open={contextOpen} onOpenChange={(o) => void handleContextOpenChange(o)}>
-              <PopoverTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
-                    title="上下文用量"
-                  >
-                    <Sparkles className="size-3" />
-                    <span className="tabular-nums">
-                      {formatTokensWan(contextInfo?.totalTokens ?? null)}
-                    </span>
-                  </Button>
-                }
-              />
-              <PopoverContent align="end" className="w-72 p-3">
-                <div className="space-y-2.5">
-                  <div className="text-xs font-medium">上下文</div>
-                  {contextLoading ? (
-                    <div className="text-xs text-muted-foreground">加载中…</div>
-                  ) : contextInfo ? (
-                    <>
-                      <div className="text-sm tabular-nums">
-                        {formatTokensWan(contextInfo.totalTokens)}
-                      </div>
-                      {contextInfo.breakdown.length > 0 && (
-                        <ul className="space-y-1 text-[11px] text-muted-foreground">
-                          {contextInfo.breakdown.map((b) => (
-                            <li
-                              key={b.label}
-                              className="flex justify-between gap-2"
-                            >
-                              <span className="min-w-0 truncate">{b.label}</span>
-                              <span className="shrink-0 tabular-nums">
-                                {b.tokens.toLocaleString()}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </>
-                  ) : (
-                    <div className="text-xs text-muted-foreground">暂无数据</div>
-                  )}
-                </div>
-              </PopoverContent>
-            </Popover>
           </div>
         </div>
         {statusHint && (

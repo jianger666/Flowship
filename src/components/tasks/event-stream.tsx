@@ -383,9 +383,10 @@ const eventsForStreamRender = (
     : events;
 
 /**
- * 共用纯管线：过滤 → thinking 合并 → tool 配对 →（仅 chat）工作过程分组。
+ * 共用纯管线：过滤 → thinking 合并 → tool 配对 → 工作过程分组。
  * items useMemo 与 loadEarlier 的 beforeLen/afterLen 必须走同一函数，
  * 否则跨页组合并时 firstItemIndex 差值不准、滚动会跳。
+ * 分组对 chat / task(log) 两形态统一生效（2026-07-21 用户拍板 task 不必单独保旧样）；
  * pending / streaming / loading / boot 虚拟项在分组之后追加、不进本函数。
  */
 const buildStreamItems = (
@@ -394,7 +395,7 @@ const buildStreamItems = (
 ): Array<StreamRenderItem | WorkGroupItem> => {
   const src = eventsForStreamRender(events, isChat);
   const merged = mergeToolDisplayEvents(mergeAdjacentThinking(src));
-  return isChat ? groupChatRenderItems(merged) : merged;
+  return groupChatRenderItems(merged);
 };
 
 const EventStreamImpl = ({
@@ -1006,6 +1007,7 @@ const EventStreamImpl = ({
                     group={item}
                     taskId={task.id}
                     task={task}
+                    variant={variant}
                     liveToolOutputs={liveToolOutputs}
                     isRunningTail={item.id === lastGroupId && !!isRunning}
                   />

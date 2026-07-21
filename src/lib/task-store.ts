@@ -908,25 +908,6 @@ export const removeChatQueueItems = async (
   return data.removedIds;
 };
 
-/** P4：会话 token 透视 */
-export type ChatContextInfo = {
-  totalTokens: number | null;
-  breakdown: Array<{ label: string; tokens: number }>;
-  turnCount: number;
-  lastTurnAt: number | null;
-};
-
-export const fetchChatContext = async (
-  taskId: string,
-): Promise<ChatContextInfo> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/context`,
-    { cache: "no-store" },
-  );
-  const data = await handleJson<{ ok: true; context: ChatContextInfo }>(res);
-  return data.context;
-};
-
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道
 //（服务端按 awaiting_ack 自动附「重新交卷」上下文）；approve 由推进时自动认可承担。
 

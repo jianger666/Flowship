@@ -55,7 +55,6 @@ import {
 } from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
 import { cleanupChatQueueState, failQueuedItems } from "@/lib/server/chat-queue";
-import { clearChatContextUsage } from "@/lib/server/chat-context-usage";
 import {
   beginChatLifecycle,
   cancelChatStart,
@@ -489,10 +488,9 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     if (!isTaskStarting(id)) {
       pendingStopRequests.delete(id);
     }
-    // queue generation / context usage 只增不删——删任务时一并清，
+    // queue generation 只增不删——删任务时一并清，
     // 防长跑进程 Map 积键（须在 waitForChatToStop 之后、活跃 drain 已退出）
     cleanupChatQueueState(id);
-    clearChatContextUsage(id);
 
     // quarantine 场景——先 prepared→tombstone→committed，再 HTTP 200；
     // deleting lifecycle 保持到后台物理删完；job 归零后再清 refs + deleteTask（refs 失败留 journal）。
