@@ -276,9 +276,6 @@ export const __resetFeishuOutboundForTest = (): void => {
   getBotAppInfoImpl = defaultGetBotAppInfo;
 };
 
-/** 流式卡 finalize 后追发短文本的耗时门槛（秒回场景用户多半还在看、不刷屏） */
-const COMPLETION_PING_MIN_MS = 30_000;
-
 // ----------------- 小工具 -----------------
 
 const truncateOneLine = (s: string, max = 80): string => {
@@ -1150,8 +1147,8 @@ const maybeSendCompletionPing = async (
   // turn.streaming 在 ensureCardStarted 时定稿；undefined = 未建卡（本路径不会进来）
   if (turn.streaming !== true) return;
   if (opts.outcome === "stopped") return;
+  // 每轮都追发（2026-07-21 用户拍板去掉原 30s 耗时门槛——卡片更新不推通知、追发是唯一推送）
   const elapsedMs = Date.now() - turn.turnStartedAt;
-  if (elapsedMs <= COMPLETION_PING_MIN_MS) return;
 
   let text: string;
   if (!opts.ok) {

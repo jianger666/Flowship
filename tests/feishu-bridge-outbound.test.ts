@@ -901,7 +901,7 @@ describe("流式完成追发短文本", () => {
     }
   };
 
-  it("耗时 >30s + done ok → sendTextMessage 文案含「已完成」", async () => {
+  it("done ok → sendTextMessage 文案含「已完成」", async () => {
     await runTurnToDone({ taskId: "t_ping_ok", elapsedMs: 83_000 });
     expect(sendTextMessage).toHaveBeenCalledTimes(1);
     expect(sendTextMessage).toHaveBeenCalledWith(
@@ -912,12 +912,16 @@ describe("流式完成追发短文本", () => {
     expect(text).toMatch(/1m23s/);
   });
 
-  it("耗时 <30s → 不追发", async () => {
+  it("秒回短轮也追发（2026-07-21 用户拍板去掉 30s 门槛）", async () => {
     await runTurnToDone({ taskId: "t_ping_short", elapsedMs: 10_000 });
-    expect(sendTextMessage).not.toHaveBeenCalled();
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("已完成"),
+    );
   });
 
-  it("done ok=false（耗时 >30s）→ 文案含「处理失败」", async () => {
+  it("done ok=false → 文案含「处理失败」", async () => {
     await runTurnToDone({
       taskId: "t_ping_fail",
       elapsedMs: 31_000,
