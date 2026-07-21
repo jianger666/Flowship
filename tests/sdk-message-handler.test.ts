@@ -3,7 +3,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { parseTaskToolArgs } from "@/lib/tool-display";
+import { parseTaskToolArgs, parseTodoToolArgs } from "@/lib/tool-display";
 
 type WrittenEvent = {
   kind: string;
@@ -187,5 +187,35 @@ describe("handleSdkMessage task 工具 args 短字段前置 + 截断", () => {
     // truncate 默认 max=500：正文前 500 字符 + 后缀
     const body = argsStr.replace(/…\(truncated \d+ chars\)$/, "");
     expect(body.length).toBe(500);
+  });
+
+  it("updateTodos 长 todos 数组 → 事件 args 能解析出全部条目", async () => {
+    // 构造远超旧默认 500 的 todos 数组，验证放大到 4000 后仍完整可解析
+    const todos = Array.from({ length: 40 }, (_, i) => ({
+      content: `Task ${i + 1}: implement feature module section detail ${i}`,
+      status: i % 4 === 0 ? "completed" : i % 4 === 1 ? "in_progress" : "pending",
+    }));
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        name: "updateTodos",
+        call_id: "call_todos_long",
+        status: "running",
+        args: { todos, merge: true },
+      } as never,
+      assistantCtx,
+      leaseOk,
+    );
+
+    const args = toolCallEvents()[0]?.meta?.args;
+    expect(typeof args).toBe("string");
+    const argsStr = args as string;
+    // 完整 stringify 可能仍超 4000；至少不能被默认 500 截到只剩几条
+    const parsed = parseTodoToolArgs(argsStr);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.length).toBe(40);
+    expect(parsed![0]?.content).toContain("Task 1:");
+    expect(parsed![39]?.content).toContain("Task 40:");
   });
 });

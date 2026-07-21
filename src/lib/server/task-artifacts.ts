@@ -167,6 +167,53 @@ export const saveImageAttachments = async (
   });
 };
 
+// ----------------- 粘贴超长文本附件（uploads/paste-<ts>.txt）-----------------
+
+/** 单次粘贴文本上限 2MB（UTF-8 字节），与 paste-text route / lib 常量对齐 */
+const MAX_PASTE_TEXT_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 把用户粘贴的超长纯文本落盘到 `data/tasks/<id>/uploads/paste-<ts>.txt`。
+ *
+ * 与 saveImageAttachments 同锁约定：落盘段走 withTaskLock + lifecycle / meta 复查，
+ * 防 DELETE 并发后重建孤儿 uploads。文件名带时间戳、同秒多次粘贴靠 ms 区分够用。
+ */
+export const savePastedTextAttachment = async (
+  taskId: string,
+  content: string,
+): Promise<{ absPath: string; filename: string; bytes: number }> => {
+  sanitizeId(taskId);
+  if (!content) {
+    throw new Error("粘贴内容为空");
+  }
+  const bytes = Buffer.byteLength(content, "utf8");
+  if (bytes > MAX_PASTE_TEXT_BYTES) {
+    throw new Error(
+      `粘贴文本过大：${(bytes / 1024 / 1024).toFixed(2)} MB（上限 ${
+        MAX_PASTE_TEXT_BYTES / 1024 / 1024
+      } MB）`,
+    );
+  }
+
+  return withTaskLock(taskId, async () => {
+    if (getChatLifecycle(taskId) === "deleting") {
+      throw new Error("任务正在删除、附件未保存");
+    }
+    const meta = await readMetaV06(taskId);
+    if (!meta) {
+      throw new Error("任务不存在或已删除、附件未保存");
+    }
+
+    const uploadsDir = path.join(taskDir(taskId), UPLOADS_DIR);
+    await fs.mkdir(uploadsDir, { recursive: true });
+
+    const filename = `paste-${Date.now()}.txt`;
+    const absPath = path.join(uploadsDir, filename);
+    await fs.writeFile(absPath, content, "utf8");
+    return { absPath, filename, bytes };
+  });
+};
+
 // ----------------- artifact 读 -----------------
 
 /**

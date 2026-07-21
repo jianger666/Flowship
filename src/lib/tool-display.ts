@@ -16,9 +16,160 @@ import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
 export const isEphemeralToolOutputDelta = (ev: TaskEvent): boolean =>
   ev.kind === "tool_output_delta" || ev.id.startsWith("ephemeral_tod_");
 
+/** 待办条目（updateTodos / todo_write 等） */
+export type TodoItem = {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+};
+
+const TODO_STATUS_SET = new Set<TodoItem["status"]>([
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+]);
+
+/**
+ * 是否待办清单类工具（大小写 / 下划线变体）。
+ * 进专属卡 + 连续合并；不进 verb-group。
+ */
+export const isTodoTool = (name: string): boolean => {
+  const n = name.toLowerCase().replace(/[-_\s]/g, "");
+  return (
+    n === "updatetodos" ||
+    n === "todowrite" ||
+    n === "writetodos" ||
+    n === "todoupdate"
+  );
+};
+
+const normalizeTodoStatus = (v: unknown): TodoItem["status"] => {
+  if (typeof v === "string" && TODO_STATUS_SET.has(v as TodoItem["status"])) {
+    return v as TodoItem["status"];
+  }
+  // 非法 / 缺失 → pending（容错，别整条丢）
+  return "pending";
+};
+
+/** 单条 todo 对象 → TodoItem；非对象返 null */
+const normalizeTodoItem = (raw: unknown): TodoItem | null => {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  // content 缺失时兜底 title / 空串，仍出条目（status 仍可读）
+  let content = "";
+  if (typeof obj.content === "string") content = obj.content;
+  else if (typeof obj.title === "string") content = obj.title;
+  return { content, status: normalizeTodoStatus(obj.status) };
+};
+
+/**
+ * 残缺 / 截断 JSON：从 `"todos":[` 后抠完整 `{...}` 对象。
+ * 抠不出完整条目 → null（调用方回退普通工具行）。
+ */
+const extractTodosFromPartialJson = (raw: string): TodoItem[] | null => {
+  const m = raw.match(/"todos"\s*:\s*\[/);
+  if (!m || m.index == null) return null;
+  const slice = raw.slice(m.index + m[0].length);
+  const items: TodoItem[] = [];
+  let i = 0;
+  while (i < slice.length) {
+    while (i < slice.length && /[\s,]/.test(slice[i]!)) i += 1;
+    if (i >= slice.length || slice[i] === "]") break;
+    if (slice[i] !== "{") break; // 半截对象 / 非对象 → 停
+
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+    for (; j < slice.length; j += 1) {
+      const c = slice[j]!;
+      if (inStr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c === "\\") {
+          esc = true;
+          continue;
+        }
+        if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') {
+        inStr = true;
+        continue;
+      }
+      if (c === "{") depth += 1;
+      else if (c === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          j += 1;
+          break;
+        }
+      }
+    }
+    // 括号未闭合 = 截断在对象中间，后面都不可信
+    if (depth !== 0) break;
+
+    try {
+      const parsed: unknown = JSON.parse(slice.slice(i, j));
+      const item = normalizeTodoItem(parsed);
+      if (item) items.push(item);
+    } catch {
+      break;
+    }
+    i = j;
+  }
+  return items.length > 0 ? items : null;
+};
+
+/**
+ * 解析 updateTodos 类工具的 args。
+ * 容忍：JSON 字符串 / 已解析对象 / 截断前缀（尽量抠完整条目）。
+ * 抠不出任何条目 → null（UI 回退 RegularToolBlockRow）。
+ */
+export const parseTodoToolArgs = (
+  args: string | Record<string, unknown> | null | undefined,
+): TodoItem[] | null => {
+  if (args == null) return null;
+
+  const fromTodosField = (todos: unknown): TodoItem[] | null => {
+    if (!Array.isArray(todos) || todos.length === 0) return null;
+    const items: TodoItem[] = [];
+    for (const t of todos) {
+      const item = normalizeTodoItem(t);
+      if (item) items.push(item);
+    }
+    return items.length > 0 ? items : null;
+  };
+
+  if (typeof args === "object" && !Array.isArray(args)) {
+    return fromTodosField(args.todos);
+  }
+
+  if (typeof args === "string") {
+    const cleaned = args.replace(/…\(truncated \d+ chars\)$/, "").trim();
+    if (!cleaned) return null;
+    const parsed = parseToolArgsJson(cleaned);
+    if (parsed) return fromTodosField(parsed.todos);
+    // 截断 JSON：尽量抠已写完的完整 todo 对象
+    return extractTodosFromPartialJson(cleaned);
+  }
+
+  return null;
+};
+
+/** 折叠行摘要：`N 项 · M 完成` */
+export const todoListSummary = (todos: TodoItem[]): string => {
+  const done = todos.filter((t) => t.status === "completed").length;
+  return `${todos.length} 项 · ${done} 完成`;
+};
+
 /** GB verb_group：非破坏性读/搜类 */
 export const isVerbGroupMember = (name: string): boolean => {
   const n = name.toLowerCase();
+  // 待办专属卡 / 连续合并，绝不进 verb-group
+  if (isTodoTool(name)) return false;
   if (n.startsWith("mcp:")) return false;
   if (
     n === "shell" ||
@@ -84,6 +235,8 @@ export const toolBlockDefaultCollapsed = (
   const n = name.toLowerCase();
   // edit/write：展开看 inline diff（GB collapsed_edit_blocks=OFF 同款）
   if (n === "edit" || n === "write") return false;
+  // 待办清单本身就是要看的内容 → 默认展开
+  if (isTodoTool(name)) return false;
   // shell 对齐 GB Execute=Collapsed；其余默认折叠
   return true;
 };
@@ -360,7 +513,29 @@ export const mergeToolDisplayEvents = (
     raw.push(ev);
   }
 
-  return groupVerbRuns(raw);
+  // 连续 updateTodos 只留最新（中间状态无回看价值）；再进 verb-group
+  return groupVerbRuns(collapseConsecutiveTodoBlocks(raw));
+};
+
+/**
+ * 连续多条待办工具块（中间无其它非 ephemeral 项）→ 只保留最新一条。
+ * id/ts 用最新，虚拟列表 key 跟随最新 call。
+ */
+const collapseConsecutiveTodoBlocks = (
+  items: StreamRenderItem[],
+): StreamRenderItem[] => {
+  const out: StreamRenderItem[] = [];
+  for (const it of items) {
+    if (isToolBlock(it) && isTodoTool(it.name)) {
+      const prev = out[out.length - 1];
+      if (prev && isToolBlock(prev) && isTodoTool(prev.name)) {
+        out[out.length - 1] = it;
+        continue;
+      }
+    }
+    out.push(it);
+  }
+  return out;
 };
 
 const groupVerbRuns = (items: StreamRenderItem[]): StreamRenderItem[] => {
@@ -531,6 +706,12 @@ export const toolBlockSummary = (block: ToolBlock): string => {
   const parsed = parseToolArgsJson(block.args);
   const diff = block.result?.diff;
   const diffStats = diff ? countDiffStats(diff) : null;
+
+  // 待办：N 项 · M 完成（专属卡折叠行同文案）
+  if (isTodoTool(block.name)) {
+    const todos = parseTodoToolArgs(block.args);
+    if (todos) return todoListSummary(todos);
+  }
 
   // edit / write：路径 + 行统计
   if (n === "edit" || n === "write") {

@@ -787,6 +787,24 @@ const EventStreamImpl = ({
     await handleResend(lastUserReply.text, lastUserReply);
   }, [handleResend, lastUserReply]);
 
+  // 引用追问：选中 AI 回复 → 浮动「引用」→ 把选区写成 markdown blockquote 前置进 draft
+  // （零服务端改动；blockquote 语义模型天然理解；不进 composer 内部）
+  const handleQuote = useCallback(
+    (text: string) => {
+      const quoted = text
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n");
+      setDraft((prev) => {
+        const next = `${quoted}\n\n${prev}`;
+        saveDraft("reply", task.id, next);
+        return next;
+      });
+      inputRef.current?.focus();
+    },
+    [task.id],
+  );
+
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
   const sendingLockRef = useRef(false);
   // 排队 / 立即发送共用同一套「取草稿 → 发送 → 成功清空」流程、只有发送通道不同
@@ -1068,6 +1086,8 @@ const EventStreamImpl = ({
                         : undefined
                     }
                     onRewind={isChat ? onRewind : undefined}
+                    // 引用追问：可发消息时所有 AI 回复都可引用（不限最后一条）
+                    onQuote={isChat && canCompose ? handleQuote : undefined}
                     runActive={!!isRunning}
                   />
                 )}
@@ -1112,6 +1132,9 @@ const EventStreamImpl = ({
             onRemovePath={pathAttach.removePath}
             onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
             picking={pathAttach.picking}
+            onPasteLongText={(content) =>
+              pathAttach.addPastedText(task.id, content)
+            }
             topRow={composerTop}
             leading={composerLeading}
             running={isRunning}

@@ -25,6 +25,7 @@ import {
   MessageSquareText,
   PencilLine,
   Plug,
+  Quote,
   RotateCcw,
   Send,
   Sparkles,
@@ -266,6 +267,7 @@ const EventRowImpl = ({
   onResend,
   onRegenerate,
   onRewind,
+  onQuote,
   runActive = false,
 }: {
   ev: TaskEvent;
@@ -288,6 +290,12 @@ const EventRowImpl = ({
   onRegenerate?: () => void | Promise<void>;
   /** chat checkpoint 回退：仅 checkpointed user_reply + 非 running 时传 */
   onRewind?: (eventId: string) => void;
+  /**
+   * chat「引用追问」：选中 AI 回复一段文字后点浮动「引用」——把选区文本回传给父、
+   * 由 event-stream 前置成 markdown blockquote 写进 draft（零服务端改动）。
+   * 仅 chat + canCompose 时父才传；本组件只在 assistant 分支启用选中检测。
+   */
+  onQuote?: (text: string) => void;
   /** agent 正在跑：隐藏回退按钮 */
   runActive?: boolean;
 }) => {
@@ -308,10 +316,48 @@ const EventRowImpl = ({
   const resendLockRef = useRef(false);
   // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、别写死）
   const submitShortcut = useSubmitShortcut();
+  // AI 回复容器：引用按钮相对此节点定位（容器已 relative）
+  const assistantContainerRef = useRef<HTMLDivElement>(null);
+  // 选区浮动「引用」按钮：相对容器的 top/left + 已截断的选中文本；null = 不显示
+  const [quoteBtn, setQuoteBtn] = useState<{
+    top: number;
+    left: number;
+    text: string;
+  } | null>(null);
   // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
   useEffect(() => {
     if (!onResend) setEditing(false);
   }, [onResend]);
+  // 引用能力关掉时清浮动按钮（canCompose 变 false / 切 task）
+  useEffect(() => {
+    if (!onQuote) setQuoteBtn(null);
+  }, [onQuote]);
+  // 选区清空或落到本消息外 → 藏按钮（mouseup 负责出现；这里只清理）
+  useEffect(() => {
+    if (!onQuote) return;
+    const onSelectionChange = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setQuoteBtn(null);
+        return;
+      }
+      const container = assistantContainerRef.current;
+      const anchor = sel.anchorNode;
+      const focus = sel.focusNode;
+      // 跨消息选区（anchor/focus 不在同一容器）一律不显示
+      if (
+        !container ||
+        !anchor ||
+        !focus ||
+        !container.contains(anchor) ||
+        !container.contains(focus)
+      ) {
+        setQuoteBtn(null);
+      }
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => document.removeEventListener("selectionchange", onSelectionChange);
+  }, [onQuote]);
 
   const runResend = async (
     text: string,
@@ -431,8 +477,53 @@ const EventRowImpl = ({
     // AI 回复：平铺 prose、hover 出「复制」；最后一条还可「重新生成」（与复制并排）
     // 字号略大于过程行、长文可读性优先
     if (isAssistant) {
+      // mouseup 读选区：非空且完全落在本消息容器内 → 在选区顶部中间浮「引用」
+      const handleAssistantMouseUp = () => {
+        if (!onQuote) return;
+        // rAF：等浏览器把选区 commit 完再读（部分浏览器 mouseup 时 selection 尚不稳定）
+        requestAnimationFrame(() => {
+          const sel = window.getSelection();
+          const container = assistantContainerRef.current;
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !container) {
+            setQuoteBtn(null);
+            return;
+          }
+          const anchor = sel.anchorNode;
+          const focus = sel.focusNode;
+          if (
+            !anchor ||
+            !focus ||
+            !container.contains(anchor) ||
+            !container.contains(focus)
+          ) {
+            setQuoteBtn(null);
+            return;
+          }
+          const trimmed = sel.toString().trim();
+          if (!trimmed) {
+            setQuoteBtn(null);
+            return;
+          }
+          // 截断 1000 字，防整篇引用撑爆输入框
+          const text =
+            trimmed.length > 1000 ? trimmed.slice(0, 1000) : trimmed;
+          const range = sel.getRangeAt(0);
+          const rect = range.getBoundingClientRect();
+          const containerRect = container.getBoundingClientRect();
+          setQuoteBtn({
+            top: rect.top - containerRect.top,
+            left: rect.left - containerRect.left + rect.width / 2,
+            text,
+          });
+        });
+      };
+
       return (
-        <div className="group relative text-[15px] leading-7">
+        <div
+          ref={assistantContainerRef}
+          className="group relative text-[15px] leading-7"
+          onMouseUp={onQuote ? handleAssistantMouseUp : undefined}
+        >
           <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
             <button
               type="button"
@@ -458,6 +549,26 @@ const EventRowImpl = ({
               </button>
             )}
           </div>
+          {/* 选区浮动「引用」：绝对定位相对本容器；mousedown preventDefault 防点按钮时选区塌陷导致按钮先 unmount */}
+          {quoteBtn && onQuote && (
+            <button
+              type="button"
+              aria-label="引用"
+              className="absolute z-10 flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-md bg-foreground px-2 py-1 text-xs text-background opacity-100 shadow-md transition-opacity"
+              style={{ top: quoteBtn.top, left: quoteBtn.left }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+              }}
+              onClick={() => {
+                onQuote(quoteBtn.text);
+                setQuoteBtn(null);
+                window.getSelection()?.removeAllRanges();
+              }}
+            >
+              <Quote className="size-3" />
+              引用
+            </button>
+          )}
           <MarkdownText text={ev.text} />
         </div>
       );

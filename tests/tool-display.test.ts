@@ -3,11 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   countDiffStats,
   isEphemeralToolOutputDelta,
+  isTodoTool,
   isVerbGroupMember,
   mergeToolDisplayEvents,
   parseTaskToolArgs,
+  parseTodoToolArgs,
   parseToolArgsJson,
   parseUnifiedDiff,
+  todoListSummary,
   toolBlockDefaultCollapsed,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
@@ -432,5 +435,125 @@ describe("parseUnifiedDiff", () => {
     expect(truncated[2]).toEqual({ kind: "context", text: "orphan" });
     expect(truncated[1].oldLine).toBeUndefined();
     expect(truncated[2].newLine).toBeUndefined();
+  });
+});
+
+describe("parseTodoToolArgs / updateTodos 合并", () => {
+  it("isTodoTool 识别 updateTodos / update_todos / todo_write 变体", () => {
+    expect(isTodoTool("updateTodos")).toBe(true);
+    expect(isTodoTool("Update_Todos")).toBe(true);
+    expect(isTodoTool("todo_write")).toBe(true);
+    expect(isTodoTool("TodoWrite")).toBe(true);
+    expect(isTodoTool("shell")).toBe(false);
+    expect(isVerbGroupMember("updateTodos")).toBe(false);
+  });
+
+  it("完整 JSON 解析 todos + 非法 status 当 pending", () => {
+    const args = JSON.stringify({
+      todos: [
+        { content: "A", status: "completed" },
+        { content: "B", status: "weird" },
+        { status: "in_progress" },
+      ],
+      merge: true,
+    });
+    expect(parseTodoToolArgs(args)).toEqual([
+      { content: "A", status: "completed" },
+      { content: "B", status: "pending" },
+      { content: "", status: "in_progress" },
+    ]);
+  });
+
+  it("截断 JSON 尽量抠完整条目", () => {
+    // 第三条 content 未闭合 → 只保留前两条完整对象
+    const partial =
+      '{"todos":[{"content":"一","status":"completed"},{"content":"二","status":"pending"},{"content":"三未闭合';
+    const got = parseTodoToolArgs(partial);
+    expect(got).toEqual([
+      { content: "一", status: "completed" },
+      { content: "二", status: "pending" },
+    ]);
+  });
+
+  it("抠不出条目返 null", () => {
+    expect(parseTodoToolArgs("")).toBeNull();
+    expect(parseTodoToolArgs("{}")).toBeNull();
+    expect(parseTodoToolArgs('{"todos":[')).toBeNull();
+  });
+
+  it("todoListSummary 与默认展开", () => {
+    expect(
+      todoListSummary([
+        { content: "a", status: "completed" },
+        { content: "b", status: "pending" },
+        { content: "c", status: "completed" },
+      ]),
+    ).toBe("3 项 · 2 完成");
+    expect(toolBlockDefaultCollapsed("updateTodos")).toBe(false);
+    expect(
+      toolBlockSummary(
+        block({
+          name: "updateTodos",
+          args: JSON.stringify({
+            todos: [
+              { content: "x", status: "completed" },
+              { content: "y", status: "pending" },
+            ],
+          }),
+        }),
+      ),
+    ).toBe("2 项 · 1 完成");
+  });
+
+  it("连续三连 updateTodos + assistant 隔开的第四条 → 保留最新第三条 + 第四条", () => {
+    const mkTodo = (
+      id: string,
+      callId: string,
+      label: string,
+      ts: number,
+    ): TaskEvent =>
+      ev({
+        id,
+        kind: "tool_call",
+        text: "调用 updateTodos",
+        ts,
+        meta: {
+          callId,
+          name: "updateTodos",
+          args: JSON.stringify({
+            todos: [{ content: label, status: "pending" }],
+            merge: true,
+          }),
+        },
+      });
+
+    const out = mergeToolDisplayEvents([
+      mkTodo("t1", "c1", "v1", 1),
+      mkTodo("t2", "c2", "v2", 2),
+      mkTodo("t3", "c3", "v3", 3),
+      ev({
+        id: "a1",
+        kind: "assistant_message",
+        text: "中间旁白",
+        ts: 4,
+      }),
+      mkTodo("t4", "c4", "v4", 5),
+    ]);
+
+    expect(out).toHaveLength(3);
+    expect(out[0]).toMatchObject({
+      kind: "__tool_block__",
+      id: "t3",
+      callId: "c3",
+      name: "updateTodos",
+    });
+    expect((out[0] as ToolBlock).args).toContain("v3");
+    expect(out[1]).toMatchObject({ kind: "assistant_message", text: "中间旁白" });
+    expect(out[2]).toMatchObject({
+      kind: "__tool_block__",
+      id: "t4",
+      callId: "c4",
+    });
+    expect((out[2] as ToolBlock).args).toContain("v4");
   });
 });

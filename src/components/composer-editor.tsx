@@ -73,6 +73,7 @@ import {
 } from "@/lib/keyboard-shortcuts";
 import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
+import { shouldConvertPasteToAttachment } from "@/lib/paste-text-attach";
 
 /** 与旧 textarea 排版对齐，拖高 / placeholder 视觉不变 */
 const COMPOSER_EDITOR_CLASS =
@@ -107,6 +108,11 @@ export interface ComposerEditorProps {
   /** `@` 文件引用（由 Composer 在有 session 时创建） */
   atMention?: AtMentionApi;
   attach?: UseImageAttachReturn;
+  /**
+   * 超长纯文本粘贴转附件；不传则走 Lexical 默认插入。
+   * 异步失败返 false 时本插件把原文插回选区，避免丢用户内容。
+   */
+  onPasteLongText?: (content: string) => Promise<boolean>;
   className?: string;
 }
 
@@ -770,6 +776,65 @@ const PasteImagePlugin = ({ attach }: { attach?: UseImageAttachReturn }) => {
   return null;
 };
 
+/**
+ * 粘贴超长纯文本 → 附件 pill（Cursor 同款）。
+ * 优先级与 PasteImagePlugin 同级 HIGH：有图时先让图插件吃（本 handler 见图即放行）；
+ * 无图且超阈值才 preventDefault + 调 onPasteLongText。
+ */
+const PasteLongTextPlugin = ({
+  onPasteLongText,
+}: {
+  onPasteLongText?: (content: string) => Promise<boolean>;
+}) => {
+  const [editor] = useLexicalComposerContext();
+  const handlerRef = useRef(onPasteLongText);
+  handlerRef.current = onPasteLongText;
+
+  useEffect(() => {
+    return editor.registerCommand(
+      PASTE_COMMAND,
+      (event) => {
+        const handler = handlerRef.current;
+        if (!handler || !(event instanceof ClipboardEvent)) return false;
+        const items = event.clipboardData?.items;
+        // 剪贴板带图 → 交给 PasteImagePlugin，不抢
+        if (items) {
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            if (item && item.kind === "file" && item.type.startsWith("image/")) {
+              return false;
+            }
+          }
+        }
+        const text = event.clipboardData?.getData("text/plain") ?? "";
+        if (!shouldConvertPasteToAttachment(text)) return false;
+
+        event.preventDefault();
+        // 异步落盘：成功则已加 path pill；失败把原文插回选区（别丢用户内容）
+        void (async () => {
+          const ok = await handler(text);
+          if (ok) return;
+          editor.update(() => {
+            const selection = $getSelection();
+            if ($isRangeSelection(selection)) {
+              selection.insertText(text);
+            } else {
+              const root = $getRoot();
+              root.selectEnd();
+              const sel = $getSelection();
+              if ($isRangeSelection(sel)) sel.insertText(text);
+            }
+          });
+        })();
+        return true;
+      },
+      COMMAND_PRIORITY_HIGH,
+    );
+  }, [editor]);
+
+  return null;
+};
+
 const FocusHandlePlugin = ({
   focusRef,
   pendingCursorRef,
@@ -810,6 +875,7 @@ const ComposerEditorInner = ({
   slash,
   atMention,
   attach,
+  onPasteLongText,
   className,
   lastEmittedRef,
   pendingCursorRef,
@@ -931,6 +997,7 @@ const ComposerEditorInner = ({
         editorKey={editorKey}
       />
       <PasteImagePlugin attach={attach} />
+      <PasteLongTextPlugin onPasteLongText={onPasteLongText} />
       <FocusHandlePlugin
         focusRef={focusRef}
         pendingCursorRef={pendingCursorRef}

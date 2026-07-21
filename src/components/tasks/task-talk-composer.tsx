@@ -186,6 +186,9 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
           onRemovePath={pathAttach.removePath}
           onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
           picking={pathAttach.picking}
+          onPasteLongText={(content) =>
+            pathAttach.addPastedText(task.id, content)
+          }
           leading={
             <ModelSelect
               models={models}

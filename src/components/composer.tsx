@@ -89,6 +89,11 @@ export interface ComposerProps {
   onRemovePath?: (p: string) => void;
   onPickPaths?: (mode: "file" | "folder") => void;
   picking?: false | "file" | "folder";
+  /**
+   * 粘贴超长纯文本 → 转路径附件（父组件调 paste-text API + addAbsPath）。
+   * 不传 = 超长文本仍正常插入编辑器；失败应返 false 让编辑器把原文插回。
+   */
+  onPasteLongText?: (content: string) => Promise<boolean>;
 
   /** 岛顶配置行（chat 的工作目录 / 分支选择器） */
   topRow?: ReactNode;
@@ -132,6 +137,7 @@ export const Composer = ({
   onRemovePath,
   onPickPaths,
   picking = false,
+  onPasteLongText,
   topRow,
   leading,
   running,
@@ -347,6 +353,7 @@ export const Composer = ({
         slash={slash}
         atMention={atForEditor}
         attach={attach}
+        onPasteLongText={onPasteLongText}
       />
 
       {/* footer：左 slot + 右动作组（运行态原地替换、不顶布局） */}

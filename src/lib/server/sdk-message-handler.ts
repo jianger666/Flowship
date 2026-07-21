@@ -84,9 +84,23 @@ export const __resetToolCallRunningSeenForTest = (): void => {
 const TASK_TOOL_ARGS_TRUNCATE_MAX = 2000;
 
 /**
+ * updateTodos 主体是 todos 数组，没法短字段前置；默认 500 会截断条目 →
+ * 前端 parseTodoToolArgs 解析不全。放宽到 4000 够常见清单。
+ */
+const TODO_TOOL_ARGS_TRUNCATE_MAX = 4000;
+
+/** updateTodos / update_todos（大小写不敏感） */
+const isUpdateTodosToolName = (name: string): boolean => {
+  const n = name.toLowerCase();
+  return n === "updatetodos" || n === "update_todos";
+};
+
+/**
  * task 工具：短字段（description / model / subagentType）前置再 stringify。
  * 原始键序常是 description→prompt→subagentType→model，prompt 动辄 500+，
  * 默认 truncate(500) 会把尾部 model 永久截掉 → 前端徽标永远拿不到。
+ *
+ * updateTodos：放大截断上限（见 TODO_TOOL_ARGS_TRUNCATE_MAX）。
  */
 const stringifyToolCallArgs = (
   name: string,
@@ -105,6 +119,13 @@ const stringifyToolCallArgs = (
     return {
       argsStr: stringifyMeta(reordered),
       truncateMax: TASK_TOOL_ARGS_TRUNCATE_MAX,
+    };
+  }
+  // 待办清单：数组是主体，只能放大截断上限
+  if (isUpdateTodosToolName(name)) {
+    return {
+      argsStr: stringifyMeta(args),
+      truncateMax: TODO_TOOL_ARGS_TRUNCATE_MAX,
     };
   }
   return { argsStr: stringifyMeta(args), truncateMax: 500 };

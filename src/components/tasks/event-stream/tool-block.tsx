@@ -13,7 +13,10 @@ import {
   Bot,
   Check,
   ChevronRight,
+  Circle,
+  CircleSlash,
   FileCode2,
+  ListTodo,
   Loader2,
   Terminal,
   X,
@@ -24,14 +27,18 @@ import { MarkdownText } from "@/components/markdown-text";
 import { cn } from "@/lib/utils";
 import {
   countDiffStats,
+  isTodoTool,
   parseTaskToolArgs,
+  parseTodoToolArgs,
   parseUnifiedDiff,
+  todoListSummary,
   toolBlockDefaultCollapsed,
   toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
   verbGroupLabel,
   type DiffViewLine,
+  type TodoItem,
   type ToolBlock,
   type ToolVerbGroup,
 } from "@/lib/tool-display";
@@ -604,10 +611,125 @@ const RegularToolBlockRow = ({
   );
 };
 
+/**
+ * name=updateTodos 待办清单专属卡。
+ * 默认展开（清单本身就是要看的）；解析失败由分流点回退 RegularToolBlockRow。
+ */
+const TodoToolBlock = ({
+  block,
+  nested,
+}: ToolBlockRowProps) => {
+  // 清单默认展开；nested（verb 内）仍跟 defaultCollapsed
+  const [collapsed, setCollapsed] = useState(() =>
+    toolBlockDefaultCollapsed(block.name, nested),
+  );
+
+  const todos = useMemo(
+    () => parseTodoToolArgs(block.args) ?? [],
+    [block.args],
+  );
+  const summary = todoListSummary(todos);
+
+  const statusIcon =
+    block.status === "running" ? (
+      <Loader2 className="size-3.5 shrink-0 animate-spin text-sky-500" />
+    ) : block.status === "error" ? (
+      <X className="size-3.5 shrink-0 text-destructive" />
+    ) : (
+      <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+    );
+
+  return (
+    <div className={cn("group/tool", nested && "pl-0")}>
+      <button
+        type="button"
+        onClick={() => setCollapsed((c) => !c)}
+        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+      >
+        <CollapseChevron open={!collapsed} />
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-sky-500/15 dark:bg-sky-400/20">
+          <ListTodo className="size-3.5 text-sky-600 dark:text-sky-300" />
+        </span>
+        <span className="shrink-0 rounded-md bg-sky-500/15 px-1.5 py-px text-[10px] font-semibold tracking-wide text-sky-700 dark:bg-sky-400/20 dark:text-sky-200">
+          待办
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[11px] tabular-nums opacity-80">
+          {summary}
+        </span>
+        {statusIcon}
+        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+          {formatTs(block.ts)}
+        </span>
+      </button>
+
+      {!collapsed && (
+        <ul className="ml-5 mt-1 space-y-1 border-l border-border/50 pl-3">
+          {todos.map((item, i) => (
+            <TodoToolItemRow key={i} item={item} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+};
+
+/** 单行待办：状态图标 + 内容（truncate + title 全文） */
+const TodoToolItemRow = ({ item }: { item: TodoItem }) => {
+  const done = item.status === "completed";
+  const cancelled = item.status === "cancelled";
+  const active = item.status === "in_progress";
+
+  return (
+    <li className="flex min-w-0 items-start gap-1.5">
+      <TodoStatusIcon status={item.status} />
+      <span
+        title={item.content}
+        className={cn(
+          "min-w-0 flex-1 truncate text-xs leading-5",
+          done && "text-muted-foreground line-through",
+          cancelled && "text-muted-foreground/70 line-through",
+          active && "font-medium text-foreground",
+          !done && !cancelled && !active && "text-muted-foreground",
+        )}
+      >
+        {item.content || "（无标题）"}
+      </span>
+    </li>
+  );
+};
+
+const TodoStatusIcon = ({ status }: { status: TodoItem["status"] }) => {
+  if (status === "completed") {
+    return (
+      <Check className="mt-0.5 size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+    );
+  }
+  if (status === "in_progress") {
+    // 实心点 primary：当前推进项高亮
+    return (
+      <span
+        className="mt-1.5 size-2 shrink-0 rounded-full bg-primary"
+        aria-hidden
+      />
+    );
+  }
+  if (status === "cancelled") {
+    return (
+      <CircleSlash className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/60" />
+    );
+  }
+  // pending：空心圈
+  return <Circle className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/50" />;
+};
+
 const ToolBlockRowImpl = (props: ToolBlockRowProps) => {
   // task 子代理：走专属卡片（独立组件，避免 hooks 条件分支）
   if (props.block.name.toLowerCase() === "task") {
     return <TaskSubagentBlock {...props} />;
+  }
+  // updateTodos：解析成功才走专属卡；失败回退普通行（别渲空清单）
+  if (isTodoTool(props.block.name) && parseTodoToolArgs(props.block.args)) {
+    return <TodoToolBlock {...props} />;
   }
   return <RegularToolBlockRow {...props} />;
 };

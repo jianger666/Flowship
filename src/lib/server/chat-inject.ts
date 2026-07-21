@@ -76,6 +76,7 @@ import {
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
 import { buildSkillDirective } from "@/lib/protocol-signals";
+import { buildLinkedUrlsSection } from "@/lib/server/url-fetch";
 import {
   errorResponse,
   isValidModel,
@@ -300,7 +301,9 @@ export const handleChatReplyInject = async (
       ? "(用户附了图片 / 文件)"
       : "";
   // 事件 = 用户原文；agent = skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
-  const agentText = buildSkillDirective(skills) + text;
+  // URL 投喂：用户贴链接时并发抓网页正文拼进尾部（失败降级、不挡发送；本函数仅 chat 模式）
+  const linkedSection = await buildLinkedUrlsSection(text);
+  const agentText = buildSkillDirective(skills) + text + linkedSection;
 
   // Phase 3：绑定 workdir 的 chat 在 agent 开工前打 git tree 快照（失败不挡发消息）
   const tryCaptureCheckpoint = async (): Promise<CaptureCheckpointResult> => {
