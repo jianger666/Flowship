@@ -3,17 +3,10 @@
  *
  * run-perf 在 turn-ended 记 usage 时同步写入本 Map；
  * 会话关闭不清（保留最后值）；进程重启后无数据 → totalTokens: null。
+ *
+ * 注意：turn-ended 的 inputTokens 是整 turn 内所有 LLM 步的累计（每步工具循环
+ * 重发全上下文、重复计数），不能当真实上下文窗口占用——仅作粗略透视。
  */
-
-/** 建议压缩阈值：最近 turn inputTokens 超过则 compactRecommended=true（将来可调） */
-export const COMPACT_RECOMMENDED_INPUT_TOKENS = 200_000;
-
-/**
- * 自动压缩阈值（绝对值）。
- * 我们没有精确 context window 数字；按 GB 约 85% context 粗估，从 260k inputTokens 起步。
- * 超阈值 → run 收尾自动 compact；失败再落 info 让用户手动。
- */
-export const COMPACT_SUGGEST_INFO_INPUT_TOKENS = 260_000;
 
 export type ChatTurnUsage = {
   inputTokens: number;
@@ -31,11 +24,6 @@ export type ChatContextUsageRecord = {
    * breakdown「首包注入」用 bytes/4 估 tokens；会话关闭后仍保留。
    */
   firstPromptBytes: number | null;
-  /**
-   * 本会话是否已尝试过自动 compact（成功或失败都算）。
-   * 失败降级后不再死循环重试；新会话（首包重建）清零。
-   */
-  autoCompactAttempted?: boolean;
 };
 
 interface ChatUsageGlobalState {
@@ -55,7 +43,7 @@ const getUsageState = (): ChatUsageGlobalState => {
   return g[CHAT_USAGE_GLOBAL_KEY]!;
 };
 
-/** 记下首包字节（每次 chat-first / 压缩重建会话时覆盖） */
+/** 记下首包字节（每次 chat-first 时覆盖） */
 export const recordChatFirstPromptBytes = (
   taskId: string,
   promptBytes: number,
@@ -68,12 +56,9 @@ export const recordChatFirstPromptBytes = (
       outputTokens: 0,
       cacheReadTokens: 0,
     },
-    // 压缩重建后 turn 计数可延续；首包字节必须换成新会话的
     turnCount: cur?.turnCount ?? 0,
     lastTurnAt: cur?.lastTurnAt ?? 0,
     firstPromptBytes: promptBytes,
-    // 保留 autoCompactAttempted：压缩续接首包不能清，否则续接 turn 仍超阈值会死循环再压
-    autoCompactAttempted: cur?.autoCompactAttempted,
   });
 };
 
@@ -84,17 +69,11 @@ export const recordChatTurnUsage = (
 ): ChatContextUsageRecord => {
   const map = getUsageState().byTask;
   const cur = map.get(taskId);
-  // 上下文已明显降到阈值一半以下 → 允许下次再自动压（成功压缩后的正常路径）
-  let attempted = cur?.autoCompactAttempted;
-  if (usage.inputTokens < COMPACT_SUGGEST_INFO_INPUT_TOKENS * 0.5) {
-    attempted = false;
-  }
   const next: ChatContextUsageRecord = {
     lastUsage: usage,
     turnCount: (cur?.turnCount ?? 0) + 1,
     lastTurnAt: Date.now(),
     firstPromptBytes: cur?.firstPromptBytes ?? null,
-    autoCompactAttempted: attempted,
   };
   map.set(taskId, next);
   return next;
@@ -110,34 +89,6 @@ export const getChatContextUsage = (
 ): ChatContextUsageRecord | null =>
   getUsageState().byTask.get(taskId) ?? null;
 
-/** 标记本会话已尝试自动 compact（成功/失败都调，防死循环） */
-export const markChatAutoCompactAttempted = (taskId: string): void => {
-  const map = getUsageState().byTask;
-  const cur = map.get(taskId);
-  if (!cur) {
-    // 尚无 usage 记录也占位，避免紧接着又触发
-    map.set(taskId, {
-      lastUsage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
-      turnCount: 0,
-      lastTurnAt: 0,
-      firstPromptBytes: null,
-      autoCompactAttempted: true,
-    });
-    return;
-  }
-  map.set(taskId, { ...cur, autoCompactAttempted: true });
-};
-
-/**
- * 纯函数：run 收尾是否应触发自动 compact。
- * 阈值沿用 COMPACT_SUGGEST_INFO_INPUT_TOKENS；已尝试过则不再自动。
- */
-export const shouldAutoCompactAfterTurn = (
-  inputTokens: number,
-  autoCompactAttempted: boolean,
-): boolean =>
-  inputTokens > COMPACT_SUGGEST_INFO_INPUT_TOKENS && !autoCompactAttempted;
-
 /** bytes → 粗估 tokens（GB / 业界惯例 ≈ bytes/4） */
 export const estimateTokensFromBytes = (bytes: number): number =>
   Math.max(0, Math.round(bytes / 4));
@@ -147,7 +98,6 @@ export type ChatContextApiPayload = {
   breakdown: Array<{ label: string; tokens: number }>;
   turnCount: number;
   lastTurnAt: number | null;
-  compactRecommended: boolean;
 };
 
 /**
@@ -166,7 +116,6 @@ export const buildChatContextPayload = (
       breakdown: [],
       turnCount: 0,
       lastTurnAt: null,
-      compactRecommended: false,
     };
   }
 
@@ -189,6 +138,5 @@ export const buildChatContextPayload = (
     breakdown,
     turnCount: rec.turnCount,
     lastTurnAt: rec.lastTurnAt || null,
-    compactRecommended: input > COMPACT_RECOMMENDED_INPUT_TOKENS,
   };
 };

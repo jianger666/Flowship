@@ -851,12 +851,6 @@ export type EventKind =
   | "assistant_message"
   | "ask_user_request"
   | "ask_user_reply"
-  /**
-   * Chat 长会话压缩后的摘要全文（Phase 4 compact）。
-   * meta: { summary: string }——前端可折叠查看；text 可放一行摘要标题。
-   * 仅 chat 模式写入；压缩会关旧会话并以摘要重建首包。
-   */
-  | "compact_summary"
   | "error";
 
 /**

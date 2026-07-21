@@ -68,6 +68,7 @@ import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import { createRunPerfTracker } from "./run-perf";
 import {
   composeOnDelta,
+  createSdkSummaryDeltaPublisher,
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
 import { getChatMcpUrl } from "./chat-mcp";
@@ -2927,6 +2928,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
                   task.id,
                   () => !!opHandle && isTaskOpCurrent(opHandle),
                 ),
+                createSdkSummaryDeltaPublisher(
+                  task.id,
+                  () => !!opHandle && isTaskOpCurrent(opHandle),
+                ),
               ),
               onStep: perfTracker.onStep,
             });
@@ -3226,6 +3231,9 @@ const tryAutoReconnect = async (
         perfTracker.onDelta,
         // 重连 send 绑入场 opHandle
         createShellOutputDeltaPublisher(task.id, () =>
+          isTaskOpCurrent(opts.opHandle),
+        ),
+        createSdkSummaryDeltaPublisher(task.id, () =>
           isTaskOpCurrent(opts.opHandle),
         ),
       ),
@@ -4091,6 +4099,9 @@ const consumeSessionRun = async (
               createShellOutputDeltaPublisher(task.id, () =>
                 isTaskOpCurrent(opts.opHandle),
               ),
+              createSdkSummaryDeltaPublisher(task.id, () =>
+                isTaskOpCurrent(opts.opHandle),
+              ),
             ),
             onStep: perfTracker.onStep,
           });
@@ -4815,6 +4826,9 @@ export const startOneShotQuestion = (
               createShellOutputDeltaPublisher(task.id, () =>
                 isTaskOpCurrent(oneshotOpHandle),
               ),
+              createSdkSummaryDeltaPublisher(task.id, () =>
+                isTaskOpCurrent(oneshotOpHandle),
+              ),
             ),
             onStep: perfTracker.onStep,
           });
@@ -5048,6 +5062,9 @@ const sendToTaskSessionBody = async (
           perfTracker.onDelta,
           // 续接 / 问一问 send 绑入场 opHandle
           createShellOutputDeltaPublisher(task.id, () =>
+            isTaskOpCurrent(entryOpHandle),
+          ),
+          createSdkSummaryDeltaPublisher(task.id, () =>
             isTaskOpCurrent(entryOpHandle),
           ),
         ),

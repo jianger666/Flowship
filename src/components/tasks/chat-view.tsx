@@ -37,7 +37,6 @@ import {
 } from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Popover,
   PopoverContent,
@@ -74,7 +73,6 @@ import {
 } from "@/lib/task-display";
 import {
   ApiRequestError,
-  compactChatSession,
   fetchChatContext,
   rewindChatToEvent,
   sendChatReply,
@@ -162,8 +160,6 @@ export const ChatView = ({
   const [contextOpen, setContextOpen] = useState(false);
   const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
-  const [keepHints, setKeepHints] = useState("");
-  const [compacting, setCompacting] = useState(false);
 
   // 全局 prompt / confirm（重命名 / 回退）
   const { prompt, confirm } = useDialog();
@@ -223,7 +219,6 @@ export const ChatView = ({
     setStopping(false);
     setLiveToolOutputs({});
     setContextInfo(null);
-    setKeepHints("");
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
     return subscribeChatOp(task.id, applyLedgerToUi);
@@ -655,28 +650,6 @@ export const ChatView = ({
     [task.id],
   );
 
-  const handleCompact = useCallback(async () => {
-    setCompacting(true);
-    try {
-      const latest = await compactChatSession(
-        task.id,
-        keepHints.trim() || undefined,
-      );
-      onTaskUpdateRef.current(latest);
-      toast.success("会话已压缩");
-      setContextOpen(false);
-      // 刷新透视
-      try {
-        setContextInfo(await fetchChatContext(task.id));
-      } catch {
-        /* ignore */
-      }
-    } catch (err) {
-      toast.error(`压缩失败：${(err as Error).message}`);
-    } finally {
-      setCompacting(false);
-    }
-  }, [keepHints, task.id]);
 
   // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
   const canReply = !isSubmitting;
@@ -776,26 +749,6 @@ export const ChatView = ({
                           ))}
                         </ul>
                       )}
-                      {contextInfo.compactRecommended && (
-                        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-300">
-                          上下文较大，建议压缩
-                        </div>
-                      )}
-                      <Input
-                        value={keepHints}
-                        onChange={(e) => setKeepHints(e.target.value)}
-                        placeholder="保留要点（可选）"
-                        className="h-7 text-xs"
-                        disabled={compacting}
-                      />
-                      <Button
-                        size="sm"
-                        className="h-7 w-full text-xs"
-                        disabled={compacting || task.runStatus === "running"}
-                        onClick={() => void handleCompact()}
-                      >
-                        {compacting ? "压缩中…" : "压缩会话"}
-                      </Button>
                     </>
                   ) : (
                     <div className="text-xs text-muted-foreground">暂无数据</div>

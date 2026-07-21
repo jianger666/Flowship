@@ -16,8 +16,8 @@
  * 否则被删任务的历史 tree/blob 会永久留在用户仓里。
  *
  * 与 chat-runner / chat-reply 的配合：本侧 tryBeginChatRewind 占门闩；对侧在
- * 发送/启动/compact/drain 前同步检查 isChatRewindInProgress；本侧再查
- * isCompactInProgress / isQueueDraining，两侧 check-and-set 交叉闭合竞态窗口。
+ * 发送/启动/drain 前同步检查 isChatRewindInProgress；本侧再查
+ * isQueueDraining，两侧 check-and-set 交叉闭合竞态窗口。
  */
 
 import { execFile } from "node:child_process";
@@ -970,11 +970,6 @@ export interface RewindDeps {
   /** 当前是否有 chat run 在跑 */
   isRunActive: (taskId: string) => boolean;
   /**
-   * compact 是否进行中。与 chat-runner.compactChatSession 交叉闭合：
-   * compact 侧先 set 再查 rewind 门闩；本侧占 rewind 门闩后再查 compact。
-   */
-  isCompactInProgress: (taskId: string) => boolean;
-  /**
    * queue drain（flushChatQueue）是否进行中。与 flushChatQueue 入口的
    * rewind 门闩检查交叉闭合（另一侧在 chat-runner 做）。
    */
@@ -1046,15 +1041,6 @@ export const executeChatRewind = async (
       );
     }
 
-    // 占位后再查 compact：与 compact 侧「先 set 再查 rewind」交叉闭合
-    if (deps.isCompactInProgress(taskId)) {
-      throw new RewindError(
-        "run_active",
-        "正在压缩会话、请稍后回退",
-        409,
-      );
-    }
-
     const meta = await readMetaV06(taskId);
     if (!meta) {
       throw new RewindError("not_found", "task 不存在", 404);
@@ -1096,8 +1082,8 @@ export const executeChatRewind = async (
       }
       const lockedTarget = lockedPoints[targetIdx]!;
 
-      // —— 锁内复查（闭合 TOCTOU）：进锁前到破坏性操作之间，chat-reply / compact / drain 可能已启动 ——
-      // 对侧会在发送/启动/compact/drain 前同步检查 isChatRewindInProgress；两侧配合闭合窗口。
+      // —— 锁内复查（闭合 TOCTOU）：进锁前到破坏性操作之间，chat-reply / drain 可能已启动 ——
+      // 对侧会在发送/启动/drain 前同步检查 isChatRewindInProgress；两侧配合闭合窗口。
       const lockedMeta = await readMetaV06(taskId);
       if (!lockedMeta) {
         throw new RewindError("not_found", "task 在 rewind 中被删", 404);
@@ -1113,13 +1099,6 @@ export const executeChatRewind = async (
         throw new RewindError(
           "run_active",
           "任务 runStatus 为 running、请先停止再回退",
-          409,
-        );
-      }
-      if (deps.isCompactInProgress(taskId)) {
-        throw new RewindError(
-          "run_active",
-          "正在压缩会话、请稍后回退",
           409,
         );
       }

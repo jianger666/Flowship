@@ -1,11 +1,9 @@
 /**
- * T3 / T4 / T5（第十三轮验收）：
+ * T3 / T4（第十三轮验收）：
  * - T3：create pending → forceClear + B → A create resolve 不得 send
  * - T4：flushChatQueue single-flight，并发第二次直接 return、FIFO 不乱
- * - T5：重建 pending 时 stop → summarize_cancelled 且无 compact_done；
- *       重建失败 → restart_failed 且无 compact_done
  *
- * Mock 手法对齐 chat-runner-start-lease / compact-stop（挂起 promise、DATA_DIR 隔离）。
+ * Mock 手法对齐 chat-runner-start-lease（挂起 promise、DATA_DIR 隔离）。
  */
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -22,8 +20,6 @@ import {
 
 import type { TaskMetaV06 } from "@/lib/server/task-fs-core";
 import type { Task } from "@/lib/types";
-import { MIN_COMPACT_SUMMARY_CHARS } from "@/lib/server/chat-compact-prompt";
-
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-chat-t3-t4-t5-"));
 const DATA_DIR = path.join(TMP_ROOT, "data");
 process.env.FLOWSHIP_DATA_DIR = DATA_DIR;
@@ -55,14 +51,10 @@ vi.mock("@/lib/server/skills-loader", () => ({
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { readMetaV06, taskDir, writeMeta } = taskFsCore;
 const {
-  cancelChatRun,
   closeChatSessionUnconditional,
-  compactChatSession,
-  CompactChatError,
   flushChatQueue,
   forceClearChatRun,
   hasChatSession,
-  isChatCompactInProgress,
   isChatQueueDraining,
   resumeChatSession,
   runChatSession,
@@ -82,7 +74,6 @@ if (!taskDir("probe").startsWith(TMP_ROOT)) {
 const TASK_ID = "t_1700000001200_t3_t4_t5";
 const AGENT_A = "agent_fake_t3_A";
 const AGENT_B = "agent_fake_t3_B";
-const AGENT_COMPACT = "agent_fake_t5_compact";
 
 const BOOT = {
   apiKey: "test-key",
@@ -132,22 +123,6 @@ const makePendingSend = () => {
   return { send, resolveNext, fakeRun };
 };
 
-const LONG_SUMMARY = "摘要内容".repeat(
-  Math.ceil(MIN_COMPACT_SUMMARY_CHARS / 4) + 10,
-);
-const SUMMARY_PAYLOAD = `<summary>${LONG_SUMMARY}</summary>`;
-
-const makeSummaryRun = (text: string) => ({
-  stream: async function* () {
-    yield {
-      type: "assistant" as const,
-      message: { content: [{ type: "text" as const, text }] },
-    };
-  },
-  wait: async () => ({ status: "finished" as const }),
-  cancel: vi.fn(),
-});
-
 const writeServerCreds = async () => {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(
@@ -160,13 +135,6 @@ const writeServerCreds = async () => {
   );
 };
 
-const readEventsLog = async (): Promise<string> => {
-  try {
-    return await fs.readFile(path.join(taskDir(TASK_ID), "events.jsonl"), "utf-8");
-  } catch {
-    return "";
-  }
-};
 
 beforeEach(async () => {
   mockCreate.mockReset();
@@ -183,7 +151,6 @@ afterEach(async () => {
   closeChatSessionUnconditional(TASK_ID);
   clearChatQueue(TASK_ID);
   await new Promise((r) => setTimeout(r, 30));
-  expect(isChatCompactInProgress(TASK_ID)).toBe(false);
 });
 
 afterAll(async () => {
@@ -332,99 +299,3 @@ describe("T4：flushChatQueue single-flight", () => {
   );
 });
 
-describe("T5：compact 重建成功前不写 done；stop/失败口径", () => {
-  it("重建 runChatSession（create）pending 时 cancel → summarize_cancelled 且无 compact_done", async () => {
-    const mockSend = vi
-      .fn()
-      .mockResolvedValue(makeSummaryRun(SUMMARY_PAYLOAD));
-    mockResume.mockResolvedValue({
-      agentId: AGENT_COMPACT,
-      close: vi.fn(),
-      send: mockSend,
-    });
-
-    let resolveCreate!: (agent: unknown) => void;
-    const createGate = new Promise((resolve) => {
-      resolveCreate = resolve;
-    });
-    const closeNew = vi.fn().mockResolvedValue(undefined);
-    const sendNew = vi.fn();
-    mockCreate.mockImplementationOnce(() => createGate);
-
-    await writeMeta(makeMeta(TASK_ID, AGENT_COMPACT));
-    const task = asTask(makeMeta(TASK_ID, AGENT_COMPACT));
-    expect(await resumeChatSession(task, BOOT)).not.toBeNull();
-
-    const compactP = compactChatSession(TASK_ID);
-    await vi.waitFor(() => expect(mockSend).toHaveBeenCalledTimes(1), {
-      timeout: 3_000,
-      interval: 20,
-    });
-    // 摘要成功后重建 create 挂起
-    await vi.waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1), {
-      timeout: 3_000,
-      interval: 20,
-    });
-
-    // 此时不得已写成功事件
-    expect(await readEventsLog()).not.toContain("compact_done");
-    expect(await readEventsLog()).not.toContain('"kind":"compact_summary"');
-
-    expect(cancelChatRun(TASK_ID)).toBe(true);
-
-    // 放行迟到 create（cancelled/instance 复查应丢弃）
-    resolveCreate({
-      agentId: "agent_fake_restart",
-      close: closeNew,
-      send: sendNew,
-    });
-
-    let err: unknown;
-    try {
-      await compactP;
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(CompactChatError);
-    expect((err as InstanceType<typeof CompactChatError>).code).toBe(
-      "summarize_cancelled",
-    );
-
-    const log = await readEventsLog();
-    expect(log).not.toContain("compact_done");
-    expect(log).not.toContain('"kind":"compact_summary"');
-    expect(sendNew).not.toHaveBeenCalled();
-  });
-
-  it("重建失败（create 抛错）→ restart_failed 且无 compact_done", async () => {
-    const mockSend = vi
-      .fn()
-      .mockResolvedValue(makeSummaryRun(SUMMARY_PAYLOAD));
-    mockResume.mockResolvedValue({
-      agentId: AGENT_COMPACT,
-      close: vi.fn(),
-      send: mockSend,
-    });
-    mockCreate.mockRejectedValueOnce(new Error("create boom"));
-
-    await writeMeta(makeMeta(TASK_ID, AGENT_COMPACT));
-    const task = asTask(makeMeta(TASK_ID, AGENT_COMPACT));
-    expect(await resumeChatSession(task, BOOT)).not.toBeNull();
-
-    let err: unknown;
-    try {
-      await compactChatSession(TASK_ID);
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(CompactChatError);
-    expect((err as InstanceType<typeof CompactChatError>).code).toBe(
-      "restart_failed",
-    );
-
-    const log = await readEventsLog();
-    expect(log).not.toContain("compact_done");
-    expect(log).not.toContain('"kind":"compact_summary"');
-    expect(hasChatSession(TASK_ID)).toBe(false);
-  });
-});

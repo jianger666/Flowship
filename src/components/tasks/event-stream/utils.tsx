@@ -37,7 +37,6 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   assistant_message: "AI 回复",
   ask_user_request: "向你提问",
   ask_user_reply: "你的回答",
-  compact_summary: "会话摘要",
   error: "错误",
 };
 
@@ -55,8 +54,6 @@ export const renderEventIcon = (kind: EventKind) => {
       return <ArrowUpRight className="size-4 text-muted-foreground" />;
     case "thinking":
       return <Brain className="size-4 text-violet-500" />;
-    case "compact_summary":
-      return <Brain className="size-4 text-violet-500/80" />;
     case "user_reply":
       return <UserCircle2 className="size-4 text-foreground" />;
     case "ask_user_request":

@@ -30,13 +30,6 @@ const writeEventAndPublish = vi.hoisted(() =>
   })),
 );
 
-// compact 窗口守卫（一次回复拆两卡的根因）——默认不在压缩中
-const isChatCompactInProgress = vi.hoisted(() => vi.fn(() => false));
-
-vi.mock("@/lib/server/chat-runner", () => ({
-  isChatCompactInProgress,
-}));
-
 vi.mock("@/lib/server/task-fs", () => ({
   getTask,
 }));
@@ -818,34 +811,7 @@ describe("turn 状态机", () => {
   });
 });
 
-describe("compact 窗口守卫", () => {
-  it("压缩中 agent 活动不开卡（2026-07-20 一次回复拆两卡）、压缩完恢复", async () => {
-    const taskId = "t_compact_guard";
-    // auto-compact 续接首包 turn：无 user_reply、直接来 assistant 活动
-    isChatCompactInProgress.mockReturnValue(true);
-    publishTaskStreamEvent(taskId, makeEvent("thinking", "recap 想法"));
-    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "recap 正文" });
-    publishTaskStreamEvent(taskId, {
-      kind: "done",
-      ok: true,
-      task: {
-        id: taskId,
-        title: "测对话",
-        mode: "chat",
-        runStatus: "awaiting_user",
-      } as never,
-    });
-    await flush();
-    expect(cardFactory.create).not.toHaveBeenCalled();
-
-    // 压缩结束后正常轮不受影响
-    isChatCompactInProgress.mockReturnValue(false);
-    publishTaskStreamEvent(taskId, makeEvent("user_reply", "继续聊"));
-    publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: "好的" });
-    await flush();
-    expect(cardFactory.create).toHaveBeenCalledTimes(1);
-  });
-
+describe("流式开关冻结", () => {
   it("流式开关本轮定稿：中途改 settings 不影响本轮 create opts", async () => {
     const taskId = "t_stream_freeze";
     publishTaskStreamEvent(taskId, makeEvent("user_reply", "hi"));

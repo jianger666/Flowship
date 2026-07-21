@@ -914,7 +914,6 @@ export type ChatContextInfo = {
   breakdown: Array<{ label: string; tokens: number }>;
   turnCount: number;
   lastTurnAt: number | null;
-  compactRecommended: boolean;
 };
 
 export const fetchChatContext = async (
@@ -926,25 +925,6 @@ export const fetchChatContext = async (
   );
   const data = await handleJson<{ ok: true; context: ChatContextInfo }>(res);
   return data.context;
-};
-
-/** P4：手动压缩会话 */
-export const compactChatSession = async (
-  taskId: string,
-  keepHints?: string,
-): Promise<Task> => {
-  const res = await fetch(
-    `/api/tasks/${encodeURIComponent(taskId)}/compact`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        keepHints: keepHints?.trim() ? keepHints.trim() : undefined,
-      }),
-    },
-  );
-  const data = await handleJson<{ ok: true; task: Task }>(res);
-  return data.task;
 };
 
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道

@@ -2,7 +2,7 @@
  * Chat checkpoint / rewind 单元 + 临时 git fixture 集成
  *
  * 覆盖：打快照 → 改文件 / 加 untracked → 恢复断言；rewind_points 读写与保留策略；
- * checkpoint ref 防 gc、裁剪删 ref、事务回滚、门闩、compact/drain 互斥、refs 清理。
+ * checkpoint ref 防 gc、裁剪删 ref、事务回滚、门闩、drain 互斥、refs 清理。
  *
  * 并行隔离：DATA_DIR 在 task-fs-core 模块加载时冻结；ESM 静态 import 会 hoist，
  * 必须先钉 FLOWSHIP_DATA_DIR 再动态 import，否则全量并行时多文件撞 cwd/data/tasks。
@@ -125,7 +125,6 @@ const stubRewindDeps = (
   overrides: Partial<{
     closeSession: (taskId: string) => void;
     isRunActive: (taskId: string) => boolean;
-    isCompactInProgress: (taskId: string) => boolean;
     isQueueDraining: (taskId: string) => boolean;
     appendInfoEvent: (
       taskId: string,
@@ -136,7 +135,6 @@ const stubRewindDeps = (
 ) => ({
   closeSession: () => {},
   isRunActive: () => false,
-  isCompactInProgress: () => false,
   isQueueDraining: () => false,
   appendInfoEvent: async () => null,
   getTask: async () =>
@@ -634,31 +632,6 @@ describe("executeChatRewind 事务回滚与门闩", () => {
     GIT_IT_TIMEOUT_MS,
   );
 
-  it(
-    "compact 互斥：isCompactInProgress → run_active 且不动文件",
-    async () => {
-      const eventId = newEventId();
-      await seedSingleRepoRewind(eventId);
-      await fs.writeFile(path.join(REPO, "tracked.txt"), "compact-keep\n");
-
-      await expect(
-        executeChatRewind(
-          TASK_ID,
-          eventId,
-          stubRewindDeps({ isCompactInProgress: () => true }),
-        ),
-      ).rejects.toMatchObject({
-        name: "RewindError",
-        code: "run_active",
-        message: expect.stringContaining("正在压缩会话"),
-      });
-
-      await expect(
-        fs.readFile(path.join(REPO, "tracked.txt"), "utf8"),
-      ).resolves.toBe("compact-keep\n");
-    },
-    GIT_IT_TIMEOUT_MS,
-  );
 
   it(
     "drain 互斥：isQueueDraining → run_active 且不动文件",

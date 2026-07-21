@@ -20,7 +20,6 @@
 import { getTask } from "@/lib/server/task-fs";
 import {
   closeChatSessionUnconditional,
-  isChatCompactInProgress,
   isChatQueueDraining,
   isChatRunActive,
 } from "@/lib/server/chat-runner";
@@ -63,7 +62,6 @@ export const POST = async (req: Request, { params }: Ctx) => {
     const result = await executeChatRewind(id, eventId, {
       closeSession: closeChatSessionUnconditional,
       isRunActive: isChatRunActive,
-      isCompactInProgress: isChatCompactInProgress,
       isQueueDraining: isChatQueueDraining,
       // rewind info 改 writeEventAndPublish——磁盘序 = SSE 序（用户操作、无条件语义）
       appendInfoEvent: async (taskId, text) =>

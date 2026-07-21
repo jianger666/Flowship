@@ -28,7 +28,6 @@ import {
   getChatRunModel,
   getChatRunRepoPaths,
   hasChatSession,
-  isChatCompactInProgress,
   isChatQueueDraining,
   isChatRunActive,
   releaseChatRunClaim,
@@ -455,11 +454,6 @@ export const handleChatReplyInject = async (
   // 提到模式判断前声明（原在模式 2 处、模式 1 引用会 TDZ 报错）
   const bootArgs = parsed.bootArgs;
 
-  // compact 进行中：一律入队（勿 send / 勿懒重启 / 勿起新会话），等 compact 完 flush
-  if (isChatCompactInProgress(task.id)) {
-    return enqueueOrReject();
-  }
-
   // V0.11.1：内存没会话但有落盘锚点（服务重启 / 空闲回收后）→ 先 Agent.resume 接回、
   // 下面统一走「有会话」分支 send 续接、上下文不丢。resume 失败会清锚点、自然落到起新会话。
   // 本请求是预约赢家 → claimRun 认领首发，勿在通用 resume 里无条件 flush。
@@ -587,7 +581,7 @@ export const handleChatReplyInject = async (
             409,
           );
         }
-        // busy：run 在跑 / rewind / compact 门闩中 → P5.1 入队（202）；
+        // busy：run 在跑 / rewind 门闩中 → P5.1 入队（202）；
         // owner 早退路径已在 sendChatMessage 内释放认领
         if (sent === "busy") {
           const queuedResp = await enqueueOrReject();
@@ -601,8 +595,8 @@ export const handleChatReplyInject = async (
           return queuedResp;
         }
         // no_session / send_failed：会话没了（send 抛错已 close / record 消失）
-        // → 落到下面起新会话；防御复查：极端竞态下别处刚起了会话 / compact 则入队
-        if (hasChatSession(task.id) || isChatCompactInProgress(task.id)) {
+        // → 落到下面起新会话；防御复查：极端竞态下别处刚起了会话则入队
+        if (hasChatSession(task.id)) {
           return enqueueOrReject();
         }
       } catch (err) {
@@ -648,8 +642,8 @@ export const handleChatReplyInject = async (
     return errorResponse("bootArgs.model 非法");
   }
 
-  // 防重复启动：会话还在 / compact 中（send 失败但 run 在跑等 race）→ 同样入队
-  if (hasChatSession(task.id) || isChatCompactInProgress(task.id)) {
+  // 防重复启动：会话还在（send 失败但 run 在跑等 race）→ 同样入队
+  if (hasChatSession(task.id)) {
     return enqueueOrReject();
   }
 

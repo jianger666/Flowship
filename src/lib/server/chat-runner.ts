@@ -60,6 +60,7 @@ import { dataRoot } from "./data-root";
 import { createRunPerfTracker } from "./run-perf";
 import {
   composeOnDelta,
+  createSdkSummaryDeltaPublisher,
   createShellOutputDeltaPublisher,
 } from "./shell-output-bridge";
 import {
@@ -114,18 +115,9 @@ import {
   type QueuedChatMsg,
 } from "./chat-queue";
 import {
-  getChatContextUsage,
-  markChatAutoCompactAttempted,
   recordChatFirstPromptBytes,
   recordChatTurnUsage,
-  shouldAutoCompactAfterTurn,
 } from "./chat-context-usage";
-import {
-  buildCompactContinuationSection,
-  buildCompactSummarizePrompt,
-  extractCompactSummaryText,
-  MIN_COMPACT_SUMMARY_CHARS,
-} from "./chat-compact-prompt";
 import {
   captureChatCheckpoint,
   persistCheckpointForReply,
@@ -321,14 +313,8 @@ const CHAT_SWEEPER_KEY = "__flowshipChatSweeperV1__";
 export const cancelChatRun = (taskId: string): boolean => {
   const reconnectStop = getReconnectStops().get(taskId);
   if (reconnectStop) reconnectStop();
-  // compact 进行中 → 置事务级 abort，阻止摘要重试与重建「复活」AI
-  let compactAborted = false;
-  if (isChatCompactInProgress(taskId)) {
-    markChatCompactAborted(taskId);
-    compactAborted = true;
-  }
   const rec = runningChats.get(taskId);
-  if (!rec) return !!reconnectStop || compactAborted;
+  if (!rec) return !!reconnectStop;
   if (rec.runActive) {
     rec.cancel();
   } else {
@@ -483,59 +469,6 @@ const getReconnectStops = (): Map<string, () => void> => {
   return g[RECONNECT_STOPS_KEY]!;
 };
 
-// ----------------- compact 进行中标记（关旧→起新窗口也要挡并发 send） -----------------
-
-interface ChatCompactGlobalState {
-  inProgress: Set<string>;
-  /**
-   * compact 事务级 abort。cancelChatRun / stop 在 compact 窗口置位，
-   * compactChatSession 在摘要重试与重建序列检查点命中后停止后续副作用。
-   */
-  aborted: Set<string>;
-}
-
-// V2：相对 V1 增 aborted；换 key 避免 hot-reload 后读到缺字段的旧 state
-const CHAT_COMPACT_GLOBAL_KEY = "__flowshipChatCompactV2__";
-
-const getCompactState = (): ChatCompactGlobalState => {
-  const g = globalThis as unknown as Record<
-    string,
-    ChatCompactGlobalState | undefined
-  >;
-  if (!g[CHAT_COMPACT_GLOBAL_KEY]) {
-    g[CHAT_COMPACT_GLOBAL_KEY] = {
-      inProgress: new Set(),
-      aborted: new Set(),
-    };
-  }
-  if (!g[CHAT_COMPACT_GLOBAL_KEY]!.aborted) {
-    g[CHAT_COMPACT_GLOBAL_KEY]!.aborted = new Set();
-  }
-  return g[CHAT_COMPACT_GLOBAL_KEY]!;
-};
-
-/** compact 进行中（含 summarize / 关旧 / 重建）；chat-reply 应入队而非起新会话 */
-export const isChatCompactInProgress = (taskId: string): boolean =>
-  getCompactState().inProgress.has(taskId);
-
-const markChatCompactAborted = (taskId: string): void => {
-  getCompactState().aborted.add(taskId);
-};
-
-const isChatCompactAborted = (taskId: string): boolean =>
-  getCompactState().aborted.has(taskId);
-
-const setChatCompactInProgress = (taskId: string, on: boolean): void => {
-  const state = getCompactState();
-  if (on) {
-    state.inProgress.add(taskId);
-  } else {
-    state.inProgress.delete(taskId);
-    // compact 结束后不得残留 abort，影响下一次压缩
-    state.aborted.delete(taskId);
-  }
-};
-
 // ----------------- publish 帮手（复用 task-runner SSE 通道） -----------------
 
 const publish = (taskId: string, ev: TaskStreamEvent): void => {
@@ -568,8 +501,8 @@ const publishBootProgress = (
 // writeEventAndPublish（用户操作/系统通知语义）与 writeOwnedEventAndPublish（owner 语境、lease 必填）。
 
 /**
- * chat turn-ended usage → 只写内存透视。
- * 超阈值自动 compact 改在 consumeChatRun 收尾触发（见 maybeAutoCompactThenFlush）。
+ * chat turn-ended usage → 只写内存透视（供 /context 面板）。
+ * 注意：SDK 累计 inputTokens 不能当真实上下文窗口占用。
  */
 const handleChatTurnUsage = (
   taskId: string,
@@ -601,7 +534,6 @@ interface InitialUserMessage {
  * 回合纪律见 chatTurnProtocolSection（含 ask_user 答题卡）；submit_work 在 chat 不用。
  *
  * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答
- * 有 continuationSummary：压缩续接（GB full-replace），摘要进首包
  * 无 firstMessage：起手等用户发第一句（边界情况）
  */
 const buildInitialPrompt = (
@@ -613,8 +545,6 @@ const buildInitialPrompt = (
   userIdentityLine = "",
   /** GitLab 访问段（绑仓 + 配了 gitToken 时注入；空串 = 不注入） */
   gitlabAccessSection = "",
-  /** P4.2 压缩续接摘要（与 firstMessage 互斥优先：有摘要走续接段） */
-  continuationSummary?: string,
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -708,16 +638,7 @@ const buildInitialPrompt = (
     "",
   );
 
-  // 压缩续接优先于首条消息（compact 重建会话）
-  if (continuationSummary && continuationSummary.trim().length > 0) {
-    lines.push(
-      buildCompactContinuationSection(continuationSummary),
-      "请基于以上摘要继续协助用户。用户的下一条消息会单独送达——本回合直接结束回复即可。",
-      "",
-    );
-  } else {
-    lines.push(...buildOpeningStanceSection(task.id, firstMessage));
-  }
+  lines.push(...buildOpeningStanceSection(task.id, firstMessage));
 
   return lines.join("\n");
 };
@@ -787,8 +708,6 @@ export interface RunChatInput {
   // 首条消息对应的 user_reply 事件 id（chat-reply 启 run 前已写、传进来）。
   // 历史曾写进「Chat 任务启动」info meta；该 info 已去掉（用户嫌吵），参数保留供兜底定位扩展。
   firstMessageEventId?: string;
-  /** P4.2 压缩续接：关旧会话后新会话首包注入的摘要 */
-  continuationSummary?: string;
   /**
    * chat-reply / deliverChatAskReply 启动预约 token。
    * 有则入口同步校验 lease，失效不注册 runningChats。
@@ -819,7 +738,6 @@ export const runChatSession = async (
     model,
     firstMessage,
     firstMessageEventId: _firstMessageEventId,
-    continuationSummary,
     startToken,
     clientItemId,
   } = input;
@@ -1093,7 +1011,6 @@ export const runChatSession = async (
       firstMessage,
       userIdentityLine,
       gitlabAccessSection,
-      continuationSummary,
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 
@@ -1134,6 +1051,11 @@ export const runChatSession = async (
         perfTracker.onDelta,
         // chat shell delta 绑本实例 instanceId——失主丢弃迟到输出
         createShellOutputDeltaPublisher(
+          task.id,
+          () => runningChats.get(task.id)?.instanceId === myInstanceId,
+        ),
+        // SDK in-place summarization → 事件流一条 info
+        createSdkSummaryDeltaPublisher(
           task.id,
           () => runningChats.get(task.id)?.instanceId === myInstanceId,
         ),
@@ -1629,6 +1551,10 @@ const runReconnectAttempt = async (
           task.id,
           () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
         ),
+        createSdkSummaryDeltaPublisher(
+          task.id,
+          () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+        ),
       ),
       onStep: perfTracker.onStep,
     });
@@ -1696,7 +1622,7 @@ type FinalizeChatRunCtx = {
 };
 
 /**
- * chat run 收尾唯一入口——所有 status/queue/session/done/error/compact/flush
+ * chat run 收尾唯一入口——所有 status/queue/session/done/error/flush
  * 共享写只有在「runningChats 当前记录仍是本 instanceId」的 CAS 下执行；
  * 失主（含 map 为空——forceClear 空窗不是授权）一律 no-op 只清本地。
  *
@@ -1721,7 +1647,7 @@ const finalizeChatRunIfCurrent = async (
     runningChats.get(taskId)?.instanceId === instanceId;
 
   if (outcome === "finished") {
-    // 自然结束：会话保留，只归位 awaiting_user + done + compact/flush
+    // 自然结束：会话保留，只归位 awaiting_user + done + flush
     rec.runActive = false;
     rec.lastActiveAt = Date.now();
     const doneTask = await setTaskRunStatusIfRunOwner(
@@ -1729,7 +1655,7 @@ const finalizeChatRunIfCurrent = async (
       "awaiting_user",
       isCurrent,
     );
-    // 写盘 await 后失主 → 不 publish / 不 compact（避免清 B 前端 streaming）
+    // 写盘 await 后失主 → 不 publish / 不 flush（避免清 B 前端 streaming）
     if (!isCurrent()) return false;
     if (doneTask) publish(taskId, { kind: "task", task: doneTask });
     publish(taskId, {
@@ -1737,7 +1663,7 @@ const finalizeChatRunIfCurrent = async (
       task: doneTask ?? ctx.task,
       ok: true,
     });
-    void maybeAutoCompactThenFlush(taskId);
+    void flushChatQueue(taskId);
     return true;
   }
 
@@ -1946,7 +1872,7 @@ const consumeChatRun = async (
  * - `sent`：已送达（run 已异步起消费）
  * - `cancelled`：owner claim 被用户 stop 摘除（内部已消费 cancelled 标记）→ 调用方终止请求、绝不入 mode 2
  * - `owner_invalid`：owner claim 实例已被替换（forceClear 换新等）→ 同样终止、不得把消息重放给新实例
- * - `busy`：run 在跑 / rewind / compact 门闩中 / 会话冷启动占位 → 调用方入队
+ * - `busy`：run 在跑 / rewind 门闩中 / 会话冷启动占位 → 调用方入队
  * - `no_session`：无会话可续接（非 owner）→ 调用方起新会话
  * - `send_failed`：agent.send 抛错（会话已关）→ 调用方起新会话
  */
@@ -2013,11 +1939,6 @@ export const sendChatMessage = async (
     releaseOwnerClaimIfNeeded();
     return "busy";
   }
-  // compact 进行中：busy → chat-reply 入队（与 runActive 同口径）
-  if (isChatCompactInProgress(task.id)) {
-    releaseOwnerClaimIfNeeded();
-    return "busy";
-  }
   // 无会话（owner 场景已在上面按 cancelled/owner_invalid 收敛、至此必是非 owner）
   if (!rec) return "no_session";
   // 冷启动占位（agent 还没就位）/ run 在跑：busy 入队等 flush
@@ -2081,6 +2002,10 @@ export const sendChatMessage = async (
         perfTracker.onDelta,
         // follow-up shell delta 绑 rec.instanceId
         createShellOutputDeltaPublisher(
+          task.id,
+          () => runningChats.get(task.id)?.instanceId === rec.instanceId,
+        ),
+        createSdkSummaryDeltaPublisher(
           task.id,
           () => runningChats.get(task.id)?.instanceId === rec.instanceId,
         ),
@@ -2184,9 +2109,8 @@ export const deliverChatAskReply = async (
   imagePaths?: string[],
   bootArgs?: { apiKey?: string; model?: ModelSelection },
 ): Promise<boolean> => {
-  // compact / rewind 窗口内会话可能刚被关（重建中）——此时绝不能
-  // 走下面 resume / 起新会话与 compact 重建打架，直接返 false 让用户稍后用输入条答复
-  if (isChatCompactInProgress(task.id) || isChatRewindInProgress(task.id)) {
+  // rewind 窗口内绝不能走 resume / 起新会话，直接返 false 让用户稍后用输入条答复
+  if (isChatRewindInProgress(task.id)) {
     return false;
   }
   // 1) 存活会话直接 send
@@ -2306,8 +2230,7 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
   // per-task 单 owner drain——非 owner 直接返回，防双 drain 并发 dequeue
   // 破坏 FIFO / 两个 finally 提前清 draining 标记。Node 单线程：同步
   // check-and-set（第一个 await 之前）即原子。
-  // 配套：compact finally 的 void flush 与 maybeAutoCompactThenFlush catch 的
-  // await flush 会撞车——谁先到谁当 owner，另一路直接 return；消息不会滞留
+  // single-flight：谁先到谁当 owner，另一路直接 return；消息不会滞留
   //（owner 发队首，后续靠 run 结束后链式 flush）。
   if (drainingQueues.has(taskId)) return;
 
@@ -2357,12 +2280,8 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         });
         return;
       }
-      // 无存活会话 → 清队列（没法按序送达）；compact 窗口例外：塞回队首等 compact 完再 flush
+      // 无存活会话 → 清队列（没法按序送达）
       if (!hasChatSession(taskId)) {
-        if (isChatCompactInProgress(taskId)) {
-          requeueIfSameGen(msg, "compact 例外塞回");
-          return;
-        }
         // 会话消失清整队走 failQueuedItems（带 itemIds 终态），info 仍 best-effort
         const failedIds = failQueuedItems(taskId, {
           reason: "no_session",
@@ -2384,8 +2303,8 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
         }
         return;
       }
-      if (isChatRunActive(taskId) || isChatCompactInProgress(taskId)) {
-        requeueIfSameGen(msg, "runActive/compact 塞回");
+      if (isChatRunActive(taskId)) {
+        requeueIfSameGen(msg, "runActive 塞回");
         return;
       }
 
@@ -2532,13 +2451,12 @@ export const flushChatQueue = async (taskId: string): Promise<void> => {
   }
   // 配套：single-flight 下，consume 收尾的链式 flush 可能撞上「本轮仍 draining」
   // 而空 return，队内后续消息会滞留。本轮 finally 清位后：若队列非空且会话空闲
-  //（无 run / compact / rewind），再续一次 drain。run 仍活跃时不续——等 consume
+  //（无 run / rewind），再续一次 drain。run 仍活跃时不续——等 consume
   // 自己的链式 flush，避免「dequeue → 见 busy → 塞回 → 再 flush」忙等。
   if (
     getChatQueueCount(taskId) > 0 &&
     !drainingQueues.has(taskId) &&
     !isChatRunActive(taskId) &&
-    !isChatCompactInProgress(taskId) &&
     !isChatRewindInProgress(taskId)
   ) {
     void flushChatQueue(taskId);
@@ -2587,7 +2505,6 @@ const scheduleQueueDrainAfterGate = (taskId: string): void => {
         }
         await new Promise((r) => setTimeout(r, DEFERRED_DRAIN_POLL_MS));
       }
-      // compact 进行中时 flush 会塞回队首、等 compact finally 再 flush——已有链路，不特判
       await flushChatQueue(taskId);
     } catch (err) {
       console.warn(
@@ -2598,384 +2515,4 @@ const scheduleQueueDrainAfterGate = (taskId: string): void => {
       pending.delete(taskId);
     }
   })();
-};
-
-// ----------------- P4.2：compact -----------------
-
-export type CompactChatErrorCode =
-  | "not_found"
-  | "not_chat"
-  | "run_active"
-  | "no_session"
-  | "summarize_failed"
-  /** 用户 stop / compact 事务 abort——不重试、不重建 */
-  | "summarize_cancelled"
-  | "restart_failed"
-  | "compact_busy";
-
-export class CompactChatError extends Error {
-  readonly code: CompactChatErrorCode;
-  readonly status: number;
-
-  constructor(code: CompactChatErrorCode, message: string, status: number) {
-    super(message);
-    this.name = "CompactChatError";
-    this.code = code;
-    this.status = status;
-  }
-}
-
-/**
- * run 自然结束后：超阈值则自动 compact，再 flush 队列；否则直接 flush。
- * 失败降级为 info 提示手动，标记 attempted 防死循环。
- */
-const maybeAutoCompactThenFlush = async (taskId: string): Promise<void> => {
-  // 压缩重建的续接 turn 收尾时外层仍持 compactInProgress——跳过，由外层 flush
-  if (isChatCompactInProgress(taskId)) return;
-
-  const usage = getChatContextUsage(taskId);
-  const inputTokens = usage?.lastUsage.inputTokens ?? 0;
-  const attempted = usage?.autoCompactAttempted === true;
-  if (!shouldAutoCompactAfterTurn(inputTokens, attempted)) {
-    await flushChatQueue(taskId);
-    return;
-  }
-  // 无活会话（极少）→ 跳过自动、仍 flush
-  if (!hasChatSession(taskId) || isChatRunActive(taskId)) {
-    await flushChatQueue(taskId);
-    return;
-  }
-
-  markChatAutoCompactAttempted(taskId);
-  try {
-    // compactChatSession 成功后会自己 flush
-    await compactChatSession(taskId, { reason: "auto" });
-  } catch (err) {
-    // 用户主动取消不算失败提示，compact finally 已 flush
-    if (err instanceof CompactChatError && err.code === "summarize_cancelled") {
-      return;
-    }
-    const msg =
-      err instanceof Error ? err.message : String(err);
-    console.warn(`[chat-runner] 自动 compact 失败 task=${taskId}:`, err);
-    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 系统通知
-    await writeEventAndPublish(taskId, {
-      kind: "info",
-      text: "上下文过大，自动压缩失败，可手动压缩会话",
-      meta: {
-        kind: "compact_suggested",
-        inputTokens,
-        autoFailed: true,
-        detail: msg.slice(0, 200),
-      },
-    });
-    // compact finally 已 void flush；此处再 await 是失败路径兜底。
-    // single-flight 下若 finally 已抢成 owner，本调用直接 return——无消息滞留
-    //（owner 会把队首发出去，后续消息靠 run 结束后的链式 flush）。
-    await flushChatQueue(taskId);
-  }
-};
-
-/**
- * 一次性问答：对存活会话 send 摘要指令，只收集文本、不落 user_reply / assistant_message。
- * （对齐 task 侧 startOneShotQuestion 的 oneshot 语义，但不另起 agent——复用当前会话上下文。）
- */
-const runChatSummarizeOnesHot = async (
-  taskId: string,
-  prompt: string,
-): Promise<string> => {
-  const rec = runningChats.get(taskId);
-  if (!rec?.agent || rec.runActive) {
-    throw new CompactChatError(
-      "no_session",
-      "无可用会话或 agent 正在回",
-      400,
-    );
-  }
-  rec.runActive = true;
-  let collected = "";
-  // agent.send 是 await 点，stop 可发生在 pending 期间——共享取消闭包
-  // 记录信号、run 一旦可用立即补 cancel，摘要绝不能在「已停止」之后继续跑。
-  let cancelledDuringSend = false;
-  let summarizeRun: ChatRun | undefined;
-  const cancelBeforeSend = rec.cancel;
-  rec.cancel = () => {
-    cancelledDuringSend = true;
-    if (summarizeRun) void summarizeRun.cancel().catch(() => {});
-    cancelBeforeSend();
-  };
-  try {
-    const runningTask = await setTaskRunStatus(taskId, "running");
-    if (runningTask) publish(taskId, { kind: "task", task: runningTask });
-
-    const run = await rec.agent.send(prompt, {
-      onDelta: () => {},
-      onStep: () => {},
-    });
-    summarizeRun = run;
-    // 与 sendChatMessage 同款：包装并转调旧 cancel、不裸替换（保持 stop 语义链完整）
-    rec.cancel = () => {
-      cancelledDuringSend = true;
-      void run.cancel().catch(() => {});
-      cancelBeforeSend();
-    };
-    // 取消走专用码，compact 重试循环不得当普通失败再试一次
-    if (cancelledDuringSend) {
-      void run.cancel().catch(() => {});
-      throw new CompactChatError(
-        "summarize_cancelled",
-        "压缩已被用户取消",
-        409,
-      );
-    }
-
-    for await (const msg of run.stream()) {
-      // 与 sdk-message-handler assistant 分支同口径：拼 text block，不落盘
-      if (msg.type === "assistant") {
-        for (const block of msg.message.content) {
-          if (block.type === "text" && block.text) {
-            collected += block.text;
-          }
-        }
-      }
-    }
-
-    const result = await run.wait();
-    if (result.status === "cancelled" || cancelledDuringSend) {
-      throw new CompactChatError(
-        "summarize_cancelled",
-        "压缩已被用户取消",
-        409,
-      );
-    }
-    if (result.status !== "finished") {
-      throw new CompactChatError(
-        "summarize_failed",
-        `摘要 run 状态=${result.status}`,
-        400,
-      );
-    }
-    // 部分 SDK 把终稿放在 result.result
-    if (collected.trim().length < MIN_COMPACT_SUMMARY_CHARS && result.result) {
-      collected = result.result;
-    }
-    return collected;
-  } finally {
-    // 恢复 stop 链，避免摘要结束后 cancel 仍指向本轮包装
-    rec.cancel = cancelBeforeSend;
-    rec.runActive = false;
-    rec.lastActiveAt = Date.now();
-    // 用户 stop 已把 runStatus 归位 idle——不得再覆盖成 awaiting_user
-    if (!cancelledDuringSend) {
-      const idleTask = await setTaskRunStatus(taskId, "awaiting_user");
-      if (idleTask) publish(taskId, { kind: "task", task: idleTask });
-    }
-  }
-};
-
-/**
- * 执行 chat 会话压缩（GB full-replace 思路 + 懒重启）：
- * summarize oneshot → 关旧会话 → 新会话首包注入摘要 → 落 info + compact_summary。
- *
- * reason=auto：文案「已自动压缩」；手动保留原「已压缩」。
- * compactInProgress 期间 send 返 false → 消息进队列；完成后由调用方 flush。
- *
- * 与 rewind 交叉闭合（N2）：先只读校验 task（不占位）→ 同步临界区先占 compact
- * 再复查 rewind / runActive / session（中间无 await）。rewind 侧 tryBeginChatRewind
- * 占位后复查 isCompactInProgress。
- */
-export const compactChatSession = async (
-  taskId: string,
-  opts: { keepHints?: string; reason?: "manual" | "auto" } = {},
-): Promise<Task> => {
-  const reason = opts.reason ?? "manual";
-
-  // 前置校验（只读、不占位）：注定失败时不要先置 compact，否则 chat-reply 在
-  // await getTask 窗口里看到标记会白白入队，compact 再抛 no_session 时 finally
-  // flush 无会话会清队—— 静默丢消息。
-  const task = await getTask(taskId);
-  if (!task) {
-    throw new CompactChatError("not_found", "task 不存在", 404);
-  }
-  if (task.mode !== "chat") {
-    throw new CompactChatError("not_chat", "仅 chat 模式支持压缩", 409);
-  }
-
-  // 同步临界区（中间无 await）：先占 compact 再查 rewind——保持 N2 交叉契约。
-  // 临界区内复查是防 getTask await 期间状态变化。
-  if (isChatCompactInProgress(taskId)) {
-    throw new CompactChatError(
-      "compact_busy",
-      "正在压缩会话、请稍候",
-      409,
-    );
-  }
-  setChatCompactInProgress(taskId, true);
-  if (isChatRewindInProgress(taskId)) {
-    setChatCompactInProgress(taskId, false);
-    throw new CompactChatError("run_active", "正在回退到检查点", 409);
-  }
-  if (isChatRunActive(taskId)) {
-    setChatCompactInProgress(taskId, false);
-    throw new CompactChatError(
-      "run_active",
-      "agent 正在回、等它说完再压缩",
-      409,
-    );
-  }
-  if (!hasChatSession(taskId)) {
-    setChatCompactInProgress(taskId, false);
-    throw new CompactChatError(
-      "no_session",
-      "无活会话、请先发一条消息再压缩",
-      400,
-    );
-  }
-
-  /** abort 命中 → 专用码抛出，调用方不得再产生重建副作用 */
-  const throwIfCompactAborted = (): void => {
-    if (isChatCompactAborted(taskId)) {
-      throw new CompactChatError(
-        "summarize_cancelled",
-        "压缩已被用户取消",
-        409,
-      );
-    }
-  };
-
-  try {
-    const summarizePrompt = buildCompactSummarizePrompt(opts.keepHints);
-    let summary = "";
-    let lastErr: unknown;
-    // GB：不足 500 字视为失败，重试 1 次（共 2 次）
-    for (let attempt = 0; attempt < 2; attempt++) {
-      // 每次 attempt 前查 abort——用户 stop 后绝不再开第二次摘要
-      throwIfCompactAborted();
-      try {
-        const raw = await runChatSummarizeOnesHot(taskId, summarizePrompt);
-        const extracted = extractCompactSummaryText(raw);
-        if (extracted.length >= MIN_COMPACT_SUMMARY_CHARS) {
-          summary = extracted;
-          lastErr = null;
-          break;
-        }
-        lastErr = new Error(
-          `摘要过短（${extracted.length} 字 < ${MIN_COMPACT_SUMMARY_CHARS}）`,
-        );
-      } catch (err) {
-        lastErr = err;
-        // no_session / summarize_cancelled：与终态同款直接抛，不进第二次尝试
-        if (
-          err instanceof CompactChatError &&
-          (err.code === "no_session" || err.code === "summarize_cancelled")
-        ) {
-          throw err;
-        }
-      }
-    }
-    if (!summary || summary.length < MIN_COMPACT_SUMMARY_CHARS) {
-      const msg =
-        lastErr instanceof Error
-          ? lastErr.message
-          : lastErr
-            ? String(lastErr)
-            : "摘要生成失败";
-      if (lastErr instanceof CompactChatError) throw lastErr;
-      throw new CompactChatError("summarize_failed", `压缩摘要失败：${msg}`, 400);
-    }
-
-    // —— 摘要成功后的重建序列：每个 await 前后查 abort，命中则停、不写事件、不置 running、不重建 ——
-    throwIfCompactAborted();
-    // 记下旧会话模型，关旧 → 起新
-    const oldModel = getChatRunModel(taskId);
-    const creds = await readServerChatCreds();
-    throwIfCompactAborted();
-    const apiKey = creds?.apiKey;
-    const model = oldModel ?? creds?.model;
-    if (!apiKey || !model) {
-      throw new CompactChatError(
-        "restart_failed",
-        "缺少 API Key / 模型，无法重建会话",
-        400,
-      );
-    }
-
-    // 关旧会话前再查：命中则保留旧会话（若尚未关）并退出
-    throwIfCompactAborted();
-    closeChatSession(taskId);
-    await waitForChatToStop(taskId, 3000);
-    // 此后旧会话可能已关——abort 只阻止后续副作用（running / 重建 / 写成功事件）
-    throwIfCompactAborted();
-
-    // 先置 running 再重建。若重建 await 期间用户 stop，abort 已置位且
-    // cancelChatRun 会取消重建 run；stop 路由自己会把 runStatus 归 idle——
-    // 此处不必额外回写（避免与 stop 收尾竞态双写）。
-    const runningTask = await setTaskRunStatus(taskId, "running");
-    if (runningTask) publish(taskId, { kind: "task", task: runningTask });
-
-    throwIfCompactAborted();
-    try {
-      // await：等续接首包 turn 结束再返回（agent 被要求本回合直接结束）
-      await runChatSession({
-        task: runningTask ?? task,
-        apiKey,
-        model,
-        continuationSummary: summary,
-      });
-    } catch (err) {
-      throw new CompactChatError(
-        "restart_failed",
-        `重建会话失败：${err instanceof Error ? err.message : String(err)}`,
-        500,
-      );
-    }
-    // 重建返回后先查 abort——用户 stop 命中重建阶段应抛 summarize_cancelled
-    //（上层 maybeAutoCompactThenFlush 对该 code 静默分流），绝不能落成 restart_failed
-    // 再追加「自动压缩失败」。
-    throwIfCompactAborted();
-    // runChatSession 内部 Agent.create/send 失败走 handleChatRunFailure
-    // 不抛错（上面 catch 是死代码兜底）——重建失败必须显式报错，绝不能 200 假成功
-    if (!hasChatSession(taskId)) {
-      throw new CompactChatError(
-        "restart_failed",
-        "重建会话失败（新会话未存活）、请重试压缩或直接发消息",
-        500,
-      );
-    }
-
-    // compact_done / compact_summary 挪到重建确认成功之后再写。
-    // 取舍：续接 turn 的 prompt 已要求 agent 直接结束不输出正文，通常无 assistant
-    // 事件；即使有，「事件顺序小瑕疵」也好过「假成功」（事件流已显示已压缩但无可用会话）。
-    const doneText =
-      reason === "auto"
-        ? `上下文过大，已自动压缩会话（摘要 ${summary.length} 字）`
-        : `已压缩会话（摘要 ${summary.length} 字）`;
-    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 完成通知（重建确认成功后写、用户操作链）
-    await writeEventAndPublish(taskId, {
-      kind: "info",
-      text: doneText,
-      meta: {
-        kind: "compact_done",
-        summaryChars: summary.length,
-        reason,
-      },
-    });
-    // eslint-disable-next-line no-restricted-syntax -- 豁免：compact 完成通知（重建确认成功后写、用户操作链）
-    await writeEventAndPublish(taskId, {
-      kind: "compact_summary",
-      text: `会话摘要（${summary.length} 字）`,
-      meta: { summary },
-    });
-
-    const fresh = await getTask(taskId);
-    if (!fresh) {
-      throw new CompactChatError("not_found", "压缩后读 task 失败", 404);
-    }
-    return fresh;
-  } finally {
-    // setChatCompactInProgress(false) 同步清 aborted，防残留影响下次
-    setChatCompactInProgress(taskId, false);
-    // 成功或失败都尝试排空：compact 期间入队的消息在此发出
-    void flushChatQueue(taskId);
-  }
 };

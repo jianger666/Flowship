@@ -81,7 +81,6 @@ const BOOT_SETTLING_KINDS: ReadonlySet<string> = new Set([
   "tool_call",
   "tool_result",
   "ask_user_request",
-  "compact_summary",
   "error",
 ]);
 

@@ -5,7 +5,7 @@
  * 数据来自 run-perf turn-ended 写入的内存表；进程重启后无数据 → totalTokens: null。
  *
  * # 成功
- * { ok: true, context: { totalTokens, breakdown, turnCount, lastTurnAt, compactRecommended } }
+ * { ok: true, context: { totalTokens, breakdown, turnCount, lastTurnAt } }
  */
 
 import { getTask } from "@/lib/server/task-fs";

@@ -331,7 +331,6 @@ const EventRowImpl = ({
   const hasImageMeta = isUser || ev.kind === "ask_user_reply";
   const isAssistant = ev.kind === "assistant_message";
   const isThinking = ev.kind === "thinking";
-  const isCompactSummary = ev.kind === "compact_summary";
   const isToolCall = ev.kind === "tool_call";
   const isAwaitingAck = ev.meta?.awaitingAck === true;
   // checkpointed：可回退到这条用户消息
@@ -413,7 +412,7 @@ const EventRowImpl = ({
       batch={batch}
       actionTag={variant === "log" && actionType ? (ACTION_LABEL_SHORT[actionType] ?? actionType) : undefined}
       isToolCall={isToolCall}
-      isThinking={isThinking || isCompactSummary}
+      isThinking={isThinking}
       onToggle={handleToggle}
     />
   );
@@ -425,10 +424,6 @@ const EventRowImpl = ({
   //   - thinking / tool_call / info：单行细条目（小图标 + 摘要 + 时间）、点击展开、
   //     视觉权重压到最低——过程可查但不抢戏
   if (variant === "chat") {
-    // 会话压缩摘要：thinking 同款可折叠细行
-    if (isCompactSummary) {
-      return processRow;
-    }
     // AI 回复：平铺 prose、hover 出「复制」
     if (isAssistant) {
       return (

@@ -1,6 +1,6 @@
 /**
  * Chat 运行中消息队列（P5.1）纯函数 / Map 契约测试
- * + 自动 compact 触发判定 / tool-outputs 清理纯函数
+ * + tool-outputs 清理纯函数
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -25,10 +25,6 @@ import {
   __clearQueuedMessageFlushedListenersForTest,
   type QueuedChatMsg,
 } from "../src/lib/server/chat-queue";
-import {
-  COMPACT_SUGGEST_INFO_INPUT_TOKENS,
-  shouldAutoCompactAfterTurn,
-} from "../src/lib/server/chat-context-usage";
 import {
   selectToolOutputsToPrune,
   TOOL_OUTPUTS_MAX_BYTES,
@@ -215,21 +211,19 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     expect(getChatQueueCount(id)).toBe(1);
   });
 
-  it("compact 期间入队语义：send 返 false 后仍可 enqueue、完成后 FIFO 发出", () => {
-    // 对齐 chat-reply：compactInProgress → sendChatMessage false → enqueue
+  it("enqueue 后 FIFO dequeue 保序", () => {
     const id = alloc();
     expect(enqueueChatMessage(id, msg(1)).ok).toBe(true);
     expect(enqueueChatMessage(id, msg(2)).ok).toBe(true);
-    // compact 结束 flush：dequeue 保序
     expect(dequeueChatMessage(id)?.displayText).toBe("user-1");
     expect(dequeueChatMessage(id)?.displayText).toBe("user-2");
   });
 
-  it("flush 遇 busy 时 enqueueFront 保序（compact/runActive 同口径）", () => {
+  it("flush 遇 busy 时 enqueueFront 保序（runActive 同口径）", () => {
     const id = alloc();
     enqueueChatMessage(id, msg(2));
     enqueueChatMessage(id, msg(3));
-    // 模拟 flush 取出 msg2 后发现 compact 中 → 塞回队首
+    // 模拟 flush 取出 msg2 后发现 runActive → 塞回队首
     const head = dequeueChatMessage(id)!;
     enqueueChatMessageFront(id, head);
     expect(dequeueChatMessage(id)?.displayText).toBe("user-2");
@@ -303,28 +297,6 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
   });
 });
 
-describe("shouldAutoCompactAfterTurn（纯函数）", () => {
-  it("低于阈值不触发", () => {
-    expect(
-      shouldAutoCompactAfterTurn(COMPACT_SUGGEST_INFO_INPUT_TOKENS, false),
-    ).toBe(false);
-    expect(
-      shouldAutoCompactAfterTurn(COMPACT_SUGGEST_INFO_INPUT_TOKENS - 1, false),
-    ).toBe(false);
-  });
-
-  it("超过阈值且未尝试过 → 触发", () => {
-    expect(
-      shouldAutoCompactAfterTurn(COMPACT_SUGGEST_INFO_INPUT_TOKENS + 1, false),
-    ).toBe(true);
-  });
-
-  it("已尝试过 → 不重试（防死循环）", () => {
-    expect(
-      shouldAutoCompactAfterTurn(COMPACT_SUGGEST_INFO_INPUT_TOKENS + 50_000, true),
-    ).toBe(false);
-  });
-});
 
 describe("selectToolOutputsToPrune（纯函数）", () => {
   it("未超限不删", () => {

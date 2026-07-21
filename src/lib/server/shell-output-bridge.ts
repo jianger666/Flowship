@@ -13,7 +13,7 @@
 
 import type { InteractionUpdate } from "@cursor/sdk";
 
-import { publish } from "./task-stream";
+import { publish, writeOwnedEventAndPublish } from "./task-stream";
 
 const FLUSH_INTERVAL_MS = 500;
 const FLUSH_BYTES = 2 * 1024;
@@ -135,7 +135,68 @@ export const createShellOutputDeltaPublisher = (
   };
 };
 
-/** 串联多个 onDelta（perf + shell 流式等） */
+/**
+ * 监听 SDK 自带 in-place summarization（summary-started / summary / summary-completed）。
+ * summary-completed 时落一条 info 事件；summary-started 只打日志（避免半程失败留孤儿提示）。
+ * 写事件是 async——火忘、不阻塞 onDelta 同步签名。
+ *
+ * @param lease 绑 instanceId / opHandle——失主丢弃迟到 summary 事件
+ */
+export const createSdkSummaryDeltaPublisher = (
+  taskId: string,
+  lease: () => boolean,
+): ((args: { update: InteractionUpdate }) => void) => {
+  // 暂存最近一次 summary 文本字数（summary update 通常先于 summary-completed）
+  let lastSummaryChars: number | undefined;
+
+  return (args: { update: InteractionUpdate }): void => {
+    try {
+      const { update } = args;
+
+      if (update.type === "summary-started") {
+        lastSummaryChars = undefined;
+        console.log(`[sdk-summary] task=${taskId} summary-started`);
+        return;
+      }
+
+      if (update.type === "summary") {
+        const text = typeof update.summary === "string" ? update.summary : "";
+        lastSummaryChars = text.length;
+        return;
+      }
+
+      if (update.type !== "summary-completed") return;
+
+      const summaryChars = lastSummaryChars;
+      lastSummaryChars = undefined;
+      console.log(
+        `[sdk-summary] task=${taskId} summary-completed` +
+          (summaryChars != null ? ` chars=${summaryChars}` : ""),
+      );
+
+      // onDelta 同步签名——写事件火忘，失主由 lease 挡住
+      void (async () => {
+        try {
+          if (!lease()) return;
+          await writeOwnedEventAndPublish(taskId, lease, {
+            kind: "info",
+            text: "上下文过长，SDK 已自动压缩会话",
+            meta: {
+              kind: "sdk_summary",
+              ...(summaryChars != null ? { summaryChars } : {}),
+            },
+          });
+        } catch (err) {
+          console.warn(`[sdk-summary] task=${taskId} 写事件失败:`, err);
+        }
+      })();
+    } catch (err) {
+      console.warn(`[sdk-summary] onDelta 失败 task=${taskId}`, err);
+    }
+  };
+};
+
+/** 串联多个 onDelta（perf + shell 流式 + sdk summary 等） */
 export const composeOnDelta = (
   ...handlers: Array<(args: { update: InteractionUpdate }) => void>
 ): ((args: { update: InteractionUpdate }) => void) => {

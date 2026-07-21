@@ -83,7 +83,6 @@ vi.mock("@/lib/server/chat-runner", async (importOriginal) => {
     forceClearChatRun: vi.fn(),
     waitForChatToStop: vi.fn(async () => true),
     releaseChatRunClaim: vi.fn(),
-    isChatCompactInProgress: vi.fn(() => false),
     isChatQueueDraining: vi.fn(() => false),
   };
 });
