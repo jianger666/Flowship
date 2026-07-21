@@ -797,7 +797,7 @@ const TaskDetailPage = () => {
                 ) : (
                   "(未绑仓库、agent 在 home 跑)"
                 )}
-                {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name && (
+                {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name ? (
                   <span
                     className="ml-2 font-mono"
                     title={task.gitBranches
@@ -813,6 +813,26 @@ const TaskDetailPage = () => {
                       </span>
                     )}
                   </span>
+                ) : (
+                  // gitBranches 只在 build / worktree 链路写入——全 custom action 的任务
+                  // 永远没记录（2026-07-21 同事实测「没展示分支」）。用户手动配置的
+                  // feature 分支兜底展示（agent 实际也按它工作、只是没落权威记录）
+                  (() => {
+                    const configured = task.repoPaths
+                      .map((p) => task.repoFeatureBranches?.[p]?.trim())
+                      .filter((b): b is string => !!b);
+                    if (configured.length === 0) return null;
+                    return (
+                      <span className="ml-2 font-mono" title="任务配置的工作分支">
+                        @ {configured[0]}
+                        {configured.length > 1 && (
+                          <span className="ml-1 text-muted-foreground">
+                            ({configured.length} 仓)
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })()
                 )}
               </div>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
