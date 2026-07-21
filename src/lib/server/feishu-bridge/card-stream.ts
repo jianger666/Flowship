@@ -133,8 +133,8 @@ export const truncateForCard = (text: string): string => {
   return text.slice(0, Math.max(0, budget)) + TRUNCATE_HINT;
 };
 
-/** Hermes `_format_duration`：h/m/s 三段、分档始终带秒（2m0s 而非 2m） */
-const formatDuration = (ms: number): string => {
+/** Hermes `_format_duration`：h/m/s 三段、分档始终带秒（2m0s 而非 2m）；outbound 完成追发也复用 */
+export const formatDuration = (ms: number): string => {
   if (!Number.isFinite(ms) || ms < 0) return "";
   const total = Math.round(ms / 1000);
   const s = total % 60;

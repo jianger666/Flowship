@@ -14,6 +14,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { getPendingAsk } from "@/lib/server/chat-pending";
 import { dataRoot } from "@/lib/server/data-root";
 import { getTask } from "@/lib/server/task-fs";
 import { taskDir } from "@/lib/server/task-fs-core";
@@ -30,8 +31,13 @@ import {
 } from "./bridge-config";
 import {
   createCardStream as defaultCreateCardStream,
+  formatDuration,
 } from "./card-stream";
-import { uploadImage as defaultUploadImage } from "./lark-api";
+import {
+  getBotAppInfo as defaultGetBotAppInfo,
+  sendTextMessage as defaultSendTextMessage,
+  uploadImage as defaultUploadImage,
+} from "./lark-api";
 import type {
   CardStreamAppendAskOpts,
   CardStreamHandle,
@@ -45,9 +51,13 @@ type CreateCardStreamFn = (
   opts: CardStreamOptions,
 ) => CardStreamHandle;
 type UploadImageFn = (filePath: string) => Promise<string>;
+type SendTextMessageFn = typeof defaultSendTextMessage;
+type GetBotAppInfoFn = typeof defaultGetBotAppInfo;
 
 let createCardStreamImpl: CreateCardStreamFn = defaultCreateCardStream;
 let uploadImageImpl: UploadImageFn = defaultUploadImage;
+let sendTextMessageImpl: SendTextMessageFn = defaultSendTextMessage;
+let getBotAppInfoImpl: GetBotAppInfoFn = defaultGetBotAppInfo;
 
 /** 单测替换 createCardStream 工厂 */
 export const __setCreateCardStreamForTest = (
@@ -59,6 +69,20 @@ export const __setCreateCardStreamForTest = (
 /** 单测替换 uploadImage */
 export const __setUploadImageForTest = (fn: UploadImageFn | null): void => {
   uploadImageImpl = fn ?? defaultUploadImage;
+};
+
+/** 单测替换 sendTextMessage（完成追发） */
+export const __setSendTextMessageForTest = (
+  fn: SendTextMessageFn | null,
+): void => {
+  sendTextMessageImpl = fn ?? defaultSendTextMessage;
+};
+
+/** 单测替换 getBotAppInfo（完成追发取 ownerOpenId） */
+export const __setGetBotAppInfoForTest = (
+  fn: GetBotAppInfoFn | null,
+): void => {
+  getBotAppInfoImpl = fn ?? defaultGetBotAppInfo;
 };
 
 // ----------------- 开关缓存（避免每事件读盘） -----------------
@@ -248,7 +272,12 @@ export const __resetFeishuOutboundForTest = (): void => {
   enabledOverride = null;
   createCardStreamImpl = defaultCreateCardStream;
   uploadImageImpl = defaultUploadImage;
+  sendTextMessageImpl = defaultSendTextMessage;
+  getBotAppInfoImpl = defaultGetBotAppInfo;
 };
+
+/** 流式卡 finalize 后追发短文本的耗时门槛（秒回场景用户多半还在看、不刷屏） */
+const COMPLETION_PING_MIN_MS = 30_000;
 
 // ----------------- 小工具 -----------------
 
@@ -1108,6 +1137,43 @@ const handleAskUser = (
   });
 };
 
+/**
+ * 流式卡 finalize 后追发短文本，让用户切走飞书后仍能收到完成推送。
+ * 非流式不追（finalize 本就是第一次发卡、通知已在完成时）；stopped 不追（用户自己停的）。
+ * 发送失败只 warn，绝不打断 finalize 链（坑 #10）。
+ */
+const maybeSendCompletionPing = async (
+  taskId: string,
+  turn: TurnState,
+  opts: { ok: boolean; outcome?: "stopped" },
+): Promise<void> => {
+  // turn.streaming 在 ensureCardStarted 时定稿；undefined = 未建卡（本路径不会进来）
+  if (turn.streaming !== true) return;
+  if (opts.outcome === "stopped") return;
+  const elapsedMs = Date.now() - turn.turnStartedAt;
+  if (elapsedMs <= COMPLETION_PING_MIN_MS) return;
+
+  let text: string;
+  if (!opts.ok) {
+    text = "❌ 处理失败，可在卡片重试";
+  } else if (getPendingAsk(taskId)) {
+    text = "🙋 有问题等你回答";
+  } else {
+    // 耗时格式与 card-stream footer 同款（分秒、始终带秒）
+    text = `✅ 已完成（${formatDuration(elapsedMs)}）`;
+  }
+
+  try {
+    const info = await getBotAppInfoImpl();
+    await sendTextMessageImpl(info.ownerOpenId, text);
+  } catch (err) {
+    console.warn(
+      `[feishu-bridge/outbound] 完成追发失败 task=${taskId}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+};
+
 const finalizeTurn = async (
   taskId: string,
   turn: TurnState,
@@ -1159,6 +1225,9 @@ const finalizeTurn = async (
       error: opts.error,
       outcome: opts.outcome,
     });
+
+    // 流式长轮完成后追发短文本推送（放在 finalize 之后、失败 info 之前）
+    await maybeSendCompletionPing(taskId, turn, opts);
 
     // review P1#4 / 坑 #10：连续出向失败要在 app 内可见（每轮最多一条 info）
     const fails = card.getFailCount();

@@ -50,6 +50,12 @@ vi.mock("@/lib/server/feishu-bridge/bridge-config", () => ({
   isFeishuBridgeStreamingEnabled: vi.fn(async () => true),
 }));
 
+const getPendingAsk = vi.hoisted(() => vi.fn(() => null));
+
+vi.mock("@/lib/server/chat-pending", () => ({
+  getPendingAsk,
+}));
+
 const { isFeishuBridgeStreamingEnabled } = await import(
   "@/lib/server/feishu-bridge/bridge-config"
 );
@@ -90,11 +96,26 @@ const uploadImage = vi.hoisted(() =>
   vi.fn(async (p: string) => `img_key_for_${p.split("/").pop()}`),
 );
 
+const sendTextMessage = vi.hoisted(() =>
+  vi.fn(async () => ({ chat_id: "oc_x", message_id: "om_text" })) as unknown as ReturnType<
+    typeof vi.fn<(openId: string, text: string) => Promise<{ chat_id: string; message_id: string }>>
+  >,
+);
+
+const getBotAppInfo = vi.hoisted(() =>
+  vi.fn(async () => ({
+    appId: "cli_x",
+    ownerOpenId: "ou_owner",
+  })),
+);
+
 const {
   ensureFeishuOutboundRegistered,
   __resetFeishuOutboundForTest,
   __setCreateCardStreamForTest,
   __setUploadImageForTest,
+  __setSendTextMessageForTest,
+  __setGetBotAppInfoForTest,
   __setBridgeEnabledForTest,
   handleFeishuOutboundEvent,
   formatElapsed,
@@ -141,6 +162,10 @@ beforeEach(() => {
   }));
   writeEventAndPublish.mockClear();
   uploadImage.mockClear();
+  sendTextMessage.mockClear();
+  getBotAppInfo.mockClear();
+  getPendingAsk.mockClear();
+  getPendingAsk.mockReturnValue(null);
   vi.mocked(isFeishuBridgeStreamingEnabled).mockReset();
   vi.mocked(isFeishuBridgeStreamingEnabled).mockResolvedValue(true);
   __setCreateCardStreamForTest(
@@ -149,6 +174,8 @@ beforeEach(() => {
     >[0],
   );
   __setUploadImageForTest(uploadImage);
+  __setSendTextMessageForTest(sendTextMessage);
+  __setGetBotAppInfoForTest(getBotAppInfo);
   __setBridgeEnabledForTest(true);
   ensureFeishuOutboundRegistered();
 });
@@ -830,5 +857,95 @@ describe("流式开关冻结", () => {
     expect(cardFactory.create).toHaveBeenCalledTimes(1);
     expect(isFeishuBridgeStreamingEnabled).toHaveBeenCalledTimes(1);
     expect(cardFactory.cards[0]!.pushAnswer).toHaveBeenCalled();
+  });
+});
+
+describe("流式完成追发短文本", () => {
+  /** 跑一轮 user_reply → delta → done；elapsedMs 控制 Date.now 相对起点的流逝 */
+  const runTurnToDone = async (opts: {
+    taskId: string;
+    elapsedMs: number;
+    ok?: boolean;
+    runStatus?: string;
+    answer?: string;
+  }): Promise<void> => {
+    const {
+      taskId,
+      elapsedMs,
+      ok = true,
+      runStatus = "awaiting_user",
+      answer = "答",
+    } = opts;
+    const t0 = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      publishTaskStreamEvent(taskId, makeEvent("user_reply", "问"));
+      await flush();
+      // 流逝后再推 delta/done——turnStartedAt 已在 user_reply 时钉在 t0
+      nowSpy.mockReturnValue(t0 + elapsedMs);
+      publishTaskStreamEvent(taskId, { kind: "assistant_delta", text: answer });
+      await flush();
+      publishTaskStreamEvent(taskId, {
+        kind: "done",
+        ok,
+        task: {
+          id: taskId,
+          title: "测对话",
+          mode: "chat",
+          runStatus,
+        } as never,
+      });
+      await flush();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  };
+
+  it("耗时 >30s + done ok → sendTextMessage 文案含「已完成」", async () => {
+    await runTurnToDone({ taskId: "t_ping_ok", elapsedMs: 83_000 });
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("已完成"),
+    );
+    const text = String(sendTextMessage.mock.calls[0]?.[1] ?? "");
+    expect(text).toMatch(/1m23s/);
+  });
+
+  it("耗时 <30s → 不追发", async () => {
+    await runTurnToDone({ taskId: "t_ping_short", elapsedMs: 10_000 });
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it("done ok=false（耗时 >30s）→ 文案含「处理失败」", async () => {
+    await runTurnToDone({
+      taskId: "t_ping_fail",
+      elapsedMs: 31_000,
+      ok: false,
+    });
+    expect(sendTextMessage).toHaveBeenCalledTimes(1);
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      "ou_owner",
+      expect.stringContaining("处理失败"),
+    );
+  });
+
+  it("outcome=stopped → 不追发", async () => {
+    await runTurnToDone({
+      taskId: "t_ping_stopped",
+      elapsedMs: 60_000,
+      runStatus: "idle",
+    });
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it("非流式模式 → 不追发", async () => {
+    vi.mocked(isFeishuBridgeStreamingEnabled).mockResolvedValue(false);
+    await runTurnToDone({ taskId: "t_ping_nostream", elapsedMs: 60_000 });
+    expect(cardFactory.create).toHaveBeenCalledWith("t_ping_nostream", {
+      title: "测对话",
+      streaming: false,
+    });
+    expect(sendTextMessage).not.toHaveBeenCalled();
   });
 });

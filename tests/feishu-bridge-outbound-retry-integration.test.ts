@@ -50,6 +50,10 @@ const larkMocks = vi.hoisted(() => {
       chat_id: "oc_int",
       message_id: "om_int",
     })),
+    sendTextMessage: vi.fn<AnyFn>(async () => ({
+      chat_id: "oc_int",
+      message_id: "om_text_int",
+    })),
     updateCardEntity: vi.fn<AnyFn>(async () => undefined),
     updateCardElementContent: vi.fn<AnyFn>(async () => undefined),
     patchCardSettings: vi.fn<AnyFn>(async () => undefined),
