@@ -80,11 +80,11 @@ const TaskListContext = createContext<TaskListContextValue | null>(null);
 // 条件轮询间隔：仅当有任务在跑时生效（本地读 meta.json 很轻、2s 兼顾实时与开销）
 const POLL_INTERVAL_MS = 2000;
 
-// Task（完整）→ TaskSummary：派生 actionCount / lastAction*，剔除 events / actions
+// Task（完整）→ TaskSummary：派生 actionCount / lastAction* / hasPendingAsk，剔除 events / actions / pendingAskId
 // （避免把可能很大的 events 数组带进侧栏列表）。本身已是 Summary 则原样返回。
 const toSummary = (task: Task | TaskSummary): TaskSummary => {
   if ("actionCount" in task) return task;
-  const { events, actions, ...rest } = task;
+  const { events, actions, pendingAskId, ...rest } = task;
   void events; // 仅为从 rest 中剔除、不入列表
   const last = actions[actions.length - 1];
   return {
@@ -92,6 +92,7 @@ const toSummary = (task: Task | TaskSummary): TaskSummary => {
     actionCount: actions.length,
     lastActionType: last?.type,
     lastActionStatus: last?.status,
+    hasPendingAsk: !!pendingAskId,
   };
 };
 

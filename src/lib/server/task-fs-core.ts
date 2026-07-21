@@ -213,6 +213,11 @@ export interface TaskMetaV06 {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户置顶（缺省 false） */
   pinned?: boolean;
+  /**
+   * 当前未答 ask_user 的 askId（落盘、app 重启不丢）。
+   * 与内存 pendingAsks 同步写/清；老任务无此字段 = 无 pending ask。
+   */
+  pendingAskId?: string | null;
   createdAt: number;
   updatedAt: number;
   model?: ModelSelection;
@@ -1144,6 +1149,7 @@ export const assembleTask = (
   taskDirPath: taskDir(meta.id),
   removeSourceBranchOnMerge: meta.removeSourceBranchOnMerge,
   pinned: meta.pinned,
+  pendingAskId: meta.pendingAskId,
   createdAt: meta.createdAt,
   updatedAt: meta.updatedAt,
   model: meta.model,
@@ -1203,5 +1209,7 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     actionCount: meta.actions.length,
     lastActionType: lastAction?.type,
     lastActionStatus: lastAction?.status,
+    // 侧栏「待回答」看这个、不看 action 状态组合（断掉态同为 awaiting_user+running）
+    hasPendingAsk: !!meta.pendingAskId,
   };
 };

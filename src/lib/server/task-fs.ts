@@ -1700,6 +1700,37 @@ export const clearTaskSessionAgentIdIf = async (
   }
 };
 
+/**
+ * 把内存 pendingAsks 的当前 askId 收敛到 meta.pendingAskId（落盘）。
+ * 在 withTaskLock 内再读一次 getDesired——并发 register/clear 时后到的 sync
+ * 仍写到内存最新值，避免 fire-and-forget 乱序把旧 askId 写回盘。
+ * best-effort：任务已删 ENOENT 静默；不 bump updatedAt（跟 sessionAgentId 同口径）。
+ */
+export const syncTaskPendingAskId = async (
+  taskId: string,
+  getDesired: () => string | null,
+): Promise<void> => {
+  try {
+    await withTaskLock(taskId, async () => {
+      const meta = await readMetaV06(taskId);
+      if (!meta) return;
+      const desired = getDesired();
+      const onDisk = meta.pendingAskId ?? null;
+      if (desired === onDisk) return;
+      if (desired) meta.pendingAskId = desired;
+      else delete meta.pendingAskId;
+      await writeMeta(meta);
+    });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.warn(
+        `[task-fs] syncTaskPendingAskId 失败（best-effort、忽略）task=${taskId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+};
+
 // V0.8 侧栏：置顶 / 取消置顶（排到任务列表最上）。不动 updatedAt（置顶与活跃度无关）。
 export const setTaskPinned = async (
   id: string,

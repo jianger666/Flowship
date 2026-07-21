@@ -1141,6 +1141,13 @@ export interface Task {
   removeSourceBranchOnMerge?: boolean;
   /** V0.8 侧栏：用户手动置顶（排到任务列表最上）。缺省 / undefined = 未置顶。 */
   pinned?: boolean;
+  /**
+   * 当前未答 ask_user 的 askId（落盘、app 重启不丢）。
+   * - 有值 = 真在等用户答题（侧栏「待回答」/ 详情答题卡权威源之一）
+   * - null / undefined = 无 pending ask（含「awaiting_user + action running」的断掉态）
+   * 内存 Map（chat-pending）仍是运行时校验用；本字段专供重启后列表 / 侧栏判定。
+   */
+  pendingAskId?: string | null;
   createdAt: number;
   updatedAt: number;
   model?: ModelSelection;
@@ -1200,11 +1207,16 @@ export interface AddContextDocInput {
  * 跟 Task 比少 events（events.jsonl 可能几千行、parse 开销大）+ actions 详细内容
  * 仍保留 actionCount 让 UI 卡片显示「N 个 action」徽章
  */
-export type TaskSummary = Omit<Task, "events" | "actions"> & {
+export type TaskSummary = Omit<Task, "events" | "actions" | "pendingAskId"> & {
   actionCount: number;
   // V0.6：列表卡片需要展示「最近一个 action」简略信息
   lastActionType?: ActionType;
   lastActionStatus?: ActionStatus;
+  /**
+   * meta.pendingAskId 非空——侧栏「待回答」判定用（不暴露具体 askId）。
+   * 老任务无该字段 = undefined → 当无 ask。
+   */
+  hasPendingAsk?: boolean;
 };
 
 // ---- MCP 连通性健康（V0.6.11） ----

@@ -170,6 +170,36 @@ export const sessionTransports = getGlobalState().sessionTransports;
 // 短 token：8 字符 base36、够防撞、不浪费 context（模型只透传、不需要 crypto 强度）
 const newAskToken = (): string => Math.random().toString(36).slice(2, 10);
 
+/**
+ * 内存 Map 变更后异步收敛到 meta.pendingAskId。
+ * 动态 import task-fs：避免本文件与 runner/route 图在静态边形成环。
+ * 按 taskId 串最新 Promise——测试可 await whenPendingAskMetaSynced。
+ */
+const pendingAskMetaSyncByTask = new Map<string, Promise<void>>();
+
+const schedulePendingAskMetaSync = (taskId: string): void => {
+  const run = async (): Promise<void> => {
+    const { syncTaskPendingAskId } = await import("./task-fs");
+    await syncTaskPendingAskId(
+      taskId,
+      () => pendingAsks.get(taskId)?.askId ?? null,
+    );
+  };
+  const next = (pendingAskMetaSyncByTask.get(taskId) ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(run);
+  pendingAskMetaSyncByTask.set(taskId, next);
+  void next.finally(() => {
+    if (pendingAskMetaSyncByTask.get(taskId) === next) {
+      pendingAskMetaSyncByTask.delete(taskId);
+    }
+  });
+};
+
+/** 等指定 task 的 pendingAskId meta 同步落盘（测试 / 需要强一致读盘时用） */
+export const whenPendingAskMetaSynced = (taskId: string): Promise<void> =>
+  pendingAskMetaSyncByTask.get(taskId) ?? Promise.resolve();
+
 /** ask_user 工具 handler 调：登记一组新提问（顶掉旧的、旧弹窗答案会因 token 不符被拒） */
 export const registerPendingAsk = (
   taskId: string,
@@ -183,6 +213,8 @@ export const registerPendingAsk = (
     createdAt: Date.now(),
   };
   pendingAsks.set(taskId, ask);
+  // 落盘 meta.pendingAskId——侧栏 / 重启后列表靠这个判「真有题」
+  schedulePendingAskMetaSync(taskId);
   return ask;
 };
 
@@ -193,6 +225,7 @@ export const getPendingAsk = (taskId: string): PendingAsk | null =>
 /** 答完 / 作废时清登记 */
 export const clearPendingAsk = (taskId: string): void => {
   pendingAsks.delete(taskId);
+  schedulePendingAskMetaSync(taskId);
 };
 
 /**
@@ -200,8 +233,12 @@ export const clearPendingAsk = (taskId: string): void => {
  * 失主让位反登记请用 {@link cancelPendingIf}——裸删会误清 B 刚登记的新提问。
  * @returns 是否真的清了（调用方据此决定要不要写「已作废」事件）
  */
-export const cancelPending = (taskId: string): boolean =>
-  pendingAsks.delete(taskId);
+export const cancelPending = (taskId: string): boolean => {
+  const deleted = pendingAsks.delete(taskId);
+  // 无论内存是否刚删：sync 收敛盘面（覆盖重启后「内存空、meta 仍有孤儿 askId」）
+  schedulePendingAskMetaSync(taskId);
+  return deleted;
+};
 
 /**
  * 按 askId 条件反登记——当前 pendingAsk 的 askId 匹配才删。
@@ -215,6 +252,7 @@ export const cancelPendingIf = (
   const cur = pendingAsks.get(taskId);
   if (!cur || cur.askId !== expectedAskId) return false;
   pendingAsks.delete(taskId);
+  schedulePendingAskMetaSync(taskId);
   return true;
 };
 
@@ -237,6 +275,8 @@ export const cleanupChatTaskState = (taskId: string): void => {
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
   expectedCallerTokens.delete(taskId);
+  // 始终 sync：stop 后不应再亮「待回答」；重启孤儿 askId 也一并清掉
+  schedulePendingAskMetaSync(taskId);
 };
 
 /** MCP 拒文案（工具 handler / 分派层共用、测试断言也认这个字面量） */

@@ -45,7 +45,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { actionDisplayLabel, formatRelative } from "@/lib/task-display";
+import { formatRelative } from "@/lib/task-display";
+import { taskStageLine } from "@/lib/task-stage-line";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
@@ -70,37 +71,8 @@ const useTaskSeenAt = (taskId: string): number => {
 };
 
 // v1.0.x 监控行降噪（用户实测「有了那么多状态反而更杂乱」）：
-// **只有活跃态才出第二行**——运行中 / 待确认 / 待回答；空闲 / 静息 / 失败一律单行只标题。
-// 监控信号只对「正在发生事」的任务有价值、满屏「方案 · 空闲」是废话 + 多色噪音。
-// error 也不标（跟行首指示同一原则：断线类 error 常见、老任务红字刷屏反而噪声；
-// 真失败有系统通知 + 打开任务可见）。
-const taskStageLine = (
-  task: TaskSummary,
-  seenAt: number,
-): { stage: string; status: string; tone: "run" | "wait" } | null => {
-  if (task.mode === "chat") return null;
-  const stage = task.lastActionType
-    ? actionDisplayLabel({ type: task.lastActionType }, "short")
-    : "未开始";
-  if (task.runStatus === "running") {
-    return { stage, status: "运行中", tone: "run" };
-  }
-  if (task.runStatus === "awaiting_user") {
-    // awaiting_ack = 交卷等审阅；running（此刻不在跑但 action 挂 running）= agent 提问等答
-    if (task.lastActionStatus === "awaiting_ack") {
-      // 已读即清（v1.1.x 用户拍板「点进去看过、状态就该清掉」）：交卷后打开过详情
-      //（seenAt 晚于任务最后动静）→ 回归静息单行；再有新交卷 updatedAt 前移、重新亮
-      if (seenAt >= task.updatedAt) return null;
-      return { stage, status: "待确认", tone: "wait" };
-    }
-    // 待回答不做已读清除：AI 被阻塞在等答案、不答永远停——必须一直亮
-    if (task.lastActionStatus === "running") {
-      return { stage, status: "待回答", tone: "wait" };
-    }
-  }
-  // 空闲 / 静息 / 失败：不出第二行
-  return null;
-};
+// **只有活跃态才出第二行**——运行中 / 待确认 / 待回答 / 已暂停；空闲 / 静息 / 失败一律单行只标题。
+// 判定逻辑见 @/lib/task-stage-line（可单测）。
 
 const TONE_CLASS: Record<"run" | "wait", string> = {
   run: "text-primary",
@@ -127,12 +99,14 @@ const LeadingIndicator = ({
   }
   // 真有事等你才亮琥珀点（task 模式限定、见文件头 V0.11.x 收窄说明）：
   // - awaiting_ack 且**未读**（v1.1.x：看过详情即清、跟监控行同判定）
-  // - running + awaiting_user：agent 提问（ask 弹窗）等你答案（不做已读清除）
+  // - hasPendingAsk：agent 提问等答案
+  // - action 仍 running 且无 ask：断掉「已暂停」——也值得一眼看见、可说话唤醒
   const needsAttention =
     task.runStatus === "awaiting_user" &&
     task.mode !== "chat" &&
     ((task.lastActionStatus === "awaiting_ack" &&
       seenAt < task.updatedAt) ||
+      !!task.hasPendingAsk ||
       task.lastActionStatus === "running");
   if (needsAttention) {
     return (
