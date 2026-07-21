@@ -36,34 +36,42 @@ const verbGroup = (
 });
 
 describe("groupChatRenderItems", () => {
-  it("单 turn：user → thinking → tool → 旁白 → 正文 → [user, group(3), 正文]", () => {
+  it("AI 中间插话独立并隔断组：user → thinking+tool 成组 → 插话 → 后续工具成新组 → 正文", () => {
+    // 2026-07-21 用户验收拍板：AI 中间插的话不进组、且插话前后两批工具不得整合进同一组
     const user = ev({ id: "u1", kind: "user_reply", text: "你好", ts: 10 });
     const thinking = ev({ id: "t1", kind: "thinking", text: "想一下", ts: 20 });
     const tool = block({ id: "tb1", name: "shell", ts: 30, status: "success" });
     const aside = ev({
       id: "a1",
       kind: "assistant_message",
-      text: "正在查…",
+      text: "查到 X、我再看看 Y",
       ts: 40,
     });
+    const tool2 = block({ id: "tb2", name: "read", ts: 45, status: "success" });
     const body = ev({
       id: "a2",
       kind: "assistant_message",
       text: "结论在此",
       ts: 50,
     });
-    const out = groupChatRenderItems([user, thinking, tool, aside, body]);
-    expect(out).toHaveLength(3);
-    expect(out[0]).toMatchObject({ kind: "user_reply", id: "u1" });
-    expect(isWorkGroup(out[1]!)).toBe(true);
-    const g = out[1] as WorkGroupItem;
-    expect(g.id).toBe("t1");
-    expect(g.members).toHaveLength(3);
-    expect(g.members.map((m) => m.id)).toEqual(["t1", "tb1", "a1"]);
-    expect(g.stepCount).toBe(3);
-    expect(g.startTs).toBe(20);
-    expect(g.endTs).toBe(40);
-    expect(out[2]).toMatchObject({ kind: "assistant_message", id: "a2" });
+    const out = groupChatRenderItems([user, thinking, tool, aside, tool2, body]);
+    expect(out.map((x) => x.kind)).toEqual([
+      "user_reply",
+      "__work_group__",
+      "assistant_message",
+      "__work_group__",
+      "assistant_message",
+    ]);
+    const g1 = out[1] as WorkGroupItem;
+    expect(g1.id).toBe("t1");
+    expect(g1.members.map((m) => m.id)).toEqual(["t1", "tb1"]);
+    expect(g1.stepCount).toBe(2);
+    expect(g1.startTs).toBe(20);
+    expect(g1.endTs).toBe(30);
+    expect(out[2]).toMatchObject({ kind: "assistant_message", id: "a1" });
+    const g2 = out[3] as WorkGroupItem;
+    expect(g2.members.map((m) => m.id)).toEqual(["tb2"]);
+    expect(out[4]).toMatchObject({ kind: "assistant_message", id: "a2" });
   });
 
   it("多 turn 边界：第二个 user_reply 重开分组", () => {
@@ -89,7 +97,7 @@ describe("groupChatRenderItems", () => {
     expect(out[5]).toMatchObject({ id: "a2" });
   });
 
-  it("正文判定：唯一 assistant 是正文不进组；零 assistant 全成组", () => {
+  it("assistant 一律独立：唯一 assistant 不进组；零 assistant 全成组", () => {
     const onlyBody = groupChatRenderItems([
       ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
       ev({ id: "a", kind: "assistant_message", text: "only", ts: 2 }),
@@ -138,7 +146,7 @@ describe("groupChatRenderItems", () => {
     expect((out[3] as WorkGroupItem).members.map((m) => m.id)).toEqual(["tb"]);
   });
 
-  it("正文后收尾成员 → 正文后新组", () => {
+  it("assistant 之后的收尾成员 → 新组", () => {
     const out = groupChatRenderItems([
       ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
       ev({ id: "t", kind: "thinking", text: "想", ts: 2 }),

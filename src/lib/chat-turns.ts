@@ -1,9 +1,11 @@
 /**
- * chat turn 分组纯函数（CHAT-REDESIGN Batch A）
+ * chat 工作过程分组纯函数（CHAT-REDESIGN Batch A、2026-07-21 用户验收修正语义）
  *
- * 把 mergeToolDisplayEvents 产出的 StreamRenderItem[] 再收成「工作过程组 + 正文」，
- * 供 event-stream 渲染层折叠；粘性状态行文案也在此派生。
- * 不碰 events.jsonl、不碰组件。
+ * 把 mergeToolDisplayEvents 产出的 StreamRenderItem[] 里连续的过程项
+ * （thinking / 工具块 / verb-group / error）收成「工作过程组」；
+ * assistant_message 一律独立平铺——AI 中间插话天然分隔前后两个组，
+ * 不把「插话前后的两批工具」整合进同一组（用户拍板）。
+ * 粘性状态行文案也在此派生。不碰 events.jsonl、不碰组件。
  */
 
 import type { TaskEvent } from "@/lib/types";
@@ -48,23 +50,16 @@ export const isWorkGroup = (it: ChatRenderItem): it is WorkGroupItem =>
 
 // ---------- 组成员判定 ----------
 
-/** 永远进组的 kind（assistant_message 另议：仅非正文时进组） */
-const ALWAYS_MEMBER_KINDS = new Set<string>([
+/**
+ * 进组的 kind——纯过程项。assistant_message 不在其中：
+ * AI 说的每段话（含中间插话）都独立平铺、并天然隔断前后组。
+ */
+const MEMBER_KINDS = new Set<string>([
   "thinking",
   "__tool_block__",
   "__tool_verb_group__",
   "error",
 ]);
-
-/** 永远不进组、原样输出（含宽容：未知 kind 也走独立路径） */
-const isAlwaysIndependent = (kind: string): boolean => {
-  if (ALWAYS_MEMBER_KINDS.has(kind)) return false;
-  if (kind === "assistant_message") return false; // 正文 / 旁白分叉另判
-  // user_reply / ask_* / info / 其它未知 → 独立
-  return true;
-};
-
-const itemTs = (it: StreamRenderItem): number => it.ts;
 
 const memberHasError = (it: StreamRenderItem): boolean => {
   if (it.kind === "error") return true;
@@ -96,54 +91,22 @@ const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
     members,
     hasError: members.some(memberHasError),
     hasRunning: members.some(memberHasRunning),
-    startTs: itemTs(first),
-    endTs: itemTs(last),
+    startTs: first.ts,
+    endTs: last.ts,
     stepCount: members.length,
   };
 };
 
 /**
- * 把 StreamRenderItem[] 按 turn 收成工作过程组 + 正文。
- *
- * 两遍扫：先按 user_reply 切 turn 并标正文（turn 内最后一个 assistant_message），
- * 再线性扫产组——被独立项 / 正文隔断后开新组；正文后的收尾成员进新组。
+ * 线性扫产组：连续过程项（thinking / 工具 / error）收进同一组；
+ * 任何非过程项（user_reply / assistant_message / ask_* / info / 未知）
+ * 独立输出并隔断组。单成员也成组（统一渲染路径）。O(n)。
  */
 export const groupChatRenderItems = (
   items: StreamRenderItem[],
 ): ChatRenderItem[] => {
   if (items.length === 0) return [];
 
-  // ---- 第一遍：切 turn、标每 turn 正文下标（相对 turn 切片） ----
-  type TurnSlice = {
-    start: number;
-    end: number; // exclusive
-    /** turn 内最后一个 assistant_message 的绝对下标；无则 -1 */
-    bodyAbsIdx: number;
-  };
-
-  const turns: TurnSlice[] = [];
-  let turnStart = 0;
-  for (let i = 0; i < items.length; i++) {
-    if (i > 0 && items[i]!.kind === "user_reply") {
-      turns.push({
-        start: turnStart,
-        end: i,
-        bodyAbsIdx: -1, // 稍后填
-      });
-      turnStart = i;
-    }
-  }
-  turns.push({ start: turnStart, end: items.length, bodyAbsIdx: -1 });
-
-  for (const turn of turns) {
-    let lastAssistant = -1;
-    for (let i = turn.start; i < turn.end; i++) {
-      if (items[i]!.kind === "assistant_message") lastAssistant = i;
-    }
-    turn.bodyAbsIdx = lastAssistant;
-  }
-
-  // ---- 第二遍：线性扫产组 ----
   const out: ChatRenderItem[] = [];
   let buf: StreamRenderItem[] = [];
 
@@ -153,40 +116,13 @@ export const groupChatRenderItems = (
     buf = [];
   };
 
-  for (const turn of turns) {
-    for (let i = turn.start; i < turn.end; i++) {
-      const it = items[i]!;
-      const kind = it.kind;
-
-      // 正文：独立输出、隔断组
-      if (kind === "assistant_message" && i === turn.bodyAbsIdx) {
-        flush();
-        out.push(it);
-        continue;
-      }
-
-      // 旁白 assistant / thinking / tool / error → 进组
-      if (
-        ALWAYS_MEMBER_KINDS.has(kind) ||
-        (kind === "assistant_message" && i !== turn.bodyAbsIdx)
-      ) {
-        buf.push(it);
-        continue;
-      }
-
-      // 独立项（user_reply / ask_* / info / 未知）→ 隔断组
-      if (isAlwaysIndependent(kind)) {
-        flush();
-        out.push(it);
-        continue;
-      }
-
-      // 理论不可达：兜底当独立项
-      flush();
-      out.push(it);
+  for (const it of items) {
+    if (MEMBER_KINDS.has(it.kind)) {
+      buf.push(it);
+      continue;
     }
-    // turn 边界不强制 flush——连续组成员跨 turn？不会，user_reply 会隔断。
-    // 但 turn 末尾可能还有 buf，留给下一 turn 开头的独立项 flush，或最终 flush。
+    flush();
+    out.push(it);
   }
   flush();
   return out;

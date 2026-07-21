@@ -11,7 +11,6 @@
 import { memo, useState } from "react";
 import { ChevronRight, Loader2, X } from "lucide-react";
 
-import { MarkdownText } from "@/components/markdown-text";
 import type { WorkGroupItem } from "@/lib/chat-turns";
 import {
   isToolBlock,
@@ -80,16 +79,7 @@ const WorkGroupMember = ({
   if (isToolVerbGroup(member)) {
     return <ToolVerbGroupRow group={member} taskId={taskId} />;
   }
-  // 组内旁白：不用 EventRow（会全权重平铺抢戏）——降权 markdown
-  if (member.kind === "assistant_message") {
-    const ev = member as TaskEvent;
-    return (
-      <div className="px-1 text-[13px] leading-relaxed text-muted-foreground">
-        <MarkdownText text={ev.text} />
-      </div>
-    );
-  }
-  // thinking / error / 其它 TaskEvent → EventRow chat 细行分支
+  // thinking / error（assistant 插话不进组、独立平铺）→ EventRow chat 细行分支
   return (
     <EventRow
       ev={member as TaskEvent}

@@ -11,32 +11,31 @@
 
 ```
 [用户消息（右侧浅气泡）]
-[▸ 工作过程 · 12 步 · 2m14s]        ← 历史轮默认折叠成一行；运行中轮展开直播
+[▸ 工作过程 · 5 步 · 40s]           ← 连续过程项收组；历史默认折叠、运行中展开直播
+[AI 插话（全宽平铺）]                ← AI 说的每段话都独立、天然隔断前后组
+[▸ 工作过程 · 7 步 · 1m34s]
 [AI 正文（全宽平铺 markdown）]
 ──────── 时间胶囊分割线 ────────
 [下一轮用户消息]
 ```
 
-- **正文** = turn 内最后一段 `assistant_message`（全宽平铺、最大可读性）
-- **过程组（work group）** = turn 内正文之前的 thinking / tool 块 / verb-group /
-  中间 assistant 旁白（「正在查 X…」这类段落是主要噪音源）/ error
-- **组外保留独立渲染**：`ask_user_request`（交互卡）、`ask_user_reply`、
-  `info`（细线化降权）、reconnecting 特殊行、虚拟项（streaming / loading / pending / boot）
+- **assistant_message 一律独立平铺**（2026-07-21 用户验收拍板）：AI 中间插的话
+  不进组、且插话前后两批工具**不得**整合进同一组——插话是组的天然分隔符
+- **过程组（work group）** = **连续的** thinking / tool 块 / verb-group / error
+- **组外保留独立渲染**：`user_reply`、`assistant_message`、`ask_user_request`
+  （交互卡）、`ask_user_reply`、`info`（细线化降权）、reconnecting 特殊行、
+  虚拟项（streaming / loading / pending / boot）
 - **运行中粘性状态行**：running 时 Composer 上方一行 shimmer（当前步骤 + 耗时），
   过程不再依赖用户滚动事件流跟踪；turn 结束消失
 
 ## 判定规则（纯函数、可单测）
 
-- turn 边界：`user_reply` 或流首
-- 组成员：`thinking`、`__tool_block__`、`__tool_verb_group__`、`error`、
-  非最后的 `assistant_message`
-- 正文：turn 内**最后一个** `assistant_message`（其后可能还有组成员——
-  「答完又收尾动作」的杂事仍归组、但组渲染在正文之前保持时序感知即可，
-  实现按「正文之后的成员进下一个组段」处理）
+- 组成员：`thinking`、`__tool_block__`、`__tool_verb_group__`、`error`——
+  **连续**出现收进同一组；被任何独立项（含 assistant 插话）隔断后开新组
 - 组折叠默认值：组内含 running 工具块、或（它是全流最后一个组且 isRunning）→ 展开；
   否则折叠。用户手动 toggle 后以手动为准（state 按组 id 记在组件内）
 - 组 id：组内第一个成员的 id（分页 prepend 下稳定）
-- 组头摘要：`N 步 · 耗时`（首末成员 ts 差）；含 error 成员时加错误标记；
+- 组头摘要：`N 步 · 耗时`（首末成员 ts 差；<1s 不显示）；含 error 成员时加错误标记；
   running 时显示当前步骤尾行代替耗时
 
 ## 工程分批（串行、每批全量门禁）
