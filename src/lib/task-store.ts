@@ -909,22 +909,29 @@ export const removeChatQueueItems = async (
 };
 
 /**
- * 把排队中的指定条目置顶到队首（「立即发送」第一步）。
- * 成功后调用方若 runStatus===running 再 stopTask，打断当前回复 → flush 发队首。
+ * 排队消息「立即发送」：server 原子编排（take → stop 清剩余队 → 用该条起新会话）。
+ * 旧路径 promote + stop 会把刚置顶的条一并 failQueuedItems 清掉，永远发不出去。
+ * bootArgs 必传（stop 后无会话、要自动启动）。
  */
-export const promoteQueuedChatMessage = async (
+export const sendQueuedChatMessageNow = async (
   taskId: string,
   itemId: string,
-): Promise<void> => {
+  bootArgs: { apiKey: string; model: ModelSelection },
+): Promise<{ task: Task }> => {
   const res = await fetch(
     `/api/tasks/${encodeURIComponent(taskId)}/chat-queue`,
     {
-      method: "PATCH",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ itemId }),
+      body: JSON.stringify({
+        action: "send_now",
+        itemId,
+        bootArgs,
+      }),
     },
   );
-  await handleJson<{ ok: true }>(res);
+  const data = await handleJson<{ ok: true; task: Task }>(res);
+  return { task: data.task };
 };
 
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道

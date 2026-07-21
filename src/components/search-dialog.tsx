@@ -274,13 +274,23 @@ export const SearchDialog = () => {
     ...results.map((hit): ListItem => ({ kind: "hit", hit })),
   ];
 
-  // 列表内容变化时高亮回到第一条
+  // 高亮跟随实时过滤列表：commands 按 query 即时滤、results 按 debounce——
+  // 只跟 debouncedQuery/results 会在输入过程中让 activeIndex 指到已消失的旧项。
+  // 依赖 items.length + 首项 key，列表一变就重置；越界再 clamp 兜底。
+  const itemsSignature =
+    items.length === 0
+      ? "empty"
+      : `${items.length}:${items[0]!.kind === "command" ? items[0]!.entry.key : items[0]!.hit.taskId}`;
   useEffect(() => {
     setActiveIndex(0);
-  }, [results, debouncedQuery]);
+  }, [itemsSignature]);
+
+  // Enter / 箭头用的安全索引：列表变短时不指向空洞
+  const safeActiveIndex =
+    items.length === 0 ? 0 : Math.min(activeIndex, items.length - 1);
 
   const runActive = () => {
-    const item = items[activeIndex];
+    const item = items[safeActiveIndex];
     if (!item) return;
     if (item.kind === "command") item.entry.run();
     else goTo(item.hit.taskId);
@@ -290,12 +300,16 @@ export const SearchDialog = () => {
     if (e.nativeEvent.isComposing) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIndex((i) => (items.length ? (i + 1) % items.length : 0));
+      setActiveIndex((i) => {
+        const cur = items.length === 0 ? 0 : Math.min(i, items.length - 1);
+        return items.length ? (cur + 1) % items.length : 0;
+      });
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActiveIndex((i) =>
-        items.length ? (i - 1 + items.length) % items.length : 0,
-      );
+      setActiveIndex((i) => {
+        const cur = items.length === 0 ? 0 : Math.min(i, items.length - 1);
+        return items.length ? (cur - 1 + items.length) % items.length : 0;
+      });
     } else if (e.key === "Enter") {
       e.preventDefault();
       runActive();
@@ -305,10 +319,10 @@ export const SearchDialog = () => {
   // 高亮项滚进视口
   useEffect(() => {
     const el = listRef.current?.querySelector<HTMLElement>(
-      `[data-search-index="${activeIndex}"]`,
+      `[data-search-index="${safeActiveIndex}"]`,
     );
     el?.scrollIntoView({ block: "nearest" });
-  }, [activeIndex]);
+  }, [safeActiveIndex]);
 
   const showEmpty = !loading && trimmed.length > 0 && items.length === 0;
 
@@ -359,7 +373,7 @@ export const SearchDialog = () => {
                       className={cn(
                         "flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm",
                         // 键盘高亮是瞬时态、走 accent（选中态规范只管持久选中）
-                        i === activeIndex && "bg-accent text-accent-foreground",
+                        i === safeActiveIndex && "bg-accent text-accent-foreground",
                       )}
                     >
                       <span className="shrink-0 text-muted-foreground">
@@ -381,7 +395,7 @@ export const SearchDialog = () => {
                       onMouseEnter={() => setActiveIndex(i)}
                       className={cn(
                         "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-2 text-left",
-                        i === activeIndex && "bg-accent text-accent-foreground",
+                        i === safeActiveIndex && "bg-accent text-accent-foreground",
                       )}
                     >
                       <div className="flex items-center gap-2">

@@ -7,8 +7,8 @@
  * 列出排队中消息（GET /chat-queue 实时拉）、每行可「删除」/「立即发送」。
  * 删除走 DELETE /chat-queue → server removeQueuedChatMessages 会 publish
  * queue_failed(cancelled)，客户端 ledger 经 SSE 自动清 pending 占位、条数自然回落。
- * 「立即发送」= PATCH 置顶到队首 +（running 时）stopTask 打断当前回复 →
- * 停止后 flush 自然发队首；idle 时跳过 stop（队列本就会自动 flush）。
+ * 「立即发送」= POST send_now（server：take → stop 清剩余队 → 用该条起新会话）；
+ * 不再走 promote + stop（stop 会 failQueuedItems 清整队、含刚置顶那条）。
  */
 
 import { useState } from "react";
@@ -23,28 +23,23 @@ import {
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { summarize } from "@/components/tasks/event-stream/utils";
+import { prepareRunArgs } from "@/lib/run-args";
 import {
   fetchChatQueue,
-  promoteQueuedChatMessage,
   removeChatQueueItems,
-  stopTask,
+  sendQueuedChatMessageNow,
   type ChatQueueItem,
 } from "@/lib/task-store";
-import type { RunStatus } from "@/lib/types";
+import type { Task } from "@/lib/types";
 
 interface Props {
-  taskId: string;
+  task: Task;
   /** 本地 ledger 统计的排队条数（banner 文案用；面板列表以服务端为准） */
   queuedCount: number;
-  /** 当前 run 态：running 才 stop 打断；idle 等跳过（队列会自动 flush） */
-  runStatus: RunStatus;
 }
 
-export const ChatQueueBanner = ({
-  taskId,
-  queuedCount,
-  runStatus,
-}: Props) => {
+export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
+  const taskId = task.id;
   // 面板开关（受控：打开时拉一次服务端队列快照）
   const [open, setOpen] = useState(false);
   // 服务端队列快照（null = 尚未拉到）
@@ -53,8 +48,8 @@ export const ChatQueueBanner = ({
   const [loading, setLoading] = useState(false);
   // 删除飞行中的 itemId 集合（行内按钮 disabled、防连点）
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(new Set());
-  // 「立即发送」飞行中的 itemId 集合（置顶 + 可选 stop、防连点）
-  const [promoting, setPromoting] = useState<ReadonlySet<string>>(new Set());
+  // 「立即发送」飞行中的 itemId 集合（防连点）
+  const [sendingNow, setSendingNow] = useState<ReadonlySet<string>>(new Set());
 
   const handleOpenChange = (next: boolean) => {
     setOpen(next);
@@ -94,38 +89,34 @@ export const ChatQueueBanner = ({
   };
 
   /**
-   * 置顶并立即发送：先 promote 到队首，再按需 stop 打断当前回复。
-   * stop 成功后 runner 会 flush 队首；本就 idle 则跳过 stop、等自然 flush。
-   * 面板本地把该条挪到列表头（与服务端顺序对齐；条数不变、靠本地重排即可）。
+   * 立即发送：prepareRunArgs 拿 bootArgs → POST send_now。
+   * server 原子编排 take→stop→注入，本地列表直接去掉该条。
    */
   const handleSendNow = (itemId: string) => {
-    setPromoting((prev) => new Set(prev).add(itemId));
-    void (async () => {
-      try {
-        await promoteQueuedChatMessage(taskId, itemId);
-        setItems((prev) => {
-          if (!prev) return prev;
-          const idx = prev.findIndex((it) => it.itemId === itemId);
-          if (idx <= 0) return prev;
-          const next = [...prev];
-          const [item] = next.splice(idx, 1);
-          next.unshift(item!);
-          return next;
-        });
-        // 仅 running 才打断；idle / awaiting_user 等跳过（队列会自动 flush）
-        if (runStatus === "running") {
-          await stopTask(taskId);
-        }
-      } catch (err) {
+    const args = prepareRunArgs(task);
+    if (!args) return; // prepareRunArgs 已 toast
+
+    setSendingNow((prev) => new Set(prev).add(itemId));
+    void sendQueuedChatMessageNow(taskId, itemId, {
+      apiKey: args.apiKey,
+      model: args.model,
+    })
+      .then(() => {
+        setItems((prev) =>
+          prev ? prev.filter((it) => it.itemId !== itemId) : prev,
+        );
+        setOpen(false);
+      })
+      .catch((err) => {
         toast.error(`立即发送失败：${(err as Error).message}`);
-      } finally {
-        setPromoting((prev) => {
+      })
+      .finally(() => {
+        setSendingNow((prev) => {
           const next = new Set(prev);
           next.delete(itemId);
           return next;
         });
-      }
-    })();
+      });
   };
 
   return (
@@ -153,7 +144,7 @@ export const ChatQueueBanner = ({
           <ul className="space-y-1">
             {items.map((it) => {
               const busy =
-                deleting.has(it.itemId) || promoting.has(it.itemId);
+                deleting.has(it.itemId) || sendingNow.has(it.itemId);
               return (
                 <li
                   key={it.itemId}
@@ -169,11 +160,11 @@ export const ChatQueueBanner = ({
                     type="button"
                     onClick={() => handleSendNow(it.itemId)}
                     disabled={busy}
-                    title="置顶并立即发送（打断当前回复）"
+                    title="立即发送（打断当前回复）"
                     aria-label="立即发送"
                     className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
                   >
-                    {promoting.has(it.itemId) ? (
+                    {sendingNow.has(it.itemId) ? (
                       <Loader2 className="size-3 animate-spin" />
                     ) : (
                       <Zap className="size-3" />

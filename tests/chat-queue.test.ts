@@ -19,6 +19,7 @@ import {
   onQueuedMessageFlushed,
   removeQueuedChatMessages,
   promoteQueuedChatMessage,
+  takeQueuedChatMessage,
   getChatQueueCount,
   getChatQueueGeneration,
   getChatQueueInFlight,
@@ -243,6 +244,37 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     expect(promoteQueuedChatMessage(id, "")).toBe(false);
     // 队列未被误改
     expect(listQueuedChatMessages(id).map((m) => m.itemId)).toEqual(["item_1"]);
+  });
+
+  it("takeQueuedChatMessage 按 id 取出完整条目、队内移除但不 settle", () => {
+    const id = alloc();
+    enqueueChatMessage(id, msg(1));
+    enqueueChatMessage(id, {
+      ...msg(2),
+      skipPersistEvent: true,
+      agentText: "agent-with-skill",
+    });
+    enqueueChatMessage(id, msg(3));
+
+    const taken = takeQueuedChatMessage(id, "item_2");
+    expect(taken).not.toBeNull();
+    expect(taken!.itemId).toBe("item_2");
+    expect(taken!.skipPersistEvent).toBe(true);
+    expect(taken!.agentText).toBe("agent-with-skill");
+    expect(listQueuedChatMessages(id).map((m) => m.itemId)).toEqual([
+      "item_1",
+      "item_3",
+    ]);
+    // 与 remove 不同：不进 recentSettled cancelled
+    expect(findRecentSettledEntry(id, "item_2")).toBeUndefined();
+  });
+
+  it("takeQueuedChatMessage 不存在项返 null", () => {
+    const id = alloc();
+    enqueueChatMessage(id, msg(1));
+    expect(takeQueuedChatMessage(id, "item_missing")).toBeNull();
+    expect(takeQueuedChatMessage(id, "")).toBeNull();
+    expect(getChatQueueCount(id)).toBe(1);
   });
 
   it("enqueue 后 FIFO dequeue 保序", () => {

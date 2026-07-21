@@ -1002,7 +1002,8 @@ export const cleanupChatQueueState = (taskId: string): void => {
 };
 
 /**
- * 把指定排队条目挪到队首（「立即发送」：置顶后 stop → flush 自然发队首）。
+ * 把指定排队条目挪到队首（PATCH 置顶；单测 / 潜在调用方仍可用）。
+ * 「立即发送」已改走 take + stop + 注入（见 chat-queue-send-now），不再依赖本函数。
  * 不碰 in-flight / generation——只重排还在队列里、尚未 dequeue 的条目。
  * @returns true = 已置顶（含本就在队首的幂等命中）；false = 队里没有该 itemId
  */
@@ -1023,6 +1024,32 @@ export const promoteQueuedChatMessage = (
   next.unshift(item!);
   map.set(taskId, next);
   return true;
+};
+
+/**
+ * 按 itemId 取出一条排队消息（不 settle failed / 不 publish queue_failed）。
+ *
+ * 供「立即发送」在 stop 清队之前把目标条救出走——stop 的 failQueuedItems 会作废
+ * 整队，若用 removeQueuedChatMessages 则会被标 cancelled，发出去也晚了。
+ * 取出后 MessageOperation 保持原状，交给后续注入路径继续 persisted → handedOff。
+ *
+ * @returns 完整 QueuedChatMsg；队里没有该 id → null
+ */
+export const takeQueuedChatMessage = (
+  taskId: string,
+  itemId: string,
+): QueuedChatMsg | null => {
+  if (!itemId) return null;
+  const map = queues();
+  const cur = map.get(taskId);
+  if (!cur || cur.length === 0) return null;
+  const idx = cur.findIndex((m) => m.itemId === itemId);
+  if (idx < 0) return null;
+  const next = [...cur];
+  const [item] = next.splice(idx, 1);
+  if (next.length === 0) map.delete(taskId);
+  else map.set(taskId, next);
+  return item ?? null;
 };
 
 /**

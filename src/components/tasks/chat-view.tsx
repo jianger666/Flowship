@@ -614,11 +614,7 @@ export const ChatView = ({
   // D 批次：排队条可点开小面板（列排队消息 + 行内删除 / 立即发送）、组件见 chat-queue-banner
   const queueBanner =
     queuedCount != null && queuedCount > 0 ? (
-      <ChatQueueBanner
-        taskId={task.id}
-        queuedCount={queuedCount}
-        runStatus={task.runStatus}
-      />
+      <ChatQueueBanner task={task} queuedCount={queuedCount} />
     ) : null;
 
   return (
