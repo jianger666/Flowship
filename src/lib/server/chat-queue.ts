@@ -1002,6 +1002,30 @@ export const cleanupChatQueueState = (taskId: string): void => {
 };
 
 /**
+ * 把指定排队条目挪到队首（「立即发送」：置顶后 stop → flush 自然发队首）。
+ * 不碰 in-flight / generation——只重排还在队列里、尚未 dequeue 的条目。
+ * @returns true = 已置顶（含本就在队首的幂等命中）；false = 队里没有该 itemId
+ */
+export const promoteQueuedChatMessage = (
+  taskId: string,
+  itemId: string,
+): boolean => {
+  if (!itemId) return false;
+  const map = queues();
+  const cur = map.get(taskId);
+  if (!cur || cur.length === 0) return false;
+  const idx = cur.findIndex((m) => m.itemId === itemId);
+  if (idx < 0) return false;
+  // 已在队首：幂等成功，不必写回
+  if (idx === 0) return true;
+  const next = [...cur];
+  const [item] = next.splice(idx, 1);
+  next.unshift(item!);
+  map.set(taskId, next);
+  return true;
+};
+
+/**
  * 按谓词移除排队中的消息（飞书撤回同步出队）。
  * 不碰 in-flight / generation——只删还在队列里、尚未 dequeue 的条目。
  * 出队同时 settle failed（cancelled）：与 failQueuedItems 同口径写 ledger / message_op，

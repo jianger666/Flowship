@@ -31,7 +31,6 @@ import {
   Loader2,
   Square,
   X,
-  Zap,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -45,7 +44,6 @@ import { useComposerSession } from "@/components/composer-session";
 import { Button } from "@/components/ui/button";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
-import { oppositeSubmitShortcut } from "@/lib/keyboard-shortcuts";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { pathBasename } from "@/lib/path-utils";
 import { loadBoxHeight, saveBoxHeight } from "@/lib/view-memory";
@@ -110,11 +108,6 @@ export interface ComposerProps {
    * 不传 / false = 旧行为（运行中只显示停止）。
    */
   allowQueueWhileRunning?: boolean;
-  /**
-   * B 批次「立即发送」：运行中打断当前回复立刻发（默认发送键 = 排队）。
-   * 仅 running + allowQueueWhileRunning 时生效；快捷键用提交偏好的对位组合。
-   */
-  onSubmitNow?: () => void;
   /** 输入区上方排队提示条 */
   queueBanner?: ReactNode;
 
@@ -144,7 +137,6 @@ export const Composer = ({
   onStop,
   stopping,
   allowQueueWhileRunning,
-  onSubmitNow,
   queueBanner,
   className,
 }: ComposerProps) => {
@@ -187,13 +179,6 @@ export const Composer = ({
   const handleSubmit = () => {
     if (disabled || submitting || !hasContent) return;
     onSubmit();
-  };
-
-  // 立即发送（打断当前回复）：仅运行中排队场景有意义、guard 与 handleSubmit 同口径
-  const canSendNow = !!(running && allowQueueWhileRunning && onSubmitNow);
-  const handleSubmitNow = () => {
-    if (!canSendNow || disabled || submitting || !hasContent) return;
-    onSubmitNow?.();
   };
 
   const showUnbound =
@@ -343,8 +328,6 @@ export const Composer = ({
         value={value}
         onChange={onChange}
         onSubmit={handleSubmit}
-        // 运行中才把「立即发送」快捷通道交给编辑器（提交偏好的对位组合）
-        onSubmitNow={canSendNow ? handleSubmitNow : undefined}
         placeholder={placeholder}
         disabled={disabled}
         focusRef={focusRef}
@@ -377,21 +360,6 @@ export const Composer = ({
                   <Square className="size-3 fill-current" />
                 )}
               </Button>
-              {/* B 批次：立即发送（打断当前回复）——排队键旁的低调次动作 */}
-              {canSendNow && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={disabled || submitting || !hasContent}
-                  onClick={handleSubmitNow}
-                  className="ml-1 size-7 rounded-lg p-0 text-muted-foreground hover:text-foreground"
-                  aria-label="立即发送"
-                  title={`立即发送（打断当前回复；${getSubmitShortcutTitle(oppositeSubmitShortcut(submitShortcut))}）`}
-                >
-                  <Zap className="size-3.5" />
-                </Button>
-              )}
               {/* chat 排队：运行中仍可发下一条 */}
               {allowQueueWhileRunning && (
                 <Button

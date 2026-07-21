@@ -67,10 +67,7 @@ import {
 } from "@/components/at-mention";
 import { useComposerSession } from "@/components/composer-session";
 import { useSubmitShortcut } from "@/hooks/use-settings";
-import {
-  isDoubleEsc,
-  resolveRunningSubmitAction,
-} from "@/lib/keyboard-shortcuts";
+import { isDoubleEsc } from "@/lib/keyboard-shortcuts";
 import type { SubmitShortcut } from "@/lib/types";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
 import { shouldConvertPasteToAttachment } from "@/lib/paste-text-attach";
@@ -93,11 +90,6 @@ export interface ComposerEditorProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
-  /**
-   * B 批次「立即发送」（运行中打断当前回复）：命中提交偏好的对位组合时触发
-   * （enter 偏好 → Cmd/Ctrl+Enter；mod-enter 偏好 → 裸 Enter）。不传 = 无此通道。
-   */
-  onSubmitNow?: () => void;
   placeholder?: string;
   disabled?: boolean;
   focusRef?: RefObject<ComposerFocusHandle | null>;
@@ -493,7 +485,6 @@ const SlashAtAndSubmitPlugin = ({
   slash,
   atMention,
   onSubmit,
-  onSubmitNow,
   submitShortcut,
   knownNames,
   lastEmittedRef,
@@ -502,7 +493,6 @@ const SlashAtAndSubmitPlugin = ({
   slash?: SlashSkillsApi;
   atMention?: AtMentionApi;
   onSubmit: () => void;
-  onSubmitNow?: () => void;
   submitShortcut: SubmitShortcut;
   knownNames: ReadonlySet<string>;
   lastEmittedRef: RefObject<string>;
@@ -515,8 +505,6 @@ const SlashAtAndSubmitPlugin = ({
   atRef.current = atMention;
   const onSubmitRef = useRef(onSubmit);
   onSubmitRef.current = onSubmit;
-  const onSubmitNowRef = useRef(onSubmitNow);
-  onSubmitNowRef.current = onSubmitNow;
   const shortcutRef = useRef(submitShortcut);
   shortcutRef.current = submitShortcut;
   const namesRef = useRef(knownNames);
@@ -583,18 +571,7 @@ const SlashAtAndSubmitPlugin = ({
           onSubmitRef.current();
           return true;
         }
-        // 运行中「立即发送」通道（onSubmitNow 仅 running 时由 Composer 传入）：
-        // 命中提交偏好的对位组合 → 打断当前回复立刻发（B 批次）
-        const sendNow = onSubmitNowRef.current;
-        if (
-          event &&
-          sendNow &&
-          resolveRunningSubmitAction(event, shortcutRef.current) === "sendNow"
-        ) {
-          event.preventDefault();
-          sendNow();
-          return true;
-        }
+        // 对位组合（原「立即发送」快捷键）现无动作——立即发送已迁到排队面板置顶按钮
         return false;
       },
       COMMAND_PRIORITY_HIGH,
@@ -866,7 +843,6 @@ const ComposerEditorInner = ({
   value,
   onChange,
   onSubmit,
-  onSubmitNow,
   placeholder,
   disabled,
   focusRef,
@@ -982,7 +958,6 @@ const ComposerEditorInner = ({
         slash={slash}
         atMention={atMention}
         onSubmit={onSubmit}
-        onSubmitNow={onSubmitNow}
         submitShortcut={submitShortcut}
         knownNames={knownNames}
         lastEmittedRef={lastEmittedRef}

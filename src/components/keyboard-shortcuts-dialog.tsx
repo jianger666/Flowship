@@ -12,7 +12,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useSubmitShortcut } from "@/hooks/use-settings";
-import { oppositeSubmitShortcut } from "@/lib/keyboard-shortcuts";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 
 interface Props {
@@ -30,9 +29,6 @@ const Kbd = ({ children }: { children: string }) => (
 export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
   const submitShortcut = useSubmitShortcut();
   const submitKey = getSubmitShortcutTitle(submitShortcut);
-  const sendNowKey = getSubmitShortcutTitle(
-    oppositeSubmitShortcut(submitShortcut),
-  );
 
   const rows: Array<{ label: string; keys: string[] }> = [
     { label: "搜索对话", keys: ["Cmd/Ctrl+K"] },
@@ -41,7 +37,6 @@ export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
     { label: "聚焦输入框（任务页）", keys: ["Cmd/Ctrl+J"] },
     { label: "发送消息", keys: [submitKey] },
     { label: "运行中：排队发送", keys: [submitKey] },
-    { label: "运行中：立即发送（打断）", keys: [sendNowKey] },
     { label: "清空输入框", keys: ["Esc", "Esc"] },
     { label: "关闭弹窗 / 菜单", keys: ["Esc"] },
   ];

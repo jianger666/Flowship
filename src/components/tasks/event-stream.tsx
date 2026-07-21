@@ -287,16 +287,6 @@ interface Props {
     attachments?: string[],
     skillRefs?: Array<{ name: string; absPath: string }>,
   ) => boolean | void | Promise<boolean | void>;
-  /**
-   * B 批次「立即发送」通道：agent 运行中打断当前回复后立刻发这条
-   * （chat-view 实现 = 先 stopTask 等停止、再走常规发送）。不传 = 运行中只能排队。
-   */
-  onUserReplyNow?: (
-    text: string,
-    images?: ImagePayload[],
-    attachments?: string[],
-    skillRefs?: Array<{ name: string; absPath: string }>,
-  ) => boolean | void | Promise<boolean | void>;
   // V0.2 plan workflow 模式下传 true、不渲染底部「自由回复」输入框
   // 因为 plan 模式的 HITL 是 phase ack（通过 / 再聊聊）、不是 free-form 聊天
   // ack 按钮由父组件渲染在顶部 / 详情区其他位置
@@ -402,7 +392,6 @@ const EventStreamImpl = ({
   task,
   streamingText,
   onUserReply,
-  onUserReplyNow,
   hideReplyComposer,
   canReply,
   submitting,
@@ -807,7 +796,7 @@ const EventStreamImpl = ({
 
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
   const sendingLockRef = useRef(false);
-  // 排队 / 立即发送共用同一套「取草稿 → 发送 → 成功清空」流程、只有发送通道不同
+  // 取草稿 → 发送 → 成功清空
   const submitVia = (send: typeof onUserReply) => {
     if (!send || sendingLockRef.current) return;
     const text = draft.trim();
@@ -840,8 +829,6 @@ const EventStreamImpl = ({
     })();
   };
   const handleSend = () => submitVia(onUserReply);
-  // 立即发送（打断当前回复）：仅运行中且父组件给了通道时 Composer 才会暴露入口
-  const handleSendNow = () => submitVia(onUserReplyNow);
 
   // chat 形态间距：对话消息（AI / 用户 / streaming / ask_user）之间留大段落感、
   // 连续过程行（thinking / tool / info / 工作组）紧凑堆叠成一组
@@ -1115,7 +1102,6 @@ const EventStreamImpl = ({
               saveDraft("reply", task.id, v);
             }}
             onSubmit={handleSend}
-            onSubmitNow={onUserReplyNow ? handleSendNow : undefined}
             placeholder={
               isAwaitingUser || (isRunning && allowQueueWhileRunning)
                 ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`

@@ -908,6 +908,25 @@ export const removeChatQueueItems = async (
   return data.removedIds;
 };
 
+/**
+ * 把排队中的指定条目置顶到队首（「立即发送」第一步）。
+ * 成功后调用方若 runStatus===running 再 stopTask，打断当前回复 → flush 发队首。
+ */
+export const promoteQueuedChatMessage = async (
+  taskId: string,
+  itemId: string,
+): Promise<void> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/chat-queue`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ itemId }),
+    },
+  );
+  await handleJson<{ ok: true }>(res);
+};
+
 // V0.13.x：submitActionAck 已退役——「再聊聊」并入 submitTaskQuestion 统一消息通道
 //（服务端按 awaiting_ack 自动附「重新交卷」上下文）；approve 由推进时自动认可承担。
 

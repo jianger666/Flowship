@@ -515,7 +515,7 @@ export const ChatView = ({
     [task],
   );
 
-  // 停止当前正在跑的 chat agent；返回是否成功（「立即发送」要据此决定发不发）
+  // 停止当前正在跑的 chat agent
   const stopAgentCore = useCallback(async (): Promise<boolean> => {
     setStopping(true);
     try {
@@ -543,23 +543,6 @@ export const ChatView = ({
   const handleStop = useCallback(async () => {
     await stopAgentCore();
   }, [stopAgentCore]);
-
-  // B 批次「立即发送」：先停止当前回复（等停止落定）、再走常规发送——
-  // 停止后 runStatus 归 idle、handleUserReply 走直发通道开新一轮
-  const handleUserReplyNow = useCallback(
-    async (
-      text: string,
-      images?: ImagePayload[],
-      attachments?: string[],
-      skillRefs?: Array<{ name: string; absPath: string }>,
-    ): Promise<boolean> => {
-      const stopped = await stopAgentCore();
-      // 停止失败保留草稿（返回 false 调用方不清空）、不发这条
-      if (!stopped) return false;
-      return handleUserReply(text, images, attachments, skillRefs);
-    },
-    [stopAgentCore, handleUserReply],
-  );
 
   // 重命名对话
   const handleRename = useCallback(async () => {
@@ -628,10 +611,14 @@ export const ChatView = ({
     return null;
   })();
 
-  // D 批次：排队条可点开小面板（列排队消息 + 行内删除）、组件见 chat-queue-banner
+  // D 批次：排队条可点开小面板（列排队消息 + 行内删除 / 立即发送）、组件见 chat-queue-banner
   const queueBanner =
     queuedCount != null && queuedCount > 0 ? (
-      <ChatQueueBanner taskId={task.id} queuedCount={queuedCount} />
+      <ChatQueueBanner
+        taskId={task.id}
+        queuedCount={queuedCount}
+        runStatus={task.runStatus}
+      />
     ) : null;
 
   return (
@@ -683,7 +670,6 @@ export const ChatView = ({
           streamingText={streamingText}
           liveToolOutputs={liveToolOutputs}
           onUserReply={handleUserReply}
-          onUserReplyNow={handleUserReplyNow}
           canReply={canReply}
           submitting={isSubmitting}
           disabledHint={disabledHint}

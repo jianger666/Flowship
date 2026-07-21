@@ -18,9 +18,11 @@ import {
   getMessageOperation,
   onQueuedMessageFlushed,
   removeQueuedChatMessages,
+  promoteQueuedChatMessage,
   getChatQueueCount,
   getChatQueueGeneration,
   getChatQueueInFlight,
+  listQueuedChatMessages,
   tryEnqueueMsg,
   __clearQueuedMessageFlushedListenersForTest,
   type QueuedChatMsg,
@@ -209,6 +211,38 @@ describe("enqueue / dequeue / clear（per-task Map）", () => {
     // 未移除的仍在队、未终态
     expect(findRecentSettledEntry(id, r1.itemId)).toBeUndefined();
     expect(getChatQueueCount(id)).toBe(1);
+  });
+
+  it("promoteQueuedChatMessage 存在项挪到队首、队列顺序正确", () => {
+    const id = alloc();
+    enqueueChatMessage(id, msg(1));
+    enqueueChatMessage(id, msg(2));
+    enqueueChatMessage(id, msg(3));
+    expect(promoteQueuedChatMessage(id, "item_3")).toBe(true);
+    expect(listQueuedChatMessages(id).map((m) => m.itemId)).toEqual([
+      "item_3",
+      "item_1",
+      "item_2",
+    ]);
+    // 已在队首再 promote = 幂等成功、顺序不变
+    expect(promoteQueuedChatMessage(id, "item_3")).toBe(true);
+    expect(listQueuedChatMessages(id).map((m) => m.itemId)).toEqual([
+      "item_3",
+      "item_1",
+      "item_2",
+    ]);
+    expect(dequeueChatMessage(id)?.itemId).toBe("item_3");
+    expect(dequeueChatMessage(id)?.itemId).toBe("item_1");
+    expect(dequeueChatMessage(id)?.itemId).toBe("item_2");
+  });
+
+  it("promoteQueuedChatMessage 不存在项返 false", () => {
+    const id = alloc();
+    enqueueChatMessage(id, msg(1));
+    expect(promoteQueuedChatMessage(id, "item_missing")).toBe(false);
+    expect(promoteQueuedChatMessage(id, "")).toBe(false);
+    // 队列未被误改
+    expect(listQueuedChatMessages(id).map((m) => m.itemId)).toEqual(["item_1"]);
   });
 
   it("enqueue 后 FIFO dequeue 保序", () => {
