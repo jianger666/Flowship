@@ -518,6 +518,85 @@ describe("createCardStream", () => {
     expect(cardJson.header.subtitle?.content).toBe("已停止");
   });
 
+  // R3-2：失败终态消费 fin.error——footer 带错误摘要 + 耗时/模型统计
+  it("finalize ok=false → red 卡 footer 带错误摘要与统计", async () => {
+    const stream = createCardStream("task_fail_msg", { title: "t", openId: "ou" });
+    await stream.start();
+    stream.pushAnswer("半截");
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+    await stream.finalize({
+      ok: false,
+      error: "Chat agent 异常：连接断了",
+      durationMs: 65_000,
+      model: "gpt-5.5",
+    });
+    const entityCalls = updateCardEntity.mock.calls as unknown as Array<
+      [
+        string,
+        {
+          header: { subtitle?: { content: string }; template: string };
+          config: { summary: { content: string } };
+          body: { elements: Array<{ element_id?: string; content?: string }> };
+        },
+      ]
+    >;
+    const cardJson = entityCalls.at(-1)![1];
+    expect(cardJson.header.template).toBe("red");
+    // Hermes failed：subtitle 空、summary「处理失败」靠 template
+    expect(cardJson.header.subtitle).toBeUndefined();
+    expect(cardJson.config.summary.content).toBe("处理失败");
+    const footer = cardJson.body.elements.find(
+      (e) => e.element_id === "md_footer",
+    );
+    expect(footer?.content).toContain("处理失败：Chat agent 异常：连接断了");
+    expect(footer?.content).toContain("1m5s");
+    expect(footer?.content).toContain("gpt-5.5");
+    // 不再与用户主动 stop 的「已停止」撞文案
+    expect(footer?.content).not.toContain("已停止");
+  });
+
+  // R3-1：重试按钮先于 finalize 追加（outbound 修正后的真实顺序）→ 终态卡保留按钮
+  it("流式先 appendRetryButton 后 finalize：batch 真发出、终态全量 PUT 保留 btn_retry", async () => {
+    const stream = createCardStream("task_retry_keep", {
+      title: "t",
+      openId: "ou",
+    });
+    await stream.start();
+    stream.pushAnswer("半截");
+    await vi.waitFor(() => expect(updateCardEntity).toHaveBeenCalled());
+
+    await stream.appendRetryButton("上一条用户消息");
+    const addCalls = (
+      batchUpdateCard.mock.calls as unknown as Array<
+        [
+          string,
+          Array<{
+            action: string;
+            params: { elements?: Array<{ element_id?: string }> };
+          }>,
+        ]
+      >
+    ).filter((c) => c[1]?.some((a) => a.action === "add_elements"));
+    expect(
+      addCalls.some((c) =>
+        c[1].some((a) =>
+          a.params.elements?.some((e) => e.element_id === "btn_retry"),
+        ),
+      ),
+    ).toBe(true);
+
+    await stream.finalize({ ok: false, error: "boom", durationMs: 1000 });
+    const cardJson = (
+      updateCardEntity.mock.calls.at(-1) as unknown as [
+        string,
+        { body: { elements: Array<{ tag?: string; element_id?: string }> } },
+      ]
+    )[1];
+    expect(
+      cardJson.body.elements.some((e) => e.element_id === "btn_retry"),
+    ).toBe(true);
+  });
+
   // R1-1c + R1-13d：append 与 finalize 交错按链序
   it("appendAskUser 与 finalize 交错时按链序执行（finalize 在 append 后）", async () => {
     const order: string[] = [];

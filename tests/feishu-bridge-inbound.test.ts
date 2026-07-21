@@ -242,6 +242,32 @@ describe("bridge runtime 生命周期（mock spawn）", () => {
     expect(got[0]).toEqual({ action: { tag: "button" } });
   });
 
+  // R3-3：card.action 挂独立串行链——双击答题卡两个选项不再并发过 pendingAsk 检查
+  it("card.action 事件串行处理（第二次点击等第一次处理完）", async () => {
+    const { card } = await startBridge();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    registerCardActionHandler(async (e) => {
+      const tag = (e as { n?: string }).n ?? "?";
+      order.push(`${tag}-start`);
+      if (tag === "1") await gate;
+      order.push(`${tag}-end`);
+    });
+    card.stdout.write(`${JSON.stringify({ n: "1" })}\n`);
+    card.stdout.write(`${JSON.stringify({ n: "2" })}\n`);
+    await vi.waitFor(() => expect(order).toContain("1-start"));
+    // 第二个事件已入队但不得在第一个结束前跑（旧 fire-and-forget 会并发 2-start）
+    await new Promise((r) => setTimeout(r, 30));
+    expect(order).toEqual(["1-start"]);
+    releaseFirst();
+    await vi.waitFor(() =>
+      expect(order).toEqual(["1-start", "1-end", "2-start", "2-end"]),
+    );
+  });
+
   it("stdout NDJSON 分发：im.message 走完整链（normalize → route → 去重标记）；群聊不污染 p2p chatId", async () => {
     const { im } = await startBridge();
     // 群聊消息：router 过滤（不需要 bot 身份）、但 inbound 仍记 processed 去重

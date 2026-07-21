@@ -640,10 +640,16 @@ export const createCardStream = (
       template = "green";
       footerText = statsFooter;
     } else {
-      // Hermes failed：subtitle 空、summary「处理失败」、red
+      // Hermes failed：subtitle 空、summary「处理失败」靠 template=red
       subtitle = "";
       template = "red";
-      footerText = "已停止";
+      // R3-2：消费 fin.error——失败原因进 footer（收单行 + 截断），并保留耗时/模型统计。
+      // 旧文案固定「已停止」：错误信息全丢、还和用户主动 stop 的灰卡撞文案
+      const errLine = (fin.error ?? "").replace(/\s+/g, " ").trim();
+      const failLabel = errLine
+        ? `处理失败：${errLine.length > 120 ? `${errLine.slice(0, 119)}…` : errLine}`
+        : "处理失败";
+      footerText = statsFooter ? `${failLabel} · ${statsFooter}` : failLabel;
     }
   };
 

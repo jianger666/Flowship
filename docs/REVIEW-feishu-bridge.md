@@ -34,8 +34,8 @@
 | `router.ts` | 入向消息路由：p2p+本人过滤 → content 解析（text/image/file/post，图片 6 张 10MB、文件 50MB 上限）→ 命令词/skill 分发 → taskId 定位（回复锚定 → 活跃唯一 → 0 个自动新建 → 多个提示）→ pendingAsk 走答题注入、否则 chat 注入；注入结果钩子（多订阅） |
 | `ask-inject.ts` | 飞书自由文本答 pending ask（对齐 ask-reply chat 分支语义） |
 | `card-action.ts` | 卡片按钮回调：operator 身份校验 → ask 答题（整组提交、卡片置「✅ 已选」）/ 错误重试按钮；与 card-stream 的按钮 element_id/value 严格对偶 |
-| `commands.ts` | 七命令：/stop /compact /new /list /history /status /help（回复锚定同款 task 定位） |
-| `reactions.ts` | 注入结果 emoji 回执：成功 Get、排队 Typing、失败 CrossMark（键名实测）；队列 flush 后 Typing→Get 升级 |
+| `commands.ts` | 四命令：/new /stop /status /help（/compact /list /history 已砍、2026-07-20 用户拍板；回复锚定同款 task 定位） |
+| `reactions.ts` | 注入结果 emoji 回执：成功/排队统一 Get、失败 CrossMark（键名实测）；Typing→Get 升级已删（两态同表情无需升级） |
 | `probe.ts` + `/api/feishu-bridge/status` | 设置页引导检查：CLI 登录/scope 等价核对（含权限预填深链）/cardkit 试建卡/runtime 状态；欢迎消息 |
 | `bootstrap.ts` | 统一注册入口，挂在 /api/tasks 与 status route 模块加载（不能挂 instrumentation——webpack 不吃 serverExternalPackages 会炸路由，S5 实录 #4） |
 | `bridge-config.ts` / `bridge-state.ts` / `keep-awake.ts` | 开关读取/深链拼接；p2p chatId + 已处理 message_id 去重落盘；防睡眠 |
@@ -262,3 +262,41 @@ f)【已修】feishu-bridge-block mountedRef 守卫三个 async handler。
 R1 全部条目销项、门禁独立复核通过、关键修复均有测试锁定 + 真机佐证。
 
 **状态：收敛 ✅（等用户二次验收）**
+
+---
+
+### R3（第三轮全面检查后的修复，2026-07-21，开发 AI）
+
+> 背景：用户要求再做一轮全面检查，发现 3 个 R1/R2 均未覆盖的问题并修复。
+> 门禁：`pnpm typecheck` / `pnpm lint` / `pnpm vitest run` 全绿（见本轮提交）。
+
+**R3-1 | P1 | 错误卡「重试」按钮死路（已修）**
+`outbound.finalizeTurn` 原先「先 finalize、后 appendRetryButton」——但 card-stream
+的 `finalize` 在 finally 必置 `finalized=true`，`appendRetryButton` 首行守卫
+`if (!started || finalized) return` 直接短路：流式/非流式失败卡都渲染不出重试按钮，
+card-action 的 `kind:"retry"` 分支整段不可达。两轮 review 漏掉的原因：outbound 测试
+mock 卡片句柄（只断言被调过）、card-stream 测试全是「先 append 后 finalize」顺序，
+没有用例走真实跨层顺序。修法：outbound 把 `appendRetryButton` 挪到 `finalize` 之前
+（appendedElements 快照让 finalize 全量 PUT 自动带上按钮、非流式自然并入整卡）。
+护栏：新增 `tests/feishu-bridge-outbound-retry-integration.test.ts`（outbound → 真
+card-stream 只 mock lark-api 的集成用例，锁「done ok=false → batch add_elements 真发出
++ 终态全量 PUT 保留 btn_retry」）+ card-stream 补「先 append 后 finalize 保留按钮」用例。
+
+**R3-2 | P2 | 失败卡不给错误信息、`finalize` 的 `error` 参数是死参数（已修）**
+`applyFinalizeVisual` 失败分支 footer 固定「已停止」——丢错误摘要、丢耗时/模型统计、
+还和用户主动 stop 的灰卡撞文案。修法：footer 渲染「处理失败：<error 单行截断 120 字>
+· 耗时 · 模型」。用例：`finalize ok=false → red 卡 footer 带错误摘要与统计`。
+
+**R3-3 | P2 | card.action 事件 fire-and-forget，双击按钮并发竞态（已修）**
+R1-2 只把消息 consumer 收敛进入向单链，card.action 留在链外：快速双击答题卡两个选项
+→ 两个 `handleAskAction` 并发都过 `getPendingAsk` 检查 → 双份 `deliverChatAskReply`。
+修法：新增独立 `enqueueCardAction` 串行链（不与消息链共链——按钮回调不被大文件下载
+头阻塞），第二次点击自然走「askId 不匹配 → 已失效」优雅分支。用例：inbound 测试
+`card.action 事件串行处理`。
+
+**顺手**：模块地图同步（commands 七命令→四命令、reactions Typing→Get 升级已删）。
+
+**遗留（记录在案、按 ROI 择期）**：大文件下载 30s 超时 + lark 单飞队列头阻塞
+（建议先真机复现再动手，超时放宽与资源独立 lane 要一起做，只放宽超时会加重头阻塞）；
+probe 探测卡 TTL 缓存；出向 start 失败的 app 内可见 info；入向 REST 反查与
+parseInboundContent 并行化；答题后卡片 header 恢复绿色。

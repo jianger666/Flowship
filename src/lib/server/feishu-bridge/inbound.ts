@@ -182,6 +182,32 @@ export const enqueueInboundMessage = <T>(run: () => Promise<T>): Promise<T> => {
 };
 
 /**
+ * card.action 串行链（R3-3）：独立于消息链——按钮回调不被入向消息的
+ * 大文件下载头阻塞；但自身串行，消灭「双击答题卡两个选项」的并发竞态：
+ * 第二次点击排在 clearPendingAsk 之后处理，自然走 card-action 已有的
+ * 「askId 不匹配 → 已失效」优雅分支。
+ */
+const CARD_ACTION_CHAIN_KEY = "__flowshipFeishuCardActionChainV1__";
+
+const getCardActionChain = (): InboundChainState => {
+  const g = globalThis as unknown as Record<string, InboundChainState | undefined>;
+  if (!g[CARD_ACTION_CHAIN_KEY]) {
+    g[CARD_ACTION_CHAIN_KEY] = { current: Promise.resolve() };
+  }
+  return g[CARD_ACTION_CHAIN_KEY]!;
+};
+
+export const enqueueCardAction = <T>(run: () => Promise<T>): Promise<T> => {
+  const state = getCardActionChain();
+  const result = state.current.then(run, run);
+  state.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
+
+/**
  * 入向消息默认处理：去重 → 路由 →（非 retryable）标记已处理 + 推进游标。
  * live stdout 与 catchUpMissedMessages 都走这里（同链）。
  */
@@ -211,9 +237,10 @@ export const defaultMessageHandler = async (raw: unknown): Promise<void> =>
     }
   });
 
-const defaultCardActionHandler = async (raw: unknown): Promise<void> => {
-  await dispatchCardActionEvent(raw);
-};
+const defaultCardActionHandler = async (raw: unknown): Promise<void> =>
+  enqueueCardAction(async () => {
+    await dispatchCardActionEvent(raw);
+  });
 
 /** 声明式列表：消息 + 卡片按钮 + 撤回出队（决策 #20） */
 export const CONSUMER_SPECS: ConsumerSpec[] = [
@@ -682,7 +709,8 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
         if (h.stderrTail.length > 20) h.stderrTail.shift();
         return;
       }
-      // 消息 consumer：onEvent 内部已挂入向单链；card.action 仍 fire-and-forget
+      // 两个 consumer 的 onEvent 内部各自挂串行链（消息链 / card.action 链，R3-3）；
+      // 这里 void 只是不阻塞 readline 行读取，处理顺序由链保证
       void h.spec.onEvent(parsed).catch((err) => {
         console.error(
           `[feishu-bridge/inbound] onEvent 失败 event_key=${h.spec.eventKey}:`,
