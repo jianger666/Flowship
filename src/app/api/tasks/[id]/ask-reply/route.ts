@@ -658,7 +658,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running
-  // （正常结束不 bump gen，旧闭包仍 true）。running 写以 deliver/consume 内部 owner 门控为准。
+  // （正常结束不 bump gen，旧闭包仍 true）。running 由 sendToTaskSessionBody 受理成功后
+  // 在 consume 启动前 owner 门控写入（本路由不再碰）。
   const freshTask = (await getTask(task.id)) ?? task;
 
   return new Response(

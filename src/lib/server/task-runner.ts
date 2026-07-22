@@ -3410,11 +3410,13 @@ export const handleRunFailure = async (
 
 /**
  * 问一问 run 收尾：按当前 action 状态把 runStatus 归回「提问前」的等待位
- * （awaiting_ack → awaiting_user、error → error、其余 → idle）。
+ * （awaiting_ack / running → awaiting_user、error → error、其余 → idle）。
+ * action 仍 running（断掉半路、用户插话唤醒的场景）归 awaiting_user、保住侧栏
+ * 「已暂停」可说话唤醒的语义、而不是静默变「空闲」。
  * 只在 runStatus 还挂 running 时动手（compare-set、不覆盖 notifier 已落的状态）。
  *
  * 调用方须先过 `shouldRestoreAfterQuestion`——gen stale / lifecycle 进行中时
- * 禁止调用（stop/DELETE 已归位；裸 restore 会把后继 B 的 running 打回 idle）。
+ * 禁止调用（stop/DELETE 已归位；裸 restore 会把后继 B 的 running 错误归位）。
  *
  * 再加 isOwner（runningTasks.instanceId）锁内条件写——前驱 one-shot 被接管后
  * 不得按最新 action B 把 task 写成 idle。
@@ -3427,7 +3429,7 @@ const restoreRunStatusAfterQuestion = async (
   if (!fresh || fresh.runStatus !== "running") return;
   const cur = fresh.actions.find((a) => a.id === fresh.currentActionId);
   const target =
-    cur?.status === "awaiting_ack"
+    cur?.status === "awaiting_ack" || cur?.status === "running"
       ? ("awaiting_user" as const)
       : cur?.status === "error"
         ? ("error" as const)
@@ -5155,6 +5157,20 @@ const sendToTaskSessionBody = async (
       return "stale";
     }
     session.lastActiveAt = Date.now();
+    // 续接 send（ask 答复 / 插话 / 唤醒）受理成功即把盘上 runStatus 刷成 running——
+    // 否则 run 活跃期间盘上仍停 awaiting_user：侧栏标「已暂停」、顶栏「推进」误亮
+    //（点了会 claim 所有权掐掉在跑的 agent）。V12 重构删掉路由末尾兜底写后此处成空洞。
+    // 写点在 consume 启动前、单线程顺序保证先于本 run 任何出口写（awaiting_user/idle/error）；
+    // owner 门控 + 终态内拒（setTaskRunStatusIfRunOwner 自带），stop/接管后不盖写。
+    // 已知极窄窗口（可接受）：agent 若在本写 commit 前就经 MCP notifier 落了 awaiting_user
+    //（send resolve 后毫秒级调 ask_user/submit_work、现实几乎不可能），会被本写短暂盖回 running、
+    // 由 consume 出口归位。
+    const runningNow = await setTaskRunStatusIfRunOwner(
+      task.id,
+      "running",
+      () => isTaskOpCurrent(entryOpHandle),
+    );
+    if (runningNow) publish(task.id, { kind: "task", task: runningNow });
     // consume 直接用入场 entryOpHandle——禁止 send 后再 snapshotTaskOp
     void consumeSessionRun(task, agent, run, {
       errorActionId: opts.errorActionId,
