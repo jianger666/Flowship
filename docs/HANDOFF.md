@@ -320,6 +320,16 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-23 自动更新体验重构（状态机 + 页面进度 + 端口占用/重复点击回归修复、随 v1.4.1 发）
+
+- **背景（用户手机反馈三连）**：mac 点「新版本」没下载进度条、再点必弹「自动更新失败」、每次升级重启必弹「端口被占用」。排查结论：全是 `45eb485`（mac 延迟替换）回归——下载前移到发现新版时后台暂存（点徽标时已无下载可看、进度本来也只画在 Dock）、`installUpdateNow`/`applyStagedUpdate` 无安装互斥（二次点击吃空已被 rename 消费的暂存必炸）、「立即更新」走 `app.relaunch()+app.exit(0)` 而 **`app.exit` 不触发 `before-quit`**（唯一杀 server 的钩子被绕过 → 旧 server 孤儿占 8876 → 新实例必弹端口占用）。
+- **主进程更新状态机**（`main.js` `updateState`：idle/available/downloading/ready/installing + percent/error、win/mac 统一语义）：`webContents.send("update-state")` 实时推 + `get-update-state` IPC 全量拉、替代旧 executeJavaScript 注入 `__appUpdateVersion`（时序竞态、带不了进度）。mac dmg 下载循环按整数百分点节流推进度；staging single-flight wrapper 统一置 ready / 失败回 available（installInFlight 持锁中跳过 ready、防闪帧）。
+- **端口占用修复**：`applyStagedUpdate` relaunch 分支 exit 前 `await stopServer()`；win `before-quit` 改同步 `execFileSync taskkill /T /F`（连进程树、5s timeout 兜底）——`kill("SIGKILL")` 只杀单进程、SDK agent 孙进程留着继续占端口。
+- **重复点击修复**：`installUpdateNow` 加 `installInFlight` 互斥、UpdateBadge downloading/installing 态 disabled；win `promptWinInstall` 抽出（「稍后」后再点徽标直接重弹确认、不重复下载）+ 自身单飞（downloadUpdate resolve 后锁已释放、弹窗还开着时二次进入会叠双弹窗）。
+- **win 静默安装**：`quitAndInstall(true, true)`（`oneClick:false` 下不传 isSilent 会弹完整 NSIS 向导、与 electron-builder.yml「自更新走 /S」注释不符的存量 bug）；**不在 quitAndInstall 前杀 server**（蓝军 P0：`install()` 失败不退出时 app 变没后端的僵尸）、靠 before-quit 树杀；`error` 事件 installing 态回滚 quitting=false + phase→ready。
+- **前端**：`update-badge.tsx` 纯状态驱动（「新版本 vX / 下载中 x% / 重启更新 vX / 更新中…」、ready 与 available 分文案 confirm）、先订阅 onState 再 getState（防旧快照倒退进度）；preload `__appUpdater` 桥扩展 install/getState/onState（install 替代 `app-update://` 伪协议、will-navigate 拦截保留兜底）；`window.__appUpdater`/`__appVersion` 全局类型收敛到 `src/lib/app-updater.ts`。手动「检查更新」mac 打包环境也触发后台暂存（对齐轮询）。
+- 蓝军 review 两轮 + 终审「可合入」：一轮 1 P0（win 提前杀 server）+ 4 P1；二轮 4 P1（改盘/停服顺序、win installing 短路、quitting 回滚守卫、installing 期 staging 门闩）+ 验收揪出「旧 server 迟到 exit 误杀新 server」竞态 → `startServer` 世代守卫（exit/error handler `serverProc !== proc` 时只记日志）+ `stopServer` SIGKILL 后短等 1s 回收、`applyStagedUpdate` 失败恢复按 `hadRunningServer` 拉回 server。轮询/手动检查在 downloading/installing 中不打断状态机（下载 A 时发布 B 下轮自愈）。门禁 typecheck / lint / 1413 测试全绿。**win 真机未验**（mac 开发机）——发版后需 win 同事验证：静默安装不弹向导、升级重启无端口弹窗、任务栏+徽标进度。
+
 ### 2026-07-23 首包可靠性 + REQ-ID 无感注入 + 收尾修理批（随 v1.4.0 发）
 
 - **首包可靠性批（源起同事实测「task 发消息 10 分钟 AI 才动」）**：① SDK 全调用超时保护——新 `sdk-deadline.ts`（`withSdkDeadline`：create/resume 180s、send 120s；超时走既有错误/重连链、late 收尸 `reapLateSdkResult` 防「超时但实际成功」孤儿 agent）；② 假死 run 主动中止（`abortStuckRunForSend`：90s drain 失败先 cancel 再继续 send、instanceId CAS 强删）；③ 发送后进度可见（question/advance 受理即落「正在恢复会话/启动 agent/准备工作区…」info）；④ 依赖拷贝不挡首包（oneshot `skipDepClone`、正式路径 `deferDepClone` 后台补拷）。根因结论：最像 10 分钟的是「半死连接 + 裸 await 无超时（OS TCP 重传 10~15min）」、非依赖拷贝。
@@ -329,16 +339,6 @@ ai-flow-action-hub/
 - **完整输出加载失败修复**：子代理工具 callId 含换行、落盘名已消毒但 route 用原始 callId 过 `isSafeId` 直接 400——route 先消毒再校验、前端改传 fullPath basename、404 文案降级。
 - **交互修理**：ask_user「提问即收尾」双指令源（chat-mcp describe + `_super.md`：背景写进 question 字段、调用后不再输出总结段落防答题卡被顶走）；task 停止键下移输入条（chat 同款）+ 顶栏转圈/停止合一（hover 变红）；推进按钮 pending-ask 时拦截；模型选择器跟随态显示实际模型名；MCP 计数改有效交集（修 `-1/8`）；重复创建 action 返 409（`CustomActionFsError.code` 替代文案子串）；首启迁移与预置安装串行化；lark-cli 身份缺失主动引导登录（`buildLarkCliAuthMissingRule`）。
 - **SDK 1.0.23 → 1.0.24**；两轮发版前全量 review（96 文件 +4244/-1754）扫出 1 P0 + 3 P1 全修复。
-
-### 2026-07-22 团队库（组共享库 + 知识库镜像 + 市场模型）（随 v1.4.0 发）
-
-- **背景**：用户下周部门分享、定位转向「推进式 AI 工作方式」；部门领导已有一套 harness（wk-knowledgebase：43 工程知识档案 + 53 个 Codex skill + wk:* 指令流 + python 门禁），Flowship 定位其「驾驶舱」。当天一整天与用户多轮拍板迭代出最终形态（详见「当前架构快照 → 团队库」节）。
-- **落地主链**：`team-library.ts`（clone/sync/上传/镜像/安装卸载、全局仓锁）+ `team-skill-states.ts`（安装态单一 owner 存储）+ skills-loader 第四源「team」（kbRoot 注入）+ custom-action-fs 派生共享 action（`team:<skill名>` 虚拟 def、写入口防护）+ 能力页 Skills 区双栏重构（5 项来源导航 + chip 分类过滤 + 搜索 + 市场行）+ 上传/安装 dialog 产品化（角色分类默认 userRole）。
-- **当天关键拍板**（时序）：整库挂载替代单 skill 拉取（KB_ROOT 断链问题）→ 共享库对用户无感（地址内置、启动自动 sync）→ 知识库镜像解决同事无权限 → 上传被保护分支拒自动降级开 MR → 双库合一仓（action-hub：skills/ 角色分组 + knowledge/ 镜像）→ 开关模型三迭代（单总开关 → 双开关 → 市场安装/卸载 + 仅团队规范保留总开关）→ 内置/飞书 CLI 去开关（必备只读、disabledSkills 缩域到自管）→ 共享 action 派生化（消灭双份状态）→ **全量默认安装**（用户不动 = 全都有、对齐 Codex 心智、实测 ≈1.5 万 tokens 可接受）。
-- **蓝军 review 一轮 12 项修复**：git 报错 token 脱敏（redactGitText）、认证改 inline credential helper + env（token 不进命令行/config/FETCH_HEAD）、settings 写穿防护、全局仓锁互斥、push 拒绝分类收窄、镜像大 push postBuffer 等。
-- **收尾三件**（UI/展示）：共享来源的卸载按钮统一 PackageMinus（垃圾桶只给自建删除）；派生 team action 行加只读查看（`team-action-view-dialog.tsx`、Action 列表与安装 dialog 共用）；team skill / 派生 action 显示创建人（`team-skill-authors.ts`——共享库 git 历史首次引入 SKILL.md 的 author、HEAD 级 globalThis 缓存一次全量扫描）。
-- **P0 实测教训**：team skill 禁用名单曾写进 settings.disabledSkills——client 设置保存链整写 config 把 server 追加的名单冲掉（两 writer 抢一字段）→ 收敛为独立存储 skill-states.json 单一 owner（呼应 07-19 所有权协议）。
-- 远端仓：`frontend/infra/ai-flow-action-hub`（全组 63 人成员）；已推 9 个 wk:* action 壳（skills/common/）+ 知识库全量镜像（knowledge/、5.2M）。分享飞书文档：`docs/sharing-20260723.md`（含 Demo 脚本、延期至下周）。
 
 
 ## 关键文件索引

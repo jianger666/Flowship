@@ -14,20 +14,8 @@ import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-
-type CheckResult = {
-  status: "latest" | "available" | "error";
-  current: string;
-  latest?: string;
-  message?: string;
-};
-
-declare global {
-  interface Window {
-    /** Electron 壳注入：按需检查更新 */
-    __appUpdater?: { check: () => Promise<CheckResult> };
-  }
-}
+// 副作用 import：window.__appUpdater 全局类型声明集中在这（UpdateBadge 共用）
+import "@/lib/app-updater";
 
 export const CheckUpdateButton = () => {
   // 当前是否跑在桌面壳里（web 版无 __appUpdater、不渲染按钮）
@@ -50,8 +38,8 @@ export const CheckUpdateButton = () => {
       if (r.status === "latest") {
         toast.success(`已是最新版本 v${r.current}`);
       } else if (r.status === "available") {
-        // 壳已点亮右上角「新版本」标识、这里引导用户去那更新
-        toast.success(`发现新版本 v${r.latest}、点右上角「新版本」更新`);
+        // 壳已点亮右上角徽标（mac 已暂存时显示「重启更新」、其余「新版本」）、引导去那更新
+        toast.success(`发现新版本 v${r.latest}、点右上角按钮完成更新`);
       } else {
         toast.error(`检查更新失败：${r.message ?? "未知错误"}`);
       }

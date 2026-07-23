@@ -15,6 +15,16 @@
 
 ---
 
+### 2026-07-22 团队库（组共享库 + 知识库镜像 + 市场模型）（随 v1.4.0 发）
+
+- **背景**：用户下周部门分享、定位转向「推进式 AI 工作方式」；部门领导已有一套 harness（wk-knowledgebase：43 工程知识档案 + 53 个 Codex skill + wk:* 指令流 + python 门禁），Flowship 定位其「驾驶舱」。当天一整天与用户多轮拍板迭代出最终形态（详见 HANDOFF「当前架构快照 → 团队库」节）。
+- **落地主链**：`team-library.ts`（clone/sync/上传/镜像/安装卸载、全局仓锁）+ `team-skill-states.ts`（安装态单一 owner 存储）+ skills-loader 第四源「team」（kbRoot 注入）+ custom-action-fs 派生共享 action（`team:<skill名>` 虚拟 def、写入口防护）+ 能力页 Skills 区双栏重构（5 项来源导航 + chip 分类过滤 + 搜索 + 市场行）+ 上传/安装 dialog 产品化（角色分类默认 userRole）。
+- **当天关键拍板**（时序）：整库挂载替代单 skill 拉取（KB_ROOT 断链问题）→ 共享库对用户无感（地址内置、启动自动 sync）→ 知识库镜像解决同事无权限 → 上传被保护分支拒自动降级开 MR → 双库合一仓（action-hub：skills/ 角色分组 + knowledge/ 镜像）→ 开关模型三迭代（单总开关 → 双开关 → 市场安装/卸载 + 仅团队规范保留总开关）→ 内置/飞书 CLI 去开关（必备只读、disabledSkills 缩域到自管）→ 共享 action 派生化（消灭双份状态）→ **全量默认安装**（用户不动 = 全都有、对齐 Codex 心智、实测 ≈1.5 万 tokens 可接受）。
+- **蓝军 review 一轮 12 项修复**：git 报错 token 脱敏（redactGitText）、认证改 inline credential helper + env（token 不进命令行/config/FETCH_HEAD）、settings 写穿防护、全局仓锁互斥、push 拒绝分类收窄、镜像大 push postBuffer 等。
+- **收尾三件**（UI/展示）：共享来源的卸载按钮统一 PackageMinus（垃圾桶只给自建删除）；派生 team action 行加只读查看（`team-action-view-dialog.tsx`、Action 列表与安装 dialog 共用）；team skill / 派生 action 显示创建人（`team-skill-authors.ts`——共享库 git 历史首次引入 SKILL.md 的 author、HEAD 级 globalThis 缓存一次全量扫描）。
+- **P0 实测教训**：team skill 禁用名单曾写进 settings.disabledSkills——client 设置保存链整写 config 把 server 追加的名单冲掉（两 writer 抢一字段）→ 收敛为独立存储 skill-states.json 单一 owner（呼应 07-19 所有权协议）。
+- 远端仓：`frontend/infra/ai-flow-action-hub`（全组 63 人成员）；已推 9 个 wk:* action 壳（skills/common/）+ 知识库全量镜像（knowledge/、5.2M）。分享飞书文档：`docs/sharing-20260723.md`（含 Demo 脚本、延期至下周）。
+
 ### 2026-07-21 chat 消息流大重构（回复优先）+ 压缩改挂 SDK + 飞书完成通知（随 v1.4.0 发）
 
 - **chat 信息架构重构（`docs/CHAT-REDESIGN.md`）**：事件流从「run log 平铺」改「回复优先、过程按需」——turn 内 thinking / 工具 / 中间旁白收进「工作过程」折叠组（`chat-turns.ts` 纯函数分组 + `work-group.tsx`；running 自动展开、完成自动收起、手动优先），正文（turn 末段 assistant）全宽平铺 15px；running 时 Composer 上方粘性 shimmer 状态行（`deriveActiveStatus` + `active-status-line.tsx`）；info 细线化。分页 prepend 差值与 items 共用 `buildStreamItems` 管线（跨页组合并不跳滚动）。task(log) 形态零变化。

@@ -18,11 +18,27 @@ contextBridge.exposeInMainWorld("__nativePicker", {
   pick: (opts) => ipcRenderer.invoke("native-pick", opts),
 });
 
-// 检查更新（设置页「检查更新」按钮）——按需查一次、返回 { status, current, latest? }；
-// 发现新版时壳会同步点亮右上角「新版本」标识（走既有 UpdateBadge / 自更新流程）
+// 自动更新桥（设置页「检查更新」+ 右上角 UpdateBadge 共用）：
+// - check：按需查一次、返回 { status, current, latest? }
+// - install：点徽标装更新（主进程按状态分流：下载 / 弹重启确认 / 忽略重入）
+// - getState / onState：更新状态机全量拉取 + 实时订阅（phase/version/percent/error、
+//   徽标据此渲染「新版本 / 下载中 x% / 重启更新 / 更新中」，见 main.js updateState）
 contextBridge.exposeInMainWorld("__appUpdater", {
   /** @returns {Promise<{ status: "latest"|"available"|"error", current: string, latest?: string, message?: string }>} */
   check: () => ipcRenderer.invoke("check-for-update"),
+  /** 安装更新（等价旧 app-update://install 伪协议、走正规 IPC） */
+  install: () => ipcRenderer.send("install-update"),
+  /** @returns {Promise<{ phase: string, version: string|null, percent: number, error: string|null }>} */
+  getState: () => ipcRenderer.invoke("get-update-state"),
+  /**
+   * 订阅更新状态变化。返回取消订阅函数。
+   * @param {(state: { phase: string, version: string|null, percent: number, error: string|null }) => void} callback
+   */
+  onState: (callback) => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on("update-state", listener);
+    return () => ipcRenderer.removeListener("update-state", listener);
+  },
 });
 
 // 任务注意力通知（v0.9.5）：页面发现任务转入「等你回复 / 提问 / 失败」且窗口不在前台

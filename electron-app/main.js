@@ -26,7 +26,7 @@ import {
   shell,
   Tray,
 } from "electron";
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
 import {
   promises as fs,
@@ -262,7 +262,7 @@ const serverNodeBin = () => {
 
 const startServer = () => {
   const serverJs = path.join(serverDir, "server.js");
-  serverProc = spawn(serverNodeBin(), [serverJs], {
+  const proc = spawn(serverNodeBin(), [serverJs], {
     env: {
       ...process.env,
       // 三件套：execPath 当 node 用（含孙进程继承、hooks 依赖）+ 端口 + 数据目录
@@ -275,24 +275,31 @@ const startServer = () => {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  log(`[main] server 启动 pid=${serverProc.pid} dataDir=${path.join(app.getPath("userData"), "data")}`);
+  serverProc = proc;
+  log(`[main] server 启动 pid=${proc.pid} dataDir=${path.join(app.getPath("userData"), "data")}`);
+  // ⚠️ 世代守卫（自更新失败恢复竞态）：stopServer 会先把 serverProc 置 null 再杀、
+  // SIGKILL 后不等回收就可能 startServer 拉新的——旧进程迟来的 exit 若无脑
+  // serverProc=null / 弹「服务异常退出」、会误杀刚拉起的新 server（serverProc !== proc
+  // = 该进程已被主动接管或替换、只记日志不动状态）
   // spawn 本身失败（如二进制路径不存在 ENOENT）不会触发 exit、必须挂 error——
   // v0.7.9 实测 Helper 路径拼错时 pid=undefined 静默挂死、靠这里明错
-  serverProc.on("error", (err) => {
-    serverProc = null;
-    log(`[main] server spawn 失败：${err?.message || err}`);
-    if (!quitting) {
+  proc.on("error", (err) => {
+    const stale = serverProc !== proc;
+    if (!stale) serverProc = null;
+    log(`[main] server spawn 失败：${err?.message || err} stale=${stale}`);
+    if (!stale && !quitting) {
       dialog.showErrorBox("服务启动失败", `内部服务进程拉不起来：${err?.message || err}`);
       app.quit();
     }
   });
-  serverProc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
-  serverProc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
-  serverProc.on("exit", (code) => {
-    serverProc = null;
-    log(`[main] server 退出 code=${code ?? "?"} quitting=${quitting}`);
+  proc.stdout.on("data", (d) => log(`[server] ${d}`.trimEnd()));
+  proc.stderr.on("data", (d) => log(`[server:err] ${d}`.trimEnd()));
+  proc.on("exit", (code) => {
+    const stale = serverProc !== proc;
+    if (!stale) serverProc = null;
+    log(`[main] server 退出 code=${code ?? "?"} quitting=${quitting} stale=${stale}`);
     // 不是用户主动退出、说明 server 崩了——提示后整个 app 退出（窗口留着也没意义）
-    if (!quitting) {
+    if (!stale && !quitting) {
       dialog.showErrorBox(
         "服务异常退出",
         `内部服务意外退出（code=${code ?? "?"}）、请重新打开应用。`,
@@ -323,6 +330,12 @@ const stopServer = async () => {
     } catch {
       // 已退、忽略
     }
+    // SIGKILL 后短等回收（最多 1s）：自更新失败恢复路径随后可能立刻 startServer、
+    // 不等的话新 server 有短暂 EADDRINUSE 撞旧监听 socket 的风险
+    await Promise.race([
+      new Promise((r) => proc.once("exit", () => r(true))),
+      sleep(1000),
+    ]);
   }
 };
 
@@ -878,7 +891,7 @@ const createWindow = async () => {
       pageLoaded = false;
     }
   });
-  // 页面每次加载完成（首次加载 / 更新后重载）重注入版本号 + 更新标识、不丢状态
+  // 页面每次加载完成（首次加载 / 更新后重载）重注入版本号 + 重推更新状态、不丢徽标
   mainWindow.webContents.on("did-finish-load", () => {
     log("[close] did-finish-load（pageLoaded → true）");
     pageLoaded = true;
@@ -886,7 +899,8 @@ const createWindow = async () => {
     mainWindow?.webContents
       .executeJavaScript(`window.__appVersion=${JSON.stringify(app.getVersion())};`)
       .catch(() => {});
-    notifyPageUpdateReady();
+    // 更新状态重推一次（页面刷新 / 更新后重载不丢徽标；组件 mount 时也会主动拉）
+    setUpdateState({});
     // 冷启动 / boot 窗口深链：文档就绪后再投递（坑 #15 + R1-10）
     flushPendingDeepLink();
   });
@@ -1057,14 +1071,27 @@ const markPrompted = async (version) => {
   }
 };
 
-// 通知页面「新版本就绪」：全局变量 + CustomEvent 双通道
-// （变量给 mount 晚于注入的组件读、事件给已 mount 的组件实时响应；
-//  did-finish-load 时重注入、页面刷新也不丢标识）
-const notifyPageUpdateReady = () => {
-  if (!mainWindow || !updateReadyVersion) return;
-  // win/mac 都点亮「新版本」徽标；mac 此时可能已暂存完毕、点徽标走 apply+relaunch
-  const js = `window.__appUpdateVersion=${JSON.stringify(updateReadyVersion)};window.dispatchEvent(new Event("app-update-ready"));`;
-  mainWindow.webContents.executeJavaScript(js).catch(() => {});
+// ---------- 更新状态机（主进程唯一数据源、页面 UpdateBadge 全量订阅） ----------
+//
+// phase 流转（win/mac 统一语义）：
+//   idle        无更新
+//   available   发现新版（win=等用户点下载；mac=即将/正在后台暂存前的瞬间、或下载失败可重试）
+//   downloading 下载中（percent 0-100；mac=后台暂存 dmg、win=electron-updater 下载 NSIS）
+//   ready       已就绪（mac=已暂存 staged-*.app、win=安装包已下载完）、点徽标即重启完成更新
+//   installing  安装中（mac=apply+relaunch 前、win=quitAndInstall 前）——UI disabled + 主进程互斥双保险
+// error 是附加字段：失败时 phase 回退到 available/ready、error 带原因（UI 可提示重试）。
+//
+// 推送通道：webContents.send("update-state") 实时推 + IPC get-update-state 供页面
+// mount / 刷新时拉全量（替代旧 executeJavaScript 注入 __appUpdateVersion 方案——
+// 注入有时序竞态、且没法带进度）。
+let updateState = { phase: "idle", version: null, percent: 0, error: null };
+const setUpdateState = (patch) => {
+  updateState = { ...updateState, ...patch };
+  try {
+    mainWindow?.webContents.send("update-state", updateState);
+  } catch {
+    // 窗口销毁中、忽略
+  }
 };
 
 // execFile 的「失败要 throw」版（自更新链路用、跟 fail-open 的 execFileP 区分）
@@ -1275,9 +1302,24 @@ const verifyDownloadedUpdate = async (version, dmgPath, assetName) => {
 let stagingPromise = null;
 const downloadAndStageMacUpdate = (version) => {
   if (stagingPromise) return stagingPromise;
-  stagingPromise = downloadAndStageMacUpdateInner(version).finally(() => {
-    stagingPromise = null;
-  });
+  stagingPromise = downloadAndStageMacUpdateInner(version)
+    .then((meta) => {
+      // 已暂存跳过下载 / 下载暂存完成——统一在这置 ready、页面徽标变「重启更新」。
+      // 用户点徽标触发的链路（installInFlight 持锁中）跳过：macSelfUpdate 马上置
+      // installing、中间闪一帧可点的 ready 没意义（蓝军 P1）
+      if (!installInFlight) {
+        setUpdateState({ phase: "ready", version, percent: 100, error: null });
+      }
+      return meta;
+    })
+    .catch((err) => {
+      // 失败回 available（徽标仍亮、点击可重试）；弹不弹框由调用方决定
+      setUpdateState({ phase: "available", version, error: String(err?.message || err) });
+      throw err;
+    })
+    .finally(() => {
+      stagingPromise = null;
+    });
   return stagingPromise;
 };
 
@@ -1306,16 +1348,25 @@ const downloadAndStageMacUpdateInner = async (version) => {
   try {
     mkdirSync(updatesDir, { recursive: true });
     log(`[updater] 下载 ${dmgUrl}`);
+    setUpdateState({ phase: "downloading", version, percent: 0, error: null });
     const res = await fetch(dmgUrl);
     if (!res.ok || !res.body) throw new Error(`下载失败 HTTP ${res.status}`);
-    // 流式落盘 + Dock 图标进度条（dialog 没法动态刷、原生进度条够用）
+    // 流式落盘 + Dock 图标进度条 + 页面徽标进度（整数百分点变化才推、别刷爆 IPC）
     const total = Number(res.headers.get("content-length")) || 0;
     const ws = createWriteStream(dmgPath);
     let got = 0;
+    let lastPct = -1;
     for await (const chunk of res.body) {
       if (!ws.write(chunk)) await new Promise((r) => ws.once("drain", r));
       got += chunk.length;
-      if (total && mainWindow) mainWindow.setProgressBar(got / total);
+      if (total) {
+        mainWindow?.setProgressBar(got / total);
+        const pct = Math.floor((got / total) * 100);
+        if (pct > lastPct) {
+          lastPct = pct;
+          setUpdateState({ percent: pct });
+        }
+      }
     }
     await new Promise((resolve, reject) =>
       ws.end((err) => (err ? reject(err) : resolve(undefined))),
@@ -1368,22 +1419,45 @@ const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) =>
   if (!appPath.endsWith(".app") || appPath.startsWith("/Volumes/")) {
     throw new Error("非常规安装位置、无法套用暂存更新");
   }
+  // 「立即更新」失败恢复用：改盘前 server 是否在跑（启动兜底路径 serverProc=null、失败不能误拉）
+  const hadRunningServer = !!serverProc;
+  if (relaunch) {
+    // ⚠️ 「立即更新」必须在改盘**之前**停 server（二轮复审 P1）：
+    // 1) app.exit() 不触发 before-quit、唯一杀 server 的钩子会被绕过 → 旧 server
+    //    孤儿占端口、新实例必弹「端口被占用」（2026-07-23 用户线上确诊回归）；
+    // 2) 先停再替换、避免旧 server 在「磁盘已是新包」上多跑最长 2s（SIGTERM 优雅期）
+    //    触发 lazy-load 半新半旧（延迟替换方案要解决的原始问题域）。
+    // 退出路径（relaunch=false）server 已在 before-quit 被杀；启动兜底 serverProc=null 秒过。
+    quitting = true;
+    await stopServer();
+  }
   const updatesDir = updatesDirPath();
   mkdirSync(updatesDir, { recursive: true });
   // 旧 app 先挪到暂存（同卷 rename 原子）；新包同卷 rename 优先、跨卷再 ditto
   const stagedOld = path.join(updatesDir, `old-${Date.now()}.app`);
   log(`[updater] 套用暂存 v${meta.version} → ${appPath}`);
-  await fs.rename(appPath, stagedOld);
   try {
+    await fs.rename(appPath, stagedOld);
     try {
-      await fs.rename(meta.appPath, appPath);
-    } catch {
-      // EXDEV 等跨卷：ditto 拷过去再删源
-      await execFileStrict("ditto", [meta.appPath, appPath]);
-      await fs.rm(meta.appPath, { recursive: true, force: true }).catch(() => {});
+      try {
+        await fs.rename(meta.appPath, appPath);
+      } catch {
+        // EXDEV 等跨卷：ditto 拷过去再删源
+        await execFileStrict("ditto", [meta.appPath, appPath]);
+        await fs.rm(meta.appPath, { recursive: true, force: true }).catch(() => {});
+      }
+    } catch (err) {
+      await fs.rename(stagedOld, appPath).catch(() => {});
+      throw err;
     }
   } catch (err) {
-    await fs.rename(stagedOld, appPath).catch(() => {});
+    // relaunch 路径 server 已停：替换失败（旧 app 已回滚 / 未动）必须把 server 拉回来、
+    // 否则 app 变成没后端的僵尸且 quitting=true 连「服务异常退出」提示都被吞。
+    // 启动兜底路径（改盘前 server 本就没起）不拉——whenReady 后续流程自己会 startServer。
+    if (relaunch) {
+      quitting = false;
+      if (hadRunningServer && !serverProc) startServer();
+    }
     throw err;
   }
   await fs.rm(stagedOld, { recursive: true, force: true }).catch((err) => {
@@ -1413,7 +1487,7 @@ const applyStagedUpdate = async ({ relaunch, pendingMarker = relaunch } = {}) =>
 
   log(`[updater] v${meta.version} 已就位${relaunch ? "、即将重启" : "（退出路径、下次打开即新版）"}`);
   if (relaunch) {
-    quitting = true;
+    // server 已在替换前停掉（见函数开头）、这里直接重启进新包
     app.relaunch();
     app.exit(0);
   }
@@ -1471,9 +1545,20 @@ const applyStagedUpdateOnQuit = async () => {
 const macSelfUpdate = async (version) => {
   try {
     await downloadAndStageMacUpdate(version);
+    // 暂存就绪 → 替换 + 重启（applyStagedUpdate 内部会先停 server 再 relaunch）
+    setUpdateState({ phase: "installing", version, error: null });
     await applyStagedUpdate({ relaunch: true });
   } catch (err) {
     log(`[updater] 自更新失败：${err?.message || err}、降级开下载页`);
+    // 状态回退：暂存还有效回 ready（点徽标重试秒装）、否则回 available（重试重下）
+    const staged = await readStagedMeta().catch(() => null);
+    const stillStaged =
+      staged?.version === version && staged?.appPath && existsSync(staged.appPath);
+    setUpdateState({
+      phase: stillStaged ? "ready" : "available",
+      version,
+      error: String(err?.message || err),
+    });
     dialog.showErrorBox(
       "自动更新失败",
       `${err?.message || err}\n\n将打开下载页、请手动下载安装。`,
@@ -1487,26 +1572,49 @@ const macSelfUpdate = async (version) => {
 // 应用更新（页面点右上角「新版本」徽标走到这；发现新版本身不弹窗，2026-07-15 用户拍板）：
 // mac：确保已暂存 → apply + relaunch（轮询已后台暂存的包在此套用；未暂存则先下）
 // win：此刻才开始下载（autoDownload=false）、下载完弹「立即重启」→ quitAndInstall（用户主动点徽标触发，保留）
+// 安装互斥锁：徽标连点 / will-navigate 重入时第二次直接忽略——
+// 第一次点击已把暂存包 rename 消费掉、重入 apply 必吃「没有有效的暂存更新」
+// 并误弹「自动更新失败」（2026-07-23 用户线上确诊）。UI disabled 是第一道防线、这里兜底。
+let installInFlight = false;
 const installUpdateNow = async () => {
-  if (!updateReadyVersion) return;
-  if (UPDATE_MODE === "download") {
-    log(`[updater] mac 套用更新（v${updateReadyVersion}）`);
-    await macSelfUpdate(updateReadyVersion);
-    return;
-  }
-  // win：此刻才下载（进度走任务栏、见 download-progress 监听）；完成后弹「立即重启」装
+  if (!updateReadyVersion || installInFlight) return;
+  installInFlight = true;
   try {
-    log(`[updater] win 开始下载 v${updateReadyVersion}`);
-    const updater = await ensureWinAutoUpdater();
-    await updater.downloadUpdate();
-  } catch (err) {
-    mainWindow?.setProgressBar(-1);
-    log(`[updater] win 下载失败 ${err?.message || err}`);
-    dialog.showErrorBox(
-      "下载更新失败",
-      `${err?.message || err}\n\n可稍后重试、或去发布页手动下载安装。`,
-    );
-    void shell.openExternal(RELEASE_LATEST_URL);
+    if (UPDATE_MODE === "download") {
+      log(`[updater] mac 套用更新（v${updateReadyVersion}）`);
+      await macSelfUpdate(updateReadyVersion);
+      return;
+    }
+    // win：按状态分流——下载中 / 安装中忽略（installing 不短路会落到重新 downloadUpdate、
+    // 二轮复审 P1）；已下载完（用户之前点过「稍后」）直接再弹重启确认、不重复下载；
+    // 其余此刻才开始下载（autoDownload=false）
+    if (updateState.phase === "downloading" || updateState.phase === "installing") return;
+    if (updateState.phase === "ready") {
+      await promptWinInstall(updateReadyVersion);
+      return;
+    }
+    try {
+      log(`[updater] win 开始下载 v${updateReadyVersion}`);
+      const updater = await ensureWinAutoUpdater();
+      setUpdateState({ phase: "downloading", version: updateReadyVersion, percent: 0, error: null });
+      await updater.downloadUpdate();
+      // 下载完成走 update-downloaded 事件（置 ready + 弹「立即重启」）、这里不用管
+    } catch (err) {
+      mainWindow?.setProgressBar(-1);
+      log(`[updater] win 下载失败 ${err?.message || err}`);
+      setUpdateState({
+        phase: "available",
+        version: updateReadyVersion,
+        error: String(err?.message || err),
+      });
+      dialog.showErrorBox(
+        "下载更新失败",
+        `${err?.message || err}\n\n可稍后重试、或去发布页手动下载安装。`,
+      );
+      void shell.openExternal(RELEASE_LATEST_URL);
+    }
+  } finally {
+    installInFlight = false;
   }
 };
 
@@ -1537,38 +1645,78 @@ let winAutoUpdater = null;
 // win electron-updater 懒加载初始化（只做一次）：
 // - autoDownload=false 是本方案核心——检查更新只查版本号、不自动下载、把下载推迟到用户点按钮后（对齐 mac）
 // - 注册下载进度（任务栏进度条）/ 下载完成（弹「立即重启」装）/ 出错事件、只注册一次防监听器泄漏
+// win「立即重启 / 稍后」确认框（update-downloaded 首次弹 + 点「稍后」后再点徽标重弹）。
+// 确认后 quitAndInstall(true, true)：isSilent=true 走 NSIS /S 静默装（oneClick:false
+// 时不传会弹完整安装向导、与「点了立即重启」预期不符）、isForceRunAfter=true 装完自动拉起。
+// server 清理不在这做：quitAndInstall 内部走 app.quit() → before-quit 已同步 taskkill /T
+// 连树杀（蓝军 P0：若在这提前杀、quitAndInstall 失败不退出时 app 就成了没后端的僵尸）。
+// 弹窗自身加单飞：downloadUpdate resolve 后 installInFlight 已释放、弹窗还开着时
+// 再点徽标（phase=ready 分支）会二次进来叠双弹窗。
+let promptWinInstallInFlight = false;
+const promptWinInstall = async (version) => {
+  if (promptWinInstallInFlight) return;
+  promptWinInstallInFlight = true;
+  try {
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "更新完成",
+      message: `已下载 v${version}`,
+      detail: "重启应用后生效。",
+      buttons: ["立即重启", "稍后"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response !== 0) return; // 「稍后」：phase 保持 ready、退出时 autoInstallOnAppQuit 兜底
+    quitting = true;
+    setUpdateState({ phase: "installing", version, error: null });
+    winAutoUpdater.quitAndInstall(true, true);
+  } finally {
+    promptWinInstallInFlight = false;
+  }
+};
+
 const ensureWinAutoUpdater = async () => {
   if (winAutoUpdater) return winAutoUpdater;
   // electron-updater 是 CJS、ESM 下走 default 再解构最稳
   const { default: updater } = await import("electron-updater");
   winAutoUpdater = updater.autoUpdater;
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
-  // 下载进度 → 任务栏进度条（对齐 mac downloadAndStageMacUpdate 的 Dock 进度条）
+  // 下载进度 → 任务栏进度条 + 页面徽标进度（对齐 mac 的 Dock + 页面双通道）
   winAutoUpdater.on("download-progress", (p) => {
-    if (mainWindow && typeof p?.percent === "number") mainWindow.setProgressBar(p.percent / 100);
+    if (typeof p?.percent !== "number") return;
+    mainWindow?.setProgressBar(p.percent / 100);
+    setUpdateState({ phase: "downloading", percent: Math.floor(p.percent) });
   });
   // 下载完成（autoDownload=false 下只会被用户点按钮后的 downloadUpdate 触发）→ 弹「立即重启」装
   winAutoUpdater.on("update-downloaded", async (info) => {
     mainWindow?.setProgressBar(-1);
     const v = info?.version || updateReadyVersion;
     log(`[updater] 新版本 v${v} 已下载完成`);
-    const { response } = await dialog.showMessageBox(mainWindow, {
-      type: "info",
-      title: "更新完成",
-      message: `已下载 v${v}`,
-      detail: "重启应用后生效。",
-      buttons: ["立即重启", "稍后"],
-      defaultId: 0,
-      cancelId: 1,
-    });
-    if (response === 0) {
-      quitting = true;
-      winAutoUpdater.quitAndInstall();
-    }
+    setUpdateState({ phase: "ready", version: v, percent: 100, error: null });
+    await promptWinInstall(v);
   });
   winAutoUpdater.on("error", (err) => {
     mainWindow?.setProgressBar(-1);
     log(`[updater] ${err?.message || err}`);
+    // 下载中出错 → 回 available 可重试；安装中出错（quitAndInstall 的 install() 失败、
+    // 进程不会退）→ 回 ready（包还在、可再点重试）+ 撤销 quitting、别让 app 带着
+    // 「正在退出」标记继续跑（server 崩溃提示 / 关窗拦截都靠它）。
+    // ⚠️ 回滚必须带 serverProc 守卫（二轮复审 P1）：install() 失败发生在 app.quit() 之前、
+    // server 此刻还活着；若 error 与真退出竞态（before-quit 已杀 server → serverProc=null）、
+    // 无条件 quitting=false 会让关窗拦截复活、app 变成没后端的僵尸。
+    // checkForUpdates 的网络错不动徽标。
+    if (updateState.phase === "downloading") {
+      setUpdateState({
+        phase: "available",
+        error: String(err?.message || err),
+      });
+    } else if (updateState.phase === "installing" && serverProc) {
+      quitting = false;
+      setUpdateState({
+        phase: "ready",
+        error: String(err?.message || err),
+      });
+    }
   });
   return winAutoUpdater;
 };
@@ -1592,10 +1740,21 @@ const runUpdateCheck = async () => {
     if (!latest || !isNewer(latest, current)) return;
     updateReadyVersion = latest;
     log(`[updater] 发现新版本 v${latest}（当前 v${current}）`);
-    notifyPageUpdateReady();
+    // 点亮徽标（mac 随后立刻转 downloading → ready；win 停在 available 等用户点）。
+    // downloading/installing 中不打断（极端：下载 A 时轮询到 B——让当前流程跑完、
+    // 下轮轮询 phase 已收敛再切新版自愈、别把进行中的状态机踩乱）
+    if (
+      updateState.phase !== "downloading" &&
+      updateState.phase !== "installing" &&
+      (updateState.version !== latest || updateState.phase === "idle")
+    ) {
+      setUpdateState({ phase: "available", version: latest, percent: 0, error: null });
+    }
 
-    // mac：后台下载暂存（已暂存同版本则跳过）——不弹窗；点徽标秒装 / 退出时自动套用
-    if (UPDATE_MODE === "download") {
+    // mac：后台下载暂存（已暂存同版本则跳过）——不弹窗；点徽标秒装 / 退出时自动套用。
+    // 安装中跳过（二轮复审 P1）：apply 已消费 meta、此刻再触发 staging 会重新下 dmg、
+    // 与替换 / relaunch / 启动清扫竞态
+    if (UPDATE_MODE === "download" && !installInFlight && updateState.phase !== "installing") {
       try {
         await downloadAndStageMacUpdate(latest);
       } catch (err) {
@@ -1655,7 +1814,26 @@ const manualCheckForUpdate = async () => {
       // 立即点亮右上角「新版本」标识（win/mac 一致、不再等下载完）
       updateReadyVersion = latest;
       log(`[updater] 手动检查发现新版本 v${latest}（当前 v${current}）`);
-      notifyPageUpdateReady();
+      // 同 runUpdateCheck：downloading/installing 中不打断进行中的状态机
+      if (
+        updateState.phase !== "downloading" &&
+        updateState.phase !== "installing" &&
+        (updateState.version !== latest || updateState.phase === "idle")
+      ) {
+        setUpdateState({ phase: "available", version: latest, percent: 0, error: null });
+      }
+      // mac：手动检查发现新版也立刻后台暂存（对齐轮询、含 installing 门闩）、
+      // 徽标随进度走、点徽标秒装。
+      // 失败静默回 available（wrapper 管）——手动路径 toast 已提示去点徽标、点了会重试并明错
+      if (
+        UPDATE_MODE === "download" &&
+        app.isPackaged &&
+        !IS_TEST &&
+        !installInFlight &&
+        updateState.phase !== "installing"
+      ) {
+        void downloadAndStageMacUpdate(latest).catch(() => {});
+      }
       return { status: "available", current, latest };
     }
     return { status: "latest", current };
@@ -1667,6 +1845,13 @@ const manualCheckForUpdate = async () => {
 
 // 设置页「检查更新」按钮 → preload window.__appUpdater.check() → 这里
 ipcMain.handle("check-for-update", () => manualCheckForUpdate());
+
+// 页面 UpdateBadge mount / 刷新时拉全量更新状态（实时变化走 update-state 推送）
+ipcMain.handle("get-update-state", () => updateState);
+
+// 页面点「新版本」徽标 → preload window.__appUpdater.install()（正规 IPC、
+// 替代 app-update:// 伪协议导航；will-navigate 拦截仍保留兜底旧缓存页面）
+ipcMain.on("install-update", () => void installUpdateNow());
 
 // ---------- 生命周期 ----------
 
@@ -1811,10 +1996,22 @@ if (!app.requestSingleInstanceLock()) {
     quitting = true;
     if (serverProc) {
       try {
-        serverProc.kill("SIGKILL");
+        if (process.platform === "win32") {
+          // win 必须连进程树杀（server 可能挂着 SDK agent / hook 子进程）——
+          // kill("SIGKILL") 只杀单进程、孤儿子进程会占着端口导致下次启动弹
+          // 「端口被占用」。before-quit 是同步钩子、用 execFileSync（毫秒级）；
+          // timeout 兜底：taskkill 万一挂起也不能卡死退出流程
+          execFileSync("taskkill", ["/PID", String(serverProc.pid), "/T", "/F"], {
+            windowsHide: true,
+            timeout: 5000,
+          });
+        } else {
+          serverProc.kill("SIGKILL");
+        }
       } catch {
         // 已退、忽略
       }
+      serverProc = null;
     }
     if (applyingStagedOnQuit) return; // 套用完二次 exit、不再进
     // 仅 packaged mac 正式包；有有效暂存才拦截
