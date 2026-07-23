@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, Pencil, Plus, Trash2 } from "lucide-react";
+import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -276,24 +276,22 @@ export const RulesCard = () => {
                       {r.name}
                     </div>
                   </div>
+                  {/* 行操作：常驻文字按钮（与能力页 Skill/Action 统一） */}
                   <Button
-                    size="icon-xs"
+                    size="sm"
                     variant="ghost"
-                    aria-label={`编辑 ${r.name}`}
-                    title="编辑"
+                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground"
                     onClick={() => void openEdit(r.name)}
                   >
-                    <Pencil />
+                    编辑
                   </Button>
                   <Button
-                    size="icon-xs"
+                    size="sm"
                     variant="ghost"
-                    aria-label={`删除 ${r.name}`}
-                    title="删除"
-                    className="text-muted-foreground hover:text-destructive"
+                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-destructive"
                     onClick={() => void handleDelete(r.name)}
                   >
-                    <Trash2 />
+                    删除
                   </Button>
                   {/* 开关放行尾：操作按钮在前（跟 Skills / MCP 列表对齐） */}
                   <Switch

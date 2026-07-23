@@ -71,7 +71,6 @@ import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
-import { SettingsLink } from "@/lib/settings-link";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import {
   ACTION_LABEL,
@@ -84,11 +83,13 @@ import { fetchCustomActions } from "@/lib/custom-action-client";
 import {
   arrangeByLayout,
   BUILTIN_ADVANCE_ACTIONS,
+  filterAdvanceByDisabledAppSkills,
+  filterAdvanceByRequiresKnowledge,
   isBuiltinAdvanceAction,
   usableCustomActions,
 } from "@/lib/action-layout";
 import { cn } from "@/lib/utils";
-import { TEST_STRATEGY_LABEL } from "@/lib/types";
+import { isSharedTeamCategory, TEST_STRATEGY_LABEL } from "@/lib/types";
 import type {
   ActionType,
   CustomActionDef,
@@ -109,6 +110,29 @@ const ALL_READONLY_REPOS_BLOCK_REASON =
 const taskAllReposReadonly = (task: Task): boolean =>
   task.repoPaths.length > 0 &&
   task.repoPaths.every((p) => (task.readonlyRepoPaths ?? []).includes(p));
+
+/**
+ * 默认选中 = 混排可见列表第一位（内置 / custom / 全空）。
+ * open-effect 与 fetch 后「幽灵选中」重置共用，避免两处分支漂移。
+ */
+const selectFirstVisibleAction = (
+  visibleKeys: string[],
+  setActionType: (v: ActionType | null) => void,
+  setSelectedCustomActionId: (v: string | null) => void,
+): void => {
+  const first = visibleKeys[0];
+  if (first === undefined) {
+    // 全部 action 被隐藏（且无自定义）——无选中、chips 区显示空态引导
+    setActionType(null);
+    setSelectedCustomActionId(null);
+  } else if (isBuiltinAdvanceAction(first)) {
+    setActionType(first);
+    setSelectedCustomActionId(null);
+  } else {
+    setActionType("custom");
+    setSelectedCustomActionId(first);
+  }
+};
 
 const inferDisabledReason = (
   task: Task,
@@ -145,12 +169,8 @@ const inferDisabledReason = (
         return <>未能从仓库 remote 推导 GitLab 地址、检查仓库是否配了 origin</>;
       }
       if (!ctx.token) {
-        return (
-          <>
-            缺少 GitLab PAT，
-            <SettingsLink focus="git">去设置</SettingsLink>
-          </>
-        );
+        // Tooltip 全局 pointer-events-none（防叠层 hover 死循环），气泡内链接点不到——改纯文案指路
+        return <>缺少 GitLab PAT，去设置 → 连接 里配置</>;
       }
       return null;
     case "dev": {
@@ -162,12 +182,8 @@ const inferDisabledReason = (
         (p) => (devBranches?.[p]?.trim() ?? "").length > 0,
       );
       if (!anyDev) {
-        return (
-          <>
-            需要配 dev 分支，
-            <SettingsLink focus="repos">去设置</SettingsLink>
-          </>
-        );
+        // 同上：Tooltip 不可点，纯文案指路
+        return <>需要配 dev 分支，去设置 → 仓库 里配置</>;
       }
       return null;
     }
@@ -182,22 +198,27 @@ const inferDisabledReason = (
 };
 
 // action 方块卡共用外观（内置 + 自定义两处渲染、单一来源）：
-// 主标题水平垂直居中、左上角固定 ✨ 角标点睛（用户拍板：统一星星、不搞每 action 一个 icon）
-// 固定 h-10 单行：两行方案会让不同 grid 行高度不齐、用户拍板改 hover Tooltip 补全长名
+// 两行结构（中文名 + 标识符）统一 min-h、天然齐高；左上角固定 ✨ 角标点睛
 // 选中态 bg-selected 实底 + 品牌色描边、角标同步亮品牌色
 const actionCardClass = (selected: boolean) =>
   cn(
-    "group flex h-10 w-full items-center justify-center py-0 px-0",
+    // min-h 兜底两行（label xs + id 10px + gap）；py 给上下呼吸、盖过 ChoiceButton card 默认 p-3
+    "group flex min-h-11 w-full items-center justify-center py-1.5 px-0",
     selected ? "border-primary/50 bg-selected" : "hover:bg-muted/40",
   );
 
-// action 方块卡内容：居中 label + 左上角固定 ✨ 角标（选中品牌色、未选中 muted、hover 过渡）
-// 长名单行 truncate、完整名由外层 Tooltip 补全（跟侧栏任务行同款约定）
+// action 方块卡内容：两行居中（用户拍板 2026-07-23）
+//   1) label——中文名、主字号；过长 truncate，完整名由外层 Tooltip 补全
+//   2) identifier——灰色 mono 小字；内置=类型名、自定义/派生=挂载 skill 名（不解析 label）
+// 左上角固定 ✨ 角标（选中品牌色、未选中 muted、hover 过渡）
 const ActionCardContent = ({
   label,
+  identifier,
   selected,
 }: {
   label: string;
+  /** 第二行标识符：builtin type 或 custom skill 名 */
+  identifier: string;
   selected: boolean;
 }) => (
   <>
@@ -209,14 +230,19 @@ const ActionCardContent = ({
           : "text-muted-foreground/60 group-hover:text-muted-foreground",
       )}
     />
-    {/* 12px + 收窄左右 padding（px-6→px-5、✨ 在 left-2 不重叠）：一行多容 1-2 个字、减少截断；min-w-0 让 truncate 在 flex/grid 里生效 */}
-    <span
-      className={cn(
-        "min-w-0 w-full truncate px-5 text-center text-xs font-medium leading-none",
-        selected && "text-primary",
-      )}
-    >
-      {label}
+    {/* px-5：✨ 在 left-2 不压字；min-w-0 让 truncate 在 flex/grid 里生效 */}
+    <span className="flex min-w-0 w-full flex-col items-center gap-0.5 px-5">
+      <span
+        className={cn(
+          "min-w-0 w-full truncate text-center text-xs font-medium leading-tight",
+          selected && "text-primary",
+        )}
+      >
+        {label}
+      </span>
+      <span className="min-w-0 w-full truncate text-center font-mono text-[10px] leading-tight text-muted-foreground">
+        {identifier}
+      </span>
     </span>
   </>
 );
@@ -289,7 +315,7 @@ interface Props {
    */
   prefill?: {
     instruction?: string;
-    /** 收件箱改bug入口用：预选 builtin-fix-bug 等 custom action */
+    /** 收件箱改bug入口用：预选 app:fix-bug 等 custom action */
     customActionId?: string;
   } | null;
   onSubmit: (input: {
@@ -360,10 +386,21 @@ export const AdvanceDialog = ({
   //（进依赖会让异步拉取完成时重跑 open-effect、把用户已改的表单打回默认）
   const customActionsRef = useRef(customActions);
   customActionsRef.current = customActions;
+  // 团队规范开关 + knowledge skill 名集合（打开瞬间读；关 → 渲染层隐藏挂载 knowledge skill 的自定义 action）
+  // shared 无总开关（市场模型）、不参与过滤。用 ref：open-effect 与异步 fetch 共用、不进 effect 依赖（防表单被打回）
+  // null = skills 元数据没拿到（区别于空 Set = 加载成功但没有 knowledge skill）
+  const teamKnowledgeEnabledRef = useRef(true);
+  const teamKnowledgeSkillNamesRef = useRef<Set<string> | null>(new Set());
   // 当前选中的 custom 定义 id（仅 actionType="custom" 时有效）
   const [selectedCustomActionId, setSelectedCustomActionId] = useState<
     string | null
   >(null);
+  // fetch effect 依赖只有 [open]，闭包里的 actionType / selectedCustomActionId 会 stale——
+  // ref 同步最新选中，供拉完列表后校验「幽灵选中」时读取
+  const actionTypeRef = useRef(actionType);
+  actionTypeRef.current = actionType;
+  const selectedCustomActionIdRef = useRef(selectedCustomActionId);
+  selectedCustomActionIdRef.current = selectedCustomActionId;
   // V0.9：推进面板布局偏好（顺序 + 显隐）；open effect 里读 getSettings() 刷新（非响应式、靠重开拉最新）
   const [actionLayout, setActionLayout] = useState<{
     order: string[];
@@ -472,6 +509,8 @@ export const AdvanceDialog = ({
     setReuseAgent(s.reuseAgentDefault ?? false);
     setPickedModel(defaultPickedModelRef.current ?? s.defaultModel ?? { id: "" });
     setGitToken(s.gitToken?.trim() || undefined);
+    // 团队规范开关：缺省 true；关了推进列表隐藏挂载 knowledge skill 的自定义 action
+    teamKnowledgeEnabledRef.current = s.teamKnowledgeEnabled !== false;
     setResolvedGitHost(undefined);
     setGitHostError(null);
     if (repoPathsRef.current.length > 0) {
@@ -509,10 +548,32 @@ export const AdvanceDialog = ({
     const prefillCustomId =
       prefillRef.current?.customActionId?.trim() || null;
     pendingPrefillCustomIdRef.current = prefillCustomId;
+    // 打开瞬间按团队规范开关过滤自定义列表（定义不删、只渲染层）
+    const filterTeam = (defs: CustomActionDef[]) => {
+      // T15：requiresKnowledge 与 knowledge 分类过滤同受总开关
+      const afterRequires = filterAdvanceByRequiresKnowledge(
+        defs,
+        s.teamKnowledgeEnabled !== false,
+      );
+      if (s.teamKnowledgeEnabled !== false) return afterRequires;
+      const knowledgeNames = teamKnowledgeSkillNamesRef.current;
+      // null = 元数据没拿到：保守过滤派生 knowledge action（origin=team 且非 shared:）
+      if (knowledgeNames === null) {
+        return afterRequires.filter(
+          (d) =>
+            !(d.origin === "team" && !isSharedTeamCategory(d.teamCategory)),
+        );
+      }
+      // 空 Set = 真没有 knowledge skill、不过滤
+      if (knowledgeNames.size === 0) return afterRequires;
+      return afterRequires.filter(
+        (d) => !d.skill || !knowledgeNames.has(d.skill),
+      );
+    };
     const visibleKeys = arrangeByLayout(
       [
         ...BUILTIN_ADVANCE_ACTIONS,
-        ...customActionsRef.current.map((d) => d.id),
+        ...filterTeam(customActionsRef.current).map((d) => d.id),
       ],
       layout,
     );
@@ -526,19 +587,13 @@ export const AdvanceDialog = ({
     // 原「按 repoStatus / 最近 action 顺推」的 inferDefaultActionType 已删）。
     // customActions 用 ref 读打开瞬间的缓存：首次打开还没拉到就只在内置里选、
     // 拉完不追改选中（用户可能已开始操作、追改会跳）；第二次打开起缓存已有、custom 排第一也能选中。
-    // 例外：上面 pendingPrefillCustomId 仍挂着时、fetch effect 会补一次预选。
-    const first = visibleKeys[0];
-    if (first === undefined) {
-      // 全部 action 被隐藏（且无自定义）——无选中、chips 区显示空态引导
-      setActionType(null);
-      setSelectedCustomActionId(null);
-    } else if (isBuiltinAdvanceAction(first)) {
-      setActionType(first);
-      setSelectedCustomActionId(null);
-    } else {
-      setActionType("custom");
-      setSelectedCustomActionId(first);
-    }
+    // 例外：上面 pendingPrefillCustomId 仍挂着时、fetch effect 会补一次预选；
+    // 若缓存选中项被团队规范 / 已关闭 skill 滤掉，fetch effect 会重置幽灵选中。
+    selectFirstVisibleAction(
+      visibleKeys,
+      setActionType,
+      setSelectedCustomActionId,
+    );
   }, [open, defaultRemoveSourceBranch]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
@@ -551,33 +606,137 @@ export const AdvanceDialog = ({
     }
   }, [open, availableModels.length, fetchModels]);
 
-  // dialog 打开时拉自定义 action 列表（供「我的 Action」组渲染）；拉失败静默清空、不挡内置 action。
+  // dialog 打开时拉自定义 action 列表 + knowledge skill 名（团队规范开关过滤用）
+  // + 已关闭自管 skill 名（推进面板隐藏挂它的自建 action）；拉失败静默清空、不挡内置 action。
   // 旧格式（legacy）已停用、在这个唯一数据源处滤掉——下游 customById / visibleKeys / 默认选中全部跟随。
   // 收件箱改bug：若 open effect 时列表还没缓存、这里补一次 customActionId 预选（仅 pending 未清时）。
   useEffect(() => {
     if (!open) return;
-    void fetchCustomActions()
-      .then((defs) => {
-        const usable = usableCustomActions(defs);
-        setCustomActions(usable);
-        const pending = pendingPrefillCustomIdRef.current;
-        if (!pending) return;
-        pendingPrefillCustomIdRef.current = null;
-        // 用户已手点过 chip → 补选作废，不追改用户的选择
-        if (userTouchedActionRef.current) return;
-        // 列表没有 / 被隐藏 → 忽略预选、保留 open effect 已选的默认第一位
+    // 并行拉 custom actions + skills 元数据（knowledge 名集合 + 已关闭自管名）
+    // knowledge: null = 没拿到数据（!ok / catch）；空 Set = 加载成功且真没有 knowledge skill
+    const skillsP = fetch("/api/skills", { cache: "no-store" })
+      .then(async (r) => {
+        if (!r.ok) {
+          return {
+            knowledge: null as Set<string> | null,
+            disabledApp: new Set<string>(),
+          };
+        }
+        const d = (await r.json()) as {
+          skills?: Array<{
+            name?: string;
+            source?: string;
+            enabled?: boolean;
+            teamCategory?: string;
+          }>;
+        };
+        const knowledge = new Set<string>();
+        const disabledApp = new Set<string>();
+        for (const s of d.skills ?? []) {
+          if (typeof s.name !== "string") continue;
+          // 自管源且关闭 → 推进面板隐藏挂它的自建 action
+          if (s.source === "app" && s.enabled === false) {
+            disabledApp.add(s.name);
+          }
+          if (s.source !== "team") continue;
+          if (
+            typeof s.teamCategory === "string" &&
+            s.teamCategory.startsWith("shared:")
+          ) {
+            continue; // shared 无总开关、不参与过滤
+          }
+          knowledge.add(s.name);
+        }
+        return { knowledge, disabledApp };
+      })
+      .catch(() => ({
+        knowledge: null as Set<string> | null,
+        disabledApp: new Set<string>(),
+      }));
+
+    void Promise.all([fetchCustomActions(), skillsP])
+      .then(([defs, { knowledge: knowledgeNames, disabledApp }]) => {
+        teamKnowledgeSkillNamesRef.current = knowledgeNames;
+        const usable = filterAdvanceByDisabledAppSkills(
+          usableCustomActions(defs),
+          disabledApp,
+        );
+        // 团队规范关时：requiresKnowledge 隐藏 + knowledge 分类过滤
+        // null = 没拿到数据 → 保守滤掉 origin=team 且非 shared 的派生 action
+        // 空 Set = 真没有 knowledge skill、不过滤
+        const knowledgeOn = teamKnowledgeEnabledRef.current;
+        const afterRequires = filterAdvanceByRequiresKnowledge(
+          usable,
+          knowledgeOn,
+        );
+        const filtered = (() => {
+          if (knowledgeOn) return afterRequires;
+          if (knowledgeNames === null) {
+            return afterRequires.filter(
+              (d) =>
+                !(
+                  d.origin === "team" && !isSharedTeamCategory(d.teamCategory)
+                ),
+            );
+          }
+          if (knowledgeNames.size === 0) return afterRequires;
+          return afterRequires.filter(
+            (d) => !d.skill || !knowledgeNames.has(d.skill),
+          );
+        })();
+        setCustomActions(filtered);
         const layout = getSettings().actionLayout ?? { order: [], hidden: [] };
         const visible = arrangeByLayout(
-          [...BUILTIN_ADVANCE_ACTIONS, ...usable.map((d) => d.id)],
+          [...BUILTIN_ADVANCE_ACTIONS, ...filtered.map((d) => d.id)],
           layout,
         );
-        if (!visible.includes(pending)) return;
-        setActionType("custom");
-        setSelectedCustomActionId(pending);
+        const filteredIds = new Set(filtered.map((d) => d.id));
+
+        // 收件箱改bug：pending 预选优先（命中则落选并 return，避免被下面的幽灵重置盖掉）
+        const pending = pendingPrefillCustomIdRef.current;
+        if (pending) {
+          pendingPrefillCustomIdRef.current = null;
+          // 用户已手点过 chip → 补选作废，不追改用户的选择
+          if (!userTouchedActionRef.current && visible.includes(pending)) {
+            setActionType("custom");
+            setSelectedCustomActionId(pending);
+            return;
+          }
+          // pending 未命中 / 用户已手点 → 落下去校验当前选中是否仍在列表
+        }
+
+        // 过滤后当前 custom 选中已不在列表（被团队规范 / 关 skill / 删除滤掉）→ 重置，防幽灵可提交
+        if (
+          actionTypeRef.current === "custom" &&
+          selectedCustomActionIdRef.current &&
+          !filteredIds.has(selectedCustomActionIdRef.current)
+        ) {
+          selectFirstVisibleAction(
+            visible,
+            setActionType,
+            setSelectedCustomActionId,
+          );
+        }
       })
       .catch(() => {
         setCustomActions([]);
         pendingPrefillCustomIdRef.current = null;
+        // 列表拉失败清空后，若仍挂着 custom 选中 → 同样重置，避免幽灵提交
+        if (
+          actionTypeRef.current === "custom" &&
+          selectedCustomActionIdRef.current
+        ) {
+          const layout = getSettings().actionLayout ?? { order: [], hidden: [] };
+          const visible = arrangeByLayout(
+            [...BUILTIN_ADVANCE_ACTIONS],
+            layout,
+          );
+          selectFirstVisibleAction(
+            visible,
+            setActionType,
+            setSelectedCustomActionId,
+          );
+        }
       });
   }, [open]);
 
@@ -603,9 +762,9 @@ export const AdvanceDialog = ({
     [customById, actionLayout],
   );
 
-  // 「下一步」：网格方块卡、竖排居中（icon 上 label 下、Raycast/Linear 式克制点睛）
+  // 「下一步」：网格方块卡（两行：中文名 + 标识符）
   // 内置 + 自定义混排；外观 / 内容走 actionCardClass + ActionCardContent 单一来源；
-  // 不可选原因仍用角标警告 icon（右上角、icon 居中后两者不重叠）。
+  // 不可选原因仍用角标警告 icon（右上角、与 ✨ 左侧重不重叠）。
   const renderActionChip = (key: string) => {
     if (isBuiltinAdvanceAction(key)) {
       const type = key;
@@ -618,8 +777,8 @@ export const AdvanceDialog = ({
       const selected = actionType === type;
       return (
         // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip；
-        // 长名 Tooltip 也挂外层 div（hover 卡片即出全名、disabled 卡也能出）
-        <Tooltip key={key} content={ACTION_LABEL[type]}>
+        // 长名 Tooltip 也挂外层 div（hover 卡片即出全名 + 标识符、disabled 卡也能出）
+        <Tooltip key={key} content={`${ACTION_LABEL[type]}（${type}）`}>
           <div className="relative">
             <ChoiceButton
               shape="card"
@@ -632,7 +791,11 @@ export const AdvanceDialog = ({
               disabled={submitting || !!reason}
               className={actionCardClass(selected)}
             >
-              <ActionCardContent label={ACTION_LABEL[type]} selected={selected} />
+              <ActionCardContent
+                label={ACTION_LABEL[type]}
+                identifier={type}
+                selected={selected}
+              />
             </ChoiceButton>
             {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
             {reason && (
@@ -651,8 +814,8 @@ export const AdvanceDialog = ({
     if (!def) return null;
     const selected = actionType === "custom" && selectedCustomActionId === def.id;
     return (
-      // 自定义 action 名可长（如「飞书项目周报生成」）、单行截断后靠 hover Tooltip 看全名
-      <Tooltip key={key} content={def.label}>
+      // 自定义 action 名可长（如「飞书项目周报生成」）、截断后靠 hover Tooltip 看全名 + skill 标识符
+      <Tooltip key={key} content={def.skill ? `${def.label}（${def.skill}）` : def.label}>
         <div className="relative">
           <ChoiceButton
             shape="card"
@@ -665,7 +828,11 @@ export const AdvanceDialog = ({
             disabled={submitting}
             className={actionCardClass(selected)}
           >
-            <ActionCardContent label={def.label} selected={selected} />
+            <ActionCardContent
+              label={def.label}
+              identifier={def.skill}
+              selected={selected}
+            />
           </ChoiceButton>
         </div>
       </Tooltip>

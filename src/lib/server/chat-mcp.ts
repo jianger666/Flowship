@@ -44,7 +44,9 @@ import {
 /** notify 未送达时工具返回（反登记后、非 ASK_SUBMITTED） */
 const ASK_NOTIFY_FAILED_TEXT = "任务已被接管/通知失败、请重试";
 import { createCustomAction } from "./custom-action-fs";
-import { findSkillByName } from "./skills-loader";
+import { getAppSkillsDir } from "./skills-loader";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
 /** caller 不匹配时的 MCP 工具返回（无副作用） */
 const callerMismatchContent = () => ({
@@ -103,7 +105,7 @@ const askSubmittedText = (askId: string): string =>
   [
     `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
     "",
-    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问。",
+    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问、**不要再输出任何总结 / 补充段落**（提问本身就是本轮收尾）。",
     "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（或 `[ASK_USER_REPLY deferred]` = 稍后再补充 → 按 default 推进、未答项自行记住即可）。",
   ].join("\n");
 
@@ -273,15 +275,17 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         "- **可多次**：上一轮答模糊 → 形成判断后再问一轮给具体选项，正常",
         "- **只在确实有不确定项时调**——没问题就跳过",
         "- **options 不要塞 Other / 其他 / 以上都不是**——`allow_text=true` 时 UI 自动加「自定义」、你再加会重复",
+        "- **背景说明 / 前情提要放进 question 字段**（答题卡里展示）——不要另写一段正文当「铺垫」",
         "",
         "## 返回值（非阻塞）",
         "",
-        "- `[ASK_SUBMITTED]` = 答题卡已推——**立即结束本轮回复**、别等 / 别轮询",
+        "- `[ASK_SUBMITTED]` = 答题卡已推——**立即结束本轮回复**、别等 / 别轮询、**不要再输出任何总结段落**（提问本身就是本轮收尾）",
         "- 用户答完以新消息送达：`[ASK_USER_REPLY]` Q&A、或 `[ASK_USER_REPLY deferred]`（稍后再补 → 按 default 推进、别再问同组）",
         "",
         "## 礼仪",
         "",
-        "- 调前 / 后别在正文预告「我先问几个问题」——答题卡自己会出",
+        "- 调前别在正文预告「我先问几个问题」——答题卡自己会出",
+        "- **调用本工具后直接结束回复、不要再输出任何总结 / 补充段落**（否则会把答题卡顶上去）",
         "- 答完别复述「你选了 X」、直接按答案推进",
       ].join("\n"),
       inputSchema: {
@@ -638,15 +642,19 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
           ],
         };
       }
+      // 查无此自管 skill → 返回错误文本让 AI 先建 skill（不抛、MCP 工具约定用 content 回传）
       const skillName = skill.trim();
-      // 查无此 skill → 返回错误文本让 AI 先建 skill（不抛、MCP 工具约定用 content 回传）
-      const found = await findSkillByName(skillName);
-      if (!found) {
+      const appDir = path.join(getAppSkillsDir(), skillName);
+      const appExists = await fs.stat(appDir).then(
+        (st) => st.isDirectory(),
+        () => false,
+      );
+      if (!appExists) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `主 skill「${skillName}」本机找不到。请先把纯方法论 SKILL.md 写进自管 skills 目录（目录名=${skillName}），再调本工具挂壳。`,
+              text: `主 skill「${skillName}」不在自管目录。请先把 SKILL.md 写进自管 skills（目录名=${skillName}），再调本工具挂壳。`,
             },
           ],
         };

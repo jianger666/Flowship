@@ -163,6 +163,14 @@ interface ToolBlockRowProps {
   nested?: boolean;
 }
 
+/**
+ * 从 tool_result.fullPath 取已消毒的文件名（无目录 / 无 .txt）。
+ * 子代理 callId 常含 `\n`，直接拿 callId 请求会被旧 API 拒或 URL 怪异；
+ * fullPath 落盘时已 sanitize，与磁盘文件名一致。
+ */
+const toolOutputIdFromFullPath = (fullPath: string): string =>
+  fullPath.replace(/^.*\//, "").replace(/\.txt$/i, "");
+
 /** 展开区底部：加载完整输出按钮（truncated + fullPath） */
 const LoadFullOutputButton = ({
   block,
@@ -197,9 +205,19 @@ const LoadFullOutputButton = ({
         onEnsureOpen();
         void (async () => {
           try {
-            const res = await fetch(
-              `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(block.callId)}`,
+            const fromPath = toolOutputIdFromFullPath(
+              block.result?.fullPath ?? "",
             );
+            // 优先 fullPath 消毒名；兜底 callId（普通工具 callId 本身已安全）
+            const outputId = fromPath || block.callId;
+            const res = await fetch(
+              `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(outputId)}`,
+            );
+            // 历史事件写盘失败 / 已被 prune：降级提示，不当成硬错误
+            if (res.status === 404) {
+              toast.error("完整输出已不可用（可能未保存或已清理）");
+              return;
+            }
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             onLoaded(await res.text());
           } catch {

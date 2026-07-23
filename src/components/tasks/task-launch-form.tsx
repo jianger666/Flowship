@@ -397,7 +397,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
             <Plug />
             <span>启用的 MCP servers</span>
             <span className="text-xs text-muted-foreground">
-              （{availableMcp.length - disabledMcp.length}/{availableMcp.length}）
+              {/* 黑名单可能残留已删除的 server 名（设置页快照）、直接减长度会出负数——按有效交集算 */}
+              （{availableMcp.filter((n) => !disabledMcp.includes(n)).length}/
+              {availableMcp.length}）
             </span>
           </Button>
           {mcpExpanded && (

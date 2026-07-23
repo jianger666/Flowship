@@ -69,7 +69,7 @@ import {
   type AssistantBufferCtx,
 } from "./sdk-message-handler";
 import {
-  loadSkills,
+  loadSkillsForTask,
   renderSkillsForPrompt,
   type SkillEntry,
 } from "./skills-loader";
@@ -80,6 +80,7 @@ import {
 import { resolveUserIdentityForPrompt } from "./meegle-cli";
 import {
   buildGitlabAccessDirective,
+  buildLarkCliAuthMissingRule,
   renderReadonlyRepoDirective,
   renderScriptRepoDirective,
 } from "./task-prompts";
@@ -88,6 +89,11 @@ import { readSettingsFile } from "./settings-fs";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
 import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
+import {
+  SDK_CREATE_RESUME_TIMEOUT_MS,
+  SDK_SEND_TIMEOUT_MS,
+  withSdkDeadline,
+} from "./sdk-deadline";
 import {
   allocTaskRunInstanceId,
   publishTaskStreamEvent,
@@ -232,7 +238,7 @@ export const hasChatSession = (taskId: string): boolean =>
  * 不传 = 关当前的（用户主动 stop / forceClear）。对齐 task-runner.closeTaskSession。
  * 门控键从 agentId 改为 instanceId——Agent.resume 恢复同一持久化 agent 时
  * agentId 相同，旧 retry / 迟到收尾按 agentId 会误关退避期间用户恢复的新实例。
- * keepPersisted = 空闲回收用（sessionAgentId 留着、下次消息 Agent.resume 接回）
+ * keepPersisted = 空闲回收 / error 收尾用（sessionAgentId 留着、下次消息 Agent.resume 接回）
  *
  * 落盘锚点改条件清（clearTaskSessionAgentIdIf）——expected=本次关的 agentId，
  * extraGuard=内存无后继 chat 会话；`!rec` 禁止裸清（迟到 fire-and-forget 不得抹 B 锚点）。
@@ -523,6 +529,8 @@ const buildInitialPrompt = (
   userIdentityLine = "",
   /** GitLab 访问段（绑仓 + 配了 gitToken 时注入；空串 = 不注入） */
   gitlabAccessSection = "",
+  /** lark-cli 身份缺失登录兜底（常驻） */
+  larkCliAuthSection = "",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -603,6 +611,10 @@ const buildInitialPrompt = (
   // 绑仓 + settings 有 gitToken → 注入 GitLab 访问说明（纯聊天不注）
   if (gitlabAccessSection.trim()) {
     lines.push(gitlabAccessSection.trim(), "");
+  }
+  // lark-cli 身份缺失 → 主动问是否代为登录（常驻、不绑 gitToken）
+  if (larkCliAuthSection.trim()) {
+    lines.push(larkCliAuthSection.trim(), "");
   }
   lines.push(
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
@@ -906,8 +918,8 @@ export const runChatSession = async (
     // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills / rules 读盘、identity 走
     // meegle CLI、gitlab 段读 settings + 推 remote host——都不依赖 agent、重叠后首 token 提前。
     // 侧挂 catch 防「create 期间先 reject」的 unhandledRejection 噪音（await 时仍抛给外层 catch）。
-    const skillsPromise = loadSkills().catch((err) => {
-      console.error("[chat-runner] loadSkills failed", err);
+    const skillsPromise = loadSkillsForTask(task.repoPaths ?? []).catch((err) => {
+      console.error("[chat-runner] loadSkillsForTask failed", err);
       return [];
     });
     const rulesPromise = readAppRulesForPrompt();
@@ -933,24 +945,28 @@ export const runChatSession = async (
     // 4) 启动 agent + 流式消费
     publishBootProgress(task.id, "create", "正在创建会话…");
     const perfCreateStart = Date.now();
-    agent = await Agent.create({
-      apiKey,
-      model,
-      // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
-      // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
-      // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
-      local: {
-        // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
-        //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
-        // Cursor（默认 workspace）：总给个用户地盘的合法 cwd、要 agent 干活就让用户选目录。
-        cwd:
-          task.repoPaths.length > 0
-            ? getEffectiveCwd(task.repoPaths)
-            : os.homedir(),
-        settingSources: [],
-      },
-      mcpServers: mergedMcp,
-    });
+    agent = await withSdkDeadline(
+      Agent.create({
+        apiKey,
+        model,
+        // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
+        // 曾用 ["project"] 时未绑工作目录 cwd=homedir → 把 ~/.cursor MCP 整包漏进 agent（实锤）。
+        // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills / inline mcpServers）。
+        local: {
+          // 未绑工作目录（自由对话没选目录）→ cwd 用用户主目录、不用 process.cwd()
+          //（打包后 = app 内部目录、对终端用户无意义）。对齐 codex（默认终端 pwd）/
+          // Cursor（默认 workspace）：总给个用户地盘的合法 cwd、要 agent 干活就让用户选目录。
+          cwd:
+            task.repoPaths.length > 0
+              ? getEffectiveCwd(task.repoPaths)
+              : os.homedir(),
+          settingSources: [],
+        },
+        mcpServers: mergedMcp,
+      }),
+      SDK_CREATE_RESUME_TIMEOUT_MS,
+      "Agent.create",
+    );
     const perfCreateMs = Date.now() - perfCreateStart;
 
     // Agent.create 冷启动也要数秒——期间可能被 stop（cancelled）或
@@ -989,6 +1005,7 @@ export const runChatSession = async (
       firstMessage,
       userIdentityLine,
       gitlabAccessSection,
+      buildLarkCliAuthMissingRule(),
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 
@@ -1019,22 +1036,26 @@ export const runChatSession = async (
       runKind: "chat-first",
       promptBytes,
     });
-    run = await agent.send(initialPrompt, {
-      onDelta: composeOnDelta(
-        perfTracker.onDelta,
-        // chat shell delta 绑本实例 instanceId——失主丢弃迟到输出
-        createShellOutputDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === myInstanceId,
+    run = await withSdkDeadline(
+      agent.send(initialPrompt, {
+        onDelta: composeOnDelta(
+          perfTracker.onDelta,
+          // chat shell delta 绑本实例 instanceId——失主丢弃迟到输出
+          createShellOutputDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === myInstanceId,
+          ),
+          // SDK in-place summarization → 事件流一条 info
+          createSdkSummaryDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === myInstanceId,
+          ),
         ),
-        // SDK in-place summarization → 事件流一条 info
-        createSdkSummaryDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === myInstanceId,
-        ),
-      ),
-      onStep: perfTracker.onStep,
-    });
+        onStep: perfTracker.onStep,
+      }),
+      SDK_SEND_TIMEOUT_MS,
+      "agent.send",
+    );
     perfTracker.attachRun(run);
     // 单行汇总（不写 events、纯日志）：mcp=探测+merge、create=SDK 冷启动、
     // prompt=素材收割+拼装（含首包字节数）、send=Run 受理、total=自进入本函数起
@@ -1226,21 +1247,25 @@ export const resumeChatSession = async (
       ...cursorMcp,
       [CHAT_TOOL_MCP_NAME]: { type: "http", url: getChatMcpUrl(callerToken) },
     };
-    const agent = await Agent.resume(task.sessionAgentId, {
-      apiKey: bootArgs.apiKey,
-      // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
-      model: bootArgs.model,
-      // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
-      // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
-      local: {
-        cwd:
-          task.repoPaths.length > 0
-            ? getEffectiveCwd(task.repoPaths)
-            : os.homedir(),
-        settingSources: [],
-      },
-      mcpServers: mergedMcp,
-    });
+    const agent = await withSdkDeadline(
+      Agent.resume(task.sessionAgentId, {
+        apiKey: bootArgs.apiKey,
+        // 恢复的本地 agent 不保留 model、后续 send 会报 ConfigurationError（实测踩过）——显式传
+        model: bootArgs.model,
+        // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
+        // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
+        local: {
+          cwd:
+            task.repoPaths.length > 0
+              ? getEffectiveCwd(task.repoPaths)
+              : os.homedir(),
+          settingSources: [],
+        },
+        mcpServers: mergedMcp,
+      }),
+      SDK_CREATE_RESUME_TIMEOUT_MS,
+      "Agent.resume",
+    );
     // Agent.resume 成功后、runningChats.set 之前的同步复查：
     // await 期间 rewind / 并发 resume / stop(cancelChatStart) 可能已抢占——放弃挂载
     if (
@@ -1522,21 +1547,25 @@ const runReconnectAttempt = async (
     });
     // 认领已在 resume 注册时完成（runActive=true），勿等 send 后再置——
     // 否则 flush / 并发 send 可插在 reconnect prompt 之前（ 点名的晚置位窗口）
-    const run = await rec.agent.send(reconnectPrompt, {
-      onDelta: composeOnDelta(
-        perfTracker.onDelta,
-        // 重连 shell delta 绑 claimedInstanceId
-        createShellOutputDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+    const run = await withSdkDeadline(
+      rec.agent.send(reconnectPrompt, {
+        onDelta: composeOnDelta(
+          perfTracker.onDelta,
+          // 重连 shell delta 绑 claimedInstanceId
+          createShellOutputDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+          ),
+          createSdkSummaryDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
+          ),
         ),
-        createSdkSummaryDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === claimedInstanceId,
-        ),
-      ),
-      onStep: perfTracker.onStep,
-    });
+        onStep: perfTracker.onStep,
+      }),
+      SDK_SEND_TIMEOUT_MS,
+      "agent.send(reconnect)",
+    );
     perfTracker.attachRun(run);
     // send pending 期间用户 stop（claim cancel 已摘表）或实例被
     // forceClear 替换 → 丢弃迟到 run，绝不写「重连成功」再把 AI 拉起来。
@@ -1691,7 +1720,10 @@ const finalizeChatRunIfCurrent = async (
   if (!isCurrent()) return false;
   // error 清队走唯一 sink（queue_failed + recentSettled）
   failQueuedItems(taskId, { reason: "error" });
-  const closed = closeChatSession(taskId, instanceId);
+  // error 收尾：关内存会话，但保留落盘 sessionAgentId——模型/区域等不可重试错
+  // 并不代表持久化 agent 坏了；下条消息走既有「模式 2 resume → 失败降级模式 3」。
+  // stop / forceClear / rewind 仍走无 keepPersisted 的清锚点路径。
+  const closed = closeChatSession(taskId, instanceId, { keepPersisted: true });
   if (!closed) return false;
   // 关会话后不再 await getTask——避免空窗里 B 已启动却仍 publish done 清其 streaming
   if (errorTask) publish(taskId, { kind: "task", task: errorTask });
@@ -1719,8 +1751,9 @@ const handleChatRunFailure = async (
 
 /**
  * 消费一个 chat run 的完整生命周期。
- * 自然 finished = 正常出口：runStatus → awaiting_user（等下一条消息）、**会话保留**；
- * cancel / error → 关会话（下一条消息起新会话、靠 events.jsonl 恢复上下文）。
+ * 自然 finished = 正常出口：runStatus → awaiting_user（等下一条消息）、**内存会话保留**；
+ * cancel → 关内存 + 清落盘 sessionAgentId（下一条起新）；
+ * error → 关内存但保留落盘 sessionAgentId（下一条优先 Agent.resume）。
  */
 const consumeChatRun = async (
   task: Task,
@@ -1973,21 +2006,25 @@ export const sendChatMessage = async (
       runKind: "chat-followup",
       promptBytes: Buffer.byteLength(prompt, "utf-8"),
     });
-    run = await rec.agent.send(prompt, {
-      onDelta: composeOnDelta(
-        perfTracker.onDelta,
-        // follow-up shell delta 绑 rec.instanceId
-        createShellOutputDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === rec.instanceId,
+    run = await withSdkDeadline(
+      rec.agent.send(prompt, {
+        onDelta: composeOnDelta(
+          perfTracker.onDelta,
+          // follow-up shell delta 绑 rec.instanceId
+          createShellOutputDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === rec.instanceId,
+          ),
+          createSdkSummaryDeltaPublisher(
+            task.id,
+            () => runningChats.get(task.id)?.instanceId === rec.instanceId,
+          ),
         ),
-        createSdkSummaryDeltaPublisher(
-          task.id,
-          () => runningChats.get(task.id)?.instanceId === rec.instanceId,
-        ),
-      ),
-      onStep: perfTracker.onStep,
-    });
+        onStep: perfTracker.onStep,
+      }),
+      SDK_SEND_TIMEOUT_MS,
+      "agent.send",
+    );
     // 立刻挂到共享取消闭包：此后 stop 到达（如置 running 的 await 期间）能直接 cancel 本 run
     acceptedRun = run;
     perfTracker.attachRun(run);

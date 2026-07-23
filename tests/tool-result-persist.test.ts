@@ -134,4 +134,12 @@ describe("sanitizeCallIdForPath", () => {
     // 两次空串同一回退（旧实现 Date.now 写读不一致）
     expect(sanitizeCallIdForPath("")).toBe(sanitizeCallIdForPath(""));
   });
+
+  it("子代理 callId 内嵌换行 → 换成下划线（与 tool-output API 读盘一致）", () => {
+    const raw =
+      "call-2db24248-f3ac-4b60-898b-341cc901ac7a-5\nfc_cfbdbf80-a56a-9c71-a13b-eb5c6f722724_5";
+    expect(sanitizeCallIdForPath(raw)).toBe(
+      "call-2db24248-f3ac-4b60-898b-341cc901ac7a-5_fc_cfbdbf80-a56a-9c71-a13b-eb5c6f722724_5",
+    );
+  });
 });

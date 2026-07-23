@@ -412,6 +412,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
     if (isTaskOpStale(task.id, opGen)) {
       return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
     }
+    // 受理即可见：唤醒 fire-and-forget 前先落进度，避免「接口 200 后长时间无动静」
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      actionId: task.currentActionId ?? undefined,
+      text: "正在唤醒当前阶段…",
+    });
     // 唤醒模式自己管状态（patch action running + runStatus + 事件）；失败标 error 有内部兜底
     void resumeCurrentActionWithMessage({
       task,
@@ -462,6 +468,12 @@ export const POST = async (req: Request, { params }: Ctx) => {
   publishTaskStreamEvent(task.id, { kind: "task", task: updated });
 
   if (useOneShot) {
+    // 受理即可见：oneshot 启动前先落进度
+    await writeEventAndPublish(task.id, {
+      kind: "info",
+      actionId: task.currentActionId ?? undefined,
+      text: "正在启动答疑 agent…",
+    });
     startOneShotQuestion(
       task,
       agentText,

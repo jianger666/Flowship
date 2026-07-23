@@ -22,6 +22,7 @@ import {
   getAppSkillsDir,
   readDisabledSkills,
 } from "@/lib/server/skills-loader";
+import { readTeamSkillStates } from "@/lib/server/team-skill-states";
 import { errorResponse } from "@/lib/server/route-helpers";
 
 export const runtime = "nodejs";
@@ -30,10 +31,11 @@ export const GET = async () => {
   // 顺手保证自管目录存在：「AI 帮建」开对话要拿它当 cwd、不存在 agent 起不来
   const appSkillsDir = getAppSkillsDir();
   await fs.mkdir(appSkillsDir, { recursive: true }).catch(() => {});
-  const [skills, cursorGlobal, disabled] = await Promise.all([
+  const [skills, cursorGlobal, disabled, teamStates] = await Promise.all([
     listSkillsWithSource(),
     listCursorGlobalSkills(),
     readDisabledSkills(),
+    readTeamSkillStates(),
   ]);
   return NextResponse.json({
     ok: true,
@@ -42,13 +44,27 @@ export const GET = async () => {
       description: s.description,
       source: s.source,
       editable: s.editable,
-      // v1.1.x 可关：关掉的不注入 agent / 不进 slash 菜单（能力页开关切换）
-      enabled: !disabled.has(s.name),
+      // 启停三分：team = skill-states（enabled=已安装）；app 自管 = settings.disabledSkills；
+      // 内置 / 飞书 CLI = 必备只读、恒 true
+      enabled:
+        s.source === "team"
+          ? teamStates[s.name] !== "disabled"
+          : s.source === "app"
+            ? !disabled.has(s.name)
+            : true,
       // absPath 必须是真绝对路径——slash 引用把它发给服务端校验 + agent read 用
       //（v1.1.x 踩过：这里缩成 ~ 短路径、skills[].absPath 校验直接 400「必须是绝对路径」）
       absPath: s.absPath,
       // 展示用短路径（设置页列表 title）、跟数据路径分开
       displayPath: shortenHomePath(s.absPath),
+      // team 分组：shared:<cat> = clone skills/<cat>；其余 = knowledge/skills/<dir>
+      ...(s.teamCategory !== undefined
+        ? { teamCategory: s.teamCategory }
+        : {}),
+      // team 源：带 .flowship-action.json → 安装时顺带挂推进 action
+      ...(s.hasActionMarker ? { teamAction: true } : {}),
+      // team 源：创建人（共享库 git 首次引入者、小字展示）
+      ...(s.author ? { author: s.author } : {}),
     })),
     cursorGlobal,
     appSkillsDir,

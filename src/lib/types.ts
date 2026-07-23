@@ -159,6 +159,46 @@ export const USER_ROLE_LABEL: Record<UserRole, string> = {
   other: "其它",
 };
 
+/**
+ * 共享库角色分组展示名：USER_ROLE_LABEL + common=通用。
+ * 未知目录名原样显示（路径推导、不写死枚举）。
+ */
+export const TEAM_SHARED_CATEGORY_LABEL: Record<string, string> = {
+  ...USER_ROLE_LABEL,
+  common: "通用",
+};
+
+/** 共享库分类 → 中文；未知目录原样返回 */
+export const labelTeamSharedCategory = (cat: string): string =>
+  TEAM_SHARED_CATEGORY_LABEL[cat] ?? cat;
+
+/** teamCategory 是否为组内共享（`shared:<cat>`） */
+export const isSharedTeamCategory = (teamCategory?: string): boolean =>
+  typeof teamCategory === "string" && teamCategory.startsWith("shared:");
+
+/** 从 `shared:fe` 抽出 `fe`；非 shared 前缀返空串 */
+export const parseSharedCategory = (teamCategory: string): string =>
+  isSharedTeamCategory(teamCategory)
+    ? teamCategory.slice("shared:".length)
+    : "";
+
+/**
+ * team 来源分类 → Badge / 搜索小标签文案（Action 列表与 Skill 面板共用）。
+ * - shared:fe →「共享 · 前端」
+ * - global →「规范 · global」
+ * - 缺省 → emptyLabel（Action 派生行默认「共享」；Skill 搜索可传「规范 · unknown」）
+ */
+export const labelTeamCategoryBadge = (
+  teamCategory: string | undefined,
+  emptyLabel = "共享",
+): string => {
+  if (!teamCategory) return emptyLabel;
+  if (isSharedTeamCategory(teamCategory)) {
+    return `共享 · ${labelTeamSharedCategory(parseSharedCategory(teamCategory) || "common")}`;
+  }
+  return `规范 · ${teamCategory}`;
+};
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
@@ -210,8 +250,9 @@ export interface FeAiFlowSettings {
    */
   isolateWorktreeDefault?: boolean;
   /**
-   * v1.1.x：禁用的 skill 名单（按 skill name）。关掉的不注入 agent prompt、
-   * slash 菜单也不出——团队 skill 包装了一堆只想用两个的场景用。
+   * 禁用的 skill 名单（按 skill name）。**作用域仅 app 自管源**：
+   * team 源走 skill-states.json（安装/卸载、单一 owner = team-library 模块）；
+   * 内置 / 飞书 CLI 是必备只读、无启停。关掉的不注入 agent prompt、slash 菜单也不出。
    */
   disabledSkills?: string[];
   /**
@@ -245,6 +286,14 @@ export interface FeAiFlowSettings {
    * 与 feishuChatBridge 独立——桥接关时此项无运行时效果。
    */
   feishuBridgeStreaming?: boolean;
+  /**
+   * 团队规范总开关（Skills 区「团队规范」组头）= 一键隔离 wk 知识库那套。
+   * 默认 true：日常注入 `knowledge/skills/` + loadSkillsForTask 按仓匹配；
+   * 推进面板可出挂载 knowledge skill 的自定义 action。
+   * 显式 false → 跳过 knowledge（含自动匹配；直读不受影响）。
+   * 共享 skills/ 无总开关（市场模型、按 skill 安装/卸载）。
+   */
+  teamKnowledgeEnabled?: boolean;
 }
 
 /**
@@ -418,20 +467,19 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
 };
 
 /**
- * 自定义 action 定义（用户在 /actions 页建、存 dataRoot()/custom-actions/<id>/ACTION.md）
+ * 自定义 action 定义（用户在 /actions 页建）
  *
- * 瘦身后 = skill 挂载壳：内容全部住在 skill 里、ACTION.md 只剩执行参数（frontmatter-only）。
- * 运行时：一条 type="custom" 的 ActionRecord 用 customActionId 指向这里、
- * runner 读主 skill 的 SKILL.md 正文当 action prompt 注入。
+ * 存储收敛（2026-07-23）：action 与 skill 只保留一份、由 skill 托管。
+ * 自建 / 共享完全同构——skill 目录内 `.flowship-action.json` 为壳参数事实源，
+ * 推进入口全部实时派生：
+ *   - 自建：`<dataRoot>/skills/<name>/.flowship-action.json` → id=`app:<skill名>`、origin=`app-skill`
+ *   - 共享：team clone `skills/<cat>/<name>/.flowship-action.json` → id=`team:<skill名>`、origin=`team`
  *
- * 壳四字段：label / skill / output / placeholder（+ id / 时间戳由存储层管）。
- * - id：唯一（= 目录名）
- * - label：动作名（如「性能审计」、推进菜单 + timeline 展示）
- * - skill：主 skill 名（必填、prompt 注入其 SKILL.md 正文）
- * - output：本 action 的产出要求（可选、多行；属壳参数、不进 skill——skill 可拆卸复用）
- * - placeholder：推进弹窗输入框的提示文案（可选）
+ * 壳字段：label / output / placeholder / requiresKnowledge / order（+ exportedAt）。
+ * skill 名 = 目录名，不写进 json。
  *
- * 旧数据里残留的 summary / extraSkills / freshAgent 字段（壳瘦身前的配置）解析时直接忽略。
+ * 旧 `custom-actions/<id>/ACTION.md`：非 legacy 启动时迁进 skill json 后删除；
+ * legacy（playbook 正文）保留只读展示 + 转建。
  */
 export interface CustomActionDef {
   id: string;
@@ -442,19 +490,46 @@ export interface CustomActionDef {
   output?: string;
   placeholder?: string;
   /**
+   * 流程默认顺序（可选、写在 .flowship-action.json）。
+   * listCustomActions：有 order 的升序排前，无 order 的按 updatedAt 倒序排后。
+   * 与 settings.actionLayout.order（用户手拖）无关——客户端 sortByOrder 仍是「拖过的优先」。
+   */
+  order?: number;
+  /**
+   * 本 action 依赖团队规范知识库：teamKnowledgeEnabled 关时推进面板隐藏。
+   * 自建 / 共享同构（写在 .flowship-action.json）。
+   */
+  requiresKnowledge?: boolean;
+  /**
    * 旧格式残留（V0.9~v1.1 playbook 写在 ACTION.md 正文、无 skill 字段）：
    * 非空 = 该 action 已停用、只供能力页查看原文——不进推进列表、不注入运行。
-   * 用户把原内容建成 skill 后重新新建挂载。
    */
   legacyPlaybook?: string;
+  /**
+   * 派生来源：
+   * - app-skill = 自管 skill 目录 json 实时合成（id=app:<skill名>）
+   * - team = 已安装共享库 skill 实时合成（id=team:<skill名>）
+   * - 缺省 = 旧 custom-actions 残留（仅 legacy）
+   */
+  origin?: "app-skill" | "team";
+  /** 仅 origin=team：来源分组（shared:<cat> 或 knowledge 顶层目录名）、UI 显示分类 Badge */
+  teamCategory?: string;
+  /** 仅 origin=team：创建人（共享库 git 历史首次引入者、小字展示） */
+  author?: string;
   createdAt: number;
   updatedAt: number;
 }
 
-/** 新建 / 更新自定义 action 的入参（不含 id / 时间戳 / legacy 标记、那些由存储层管、前后端共用） */
+/** 新建 / 更新自定义 action 的入参（不含 id / 时间戳 / legacy·派生标记） */
 export type CustomActionInput = Omit<
   CustomActionDef,
-  "id" | "createdAt" | "updatedAt" | "legacyPlaybook"
+  | "id"
+  | "createdAt"
+  | "updatedAt"
+  | "legacyPlaybook"
+  | "origin"
+  | "teamCategory"
+  | "author"
 >;
 
 /**

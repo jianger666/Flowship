@@ -8,8 +8,9 @@
  * 上下文；会话断时服务端按 action 状态走唤醒 / 一次性临时 agent、客户端无感。
  *
  * v1.1.x 起视觉 / 交互统一走 <Composer>（chat 输入岛同款）：贴图 / 附文件目录 /
- * `/` 唤起 skill / `@` 引用文件 / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定）。
- * Cmd/Ctrl+J 聚焦。agent 正在跑时禁用；任务终态整条隐藏。
+ * `/` 唤起 skill / `@` 引用文件 / 顶边拖高；本文件只留业务态（发送通道 / 模型 / 禁用判定 /
+ * 运行中停止键）。Cmd/Ctrl+J 聚焦。agent 正在跑时禁用发送、右侧换成 Composer 同款停止键；
+ * 任务终态整条隐藏。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -35,17 +36,42 @@ interface Props {
   task: Task;
   // 提交成功后父组件用返回的最新 task 刷状态（running 态 UI 立即切）
   onTaskUpdate: (next: Task) => void;
+  // 运行中停止：与顶栏共用同一 stopTask 通道（父组件持 confirm + stopping 锁）
+  onStop?: () => void;
+  // 停止请求飞行中——Composer 红方块键 disabled、防双击
+  stopping?: boolean;
 }
 
-export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
+export const TaskTalkComposer = ({
+  task,
+  onTaskUpdate,
+  onStop,
+  stopping = false,
+}: Props) => {
   // 草稿：按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）、发送后清
   const [draft, setDraft] = useState(() => loadDraft("talk", task.id));
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
   // 显式指定的模型（id 空 = 跟随会话；选了 = 换这个模型处理本条消息）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
-  // 模型列表：打开选择器时按需拉（SWR 缓存、不重复打网络）
+  // 模型列表：挂载即拉（跟随会话文案要反查 displayName）；打开选择器时再兜底一次
   const { models, fetchModels } = useModels();
+  useEffect(() => {
+    const s = getSettings();
+    if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
+  }, [models.length, fetchModels]);
+
+  // 跟随态 trigger：带上会话实际模型名（task.model 快照）；未跑过 / 无模型时退回原占位
+  const followPlaceholder = useMemo(() => {
+    const id = task.model?.id?.trim();
+    if (!id) return "模型 · 跟随会话";
+    const m = models.find((x) => x.id === id);
+    const raw = m?.displayName;
+    // displayName 是图标 token 时退显 id（与 ModelSelect 同口径）
+    const name = !raw || /:icon-/.test(raw) ? id : raw;
+    return `${name} · 跟随会话`;
+  }, [task.model, models]);
+
   // 文件 / 目录路径附件（原生 picker、chat 输入岛同款 hook）
   const pathAttach = usePathAttach();
   const resetPaths = pathAttach.reset;
@@ -67,8 +93,9 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // agent 在跑时不可说；任务终态整条隐藏
-  const busy = submitting || task.runStatus === "running";
+  // agent 在跑时不可说（发送禁用）；运行中 Composer 右侧换成 spinner + 停止键（对齐 chat）
+  const isRunning = task.runStatus === "running";
+  const busy = submitting || isRunning;
 
   // `/` 唤起 skill：选中后补全成内联 `/name ` token（Codex 风、留在文本流里）
   const slash = useSlashSkills({
@@ -196,7 +223,7 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               onChange={setPickedModel}
               disabled={busy}
               variant="compact"
-              emptyPlaceholder="模型 · 跟随会话"
+              emptyPlaceholder={followPlaceholder}
               followOption="跟随会话"
               onOpenChange={(open) => {
                 if (!open) return;
@@ -206,6 +233,10 @@ export const TaskTalkComposer = ({ task, onTaskUpdate }: Props) => {
               }}
             />
           }
+          // 运行中：右侧动作组原地换成 spinner + 红停止键（Composer 同款、与 chat 对齐；无排队）
+          running={isRunning}
+          onStop={onStop}
+          stopping={stopping}
         />
       </div>
     </ComposerSessionProvider>

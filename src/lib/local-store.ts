@@ -53,6 +53,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   feishuChatBridge: false,
   feishuBridgeKeepAwake: true,
   feishuBridgeStreaming: true,
+  // 团队规范总开关：默认开（日常注入 knowledge）；显式 false 才关
+  teamKnowledgeEnabled: true,
 };
 
 /**
@@ -220,6 +222,8 @@ export const normalizeSettings = (
     feishuBridgeKeepAwake: parsed.feishuBridgeKeepAwake !== false,
     // 流式回复：缺省 / 非 false → true
     feishuBridgeStreaming: parsed.feishuBridgeStreaming !== false,
+    // 团队规范总开关：缺省 / 非 false → true（显式 false 才关）
+    teamKnowledgeEnabled: parsed.teamKnowledgeEnabled !== false,
   };
 };
 

@@ -598,11 +598,16 @@ export const buildFixBugInstruction = (opts: {
   return lines.join("\n");
 };
 
-/** 出厂预置「改bug」custom action id（装过一次记入 presets-installed，删了不重装） */
-export const BUILTIN_FIX_BUG_ACTION_ID = "builtin-fix-bug";
+/** 出厂预置「改bug」派生 action id（skill 托管后 = app:fix-bug） */
+export const BUILTIN_FIX_BUG_ACTION_ID = "app:fix-bug";
 export const BUILTIN_FIX_BUG_SKILL = "fix-bug";
 /** skill 预置记账 key（与 action 记账互相独立） */
 export const BUILTIN_FIX_BUG_SKILL_PRESET_ID = "builtin-fix-bug-skill";
+/**
+ * action 预置记账 key（历史写过 `builtin-fix-bug`；id 已改为 app:fix-bug，
+ * 记账仍用旧 key 防重复安装）。
+ */
+export const BUILTIN_FIX_BUG_ACTION_PRESET_ID = "builtin-fix-bug";
 // ----------------- 三期：注意力（角标同源未读 + 增量通知文案） -----------------
 
 /** 未读条目最小字段（diff / 通知文案用） */

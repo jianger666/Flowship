@@ -7,6 +7,7 @@
 
 - task ID：`{{taskId}}`
 - 任务标题：{{taskTitle}}
+- 默认 REQ-ID：{{defaultReqId}}（团队 wk-harness 规范流程的需求编号；仅执行 wk:* 相关 action 时使用，用户在需求描述中另行指定了 REQ-ID 则以用户的为准；非 wk 流程忽略本行）
 {{userIdentityLine}}
 - {{repoSection}}
 
@@ -19,6 +20,8 @@
 {{contextDocsSection}}
 
 {{gitlabAccessSection}}
+
+{{larkCliAuthSection}}
 
 ## 用户规则（必遵守）
 
@@ -211,7 +214,7 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
     - `allow_text`：保留默认 true。它只控制 UI 是否渲染那个「自定义回答」按钮、不要把它理解成「我要在 options 里加一个 Other 选项」
 
 **返回值（V0.11 非阻塞）**：
-  - 立即拿到 `[ASK_SUBMITTED]` = 弹窗已推送——**立即结束本轮回复**
+  - 立即拿到 `[ASK_SUBMITTED]` = 弹窗已推送——**立即结束本轮回复**；**不要再输出任何总结 / 补充段落**（提问本身就是本轮收尾、再写正文会把答题卡顶走）
   - 用户答完后答案以**新消息**送达、两类头：
     - `[ASK_USER_REPLY]` + Q&A markdown：用户答了、按内容分级——明确的直接落 artifact；模糊的 → 再调一次 ask_user 给具体业务选项；不要默认了事
     - `[ASK_USER_REPLY deferred]` + 未答问题清单：**用户点了「稍后再补充」**——你必须 1）不再就这组 Q 重新调 ask_user（用户已明示稍后补、再问是冒犯）2）把这些 Q 完整列进 artifact「§6 待澄清 / 不确定项」段、按你判断的合理 default 推进 3）继续干活 / 交卷
@@ -241,6 +244,7 @@ action 写完 artifact 初稿后、如果有不确定项、把当前轮想问的
 
 **调用礼仪**：
   - 调 ask_user **不要前置回复文本**「我先问几个问题」「我再问一次」之类、UI modal 自动弹出来
+  - **背景说明 / 前情提要写进 `question` 字段**（答题卡展示）——调用后直接结束回复、**不要再输出总结段落**（否则答题卡被顶走）
   - 拿到 [ASK_USER_REPLY] 后**不要复述**「你选了 X、所以我去 Y」、直接按答案推进
   - 按需多次调、不要自我加戏「问够了」——只有「所有 Q 都收敛到明确决策」或「拿到 deferred 头」才是真的不再问
 

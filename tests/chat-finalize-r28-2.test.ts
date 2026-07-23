@@ -6,6 +6,8 @@
  * ③ A reject 的 handleChatRunFailure × B 已注册 → 不写 error/idle
  * ④ reconnect preamble × B 已注册 → 不写「正在重连」
  * ⑤ 正常路径回归（A 是当前 instance → 收尾正常执行）
+ * ⑥ error 收尾保留落盘 sessionAgentId（内存会话关闭、runStatus=error）
+ * ⑦ stop/cancelled 收尾仍清落盘 sessionAgentId
  *
  * Mock 手法对齐 chat-runner-start-lease / reconnect-race（挂起 run + forceClear + failpoint）。
  */
@@ -50,12 +52,14 @@ vi.mock("@/lib/server/mcp-probe", () => ({
 }));
 vi.mock("@/lib/server/skills-loader", () => ({
   loadSkills: async () => [],
+  loadSkillsForTask: async () => [],
   renderSkillsForPrompt: () => "",
 }));
 
 const taskFsCore = await import("@/lib/server/task-fs-core");
 const { readEvents, readMetaV06, taskDir, writeMeta } = taskFsCore;
 const {
+  cancelChatRun,
   closeChatSessionUnconditional,
   forceClearChatRun,
   hasChatSession,
@@ -537,5 +541,92 @@ describe("R28-2 finalizeChatRunIfCurrent", () => {
       unsub();
     },
     15_000,
+  );
+
+  it(
+    "⑥ error 收尾：关内存会话但保留落盘 sessionAgentId（供下条 resume）",
+    async () => {
+      // 非可重试错 → 跳过 auto-reconnect，走 finalize error
+      const runA = {
+        stream: async function* (): AsyncGenerator<never> {
+          throw new Error(
+            "Model not available: claude-4.6-opus is not supported in your region",
+          );
+        },
+        wait: async () => ({ status: "finished" as const }),
+        cancel: vi.fn(),
+      };
+      mockCreate.mockResolvedValueOnce({
+        agentId: AGENT_A,
+        close: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockResolvedValue(runA),
+      });
+
+      await runChatSession({
+        task: asTask(makeMeta(TASK_ID)),
+        ...BOOT,
+        firstMessage: { text: "模型区域不可用" },
+      });
+
+      for (let i = 0; i < 80; i++) {
+        const m = await readMetaV06(TASK_ID);
+        if (m?.runStatus === "error") break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      // 等 fire-and-forget setTaskSessionAgentId 与条件清竞态收束
+      await new Promise((r) => setTimeout(r, 80));
+
+      const meta = await readMetaV06(TASK_ID);
+      expect(meta?.runStatus).toBe("error");
+      // 内存已关、落盘锚点仍在 → 下条消息可走模式 2 Agent.resume
+      expect(hasChatSession(TASK_ID)).toBe(false);
+      expect(meta?.sessionAgentId).toBe(AGENT_A);
+    },
+    20_000,
+  );
+
+  it(
+    "⑦ stop/cancelled 收尾：仍清落盘 sessionAgentId",
+    async () => {
+      const runA = makeControllableRun("cancelled");
+      mockCreate.mockResolvedValueOnce({
+        agentId: AGENT_A,
+        close: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockResolvedValue(runA),
+      });
+
+      const startA = runChatSession({
+        task: asTask(makeMeta(TASK_ID)),
+        ...BOOT,
+        firstMessage: { text: "用户停止" },
+      });
+
+      for (let i = 0; i < 80 && !isChatRunActive(TASK_ID); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(hasChatSession(TASK_ID)).toBe(true);
+      // 等 sessionAgentId 落盘（create 后 fire-and-forget）
+      for (let i = 0; i < 40; i++) {
+        const m = await readMetaV06(TASK_ID);
+        if (m?.sessionAgentId === AGENT_A) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect((await readMetaV06(TASK_ID))?.sessionAgentId).toBe(AGENT_A);
+
+      expect(cancelChatRun(TASK_ID)).toBe(true);
+      runA.resolveCancelled();
+      await startA;
+
+      for (let i = 0; i < 50; i++) {
+        const m = await readMetaV06(TASK_ID);
+        if (!m?.sessionAgentId && m?.runStatus === "idle") break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const meta = await readMetaV06(TASK_ID);
+      expect(meta?.runStatus).toBe("idle");
+      expect(hasChatSession(TASK_ID)).toBe(false);
+      expect(meta?.sessionAgentId).toBeUndefined();
+    },
+    20_000,
   );
 });

@@ -26,7 +26,6 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
-  Ban,
   ExternalLink,
   Flag,
   Loader2,
@@ -66,6 +65,7 @@ import { Separator } from "@/components/ui/separator";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
+import { findPendingAskEvent } from "@/lib/ask-pending";
 import { isEphemeralToolOutputDelta } from "@/lib/tool-display";
 
 import { getSettings } from "@/lib/local-store";
@@ -282,9 +282,13 @@ const TaskDetailPage = () => {
     // task 未加载完先等（不消费、下轮重试）
     if (!task) return;
     fixBugDeepLinkConsumedRef.current = token;
-    // 与「推进」按钮的 canAdvance 口径对齐：chat 模式 / running / 终态不开弹窗（深链不能绕过叠跑推进）
+    // 与「推进」按钮的 canAdvance 口径对齐：chat 模式 / running / 终态 / 等提问答案不开弹窗
+    //（深链不能绕过叠跑推进、也不能绕开未答的 ask）
+    const deepLinkAwaitingAsk =
+      task.runStatus === "awaiting_user" && !!findPendingAskEvent(task.events);
     const advanceable =
       task.mode !== "chat" &&
+      !deepLinkAwaitingAsk &&
       task.runStatus !== "running" &&
       task.repoStatus !== "merged" &&
       task.repoStatus !== "abandoned";
@@ -300,6 +304,8 @@ const TaskDetailPage = () => {
       setAdvanceDialogOpen(true);
     } else if (task.runStatus === "running") {
       toast.info("任务正在运行中，等它跑完再推进改bug");
+    } else if (deepLinkAwaitingAsk) {
+      toast.info("AI 在等你回答提问，先回复后再推进");
     } else if (task.mode !== "chat") {
       toast.info("任务已是终态（已合入 / 已放弃），恢复后才能推进");
     }
@@ -464,11 +470,18 @@ const TaskDetailPage = () => {
   // ---- 按钮渲染条件 ----
   // canAck 在上方 hooks 区 useMemo 算好（auto-close effect 也要用）
 
-  // 推进按钮：任务非终结态 + agent 不在跑代码
+  // AI 提问等答案中（未答 ask 且提问还有人接）：推进藏起来——此时推进会绕开答题打断
+  // 会话语境（agent 还在等答案）；用户先答题（或底部输入条说话）后按钮自然恢复。
+  // runStatus=error（提问已没人接）不拦、推进是恢复手段。
+  const awaitingAskAnswer =
+    task.runStatus === "awaiting_user" && !!findPendingAskEvent(task.events);
+
+  // 推进按钮：任务非终结态 + agent 不在跑代码 + 不在等提问答案
   //   - idle / error：没活 agent、推进会起新 Run
   //   - awaiting_user（含当前 action 等 ack 时）：去掉「通过」按钮后、推进会隐式认可当前 action、
   //     再走 submitNextAction 续接 / force-new 起新（V0.x 去掉了原先「先 ack 才解锁」的 !canAck 限制）
   const canAdvance =
+    !awaitingAskAnswer &&
     task.runStatus !== "running" &&
     task.repoStatus !== "merged" &&
     task.repoStatus !== "abandoned";
@@ -918,21 +931,18 @@ const TaskDetailPage = () => {
               </>
             )}
             {task.runStatus === "running" && !canAck && (
-              <>
-                {/* 只留 spinner 示意运行中（2026-07-21 用户拍板去掉「agent 正在跑 …」文字、顶栏减噪） */}
-                <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleStop}
-                  disabled={stopping}
-                  title="停止当前 action（中断 agent、可重新推进）"
-                  className="text-muted-foreground hover:text-destructive"
-                >
-                  {stopping ? <Loader2 className="animate-spin" /> : <Ban />}
-                  停止
-                </Button>
-              </>
+              // 转圈 +「停止」合体：运行中一体按钮、hover 变红；stopping 防双击
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleStop}
+                disabled={stopping}
+                title="停止当前 action（中断 agent、可重新推进）"
+                className="text-muted-foreground hover:text-destructive"
+              >
+                <Loader2 className="animate-spin" />
+                停止
+              </Button>
             )}
             {canReopen && (
               <Button
@@ -1067,7 +1077,12 @@ const TaskDetailPage = () => {
                 />
               </div>
               {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
-              <TaskTalkComposer task={task} onTaskUpdate={absorbTask} />
+              <TaskTalkComposer
+                task={task}
+                onTaskUpdate={absorbTask}
+                onStop={() => void handleStop()}
+                stopping={stopping}
+              />
             </aside>
           </ResizablePanel>
         </ResizablePanelGroup>

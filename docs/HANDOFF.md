@@ -281,6 +281,25 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 `src/lib/server/skills-loader.ts` 加载三源注入 prompt：平台自带 `<app>/skills/` + app 自管 `<dataRoot>/skills/` + 飞书 CLI `<dataRoot>/tools/skills/`。**不扫** `~/.cursor/skills/`（Cursor 全局只作能力页「从 Cursor 导入」源、拷成自管副本后才注入）。同名优先级：自管 > 平台 > 飞书 CLI。
 
+### 团队库（组共享库 + 知识库镜像、2026-07-22）
+
+一个 GitLab 仓（内置地址 `frontend/infra/ai-flow-action-hub`、`<dataRoot>/team-library.json` 可覆盖）作为团队 skill / action 分发中心，对用户无感：启动自动 clone/pull 到 `<dataRoot>/team-library/repo`。
+
+```
+ai-flow-action-hub/
+├─ skills/<角色分类>/<skill名>/SKILL.md [+ .flowship-action.json]  ← 组内沉淀（fe/be/qa/other/common）
+└─ knowledge/   ← 公司知识库 wk-knowledgebase 整库镜像（只读规范：43 工程档案 + 53 skill + 门禁脚本）
+```
+
+- **模块**：`team-library.ts`（sync / 上传 / 镜像 / 安装卸载，git 网络操作走 inline credential helper + env 传 token——不进命令行/config/FETCH_HEAD；对外错误统一 `redactGitText` 脱敏；`withTeamLibraryLock` 全局仓锁互斥）+ `team-skill-states.ts`（安装态存储、零依赖小模块）
+- **skills 第四源「team」**：loader 扫 clone 两目录注入；`knowledge/skills/**` 条目带 `kbRoot`（skill 内库相对路径的解析根）；同名优先级最低；`loadSkillsForTask(repoPaths)` 按任务仓 basename 强制注入命中的工程档案 skill（无视安装态）
+- **市场模型**：team skill = 安装/卸载（`skill-states.json`、单一 owner = team-library 模块，settings.disabledSkills 只管自管源）；**默认全量安装**（首次发现一律 enabled、用户不动 = 全都有）；用户改过的永不被默认策略覆盖
+- **共享 action 派生**：带 `.flowship-action.json` 的已安装 team skill 实时派生虚拟 CustomActionDef（id `team:<skill名>`、origin "team"），合成点在 custom-action-fs 读入口——安装/卸载一份状态、无第二份定义文件可撕裂；写入口对 `team:` id 防护（PATCH 拒绝、DELETE 转卸载）
+- **上传**：勾自管 skill → 选角色分类（默认 userRole）→ commit+push main；被保护分支拒 → 自动推临时分支 + GitLab REST 开 MR（pendingReview + mrUrl、maintainer 审批）
+- **知识库镜像**：`canMirror` 按 gitToken 对源仓的真实权限探测显隐；镜像 = 拉 wk-knowledgebase → 拷进 `knowledge/`（排除 codes/ 等）→ push；同事无源仓权限也能用全套规范
+- **开关**：仅「团队规范」保留总开关 `teamKnowledgeEnabled`（一键隔离 wk 套：skill 不注入 + 自动匹配停 + 推进面板隐藏相关 action）；共享无总开关；内置/飞书 CLI 无行开关（必备只读）
+- **UI**：能力页 Skills 区双栏（左 5 项来源导航 + 右列表：chip 分类过滤 / 搜索跨源平铺 / 市场行「安装/已安装+卸载」/ 组头挂同步·镜像·上传）；组件在 `skills-panel/`
+
 ### 并发所有权与消息投递协议（2026-07-19 收敛）
 
 > 21 轮 adversarial review（外部 AI 深审 + 生产链反例）后收敛的并发模型。核心原则：**一个 owner、一套状态迁移、状态类别不共用空值/计数器**。动这些模块前先读本节；改并发/竞态 bug 优先收敛模型、不打局部补丁（learned-conventions 有对应条目）。
@@ -301,19 +320,26 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-21 chat 消息流大重构（回复优先）+ 压缩改挂 SDK + 飞书完成通知（未发版）
+### 2026-07-23 首包可靠性 + REQ-ID 无感注入 + 收尾修理批（随 v1.4.0 发）
 
-- **chat 信息架构重构（`docs/CHAT-REDESIGN.md`）**：事件流从「run log 平铺」改「回复优先、过程按需」——turn 内 thinking / 工具 / 中间旁白收进「工作过程」折叠组（`chat-turns.ts` 纯函数分组 + `work-group.tsx`；running 自动展开、完成自动收起、手动优先），正文（turn 末段 assistant）全宽平铺 15px；running 时 Composer 上方粘性 shimmer 状态行（`deriveActiveStatus` + `active-status-line.tsx`）；info 细线化。分页 prepend 差值与 items 共用 `buildStreamItems` 管线（跨页组合并不跳滚动）。task(log) 形态零变化。
-- **砍自建上下文压缩、改挂 SDK 自带 summarization**：turn-ended usage 是 turn 内累计（官方确认不能当上下文大小、单 turn 实测 554 万 tokens）→ 26 万阈值频繁误触发。自动/手动 compact 全删（净 -1250 行）；`createSdkSummaryDeltaPublisher` 监听 `summary-completed` 落「SDK 已自动压缩」info。
-- **工具事件双写去重 + 子代理卡重做**：SDK 对长 args 工具（task/edit）双发 running → 同 callId 只落盘一条 + 渲染层去重兜底；task args 短字段前置 + 截断 2000（model 徽标不再被吃）；子代理卡升级紫轨渐变迷你卡、产出 markdown 渲染。
-- **飞书桥完成通知**：流式卡 finalize 后耗时 >30s 追发短文本（✅/🙋/❌）触发飞书推送——解决「切走后答完了不知道」（通知时机长在开始不在完成）。
-- 教训入 rules：并行子代理任务书必须禁 git stash/checkout（本批事故：子代理 stash 骚操作弄丢并行改动、靠上下文重建）。
+- **首包可靠性批（源起同事实测「task 发消息 10 分钟 AI 才动」）**：① SDK 全调用超时保护——新 `sdk-deadline.ts`（`withSdkDeadline`：create/resume 180s、send 120s；超时走既有错误/重连链、late 收尸 `reapLateSdkResult` 防「超时但实际成功」孤儿 agent）；② 假死 run 主动中止（`abortStuckRunForSend`：90s drain 失败先 cancel 再继续 send、instanceId CAS 强删）；③ 发送后进度可见（question/advance 受理即落「正在恢复会话/启动 agent/准备工作区…」info）；④ 依赖拷贝不挡首包（oneshot `skipDepClone`、正式路径 `deferDepClone` 后台补拷）。根因结论：最像 10 分钟的是「半死连接 + 裸 await 无超时（OS TCP 重传 10~15min）」、非依赖拷贝。
+- **P0 修复（终审 review 揪出、并发所有权族）**：假死恢复刻意保留 session 给后继复用、但旧 consume 退场时 `yieldIfSuperseded → closeMySession` 会把刚恢复成功的共享 session 一起关——收敛为「session 关闭只能由当前持有者执行」：表内 instance 仍被占用时只 cancel 自己的 run、禁止 close；三个清理入口（forceClearStaleRunnerState / abortStuckRunForSend / yieldIfSuperseded）所有权语义注释对齐。
+- **REQ-ID 无感注入（wk-harness 对接）**：`src/lib/req-id.ts` `deriveReqId(task)`——绑需求链接 → `REQ-<story号>`（复用 `extractFeishuStoryId`、跨人收敛到同一业务号）、否则 `REQ-TASK-<task尾段>`；`_super.md` 任务基本信息段注入「默认 REQ-ID」行（自解释措辞、非 wk 流程忽略、用户显式指定优先）。共享库 9 个 wk 壳同步：`.flowship-action.json` 加 `order`（10~90 流程序、`listCustomActions` 有 order 排前）+ placeholder 去 REQ-ID 提示 + SKILL.md「REQ-ID 优先取上下文默认」（action-hub commit ed3b8f7）。
+- **事件流本地图片终修**：真根因是 Streamdown 默认 rehype-sanitize 把 `file://`/绝对路径 img src 剥掉——新 `rehypeRewriteLocalImages`（sanitize **前**改写到 `/api/local-image`）+ `STREAMDOWN_REHYPE_PLUGINS` 三处共用（markdown-text / artifact-panel / artifact-revision-view）。
+- **完整输出加载失败修复**：子代理工具 callId 含换行、落盘名已消毒但 route 用原始 callId 过 `isSafeId` 直接 400——route 先消毒再校验、前端改传 fullPath basename、404 文案降级。
+- **交互修理**：ask_user「提问即收尾」双指令源（chat-mcp describe + `_super.md`：背景写进 question 字段、调用后不再输出总结段落防答题卡被顶走）；task 停止键下移输入条（chat 同款）+ 顶栏转圈/停止合一（hover 变红）；推进按钮 pending-ask 时拦截；模型选择器跟随态显示实际模型名；MCP 计数改有效交集（修 `-1/8`）；重复创建 action 返 409（`CustomActionFsError.code` 替代文案子串）；首启迁移与预置安装串行化；lark-cli 身份缺失主动引导登录（`buildLarkCliAuthMissingRule`）。
+- **SDK 1.0.23 → 1.0.24**；两轮发版前全量 review（96 文件 +4244/-1754）扫出 1 P0 + 3 P1 全修复。
 
-### 2026-07-19 并发收敛重构（chat 打磨验收链完结、未发版）
+### 2026-07-22 团队库（组共享库 + 知识库镜像 + 市场模型）（随 v1.4.0 发）
 
-- **背景**：chat 打磨批次的验收由外部 AI 连审 21 轮、每轮 4-12 个并发/竞态 P1——根因是任务启动/接管、消息受理、删除证据、client 状态各自没有单一 owner 状态机、局部补丁组合爆炸。用户拍板停止打补丁、做收敛重构。
-- **落地**：见「当前架构快照 → 并发所有权与消息投递协议」一节（7 层协议：TaskOpHandle / MessageOperation aggregate / 共享 wire schema / 删除三态 / client 三轴格 join / watch 双计数 + established epoch / failpoint 测试法）。
-- **验收**：终轮生产链探针全部反转、蓝军证伪通过；门禁 typecheck / lint 0 warning / **全量 113 文件 1019 项测试全绿** / build。review 过程文档已清理、注释已脱敏（轮次编号全部改为自解释描述）。
+- **背景**：用户下周部门分享、定位转向「推进式 AI 工作方式」；部门领导已有一套 harness（wk-knowledgebase：43 工程知识档案 + 53 个 Codex skill + wk:* 指令流 + python 门禁），Flowship 定位其「驾驶舱」。当天一整天与用户多轮拍板迭代出最终形态（详见「当前架构快照 → 团队库」节）。
+- **落地主链**：`team-library.ts`（clone/sync/上传/镜像/安装卸载、全局仓锁）+ `team-skill-states.ts`（安装态单一 owner 存储）+ skills-loader 第四源「team」（kbRoot 注入）+ custom-action-fs 派生共享 action（`team:<skill名>` 虚拟 def、写入口防护）+ 能力页 Skills 区双栏重构（5 项来源导航 + chip 分类过滤 + 搜索 + 市场行）+ 上传/安装 dialog 产品化（角色分类默认 userRole）。
+- **当天关键拍板**（时序）：整库挂载替代单 skill 拉取（KB_ROOT 断链问题）→ 共享库对用户无感（地址内置、启动自动 sync）→ 知识库镜像解决同事无权限 → 上传被保护分支拒自动降级开 MR → 双库合一仓（action-hub：skills/ 角色分组 + knowledge/ 镜像）→ 开关模型三迭代（单总开关 → 双开关 → 市场安装/卸载 + 仅团队规范保留总开关）→ 内置/飞书 CLI 去开关（必备只读、disabledSkills 缩域到自管）→ 共享 action 派生化（消灭双份状态）→ **全量默认安装**（用户不动 = 全都有、对齐 Codex 心智、实测 ≈1.5 万 tokens 可接受）。
+- **蓝军 review 一轮 12 项修复**：git 报错 token 脱敏（redactGitText）、认证改 inline credential helper + env（token 不进命令行/config/FETCH_HEAD）、settings 写穿防护、全局仓锁互斥、push 拒绝分类收窄、镜像大 push postBuffer 等。
+- **收尾三件**（UI/展示）：共享来源的卸载按钮统一 PackageMinus（垃圾桶只给自建删除）；派生 team action 行加只读查看（`team-action-view-dialog.tsx`、Action 列表与安装 dialog 共用）；team skill / 派生 action 显示创建人（`team-skill-authors.ts`——共享库 git 历史首次引入 SKILL.md 的 author、HEAD 级 globalThis 缓存一次全量扫描）。
+- **P0 实测教训**：team skill 禁用名单曾写进 settings.disabledSkills——client 设置保存链整写 config 把 server 追加的名单冲掉（两 writer 抢一字段）→ 收敛为独立存储 skill-states.json 单一 owner（呼应 07-19 所有权协议）。
+- 远端仓：`frontend/infra/ai-flow-action-hub`（全组 63 人成员）；已推 9 个 wk:* action 壳（skills/common/）+ 知识库全量镜像（knowledge/、5.2M）。分享飞书文档：`docs/sharing-20260723.md`（含 Demo 脚本、延期至下周）。
+
 
 ## 关键文件索引
 
@@ -335,6 +361,7 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 | **GitLab REST client（V0.6.1 新、V0.6.8 加 closeOpenMR 关被取代的旧 MR）** | `src/lib/server/gitlab-client.ts` |
 | **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
 | **任务 worktree 隔离（V0.10：ensure/remove/孤儿扫描/getTaskCwd/路径归一）** | `src/lib/server/task-worktrees.ts` + `tests/task-worktrees{,.integration}.test.ts` |
+| **团队库（2026-07-22：组共享库 clone/sync/上传/镜像/市场安装卸载 + 安装态存储 + 派生共享 action + 双栏 UI）** | `src/lib/server/{team-library,team-skill-states}.ts` + `src/app/api/team-library/**` + `src/components/settings/skills-panel/*` + `src/components/custom-actions/install-team-actions.tsx` + `src/hooks/use-team-library.ts` + `tests/{team-library,skills-loader-team}.test.ts` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |
 | **Cursor MCP 只读 API + hook（V0.6.2 新）** | `src/app/api/cursor-mcp/route.ts` + `src/hooks/use-cursor-mcp.ts` |
 | **MCP OAuth（V0.6.4 新、走 OAuth 的远程 MCP 授权 + 注入）** | `src/lib/server/mcp-oauth.ts` + `src/app/api/mcp-oauth/{start,callback,status,revoke}` + `src/hooks/use-mcp-oauth.ts` |

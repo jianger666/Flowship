@@ -225,6 +225,18 @@
   background: transparent;
 }
 
+/* ---------- 滚动条布局抖动全局治理（2026-07-23、用户实测「切 tab 页面抖」） ----------
+   我们的自定义滚动条是 classic 模式（占 8px 布局宽度）：内容高度跨页面/tab 变化时
+   滚动条出现/消失会挤压内容宽度 → 整页横向抖动。
+   治理机制：把 scrollbar-gutter: stable 挂在 Tailwind 滚动工具类本身——凡是用
+   `overflow-y-auto` / `overflow-auto` 的容器（现有 + 将来新增）都自动预留滚动条槽位、
+   宽度恒定，不需要每处手动加、也不会有新滚动容器漏治理。
+   （不能用 `*` 全局设：overflow-hidden 容器也会被预留槽、白吃 8px。） */
+.overflow-y-auto,
+.overflow-auto {
+  scrollbar-gutter: stable;
+}
+
 /* ---------- Streamdown 代码块 / 表格减重（v1.0.x、用户实测「双层卡片 + 操作栏太重」） ----------
    Streamdown 默认给代码块 / 表格 / mermaid 套「外层 rounded-xl border bg-sidebar p-2 +
    内层再一圈 border」的双层卡片、外加 my-4 大间距——聊天密度下视觉过重。

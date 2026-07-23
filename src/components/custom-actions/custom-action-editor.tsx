@@ -3,8 +3,8 @@
 /**
  * 自定义 action 编辑器（新建 / 编辑共用 Dialog）
  *
- * 瘦身后 = skill 挂载壳：动作名 + 主 skill 下拉 + 产出要求 + placeholder。
- * 内容创作走 Skill tab；这里只把已有 skill 挂到推进面板上跑。
+ * skill 托管收敛后：编辑对象 = 自管 skill 的壳参数（.flowship-action.json）。
+ * 新建 = 选一个尚无壳的自管 skill 挂推进入口；编辑时 skill 锁定不可改。
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -31,6 +31,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   createCustomActionReq,
+  fetchCustomActions,
   fetchSkills,
   updateCustomActionReq,
   type SkillOption,
@@ -66,6 +67,10 @@ export const CustomActionEditor = ({
   const [draft, setDraft] = useState<CustomActionInput>(emptyDraft);
   // 可勾选的 skill 列表（打开时拉一次、只含 enabled）
   const [skillOptions, setSkillOptions] = useState<SkillOption[]>([]);
+  // 已有推进入口的 skill 名（新建时过滤掉，1:1）
+  const [skillsWithShell, setSkillsWithShell] = useState<Set<string>>(
+    () => new Set(),
+  );
   // 保存中（防双击）
   const [saving, setSaving] = useState(false);
 
@@ -84,13 +89,24 @@ export const CustomActionEditor = ({
     );
   }, [open, editing]);
 
-  // 打开时拉一次可用 skill（失败 toast、不阻塞编辑）
+  // 打开时拉可用 skill + 已挂壳名单
   useEffect(() => {
     if (!open) return;
     let alive = true;
-    fetchSkills()
-      .then((s) => {
-        if (alive) setSkillOptions(s);
+    void Promise.all([
+      fetchSkills(),
+      fetchCustomActions().catch(() => [] as CustomActionDef[]),
+    ])
+      .then(([skills, actions]) => {
+        if (!alive) return;
+        setSkillOptions(skills);
+        setSkillsWithShell(
+          new Set(
+            actions
+              .filter((a) => !a.legacyPlaybook && a.skill)
+              .map((a) => a.skill),
+          ),
+        );
       })
       .catch((err) =>
         toast.error(
@@ -105,21 +121,24 @@ export const CustomActionEditor = ({
   const patch = (p: Partial<CustomActionInput>) =>
     setDraft((d) => ({ ...d, ...p }));
 
-  // 主 skill 下拉：已选但不在 enabled 列表里的（被关 / 删了）合成一项、避免 Select 空白
+  // 新建：只列尚无壳的自管 skill；编辑：锁定当前 skill（可合成缺失项）
   const mainSkillOptions = useMemo<EditorSkillOption[]>(() => {
-    const known = new Set(skillOptions.map((s) => s.name));
-    if (draft.skill && !known.has(draft.skill)) {
-      return [
-        {
-          name: draft.skill,
-          description: "本机未找到或已停用",
-          missing: true,
-        },
-        ...skillOptions,
-      ];
+    if (editing) {
+      const known = new Set(skillOptions.map((s) => s.name));
+      if (draft.skill && !known.has(draft.skill)) {
+        return [
+          {
+            name: draft.skill,
+            description: "本机未找到或已停用",
+            missing: true,
+          },
+          ...skillOptions,
+        ];
+      }
+      return skillOptions;
     }
-    return skillOptions;
-  }, [skillOptions, draft.skill]);
+    return skillOptions.filter((s) => !skillsWithShell.has(s.name));
+  }, [skillOptions, skillsWithShell, editing, draft.skill]);
 
   const handleSave = async () => {
     if (!draft.label.trim()) {
@@ -132,10 +151,17 @@ export const CustomActionEditor = ({
     }
     setSaving(true);
     try {
+      // 不写 requiresKnowledge：概念已从 UI 隐藏；编辑时保留磁盘既有值（API 未传则不改）
+      const payload: CustomActionInput = {
+        label: draft.label,
+        skill: draft.skill,
+        output: draft.output,
+        placeholder: draft.placeholder,
+      };
       const saved = editing
-        ? await updateCustomActionReq(editing.id, draft)
-        : await createCustomActionReq(draft);
-      toast.success(editing ? "已保存" : "已创建");
+        ? await updateCustomActionReq(editing.id, payload)
+        : await createCustomActionReq(payload);
+      // 成功：弹窗关 + 列表刷新自表达，不 toast
       onSaved(saved);
       onOpenChange(false);
     } catch (err) {
@@ -150,10 +176,12 @@ export const CustomActionEditor = ({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
-            {editing ? "编辑自定义 Action" : "新建自定义 Action"}
+            {editing ? "编辑推进入口" : "新建推进入口"}
           </DialogTitle>
           <DialogDescription>
-            把某个 skill 挂到任务推进链上跑
+            {editing
+              ? "改壳参数；skill 内容请去 Skill tab 编辑"
+              : "选一个自管 skill 挂到推进面板"}
           </DialogDescription>
         </DialogHeader>
 
@@ -170,19 +198,24 @@ export const CustomActionEditor = ({
 
           <div className="grid gap-1.5">
             <Label>主 skill</Label>
-            {/* 用户纠偏：skill = 纯方法论可拆卸；产出要求属壳参数 */}
-            <p className="text-xs text-muted-foreground">
-              做什么写在 skill 里；这次要产出什么写在下面（可选）
-            </p>
             <Select
               value={draft.skill || undefined}
+              disabled={!!editing}
               onValueChange={(v) => {
                 if (v == null) return;
                 patch({ skill: v });
               }}
             >
               <SelectTrigger className="w-full">
-                <SelectValue placeholder="选一个 skill 作为执行内容">
+                <SelectValue
+                  placeholder={
+                    editing
+                      ? draft.skill
+                      : mainSkillOptions.length === 0
+                        ? "没有可挂的 skill（先去 Skill tab 创建）"
+                        : "选一个 skill"
+                  }
+                >
                   {draft.skill
                     ? mainSkillOptions.find((s) => s.name === draft.skill)
                         ?.name ?? draft.skill
@@ -192,7 +225,6 @@ export const CustomActionEditor = ({
               <SelectContent>
                 {mainSkillOptions.map((s) => (
                   <SelectItem key={s.name} value={s.name}>
-                    {/* 两行条目：外层 min-w-0 保证选中底色内描述可截断、不与左侧勾重叠 */}
                     <span className="flex min-w-0 flex-col items-start gap-0.5">
                       <span
                         className={cn(
@@ -234,6 +266,7 @@ export const CustomActionEditor = ({
               placeholder="推进选中这个 action 时、告诉使用者该填什么"
             />
           </div>
+
         </div>
 
         <DialogFooter>

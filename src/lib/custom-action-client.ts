@@ -52,7 +52,8 @@ export const updateCustomActionReq = async (
   id: string,
   patch: Partial<CustomActionInput>,
 ): Promise<CustomActionDef> => {
-  const res = await fetch(`/api/custom-actions/${id}`, {
+  // id 可能含 `team:` 等特殊字符，必须 encode 再拼 URL
+  const res = await fetch(`/api/custom-actions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
@@ -61,8 +62,15 @@ export const updateCustomActionReq = async (
   return action;
 };
 
-export const deleteCustomActionReq = async (id: string): Promise<void> => {
-  const res = await fetch(`/api/custom-actions/${id}`, { method: "DELETE" });
+export const deleteCustomActionReq = async (
+  id: string,
+  opts?: { withSkill?: boolean },
+): Promise<void> => {
+  const qs = opts?.withSkill ? "?withSkill=1" : "";
+  const res = await fetch(
+    `/api/custom-actions/${encodeURIComponent(id)}${qs}`,
+    { method: "DELETE" },
+  );
   await handleJson<{ ok: true }>(res);
 };
 

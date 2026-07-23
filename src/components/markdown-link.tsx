@@ -16,6 +16,7 @@
 import type { AnchorHTMLAttributes } from "react";
 
 import { useImagePreview } from "@/components/ui/image-preview";
+import { toLoadableImageSrc } from "@/lib/local-image-src";
 
 const CLICKABLE = /^https?:\/\//;
 // 本地绝对路径（POSIX / Windows 盘符、含 file:// 前缀）+ 图片扩展名
@@ -31,13 +32,12 @@ export const MarkdownLink = ({
   void node;
   const { open } = useImagePreview();
   if (href && LOCAL_IMAGE.test(href)) {
-    const p = href.startsWith("file://") ? href.slice("file://".length) : href;
-    const src = `/api/local-image?path=${encodeURIComponent(p)}`;
+    const src = toLoadableImageSrc(href);
     return (
       <button
         type="button"
-        onClick={() => open([{ src, alt: p }])}
-        title={`预览图片：${p}`}
+        onClick={() => open([{ src, alt: href }])}
+        title={`预览图片：${href}`}
         className="cursor-zoom-in font-mono text-[0.9em] text-primary underline-offset-2 hover:underline"
       >
         {children}

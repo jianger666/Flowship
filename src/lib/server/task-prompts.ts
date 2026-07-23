@@ -23,6 +23,7 @@ import { renderContextDocsSection } from "./context-docs-prompt";
 import { turnDisciplineSection } from "./turn-discipline";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { formatRepoSectionForPrompt } from "@/lib/path-utils";
+import { deriveReqId } from "@/lib/req-id";
 import {
   getTaskCwd,
   getTaskWorkRepoPaths,
@@ -69,7 +70,8 @@ const NULL_PLACEHOLDER = "（未提供）";
 
 /**
  * 运行时注入「GitLab 访问」说明（settings 配了 gitToken 才注入）。
- * host 空时用「（host 见仓库 origin）」兜底；顺带钉死内置飞书 CLI 勿预检 auth。
+ * host 空时用「（host 见仓库 origin）」兜底；顺带钉死内置飞书 CLI 路径。
+ * lark-cli 身份缺失规则见 buildLarkCliAuthMissingRule（task/chat 常驻注入、不绑 gitToken）。
  */
 export const buildGitlabAccessDirective = (
   gitHost: string | null | undefined,
@@ -86,9 +88,20 @@ export const buildGitlabAccessDirective = (
   return [
     "## GitLab 访问",
     `- 系统已配置 GitLab（host: ${host}）；API 凭证在 \`${dataRootPath}/config.json\` 的 **gitToken 字段**（PRIVATE-TOKEN header）——用 jq/node 只取该字段、**不要 cat 整个文件**（里面还有其它密钥）。`,
-    `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 已安装已登录（在 \`${toolsBin}\`）——shell 直调 \`meegle\` 报 command not found 就用该目录下的绝对路径、不要去别处找；不要先跑 auth status 探测。`,
+    `- 读操作（查 MR / diff / pipeline）随便用；写操作只做任务明确要求的；绝不 merge MR / 删远程分支。内置 meegle / lark-cli 在 \`${toolsBin}\`——shell 直调报 command not found 就用该目录绝对路径、不要去别处找；不必预先跑 auth status 探测。`,
   ].join("\n");
 };
+
+/**
+ * lark-cli 遇身份缺失时的产品规则（精炼、不写教程；split-flow 细节见注入的 lark-shared skill）。
+ * task / chat 常驻注入——不依赖 gitToken。
+ */
+export const buildLarkCliAuthMissingRule = (): string =>
+  [
+    "## 飞书 CLI（lark-cli）登录兜底",
+    `- **身份缺失**（auth status / 业务命令报 identity missing / 未登录）：主动告知用户，并询问是否代为执行登录；用户同意后再走 split-flow（\`auth login --no-wait --json\` → 把 verification_url + 二维码图贴进回复 → 等用户说完成后再 \`--device-code\` 收尾）。`,
+  ].join("\n");
+
 
 // ----------------- prompt 模板渲染 -----------------
 
@@ -253,6 +266,10 @@ export const buildSuperPrompt = async (
    * 空串 = 整段不注入（renderSuperPromptTemplate 保留字面空）。
    */
   gitlabAccessSection = "",
+  /**
+   * lark-cli 身份缺失登录兜底（常驻；调用方用 buildLarkCliAuthMissingRule）。
+   */
+  larkCliAuthSection = "",
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -276,6 +293,8 @@ export const buildSuperPrompt = async (
   return renderSuperPromptTemplate(template, {
     taskId: task.id,
     taskTitle: task.title,
+    // 默认 REQ-ID：绑飞书 story → REQ-<id>；否则 REQ-TASK-<id 末段>；全 task 统一注入
+    defaultReqId: deriveReqId(task),
     // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
     userIdentityLine,
     repoSection: renderRepoSection(task),
@@ -286,6 +305,7 @@ export const buildSuperPrompt = async (
       "→ 没有上下文文档时、按 action 内容判断要不要主动调 MCP / read / grep 摸资料。",
     ),
     gitlabAccessSection,
+    larkCliAuthSection,
     rulesSection,
     skillsSection: renderSkillsForPrompt(skills),
     eventsLogPath: getEventsLogPath(task.id),

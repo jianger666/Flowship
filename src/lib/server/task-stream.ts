@@ -628,12 +628,21 @@ export const waitForTaskToStop = async (
  * 仍删 forkPendingTasks——强清的调用方（advance 等满 5s）紧接着起 B，
  * 「B 等 A」标记语义已耗尽。旧 A 迟到收尾不再依赖 fork 标记识别后继，
  * 改靠 RunningTaskRecord.instanceId 门控（见 consumeSessionRun）。
+ *
+ * ## Session 所有权协议（与 abortStuckRunForSend / closeMySession 对照）
+ * - **forceClear**：主动换主——runner + session 一起清，关会话是本函数职责
+ *   （后继会建新 session / 新 instanceId）。
+ * - **abortStuckRunForSend**：假死恢复——只 CAS 删 stuck runner，**刻意保留 session**
+ *   给后继 send 复用；关会话不归它。
+ * - **被 supersede 的旧 consume**：只 cancel 自己的 run；若表内 session instance
+ *   仍是入场记下的那份，禁止 close（会话已交给 / 留给后继持有者）。
+ * 铁律：session 的关闭只能由当前持有者执行；完成信号只能由最终提交者发出。
  */
 export const forceClearStaleRunnerState = (taskId: string): void => {
   runningTasks.delete(taskId);
   forkPendingTasks.delete(taskId);
   pendingStopRequests.delete(taskId);
-  // V0.11：连会话一起强清（agent close 尽力而为）
+  // V0.11：连会话一起强清（agent close 尽力而为）——主动换主场景
   const session = agentSessions.get(taskId);
   if (session) {
     agentSessions.delete(taskId);

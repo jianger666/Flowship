@@ -28,6 +28,37 @@ export const usableCustomActions = (
   defs: CustomActionDef[],
 ): CustomActionDef[] => defs.filter((d) => !d.legacyPlaybook);
 
+/**
+ * 推进面板：主 skill 为自管源且已关闭 → 对应自建 action 隐藏（开回来即恢复）。
+ * 只拦面板入口；运行时 findSkillByName 直读不过滤（历史任务重启不炸）。
+ * team 派生 action 不动（走 skill-states 安装态）。
+ * origin=app-skill / 缺省（旧残留）都按 skill 名查禁用表。
+ */
+export const filterAdvanceByDisabledAppSkills = (
+  defs: CustomActionDef[],
+  disabledAppSkillNames: ReadonlySet<string>,
+): CustomActionDef[] => {
+  if (disabledAppSkillNames.size === 0) return defs;
+  return defs.filter((d) => {
+    if (d.origin === "team") return true;
+    const skill = d.skill?.trim();
+    if (!skill) return true;
+    return !disabledAppSkillNames.has(skill);
+  });
+};
+
+/**
+ * 团队规范总开关关时：隐藏 requiresKnowledge=true 的派生 action（app / team 同构）。
+ * enabled=true → 原样；仅严格 true 才藏（缺省 / false 都保留）。
+ */
+export const filterAdvanceByRequiresKnowledge = (
+  defs: CustomActionDef[],
+  teamKnowledgeEnabled: boolean,
+): CustomActionDef[] => {
+  if (teamKnowledgeEnabled) return defs;
+  return defs.filter((d) => d.requiresKnowledge !== true);
+};
+
 // key 是不是内置推进 action——混排列表里区分内置 / 自定义（自定义 key 是 custom id）
 export const isBuiltinAdvanceAction = (
   key: string,

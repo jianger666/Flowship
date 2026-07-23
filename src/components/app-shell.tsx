@@ -106,6 +106,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
         <main
           ref={mainRef}
           onScroll={handleMainScroll}
+          // 滚动条槽位预留（防切页/切 tab 抖动）由 globals.css 对 .overflow-y-auto 全局治理
           className="min-w-0 flex-1 overflow-y-auto"
         >
           {children}

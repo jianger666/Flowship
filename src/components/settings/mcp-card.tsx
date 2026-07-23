@@ -15,11 +15,9 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
-  Pencil,
   Plus,
   RefreshCw,
   ShieldCheck,
-  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import type { McpServerConfig } from "@cursor/sdk";
@@ -207,24 +205,22 @@ export const McpCard = ({
                         授权
                       </Button>
                     ))}
+                  {/* 行操作：常驻文字按钮（与能力页 Skill/Action 统一） */}
                   <Button
-                    size="icon-xs"
+                    size="sm"
                     variant="ghost"
-                    aria-label={`编辑 ${name}`}
-                    title="编辑"
+                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground"
                     onClick={() => setEditing({ name })}
                   >
-                    <Pencil />
+                    编辑
                   </Button>
                   <Button
-                    size="icon-xs"
+                    size="sm"
                     variant="ghost"
-                    aria-label={`删除 ${name}`}
-                    title="删除"
-                    className="text-muted-foreground hover:text-destructive"
+                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-destructive"
                     onClick={() => void handleDelete(name)}
                   >
-                    <Trash2 />
+                    删除
                   </Button>
                   {/* 常用开关：关 = 进新任务默认黑名单（跟原「常用 MCP」区同语义） */}
                   <Switch

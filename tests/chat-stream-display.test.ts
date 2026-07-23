@@ -11,6 +11,7 @@ import {
   USER_MSG_COLLAPSE_LINES,
   extractActiveBootStage,
   isBootStageInfo,
+  resolveStickyTurn,
   shouldCollapseUserMessage,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
@@ -94,6 +95,39 @@ describe("shouldShowTurnDivider（每轮分割线）", () => {
   it("此前只有 __work_group__（正文被吸组）→ 画", () => {
     const kinds = ["user_reply", "__work_group__", "user_reply"];
     expect(shouldShowTurnDivider(kinds, 2)).toBe(true);
+  });
+});
+
+describe("resolveStickyTurn（粘顶轮次头）", () => {
+  const items = [
+    { id: "u1", kind: "user_reply", text: "问题一" },
+    { id: "a1", kind: "assistant_message", text: "回答一" },
+    { id: "u2", kind: "user_reply", text: "问题二" },
+    { id: "g1", kind: "__work_group__" },
+    { id: "a2", kind: "assistant_message", text: "回答二" },
+  ];
+
+  it("视口顶正好是 user_reply → 不粘（自身还看得见）", () => {
+    expect(resolveStickyTurn(items, 0)).toBeNull();
+    expect(resolveStickyTurn(items, 2)).toBeNull();
+  });
+
+  it("滚过 user_reply 落到其后的回答/工作组 → 粘那条问题", () => {
+    expect(resolveStickyTurn(items, 1)).toEqual({ id: "u1", text: "问题一" });
+    expect(resolveStickyTurn(items, 3)).toEqual({ id: "u2", text: "问题二" });
+    expect(resolveStickyTurn(items, 4)).toEqual({ id: "u2", text: "问题二" });
+  });
+
+  it("空列表 / 负下标 → null", () => {
+    expect(resolveStickyTurn([], 0)).toBeNull();
+    expect(resolveStickyTurn(items, -1)).toBeNull();
+  });
+
+  it("边界来回翻（localIdx 在 user_reply 与下一项之间）结果应稳定可判定", () => {
+    // 防回归：旧实现在这两态之间 setState → Virtuoso 重渲 → startIndex 振荡
+    expect(resolveStickyTurn(items, 2)).toBeNull();
+    expect(resolveStickyTurn(items, 3)?.id).toBe("u2");
+    expect(resolveStickyTurn(items, 2)).toBeNull();
   });
 });
 

@@ -427,6 +427,17 @@ export interface EnsureWorktreesResult {
 }
 
 /**
+ * ensure 可选策略：
+ * - skipDepClone：纯答疑 oneshot——目录就绪即可、不挡首包
+ * - deferDepClone：正式启动——worktree/分支先就绪，依赖拷贝交给
+ *   {@link cloneMissingTaskDepDirs} 后台跑（与 Agent.create 重叠）
+ */
+export interface EnsureWorktreesOptions {
+  skipDepClone?: boolean;
+  deferDepClone?: boolean;
+}
+
+/**
  * 确保本 task 每个仓的 worktree 都存在且检出了任务分支（幂等、可反复调）。
  *
  * 单仓流程：
@@ -449,6 +460,7 @@ export interface EnsureWorktreesResult {
 export const ensureTaskWorktrees = async (
   task: Task,
   lease: () => boolean,
+  opts?: EnsureWorktreesOptions,
 ): Promise<EnsureWorktreesResult> => {
   // join 超时后的 quarantine 挡住后继——旧慢清理未退前不得复用同路径
   if (isWorkspaceQuarantined(task.id)) {
@@ -487,7 +499,45 @@ export const ensureTaskWorktrees = async (
       lease,
       entryHandle,
       job,
+      // skip / defer 都跳过同步 clone；defer 由 caller 调 cloneMissingTaskDepDirs 后台补
+      skipDepClone: !!(opts?.skipDepClone || opts?.deferDepClone),
     });
+  } finally {
+    endResourceJob(job);
+  }
+};
+
+/**
+ * 后台补齐 worktree 里缺失的依赖目录（与 Agent.create 重叠用）。
+ * 幂等：目标已存在则跳过；无缺失时秒过返空。lease 失效抛 WorktreeLeaseLostError。
+ */
+export const cloneMissingTaskDepDirs = async (
+  task: Task,
+  lease: () => boolean,
+): Promise<{ repoPath: string; dirs: string[] }[]> => {
+  if (isWorkspaceQuarantined(task.id)) {
+    throw new WorktreeLeaseLostError(
+      "workspace 仍在 quarantine（旧资源事务未退）、拒绝依赖克隆",
+    );
+  }
+  if (!isWorktreeTask(task)) return [];
+  const job = beginResourceJob(task.id);
+  const clonedDeps: { repoPath: string; dirs: string[] }[] = [];
+  try {
+    const assertLease = (): void => {
+      if (!lease()) throw new WorktreeLeaseLostError();
+    };
+    const workPaths = getTaskWorkRepoPaths(task);
+    for (let i = 0; i < task.repoPaths.length; i++) {
+      const repoPath = task.repoPaths[i];
+      const workDir = workPaths[i];
+      if (skipsWorktreeIsolation(task, repoPath)) continue;
+      if (!(await pathExists(workDir))) continue;
+      assertLease();
+      const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
+      if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
+    }
+    return clonedDeps;
   } finally {
     endResourceJob(job);
   }
@@ -586,6 +636,8 @@ const ensureTaskWorktreesInner = async (ctx: {
   entryHandle: { opId: number | null; gen: number; claimSeq: number };
   /** resource job——长 git / cp 子进程挂 abort */
   job: ResourceJobHandle;
+  /** true = 跳过同步 dep clone（oneshot skip / 正式路径 defer） */
+  skipDepClone: boolean;
 }): Promise<EnsureWorktreesResult> => {
   const {
     task,
@@ -598,6 +650,7 @@ const ensureTaskWorktreesInner = async (ctx: {
     lease,
     entryHandle,
     job,
+    skipDepClone,
   } = ctx;
 
   // 根目录 mkdir 前插桩 + 验 lease（旧实现 mkdir 在首次 lease 前）
@@ -685,9 +738,11 @@ const ensureTaskWorktreesInner = async (ctx: {
             `[task-worktrees] worktree 已切回任务分支：${workDir}（${currentBranch || "detached HEAD"} → ${branch}）`,
           );
         }
-        // 热路径 dep clone：逐单元验 lease（不补偿移除已有 worktree）
-        const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
-        if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
+        // 热路径 dep clone：oneshot/defer 跳过同步拷贝；正式路径逐单元验 lease
+        if (!skipDepClone) {
+          const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
+          if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
+        }
         continue;
       }
     }
@@ -857,9 +912,11 @@ const ensureTaskWorktreesInner = async (ctx: {
     try {
       assertLease();
       await copyRootEnvFiles(repoPath, workDir);
-      // dep clone：每单元前验 lease（600s 大头）；失主走外层补偿
-      const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
-      if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
+      // dep clone：oneshot/defer 跳过同步拷贝（600s 大头挪后台 / 答疑不需要）
+      if (!skipDepClone) {
+        const dirs = await cloneDepDirs(repoPath, workDir, assertLease, job);
+        if (dirs.length > 0) clonedDeps.push({ repoPath, dirs });
+      }
     } catch (err) {
       if (err instanceof WorktreeLeaseLostError) {
         await yieldAfterCompensate();

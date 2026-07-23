@@ -66,6 +66,12 @@ alwaysApply: true
   - 多焦点弹窗（如 ask_user 有选项按钮 + textarea）把 handler 绑在 `DialogContent` 容器级（事件冒泡覆盖 textarea）；但 `enter` 模式要 guard `e.target.tagName === "TEXTAREA"`、只在 textarea 内裸 Enter 提交、避免焦点在按钮 / 容器时裸 Enter 误提交整表。
   - 例外：**单行 `<Input>`**（如 `useDialog().prompt` 重命名框）保持 Enter 提交即可——设置项本意是「多行 textarea 的 Enter 歧义」、单行无歧义、不套设置。
 
+## 滚动条布局抖动全局治理（2026-07-23 用户拍板「全局治理、以后新增也不复现」）
+
+- 自定义滚动条是 classic 模式（占 8px 布局宽度）→ 滚动条出现/消失会挤压内容宽度、整页抖动（踩过：能力页切 tab 抖）。
+- **治理机制在 `globals.css`**：`scrollbar-gutter: stable` 挂在 `.overflow-y-auto` / `.overflow-auto` 工具类上——新增滚动容器只要用这两个 Tailwind 类就自动带治理、不需要手动加。
+- ⛔ 不要在单个组件里手加 `[scrollbar-gutter:stable]` 打补丁；⛔ 不要把规则改成 `*` 全局（overflow-hidden 容器会白吃 8px 槽位）。
+
 ## 设计 skill（V0.7.8 引入、两个都在 .cursor/skills/）
 
 - **新页面 / 新视觉块 / 改版**：先读 `frontend-design`（防 AI 模板脸、定调性）+ 用 `ui-ux-pro-max` 检索具体建议（`python3 .cursor/skills/ui-ux-pro-max/scripts/search.py "<query>" --domain style|color|typography|ux`）

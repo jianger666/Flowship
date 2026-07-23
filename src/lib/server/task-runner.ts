@@ -94,6 +94,7 @@ import {
   stopPreviewsForTask,
 } from "./preview-manager";
 import {
+  cloneMissingTaskDepDirs,
   ensureTaskWorktrees,
   getTaskCwd,
   getTaskWorkRepoPaths,
@@ -101,8 +102,14 @@ import {
   removeTaskWorktrees,
   resolveOriginalRepoPath,
   WorktreeLeaseLostError,
+  type EnsureWorktreesOptions,
 } from "./task-worktrees";
-import { loadSkills, type SkillEntry } from "./skills-loader";
+import {
+  SDK_CREATE_RESUME_TIMEOUT_MS,
+  SDK_SEND_TIMEOUT_MS,
+  withSdkDeadline,
+} from "./sdk-deadline";
+import { loadSkillsForTask, type SkillEntry } from "./skills-loader";
 import {
   resolveTaskMcpServers,
 } from "./cursor-config";
@@ -161,6 +168,7 @@ import { failpoint } from "./failpoints";
 import {
   buildBatchDirective,
   buildGitlabAccessDirective,
+  buildLarkCliAuthMissingRule,
   buildNextActionDirective,
   buildPlanReplanDirective,
   buildResumeActionInstruction,
@@ -991,9 +999,17 @@ const advanceTaskCore = async (
   if (isWorktreeTask(task)) {
     // advance 链的 resource lease（此处尚未 claim、用 admission gen + lifecycle；
     // lease 失效抛 WorktreeLeaseLostError → 转 stale、不得 upsert / 写事件）
+    // deferDepClone：worktree/分支先就绪，依赖拷贝交给 internalStartAgent 后台
     let ensured;
     try {
-      ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen));
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        { kind: "info", text: "正在准备工作区…" },
+      );
+      ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen), {
+        deferDepClone: true,
+      });
     } catch (err) {
       // 让位不吞——显式终态，不继续 upsertGitBranch / info
       if (err instanceof WorktreeLeaseLostError) {
@@ -1013,15 +1029,7 @@ const advanceTaskCore = async (
         );
       }
     }
-    const cloneNote =
-      ensured.clonedDeps.length > 0
-        ? `依赖目录已从原仓库秒级克隆（${ensured.clonedDeps
-            .map(
-              (c) =>
-                `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
-            )
-            .join("、")}）、不需要重新下载`
-        : "";
+    // defer 后 clonedDeps 恒空——依赖完成事件由 kickoffDeferredDepClone 落
     if (ensured.createdRepos.length > 0) {
       // owner 语境（advance 启动链、claim 前）——admission lease
       await writeOwnedEventAndPublish(
@@ -1031,15 +1039,8 @@ const advanceTaskCore = async (
           kind: "info",
           text: `已创建任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
             .map((p) => p.split("/").filter(Boolean).pop() ?? p)
-            .join("、")}${cloneNote ? `；${cloneNote}` : ""}`,
+            .join("、")}；依赖目录后台准备中`,
         },
-      );
-    } else if (cloneNote) {
-      // 复用已有 worktree 时补克隆（老 worktree 建于克隆功能上线前）也要让用户知道
-      await writeOwnedEventAndPublish(
-        task.id,
-        () => !isTaskOpStale(task.id, opGen),
-        { kind: "info", text: cloneNote },
       );
     }
     task = (await getTask(task.id)) ?? task;
@@ -1458,12 +1459,19 @@ const resumeCurrentActionCore = async (
   );
   await abortIfTaskOpStale(fresh.id, opGen);
 
-  // 隔离工作区 task → 确保 worktree 在（可能被手删过）
+  // 隔离工作区 task → 确保 worktree 在（可能被手删过）；依赖拷贝 defer 给 internalStartAgent
   if (isWorktreeTask(startTask)) {
     // resume 链已 claim——resource lease 用 opHandle；让位不吞
     let ensured;
     try {
-      ensured = await ensureTaskWorktrees(startTask, () => isOpOwner(opHandle));
+      await writeOwnedEventAndPublish(
+        fresh.id,
+        () => isOpOwner(opHandle),
+        { kind: "info", actionId: action.id, text: "正在准备工作区…" },
+      );
+      ensured = await ensureTaskWorktrees(startTask, () => isOpOwner(opHandle), {
+        deferDepClone: true,
+      });
     } catch (err) {
       if (err instanceof WorktreeLeaseLostError) {
         releaseTaskOpIf(opHandle);
@@ -2526,10 +2534,12 @@ export const installSessionIfCurrent = (
  *    失败直接抛（分支被占等）——调用方已有错误处理、不在这里吞。
  *
  * @param lease **必填**——mkdir 前验、透传给 ensureTaskWorktrees；失主抛 WorktreeLeaseLostError
+ * @param opts skipDepClone（oneshot）/ deferDepClone（正式启动不挡首包）
  */
 const ensureWorkspaceReady = async (
   task: Task,
   lease: () => boolean,
+  opts?: EnsureWorktreesOptions,
 ): Promise<void> => {
   // workspace mkdir 前验 lease（与 worktree ensure 共用同一租约）
   if (!lease()) throw new WorktreeLeaseLostError();
@@ -2542,7 +2552,53 @@ const ensureWorkspaceReady = async (
       );
   }
   if (!isWorktreeTask(task)) return;
-  await ensureTaskWorktrees(task, lease);
+  await ensureTaskWorktrees(task, lease, opts);
+};
+
+/**
+ * 依赖目录后台克隆（与 Agent.create 重叠）。
+ * 无缺失秒过不刷事件；有克隆才落完成 info。失主静默。
+ */
+const kickoffDeferredDepClone = (
+  task: Task,
+  lease: () => boolean,
+): void => {
+  if (!isWorktreeTask(task)) return;
+  void (async () => {
+    try {
+      const cloned = await cloneMissingTaskDepDirs(task, lease);
+      if (cloned.length === 0) return;
+      await writeEventAndPublish(
+        task.id,
+        {
+          kind: "info",
+          text: `依赖目录已后台克隆完成（${cloned
+            .map(
+              (c) =>
+                `${c.repoPath.split("/").filter(Boolean).pop() ?? c.repoPath}: ${c.dirs.join(" + ")}`,
+            )
+            .join("、")}）`,
+        },
+        lease,
+      );
+    } catch (err) {
+      if (err instanceof WorktreeLeaseLostError) return;
+      console.warn(
+        `[task-runner] 后台依赖克隆失败（回退 agent 自装）task=${task.id}`,
+        err,
+      );
+      await writeEventAndPublish(
+        task.id,
+        {
+          kind: "info",
+          text: `依赖目录后台克隆失败（agent 可自行 install）：${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        },
+        lease,
+      ).catch(() => {});
+    }
+  })();
 };
 
 const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
@@ -2575,9 +2631,9 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
   beginTaskStarting(task.id);
   let handedOffToRunner = false;
   try {
-    // 兜底：调用方约定已 ensure，但 resume / 问一问 / 手删 worktree 等路径可能漏——入口再保证一次
+    // 兜底：调用方约定已 ensure；依赖拷贝 defer 不挡首包（与 MCP/create 重叠）
     try {
-      await ensureWorkspaceReady(task, workspaceLease);
+      await ensureWorkspaceReady(task, workspaceLease, { deferDepClone: true });
     } catch (err) {
       // 让位 → 抛 stale（advance / resume 调用方不得当作启动成功）
       if (err instanceof WorktreeLeaseLostError) {
@@ -2588,6 +2644,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       }
       throw err;
     }
+    // worktree 就绪后后台补依赖（与后续 MCP/create 重叠）
+    kickoffDeferredDepClone(task, workspaceLease);
     // V1：ensure 可能用 stale task 重建了已删目录——立刻发现作废则不再 create
     await abortIfTaskOpStale(task.id, opGen);
     const perfWorkspaceMs = Date.now() - perfStart;
@@ -2633,7 +2691,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
       {
         kind: "info",
         actionId: action.id,
-        text: `启动新 agent（model: ${model.id}、${mcpDesc}）`,
+        text: `正在启动 agent…（model: ${model.id}、${mcpDesc}）`,
       },
     );
 
@@ -2677,8 +2735,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
         // prompt 素材与 Agent.create 并行（v1.1.x 提速）：skills 读盘、identity 走
         // meegle CLI 都可达秒级——create 冷启动本身要数秒、重叠后首 token 提前。
         // 侧挂 catch 防「create 期间先 reject」的 unhandledRejection 噪音（await 时仍抛）。
-        const skillsPromise = loadSkills().catch((err) => {
-          console.error("[task-runner] loadSkills failed", err);
+        const skillsPromise = loadSkillsForTask(task.repoPaths ?? []).catch((err) => {
+          console.error("[task-runner] loadSkillsForTask failed", err);
           return [] as SkillEntry[];
         });
         const identityPromise = resolveUserIdentityForPrompt();
@@ -2752,16 +2810,20 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               }
             }
             const perfCreateStart = Date.now();
-            const created = await Agent.create({
-              apiKey,
-              model,
-              // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
-              // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
-              // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
-              // ~/.cursor MCP 整包漏进 agent（实锤 bug）。
-              local: { cwd: effectiveCwd, settingSources: [] },
-              mcpServers: mergedMcp,
-            });
+            const created = await withSdkDeadline(
+              Agent.create({
+                apiKey,
+                model,
+                // settingSources:[] = 不加载任何 .cursor/（彻底脱离 Cursor 安装 / 项目配置）。
+                // rules / skills / mcp 全部由 fe 自管注入（readAppRulesForPrompt / loadSkills /
+                // inline mcpServers）；曾用 ["project"] 时 chat 未绑目录 cwd=homedir 会把
+                // ~/.cursor MCP 整包漏进 agent（实锤 bug）。
+                local: { cwd: effectiveCwd, settingSources: [] },
+                mcpServers: mergedMcp,
+              }),
+              SDK_CREATE_RESUME_TIMEOUT_MS,
+              "Agent.create",
+            );
             await failpoint("start.afterCreate");
             agentBox.current = created;
             const perfCreateMs = Date.now() - perfCreateStart;
@@ -2887,6 +2949,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               },
               userIdentityLine,
               gitlabAccessSection,
+              buildLarkCliAuthMissingRule(),
             );
             await failpoint("start.afterPrompt");
             const perfPromptMs = Date.now() - perfPromptStart;
@@ -2920,21 +2983,25 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               runKind: "task-first",
               promptBytes,
             });
-            const run = await created.send(superPrompt, {
-              onDelta: composeOnDelta(
-                perfTracker.onDelta,
-                // shell delta 绑本启动链 op lease——失主迟到 flush 丢弃
-                createShellOutputDeltaPublisher(
-                  task.id,
-                  () => !!opHandle && isTaskOpCurrent(opHandle),
+            const run = await withSdkDeadline(
+              created.send(superPrompt, {
+                onDelta: composeOnDelta(
+                  perfTracker.onDelta,
+                  // shell delta 绑本启动链 op lease——失主迟到 flush 丢弃
+                  createShellOutputDeltaPublisher(
+                    task.id,
+                    () => !!opHandle && isTaskOpCurrent(opHandle),
+                  ),
+                  createSdkSummaryDeltaPublisher(
+                    task.id,
+                    () => !!opHandle && isTaskOpCurrent(opHandle),
+                  ),
                 ),
-                createSdkSummaryDeltaPublisher(
-                  task.id,
-                  () => !!opHandle && isTaskOpCurrent(opHandle),
-                ),
-              ),
-              onStep: perfTracker.onStep,
-            });
+                onStep: perfTracker.onStep,
+              }),
+              SDK_SEND_TIMEOUT_MS,
+              "agent.send",
+            );
             await failpoint("start.afterSend");
             perfTracker.attachRun(run);
             const perfSendMs = Date.now() - perfSendStart;
@@ -3226,19 +3293,23 @@ const tryAutoReconnect = async (
       runKind: "task-reconnect",
       promptBytes: Buffer.byteLength(reconnectPrompt, "utf-8"),
     });
-    const run = await resumedAgent.send(reconnectPrompt, {
-      onDelta: composeOnDelta(
-        perfTracker.onDelta,
-        // 重连 send 绑入场 opHandle
-        createShellOutputDeltaPublisher(task.id, () =>
-          isTaskOpCurrent(opts.opHandle),
+    const run = await withSdkDeadline(
+      resumedAgent.send(reconnectPrompt, {
+        onDelta: composeOnDelta(
+          perfTracker.onDelta,
+          // 重连 send 绑入场 opHandle
+          createShellOutputDeltaPublisher(task.id, () =>
+            isTaskOpCurrent(opts.opHandle),
+          ),
+          createSdkSummaryDeltaPublisher(task.id, () =>
+            isTaskOpCurrent(opts.opHandle),
+          ),
         ),
-        createSdkSummaryDeltaPublisher(task.id, () =>
-          isTaskOpCurrent(opts.opHandle),
-        ),
-      ),
-      onStep: perfTracker.onStep,
-    });
+        onStep: perfTracker.onStep,
+      }),
+      SDK_SEND_TIMEOUT_MS,
+      "agent.send(reconnect)",
+    );
     {
       const y = yieldIfOpLost();
       if (y) {
@@ -3705,9 +3776,13 @@ const consumeSessionRun = async (
   const lostStartOwner = (): boolean => !isTaskOpCurrent(opts.opHandle);
 
   /**
-   * 按 session instanceId 关自己的会话。
+   * 按 session instanceId 关自己的会话（仅「当前持有者」路径调用）。
    * 入场时拿不到精确实例号（session 已不是本 agent 对象）→ fail-closed 只关本地，
    * 绝不把 undefined 传给 closeTaskSession（那会退化成按 agentId 关当前）。
+   *
+   * ⛔ 被 supersede 的收尾不得无脑调本函数——见 yieldIfSuperseded：
+   * abortStuck 会保留同一 session instance 给后继，expectedSessionInstanceId 仍匹配
+   * → 误关共享 session。关会话只能由仍持有该 session 的当前 runner / 主动换主方执行。
    */
   const closeMySession = (): void => {
     if (mySessionInstanceId === undefined) {
@@ -3724,8 +3799,12 @@ const consumeSessionRun = async (
   };
 
   /**
-   * 已被 forceClear + 后继 B 接管时，只 cancel/close 自己的 run/agent，
-   * 绝不 finalize 全表 / 裸写 idle / 无 instanceId 门控 closeTaskSession。
+   * 已被 forceClear / abortStuck + 后继 B 接管时，只 cancel 自己的 run。
+   * 绝不 finalize 全表 / 裸写 idle / 无条件 close 共享 session。
+   *
+   * Session 所有权：表内 session.instanceId 仍等于入场记下的 mySessionInstanceId
+   * → 会话被 abortStuck 留给后继、或后继已复用同一实例；禁止 closeMySession
+   * （CAS 挡不住「同 instance」误关）。session 已换号 / 已不在表 → 再 CAS 关自己的。
    * @returns true = 已让位、调用方应立即 return
    */
   const yieldIfSuperseded = (): boolean => {
@@ -3738,6 +3817,15 @@ const consumeSessionRun = async (
     void run.cancel().catch(() => {
       /* noop */
     });
+    // 共享 session 仍挂在表上 = 已交给 / 留给后继持有者，只 cancel run
+    const sess = agentSessions.get(task.id);
+    if (
+      mySessionInstanceId !== undefined &&
+      sess?.instanceId === mySessionInstanceId
+    ) {
+      return true;
+    }
+    // session 已换主或不在表：按 instanceId CAS 关（换主则 no-op）
     closeMySession();
     return true;
   };
@@ -4094,19 +4182,23 @@ const consumeSessionRun = async (
             runKind: "task-submit-followup",
             promptBytes: Buffer.byteLength(followup, "utf-8"),
           });
-          nextRun = await agent.send(followup, {
-            onDelta: composeOnDelta(
-              perfTracker.onDelta,
-              // 交卷追问绑 consume 的 opHandle
-              createShellOutputDeltaPublisher(task.id, () =>
-                isTaskOpCurrent(opts.opHandle),
+          nextRun = await withSdkDeadline(
+            agent.send(followup, {
+              onDelta: composeOnDelta(
+                perfTracker.onDelta,
+                // 交卷追问绑 consume 的 opHandle
+                createShellOutputDeltaPublisher(task.id, () =>
+                  isTaskOpCurrent(opts.opHandle),
+                ),
+                createSdkSummaryDeltaPublisher(task.id, () =>
+                  isTaskOpCurrent(opts.opHandle),
+                ),
               ),
-              createSdkSummaryDeltaPublisher(task.id, () =>
-                isTaskOpCurrent(opts.opHandle),
-              ),
-            ),
-            onStep: perfTracker.onStep,
-          });
+              onStep: perfTracker.onStep,
+            }),
+            SDK_SEND_TIMEOUT_MS,
+            "agent.send(followup)",
+          );
           perfTracker.attachRun(nextRun);
         } catch (err) {
           console.error(
@@ -4480,12 +4572,13 @@ export const resumeTaskSession = async (
     return true;
   };
   try {
-    await ensureWorkspaceReady(task, resumeLease);
+    await ensureWorkspaceReady(task, resumeLease, { deferDepClone: true });
   } catch (err) {
     // 让位 → 静默 return null（不起 session）
     if (err instanceof WorktreeLeaseLostError) return null;
     throw err;
   }
+  // resume 只保证 cwd；依赖补齐由后续 internalStartAgent / 已有 worktree 承担，避免与 create 双开 clone
   if (!(await mayResume())) return null;
 
   try {
@@ -4494,14 +4587,26 @@ export const resumeTaskSession = async (
     const { mergedMcp } = await buildMergedMcpForTask(task, callerToken);
     if (!(await mayResume())) return null;
 
-    const agent = await Agent.resume(task.sessionAgentId, {
-      apiKey: creds.apiKey,
-      model,
-      // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
-      // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
-      local: { cwd: getTaskCwd(task), settingSources: [] },
-      mcpServers: mergedMcp,
-    });
+    await writeOwnedEventAndPublish(
+      task.id,
+      () =>
+        (!opts?.opHandle || isTaskOpCurrent(opts.opHandle)) &&
+        getChatLifecycle(task.id) === null,
+      { kind: "info", text: "正在恢复会话…" },
+    );
+
+    const agent = await withSdkDeadline(
+      Agent.resume(task.sessionAgentId, {
+        apiKey: creds.apiKey,
+        model,
+        // 本地 agent 按 cwd 定位持久化存储、必须跟 create 时一致（不传会 AgentNotFoundError、实测踩过）
+        // settingSources:[] 同 create——不加载 .cursor/、全部 fe 自管注入
+        local: { cwd: getTaskCwd(task), settingSources: [] },
+        mcpServers: mergedMcp,
+      }),
+      SDK_CREATE_RESUME_TIMEOUT_MS,
+      "Agent.resume",
+    );
     const closeLocal = (): void => {
       try {
         agent.close();
@@ -4714,10 +4819,16 @@ export const startOneShotQuestion = (
     try {
       // 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
       await failpoint("oneshot.beforeEnsure");
-      // finalize / 手删后 worktree 可能已不在——起兜底 agent 前先保证目录存在
-      // one-shot 传 observer 闭包
+      // 纯答疑：只保证 cwd 目录在，跳过依赖拷贝（不挡首包）
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(oneshotOpHandle),
+        { kind: "info", text: "正在准备工作区…" },
+      );
       try {
-        await ensureWorkspaceReady(task, () => isTaskOpCurrent(oneshotOpHandle));
+        await ensureWorkspaceReady(task, () => isTaskOpCurrent(oneshotOpHandle), {
+          skipDepClone: true,
+        });
       } catch (err) {
         // 让位 → 静默 return（不起 agent）
         if (err instanceof WorktreeLeaseLostError) {
@@ -4767,12 +4878,21 @@ export const startOneShotQuestion = (
             }
           }
           const effectiveCwd = getTaskCwd(task);
-          const created = await Agent.create({
-            apiKey: creds.apiKey,
-            model: creds.model,
-            // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
-            local: { cwd: effectiveCwd, settingSources: [] },
-          });
+          await writeOwnedEventAndPublish(
+            task.id,
+            () => isTaskOpCurrent(oneshotOpHandle),
+            { kind: "info", text: "正在启动 agent…" },
+          );
+          const created = await withSdkDeadline(
+            Agent.create({
+              apiKey: creds.apiKey,
+              model: creds.model,
+              // settingSources:[] 同正式会话——不加载 .cursor/、全部 fe 自管注入
+              local: { cwd: effectiveCwd, settingSources: [] },
+            }),
+            SDK_CREATE_RESUME_TIMEOUT_MS,
+            "Agent.create(oneshot)",
+          );
           agentBox.current = created;
           console.log(
             `[task-runner] task=${task.id} 问一问兜底 agent 已起 agentId=${created.agentId}`,
@@ -4821,19 +4941,23 @@ export const startOneShotQuestion = (
             runKind: "question",
             promptBytes: Buffer.byteLength(prompt, "utf-8"),
           });
-          const run = await created.send(prompt, {
-            onDelta: composeOnDelta(
-              perfTracker.onDelta,
-              // one-shot 绑 observer handle
-              createShellOutputDeltaPublisher(task.id, () =>
-                isTaskOpCurrent(oneshotOpHandle),
+          const run = await withSdkDeadline(
+            created.send(prompt, {
+              onDelta: composeOnDelta(
+                perfTracker.onDelta,
+                // one-shot 绑 observer handle
+                createShellOutputDeltaPublisher(task.id, () =>
+                  isTaskOpCurrent(oneshotOpHandle),
+                ),
+                createSdkSummaryDeltaPublisher(task.id, () =>
+                  isTaskOpCurrent(oneshotOpHandle),
+                ),
               ),
-              createSdkSummaryDeltaPublisher(task.id, () =>
-                isTaskOpCurrent(oneshotOpHandle),
-              ),
-            ),
-            onStep: perfTracker.onStep,
-          });
+              onStep: perfTracker.onStep,
+            }),
+            SDK_SEND_TIMEOUT_MS,
+            "agent.send(oneshot)",
+          );
           perfTracker.attachRun(run);
 
           // send resolve 后插桩；失主则 cancel + 关本地、不注册 runningTasks
@@ -4934,6 +5058,9 @@ export const startOneShotQuestion = (
 // 场景：ask_user 弹窗在 agent 调工具的瞬间就弹给用户、但本回合 run 要再过几秒才 finished
 // （收尾旁白；未交卷时还有 send 追问）——用户手快秒答会撞上「run 在跑」。这几秒是协议的正常间隙、
 // 等它排空再 send、而不是把用户的答案拒回去（实测踩过：第一次提交报「没有活跃会话」、几秒后重试才过）。
+//
+// 上限 90s：正常协议间隙远短于此；超时多半是假死 run（SDK/TCP 挂死）。
+// 调用方不得把超时直接折叠成「无会话」后另起一条漫长等待链——见 sendToTaskSessionBody 的中止逻辑。
 const waitForRunToDrain = async (
   taskId: string,
   timeoutMs = 90_000,
@@ -4944,6 +5071,52 @@ const waitForRunToDrain = async (
     await new Promise((r) => setTimeout(r, 300));
   }
   return true;
+};
+
+/**
+ * 假死 run：cancel → 短等 → 仍占表则 **instanceId CAS** 只清当初记下的 stuck runner
+ *（保留 session 给后续带超时的 send 复用同一 agentSessions 实例）。
+ *
+ * ## Session 所有权协议（与 forceClearStaleRunnerState / yieldIfSuperseded 对照）
+ * - 本函数**不是**当前 session 持有者的终结者：不关 session、不碰 agentSessions。
+ * - 强删 runner 必须 CAS `stuck.instanceId`——await 期间后继可能已登记新 runner，
+ *   裸 `runningTasks.delete` 会误删后继占位。
+ * - 旧 consume 被 cancel 后走 yieldIfSuperseded：发现 runner 已非自己、但 session
+ *   instance 仍在表 → **只 cancel run、禁止 close 共享 session**（否则 expectedSessionInstanceId
+ *   仍匹配、把刚恢复成功的后继 send/consume 一起关掉）。
+ * 铁律：session 关闭只能由当前持有者执行；完成信号只能由最终提交者发出。
+ */
+const abortStuckRunForSend = async (taskId: string): Promise<void> => {
+  const stuck = runningTasks.get(taskId);
+  if (!stuck) return;
+  // 入场记下 stuck instance——后续 CAS 只删这一份，防误删后继
+  const stuckInstanceId = stuck.instanceId;
+  console.warn(
+    `[task-runner] sendToTaskSession: task=${taskId} run 排空超时、中止假死 run（instance=${stuckInstanceId}）`,
+  );
+  try {
+    stuck.cancel();
+  } catch {
+    /* noop */
+  }
+  const cleared = await waitForRunToDrain(taskId, 5_000);
+  if (!cleared) {
+    // instanceId CAS：只清当初 stuck 那条；后继已换号则不动
+    const cur = runningTasks.get(taskId);
+    if (cur?.instanceId === stuckInstanceId) {
+      runningTasks.delete(taskId);
+      forkPendingTasks.delete(taskId);
+    }
+  }
+  await writeEventAndPublish(
+    taskId,
+    {
+      kind: "info",
+      text: "上一轮疑似假死、已中止并继续发送",
+    },
+    // 假死中止是系统恢复、无单一 op owner；lifecycle 空即可写
+    () => getChatLifecycle(taskId) === null,
+  ).catch(() => {});
 };
 
 const sendToTaskSession = async (
@@ -4995,11 +5168,22 @@ const sendToTaskSessionBody = async (
     const entryLost = (): boolean =>
       !isTaskOpCurrent(entryOpHandle) || isTaskOpStale(task.id, opGen);
 
-    if (!(await waitForRunToDrain(task.id))) {
-      console.warn(
-        `[task-runner] sendToTaskSession: task=${task.id} run 排空超时、拒绝并发 send`,
+    if (runningTasks.has(task.id)) {
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => !isTaskOpStale(task.id, opGen),
+        { kind: "info", text: "上一轮尚未结束、正在等待…" },
       );
-      return "no_session";
+    }
+    if (!(await waitForRunToDrain(task.id))) {
+      // 结构性修复：超时后中止假死 run，再试一次短 drain；仍占表才放弃本 send
+      await abortStuckRunForSend(task.id);
+      if (!(await waitForRunToDrain(task.id, 2_000))) {
+        console.warn(
+          `[task-runner] sendToTaskSession: task=${task.id} 假死 run 中止后仍占位、拒绝并发 send`,
+        );
+        return "no_session";
+      }
     }
     // drain 期间同 gen claim 也要让位（纯 gen 比对看不见）
     if (entryLost()) return "stale";
@@ -5059,19 +5243,23 @@ const sendToTaskSessionBody = async (
         runKind,
         promptBytes: Buffer.byteLength(text, "utf-8"),
       });
-      run = await agent.send(text, {
-        onDelta: composeOnDelta(
-          perfTracker.onDelta,
-          // 续接 / 问一问 send 绑入场 opHandle
-          createShellOutputDeltaPublisher(task.id, () =>
-            isTaskOpCurrent(entryOpHandle),
+      run = await withSdkDeadline(
+        agent.send(text, {
+          onDelta: composeOnDelta(
+            perfTracker.onDelta,
+            // 续接 / 问一问 send 绑入场 opHandle
+            createShellOutputDeltaPublisher(task.id, () =>
+              isTaskOpCurrent(entryOpHandle),
+            ),
+            createSdkSummaryDeltaPublisher(task.id, () =>
+              isTaskOpCurrent(entryOpHandle),
+            ),
           ),
-          createSdkSummaryDeltaPublisher(task.id, () =>
-            isTaskOpCurrent(entryOpHandle),
-          ),
-        ),
-        onStep: perfTracker.onStep,
-      });
+          onStep: perfTracker.onStep,
+        }),
+        SDK_SEND_TIMEOUT_MS,
+        "agent.send",
+      );
       perfTracker.attachRun(run);
     } catch (err) {
       // 续接 / 问一问 send 期间点停止会先 close 会话 → send 抛错；

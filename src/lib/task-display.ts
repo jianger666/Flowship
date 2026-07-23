@@ -49,6 +49,21 @@ export const ACTION_LABEL_SHORT: Record<string, string> = {
 };
 
 /**
+ * 内置 action 一行说明（能力页 Action 列表副标题；与 ACTION_LABEL 同处单一源）。
+ * 文案按 prompts/action-*.md 实际职责压成一句话。
+ */
+export const ACTION_DESC: Record<
+  "plan" | "build" | "review" | "ship" | "dev",
+  string
+> = {
+  plan: "读需求扫仓库，出技术方案",
+  build: "按方案或指令改代码",
+  review: "换个 agent 复审改动找问题",
+  ship: "推分支提测 MR 并通知测试",
+  dev: "推改动到联调分支或提 PR",
+};
+
+/**
  * 取一条 action 的展示 label（统一来源、展示层都该走这个、不要裸 ACTION_LABEL[type]）。
  * - 内置已知类型 → 按 variant 取 ACTION_LABEL / ACTION_LABEL_SHORT / ACTION_LABEL_EN
  * - custom → action.customLabel 快照（advance 时从定义固化）、缺省回退兜底「自定义」

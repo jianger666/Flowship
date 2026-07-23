@@ -16,7 +16,12 @@ import { errorResponse } from "@/lib/server/route-helpers";
 
 export const runtime = "nodejs";
 
-const VALID_SOURCES = new Set<SkillSource>(["builtin", "app", "feishu-cli"]);
+const VALID_SOURCES = new Set<SkillSource>([
+  "builtin",
+  "app",
+  "feishu-cli",
+  "team",
+]);
 
 export const GET = async (req: Request) => {
   const url = new URL(req.url);

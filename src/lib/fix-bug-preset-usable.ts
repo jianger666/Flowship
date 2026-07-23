@@ -5,7 +5,7 @@
  * **必须用同一套口径**，避免「一边说缺、一边觉得在」的死循环。
  *
  * 口径（四条全满足才可用）：
- * 1. action `builtin-fix-bug` 存在
+ * 1. action `app:fix-bug` 存在
  * 2. 非 legacyPlaybook
  * 3. skill 挂载非空
  * 4. **实际挂载的** skill 名在可见列表里（挂用户自定义 skill 也算可用）

@@ -61,6 +61,7 @@ vi.mock("@/lib/server/mcp-probe", () => ({
 }));
 vi.mock("@/lib/server/skills-loader", () => ({
   loadSkills: async () => [],
+  loadSkillsForTask: async () => [],
   renderSkillsForPrompt: () => "",
 }));
 vi.mock("@/lib/server/kill-orphans", () => ({
@@ -937,6 +938,91 @@ describe("V1/V2/W1–W3 taskOpGenerations + startingTasks + one-shot", () => {
       expect(fresh?.actions.find((a) => a.id === "act_b")?.status).toBe(
         "running",
       );
+    });
+
+    it("abortStuck 保留共享 session：旧 A yield 不得 close 后继占用的同 instance", async () => {
+      // P0：假死恢复只删 runner、保留 session；旧 consume supersede 后若仍 closeMySession，
+      // expectedSessionInstanceId 仍匹配 → 误关后继。yield 只 cancel run、禁止关共享 session。
+      const id = alloc();
+      const meta = makeMeta(id);
+      meta.runStatus = "running";
+      meta.currentActionId = "act_a";
+      meta.actions = [
+        {
+          id: "act_a",
+          n: 1,
+          type: "plan",
+          status: "running",
+          userInstruction: "",
+          artifactPath: null,
+          startedAt: Date.now(),
+          endedAt: null,
+        },
+      ] as TaskMetaV06["actions"];
+      await writeMeta(meta);
+
+      let resolveWait!: (v: { status: "cancelled" }) => void;
+      const waitGate = new Promise<{ status: "cancelled" }>((r) => {
+        resolveWait = r;
+      });
+      const sharedAgentId = "agent_stuck_shared_session";
+      const sessionClose = vi.fn();
+      const send = vi.fn().mockResolvedValue({
+        stream: async function* () {
+          /* 空 */
+        },
+        wait: () => waitGate,
+        cancel: vi.fn().mockResolvedValue(undefined),
+      });
+      const sharedSessionId = allocTaskRunInstanceId();
+      agentSessions.set(id, {
+        instanceId: sharedSessionId,
+        agent: { agentId: sharedAgentId, send, close: sessionClose },
+        agentId: sharedAgentId,
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+        startSnapshot: { title: meta.title },
+      });
+
+      const task = (await getTask(id))!;
+      const pA = deliverAskReply(
+        task,
+        "s1",
+        undefined,
+        "act_a",
+        { apiKey: "k", model: { id: "m", params: [] as never[] } },
+      );
+      const regDeadline = Date.now() + 5000;
+      while (!runningTasks.has(id) && Date.now() < regDeadline) {
+        await sleep(20);
+      }
+      const aRec = runningTasks.get(id)!;
+      const aInstanceId = aRec.instanceId;
+      aRec.cancel();
+
+      // 模拟 abortStuckRunForSend：CAS 只删 stuck runner，刻意保留同一 session
+      if (runningTasks.get(id)?.instanceId === aInstanceId) {
+        runningTasks.delete(id);
+      }
+      // 后继 B 登记新 runner，复用同一 agentSessions instance
+      const bInstanceId = allocTaskRunInstanceId();
+      runningTasks.set(id, {
+        instanceId: bInstanceId,
+        agentId: sharedAgentId,
+        startedAt: Date.now(),
+        startSnapshot: { title: meta.title },
+        cancel: vi.fn(),
+      });
+
+      await expect(pA).resolves.toBe("sent");
+      resolveWait({ status: "cancelled" });
+      await sleep(80);
+
+      // 共享 session 仍在、close 不得被旧 A 的 yield 触发
+      expect(agentSessions.get(id)?.instanceId).toBe(sharedSessionId);
+      expect(agentSessions.get(id)?.agentId).toBe(sharedAgentId);
+      expect(sessionClose).not.toHaveBeenCalled();
+      expect(runningTasks.get(id)?.instanceId).toBe(bInstanceId);
     });
 
     it("旧 A 在 setTaskRunStatusIfRunOwner 锁内已非 owner → 不覆盖 B 的 running", async () => {

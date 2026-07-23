@@ -20,15 +20,43 @@ import {
   scanSkillsDir,
   type SkillEntry,
 } from "./skills-loader";
+import {
+  getTeamLibraryKnowledgeRoot,
+  getTeamLibraryKnowledgeSkillsDir,
+  getTeamLibrarySkillsDir,
+  teamLibraryRepoDir,
+} from "./team-library";
+import { getTeamSkillAuthors } from "./team-skill-authors";
 
 /** skill 来源（设置页标签 + 是否可编辑的判定；不含 Cursor 全局——那只作导入源） */
-export type SkillSource = "builtin" | "app" | "feishu-cli";
+export type SkillSource = "builtin" | "app" | "feishu-cli" | "team";
 
 export interface SkillWithSource extends SkillEntry {
   source: SkillSource;
   /** 只有 app 自管的可编辑 / 删除 */
   editable: boolean;
+  /**
+   * 仅 source=team：来自 clone `skills/<cat>/...` → `shared:<cat>`（如 shared:fe）；
+   * 来自 `knowledge/skills/<dir>/...` → `<dir>` 原样（如 global/frontend，路径推导不写死枚举）。
+   */
+  teamCategory?: string;
+  /** 仅 source=team：同目录有 .flowship-action.json（安装时会顺带挂 custom action） */
+  hasActionMarker?: boolean;
+  /** 仅 source=team：创建人（共享库 git 历史首次引入者；解析不到不带） */
+  author?: string;
 }
+
+/** SKILL.md 同目录是否有 .flowship-action.json */
+const hasActionMarkerFor = async (skillMdAbsPath: string): Promise<boolean> => {
+  try {
+    await fs.stat(
+      path.join(path.dirname(skillMdAbsPath), ".flowship-action.json"),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // skill 名 = 目录名：字母数字中文 + ._-、首字符不能是点（拦 `..`）；拒绝 / \
 const isSafeSkillName = (name: string): boolean =>
@@ -37,14 +65,73 @@ const isSafeSkillName = (name: string): boolean =>
 /** 按来源列全部 skill（不去重——同名多来源都展示、用户能看清覆盖关系） */
 export const listSkillsWithSource = async (): Promise<SkillWithSource[]> => {
   const out: SkillWithSource[] = [];
-  const push = (entries: SkillEntry[], source: SkillSource) => {
+  const push = (
+    entries: SkillEntry[],
+    source: SkillSource,
+    teamCategory?: string,
+  ) => {
     for (const e of entries) {
-      out.push({ ...e, source, editable: source === "app" });
+      out.push({
+        ...e,
+        source,
+        editable: source === "app",
+        ...(teamCategory !== undefined ? { teamCategory } : {}),
+      });
     }
   };
   push(await scanSkillsDir(path.join(process.cwd(), "skills")), "builtin");
   push(await scanSkillsDir(getAppSkillsDir()), "app");
   push(await scanSkillsDir(getToolsSkillsDir()), "feishu-cli");
+  // team 条目附创建人：git 历史索引（HEAD 级缓存、失败空表不阻断）
+  const repoDir = teamLibraryRepoDir();
+  const authors = await getTeamSkillAuthors(repoDir);
+  const authorOf = (skillMdAbsPath: string): string | undefined => {
+    const relDir = path
+      .relative(repoDir, path.dirname(skillMdAbsPath))
+      .split(path.sep)
+      .join("/");
+    return authors[relDir];
+  };
+  // 组共享库 skills/<cat>/<name>/ → teamCategory = shared:<cat>（路径推导）
+  // 相对路径 ≥3 段（cat/skill/SKILL.md）取顶层为 cat；旧扁平 skills/<name>/SKILL.md → common
+  const sharedDir = getTeamLibrarySkillsDir();
+  const sharedEntries = await scanSkillsDir(sharedDir, {
+    enforceTeamName: true,
+  });
+  for (const e of sharedEntries) {
+    const parts = path
+      .relative(sharedDir, e.absPath)
+      .split(path.sep)
+      .filter(Boolean);
+    const category = parts.length >= 3 ? (parts[0] ?? "common") : "common";
+    out.push({
+      ...e,
+      source: "team",
+      editable: false,
+      teamCategory: `shared:${category}`,
+      hasActionMarker: await hasActionMarkerFor(e.absPath),
+      ...(authorOf(e.absPath) ? { author: authorOf(e.absPath) } : {}),
+    });
+  }
+  // 知识库镜像 knowledge/skills/<dir>/... → teamCategory = <dir>（路径推导）
+  const kbRoot = getTeamLibraryKnowledgeRoot();
+  const kbSkillsDir = getTeamLibraryKnowledgeSkillsDir();
+  const kbEntries = await scanSkillsDir(kbSkillsDir, {
+    enforceTeamName: true,
+  });
+  for (const e of kbEntries) {
+    const rel = path.relative(kbSkillsDir, e.absPath);
+    const top = rel.split(path.sep).filter(Boolean)[0] ?? "";
+    out.push({
+      ...e,
+      kbRoot,
+      source: "team",
+      editable: false,
+      teamCategory: top || "unknown",
+      hasActionMarker: await hasActionMarkerFor(e.absPath),
+      ...(authorOf(e.absPath) ? { author: authorOf(e.absPath) } : {}),
+    });
+  }
   return out.sort((a, b) => a.name.localeCompare(b.name));
 };
 

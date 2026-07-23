@@ -22,6 +22,7 @@ import { memo } from "react";
 import {
   Streamdown,
   defaultRemarkPlugins,
+  defaultRehypePlugins,
   type Components,
   type ThemeInput,
 } from "streamdown";
@@ -35,6 +36,7 @@ import "streamdown/styles.css";
 import { cn } from "@/lib/utils";
 import { MarkdownLink } from "@/components/markdown-link";
 import { MarkdownImage } from "@/components/ui/image-preview";
+import { rehypeRewriteLocalImages } from "@/lib/rehype-rewrite-local-images";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
@@ -51,6 +53,14 @@ const REMARK_PLUGINS = [
   remarkCodeReference,
   remarkKeepTrailingUnderscore,
   remarkTrimAutolinkCjk,
+];
+// rehype：传自定义列表也是整表替换。顺序 = raw → 本地图改写 → sanitize → harden。
+// 本地图必须在 sanitize 前改写（file:// 会被剥 src）；artifact / 修订视图共用此表。
+export const STREAMDOWN_REHYPE_PLUGINS = [
+  defaultRehypePlugins.raw,
+  rehypeRewriteLocalImages,
+  defaultRehypePlugins.sanitize,
+  defaultRehypePlugins.harden,
 ];
 // 操作栏精简（用户反馈「又有间距又有操作栏、太重」）：代码块只留复制、表格全关、
 // mermaid 留全屏 + 拖拽缩放（图表真需要）；行号也关（聊天场景不引用行号、纯噪音）
@@ -90,6 +100,7 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
       shikiTheme={SHIKI_THEME}
       plugins={STREAMDOWN_PLUGINS}
       remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
       components={MARKDOWN_COMPONENTS}
       controls={STREAMDOWN_CONTROLS}
       // 行号视觉上不要（globals.css 藏 ::before 计数器）、但 **不能传 lineNumbers=false**：

@@ -42,6 +42,7 @@ vi.mock("@/lib/server/mcp-probe", () => ({
 }));
 vi.mock("@/lib/server/skills-loader", () => ({
   loadSkills: async () => [],
+  loadSkillsForTask: async () => [],
   renderSkillsForPrompt: () => "",
 }));
 vi.mock("@/lib/server/kill-orphans", () => ({

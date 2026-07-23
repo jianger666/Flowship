@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Copy, FileUp, Loader2, Plus, Sparkles } from "lucide-react";
+import { ArrowLeft, Copy, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -36,18 +36,16 @@ import { ActionLayoutConfig } from "@/components/custom-actions/action-layout-co
 import { McpCard } from "@/components/settings/mcp-card";
 import { RulesCard } from "@/components/settings/rules-card";
 import { SkillsCard } from "@/components/settings/skills-card";
+import { UploadToTeamLibraryButton } from "@/components/settings/skills-panel/upload-to-team-library";
+import { InstallTeamActions } from "@/components/custom-actions/install-team-actions";
 import { setPendingSlashSkill, fetchSkills as fetchSlashSkills } from "@/components/slash-skills";
 import {
   deleteCustomActionReq,
-  exportCustomActionReq,
   fetchAppSkillsDir,
   fetchCustomActions,
-  fetchSkills,
-  importCustomActionBundleReq,
 } from "@/lib/custom-action-client";
 import { removeActionLayoutId } from "@/lib/action-layout";
 import { getSettings, saveSettings } from "@/lib/local-store";
-import { pickNativePaths } from "@/lib/native-picker";
 import { createTask, sendChatReply } from "@/lib/task-store";
 import type { CustomActionDef } from "@/lib/types";
 import { saveDraft } from "@/lib/view-memory";
@@ -79,10 +77,10 @@ const ActionsPanel = () => {
   const [editorOpen, setEditorOpen] = useState(false);
   // 正在编辑的 action（null = 新建）
   const [editing, setEditing] = useState<CustomActionDef | null>(null);
-  // 本机可用 skill 名集合（给行内 chips 判定缺失；null = 未拉到、不判定防误报）
+  // 本机全部 skill 名（含已关闭自管；给行内缺失判定；null = 未拉到、不判定防误报）
   const [knownSkills, setKnownSkills] = useState<Set<string> | null>(null);
-  // 导入 / 导出进行中（防双击连开两个原生对话框）
-  const [transferring, setTransferring] = useState(false);
+  // 自管源 skill 名集合（配合 settings.disabledSkills 标「skill 已关闭」）
+  const [appSkillNames, setAppSkillNames] = useState<Set<string> | null>(null);
   // 「对话创建」发起中（防双击）
   const [aiCreating, setAiCreating] = useState(false);
   // 正在转建的旧格式 action id（防双击；null = 无）
@@ -93,6 +91,8 @@ const ActionsPanel = () => {
   const [viewingLegacy, setViewingLegacy] = useState<CustomActionDef | null>(
     null,
   );
+  // Action 内子 tab：我的列表 / 共享市场（默认我的）
+  const [actionSubTab, setActionSubTab] = useState<"mine" | "market">("mine");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -236,11 +236,29 @@ const ActionsPanel = () => {
     void load();
   }, [load]);
 
-  // skill 集合 + 自管目录拉一次（目录给对话创建当 cwd）
+  // skill 全集（含关闭的自管）+ 自管目录拉一次（目录给对话创建当 cwd）
+  // 不用 fetchSkills（它只返 enabled）——关闭的自管要标「skill 已关闭」而不是「缺失」
   useEffect(() => {
-    fetchSkills()
-      .then((s) => setKnownSkills(new Set(s.map((x) => x.name))))
-      .catch(() => setKnownSkills(null));
+    void fetch("/api/skills", { cache: "no-store" })
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const body = (await r.json()) as {
+          skills?: Array<{ name?: string; source?: string }>;
+        };
+        const all = new Set<string>();
+        const app = new Set<string>();
+        for (const s of body.skills ?? []) {
+          if (typeof s.name !== "string" || !s.name) continue;
+          all.add(s.name);
+          if (s.source === "app") app.add(s.name);
+        }
+        setKnownSkills(all);
+        setAppSkillNames(app);
+      })
+      .catch(() => {
+        setKnownSkills(null);
+        setAppSkillNames(null);
+      });
     fetchAppSkillsDir()
       .then(setAppSkillsDir)
       .catch(() => setAppSkillsDir(""));
@@ -257,50 +275,81 @@ const ActionsPanel = () => {
   };
 
   const handleDelete = async (def: CustomActionDef) => {
-    // skill 仅 app 源时可勾「同步删除」；内置 / 飞书不给勾（删不了）
-    let syncSkillName: string | null = null;
-    const skillName = def.skill?.trim();
-    if (skillName) {
-      try {
-        const res = await fetch("/api/skills");
-        if (res.ok) {
-          const body = (await res.json()) as {
-            skills?: Array<{ name: string; source: string }>;
-          };
-          const hit = (body.skills ?? []).find(
-            (s) => s.name === skillName && s.source === "app",
-          );
-          if (hit) syncSkillName = hit.name;
-        }
-      } catch {
-        // 拉 skills 失败不挡删 action、只是不出勾选
-      }
-    }
-
-    let alsoDeleteSkill = false;
-    if (syncSkillName) {
-      const result = await confirm({
-        title: `删除「${def.label}」？`,
-        description:
-          "用它跑过的历史任务不受影响、但之后不能再新推进这个 action。",
-        destructive: true,
-        checkboxLabel: `同时删除 skill「${syncSkillName}」`,
-      });
-      if (!result) return;
-      alsoDeleteSkill = result.checked;
-    } else {
+    // 派生 team action：删除 = 卸载对应共享库 skill（DELETE route 转卸载语义）
+    if (def.origin === "team") {
       const ok = await confirm({
-        title: `删除「${def.label}」？`,
-        description:
-          "用它跑过的历史任务不受影响、但之后不能再新推进这个 action。",
+        title: `卸载「${def.label}」？`,
+        description: "推进面板将移除此按钮，可到 Skill tab 重新安装",
         destructive: true,
+        confirmLabel: "卸载",
       });
       if (!ok) return;
+      try {
+        await deleteCustomActionReq(def.id);
+        const s = getSettings();
+        const layout = s.actionLayout ?? { order: [], hidden: [] };
+        const pruned = removeActionLayoutId(layout, def.id);
+        if (
+          pruned.order.length !== layout.order.length ||
+          pruned.hidden.length !== layout.hidden.length
+        ) {
+          void saveSettings({ ...s, actionLayout: pruned });
+        }
+        setActions((prev) => prev.filter((a) => a.id !== def.id));
+        // 成功：列表行消失自表达，不 toast
+      } catch (err) {
+        toast.error(
+          `卸载失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return;
     }
 
+    // 自建（app-skill / 1:1）：二选一——仅移除推进入口 / 连 skill 一起删
+    const skillName = def.skill?.trim() || "";
+    const isAppHosted = def.origin === "app-skill" || !!skillName;
+
+    if (isAppHosted && skillName && !def.legacyPlaybook) {
+      const result = await confirm({
+        title: `删除「${def.label}」？`,
+        description: "默认仅移除推进入口；勾选则连同 skill 一起删",
+        checkboxLabel: `同时删除 skill「${skillName}」`,
+        destructive: true,
+        confirmLabel: "删除",
+      });
+      if (!result) return;
+      try {
+        await deleteCustomActionReq(def.id, {
+          withSkill: result.checked,
+        });
+        const s = getSettings();
+        const layout = s.actionLayout ?? { order: [], hidden: [] };
+        const pruned = removeActionLayoutId(layout, def.id);
+        if (
+          pruned.order.length !== layout.order.length ||
+          pruned.hidden.length !== layout.hidden.length
+        ) {
+          void saveSettings({ ...s, actionLayout: pruned });
+        }
+        setActions((prev) => prev.filter((a) => a.id !== def.id));
+        // 成功：列表行消失自表达；连删 skill 也无额外成功 toast（失败才 toast）
+      } catch (err) {
+        toast.error(
+          `删除失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      return;
+    }
+
+    // legacy：只删旧 ACTION.md 目录
+    const ok = await confirm({
+      title: `删除「${def.label}」？`,
+      description: "旧格式定义将被删除",
+      destructive: true,
+    });
+    if (!ok) return;
     try {
       await deleteCustomActionReq(def.id);
-      // 同步清 actionLayout 里该 id 的 order/hidden 残留（不等拖拽时才 prune）
       const s = getSettings();
       const layout = s.actionLayout ?? { order: [], hidden: [] };
       const pruned = removeActionLayoutId(layout, def.id);
@@ -311,89 +360,14 @@ const ActionsPanel = () => {
         void saveSettings({ ...s, actionLayout: pruned });
       }
       setActions((prev) => prev.filter((a) => a.id !== def.id));
-
-      if (alsoDeleteSkill && syncSkillName) {
-        try {
-          const delRes = await fetch(
-            `/api/skills?name=${encodeURIComponent(syncSkillName)}`,
-            { method: "DELETE" },
-          );
-          if (!delRes.ok) {
-            let msg = `HTTP ${delRes.status}`;
-            try {
-              const body = (await delRes.json()) as { error?: string };
-              if (body.error) msg = body.error;
-            } catch {
-              // ignore
-            }
-            toast.error(`action 已删，但删除 skill 失败：${msg}`);
-            return;
-          }
-          toast.success("已删除 action 和 skill");
-          return;
-        } catch (err) {
-          toast.error(
-            `action 已删，但删除 skill 失败：${err instanceof Error ? err.message : err}`,
-          );
-          return;
-        }
-      }
-      toast.success("已删除");
+      // 成功：列表行消失自表达，不 toast
     } catch (err) {
       toast.error(`删除失败：${err instanceof Error ? err.message : err}`);
     }
   };
 
-  // 导出：原生 picker 选目标目录 → 拷主 skill 目录 + 写 .flowship-action.json
-  const handleExport = async (def: CustomActionDef) => {
-    if (transferring) return;
-    const dirs = await pickNativePaths({
-      mode: "folder",
-      prompt: "选择导出目录",
-    });
-    if (!dirs?.[0]) return;
-    setTransferring(true);
-    try {
-      const r = await exportCustomActionReq(def.id, dirs[0]);
-      toast.success(`已导出到 ${r.skillDir}`);
-    } catch (err) {
-      toast.error(`导出失败：${err instanceof Error ? err.message : err}`);
-    } finally {
-      setTransferring(false);
-    }
-  };
-
-  // 导入：原生 picker 选 skill 文件夹 → 拷进自管 skills → 有 .flowship-action.json 则挂壳
-  const handleImport = async () => {
-    if (transferring) return;
-    const dirs = await pickNativePaths({
-      mode: "folder",
-      prompt: "选择要导入的 skill 文件夹（须含 SKILL.md）",
-    });
-    if (!dirs?.[0]) return;
-    setTransferring(true);
-    try {
-      const r = await importCustomActionBundleReq(dirs[0]);
-      if (r.action) {
-        toast.success("已导入 skill 并挂成 action");
-        void load();
-      } else if (r.actionError) {
-        toast.error(
-          `已导入 skill「${r.skillName}」、挂壳失败：${r.actionError}`,
-        );
-      } else {
-        toast.success("已导入 skill、未带挂载参数、可手动新建 action");
-      }
-      // 刷新 knownSkills、让行内 chips 立刻认新 skill
-      fetchSkills()
-        .then((s) => setKnownSkills(new Set(s.map((x) => x.name))))
-        .catch(() => {});
-    } catch (err) {
-      toast.error(`导入失败：${err instanceof Error ? err.message : err}`);
-    } finally {
-      setTransferring(false);
-    }
-  };
+  // 本地导入 / 导出已下线（2026-07-22 用户拍板：分发统一走共享库、不再需要本地文件包搬运）；
+  // 恢复的话看 git 历史（handleImport / handleExport + exportCustomActionReq / importCustomActionBundleReq）。
 
   // 复制旧格式原内容（供用户拿去建 skill 后重新挂载）
   const handleCopyLegacy = async () => {
@@ -419,53 +393,73 @@ const ActionsPanel = () => {
 
   return (
     <div>
-      {/* 面板工具行：说明 + 对话创建 / 导入 / 新建 */}
-      <div className="mb-4 flex items-center justify-between gap-2">
-        <p className="text-sm text-muted-foreground">
-          自定义 action = 把某个 skill 挂到任务链上跑；拖拽调顺序、开关控显隐
-        </p>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void handleAiCreate()}
-            disabled={aiCreating}
-            title="开个对话、AI 按你的描述生成 skill 并挂成 action"
-          >
-            {aiCreating ? <Loader2 className="animate-spin" /> : <Sparkles />}
-            对话创建
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void handleImport()}
-            disabled={transferring}
-            title="导入他人分享的 skill 包（可含 .flowship-action.json）"
-          >
-            {transferring ? <Loader2 className="animate-spin" /> : <FileUp />}
-            导入
-          </Button>
-          <Button size="sm" onClick={handleNew}>
-            <Plus />
-            新建
-          </Button>
-        </div>
+      {/* Action 内子 tab：我的 = 本机列表；共享市场 = 可安装的共享 action */}
+      <div className="mb-4 flex items-center gap-1">
+        <ChoiceButton
+          shape="tab"
+          selected={actionSubTab === "mine"}
+          onClick={() => setActionSubTab("mine")}
+        >
+          我的
+        </ChoiceButton>
+        <ChoiceButton
+          shape="tab"
+          selected={actionSubTab === "market"}
+          onClick={() => setActionSubTab("market")}
+        >
+          共享市场
+        </ChoiceButton>
       </div>
 
-      {/* 内置 + 自定义混排成一个列表统一管理：拖拽排序 + 显隐开关、自定义行额外可编辑 / 导出 / 删除 */}
-      {loading ? (
-        <LoadingState variant="card" />
-      ) : (
-        <ActionLayoutConfig
-          customActions={actions}
-          knownSkills={knownSkills}
-          onEdit={handleEdit}
-          onDelete={handleDelete}
-          onExport={(def) => void handleExport(def)}
-          onViewLegacy={setViewingLegacy}
-          onConvertLegacy={(def) => void handleConvertLegacy(def)}
-          convertingLegacyId={convertingLegacyId}
-        />
+      {actionSubTab === "mine" && (
+        <>
+          {/* 工具行：说明 + 上传 / 对话创建 / 新建 */}
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm text-muted-foreground">
+              自定义 action = 把某个 skill 挂到任务链上跑；拖拽调顺序、开关控显隐
+            </p>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <UploadToTeamLibraryButton mode="action" />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleAiCreate()}
+                disabled={aiCreating}
+                title="开个对话、AI 按你的描述生成 skill 并挂成 action"
+              >
+                {aiCreating ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <Sparkles />
+                )}
+                对话创建
+              </Button>
+              <Button size="sm" onClick={handleNew}>
+                <Plus />
+                新建
+              </Button>
+            </div>
+          </div>
+
+          {loading ? (
+            <LoadingState variant="card" />
+          ) : (
+            <ActionLayoutConfig
+              customActions={actions}
+              knownSkills={knownSkills}
+              appSkillNames={appSkillNames}
+              onEdit={handleEdit}
+              onDelete={handleDelete}
+              onViewLegacy={setViewingLegacy}
+              onConvertLegacy={(def) => void handleConvertLegacy(def)}
+              convertingLegacyId={convertingLegacyId}
+            />
+          )}
+        </>
+      )}
+
+      {actionSubTab === "market" && (
+        <InstallTeamActions onInstalled={() => void load()} />
       )}
 
       <CustomActionEditor
@@ -545,7 +539,7 @@ const CapabilitiesPage = () => {
   };
 
   return (
-    <div className="mx-auto max-w-3xl px-6 py-8">
+    <div className="mx-auto max-w-5xl px-6 py-8">
       <div className="mb-6">
         <Button
           variant="ghost"
@@ -560,7 +554,6 @@ const CapabilitiesPage = () => {
         <p className="mt-0.5 text-sm text-muted-foreground">
           AI 干活用的四类能力：推进动作（Action）、技能（Skill）、外部工具（MCP）、规则（Rules）
         </p>
-        {/* tab 行：切换能力面板 */}
         <div className="mt-4 flex items-center gap-1 border-b pb-2">
           {CAP_TABS.map((t) => (
             <ChoiceButton

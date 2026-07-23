@@ -57,6 +57,7 @@ import {
 import {
   extractActiveBootStage,
   isBootStageInfo,
+  resolveStickyTurn,
   shouldShowTurnDivider,
 } from "@/lib/chat-stream-display";
 import {
@@ -439,10 +440,30 @@ const EventStreamImpl = ({
   );
   const displayedBoot = useStagedBootDisplay(activeBoot);
 
+  // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
+  // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
+  // 放在 items 之前算：items 构建要用它做「答题卡置底」。
+  const pendingAskEvent = useMemo(
+    () => findPendingAskEvent(task.events),
+    [task.events],
+  );
+
   // 渲染前：buildStreamItems（滤噪声 → thinking → tool → chat 分组）→
   // 再追加 pending / streaming / loading / boot 虚拟项（不参与分组）
   const items: RenderItem[] = useMemo(() => {
     const merged = buildStreamItems(task.events, isChat);
+    // 未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的漏网），
+    // 渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）
+    if (pendingAskEvent) {
+      const askIdx = merged.findIndex(
+        (it) => it.kind === "ask_user_request" && it.id === pendingAskEvent.id,
+      );
+      if (askIdx >= 0 && askIdx < merged.length - 1) {
+        const [askItem] = merged.splice(askIdx, 1);
+        merged.push(askItem);
+      }
+    }
+    // ⚠️ 本 useMemo 依赖 pendingAskEvent（上方置底逻辑）——deps 里必须带上
     const withPending: RenderItem[] = [
       ...merged,
       ...(pendingLocalReplies ?? []).map(
@@ -496,7 +517,7 @@ const EventStreamImpl = ({
       return [...withPending, { kind: "__loading__", id: "__loading__" }];
     }
     return withPending;
-  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies, displayedBoot]);
+  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies, displayedBoot, pendingAskEvent]);
 
   // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）
   const lastGroupId = useMemo(() => {
@@ -517,29 +538,36 @@ const EventStreamImpl = ({
     [isChat, isRunning, task.events, liveToolOutputs],
   );
 
-  // 当前待答的 ask（V0.13.x 内联答题卡分流用）：命中的那条渲染 AskUserInlineCard、
-  // 其余 ask 行走回放卡。判定收口在 lib/ask-pending（只认最新一条未了结的）。
-  const pendingAskEvent = useMemo(
-    () => findPendingAskEvent(task.events),
-    [task.events],
-  );
-
   // 轮次分割判定用的 kind 序列（与 items 对齐；shouldShowTurnDivider 纯函数吃它）
   const itemKinds = useMemo(() => items.map((it) => it.kind), [items]);
 
   // E1 sticky 轮次头：当前轮的用户消息句（滚出视口上沿后粘顶、点击回滚到该轮头部）。
-  // Virtuoso 无逐组 sticky API（GroupedVirtuoso 要整体重构数据形状）——用
-  // rangeChanged 维护「视口顶上方最近一条 user_reply」+ 绝对定位 overlay 实现。
-  const [stickyTurn, setStickyTurn] = useState<{
-    id: string;
-    text: string;
-  } | null>(null);
-  // 上次 sticky id（ref 比对、避免滚动中重复 setState）
+  // Virtuoso 无逐组 sticky API——用 rangeChanged + 绝对定位 overlay。
+  // ⚠️ 必须命令式更新 DOM、禁止 setState：滚动热路径 setState → Virtuoso 重渲 →
+  // startIndex 在 user_reply 边界来回翻 → 粘顶显隐振荡 = 快速持续抖动（2026-07-23）。
+  const stickyRootRef = useRef<HTMLDivElement | null>(null);
+  const stickyTextRef = useRef<HTMLSpanElement | null>(null);
+  // 当前粘顶的 user_reply id（点击回滚 + 去重用）
   const stickyTurnIdRef = useRef<string | null>(null);
-  const updateStickyTurn = (next: { id: string; text: string } | null) => {
-    if ((next?.id ?? null) === stickyTurnIdRef.current) return;
-    stickyTurnIdRef.current = next?.id ?? null;
-    setStickyTurn(next);
+  // items 最新快照：rangeChanged / sticky 点击不闭包陈旧 items
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const applyStickyTurn = (next: { id: string; text: string } | null) => {
+    const nextId = next?.id ?? null;
+    // 同 id 已应用过 → 跳过（滚动热路径高频）
+    if (nextId === stickyTurnIdRef.current) return;
+    const root = stickyRootRef.current;
+    const textEl = stickyTextRef.current;
+    // root 尚未挂上时不提前写 id——否则永远补不上显隐
+    if (!root) return;
+    stickyTurnIdRef.current = nextId;
+    if (next) {
+      root.classList.remove("hidden");
+      if (textEl) textEl.textContent = summarize(next.text);
+    } else {
+      root.classList.add("hidden");
+      if (textEl) textEl.textContent = "";
+    }
   };
 
   // ---------- v1.0.x 事件懒加载（上拉分页） ----------
@@ -570,7 +598,11 @@ const EventStreamImpl = ({
     setDraft(loadDraft("reply", task.id));
     initialTopRef.current = null;
     stickyTurnIdRef.current = null;
-    setStickyTurn(null);
+    // 切 task：命令式藏 sticky（不走 setState；root 可能尚未挂上、下帧再清也行）
+    const root = stickyRootRef.current;
+    if (root) root.classList.add("hidden");
+    const textEl = stickyTextRef.current;
+    if (textEl) textEl.textContent = "";
   }, [task.id]);
   // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
   // 已经拉过页就不再被它改（本地分页状态才是准的）
@@ -859,14 +891,19 @@ const EventStreamImpl = ({
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
           relative：给「AI 在等你回答」悬浮条定位 */}
       <div className="relative min-h-0 flex-1">
-        {/* E1 sticky 轮次头：当前轮用户消息滚出视口后粘顶（低调 backdrop-blur）、点击回该轮头部 */}
-        {isChat && stickyTurn && (
-          <div className="pointer-events-none absolute inset-x-0 top-0 z-10">
+        {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn） */}
+        {isChat && (
+          <div
+            ref={stickyRootRef}
+            className="pointer-events-none absolute inset-x-0 top-0 z-10 hidden"
+          >
             <div className="mx-auto w-full max-w-3xl px-6">
               <button
                 type="button"
                 onClick={() => {
-                  const idx = items.findIndex((it) => it.id === stickyTurn.id);
+                  const id = stickyTurnIdRef.current;
+                  if (!id) return;
+                  const idx = itemsRef.current.findIndex((it) => it.id === id);
                   if (idx >= 0) {
                     virtuosoRef.current?.scrollToIndex({
                       index: idx,
@@ -878,9 +915,10 @@ const EventStreamImpl = ({
                 title="回到本轮开头"
                 className="pointer-events-auto flex w-full cursor-pointer items-center rounded-b-md border-x border-b border-border/40 bg-background/75 px-3 py-1.5 text-left text-xs text-muted-foreground backdrop-blur transition-colors hover:text-foreground"
               >
-                <span className="min-w-0 flex-1 truncate">
-                  {summarize(stickyTurn.text)}
-                </span>
+                <span
+                  ref={stickyTextRef}
+                  className="min-w-0 flex-1 truncate"
+                />
               </button>
             </div>
           </div>
@@ -941,23 +979,13 @@ const EventStreamImpl = ({
             // v1.1.x 滚动位置记忆：滚动时持续记「视口顶部第一条事件 id + 是否贴底」、
             // 切走再切回按它恢复（虚拟 item __streaming__/__loading__ 不作锚点）
             rangeChanged={(range) => {
+              const list = itemsRef.current;
               const localIdx = range.startIndex - firstItemIndex;
-              // E1 sticky 轮次头：往上找「视口顶或其上方」最近一条 user_reply；
-              // 它正好就是顶部第一条（自身还看得见）时不粘、滚过去了才粘
+              // E1 sticky：纯函数算目标 + 命令式 DOM，滚动路径零 setState
               if (isChat) {
-                let sticky: { id: string; text: string } | null = null;
-                for (let i = Math.min(localIdx, items.length - 1); i >= 0; i--) {
-                  const it = items[i];
-                  if (it && it.kind === "user_reply") {
-                    if (i < localIdx) {
-                      sticky = { id: it.id, text: it.text };
-                    }
-                    break;
-                  }
-                }
-                updateStickyTurn(sticky);
+                applyStickyTurn(resolveStickyTurn(list, localIdx));
               }
-              const top = items[localIdx];
+              const top = list[localIdx];
               if (!top || top.id.startsWith("__")) return;
               saveScrollAnchor(task.id, {
                 anchorId: top.id,

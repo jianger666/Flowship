@@ -26,7 +26,10 @@ import { mermaid as streamdownMermaid } from "@streamdown/mermaid";
 import { math as streamdownMath } from "@streamdown/math";
 import { cjk as streamdownCjk } from "@streamdown/cjk";
 
-import { STREAMDOWN_CONTROLS } from "@/components/markdown-text";
+import {
+  STREAMDOWN_CONTROLS,
+  STREAMDOWN_REHYPE_PLUGINS,
+} from "@/components/markdown-text";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -161,6 +164,7 @@ export const ArtifactRevisionView = ({
             shikiTheme={SHIKI_THEME}
             plugins={PLUGINS}
             remarkPlugins={remarkPlugins}
+            rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
             components={components}
             controls={STREAMDOWN_CONTROLS}
           >

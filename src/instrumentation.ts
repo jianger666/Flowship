@@ -90,8 +90,17 @@ export const register = (): void => {
       );
     });
 
-  // 收件箱二期：出厂预置「改bug」custom action + skill（各记一次、删过不重装）
-  void import("./lib/server/preset-actions")
+  // 自定义 action → skill 托管迁移（幂等）须在预置安装前跑、把旧 builtin-fix-bug 迁成 app:fix-bug；
+  // 再 ensureBuiltinFixBugPreset。错误各自捕获、不阻断启动（链式串行、禁止并行竞态）。
+  void import("./lib/server/custom-action-fs")
+    .then((m) => m.migrateCustomActionsToSkillHosted())
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] custom-actions → skill 托管迁移失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    })
+    .then(() => import("./lib/server/preset-actions"))
     .then((m) => m.ensureBuiltinFixBugPreset())
     .catch((err) => {
       console.warn(
@@ -106,6 +115,23 @@ export const register = (): void => {
     .catch((err) => {
       console.warn(
         "[instrumentation] 应用 Agent shell 偏好失败（不阻断启动）:",
+        err instanceof Error ? err.message : err,
+      );
+    });
+
+  // 组共享库：启动自动 sync（没配 gitToken 内部静默跳过；失败只 warn）
+  // 注：cleanup-fe-hooks 挂在 task-runner 非启动链，故同步挂在本 instrumentation 启动 fire-and-forget 段
+  void import("./lib/server/team-library")
+    .then((m) => m.syncTeamLibrary({ silentWithoutToken: true }))
+    .then((r) => {
+      if (r.skipped) return;
+      if (!r.ok) {
+        console.warn("[instrumentation] 组共享库 sync 失败:", r.error);
+      }
+    })
+    .catch((err) => {
+      console.warn(
+        "[instrumentation] 组共享库 sync 异常（不阻断启动）:",
         err instanceof Error ? err.message : err,
       );
     });

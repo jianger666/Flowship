@@ -59,6 +59,44 @@ export const shouldShowTurnDivider = (
   return false;
 };
 
+// ---------- sticky 轮次头（视口顶上方最近一条 user_reply） ----------
+
+/** sticky 判定只关心 kind / id / text，避免绑死 RenderItem 联合类型 */
+export type StickyTurnCandidate = {
+  id: string;
+  kind: string;
+  text?: string;
+};
+
+/**
+ * 根据 Virtuoso range.startIndex（换算成 items 下标）算是否该粘顶。
+ *
+ * 规则：从视口顶项往上找最近一条 user_reply；
+ * - 它严格在顶项上方（已滚出）→ 粘它
+ * - 它就是顶项本身（还看得见）→ 不粘
+ * - 上方没有 user_reply → 不粘
+ *
+ * 抽纯函数：event-stream 滚动热路径只调它、再用命令式 DOM 更新粘顶条——
+ * 禁止在 rangeChanged 里 setState（会触发 Virtuoso 重渲 → startIndex 在
+ * user_reply 边界来回翻 → 快速持续抖动）。
+ */
+export const resolveStickyTurn = (
+  items: readonly StickyTurnCandidate[],
+  localIdx: number,
+): { id: string; text: string } | null => {
+  if (items.length === 0 || localIdx < 0) return null;
+  for (let i = Math.min(localIdx, items.length - 1); i >= 0; i--) {
+    const it = items[i];
+    if (it && it.kind === "user_reply") {
+      if (i < localIdx) {
+        return { id: it.id, text: typeof it.text === "string" ? it.text : "" };
+      }
+      return null;
+    }
+  }
+  return null;
+};
+
 // ---------- 启动进度渐进单行（boot stage） ----------
 
 /**

@@ -66,7 +66,10 @@ const ARTIFACT_REMARK_PLUGINS = [
 ];
 
 import { MarkdownLink } from "@/components/markdown-link";
-import { STREAMDOWN_CONTROLS } from "@/components/markdown-text";
+import {
+  STREAMDOWN_CONTROLS,
+  STREAMDOWN_REHYPE_PLUGINS,
+} from "@/components/markdown-text";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
@@ -967,6 +970,7 @@ export const ArtifactPanel = ({
                     shikiTheme={ARTIFACT_SHIKI_THEME}
                     plugins={ARTIFACT_STREAMDOWN_PLUGINS}
                     remarkPlugins={ARTIFACT_REMARK_PLUGINS}
+                    rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
                     components={markdownComponents}
                     controls={STREAMDOWN_CONTROLS}
                   >
