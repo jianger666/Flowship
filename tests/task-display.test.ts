@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { computeBatchProgress } from "@/lib/task-display";
+import { buildDefaultDailyTaskTitle, computeBatchProgress } from "@/lib/task-display";
 import type {
   ActionRecord,
   ActionType,
@@ -138,5 +138,29 @@ describe("computeBatchProgress 多 plan 派生", () => {
 
     expect(progress.done).toBe(1);
     expect(progress.remaining.map((b) => b.rawId)).toEqual(["b2"]);
+  });
+});
+
+describe("buildDefaultDailyTaskTitle", () => {
+  it("日常 · 首仓短名 · 时间（多仓只取第一个）", () => {
+    const now = new Date(2026, 6, 24, 13, 45); // 月 0-based → 7 月
+    const title = buildDefaultDailyTaskTitle(
+      ["/Users/me/work/crm-web", "/Users/me/work/crm-api"],
+      now,
+    );
+    expect(title.startsWith("日常 · crm-web · ")).toBe(true);
+    expect(title).toContain(
+      now.toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    );
+  });
+
+  it("无仓路径兜底短名「任务」", () => {
+    const title = buildDefaultDailyTaskTitle([], new Date(2026, 0, 1, 0, 0));
+    expect(title.startsWith("日常 · 任务 · ")).toBe(true);
   });
 });

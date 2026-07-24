@@ -199,6 +199,102 @@ export const labelTeamCategoryBadge = (
   return `规范 · ${teamCategory}`;
 };
 
+/**
+ * 公司环境配置（设置页「环境配置」）
+ * 排查类 skill / action 用：服务器 SSH、PG、日志路径、XXL-Job、Nacos、ELK。
+ * 凭据只进 config.json / company-env.json，不进 prompt / 共享库。
+ */
+export type CompanyEnvServerEnv = "test" | "dev";
+
+export interface CompanyEnvServer {
+  name: string;
+  env: CompanyEnvServerEnv;
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+}
+
+export interface CompanyEnvPg {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  /** 库名模板，如 `{project}-test` */
+  dbTemplates: string[];
+  /**
+   * 只读软约束（默认 true）：落 company-env.json + brief 声明禁止写；
+   * 非硬闸，靠 prompt 约束 AI。
+   */
+  readonly: boolean;
+}
+
+export interface CompanyEnvXxlJob {
+  env: string;
+  baseUrl: string;
+  username: string;
+  password: string;
+  /** 只读软约束（默认 true）；小节 UI 一把开关同步到所有条目 */
+  readonly: boolean;
+}
+
+export interface CompanyEnvNacos {
+  baseUrl: string;
+  username: string;
+  password: string;
+  namespaces: string[];
+  /** 只读软约束（默认 true） */
+  readonly: boolean;
+}
+
+export interface CompanyEnvElk {
+  baseUrl: string;
+  username: string;
+  password: string;
+  dataView: string;
+}
+
+/** HTTP API 认证：无 / 固定 Header / 登录换 token */
+export type CompanyEnvHttpApiAuth =
+  | { type: "none" }
+  | { type: "header"; headerName: string; headerValue: string }
+  | {
+      type: "login";
+      loginUrl: string;
+      username: string;
+      password: string;
+      /** 响应里 token 取值路径，如 `token` / `data.accessToken` */
+      tokenPath: string;
+      authHeaderName: string;
+      /** 如 `Bearer {token}` */
+      authHeaderTemplate: string;
+    };
+
+/**
+ * 业务 HTTP API（排查时 AI 调业务接口验证）。
+ * note 落 company-env.json 供 AI 读文件时看到；不进 prompt 常驻声明。
+ */
+export interface CompanyEnvHttpApi {
+  name: string;
+  env: string;
+  baseUrl: string;
+  auth: CompanyEnvHttpApiAuth;
+  /** 给 AI 的用法提示（选填），如分页参数 / token 有效期 */
+  note?: string;
+}
+
+export interface CompanyEnv {
+  servers: CompanyEnvServer[];
+  pg?: CompanyEnvPg;
+  /** 日志路径模板，如 `/apps/{project}/logs/console.log*` */
+  logPathTemplates: string[];
+  xxljob: CompanyEnvXxlJob[];
+  nacos?: CompanyEnvNacos;
+  elk?: CompanyEnvElk;
+  /** 业务 HTTP API（可多条） */
+  httpApis: CompanyEnvHttpApi[];
+}
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
@@ -294,6 +390,11 @@ export interface FeAiFlowSettings {
    * 共享 skills/ 无总开关（市场模型、按 skill 安装/卸载）。
    */
   teamKnowledgeEnabled?: boolean;
+  /**
+   * 公司环境配置（服务器 / PG / 日志 / XXL / Nacos / ELK / HTTP API）。
+   * 排查类 action 用；运行时同步到 `<dataRoot>/company-env.json` 供 skill 读。
+   */
+  companyEnv?: CompanyEnv;
 }
 
 /**
@@ -322,6 +423,16 @@ export interface ActionLayoutPref {
   order: string[];
   /** 在「推进」弹窗隐藏的 action key（v0.9.12 起直接不出现、去 /actions 页开关恢复） */
   hidden: string[];
+  /**
+   * 推进弹窗分组顺序（内置三组：builtin / team / custom）。
+   * 缺省 = ["builtin","team","custom"]；能力页可上移/下移。
+   */
+  groupOrder?: string[];
+  /**
+   * 默认折叠的组 key（推进弹窗打开时初始收起；弹窗内展开/收起是临时态、不落盘）。
+   * 缺省空 = 全展开。
+   */
+  collapsedGroups?: string[];
 }
 
 /**
@@ -475,7 +586,7 @@ export const ACTION_FRESH_AGENT_DEFAULT: Record<ActionType, boolean> = {
  *   - 自建：`<dataRoot>/skills/<name>/.flowship-action.json` → id=`app:<skill名>`、origin=`app-skill`
  *   - 共享：team clone `skills/<cat>/<name>/.flowship-action.json` → id=`team:<skill名>`、origin=`team`
  *
- * 壳字段：label / output / placeholder / requiresKnowledge / order（+ exportedAt）。
+ * 壳字段：label / output / placeholder / requiresKnowledge / requiresCompanyEnv / order（+ exportedAt）。
  * skill 名 = 目录名，不写进 json。
  *
  * 旧 `custom-actions/<id>/ACTION.md`：非 legacy 启动时迁进 skill json 后删除；
@@ -500,6 +611,11 @@ export interface CustomActionDef {
    * 自建 / 共享同构（写在 .flowship-action.json）。
    */
   requiresKnowledge?: boolean;
+  /**
+   * 本 action 依赖公司环境配置：推进弹窗选中时若未配 companyEnv，显示轻量提示（不阻断提交）。
+   * 自建 / 共享同构（写在 .flowship-action.json）。
+   */
+  requiresCompanyEnv?: boolean;
   /**
    * 旧格式残留（V0.9~v1.1 playbook 写在 ACTION.md 正文、无 skill 字段）：
    * 非空 = 该 action 已停用、只供能力页查看原文——不进推进列表、不注入运行。

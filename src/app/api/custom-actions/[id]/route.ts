@@ -74,6 +74,9 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       // 显式 false / 其它 → 清掉；仅 true 写入
       patch.requiresKnowledge = body.requiresKnowledge === true;
     }
+    if ("requiresCompanyEnv" in body) {
+      patch.requiresCompanyEnv = body.requiresCompanyEnv === true;
+    }
 
     const action = await updateCustomAction(id, patch);
     return NextResponse.json({ action });

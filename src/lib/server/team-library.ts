@@ -57,6 +57,13 @@ import {
   writeTeamSkillStates,
   type TeamSkillState,
 } from "./team-skill-states";
+import {
+  formatSensitiveScanError,
+  gateSensitiveUpload,
+  scanSensitiveFiles,
+  type SecretScanFile,
+  type SecretScanHit,
+} from "./team-library-secret-scan";
 
 export {
   getTeamLibraryKnowledgeRoot,
@@ -67,6 +74,19 @@ export {
   teamLibraryRepoDir,
   teamLibraryRoot,
 };
+
+// 敏感扫描纯函数 re-export（单测 / API 共用类型）
+export {
+  formatSensitiveScanError,
+  gateSensitiveUpload,
+  isPlaceholderSecretValue,
+  isProbablyBinaryText,
+  looksHighEntropySecret,
+  redactSecretValue,
+  scanSensitiveFiles,
+  type SecretScanFile,
+  type SecretScanHit,
+} from "./team-library-secret-scan";
 
 const execFileAsync = promisify(execFile);
 
@@ -141,12 +161,18 @@ export const KNOWLEDGE_GLOBAL_DEFAULT_ENABLED = [
 ] as const;
 
 /**
- * 默认启停策略（2026-07-22 用户拍板「全量默认安装」）：
- * 对「还不在 skill-states 表里」（= 首次发现）的 team skill **一律默认 enabled**——
- * 用户不动 = 全都有（对齐 Codex / 领导库全量注入的心智、同步即全量可用）；
- * 动了 = 个性化（卸载单个 / 团队规范总开关一键隔离仍在）。
- * 实测全量注入 ≈ 1.5 万 tokens、成本可接受、换「用户零决策」。
+ * 默认启停策略（两种场景，2026-07-24 拆开）：
+ *
+ * 1. **首次初始化**（`isFirstInit: true`）：skill-states 表空 / 文件不存在。
+ *    团队库刚 clone，存量几十个 skill 不能让用户挨个点安装 → 表外新名一律
+ *    `enabled`（对齐「同步即全量可用」；实测 ≈ 1.5 万 tokens 可接受）。
+ *
+ * 2. **后续 sync 增量**（`isFirstInit: false`）：表已非空，表外新名 = 同事新上传。
+ *    一律 `disabled`（未安装）——用户在共享市场手动点「安装」才进注入集。
+ *    旧逻辑把增量也写成 enabled，等于 sync 后自动安装，不合理。
+ *
  * 已在表里（known）的一律不动——用户改过的永不被策略覆盖。
+ * 调用方须自行判定 isFirstInit；损坏保护在 apply 层（trusted:false 绝不当首次）。
  *
  * @returns 仅含新写入项的增量表（known 里的名字不出现）
  */
@@ -155,12 +181,19 @@ export const computeDefaultSkillStates = (input: {
   skills: Array<{ name: string; relDir: string }>;
   /** 已在 skill-states 表里的名字（含用户手动改过的） */
   known: ReadonlySet<string>;
+  /**
+   * true = 表空 / 文件不存在（首次）；false = 表非空后的增量 sync。
+   * 损坏文件绝不能传 true——由 applyDefaultSkillStates 在 trusted:false 时直接跳过。
+   */
+  isFirstInit: boolean;
 }): Record<string, TeamSkillState> => {
   const next: Record<string, TeamSkillState> = {};
+  // 首次全装；增量未装（市场里点「安装」）
+  const defaultState: TeamSkillState = input.isFirstInit ? "enabled" : "disabled";
   for (const s of input.skills) {
     // 已在表里（用户改过 / 早批次默认）→ 不动；同批重名首个胜出
     if (input.known.has(s.name) || s.name in next) continue;
-    next[s.name] = "enabled";
+    next[s.name] = defaultState;
   }
   return next;
 };
@@ -627,9 +660,10 @@ const copyAppSkillIntoRepo = async (
 /**
  * sync 成功后：扫描 team 源 skill、对不在 skill-states 表里的按默认策略写入
  * enabled / disabled（见 computeDefaultSkillStates）。在表里的一律不动——
- * 用户改过的永不被策略覆盖。「首次发现」语义由「不在表里」承担、seen 记账已退役。
+ * 用户改过的永不被策略覆盖。
  * 调用方（syncInternal）已持仓锁，这里直接读改写。
  *
+ * 「首次」判定：读到的表为空（ENOENT 或合法空对象 `{}`）→ isFirstInit。
  * 损坏保护：skill-states.json 坏了绝不能当「空表首次」——否则会把用户的
  * disabled（卸载）偏好全冲成 enabled。trusted:false 时跳过，等文件恢复后再补。
  * export：单测验证「损坏 → 跳过」。
@@ -663,16 +697,22 @@ export const applyDefaultSkillStates = async (
     return;
   }
   const states = syncRead.states;
+  // 表空 / 文件不存在（ENOENT→states:{}）= 首次；表非空 = 增量。损坏已在上方跳过。
+  const isFirstInit = Object.keys(states).length === 0;
   const added = computeDefaultSkillStates({
     skills,
     known: new Set(Object.keys(states)),
+    isFirstInit,
   });
   const addedNames = Object.keys(added);
   if (addedNames.length === 0) return;
   await writeTeamSkillStates({ ...states, ...added });
-  // 全量默认 enabled 策略下不再有「默认禁用」口径——日志只报安装数，免误导排障
+  const enabledCount = addedNames.filter((n) => added[n] === "enabled").length;
+  const disabledCount = addedNames.length - enabledCount;
   console.log(
-    `[team-library] 首次发现 team skill ${addedNames.length} 个（默认安装 ${addedNames.length}）`,
+    isFirstInit
+      ? `[team-library] 首次初始化 team skill ${addedNames.length} 个（默认安装 ${enabledCount}）`
+      : `[team-library] sync 增量发现 team skill ${addedNames.length} 个（默认未安装 ${disabledCount}）`,
   );
 };
 
@@ -868,7 +908,55 @@ type CommitPushResult =
       pendingReview?: boolean;
       mrUrl?: string;
     }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      /** 敏感扫描命中（已脱敏）；有此字段时调用方勿推送 */
+      sensitiveHits?: SecretScanHit[];
+    };
+
+/**
+ * 读「已 staged、将推送」的新增/变更文本文件（跳过删除 / 二进制）。
+ * 在 git add -A 之后调用；路径相对 repoDir。
+ */
+const collectStagedTextFilesForScan = async (
+  repoDir: string,
+): Promise<SecretScanFile[]> => {
+  // -z + ACMR：只看将写入远端的路径，NUL 分隔避空格坑
+  const listed = await runGit(
+    ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+    repoDir,
+  );
+  if (!listed.ok || !listed.stdout) return [];
+  const relPaths = listed.stdout.split("\0").filter(Boolean);
+  const out: SecretScanFile[] = [];
+  for (const rel of relPaths) {
+    const abs = path.resolve(repoDir, rel);
+    // 锚定仓内（防御 git 吐出奇怪路径）
+    if (!isStrictlyInside(repoDir, abs)) continue;
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(abs);
+    } catch {
+      continue; // 偶发消失 / 目录项跳过
+    }
+    // 二进制：NUL 或非打印占比过高
+    if (buf.includes(0)) continue;
+    const sample = buf.subarray(0, Math.min(buf.length, 8192));
+    let nonPrintable = 0;
+    for (let i = 0; i < sample.length; i++) {
+      const c = sample[i]!;
+      if (c === 9 || c === 10 || c === 13) continue;
+      if (c < 32 || c === 127) nonPrintable++;
+    }
+    if (sample.length > 0 && nonPrintable / sample.length > 0.1) continue;
+    out.push({
+      path: rel.replace(/\\/g, "/"),
+      content: buf.toString("utf-8"),
+    });
+  }
+  return out;
+};
 
 const commitAndPush = async (opts: {
   repoDir: string;
@@ -886,14 +974,33 @@ const commitAndPush = async (opts: {
     tempBranch: string;
     description: string;
   };
+  /**
+   * true = 跳过敏感扫描（上传 dialog「确认无敏感信息、强制上传」误报出口）。
+   * mirror 默认 false、始终扫描。
+   */
+  force?: boolean;
 }): Promise<CommitPushResult> => {
-  const { repoDir, cleanUrl, branch, token, message, restage, mrFallback } =
-    opts;
+  const {
+    repoDir,
+    cleanUrl,
+    branch,
+    token,
+    message,
+    restage,
+    mrFallback,
+    force = false,
+  } = opts;
   // token 走 env + inline credential helper、push 用干净的 origin（不再拼 authed URL）
   const env = buildGitTokenEnv(token);
 
   const tryOnce = async (): Promise<
-    { ok: true } | { ok: false; error: string; kind: PushRejectionKind }
+    | { ok: true }
+    | {
+        ok: false;
+        error: string;
+        kind: PushRejectionKind | "sensitive";
+        sensitiveHits?: SecretScanHit[];
+      }
   > => {
     const add = await runGit(["add", "-A"], repoDir);
     if (!add.ok) {
@@ -911,6 +1018,19 @@ const commitAndPush = async (opts: {
     if (!status.stdout.trim()) {
       // 无变更：视为成功（幂等）
       return { ok: true };
+    }
+
+    // 推送前敏感扫描（force 放行误报）；命中则不 commit
+    const files = await collectStagedTextFilesForScan(repoDir);
+    const hits = scanSensitiveFiles(files);
+    const gate = gateSensitiveUpload(hits, force);
+    if (gate.blocked) {
+      return {
+        ok: false,
+        error: formatSensitiveScanError(gate.hits),
+        kind: "sensitive",
+        sensitiveHits: gate.hits,
+      };
     }
 
     const commit = await runGit(
@@ -1014,6 +1134,14 @@ const commitAndPush = async (opts: {
 
   const first = await tryOnce();
   if (first.ok) return { ok: true };
+  // 敏感命中：不重试、不降级 MR，直接把脱敏清单抛给调用方
+  if (first.kind === "sensitive") {
+    return {
+      ok: false,
+      error: first.error,
+      sensitiveHits: first.sensitiveHits,
+    };
+  }
   if (first.kind === "protected") {
     // mirror 场景（无降级参数）：保护分支拒绝直接透传 git 错误
     if (!mrFallback) return { ok: false, error: first.error };
@@ -1042,6 +1170,13 @@ const commitAndPush = async (opts: {
   }
   const second = await tryOnce();
   if (second.ok) return { ok: true };
+  if (second.kind === "sensitive") {
+    return {
+      ok: false,
+      error: second.error,
+      sensitiveHits: second.sensitiveHits,
+    };
+  }
   // 重试路径上也可能撞保护分支（如首次误判）——同样降级（mirror 无降级参数则透传）
   if (second.kind === "protected" && mrFallback) return fallbackToMR(mrFallback);
   return { ok: false, error: second.error };
@@ -1062,12 +1197,15 @@ export type UploadSkillsResult = {
   /** 保护分支降级走 MR：已提交待审核（ok 仍为 true） */
   pendingReview?: boolean;
   mrUrl?: string;
+  /** 敏感扫描命中清单（已脱敏）；有则未推送 */
+  sensitiveHits?: SecretScanHit[];
 };
 
 /** upload 实现体（不加锁）：对外入口 uploadSkillsToTeamLibrary 持仓锁后进来 */
 const uploadSkillsInternal = async (
   names: string[],
   category: string,
+  opts?: { force?: boolean },
 ): Promise<UploadSkillsResult> => {
   const unique = [
     ...new Set(
@@ -1266,6 +1404,8 @@ const uploadSkillsInternal = async (
         ...unique.map((n) => `- ${n}`),
       ].join("\n"),
     },
+    // dialog「确认无敏感信息」勾选后带 force 放行误报
+    force: opts?.force === true,
   });
 
   if (!push.ok) {
@@ -1275,6 +1415,7 @@ const uploadSkillsInternal = async (
         r.ok ? { ...r, ok: false, error: push.error } : r,
       ),
       error: push.error,
+      ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
     };
   }
   const allOk = results.every((r) => r.ok);
@@ -1289,17 +1430,20 @@ const uploadSkillsInternal = async (
  * 把本机自管 skill 上传到共享库 skills/<category>/<name>/（对外入口、进仓锁）。
  * 有对应 custom action 时写 .flowship-action.json（多挂载取第一个 + warn）。
  * main 受保护被拒时自动降级：推临时分支 + 开 MR（pendingReview:true + mrUrl）。
+ * opts.force：跳过敏感扫描阻断（误报出口；默认仍扫描）。
  */
 export const uploadSkillsToTeamLibrary = async (
   names: string[],
   category: string,
+  opts?: { force?: boolean },
 ): Promise<UploadSkillsResult> =>
-  withTeamLibraryLock(() => uploadSkillsInternal(names, category));
+  withTeamLibraryLock(() => uploadSkillsInternal(names, category, opts));
 
 /** mirror 实现体（不加锁）：对外入口 mirrorKnowledgeBase 持仓锁后进来 */
 const mirrorKnowledgeBaseInternal = async (): Promise<{
   ok: boolean;
   error?: string;
+  sensitiveHits?: SecretScanHit[];
 }> => {
   const token = await readGitToken();
   if (!token) {
@@ -1349,7 +1493,13 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
     message: "chore(knowledge): mirror wk-knowledgebase from Flowship",
     restage: stageMirror,
   });
-  if (!push.ok) return { ok: false, error: push.error };
+  if (!push.ok) {
+    return {
+      ok: false,
+      error: push.error,
+      ...(push.sensitiveHits ? { sensitiveHits: push.sensitiveHits } : {}),
+    };
+  }
   return { ok: true };
 };
 
@@ -1357,6 +1507,7 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
 export const mirrorKnowledgeBase = async (): Promise<{
   ok: boolean;
   error?: string;
+  sensitiveHits?: SecretScanHit[];
 }> => withTeamLibraryLock(() => mirrorKnowledgeBaseInternal());
 
 // ---------- list / install team actions ----------

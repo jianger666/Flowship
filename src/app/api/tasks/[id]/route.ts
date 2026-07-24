@@ -324,23 +324,49 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { status: 400 },
         );
       }
-      const task = await updateTaskFields(id, {
-        title: body.title,
-        // 用户手动改名 → 清掉自动标题挂起，避免 SDK 结果事后覆盖用户起的名
-        ...(typeof body.title === "string"
-          ? { titleAutoPending: false }
-          : {}),
-        feishuStoryUrl: body.feishuStoryUrl,
-        repoFeatureBranches: body.repoFeatureBranches,
-        addRepoPaths: body.addRepoPaths,
-        addRepoBaseBranches: body.addRepoBaseBranches,
-        addRepoTestBranches: body.addRepoTestBranches,
-        addRepoDevBranches: body.addRepoDevBranches,
-        addRepoBranchTemplates: body.addRepoBranchTemplates,
-      });
-      if (!task)
-        return NextResponse.json({ error: "not_found" }, { status: 404 });
-      return NextResponse.json({ task });
+      // 日常/需求身份（有无飞书链接）创建时定死、编辑禁止有↔无；可改具体链接
+      if ("feishuStoryUrl" in body) {
+        const current = await getTask(id);
+        if (!current)
+          return NextResponse.json({ error: "not_found" }, { status: 404 });
+        const oldHas = !!(current.feishuStoryUrl ?? "").trim();
+        const newHas =
+          body.feishuStoryUrl != null && !!String(body.feishuStoryUrl).trim();
+        if (oldHas !== newHas) {
+          return NextResponse.json(
+            { error: "日常/需求身份创建后不可改、需要请新建任务" },
+            { status: 400 },
+          );
+        }
+      }
+      try {
+        const task = await updateTaskFields(id, {
+          title: body.title,
+          // 用户手动改名 → 清掉自动标题挂起，避免 SDK 结果事后覆盖用户起的名
+          ...(typeof body.title === "string"
+            ? { titleAutoPending: false }
+            : {}),
+          feishuStoryUrl: body.feishuStoryUrl,
+          repoFeatureBranches: body.repoFeatureBranches,
+          addRepoPaths: body.addRepoPaths,
+          addRepoBaseBranches: body.addRepoBaseBranches,
+          addRepoTestBranches: body.addRepoTestBranches,
+          addRepoDevBranches: body.addRepoDevBranches,
+          addRepoBranchTemplates: body.addRepoBranchTemplates,
+        });
+        if (!task)
+          return NextResponse.json({ error: "not_found" }, { status: 404 });
+        return NextResponse.json({ task });
+      } catch (err) {
+        // updateTaskFields 身份闸门抛错 → 透传文案给前端 toast
+        if (
+          err instanceof Error &&
+          err.message.includes("日常/需求身份创建后不可改")
+        ) {
+          return NextResponse.json({ error: err.message }, { status: 400 });
+        }
+        throw err;
+      }
     }
 
     return NextResponse.json(

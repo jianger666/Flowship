@@ -213,6 +213,27 @@ export const isPlaceholderChatTitle = (title: string): boolean =>
   title.startsWith(CHAT_TITLE_PLACEHOLDER_PREFIX);
 
 /**
+ * 日常任务留空标题时的默认名：`日常 · <首仓短名> · MM-DD HH:mm`
+ * 多仓只取第一个路径末段；无仓兜底「任务」（调用方一般已拦空仓）。
+ * 时间格式跟 {@link buildPlaceholderChatTitle} 同一套 toLocaleString。
+ */
+export const buildDefaultDailyTaskTitle = (
+  repoPaths: readonly string[],
+  now: Date = new Date(),
+): string => {
+  const first = (repoPaths[0] ?? "").replace(/\/+$/, "");
+  const short =
+    first.split("/").filter(Boolean).pop() || first || "任务";
+  const when = now.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `日常 · ${short} · ${when}`;
+};
+
+/**
  * 从用户首条消息派生 chat 标题（纯截取、不调 AI）：
  * 去代码块 / 常见 markdown 标记 / 折叠空白换行 → 截到 ~24 字（CJK 占位宽、侧栏窄）、超出加省略号。
  * 全空白返回 null（调用方保留占位）。

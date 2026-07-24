@@ -4,13 +4,17 @@
  * 任务启动表单（V0.14、原 NewTaskDialog 的表单核心内联成页面组件）
  *
  * 两条入口：
- * - 看板点工作项 → 预览页（工作项详情 + 本表单）→ 标题 / 飞书链接预填
- * - 看板「手动建任务」→ `/workitems/new`（无预填）→ 标题手填、飞书链接可粘贴
+ * - 看板点工作项 → 预览页（工作项详情 + 本表单）→ 标题 / 飞书链接预填（恒为需求任务）
+ * - 看板「手动建任务」→ `/workitems/new`（无预填）→ 顶部显式二选「需求任务 / 日常任务」
+ *
+ * 手动路径任务类型（纯 UI、不落 schema）：
+ * - 需求任务（默认）：飞书链接必填；可填已有工作分支 / worktree
+ * - 日常任务：隐藏链接与分支相关字段；提交 storyUrl 空 → 服务端轻量态（原仓当前分支）
+ * 切换模式草稿保留（切走再切回链接 / 分支仍在 state）
  *
  * 零操作设计（解「不选仓库就卡住」的痛点）：
  * - 仓库预填「上次启动用的」（localStorage 记忆）、90% 场景直接点启动
  * - 真缺仓库时启动置灰 + 琥珀高亮引导（卡点可见、不是谜题）
- * - 标题预填工作项名（可改）；飞书链接：有预填则固定带入、无预填则可编辑
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -18,7 +22,8 @@ import { ChevronDown, ChevronUp, Plug, Rocket } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { CheckboxRow } from "@/components/ui/checkbox-row";
+import { ChoiceButton } from "@/components/ui/choice-button";
 import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Label } from "@/components/ui/label";
@@ -32,6 +37,7 @@ import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
 import { settingsUrl } from "@/lib/settings-link";
+import { buildDefaultDailyTaskTitle } from "@/lib/task-display";
 import { createTask } from "@/lib/task-store";
 
 import {
@@ -47,6 +53,9 @@ interface LastLaunch {
   repoPaths?: string[];
   // 旧版曾存 role、读时忽略、写时不再带
 }
+
+/** 手动建任务时的显式模式（看板预填路径不展示、恒走需求） */
+type LaunchKind = "requirement" | "daily";
 
 const readLastLaunch = (): LastLaunch => {
   try {
@@ -73,11 +82,13 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [title, setTitle] = useState(initialTitle);
   // 飞书链接：预填路径用 prop；手动路径本地可编辑（初始空时放开输入）
   const [storyUrl, setStoryUrl] = useState(feishuStoryUrl);
-  // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入
+  // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入 + 模式二选
   const urlEditable = !feishuStoryUrl.trim();
+  // 手动路径：需求任务（默认）/ 日常任务；切走再切回不丢草稿
+  const [launchKind, setLaunchKind] = useState<LaunchKind>("requirement");
   // 目标仓库（预填上次的、过滤掉已从设置删除的）
   const [repoPaths, setRepoPaths] = useState<string[]>([]);
-  // per-repo「已有工作分支」覆盖
+  // per-repo「已有工作分支」覆盖（日常模式隐藏、state 保留）
   const [featureBranches, setFeatureBranches] = useState<Record<string, string>>({});
   // 仓库下拉源（settings）
   const [repos, setRepos] = useState<RepoConfig[]>([]);
@@ -93,6 +104,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const { models: availableModels, fetchModels } = useModels();
   const branchMap = useRepoBranches(repoPaths);
   const [submitting, setSubmitting] = useState(false);
+
+  // 手动 + 选了日常 → 轻量态 UI；看板预填恒为需求任务
+  const isDailyLaunch = urlEditable && launchKind === "daily";
 
   // mount：await initSettings 后再读 cache 预填（冷启动同步 getSettings 会拿到 DEFAULT_SETTINGS）
   useEffect(() => {
@@ -135,30 +149,36 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   }, [feishuStoryUrl]);
 
   // 当前已选仓任一填了「已有工作分支」→ 强制原仓（隔离 worktree 不能检出原仓已占用的同名分支）
+  // 日常模式也强制原仓（不建分支 / worktree）
   const forcedInRepo = useMemo(
-    () => repoPaths.some((p) => !!featureBranches[p]?.trim()),
-    [repoPaths, featureBranches],
-  );
-
-  const canSubmit = useMemo(
     () =>
-      !submitting &&
-      !!title.trim() &&
-      repoPaths.length > 0 &&
-      !!storyUrl.trim(),
-    [submitting, title, repoPaths, storyUrl],
+      !isDailyLaunch &&
+      repoPaths.some((p) => !!featureBranches[p]?.trim()),
+    [isDailyLaunch, repoPaths, featureBranches],
   );
+  const forceOriginalRepo = forcedInRepo || isDailyLaunch;
+
+  const canSubmit = useMemo(() => {
+    if (submitting || repoPaths.length === 0) return false;
+    // 需求任务：标题 + 飞书链接必填；日常任务标题选填（空则提交时自动命名）
+    if (!isDailyLaunch) {
+      if (!title.trim()) return false;
+      if (!storyUrl.trim()) return false;
+    }
+    return true;
+  }, [submitting, title, repoPaths, isDailyLaunch, storyUrl]);
+
   // 缺项引导文案（启动置灰时告诉用户差什么、防隐性卡点）
   const missingHint = useMemo(() => {
-    if (!storyUrl.trim()) {
+    if (!isDailyLaunch && !storyUrl.trim()) {
       return urlEditable
         ? "粘贴飞书工作项链接即可启动"
         : "工作项链接缺失、回看板重新进入";
     }
     if (repoPaths.length === 0) return "选个目标仓库即可启动";
-    if (!title.trim()) return "填个任务标题即可启动";
+    if (!isDailyLaunch && !title.trim()) return "填个任务标题即可启动";
     return null;
-  }, [storyUrl, urlEditable, repoPaths, title]);
+  }, [isDailyLaunch, storyUrl, urlEditable, repoPaths, title]);
 
   const handleLaunch = async () => {
     if (!canSubmit) return;
@@ -186,28 +206,39 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           repo?.branchTemplate,
           settings.branchTemplate,
         );
-        const fb = featureBranches[p]?.trim();
-        if (fb) repoFeatureBranches[p] = fb;
+        // 日常不建分支——即使 state 里留着草稿也不提交
+        if (!isDailyLaunch) {
+          const fb = featureBranches[p]?.trim();
+          if (fb) repoFeatureBranches[p] = fb;
+        }
       }
 
       const task = await createTask({
         mode: "task",
-        title: title.trim(),
+        // 日常留空 → 自动「日常 · <首仓短名> · MM-DD HH:mm」；需求任务 canSubmit 已拦空标题
+        title: title.trim()
+          ? title.trim()
+          : buildDefaultDailyTaskTitle(repoPaths),
         repoPaths,
-        feishuStoryUrl: storyUrl.trim(),
+        // 日常 → 空链接触发服务端轻量态；需求 → 必有链接
+        feishuStoryUrl: isDailyLaunch ? undefined : storyUrl.trim() || undefined,
         repoBaseBranches:
           Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
         repoFeatureBranches:
-          Object.keys(repoFeatureBranches).length > 0 ? repoFeatureBranches : undefined,
+          Object.keys(repoFeatureBranches).length > 0
+            ? repoFeatureBranches
+            : undefined,
         repoTestBranches:
           Object.keys(repoTestBranches).length > 0 ? repoTestBranches : undefined,
         repoDevBranches:
           Object.keys(repoDevBranches).length > 0 ? repoDevBranches : undefined,
         repoBranchTemplates:
-          Object.keys(repoBranchTemplates).length > 0 ? repoBranchTemplates : undefined,
+          Object.keys(repoBranchTemplates).length > 0
+            ? repoBranchTemplates
+            : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
-        // forcedInRepo 时一律原仓；runInRepo 状态保留不写回、清空分支后勾选框恢复用户原值
-        isolateWorktree: forcedInRepo ? false : !runInRepo,
+        // 日常 / 已有分支 → 强制原仓；runInRepo 状态保留、条件解除后勾选框恢复用户原值
+        isolateWorktree: forceOriginalRepo ? false : !runInRepo,
         model,
       });
       // 记住这次的仓库组合、下次预填零操作（旧 LastLaunch.role 不再写入）
@@ -230,21 +261,46 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
   return (
     <div className="flex flex-col gap-4">
-      {/* 标题（预填工作项名、可改） */}
+      {/* 手动入口：显式二选，避免「留空链接」隐式触发日常 */}
+      {urlEditable && (
+        <div className="grid gap-1.5">
+          <Label>任务类型</Label>
+          <div className="flex flex-wrap gap-1.5">
+            <ChoiceButton
+              shape="chip"
+              selected={launchKind === "requirement"}
+              onClick={() => setLaunchKind("requirement")}
+              disabled={submitting}
+            >
+              需求任务
+            </ChoiceButton>
+            <ChoiceButton
+              shape="chip"
+              selected={launchKind === "daily"}
+              onClick={() => setLaunchKind("daily")}
+              disabled={submitting}
+            >
+              日常任务
+            </ChoiceButton>
+          </div>
+        </div>
+      )}
+
+      {/* 标题：需求任务必填；日常选填（留空提交时自动命名） */}
       <div className="grid gap-1.5">
-        <Label htmlFor="l-title" required>
+        <Label htmlFor="l-title" required={!isDailyLaunch}>
           任务标题
         </Label>
         <Input
           id="l-title"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          placeholder="任务标题"
+          placeholder={isDailyLaunch ? "留空自动命名" : "任务标题"}
         />
       </div>
 
-      {/* 飞书链接：仅手动入口（无预填）露出；看板进已带 URL、不占一行 */}
-      {urlEditable && (
+      {/* 飞书链接：需求任务必填（手动可编辑 / 看板预填隐藏）；日常任务整段隐藏、草稿保留 */}
+      {urlEditable && !isDailyLaunch && (
         <div className="grid gap-1.5">
           <Label htmlFor="l-story-url" required>
             飞书工作项链接
@@ -322,8 +378,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       {/* 角色选择已隐藏（v1.1.x 用户拍板「去掉」）：默认自适应——AI 从需求 + 仓库
           自己判断视角、比每单点一次枚举更省；字段保留在数据层、editing 兜底 */}
 
-      {/* 已有工作分支（选填、已自己建分支做了一部分时填） */}
-      {repoPaths.length > 0 && (
+      {/* 已有工作分支：仅需求任务（日常不建分支、无意义；切走再切回草稿仍在） */}
+      {!isDailyLaunch && repoPaths.length > 0 && (
         <div className="grid gap-1.5">
           <Label>已有工作分支（选填）</Label>
           <div className="grid gap-2">
@@ -414,23 +470,24 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         </div>
       )}
 
-      {/* worktree 开关：填了已有分支时强制不用 worktree、隐藏勾选（runInRepo state 保留、清空分支后恢复）。
-          文案围绕 worktree 表述（用户拍板：「原仓运行」大家看不懂、说清用不用 worktree） */}
-      {forcedInRepo ? (
+      {/* worktree 开关：日常 / 已有分支时强制不用 worktree、隐藏勾选
+          （runInRepo state 保留、条件解除后恢复）。文案围绕 worktree 表述 */}
+      {forceOriginalRepo ? (
         <p className="text-xs text-muted-foreground">
-          已填已有分支、本任务不使用 worktree、直接在原仓库该分支上运行
+          {isDailyLaunch
+            ? "日常任务直接在原仓库当前分支运行"
+            : "已填已有分支、本任务不使用 worktree、直接在原仓库该分支上运行"}
         </p>
       ) : (
-        <div className="flex items-center gap-2">
-          <Checkbox
-            id="l-use-worktree"
-            checked={!runInRepo}
-            onCheckedChange={(v) => setRunInRepo(!v)}
-          />
-          <Label htmlFor="l-use-worktree" className="cursor-pointer font-normal">
+        <CheckboxRow
+          checkboxId="l-use-worktree"
+          checked={!runInRepo}
+          onCheckedChange={(v) => setRunInRepo(!v)}
+        >
+          <span className="text-sm font-normal leading-none">
             使用 worktree 隔离运行（不影响原仓库、并行任务互不干扰）
-          </Label>
-        </div>
+          </span>
+        </CheckboxRow>
       )}
 
       {/* 启动 + 缺项引导 */}

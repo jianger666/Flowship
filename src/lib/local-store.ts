@@ -20,6 +20,16 @@ import type {
   ModelUsageEntry,
   UserRole,
 } from "./types";
+import {
+  emptyActionLayout,
+  normalizeCollapsedGroups,
+  normalizeGroupOrder,
+} from "./action-layout";
+import {
+  cloneCompanyEnv,
+  emptyCompanyEnv,
+  normalizeCompanyEnv,
+} from "./company-env";
 
 /** 已退役的 settings localStorage key——启动时删掉防残留脏数据被误读 */
 const LEGACY_SETTINGS_KEY = "fe-ai-flow:settings";
@@ -39,7 +49,12 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   branchTemplate: "",
   disabledMcpServers: [],
   mcpServers: {},
-  actionLayout: { order: [], hidden: [] },
+  actionLayout: {
+    order: [],
+    hidden: [],
+    groupOrder: ["builtin", "team", "custom"],
+    collapsedGroups: [],
+  },
   reuseAgentDefault: false,
   // Windows Agent shell 用 Git Bash——默认关、非 win32 UI 也不展示
   agentShellGitBash: false,
@@ -55,6 +70,8 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   feishuBridgeStreaming: true,
   // 团队规范总开关：默认开（日常注入 knowledge）；显式 false 才关
   teamKnowledgeEnabled: true,
+  // 公司环境：默认空（设置页「环境配置」填写；运行时同步 company-env.json）
+  companyEnv: emptyCompanyEnv(),
 };
 
 /**
@@ -71,6 +88,16 @@ const cloneDefaultSettings = (): FeAiFlowSettings => ({
   actionLayout: {
     order: [...(DEFAULT_SETTINGS.actionLayout?.order ?? [])],
     hidden: [...(DEFAULT_SETTINGS.actionLayout?.hidden ?? [])],
+    groupOrder: [
+      ...(DEFAULT_SETTINGS.actionLayout?.groupOrder ?? [
+        "builtin",
+        "team",
+        "custom",
+      ]),
+    ],
+    collapsedGroups: [
+      ...(DEFAULT_SETTINGS.actionLayout?.collapsedGroups ?? []),
+    ],
   },
   disabledSkills: [...(DEFAULT_SETTINGS.disabledSkills ?? [])],
   disabledRules: [...(DEFAULT_SETTINGS.disabledRules ?? [])],
@@ -78,6 +105,9 @@ const cloneDefaultSettings = (): FeAiFlowSettings => ({
   meegleProject: DEFAULT_SETTINGS.meegleProject
     ? { ...DEFAULT_SETTINGS.meegleProject }
     : undefined,
+  companyEnv: cloneCompanyEnv(
+    DEFAULT_SETTINGS.companyEnv ?? emptyCompanyEnv(),
+  ),
 });
 
 const isBrowser = (): boolean =>
@@ -97,13 +127,23 @@ const readDefaultModel = (raw: unknown): ModelSelection => {
   return { id: "" };
 };
 
-// 推进面板布局偏好归一：order / hidden 必须是字符串数组、坏值 / 缺省回退空
+// 推进面板布局偏好归一：order / hidden / 分组字段；坏值回退缺省
 const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
-  if (!raw || typeof raw !== "object") return { order: [], hidden: [] };
-  const o = raw as { order?: unknown; hidden?: unknown };
+  if (!raw || typeof raw !== "object") return emptyActionLayout();
+  const o = raw as {
+    order?: unknown;
+    hidden?: unknown;
+    groupOrder?: unknown;
+    collapsedGroups?: unknown;
+  };
   const toStrArr = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-  return { order: toStrArr(o.order), hidden: toStrArr(o.hidden) };
+  return {
+    order: toStrArr(o.order),
+    hidden: toStrArr(o.hidden),
+    groupOrder: normalizeGroupOrder(toStrArr(o.groupOrder)),
+    collapsedGroups: normalizeCollapsedGroups(toStrArr(o.collapsedGroups)),
+  };
 };
 
 /**
@@ -224,6 +264,8 @@ export const normalizeSettings = (
     feishuBridgeStreaming: parsed.feishuBridgeStreaming !== false,
     // 团队规范总开关：缺省 / 非 false → true（显式 false 才关）
     teamKnowledgeEnabled: parsed.teamKnowledgeEnabled !== false,
+    // 公司环境：缺 / 坏 → 空配置（不挡启动）
+    companyEnv: normalizeCompanyEnv(parsed.companyEnv),
   };
 };
 

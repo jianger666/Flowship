@@ -41,6 +41,8 @@ import type { GitBranchInfo, Task, TaskMode } from "@/lib/types";
 
 /** re-export：调用方 / 单测可从本模块取分支名白名单校验 */
 export { isSafeBranchName };
+/** re-export：日常轻量态判定（实现在 client-safe 的 lightweight-task） */
+export { isLightweightDailyTask } from "@/lib/lightweight-task";
 
 /**
  * resource lease 失效时 ensureTaskWorktrees 抛此错让位——
@@ -150,6 +152,22 @@ export interface WorktreeTaskLike {
 /** 本 task 是否走隔离工作区（chat 模式 / 逃生口 / 无仓库一律不隔离） */
 export const isWorktreeTask = (t: WorktreeTaskLike): boolean =>
   t.mode !== "chat" && t.isolateWorktree === true && t.repoPaths.length > 0;
+
+/**
+ * 建 task 时的 isolateWorktree 落盘决策（单一来源）。
+ * - chat → undefined（不隔离）
+ * - 无飞书链接（日常轻量态）→ 强制 false（原仓、不建分支）
+ * - 其余：显式 false 才原仓，缺省 / true → true
+ */
+export const resolveTaskIsolateWorktree = (
+  mode: TaskMode | undefined,
+  feishuStoryUrl: string | undefined,
+  isolateWorktree: boolean | undefined,
+): boolean | undefined => {
+  if (mode === "chat") return undefined;
+  if (!(feishuStoryUrl ?? "").trim()) return false;
+  return isolateWorktree !== false;
+};
 
 /**
  * 读快照判断某仓是否非 git（undefined / 未列入 = git）。

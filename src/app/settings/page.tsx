@@ -4,12 +4,12 @@
  * 设置页（壳子）
  *
  * v1.0.x 整合（用户拍板「太零散、一个 tab 下只有一两个设置项」）：8 张卡收成 4 组——
- *   连接（Cursor API Key + GitLab Token + 飞书集成）/ 偏好（跳转 IDE + 分支模板 +
+ *   连接（Cursor API Key + GitLab Token + 飞书集成 + 环境配置）/ 偏好（跳转 IDE + 分支模板 +
  *   提交快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储。
  * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航四项。
  *
  * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
- * - 旧深链兼容：?focus=api-key|feishu|git → 连接、profile|preference|model → 偏好、
+ * - 旧深链兼容：?focus=api-key|feishu|git|env → 连接、profile|preference|model → 偏好、
  *   mcp / skills → 重定向 /actions?tab=
  *
  * 拆分约定：状态管理 → hooks；配置节 → components/settings/*-card.tsx；本文件只组合。
@@ -42,11 +42,13 @@ import { RepoCard } from "@/components/settings/repo-card";
 import { StorageCard } from "@/components/settings/storage-card";
 import { GitLabSection } from "@/components/settings/git-card";
 import { PreferenceSections } from "@/components/settings/preference-card";
+import { CompanyEnvSection } from "@/components/settings/company-env-card";
 import { CheckUpdateButton } from "@/components/settings/check-update-button";
 import { DiagnosticsButton } from "@/components/settings/diagnostics-button";
 import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
+import { emptyCompanyEnv } from "@/lib/company-env";
 
-// 左侧锚点导航（v1.0.x 四组）：id 同 ?focus= 新取值
+// 左侧锚点导航（四组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
   { focus: "connect", label: "连接" },
   { focus: "prefs", label: "偏好" },
@@ -59,6 +61,8 @@ const LEGACY_FOCUS: Record<string, string> = {
   "api-key": "connect",
   feishu: "connect",
   git: "connect",
+  // 曾短暂独立「环境」分组 → 并回连接
+  env: "connect",
   profile: "prefs",
   preference: "prefs",
   model: "prefs",
@@ -247,7 +251,7 @@ const SettingsPage = () => {
           </div>
         </div>
 
-        {/* ---- 连接：外部服务凭据（Cursor / GitLab / 飞书）---- */}
+        {/* ---- 连接：外部服务凭据（Cursor / GitLab / 飞书 / 公司环境）---- */}
         {wrapCard(
           "connect",
           <Card>
@@ -285,6 +289,12 @@ const SettingsPage = () => {
                 onFeishuBridgeStreamingChange={(v) =>
                   saveFieldValue("feishuBridgeStreaming", v)
                 }
+              />
+              <Separator />
+              <CompanyEnvSection
+                value={settings.companyEnv ?? emptyCompanyEnv()}
+                onChange={(next) => update("companyEnv", next)}
+                onCommit={(next) => void saveFieldValue("companyEnv", next)}
               />
             </CardContent>
           </Card>,

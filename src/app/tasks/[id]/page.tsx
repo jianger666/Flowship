@@ -74,6 +74,7 @@ import {
   buildFixBugInstruction,
 } from "@/lib/mr-inbox";
 import { prepareRunArgs } from "@/lib/run-args";
+import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import {
   fetchTask,
   finalizeTask,
@@ -744,6 +745,15 @@ const TaskDetailPage = () => {
                 <Badge variant={REPO_STATUS_VARIANT[task.repoStatus]}>
                   {REPO_STATUS_LABEL[task.repoStatus]}
                 </Badge>
+                {/* 无飞书链接 = 日常轻量态；中性色、与 status badge 同排 */}
+                {isLightweightDailyTask(task) && (
+                  <Badge
+                    variant="secondary"
+                    className="text-[10px] font-normal"
+                  >
+                    日常
+                  </Badge>
+                )}
                 {task.runStatus === "error" ? (
                   <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground">
                     <span className="size-1.5 rounded-full bg-destructive/80" />

@@ -45,6 +45,7 @@ description: ai-flow 项目核心上下文、新对话第 1 步必读
 - **不接 LangChain / LangGraph / Mastra / CrewAI**——保持简单
 - **思考和回复永远用中文**
 - **每次对话操作前唤起 cursor-feedback、timeout 600 秒**
+- **等子代理/长任务时不要用 AwaitShell 挂倒计时干等（2026-07-24 用户两次纠正）**——等待期间一律唤起 cursor-feedback 挂着（用户随时能插话）；子代理完成靠 end-of-turn 通知回来处理
 - **代码改完跑 `pnpm typecheck` + `pnpm lint`**——用户对低级错误零容忍、warning 都不能留
 - **开发期不写向后兼容代码**：改 schema / 字段名 / EventKind 枚举 / 接口签名时、直接删旧的、不写双兼容
 

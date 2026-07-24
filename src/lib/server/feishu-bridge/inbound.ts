@@ -208,6 +208,23 @@ export const enqueueCardAction = <T>(run: () => Promise<T>): Promise<T> => {
 };
 
 /**
+ * 单测排空并重置入向链——用例超时 / 未 await 的 handler 会占住 globalThis 链，
+ * 下一用例的 inject mock 会被迟到的旧 handler 误点（R1-2a→R1-2b 串味根因）。
+ * 排空带上限：跨文件残留若卡在真实网络，不能让 beforeEach 永久挂死。
+ */
+export const __resetInboundChainForTest = async (): Promise<void> => {
+  const drainWithCap = async (state: InboundChainState): Promise<void> => {
+    await Promise.race([
+      state.current.catch(() => undefined),
+      new Promise<void>((r) => setTimeout(r, 2_000)),
+    ]);
+    state.current = Promise.resolve();
+  };
+  await drainWithCap(getInboundChain());
+  await drainWithCap(getCardActionChain());
+};
+
+/**
  * 入向消息默认处理：去重 → 路由 →（非 retryable）标记已处理 + 推进游标。
  * live stdout 与 catchUpMissedMessages 都走这里（同链）。
  */

@@ -7,8 +7,13 @@
  *   - checked / onCheckedChange：受控 boolean
  *   - indeterminate：部分选中态（「全选」父勾选框用、显示横杠）
  *   - disabled：禁用态
+ *   - onClick / tabIndex：透传（整行可点场景见 CheckboxRow）
+ *
+ * ⚠️ 渲染为 `<span role="checkbox">`、非原生 input——HTML label/htmlFor
+ * 点击联动无效。需要「点行文字也勾选」时用 CheckboxRow，别包 `<label>`。
  */
 
+import type { MouseEvent } from "react";
 import { Checkbox as CheckboxPrimitive } from "@base-ui/react/checkbox";
 import { CheckIcon, MinusIcon } from "lucide-react";
 
@@ -21,6 +26,9 @@ interface CheckboxProps {
   disabled?: boolean;
   className?: string;
   id?: string;
+  onClick?: (e: MouseEvent<HTMLElement>) => void;
+  /** CheckboxRow 内置 -1，键盘统一走行容器 */
+  tabIndex?: number;
 }
 
 export const Checkbox = ({
@@ -30,6 +38,8 @@ export const Checkbox = ({
   disabled,
   className,
   id,
+  onClick,
+  tabIndex,
 }: CheckboxProps) => {
   return (
     <CheckboxPrimitive.Root
@@ -38,6 +48,8 @@ export const Checkbox = ({
       onCheckedChange={onCheckedChange}
       indeterminate={indeterminate}
       disabled={disabled}
+      onClick={onClick}
+      tabIndex={tabIndex}
       className={cn(
         "peer flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-input shadow-xs transition-colors outline-none",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",

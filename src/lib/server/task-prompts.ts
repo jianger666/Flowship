@@ -33,6 +33,7 @@ import {
   isWorktreeTask,
   taskHasGitRepo,
 } from "./task-worktrees";
+import { renderLightweightDailySection } from "@/lib/lightweight-task";
 import {
   readSkillBodyByName,
   renderSkillsForPrompt,
@@ -270,6 +271,10 @@ export const buildSuperPrompt = async (
    * lark-cli 身份缺失登录兜底（常驻；调用方用 buildLarkCliAuthMissingRule）。
    */
   larkCliAuthSection = "",
+  /**
+   * 公司环境常驻声明（有 servers/PG 实质配置时非空；调用方用 loadCompanyEnvBriefSection）。
+   */
+  companyEnvBriefSection = "",
 ): Promise<string> => {
   const template = await loadFileSafe(SUPER_PROMPT_FILE);
   const sharedRules = await loadSharedPrompt(task);
@@ -298,6 +303,8 @@ export const buildSuperPrompt = async (
     // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
     userIdentityLine,
     repoSection: renderRepoSection(task),
+    // 日常轻量态声明（无飞书链接）：全 action 共用一段、正式任务空串
+    lightweightDailySection: renderLightweightDailySection(task),
     repoBranchSection: renderRepoBranchSection(task),
     repoPath: getTaskCwd(task),
     contextDocsSection: renderContextDocsSection(
@@ -306,6 +313,7 @@ export const buildSuperPrompt = async (
     ),
     gitlabAccessSection,
     larkCliAuthSection,
+    companyEnvBriefSection,
     rulesSection,
     skillsSection: renderSkillsForPrompt(skills),
     eventsLogPath: getEventsLogPath(task.id),

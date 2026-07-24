@@ -66,6 +66,7 @@ import {
   getTaskCwd,
   isWorktreeTask,
   removeTaskWorktrees,
+  resolveTaskIsolateWorktree,
 } from "./task-worktrees";
 import {
   cleanupCheckpointRefsForTask,
@@ -1338,16 +1339,19 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
       Object.keys(repoBranchTemplates).length > 0
         ? repoBranchTemplates
         : undefined,
-    feishuStoryUrl: input.feishuStoryUrl,
+    feishuStoryUrl: input.feishuStoryUrl?.trim() || undefined,
     contextDocs: initialContextDocs,
     disabledMcpServers:
       input.disabledMcpServers && input.disabledMcpServers.length > 0
         ? input.disabledMcpServers
         : undefined,
-    // V0.10：task 模式默认隔离工作区、显式传 false（新建弹窗逃生口）才直跑原仓库；
-    // chat 模式恒不隔离（不建分支、直接用所选目录）
-    isolateWorktree:
-      input.mode === "chat" ? undefined : input.isolateWorktree !== false,
+    // V0.10：task 模式默认隔离；chat 不隔离；无飞书链接 = 日常轻量态强制原仓
+    // （决策单一源：resolveTaskIsolateWorktree）
+    isolateWorktree: resolveTaskIsolateWorktree(
+      input.mode,
+      input.feishuStoryUrl,
+      input.isolateWorktree,
+    ),
     model: input.model,
     pinned: false,
     createdAt: now,
@@ -1817,9 +1821,15 @@ export const updateTaskFields = async (
     }
 
     // 飞书链接：改动时同步「建任务自动生成的那条 url 上下文文档」、否则 agent 读 contextDocs 仍是旧链接、两处漂移
+    // 身份闸门：isolateWorktree / 轻量态只在创建时按「有无 storyUrl」落盘一次，禁止编辑时有↔无切换
     if (input.feishuStoryUrl !== undefined) {
       const oldUrl = meta.feishuStoryUrl;
       const newUrl = input.feishuStoryUrl?.trim() || undefined;
+      const oldHas = !!(oldUrl ?? "").trim();
+      const newHas = !!newUrl;
+      if (oldHas !== newHas) {
+        throw new Error("日常/需求身份创建后不可改、需要请新建任务");
+      }
       meta.feishuStoryUrl = newUrl;
       if (oldUrl && oldUrl !== newUrl && newUrl && meta.contextDocs) {
         const doc = meta.contextDocs.find(

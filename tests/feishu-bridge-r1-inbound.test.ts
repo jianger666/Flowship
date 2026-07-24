@@ -14,6 +14,7 @@ process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
 const {
   defaultMessageHandler,
   enqueueInboundMessage,
+  __resetInboundChainForTest,
 } = await import("@/lib/server/feishu-bridge/inbound");
 const {
   __setRouterDepsForTest,
@@ -37,17 +38,59 @@ const {
 } = await import("@/lib/server/feishu-bridge/card-map");
 const { KeepAwake } = await import("@/lib/server/feishu-bridge/keep-awake");
 
+/** 路由单测公共 deps：必须 mock larkApi，否则 resolveReplyAnchorIds 打真网拖死链 */
+const baseRouterDeps = () => ({
+  getBotAppInfo: async () => ({
+    appId: "cli_x",
+    ownerOpenId: "ou_owner",
+  }),
+  sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
+  findTaskByMessageId: async () => null,
+  listTasks: async () =>
+    [
+      {
+        id: "task-1",
+        title: "t",
+        mode: "chat",
+        repoStatus: "developing",
+        runStatus: "idle",
+        updatedAt: Date.now(),
+        createdAt: Date.now(),
+      },
+    ] as never,
+  getPendingAsk: () => null,
+  // 反查 parent/root：空结果即可走活跃 chat 兜底，绝不能打真飞书
+  larkApi: async () => ({ data: { items: [] } }),
+  readSettingsFile: async () => ({
+    status: "ok" as const,
+    settings: {
+      apiKey: "sk",
+      defaultModel: { id: "gpt-5" },
+      repos: [{ path: "/tmp/r" }],
+    },
+  }),
+  listSkillsWithSource: async () => [],
+  prewarmTaskWorkspace: () => undefined,
+  createTask: async () => ({ id: "task-1" }) as never,
+});
+
 beforeEach(async () => {
+  // R1-8 若中途失败可能留下 fake timers，链重置里的 2s cap 会永不触发
+  vi.useRealTimers();
   await fs.rm(TMP, { recursive: true, force: true });
   await fs.mkdir(path.join(TMP, "data"), { recursive: true });
+  // 先排空入向链，再清盘——避免上一用例未 await 的 handler 串味
+  await __resetInboundChainForTest();
   await __resetBridgeStateForTest();
   __setCardMapMaxForTest(50);
   __setRouterDepsForTest(null);
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   __setRouterDepsForTest(null);
   __setCardMapMaxForTest(null);
+  await __resetInboundChainForTest();
   await __resetBridgeStateForTest();
   await fs.rm(TMP, { recursive: true, force: true });
 });
@@ -71,31 +114,19 @@ describe("R1-2a：入向单链按序注入", () => {
     const gateA = new Promise<void>((r) => {
       releaseA = r;
     });
+    // 确定性信号：A 进入 inject 即 resolve，替代短 timeout waitFor（高负载下假红）
+    let signalAStart!: () => void;
+    const aStarted = new Promise<void>((r) => {
+      signalAStart = r;
+    });
 
     __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-      findTaskByMessageId: async () => null,
-      listTasks: async () =>
-        [
-          {
-            id: "task-1",
-            title: "t",
-            mode: "chat",
-            repoStatus: "developing",
-            runStatus: "idle",
-            updatedAt: Date.now(),
-            createdAt: Date.now(),
-          },
-        ] as never,
-      getPendingAsk: () => null,
+      ...baseRouterDeps(),
       handleChatReplyInject: async (_id, body) => {
         const text = (body as { text?: string }).text ?? "";
         if (text === "A") {
           order.push("A-start");
+          signalAStart();
           await gateA;
           order.push("A-end");
         } else {
@@ -106,17 +137,6 @@ describe("R1-2a：入向单链按序注入", () => {
           headers: { "Content-Type": "application/json" },
         });
       },
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/r" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-      createTask: async () => ({ id: "task-1" }) as never,
     });
 
     const pA = defaultMessageHandler(
@@ -125,19 +145,21 @@ describe("R1-2a：入向单链按序注入", () => {
         content: JSON.stringify({ text: "A" }),
       }),
     );
-    // 给 A 一点时间占住链
-    await vi.waitFor(() => expect(order).toContain("A-start"), {
-      timeout: 1000,
-      interval: 5,
-    });
+    // 安全上限仅防死锁；正常路径由 aStarted 立即放行
+    await Promise.race([
+      aStarted,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("A-start 未在 10s 内到达")), 10_000),
+      ),
+    ]);
     const pB = defaultMessageHandler(
       baseRaw({
         message_id: "om_B",
         content: JSON.stringify({ text: "B" }),
       }),
     );
-    // B 已入队但不得在 A 结束前跑
-    await new Promise((r) => setTimeout(r, 30));
+    // B 已入队但不得在 A 结束前跑——用微任务/短 tick 即可，不再靠墙钟 30ms
+    await new Promise((r) => setImmediate(r));
     expect(order).toEqual(["A-start"]);
     releaseA();
     await Promise.all([pA, pB]);
@@ -155,37 +177,8 @@ describe("R1-2b / R1-13e：live+catchup 同 message_id 只注入一次", () => {
       });
     });
     __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-      findTaskByMessageId: async () => null,
-      listTasks: async () =>
-        [
-          {
-            id: "task-1",
-            title: "t",
-            mode: "chat",
-            repoStatus: "developing",
-            runStatus: "idle",
-            updatedAt: Date.now(),
-            createdAt: Date.now(),
-          },
-        ] as never,
-      getPendingAsk: () => null,
+      ...baseRouterDeps(),
       handleChatReplyInject: inject as never,
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/r" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-      createTask: async () => ({ id: "task-1" }) as never,
     });
 
     const raw = baseRaw({ message_id: "om_dup" });
@@ -243,37 +236,12 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
       }),
     );
     __setRouterDepsForTest({
+      ...baseRouterDeps(),
       getBotAppInfo: async () => {
         if (boom) throw new Error("cli jitter");
         return { appId: "cli_x", ownerOpenId: "ou_owner" };
       },
-      sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-      findTaskByMessageId: async () => null,
-      listTasks: async () =>
-        [
-          {
-            id: "task-1",
-            title: "t",
-            mode: "chat",
-            repoStatus: "developing",
-            runStatus: "idle",
-            updatedAt: Date.now(),
-            createdAt: Date.now(),
-          },
-        ] as never,
-      getPendingAsk: () => null,
       handleChatReplyInject: inject as never,
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/r" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-      createTask: async () => ({ id: "task-1" }) as never,
     });
 
     const raw = baseRaw({ message_id: "om_retry" });
@@ -289,41 +257,12 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
 
   it("内容终态（队满 409）→ 非 retryable、照 mark", async () => {
     __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-      findTaskByMessageId: async () => null,
-      listTasks: async () =>
-        [
-          {
-            id: "task-1",
-            title: "t",
-            mode: "chat",
-            repoStatus: "developing",
-            runStatus: "idle",
-            updatedAt: Date.now(),
-            createdAt: Date.now(),
-          },
-        ] as never,
-      getPendingAsk: () => null,
+      ...baseRouterDeps(),
       handleChatReplyInject: async () =>
         new Response(JSON.stringify({ error: "排队已满" }), {
           status: 409,
           headers: { "Content-Type": "application/json" },
         }),
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/r" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-      createTask: async () => ({ id: "task-1" }) as never,
     });
 
     const r409 = await routeInboundMessage({
@@ -350,41 +289,12 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
 
   it("5xx inject → retryable、不 mark", async () => {
     __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-      findTaskByMessageId: async () => null,
-      listTasks: async () =>
-        [
-          {
-            id: "task-1",
-            title: "t",
-            mode: "chat",
-            repoStatus: "developing",
-            runStatus: "idle",
-            updatedAt: Date.now(),
-            createdAt: Date.now(),
-          },
-        ] as never,
-      getPendingAsk: () => null,
+      ...baseRouterDeps(),
       handleChatReplyInject: async () =>
         new Response(JSON.stringify({ error: "upstream" }), {
           status: 503,
           headers: { "Content-Type": "application/json" },
         }),
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/r" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-      createTask: async () => ({ id: "task-1" }) as never,
     });
 
     const result: InjectResultPayload = await routeInboundMessage({

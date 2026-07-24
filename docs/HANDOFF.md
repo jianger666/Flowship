@@ -320,6 +320,15 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-07-24 日常任务 + 能力页分组 + 公司环境配置（company-env）（未发版）
+
+- **日常任务轻量模式**（源起用户「排查类 action 不对应任何飞书需求」）：新建表单顶部「需求任务 / 日常任务」二选 chip（看板预填入口不显示、恒需求）；日常任务 = 无 storyUrl——**不建 worktree 不建/切分支**（`resolveTaskIsolateWorktree` 强制原仓模式）、标题选填（`buildDefaultDailyTaskTitle`「日常 · 仓短名 · MM-DD HH:mm」）、列表/详情「日常」Badge、推进弹窗只显自定义组（wk/内置流程强依赖需求号进不来 = 风险源头消失）、prompt 注入轻量态声明（改文件可以、commit/push/建分支先问用户）；需求任务链接恢复必填（显式二分后无模糊态）。
+- **能力页 action 分组**：列表按组分区（通用 / 团队 · wk 流程按 order / 自定义），嵌套 Reorder——组头拖拽换整组序 + 组内行拖拽照旧；组头「默认折叠」Switch（推进弹窗里生效）；拖组时全组瞬时收起（200ms 过渡曾致换位判定拿漂移坐标、「第一下拖不过去」——收起瞬时/恢复平滑/换位 150ms 三段不对称处理）；推进弹窗组头精致化（组语义图标 Zap/Users/Sparkles + 数量 badge + chevron 旋转 + grid-rows 高度动画）。
+- **公司环境配置（company-env）全套**（源起把后端同事排查方法论做成共享 action、其工具 WuyaFlow 的数据源模型）：`settings.companyEnv`（服务器/PG/日志路径模板/XXL-Job/Nacos/ELK/HTTP API）——设置页「连接」尾部折叠小节表单（收起态状态摘要、PasswordInput 小眼睛、逐条列表替代 textarea）+ 导入/导出/预览模板（json 发同事一键导入）；**SDK local 无 env 透传** → 每次 Agent.create 前原子写 `<dataRoot>/company-env.json`（0600、`writePrivateFileAtomic`）、skill 脚本从固定路径读、密码不进 prompt/对话；**环境能力常驻声明**（`buildCompanyEnvBrief`、chat+task 注入「已配置哪些子系统、怎么用、禁止打印密码」）；HTTP API 认证三选（无/固定 Header/登录换 token）+ 自由 note（给 AI 的用法说明）；PG/XXL/Nacos「只读」Switch（默认开、声明里带 SELECT-only 等软约束）。
+- **排查 skill 上共享库**：`skills/backend/service-trace-debug`（action-hub cacaee8）——同事五段式排查方法论（场景词宽搜代码→日志三段式 ls/宽搜/精读→只读查库→规则与时间线对齐→结构化输出、强制区分 Bug vs 按设计）+ 反模式清单 + 凭据铁律（禁 cat company-env.json、脚本进程内读、PGPASSWORD 进程内传）+ `read-log.sh`/`query-db.sh` 封装（零内置兜底、全部从配置读）。
+- **修理**：上传/导入等 6 处「label 包 Checkbox 点行无效」收敛为 `CheckboxRow` 公共组件（base-ui checkbox 非原生 input、label 联动不生效——CDP 实测定位）；共享市场**增量新 skill 默认不装**（首次接入全装保留、`isFirstInit` 拆分）；团队库上传/镜像**敏感信息扫描闸**（五类模式、占位符豁免、命中阻断 + force 出口、snippet 脱敏）；导入失败必弹提示；feishu-bridge 两条 flaky 根治（测试隔离 + mock 真网、确认非生产去重窗口）。
+- 记录：用户同事自建了同类工具 WuyaFlow（Windows、数据源模型可借鉴：stageKeywords 阶段默认指令、grill-me 高压澄清 skill）。
+
 ### 2026-07-23 自动更新体验重构（状态机 + 页面进度 + 端口占用/重复点击回归修复、随 v1.4.1 发）
 
 - **背景（用户手机反馈三连）**：mac 点「新版本」没下载进度条、再点必弹「自动更新失败」、每次升级重启必弹「端口被占用」。排查结论：全是 `45eb485`（mac 延迟替换）回归——下载前移到发现新版时后台暂存（点徽标时已无下载可看、进度本来也只画在 Dock）、`installUpdateNow`/`applyStagedUpdate` 无安装互斥（二次点击吃空已被 rename 消费的暂存必炸）、「立即更新」走 `app.relaunch()+app.exit(0)` 而 **`app.exit` 不触发 `before-quit`**（唯一杀 server 的钩子被绕过 → 旧 server 孤儿占 8876 → 新实例必弹端口占用）。
@@ -329,17 +338,6 @@ ai-flow-action-hub/
 - **win 静默安装**：`quitAndInstall(true, true)`（`oneClick:false` 下不传 isSilent 会弹完整 NSIS 向导、与 electron-builder.yml「自更新走 /S」注释不符的存量 bug）；**不在 quitAndInstall 前杀 server**（蓝军 P0：`install()` 失败不退出时 app 变没后端的僵尸）、靠 before-quit 树杀；`error` 事件 installing 态回滚 quitting=false + phase→ready。
 - **前端**：`update-badge.tsx` 纯状态驱动（「新版本 vX / 下载中 x% / 重启更新 vX / 更新中…」、ready 与 available 分文案 confirm）、先订阅 onState 再 getState（防旧快照倒退进度）；preload `__appUpdater` 桥扩展 install/getState/onState（install 替代 `app-update://` 伪协议、will-navigate 拦截保留兜底）；`window.__appUpdater`/`__appVersion` 全局类型收敛到 `src/lib/app-updater.ts`。手动「检查更新」mac 打包环境也触发后台暂存（对齐轮询）。
 - 蓝军 review 两轮 + 终审「可合入」：一轮 1 P0（win 提前杀 server）+ 4 P1；二轮 4 P1（改盘/停服顺序、win installing 短路、quitting 回滚守卫、installing 期 staging 门闩）+ 验收揪出「旧 server 迟到 exit 误杀新 server」竞态 → `startServer` 世代守卫（exit/error handler `serverProc !== proc` 时只记日志）+ `stopServer` SIGKILL 后短等 1s 回收、`applyStagedUpdate` 失败恢复按 `hadRunningServer` 拉回 server。轮询/手动检查在 downloading/installing 中不打断状态机（下载 A 时发布 B 下轮自愈）。门禁 typecheck / lint / 1413 测试全绿。**win 真机未验**（mac 开发机）——发版后需 win 同事验证：静默安装不弹向导、升级重启无端口弹窗、任务栏+徽标进度。
-
-### 2026-07-23 首包可靠性 + REQ-ID 无感注入 + 收尾修理批（随 v1.4.0 发）
-
-- **首包可靠性批（源起同事实测「task 发消息 10 分钟 AI 才动」）**：① SDK 全调用超时保护——新 `sdk-deadline.ts`（`withSdkDeadline`：create/resume 180s、send 120s；超时走既有错误/重连链、late 收尸 `reapLateSdkResult` 防「超时但实际成功」孤儿 agent）；② 假死 run 主动中止（`abortStuckRunForSend`：90s drain 失败先 cancel 再继续 send、instanceId CAS 强删）；③ 发送后进度可见（question/advance 受理即落「正在恢复会话/启动 agent/准备工作区…」info）；④ 依赖拷贝不挡首包（oneshot `skipDepClone`、正式路径 `deferDepClone` 后台补拷）。根因结论：最像 10 分钟的是「半死连接 + 裸 await 无超时（OS TCP 重传 10~15min）」、非依赖拷贝。
-- **P0 修复（终审 review 揪出、并发所有权族）**：假死恢复刻意保留 session 给后继复用、但旧 consume 退场时 `yieldIfSuperseded → closeMySession` 会把刚恢复成功的共享 session 一起关——收敛为「session 关闭只能由当前持有者执行」：表内 instance 仍被占用时只 cancel 自己的 run、禁止 close；三个清理入口（forceClearStaleRunnerState / abortStuckRunForSend / yieldIfSuperseded）所有权语义注释对齐。
-- **REQ-ID 无感注入（wk-harness 对接）**：`src/lib/req-id.ts` `deriveReqId(task)`——绑需求链接 → `REQ-<story号>`（复用 `extractFeishuStoryId`、跨人收敛到同一业务号）、否则 `REQ-TASK-<task尾段>`；`_super.md` 任务基本信息段注入「默认 REQ-ID」行（自解释措辞、非 wk 流程忽略、用户显式指定优先）。共享库 9 个 wk 壳同步：`.flowship-action.json` 加 `order`（10~90 流程序、`listCustomActions` 有 order 排前）+ placeholder 去 REQ-ID 提示 + SKILL.md「REQ-ID 优先取上下文默认」（action-hub commit ed3b8f7）。
-- **事件流本地图片终修**：真根因是 Streamdown 默认 rehype-sanitize 把 `file://`/绝对路径 img src 剥掉——新 `rehypeRewriteLocalImages`（sanitize **前**改写到 `/api/local-image`）+ `STREAMDOWN_REHYPE_PLUGINS` 三处共用（markdown-text / artifact-panel / artifact-revision-view）。
-- **完整输出加载失败修复**：子代理工具 callId 含换行、落盘名已消毒但 route 用原始 callId 过 `isSafeId` 直接 400——route 先消毒再校验、前端改传 fullPath basename、404 文案降级。
-- **交互修理**：ask_user「提问即收尾」双指令源（chat-mcp describe + `_super.md`：背景写进 question 字段、调用后不再输出总结段落防答题卡被顶走）；task 停止键下移输入条（chat 同款）+ 顶栏转圈/停止合一（hover 变红）；推进按钮 pending-ask 时拦截；模型选择器跟随态显示实际模型名；MCP 计数改有效交集（修 `-1/8`）；重复创建 action 返 409（`CustomActionFsError.code` 替代文案子串）；首启迁移与预置安装串行化；lark-cli 身份缺失主动引导登录（`buildLarkCliAuthMissingRule`）。
-- **SDK 1.0.23 → 1.0.24**；两轮发版前全量 review（96 文件 +4244/-1754）扫出 1 P0 + 3 P1 全修复。
-
 
 ## 关键文件索引
 

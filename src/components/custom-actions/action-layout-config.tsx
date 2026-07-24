@@ -3,17 +3,20 @@
 /**
  * Action 管理列表（V0.9、嵌在 /actions 页、内置 + 自定义统一一个地方管）
  *
- * 内置 + 自定义混排成一个列表：拖拽调「推进」里的顺序（framer-motion Reorder）+ 开关控显隐、
- * 自定义项带「自定义」Badge、且额外给「编辑 / 删除」入口（内置不可改不可删）。
+ * 按固定三组分区展示：组头可拖拽换组序（framer-motion Reorder）+ 「默认折叠」开关；
+ * 组内 action 行同套拖拽调「推进」顺序 + 开关控显隐。
  * 隐藏的在「推进」弹窗直接不出现（v0.9.12 删「更多」折叠区、本页开关是唯一恢复入口）。
- * 顺序 / 显隐偏好落 config.json（settings.actionLayout）、个人级、全任务生效。
+ * 顺序 / 显隐 / 组序 / 默认折叠落 config.json（settings.actionLayout）、个人级、全任务生效。
  * 拖拽：onReorder 只更新本地态、松手（onDragEnd）才落盘——避免拖动过程狂发 config.json 写请求。
  *
+ * 组头拖拽：开始拖任意组时全体临时收起只留组头（Notion/Trello section 同款），
+ * 松手恢复拖前展开态（能力页常态 = 组内全展开；「默认折叠」只影响推进弹窗）。
  * 行操作一律常驻文字按钮（与 Skill tab 统一；废除纯 icon）。
  * T24：Reorder layout 动画只在拖拽会话中启用——mount / 数据回灌不重放位移。
+ * 空组：能力页仍显示组头（可配折叠）；推进弹窗空组不渲染。
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Reorder, useDragControls } from "framer-motion";
 import { GripVertical, Loader2 } from "lucide-react";
 
@@ -35,14 +38,22 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Switch } from "@/components/ui/switch";
 import { useSettings } from "@/hooks/use-settings";
 import {
+  ACTION_GROUP_LABEL,
   BUILTIN_ADVANCE_ACTIONS,
+  DEFAULT_GROUP_ORDER,
   isBuiltinAdvanceAction,
+  normalizeCollapsedGroups,
+  normalizeGroupOrder,
+  partitionActionsByGroup,
+  resolveActionGroup,
   sortByOrder,
+  type ActionGroupKey,
 } from "@/lib/action-layout";
 import { fetchCustomActions } from "@/lib/custom-action-client";
 import { ACTION_DESC, ACTION_LABEL } from "@/lib/task-display";
 import {
   labelTeamCategoryBadge,
+  type ActionLayoutPref,
   type CustomActionDef,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -50,6 +61,10 @@ import { cn } from "@/lib/utils";
 /** 行内次要操作：紧凑 ghost 文字按钮（查看/编辑/删除/卸载/转建共用基线） */
 const ROW_ACTION_BTN =
   "h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground";
+
+/** 组头 / action 行共用拖拽手柄样式（视觉一致） */
+const DRAG_HANDLE_CLASS =
+  "cursor-grab touch-none text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing";
 
 interface Props {
   // 当前自定义 action 列表（由 /actions 页加载后传入、增删后自动反映）
@@ -195,7 +210,7 @@ const LayoutRow = ({
       <button
         type="button"
         onPointerDown={(e) => controls.start(e)}
-        className="cursor-grab touch-none text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+        className={DRAG_HANDLE_CLASS}
         title="拖拽排序"
       >
         <GripVertical className="size-4" />
@@ -347,6 +362,105 @@ const LayoutRow = ({
   );
 };
 
+/** 一组：可拖拽组头（换组序）+ 组内 action Reorder */
+const GroupSection = ({
+  groupKey,
+  keys,
+  collapsedDefault,
+  layoutEnabled,
+  // 拖任意组头时全体 true → 组内 action height 收起，松手恢复
+  collapseActions,
+  onGroupDragSessionStart,
+  onGroupDragEnd,
+  onToggleCollapsed,
+  onActionReorder,
+  renderRow,
+}: {
+  groupKey: ActionGroupKey;
+  keys: string[];
+  collapsedDefault: boolean;
+  layoutEnabled: boolean;
+  collapseActions: boolean;
+  onGroupDragSessionStart: () => void;
+  onGroupDragEnd: () => void;
+  onToggleCollapsed: (on: boolean) => void;
+  onActionReorder: (nextKeys: string[]) => void;
+  renderRow: (key: string) => ReactNode;
+}) => {
+  // 组头独立拖拽控制器——只手柄发起、不误触「默认折叠」开关
+  const controls = useDragControls();
+  return (
+    <Reorder.Item
+      value={groupKey}
+      initial={false}
+      // position：只跟 x/y。换位判定看 onLayoutMeasure 的流式盒 + drag offset
+      //（framer check-reorder），不跟兄弟投影中间态——短 layout tween 安全；
+      // 高度收起（grid-rows）才是漂移元凶，必须瞬时。
+      layout="position"
+      transition={
+        collapseActions
+          ? // 拖组中：兄弟挤开让位（~150ms tween）；收起高度仍无过渡
+            { layout: { duration: 0.15, ease: "easeOut" } }
+          : layoutEnabled
+            ? { layout: { type: "spring", stiffness: 450, damping: 32 } }
+            : { layout: { duration: 0 } }
+      }
+      dragListener={false}
+      dragControls={controls}
+      onDragStart={onGroupDragSessionStart}
+      onDragEnd={onGroupDragEnd}
+      className="grid gap-1.5"
+    >
+      {/* 组头：手柄 + 标题 + 数量 + 默认折叠（空组也显示，方便配折叠） */}
+      <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
+        <button
+          type="button"
+          onPointerDown={(e) => controls.start(e)}
+          className={DRAG_HANDLE_CLASS}
+          title="拖拽调整组顺序"
+        >
+          <GripVertical className="size-4" />
+        </button>
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+          {ACTION_GROUP_LABEL[groupKey]}
+        </span>
+        <span className="shrink-0 tabular-nums text-xs text-muted-foreground/70">
+          {keys.length}
+        </span>
+        <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <span>默认折叠</span>
+          <Switch
+            checked={collapsedDefault}
+            onCheckedChange={onToggleCollapsed}
+          />
+        </label>
+      </div>
+      {/* 组内 action：收起瞬时（拖中 y 坐标不能漂）、展开平滑；勿用 display:none */}
+      {keys.length > 0 && (
+        <div
+          className={cn(
+            "grid",
+            collapseActions
+              ? "grid-rows-[0fr]"
+              : "grid-rows-[1fr] transition-[grid-template-rows] duration-200 ease-out",
+          )}
+        >
+          <div className="min-h-0 overflow-hidden">
+            <Reorder.Group
+              axis="y"
+              values={keys}
+              onReorder={onActionReorder}
+              className="grid gap-1.5"
+            >
+              {keys.map((key) => renderRow(key))}
+            </Reorder.Group>
+          </div>
+        </div>
+      )}
+    </Reorder.Item>
+  );
+};
+
 export const ActionLayoutConfig = ({
   customActions,
   knownSkills,
@@ -372,6 +486,9 @@ export const ActionLayoutConfig = ({
   );
   // 拖拽会话中才开 Reorder layout 动画（T24：防切 tab / 进页重放）
   const [dragging, setDragging] = useState(false);
+  // 正在拖组头：全体组临时收起只留组头（Notion section 同款）；松手恢复展开
+  // 收起必须瞬时（无过渡）——过渡期 y 漂移会让 Reorder 换位判定失灵
+  const [draggingGroup, setDraggingGroup] = useState(false);
   // 父 props 指纹变化（新建 / 编辑 / 删除）时清覆写、以父为准
   const parentKey = customActions.map((a) => `${a.id}:${a.updatedAt ?? a.label}`).join("|");
   useEffect(() => {
@@ -379,11 +496,26 @@ export const ActionLayoutConfig = ({
   }, [parentKey]);
 
   const effectiveActions = actionsOverride ?? customActions;
-  const layout = settings.actionLayout ?? { order: [], hidden: [] };
+  const layout = settings.actionLayout ?? {
+    order: [],
+    hidden: [],
+    groupOrder: [...DEFAULT_GROUP_ORDER],
+    collapsedGroups: [],
+  };
   const hiddenSet = new Set(layout.hidden);
   // 自管关闭名单（settings 响应式；开/关 skill 后 Action 列表即标「skill 已关闭」）
   const disabledSkills = new Set(settings.disabledSkills ?? []);
-  const customById = new Map(effectiveActions.map((d) => [d.id, d] as const));
+  // Map 引用稳定：避免每次 render 新 Map 触发 sections useMemo 重算
+  const customById = useMemo(
+    () => new Map(effectiveActions.map((d) => [d.id, d] as const)),
+    [effectiveActions],
+  );
+
+  // 设置里的组序 / 默认折叠（落盘源）
+  const settingsGroupOrder = normalizeGroupOrder(layout.groupOrder);
+  const collapsedGroupSet = new Set(
+    normalizeCollapsedGroups(layout.collapsedGroups),
+  );
 
   // 混排全序（内置 + 自定义、按 order 排、增删 custom 自动反映）
   const computedOrder = sortByOrder(
@@ -391,10 +523,16 @@ export const ActionLayoutConfig = ({
     layout.order,
   );
 
-  // 本地拖拽态：拖动中实时更新（不落盘）、松手才 persist；orderRef 给松手 / 显隐回调读最新顺序
+  // 本地拖拽态：拖动中实时更新（不落盘）、松手才 persist
   const [order, setOrder] = useState<string[]>(computedOrder);
   const orderRef = useRef(order);
   orderRef.current = order;
+  // 组序本地态（组头拖拽）；与 settings 同步
+  const [groupOrderLocal, setGroupOrderLocal] =
+    useState<ActionGroupKey[]>(settingsGroupOrder);
+  const groupOrderRef = useRef(groupOrderLocal);
+  groupOrderRef.current = groupOrderLocal;
+
   // computedOrder 内容变了（增删 custom / 外部改 order）才回灌——用 join 当指纹、避免每 render 重置打断拖拽
   const computedKey = computedOrder.join("|");
   useEffect(() => {
@@ -402,8 +540,45 @@ export const ActionLayoutConfig = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [computedKey]);
 
-  // 落盘：order 始终用最新本地顺序、清理已删除的 custom id 残留
-  const persist = (nextOrder: string[], nextHidden: string[]) => {
+  const settingsGroupKey = settingsGroupOrder.join("|");
+  useEffect(() => {
+    setGroupOrderLocal(settingsGroupOrder);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsGroupKey]);
+
+  // 按当前本地 order + 组序分桶（空组也出、能力页要能配折叠）
+  const sections = useMemo(
+    () =>
+      partitionActionsByGroup(order, customById, groupOrderLocal, {
+        includeEmpty: true,
+      }),
+    [order, customById, groupOrderLocal],
+  );
+
+  /** 从扁平 order 按归属拆成三组桶（组内相对序保留） */
+  const bucketsFromFlat = (flat: string[]) => {
+    const buckets: Record<ActionGroupKey, string[]> = {
+      builtin: [],
+      team: [],
+      custom: [],
+    };
+    for (const key of flat) {
+      buckets[resolveActionGroup(key, customById)].push(key);
+    }
+    return buckets;
+  };
+
+  const flatFromBuckets = (
+    groups: ActionGroupKey[],
+    buckets: Record<ActionGroupKey, string[]>,
+  ) => groups.flatMap((g) => buckets[g]);
+
+  // 落盘：order / 组序 / 折叠字段一并写入；清理已删除 custom id
+  const persist = (
+    nextOrder: string[],
+    nextHidden: string[],
+    groupPatch?: Pick<ActionLayoutPref, "groupOrder" | "collapsedGroups">,
+  ) => {
     const valid = new Set<string>([
       ...BUILTIN_ADVANCE_ACTIONS,
       ...effectiveActions.map((d) => d.id),
@@ -411,13 +586,58 @@ export const ActionLayoutConfig = ({
     saveFieldValue("actionLayout", {
       order: nextOrder.filter((k) => valid.has(k)),
       hidden: nextHidden.filter((k) => valid.has(k)),
+      groupOrder: groupPatch?.groupOrder ?? groupOrderRef.current,
+      collapsedGroups:
+        groupPatch?.collapsedGroups ??
+        normalizeCollapsedGroups(layout.collapsedGroups),
+    } satisfies ActionLayoutPref);
+  };
+
+  const toggleCollapsedDefault = (key: ActionGroupKey, on: boolean) => {
+    const set = new Set(collapsedGroupSet);
+    if (on) set.add(key);
+    else set.delete(key);
+    persist(orderRef.current, layout.hidden, {
+      collapsedGroups: [...set],
     });
   };
 
-  const handleDragEnd = () => {
-    persist(orderRef.current, layout.hidden);
+  const endDragSession = () => {
     // 松手后再关 layout 动画，让落位 spring 跑完（立刻关会 snap）
     window.setTimeout(() => setDragging(false), 280);
+  };
+
+  /** 组头开始拖：全体临时收起（只剩三行组头） */
+  const handleGroupDragStart = () => {
+    setDragging(true);
+    setDraggingGroup(true);
+  };
+
+  /** 组头拖拽松手 / 取消：立刻恢复展开 + 落盘组序 */
+  const handleGroupDragEnd = () => {
+    setDraggingGroup(false);
+    persist(orderRef.current, layout.hidden, {
+      groupOrder: groupOrderRef.current,
+    });
+    endDragSession();
+  };
+
+  /** 组内 action 拖拽松手 */
+  const handleActionDragEnd = () => {
+    persist(orderRef.current, layout.hidden);
+    endDragSession();
+  };
+
+  const handleGroupReorder = (nextGroups: ActionGroupKey[]) => {
+    setGroupOrderLocal(nextGroups);
+    const buckets = bucketsFromFlat(orderRef.current);
+    setOrder(flatFromBuckets(nextGroups, buckets));
+  };
+
+  const handleActionReorder = (groupKey: ActionGroupKey, nextKeys: string[]) => {
+    const buckets = bucketsFromFlat(orderRef.current);
+    buckets[groupKey] = nextKeys;
+    setOrder(flatFromBuckets(groupOrderRef.current, buckets));
   };
 
   const toggleHidden = (key: string, visible: boolean) => {
@@ -436,121 +656,138 @@ export const ActionLayoutConfig = ({
     }
   };
 
+  const renderRow = (key: string) => {
+    const def = customById.get(key);
+    // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留转建 / 查看原内容 + 删除
+    const isLegacy = !!def?.legacyPlaybook;
+    // 派生 team action：定义在共享库、不可编辑 / 导出、删除 = 卸载
+    const isTeam = def?.origin === "team";
+    const skillName = def?.skill?.trim() ?? "";
+    // 自建 action 挂自管 skill 且该 skill 在 disabledSkills → 推进面板隐藏、本列表置灰
+    const skillDisabled =
+      !!def &&
+      !isLegacy &&
+      !isTeam &&
+      !!skillName &&
+      appSkillNames !== null &&
+      appSkillNames.has(skillName) &&
+      disabledSkills.has(skillName);
+    // 团队规范总开关关 + requiresKnowledge → 同视觉（推进面板已隐藏该行）
+    const knowledgeDisabled =
+      !!def &&
+      def.requiresKnowledge === true &&
+      settings.teamKnowledgeEnabled === false;
+    const builtin =
+      isBuiltinAdvanceAction(key) && key in ACTION_DESC
+        ? (key as keyof typeof ACTION_DESC)
+        : null;
+    return (
+      <LayoutRow
+        key={key}
+        value={key}
+        label={
+          isBuiltinAdvanceAction(key)
+            ? ACTION_LABEL[key]
+            : (def?.label ?? key)
+        }
+        isCustom={!isBuiltinAdvanceAction(key)}
+        isHidden={hiddenSet.has(key)}
+        isLegacy={isLegacy}
+        isTeam={isTeam}
+        skillDisabled={skillDisabled}
+        knowledgeDisabled={knowledgeDisabled}
+        description={builtin ? ACTION_DESC[builtin] : undefined}
+        teamBadge={
+          isTeam && def
+            ? labelTeamCategoryBadge(def.teamCategory)
+            : undefined
+        }
+        author={isTeam ? def?.author : undefined}
+        layoutEnabled={dragging}
+        onDragSessionStart={() => setDragging(true)}
+        onView={
+          isTeam && def
+            ? () =>
+                setViewingTeam({
+                  label: def.label,
+                  skillName: def.skill,
+                  placeholder: def.placeholder,
+                  categoryLabel: labelTeamCategoryBadge(def.teamCategory),
+                  author: def.author,
+                })
+            : builtin
+              ? () =>
+                  setViewingBuiltin({
+                    label: ACTION_LABEL[builtin],
+                    description: ACTION_DESC[builtin],
+                  })
+              : undefined
+        }
+        // 主 skill：knownSkills 没拉到（null）时不标缺失、避免加载中误报；
+        // legacy 无挂载 skill（空串）、chips 不展示；已关闭不算缺失
+        skills={
+          def && !isLegacy
+            ? [def.skill].map((name) => ({
+                name,
+                missing:
+                  knownSkills !== null &&
+                  !knownSkills.has(name) &&
+                  !skillDisabled,
+              }))
+            : undefined
+        }
+        onToggleHidden={(visible) => toggleHidden(key, visible)}
+        onDragEnd={handleActionDragEnd}
+        onEdit={def && !isLegacy && !isTeam ? () => onEdit(def) : undefined}
+        onDelete={
+          def
+            ? () => {
+                // 父删完再本地重拉：覆盖「仅 override 里有、父 state 不知」的安装项
+                void Promise.resolve(onDelete(def)).then(() => {
+                  void reloadActionsLocally();
+                });
+              }
+            : undefined
+        }
+        onViewLegacy={def && isLegacy ? () => onViewLegacy(def) : undefined}
+        onConvertLegacy={
+          def && isLegacy ? () => onConvertLegacy(def) : undefined
+        }
+        converting={!!def && convertingLegacyId === def.id}
+      />
+    );
+  };
+
   if (!loaded) return <LoadingState variant="inline" />;
 
   return (
     <div className="space-y-3">
+      {/* 外层：组可拖拽换序；每组内嵌 action Reorder */}
       <Reorder.Group
         axis="y"
-        values={order}
-        onReorder={setOrder}
-        className="grid gap-1.5"
+        values={groupOrderLocal}
+        onReorder={handleGroupReorder}
+        className="grid gap-3"
       >
-        {order.map((key) => {
-          const def = customById.get(key);
-          // 旧格式（playbook 写正文）已停用：不可编辑 / 导出、只留转建 / 查看原内容 + 删除
-          const isLegacy = !!def?.legacyPlaybook;
-          // 派生 team action：定义在共享库、不可编辑 / 导出、删除 = 卸载
-          const isTeam = def?.origin === "team";
-          const skillName = def?.skill?.trim() ?? "";
-          // 自建 action 挂自管 skill 且该 skill 在 disabledSkills → 推进面板隐藏、本列表置灰
-          const skillDisabled =
-            !!def &&
-            !isLegacy &&
-            !isTeam &&
-            !!skillName &&
-            appSkillNames !== null &&
-            appSkillNames.has(skillName) &&
-            disabledSkills.has(skillName);
-          // 团队规范总开关关 + requiresKnowledge → 同视觉（推进面板已隐藏该行）
-          const knowledgeDisabled =
-            !!def &&
-            def.requiresKnowledge === true &&
-            settings.teamKnowledgeEnabled === false;
-          const builtin =
-            isBuiltinAdvanceAction(key) && key in ACTION_DESC
-              ? (key as keyof typeof ACTION_DESC)
-              : null;
-          return (
-            <LayoutRow
-              key={key}
-              value={key}
-              label={
-                isBuiltinAdvanceAction(key)
-                  ? ACTION_LABEL[key]
-                  : (def?.label ?? key)
-              }
-              isCustom={!isBuiltinAdvanceAction(key)}
-              isHidden={hiddenSet.has(key)}
-              isLegacy={isLegacy}
-              isTeam={isTeam}
-              skillDisabled={skillDisabled}
-              knowledgeDisabled={knowledgeDisabled}
-              description={builtin ? ACTION_DESC[builtin] : undefined}
-              teamBadge={
-                isTeam && def
-                  ? labelTeamCategoryBadge(def.teamCategory)
-                  : undefined
-              }
-              author={isTeam ? def?.author : undefined}
-              layoutEnabled={dragging}
-              onDragSessionStart={() => setDragging(true)}
-              onView={
-                isTeam && def
-                  ? () =>
-                      setViewingTeam({
-                        label: def.label,
-                        skillName: def.skill,
-                        placeholder: def.placeholder,
-                        categoryLabel: labelTeamCategoryBadge(def.teamCategory),
-                        author: def.author,
-                      })
-                  : builtin
-                    ? () =>
-                        setViewingBuiltin({
-                          label: ACTION_LABEL[builtin],
-                          description: ACTION_DESC[builtin],
-                        })
-                    : undefined
-              }
-              // 主 skill：knownSkills 没拉到（null）时不标缺失、避免加载中误报；
-              // legacy 无挂载 skill（空串）、chips 不展示；已关闭不算缺失
-              skills={
-                def && !isLegacy
-                  ? [def.skill].map((name) => ({
-                      name,
-                      missing:
-                        knownSkills !== null &&
-                        !knownSkills.has(name) &&
-                        !skillDisabled,
-                    }))
-                  : undefined
-              }
-              onToggleHidden={(visible) => toggleHidden(key, visible)}
-              onDragEnd={handleDragEnd}
-              onEdit={
-                def && !isLegacy && !isTeam ? () => onEdit(def) : undefined
-              }
-              onDelete={
-                def
-                  ? () => {
-                      // 父删完再本地重拉：覆盖「仅 override 里有、父 state 不知」的安装项
-                      void Promise.resolve(onDelete(def)).then(() => {
-                        void reloadActionsLocally();
-                      });
-                    }
-                  : undefined
-              }
-              onViewLegacy={
-                def && isLegacy ? () => onViewLegacy(def) : undefined
-              }
-              onConvertLegacy={
-                def && isLegacy ? () => onConvertLegacy(def) : undefined
-              }
-              converting={!!def && convertingLegacyId === def.id}
-            />
-          );
-        })}
+        {sections.map((section) => (
+          <GroupSection
+            key={section.key}
+            groupKey={section.key}
+            keys={section.keys}
+            collapsedDefault={collapsedGroupSet.has(section.key)}
+            layoutEnabled={dragging}
+            collapseActions={draggingGroup}
+            onGroupDragSessionStart={handleGroupDragStart}
+            onGroupDragEnd={handleGroupDragEnd}
+            onToggleCollapsed={(on) =>
+              toggleCollapsedDefault(section.key, on)
+            }
+            onActionReorder={(nextKeys) =>
+              handleActionReorder(section.key, nextKeys)
+            }
+            renderRow={renderRow}
+          />
+        ))}
       </Reorder.Group>
 
       {viewingTeam && (

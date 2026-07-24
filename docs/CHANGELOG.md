@@ -15,6 +15,10 @@
 
 ---
 
+### 2026-07-23 首包可靠性 + REQ-ID 无感注入 + 收尾修理批（随 v1.4.0 发）
+
+> 详细内容见当日 HANDOFF 快照（迁移时保留原文于 git 历史 a0f0dc6）；要点：sdk-deadline 超时保护（create/resume 180s、send 120s、late 收尸）、假死 run 主动中止（instanceId CAS）、「session 关闭只能由当前持有者执行」协议收敛、发送后进度 info、依赖拷贝不挡首包（skipDepClone/deferDepClone）、REQ-ID 派生注入（story 号优先/REQ-TASK 兜底）、共享库 wk 壳 order 流程序 + placeholder 精简、事件流本地图片 rehype 改写、完整输出 callId 换行修复、ask_user 提问即收尾、停止键下移合并、SDK 1.0.24。
+
 ### 2026-07-22 团队库（组共享库 + 知识库镜像 + 市场模型）（随 v1.4.0 发）
 
 - **背景**：用户下周部门分享、定位转向「推进式 AI 工作方式」；部门领导已有一套 harness（wk-knowledgebase：43 工程知识档案 + 53 个 Codex skill + wk:* 指令流 + python 门禁），Flowship 定位其「驾驶舱」。当天一整天与用户多轮拍板迭代出最终形态（详见 HANDOFF「当前架构快照 → 团队库」节）。

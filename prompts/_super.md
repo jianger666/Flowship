@@ -11,6 +11,8 @@
 {{userIdentityLine}}
 - {{repoSection}}
 
+{{lightweightDailySection}}
+
 > ⚠️ 以上「任务标题 / 飞书链接」是 **task 启动那一刻的快照**。用户中途可能在详情页改这几项——一旦后续某条 `[NEXT_ACTION]` 头下面跟了 `[TASK_UPDATED]` 段、**以那里列的最新值为准**、忽略本段旧值。
 
 ## 仓库分支配置
@@ -22,6 +24,8 @@
 {{gitlabAccessSection}}
 
 {{larkCliAuthSection}}
+
+{{companyEnvBriefSection}}
 
 ## 用户规则（必遵守）
 

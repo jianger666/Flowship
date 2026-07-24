@@ -531,6 +531,8 @@ const buildInitialPrompt = (
   gitlabAccessSection = "",
   /** lark-cli 身份缺失登录兜底（常驻） */
   larkCliAuthSection = "",
+  /** 公司环境常驻声明（有 servers/PG 时非空） */
+  companyEnvBriefSection = "",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -615,6 +617,10 @@ const buildInitialPrompt = (
   // lark-cli 身份缺失 → 主动问是否代为登录（常驻、不绑 gitToken）
   if (larkCliAuthSection.trim()) {
     lines.push(larkCliAuthSection.trim(), "");
+  }
+  // 公司环境常驻声明（有 servers/PG 时）
+  if (companyEnvBriefSection.trim()) {
+    lines.push(companyEnvBriefSection.trim(), "");
   }
   lines.push(
     "## 任务事件日志（按需读、`chat-history-recovery` skill 详述）",
@@ -945,6 +951,9 @@ export const runChatSession = async (
     // 4) 启动 agent + 流式消费
     publishBootProgress(task.id, "create", "正在创建会话…");
     const perfCreateStart = Date.now();
+    // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
+    const { syncCompanyEnvFileFromSettings } = await import("./company-env-fs");
+    await syncCompanyEnvFileFromSettings();
     agent = await withSdkDeadline(
       Agent.create({
         apiKey,
@@ -998,6 +1007,8 @@ export const runChatSession = async (
     const rulesSection = await rulesPromise;
     const userIdentityLine = await identityPromise;
     const gitlabAccessSection = await gitlabAccessPromise;
+    const { loadCompanyEnvBriefSection } = await import("./company-env-fs");
+    const companyEnvBriefSection = await loadCompanyEnvBriefSection();
     const initialPrompt = buildInitialPrompt(
       task,
       skills,
@@ -1006,6 +1017,7 @@ export const runChatSession = async (
       userIdentityLine,
       gitlabAccessSection,
       buildLarkCliAuthMissingRule(),
+      companyEnvBriefSection,
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 

@@ -32,6 +32,12 @@ describe("planBranchesForBuild bash hint 防注入", () => {
     expect(r!.promptHint).not.toMatch(/git checkout feature\/123456/);
   });
 
+  it("无飞书链接（日常轻量态）→ 不建分支 / 不注入 checkout hint", () => {
+    expect(planBranchesForBuild(baseTask({ feishuStoryUrl: undefined }))).toBeNull();
+    expect(planBranchesForBuild(baseTask({ feishuStoryUrl: "" }))).toBeNull();
+    expect(planBranchesForBuild(baseTask({ feishuStoryUrl: "  " }))).toBeNull();
+  });
+
   it("用户指定含 ; /$() 的分支名 → 清洗后再进 hint", () => {
     const r = planBranchesForBuild(
       baseTask({

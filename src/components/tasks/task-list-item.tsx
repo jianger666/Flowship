@@ -46,10 +46,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { formatRelative } from "@/lib/task-display";
+import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { taskStageLine } from "@/lib/task-stage-line";
 import { cn } from "@/lib/utils";
 import { getTaskSeenAt } from "@/lib/view-memory";
 import type { TaskSummary } from "@/lib/types";
+import { Badge } from "@/components/ui/badge";
 
 /** 同页 markTaskSeen 后派发，驱动侧栏重读 localStorage（storage 事件只跨 tab） */
 export const TASK_SEEN_EVENT = "flowship:task-seen";
@@ -206,9 +208,20 @@ export const TaskListItem = ({
         </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           {/* 标题 truncate + hover tooltip 补全完整标题（侧栏窄、长标题看不全） */}
-          <Tooltip content={task.title}>
-            <span className="min-w-0 truncate leading-tight">{task.title}</span>
-          </Tooltip>
+          <span className="flex min-w-0 items-center gap-1">
+            <Tooltip content={task.title}>
+              <span className="min-w-0 truncate leading-tight">{task.title}</span>
+            </Tooltip>
+            {/* 无飞书链接 = 日常轻量态；中性色小徽标、与对话行「对话」徽标同量级 */}
+            {task.mode !== "chat" && isLightweightDailyTask(task) && (
+              <Badge
+                variant="secondary"
+                className="shrink-0 px-1.5 text-[10px] font-normal"
+              >
+                日常
+              </Badge>
+            )}
+          </span>
           {/* task 活跃态：阶段 · 状态；其余单行只标题 */}
           {stageLine && (
             <span className="flex min-w-0 items-center gap-1 text-[11px] leading-none">

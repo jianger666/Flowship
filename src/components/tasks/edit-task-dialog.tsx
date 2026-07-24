@@ -4,12 +4,13 @@
  * 编辑任务 Dialog（V0.6.6）
  *
  * 详情页「编辑」按钮打开、改建任务时填的软配置字段：
- *   标题 / 飞书链接 / 已有工作分支（per-repo）
+ *   标题 / 飞书链接（仅需求任务可改具体 URL） / 已有工作分支（per-repo）
  *
  * 刻意不在此改：
  *   - 模型 model（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）
  *   - mode（task/chat 是两套通路、切了等于换任务）
  *   - MCP 开关（走 TaskMcpPanel）、上下文 doc（走 ContextDocsPanel）——详情页已有各自面板
+ *   - 日常/需求身份（有无飞书链接）：isolateWorktree 创建时定死，禁止有↔无切换
  *
  * 仓库（V0.6.28）：**只允许追加、不允许移除**——同事实测场景「做着做着发现还依赖另一个仓」；
  *   删仓涉及已建分支 / MR 残留引用、边界多收益低、不做。已绑仓只读展示、新仓走下方 MultiSelect、
@@ -56,8 +57,12 @@ interface Props {
 export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => {
   // 任务标题（必填）
   const [title, setTitle] = useState(task.title);
-  // 飞书项目链接（选填、空=清空）
+  // 飞书项目链接草稿：需求任务可改具体 URL；日常任务禁用（身份创建后不可有↔无）
   const [feishuStoryUrl, setFeishuStoryUrl] = useState(task.feishuStoryUrl ?? "");
+  // 打开时锁定身份：有链接 = 需求任务（可改 URL、不可清空）；无链接 = 日常（不可补链接）
+  const [storyUrlLockedHas, setStoryUrlLockedHas] = useState(
+    !!(task.feishuStoryUrl ?? "").trim(),
+  );
   // per-repo「已有工作分支」草稿（key=repoPath）
   const [featureBranches, setFeatureBranches] = useState<
     Record<string, string>
@@ -78,6 +83,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     const t = taskRef.current;
     setTitle(t.title);
     setFeishuStoryUrl(t.feishuStoryUrl ?? "");
+    setStoryUrlLockedHas(!!(t.feishuStoryUrl ?? "").trim());
     setFeatureBranches(t.repoFeatureBranches ?? {});
     setAddRepos([]);
     setSubmitting(false);
@@ -105,7 +111,11 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   // v0.9.11：分支候选（已绑仓 + 本次追加仓、「已有工作分支」Combobox 用）
   const branchMap = useRepoBranches([...task.repoPaths, ...addRepos]);
 
-  const canSubmit = title.trim().length > 0 && !submitting;
+  // 需求任务改链接时不可清空（身份闸门）；日常任务不传 feishuStoryUrl
+  const canSubmit =
+    title.trim().length > 0 &&
+    !submitting &&
+    (!storyUrlLockedHas || feishuStoryUrl.trim().length > 0);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -140,7 +150,10 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
 
       const updated = await updateTaskFields(task.id, {
         title: title.trim(),
-        feishuStoryUrl: feishuStoryUrl.trim() || null,
+        // 日常任务不传链接字段；需求任务只传非空 URL（禁止清空）
+        ...(storyUrlLockedHas
+          ? { feishuStoryUrl: feishuStoryUrl.trim() }
+          : {}),
         repoFeatureBranches:
           Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
         ...(addRepos.length > 0
@@ -184,15 +197,23 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             />
           </div>
 
-          {/* 飞书链接 */}
+          {/* 飞书链接：需求任务可改具体 URL、不可清空；日常任务禁用（身份创建后定死） */}
           <div className="grid gap-1.5">
             <Label htmlFor="edit-story">飞书项目链接</Label>
             <Input
               id="edit-story"
               value={feishuStoryUrl}
               onChange={(e) => setFeishuStoryUrl(e.target.value)}
-              placeholder="https://project.feishu.cn/<space>/story/detail/..."
+              disabled={!storyUrlLockedHas}
+              placeholder={
+                storyUrlLockedHas
+                  ? "https://project.feishu.cn/<space>/story/detail/..."
+                  : "日常任务无飞书链接"
+              }
             />
+            <p className="text-xs text-muted-foreground">
+              日常/需求身份创建后不可改、需要请新建任务
+            </p>
           </div>
 
           {/* 仓库：已绑只读（不可移除）、下方可追加 */}

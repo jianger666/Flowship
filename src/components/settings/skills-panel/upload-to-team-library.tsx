@@ -53,6 +53,10 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
   const [teamSkillCategories, setTeamSkillCategories] = useState<
     Record<string, string[]>
   >({});
+  // 敏感扫描命中（API 透传、dialog 展示明细 + 强制勾选）
+  const [sensitiveHits, setSensitiveHits] = useState<
+    Array<{ file: string; line: number; kind: string; snippet: string }>
+  >([]);
 
   const loadDialogData = useCallback(async () => {
     try {
@@ -135,13 +139,17 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
     [settings.userRole],
   );
 
-  const handleUpload = async (skillNames: string[], category: string) => {
+  const handleUpload = async (
+    skillNames: string[],
+    category: string,
+    force = false,
+  ) => {
     setBusy(true);
     try {
       const res = await fetch("/api/team-library/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skillNames, category }),
+        body: JSON.stringify({ skillNames, category, force }),
       });
       const data = (await res.json()) as {
         ok?: boolean;
@@ -149,7 +157,20 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
         results?: Array<{ name: string; ok: boolean; error?: string }>;
         pendingReview?: boolean;
         mrUrl?: string;
+        sensitiveHits?: Array<{
+          file: string;
+          line: number;
+          kind: string;
+          snippet: string;
+        }>;
       };
+      // 敏感命中：留在 dialog 展示明细，不 toast 轰炸、不关窗
+      if (data.sensitiveHits && data.sensitiveHits.length > 0) {
+        setSensitiveHits(data.sensitiveHits);
+        toast.error(data.error ?? "发现疑似敏感信息，已阻断上传");
+        return;
+      }
+      setSensitiveHits([]);
       if (!res.ok && !data.results) {
         toast.error(data.error ?? "上传失败");
         return;
@@ -201,7 +222,10 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
         type="button"
         variant="outline"
         size="sm"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          setSensitiveHits([]);
+          setOpen(true);
+        }}
       >
         <Upload />
         {BUTTON_LABEL[mode]}
@@ -214,8 +238,14 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
         actions={actions}
         teamSkillCategories={teamSkillCategories}
         defaultCategory={defaultCategory}
-        onClose={() => setOpen(false)}
-        onUpload={(names, category) => void handleUpload(names, category)}
+        sensitiveHits={sensitiveHits}
+        onClose={() => {
+          setSensitiveHits([]);
+          setOpen(false);
+        }}
+        onUpload={(names, category, force) =>
+          void handleUpload(names, category, force)
+        }
       />
     </>
   );

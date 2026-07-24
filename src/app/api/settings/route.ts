@@ -76,6 +76,18 @@ export const PUT = async (req: Request): Promise<Response> => {
         err instanceof Error ? err.message : err,
       );
     }
+    // 公司环境：同步到 company-env.json（skill 固定路径读取；SDK local 无 env 透传）
+    try {
+      const { syncCompanyEnvFileFromObject } = await import(
+        "@/lib/server/company-env-fs"
+      );
+      await syncCompanyEnvFileFromObject(guarded.companyEnv);
+    } catch (err) {
+      console.warn(
+        "[/api/settings] 同步 company-env.json 失败（配置已保存）:",
+        err instanceof Error ? err.message : err,
+      );
+    }
     return NextResponse.json({
       ok: true,
       settings: maskSettingsSecrets(guarded),

@@ -1,7 +1,8 @@
 /**
  * POST /api/team-library/upload
- * body: { skillNames: string[]; category: string }
+ * body: { skillNames: string[]; category: string; force?: boolean }
  * → 把本机自管 skill 上传到共享库 skills/<category>/
+ * force=true：跳过敏感扫描阻断（误报出口）
  */
 
 import { NextResponse } from "next/server";
@@ -15,7 +16,11 @@ import {
 export const runtime = "nodejs";
 
 export const POST = async (req: Request) => {
-  let body: { skillNames?: unknown; category?: unknown };
+  let body: {
+    skillNames?: unknown;
+    category?: unknown;
+    force?: unknown;
+  };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -41,15 +46,21 @@ export const POST = async (req: Request) => {
       "category 非法（只允许小写字母数字连字符、1~32 位）",
     );
   }
+  const force = body.force === true;
 
   try {
-    const result = await uploadSkillsToTeamLibrary(skillNames, category);
+    const result = await uploadSkillsToTeamLibrary(skillNames, category, {
+      force,
+    });
     if (!result.ok) {
       return NextResponse.json(
         {
           ok: false,
           error: result.error ?? "upload 失败",
           results: result.results,
+          ...(result.sensitiveHits
+            ? { sensitiveHits: result.sensitiveHits }
+            : {}),
         },
         { status: 409 },
       );

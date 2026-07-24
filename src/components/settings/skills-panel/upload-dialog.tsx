@@ -6,6 +6,9 @@
  * - mode=skill：只列自管 skill
  * - mode=action：只列自建非 legacy action；勾选 = 上传挂载的自管 skill，
  *   server uploadSkillsToTeamLibrary 会按挂载关系写 .flowship-action.json
+ *
+ * 候选行 / 强制上传勾选一律用 CheckboxRow（整行可点）—— base-ui Checkbox
+ * 非原生 input，不能靠 `<label>` 联动，见 checkbox-row.tsx 顶部注释。
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -13,7 +16,7 @@ import { Loader2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
@@ -61,9 +64,19 @@ type Props = {
   teamSkillCategories: Record<string, string[]>;
   /** 默认分类：settings.userRole；未配 → common */
   defaultCategory: UploadCategory;
+  /**
+   * 敏感扫描命中（已脱敏）；有则停在分类步展示明细 + 强制勾选。
+   * 由父组件在 API 409 + sensitiveHits 时注入。
+   */
+  sensitiveHits?: Array<{
+    file: string;
+    line: number;
+    kind: string;
+    snippet: string;
+  }>;
   onClose: () => void;
-  /** 最终提交 skill 名列表（action 勾选会展开成其 skill） */
-  onUpload: (skillNames: string[], category: string) => void;
+  /** 最终提交 skill 名列表（action 勾选会展开成其 skill）；force=误报强制上传 */
+  onUpload: (skillNames: string[], category: string, force?: boolean) => void;
 };
 
 /** 相对目标分类：覆盖 / 跨分类冲突 / 无 */
@@ -88,6 +101,7 @@ export const UploadSkillsDialog = ({
   actions = [],
   teamSkillCategories,
   defaultCategory,
+  sensitiveHits = [],
   onClose,
   onUpload,
 }: Props) => {
@@ -97,15 +111,23 @@ export const UploadSkillsDialog = ({
   const [category, setCategory] = useState<UploadCategory>(defaultCategory);
   // 步骤：先勾选再选分类
   const [step, setStep] = useState<Step>("pick");
+  // 误报出口：确认无敏感信息后允许带 force 重试
+  const [forceUpload, setForceUpload] = useState(false);
 
   useEffect(() => {
     if (!open) {
       setPicked(new Set());
       setStep("pick");
+      setForceUpload(false);
       return;
     }
     setCategory(defaultCategory);
   }, [open, defaultCategory]);
+
+  // 新一轮命中到来时重置 force（避免上次勾选残留）
+  useEffect(() => {
+    if (sensitiveHits.length > 0) setForceUpload(false);
+  }, [sensitiveHits]);
 
   const toggle = (id: string) =>
     setPicked((prev) => {
@@ -213,23 +235,19 @@ export const UploadSkillsDialog = ({
                   );
                   const conflict = typeof st === "object";
                   return (
-                    <label
+                    <CheckboxRow
                       key={s.name}
+                      checked={picked.has(s.name)}
+                      disabled={conflict}
+                      checkboxClassName="mt-0.5"
                       className={cn(
-                        "flex items-start gap-2 rounded-md px-2 py-1.5 transition-colors",
-                        conflict
-                          ? "cursor-not-allowed opacity-60"
-                          : "cursor-pointer hover:bg-accent/50",
+                        "items-start rounded-md px-2 py-1.5 transition-colors",
+                        !conflict && "hover:bg-accent/50",
                       )}
+                      onCheckedChange={() => {
+                        if (!conflict) toggle(s.name);
+                      }}
                     >
-                      <Checkbox
-                        className="mt-0.5"
-                        checked={picked.has(s.name)}
-                        disabled={conflict}
-                        onCheckedChange={() => {
-                          if (!conflict) toggle(s.name);
-                        }}
-                      />
                       <div className="min-w-0 flex-1">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                           <span className="truncate text-sm">{s.name}</span>
@@ -239,7 +257,7 @@ export const UploadSkillsDialog = ({
                           {s.description}
                         </p>
                       </div>
-                    </label>
+                    </CheckboxRow>
                   );
                 })}
               </div>
@@ -255,23 +273,19 @@ export const UploadSkillsDialog = ({
                     ) === "object";
                   const disabled = !!a.disabledReason || nameConflict;
                   return (
-                    <label
+                    <CheckboxRow
                       key={a.id}
+                      checked={picked.has(a.id)}
+                      disabled={disabled}
+                      checkboxClassName="mt-0.5"
                       className={cn(
-                        "flex items-start gap-2 rounded-md px-2 py-1.5 transition-colors",
-                        disabled
-                          ? "cursor-not-allowed opacity-60"
-                          : "cursor-pointer hover:bg-accent/50",
+                        "items-start rounded-md px-2 py-1.5 transition-colors",
+                        !disabled && "hover:bg-accent/50",
                       )}
+                      onCheckedChange={() => {
+                        if (!disabled) toggle(a.id);
+                      }}
                     >
-                      <Checkbox
-                        className="mt-0.5"
-                        checked={picked.has(a.id)}
-                        disabled={disabled}
-                        onCheckedChange={() => {
-                          if (!disabled) toggle(a.id);
-                        }}
-                      />
                       <div className="min-w-0 flex-1">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                           <span className="truncate text-sm">
@@ -288,7 +302,7 @@ export const UploadSkillsDialog = ({
                           </p>
                         )}
                       </div>
-                    </label>
+                    </CheckboxRow>
                   );
                 })}
               </div>
@@ -365,6 +379,35 @@ export const UploadSkillsDialog = ({
                 ，请换分类或返回取消勾选
               </p>
             )}
+            {sensitiveHits.length > 0 && (
+              <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-2.5">
+                <p className="text-xs text-destructive">
+                  发现 {sensitiveHits.length} 处疑似敏感信息，已阻断上传
+                </p>
+                <ul className="max-h-36 space-y-1 overflow-y-auto text-[11px] text-muted-foreground">
+                  {sensitiveHits.map((h, i) => (
+                    <li key={`${h.file}:${h.line}:${h.kind}:${i}`} className="min-w-0">
+                      <span className="wrap-anywhere font-mono">
+                        {h.file}:{h.line}
+                      </span>
+                      {" · "}
+                      {h.kind}
+                      {" · "}
+                      <span className="wrap-anywhere">{h.snippet}</span>
+                    </li>
+                  ))}
+                </ul>
+                <CheckboxRow
+                  checked={forceUpload}
+                  disabled={busy}
+                  checkboxClassName="mt-0.5"
+                  className="items-start"
+                  onCheckedChange={setForceUpload}
+                >
+                  <span className="text-xs">确认无敏感信息、强制上传</span>
+                </CheckboxRow>
+              </div>
+            )}
             <DialogFooter>
               <Button
                 variant="ghost"
@@ -374,15 +417,22 @@ export const UploadSkillsDialog = ({
                 上一步
               </Button>
               <Button
-                onClick={() => onUpload(resolvedSkillNames, category)}
+                onClick={() =>
+                  onUpload(
+                    resolvedSkillNames,
+                    category,
+                    sensitiveHits.length > 0 ? forceUpload : false,
+                  )
+                }
                 disabled={
                   busy ||
                   resolvedSkillNames.length === 0 ||
-                  categoryStepConflicts.length > 0
+                  categoryStepConflicts.length > 0 ||
+                  (sensitiveHits.length > 0 && !forceUpload)
                 }
               >
                 {busy ? <Loader2 className="animate-spin" /> : null}
-                上传
+                {sensitiveHits.length > 0 ? "强制上传" : "上传"}
               </Button>
             </DialogFooter>
           </>

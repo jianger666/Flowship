@@ -188,6 +188,8 @@ export interface ExportedActionMeta {
   order?: number;
   /** 严格 true 才写入；缺省 / 假值不落盘 */
   requiresKnowledge?: boolean;
+  /** 严格 true 才写入；推进弹窗缺 companyEnv 时轻量提示 */
+  requiresCompanyEnv?: boolean;
   exportedAt: number;
 }
 
@@ -231,6 +233,9 @@ export const parseFlowshipActionMeta = (
   if (o.requiresKnowledge === true) {
     meta.requiresKnowledge = true;
   }
+  if (o.requiresCompanyEnv === true) {
+    meta.requiresCompanyEnv = true;
+  }
   return meta;
 };
 
@@ -248,6 +253,7 @@ export const writeFlowshipActionJson = async (
       ? { order: meta.order }
       : {}),
     ...(meta.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+    ...(meta.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
   };
   await writePrivateFileAtomic(
     path.join(skillDir, FLOWSHIP_ACTION_JSON),
@@ -271,6 +277,7 @@ const defFromMeta = (
     ? { order: meta.order }
     : {}),
   ...(meta.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+  ...(meta.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
   createdAt: meta.exportedAt,
   updatedAt: meta.exportedAt,
   ...extra,
@@ -310,6 +317,7 @@ const parseDef = (id: string, raw: string): CustomActionDef | null => {
         : undefined,
     // 旧 ACTION.md 若写过 requiresKnowledge（极少）——迁移时一并带上
     ...(data.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+    ...(data.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
     ...common,
   };
 };
@@ -594,6 +602,7 @@ export const createCustomAction = async (
       ? { order: input.order }
       : {}),
     ...(input.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+    ...(input.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
   };
   await writeFlowshipActionJson(skillDir, meta);
   return defFromMeta(appActionIdFor(skill), skill, meta, {
@@ -658,6 +667,11 @@ export const updateCustomAction = async (
         ? patch.requiresKnowledge === true
         : existing.requiresKnowledge === true)
         ? { requiresKnowledge: true as const }
+        : {}),
+      ...((patch.requiresCompanyEnv !== undefined
+        ? patch.requiresCompanyEnv === true
+        : existing.requiresCompanyEnv === true)
+        ? { requiresCompanyEnv: true as const }
         : {}),
     };
     if (!meta.label) throw new Error("label 不能为空");
@@ -754,6 +768,7 @@ export const ensureCustomActionById = async (
       ? { order: input.order }
       : {}),
     ...(input.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+    ...(input.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
   });
   return "created";
 };
@@ -830,6 +845,7 @@ export const exportCustomAction = async (
       ? { order: def.order }
       : {}),
     ...(def.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+    ...(def.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
     exportedAt: Date.now(),
   };
   await writeFlowshipActionJson(destSkillDir, meta);
@@ -1051,6 +1067,7 @@ export const migrateCustomActionsToSkillHosted = async (): Promise<{
         ...(def.output ? { output: def.output } : {}),
         ...(def.placeholder ? { placeholder: def.placeholder } : {}),
         ...(def.requiresKnowledge === true ? { requiresKnowledge: true } : {}),
+        ...(def.requiresCompanyEnv === true ? { requiresCompanyEnv: true } : {}),
       });
       await fs.rm(dirOf(id), { recursive: true, force: true });
       console.log(`[custom-action-fs] 迁移：${id} → ${newId}`);
@@ -1077,7 +1094,12 @@ const remapLayoutInSettings = async (
   if (!rawLayout || typeof rawLayout !== "object" || Array.isArray(rawLayout)) {
     return;
   }
-  const o = rawLayout as { order?: unknown; hidden?: unknown };
+  const o = rawLayout as {
+    order?: unknown;
+    hidden?: unknown;
+    groupOrder?: unknown;
+    collapsedGroups?: unknown;
+  };
   const toStrArr = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
   const before = { order: toStrArr(o.order), hidden: toStrArr(o.hidden) };
@@ -1091,9 +1113,18 @@ const remapLayoutInSettings = async (
     after.hidden.every((v, i) => v === before.hidden[i]);
   if (same) return;
 
+  // 只改 order/hidden id；分组字段原样保留（不参与 id remap）
+  const nextLayout = {
+    ...after,
+    ...(Array.isArray(o.groupOrder) ? { groupOrder: toStrArr(o.groupOrder) } : {}),
+    ...(Array.isArray(o.collapsedGroups)
+      ? { collapsedGroups: toStrArr(o.collapsedGroups) }
+      : {}),
+  };
+
   await writePrivateFileAtomic(
     path.join(dataRoot(), "config.json"),
-    JSON.stringify({ ...settings, actionLayout: after }, null, 2),
+    JSON.stringify({ ...settings, actionLayout: nextLayout }, null, 2),
   );
   console.log(`[custom-action-fs] 已 remap actionLayout id`);
 };

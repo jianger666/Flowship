@@ -26,7 +26,7 @@ import type { McpHealth } from "@/lib/types";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { CodeEditor } from "@/components/ui/code-editor";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
@@ -464,6 +464,8 @@ const ServerEditDialog = ({
 };
 
 // ----------------- 从 Cursor 导入 -----------------
+// 候选行用 CheckboxRow（整行可点）—— base-ui Checkbox 非原生 input，
+// 不能靠 `<label>` 联动，见 checkbox-row.tsx 顶部注释。
 
 const ImportCursorDialog = ({
   open,
@@ -529,14 +531,12 @@ const ImportCursorDialog = ({
         ) : (
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {cursorNames.map((name) => (
-              <label
+              <CheckboxRow
                 key={name}
-                className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/50"
+                checked={picked.has(name)}
+                className="rounded-md px-2 py-1.5 transition-colors hover:bg-accent/50"
+                onCheckedChange={() => toggle(name)}
               >
-                <Checkbox
-                  checked={picked.has(name)}
-                  onCheckedChange={() => toggle(name)}
-                />
                 <span className="min-w-0 flex-1 truncate text-sm" title={name}>
                   {name}
                 </span>
@@ -545,7 +545,7 @@ const ImportCursorDialog = ({
                     已存在、导入将覆盖
                   </Badge>
                 )}
-              </label>
+              </CheckboxRow>
             ))}
           </div>
         )}

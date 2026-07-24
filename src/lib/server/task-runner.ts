@@ -90,6 +90,7 @@ import { validateSubmitMr } from "./submit-mr-guard";
 import { cleanupFeHooksJson } from "./cleanup-fe-hooks";
 import { assertNoUpdatePendingRestart } from "./update-pending";
 import { reapTaskOrphans } from "./kill-orphans";
+import { syncCompanyEnvFileFromSettings } from "./company-env-fs";
 import {
   stopPreviewsForTask,
 } from "./preview-manager";
@@ -98,6 +99,7 @@ import {
   ensureTaskWorktrees,
   getTaskCwd,
   getTaskWorkRepoPaths,
+  isLightweightDailyTask,
   isWorktreeTask,
   removeTaskWorktrees,
   resolveOriginalRepoPath,
@@ -1170,6 +1172,23 @@ const advanceTaskCore = async (
     }
   }
   // owner 语境（已 claim）——opHandle lease
+  // 日常轻量态（无飞书链接）：首次推进落一条 info，告知用户直接在原仓当前分支干活（只写一次、不刷屏）
+  if (
+    action.n === 1 &&
+    isLightweightDailyTask(taskAfterAppend) &&
+    !isWorktreeTask(taskAfterAppend)
+  ) {
+    await writeOwnedEventAndPublish(
+      task.id,
+      () => isOpOwner(opHandle),
+      {
+        kind: "info",
+        actionId: action.id,
+        text: "日常任务：直接工作在原仓当前分支",
+      },
+    );
+    await abortIfTaskOpStale(task.id, opGen);
+  }
   await writeOwnedEventAndPublish(
     task.id,
     () => isOpOwner(opHandle),
@@ -2810,6 +2829,8 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               }
             }
             const perfCreateStart = Date.now();
+            // SDK local 无 env 透传 → 启动前把 companyEnv 同步到固定路径供 skill 读
+            await syncCompanyEnvFileFromSettings();
             const created = await withSdkDeadline(
               Agent.create({
                 apiKey,
@@ -2935,6 +2956,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               gitToken && gitToken.trim().length > 0
                 ? buildGitlabAccessDirective(effectiveGitHost, dataRoot())
                 : "";
+            const { loadCompanyEnvBriefSection } = await import(
+              "./company-env-fs"
+            );
+            const companyEnvBriefSection = await loadCompanyEnvBriefSection();
             const superPrompt = await buildSuperPrompt(
               task,
               skills,
@@ -2950,6 +2975,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               userIdentityLine,
               gitlabAccessSection,
               buildLarkCliAuthMissingRule(),
+              companyEnvBriefSection,
             );
             await failpoint("start.afterPrompt");
             const perfPromptMs = Date.now() - perfPromptStart;
@@ -4883,6 +4909,8 @@ export const startOneShotQuestion = (
             () => isTaskOpCurrent(oneshotOpHandle),
             { kind: "info", text: "正在启动 agent…" },
           );
+          // SDK local 无 env 透传 → 启动前同步 company-env.json
+          await syncCompanyEnvFileFromSettings();
           const created = await withSdkDeadline(
             Agent.create({
               apiKey: creds.apiKey,

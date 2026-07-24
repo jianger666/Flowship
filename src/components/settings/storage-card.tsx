@@ -7,6 +7,9 @@
  * node_modules 工作区都无限积累）、app 越用越大。
  * 这里给「看占用 + 手动挑着删」的入口——不做自动删除、全部用户手选 + 二次确认。
  *
+ * 占用列表行用 CheckboxRow（整行可点）—— base-ui Checkbox 非原生 input，
+ * 不能靠 `<label>` 联动，见 checkbox-row.tsx 顶部注释。
+ *
  * 快捷筛选：
  *   - 已终结任务（已合入 / 已放弃）——task 模式的自然清理点
  *   - 30 天未活跃对话——chat 没有终态、按不活跃时间挑
@@ -25,7 +28,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
+import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { useDialog } from "@/hooks/use-dialog";
@@ -354,14 +357,12 @@ export const StorageCard = () => {
                   {visible.map((e) => {
                     const sizeSub = entrySizeSub(e.bytes, e.worktreeBytes);
                     return (
-                      <label
+                      <CheckboxRow
                         key={e.id}
-                        className="flex cursor-pointer items-center gap-2.5 px-3 py-2 hover:bg-muted/40"
+                        checked={picked.has(e.id)}
+                        className="gap-2.5 px-3 py-2 hover:bg-muted/40"
+                        onCheckedChange={() => togglePick(e.id)}
                       >
-                        <Checkbox
-                          checked={picked.has(e.id)}
-                          onCheckedChange={() => togglePick(e.id)}
-                        />
                         <span className="min-w-0 flex-1 truncate text-sm" title={e.title}>
                           {e.title}
                         </span>
@@ -385,7 +386,7 @@ export const StorageCard = () => {
                             </span>
                           )}
                         </span>
-                      </label>
+                      </CheckboxRow>
                     );
                   })}
                 </div>
@@ -410,14 +411,12 @@ export const StorageCard = () => {
                   {staleWorktrees.map((s) => {
                     const key = `${STALE_PICK_PREFIX}${s.id}`;
                     return (
-                      <label
+                      <CheckboxRow
                         key={key}
-                        className="flex cursor-pointer items-center gap-2.5 px-3 py-2 hover:bg-muted/40"
+                        checked={picked.has(key)}
+                        className="gap-2.5 px-3 py-2 hover:bg-muted/40"
+                        onCheckedChange={() => togglePick(key)}
                       >
-                        <Checkbox
-                          checked={picked.has(key)}
-                          onCheckedChange={() => togglePick(key)}
-                        />
                         <span className="min-w-0 flex-1 truncate font-mono text-sm" title={s.id}>
                           {s.id}
                         </span>
@@ -425,7 +424,7 @@ export const StorageCard = () => {
                         <span className="w-24 shrink-0 whitespace-nowrap text-right font-mono text-xs">
                           {formatBytes(s.bytes)}
                         </span>
-                      </label>
+                      </CheckboxRow>
                     );
                   })}
                 </div>

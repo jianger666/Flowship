@@ -3,7 +3,8 @@
  *
  * 覆盖：配置合并、.flowship-action.json 解析、seen 默认禁用策略（白名单版）、
  * git 输出脱敏、credential helper 参数构造、push 错误分类、GitLab URL 解析、
- * 上传分支名、skill 名白名单、仓级互斥串行、半残 .git 自愈（本地 bare）。
+ * 上传分支名、skill 名白名单、仓级互斥串行、半残 .git 自愈（本地 bare）、
+ * 上传敏感信息扫描闸（各模式命中 / 占位符不误报 / force 放行）。
  */
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -22,12 +23,17 @@ import {
   classifyPushRejection,
   computeDefaultSkillStates,
   ensureRepoAt,
+  formatSensitiveScanError,
+  gateSensitiveUpload,
+  isPlaceholderSecretValue,
   isSafeTeamCategory,
   isSafeTeamSkillName,
   locateSharedSkillPath,
   mergeTeamLibraryConfig,
   parseGitLabRepoUrl,
   redactGitText,
+  redactSecretValue,
+  scanSensitiveFiles,
   withTeamLibraryLock,
 } from "@/lib/server/team-library";
 // 派生模型后 parseFlowshipActionMeta 挪到 custom-action-fs（避免循环 import）
@@ -119,7 +125,7 @@ describe("parseFlowshipActionMeta", () => {
 });
 
 describe("computeDefaultSkillStates", () => {
-  it("全量默认安装：首次发现的 team skill 不分位置一律 enabled", () => {
+  it("首次初始化：表外新名一律 enabled（存量不让用户挨个装）", () => {
     const added = computeDefaultSkillStates({
       skills: [
         // 组内普通沉淀（含角色分组路径）
@@ -144,6 +150,7 @@ describe("computeDefaultSkillStates", () => {
         },
       ],
       known: new Set(),
+      isFirstInit: true,
     });
     expect(added).toEqual({
       "group-plain": "enabled",
@@ -160,7 +167,7 @@ describe("computeDefaultSkillStates", () => {
     ]);
   });
 
-  it("已在表里（known）→ 不出现在增量表（用户改过的永不被策略覆盖）", () => {
+  it("后续 sync 增量：表外新名一律 disabled（市场手动安装）", () => {
     const added = computeDefaultSkillStates({
       skills: [
         {
@@ -171,21 +178,50 @@ describe("computeDefaultSkillStates", () => {
           name: "new-one",
           relDir: "knowledge/skills/frontend/crm/new-one",
         },
+        // action 壳增量也不自动装
+        {
+          name: "colleague-action",
+          relDir: "skills/common/colleague-action",
+        },
       ],
       known: new Set(["fe-helper"]),
+      isFirstInit: false,
     });
-    expect(added).toEqual({ "new-one": "enabled" });
+    // known 不动；新名默认未安装
+    expect(added).toEqual({
+      "new-one": "disabled",
+      "colleague-action": "disabled",
+    });
   });
 
-  it("同批重名首个胜出、不重复写入", () => {
+  it("同批重名首个胜出、不重复写入（首次）", () => {
     const added = computeDefaultSkillStates({
       skills: [
         { name: "x", relDir: "skills/common/x" },
         { name: "x", relDir: "knowledge/skills/frontend/app/x" },
       ],
       known: new Set(),
+      isFirstInit: true,
     });
     expect(added).toEqual({ x: "enabled" });
+  });
+});
+
+/**
+ * 损坏保护语义：apply 层 trusted:false 直接 return，绝不当「空表首次」。
+ * 纯函数侧无法覆盖 IO；这里用契约注释 + 既有 skills-loader-team 集成测兜底。
+ * 下面这条断言「调用方必须传 isFirstInit、不得省略」——缺参在类型层已拦。
+ */
+describe("computeDefaultSkillStates 损坏保护契约", () => {
+  it("损坏场景绝不当首次：即便 known 空，isFirstInit=false 也写 disabled（apply 层应先跳过）", () => {
+    // 模拟「若错误地把损坏当空表」时的纯函数结果——应是 disabled 而非 enabled；
+    // 真实 applyDefaultSkillStates 在 trusted:false 时根本不会调用本函数。
+    const added = computeDefaultSkillStates({
+      skills: [{ name: "keep-off", relDir: "skills/fe/keep-off" }],
+      known: new Set(),
+      isFirstInit: false,
+    });
+    expect(added).toEqual({ "keep-off": "disabled" });
   });
 });
 
@@ -537,5 +573,97 @@ describe("ensureRepoAt（半残 .git 自愈）", () => {
     ).resolves.toBe("seed\n");
     // 探活现在应成功
     await execFileAsync("git", ["rev-parse", "--git-dir"], { cwd: workDir });
+  });
+});
+describe("scanSensitiveFiles / 敏感上传闸", () => {
+  it("脱敏只露前 3 字符", () => {
+    expect(redactSecretValue("abcdefgh")).toBe("abc***");
+    expect(redactSecretValue("ab")).toBe("***");
+    expect(redactSecretValue("")).toBe("***");
+  });
+
+  it("命中 credential-key / private-key / connection-string / pgpass / high-entropy", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/demo/config.env",
+        content: [
+          "password=SuperSecretValue99",
+          "api_key: sk-live-abcdef012345",
+          "-----BEGIN RSA PRIVATE KEY-----",
+          "postgresql://admin:DbPassw0rd!@db.example.com:5432/app",
+          "https://user:HttpPass99@example.com/path",
+          "db.example.com:5432:mydb:admin:PgPassHunter2",
+          "AUTH_TOKEN=aB3dE5fG7hI9jK1lM2nOpQr",
+        ].join("\n"),
+      },
+    ]);
+    const kinds = new Set(hits.map((h) => h.kind));
+    expect(kinds.has("credential-key")).toBe(true);
+    expect(kinds.has("private-key")).toBe(true);
+    expect(kinds.has("connection-string")).toBe(true);
+    expect(kinds.has("pgpass")).toBe(true);
+    expect(kinds.has("high-entropy")).toBe(true);
+    // 绝不回传完整密文
+    for (const h of hits) {
+      expect(h.snippet).toContain("***");
+      expect(h.snippet).not.toContain("SuperSecretValue99");
+      expect(h.snippet).not.toContain("DbPassw0rd!");
+      expect(h.snippet).not.toContain("PgPassHunter2");
+      expect(h.snippet).not.toContain("aB3dE5fG7hI9jK1lM2nOpQr");
+    }
+  });
+
+  it("占位符 / 空值不误报", () => {
+    expect(isPlaceholderSecretValue("【填写】")).toBe(true);
+    expect(isPlaceholderSecretValue("<your-password>")).toBe(true);
+    expect(isPlaceholderSecretValue("your-api-key")).toBe(true);
+    expect(isPlaceholderSecretValue("xxx")).toBe(true);
+    expect(isPlaceholderSecretValue("")).toBe(true);
+    expect(isPlaceholderSecretValue("$GITLAB_TOKEN")).toBe(true);
+
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/tpl/SKILL.md",
+        content: [
+          "password=【填写】",
+          "passwd: <password>",
+          "api_key=your-api-key-here",
+          'token: "xxx"',
+          "secret=",
+          "pwd: $API_TOKEN",
+          // hash 语境长 hex 不报高熵
+          "sha256:abcdef0123456789abcdef0123456789ab",
+          "commit: deadbeefdeadbeefdeadbeefdeadbeef",
+        ].join("\n"),
+      },
+    ]);
+    expect(hits).toEqual([]);
+  });
+
+  it("二进制内容跳过", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "skills/fe/demo/blob.bin",
+        content: `password=SuperSecretValue99\0more`,
+      },
+    ]);
+    expect(hits).toEqual([]);
+  });
+
+  it("force 放行 / 未 force 阻断", () => {
+    const hits = scanSensitiveFiles([
+      {
+        path: "a.env",
+        content: "password=RealSecretValue1\n",
+      },
+    ]);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(gateSensitiveUpload(hits, false)).toEqual({
+      blocked: true,
+      hits,
+    });
+    expect(gateSensitiveUpload(hits, true)).toEqual({ blocked: false });
+    expect(gateSensitiveUpload([], false)).toEqual({ blocked: false });
+    expect(formatSensitiveScanError(hits)).toMatch(/阻断上传/);
   });
 });

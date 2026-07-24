@@ -223,8 +223,14 @@ export const markProcessedMessageId = async (
   });
 };
 
-/** 单测清状态文件 */
+/**
+ * 单测清状态：先排空写队列再删文件，避免火忘 RMW（如 rememberInboundReceivedAt）
+ * 在 unlink 之后落盘、污染下一用例的去重集合。
+ */
 export const __resetBridgeStateForTest = async (): Promise<void> => {
+  const chain = getBridgeStateWriteChain();
+  await chain.current.catch(() => undefined);
+  chain.current = Promise.resolve();
   try {
     await fs.unlink(await stateFilePath());
   } catch {

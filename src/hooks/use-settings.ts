@@ -127,6 +127,7 @@ type FieldEqKind =
   | "actionLayout"
   | "defaultModel"
   | "meegleProject"
+  | "companyEnv"
   | "ignore";
 
 const FIELD_EQ_KIND = {
@@ -151,6 +152,7 @@ const FIELD_EQ_KIND = {
   actionLayout: "actionLayout",
   defaultModel: "defaultModel",
   meegleProject: "meegleProject",
+  companyEnv: "companyEnv",
   modelUsage: "ignore",
 } as const satisfies Record<SettingsField, FieldEqKind>;
 
@@ -191,9 +193,17 @@ export const isFieldEqual = (
     case "actionLayout": {
       const ax = a.actionLayout ?? { order: [], hidden: [] };
       const bx = b.actionLayout ?? { order: [], hidden: [] };
-      const eqArr = (m: string[], n: string[]) =>
-        m.length === n.length && m.every((v, i) => v === n[i]);
-      return eqArr(ax.order, bx.order) && eqArr(ax.hidden, bx.hidden);
+      const eqArr = (m: string[] | undefined, n: string[] | undefined) => {
+        const mm = m ?? [];
+        const nn = n ?? [];
+        return mm.length === nn.length && mm.every((v, i) => v === nn[i]);
+      };
+      return (
+        eqArr(ax.order, bx.order) &&
+        eqArr(ax.hidden, bx.hidden) &&
+        eqArr(ax.groupOrder, bx.groupOrder) &&
+        eqArr(ax.collapsedGroups, bx.collapsedGroups)
+      );
     }
     case "defaultModel": {
       const x = a.defaultModel;
@@ -213,6 +223,12 @@ export const isFieldEqual = (
         (ax?.simpleName ?? "") === (bx?.simpleName ?? "")
       );
     }
+    case "companyEnv":
+      // 结构化对象：稳定 JSON 比；缺省视同空配置
+      return (
+        JSON.stringify(a.companyEnv ?? {}) ===
+        JSON.stringify(b.companyEnv ?? {})
+      );
     case "ignore":
       return true;
   }
@@ -303,6 +319,7 @@ export const useSettings = (): UseSettingsResult => {
         settings,
         savedSettings,
       ),
+      companyEnv: !isFieldEqual("companyEnv", settings, savedSettings),
     }),
     [settings, savedSettings]
   );

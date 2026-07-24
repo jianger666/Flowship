@@ -53,7 +53,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { Input } from "@/components/ui/input";
 
 // Confirm 配置
@@ -243,17 +243,14 @@ export const DialogProvider = ({ children }: DialogProviderProps) => {
               )}
             </AlertDialogHeader>
             {state.withCheckbox && state.opts.checkboxLabel && (
-              <label
-                htmlFor={checkboxId}
-                className="flex cursor-pointer items-center gap-2 text-sm"
+              <CheckboxRow
+                checkboxId={checkboxId}
+                checked={confirmChecked}
+                className="text-sm"
+                onCheckedChange={setConfirmChecked}
               >
-                <Checkbox
-                  id={checkboxId}
-                  checked={confirmChecked}
-                  onCheckedChange={setConfirmChecked}
-                />
                 <span>{state.opts.checkboxLabel}</span>
-              </label>
+              </CheckboxRow>
             )}
             <AlertDialogFooter>
               <AlertDialogCancel onClick={() => closeConfirm(false)}>

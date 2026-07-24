@@ -6,7 +6,7 @@
  *
  * V0.6.0.1 改造：
  *   - 重新引入 mode（"task" | "chat"、对齐 V0.5 概念）
- *   - mode="task"：正经 feature task、title / repoPaths / feishuStoryUrl 三必填
+ *   - mode="task"：title / repoPaths 必填；feishuStoryUrl 选填（空 = 日常轻量态、强制原仓）
  *   - mode="chat"：自由对话、title / repoPaths / feishuStoryUrl 全选填（title 缺省自动补「未命名对话 MM-DD HH:mm」）
  *
  * 路由只做 IO + 校验、状态推进 / 业务规则归 task-fs.ts。
@@ -77,16 +77,10 @@ export const POST = async (req: Request) => {
     const mode = sanitizeMode(body.mode);
     const isChat = mode === "chat";
 
-    // chat 模式三选填、其他模式三必填
+    // chat 模式 title/repo/链接全选填；task 模式 title 必填、飞书链接选填（空=日常轻量态）
     if (!isChat) {
       if (!isNonEmptyString(body.title)) {
         return NextResponse.json({ error: "title 必填" }, { status: 400 });
-      }
-      if (!isNonEmptyString(body.feishuStoryUrl)) {
-        return NextResponse.json(
-          { error: "feishuStoryUrl 必填" },
-          { status: 400 },
-        );
       }
     }
 
@@ -125,7 +119,7 @@ export const POST = async (req: Request) => {
         body.disabledMcpServers.every((s) => typeof s === "string")
           ? body.disabledMcpServers
           : undefined,
-      // V0.10：任务隔离工作区开关（缺省 = task 模式默认 true、见 createTask）
+      // V0.10：隔离开关（缺省 task 默认 true）；无飞书链接时 createTask 内强制 false
       isolateWorktree:
         typeof body.isolateWorktree === "boolean"
           ? body.isolateWorktree

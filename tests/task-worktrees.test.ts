@@ -43,12 +43,14 @@ import {
   getTaskCwd,
   getTaskWorkRepoPaths,
   isGitRepoPath,
+  isLightweightDailyTask,
   isSafeBranchName,
   isWorktreeTask,
   parseMainGitDirFromPointer,
   parseOccupyingWorktreePath,
   planWorktreeBranchInfos,
   resolveOriginalRepoPath,
+  resolveTaskIsolateWorktree,
 } from "@/lib/server/task-worktrees";
 import {
   formatRepoSectionForPrompt,
@@ -56,6 +58,11 @@ import {
   getUniqueRepoDirNames,
 } from "@/lib/path-utils";
 import { extractFeishuStoryId } from "@/lib/branch-template";
+import {
+  filterAdvanceGroupsForDailyTask,
+  LIGHTWEIGHT_DAILY_PROMPT_DIRECTIVE,
+  renderLightweightDailySection,
+} from "@/lib/lightweight-task";
 
 const baseTask = (patch: Partial<Task> = {}): Task =>
   ({
@@ -93,6 +100,70 @@ describe("isWorktreeTask 隔离判定", () => {
     expect(isWorktreeTask(baseTask({ isolateWorktree: false }))).toBe(false);
     expect(isWorktreeTask(baseTask({ isolateWorktree: undefined }))).toBe(false);
     expect(isWorktreeTask(baseTask({ repoPaths: [] }))).toBe(false);
+  });
+});
+
+describe("日常轻量态（无飞书链接）— 原仓 + 不建分支", () => {
+  it("resolveTaskIsolateWorktree：无 storyUrl 强制原仓，即使入参要隔离", () => {
+    expect(resolveTaskIsolateWorktree("task", undefined, true)).toBe(false);
+    expect(resolveTaskIsolateWorktree("task", "", true)).toBe(false);
+    expect(resolveTaskIsolateWorktree("task", "  ", undefined)).toBe(false);
+  });
+
+  it("resolveTaskIsolateWorktree：有 storyUrl 时缺省隔离、显式 false 逃生", () => {
+    const url = "https://project.feishu.cn/x/story/detail/1";
+    expect(resolveTaskIsolateWorktree("task", url, undefined)).toBe(true);
+    expect(resolveTaskIsolateWorktree("task", url, true)).toBe(true);
+    expect(resolveTaskIsolateWorktree("task", url, false)).toBe(false);
+    expect(resolveTaskIsolateWorktree("chat", url, true)).toBeUndefined();
+  });
+
+  it("isLightweightDailyTask：仅看 storyUrl 是否为空", () => {
+    expect(isLightweightDailyTask({})).toBe(true);
+    expect(isLightweightDailyTask({ feishuStoryUrl: "" })).toBe(true);
+    expect(
+      isLightweightDailyTask({
+        feishuStoryUrl: "https://project.feishu.cn/x/story/detail/1",
+      }),
+    ).toBe(false);
+  });
+
+  it("无 storyUrl + 落盘 isolateWorktree=false → 不走隔离（原仓路径）", () => {
+    const t = baseTask({
+      feishuStoryUrl: undefined,
+      isolateWorktree: resolveTaskIsolateWorktree("task", undefined, true),
+    });
+    expect(t.isolateWorktree).toBe(false);
+    expect(isWorktreeTask(t)).toBe(false);
+    expect(getTaskWorkRepoPaths(t)).toEqual([REPO_WEB]);
+    expect(getTaskCwd(t)).toBe(REPO_WEB);
+  });
+
+  it("prompt 声明段：轻量态非空、正式任务空串", () => {
+    expect(renderLightweightDailySection({})).toContain(
+      LIGHTWEIGHT_DAILY_PROMPT_DIRECTIVE,
+    );
+    expect(
+      renderLightweightDailySection({
+        feishuStoryUrl: "https://project.feishu.cn/x/story/detail/1",
+      }),
+    ).toBe("");
+  });
+
+  it("推进分组过滤：日常只留 custom，正式原样", () => {
+    const groups = [
+      { key: "builtin", keys: ["plan"] },
+      { key: "team", keys: ["wk-1"] },
+      { key: "custom", keys: ["ca-1"] },
+    ];
+    expect(filterAdvanceGroupsForDailyTask(groups, {})).toEqual([
+      { key: "custom", keys: ["ca-1"] },
+    ]);
+    expect(
+      filterAdvanceGroupsForDailyTask(groups, {
+        feishuStoryUrl: "https://project.feishu.cn/x/story/detail/1",
+      }),
+    ).toEqual(groups);
   });
 });
 

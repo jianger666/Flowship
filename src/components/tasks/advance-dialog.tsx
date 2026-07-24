@@ -44,10 +44,14 @@ import Link from "next/link";
 import {
   AlertTriangle,
   ArrowRight,
+  ChevronDown,
   Info,
   Loader2,
   Paperclip,
   Sparkles,
+  Users,
+  Zap,
+  type LucideIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -83,14 +87,25 @@ import { fetchCustomActions } from "@/lib/custom-action-client";
 import {
   arrangeByLayout,
   BUILTIN_ADVANCE_ACTIONS,
+  emptyActionLayout,
   filterAdvanceByDisabledAppSkills,
   filterAdvanceByRequiresKnowledge,
+  groupAdvanceActions,
   isBuiltinAdvanceAction,
+  normalizeCollapsedGroups,
   usableCustomActions,
+  type ActionGroupKey,
 } from "@/lib/action-layout";
+import {
+  filterAdvanceGroupsForDailyTask,
+  isLightweightDailyTask,
+} from "@/lib/lightweight-task";
+import { isCompanyEnvConfigured } from "@/lib/company-env";
+import { SettingsLink } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
 import { isSharedTeamCategory, TEST_STRATEGY_LABEL } from "@/lib/types";
 import type {
+  ActionLayoutPref,
   ActionType,
   CustomActionDef,
   DevPushMode,
@@ -100,6 +115,13 @@ import type {
 
 // 推进面板内置 action 顺序 + 渲染走 @/lib/action-layout 的 BUILTIN_ADVANCE_ACTIONS
 //（单一来源、跟 /actions 布局配置页共用；custom 不在内、自定义组单独渲染）
+
+/** 推进弹窗组头语义图标：通用 / 团队 / 自定义一眼可辨（能力页组头不复用） */
+const ADVANCE_GROUP_ICON: Record<ActionGroupKey, LucideIcon> = {
+  builtin: Zap,
+  team: Users,
+  custom: Sparkles,
+};
 
 // 跟 runner 的 checkActionPrerequisites 对齐（V0.6 门槛 1 软提示）
 // 服务端会双重校验、UI 仅为提示用户「为什么这个 action 不能选」
@@ -401,11 +423,14 @@ export const AdvanceDialog = ({
   actionTypeRef.current = actionType;
   const selectedCustomActionIdRef = useRef(selectedCustomActionId);
   selectedCustomActionIdRef.current = selectedCustomActionId;
-  // V0.9：推进面板布局偏好（顺序 + 显隐）；open effect 里读 getSettings() 刷新（非响应式、靠重开拉最新）
-  const [actionLayout, setActionLayout] = useState<{
-    order: string[];
-    hidden: string[];
-  }>({ order: [], hidden: [] });
+  // V0.9：推进面板布局偏好（顺序 + 显隐 + 分组）；open effect 里读 getSettings() 刷新（非响应式、靠重开拉最新）
+  const [actionLayout, setActionLayout] = useState<ActionLayoutPref>(
+    emptyActionLayout,
+  );
+  // 弹窗内分组折叠临时态（打开时从 collapsedGroups 灌入、切换不落盘）
+  const [collapsedGroups, setCollapsedGroups] = useState<
+    Set<ActionGroupKey>
+  >(() => new Set());
   // 用户指令、选填——飞书/上下文都已带上、空也能跑
   const [instruction, setInstruction] = useState("");
   // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接；
@@ -455,6 +480,9 @@ export const AdvanceDialog = ({
   // ref 持本 task 各仓路径——open effect 读设置页 dev 分支时用、不进 effect 依赖（同 hasPlanHistoryRef 套路）
   const repoPathsRef = useRef(task.repoPaths);
   repoPathsRef.current = task.repoPaths;
+  // 日常轻量态判定用（open / fetch effect 不进 task 依赖、靠 ref 读最新）
+  const feishuStoryUrlRef = useRef(task.feishuStoryUrl);
+  feishuStoryUrlRef.current = task.feishuStoryUrl;
   // 打开瞬间快照：本次正在创建的 plan 提交后会进 task.actions、但快照不变——
   // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
   const [hasPlanHistory, setHasPlanHistory] = useState(false);
@@ -541,9 +569,11 @@ export const AdvanceDialog = ({
     setLiveDevBranches(devMap);
     // 快照「打开瞬间是否已有方案」——提交后 task.actions 变、快照不变、不误闪 append 文案
     setHasPlanHistory(hasPlanHistoryRef.current);
-    // V0.9：读最新布局偏好（顺序 + 显隐）；隐藏项直接不渲染（v0.9.12 删「更多」折叠区、重新启用去 /actions 页）
-    const layout = s.actionLayout ?? { order: [], hidden: [] };
+    // V0.9：读最新布局偏好（顺序 + 显隐 + 分组）；隐藏项直接不渲染
+    const layout = s.actionLayout ?? emptyActionLayout();
     setActionLayout(layout);
+    // 默认折叠：从配置灌入临时态（弹窗内展开/收起不落盘）
+    setCollapsedGroups(new Set(normalizeCollapsedGroups(layout.collapsedGroups)));
     // 收件箱改bug：优先预选 customActionId（缓存里已有且可见才当场选；否则挂 pending 等拉列表）
     const prefillCustomId =
       prefillRef.current?.customActionId?.trim() || null;
@@ -570,20 +600,24 @@ export const AdvanceDialog = ({
         (d) => !d.skill || !knowledgeNames.has(d.skill),
       );
     };
-    const visibleKeys = arrangeByLayout(
-      [
-        ...BUILTIN_ADVANCE_ACTIONS,
-        ...filterTeam(customActionsRef.current).map((d) => d.id),
-      ],
+    const filteredCustom = filterTeam(customActionsRef.current);
+    const customMap = new Map(filteredCustom.map((d) => [d.id, d] as const));
+    const arranged = arrangeByLayout(
+      [...BUILTIN_ADVANCE_ACTIONS, ...filteredCustom.map((d) => d.id)],
       layout,
     );
+    // 默认选中 = 按组序展开后的第一位（空组跳过）；日常任务只看自定义组
+    const visibleKeys = filterAdvanceGroupsForDailyTask(
+      groupAdvanceActions(arranged, customMap, layout.groupOrder),
+      { feishuStoryUrl: feishuStoryUrlRef.current },
+    ).flatMap((g) => g.keys);
     if (prefillCustomId && visibleKeys.includes(prefillCustomId)) {
       setActionType("custom");
       setSelectedCustomActionId(prefillCustomId);
       pendingPrefillCustomIdRef.current = null;
       return;
     }
-    // v0.9.12 通用化：默认选中 = 混排可见列表第一位（用户自己排的顺序、无业务状态假设——
+    // v0.9.12 通用化：默认选中 = 可见列表第一位（组序优先；无业务状态假设——
     // 原「按 repoStatus / 最近 action 顺推」的 inferDefaultActionType 已删）。
     // customActions 用 ref 读打开瞬间的缓存：首次打开还没拉到就只在内置里选、
     // 拉完不追改选中（用户可能已开始操作、追改会跳）；第二次打开起缓存已有、custom 排第一也能选中。
@@ -685,11 +719,19 @@ export const AdvanceDialog = ({
           );
         })();
         setCustomActions(filtered);
-        const layout = getSettings().actionLayout ?? { order: [], hidden: [] };
-        const visible = arrangeByLayout(
-          [...BUILTIN_ADVANCE_ACTIONS, ...filtered.map((d) => d.id)],
-          layout,
-        );
+        const layout = getSettings().actionLayout ?? emptyActionLayout();
+        const customMap = new Map(filtered.map((d) => [d.id, d] as const));
+        const visible = filterAdvanceGroupsForDailyTask(
+          groupAdvanceActions(
+            arrangeByLayout(
+              [...BUILTIN_ADVANCE_ACTIONS, ...filtered.map((d) => d.id)],
+              layout,
+            ),
+            customMap,
+            layout.groupOrder,
+          ),
+          { feishuStoryUrl: feishuStoryUrlRef.current },
+        ).flatMap((g) => g.keys);
         const filteredIds = new Set(filtered.map((d) => d.id));
 
         // 收件箱改bug：pending 预选优先（命中则落选并 return，避免被下面的幽灵重置盖掉）
@@ -703,6 +745,23 @@ export const AdvanceDialog = ({
             return;
           }
           // pending 未命中 / 用户已手点 → 落下去校验当前选中是否仍在列表
+        }
+
+        // 日常任务：打开瞬间自定义列表可能还空 → 默认 null；拉完后若用户未手点、补选第一项
+        if (
+          isLightweightDailyTask({
+            feishuStoryUrl: feishuStoryUrlRef.current,
+          }) &&
+          !userTouchedActionRef.current &&
+          actionTypeRef.current === null &&
+          visible.length > 0
+        ) {
+          selectFirstVisibleAction(
+            visible,
+            setActionType,
+            setSelectedCustomActionId,
+          );
+          return;
         }
 
         // 过滤后当前 custom 选中已不在列表（被团队规范 / 关 skill / 删除滤掉）→ 重置，防幽灵可提交
@@ -726,11 +785,15 @@ export const AdvanceDialog = ({
           actionTypeRef.current === "custom" &&
           selectedCustomActionIdRef.current
         ) {
-          const layout = getSettings().actionLayout ?? { order: [], hidden: [] };
-          const visible = arrangeByLayout(
-            [...BUILTIN_ADVANCE_ACTIONS],
-            layout,
-          );
+          const layout = getSettings().actionLayout ?? emptyActionLayout();
+          const visible = filterAdvanceGroupsForDailyTask(
+            groupAdvanceActions(
+              arrangeByLayout([...BUILTIN_ADVANCE_ACTIONS], layout),
+              new Map(),
+              layout.groupOrder,
+            ),
+            { feishuStoryUrl: feishuStoryUrlRef.current },
+          ).flatMap((g) => g.keys);
           selectFirstVisibleAction(
             visible,
             setActionType,
@@ -747,20 +810,41 @@ export const AdvanceDialog = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // V0.9：内置 + 自定义混排成一个列表、按 layout 统一排序 + 过滤隐藏项
+  // V0.9：内置 + 自定义按 layout 排好后分三组渲染（空组不出现）
   //（v0.9.12：隐藏的直接不出现、「更多」折叠区已删）。
   const customById = useMemo(
     () => new Map(customActions.map((d) => [d.id, d] as const)),
     [customActions],
   );
-  const visibleKeys = useMemo(
+  const visibleGroups = useMemo(
     () =>
-      arrangeByLayout(
-        [...BUILTIN_ADVANCE_ACTIONS, ...customById.keys()],
-        actionLayout,
+      filterAdvanceGroupsForDailyTask(
+        groupAdvanceActions(
+          arrangeByLayout(
+            [...BUILTIN_ADVANCE_ACTIONS, ...customById.keys()],
+            actionLayout,
+          ),
+          customById,
+          actionLayout.groupOrder,
+        ),
+        task,
       ),
-    [customById, actionLayout],
+    [customById, actionLayout, task],
   );
+  // 扁平可见 key（默认选中 / 空态判断仍用）
+  const visibleKeys = useMemo(
+    () => visibleGroups.flatMap((g) => g.keys),
+    [visibleGroups],
+  );
+
+  const toggleGroupCollapsed = (key: ActionGroupKey) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
 
   // 「下一步」：网格方块卡（两行：中文名 + 标识符）
   // 内置 + 自定义混排；外观 / 内容走 actionCardClass + ActionCardContent 单一来源；
@@ -1000,13 +1084,66 @@ export const AdvanceDialog = ({
         {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5）
             高度随内容自适应（防抖占位撑出大空档、用户实测点名去掉） */}
         <div className="flex flex-col gap-4">
-          {/* action 类型选择：内置 + 自定义混排成 grid 方块（顺序 / 显隐在 /actions 页配、隐藏的不出现） */}
+          {/* action 类型选择：按固定三组渲染（组序 / 默认折叠在 /actions 页配；隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             {visibleKeys.length > 0 ? (
-              <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4">
-                {visibleKeys.map((key) => renderActionChip(key))}
+              // 组到组 gap-3 拉开层次；组头→卡片间距放进展开内容的 pt、收起时不留空缝
+              <div className="grid gap-3">
+                {visibleGroups.map((group) => {
+                  const collapsed = collapsedGroups.has(group.key);
+                  const GroupIcon = ADVANCE_GROUP_ICON[group.key];
+                  return (
+                    <div key={group.key} className="grid">
+                      {/* 组头整行可点：rounded + hover:bg-accent；折叠态靠 badge 数量暗示「收着东西」 */}
+                      <button
+                        type="button"
+                        onClick={() => toggleGroupCollapsed(group.key)}
+                        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                        aria-expanded={!collapsed}
+                      >
+                        <ChevronDown
+                          className={cn(
+                            "size-3.5 shrink-0 transition-transform duration-150",
+                            collapsed && "-rotate-90",
+                          )}
+                        />
+                        <GroupIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 flex-1 truncate font-medium">
+                          {group.label}
+                        </span>
+                        <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-md bg-muted px-1 text-[10px] tabular-nums text-muted-foreground">
+                          {group.keys.length}
+                        </span>
+                      </button>
+                      {/* 双向 grid-rows 过渡：展开/收起都平滑，避免条件挂载闪跳 */}
+                      <div
+                        className={cn(
+                          "grid transition-[grid-template-rows] duration-150 ease-out",
+                          collapsed
+                            ? "grid-rows-[0fr]"
+                            : "grid-rows-[1fr]",
+                        )}
+                      >
+                        <div className="min-h-0 overflow-hidden">
+                          <div className="grid grid-cols-3 gap-1.5 pt-1.5 sm:grid-cols-4">
+                            {group.keys.map((key) => renderActionChip(key))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
+            ) : isLightweightDailyTask(task) ? (
+              // 日常任务不展示通用 / 团队组——自定义也空时引导去能力页
+              <EmptyHint size="sm">
+                日常任务只支持自定义 action，去{" "}
+                <Link href="/actions" className="text-primary underline">
+                  能力页
+                </Link>{" "}
+                创建或安装
+              </EmptyHint>
             ) : (
               // 全部 action 被隐藏（极端配置）——引导去 /actions 页开启或新建、不把关掉的又摆出来
               <EmptyHint size="sm">
@@ -1017,15 +1154,28 @@ export const AdvanceDialog = ({
                 开启或新建。
               </EmptyHint>
             )}
-            {/* plan 追加提示：有内容才渲染（占位防抖已回退） */}
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground empty:hidden">
+            {/* plan 追加提示 / 环境配置缺省提示：有内容才渲染 */}
+            <div className="flex flex-col gap-1.5 text-xs text-muted-foreground empty:hidden">
               {actionType === "plan" && hasPlanHistory ? (
-                <>
+                <div className="flex items-center gap-1.5">
                   <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
                   <span>
                     本次会追加到现有方案，新增批次会进入「改代码」选择。
                   </span>
-                </>
+                </div>
+              ) : null}
+              {actionType === "custom" &&
+              selectedCustomActionId &&
+              customById.get(selectedCustomActionId)?.requiresCompanyEnv ===
+                true &&
+              !isCompanyEnvConfigured(getSettings().companyEnv) ? (
+                <div className="flex items-center gap-1.5">
+                  <Info className="size-3.5 shrink-0 text-muted-foreground/70" />
+                  <span>
+                    需先在设置页填环境配置 ·{" "}
+                    <SettingsLink focus="connect">去配置</SettingsLink>
+                  </span>
+                </div>
               ) : null}
             </div>
           </div>
