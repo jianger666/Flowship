@@ -11,6 +11,7 @@
  *
  * 各模块自带 globalThis 幂等，这里只负责「一处调齐」：
  * - outbound：全局 tap 订阅 chat 事件流 → 流式卡片
+ * - group-outbound：全局 tap → 需求群 ask 卡 / 回答回群 / 推进产物回群（第二批）
  * - card-action：卡片按钮回调（ask 答题 / 错误重试）
  * - commands：/stop /new /list /status /help
  * - reactions：注入结果 emoji 回执（Get / Typing / CrossMark）
@@ -21,6 +22,7 @@
 
 import { ensureCardActionHandlerRegistered } from "./card-action";
 import { ensureBridgeCommandsRegistered } from "./commands";
+import { ensureFeishuGroupOutboundRegistered } from "./group-outbound";
 import { ensureBridgeRuntimePolling } from "./inbound";
 import { ensureFeishuOutboundRegistered } from "./outbound";
 import { ensureReactionReceiptsRegistered } from "./reactions";
@@ -28,6 +30,7 @@ import { ensureReactionReceiptsRegistered } from "./reactions";
 /** server 启动时调一次；重复调用无副作用 */
 export const ensureFeishuBridgeBootstrapped = (): void => {
   ensureFeishuOutboundRegistered();
+  ensureFeishuGroupOutboundRegistered();
   ensureCardActionHandlerRegistered();
   ensureBridgeCommandsRegistered();
   ensureReactionReceiptsRegistered();

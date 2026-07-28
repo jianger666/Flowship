@@ -263,7 +263,7 @@ export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
               )}
             >
               {f.isDir ? (
-                <Folder className="size-3.5 shrink-0 text-amber-500" />
+                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
               ) : (
                 <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
               )}
@@ -274,7 +274,7 @@ export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
           ))
         )}
       </div>
-      <div className="border-t bg-muted/40 px-2.5 py-1 text-[10px] text-muted-foreground">
+      <div className="border-t bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground">
         ↑↓ 选择 · Enter 确认 · Esc 关闭
       </div>
     </div>

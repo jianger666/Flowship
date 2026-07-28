@@ -8,8 +8,11 @@
 
 import type {
   CompanyEnv,
+  CompanyEnvElk,
   CompanyEnvHttpApi,
   CompanyEnvHttpApiAuth,
+  CompanyEnvNacos,
+  CompanyEnvPg,
   CompanyEnvServer,
   CompanyEnvXxlJob,
 } from "./types";
@@ -17,8 +20,11 @@ import type {
 /** 空配置（DEFAULT_SETTINGS / 表单初始） */
 export const emptyCompanyEnv = (): CompanyEnv => ({
   servers: [],
+  pg: [],
   logPathTemplates: [],
   xxljob: [],
+  nacos: [],
+  elk: [],
   httpApis: [],
 });
 
@@ -42,14 +48,29 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       password: "【填写】",
     },
   ],
-  pg: {
-    host: "10.0.3.20",
-    port: 5432,
-    user: "readonly",
-    password: "【填写】",
-    dbTemplates: ["{project}-test", "{project}-dev"],
-    readonly: true,
-  },
+  // 两条：体现「不同环境 / 不同业务库是不同 host + 不同账号」的多实例用法
+  pg: [
+    {
+      name: "CRM 测试库",
+      env: "test",
+      host: "10.0.3.20",
+      port: 5432,
+      user: "readonly",
+      password: "【填写】",
+      dbTemplates: ["{project}-test", "{project}-dev"],
+      readonly: true,
+    },
+    {
+      name: "CRM 预发库",
+      env: "pre",
+      host: "10.0.4.20",
+      port: 5432,
+      user: "readonly",
+      password: "【填写】",
+      dbTemplates: ["{project}-pre"],
+      readonly: true,
+    },
+  ],
   logPathTemplates: ["/apps/{project}/logs/console.log*"],
   xxljob: [
     {
@@ -60,19 +81,27 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       readonly: true,
     },
   ],
-  nacos: {
-    baseUrl: "http://nacos.example.com:8848",
-    username: "nacos",
-    password: "【填写】",
-    namespaces: ["test", "dev"],
-    readonly: true,
-  },
-  elk: {
-    baseUrl: "https://kibana.example.com",
-    username: "readonly",
-    password: "【填写】",
-    dataView: "app-logs-*",
-  },
+  nacos: [
+    {
+      name: "测试集群",
+      env: "test",
+      baseUrl: "http://nacos-test.example.com:8848",
+      username: "nacos",
+      password: "【填写】",
+      namespaces: ["test", "dev"],
+      readonly: true,
+    },
+  ],
+  elk: [
+    {
+      name: "Kibana 测试",
+      env: "test",
+      baseUrl: "https://kibana-test.example.com",
+      username: "readonly",
+      password: "【填写】",
+      dataView: "app-logs-*",
+    },
+  ],
   httpApis: [
     {
       name: "CRM",
@@ -182,6 +211,70 @@ const normalizeXxl = (
   };
 };
 
+/** 多实例小节的公共标识字段（name / env 都允许留空） */
+const instanceId = (o: Record<string, unknown>) => ({
+  name: asTrimmedString(o.name) ?? "",
+  env: asTrimmedString(o.env) ?? "",
+});
+
+const normalizePg = (o: Record<string, unknown>): CompanyEnvPg => ({
+  ...instanceId(o),
+  host: asTrimmedString(o.host) ?? "",
+  port: asPort(o.port, 5432),
+  user: asTrimmedString(o.user) ?? "",
+  password: typeof o.password === "string" ? o.password : "",
+  dbTemplates: asStringArray(o.dbTemplates),
+  readonly: asReadonlyDefaultTrue(o.readonly),
+});
+
+const normalizeNacos = (o: Record<string, unknown>): CompanyEnvNacos => ({
+  ...instanceId(o),
+  baseUrl: asTrimmedString(o.baseUrl) ?? "",
+  username: asTrimmedString(o.username) ?? "",
+  password: typeof o.password === "string" ? o.password : "",
+  namespaces: asStringArray(o.namespaces),
+  readonly: asReadonlyDefaultTrue(o.readonly),
+});
+
+const normalizeElk = (o: Record<string, unknown>): CompanyEnvElk => ({
+  ...instanceId(o),
+  baseUrl: asTrimmedString(o.baseUrl) ?? "",
+  username: asTrimmedString(o.username) ?? "",
+  password: typeof o.password === "string" ? o.password : "",
+  dataView: asTrimmedString(o.dataView) ?? "",
+});
+
+/**
+ * 归一 pg / nacos / elk 这三个多实例小节。
+ *
+ * **单个对象 = 旧版单实例格式**（这三项以前不是数组）——读时原样升级成单元素数组，
+ * 用户已填的 host / 账号 / 密码全部保留、不用重填。一次性数据迁移、不是长期兼容层。
+ */
+const normalizeInstanceList = <T>(
+  raw: unknown,
+  key: string,
+  warnings: string[],
+  one: (o: Record<string, unknown>) => T,
+): T[] => {
+  if (raw === undefined || raw === null) return [];
+  if (Array.isArray(raw)) {
+    const out: T[] = [];
+    raw.forEach((row, i) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        warnings.push(`${key}[${i}] 不是对象、已跳过`);
+        return;
+      }
+      out.push(one(row as Record<string, unknown>));
+    });
+    return out;
+  }
+  if (typeof raw !== "object") {
+    warnings.push(`${key} 既不是数组也不是对象、已忽略`);
+    return [];
+  }
+  return [one(raw as Record<string, unknown>)];
+};
+
 const normalizeHttpAuth = (
   raw: unknown,
   warnings: string[],
@@ -288,61 +381,13 @@ export const normalizeCompanyEnv = (
     }
   }
 
-  let pg: CompanyEnv["pg"];
-  if (o.pg !== undefined && o.pg !== null) {
-    if (typeof o.pg !== "object" || Array.isArray(o.pg)) {
-      warnings.push("pg 不是对象、已忽略");
-    } else {
-      const p = o.pg as Record<string, unknown>;
-      pg = {
-        host: asTrimmedString(p.host) ?? "",
-        port: asPort(p.port, 5432),
-        user: asTrimmedString(p.user) ?? "",
-        password: typeof p.password === "string" ? p.password : "",
-        dbTemplates: asStringArray(p.dbTemplates),
-        readonly: asReadonlyDefaultTrue(p.readonly),
-      };
-    }
-  }
-
-  let nacos: CompanyEnv["nacos"];
-  if (o.nacos !== undefined && o.nacos !== null) {
-    if (typeof o.nacos !== "object" || Array.isArray(o.nacos)) {
-      warnings.push("nacos 不是对象、已忽略");
-    } else {
-      const n = o.nacos as Record<string, unknown>;
-      nacos = {
-        baseUrl: asTrimmedString(n.baseUrl) ?? "",
-        username: asTrimmedString(n.username) ?? "",
-        password: typeof n.password === "string" ? n.password : "",
-        namespaces: asStringArray(n.namespaces),
-        readonly: asReadonlyDefaultTrue(n.readonly),
-      };
-    }
-  }
-
-  let elk: CompanyEnv["elk"];
-  if (o.elk !== undefined && o.elk !== null) {
-    if (typeof o.elk !== "object" || Array.isArray(o.elk)) {
-      warnings.push("elk 不是对象、已忽略");
-    } else {
-      const e = o.elk as Record<string, unknown>;
-      elk = {
-        baseUrl: asTrimmedString(e.baseUrl) ?? "",
-        username: asTrimmedString(e.username) ?? "",
-        password: typeof e.password === "string" ? e.password : "",
-        dataView: asTrimmedString(e.dataView) ?? "",
-      };
-    }
-  }
-
   return {
     servers,
-    ...(pg ? { pg } : {}),
+    pg: normalizeInstanceList(o.pg, "pg", warnings, normalizePg),
     logPathTemplates: asStringArray(o.logPathTemplates),
     xxljob,
-    ...(nacos ? { nacos } : {}),
-    ...(elk ? { elk } : {}),
+    nacos: normalizeInstanceList(o.nacos, "nacos", warnings, normalizeNacos),
+    elk: normalizeInstanceList(o.elk, "elk", warnings, normalizeElk),
     httpApis,
   };
 };
@@ -396,6 +441,21 @@ export const isXxljobReadonly = (rows: CompanyEnvXxlJob[]): boolean =>
   rows.length === 0 || rows.every((x) => x.readonly !== false);
 
 /**
+ * 多实例小节的只读括号文案，三态：
+ * 全只读 → 整节约束；全可写 → 不加括号（同 {@link isXxljobReadonly} 的「任一条显式 false → 整节可写」口径）；
+ * 混合 → 报只读条数 + 让 AI 回配置文件逐条看 readonly，避免整节口径把可写实例误说成只读。
+ */
+const readonlyNote = (
+  rows: { readonly: boolean }[],
+  constraint: string,
+): string => {
+  const readonlyCount = rows.filter((r) => r.readonly !== false).length;
+  if (readonlyCount === 0) return "";
+  if (readonlyCount === rows.length) return `（只读——${constraint}）`;
+  return `（其中 ${readonlyCount} 个只读——${constraint}；其余可写，以配置文件里每条的 readonly 为准）`;
+};
+
+/**
  * 常驻 prompt 声明：有实质配置（≥1 台有 host 的服务器，或 PG host 已填）时返回一段，
  * 否则空串。fileAbsPath = company-env.json 绝对路径（调用方传入，保持本函数纯、可单测）。
  * **绝不写入任何密码 / note 正文**——只枚举已配置子系统 + 只读软约束。
@@ -410,15 +470,19 @@ export const buildCompanyEnvBrief = (
   if (!isCompanyEnvConfigured(env)) return "";
 
   const serverCount = env.servers.filter((s) => s.host.trim()).length;
-  const hasPg = !!env.pg?.host?.trim();
+  // 只统计「填了 host / baseUrl」的实例——空壳条目不该让 AI 以为有得用
+  const pgRows = env.pg.filter((p) => p.host.trim());
+  const nacosRows = env.nacos.filter((n) => n.baseUrl.trim());
+  const elkCount = env.elk.filter((e) => e.baseUrl.trim()).length;
 
   const parts: string[] = [];
   if (serverCount > 0) parts.push(`服务器 ${serverCount} 台`);
-  if (hasPg) {
+  if (pgRows.length > 0) {
     parts.push(
-      env.pg!.readonly !== false
-        ? "PostgreSQL（只读——只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DDL）"
-        : "PostgreSQL",
+      `PostgreSQL ${pgRows.length} 个实例${readonlyNote(
+        pgRows,
+        "只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DDL",
+      )}`,
     );
   }
   if (env.logPathTemplates.some((t) => t.trim())) parts.push("日志路径模板");
@@ -429,14 +493,15 @@ export const buildCompanyEnvBrief = (
         : "XXL-Job",
     );
   }
-  if (env.nacos?.baseUrl?.trim()) {
+  if (nacosRows.length > 0) {
     parts.push(
-      env.nacos.readonly !== false
-        ? "Nacos（只读——只允许读配置、禁止发布修改）"
-        : "Nacos",
+      `Nacos ${nacosRows.length} 个集群${readonlyNote(
+        nacosRows,
+        "只允许读配置、禁止发布修改",
+      )}`,
     );
   }
-  if (env.elk?.baseUrl?.trim()) parts.push("ELK");
+  if (elkCount > 0) parts.push(`ELK ${elkCount} 个实例`);
   const httpApiCount = (env.httpApis ?? []).filter((h) =>
     h.baseUrl.trim(),
   ).length;
@@ -456,10 +521,10 @@ export const buildCompanyEnvBrief = (
 export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => {
   if (!env) return false;
   if (env.servers.some((s) => s.host.trim())) return true;
-  if (env.pg?.host?.trim()) return true;
+  if (env.pg.some((p) => p.host.trim())) return true;
   if (env.xxljob.some((x) => x.baseUrl.trim())) return true;
-  if (env.nacos?.baseUrl?.trim()) return true;
-  if (env.elk?.baseUrl?.trim()) return true;
+  if (env.nacos.some((n) => n.baseUrl.trim())) return true;
+  if (env.elk.some((e) => e.baseUrl.trim())) return true;
   if ((env.httpApis ?? []).some((h) => h.baseUrl.trim())) return true;
   return false;
 };
@@ -471,6 +536,23 @@ const envSegment = (raw: string): string =>
     .toUpperCase()
     .replace(/[^A-Z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "") || "UNKNOWN";
+
+/**
+ * 多实例子系统的环境变量前缀：`FS_ENV_<子系统>[_<环境段>][_序号]`。
+ * env 留空 → 不带环境段（旧单实例配置升上来的那条正好还是 `FS_ENV_PG_*` 老键名）；
+ * 同一环境段第 2 条起加 `_2` / `_3`，与 xxljob / httpApis 的现成规则一致。
+ * counter 由调用方按子系统各持一个，跨子系统不互相影响。
+ */
+const instanceVarPrefix = (
+  subsystem: string,
+  env: string,
+  counter: Map<string, number>,
+): string => {
+  const seg = env.trim() ? `_${envSegment(env)}` : "";
+  const n = (counter.get(seg) ?? 0) + 1;
+  counter.set(seg, n);
+  return `FS_ENV_${subsystem}${seg}${n === 1 ? "" : `_${n}`}`;
+};
 
 /** 仅非空字符串才写入 */
 const put = (
@@ -508,14 +590,17 @@ export const companyEnvToEnvVars = (
     put(out, `${prefix}_NAME`, s.name.trim());
   }
 
-  if (env.pg) {
-    put(out, "FS_ENV_PG_HOST", env.pg.host.trim());
-    put(out, "FS_ENV_PG_PORT", env.pg.port);
-    put(out, "FS_ENV_PG_USER", env.pg.user.trim());
-    put(out, "FS_ENV_PG_PASSWORD", env.pg.password);
-    put(out, "FS_ENV_PG_READONLY", env.pg.readonly !== false ? "1" : "0");
-    if (env.pg.dbTemplates.length > 0) {
-      put(out, "FS_ENV_PG_DB_TEMPLATES", env.pg.dbTemplates.join("\n"));
+  const pgCount = new Map<string, number>();
+  for (const p of env.pg) {
+    const prefix = instanceVarPrefix("PG", p.env, pgCount);
+    put(out, `${prefix}_NAME`, p.name.trim());
+    put(out, `${prefix}_HOST`, p.host.trim());
+    put(out, `${prefix}_PORT`, p.port);
+    put(out, `${prefix}_USER`, p.user.trim());
+    put(out, `${prefix}_PASSWORD`, p.password);
+    put(out, `${prefix}_READONLY`, p.readonly !== false ? "1" : "0");
+    if (p.dbTemplates.length > 0) {
+      put(out, `${prefix}_DB_TEMPLATES`, p.dbTemplates.join("\n"));
     }
   }
 
@@ -536,25 +621,27 @@ export const companyEnvToEnvVars = (
     put(out, `${prefix}_READONLY`, x.readonly !== false ? "1" : "0");
   }
 
-  if (env.nacos) {
-    put(out, "FS_ENV_NACOS_BASE_URL", env.nacos.baseUrl.trim());
-    put(out, "FS_ENV_NACOS_USERNAME", env.nacos.username.trim());
-    put(out, "FS_ENV_NACOS_PASSWORD", env.nacos.password);
-    put(
-      out,
-      "FS_ENV_NACOS_READONLY",
-      env.nacos.readonly !== false ? "1" : "0",
-    );
-    if (env.nacos.namespaces.length > 0) {
-      put(out, "FS_ENV_NACOS_NAMESPACES", env.nacos.namespaces.join("\n"));
+  const nacosCount = new Map<string, number>();
+  for (const n of env.nacos) {
+    const prefix = instanceVarPrefix("NACOS", n.env, nacosCount);
+    put(out, `${prefix}_NAME`, n.name.trim());
+    put(out, `${prefix}_BASE_URL`, n.baseUrl.trim());
+    put(out, `${prefix}_USERNAME`, n.username.trim());
+    put(out, `${prefix}_PASSWORD`, n.password);
+    put(out, `${prefix}_READONLY`, n.readonly !== false ? "1" : "0");
+    if (n.namespaces.length > 0) {
+      put(out, `${prefix}_NAMESPACES`, n.namespaces.join("\n"));
     }
   }
 
-  if (env.elk) {
-    put(out, "FS_ENV_ELK_BASE_URL", env.elk.baseUrl.trim());
-    put(out, "FS_ENV_ELK_USERNAME", env.elk.username.trim());
-    put(out, "FS_ENV_ELK_PASSWORD", env.elk.password);
-    put(out, "FS_ENV_ELK_DATA_VIEW", env.elk.dataView.trim());
+  const elkCount = new Map<string, number>();
+  for (const e of env.elk) {
+    const prefix = instanceVarPrefix("ELK", e.env, elkCount);
+    put(out, `${prefix}_NAME`, e.name.trim());
+    put(out, `${prefix}_BASE_URL`, e.baseUrl.trim());
+    put(out, `${prefix}_USERNAME`, e.username.trim());
+    put(out, `${prefix}_PASSWORD`, e.password);
+    put(out, `${prefix}_DATA_VIEW`, e.dataView.trim());
   }
 
   const httpCount = new Map<string, number>();
@@ -597,25 +684,11 @@ const cloneHttpAuth = (auth: CompanyEnvHttpApiAuth): CompanyEnvHttpApiAuth => {
 /** 深拷贝（settings clone / dirty 比较前防共享引用） */
 export const cloneCompanyEnv = (env: CompanyEnv): CompanyEnv => ({
   servers: env.servers.map((s) => ({ ...s })),
-  ...(env.pg
-    ? {
-        pg: {
-          ...env.pg,
-          dbTemplates: [...env.pg.dbTemplates],
-        },
-      }
-    : {}),
+  pg: env.pg.map((p) => ({ ...p, dbTemplates: [...p.dbTemplates] })),
   logPathTemplates: [...env.logPathTemplates],
   xxljob: env.xxljob.map((x) => ({ ...x })),
-  ...(env.nacos
-    ? {
-        nacos: {
-          ...env.nacos,
-          namespaces: [...env.nacos.namespaces],
-        },
-      }
-    : {}),
-  ...(env.elk ? { elk: { ...env.elk } } : {}),
+  nacos: env.nacos.map((n) => ({ ...n, namespaces: [...n.namespaces] })),
+  elk: env.elk.map((e) => ({ ...e })),
   httpApis: (env.httpApis ?? []).map((h) => ({
     ...h,
     auth: cloneHttpAuth(h.auth),

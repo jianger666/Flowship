@@ -57,11 +57,11 @@ const PLUGINS = {
 };
 const SHIKI_THEME: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
 
-/** 新增：浅绿底；删除：浅红底+删除线——浅深两主题都保对比度 */
+/** 新增：success 底衬；删除：destructive 底衬 + 删除线——两个 token 浅深两套都调过对比度 */
 const REVISION_INS_CLASS =
-  "rounded-[2px] bg-green-100 px-0.5 text-green-900 no-underline dark:bg-green-900/55 dark:text-green-50";
+  "rounded-[2px] bg-success/15 px-0.5 text-success no-underline";
 const REVISION_DEL_CLASS =
-  "rounded-[2px] bg-red-100 px-0.5 text-red-900 line-through decoration-red-700/80 dark:bg-red-900/50 dark:text-red-100 dark:decoration-red-300/70";
+  "rounded-[2px] bg-destructive/15 px-0.5 text-destructive line-through decoration-destructive/70";
 
 interface Props {
   oldMd: string;
@@ -152,9 +152,9 @@ export const ArtifactRevisionView = ({
           "relative",
           // 块级左边条
           "[&_[data-revision-status]]:relative [&_[data-revision-status]]:pl-3",
-          "[&_[data-revision-status=added]]:border-l-[3px] [&_[data-revision-status=added]]:border-green-500 [&_[data-revision-status=added]]:bg-green-50/40 dark:[&_[data-revision-status=added]]:bg-green-950/25",
-          "[&_[data-revision-status=removed]]:border-l-[3px] [&_[data-revision-status=removed]]:border-red-500 [&_[data-revision-status=removed]]:bg-red-50/40 [&_[data-revision-status=removed]]:opacity-80 dark:[&_[data-revision-status=removed]]:bg-red-950/30",
-          "[&_[data-revision-status=modified]]:border-l-[3px] [&_[data-revision-status=modified]]:border-amber-500 [&_[data-revision-status=modified]]:bg-amber-50/30 dark:[&_[data-revision-status=modified]]:border-sky-400 dark:[&_[data-revision-status=modified]]:bg-sky-950/20",
+          "[&_[data-revision-status=added]]:border-l-[3px] [&_[data-revision-status=added]]:border-success [&_[data-revision-status=added]]:bg-success/5",
+          "[&_[data-revision-status=removed]]:border-l-[3px] [&_[data-revision-status=removed]]:border-destructive [&_[data-revision-status=removed]]:bg-destructive/5 [&_[data-revision-status=removed]]:opacity-80",
+          "[&_[data-revision-status=modified]]:border-l-[3px] [&_[data-revision-status=modified]]:border-warning [&_[data-revision-status=modified]]:bg-warning/5",
           className,
         )}
       >
@@ -283,7 +283,7 @@ const RevisionModifiedBadges = ({
           key={b.index}
           type="button"
           data-revision-badge=""
-          className="pointer-events-auto absolute rounded border border-amber-500/50 bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-900 shadow-sm hover:bg-amber-200 dark:border-sky-400/50 dark:bg-sky-950 dark:text-sky-100 dark:hover:bg-sky-900"
+          className="pointer-events-auto absolute rounded border border-warning/50 bg-warning/15 px-1.5 py-0.5 text-[11px] font-medium text-warning shadow-sm transition-colors hover:bg-warning/25"
           style={{ top: b.top + 4, right: b.right }}
           onClick={(e) => {
             e.preventDefault();

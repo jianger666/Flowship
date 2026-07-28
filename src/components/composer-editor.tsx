@@ -74,7 +74,7 @@ import { shouldConvertPasteToAttachment } from "@/lib/paste-text-attach";
 
 /** 与旧 textarea 排版对齐，拖高 / placeholder 视觉不变 */
 const COMPOSER_EDITOR_CLASS =
-  "min-h-13 w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
+  "w-full px-3.5 pt-1 pb-2.5 text-sm leading-normal wrap-anywhere whitespace-pre-wrap";
 
 /** 调用方只用 focus（Cmd+J / awaiting 自动聚焦） */
 export interface ComposerFocusHandle {
@@ -923,6 +923,11 @@ const ComposerEditorInner = ({
             <ContentEditable
               className={cn(
                 COMPOSER_EDITOR_CLASS,
+                // 固定高度容器（推进弹窗 / 答题卡 / 拖高过的输入条）必须让编辑器撑满外层、
+                // 整块都能点聚焦：否则容器比编辑器高的那截属于外层 div、点了不进编辑器
+                //（用户实测「指令框只有顶上一条能点」）。内容超出时编辑器自然长高、外层照常滚。
+                // 高度随内容（boxHeight=null）时外层就是被编辑器撑起来的、没有空档，保持两行下限。
+                boxHeight != null ? "min-h-full" : "min-h-13",
                 "relative outline-none",
                 disabled && "cursor-not-allowed opacity-60",
                 className,
@@ -932,6 +937,7 @@ const ComposerEditorInner = ({
                 <div
                   className={cn(
                     COMPOSER_EDITOR_CLASS,
+                    // absolute inset-0 已按外层尺寸铺满、不需要再给 min-height
                     "pointer-events-none absolute inset-0 text-muted-foreground",
                   )}
                 >

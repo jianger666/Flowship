@@ -64,6 +64,7 @@ import {
   captureActionStartBaseline,
   captureReadonlyRepoBaselines,
 } from "./action-checks";
+import { evaluateWkAdvanceGate } from "./wk-gate";
 import { isRetryableRunError, summarizeRunFailure } from "./sdk-error";
 import { createRunPerfTracker } from "./run-perf";
 import {
@@ -124,6 +125,7 @@ import {
   agentSessions,
   allocTaskRunInstanceId,
   beginTaskStarting,
+  cancelRestrictedQuestions,
   claimTaskOp,
   endTaskStarting,
   forceClearStaleRunnerState,
@@ -152,6 +154,7 @@ import {
   runningChecks,
   runningTasks,
   snapshotTaskOp,
+  waitForRestrictedQuestionsToStop,
   waitForTaskToStop,
   writeEventAndPublish,
   writeOwnedEventAndPublish,
@@ -167,6 +170,8 @@ import {
   getChatLifecycle,
 } from "./chat-gate";
 import { failpoint } from "./failpoints";
+import { finalizeOpenToolCalls } from "./finalize-open-tools";
+import { broadcastActionCompletion } from "./feishu-bridge/group-broadcast";
 import {
   buildBatchDirective,
   buildGitlabAccessDirective,
@@ -192,6 +197,7 @@ import {
 import type {
   ActionRecord,
   ActionType,
+  CustomActionDef,
   DevPushMode,
   RepoStatus,
   ReplanMode,
@@ -205,6 +211,7 @@ import {
   actionDisplayLabel,
   mrTargetBranchOf,
 } from "@/lib/task-display";
+import { buildSkillDirective } from "@/lib/protocol-signals";
 import { supersedePendingAsks } from "./ask-supersede";
 
 /**
@@ -497,6 +504,32 @@ export const cancelTaskRun = (taskId: string): boolean => {
 };
 
 /**
+ * 需求群自动播报（第三批）——action 落 awaiting_ack 之后的增强动作。
+ *
+ * 只在后置检查收口点里调（唯一的「action 完成」时刻）、复用同一份 check 租约：
+ * 降级 info 事件走 `writeOwnedEventAndPublish` + `stillOwner`，租约没了就不写。
+ * 整个调用**绝不抛**（broadcastActionCompletion 内部全包 + 自带超时），
+ * 播报挂了不影响 action 已经完成的事实。
+ */
+const broadcastActionToGroup = async (
+  task: Task,
+  actionId: string,
+  stillOwner: () => boolean,
+): Promise<void> => {
+  const action = task.actions.find((a) => a.id === actionId);
+  if (!action) return;
+  await broadcastActionCompletion(task, action, {
+    emitInfo: async (text) => {
+      await writeOwnedEventAndPublish(task.id, stillOwner, {
+        kind: "info",
+        actionId,
+        text,
+      });
+    },
+  });
+};
+
+/**
  * V0.8.18：后台跑某 action 的后置 deterministic check（异步、不阻塞调用方）。
  *
  * # 为什么后台跑（线上踩过）
@@ -652,6 +685,10 @@ const runActionPostCheck = (
           },
         },
     );
+      // 需求群自动播报（第三批）：这里是 action「完成」的唯一收口点，
+      // 播报挂在收尾持有者（check 租约）路径里、不另开写路径。
+      // broadcastActionCompletion 绝不抛、失败自行降级成一条 info 事件。
+      await broadcastActionToGroup(patched, actionId, () => stillOwner());
     }
     // 全部落完、摘除自己；带身份校验：万一落状态期间被新一轮 wait 顶替、别误删后来者
     dropSelf();
@@ -681,6 +718,34 @@ export const abortRunningCheck = (taskId: string): void => {
   );
 };
 
+/**
+ * 推进前的 wk-harness 门禁（团队规范的 fallback preflight）。
+ *
+ * 判定 + 跑脚本 + 提示落事件流全在 `evaluateWkAdvanceGate`；这里只负责把
+ * 带 lease 的事件 writer 递进去，并把 block 决策翻成异常——
+ * 调用点在 appendAction 之前，抛出去 = 不 append、不启动 agent、路由 400。
+ */
+const runWkAdvanceGate = async (
+  task: Task,
+  customDef: CustomActionDef | null,
+  opGen: number,
+): Promise<void> => {
+  const result = await evaluateWkAdvanceGate(task, customDef, async (kind, text) => {
+    await writeOwnedEventAndPublish(
+      task.id,
+      () => !isTaskOpStale(task.id, opGen),
+      {
+        kind,
+        text,
+        // 门禁的 info 全是「跳过了、去哪儿配」的行动指引——普通 info 会被事件流
+        // 压成一行 truncate 灰字、用户根本注意不到；打上 notice 走可见形态
+        ...(kind === "info" ? { meta: { notice: true } } : {}),
+      },
+    );
+  });
+  if (result.decision === "block") throw new Error(result.message);
+};
+
 // ----------------- 公开 mutation API -----------------
 
 /**
@@ -701,6 +766,12 @@ export interface AdvanceTaskInput {
   userInstruction: string;
   attachedImagePaths?: string[];
   attachedFilePaths?: string[];
+  /**
+   * v1.1.x 推进弹窗富输入：用户 `/` 引用到的 skill。
+   * 跟 chat / question 通道同语义——指引只拼进发给 agent 的 [NEXT_ACTION] 载荷，
+   * **不**并进 action.userInstruction（否则每条 action 历史都会重复一段指引）。
+   */
+  skillRefs?: Array<{ name: string; absPath: string }>;
   apiKey: string;
   model: ModelSelection;
   // V0.6.27 语义反转：默认每 action 起新 Agent（context 截断治跑偏）、勾「续用当前 agent」才续接。
@@ -950,6 +1021,7 @@ const advanceTaskCore = async (
     userInstruction,
     attachedImagePaths,
     attachedFilePaths,
+    skillRefs,
     apiKey,
     model,
     reuseAgent,
@@ -962,6 +1034,8 @@ const advanceTaskCore = async (
     repoDevBranches,
     customActionId,
   } = input;
+  // `/` skill 指引段：只进发给 agent 的载荷、不进 action.userInstruction（历史不重复）
+  const skillDirective = buildSkillDirective(skillRefs);
   // task 用 let：去掉「通过」后、推进开头会隐式认可当前 awaiting_ack action、之后重读最新 task 供准入 / appendAction 用
   let task = input.task;
   // 由 advanceTask 导出入口传入（禁止在此自取——出队后取会踩）
@@ -1107,6 +1181,13 @@ const advanceTaskCore = async (
   if (!pre.ok) {
     throw new Error(`准入条件不满足：${pre.reason}`);
   }
+
+  // 1.5) wk-harness 前置门禁（只对团队 wk 系 action 生效）：
+  //   context-init 幂等初始化仓库级上下文 → command preflight。
+  //   preflight 非 0 = 规范里的 fallback preflight 硬拦——**不 append action、不起 agent**。
+  //   其余一切降级（没配 doc_repo / 没装 python3 / 文档仓无该 REQ-ID 目录）只写一条提示。
+  //   放在 appendAction 之前：拦下时盘上不留 running action、任务状态干净。
+  await runWkAdvanceGate(task, customDef, opGen);
 
   // 2) appendAction：写一条新 ActionRecord、task.runStatus 自动转 running
   // 新推进 = 新意图：作废上一轮残留的停止请求，避免误杀本次启动。
@@ -1267,6 +1348,7 @@ const advanceTaskCore = async (
         text: buildNextActionDirective({
           action,
           userInstruction,
+          skillDirective,
           attachedImagePaths,
           attachedFilePaths,
           branchCheckoutHint,
@@ -1329,6 +1411,7 @@ const advanceTaskCore = async (
     task: taskAfterAppend,
     action,
     userInstruction,
+    skillDirective,
     attachedImagePaths,
     attachedFilePaths,
     branchCheckoutHint,
@@ -1613,6 +1696,9 @@ export const finalizeTask = async (
     // V0.11：不再向 agent 发终态信号——finalize 语义就是「关掉这个 task」：
     // 有活 run 直接 cancel、跨 run 会话一并关掉（cancelTaskRun 内部处理）
     const hadLive = cancelTaskRun(taskId);
+    // 旁路的受限群答疑不在 runningTasks 里（刻意解耦）——但终结要清 worktree、
+    // 它必须一起叫停，否则会在被删掉的 cwd 里继续跑
+    cancelRestrictedQuestions(taskId);
     // 同 stopTaskAgent：无活 run 时 cancelTaskRun 会写入 pendingStopRequests，终结后必须清掉
     pendingStopRequests.delete(taskId);
     console.log(
@@ -1649,6 +1735,8 @@ export const finalizeTask = async (
     // cancel 只是发信号、run 的 finally 可能还在往 worktree 写文件——对齐 DELETE 路由 /
     // deleteTask 口径、等真停再删、防边写边删撞车。没活 run 时秒过。
     await waitForTaskToStop(taskId, 8000);
+    // 旁路答疑同理（不在 runningTasks 里、上面那句等不到它）
+    await waitForRestrictedQuestionsToStop(taskId, 8000);
 
     // V0.x：merged（已合入）时、当前还在等 ack 的 action 标 completed——用户认可了产物才去合 MR、
     //   不该记成 cancelled（abandoned 维持下面的 cancelled：没认可就放弃）。
@@ -1891,6 +1979,8 @@ interface StartAgentInput {
   task: Task;
   action: ActionRecord;
   userInstruction: string;
+  /** v1.1.x：`/` skill 指引段（已由调用方 buildSkillDirective 拼好、空串 = 没引用） */
+  skillDirective?: string;
   attachedImagePaths?: string[];
   attachedFilePaths?: string[];
   branchCheckoutHint?: string;
@@ -2554,8 +2644,11 @@ export const installSessionIfCurrent = (
  *
  * @param lease **必填**——mkdir 前验、透传给 ensureTaskWorktrees；失主抛 WorktreeLeaseLostError
  * @param opts skipDepClone（oneshot）/ deferDepClone（正式启动不挡首包）
+ *
+ * 导出原因：受限群答疑（`restricted-question.ts`）是独立通道、但同样要先备好 cwd，
+ * 复用这一份、别再抄一遍 mkdir + ensureTaskWorktrees。
  */
-const ensureWorkspaceReady = async (
+export const ensureWorkspaceReady = async (
   task: Task,
   lease: () => boolean,
   opts?: EnsureWorktreesOptions,
@@ -2625,6 +2718,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     task,
     action,
     userInstruction,
+    skillDirective,
     attachedImagePaths,
     attachedFilePaths,
     branchCheckoutHint,
@@ -2966,6 +3060,7 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
               {
                 action,
                 userInstruction,
+                skillDirective,
                 attachedImagePaths,
                 attachedFilePaths,
                 branchCheckoutHint,
@@ -4499,6 +4594,13 @@ const consumeSessionRun = async (
       }
     }
   } finally {
+    // 收尾持有者闭合未配对 tool running（cancel / error / finished 共用入口）
+    // 必须在 release 之前；失主（已被后继 claim）lease 拒写、不伤 B
+    if (isTaskOpCurrent(opts.opHandle)) {
+      await finalizeOpenToolCalls(task.id, () =>
+        isTaskOpCurrent(opts.opHandle),
+      );
+    }
     // 按 instanceId 删——forceClear 后 B 换了新号，旧 finally 不得抹掉 B
     if (iOwnRunner()) {
       runningTasks.delete(task.id);
@@ -4804,6 +4906,10 @@ export const deliverTaskQuestion = async (
  * - 不注册 agentSessions / 不落盘锚点——它只懂答疑、不能被后续「续用推进」误当正式会话
  * - 答完 close、下次再问再起（低频场景、冷启动可接受）
  *
+ * ⚠️ 本函数是**属主自己的**通道（任务页输入条）：agent 能动手改小改动，且它是这个 task
+ * 的一次 run（占 runningTasks、调用方先写 runStatus=running、收尾归位）。需求群里
+ * **非属主**的提问不走这里——那是完全解耦的旁路，见 `restricted-question.ts`。
+ *
  * fire-and-forget：调用方写完事件 / 切 running 后调、失败在内部标回原状态 + error 事件。
  */
 export const startOneShotQuestion = (
@@ -4842,6 +4948,39 @@ export const startOneShotQuestion = (
         /* noop */
       }
     };
+    /**
+     * 受理段早退收尾（**非让位**路径专用）。
+     *
+     * 调用方（question 注入链）在调本函数前已把 runStatus 写成 running，而这条
+     * one-shot 到这一步还没登记进 runningTasks——静默 return 就是三重黑洞：
+     * 群里没回音、App 侧任务永远「运行中」、`rememberGroupReply` 登记一直挂着
+     * （下一轮无关的 done 会把结果错 @ 给他）。所以早退必须自己收口：
+     * 写 error 事件 → 条件恢复 prevRunStatus → 发 `done(ok=false)`
+     *（群出向 tap 收到 done 就把「这轮没跑成功」发回群、顺手摘掉登记）。
+     *
+     * 两道条件同时成立才动手，否则这个 running 是别人的、碰了就是踩后继：
+     * 仍是当前 op（没被后继 claim / stop revoke）+ runningTasks 里没有别的 run 占位。
+     */
+    const bailOutWithoutRun = async (reason: string): Promise<void> => {
+      if (!isTaskOpCurrent(oneshotOpHandle) || runningTasks.has(task.id)) return;
+      await writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(oneshotOpHandle),
+        { kind: "error", text: reason },
+      );
+      const restored = await setTaskRunStatusIfRunOwner(
+        task.id,
+        prevRunStatus,
+        () => isTaskOpCurrent(oneshotOpHandle) && !runningTasks.has(task.id),
+        undefined,
+        // 只回滚「调用方为本次 one-shot 写的那个 running」；盘上已不是 running
+        // 说明中途有人接管过，不许覆盖
+        "running",
+      );
+      if (restored) publish(task.id, { kind: "task", task: restored });
+      if (!isTaskOpCurrent(oneshotOpHandle)) return;
+      publish(task.id, { kind: "done", task: restored ?? task, ok: false });
+    };
     try {
       // 测试插桩：入口 snapshot 之后、首个 IO 之前——矩阵可在此注入 claim
       await failpoint("oneshot.beforeEnsure");
@@ -4856,9 +4995,11 @@ export const startOneShotQuestion = (
           skipDepClone: true,
         });
       } catch (err) {
-        // 让位 → 静默 return（不起 agent）
+        // 工作区被别人接管 → 不起 agent。仍是当前 op（没换主）时按早退收口，
+        // 别把调用方写的 running 留在盘上
         if (err instanceof WorktreeLeaseLostError) {
           abortStaleQuietly();
+          await bailOutWithoutRun("答疑 agent 没启动：工作区已被其它任务接管");
           return;
         }
         throw err;
@@ -4885,20 +5026,35 @@ export const startOneShotQuestion = (
           ) {
             return null;
           }
-          // 正式会话/run 已占位 → one-shot 让位（推进优先）
-          if (runningTasks.has(task.id) || agentSessions.has(task.id)) {
+          // 正式 run 在飞 → 让位（推进优先）。这条是真让位：B 的 consume 会自己
+          // 收尾 runStatus，这里碰它就是踩后继，所以静默 return
+          if (runningTasks.has(task.id)) {
             console.warn(
-              `[task-runner] startOneShotQuestion: task=${task.id} 正式 run/会话已占位、one-shot 让位`,
+              `[task-runner] startOneShotQuestion: task=${task.id} 正式 run 已占位、one-shot 让位`,
+            );
+            return null;
+          }
+          // 活会话占位 → 让位（属主自己的消息该由那个全权限会话接）。
+          // 但没有 run 在飞、那个 running 是调用方为我写的——必须自己收口，不能静默
+          if (agentSessions.has(task.id)) {
+            console.warn(
+              `[task-runner] startOneShotQuestion: task=${task.id} 活会话已占位、one-shot 让位`,
+            );
+            await bailOutWithoutRun(
+              "答疑 agent 没启动：任务已有活跃会话接管本轮对话、请重新发送",
             );
             return null;
           }
 
-          // 启动副作用边界——盘上终态让位，不 Agent.create
+          // 启动副作用边界——盘上终态不 Agent.create（同样要收口 running）
           {
             const repoStatus = await readTaskRepoStatusFresh(task.id);
             if (repoStatus === "merged" || repoStatus === "abandoned") {
               console.warn(
                 `[task-runner] startOneShotQuestion: task=${task.id} 盘上已终态 ${repoStatus}、让位`,
+              );
+              await bailOutWithoutRun(
+                `答疑 agent 没启动：任务已${repoStatus === "merged" ? "合入" : "放弃"}`,
               );
               return null;
             }
@@ -4933,23 +5089,27 @@ export const startOneShotQuestion = (
             abortStaleQuietly();
             return null;
           }
-          // V0.13.x 放开「只读答疑」（用户拍板「纯答疑限制太死」）：疑问就答、要改就改——
-          // 只是不推进任务链（本 agent 没有 action 上下文、大改动引导用户走推进）
-          const prompt = [
-            `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
-            "",
+          const backgroundLines = [
             "# 任务背景（按需 read / grep、先查再答）",
             `- 任务事件日志（完整历史）：${getEventsLogPath(task.id)}`,
             `- 产出文档目录（方案 / 实现 / 复核等 artifact）：${getActionsDir(task.id)}`,
             `- 工作目录：${effectiveCwd}`,
+          ];
+          const askedText = buildAgentMessage({
+            kind: "user_message",
+            text: questionText,
+            imagePaths,
+            attachmentPaths,
+          });
+          // V0.13.x 放开「只读答疑」（用户拍板「纯答疑限制太死」）——疑问就答、
+          // 要改就改，只是不推进任务链（本 agent 没有 action 上下文）。
+          const prompt = [
+            `你是任务「${task.title}」的临时助手。用户在任务页说了句话、按内容处理：疑问就答、修改要求就直接动手。`,
+            "",
+            ...backgroundLines,
             "",
             "# 用户的话",
-            buildAgentMessage({
-              kind: "user_message",
-              text: questionText,
-              imagePaths,
-              attachmentPaths,
-            }),
+            askedText,
             "",
             "# 边界",
             "- 是疑问 → 直接回答；是小改动要求 → 直接改（改完说明改了什么）",

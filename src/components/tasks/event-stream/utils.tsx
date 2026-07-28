@@ -45,27 +45,44 @@ export const renderEventIcon = (kind: EventKind) => {
     case "action_start":
       return <Sparkles className="size-4 text-primary" />;
     case "action_ack":
-      return <CheckCircle2 className="size-4 text-emerald-500" />;
+      return <CheckCircle2 className="size-4 text-success" />;
     case "tool_call":
-      return <ArrowUpRight className="size-4 text-blue-500" />;
+      return <ArrowUpRight className="size-4 text-info" />;
+    // tool_result 是「工具跑完了」——原来跟 tool_call 同为 blue，
+    // 一个 CheckCircle 却不是 success 色，扫一眼分不出发起和完成
     case "tool_result":
-      return <CheckCircle2 className="size-4 text-blue-500" />;
+      return <CheckCircle2 className="size-4 text-success" />;
     case "tool_output_delta":
       return <ArrowUpRight className="size-4 text-muted-foreground" />;
     case "thinking":
-      return <Brain className="size-4 text-violet-500" />;
+      return <Brain className="size-4 text-subagent" />;
     case "user_reply":
       return <UserCircle2 className="size-4 text-foreground" />;
+    // ask_user_request = 「等你行动」信号族
     case "ask_user_request":
-      return <Sparkles className="size-4 text-amber-500" />;
+      return <Sparkles className="size-4 text-brand" />;
     case "ask_user_reply":
-      return <UserCircle2 className="size-4 text-emerald-500" />;
+      return <UserCircle2 className="size-4 text-success" />;
     case "error":
       return <CircleAlert className="size-4 text-destructive" />;
     default:
       return <CircleDashed className="size-4 text-muted-foreground" />;
   }
 };
+
+/**
+ * action 归属标（`plan` / `build` / …）——事件流三处共用：
+ * 过程行、log 形态卡片头、错误卡。
+ *
+ * 抽出来的原因（2026-07-28 胶囊家族收口）：三处各自手写、底衬还不一样
+ * （muted/35 vs muted/60），同一个东西在一屏里深浅不一。改样式只改这里。
+ * 圆角走 tag 家族统一档 rounded-sm。
+ */
+export const ActionTag = ({ label }: { label: string }) => (
+  <span className="shrink-0 rounded-sm bg-muted/60 px-1 py-0.5 text-[11px] tracking-wide text-muted-foreground">
+    {label}
+  </span>
+);
 
 // HH:MM 简洁格式、事件流里只显示「这条事件几点几分」、不显示秒 / 日期
 export const formatTs = (ts: number): string => {

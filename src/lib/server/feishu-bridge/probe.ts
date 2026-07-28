@@ -13,7 +13,7 @@ import {
   larkApi,
   sendTextMessage,
 } from "./lark-api";
-import { LarkApiError } from "./types";
+import { isTransientLarkMessage, LarkApiError } from "./types";
 
 // ----------------- scope 清单（与提案 4.4b 表一致） -----------------
 
@@ -104,11 +104,9 @@ export interface ProbeCardkitCheck extends ProbeCheckItem {
 /**
  * 网络类错误判定（2026-07-20 同事实测：公司网络下 accounts.feishu.cn EOF 被
  * 渲染成「权限缺失 + 去开通」、纯误导）——这类失败只提示重试/查网络。
+ * 判据下沉到 types.isTransientLarkMessage（与 runLark 的重试闸共用同一份口径）。
  */
-const isNetworkErrorMessage = (msg: string): boolean =>
-  /EOF|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed|timeout|network|socket hang up/i.test(
-    msg,
-  );
+const isNetworkErrorMessage = isTransientLarkMessage;
 
 export interface BridgeProbeStatus {
   cli: ProbeCliCheck;

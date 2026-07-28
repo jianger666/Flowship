@@ -10,6 +10,7 @@
  * 只做 UI 渲染前合并，不动 events.jsonl。
  */
 
+import { isAbsolutePathLike } from "@/lib/path-utils";
 import type { TaskEvent, ToolResultEventMeta } from "@/lib/types";
 
 /** SSE ephemeral：不进 task.events / 不进持久 rows */
@@ -353,7 +354,7 @@ const clipOneLine = (s: string, max = 120): string => {
   return `${flat.slice(0, max)}…`;
 };
 
-export type ToolBlockStatus = "running" | "success" | "error";
+export type ToolBlockStatus = "running" | "success" | "error" | "interrupted";
 
 /** 配对后的单工具块（渲染层用） */
 export type ToolBlock = {
@@ -407,9 +408,24 @@ const asToolResultMeta = (
   if (!meta || typeof meta.callId !== "string" || typeof meta.name !== "string") {
     return undefined;
   }
-  if (meta.status !== "success" && meta.status !== "error") return undefined;
+  if (
+    meta.status !== "success" &&
+    meta.status !== "error" &&
+    meta.status !== "interrupted"
+  ) {
+    return undefined;
+  }
   if (typeof meta.output !== "string") return undefined;
   return meta as unknown as ToolResultEventMeta;
+};
+
+/** tool_result.status → 渲染块 status（interrupted 单独保留，不当 success） */
+const toolResultStatusToBlock = (
+  status: ToolResultEventMeta["status"],
+): Exclude<ToolBlockStatus, "running"> => {
+  if (status === "error") return "error";
+  if (status === "interrupted") return "interrupted";
+  return "success";
 };
 
 const toolCallToBlock = (
@@ -420,7 +436,7 @@ const toolCallToBlock = (
   const callId = getCallId(ev) || ev.id;
   const name = result?.name || getToolName(ev) || "tool";
   let status: ToolBlockStatus = "running";
-  if (result) status = result.status === "error" ? "error" : "success";
+  if (result) status = toolResultStatusToBlock(result.status);
   return {
     kind: "__tool_block__",
     id: ev.id,
@@ -501,7 +517,7 @@ export const mergeToolDisplayEvents = (
         id: ev.id,
         callId: meta.callId,
         name: meta.name,
-        status: meta.status === "error" ? "error" : "success",
+        status: toolResultStatusToBlock(meta.status),
         text: ev.text,
         result: meta,
         ts: ev.ts,
@@ -515,6 +531,37 @@ export const mergeToolDisplayEvents = (
 
   // 连续 updateTodos 只留最新（中间状态无回看价值）；再进 verb-group
   return groupVerbRuns(collapseConsecutiveTodoBlocks(raw));
+};
+
+/**
+ * 渲染层兜底：会话已非 running 时，把仍挂 running 的工具块改成 interrupted。
+ * 治历史脏数据（旧版 cancel 未补写 tool_result）；服务端已 finalize 的不受影响。
+ */
+export const coerceStaleRunningTools = (
+  items: StreamRenderItem[],
+): StreamRenderItem[] => {
+  let changed = false;
+  const mapBlock = (block: ToolBlock): ToolBlock => {
+    if (block.status !== "running") return block;
+    changed = true;
+    return { ...block, status: "interrupted" };
+  };
+  const out = items.map((it) => {
+    if (isToolBlock(it)) return mapBlock(it);
+    if (isToolVerbGroup(it)) {
+      let groupChanged = false;
+      const members = it.members.map((m) => {
+        if (m.status !== "running") return m;
+        groupChanged = true;
+        return { ...m, status: "interrupted" as const };
+      });
+      if (!groupChanged) return it;
+      changed = true;
+      return { ...it, members };
+    }
+    return it;
+  });
+  return changed ? out : items;
 };
 
 /**
@@ -865,12 +912,140 @@ export const toolBlockExpandedArgsPreview = (
   return null;
 };
 
-/** verb group 文案（对标 GB「Read N files」） */
+/** verb-group 成员的实际动作分类（文案按类计数、别把搜索也说成「读取文件」） */
+export type VerbToolKind = "read" | "search" | "list" | "web" | "other";
+
+/**
+ * 工具名 → 动作分类。
+ * 判定顺序有讲究：`web_search` 既 startsWith("web") 又 includes("search")、
+ * 联网类先判、别被代码搜索桶吃掉。
+ */
+export const classifyVerbTool = (name: string): VerbToolKind => {
+  const n = name.toLowerCase();
+  // web_search / web_fetch / webSearch……
+  if (n.startsWith("web")) return "web";
+  if (n === "read" || n.startsWith("read_") || n.includes("read_file")) {
+    return "read";
+  }
+  if (
+    n === "ls" ||
+    n === "list" ||
+    n === "listdir" ||
+    n === "list_dir" ||
+    n.includes("list_dir") ||
+    n.includes("listdir")
+  ) {
+    return "list";
+  }
+  if (
+    n === "grep" ||
+    n === "glob" ||
+    n === "greptool" ||
+    n === "globtool" ||
+    n.includes("grep") ||
+    n.includes("glob") ||
+    n.includes("search")
+  ) {
+    return "search";
+  }
+  return "other";
+};
+
+/** 分类 → 计数文案；顺序即 label 里的拼接顺序 */
+const VERB_KIND_LABEL: Array<[VerbToolKind, (n: number) => string]> = [
+  ["read", (n) => `读取了 ${n} 个文件`],
+  ["search", (n) => `搜索了 ${n} 次`],
+  ["list", (n) => `列了 ${n} 个目录`],
+  ["web", (n) => `联网查了 ${n} 次`],
+  ["other", (n) => `其它 ${n} 次`],
+];
+
+/**
+ * verb group 折叠行文案（对标 GB「Read N files」）。
+ *
+ * 按成员实际动作分类计数——组里混着 grep / glob / list / web_* 时不能一律说
+ * 「读取了 N 个文件」（连搜 5 次显示「读取了 5 个文件」是错的）。
+ * 多类时用 `·` 串起来：`读取了 3 个文件 · 搜索了 2 次`。
+ */
 export const verbGroupLabel = (group: ToolVerbGroup): string => {
-  const n = group.members.length;
+  const counts = new Map<VerbToolKind, number>();
+  for (const m of group.members) {
+    const kind = classifyVerbTool(m.name);
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const parts = VERB_KIND_LABEL.filter(([kind]) => counts.has(kind)).map(
+    ([kind, format]) => format(counts.get(kind) ?? 0),
+  );
+  // 空组理论上进不来（groupVerbRuns 至少 2 个成员），兜底别渲出空串
+  const base = parts.length > 0 ? parts.join(" · ") : "无操作";
   const failed = group.members.filter((m) => m.status === "error").length;
-  const base = `读取了 ${n} 个文件`;
   return failed > 0 ? `${base}（${failed} 失败）` : `${base}…`;
+};
+
+/**
+ * 指向「单个文件」的工具——路径可点跳 IDE。
+ * grep / glob / list 的 path 是**目录**、跳过去会把 IDE 当前窗口的工作区换掉，不算。
+ * delete 类也不算（文件已经没了、跳过去必报路径不存在）。
+ */
+const isSingleFileTool = (name: string): boolean => {
+  const n = name.toLowerCase();
+  return (
+    n === "edit" ||
+    n === "write" ||
+    n === "read" ||
+    n.startsWith("read_") ||
+    n.includes("read_file")
+  );
+};
+
+/**
+ * 工具块指向的文件路径（渲染 IDE 跳转链接用）；拿不到返 null。
+ *
+ * - `result.filePath`（edit / write 落盘时由 tool-result-persist 带上）优先
+ * - 否则单文件工具从 args 抽 path 类字段（read 的 `path` 等）
+ * - shell / 待办 / 子代理 / 目录类工具一律 null
+ */
+export const toolBlockFilePath = (block: ToolBlock): string | null => {
+  const fromResult = block.result?.filePath?.trim();
+  if (fromResult) return fromResult;
+  if (!isSingleFileTool(block.name)) return null;
+  const parsed = parseToolArgsJson(block.args);
+  if (!parsed) return null;
+  return (
+    pickStr(parsed, ["path", "target_file", "file_path", "filePath"]) ?? null
+  );
+};
+
+/**
+ * 展开区 detail 行里「属于文件路径」的那一段（渲染成可点链接的部分）；不是路径行返 null。
+ *
+ * 两种命中：
+ * - detail 以完整路径打头：read = 路径本身、edit = `路径 +N/−M`
+ * - 路径超长被 `toolBlockSummary` 的 clipOneLine 截成「前 120 字 + …」——此时
+ *   startsWith 不成立（实测业务仓路径动辄 150+ 字），单独认一次「detail 是路径前缀」
+ *
+ * shell 的 `$ cmd`、args JSON 兜底等一律返 null（调用方渲染纯文本）。
+ */
+export const toolDetailPathSegment = (
+  detailLine: string | null,
+  filePath: string | null,
+): string | null => {
+  if (!detailLine || !filePath) return null;
+  if (detailLine.startsWith(filePath)) return filePath;
+  const clipped = detailLine.replace(/…$/, "");
+  return clipped.length > 0 && filePath.startsWith(clipped) ? detailLine : null;
+};
+
+/**
+ * 这个路径要不要 baseDir 才拼得出绝对路径（= 相对路径）。
+ * 渲染层据此决定「要不要去查 task 的 cwd」——实测 SDK 给的基本都是绝对路径、
+ * 绝大多数块直接能拼链接、不该为它们白发一次任务详情请求。
+ */
+export const toolPathNeedsBaseDir = (pathLike: string): boolean => {
+  if (!pathLike) return false;
+  // http:// / cursor:// 之类：给什么 baseDir 都跳不了
+  if (/^[a-z]+:\/\//i.test(pathLike)) return false;
+  return !isAbsolutePathLike(pathLike);
 };
 
 /** 从 tool_output_delta 抽 callId + chunk */

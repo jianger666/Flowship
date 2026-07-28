@@ -99,17 +99,98 @@ const MiniField = ({
   </label>
 );
 
-/** 小节顶部「只读」开关（软约束落盘 + brief；无多余说明） */
-const ReadonlySwitchRow = ({
-  checked,
-  onCheckedChange,
+/** 实例卡外壳（一条服务器 / PG 实例 / Nacos 集群 / ELK / XXL 环境） */
+const InstanceCard = ({ children }: { children: ReactNode }) => (
+  <div className="space-y-1.5 rounded-md border border-border/60 bg-muted/20 p-2.5">
+    {children}
+  </div>
+);
+
+/** 列表底部「再加一条」按钮（各实例小节 + StringListEditor 共用） */
+const AddRowButton = ({
+  label,
+  onClick,
 }: {
-  checked: boolean;
-  onCheckedChange: (next: boolean) => void;
+  label: string;
+  onClick: () => void;
 }) => (
-  <div className="flex items-center justify-between gap-3">
-    <span className="text-sm">只读</span>
-    <Switch checked={checked} onCheckedChange={onCheckedChange} />
+  <Button
+    type="button"
+    variant="ghost"
+    size="sm"
+    className="h-7 px-2 text-xs text-muted-foreground"
+    onClick={onClick}
+  >
+    <Plus className="size-3.5" />
+    {label}
+  </Button>
+);
+
+/**
+ * 多实例卡片头：名称 + 环境 +（只读开关）+ 删除。
+ * PG / Nacos / ELK 三处共用，字段布局与「服务器」小节的实例卡对齐。
+ */
+const InstanceCardHeader = ({
+  name,
+  env,
+  readonly,
+  namePlaceholder,
+  onNameChange,
+  onEnvChange,
+  onReadonlyChange,
+  onBlur,
+  onRemove,
+}: {
+  name: string;
+  env: string;
+  readonly?: boolean;
+  namePlaceholder?: string;
+  onNameChange: (next: string) => void;
+  onEnvChange: (next: string) => void;
+  /** 不传 = 该子系统没有只读语义（ELK） */
+  onReadonlyChange?: (next: boolean) => void;
+  onBlur: () => void;
+  onRemove: () => void;
+}) => (
+  <div className="flex flex-wrap gap-1.5">
+    <MiniField label="名称">
+      <Input
+        value={name}
+        onChange={(e) => onNameChange(e.target.value)}
+        onBlur={onBlur}
+        placeholder={namePlaceholder}
+        className="h-8"
+      />
+    </MiniField>
+    <MiniField label="环境" className="w-24 shrink-0 space-y-0.5">
+      <Input
+        value={env}
+        onChange={(e) => onEnvChange(e.target.value)}
+        onBlur={onBlur}
+        placeholder="test"
+        className="h-8"
+      />
+    </MiniField>
+    {onReadonlyChange ? (
+      // mt-4 与上方 11px 迷你 label 让位、跟同排输入框基线对齐
+      <div className="mt-4 flex h-8 shrink-0 items-center gap-1.5">
+        <span className="text-[11px] text-muted-foreground">只读</span>
+        <Switch
+          checked={readonly !== false}
+          onCheckedChange={onReadonlyChange}
+        />
+      </div>
+    ) : null}
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className="mt-4 size-8 shrink-0"
+      title="删除"
+      onClick={onRemove}
+    >
+      <Trash2 className="size-3.5" />
+    </Button>
   </div>
 );
 
@@ -184,16 +265,7 @@ const StringListEditor = ({
         </Button>
       </div>
     ))}
-    <Button
-      type="button"
-      variant="ghost"
-      size="sm"
-      className="h-7 px-2 text-xs text-muted-foreground"
-      onClick={() => onCommit([...lines, ""])}
-    >
-      <Plus className="size-3.5" />
-      {addLabel}
-    </Button>
+    <AddRowButton label={addLabel} onClick={() => onCommit([...lines, ""])} />
   </div>
 );
 
@@ -230,7 +302,7 @@ const EnvSection = ({
         <span
           className={cn(
             "size-1.5 shrink-0 rounded-full",
-            configured ? "bg-emerald-500" : "bg-muted-foreground/40",
+            configured ? "bg-success" : "bg-muted-foreground/40",
           )}
           aria-hidden
         />
@@ -268,14 +340,11 @@ const serverSummary = (
 };
 
 const pgSummary = (
-  pg: CompanyEnvPg | undefined,
+  rows: CompanyEnvPg[],
 ): { configured: boolean; summary: string } => {
-  if (!pg?.host?.trim()) return { configured: false, summary: "未配置" };
-  const n = pg.dbTemplates.filter((t) => t.trim()).length;
-  return {
-    configured: true,
-    summary: n > 0 ? `${pg.host.trim()} · ${n} 库模板` : pg.host.trim(),
-  };
+  const filled = rows.filter((p) => p.host.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 个实例` };
 };
 
 const logsSummary = (
@@ -295,24 +364,19 @@ const xxlSummary = (
 };
 
 const nacosSummary = (
-  nacos: CompanyEnvNacos | undefined,
+  rows: CompanyEnvNacos[],
 ): { configured: boolean; summary: string } => {
-  if (!nacos?.baseUrl?.trim()) return { configured: false, summary: "未配置" };
-  const n = nacos.namespaces.filter((s) => s.trim()).length;
-  return {
-    configured: true,
-    summary: n > 0 ? `已填 · ${n} 命名空间` : "host 已填",
-  };
+  const filled = rows.filter((n) => n.baseUrl.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 个集群` };
 };
 
 const elkSummary = (
-  elk: CompanyEnvElk | undefined,
+  rows: CompanyEnvElk[],
 ): { configured: boolean; summary: string } => {
-  if (!elk?.baseUrl?.trim()) return { configured: false, summary: "未配置" };
-  return {
-    configured: true,
-    summary: elk.dataView.trim() ? elk.dataView.trim() : "host 已填",
-  };
+  const filled = rows.filter((e) => e.baseUrl.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 个实例` };
 };
 
 const httpApiSummary = (
@@ -434,36 +498,17 @@ export const CompanyEnvSection = ({
   };
 
   const servers = value.servers;
-  const pg = value.pg ?? {
-    host: "",
-    port: 5432,
-    user: "",
-    password: "",
-    dbTemplates: [],
-    readonly: true,
-  };
-  const nacos = value.nacos ?? {
-    baseUrl: "",
-    username: "",
-    password: "",
-    namespaces: [],
-    readonly: true,
-  };
-  const elk = value.elk ?? {
-    baseUrl: "",
-    username: "",
-    password: "",
-    dataView: "",
-  };
-
+  const pgList = value.pg;
+  const nacosList = value.nacos;
+  const elkList = value.elk;
   const httpApis = value.httpApis ?? [];
 
   const sStat = serverSummary(servers);
-  const pStat = pgSummary(value.pg);
+  const pStat = pgSummary(pgList);
   const lStat = logsSummary(value.logPathTemplates);
   const xStat = xxlSummary(value.xxljob);
-  const nStat = nacosSummary(value.nacos);
-  const eStat = elkSummary(value.elk);
+  const nStat = nacosSummary(nacosList);
+  const eStat = elkSummary(elkList);
   const hStat = httpApiSummary(httpApis);
 
   return (
@@ -521,10 +566,7 @@ export const CompanyEnvSection = ({
           >
             <div className="space-y-2">
               {servers.map((s, i) => (
-                <div
-                  key={i}
-                  className="space-y-1.5 rounded-md border border-border/60 bg-muted/20 p-2.5"
-                >
+                <InstanceCard key={i}>
                   <div className="flex flex-wrap gap-1.5">
                     <MiniField label="名称">
                       <Input
@@ -641,13 +683,10 @@ export const CompanyEnvSection = ({
                       />
                     </MiniField>
                   </div>
-                </div>
+                </InstanceCard>
               ))}
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-xs text-muted-foreground"
+              <AddRowButton
+                label="添加服务器"
                 onClick={() => {
                   const row: CompanyEnvServer = {
                     name: "",
@@ -659,10 +698,7 @@ export const CompanyEnvSection = ({
                   };
                   commit({ ...value, servers: [...servers, row] });
                 }}
-              >
-                <Plus className="size-3.5" />
-                添加服务器
-              </Button>
+              />
             </div>
           </EnvSection>
 
@@ -676,77 +712,119 @@ export const CompanyEnvSection = ({
             onToggle={toggle}
           >
             <div className="space-y-2">
-              <ReadonlySwitchRow
-                checked={pg.readonly !== false}
-                onCheckedChange={(checked) =>
+              {pgList.map((p, i) => {
+                const patchPg = (next: CompanyEnvPg) =>
+                  patch({ pg: pgList.map((row, j) => (j === i ? next : row)) });
+                const commitPg = (next: CompanyEnvPg) =>
                   commit({
                     ...value,
-                    pg: { ...pg, readonly: checked },
-                  })
-                }
+                    pg: pgList.map((row, j) => (j === i ? next : row)),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <InstanceCardHeader
+                      name={p.name}
+                      env={p.env}
+                      readonly={p.readonly}
+                      namePlaceholder="测试库"
+                      onNameChange={(name) => patchPg({ ...p, name })}
+                      onEnvChange={(env) => patchPg({ ...p, env })}
+                      onReadonlyChange={(readonly) =>
+                        commitPg({ ...p, readonly })
+                      }
+                      onBlur={() => onCommit(value)}
+                      onRemove={() =>
+                        commit({
+                          ...value,
+                          pg: pgList.filter((_, j) => j !== i),
+                        })
+                      }
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField label="主机">
+                        <Input
+                          value={p.host}
+                          onChange={(e) =>
+                            patchPg({ ...p, host: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="端口"
+                        className="w-20 shrink-0 space-y-0.5"
+                      >
+                        <Input
+                          type="number"
+                          value={p.port}
+                          onChange={(e) =>
+                            patchPg({
+                              ...p,
+                              port: Number(e.target.value) || 5432,
+                            })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="用户">
+                        <Input
+                          value={p.user}
+                          onChange={(e) =>
+                            patchPg({ ...p, user: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={p.password}
+                          onChange={(e) =>
+                            patchPg({ ...p, password: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-[11px] text-muted-foreground">
+                        库名模板
+                      </div>
+                      <StringListEditor
+                        lines={p.dbTemplates}
+                        placeholder="{project}-test"
+                        addLabel="添加模板"
+                        onChange={(dbTemplates) =>
+                          patchPg({ ...p, dbTemplates })
+                        }
+                        onCommit={(dbTemplates) =>
+                          commitPg({ ...p, dbTemplates })
+                        }
+                      />
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加实例"
+                onClick={() => {
+                  const row: CompanyEnvPg = {
+                    name: "",
+                    env: "test",
+                    host: "",
+                    port: 5432,
+                    user: "",
+                    password: "",
+                    dbTemplates: [],
+                    readonly: true,
+                  };
+                  commit({ ...value, pg: [...pgList, row] });
+                }}
               />
-              <div className="flex flex-wrap gap-1.5">
-              <MiniField label="主机">
-                <Input
-                  value={pg.host}
-                  onChange={(e) =>
-                    patch({
-                      pg: { ...pg, host: e.target.value } satisfies CompanyEnvPg,
-                    })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8 font-mono text-xs"
-                />
-              </MiniField>
-              <MiniField label="端口" className="w-20 shrink-0 space-y-0.5">
-                <Input
-                  type="number"
-                  value={pg.port}
-                  onChange={(e) =>
-                    patch({
-                      pg: { ...pg, port: Number(e.target.value) || 5432 },
-                    })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8"
-                />
-              </MiniField>
-              <MiniField label="用户">
-                <Input
-                  value={pg.user}
-                  onChange={(e) =>
-                    patch({ pg: { ...pg, user: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8"
-                />
-              </MiniField>
-              <MiniField label="密码">
-                <PasswordInput
-                  value={pg.password}
-                  onChange={(e) =>
-                    patch({ pg: { ...pg, password: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  autoComplete="off"
-                  className="h-8"
-                />
-              </MiniField>
-            </div>
-            <div className="space-y-1">
-              <div className="text-[11px] text-muted-foreground">库名模板</div>
-              <StringListEditor
-                lines={pg.dbTemplates}
-                placeholder="{project}-test"
-                addLabel="添加模板"
-                onChange={(dbTemplates) =>
-                  patch({ pg: { ...pg, dbTemplates } })
-                }
-                onCommit={(dbTemplates) =>
-                  commit({ ...value, pg: { ...pg, dbTemplates } })
-                }
-              />
-            </div>
             </div>
           </EnvSection>
 
@@ -780,101 +858,103 @@ export const CompanyEnvSection = ({
             onToggle={toggle}
           >
             <div className="space-y-2">
-              <ReadonlySwitchRow
-                checked={isXxljobReadonly(value.xxljob)}
-                onCheckedChange={(checked) => {
-                  commit({
-                    ...value,
-                    xxljob: value.xxljob.map((row) => ({
-                      ...row,
-                      readonly: checked,
-                    })),
+              {value.xxljob.map((x, i) => {
+                const patchXxl = (next: CompanyEnvXxlJob) =>
+                  patch({
+                    xxljob: value.xxljob.map((row, j) =>
+                      j === i ? next : row,
+                    ),
                   });
-                }}
-              />
-              {value.xxljob.map((x, i) => (
-                <div
-                  key={i}
-                  className="flex flex-wrap gap-1.5 rounded-md border border-border/60 bg-muted/20 p-2.5"
-                >
-                  <MiniField label="环境" className="w-24 shrink-0 space-y-0.5">
-                    <Input
-                      value={x.env}
-                      onChange={(e) => {
-                        const next = value.xxljob.map((row, j) =>
-                          j === i ? { ...row, env: e.target.value } : row,
-                        );
-                        patch({ xxljob: next });
-                      }}
-                      onBlur={() => onCommit(value)}
-                      className="h-8"
-                    />
-                  </MiniField>
-                  <MiniField
-                    label="Base URL"
-                    className="min-w-[10rem] flex-[2] space-y-0.5"
-                  >
-                    <Input
-                      value={x.baseUrl}
-                      onChange={(e) => {
-                        const next = value.xxljob.map((row, j) =>
-                          j === i ? { ...row, baseUrl: e.target.value } : row,
-                        );
-                        patch({ xxljob: next });
-                      }}
-                      onBlur={() => onCommit(value)}
-                      className="h-8 font-mono text-xs"
-                    />
-                  </MiniField>
-                  <MiniField label="用户名">
-                    <Input
-                      value={x.username}
-                      onChange={(e) => {
-                        const next = value.xxljob.map((row, j) =>
-                          j === i ? { ...row, username: e.target.value } : row,
-                        );
-                        patch({ xxljob: next });
-                      }}
-                      onBlur={() => onCommit(value)}
-                      className="h-8"
-                    />
-                  </MiniField>
-                  <MiniField label="密码">
-                    <PasswordInput
-                      value={x.password}
-                      onChange={(e) => {
-                        const next = value.xxljob.map((row, j) =>
-                          j === i ? { ...row, password: e.target.value } : row,
-                        );
-                        patch({ xxljob: next });
-                      }}
-                      onBlur={() => onCommit(value)}
-                      autoComplete="off"
-                      className="h-8"
-                    />
-                  </MiniField>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="mt-4 size-8 shrink-0"
-                    title="删除"
-                    onClick={() => {
-                      commit({
-                        ...value,
-                        xxljob: value.xxljob.filter((_, j) => j !== i),
-                      });
-                    }}
-                  >
-                    <Trash2 className="size-3.5" />
-                  </Button>
-                </div>
-              ))}
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-xs text-muted-foreground"
+                return (
+                  <InstanceCard key={i}>
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField
+                        label="环境"
+                        className="w-24 shrink-0 space-y-0.5"
+                      >
+                        <Input
+                          value={x.env}
+                          onChange={(e) =>
+                            patchXxl({ ...x, env: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="Base URL"
+                        className="min-w-[10rem] flex-[2] space-y-0.5"
+                      >
+                        <Input
+                          value={x.baseUrl}
+                          onChange={(e) =>
+                            patchXxl({ ...x, baseUrl: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      {/* 只读逐条一份——与 PG / Nacos 的实例卡同款位置 */}
+                      <div className="mt-4 flex h-8 shrink-0 items-center gap-1.5">
+                        <span className="text-[11px] text-muted-foreground">
+                          只读
+                        </span>
+                        <Switch
+                          checked={x.readonly !== false}
+                          onCheckedChange={(readonly) =>
+                            commit({
+                              ...value,
+                              xxljob: value.xxljob.map((row, j) =>
+                                j === i ? { ...row, readonly } : row,
+                              ),
+                            })
+                          }
+                        />
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="mt-4 size-8 shrink-0"
+                        title="删除"
+                        onClick={() => {
+                          commit({
+                            ...value,
+                            xxljob: value.xxljob.filter((_, j) => j !== i),
+                          });
+                        }}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField label="用户名">
+                        <Input
+                          value={x.username}
+                          onChange={(e) =>
+                            patchXxl({ ...x, username: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={x.password}
+                          onChange={(e) =>
+                            patchXxl({ ...x, password: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加环境"
                 onClick={() => {
                   const row: CompanyEnvXxlJob = {
                     env: "test",
@@ -885,10 +965,7 @@ export const CompanyEnvSection = ({
                   };
                   commit({ ...value, xxljob: [...value.xxljob, row] });
                 }}
-              >
-                <Plus className="size-3.5" />
-                添加环境
-              </Button>
+              />
             </div>
           </EnvSection>
 
@@ -902,69 +979,105 @@ export const CompanyEnvSection = ({
             onToggle={toggle}
           >
             <div className="space-y-2">
-              <ReadonlySwitchRow
-                checked={nacos.readonly !== false}
-                onCheckedChange={(checked) =>
+              {nacosList.map((n, i) => {
+                const patchNacos = (next: CompanyEnvNacos) =>
+                  patch({
+                    nacos: nacosList.map((row, j) => (j === i ? next : row)),
+                  });
+                const commitNacos = (next: CompanyEnvNacos) =>
                   commit({
                     ...value,
-                    nacos: { ...nacos, readonly: checked },
-                  })
-                }
+                    nacos: nacosList.map((row, j) => (j === i ? next : row)),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <InstanceCardHeader
+                      name={n.name}
+                      env={n.env}
+                      readonly={n.readonly}
+                      namePlaceholder="测试集群"
+                      onNameChange={(name) => patchNacos({ ...n, name })}
+                      onEnvChange={(env) => patchNacos({ ...n, env })}
+                      onReadonlyChange={(readonly) =>
+                        commitNacos({ ...n, readonly })
+                      }
+                      onBlur={() => onCommit(value)}
+                      onRemove={() =>
+                        commit({
+                          ...value,
+                          nacos: nacosList.filter((_, j) => j !== i),
+                        })
+                      }
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField
+                        label="Base URL"
+                        className="min-w-[10rem] flex-[2] space-y-0.5"
+                      >
+                        <Input
+                          value={n.baseUrl}
+                          onChange={(e) =>
+                            patchNacos({ ...n, baseUrl: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField label="用户名">
+                        <Input
+                          value={n.username}
+                          onChange={(e) =>
+                            patchNacos({ ...n, username: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={n.password}
+                          onChange={(e) =>
+                            patchNacos({ ...n, password: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-[11px] text-muted-foreground">
+                        命名空间
+                      </div>
+                      <StringListEditor
+                        lines={n.namespaces}
+                        addLabel="添加命名空间"
+                        onChange={(namespaces) =>
+                          patchNacos({ ...n, namespaces })
+                        }
+                        onCommit={(namespaces) =>
+                          commitNacos({ ...n, namespaces })
+                        }
+                      />
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加集群"
+                onClick={() => {
+                  const row: CompanyEnvNacos = {
+                    name: "",
+                    env: "test",
+                    baseUrl: "",
+                    username: "",
+                    password: "",
+                    namespaces: [],
+                    readonly: true,
+                  };
+                  commit({ ...value, nacos: [...nacosList, row] });
+                }}
               />
-              <div className="flex flex-wrap gap-1.5">
-              <MiniField
-                label="Base URL"
-                className="min-w-[10rem] flex-[2] space-y-0.5"
-              >
-                <Input
-                  value={nacos.baseUrl}
-                  onChange={(e) =>
-                    patch({
-                      nacos: {
-                        ...nacos,
-                        baseUrl: e.target.value,
-                      } satisfies CompanyEnvNacos,
-                    })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8 font-mono text-xs"
-                />
-              </MiniField>
-              <MiniField label="用户名">
-                <Input
-                  value={nacos.username}
-                  onChange={(e) =>
-                    patch({ nacos: { ...nacos, username: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8"
-                />
-              </MiniField>
-              <MiniField label="密码">
-                <PasswordInput
-                  value={nacos.password}
-                  onChange={(e) =>
-                    patch({ nacos: { ...nacos, password: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  autoComplete="off"
-                  className="h-8"
-                />
-              </MiniField>
-            </div>
-            <div className="space-y-1">
-              <div className="text-[11px] text-muted-foreground">命名空间</div>
-              <StringListEditor
-                lines={nacos.namespaces}
-                addLabel="添加命名空间"
-                onChange={(namespaces) =>
-                  patch({ nacos: { ...nacos, namespaces } })
-                }
-                onCommit={(namespaces) =>
-                  commit({ ...value, nacos: { ...nacos, namespaces } })
-                }
-              />
-            </div>
             </div>
           </EnvSection>
 
@@ -977,56 +1090,91 @@ export const CompanyEnvSection = ({
             open={openId === "elk"}
             onToggle={toggle}
           >
-            <div className="flex flex-wrap gap-1.5">
-              <MiniField
-                label="Base URL"
-                className="min-w-[10rem] flex-[2] space-y-0.5"
-              >
-                <Input
-                  value={elk.baseUrl}
-                  onChange={(e) =>
-                    patch({
-                      elk: {
-                        ...elk,
-                        baseUrl: e.target.value,
-                      } satisfies CompanyEnvElk,
-                    })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8 font-mono text-xs"
-                />
-              </MiniField>
-              <MiniField label="用户名">
-                <Input
-                  value={elk.username}
-                  onChange={(e) =>
-                    patch({ elk: { ...elk, username: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8"
-                />
-              </MiniField>
-              <MiniField label="密码">
-                <PasswordInput
-                  value={elk.password}
-                  onChange={(e) =>
-                    patch({ elk: { ...elk, password: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  autoComplete="off"
-                  className="h-8"
-                />
-              </MiniField>
-              <MiniField label="Data View">
-                <Input
-                  value={elk.dataView}
-                  onChange={(e) =>
-                    patch({ elk: { ...elk, dataView: e.target.value } })
-                  }
-                  onBlur={() => onCommit(value)}
-                  className="h-8 font-mono text-xs"
-                />
-              </MiniField>
+            <div className="space-y-2">
+              {elkList.map((e, i) => {
+                const patchElk = (next: CompanyEnvElk) =>
+                  patch({
+                    elk: elkList.map((row, j) => (j === i ? next : row)),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <InstanceCardHeader
+                      name={e.name}
+                      env={e.env}
+                      namePlaceholder="Kibana 测试"
+                      onNameChange={(name) => patchElk({ ...e, name })}
+                      onEnvChange={(env) => patchElk({ ...e, env })}
+                      onBlur={() => onCommit(value)}
+                      onRemove={() =>
+                        commit({
+                          ...value,
+                          elk: elkList.filter((_, j) => j !== i),
+                        })
+                      }
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField
+                        label="Base URL"
+                        className="min-w-[10rem] flex-[2] space-y-0.5"
+                      >
+                        <Input
+                          value={e.baseUrl}
+                          onChange={(ev) =>
+                            patchElk({ ...e, baseUrl: ev.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField label="用户名">
+                        <Input
+                          value={e.username}
+                          onChange={(ev) =>
+                            patchElk({ ...e, username: ev.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={e.password}
+                          onChange={(ev) =>
+                            patchElk({ ...e, password: ev.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="Data View">
+                        <Input
+                          value={e.dataView}
+                          onChange={(ev) =>
+                            patchElk({ ...e, dataView: ev.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加实例"
+                onClick={() => {
+                  const row: CompanyEnvElk = {
+                    name: "",
+                    env: "test",
+                    baseUrl: "",
+                    username: "",
+                    password: "",
+                    dataView: "",
+                  };
+                  commit({ ...value, elk: [...elkList, row] });
+                }}
+              />
             </div>
           </EnvSection>
 

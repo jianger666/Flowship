@@ -382,7 +382,7 @@ export const SearchDialog = () => {
                       <span className="min-w-0 flex-1 truncate">
                         {highlightMatch(item.entry.label, trimmed)}
                       </span>
-                      <span className="shrink-0 text-[10px] text-muted-foreground/70">
+                      <span className="shrink-0 text-[11px] text-muted-foreground/70">
                         操作
                       </span>
                     </button>
@@ -402,10 +402,7 @@ export const SearchDialog = () => {
                         <span className="min-w-0 flex-1 truncate text-sm">
                           {highlightMatch(item.hit.title || "未命名", trimmed)}
                         </span>
-                        <Badge
-                          variant="secondary"
-                          className="shrink-0 text-[10px]"
-                        >
+                        <Badge variant="secondary" size="xs">
                           {modeLabel(item.hit.mode)}
                         </Badge>
                       </div>

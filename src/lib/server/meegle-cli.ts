@@ -278,10 +278,14 @@ let meCache: string | undefined;
 /** 身份缓存（姓名 + user_key）；与 meCache 同源、成功后两边一起填 */
 let identityCache: MeegleIdentity | undefined;
 
+/** 本人邮箱缓存（需求群成员注册表的 key）；只缓存成功结果 */
+let myEmailCache: string | undefined;
+
 /** 清 me / identity 进程内缓存（换账号后必须调；projectsCache 自带 TTL 不在此列） */
 export const invalidateMeegleIdentityCaches = (): void => {
   meCache = undefined;
   identityCache = undefined;
+  myEmailCache = undefined;
 };
 
 // meegle-cli 已依赖 feishu-cli、反向 import 会循环——用注册回调挂到 invalidateStatusCache
@@ -342,6 +346,180 @@ export const fetchMyIdentity = async (): Promise<MeegleIdentity | null> => {
     return null;
   }
 };
+
+// ---------- 本人邮箱（需求群成员注册表的 key） ----------
+
+/** 从一条用户记录里抠邮箱（各命令字段名不统一、都试一遍） */
+const pickUserEmail = (rec: Record<string, unknown>): string | undefined =>
+  asStr(rec.email) ??
+  asStr(rec.user_email) ??
+  asStr(rec.enterprise_email) ??
+  asStr(rec.email_address);
+
+/**
+ * 从 `user search` 响应里按 user_key 找邮箱（纯函数、单测友好）。
+ * CLI 各版本包裹层不一（裸数组 / { data: [...] } / { list: [...] }）——都兼容；
+ * 只有一条结果时不强求 key 匹配（`current_login_user()` 之类的查法拿不到 key 回填）。
+ */
+export const parseUserSearchEmail = (
+  resp: unknown,
+  userKey?: string,
+): string | undefined => {
+  const items: Record<string, unknown>[] = [];
+  const collect = (v: unknown, depth: number): void => {
+    if (depth > 3 || !v || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          items.push(item as Record<string, unknown>);
+        }
+      }
+      return;
+    }
+    const rec = v as Record<string, unknown>;
+    for (const key of ["data", "list", "items", "users", "result"]) {
+      if (rec[key] !== undefined) collect(rec[key], depth + 1);
+    }
+    // 单对象响应（没有列表包裹）
+    if (items.length === 0 && pickUserEmail(rec)) items.push(rec);
+  };
+  collect(resp, 0);
+  if (items.length === 0) return undefined;
+
+  if (userKey) {
+    const hit = items.find(
+      (it) => asStr(it.user_key) === userKey || asStr(it.key) === userKey,
+    );
+    const email = hit ? pickUserEmail(hit) : undefined;
+    if (email) return email;
+  }
+  return items.length === 1 ? pickUserEmail(items[0]!) : undefined;
+};
+
+/**
+ * 当前登录用户的邮箱——**需求群成员注册表的 key**。
+ *
+ * 必须走 meegle：注册表的另一端（工作项角色成员）给的就是 meegle 侧邮箱，
+ * 两边同源才对得上号。lark-cli 侧拿不到本人邮箱（`authen/v1/user_info` 不返 email、
+ * `contact +get-user` 缺 `contact:user.basic_profile:readonly`，2026-07-27 实测）。
+ *
+ * 探测链：`user me` 直接带 email → 否则用 user_key 走 `user search` 换。
+ * **增强路径、失败一律返 null**（未装 / 未登录 / 超时都不抛）。
+ */
+export const fetchMyEmail = async (): Promise<string | null> => {
+  if (myEmailCache !== undefined) return myEmailCache;
+  try {
+    const me = (await runMeegle(["user", "me"])) as Record<string, unknown>;
+    const direct = pickUserEmail(me);
+    if (direct) {
+      myEmailCache = direct;
+      return direct;
+    }
+    const userKey = asStr(me.user_key);
+    if (!userKey) return null;
+    const searched = await runMeegle([
+      "user",
+      "search",
+      "--user-keys",
+      JSON.stringify([userKey]),
+    ]);
+    const email = parseUserSearchEmail(searched, userKey);
+    if (!email) return null;
+    myEmailCache = email;
+    return email;
+  } catch {
+    // 不缓存失败：CLI 装好 / 登录上之后下一轮就能拿到
+    return null;
+  }
+};
+
+// ---------- 工作项角色成员（建群拉人的数据源） ----------
+
+/** 工作项某个角色下的一位成员（字段解析不出就 undefined） */
+export interface WorkitemRoleMember {
+  /** 角色名（「开发」「测试」「产品」…、空间自定义、不要写死枚举） */
+  role?: string;
+  name?: string;
+  /** 邮箱——需求群成员注册表的反查 key */
+  email?: string;
+  /** 飞书项目 user_key（纯数字、@ mention 用；换不出 IM open_id） */
+  userKey?: string;
+}
+
+/**
+ * 从 `workitem get` 响应里抠角色成员（纯函数、单测友好）。
+ *
+ * 服务端把它放在 `work_item_attribute.role_members[]`，但不同空间 / 版本还见过
+ * `role_owners`、以及塞进 `work_item_fields` 里的形态——所以做**有界深度遍历**、
+ * 见到这两个 key 的数组就收，不写死路径。
+ */
+export const parseWorkitemRoleMembers = (
+  resp: unknown,
+): WorkitemRoleMember[] => {
+  const out: WorkitemRoleMember[] = [];
+
+  const pushMember = (raw: unknown, role: string | undefined): void => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const m = raw as Record<string, unknown>;
+    const email = pickUserEmail(m);
+    const name = asStr(m.name) ?? asStr(m.name_cn) ?? asStr(m.name_en);
+    const userKey = asStr(m.key) ?? asStr(m.user_key);
+    if (!email && !name && !userKey) return;
+    out.push({
+      ...(role ? { role } : {}),
+      ...(name ? { name } : {}),
+      ...(email ? { email } : {}),
+      ...(userKey ? { userKey } : {}),
+    });
+  };
+
+  const takeRoleArray = (arr: unknown[]): void => {
+    for (const entry of arr) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const e = entry as Record<string, unknown>;
+      const role = asStr(e.role) ?? asStr(e.role_name) ?? asStr(e.name);
+      const members = e.members ?? e.owners ?? e.users ?? e.member_list;
+      if (Array.isArray(members)) {
+        for (const m of members) pushMember(m, role);
+        continue;
+      }
+      // 扁平形态：角色条目本身就是一个人
+      if (pickUserEmail(e) || asStr(e.key) || asStr(e.user_key)) {
+        pushMember(e, undefined);
+      }
+    }
+  };
+
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 6 || !v || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) walk(item, depth + 1);
+      return;
+    }
+    const rec = v as Record<string, unknown>;
+    for (const [key, value] of Object.entries(rec)) {
+      if ((key === "role_members" || key === "role_owners") && Array.isArray(value)) {
+        takeRoleArray(value);
+        continue;
+      }
+      walk(value, depth + 1);
+    }
+  };
+
+  walk(resp, 0);
+  return out;
+};
+
+/**
+ * 工作项角色成员清单（建群时按 email 反查注册表用）。
+ * 复用 `fetchWorkitemDetail` 的全量查询 + 进程缓存——建群是低频动作、
+ * 不值得为它多打一次 CLI 往返。
+ */
+export const fetchWorkitemRoleMembers = async (
+  workItemId: string,
+  projectKey?: string,
+): Promise<WorkitemRoleMember[]> =>
+  parseWorkitemRoleMembers(await fetchWorkitemDetail(workItemId, projectKey));
 
 // ---------- prompt「用户身份」行（姓名 meegle + 角色 settings） ----------
 
@@ -1053,4 +1231,192 @@ export const addWorkitemComment = async (
     "--content",
     content,
   ]);
+};
+
+// ---------- 需求群（group_type 逻辑字段）----------
+
+/**
+ * 拉群方式读结果（读写协议不对称：读判别键是 `value`，写是 `type`）。
+ * - auto / bind 通常带 group_id（oc_xxx）
+ * - disabled 无 group_id
+ */
+export interface WorkitemGroupType {
+  /** auto | bind | disabled | 未知原值 */
+  value: string;
+  groupId?: string;
+  label?: string;
+}
+
+/**
+ * 读工作项 `group_type`（只取拉群字段，不走 detail 全量缓存——bind 后要立刻再读）。
+ */
+export const fetchWorkitemGroupType = async (
+  workItemId: string,
+  projectKey?: string,
+): Promise<WorkitemGroupType | null> => {
+  const args = [
+    "workitem",
+    "get",
+    "--work-item-id",
+    workItemId,
+    "--fields",
+    '["group_type"]',
+  ];
+  if (projectKey) args.push("--project-key", projectKey);
+  const resp = await runMeegle(args);
+  return parseGroupTypeFromWorkitem(resp);
+};
+
+/**
+ * bind 现有群到工作项：`field_value` 必须是 stringified JSON，
+ * 写协议 `{"type":"bind","group_id":"oc_xxx"}`（判别键是 type，不是 value）。
+ */
+export const bindWorkitemGroup = async (
+  workItemId: string,
+  projectKey: string | undefined,
+  groupId: string,
+): Promise<void> => {
+  const fieldValue = JSON.stringify({ type: "bind", group_id: groupId });
+  const fields = JSON.stringify([
+    { field_key: "group_type", field_value: fieldValue },
+  ]);
+  const args = [
+    "workitem",
+    "update",
+    "--work-item-id",
+    workItemId,
+    "--fields",
+    fields,
+  ];
+  if (projectKey) args.push("--project-key", projectKey);
+  await runMeegle(args);
+};
+
+/**
+ * 拉工作项名称（需求群群名 `<需求名>需求群` 的来源）。只取 name 一个字段。
+ *
+ * 建群拉同事走另一条路：`fetchWorkitemRoleMembers` 取角色成员**邮箱**、再到
+ * 需求群成员注册表按邮箱反查 open_id / bot app_id（`feishu-group-registry`）——
+ * user_key ↔ IM open_id 换不出来，邮箱才是两侧都有的键。
+ */
+export const fetchWorkitemName = async (
+  workItemId: string,
+  projectKey?: string,
+): Promise<string | undefined> => {
+  const args = [
+    "workitem",
+    "get",
+    "--work-item-id",
+    workItemId,
+    "--fields",
+    '["name"]',
+  ];
+  if (projectKey) args.push("--project-key", projectKey);
+  const resp = await runMeegle(args);
+  const flat = flattenWorkitemFields(resp);
+  return (
+    asStr(flat.name) ??
+    asStr(flat.work_item_name) ??
+    (resp && typeof resp === "object"
+      ? asStr((resp as Record<string, unknown>).name)
+      : undefined)
+  );
+};
+
+/** 从 workitem get 响应抠 group_type */
+/** export 仅供单测（真实服务端返回形状回归）；业务方走 fetchWorkitemGroupType */
+export const parseGroupTypeFromWorkitem = (
+  resp: unknown,
+): WorkitemGroupType | null => {
+  const flat = flattenWorkitemFields(resp);
+  const raw =
+    flat.group_type ??
+    pickNestedFieldValue(resp, "group_type") ??
+    // 真实服务端返回里 group_type 逻辑字段的 field_key 是 null（2026-07-27 实测）——
+    // 按 key 匹配必然扑空。我们请求时 --fields 只要了 ["group_type"]，
+    // 所以兜底：按值形状识别（对象含 value=auto/bind/disabled）。
+    pickGroupTypeShapedValue(resp);
+  if (raw == null) return null;
+  // 可能是对象，也可能是 stringified JSON
+  let obj: Record<string, unknown> | null = null;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        obj = parsed as Record<string, unknown>;
+      } else {
+        return { value: raw };
+      }
+    } catch {
+      return { value: raw };
+    }
+  } else if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    obj = raw as Record<string, unknown>;
+  }
+  if (!obj) return null;
+  // 读判别键是 value（偶发 type）
+  const value =
+    asStr(obj.value) ?? asStr(obj.type) ?? asStr(obj.group_type) ?? "";
+  if (!value) return null;
+  const groupId =
+    asStr(obj.group_id) ?? asStr(obj.groupId) ?? asStr(obj.chat_id);
+  return {
+    value,
+    groupId: groupId || undefined,
+    label: asStr(obj.label) ?? asStr(obj.name),
+  };
+};
+
+/**
+ * 按「拉群字段的值形状」在 fields 数组里兜底找 group_type：
+ * 对象且 value（或 type）∈ {auto, bind, disabled}。
+ * 服务端对逻辑字段可能返回 field_key=null，按 key 匹配会漏（实测于 workitem get --fields '["group_type"]'）。
+ */
+const pickGroupTypeShapedValue = (resp: unknown): unknown => {
+  if (!resp || typeof resp !== "object") return undefined;
+  const r = resp as Record<string, unknown>;
+  for (const arrKey of ["work_item_fields", "fields", "list"]) {
+    const arr = r[arrKey];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const m = item as Record<string, unknown>;
+      const v = m.field_value ?? m.value;
+      const obj =
+        v && typeof v === "object" && !Array.isArray(v)
+          ? (v as Record<string, unknown>)
+          : null;
+      const discriminant = obj ? (asStr(obj.value) ?? asStr(obj.type)) : null;
+      if (
+        discriminant === "auto" ||
+        discriminant === "bind" ||
+        discriminant === "disabled"
+      ) {
+        return v;
+      }
+    }
+  }
+  if (r.data !== undefined) return pickGroupTypeShapedValue(r.data);
+  return undefined;
+};
+
+/** 在嵌套 fields 数组里找指定 field_key 的 value */
+const pickNestedFieldValue = (
+  resp: unknown,
+  fieldKey: string,
+): unknown => {
+  if (!resp || typeof resp !== "object") return undefined;
+  const r = resp as Record<string, unknown>;
+  for (const arrKey of ["work_item_fields", "fields", "list"]) {
+    const arr = r[arrKey];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const m = item as Record<string, unknown>;
+      const key = asStr(m.field_key) ?? asStr(m.key);
+      if (key === fieldKey) return m.field_value ?? m.value;
+    }
+  }
+  if (r.data !== undefined) return pickNestedFieldValue(r.data, fieldKey);
+  return undefined;
 };

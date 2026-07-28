@@ -41,6 +41,7 @@ import {
 } from "@/lib/server/task-fs";
 import { MAX_EVENTS_TAIL } from "@/lib/server/task-fs-core";
 import {
+  hasRestrictedQuestionInFlight,
   type TaskStreamEvent,
   subscribeTaskStream,
 } from "@/lib/server/task-stream";
@@ -224,6 +225,11 @@ export const GET = async (req: Request, { params }: Ctx) => {
               outcome: ev.outcome,
             });
             break;
+          // 旁路（受限群答疑）run 在飞与否——它不写 runStatus，前端只能靠这一帧
+          // 知道「工具块还该转圈」（否则渲染成灰色「已中断」）
+          case "restricted_run":
+            send({ type: "restricted_run", active: ev.active });
+            break;
           // DELETE 逻辑删除提交 → 通知客户端并关流
           case "task_deleted":
             send({ type: "task_deleted", taskId: ev.taskId });
@@ -254,6 +260,13 @@ export const GET = async (req: Request, { params }: Ctx) => {
           itemIds: listChatQueueItemIds(id),
           operationSnapshot: listMessageOperationSnapshot(id),
           recentSettled: listRecentSettled(id),
+        });
+        // 旁路答疑在飞与否的补位：中途打开页面 / 断线重连都收不到 register/unregister
+        // 那两帧——在飞不补 → 工具块被当脏数据渲染「已中断」；已结束不补 → 断线前的
+        // true 会一直挂着（转圈不停）。所以**无条件**发一帧当前值、让客户端对齐。
+        send({
+          type: "restricted_run",
+          active: hasRestrictedQuestionInFlight(id),
         });
       } catch (err) {
         console.error("[watch-task] bootstrap failed:", err);

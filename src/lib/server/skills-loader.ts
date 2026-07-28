@@ -422,17 +422,27 @@ export const findSkillByName = async (
 };
 
 /**
- * 读 skill 的 SKILL.md 正文（去掉 frontmatter、只返 content）。
+ * 读 skill 的 SKILL.md 正文（去掉 frontmatter）**外加它所在目录**。
+ *
+ * 为什么必须连目录一起返：正文里的 `templates/` `references/` `scripts/` 是
+ * **相对 SKILL.md 所在目录**的；只把正文字符串注入 prompt（旧行为）等于把
+ * 「这段话从哪个文件读出来的」丢了、agent 无从解析这些相对路径。
+ * kbRoot 是另一个根（知识库根、解析 `knowledge-base/…` 用）、不能拿它当 skill 目录。
+ *
  * 找不到 / 读失败 → null（调用方出「定义缺失」兜底文案）。
  */
 export const readSkillBodyByName = async (
   name: string,
-): Promise<string | null> => {
+): Promise<{ body: string; skillDir: string; kbRoot?: string } | null> => {
   const entry = await findSkillByName(name);
   if (!entry) return null;
   try {
     const raw = await fs.readFile(entry.absPath, "utf-8");
-    return matter(raw).content.trim();
+    return {
+      body: matter(raw).content.trim(),
+      skillDir: path.dirname(entry.absPath),
+      ...(entry.kbRoot ? { kbRoot: entry.kbRoot } : {}),
+    };
   } catch {
     return null;
   }
@@ -441,10 +451,18 @@ export const readSkillBodyByName = async (
 /**
  * 把 skills 渲染成 prompt 末尾的 [AVAILABLE_SKILLS] 段
  *
- * 每个 skill 占 3 行：
+ * 段首一行「相对路径解析」+ 每个 skill 2~4 行：
  *   - skill_name
  *   - desc: 单行简介
- *   - path: 绝对路径（agent 调 `read` 工具用）
+ *   - path: SKILL.md 绝对路径（agent 调 `read` 工具用）
+ *   - kbRoot: 知识库根（只有 team knowledge 源有）
+ *
+ * 段首那行不是废话——skill 自带资源（`templates/` `references/` `scripts/`）在
+ * **SKILL.md 所在目录**下，而 kbRoot 指的是知识库根，两个根不是一回事。
+ * 旧版只给 kbRoot 且标注「本 skill 内的相对路径以此目录为根解析」，agent 照做把
+ * `templates/business/biz-analysis.md` 解析到 `<kbRoot>/templates/…`（不存在）→
+ * 读不到团队模板只能自己编章节 → 团队文档门禁全红（2026-07-28 实测）。
+ * 解析规则放段首一行、不逐条重复，省 token 也只有一个源。
  *
  * 整段总 token 量预估：N × 80~120 token；N=10 时 ~1k token、可接受
  */
@@ -452,16 +470,17 @@ export const renderSkillsForPrompt = (skills: SkillEntry[]): string => {
   if (skills.length === 0) {
     return "（当前没有可用 skill。平台 skill 放在 Flowship `skills/<name>/SKILL.md`、自管 skill 在能力页管理；也可从 Cursor 导入为自管副本。）";
   }
-  const lines: string[] = [];
+  const lines: string[] = [
+    "相对路径解析：SKILL.md 正文里的 `templates/` `references/` `scripts/` 等相对路径都在该 skill `path` 所在目录下、用 `read` 读；`kbRoot` 只用来解析 `knowledge-base/…` 这类库内路径。",
+    "",
+  ];
   for (const s of skills) {
     lines.push(`- **${s.name}**`);
     lines.push(`  desc: ${s.description.replace(/\n/g, " ")}`);
     lines.push(`  path: ${s.absPath}`);
-    // 知识库 skill：相对路径以此根解析（knowledge-base/...、scripts/*.py）
+    // 知识库 skill 的库内根（解析规则见段首、这里不重复）
     if (s.kbRoot) {
-      lines.push(
-        `  kbRoot: ${s.kbRoot}（本 skill 内的相对路径以此目录为根解析）`,
-      );
+      lines.push(`  kbRoot: ${s.kbRoot}`);
     }
     if (s.paths && s.paths.length > 0) {
       lines.push(`  paths: ${s.paths.join(", ")}`);

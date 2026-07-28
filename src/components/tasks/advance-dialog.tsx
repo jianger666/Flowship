@@ -39,7 +39,14 @@
  *     之前 agent 挂掉重启时也没法换模型、只能去 settings 改全局再回来
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -47,13 +54,15 @@ import {
   ChevronDown,
   Info,
   Loader2,
-  Paperclip,
+  Share2,
   Sparkles,
   Users,
   Zap,
   type LucideIcon,
 } from "lucide-react";
 
+import { RichInput } from "@/components/rich-input";
+import { ComposerSessionProvider } from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
@@ -65,17 +74,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
-import { ImageThumb } from "@/components/ui/image-preview";
 import { Label } from "@/components/ui/label";
 import { ModelSelect } from "@/components/ui/model-select";
 import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { Tooltip } from "@/components/ui/tooltip";
-import { useImageAttach } from "@/hooks/use-image-attach";
 import { useModels } from "@/hooks/use-models";
-import { useSubmitShortcut } from "@/hooks/use-settings";
+import { useRichInput } from "@/hooks/use-rich-input";
+import { buildActionInstructionHistory } from "@/lib/composer-history";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
-import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import {
   ACTION_LABEL,
   computeBatchProgress,
@@ -116,10 +122,11 @@ import type {
 // 推进面板内置 action 顺序 + 渲染走 @/lib/action-layout 的 BUILTIN_ADVANCE_ACTIONS
 //（单一来源、跟 /actions 布局配置页共用；custom 不在内、自定义组单独渲染）
 
-/** 推进弹窗组头语义图标：通用 / 团队 / 自定义一眼可辨（能力页组头不复用） */
+/** 推进弹窗组头语义图标：通用 / 团队 / 共享 / 自定义一眼可辨（能力页组头不复用） */
 const ADVANCE_GROUP_ICON: Record<ActionGroupKey, LucideIcon> = {
   builtin: Zap,
   team: Users,
+  shared: Share2,
   custom: Sparkles,
 };
 
@@ -262,12 +269,16 @@ const ActionCardContent = ({
       >
         {label}
       </span>
-      <span className="min-w-0 w-full truncate text-center font-mono text-[10px] leading-tight text-muted-foreground">
+      <span className="min-w-0 w-full truncate text-center font-mono text-[11px] leading-tight text-muted-foreground">
         {identifier}
       </span>
     </span>
   </>
 );
+
+// 弹窗里指令输入区的固定高度（px、约 4 行）：弹窗要的是「稳定排版」而不是 chat 那种
+// 随内容长高、拖柄可调——超出内部滚动即可。
+const ADVANCE_INPUT_HEIGHT = 104;
 
 // 各 action 的指令 placeholder（V0.6 门槛 6、§6.7 表格）
 // 简单情况下用固定文案；首次 plan / 修 bug 等场景由 buildPlaceholder() 进一步细化
@@ -349,6 +360,10 @@ interface Props {
     model?: ModelSelection;
     // 指令配的截图附件（选填、贴图说明改哪）
     images?: ImagePayload[];
+    // 指令里 `/` 唤起的 skill 引用（选填）——指引由服务端拼进 agent 消息、不落进指令原文
+    skillRefs?: Array<{ name: string; absPath: string }>;
+    // 原生 picker 选的文件 / 目录绝对路径（选填、agent 用 read 看）
+    attachments?: string[];
     // V0.6.14：合并后是否删源分支（仅 actionType==="ship" 时传、其它为 undefined）
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（仅 build 且 plan 拆批时传、其它 undefined=全做）
@@ -431,8 +446,16 @@ export const AdvanceDialog = ({
   const [collapsedGroups, setCollapsedGroups] = useState<
     Set<ActionGroupKey>
   >(() => new Set());
-  // 用户指令、选填——飞书/上下文都已带上、空也能跑
-  const [instruction, setInstruction] = useState("");
+  // 用户指令、选填——飞书/上下文都已带上、空也能跑。
+  // 整套输入态（正文 + `/`skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟事件流输入条同一份实现：
+  //   - 不传 draft：弹窗关掉草稿就该没、不进 sessionStorage
+  //   - consumePendingSlash=false：跨页 handoff 的 pending skill 属于常驻输入条、弹窗不许抢
+  const rich = useRichInput({
+    taskId: task.id,
+    disabled: submitting,
+    consumePendingSlash: false,
+  });
+  const setInstruction = rich.setValue;
   // V0.6.27 语义反转：默认每 action 起新 agent（context 截断治跑偏）、勾「续用当前 agent」才续接；
   // v0.9.11：默认勾选可在设置页「交互偏好」配置（打开 dialog 时从 settings 读、见 reset effect）
   const [reuseAgent, setReuseAgent] = useState(false);
@@ -463,8 +486,6 @@ export const AdvanceDialog = ({
   );
   // 可选模型列表、用 settings.apiKey 按需拉一次、跟 settings page / new-task-dialog 同一套
   const { models: availableModels, fetchModels } = useModels();
-  // 推进指令也是长文本输入框，提交键跟聊天输入保持一致。
-  const submitShortcut = useSubmitShortcut();
   // 是否已有「有效方案历史」——决定本次 plan 是不是 append（追加补充）。
   // 实时值：排除 excluded（划除的 action 不进 prompt 上下文、append 判定也不该算它）。
   const hasPlanHistoryNow = task.actions.some(
@@ -487,22 +508,23 @@ export const AdvanceDialog = ({
   // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
   const [hasPlanHistory, setHasPlanHistory] = useState(false);
 
-  // 指令输入框的图附件（粘贴 / 拖拽 / 选文件）、跟 revise-dialog 共用 hook
-  const {
-    images,
-    isDragging,
-    fileInputRef,
-    maxImages,
-    removeImage,
-    reset: resetImages,
-    triggerFilePicker,
-    onPaste,
-    onDragOver,
-    onDragLeave,
-    onDrop,
-    onFileInputChange,
-    toUploadPayload,
-  } = useImageAttach();
+  // slash / `@` 菜单是否开着——Dialog 据此拦 Esc（菜单开着时 Esc 只关菜单、别把草稿连窗一起关没）
+  const menuOpenRef = useRef(false);
+  // 关菜单的手柄（由 RichInput 上报）：拦下的那次 Esc 得由弹窗自己把菜单关掉
+  const closeMenusRef = useRef<(() => void) | null>(null);
+  const handleMenuOpenChange = useCallback((v: boolean, close: () => void) => {
+    menuOpenRef.current = v;
+    closeMenusRef.current = close;
+  }, []);
+  // `@` 引文件 / ↑ 翻历史指令要的会话上下文（跟输入条同一个 Provider 协议）
+  const composerSession = useMemo(
+    () => ({
+      taskId: task.id,
+      repoPaths: task.repoPaths,
+      inputHistory: buildActionInstructionHistory(task.actions),
+    }),
+    [task.id, task.repoPaths, task.actions],
+  );
 
   // 用 ref 持预填：只在「打开瞬间」读、不进 effect 依赖——
   // 否则父组件清 prefill / 换引用会把用户已改的表单打回。
@@ -628,7 +650,8 @@ export const AdvanceDialog = ({
       setActionType,
       setSelectedCustomActionId,
     );
-  }, [open, defaultRemoveSourceBranch]);
+    // setInstruction 引用稳定（弹窗不带草稿 scope）、进 deps 不会让本 effect 多跑
+  }, [open, defaultRemoveSourceBranch, setInstruction]);
 
   // dialog 打开时按需拉模型列表（跟上面的表单初始化解耦）。
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
@@ -803,14 +826,23 @@ export const AdvanceDialog = ({
       });
   }, [open]);
 
-  // dialog 关闭时清空附图、下次打开不残留上次的图
-  //（resetImages 每次 render 新引用、故意只在 open 变化时跑、不进 deps）
+  // dialog 关闭时清空正文 + 附件 + slash 菜单态，下次打开不残留上一轮的图 / 路径
+  //（reset 每次 render 都是新引用、故意只在 open 变化时跑、不进 deps）
+  const resetRich = rich.reset;
   useEffect(() => {
-    if (!open) resetImages();
+    if (!open) resetRich();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // V0.9：内置 + 自定义按 layout 排好后分三组渲染（空组不出现）
+  // 打开时把焦点落进富输入（原 textarea 的 autoFocus；Lexical 要等编辑器挂完 handle）
+  const focusRich = rich.focus;
+  useEffect(() => {
+    if (!open) return;
+    const timer = requestAnimationFrame(focusRich);
+    return () => cancelAnimationFrame(timer);
+  }, [open, focusRich]);
+
+  // V0.9：内置 + 自定义按 layout 排好后分四组渲染（空组不出现）
   //（v0.9.12：隐藏的直接不出现、「更多」折叠区已删）。
   const customById = useMemo(
     () => new Map(customActions.map((d) => [d.id, d] as const)),
@@ -884,7 +916,7 @@ export const AdvanceDialog = ({
             {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
             {reason && (
               <Tooltip content={reason}>
-                <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-amber-500">
+                <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-warning">
                   <AlertTriangle className="size-3.5" />
                 </span>
               </Tooltip>
@@ -1016,24 +1048,21 @@ export const AdvanceDialog = ({
       >
         <div className="flex w-full items-center gap-1.5">
           <span className="min-w-0 truncate text-xs font-medium">{b.title}</span>
-          <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px]">
+          <Badge variant="outline" size="xs">
             #{b.sourceActionN}
           </Badge>
           {b.duplicateOfEffectiveId && (
-            <Badge variant="secondary" className="shrink-0 px-1 py-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               疑似重复
             </Badge>
           )}
           {done && (
-            <Badge
-              variant="secondary"
-              className="ml-auto shrink-0 px-1 py-0 text-[10px]"
-            >
+            <Badge variant="secondary" size="xs" className="ml-auto">
               已做
             </Badge>
           )}
         </div>
-        <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground">
           {b.rawId} · {TEST_STRATEGY_LABEL[b.testStrategy]}
           {b.taskRefs.length > 0 ? ` · ${b.taskRefs.join(" / ")}` : ""}
         </span>
@@ -1046,14 +1075,20 @@ export const AdvanceDialog = ({
     if (!canSubmit || !actionType) return;
     // 常用模型计数：只在「起新 agent 且选了模型」时记（续用不换模型、不算一次使用）
     if (!reuseAgent && pickedModel.id) recordModelUsage(pickedModel);
+    // 富输入四件套：正文（`/skill`、`@文件` 以原文内联其中）+ 图 + 路径附件 + skill 引用
+    const { text, images, attachments, skillRefs } = rich.payload();
     await onSubmit({
       actionType,
-      userInstruction: instruction.trim(),
+      userInstruction: text,
       reuseAgent,
       // 只在起新 agent（默认）时透传模型选择、续接走 task.model
       model: !reuseAgent && pickedModel.id ? pickedModel : undefined,
       // 截图附件（选填）、后端落盘后把路径注入 agent prompt
-      images: toUploadPayload(),
+      images,
+      // skill 指引由服务端拼进 agent 消息（不进 action.userInstruction、不污染历史）
+      skillRefs,
+      // 原生 picker 选的文件 / 目录绝对路径（server stat 后拼 [ATTACHED_PATHS]）
+      attachments,
       // 仅 ship 时传「合并后删源分支」、其它 action 无意义（advance route 据此决定是否落字段）
       removeSourceBranch: actionType === "ship" ? removeSourceBranch : undefined,
       // 仅 build 且 plan 拆批且选了批次时传；空选不传（V0.6.29 = 自由改动、server 注入「不绑定批次」指令）
@@ -1075,7 +1110,22 @@ export const AdvanceDialog = ({
 
   return (
     // disablePointerDismissal：带草稿表单（指令 + 附件）、点外误关丢草稿；Esc / X / 取消仍可关
-    <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
+    <Dialog
+      open={open}
+      onOpenChange={(next, details) => {
+        // slash / `@` 菜单开着时的 Esc 归菜单——不然一按 Esc 连指令草稿一起关没。
+        // 关键是**主动关掉**而不是空 return：焦点不在编辑器时（点过下拉 / 按钮）
+        // 编辑器自己的 Esc 处理收不到这一下，光拦不关 → 菜单永远开着 → Esc 成死键、
+        // 弹窗再也关不掉（只能点 X / 取消）
+        if (!next && details.reason === "escape-key" && menuOpenRef.current) {
+          closeMenusRef.current?.();
+          menuOpenRef.current = false;
+          return;
+        }
+        onOpenChange(next);
+      }}
+      disablePointerDismissal
+    >
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>推进任务</DialogTitle>
@@ -1084,7 +1134,7 @@ export const AdvanceDialog = ({
         {/* 区块节奏：下一步 / 指令 / 模型区之间统一 16px（gap-4）；label 与控件 6px（gap-1.5）
             高度随内容自适应（防抖占位撑出大空档、用户实测点名去掉） */}
         <div className="flex flex-col gap-4">
-          {/* action 类型选择：按固定三组渲染（组序 / 默认折叠在 /actions 页配；隐藏的不出现） */}
+          {/* action 类型选择：按固定四组渲染（组序 / 默认折叠在 /actions 页配；隐藏的不出现） */}
           <div className="grid gap-1.5">
             <Label>下一步</Label>
             {visibleKeys.length > 0 ? (
@@ -1112,7 +1162,7 @@ export const AdvanceDialog = ({
                         <span className="min-w-0 flex-1 truncate font-medium">
                           {group.label}
                         </span>
-                        <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-md bg-muted px-1 text-[10px] tabular-nums text-muted-foreground">
+                        <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-sm bg-muted px-1 text-[11px] tabular-nums text-muted-foreground">
                           {group.keys.length}
                         </span>
                       </button>
@@ -1136,7 +1186,7 @@ export const AdvanceDialog = ({
                 })}
               </div>
             ) : isLightweightDailyTask(task) ? (
-              // 日常任务不展示通用 / 团队组——自定义也空时引导去能力页
+              // 日常任务不展示通用 / 团队 / 共享组——自定义也空时引导去能力页
               <EmptyHint size="sm">
                 日常任务只支持自定义 action，去{" "}
                 <Link href="/actions" className="text-primary underline">
@@ -1185,7 +1235,7 @@ export const AdvanceDialog = ({
           {actionType === "build" && hasBatches && (
             <div className="grid gap-1.5">
               {batchProgress.latestPlanMissingBatches && (
-                <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-xs text-warning">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                   <span>
                     #{batchProgress.latestPlanMissingBatches.n} 方案没有结构化批次，未纳入本次选择。
@@ -1215,7 +1265,7 @@ export const AdvanceDialog = ({
                 {normalBatches.map(renderBatchChoice)}
                 {duplicateBatches.length > 0 && (
                   <div className="grid gap-1.5 rounded-md border border-dashed bg-muted/20 p-2">
-                    <div className="text-[10px] text-muted-foreground">
+                    <div className="text-[11px] text-muted-foreground">
                       疑似重复批次（请核对后再选）
                     </div>
                     {duplicateBatches.map(renderBatchChoice)}
@@ -1232,7 +1282,7 @@ export const AdvanceDialog = ({
                   <span className="text-xs font-medium">
                     自由改动（不绑定批次）
                   </span>
-                  <span className="text-[10px] text-muted-foreground">
+                  <span className="text-[11px] text-muted-foreground">
                     改bug / 跨批次散改、范围以指令为准、不计批次进度
                   </span>
                 </ChoiceButton>
@@ -1240,52 +1290,18 @@ export const AdvanceDialog = ({
             </div>
           )}
 
-          {/* 用户指令、选填——飞书/上下文 doc 已经在 super-prompt 里带上、空提交也能跑 */}
+          {/* 用户指令、选填——飞书/上下文 doc 已经在 super-prompt 里带上、空提交也能跑。
+              v1.1.x：换成跟事件流输入条同一个 RichInput（`/` 唤起 skill、`@` 引仓库文件、
+              贴图 / 拖拽 / 附文件目录），高度固定 4 行左右、不像 chat 那样占半屏 */}
           <div className="grid gap-1.5">
-            <Label htmlFor="advance-instruction">
+            <Label>
               指令 <span className="text-xs text-muted-foreground">（选填）</span>
             </Label>
-            {/* 整片输入区支持拖拽贴图：drag over 时轮廓高亮（跟 revise-dialog 一致） */}
-            <div
-              className={cn(
-                "flex flex-col gap-2 rounded-md transition-colors",
-                isDragging &&
-                  "bg-primary/5 p-1 ring-1 ring-primary/30 ring-inset",
-              )}
-              onDragOver={onDragOver}
-              onDragLeave={onDragLeave}
-              onDrop={onDrop}
-            >
-              {/* 缩略图区：提交前可移除单张、点击站内看大图（多图左右切换） */}
-              {images.length > 0 && (
-                <div className="flex flex-wrap gap-2">
-                  {images.map((img, i) => (
-                    <ImageThumb
-                      key={img.id}
-                      src={img.dataUrl}
-                      alt={img.file.name}
-                      className="size-16"
-                      onRemove={() => removeImage(img.id)}
-                      group={images.map((im) => ({
-                        src: im.dataUrl,
-                        alt: im.file.name,
-                      }))}
-                      index={i}
-                    />
-                  ))}
-                </div>
-              )}
-              <Textarea
-                id="advance-instruction"
-                value={instruction}
-                onChange={(e) => setInstruction(e.target.value)}
-                onPaste={onPaste}
-                onKeyDown={(e) => {
-                  if (shouldSubmitOnKeyDown(e, submitShortcut)) {
-                    e.preventDefault();
-                    void handleSubmit();
-                  }
-                }}
+            {/* Provider 给 `@` 引文件 / ↑ 翻历次指令供 task 上下文（只需覆盖输入本身） */}
+            <ComposerSessionProvider value={composerSession}>
+              <RichInput
+                {...rich.bind}
+                onSubmit={() => void handleSubmit()}
                 placeholder={buildPlaceholder(
                   task,
                   actionType,
@@ -1294,39 +1310,10 @@ export const AdvanceDialog = ({
                     : undefined,
                 )}
                 disabled={submitting}
-                rows={4}
-                autoFocus
-                className="resize-none"
+                boxHeight={ADVANCE_INPUT_HEIGHT}
+                onMenuOpenChange={handleMenuOpenChange}
               />
-              {/* 隐藏 input：附图按钮触发 */}
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-                multiple
-                className="hidden"
-                onChange={onFileInputChange}
-              />
-              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                <span className="min-w-0 truncate">
-                  {images.length > 0
-                    ? `图 ${images.length}/${maxImages}`
-                    : "可粘贴 / 拖拽截图、或点附图"}
-                </span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={triggerFilePicker}
-                  disabled={submitting}
-                  className="h-7 gap-1 px-2 text-xs"
-                  title="附图（也支持粘贴 / 拖拽）"
-                >
-                  <Paperclip className="size-3.5" />
-                  附图
-                </Button>
-              </div>
-            </div>
+            </ComposerSessionProvider>
           </div>
 
           {/* action 专属附加区：有内容才占高（防抖占位会撑出大空档、已回退） */}
@@ -1362,7 +1349,7 @@ export const AdvanceDialog = ({
                     className="flex flex-col items-start gap-0.5"
                   >
                     <span className="text-xs font-medium">直接推送</span>
-                    <span className="text-[10px] text-muted-foreground">
+                    <span className="text-[11px] text-muted-foreground">
                       本地合 dev 后直推、最快触发流水线
                     </span>
                   </ChoiceButton>
@@ -1374,7 +1361,7 @@ export const AdvanceDialog = ({
                     className="flex flex-col items-start gap-0.5"
                   >
                     <span className="text-xs font-medium">提 PR</span>
-                    <span className="text-[10px] text-muted-foreground">
+                    <span className="text-[11px] text-muted-foreground">
                       建 feature→dev 的 MR、进 MR 列表
                     </span>
                   </ChoiceButton>

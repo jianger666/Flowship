@@ -6,7 +6,7 @@
  * 渲染任务的 action 历史、按时间从左到右展示。每个 chip：
  *   - 文案：`N <ACTION_LABEL>`、如 `1 plan`
  *   - 点击切换 selected 状态、父组件控制 selectedActionId
- *   - 只高亮 selected（当前正在看的产物）和 excluded（已划除、不进 agent 上下文）
+ *   - 只高亮 selected（当前正在看的产物、走全局 bg-selected + ring）和 excluded（已划除、不进 agent 上下文）
  *   - 不展示 action status / latest / stale 视觉：长 shell 等用户导致历史状态容易误导，
  *     timeline 在这里退回纯导航条
  *
@@ -91,19 +91,19 @@ const ActionChip = ({
         onClick={() => onSelectAction(action.id)}
         className={cn(
           "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
-          // 当前查看 = 靛蓝描边 + 靛蓝字（无填充底）。
+          // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
+          // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
           // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
-          // 选中前后宽高完全一致、点击切换不抖动。
-          isSelected &&
-            "text-indigo-600 ring-1 ring-indigo-500/55 dark:text-indigo-300 dark:ring-indigo-400/55",
+          // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
+          isSelected && "text-foreground ring-1 ring-ring/70",
           isExcluded && "line-through opacity-60",
         )}
         title={title}
       >
         <span
           className={cn(
-            "text-[10px] text-muted-foreground/80",
-            isSelected && "text-indigo-600/80 dark:text-indigo-300/80",
+            "text-[11px] text-muted-foreground/80",
+            isSelected && "text-foreground/70",
           )}
         >
           #{action.n}

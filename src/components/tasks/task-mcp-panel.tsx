@@ -73,7 +73,7 @@ export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
       >
         <Plug />
         MCP servers
-        <span className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+        <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
           {enabledCount}/{availableServers.length}
         </span>
       </Button>

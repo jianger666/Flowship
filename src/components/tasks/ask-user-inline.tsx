@@ -19,18 +19,20 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Paperclip, Sparkles } from "lucide-react";
+import { AlertTriangle, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
-import { ImageThumb } from "@/components/ui/image-preview";
-import { Textarea } from "@/components/ui/textarea";
+import { ComposerSessionProvider } from "@/components/composer-session";
+import { RichInput } from "@/components/rich-input";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/components/tasks/event-stream/rows";
+import { extractAskQuestions } from "@/lib/ask-pending";
 import { useDialog } from "@/hooks/use-dialog";
-import { useImageAttach } from "@/hooks/use-image-attach";
+import { useRichInput } from "@/hooks/use-rich-input";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { submitAskReply } from "@/lib/task-store";
 import type { ImagePayload } from "@/lib/task-store";
@@ -41,45 +43,20 @@ import type {
   TaskEvent,
 } from "@/lib/types";
 
+// 答题框固定高度（px、约 3 行）：卡片内嵌在事件流里、不该随内容长高把上下文顶走
+const ASK_INPUT_HEIGHT = 84;
+
 // 单条问题的回答态（子组件上报、父汇总）
 // - optionId：选了哪个 option（undefined = 还没选 / 走自定义）
 // - text：自定义模式下的自由文本
 // - images：本题各自绑的图。仅自定义回答模式才带、选固定选项上报空数组
+// - skillRefs：本题 `/` 引用到的 skill（父组件合并去重后随 ask-reply 一起送服务端）
 interface AnswerDraft {
   optionId?: string;
   text: string;
   images: ImagePayload[];
+  skillRefs: Array<{ name: string; absPath: string }>;
 }
-
-// 从 ev.meta 抠 questions[]（meta 不规整时返空、上层判定空就不渲染）
-const extractAskQuestions = (
-  meta: TaskEvent["meta"],
-): AskUserQuestion[] => {
-  if (!meta || !Array.isArray(meta.questions)) return [];
-  const out: AskUserQuestion[] = [];
-  for (const item of meta.questions as unknown[]) {
-    if (!item || typeof item !== "object") continue;
-    const m = item as Record<string, unknown>;
-    if (typeof m.id !== "string" || typeof m.question !== "string") continue;
-    const options: AskUserQuestion["options"] = [];
-    if (Array.isArray(m.options)) {
-      for (const optRaw of m.options as unknown[]) {
-        if (!optRaw || typeof optRaw !== "object") continue;
-        const o = optRaw as Record<string, unknown>;
-        if (typeof o.id === "string" && typeof o.label === "string") {
-          options.push({ id: o.id, label: o.label });
-        }
-      }
-    }
-    out.push({
-      id: m.id,
-      question: m.question,
-      options: options.length > 0 ? options : undefined,
-      allowText: typeof m.allowText === "boolean" ? m.allowText : true,
-    });
-  }
-  return out;
-};
 
 // 字母前缀：A-Z、超过 26 个回退数字（选项数量不设上限、schema 已放开）
 const LETTER_PREFIX = Array.from({ length: 26 }, (_, i) =>
@@ -90,56 +67,75 @@ const LETTER_PREFIX = Array.from({ length: 26 }, (_, i) =>
 const isDraftAnswered = (d?: AnswerDraft): boolean =>
   !!d && (!!d.optionId || d.text.trim().length > 0 || d.images.length > 0);
 
+// 各题 skill 引用合并去重（按 name、保出现序）——一次 ask-reply 只发一条消息、指引拼一份。
+// 上限走 MAX_SKILL_REFS 单一源（服务端 parseAndValidateSkills 同源、别再定第二个常量）
+const mergeSkillRefs = (
+  drafts: Array<AnswerDraft | undefined>,
+): Array<{ name: string; absPath: string }> => {
+  const seen = new Set<string>();
+  const out: Array<{ name: string; absPath: string }> = [];
+  for (const d of drafts) {
+    for (const s of d?.skillRefs ?? []) {
+      if (seen.has(s.name)) continue;
+      seen.add(s.name);
+      out.push(s);
+      if (out.length >= MAX_SKILL_REFS) return out;
+    }
+  }
+  return out;
+};
+
 // ----------------- 单题子组件 -----------------
 
 interface AskQuestionItemProps {
   question: AskUserQuestion;
+  // 所属任务：`@` 引文件 / 粘贴落盘要用（本题输入内核透传）
+  taskId: string;
   // 题号（从 1 开始展示）
   index: number;
   // 提交锁：提交中禁所有交互
   submitting: boolean;
-  // 上报本题回答态（含图）给父组件
+  // 上报本题回答态（含图 / skill 引用）给父组件
   onChange: (qid: string, draft: AnswerDraft) => void;
+  // 在答题框里按提交快捷键 = 提交整张卡（一题一发没有意义）
+  onSubmitAll: () => void;
 }
 
 /**
- * 一道题的完整渲染 + 本题图附件管理。
- * 拆子组件的原因：useImageAttach 是 hook、不能在 questions.map 里循环调用——
- * 每题一个子组件实例 = 各自合法 call 一次 hook、各绑各的图。
+ * 一道题的完整渲染 + 本题输入态。
+ * 拆子组件的原因：useRichInput 是 hook、不能在 questions.map 里循环调用——
+ * 每题一个子组件实例 = 各自合法 call 一次 hook、各绑各的正文 / 图 / skill 引用。
  */
 const AskQuestionItem = ({
   question,
+  taskId,
   index,
   submitting,
   onChange,
+  onSubmitAll,
 }: AskQuestionItemProps) => {
   // 本题选了哪个 option（undefined = 没选 / 走自定义文本）
   const [optionId, setOptionId] = useState<string | undefined>(undefined);
-  // 自定义文本草稿
-  const [text, setText] = useState("");
   const hasOptions = !!question.options && question.options.length > 0;
-  // 自定义输入模式：没 options 的纯文本题天然常显 textarea、有 options 的点「自定义回答」才切
+  // 自定义输入模式：没 options 的纯文本题天然常显输入框、有 options 的点「自定义回答」才切
   const [otherMode, setOtherMode] = useState(!hasOptions);
 
-  // 本题图附件：各题独立一套（粘贴 / 拖拽 / 选文件 / 缩略图 / 移除）
-  const {
-    images,
-    isDragging,
-    fileInputRef,
-    maxImages,
-    removeImage,
-    triggerFilePicker,
-    onPaste,
-    onDragOver,
-    onDragLeave,
-    onDrop,
-    onFileInputChange,
-  } = useImageAttach({ disabled: submitting });
+  // 本题输入态：跟输入条 / 推进弹窗同一套内核（`/` skill、`@` 引文件、贴图）。
+  // 不给路径附件——ask-reply 通道不收 attachments（`@` 引用本身以原文进答案、agent 照样能读）。
+  const rich = useRichInput({
+    taskId,
+    disabled: submitting,
+    enablePaths: false,
+    consumePendingSlash: false,
+  });
+  const { value: text, setValue: setText, attach, slash } = rich;
+  const images = attach.images;
 
   // 仅「自定义回答」模式能带图：选固定选项（A/B/C）不带（用户拍板）。
   const inCustomMode = otherMode || !hasOptions;
 
-  // 上报本题回答态给父组件（images 引用稳定、无死循环——同原弹窗实现）
+  // 上报本题回答态给父组件（images / references 引用稳定、无死循环——同原弹窗实现）
+  const skillReferences = slash.references;
   useEffect(() => {
     const imgPayload: ImagePayload[] = inCustomMode
       ? images.map((p) => ({
@@ -148,8 +144,24 @@ const AskQuestionItem = ({
           filename: p.file.name,
         }))
       : [];
-    onChange(question.id, { optionId, text, images: imgPayload });
-  }, [optionId, text, images, inCustomMode, onChange, question.id]);
+    onChange(question.id, {
+      optionId,
+      text,
+      images: imgPayload,
+      // 选了固定选项时正文被清空、skill 引用自然也不该带走
+      skillRefs: inCustomMode
+        ? skillReferences.map((s) => ({ name: s.name, absPath: s.absPath }))
+        : [],
+    });
+  }, [
+    optionId,
+    text,
+    images,
+    skillReferences,
+    inCustomMode,
+    onChange,
+    question.id,
+  ]);
 
   // 点选项：写 optionId、清文本、退出自定义模式（图保留、与答案模式无关）
   const handlePickOption = (optId: string) => {
@@ -167,11 +179,11 @@ const AskQuestionItem = ({
   return (
     <div className="flex flex-col gap-2.5">
       <div className="flex items-start gap-2.5">
-        <span className="mt-0.5 shrink-0 rounded bg-muted/80 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+        <span className="mt-0.5 shrink-0 rounded-sm bg-muted/80 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
           Q{index}
         </span>
-        {/* min-w-0：flex item 防长 inline code 撑破容器；字级略高于选项 */}
-        <div className="min-w-0 flex-1 text-[13px] leading-relaxed text-foreground">
+        {/* min-w-0：flex item 防长 inline code 撑破容器；问题走默认档、选项 12px 压一档 */}
+        <div className="min-w-0 flex-1 text-sm leading-relaxed text-foreground">
           <MarkdownText text={question.question} />
         </div>
       </div>
@@ -193,7 +205,7 @@ const AskQuestionItem = ({
               >
                 <span
                   className={cn(
-                    "shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] leading-none",
+                    "shrink-0 rounded-sm px-1.5 py-0.5 font-mono text-[11px] leading-none",
                     selected
                       ? "bg-primary text-primary-foreground"
                       : "bg-muted text-muted-foreground",
@@ -219,64 +231,18 @@ const AskQuestionItem = ({
         </div>
       )}
 
-      {/* 自定义回答区：图附件整体收在这里——只有自定义回答能带图（用户拍板） */}
+      {/* 自定义回答区：跟输入条同款富输入（`/` skill、`@` 引文件、贴图 / 拖拽）——
+          只有自定义回答能带图（用户拍板）；固定高度 3 行、不把事件流顶走 */}
       {inCustomMode && (
-        <div
-          className={cn(
-            "flex flex-col gap-2 rounded-md pl-8 transition-colors",
-            isDragging && "bg-primary/5 p-1 ring-1 ring-primary/30 ring-inset",
-          )}
-          onDragOver={onDragOver}
-          onDragLeave={onDragLeave}
-          onDrop={onDrop}
-        >
-          <Textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onPaste={onPaste}
+        <div className="pl-8">
+          <RichInput
+            {...rich.bind}
+            onSubmit={onSubmitAll}
             placeholder="输入你的回答…"
-            rows={3}
-            className="resize-none bg-background text-sm"
             disabled={submitting}
+            boxHeight={ASK_INPUT_HEIGHT}
+            className="bg-background"
           />
-
-          {images.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              {images.map((img, i) => (
-                <ImageThumb
-                  key={img.id}
-                  src={img.dataUrl}
-                  alt={img.file.name}
-                  onRemove={() => removeImage(img.id)}
-                  group={images.map((im) => ({
-                    src: im.dataUrl,
-                    alt: im.file.name,
-                  }))}
-                  index={i}
-                />
-              ))}
-            </div>
-          )}
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
-            multiple
-            className="hidden"
-            onChange={onFileInputChange}
-          />
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={triggerFilePicker}
-            disabled={submitting}
-            className="h-7 gap-1 self-start px-2 text-xs text-muted-foreground"
-            title="给本题附图（也支持粘贴 / 拖拽）"
-          >
-            <Paperclip className="size-3.5" />
-            {images.length > 0 ? `本题附图 ${images.length}/${maxImages}` : "附图"}
-          </Button>
         </div>
       )}
     </div>
@@ -297,6 +263,11 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
 
   const askId = typeof ev.meta?.askId === "string" ? ev.meta.askId : null;
   const questions = useMemo(() => extractAskQuestions(ev.meta), [ev.meta]);
+  // 答题框的 `@` 引文件上下文；inputHistory 留空——答题不该翻「说过的话」
+  const composerSession = useMemo(
+    () => ({ taskId: task.id, repoPaths: task.repoPaths, inputHistory: [] }),
+    [task.id, task.repoPaths],
+  );
 
   // 每题草稿答案（含图）、子组件上报、按 question.id 索引
   const [drafts, setDrafts] = useState<Record<string, AnswerDraft>>({});
@@ -366,6 +337,8 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       const imgs = drafts[q.id]?.images;
       if (imgs && imgs.length > 0) imagesByQuestion[q.id] = imgs;
     }
+    // 各题 `/` 引用的 skill 合并去重（一次 ask-reply 只发一条消息、指引拼一份就够）
+    const skillRefs = mergeSkillRefs(questions.map((q) => drafts[q.id]));
     setSubmitting(true);
     // 超时解锁时 abort 在飞请求，避免迟到响应与用户重试撞成重复回答
     const ac = new AbortController();
@@ -379,6 +352,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
     try {
       const askResult = await submitAskReply(task.id, askId, answers, {
         imagesByQuestion,
+        skills: skillRefs.length > 0 ? skillRefs : undefined,
         signal: ac.signal,
       });
       // send 后落盘失败——不可忽略提示
@@ -451,15 +425,17 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
 
   return (
     <div
-      // amber 强调（2026-07-20 用户实测：中性灰不够醒目、看不出「等你答题」）——
-      // 与「AI 在等你回答」浮标同色系、一眼锁定
-      className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/[0.06] p-3.5"
+      // 品牌琥珀强调（2026-07-20 用户实测：中性灰不够醒目、看不出「等你答题」）——
+      // 与「AI 在等你回答」浮标、侧栏琥珀点同属「等你行动」信号族、一眼锁定
+      className="flex flex-col gap-3 rounded-lg border border-brand/40 bg-brand/[0.06] p-3.5"
       onKeyDown={(e) => {
-        // 容器级提交快捷键（事件冒泡覆盖 textarea）：
-        // - mod-enter（默认）：任意焦点都可提交
-        // - enter：只在 textarea 内裸 Enter 提交（焦点在选项按钮时裸 Enter 不误提交整表）
-        const inTextarea = (e.target as HTMLElement).tagName === "TEXTAREA";
-        if (submitShortcut === "enter" && !inTextarea) return;
+        // 容器级提交快捷键，只管「焦点不在答题框里」的情况（选项按钮 / 卡片本身）：
+        // - 焦点在答题框内 → RichInput 内部已按偏好判定并回调 onSubmit，这里必须让开、否则双提交
+        // - enter 模式：卡片上裸 Enter 不提交（焦点在选项按钮时会误提交整表）
+        const inEditor = !!(e.target as HTMLElement).closest(
+          '[contenteditable="true"]',
+        );
+        if (inEditor || submitShortcut === "enter") return;
         if (shouldSubmitOnKeyDown(e, submitShortcut)) {
           e.preventDefault();
           void handleSubmit();
@@ -467,7 +443,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
       }}
     >
       <div className="flex items-center gap-2">
-        <Sparkles className="size-3.5 shrink-0 text-amber-500" />
+        <Sparkles className="size-3.5 shrink-0 text-brand" />
         <span className="text-xs font-medium text-foreground">
           AI 想跟你确认 {questions.length} 个问题
         </span>
@@ -481,23 +457,28 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
         </div>
       ) : (
         <>
-          <div className="flex flex-col">
-            {questions.map((q, qIdx) => (
-              <div
-                key={`${askId}:${q.id}`}
-                className={cn(
-                  qIdx > 0 && "mt-3 border-t border-border/50 pt-3",
-                )}
-              >
-                <AskQuestionItem
-                  question={q}
-                  index={qIdx + 1}
-                  submitting={submitting}
-                  onChange={handleDraftChange}
-                />
-              </div>
-            ))}
-          </div>
+          {/* 答题框的 `@` 引文件要 task 上下文；答题不套 ↑ 历史（历史是「说过的话」、跟本题无关） */}
+          <ComposerSessionProvider value={composerSession}>
+            <div className="flex flex-col">
+              {questions.map((q, qIdx) => (
+                <div
+                  key={`${askId}:${q.id}`}
+                  className={cn(
+                    qIdx > 0 && "mt-3 border-t border-border/50 pt-3",
+                  )}
+                >
+                  <AskQuestionItem
+                    question={q}
+                    taskId={task.id}
+                    index={qIdx + 1}
+                    submitting={submitting}
+                    onChange={handleDraftChange}
+                    onSubmitAll={() => void handleSubmit()}
+                  />
+                </div>
+              ))}
+            </div>
+          </ComposerSessionProvider>
 
           <div className="flex items-center justify-between gap-2 border-t border-border/50 pt-2.5 text-xs text-muted-foreground">
             <span className="shrink-0 tabular-nums">

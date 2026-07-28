@@ -217,7 +217,11 @@ export const ModelSelect = ({
             // 视觉对齐 shadcn SelectTrigger（src/components/ui/select.tsx）
             className={cn(
               "flex h-9 items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
-              variant === "compact" ? "h-7 max-w-52 text-xs" : "w-full",
+              // compact 行内用法必须能被压缩：模型名 nowrap（truncate 自带）、flex item
+              // 默认 min-width:auto = 内容宽 → 窗口变窄时 trigger 死顶着整串模型名不缩、
+              // 溢出父容器压到 footer 右侧图标上（用户实测重叠）。父级 min-w-0 救不了它、
+              // 得自己放开下限，里面的 label 才会真的 truncate 出省略号。
+              variant === "compact" ? "h-7 min-w-0 max-w-52 text-xs" : "w-full",
             )}
           >
             <span

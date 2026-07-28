@@ -43,6 +43,7 @@ import {
 import { failpoint } from "@/lib/server/failpoints";
 import { abortRunningCheck, cancelTaskRun } from "@/lib/server/task-runner";
 import {
+  cancelRestrictedQuestions,
   hasResourceJobs,
   isTaskStarting,
   joinResourceJobs,
@@ -51,6 +52,7 @@ import {
   publishTaskStreamEvent,
   revokeResourceJobs,
   revokeTaskOps,
+  waitForRestrictedQuestionsToStop,
   waitForTaskToStop,
 } from "@/lib/server/task-stream";
 import { cancelChatRun, waitForChatToStop } from "@/lib/server/chat-runner";
@@ -63,6 +65,7 @@ import {
   isChatRewindInProgress,
 } from "@/lib/server/chat-gate";
 import { cleanupChatTaskState } from "@/lib/server/chat-pending";
+import { isValidReqId } from "@/lib/req-id";
 import { clearActionSideEffects } from "@/lib/server/action-side-effects";
 import {
   cleanupCheckpointRefsFromManifest,
@@ -205,6 +208,8 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
       // V0.6.6：编辑任务字段（详情页编辑弹窗、可一次传多个）
       title?: string;
       feishuStoryUrl?: string | null;
+      // wk 需求编号（手填、传 null / 空串 = 清空回退派生值）
+      reqId?: string | null;
       repoFeatureBranches?: Record<string, string> | null;
       // V0.6.28：中途追加仓库（只增不删）+ 新仓的 per-repo 快照（前端从 settings 取好传来）
       addRepoPaths?: string[];
@@ -302,6 +307,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
     const editKeys = [
       "title",
       "feishuStoryUrl",
+      "reqId",
       "repoFeatureBranches",
       "addRepoPaths",
     ] as const;
@@ -311,6 +317,21 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
           { error: "title 必须是字符串" },
           { status: 400 },
         );
+      }
+      // 空串 = 清空（回退派生值）；非空必须是合法字面，早报错比默默丢弃好排查
+      if ("reqId" in body && body.reqId != null) {
+        if (typeof body.reqId !== "string") {
+          return NextResponse.json(
+            { error: "reqId 必须是字符串或 null" },
+            { status: 400 },
+          );
+        }
+        if (body.reqId.trim() && !isValidReqId(body.reqId)) {
+          return NextResponse.json(
+            { error: "需求编号只能用字母数字与 . _ -、且以字母数字开头" },
+            { status: 400 },
+          );
+        }
       }
       if (
         "addRepoPaths" in body &&
@@ -347,6 +368,7 @@ export const PATCH = async (req: Request, { params }: Ctx) => {
             ? { titleAutoPending: false }
             : {}),
           feishuStoryUrl: body.feishuStoryUrl,
+          reqId: body.reqId,
           repoFeatureBranches: body.repoFeatureBranches,
           addRepoPaths: body.addRepoPaths,
           addRepoBaseBranches: body.addRepoBaseBranches,
@@ -470,6 +492,9 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 顺序很重要：删了文件 agent 还在跑会写不到 events.jsonl 报错
     // chat task 的 run 在 chat-runner 的 runningChats、cancelTaskRun 停不到、两个都试（同 stop route）
     if (!cancelTaskRun(id)) cancelChatRun(id);
+    // 旁路的受限群答疑不在 runningTasks / runningChats 里（刻意解耦）——
+    // 删任务要删目录，它必须一起叫停，否则会往被删掉的 cwd 里继续跑
+    cancelRestrictedQuestions(id);
     // 删任务清队也走唯一终态 sink——已 202 的排队消息发 queue_failed（deleted）、
     // 前端按 itemId 清占位（原裸 clearChatQueue 会留幽灵 pending）
     failQueuedItems(id, { reason: "deleted" });
@@ -486,6 +511,8 @@ export const DELETE = async (_req: Request, { params }: Ctx) => {
     // 「第一次删失败、点进任务内容已被清空、再删一次才成功」。没活 run 时秒过。
     await waitForTaskToStop(id, 8000);
     await waitForChatToStop(id, 8000);
+    // 旁路答疑同理（它不在上面两张表里）——不等它退出就 rm 会边写边删撞车
+    await waitForRestrictedQuestionsToStop(id, 8000);
     // waitFor* 只等可见 record；Agent.create 飞行中无 record 会秒过——
     // 先 revokeResourceJobs，再 join starting + resourceJobs。
     // resourceJobs 超时 → quarantine，目录删除延迟到 job 归零（不再开闸硬删）。

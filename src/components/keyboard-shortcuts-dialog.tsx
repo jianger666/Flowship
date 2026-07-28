@@ -35,6 +35,7 @@ export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
     { label: "新建对话", keys: ["Cmd/Ctrl+N"] },
     { label: "切换侧栏", keys: ["Cmd/Ctrl+B"] },
     { label: "聚焦输入框（任务页）", keys: ["Cmd/Ctrl+J"] },
+    { label: "回到最新（事件流）", keys: ["Cmd/Ctrl+End"] },
     { label: "发送消息", keys: [submitKey] },
     { label: "运行中：排队发送", keys: [submitKey] },
     { label: "清空输入框", keys: ["Esc", "Esc"] },

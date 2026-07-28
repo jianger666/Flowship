@@ -144,7 +144,7 @@ export const pruneToolOutputsDir = async (taskId: string): Promise<void> => {
   }
 };
 
-export type ToolResultStatus = "success" | "error";
+export type ToolResultStatus = "success" | "error" | "interrupted";
 
 export type ToolResultMeta = {
   callId: string;

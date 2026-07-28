@@ -15,6 +15,91 @@
 
 ---
 
+### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
+
+> HANDOFF「最近演进」有精简版（干了什么 + 口径 + 欠账）。本段是过程档案：双模型交叉 review 的逐条结论、
+> 哪些成立哪些被证伪、以及为什么这么修。
+
+#### 做了什么
+
+- **门禁执行**（`wk-gate.ts`）：九个 `wk:*` 指令壳（共享库 `skills/common/wk-<x>/` 派生的 team action）在 Flowship 里跑时，由流程节点强制调官方脚本——推进前 `wk-context-init.py` + `doc-quality-gate.py --command`（非 0 硬拦）、收尾 `--stage`（并进 `postCheck`）、过了才 `wk-delivery-sync.py`。指令映射表（scope / 要不要带 biz-path / repo-path）在 `wk-command.ts`、对齐官方 `gates/runner.py` 的 `COMMANDS` / `COMMAND_SCOPE`。
+- **配置接入**（`wk-config.ts` + 设置页「团队 wk 流程」节）：文档仓路径 + 交付中心地址 + 两个开关写回 `~/.wk/config.yaml`，**键级合并**保住同事手写的键与注释；交付中心可达性探针挑了 `GET /internal/harness/artifact-state`（官方接口里唯一「GET + 无副作用 + 免鉴权」的那个）。
+- **REQ-ID 可编辑**：新建表单预填链接派生值、详情页编辑弹窗也能改；门禁按「文档仓有没有 `requirements/<REQ-ID>` 目录」决定跑不跑，填错了只会跳过、不会炸。
+
+#### 双模型交叉 review（两份报告合并去重）
+
+- **被证伪的一条 P0（脚本路径）**：报告怀疑 `wkScriptsDir()` 指错、该用 `knowledge/scripts/`。实地查真实镜像后确认**代码是对的**——七个门禁脚本在 `knowledge/skills/global/wk-harness/scripts/`，`knowledge/scripts/` 放的是知识库维护脚本（`kb_refresh.sh` / `pull_*_repos.sh`）。要改的是文档：`team-library.ts` 头注释与 HANDOFF 的目录树把两者写反了，本批订正（这也是「grep 没命中 ≠ 现象不存在」的反向版：报告读着注释就下了结论）。
+- **P0-1 团队库版本差异，每次推进刷假告警**（另一份报告说「`wk-context-init.py` 根本不存在」，实测是版本差异：正式实例的旧镜像没有、测试实例 07-27 同步后有）。链路：脚本不在盘 → python 退 2 → `runWkScript` 判 `failed` → `formatWkGateFailure` 拿到的输出既没有 `FAIL:` 也没有 `- ` 明细、落到「原样当明细」兜底分支 → **每次 wk 推进都往事件流写一条**「wk 上下文初始化未完成 + Python: can't open file …」，verdict 被拉成 warn，「通过时不写事件」的设计当场失效。修法两层：① `planWkGate` 对 `wk-context-init.py` 跟 `doc-quality-gate.py` 一样做 `fileExists` 探测，缺了**整步静默跳过**（对老版本团队库这是正常缺席、不是异常，所以连 warn 都不打）；② `runWkScript` 补兜底——`exitCode === 2 && /can't open file/` 归成 `unavailable` 且带 `reason: "no-script"`，避免同类问题再以「门禁失败」的面目出现。注意 `no-python` 与 `no-script` 必须分开：前者短路（第二个脚本必然也起不来）、后者不能短路（doc-quality-gate 多半还在），文案也不一样。
+- **P0-2 编辑任务改飞书链接会把旧 REQ-ID 误锁成手填值**：弹窗打开时 `setReqId(resolveReqId(t))` 显示的是**旧链接**的派生值，改链接时草稿不跟随，保存时却用「当前草稿 ≠ 新链接派生值」判手填 → 用户只改了链接没动编号，`REQ-<旧 story>` 被当成显式 `reqId` 落盘、此后永远压过新链接（门禁跟着指到一个不存在的目录）。修法：判定收敛成 `req-id.ts` 的 `reqIdPatchValue`（新建表单与编辑弹窗共用），入参带 `touched`——「库里本来就有手填值」或「用户在本次编辑里动过输入框」才算手填；弹窗补一条 follow effect，未手改时跟着链接重算（与新建表单同款）。
+- **测试基建的教训**：`tests/wk-gate.test.ts` 把 `node:child_process` 整个 mock 成「无脑成功」、只断言「参数里出现了脚本名」，所以脚本在不在盘上一条用例都拦不住。改成 **mock 认真实文件系统**：脚本不存在就照抄真 python 的形态（退 2 + stderr `can't open file`）。新断言逐条先对旧实现跑过、确认会红才算数——旧实现下这批红成 `expected 'warn' to be 'pass'` / `expected [{ kind: 'info' }] to deeply equal []` / `expected 'blocked' to be 'warn'`，正好是线上那三个症状。
+- **P1 五条**：① 后置门禁最坏 60s（阶段门禁 20s + 交付同步 40s 串行）挂在 action 从 running 翻 awaiting_ack 的必经路径上、与「绝不阻塞主流程」冲突 → 本地 fs 校验类压到 10s、交付同步压到 20s（脚本自身 `--timeout 15s`），最坏 30s；再往下就得把交付同步改成不阻塞状态翻转（记账在 HANDOFF 欠账）。② 降级提示写的是 info、而事件流把普通 info 压成一行居中 truncate 灰字，「去设置页配」「去能力页同步」这类行动指引根本看不见 → 门禁的 info 带 `meta.notice`、走默认展开的可见形态（复用 `awaitingAck` 那条既有分流）。③ 错误卡正文缺 `whitespace-pre-wrap`，门禁的多行明细被压成一团；同时推进失败的 toast 把整段塞进去又臭又长 → 卡片保留换行、toast 只留首行 +「详情见事件流」。④ `no-req-dir` 把「首次跑 `wk:biz-analyze`、目录本来就还没建」和「编号填错了」用同一句话说，还诱导用户去改编号 → 按 command 分文案。⑤ 半截 hub 配置（同事手写 `require_*: true` 却没 `base_url`）在设置页显示为「开着且 disabled」，用户没有任何办法关掉它，而官方 baseline 脚本遇到这种配置直接 FAIL 挡死 `wk:*` → 改成「没地址时只禁开、不禁关」，关一下就会走 PUT 的归一把这三个键从文件里清掉。
+- **P1 另两条**：交付中心地址格式非法时只设了 probe 状态、草稿不回滚（留着非法草稿的话，之后拨开关会把「当前草稿 + 这次改的字段」整份存下去）→ 跟文档仓那条对齐：toast 报错 + 草稿退回落盘真值。文档记账（本条）。
+- **P2 顺手清掉**：新建任务 API 对非法 REQ-ID 静默丢弃、编辑 API 却返 400 → 统一 400（一边报错一边静默的话，用户只在其中一个入口能发现自己填错）；`formatWkGateFailure` 加可选「下一步」行（结论与明细都是脚本打的英文，硬拦语境补一句中文指引）；`evaluateWkAdvanceGate` 的外层 catch 会把 skip 提示连同写事件的异常一起吞掉 → 写事件统一走带自己 try 的 `notify`。
+- **P2 记账不做**：后置门禁降级时 `postCheck.passed` 仍为 true，而 postCheck 详情只在 `passed=false` 时渲染 → 用户看不到「这次门禁其实没跑」。要修得给 postCheck 加 warn 态（不只是布尔）+ UI 加黄条，超出本轮修复范围。
+- **门禁**：typecheck / lint 0 warning / vitest 全绿。
+
+### 2026-07-27 需求群协作 + 受限答疑协议 + 输入体系重构（v1.6.0）
+
+> 跨多轮多子代理的一整批。HANDOFF「当前架构快照」有稳定形态描述（需求群协作 / 受限答疑旁路）、
+> 「最近演进」有精简版；群协作的完整设计与实测数据见 `docs/feishu-group-collab.md`。
+> 本段是过程档案：怎么一步步收敛到那个形态的。
+
+#### 需求群协作（一～五期一口气交付）
+
+- **产品**（用户拍板四点全做、loop 模式一口气交付）：前后端测试各自的 Flowship 任务关联同一飞书项目工作项——任意角色一键把产物 / 疑问分享到「需求群」；首个分享者触发建群（幂等、meegle `group_type` bind 绑定工作项），后来者直发；群里 @ 机器人提问回灌任务、ask 答题卡发群跨角色作答、属主本人群内「推进」、action 完成自动播报。
+- **权限边界（lark-cli bot 实测）**：bot 建群 ✓、建群时带人（≤50）/ bot（≤5）✓、bot 发消息 ✓；事后拉人 / 拉 bot、me_join、用户身份发消息、解散群全部缺 scope 不可用（公司不给审批）——方案完全建立在免审能力上。每人各自的飞书自建 app（bot 事件只到属主本机、@ 谁的 bot 路由到谁）。
+- **接入形态：自动注册表 + 首次手动引导兜底**（手工 `members.json` 那版已删、改成零操作自动登记）：建群时按**工作项角色成员邮箱**去团队库共享的注册表反查 open_id / bot app_id，一次把人和他们各自的 bot 都带进群。邮箱是 meegle 与本机唯一同源的键——user_key / lark_user_id / union_id 都换不出自建 app 可用的 open_id（换算实测表见设计文档）。注册用户零操作：用到群协作时后台把「本机 email + open_id + bot app_id」写进团队库**数据分支 `members`** 的 `group-members.json`（幂等、静默失败、走 git plumbing 绝不动主克隆 HEAD）。⚠️ **运维前提：`members` 分支不能开保护**——main 受保护、developer 直推被拒，注册会永远失败（失败即静默退回「只拉发起人本人」的老行为）。没命中的同事首次分享 → 409 `bot_not_in_group` → `BotAddGuideDialog`（机器人**准确名** + 复制 + 三步指引 + 「已添加，重试发送」原样重发）。
+- **落地主链**：`feishu-group.ts`（ensureRequirementGroup 幂等建群 + bind、双建收敛、卡片带「来自 XX」署名）+ `POST /api/tasks/[id]/share-to-group`（结构化错误 code、409 botLabel 透传）+ MCP `share_to_group` + UI 两入口（产物面板确认 dialog / 正文选中段直发）+ bridge 群消息分支（三层 @ 过滤、群 ↔ 任务反查 10min 正缓存 / 60s 负缓存）+ `task-question-inject`（question 路由 400 行状态机抽薄壳、群 / p2p / UI 复用）+ ask-inject 扩任务模式 + `settings.groupCollab` + 播报挂 action 完成唯一收口。
+- **用户实测修复批**：① 分享第二次点击必挂「field validation failed」——根因 `listChatBotAppIds` 用了非法 `member_id_type=app_id` 且接口缺 scope，「事前检测 bot 在群」免审权限下不可行 → 整段删掉、改**事后判定**（发送失败按 230002 一族错误码映射 `bot_not_in_group`）；② 群内「推进」不带名默认顺推直接开跑改代码——用户拍板「每个人的 action 和顺序都不一样、必须能选」→ 改回 **action 选择卡**（数据源 = 推进弹窗同款、server 复算 `advance-options.ts`；pickId 占坑防同卡重复点击），「推进 <名字>」直推保留并扩到自定义 label / skill 名模糊匹配。
+
+#### 七轮双模型交叉 review（同一族问题的五次投影 → 三次协议级收敛）
+
+- **第一轮（fable-5、0 P0 / 3 P1 / 9 P2）**：群回复登记改 token 条件恢复（对齐 conditional-unset 铁律）；拍安全侧——**非属主群消息强制 question-only**；flush / 播报共享防重表（先占再发关死双卡窗口）、跨链答题同步摘走单投、autoBroadcast 只发已有群（不隐式建群）。
+- **第二轮（P0×2 + P1×12）**：**P0-A 「只答疑」曾是假的**——`restrictToQuestion` 只剪了 ackContext 与 resume，有活会话时消息直接 `agent.send` 进属主全权限 agent → 改成一律不复用活会话；同族第二处：**chat 型任务没有受限通道 → 非属主普通文本直接拒**。**P0-B task 事件流把运行中的工具全渲染成「已中断」**（详情页漏传 `isRunning` → `runActive` 恒 false）→ 补传 + 改必填 prop + 源码契约测试盯住所有调用点。P1 十二条含：群昵称统一 `sanitizeGroupMemberName`（防伪造「任务所有者」抬头）、bind 抛错不再丢已建的群、群答题卡校验点击来源 chat、bot 身份不可用时设置页出红灯、skill 上限收进 `MAX_SKILL_REFS` 单一源、group-outbound 开关加 8s 缓存、播报给 ensure-share 加 `allowCreate:false` 治 TOCTOU、finalize 只扫事件流尾窗。
+- **第三轮（P0×2 + P1×5，两份报告指向同一处：上一轮的修复没闭环）**：**P0-1 一次性答疑 agent 在活会话在场时静默让位 = 假 running + 消息黑洞**（交卷后会话是刻意保留的，而那恰是产物刚播报进群、同事最可能回话的窗口）；**P0-2 「受限答疑」agent 实际能改代码**（V0.13.x 把一次性 agent 放开成「小改动直接动手」，群非属主复用同一入口）。这两条催生了下一轮的架构级收敛。
+- **第四轮（P0×3）→ 架构级收敛①：受限答疑与 task 运行状态机解耦**（三条 P0 同一根因——把「群里非属主的一句话」当成了这个 task 的一次 action run）：新增 `restricted-question.ts`，**不写 runStatus / 不占 runningTasks / 不进 agentSessions / 不动 action**；顶栏停止键那条核弹路径由此自然波及不到（`isStopButtonVisible` 抽成单一源）；收口收敛成幂等 `settle(ok, errorText?)`；prompt 换 `buildReadonlyUserMessage`（不再复用属主版那段「…修改要求才动手改…」自相矛盾的尾巴）；终态叫停 `cancelRestrictedQuestions` + 群侧串行闸 `hasRestrictedQuestionInFlight` 共用 task-stream 轻量表。
+- **第四轮共识 P1 → 架构级收敛②：回群登记 token 化投递协议**（同族第三次冒头：登记是 task 级单格、没有「在等哪一轮 run」的身份）：登记绑 `runTag`（owner = null 单格 / restricted = 自己的 token、多条并存），攒回答与 flush **只认 `origin === runTag` 的那一路**；事件侧 `event / assistant_delta / done` 三种帧加可选 `origin`（只在 envelope、不落盘），旁路 run **永远**带 origin；新增纯 UI 帧 `restricted_run` 修「旁路工具块被渲染成已中断」。
+- **第五轮（P1×2 + P2×4）→ 收口判据从「turn 结束」改成「action 落终态」**（同族第四次投影）：**P1-A 群内推进遇 `ask_user` → 群里收到假「产物」卡、真产物永久发不进群**（`done` 是 turn 级语义、artifact 还没写就被当成跑完，还顺手占死防重坑）→ advance 登记只在 action 落终态时 take，`running`（含等 ask 答案）原样挂着；终态无 artifact 按**文本**回旁白、绝不冒充产物卡；actionId 未补记时继续等、不退回 `task.currentActionId` 顶包。**P1-B chat 型任务 202 排队仍挂着登记** → 排队即摘、只回受理回执。P2 含：群答题卡点按钮答完也登记回群、旁路在飞的拒信独立文案、`hasGroupAdvanceReplyFor` 去掉 `!e.actionId` 宽判。
+- **第六轮（P1×2）→ 架构级收敛③：推进登记的保活策略成文**（同族第五次投影：前几轮收敛了「谁能收走登记」，但「谁能**清掉**它」还散在几条清理链里）：**P1-1 死墙钟 TTL 会摘掉仍在跑的推进登记**（群里推进 → agent 中途 `ask_user` → 人隔夜才答，这段纯等待期一条事件都没有）→ 改成**租约 + 到期收口协议**（prune 对 advance 只把租约往后推一个巡检间隔、判定推给出向钩子 `reviewExpiredGroupAdvance`）；**P1-2 容量上限的裸 `shift()` 会挤掉在飞的推进** → 只丢非 advance 的最老那条。顺带 advance 收口的「peek → await → take」改按 **token** 摘。清理链口径统一成一张表，写进 `group-shared` 文件头与设计文档。
+- **第七轮（终审）判可交付，列三条不挡交付的小口子 → 本轮清掉**：
+  1. `restoreGroupReply` 是清理链口径表**外**的第四个改表点——放回 `previous` 时有 `Date.now() <= prev.expiresAt` 闸，能丢掉一条租约已过期的在飞 advance。改成 `advance` **无条件放回**（过期交给到期收口协议接手），并把这一行补进口径表（`group-shared` 文件头 + 设计文档两处同款）。
+  2. **advance 覆盖 advance 仍是静默丢**：可达剧本不极端——advance#1 停在 `running` 等 `ask_user` 时 `runStatus` 已是 `awaiting_user`，`checkTaskAdvanceable` 与 `advanceTask` 都放行。顶掉本身是对的（群里要的是最新那轮），补的是回执：`group-route` 在 `advanceTask` **成功之后**给上一轮的发起人 @ 一句「上一轮推进已被新一轮取代…」（启动失败会 `restoreGroupReply` 原样放回、那就没被取代，所以绝不能提前发）；「推进结果回群」关掉时不发，与到期回执同口径。
+  3. **到期回执没看桥接总开关**：钩子由 `hasGroupReplies` 那句同步预筛里的 prune 触发，而预筛排在 `handleGroupOutboundEvent` 的开关判定**之前** → `reviewExpiredGroupAdvance` 自己补一次 `isBridgeEnabledCached()`，判不过什么都不做（登记留着、不静默摘）。
+- **遗留未做**（记账在此、不属于本批小修范围）：App 里答完群答题卡后，群里那张卡不置态（看着仍像待答）——p2p 卡片是同一个毛病（终态 patch 只发生在「从这张卡答」的分支里），要做得改 card-map 的键（`taskId+askId → cardId`）并在 ask 收口点统一 patch 两处卡片。
+
+#### 输入体系重构：四处输入收敛成一套
+
+- **起因**（用户原话）：「推进里的输入框应该和事件流上面的输入框交互保持一致，比如可以 /skill、也能引入文件」+「尽可能地提出公共的东西……chat 和 task 其实可以一样吧」+「答题卡回答框也一并升级」。
+- **三层分层**（单一来源、以后加输入能力只改内核）：`rich-input.tsx` = 输入内核（Lexical + skill/file token + `/` skill 菜单 + `@` 文件菜单 + 图附件 + 目录 picker + 提交快捷键 + Esc Esc 清空 + ↑ 历史、三个 slot 给外壳插东西）／`conversation-composer.tsx` = 会话壳（原 `composer.tsx` 改名：拖柄高度记忆 / 未绑仓提示 / 排队条 / 工作目录行 / 发送键 / 停止键，chat 输入岛与 task 事件流输入条本就共用这一层、差异走 props）／`use-rich-input.ts` = 状态层（草稿 + slash + 图 + 路径附件 + 聚焦句柄 + `payload()` 四件套 + `reset()` + `bind`）。
+- **四处接入**：event-stream（chat 输入岛）/ task-talk-composer（跟 AI 说）→ 会话壳；advance-dialog（推进指令、固定 4 行高）/ ask-user-inline（答题卡每题回答框、固定 3 行高）→ 只用内核。
+- **后端贯通 `/skill`**（`@文件` 本就以原文内联进正文）：advance 链路 `POST /advance` 收 `skills` → `parseAndValidateSkills` → `AdvanceTaskInput.skillRefs` → `buildSkillDirective` → 拼进 `[NEXT_ACTION]` 载荷（续接 / 新 agent 两条路径都覆盖），**不进 `action.userInstruction`**（否则每条 action 历史都重复一段指引）；ask-reply 链路事件气泡仍存用户原答案、送 agent 的是 `skillDirective + replyText`（送达 / 唤醒 / 僵尸兜底三条路径同口径）。
+- 顺带：`buildInputHistory` 挪到 `lib/composer-history.ts` + 新增 `buildActionInstructionHistory`（推进弹窗 ↑ 翻历次 action 指令）；`useSlashSkills` 加 `consumePending` 开关（同页第二个输入框不许抢跨页 pending skill handoff）；`view-memory` 草稿 scope 收成 `DraftScope` 联合类型。
+
+#### 其它
+
+- **团队库源仓迁移**：`wukong/wk-knowledgebase` → `wukong/wk-harness-platform`（旧路径 404）、默认分支走 `git ls-remote --symref` 探测（当前 `release/1.0`、**不是 main**，探不到才回退配置值）；`MIRROR_EXCLUDED_TOP_DIRS` 加 `harness-delivery-hub/`（交付平台服务端项目、1.2M / 176 文件 / 0 个 skill）；**`knowledge/` 整棵豁免敏感扫描**——机器镜像不是用户手写内容，高熵规则对 py 标识符 / XML 属性值 / 文档示例 URL 满屏误报会把镜像永久卡死，扫描只保留在真正的风险面（用户上传自管 skill）。
+- **UI 修理**：事件流工具态（运行中的工具不再被 `coerceStaleRunningTools` 判成「已中断」）、停止键可见性单一源、滚动条布局抖动全局治理（`scrollbar-gutter: stable` 挂 `.overflow-y-auto` / `.overflow-auto` 工具类、新增滚动容器自动带治理）、选区浮动按钮抽公共件（`ui/selection-float.tsx`：产物「分享到群」与事件流「引用」共用一份定位 / 样式 / 防塌陷）。
+- **门禁**：typecheck / lint 0 warning / vitest 全绿；并发与协议类新断言**逐条先对旧实现跑过、确认会红**才算数。用例总数以本地 / CI 实跑为准——不在文档里写死数字（写死必漂移）。
+
+### 2026-07-24 日常任务 + 能力页分组 + 公司环境配置（company-env）（随 v1.5.0 发）
+
+- **日常任务轻量模式**（源起用户「排查类 action 不对应任何飞书需求」）：新建表单顶部「需求任务 / 日常任务」二选 chip（看板预填入口不显示、恒需求）；日常任务 = 无 storyUrl——**不建 worktree 不建/切分支**（`resolveTaskIsolateWorktree` 强制原仓模式）、标题选填（`buildDefaultDailyTaskTitle`「日常 · 仓短名 · MM-DD HH:mm」）、列表/详情「日常」Badge、推进弹窗只显自定义组（wk/内置流程强依赖需求号进不来 = 风险源头消失）、prompt 注入轻量态声明（改文件可以、commit/push/建分支先问用户）；需求任务链接恢复必填（显式二分后无模糊态）。
+- **能力页 action 分组**：列表按组分区（通用 / 团队 · wk 流程按 order / 自定义），嵌套 Reorder——组头拖拽换整组序 + 组内行拖拽照旧；组头「默认折叠」Switch（推进弹窗里生效）；拖组时全组瞬时收起（200ms 过渡曾致换位判定拿漂移坐标、「第一下拖不过去」——收起瞬时/恢复平滑/换位 150ms 三段不对称处理）；推进弹窗组头精致化（组语义图标 Zap/Users/Sparkles + 数量 badge + chevron 旋转 + grid-rows 高度动画）。
+- **公司环境配置（company-env）全套**（源起把后端同事排查方法论做成共享 action、其工具 WuyaFlow 的数据源模型）：`settings.companyEnv`（服务器/PG/日志路径模板/XXL-Job/Nacos/ELK/HTTP API）——设置页「连接」尾部折叠小节表单（收起态状态摘要、PasswordInput 小眼睛、逐条列表替代 textarea）+ 导入/导出/预览模板（json 发同事一键导入）；**SDK local 无 env 透传** → 每次 Agent.create 前原子写 `<dataRoot>/company-env.json`（0600、`writePrivateFileAtomic`）、skill 脚本从固定路径读、密码不进 prompt/对话；**环境能力常驻声明**（`buildCompanyEnvBrief`、chat+task 注入「已配置哪些子系统、怎么用、禁止打印密码」）；HTTP API 认证三选（无/固定 Header/登录换 token）+ 自由 note（给 AI 的用法说明）；PG/XXL/Nacos「只读」Switch（默认开、声明里带 SELECT-only 等软约束）。
+- **排查 skill 上共享库**：`skills/backend/service-trace-debug`（action-hub cacaee8）——同事五段式排查方法论（场景词宽搜代码→日志三段式 ls/宽搜/精读→只读查库→规则与时间线对齐→结构化输出、强制区分 Bug vs 按设计）+ 反模式清单 + 凭据铁律（禁 cat company-env.json、脚本进程内读、PGPASSWORD 进程内传）+ `read-log.sh`/`query-db.sh` 封装（零内置兜底、全部从配置读）。
+- **修理**：上传/导入等 6 处「label 包 Checkbox 点行无效」收敛为 `CheckboxRow` 公共组件（base-ui checkbox 非原生 input、label 联动不生效——CDP 实测定位）；共享市场**增量新 skill 默认不装**（首次接入全装保留、`isFirstInit` 拆分）；团队库上传/镜像**敏感信息扫描闸**（五类模式、占位符豁免、命中阻断 + force 出口、snippet 脱敏）；导入失败必弹提示；feishu-bridge 两条 flaky 根治（测试隔离 + mock 真网、确认非生产去重窗口）。
+- 记录：用户同事自建了同类工具 WuyaFlow（Windows、数据源模型可借鉴：stageKeywords 阶段默认指令、grill-me 高压澄清 skill）。
+
+### 2026-07-23 自动更新体验重构（状态机 + 页面进度 + 端口占用/重复点击回归修复、随 v1.4.1 发）
+
+- **背景（用户手机反馈三连）**：mac 点「新版本」没下载进度条、再点必弹「自动更新失败」、每次升级重启必弹「端口被占用」。排查结论：全是 `45eb485`（mac 延迟替换）回归——下载前移到发现新版时后台暂存（点徽标时已无下载可看、进度本来也只画在 Dock）、`installUpdateNow`/`applyStagedUpdate` 无安装互斥（二次点击吃空已被 rename 消费的暂存必炸）、「立即更新」走 `app.relaunch()+app.exit(0)` 而 **`app.exit` 不触发 `before-quit`**（唯一杀 server 的钩子被绕过 → 旧 server 孤儿占 8876 → 新实例必弹端口占用）。
+- **主进程更新状态机**（`main.js` `updateState`：idle/available/downloading/ready/installing + percent/error、win/mac 统一语义）：`webContents.send("update-state")` 实时推 + `get-update-state` IPC 全量拉、替代旧 executeJavaScript 注入 `__appUpdateVersion`（时序竞态、带不了进度）。mac dmg 下载循环按整数百分点节流推进度；staging single-flight wrapper 统一置 ready / 失败回 available（installInFlight 持锁中跳过 ready、防闪帧）。
+- **端口占用修复**：`applyStagedUpdate` relaunch 分支 exit 前 `await stopServer()`；win `before-quit` 改同步 `execFileSync taskkill /T /F`（连进程树、5s timeout 兜底）——`kill("SIGKILL")` 只杀单进程、SDK agent 孙进程留着继续占端口。
+- **重复点击修复**：`installUpdateNow` 加 `installInFlight` 互斥、UpdateBadge downloading/installing 态 disabled；win `promptWinInstall` 抽出（「稍后」后再点徽标直接重弹确认、不重复下载）+ 自身单飞（downloadUpdate resolve 后锁已释放、弹窗还开着时二次进入会叠双弹窗）。
+- **win 静默安装**：`quitAndInstall(true, true)`（`oneClick:false` 下不传 isSilent 会弹完整 NSIS 向导、与 electron-builder.yml「自更新走 /S」注释不符的存量 bug）；**不在 quitAndInstall 前杀 server**（蓝军 P0：`install()` 失败不退出时 app 变没后端的僵尸）、靠 before-quit 树杀；`error` 事件 installing 态回滚 quitting=false + phase→ready。
+- **前端**：`update-badge.tsx` 纯状态驱动（「新版本 vX / 下载中 x% / 重启更新 vX / 更新中…」、ready 与 available 分文案 confirm）、先订阅 onState 再 getState（防旧快照倒退进度）；preload `__appUpdater` 桥扩展 install/getState/onState（install 替代 `app-update://` 伪协议、will-navigate 拦截保留兜底）；`window.__appUpdater`/`__appVersion` 全局类型收敛到 `src/lib/app-updater.ts`。手动「检查更新」mac 打包环境也触发后台暂存（对齐轮询）。
+- 蓝军 review 两轮 + 终审「可合入」：一轮 1 P0（win 提前杀 server）+ 4 P1；二轮 4 P1（改盘/停服顺序、win installing 短路、quitting 回滚守卫、installing 期 staging 门闩）+ 验收揪出「旧 server 迟到 exit 误杀新 server」竞态 → `startServer` 世代守卫（exit/error handler `serverProc !== proc` 时只记日志）+ `stopServer` SIGKILL 后短等 1s 回收、`applyStagedUpdate` 失败恢复按 `hadRunningServer` 拉回 server。轮询/手动检查在 downloading/installing 中不打断状态机（下载 A 时发布 B 下轮自愈）。门禁 typecheck / lint / 1413 测试全绿。**win 真机未验**（mac 开发机）——发版后需 win 同事验证：静默安装不弹向导、升级重启无端口弹窗、任务栏+徽标进度。
+
 ### 2026-07-23 首包可靠性 + REQ-ID 无感注入 + 收尾修理批（随 v1.4.0 发）
 
 > 详细内容见当日 HANDOFF 快照（迁移时保留原文于 git 历史 a0f0dc6）；要点：sdk-deadline 超时保护（create/resume 180s、send 120s、late 收尸）、假死 run 主动中止（instanceId CAS）、「session 关闭只能由当前持有者执行」协议收敛、发送后进度 info、依赖拷贝不挡首包（skipDepClone/deferDepClone）、REQ-ID 派生注入（story 号优先/REQ-TASK 兜底）、共享库 wk 壳 order 流程序 + placeholder 精简、事件流本地图片 rehype 改写、完整输出 callId 换行修复、ask_user 提问即收尾、停止键下移合并、SDK 1.0.24。

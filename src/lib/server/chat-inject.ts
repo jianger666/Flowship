@@ -75,6 +75,7 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { checkUpdatePendingRestart } from "@/lib/server/update-pending";
+import { beginAskSkip, type AskSkipHandle } from "@/lib/server/ask-skip";
 import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
@@ -119,7 +120,7 @@ export interface ChatInjectOptions {
 
 const MAX_IMAGES_PER_REPLY = 6;
 const MAX_ATTACHMENTS_PER_REPLY = 10;
-const MAX_SKILLS_PER_REPLY = 8;
+// skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
 // 切模型懒重启：cancel 旧 Run 后等它真退的上限（对齐 task-runner force-new 的 5s）、超时强清继续
 const CHAT_RESTART_STOP_TIMEOUT_MS = 5000;
 
@@ -127,11 +128,28 @@ const CHAT_RESTART_STOP_TIMEOUT_MS = 5000;
 /**
  * 注入一条 chat 用户消息。返回值形态与原 chat-reply HTTP 响应一致（便于 route 原样透传）。
  * `userReplyMetaExtra` 供桥接写入 meta.source / feishuMessageId 等标记。
+ *
+ * 外层只做一件事：**消息没送出去就把「跳过提问」的认领放回**。本函数有几十个
+ * 4xx / 5xx 出口，逐个补回滚必漏；commit 幂等，已提交时 rollback 自动 no-op。
  */
 export const handleChatReplyInject = async (
   id: string,
   body: unknown,
   options: ChatInjectOptions = {},
+): Promise<Response> => {
+  const skipRef: { handle: AskSkipHandle | null } = { handle: null };
+  try {
+    return await runChatReplyInject(id, body, options, skipRef);
+  } finally {
+    skipRef.handle?.rollback();
+  }
+};
+
+const runChatReplyInject = async (
+  id: string,
+  body: unknown,
+  options: ChatInjectOptions,
+  skipRef: { handle: AskSkipHandle | null },
 ): Promise<Response> => {
   const parsed = (body ?? {}) as ChatInjectBody;
 
@@ -154,7 +172,7 @@ export const handleChatReplyInject = async (
   const attachmentAbsPaths = attachResult.paths;
 
   // skill 引用：指引只拼进 agent 消息、事件气泡存用户原文
-  const skillsResult = parseAndValidateSkills(parsed.skills, MAX_SKILLS_PER_REPLY);
+  const skillsResult = parseAndValidateSkills(parsed.skills);
   if (!skillsResult.ok) return skillsResult.errorResponse;
   const skills = skillsResult.skills;
 
@@ -299,9 +317,15 @@ export const handleChatReplyInject = async (
     text.length === 0 && (imageAbsPaths || attachmentAbsPaths.length > 0)
       ? "(用户附了图片 / 文件)"
       : "";
-  // 事件 = 用户原文；agent = skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
+  // agent 提问后用户不答、直接发新消息 = **隐式跳过**那组提问（chat 侧原来一个字都没处理：
+  // 答题卡和顶部「AI 在等你回答」悬浮条会一直挂着）。认领同步、赶在下面所有 await 之前——
+  // 它是与「答题」互斥的那一步（谁先摘到 pendingAsk 谁说了算，见 ask-skip 文件头）
+  const askSkip = beginAskSkip(task);
+  if (askSkip.claimed) skipRef.handle = askSkip;
+
+  // 事件 = 用户原文；agent = 跳过上下文 + skill 指引 + 原文（与 ATTACHED_* 一样不进气泡）
   // （URL 自动抓取投喂做过又撤了——2026-07-21 用户实测收益不大问题多、链接交给 agent 自己解析）
-  const agentText = buildSkillDirective(skills) + text;
+  const agentText = askSkip.hint + buildSkillDirective(skills) + text;
 
   // Phase 3：绑定 workdir 的 chat 在 agent 开工前打 git tree 快照（失败不挡发消息）
   const tryCaptureCheckpoint = async (): Promise<CaptureCheckpointResult> => {
@@ -415,6 +439,9 @@ export const handleChatReplyInject = async (
     lastEnqueuedItemId = queued.itemId;
     // 入队成功 → transfer 给 queue（finally 不再 release）
     opHandle?.transfer();
+    // 入队 = 202 受理，这条消息（连同开头那句跳过上下文）一定会 flush 给 agent →
+    // 落跳过标记。真 handoff 在稍后的 flush 里、这里是 chat 侧唯一能拿到的受理点
+    await askSkip.commit();
     // 幂等命中（已 active）→ 直接同语义 202，不再挂 afterEnqueue
     if (!queued.alreadyAccepted) {
       // 测试可在入队后、202 返回前挂起（模拟 getTask/网络慢于 stop 终态）
@@ -529,6 +556,8 @@ export const handleChatReplyInject = async (
         );
         if (sent === "sent") {
           sentOk = true;
+          // agent 已接管这条消息 → 那组没答的提问就此跳过（作废事件 + 飞书卡片终态）
+          await askSkip.commit();
           // send===sent 即 handedOff（agent 已接管）；落盘失败仍算已送达
           if (clientItemId) {
             settleMessageHandedOff(task.id, clientItemId);
@@ -956,6 +985,8 @@ export const handleChatReplyInject = async (
     // starting 占位已挂 → transfer 给 runner；HTTP 返 persisted 202
     opHandle?.transfer();
     agentStarted = true;
+    // 新会话已带着这条消息（含跳过上下文）起来了 → 落跳过标记
+    await askSkip.commit();
 
     const fresh = await getTask(task.id);
     const phase =

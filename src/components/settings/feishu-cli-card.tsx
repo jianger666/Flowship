@@ -233,13 +233,13 @@ export const FeishuCliSection = ({
             <Badge variant="secondary">{tool.version ? `v${tool.version}` : "已安装"}</Badge>
             {tool.loggedIn ? (
               <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                <CheckCircle2 className="size-3.5 text-green-500" />
+                <CheckCircle2 className="size-3.5 text-success" />
                 已登录{tool.authDetail ? `：${tool.authDetail}` : ""}
               </span>
             ) : (
               <>
                 <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                  <XCircle className="size-3.5 text-amber-500" />
+                  <XCircle className="size-3.5 text-warning" />
                   未登录
                 </span>
                 <Button

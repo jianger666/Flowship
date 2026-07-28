@@ -1,17 +1,31 @@
 /**
  * createRunPerfTracker 纯逻辑单测：假 InteractionUpdate 序列 + 拦截 console.log。
  * 锁住「记哪些事件 / 不记 delta / wall 合理 / MCP 工具名归一」——防埋点回归静默失效。
+ *
+ * turn-ended 现在会火忘地把用量写进 meta.json（persistTurnUsage）——数据根指向临时目录，
+ * 别让单测碰到仓库里的 data/。落盘链本身在 tests/turn-usage-persist.test.ts 测。
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
-import { createRunPerfTracker } from "@/lib/server/run-perf";
 import type { InteractionUpdate } from "@cursor/sdk";
+
+const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), "fe-run-perf-"));
+process.env.FLOWSHIP_DATA_DIR = path.join(TMP_ROOT, "data");
+
+const { createRunPerfTracker } = await import("@/lib/server/run-perf");
 
 const logs: string[] = [];
 
 afterEach(() => {
   logs.length = 0;
   vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  rmSync(TMP_ROOT, { recursive: true, force: true });
 });
 
 const captureLogs = () => {

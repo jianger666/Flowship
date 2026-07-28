@@ -191,7 +191,7 @@ export const McpCard = ({
                         disabled={busy === name}
                         title="已授权、点击撤销"
                       >
-                        <ShieldCheck className="text-emerald-500" />
+                        <ShieldCheck className="text-success" />
                         已授权
                       </Button>
                     ) : (
@@ -209,7 +209,7 @@ export const McpCard = ({
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground"
+                    className="h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground"
                     onClick={() => setEditing({ name })}
                   >
                     编辑
@@ -217,7 +217,7 @@ export const McpCard = ({
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-destructive"
+                    className="h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-destructive"
                     onClick={() => void handleDelete(name)}
                   >
                     删除
@@ -277,7 +277,7 @@ export const McpCard = ({
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <span className="size-2 shrink-0 rounded-full bg-red-500" />
+              <span className="size-2 shrink-0 rounded-full bg-destructive" />
               <span className="truncate font-mono">{logHealth?.name}</span>
               <span className="text-muted-foreground">连接失败</span>
             </DialogTitle>
@@ -541,7 +541,7 @@ const ImportCursorDialog = ({
                   {name}
                 </span>
                 {appServers[name] && (
-                  <Badge variant="outline" className="shrink-0 text-[10px]">
+                  <Badge variant="outline" size="xs">
                     已存在、导入将覆盖
                   </Badge>
                 )}

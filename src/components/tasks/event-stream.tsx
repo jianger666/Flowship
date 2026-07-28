@@ -19,26 +19,40 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
-import { Loader2, Sparkles as SparklesIcon } from "lucide-react";
+import {
+  ArrowDown as ArrowDownIcon,
+  Loader2,
+  Sparkles as SparklesIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
-import { Composer, type ComposerFocusHandle } from "@/components/composer";
+import { Button } from "@/components/ui/button";
+import { ConversationComposer } from "@/components/conversation-composer";
 import {
-  useSlashSkills,
   resolveSkillReferences,
   fetchSkills,
 } from "@/components/slash-skills";
-import { useImageAttach } from "@/hooks/use-image-attach";
-import { usePathAttach } from "@/hooks/use-path-attach";
+import { useRichInput } from "@/hooks/use-rich-input";
 import { useSubmitShortcut } from "@/hooks/use-settings";
-import { findPendingAskEvent } from "@/lib/ask-pending";
+import {
+  StreamFollowContext,
+  useIsFollowing,
+  useStreamFollow,
+  type StreamFollowController,
+} from "@/hooks/use-stream-follow";
+import { findPendingAskEvent, isAskSkipMarkerEvent } from "@/lib/ask-pending";
+import { isModCombo } from "@/lib/keyboard-shortcuts";
+import {
+  FOLLOW_PIN_THRESHOLD,
+  countNewItems,
+  nextNewItemsBaseline,
+} from "@/lib/scroll-follow";
 import { getSubmitShortcutHint } from "@/lib/submit-shortcut";
 import { fetchEarlierEvents, type ImagePayload } from "@/lib/task-store";
 import {
   getScrollAnchor,
   loadDraft,
-  saveDraft,
   saveScrollAnchor,
 } from "@/lib/view-memory";
 import type { Task, TaskEvent } from "@/lib/types";
@@ -49,6 +63,7 @@ import {
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import {
+  coerceStaleRunningTools,
   isToolBlock,
   isToolVerbGroup,
   mergeToolDisplayEvents,
@@ -306,9 +321,13 @@ interface Props {
   composerLeading?: ReactNode;
   // chat 模式 textarea 上方一行 slot（注入工作目录 + 分支选择器、跟底部 model 分两处放）
   composerTop?: ReactNode;
-  // V0.7.21：chat 运行态——agent 正在生成时、底部操作行把发送键换成红色停止键 + loading 转圈
-  // （取代顶栏旧的「AI 正在回 + 停止」、统一收进输入岛、靠原地替换不顶布局）
-  isRunning?: boolean;
+  // agent 正在跑。两个用途：
+  // 1) chat 运行态——底部操作行把发送键换成红色停止键 + loading 转圈（V0.7.21）
+  // 2) **工具块是否还该转圈**——false 时 coerceStaleRunningTools 把未闭合的 tool_call
+  //    改判「已中断」（治历史脏数据）
+  // **必填**：曾漏传（task 详情页）→ 恒 false → 跑 action 时长 shell / subagent 全被
+  // 渲染成灰色「已中断」。别改回可选。
+  isRunning: boolean;
   onStop?: () => void;
   stopping?: boolean;
   // V0.7.11：渲染形态
@@ -363,15 +382,105 @@ const EarlierLoadingHeader = ({ context }: { context?: StreamListContext }) =>
 
 const VIRTUOSO_COMPONENTS = { Header: EarlierLoadingHeader };
 
+/**
+ * 视口外预渲染余量（Virtuoso overscan）：快速往下滚时视口外没有备好的 item 会
+ * 先露白再补齐、观感就是「抖」。
+ *
+ * ⚠️ **top 必须留 0**：`rangeChanged` 报的是「已渲染范围」不是「可见范围」，
+ * 顶部余量会把 startIndex 往前推——sticky 轮次头会晚出现一屏、滚动位置记忆的
+ * 锚点也会记成上面几条，两个既有契约都会漂。底部余量不影响 startIndex，可以放心加。
+ */
+const VIEWPORT_OVERSCAN = { top: 0, bottom: 400 };
+
+/**
+ * 事件流底部悬浮层：「回到最新」按钮 +「AI 在等你回答」提示条。
+ *
+ * **为什么合成一颗**（而不是两个各自定位的组件）：
+ * 两条的显示条件都含「用户滚离底部」，琥珀条只是多要一个未答提问——
+ * 也就是「琥珀条出现 ⟹ 回底按钮一定也在」。共存位置必须由同一处拍板，
+ * 各定各的迟早在窄面板（task 模式右栏）里叠上。这里的分工是
+ * **回底按钮蹲右下角（贴着输入区、市面统一位置）、琥珀条居中悬在它上一排**，
+ * 横向纵向都错开、宽度再窄也不会压。
+ *
+ * 另外只订阅一次跟随态：贴底翻转只重渲这一颗，主组件不参与
+ * （滚动热路径上重渲整条事件流本身就是抖动源）。
+ */
+const StreamFloatingBar = ({
+  follow,
+  contentCount,
+  hasPendingAsk,
+  onJumpToAsk,
+  onBackToBottom,
+}: {
+  follow: StreamFollowController;
+  /** 当前内容条数（工作过程组已摊开）——算「离开底部后又追加了几条」的基准 */
+  contentCount: number;
+  hasPendingAsk: boolean;
+  onJumpToAsk: () => void;
+  onBackToBottom: () => void;
+}) => {
+  const following = useIsFollowing(follow);
+  // 离开底部那一刻的条数基线。用 ref 不用 state：它是从 props 推出来的缓存、
+  // 自己不该触发重渲；推进函数幂等，渲染期写安全（StrictMode 双渲同结果）
+  const baselineRef = useRef(contentCount);
+  baselineRef.current = nextNewItemsBaseline(
+    baselineRef.current,
+    contentCount,
+    following,
+  );
+  // 贴底跟随中 = 最新内容就在眼前，两条都不用出
+  if (following) return null;
+  const newCount = countNewItems(baselineRef.current, contentCount);
+
+  return (
+    <>
+      {hasPendingAsk && (
+        <button
+          type="button"
+          onClick={onJumpToAsk}
+          className="absolute bottom-14 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-brand/50 bg-brand/15 px-3 py-1.5 text-xs font-medium text-brand shadow-md backdrop-blur transition-colors hover:bg-brand/25"
+        >
+          <SparklesIcon className="size-3.5 animate-pulse" />
+          AI 在等你回答、点击查看
+        </button>
+      )}
+      {/* 有新内容时摊成带计数的胶囊、没有就是个纯圆钮；两态同高（h-9）、不跳 */}
+      <Button
+        variant="outline"
+        size={newCount > 0 ? "lg" : "icon-lg"}
+        onClick={onBackToBottom}
+        title="回到最新"
+        // 无新内容时只有一个箭头图标、没有可读文本，读屏得靠它
+        aria-label="回到最新"
+        className={cn(
+          "absolute bottom-3 right-3 z-10 rounded-full bg-background/90 text-xs shadow-md backdrop-blur",
+          newCount > 0 && "px-3.5",
+        )}
+      >
+        <ArrowDownIcon />
+        {newCount > 0 && (
+          // 长 action 能刷出四位数、胶囊会被撑得离谱——封顶显示
+          <span className="tabular-nums">
+            {newCount > 99 ? "99+" : newCount} 条新内容
+          </span>
+        )}
+      </Button>
+    </>
+  );
+};
+
 /** chat 渲染管线：与 items / loadEarlier prepend 共用同一过滤，避免 firstItemIndex 与可视条数不一致
- *  boot stage info 也在这滤掉（F 批次）——它们只以末尾渐进单行呈现、历史回看无价值 */
+ *  boot stage info 也在这滤掉（F 批次）——它们只以末尾渐进单行呈现、历史回看无价值
+ *  「用户跳过提问」的作废标记两种形态都滤——那句话由 ask 行的折叠态承载，别同话说两遍 */
 const eventsForStreamRender = (
   events: TaskEvent[],
   isChat: boolean,
-): TaskEvent[] =>
-  isChat
-    ? events.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
-    : events;
+): TaskEvent[] => {
+  const base = events.filter((e) => !isAskSkipMarkerEvent(e));
+  return isChat
+    ? base.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
+    : base;
+};
 
 /**
  * 共用纯管线：过滤 → thinking 合并 → tool 配对 → 工作过程分组。
@@ -383,10 +492,18 @@ const eventsForStreamRender = (
 const buildStreamItems = (
   events: TaskEvent[],
   isChat: boolean,
+  /**
+   * false = 会话已非 running → 把仍挂转圈的工具块改成「已中断」（治历史脏数据）。
+   * **无默认值**：默认成 true / false 都会在某条调用路径上悄悄判错（漏传 isRunning
+   * 那次就是恒 false、跑着的工具全成「已中断」）——强制每个调用点自己说清楚。
+   */
+  runActive: boolean,
 ): Array<StreamRenderItem | WorkGroupItem> => {
   const src = eventsForStreamRender(events, isChat);
   const merged = mergeToolDisplayEvents(mergeAdjacentThinking(src));
-  return groupChatRenderItems(merged);
+  // 仅非 running 时 coerce——running 中的真·进行中工具保持转圈
+  const tools = runActive ? merged : coerceStaleRunningTools(merged);
+  return groupChatRenderItems(tools);
 };
 
 const EventStreamImpl = ({
@@ -411,25 +528,48 @@ const EventStreamImpl = ({
   allowQueueWhileRunning,
 }: Props) => {
   const isChat = variant === "chat";
-  // 输入草稿、发送后清空；按 task 记进 sessionStorage（v1.1.x、打半段切页不丢）
-  const [draft, setDraft] = useState(() => loadDraft("reply", task.id));
-  // 文件 / 目录路径附件（原生 picker、跟 task「跟 AI 说」条共用 hook）
-  const pathAttach = usePathAttach();
+
+  // 输入框可用 = 父组件传 canReply（没传回退 awaiting_user）；提前算、下面 useRichInput 要用
+  const canCompose = canReply ?? task.runStatus === "awaiting_user";
+  // 自动聚焦判定：跟 canCompose 同款（chat 下 agent 答完 → canCompose true → focus）
+  const isAwaitingUser = canCompose;
+  // 可输入 = 轮到用户说话、或运行中但允许排队（chat）
+  const composeEnabled =
+    isAwaitingUser || !!(isRunning && allowQueueWhileRunning);
+
+  // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、
+  // 跟 task「跟 AI 说」条 / 推进弹窗 / 答题卡同一份实现（见 hooks/use-rich-input.ts）
+  const rich = useRichInput({
+    taskId: task.id,
+    draft: { scope: "reply", id: task.id },
+    // 不可输入时附件 handler 短路；chat 排队时 running 仍可附图
+    disabled: !composeEnabled,
+  });
+  const setDraft = rich.setValue;
+  const inputRef = rich.focusRef;
+
   // 个人偏好的提交快捷键（placeholder 提示用；提交判定在 Composer 内部）
   const submitShortcutHint = getSubmitShortcutHint(useSubmitShortcut());
-  // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方 streaming 自动滚 effect）
+  // Virtuoso 句柄：流式增长时手动 scrollToIndex 贴底（见下方跟随 effect）
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
-  // 用户当前是否贴在底部（由 Virtuoso atBottomStateChange 维护）。
-  // 初始 true：进来 initialTopMostItemIndex 定位到末尾、就是贴底态。
-  // 关键作用：流式回复时只有「用户本来就在底部」才自动跟随、用户主动往上翻看历史就不打扰。
-  const atBottomRef = useRef(true);
-  // 贴底状态的 state 版（V0.13.x「AI 在等你回答」悬浮条显隐用——ref 不触发渲染）
-  const [atBottomState, setAtBottomState] = useState(true);
+  // 贴底动作：index:"LAST" 比 items.length-1 稳（分页 firstItemIndex 下不用管索引空间）；
+  // behavior 恒 "auto"——流式期间用 smooth 会跟下一次滚动互相打断（见 followOutput 注释）
+  const scrollToBottom = useCallback(() => {
+    virtuosoRef.current?.scrollToIndex({
+      index: "LAST",
+      align: "end",
+      behavior: "auto",
+    });
+  }, []);
+  // 跟随控制器（2026-07-28）：唯一的「现在该不该自动贴底」判定源。
+  // 老实现靠 Virtuoso 的 atBottomThreshold=120 兼职这件事——用户上滚 50px 仍算贴底、
+  // 下一个 chunk 就把他拽回去 = 用户实测的「一滚就抖」。现在改成听用户手势意图。
+  const follow = useStreamFollow(scrollToBottom);
   // 初始滚动定位闸（v1.1.x 滚动位置记忆）：首次有 items 时算一次——有「非贴底离开」的
   // 锚点就恢复到那条、否则默认落底；null = 还没算（切 task 时重开）
   const initialTopRef = useRef<number | null>(null);
-  // 输入框：用于「awaiting_user 时自动聚焦」、避免用户每次都得手动点输入框
-  const inputRef = useRef<ComposerFocusHandle | null>(null);
+  // rangeChanged 去重：同一个 startIndex 重复回调直接短路（Virtuoso 重渲会重发同 range）
+  const lastRangeStartRef = useRef<number | null>(null);
 
   // 启动进度渐进单行的「最小停留」缓冲（2026-07-20 用户实测：MCP/建会话两阶段
   // 太快、一闪而过像丢了——每个阶段至少停 BOOT_STAGE_MIN_MS、按序补播；
@@ -448,24 +588,39 @@ const EventStreamImpl = ({
     [task.events],
   );
 
-  // 渲染前：buildStreamItems（滤噪声 → thinking → tool → chat 分组）→
-  // 再追加 pending / streaming / loading / boot 虚拟项（不参与分组）
+  // 渲染管线拆三层（2026-07-28 性能修）。**层次不能合并**：
+  // 老实现把 streamingText 放进同一个 useMemo 的 deps，于是每来一个 chunk 都重跑
+  // 一遍 buildStreamItems，产出的 ToolBlock / WorkGroupItem 全是新对象身份 →
+  // memo(ToolBlockRow) / memo(WorkGroupRow) 集体失效 → 整个可视工具子树每 chunk
+  // 重渲一次。事件一多就掉帧，正好在「流式吐字时去滚动」的场景下最明显。
+  //
+  // 第一层：只吃真实事件（滤噪声 → thinking 合并 → tool 配对 → 工作过程分组）。
+  // isRunning=false 时 coerce 脏 running 工具 →「已中断」（chat / task 共用）
+  const baseItems = useMemo(
+    () => buildStreamItems(task.events, isChat, isRunning),
+    [task.events, isChat, isRunning],
+  );
+
+  // 第二层：未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的
+  // 漏网），渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）。
+  // 不原地 splice：baseItems 是 memo 结果、改它会污染下一次复用。
+  const orderedItems = useMemo(() => {
+    if (!pendingAskEvent) return baseItems;
+    const askIdx = baseItems.findIndex(
+      (it) => it.kind === "ask_user_request" && it.id === pendingAskEvent.id,
+    );
+    if (askIdx < 0 || askIdx === baseItems.length - 1) return baseItems;
+    const next = [...baseItems];
+    const [askItem] = next.splice(askIdx, 1);
+    next.push(askItem!);
+    return next;
+  }, [baseItems, pendingAskEvent]);
+
+  // 第三层：追加 pending / streaming / loading / boot 虚拟项（不参与分组）。
+  // 只有这层跟着 chunk 变、而它产出的新身份只有末尾那一两个虚拟项。
   const items: RenderItem[] = useMemo(() => {
-    const merged = buildStreamItems(task.events, isChat);
-    // 未答的答题卡固定挪到流末尾——AI 提问后若又输出了正文（prompt 约束外的漏网），
-    // 渲染层兜底保证答题卡不被顶走（纯显示排序、数据不动、2026-07-23 用户实测痛点）
-    if (pendingAskEvent) {
-      const askIdx = merged.findIndex(
-        (it) => it.kind === "ask_user_request" && it.id === pendingAskEvent.id,
-      );
-      if (askIdx >= 0 && askIdx < merged.length - 1) {
-        const [askItem] = merged.splice(askIdx, 1);
-        merged.push(askItem);
-      }
-    }
-    // ⚠️ 本 useMemo 依赖 pendingAskEvent（上方置底逻辑）——deps 里必须带上
     const withPending: RenderItem[] = [
-      ...merged,
+      ...orderedItems,
       ...(pendingLocalReplies ?? []).map(
         (p): PendingLocalItem => ({
           kind: "__pending_local__",
@@ -517,29 +672,79 @@ const EventStreamImpl = ({
       return [...withPending, { kind: "__loading__", id: "__loading__" }];
     }
     return withPending;
-  }, [task.events, streamingText, isRunning, isChat, pendingLocalReplies, displayedBoot, pendingAskEvent]);
+  }, [
+    orderedItems,
+    streamingText,
+    isRunning,
+    isChat,
+    pendingLocalReplies,
+    displayedBoot,
+  ]);
 
-  // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）
+  // 「N 条新内容」的计量单位（回到最新按钮）：工作过程组按**成员**摊开算。
+  //
+  // 直接用 items.length 会在最需要它的场景下失灵——一个 build action 打出的几十上百个
+  // 工具块是连续过程项，groupChatRenderItems 全收进同一个工作过程组，items.length
+  // 一动不动；于是用户翻在历史里、agent 忙了十分钟，按钮上还挂着「0」。
+  //
+  // 挂 orderedItems 不挂 items：虚拟项（streaming / loading）跟着 chunk 变，
+  // 让计数每秒重算几十次不值当；流式那段落成 assistant_message 事件时自然计进来。
+  const contentCount = useMemo(
+    () =>
+      orderedItems.reduce(
+        (n, it) => n + (it.kind === "__work_group__" ? it.members.length : 1),
+        0,
+      ),
+    [orderedItems],
+  );
+
+  // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）。
+  // 挂 orderedItems 不挂 items——虚拟项里没有工作过程组，跟着 chunk 重算纯属浪费
   const lastGroupId = useMemo(() => {
-    for (let i = items.length - 1; i >= 0; i--) {
-      const it = items[i]!;
+    for (let i = orderedItems.length - 1; i >= 0; i--) {
+      const it = orderedItems[i]!;
       // 用 kind 判别收窄（RenderItem 比 ChatRenderItem 宽，不能直接调 isWorkGroup）
       if (it.kind === "__work_group__") return it.id;
     }
     return null;
-  }, [items]);
+  }, [orderedItems]);
+
+  // 粘性状态行的输入切片：只保留「最近一条 user_reply 起」的本轮事件。
+  //
+  // 为什么要切（2026-07-28 性能修）：deriveActiveStatus 的第一步是 O(全部事件) 地收
+  // doneCallIds，而下面那个 memo 的依赖里有 liveToolOutputs——shell 直播每来一个
+  // delta 就是一个新对象引用，memo 必然重算。跑 `pnpm build` 这种每秒几十行输出的
+  // 命令、events 又攒到几千条时，主线程就在持续重扫全量事件。
+  //
+  // 为什么切了等价：deriveActiveStatus 从尾部回扫、**撞到 user_reply 必定收尾**
+  //（「正在启动…」那条分支），所以它根本走不到最近一条 user_reply 之前；而 tool_result
+  // 永远晚于自己的 tool_call，切片里的 tool_call 要配的 result 也一定在切片内，
+  // doneCallIds 因此不会漏。结论：同样的答案，扫描量从「全量」降到「本轮」。
+  // 没有 user_reply（刚建的 chat）时退回全量，那会儿本来也没几条。
+  const statusEvents = useMemo(() => {
+    if (!isChat) return task.events;
+    for (let i = task.events.length - 1; i >= 0; i--) {
+      if (task.events[i]!.kind === "user_reply") return task.events.slice(i);
+    }
+    return task.events;
+  }, [isChat, task.events]);
 
   // 运行中粘性状态行（Batch C）：仅 chat + running；有 streamingText 时 label「正在回复…」正常
   const activeStatus = useMemo(
     () =>
       isChat && isRunning
-        ? deriveActiveStatus(task.events, liveToolOutputs)
+        ? deriveActiveStatus(statusEvents, liveToolOutputs)
         : null,
-    [isChat, isRunning, task.events, liveToolOutputs],
+    [isChat, isRunning, statusEvents, liveToolOutputs],
   );
 
-  // 轮次分割判定用的 kind 序列（与 items 对齐；shouldShowTurnDivider 纯函数吃它）
-  const itemKinds = useMemo(() => items.map((it) => it.kind), [items]);
+  // 轮次分割判定用的 kind 序列。挂 orderedItems 不挂 items：虚拟项一律追加在尾部、
+  // 且都不是 user_reply，越界读回 undefined、shouldShowTurnDivider 自然返回 false，
+  // 语义等价但少一次每 chunk 的全量 map
+  const itemKinds = useMemo(
+    () => orderedItems.map((it) => it.kind),
+    [orderedItems],
+  );
 
   // E1 sticky 轮次头：当前轮的用户消息句（滚出视口上沿后粘顶、点击回滚到该轮头部）。
   // Virtuoso 无逐组 sticky API——用 rangeChanged + 绝对定位 overlay。
@@ -595,15 +800,20 @@ const EventStreamImpl = ({
     setFirstItemIndex(FIRST_INDEX_BASE);
     setHasMoreEarlier(false);
     setLoadingEarlier(false);
+    // 切 task 换载对应草稿（hook 的初值只在 mount 时读一次、详情页内导航不重挂）
     setDraft(loadDraft("reply", task.id));
+    // 重开初始定位闸；跟随态**不在这里**改——它跟初始定位是同一个决定，
+    // 统一由下面的渲染期 latch 出（effect 跑在渲染之后，在这里置 true 会把
+    // 同一帧刚按锚点恢复出来的「非贴底」冲掉）
     initialTopRef.current = null;
+    lastRangeStartRef.current = null;
     stickyTurnIdRef.current = null;
     // 切 task：命令式藏 sticky（不走 setState；root 可能尚未挂上、下帧再清也行）
     const root = stickyRootRef.current;
     if (root) root.classList.add("hidden");
     const textEl = stickyTextRef.current;
     if (textEl) textEl.textContent = "";
-  }, [task.id]);
+  }, [task.id, setDraft]);
   // eventsTruncated 就绪（refresh / SSE bootstrap 都可能晚于 mount）时同步分页开关（升降都跟）；
   // 已经拉过页就不再被它改（本地分页状态才是准的）
   useEffect(() => {
@@ -635,8 +845,12 @@ const EventStreamImpl = ({
       if (fresh.length > 0) {
         // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
         // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
-        const beforeLen = buildStreamItems(cur, isChat).length;
-        const afterLen = buildStreamItems([...fresh, ...cur], isChat).length;
+        const beforeLen = buildStreamItems(cur, isChat, isRunning).length;
+        const afterLen = buildStreamItems(
+          [...fresh, ...cur],
+          isChat,
+          isRunning,
+        ).length;
         onPrependEvents(fresh);
         setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
       }
@@ -652,55 +866,96 @@ const EventStreamImpl = ({
     }
   };
 
-  // v1.1.x 滚动位置记忆：首次有 items 时把初始定位算进闸（渲染期 latch、只写一次）。
-  // 锚点是「离开时视口顶部的事件 id」；贴底离开 / 锚点不在当前尾页（懒加载没包含）→ 落底
+  // v1.1.x 滚动位置记忆：首次有 items 时把初始定位算进闸（渲染期 latch、每个 task 只写一次）。
+  // 锚点是「离开时视口顶部的事件 id」；贴底离开 / 锚点不在当前尾页（懒加载没包含）→ 落底。
+  // 初始跟随态跟初始定位是同一个决定，一并在这里出：恢复到历史位置 = 非贴底态、
+  // 流式自动跟随不要立刻把人拽回底部。控制器的通知走微任务，渲染期写它不会触发
+  // React 的跨组件更新告警。
   if (initialTopRef.current === null && items.length > 0) {
     let idx = items.length - 1;
+    let startFollowing = true;
     const saved = getScrollAnchor(task.id);
     if (saved && !saved.atBottom) {
       const found = items.findIndex((it) => it.id === saved.anchorId);
       if (found >= 0) {
         idx = found;
-        // 恢复到历史位置 = 非贴底态、流式自动跟随不要立刻把人拽回底部
-        atBottomRef.current = false;
+        startFollowing = false;
       }
     }
+    follow.setFollowing(startFollowing);
     initialTopRef.current = idx;
   }
 
-  // 流式回复自动贴底（V0.8.3 修）：
-  // 根因——流式回复是往同一个 `__streaming__` 虚拟 item 的 text 里追加、items 长度不变（始终
-  // merged.length + 1）。react-virtuoso 的 followOutput 只在 data 条数变化时触发滚动、对「最后一项
-  // 内容增高」无感、所以流式增长期间不会自动滚（用户实测：滚到底聊天、AI 回复过程不跟随）。
-  // 修法——streamingText 每变一次（每个 chunk）、若用户本来贴在底部、就手动把最后一项滚到视口底。
-  // 用 behavior:"auto"（瞬时）避免每个 chunk smooth 动画互相打架卡顿。atBottomRef 由下方
-  // atBottomStateChange 维护、配合 Virtuoso 的 atBottomThreshold（给足余量、防单 chunk 增高把
-  // atBottom 误判成 false 导致自废）。useEffect（非 layout）跑在 Virtuoso 测完新高度之后、scrollToIndex
-  // 才能命中真正的新底部。
+  // 跟随最新（V0.8.3 引入、2026-07-28 收口成唯一入口）：
+  //
+  // 为什么需要它——react-virtuoso 的 followOutput 只在 data **条数**变化时触发滚动，
+  // 对「最后一项内容增高」无感；而流式回复是往同一个 `__streaming__` 虚拟 item 的
+  // text 里追加、条数不变，所以光靠 followOutput 流式期间不会跟随。
+  //
+  // 为什么把条数变化也一起收进来——除了流式追加，还有一堆「不改条数但改高度」的路径
+  // 会让贴底态漂掉：工作过程组 run 结束自动收起、Streamdown 的 Shiki / Mermaid 异步
+  // 渲染完成、图片 / 代码块布局回填。统一在这里 rAF 合批重新贴底、一帧最多滚一次，
+  // 比逐条打补丁稳。控制器内部还会先看「是不是已经贴着了」、贴着就不空跑。
+  //
+  // useEffect（非 layout）跑在 Virtuoso 测完新高度之后、scrollToIndex 才能命中真底部。
   useEffect(() => {
-    if (!streamingText) return;
-    if (!atBottomRef.current) return;
+    if (!follow.isFollowing()) return;
+    follow.requestScrollToBottom();
+  }, [follow, items, streamingText, isRunning]);
+
+  // 跟随态翻转时刷进滚动锚点（切走再切回的恢复依据；锚点 id 由 rangeChanged 维护）。
+  // 订阅式、不引起本组件重渲——老实现是 atBottomStateChange 里 setState、
+  // 一翻转就把整条事件流重渲一遍
+  useEffect(
+    () =>
+      follow.subscribe(() => {
+        const taskId = taskIdRef.current;
+        const saved = getScrollAnchor(taskId);
+        if (saved) {
+          saveScrollAnchor(taskId, {
+            ...saved,
+            atBottom: follow.isFollowing(),
+          });
+        }
+      }),
+    [follow],
+  );
+
+  // 「回到最新」：恢复自动跟随 + 贴底。
+  // **不新开滚动入口**——setFollowing 先把控制器的闸打开，贴底动作仍走它那唯一的
+  // scrollToBottom（rAF 合批 + 已贴底不空跑）。这里若自己再调一次 scrollToIndex，
+  // 就等于把「两套自动滚」的老毛病请回来（源码契约测试也盯着这条）。
+  const backToBottom = useCallback(() => {
+    follow.setFollowing(true);
+    follow.requestScrollToBottom();
+  }, [follow]);
+
+  // Cmd/Ctrl+End 回到最新（对齐 Claude Code 的 scroll:bottom）。
+  // 跟 Cmd+J 一档的局部 listener——绑的是本组件的跟随控制器、不上收 global-shortcuts。
+  // 带修饰键、输入框里按也放行（正在打字时想看最新才是主场景）
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isModCombo(e, "End")) return;
+      e.preventDefault();
+      backToBottom();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [backToBottom]);
+
+  // 悬浮条「点击查看」：滚到未答答题卡。用 ref 读最新 items、回调引用恒定，
+  // 悬浮条子组件不会因为 items 变化而重渲
+  const pendingAskId = pendingAskEvent?.id;
+  const jumpToPendingAsk = useCallback(() => {
+    if (!pendingAskId) return;
+    const idx = itemsRef.current.findIndex((it) => it.id === pendingAskId);
+    if (idx < 0) return;
     virtuosoRef.current?.scrollToIndex({
-      // "LAST"：末尾项——比 items.length-1 稳（firstItemIndex 分页下不用管 index 空间）
-      index: "LAST",
-      align: "end",
-      behavior: "auto",
+      index: idx,
+      align: "center",
+      behavior: "smooth",
     });
-  }, [streamingText, items.length]);
-
-  // V0.6：输入框可用 = 父组件传 canReply
-  // 父组件没传时回退 task.runStatus === "awaiting_user"
-  const canCompose = canReply ?? task.runStatus === "awaiting_user";
-
-  // 输入框自动聚焦判定：跟 canCompose 同款（之前用 isAwaitingUser、现在统一走 canCompose）
-  // - chat 下 agent 答完自然结束回合、status 变 awaiting_user → canCompose 变 true 触发 focus
-  const isAwaitingUser = canCompose;
-
-  // V0.5.4 图附件管理统一走 hook（v1.1.x 起整个对象直传 <Composer>）
-  // disabled 时所有 handler 短路；chat 排队时 running 仍可附图
-  const attach = useImageAttach({
-    disabled: !(isAwaitingUser || (isRunning && !!allowQueueWhileRunning)),
-  });
+  }, [pendingAskId]);
 
   // 自动聚焦：进入「可输入」时把光标放进输入框、用户立刻可以打字
   // - 解决以前的痛点：agent 回完话、用户得鼠标点输入框才能输入
@@ -712,21 +967,8 @@ const EventStreamImpl = ({
       const timer = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(timer);
     }
-  }, [isAwaitingUser]);
-
-  // `/` 唤起 skill：选中后补全成内联 `/name ` token（Codex 风、留在文本流里）
-  const slash = useSlashSkills({
-    draft,
-    applyDraft: (next, cursor) => {
-      // Lexical pick 通常已直接写编辑器；fallback / pending handoff 走这里
-      if (cursor != null) inputRef.current?.prepareCursor(cursor);
-      setDraft(next);
-      saveDraft("reply", task.id, next);
-      requestAnimationFrame(() => {
-        inputRef.current?.focus();
-      });
-    },
-  });
+    // inputRef 是 useRichInput 里的 useRef、引用恒定；进 deps 只为满足 lint
+  }, [isAwaitingUser, inputRef]);
 
   // v1.0：chat「最后一条用户消息」重发 / 原地编辑——把（编辑后的）内容作为新消息发到末尾。
   // 原消息保留（append-only）；重发携带原 meta.images / attachments（批 B 补图）。
@@ -816,14 +1058,10 @@ const EventStreamImpl = ({
         .split("\n")
         .map((line) => `> ${line}`)
         .join("\n");
-      setDraft((prev) => {
-        const next = `${quoted}\n\n${prev}`;
-        saveDraft("reply", task.id, next);
-        return next;
-      });
+      setDraft((prev) => `${quoted}\n\n${prev}`);
       inputRef.current?.focus();
     },
-    [task.id],
+    [setDraft, inputRef],
   );
 
   // 同步飞行锁：防 isSubmitting state 一帧延迟导致连点重复提交
@@ -831,30 +1069,17 @@ const EventStreamImpl = ({
   // 取草稿 → 发送 → 成功清空
   const submitVia = (send: typeof onUserReply) => {
     if (!send || sendingLockRef.current) return;
-    const text = draft.trim();
     // 文本 / 图 / 路径至少有一个、纯空消息不发
-    if (!text && attach.images.length === 0 && pathAttach.paths.length === 0) {
-      return;
-    }
-    const images: ImagePayload[] | undefined = attach.toUploadPayload();
-    const attachments =
-      pathAttach.paths.length > 0 ? pathAttach.paths : undefined;
+    if (!rich.hasContent) return;
     // skill 指引不拼进 text——独立字段传服务端，气泡只显示用户原文
-    const skillRefs =
-      slash.references.length > 0
-        ? slash.references.map((s) => ({ name: s.name, absPath: s.absPath }))
-        : undefined;
+    const { text, images, attachments, skillRefs } = rich.payload();
     sendingLockRef.current = true;
     void (async () => {
       try {
         const result = await send(text, images, attachments, skillRefs);
         // 仅成功（200/202 → true）后清空；prepareRunArgs null / 失败保留草稿+附件
         if (result === false) return;
-        setDraft("");
-        saveDraft("reply", task.id, "");
-        slash.reset();
-        attach.reset();
-        pathAttach.reset();
+        rich.reset();
       } finally {
         sendingLockRef.current = false;
       }
@@ -881,6 +1106,8 @@ const EventStreamImpl = ({
   };
 
   return (
+    // 跟随控制器透给深层子树：工作过程组的「自动折叠」要看用户是不是在翻历史
+    <StreamFollowContext.Provider value={follow}>
     <div className="flex h-full flex-col">
       {/* chat 形态不渲染「事件流」标签条（ChatView 自有顶部 bar、少一层视觉框） */}
       {!isChat && (
@@ -923,23 +1150,17 @@ const EventStreamImpl = ({
             </div>
           </div>
         )}
-        {/* V0.13.x 注意力悬浮条（用户拍板「事件流太弱、怕注意不到」）：
-            有未答提问且用户滚在历史里（不贴底）时、底部悬浮提示、点击滚到答题卡 */}
-        {pendingAskEvent && !atBottomState && (
-          <button
-            type="button"
-            onClick={() => {
-              const idx = items.findIndex((it) => it.id === pendingAskEvent.id);
-              if (idx >= 0) {
-                virtuosoRef.current?.scrollToIndex({ index: idx, align: "center", behavior: "smooth" });
-              }
-            }}
-            className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-amber-500/50 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-600 shadow-md backdrop-blur transition-colors hover:bg-amber-500/25 dark:text-amber-400"
-          >
-            <SparklesIcon className="size-3.5 animate-pulse" />
-            AI 在等你回答、点击查看
-          </button>
-        )}
+        {/* 底部悬浮层：回到最新（带新增条数）+ 未答提问提示条。
+            显隐由子组件自己订阅跟随态，主组件不参与（滚动路径零重渲）。
+            key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来 */}
+        <StreamFloatingBar
+          key={task.id}
+          follow={follow}
+          contentCount={contentCount}
+          hasPendingAsk={!!pendingAskEvent}
+          onJumpToAsk={jumpToPendingAsk}
+          onBackToBottom={backToBottom}
+        />
         {items.length === 0 ? (
           <div
             className={cn(
@@ -952,7 +1173,10 @@ const EventStreamImpl = ({
         ) : (
           <Virtuoso
             ref={virtuosoRef}
-            className="h-full"
+            // overflow-y-auto 不是为了改 overflow（Virtuoso 自己内联了同值），
+            // 是为了吃到 globals.css 挂在该工具类上的 `scrollbar-gutter: stable`——
+            // 否则内容首次超过一屏时滚动条突然占掉 8px、居中列横向跳一下
+            className="h-full overflow-y-auto"
             data={items}
             // v1.0.x 上拉分页三件套：
             // - computeItemKey：item 身份稳定（prepend 后不整列重挂）
@@ -963,22 +1187,20 @@ const EventStreamImpl = ({
             startReached={() => void loadEarlier()}
             context={{ loadingEarlier }}
             components={VIRTUOSO_COMPONENTS}
-            // 贴底跟随语义：用户贴在底部时新 item 来自动滚（smooth）；
-            // 用户主动滚走看历史时不打扰；滚回底部恢复跟随
-            // 这一行替代了老的 stickToBottomRef + handleScroll + autoScroll useEffect、
-            // 库自己维护「是否贴底」、不需要外部 ref 状态
-            followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
-            // 维护「用户是否贴底」给上面的流式自动滚 effect 用。
-            atBottomStateChange={(atBottom) => {
-              atBottomRef.current = atBottom;
-              setAtBottomState(atBottom);
-              // 贴底状态变化也刷进锚点记忆（只更新 atBottom、锚点 id 由 rangeChanged 维护）
-              const saved = getScrollAnchor(task.id);
-              if (saved) saveScrollAnchor(task.id, { ...saved, atBottom });
-            }}
-            // v1.1.x 滚动位置记忆：滚动时持续记「视口顶部第一条事件 id + 是否贴底」、
+            // 滚动容器交给跟随控制器接手势（滚轮 / 触摸 / 键盘 / 拖滚动条）
+            scrollerRef={follow.attachScroller}
+            // 条数变化时的跟随：跟不跟由控制器说了算（Virtuoso 自己的 isAtBottom 只看
+            // 几何、看不出「用户刚往上翻」）。behavior 必须是 "auto"——
+            // 老实现这里用 smooth，跟流式那条瞬时滚同时存在：smooth 动画滚到一半被
+            // 下一次瞬时滚打断，视觉上就是抖。现在两条路径统一走 auto + rAF 合批。
+            followOutput={() => (follow.isFollowing() ? "auto" : false)}
+            // v1.1.x 滚动位置记忆：滚动时持续记「视口顶部第一条事件 id + 是否跟随」、
             // 切走再切回按它恢复（虚拟 item __streaming__/__loading__ 不作锚点）
             rangeChanged={(range) => {
+              // 同 startIndex 重复回调短路：Virtuoso 每次重渲都会重发一遍 range，
+              // 而 sticky 计算 + 锚点写入只在顶项真的换了时才有意义
+              if (lastRangeStartRef.current === range.startIndex) return;
+              lastRangeStartRef.current = range.startIndex;
               const list = itemsRef.current;
               const localIdx = range.startIndex - firstItemIndex;
               // E1 sticky：纯函数算目标 + 命令式 DOM，滚动路径零 setState
@@ -989,13 +1211,17 @@ const EventStreamImpl = ({
               if (!top || top.id.startsWith("__")) return;
               saveScrollAnchor(task.id, {
                 anchorId: top.id,
-                atBottom: atBottomRef.current,
+                atBottom: follow.isFollowing(),
               });
             }}
-            // 贴底判定余量调大（默认仅 4px）：流式时最后一项每来一个 chunk 会增高若干像素、
-            // 余量太小会立刻被判成「离开底部」→ effect 自废不再跟随。120px 覆盖常见 chunk 增量、
-            // 让「滚到底跟随」稳定；用户真往上翻 >120px 才停跟随。
-            atBottomThreshold={120}
+            // 跟 FOLLOW_PIN_THRESHOLD 同一口径：Virtuoso 内部的贴底判定和我们的
+            // 「回到底部就恢复跟随」保持一致，省得两套阈值各判各的。
+            // 注意它已经**不再**兼职「防流式增高误判」——那件事现在由控制器的
+            // 用户意图检测负责，跟距离无关（老实现塞 120px 就是为了兼职、副作用是
+            // 用户小幅上滚被无视、下一个 chunk 又给拽回底部）
+            atBottomThreshold={FOLLOW_PIN_THRESHOLD}
+            // 视口外预渲染余量：快滚时先露白再补齐同样被感知成「抖」
+            increaseViewportBy={VIEWPORT_OVERSCAN}
             // 初始定位：默认末尾（直接看最新事件）；有非贴底离开的锚点则恢复到那条（v1.1.x）
             initialTopMostItemIndex={initialTopRef.current ?? items.length - 1}
             // 每条 item 自带 padding；chat 形态窄列居中 + 按消息类型分配段落间距。
@@ -1033,7 +1259,7 @@ const EventStreamImpl = ({
                       aria-hidden
                     >
                       <div className="h-px w-16 bg-gradient-to-r from-transparent to-border" />
-                      <span className="rounded-full bg-muted/50 px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground/70">
+                      <span className="rounded-full bg-muted/50 px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground/70">
                         {formatTs(item.ts)}
                       </span>
                       <div className="h-px w-16 bg-gradient-to-l from-transparent to-border" />
@@ -1057,7 +1283,7 @@ const EventStreamImpl = ({
                     task={task}
                     variant={variant}
                     liveToolOutputs={liveToolOutputs}
-                    isRunningTail={item.id === lastGroupId && !!isRunning}
+                    isRunningTail={item.id === lastGroupId && isRunning}
                   />
                 ) : isToolBlock(item) ? (
                   <ToolBlockRow
@@ -1103,7 +1329,7 @@ const EventStreamImpl = ({
                     onRewind={isChat ? onRewind : undefined}
                     // 引用追问：可发消息时所有 AI 回复都可引用（不限最后一条）
                     onQuote={isChat && canCompose ? handleQuote : undefined}
-                    runActive={!!isRunning}
+                    runActive={isRunning}
                   />
                 )}
               </div>
@@ -1113,7 +1339,7 @@ const EventStreamImpl = ({
         )}
       </div>
       {/* hideReplyComposer=true 时（task 模式）只展示事件流、底部输入区由父组件的
-          TaskTalkComposer 替代；chat 形态渲染统一输入岛 <Composer>（v1.1.x 收口） */}
+          TaskTalkComposer 替代；chat 形态渲染统一输入岛 <ConversationComposer>（v1.1.x 收口） */}
       {hideReplyComposer || !isChat ? null : (
         <div className="shrink-0 px-6 pb-5 pt-1">
           {/* 运行中粘性状态行：挂 Composer 上方，turn 结束（非 running）自然消失 */}
@@ -1122,33 +1348,17 @@ const EventStreamImpl = ({
               <ActiveStatusLine status={activeStatus} />
             </div>
           )}
-          <Composer
+          <ConversationComposer
+            {...rich.bind}
             editorKey={task.id}
-            value={draft}
-            onChange={(v) => {
-              setDraft(v);
-              saveDraft("reply", task.id, v);
-            }}
             onSubmit={handleSend}
             placeholder={
-              isAwaitingUser || (isRunning && allowQueueWhileRunning)
+              composeEnabled
                 ? `随便聊、贴图、拖文件、/ 唤起 skill（${submitShortcutHint}）`
                 : (disabledHint ?? "agent 当前没有等待你回复")
             }
-            disabled={
-              !(isAwaitingUser || (isRunning && !!allowQueueWhileRunning))
-            }
+            disabled={!composeEnabled}
             submitting={submitting}
-            focusRef={inputRef}
-            slash={slash}
-            attach={attach}
-            paths={pathAttach.paths}
-            onRemovePath={pathAttach.removePath}
-            onPickPaths={(mode) => void pathAttach.pickPaths(mode)}
-            picking={pathAttach.picking}
-            onPasteLongText={(content) =>
-              pathAttach.addPastedText(task.id, content)
-            }
             topRow={composerTop}
             leading={composerLeading}
             running={isRunning}
@@ -1164,6 +1374,7 @@ const EventStreamImpl = ({
         </div>
       )}
     </div>
+    </StreamFollowContext.Provider>
   );
 };
 

@@ -368,7 +368,7 @@ export const StorageCard = () => {
                         </span>
                         {/* 定宽容器：Badge 本身随 2–3 字变宽，包一层让行间列对齐 */}
                         <span className="flex w-14 shrink-0 justify-center">
-                          <Badge variant="outline" className="text-[10px]">
+                          <Badge variant="outline" size="xs">
                             {e.mode === "chat" ? "对话" : REPO_STATUS_LABEL[e.repoStatus]}
                           </Badge>
                         </span>
@@ -381,7 +381,7 @@ export const StorageCard = () => {
                             {entrySizeMain(e.bytes, e.worktreeBytes)}
                           </span>
                           {sizeSub && (
-                            <span className="block whitespace-nowrap text-[10px] text-muted-foreground">
+                            <span className="block whitespace-nowrap text-[11px] text-muted-foreground">
                               {sizeSub}
                             </span>
                           )}

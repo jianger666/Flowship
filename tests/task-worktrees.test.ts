@@ -150,10 +150,11 @@ describe("日常轻量态（无飞书链接）— 原仓 + 不建分支", () => 
     ).toBe("");
   });
 
-  it("推进分组过滤：日常只留 custom，正式原样", () => {
+  it("推进分组过滤：日常只留 custom（隐藏 builtin/team/shared），正式原样", () => {
     const groups = [
       { key: "builtin", keys: ["plan"] },
       { key: "team", keys: ["wk-1"] },
+      { key: "shared", keys: ["svc-debug"] },
       { key: "custom", keys: ["ca-1"] },
     ];
     expect(filterAdvanceGroupsForDailyTask(groups, {})).toEqual([

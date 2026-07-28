@@ -70,7 +70,7 @@ export const TeamActionViewDialog = ({
           <DialogTitle className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 truncate">{target.label}</span>
             {target.categoryLabel && (
-              <Badge variant="secondary" className="shrink-0 text-[10px]">
+              <Badge variant="secondary" size="xs">
                 {target.categoryLabel}
               </Badge>
             )}

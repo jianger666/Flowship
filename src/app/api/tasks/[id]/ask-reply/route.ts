@@ -38,7 +38,15 @@ import type {
   ImageAttachmentInput,
   ImageAttachmentSaved,
 } from "@/lib/server/task-artifacts";
-import { clearPendingAsk, getPendingAsk } from "@/lib/server/chat-pending";
+import { extractAskQuestions, isAskSkipped } from "@/lib/ask-pending";
+import {
+  clearPendingAsk,
+  getPendingAsk,
+  restorePendingAskIf,
+  takePendingAskIf,
+  wasAskTakenRecently,
+  type PendingAsk,
+} from "@/lib/server/chat-pending";
 import {
   deliverAskReply,
   isTaskOpStale,
@@ -62,9 +70,11 @@ import {
   writeUserEventAndPublishStrict,
 } from "@/lib/server/task-stream";
 import { getChatLifecycle } from "@/lib/server/chat-gate";
+import { buildSkillDirective } from "@/lib/protocol-signals";
 import {
   errorResponse,
   parseAndValidateImages,
+  parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 
 interface Ctx {
@@ -88,6 +98,9 @@ interface PostBody {
   answers?: AnswerPayload[];
   deferred?: boolean;
   imagesByQuestion?: Record<string, RawImagePayload[]>;
+  // v1.1.x：答题框 `/` 引用到的 skill（各题合并去重后一份）。
+  // 指引只拼进发给 agent 的文本、不进 ask_user_reply 事件（气泡存用户原答案）
+  skills?: Array<{ name?: string; absPath?: string }>;
   // V0.11.1：会话恢复凭据（服务重启 / 空闲回收后答案靠它 Agent.resume 接回会话送达）
   bootArgs?: {
     apiKey?: string;
@@ -99,37 +112,9 @@ interface PostBody {
 // 单题最多附 6 张图；全部题加起来最多 12 张（防一次答超多题各塞满图把 agent context 撑爆）
 const MAX_IMAGES_PER_QUESTION = 6;
 const MAX_IMAGES_TOTAL = 12;
+// skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
 
 export const runtime = "nodejs";
-
-const extractQuestionsFromMeta = (
-  meta: Record<string, unknown> | undefined,
-): AskUserQuestion[] => {
-  if (!meta || !Array.isArray(meta.questions)) return [];
-  const out: AskUserQuestion[] = [];
-  for (const item of meta.questions as unknown[]) {
-    if (!item || typeof item !== "object") continue;
-    const m = item as Record<string, unknown>;
-    if (typeof m.id !== "string" || typeof m.question !== "string") continue;
-    const options: AskUserQuestion["options"] = [];
-    if (Array.isArray(m.options)) {
-      for (const optRaw of m.options as unknown[]) {
-        if (!optRaw || typeof optRaw !== "object") continue;
-        const o = optRaw as Record<string, unknown>;
-        if (typeof o.id === "string" && typeof o.label === "string") {
-          options.push({ id: o.id, label: o.label });
-        }
-      }
-    }
-    out.push({
-      id: m.id,
-      question: m.question,
-      options: options.length > 0 ? options : undefined,
-      allowText: typeof m.allowText === "boolean" ? m.allowText : true,
-    });
-  }
-  return out;
-};
 
 const buildReplyText = (
   questions: AskUserQuestion[],
@@ -173,9 +158,32 @@ const buildReplyText = (
   return sections.join("\n");
 };
 
-export const POST = async (req: Request, { params }: Ctx) => {
-  const { id } = await params;
+/**
+ * 认领到的 pendingAsk 放在容器里传给内部实现——外层 catch 据此在**抛错**时把登记放回。
+ * （逐个出口补回滚只覆盖得了「我们自己 return 的那些」，deliver / 落盘真抛出来时
+ * 登记就没了、用户回不去答题。）
+ */
+interface AskClaimRef {
+  taken: PendingAsk | null;
+}
 
+export const POST = async (req: Request, ctx: Ctx) => {
+  const { id } = await ctx.params;
+  const claimRef: AskClaimRef = { taken: null };
+  try {
+    return await handleAskReply(req, id, claimRef);
+  } catch (err) {
+    // 抛到这里 = 答案没送达（也没写「已答」事件）：登记原样放回
+    if (claimRef.taken) restorePendingAskIf(id, claimRef.taken);
+    throw err;
+  }
+};
+
+const handleAskReply = async (
+  req: Request,
+  id: string,
+  claimRef: AskClaimRef,
+): Promise<Response> => {
   let body: PostBody;
   try {
     body = (await req.json()) as PostBody;
@@ -186,6 +194,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
   const askId = (body.askId ?? "").trim();
   const rawAnswers = body.answers;
   const deferred = body.deferred === true;
+
+  // deferred 是「跳过这组问题」、没有正文也就无所谓 skill 指引
+  const skillsResult = parseAndValidateSkills(
+    deferred ? undefined : body.skills,
+  );
+  if (!skillsResult.ok) return skillsResult.errorResponse;
+  const skillDirective = buildSkillDirective(skillsResult.skills);
 
   if (!askId) return errorResponse("askId 必填");
   if (!deferred) {
@@ -265,8 +280,13 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (alreadyReplied) {
     return errorResponse(`askId=${askId} 已经回答过、不能重复提交`, 409);
   }
+  // 用户已经用「直接发新消息」跳过了这组提问（ask-skip 写的作废事件）——
+  // 答案不能再送达（agent 那边已经按新消息继续了），温和拒绝、不走下面的僵尸唤醒
+  if (isAskSkipped(task.events, askId)) {
+    return errorResponse("这组提问已跳过（你发了新消息）、无需再回答", 409);
+  }
 
-  const questions = extractQuestionsFromMeta(reqEvent.meta);
+  const questions = extractAskQuestions(reqEvent.meta);
   if (questions.length === 0) {
     return errorResponse(`askId=${askId} 的 questions 元信息丢失、无法处理`, 500);
   }
@@ -275,12 +295,74 @@ export const POST = async (req: Request, { params }: Ctx) => {
   // 收窄到「还在等这组 ask」——防旧弹窗答案串进被顶替的新提问（force-new-agent / 顶替 race）。
   const expectedToken =
     typeof reqEvent.meta?.token === "string" ? reqEvent.meta.token : undefined;
-  const checkPending = (): boolean => {
-    const pendingAsk = getPendingAsk(task.id);
-    if (!pendingAsk) return false;
-    if (pendingAsk.askId !== askId) return false;
-    if (expectedToken && pendingAsk.token !== expectedToken) return false;
-    return true;
+  /**
+   * 本次认领到的登记（在下面 `claimPending()` 处**同步原子摘走**）。
+   *
+   * 为什么不是原来的「先 peek、送达后再 clear」：peek 到送达之间隔着存图 / send 两段
+   * await，用户此刻在输入条发新消息就会被 `ask-skip` 摘走同一组 ask——于是 agent 同时
+   * 收到「这组问题的答案」和「上一组提问用户跳过了」两条矛盾指令。改成摘走之后，
+   * 答与跳只有一个拿得到登记、另一个自然让路（仲裁者只有 pendingAsks 一个）。
+   *
+   * 代价：中途没送出去必须**放回**（{@link giveBackPending}），否则用户回不去答题。
+   */
+  /** 摘走登记（同步、无 await）；返回「这组 ask 还在等」 */
+  const claimPending = (): boolean => {
+    claimRef.taken = takePendingAskIf(task.id, askId, expectedToken);
+    return claimRef.taken !== null;
+  };
+  /**
+   * 本次没把答案送出去 → 原样放回（槽位已被新提问占住就不放，绝不盖掉新的）。
+   * 放完清掉 claimRef——外层 catch 不该再放第二次。
+   */
+  const giveBackPending = (): void => {
+    if (!claimRef.taken) return;
+    restorePendingAskIf(task.id, claimRef.taken);
+    claimRef.taken = null;
+  };
+  /** 答案确实送达了 → 交出所有权，外层 catch 不许再把它放回来（那会让用户重复答） */
+  const keepPendingClaimed = (): void => {
+    claimRef.taken = null;
+  };
+
+  /**
+   * 在 app 里答完 → 把飞书那边同一组 ask 的卡片（需求群答题卡 / p2p 流式卡）也置成终态。
+   *
+   * 这是 HANDOFF 记的那笔欠账：终态 patch 原来只写在「**从这张卡点按钮**」的分支里，
+   * 从 app 答完两边卡片都不置态、群里看着还像待答。收口点就一个（ask-card-settle），
+   * 谁了结的谁调一次。
+   *
+   * 动态 import：route 不该把 feishu-bridge 那张图静态挂上；整段吞异常——
+   * 答案已经送达了，卡片没刷成功不该让接口报错。
+   */
+  const settleAnsweredCards = async (): Promise<void> => {
+    if (questions.length === 0) return;
+    try {
+      const { ASK_CARD_ANSWERED_HINT, settleAskCards } = await import(
+        "@/lib/server/feishu-bridge/ask-card-settle"
+      );
+      const noteByQuestion: Record<string, string> = {};
+      if (!deferred) {
+        for (const a of answers) {
+          const text = a.answer.trim();
+          if (!text) continue;
+          noteByQuestion[a.questionId] =
+            `已回答：${text.length > 120 ? `${text.slice(0, 119)}…` : text}`;
+        }
+      }
+      await settleAskCards({
+        taskId: task.id,
+        askId,
+        questions,
+        noteByQuestion,
+        fallbackNote: deferred ? "（用户选择稍后再补充）" : "已在 Flowship 里回答",
+        hintNote: ASK_CARD_ANSWERED_HINT,
+      });
+    } catch (err) {
+      console.warn(
+        `[ask-reply] 置飞书卡片终态失败 task=${task.id} ask=${askId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   };
 
   const questionIds = new Set(questions.map((q) => q.id));
@@ -314,12 +396,21 @@ export const POST = async (req: Request, { params }: Ctx) => {
     validatedByQuestion[qid] = result.images;
   }
 
-  const pending = checkPending();
+  const pending = claimPending();
 
   // 落盘图 + 拼 replyText：pending 命中 或 僵尸唤醒（pending 丢了但仍 awaiting）都要用。
   // 抽成闭包、避免两处复制；真正写盘仅在确认要接受这组答案时调用。
   const persistAnswerAssets = async (): Promise<
-    | { ok: true; savedByQuestion: Record<string, ImageAttachmentSaved[]>; allSaved: ImageAttachmentSaved[]; allAbsPaths: string[]; replyText: string }
+    | {
+        ok: true;
+        savedByQuestion: Record<string, ImageAttachmentSaved[]>;
+        allSaved: ImageAttachmentSaved[];
+        allAbsPaths: string[];
+        /** 写进 ask_user_reply 事件的用户原文（气泡看到的就是它） */
+        replyText: string;
+        /** 真正 send 给 agent 的文本 = skill 指引 + 原文 */
+        agentText: string;
+      }
     | { ok: false; errorResponse: Response }
   > => {
     const savedByQuestion: Record<string, ImageAttachmentSaved[]> = {};
@@ -338,12 +429,19 @@ export const POST = async (req: Request, { params }: Ctx) => {
         };
       }
     }
+    const replyText = buildReplyText(
+      questions,
+      answers,
+      deferred,
+      savedByQuestion,
+    );
     return {
       ok: true,
       savedByQuestion,
       allSaved,
       allAbsPaths: allSaved.map((s) => s.absPath),
-      replyText: buildReplyText(questions, answers, deferred, savedByQuestion),
+      replyText,
+      agentText: skillDirective + replyText,
     };
   };
 
@@ -364,13 +462,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
   });
 
   const wakeWithAnswer = async (
+    // 事件气泡存原文、送 agent 的带 skill 指引（两者只在有 `/` 引用时不同）
     replyText: string,
+    agentText: string,
     allSaved: ImageAttachmentSaved[],
     allAbsPaths: string[],
     reason: string,
   ): Promise<Response | null> => {
     // wake 前复查——stale 不得清 pending / 记「已答」
     if (isTaskOpStale(task.id, opGen)) {
+      giveBackPending();
       return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
     }
     const boot = parseBootArgs();
@@ -396,6 +497,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
         },
       });
       if (!wrote) {
+        giveBackPending();
         return errorResponse("not_found", 404);
       }
     } catch (persistErr) {
@@ -403,43 +505,82 @@ export const POST = async (req: Request, { params }: Ctx) => {
         `[ask-reply] 唤醒前落盘失败 task=${task.id}:`,
         persistErr,
       );
+      // 答案没落盘就没唤醒 = 这次没答成，登记放回（契约：wake 前失败不清 pending）
+      giveBackPending();
       return errorResponse(PERSIST_FAIL_RETRY_MESSAGE, 500);
     }
-    clearPendingAsk(task.id);
+    // 这里不再 clearPendingAsk：本组登记在入口 claimPending 就摘走了，
+    // 此刻槽位里若有东西那是**新一组**提问——裸清会把它一起抹掉。
+    // 答案已落盘 + 即将交给新 agent → 所有权交出去，后面再抛也不许放回
+    keepPendingClaimed();
     console.log(
       `[ask-reply] task=${task.id} askId=${askId} ${reason}、走唤醒兜底（${isChat ? "chat 新会话" : "新 agent"}接手、答案随消息带过去）`,
     );
+    /**
+     * 唤醒失败的引导事件。**自己吞掉写盘异常**——它挂在 fire-and-forget 链的最后一环，
+     * 抛出去没人接，Node 默认策略下 unhandled rejection 可能直接带崩整个服务进程。
+     */
+    const noteWakeFailure = async (text: string): Promise<void> => {
+      try {
+        await writeEventAndPublish(task.id, {
+          kind: "error",
+          // chat 没有 action 维度，只有 task 模式把事件挂回提问所属 action
+          ...(isChat ? {} : { actionId: reqEvent.actionId }),
+          text,
+        });
+      } catch (err) {
+        console.error(
+          `[ask-reply] task=${task.id} 连唤醒失败事件都没写下去：`,
+          err,
+        );
+      }
+    };
 
+    // 飞书答题卡置终态排在**投递成功之后**（同主路径的顺序约定）：这两条都是
+    // fire-and-forget，提前置态时一旦唤醒失败，卡片上写着「已回答」而 agent 根本没收到。
+    // 失败路径一律不置态、只落错误事件引导用户用输入条恢复。
     if (isChat) {
       void deliverChatAskReply(
         task,
-        replyText,
+        agentText,
         allAbsPaths.length > 0 ? allAbsPaths : undefined,
         boot,
-      ).catch(async (err) => {
-        console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
-        await writeEventAndPublish(task.id, {
-          kind: "error",
-          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
+      )
+        .then(async (ok) => {
+          if (ok) {
+            await settleAnsweredCards();
+            return;
+          }
+          // 返 false = 会话没接回来（rewind 窗口 / 被停 / run 在跑）：同样是没送到
+          await noteWakeFailure(
+            "答案已记录、但唤醒 AI 失败（会话没接回来）——在底部输入条说句话即可继续",
+          );
+        })
+        .catch(async (err) => {
+          console.error(`[ask-reply] chat=${task.id} 唤醒兜底失败：`, err);
+          await noteWakeFailure(
+            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话即可继续`,
+          );
         });
-      });
     } else {
       void resumeCurrentActionWithMessage({
         task,
-        userMessage: replyText,
+        userMessage: agentText,
         imagePaths: allAbsPaths.length > 0 ? allAbsPaths : undefined,
         apiKey: boot.apiKey!,
         fallbackModel: boot.model!,
         gitToken: boot.gitToken,
         opGen,
-      }).catch(async (err) => {
-        console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
-        await writeEventAndPublish(task.id, {
-          kind: "error",
-          actionId: reqEvent.actionId,
-          text: `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+      })
+        .then(async () => {
+          await settleAnsweredCards();
+        })
+        .catch(async (err) => {
+          console.error(`[ask-reply] task=${task.id} 唤醒兜底失败：`, err);
+          await noteWakeFailure(
+            `答案已记录、但唤醒 AI 失败：${err instanceof Error ? err.message : String(err)}——在底部输入条说句话或重新「推进」即可继续`,
+          );
         });
-      });
     }
     const fresh = await getTask(task.id);
     return new Response(JSON.stringify({ ok: true, task: fresh ?? task }), {
@@ -449,6 +590,21 @@ export const POST = async (req: Request, { params }: Ctx) => {
   };
 
   if (!pending) {
+    // 登记为空的第一种可能：另一条链（跳过 / 飞书答题）**刚把它原子摘走、正在投递**。
+    // 这一条必须挡在下面两个子分支之前——它们各自都会替那条链下结论：
+    // 「已失效」分支写作废事件（跳过链随后 rollback 放回登记的话，事件流里那条假作废会让
+    // 答题卡直接消失、用户再也答不了；commit 成功则同一 ask 落两条 supersede 事件），
+    // 「僵尸」分支更狠、直接唤醒新 agent 把答案送过去（agent 同时收到答案和跳过两条矛盾指令）。
+    // 收口是那条链自己的事，这里只温和拒绝、**一个事件都不写**。
+    // takenAsks 是内存态、重启后天然为空，正好把「链在飞」和真孤儿区分开。
+    if (wasAskTakenRecently(task.id, askId)) {
+      console.warn(
+        `[ask-reply] task=${task.id} askId=${askId} 另一条链正在了结这组提问、本次回答不投递`,
+      );
+      // 文案保持中性：takenAsks 不记谁摘的——双击提交时第二个请求的用户并没发过新消息
+      return errorResponse("这组提问正在被处理、无需再回答", 409);
+    }
+
     const fresh = (await getTask(id)) ?? task;
 
     // 这组 ask 已被顶替（task 有别的新提问在等）/ agent 还在跑 / **会话还活着**（V0.11：
@@ -481,6 +637,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
     // 旧逻辑当场 410 + 标 error → 答题卡 isStale「用输入条唤醒」+ 输入条因未了结 ask
     // 仍禁用 = 对锁死。有凭据则接受答案并唤醒；没凭据才作废提问 + 标 error 放行输入条。
     if (fresh.runStatus === "awaiting_user") {
+      // 走到这里 = 登记为空且**没有任何链在飞**（入口的 wasAskTakenRecently 已经放行）：
+      // 真孤儿（进程重启 / 网断后 agent 异常退出），可以接管这组答案。
       // 入场判定僵尸态处立刻 snapshot——B claim 后（写 running 前）本 observer
       // 即失效，闭包不再只靠 opGen（同 gen claim 看不见）。
       const zombieObserver = snapshotTaskOp(task.id);
@@ -491,6 +649,7 @@ export const POST = async (req: Request, { params }: Ctx) => {
       if (!assets.ok) return assets.errorResponse;
       const woken = await wakeWithAnswer(
         assets.replyText,
+        assets.agentText,
         assets.allSaved,
         assets.allAbsPaths,
         "僵尸态（pending 已丢）",
@@ -558,11 +717,16 @@ export const POST = async (req: Request, { params }: Ctx) => {
 
   // 确认 agent 还在等了、现在才真把图写盘（逐题落、按 questionId 归档）。
   const assets = await persistAnswerAssets();
-  if (!assets.ok) return assets.errorResponse;
-  const { allSaved, allAbsPaths, replyText } = assets;
+  if (!assets.ok) {
+    // 存图失败 = 这次没答成，把登记放回让用户能重来
+    giveBackPending();
+    return assets.errorResponse;
+  }
+  const { allSaved, allAbsPaths, replyText, agentText } = assets;
 
   // 存图长 await 后复查
   if (isTaskOpStale(task.id, opGen)) {
+    giveBackPending();
     return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
   }
 
@@ -573,20 +737,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
   if (isChat) {
     const ok = await deliverChatAskReply(
       task,
-      replyText,
+      agentText,
       allAbsPaths.length > 0 ? allAbsPaths : undefined,
       boot,
     );
     if (!ok) {
       const woken = await wakeWithAnswer(
         replyText,
+        agentText,
         allSaved,
         allAbsPaths,
         "会话已死",
       );
       if (woken) return woken;
+      // 会话彻底没了、也唤不醒 → 这组提问就此作废（**不放回**登记：放回等于让用户
+      // 对着一个送不到的会话反复答）。clearPendingAsk 不再调——本组早在入口摘走了
+      keepPendingClaimed();
       await supersedePendingAsks(task.id, "会话已失效");
-      clearPendingAsk(task.id);
       return errorResponse(
         "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话即可继续",
         409,
@@ -595,14 +762,15 @@ export const POST = async (req: Request, { params }: Ctx) => {
   } else {
     const deliverResult = await deliverAskReply(
       task,
-      replyText,
+      agentText,
       allAbsPaths.length > 0 ? allAbsPaths : undefined,
       reqEvent.actionId,
       boot,
       opGen,
     );
-    // stale → 409，不清 pending、不记已答、不走 wake
+    // stale → 409，登记放回、不记已答、不走 wake
     if (deliverResult === "stale" || isTaskOpStale(task.id, opGen)) {
+      giveBackPending();
       return errorResponse(TASK_OP_STALE_HTTP_MESSAGE, 409);
     }
     if (deliverResult !== "sent") {
@@ -610,22 +778,23 @@ export const POST = async (req: Request, { params }: Ctx) => {
       // 手动推进——直接**唤醒新 agent**、把完整 Q&A 文本当最新指示带过去。
       const woken = await wakeWithAnswer(
         replyText,
+        agentText,
         allSaved,
         allAbsPaths,
         "会话已死",
       );
       if (woken) return woken;
-      // 没凭据（极端）：维持原作废 + 报错兜底
+      // 没凭据（极端）：维持原作废 + 报错兜底（同 chat 分支，登记不放回、也不裸清）
+      keepPendingClaimed();
       await supersedePendingAsks(task.id, "会话已失效");
-      clearPendingAsk(task.id);
       return errorResponse(
         "没有可续接的 agent 会话（会话已失效）——在底部输入条说句话或重新「推进」即可继续",
         409,
       );
     }
   }
-  // 答案已送达 → 照常清 pending；落盘失败带 persistWarning，不伪装未发送
-  clearPendingAsk(task.id);
+  // 答案已送达（登记在入口就摘走了、无需再清）→ 交出所有权，后面再抛也不许放回
+  keepPendingClaimed();
 
   const actionId = reqEvent.actionId;
   let persistWarning: string | undefined;
@@ -655,6 +824,10 @@ export const POST = async (req: Request, { params }: Ctx) => {
     );
     persistWarning = PERSIST_WARNING_DELIVERED;
   }
+
+  // 飞书那边的答题卡置终态——排在「已答」事件落盘**之后**：置态是锦上添花，
+  // 不能让两次 lark 往返拖住用户看到自己那条回答（内部吞异常、绝不抛）
+  await settleAnsweredCards();
 
   // 删除迟到「幂等刷 running」——send 成功后本路由还有清 pending / 落事件等 await，
   // run 快速结束会先归位 awaiting_user/idle；再刷会把已结束 run 写回永久 running

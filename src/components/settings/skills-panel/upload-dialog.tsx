@@ -189,14 +189,14 @@ export const UploadSkillsDialog = ({
     const st = uploadNameStatus(name, category, teamSkillCategories);
     if (st === "overwrite") {
       return (
-        <Badge variant="outline" className="shrink-0 text-[10px]">
+        <Badge variant="outline" size="xs">
           将覆盖
         </Badge>
       );
     }
     if (typeof st === "object") {
       return (
-        <Badge variant="outline" className="shrink-0 text-[10px]">
+        <Badge variant="outline" size="xs">
           与库内同名冲突（{labelUploadCategory(st.conflict)} 分类）
         </Badge>
       );

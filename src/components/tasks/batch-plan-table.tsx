@@ -81,7 +81,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                   <div>{b.rawId}</div>
                   {/* 追加场景标来源：这批是第几次方案引入的 */}
                   {multiSource && (
-                    <div className="mt-0.5 text-[10px] text-muted-foreground/70">
+                    <div className="mt-0.5 text-[11px] text-muted-foreground/70">
                       #{b.sourceActionN}
                     </div>
                   )}
@@ -89,7 +89,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                 <TableCell className="align-top font-medium">
                   <span>{b.title}</span>
                   {isNew && (
-                    <span className="ml-2 inline-block rounded bg-primary/10 px-1.5 py-0.5 align-middle text-[10px] font-normal text-primary">
+                    <span className="ml-2 inline-block rounded-sm bg-primary/10 px-1.5 py-0.5 align-middle text-[11px] font-normal text-primary">
                       本次新增
                     </span>
                   )}
@@ -104,7 +104,7 @@ export const BatchPlanTable = ({ batches, currentActionN }: Props) => {
                     不加会把「待实现」挤换行成「待实/现」。span nowrap + icon shrink-0 锁一行 */}
                 <TableCell className="align-top whitespace-nowrap">
                   {built ? (
-                    <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                    <span className="inline-flex items-center gap-1 text-success">
                       <CheckCircle2 className="size-3.5 shrink-0" />
                       已实现
                     </span>

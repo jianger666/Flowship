@@ -51,6 +51,29 @@
      * 一律 bg-selected + text-selected-foreground、别再用 bg-muted/xx 自拼 */
     --selected: oklch(0.885 0.006 247);
     --selected-foreground: oklch(0.185 0.008 264);
+
+    /* ---------- 语义状态色（2026-07-28 一致性收口、做法与 --selected 完全同款） ----------
+     * 收编前全站同一语义多处取色不一致：「运行中」有 blue-500 / sky-500 / muted-foreground
+     * 三种、「成功」有 emerald-600 / green-500 / green-700 三种、「危险」大多走 destructive
+     * 但也有手写 bg-red-500。这里一族一个 token、组件侧只写 text-success / bg-warning/10 之类。
+     *
+     * 取值口径（与现成 --destructive 对齐、不重配灰阶）：
+     * - 浅色统一压到 L≈0.54~0.58（跟 --destructive 的 0.577 同档）——原来的 emerald-600 /
+     *   amber-600 / sky-600 在白卡上只有 3.2~4.0:1，小字（11px）根本不够；现在都是
+     *   4.66~5.54:1（destructive 是 4.76:1），一次把光模式的对比度补齐。
+     * - 深色统一 L≈0.76~0.82，正好是原来在用的 emerald-400 / amber-500 / sky-400 那一档
+     *   （8.3~9.9:1 on card），所以深色观感基本不变、这批改动的视觉风险集中在浅色一侧。
+     * - danger 不新增、沿用 --destructive。 */
+    --success: oklch(0.54 0.13 163);
+    --warning: oklch(0.56 0.13 80);
+    --info: oklch(0.55 0.15 240);
+    /* 品牌琥珀「电流」：全站唯一 accent，只给 logo + 「等你行动」信号族（琥珀点 /
+     * 答题卡 / 「AI 在等你回答」悬浮条）。与 --warning 同源不同档：hue 55 更焦糖、
+     * 贴 logo 的 --brand-current-color（oklch(0.45 0.13 55)），warning hue 80 更黄。 */
+    --brand: oklch(0.53 0.15 55);
+    /* 块类型身份色（非状态色）：事件流里「子代理卡 / 思考」这一族。
+     * 不并进 --info——待办卡已经是 info 蓝，并了两张相邻卡片就分不出来了。 */
+    --subagent: oklch(0.55 0.2 292);
   }
 
   .dark {
@@ -77,6 +100,14 @@
     /* 选中态底色：比 muted(0.27) 提两档、深色下同样一眼可辨 */
     --selected: oklch(0.34 0.008 264);
     --selected-foreground: oklch(0.97 0.003 247);
+
+    /* 语义状态色（深色档、口径见 :root 注释）：L≈0.76~0.82，
+     * 与替换前在用的 emerald-400 / amber-500 / sky-400 / violet-300 同档，深色观感不变 */
+    --success: oklch(0.78 0.15 163);
+    --warning: oklch(0.82 0.15 82);
+    --info: oklch(0.76 0.14 234);
+    --brand: oklch(0.79 0.16 62);
+    --subagent: oklch(0.78 0.14 292);
   }
 }
 
@@ -103,6 +134,11 @@
   --color-ring: var(--ring);
   --color-selected: var(--selected);
   --color-selected-foreground: var(--selected-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-brand: var(--brand);
+  --color-subagent: var(--subagent);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -282,7 +318,9 @@
   animation: brand-glow-breathe 1.8s ease-in-out infinite;
 }
 /* 电流颜色随主题（用户实测：浅色下白电流贴白底看不清）——
-   浅色用深琥珀焦糖、深色用近白暖光；BrandMark stroke 引用本变量 */
+   浅色用深琥珀焦糖、深色用近白暖光；BrandMark stroke 引用本变量。
+   这是 --brand 的「logo 描边档」：浅色比 --brand 再深一档保证细线可见，
+   深色故意走近白暖光（亮电流观感），所以不直接复用 --brand、两者同族不同值。 */
 :root {
   --brand-current-color: oklch(0.45 0.13 55);
 }

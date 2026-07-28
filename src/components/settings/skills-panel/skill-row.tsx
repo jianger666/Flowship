@@ -24,7 +24,7 @@ import { isSharedTeamCategory, type SkillRow } from "./types";
 
 /** 行内次要操作：紧凑 ghost 文字按钮（查看/编辑/删除/卸载共用） */
 const ROW_ACTION_BTN =
-  "h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground";
+  "h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground";
 
 type Props = {
   skill: SkillRow;
@@ -93,28 +93,25 @@ export const SkillRowItem = ({
             {s.name}
           </span>
           {s.teamAction && (
-            <Badge variant="outline" className="shrink-0 text-[10px]">
+            <Badge variant="outline" size="xs">
               action
             </Badge>
           )}
           {/* 「已安装」仅共享市场语义；knowledge 靠 Switch 自表达 */}
           {installed && (
-            <Badge
-              variant="secondary"
-              className="shrink-0 text-[10px] text-muted-foreground"
-            >
+            <Badge variant="secondary" size="xs" className="text-muted-foreground">
               已安装
             </Badge>
           )}
           {sourceTag && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               {sourceTag}
             </Badge>
           )}
           {/* 创建人：仅共享沉淀显示（组内谁传的有意义）；团队规范是镜像的官方库、不标 by */}
           {isShared && s.author && <AuthorByline author={s.author} />}
         </div>
-        <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted-foreground">
+        <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
           {s.description}
         </p>
       </div>
@@ -203,7 +200,7 @@ export const SkillRowItem = ({
         <Button
           size="sm"
           variant="outline"
-          className="h-7 shrink-0 px-2.5 text-[12px]"
+          className="h-7 shrink-0 px-2.5 text-xs"
           disabled={controlsDisabled}
           onClick={() => onInstall(s)}
         >

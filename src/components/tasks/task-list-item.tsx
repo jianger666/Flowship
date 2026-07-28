@@ -78,7 +78,8 @@ const useTaskSeenAt = (taskId: string): number => {
 
 const TONE_CLASS: Record<"run" | "wait", string> = {
   run: "text-primary",
-  wait: "text-amber-600 dark:text-amber-500",
+  // wait = 「等你行动」信号族、跟琥珀点 / 答题卡同一个品牌色
+  wait: "text-brand",
 };
 
 // 行首指示：runStatus 优先（运行 / 等你回复）、否则回退类型图标。
@@ -94,7 +95,7 @@ const LeadingIndicator = ({
   if (task.runStatus === "running") {
     return (
       <Loader2
-        className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+        className="size-3.5 shrink-0 animate-spin text-info"
         aria-label="AI 运行中"
       />
     );
@@ -116,7 +117,7 @@ const LeadingIndicator = ({
         className="flex size-3.5 shrink-0 items-center justify-center"
         aria-label="等待你处理"
       >
-        <span className="size-2 animate-pulse rounded-full bg-amber-500" />
+        <span className="size-2 animate-pulse rounded-full bg-brand" />
       </span>
     );
   }
@@ -214,10 +215,7 @@ export const TaskListItem = ({
             </Tooltip>
             {/* 无飞书链接 = 日常轻量态；中性色小徽标、与对话行「对话」徽标同量级 */}
             {task.mode !== "chat" && isLightweightDailyTask(task) && (
-              <Badge
-                variant="secondary"
-                className="shrink-0 px-1.5 text-[10px] font-normal"
-              >
+              <Badge variant="secondary" size="xs" className="font-normal">
                 日常
               </Badge>
             )}
@@ -237,7 +235,7 @@ export const TaskListItem = ({
       {/* chat 相对时间：吸行尾右侧（与 hover 按钮同槽——hover 时按钮浮现、时间隐去），
           不挤标题宽度（标题的右 padding 本来就为按钮槽留好了） */}
       {subtitle && (
-        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[10px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0 group-has-[[data-popup-open]]/item:opacity-0">
+        <span className="pointer-events-none absolute inset-y-0 right-2 my-auto flex h-4 items-center text-[11px] tabular-nums text-muted-foreground/50 transition-opacity group-hover/item:opacity-0 group-has-[[data-popup-open]]/item:opacity-0">
           {subtitle}
         </span>
       )}

@@ -11,17 +11,20 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   DEFAULT_TEAM_LIBRARY,
   GIT_TOKEN_ENV,
   KNOWLEDGE_GLOBAL_DEFAULT_ENABLED,
+  MIRROR_EXCLUDED_TOP_DIRS,
+  TEAM_LIBRARY_DATA_BRANCH,
   buildAuthedGitArgs,
   buildUploadBranchName,
   checkUploadNameAcrossCategories,
   classifyPushRejection,
   computeDefaultSkillStates,
+  copyTree,
   ensureRepoAt,
   formatSensitiveScanError,
   gateSensitiveUpload,
@@ -31,10 +34,15 @@ import {
   locateSharedSkillPath,
   mergeTeamLibraryConfig,
   parseGitLabRepoUrl,
+  parseSymrefDefaultBranch,
+  readTeamLibraryBranchFile,
   redactGitText,
   redactSecretValue,
+  resolveMirrorSourceBranch,
   scanSensitiveFiles,
+  shouldScanStagedPath,
   withTeamLibraryLock,
+  writeTeamLibraryBranchFile,
 } from "@/lib/server/team-library";
 // 派生模型后 parseFlowshipActionMeta 挪到 custom-action-fs（避免循环 import）
 import { parseFlowshipActionMeta } from "@/lib/server/custom-action-fs";
@@ -332,16 +340,214 @@ describe("parseGitLabRepoUrl", () => {
       projectPath: "frontend/infra/ai-flow-action-hub",
     });
     expect(
-      parseGitLabRepoUrl("https://gitlab.wukongedu.net/wukong/wk-knowledgebase.git"),
+      parseGitLabRepoUrl(
+        "https://gitlab.wukongedu.net/wukong/wk-harness-platform.git",
+      ),
     ).toEqual({
       host: "gitlab.wukongedu.net",
-      projectPath: "wukong/wk-knowledgebase",
+      projectPath: "wukong/wk-harness-platform",
     });
   });
 
   it("非法 URL / 空 path → null", () => {
     expect(parseGitLabRepoUrl("not-a-url")).toBeNull();
     expect(parseGitLabRepoUrl("https://gitlab.example.com/")).toBeNull();
+  });
+});
+
+/**
+ * 知识库源仓迁移（2026-07-27）：wukong/wk-knowledgebase → wukong/wk-harness-platform。
+ * canMirror 探测、镜像 clone 都读 knowledgeSourceUrl，锁死默认值防回退到 404 旧路径。
+ */
+describe("知识库源仓默认配置", () => {
+  it("默认源仓指向 wk-harness-platform、旧路径不再出现", () => {
+    expect(DEFAULT_TEAM_LIBRARY.knowledgeSourceUrl).toBe(
+      "https://gitlab.wukongedu.net/wukong/wk-harness-platform.git",
+    );
+    expect(DEFAULT_TEAM_LIBRARY.knowledgeSourceUrl).not.toContain(
+      "wk-knowledgebase",
+    );
+  });
+
+  it("兜底分支是 release/1.0（新仓默认分支、不是 main）", () => {
+    expect(DEFAULT_TEAM_LIBRARY.knowledgeSourceBranch).toBe("release/1.0");
+  });
+});
+
+describe("parseSymrefDefaultBranch", () => {
+  it("解析 ls-remote --symref 输出里的默认分支（含带斜杠的分支名）", () => {
+    const stdout =
+      "ref: refs/heads/release/1.0\tHEAD\n" +
+      "ed319c8b81358256217570f5b38c329ad0487409\tHEAD\n";
+    expect(parseSymrefDefaultBranch(stdout)).toBe("release/1.0");
+  });
+
+  it("默认分支是 main 时同样解析得到", () => {
+    expect(
+      parseSymrefDefaultBranch("ref: refs/heads/main\tHEAD\n<sha>\tHEAD\n"),
+    ).toBe("main");
+  });
+
+  it("无 symref 行 / 空输出 → null（调用方回退配置值）", () => {
+    expect(parseSymrefDefaultBranch("")).toBeNull();
+    expect(parseSymrefDefaultBranch("ed319c8\tHEAD\n")).toBeNull();
+    // 只有 tag ref、没有 HEAD symref
+    expect(
+      parseSymrefDefaultBranch("ref: refs/tags/v1\trefs/tags/v1\n"),
+    ).toBeNull();
+  });
+});
+
+describe("resolveMirrorSourceBranch", () => {
+  it("探到默认分支 → 用探测值（对方改默认分支我们自动跟上）", () => {
+    expect(resolveMirrorSourceBranch("release/1.0", "main")).toBe("release/1.0");
+  });
+
+  it("探不到 → 回退配置值", () => {
+    expect(resolveMirrorSourceBranch(null, "release/1.0")).toBe("release/1.0");
+  });
+
+  it("探到非法分支名 → 不拼进 git 参数、回退配置值", () => {
+    // 分支名要被拼进 `clone --branch` / `fetch`，`..`、前导横杠、空格一律拒
+    expect(resolveMirrorSourceBranch("../evil", "main")).toBe("main");
+    expect(resolveMirrorSourceBranch("-upload-pack=x", "main")).toBe("main");
+    expect(resolveMirrorSourceBranch("has space", "main")).toBe("main");
+    expect(resolveMirrorSourceBranch("", "main")).toBe("main");
+  });
+});
+
+/** 真跑 `git ls-remote --symref`：锁死输出格式契约（parse 不是照着记忆写的） */
+describe("git ls-remote --symref 输出格式契约", () => {
+  const TMP = path.join(os.tmpdir(), `fe-symref-${Date.now()}`);
+  const bareDir = path.join(TMP, "bare.git");
+
+  afterAll(async () => {
+    await fs.rm(TMP, { recursive: true, force: true });
+  });
+
+  it("远端 HEAD 指向 release/1.0 → 能解析出 release/1.0", async () => {
+    await fs.mkdir(TMP, { recursive: true });
+    // 默认分支刻意设成带斜杠的 release/1.0（对齐真实源仓、且不是 main）
+    await execFileAsync("git", ["init", "--bare", "-b", "release/1.0", bareDir]);
+    const seed = path.join(TMP, "seed");
+    await fs.mkdir(seed, { recursive: true });
+    await fs.writeFile(path.join(seed, "README.md"), "seed\n", "utf-8");
+    await execFileAsync("git", ["init", "-b", "release/1.0"], { cwd: seed });
+    await execFileAsync("git", ["config", "user.email", "t@t.com"], { cwd: seed });
+    await execFileAsync("git", ["config", "user.name", "t"], { cwd: seed });
+    await execFileAsync("git", ["add", "."], { cwd: seed });
+    await execFileAsync("git", ["commit", "-m", "init"], { cwd: seed });
+    await execFileAsync("git", ["push", bareDir, "release/1.0"], { cwd: seed });
+
+    const { stdout } = await execFileAsync("git", [
+      "ls-remote",
+      "--symref",
+      bareDir,
+      "HEAD",
+    ]);
+    expect(parseSymrefDefaultBranch(stdout)).toBe("release/1.0");
+  });
+});
+
+/**
+ * 镜像拷贝：顶层排除 + 整体替换。
+ * 排除清单是单一来源常量（MIRROR_EXCLUDED_TOP_DIRS），不是散落各处的路径判断。
+ */
+describe("copyTree（镜像排除 + 整体替换）", () => {
+  const TMP = path.join(os.tmpdir(), `fe-mirror-copy-${Date.now()}`);
+  const src = path.join(TMP, "src");
+  const dest = path.join(TMP, "dest");
+
+  const write = async (rel: string, body: string): Promise<void> => {
+    const abs = path.join(src, rel);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, body, "utf-8");
+  };
+  const exists = async (rel: string): Promise<boolean> =>
+    !!(await fs.stat(path.join(dest, rel)).catch(() => null));
+
+  beforeAll(async () => {
+    await write("knowledge-base/projects/a.md", "kb\n");
+    await write("skills/global/wk-harness/SKILL.md", "skill\n");
+    await write("scripts/gate.py", "print(1)\n");
+    await write(".gitignore", "codes/\n");
+    // 排除目标
+    await write("harness-delivery-hub/delivery-server/main.ts", "server\n");
+    await write("codes/backend/Z.java", "java\n");
+    // 通用跳过项
+    await write(".DS_Store", "junk\n");
+    await write("__pycache__/x.pyc", "junk\n");
+    await write("scripts/stale.pyc", "junk\n");
+    // 同名但不在顶层——不该被误伤（排除只认顶层）
+    await write("skills/global/harness-delivery-hub/SKILL.md", "nested\n");
+
+    // dest 预置存量（模拟旧结构的老镜像），验证整体替换
+    await fs.mkdir(path.join(dest, "legacy"), { recursive: true });
+    await fs.writeFile(path.join(dest, "legacy", "old.md"), "old\n", "utf-8");
+
+    await copyTree(src, dest, {
+      clearDest: true,
+      excludeTopNames: MIRROR_EXCLUDED_TOP_DIRS,
+    });
+  });
+
+  afterAll(async () => {
+    await fs.rm(TMP, { recursive: true, force: true });
+  });
+
+  it("知识内容三件套 + .gitignore 都拷过去", async () => {
+    expect(await exists("knowledge-base/projects/a.md")).toBe(true);
+    expect(await exists("skills/global/wk-harness/SKILL.md")).toBe(true);
+    expect(await exists("scripts/gate.py")).toBe(true);
+    expect(await exists(".gitignore")).toBe(true);
+  });
+
+  it("顶层 harness-delivery-hub / codes 被排除", async () => {
+    expect(await exists("harness-delivery-hub")).toBe(false);
+    expect(await exists("codes")).toBe(false);
+  });
+
+  it("排除只认顶层——深层同名目录不误伤", async () => {
+    expect(await exists("skills/global/harness-delivery-hub/SKILL.md")).toBe(
+      true,
+    );
+  });
+
+  it(".DS_Store / __pycache__ / *.pyc 一律跳过", async () => {
+    expect(await exists(".DS_Store")).toBe(false);
+    expect(await exists("__pycache__")).toBe(false);
+    expect(await exists("scripts/stale.pyc")).toBe(false);
+  });
+
+  it("clearDest：dest 里的存量老结构被整体清掉、不留幽灵", async () => {
+    expect(await exists("legacy/old.md")).toBe(false);
+    expect(await exists("legacy")).toBe(false);
+  });
+});
+
+/**
+ * knowledge/ 是整库机器镜像、豁免敏感扫描。
+ * 不豁免的话高熵规则会把 py 标识符 / 文档示例 URL 全判成密钥
+ *（实测一次常规镜像 18 个变更文件命中 106 处、无一为真）、镜像永久推不上去。
+ */
+describe("shouldScanStagedPath（敏感扫描豁免面）", () => {
+  it("knowledge/ 下一律豁免", () => {
+    expect(shouldScanStagedPath("knowledge/skills/global/wk/x.py")).toBe(false);
+    expect(shouldScanStagedPath("knowledge/knowledge-base/a.md")).toBe(false);
+    expect(shouldScanStagedPath("knowledge/.gitignore")).toBe(false);
+  });
+
+  it("用户上传面 skills/ 仍然要扫", () => {
+    expect(shouldScanStagedPath("skills/fe/my-skill/SKILL.md")).toBe(true);
+    expect(shouldScanStagedPath("README.md")).toBe(true);
+  });
+
+  it("同名前缀不误豁免（knowledge-notes/ 不是 knowledge/）", () => {
+    expect(shouldScanStagedPath("knowledge-notes/a.md")).toBe(true);
+  });
+
+  it("Windows 反斜杠路径也认得出豁免前缀", () => {
+    expect(shouldScanStagedPath("knowledge\\skills\\a.py")).toBe(false);
   });
 });
 
@@ -575,6 +781,205 @@ describe("ensureRepoAt（半残 .git 自愈）", () => {
     await execFileAsync("git", ["rev-parse", "--git-dir"], { cwd: workDir });
   });
 });
+/**
+ * 数据分支（成员注册表）读改写——真跑 git（本地 bare 远端、不碰网络）。
+ *
+ * 最要紧的不变量：**主克隆的 HEAD / 索引 / 工作树全程不能被动**——团队库主克隆
+ * 同时被 skill 同步 / 上传 / 镜像链路使用，切走 HEAD 会直接搞坏它们。
+ */
+describe("writeTeamLibraryBranchFile / readTeamLibraryBranchFile（数据分支）", () => {
+  const TMP = path.join(os.tmpdir(), `fe-tl-branch-${Date.now()}`);
+  const bareDir = path.join(TMP, "bare.git");
+  const dataDir = path.join(TMP, "data");
+  const repoDir = path.join(dataDir, "team-library", "repo");
+  const FILE = "group-members.json";
+  const prevDataDir = process.env.FLOWSHIP_DATA_DIR;
+
+  /** 在 bare 远端上跑 git（断言远端状态） */
+  const inBare = async (args: string[]): Promise<string> =>
+    (await execFileAsync("git", args, { cwd: bareDir })).stdout.trim();
+
+  /** 在主克隆上跑 git（断言它没被动过） */
+  const inClone = async (args: string[]): Promise<string> =>
+    (await execFileAsync("git", args, { cwd: repoDir })).stdout.trim();
+
+  beforeAll(async () => {
+    await fs.mkdir(TMP, { recursive: true });
+    await execFileAsync("git", ["init", "--bare", "-b", "main", bareDir]);
+
+    const seed = path.join(TMP, "seed");
+    await fs.mkdir(path.join(seed, "skills"), { recursive: true });
+    await fs.writeFile(path.join(seed, "skills", "keep.md"), "seed\n", "utf-8");
+    await execFileAsync("git", ["init", "-b", "main"], { cwd: seed });
+    await execFileAsync("git", ["config", "user.email", "t@t.com"], { cwd: seed });
+    await execFileAsync("git", ["config", "user.name", "t"], { cwd: seed });
+    await execFileAsync("git", ["add", "."], { cwd: seed });
+    await execFileAsync("git", ["commit", "-m", "init"], { cwd: seed });
+    await execFileAsync("git", ["push", bareDir, "main"], { cwd: seed });
+
+    await fs.mkdir(dataDir, { recursive: true });
+    await execFileAsync("git", [
+      "clone",
+      "--branch",
+      "main",
+      "--single-branch",
+      bareDir,
+      repoDir,
+    ]);
+    // commit-tree 要提交者身份；测试里显式配死，别依赖跑测机器的全局 git config
+    await execFileAsync("git", ["config", "user.email", "t@t.com"], { cwd: repoDir });
+    await execFileAsync("git", ["config", "user.name", "t"], { cwd: repoDir });
+
+    // readGitToken 读 <dataRoot>/config.json；dataRoot 每次调用现读 env
+    await fs.writeFile(
+      path.join(dataDir, "config.json"),
+      JSON.stringify({ gitToken: "dummy-token" }),
+      "utf-8",
+    );
+    process.env.FLOWSHIP_DATA_DIR = dataDir;
+  });
+
+  afterAll(async () => {
+    if (prevDataDir === undefined) delete process.env.FLOWSHIP_DATA_DIR;
+    else process.env.FLOWSHIP_DATA_DIR = prevDataDir;
+    await fs.rm(TMP, { recursive: true, force: true });
+  });
+
+  it("分支不存在 → 建孤儿分支首推；主克隆 HEAD / 工作树纹丝不动", async () => {
+    const headBefore = await inClone(["rev-parse", "HEAD"]);
+
+    const r = await writeTeamLibraryBranchFile({
+      relPath: FILE,
+      mutate: () => '{"version":1,"members":{}}\n',
+      message: "chore: 首次创建注册表",
+    });
+    expect(r).toEqual({ ok: true, changed: true });
+
+    // 远端：分支建出来了，且是**孤儿**（只有一条根提交、树里只有这一个文件）
+    expect(await inBare(["rev-list", "--count", TEAM_LIBRARY_DATA_BRANCH])).toBe("1");
+    expect(await inBare(["ls-tree", "-r", "--name-only", TEAM_LIBRARY_DATA_BRANCH])).toBe(
+      FILE,
+    );
+    // main 一点没被碰
+    expect(await inBare(["ls-tree", "-r", "--name-only", "main"])).toBe(
+      "skills/keep.md",
+    );
+
+    // 主克隆：还在 main、HEAD 没挪、工作树干净（没有多出 group-members.json）
+    expect(await inClone(["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+    expect(await inClone(["rev-parse", "HEAD"])).toBe(headBefore);
+    expect(await inClone(["status", "--porcelain"])).toBe("");
+    await expect(fs.access(path.join(repoDir, FILE))).rejects.toThrow();
+  });
+
+  it("读走 origin/<branch>；内容原样（不受 runGit 脱敏影响）", async () => {
+    await expect(readTeamLibraryBranchFile({ relPath: FILE })).resolves.toBe(
+      '{"version":1,"members":{}}\n',
+    );
+  });
+
+  it("幂等：mutate 返 null / 内容没变 → 不造提交", async () => {
+    const before = await inBare(["rev-parse", TEAM_LIBRARY_DATA_BRANCH]);
+
+    await expect(
+      writeTeamLibraryBranchFile({
+        relPath: FILE,
+        mutate: () => null,
+        message: "不该发生",
+      }),
+    ).resolves.toEqual({ ok: true, changed: false });
+    await expect(
+      writeTeamLibraryBranchFile({
+        relPath: FILE,
+        mutate: (cur) => cur,
+        message: "不该发生",
+      }),
+    ).resolves.toEqual({ ok: true, changed: false });
+
+    expect(await inBare(["rev-parse", TEAM_LIBRARY_DATA_BRANCH])).toBe(before);
+  });
+
+  it("并发写：push 被拒后重新 fetch 重来，拿到对手的最新内容再合并", async () => {
+    const seen: Array<string | null> = [];
+    let raced = false;
+
+    const r = await writeTeamLibraryBranchFile({
+      relPath: FILE,
+      mutate: async (cur) => {
+        seen.push(cur);
+        // 第一轮：在我们 push 之前，模拟同事抢先推了一条（制造 non-fast-forward）
+        if (!raced) {
+          raced = true;
+          const rival = path.join(TMP, "rival");
+          await fs.rm(rival, { recursive: true, force: true });
+          await execFileAsync("git", [
+            "clone",
+            "--branch",
+            TEAM_LIBRARY_DATA_BRANCH,
+            "--single-branch",
+            bareDir,
+            rival,
+          ]);
+          await execFileAsync("git", ["config", "user.email", "r@r.com"], { cwd: rival });
+          await execFileAsync("git", ["config", "user.name", "r"], { cwd: rival });
+          await fs.writeFile(path.join(rival, FILE), '{"peer":true}\n', "utf-8");
+          await execFileAsync("git", ["add", "-A"], { cwd: rival });
+          await execFileAsync("git", ["commit", "-m", "peer"], { cwd: rival });
+          await execFileAsync("git", ["push", "origin", TEAM_LIBRARY_DATA_BRANCH], {
+            cwd: rival,
+          });
+        }
+        return '{"mine":true}\n';
+      },
+      message: "chore: 并发写",
+    });
+
+    expect(r).toEqual({ ok: true, changed: true });
+    // mutate 被调了两轮；第二轮看到的是对手推上去的最新内容（不是第一轮那份）
+    expect(seen).toEqual(['{"version":1,"members":{}}\n', '{"peer":true}\n']);
+    // 最终远端是我们的内容，且历史上对手那条提交还在（我们是接在它后面的）
+    expect(await inBare(["show", `${TEAM_LIBRARY_DATA_BRANCH}:${FILE}`])).toBe(
+      '{"mine":true}',
+    );
+    expect(
+      Number(await inBare(["rev-list", "--count", TEAM_LIBRARY_DATA_BRANCH])),
+    ).toBe(3);
+    // 全程主克隆仍在 main、工作树干净
+    expect(await inClone(["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+    expect(await inClone(["status", "--porcelain"])).toBe("");
+  });
+
+  it("分支 / 文件不存在 → 读返回 null（调用方降级）", async () => {
+    await expect(
+      readTeamLibraryBranchFile({ relPath: FILE, branch: "no-such-branch" }),
+    ).resolves.toBeNull();
+    await expect(
+      readTeamLibraryBranchFile({ relPath: "not-there.json" }),
+    ).resolves.toBeNull();
+  });
+
+  it("非法文件名 / 分支名一律拒绝（拼进 refspec 前的白名单）", async () => {
+    await expect(
+      readTeamLibraryBranchFile({ relPath: "../escape.json" }),
+    ).resolves.toBeNull();
+    await expect(
+      writeTeamLibraryBranchFile({
+        relPath: "sub/dir.json",
+        mutate: () => "x",
+        message: "m",
+      }),
+    ).resolves.toMatchObject({ ok: false });
+    await expect(
+      writeTeamLibraryBranchFile({
+        relPath: FILE,
+        branch: "--upload-pack=evil",
+        mutate: () => "x",
+        message: "m",
+      }),
+    ).resolves.toMatchObject({ ok: false });
+  });
+});
+
 describe("scanSensitiveFiles / 敏感上传闸", () => {
   it("脱敏只露前 3 字符", () => {
     expect(redactSecretValue("abcdefgh")).toBe("abc***");

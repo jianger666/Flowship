@@ -81,7 +81,7 @@ export const ChatMcpPicker = ({ task, onTaskUpdate }: Props) => {
           >
             <Plug className="size-3.5 shrink-0 text-muted-foreground" />
             <span>MCP</span>
-            <span className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+            <span className="rounded-sm bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
               {enabledCount}/{availableServers.length}
             </span>
             <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />

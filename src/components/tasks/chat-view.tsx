@@ -31,10 +31,13 @@ import {
 import { ChatMcpPicker } from "@/components/tasks/chat-mcp-picker";
 import { ChatQueueBanner } from "@/components/tasks/chat-queue-banner";
 import { EventStream } from "@/components/tasks/event-stream";
+import { StreamActionsProvider } from "@/components/tasks/event-stream/stream-actions";
 import {
-  ComposerSessionProvider,
-  buildInputHistory,
-} from "@/components/composer-session";
+  buildResendPayload,
+  findLastUserReply,
+} from "@/components/tasks/event-stream/resend-payload";
+import { TokenUsageChip } from "@/components/tasks/token-usage-chip";
+import { ComposerSessionProvider } from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useTaskWatch } from "@/hooks/use-task-watch";
@@ -46,6 +49,7 @@ import {
   subscribeChatOp,
 } from "@/lib/chat-op-ledger";
 import { fingerprintFromChatSendArgs } from "@/lib/chat-payload-fingerprint";
+import { buildInputHistory } from "@/lib/composer-history";
 import {
   allocClientChatQueueItemId,
   findReusableUncertainOperation,
@@ -329,7 +333,9 @@ export const ChatView = ({
       onTaskUpdateRef.current(t);
     },
     onAssistantDelta: (text) => setStreamingText((prev) => prev + text),
-    onErrorMessage: (msg) => toast.error(`Chat watch 出错：${msg}`),
+    // msg 已是 runner 拼好的可读文案（「Chat agent 异常：…」），别再套一层
+    // 「watch 出错」——那会误导成 SSE 断了，实际是 agent 挂了
+    onErrorMessage: (msg) => toast.error(msg),
     onWatchException: (err) => toast.error(`Chat watch 异常：${err.message}`),
     // task_deleted / watch 410 → 清 pending/streaming + ledger，再走统一 sink
     onTaskDeleted: (deletedId) => {
@@ -599,6 +605,26 @@ export const ChatView = ({
   // P5：running 时仍可排队发送；仅 isSubmitting 短暂锁
   const canReply = !isSubmitting;
 
+  // 事件流行内动作（错误卡「重试」）：能力住在这里（握着 ledger / 提交锁），
+  // 靠 Context 注入给深层的错误卡，避免为一个按钮往 EventStream 加一路 prop
+  const streamActions = useMemo(
+    () => ({
+      onRetryLastMessage: async () => {
+        const last = findLastUserReply(task.events);
+        if (!last) return;
+        const payload = await buildResendPayload(task.id, last);
+        if (payload.imagesPartial) toast.warning("部分附图未能重发");
+        await handleUserReply(
+          payload.text,
+          payload.images,
+          payload.attachments,
+          payload.skillRefs,
+        );
+      },
+    }),
+    [task.events, task.id, handleUserReply],
+  );
+
   const disabledHint = (() => {
     if (isSubmitting) return "正在发送、稍候";
     return undefined;
@@ -637,17 +663,16 @@ export const ChatView = ({
               >
                 <Pencil />
               </Button>
-              <Badge variant="outline" className="text-[10px]">
+              <Badge variant="outline" size="xs">
                 对话
               </Badge>
               {task.runStatus !== "idle" && task.runStatus !== "awaiting_user" && (
-                <Badge
-                  variant={RUN_STATUS_VARIANT[task.runStatus]}
-                  className="text-[10px]"
-                >
+                <Badge variant={RUN_STATUS_VARIANT[task.runStatus]} size="xs">
                   {RUN_STATUS_LABEL[task.runStatus]}
                 </Badge>
               )}
+              {/* token 用量：辅助信息、hover 看本轮明细（长对话最需要它） */}
+              <TokenUsageChip usage={task.tokenUsage} />
             </div>
           </div>
         </div>
@@ -659,6 +684,7 @@ export const ChatView = ({
       </div>
 
       <div className="min-h-0 flex-1">
+        <StreamActionsProvider value={streamActions}>
         <EventStream
           key={task.id}
           task={task}
@@ -692,6 +718,7 @@ export const ChatView = ({
             </>
           }
         />
+        </StreamActionsProvider>
       </div>
     </div>
     </ComposerSessionProvider>

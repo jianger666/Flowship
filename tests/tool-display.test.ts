@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  coerceStaleRunningTools,
   countDiffStats,
   isEphemeralToolOutputDelta,
   isTodoTool,
@@ -81,6 +82,56 @@ describe("tool-display merge / GB 折叠规则", () => {
     });
   });
 
+  it("tool_result status=interrupted → 块 status=interrupted（非 success）", () => {
+    const call = ev({
+      id: "a",
+      kind: "tool_call",
+      text: "调用 shell",
+      meta: { callId: "c_int", name: "shell" },
+    });
+    const result = ev({
+      id: "b",
+      kind: "tool_result",
+      text: "工具已中断 shell",
+      ts: 2,
+      meta: {
+        callId: "c_int",
+        name: "shell",
+        status: "interrupted",
+        output: "",
+      },
+    });
+    const out = mergeToolDisplayEvents([call, result]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: "__tool_block__",
+      callId: "c_int",
+      status: "interrupted",
+    });
+  });
+
+  it("coerceStaleRunningTools：非 running 会话把转圈块改成 interrupted", () => {
+    const running = block({
+      id: "r1",
+      callId: "c_stale",
+      name: "shell",
+      status: "running",
+    });
+    const ok = block({
+      id: "r2",
+      callId: "c_ok",
+      name: "read",
+      status: "success",
+    });
+    const out = coerceStaleRunningTools([running, ok]);
+    expect(out[0]).toMatchObject({
+      kind: "__tool_block__",
+      callId: "c_stale",
+      status: "interrupted",
+    });
+    expect(out[1]).toBe(ok);
+  });
+
   it("同 callId 多条 tool_call 去重：args 取更长、id/ts 留第一条并配对 result", () => {
     // 历史双写：SDK 对同一 call 发两次 running，落盘成两条 tool_call
     const shortArgs = JSON.stringify({ description: "扫代码" });
@@ -159,7 +210,8 @@ describe("tool-display merge / GB 折叠规则", () => {
     expect(out[0]?.kind).toBe("__tool_verb_group__");
     const group = out[0] as ToolVerbGroup;
     expect(group.members).toHaveLength(2);
-    expect(verbGroupLabel(group)).toContain("读取了 2 个文件");
+    // 成员是 read + grep：文案按实际动作分类计数、不再一律说「读取了 2 个文件」
+    expect(verbGroupLabel(group)).toContain("读取了 1 个文件 · 搜索了 1 次");
     expect(out[1]).toMatchObject({ kind: "__tool_block__", name: "shell" });
   });
 

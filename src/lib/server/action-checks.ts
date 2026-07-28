@@ -50,6 +50,7 @@ import {
   getTaskWorkRepoPaths,
   isTaskReadonlyRepo,
 } from "./task-worktrees";
+import { planWkGateForAction, runWkPostStage } from "./wk-gate";
 
 export interface ActionCheckResult {
   passed: boolean;
@@ -125,6 +126,17 @@ export const runActionCheck = async (
           : `${typeResult.details}；${readonlyResult.details}`,
       };
     }
+    // wk-harness 阶段门禁（只对团队 wk 系 action 生效、其余一律 null）：
+    // 未过 → 并进 postCheck.passed=false，UI 挂红条告诉用户该补哪些产物段落
+    const wkResult = await checkWkStageGate(task, action);
+    if (wkResult) {
+      return {
+        passed: typeResult.passed && wkResult.passed,
+        details: [typeResult.details, wkResult.details]
+          .filter(Boolean)
+          .join("\n"),
+      };
+    }
     return typeResult;
   } catch (err) {
     // 兜底：检查脚本异常 → 不挡用户、报警 console
@@ -136,6 +148,43 @@ export const runActionCheck = async (
       passed: true,
       details: `检查脚本异常：${err instanceof Error ? err.message : String(err)}（跳过）`,
     };
+  }
+};
+
+// ----------------- wk-harness 阶段门禁 -----------------
+
+/**
+ * 团队 wk 流程 action 收尾时跑官方 post-stage 门禁 + Delivery Hub 同步。
+ *
+ * 返回 null = 与本 action 无关（普通 action / 没配产出目录 / 产出目录没这个 REQ-ID 等），
+ * 调用方原样用类型检查结果。返回非 null 时 details 已是人可读形态（不是一坨 stderr）。
+ *
+ * 任何异常都吞掉返 null——后置检查是「提示」不是「闸门」，绝不能因为门禁脚本抽风
+ * 让用户的 action 卡住。
+ */
+const checkWkStageGate = async (
+  task: Task,
+  action: ActionRecord,
+): Promise<ActionCheckResult | null> => {
+  try {
+    const plan = await planWkGateForAction(task, action);
+    if (!plan.applies) {
+      // not-wk 静默；其余降级原因（没配 doc_repo 等）挂一行提示，让用户知道门禁没跑
+      return plan.reason === "not-wk"
+        ? null
+        : { passed: true, details: plan.message };
+    }
+    const report = await runWkPostStage(plan);
+    return {
+      passed: report.verdict !== "blocked",
+      details: report.message,
+    };
+  } catch (err) {
+    console.warn(
+      `[action-check] wk 阶段门禁异常 task=${task.id} action=${action.id}：`,
+      err,
+    );
+    return null;
   }
 };
 

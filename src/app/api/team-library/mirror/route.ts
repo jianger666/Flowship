@@ -1,7 +1,8 @@
 /**
  * POST /api/team-library/mirror
- * → 把 wk-knowledgebase 镜像进共享库 knowledge/
- * 推送前跑敏感扫描；命中返回 sensitiveHits（已脱敏）、不推送
+ * → 把 wk-harness-platform 镜像进共享库 knowledge/
+ * 推送前跑敏感扫描（knowledge/ 整库镜像豁免、见 team-library 的 SCAN_EXEMPT_PREFIXES）；
+ * 命中返回 sensitiveHits（已脱敏）、不推送
  */
 
 import { NextResponse } from "next/server";

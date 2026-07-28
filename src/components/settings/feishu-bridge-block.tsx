@@ -71,6 +71,8 @@ interface BridgeStatusPayload {
     lastInboundAt?: number;
     /** 历史上收到过（时间未知）——自检按通过展示 */
     everInbound?: boolean;
+    /** 群消息认不出 @（bot 身份取不到）——群回流此刻是哑的 */
+    groupMentionUnavailable?: boolean;
   } | null;
   error?: string;
 }
@@ -100,7 +102,7 @@ const CheckRow = ({
 }) => (
   <div className="flex items-start gap-2.5 py-2">
     {ok ? (
-      <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-green-500" />
+      <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-success" />
     ) : (
       <XCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
     )}
@@ -267,10 +269,11 @@ export const FeishuBridgeBlock = ({
   const problemConsumers = (status?.runtime?.consumers ?? []).filter((c) =>
     ["unsupported", "conflict", "error"].includes(c.status),
   );
-  // 全绿（含收到过消息、无问题监听器）→ 检查区收成一行（用户反馈：四行占空间）
+  // 全绿（含收到过消息、无问题监听器、群 @ 认得出）→ 检查区收成一行（用户反馈：四行占空间）
   const allChecksOk =
     allGreen &&
     (!!status?.runtime?.lastInboundAt || !!status?.runtime?.everInbound) &&
+    !status?.runtime?.groupMentionUnavailable &&
     problemConsumers.length === 0;
 
   return (
@@ -366,6 +369,15 @@ export const FeishuBridgeBlock = ({
                         : "初次绑定：在飞书给机器人发一句，点刷新验证"
                   }
                 />
+                {/* 群消息认不出 @：bot open_id 与应用名都取不到时群回流整条哑掉、
+                    现象只有「机器人在群里不理人」——必须摆出来，别静默 */}
+                {status?.runtime?.groupMentionUnavailable && (
+                  <CheckRow
+                    ok={false}
+                    title="群消息认不出 @"
+                    detail="取不到机器人身份、群里 @ 它不会有反应，点刷新重试或重新授权 lark-cli"
+                  />
+                )}
                 {/* 监听器只展示「需要用户动作/关注」的问题行（unsupported/conflict/error）；
                     ready 正常态和启动瞬态（starting/stopped/backoff 几秒内自愈）不展示、
                     避免误解（2026-07-19 用户反馈：正常也一排 stopped 很吓人） */}

@@ -28,6 +28,7 @@ import {
   Quote,
   RotateCcw,
   Send,
+  Share2,
   Sparkles,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -40,9 +41,25 @@ import {
   ImageThumb,
   type PreviewImage,
 } from "@/components/ui/image-preview";
-import { isAskSuperseded } from "@/lib/ask-pending";
+import {
+  MessageActionBar,
+  MESSAGE_ACTION_HOST,
+  type MessageActionInput,
+} from "@/components/ui/message-action-bar";
+import {
+  SelectionFloatButton,
+  useSelectionFloat,
+} from "@/components/ui/selection-float";
+import { useShareToGroup } from "@/hooks/use-share-to-group";
+import {
+  extractAskQuestions,
+  isAskSkipped,
+  isAskSuperseded,
+} from "@/lib/ask-pending";
 import { shouldCollapseUserMessage } from "@/lib/chat-stream-display";
+import { formatDurationPrecise } from "@/lib/duration-display";
 import { getIdeAnchorProps } from "@/lib/ide-open";
+import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { pathBasename } from "@/lib/path-utils";
 import { shouldSubmitOnKeyDown } from "@/lib/submit-shortcut";
 import { useJumpIde, useSubmitShortcut } from "@/hooks/use-settings";
@@ -54,7 +71,9 @@ import {
   type TaskEvent,
 } from "@/lib/types";
 
+import { ErrorCard } from "./error-card";
 import {
+  ActionTag,
   DEFAULT_EXPANDED_KINDS,
   EVENT_LABEL,
   extractUserReplyAttachments,
@@ -68,6 +87,9 @@ import {
 // Markdown 渲染统一走 @/components/markdown-text（v1.0 迁 Streamdown）——
 // 这里 re-export 保持既有 import 路径不变（ask-user-inline / workitem-detail 等仍从本文件拿）
 export { MarkdownText } from "@/components/markdown-text";
+
+/** 「引用」选区上限：整篇引进输入框会把草稿撑爆 */
+const QUOTE_MAX_LENGTH = 1000;
 
 /**
  * 流式 placeholder 卡片：复用 assistant_message 的视觉样式
@@ -85,21 +107,24 @@ const StreamingAssistantRowImpl = ({
   variant?: "log" | "chat";
 }) => {
   // chat 形态：跟正式 AI 回复同样平铺（Streamdown streaming 模式自带流式动画、无容器）
+  // 字号 / 行高必须与正式 assistant 气泡（text-[15px] leading-7）一致——
+  // 不一致的话流式结束换成正式行时整段文字会跳一下
   if (variant === "chat") {
     return (
-      <div className="text-sm leading-relaxed">
+      <div className="text-[15px] leading-7">
         <MarkdownText text={text} streaming />
       </div>
     );
   }
   return (
-    <div className="flex gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2">
+    // 「AI 回复中」是进行中、不是成功：走 info 而非原来的 emerald
+    <div className="flex gap-2 rounded-md border border-info/30 bg-info/5 p-2">
       <div className="mt-0.5 shrink-0">
-        <Sparkles className="size-4 animate-pulse text-emerald-500" />
+        <Sparkles className="size-4 animate-pulse text-info" />
       </div>
       <div className="min-w-0 flex-1 text-xs">
         <div className="flex items-center gap-2">
-          <span className="text-muted-foreground/70 text-[10px]">
+          <span className="text-muted-foreground/70 text-[11px]">
             AI 回复中…
           </span>
         </div>
@@ -149,7 +174,13 @@ const ProcessEventRow = ({
   isToolCall,
   isThinking,
   onToggle,
-}: ProcessEventRowProps) => (
+}: ProcessEventRowProps) => {
+  // 思考耗时：SDK 给的 thinking_duration_ms，mergeAdjacentThinking 已把连续几段累加好。
+  // 工具块 / 工作过程组都显示耗时，唯独思考一直没显示（Claude Code / Cursor 都有「Thought for 12s」）
+  const thinkingDuration = isThinking
+    ? formatDurationPrecise(ev.meta?.durationMs)
+    : null;
+  return (
   <div className="group/proc">
     <button
       type="button"
@@ -161,17 +192,18 @@ const ProcessEventRow = ({
         {renderEventIcon(ev.kind)}
       </span>
       <span className="shrink-0 text-[11px]">{EVENT_LABEL[ev.kind]}</span>
-      {actionTag && (
-        <span className="shrink-0 rounded bg-muted/35 px-1 py-0.5 text-[10px] text-muted-foreground/80">
-          {actionTag}
+      {thinkingDuration && (
+        <span className="shrink-0 tabular-nums text-[11px] opacity-80">
+          · {thinkingDuration}
         </span>
       )}
+      {actionTag && <ActionTag label={actionTag} />}
       {collapsed && summary && (
         <span className="min-w-0 flex-1 truncate text-[11px] opacity-80">
           {summary}
         </span>
       )}
-      <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/proc:opacity-60">
+      <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/proc:opacity-60">
         {formatTs(ev.ts)}
       </span>
     </button>
@@ -186,7 +218,7 @@ const ProcessEventRow = ({
               >
                 <span className="shrink-0 opacity-60">{formatTs(item.ts)}</span>
                 {item.name && (
-                  <span className="shrink-0 text-blue-500/80">{item.name}</span>
+                  <span className="shrink-0 text-info/80">{item.name}</span>
                 )}
                 <span className="min-w-0 flex-1">{item.text}</span>
               </li>
@@ -198,6 +230,8 @@ const ProcessEventRow = ({
               "wrap-break-word text-xs leading-relaxed text-muted-foreground",
               isToolCall && "break-all font-mono text-[11px]",
               isThinking && "italic",
+              // 行动指引类提示常是「一句结论 + 逐条明细」，不保留换行会糊成一团
+              ev.meta?.notice === true && "whitespace-pre-wrap",
             )}
           >
             {ev.text}
@@ -206,10 +240,11 @@ const ProcessEventRow = ({
       </div>
     )}
   </div>
-);
+  );
+};
 
 // V0.13.x「重连中」过程行（自动重连、event-stream 分流层直挂）：
-// spinner + 琥珀文案、同 thinking / 工具调用一档的细行、不可折叠。
+// spinner + warning 文案、同 thinking / 工具调用一档的细行、不可折叠。
 // 是否还在转圈看后续事件：出现 reconnected / error / 更新的 reconnecting 后静态显示
 export const ReconnectingRow = memo(
   ({ ev, events }: { ev: TaskEvent; events: TaskEvent[] }) => {
@@ -226,14 +261,14 @@ export const ReconnectingRow = memo(
                 e.meta?.kind === "reconnecting")),
         );
     return (
-      <div className="flex items-center gap-2 px-1.5 py-1 text-xs text-amber-600 dark:text-amber-500">
+      <div className="flex items-center gap-2 px-1.5 py-1 text-xs text-warning">
         {settled ? (
           <Plug className="size-3.5 shrink-0 opacity-60" />
         ) : (
           <Loader2 className="size-3.5 shrink-0 animate-spin" />
         )}
         <span className={cn(settled && "opacity-60")}>{ev.text}</span>
-        <span className="text-[10px] text-muted-foreground/70">
+        <span className="text-[11px] text-muted-foreground/70">
           {formatTs(ev.ts)}
         </span>
       </div>
@@ -248,7 +283,7 @@ export const PendingLocalReplyRow = memo(
     <div className="ml-auto flex w-fit max-w-[85%] items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
       <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
-        <span className="mb-0.5 block text-[10px] tracking-wide">
+        <span className="mb-0.5 block text-[11px] tracking-wide">
           {uncertain ? "发送状态未知、正在确认…" : "待发送"}
         </span>
         {/* 原文：SkillTokenText 解析 skill token、正文即用户消息 */}
@@ -316,48 +351,34 @@ const EventRowImpl = ({
   const resendLockRef = useRef(false);
   // 提交快捷键跟随设置页偏好（Enter / Cmd+Enter、别写死）
   const submitShortcut = useSubmitShortcut();
-  // AI 回复容器：引用按钮相对此节点定位（容器已 relative）
-  const assistantContainerRef = useRef<HTMLDivElement>(null);
-  // 选区浮动「引用」按钮：相对容器的 top/left + 已截断的选中文本；null = 不显示
-  const [quoteBtn, setQuoteBtn] = useState<{
-    top: number;
-    left: number;
-    text: string;
-  } | null>(null);
+  // 选中 AI 正文 → 浮「引用」；与产物面板的「选中 → 分享到群」共用公共件
+  // containerRef 挂在 AI 回复容器上（已 relative），按钮相对它定位
+  const {
+    containerRef: assistantContainerRef,
+    selection: quoteSelection,
+    onMouseUp: onAssistantMouseUp,
+    clear: clearQuoteSelection,
+  } = useSelectionFloat({ enabled: !!onQuote, maxLength: QUOTE_MAX_LENGTH });
+  // 分享到需求群：日常任务隐藏；飞行中 spinner 防双击
+  // guideDialog = bot 不在群时的手动添加引导（平时是 null、只在两个能分享的分支里渲染）
+  const { runShare, guideDialog } = useShareToGroup();
+  const canShareToGroup = !isLightweightDailyTask(task);
+  const [sharingMessage, setSharingMessage] = useState(false);
+
+  const handleShareAssistant = async () => {
+    if (sharingMessage || !ev.text.trim()) return;
+    setSharingMessage(true);
+    try {
+      await runShare(taskId, { kind: "message", content: ev.text });
+    } finally {
+      setSharingMessage(false);
+    }
+  };
+
   // 入口消失（新消息到来 / 不可发送）时退出编辑态、防 stale 草稿残留
   useEffect(() => {
     if (!onResend) setEditing(false);
   }, [onResend]);
-  // 引用能力关掉时清浮动按钮（canCompose 变 false / 切 task）
-  useEffect(() => {
-    if (!onQuote) setQuoteBtn(null);
-  }, [onQuote]);
-  // 选区清空或落到本消息外 → 藏按钮（mouseup 负责出现；这里只清理）
-  useEffect(() => {
-    if (!onQuote) return;
-    const onSelectionChange = () => {
-      const sel = window.getSelection();
-      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-        setQuoteBtn(null);
-        return;
-      }
-      const container = assistantContainerRef.current;
-      const anchor = sel.anchorNode;
-      const focus = sel.focusNode;
-      // 跨消息选区（anchor/focus 不在同一容器）一律不显示
-      if (
-        !container ||
-        !anchor ||
-        !focus ||
-        !container.contains(anchor) ||
-        !container.contains(focus)
-      ) {
-        setQuoteBtn(null);
-      }
-    };
-    document.addEventListener("selectionchange", onSelectionChange);
-    return () => document.removeEventListener("selectionchange", onSelectionChange);
-  }, [onQuote]);
 
   const runResend = async (
     text: string,
@@ -383,6 +404,9 @@ const EventRowImpl = ({
   const isThinking = ev.kind === "thinking";
   const isToolCall = ev.kind === "tool_call";
   const isAwaitingAck = ev.meta?.awaitingAck === true;
+  // 需要用户看见并照做的系统提示（如 wk 门禁「跳过了、去设置页配文档仓」）：
+  // 普通 info 会被压成一行 truncate 灰字、行动指引全被吃掉，这类走默认展开的可见形态
+  const isNotice = ev.meta?.notice === true;
   // checkpointed：可回退到这条用户消息
   const canRewind =
     variant === "chat" &&
@@ -391,7 +415,8 @@ const EventRowImpl = ({
     !!onRewind &&
     !runActive;
   // log 形态降权只看默认折叠规则：过程类降噪，HITL / 失败 / 核心对话保持可见。
-  const isDefaultVisible = DEFAULT_EXPANDED_KINDS.has(ev.kind) || isAwaitingAck;
+  const isDefaultVisible =
+    DEFAULT_EXPANDED_KINDS.has(ev.kind) || isAwaitingAck || isNotice;
   // 是否用 markdown 渲染：仅 AI 回复（用户也可能贴 markdown，但气泡要高亮
   // `/skill-name` token，markdown AST 改太重 → user_reply 走 SkillTokenText 纯文本）
   // thinking / tool_call / info / error 一律纯文本（结构化输出 / 错误消息、markdown 反而碍事）
@@ -467,6 +492,51 @@ const EventRowImpl = ({
     />
   );
 
+  // 错误：chat / log 共用同一张 destructive 卡（原始诊断 meta.detail、复制、当轮重试都在卡里）。
+  // error 已不进「工作过程」组（见 lib/chat-turns.ts 的 MEMBER_KINDS）——run 一结束整组
+  // 自动收起、用户正在读的错误会啪一下消失，这是它必须独立平铺的原因。
+  if (ev.kind === "error") {
+    return (
+      <ErrorCard
+        ev={ev}
+        events={task.events}
+        runActive={runActive}
+        // log 形态保留 action 归属标（跟其它 log 行一致、知道是哪个 action 挂的）
+        actionTag={
+          variant === "log" && actionType
+            ? (ACTION_LABEL_SHORT[actionType] ?? actionType)
+            : undefined
+        }
+      />
+    );
+  }
+
+  // AI 回复的 hover 动作条：chat / log 两形态共用同一份定义（视觉契约在 MessageActionBar）。
+  // onRegenerate 只有 chat 的最后一条才有、log 形态天然只剩复制 + 分享。
+  const assistantActions: MessageActionInput[] = [
+    {
+      key: "copy",
+      icon: <Copy className="size-3" />,
+      label: "复制原文",
+      onClick: () => void handleCopyAssistant(),
+    },
+    canShareToGroup && {
+      key: "share",
+      icon: <Share2 className="size-3" />,
+      label: "分享到需求群",
+      onClick: () => void handleShareAssistant(),
+      disabled: !ev.text.trim(),
+      busy: sharingMessage,
+    },
+    onRegenerate && {
+      key: "regenerate",
+      icon: <RotateCcw className="size-3" />,
+      label: "重新生成回答",
+      // 防连点走父组件 handleResend 的 resendLockRef（与用户消息「重发」同锁）
+      onClick: () => void onRegenerate(),
+    },
+  ];
+
   // ---------- chat 形态（V0.7.11）----------
   // 设计参照 Cursor agent window：
   //   - AI 回复：无容器平铺、prose 直接落在页面底色上（对话主体、最大可读性）
@@ -477,99 +547,27 @@ const EventRowImpl = ({
     // AI 回复：平铺 prose、hover 出「复制」；最后一条还可「重新生成」（与复制并排）
     // 字号略大于过程行、长文可读性优先
     if (isAssistant) {
-      // mouseup 读选区：非空且完全落在本消息容器内 → 在选区顶部中间浮「引用」
-      const handleAssistantMouseUp = () => {
-        if (!onQuote) return;
-        // rAF：等浏览器把选区 commit 完再读（部分浏览器 mouseup 时 selection 尚不稳定）
-        requestAnimationFrame(() => {
-          const sel = window.getSelection();
-          const container = assistantContainerRef.current;
-          if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !container) {
-            setQuoteBtn(null);
-            return;
-          }
-          const anchor = sel.anchorNode;
-          const focus = sel.focusNode;
-          if (
-            !anchor ||
-            !focus ||
-            !container.contains(anchor) ||
-            !container.contains(focus)
-          ) {
-            setQuoteBtn(null);
-            return;
-          }
-          const trimmed = sel.toString().trim();
-          if (!trimmed) {
-            setQuoteBtn(null);
-            return;
-          }
-          // 截断 1000 字，防整篇引用撑爆输入框
-          const text =
-            trimmed.length > 1000 ? trimmed.slice(0, 1000) : trimmed;
-          const range = sel.getRangeAt(0);
-          const rect = range.getBoundingClientRect();
-          const containerRect = container.getBoundingClientRect();
-          setQuoteBtn({
-            top: rect.top - containerRect.top,
-            left: rect.left - containerRect.left + rect.width / 2,
-            text,
-          });
-        });
-      };
-
       return (
         <div
           ref={assistantContainerRef}
-          className="group relative text-[15px] leading-7"
-          onMouseUp={onQuote ? handleAssistantMouseUp : undefined}
+          className={cn(MESSAGE_ACTION_HOST, "text-[15px] leading-7")}
+          onMouseUp={onAssistantMouseUp}
         >
-          <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
-            <button
-              type="button"
-              onClick={() => void handleCopyAssistant()}
-              title="复制原文"
-              aria-label="复制"
-              className="flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-            >
-              <Copy className="size-3" />
-            </button>
-            {onRegenerate && (
-              <button
-                type="button"
-                onClick={() => {
-                  // 防连点走父组件 handleResend 的 resendLockRef（与用户消息「重发」同锁）
-                  void onRegenerate();
-                }}
-                title="重新生成回答"
-                aria-label="重新生成"
-                className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <RotateCcw className="size-3" />
-              </button>
-            )}
-          </div>
-          {/* 选区浮动「引用」：绝对定位相对本容器；mousedown preventDefault 防点按钮时选区塌陷导致按钮先 unmount */}
-          {quoteBtn && onQuote && (
-            <button
-              type="button"
-              aria-label="引用"
-              className="absolute z-10 flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-md bg-foreground px-2 py-1 text-xs text-background opacity-100 shadow-md transition-opacity"
-              style={{ top: quoteBtn.top, left: quoteBtn.left }}
-              onMouseDown={(e) => {
-                e.preventDefault();
+          <MessageActionBar actions={assistantActions} />
+          {/* 选区浮动「引用」：定位 / 样式 / 防选区塌陷都在公共件里 */}
+          {quoteSelection && onQuote && (
+            <SelectionFloatButton
+              state={quoteSelection}
+              label="引用"
+              icon={<Quote className="size-3" />}
+              onTrigger={(text) => {
+                onQuote(text);
+                clearQuoteSelection(true);
               }}
-              onClick={() => {
-                onQuote(quoteBtn.text);
-                setQuoteBtn(null);
-                window.getSelection()?.removeAllRanges();
-              }}
-            >
-              <Quote className="size-3" />
-              引用
-            </button>
+            />
           )}
           <MarkdownText text={ev.text} />
+          {guideDialog}
         </div>
       );
     }
@@ -644,56 +642,43 @@ const EventRowImpl = ({
       return (
         // 右对齐收窄块（Codex 风、A1）：ml-auto + w-fit 右浮、max-w 85% 收窄，
         // 与 AI 左侧平铺拉开、扫一眼分清谁说的
-        <div className="group relative ml-auto w-fit max-w-[85%] rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5">
-          {(onResend || canRewind) && (
-            <div className="absolute -top-3 right-2 flex items-center overflow-hidden rounded-md border bg-background opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
-              {canRewind && (
-                <button
-                  type="button"
-                  onClick={() => onRewind?.(ev.id)}
-                  title="回退到这里"
-                  aria-label="回退到这里"
-                  className="flex cursor-pointer items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-                >
-                  <RotateCcw className="size-3" />
-                  回退到这里
-                </button>
-              )}
-              {onResend && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => void runResend(ev.text, ev)}
-                    title="原样重发这条消息"
-                    aria-label="重发"
-                    className={cn(
-                      "flex cursor-pointer items-center px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground",
-                      canRewind && "border-l",
-                    )}
-                  >
-                    <RotateCcw className="size-3" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditDraft(ev.text);
-                      setEditing(true);
-                    }}
-                    title="编辑后重发（原消息保留）"
-                    aria-label="编辑后重发"
-                    className="flex cursor-pointer items-center border-l px-2 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  >
-                    <PencilLine className="size-3" />
-                  </button>
-                </>
-              )}
-            </div>
+        <div
+          className={cn(
+            MESSAGE_ACTION_HOST,
+            "ml-auto w-fit max-w-[85%] rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5",
           )}
+        >
+          <MessageActionBar
+            actions={[
+              canRewind && {
+                key: "rewind",
+                icon: <RotateCcw className="size-3" />,
+                label: "回退到这里",
+                text: "回退到这里",
+                onClick: () => onRewind?.(ev.id),
+              },
+              onResend && {
+                key: "resend",
+                icon: <RotateCcw className="size-3" />,
+                label: "原样重发这条消息",
+                onClick: () => void runResend(ev.text, ev),
+              },
+              onResend && {
+                key: "edit",
+                icon: <PencilLine className="size-3" />,
+                label: "编辑后重发（原消息保留）",
+                onClick: () => {
+                  setEditDraft(ev.text);
+                  setEditing(true);
+                },
+              },
+            ]}
+          />
           {/* 飞书桥接来的消息带来源标（方案决策 #1 回显细节：一眼区分「在外面发的」）
-              带飞书品牌蓝底衬（2026-07-20 用户反馈灰字太弱） */}
+              带 info 蓝底衬（2026-07-20 用户反馈灰字太弱） */}
           {ev.meta?.source === "feishu" && (
             <div className="mb-1.5">
-              <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-1.5 py-0.5 text-[11px] font-medium text-sky-600 dark:text-sky-400">
+              <span className="inline-flex items-center gap-1 rounded-sm bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info">
                 <MessageSquareText className="size-3" />
                 来自飞书
               </span>
@@ -745,8 +730,10 @@ const EventRowImpl = ({
                   className="flex max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
                   title={`${att.absPath}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
+                  {/* 目录 / 文件用图标形状区分即可；原来目录染 amber 会跟「等你行动」
+                      的品牌琥珀抢注意力（附件 chip 并不需要用户行动） */}
                   {att.isDir ? (
-                    <Folder className="size-3 shrink-0 text-amber-500" />
+                    <Folder className="size-3 shrink-0 text-muted-foreground" />
                   ) : (
                     <FileIcon className="size-3 shrink-0 text-muted-foreground" />
                   )}
@@ -781,8 +768,9 @@ const EventRowImpl = ({
       );
     }
     // info 细线化（Batch C）：普通系统提示降权成居中短线 + 小字；
-    // awaitingAck 里程碑仍走 processRow（要可见）；reconnecting / boot 已在上层分流 / 过滤
-    if (ev.kind === "info" && !isAwaitingAck) {
+    // awaitingAck 里程碑 / notice 行动指引仍走 processRow（要可见、可展开看全文）；
+    // reconnecting / boot 已在上层分流 / 过滤
+    if (ev.kind === "info" && !isAwaitingAck && !isNotice) {
       return (
         <div
           className="group/info flex items-center justify-center gap-2 py-0.5"
@@ -792,7 +780,7 @@ const EventRowImpl = ({
           <span className="max-w-[70%] truncate text-[11px] text-muted-foreground/60">
             {ev.text}
           </span>
-          <span className="shrink-0 text-[10px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/info:opacity-100">
+          <span className="shrink-0 text-[11px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/info:opacity-100">
             {formatTs(ev.ts)}
           </span>
           <div className="h-px w-12 shrink bg-gradient-to-l from-transparent to-border" />
@@ -810,6 +798,7 @@ const EventRowImpl = ({
   return (
     <div
       className={cn(
+        MESSAGE_ACTION_HOST,
         "flex gap-2 rounded-md transition-colors",
         isDefaultVisible
           ? "border bg-card/40 p-2"
@@ -817,6 +806,10 @@ const EventRowImpl = ({
         isDefaultVisible && isUser && "border-primary/30 bg-primary/5",
       )}
     >
+      {isAssistant && guideDialog}
+      {/* log 形态 AI 回复：跟 chat 形态同一条动作条（以前这里只有分享、连复制都没有，
+          日常任务 canShareToGroup=false 时整条都不渲染——看方案时一个动作都没有） */}
+      {isAssistant && <MessageActionBar actions={assistantActions} />}
       <div
         className={cn(
           "mt-0.5 shrink-0",
@@ -838,16 +831,9 @@ const EventRowImpl = ({
         >
           <CollapseChevron open={!collapsed} />
           {actionType && (
-            <span
-              className={cn(
-                "rounded px-1 py-0.5 text-[10px] tracking-wide text-muted-foreground",
-                isDefaultVisible ? "bg-muted/60" : "bg-muted/30",
-              )}
-            >
-              {ACTION_LABEL_SHORT[actionType] ?? actionType}
-            </span>
+            <ActionTag label={ACTION_LABEL_SHORT[actionType] ?? actionType} />
           )}
-          <span className="text-muted-foreground/70 text-[10px]">
+          <span className="text-muted-foreground/70 text-[11px]">
             {EVENT_LABEL[ev.kind]}
           </span>
           <span className="text-muted-foreground">{formatTs(ev.ts)}</span>
@@ -881,7 +867,7 @@ const EventRowImpl = ({
                     {formatTs(item.ts)}
                   </span>
                   {item.name && (
-                    <span className="shrink-0 rounded bg-blue-500/10 px-1 text-blue-600 dark:text-blue-400">
+                    <span className="shrink-0 rounded-sm bg-info/10 px-1 text-info">
                       {item.name}
                     </span>
                   )}
@@ -897,6 +883,8 @@ const EventRowImpl = ({
                 isToolCall &&
                   "break-all font-mono text-[11px] text-muted-foreground/75",
                 isThinking && "italic text-muted-foreground",
+                // 行动指引类提示是多行结构（结论 + 明细 + 下一步）、换行得留住
+                isNotice && "whitespace-pre-wrap",
                 !isToolCall &&
                   !isThinking &&
                   !useMarkdown &&
@@ -954,11 +942,11 @@ const EventRowImpl = ({
                   title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
                   {att.isDir ? (
-                    <Folder className="size-3 shrink-0 text-amber-500" />
+                    <Folder className="size-3 shrink-0 text-muted-foreground" />
                   ) : (
                     <FileIcon className="size-3 shrink-0 text-muted-foreground" />
                   )}
-                  <span className="min-w-0 truncate font-mono text-[11px] text-sky-600 dark:text-sky-400">
+                  <span className="min-w-0 truncate font-mono text-[11px] text-info">
                     {pathBasename(att.absPath)}
                   </span>
                 </a>
@@ -995,6 +983,60 @@ interface AskUserRequestRowProps {
   task: Task;
 }
 
+/**
+ * 「用户没答、直接发新消息」跳过的提问：收成一行灰色细行、点开看原问题。
+ *
+ * 为什么不直接从事件流里抹掉（用户拍板）：事件流是历史记录、AI 确实问过，
+ * 彻底删掉会让回溯时看不懂 agent 后面那句「按你说的继续」是接着什么说的。
+ */
+const SkippedAskRow = ({ ev, count }: { ev: TaskEvent; count: number }) => {
+  // 展开看原问题（默认收起——跳过了就说明用户不关心）
+  const [open, setOpen] = useState(false);
+  const questions = useMemo(() => extractAskQuestions(ev.meta), [ev.meta]);
+
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/30">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+      >
+        {open ? (
+          <ChevronDown className="size-3.5 shrink-0" />
+        ) : (
+          <ChevronRight className="size-3.5 shrink-0" />
+        )}
+        <Ban className="size-3.5 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">
+          AI 提过 {count} 个问题 · 已跳过
+        </span>
+        <span className="shrink-0 tabular-nums opacity-70">
+          {formatTs(ev.ts)}
+        </span>
+      </button>
+      {open && (
+        <div className="flex flex-col gap-1.5 border-t border-border/50 px-2.5 py-2 text-xs text-muted-foreground">
+          {questions.length > 0 ? (
+            questions.map((q, idx) => (
+              <div key={q.id} className="flex items-start gap-2">
+                <span className="mt-px shrink-0 font-mono text-[11px] opacity-70">
+                  Q{idx + 1}
+                </span>
+                <div className="min-w-0 flex-1 wrap-break-word">
+                  {q.question}
+                </div>
+              </div>
+            ))
+          ) : (
+            // meta.questions 丢了的脏数据：退回事件原文
+            <div className="wrap-break-word">{ev.text}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
   const askId =
     ev.meta && typeof ev.meta.askId === "string" ? ev.meta.askId : "";
@@ -1019,11 +1061,22 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
     [task.events, askId],
   );
 
+  // 「用户没答、直接发了新消息」这一种作废（ask-skip 写的标记）——收成一行、可展开看原问题。
+  // answered 优先：极窄竞态下可能同时存在 reply 和跳过标记，有真答案就按已答显示
+  const skipped = useMemo(
+    () => !answered && isAskSkipped(task.events, askId),
+    [answered, task.events, askId],
+  );
+
   // 问题数量：从 meta.questions 拿、没有就尝试用 text 行数估
   const questionsCount =
     ev.meta && Array.isArray(ev.meta.questions)
       ? (ev.meta.questions as unknown[]).length
       : ev.text.split("\n").filter((l) => l.trim().length > 0).length;
+
+  if (skipped) {
+    return <SkippedAskRow ev={ev} count={questionsCount} />;
+  }
 
   return (
     <div
@@ -1032,17 +1085,18 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
         superseded
           ? "border-muted bg-muted/30"
           : answered
-            ? "border-emerald-500/30 bg-emerald-500/5"
-            : "border-amber-500/40 bg-amber-500/10",
+            ? "border-success/30 bg-success/5"
+            : // 未答 = 「等你行动」信号族、走品牌琥珀
+              "border-brand/40 bg-brand/10",
       )}
     >
       <div className="flex items-center gap-2 text-xs">
         {superseded ? (
           <Ban className="size-4 text-muted-foreground" />
         ) : answered ? (
-          <CheckCircle2 className="size-4 text-emerald-500" />
+          <CheckCircle2 className="size-4 text-success" />
         ) : (
-          <Sparkles className="size-4 text-amber-500 animate-pulse" />
+          <Sparkles className="size-4 animate-pulse text-brand" />
         )}
         <span
           className={cn("font-medium", superseded && "text-muted-foreground")}

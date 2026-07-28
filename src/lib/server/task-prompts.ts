@@ -23,7 +23,7 @@ import { renderContextDocsSection } from "./context-docs-prompt";
 import { turnDisciplineSection } from "./turn-discipline";
 import { buildWindowsToolDisciplineDirective } from "./windows-tool-discipline";
 import { formatRepoSectionForPrompt } from "@/lib/path-utils";
-import { deriveReqId } from "@/lib/req-id";
+import { resolveReqId } from "@/lib/req-id";
 import {
   getTaskCwd,
   getTaskWorkRepoPaths,
@@ -190,11 +190,21 @@ const loadCustomActionPlaybook = async (
     return `（自定义 action「${def.label}」是旧格式、已停用——请在能力页把原内容建成 skill 后重新新建挂载。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明该 action 已停用。）`;
   }
   // 主 skill 正文 = 真正的 playbook；找不到就跟「定义缺失」同风格兜底、说清缺哪个 skill
-  const skillBody = await readSkillBodyByName(def.skill);
-  if (!skillBody) {
+  const skill = await readSkillBodyByName(def.skill);
+  if (!skill) {
     return `（自定义 action「${def.label}」挂载的主 skill「${def.skill}」未找到、可能已删或未导入。仍需产出 artifact——按用户指令尽力执行、并在 artifact 说明 skill 缺失。）`;
   }
-  const parts = [fillTemplate(skillBody, vars)];
+  const parts = [fillTemplate(skill.body, vars)];
+  // 正文是「贴」进来的、agent 不知道它出自哪个文件——而正文里的 templates/ references/
+  // scripts/ 都是相对 skill 目录的。不给这行绝对路径、agent 读不到团队模板只能自己编
+  //（2026-07-28 实测：wk 系 action 章节全自拟、团队文档门禁全红）。
+  parts.push(
+    "",
+    `> 本 skill 目录：\`${skill.skillDir}\`——正文里 \`templates/\` \`references/\` \`scripts/\` 等相对路径都在这个目录下、用 \`read\` 读。` +
+      (skill.kbRoot
+        ? `\`knowledge-base/…\` 这类库内路径以知识库根 \`${skill.kbRoot}\` 为根。`
+        : ""),
+  );
   // 产出要求属壳参数（不进 skill）：有则注入用户文案，无则系统兜底结构——skill 可拆卸复用
   if (def.output?.trim()) {
     parts.push(
@@ -248,6 +258,8 @@ export const buildSuperPrompt = async (
   firstNextAction: {
     action: ActionRecord;
     userInstruction: string;
+    /** v1.1.x：推进弹窗 `/` 引用的 skill 指引段（buildSkillDirective 产出、空串=没引用） */
+    skillDirective?: string;
     attachedImagePaths?: string[];
     attachedFilePaths?: string[];
     branchCheckoutHint?: string;
@@ -298,8 +310,8 @@ export const buildSuperPrompt = async (
   return renderSuperPromptTemplate(template, {
     taskId: task.id,
     taskTitle: task.title,
-    // 默认 REQ-ID：绑飞书 story → REQ-<id>；否则 REQ-TASK-<id 末段>；全 task 统一注入
-    defaultReqId: deriveReqId(task),
+    // 需求编号行：用户没填就整行不注入（不猜、不占位、见 renderReqIdLine）
+    reqIdLine: renderReqIdLine(task),
     // 空串保留字面（renderSuperPromptTemplate 不把 "" 换成「（未提供）」）
     userIdentityLine,
     repoSection: renderRepoSection(task),
@@ -356,6 +368,18 @@ const renderActionHistorySection = (task: Task): string => {
     lines.push(`  - \`${getActionArtifactPath(task.id, a.n, a.type)}\``);
   }
   return lines.join("\n");
+};
+
+/**
+ * 「任务基本信息」里的 REQ-ID 行——**只有用户填了才注入**、没填整行不出现。
+ *
+ * 不给默认值也不写「（未提供）」：团队 wk-harness 规范要求「没有 REQ-ID 必须先要求
+ * 用户补充、不要猜测」，agent 拿到 wk skill 后自己会照做；我们塞个占位反而是替它猜。
+ */
+const renderReqIdLine = (task: Task): string => {
+  const reqId = resolveReqId(task);
+  if (!reqId) return "";
+  return `- REQ-ID：\`${reqId}\`（团队 wk-harness 规范流程的需求编号；仅执行 wk:* 相关 action 时使用，用户在需求描述中另行指定了 REQ-ID 则以用户的为准；非 wk 流程忽略本行）`;
 };
 
 // 渲染「任务基本信息」的仓库段：非隔离 = 原样列原仓库路径；隔离 task 额外拼一段
@@ -640,6 +664,11 @@ const buildDevDirective = (action: ActionRecord): string | undefined => {
 export const buildNextActionDirective = (input: {
   action: ActionRecord;
   userInstruction: string;
+  /**
+   * v1.1.x：推进弹窗 `/` 引用的 skill 指引段（buildSkillDirective 产出）。
+   * 放在用户指令**前**——跟 chat / question 通道同位置（先读 skill 再看指令）。
+   */
+  skillDirective?: string;
   attachedImagePaths?: string[];
   attachedFilePaths?: string[];
   branchCheckoutHint?: string;
@@ -652,6 +681,7 @@ export const buildNextActionDirective = (input: {
   const {
     action,
     userInstruction,
+    skillDirective,
     attachedImagePaths,
     attachedFilePaths,
     branchCheckoutHint,
@@ -670,6 +700,10 @@ export const buildNextActionDirective = (input: {
   // 任务字段热更（仅 reused 路径会传、有变化才有值）放最前、让 agent 先校准上下文再读指令
   if (taskUpdateHint && taskUpdateHint.trim().length > 0) {
     lines.push(taskUpdateHint.trim(), "");
+  }
+  // `/` 引用的 skill 指引：紧贴用户指令之前（先 read skill 再执行指令）
+  if (skillDirective && skillDirective.trim().length > 0) {
+    lines.push(skillDirective.trim(), "");
   }
   if (userInstruction.trim().length > 0) {
     lines.push(userInstruction.trim(), "");

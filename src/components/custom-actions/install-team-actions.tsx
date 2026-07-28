@@ -34,7 +34,7 @@ import { cn } from "@/lib/utils";
 
 /** 行内次要操作：紧凑 ghost 文字按钮（与能力页 Skill/Action 行统一） */
 const ROW_ACTION_BTN =
-  "h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground";
+  "h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground";
 
 type Props = {
   /** 安装 / 卸载后回调（父组件刷新自定义 action 列表） */
@@ -252,7 +252,7 @@ export const InstallTeamActions = ({ onInstalled }: Props) => {
         <div className="flex shrink-0 items-center gap-1.5">
           {status?.syncedAt != null && (
             <span
-              className="max-w-[5.5rem] truncate text-[10px] text-muted-foreground"
+              className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground"
               title={new Date(status.syncedAt).toLocaleString("zh-CN")}
             >
               {formatRelative(status.syncedAt)}
@@ -335,17 +335,15 @@ export const InstallTeamActions = ({ onInstalled }: Props) => {
                       {a.label}
                     </span>
                     {cat && (
-                      <Badge
-                        variant="secondary"
-                        className="shrink-0 text-[10px]"
-                      >
+                      <Badge variant="secondary" size="xs">
                         {cat}
                       </Badge>
                     )}
                     {a.installed && (
                       <Badge
                         variant="secondary"
-                        className="shrink-0 text-[10px] text-muted-foreground"
+                        size="xs"
+                        className="text-muted-foreground"
                       >
                         已安装
                       </Badge>
@@ -398,7 +396,7 @@ export const InstallTeamActions = ({ onInstalled }: Props) => {
                       type="button"
                       size="sm"
                       variant="outline"
-                      className="h-7 shrink-0 px-2.5 text-[12px]"
+                      className="h-7 shrink-0 px-2.5 text-xs"
                       disabled={!!busyName}
                       onClick={() => void handleInstall(a.skillName)}
                     >

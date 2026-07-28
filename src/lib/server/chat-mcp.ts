@@ -3,7 +3,7 @@
  *
  * 这个文件做的事情（V0.9.x 拆分、V0.11 wait 协议退役后）：
  * 1. 用官方 `@modelcontextprotocol/sdk` 起一个 stateful 的 HTTP MCP server
- * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `set_plan_batches` / `create_custom_action` 工具
+ * 2. 在它上面注册 `submit_work` / `ask_user` / `submit_mr` / `set_feishu_testers` / `share_to_group` / `set_plan_batches` / `create_custom_action` 工具
  * 3. 工具 handler 调 chat-pending 的 registerPendingAsk / runTaskAction / safeNotifyXxx
  * 4. 暴露一个 fetch-style 的 `handleChatMcpRequest`、给 Next.js App Router 直接调
  *
@@ -683,6 +683,151 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
             {
               type: "text" as const,
               text: `挂载失败：${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ----------------- share_to_group（需求群分享闭环）-----------------
+  //
+  // 把产物 / 疑问 / 进展发到飞书「需求群」：ensure 幂等建群 → bot 发互动卡。
+  // describe 是 agent 第二指令源——只在用户明确要求分享 / playbook 编排时调，禁止滥发。
+  srv.registerTool(
+    "share_to_group",
+    {
+      title: "分享到飞书需求群（产物 / 疑问 / 进展）",
+      description: [
+        "把内容以互动卡片发到当前任务关联飞书工作项的「需求群」。",
+        "首个分享者会幂等建群并 bind；后来者直接发（本机 bot 须已在群）。",
+        "kind=artifact（整份产物）时卡片只放需求名 / 标题 / 链接 / 署名，正文另发一条 md 文件消息。",
+        "",
+        "## 什么时候调",
+        "",
+        "- 用户**明确要求**分享到需求群 / 飞书群",
+        "- playbook / skill 编排里写了「分享到需求群」步骤",
+        "",
+        "## 什么时候不调",
+        "",
+        "- **不要自行滥发**——交卷、旁白、日常进展默认不发群",
+        "- 用户只是在 app 里聊天 / 提问、没提分享 → 不调",
+        "- 任务没有飞书工作项链接 → 不调（会报错）",
+        "- **action 交卷后不要顺手调**——产物默认不进群，用户想发会自己点分享 / 明说",
+        "",
+        "## 入参",
+        "",
+        "- `task_id`：当前任务 id",
+        "- `content`：分享正文（必填）。`artifact` 走 md 文件、不截断；其余进卡片、截断约 2000 字",
+        "- `title`：可选小标题（`artifact` 时会进 md 文件名）",
+        "- `links`：可选按钮链接 `[{label, url}]`（会自动再加「查看工作项」）",
+        "- `kind`：可选 `artifact` / `message` / `question`，默认 `message`",
+        "",
+        "## 返回值",
+        "",
+        "- 成功：`{ ok: true, chatId, chatName?, messageId, created, docMessageId? }`（created=是否本次新建了群；",
+        "  chatName=群名，转告用户时带上它、让他知道发去了哪个群；",
+        "  docMessageId=md 文件消息 id，缺失说明文件没发出去、但卡片已在群里、不要重发）",
+        "- 失败：`{ ok: false, error, code? }`，一律**如实转告用户、不要自行重试**：",
+        "  `bot_not_in_group` 提示他在群设置里手动加一次机器人（仅首次）；",
+        "  `owner_not_in_group` / `group_unreachable` 说明他已不在原需求群（退群 / 群解散），",
+        "  让他去产物面板点「分享到群」按重建引导走一遍——你自己没有重建群的口子",
+      ].join("\n"),
+      inputSchema: {
+        task_id: z.string().describe("任务 id"),
+        content: z
+          .string()
+          .min(1)
+          .describe("分享正文；artifact 走 md 文件、其余进卡片 markdown"),
+        title: z.string().optional().describe("可选小标题（artifact 进 md 文件名）"),
+        kind: z
+          .enum(["artifact", "message", "question"])
+          .optional()
+          .describe(
+            "artifact=整份产物（正文以 md 文件发、卡片不放正文）；message / question 进卡片正文。默认 message",
+          ),
+        links: z
+          .array(
+            z.object({
+              label: z.string().describe("按钮文案"),
+              url: z.string().describe("跳转 URL"),
+            }),
+          )
+          .optional()
+          .describe("可选外链按钮"),
+      },
+    },
+    async ({ task_id, content, title, kind, links }) => {
+      if (!matchExpectedCallerToken(task_id, callerToken)) {
+        return callerMismatchContent();
+      }
+      console.log(
+        `[chat-mcp] share_to_group task=${task_id} kind=${kind ?? "message"} caller=${callerToken ?? "<none>"}`,
+      );
+      // 动态 import：避免 chat-mcp 静态依赖 feishu-group → meegle 新导出，
+      // 拉垮大量只 mock resolveUserIdentityForPrompt 的 ownership 单测。
+      const { getTask } = await import("./task-fs");
+      const { FeishuGroupError, shareToRequirementGroup } = await import(
+        "./feishu-group"
+      );
+      const task = await getTask(task_id);
+      if (!task) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ ok: false, error: "任务不存在" }),
+            },
+          ],
+        };
+      }
+      try {
+        const result = await shareToRequirementGroup(
+          task,
+          {
+            kind: kind ?? "message",
+            title,
+            content,
+            links,
+          },
+          // 显式分享（与 API / UI 同一条口子）：复用绑定前先确认属主还在群里，
+          // 否则卡片发进一个他看不见的群、还回报「分享成功」。
+          // 重建没有 agent 入口——recreateFrom 只由用户在 UI 引导里确认后回传。
+          { verifyOwnerMembership: true },
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ ok: true, ...result }),
+            },
+          ],
+        };
+      } catch (err) {
+        if (err instanceof FeishuGroupError) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  ok: false,
+                  error: err.message,
+                  code: err.code,
+                  ...(err.botLabel ? { botLabel: err.botLabel } : {}),
+                  ...(err.chatId ? { chatId: err.chatId } : {}),
+                }),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              }),
             },
           ],
         };

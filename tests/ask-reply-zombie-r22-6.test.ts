@@ -33,9 +33,13 @@ vi.mock("@/lib/server/task-artifacts", () => ({
 
 vi.mock("@/lib/server/chat-pending", () => ({
   invalidateCallerToken: vi.fn(),
-  // 僵尸前提：pending 内存已丢
+  // 僵尸前提：pending 内存已丢——认领必然落空、走下面的僵尸兜底分支
   getPendingAsk: vi.fn(() => null),
   clearPendingAsk: vi.fn(),
+  takePendingAskIf: vi.fn(() => null),
+  restorePendingAskIf: vi.fn(),
+  // 真僵尸的前提：没有别的链在了结这组 ask（跳过链在飞时另有守卫、见 tests/ask-skip.test.ts）
+  wasAskTakenRecently: vi.fn(() => false),
 }));
 
 vi.mock("@/lib/server/task-runner", async (importOriginal) => {

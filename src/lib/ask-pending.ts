@@ -9,9 +9,21 @@
  *
  * 这套判定原来散在前端 pendingEvent / rows / 后端 supersedePendingAsks 三处、各写一遍易漂移、
  * 收口到这里做单一源（项目约定：同样逻辑两处以上必抽 + 可单测）。
+ *
+ * 顺带收了 ask 事件 meta 的解析（{@link extractAskQuestions}）——同一份解析原本在
+ * 答题卡 / 回放行 / ask-reply 路由各有一份拷贝。本文件保持纯函数、client / server 共用。
  */
 
-import type { TaskEvent } from "./types";
+import type { AskUserQuestion, TaskEvent } from "./types";
+
+/**
+ * 「用户没答、直接发了新消息」这一种作废的 meta 标记（写在作废 info 事件上）。
+ *
+ * 为什么不另起一种事件 kind：了结判定（{@link isAskSettled} / {@link findPendingAskEvent}）
+ * 必须只有一套——跳过就是作废的一种，仍走 `meta.supersededAskId`，这个布尔只额外回答
+ * 「作废的原因是不是用户主动跳过」，供 UI 显示「已跳过」而不是中性的「已失效」。
+ */
+export const ASK_SKIPPED_META_KEY = "askSkipped";
 
 /** 某条 ask 是否已被用户回答（有对应的 ask_user_reply） */
 export const isAskReplied = (events: TaskEvent[], askId: string): boolean =>
@@ -33,6 +45,31 @@ export const isAskSuperseded = (events: TaskEvent[], askId: string): boolean =>
       typeof e.meta?.supersededAskId === "string" &&
       e.meta.supersededAskId === askId,
   );
+
+/**
+ * 某条 ask 是否是「被用户跳过」作废的（用户没答、直接发了新消息）。
+ * 是 {@link isAskSuperseded} 的子集——UI 据此把卡片收成一行「已跳过」。
+ */
+export const isAskSkipped = (events: TaskEvent[], askId: string): boolean =>
+  events.some(
+    (e) =>
+      e.kind === "info" &&
+      typeof e.meta?.supersededAskId === "string" &&
+      e.meta.supersededAskId === askId &&
+      e.meta[ASK_SKIPPED_META_KEY] === true,
+  );
+
+/**
+ * 这条 info 事件就是「用户跳过」的作废标记本身吗。
+ *
+ * 事件流渲染要把它滤掉：同一件事已经由那条 ask 折叠行（「AI 提过 N 个问题 · 已跳过」）
+ * 说清楚了，再多一行「上一组提问已跳过…」就是同话说两遍。**只滤显示、不滤数据**——
+ * 标记仍在 events.jsonl 里，了结判定全靠它。
+ */
+export const isAskSkipMarkerEvent = (ev: TaskEvent): boolean =>
+  ev.kind === "info" &&
+  typeof ev.meta?.supersededAskId === "string" &&
+  ev.meta[ASK_SKIPPED_META_KEY] === true;
 
 /** 某条 ask 是否已了结（已答 或 已作废）——了结的都不该再弹窗 */
 export const isAskSettled = (events: TaskEvent[], askId: string): boolean =>
@@ -56,4 +93,43 @@ export const findPendingAskEvent = (events: TaskEvent[]): TaskEvent | null => {
     return isAskSettled(events, askId) ? null : ev;
   }
   return null;
+};
+
+/** 读一条 ask_user_request 事件的 askId（缺 / 类型不对返 null） */
+export const askIdOfEvent = (ev: TaskEvent): string | null =>
+  typeof ev.meta?.askId === "string" && ev.meta.askId ? ev.meta.askId : null;
+
+/**
+ * 从 ask_user_request 事件的 meta 里解析出题目数组（宽容：脏条目跳过、坏 meta 返空）。
+ *
+ * 单一源：答题卡（客户端）、事件流回放行（客户端）、ask-reply 路由（服务端）、
+ * 跳过收口（服务端）四处都要同一份解析，原先各写了一遍。
+ */
+export const extractAskQuestions = (
+  meta: TaskEvent["meta"],
+): AskUserQuestion[] => {
+  if (!meta || !Array.isArray(meta.questions)) return [];
+  const out: AskUserQuestion[] = [];
+  for (const item of meta.questions as unknown[]) {
+    if (!item || typeof item !== "object") continue;
+    const m = item as Record<string, unknown>;
+    if (typeof m.id !== "string" || typeof m.question !== "string") continue;
+    const options: AskUserQuestion["options"] = [];
+    if (Array.isArray(m.options)) {
+      for (const optRaw of m.options as unknown[]) {
+        if (!optRaw || typeof optRaw !== "object") continue;
+        const o = optRaw as Record<string, unknown>;
+        if (typeof o.id === "string" && typeof o.label === "string") {
+          options.push({ id: o.id, label: o.label });
+        }
+      }
+    }
+    out.push({
+      id: m.id,
+      question: m.question,
+      options: options.length > 0 ? options : undefined,
+      allowText: typeof m.allowText === "boolean" ? m.allowText : true,
+    });
+  }
+  return out;
 };

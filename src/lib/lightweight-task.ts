@@ -24,7 +24,7 @@ export const renderLightweightDailySection = (t: {
 };
 
 /**
- * 推进弹窗：日常任务只保留「自定义」组（隐藏通用 / 团队 wk）。
+ * 推进弹窗：日常任务只保留「自定义」组（隐藏通用 / 团队 wk / 共享）。
  * 正式任务原样返回。
  */
 export const filterAdvanceGroupsForDailyTask = <T extends { key: string }>(

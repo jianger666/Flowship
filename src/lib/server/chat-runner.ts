@@ -94,6 +94,7 @@ import {
   SDK_SEND_TIMEOUT_MS,
   withSdkDeadline,
 } from "./sdk-deadline";
+import { finalizeOpenToolCalls } from "./finalize-open-tools";
 import {
   allocTaskRunInstanceId,
   publishTaskStreamEvent,
@@ -1665,6 +1666,10 @@ const finalizeChatRunIfCurrent = async (
 
   const isCurrent = (): boolean =>
     runningChats.get(taskId)?.instanceId === instanceId;
+
+  // 先闭合未配对 tool running——停止 / 完成 / 错误共用；写前复查 lease
+  await finalizeOpenToolCalls(taskId, isCurrent);
+  if (!isCurrent()) return false;
 
   if (outcome === "finished") {
     // 自然结束：会话保留，只归位 awaiting_user + done + flush

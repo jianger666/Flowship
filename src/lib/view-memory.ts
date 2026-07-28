@@ -31,13 +31,16 @@ export const getLastChatId = (): string | null =>
 // ---------- 输入草稿（按 task 记、发送后清；打了半段切页不丢） ----------
 
 // scope 区分同一 task 的多个输入位（chat 事件流输入岛 / 任务「跟 AI 说」条）
-const draftKey = (scope: string, taskId: string) =>
+// 只有「常驻输入位」才留草稿——弹窗 / 答题卡关掉就该清空、不进这套
+export type DraftScope = "reply" | "talk";
+
+const draftKey = (scope: DraftScope, taskId: string) =>
   `flowship:draft:${scope}:${taskId}`;
 
-export const loadDraft = (scope: string, taskId: string): string =>
+export const loadDraft = (scope: DraftScope, taskId: string): string =>
   ss()?.getItem(draftKey(scope, taskId)) ?? "";
 
-export const saveDraft = (scope: string, taskId: string, text: string) => {
+export const saveDraft = (scope: DraftScope, taskId: string, text: string) => {
   const s = ss();
   if (!s) return;
   if (text) s.setItem(draftKey(scope, taskId), text);

@@ -1,11 +1,11 @@
 /**
- * 推进面板布局：按用户偏好对 action key 排序 + 过滤隐藏项 + 固定三组分组。
+ * 推进面板布局：按用户偏好对 action key 排序 + 过滤隐藏项 + 固定四组分组。
  *
  * v0.9.12 起隐藏语义彻底化：/actions 页关掉的 action 在「推进」弹窗直接不出现
  *（原「更多」折叠区删了——关了就关了、要用去 /actions 页重新开启）。
  * 偏好来自 settings.actionLayout（个人级、落 config.json）。
  *
- * 分组（渲染层、内置固定三组）：通用 / 团队·wk 流程 / 自定义；
+ * 分组（渲染层、内置固定四组）：通用 / 团队·wk 流程 / 共享 / 自定义；
  * 组顺序 + 默认折叠走 actionLayout.groupOrder / collapsedGroups。
  */
 
@@ -28,13 +28,14 @@ export const isBuiltinAdvanceAction = (
   key: string,
 ): key is Exclude<ActionType, "custom"> => BUILTIN_SET.has(key);
 
-/** 推进弹窗固定三组 key（渲染层归属判定用） */
-export type ActionGroupKey = "builtin" | "team" | "custom";
+/** 推进弹窗固定四组 key（渲染层归属判定用） */
+export type ActionGroupKey = "builtin" | "team" | "shared" | "custom";
 
-/** 组顺序默认：通用 → 团队 · wk 流程 → 自定义 */
+/** 组顺序默认：通用 → 团队 · wk 流程 → 共享 → 自定义 */
 export const DEFAULT_GROUP_ORDER: ActionGroupKey[] = [
   "builtin",
   "team",
+  "shared",
   "custom",
 ];
 
@@ -42,6 +43,7 @@ export const DEFAULT_GROUP_ORDER: ActionGroupKey[] = [
 export const ACTION_GROUP_LABEL: Record<ActionGroupKey, string> = {
   builtin: "通用",
   team: "团队 · wk 流程",
+  shared: "共享",
   custom: "自定义",
 };
 
@@ -51,9 +53,28 @@ export const isActionGroupKey = (k: string): k is ActionGroupKey =>
   GROUP_KEY_SET.has(k);
 
 /**
- * 归一 groupOrder：只留合法三组、去重、缺的补到末尾（保证始终恰好三组）。
+ * 是否 wk 官方流程壳。
+ * 判定依据（二者取或，任一命中即视为壳）：
+ * 1. skill 名以 `wk-` 开头（wk 九壳命名约定）
+ * 2. 带有有限 order 字段（wk 九壳 order 10~90；杂项共享 action 通常无 order）
  */
-export const normalizeGroupOrder = (raw: string[] | undefined): ActionGroupKey[] => {
+export const isWkFlowShell = (
+  def: Pick<CustomActionDef, "skill" | "order"> | undefined,
+): boolean => {
+  if (!def) return false;
+  const skill = (def.skill ?? "").trim();
+  if (skill.startsWith("wk-")) return true;
+  const o = def.order;
+  return typeof o === "number" && Number.isFinite(o);
+};
+
+/**
+ * 归一 groupOrder：只留合法四组、去重；缺的按 DEFAULT_GROUP_ORDER 相对位置插入
+ *（存量三组无 shared → 插在 team 后，例如 builtin/team/custom → builtin/team/shared/custom）。
+ */
+export const normalizeGroupOrder = (
+  raw: string[] | undefined,
+): ActionGroupKey[] => {
   const seen = new Set<ActionGroupKey>();
   const out: ActionGroupKey[] = [];
   for (const k of raw ?? []) {
@@ -62,7 +83,20 @@ export const normalizeGroupOrder = (raw: string[] | undefined): ActionGroupKey[]
     seen.add(k);
   }
   for (const k of DEFAULT_GROUP_ORDER) {
-    if (!seen.has(k)) out.push(k);
+    if (seen.has(k)) continue;
+    // 缺组：插到默认序中「最后一个已存在的前驱」之后；前驱全无则插开头
+    const defaultIdx = DEFAULT_GROUP_ORDER.indexOf(k);
+    let insertAt = 0;
+    for (let i = defaultIdx - 1; i >= 0; i--) {
+      const pred = DEFAULT_GROUP_ORDER[i]!;
+      const predPos = out.indexOf(pred);
+      if (predPos >= 0) {
+        insertAt = predPos + 1;
+        break;
+      }
+    }
+    out.splice(insertAt, 0, k);
+    seen.add(k);
   }
   return out;
 };
@@ -94,18 +128,28 @@ export const emptyActionLayout = (): ActionLayoutPref => ({
   collapsedGroups: [],
 });
 
+/** resolveActionGroup / 分桶用的 def 切片（需 skill+order 判 wk 壳） */
+export type ActionGroupDefSlice = Pick<
+  CustomActionDef,
+  "origin" | "skill" | "order"
+>;
+
 /**
  * 判定 action key 归属哪一组。
  * - builtin：内置 ActionType
- * - team：origin=team 的派生
+ * - team：origin=team 且是 wk 流程壳（wk- 前缀或有 order）
+ * - shared：origin=team 的其余（同事共享杂项）
  * - custom：其余（legacy 自建 + app 壳派生）
  */
 export const resolveActionGroup = (
   key: string,
-  customById: ReadonlyMap<string, Pick<CustomActionDef, "origin">>,
+  customById: ReadonlyMap<string, ActionGroupDefSlice>,
 ): ActionGroupKey => {
   if (isBuiltinAdvanceAction(key)) return "builtin";
-  if (customById.get(key)?.origin === "team") return "team";
+  const def = customById.get(key);
+  if (def?.origin === "team") {
+    return isWkFlowShell(def) ? "team" : "shared";
+  }
   return "custom";
 };
 
@@ -130,7 +174,7 @@ export type PartitionGroupsOptions = {
  */
 export const partitionActionsByGroup = (
   keys: readonly string[],
-  customById: ReadonlyMap<string, Pick<CustomActionDef, "origin" | "order">>,
+  customById: ReadonlyMap<string, ActionGroupDefSlice>,
   groupOrder: string[] | undefined = DEFAULT_GROUP_ORDER,
   options: PartitionGroupsOptions = {},
 ): AdvanceActionGroup[] => {
@@ -138,6 +182,7 @@ export const partitionActionsByGroup = (
   const buckets: Record<ActionGroupKey, string[]> = {
     builtin: [],
     team: [],
+    shared: [],
     custom: [],
   };
   for (const key of keys) {
@@ -161,7 +206,7 @@ export const partitionActionsByGroup = (
  */
 export const groupAdvanceActions = (
   keys: readonly string[],
-  customById: ReadonlyMap<string, Pick<CustomActionDef, "origin" | "order">>,
+  customById: ReadonlyMap<string, ActionGroupDefSlice>,
   groupOrder: string[] | undefined = DEFAULT_GROUP_ORDER,
 ): AdvanceActionGroup[] =>
   partitionActionsByGroup(keys, customById, groupOrder, {

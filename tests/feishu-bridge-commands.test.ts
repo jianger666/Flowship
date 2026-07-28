@@ -1,8 +1,6 @@
 /**
  * 飞书桥接命令词：/help 面板卡 / /stop 双语义（锚定停运行、直发清理卡）/ 回执文案 / 异常
  */
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -18,13 +16,15 @@ import { __clearBridgeCommandsForTest } from "@/lib/server/feishu-bridge/router"
 import type { FeishuInboundMessage } from "@/lib/server/feishu-bridge/types";
 import type { TaskSummary } from "@/lib/types";
 
-// runCmd 走 routeInboundMessage、指针层会读写真实 bridge-state 文件——隔离到独立 tmp。
-// bridge-state 的数据目录在每次调用时才解析 env、import 后再设也生效。
-process.env.FLOWSHIP_DATA_DIR = path.join(
-  os.tmpdir(),
-  `feishu-bridge-commands-${Date.now()}`,
-  "data",
-);
+import {
+  baseRouterDeps,
+  installBridgeTestHooks,
+  makeBridgeTmpDataDir,
+} from "./helpers/feishu-bridge-harness";
+
+// runCmd 走 routeInboundMessage、指针层会读写真实 bridge-state 文件——隔离到独立 tmp
+const TMP = makeBridgeTmpDataDir("feishu-bridge-commands");
+installBridgeTestHooks({ tmpRoot: TMP });
 
 const baseMsg = (
   overrides: Partial<FeishuInboundMessage> = {},
@@ -166,35 +166,22 @@ describe("ensureBridgeCommandsRegistered", () => {
     const { routeInboundMessage, __setRouterDepsForTest } = await import(
       "@/lib/server/feishu-bridge/router"
     );
-    __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
+    // 走 baseRouterDeps 铺满：未注册命令（/compact 等）会落到注入主路径，
+    // 那里的 resolveReplyAnchorIds 要用 larkApi 反查 REST——漏给就真 spawn lark-cli
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        sendTextMessage: sendText,
+        findTaskByMessageId: findByRoot,
+        listTasks: async () => [mockTask()],
+        createTask: async (input) =>
+          ({
+            id: "task-new",
+            title: input.title,
+            mode: "chat",
+          }) as never,
+        handleChatReplyInject: handleChat as never,
       }),
-      sendTextMessage: sendText,
-      downloadMessageResource: async () => "/tmp/x",
-      findTaskByMessageId: findByRoot,
-      listTasks: async () => [mockTask()],
-      createTask: async (input) =>
-        ({
-          id: "task-new",
-          title: input.title,
-          mode: "chat",
-        }) as never,
-      getPendingAsk: () => null,
-      handleChatReplyInject: handleChat as never,
-      injectPendingAskText: async () => ({ ok: true as const }),
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk-test",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/repo" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-    });
+    );
     await routeInboundMessage(
       baseMsg({
         content: `/${command}${args ? ` ${args}` : ""}`,

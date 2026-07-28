@@ -29,6 +29,7 @@ import type {
   TaskEvent,
   TaskMode,
   TaskSummary,
+  TokenUsageRollup,
 } from "@/lib/types";
 import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
 import { failpoint } from "./failpoints";
@@ -203,6 +204,8 @@ export interface TaskMetaV06 {
   /** V0.6.7：per-repo 有效命名模板快照（build 渲染分支名用） */
   repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
+  /** 手填的 wk 需求编号（详见 types.ts Task.reqId；空 = 这个 task 没有 REQ-ID） */
+  reqId?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
   /** V0.10：任务隔离工作区开关（新建默认 true、逃生口 false、详见 types.ts Task.isolateWorktree） */
@@ -220,6 +223,8 @@ export interface TaskMetaV06 {
   pendingAskId?: string | null;
   createdAt: number;
   updatedAt: number;
+  /** token 用量汇总（每轮 turn-ended 落一次账、详见 types.ts TokenUsageRollup） */
+  tokenUsage?: TokenUsageRollup;
   model?: ModelSelection;
   uiLayout?: { artifactPanelSize?: number };
 }
@@ -1137,6 +1142,7 @@ export const assembleTask = (
   repoDevBranches: meta.repoDevBranches,
   repoBranchTemplates: meta.repoBranchTemplates,
   feishuStoryUrl: meta.feishuStoryUrl,
+  reqId: meta.reqId,
   contextDocs: meta.contextDocs,
   disabledMcpServers: meta.disabledMcpServers,
   isolateWorktree: meta.isolateWorktree,
@@ -1152,6 +1158,7 @@ export const assembleTask = (
   pendingAskId: meta.pendingAskId,
   createdAt: meta.createdAt,
   updatedAt: meta.updatedAt,
+  tokenUsage: meta.tokenUsage,
   model: meta.model,
   uiLayout: meta.uiLayout,
   events,

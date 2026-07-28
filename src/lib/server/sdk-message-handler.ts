@@ -160,6 +160,8 @@ const emitToolResult = async (
   msg: Extract<SDKMessage, { type: "tool_call" }>,
   /** await 后写前复查 */
   stillCurrent: () => boolean,
+  /** 旁路 run 身份（属主主链 undefined）——见 handleSdkMessage 的 origin 参数 */
+  origin?: string,
 ): Promise<void> => {
   try {
     const meta = await buildToolResultMeta({
@@ -185,6 +187,7 @@ const emitToolResult = async (
         text: summary,
         meta,
       },
+      origin,
     );
   } catch (err) {
     console.warn(
@@ -208,26 +211,34 @@ export const handleSdkMessage = async (
    * assistant / tool / error / tool_result + publish）。
    */
   lease: () => boolean,
+  /**
+   * 这一路 run 的身份 token（属主主链不传）。本翻译器被属主 run 与旁路只读答疑 run
+   * 共用——publish 出去的 envelope 带上它，群回流才分得清「这段回答是谁的」
+   * （见 task-stream 的 TaskStreamEvent.origin）。只影响 envelope、不落盘。
+   */
+  origin?: string,
 ): Promise<void> => {
   // 入口一次不够——每个 await 之后、写事件之前复用同一闭包复查
   const stillCurrent = lease;
   if (!stillCurrent()) return;
 
+  /** 本轮统一 sink：lease + origin 一次绑好，下面各分支只管事件内容 */
+  const writeEv = (
+    ev: Parameters<typeof writeOwnedEventAndPublish>[2],
+  ): Promise<unknown> =>
+    writeOwnedEventAndPublish(taskId, stillCurrent, ev, origin);
+
   switch (msg.type) {
     case "thinking": {
       await assistantCtx.flush();
       if (!stillCurrent()) return;
-      await writeOwnedEventAndPublish(
-        taskId,
-        stillCurrent,
-        {
-          kind: "thinking",
-          text: msg.text,
-          meta: msg.thinking_duration_ms
-            ? { durationMs: msg.thinking_duration_ms }
-            : undefined,
-        },
-    );
+      await writeEv({
+        kind: "thinking",
+        text: msg.text,
+        meta: msg.thinking_duration_ms
+          ? { durationMs: msg.thinking_duration_ms }
+          : undefined,
+      });
       break;
     }
 
@@ -263,43 +274,35 @@ export const handleSdkMessage = async (
           if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
           const argsStr = stringifyMeta(msg.args);
           if (!stillCurrent()) return;
-          await writeOwnedEventAndPublish(
-            taskId,
-            stillCurrent,
-            {
-              kind: "tool_call",
-              text: `agent 在写 artifact: ${possibleTarget}`,
-              meta: {
-                callId: msg.call_id,
-                name: msg.name,
-                args: argsStr ? truncate(argsStr) : undefined,
-              },
+          await writeEv({
+            kind: "tool_call",
+            text: `agent 在写 artifact: ${possibleTarget}`,
+            meta: {
+              callId: msg.call_id,
+              name: msg.name,
+              args: argsStr ? truncate(argsStr) : undefined,
             },
-    );
+          });
           break;
         }
         if (msg.status === "error") {
           const resStr = stringifyMeta(msg.result);
           if (!stillCurrent()) return;
-          await writeOwnedEventAndPublish(
-            taskId,
-            stillCurrent,
-            {
-              kind: "error",
-              text: `artifact 写入失败 ${msg.name} → ${possibleTarget}：${truncate(resStr, 200)}`,
-              meta: {
-                callId: msg.call_id,
-                name: msg.name,
-                target: possibleTarget,
-                result: truncate(resStr),
-              },
+          await writeEv({
+            kind: "error",
+            text: `artifact 写入失败 ${msg.name} → ${possibleTarget}：${truncate(resStr, 200)}`,
+            meta: {
+              callId: msg.call_id,
+              name: msg.name,
+              target: possibleTarget,
+              result: truncate(resStr),
             },
-    );
-          await emitToolResult(taskId, msg, stillCurrent);
+          });
+          await emitToolResult(taskId, msg, stillCurrent, origin);
           break;
         }
         // 写成功：先落 tool_result（给前端看 diff/摘要），再刷 artifact 面板
-        await emitToolResult(taskId, msg, stillCurrent);
+        await emitToolResult(taskId, msg, stillCurrent, origin);
         {
           const m = normalizedTarget.match(/actions\/(\d+)-[a-z]+\.md$/);
           if (m) {
@@ -328,14 +331,10 @@ export const handleSdkMessage = async (
         if (msg.status === "error") {
           const resStr = stringifyMeta(msg.result);
           if (!stillCurrent()) return;
-          await writeOwnedEventAndPublish(
-            taskId,
-            stillCurrent,
-            {
-              kind: "error",
-              text: `submit_work 工具调用失败：${truncate(resStr, 200)}`,
-            },
-    );
+          await writeEv({
+            kind: "error",
+            text: `submit_work 工具调用失败：${truncate(resStr, 200)}`,
+          });
         }
         break;
       }
@@ -348,42 +347,34 @@ export const handleSdkMessage = async (
           msg.args,
         );
         if (!stillCurrent()) return;
-        await writeOwnedEventAndPublish(
-          taskId,
-          stillCurrent,
-          {
-            kind: "tool_call",
-            text: `调用 ${msg.name}${argsStr ? `:${truncate(argsStr, 120)}` : ""}`,
-            // callId 供前端与 tool_result / tool_output_delta 配对；
-            // innerToolName 给兜底 A 精确识别 MCP 工具（勿解析 truncate 后的 text）
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              innerToolName: innerToolName || undefined,
-              args: argsStr ? truncate(argsStr, truncateMax) : undefined,
-            },
+        await writeEv({
+          kind: "tool_call",
+          text: `调用 ${msg.name}${argsStr ? `:${truncate(argsStr, 120)}` : ""}`,
+          // callId 供前端与 tool_result / tool_output_delta 配对；
+          // innerToolName 给兜底 A 精确识别 MCP 工具（勿解析 truncate 后的 text）
+          meta: {
+            callId: msg.call_id,
+            name: msg.name,
+            innerToolName: innerToolName || undefined,
+            args: argsStr ? truncate(argsStr, truncateMax) : undefined,
           },
-    );
+        });
       } else if (msg.status === "error") {
         const resStr = stringifyMeta(msg.result);
         if (!stillCurrent()) return;
-        await writeOwnedEventAndPublish(
-          taskId,
-          stillCurrent,
-          {
-            kind: "error",
-            text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
-            meta: {
-              callId: msg.call_id,
-              name: msg.name,
-              result: truncate(resStr),
-            },
+        await writeEv({
+          kind: "error",
+          text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
+          meta: {
+            callId: msg.call_id,
+            name: msg.name,
+            result: truncate(resStr),
           },
-    );
-        await emitToolResult(taskId, msg, stillCurrent);
+        });
+        await emitToolResult(taskId, msg, stillCurrent, origin);
       } else if (msg.status === "completed") {
         // Phase 1：completed 结果落盘（此前完全忽略 → shell/read 输出用户看不见）
-        await emitToolResult(taskId, msg, stillCurrent);
+        await emitToolResult(taskId, msg, stillCurrent, origin);
       }
       break;
     }
@@ -405,6 +396,7 @@ export const handleSdkMessage = async (
         publishIfCurrent(taskId, stillCurrent, {
           kind: "assistant_delta",
           text,
+          ...(origin ? { origin } : {}),
         });
       }
       break;
@@ -420,18 +412,14 @@ export const handleSdkMessage = async (
       ) {
         if (!stillCurrent()) return;
         assistantCtx.sdkErrorMessage = msg.message;
-        await writeOwnedEventAndPublish(
-          taskId,
-          stillCurrent,
-          {
-            kind: "error",
-            text: `SDK ${msg.status}：${msg.message}`,
-            meta: {
-              sdkStatus: msg.status,
-              sdkMessage: msg.message,
-            },
+        await writeEv({
+          kind: "error",
+          text: `SDK ${msg.status}：${msg.message}`,
+          meta: {
+            sdkStatus: msg.status,
+            sdkMessage: msg.message,
           },
-    );
+        });
       }
       break;
     }

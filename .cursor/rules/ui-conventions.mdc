@@ -43,6 +43,52 @@ alwaysApply: true
 - 需要「品牌强调」的选中（ChoiceButton card/chip）继续走 `border-primary + bg-primary/5~10 + text-primary`（有边框和文字色双重信号、两种模式都可辨）。
 - 改 `--selected` 值只动 globals.css 一处、所有选中态全站跟随。
 
+## 语义状态色 token（2026-07-28 一致性收口立规）
+
+- **一族一个 token，组件里不许再出现裸 Tailwind 色号**（`emerald-600` / `sky-500` / `amber-500` / `red-500` …）。token 在 `globals.css` 定义（`:root` + `.dark` 两套）、`@theme inline` 映射，做法与 `--selected` 完全同款：
+
+  | token | 语义 | 典型用法 |
+  | --- | --- | --- |
+  | `--success` | 成功 / 已完成 / 连通 | `text-success`、`bg-success/10`、`bg-success`（状态点） |
+  | `--warning` | 注意 / 有风险但不阻塞 | 已截断、非默认模型、缺项引导、探测「连上了但不对劲」 |
+  | `--info` | 进行中 / 中性信息 / 可跳转 | 运行中 spinner、tool_call、待办卡、路径链接、来源标 |
+  | `--destructive` | 失败 / 危险（**沿用现成的、不新增 danger**） | 错误图标、失败状态点、diff 删除行 |
+  | `--brand` | 品牌琥珀「电流」＝**唯一 accent** | logo、「等你行动」信号族 |
+  | `--subagent` | 块类型身份色（**不是状态色**） | 事件流子代理卡 / 思考图标 |
+
+- **取值口径**：浅色统一压到 `L≈0.54~0.58`（跟 `--destructive` 的 0.577 同档、白卡上 4.7~5.5:1）；深色统一 `L≈0.76~0.82`（原来在用的 400/500 档、8.3~9.9:1）。改颜色只动 `globals.css` 一处。
+- **「运行中」全站只有一种颜色：`text-info`**。`muted-foreground` 已经被「已中断」和降权过程行占着，运行中再用它就分不出两个状态了。
+- **`--brand` 只给「等你行动」**（侧栏琥珀脉冲点 / ask 答题卡 / 「AI 在等你回答」悬浮条 / `ask_user_request` 图标）+ logo。⛔ 别拿琥珀去染装饰性图标（目录 icon 之类）——每多染一处，真正需要用户行动时的信号就弱一分。装饰性图标一律 `text-muted-foreground`，形状本身已经能区分。
+- **`--warning` 和 `--brand` 同源不同档**（hue 80 vs 55），语义分开：warning = 「你看一眼」，brand = 「等你动手」。
+- 「当前查看 / 选中」永远走**选中态规范**（`bg-selected` + `ring-ring`），⛔ 不许为某一处单独引入第三种彩色体系（踩过：action-timeline 的 indigo 是全站唯一一处靛蓝）。
+
+## 字号阶梯：只有 4 档（2026-07-28 立规）
+
+收口前一屏并存六档（10 / 11 / 12 / 12.8 / 14 / 15），相邻档差 1px——起不到层级作用，只让同类信息「差一点点」，这是「看起来粗糙但说不出为什么」的典型来源。
+
+| 档 | 写法 | 用途 |
+| --- | --- | --- |
+| 15px | `text-[15px] leading-7` | 对话正文（chat 的 AI 回复；流式 placeholder 必须同档、否则收尾时整段跳一下） |
+| 14px | `text-sm` | 默认正文 |
+| 12px | `text-xs` | 辅助文字、次要说明、小按钮 |
+| 11px | `text-[11px]` | 元信息：时间戳、tag、计数、状态尾巴 |
+
+- ⛔ **不许再出现 10px**（可读性差一档、省不出信息密度）、`text-[0.8rem]`（12.8px）、`text-[12px]`（重复拼法、统一写 `text-xs`）、`text-[13px]`。
+- 12 和 11 之间不要再插新档；需要「比 11 更弱」用透明度（`text-muted-foreground/70`）而不是更小的字。
+
+## 页面标题只有 2 档（2026-07-28 立规）
+
+- **独立页**（看板 / 设置 / 能力 / 开始使用）：`text-lg font-semibold`
+- **详情页顶栏**（task 详情 / chat 详情）：`text-sm font-medium tracking-tight` —— 详情页顶栏是工具条不是封面，标题让位给密度；task 和 chat 是同一层级、必须同一规格。
+
+## 胶囊 / tag 家族（2026-07-28 立规）
+
+三种形态、各有归属，⛔ 不许再手写第四种：
+
+- **徽标** → `<Badge>`（`rounded-4xl`）。两档尺寸：`size="default"`（h-5 / 12px，独立状态标）、`size="xs"`（h-4.5 / 11px，挤在行内的元信息标）。语义色走 `variant="success" | "warning" | "destructive"`（三者形状对称、都是 `/10` 底衬 + 同色字）。⛔ 别在调用处用 `className="px-1 py-0 text-[11px]"` 或自己拼 tone class 造第三档。
+- **可点选 chip** → `<ChoiceButton shape="chip">`（`rounded-full`）。
+- **行内 tag**（action 归属标、来源标、待办 / 子代理标、skill / file token、muted 小计数标）→ 统一 `rounded-sm` + 11px。事件流的 action 归属标已抽成 `ActionTag`（`event-stream/utils.tsx`）、三处共用，别再各写一份。
+
 ## 设置类页面（v1.0.x 立规、用户两轮实测「乱」后定型）
 
 - **每个配置项一律用 `<SettingRow>`**（`src/components/ui/setting-row.tsx`）：左「名称 + 一句说明」右控件；宽控件（Input / ModelSelect）用 `stacked`（名称行 + 全宽控件、`labelExtra` 放名称行右侧操作按钮）。外层容器 `divide-y` 出行间分隔。
@@ -71,6 +117,12 @@ alwaysApply: true
 - 自定义滚动条是 classic 模式（占 8px 布局宽度）→ 滚动条出现/消失会挤压内容宽度、整页抖动（踩过：能力页切 tab 抖）。
 - **治理机制在 `globals.css`**：`scrollbar-gutter: stable` 挂在 `.overflow-y-auto` / `.overflow-auto` 工具类上——新增滚动容器只要用这两个 Tailwind 类就自动带治理、不需要手动加。
 - ⛔ 不要在单个组件里手加 `[scrollbar-gutter:stable]` 打补丁；⛔ 不要把规则改成 `*` 全局（overflow-hidden 容器会白吃 8px 槽位）。
+
+## 输入框「可点区」与 footer 挤压（2026-07-28 用户实测两条一起立规）
+
+- **定高的编辑区、编辑器本体必须撑满外层容器**（`min-h-full`）——外层给了固定高度（推进弹窗 104 / ask 答题卡 84 / 输入条拖高值）而编辑器只有 `min-h-13` 时，下面那截空白属于外层 div、点了不聚焦（用户实测「指令框只有顶上一行能点」）。高度随内容（无固定高）的场景保持 `min-h-13` 即可——外层本来就是被编辑器撑起来的、没有空档。⛔ 别用「外层 onClick 手动 focus」绕：会干扰选词、光标落位也不自然。
+- **`min-w-0` 要加在「自己是 nowrap 内容」的那个 flex item 上、父级加了不算数**——`truncate` 自带 `white-space: nowrap`，该元素的 min-content = 整串文字宽；它作为 flex item 时 `min-width:auto` 就等于内容宽、`max-w-*` 也压不住（min 赢 max），于是溢出父容器压到同排的右侧控件上（踩过：composer footer 模型选择器压住附图 / 发送图标）。父容器的 `min-w-0` 只让父容器能缩、管不到子元素。
+- 给别人塞内容的 **slot 容器**（footer `leading`、dialog body 之类）统一挂 `*:min-w-0` 兜底（同 `DialogContent` 既有做法）、新加内容不必各自记得。
 
 ## 设计 skill（V0.7.8 引入、两个都在 .cursor/skills/）
 

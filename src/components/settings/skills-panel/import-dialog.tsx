@@ -81,7 +81,7 @@ export const ImportSkillsDialog = ({
                   </div>
                 </div>
                 {appNames.has(s.dirName) && (
-                  <Badge variant="outline" className="shrink-0 text-[10px]">
+                  <Badge variant="outline" size="xs">
                     将覆盖
                   </Badge>
                 )}

@@ -207,6 +207,8 @@ export const updateTaskFields = async (
   patch: {
     title?: string;
     feishuStoryUrl?: string | null;
+    /** wk 需求编号：传值 = 改、传 null / 空串 = 清空回退派生值 */
+    reqId?: string | null;
     repoFeatureBranches?: Record<string, string> | null;
     addRepoPaths?: string[];
     addRepoBaseBranches?: Record<string, string>;
@@ -408,6 +410,8 @@ interface SSEEnvelope {
     | "queue_state"
     /** MessageOperation phase / terminal 帧 */
     | "message_op"
+    /** 旁路（受限群答疑）run 在飞与否——不写 runStatus，运行态只能靠这一帧 */
+    | "restricted_run"
     /** 任务已逻辑删除，客户端应停订阅、勿重连 */
     | "task_deleted";
   event?: TaskEvent;
@@ -432,6 +436,8 @@ interface SSEEnvelope {
   phase?: string;
   outcome?: string;
   taskId?: string;
+  /** restricted_run 帧：旁路答疑此刻在不在飞 */
+  active?: boolean;
 }
 
 const parseSseEvent = (frame: string): SSEEnvelope | null => {
@@ -495,6 +501,12 @@ export interface TaskStreamCallbacks {
     phase?: string;
     outcome?: string;
   }) => void;
+  /**
+   * restricted_run——旁路（受限群答疑）run 在飞与否。
+   * 它刻意不写 task.runStatus（与运行状态机解耦），但事件流里照样有它的工具调用；
+   * UI 拿它跟 runStatus 一起算「运行中」，否则那些工具块会被判成脏数据渲染「已中断」。
+   */
+  onRestrictedRun?: (active: boolean) => void;
   /**
    * task_deleted——任务已删，hook 停重连；可选通知 UI 清详情
    */
@@ -639,6 +651,12 @@ export const watchTaskStream = async (
               outcome:
                 typeof env.outcome === "string" ? env.outcome : undefined,
             });
+          } else if (
+            env.type === "restricted_run" &&
+            typeof env.active === "boolean"
+          ) {
+            // 旁路答疑在飞与否（运行态信号、不进 task.runStatus）
+            callbacks.onRestrictedRun?.(env.active);
           } else if (
             env.type === "task_deleted" &&
             typeof env.taskId === "string"
@@ -1119,6 +1137,8 @@ export const submitAskReply = async (
   options?: {
     deferred?: boolean;
     imagesByQuestion?: Record<string, ImagePayload[]>;
+    // v1.1.x：答题框 `/` 引用到的 skill（各题合并去重后传一份、指引只进 agent 消息）
+    skills?: Array<{ name: string; absPath: string }>;
     signal?: AbortSignal;
   },
 ): Promise<{ ok: true; persistWarning?: string }> => {
@@ -1144,6 +1164,9 @@ export const submitAskReply = async (
         ...(options?.deferred ? { deferred: true } : {}),
         ...(imagesByQuestion && Object.keys(imagesByQuestion).length > 0
           ? { imagesByQuestion }
+          : {}),
+        ...(options?.skills && options.skills.length > 0
+          ? { skills: options.skills }
           : {}),
         bootArgs: {
           apiKey: s.apiKey,
@@ -1250,4 +1273,133 @@ export const stopTaskPreview = async (repoPath?: string): Promise<void> => {
       body: JSON.stringify(repoPath ? { repoPath } : {}),
     }),
   );
+};
+
+// ----------------- 分享到需求群 -----------------
+
+/** 分享内容类型（与 POST /share-to-group body.kind 对齐） */
+export type ShareToGroupKind = "artifact" | "message" | "question";
+
+export type ShareToGroupLink = { label: string; url: string };
+
+export type ShareToGroupInput = {
+  kind: ShareToGroupKind;
+  title?: string;
+  content: string;
+  links?: ShareToGroupLink[];
+  /**
+   * 用户在「你已不在原需求群」引导里确认重建时回传的那条失效 chatId：
+   * 服务端跳过复用、重建群并覆盖工作项绑定。只有用户确认过才带。
+   */
+  recreateFrom?: string;
+};
+
+/** 成功 / 业务失败（含两类引导）统一结果；网络层失败仍抛 ApiRequestError */
+export type ShareToGroupResult =
+  | {
+      ok: true;
+      chatId: string;
+      /** 群名（服务端读到才有）——toast 说清发到哪个群了 */
+      chatName?: string;
+      messageId: string;
+      created: boolean;
+      /** 「本人还在不在群」没查出来（scope / 网络）——已照常发出 */
+      membershipUnknown?: boolean;
+    }
+  | {
+      ok: false;
+      error: string;
+      needManualBotAdd?: boolean;
+      /** needManualBotAdd 时的机器人准确名称（引导弹窗让用户搜这个名字加） */
+      botLabel?: string;
+      /** 死绑定（本人已退群 / 群没了）——调用方引导用户重建需求群 */
+      needGroupRebuild?: boolean;
+      /** needGroupRebuild 时那条失效的 chatId（确认重建后原样回传） */
+      chatId?: string;
+      /** needGroupRebuild 时的群名（读到才有）——弹窗里点名是哪个群 */
+      chatName?: string;
+    };
+
+/** 死绑定两码：本人已不在群 / 群已不可达，补救动作都是「重建需求群」 */
+const GROUP_REBUILD_CODES = new Set(["owner_not_in_group", "group_unreachable"]);
+
+/**
+ * 分享到飞书需求群。
+ * 业务失败（ok:false，含需手动加机器人 / 需重建群）不抛、由调用方按
+ * needManualBotAdd / needGroupRebuild 分流 UI；HTTP / 解析失败仍抛 ApiRequestError。
+ */
+export const shareToGroup = async (
+  taskId: string,
+  body: ShareToGroupInput,
+): Promise<ShareToGroupResult> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/share-to-group`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  // 业务失败：server 返 { error, code?, ... }（4xx 结构化错误，无 ok 字段）。
+  // 两类有引导可走：bot_not_in_group → 弹「手动加机器人」；
+  // owner_not_in_group / group_unreachable → 弹「重新建群」
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    !res.ok &&
+    "error" in data &&
+    typeof (data as { error: unknown }).error === "string"
+  ) {
+    const err = data as {
+      error: string;
+      code?: unknown;
+      botLabel?: unknown;
+      chatId?: unknown;
+      chatName?: unknown;
+    };
+    return {
+      ok: false,
+      error: err.error.trim() || `分享失败（HTTP ${res.status}）`,
+      needManualBotAdd: err.code === "bot_not_in_group",
+      botLabel: typeof err.botLabel === "string" ? err.botLabel : undefined,
+      needGroupRebuild: GROUP_REBUILD_CODES.has(String(err.code ?? "")),
+      chatId: typeof err.chatId === "string" ? err.chatId : undefined,
+      chatName: typeof err.chatName === "string" ? err.chatName : undefined,
+    };
+  }
+  if (!res.ok) {
+    const msg =
+      typeof data === "object" &&
+      data !== null &&
+      "error" in data &&
+      typeof (data as { error: unknown }).error === "string"
+        ? (data as { error: string }).error
+        : `HTTP ${res.status}`;
+    throw new ApiRequestError(msg, res.status);
+  }
+  const ok = data as {
+    ok?: unknown;
+    chatId?: unknown;
+    chatName?: unknown;
+    messageId?: unknown;
+    created?: unknown;
+    membershipUnknown?: unknown;
+  };
+  if (ok.ok !== true) {
+    throw new ApiRequestError("分享响应异常", res.status || 500);
+  }
+  return {
+    ok: true,
+    chatId: typeof ok.chatId === "string" ? ok.chatId : "",
+    chatName: typeof ok.chatName === "string" ? ok.chatName : undefined,
+    messageId: typeof ok.messageId === "string" ? ok.messageId : "",
+    created: ok.created === true,
+    membershipUnknown: ok.membershipUnknown === true,
+  };
 };

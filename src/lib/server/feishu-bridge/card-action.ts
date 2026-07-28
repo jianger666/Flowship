@@ -32,9 +32,20 @@ import {
   getCurrentChatTaskId,
   setCurrentChatTaskId,
 } from "./bridge-state";
+import {
+  ASK_CARD_ANSWERED_HINT,
+  isAskCardSettled,
+  settleAskCards,
+} from "./ask-card-settle";
 import { findTaskByMessageId } from "./card-map";
+import {
+  GROUP_MEMBER_FALLBACK_NAME,
+  mentionTag,
+  rememberGroupReply,
+  restoreGroupReply,
+} from "./group-shared";
 import { nextCardSequence } from "./card-seq";
-import { askOptionElementId, askQuestionElementId } from "./card-stream";
+import { askOptionElementId } from "./card-stream";
 import {
   execCleanupCard,
   execNewChatNoArgs,
@@ -49,6 +60,7 @@ import {
   batchUpdateCard,
   getBotAppInfo,
   sendTextMessage,
+  sendTextMessageToChat,
   updateCardEntity,
 } from "./lark-api";
 import {
@@ -75,10 +87,19 @@ export type NormalizedCardAction = {
   chatId?: string;
 };
 
+/** 取第一个非空字符串（各家 schema 字段名不一、取值链一律用它拼） */
+const firstString = (...cands: unknown[]): string | undefined => {
+  for (const c of cands) {
+    if (typeof c === "string" && c) return c;
+  }
+  return undefined;
+};
+
 /**
  * 从 lark-cli 扁平输出 / 官方嵌套 event 两种形态抽出关键字段。
- * 扁平（consume 实测 schema）：operator_id / action_value / message_id / token
- * 嵌套（开放平台原文）：operator.open_id / event.action.value / event.context.open_message_id
+ * 扁平（consume 实测 schema）：operator_id / action_value / message_id / chat_id / token
+ * 嵌套（开放平台原文）：operator.open_id / event.action.value /
+ * event.context.open_message_id / event.context.open_chat_id
  */
 export const normalizeCardActionEvent = (
   raw: unknown,
@@ -88,6 +109,11 @@ export const normalizeCardActionEvent = (
   const nested =
     o.event && typeof o.event === "object"
       ? (o.event as Record<string, unknown>)
+      : null;
+  // 官方原文把会话 / 消息标识塞在 event.context 里（扁平 schema 没有这一层）
+  const nestedCtx =
+    nested?.context && typeof nested.context === "object"
+      ? (nested.context as Record<string, unknown>)
       : null;
 
   // operator
@@ -110,20 +136,13 @@ export const normalizeCardActionEvent = (
   }
 
   // message_id
-  let messageId = "";
-  if (typeof o.message_id === "string") messageId = o.message_id;
-  else if (typeof o.open_message_id === "string") messageId = o.open_message_id;
-  else if (nested) {
-    const ctx =
-      nested.context && typeof nested.context === "object"
-        ? (nested.context as Record<string, unknown>)
-        : null;
-    if (ctx && typeof ctx.open_message_id === "string") {
-      messageId = ctx.open_message_id;
-    } else if (typeof nested.message_id === "string") {
-      messageId = nested.message_id;
-    }
-  }
+  const messageId =
+    firstString(
+      o.message_id,
+      o.open_message_id,
+      nestedCtx?.open_message_id,
+      nested?.message_id,
+    ) ?? "";
 
   // action value：扁平 action_value（常为 JSON 字符串）/ 嵌套 action.value（对象或字符串）
   let valueRaw: unknown;
@@ -146,14 +165,18 @@ export const normalizeCardActionEvent = (
     return null;
   }
 
-  const token =
-    (typeof o.token === "string" && o.token) ||
-    (nested && typeof nested.token === "string" && nested.token) ||
-    undefined;
-  const chatId =
-    (typeof o.chat_id === "string" && o.chat_id) ||
-    (nested && typeof nested.chat_id === "string" && nested.chat_id) ||
-    undefined;
+  const token = firstString(o.token, nested?.token);
+  // 来源 chat 取值链：漏一层就会让群卡片校验拿不到来源、把跨角色答题 / 群推进
+  // 降级成 owner-only（`isGroupCardClickFromItsChat` 的 fail-closed 兜底）——
+  // 群里除属主外全员哑火。扁平 chat_id / open_chat_id、嵌套 event.*、
+  // 官方原文 event.context.open_chat_id 都要认。
+  const chatId = firstString(
+    o.chat_id,
+    o.open_chat_id,
+    nested?.chat_id,
+    nested?.open_chat_id,
+    nestedCtx?.open_chat_id,
+  );
 
   return { operatorOpenId, messageId, token, valueRaw, chatId };
 };
@@ -197,6 +220,43 @@ export const parseCardButtonValue = (raw: unknown): CardButtonValue | null => {
       ...(typeof v.lastUserMessage === "string"
         ? { lastUserMessage: v.lastUserMessage }
         : {}),
+    };
+  }
+  if (v.kind === "group_ask") {
+    if (
+      typeof v.taskId !== "string" ||
+      typeof v.askId !== "string" ||
+      typeof v.questionId !== "string" ||
+      typeof v.optionId !== "string" ||
+      typeof v.chatId !== "string"
+    ) {
+      return null;
+    }
+    return {
+      kind: "group_ask",
+      taskId: v.taskId,
+      askId: v.askId,
+      questionId: v.questionId,
+      optionId: v.optionId,
+      chatId: v.chatId,
+    };
+  }
+  if (v.kind === "group_advance") {
+    if (
+      typeof v.taskId !== "string" ||
+      typeof v.chatId !== "string" ||
+      typeof v.pickId !== "string" ||
+      typeof v.actionKey !== "string"
+    ) {
+      return null;
+    }
+    return {
+      kind: "group_advance",
+      taskId: v.taskId,
+      chatId: v.chatId,
+      pickId: v.pickId,
+      actionKey: v.actionKey,
+      ...(typeof v.label === "string" ? { label: v.label } : {}),
     };
   }
   if (v.kind === "end_chat") {
@@ -254,50 +314,19 @@ const resolveCardId = async (
 };
 
 /**
- * 把某题的选项按钮组换成一句 markdown（delete_elements + update_element 问题区）。
- * element_id 与 card-stream.appendAskUser 严格对偶：短哈希 helper 单一来源
- * （CardKit element_id ≤20 字符硬约束、不能直拼 askId/qid/optId）。
+ * 无 pending 时只知道被点的那颗按钮——把它换成失效提示。
+ *
+ * 这组 ask 已经被 {@link settleAskCards} 整体置成终态时**不做**：问题区连同按钮
+ * 早被换掉了，再 patch 一个不存在的 element_id 只会白报一次飞书错误。
  */
-const patchAskQuestionAnswered = async (
-  cardId: string,
-  askId: string,
-  questionId: string,
-  optionIds: string[],
-  statusMarkdown: string,
-): Promise<void> => {
-  const btnIds = optionIds.map((oid) =>
-    askOptionElementId(askId, questionId, oid),
-  );
-  const actions: unknown[] = [];
-  if (btnIds.length > 0) {
-    actions.push({
-      action: "delete_elements",
-      params: { element_ids: btnIds },
-    });
-  }
-  const qid = askQuestionElementId(askId, questionId);
-  // 问题标题 markdown → 附上已选/失效文案（全量替换该 element）
-  actions.push({
-    action: "update_element",
-    params: {
-      element_id: qid,
-      element: {
-        tag: "markdown",
-        element_id: qid,
-        content: statusMarkdown,
-      },
-    },
-  });
-  await batchUpdateCard(cardId, actions, nextOutOfBandSeq(cardId));
-};
-
-/** 无 pending 时只知道被点的那颗按钮——把它换成失效提示 */
 const patchSingleButtonStale = async (
   cardId: string,
+  taskId: string,
   askId: string,
   questionId: string,
   optionId: string,
 ): Promise<void> => {
+  if (isAskCardSettled(taskId, askId)) return;
   const bid = askOptionElementId(askId, questionId, optionId);
   await batchUpdateCard(
     cardId,
@@ -342,6 +371,7 @@ const patchRetryDone = async (cardId: string): Promise<void> => {
 // ----------------- ask / retry 业务 -----------------
 
 type AskValue = Extract<CardButtonValue, { kind: "ask" }>;
+type GroupAskValue = Extract<CardButtonValue, { kind: "group_ask" }>;
 type RetryValue = Extract<CardButtonValue, { kind: "retry" }>;
 type EndChatValue = Extract<CardButtonValue, { kind: "end_chat" }>;
 type CmdValue = Extract<CardButtonValue, { kind: "cmd" }>;
@@ -401,6 +431,7 @@ const handleAskAction = async (
       try {
         await patchSingleButtonStale(
           cardId,
+          value.taskId,
           value.askId,
           value.questionId,
           value.optionId,
@@ -519,28 +550,17 @@ const handleAskAction = async (
     warnLark("writeUserEventAndPublishStrict(ask_user_reply)", err);
   }
 
-  // 卡片置已答：被点题「已选择：」（Hermes interaction_result 同款）、其余题「（未回答）」+ 删按钮
-  // header 恢复：出卡句柄不可达，且 updateCardEntity 需全量 card JSON——本路径只改按钮区
-  if (cardId) {
-    try {
-      for (const question of pending.questions) {
-        const optIds = question.options?.map((o) => o.id) ?? [];
-        const status =
-          question.id === value.questionId
-            ? `**${question.question}**\n\n已选择：${built.label}`
-            : `**${question.question}**\n\n（未回答）`;
-        await patchAskQuestionAnswered(
-          cardId,
-          value.askId,
-          question.id,
-          optIds.length > 0 ? optIds : [value.optionId],
-          status,
-        );
-      }
-    } catch (err) {
-      warnLark("patchAskAnswered", err);
-    }
-  }
+  // 卡片置已答：被点题「已选择：」（Hermes interaction_result 同款）、其余题「（未回答）」+ 删按钮。
+  // 走统一收口点——同一组 ask 可能同时挂在 p2p 流式卡和需求群答题卡上，两张都要置态
+  //（header 恢复不了：出卡句柄不可达、updateCardEntity 要全量 card JSON，本路径只改元素区）
+  await settleAskCards({
+    taskId: value.taskId,
+    askId: value.askId,
+    questions: pending.questions,
+    noteByQuestion: { [value.questionId]: `已选择：${built.label}` },
+    fallbackNote: "（未回答）",
+    hintNote: ASK_CARD_ANSWERED_HINT,
+  });
 };
 
 const handleRetryAction = async (
@@ -694,6 +714,112 @@ const handleEndAllAction = async (messageId: string): Promise<void> => {
   }
 };
 
+// ----------------- 需求群答题（跨角色、非 owner 也放行） -----------------
+
+/**
+ * 群答题卡按钮回调。
+ *
+ * 与 p2p handleAskAction 的三点差异：
+ * 1. 不过 owner 闸——群里任何人都能替本机任务答题（跨角色协作的核心）；
+ * 2. 走 injectPendingAskText（chat / task 两种模式通吃）而不是只认 chat 的 deliverChatAskReply；
+ * 3. 答案带答题人姓名（事件流看得出谁答的）；先到先得，后到的在群里回「已被 XX 回答」。
+ *
+ * 答完同样登记回群（第五轮双审 P2-1）：在群里**打字**作答会把 agent 这轮的答复 @ 回群，
+ * **点按钮**却全程不登记——同一件事两种入口两种结果，点完按钮的人就此没了下文。
+ */
+const handleGroupAskAction = async (
+  value: GroupAskValue,
+  operatorOpenId: string,
+  messageId: string,
+): Promise<void> => {
+  // 动态 import：ask-inject 静态引 task-runner，本模块挂在 bootstrap 启动链上——
+  // 静态连边会把这条重依赖拖进 p2p 卡片回调的模块图（并炸「只 mock 局部导出」的
+  // 既有单测）。群答题是低频路径，按需加载即可。
+  const { injectPendingAskText } = await import("./ask-inject");
+  // 卡片回调事件只给 open_id、没有姓名（换姓名要通讯录权限、公司不给审批）——
+  // 群里点按钮答题一律记泛称；打字作答那条链有 sender_name、记的是真名。
+  const answeredBy = GROUP_MEMBER_FALLBACK_NAME;
+  const cardId = await resolveCardId(messageId);
+  const pending = getPendingAsk(value.taskId);
+
+  // 先到先得：app / p2p / 群里另一个人已经答过 → 这次点击作废
+  if (!pending || pending.askId !== value.askId) {
+    if (cardId) {
+      try {
+        await patchSingleButtonStale(
+          cardId,
+          value.taskId,
+          value.askId,
+          value.questionId,
+          value.optionId,
+        );
+      } catch (err) {
+        warnLark("patchGroupAskStale", err);
+      }
+    }
+    try {
+      await sendTextMessageToChat(
+        value.chatId,
+        `${mentionTag(operatorOpenId, answeredBy)} 这个问题已经有人回答了`,
+      );
+    } catch (err) {
+      warnLark("sendTextMessageToChat(stale group ask)", err);
+    }
+    return;
+  }
+
+  const q = pending.questions.find((x) => x.id === value.questionId);
+  const opt = q?.options?.find((o) => o.id === value.optionId);
+  if (!q || !opt) {
+    console.warn(
+      `${LOG} 群答题选项不在 pending 内 task=${value.taskId} q=${value.questionId} opt=${value.optionId}`,
+    );
+    return;
+  }
+
+  let bootArgs: { apiKey?: string; model?: ModelSelection } | undefined;
+  try {
+    const boot = await loadBridgeBootContext();
+    if (boot) bootArgs = { apiKey: boot.apiKey, model: boot.model };
+  } catch (err) {
+    warnLark("loadBridgeBootContext(group ask)", err);
+  }
+
+  // 登记必须抢在注入之前：deliverAskReply 一返回 agent 就在跑、先到的 delta / done
+  // 会错过窗口。答案送进的是属主活会话 → owner 通道；那格被在飞的推进登记占着时
+  // rememberGroupReply 自己让位返 null（这轮结果由推进的产物卡承载）
+  const replyHandle = rememberGroupReply(value.taskId, {
+    chatId: value.chatId,
+    requesterOpenId: operatorOpenId,
+    requesterName: answeredBy,
+    kind: "question",
+    channel: "owner",
+  });
+  const result = await injectPendingAskText(
+    value.taskId,
+    opt.label,
+    bootArgs,
+    undefined,
+    { answeredBy },
+  );
+  if (!result.ok) {
+    // 没送进去就别挂着登记——否则下一轮无关的 done 会把结果误发进群
+    restoreGroupReply(value.taskId, replyHandle);
+    try {
+      await sendTextMessageToChat(
+        value.chatId,
+        `${mentionTag(operatorOpenId, answeredBy)} 答案没送达：${result.error}`,
+      );
+    } catch (err) {
+      warnLark("sendTextMessageToChat(group ask fail)", err);
+    }
+    return;
+  }
+
+  // 卡片置已答不在这里做：`injectPendingAskText` 送达成功后统一置态（群卡 + p2p 卡一起），
+  // 群里**打字**作答走的也是它——同一件事只留一个收口点，两个入口结果一致
+};
+
 // ----------------- 控制面板快捷按钮 -----------------
 
 /** 面板按钮 → 等价命令流程（commands 导出的共用执行体） */
@@ -712,6 +838,44 @@ const handleCmdAction = async (value: CmdValue): Promise<void> => {
 // ----------------- 入口 -----------------
 
 /**
+ * 这次群卡片点击是不是发生在卡片自己那个群里（群答题卡 / 群推进选择卡共用）。
+ *
+ * 群答题卡不过 owner 闸（跨角色作答是它的意义），于是「谁能点」全靠这条：
+ * 飞书卡片可以被转发到任意会话，转发后的按钮 value 原样带着 taskId / askId ——
+ * 不校来源的话，任何拿到转发卡的人都能替属主把这组问题答掉。
+ * 群推进卡虽然还有一道 owner 闸，但它的回执 / 拒绝提示都发往 `value.chatId`
+ *（出卡时写死的那个需求群），转发出去点一下就是往无关群里丢消息。
+ *
+ * 事件没带来源 chat（lark-cli 扁平 schema 偶尔缺字段）时退回 owner 闸：
+ * 宁可只让本机应用 owner 点，也不放行一次身份不明的作答。
+ */
+const isGroupCardClickFromItsChat = async (
+  norm: NormalizedCardAction,
+  cardChatId: string,
+): Promise<boolean> => {
+  const from = norm.chatId?.trim() ?? "";
+  if (from) {
+    if (from === cardChatId) return true;
+    console.warn(
+      `${LOG} 群卡片点击来源与卡片绑定的群不一致、丢弃 from=${from} card=${cardChatId}`,
+    );
+    return false;
+  }
+  let ownerOpenId = "";
+  try {
+    ownerOpenId = (await getBotAppInfo()).ownerOpenId;
+  } catch (err) {
+    warnLark("getBotAppInfo(群卡片来源校验)", err);
+    return false;
+  }
+  if (ownerOpenId && norm.operatorOpenId === ownerOpenId) return true;
+  console.warn(
+    `${LOG} 群卡片点击缺来源 chat、非 owner 一律丢弃 op=${norm.operatorOpenId}`,
+  );
+  return false;
+};
+
+/**
  * inbound 经 router.dispatchCardActionEvent 丢进来的原始 NDJSON。
  * 全程 try/catch，不向外抛（坑 #10）。
  */
@@ -723,7 +887,38 @@ export const handleCardActionEvent = async (raw: unknown): Promise<void> => {
       return;
     }
 
-    // 坑 #12：非本人忽略（卡片可被转发）
+    const value = parseCardButtonValue(norm.valueRaw);
+    if (!value) {
+      console.warn(`${LOG} CardButtonValue 不合法、丢弃`);
+      return;
+    }
+
+    // 需求群答题卡：跨角色协作的核心——群里任何人都能答，**不过** owner 闸。
+    // 但「群里任何人」的边界得校出来：卡片能被转发，转发后点按钮的人跟需求群毫无关系
+    // （坑 #12 那道 owner 闸对本分支是关的）。所以要求事件来源 chat 与卡片自己记的
+    // chatId 一致；来源拿不到时退回 owner 闸。
+    if (value.kind === "group_ask") {
+      if (!(await isGroupCardClickFromItsChat(norm, value.chatId))) return;
+      await handleGroupAskAction(value, norm.operatorOpenId, norm.messageId);
+      return;
+    }
+
+    // 需求群推进选择卡：属主闸在 group-route 内做（非属主要回群提示、不是静默丢弃）。
+    // 但来源校验得先做——卡片能被转发，转发到别的群里点「推进」会往**卡片自己那个
+    // 需求群**回「已开始跑」（value.chatId 是出卡时写死的），同 group_ask 一条口径。
+    // 动态 import：group-route 静态挂着 task-runner 一串重依赖——按需加载、
+    // 别拖进 p2p 卡片回调的模块图（同 group_ask 走 ask-inject 的处理）。
+    if (value.kind === "group_advance") {
+      if (!(await isGroupCardClickFromItsChat(norm, value.chatId))) return;
+      const { handleGroupAdvancePick } = await import("./group-route");
+      await handleGroupAdvancePick(value, norm.operatorOpenId, async () => {
+        const boot = await loadBridgeBootContext();
+        return boot ? { apiKey: boot.apiKey, model: boot.model } : null;
+      });
+      return;
+    }
+
+    // 坑 #12：其余卡片非本人忽略（卡片可被转发）
     let ownerOpenId = "";
     try {
       ownerOpenId = (await getBotAppInfo()).ownerOpenId;
@@ -735,12 +930,6 @@ export const handleCardActionEvent = async (raw: unknown): Promise<void> => {
       console.warn(
         `${LOG} operator≠owner、丢弃 op=${norm.operatorOpenId} owner=${ownerOpenId}`,
       );
-      return;
-    }
-
-    const value = parseCardButtonValue(norm.valueRaw);
-    if (!value) {
-      console.warn(`${LOG} CardButtonValue 不合法、丢弃`);
       return;
     }
 

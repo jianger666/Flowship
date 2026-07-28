@@ -138,11 +138,11 @@ const StepRow = ({
 }) => (
   <div className="flex items-center gap-3 px-4 py-3.5">
     {done ? (
-      <CheckCircle2 className="size-5 shrink-0 text-green-500" />
+      <CheckCircle2 className="size-5 shrink-0 text-success" />
     ) : (
       <span className="relative flex size-5 shrink-0 items-center justify-center">
         <Circle className="size-5 text-muted-foreground/40" />
-        <span className="absolute text-[10px] font-medium text-muted-foreground">
+        <span className="absolute text-[11px] font-medium text-muted-foreground">
           {index}
         </span>
       </span>
@@ -171,7 +171,7 @@ const StepRow = ({
 export const SetupChecklist = ({ gate }: { gate: SetupGate }) => {
   return (
     <div className="mx-auto w-full max-w-xl px-6 py-14">
-      <h1 className="text-xl font-semibold tracking-tight">开始使用</h1>
+      <h1 className="text-lg font-semibold tracking-tight">开始使用</h1>
       <p className="mt-1 text-sm text-muted-foreground">
         配好这几样、这里就是你的飞书排期看板
       </p>

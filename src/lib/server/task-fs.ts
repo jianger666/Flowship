@@ -56,7 +56,10 @@ import type {
   TaskContextDocType,
   TaskEvent,
   TaskSummary,
+  TurnTokenUsage,
 } from "@/lib/types";
+import { accumulateTokenUsage } from "@/lib/token-usage";
+import { normalizeReqId } from "@/lib/req-id";
 import { mrTargetBranchOf } from "@/lib/task-display";
 import {
   cleanupOrphanTaskWorktrees,
@@ -86,6 +89,7 @@ import {
   META_FILE,
   actionArtifactRelPath,
   appendEventLine,
+  assembleTask,
   clearEventSeqCounter,
   ensureDataDir,
   exists,
@@ -1340,6 +1344,8 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
         ? repoBranchTemplates
         : undefined,
     feishuStoryUrl: input.feishuStoryUrl?.trim() || undefined,
+    // 手填 wk 需求编号：非法字面（带 / 空格等）一律丢弃、运行时回退派生值
+    reqId: normalizeReqId(input.reqId),
     contextDocs: initialContextDocs,
     disabledMcpServers:
       input.disabledMcpServers && input.disabledMcpServers.length > 0
@@ -1767,6 +1773,53 @@ export const setTaskUiLayout = async (
   });
 
 /**
+ * 落一轮 token 用量（SDK `turn-ended` → run-perf 调、每轮只写一次）
+ *
+ * 双投影、一次写盘：
+ *   - `meta.tokenUsage`   task 级（chat / task 两条链都走这里）
+ *   - `action.tokenUsage` 只记到「此刻正在跑」的那条 action 上（回答「一次 build 烧了多少」）
+ *     卡 status=running：迟到的 turn-ended（run 已收尾 / 旁路只读答疑在 idle 时跑）
+ *     不会误记到已完成的 action 头上。
+ *
+ * 刻意**不动 `meta.updatedAt`**——用量是旁路遥测，不该顶掉侧栏排序 / 已读判定。
+ *
+ * @returns 更新后的 Task，**events 为空数组**：调用方只拿它 publish 一帧 `task`
+ *   （watch-task 对中途 task 帧本来就 stripEvents、客户端 mergeTaskEvents 保留本地事件），
+ *   顺带避开「读全量 events.jsonl 期间被更新的写抢先、publish 回旧快照」的窗口。
+ *   任务不存在 / meta 损坏 → null（不抛，埋点绝不能拖垮主流程）。
+ */
+export const recordTurnUsage = async (
+  taskId: string,
+  turn: TurnTokenUsage,
+): Promise<Task | null> =>
+  withTaskLock(taskId, async () => {
+    // meta 损坏时 readMetaV06 会抛——埋点场景一律降级成「不记账」
+    const meta = await readMetaV06(taskId).catch(() => null);
+    if (!meta) return null;
+    const now = Date.now();
+    meta.tokenUsage = accumulateTokenUsage(meta.tokenUsage, turn, now);
+
+    const idx = meta.currentActionId
+      ? meta.actions.findIndex((a) => a.id === meta.currentActionId)
+      : -1;
+    const current = idx >= 0 ? meta.actions[idx] : undefined;
+    if (current && current.status === "running") {
+      const next: ActionRecord = {
+        ...current,
+        tokenUsage: accumulateTokenUsage(current.tokenUsage, turn, now),
+      };
+      meta.actions = [
+        ...meta.actions.slice(0, idx),
+        next,
+        ...meta.actions.slice(idx + 1),
+      ];
+    }
+
+    await writeMeta(meta);
+    return assembleTask(meta, []);
+  });
+
+/**
  * V0.6.6：编辑任务的「建任务字段」（详情页编辑弹窗用）
  *
  * 只放可安全后改的软配置：title / feishuStoryUrl / repoFeatureBranches。
@@ -1785,6 +1838,11 @@ export interface UpdateTaskFieldsInput {
    */
   titleAutoPending?: boolean;
   feishuStoryUrl?: string | null;
+  /**
+   * 手填 wk 需求编号：传值 = 改、传 null / 空串 = 清空回退派生值。
+   * 与飞书链接不同、这个字段没有身份闸门——改错了下次门禁自己会跳过、不留坏状态。
+   */
+  reqId?: string | null;
   repoFeatureBranches?: Record<string, string> | null;
   /**
    * V0.6.28：中途**追加**仓库（只增不删、删仓涉及已建分支 / MR 残留引用、边界多收益低）
@@ -1837,6 +1895,13 @@ export const updateTaskFields = async (
         );
         if (doc) doc.content = newUrl;
       }
+    }
+
+    // wk 需求编号：null / 空串 / 非法字面 → 删字段（回退派生值）；合法值原样落盘
+    if (input.reqId !== undefined) {
+      const next = normalizeReqId(input.reqId ?? undefined);
+      if (next) meta.reqId = next;
+      else delete meta.reqId;
     }
 
     // V0.6.28：追加仓库（只增不删、并集语义）——必须在 repoFeatureBranches 清洗之前处理、

@@ -20,6 +20,7 @@ import { promises as fs } from "node:fs";
 import type { ModelSelection } from "@cursor/sdk";
 
 import { isAbsolutePathLike } from "@/lib/path-utils";
+import { MAX_SKILL_REFS } from "@/lib/protocol-signals";
 import type { ImageAttachmentInput } from "@/lib/server/task-artifacts";
 
 // ----------------- Response helpers -----------------
@@ -285,10 +286,12 @@ interface ParseSkillsErr {
  * 校验 body.skills：数组、每项 name/absPath 非空字符串、上限 max、absPath 必须绝对路径。
  * 不做 fs.stat（skill 路径来自本机扫描缓存、缺文件由 agent read 时报错即可）。
  * 缺省 / null / undefined → 空数组（调用方直接拼 directive 即可）。
+ *
+ * 上限默认取 `MAX_SKILL_REFS`（与客户端截断同源）——各通道别再自己定一份。
  */
 export const parseAndValidateSkills = (
   raw: unknown,
-  max = 8,
+  max = MAX_SKILL_REFS,
 ): ParseSkillsOk | ParseSkillsErr => {
   if (raw === undefined || raw === null) {
     return { ok: true, skills: [] };
@@ -299,7 +302,11 @@ export const parseAndValidateSkills = (
   if (raw.length > max) {
     return {
       ok: false,
-      errorResponse: errorResponse(`skills 最多 ${max} 个`),
+      // 文案给可行动的下一步：正常路径上客户端已按同一上限截断过，
+      // 走到这里多半是 HTTP 直调
+      errorResponse: errorResponse(
+        `一条消息最多引用 ${max} 个 skill，请删掉几个再发`,
+      ),
     };
   }
   const skills: SkillRefInput[] = [];

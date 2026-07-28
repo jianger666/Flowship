@@ -105,8 +105,8 @@ const ManualLaunchInner = () => {
       </div>
 
       {isFixBugFlow && (
-        <div className="flex items-center gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm">
-          <Bug className="size-4 shrink-0 text-amber-600 dark:text-amber-500" />
+        <div className="flex items-center gap-3 rounded-md border border-warning/30 bg-warning/5 px-4 py-3 text-sm">
+          <Bug className="size-4 shrink-0 text-warning" />
           <span className="min-w-0 flex-1">
             将修复：
             <a

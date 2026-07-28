@@ -53,7 +53,7 @@ export const BatchProgress = ({ task }: Props) => {
         <Layers />
         {hasBatches ? "批次进度" : "未分批"}
         {hasBatches && (
-          <span className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+          <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
             {done}/{total}
           </span>
         )}
@@ -92,7 +92,7 @@ export const BatchProgress = ({ task }: Props) => {
                       {/* 序号 / 绿勾 */}
                       <span
                         className={cn(
-                          "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full border font-mono text-[10px]",
+                          "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full border font-mono text-[11px]",
                           isDone
                             ? "border-primary/40 bg-primary/10 text-primary"
                             : "border-border bg-background text-muted-foreground",
@@ -106,25 +106,16 @@ export const BatchProgress = ({ task }: Props) => {
                           <span className="min-w-0 flex-1 truncate text-sm font-medium">
                             {b.title}
                           </span>
-                          <Badge
-                            variant="outline"
-                            className="shrink-0 px-1 py-0 text-[10px]"
-                          >
+                          <Badge variant="outline" size="xs">
                             #{b.sourceActionN}
                           </Badge>
                           {b.duplicateOfEffectiveId && (
-                            <Badge
-                              variant="secondary"
-                              className="shrink-0 px-1 py-0 text-[10px]"
-                            >
+                            <Badge variant="secondary" size="xs">
                               疑似重复
                             </Badge>
                           )}
                           {isDone && (
-                            <Badge
-                              variant="secondary"
-                              className="shrink-0 px-1 py-0 text-[10px]"
-                            >
+                            <Badge variant="secondary" size="xs">
                               已做
                             </Badge>
                           )}

@@ -280,7 +280,7 @@ export const RulesCard = () => {
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground"
+                    className="h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground"
                     onClick={() => void openEdit(r.name)}
                   >
                     编辑
@@ -288,7 +288,7 @@ export const RulesCard = () => {
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-destructive"
+                    className="h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-destructive"
                     onClick={() => void handleDelete(r.name)}
                   >
                     删除

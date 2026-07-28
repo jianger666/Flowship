@@ -11,7 +11,7 @@
 
 import { getPendingAsk } from "@/lib/server/chat-pending";
 
-import { rememberCardMessage } from "./card-map";
+import { rememberAskCard, rememberCardMessage } from "./card-map";
 import { flushCardSeqToDisk, nextCardSequence } from "./card-seq";
 import {
   batchUpdateCard,
@@ -346,6 +346,11 @@ export const createCardStream = (
   /** 是否已 start / finalize */
   let started = false;
   let finalized = false;
+  /**
+   * 本卡承载的 ask 组（appendAskUser 记下）——给 card-map 的 ask 索引用。
+   * 非流式路径 append 时还没建卡（finalize 才建），先攒着、建完卡再补记。
+   */
+  let askIdForCardMap: string | undefined;
 
   /** 当前标题 / header */
   const title = opts.title;
@@ -733,6 +738,28 @@ export const createCardStream = (
     }
   };
 
+  /**
+   * 把「本卡承载了 task 的哪组 ask」写进 card-map 的 ask 索引。
+   * 卡还没建出来时只记在内存、等 finalize 建完卡再补（非流式路径）。
+   * 记不上只影响终态置态、不影响答题本身——失败只 warn。
+   */
+  const rememberAskCardRef = async (askId?: string): Promise<void> => {
+    if (askId) askIdForCardMap = askId;
+    const pendingAskId = askIdForCardMap;
+    if (!pendingAskId || !messageId || !cardId) return;
+    try {
+      await rememberAskCard({
+        messageId,
+        cardId,
+        routeTaskId: taskId,
+        askTaskId: taskId,
+        askId: pendingAskId,
+      });
+    } catch (err) {
+      warnFail("rememberAskCard", err);
+    }
+  };
+
   const appendAskUser = async (
     askOpts: CardStreamAppendAskOpts,
   ): Promise<void> => {
@@ -747,6 +774,11 @@ export const createCardStream = (
       footerText = "等待选择";
       // 记住元素：后续全量 PUT / 非流式 finalize 整卡都带上（R1-1a）
       appendedElements = [...appendedElements, ...elements];
+
+      // 给 card-map 补上 ask 索引：这组提问从别处了结（app 答题卡 / 群里作答 /
+      // 用户直接发新消息跳过）时，ask-card-settle 靠它反查到本卡做终态 patch。
+      // 非流式此刻还没 cardId（finalize 才建卡）——那条路径在 finalize 里补记。
+      await rememberAskCardRef(askOpts.askId);
 
       // 非流式：只记状态，finalize 并入整卡
       if (!streamingEnabled) return;
@@ -857,6 +889,8 @@ export const createCardStream = (
             taskId,
             createdAt: Date.now(),
           });
+          // 非流式：ask 元素在 append 时还没卡可记、建完卡在这里补上索引
+          await rememberAskCardRef();
           // 非流式从未开 streaming_mode，无需 patch 关流；仍刷 seq 盘水位（card-action 可能后续 patch）
           await flushCardSeqToDisk();
         } catch (err) {

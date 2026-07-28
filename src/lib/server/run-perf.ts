@@ -6,11 +6,18 @@
  * 只打元数据日志（绝不记录命令内容 / 工具参数 / 输出 / prompt 正文）。
  *
  * 用法：send 前 createRunPerfTracker → 把 onDelta/onStep 塞进 SendOptions → send 返回后 attachRun。
+ *
+ * 除日志外唯一的副作用：`turn-ended` 的 token 用量会落进 meta.json（见 persistTurnUsage）。
+ * 落在这里而不是各调用点，是因为 9 个 agent.send 全都已经接了本 tracker——
+ * chat / task / 交卷追问 / ask 回复 / 问一问 / 重连各链路零改动自动覆盖。
  */
 
 import type { ConversationStep, InteractionUpdate, Run } from "@cursor/sdk";
 
 import { normalizeToolName } from "./normalize-tool-name";
+import { recordTurnUsage } from "./task-fs";
+import { publish } from "./task-stream";
+import { normalizeTurnUsage } from "@/lib/token-usage";
 
 export type RunPerfCtx = {
   taskId: string;
@@ -68,6 +75,25 @@ const shellSdkExecMs = (toolCall: ToolCallLike): number | undefined => {
   if (toolCall.type !== "shell") return undefined;
   const t = toolCall.result?.value?.executionTime;
   return typeof t === "number" && Number.isFinite(t) ? t : undefined;
+};
+
+/**
+ * turn 用量落盘 + 推一帧 task 给前端（火忘：onDelta 是同步签名、绝不能 await）。
+ *
+ * 频次：实测一次 agent.send 只发一条 turn-ended（哪怕中间跑了 40 多步、几十个工具），
+ * 所以「一轮写一次 meta」的量级跟现有 patchAction 比可以忽略——绝不按 delta 写盘。
+ */
+const persistTurnUsage = (taskId: string, rawUsage: unknown): void => {
+  const usage = normalizeTurnUsage(rawUsage);
+  if (!usage) return;
+  void (async () => {
+    try {
+      const task = await recordTurnUsage(taskId, usage);
+      if (task) publish(taskId, { kind: "task", task });
+    } catch (err) {
+      console.warn(`[perf] turn 用量落盘失败 task=${taskId}`, err);
+    }
+  })();
 };
 
 export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
@@ -148,6 +174,8 @@ export const createRunPerfTracker = (ctx: RunPerfCtx): RunPerfTracker => {
           `[perf-turn] ${base} inputTokens=${u.inputTokens} outputTokens=${u.outputTokens}` +
             ` cacheReadTokens=${u.cacheReadTokens} cacheWriteTokens=${u.cacheWriteTokens}${reasoning}`,
         );
+        // 日志之外唯一副作用：落进 meta.json 供 UI 展示（内部已 try/catch + 火忘）
+        persistTurnUsage(ctx.taskId, u);
       }
     } catch (err) {
       // 埋点绝不能拖垮主流程

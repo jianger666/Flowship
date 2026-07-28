@@ -100,6 +100,12 @@ export interface UseTaskWatchCallbacks {
     outcome?: string;
   }) => void;
   /**
+   * 旁路（受限群答疑）run 在飞与否——它不写 task.runStatus，
+   * 调用方要把它并进「运行中」判定，否则它的工具块会被渲染成「已中断」。
+   * 每次连接的 bootstrap 会补发当前值，断线重连后不会停在旧状态。
+   */
+  onRestrictedRun?: (active: boolean) => void;
+  /**
    * task_deleted / watch 410 / 已 hydrate 的 404 → 停重连。
    * 调用方接到后 `commitTaskDeleted`；503 unavailable 不可走此 sink。
    */
@@ -200,6 +206,10 @@ export const useTaskWatch = (
           onMessageOp: (payload) => {
             if (cancelled) return;
             callbacksRef.current.onMessageOp?.(payload);
+          },
+          onRestrictedRun: (active) => {
+            if (cancelled) return;
+            callbacksRef.current.onRestrictedRun?.(active);
           },
           onTaskDeleted: (deletedId) => {
             if (cancelled) return;

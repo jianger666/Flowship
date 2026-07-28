@@ -3,7 +3,7 @@
 /**
  * Action 管理列表（V0.9、嵌在 /actions 页、内置 + 自定义统一一个地方管）
  *
- * 按固定三组分区展示：组头可拖拽换组序（framer-motion Reorder）+ 「默认折叠」开关；
+ * 按固定四组分区展示：组头可拖拽换组序（framer-motion Reorder）+ 「默认折叠」开关；
  * 组内 action 行同套拖拽调「推进」顺序 + 开关控显隐。
  * 隐藏的在「推进」弹窗直接不出现（v0.9.12 删「更多」折叠区、本页开关是唯一恢复入口）。
  * 顺序 / 显隐 / 组序 / 默认折叠落 config.json（settings.actionLayout）、个人级、全任务生效。
@@ -60,7 +60,7 @@ import { cn } from "@/lib/utils";
 
 /** 行内次要操作：紧凑 ghost 文字按钮（查看/编辑/删除/卸载/转建共用基线） */
 const ROW_ACTION_BTN =
-  "h-6 shrink-0 px-2 text-[12px] text-muted-foreground hover:text-foreground";
+  "h-6 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground";
 
 /** 组头 / action 行共用拖拽手柄样式（视觉一致） */
 const DRAG_HANDLE_CLASS =
@@ -228,27 +228,27 @@ const LayoutRow = ({
           <span className="min-w-0 truncate font-medium">{label}</span>
           {/* 只标自定义、内置多数不吵；一眼可辨来源 */}
           {isCustom && !isTeam && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               自管
             </Badge>
           )}
           {isLegacy && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               旧格式・已停用
             </Badge>
           )}
           {skillDisabled && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               skill 已关闭
             </Badge>
           )}
           {knowledgeDisabled && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               团队规范已关闭
             </Badge>
           )}
           {teamBadge && (
-            <Badge variant="secondary" className="shrink-0 text-[10px]">
+            <Badge variant="secondary" size="xs">
               {teamBadge}
             </Badge>
           )}
@@ -257,14 +257,14 @@ const LayoutRow = ({
         </div>
         {/* 副标题：内置用 ACTION_DESC；自定义挂 skill；旧格式转建提示 */}
         {description && (
-          <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted-foreground">
+          <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
             {description}
           </p>
         )}
         {skills && skills.length > 0 && (
           <p
             className={cn(
-              "mt-0.5 truncate text-[12px] leading-snug text-muted-foreground",
+              "mt-0.5 truncate text-xs leading-snug text-muted-foreground",
               skills[0]?.missing && "line-through opacity-60",
             )}
             title={
@@ -281,13 +281,13 @@ const LayoutRow = ({
           </p>
         )}
         {isLegacy && (
-          <p className="mt-0.5 text-[12px] leading-snug text-muted-foreground">
+          <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
             点「转建新版」让 AI 提炼成 skill 并挂壳
           </p>
         )}
       </div>
       {isHidden && (
-        <span className="shrink-0 text-[10px] text-muted-foreground">
+        <span className="shrink-0 text-[11px] text-muted-foreground">
           已隐藏
         </span>
       )}
@@ -555,11 +555,12 @@ export const ActionLayoutConfig = ({
     [order, customById, groupOrderLocal],
   );
 
-  /** 从扁平 order 按归属拆成三组桶（组内相对序保留） */
+  /** 从扁平 order 按归属拆成四组桶（组内相对序保留） */
   const bucketsFromFlat = (flat: string[]) => {
     const buckets: Record<ActionGroupKey, string[]> = {
       builtin: [],
       team: [],
+      shared: [],
       custom: [],
     };
     for (const key of flat) {

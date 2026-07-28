@@ -40,6 +40,7 @@ import {
   errorResponse,
   isValidModel,
   parseAndValidateImages,
+  parseAndValidateSkills,
 } from "@/lib/server/route-helpers";
 import {
   getTask,
@@ -66,6 +67,8 @@ interface PostBody {
   userInstruction?: string;
   images?: Array<{ data?: string; mimeType?: string; filename?: string }>;
   attachments?: string[];
+  // v1.1.x 推进弹窗富输入：`/` 引用到的 skill（指引只进 agent 消息、不落 action.userInstruction）
+  skills?: Array<{ name?: string; absPath?: string }>;
   apiKey?: string;
   model?: ModelSelection;
   reuseAgent?: boolean;
@@ -91,6 +94,7 @@ interface PostBody {
 
 const MAX_IMAGES_PER_REQUEST = 6;
 const MAX_ATTACHMENTS_PER_REQUEST = 10;
+// skill 上限走 protocol-signals 的 MAX_SKILL_REFS（客户端截断同源）——见 parseAndValidateSkills 默认值
 
 const isValidActionType = (v: unknown): v is ActionType =>
   typeof v === "string" &&
@@ -180,6 +184,11 @@ export const POST = async (req: Request, { params }: Ctx) => {
     }
   }
 
+  // 校验 skills：name / absPath 非空 + 绝对路径（不 stat、缺文件由 agent read 时报错）
+  const skillsResult = parseAndValidateSkills(body.skills);
+  if (!skillsResult.ok) return skillsResult.errorResponse;
+  const skillRefs = skillsResult.skills;
+
   // V0.9：自定义 action 必须带存在的定义 id（定义可能被删——这里挡住、不让起一个找不到 playbook 的 agent）
   let customActionId: string | undefined;
   if (actionType === "custom") {
@@ -260,6 +269,8 @@ export const POST = async (req: Request, { params }: Ctx) => {
       attachedImagePaths: imageAbsPaths,
       attachedFilePaths:
         attachmentAbsPaths.length > 0 ? attachmentAbsPaths : undefined,
+      // v1.1.x：`/` skill 引用——runner 拼成 [使用 skill] 指引进 [NEXT_ACTION] 载荷
+      skillRefs: skillRefs.length > 0 ? skillRefs : undefined,
       apiKey,
       model,
       reuseAgent: body.reuseAgent === true,

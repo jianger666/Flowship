@@ -36,6 +36,7 @@ import {
   getLastProcessedTs,
   setLastProcessedTs,
 } from "./card-map";
+import { isGroupBotIdentityUnusable } from "./group-shared";
 import { KeepAwake } from "./keep-awake";
 import {
   getBotAppInfo,
@@ -51,7 +52,7 @@ import {
   SKIP_NOT_OWNER,
   SKIP_NOT_P2P,
 } from "./router";
-import type { FeishuInboundMessage } from "./types";
+import type { FeishuInboundMessage, FeishuMention } from "./types";
 
 // ----------------- 声明式 consumer 列表 -----------------
 
@@ -66,6 +67,43 @@ type ConsumerSpec = {
    * 功能优雅降级。
    */
   optional?: boolean;
+};
+
+/**
+ * 归一化 mentions 数组（群消息「@ 了谁」）。
+ *
+ * 三种形态都兼容（CLI 扁平化程度不定）：
+ * - 官方：`{ key, id: { open_id }, name }`
+ * - 扁平：`{ key, open_id, name }`
+ * - 退化：字符串（只有名字）
+ */
+const normalizeMentions = (raw: unknown): FeishuMention[] | undefined => {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: FeishuMention[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      if (item.trim()) out.push({ name: item.trim() });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const m = item as Record<string, unknown>;
+    const idObj =
+      m.id && typeof m.id === "object" ? (m.id as Record<string, unknown>) : null;
+    const openId =
+      (idObj && typeof idObj.open_id === "string" && idObj.open_id) ||
+      (typeof m.open_id === "string" && m.open_id) ||
+      (typeof m.id === "string" && m.id) ||
+      "";
+    const name = typeof m.name === "string" ? m.name : "";
+    const key = typeof m.key === "string" ? m.key : "";
+    if (!openId && !name && !key) continue;
+    out.push({
+      ...(key ? { key } : {}),
+      ...(openId ? { openId } : {}),
+      ...(name ? { name } : {}),
+    });
+  }
+  return out.length > 0 ? out : undefined;
 };
 
 /** 归一化 im.message.receive_v1 NDJSON → FeishuInboundMessage */
@@ -140,6 +178,16 @@ export const normalizeInboundEvent = (
       (typeof o.message_type === "string" && o.message_type) ||
       "",
     sender_id: senderId,
+    sender_name:
+      (typeof o.sender_name === "string" && o.sender_name) ||
+      (sender && typeof sender.name === "string" && sender.name) ||
+      (nested &&
+        typeof (nested as { sender_name?: unknown }).sender_name === "string" &&
+        (nested as { sender_name: string }).sender_name) ||
+      undefined,
+    // 群消息 @ 列表：官方在 event.message.mentions、CLI 扁平化后可能提到顶层
+    mentions:
+      normalizeMentions(msgObj.mentions) ?? normalizeMentions(o.mentions),
     content,
     root_id:
       (typeof msgObj.root_id === "string" && msgObj.root_id) ||
@@ -305,6 +353,11 @@ export type BridgeRuntimeStatus = {
   lastInboundAt?: number;
   /** 历史上收到过（时间未知、老版本收的）——自检按通过展示 */
   everInbound?: boolean;
+  /**
+   * 群消息认不出 @（bot open_id 与应用名都取不到）——群回流此刻是哑的。
+   * 只在真探测到时出现，设置页据此出一行提示（否则用户只会看到「机器人在群里不理人」）。
+   */
+  groupMentionUnavailable?: boolean;
 };
 
 /** 入向链路收到任意消息时打点——设置页「收消息自检」数据源（内存 + 节流落盘） */
@@ -351,6 +404,18 @@ const BACKOFF_CAP_MS = 60_000;
 const HEALTHY_RESET_MS = 5 * 60_000;
 const STOP_GRACE_MS = 5_000;
 const CATCHUP_MAX_MS = 30 * 60_000;
+
+/** 首轮重启退避基数（之后翻倍到 BACKOFF_CAP_MS 封顶） */
+const DEFAULT_BACKOFF_BASE_MS = 1_000;
+let backoffBaseMs = DEFAULT_BACKOFF_BASE_MS;
+
+/**
+ * 单测调小首轮退避；传 null 复原。
+ * 崩溃重启用例本来真等 1s，撑掉大半个用例预算——全量并发下随机超时。
+ */
+export const __setConsumerBackoffBaseForTest = (ms: number | null): void => {
+  backoffBaseMs = ms ?? DEFAULT_BACKOFF_BASE_MS;
+};
 
 type ConsumerHandle = {
   spec: ConsumerSpec;
@@ -639,7 +704,7 @@ const ensureHandle = (spec: ConsumerSpec): ConsumerHandle => {
       child: null,
       stopping: false,
       restartTimer: null,
-      backoffMs: 1000,
+      backoffMs: backoffBaseMs,
       startedAt: 0,
       ourPid: null,
       stderrTail: [],
@@ -781,7 +846,7 @@ const wireChild = (h: ConsumerHandle, child: ChildProcess): void => {
 
     // 存活 ≥5 分钟 → 重置退避
     if (Date.now() - h.startedAt >= HEALTHY_RESET_MS) {
-      h.backoffMs = 1000;
+      h.backoffMs = backoffBaseMs;
     }
     h.state.restartCount += 1;
     h.state.lastError = `exit code=${code} signal=${signal}`;
@@ -843,7 +908,7 @@ const stopConsumer = async (h: ConsumerHandle): Promise<void> => {
   h.state.status = "stopped";
   h.state.conflictDetail = undefined;
   h.stopping = false;
-  h.backoffMs = 1000;
+  h.backoffMs = backoffBaseMs;
   unregisterManagedChild(`feishu-bridge:${h.spec.eventKey}`);
 };
 
@@ -941,6 +1006,7 @@ export const getBridgeRuntimeStatus = (): BridgeRuntimeStatus => {
     lastError: rt.lastOverallError,
     lastInboundAt: rt.lastInboundAt,
     everInbound: rt.everInbound,
+    ...(isGroupBotIdentityUnusable() ? { groupMentionUnavailable: true } : {}),
   };
 };
 

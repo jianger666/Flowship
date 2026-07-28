@@ -11,6 +11,14 @@
  * - 401/403/其它/连不上 → fail（失败、原因落 detail、前端失败可点开看日志）
  * stdio（无 url）本地进程没法 HTTP 探测、乐观标 ok（保留注入、交给 SDK 起进程）。
  *
+ * 两种 transport 的探法不同（2026-07-28）：老式 HTTP+SSE（MCP 2024-11-05）的 url 是
+ * **GET 建流**端点、POST initialize 过去只会吃 404/405——一律 POST 会把这类 server 全判死。
+ * 内网 wk-knowledge（`:8765/sse`：GET 401、POST 404）就是这么被静默剔除的。故：
+ * - 认得出是 SSE（显式 type 或 /sse 端点）→ 直接 GET 探
+ * - 认不出、POST 又吃 404/405 → 再 GET 兜一次（显式 type: "http" 不兜、那是真坏了）
+ * 探测放行还不够：SDK 那边按 Streamable HTTP 连一样连不上，故注入前补 type（见
+ * withInferredTransport）。
+ *
  * V0.6.13：状态从 4 态（ok/unauthorized/unreachable/local）收敛为 2 态（ok/fail）、
  * 降低噪音（用户拍板）。失败原因不再靠 status 区分、改全部塞进 detail 给日志弹窗看。
  *
@@ -48,10 +56,10 @@ const G = globalThis as unknown as {
 };
 const probeCache = (G.__feMcpProbeCache ??= new Map());
 
-// 缓存 key：sha256(name|url|headers)——避免明文 Bearer 进 Map key；token 换了摘要自然变
+// 缓存 key：sha256(name|url|type|headers)——避免明文 Bearer 进 Map key；token / transport 换了摘要自然变
 const probeCacheKey = (name: string, cfg: McpServerConfig): string | null => {
   if (!("url" in cfg)) return null;
-  const payload = `${name}|${cfg.url}|${JSON.stringify(cfg.headers ?? {})}`;
+  const payload = `${name}|${cfg.url}|${cfg.type ?? ""}|${JSON.stringify(cfg.headers ?? {})}`;
   return createHash("sha256").update(payload).digest("hex");
 };
 
@@ -85,11 +93,82 @@ export const invalidateMcpProbeCache = (): void => {
   probeCache.clear();
 };
 
+/** 带 url 的远程 server（stdio 分支已在类型上排除） */
+type RemoteMcpConfig = Extract<McpServerConfig, { url: string }>;
+
+/** 单次探测的原始结果：拿到响应算 httpCode、连不上算 error */
+type ProbeAttempt = { httpCode: number } | { error: string };
+
+/**
+ * undici 的 fetch 失败一律 message="fetch failed"、真因（ECONNREFUSED / EHOSTUNREACH /
+ * ENOTFOUND…）藏在 cause 里——不摊开的话失败提示等于没说，用户点开日志也无从下手。
+ */
+const describeFetchError = (err: unknown): string => {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as { cause?: unknown }).cause;
+  if (!cause) return err.message;
+  if (!(cause instanceof Error)) return `${err.message}（${String(cause)}）`;
+  const code = (cause as { code?: string }).code;
+  // ECONNREFUSED 这类 code 通常已在 message 里、别拼成「ECONNREFUSED connect ECONNREFUSED …」
+  const detail = code && !cause.message.includes(code) ? `${code} ${cause.message}` : cause.message;
+  return detail ? `${err.message}（${detail}）` : err.message;
+};
+
+/**
+ * 判定「老式 HTTP+SSE transport」。两条依据、有先后：
+ * 1. 配置显式写了 type——完全以它为准（写了 "http" 却指向 /sse 也照 http 探，
+ *    否则会 GET 探出 ok、SDK 却按 Streamable HTTP 连不上，探测反倒放行了一个死的）
+ * 2. 没写 type 才看 url：路径以 /sse 结尾——社区约定俗成的建流端点名（尾部斜杠不算数）
+ */
+const isSseTransport = (cfg: RemoteMcpConfig): boolean => {
+  if (cfg.type) return cfg.type === "sse";
+  try {
+    return new URL(cfg.url).pathname.replace(/\/+$/, "").endsWith("/sse");
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 注入给 SDK 前补 transport 标注——探测放行了、SDK 按 Streamable HTTP 去连照样连不上。
+ * 只补「推导得出且用户没显式写过」的：写了就尊重、不替用户改主意。
+ */
+export const withInferredTransport = (cfg: McpServerConfig): McpServerConfig => {
+  if (!("url" in cfg) || cfg.type) return cfg;
+  return isSseTransport(cfg) ? { ...cfg, type: "sse" } : cfg;
+};
+
+/**
+ * GET 建流探 SSE 端点：拿到响应头就够判定、立刻 abort。
+ * SSE 是长连接、探完不掐会一直占着（服务端还会给它留 session）。
+ */
+const sendSseHandshake = async (
+  url: string,
+  headers?: Record<string, string>,
+): Promise<ProbeAttempt> => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { accept: "text/event-stream", ...(headers ?? {}) },
+      redirect: "manual",
+      signal: ctl.signal,
+    });
+    return { httpCode: res.status };
+  } catch (err) {
+    return { error: describeFetchError(err) };
+  } finally {
+    clearTimeout(timer);
+    ctl.abort();
+  }
+};
+
 // 发 initialize 拿 HTTP 状态码（连不上则返 error）
 const sendInitialize = async (
   url: string,
   headers?: Record<string, string>,
-): Promise<{ httpCode: number } | { error: string }> => {
+): Promise<ProbeAttempt> => {
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -113,8 +192,40 @@ const sendInitialize = async (
     });
     return { httpCode: res.status };
   } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
+    return { error: describeFetchError(err) };
   }
+};
+
+/** 把单次探测结果翻成 McpHealth（POST / GET 两条路共用一套判定） */
+const classifyAttempt = (
+  name: string,
+  url: string,
+  r: ProbeAttempt,
+): McpHealth => {
+  // 连不上（超时 / DNS / 连接拒绝）：detail 带 url + 错误原文、点开看日志能直接排查
+  if ("error" in r) {
+    return { name, status: "fail", detail: `连接失败：${r.error}\nURL：${url}` };
+  }
+  // 2xx：正常
+  if (r.httpCode >= 200 && r.httpCode < 300) {
+    return { name, status: "ok", httpCode: r.httpCode };
+  }
+  // 401/403：需要授权（远程 OAuth MCP 没授权 / token 失效）
+  if (r.httpCode === 401 || r.httpCode === 403) {
+    return {
+      name,
+      status: "fail",
+      httpCode: r.httpCode,
+      detail: `需要授权（HTTP ${r.httpCode}）——去设置页给「${name}」授权\nURL：${url}`,
+    };
+  }
+  // 其它非 2xx 异常状态码（404 / 405 / 5xx 等）
+  return {
+    name,
+    status: "fail",
+    httpCode: r.httpCode,
+    detail: `服务异常 HTTP ${r.httpCode}\nURL：${url}`,
+  };
 };
 
 /** 探测单个 MCP server 的连通性 */
@@ -131,35 +242,27 @@ const probeMcpHealth = async (
     };
   }
   const headers = cfg.headers as Record<string, string> | undefined;
+
+  // 认得出是 SSE：直接 GET 建流（POST 过去必吃 404、白付一轮超时）
+  if (isSseTransport(cfg)) {
+    return classifyAttempt(name, cfg.url, await sendSseHandshake(cfg.url, headers));
+  }
+
   const r = await sendInitialize(cfg.url, headers);
-  // 连不上（超时 / DNS / 连接拒绝）：detail 带 url + 错误原文、点开看日志能直接排查
-  if ("error" in r) {
-    return {
-      name,
-      status: "fail",
-      detail: `连接失败：${r.error}\nURL：${cfg.url}`,
-    };
+
+  // POST 吃 404/405 未必是服务坏了——也可能是没标 type、端点名也不带 /sse 的老式 SSE server，
+  // 对它来说 GET 才是入口。显式 type: "http" 的不兜底：那是 Streamable HTTP 的承诺、404 就是真坏。
+  // GET 通了按 GET 判；GET 也连不上则退回 POST 的结论（别拿兜底的错遮住原始症状）。
+  const worthSseRetry =
+    cfg.type !== "http" &&
+    !("error" in r) &&
+    (r.httpCode === 404 || r.httpCode === 405);
+  if (worthSseRetry) {
+    const sse = await sendSseHandshake(cfg.url, headers);
+    if (!("error" in sse)) return classifyAttempt(name, cfg.url, sse);
   }
-  // 2xx：正常
-  if (r.httpCode >= 200 && r.httpCode < 300) {
-    return { name, status: "ok", httpCode: r.httpCode };
-  }
-  // 401/403：需要授权（远程 OAuth MCP 没授权 / token 失效）
-  if (r.httpCode === 401 || r.httpCode === 403) {
-    return {
-      name,
-      status: "fail",
-      httpCode: r.httpCode,
-      detail: `需要授权（HTTP ${r.httpCode}）——去设置页给「${name}」授权\nURL：${cfg.url}`,
-    };
-  }
-  // 其它非 2xx 异常状态码（404 / 405 / 5xx 等）
-  return {
-    name,
-    status: "fail",
-    httpCode: r.httpCode,
-    detail: `服务异常 HTTP ${r.httpCode}\nURL：${cfg.url}`,
-  };
+
+  return classifyAttempt(name, cfg.url, r);
 };
 
 /**
@@ -218,7 +321,7 @@ export const filterHealthyMcp = async (
   const dropped: McpHealth[] = [];
   for (const [name, cfg, h] of entries) {
     if (h.status === "ok") {
-      kept[name] = cfg;
+      kept[name] = withInferredTransport(cfg);
     } else {
       dropped.push(h);
     }

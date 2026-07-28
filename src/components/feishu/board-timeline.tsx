@@ -200,7 +200,7 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
             <div
               key={i}
               className={cn(
-                "sticky top-0 z-30 flex flex-col items-center gap-0.5 border-b border-border/60 bg-background py-1.5 text-[10px]",
+                "sticky top-0 z-30 flex flex-col items-center gap-0.5 border-b border-border/60 bg-background py-1.5 text-[11px]",
                 d.isWeekend && "bg-muted/40",
                 d.isToday && "bg-primary/10",
               )}
@@ -295,7 +295,7 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                       <span className="min-w-0 truncate text-xs">
                         <span className="font-medium">{it.name}</span>
                         {it.statusLabel && (
-                          <span className="ml-1.5 text-[10px] text-muted-foreground">
+                          <span className="ml-1.5 text-[11px] text-muted-foreground">
                             {it.statusLabel}
                           </span>
                         )}
@@ -328,7 +328,7 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
                 >
                   <span
                     className={cn(
-                      "min-w-0 truncate text-[10px]",
+                      "min-w-0 truncate text-[11px]",
                       row.isSub ? "text-foreground/80" : "text-muted-foreground",
                     )}
                   >

@@ -7,14 +7,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  __resetBridgeStateForTest,
   addEndedChatTaskId,
   getCurrentChatTaskId,
   getEndedChatTaskIds,
   setCurrentChatTaskId,
 } from "@/lib/server/feishu-bridge/bridge-state";
 import {
-  __clearBridgeCommandsForTest,
   __setRouterDepsForTest,
   isActiveChatTask,
   onInjectResult,
@@ -26,13 +24,15 @@ import {
 import type { FeishuInboundMessage } from "@/lib/server/feishu-bridge/types";
 import type { TaskSummary } from "@/lib/types";
 
-// 指针路由读写真实 bridge-state 文件——隔离到独立 tmp、避免污染 cwd/data。
-// bridge-state 的数据目录在每次调用时才解析 env、import 后再设也生效。
-process.env.FLOWSHIP_DATA_DIR = path.join(
-  os.tmpdir(),
-  `feishu-bridge-router-${Date.now()}`,
-  "data",
-);
+import {
+  baseRouterDeps,
+  installBridgeTestHooks,
+  makeBridgeTmpDataDir,
+} from "./helpers/feishu-bridge-harness";
+
+// 指针路由读写真实 bridge-state 文件——隔离到独立 tmp、避免污染 cwd/data
+const TMP = makeBridgeTmpDataDir("feishu-bridge-router");
+installBridgeTestHooks({ tmpRoot: TMP });
 
 const baseMsg = (
   overrides: Partial<FeishuInboundMessage> = {},
@@ -97,12 +97,14 @@ describe("parseInboundContent markdown 图提取", () => {
   it("post markdown 图文混排 → images 提取 + 文本剥离", async () => {
     const png = await makePng();
     const downloaded: string[] = [];
-    __setRouterDepsForTest({
-      downloadMessageResource: async (_mid, key) => {
-        downloaded.push(key);
-        return png;
-      },
-    });
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          downloaded.push(key);
+          return png;
+        },
+      }),
+    );
     const content =
       "![Image](img_v3_0213o_2b0d4c5b-4df7-4440-9058-a784d363914g)\n我再试试";
     const parsed = await parseInboundContent(
@@ -122,9 +124,7 @@ describe("parseInboundContent markdown 图提取", () => {
 
   it("纯 markdown 图无文字 → text 空 + 1 张图", async () => {
     const png = await makePng();
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => png,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => png }));
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "post",
@@ -137,9 +137,7 @@ describe("parseInboundContent markdown 图提取", () => {
 
   it("text 类型带 markdown 图同样提取", async () => {
     const png = await makePng();
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => png,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => png }));
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "text",
@@ -153,12 +151,14 @@ describe("parseInboundContent markdown 图提取", () => {
   it("超过 6 张图只下载前 6 张（超限降级）", async () => {
     const png = await makePng();
     const keys: string[] = [];
-    __setRouterDepsForTest({
-      downloadMessageResource: async (_mid, key) => {
-        keys.push(key);
-        return png;
-      },
-    });
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key) => {
+          keys.push(key);
+          return png;
+        },
+      }),
+    );
     const parts = Array.from(
       { length: 8 },
       (_, i) => `![Image](img_v3_key_${i}_abcdef)`,
@@ -176,9 +176,7 @@ describe("parseInboundContent markdown 图提取", () => {
 
   it("post JSON 节点树路径仍可用（兼容官方形态）", async () => {
     const png = await makePng();
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => png,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => png }));
     const content = JSON.stringify({
       title: "",
       content: [
@@ -218,12 +216,14 @@ describe("parseInboundContent 文件消息双形态", () => {
   it("enrichment `<file key name/>` 形态 → 提取 file_key + 保留原文件名", async () => {
     const tmp = await makeTmpFile();
     const downloaded: Array<{ key: string; type: string }> = [];
-    __setRouterDepsForTest({
-      downloadMessageResource: async (_mid, key, type) => {
-        downloaded.push({ key, type });
-        return tmp;
-      },
-    });
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        downloadMessageResource: async (_mid, key, type) => {
+          downloaded.push({ key, type });
+          return tmp;
+        },
+      }),
+    );
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "file",
@@ -242,9 +242,7 @@ describe("parseInboundContent 文件消息双形态", () => {
 
   it("markdown `[名称](file_key)` 链接形态同样提取", async () => {
     const tmp = await makeTmpFile();
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => tmp,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => tmp }));
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "file",
@@ -259,9 +257,7 @@ describe("parseInboundContent 文件消息双形态", () => {
 
   it("JSON content 形态（补拉路径）不回归", async () => {
     const tmp = await makeTmpFile();
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => tmp,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => tmp }));
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "file",
@@ -294,9 +290,7 @@ describe("parseInboundContent 文件消息双形态", () => {
     buf.write("\x89PNG\r\n\x1a\n", 0);
     await fs.writeFile(p, buf);
     tmpFiles.push(p);
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => p,
-    });
+    __setRouterDepsForTest(baseRouterDeps({ downloadMessageResource: async () => p }));
     const parsed = await parseInboundContent(
       baseMsg({
         message_type: "image",
@@ -367,8 +361,32 @@ describe("routeInboundMessage", () => {
   );
   const results: Array<{ kind: string }> = [];
 
-  beforeEach(async () => {
-    await __resetBridgeStateForTest();
+  /** 本 describe 的 deps 基线（外部 IO 由 harness 铺满、这里只挂本文件的 spy） */
+  const applyDeps = (
+    overrides: Parameters<typeof baseRouterDeps>[0] = {},
+  ): void => {
+    __setRouterDepsForTest(
+      baseRouterDeps({
+        sendTextMessage: sendText,
+        findTaskByMessageId: findByRoot,
+        rememberCardMessage: remember,
+        larkApi: larkApiMock as never,
+        listTasks,
+        createTask: async (input) =>
+          ({
+            id: "task-new",
+            title: input.title,
+            mode: "chat",
+          }) as never,
+        getPendingAsk: getPending as never,
+        handleChatReplyInject: handleChat as never,
+        injectPendingAskText: injectAsk as never,
+        ...overrides,
+      }),
+    );
+  };
+
+  beforeEach(() => {
     sendText.mockClear();
     handleChat.mockClear();
     injectAsk.mockClear();
@@ -381,48 +399,14 @@ describe("routeInboundMessage", () => {
     getPending.mockClear();
     getPending.mockReturnValue(null);
     results.length = 0;
-    __clearBridgeCommandsForTest();
     onInjectResult((p) => {
       results.push(p);
     });
-    __setRouterDepsForTest({
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: sendText,
-      downloadMessageResource: async () => "/tmp/x",
-      findTaskByMessageId: findByRoot,
-      rememberCardMessage: remember,
-      larkApi: larkApiMock as never,
-      listTasks,
-      createTask: async (input) =>
-        ({
-          id: "task-new",
-          title: input.title,
-          mode: "chat",
-        }) as never,
-      getPendingAsk: getPending as never,
-      handleChatReplyInject: handleChat as never,
-      injectPendingAskText: injectAsk as never,
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk-test",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/repo" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-    });
+    applyDeps();
   });
 
-  afterEach(async () => {
-    __setRouterDepsForTest(null);
+  afterEach(() => {
     onInjectResult(null);
-    __clearBridgeCommandsForTest();
-    await __resetBridgeStateForTest();
   });
 
   it("非 p2p / 非本人 → skipped", async () => {
@@ -903,35 +887,7 @@ describe("routeInboundMessage", () => {
     const big2 = path.join(tmpDir, "big2.bin");
     await fs.writeFile(big2, "");
     await fs.truncate(big2, 50 * 1024 * 1024 + 1);
-    __setRouterDepsForTest({
-      downloadMessageResource: async () => big2,
-      getBotAppInfo: async () => ({
-        appId: "cli_x",
-        ownerOpenId: "ou_owner",
-      }),
-      sendTextMessage: sendText,
-      findTaskByMessageId: findByRoot,
-      listTasks,
-      createTask: async (input) =>
-        ({
-          id: "task-new",
-          title: input.title,
-          mode: "chat",
-        }) as never,
-      getPendingAsk: getPending as never,
-      handleChatReplyInject: handleChat as never,
-      injectPendingAskText: injectAsk as never,
-      readSettingsFile: async () => ({
-        status: "ok" as const,
-        settings: {
-          apiKey: "sk-test",
-          defaultModel: { id: "gpt-5" },
-          repos: [{ path: "/tmp/repo" }],
-        },
-      }),
-      listSkillsWithSource: async () => [],
-      prewarmTaskWorkspace: () => undefined,
-    });
+    applyDeps({ downloadMessageResource: async () => big2 });
     const r = await routeInboundMessage(
       baseMsg({
         message_type: "file",

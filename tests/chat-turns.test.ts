@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   deriveActiveStatus,
   groupChatRenderItems,
+  isLatestErrorEvent,
   isWorkGroup,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
@@ -164,6 +165,35 @@ describe("groupChatRenderItems", () => {
     expect((out[3] as WorkGroupItem).members).toHaveLength(1);
   });
 
+  it("error 独立平铺、隔断前后组——不能被组的「run 结束自动收起」吃掉", () => {
+    // 2026-07-28：跑了 40 分钟的 build 挂了，错误却收进工作过程组、run 一结束整组自动
+    // 收起，用户正在读的错误啪一下消失。error 从此不进组、跟 assistant_message 同等待遇。
+    const out = groupChatRenderItems([
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      ev({ id: "t", kind: "thinking", text: "想", ts: 2 }),
+      block({ id: "tb", name: "shell", ts: 3, status: "success" }),
+      ev({ id: "e", kind: "error", text: "Chat agent 异常：炸了", ts: 4 }),
+      block({ id: "tb2", name: "read", ts: 5, status: "success" }),
+      ev({ id: "a", kind: "assistant_message", text: "答", ts: 6 }),
+    ]);
+    expect(out.map((x) => x.kind)).toEqual([
+      "user_reply",
+      "__work_group__",
+      "error",
+      "__work_group__",
+      "assistant_message",
+    ]);
+    // 错误项原样输出、没有被包进任何组
+    expect(out[2]).toMatchObject({ kind: "error", id: "e" });
+    expect((out[1] as WorkGroupItem).members.map((m) => m.id)).toEqual([
+      "t",
+      "tb",
+    ]);
+    expect((out[3] as WorkGroupItem).members.map((m) => m.id)).toEqual(["tb2"]);
+    // 组里没有 error 成员了 → hasError 只由「工具执行失败」驱动
+    expect((out[1] as WorkGroupItem).hasError).toBe(false);
+  });
+
   it("hasError / hasRunning / stepCount / startTs / endTs", () => {
     const thinking = ev({ id: "t", kind: "thinking", text: "x", ts: 100 });
     const running = block({
@@ -172,7 +202,6 @@ describe("groupChatRenderItems", () => {
       ts: 200,
       status: "running",
     });
-    const errEv = ev({ id: "e", kind: "error", text: "炸了", ts: 300 });
     const errBlock = block({
       id: "eb",
       name: "edit",
@@ -189,14 +218,14 @@ describe("groupChatRenderItems", () => {
       ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
       thinking,
       running,
-      errEv,
       errBlock,
       body,
     ]);
     const g = out[1] as WorkGroupItem;
+    // 工具块 error 状态仍算组内有错（组头那个 ✗ 靠它）
     expect(g.hasError).toBe(true);
     expect(g.hasRunning).toBe(true);
-    expect(g.stepCount).toBe(4);
+    expect(g.stepCount).toBe(3);
     expect(g.startTs).toBe(100);
     expect(g.endTs).toBe(400);
 
@@ -277,6 +306,59 @@ describe("groupChatRenderItems", () => {
       "user_reply",
       "assistant_message",
     ]);
+  });
+});
+
+describe("isLatestErrorEvent", () => {
+  // 「重试」发的是最后一条用户消息——只有当轮失败该给这个入口，
+  // 否则翻历史点旧错误上的重试会把今天最后那条消息重发出去
+  const err = (id: string, ts: number) =>
+    ev({ id, kind: "error", text: "炸了", ts });
+
+  it("最后一条 error 且其后无新用户消息 → 可重试", () => {
+    const events = [
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      ev({ id: "t", kind: "thinking", text: "想", ts: 2 }),
+      err("e1", 3),
+    ];
+    expect(isLatestErrorEvent(events, "e1")).toBe(true);
+
+    // 错误之后还有 assistant / info 之类不影响判定（用户没接话、这轮还没翻篇）
+    expect(
+      isLatestErrorEvent(
+        [...events, ev({ id: "i", kind: "info", text: "已停止", ts: 4 })],
+        "e1",
+      ),
+    ).toBe(true);
+  });
+
+  it("其后有新用户消息 → 这轮已翻篇、不给重试", () => {
+    const events = [
+      ev({ id: "u1", kind: "user_reply", text: "q", ts: 1 }),
+      err("e1", 2),
+      ev({ id: "u2", kind: "user_reply", text: "再来", ts: 3 }),
+    ];
+    expect(isLatestErrorEvent(events, "e1")).toBe(false);
+  });
+
+  it("有更新的 error → 只有最新那条可重试", () => {
+    const events = [
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      err("e1", 2),
+      err("e2", 3),
+    ];
+    expect(isLatestErrorEvent(events, "e1")).toBe(false);
+    expect(isLatestErrorEvent(events, "e2")).toBe(true);
+  });
+
+  it("非 error 事件 / 不存在的 id → false", () => {
+    const events = [
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      ev({ id: "a", kind: "assistant_message", text: "答", ts: 2 }),
+    ];
+    expect(isLatestErrorEvent(events, "a")).toBe(false);
+    expect(isLatestErrorEvent(events, "nope")).toBe(false);
+    expect(isLatestErrorEvent([], "e")).toBe(false);
   });
 });
 

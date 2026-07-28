@@ -7,7 +7,7 @@
 
 - task ID：`{{taskId}}`
 - 任务标题：{{taskTitle}}
-- 默认 REQ-ID：{{defaultReqId}}（团队 wk-harness 规范流程的需求编号；仅执行 wk:* 相关 action 时使用，用户在需求描述中另行指定了 REQ-ID 则以用户的为准；非 wk 流程忽略本行）
+{{reqIdLine}}
 {{userIdentityLine}}
 - {{repoSection}}
 

@@ -215,7 +215,20 @@ export interface CompanyEnvServer {
   password: string;
 }
 
-export interface CompanyEnvPg {
+/**
+ * PG / Nacos / ELK 多实例的共同标识字段（取 servers 的 `name` + xxljob 的自由 `env` 并集）。
+ * - `name`：人看的名字（「CRM 测试库」/「预发库」），实例卡标题 + `FS_ENV_*_NAME`
+ * - `env`：环境段、自由字符串（test / pre / prod 都行，不做窄联合），决定
+ *   `FS_ENV_<子系统>_<环境段>_*` 里的段名；留空 = 不带环境段
+ *
+ * 两者都不要求唯一：同一环境段下第 2 条起自动加 `_2` / `_3` 序号后缀。
+ */
+export interface CompanyEnvInstanceId {
+  name: string;
+  env: string;
+}
+
+export interface CompanyEnvPg extends CompanyEnvInstanceId {
   host: string;
   port: number;
   user: string;
@@ -224,7 +237,7 @@ export interface CompanyEnvPg {
   dbTemplates: string[];
   /**
    * 只读软约束（默认 true）：落 company-env.json + brief 声明禁止写；
-   * 非硬闸，靠 prompt 约束 AI。
+   * 非硬闸，靠 prompt 约束 AI。每个实例各自一份——测试库可写、预发库只读是常态。
    */
   readonly: boolean;
 }
@@ -234,20 +247,21 @@ export interface CompanyEnvXxlJob {
   baseUrl: string;
   username: string;
   password: string;
-  /** 只读软约束（默认 true）；小节 UI 一把开关同步到所有条目 */
+  /** 只读软约束（默认 true），每条各自一份 */
   readonly: boolean;
 }
 
-export interface CompanyEnvNacos {
+/** Nacos 集群：测试 / 生产通常是两套独立集群（namespaces 只是单个集群内部的隔离维度） */
+export interface CompanyEnvNacos extends CompanyEnvInstanceId {
   baseUrl: string;
   username: string;
   password: string;
   namespaces: string[];
-  /** 只读软约束（默认 true） */
+  /** 只读软约束（默认 true），每个集群各自一份 */
   readonly: boolean;
 }
 
-export interface CompanyEnvElk {
+export interface CompanyEnvElk extends CompanyEnvInstanceId {
   baseUrl: string;
   username: string;
   password: string;
@@ -285,12 +299,15 @@ export interface CompanyEnvHttpApi {
 
 export interface CompanyEnv {
   servers: CompanyEnvServer[];
-  pg?: CompanyEnvPg;
+  /** PostgreSQL 实例（测试库 / 预发库 / 不同业务库各一条） */
+  pg: CompanyEnvPg[];
   /** 日志路径模板，如 `/apps/{project}/logs/console.log*` */
   logPathTemplates: string[];
   xxljob: CompanyEnvXxlJob[];
-  nacos?: CompanyEnvNacos;
-  elk?: CompanyEnvElk;
+  /** Nacos 集群（可多套） */
+  nacos: CompanyEnvNacos[];
+  /** ELK / Kibana 实例（可多套） */
+  elk: CompanyEnvElk[];
   /** 业务 HTTP API（可多条） */
   httpApis: CompanyEnvHttpApi[];
 }
@@ -398,6 +415,17 @@ export interface FeAiFlowSettings {
 }
 
 /**
+ * 自动播报档位——action 完成（产物过后置检查、进入待确认态）后自动发需求群。
+ * - off：不自动播报（只有用户点分享 / agent 按 playbook 调 share_to_group 才发）
+ * - ship：仅提测类（ship）跑完播报——群里最关心的是「提测了没、MR 在哪」
+ * - all：每个 action 跑完都播报
+ *
+ * 取值不再由用户配置、固定在 `feishu-bridge/bridge-config.GROUP_COLLAB_POLICY`。
+ */
+export const GROUP_AUTO_BROADCASTS = ["off", "ship", "all"] as const;
+export type GroupAutoBroadcast = (typeof GROUP_AUTO_BROADCASTS)[number];
+
+/**
  * 默认飞书项目空间（硬编码悟空产研）——历史用户 config 无此字段时回落这里、不写迁移脚本。
  */
 export const DEFAULT_MEEGLE_PROJECT = {
@@ -424,8 +452,9 @@ export interface ActionLayoutPref {
   /** 在「推进」弹窗隐藏的 action key（v0.9.12 起直接不出现、去 /actions 页开关恢复） */
   hidden: string[];
   /**
-   * 推进弹窗分组顺序（内置三组：builtin / team / custom）。
-   * 缺省 = ["builtin","team","custom"]；能力页可上移/下移。
+   * 推进弹窗分组顺序（内置四组：builtin / team / shared / custom）。
+   * 缺省 = ["builtin","team","shared","custom"]；能力页可上移/下移。
+   * 存量三组配置读入时由 normalizeGroupOrder 在 team 后补 shared。
    */
   groupOrder?: string[];
   /**
@@ -703,6 +732,45 @@ export interface PlanBatch {
 
 export type ReplanMode = "append" | "rebuild";
 
+// ===========================================
+// token 用量（SDK turn-ended 埋点落盘）
+// ===========================================
+
+/**
+ * 单轮（一次 agent.send 从发出到 turn 结束）的 token 用量、字段与 SDK
+ * `turn-ended` update 的 usage 一一对应、原样落盘不加工。
+ *
+ * ⚠️ 语义务必看清楚，别当成「上下文占用」用：
+ * - `inputTokens` 是**本轮内所有模型调用的 prompt token 之和**（一轮里 agent 可能
+ *   调几十次模型 + 工具），实测单轮能到 500 万——它 >> 任何模型的上下文窗口，
+ *   不是「当前上下文有多满」。
+ * - `cacheReadTokens` / `cacheWriteTokens` 是 inputTokens 的**子集**
+ *   （实测 read + write ≈ input，差值 = 没命中缓存的增量部分）。
+ * - `reasoningTokens` 是 outputTokens 的子集（思考 token）。
+ */
+export interface TurnTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens?: number;
+}
+
+/**
+ * token 用量汇总（task 级 / action 级共用一套形状）。
+ * 每轮 turn 结束落一次账：`last` 覆盖、`total` 逐字段累加、`turns` +1。
+ */
+export interface TokenUsageRollup {
+  /** 最近一轮的原始用量 */
+  last: TurnTokenUsage;
+  /** 累计用量（逐字段相加） */
+  total: TurnTokenUsage;
+  /** 已累计的轮数 */
+  turns: number;
+  /** 最近一次落账时间 */
+  updatedAt: number;
+}
+
 /**
  * 单条 action 记录
  *
@@ -860,6 +928,13 @@ export interface ActionRecord {
    * - 每条 action 上限 10、GC 删最老
    */
   revisions?: ArtifactRevision[];
+
+  /**
+   * 本 action 期间的 token 用量（回答「这次 build 到底烧了多少」）。
+   * 只在 action status=running 时把 turn 用量记到它头上（见 task-fs.recordTurnUsage）；
+   * 不存 = 这条 action 跑完时还没这个埋点 / 期间没收到过 turn-ended。
+   */
+  tokenUsage?: TokenUsageRollup;
 }
 
 /**
@@ -1077,7 +1152,7 @@ export type QueueStateSseEnvelope = {
  * |---|---|---|
  * | callId | string | 与 tool_call / tool_output_delta 配对（= SDK call_id） |
  * | name | string | 归一化工具名；MCP 为 `mcp:<server>:<tool>` |
- * | status | "success" \| "error" | 完成态 |
+ * | status | "success" \| "error" \| "interrupted" | 完成态；interrupted = run 终结时未收到 SDK 完成帧 |
  * | output | string | 结果文本，上限 8KB（UTF-8 字节）；超限截断 |
  * | truncated | boolean? | output 被截断时为 true |
  * | fullPath | string? | 截断时全量相对路径 `tool-outputs/<callId>.txt` |
@@ -1090,7 +1165,7 @@ export type QueueStateSseEnvelope = {
 export type ToolResultEventMeta = {
   callId: string;
   name: string;
-  status: "success" | "error";
+  status: "success" | "error" | "interrupted";
   output: string;
   truncated?: boolean;
   fullPath?: string;
@@ -1289,6 +1364,13 @@ export interface Task {
    */
   repoBranchTemplates?: Record<string, string>;
   feishuStoryUrl?: string;
+  /**
+   * 团队 wk-harness 规范的需求编号（**只认用户手填、系统不派生**、见 `req-id.ts`）。
+   * - 新建表单 / 详情页编辑弹窗都能填、两处输入框都默认留空
+   * - 空 / 未填 → 这个 task 就是没有 REQ-ID：wk 门禁跳过、prompt 不注入这一行
+   * - wk 门禁用它拼 `requirements/<REQ-ID>`；填错了门禁会「WK 产出目录里没这个目录」跳过、不炸
+   */
+  reqId?: string;
   contextDocs?: TaskContextDoc[];
   disabledMcpServers?: string[];
   /**
@@ -1341,6 +1423,11 @@ export interface Task {
   pendingAskId?: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * 本任务的 token 用量（每轮 turn 结束落一次账、见 TokenUsageRollup）。
+   * 不存 = 这个任务还没跑过 / 埋点上线前的老数据。
+   */
+  tokenUsage?: TokenUsageRollup;
   model?: ModelSelection;
   uiLayout?: { artifactPanelSize?: number };
   events: TaskEvent[];
@@ -1362,6 +1449,7 @@ export type NewTaskInput = Pick<
   | "title"
   | "repoPaths"
   | "feishuStoryUrl"
+  | "reqId"
   | "disabledMcpServers"
   | "model"
   | "repoBaseBranches"

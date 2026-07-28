@@ -9,8 +9,6 @@
 
 import { createContext, useContext, type ReactNode } from "react";
 
-import type { TaskEvent } from "@/lib/types";
-
 export interface ComposerSessionValue {
   taskId: string;
   repoPaths: string[];
@@ -43,17 +41,3 @@ export const ComposerSessionProvider = ({
 
 export const useComposerSession = (): ComposerSessionValue | null =>
   useContext(ComposerSessionContext);
-
-/** 从 events 抽 user_reply 文本，新→旧、去空、连续相同去重 */
-export const buildInputHistory = (events: TaskEvent[]): string[] => {
-  const out: string[] = [];
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i]!;
-    if (ev.kind !== "user_reply") continue;
-    const t = (ev.text ?? "").trim();
-    if (!t) continue;
-    if (out.length > 0 && out[out.length - 1] === t) continue;
-    out.push(t);
-  }
-  return out;
-};

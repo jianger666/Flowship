@@ -24,7 +24,7 @@
  * 所有 handler 内部短路、避免无效操作。
  */
 
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import type { ImagePayload } from "@/lib/task-store";
@@ -193,10 +193,13 @@ export const useImageAttach = (
     setImages((prev) => prev.filter((p) => p.id !== id));
   };
 
-  const reset = () => {
+  // useCallback（稳定引用）：调用方要把它放进 useEffect 依赖（切 task 时清附件），
+  // 每次 render 换个新函数会让那个 effect 每帧都跑一遍、把用户正在打的内容清掉
+  //（use-path-attach 的回调同理，全是稳定引用）
+  const reset = useCallback(() => {
     setImages([]);
     setIsDragging(false);
-  };
+  }, []);
 
   const triggerFilePicker = () => {
     if (options?.disabled) return;

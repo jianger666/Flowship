@@ -164,6 +164,12 @@ export const useSlashSkills = (opts: {
    * 第二参 cursor：希望编辑器落位的纯文本 offset（补全后应在 token 尾空格之后）。
    */
   applyDraft: (next: string, cursor?: number) => void;
+  /**
+   * 是否消费跨页 handoff（setPendingSlashSkill 写的那份）。默认 true。
+   * 同一页有第二个输入框时（推进弹窗）必须传 false——否则两个 hook 抢同一份
+   * pending、skill token 可能落进用户没看的那个框、还把 sessionStorage 清了。
+   */
+  consumePending?: boolean;
 }): SlashSkillsApi => {
   // 全量 skills（首次用到时拉、模块级缓存）
   const [skills, setSkills] = useState<SlashSkill[]>([]);
@@ -176,7 +182,7 @@ export const useSlashSkills = (opts: {
   // Lexical 注入的 pick：优先插 SkillTokenNode，失败再字符串 fallback
   const pickHandlerRef = useRef<SlashPickHandler | null>(null);
 
-  const { applyDraft, draft } = opts;
+  const { applyDraft, draft, consumePending = true } = opts;
   // applyDraft / draft 可能每次 render 都是新引用——ref 化避免 pending effect 依赖抖动
   const applyDraftRef = useRef(applyDraft);
   applyDraftRef.current = applyDraft;
@@ -190,6 +196,7 @@ export const useSlashSkills = (opts: {
   // 跨页 handoff：skills 拉齐后再往草稿头插 `/name `（保证能命中 knownNames 才高亮）
   const pendingConsumedRef = useRef(false);
   useEffect(() => {
+    if (!consumePending) return;
     if (skills.length === 0 || pendingConsumedRef.current) return;
     try {
       const pending = sessionStorage.getItem(PENDING_KEY);
@@ -216,7 +223,7 @@ export const useSlashSkills = (opts: {
     } catch {
       pendingConsumedRef.current = true;
     }
-  }, [skills]);
+  }, [skills, consumePending]);
 
   const knownNames = useMemo(
     () => new Set(skills.map((s) => s.name)),
@@ -366,7 +373,7 @@ export const SlashSkillMenu = ({ slash }: { slash: SlashSkillsApi }) => {
           </button>
         ))}
       </div>
-      <div className="border-t bg-muted/40 px-2.5 py-1 text-[10px] text-muted-foreground">
+      <div className="border-t bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground">
         ↑↓ 选择 · Enter 确认 · Esc 关闭
       </div>
     </div>

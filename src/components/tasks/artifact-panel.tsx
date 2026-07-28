@@ -31,6 +31,8 @@ import {
   Gamepad2,
   Info,
   Layers,
+  Loader2,
+  Share2,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -71,10 +73,21 @@ import {
   STREAMDOWN_REHYPE_PLUGINS,
 } from "@/components/markdown-text";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
+import { ShareToGroupDialog } from "@/components/tasks/share-to-group-dialog";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
+import {
+  SelectionFloatButton,
+  useSelectionFloat,
+} from "@/components/ui/selection-float";
+import { useShareToGroup } from "@/hooks/use-share-to-group";
+import { extractMrUrlsFromText } from "@/lib/mr-inbox";
+import {
+  SHARE_TO_GROUP_CONTENT_MAX,
+  buildSelectionShareInput,
+} from "@/lib/share-to-group";
 import {
   Select,
   SelectContent,
@@ -223,7 +236,7 @@ const buildMarkdownComponents = (
           onClick={() => onArtifactRefClick(ref)}
           title={`跳到 ${ACTION_LABEL_SHORT[ref.type] ?? ref.type} action #${ref.n}`}
         >
-          <span className="font-mono text-[0.85em] text-sky-600 dark:text-sky-400 underline-offset-2 group-hover:underline">
+          <span className="font-mono text-[0.85em] text-info underline-offset-2 group-hover:underline">
             {text}
           </span>
         </button>
@@ -258,7 +271,7 @@ const buildMarkdownComponents = (
                     className="no-underline"
                     title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${parsed.path}:${seg.line}`}
                   >
-                    <span className="text-sky-600 dark:text-sky-400 underline-offset-2 hover:underline">
+                    <span className="text-info underline-offset-2 hover:underline">
                       {i === 0 ? `${parsed.path}:${seg.text}` : seg.text}
                     </span>
                   </a>
@@ -273,7 +286,7 @@ const buildMarkdownComponents = (
           className={cn(
             "font-mono text-[0.85em]",
             anchor
-              ? "text-sky-600 dark:text-sky-400 underline-offset-2 group-hover:underline"
+              ? "text-info underline-offset-2 group-hover:underline"
               : "text-foreground",
           )}
         >
@@ -330,6 +343,11 @@ interface Props {
    * null = 没有产物 / 加载中尚无内容。父组件需用 useCallback 稳定引用、否则 effect 反复触发。
    */
   onArtifactMetaChange?: (meta: { filename: string } | null) => void;
+  /**
+   * 是否可「分享到需求群」。日常轻量任务（无飞书链接）为 false → 隐藏分享按钮。
+   * 由父组件用 isLightweightDailyTask 判定后传入。
+   */
+  canShareToGroup?: boolean;
 }
 
 const revisionOptionLabel = (
@@ -352,6 +370,7 @@ export const ArtifactPanel = ({
   priorPlans,
   onArtifactRefClick,
   onArtifactMetaChange,
+  canShareToGroup = false,
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
   // 代码跳转 IDE 配置（设置页可切 Cursor / IDEA）
@@ -361,6 +380,12 @@ export const ArtifactPanel = ({
       buildMarkdownComponents(baseDir, repoShortNames, jumpIde, onArtifactRefClick),
     [baseDir, repoShortNames, jumpIde, onArtifactRefClick],
   );
+  // 分享到需求群（确认 dialog + API；日常任务 canShareToGroup=false 不渲按钮）
+  // guideDialog = bot 不在群时的手动添加引导（叠在确认 dialog 之上、加完可原地重试）
+  const { runShare, guideDialog } = useShareToGroup();
+  const [shareOpen, setShareOpen] = useState(false); // 分享确认 dialog 开关
+  const [sharing, setSharing] = useState(false); // 整份产物分享飞行中、防双击
+  const [sharingSelection, setSharingSelection] = useState(false); // 选中段分享飞行中
 
   const [revisionOn, setRevisionOn] = useState(false); // 修订开关：开则正文变内联修订视图
   // 产物 / 游戏视图：推进中无产物时自动进游戏，也可随时手动切换摸鱼
@@ -417,6 +442,18 @@ export const ArtifactPanel = ({
   // 切 action 时读最新 status（不把 status 放进 reset effect 依赖，避免交卷后强切视图）
   const actionStatusRef = useRef(action.status);
   actionStatusRef.current = action.status;
+
+  // 选中正文一段 → 浮「分享到群」（与事件流「引用」同一个公共件）。
+  // 修订视图下关掉：那时正文是 diff 标记、选出来的片段带增删痕迹、发出去没意义
+  const {
+    containerRef: contentRef,
+    selection: shareSelection,
+    onMouseUp: onContentMouseUp,
+    clear: clearShareSelection,
+  } = useSelectionFloat({
+    enabled: canShareToGroup && !revisionOn,
+    maxLength: SHARE_TO_GROUP_CONTENT_MAX,
+  });
 
   // action 维度的「已看」状态：进 action 时读、切 action 时重置
   useEffect(() => {
@@ -709,6 +746,46 @@ export const ArtifactPanel = ({
   const canRevise = totalRevisions > 0;
   const showGame = panelView === "game";
 
+  // 选中段分享：直接发、不再弹确认（选区本身就是用户的明确意图）。
+  // kind=message：短内容进卡片正文，不像整份产物那样另发 md 文件。
+  const handleShareSelection = async (text: string) => {
+    if (sharingSelection) return;
+    const input = buildSelectionShareInput(text, actionTitle);
+    if (!input) return;
+    setSharingSelection(true);
+    try {
+      // 成败的 toast 由 runShare 收口；发出去了才清选区（失败时保留、方便原样重试）
+      if (await runShare(taskId, input)) clearShareSelection(true);
+    } finally {
+      setSharingSelection(false);
+    }
+  };
+
+  // 整份产物分享：正文不截断（走 md 文件）；MR 链接复用 extractMrUrlsFromText
+  const handleShareConfirm = async () => {
+    if (!currentArtifact || sharing) return;
+    setSharing(true);
+    try {
+      const mrUrls = extractMrUrlsFromText(currentArtifact.content);
+      const links =
+        mrUrls.length > 0
+          ? mrUrls.map((url, i) => ({
+              label: mrUrls.length === 1 ? "MR" : `MR ${i + 1}`,
+              url,
+            }))
+          : undefined;
+      const ok = await runShare(taskId, {
+        kind: "artifact",
+        title: actionTitle,
+        content: currentArtifact.content,
+        links,
+      });
+      if (ok) setShareOpen(false);
+    } finally {
+      setSharing(false);
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* toolbar：左视图切换 / 右修订（跟修订同栏、切换别抢戏） */}
@@ -737,6 +814,24 @@ export const ArtifactPanel = ({
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          {/* 有飞书链接 + 有产物正文才显示；日常轻量任务隐藏 */}
+          {canShareToGroup && currentArtifact && (
+            <ChoiceButton
+              shape="tab"
+              selected={false}
+              disabled={sharing}
+              onClick={() => setShareOpen(true)}
+              title="分享到需求群"
+              className="inline-flex items-center gap-1"
+            >
+              {sharing ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Share2 className="size-3.5" />
+              )}
+              分享到群
+            </ChoiceButton>
+          )}
           <ChoiceButton
             shape="tab"
             selected={revisionOn}
@@ -757,7 +852,7 @@ export const ArtifactPanel = ({
             {hasUnseen && (
               <span
                 aria-hidden
-                className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-red-500 ring-2 ring-background"
+                className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-destructive ring-2 ring-background"
               />
             )}
           </ChoiceButton>
@@ -803,12 +898,8 @@ export const ArtifactPanel = ({
                   className="ml-1 tabular-nums text-[11px] text-muted-foreground"
                   title="词级增删统计"
                 >
-                  <span className="text-green-700 dark:text-green-400">
-                    +{revisionStats.ins}
-                  </span>{" "}
-                  <span className="text-red-700 dark:text-red-400">
-                    −{revisionStats.del}
-                  </span>
+                  <span className="text-success">+{revisionStats.ins}</span>{" "}
+                  <span className="text-destructive">−{revisionStats.del}</span>
                 </span>
               )}
               <Button
@@ -961,21 +1052,43 @@ export const ArtifactPanel = ({
               )
             ) : (
               <>
-                {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
-                    让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
-                    （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
-                <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
-                  <Streamdown
-                    mode="static"
-                    shikiTheme={ARTIFACT_SHIKI_THEME}
-                    plugins={ARTIFACT_STREAMDOWN_PLUGINS}
-                    remarkPlugins={ARTIFACT_REMARK_PLUGINS}
-                    rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
-                    components={markdownComponents}
-                    controls={STREAMDOWN_CONTROLS}
-                  >
-                    {currentArtifact.content}
-                  </Streamdown>
+                {/* relative：选区浮动「分享到群」按钮相对本容器定位（跟着滚动一起走） */}
+                <div
+                  ref={contentRef}
+                  className="relative"
+                  onMouseUp={onContentMouseUp}
+                >
+                  {shareSelection && (
+                    <SelectionFloatButton
+                      state={shareSelection}
+                      label="分享到群"
+                      disabled={sharingSelection}
+                      icon={
+                        sharingSelection ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Share2 className="size-3" />
+                        )
+                      }
+                      onTrigger={(text) => void handleShareSelection(text)}
+                    />
+                  )}
+                  {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
+                      让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
+                      （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
+                  <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
+                    <Streamdown
+                      mode="static"
+                      shikiTheme={ARTIFACT_SHIKI_THEME}
+                      plugins={ARTIFACT_STREAMDOWN_PLUGINS}
+                      remarkPlugins={ARTIFACT_REMARK_PLUGINS}
+                      rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
+                      components={markdownComponents}
+                      controls={STREAMDOWN_CONTROLS}
+                    >
+                      {currentArtifact.content}
+                    </Streamdown>
+                  </div>
                 </div>
                 {/* V0.8.x：plan 批次表用全量有效批次（deriveEffectiveBatches）、不是单 action delta——
                     追加补充需求后也能看到完整批次盘子 b1/b2/b3 + 进度 + 来源 / 本次新增标记 */}
@@ -992,6 +1105,16 @@ export const ArtifactPanel = ({
           </div>
         </div>
       )}
+      {canShareToGroup && currentArtifact && (
+        <ShareToGroupDialog
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+          title={actionTitle}
+          sharing={sharing}
+          onConfirm={() => void handleShareConfirm()}
+        />
+      )}
+      {guideDialog}
     </div>
   );
 };

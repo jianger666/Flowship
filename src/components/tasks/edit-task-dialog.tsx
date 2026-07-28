@@ -43,6 +43,7 @@ import { MultiSelect } from "@/components/ui/multi-select";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
+import { normalizeReqId, reqIdPatchValue } from "@/lib/req-id";
 import { updateTaskFields } from "@/lib/task-store";
 import type { RepoConfig, Task } from "@/lib/types";
 
@@ -63,6 +64,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   const [storyUrlLockedHas, setStoryUrlLockedHas] = useState(
     !!(task.feishuStoryUrl ?? "").trim(),
   );
+  // wk 需求编号草稿：回填库里存的值、没有就空着（我们不猜、不预填任何派生值）。
+  // 清空并保存 = 这个 task 没有 REQ-ID（后端删字段、wk 门禁跳过）
+  const [reqId, setReqId] = useState(() => normalizeReqId(task.reqId) ?? "");
   // per-repo「已有工作分支」草稿（key=repoPath）
   const [featureBranches, setFeatureBranches] = useState<
     Record<string, string>
@@ -84,6 +88,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     setTitle(t.title);
     setFeishuStoryUrl(t.feishuStoryUrl ?? "");
     setStoryUrlLockedHas(!!(t.feishuStoryUrl ?? "").trim());
+    setReqId(normalizeReqId(t.reqId) ?? "");
     setFeatureBranches(t.repoFeatureBranches ?? {});
     setAddRepos([]);
     setSubmitting(false);
@@ -154,6 +159,8 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
         ...(storyUrlLockedHas
           ? { feishuStoryUrl: feishuStoryUrl.trim() }
           : {}),
+        // 需求编号：填了什么存什么、清空落 null（后端删字段 = 这个 task 没有 REQ-ID）
+        ...(storyUrlLockedHas ? { reqId: reqIdPatchValue(reqId) } : {}),
         repoFeatureBranches:
           Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
         ...(addRepos.length > 0
@@ -215,6 +222,19 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
               日常/需求身份创建后不可改、需要请新建任务
             </p>
           </div>
+
+          {/* wk 需求编号：只对需求任务有意义（日常任务推进面板不出 wk 流程组） */}
+          {storyUrlLockedHas && (
+            <div className="grid gap-1.5">
+              <Label htmlFor="edit-req-id">需求编号</Label>
+              <Input
+                id="edit-req-id"
+                value={reqId}
+                onChange={(e) => setReqId(e.target.value)}
+                placeholder="暂无 REQ-ID、可后补"
+              />
+            </div>
+          )}
 
           {/* 仓库：已绑只读（不可移除）、下方可追加 */}
           <div className="grid gap-1.5">

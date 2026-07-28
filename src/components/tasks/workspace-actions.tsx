@@ -182,7 +182,7 @@ export const WorkspaceActions = ({ task }: Props) => {
       return (
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-muted-foreground">
-            <span className="size-1.5 animate-pulse rounded-full bg-emerald-500" />
+            <span className="size-1.5 animate-pulse rounded-full bg-success" />
             预览中
           </span>
           {mine.url && (
@@ -395,10 +395,10 @@ const PreviewLogPopover = ({ slot }: { slot: PreviewSlotStatus }) => (
       日志
     </PopoverTrigger>
     <PopoverContent align="start" className="w-[480px] p-2">
-      <div className="mb-1 truncate font-mono text-[10px] text-muted-foreground" title={slot.command}>
+      <div className="mb-1 truncate font-mono text-[11px] text-muted-foreground" title={slot.command}>
         $ {slot.command}
       </div>
-      <pre className="max-h-64 overflow-auto whitespace-pre-wrap wrap-anywhere rounded bg-muted/40 p-2 font-mono text-[10px] leading-relaxed">
+      <pre className="max-h-64 overflow-auto whitespace-pre-wrap wrap-anywhere rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
         {slot.logTail.length > 0 ? slot.logTail.join("\n") : "（暂无输出）"}
       </pre>
     </PopoverContent>

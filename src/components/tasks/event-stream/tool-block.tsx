@@ -24,6 +24,16 @@ import {
 import { toast } from "sonner";
 
 import { MarkdownText } from "@/components/markdown-text";
+import {
+  CopyableBlock,
+  type CopyTextSource,
+} from "@/components/ui/copy-button";
+import {
+  IdePathLink,
+  useIdePathLinker,
+  type IdePathLinker,
+} from "@/components/ui/ide-path-link";
+import { useTaskBaseDir } from "@/hooks/use-task-base-dir";
 import { cn } from "@/lib/utils";
 import {
   countDiffStats,
@@ -35,7 +45,10 @@ import {
   toolBlockDefaultCollapsed,
   toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
+  toolBlockFilePath,
   toolBlockSummary,
+  toolDetailPathSegment,
+  toolPathNeedsBaseDir,
   verbGroupLabel,
   type DiffViewLine,
   type TodoItem,
@@ -46,19 +59,54 @@ import { formatTs } from "./utils";
 
 // ---------- 干净 diff 视图（解析层 parseUnifiedDiff；双列行号 + 无 @@ 原文）----------
 
-const DiffLineNum = ({ n }: { n?: number }) => (
-  <span className="w-8 shrink-0 select-none pr-1 text-right tabular-nums text-muted-foreground/50">
-    {n ?? ""}
-  </span>
-);
+const DIFF_LINE_NUM_CLASS =
+  "w-8 shrink-0 select-none pr-1 text-right tabular-nums text-muted-foreground/50";
 
-const DiffLine = ({ line }: { line: DiffViewLine }) => {
+/**
+ * diff 行号格。给了 linker + filePath 的那一列可点、跳 IDE 对应行。
+ * 只有「新文件行号」列接跳转——删除行在盘上已经没了、跳过去定位必偏。
+ */
+const DiffLineNum = ({
+  n,
+  linker,
+  filePath,
+}: {
+  n?: number;
+  linker?: IdePathLinker;
+  filePath?: string | null;
+}) => {
+  if (n == null || !linker || !filePath) {
+    return <span className={DIFF_LINE_NUM_CLASS}>{n ?? ""}</span>;
+  }
+  return (
+    <IdePathLink
+      linker={linker}
+      path={filePath}
+      line={n}
+      className={DIFF_LINE_NUM_CLASS}
+      // 行号保持原本的暗色、只在 hover 时提示可点（整列染蓝太吵）
+      linkClassName="cursor-pointer underline-offset-2 hover:text-info hover:underline"
+    >
+      {n}
+    </IdePathLink>
+  );
+};
+
+const DiffLine = ({
+  line,
+  linker,
+  filePath,
+}: {
+  line: DiffViewLine;
+  linker?: IdePathLinker;
+  filePath?: string | null;
+}) => {
   // hunk：极细分隔，不回显 @@ 原文（文件名已在标题行）
   if (line.kind === "hunk") {
     return (
       <div className="flex select-none items-center gap-2 px-2 py-1">
         <div className="h-px flex-1 border-t border-dashed border-border/60" />
-        <span className="text-[10px] leading-none text-muted-foreground/50">
+        <span className="text-[11px] leading-none text-muted-foreground/50">
           ⋯
         </span>
         <div className="h-px flex-1 border-t border-dashed border-border/60" />
@@ -70,15 +118,13 @@ const DiffLine = ({ line }: { line: DiffViewLine }) => {
     <div
       className={cn(
         "flex font-mono text-[11px] leading-relaxed",
-        line.kind === "add" &&
-          "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
-        line.kind === "del" &&
-          "bg-red-500/10 text-red-700 dark:text-red-400",
+        line.kind === "add" && "bg-success/10 text-success",
+        line.kind === "del" && "bg-destructive/10 text-destructive",
         line.kind === "context" && "text-muted-foreground",
       )}
     >
       <DiffLineNum n={line.oldLine} />
-      <DiffLineNum n={line.newLine} />
+      <DiffLineNum n={line.newLine} linker={linker} filePath={filePath} />
       {/* whitespace-pre + 外层横滚：折行会打乱双列行号对齐 */}
       <span className="min-w-0 flex-1 whitespace-pre px-2 py-px">
         {line.text || " "}
@@ -90,22 +136,31 @@ const DiffLine = ({ line }: { line: DiffViewLine }) => {
 const InlineDiff = ({
   diff,
   truncated,
+  linker,
+  filePath,
 }: {
   diff: string;
   truncated?: boolean;
+  /** 有 linker + filePath 时新行号可点、跳 IDE 对应行 */
+  linker?: IdePathLinker;
+  filePath?: string | null;
 }) => {
   const lines = useMemo(() => parseUnifiedDiff(diff), [diff]);
   return (
-    <div className="mt-1.5 max-h-64 overflow-x-auto overflow-y-auto rounded-md border border-border/60 bg-muted/20">
-      {lines.map((line, i) => (
-        <DiffLine key={i} line={line} />
-      ))}
-      {truncated && (
-        <div className="border-t border-border/50 px-2 py-1 text-[10px] text-muted-foreground">
-          diff 已截断
-        </div>
-      )}
-    </div>
+    // 复制的是 unified diff 原文（能直接贴回终端 / patch）；服务端截断过的就只有这些、
+    // diff 没有「加载完整」通道（跟工具输出不同、落盘的只有截断后的那份）
+    <CopyableBlock text={diff} label="复制 diff" className="mt-1.5">
+      <div className="max-h-64 overflow-x-auto overflow-y-auto rounded-md border border-border/60 bg-muted/20">
+        {lines.map((line, i) => (
+          <DiffLine key={i} line={line} linker={linker} filePath={filePath} />
+        ))}
+        {truncated && (
+          <div className="border-t border-border/50 px-2 py-1 text-[11px] text-muted-foreground">
+            diff 已截断
+          </div>
+        )}
+      </div>
+    </CopyableBlock>
   );
 };
 
@@ -128,21 +183,28 @@ const ToolBlockIcon = ({
   block: ToolBlock;
 }) => {
   if (block.status === "running") {
-    return <Loader2 className="size-3.5 shrink-0 animate-spin text-blue-500" />;
+    return <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />;
+  }
+  // run 终结未收到完成帧 / 渲染层 coerce：中性灰、不转圈
+  if (block.status === "interrupted") {
+    return <CircleSlash className="size-3.5 shrink-0 text-muted-foreground" />;
   }
   if (block.status === "error") {
     return <X className="size-3.5 shrink-0 text-destructive" />;
   }
+  // 完成态一律 success 色：形状表达「哪种工具」（终端 / 文件 / 通用），
+  // 颜色只表达「跑完了没出错」。原来 edit/write 用 amber、跟 warning 撞语义，
+  // 看起来像「这次编辑有问题」，其实只是成功的编辑。
   if (block.name.toLowerCase() === "shell") {
-    return <Terminal className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />;
+    return <Terminal className="size-3.5 shrink-0 text-success" />;
   }
   if (
     block.name.toLowerCase() === "edit" ||
     block.name.toLowerCase() === "write"
   ) {
-    return <FileCode2 className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />;
+    return <FileCode2 className="size-3.5 shrink-0 text-success" />;
   }
-  return <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />;
+  return <Check className="size-3.5 shrink-0 text-success" />;
 };
 
 const formatDuration = (ms?: number): string | null => {
@@ -170,6 +232,56 @@ interface ToolBlockRowProps {
  */
 const toolOutputIdFromFullPath = (fullPath: string): string =>
   fullPath.replace(/^.*\//, "").replace(/\.txt$/i, "");
+
+/**
+ * 拉工具完整输出（展示被截断时用）。「加载完整输出」按钮和「复制」共用这一条通道。
+ * 404（写盘失败 / 已被 prune）与网络错误都 toast 后返 null——调用方按「拿不到」处理。
+ */
+const fetchToolFullOutput = async (
+  taskId: string,
+  block: ToolBlock,
+): Promise<string | null> => {
+  try {
+    const fromPath = toolOutputIdFromFullPath(block.result?.fullPath ?? "");
+    // 优先 fullPath 消毒名；兜底 callId（普通工具 callId 本身已安全）
+    const outputId = fromPath || block.callId;
+    const res = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(outputId)}`,
+    );
+    // 历史事件写盘失败 / 已被 prune：降级提示，不当成硬错误
+    if (res.status === 404) {
+      toast.error("完整输出已不可用（可能未保存或已清理）");
+      return null;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } catch {
+    toast.error("完整输出加载失败");
+    return null;
+  }
+};
+
+/**
+ * 「复制输出」的取值源——复制的永远是**全量**、不是滚动框里可见的那截：
+ * 展示被截断且还没拉过全量 → 复制时现拉（顺手补进视图、跟按钮同源）；否则直接给当前文本。
+ */
+const buildOutputCopySource = (
+  taskId: string,
+  block: ToolBlock,
+  fullText: string | null,
+  displayOutput: string | undefined,
+  onLoaded: (text: string) => void,
+): CopyTextSource => {
+  if (fullText != null) return fullText;
+  if (block.result?.truncated && block.result?.fullPath) {
+    return async () => {
+      const text = await fetchToolFullOutput(taskId, block);
+      if (text != null) onLoaded(text);
+      return text;
+    };
+  }
+  return displayOutput ?? "";
+};
 
 /** 展开区底部：加载完整输出按钮（truncated + fullPath） */
 const LoadFullOutputButton = ({
@@ -204,27 +316,9 @@ const LoadFullOutputButton = ({
         onLoadingChange(true);
         onEnsureOpen();
         void (async () => {
-          try {
-            const fromPath = toolOutputIdFromFullPath(
-              block.result?.fullPath ?? "",
-            );
-            // 优先 fullPath 消毒名；兜底 callId（普通工具 callId 本身已安全）
-            const outputId = fromPath || block.callId;
-            const res = await fetch(
-              `/api/tasks/${encodeURIComponent(taskId)}/tool-output/${encodeURIComponent(outputId)}`,
-            );
-            // 历史事件写盘失败 / 已被 prune：降级提示，不当成硬错误
-            if (res.status === 404) {
-              toast.error("完整输出已不可用（可能未保存或已清理）");
-              return;
-            }
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            onLoaded(await res.text());
-          } catch {
-            toast.error("完整输出加载失败");
-          } finally {
-            onLoadingChange(false);
-          }
+          const text = await fetchToolFullOutput(taskId, block);
+          if (text != null) onLoaded(text);
+          onLoadingChange(false);
         })();
       }}
       className="mt-1 cursor-pointer text-[11px] text-primary hover:underline disabled:opacity-50"
@@ -234,7 +328,7 @@ const LoadFullOutputButton = ({
   );
 };
 
-/** 展开区空态：running → 等待输出；完成 → 无输出 */
+/** 展开区空态：running → 等待输出；interrupted → 已中断；完成 → 无输出 */
 const ExpandedEmptyPlaceholder = ({
   status,
 }: {
@@ -246,6 +340,11 @@ const ExpandedEmptyPlaceholder = ({
         <Loader2 className="size-3 shrink-0 animate-spin" />
         <span>等待输出…</span>
       </div>
+    );
+  }
+  if (status === "interrupted") {
+    return (
+      <div className="text-[11px] text-muted-foreground/70">已中断</div>
     );
   }
   return (
@@ -295,6 +394,14 @@ const TaskSubagentBlock = ({
       : block.result?.output;
 
   const outputBody = fullText ?? displayOutput;
+  // 复制产出：截断时现拉全量（不是复制滚动框里可见的那截）
+  const outputCopySource = buildOutputCopySource(
+    taskId,
+    block,
+    fullText,
+    displayOutput,
+    setFullText,
+  );
 
   const liveTail =
     collapsed &&
@@ -305,34 +412,36 @@ const TaskSubagentBlock = ({
 
   const statusIcon =
     block.status === "running" ? (
-      <Loader2 className="size-3.5 shrink-0 animate-spin text-violet-500" />
+      <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />
+    ) : block.status === "interrupted" ? (
+      <CircleSlash className="size-3.5 shrink-0 text-muted-foreground" />
     ) : block.status === "error" ? (
       <X className="size-3.5 shrink-0 text-destructive" />
     ) : (
-      <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      <Check className="size-3.5 shrink-0 text-success" />
     );
 
   return (
     <div
       className={cn(
         // 迷你卡：与普通工具行拉开层次（边框 + 渐变底 + 左侧紫轨）
-        "group/tool overflow-hidden rounded-lg border border-violet-500/20",
-        "bg-gradient-to-br from-violet-500/[0.08] via-violet-500/[0.02] to-transparent",
-        "dark:border-violet-400/25 dark:from-violet-400/15 dark:via-violet-500/[0.04]",
+        "group/tool overflow-hidden rounded-lg border border-subagent/25",
+        "bg-gradient-to-br from-subagent/[0.08] via-subagent/[0.02] to-transparent",
+        "dark:from-subagent/15 dark:via-subagent/[0.04]",
         nested && "pl-0",
       )}
     >
-      <div className="border-l-[3px] border-l-violet-500/70 dark:border-l-violet-400/55">
+      <div className="border-l-[3px] border-l-subagent/60">
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-violet-500/[0.06] hover:text-foreground dark:hover:bg-violet-400/10"
+          className="flex w-full cursor-pointer items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-subagent/[0.08] hover:text-foreground"
         >
           <CollapseChevron open={!collapsed} />
-          <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-violet-500/15 dark:bg-violet-400/20">
-            <Bot className="size-3.5 text-violet-600 dark:text-violet-300" />
+          <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-subagent/15">
+            <Bot className="size-3.5 text-subagent" />
           </span>
-          <span className="shrink-0 rounded-md bg-violet-500/15 px-1.5 py-px text-[10px] font-semibold tracking-wide text-violet-700 dark:bg-violet-400/20 dark:text-violet-200">
+          <span className="shrink-0 rounded-sm bg-subagent/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-subagent">
             子代理
           </span>
           <span className="min-w-0 shrink truncate text-[11px] font-medium text-foreground/90">
@@ -340,7 +449,7 @@ const TaskSubagentBlock = ({
           </span>
           {/* 模型徽标：args.model 有值才显示；历史缺 model 不硬造 */}
           {taskArgs?.model && (
-            <span className="shrink-0 rounded border border-violet-500/20 bg-background/60 px-1 py-px font-mono text-[10px] text-violet-700/80 dark:border-violet-400/25 dark:bg-violet-950/40 dark:text-violet-300/90">
+            <span className="shrink-0 rounded-sm border border-subagent/25 bg-background/60 px-1 py-px font-mono text-[11px] text-subagent/90">
               {taskArgs.model}
             </span>
           )}
@@ -350,7 +459,7 @@ const TaskSubagentBlock = ({
               {liveTail}
             </span>
           )}
-          <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+          <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
             {formatTs(block.ts)}
           </span>
         </button>
@@ -359,19 +468,22 @@ const TaskSubagentBlock = ({
           <div className="space-y-2.5 px-3 pb-3 pt-0.5">
             {/* 任务书 */}
             <div className="space-y-1">
-              <div className="text-[10px] font-medium tracking-wide text-violet-700/70 dark:text-violet-300/60">
+              <div className="text-[11px] font-medium tracking-wide text-subagent/80">
                 任务书
               </div>
               {prompt ? (
                 <div className="space-y-1">
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-violet-500/15 bg-background/70 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground dark:border-violet-400/15 dark:bg-background/40">
-                    {promptShown}
-                  </pre>
+                  {/* 复制的是完整任务书、不是「显示更多」之前的那截 */}
+                  <CopyableBlock text={prompt} label="复制任务书">
+                    <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-subagent/15 bg-background/70 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground dark:bg-background/40">
+                      {promptShown}
+                    </pre>
+                  </CopyableBlock>
                   {promptLong && (
                     <button
                       type="button"
                       onClick={() => setPromptExpanded((v) => !v)}
-                      className="cursor-pointer text-[11px] text-violet-700 hover:underline dark:text-violet-300"
+                      className="cursor-pointer text-[11px] text-subagent hover:underline"
                     >
                       {promptExpanded ? "收起" : "显示更多"}
                     </button>
@@ -384,12 +496,12 @@ const TaskSubagentBlock = ({
 
             {/* 产出：完成态 markdown；running 用 pre 防流式闪烁 */}
             <div className="space-y-1">
-              <div className="text-[10px] font-medium tracking-wide text-violet-700/70 dark:text-violet-300/60">
+              <div className="text-[11px] font-medium tracking-wide text-subagent/80">
                 产出
               </div>
               {block.status === "running" && !displayOutput ? (
                 <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80">
-                  <Loader2 className="size-3 shrink-0 animate-spin text-violet-500" />
+                  <Loader2 className="size-3 shrink-0 animate-spin text-info" />
                   <span>运行中…</span>
                 </div>
               ) : displayOutput ? (
@@ -405,17 +517,23 @@ const TaskSubagentBlock = ({
                     </button>
                   )}
                   {(block.status === "running" || outputOpen) && (
-                    <div className="mt-1 max-h-64 overflow-y-auto rounded-md border border-violet-500/15 bg-background/80 p-2 dark:border-violet-400/15 dark:bg-background/40">
-                      {block.status === "running" ? (
-                        <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
-                          {outputBody}
-                        </pre>
-                      ) : (
-                        <div className="text-[12px] leading-relaxed text-foreground/90 [&_.prose]:text-[12px]">
-                          <MarkdownText text={outputBody ?? ""} />
-                        </div>
-                      )}
-                    </div>
+                    <CopyableBlock
+                      text={outputCopySource}
+                      label="复制产出"
+                      className="mt-1"
+                    >
+                      <div className="max-h-64 overflow-y-auto rounded-md border border-subagent/15 bg-background/80 p-2 dark:bg-background/40">
+                        {block.status === "running" ? (
+                          <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                            {outputBody}
+                          </pre>
+                        ) : (
+                          <div className="text-xs leading-relaxed text-foreground/90 [&_.prose]:text-xs">
+                            <MarkdownText text={outputBody ?? ""} />
+                          </div>
+                        )}
+                      </div>
+                    </CopyableBlock>
                   )}
                   <LoadFullOutputButton
                     block={block}
@@ -470,9 +588,23 @@ const RegularToolBlockRow = ({
     [diff],
   );
 
+  // 本块指向的文件（edit / write / read）——路径、diff 标题、diff 行号都拿它去跳 IDE
+  const filePath = useMemo(() => toolBlockFilePath(block), [block]);
+  // 只有相对路径才需要 task cwd 兜底：SDK 给的基本是绝对路径、不为它们白发一次详情请求
+  const baseDir = useTaskBaseDir(
+    taskId,
+    !!filePath && toolPathNeedsBaseDir(filePath),
+    block.actionId,
+  );
+  // 拼不出绝对路径时 IdePathLink 自己退化成纯文本（不给点了没反应的假链接）
+  const linker = useIdePathLinker(baseDir);
+  // detail 行里可点的那一段（不是路径行 → null、整行走原纯文本）
+  const detailPath = toolDetailPathSegment(detailLine, filePath);
+
   const statusBits: string[] = [];
   if (block.status === "success") statusBits.push("✓");
   if (block.status === "error") statusBits.push("✗");
+  if (block.status === "interrupted") statusBits.push("已中断");
   if (block.result?.exitCode != null) {
     statusBits.push(`exit ${block.result.exitCode}`);
   }
@@ -497,6 +629,15 @@ const RegularToolBlockRow = ({
     detailLine || argsPreview || diff || displayOutput,
   );
 
+  // 复制输出：截断时现拉全量（不是复制滚动框里可见的那截）
+  const outputCopySource = buildOutputCopySource(
+    taskId,
+    block,
+    fullText,
+    displayOutput,
+    setFullText,
+  );
+
   return (
     <div className={cn("group/tool", nested && "pl-0")}>
       <button
@@ -510,7 +651,7 @@ const RegularToolBlockRow = ({
           {block.name}
         </span>
         {statusBits.length > 0 && block.status !== "running" && (
-          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/80">
+          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/80">
             {statusBits.join(" · ")}
           </span>
         )}
@@ -529,12 +670,15 @@ const RegularToolBlockRow = ({
             {liveTail ?? summary}
           </span>
         )}
+        {/* 展开态的路径：点它跳 IDE、点行内其它地方仍是折叠（IdePathLink 内部 stopPropagation） */}
         {!collapsed && block.result?.filePath && !diff && (
-          <span className="min-w-0 flex-1 truncate font-mono text-[11px] opacity-80">
-            {block.result.filePath}
-          </span>
+          <IdePathLink
+            linker={linker}
+            path={block.result.filePath}
+            className="min-w-0 flex-1 truncate font-mono text-[11px] opacity-80"
+          />
         )}
-        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
           {formatTs(block.ts)}
         </span>
       </button>
@@ -551,7 +695,17 @@ const RegularToolBlockRow = ({
                   : "whitespace-pre-wrap break-all font-mono",
               )}
             >
-              {detailLine ?? argsPreview}
+              {/* detail 打头是文件路径（read 的路径 / edit 的「路径 +N/−M」）→ 路径段可点 */}
+              {detailPath && filePath ? (
+                <>
+                  <IdePathLink linker={linker} path={filePath}>
+                    {detailPath}
+                  </IdePathLink>
+                  {detailLine?.slice(detailPath.length)}
+                </>
+              ) : (
+                (detailLine ?? argsPreview)
+              )}
             </div>
           )}
 
@@ -565,7 +719,11 @@ const RegularToolBlockRow = ({
               >
                 <CollapseChevron open={!diffCollapsed} />
                 <span className="min-w-0 truncate font-mono">
-                  {block.result?.filePath ?? "diff"}
+                  {filePath ? (
+                    <IdePathLink linker={linker} path={filePath} />
+                  ) : (
+                    "diff"
+                  )}
                   {diffStats && (
                     <span className="ml-1 tabular-nums">
                       +{diffStats.added}/−{diffStats.removed}
@@ -573,15 +731,15 @@ const RegularToolBlockRow = ({
                   )}
                 </span>
                 {block.result?.diffTruncated && (
-                  <span className="text-[10px] text-amber-600 dark:text-amber-400">
-                    已截断
-                  </span>
+                  <span className="text-[11px] text-warning">已截断</span>
                 )}
               </button>
               {!diffCollapsed && (
                 <InlineDiff
                   diff={diff}
                   truncated={block.result?.diffTruncated}
+                  linker={linker}
+                  filePath={filePath}
                 />
               )}
             </div>
@@ -601,9 +759,15 @@ const RegularToolBlockRow = ({
                 </button>
               )}
               {(block.status === "running" || outputOpen) && (
-                <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                  {fullText ?? displayOutput}
-                </pre>
+                <CopyableBlock
+                  text={outputCopySource}
+                  label="复制输出"
+                  className="mt-1"
+                >
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-border/50 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                    {fullText ?? displayOutput}
+                  </pre>
+                </CopyableBlock>
               )}
               {/* 仅 truncated+fullPath 都有才出按钮；写盘失败只有 truncated、点开会 404。
                   点击就地拉全量替换进上面的滚动框（不再弹 Dialog——用户嫌重） */}
@@ -650,11 +814,13 @@ const TodoToolBlock = ({
 
   const statusIcon =
     block.status === "running" ? (
-      <Loader2 className="size-3.5 shrink-0 animate-spin text-sky-500" />
+      <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />
+    ) : block.status === "interrupted" ? (
+      <CircleSlash className="size-3.5 shrink-0 text-muted-foreground" />
     ) : block.status === "error" ? (
       <X className="size-3.5 shrink-0 text-destructive" />
     ) : (
-      <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      <Check className="size-3.5 shrink-0 text-success" />
     );
 
   return (
@@ -665,17 +831,17 @@ const TodoToolBlock = ({
         className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
       >
         <CollapseChevron open={!collapsed} />
-        <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-sky-500/15 dark:bg-sky-400/20">
-          <ListTodo className="size-3.5 text-sky-600 dark:text-sky-300" />
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-info/15">
+          <ListTodo className="size-3.5 text-info" />
         </span>
-        <span className="shrink-0 rounded-md bg-sky-500/15 px-1.5 py-px text-[10px] font-semibold tracking-wide text-sky-700 dark:bg-sky-400/20 dark:text-sky-200">
+        <span className="shrink-0 rounded-sm bg-info/15 px-1.5 py-px text-[11px] font-semibold tracking-wide text-info">
           待办
         </span>
         <span className="min-w-0 flex-1 truncate text-[11px] tabular-nums opacity-80">
           {summary}
         </span>
         {statusIcon}
-        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/tool:opacity-60">
+        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/tool:opacity-60">
           {formatTs(block.ts)}
         </span>
       </button>
@@ -719,7 +885,7 @@ const TodoToolItemRow = ({ item }: { item: TodoItem }) => {
 const TodoStatusIcon = ({ status }: { status: TodoItem["status"] }) => {
   if (status === "completed") {
     return (
-      <Check className="mt-0.5 size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
     );
   }
   if (status === "in_progress") {
@@ -773,11 +939,11 @@ const ToolVerbGroupRowImpl = ({
         className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground/70 transition-colors hover:bg-muted/40 hover:text-muted-foreground"
       >
         <CollapseChevron open={!collapsed} />
-        <Check className="size-3.5 shrink-0 text-emerald-600/80 dark:text-emerald-400/80" />
+        <Check className="size-3.5 shrink-0 text-success/80" />
         <span className="min-w-0 flex-1 truncate text-[11px]">
           {verbGroupLabel(group)}
         </span>
-        <span className="ml-auto shrink-0 text-[10px] opacity-0 transition-opacity group-hover/verb:opacity-60">
+        <span className="ml-auto shrink-0 text-[11px] opacity-0 transition-opacity group-hover/verb:opacity-60">
           {formatTs(group.ts)}
         </span>
       </button>

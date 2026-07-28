@@ -44,17 +44,26 @@ export const stringifyMeta = (v: unknown): string => {
 //   - error: 顶层错误（用于显示 toast）
 //   - assistant_delta: assistant_message 流式 chunk、UI 拼接打字效果
 //   - queue_failed: 队列整队失败控制帧（纯内存、不落盘）
+//   - restricted_run: 旁路只读答疑 run 的活跃度信号（纯内存、不落盘、不进 runStatus）
 //   - task_deleted: DELETE 逻辑删除提交后通知既有 watcher 关流（纯内存、不落盘）
+//
+// `origin`（event / assistant_delta / done 三种帧）= 这条事件出自哪一路 run：
+//   - 省略  → 属主主链（task / chat run、one-shot、stop 补发的 done…）
+//   - 有值  → 旁路 run 的不可复用 token（当前只有受限群答疑）
+// 群回流的回群登记按它精确投递（见 feishu-bridge/group-shared 的 token 化协议）。
+// 前端不消费 origin——旁路是否在飞走 restricted_run 帧。
 export type TaskStreamEvent =
-  | { kind: "event"; event: TaskEvent }
+  | { kind: "event"; event: TaskEvent; origin?: string }
   | { kind: "task"; task: Task }
   | { kind: "action"; action: ActionRecord }
-  | { kind: "done"; task: Task; ok: boolean }
+  | { kind: "done"; task: Task; ok: boolean; origin?: string }
   | { kind: "error"; message: string }
-  | { kind: "assistant_delta"; text: string }
+  | { kind: "assistant_delta"; text: string; origin?: string }
   | { kind: "queue_failed"; itemIds: string[]; reason: string }
   // MessageOperation 终态帧（纯内存、不落盘）——client ledger 成功/失败终态的实时来源
   | { kind: "message_op"; itemId: string; phase?: string; outcome?: string }
+  // 旁路（受限群答疑）run 在飞与否——前端据此决定工具块还该不该转圈（见 P1-2 注释）
+  | { kind: "restricted_run"; active: boolean }
   | { kind: "task_deleted"; taskId: string };
 
 export type TaskStreamListener = (ev: TaskStreamEvent) => void;
@@ -298,6 +307,121 @@ export const isTaskStarting = (taskId: string): boolean =>
 /** 测试 / 异常清理：强制清零某 task 的 starting 计数 */
 export const clearTaskStarting = (taskId: string): void => {
   startingTasksMap().delete(taskId);
+};
+
+// ----------------- 受限（只读）群答疑：旁路 agent 登记 -----------------
+//
+// 需求群里**非任务所有者**的提问会起一个只读 agent，它**不是这个 task 的 action run**：
+// 不写 runStatus、不占 runningTasks、不进 agentSessions、不动 action——所以上面那几张表
+// 一概不认识它（这正是它跟属主会话能安全并存的原因，见 restricted-question.ts）。
+//
+// 但「进程里还有没有这种旁路 agent 在飞」仍有两个硬需求，故单开这张轻量表：
+//   1. **终态清理**：DELETE / finalize 会删 worktree，旁路 agent 必须先被叫停，
+//      否则它在被删掉的 cwd 里继续跑（孤儿进程 + 写不进 events.jsonl）
+//   2. **群侧串行**：入向路由据此让第二条群消息稍后再发——同一个 worktree 上并排起
+//      好几个只读 agent 既烧额度又抢 IO，群里也只有一条对话线索。
+//      ⚠️ 不是为了投递安全：回群登记的旁路条目**可以并存**、各按自己的 token 投递
+//      （见 feishu-bridge/group-shared 的 token 化投递协议）
+//
+// ⛔ 不要把它接进 runStatus / 停止键 / advance 准入等 task 运行态判定——
+//    第三轮双审的 P0 就是「旁路答疑染指 task 运行状态机」。
+
+/** 一条在飞的受限答疑（cancelled 同时是它的事件落盘 lease） */
+export interface RestrictedQuestionRun {
+  /** 置 true 后：事件不再落盘、在飞的 run 被 cancel、启动链自裁 */
+  cancelled: boolean;
+  /** 中止在飞的 SDK run（还没 send 出去时是 no-op、靠 cancelled 自裁） */
+  cancel: () => void;
+}
+
+const RESTRICTED_QUESTION_KEY = "__flowshipRestrictedQuestionRunsV1__";
+
+const restrictedQuestionRuns = (): Map<string, Set<RestrictedQuestionRun>> => {
+  const g = globalThis as unknown as Record<
+    string,
+    Map<string, Set<RestrictedQuestionRun>> | undefined
+  >;
+  if (!g[RESTRICTED_QUESTION_KEY]) g[RESTRICTED_QUESTION_KEY] = new Map();
+  return g[RESTRICTED_QUESTION_KEY]!;
+};
+
+/**
+ * 旁路在飞信号——**只服务 UI**（事件流的工具块该不该继续转圈）。
+ *
+ * 旁路 run 不写 runStatus，前端的 `isRunning` 却只看 runStatus → 旁路 agent 跑着的
+ * 长 shell / 子代理会被判成脏数据、渲染成灰色「已中断」。信号从登记表这个唯一源发出，
+ * 表变了必发、不会与真实在飞状态漂移；watch-task bootstrap 也按同一张表补发一帧
+ * （中途打开页面 / 断线重连的补位）。
+ *
+ * ⛔ 仍然不许把这张表接进 runStatus / 停止键 / 推进准入——那是上一轮拆掉的耦合。
+ */
+const publishRestrictedRunSignal = (taskId: string): void => {
+  publish(taskId, {
+    kind: "restricted_run",
+    active: hasRestrictedQuestionInFlight(taskId),
+  });
+};
+
+export const registerRestrictedQuestion = (
+  taskId: string,
+  run: RestrictedQuestionRun,
+): void => {
+  const m = restrictedQuestionRuns();
+  const set = m.get(taskId) ?? new Set<RestrictedQuestionRun>();
+  set.add(run);
+  m.set(taskId, set);
+  publishRestrictedRunSignal(taskId);
+};
+
+export const unregisterRestrictedQuestion = (
+  taskId: string,
+  run: RestrictedQuestionRun,
+): void => {
+  const m = restrictedQuestionRuns();
+  const set = m.get(taskId);
+  if (!set) return;
+  set.delete(run);
+  if (set.size === 0) m.delete(taskId);
+  // 还有别的旁路 run 在飞时仍是 active——信号按表算、不按「我退出了」算
+  publishRestrictedRunSignal(taskId);
+};
+
+/** 这个 task 此刻有受限群答疑在飞吗（群入向串行判定用） */
+export const hasRestrictedQuestionInFlight = (taskId: string): boolean =>
+  (restrictedQuestionRuns().get(taskId)?.size ?? 0) > 0;
+
+/**
+ * 叫停某 task 名下全部受限群答疑（DELETE / finalize 这种要删 worktree 的终态收尾调）。
+ * 只发信号、不等它退出——要等请配 {@link waitForRestrictedQuestionsToStop}。
+ */
+export const cancelRestrictedQuestions = (taskId: string): void => {
+  const set = restrictedQuestionRuns().get(taskId);
+  if (!set) return;
+  for (const run of set) {
+    run.cancelled = true;
+    try {
+      run.cancel();
+    } catch {
+      /* noop */
+    }
+  }
+};
+
+/**
+ * 等旁路答疑真退出（对齐 {@link waitForTaskToStop} 的用法：cancel 只是发信号、
+ * 收尾链的 finally 还可能往 events.jsonl 落一笔——不等它就 rm 会边写边删撞车）。
+ * @returns false = 超时仍在飞
+ */
+export const waitForRestrictedQuestionsToStop = async (
+  taskId: string,
+  timeoutMs = 8000,
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (hasRestrictedQuestionInFlight(taskId)) {
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return true;
 };
 
 // resource job + quarantine 实现在 resource-jobs.ts（避环）；此处 re-export
@@ -585,15 +709,19 @@ export const PERSIST_FAIL_RETRY_MESSAGE = "消息保存失败、请重试" as co
  * owned 事件 sink——lease 必填，缺省即编译失败。
  * 内部走带 lease 的 appendEvent；失主 / ENOENT 不写盘、不 publish。
  * publish 同样进 append 链（与 writeEventAndPublish 同序协议）。
+ *
+ * @param origin 旁路 run 的身份 token（属主主链不传）——见 TaskStreamEvent.origin。
+ *   只挂在 publish 出去的 envelope 上、不落盘（events.jsonl 里没有这个字段）。
  */
 export const writeOwnedEventAndPublish = async (
   taskId: string,
   lease: () => boolean,
   ev: Omit<TaskEvent, "id" | "ts" | "seq">,
+  origin?: string,
 ): Promise<TaskEvent | null> => {
   try {
     return await appendEvent(taskId, ev, lease, (event) => {
-      publish(taskId, { kind: "event", event });
+      publish(taskId, { kind: "event", event, ...(origin ? { origin } : {}) });
     });
   } catch (err) {
     console.warn(

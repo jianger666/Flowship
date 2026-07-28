@@ -50,6 +50,15 @@ export const buildNextActionHead = (args: {
     .join(" ") + "]";
 
 /**
+ * 一条消息最多引用几个 skill——**客户端截断与服务端校验的同一个源**。
+ *
+ * 分家过：客户端不限、服务端四条通道各写一份 `MAX_SKILLS = 8`，用户在输入框敲到
+ * 第 9 个 `/skill` 就整条消息 400（正文和附件一起丢）。现在客户端按它截断 + 提示，
+ * 服务端仍校验兜底（HTTP 直调）。
+ */
+export const MAX_SKILL_REFS = 8;
+
+/**
  * 拼 skill 指引段（只进 agent 消息、不进 user_reply 事件）。
  * 格式与旧客户端 buildSkillPrefix 一致，方便 agent / 历史兼容。
  */

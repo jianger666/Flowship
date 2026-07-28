@@ -4,35 +4,42 @@
  */
 import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// 数据目录隔离到 tmp（必须在 import 被测模块之前设好——dataRoot 每次调用读 env）
-const TMP = path.join(os.tmpdir(), `feishu-bridge-inbound-${Date.now()}`);
-process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
+import {
+  installBridgeTestHooks,
+  tick,
+  makeBridgeTmpDataDir,
+} from "./helpers/feishu-bridge-harness";
+
+// 数据目录隔离到 tmp（dataRoot 每次调用读 env、import 后再设也生效）
+const TMP = makeBridgeTmpDataDir("feishu-bridge-inbound");
 
 const {
   __resetBridgeRuntimeForTest,
+  __setConsumerBackoffBaseForTest,
   __setInboundSpawnForTest,
   checkEventKeyConflict,
   getBridgeRuntimeStatus,
   normalizeInboundEvent,
   syncBridgeRuntime,
 } = await import("@/lib/server/feishu-bridge/inbound");
-const { __resetLarkBinCacheForTest, __setLarkExecForTest } = await import(
+const { __setLarkExecForTest } = await import(
   "@/lib/server/feishu-bridge/lark-api"
 );
 const { registerCardActionHandler } = await import(
   "@/lib/server/feishu-bridge/router"
 );
-const {
-  __resetBridgeStateForTest,
-  getLastP2pChatId,
-  hasProcessedMessageId,
-} = await import("@/lib/server/feishu-bridge/bridge-state");
+const { getLastP2pChatId, hasProcessedMessageId } = await import(
+  "@/lib/server/feishu-bridge/bridge-state"
+);
+
+// 排空入向 / card.action 共享链 + 重建隔离数据目录（__resetBridgeRuntimeForTest
+// 只停 consumer、不排链——遗留 handler 会在下一用例里对着已撤的 mock 跑）
+installBridgeTestHooks({ tmpRoot: TMP });
 
 // ----------------- fake child（模拟 lark-cli event consume 子进程） -----------------
 
@@ -113,10 +120,11 @@ const startBridge = async (): Promise<{ im: FakeChild; card: FakeChild }> => {
 
 beforeEach(async () => {
   await __resetBridgeRuntimeForTest();
-  await __resetBridgeStateForTest();
   spawned = [];
   statusConsumers = [];
   __setInboundSpawnForTest(fakeSpawn);
+  // 崩溃重启用例本来真等 1s 首轮退避——占掉大半个用例预算、全量并发下随机超时
+  __setConsumerBackoffBaseForTest(20);
   // mock lark-cli exec：event status 返回可控 consumer 列表、其余返回 ok
   __setLarkExecForTest(async (_bin, args) => {
     if (args[0] === "event" && args[1] === "status") {
@@ -144,11 +152,7 @@ afterEach(async () => {
   registerCardActionHandler(null);
   __setInboundSpawnForTest(null);
   __setLarkExecForTest(null);
-  __resetLarkBinCacheForTest();
-});
-
-afterAll(async () => {
-  await fs.rm(TMP, { recursive: true, force: true });
+  __setConsumerBackoffBaseForTest(null);
 });
 
 // ----------------- normalizeInboundEvent -----------------
@@ -259,8 +263,9 @@ describe("bridge runtime 生命周期（mock spawn）", () => {
     card.stdout.write(`${JSON.stringify({ n: "1" })}\n`);
     card.stdout.write(`${JSON.stringify({ n: "2" })}\n`);
     await vi.waitFor(() => expect(order).toContain("1-start"));
-    // 第二个事件已入队但不得在第一个结束前跑（旧 fire-and-forget 会并发 2-start）
-    await new Promise((r) => setTimeout(r, 30));
+    // 第二个事件已入队但不得在第一个结束前跑（旧 fire-and-forget 会并发 2-start）——
+    // 排空几轮事件循环即可，不靠墙钟 30ms
+    await tick(3);
     expect(order).toEqual(["1-start"]);
     releaseFirst();
     await vi.waitFor(() =>
@@ -304,13 +309,10 @@ describe("bridge runtime 生命周期（mock spawn）", () => {
       expect(st?.status).toBe("backoff");
       expect(st?.restartCount).toBe(1);
     });
-    // 首轮退避 1s、之后翻倍——等它真的重启（真实计时、上限 3s 足够）
-    await vi.waitFor(
-      () => {
-        expect(findSpawned("im.message.receive_v1")).toHaveLength(2);
-      },
-      { timeout: 3000 },
-    );
+    // 首轮退避已调到 20ms（见 beforeEach）——等它真的重启
+    await vi.waitFor(() => {
+      expect(findSpawned("im.message.receive_v1")).toHaveLength(2);
+    });
   });
 
   it("开关关 → sync 优雅停（stdin EOF、状态 stopped、不重启）", async () => {

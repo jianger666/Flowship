@@ -52,7 +52,7 @@ export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   actionLayout: {
     order: [],
     hidden: [],
-    groupOrder: ["builtin", "team", "custom"],
+    groupOrder: ["builtin", "team", "shared", "custom"],
     collapsedGroups: [],
   },
   reuseAgentDefault: false,
@@ -92,6 +92,7 @@ const cloneDefaultSettings = (): FeAiFlowSettings => ({
       ...(DEFAULT_SETTINGS.actionLayout?.groupOrder ?? [
         "builtin",
         "team",
+        "shared",
         "custom",
       ]),
     ],
@@ -192,10 +193,12 @@ export const normalizeSettings = (
       };
     });
   const merged = { ...DEFAULT_SETTINGS, ...parsed };
-  // 历史残留键读取时忽略、不落进归一结果
-  // username：V0.12.x 已删；gitHost：已退役（host 按任务仓库 remote 现推）
+  // 历史残留键读取时忽略、不落进归一结果（下次落盘就把它们从 config.json 抹掉）
+  // username：V0.12.x 已删；gitHost：已退役（host 按任务仓库 remote 现推）；
+  // groupCollab：2026-07-28 三个群协作开关砍掉、行为固定在 bridge-config.GROUP_COLLAB_POLICY
   delete (merged as Record<string, unknown>).username;
   delete (merged as Record<string, unknown>).gitHost;
+  delete (merged as Record<string, unknown>).groupCollab;
 
   return {
     ...merged,

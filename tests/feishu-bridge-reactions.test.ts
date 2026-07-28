@@ -34,6 +34,8 @@ import {
   __emitInjectResultForTest,
 } from "@/lib/server/feishu-bridge/router";
 
+import { tick } from "./helpers/feishu-bridge-harness";
+
 describe("feishu-bridge reactions", () => {
   beforeEach(() => {
     __resetReactionsForTest();
@@ -124,8 +126,9 @@ describe("feishu-bridge reactions", () => {
       enqueuedAt: Date.now(),
       extraMeta: { feishuMessageId: "om_upgrade" },
     });
-    // flush 事件发出后给回调机会执行——期望完全无表情操作
-    await new Promise((r) => setTimeout(r, 50));
+    // flush 事件发出后给回调机会执行——期望完全无表情操作。
+    // 排空几轮事件循环即可，不靠墙钟 50ms
+    await tick(3);
     expect(removeReaction).not.toHaveBeenCalled();
     expect(addReaction).not.toHaveBeenCalled();
     expect(getStoredReaction("om_upgrade")?.emojiType).toBe(EMOJI_QUEUED);

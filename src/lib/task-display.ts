@@ -172,6 +172,18 @@ export const RUN_STATUS_VARIANT: Record<
   error: "destructive",
 };
 
+/**
+ * 顶栏「停止」按钮的可见条件——`runStatus === "running"` 是唯一依据。
+ *
+ * 抽成单一源是因为它同时是一条**安全契约**：点下去走的是 `stopTaskAgent` 核弹路径
+ * （running / awaiting_ack 的 action 一律标 cancelled + 关属主会话）。所以凡是
+ * 「不属于本 task action run」的旁路 agent（如需求群非属主的受限答疑）都**不得**
+ * 写 `runStatus = running`，否则停止键会在旁路跑着时冒出来、误伤审阅中的产物。
+ * 由 `tests/restricted-group-question.test.ts` 钉住。
+ */
+export const isStopButtonVisible = (task: Pick<Task, "runStatus">): boolean =>
+  task.runStatus === "running";
+
 // ===========================================
 // 相对时间文案
 // ===========================================

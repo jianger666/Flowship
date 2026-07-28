@@ -2,9 +2,10 @@
  * chat 工作过程分组纯函数（CHAT-REDESIGN Batch A、2026-07-21 用户验收修正语义）
  *
  * 把 mergeToolDisplayEvents 产出的 StreamRenderItem[] 里连续的过程项
- * （thinking / 工具块 / verb-group / error）收成「工作过程组」；
+ * （thinking / 工具块 / verb-group）收成「工作过程组」；
  * assistant_message 一律独立平铺——AI 中间插话天然分隔前后两个组，
  * 不把「插话前后的两批工具」整合进同一组（用户拍板）。
+ * error 同样独立平铺（2026-07-28）——见下方 MEMBER_KINDS 注释。
  * 粘性状态行文案也在此派生。不碰 events.jsonl、不碰组件。
  */
 
@@ -51,18 +52,19 @@ export const isWorkGroup = (it: ChatRenderItem): it is WorkGroupItem =>
 // ---------- 组成员判定 ----------
 
 /**
- * 进组的 kind——纯过程项。assistant_message 不在其中：
- * AI 说的每段话（含中间插话）都独立平铺、并天然隔断前后组。
+ * 进组的 kind——纯过程项。两类东西**不**进组、独立平铺并隔断前后组：
+ *   - assistant_message：AI 说的每段话（含中间插话）都是正文
+ *   - error（2026-07-28）：run 挂了是这一轮最重要的信息、不能被组的
+ *     「run 结束自动收起」吃掉（用户正在读的错误会啪一下消失、还得点两次找回来）
  */
 const MEMBER_KINDS = new Set<string>([
   "thinking",
   "__tool_block__",
   "__tool_verb_group__",
-  "error",
 ]);
 
+// error 事件已不进组（见 MEMBER_KINDS）、组内只可能剩「工具执行失败」这一种错
 const memberHasError = (it: StreamRenderItem): boolean => {
-  if (it.kind === "error") return true;
   if (it.kind === "__tool_block__") {
     return (it as ToolBlock).status === "error";
   }
@@ -98,8 +100,8 @@ const buildWorkGroup = (members: StreamRenderItem[]): WorkGroupItem => {
 };
 
 /**
- * 线性扫产组：连续过程项（thinking / 工具 / error）收进同一组；
- * 任何非过程项（user_reply / assistant_message / ask_* / info / 未知）
+ * 线性扫产组：连续过程项（thinking / 工具）收进同一组；
+ * 任何非过程项（user_reply / assistant_message / error / ask_* / info / 未知）
  * 独立输出并隔断组。单成员也成组（统一渲染路径）。O(n)。
  */
 export const groupChatRenderItems = (
@@ -126,6 +128,28 @@ export const groupChatRenderItems = (
   }
   flush();
   return out;
+};
+
+// ---------- 错误可重试判定 ----------
+
+/**
+ * 这条 error 是不是「当轮失败」——只有它该给「重试」入口。
+ *
+ * 重试的语义是「把最后一条用户消息原样再发」。翻历史时点旧错误上的重试、
+ * 发出去的是今天最后那条消息、完全不是用户预期。所以要求两件事同时成立：
+ *   1. 它是最后一条 error（之后没有更新的失败）
+ *   2. 其后没有新的 user_reply（用户已经继续说话 = 这一轮翻篇了）
+ */
+export const isLatestErrorEvent = (
+  events: readonly TaskEvent[],
+  eventId: string,
+): boolean => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (ev.id === eventId) return ev.kind === "error";
+    if (ev.kind === "error" || ev.kind === "user_reply") return false;
+  }
+  return false;
 };
 
 // ---------- deriveActiveStatus ----------

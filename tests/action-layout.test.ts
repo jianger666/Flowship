@@ -8,6 +8,7 @@ import {
   filterAdvanceByDisabledAppSkills,
   filterAdvanceByRequiresKnowledge,
   groupAdvanceActions,
+  isWkFlowShell,
   normalizeCollapsedGroups,
   normalizeGroupOrder,
   partitionActionsByGroup,
@@ -54,12 +55,12 @@ describe("removeActionLayoutId（D10）", () => {
       {
         order: ["plan", "x"],
         hidden: [],
-        groupOrder: ["custom", "builtin", "team"],
+        groupOrder: ["custom", "builtin", "team", "shared"],
         collapsedGroups: ["team"],
       },
       "x",
     );
-    expect(next.groupOrder).toEqual(["custom", "builtin", "team"]);
+    expect(next.groupOrder).toEqual(["custom", "builtin", "team", "shared"]);
     expect(next.collapsedGroups).toEqual(["team"]);
     expect(next.order).toEqual(["plan"]);
   });
@@ -82,24 +83,40 @@ describe("sortByOrder / arrangeByLayout 冒烟", () => {
 });
 
 describe("分组：resolveActionGroup / groupAdvanceActions / normalize*", () => {
-  const teamA = def({
-    id: "team:a",
-    label: "A",
-    skill: "a",
+  // wk 壳：有 order（九壳 10~90）
+  const wkByOrder = def({
+    id: "team:wk-plan",
+    label: "方案",
+    skill: "wk-plan",
     origin: "team",
     order: 20,
   });
-  const teamB = def({
-    id: "team:b",
-    label: "B",
-    skill: "b",
+  // wk 壳：仅 wk- 前缀、无 order（仍进 team）
+  const wkByName = def({
+    id: "team:wk-ship",
+    label: "提测",
+    skill: "wk-ship",
     origin: "team",
-    order: 10,
   });
-  const teamNoOrder = def({
-    id: "team:c",
-    label: "C",
-    skill: "c",
+  // 有 order 的非 wk 名：仍算壳（order 信号）
+  const wkOrderOnly = def({
+    id: "team:flow-build",
+    label: "开发",
+    skill: "flow-build",
+    origin: "team",
+    order: 30,
+  });
+  // 共享杂项：origin=team、无 order、非 wk- 前缀
+  const sharedMisc = def({
+    id: "team:svc-debug",
+    label: "服务排查",
+    skill: "svc-debug",
+    origin: "team",
+  });
+  const sharedBug = def({
+    id: "team:file-bug",
+    label: "提缺陷",
+    skill: "file-bug",
     origin: "team",
   });
   const appX = def({
@@ -111,12 +128,32 @@ describe("分组：resolveActionGroup / groupAdvanceActions / normalize*", () =>
   const legacy = def({ id: "old", label: "旧", skill: "" });
 
   const byId = new Map(
-    [teamA, teamB, teamNoOrder, appX, legacy].map((d) => [d.id, d] as const),
+    [
+      wkByOrder,
+      wkByName,
+      wkOrderOnly,
+      sharedMisc,
+      sharedBug,
+      appX,
+      legacy,
+    ].map((d) => [d.id, d] as const),
   );
 
-  it("归属：内置 / team / 其余→custom", () => {
+  it("isWkFlowShell：wk- 前缀或有限 order 取或", () => {
+    expect(isWkFlowShell(wkByOrder)).toBe(true);
+    expect(isWkFlowShell(wkByName)).toBe(true);
+    expect(isWkFlowShell(wkOrderOnly)).toBe(true);
+    expect(isWkFlowShell(sharedMisc)).toBe(false);
+    expect(isWkFlowShell(undefined)).toBe(false);
+  });
+
+  it("归属：builtin / wk壳→team / 其余team→shared / 自建→custom", () => {
     expect(resolveActionGroup("plan", byId)).toBe("builtin");
-    expect(resolveActionGroup("team:a", byId)).toBe("team");
+    expect(resolveActionGroup("team:wk-plan", byId)).toBe("team");
+    expect(resolveActionGroup("team:wk-ship", byId)).toBe("team");
+    expect(resolveActionGroup("team:flow-build", byId)).toBe("team");
+    expect(resolveActionGroup("team:svc-debug", byId)).toBe("shared");
+    expect(resolveActionGroup("team:file-bug", byId)).toBe("shared");
     expect(resolveActionGroup("app:x", byId)).toBe("custom");
     expect(resolveActionGroup("old", byId)).toBe("custom");
     expect(resolveActionGroup("ghost", byId)).toBe("custom");
@@ -124,53 +161,91 @@ describe("分组：resolveActionGroup / groupAdvanceActions / normalize*", () =>
 
   it("按默认组序分桶、空组不返回、team 按 order 升序", () => {
     const groups = groupAdvanceActions(
-      ["plan", "team:a", "app:x", "team:b", "team:c", "build"],
+      [
+        "plan",
+        "team:wk-plan",
+        "app:x",
+        "team:wk-ship",
+        "team:flow-build",
+        "team:svc-debug",
+        "build",
+      ],
       byId,
     );
-    expect(groups.map((g) => g.key)).toEqual(["builtin", "team", "custom"]);
+    expect(groups.map((g) => g.key)).toEqual([
+      "builtin",
+      "team",
+      "shared",
+      "custom",
+    ]);
     expect(groups[0]!.keys).toEqual(["plan", "build"]);
-    // team：有 order 的升序（b=10 → a=20），无 order 的 c 接后
-    expect(groups[1]!.keys).toEqual(["team:b", "team:a", "team:c"]);
-    expect(groups[2]!.keys).toEqual(["app:x"]);
+    // team：有 order 的升序（wk-plan=20 → flow-build=30），无 order 的 wk-ship 接后
+    expect(groups[1]!.keys).toEqual([
+      "team:wk-plan",
+      "team:flow-build",
+      "team:wk-ship",
+    ]);
+    expect(groups[2]!.keys).toEqual(["team:svc-debug"]);
+    expect(groups[3]!.keys).toEqual(["app:x"]);
   });
 
   it("groupOrder 可调；空组跳过", () => {
     const groups = groupAdvanceActions(
       ["plan", "app:x"],
       byId,
-      ["custom", "builtin", "team"],
+      ["custom", "builtin", "team", "shared"],
     );
     expect(groups.map((g) => g.key)).toEqual(["custom", "builtin"]);
     expect(groups[0]!.keys).toEqual(["app:x"]);
     expect(groups[1]!.keys).toEqual(["plan"]);
   });
 
-  it("normalizeGroupOrder：去重 + 补齐三组", () => {
+  it("normalizeGroupOrder：去重 + 补齐四组；存量三组在 team 后插 shared", () => {
     expect(normalizeGroupOrder(undefined)).toEqual([
       "builtin",
       "team",
+      "shared",
       "custom",
     ]);
+    // 存量默认三组 → shared 插在 team 后
+    expect(normalizeGroupOrder(["builtin", "team", "custom"])).toEqual([
+      "builtin",
+      "team",
+      "shared",
+      "custom",
+    ]);
+    // 用户调过组序的三组 → shared 仍跟在 team 后
+    expect(normalizeGroupOrder(["custom", "builtin", "team"])).toEqual([
+      "custom",
+      "builtin",
+      "team",
+      "shared",
+    ]);
     expect(normalizeGroupOrder(["custom", "custom", "nope", "builtin"])).toEqual(
-      ["custom", "builtin", "team"],
+      ["custom", "builtin", "team", "shared"],
     );
   });
 
-  it("normalizeCollapsedGroups：只留合法组 key", () => {
-    expect(normalizeCollapsedGroups(["team", "team", "x", "custom"])).toEqual([
-      "team",
-      "custom",
-    ]);
+  it("normalizeCollapsedGroups：只留合法组 key（含 shared）", () => {
+    expect(
+      normalizeCollapsedGroups(["team", "team", "x", "custom", "shared"]),
+    ).toEqual(["team", "custom", "shared"]);
   });
 
-  it("partitionActionsByGroup includeEmpty：空组也出组头", () => {
+  it("partitionActionsByGroup includeEmpty：空组也出组头（四组）", () => {
     const groups = partitionActionsByGroup(["plan"], byId, undefined, {
       includeEmpty: true,
     });
-    expect(groups.map((g) => g.key)).toEqual(["builtin", "team", "custom"]);
+    expect(groups.map((g) => g.key)).toEqual([
+      "builtin",
+      "team",
+      "shared",
+      "custom",
+    ]);
     expect(groups[0]!.keys).toEqual(["plan"]);
     expect(groups[1]!.keys).toEqual([]);
     expect(groups[2]!.keys).toEqual([]);
+    expect(groups[3]!.keys).toEqual([]);
   });
 });
 

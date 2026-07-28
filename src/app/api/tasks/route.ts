@@ -21,6 +21,7 @@ import {
 import { ensureFeishuBridgeBootstrapped } from "@/lib/server/feishu-bridge/bootstrap";
 import { failpoint } from "@/lib/server/failpoints";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
+import { isValidReqId } from "@/lib/req-id";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
 import type { NewTaskInput, TaskMode } from "@/lib/types";
 
@@ -92,6 +93,15 @@ export const POST = async (req: Request) => {
       );
     }
 
+    // 非法编号早报错、别默默丢弃（口径跟 PATCH /api/tasks/[id] 一致：
+    // 一边 400 一边静默回退派生值的话，用户只在其中一个入口能发现自己填错了）
+    if (isNonEmptyString(body.reqId) && !isValidReqId(body.reqId)) {
+      return NextResponse.json(
+        { error: "需求编号只能用字母数字与 . _ -、且以字母数字开头" },
+        { status: 400 },
+      );
+    }
+
     // chat 模式未填 title 时补占位「对话 · MM-DD HH:mm」（侧栏窄、标题尽量短；
     // 用户发首条消息后由 chat-reply 用 deriveChatTitleFromMessage 覆盖、单一源见 task-display）
     const title = isNonEmptyString(body.title)
@@ -114,6 +124,8 @@ export const POST = async (req: Request) => {
       feishuStoryUrl: isNonEmptyString(body.feishuStoryUrl)
         ? body.feishuStoryUrl.trim()
         : undefined,
+      // wk 需求编号（手填、可空）——非法字面上面已 400；createTask 里的 normalizeReqId 仍兜一道
+      reqId: isNonEmptyString(body.reqId) ? body.reqId.trim() : undefined,
       disabledMcpServers:
         Array.isArray(body.disabledMcpServers) &&
         body.disabledMcpServers.every((s) => typeof s === "string")

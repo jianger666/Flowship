@@ -37,12 +37,12 @@ import type { McpHealth, McpHealthStatus, Task } from "@/lib/types";
 
 // 连通性状态点 / 文字配色（V0.6.13 收敛为 ok 绿 / fail 红两态）
 const HEALTH_DOT: Record<McpHealthStatus, string> = {
-  ok: "bg-emerald-500",
-  fail: "bg-red-500",
+  ok: "bg-success",
+  fail: "bg-destructive",
 };
 const HEALTH_TEXT: Record<McpHealthStatus, string> = {
-  ok: "text-emerald-600 dark:text-emerald-500",
-  fail: "text-red-600 dark:text-red-500",
+  ok: "text-success",
+  fail: "text-destructive",
 };
 
 // 单个 server 的连通性徽标：点 + 中文。h 没探到 + loading → spinner。
@@ -235,9 +235,7 @@ export const McpToggleList = ({
                 <Plug
                   className={cn(
                     "size-3.5 shrink-0",
-                    isDisabled
-                      ? "text-muted-foreground/40"
-                      : "text-emerald-500",
+                    isDisabled ? "text-muted-foreground/40" : "text-success",
                   )}
                 />
                 <span
@@ -286,7 +284,7 @@ export const McpToggleList = ({
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle className="flex min-w-0 items-center gap-2">
-              <span className="size-2 shrink-0 rounded-full bg-red-500" />
+              <span className="size-2 shrink-0 rounded-full bg-destructive" />
               <span className="min-w-0 truncate font-mono">
                 {logHealth?.name}
               </span>

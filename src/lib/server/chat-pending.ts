@@ -125,6 +125,15 @@ export type ChatTaskActionHandler = (
 interface ChatMcpGlobalState {
   // taskId → 当前未答的一组 ask_user 问题（新提问顶旧的）
   pendingAsks: Map<string, PendingAsk>;
+  /**
+   * taskId → 最近被**本进程**摘走 / 清掉的那组 ask。
+   *
+   * 单独记一笔的原因：登记没了有两种截然不同的含义——「答题链刚摘走、正在投递」
+   * vs「进程重启后登记丢了、事件还挂着（孤儿）」。前者绝不能再被标成「用户跳过」
+   * （否则 agent 同时收到答案和「上一组问题跳过了」两条矛盾指令），后者必须能跳过
+   * （否则答题卡永远挂在事件流里）。这张表是内存态，重启后自然为空 = 天然区分。
+   */
+  takenAsks: Map<string, { askId: string; at: number }>;
   awaitingNotifiers: Map<string, AwaitingNotifier>;
   taskActionHandlers: Map<string, ChatTaskActionHandler>;
   /**
@@ -135,12 +144,13 @@ interface ChatMcpGlobalState {
   sessionTransports: Map<string, WebStandardStreamableHTTPServerTransport>;
 }
 
+// V15：2026-07-28——加 takenAsks（区分「答题链摘走」与「重启后孤儿」）。
 // V14：2026-07-18——加 expectedCallerTokens（MCP caller 身份）。
 // V13：2026-07-07 V0.11 wait 协议退役——删 pendingMap / tokenToTask / waitingTasks /
 //      pendingNextActions / unansweredRevises / chatModeTasks / prematureWaitRejects、
 //      新增 pendingAsks（ask 弹窗登记）。bump 强制 dev hot reload 拿全新 state。
 // V12 及更早见 git 历史（wait 协议时代的状态机字段）。
-const GLOBAL_KEY = "__flowshipChatStateV14__";
+const GLOBAL_KEY = "__flowshipChatStateV15__";
 
 const getGlobalState = (): ChatMcpGlobalState => {
   const g = globalThis as unknown as Record<string, ChatMcpGlobalState>;
@@ -148,6 +158,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
     console.log("[chat-mcp] 初始化 globalThis 状态（首次）");
     g[GLOBAL_KEY] = {
       pendingAsks: new Map(),
+      takenAsks: new Map(),
       awaitingNotifiers: new Map(),
       taskActionHandlers: new Map(),
       expectedCallerTokens: new Map(),
@@ -158,6 +169,7 @@ const getGlobalState = (): ChatMcpGlobalState => {
 };
 
 const pendingAsks = getGlobalState().pendingAsks;
+const takenAsks = getGlobalState().takenAsks;
 const awaitingNotifiers = getGlobalState().awaitingNotifiers;
 const taskActionHandlers = getGlobalState().taskActionHandlers;
 const expectedCallerTokens = getGlobalState().expectedCallerTokens;
@@ -200,6 +212,67 @@ const schedulePendingAskMetaSync = (taskId: string): void => {
 export const whenPendingAskMetaSynced = (taskId: string): Promise<void> =>
   pendingAskMetaSyncByTask.get(taskId) ?? Promise.resolve();
 
+// ----------------- takenAsks（「这组 ask 已经有人在了结」） -----------------
+
+/**
+ * 记录时长——只需覆盖「摘走 → 投递完成」这段在飞窗口。
+ * 投递完了事件流里就有 reply / 作废标记，判定不再依赖本表。
+ */
+const TAKEN_ASK_TTL_MS = 10 * 60 * 1000;
+
+/** 摘走 / 清掉一组登记时打点（谁摘的不重要，重要的是「本进程已经有人在了结它」） */
+const markAskTaken = (taskId: string, askId: string | undefined): void => {
+  if (!askId) return;
+  takenAsks.set(taskId, { askId, at: Date.now() });
+};
+
+/**
+ * 没有登记可摘时的占位打点（**孤儿 ask 专用**：进程重启后登记丢了、事件还挂着）。
+ * 让并发的第二条消息看到「已经有人在了结它了」，不会各写一条跳过标记。
+ */
+export const markAskSettlingWithoutPending = (
+  taskId: string,
+  askId: string,
+): void => markAskTaken(taskId, askId);
+
+/**
+ * 撤掉「这组 ask 已经有人在了结」的打点（**只撤自己那组**）。
+ *
+ * 跳过链的孤儿分支没有登记可放回（{@link markAskSettlingWithoutPending} 只是个占位），
+ * 投递失败回滚 / 作废事件写不下去时若把占位挂着，接下来一整个 TTL 里用户每发一条消息
+ * 都会被 {@link wasAskTakenRecently} 判成「已有人在了结」→ 谁都认领不上、答题卡一直挂着。
+ * 语义对齐 {@link restorePendingAskIf}「又在等人答了就撤打点」。
+ *
+ * askId 必须匹配：期间可能已经有新一组提问登记过、迟到的撤销不许抹掉新那组的打点。
+ */
+export const clearAskTakenMark = (taskId: string, askId: string): void => {
+  if (takenAsks.get(taskId)?.askId === askId) takenAsks.delete(taskId);
+};
+
+/**
+ * 这组 ask 是不是刚被本进程摘走（答题链在飞 / 已了结）。
+ *
+ * 两条链在「登记为空」时都要靠它判断该不该按事件收口——true = 有人正在了结、放手；
+ * false = 真孤儿（重启后表本来就空）、才可以自己收口：
+ * - 跳过链的孤儿分支（`ask-skip`）：false 才写作废标记
+ * - 答题链的僵尸唤醒分支（`ask-reply` 路由）：false 才唤醒新 agent 把答案带过去
+ */
+export const wasAskTakenRecently = (taskId: string, askId: string): boolean => {
+  const rec = takenAsks.get(taskId);
+  if (!rec || rec.askId !== askId) return false;
+  if (Date.now() - rec.at > TAKEN_ASK_TTL_MS) {
+    takenAsks.delete(taskId);
+    return false;
+  }
+  return true;
+};
+
+/** 单测重置：两张表都是进程级、跨用例会串（尤其 takenAsks 会让孤儿判定失真） */
+export const __resetPendingAskStateForTest = (): void => {
+  pendingAsks.clear();
+  takenAsks.clear();
+};
+
 /** ask_user 工具 handler 调：登记一组新提问（顶掉旧的、旧弹窗答案会因 token 不符被拒） */
 export const registerPendingAsk = (
   taskId: string,
@@ -213,6 +286,8 @@ export const registerPendingAsk = (
     createdAt: Date.now(),
   };
   pendingAsks.set(taskId, ask);
+  // 新一组提问 = 干净起点：上一组的「已被摘走」打点作废
+  takenAsks.delete(taskId);
   // 落盘 meta.pendingAskId——侧栏 / 重启后列表靠这个判「真有题」
   schedulePendingAskMetaSync(taskId);
   return ask;
@@ -224,8 +299,75 @@ export const getPendingAsk = (taskId: string): PendingAsk | null =>
 
 /** 答完 / 作废时清登记 */
 export const clearPendingAsk = (taskId: string): void => {
+  markAskTaken(taskId, pendingAsks.get(taskId)?.askId);
   pendingAsks.delete(taskId);
   schedulePendingAskMetaSync(taskId);
+};
+
+/**
+ * 同步取走当前 pending（「先摘再投」）——投递链路的入口专用。
+ *
+ * 投递有长 await（存图 / deliver），`get → deliver → clear` 中间的窗口会让两条
+ * **互相独立**的串行链（卡片回调链 enqueueCardAction / 入向消息链 enqueueInboundMessage）
+ * 把同一组问题各投一份 `[ASK_USER_REPLY]` 给 agent（V0.13 群协作 review P2-2）。
+ * 入口同步摘走 = 后到的那条直接看到「无 pending」、走既有的失效分支。
+ * 投递失败要放回的话用 {@link restorePendingAskIf}。
+ */
+export const takePendingAsk = (taskId: string): PendingAsk | null => {
+  const cur = pendingAsks.get(taskId);
+  if (!cur) return null;
+  pendingAsks.delete(taskId);
+  markAskTaken(taskId, cur.askId);
+  schedulePendingAskMetaSync(taskId);
+  return cur;
+};
+
+/**
+ * 按身份原子摘走（**了结这组 ask 的唯一认领口**）。
+ *
+ * 「答」和「跳过」是同一件事的两个出口——谁先摘到这组登记谁说了算，摘不到的那条
+ * 必须彻底放手（不投递、不写事件、不置卡片）。三条链都走它：
+ * app 答题（ask-reply 路由）、飞书答题（{@link takePendingAsk} 的无条件版，入口只有一组）、
+ * 用户跳过（`ask-skip`）。
+ *
+ * 判据用 askId + 事件里带回的 token：askId 相同但 token 不同 = 这组已经被新提问顶替过
+ *（force-new-agent / 顶替 race），旧界面上的动作不许作用到新提问上。
+ *
+ * @returns 摘到的那组；null = 不是当前这组 / 没有登记（调用方按「已被别人了结」处理）
+ */
+export const takePendingAskIf = (
+  taskId: string,
+  expectedAskId: string,
+  expectedToken?: string,
+): PendingAsk | null => {
+  const cur = pendingAsks.get(taskId);
+  if (!cur || cur.askId !== expectedAskId) return null;
+  if (expectedToken && cur.token !== expectedToken) return null;
+  pendingAsks.delete(taskId);
+  markAskTaken(taskId, cur.askId);
+  schedulePendingAskMetaSync(taskId);
+  return cur;
+};
+
+/**
+ * 条件放回（投递失败时用）：只有槽位还空着才放回自己摘走的那组。
+ * 摘走之后 agent 可能已经登记了新提问——绝不能拿旧的盖掉新的
+ *（同 cancelPendingIf 的「按身份条件操作、不裸写」口径）。
+ * @returns true=放回了；false=槽位已被新提问占住（自己那组就此作废）
+ */
+export const restorePendingAskIf = (
+  taskId: string,
+  ask: PendingAsk,
+): boolean => {
+  if (pendingAsks.has(taskId)) return false;
+  pendingAsks.set(taskId, ask);
+  // 又在等人答了 → 撤掉「已被摘走」的打点，跳过 / 答题都该能重新认领。
+  // 只撤**放回那组自己**的打点：迟到的 rollback 撞上「新一组 ask 已注册、又已被答题链
+  // 摘走（槽位恰好空）」时会把旧那组放回，此时打点标的是新那组、还在飞——顺手删掉的话
+  // 跳过链会把它当孤儿再收一次口（同 clearAskTakenMark 的按 askId 匹配口径）
+  clearAskTakenMark(taskId, ask.askId);
+  schedulePendingAskMetaSync(taskId);
+  return true;
 };
 
 /**
@@ -234,6 +376,7 @@ export const clearPendingAsk = (taskId: string): void => {
  * @returns 是否真的清了（调用方据此决定要不要写「已作废」事件）
  */
 export const cancelPending = (taskId: string): boolean => {
+  markAskTaken(taskId, pendingAsks.get(taskId)?.askId);
   const deleted = pendingAsks.delete(taskId);
   // 无论内存是否刚删：sync 收敛盘面（覆盖重启后「内存空、meta 仍有孤儿 askId」）
   schedulePendingAskMetaSync(taskId);
@@ -252,6 +395,7 @@ export const cancelPendingIf = (
   const cur = pendingAsks.get(taskId);
   if (!cur || cur.askId !== expectedAskId) return false;
   pendingAsks.delete(taskId);
+  markAskTaken(taskId, cur.askId);
   schedulePendingAskMetaSync(taskId);
   return true;
 };
@@ -271,6 +415,7 @@ export const invalidateCallerToken = (taskId: string): void => {
  * 仅 deleteTask（文件真删）才 clearEventSeqCounter。
  */
 export const cleanupChatTaskState = (taskId: string): void => {
+  markAskTaken(taskId, pendingAsks.get(taskId)?.askId);
   pendingAsks.delete(taskId);
   awaitingNotifiers.delete(taskId);
   taskActionHandlers.delete(taskId);
@@ -548,31 +693,52 @@ export type AgentMessage = {
   nextArtifactPath?: string;
 };
 
+/** 附件段（图片 / 文件路径）——两个消息封装共用同一份，别各写一遍 */
+const attachmentSections = (m: {
+  imagePaths?: string[];
+  attachmentPaths?: string[];
+}): string[] => {
+  const lines: string[] = [];
+  if (m.imagePaths && m.imagePaths.length > 0) {
+    lines.push(
+      "",
+      `${SIGNALS.ATTACHED_IMAGES} 用户附了以下图片、请用 \`read\` 工具逐一读取（SDK 内置 \`read\` 会把图片转成 vision、你能直接看到图像内容）：`,
+      ...m.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+  if (m.attachmentPaths && m.attachmentPaths.length > 0) {
+    lines.push(
+      "",
+      `${SIGNALS.ATTACHED_PATHS} 用户附了以下文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取（路径已是绝对路径、直接用）：`,
+      ...m.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
+    );
+  }
+  return lines;
+};
+
+/**
+ * **只读**消息封装：`[USER_MESSAGE]` 抬头 + 正文 + 附件段，到此为止。
+ *
+ * 为什么不复用 {@link buildAgentMessage}：它的 `user_message` 分支会追加一段固定行为
+ * 约束（「…**修改要求**才动手改（改完说明改了什么）…不要调 submit_work…」）。那段是给
+ * **属主**写的——把它塞进受限（只读）答疑的 prompt，就等于在同一段指令里既写「禁止改」
+ * 又写「修改要求才动手改」，还把群里的非属主称作「用户」，只读招牌当场作废。
+ *
+ * 调用方：需求群非属主的受限答疑通道（`restricted-question.ts`）。
+ */
+export const buildReadonlyUserMessage = (msg: {
+  text: string;
+  imagePaths?: string[];
+  attachmentPaths?: string[];
+}): string =>
+  [SIGNALS.USER_MESSAGE, "", msg.text, ...attachmentSections(msg)].join("\n");
+
 /**
  * 把用户操作序列化成发给 agent 的消息文本（`agent.send(text)`）。
  * 头部信号字面量（[NEXT_ACTION] / [USER_MESSAGE] / [USER_REPLY]…）与 prompts 的
  * 解读约定一致、由 tests/protocol-signals.test.ts 守护。
  */
 export const buildAgentMessage = (msg: AgentMessage): string => {
-  const attachmentSections = (m: AgentMessage): string[] => {
-    const lines: string[] = [];
-    if (m.imagePaths && m.imagePaths.length > 0) {
-      lines.push(
-        "",
-        `${SIGNALS.ATTACHED_IMAGES} 用户附了以下图片、请用 \`read\` 工具逐一读取（SDK 内置 \`read\` 会把图片转成 vision、你能直接看到图像内容）：`,
-        ...m.imagePaths.map((p, i) => `  ${i + 1}. ${p}`),
-      );
-    }
-    if (m.attachmentPaths && m.attachmentPaths.length > 0) {
-      lines.push(
-        "",
-        `${SIGNALS.ATTACHED_PATHS} 用户附了以下文件 / 目录路径、按需用 \`read\` / \`grep\` / \`glob\` 读取（路径已是绝对路径、直接用）：`,
-        ...m.attachmentPaths.map((p, i) => `  ${i + 1}. ${p}`),
-      );
-    }
-    return lines;
-  };
-
   if (msg.kind === "next_action") {
     const head = buildNextActionHead({
       actionId: msg.nextActionId,

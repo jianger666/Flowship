@@ -108,7 +108,7 @@ export const SkillListPane = ({
     <>
       {teamStatus?.syncedAt != null && (
         <span
-          className="max-w-[5.5rem] truncate text-[10px] text-muted-foreground"
+          className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground"
           title={new Date(teamStatus.syncedAt).toLocaleString("zh-CN")}
         >
           {formatRelative(teamStatus.syncedAt)}

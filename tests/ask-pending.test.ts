@@ -9,9 +9,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  extractAskQuestions,
   findPendingAskEvent,
   isAskReplied,
   isAskSettled,
+  isAskSkipped,
   isAskSuperseded,
 } from "@/lib/ask-pending";
 import type { TaskEvent } from "@/lib/types";
@@ -32,6 +34,9 @@ const ev = (
 const ask = (askId: string) => ev("ask_user_request", { askId, questions: [] });
 const reply = (askId: string) => ev("ask_user_reply", { askId });
 const supersede = (askId: string) => ev("info", { supersededAskId: askId });
+/** 用户没答、直接发新消息 → 作废的一种，多带一个 askSkipped */
+const skip = (askId: string) =>
+  ev("info", { supersededAskId: askId, askSkipped: true });
 
 describe("isAskReplied", () => {
   it("有对应 ask_user_reply → true", () => {
@@ -54,6 +59,48 @@ describe("isAskSuperseded", () => {
   });
   it("作废的是别的 askId → false", () => {
     expect(isAskSuperseded([ask("X"), supersede("Y")], "X")).toBe(false);
+  });
+});
+
+describe("isAskSkipped", () => {
+  it("带 askSkipped 的作废标记 → true（UI 收成一行「已跳过」）", () => {
+    expect(isAskSkipped([ask("X"), skip("X")], "X")).toBe(true);
+  });
+  it("普通作废（断线重启 / 换 agent）不算跳过 → false", () => {
+    expect(isAskSkipped([ask("X"), supersede("X")], "X")).toBe(false);
+  });
+  it("跳过的是别的 askId → false", () => {
+    expect(isAskSkipped([ask("X"), skip("Y")], "X")).toBe(false);
+  });
+  it("跳过仍然是「已作废」的一种——了结判定只有一套", () => {
+    expect(isAskSuperseded([ask("X"), skip("X")], "X")).toBe(true);
+    expect(isAskSettled([ask("X"), skip("X")], "X")).toBe(true);
+    expect(findPendingAskEvent([ask("X"), skip("X")])).toBeNull();
+  });
+});
+
+describe("extractAskQuestions", () => {
+  it("解析出题目 + 选项，allowText 缺省补 true", () => {
+    const parsed = extractAskQuestions({
+      questions: [
+        { id: "q1", question: "选哪个", options: [{ id: "a", label: "A" }] },
+      ],
+    });
+    expect(parsed).toEqual([
+      {
+        id: "q1",
+        question: "选哪个",
+        options: [{ id: "a", label: "A" }],
+        allowText: true,
+      },
+    ]);
+  });
+  it("脏条目跳过、坏 meta 返空（答题卡 / 回放行 / 路由共用这一份宽容解析）", () => {
+    expect(extractAskQuestions(undefined)).toEqual([]);
+    expect(extractAskQuestions({ questions: "nope" })).toEqual([]);
+    expect(
+      extractAskQuestions({ questions: [{ id: 1 }, null, { question: "无 id" }] }),
+    ).toEqual([]);
   });
 });
 

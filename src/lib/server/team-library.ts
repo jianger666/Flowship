@@ -6,8 +6,12 @@
  *
  * 目录约定（远端仓）：
  *   skills/<skill名>/SKILL.md [+ .flowship-action.json]
- *   knowledge/  ← wk-knowledgebase 整库镜像
- *     skills/{global,frontend,...}/<工程>/<skill>/SKILL.md
+ *   knowledge/  ← wk-harness-platform 整库镜像（排除 MIRROR_EXCLUDED_TOP_DIRS）
+ *     knowledge-base/  工程知识档案
+ *     scripts/         知识库维护脚本（kb_refresh.sh / pull_*_repos.sh）——**不是**门禁脚本
+ *     skills/{global,frontend,backend,client}/<工程>/<skill>/SKILL.md
+ *       └─ global/wk-harness/scripts/  ← 七个 wk 门禁脚本在这（doc-quality-gate.py 等、
+ *          `wk-gate.wkScriptsDir()` 指向它）
  *
  * 本地：
  *   <dataRoot>/team-library/repo          ← 共享库 clone
@@ -22,6 +26,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -94,7 +99,10 @@ const execFileAsync = promisify(execFile);
 export const DEFAULT_TEAM_LIBRARY = {
   repoUrl: "https://gitlab.wukongedu.net/frontend/infra/ai-flow-action-hub.git",
   branch: "main",
-  knowledgeSourceUrl: "https://gitlab.wukongedu.net/wukong/wk-knowledgebase.git",
+  // 2026-07-27 源仓迁移：wukong/wk-knowledgebase → wukong/wk-harness-platform（旧路径已 404）
+  knowledgeSourceUrl: "https://gitlab.wukongedu.net/wukong/wk-harness-platform.git",
+  // 兜底分支：正常由 detectRemoteDefaultBranch 探远端默认分支（当前也是 release/1.0），
+  // 只有探测失败（离线 / 远端不给 symref）才落到这个写死值
   knowledgeSourceBranch: "release/1.0",
 } as const;
 
@@ -587,11 +595,18 @@ const shouldSkipName = (name: string, excludeNames: Set<string>): boolean => {
   return false;
 };
 
-/** 递归拷贝：先清空 dest（可选）、排除 .git / codes / __pycache__ / *.pyc / .DS_Store */
-const copyTree = async (
+/**
+ * 递归拷贝：先清空 dest（可选）、排除 .git / __pycache__ / *.pyc / .DS_Store，
+ * 外加调用方给的顶层目录名（镜像用 MIRROR_EXCLUDED_TOP_DIRS）。
+ *
+ * `clearDest` 是镜像「整体替换」的关键：先 rm -rf dest 再重建，源仓删掉的文件
+ * 不会在本地残留成幽灵（随后 `git add -A` 把删除也 stage 上）。
+ * export 仅供单测（验排除规则 + 整体替换语义）。
+ */
+export const copyTree = async (
   src: string,
   dest: string,
-  opts?: { excludeTopNames?: string[]; clearDest?: boolean },
+  opts?: { excludeTopNames?: readonly string[]; clearDest?: boolean },
 ): Promise<void> => {
   const exclude = new Set(opts?.excludeTopNames ?? []);
   if (opts?.clearDest) {
@@ -873,6 +888,20 @@ const syncInternal = async (opts?: {
     );
   }
 
+  // 顺带把数据分支（成员注册表）拉到 refs/remotes/origin/<branch>——读路径直接读它。
+  // 只动 ref 不动工作树；分支可能压根还没人建，失败一律只 warn、绝不判 sync 失败。
+  const dataFetch = await fetchDataBranch(
+    teamLibraryRepoDir(),
+    TEAM_LIBRARY_DATA_BRANCH,
+    token,
+  );
+  if (!dataFetch.ok) {
+    console.warn(
+      `[team-library] 拉取数据分支 ${TEAM_LIBRARY_DATA_BRANCH} 失败（不阻断 sync）:`,
+      dataFetch.error,
+    );
+  }
+
   const syncedAt = Date.now();
   getTeamLibState().syncedAt = syncedAt;
   return { ok: true, syncedAt };
@@ -916,7 +945,25 @@ type CommitPushResult =
     };
 
 /**
- * 读「已 staged、将推送」的新增/变更文本文件（跳过删除 / 二进制）。
+ * 敏感扫描的豁免前缀。
+ *
+ * `knowledge/` 下是知识库源仓的**整库机器镜像**：内容不由本机用户撰写，源仓与共享库
+ * 同在一个 GitLab、受众相同，扫它挡不住任何真实泄露，只会撞满误报——高熵规则会把
+ * py 脚本里的标识符、XML 属性值、文档里的示例 URL 全判成密钥（2026-07-27 实测：
+ * 一次常规镜像仅 18 个变更文件就命中 106 处、无一为真），结果是镜像永远推不上去。
+ *
+ * 扫描真正要防的是「用户手动上传自管 skill 时带出私货」，那条路径只写 `skills/`。
+ */
+const SCAN_EXEMPT_PREFIXES = ["knowledge/"] as const;
+
+/** 该 staged 路径是否需要过敏感扫描（export 供单测） */
+export const shouldScanStagedPath = (relPath: string): boolean => {
+  const p = relPath.replace(/\\/g, "/");
+  return !SCAN_EXEMPT_PREFIXES.some((prefix) => p.startsWith(prefix));
+};
+
+/**
+ * 读「已 staged、将推送」的新增/变更文本文件（跳过删除 / 二进制 / 豁免前缀）。
  * 在 git add -A 之后调用；路径相对 repoDir。
  */
 const collectStagedTextFilesForScan = async (
@@ -931,6 +978,8 @@ const collectStagedTextFilesForScan = async (
   const relPaths = listed.stdout.split("\0").filter(Boolean);
   const out: SecretScanFile[] = [];
   for (const rel of relPaths) {
+    // 豁免前缀先挡掉（顺带省掉整棵镜像树的读盘）
+    if (!shouldScanStagedPath(rel)) continue;
     const abs = path.resolve(repoDir, rel);
     // 锚定仓内（防御 git 吐出奇怪路径）
     if (!isStrictlyInside(repoDir, abs)) continue;
@@ -1180,6 +1229,292 @@ const commitAndPush = async (opts: {
   // 重试路径上也可能撞保护分支（如首次误判）——同样降级（mirror 无降级参数则透传）
   if (second.kind === "protected" && mrFallback) return fallbackToMR(mrFallback);
   return { ok: false, error: second.error };
+};
+
+// ---------- 数据分支：多人自动写的小文件（成员注册表等） ----------
+
+/**
+ * 「每台 Flowship 自动写」的小文件放的**专用孤儿分支**。
+ *
+ * ⚠️ **这个分支不能开保护**：`main` 受保护、developer 直推被拒——注册表放 main
+ * 等于自动注册永远失败。首次由有推送权限的人创建（或由第一个注册成功的人自动建）。
+ * 详见 `docs/feishu-group-collab.md`。
+ *
+ * 孤儿分支（无父提交、树里只有那几个数据文件）：与 skill 库历史完全隔离，
+ * 高频自动提交不会把 `main` 的历史搅乱，体积也可忽略。
+ */
+export const TEAM_LIBRARY_DATA_BRANCH = "members";
+
+/** 仓根下的单层文件名白名单（拒目录 / 穿越 / 隐藏文件） */
+const isSafeTeamLibraryFileName = (name: string): boolean =>
+  /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name);
+
+/** 分支名白名单（拼进 refspec，必须挡住空格 / `..` / 前导横杠等） */
+const isSafeTeamLibraryBranch = (name: string): boolean =>
+  /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,63}$/.test(name) && !name.includes("..");
+
+/** 数据分支的远程跟踪 ref（单分支 clone 的默认 refspec 不含它，必须显式写） */
+const dataBranchRef = (branch: string): string => `refs/remotes/origin/${branch}`;
+
+const dataBranchRefspec = (branch: string): string =>
+  `+refs/heads/${branch}:${dataBranchRef(branch)}`;
+
+/**
+ * 读某个 rev 下的文件内容（`git show <rev>:<path>`）。
+ *
+ * **刻意不走 `runGit`**：那层对 stdout 做凭据脱敏，那是给「命令输出」准备的，
+ * 文件内容必须原样返回。rev / 文件不存在一律返 null（当「还没有」）。
+ */
+const showGitFile = async (
+  repoDir: string,
+  rev: string,
+  relPath: string,
+): Promise<string | null> => {
+  try {
+    const { stdout } = await execFileAsync("git", ["show", `${rev}:${relPath}`], {
+      cwd: repoDir,
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    return typeof stdout === "string" ? stdout : String(stdout);
+  } catch {
+    return null;
+  }
+};
+
+/** fetch 数据分支到远程跟踪 ref。区分「分支还没人建」与「网络 / 认证挂了」 */
+const fetchDataBranch = async (
+  repoDir: string,
+  branch: string,
+  token: string,
+): Promise<{ ok: boolean; exists: boolean; error?: string }> => {
+  const r = await runGit(
+    buildAuthedGitArgs(["fetch", "--no-tags", "origin", dataBranchRefspec(branch)]),
+    repoDir,
+    buildGitTokenEnv(token),
+  );
+  if (r.ok) return { ok: true, exists: true };
+  // 分支还没被任何人创建过——这不是错误，第一个注册的人负责建它
+  if (/couldn't find remote ref|no matching|not our ref/i.test(`${r.error}${r.stderr}`)) {
+    return { ok: true, exists: false };
+  }
+  return { ok: false, exists: false, error: r.error };
+};
+
+/**
+ * 读数据分支上的某个文件（**无锁、零副作用**）。
+ *
+ * 直接读上次 fetch 下来的 `origin/<branch>`——新鲜度由 `syncTeamLibrary` 负责
+ *（它每轮顺带 fetch 这个分支）。分支 / 文件不存在返 null，调用方自行降级。
+ */
+export const readTeamLibraryBranchFile = async (opts: {
+  relPath: string;
+  branch?: string;
+}): Promise<string | null> => {
+  const branch = opts.branch ?? TEAM_LIBRARY_DATA_BRANCH;
+  if (!isSafeTeamLibraryFileName(opts.relPath) || !isSafeTeamLibraryBranch(branch)) {
+    return null;
+  }
+  return showGitFile(teamLibraryRepoDir(), dataBranchRef(branch), opts.relPath);
+};
+
+export type WriteTeamLibraryFileResult =
+  | { ok: true; changed: boolean }
+  | { ok: false; error: string };
+
+/** 读改写的最大轮数（每轮 = fetch → mutate → commit-tree → push） */
+const WRITE_FILE_MAX_ATTEMPTS = 3;
+
+/**
+ * 在数据分支上**读改写单个文件**并直推（对外入口、进仓锁）。
+ *
+ * # 铁律：绝不动主克隆的 HEAD / 索引 / 工作树
+ *
+ * 团队库主克隆同时被 skill 同步 / 上传 / 镜像链路使用，`git checkout` 把 HEAD
+ * 切走会直接搞坏它们。所以这条链**全程走底层 plumbing**、一次 checkout 都不做：
+ *
+ * ```
+ * fetch  +refs/heads/<branch>:refs/remotes/origin/<branch>   ← 只动 ref
+ * show   origin/<branch>:<file>                              ← 读旧内容（只读对象库）
+ * hash-object -w  <仓库外的临时文件>                          ← 写 blob（只动对象库）
+ * read-tree / update-index / write-tree（GIT_INDEX_FILE=临时索引）← 不碰 .git/index
+ * commit-tree <tree> [-p <parent>]                           ← 造提交（不动 HEAD）
+ * push origin <commit-sha>:refs/heads/<branch>               ← 只动远端 ref
+ * ```
+ *
+ * 分支不存在时 `commit-tree` 不带 `-p`，推上去就是一条**孤儿分支**的根提交。
+ *
+ * # 其它语义
+ *
+ * - `mutate` 返回 null 或与原文相同 → 幂等成功（`changed:false`）、不造提交不 push
+ * - push 撞 non-fast-forward（别人抢先写了）→ 重新 fetch 后整轮重来，最多 3 轮
+ * - 保护分支拒绝 / 其它错误 → 直接返回错误，**不降级开 MR**（自动写入不值得开 MR、
+ *   调用方按静默失败处理）
+ * - 全程不写工作树，所以**不需要任何收尾恢复**——失败最多在对象库里留几个
+ *   悬空对象，git gc 自己会清
+ */
+export const writeTeamLibraryBranchFile = async (opts: {
+  /** 仓根下的文件名（单层、白名单校验） */
+  relPath: string;
+  branch?: string;
+  /** 收到分支上的最新原文（不存在 = null）→ 返回新内容；返 null = 无需改动 */
+  mutate: (currentRaw: string | null) => Promise<string | null> | string | null;
+  message: string;
+}): Promise<WriteTeamLibraryFileResult> =>
+  withTeamLibraryLock(() => writeTeamLibraryBranchFileInternal(opts));
+
+const writeTeamLibraryBranchFileInternal = async (opts: {
+  relPath: string;
+  branch?: string;
+  mutate: (currentRaw: string | null) => Promise<string | null> | string | null;
+  message: string;
+}): Promise<WriteTeamLibraryFileResult> => {
+  const { relPath, mutate, message } = opts;
+  const branch = opts.branch ?? TEAM_LIBRARY_DATA_BRANCH;
+  if (!isSafeTeamLibraryFileName(relPath)) {
+    return { ok: false, error: `relPath 非法（只允许仓根单层文件名）：${relPath}` };
+  }
+  if (!isSafeTeamLibraryBranch(branch)) {
+    return { ok: false, error: `分支名非法：${branch}` };
+  }
+  const token = await readGitToken();
+  if (!token) {
+    return { ok: false, error: "未配置 GitLab Token（设置页 gitToken）" };
+  }
+  const repoDir = teamLibraryRepoDir();
+  // 本函数只用对象库 + ref，不自愈克隆（那是 sync 的事）——没克隆就等下一轮
+  if (!(await pathExists(path.join(repoDir, ".git")))) {
+    return { ok: false, error: "团队库尚未同步到本机（等启动 sync 完成后自动重试）" };
+  }
+  const env = buildGitTokenEnv(token);
+  // 临时索引 + 暂存内容都放系统临时目录：绝不能落在仓库工作树里
+  // （会被 `git clean -fd` 删、或被 upload 的 `git add -A` 捡走）
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "flowship-tl-"));
+  const indexFile = path.join(tmpDir, "index");
+  const blobFile = path.join(tmpDir, "blob");
+  const indexEnv = { ...process.env, GIT_INDEX_FILE: indexFile };
+
+  let lastError = "";
+  try {
+    for (let attempt = 0; attempt < WRITE_FILE_MAX_ATTEMPTS; attempt++) {
+      // 1) 对齐远端分支（只动 refs/remotes，不碰工作树）
+      const fetched = await fetchDataBranch(repoDir, branch, token);
+      if (!fetched.ok) {
+        lastError = `fetch ${branch} 失败：${fetched.error}`;
+        continue; // 网络抖动：下一轮再试
+      }
+
+      // 2) 读分支上的当前内容 → 调用方合并
+      const parent = fetched.exists
+        ? (await runGit(["rev-parse", "--verify", "-q", dataBranchRef(branch)], repoDir))
+        : null;
+      const parentSha = parent?.ok ? parent.stdout.trim() : "";
+      const currentRaw = parentSha
+        ? await showGitFile(repoDir, parentSha, relPath)
+        : null;
+      const next = await mutate(currentRaw);
+      if (next === null || next === currentRaw) {
+        return { ok: true, changed: false };
+      }
+
+      // 3) 内容 → blob（--no-filters：按字节存，不受 autocrlf 等本地配置影响）
+      await fs.writeFile(blobFile, next, "utf-8");
+      const hashed = await runGit(
+        ["hash-object", "-w", "--no-filters", "--", blobFile],
+        repoDir,
+      );
+      if (!hashed.ok) {
+        lastError = `git hash-object 失败：${hashed.error}`;
+        break;
+      }
+      const blobSha = hashed.stdout.trim();
+
+      // 4) 临时索引造树：有父就以父树打底（保住分支上别的文件），否则从空树起
+      await fs.rm(indexFile, { force: true });
+      if (parentSha) {
+        const readTree = await runGit(["read-tree", parentSha], repoDir, indexEnv);
+        if (!readTree.ok) {
+          lastError = `git read-tree 失败：${readTree.error}`;
+          break;
+        }
+      }
+      const updateIndex = await runGit(
+        ["update-index", "--add", "--cacheinfo", `100644,${blobSha},${relPath}`],
+        repoDir,
+        indexEnv,
+      );
+      if (!updateIndex.ok) {
+        lastError = `git update-index 失败：${updateIndex.error}`;
+        break;
+      }
+      const written = await runGit(["write-tree"], repoDir, indexEnv);
+      if (!written.ok) {
+        lastError = `git write-tree 失败：${written.error}`;
+        break;
+      }
+      const treeSha = written.stdout.trim();
+
+      // 5) 造提交（不动 HEAD）；无父 = 孤儿分支的根提交
+      const committed = await runGit(
+        [
+          "commit-tree",
+          treeSha,
+          ...(parentSha ? ["-p", parentSha] : []),
+          "-m",
+          message,
+        ],
+        repoDir,
+      );
+      if (!committed.ok) {
+        lastError = `git commit-tree 失败：${committed.error}`;
+        break;
+      }
+      const commitSha = committed.stdout.trim();
+
+      // 6) 推 sha 到远端分支（本地一个分支都不建）
+      const push = await runGit(
+        buildAuthedGitArgs([
+          "push",
+          "origin",
+          `${commitSha}:refs/heads/${branch}`,
+        ]),
+        repoDir,
+        env,
+      );
+      if (push.ok) {
+        // 推的是裸 sha（本地没建分支），远程跟踪 ref 不会自动前进——手动对齐，
+        // 否则「刚写完立刻读」会读到旧内容 / 分支首建时压根读不到
+        const updated = await runGit(
+          ["update-ref", dataBranchRef(branch), commitSha],
+          repoDir,
+        );
+        if (!updated.ok) {
+          console.warn(
+            `[team-library] 推送成功但更新 ${dataBranchRef(branch)} 失败（下次 sync 兜底）:`,
+            updated.error,
+          );
+        }
+        return { ok: true, changed: true };
+      }
+
+      lastError = `git push 失败：${push.error}`;
+      // 只有「别人抢先写了」值得重来；保护分支 / 钩子拒绝重试也没用
+      if (classifyPushRejection(push.error + push.stderr) !== "non-fast-forward") {
+        break;
+      }
+      console.warn(
+        `[team-library] ${branch}:${relPath} push 撞并发写、重新 fetch 后重试（第 ${attempt + 1} 轮）`,
+      );
+    }
+    return { ok: false, error: lastError || "写共享库失败" };
+  } catch (err) {
+    return {
+      ok: false,
+      error: redactGitText(err instanceof Error ? err.message : String(err)),
+    };
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 };
 
 // ---------- upload / mirror ----------
@@ -1439,6 +1774,68 @@ export const uploadSkillsToTeamLibrary = async (
 ): Promise<UploadSkillsResult> =>
   withTeamLibraryLock(() => uploadSkillsInternal(names, category, opts));
 
+/**
+ * 镜像时排除的**源仓顶层目录**（单一来源、只在这里列一次，由 copyTree 的
+ * excludeTopNames 消费——不散落成到处 if 的路径黑名单）：
+ *
+ * - `codes/`：历史遗留的大体积代码样本
+ * - `harness-delivery-hub/`：交付平台服务端项目（delivery-fe + delivery-server +
+ *   docker-compose，实测 1.2M / 176 文件、0 个 SKILL.md）——是可部署服务、不是知识内容，
+ *   镜像进来只白撑共享库体积
+ */
+export const MIRROR_EXCLUDED_TOP_DIRS = [
+  "codes",
+  "harness-delivery-hub",
+] as const;
+
+/**
+ * 从 `git ls-remote --symref <url> HEAD` 输出里解析远端默认分支名。
+ * 典型输出（第一行才是 symref）：
+ * ```
+ * ref: refs/heads/release/1.0	HEAD
+ * ed319c8b81358256217570f5b38c329ad0487409	HEAD
+ * ```
+ * 解析不到（老 git / 远端不给 symref / 空输出）返 null，调用方回退配置值。
+ */
+export const parseSymrefDefaultBranch = (stdout: string): string | null => {
+  const m = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(stdout);
+  const branch = m?.[1]?.trim();
+  return branch ? branch : null;
+};
+
+/**
+ * 探测源仓的远端默认分支。
+ *
+ * 为什么不写死：默认分支归对方仓库维护者管（wk-harness-platform 当前是
+ * `release/1.0`、`main` 反而是另一条受保护的分支），写死等于对方改一次我们就
+ * clone 到空分支或直接失败。探测失败一律返 null、不阻断，由调用方回退配置值。
+ */
+const detectRemoteDefaultBranch = async (
+  cleanUrl: string,
+  token: string,
+): Promise<string | null> => {
+  const r = await runGit(
+    buildAuthedGitArgs(["ls-remote", "--symref", cleanUrl, "HEAD"]),
+    undefined,
+    buildGitTokenEnv(token),
+  );
+  if (!r.ok) {
+    console.warn("[team-library] 探测源仓默认分支失败、回退配置分支:", r.error);
+    return null;
+  }
+  return parseSymrefDefaultBranch(r.stdout);
+};
+
+/**
+ * 镜像实际使用的源分支：探到的远端默认分支优先、探不到或不合法回退配置值。
+ * 必须过分支名白名单——它会被拼进 `git clone --branch` / `fetch` 的参数位。
+ */
+export const resolveMirrorSourceBranch = (
+  detected: string | null,
+  configured: string,
+): string =>
+  detected && isSafeTeamLibraryBranch(detected) ? detected : configured;
+
 /** mirror 实现体（不加锁）：对外入口 mirrorKnowledgeBase 持仓锁后进来 */
 const mirrorKnowledgeBaseInternal = async (): Promise<{
   ok: boolean;
@@ -1455,11 +1852,15 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
   const sync = await syncInternal();
   if (!sync.ok) return { ok: false, error: sync.error };
 
-  // 2) 同步知识库源缓存
+  // 2) 同步知识库源缓存（分支：探远端默认分支优先、配置值兜底）
+  const sourceBranch = resolveMirrorSourceBranch(
+    await detectRemoteDefaultBranch(cfg.knowledgeSourceUrl, token),
+    cfg.knowledgeSourceBranch,
+  );
   const srcEnsured = await ensureRepoAt({
     dir: teamLibraryKnowledgeSrcDir(),
     cleanUrl: cfg.knowledgeSourceUrl,
-    branch: cfg.knowledgeSourceBranch,
+    branch: sourceBranch,
     token,
   });
   if (!srcEnsured.ok) {
@@ -1469,10 +1870,12 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
   const repoDir = teamLibraryRepoDir();
   const knowledgeDest = path.join(repoDir, "knowledge");
 
+  // clearDest：整棵 knowledge/ 先删后建——源仓结构调整 / 删文件时本地不留幽灵，
+  // 随后的 `git add -A` 会把这些删除一并 stage 上去
   const stageMirror = async (): Promise<void> => {
     await copyTree(teamLibraryKnowledgeSrcDir(), knowledgeDest, {
       clearDest: true,
-      excludeTopNames: ["codes"],
+      excludeTopNames: MIRROR_EXCLUDED_TOP_DIRS,
     });
   };
 
@@ -1490,7 +1893,7 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
     cleanUrl: cfg.repoUrl,
     branch: cfg.branch,
     token,
-    message: "chore(knowledge): mirror wk-knowledgebase from Flowship",
+    message: "chore(knowledge): mirror wk-harness-platform from Flowship",
     restage: stageMirror,
   });
   if (!push.ok) {
@@ -1503,7 +1906,11 @@ const mirrorKnowledgeBaseInternal = async (): Promise<{
   return { ok: true };
 };
 
-/** 把 wk-knowledgebase 镜像进共享库 knowledge/（对外入口、进仓锁；排除 .git / codes / __pycache__ / *.pyc） */
+/**
+ * 把 wk-harness-platform 镜像进共享库 `knowledge/`（对外入口、进仓锁）。
+ * 源分支走远端默认分支探测；排除 .git / __pycache__ / *.pyc /
+ * MIRROR_EXCLUDED_TOP_DIRS；`knowledge/` 不过敏感扫描（见 SCAN_EXEMPT_PREFIXES）。
+ */
 export const mirrorKnowledgeBase = async (): Promise<{
   ok: boolean;
   error?: string;

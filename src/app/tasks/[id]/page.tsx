@@ -51,6 +51,7 @@ import { EventStream } from "@/components/tasks/event-stream";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
+import { TokenUsageChip } from "@/components/tasks/token-usage-chip";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -97,6 +98,7 @@ import {
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
   deriveEffectiveBatches,
+  isStopButtonVisible,
   mrKindOf,
   mrTargetBranchOf,
 } from "@/lib/task-display";
@@ -118,6 +120,15 @@ import type {
 // 打开任务默认只加载最近这么多条事件（更早的上拉分页、v1.0.x 事件懒加载）
 const EVENT_TAIL = 300;
 
+/**
+ * toast 只留一句结论：推进失败的原因可能是多行结构（wk 门禁「结论 + 逐条明细 + 下一步」），
+ * 整段塞进 toast 又臭又长还会盖住半屏——完整明细同一时刻已经写进事件流了。
+ */
+const toastLine = (message: string): string => {
+  const [first = "", ...rest] = message.split("\n").map((l) => l.trim());
+  return rest.some(Boolean) ? `${first}（详情见事件流）` : first;
+};
+
 const TaskDetailPage = () => {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -135,6 +146,10 @@ const TaskDetailPage = () => {
   const [starting, setStarting] = useState(false);
   // 流式打字态（assistant chunk 累加、收到 assistant_message 事件清空）
   const [streamingText, setStreamingText] = useState("");
+  // 旁路（需求群受限答疑）run 在不在飞——它刻意不写 task.runStatus，
+  // 但它的工具调用照样进事件流：不并进「运行中」判定，那些工具块会被渲染成「已中断」。
+  // 值由 SSE 的 restricted_run 帧维护（每次连接 bootstrap 都会补发当前值）
+  const [restrictedRunActive, setRestrictedRunActive] = useState(false);
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
   // 收件箱「改bug」深链带来的指令 + 预选 custom action（打开 dialog 后消费掉）
@@ -183,6 +198,8 @@ const TaskDetailPage = () => {
     setLoaded(false);
     setStreamingText("");
     setSelectedActionId(null);
+    // 旁路在飞是 per-task 信号（新任务的 bootstrap 会补发它自己的值）
+    setRestrictedRunActive(false);
   }, [id]);
 
   // v1.0.x 事件懒加载：所有「服务端 task 快照 → 本地 state」都走 absorbTask、
@@ -372,6 +389,7 @@ const TaskDetailPage = () => {
         absorbTask(t);
       },
       onAssistantDelta: (text) => setStreamingText((p) => p + text),
+      onRestrictedRun: setRestrictedRunActive,
       onErrorMessage: (msg) => toast.error(`watch 出错：${msg}`),
       onWatchException: (err) => toast.error(`watch 异常：${err.message}`),
       onTaskDeleted: handleTaskDeleted,
@@ -509,6 +527,10 @@ const TaskDetailPage = () => {
     model?: ModelSelection;
     // 指令配的截图附件（选填）
     images?: ImagePayload[];
+    // 指令里 `/` 引用到的 skill（选填）——服务端拼进 agent 消息、不落进 action.userInstruction
+    skillRefs?: Array<{ name: string; absPath: string }>;
+    // 原生 picker 选的文件 / 目录绝对路径（选填）
+    attachments?: string[];
     // V0.6.14：合并后是否删源分支（advance-dialog 仅 ship 时给值、否则 undefined）
     removeSourceBranch?: boolean;
     // V0.6.23：build 分批——本次做哪些批次（advance-dialog 仅 build 且 plan 拆批时给值）
@@ -555,6 +577,15 @@ const TaskDetailPage = () => {
           // 截图附件（选填）、后端落盘后把路径注入 agent prompt
           images:
             input.images && input.images.length > 0 ? input.images : undefined,
+          // v1.1.x 富输入：文件 / 目录路径附件 + `/` skill 引用（跟输入条同款字段）
+          attachments:
+            input.attachments && input.attachments.length > 0
+              ? input.attachments
+              : undefined,
+          skills:
+            input.skillRefs && input.skillRefs.length > 0
+              ? input.skillRefs
+              : undefined,
           apiKey: args.apiKey,
           model,
           reuseAgent: input.reuseAgent,
@@ -603,7 +634,7 @@ const TaskDetailPage = () => {
       // 否则改bug 深链推进成功后，下次手动推进仍会灌入旧 bug 指令
       setAdvancePrefill(null);
     } catch (err) {
-      toast.error(`推进失败：${(err as Error).message}`);
+      toast.error(`推进失败：${toastLine((err as Error).message)}`);
     } finally {
       setStarting(false);
     }
@@ -739,7 +770,8 @@ const TaskDetailPage = () => {
               {/* min-w-0：让 h1 的 truncate 真正生效——否则长标题撑满、把后面的状态
                   badge（已带 shrink-0）挤到溢出 / 换行。标题省略、状态 badge 始终同一行。 */}
               <div className="flex min-w-0 items-center gap-2">
-                <h1 className="min-w-0 truncate text-base font-semibold">
+                {/* 详情页顶栏标题档：与 chat 详情页（chat-view）同一规格、见 ui-conventions */}
+                <h1 className="min-w-0 truncate text-sm font-medium tracking-tight">
                   {task.title}
                 </h1>
                 <Badge variant={REPO_STATUS_VARIANT[task.repoStatus]}>
@@ -747,10 +779,7 @@ const TaskDetailPage = () => {
                 </Badge>
                 {/* 无飞书链接 = 日常轻量态；中性色、与 status badge 同排 */}
                 {isLightweightDailyTask(task) && (
-                  <Badge
-                    variant="secondary"
-                    className="text-[10px] font-normal"
-                  >
+                  <Badge variant="secondary" size="xs" className="font-normal">
                     日常
                   </Badge>
                 )}
@@ -776,6 +805,18 @@ const TaskDetailPage = () => {
                     <Pencil className="size-3.5" />
                   </Button>
                 )}
+                {/* token 用量：辅助信息、排在这排最后、hover 看本轮明细 */}
+                <TokenUsageChip
+                  usage={task.tokenUsage}
+                  actionUsage={
+                    selectedAction?.tokenUsage
+                      ? {
+                          label: `#${selectedAction.n} ${actionDisplayLabel(selectedAction)}`,
+                          usage: selectedAction.tokenUsage,
+                        }
+                      : undefined
+                  }
+                />
               </div>
               <div
                 className="text-xs text-muted-foreground"
@@ -885,10 +926,7 @@ const TaskDetailPage = () => {
                         title={`${MR_KIND_LABEL[kind]} → ${target}\n${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
                       >
                         <ExternalLink className="size-3" />
-                        <Badge
-                          variant="outline"
-                          className="px-1 py-0 text-[10px] font-normal"
-                        >
+                        <Badge variant="outline" size="xs" className="font-normal">
                           {MR_KIND_LABEL[kind]}
                         </Badge>
                         {tail}
@@ -940,7 +978,7 @@ const TaskDetailPage = () => {
                 </Button>
               </>
             )}
-            {task.runStatus === "running" && !canAck && (
+            {isStopButtonVisible(task) && !canAck && (
               // 转圈 +「停止」合体：运行中一体按钮、hover 变红；stopping 防双击
               <Button
                 variant="ghost"
@@ -1055,6 +1093,7 @@ const TaskDetailPage = () => {
                       if (target) setSelectedActionId(target.id);
                     }}
                     onArtifactMetaChange={handleArtifactMeta}
+                    canShareToGroup={!isLightweightDailyTask(task)}
                   />
                 ) : (
                   <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -1083,6 +1122,10 @@ const TaskDetailPage = () => {
                   task={task}
                   streamingText={streamingText}
                   hideReplyComposer
+                  // 必传：漏了会让运行中的长 shell / subagent 被当成脏数据渲染成「已中断」。
+                  // 旁路答疑（需求群非属主提问）同样在往这条流里写工具事件、
+                  // 但它刻意不写 runStatus——必须并进来，否则它跑着的工具全成「已中断」
+                  isRunning={task.runStatus === "running" || restrictedRunActive}
                   onPrependEvents={handlePrependEvents}
                 />
               </div>

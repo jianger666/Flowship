@@ -210,7 +210,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
       >
         <Notebook />
         上下文文档
-        <span className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+        <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
           {docs.length}
         </span>
       </Button>
@@ -243,7 +243,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                     <ArrowLeft />
                   </Button>
                   <span className="truncate min-w-0">{detailDoc.title}</span>
-                  <span className="text-[10px] uppercase text-muted-foreground/60 shrink-0">
+                  <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
                     {detailDoc.type}
                   </span>
                 </DialogTitle>
@@ -369,7 +369,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                           {renderPreview(doc)}
                         </span>
                       </button>
-                      <span className="text-[10px] uppercase text-muted-foreground/60 shrink-0">
+                      <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
                         {doc.type}
                       </span>
                       <Button
@@ -477,7 +477,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
               >
                 <ImagePlus />
                 附图
-                <span className="ml-1 text-[10px] text-muted-foreground">
+                <span className="ml-1 text-[11px] text-muted-foreground">
                   {attach.images.length}/{attach.maxImages}
                 </span>
               </Button>

@@ -288,7 +288,12 @@ ArtifactPanel 正文常显 + toolbar「修订」开关（原「正文 / Diff」t
 ```
 ai-flow-action-hub/
 ├─ skills/<角色分类>/<skill名>/SKILL.md [+ .flowship-action.json]  ← 组内沉淀（fe/be/qa/other/common）
-└─ knowledge/   ← 公司知识库 wk-knowledgebase 整库镜像（只读规范：43 工程档案 + 53 skill + 门禁脚本）
+└─ knowledge/   ← 公司知识库 wukong/wk-harness-platform 整库镜像（默认分支 release/1.0）
+   ├─ knowledge-base/  工程知识档案
+   ├─ scripts/         知识库维护脚本（kb_refresh.sh / pull_*_repos.sh）——不是门禁脚本
+   └─ skills/{global,frontend,backend,client}/<工程>/<skill>/SKILL.md
+      └─ global/wk-harness/scripts/  ← 七个 wk 门禁脚本（doc-quality-gate.py / wk-context-init.py /
+         wk-delivery-sync.py 等），`wk-gate.wkScriptsDir()` 指向这里
 ```
 
 - **模块**：`team-library.ts`（sync / 上传 / 镜像 / 安装卸载，git 网络操作走 inline credential helper + env 传 token——不进命令行/config/FETCH_HEAD；对外错误统一 `redactGitText` 脱敏；`withTeamLibraryLock` 全局仓锁互斥）+ `team-skill-states.ts`（安装态存储、零依赖小模块）
@@ -296,9 +301,54 @@ ai-flow-action-hub/
 - **市场模型**：team skill = 安装/卸载（`skill-states.json`、单一 owner = team-library 模块，settings.disabledSkills 只管自管源）；**默认全量安装**（首次发现一律 enabled、用户不动 = 全都有）；用户改过的永不被默认策略覆盖
 - **共享 action 派生**：带 `.flowship-action.json` 的已安装 team skill 实时派生虚拟 CustomActionDef（id `team:<skill名>`、origin "team"），合成点在 custom-action-fs 读入口——安装/卸载一份状态、无第二份定义文件可撕裂；写入口对 `team:` id 防护（PATCH 拒绝、DELETE 转卸载）
 - **上传**：勾自管 skill → 选角色分类（默认 userRole）→ commit+push main；被保护分支拒 → 自动推临时分支 + GitLab REST 开 MR（pendingReview + mrUrl、maintainer 审批）
-- **知识库镜像**：`canMirror` 按 gitToken 对源仓的真实权限探测显隐；镜像 = 拉 wk-knowledgebase → 拷进 `knowledge/`（排除 codes/ 等）→ push；同事无源仓权限也能用全套规范
+- **知识库镜像**：`canMirror` 按 gitToken 对源仓的真实权限探测显隐；镜像 = 拉 `wukong/wk-harness-platform` → 拷进 `knowledge/` → push；同事无源仓权限也能用全套规范
+  - **源分支**：`git ls-remote --symref` 探远端默认分支（当前 `release/1.0`，**不是 main**——main 是另一条受保护分支），探不到才回退 `knowledgeSourceBranch` 配置值
+  - **排除**：`MIRROR_EXCLUDED_TOP_DIRS`（单一来源常量）= `codes/` + `harness-delivery-hub/`（交付平台服务端项目、1.2M/176 文件/0 个 skill，不是知识内容）
+  - **整体替换**：`copyTree(clearDest:true)` 先删整棵 `knowledge/` 再重建，源仓删的文件不留幽灵
+  - **`knowledge/` 豁免敏感扫描**：机器镜像不是用户手写内容，高熵规则对 py 标识符 / XML 属性值 / 文档示例 URL 满屏误报（实测 18 个变更文件 106 处、无一为真）会把镜像永久卡死；扫描只保留在真正的风险面「用户上传自管 skill → `skills/`」
 - **开关**：仅「团队规范」保留总开关 `teamKnowledgeEnabled`（一键隔离 wk 套：skill 不注入 + 自动匹配停 + 推进面板隐藏相关 action）；共享无总开关；内置/飞书 CLI 无行开关（必备只读）
 - **UI**：能力页 Skills 区双栏（左 5 项来源导航 + 右列表：chip 分类过滤 / 搜索跨源平铺 / 市场行「安装/已安装+卸载」/ 组头挂同步·镜像·上传）；组件在 `skills-panel/`
+
+### 需求群协作（飞书需求群 ↔ 任务双向打通）
+
+一个飞书群绑一个飞书项目工作项（meegle `group_type` bind），前后端测试各自的 Flowship 任务都往这个群里发 / 从这个群里收。**每人各配自己的飞书自建应用**——bot 事件只到属主本机、@ 谁的 bot 就路由到谁，天然没有广播认领问题。完整设计与实测数据（权限边界 / id 换算表 / 竞态语义全表 / 单测清单）在 `docs/feishu-group-collab.md`，改群相关代码前先读它。
+
+| 链路 | 模块 | 干什么 |
+|---|---|---|
+| 分享（出）| `feishu-group.ts` + `POST /api/tasks/[id]/share-to-group` + MCP `share_to_group` | 幂等建群 + bind 工作项 + 发卡；`artifact` 走「瘦卡片 + 全文 md 文件」、其余进卡片正文 |
+| 成员注册表 | `feishu-group-registry.ts` | **建群是唯一能带人 / 带 bot 的时机**（事后拉人缺 scope）——按工作项角色成员邮箱反查，一次把人和他们各自的 bot 带齐 |
+| 回流（入）| `feishu-bridge/group-route.ts` | 群消息 → 任务：三层 @ 过滤 → chat_id 反查本机任务 → 推进命令 / 答题 / 消息注入 |
+| 出向 | `feishu-bridge/group-outbound.ts` | 全局 task 流 tap：ask 卡发群、回答回群、推进产物回群 |
+| 自动播报 | `feishu-bridge/group-broadcast.ts` | app 内 action 跑完自动进群（`off` / `ship` / `all` 三档、当前固定 `off`、**绝不建群**）|
+| 共享状态 | `feishu-bridge/group-shared.ts` | 回群登记表 + 产物卡防重 + 选择卡防重 + 群成员名清洗 |
+
+四条硬口径（都是踩出来的、别回退）：
+
+- **身份门控**：读 / 答疑对全群开放，**写路径只有任务所有者本人**能触发（推进 action、改产物重交卷、唤醒全权限 agent）。非属主的普通文本强制走受限旁路（见下节）；chat 型任务没有受限通道 → 非属主普通文本直接拒。
+- **回群登记 token 化投递**：每条登记绑不可复用 token + 记死「在等哪一路 run」（`runTag`：属主主链 = null 单格、旁路 = 自己的 token 且多条并存），攒回答与 flush **只认 `origin === runTag` 的那一路**——属主 run 与多位同事的答疑 run 同时在飞也各回各的。
+- **advance 登记只增不静默减**：摘掉它 = 群里永久收不到那轮产物（既没产物卡也没失败回执）。四条清理链（租约到期 / 属主单格覆盖 / 容量上限 / 失败回滚）对 advance 的口径统一成**一张表**，写在 `group-shared` 文件头与设计文档——⛔ 新增清理链先对表。推进的收口判据是 **action 落终态**、不是 turn 结束（`done` 在 agent 中途 `ask_user` 时就会发一帧、那会儿 artifact 还没写）。
+- **依赖方向**：`feishu-group` 静态引 meegle-cli，**挂在 router / bootstrap / task-runner 图上的模块一律动态 `import()` 它**（否则一堆把 meegle-cli 整个 mock 掉的单测在 import 阶段就炸 missing export）。
+- **ask 卡片终态只有一个收口点**：`feishu-bridge/ask-card-settle.settleAskCards(taskId, askId, …)`，按 card-map 的 ask 索引（`askTaskId + askId`）反查**所有**承载卡（p2p 流式卡 + 群答题卡）一起 patch。了结这组 ask 的每条链（app 答题 / 群里打字 / 群卡点按钮 / 用户跳过）各调一次；同步占坑保证只置一次。⛔ 别再在某个入口分支里单独写 patch——那正是「从别处答完群里卡片不置态」的老根因。
+
+**群协作行为是固定策略、不是设置项**（2026-07-28 砍掉设置页三个开关、`settings.groupCollab` 字段一并删）：单一源 `bridge-config.GROUP_COLLAB_POLICY` = `askToGroup: false` / `advanceResultToGroup: true` / `autoBroadcast: "off"`，口径是**默认不主动吵群、但别人主动在群里发起的操作一定有回应**。三条链代码全保留、只是入参写死，以后要放开改这一个常量即可。
+
+### 受限答疑旁路（非属主群消息、与 task 运行状态机完全解耦）
+
+`src/lib/server/restricted-question.ts`。群里**非任务所有者**的一句话只配得到一个答案，它**不是这个 task 的一次 action run**——review 里连报的三条 P0 全长在「把它当成 run」这个耦合上（停止键在答疑期间冒出来、点下去把审阅中的 action 全标 cancelled；早退路径要回滚的东西补不完；prompt 里同时出现「禁止改」和「修改要求才动手改」）。契约：
+
+| 不碰 | 为什么 |
+|---|---|
+| `task.runStatus` | 一个字节都不写。停止键只看它（`isStopButtonVisible` 单一源）——不写就不会冒出来，`stopTaskAgent` 那条核弹路径（running / `awaiting_ack` 的 action 一律 cancelled + 关属主会话）也波及不到审阅中的产物 |
+| `runningTasks` | 不占位 = 不进 advance / send 互斥判定，也不会被 `cancelTaskRun` 顺手带走 |
+| `agentSessions` | 独立实例、答完 close，与属主活会话**并存**——交卷后会话是刻意保留的，而那正是产物刚播报进群、同事最可能回话的窗口（老实现在这里静默让位 = 群里没回音 + App 侧假「运行中」）|
+| action / artifact | 只读 prompt 硬拦：只答疑、禁止新建 / 修改 / 删除文件、禁止有副作用的命令 |
+
+- **唯一收口 `settle(ok, errorText?)`**：幂等，任何出口（成功 / 失败 / 取消 / finally 兜底）都只经它发一次 `done`——群出向据此回群 + 摘登记，漏发一次那条登记就一直挂到租约到期。
+- **prompt 走 `buildReadonlyUserMessage`**：⛔ 不得复用 `buildAgentMessage({kind:"user_message"})`（它会追加一段给属主写的行为尾巴「…修改要求才动手改…」，塞进只读 prompt 当场自相矛盾）；「# 边界（硬约束）」永远排在最后一段。
+- **本 run 的每条 envelope 都带 `origin`**（= 本轮回群登记 token）：与属主 run 并行时不错投的唯一依据，⛔ 别在这条链上新增「不带 origin 的 publish」。
+- 唯一登记是 task-stream 的轻量旁路表，只服务三件事：终态叫停（`cancelRestrictedQuestions`——它不在 `runningTasks` 里、`cancelTaskRun` 够不着）、**群入向**串行闸（同 worktree 并排起多个只读 agent 烧额度又抢 IO）、纯 UI 帧 `restricted_run`（详情页并进 `isRunning`，否则旁路跑的工具块会被判成「已中断」）。
+- ⛔ 别把这张表接回 `runStatus` / 停止键 / **app 侧** advance 准入——那就是又耦合回去了。
+- 属主自己的 `startOneShotQuestion` 是**另一条通道**（V0.13.x 起能直接改小改动、用户拍板「纯答疑限制太死」）。两条彻底分家，别再合并回一个入口。
 
 ### 并发所有权与消息投递协议（2026-07-19 收敛）
 
@@ -320,24 +370,37 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
-### 2026-07-24 日常任务 + 能力页分组 + 公司环境配置（company-env）（未发版）
+### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
 
-- **日常任务轻量模式**（源起用户「排查类 action 不对应任何飞书需求」）：新建表单顶部「需求任务 / 日常任务」二选 chip（看板预填入口不显示、恒需求）；日常任务 = 无 storyUrl——**不建 worktree 不建/切分支**（`resolveTaskIsolateWorktree` 强制原仓模式）、标题选填（`buildDefaultDailyTaskTitle`「日常 · 仓短名 · MM-DD HH:mm」）、列表/详情「日常」Badge、推进弹窗只显自定义组（wk/内置流程强依赖需求号进不来 = 风险源头消失）、prompt 注入轻量态声明（改文件可以、commit/push/建分支先问用户）；需求任务链接恢复必填（显式二分后无模糊态）。
-- **能力页 action 分组**：列表按组分区（通用 / 团队 · wk 流程按 order / 自定义），嵌套 Reorder——组头拖拽换整组序 + 组内行拖拽照旧；组头「默认折叠」Switch（推进弹窗里生效）；拖组时全组瞬时收起（200ms 过渡曾致换位判定拿漂移坐标、「第一下拖不过去」——收起瞬时/恢复平滑/换位 150ms 三段不对称处理）；推进弹窗组头精致化（组语义图标 Zap/Users/Sparkles + 数量 badge + chevron 旋转 + grid-rows 高度动画）。
-- **公司环境配置（company-env）全套**（源起把后端同事排查方法论做成共享 action、其工具 WuyaFlow 的数据源模型）：`settings.companyEnv`（服务器/PG/日志路径模板/XXL-Job/Nacos/ELK/HTTP API）——设置页「连接」尾部折叠小节表单（收起态状态摘要、PasswordInput 小眼睛、逐条列表替代 textarea）+ 导入/导出/预览模板（json 发同事一键导入）；**SDK local 无 env 透传** → 每次 Agent.create 前原子写 `<dataRoot>/company-env.json`（0600、`writePrivateFileAtomic`）、skill 脚本从固定路径读、密码不进 prompt/对话；**环境能力常驻声明**（`buildCompanyEnvBrief`、chat+task 注入「已配置哪些子系统、怎么用、禁止打印密码」）；HTTP API 认证三选（无/固定 Header/登录换 token）+ 自由 note（给 AI 的用法说明）；PG/XXL/Nacos「只读」Switch（默认开、声明里带 SELECT-only 等软约束）。
-- **排查 skill 上共享库**：`skills/backend/service-trace-debug`（action-hub cacaee8）——同事五段式排查方法论（场景词宽搜代码→日志三段式 ls/宽搜/精读→只读查库→规则与时间线对齐→结构化输出、强制区分 Bug vs 按设计）+ 反模式清单 + 凭据铁律（禁 cat company-env.json、脚本进程内读、PGPASSWORD 进程内传）+ `read-log.sh`/`query-db.sh` 封装（零内置兜底、全部从配置读）。
-- **修理**：上传/导入等 6 处「label 包 Checkbox 点行无效」收敛为 `CheckboxRow` 公共组件（base-ui checkbox 非原生 input、label 联动不生效——CDP 实测定位）；共享市场**增量新 skill 默认不装**（首次接入全装保留、`isFirstInit` 拆分）；团队库上传/镜像**敏感信息扫描闸**（五类模式、占位符豁免、命中阻断 + force 出口、snippet 脱敏）；导入失败必弹提示；feishu-bridge 两条 flaky 根治（测试隔离 + mock 真网、确认非生产去重窗口）。
-- 记录：用户同事自建了同类工具 WuyaFlow（Windows、数据源模型可借鉴：stageKeywords 阶段默认指令、grill-me 高压澄清 skill）。
+> 双模型交叉 review 的逐条结论与判断过程存 `docs/CHANGELOG.md` 同名条目。本段只留「这批干了什么 + 口径」。
 
-### 2026-07-23 自动更新体验重构（状态机 + 页面进度 + 端口占用/重复点击回归修复、随 v1.4.1 发）
+- **门禁由 Flowship 在流程节点强制调**（不靠 agent 自觉）：`wk-gate.ts` 三个挂钩点——推进前 `wk-context-init.py`（warn-only）+ `doc-quality-gate.py --command wk:xxx`（**非 0 硬拦**：不 append action、不起 agent、错误进事件流）；action 收尾 `--stage <stage>`（并进 `postCheck.passed`、UI 红条）；过了才 `wk-delivery-sync.py`。起因是我们起 SDK agent 传 `settingSources: []`（修 MCP 泄漏），规范里唯一「平台强制」的 hook guard 加载不了，于是走规范自带的 fallback preflight 条款——反过来把原本靠 agent 自觉的那几类也变可靠了。`wk-state.py transition` 仍归 agent（要带只有它知道的 reason / target-status）。
+- **五档降级 + 一条铁律**：非 wk action（静默）/ 没绑仓 / 没配 doc_repo / 团队库缺脚本 / 文档仓没这个 REQ-ID 目录 → 跳过 + 事件流一条可读提示；**除「preflight 非 0」这一处有意硬拦外，任何异常都不阻塞主流程**（脚本起不来、缺席、超时、读盘炸全部降级放行）。脚本输出经 `wk-gate-output.ts` 转成「一句话结论 + 有限条明细」，不把 stdout 一坨塞进事件流。
+- **脚本目录口径**：门禁脚本在镜像的 `knowledge/skills/global/wk-harness/scripts/`（`wkScriptsDir()`）；`knowledge/scripts/` 放的是知识库维护脚本（`kb_refresh.sh` / `pull_*_repos.sh`）——本文件与 `team-library.ts` 旧注释把这两个写反了，本批订正。
+- **配置落 `~/.wk/config.yaml`**（不用 Flowship 的同事读同一份）：设置页 连接 → 团队 wk 流程 配文档仓路径 + 交付中心地址 + 两个开关；写回是**键级合并**（同事配的其它键与注释原样保留）、解析 / 生成口径对齐官方 python 的 `read_simple_delivery_yaml`；地址留空时三个 `delivery_hub` 键一起删（官方 baseline 脚本遇到「require_* 为真却没 base_url」直接 FAIL 挡死 `wk:*`）。交付中心可达性探测走服务端（hub 在内网、没配 CORS）。
+- **REQ-ID 可编辑**：`resolveReqId`（手填 > 飞书链接派生 > `REQ-TASK-*` 本地兜底）是 prompt 注入与门禁拼 `requirements/<REQ-ID>` 的唯一入口；新建表单与编辑弹窗都能改，提交判定共用 `reqIdPatchValue`（**必须带 `touched`**：只展示派生值不算手填，否则改链接会把旧派生值锁死）。
+- **本轮 review 修掉的两条 P0**：① 团队库版本差异（`wk-context-init.py` 07-27 才加）让老镜像**每次 wk 推进刷一条假告警**——现在 plan 先探盘、缺了整步跳过，且 `runWkScript` 把「退 2 + can't open file」归成 `unavailable/no-script` 而非 `failed`；② 编辑弹窗改飞书链接会把旧 REQ-ID 误锁成手填值。两条都补了先对旧实现跑红过的用例（`tests/wk-gate.test.ts` 的 execFile mock 改成**认真实文件系统**、`tests/req-id{,-form-contract}.test.ts`）。
+- **P1 顺带**：后置门禁最坏耗时 60s → 30s（它挂在 action 从 running 翻 awaiting_ack 的必经路径上）；降级提示带 `meta.notice` 走事件流可见形态（原来被压成一行 truncate 灰字、「去设置页配」这类指引根本看不到）；错误卡保留换行、toast 只留一句结论（明细看事件流）；`no-req-dir` 按 command 分文案（首跑 `wk:biz-analyze` 不再诱导用户改编号）；半截 hub 配置（`require_*=true` 却没地址）允许关掉、非法地址草稿失焦即回滚。
+- **已知欠账**：后置门禁降级时 `postCheck.passed` 仍是 true、而 postCheck 详情只在 `passed=false` 时渲染 → 用户看不到「这次门禁其实没跑」（要修得给 postCheck 加 warn 态、不只是布尔）；交付同步仍是阻塞状态翻转的串行一步。
+- **命名统一 Delivery Hub**（发版前顺手）：产物中心此前代码里叫「Harness Hub」，团队规范（wk-harness skill 全篇）的官方叫法是 delivery hub（项目名 `harness-delivery-hub`、配置键 `delivery_hub.*`）——页面文案 / 事件流消息 / 注释 / 测试断言全量改为「Delivery Hub」（42 处），代码标识符（`hubBaseUrl` 等）不动。
 
-- **背景（用户手机反馈三连）**：mac 点「新版本」没下载进度条、再点必弹「自动更新失败」、每次升级重启必弹「端口被占用」。排查结论：全是 `45eb485`（mac 延迟替换）回归——下载前移到发现新版时后台暂存（点徽标时已无下载可看、进度本来也只画在 Dock）、`installUpdateNow`/`applyStagedUpdate` 无安装互斥（二次点击吃空已被 rename 消费的暂存必炸）、「立即更新」走 `app.relaunch()+app.exit(0)` 而 **`app.exit` 不触发 `before-quit`**（唯一杀 server 的钩子被绕过 → 旧 server 孤儿占 8876 → 新实例必弹端口占用）。
-- **主进程更新状态机**（`main.js` `updateState`：idle/available/downloading/ready/installing + percent/error、win/mac 统一语义）：`webContents.send("update-state")` 实时推 + `get-update-state` IPC 全量拉、替代旧 executeJavaScript 注入 `__appUpdateVersion`（时序竞态、带不了进度）。mac dmg 下载循环按整数百分点节流推进度；staging single-flight wrapper 统一置 ready / 失败回 available（installInFlight 持锁中跳过 ready、防闪帧）。
-- **端口占用修复**：`applyStagedUpdate` relaunch 分支 exit 前 `await stopServer()`；win `before-quit` 改同步 `execFileSync taskkill /T /F`（连进程树、5s timeout 兜底）——`kill("SIGKILL")` 只杀单进程、SDK agent 孙进程留着继续占端口。
-- **重复点击修复**：`installUpdateNow` 加 `installInFlight` 互斥、UpdateBadge downloading/installing 态 disabled；win `promptWinInstall` 抽出（「稍后」后再点徽标直接重弹确认、不重复下载）+ 自身单飞（downloadUpdate resolve 后锁已释放、弹窗还开着时二次进入会叠双弹窗）。
-- **win 静默安装**：`quitAndInstall(true, true)`（`oneClick:false` 下不传 isSilent 会弹完整 NSIS 向导、与 electron-builder.yml「自更新走 /S」注释不符的存量 bug）；**不在 quitAndInstall 前杀 server**（蓝军 P0：`install()` 失败不退出时 app 变没后端的僵尸）、靠 before-quit 树杀；`error` 事件 installing 态回滚 quitting=false + phase→ready。
-- **前端**：`update-badge.tsx` 纯状态驱动（「新版本 vX / 下载中 x% / 重启更新 vX / 更新中…」、ready 与 available 分文案 confirm）、先订阅 onState 再 getState（防旧快照倒退进度）；preload `__appUpdater` 桥扩展 install/getState/onState（install 替代 `app-update://` 伪协议、will-navigate 拦截保留兜底）；`window.__appUpdater`/`__appVersion` 全局类型收敛到 `src/lib/app-updater.ts`。手动「检查更新」mac 打包环境也触发后台暂存（对齐轮询）。
-- 蓝军 review 两轮 + 终审「可合入」：一轮 1 P0（win 提前杀 server）+ 4 P1；二轮 4 P1（改盘/停服顺序、win installing 短路、quitting 回滚守卫、installing 期 staging 门闩）+ 验收揪出「旧 server 迟到 exit 误杀新 server」竞态 → `startServer` 世代守卫（exit/error handler `serverProc !== proc` 时只记日志）+ `stopServer` SIGKILL 后短等 1s 回收、`applyStagedUpdate` 失败恢复按 `hadRunningServer` 拉回 server。轮询/手动检查在 downloading/installing 中不打断状态机（下载 A 时发布 B 下轮自愈）。门禁 typecheck / lint / 1413 测试全绿。**win 真机未验**（mac 开发机）——发版后需 win 同事验证：静默安装不弹向导、升级重启无端口弹窗、任务栏+徽标进度。
+### 2026-07-27 需求群协作 + 受限答疑协议 + 输入体系重构（v1.6.0）
+
+> 稳定形态已写进上面的「当前架构快照」（需求群协作 / 受限答疑旁路）+ `docs/feishu-group-collab.md`；
+> 七轮双模型交叉 review 的逐轮过程存 `docs/CHANGELOG.md` 同名条目。本段只留「这批干了什么 + 还欠什么」。
+
+- **需求群协作一～五期一口气交付**：分享闭环（API + MCP + 产物面板 / 选中段两个 UI 入口）、群消息回流、群内答题卡、群内推进（「推进」出 action 选择卡 / 「推进 <名字>」模糊匹配）、action 完成自动播报、建群按**成员自动注册表**一次带齐角色成员和他们各自的 bot（团队库 `members` 数据分支、⚠️ 不能开保护，否则每个人的自动注册都失败）。方案完全建立在**免审 scope** 上——事后拉人 / 查群成员 / 用户身份发消息全部不可用（实测表见设计文档）。
+- **受限答疑协议**（七轮双模型 review 收敛的成果、架构级）：非属主群消息落只读旁路 `restricted-question.ts`、与 task 运行状态机**完全解耦**；回群登记 **token 化投递**（`runTag` + 事件 `origin`，属主 run 与多位同事的答疑 run 各回各的）；推进收口看 **action 真实状态**而不是 turn 结束；advance 登记的**四条清理链口径表**。三次协议级收敛的共同教训：同族问题第二次以「更细窗口」重现就别再逐分支打补丁（learned-conventions 已立条）。
+- **本轮清尾三条**（终审判可交付后剩的小口子）：① `restoreGroupReply` 放回 `previous` 时 advance **无条件放回**——原来的租约闸等于在回滚路径上静默摘掉一条在飞推进，这第四个改表点同步补进口径表两处；② advance 顶掉 advance 不再静默丢——`advanceTask` **成功之后**给上一轮的发起人 @ 一句「上一轮推进已被新一轮取代」（失败路径要 restore，所以绝不能提前发；「推进结果回群」关掉时不发）；③ 到期回执自己判一次桥接总开关（钩子由 `hasGroupReplies` 的 prune 触发、早于出向那句开关判定）。
+- **输入体系重构**：`rich-input.tsx`（内核）/ `conversation-composer.tsx`（会话壳、原 `composer.tsx`）/ `use-rich-input.ts`（状态层）三层单一来源，chat 输入岛 / task 事件流输入条 / 推进弹窗 / 答题卡四处共用；`/skill` 后端贯通 advance 与 ask-reply 两条链——**不进 `action.userInstruction`**，否则每条 action 历史都重复一段指引。
+- **其它**：团队库源仓迁 `wk-harness-platform` + 默认分支探测（当前 `release/1.0`）+ 排除 `harness-delivery-hub/` + `knowledge/` 豁免敏感扫描；UI 修复若干（事件流工具态不再误判「已中断」、停止键可见性单一源、滚动条布局抖动全局治理、选区浮动按钮抽公共件）。
+- **不答提问、直接发新消息 = 隐式跳过那组提问**（用户实测缺陷：待答卡片 + 顶部「AI 在等你回答」悬浮条一直挂着、推进按钮也被按住，用户原话「像牛皮癣一样」；chat 模式那条链原本一个字都没处理）。协议在 `src/lib/server/ask-skip.ts`：入口**同步认领**（原子摘走 pendingAsk）→ 消息确认交给 agent 后**提交**（写 `meta.supersededAskId` + `askSkipped` 的作废事件 + 置飞书卡片终态）→ 没送出去**回滚**（登记放回、还能回去答）。
+  - **UI 不是删除、是折叠**：事件流里收成一行「AI 提过 N 个问题 · 已跳过」、可展开看原问题（事件流是历史、抹掉会让回溯看不懂 agent 后面那句「按你说的继续」）；那条作废 info 不再单独占一行。悬浮条 / `canAdvance` 跟着 `findPendingAskEvent` 自动恢复——三处共用同一判定，没有第二套。
+  - **agent 消息前置一句跳过上下文**（`ASK_SKIP_AGENT_HINT`），不加的话 AI 大概率换个说法把同一组问题再问一遍；只进 agent 文本、不进事件流气泡。
+  - **答 vs 跳只有一个赢**：仲裁者只有 pendingAsks 一张表，`takePendingAskIf` 是唯一认领口——`ask-reply` 路由从「先 peek、送达后 clear」改成同款原子摘走（失败路径条件放回），跳过赢了则 `ask-reply` 入口的 `isAskSkipped` 闸 409。登记为空时靠 `wasAskTakenRecently` 区分「答题链在飞」与「重启后的孤儿 ask」（前者放手、后者才按事件收口，否则卡片永远挂着）。
+  - **顺带清掉上一批的欠账**：卡片终态收口点（见上「需求群协作」第五条）——现在从 app 答完，群里 / p2p 那张卡也会一起置成终态。
+- **发版前收尾（2026-07-28、三模型交叉 review + 两轮蓝军审查）**：修掉「跳过提问」协议 6 条竞态 / 失败路径问题——① ask-reply `!pending` 入口统一加 `wasAskTakenRecently` 让路守卫（跳过链在飞时既不写作废事件也不走僵尸唤醒，覆盖「已失效」与「僵尸」两个子分支）；② 唤醒兜底的飞书答题卡终态挪到投递成功之后（fire-and-forget 成功路径才 settle、失败只落引导事件，chat 返 false 不再静默）；③ 孤儿跳过 rollback 撤占位打点（新增 `clearAskTakenMark`、askId 匹配才清）；④ commit 写作废事件失败撤打点（自愈窗口 TTL 10 分钟 → 下一条消息）；⑤ `restorePendingAskIf` 撤打点对齐 askId 匹配口径；⑥ fire-and-forget 收尾回调包 `noteWakeFailure`（写盘失败不再逃逸成 unhandled rejection）。已知窄窗口 P2 两条记录在案不阻塞：commit 撤打点后写盘失败+会话死+用户答题三重叠加的双赢可能、僵尸分支 await 后可补守卫复查。
+- **门禁**：typecheck / lint 0 warning / vitest 全绿；并发与协议类新断言逐条先对旧实现跑过、确认会红才算数。用例总数以本地 / CI 实跑为准，⛔ 不在文档里写死数字。
 
 ## 关键文件索引
 
@@ -360,6 +423,17 @@ ai-flow-action-hub/
 | **agent 孤儿子进程清理（V0.6.8、停 task / finally 调）** | `src/lib/server/kill-orphans.ts` |
 | **任务 worktree 隔离（V0.10：ensure/remove/孤儿扫描/getTaskCwd/路径归一）** | `src/lib/server/task-worktrees.ts` + `tests/task-worktrees{,.integration}.test.ts` |
 | **团队库（2026-07-22：组共享库 clone/sync/上传/镜像/市场安装卸载 + 安装态存储 + 派生共享 action + 双栏 UI）** | `src/lib/server/{team-library,team-skill-states}.ts` + `src/app/api/team-library/**` + `src/components/settings/skills-panel/*` + `src/components/custom-actions/install-team-actions.tsx` + `src/hooks/use-team-library.ts` + `tests/{team-library,skills-loader-team}.test.ts` |
+| **团队 wk 流程门禁（2026-07-28：三个挂钩点强制调官方脚本 + 五档降级 + 输出转人话；脚本目录 = 镜像里 `knowledge/skills/global/wk-harness/scripts/`）** | `src/lib/server/wk-gate.ts` + `src/lib/{wk-command,wk-gate-output}.ts` + `src/lib/server/action-checks.ts: checkWkStageGate` + `tests/{wk-gate,wk-gate-output,wk-command,wk-post-stage-hook}.test.ts` |
+| **wk 本机配置 `~/.wk/config.yaml`（键级合并、与不用 Flowship 的同事共用同一份）+ 交付中心探测** | `src/lib/{wk-config,wk-hub}.ts` + `src/lib/server/{wk-config,wk-hub-probe}.ts` + `src/app/api/system/wk-config/{route,probe/route}.ts` + `src/components/settings/wk-harness-card.tsx` + `src/hooks/use-wk-config.ts` + `tests/{wk-config,wk-hub-probe}.test.ts` |
+| **REQ-ID（手填 > 链接派生 > 兜底；`reqIdPatchValue` 是新建表单与编辑弹窗共用的提交判定）** | `src/lib/req-id.ts` + `src/components/tasks/{task-launch-form,edit-task-dialog}.tsx` + `tests/{req-id,req-id-form-contract}.test.ts` |
+| **需求群协作（2026-07-27：建群 / 分享 / 群消息回流 / 群内推进 / 自动播报 / 成员自动注册表）** | `src/lib/server/{feishu-group,feishu-group-registry}.ts` + `src/lib/server/feishu-bridge/group-{route,outbound,broadcast,shared,ask-card,advance-card}.ts` + `src/app/api/tasks/[id]/share-to-group/route.ts` + `src/lib/share-to-group.ts` + `src/hooks/use-share-to-group.tsx` + `src/components/tasks/{share-to-group-dialog,bot-add-guide-dialog}.tsx` + `docs/feishu-group-collab.md` |
+| **受限答疑旁路（非属主群消息、与 task 运行状态机解耦；只读 prompt + 唯一 settle + 事件带 origin）** | `src/lib/server/restricted-question.ts` + `task-stream.ts` 的旁路表 / `restricted_run` 帧 + `tests/{restricted-group-question,restricted-run-signal,task-question-inject-restrict}.test.ts` |
+| **task 模式消息注入链（question 路由抽出的薄壳、群 / p2p / UI 三处复用；非属主传 `restrictToQuestion`）** | `src/lib/server/task-question-inject.ts` |
+| **server 复算「当前可推进 action 清单」（与推进弹窗同一套过滤 / 分组序，群内推进选择卡与模糊匹配的数据源）** | `src/lib/server/advance-options.ts` + `tests/advance-options.test.ts` |
+| **富输入三层（2026-07-27：内核 / 会话壳 / 状态层，chat 输入岛 + 事件流输入条 + 推进弹窗 + 答题卡四处共用）** | `src/components/{rich-input,conversation-composer}.tsx` + `src/hooks/use-rich-input.ts` + `src/lib/{rich-input-payload,composer-history}.ts` |
+| **公司环境配置 company-env（设置页表单 + 导入导出 + `Agent.create` 前原子写 `<dataRoot>/company-env.json` 0600 给 skill 脚本读、密码不进 prompt）** | `FeAiFlowSettings.companyEnv` + `src/lib/company-env.ts`（归一 + `buildCompanyEnvBrief` 能力声明）+ `src/lib/server/company-env-fs.ts`（`writeCompanyEnvFile` / `syncCompanyEnvFileFromSettings`）+ `src/components/settings/company-env-card.tsx` |
+| **run 收尾闭合未配对 tool_call（只扫事件流尾窗、避免翻出远古孤儿「已中断」）** | `src/lib/server/finalize-open-tools.ts` + `tests/finalize-open-tools.test.ts` |
+| **选区浮动按钮公共件（产物「分享到群」与事件流「引用」共用定位 / 样式 / 防选区塌陷）** | `src/components/ui/selection-float.tsx` |
 | **读 Cursor 全局配置 mcp/rules（V0.6.2 新）** | `src/lib/server/cursor-config.ts` |
 | **Cursor MCP 只读 API + hook（V0.6.2 新）** | `src/app/api/cursor-mcp/route.ts` + `src/hooks/use-cursor-mcp.ts` |
 | **MCP OAuth（V0.6.4 新、走 OAuth 的远程 MCP 授权 + 注入）** | `src/lib/server/mcp-oauth.ts` + `src/app/api/mcp-oauth/{start,callback,status,revoke}` + `src/hooks/use-mcp-oauth.ts` |

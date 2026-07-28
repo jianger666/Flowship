@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -65,36 +66,31 @@ interface MrInboxPanelProps {
   className?: string;
 }
 
-/** 小 chip（优先级 / 状态 / MR 可合性） */
+/**
+ * 小 chip（优先级 / 状态 / MR 可合性）。
+ * 2026-07-28 胶囊家族收口：原来是手写 span 拼 `h-5 rounded-4xl` + 各自的 tone class，
+ * 跟 Badge 长得一模一样；现在只做 tone → Badge variant 的映射，视觉单一来源在 Badge。
+ */
+const CHIP_VARIANT = {
+  muted: "secondary",
+  ok: "success",
+  danger: "destructive",
+  warn: "warning",
+} as const;
+
 const Chip = ({
   children,
   tone = "muted",
   title,
 }: {
   children: ReactNode;
-  tone?: "muted" | "ok" | "danger" | "warn";
+  tone?: keyof typeof CHIP_VARIANT;
   title?: string;
-}) => {
-  const toneClass =
-    tone === "ok"
-      ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
-      : tone === "danger"
-        ? "bg-destructive/10 text-destructive"
-        : tone === "warn"
-          ? "bg-amber-500/15 text-amber-800 dark:text-amber-300"
-          : "bg-muted text-muted-foreground";
-  return (
-    <span
-      title={title}
-      className={cn(
-        "inline-flex h-5 shrink-0 items-center rounded-4xl px-2 text-xs",
-        toneClass,
-      )}
-    >
-      {children}
-    </span>
-  );
-};
+}) => (
+  <Badge variant={CHIP_VARIANT[tone]} title={title}>
+    {children}
+  </Badge>
+);
 
 /**
  * MR 可合性 chip（待测 MR 行 / 待回归 bug 行共用）。
@@ -570,7 +566,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
             <DropdownMenuTrigger
               disabled={transitioning}
               className={cn(
-                "inline-flex h-5 shrink-0 cursor-pointer items-center gap-0.5 rounded-4xl border border-input bg-background px-2 text-[10px] text-muted-foreground outline-none",
+                "inline-flex h-5 shrink-0 cursor-pointer items-center gap-0.5 rounded-4xl border border-input bg-background px-2 text-[11px] text-muted-foreground outline-none",
                 "hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
                 "disabled:cursor-not-allowed disabled:opacity-50",
               )}

@@ -25,6 +25,10 @@ import type { TaskSummary } from "@/lib/types";
 
 import { injectPendingAskText } from "./ask-inject";
 import {
+  isGroupChatMessage,
+  routeGroupInboundMessage,
+} from "./group-route";
+import {
   getCurrentChatTaskId,
   getEndedChatTaskIds,
   removeEndedChatTaskId,
@@ -960,8 +964,19 @@ export const resolveReplyAnchorIds = async (
 export const routeInboundMessage = async (
   msg: FeishuInboundMessage,
 ): Promise<InjectResultPayload> => {
-  // 1) 过滤
+  // 1) 过滤：群消息走需求群回流分支（第二批）；其余非 p2p 忽略
   if (msg.chat_type !== "p2p") {
+    if (isGroupChatMessage(msg)) {
+      const payload = await routeGroupInboundMessage(msg, {
+        parseContent: parseInboundContent,
+        loadBootContext: async () => {
+          const boot = await loadBridgeBootContext();
+          return boot ? { apiKey: boot.apiKey, model: boot.model } : null;
+        },
+      });
+      await emitInjectResult(payload);
+      return payload;
+    }
     return { kind: "skipped", messageId: msg.message_id, error: SKIP_NOT_P2P };
   }
   let ownerOpenId: string;

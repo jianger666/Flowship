@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { dataRoot, ensurePrivateDir } from "@/lib/server/data-root";
 import { readSettingsFile } from "@/lib/server/settings-fs";
+import type { GroupAutoBroadcast } from "@/lib/types";
 
 /** 桥接落盘根：card-map、下载临时文件等 */
 export const getBridgeDataDir = async (): Promise<string> => {
@@ -54,3 +55,37 @@ export const isFeishuBridgeStreamingEnabled = async (): Promise<boolean> => {
   // 缺省 / 非 false → true
   return v !== false;
 };
+
+/**
+ * 需求群协作行为：**固定策略、不再是用户设置**（2026-07-28 用户拍板砍掉三个开关，
+ * 原话「不需要那么多个性化挂设置」）。原 `settings.groupCollab` 字段已从 schema 删除。
+ *
+ * 一句话原则：**默认不主动吵群，但别人主动在群里发起的操作一定有回应。**
+ *
+ * 底层三条链（ask 卡发群 / 推进结果回群 / action 完成播报）全部保留、只是入参写死——
+ * 以后想放开（重新挂设置或分场景差异化）只需改这里的常量，下游一行不用动。
+ */
+export const GROUP_COLLAB_POLICY: {
+  askToGroup: boolean;
+  advanceResultToGroup: boolean;
+  autoBroadcast: GroupAutoBroadcast;
+} = {
+  // 每次 ask_user 都往群里发卡太吵。用户自己在 app 里答；要别人帮忙时手动「分享到群」
+  askToGroup: false,
+  // 群里点了推进却看不到结果、这功能就废了
+  advanceResultToGroup: true,
+  // 每个 action 跑完都刷群太吞
+  autoBroadcast: "off",
+};
+
+/** ask_user 答题卡是否同步发需求群 */
+export const isAskToGroupEnabled = async (): Promise<boolean> =>
+  GROUP_COLLAB_POLICY.askToGroup;
+
+/** 群内推进跑完是否自动把产物发回群 */
+export const isAdvanceResultToGroupEnabled = async (): Promise<boolean> =>
+  GROUP_COLLAB_POLICY.advanceResultToGroup;
+
+/** app 内 action 跑完的自动播报档位 */
+export const getGroupAutoBroadcastMode =
+  async (): Promise<GroupAutoBroadcast> => GROUP_COLLAB_POLICY.autoBroadcast;

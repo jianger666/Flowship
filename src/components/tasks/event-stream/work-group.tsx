@@ -3,15 +3,19 @@
 /**
  * 工作过程组折叠行（CHAT-REDESIGN Batch B）
  *
- * 把 turn 内正文之前的 thinking / 工具 / 旁白 / error 收成一行摘要；
+ * 把 turn 内正文之前的 thinking / 工具调用收成一行摘要；
  * running 自动展开、完成后自动收起；用户手动 toggle 后以手动为准。
+ * error 事件**不**进组（2026-07-28）——自动收起会把用户正在读的错误吃掉、见 lib/chat-turns.ts。
  * 本文件只交付组件，Batch C 再接到 event-stream items 管线。
  */
 
-import { memo, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { ChevronRight, Loader2, X } from "lucide-react";
 
+import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import type { WorkGroupItem } from "@/lib/chat-turns";
+import { formatDurationCoarse } from "@/lib/duration-display";
+import { shouldPinWorkGroupOpen } from "@/lib/scroll-follow";
 import {
   isToolBlock,
   isToolVerbGroup,
@@ -25,16 +29,9 @@ import { ToolBlockRow, ToolVerbGroupRow } from "./tool-block";
 
 // ---------- 耗时 / 活动摘要 ----------
 
-/** 组头耗时：秒级密度（`12s` / `2m14s`）；同秒完成（<1s）返回空、组头不显示 0s */
-const formatGroupDuration = (startTs: number, endTs: number): string => {
-  const ms = Math.max(0, endTs - startTs);
-  const totalSec = Math.round(ms / 1000);
-  if (totalSec < 1) return "";
-  if (totalSec < 60) return `${totalSec}s`;
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}m${s}s`;
-};
+/** 组头耗时：口径（秒级密度、<1s 不显示）收在 lib/duration-display、跟事件流其它耗时同源 */
+const formatGroupDuration = (startTs: number, endTs: number): string | null =>
+  formatDurationCoarse(Math.max(0, endTs - startTs));
 
 /**
  * 折叠且 running 时右侧活动摘要：从末尾找最近一个 running 工具名即可。
@@ -82,7 +79,7 @@ const WorkGroupMember = ({
   if (isToolVerbGroup(member)) {
     return <ToolVerbGroupRow group={member} taskId={taskId} />;
   }
-  // thinking / error（assistant 插话不进组、独立平铺）→ EventRow 细行分支
+  // thinking（assistant 插话 / error 都不进组、各自独立平铺）→ EventRow 细行分支
   return (
     <EventRow
       ev={member as TaskEvent}
@@ -128,7 +125,26 @@ const WorkGroupRowImpl = ({
   const [manual, setManual] = useState<boolean | null>(null);
 
   const autoExpanded = group.hasRunning || !!isRunningTail;
-  const expanded = manual ?? autoExpanded;
+
+  // 自动收起的「防打扰」闸（2026-07-28、用户实测「自动折叠也感觉怪」）：
+  // 判定见 shouldPinWorkGroupOpen（纯函数、可单测）。
+  // 用渲染期 latch 而不是 useEffect：effect 跑在 commit 之后，会先闪一帧折叠再弹回来。
+  const followCtl = useStreamFollowContext();
+  const prevAutoExpandedRef = useRef(autoExpanded);
+  const stickyOpenRef = useRef(false);
+  if (
+    shouldPinWorkGroupOpen(
+      prevAutoExpandedRef.current,
+      autoExpanded,
+      // 拿不到控制器（组件被单独复用）时按「跟随中」算、维持原自动收起行为
+      followCtl ? followCtl.isFollowing() : true,
+    )
+  ) {
+    stickyOpenRef.current = true;
+  }
+  prevAutoExpandedRef.current = autoExpanded;
+  // 用户手动点过就完全以他为准（含手动收起被钉住的组）
+  const expanded = manual ?? (autoExpanded || stickyOpenRef.current);
 
   const runningTail =
     !expanded && group.hasRunning ? lastRunningName(group.members) : null;
@@ -137,14 +153,14 @@ const WorkGroupRowImpl = ({
     <div className="min-w-0">
       <button
         type="button"
-        onClick={() => setManual(!(manual ?? autoExpanded))}
+        onClick={() => setManual(!expanded)}
         className="flex h-7 w-full cursor-pointer items-center gap-1.5 rounded px-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-muted/30 hover:text-muted-foreground"
       >
         <CollapseChevron open={expanded} />
         <span className="shrink-0">工作过程</span>
         <span className="shrink-0 tabular-nums">· {group.stepCount} 步</span>
         {group.hasRunning ? (
-          <Loader2 className="size-3 shrink-0 animate-spin opacity-70" />
+          <Loader2 className="size-3 shrink-0 animate-spin text-info" />
         ) : (
           // 同秒完成（<1s）不显示「0s」——空字符串时整段不渲染
           formatGroupDuration(group.startTs, group.endTs) && (

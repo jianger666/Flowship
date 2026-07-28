@@ -105,7 +105,7 @@ describe("prompt 模板占位符对账（防漏渲染）", () => {
     const supplied = new Set([
       "taskId",
       "taskTitle",
-      "defaultReqId",
+      "reqIdLine",
       "userIdentityLine",
       "repoSection",
       "lightweightDailySection",

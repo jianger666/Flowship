@@ -36,6 +36,7 @@ import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
+import { reqIdPatchValue } from "@/lib/req-id";
 import { settingsUrl } from "@/lib/settings-link";
 import { buildDefaultDailyTaskTitle } from "@/lib/task-display";
 import { createTask } from "@/lib/task-store";
@@ -82,6 +83,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [title, setTitle] = useState(initialTitle);
   // 飞书链接：预填路径用 prop；手动路径本地可编辑（初始空时放开输入）
   const [storyUrl, setStoryUrl] = useState(feishuStoryUrl);
+  // wk 需求编号（团队规范的 REQ-ID）：需求 owner 分发的编号，没有就留空——
+  // 我们不猜（不从飞书链接 / task id 派生），空着 = 这个 task 没有 REQ-ID、wk 门禁自会跳过
+  const [reqId, setReqId] = useState("");
   // 有预填则隐藏链接框（看板进）；无预填才露出可编辑输入 + 模式二选
   const urlEditable = !feishuStoryUrl.trim();
   // 手动路径：需求任务（默认）/ 日常任务；切走再切回不丢草稿
@@ -222,6 +226,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         repoPaths,
         // 日常 → 空链接触发服务端轻量态；需求 → 必有链接
         feishuStoryUrl: isDailyLaunch ? undefined : storyUrl.trim() || undefined,
+        // 填了什么存什么、空 = 没有编号（判定与编辑弹窗共用 reqIdPatchValue）
+        reqId: isDailyLaunch ? undefined : (reqIdPatchValue(reqId) ?? undefined),
         repoBaseBranches:
           Object.keys(repoBaseBranches).length > 0 ? repoBaseBranches : undefined,
         repoFeatureBranches:
@@ -314,14 +320,28 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         </div>
       )}
 
-      {/* 仓库（缺项时琥珀高亮引导） */}
+      {/* wk 需求编号：选填、拿到编号后也能在任务详情页补。
+          日常任务不出现（推进面板本来就不给日常任务出 wk 流程组） */}
+      {!isDailyLaunch && (
+        <div className="grid gap-1.5">
+          <Label htmlFor="l-req-id">需求编号</Label>
+          <Input
+            id="l-req-id"
+            value={reqId}
+            onChange={(e) => setReqId(e.target.value)}
+            placeholder="暂无 REQ-ID、可后补"
+          />
+        </div>
+      )}
+
+      {/* 仓库（缺项时 warning 高亮引导） */}
       <div className="grid gap-1.5">
         <Label required>目标仓库</Label>
         {repos.length > 0 ? (
           <div
             className={
               repoPaths.length === 0
-                ? "rounded-md ring-1 ring-amber-500/60"
+                ? "rounded-md ring-1 ring-warning/60"
                 : undefined
             }
           >
@@ -436,7 +456,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           }
         />
         {pickedModel.id && defaultModelId && pickedModel.id !== defaultModelId && (
-          <p className="text-xs text-amber-500">已切到非默认模型</p>
+          <p className="text-xs text-warning">已切到非默认模型</p>
         )}
       </div>
 
@@ -497,7 +517,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
           {submitting ? "创建中…" : "启动任务"}
         </Button>
         {missingHint && (
-          <span className="text-xs text-amber-600 dark:text-amber-500">{missingHint}</span>
+          <span className="text-xs text-warning">{missingHint}</span>
         )}
       </div>
     </div>

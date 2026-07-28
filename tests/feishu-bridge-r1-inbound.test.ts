@@ -2,28 +2,32 @@
  * R1 入向/基建族：串行链 / 去重 / RMW 写队列 / retryable / keep-awake 身份
  */
 import { EventEmitter } from "node:events";
-import { promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-const TMP = path.join(os.tmpdir(), `feishu-bridge-r1-inbound-${Date.now()}`);
-process.env.FLOWSHIP_DATA_DIR = path.join(TMP, "data");
+import {
+  baseRouterDeps,
+  deferred,
+  failInjectResponse,
+  installBridgeTestHooks,
+  okInjectResponse,
+  tick,
+  makeBridgeTmpDataDir,
+} from "./helpers/feishu-bridge-harness";
+
+const TMP = makeBridgeTmpDataDir("feishu-bridge-r1-inbound");
 
 const {
   defaultMessageHandler,
   enqueueInboundMessage,
-  __resetInboundChainForTest,
 } = await import("@/lib/server/feishu-bridge/inbound");
 const {
-  __setRouterDepsForTest,
   routeInboundMessage,
+  __setRouterDepsForTest,
 } = await import("@/lib/server/feishu-bridge/router");
 type InjectResultPayload =
   import("@/lib/server/feishu-bridge/router").InjectResultPayload;
 const {
-  __resetBridgeStateForTest,
   hasProcessedMessageId,
   markProcessedMessageId,
   rememberP2pChatId,
@@ -34,66 +38,39 @@ const {
   setLastProcessedTs,
   getLastProcessedTs,
   findTaskByMessageId,
-  __setCardMapMaxForTest,
 } = await import("@/lib/server/feishu-bridge/card-map");
 const { KeepAwake } = await import("@/lib/server/feishu-bridge/keep-awake");
 
-/** 路由单测公共 deps：必须 mock larkApi，否则 resolveReplyAnchorIds 打真网拖死链 */
-const baseRouterDeps = () => ({
-  getBotAppInfo: async () => ({
-    appId: "cli_x",
-    ownerOpenId: "ou_owner",
-  }),
-  sendTextMessage: async () => ({ chat_id: "c", message_id: "m" }),
-  findTaskByMessageId: async () => null,
-  listTasks: async () =>
-    [
-      {
-        id: "task-1",
-        title: "t",
-        mode: "chat",
-        repoStatus: "developing",
-        runStatus: "idle",
-        updatedAt: Date.now(),
-        createdAt: Date.now(),
-      },
-    ] as never,
-  getPendingAsk: () => null,
-  // 反查 parent/root：空结果即可走活跃 chat 兜底，绝不能打真飞书
-  larkApi: async () => ({ data: { items: [] } }),
-  readSettingsFile: async () => ({
-    status: "ok" as const,
-    settings: {
-      apiKey: "sk",
-      defaultModel: { id: "gpt-5" },
-      repos: [{ path: "/tmp/r" }],
+// 排空共享链 + 重建隔离数据目录统一交给 harness（含 fake timers 复位——
+// R1-8 中途失败会留下 fake timers、链重置里的 2s cap 会永不触发）
+installBridgeTestHooks({ tmpRoot: TMP, cardMapMax: 50 });
+
+/** 本族默认「唯一活跃 chat」，直发不触发多对话提示 */
+const oneActiveChat = () =>
+  [
+    {
+      id: "task-1",
+      title: "t",
+      mode: "chat",
+      repoStatus: "developing",
+      runStatus: "idle",
+      updatedAt: Date.now(),
+      createdAt: Date.now(),
     },
-  }),
-  listSkillsWithSource: async () => [],
-  prewarmTaskWorkspace: () => undefined,
-  createTask: async () => ({ id: "task-1" }) as never,
-});
+  ] as never;
 
-beforeEach(async () => {
-  // R1-8 若中途失败可能留下 fake timers，链重置里的 2s cap 会永不触发
-  vi.useRealTimers();
-  await fs.rm(TMP, { recursive: true, force: true });
-  await fs.mkdir(path.join(TMP, "data"), { recursive: true });
-  // 先排空入向链，再清盘——避免上一用例未 await 的 handler 串味
-  await __resetInboundChainForTest();
-  await __resetBridgeStateForTest();
-  __setCardMapMaxForTest(50);
-  __setRouterDepsForTest(null);
-});
-
-afterEach(async () => {
-  vi.useRealTimers();
-  __setRouterDepsForTest(null);
-  __setCardMapMaxForTest(null);
-  await __resetInboundChainForTest();
-  await __resetBridgeStateForTest();
-  await fs.rm(TMP, { recursive: true, force: true });
-});
+/** 路由 deps 基线（larkApi 等外部 IO 已在 harness 里铺满） */
+const routerDeps = (
+  overrides: Parameters<typeof baseRouterDeps>[0] = {},
+): void => {
+  __setRouterDepsForTest(
+    baseRouterDeps({
+      listTasks: async () => oneActiveChat(),
+      createTask: async () => ({ id: "task-1" }) as never,
+      ...overrides,
+    }),
+  );
+};
 
 const baseRaw = (overrides: Record<string, unknown> = {}) => ({
   type: "im.message.receive_v1",
@@ -110,32 +87,22 @@ const baseRaw = (overrides: Record<string, unknown> = {}) => ({
 describe("R1-2a：入向单链按序注入", () => {
   it("并发两条消息按入队顺序注入（慢 A 不让快 B 抢先）", async () => {
     const order: string[] = [];
-    let releaseA!: () => void;
-    const gateA = new Promise<void>((r) => {
-      releaseA = r;
-    });
+    const gateA = deferred();
     // 确定性信号：A 进入 inject 即 resolve，替代短 timeout waitFor（高负载下假红）
-    let signalAStart!: () => void;
-    const aStarted = new Promise<void>((r) => {
-      signalAStart = r;
-    });
+    const aStarted = deferred();
 
-    __setRouterDepsForTest({
-      ...baseRouterDeps(),
+    routerDeps({
       handleChatReplyInject: async (_id, body) => {
         const text = (body as { text?: string }).text ?? "";
         if (text === "A") {
           order.push("A-start");
-          signalAStart();
-          await gateA;
+          aStarted.resolve();
+          await gateA.promise;
           order.push("A-end");
         } else {
           order.push("B");
         }
-        return new Response(JSON.stringify({ ok: true }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        return okInjectResponse();
       },
     });
 
@@ -145,23 +112,17 @@ describe("R1-2a：入向单链按序注入", () => {
         content: JSON.stringify({ text: "A" }),
       }),
     );
-    // 安全上限仅防死锁；正常路径由 aStarted 立即放行
-    await Promise.race([
-      aStarted,
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error("A-start 未在 10s 内到达")), 10_000),
-      ),
-    ]);
+    await aStarted.promise;
     const pB = defaultMessageHandler(
       baseRaw({
         message_id: "om_B",
         content: JSON.stringify({ text: "B" }),
       }),
     );
-    // B 已入队但不得在 A 结束前跑——用微任务/短 tick 即可，不再靠墙钟 30ms
-    await new Promise((r) => setImmediate(r));
+    // B 已入队但不得在 A 结束前跑——排空当前几轮事件循环即可，不靠墙钟猜
+    await tick(2);
     expect(order).toEqual(["A-start"]);
-    releaseA();
+    gateA.resolve();
     await Promise.all([pA, pB]);
     expect(order).toEqual(["A-start", "A-end", "B"]);
   });
@@ -169,18 +130,11 @@ describe("R1-2a：入向单链按序注入", () => {
 
 describe("R1-2b / R1-13e：live+catchup 同 message_id 只注入一次", () => {
   it("两条路径并发处理同 id → handleChat 只调一次", async () => {
-    const inject = vi.fn(async () => {
-      await new Promise((r) => setTimeout(r, 40));
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    });
-    __setRouterDepsForTest({
-      ...baseRouterDeps(),
-      handleChatReplyInject: inject as never,
-    });
+    const inject = vi.fn(async () => okInjectResponse());
+    routerDeps({ handleChatReplyInject: inject as never });
 
+    // enqueueInboundMessage 是同步挂链——两条 handler 在同一 tick 就都已入队、
+    // 重叠窗口由构造保证，不需要给第一条塞人为延时（旧写法睡 40ms）
     const raw = baseRaw({ message_id: "om_dup" });
     await Promise.all([
       defaultMessageHandler(raw),
@@ -229,14 +183,8 @@ describe("R1-2c：card-map / bridge-state 写队列不互盖", () => {
 describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
   it("getBotAppInfo 失败 → retryable、不 mark；修复后可重投", async () => {
     let boom = true;
-    const inject = vi.fn(async () =>
-      new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-    __setRouterDepsForTest({
-      ...baseRouterDeps(),
+    const inject = vi.fn(async () => okInjectResponse());
+    routerDeps({
       getBotAppInfo: async () => {
         if (boom) throw new Error("cli jitter");
         return { appId: "cli_x", ownerOpenId: "ou_owner" };
@@ -256,13 +204,8 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
   });
 
   it("内容终态（队满 409）→ 非 retryable、照 mark", async () => {
-    __setRouterDepsForTest({
-      ...baseRouterDeps(),
-      handleChatReplyInject: async () =>
-        new Response(JSON.stringify({ error: "排队已满" }), {
-          status: 409,
-          headers: { "Content-Type": "application/json" },
-        }),
+    routerDeps({
+      handleChatReplyInject: async () => failInjectResponse(409, "排队已满"),
     });
 
     const r409 = await routeInboundMessage({
@@ -288,13 +231,8 @@ describe("R1-6：retryable 失败不 mark、可补拉重投", () => {
   });
 
   it("5xx inject → retryable、不 mark", async () => {
-    __setRouterDepsForTest({
-      ...baseRouterDeps(),
-      handleChatReplyInject: async () =>
-        new Response(JSON.stringify({ error: "upstream" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        }),
+    routerDeps({
+      handleChatReplyInject: async () => failInjectResponse(503, "upstream"),
     });
 
     const result: InjectResultPayload = await routeInboundMessage({
@@ -393,15 +331,17 @@ describe("R1-8：keep-awake exit 身份校验", () => {
 describe("enqueueInboundMessage 导出", () => {
   it("串行链保证顺序", async () => {
     const seen: number[] = [];
-    await Promise.all([
-      enqueueInboundMessage(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-        seen.push(1);
-      }),
-      enqueueInboundMessage(async () => {
-        seen.push(2);
-      }),
-    ]);
+    // 第一个任务卡在闸上直到第二个也入了队——串行若失效，2 会抢在 1 前面
+    const gate = deferred();
+    const first = enqueueInboundMessage(async () => {
+      await gate.promise;
+      seen.push(1);
+    });
+    const second = enqueueInboundMessage(async () => {
+      seen.push(2);
+    });
+    gate.resolve();
+    await Promise.all([first, second]);
     expect(seen).toEqual([1, 2]);
   });
 });

@@ -42,7 +42,7 @@ export const MrInboxBell = () => {
         {unreadCount > 0 && (
           <span
             aria-hidden
-            className="absolute top-0.5 right-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-1 text-[10px] leading-none font-medium text-white"
+            className="absolute top-0.5 right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] leading-none font-medium text-white"
           >
             {formatUnreadBadge(unreadCount)}
           </span>
