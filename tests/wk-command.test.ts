@@ -88,13 +88,13 @@ describe("stage / scope / path 需求（对齐官方 runner.py 与 command-contr
     ]);
   });
 
-  it("preflight 的 --biz-path / --repo-path 要求与 check_command_gate 一致", () => {
+  it("preflight 的 path 要求覆盖 command hard gate 与 delivery baseline", () => {
     // prd-review 什么都不校验
     expect(wkNeedsBizPath("wk:prd-review")).toBe(false);
     expect(wkNeedsRepoPath("wk:prd-review")).toBe(false);
-    // repo-design 只看业务级
+    // repo-design 的 hard gate 看业务级，repo scope baseline 看仓库级
     expect(wkNeedsBizPath("wk:repo-design")).toBe(true);
-    expect(wkNeedsRepoPath("wk:repo-design")).toBe(false);
+    expect(wkNeedsRepoPath("wk:repo-design")).toBe(true);
     // repo-execute 两边都看
     expect(wkNeedsBizPath("wk:repo-execute")).toBe(true);
     expect(wkNeedsRepoPath("wk:repo-execute")).toBe(true);

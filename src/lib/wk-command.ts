@@ -60,9 +60,6 @@ const NEEDS_BIZ_PATH = new Set<WkCommand>([
   "wk:biz-verify",
 ]);
 
-/** preflight 要带 `--repo-path` 的指令（= runner.check_command_gate 里读 repo_root 的那批） */
-const NEEDS_REPO_PATH = new Set<WkCommand>(["wk:repo-execute", "wk:repo-review"]);
-
 export const isWkCommand = (v: string): v is WkCommand => WK_COMMAND_SET.has(v);
 
 /**
@@ -99,5 +96,13 @@ export const wkScopeOf = (command: WkCommand): "business" | "repo" =>
 export const wkNeedsBizPath = (command: WkCommand): boolean =>
   NEEDS_BIZ_PATH.has(command);
 
+/**
+ * 整个 `doc-quality-gate.py --command` 入口是否要带 `--repo-path`。
+ *
+ * 这不只是末尾 `runner.check_command_gate` 的读取口径：开启 delivery baseline 后，
+ * 前置 baseline 会按 COMMAND_SCOPE 校验路径，所有 repo scope 指令（包括
+ * repo-design）都要求 `--repo-path`。repo-design 同时仍要把 `--biz-path`
+ * 交给本地 hard gate。
+ */
 export const wkNeedsRepoPath = (command: WkCommand): boolean =>
-  NEEDS_REPO_PATH.has(command);
+  wkScopeOf(command) === "repo";

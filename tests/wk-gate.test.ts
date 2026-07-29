@@ -353,6 +353,19 @@ describe("脚本参数拼装（对齐 command-contract.md）", () => {
     ]);
   });
 
+  it("preflight：repo-design 同时带 hard gate 的 biz-path 与 baseline 的 repo-path", async () => {
+    await setupHappyWorld();
+    const plan = await expectActive(makeTask(), { skill: "wk-repo-design" });
+    expect(buildPreflightArgs(plan)).toEqual([
+      "--command",
+      "wk:repo-design",
+      "--biz-path",
+      plan.bizDir,
+      "--repo-path",
+      plan.repoDir,
+    ]);
+  });
+
   it("preflight：repo-review 只带 repo-path、biz-analyze 只带 biz-path", async () => {
     await setupHappyWorld();
     const review = await expectActive(makeTask(), { skill: "wk-repo-review" });

@@ -496,7 +496,8 @@ export const buildContextInitArgs = (plan: WkGatePlanActive): string[] => [
 
 /**
  * `doc-quality-gate.py --command wk:xxx [--biz-path …] [--repo-path …]`
- * 传哪些 path 对齐 runner.check_command_gate 的读取口径（见 wk-command.ts 的两张表）。
+ * 传哪些 path 对齐 command hard gate 与 delivery baseline 的合并口径
+ * （见 wk-command.ts 的两张表）。
  */
 export const buildPreflightArgs = (plan: WkGatePlanActive): string[] => {
   const args = ["--command", plan.command];
