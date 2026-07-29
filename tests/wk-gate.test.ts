@@ -366,6 +366,23 @@ describe("脚本参数拼装（对齐 command-contract.md）", () => {
     ]);
   });
 
+  it("preflight：repo baseline 使用与 delivery sync 相同的 repoName scope", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "http://127.0.0.1:8088";
+    wkCfg.requireBaseline = true;
+    const plan = await expectActive(makeTask());
+    expect(buildPreflightArgs(plan)).toEqual([
+      "--command",
+      "wk:repo-execute",
+      "--biz-path",
+      plan.bizDir,
+      "--repo-path",
+      plan.repoDir,
+      "--delivery-repo-name",
+      "crm-web",
+    ]);
+  });
+
   it("preflight：repo-review 只带 repo-path、biz-analyze 只带 biz-path", async () => {
     await setupHappyWorld();
     const review = await expectActive(makeTask(), { skill: "wk-repo-review" });

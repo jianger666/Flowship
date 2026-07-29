@@ -495,14 +495,22 @@ export const buildContextInitArgs = (plan: WkGatePlanActive): string[] => [
 ];
 
 /**
- * `doc-quality-gate.py --command wk:xxx [--biz-path …] [--repo-path …]`
+ * `doc-quality-gate.py --command wk:xxx [--biz-path …] [--repo-path …]
+ *   [--delivery-repo-name …]`
  * 传哪些 path 对齐 command hard gate 与 delivery baseline 的合并口径
  * （见 wk-command.ts 的两张表）。
+ *
+ * repo baseline 的 unit scope 必须和 post-stage sync 一致：sync 以 repoName
+ * （如 crm-web）发布，preflight 也要显式传同一个名字。否则 baseline 会退到
+ * 默认 scope `repo`，拿到另一份同 REQ-ID 的旧产物并误报本地未同步。
  */
 export const buildPreflightArgs = (plan: WkGatePlanActive): string[] => {
   const args = ["--command", plan.command];
   if (wkNeedsBizPath(plan.command)) args.push("--biz-path", plan.bizDir);
   if (wkNeedsRepoPath(plan.command)) args.push("--repo-path", plan.repoDir);
+  if (plan.pullsBaseline && wkScopeOf(plan.command) === "repo") {
+    args.push("--delivery-repo-name", plan.repoName);
+  }
   return args;
 };
 
