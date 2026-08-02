@@ -67,7 +67,7 @@ function DialogContent({
   return (
     <DialogPortal>
       <DialogOverlay />
-      <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto p-4">
+      <div className="fixed inset-0 z-50 grid place-items-center overflow-x-hidden overflow-y-auto p-4">
         <DialogPrimitive.Popup
           data-slot="dialog-content"
           className={cn(
@@ -131,7 +131,7 @@ function DialogDockedContent({
       <DialogPrimitive.Popup
         data-slot="dialog-docked-content"
         className={cn(
-          "fixed right-4 bottom-4 z-50 grid max-h-[min(80vh,40rem)] w-[min(28rem,calc(100vw-2rem))] gap-4 overflow-y-auto rounded-xl bg-popover p-4 text-sm text-popover-foreground shadow-2xl ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:slide-in-from-bottom-4 data-closed:animate-out data-closed:fade-out-0 data-closed:slide-out-to-bottom-4 *:min-w-0",
+          "fixed right-4 bottom-4 z-50 grid max-h-[min(80vh,40rem)] w-[min(28rem,calc(100vw-2rem))] gap-4 overflow-x-hidden overflow-y-auto rounded-xl bg-popover p-4 text-sm text-popover-foreground shadow-2xl ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:slide-in-from-bottom-4 data-closed:animate-out data-closed:fade-out-0 data-closed:slide-out-to-bottom-4 *:min-w-0",
           className
         )}
         {...props}

@@ -15,6 +15,7 @@ import { Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { ModelSelect } from "@/components/ui/model-select";
 import {
@@ -433,9 +434,11 @@ export const PreferenceSections = ({
           label="Agent shell 用 Git Bash"
           hint={
             gitBashPath ? (
-              <span className="block min-w-0 truncate" title={gitBashPath}>
-                {gitBashPath}
-              </span>
+              <Tooltip content={gitBashPath}>
+                <span className="block min-w-0 truncate">
+                  {gitBashPath}
+                </span>
+              </Tooltip>
             ) : gitBashPath === null ? (
               "未检测到 Git Bash"
             ) : (
@@ -503,17 +506,22 @@ export const PreferenceSections = ({
           )
         }
         labelExtra={
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => onModelsRefresh(apiKey)}
-            disabled={modelsRefreshing || !apiKey.trim()}
-            title={apiKey.trim() ? "重新拉取可用模型列表" : "请先填 API key"}
+          <Tooltip
+            content={apiKey.trim() ? "重新拉取可用模型列表" : "请先填 API key"}
           >
-            {modelsRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            获取列表
-          </Button>
+            <span className="inline-flex">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => onModelsRefresh(apiKey)}
+                disabled={modelsRefreshing || !apiKey.trim()}
+              >
+                {modelsRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                获取列表
+              </Button>
+            </span>
+          </Tooltip>
         }
         control={
           <ModelSelect

@@ -52,7 +52,13 @@ describe("贴底跟随：用户上滚意图 > 几何阈值", () => {
   });
 
   it("滚动容器必须挂给跟随控制器——漏了手势检测整个静默失效、又退回「一滚就被拽回底」", () => {
-    expect(eventStream).toContain("scrollerRef={follow.attachScroller}");
+    expect(eventStream).toContain("scrollerRef={attachScrollerRef}");
+    const attachScroller = sliceBalanced(
+      eventStream,
+      "const attachScrollerRef = useCallback",
+      "(",
+    );
+    expect(attachScroller).toContain("follow.attachScroller(el)");
   });
 
   it("跟随判定收口在控制器，组件里不再自己维护 atBottom state", () => {
@@ -95,10 +101,9 @@ describe("回到最新按钮", () => {
   });
 
   it("跟琥珀色 ask 悬浮条错位摆放——两条的显示条件都含「非贴底」、必定同时出现", () => {
-    // 回底按钮蹲右下角、琥珀条居中悬在上一排：横竖都错开，窄面板下也压不到
+    // 琥珀条居中悬在上一排（bottom-14）；回底按钮在右下角（bottom-3 right-3），纵向错开
     expect(eventStream).toContain("absolute bottom-3 right-3");
     expect(eventStream).toContain("absolute bottom-14 left-1/2");
-    // 琥珀条退回「居中 + 同排」就会跟回底按钮叠在一起（改之前就是这个位置）
     expect(eventStream).not.toContain("absolute bottom-3 left-1/2");
   });
 
@@ -110,13 +115,15 @@ describe("回到最新按钮", () => {
   it("计数按工作过程组的成员摊开——退回 items.length 会在长 action 里常驻 0", () => {
     // 一个 build action 的几十个工具块是连续过程项、被收进同一个工作过程组，
     // items.length 全程不动；而那恰恰是「用户翻在历史里想知道错过了啥」的主场景
+    expect(eventStream).toContain("countStreamContentUnits");
+    expect(eventStream).toMatch(
+      /countStreamContentUnits[\s\S]*__work_group__[\s\S]*members\.length/,
+    );
     const contentCount = sliceBalanced(
       eventStream,
       "const contentCount = useMemo",
       "(",
     );
-    expect(contentCount).toContain("__work_group__");
-    expect(contentCount).toContain("members.length");
     // 挂 orderedItems 不挂 items：虚拟项跟着 chunk 变、没必要每秒重算几十次
     expect(contentCount).toContain("orderedItems");
     expect(eventStream).toContain("contentCount={contentCount}");

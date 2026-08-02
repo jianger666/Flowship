@@ -54,6 +54,7 @@ import { SlashSkillMenu, type SlashSkillsApi } from "@/components/slash-skills";
 import { AtMentionMenu, useAtMention } from "@/components/at-mention";
 import { useComposerSession } from "@/components/composer-session";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ImageThumb } from "@/components/ui/image-preview";
 import { pathBasename } from "@/lib/path-utils";
 import type { UseImageAttachReturn } from "@/hooks/use-image-attach";
@@ -225,30 +226,28 @@ export const RichInput = ({
             // 启发式：末尾不带 . 视为目录（只影响图标、server 会再 stat）
             const looksLikeDir = !pathBasename(p).includes(".");
             return (
-              <span
-                key={p}
-                className="flex max-w-full items-center gap-1.5 rounded-md border bg-background/60 px-2 py-1 text-xs"
-                title={p}
-              >
-                {looksLikeDir ? (
-                  <Folder className="size-3 shrink-0 text-muted-foreground" />
-                ) : (
-                  <FileIcon className="size-3 shrink-0 text-muted-foreground" />
-                )}
-                <span className="min-w-0 truncate font-mono text-[11px]">
-                  {pathBasename(p)}
+              <Tooltip key={p} content={p}>
+                <span className="flex max-w-full items-center gap-1.5 rounded-md border bg-background/60 px-2 py-1 text-xs">
+                  {looksLikeDir ? (
+                    <Folder className="size-3 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <FileIcon className="size-3 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="min-w-0 truncate font-mono text-[11px]">
+                    {pathBasename(p)}
+                  </span>
+                  {onRemovePath && (
+                    <button
+                      type="button"
+                      onClick={() => onRemovePath(p)}
+                      className="flex size-3.5 shrink-0 items-center justify-center rounded-full opacity-60 hover:bg-muted hover:opacity-100"
+                      aria-label="移除"
+                    >
+                      <X className="size-2.5" />
+                    </button>
+                  )}
                 </span>
-                {onRemovePath && (
-                  <button
-                    type="button"
-                    onClick={() => onRemovePath(p)}
-                    className="flex size-3.5 shrink-0 items-center justify-center rounded-full opacity-60 hover:bg-muted hover:opacity-100"
-                    aria-label="移除"
-                  >
-                    <X className="size-2.5" />
-                  </button>
-                )}
-              </span>
+              </Tooltip>
             );
           })}
         </div>
@@ -281,53 +280,62 @@ export const RichInput = ({
         <div className="flex min-w-0 items-center *:min-w-0">{leading}</div>
         <div className="flex shrink-0 items-center gap-0.5">
           {showAttachActions && attach && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={attach.triggerFilePicker}
-              disabled={disabled || images.length >= attach.maxImages}
-              className="size-7 p-0 text-muted-foreground hover:text-foreground"
-              aria-label="附图"
-              title="附图（也支持粘贴 / 拖拽）"
-            >
-              <ImagePlus className="size-3.5" />
-            </Button>
+            <Tooltip content="附图（也支持粘贴 / 拖拽）">
+              <span className="inline-flex">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={attach.triggerFilePicker}
+                  disabled={disabled || images.length >= attach.maxImages}
+                  className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                  aria-label="附图"
+                >
+                  <ImagePlus className="size-3.5" />
+                </Button>
+              </span>
+            </Tooltip>
           )}
           {showAttachActions && onPickPaths && (
             <>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={disabled || picking !== false}
-                onClick={() => onPickPaths("file")}
-                className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                aria-label="附文件"
-                title="附文件（agent 会用 `read` 工具看）"
-              >
-                {picking === "file" ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <FileIcon className="size-3.5" />
-                )}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={disabled || picking !== false}
-                onClick={() => onPickPaths("folder")}
-                className="size-7 p-0 text-muted-foreground hover:text-foreground"
-                aria-label="附目录"
-                title="附目录（agent 会用 `read` 工具看）"
-              >
-                {picking === "folder" ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <FolderOpen className="size-3.5" />
-                )}
-              </Button>
+              <Tooltip content="附文件（agent 会用 `read` 工具看）">
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={disabled || picking !== false}
+                    onClick={() => onPickPaths("file")}
+                    className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                    aria-label="附文件"
+                  >
+                    {picking === "file" ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <FileIcon className="size-3.5" />
+                    )}
+                  </Button>
+                </span>
+              </Tooltip>
+              <Tooltip content="附目录（agent 会用 `read` 工具看）">
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={disabled || picking !== false}
+                    onClick={() => onPickPaths("folder")}
+                    className="size-7 p-0 text-muted-foreground hover:text-foreground"
+                    aria-label="附目录"
+                  >
+                    {picking === "folder" ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <FolderOpen className="size-3.5" />
+                    )}
+                  </Button>
+                </span>
+              </Tooltip>
             </>
           )}
           {trailing}

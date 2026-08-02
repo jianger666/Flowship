@@ -3,7 +3,7 @@
 /**
  * 全局快捷键统一注册（C 批次）：挂在 providers、全站只此一个 keydown 入口
  *（散落 listener 的例外：Cmd+B 在 app-shell 持有侧栏 state、Cmd+J 在任务页组件、
- * Cmd+K 在 SearchDialog（搜索 + 命令合一面板、侧栏挂载）——它们绑定局部 state、
+ * Cmd+K 在 SearchDialog（搜索 + 命令合一面板、providers 挂载）——它们绑定局部 state、
  * 暂不上收；新增全局键一律加在这）。
  *
  * - Cmd/Ctrl+N：新建对话（输入框聚焦时也生效——带修饰键、不影响打字）

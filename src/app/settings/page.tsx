@@ -20,6 +20,7 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Card,
   CardContent,
@@ -243,9 +244,11 @@ const SettingsPage = () => {
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-semibold">设置</h1>
             {appVersion && (
-              <span className="text-xs text-muted-foreground" title="桌面端版本号">
-                v{appVersion}
-              </span>
+              <Tooltip content="桌面端版本号">
+                <span className="text-xs text-muted-foreground">
+                  v{appVersion}
+                </span>
+              </Tooltip>
             )}
             <DiagnosticsButton />
             <CheckUpdateButton />

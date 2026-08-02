@@ -24,6 +24,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { McpToggleList } from "@/components/tasks/mcp-toggle-list";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -70,22 +71,25 @@ export const ChatMcpPicker = ({ task, onTaskUpdate }: Props) => {
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            disabled={running}
-            title="选本次对话启用哪些 MCP"
-            // 视觉对齐 ChatBranchPicker / ChatWorkdirPicker、三者并排齐平
-            className={cn(
-              "flex h-7 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
-            )}
-          >
-            <Plug className="size-3.5 shrink-0 text-muted-foreground" />
-            <span>MCP</span>
-            <span className="rounded-sm bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
-              {enabledCount}/{availableServers.length}
+          <Tooltip content="选本次对话启用哪些 MCP">
+            <span className="inline-flex">
+              <button
+                type="button"
+                disabled={running}
+                // 视觉对齐 ChatBranchPicker / ChatWorkdirPicker、三者并排齐平
+                className={cn(
+                  "flex h-7 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
+                )}
+              >
+                <Plug className="size-3.5 shrink-0 text-muted-foreground" />
+                <span>MCP</span>
+                <span className="rounded-sm bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
+                  {enabledCount}/{availableServers.length}
+                </span>
+                <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
+              </button>
             </span>
-            <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
-          </button>
+          </Tooltip>
         }
       />
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">

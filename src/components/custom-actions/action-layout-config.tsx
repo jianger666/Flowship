@@ -27,6 +27,7 @@ import {
 import { AuthorByline } from "@/components/ui/author-byline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -207,14 +208,15 @@ const LayoutRow = ({
         (skillDisabled || knowledgeDisabled) && "opacity-60",
       )}
     >
-      <button
-        type="button"
-        onPointerDown={(e) => controls.start(e)}
-        className={DRAG_HANDLE_CLASS}
-        title="拖拽排序"
-      >
-        <GripVertical className="size-4" />
-      </button>
+      <Tooltip content="拖拽排序">
+        <button
+          type="button"
+          onPointerDown={(e) => controls.start(e)}
+          className={DRAG_HANDLE_CLASS}
+        >
+          <GripVertical className="size-4" />
+        </button>
+      </Tooltip>
       <div className="min-w-0 flex-1">
         {/* 名称行：名称 + badge 群 + 创建人 */}
         <div
@@ -262,23 +264,26 @@ const LayoutRow = ({
           </p>
         )}
         {skills && skills.length > 0 && (
-          <p
-            className={cn(
-              "mt-0.5 truncate text-xs leading-snug text-muted-foreground",
-              skills[0]?.missing && "line-through opacity-60",
-            )}
-            title={
+          <Tooltip
+            content={
               skillDisabled
                 ? "挂载的自管 skill 已关闭、推进面板隐藏"
                 : knowledgeDisabled
                   ? "团队规范已关闭、推进面板隐藏"
                   : skills[0]?.missing
                     ? "本机未找到、推进时自动跳过"
-                    : undefined
+                    : ""
             }
           >
-            skill: {skills[0]?.name}
-          </p>
+            <p
+              className={cn(
+                "mt-0.5 truncate text-xs leading-snug text-muted-foreground",
+                skills[0]?.missing && "line-through opacity-60",
+              )}
+            >
+              skill: {skills[0]?.name}
+            </p>
+          </Tooltip>
         )}
         {isLegacy && (
           <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
@@ -413,14 +418,15 @@ const GroupSection = ({
     >
       {/* 组头：手柄 + 标题 + 数量 + 默认折叠（空组也显示，方便配折叠） */}
       <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
-        <button
-          type="button"
-          onPointerDown={(e) => controls.start(e)}
-          className={DRAG_HANDLE_CLASS}
-          title="拖拽调整组顺序"
-        >
-          <GripVertical className="size-4" />
-        </button>
+        <Tooltip content="拖拽调整组顺序">
+          <button
+            type="button"
+            onPointerDown={(e) => controls.start(e)}
+            className={DRAG_HANDLE_CLASS}
+          >
+            <GripVertical className="size-4" />
+          </button>
+        </Tooltip>
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
           {ACTION_GROUP_LABEL[groupKey]}
         </span>

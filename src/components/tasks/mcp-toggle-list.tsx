@@ -28,6 +28,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyHint } from "@/components/ui/empty-hint";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { settingsUrl } from "@/lib/settings-link";
@@ -63,35 +64,39 @@ export const HealthBadge = ({
     );
     if (h.status === "fail") {
       return (
-        <button
-          type="button"
-          onClick={onShowLog}
-          className={cn(
-            "flex shrink-0 cursor-pointer items-center gap-1 text-[11px] underline-offset-2 hover:underline",
-            HEALTH_TEXT[h.status],
-          )}
-          title="点击看报错日志"
-        >
-          {dot}
-          {MCP_HEALTH_LABEL[h.status]}
-        </button>
+        <Tooltip content="点击看报错日志">
+          <button
+            type="button"
+            onClick={onShowLog}
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center gap-1 text-[11px] underline-offset-2 hover:underline",
+              HEALTH_TEXT[h.status],
+            )}
+          >
+            {dot}
+            {MCP_HEALTH_LABEL[h.status]}
+          </button>
+        </Tooltip>
       );
     }
     return (
-      <span
-        className={cn(
-          "flex shrink-0 items-center gap-1 text-[11px]",
-          HEALTH_TEXT[h.status],
-        )}
-        title={
+      <Tooltip
+        content={
           h.detail
             ? `${MCP_HEALTH_LABEL[h.status]}：${h.detail}`
             : MCP_HEALTH_LABEL[h.status]
         }
       >
-        {dot}
-        {MCP_HEALTH_LABEL[h.status]}
-      </span>
+        <span
+          className={cn(
+            "flex shrink-0 items-center gap-1 text-[11px]",
+            HEALTH_TEXT[h.status],
+          )}
+        >
+          {dot}
+          {MCP_HEALTH_LABEL[h.status]}
+        </span>
+      </Tooltip>
     );
   }
   if (loading) {

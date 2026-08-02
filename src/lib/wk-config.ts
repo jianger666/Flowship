@@ -29,6 +29,10 @@ export interface WkConfig {
   docRepoPath: string;
   /** Delivery Hub 地址 */
   hubBaseUrl: string;
+  /** Delivery Hub 鉴权 Token（本机设置页密码框使用） */
+  hubToken: string;
+  /** Delivery Hub Token 是否已配置 */
+  hubTokenConfigured: boolean;
   /** 跑 wk:* 前从 Hub 拉最新产物 */
   requireBaseline: boolean;
   /** 产物变更推回 Hub */
@@ -36,17 +40,22 @@ export interface WkConfig {
 }
 
 /**
- * 写盘输入：只有这两项由调用方说了算。
+ * 写盘输入：路径、地址和 Token 由调用方整份提交。
  *
  * 两个 `require_*` 开关**不在其中**——UI 上已经没有开关（2026-07-28 用户拍板
  * 「这是理应开启的」），写文件时固定 true（见 `applyWkConfig`）。用类型挡住，
  * 免得哪天又从别处漏进一个「关」。
  */
-export type WkConfigInput = Pick<WkConfig, "docRepoPath" | "hubBaseUrl">;
+export type WkConfigInput = Pick<
+  WkConfig,
+  "docRepoPath" | "hubBaseUrl" | "hubToken"
+>;
 
 export const EMPTY_WK_CONFIG: WkConfig = {
   docRepoPath: "",
   hubBaseUrl: "",
+  hubToken: "",
+  hubTokenConfigured: false,
   requireBaseline: false,
   requireSync: false,
 };
@@ -86,13 +95,16 @@ export const parseSimpleYaml = (
   return out;
 };
 
-/** 解析结果 → 我们关心的四个字段 */
+/** 解析结果 → 页面需要的非敏感字段；Token 只返回是否配置 */
 export const configFromYaml = (raw: string): WkConfig => {
   const parsed = parseSimpleYaml(raw);
   const hub = parsed["delivery_hub"] ?? {};
+  const hubToken = (hub["token"] ?? "").trim();
   return {
     docRepoPath: (parsed["doc_repo"]?.["local_path"] ?? "").trim(),
     hubBaseUrl: (hub["base_url"] ?? "").trim(),
+    hubToken,
+    hubTokenConfigured: Boolean(hubToken),
     requireBaseline: isWkTruthy(hub["require_baseline"]),
     requireSync: isWkTruthy(hub["require_sync"]),
   };
@@ -240,22 +252,23 @@ const upsertSection = (
 export const applyWkConfig = (existing: string, cfg: WkConfigInput): string => {
   const docPath = cfg.docRepoPath.trim();
   const hubUrl = cfg.hubBaseUrl.trim();
+  const hubEntries: Array<[string, string | boolean | null]> = hubUrl
+    ? [
+        ["base_url", hubUrl],
+        ["require_baseline", true],
+        ["require_sync", true],
+      ]
+    : [
+        ["base_url", null],
+        ["require_baseline", null],
+        ["require_sync", null],
+      ];
+
+  hubEntries.push(["token", cfg.hubToken.trim() || null]);
+
   const plan: Array<[string, Array<[string, string | boolean | null]>]> = [
     ["doc_repo", [["local_path", docPath || null]]],
-    [
-      "delivery_hub",
-      hubUrl
-        ? [
-            ["base_url", hubUrl],
-            ["require_baseline", true],
-            ["require_sync", true],
-          ]
-        : [
-            ["base_url", null],
-            ["require_baseline", null],
-            ["require_sync", null],
-          ],
-    ],
+    ["delivery_hub", hubEntries],
   ];
 
   let lines = existing.split("\n");

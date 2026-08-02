@@ -23,6 +23,7 @@ import { Plug, RefreshCw } from "lucide-react";
 import { BoardTimeline } from "@/components/feishu/board-timeline";
 import type { DayRange } from "@/components/ui/date-range-picker";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { LoadingState } from "@/components/ui/loading-state";
 import { getSettings, initSettings } from "@/lib/local-store";
 import { settingsUrl } from "@/lib/settings-link";
@@ -328,16 +329,19 @@ export const FeishuBoard = () => {
         >
           手动建任务
         </Button>
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => void refresh()}
-          disabled={refreshing}
-          aria-label="刷新"
-          title="刷新"
-        >
-          <RefreshCw className={cn(refreshing && "animate-spin")} />
-        </Button>
+        <Tooltip content="刷新">
+          <span className="inline-flex">
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              aria-label="刷新"
+            >
+              <RefreshCw className={cn(refreshing && "animate-spin")} />
+            </Button>
+          </span>
+        </Tooltip>
       </div>
 
       <div className="min-h-0 flex-1">

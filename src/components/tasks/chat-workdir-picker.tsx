@@ -30,6 +30,7 @@ import { ChevronDown, Folder, FolderOpen, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -126,30 +127,33 @@ export const ChatWorkdirPicker = forwardRef<ChatWorkdirPickerHandle, Props>(
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            disabled={running || saving}
-            title={current || unsetHint}
-            // 视觉对齐 ModelSelect compact（src/components/ui/model-select.tsx）、并排齐平
-            className={cn(
-              "flex h-7 max-w-44 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
-            )}
-          >
-            {saving ? (
-              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-            ) : (
-              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-            )}
-            <span
-              className={cn(
-                "min-w-0 flex-1 truncate text-left",
-                !current && "text-muted-foreground",
-              )}
-            >
-              {label}
+          <Tooltip content={current || unsetHint}>
+            <span className="inline-flex">
+              <button
+                type="button"
+                disabled={running || saving}
+                // 视觉对齐 ModelSelect compact（src/components/ui/model-select.tsx）、并排齐平
+                className={cn(
+                  "flex h-7 max-w-44 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
+                )}
+              >
+                {saving ? (
+                  <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+                ) : (
+                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 truncate text-left",
+                    !current && "text-muted-foreground",
+                  )}
+                >
+                  {label}
+                </span>
+                <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
+              </button>
             </span>
-            <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
-          </button>
+          </Tooltip>
         }
       />
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">
@@ -180,12 +184,11 @@ export const ChatWorkdirPicker = forwardRef<ChatWorkdirPickerHandle, Props>(
                       <Folder className="size-3.5 shrink-0 text-muted-foreground" />
                       <span className="min-w-0 truncate">{basename(p)}</span>
                     </span>
-                    <span
-                      className="w-full truncate pl-5 font-mono text-[11px] text-muted-foreground"
-                      title={p}
-                    >
-                      {p}
-                    </span>
+                    <Tooltip content={p}>
+                      <span className="w-full truncate pl-5 font-mono text-[11px] text-muted-foreground">
+                        {p}
+                      </span>
+                    </Tooltip>
                   </button>
                 </li>
               ))}

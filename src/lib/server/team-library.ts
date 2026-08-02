@@ -37,7 +37,10 @@ import {
 } from "./custom-action-fs";
 import { dataRoot } from "./data-root";
 import { createMR } from "./gitlab-client";
-import { getTeamSkillAuthors } from "./team-skill-authors";
+import {
+  getTeamSkillAuthorIdentities,
+  getTeamSkillAuthors,
+} from "./team-skill-authors";
 import { readSettingsFile } from "./settings-fs";
 import {
   getAppSkillsDir,
@@ -69,6 +72,13 @@ import {
   type SecretScanFile,
   type SecretScanHit,
 } from "./team-library-secret-scan";
+import {
+  decideSharedSkillUpdate,
+  ownerFromGitLabIdentity,
+  parseSharedSkillOwner,
+  type GitLabUploadIdentity,
+  type SharedSkillOwner,
+} from "./team-library-ownership";
 
 export {
   getTeamLibraryKnowledgeRoot,
@@ -288,6 +298,115 @@ export const parseGitLabRepoUrl = (
   } catch {
     return null;
   }
+};
+
+const SHARED_OWNER_FILE = ".flowship-owner.json";
+const GITLAB_IDENTITY_CACHE_TTL_MS = 5 * 60 * 1000;
+const gitLabIdentityCache = new Map<
+  string,
+  { identity: GitLabUploadIdentity; expiresAt: number }
+>();
+
+/** 用实际执行 push 的 GitLab Token 查询身份；operator/本地 git author 不作为新归属依据。 */
+const getGitLabUploadIdentity = async (
+  repoUrl: string,
+  token: string,
+): Promise<
+  | { ok: true; identity: GitLabUploadIdentity }
+  | { ok: false; error: string }
+> => {
+  const parsed = parseGitLabRepoUrl(repoUrl);
+  if (!parsed) {
+    return { ok: false, error: `无法解析共享库 GitLab 地址：${repoUrl}` };
+  }
+  const tokenDigest = createHash("sha256")
+    .update(token)
+    .digest("hex")
+    .slice(0, 12);
+  const cacheKey = `${parsed.host}:${tokenDigest}`;
+  const cached = gitLabIdentityCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ok: true, identity: cached.identity };
+  }
+  try {
+    const response = await fetch(`https://${parsed.host}/api/v4/user`, {
+      method: "GET",
+      headers: {
+        "PRIVATE-TOKEN": token,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `无法确认 GitLab 上传身份（${response.status} ${response.statusText}）`,
+      };
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    const userId =
+      typeof body.id === "number" && Number.isFinite(body.id)
+        ? body.id
+        : null;
+    const username =
+      typeof body.username === "string" ? body.username.trim() : "";
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const emails = [
+      body.email,
+      body.public_email,
+      body.commit_email,
+    ]
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (userId === null || !username) {
+      return { ok: false, error: "GitLab 用户信息缺少 id/username" };
+    }
+    const identity: GitLabUploadIdentity = {
+      host: parsed.host,
+      userId,
+      username,
+      name: name || username,
+      emails: [...new Set(emails)],
+    };
+    gitLabIdentityCache.set(cacheKey, {
+      identity,
+      expiresAt: Date.now() + GITLAB_IDENTITY_CACHE_TTL_MS,
+    });
+    return { ok: true, identity };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `无法确认 GitLab 上传身份：${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+};
+
+const readSharedSkillOwner = async (
+  skillDir: string,
+): Promise<SharedSkillOwner | null> => {
+  try {
+    return parseSharedSkillOwner(
+      JSON.parse(
+        await fs.readFile(path.join(skillDir, SHARED_OWNER_FILE), "utf-8"),
+      ) as unknown,
+    );
+  } catch {
+    return null;
+  }
+};
+
+const writeSharedSkillOwner = async (
+  skillDir: string,
+  identity: GitLabUploadIdentity,
+): Promise<void> => {
+  await fs.writeFile(
+    path.join(skillDir, SHARED_OWNER_FILE),
+    `${JSON.stringify(ownerFromGitLabIdentity(identity), null, 2)}\n`,
+    "utf-8",
+  );
 };
 
 /** 上传降级 MR 用的临时分支名：`upload/<skill名slug>-<yyyyMMddHHmmss>` */
@@ -1608,18 +1727,37 @@ const uploadSkillsInternal = async (
     };
   }
   const cfg = await getTeamLibraryConfig();
+  const identity = await getGitLabUploadIdentity(cfg.repoUrl, token);
+  if (!identity.ok) {
+    return {
+      ok: false,
+      results: unique.map((name) => ({
+        name,
+        ok: false,
+        error: identity.error,
+      })),
+      error: identity.error,
+    };
+  }
   const repoDir = teamLibraryRepoDir();
   // 上传前先列一次、作 app skill json 缺失时的兜底；优先读自管目录现成 json
   const actions = await listCustomActions();
   // 全库跨分类索引 + 创建人（stage 循环内复用；restage 时再扫一轮）
   const loadConflictContext = async () => {
     const sharedEntries = await listSharedSkillDirs(repoDir);
-    const authors = await getTeamSkillAuthors(repoDir);
-    return { sharedEntries, authors };
+    const authorIdentities = await getTeamSkillAuthorIdentities(repoDir);
+    const authors = Object.fromEntries(
+      Object.entries(authorIdentities).map(([relDir, author]) => [
+        relDir,
+        author.name,
+      ]),
+    );
+    return { sharedEntries, authors, authorIdentities };
   };
 
   const stageAll = async (): Promise<UploadSkillResult[]> => {
-    const { sharedEntries, authors } = await loadConflictContext();
+    const { sharedEntries, authors, authorIdentities } =
+      await loadConflictContext();
     const results: UploadSkillResult[] = [];
     for (const name of unique) {
       // 跨分类同名 → 拒收该条（其余合法项继续）；同分类 → 覆盖
@@ -1633,8 +1771,31 @@ const uploadSkillsInternal = async (
         results.push({ name, ok: false, error: conflict.error });
         continue;
       }
+      if (conflict.status === "overwrite") {
+        const relDir = `skills/${category}/${name}`;
+        const existingDir = path.join(repoDir, relDir);
+        const decision = decideSharedSkillUpdate({
+          exists: true,
+          owner: await readSharedSkillOwner(existingDir),
+          legacyAuthor: authors[relDir],
+          legacyAuthorEmail: authorIdentities[relDir]?.email,
+          currentUser: identity.identity,
+        });
+        if (!decision.allowed) {
+          results.push({ name, ok: false, error: decision.reason });
+          continue;
+        }
+      }
       try {
         await copyAppSkillIntoRepo(name, repoDir, category);
+        const uploadedSkillDir = path.join(
+          repoDir,
+          "skills",
+          category,
+          name,
+        );
+        // 本地目录内容不可信任其 owner 文件；每次都用实际 GitLab token 身份覆盖写入。
+        await writeSharedSkillOwner(uploadedSkillDir, identity.identity);
         // 优先：自管 skill 目录里已有的 .flowship-action.json（事实源）
         let meta: ExportedActionMeta | null = null;
         const appJsonPath = path.join(
@@ -1690,10 +1851,7 @@ const uploadSkillsInternal = async (
           };
           await fs.writeFile(
             path.join(
-              repoDir,
-              "skills",
-              category,
-              name,
+              uploadedSkillDir,
               ".flowship-action.json",
             ),
             `${JSON.stringify(payload, null, 2)}\n`,
@@ -2148,6 +2306,81 @@ const listSharedSkillDirs = async (
   return out;
 };
 
+export type TeamUploadPermission = {
+  category: string;
+  canUpdate: boolean;
+  author?: string;
+  reason?: string;
+};
+
+export type TeamUploadPermissionsResult =
+  | {
+      ok: true;
+      permissions: Record<string, TeamUploadPermission>;
+    }
+  | { ok: false; error: string; permissions: Record<string, never> };
+
+/**
+ * 上传弹窗使用的只读归属快照。不存在于 permissions 的名字是新上传；
+ * 已存在项必须明确 canUpdate=true 才能在 UI 解禁，服务端 POST 仍会再次校验。
+ */
+export const getTeamUploadPermissions =
+  async (): Promise<TeamUploadPermissionsResult> => {
+    const token = await readGitToken();
+    if (!token) {
+      return {
+        ok: false,
+        error: "未配置 GitLab Token",
+        permissions: {},
+      };
+    }
+    const cfg = await getTeamLibraryConfig();
+    const identity = await getGitLabUploadIdentity(cfg.repoUrl, token);
+    if (!identity.ok) {
+      return { ok: false, error: identity.error, permissions: {} };
+    }
+    const repoDir = teamLibraryRepoDir();
+    const [entries, authorIdentities] = await Promise.all([
+      listSharedSkillDirs(repoDir),
+      getTeamSkillAuthorIdentities(repoDir),
+    ]);
+    const counts = new Map<string, number>();
+    for (const entry of entries) {
+      counts.set(entry.name, (counts.get(entry.name) ?? 0) + 1);
+    }
+
+    const permissions: Record<string, TeamUploadPermission> = {};
+    for (const entry of entries) {
+      const relDir = `skills/${entry.category}/${entry.name}`;
+      const authorIdentity = authorIdentities[relDir];
+      const author = authorIdentity?.name.trim() || undefined;
+      if ((counts.get(entry.name) ?? 0) > 1) {
+        permissions[entry.name] = {
+          category: entry.category,
+          canUpdate: false,
+          ...(author ? { author } : {}),
+          reason: "库内存在多个同名分类，不能自动覆盖",
+        };
+        continue;
+      }
+      const owner = await readSharedSkillOwner(entry.absDir);
+      const decision = decideSharedSkillUpdate({
+        exists: true,
+        owner,
+        legacyAuthor: author,
+        legacyAuthorEmail: authorIdentity?.email,
+        currentUser: identity.identity,
+      });
+      permissions[entry.name] = {
+        category: entry.category,
+        canUpdate: decision.allowed,
+        ...(author ? { author } : {}),
+        ...(!decision.allowed ? { reason: decision.reason } : {}),
+      };
+    }
+    return { ok: true, permissions };
+  };
+
 export type DeleteFromTeamLibraryResult =
   | {
       ok: true;
@@ -2266,4 +2499,3 @@ export const deleteFromTeamLibrary = async (
   name: string,
 ): Promise<DeleteFromTeamLibraryResult> =>
   withTeamLibraryLock(() => deleteFromTeamLibraryInternal(name));
-

@@ -69,13 +69,16 @@ const ARTIFACT_REMARK_PLUGINS = [
 
 import { MarkdownLink } from "@/components/markdown-link";
 import {
+  MARKDOWN_PROSE_DOCUMENT,
   STREAMDOWN_CONTROLS,
   STREAMDOWN_REHYPE_PLUGINS,
 } from "@/components/markdown-text";
+import { EventStreamSearchBar } from "@/components/tasks/event-stream-search-bar";
 import { BatchPlanTable } from "@/components/tasks/batch-plan-table";
 import { ShareToGroupDialog } from "@/components/tasks/share-to-group-dialog";
 import { Button } from "@/components/ui/button";
 import { ChoiceButton } from "@/components/ui/choice-button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { MarkdownImage } from "@/components/ui/image-preview";
 import { LoadingState } from "@/components/ui/loading-state";
 import {
@@ -95,17 +98,38 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { cn } from "@/lib/utils";
-import { getIdeAnchorProps } from "@/lib/ide-open";
+import {
+  LocalFileLink,
+  LocalFilePathSegments,
+  useLocalFilePathLinker,
+  type LocalFilePathLinker,
+} from "@/components/ui/local-file-link";
+import { resolveLocalFileAbsolute } from "@/components/ui/local-file-preview";
 import { jumpRevisionHit } from "@/lib/revision-hit";
+import { normalizeArtifactSearchQuery } from "@/lib/artifact-search";
+import {
+  applyDomSearchHighlights,
+  clearDomSearchHighlights,
+  findRootDomSearchMatches,
+  scrollDomSearchMatchIntoView,
+  type DomSearchMatch,
+} from "@/lib/dom-text-search";
+import {
+  ARTIFACT_SEARCH_FOCUS_EVENT,
+  setActivePaneSearchScope,
+} from "@/lib/pane-search";
+import {
+  stabilizeOccurrenceIndex,
+  stepOccurrenceIndex,
+} from "@/lib/text-search-highlight";
 import {
   hasValidRepoPrefix,
   looksLikeArtifactRef,
   looksLikePath,
   parsePathSegments,
+  pathDisplayLabel,
   type ActionArtifactRef,
 } from "@/lib/path-utils";
-import { useJumpIde } from "@/hooks/use-settings";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
 import { remarkTrimAutolinkCjk } from "@/lib/remark-trim-autolink-cjk";
@@ -145,10 +169,8 @@ const DinoRunner = dynamic(
 );
 import { fetchActionDiff, fetchActionRevisions } from "@/lib/task-store";
 import {
-  JUMP_IDE_LABEL,
   type ActionRecord,
   type ArtifactRevision,
-  type JumpIde,
 } from "@/lib/types";
 
 // artifact-panel 的标题用「中文（英文）」复合形式
@@ -207,9 +229,8 @@ const writeSeenTs = (taskId: string, actionId: string, ts: number) => {
 // 返回体断言成 Streamdown Components——我们的 a/img/code 用宽松 props（string|Blob 等）、
 // 跟 Streamdown 严格签名对不上、运行时形状兼容
 const buildMarkdownComponents = (
-  baseDir: string | undefined,
+  linker: LocalFilePathLinker,
   repoShortNames: string[] | undefined,
-  ide: JumpIde,
   onArtifactRefClick: ((ref: ActionArtifactRef) => void) | undefined,
 ): Components => (({
   // markdown 原生链接：http(s) 新窗口 / 系统浏览器、相对路径降级纯文本（V0.7.7）
@@ -218,7 +239,7 @@ const buildMarkdownComponents = (
   img: MarkdownImage,
   // 只覆盖 **inline code**（走 Streamdown 的 inlineCode 槽、原来覆盖 code
   // 会连 fenced 一起接管、fenced 失去 Shiki 高亮）——fenced 交给 code 插件的 CodeBlock。
-  // inline code 里识别文件路径 / artifact 引用、转可点跳转（跳 IDE / 跳 action）
+  // inline code 里识别文件路径 / artifact 引用、转可点（预览 Sheet / 跳 action）
   inlineCode: ({
     children,
     ...rest
@@ -230,91 +251,55 @@ const buildMarkdownComponents = (
     const ref = looksLikeArtifactRef(text);
     if (ref && onArtifactRefClick) {
       return (
-        <button
-          type="button"
-          className="group cursor-pointer bg-transparent p-0 align-baseline"
-          onClick={() => onArtifactRefClick(ref)}
-          title={`跳到 ${ACTION_LABEL_SHORT[ref.type] ?? ref.type} action #${ref.n}`}
-        >
-          <span className="font-mono text-[0.85em] text-info underline-offset-2 group-hover:underline">
-            {text}
-          </span>
-        </button>
+        <Tooltip content={`跳到 ${ACTION_LABEL_SHORT[ref.type] ?? ref.type} action #${ref.n}`}>
+          <button
+            type="button"
+            className="group cursor-pointer bg-transparent p-0 align-baseline"
+            onClick={() => onArtifactRefClick(ref)}
+          >
+            <span className="font-mono text-[0.85em] text-info underline-offset-2 group-hover:underline">
+              {text}
+            </span>
+          </button>
+        </Tooltip>
       );
     }
     if (looksLikePath(text)) {
-      // 多仓 task：相对路径首段不是任务里的仓名 = agent 漏写仓名前缀、
-      // 拼出来的链接必 404（实测弹「路径不存在」）——降级纯文本、不给误导性链接
       const prefixOk = hasValidRepoPrefix(text, repoShortNames);
-      // V0.11.8：跳转属性统一走 getIdeAnchorProps（cursor/vscode = deep link、
-      // JetBrains 系 = onClick 后端拉起、不依赖 idea:// 协议）
-      const anchor = prefixOk ? getIdeAnchorProps(text, baseDir, ide) : null;
-      // 多段行号（`path:147-175、341-370、485-508`）→ 每段独立链接、点哪段跳哪段
-      //   首段渲染 `path:147-175`、后续段渲染 `、341-370`（sep 原样保留、视觉跟原文一致）
-      //   单段 / 无行号 / 拼不出链接（anchor null）→ 走下面原有的整条单链接 / 纯文本分支
+      const resolved = prefixOk ? resolveLocalFileAbsolute(text, linker.baseDir) : null;
       const parsed = parsePathSegments(text);
-      if (anchor && parsed && parsed.segments.length > 1) {
+      if (resolved && parsed && parsed.segments.length > 1) {
         return (
-          <span className="font-mono text-[0.85em]">
-            {parsed.segments.map((seg, i) => {
-              // 每段单独拼 `path:起始行` 生成各自的跳转目标
-              const segAnchor = getIdeAnchorProps(
-                `${parsed.path}:${seg.line}`,
-                baseDir,
-                ide,
-              );
-              return (
-                <span key={`${seg.line}-${i}`}>
-                  {seg.sep}
-                  <a
-                    {...(segAnchor ?? { href: undefined })}
-                    className="no-underline"
-                    title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${parsed.path}:${seg.line}`}
-                  >
-                    <span className="text-info underline-offset-2 hover:underline">
-                      {i === 0 ? `${parsed.path}:${seg.text}` : seg.text}
-                    </span>
-                  </a>
-                </span>
-              );
-            })}
-          </span>
+          <LocalFilePathSegments
+            linker={linker}
+            parsedPath={parsed.path}
+            segments={parsed.segments}
+          />
         );
       }
-      const inner = (
-        <span
-          className={cn(
-            "font-mono text-[0.85em]",
-            anchor
-              ? "text-info underline-offset-2 group-hover:underline"
-              : "text-foreground",
-          )}
-        >
-          {text}
-        </span>
-      );
-      if (!anchor) {
+      if (!resolved) {
         return (
-          <span
-            title={
+          <Tooltip
+            content={
               prefixOk
                 ? text
-                : `${text}\n（路径缺少仓名前缀、定位不到文件、无法跳转）`
+                : `${text}\n（路径缺少仓名前缀、定位不到文件、无法预览）`
             }
-            {...rest}
           >
-            {inner}
-          </span>
+            <span {...rest}>
+              <span className="font-mono text-[0.85em] text-foreground">{text}</span>
+            </span>
+          </Tooltip>
         );
       }
       return (
-        <a
-          {...anchor}
-          className="group no-underline"
-          title={`点击在 ${JUMP_IDE_LABEL[ide]} 中打开：${text}`}
+        <LocalFileLink
+          linker={linker}
+          path={text}
+          linkClassName="font-mono text-[0.85em] text-info underline-offset-2 hover:underline"
         >
-          {inner}
-        </a>
+          {pathDisplayLabel(resolved.absolute)}
+        </LocalFileLink>
       );
     }
     return <code {...rest}>{children}</code>;
@@ -373,12 +358,10 @@ export const ArtifactPanel = ({
   canShareToGroup = false,
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
-  // 代码跳转 IDE 配置（设置页可切 Cursor / IDEA）
-  const jumpIde = useJumpIde();
+  const pathLinker = useLocalFilePathLinker(baseDir);
   const markdownComponents = useMemo(
-    () =>
-      buildMarkdownComponents(baseDir, repoShortNames, jumpIde, onArtifactRefClick),
-    [baseDir, repoShortNames, jumpIde, onArtifactRefClick],
+    () => buildMarkdownComponents(pathLinker, repoShortNames, onArtifactRefClick),
+    [pathLinker, repoShortNames, onArtifactRefClick],
   );
   // 分享到需求群（确认 dialog + API；日常任务 canShareToGroup=false 不渲按钮）
   // guideDialog = bot 不在群时的手动添加引导（叠在确认 dialog 之上、加完可原地重试）
@@ -386,6 +369,43 @@ export const ArtifactPanel = ({
   const [shareOpen, setShareOpen] = useState(false); // 分享确认 dialog 开关
   const [sharing, setSharing] = useState(false); // 整份产物分享飞行中、防双击
   const [sharingSelection, setSharingSelection] = useState(false); // 选中段分享飞行中
+
+  // 产物栏内联搜索
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHitIndex, setSearchHitIndex] = useState(-1);
+  const [searchHitCount, setSearchHitCount] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchMatchesRef = useRef<DomSearchMatch[]>([]);
+  const lastSearchQueryRef = useRef("");
+
+  const activateArtifactSearch = useCallback(() => {
+    setActivePaneSearchScope("artifact");
+    setSearchActive(true);
+    searchInputRef.current?.focus();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    });
+  }, []);
+
+  const closeArtifactSearch = useCallback(() => {
+    setSearchActive(false);
+    setSearchQuery("");
+    setSearchHitIndex(-1);
+    setSearchHitCount(0);
+  }, []);
+
+  useEffect(() => {
+    const onFocusSearch = () => activateArtifactSearch();
+    window.addEventListener(ARTIFACT_SEARCH_FOCUS_EVENT, onFocusSearch);
+    return () =>
+      window.removeEventListener(ARTIFACT_SEARCH_FOCUS_EVENT, onFocusSearch);
+  }, [activateArtifactSearch]);
+
+  useEffect(() => {
+    closeArtifactSearch();
+    lastSearchQueryRef.current = "";
+  }, [action.id, closeArtifactSearch]);
 
   const [revisionOn, setRevisionOn] = useState(false); // 修订开关：开则正文变内联修订视图
   // 产物 / 游戏视图：推进中无产物时自动进游戏，也可随时手动切换摸鱼
@@ -731,6 +751,112 @@ export const ArtifactPanel = ({
     </div>
   ) : null;
 
+  const artifactBody = currentArtifact?.content ?? "";
+  const isSearchFiltering =
+    searchActive &&
+    !revisionOn &&
+    normalizeArtifactSearchQuery(searchQuery).length > 0;
+
+  useEffect(() => {
+    if (!isSearchFiltering) {
+      setSearchHitIndex(-1);
+      setSearchHitCount(0);
+      return;
+    }
+    setSearchHitIndex((prev) =>
+      stabilizeOccurrenceIndex(prev, searchHitCount),
+    );
+  }, [isSearchFiltering, searchHitCount]);
+
+  const goToSearchHit = useCallback((index: number) => {
+    if (index < 0 || index >= searchHitCount) return;
+    setSearchHitIndex(index);
+  }, [searchHitCount]);
+
+  const goToNextSearchHit = useCallback(() => {
+    const next = stepOccurrenceIndex(
+      searchHitIndex,
+      searchHitCount,
+      "next",
+    );
+    if (next >= 0) goToSearchHit(next);
+  }, [goToSearchHit, searchHitCount, searchHitIndex]);
+
+  const goToPrevSearchHit = useCallback(() => {
+    const prev = stepOccurrenceIndex(
+      searchHitIndex,
+      searchHitCount,
+      "prev",
+    );
+    if (prev >= 0) goToSearchHit(prev);
+  }, [goToSearchHit, searchHitCount, searchHitIndex]);
+
+  useEffect(() => {
+    if (!isSearchFiltering || searchHitCount === 0) return;
+    if (lastSearchQueryRef.current !== searchQuery) {
+      lastSearchQueryRef.current = searchQuery;
+      goToSearchHit(0);
+    }
+  }, [goToSearchHit, isSearchFiltering, searchHitCount, searchQuery]);
+
+  useEffect(() => {
+    const root = contentRef.current;
+    if (!root || !isSearchFiltering || panelView !== "artifact") {
+      searchMatchesRef.current = [];
+      clearDomSearchHighlights(
+        "flowship-artifact-search",
+        "flowship-artifact-search-active",
+      );
+      return;
+    }
+
+    let frame = 0;
+    const refresh = () => {
+      frame = 0;
+      const matches = findRootDomSearchMatches(root, searchQuery);
+      searchMatchesRef.current = matches;
+      setSearchHitCount((count) =>
+        count === matches.length ? count : matches.length,
+      );
+      applyDomSearchHighlights(
+        matches,
+        "flowship-artifact-search",
+        "flowship-artifact-search-active",
+        (match) => match.ownerOccurrenceIndex === searchHitIndex,
+      );
+    };
+    const scheduleRefresh = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(refresh);
+    };
+    scheduleRefresh();
+    const observer = new MutationObserver(scheduleRefresh);
+    observer.observe(root, { childList: true, subtree: true, characterData: true });
+    return () => {
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+      clearDomSearchHighlights(
+        "flowship-artifact-search",
+        "flowship-artifact-search-active",
+      );
+    };
+  }, [
+    artifactBody,
+    contentRef,
+    isSearchFiltering,
+    panelView,
+    searchHitIndex,
+    searchQuery,
+  ]);
+
+  useEffect(() => {
+    if (!isSearchFiltering || searchHitIndex < 0) return;
+    const frame = requestAnimationFrame(() => {
+      scrollDomSearchMatchIntoView(searchMatchesRef.current[searchHitIndex]);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isSearchFiltering, searchHitIndex]);
+
   // ---- 渲染 ----
   // 整页 loading：仅「产物」视图且尚无内容、且不是推进中（推进中默认游戏，不挡开玩）
   if (
@@ -787,57 +913,79 @@ export const ArtifactPanel = ({
   };
 
   return (
-    <div className="flex h-full flex-col">
-      {/* toolbar：左视图切换 / 右修订（跟修订同栏、切换别抢戏） */}
+    <div
+      className="flex h-full flex-col"
+      data-pane-search="artifact"
+      onPointerDown={() => setActivePaneSearchScope("artifact")}
+    >
+      {/* toolbar：左视图切换 / 右修订 + 搜索（跟修订同栏、切换别抢戏） */}
       <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-4 text-xs">
-        <div className="flex items-center gap-0.5">
-          <ChoiceButton
-            shape="tab"
-            selected={panelView === "artifact"}
-            onClick={() => setPanelView("artifact")}
-            title="查看产物"
-            className="inline-flex items-center gap-1"
-          >
-            <FileText className="size-3.5" />
-            产物
-          </ChoiceButton>
-          <ChoiceButton
-            shape="tab"
-            selected={panelView === "game"}
-            onClick={() => setPanelView("game")}
-            title="恐龙快跑"
-            className="inline-flex items-center gap-1"
-          >
-            <Gamepad2 className="size-3.5" />
-            等待
-          </ChoiceButton>
+        <div className="flex min-w-0 flex-1 items-center gap-0.5">
+          <Tooltip content="查看产物">
+            <ChoiceButton
+              shape="tab"
+              selected={panelView === "artifact"}
+              onClick={() => setPanelView("artifact")}
+              className="inline-flex items-center gap-1"
+            >
+              <FileText className="size-3.5" />
+              产物
+            </ChoiceButton>
+          </Tooltip>
+          <Tooltip content="恐龙快跑">
+            <ChoiceButton
+              shape="tab"
+              selected={panelView === "game"}
+              onClick={() => setPanelView("game")}
+              className="inline-flex items-center gap-1"
+            >
+              <Gamepad2 className="size-3.5" />
+              等待
+            </ChoiceButton>
+          </Tooltip>
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          {!showGame && !revisionOn && currentArtifact && (
+            <EventStreamSearchBar
+              active={searchActive}
+              query={searchQuery}
+              hitIndex={searchHitIndex}
+              hitCount={searchHitCount}
+              onActivate={activateArtifactSearch}
+              onQueryChange={setSearchQuery}
+              onClose={closeArtifactSearch}
+              onPrev={goToPrevSearchHit}
+              onNext={goToNextSearchHit}
+              inputRef={searchInputRef}
+              placeholder="搜索产物…"
+              ariaLabel="搜索产物"
+              className="mr-1"
+            />
+          )}
           {/* 有飞书链接 + 有产物正文才显示；日常轻量任务隐藏 */}
           {canShareToGroup && currentArtifact && (
-            <ChoiceButton
-              shape="tab"
-              selected={false}
-              disabled={sharing}
-              onClick={() => setShareOpen(true)}
-              title="分享到需求群"
-              className="inline-flex items-center gap-1"
-            >
-              {sharing ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Share2 className="size-3.5" />
-              )}
-              分享到群
-            </ChoiceButton>
+            <Tooltip content="分享到需求群">
+              <span className="inline-flex">
+                <ChoiceButton
+                  shape="tab"
+                  selected={false}
+                  disabled={sharing}
+                  onClick={() => setShareOpen(true)}
+                  className="inline-flex items-center gap-1"
+                >
+                  {sharing ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Share2 className="size-3.5" />
+                  )}
+                  分享到群
+                </ChoiceButton>
+              </span>
+            </Tooltip>
           )}
-          <ChoiceButton
-            shape="tab"
-            selected={revisionOn}
-            onClick={() => handleRevisionToggle(!revisionOn)}
-            disabled={!canRevise}
-            title={
+          <Tooltip
+            content={
               canRevise
                 ? hasUnseen
                   ? "AI 有新的修订、打开看改了哪"
@@ -846,16 +994,25 @@ export const ArtifactPanel = ({
                     : "打开修订视图（Track Changes）"
                 : "该 action 还没有修订记录、用户「再聊聊」一次后才会有"
             }
-            className="relative"
           >
-            修订
-            {hasUnseen && (
-              <span
-                aria-hidden
-                className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-destructive ring-2 ring-background"
-              />
-            )}
-          </ChoiceButton>
+            <span className="inline-flex">
+              <ChoiceButton
+                shape="tab"
+                selected={revisionOn}
+                onClick={() => handleRevisionToggle(!revisionOn)}
+                disabled={!canRevise}
+                className="relative"
+              >
+                修订
+                {hasUnseen && (
+                  <span
+                    aria-hidden
+                    className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-destructive ring-2 ring-background"
+                  />
+                )}
+              </ChoiceButton>
+            </span>
+          </Tooltip>
 
           {revisionOn && canRevise && (
             <>
@@ -894,35 +1051,40 @@ export const ArtifactPanel = ({
                 </SelectContent>
               </Select>
               {revisionStats && (
-                <span
-                  className="ml-1 tabular-nums text-[11px] text-muted-foreground"
-                  title="词级增删统计"
-                >
-                  <span className="text-success">+{revisionStats.ins}</span>{" "}
-                  <span className="text-destructive">−{revisionStats.del}</span>
-                </span>
+                <Tooltip content="词级增删统计">
+                  <span className="ml-1 tabular-nums text-[11px] text-muted-foreground">
+                    <span className="text-success">+{revisionStats.ins}</span>{" "}
+                    <span className="text-destructive">−{revisionStats.del}</span>
+                  </span>
+                </Tooltip>
               )}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                className="ml-0.5"
-                title="上一处改动"
-                disabled={!diffData || !!diffError}
-                onClick={() => handleJumpHit("prev")}
-              >
-                <ChevronUp />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                title="下一处改动"
-                disabled={!diffData || !!diffError}
-                onClick={() => handleJumpHit("next")}
-              >
-                <ChevronDown />
-              </Button>
+              <Tooltip content="上一处改动">
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="ml-0.5"
+                    disabled={!diffData || !!diffError}
+                    onClick={() => handleJumpHit("prev")}
+                  >
+                    <ChevronUp />
+                  </Button>
+                </span>
+              </Tooltip>
+              <Tooltip content="下一处改动">
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    disabled={!diffData || !!diffError}
+                    onClick={() => handleJumpHit("next")}
+                  >
+                    <ChevronDown />
+                  </Button>
+                </span>
+              </Tooltip>
             </>
           )}
         </div>
@@ -1076,7 +1238,7 @@ export const ArtifactPanel = ({
                   {/* max-w-none：覆盖 Tailwind prose 默认的 max-width(65ch) 上限——
                       让正文随左栏拖宽撑满容器、不再卡固定字宽导致右侧大片留白
                       （用户拖中间分隔条把左栏拉宽时、md 应跟着铺满、表格 / 代码块也能多显示） */}
-                  <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:scroll-mt-4 prose-code:before:content-none prose-code:after:content-none">
+                  <div className={MARKDOWN_PROSE_DOCUMENT}>
                     <Streamdown
                       mode="static"
                       shikiTheme={ARTIFACT_SHIKI_THEME}

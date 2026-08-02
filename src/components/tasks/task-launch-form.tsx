@@ -22,6 +22,7 @@ import { ChevronDown, ChevronUp, Plug, Rocket } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { Combobox } from "@/components/ui/combobox";
@@ -408,12 +409,11 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
               const entry = branchMap[p];
               return (
                 <div key={p} className="flex items-center gap-2">
-                  <span
-                    className="w-28 shrink-0 truncate text-sm text-muted-foreground"
-                    title={repo?.name ?? p}
-                  >
-                    {repo?.name ?? p}
-                  </span>
+                  <Tooltip content={repo?.name ?? p}>
+                    <span className="w-28 shrink-0 truncate text-sm text-muted-foreground">
+                      {repo?.name ?? p}
+                    </span>
+                  </Tooltip>
                   <Combobox
                     value={featureBranches[p] ?? ""}
                     onValueChange={(v) =>

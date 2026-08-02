@@ -15,6 +15,8 @@ import {
   looksLikePath,
   parsePathSegments,
   pathBasename,
+  pathDisplayLabel,
+  shortenHomePathDisplay,
   shellQuotePath,
 } from "@/lib/path-utils";
 
@@ -310,12 +312,23 @@ describe("looksLikePath", () => {
     ).toBe(true);
   });
 
-  it("不像路径的不命中：无 /、路径含空格、最后一段无扩展名", () => {
+  it("不像路径的不命中：无 /、相对路径含空格、最后一段无扩展名", () => {
     expect(looksLikePath("foo.ts")).toBe(false);
     expect(looksLikePath("a b/c.ts")).toBe(false);
     expect(looksLikePath("src/foo")).toBe(false);
-    // 空格在路径部分（不是行号后缀）→ 仍然拒绝
+    // 空格在路径部分（不是行号后缀）→ 相对路径仍然拒绝
     expect(looksLikePath("const x = foo/bar.map()")).toBe(false);
+  });
+
+  it("绝对路径含空格仍命中（mac Application Support / 带空格的 Windows 绝对路径）", () => {
+    expect(
+      looksLikePath(
+        "/Users/me/Library/Application Support/fe-ai-flow/data/worktrees/t_1/crm-web/wk-doc/requirements/REQ-1/repo-completion-report.md",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikePath("C:/Users/me/Application Data/foo/bar.ts"),
+    ).toBe(true);
   });
 
   it("Windows 路径命中：盘符绝对 / 反斜杠相对 / 带行号", () => {
@@ -335,6 +348,58 @@ describe("pathBasename", () => {
     expect(pathBasename("/a/b/")).toBe("b");
     expect(pathBasename("abc.txt")).toBe("abc.txt");
     expect(pathBasename("D:\\IdeaProjects\\foo\\Bar.java")).toBe("Bar.java");
+  });
+});
+
+describe("pathDisplayLabel", () => {
+  it("唯一文件名 → 仅 basename", () => {
+    expect(pathDisplayLabel("/proj/src/components/LeadForm.tsx")).toBe(
+      "LeadForm.tsx",
+    );
+  });
+
+  it("泛用 index → parent/basename", () => {
+    expect(
+      pathDisplayLabel("/proj/src/pages/LeadDetail/index.tsx"),
+    ).toBe("LeadDetail/index.tsx");
+  });
+
+  it("泛用 page.tsx → parent/page.tsx", () => {
+    expect(pathDisplayLabel("/proj/app/routes/page.tsx")).toBe("routes/page.tsx");
+  });
+
+  it("非泛用嵌套路径 → 仍仅 basename", () => {
+    expect(pathDisplayLabel("/proj/src/utils/formatDate.ts")).toBe("formatDate.ts");
+  });
+
+  it("Windows 反斜杠路径", () => {
+    expect(pathDisplayLabel("D:\\a\\b\\index.tsx")).toBe("b/index.tsx");
+  });
+
+  it("无父段的 bare index.tsx → index.tsx", () => {
+    expect(pathDisplayLabel("index.tsx")).toBe("index.tsx");
+  });
+});
+
+describe("shortenHomePathDisplay", () => {
+  it("mac home → ~", () => {
+    expect(shortenHomePathDisplay("/Users/me/work/repo/a.md")).toBe(
+      "~/work/repo/a.md",
+    );
+  });
+
+  it("linux home → ~", () => {
+    expect(shortenHomePathDisplay("/home/me/a/b.ts")).toBe("~/a/b.ts");
+  });
+
+  it("Windows Users → ~", () => {
+    expect(shortenHomePathDisplay("C:\\Users\\me\\Docs\\x.md")).toBe(
+      "~/Docs/x.md",
+    );
+  });
+
+  it("非 home 原样（正斜杠归一）", () => {
+    expect(shortenHomePathDisplay("/tmp/x.md")).toBe("/tmp/x.md");
   });
 });
 

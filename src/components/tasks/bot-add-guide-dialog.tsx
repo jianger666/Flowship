@@ -12,6 +12,7 @@ import { Copy, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -73,12 +74,11 @@ export const BotAddGuideDialog = ({
         </DialogHeader>
 
         <div className="flex items-center gap-2 rounded-md border bg-muted/40 p-2">
-          <span
-            className="min-w-0 flex-1 truncate font-mono text-sm"
-            title={botLabel}
-          >
-            {botLabel}
-          </span>
+          <Tooltip content={botLabel}>
+            <span className="min-w-0 flex-1 truncate font-mono text-sm">
+              {botLabel}
+            </span>
+          </Tooltip>
           <Button type="button" variant="outline" size="sm" onClick={handleCopy}>
             <Copy className="size-3.5" />
             复制名称

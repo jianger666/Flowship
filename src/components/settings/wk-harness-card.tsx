@@ -18,8 +18,10 @@ import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { LoadingState } from "@/components/ui/loading-state";
+import { PasswordInput } from "@/components/ui/password-input";
 import { SettingRow } from "@/components/ui/setting-row";
 import { useWkConfig } from "@/hooks/use-wk-config";
 import { pickNativePaths } from "@/lib/native-picker";
@@ -52,16 +54,16 @@ export const WkHarnessSection = () => {
   );
   // 探测飞行中
   const [probing, setProbing] = useState(false);
-
   const savedHubUrl = saved.hubBaseUrl;
 
-  const runProbe = useCallback(async (baseUrl: string) => {
+  const runProbe = useCallback(async (baseUrl: string, token?: string) => {
     setProbing(true);
     try {
       const res = await fetch("/api/system/wk-config/probe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseUrl }),
+        // 有草稿时测试草稿；没草稿时服务端会用 ~/.wk/config.yaml 里的已保存 Token。
+        body: JSON.stringify({ baseUrl, ...(token ? { token } : {}) }),
       });
       const data = (await res.json().catch(() => ({}))) as Partial<
         WkHubProbeResult & { message: string }
@@ -93,7 +95,7 @@ export const WkHarnessSection = () => {
       return;
     }
     void runProbe(savedHubUrl);
-  }, [savedHubUrl, runProbe]);
+  }, [savedHubUrl, saved.hubToken, runProbe]);
 
   const handlePickDocRepo = async () => {
     setPicking(true);
@@ -124,27 +126,30 @@ export const WkHarnessSection = () => {
 
   const handleHubCommit = () => {
     const value = config.hubBaseUrl.trim();
-    // 探不通也还能用（内网 / 没起服务），但格式不对一定是填错——就地打回、不落盘。
-    // 草稿必须退回落盘真值（同产出目录那条）：留着非法草稿的话，之后另一格落盘会把
-    // 「当前草稿 + 这次改的字段」整份存下去、非法地址反而被带进文件
     if (value && !normalizeHubUrl(value)) {
       toast.error("Delivery Hub 地址格式不对，要形如 http://主机:端口");
       update("hubBaseUrl", saved.hubBaseUrl);
-      // 输入框已经换回落盘地址：刚才对着非法草稿点过「测试」的话，结论停在 invalid-url、
-      // 说的不是眼前这个地址。savedHubUrl 没变、自动探测那个 effect 不会重跑，这里补一次
-      if (saved.hubBaseUrl) void runProbe(saved.hubBaseUrl);
-      else setProbe(null);
       return;
     }
     if (value === saved.hubBaseUrl) return;
     void save({ ...config, hubBaseUrl: value });
   };
 
+  const handleTokenCommit = () => {
+    const value = config.hubToken.trim();
+    if (value === saved.hubToken) return;
+    void save({ ...config, hubToken: value });
+  };
+
+  const handleTokenClear = async () => {
+    await save({ ...config, hubToken: "" });
+  };
+
   if (!loaded) {
     return <LoadingState variant="inline" />;
   }
 
-  // 探测 / 「测试」按钮跟着草稿走：刚敲完地址还没失焦也能点
+  // 探测 / 「测试连接」按钮跟着草稿走：地址和 Token 都没失焦也能先一起验证
   const draftHubUrl = config.hubBaseUrl.trim();
   // 只显示「探的就是眼前这个地址」的结论——地址一改，旧结论先收起来，别指着 A 的状态说 B
   const shownProbe = probe?.url === draftHubUrl ? probe : null;
@@ -154,9 +159,11 @@ export const WkHarnessSection = () => {
       <div>
         <div className="text-sm font-medium">团队 wk 流程</div>
         {/* 真实绝对路径挂 title：直接铺开会把这行撑成两行 */}
-        <p className="text-xs text-muted-foreground" title={configPath}>
-          写入 ~/.wk/config.yaml、和团队 wk:* 指令共用
-        </p>
+        <Tooltip content={configPath}>
+          <p className="text-xs text-muted-foreground">
+            写入 ~/.wk/config.yaml、和团队 wk:* 指令共用
+          </p>
+        </Tooltip>
       </div>
 
       <div className="divide-y">
@@ -173,16 +180,19 @@ export const WkHarnessSection = () => {
                 placeholder="/Users/you/wk-doc"
                 className="font-mono text-xs"
               />
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                disabled={picking}
-                title="选择目录"
-                onClick={() => void handlePickDocRepo()}
-              >
-                {picking ? <Loader2 className="animate-spin" /> : <FolderOpen />}
-              </Button>
+              <Tooltip content="选择目录">
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    disabled={picking}
+                    onClick={() => void handlePickDocRepo()}
+                  >
+                    {picking ? <Loader2 className="animate-spin" /> : <FolderOpen />}
+                  </Button>
+                </span>
+              </Tooltip>
             </div>
           }
         />
@@ -190,49 +200,102 @@ export const WkHarnessSection = () => {
         <SettingRow
           stacked
           label="Delivery Hub"
-          hint="共享产物存放地址"
-          labelExtra={
-            <div className="flex min-w-0 items-center gap-2">
-              {probing ? (
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <Loader2 className="size-3 animate-spin" />
-                  探测中…
-                </span>
-              ) : shownProbe ? (
-                <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-                  <span
-                    className={cn(
-                      "size-1.5 shrink-0 rounded-full",
-                      PROBE_DOT[shownProbe.status],
-                    )}
-                    aria-hidden
-                  />
-                  <span className="min-w-0 truncate" title={shownProbe.message}>
-                    {shownProbe.message}
-                  </span>
-                </span>
-              ) : null}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="shrink-0"
-                disabled={probing || !draftHubUrl}
-                onClick={() => void runProbe(draftHubUrl)}
-              >
-                <RefreshCw />
-                测试
-              </Button>
-            </div>
-          }
+          hint="共享产物服务地址与访问凭证"
           control={
-            <Input
-              value={config.hubBaseUrl}
-              onChange={(e) => update("hubBaseUrl", e.target.value)}
-              onBlur={handleHubCommit}
-              placeholder={DEFAULT_HUB_BASE_URL}
-              className="font-mono text-xs"
-            />
+            <div className="overflow-hidden rounded-xl border bg-muted/20">
+              <div className="space-y-4 p-4">
+                <div className="space-y-1.5">
+                  <div className="text-xs font-medium text-muted-foreground">
+                    服务地址
+                  </div>
+                  <Input
+                    value={config.hubBaseUrl}
+                    onChange={(e) => {
+                      update("hubBaseUrl", e.target.value);
+                      setProbe(null);
+                    }}
+                    onBlur={handleHubCommit}
+                    placeholder={DEFAULT_HUB_BASE_URL}
+                    className="bg-background font-mono text-xs"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="text-xs font-medium text-muted-foreground">
+                    访问 Token
+                  </div>
+                  <PasswordInput
+                    value={config.hubToken}
+                    onChange={(e) => {
+                      update("hubToken", e.target.value);
+                      // Token 变了，旧的鉴权探测结果立即失效，不能继续显示“已连上”。
+                      setProbe(null);
+                    }}
+                    onBlur={handleTokenCommit}
+                    placeholder="wkdh_..."
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    className="bg-background font-mono text-xs"
+                    wrapperClassName="min-w-0"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t bg-background/60 px-4 py-3">
+                <div className="min-w-0">
+                  {probing ? (
+                    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <Loader2 className="size-3 animate-spin" />
+                      正在验证地址和 Token…
+                    </span>
+                  ) : shownProbe ? (
+                    <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                      <span
+                        className={cn(
+                          "size-1.5 shrink-0 rounded-full",
+                          PROBE_DOT[shownProbe.status],
+                        )}
+                        aria-hidden
+                      />
+                      <Tooltip content={shownProbe.message}>
+                        <span className="min-w-0 truncate">
+                          {shownProbe.message}
+                        </span>
+                      </Tooltip>
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      测试会同时验证服务地址和 Token
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {config.hubTokenConfigured ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void handleTokenClear()}
+                    >
+                      清除 Token
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={probing || !draftHubUrl}
+                    onClick={() =>
+                      void runProbe(draftHubUrl, config.hubToken.trim() || undefined)
+                    }
+                  >
+                    <RefreshCw />
+                    测试连接
+                  </Button>
+                </div>
+              </div>
+            </div>
           }
         />
       </div>

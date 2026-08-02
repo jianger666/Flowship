@@ -18,6 +18,7 @@ import type { CustomActionDef } from "@/lib/types";
 import {
   defaultUploadCategory,
   UploadSkillsDialog,
+  type TeamUploadPermission,
   type UploadActionRow,
   type UploadDialogMode,
 } from "./upload-dialog";
@@ -53,6 +54,10 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
   const [teamSkillCategories, setTeamSkillCategories] = useState<
     Record<string, string[]>
   >({});
+  // 已存在共享项的更新权限（服务端按 GitLab token 身份计算；缺失时 fail closed）
+  const [teamUploadPermissions, setTeamUploadPermissions] = useState<
+    Record<string, TeamUploadPermission>
+  >({});
   // 敏感扫描命中（API 透传、dialog 展示明细 + 强制勾选）
   const [sensitiveHits, setSensitiveHits] = useState<
     Array<{ file: string; line: number; kind: string; snippet: string }>
@@ -60,10 +65,22 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
 
   const loadDialogData = useCallback(async () => {
     try {
-      const skillsRes = await fetch("/api/skills", { cache: "no-store" });
+      const [skillsRes, permissionsRes] = await Promise.all([
+        fetch("/api/skills", { cache: "no-store" }),
+        fetch("/api/team-library/upload", { cache: "no-store" }),
+      ]);
       if (!skillsRes.ok) {
         toast.error("读取 skills 失败");
         return;
+      }
+      if (permissionsRes.ok) {
+        const permissionsData = (await permissionsRes.json()) as {
+          permissions?: Record<string, TeamUploadPermission>;
+        };
+        setTeamUploadPermissions(permissionsData.permissions ?? {});
+      } else {
+        // 新名字仍可上传；已存在名字在 dialog 内因权限缺失保持置灰。
+        setTeamUploadPermissions({});
       }
       const data = (await skillsRes.json()) as { skills?: SkillRow[] };
       const all = data.skills ?? [];
@@ -237,6 +254,7 @@ export const UploadToTeamLibraryButton = ({ mode, onUploaded }: Props) => {
         appSkills={appSkills}
         actions={actions}
         teamSkillCategories={teamSkillCategories}
+        teamUploadPermissions={teamUploadPermissions}
         defaultCategory={defaultCategory}
         sensitiveHits={sensitiveHits}
         onClose={() => {

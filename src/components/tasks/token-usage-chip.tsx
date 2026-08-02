@@ -40,9 +40,9 @@ interface TokenUsageChipProps {
  */
 const DetailRow = ({ label, value }: { label: string; value: string }) => (
   <div className="flex items-baseline justify-between gap-4">
-    <span className="min-w-0 truncate text-muted-foreground" title={label}>
-      {label}
-    </span>
+    <Tooltip content={label}>
+      <span className="min-w-0 truncate text-muted-foreground">{label}</span>
+    </Tooltip>
     <span className="shrink-0 font-mono">{value}</span>
   </div>
 );

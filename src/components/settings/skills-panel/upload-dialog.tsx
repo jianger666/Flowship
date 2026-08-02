@@ -35,19 +35,23 @@ import {
   type SkillRow,
   type UploadCategory,
 } from "./types";
+import {
+  preferredExistingCategory,
+  resolveUploadSkillNames,
+  uploadOwnershipDisabledReason,
+  uploadNameStatus,
+  type UploadActionRow,
+  type UploadDialogMode,
+  type TeamUploadPermission,
+} from "./upload-dialog-logic";
 
 type Step = "pick" | "category";
 
-export type UploadDialogMode = "skill" | "action";
-
-/** action 模式行（自建 app-skill；不可传的带 disabledReason） */
-export type UploadActionRow = {
-  id: string;
-  label: string;
-  skill: string;
-  /** null = 可勾选；非空 = 置灰原因 */
-  disabledReason: string | null;
-};
+export type {
+  TeamUploadPermission,
+  UploadActionRow,
+  UploadDialogMode,
+} from "./upload-dialog-logic";
 
 type Props = {
   open: boolean;
@@ -62,6 +66,8 @@ type Props = {
    * 仅 shared 组沉淀，不含 knowledge。
    */
   teamSkillCategories: Record<string, string[]>;
+  /** 服务端按 GitLab token 身份计算；已存在项只有 canUpdate=true 才可选。 */
+  teamUploadPermissions: Record<string, TeamUploadPermission>;
   /** 默认分类：settings.userRole；未配 → common */
   defaultCategory: UploadCategory;
   /**
@@ -79,20 +85,6 @@ type Props = {
   onUpload: (skillNames: string[], category: string, force?: boolean) => void;
 };
 
-/** 相对目标分类：覆盖 / 跨分类冲突 / 无 */
-const uploadNameStatus = (
-  name: string,
-  targetCategory: string,
-  teamSkillCategories: Record<string, string[]>,
-): "none" | "overwrite" | { conflict: string } => {
-  const cats = teamSkillCategories[name] ?? [];
-  if (cats.length === 0) return "none";
-  const other = cats.find((c) => c !== targetCategory);
-  if (other) return { conflict: other };
-  if (cats.includes(targetCategory)) return "overwrite";
-  return "none";
-};
-
 export const UploadSkillsDialog = ({
   open,
   busy,
@@ -100,6 +92,7 @@ export const UploadSkillsDialog = ({
   appSkills = [],
   actions = [],
   teamSkillCategories,
+  teamUploadPermissions,
   defaultCategory,
   sensitiveHits = [],
   onClose,
@@ -137,23 +130,25 @@ export const UploadSkillsDialog = ({
       return next;
     });
 
-  // 统一展开成要上传的 skill 名
+  // 统一展开成要上传的 skill 名。这里不能按当前默认分类过滤，否则已经上传到
+  // 其它分类的 action 会在第一步永远无法选中，也就失去更新入口。
   const resolvedSkillNames = useMemo(() => {
-    if (mode === "skill") {
-      return [...picked].filter((name) => {
-        const st = uploadNameStatus(name, category, teamSkillCategories);
-        return typeof st !== "object";
-      });
-    }
-    const names = new Set<string>();
-    for (const a of actions) {
-      if (!picked.has(a.id) || a.disabledReason || !a.skill) continue;
-      const st = uploadNameStatus(a.skill, category, teamSkillCategories);
-      if (typeof st === "object") continue;
-      names.add(a.skill);
-    }
-    return [...names];
-  }, [mode, picked, actions, category, teamSkillCategories]);
+    return resolveUploadSkillNames({
+      mode,
+      picked,
+      appSkills,
+      actions,
+    });
+  }, [mode, picked, appSkills, actions]);
+
+  const preferredCategory = useMemo(
+    () =>
+      preferredExistingCategory(
+        resolvedSkillNames,
+        teamSkillCategories,
+      ),
+    [resolvedSkillNames, teamSkillCategories],
+  );
 
   // 分类步：已勾但相对当前分类冲突的项（禁用上传）
   const categoryStepConflicts = useMemo(() => {
@@ -186,18 +181,30 @@ export const UploadSkillsDialog = ({
     mode === "skill" ? "上传我的 skill 到共享库" : "上传我的 action 到共享库";
 
   const renderNameBadge = (name: string) => {
+    const ownershipReason = uploadOwnershipDisabledReason(
+      name,
+      teamSkillCategories,
+      teamUploadPermissions,
+    );
+    if (ownershipReason) {
+      return (
+        <Badge variant="outline" size="xs">
+          不可覆盖
+        </Badge>
+      );
+    }
     const st = uploadNameStatus(name, category, teamSkillCategories);
     if (st === "overwrite") {
       return (
         <Badge variant="outline" size="xs">
-          将覆盖
+          将更新
         </Badge>
       );
     }
     if (typeof st === "object") {
       return (
         <Badge variant="outline" size="xs">
-          与库内同名冲突（{labelUploadCategory(st.conflict)} 分类）
+          已在{labelUploadCategory(st.conflict)}分类
         </Badge>
       );
     }
@@ -228,24 +235,23 @@ export const UploadSkillsDialog = ({
             ) : mode === "skill" ? (
               <div className="max-h-72 space-y-1 overflow-y-auto">
                 {appSkills.map((s) => {
-                  const st = uploadNameStatus(
+                  const ownershipReason = uploadOwnershipDisabledReason(
                     s.name,
-                    category,
                     teamSkillCategories,
+                    teamUploadPermissions,
                   );
-                  const conflict = typeof st === "object";
                   return (
                     <CheckboxRow
                       key={s.name}
                       checked={picked.has(s.name)}
-                      disabled={conflict}
+                      disabled={!!ownershipReason}
                       checkboxClassName="mt-0.5"
                       className={cn(
                         "items-start rounded-md px-2 py-1.5 transition-colors",
-                        !conflict && "hover:bg-accent/50",
+                        !ownershipReason && "hover:bg-accent/50",
                       )}
                       onCheckedChange={() => {
-                        if (!conflict) toggle(s.name);
+                        if (!ownershipReason) toggle(s.name);
                       }}
                     >
                       <div className="min-w-0 flex-1">
@@ -254,7 +260,7 @@ export const UploadSkillsDialog = ({
                           {renderNameBadge(s.name)}
                         </div>
                         <p className="line-clamp-2 text-[11px] text-muted-foreground">
-                          {s.description}
+                          {ownershipReason || s.description}
                         </p>
                       </div>
                     </CheckboxRow>
@@ -264,14 +270,16 @@ export const UploadSkillsDialog = ({
             ) : (
               <div className="max-h-72 space-y-1 overflow-y-auto">
                 {actions.map((a) => {
-                  const nameConflict =
-                    !!a.skill &&
-                    typeof uploadNameStatus(
-                      a.skill,
-                      category,
-                      teamSkillCategories,
-                    ) === "object";
-                  const disabled = !!a.disabledReason || nameConflict;
+                  const ownershipReason = a.skill
+                    ? uploadOwnershipDisabledReason(
+                        a.skill,
+                        teamSkillCategories,
+                        teamUploadPermissions,
+                      )
+                    : null;
+                  // 本人已上传的项可重新选中并沿用原分类更新；他人项继续置灰。
+                  const disabledReason = a.disabledReason || ownershipReason;
+                  const disabled = !!disabledReason;
                   return (
                     <CheckboxRow
                       key={a.id}
@@ -296,9 +304,9 @@ export const UploadSkillsDialog = ({
                             a.skill &&
                             renderNameBadge(a.skill)}
                         </div>
-                        {a.disabledReason && (
+                        {disabledReason && (
                           <p className="text-[11px] text-muted-foreground">
-                            {a.disabledReason}
+                            {disabledReason}
                           </p>
                         )}
                       </div>
@@ -312,7 +320,10 @@ export const UploadSkillsDialog = ({
                 取消
               </Button>
               <Button
-                onClick={() => setStep("category")}
+                onClick={() => {
+                  if (preferredCategory) setCategory(preferredCategory);
+                  setStep("category");
+                }}
                 disabled={busy || resolvedSkillNames.length === 0}
               >
                 下一步（{picked.size}）
@@ -333,36 +344,7 @@ export const UploadSkillsDialog = ({
                   key={cat}
                   shape="chip"
                   selected={category === cat}
-                  onClick={() => {
-                    setCategory(cat);
-                    // 换分类后清掉变冲突的勾选，避免带回 pick 仍勾着禁选项
-                    setPicked((prev) => {
-                      const next = new Set<string>();
-                      if (mode === "skill") {
-                        for (const name of prev) {
-                          const st = uploadNameStatus(
-                            name,
-                            cat,
-                            teamSkillCategories,
-                          );
-                          if (typeof st !== "object") next.add(name);
-                        }
-                      } else {
-                        for (const a of actions) {
-                          if (!prev.has(a.id) || !a.skill || a.disabledReason) {
-                            continue;
-                          }
-                          const st = uploadNameStatus(
-                            a.skill,
-                            cat,
-                            teamSkillCategories,
-                          );
-                          if (typeof st !== "object") next.add(a.id);
-                        }
-                      }
-                      return next;
-                    });
-                  }}
+                  onClick={() => setCategory(cat)}
                 >
                   {labelUploadCategory(cat)}
                 </ChoiceButton>
@@ -373,10 +355,10 @@ export const UploadSkillsDialog = ({
                 {categoryStepConflicts
                   .map(
                     (c) =>
-                      `「${c.name}」与库内同名冲突（${labelUploadCategory(c.cat)} 分类）`,
+                      `「${c.name}」已在${labelUploadCategory(c.cat)}分类`,
                   )
                   .join("；")}
-                ，请换分类或返回取消勾选
+                ，请选择原分类更新，不能跨分类覆盖
               </p>
             )}
             {sensitiveHits.length > 0 && (

@@ -3,7 +3,8 @@
  *
  * 这个文件不是 Flowship 独占的——团队里不用 Flowship、直接在 Cursor IDE 里手敲
  * `wk:*` 的同事也读同一份。所以：
- * - **只改我们管的那几个键**（`doc_repo.local_path` / `delivery_hub` 的三个），
+ * - **只改我们管的那几个键**（`doc_repo.local_path` / `delivery_hub` 的地址、
+ *   Token 与两个同步开关），
  *   同段里同事配的其它键（`provider` / `url` / `operator_account` …）连同注释原样保留
  * - 解析 / 生成口径跟官方脚本对齐（`wk-delivery-sync.read_simple_delivery_yaml`）
  *
@@ -13,9 +14,9 @@
  * 两个配置分别是什么：
  * - `doc_repo.local_path`：wk 流程产物落盘的 WK 产出目录（`requirements/<REQ-ID>/…`），
  *   跟业务代码仓分开
- * - `delivery_hub.*`：团队 Delivery Hub。`base_url` 是服务器地址；`require_baseline`
- *   /`require_sync`（跑指令前拉最新产物 / 产物变更推回）由我们固定写 true、设置页不给开关。
- *   地址留空 = 三个键一起删 = 不接入。
+ * - `delivery_hub.*`：团队 Delivery Hub。`base_url` 是服务器地址，`token` 用于上传材料
+ *   和同步状态鉴权；`require_baseline` /`require_sync`（跑指令前拉最新产物 / 产物变更
+ *   推回）由我们固定写 true、设置页不给开关。地址留空 = 三个连接键一起删 = 不接入。
  */
 
 import { promises as fs } from "node:fs";
@@ -45,6 +46,20 @@ export type { WkConfig, WkConfigInput } from "@/lib/wk-config";
 /** `~/.wk/config.yaml` 的绝对路径 */
 export const wkConfigPath = (): string =>
   path.join(homedir(), ".wk", "config.yaml");
+
+/**
+ * 仅供服务端需要向 Delivery Hub 发鉴权请求时读取。
+ *
+ * 不挂进 `WkConfig`，避免 GET /api/system/wk-config 或任意客户端状态意外拿到明文。
+ */
+export const readWkHubToken = async (): Promise<string> => {
+  try {
+    const raw = await fs.readFile(wkConfigPath(), "utf8");
+    return configFromYaml(raw).hubToken;
+  } catch {
+    return "";
+  }
+};
 
 /**
  * 「默认 Hub 地址这件事已经处理过」的标记（放 app 自己的数据目录、不污染共享 YAML）。

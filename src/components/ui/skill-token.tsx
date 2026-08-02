@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * composer 内联 token tag 的单一视觉来源（2026-07-12 用户点名立规：同一视觉元素 ≥2 处必须单一来源）。
  *
@@ -11,6 +13,8 @@
  */
 
 import type { ReactNode } from "react";
+
+import { Tooltip } from "@/components/ui/tooltip";
 
 /**
  * 品牌色 tag：作用在真实文本 span 上（Lexical caret 正常渲染的前提、别加 inline-flex）。
@@ -35,9 +39,9 @@ export const SkillToken = ({
   children: ReactNode;
   title?: string;
 }) => (
-  <span className={SKILL_TOKEN_CLASS} title={title}>
-    {children}
-  </span>
+  <Tooltip content={title ?? ""}>
+    <span className={SKILL_TOKEN_CLASS}>{children}</span>
+  </Tooltip>
 );
 
 /** React 场景的文件引用 tag；children 传 `@rel/path` 原文 */
@@ -48,7 +52,7 @@ export const FileToken = ({
   children: ReactNode;
   title?: string;
 }) => (
-  <span className={FILE_TOKEN_CLASS} title={title}>
-    {children}
-  </span>
+  <Tooltip content={title ?? ""}>
+    <span className={FILE_TOKEN_CLASS}>{children}</span>
+  </Tooltip>
 );

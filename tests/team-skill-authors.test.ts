@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   __resetTeamSkillAuthorsForTest,
   getTeamSkillAuthors,
+  parseAuthorIdentityIndexFromGitLog,
   parseAuthorIndexFromGitLog,
 } from "@/lib/server/team-skill-authors";
 
@@ -37,6 +38,19 @@ describe("parseAuthorIndexFromGitLog", () => {
     expect(parseAuthorIndexFromGitLog(stdout)).toEqual({
       "skills/common/wk-biz-analyze": "陈禄江",
       "knowledge/skills/global/wk-harness": "苏蔚",
+    });
+  });
+
+  it("同时解析首次提交邮箱，供历史 owner 安全迁移", () => {
+    const stdout = [
+      `${M}陈禄江\u0002chenlujiang@example.com`,
+      "skills/common/wk-biz-analyze/SKILL.md",
+    ].join("\n");
+    expect(parseAuthorIdentityIndexFromGitLog(stdout)).toEqual({
+      "skills/common/wk-biz-analyze": {
+        name: "陈禄江",
+        email: "chenlujiang@example.com",
+      },
     });
   });
 

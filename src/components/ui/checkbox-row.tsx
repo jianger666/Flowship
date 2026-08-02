@@ -9,13 +9,14 @@
  * 用 label 包 Checkbox 再点行文字/空白区，勾选状态不会变，体感就是「没反应」。
  *
  * 正确做法：受控状态 + 行上显式 onClick / Enter / Space 切换；
- * Checkbox 自身 onCheckedChange 保留，但点击时 stopPropagation，
- * 避免与行 onClick 双触发互相抵消；内部 Checkbox tabIndex=-1，
- * 键盘焦点统一走本行（role=button），避免嵌套双焦点。
- * 以后别再拷「label 包 Checkbox」期望整行可选中。
+ * Checkbox 只负责展示，并通过 pointer-events-none 让小方块区域的点击
+ * 直接落到行上。不要依赖 base-ui 内部的 onCheckedChange / onClick：
+ * 它在部分 Electron/base-ui 组合下会吞掉小方块的指针事件，就会出现
+ * 「文字能勾、小方块没反应」。Checkbox tabIndex=-1，键盘焦点统一走本行
+ * （role=button）。以后别再拷「label 包 Checkbox」期望整行可选中。
  */
 
-import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
@@ -73,13 +74,12 @@ export const CheckboxRow = ({
     >
       <Checkbox
         id={checkboxId}
-        className={checkboxClassName}
+        className={cn("pointer-events-none", checkboxClassName)}
         checked={checked}
         disabled={disabled}
         tabIndex={-1}
-        onCheckedChange={onCheckedChange}
-        // 点小方块时别冒泡到行，否则 onCheckedChange + 行 toggle 双触发抵消
-        onClick={(e: MouseEvent<HTMLElement>) => e.stopPropagation()}
+        // CheckboxRow 是唯一状态入口；base-ui 内部 change 不再重复改受控态。
+        onCheckedChange={() => {}}
       />
       {children}
     </div>

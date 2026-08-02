@@ -12,6 +12,7 @@ import { Inbox } from "lucide-react";
 
 import { MrInboxPanel } from "@/components/mr-inbox/mr-inbox-panel";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -27,15 +28,16 @@ export const MrInboxBell = () => {
     <Popover>
       <PopoverTrigger
         render={
-          <Button
-            variant="ghost"
-            size="icon"
-            className="relative [&_svg:not([class*='size-'])]:size-4.5"
-            aria-label={
-              unreadCount > 0 ? `收件箱（${unreadCount} 条未读）` : "收件箱"
-            }
-            title="收件箱"
-          />
+          <Tooltip content="收件箱">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="relative [&_svg:not([class*='size-'])]:size-4.5"
+              aria-label={
+                unreadCount > 0 ? `收件箱（${unreadCount} 条未读）` : "收件箱"
+              }
+            />
+          </Tooltip>
         }
       >
         <Inbox />

@@ -57,6 +57,71 @@ export const pathBasename = (p: string): string => {
   return idx >= 0 ? cleaned.slice(idx + 1) || cleaned : cleaned;
 };
 
+/** 泛用文件名（VS Code 式 disambiguation）：basename 太常见时带上父目录 */
+const GENERIC_STEMS = new Set([
+  "index",
+  "page",
+  "layout",
+  "template",
+  "default",
+  "route",
+  "loading",
+  "error",
+  "not-found",
+  "main",
+]);
+
+const GENERIC_EXACT = new Set([
+  "mod.rs",
+  "lib.rs",
+  "package.json",
+  "tsconfig.json",
+  "jsconfig.json",
+  "cargo.toml",
+  "go.mod",
+]);
+
+const isGenericBasename = (basename: string): boolean => {
+  const lower = basename.toLowerCase();
+  if (GENERIC_EXACT.has(lower)) return true;
+  if (/^readme(\.(md|txt|rst|markdown))?$/i.test(basename)) return true;
+  const dot = basename.lastIndexOf(".");
+  const stem = (dot >= 0 ? basename.slice(0, dot) : basename).toLowerCase();
+  return GENERIC_STEMS.has(stem);
+};
+
+/**
+ * 路径展示标签（链接 / 预览标题用）
+ *
+ * - 普通文件 → basename（`LeadForm.tsx`）
+ * - 泛用 basename → `parent/basename`（`LeadDetail/index.tsx`）
+ * - 无父段 → 仍返 basename（裸 `index.tsx`）
+ */
+export const pathDisplayLabel = (p: string): string => {
+  if (!p) return p;
+  const normalized = normalizeSeparators(p).replace(/\/+$/, "");
+  const basename = pathBasename(normalized);
+  if (!isGenericBasename(basename)) return basename;
+  const slashIdx = normalized.lastIndexOf("/");
+  if (slashIdx < 0) return basename;
+  const parentPath = normalized.slice(0, slashIdx);
+  return `${pathBasename(parentPath)}/${basename}`;
+};
+
+/**
+ * 展示用缩短绝对路径（客户端可用，不依赖 node:os）
+ * `/Users/me/a/b` → `~/a/b`；`C:/Users/me/a` → `~/a`；认不出 home 则原样。
+ */
+export const shortenHomePathDisplay = (p: string): string => {
+  if (!p) return p;
+  const normalized = normalizeSeparators(p);
+  const posix = normalized.match(/^(\/Users\/[^/]+|\/home\/[^/]+)(\/.*)?$/);
+  if (posix) return `~${posix[2] ?? ""}`;
+  const win = normalized.match(/^[a-zA-Z]:\/Users\/[^/]+(\/.*)?$/i);
+  if (win) return `~${win[1] ?? ""}`;
+  return normalized;
+};
+
 /**
  * 把「path:行号后缀」拆成 { path, line }
  *
@@ -136,7 +201,9 @@ export const parsePathSegments = (s: string): ParsedPathSegments | null => {
  *
  * 启发式规则（求覆盖、不求精确）：
  *   - 含 `/`、且最后一段含 `.`（扩展名）
- *   - 路径部分不能含空格 / 反引号 / 引号（这些通常是表达式不是路径）
+ *   - 路径部分不能含反引号 / 引号（这些通常是表达式不是路径）
+ *   - **空格**：相对路径仍拒绝（`a b/c.ts` / 表达式更常见）；**绝对路径放行**
+ *     （mac `~/Library/Application Support/...` 常态、产物里常出现）
  *   - 长度合理（< 200、避免误判超长字符串）
  *   - 末尾的行号后缀（含 `:20-88, 189-210` 这种逗号 + 空格多段）**不影响**识别——
  *     先剥掉再判断、空格校验只作用于剥完后的路径部分（否则多段行号引用整条丢失链接）
@@ -147,10 +214,12 @@ export const parsePathSegments = (s: string): ParsedPathSegments | null => {
 export const looksLikePath = (s: string): boolean => {
   if (!s || s.length > 200) return false;
   const { path } = parsePathWithLine(s);
-  if (/\s|"|'|`/.test(path)) return false;
+  if (/"|'|`/.test(path)) return false;
   // Windows 反斜杠路径（`D:\a\b.java` / `src\foo.ts`）归一化后按同一套规则判
   const normalized = normalizeSeparators(path);
   if (!normalized.includes("/")) return false;
+  // 相对路径含空格多半不是干净路径；绝对路径（含 Application Support）允许空格
+  if (/\s/.test(path) && !isAbsolutePathLike(normalized)) return false;
   const lastSeg = normalized.slice(normalized.lastIndexOf("/") + 1);
   return lastSeg.length > 0 && lastSeg.includes(".");
 };

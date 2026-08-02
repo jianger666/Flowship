@@ -91,6 +91,8 @@ interface AskQuestionItemProps {
   question: AskUserQuestion;
   // 所属任务：`@` 引文件 / 粘贴落盘要用（本题输入内核透传）
   taskId: string;
+  /** 相对路径 inline code 解析基准（task cwd） */
+  baseDir?: string;
   // 题号（从 1 开始展示）
   index: number;
   // 提交锁：提交中禁所有交互
@@ -109,6 +111,7 @@ interface AskQuestionItemProps {
 const AskQuestionItem = ({
   question,
   taskId,
+  baseDir,
   index,
   submitting,
   onChange,
@@ -184,7 +187,7 @@ const AskQuestionItem = ({
         </span>
         {/* min-w-0：flex item 防长 inline code 撑破容器；问题走默认档、选项 12px 压一档 */}
         <div className="min-w-0 flex-1 text-sm leading-relaxed text-foreground">
-          <MarkdownText text={question.question} />
+          <MarkdownText text={question.question} baseDir={baseDir} />
         </div>
       </div>
 
@@ -470,6 +473,7 @@ export const AskUserInlineCard = ({ task, ev }: AskUserInlineCardProps) => {
                   <AskQuestionItem
                     question={q}
                     taskId={task.id}
+                    baseDir={task.workCwd}
                     index={qIdx + 1}
                     submitting={submitting}
                     onChange={handleDraftChange}

@@ -16,6 +16,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Copy } from "lucide-react";
 import { toast } from "sonner";
 
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 /** 字符串 = 直接复制；函数 = 异步取全量（返 null 表示取不到、不复制） */
@@ -68,30 +69,33 @@ export const CopyButton = ({
 
   const Icon = copied ? Check : Copy;
   return (
-    <button
-      type="button"
-      disabled={busy}
-      aria-label={label}
-      title={label}
-      // 外层常是「整块折叠」按钮 / 可点行：复制不该顺带把块折叠了
-      onClick={(e) => {
-        e.stopPropagation();
-        void handleCopy();
-      }}
-      className={cn(
-        "cursor-pointer rounded border border-border/60 bg-background/90 p-1",
-        "text-muted-foreground shadow-sm transition-colors hover:text-foreground",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        className,
-      )}
-    >
-      <Icon
-        className={cn(
-          "size-3",
-          copied && "text-success",
-        )}
-      />
-    </button>
+    <Tooltip content={label}>
+      <span className="inline-flex">
+        <button
+          type="button"
+          disabled={busy}
+          aria-label={label}
+          // 外层常是「整块折叠」按钮 / 可点行：复制不该顺带把块折叠了
+          onClick={(e) => {
+            e.stopPropagation();
+            void handleCopy();
+          }}
+          className={cn(
+            "cursor-pointer rounded border border-border/60 bg-background/90 p-1",
+            "text-muted-foreground shadow-sm transition-colors hover:text-foreground",
+            "disabled:cursor-not-allowed disabled:opacity-50",
+            className,
+          )}
+        >
+          <Icon
+            className={cn(
+              "size-3",
+              copied && "text-success",
+            )}
+          />
+        </button>
+      </span>
+    </Tooltip>
   );
 };
 
@@ -113,7 +117,9 @@ export const CopyableBlock = ({
   className,
   children,
 }: CopyableBlockProps) => (
-  <div className={cn("group/copyable relative", className)}>
+  <div
+    className={cn("group/copyable relative min-w-0 max-w-full", className)}
+  >
     {children}
     <CopyButton
       text={text}

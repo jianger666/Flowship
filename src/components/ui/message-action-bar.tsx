@@ -14,6 +14,7 @@
 import type { ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 /**
@@ -59,27 +60,29 @@ export const MessageActionBar = ({
       )}
     >
       {items.map((action, idx) => (
-        <button
-          key={action.key}
-          type="button"
-          onClick={action.onClick}
-          disabled={action.disabled || action.busy}
-          title={action.label}
-          aria-label={action.label}
-          className={cn(
-            "flex cursor-pointer items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground",
-            "hover:bg-muted hover:text-foreground",
-            "disabled:cursor-not-allowed disabled:opacity-50",
-            idx > 0 && "border-l",
-          )}
-        >
-          {action.busy ? (
-            <Loader2 className="size-3 animate-spin" />
-          ) : (
-            action.icon
-          )}
-          {action.text}
-        </button>
+        <Tooltip key={action.key} content={action.label}>
+          <span className="inline-flex">
+            <button
+              type="button"
+              onClick={action.onClick}
+              disabled={action.disabled || action.busy}
+              aria-label={action.label}
+              className={cn(
+                "flex cursor-pointer items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground",
+                "hover:bg-muted hover:text-foreground",
+                "disabled:cursor-not-allowed disabled:opacity-50",
+                idx > 0 && "border-l",
+              )}
+            >
+              {action.busy ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                action.icon
+              )}
+              {action.text}
+            </button>
+          </span>
+        </Tooltip>
       ))}
     </div>
   );

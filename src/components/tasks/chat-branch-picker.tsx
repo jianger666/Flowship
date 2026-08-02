@@ -24,6 +24,7 @@ import {
 import { checkoutTaskBranch, fetchTaskBranches } from "@/lib/task-store";
 import type { GitBranchState, Task } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { Tooltip } from "@/components/ui/tooltip";
 
 interface Props {
   task: Task;
@@ -108,23 +109,26 @@ export const ChatBranchPicker = ({ task }: Props) => {
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            disabled={running || saving}
-            title={`当前分支：${label}`}
-            // 视觉对齐 ModelSelect compact / 工作目录选择器、三者并排齐平
-            className={cn(
-              "flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
-            )}
-          >
-            {saving ? (
-              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-            ) : (
-              <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
-            )}
-            <span className="min-w-0 flex-1 truncate text-left">{label}</span>
-            <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
-          </button>
+          <Tooltip content={`当前分支：${label}`}>
+            <span className="inline-flex">
+              <button
+                type="button"
+                disabled={running || saving}
+                // 视觉对齐 ModelSelect compact / 工作目录选择器、三者并排齐平
+                className={cn(
+                  "flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-xs outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
+                )}
+              >
+                {saving ? (
+                  <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+                ) : (
+                  <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+                <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
+              </button>
+            </span>
+          </Tooltip>
         }
       />
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">

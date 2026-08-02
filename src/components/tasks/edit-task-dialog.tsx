@@ -28,6 +28,7 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Combobox } from "@/components/ui/combobox";
 import {
   Dialog,
@@ -247,18 +248,16 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             {task.repoPaths.length > 0 ? (
               <div className="grid gap-1 rounded-md border bg-muted/30 px-3 py-2">
                 {task.repoPaths.map((p) => (
-                  <div
-                    key={p}
-                    className="flex min-w-0 items-baseline gap-2 text-xs"
-                    title={p}
-                  >
-                    <span className="shrink-0 font-medium text-foreground/80">
-                      {repoNameOf(p)}
-                    </span>
-                    <span className="min-w-0 truncate text-muted-foreground">
-                      {p}
-                    </span>
-                  </div>
+                  <Tooltip key={p} content={p}>
+                    <div className="flex min-w-0 items-baseline gap-2 text-xs">
+                      <span className="shrink-0 font-medium text-foreground/80">
+                        {repoNameOf(p)}
+                      </span>
+                      <span className="min-w-0 truncate text-muted-foreground">
+                        {p}
+                      </span>
+                    </div>
+                  </Tooltip>
                 ))}
               </div>
             ) : (
@@ -306,12 +305,11 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                   const entry = branchMap[p];
                   return (
                     <div key={p} className="flex items-center gap-2">
-                      <span
-                        className="w-28 shrink-0 truncate text-sm text-muted-foreground"
-                        title={repoNameOf(p)}
-                      >
-                        {repoNameOf(p)}
-                      </span>
+                      <Tooltip content={repoNameOf(p)}>
+                        <span className="w-28 shrink-0 truncate text-sm text-muted-foreground">
+                          {repoNameOf(p)}
+                        </span>
+                      </Tooltip>
                       <Combobox
                         value={featureBranches[p] ?? ""}
                         onValueChange={(v) =>

@@ -277,7 +277,9 @@
    Streamdown 默认给代码块 / 表格 / mermaid 套「外层 rounded-xl border bg-sidebar p-2 +
    内层再一圈 border」的双层卡片、外加 my-4 大间距——聊天密度下视觉过重。
    这里按稳定锚点 data-streamdown="..." 把外壳打薄：去外层底色 / 边框 / 内衬、间距 my-4 → 收紧、
-   只留内层一圈边框（GitHub 风）。选择器锚 data 属性、streamdown 版本升级改类名也不怕。 */
+   只留内层一圈边框（GitHub 风）。选择器锚 data 属性、streamdown 版本升级改类名也不怕。
+   表壳/表头颜色只改这里；文档面必须 bg-background + MARKDOWN_PROSE_DOCUMENT /
+   MarkdownText variant="document"。 */
 .prose [data-streamdown="code-block"],
 .prose [data-streamdown="mermaid-block"],
 .prose [data-streamdown="table-wrapper"] {
@@ -287,6 +289,12 @@
   background: transparent;
   border: none;
   border-radius: 0.5rem;
+}
+/* 表头：Streamdown 默认 thead 是 bg-muted/80（半透明）。
+ * 叠在 bg-background（产物栏）和 bg-popover（Dialog 默认纯白）上观感会漂——
+ * 改成不透明 muted，弹窗 / 产物栏表头同色。 */
+.prose [data-streamdown="table-header"] {
+  background-color: var(--muted);
 }
 /* ---------- 品牌 loading（v1.0.x、logo 重设计「雷芯」+ 用户拍板「loading = logo 通电」） ----------
    BrandMark（components/ui/brand-mark.tsx）animated 形态用：
@@ -469,4 +477,17 @@
   opacity: 0.85;
   -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>') center / contain no-repeat;
   mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>') center / contain no-repeat;
+}
+
+/* 栏内搜索：CSS Custom Highlight 直接标真实渲染文本，不改 React / Streamdown DOM。 */
+::highlight(flowship-artifact-search),
+::highlight(flowship-event-search) {
+  color: inherit;
+  background-color: color-mix(in oklch, var(--warning) 45%, transparent);
+}
+::highlight(flowship-artifact-search-active),
+::highlight(flowship-event-search-active) {
+  color: inherit;
+  background-color: color-mix(in oklch, var(--warning) 78%, transparent);
+  text-decoration: underline 2px color-mix(in oklch, var(--warning) 85%, black);
 }

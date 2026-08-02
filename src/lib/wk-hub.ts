@@ -9,9 +9,8 @@
  *   POST /internal/harness/artifacts/upload
  *   GET  /internal/harness/artifacts/file
  *   GET  /internal/harness/artifact-state?artifactKey=...
- * 其中只有 `artifact-state` 是「GET + 无副作用 + 不需要鉴权」（官方
- * `wk-delivery-baseline.py:get_artifact_state` 就是裸 urlopen 直接读）——拿它当探针
- * 最安全：随便传个不存在的 key，hub 会回 `{"data":{"exists":false}}`，既证明网络通、
+ * 其中只有 `artifact-state` 是「GET + 无副作用」——拿它当探针最安全：随便传个
+ * 不存在的 key，hub 会回 `{"data":{"exists":false}}`，既证明网络通、鉴权有效，
  * 又证明对面确实是 harness 接口而不是随便一个占了端口的服务。
  */
 

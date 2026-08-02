@@ -30,13 +30,15 @@ const failureMessage = (err: unknown): string => {
 };
 
 /**
- * 探一下这个地址后面是不是活着的 Delivery Hub。
+ * 探一下这个地址后面是不是活着的 Delivery Hub，并校验 Token 是否可用。
  *
  * @param fetchImpl 便于单测注入；默认走全局 fetch
+ * @param token Delivery Hub 鉴权 Token；为空时发匿名请求
  */
 export const probeWkHub = async (
   rawUrl: string,
   fetchImpl: typeof fetch = fetch,
+  token = "",
 ): Promise<WkHubProbeResult> => {
   const base = normalizeHubUrl(rawUrl);
   if (!base) {
@@ -49,7 +51,12 @@ export const probeWkHub = async (
   let res: Response;
   try {
     res = await fetchImpl(hubProbeUrl(base), {
-      headers: { accept: "application/json" },
+      headers: {
+        accept: "application/json",
+        ...(token.trim()
+          ? { Authorization: `Bearer ${token.trim()}` }
+          : {}),
+      },
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
   } catch (err) {
@@ -57,6 +64,12 @@ export const probeWkHub = async (
   }
 
   if (!res.ok) {
+    if (res.status === 401) {
+      return { status: "unexpected", message: "鉴权失败，请检查 Token" };
+    }
+    if (res.status === 403) {
+      return { status: "unexpected", message: "Token 没有访问权限" };
+    }
     // 端口上有服务、但 harness 接口不认——多半是地址填错（指到别的服务）或 hub 版本不对
     return {
       status: "unexpected",

@@ -15,6 +15,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Combobox } from "@/components/ui/combobox";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Input } from "@/components/ui/input";
@@ -213,25 +214,25 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                         onCheckedChange={(v) => commitRepoFlag(r.path, "readonly", v)}
                       />
                     </label>
-                    <label
-                      className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
-                      title="标注该仓专门存放脚本类产出（测试脚本 / 工具脚本等）——AI 往里写文件前会先看仓内 README / AGENTS.md 约定。与只读正交：只读脚本仓 = 纯参考库。"
-                    >
-                      脚本仓
-                      <Switch
-                        checked={r.scriptRepo === true}
-                        onCheckedChange={(v) => commitRepoFlag(r.path, "scriptRepo", v)}
-                      />
-                    </label>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() => removeRepo(r.path)}
-                      title="删除"
-                    >
-                      <Trash2 />
-                    </Button>
+                    <Tooltip content="标注该仓专门存放脚本类产出（测试脚本 / 工具脚本等）——AI 往里写文件前会先看仓内 README / AGENTS.md 约定。与只读正交：只读脚本仓 = 纯参考库。">
+                      <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                        脚本仓
+                        <Switch
+                          checked={r.scriptRepo === true}
+                          onCheckedChange={(v) => commitRepoFlag(r.path, "scriptRepo", v)}
+                        />
+                      </label>
+                    </Tooltip>
+                    <Tooltip content="删除">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        onClick={() => removeRepo(r.path)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </Tooltip>
                   </div>
 
                   {/* 第二行：线上 / 提测 / 联调 分支（都选填）。
@@ -287,29 +288,31 @@ export const RepoCard = ({ repos, onChange, onCommit }: RepoCardProps) => {
                   <div className="grid grid-cols-2 gap-2">
                     <div className="grid gap-1">
                       <span className="text-[11px] text-muted-foreground">分支模板覆盖</span>
-                      <Input
-                        value={r.branchTemplate ?? ""}
-                        onChange={(e) =>
-                          setRepoField(r.path, "branchTemplate", e.target.value)
-                        }
-                        onBlur={() => onBranchTemplateBlur(r.path)}
-                        placeholder="留空用全局默认"
-                        title="覆盖该仓 feature 分支命名模板、占位符同全局模板"
-                        className="font-mono text-xs"
-                      />
+                      <Tooltip content="覆盖该仓 feature 分支命名模板、占位符同全局模板">
+                        <Input
+                          value={r.branchTemplate ?? ""}
+                          onChange={(e) =>
+                            setRepoField(r.path, "branchTemplate", e.target.value)
+                          }
+                          onBlur={() => onBranchTemplateBlur(r.path)}
+                          placeholder="留空用全局默认"
+                          className="font-mono text-xs"
+                        />
+                      </Tooltip>
                     </div>
                     <div className="grid gap-1">
                       <span className="text-[11px] text-muted-foreground">预览启动命令</span>
-                      <Input
-                        value={r.previewCommand ?? ""}
-                        onChange={(e) =>
-                          setRepoField(r.path, "previewCommand", e.target.value)
-                        }
-                        onBlur={onRepoFieldBlur}
-                        placeholder="如 npm run dev"
-                        title="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server"
-                        className="font-mono text-xs"
-                      />
+                      <Tooltip content="配了任务页才显示「预览」按钮、点击在该任务工作区起 dev server">
+                        <Input
+                          value={r.previewCommand ?? ""}
+                          onChange={(e) =>
+                            setRepoField(r.path, "previewCommand", e.target.value)
+                          }
+                          onBlur={onRepoFieldBlur}
+                          placeholder="如 npm run dev"
+                          className="font-mono text-xs"
+                        />
+                      </Tooltip>
                     </div>
                   </div>
                 </div>

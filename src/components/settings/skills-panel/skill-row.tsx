@@ -17,6 +17,7 @@ import { Loader2 } from "lucide-react";
 import { AuthorByline } from "@/components/ui/author-byline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
@@ -86,12 +87,11 @@ export const SkillRowItem = ({
         )}
       >
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-          <span
-            className="min-w-0 truncate text-sm font-medium"
-            title={s.displayPath ?? s.absPath}
-          >
-            {s.name}
-          </span>
+          <Tooltip content={s.displayPath ?? s.absPath}>
+            <span className="min-w-0 truncate text-sm font-medium">
+              {s.name}
+            </span>
+          </Tooltip>
           {s.teamAction && (
             <Badge variant="outline" size="xs">
               action

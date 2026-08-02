@@ -22,6 +22,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 interface ComboboxProps {
@@ -36,7 +37,7 @@ interface ComboboxProps {
   allowCustom?: boolean;
   /** 候选为空（且非 loading）时列表区提示 */
   emptyHint?: string;
-  /** trigger hover 提示（对齐原生 Input 的 title 用法） */
+  /** trigger hover 提示 */
   title?: string;
   className?: string;
 }
@@ -92,16 +93,16 @@ export const Combobox = ({
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger
         render={
-          <button
-            type="button"
-            disabled={disabled}
-            title={title}
-            // 视觉对齐 shadcn SelectTrigger / ModelSelect trigger
-            className={cn(
-              "flex h-9 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
-              className,
-            )}
-          >
+          <Tooltip content={title ?? ""}>
+            <button
+              type="button"
+              disabled={disabled}
+              // 视觉对齐 shadcn SelectTrigger / ModelSelect trigger
+              className={cn(
+                "flex h-9 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
+                className,
+              )}
+            >
             <span
               className={cn(
                 "min-w-0 flex-1 truncate text-left",
@@ -129,6 +130,7 @@ export const Combobox = ({
               <ChevronDown className="pointer-events-none size-4 shrink-0 text-muted-foreground" />
             )}
           </button>
+          </Tooltip>
         }
       />
       <PopoverContent align="start" sideOffset={4} className="w-64 overflow-hidden p-0">

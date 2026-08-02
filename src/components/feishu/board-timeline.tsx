@@ -156,30 +156,32 @@ export const BoardTimeline = ({ items, onOpen, range, onRangeChange }: Props) =>
       {/* 工具条：日期范围筛选（飞书同款）+ 前后平移 */}
       <div className="flex shrink-0 items-center gap-1.5">
         <DateRangePicker value={range} onChange={onRangeChange} />
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => {
-            const shift = Math.floor(span / 2) * DAY_MS;
-            onRangeChange({ from: range.from - shift, to: range.to - shift });
-          }}
-          aria-label="往前平移"
-          title="往前平移"
-        >
-          <ChevronLeft />
-        </Button>
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => {
-            const shift = Math.floor(span / 2) * DAY_MS;
-            onRangeChange({ from: range.from + shift, to: range.to + shift });
-          }}
-          aria-label="往后平移"
-          title="往后平移"
-        >
-          <ChevronRight />
-        </Button>
+        <Tooltip content="往前平移">
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            onClick={() => {
+              const shift = Math.floor(span / 2) * DAY_MS;
+              onRangeChange({ from: range.from - shift, to: range.to - shift });
+            }}
+            aria-label="往前平移"
+          >
+            <ChevronLeft />
+          </Button>
+        </Tooltip>
+        <Tooltip content="往后平移">
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            onClick={() => {
+              const shift = Math.floor(span / 2) * DAY_MS;
+              onRangeChange({ from: range.from + shift, to: range.to + shift });
+            }}
+            aria-label="往后平移"
+          >
+            <ChevronRight />
+          </Button>
+        </Tooltip>
         <span className="ml-auto text-xs text-muted-foreground">
           {rows.filter((r) => r.kind === "item").length} 项排期中 · 点条展开节点
         </span>

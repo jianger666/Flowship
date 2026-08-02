@@ -129,3 +129,12 @@ alwaysApply: true
 - **新页面 / 新视觉块 / 改版**：先读 `frontend-design`（防 AI 模板脸、定调性）+ 用 `ui-ux-pro-max` 检索具体建议（`python3 .cursor/skills/ui-ux-pro-max/scripts/search.py "<query>" --domain style|color|typography|ux`）
 - 日常小改（加按钮 / 调间距）不必过 skill、遵守本文件 + learned-conventions 即可
 - 用户对 UI 的每次纠偏反馈 → 沉淀到本文件或 learned-conventions（用户拍板「期望 AI 慢慢沉淀」）
+
+## 文档面 Markdown（2026-07-31 立规）
+
+- **产物栏 / 本地文件预览**等静态文档必须共用 `MARKDOWN_PROSE_DOCUMENT` 或 `MarkdownText variant="document"`；表格/代码块外壳样式只改 `globals.css` 的 streamdown 段；文档壳背景用 `bg-background`，不要用 `bg-popover` 当阅读纸面。
+
+## Hover 提示（2026-07-31 立规）
+
+- 交互提示一律 `Tooltip`，禁止用原生 `title` 当 tip（`iframe` / `img` 无障碍名除外）。
+- 扫仓时区分原生 DOM `title` 与组件 prop `title`（如 DialogTitle、StepRow、EnvSection）；后者不是 hover tip、不要误改。

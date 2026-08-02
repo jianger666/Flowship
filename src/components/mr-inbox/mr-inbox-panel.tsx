@@ -28,6 +28,7 @@ import {
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -87,9 +88,11 @@ const Chip = ({
   tone?: keyof typeof CHIP_VARIANT;
   title?: string;
 }) => (
-  <Badge variant={CHIP_VARIANT[tone]} title={title}>
-    {children}
-  </Badge>
+  <Tooltip content={title ?? ""}>
+    <Badge variant={CHIP_VARIANT[tone]}>
+      {children}
+    </Badge>
+  </Tooltip>
 );
 
 /**
@@ -263,19 +266,22 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
       )}
       <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
         {entry.workItemUrl ? (
-          <a
-            href={entry.workItemUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="min-w-0 truncate hover:text-foreground hover:underline"
-            title={entry.workItemName}
-          >
-            {entry.workItemName}
-          </a>
+          <Tooltip content={entry.workItemName}>
+            <a
+              href={entry.workItemUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="min-w-0 truncate hover:text-foreground hover:underline"
+            >
+              {entry.workItemName}
+            </a>
+          </Tooltip>
         ) : (
-          <span className="min-w-0 truncate" title={entry.workItemName}>
-            {entry.workItemName}
-          </span>
+          <Tooltip content={entry.workItemName}>
+            <span className="min-w-0 truncate">
+              {entry.workItemName}
+            </span>
+          </Tooltip>
         )}
         <span className="shrink-0">
           {entry.commentAtMs > 0 ? formatRelative(entry.commentAtMs) : ""}
@@ -283,9 +289,11 @@ const MrInboxRow = ({ entry }: { entry: MrInboxEntry }) => {
       </div>
       {/* 标题左 + 可合性 chip 右，与 BUG 行视觉对齐 */}
       <div className="flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-sm font-medium" title={mrTitle}>
-          {mrTitle}
-        </span>
+        <Tooltip content={mrTitle}>
+          <span className="min-w-0 truncate text-sm font-medium">
+            {mrTitle}
+          </span>
+        </Tooltip>
         <span className="flex shrink-0 items-center gap-1">
           <MrStatusChip mr={entry.mr} mrError={entry.mrError} />
         </span>
@@ -550,28 +558,29 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
           标题作 flex item 参与收缩（min-w-0）才能出省略号——inline-flex w-fit 不收缩、
           长标题会把右侧 chip 挤扁（2026-07-15 用户反馈）；不 grow、右侧空白仍不可点 */}
       <div className="flex items-center justify-between gap-2">
-        <a
-          href={entry.bugUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="min-w-0 truncate text-sm font-medium hover:underline"
-          title={entry.name}
-        >
-          {entry.name}
-        </a>
+        <Tooltip content={entry.name}>
+          <a
+            href={entry.bugUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="min-w-0 truncate text-sm font-medium hover:underline"
+          >
+            {entry.name}
+          </a>
+        </Tooltip>
         <span className="flex shrink-0 items-center gap-1">
           {entry.priorityLabel && <Chip tone="warn">{entry.priorityLabel}</Chip>}
           <DropdownMenu open={menuOpen} onOpenChange={handleMenuOpenChange}>
             {/* outline 小 chip：边框 + chevron 明示可点（与 Regression 静态 chip 区分） */}
-            <DropdownMenuTrigger
-              disabled={transitioning}
-              className={cn(
-                "inline-flex h-5 shrink-0 cursor-pointer items-center gap-0.5 rounded-4xl border border-input bg-background px-2 text-[11px] text-muted-foreground outline-none",
-                "hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
-                "disabled:cursor-not-allowed disabled:opacity-50",
-              )}
-              title="切换状态"
-            >
+            <Tooltip content="切换状态">
+              <DropdownMenuTrigger
+                disabled={transitioning}
+                className={cn(
+                  "inline-flex h-5 shrink-0 cursor-pointer items-center gap-0.5 rounded-4xl border border-input bg-background px-2 text-[11px] text-muted-foreground outline-none",
+                  "hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
+                  "disabled:cursor-not-allowed disabled:opacity-50",
+                )}
+              >
               {transitioning ? (
                 <RefreshCw className="size-3 animate-spin" />
               ) : (
@@ -581,6 +590,7 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
                 </>
               )}
             </DropdownMenuTrigger>
+            </Tooltip>
             <DropdownMenuContent align="end" className="min-w-36">
               {loadingTransitions && (
                 <div className="px-2 py-1.5 text-xs text-muted-foreground">
@@ -614,9 +624,11 @@ const MyBugRow = ({ entry }: { entry: BugInboxEntry }) => {
         </span>
       </div>
       {entry.relatedStoryName && (
-        <p className="truncate text-xs text-muted-foreground" title={entry.relatedStoryName}>
-          关联：{entry.relatedStoryName}
-        </p>
+        <Tooltip content={entry.relatedStoryName}>
+          <p className="truncate text-xs text-muted-foreground">
+            关联：{entry.relatedStoryName}
+          </p>
+        </Tooltip>
       )}
       <div className="mt-0.5 flex items-center gap-1">
         <Button
@@ -744,46 +756,50 @@ const RegressionBugRow = ({ entry }: { entry: BugInboxEntry }) => {
       )}
       {/* 标题左、状态 + MR chip 靠右 */}
       <div className="flex items-center justify-between gap-2">
-        <a
-          href={entry.bugUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="min-w-0 truncate text-sm font-medium hover:underline"
-          title={entry.name}
-        >
-          {entry.name}
-        </a>
+        <Tooltip content={entry.name}>
+          <a
+            href={entry.bugUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="min-w-0 truncate text-sm font-medium hover:underline"
+          >
+            {entry.name}
+          </a>
+        </Tooltip>
         <span className="flex shrink-0 items-center gap-1">
           <Chip tone="ok">{entry.statusLabel || "RESOLVED"}</Chip>
           <MrStatusChip mr={entry.mr} mrError={entry.mrError} />
         </span>
       </div>
       {entry.relatedStoryName && (
-        <p className="truncate text-xs text-muted-foreground" title={entry.relatedStoryName}>
-          关联：{entry.relatedStoryName}
-        </p>
+        <Tooltip content={entry.relatedStoryName}>
+          <p className="truncate text-xs text-muted-foreground">
+            关联：{entry.relatedStoryName}
+          </p>
+        </Tooltip>
       )}
       <div className="mt-0.5 flex items-center gap-1">
         {/* 有关联 MR 时始终给「打开 MR」——冲突/检查中/无 token 时合并按钮隐藏，QA 仍需跳 GitLab */}
         {entry.mrUrl && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
-            title="在 GitLab 打开 MR"
-            nativeButton={false}
-            render={
-              <a
-                href={entry.mrUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="no-underline"
-              />
-            }
-          >
-            <ExternalLink className="size-3" />
-            打开 MR
-          </Button>
+          <Tooltip content="在 GitLab 打开 MR">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+              nativeButton={false}
+              render={
+                <a
+                  href={entry.mrUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="no-underline"
+                />
+              }
+            >
+              <ExternalLink className="size-3" />
+              打开 MR
+            </Button>
+          </Tooltip>
         )}
         <Button
           variant="ghost"
@@ -942,16 +958,19 @@ export const MrInboxPanel = ({
               全部已读
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => void refresh({ force: true })}
-            disabled={refreshing}
-            aria-label="刷新收件箱"
-            title="重新扫描"
-          >
-            <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
-          </Button>
+          <Tooltip content="重新扫描">
+            <span className="inline-flex">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => void refresh({ force: true })}
+                disabled={refreshing}
+                aria-label="刷新收件箱"
+              >
+                <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} />
+              </Button>
+            </span>
+          </Tooltip>
         </div>
       </div>
 

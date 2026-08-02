@@ -10,6 +10,7 @@
 import { Eye, EyeOff, Loader2, RefreshCw, User } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { SettingRow } from "@/components/ui/setting-row";
 
@@ -84,15 +85,16 @@ export const ApiKeySection = ({
               placeholder="crsr_..."
               className="font-mono"
             />
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              onClick={() => setShowKey((s) => !s)}
-              title={showKey ? "隐藏" : "显示"}
-            >
-              {showKey ? <EyeOff /> : <Eye />}
-            </Button>
+            <Tooltip content={showKey ? "隐藏" : "显示"}>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                onClick={() => setShowKey((s) => !s)}
+              >
+                {showKey ? <EyeOff /> : <Eye />}
+              </Button>
+            </Tooltip>
             <Button
               type="button"
               variant="outline"

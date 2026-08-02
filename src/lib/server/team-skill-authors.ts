@@ -22,27 +22,34 @@ const execFileAsync = promisify(execFile);
 
 // git log 单条 commit 头行的前缀标记（\x01 不会出现在 author 名里、天然分隔）
 const COMMIT_MARK = "\u0001";
+const EMAIL_MARK = "\u0002";
+
+export type TeamSkillAuthorIdentity = {
+  name: string;
+  email: string;
+};
 
 /**
- * 解析 `git log --reverse --diff-filter=A --name-only --format=%x01%aN` 输出 →
+ * 解析 `git log --reverse --diff-filter=AR --name-only --format=%x01%aN%x02%aE` 输出 →
  * { skill 目录相对路径（SKILL.md 的父目录、posix 分隔） → 首次引入者 }。
  * --reverse 保证时间正序、首个命中即创建人；后续 commit 再新增同路径（删了重加）不覆盖。
  * 导出供单测。
  */
-export const parseAuthorIndexFromGitLog = (
+export const parseAuthorIdentityIndexFromGitLog = (
   stdout: string,
-): Record<string, string> => {
-  const byDir: Record<string, string> = {};
-  let author = "";
+): Record<string, TeamSkillAuthorIdentity> => {
+  const byDir: Record<string, TeamSkillAuthorIdentity> = {};
+  let author: TeamSkillAuthorIdentity = { name: "", email: "" };
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
     if (line.startsWith(COMMIT_MARK)) {
-      author = line.slice(1).trim();
+      const [name = "", email = ""] = line.slice(1).split(EMAIL_MARK, 2);
+      author = { name: name.trim(), email: email.trim() };
       continue;
     }
     // 只认 SKILL.md 的新增记录（skill 目录粒度的锚点文件）
-    if (!author || !line.endsWith("SKILL.md")) continue;
+    if (!author.name || !line.endsWith("SKILL.md")) continue;
     const dir = line.slice(0, -"/SKILL.md".length);
     if (!dir || dir === line) continue; // 根目录裸 SKILL.md 不索引
     if (!(dir in byDir)) byDir[dir] = author;
@@ -50,20 +57,29 @@ export const parseAuthorIndexFromGitLog = (
   return byDir;
 };
 
+export const parseAuthorIndexFromGitLog = (
+  stdout: string,
+): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(parseAuthorIdentityIndexFromGitLog(stdout)).map(
+      ([dir, author]) => [dir, author.name],
+    ),
+  );
+
 // ---------- globalThis 缓存（key 含 HEAD sha、防 route-chunk/HMR 分裂） ----------
 
-const AUTHOR_CACHE_KEY = "__flowshipTeamSkillAuthorsV1__";
+const AUTHOR_CACHE_KEY = "__flowshipTeamSkillAuthorsV2__";
 
 type AuthorCache = {
   /** 建索引时的 HEAD sha；sync 后 HEAD 变则重建 */
   headSha: string;
-  byDir: Record<string, string>;
+  byDir: Record<string, TeamSkillAuthorIdentity>;
 } | null;
 
 type AuthorState = {
   cache: AuthorCache;
   /** cache miss 时进行中的建索引 promise（同 HEAD 并发去重） */
-  inFlight: Promise<Record<string, string>> | null;
+  inFlight: Promise<Record<string, TeamSkillAuthorIdentity>> | null;
   /** inFlight 对应的 HEAD（HEAD 变了不能搭旧车） */
   inFlightHead: string | null;
 };
@@ -118,10 +134,10 @@ type RunGitReadonly = (
  *
  * @param _testRunGit 仅单测注入（替代真实 git）；生产勿传。
  */
-export const getTeamSkillAuthors = async (
+export const getTeamSkillAuthorIdentities = async (
   repoDir: string,
   _testRunGit?: RunGitReadonly,
-): Promise<Record<string, string>> => {
+): Promise<Record<string, TeamSkillAuthorIdentity>> => {
   const runGit = _testRunGit ?? runGitReadonly;
   const state = getAuthorState();
   const head = (await runGit(repoDir, ["rev-parse", "HEAD"]))?.trim();
@@ -133,7 +149,7 @@ export const getTeamSkillAuthors = async (
     return state.inFlight;
   }
 
-  const run = (async (): Promise<Record<string, string>> => {
+  const run = (async (): Promise<Record<string, TeamSkillAuthorIdentity>> => {
     const log = await runGit(repoDir, [
       "log",
       "--reverse",
@@ -141,12 +157,12 @@ export const getTeamSkillAuthors = async (
       // 只认 A 会漏掉新路径——rename commit 的 author 作为兜底归属）
       "--diff-filter=AR",
       "--name-only",
-      `--format=%x01%aN`,
+      `--format=%x01%aN%x02%aE`,
       "--",
       "skills",
       "knowledge/skills",
     ]);
-    const byDir = log ? parseAuthorIndexFromGitLog(log) : {};
+    const byDir = log ? parseAuthorIdentityIndexFromGitLog(log) : {};
     state.cache = { headSha: head, byDir };
     return byDir;
   })();
@@ -163,3 +179,13 @@ export const getTeamSkillAuthors = async (
     }
   }
 };
+
+export const getTeamSkillAuthors = async (
+  repoDir: string,
+  _testRunGit?: RunGitReadonly,
+): Promise<Record<string, string>> =>
+  Object.fromEntries(
+    Object.entries(
+      await getTeamSkillAuthorIdentities(repoDir, _testRunGit),
+    ).map(([dir, author]) => [dir, author.name]),
+  );

@@ -8,6 +8,7 @@ import Link from "next/link";
 import { Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { Switch } from "@/components/ui/switch";
@@ -107,24 +108,26 @@ export const SkillListPane = ({
   const syncControls = (disabled: boolean) => (
     <>
       {teamStatus?.syncedAt != null && (
-        <span
-          className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground"
-          title={new Date(teamStatus.syncedAt).toLocaleString("zh-CN")}
+        <Tooltip
+          content={new Date(teamStatus.syncedAt).toLocaleString("zh-CN")}
         >
-          {formatRelative(teamStatus.syncedAt)}
-        </span>
+          <span className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground">
+            {formatRelative(teamStatus.syncedAt)}
+          </span>
+        </Tooltip>
       )}
-      <Button
-        type="button"
-        size="icon-xs"
-        variant="ghost"
-        aria-label="同步"
-        title="同步"
-        disabled={syncing || mirroring || disabled}
-        onClick={onSync}
-      >
-        {syncing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-      </Button>
+      <Tooltip content="同步">
+        <Button
+          type="button"
+          size="icon-xs"
+          variant="ghost"
+          aria-label="同步"
+          disabled={syncing || mirroring || disabled}
+          onClick={onSync}
+        >
+          {syncing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+        </Button>
+      </Tooltip>
     </>
   );
 

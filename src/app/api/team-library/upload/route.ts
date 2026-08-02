@@ -9,11 +9,26 @@ import { NextResponse } from "next/server";
 
 import { errorResponse } from "@/lib/server/route-helpers";
 import {
+  getTeamUploadPermissions,
   isSafeTeamCategory,
   uploadSkillsToTeamLibrary,
 } from "@/lib/server/team-library";
 
 export const runtime = "nodejs";
+
+/** 上传弹窗只读预检：本人可更新、他人项置灰；POST 仍会独立复验。 */
+export const GET = async () => {
+  try {
+    const result = await getTeamUploadPermissions();
+    return NextResponse.json(result, { status: result.ok ? 200 : 503 });
+  } catch (err) {
+    console.error("[GET /api/team-library/upload] failed", err);
+    return errorResponse(
+      err instanceof Error ? err.message : "upload_permissions_failed",
+      500,
+    );
+  }
+};
 
 export const POST = async (req: Request) => {
   let body: {

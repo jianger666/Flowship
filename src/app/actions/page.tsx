@@ -19,6 +19,7 @@ import { ArrowLeft, Copy, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
@@ -420,20 +421,23 @@ const ActionsPanel = () => {
             </p>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
               <UploadToTeamLibraryButton mode="action" />
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void handleAiCreate()}
-                disabled={aiCreating}
-                title="开个对话、AI 按你的描述生成 skill 并挂成 action"
-              >
-                {aiCreating ? (
-                  <Loader2 className="animate-spin" />
-                ) : (
-                  <Sparkles />
-                )}
-                对话创建
-              </Button>
+              <Tooltip content="开个对话、AI 按你的描述生成 skill 并挂成 action">
+                <span className="inline-flex">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleAiCreate()}
+                    disabled={aiCreating}
+                  >
+                    {aiCreating ? (
+                      <Loader2 className="animate-spin" />
+                    ) : (
+                      <Sparkles />
+                    )}
+                    对话创建
+                  </Button>
+                </span>
+              </Tooltip>
               <Button size="sm" onClick={handleNew}>
                 <Plus />
                 新建

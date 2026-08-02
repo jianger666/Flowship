@@ -9,9 +9,10 @@
  * 本文件只交付组件，Batch C 再接到 event-stream items 管线。
  */
 
-import { memo, useRef, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import { ChevronRight, Loader2, X } from "lucide-react";
 
+import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-context";
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
 import type { WorkGroupItem } from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
@@ -81,12 +82,14 @@ const WorkGroupMember = ({
   }
   // thinking（assistant 插话 / error 都不进组、各自独立平铺）→ EventRow 细行分支
   return (
-    <EventRow
-      ev={member as TaskEvent}
-      taskId={taskId}
-      task={task}
-      variant={variant}
-    />
+    <div data-search-owner-id={(member as TaskEvent).id}>
+      <EventRow
+        ev={member as TaskEvent}
+        taskId={taskId}
+        task={task}
+        variant={variant}
+      />
+    </div>
   );
 };
 
@@ -130,6 +133,15 @@ const WorkGroupRowImpl = ({
   // 判定见 shouldPinWorkGroupOpen（纯函数、可单测）。
   // 用渲染期 latch 而不是 useEffect：effect 跑在 commit 之后，会先闪一帧折叠再弹回来。
   const followCtl = useStreamFollowContext();
+  const searchCtx = usePaneSearchHighlight();
+  const hasSearchHitInGroup = useMemo(() => {
+    if (!searchCtx?.hitOwnerIds.size) return false;
+    for (const m of group.members) {
+      if (isToolBlock(m) || isToolVerbGroup(m)) continue;
+      if (searchCtx.hitOwnerIds.has((m as TaskEvent).id)) return true;
+    }
+    return false;
+  }, [group.members, searchCtx]);
   const prevAutoExpandedRef = useRef(autoExpanded);
   const stickyOpenRef = useRef(false);
   if (
@@ -143,8 +155,10 @@ const WorkGroupRowImpl = ({
     stickyOpenRef.current = true;
   }
   prevAutoExpandedRef.current = autoExpanded;
-  // 用户手动点过就完全以他为准（含手动收起被钉住的组）
-  const expanded = manual ?? (autoExpanded || stickyOpenRef.current);
+  // 搜索命中优先展开：即使用户此前手动收起，也不能让“下一条”跳向不可见内容。
+  const expanded =
+    hasSearchHitInGroup ||
+    (manual ?? (autoExpanded || stickyOpenRef.current));
 
   const runningTail =
     !expanded && group.hasRunning ? lastRunningName(group.members) : null;
@@ -183,7 +197,7 @@ const WorkGroupRowImpl = ({
       </button>
 
       {expanded && (
-        <div className="ml-2 mt-0.5 space-y-0.5 border-l border-border/40 pl-2.5">
+        <div className="ml-2 mt-0.5 min-w-0 max-w-full space-y-0.5 border-l border-border/40 pl-2.5">
           {group.members.map((m) => (
             <WorkGroupMember
               key={m.id}

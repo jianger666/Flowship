@@ -17,7 +17,7 @@
  *   - event-stream/rows.tsx  MarkdownText / StreamingAssistantRow / EventRow / AskUserRequestRow
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
   ArrowDown as ArrowDownIcon,
@@ -28,6 +28,7 @@ import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ConversationComposer } from "@/components/conversation-composer";
 import {
   resolveSkillReferences,
@@ -42,7 +43,28 @@ import {
   type StreamFollowController,
 } from "@/hooks/use-stream-follow";
 import { findPendingAskEvent, isAskSkipMarkerEvent } from "@/lib/ask-pending";
+import {
+  findRenderIndexForEventId,
+  normalizeEventStreamSearchQuery,
+  searchEventStreamRenderOccurrences,
+} from "@/lib/event-stream-search";
+import {
+  stabilizeOccurrenceIndex,
+  stepOccurrenceIndex,
+} from "@/lib/text-search-highlight";
+import {
+  applyDomSearchHighlights,
+  clearDomSearchHighlights,
+  findOwnerDomSearchMatches,
+  ownerOccurrenceIndexAt,
+  scrollDomSearchMatchIntoView,
+} from "@/lib/dom-text-search";
+import { PaneSearchHighlightProvider } from "@/components/ui/pane-search-highlight-context";
 import { isModCombo } from "@/lib/keyboard-shortcuts";
+import {
+  EVENT_STREAM_SEARCH_FOCUS_EVENT,
+  setActivePaneSearchScope,
+} from "@/lib/pane-search";
 import {
   FOLLOW_PIN_THRESHOLD,
   countNewItems,
@@ -97,6 +119,7 @@ import {
 import { ActiveStatusLine } from "./event-stream/active-status-line";
 import { WorkGroupRow } from "./event-stream/work-group";
 import { AskUserInlineCard } from "./ask-user-inline";
+import { EventStreamSearchBar } from "./event-stream-search-bar";
 import { pathBasename } from "@/lib/path-utils";
 
   // streaming placeholder 作为 list 末尾的「虚拟 item」、参与虚拟滚动
@@ -399,8 +422,8 @@ const VIEWPORT_OVERSCAN = { top: 0, bottom: 400 };
  * 两条的显示条件都含「用户滚离底部」，琥珀条只是多要一个未答提问——
  * 也就是「琥珀条出现 ⟹ 回底按钮一定也在」。共存位置必须由同一处拍板，
  * 各定各的迟早在窄面板（task 模式右栏）里叠上。这里的分工是
- * **回底按钮蹲右下角（贴着输入区、市面统一位置）、琥珀条居中悬在它上一排**，
- * 横向纵向都错开、宽度再窄也不会压。
+ * **琥珀条横向居中（bottom-14）；回底按钮在右下角（bottom-3 right-3）**，
+ * 纵向错开、不在同一横轴上叠成一团。
  *
  * 另外只订阅一次跟随态：贴底翻转只重渲这一颗，主组件不参与
  * （滚动热路径上重渲整条事件流本身就是抖动源）。
@@ -408,6 +431,7 @@ const VIEWPORT_OVERSCAN = { top: 0, bottom: 400 };
 const StreamFloatingBar = ({
   follow,
   contentCount,
+  prependBaselineBumpRef,
   hasPendingAsk,
   onJumpToAsk,
   onBackToBottom,
@@ -415,6 +439,8 @@ const StreamFloatingBar = ({
   follow: StreamFollowController;
   /** 当前内容条数（工作过程组已摊开）——算「离开底部后又追加了几条」的基准 */
   contentCount: number;
+  /** loadEarlier prepend 后待同步的基线抬升量（消费即清零） */
+  prependBaselineBumpRef: MutableRefObject<number>;
   hasPendingAsk: boolean;
   onJumpToAsk: () => void;
   onBackToBottom: () => void;
@@ -423,10 +449,13 @@ const StreamFloatingBar = ({
   // 离开底部那一刻的条数基线。用 ref 不用 state：它是从 props 推出来的缓存、
   // 自己不该触发重渲；推进函数幂等，渲染期写安全（StrictMode 双渲同结果）
   const baselineRef = useRef(contentCount);
+  const prependDelta = prependBaselineBumpRef.current;
+  if (prependDelta > 0) prependBaselineBumpRef.current = 0;
   baselineRef.current = nextNewItemsBaseline(
     baselineRef.current,
     contentCount,
     following,
+    prependDelta,
   );
   // 贴底跟随中 = 最新内容就在眼前，两条都不用出
   if (following) return null;
@@ -445,26 +474,27 @@ const StreamFloatingBar = ({
         </button>
       )}
       {/* 有新内容时摊成带计数的胶囊、没有就是个纯圆钮；两态同高（h-9）、不跳 */}
-      <Button
-        variant="outline"
-        size={newCount > 0 ? "lg" : "icon-lg"}
-        onClick={onBackToBottom}
-        title="回到最新"
-        // 无新内容时只有一个箭头图标、没有可读文本，读屏得靠它
-        aria-label="回到最新"
-        className={cn(
-          "absolute bottom-3 right-3 z-10 rounded-full bg-background/90 text-xs shadow-md backdrop-blur",
-          newCount > 0 && "px-3.5",
-        )}
-      >
-        <ArrowDownIcon />
-        {newCount > 0 && (
-          // 长 action 能刷出四位数、胶囊会被撑得离谱——封顶显示
-          <span className="tabular-nums">
-            {newCount > 99 ? "99+" : newCount} 条新内容
-          </span>
-        )}
-      </Button>
+      <Tooltip content="回到最新">
+        <Button
+          variant="outline"
+          size={newCount > 0 ? "lg" : "icon-lg"}
+          onClick={onBackToBottom}
+          // 无新内容时只有一个箭头图标、没有可读文本，读屏得靠它
+          aria-label="回到最新"
+          className={cn(
+            "absolute bottom-3 right-3 z-10 rounded-full bg-background/90 text-xs shadow-md backdrop-blur",
+            newCount > 0 && "px-3.5",
+          )}
+        >
+          <ArrowDownIcon />
+          {newCount > 0 && (
+            // 长 action 能刷出四位数、胶囊会被撑得离谱——封顶显示
+            <span className="tabular-nums">
+              {newCount > 99 ? "99+" : newCount} 条新内容
+            </span>
+          )}
+        </Button>
+      </Tooltip>
     </>
   );
 };
@@ -505,6 +535,15 @@ const buildStreamItems = (
   const tools = runActive ? merged : coerceStaleRunningTools(merged);
   return groupChatRenderItems(tools);
 };
+
+/** 与 contentCount 同一计量：工作过程组按成员摊开（loadEarlier 算 prepend 增量用） */
+const countStreamContentUnits = (
+  units: Array<StreamRenderItem | WorkGroupItem | RenderItem>,
+): number =>
+  units.reduce(
+    (n, it) => n + (it.kind === "__work_group__" ? it.members.length : 1),
+    0,
+  );
 
 const EventStreamImpl = ({
   task,
@@ -690,13 +729,95 @@ const EventStreamImpl = ({
   // 挂 orderedItems 不挂 items：虚拟项（streaming / loading）跟着 chunk 变，
   // 让计数每秒重算几十次不值当；流式那段落成 assistant_message 事件时自然计进来。
   const contentCount = useMemo(
-    () =>
-      orderedItems.reduce(
-        (n, it) => n + (it.kind === "__work_group__" ? it.members.length : 1),
-        0,
-      ),
+    () => countStreamContentUnits(orderedItems),
     [orderedItems],
   );
+  // 上拉 prepend 后待抬高「新内容」基线的增量（StreamFloatingBar 渲染期消费）
+  const prependBaselineBumpRef = useRef(0);
+  // Virtuoso prepend 的锚定基准；itemContent 回调会带此偏移，命令式 scrollToIndex
+  // 仍使用 data 本地下标（两套坐标不要混用）。
+  const [firstItemIndex, setFirstItemIndex] = useState(FIRST_INDEX_BASE);
+
+  // ---------- 事件流内联搜索 ----------
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHitIndex, setSearchHitIndex] = useState(-1);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const lastSearchQueryRef = useRef("");
+  const searchScrollRootRef = useRef<HTMLElement | null>(null);
+  const [searchScrollRoot, setSearchScrollRoot] = useState<HTMLElement | null>(
+    null,
+  );
+
+  const activateStreamSearch = useCallback(() => {
+    setActivePaneSearchScope("event-stream");
+    setSearchActive(true);
+    searchInputRef.current?.focus();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    });
+  }, []);
+
+  const closeStreamSearch = useCallback(() => {
+    setSearchActive(false);
+    setSearchQuery("");
+    setSearchHitIndex(-1);
+  }, []);
+
+  useEffect(() => {
+    const onFocusSearch = () => activateStreamSearch();
+    window.addEventListener(EVENT_STREAM_SEARCH_FOCUS_EVENT, onFocusSearch);
+    return () =>
+      window.removeEventListener(EVENT_STREAM_SEARCH_FOCUS_EVENT, onFocusSearch);
+  }, [activateStreamSearch]);
+
+  const searchOccurrences = useMemo(
+    () =>
+      searchActive
+        ? searchEventStreamRenderOccurrences(items, searchQuery)
+        : [],
+    [items, searchActive, searchQuery],
+  );
+
+  const isSearchFiltering =
+    searchActive &&
+    normalizeEventStreamSearchQuery(searchQuery).length > 0;
+
+  const currentSearchOwnerId =
+    searchHitIndex >= 0
+      ? (searchOccurrences[searchHitIndex]?.ownerId ?? null)
+      : null;
+  const currentSearchOwnerOccurrenceIndex = ownerOccurrenceIndexAt(
+    searchOccurrences,
+    searchHitIndex,
+  );
+
+  const searchHitOwnerIds = useMemo(() => {
+    if (!isSearchFiltering) return new Set<string>();
+    return new Set(searchOccurrences.map((o) => o.ownerId));
+  }, [isSearchFiltering, searchOccurrences]);
+
+  // 查询 / 事件变化：保持 occurrence 下标
+  useEffect(() => {
+    if (!isSearchFiltering) {
+      setSearchHitIndex(-1);
+      return;
+    }
+    setSearchHitIndex((prev) =>
+      stabilizeOccurrenceIndex(prev, searchOccurrences.length),
+    );
+  }, [searchOccurrences, isSearchFiltering]);
+
+  // 搜索 / 跳旧事件：暂停自动跟随
+  useEffect(() => {
+    if (isSearchFiltering) follow.setFollowing(false);
+  }, [follow, isSearchFiltering]);
+
+  // 切 task 退出搜索并重置查询记忆
+  useEffect(() => {
+    closeStreamSearch();
+    lastSearchQueryRef.current = "";
+  }, [task.id, closeStreamSearch]);
 
   // 全流最后一个工作过程组 id：尾部 running 展开判定用（isRunningTail）。
   // 挂 orderedItems 不挂 items——虚拟项里没有工作过程组，跟着 chunk 重算纯属浪费
@@ -757,6 +878,169 @@ const EventStreamImpl = ({
   // items 最新快照：rangeChanged / sticky 点击不闭包陈旧 items
   const itemsRef = useRef(items);
   itemsRef.current = items;
+
+  const attachScrollerRef = useCallback(
+    (el: HTMLElement | Window | null) => {
+      follow.attachScroller(el);
+      const root = el instanceof HTMLElement ? el : null;
+      searchScrollRootRef.current = root;
+      setSearchScrollRoot(root);
+    },
+    [follow],
+  );
+
+  const scrollToSearchHit = useCallback(
+    (eventId: string | null) => {
+      if (!eventId) return;
+      const idx = findRenderIndexForEventId(itemsRef.current, eventId);
+      if (idx < 0) return;
+      follow.setFollowing(false);
+      virtuosoRef.current?.scrollToIndex({
+        // scrollToIndex 使用 data 的本地下标；firstItemIndex 只服务 prepend 锚定。
+        // 传绝对偏移会被 Virtuoso 钳制到末项，导致所有搜索跳转看似失效。
+        index: idx,
+        align: "center",
+        behavior: "auto",
+      });
+    },
+    [follow],
+  );
+
+  const goToSearchHit = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= searchOccurrences.length) return;
+      setSearchHitIndex(index);
+    },
+    [searchOccurrences.length],
+  );
+
+  const goToNextSearchHit = useCallback(() => {
+    const next = stepOccurrenceIndex(
+      searchHitIndex,
+      searchOccurrences.length,
+      "next",
+    );
+    if (next >= 0) goToSearchHit(next);
+  }, [goToSearchHit, searchHitIndex, searchOccurrences.length]);
+
+  const goToPrevSearchHit = useCallback(() => {
+    const prev = stepOccurrenceIndex(
+      searchHitIndex,
+      searchOccurrences.length,
+      "prev",
+    );
+    if (prev >= 0) goToSearchHit(prev);
+  }, [goToSearchHit, searchHitIndex, searchOccurrences.length]);
+
+  useEffect(() => {
+    if (!isSearchFiltering || searchOccurrences.length === 0) return;
+    if (lastSearchQueryRef.current !== searchQuery) {
+      lastSearchQueryRef.current = searchQuery;
+      goToSearchHit(0);
+    }
+  }, [goToSearchHit, isSearchFiltering, searchOccurrences.length, searchQuery]);
+
+  useEffect(() => {
+    if (!isSearchFiltering || !currentSearchOwnerId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+
+    const revealMountedTarget = (): boolean => {
+      const root = searchScrollRootRef.current;
+      const matches = root
+        ? findOwnerDomSearchMatches(root, searchQuery)
+        : [];
+      const target = matches.find(
+        (match) =>
+          match.ownerId === currentSearchOwnerId &&
+          match.ownerOccurrenceIndex === currentSearchOwnerOccurrenceIndex,
+      );
+      if (target) {
+        applyDomSearchHighlights(
+          matches,
+          "flowship-event-search",
+          "flowship-event-search-active",
+          (match) => match === target,
+        );
+        scrollDomSearchMatchIntoView(target, root);
+        return true;
+      }
+      return false;
+    };
+
+    // 同一虚拟视口内切换命中时直接精确滚到文字，避免先滚整行、再滚文字造成抖动。
+    // 只有目标尚未挂载时才先唤醒对应 Virtuoso 行，再等待正文出现。
+    if (revealMountedTarget()) return;
+    scrollToSearchHit(currentSearchOwnerId);
+
+    const revealTarget = () => {
+      if (cancelled || revealMountedTarget()) return;
+      // Virtuoso 目标行和命中后自动展开的正文都可能晚一拍挂载；在一秒内重试，
+      // 避免旧实现只查一次、遇到隐藏/未挂载内容就静默失效。
+      attempts += 1;
+      if (attempts < 25) timer = setTimeout(revealTarget, 40);
+    };
+    timer = setTimeout(revealTarget, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [
+    currentSearchOwnerOccurrenceIndex,
+    currentSearchOwnerId,
+    isSearchFiltering,
+    searchQuery,
+    scrollToSearchHit,
+  ]);
+
+  // 高亮以当前已渲染 DOM 为准。虚拟列表换行、折叠区展开或流式文本变化后自动重建，
+  // 不再让 Streamdown 的块级 memo 留下旧查询的半截 <mark>。
+  useEffect(() => {
+    const root = searchScrollRoot;
+    if (!root || !isSearchFiltering) {
+      clearDomSearchHighlights(
+        "flowship-event-search",
+        "flowship-event-search-active",
+      );
+      return;
+    }
+    let frame = 0;
+    const refresh = () => {
+      frame = 0;
+      const matches = findOwnerDomSearchMatches(root, searchQuery);
+      applyDomSearchHighlights(
+        matches,
+        "flowship-event-search",
+        "flowship-event-search-active",
+        (match) =>
+          match.ownerId === currentSearchOwnerId &&
+          match.ownerOccurrenceIndex === currentSearchOwnerOccurrenceIndex,
+      );
+    };
+    const scheduleRefresh = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(refresh);
+    };
+    scheduleRefresh();
+    const observer = new MutationObserver(scheduleRefresh);
+    observer.observe(root, { childList: true, subtree: true, characterData: true });
+    return () => {
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+      clearDomSearchHighlights(
+        "flowship-event-search",
+        "flowship-event-search-active",
+      );
+    };
+  }, [
+    currentSearchOwnerId,
+    currentSearchOwnerOccurrenceIndex,
+    isSearchFiltering,
+    searchQuery,
+    searchScrollRoot,
+  ]);
+
   const applyStickyTurn = (next: { id: string; text: string } | null) => {
     const nextId = next?.id ?? null;
     // 同 id 已应用过 → 跳过（滚动热路径高频）
@@ -777,7 +1061,6 @@ const EventStreamImpl = ({
 
   // ---------- v1.0.x 事件懒加载（上拉分页） ----------
   // firstItemIndex：Virtuoso prepend 保滚动位置的官方机制——头部插 N 个 item 就减 N
-  const [firstItemIndex, setFirstItemIndex] = useState(FIRST_INDEX_BASE);
   // 还有没有更早的可拉（初值来自 task.eventsTruncated、之后由分页响应维护）
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   // 拉取飞行中（顶部小 spinner、渲染用）
@@ -845,12 +1128,20 @@ const EventStreamImpl = ({
       if (fresh.length > 0) {
         // items 增量不能直接用 fresh.length：渲染层有 thinking / tool 配对 /
         // chat 工作组跨页合并——必须与 items 同一套 buildStreamItems 算前后条数差值
-        const beforeLen = buildStreamItems(cur, isChat, isRunning).length;
-        const afterLen = buildStreamItems(
+        const beforeItems = buildStreamItems(cur, isChat, isRunning);
+        const afterItems = buildStreamItems(
           [...fresh, ...cur],
           isChat,
           isRunning,
-        ).length;
+        );
+        const beforeLen = beforeItems.length;
+        const afterLen = afterItems.length;
+        // 非贴底时 prepend 会让 contentCount 变大，须同步抬高基线以免误报「N 条新内容」
+        if (!follow.isFollowing()) {
+          prependBaselineBumpRef.current +=
+            countStreamContentUnits(afterItems) -
+            countStreamContentUnits(beforeItems);
+        }
         onPrependEvents(fresh);
         setFirstItemIndex((fi) => fi - (afterLen - beforeLen));
       }
@@ -1108,12 +1399,59 @@ const EventStreamImpl = ({
   return (
     // 跟随控制器透给深层子树：工作过程组的「自动折叠」要看用户是不是在翻历史
     <StreamFollowContext.Provider value={follow}>
-    <div className="flex h-full flex-col">
-      {/* chat 形态不渲染「事件流」标签条（ChatView 自有顶部 bar、少一层视觉框） */}
-      {!isChat && (
-        <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs text-muted-foreground">
-          事件流
-        </div>
+    <PaneSearchHighlightProvider
+      value={
+        isSearchFiltering
+          ? {
+              // 文本高亮统一交给 DOM/CSS Highlight；这里只保留 owner 集合，供折叠行
+              // 自动展开。否则 Streamdown memo 会残留上一次查询生成的局部 <mark>。
+              query: "",
+              activeGlobalIndex: -1,
+              occurrences: [],
+              hitOwnerIds: searchHitOwnerIds,
+            }
+          : null
+      }
+    >
+    <div
+      className="flex h-full flex-col"
+      data-pane-search="event-stream"
+      onPointerDown={() => setActivePaneSearchScope("event-stream")}
+    >
+      {/* chat 形态：顶栏只放搜索；log 形态带「事件流」标题 */}
+      {!isChat ? (
+        <EventStreamSearchBar
+          active={searchActive}
+          query={searchQuery}
+          hitIndex={searchHitIndex}
+          hitCount={searchOccurrences.length}
+          onActivate={activateStreamSearch}
+          onQueryChange={setSearchQuery}
+          onClose={closeStreamSearch}
+          onPrev={goToPrevSearchHit}
+          onNext={goToNextSearchHit}
+          inputRef={searchInputRef}
+          placeholder="搜索 AI 回复…"
+          ariaLabel="搜索 AI 回复"
+          leading={<span className="flex-1">事件流</span>}
+          className="h-10 shrink-0 border-b px-4"
+        />
+      ) : (
+        <EventStreamSearchBar
+          active={searchActive}
+          query={searchQuery}
+          hitIndex={searchHitIndex}
+          hitCount={searchOccurrences.length}
+          onActivate={activateStreamSearch}
+          onQueryChange={setSearchQuery}
+          onClose={closeStreamSearch}
+          onPrev={goToPrevSearchHit}
+          onNext={goToNextSearchHit}
+          inputRef={searchInputRef}
+          placeholder="搜索 AI 回复…"
+          ariaLabel="搜索 AI 回复"
+          className="shrink-0 justify-end border-b px-4 py-1.5"
+        />
       )}
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
           relative：给「AI 在等你回答」悬浮条定位 */}
@@ -1125,28 +1463,29 @@ const EventStreamImpl = ({
             className="pointer-events-none absolute inset-x-0 top-0 z-10 hidden"
           >
             <div className="mx-auto w-full max-w-3xl px-6">
-              <button
-                type="button"
-                onClick={() => {
-                  const id = stickyTurnIdRef.current;
-                  if (!id) return;
-                  const idx = itemsRef.current.findIndex((it) => it.id === id);
-                  if (idx >= 0) {
-                    virtuosoRef.current?.scrollToIndex({
-                      index: idx,
-                      align: "start",
-                      behavior: "smooth",
-                    });
-                  }
-                }}
-                title="回到本轮开头"
-                className="pointer-events-auto flex w-full cursor-pointer items-center rounded-b-md border-x border-b border-border/40 bg-background/75 px-3 py-1.5 text-left text-xs text-muted-foreground backdrop-blur transition-colors hover:text-foreground"
-              >
-                <span
-                  ref={stickyTextRef}
-                  className="min-w-0 flex-1 truncate"
-                />
-              </button>
+              <Tooltip content="回到本轮开头">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const id = stickyTurnIdRef.current;
+                    if (!id) return;
+                    const idx = itemsRef.current.findIndex((it) => it.id === id);
+                    if (idx >= 0) {
+                      virtuosoRef.current?.scrollToIndex({
+                        index: idx,
+                        align: "start",
+                        behavior: "smooth",
+                      });
+                    }
+                  }}
+                  className="pointer-events-auto flex w-full cursor-pointer items-center rounded-b-md border-x border-b border-border/40 bg-background/75 px-3 py-1.5 text-left text-xs text-muted-foreground backdrop-blur transition-colors hover:text-foreground"
+                >
+                  <span
+                    ref={stickyTextRef}
+                    className="min-w-0 flex-1 truncate"
+                  />
+                </button>
+              </Tooltip>
             </div>
           </div>
         )}
@@ -1157,6 +1496,7 @@ const EventStreamImpl = ({
           key={task.id}
           follow={follow}
           contentCount={contentCount}
+          prependBaselineBumpRef={prependBaselineBumpRef}
           hasPendingAsk={!!pendingAskEvent}
           onJumpToAsk={jumpToPendingAsk}
           onBackToBottom={backToBottom}
@@ -1188,7 +1528,7 @@ const EventStreamImpl = ({
             context={{ loadingEarlier }}
             components={VIRTUOSO_COMPONENTS}
             // 滚动容器交给跟随控制器接手势（滚轮 / 触摸 / 键盘 / 拖滚动条）
-            scrollerRef={follow.attachScroller}
+            scrollerRef={attachScrollerRef}
             // 条数变化时的跟随：跟不跟由控制器说了算（Virtuoso 自己的 isAtBottom 只看
             // 几何、看不出「用户刚往上翻」）。behavior 必须是 "auto"——
             // 老实现这里用 smooth，跟流式那条瞬时滚同时存在：smooth 动画滚到一半被
@@ -1231,8 +1571,15 @@ const EventStreamImpl = ({
               const idx = absIdx - firstItemIndex;
               return (
               <div
+                data-search-owner-id={
+                  item.kind === "__work_group__" ||
+                  item.kind === "__tool_block__" ||
+                  item.kind === "__tool_verb_group__"
+                    ? undefined
+                    : item.id
+                }
                 className={cn(
-                  "px-4",
+                  "min-w-0 max-w-full px-4",
                   isChat && "mx-auto w-full max-w-3xl px-6",
                   isChat
                     ? idx === 0
@@ -1266,7 +1613,12 @@ const EventStreamImpl = ({
                     </div>
                   )}
                 {isStreamingItem(item) ? (
-                  <StreamingAssistantRow text={item.text} variant={variant} />
+                  <StreamingAssistantRow
+                    text={item.text}
+                    variant={variant}
+                    baseDir={task.workCwd}
+                    ownerId="__streaming__"
+                  />
                 ) : isLoadingItem(item) ? (
                   <PendingRow />
                 ) : isBootStageItem(item) ? (
@@ -1275,6 +1627,7 @@ const EventStreamImpl = ({
                   <PendingLocalReplyRow
                     text={item.text}
                     uncertain={item.uncertain}
+                    ownerId={item.id}
                   />
                 ) : item.kind === "__work_group__" ? (
                   <WorkGroupRow
@@ -1374,6 +1727,7 @@ const EventStreamImpl = ({
         </div>
       )}
     </div>
+    </PaneSearchHighlightProvider>
     </StreamFollowContext.Provider>
   );
 };

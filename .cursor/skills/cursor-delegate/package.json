@@ -1,0 +1,8 @@
+{
+  "name": "cursor-delegate-skill",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  }
+}

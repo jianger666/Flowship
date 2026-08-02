@@ -29,6 +29,7 @@ import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -181,16 +182,17 @@ const InstanceCardHeader = ({
         />
       </div>
     ) : null}
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
-      className="mt-4 size-8 shrink-0"
-      title="删除"
-      onClick={onRemove}
-    >
-      <Trash2 className="size-3.5" />
-    </Button>
+    <Tooltip content="删除">
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="mt-4 size-8 shrink-0"
+        onClick={onRemove}
+      >
+        <Trash2 className="size-3.5" />
+      </Button>
+    </Tooltip>
   </div>
 );
 
@@ -253,16 +255,17 @@ const StringListEditor = ({
           placeholder={placeholder}
           className="h-8 font-mono text-xs"
         />
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0 text-muted-foreground"
-          title="删除"
-          onClick={() => onCommit(lines.filter((_, j) => j !== i))}
-        >
-          <X className="size-3.5" />
-        </Button>
+        <Tooltip content="删除">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0 text-muted-foreground"
+            onClick={() => onCommit(lines.filter((_, j) => j !== i))}
+          >
+            <X className="size-3.5" />
+          </Button>
+        </Tooltip>
       </div>
     ))}
     <AddRowButton label={addLabel} onClick={() => onCommit([...lines, ""])} />
@@ -605,21 +608,22 @@ export const CompanyEnvSection = ({
                         </SelectContent>
                       </Select>
                     </MiniField>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="mt-4 size-8 shrink-0"
-                      title="删除"
-                      onClick={() => {
-                        commit({
-                          ...value,
-                          servers: servers.filter((_, j) => j !== i),
-                        });
-                      }}
-                    >
-                      <Trash2 className="size-3.5" />
-                    </Button>
+                    <Tooltip content="删除">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="mt-4 size-8 shrink-0"
+                        onClick={() => {
+                          commit({
+                            ...value,
+                            servers: servers.filter((_, j) => j !== i),
+                          });
+                        }}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </Tooltip>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     <MiniField label="主机">
@@ -911,21 +915,22 @@ export const CompanyEnvSection = ({
                           }
                         />
                       </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="mt-4 size-8 shrink-0"
-                        title="删除"
-                        onClick={() => {
-                          commit({
-                            ...value,
-                            xxljob: value.xxljob.filter((_, j) => j !== i),
-                          });
-                        }}
-                      >
-                        <Trash2 className="size-3.5" />
-                      </Button>
+                      <Tooltip content="删除">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="mt-4 size-8 shrink-0"
+                          onClick={() => {
+                            commit({
+                              ...value,
+                              xxljob: value.xxljob.filter((_, j) => j !== i),
+                            });
+                          }}
+                        >
+                          <Trash2 className="size-3.5" />
+                        </Button>
+                      </Tooltip>
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       <MiniField label="用户名">

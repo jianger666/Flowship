@@ -34,9 +34,11 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownText } from "@/components/markdown-text";
-import { SkillTokenText } from "@/components/slash-skills";
+import { SearchHighlightText } from "@/components/ui/search-highlight-text";
+import { useOwnerHasSearchHit } from "@/components/ui/pane-search-highlight-context";
 import {
   ImageThumb,
   type PreviewImage,
@@ -102,9 +104,13 @@ const QUOTE_MAX_LENGTH = 1000;
 const StreamingAssistantRowImpl = ({
   text,
   variant = "log",
+  baseDir,
+  ownerId = "__streaming__",
 }: {
   text: string;
   variant?: "log" | "chat";
+  baseDir?: string;
+  ownerId?: string;
 }) => {
   // chat 形态：跟正式 AI 回复同样平铺（Streamdown streaming 模式自带流式动画、无容器）
   // 字号 / 行高必须与正式 assistant 气泡（text-[15px] leading-7）一致——
@@ -112,7 +118,13 @@ const StreamingAssistantRowImpl = ({
   if (variant === "chat") {
     return (
       <div className="text-[15px] leading-7">
-        <MarkdownText text={text} streaming />
+        <MarkdownText
+          text={text}
+          streaming
+          baseDir={baseDir}
+          searchOwnerId={ownerId}
+          searchField="extra0"
+        />
       </div>
     );
   }
@@ -130,7 +142,13 @@ const StreamingAssistantRowImpl = ({
         </div>
         <div className="mt-1 leading-relaxed wrap-break-word text-foreground">
           {/* 流式过程按 markdown 渲染、Streamdown 未闭合块平滑处理 */}
-          <MarkdownText text={text} streaming />
+          <MarkdownText
+          text={text}
+          streaming
+          baseDir={baseDir}
+          searchOwnerId={ownerId}
+          searchField="extra0"
+        />
         </div>
       </div>
     </div>
@@ -234,7 +252,11 @@ const ProcessEventRow = ({
               ev.meta?.notice === true && "whitespace-pre-wrap",
             )}
           >
-            {ev.text}
+            <SearchHighlightText
+              ownerId={ev.id}
+              field="body"
+              text={ev.text}
+            />
           </div>
         )}
       </div>
@@ -267,7 +289,9 @@ export const ReconnectingRow = memo(
         ) : (
           <Loader2 className="size-3.5 shrink-0 animate-spin" />
         )}
-        <span className={cn(settled && "opacity-60")}>{ev.text}</span>
+        <span className={cn(settled && "opacity-60")}>
+          <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
+        </span>
         <span className="text-[11px] text-muted-foreground/70">
           {formatTs(ev.ts)}
         </span>
@@ -279,15 +303,22 @@ ReconnectingRow.displayName = "ReconnectingRow";
 
 /** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐 */
 export const PendingLocalReplyRow = memo(
-  ({ text, uncertain }: { text: string; uncertain?: boolean }) => (
+  ({
+    text,
+    uncertain,
+    ownerId,
+  }: {
+    text: string;
+    uncertain?: boolean;
+    ownerId: string;
+  }) => (
     <div className="ml-auto flex w-fit max-w-[85%] items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
       <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
         <span className="mb-0.5 block text-[11px] tracking-wide">
           {uncertain ? "发送状态未知、正在确认…" : "待发送"}
         </span>
-        {/* 原文：SkillTokenText 解析 skill token、正文即用户消息 */}
-        <SkillTokenText text={text} />
+        <SearchHighlightText ownerId={ownerId} field="extra0" text={text} />
       </div>
     </div>
   ),
@@ -334,11 +365,11 @@ const EventRowImpl = ({
   /** agent 正在跑：隐藏回退按钮 */
   runActive?: boolean;
 }) => {
-  // V0.6：用 actionId 查 action 类型、渲染 tag
   const action = ev.actionId
     ? task.actions.find((a) => a.id === ev.actionId)
     : undefined;
   const actionType: ActionType | undefined = action?.type;
+  const markdownBaseDir = action?.cwd ?? task.workCwd;
 
   // 原地编辑态（仅 chat 用户消息 + onResend 存在时有意义）：
   // editing=进入编辑、editDraft=编辑草稿（进入时用原文初始化）
@@ -472,6 +503,15 @@ const EventRowImpl = ({
   // 组件内 state、用户手动切换后保持（不会被新事件刷掉）
   const defaultCollapsed = !isDefaultVisible;
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const hasSearchHit = useOwnerHasSearchHit(ev.id);
+
+  useEffect(() => {
+    if (hasSearchHit) setCollapsed(false);
+  }, [hasSearchHit]);
+
+  useEffect(() => {
+    if (hasSearchHit) setUserExpanded(true);
+  }, [hasSearchHit]);
 
   const handleToggle = () => setCollapsed((c) => !c);
 
@@ -566,7 +606,12 @@ const EventRowImpl = ({
               }}
             />
           )}
-          <MarkdownText text={ev.text} />
+          <MarkdownText
+            text={ev.text}
+            baseDir={markdownBaseDir}
+            searchOwnerId={ev.id}
+            searchField="body"
+          />
           {guideDialog}
         </div>
       );
@@ -690,7 +735,7 @@ const EventRowImpl = ({
               userCollapsible && !userExpanded && "line-clamp-8",
             )}
           >
-            <SkillTokenText text={ev.text} />
+            <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
           </div>
           {userCollapsible && (
             <button
@@ -724,21 +769,24 @@ const EventRowImpl = ({
           {attachments.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {attachments.map((att) => (
-                <a
+                <Tooltip
                   key={att.absPath}
-                  {...(getIdeAnchorProps(att.absPath, undefined, jumpIde) ?? { href: "" })}
-                  className="flex max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
-                  title={`${att.absPath}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
+                  content={`${att.absPath}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
-                  {/* 目录 / 文件用图标形状区分即可；原来目录染 amber 会跟「等你行动」
-                      的品牌琥珀抢注意力（附件 chip 并不需要用户行动） */}
-                  {att.isDir ? (
-                    <Folder className="size-3 shrink-0 text-muted-foreground" />
-                  ) : (
-                    <FileIcon className="size-3 shrink-0 text-muted-foreground" />
-                  )}
-                  <span className="min-w-0 truncate font-mono">{pathBasename(att.absPath)}</span>
-                </a>
+                  <a
+                    {...(getIdeAnchorProps(att.absPath, undefined, jumpIde) ?? { href: "" })}
+                    className="flex min-w-0 max-w-full items-center gap-1 rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-[11px] no-underline hover:bg-muted"
+                  >
+                    {/* 目录 / 文件用图标形状区分即可；原来目录染 amber 会跟「等你行动」
+                        的品牌琥珀抢注意力（附件 chip 并不需要用户行动） */}
+                    {att.isDir ? (
+                      <Folder className="size-3 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FileIcon className="size-3 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="min-w-0 truncate font-mono">{pathBasename(att.absPath)}</span>
+                  </a>
+                </Tooltip>
               ))}
             </div>
           )}
@@ -772,19 +820,18 @@ const EventRowImpl = ({
     // reconnecting / boot 已在上层分流 / 过滤
     if (ev.kind === "info" && !isAwaitingAck && !isNotice) {
       return (
-        <div
-          className="group/info flex items-center justify-center gap-2 py-0.5"
-          title={ev.text}
-        >
-          <div className="h-px w-12 shrink bg-gradient-to-r from-transparent to-border" />
-          <span className="max-w-[70%] truncate text-[11px] text-muted-foreground/60">
-            {ev.text}
-          </span>
-          <span className="shrink-0 text-[11px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/info:opacity-100">
-            {formatTs(ev.ts)}
-          </span>
-          <div className="h-px w-12 shrink bg-gradient-to-l from-transparent to-border" />
-        </div>
+        <Tooltip content={ev.text}>
+          <div className="group/info flex items-center justify-center gap-2 py-0.5">
+            <div className="h-px w-12 shrink bg-gradient-to-r from-transparent to-border" />
+            <span className="max-w-[70%] truncate text-[11px] text-muted-foreground/60">
+              <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
+            </span>
+            <span className="shrink-0 text-[11px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/info:opacity-100">
+              {formatTs(ev.ts)}
+            </span>
+            <div className="h-px w-12 shrink bg-gradient-to-l from-transparent to-border" />
+          </div>
+        </Tooltip>
       );
     }
     // 过程行（thinking / tool_call / error / awaitingAck info…）：单行细条目、可展开
@@ -892,11 +939,20 @@ const EventRowImpl = ({
               )}
             >
               {isUser ? (
-                <SkillTokenText text={ev.text} />
+                <SearchHighlightText ownerId={ev.id} field="body" text={ev.text} />
               ) : useMarkdown ? (
-                <MarkdownText text={ev.text} />
+                <MarkdownText
+                  text={ev.text}
+                  baseDir={markdownBaseDir}
+                  searchOwnerId={ev.id}
+                  searchField="body"
+                />
               ) : (
-                ev.text
+                <SearchHighlightText
+                  ownerId={ev.id}
+                  field="body"
+                  text={ev.text}
+                />
               )}
             </div>
           ))}
@@ -935,21 +991,24 @@ const EventRowImpl = ({
               const anchor =
                 getIdeAnchorProps(att.absPath, undefined, jumpIde) ?? { href: "" };
               return (
-                <a
+                <Tooltip
                   key={att.absPath}
-                  {...anchor}
-                  className="flex max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs no-underline hover:bg-muted"
-                  title={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
+                  content={`${att.absPath}${sizeStr ? ` · ${sizeStr}` : ""}\n点击在 ${JUMP_IDE_LABEL[jumpIde]} 中打开`}
                 >
-                  {att.isDir ? (
-                    <Folder className="size-3 shrink-0 text-muted-foreground" />
-                  ) : (
-                    <FileIcon className="size-3 shrink-0 text-muted-foreground" />
-                  )}
-                  <span className="min-w-0 truncate font-mono text-[11px] text-info">
-                    {pathBasename(att.absPath)}
-                  </span>
-                </a>
+                  <a
+                    {...anchor}
+                    className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border bg-card px-2 py-1 text-xs no-underline hover:bg-muted"
+                  >
+                    {att.isDir ? (
+                      <Folder className="size-3 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FileIcon className="size-3 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="min-w-0 truncate font-mono text-[11px] text-info">
+                      {pathBasename(att.absPath)}
+                    </span>
+                  </a>
+                </Tooltip>
               );
             })}
           </div>
@@ -1120,7 +1179,12 @@ const AskUserRequestRowImpl = ({ ev, task }: AskUserRequestRowProps) => {
       {/* 已答：展示拼接好的 Q&A markdown */}
       {answered && replyEvent && (
         <div className="rounded-md border bg-card/60 px-3 py-2 text-sm">
-          <MarkdownText text={replyEvent.text} />
+          <MarkdownText
+            text={replyEvent.text}
+            baseDir={task.workCwd}
+            searchOwnerId={replyEvent.id}
+            searchField="body"
+          />
         </div>
       )}
     </div>

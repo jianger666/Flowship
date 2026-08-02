@@ -21,6 +21,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { EmptyHint } from "@/components/ui/empty-hint";
+import { Tooltip } from "@/components/ui/tooltip";
 import { LoadingState } from "@/components/ui/loading-state";
 import { summarize } from "@/components/tasks/event-stream/utils";
 import { prepareRunArgs } from "@/lib/run-args";
@@ -150,40 +151,45 @@ export const ChatQueueBanner = ({ task, queuedCount }: Props) => {
                   key={it.itemId}
                   className="flex items-center gap-1 rounded-md px-1.5 py-1 hover:bg-muted/40"
                 >
-                  <span
-                    className="min-w-0 flex-1 truncate text-xs"
-                    title={it.displayText}
-                  >
-                    {summarize(it.displayText) || "（纯附件消息）"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleSendNow(it.itemId)}
-                    disabled={busy}
-                    title="立即发送（打断当前回复）"
-                    aria-label="立即发送"
-                    className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
-                  >
-                    {sendingNow.has(it.itemId) ? (
-                      <Loader2 className="size-3 animate-spin" />
-                    ) : (
-                      <Zap className="size-3" />
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(it.itemId)}
-                    disabled={busy}
-                    title="从队列删除"
-                    aria-label="删除"
-                    className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-destructive disabled:opacity-50"
-                  >
-                    {deleting.has(it.itemId) ? (
-                      <Loader2 className="size-3 animate-spin" />
-                    ) : (
-                      <Trash2 className="size-3" />
-                    )}
-                  </button>
+                  <Tooltip content={it.displayText}>
+                    <span className="min-w-0 flex-1 truncate text-xs">
+                      {summarize(it.displayText) || "（纯附件消息）"}
+                    </span>
+                  </Tooltip>
+                  <Tooltip content="立即发送（打断当前回复）">
+                    <span className="inline-flex">
+                      <button
+                        type="button"
+                        onClick={() => handleSendNow(it.itemId)}
+                        disabled={busy}
+                        aria-label="立即发送"
+                        className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                      >
+                        {sendingNow.has(it.itemId) ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Zap className="size-3" />
+                        )}
+                      </button>
+                    </span>
+                  </Tooltip>
+                  <Tooltip content="从队列删除">
+                    <span className="inline-flex">
+                      <button
+                        type="button"
+                        onClick={() => handleDelete(it.itemId)}
+                        disabled={busy}
+                        aria-label="删除"
+                        className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-destructive disabled:opacity-50"
+                      >
+                        {deleting.has(it.itemId) ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-3" />
+                        )}
+                      </button>
+                    </span>
+                  </Tooltip>
                 </li>
               );
             })}

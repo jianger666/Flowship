@@ -243,62 +243,70 @@ export const TaskListItem = ({
         <div className="absolute inset-y-0 right-1 my-auto flex h-6 items-center gap-0.5">
           {pinReorder && (
             <>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={pinReorder.onMoveUp}
-                disabled={!pinReorder.canMoveUp}
-                title="上移"
-                aria-label={`上移 ${task.title}`}
-                className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
-              >
-                <ChevronUp className="size-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={pinReorder.onMoveDown}
-                disabled={!pinReorder.canMoveDown}
-                title="下移"
-                aria-label={`下移 ${task.title}`}
-                className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
-              >
-                <ChevronDown className="size-3.5" />
-              </Button>
+              <Tooltip content="上移">
+                <span className="inline-flex">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={pinReorder.onMoveUp}
+                    disabled={!pinReorder.canMoveUp}
+                    aria-label={`上移 ${task.title}`}
+                    className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
+                  >
+                    <ChevronUp className="size-3.5" />
+                  </Button>
+                </span>
+              </Tooltip>
+              <Tooltip content="下移">
+                <span className="inline-flex">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={pinReorder.onMoveDown}
+                    disabled={!pinReorder.canMoveDown}
+                    aria-label={`下移 ${task.title}`}
+                    className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-30"
+                  >
+                    <ChevronDown className="size-3.5" />
+                  </Button>
+                </span>
+              </Tooltip>
             </>
           )}
           {onPin && (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => onPin(task)}
-              title={task.pinned ? "取消置顶" : "置顶"}
-              aria-label={
-                task.pinned ? `取消置顶 ${task.title}` : `置顶 ${task.title}`
-              }
-              className={cn(
-                "size-6 transition-opacity",
-                task.pinned
-                  ? "text-primary opacity-100"
-                  : "text-muted-foreground opacity-0 hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100",
-              )}
-            >
-              <Pin className={cn("size-3.5", task.pinned && "fill-current")} />
-            </Button>
+            <Tooltip content={task.pinned ? "取消置顶" : "置顶"}>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => onPin(task)}
+                aria-label={
+                  task.pinned ? `取消置顶 ${task.title}` : `置顶 ${task.title}`
+                }
+                className={cn(
+                  "size-6 transition-opacity",
+                  task.pinned
+                    ? "text-primary opacity-100"
+                    : "text-muted-foreground opacity-0 hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100",
+                )}
+              >
+                <Pin className={cn("size-3.5", task.pinned && "fill-current")} />
+              </Button>
+            </Tooltip>
           )}
           {hasMenu && (
             <DropdownMenu>
-              <DropdownMenuTrigger
-                title="更多"
-                aria-label={`更多操作 ${task.title}`}
-                className={cn(
-                  "inline-flex size-6 items-center justify-center rounded-md text-muted-foreground outline-none transition-opacity",
-                  "opacity-0 hover:bg-accent hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring",
-                  "data-popup-open:opacity-100",
-                )}
-              >
-                <MoreHorizontal className="size-3.5" />
-              </DropdownMenuTrigger>
+              <Tooltip content="更多">
+                <DropdownMenuTrigger
+                  aria-label={`更多操作 ${task.title}`}
+                  className={cn(
+                    "inline-flex size-6 items-center justify-center rounded-md text-muted-foreground outline-none transition-opacity",
+                    "opacity-0 hover:bg-accent hover:text-foreground group-hover/item:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring",
+                    "data-popup-open:opacity-100",
+                  )}
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </DropdownMenuTrigger>
+              </Tooltip>
               <DropdownMenuContent align="end" side="bottom" className="min-w-28">
                 <DropdownMenuItem
                   onClick={() => onRename?.(task)}
@@ -311,17 +319,20 @@ export const TaskListItem = ({
             </DropdownMenu>
           )}
           {onDelete && (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => onDelete(task)}
-              disabled={deleteDisabled}
-              title="删除任务"
-              aria-label={`删除任务 ${task.title}`}
-              className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
-            >
-              <Trash2 className="size-3.5" />
-            </Button>
+            <Tooltip content="删除任务">
+              <span className="inline-flex">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={() => onDelete(task)}
+                  disabled={deleteDisabled}
+                  aria-label={`删除任务 ${task.title}`}
+                  className="size-6 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/item:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
+                >
+                  <Trash2 className="size-3.5" />
+                </Button>
+              </span>
+            </Tooltip>
           )}
         </div>
       )}

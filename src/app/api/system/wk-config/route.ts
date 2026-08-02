@@ -35,9 +35,11 @@ export const GET = async () => {
 };
 
 export const PUT = async (req: Request) => {
-  let body: { config?: Partial<WkConfig> };
+  let body: {
+    config?: Partial<WkConfig>;
+  };
   try {
-    body = (await req.json()) as { config?: Partial<WkConfig> };
+    body = (await req.json()) as typeof body;
   } catch {
     return errorResponse("请求体不是合法 JSON");
   }
@@ -59,11 +61,17 @@ export const PUT = async (req: Request) => {
     return errorResponse(`Delivery Hub 地址格式不对：${hubRaw}`);
   }
 
-  // 客户端只能定这两项；两个 require_* 由 applyWkConfig 固定写 true（有地址时），
-  // 没地址时三个 delivery_hub 键一起删（官方脚本 require_* 缺 base_url 会 FAIL 挡住 wk:*）
+  const hubToken =
+    typeof raw.hubToken === "string" ? raw.hubToken.trim() : "";
+  if (hubToken.length > 4096) {
+    return errorResponse("Delivery Hub Token 过长");
+  }
+
+  // 两个 require_* 由 applyWkConfig 固定写 true（有地址时）。
   const config: WkConfigInput = {
     docRepoPath,
     hubBaseUrl: hubBaseUrl || "",
+    hubToken,
   };
 
   try {

@@ -20,6 +20,7 @@ import {
 import { AuthorByline } from "@/components/ui/author-byline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -251,24 +252,26 @@ export const InstallTeamActions = ({ onInstalled }: Props) => {
         </p>
         <div className="flex shrink-0 items-center gap-1.5">
           {status?.syncedAt != null && (
-            <span
-              className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground"
-              title={new Date(status.syncedAt).toLocaleString("zh-CN")}
+            <Tooltip
+              content={new Date(status.syncedAt).toLocaleString("zh-CN")}
             >
-              {formatRelative(status.syncedAt)}
-            </span>
+              <span className="max-w-[5.5rem] truncate text-[11px] text-muted-foreground">
+                {formatRelative(status.syncedAt)}
+              </span>
+            </Tooltip>
           )}
-          <Button
-            type="button"
-            size="icon-xs"
-            variant="ghost"
-            aria-label="同步"
-            title="同步"
-            disabled={syncing || !!busyName}
-            onClick={() => void handleSync()}
-          >
-            {syncing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-          </Button>
+          <Tooltip content="同步">
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="ghost"
+              aria-label="同步"
+              disabled={syncing || !!busyName}
+              onClick={() => void handleSync()}
+            >
+              {syncing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            </Button>
+          </Tooltip>
         </div>
       </div>
 

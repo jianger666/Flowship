@@ -41,25 +41,24 @@ describe("探测结论跟地址绑定", () => {
   });
 });
 
-describe("非法地址回滚", () => {
-  it("打回落盘值后补探一次（savedHubUrl 没变、自动探那个 effect 不会重跑）", () => {
+describe("非法地址不保存", () => {
+  it("显式保存时先校验地址，非法值直接返回", () => {
     const idx = card.indexOf("Delivery Hub 地址格式不对");
     expect(idx).toBeGreaterThan(0);
-    const branch = card.slice(idx, idx + 500);
-    expect(branch).toContain('update("hubBaseUrl", saved.hubBaseUrl)');
-    expect(branch).toContain("runProbe(saved.hubBaseUrl)");
-    // 落盘地址本来就是空的（没配过）→ 没什么可探的，直接收状态
-    expect(branch).toContain("setProbe(null)");
+    const returnIdx = card.indexOf("return;", idx);
+    const saveIdx = card.indexOf("save(", idx);
+    expect(returnIdx).toBeGreaterThan(idx);
+    expect(saveIdx).toBeGreaterThan(returnIdx);
   });
 });
 
 /**
  * 2026-07-28 用户拍板砍掉「运行前拉取最新产物 / 产物变更推回」两个开关
  * （「这是理应开启的」）——写盘那层固定 true，UI 上不能再冒出来。
- * 一起锁住两行的名字：这两个 label 在门禁提示里被引用（「设置页 → 团队 wk 流程」），
- * 改名要连提示一起改。
+ * 一起锁住连接项的名字：目录和 Hub label 在门禁提示里被引用
+ * （「设置页 → 团队 wk 流程」），改名要连提示一起改。
  */
-describe("这一节只剩两行", () => {
+describe("这一节的连接配置", () => {
   it("两个开关连同联动逻辑都没了", () => {
     expect(card).not.toContain("<Switch");
     expect(card).not.toContain("requireBaseline");
@@ -68,12 +67,35 @@ describe("这一节只剩两行", () => {
     expect(card).not.toContain("hubSwitchHint");
   });
 
-  it("行名是 WK产出目录 + Delivery Hub", () => {
+  it("域名和 Token 合并成一个 Delivery Hub 配置块", () => {
     expect(card).toContain('label="WK产出目录"');
     expect(card).toContain('label="Delivery Hub"');
+    expect(card).not.toContain('label="Delivery Hub Token"');
+    expect(card).toContain("服务地址");
+    expect(card).toContain("访问 Token");
   });
 
   it("Hub 输入框拿 DEFAULT_HUB_BASE_URL 当 placeholder（真值由服务端播种）", () => {
     expect(card).toContain("placeholder={DEFAULT_HUB_BASE_URL}");
+  });
+
+  it("Token 回填密码框，支持自动覆盖和显式清除", () => {
+    expect(card).toContain("config.hubTokenConfigured");
+    expect(card).toContain("value={config.hubToken}");
+    expect(card).toContain("onBlur={handleTokenCommit}");
+    expect(card).toContain('hubToken: ""');
+    expect(card).toContain('autoComplete="new-password"');
+  });
+
+  it("测试连接同时提交当前地址和 Token 草稿", () => {
+    expect(card).toContain("测试会同时验证服务地址和 Token");
+    expect(card).toContain("runProbe(draftHubUrl, config.hubToken.trim()");
+    expect(card).toContain("...(token ? { token } : {})");
+  });
+
+  it("地址和 Token 都失焦自动保存，不出现额外保存按钮", () => {
+    expect(card).toContain("onBlur={handleHubCommit}");
+    expect(card).toContain("onBlur={handleTokenCommit}");
+    expect(card).not.toContain("保存配置");
   });
 });

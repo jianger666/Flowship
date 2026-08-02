@@ -18,7 +18,7 @@
  *   - 全站 shadcn oklch token、Streamdown 组件直接吃现有主题变量
  */
 
-import { memo } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 import {
   Streamdown,
   defaultRemarkPlugins,
@@ -34,8 +34,23 @@ import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 
 import { cn } from "@/lib/utils";
+import { useSearchFieldGlobalOffset } from "@/components/ui/pane-search-highlight-context";
+import { rehypeSearchHighlight } from "@/lib/rehype-search-highlight";
 import { MarkdownLink } from "@/components/markdown-link";
 import { MarkdownImage } from "@/components/ui/image-preview";
+import { Tooltip } from "@/components/ui/tooltip";
+import {
+  LocalFileLink,
+  LocalFilePathSegments,
+  useLocalFilePathLinker,
+  type LocalFilePathLinker,
+} from "@/components/ui/local-file-link";
+import { resolveLocalFileAbsolute } from "@/components/ui/local-file-preview-context";
+import {
+  looksLikePath,
+  parsePathSegments,
+  pathDisplayLabel,
+} from "@/lib/path-utils";
 import { rehypeRewriteLocalImages } from "@/lib/rehype-rewrite-local-images";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
@@ -69,27 +84,163 @@ export const STREAMDOWN_CONTROLS = {
   table: false,
   mermaid: { copy: false, download: false, fullscreen: true, panZoom: true },
 } as const;
-// a/img 覆盖：我们的组件用宽松 props（string|Blob 等）、跟 Streamdown Components 的
-// 严格签名对不上、这里整体断言（运行时形状兼容、只是类型系统更严）
-const MARKDOWN_COMPONENTS = {
-  a: MarkdownLink,
-  img: MarkdownImage,
-} as unknown as Components;
+
+/** 产物栏 / 本地文件预览等「文档面」共用 prose 壳；禁止再复制一份 className 字符串 */
+export const MARKDOWN_PROSE_DOCUMENT = cn(
+  "prose prose-sm dark:prose-invert max-w-none",
+  "prose-headings:scroll-mt-4",
+  "prose-code:before:content-none prose-code:after:content-none",
+  "min-w-0 wrap-break-word",
+);
+// remarkCodeReference 插入的出处行：`path · L12-34`
+const CODE_REF_CAPTION_SEP = " · L";
+
+const parseCodeRefCaption = (
+  text: string,
+): { path: string; line?: number; display: string } | null => {
+  const idx = text.indexOf(CODE_REF_CAPTION_SEP);
+  if (idx <= 0) return null;
+  const path = text.slice(0, idx);
+  const lineMatch = /^(\d+)/.exec(text.slice(idx + CODE_REF_CAPTION_SEP.length));
+  if (!lineMatch || !looksLikePath(path)) return null;
+  const line = Number(lineMatch[1]);
+  const suffix = text.slice(idx);
+  return { path, line, display: `${pathDisplayLabel(path)}${suffix}` };
+};
+
+const buildMarkdownComponents = (
+  linker: LocalFilePathLinker,
+): Components =>
+  ({
+    a: MarkdownLink,
+    img: MarkdownImage,
+    // Streamdown 的 inline code 槽（覆盖 code 会连 fenced 一起接管、失去 Shiki）
+    inlineCode: ({
+      children,
+      ...rest
+    }: {
+      children?: ReactNode;
+      [key: string]: unknown;
+    }) => {
+      const text = String(children ?? "");
+      const caption = parseCodeRefCaption(text);
+      const pathText = caption?.path ?? text;
+      const line = caption?.line;
+
+      if (looksLikePath(pathText)) {
+        const resolved = resolveLocalFileAbsolute(pathText, linker.baseDir);
+        const parsed = parsePathSegments(pathText);
+        if (resolved && parsed && parsed.segments.length > 1) {
+          return (
+            <LocalFilePathSegments
+              linker={linker}
+              parsedPath={parsed.path}
+              segments={parsed.segments}
+              className="text-[0.85em]"
+            />
+          );
+        }
+        if (!resolved) {
+          return (
+            <Tooltip content={text}>
+              <span className="min-w-0 max-w-full" {...rest}>
+                <span className="font-mono text-[0.85em] text-foreground">{text}</span>
+              </span>
+            </Tooltip>
+          );
+        }
+        return (
+          <LocalFileLink
+            linker={linker}
+            path={pathText}
+            line={line}
+            linkClassName="font-mono text-[0.85em] text-info underline-offset-2 hover:underline"
+          >
+            {caption?.display ?? pathDisplayLabel(resolved.absolute)}
+          </LocalFileLink>
+        );
+      }
+      return <code {...rest}>{children}</code>;
+    },
+  }) as unknown as Components;
 
 interface MarkdownTextProps {
   text: string;
   /** 是否流式中（AI 还在吐字）——开动画光标 + 未闭合块平滑处理 */
   streaming?: boolean;
+  /** 相对路径解析基准（task cwd）；不传则路径类 inline code 退化为纯文本 */
+  baseDir?: string;
+  /** chat = 事件流密度；document = 产物栏 / 预览弹窗文档面（同 MARKDOWN_PROSE_DOCUMENT） */
+  variant?: "chat" | "document";
+  /** 外层 prose 容器额外 class */
+  className?: string;
+  /** 栏内搜索：事件 / 产物 ownerId（与 PaneSearchHighlightContext 或显式 props 配合） */
+  searchOwnerId?: string;
+  /** 栏内搜索字段 key，默认 body */
+  searchField?: string;
+  /** 显式搜索高亮（产物栏等不挂 Context 时用） */
+  searchQuery?: string;
+  searchActiveGlobalIndex?: number;
+  searchGlobalOffset?: number;
 }
 
-const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
+const MarkdownTextImpl = ({
+  text,
+  streaming,
+  baseDir,
+  variant = "chat",
+  className,
+  searchOwnerId,
+  searchField = "body",
+  searchQuery: searchQueryProp,
+  searchActiveGlobalIndex: searchActiveProp = -1,
+  searchGlobalOffset: searchGlobalOffsetProp,
+}: MarkdownTextProps) => {
+  const linker = useLocalFilePathLinker(baseDir);
+  const components = useMemo(
+    () => buildMarkdownComponents(linker),
+    [linker],
+  );
+  const ctxHighlight = useSearchFieldGlobalOffset(
+    searchOwnerId ?? "",
+    searchField,
+  );
+  const searchQuery = searchQueryProp ?? ctxHighlight?.query ?? "";
+  const searchActiveGlobalIndex =
+    searchActiveProp >= 0
+      ? searchActiveProp
+      : (ctxHighlight?.activeGlobalIndex ?? -1);
+  const searchGlobalOffset =
+    searchGlobalOffsetProp ?? ctxHighlight?.globalOffset ?? -1;
+
+  const rehypePlugins = useMemo(() => {
+    const base = [...STREAMDOWN_REHYPE_PLUGINS];
+    if (searchQuery.trim() && searchGlobalOffset >= 0) {
+      base.push(
+        rehypeSearchHighlight({
+          query: searchQuery,
+          activeGlobalIndex: searchActiveGlobalIndex,
+          globalOffset: searchGlobalOffset,
+        }),
+      );
+    }
+    return base;
+  }, [searchQuery, searchActiveGlobalIndex, searchGlobalOffset]);
+
+  return (
   <div
+    data-search-content="true"
     className={cn(
-      "prose prose-sm dark:prose-invert max-w-none wrap-break-word",
-      // 聊天密度：默认 prose 段间距太松、缩紧
-      "prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0",
-      "prose-headings:mt-2 prose-headings:mb-1",
-      "prose-code:before:content-none prose-code:after:content-none",
+      variant === "document"
+        ? MARKDOWN_PROSE_DOCUMENT
+        : [
+            "prose prose-sm dark:prose-invert min-w-0 max-w-full wrap-break-word",
+            // 聊天密度：默认 prose 段间距太松、缩紧
+            "prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0",
+            "prose-headings:mt-2 prose-headings:mb-1",
+            "prose-code:before:content-none prose-code:after:content-none",
+          ],
+      className,
     )}
   >
     <Streamdown
@@ -100,8 +251,8 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
       shikiTheme={SHIKI_THEME}
       plugins={STREAMDOWN_PLUGINS}
       remarkPlugins={REMARK_PLUGINS}
-      rehypePlugins={STREAMDOWN_REHYPE_PLUGINS}
-      components={MARKDOWN_COMPONENTS}
+      rehypePlugins={rehypePlugins}
+      components={components}
       controls={STREAMDOWN_CONTROLS}
       // 行号视觉上不要（globals.css 藏 ::before 计数器）、但 **不能传 lineNumbers=false**：
       // 上游该路径行 span 不带 block class 也不吐换行、整块代码塌成一行（headless 实测）
@@ -109,7 +260,8 @@ const MarkdownTextImpl = ({ text, streaming }: MarkdownTextProps) => (
       {text}
     </Streamdown>
   </div>
-);
+  );
+};
 
 // memo：text 频繁因 chunk 追加而变化、其它 props 稳定——SSE 推 chunk 时才重渲
 export const MarkdownText = memo(MarkdownTextImpl);

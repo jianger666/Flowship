@@ -65,6 +65,7 @@ export const nextFollowing = (prev: boolean, input: FollowInput): boolean => {
  * - 跟随中：基线持续跟平当前条数（计数恒 0、离开时天然就是当下这条）
  * - 离开后：基线冻住；但仍取 min——条数变少（切 task / 事件被裁）时基线要跟着降下来，
  *   否则会「欠着一大截」、之后真来了新内容也一直显示 0
+ * - 非跟随态下头部 prepend 历史：调用方传入 prependDelta、同步抬高基线，避免历史加载被误计
  *
  * 幂等（同一输入重复跑结果不变），所以可以在渲染期直接写进 ref。
  */
@@ -72,7 +73,12 @@ export const nextNewItemsBaseline = (
   prevBaseline: number,
   itemCount: number,
   following: boolean,
-): number => (following ? itemCount : Math.min(prevBaseline, itemCount));
+  /** 非跟随态下头部 prepend 的历史条数——同步抬高基线，避免被误算成「新内容」 */
+  prependDelta = 0,
+): number => {
+  const base = following ? itemCount : Math.min(prevBaseline, itemCount);
+  return following || prependDelta <= 0 ? base : base + prependDelta;
+};
 
 /** 基线到当前条数的差值（负数夹到 0） */
 export const countNewItems = (baseline: number, itemCount: number): number =>

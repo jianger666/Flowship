@@ -13,6 +13,7 @@ import { FileDown, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 
 export const DiagnosticsButton = () => {
   // 导出中：防双击
@@ -44,16 +45,17 @@ export const DiagnosticsButton = () => {
   };
 
   return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      disabled={exporting}
-      onClick={() => void handleExport()}
-      title="导出版本 / IDE 探测 / 日志尾部（已脱敏）、发给维护者排查"
-    >
-      {exporting ? <Loader2 className="animate-spin" /> : <FileDown />}
-      导出诊断包
-    </Button>
+    <Tooltip content="导出版本 / IDE 探测 / 日志尾部（已脱敏）、发给维护者排查">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={exporting}
+        onClick={() => void handleExport()}
+      >
+        {exporting ? <Loader2 className="animate-spin" /> : <FileDown />}
+        导出诊断包
+      </Button>
+    </Tooltip>
   );
 };

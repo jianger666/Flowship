@@ -34,6 +34,7 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
@@ -231,17 +232,18 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
             <>
               <DialogHeader>
                 <DialogTitle className="flex min-w-0 items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    onClick={() => setDetailDocId(null)}
-                    aria-label="返回列表"
-                    title="返回列表"
-                    className="shrink-0"
-                  >
-                    <ArrowLeft />
-                  </Button>
+                  <Tooltip content="返回列表">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => setDetailDocId(null)}
+                      aria-label="返回列表"
+                      className="shrink-0"
+                    >
+                      <ArrowLeft />
+                    </Button>
+                  </Tooltip>
                   <span className="truncate min-w-0">{detailDoc.title}</span>
                   <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
                     {detailDoc.type}
@@ -356,34 +358,36 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                         </span>
                       )}
                       {/* 标题 + 预览区整体可点、进详情看全文（V0.11.x 用户痛点：加完看不了详情） */}
-                      <button
-                        type="button"
-                        onClick={() => setDetailDocId(doc.id)}
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left cursor-pointer"
-                        title="查看详情"
-                      >
-                        <span className="font-medium text-foreground/90 shrink-0 group-hover:underline underline-offset-2">
-                          {doc.title}
-                        </span>
-                        <span className="text-muted-foreground truncate flex-1 min-w-0">
-                          {renderPreview(doc)}
-                        </span>
-                      </button>
+                      <Tooltip content="查看详情">
+                        <button
+                          type="button"
+                          onClick={() => setDetailDocId(doc.id)}
+                          className="flex min-w-0 flex-1 items-center gap-2 text-left cursor-pointer"
+                        >
+                          <span className="font-medium text-foreground/90 shrink-0 group-hover:underline underline-offset-2">
+                            {doc.title}
+                          </span>
+                          <span className="text-muted-foreground truncate flex-1 min-w-0">
+                            {renderPreview(doc)}
+                          </span>
+                        </button>
+                      </Tooltip>
                       <span className="text-[11px] uppercase text-muted-foreground/60 shrink-0">
                         {doc.type}
                       </span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-xs"
-                        onClick={() => handleRemove(doc.id)}
-                        disabled={removingId === doc.id}
-                        className="text-muted-foreground/60 shrink-0 hover:bg-destructive/10 hover:text-destructive"
-                        aria-label="删除"
-                        title="删除"
-                      >
-                        <Trash2 />
-                      </Button>
+                      <Tooltip content="删除">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => handleRemove(doc.id)}
+                          disabled={removingId === doc.id}
+                          className="text-muted-foreground/60 shrink-0 hover:bg-destructive/10 hover:text-destructive"
+                          aria-label="删除"
+                        >
+                          <Trash2 />
+                        </Button>
+                      </Tooltip>
                     </li>
                   );
                 })}
@@ -463,24 +467,29 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                   index={i}
                 />
               ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={attach.triggerFilePicker}
-                disabled={attach.images.length >= attach.maxImages}
-                title={
+              <Tooltip
+                content={
                   attach.images.length >= attach.maxImages
                     ? `已达上限 ${attach.maxImages} 张`
                     : "选图片（也可在内容框粘贴 / 拖拽到本卡）"
                 }
               >
-                <ImagePlus />
-                附图
-                <span className="ml-1 text-[11px] text-muted-foreground">
-                  {attach.images.length}/{attach.maxImages}
+                <span className="inline-flex">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={attach.triggerFilePicker}
+                    disabled={attach.images.length >= attach.maxImages}
+                  >
+                    <ImagePlus />
+                    附图
+                    <span className="ml-1 text-[11px] text-muted-foreground">
+                      {attach.images.length}/{attach.maxImages}
+                    </span>
+                  </Button>
                 </span>
-              </Button>
+              </Tooltip>
               <input
                 ref={attach.fileInputRef}
                 type="file"

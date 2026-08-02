@@ -12,6 +12,7 @@ import { Eye, EyeOff } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { SettingRow } from "@/components/ui/setting-row";
 
@@ -46,15 +47,16 @@ export const GitLabSection = ({
             placeholder="glpat-..."
             className="font-mono"
           />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={() => setShowToken((s) => !s)}
-            title={showToken ? "隐藏" : "显示"}
-          >
-            {showToken ? <EyeOff /> : <Eye />}
-          </Button>
+          <Tooltip content={showToken ? "隐藏" : "显示"}>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => setShowToken((s) => !s)}
+            >
+              {showToken ? <EyeOff /> : <Eye />}
+            </Button>
+          </Tooltip>
         </div>
       }
     />

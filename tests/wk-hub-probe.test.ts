@@ -18,7 +18,12 @@ import {
 } from "@/lib/wk-hub";
 
 /** 造一个假 fetch，省得真发请求 */
-const fakeFetch = (impl: () => Promise<Response>): typeof fetch =>
+const fakeFetch = (
+  impl: (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => Promise<Response>,
+): typeof fetch =>
   impl as unknown as typeof fetch;
 
 const jsonResponse = (body: unknown, status = 200): Response =>
@@ -88,6 +93,36 @@ describe("probeWkHub", () => {
       fakeFetch(async () => jsonResponse({ data: { exists: false } })),
     );
     expect(res.status).toBe("ok");
+  });
+
+  it("带 Token 时使用 Authorization Bearer，且不会进入返回结果", async () => {
+    let authorization = "";
+    const res = await probeWkHub(
+      "http://127.0.0.1:8088",
+      fakeFetch(async (_input, init) => {
+        authorization = new Headers(init?.headers).get("authorization") ?? "";
+        return jsonResponse({ data: { exists: false } });
+      }),
+      "wkdh_test-secret",
+    );
+    expect(authorization).toBe("Bearer wkdh_test-secret");
+    expect(JSON.stringify(res)).not.toContain("wkdh_test-secret");
+  });
+
+  it("401 / 403 明确提示 Token 问题", async () => {
+    const unauthorized = await probeWkHub(
+      "http://127.0.0.1:8088",
+      fakeFetch(async () => jsonResponse({}, 401)),
+      "bad-token",
+    );
+    expect(unauthorized.message).toContain("Token");
+
+    const forbidden = await probeWkHub(
+      "http://127.0.0.1:8088",
+      fakeFetch(async () => jsonResponse({}, 403)),
+      "bad-token",
+    );
+    expect(forbidden.message).toContain("Token");
   });
 
   it("HTTP 404 → unexpected（端口上有服务但不是 harness 接口）", async () => {

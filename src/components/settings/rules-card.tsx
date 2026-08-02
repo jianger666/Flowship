@@ -13,6 +13,7 @@ import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Card,
   CardContent,
@@ -265,16 +266,17 @@ export const RulesCard = () => {
                 <div key={r.name} className="flex items-center gap-2 px-3 py-2">
                   <div className={cn("min-w-0 flex-1", !r.enabled && "opacity-50")}>
                     <div className="flex items-center gap-1.5">
-                      <span className="truncate text-sm" title={primary}>
-                        {primary}
-                      </span>
+                      <Tooltip content={primary}>
+                        <span className="truncate text-sm">
+                          {primary}
+                        </span>
+                      </Tooltip>
                     </div>
-                    <div
-                      className="truncate text-[11px] text-muted-foreground"
-                      title={r.absPath}
-                    >
-                      {r.name}
-                    </div>
+                    <Tooltip content={r.absPath}>
+                      <div className="truncate text-[11px] text-muted-foreground">
+                        {r.name}
+                      </div>
+                    </Tooltip>
                   </div>
                   {/* 行操作：常驻文字按钮（与能力页 Skill/Action 统一） */}
                   <Button

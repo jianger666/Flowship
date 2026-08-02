@@ -27,6 +27,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -186,37 +187,41 @@ export const WorkspaceActions = ({ task }: Props) => {
             预览中
           </span>
           {mine.url && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className={BTN_CLS}
-              nativeButton={false}
-              render={
-                <a
-                  href={mine.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="no-underline"
-                  title={`打开 ${mine.url}`}
-                />
-              }
-            >
-              <ExternalLink className="size-3" />
-              打开
-            </Button>
+            <Tooltip content={`打开 ${mine.url}`}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={BTN_CLS}
+                nativeButton={false}
+                render={
+                  <a
+                    href={mine.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="no-underline"
+                  />
+                }
+              >
+                <ExternalLink className="size-3" />
+                打开
+              </Button>
+            </Tooltip>
           )}
           <PreviewLogPopover slot={mine} />
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            disabled={busy}
-            onClick={() => void stop(repoPath)}
-            title="停止预览 dev server"
-          >
-            {busy ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
-            停止
-          </Button>
+          <Tooltip content="停止预览 dev server">
+            <span className="inline-flex">
+              <Button
+                variant="ghost"
+                size="sm"
+                className={BTN_CLS}
+                disabled={busy}
+                onClick={() => void stop(repoPath)}
+              >
+                {busy ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
+                停止
+              </Button>
+            </span>
+          </Tooltip>
         </>
       );
     }
@@ -228,17 +233,20 @@ export const WorkspaceActions = ({ task }: Props) => {
             预览已退出{mine.exitCode !== null ? `（exit ${mine.exitCode}）` : ""}
           </span>
           <PreviewLogPopover slot={mine} />
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            disabled={busy}
-            onClick={() => void start(mine.repoPath)}
-            title="用同一命令重新启动预览"
-          >
-            <Play className="size-3" />
-            重试
-          </Button>
+          <Tooltip content="用同一命令重新启动预览">
+            <span className="inline-flex">
+              <Button
+                variant="ghost"
+                size="sm"
+                className={BTN_CLS}
+                disabled={busy}
+                onClick={() => void start(mine.repoPath)}
+              >
+                <Play className="size-3" />
+                重试
+              </Button>
+            </span>
+          </Tooltip>
         </>
       );
     }
@@ -250,22 +258,27 @@ export const WorkspaceActions = ({ task }: Props) => {
       (s) => s.repoPath === repoPath && s.taskId !== task.id && !s.exited,
     );
     return (
-      <Button
-        variant="ghost"
-        size="sm"
-        className={BTN_CLS}
-        disabled={busy}
-        onClick={() => void start(c.repoPath)}
-        title={
+      <Tooltip
+        content={
           `在任务工作区起 dev server：${c.command}` +
           (occupiedByOther
             ? `\n（会停掉「${occupiedByOther.taskTitle}」对该仓的预览）`
             : "")
         }
       >
-        {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
-        预览
-      </Button>
+        <span className="inline-flex">
+          <Button
+            variant="ghost"
+            size="sm"
+            className={BTN_CLS}
+            disabled={busy}
+            onClick={() => void start(c.repoPath)}
+          >
+            {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
+            预览
+          </Button>
+        </span>
+      </Tooltip>
     );
   };
 
@@ -285,33 +298,35 @@ export const WorkspaceActions = ({ task }: Props) => {
               <span className="px-1 text-[11px] text-muted-foreground">{t.shortName}</span>
             )}
             {anchor && (
+              <Tooltip content={`在 IDE 打开项目\n${t.workDir}`}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={BTN_CLS}
+                  nativeButton={false}
+                  render={
+                    <a
+                      {...anchor}
+                      className="no-underline"
+                    />
+                  }
+                >
+                  <SquareArrowOutUpRight className="size-3" />
+                  在 IDE 打开
+                </Button>
+              </Tooltip>
+            )}
+            <Tooltip content={`复制工作区路径\n${t.workDir}`}>
               <Button
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
-                nativeButton={false}
-                render={
-                  <a
-                    {...anchor}
-                    className="no-underline"
-                    title={`在 IDE 打开项目\n${t.workDir}`}
-                  />
-                }
+                onClick={() => void copyPath(t.workDir)}
               >
-                <SquareArrowOutUpRight className="size-3" />
-                在 IDE 打开
+                <Copy className="size-3" />
+                复制路径
               </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="sm"
-              className={BTN_CLS}
-              onClick={() => void copyPath(t.workDir)}
-              title={`复制工作区路径\n${t.workDir}`}
-            >
-              <Copy className="size-3" />
-              复制路径
-            </Button>
+            </Tooltip>
             {renderPreviewForRepo(t.repoPath)}
           </>
         );
@@ -357,22 +372,25 @@ export const WorkspaceActions = ({ task }: Props) => {
 
       {/* 打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
       {taskDirAnchor && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          nativeButton={false}
-          render={
-            <a
-              {...taskDirAnchor}
-              className="no-underline"
-              title={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
-            />
-          }
+        <Tooltip
+          content={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
         >
-          <FolderOpen className="size-3" />
-          任务文件夹
-        </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={BTN_CLS}
+            nativeButton={false}
+            render={
+              <a
+                {...taskDirAnchor}
+                className="no-underline"
+              />
+            }
+          >
+            <FolderOpen className="size-3" />
+            任务文件夹
+          </Button>
+        </Tooltip>
       )}
     </div>
   );
@@ -383,21 +401,24 @@ const PreviewLogPopover = ({ slot }: { slot: PreviewSlotStatus }) => (
   <Popover>
     <PopoverTrigger
       render={
-        <Button
-          variant="ghost"
-          size="sm"
-          className={BTN_CLS}
-          title="查看 dev server 最近输出"
-        />
+        <Tooltip content="查看 dev server 最近输出">
+          <Button
+            variant="ghost"
+            size="sm"
+            className={BTN_CLS}
+          >
+            <FileTerminal className="size-3" />
+            日志
+          </Button>
+        </Tooltip>
       }
-    >
-      <FileTerminal className="size-3" />
-      日志
-    </PopoverTrigger>
+    />
     <PopoverContent align="start" className="w-[480px] p-2">
-      <div className="mb-1 truncate font-mono text-[11px] text-muted-foreground" title={slot.command}>
-        $ {slot.command}
-      </div>
+      <Tooltip content={slot.command}>
+        <div className="mb-1 truncate font-mono text-[11px] text-muted-foreground">
+          $ {slot.command}
+        </div>
+      </Tooltip>
       <pre className="max-h-64 overflow-auto whitespace-pre-wrap wrap-anywhere rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
         {slot.logTail.length > 0 ? slot.logTail.join("\n") : "（暂无输出）"}
       </pre>

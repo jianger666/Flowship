@@ -22,6 +22,7 @@ import { EmptyHint } from "@/components/ui/empty-hint";
 import { LoadingState } from "@/components/ui/loading-state";
 import { REPO_FILES_Q_MAX_LEN } from "@/lib/repo-files-shared";
 import { cn } from "@/lib/utils";
+import { Tooltip } from "@/components/ui/tooltip";
 
 /** 光标前「正在打 @」：行首或空白后的 @partial（partial 可含 `/`、可空） */
 export const AT_RE = /(^|\s)@([^\s:]*)$/;
@@ -267,9 +268,11 @@ export const AtMentionMenu = ({ at }: { at: AtMentionApi }) => {
               ) : (
                 <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
               )}
-              <span className="min-w-0 truncate font-mono text-xs" title={f.path}>
-                {f.path}
-              </span>
+              <Tooltip content={f.path}>
+                <span className="min-w-0 truncate font-mono text-xs">
+                  {f.path}
+                </span>
+              </Tooltip>
             </button>
           ))
         )}

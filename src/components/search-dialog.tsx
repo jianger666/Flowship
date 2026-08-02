@@ -110,7 +110,12 @@ const highlightMatch = (text: string, query: string): ReactNode => {
   return parts.length === 1 ? parts[0] : parts;
 };
 
-export const SearchDialog = () => {
+export const SearchDialog = ({
+  showTrigger = true,
+}: {
+  /** 侧栏放大镜已改本地搜索；全局仍靠 Cmd/Ctrl+K，触发按钮可选 */
+  showTrigger?: boolean;
+}) => {
   const router = useRouter();
   const { upsertTask } = useTaskList();
   // 面板开关
@@ -328,16 +333,18 @@ export const SearchDialog = () => {
 
   return (
     <>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        aria-label="搜索对话"
-        onClick={() => setOpen(true)}
-        className="shrink-0"
-      >
-        <Search className="size-4" />
-      </Button>
+      {showTrigger ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label="搜索对话"
+          onClick={() => setOpen(true)}
+          className="shrink-0"
+        >
+          <Search className="size-4" />
+        </Button>
+      ) : null}
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent

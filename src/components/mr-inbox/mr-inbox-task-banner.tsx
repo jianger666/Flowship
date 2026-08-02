@@ -12,6 +12,7 @@ import { Inbox, RefreshCw } from "lucide-react";
 
 import { MrInboxPanel } from "@/components/mr-inbox/mr-inbox-panel";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Popover,
   PopoverContent,
@@ -65,17 +66,20 @@ export const MrInboxTaskBanner = ({
           <MrInboxPanel filterWorkItemId={workItemId} />
         </PopoverContent>
       </Popover>
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        className="size-6"
-        onClick={() => void refresh({ force: true })}
-        disabled={refreshing}
-        aria-label="刷新提测收件箱"
-        title="重新扫描提测评论"
-      >
-        <RefreshCw className={cn("size-3", refreshing && "animate-spin")} />
-      </Button>
+      <Tooltip content="重新扫描提测评论">
+        <span className="inline-flex">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="size-6"
+            onClick={() => void refresh({ force: true })}
+            disabled={refreshing}
+            aria-label="刷新提测收件箱"
+          >
+            <RefreshCw className={cn("size-3", refreshing && "animate-spin")} />
+          </Button>
+        </span>
+      </Tooltip>
     </div>
   );
 };

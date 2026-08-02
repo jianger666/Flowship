@@ -12,6 +12,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useSubmitShortcut } from "@/hooks/use-settings";
+import { useShellPlatform } from "@/hooks/use-shell-platform";
+import { getModFShortcutLabel } from "@/lib/platform-shortcuts";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 
 interface Props {
@@ -28,9 +30,11 @@ const Kbd = ({ children }: { children: string }) => (
 
 export const KeyboardShortcutsDialog = ({ open, onOpenChange }: Props) => {
   const submitShortcut = useSubmitShortcut();
+  const platform = useShellPlatform();
   const submitKey = getSubmitShortcutTitle(submitShortcut);
 
   const rows: Array<{ label: string; keys: string[] }> = [
+    { label: "搜索此栏", keys: [getModFShortcutLabel(platform)] },
     { label: "搜索对话", keys: ["Cmd/Ctrl+K"] },
     { label: "新建对话", keys: ["Cmd/Ctrl+N"] },
     { label: "切换侧栏", keys: ["Cmd/Ctrl+B"] },

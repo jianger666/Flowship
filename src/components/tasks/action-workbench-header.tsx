@@ -19,6 +19,8 @@
 
 import { FileText } from "lucide-react";
 
+import { Tooltip } from "@/components/ui/tooltip";
+
 import { ActionTimeline } from "@/components/tasks/action-timeline";
 import type { ActionRecord } from "@/lib/types";
 
@@ -42,7 +44,7 @@ export const ActionWorkbenchHeader = ({
   artifactFilename,
 }: Props) => {
   return (
-    <div className="shrink-0 border-b px-4 py-2">
+    <div className="min-w-0 shrink-0 overflow-hidden border-b px-4 py-2">
       {/* timeline 独占整行、拿满宽度——不再跟文件名抢同一行的宽度。
           之前 filename 在右侧同行：选不同 action 文件名变长 / 点击瞬间产物加载时文件名先消失，
           都会改变 timeline 可用宽度 → 换行重排 → 抖动。拆成上下两行根治。 */}
@@ -55,16 +57,15 @@ export const ActionWorkbenchHeader = ({
       {/* 文件名单独一行 + 固定行高占位：加载中（artifactFilename 暂空）也不塌行、
           避免每次点击 load 时该行有无导致下方正文上下跳。action 单步状态用户拍板已移除。 */}
       {selectedAction && (
-        <div className="mt-1 flex h-4 items-center gap-1 text-xs text-muted-foreground">
+        <div className="mt-1 flex h-4 w-full min-w-0 items-center gap-1 text-xs text-muted-foreground">
           {artifactFilename && (
             <>
               <FileText className="size-3.5 shrink-0" />
-              <span
-                className="min-w-0 max-w-[60%] truncate"
-                title={artifactFilename}
-              >
-                {artifactFilename}
-              </span>
+              <Tooltip content={artifactFilename}>
+                <span className="min-w-0 flex-1 truncate">
+                  {artifactFilename}
+                </span>
+              </Tooltip>
             </>
           )}
         </div>

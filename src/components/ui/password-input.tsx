@@ -10,6 +10,7 @@ import { useState, type ComponentProps } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 type PasswordInputProps = Omit<ComponentProps<typeof Input>, "type"> & {
@@ -32,17 +33,18 @@ export const PasswordInput = ({
         type={show ? "text" : "password"}
         className={cn("min-w-0 flex-1", className)}
       />
-      <Button
-        type="button"
-        variant="outline"
-        size="icon"
-        className="size-8 shrink-0"
-        onClick={() => setShow((s) => !s)}
-        title={show ? "隐藏" : "显示"}
-        tabIndex={-1}
-      >
-        {show ? <EyeOff /> : <Eye />}
-      </Button>
+      <Tooltip content={show ? "隐藏" : "显示"}>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="size-8 shrink-0"
+          onClick={() => setShow((s) => !s)}
+          tabIndex={-1}
+        >
+          {show ? <EyeOff /> : <Eye />}
+        </Button>
+      </Tooltip>
     </div>
   );
 };

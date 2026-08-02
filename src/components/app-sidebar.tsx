@@ -16,7 +16,7 @@
  *
  * 内容（自上而下）：
  *  - 顶部一栏：对话模式 =「新建对话」；工作台 = 活跃任务小标题
- *  - 列表：chat = 置顶 / 仓组 / Home（可折叠）；task = 时间桶
+ *  - 全局全文搜索用 Cmd/Ctrl+K
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -24,7 +24,6 @@ import { useParams, useRouter } from "next/navigation";
 import { ChevronDown, ChevronRight, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 
-import { SearchDialog } from "@/components/search-dialog";
 import { TaskListItem } from "@/components/tasks/task-list-item";
 import { Button } from "@/components/ui/button";
 import { EmptyHint } from "@/components/ui/empty-hint";
@@ -386,7 +385,11 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
               onClick={() => void createChat()}
               disabled={creatingChat}
             >
-              {creatingChat ? <Loader2 className="animate-spin" /> : <Plus />}
+              {creatingChat ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Plus />
+              )}
               新建对话
             </Button>
           ) : (
@@ -394,8 +397,6 @@ export const AppSidebar = ({ open }: { open: boolean }) => {
               进行中的任务
             </div>
           )}
-          {/* 全文搜索：对话 / 工作台模式都可用；Cmd/Ctrl+K 由 SearchDialog 自挂 */}
-          <SearchDialog />
         </div>
 
         {/* 列表滚动区 */}

@@ -16,6 +16,7 @@
 import type { AnchorHTMLAttributes } from "react";
 
 import { useImagePreview } from "@/components/ui/image-preview";
+import { Tooltip } from "@/components/ui/tooltip";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
 
 const CLICKABLE = /^https?:\/\//;
@@ -34,21 +35,24 @@ export const MarkdownLink = ({
   if (href && LOCAL_IMAGE.test(href)) {
     const src = toLoadableImageSrc(href);
     return (
-      <button
-        type="button"
-        onClick={() => open([{ src, alt: href }])}
-        title={`预览图片：${href}`}
-        className="cursor-zoom-in font-mono text-[0.9em] text-primary underline-offset-2 hover:underline"
-      >
-        {children}
-      </button>
+      <Tooltip content={`预览图片：${href}`}>
+        <button
+          type="button"
+          onClick={() => open([{ src, alt: href }])}
+          className="cursor-zoom-in font-mono text-[0.9em] text-primary underline-offset-2 hover:underline"
+        >
+          {children}
+        </button>
+      </Tooltip>
     );
   }
   if (!href || !CLICKABLE.test(href)) {
     return (
-      <span className="font-mono text-[0.9em] text-foreground/80" title={href}>
-        {children}
-      </span>
+      <Tooltip content={href}>
+        <span className="font-mono text-[0.9em] text-foreground/80">
+          {children}
+        </span>
+      </Tooltip>
     );
   }
   return (

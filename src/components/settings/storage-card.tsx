@@ -22,6 +22,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   Card,
   CardContent,
@@ -363,9 +364,11 @@ export const StorageCard = () => {
                         className="gap-2.5 px-3 py-2 hover:bg-muted/40"
                         onCheckedChange={() => togglePick(e.id)}
                       >
-                        <span className="min-w-0 flex-1 truncate text-sm" title={e.title}>
-                          {e.title}
-                        </span>
+                        <Tooltip content={e.title}>
+                          <span className="min-w-0 flex-1 truncate text-sm">
+                            {e.title}
+                          </span>
+                        </Tooltip>
                         {/* 定宽容器：Badge 本身随 2–3 字变宽，包一层让行间列对齐 */}
                         <span className="flex w-14 shrink-0 justify-center">
                           <Badge variant="outline" size="xs">
@@ -417,9 +420,11 @@ export const StorageCard = () => {
                         className="gap-2.5 px-3 py-2 hover:bg-muted/40"
                         onCheckedChange={() => togglePick(key)}
                       >
-                        <span className="min-w-0 flex-1 truncate font-mono text-sm" title={s.id}>
-                          {s.id}
-                        </span>
+                        <Tooltip content={s.id}>
+                          <span className="min-w-0 flex-1 truncate font-mono text-sm">
+                            {s.id}
+                          </span>
+                        </Tooltip>
                         {/* 单行体积、无明细，窄定宽即可对齐 */}
                         <span className="w-24 shrink-0 whitespace-nowrap text-right font-mono text-xs">
                           {formatBytes(s.bytes)}

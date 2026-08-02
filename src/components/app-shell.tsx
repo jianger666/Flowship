@@ -23,6 +23,15 @@ import { usePathname } from "next/navigation";
 
 import { AppHeader } from "@/components/app-header";
 import { AppSidebar } from "@/components/app-sidebar";
+import { isModCombo } from "@/lib/keyboard-shortcuts";
+import {
+  dispatchArtifactSearchFocus,
+  dispatchEventStreamSearchFocus,
+  getActivePaneSearchScope,
+  resolvePaneSearchScope,
+  setActivePaneSearchScope,
+  type PaneSearchScope,
+} from "@/lib/pane-search";
 
 // 页型：board（看板首页、默认展——2026-07-13 用户拍板「和对话保持一致、别切来切去
 // 一收一放」）/ standalone（设置 / 能力页、默认收——这类页有自己的内部导航、任务侧栏
@@ -82,6 +91,49 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleSidebar]);
+
+  // Cmd/Ctrl+F：按作用域打开产物栏或事件流内联搜索（覆盖浏览器默认查找）
+  useEffect(() => {
+    const syncScopeFromTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return;
+      const pane = el.closest("[data-pane-search]");
+      if (!(pane instanceof HTMLElement)) return;
+      const scope = pane.dataset.paneSearch as PaneSearchScope | undefined;
+      if (scope === "event-stream" || scope === "artifact") {
+        setActivePaneSearchScope(scope);
+      }
+    };
+
+    const onPointerDown = (e: PointerEvent) => syncScopeFromTarget(e.target);
+    const onFocusIn = (e: FocusEvent) => syncScopeFromTarget(e.target);
+
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("focusin", onFocusIn);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("focusin", onFocusIn);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isModCombo(e, "f")) return;
+      const scope = resolvePaneSearchScope(
+        getActivePaneSearchScope(),
+        pathname,
+      );
+      if (!scope) return;
+      e.preventDefault();
+      if (scope === "artifact") {
+        dispatchArtifactSearchFocus();
+      } else {
+        dispatchEventStreamSearchFocus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pathname]);
 
   // 路由切换：主区归顶 + 重置 scrolled（详情页 h-full 不滚、避免残留上一页的分隔线）
   useEffect(() => {

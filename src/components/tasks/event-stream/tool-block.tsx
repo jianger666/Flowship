@@ -28,6 +28,7 @@ import {
   CopyableBlock,
   type CopyTextSource,
 } from "@/components/ui/copy-button";
+import { Tooltip } from "@/components/ui/tooltip";
 import {
   IdePathLink,
   useIdePathLinker,
@@ -149,8 +150,12 @@ const InlineDiff = ({
   return (
     // 复制的是 unified diff 原文（能直接贴回终端 / patch）；服务端截断过的就只有这些、
     // diff 没有「加载完整」通道（跟工具输出不同、落盘的只有截断后的那份）
-    <CopyableBlock text={diff} label="复制 diff" className="mt-1.5">
-      <div className="max-h-64 overflow-x-auto overflow-y-auto rounded-md border border-border/60 bg-muted/20">
+    <CopyableBlock
+      text={diff}
+      label="复制 diff"
+      className="mt-1.5 min-w-0 max-w-full"
+    >
+      <div className="max-h-64 w-full max-w-full overflow-auto rounded-md border border-border/60 bg-muted/20">
         {lines.map((line, i) => (
           <DiffLine key={i} line={line} linker={linker} filePath={filePath} />
         ))}
@@ -394,6 +399,11 @@ const TaskSubagentBlock = ({
       : block.result?.output;
 
   const outputBody = fullText ?? displayOutput;
+  const markdownBaseDir = useTaskBaseDir(
+    taskId,
+    !!outputBody && block.status !== "running",
+    block.actionId,
+  );
   // 复制产出：截断时现拉全量（不是复制滚动框里可见的那截）
   const outputCopySource = buildOutputCopySource(
     taskId,
@@ -529,7 +539,7 @@ const TaskSubagentBlock = ({
                           </pre>
                         ) : (
                           <div className="text-xs leading-relaxed text-foreground/90 [&_.prose]:text-xs">
-                            <MarkdownText text={outputBody ?? ""} />
+                            <MarkdownText text={outputBody ?? ""} baseDir={markdownBaseDir} />
                           </div>
                         )}
                       </div>
@@ -639,11 +649,11 @@ const RegularToolBlockRow = ({
   );
 
   return (
-    <div className={cn("group/tool", nested && "pl-0")}>
+    <div className={cn("group/tool min-w-0 max-w-full", nested && "pl-0")}>
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
       >
         <CollapseChevron open={!collapsed} />
         <ToolBlockIcon block={block} />
@@ -684,7 +694,7 @@ const RegularToolBlockRow = ({
       </button>
 
       {!collapsed && (
-        <div className="ml-5 mt-1 space-y-1.5 border-l border-border/50 pl-3">
+        <div className="ml-5 mt-1 min-w-0 max-w-full space-y-1.5 border-l border-border/50 pl-3">
           {/* 一层：可读命令 / 路径；无 detailLine 时用 args 截断兜底 */}
           {(detailLine || (!displayOutput && !diff && argsPreview)) && (
             <div
@@ -711,27 +721,31 @@ const RegularToolBlockRow = ({
 
           {/* edit diff */}
           {diff && (
-            <div>
+            <div className="min-w-0 max-w-full">
               <button
                 type="button"
                 onClick={() => setDiffCollapsed((c) => !c)}
-                className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                className="flex w-full min-w-0 cursor-pointer items-center gap-1 text-left text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <CollapseChevron open={!diffCollapsed} />
-                <span className="min-w-0 truncate font-mono">
-                  {filePath ? (
-                    <IdePathLink linker={linker} path={filePath} />
-                  ) : (
-                    "diff"
-                  )}
-                  {diffStats && (
-                    <span className="ml-1 tabular-nums">
-                      +{diffStats.added}/−{diffStats.removed}
-                    </span>
-                  )}
-                </span>
+                {filePath ? (
+                  <IdePathLink
+                    linker={linker}
+                    path={filePath}
+                    className="min-w-0 flex-1 truncate font-mono"
+                  />
+                ) : (
+                  <span className="min-w-0 flex-1 truncate font-mono">diff</span>
+                )}
+                {diffStats && (
+                  <span className="shrink-0 tabular-nums">
+                    +{diffStats.added}/−{diffStats.removed}
+                  </span>
+                )}
                 {block.result?.diffTruncated && (
-                  <span className="text-[11px] text-warning">已截断</span>
+                  <span className="shrink-0 text-[11px] text-warning">
+                    已截断
+                  </span>
                 )}
               </button>
               {!diffCollapsed && (
@@ -866,18 +880,19 @@ const TodoToolItemRow = ({ item }: { item: TodoItem }) => {
   return (
     <li className="flex min-w-0 items-start gap-1.5">
       <TodoStatusIcon status={item.status} />
-      <span
-        title={item.content}
-        className={cn(
-          "min-w-0 flex-1 truncate text-xs leading-5",
-          done && "text-muted-foreground line-through",
-          cancelled && "text-muted-foreground/70 line-through",
-          active && "font-medium text-foreground",
-          !done && !cancelled && !active && "text-muted-foreground",
-        )}
-      >
-        {item.content || "（无标题）"}
-      </span>
+      <Tooltip content={item.content}>
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate text-xs leading-5",
+            done && "text-muted-foreground line-through",
+            cancelled && "text-muted-foreground/70 line-through",
+            active && "font-medium text-foreground",
+            !done && !cancelled && !active && "text-muted-foreground",
+          )}
+        >
+          {item.content || "（无标题）"}
+        </span>
+      </Tooltip>
     </li>
   );
 };

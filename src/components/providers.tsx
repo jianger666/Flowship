@@ -7,6 +7,7 @@
  * - DialogProvider：全局 confirm / prompt（禁用 window.{alert,confirm,prompt}）
  * - TaskListProvider：全局任务列表（侧栏 + 各页面共享、统一刷新 / 同步）
  * - ImagePreviewProvider：全局图片 lightbox（ImageThumb 点击站内看大图）
+ * - LocalFilePreviewProvider：本地路径点击 → 居中预览弹窗（pathDisplayLabel 展示）
  * - 后续如果接 react-query / jotai 等也都加在这里
  */
 
@@ -15,9 +16,11 @@ import { useEffect, type ReactNode } from "react";
 
 import { DialogProvider } from "@/hooks/use-dialog";
 import { ImagePreviewProvider } from "@/components/ui/image-preview";
+import { LocalFilePreviewProvider } from "@/components/ui/local-file-preview";
 import { CloseConfirmHandler } from "@/components/close-confirm-handler";
 import { DeepLinkHandler } from "@/components/deep-link-handler";
 import { GlobalShortcuts } from "@/components/global-shortcuts";
+import { SearchDialog } from "@/components/search-dialog";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { MrInboxProvider } from "@/hooks/use-mr-inbox";
@@ -57,6 +60,7 @@ export const Providers = ({ children }: ProvidersProps) => {
         <ModelsPrefetch />
         {/* ImagePreviewProvider：全局图片 lightbox（任意 ImageThumb 点击站内看大图、多图左右切换） */}
         <ImagePreviewProvider>
+          <LocalFilePreviewProvider>
           {/* TaskListProvider：侧栏 + 各页面共享同一份任务列表、新建 / 删除 / 状态变化统一同步 */}
           <TaskListProvider>
             {/* MrInboxProvider：提测收件箱（顶栏 badge + 任务内提醒条共享一份、前台 5 分钟轮询） */}
@@ -68,9 +72,12 @@ export const Providers = ({ children }: ProvidersProps) => {
               <CloseConfirmHandler />
               {/* 全局快捷键统一注册（Cmd+K 命令面板 / Cmd+N 新建对话） */}
               <GlobalShortcuts />
+              {/* Cmd/Ctrl+K 命令面板：无侧栏按钮、仅快捷键唤起 */}
+              <SearchDialog showTrigger={false} />
               {children}
             </MrInboxProvider>
           </TaskListProvider>
+          </LocalFilePreviewProvider>
         </ImagePreviewProvider>
       </DialogProvider>
     </ThemeProvider>

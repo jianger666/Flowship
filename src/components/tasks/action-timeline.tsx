@@ -28,6 +28,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { actionDisplayLabel } from "@/lib/task-display";
 import type { ActionRecord } from "@/lib/types";
@@ -85,77 +86,82 @@ const ActionChip = ({
       : titleParts[0];
   return (
     <div className="group/chip relative inline-flex items-center">
-      <ChoiceButton
-        shape="tab"
-        selected={isSelected}
-        onClick={() => onSelectAction(action.id)}
-        className={cn(
-          "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
-          // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
-          // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
-          // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
-          // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
-          isSelected && "text-foreground ring-1 ring-ring/70",
-          isExcluded && "line-through opacity-60",
-        )}
-        title={title}
-      >
-        <span
+      <Tooltip content={title}>
+        <ChoiceButton
+          shape="tab"
+          selected={isSelected}
+          onClick={() => onSelectAction(action.id)}
           className={cn(
-            "text-[11px] text-muted-foreground/80",
-            isSelected && "text-foreground/70",
+            "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
+            // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
+            // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
+            // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
+            // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
+            isSelected && "text-foreground ring-1 ring-ring/70",
+            isExcluded && "line-through opacity-60",
           )}
         >
-          #{action.n}
-        </span>
-        {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
-        <span>{actionDisplayLabel(action, "short")}</span>
-        {postCheckFailed && (
-          <span title={postCheckSummary} className="inline-flex">
-            <AlertTriangle
-              className="size-3 text-destructive"
-              aria-label="后置检查未通过"
-            />
+          <span
+            className={cn(
+              "text-[11px] text-muted-foreground/80",
+              isSelected && "text-foreground/70",
+            )}
+          >
+            #{action.n}
           </span>
-        )}
-      </ChoiceButton>
-      {onToggleExclude && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleExclude(action);
-          }}
-          className={cn(
-            "ml-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors",
-            isExcluded
-              ? "opacity-100 hover:text-primary"
-              : "opacity-0 group-hover/chip:opacity-100 hover:text-destructive",
+          {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
+          <span>{actionDisplayLabel(action, "short")}</span>
+          {postCheckFailed && (
+            <Tooltip content={postCheckSummary}>
+              <span className="inline-flex">
+                <AlertTriangle
+                  className="size-3 text-destructive"
+                  aria-label="后置检查未通过"
+                />
+              </span>
+            </Tooltip>
           )}
-          title={
+        </ChoiceButton>
+      </Tooltip>
+      {onToggleExclude && (
+        <Tooltip
+          content={
             isExcluded
               ? "恢复这个 action（重新纳入 agent 上下文）"
               : "划除（把这个 action 排出 agent 上下文、可恢复）"
           }
         >
-          {isExcluded ? (
-            <RotateCcw className="size-3" />
-          ) : (
-            <X className="size-3" />
-          )}
-        </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleExclude(action);
+            }}
+            className={cn(
+              "ml-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors",
+              isExcluded
+                ? "opacity-100 hover:text-primary"
+                : "opacity-0 group-hover/chip:opacity-100 hover:text-destructive",
+            )}
+          >
+            {isExcluded ? (
+              <RotateCcw className="size-3" />
+            ) : (
+              <X className="size-3" />
+            )}
+          </button>
+        </Tooltip>
       )}
     </div>
   );
 };
 
 const EllipsisChip = ({ title }: { title: string }) => (
-  <span
-    className="inline-flex h-7 items-center rounded px-1.5 text-xs text-muted-foreground/60"
-    title={title}
-  >
-    …
-  </span>
+  <Tooltip content={title}>
+    <span className="inline-flex h-7 items-center rounded px-1.5 text-xs text-muted-foreground/60">
+      …
+    </span>
+  </Tooltip>
 );
 
 export const ActionTimeline = ({
@@ -189,13 +195,14 @@ export const ActionTimeline = ({
     <div className="flex flex-wrap items-center gap-1.5">
       {needsCollapse && (
         <Popover open={allOpen} onOpenChange={setAllOpen}>
-          <PopoverTrigger
-            aria-label={`查看全部 ${actions.length} 个 action`}
-            className="inline-flex h-7 cursor-pointer items-center rounded-md border border-border/60 bg-muted/20 px-2 text-xs text-muted-foreground/90 transition-colors hover:bg-muted/50 hover:text-foreground"
-            title="查看全部 action"
-          >
-            全部 ({actions.length})
-          </PopoverTrigger>
+          <Tooltip content="查看全部 action">
+            <PopoverTrigger
+              aria-label={`查看全部 ${actions.length} 个 action`}
+              className="inline-flex h-7 cursor-pointer items-center rounded-md border border-border/60 bg-muted/20 px-2 text-xs text-muted-foreground/90 transition-colors hover:bg-muted/50 hover:text-foreground"
+            >
+              全部 ({actions.length})
+            </PopoverTrigger>
+          </Tooltip>
           <PopoverContent align="start" className="w-96 max-w-[80vw] p-2">
             <div className="mb-2 px-1 text-xs text-muted-foreground">
               全部 action

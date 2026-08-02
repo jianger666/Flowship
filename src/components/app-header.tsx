@@ -28,6 +28,7 @@ import { MrInboxBell } from "@/components/mr-inbox/mr-inbox-bell";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UpdateBadge } from "@/components/update-badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { useAppMode, type AppMode } from "@/hooks/use-app-mode";
 import { cn } from "@/lib/utils";
 
@@ -86,7 +87,11 @@ const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
             key={s.key}
             role="tab"
             aria-selected={active}
-            onClick={() => router.push(s.href)}
+            // 已在当前模式再点会 push /chats → Loading → replace 回详情，整页闪一下。
+            onClick={() => {
+              if (active) return;
+              router.push(s.href);
+            }}
             className={cn(
               // 尺寸加大一档（px-4 py-1.5 text-sm、用户确认「做明显点」）——顶栏一等导航
               "flex cursor-pointer items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors duration-200",
@@ -159,15 +164,16 @@ export const AppHeader = ({
           isMac && "pl-22",
         )}
       >
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={onToggleSidebar}
-          aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
-          title={sidebarOpen ? "收起侧栏（⌘/Ctrl+B）" : "展开侧栏（⌘/Ctrl+B）"}
-        >
-          <PanelLeft />
-        </Button>
+        <Tooltip content={sidebarOpen ? "收起侧栏（⌘/Ctrl+B）" : "展开侧栏（⌘/Ctrl+B）"}>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onToggleSidebar}
+            aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
+          >
+            <PanelLeft />
+          </Button>
+        </Tooltip>
       </div>
 
       {/* 居中：工作台 / 对话 胶囊切换（v1.0 双模式核心）；中性页不高亮任一段 */}
@@ -190,38 +196,40 @@ export const AppHeader = ({
         <ThemeToggle />
         {/* 能力页入口（Action / Skill / MCP 集中管理、v1.0.x）；
             图标升一档尺寸（用户确认「做明显点」）+ [&_svg] 放大 */}
-        <Button
-          variant="ghost"
-          size="icon"
-          className="[&_svg:not([class*='size-'])]:size-4.5"
-          nativeButton={false}
-          render={
-            <Link
-              href="/actions"
-              className="no-underline"
-              aria-label="能力"
-              title="能力（Action / Skill / MCP）"
-            />
-          }
-        >
-          <Blocks />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="[&_svg:not([class*='size-'])]:size-4.5"
-          nativeButton={false}
-          render={
-            <Link
-              href="/settings"
-              className="no-underline"
-              aria-label="设置"
-              title="设置"
-            />
-          }
-        >
-          <Settings />
-        </Button>
+        <Tooltip content="能力（Action / Skill / MCP）">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="[&_svg:not([class*='size-'])]:size-4.5"
+            nativeButton={false}
+            render={
+              <Link
+                href="/actions"
+                className="no-underline"
+                aria-label="能力"
+              />
+            }
+          >
+            <Blocks />
+          </Button>
+        </Tooltip>
+        <Tooltip content="设置">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="[&_svg:not([class*='size-'])]:size-4.5"
+            nativeButton={false}
+            render={
+              <Link
+                href="/settings"
+                className="no-underline"
+                aria-label="设置"
+              />
+            }
+          >
+            <Settings />
+          </Button>
+        </Tooltip>
       </div>
     </header>
   );

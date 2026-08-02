@@ -140,12 +140,23 @@ describe("用户上滚意图识别", () => {
 });
 
 describe("「N 条新内容」计数（回到最新按钮）", () => {
-  /** 按「跟随 → 离开 → 追加」的真实顺序推一遍基线，返回最终计数 */
-  const run = (steps: Array<{ count: number; following: boolean }>): number => {
+  /** 按「跟随 → 离开 → 追加 / prepend」的真实顺序推一遍基线，返回最终计数 */
+  const run = (
+    steps: Array<{
+      count: number;
+      following: boolean;
+      prependDelta?: number;
+    }>,
+  ): number => {
     let baseline = steps[0]!.count;
     let last = baseline;
     for (const s of steps) {
-      baseline = nextNewItemsBaseline(baseline, s.count, s.following);
+      baseline = nextNewItemsBaseline(
+        baseline,
+        s.count,
+        s.following,
+        s.prependDelta ?? 0,
+      );
       last = s.count;
     }
     return countNewItems(baseline, last);
@@ -206,6 +217,31 @@ describe("「N 条新内容」计数（回到最新按钮）", () => {
     expect(nextNewItemsBaseline(once, 130, false)).toBe(once);
     const pinned = nextNewItemsBaseline(100, 130, true);
     expect(nextNewItemsBaseline(pinned, 130, true)).toBe(pinned);
+  });
+
+  it("离开底部后 prepend 更早历史 → 计数保持 0（头部增量不是「新内容」）", () => {
+    expect(
+      run([
+        { count: 100, following: true },
+        { count: 100, following: false },
+        { count: 120, following: false, prependDelta: 20 },
+      ]),
+    ).toBe(0);
+  });
+
+  it("prepend 后再来尾部追加 → 只计尾部增量", () => {
+    expect(
+      run([
+        { count: 100, following: true },
+        { count: 100, following: false },
+        { count: 120, following: false, prependDelta: 20 },
+        { count: 125, following: false },
+      ]),
+    ).toBe(5);
+  });
+
+  it("跟随态 prepend 不走基线抬高（基线已跟平 itemCount）", () => {
+    expect(nextNewItemsBaseline(100, 120, true, 20)).toBe(120);
   });
 });
 

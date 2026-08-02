@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cursor Composer 委托"
+  short_description: "把低判断成本的仓库编码循环交给 Composer 2.5 Fast"
+  default_prompt: "使用 $cursor-delegate 委派这个任务中可独立验收的机械实现，并由当前模型完成关键判断。"

@@ -51,7 +51,6 @@ import { EventStream } from "@/components/tasks/event-stream";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
-import { TokenUsageChip } from "@/components/tasks/token-usage-chip";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,6 +62,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { Separator } from "@/components/ui/separator";
+import { Tooltip } from "@/components/ui/tooltip";
 import { useDialog } from "@/hooks/use-dialog";
 import { useTaskList } from "@/hooks/use-task-list";
 import { useTaskWatch } from "@/hooks/use-task-watch";
@@ -795,35 +795,22 @@ const TaskDetailPage = () => {
                 ) : null}
                 {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
                 {task.runStatus !== "running" && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setEditDialogOpen(true)}
-                    title="编辑任务：角色 / 标题 / 飞书链接 / 模型 / 工作分支"
-                    className="size-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-                  >
-                    <Pencil className="size-3.5" />
-                  </Button>
+                  <Tooltip content="编辑任务：角色 / 标题 / 飞书链接 / 模型 / 工作分支">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setEditDialogOpen(true)}
+                      className="size-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                    >
+                      <Pencil className="size-3.5" />
+                    </Button>
+                  </Tooltip>
                 )}
-                {/* token 用量：辅助信息、排在这排最后、hover 看本轮明细 */}
-                <TokenUsageChip
-                  usage={task.tokenUsage}
-                  actionUsage={
-                    selectedAction?.tokenUsage
-                      ? {
-                          label: `#${selectedAction.n} ${actionDisplayLabel(selectedAction)}`,
-                          usage: selectedAction.tokenUsage,
-                        }
-                      : undefined
-                  }
-                />
               </div>
-              <div
-                className="text-xs text-muted-foreground"
-                title={task.repoPaths.join("\n")}
-              >
+              <Tooltip content={task.repoPaths.join("\n")}>
+                <div className="min-w-0 max-w-full text-xs text-muted-foreground">
                 {task.repoPaths.length > 0 ? (
-                  <span className="inline-flex flex-wrap items-center gap-x-1">
+                  <span className="flex min-w-0 max-w-full flex-wrap items-center gap-x-1">
                     {task.repoPaths.map((p, i) => {
                       const readonly = (task.readonlyRepoPaths ?? []).includes(p);
                       const script = (task.scriptRepoPaths ?? []).includes(p);
@@ -834,25 +821,31 @@ const TaskDetailPage = () => {
                       return (
                         <span
                           key={p}
-                          className="inline-flex items-center gap-0.5"
+                          className="inline-flex min-w-0 max-w-full items-center gap-0.5"
                         >
                           {i > 0 && <span className="text-muted-foreground">+</span>}
-                          <span>{label}</span>
+                          <span className="min-w-0 max-w-full truncate">
+                            {label}
+                          </span>
                           {readonly && (
-                            <span title="只读仓库" className="inline-flex">
-                              <Lock
-                                className="size-3 text-muted-foreground"
-                                aria-label="只读仓库"
-                              />
-                            </span>
+                            <Tooltip content="只读仓库">
+                              <span className="inline-flex">
+                                <Lock
+                                  className="size-3 text-muted-foreground"
+                                  aria-label="只读仓库"
+                                />
+                              </span>
+                            </Tooltip>
                           )}
                           {script && (
-                            <span title="脚本仓" className="inline-flex">
-                              <ScrollText
-                                className="size-3 text-muted-foreground"
-                                aria-label="脚本仓"
-                              />
-                            </span>
+                            <Tooltip content="脚本仓">
+                              <span className="inline-flex">
+                                <ScrollText
+                                  className="size-3 text-muted-foreground"
+                                  aria-label="脚本仓"
+                                />
+                              </span>
+                            </Tooltip>
                           )}
                         </span>
                       );
@@ -862,21 +855,22 @@ const TaskDetailPage = () => {
                   "(未绑仓库、agent 在 home 跑)"
                 )}
                 {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name ? (
-                  <span
-                    className="ml-2 font-mono"
-                    title={task.gitBranches
+                  <Tooltip
+                    content={task.gitBranches
                       .map((b) =>
                         `${b.repoPath.split("/").pop()}: based on ${b.baseBranch || "?"}`,
                       )
                       .join("\n")}
                   >
-                    @ {task.gitBranches[0].name}
-                    {task.gitBranches.length > 1 && (
-                      <span className="ml-1 text-muted-foreground">
-                        ({task.gitBranches.length} 仓)
-                      </span>
-                    )}
-                  </span>
+                    <span className="ml-2 font-mono">
+                      @ {task.gitBranches[0].name}
+                      {task.gitBranches.length > 1 && (
+                        <span className="ml-1 text-muted-foreground">
+                          ({task.gitBranches.length} 仓)
+                        </span>
+                      )}
+                    </span>
+                  </Tooltip>
                 ) : (
                   // gitBranches 只在 build / worktree 链路写入——全 custom action 的任务
                   // 永远没记录（2026-07-21 同事实测「没展示分支」）。用户手动配置的
@@ -887,18 +881,21 @@ const TaskDetailPage = () => {
                       .filter((b): b is string => !!b);
                     if (configured.length === 0) return null;
                     return (
-                      <span className="ml-2 font-mono" title="任务配置的工作分支">
-                        @ {configured[0]}
-                        {configured.length > 1 && (
-                          <span className="ml-1 text-muted-foreground">
-                            ({configured.length} 仓)
-                          </span>
-                        )}
-                      </span>
+                      <Tooltip content="任务配置的工作分支">
+                        <span className="ml-2 font-mono">
+                          @ {configured[0]}
+                          {configured.length > 1 && (
+                            <span className="ml-1 text-muted-foreground">
+                              ({configured.length} 仓)
+                            </span>
+                          )}
+                        </span>
+                      </Tooltip>
                     );
                   })()
                 )}
-              </div>
+                </div>
+              </Tooltip>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
                   ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
               <WorkspaceActions task={task} />
@@ -917,21 +914,24 @@ const TaskDetailPage = () => {
                     );
                     const target = mrTargetBranchOf(mr, task.repoTestBranches);
                     return (
-                      <a
+                      <Tooltip
                         key={`${mr.repoPath}-${target}-${mr.version}`}
-                        href={mr.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
-                        title={`${MR_KIND_LABEL[kind]} → ${target}\n${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
+                        content={`${MR_KIND_LABEL[kind]} → ${target}\n${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
                       >
-                        <ExternalLink className="size-3" />
-                        <Badge variant="outline" size="xs" className="font-normal">
-                          {MR_KIND_LABEL[kind]}
-                        </Badge>
-                        {tail}
-                        {versionTag}
-                      </a>
+                        <a
+                          href={mr.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
+                        >
+                          <ExternalLink className="size-3" />
+                          <Badge variant="outline" size="xs" className="font-normal">
+                            {MR_KIND_LABEL[kind]}
+                          </Badge>
+                          {tail}
+                          {versionTag}
+                        </a>
+                      </Tooltip>
                     );
                   })}
                 </div>
@@ -942,67 +942,82 @@ const TaskDetailPage = () => {
           {/* 主操作区 */}
           <div className="flex items-center gap-2">
             {canAdvance && (
-              <Button
-                variant="default"
-                size="sm"
-                onClick={() => setAdvanceDialogOpen(true)}
-                disabled={starting}
-                title="推进任务：选下一个 action（plan / build / review / ship / dev）"
-              >
-                {starting ? <Loader2 className="animate-spin" /> : <Zap />}
-                推进
-              </Button>
+              <Tooltip content="推进任务：选下一个 action（plan / build / review / ship / dev）">
+                <span className="inline-flex">
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={() => setAdvanceDialogOpen(true)}
+                    disabled={starting}
+                  >
+                    {starting ? <Loader2 className="animate-spin" /> : <Zap />}
+                    推进
+                  </Button>
+                </span>
+              </Tooltip>
             )}
             {canFinalize && (
               <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleFinalize("merged")}
-                  disabled={starting}
-                  title="已合入 main、终结本任务"
-                >
-                  <Flag />
-                  已合入
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleFinalize("abandoned")}
-                  disabled={starting}
-                  title="放弃本任务、终结 run"
-                  className="text-muted-foreground hover:text-destructive"
-                >
-                  <XCircle />
-                  放弃
-                </Button>
+                <Tooltip content="已合入 main、终结本任务">
+                  <span className="inline-flex">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleFinalize("merged")}
+                      disabled={starting}
+                    >
+                      <Flag />
+                      已合入
+                    </Button>
+                  </span>
+                </Tooltip>
+                <Tooltip content="放弃本任务、终结 run">
+                  <span className="inline-flex">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleFinalize("abandoned")}
+                      disabled={starting}
+                      className="text-muted-foreground hover:text-destructive"
+                    >
+                      <XCircle />
+                      放弃
+                    </Button>
+                  </span>
+                </Tooltip>
               </>
             )}
             {isStopButtonVisible(task) && !canAck && (
               // 转圈 +「停止」合体：运行中一体按钮、hover 变红；stopping 防双击
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleStop}
-                disabled={stopping}
-                title="停止当前 action（中断 agent、可重新推进）"
-                className="text-muted-foreground hover:text-destructive"
-              >
-                <Loader2 className="animate-spin" />
-                停止
-              </Button>
+              <Tooltip content="停止当前 action（中断 agent、可重新推进）">
+                <span className="inline-flex">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleStop}
+                    disabled={stopping}
+                    className="text-muted-foreground hover:text-destructive"
+                  >
+                    <Loader2 className="animate-spin" />
+                    停止
+                  </Button>
+                </span>
+              </Tooltip>
             )}
             {canReopen && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleReopen}
-                disabled={starting}
-                title="恢复任务：拉回开发中、可重新推进"
-              >
-                {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-                恢复
-              </Button>
+              <Tooltip content="恢复任务：拉回开发中、可重新推进">
+                <span className="inline-flex">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleReopen}
+                    disabled={starting}
+                  >
+                    {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+                    恢复
+                  </Button>
+                </span>
+              </Tooltip>
             )}
           </div>
         </div>

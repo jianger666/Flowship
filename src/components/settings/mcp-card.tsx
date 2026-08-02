@@ -26,6 +26,7 @@ import type { McpHealth } from "@/lib/types";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { CheckboxRow } from "@/components/ui/checkbox-row";
 import { CodeEditor } from "@/components/ui/code-editor";
 import { EmptyHint } from "@/components/ui/empty-hint";
@@ -161,15 +162,16 @@ export const McpCard = ({
               return (
                 <div key={name} className="flex items-center gap-2 px-3 py-2">
                   {/* 只留名称（用户拍板：指令摘要太长、想看细节点编辑看 JSON） */}
-                  <div
-                    className={cn(
-                      "min-w-0 flex-1 truncate text-sm",
-                      isDisabled && "text-muted-foreground/60 line-through",
-                    )}
-                    title={name}
-                  >
-                    {name}
-                  </div>
+                  <Tooltip content={name}>
+                    <div
+                      className={cn(
+                        "min-w-0 flex-1 truncate text-sm",
+                        isDisabled && "text-muted-foreground/60 line-through",
+                      )}
+                    >
+                      {name}
+                    </div>
+                  </Tooltip>
                   {!isDisabled && (
                     <HealthBadge
                       h={health[name]}
@@ -183,17 +185,18 @@ export const McpCard = ({
                   {/* OAuth：需要授权的 server 行内给动作（已授权 hover 换「重新授权 / 撤销」入口在编辑侧边） */}
                   {oauth &&
                     (oauth.authorized ? (
-                      <Button
-                        size="xs"
-                        variant="ghost"
-                        className="shrink-0 text-muted-foreground"
-                        onClick={() => revoke(name)}
-                        disabled={busy === name}
-                        title="已授权、点击撤销"
-                      >
-                        <ShieldCheck className="text-success" />
-                        已授权
-                      </Button>
+                      <Tooltip content="已授权、点击撤销">
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          className="shrink-0 text-muted-foreground"
+                          onClick={() => revoke(name)}
+                          disabled={busy === name}
+                        >
+                          <ShieldCheck className="text-success" />
+                          已授权
+                        </Button>
+                      </Tooltip>
                     ) : (
                       <Button
                         size="xs"
@@ -537,9 +540,11 @@ const ImportCursorDialog = ({
                 className="rounded-md px-2 py-1.5 transition-colors hover:bg-accent/50"
                 onCheckedChange={() => toggle(name)}
               >
-                <span className="min-w-0 flex-1 truncate text-sm" title={name}>
-                  {name}
-                </span>
+                <Tooltip content={name}>
+                  <span className="min-w-0 flex-1 truncate text-sm">
+                    {name}
+                  </span>
+                </Tooltip>
                 {appServers[name] && (
                   <Badge variant="outline" size="xs">
                     已存在、导入将覆盖

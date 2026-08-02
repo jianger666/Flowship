@@ -36,10 +36,10 @@ import {
   buildResendPayload,
   findLastUserReply,
 } from "@/components/tasks/event-stream/resend-payload";
-import { TokenUsageChip } from "@/components/tasks/token-usage-chip";
 import { ComposerSessionProvider } from "@/components/composer-session";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { useTaskWatch } from "@/hooks/use-task-watch";
 import { useDialog } from "@/hooks/use-dialog";
 import {
@@ -653,16 +653,17 @@ export const ChatView = ({
               <h1 className="min-w-0 truncate text-sm font-medium tracking-tight">
                 {task.title}
               </h1>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="shrink-0 text-muted-foreground hover:text-foreground"
-                onClick={handleRename}
-                title="重命名对话"
-                aria-label="重命名对话"
-              >
-                <Pencil />
-              </Button>
+              <Tooltip content="重命名对话">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  onClick={handleRename}
+                  aria-label="重命名对话"
+                >
+                  <Pencil />
+                </Button>
+              </Tooltip>
               <Badge variant="outline" size="xs">
                 对话
               </Badge>
@@ -671,8 +672,6 @@ export const ChatView = ({
                   {RUN_STATUS_LABEL[task.runStatus]}
                 </Badge>
               )}
-              {/* token 用量：辅助信息、hover 看本轮明细（长对话最需要它） */}
-              <TokenUsageChip usage={task.tokenUsage} />
             </div>
           </div>
         </div>

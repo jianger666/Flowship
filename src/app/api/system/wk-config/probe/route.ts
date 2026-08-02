@@ -8,23 +8,35 @@
 import { NextResponse } from "next/server";
 
 import { errorResponse } from "@/lib/server/route-helpers";
+import { readWkHubToken } from "@/lib/server/wk-config";
 import { probeWkHub } from "@/lib/server/wk-hub-probe";
 
 export const runtime = "nodejs";
 
 export const POST = async (req: Request) => {
-  let body: { baseUrl?: unknown };
+  let body: { baseUrl?: unknown; token?: unknown };
   try {
-    body = (await req.json()) as { baseUrl?: unknown };
+    body = (await req.json()) as typeof body;
   } catch {
     return errorResponse("请求体不是合法 JSON");
   }
   if (typeof body.baseUrl !== "string" || !body.baseUrl.trim()) {
     return errorResponse("缺少 baseUrl");
   }
+  if (
+    body.token !== undefined &&
+    (typeof body.token !== "string" || body.token.length > 4096)
+  ) {
+    return errorResponse("Delivery Hub Token 格式不对");
+  }
 
   try {
-    return NextResponse.json(await probeWkHub(body.baseUrl));
+    // 用户正在输入新 Token 时优先试草稿；未传时读取已落盘值。两种情况下都不把明文返回前端。
+    const token =
+      typeof body.token === "string" && body.token.trim()
+        ? body.token.trim()
+        : await readWkHubToken();
+    return NextResponse.json(await probeWkHub(body.baseUrl, fetch, token));
   } catch (err) {
     console.error("[POST /api/system/wk-config/probe] failed", err);
     return NextResponse.json(

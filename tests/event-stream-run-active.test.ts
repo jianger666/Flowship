@@ -32,12 +32,24 @@ const listTsxFiles = (dir: string): string[] => {
   return out;
 };
 
+/** `<EventStream` 开标签起点；排除 `<EventStreamSearchBar` 等同名前缀组件 */
+const eventStreamTagStart = (source: string, from: number): number => {
+  let idx = from;
+  for (;;) {
+    const start = source.indexOf("<EventStream", idx);
+    if (start < 0) return -1;
+    const after = source[start + "<EventStream".length];
+    if (!after || !/[A-Za-z0-9_]/.test(after)) return start;
+    idx = start + "<EventStream".length;
+  }
+};
+
 /** 抠出每个 `<EventStream ...>` 开标签的完整属性串（到第一个 `>` 为止，跳过字符串里的 `>`） */
 const eventStreamOpenTags = (source: string): string[] => {
   const tags: string[] = [];
   let from = 0;
   for (;;) {
-    const start = source.indexOf("<EventStream", from);
+    const start = eventStreamTagStart(source, from);
     if (start < 0) break;
     let depth = 0;
     let end = -1;
@@ -64,7 +76,7 @@ describe("EventStream 的 isRunning 契约", () => {
     let callSites = 0;
     for (const file of files) {
       const source = readFileSync(file, "utf-8");
-      if (!source.includes("<EventStream")) continue;
+      if (eventStreamTagStart(source, 0) < 0) continue;
       for (const tag of eventStreamOpenTags(source)) {
         callSites += 1;
         expect(tag, `${path.relative(srcDir, file)} 的 <EventStream> 漏传 isRunning`).toContain(

@@ -28,6 +28,7 @@ import {
 import type { SlashSkillsApi } from "@/components/slash-skills";
 import { useComposerSession } from "@/components/composer-session";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import { getSubmitShortcutTitle } from "@/lib/submit-shortcut";
 import { useSubmitShortcut } from "@/hooks/use-settings";
 import { loadBoxHeight, saveBoxHeight } from "@/lib/view-memory";
@@ -151,21 +152,24 @@ export const ConversationComposer = ({
 
   // 发送键：运行态排队发送与常态发送共用（title 文案不同）
   const sendButton = (label: "发送" | "排队发送") => (
-    <Button
-      type="button"
-      size="sm"
-      disabled={disabled || submitting || !hasContent}
-      onClick={handleSubmit}
-      className="ml-1 size-7 rounded-lg p-0"
-      aria-label={label}
-      title={`${label}（${getSubmitShortcutTitle(submitShortcut)}）`}
-    >
-      {submitting ? (
-        <Loader2 className="size-4 animate-spin" />
-      ) : (
-        <ArrowUp className="size-4" />
-      )}
-    </Button>
+    <Tooltip content={`${label}（${getSubmitShortcutTitle(submitShortcut)}）`}>
+      <span className="inline-flex">
+        <Button
+          type="button"
+          size="sm"
+          disabled={disabled || submitting || !hasContent}
+          onClick={handleSubmit}
+          className="ml-1 size-7 rounded-lg p-0"
+          aria-label={label}
+        >
+          {submitting ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <ArrowUp className="size-4" />
+          )}
+        </Button>
+      </span>
+    </Tooltip>
   );
 
   return (
@@ -192,9 +196,10 @@ export const ConversationComposer = ({
       header={
         <>
           {/* 顶边拖柄：往上拉变高、往下拉变矮；setPointerCapture 让拖出手柄仍跟手 */}
-          <div
-            className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
-            onPointerDown={(e) => {
+          <Tooltip content="上下拖动调整高度">
+            <div
+              className="group flex h-2.5 w-full shrink-0 cursor-ns-resize items-center justify-center"
+              onPointerDown={(e) => {
               e.preventDefault();
               const handle = e.currentTarget;
               handle.setPointerCapture(e.pointerId);
@@ -224,10 +229,10 @@ export const ConversationComposer = ({
               handle.addEventListener("pointercancel", finish);
             }}
             aria-label="拖动调整输入框高度"
-            title="上下拖动调整高度"
           >
             <div className="h-1 w-10 rounded-full bg-border/60 transition-colors group-hover:bg-muted-foreground/50" />
           </div>
+          </Tooltip>
 
           {/* P1.6：Home（未绑仓）轻量提示（对标 Cursor 上下文条——无警示底色、一行融入 composer） */}
           {showUnbound && (
@@ -267,20 +272,23 @@ export const ConversationComposer = ({
         running ? (
           <>
             <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-            <Button
-              type="button"
-              size="sm"
-              onClick={onStop}
-              disabled={stopping}
-              title="停止生成（中断 agent）"
-              className="ml-1 size-7 rounded-lg bg-destructive p-0 text-white hover:bg-destructive/90"
-            >
-              {stopping ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Square className="size-3 fill-current" />
-              )}
-            </Button>
+            <Tooltip content="停止生成（中断 agent）">
+              <span className="inline-flex">
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={onStop}
+                  disabled={stopping}
+                  className="ml-1 size-7 rounded-lg bg-destructive p-0 text-white hover:bg-destructive/90"
+                >
+                  {stopping ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Square className="size-3 fill-current" />
+                  )}
+                </Button>
+              </span>
+            </Tooltip>
             {/* chat 排队：运行中仍可发下一条 */}
             {allowQueueWhileRunning && sendButton("排队发送")}
           </>

@@ -33,6 +33,8 @@ vi.mock("node:os", async (importOriginal) => {
 const cfg = (over: Partial<WkConfig> = {}): WkConfig => ({
   docRepoPath: "",
   hubBaseUrl: "",
+  hubToken: "",
+  hubTokenConfigured: false,
   requireBaseline: false,
   requireSync: false,
   ...over,
@@ -101,6 +103,8 @@ describe("configFromYaml", () => {
     ).toEqual({
       docRepoPath: "/Users/me/wk-doc",
       hubBaseUrl: "http://127.0.0.1:8088",
+      hubToken: "",
+      hubTokenConfigured: false,
       requireBaseline: true,
       requireSync: false,
     });
@@ -158,6 +162,8 @@ describe("applyWkConfig：只动托管键", () => {
     expect(parsed).toEqual({
       docRepoPath: "/new/doc",
       hubBaseUrl: "http://10.0.0.5:8088",
+      hubToken: "",
+      hubTokenConfigured: false,
       requireBaseline: true,
       requireSync: true,
     });
@@ -200,6 +206,8 @@ describe("applyWkConfig：新建 / 删除", () => {
     expect(configFromYaml(out)).toEqual({
       docRepoPath: "/Users/me/wk-doc",
       hubBaseUrl: "http://127.0.0.1:8088",
+      hubToken: "",
+      hubTokenConfigured: false,
       requireBaseline: true,
       requireSync: true,
     });
@@ -290,6 +298,54 @@ describe("applyWkConfig：值的写法", () => {
     const weird = "/Users/me/wk doc #1";
     const out = applyWkConfig("", cfg({ docRepoPath: weird }));
     expect(configFromYaml(out).docRepoPath).toBe(weird);
+  });
+});
+
+describe("Delivery Hub Token", () => {
+  const existing = [
+    "delivery_hub:",
+    "  base_url: https://hub.example.com",
+    "  token: old-secret",
+    "  require_baseline: true",
+    "  require_sync: true",
+  ].join("\n");
+
+  it("读取时回填 Token，密码框可显示已保存值", () => {
+    const parsed = configFromYaml(existing);
+    expect(parsed.hubTokenConfigured).toBe(true);
+    expect(parsed.hubToken).toBe("old-secret");
+  });
+
+  it("保存目录或地址时保留已有 Token", () => {
+    const out = applyWkConfig(
+      existing,
+      cfg({
+        docRepoPath: "/new",
+        hubBaseUrl: "https://hub.example.com",
+        hubToken: "old-secret",
+        hubTokenConfigured: true,
+      }),
+    );
+    expect(out).toContain("  token: old-secret");
+  });
+
+  it("显式提交时覆盖 Token，显式清除时只删除 Token", () => {
+    const updated = applyWkConfig(existing, {
+      docRepoPath: "",
+      hubBaseUrl: "https://hub.example.com",
+      hubToken: "new-secret",
+    });
+    expect(updated).toContain("  token: new-secret");
+    expect(updated).not.toContain("old-secret");
+
+    const cleared = applyWkConfig(updated, {
+      docRepoPath: "",
+      hubBaseUrl: "https://hub.example.com",
+      hubToken: "",
+    });
+    expect(cleared).not.toContain("token:");
+    expect(cleared).toContain("  base_url: https://hub.example.com");
+    expect(cleared).toContain("  require_sync: true");
   });
 });
 
