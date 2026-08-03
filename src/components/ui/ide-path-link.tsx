@@ -1,10 +1,10 @@
 "use client";
 
 /**
- * 路径链接（事件流等）：展示 pathDisplayLabel，点击打开本地文件预览弹窗。
+ * 路径链接（事件流等）：展示 pathDisplayLabel，按文件意图进入浏览器、IDE 或本地预览。
  *
  * 保留 IdePathLinker / useIdePathLinker 名称以减少 call site 改动；
- * IDE 跳转改到弹窗顶栏动作。
+ * 具体主动作由 LocalFileLink 统一判断。
  */
 
 import {

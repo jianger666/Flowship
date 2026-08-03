@@ -8,7 +8,7 @@
  * - 看板「手动建任务」→ `/workitems/new`（无预填）→ 顶部显式二选「需求任务 / 日常任务」
  *
  * 手动路径任务类型（纯 UI、不落 schema）：
- * - 需求任务（默认）：飞书链接必填；可填已有工作分支 / worktree
+ * - 需求任务（默认）：飞书链接必填；可填已有工作分支；非测试角色可选 worktree
  * - 日常任务：隐藏链接与分支相关字段；提交 storyUrl 空 → 服务端轻量态（原仓当前分支）
  * 切换模式草稿保留（切走再切回链接 / 分支仍在 state）
  *
@@ -38,6 +38,10 @@ import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
 import { reqIdPatchValue } from "@/lib/req-id";
+import {
+  resolveLaunchIsolateWorktree,
+  roleSupportsWorktree,
+} from "@/lib/role-worktree";
 import { settingsUrl } from "@/lib/settings-link";
 import { buildDefaultDailyTaskTitle } from "@/lib/task-display";
 import { createTask } from "@/lib/task-store";
@@ -46,6 +50,7 @@ import {
   type ModelSelection,
   type RepoConfig,
   type Task,
+  type UserRole,
 } from "@/lib/types";
 
 // 上次启动配置的记忆 key（仓库组合——下次预填、零操作启动）
@@ -103,6 +108,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   const [mcpExpanded, setMcpExpanded] = useState(false);
   // 逃生口：直接在原仓库运行
   const [runInRepo, setRunInRepo] = useState(false);
+  // null = 设置尚未加载；测试角色不渲染 worktree UI，提交时也强制不隔离。
+  const [userRole, setUserRole] = useState<UserRole | undefined | null>(null);
   // 模型（默认 settings.defaultModel）
   const [pickedModel, setPickedModel] = useState<ModelSelection>({ id: "" });
   const [defaultModelId, setDefaultModelId] = useState("");
@@ -120,6 +127,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       await initSettings();
       if (!alive) return;
       const s = getSettings();
+      setUserRole(s.userRole);
       setRepos(s.repos);
       setDisabledMcp(s.disabledMcpServers ?? []);
       setDefaultModelId(s.defaultModel?.id ?? "");
@@ -162,6 +170,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
     [isDailyLaunch, repoPaths, featureBranches],
   );
   const forceOriginalRepo = forcedInRepo || isDailyLaunch;
+  const showWorktreeOptions =
+    userRole !== null && roleSupportsWorktree(userRole);
 
   const canSubmit = useMemo(() => {
     if (submitting || repoPaths.length === 0) return false;
@@ -220,6 +230,8 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
       const task = await createTask({
         mode: "task",
+        // 角色语义随任务固化，后续全局切角色不改变旧任务的分支行为。
+        workRole: userRole ?? undefined,
         // 日常留空 → 自动「日常 · <首仓短名> · MM-DD HH:mm」；需求任务 canSubmit 已拦空标题
         title: title.trim()
           ? title.trim()
@@ -244,8 +256,12 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
             ? repoBranchTemplates
             : undefined,
         disabledMcpServers: disabledMcp.length > 0 ? disabledMcp : undefined,
-        // 日常 / 已有分支 → 强制原仓；runInRepo 状态保留、条件解除后勾选框恢复用户原值
-        isolateWorktree: forceOriginalRepo ? false : !runInRepo,
+        // 测试角色永不创建 worktree；其它角色仍按日常 / 已有分支 / 用户选择决定。
+        isolateWorktree: resolveLaunchIsolateWorktree({
+          role: userRole ?? undefined,
+          forceOriginalRepo,
+          runInRepo,
+        }),
         model,
       });
       // 记住这次的仓库组合、下次预填零操作（旧 LastLaunch.role 不再写入）
@@ -323,9 +339,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
 
       {/* wk 需求编号：选填、拿到编号后也能在任务详情页补。
           日常任务不出现（推进面板本来就不给日常任务出 wk 流程组） */}
-      {!isDailyLaunch && (
+      {!isDailyLaunch && userRole !== "qa" && (
         <div className="grid gap-1.5">
-          <Label htmlFor="l-req-id">需求编号</Label>
+          <Label htmlFor="l-req-id">REQ-ID</Label>
           <Input
             id="l-req-id"
             value={reqId}
@@ -399,10 +415,20 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       {/* 角色选择已隐藏（v1.1.x 用户拍板「去掉」）：默认自适应——AI 从需求 + 仓库
           自己判断视角、比每单点一次枚举更省；字段保留在数据层、editing 兜底 */}
 
-      {/* 已有工作分支：仅需求任务（日常不建分支、无意义；切走再切回草稿仍在） */}
+      {/* 测试角色复用同一分支字段，但语义是可后补的「被测业务分支」；
+          其它角色仍是已有工作分支。日常任务不展示。 */}
       {!isDailyLaunch && repoPaths.length > 0 && (
         <div className="grid gap-1.5">
-          <Label>已有工作分支（选填）</Label>
+          <Label>
+            {userRole === "qa"
+              ? "被测业务分支（可后补）"
+              : "已有工作分支（选填）"}
+          </Label>
+          {userRole === "qa" && (
+            <p className="text-xs text-muted-foreground">
+              开发分支还没建立时可以留空，先做需求分析和测试用例；分支就绪后可在任务内编辑补上
+            </p>
+          )}
           <div className="grid gap-2">
             {repoPaths.map((p) => {
               const repo = repos.find((r) => r.path === p);
@@ -420,8 +446,18 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
                       setFeatureBranches((prev) => ({ ...prev, [p]: v }))
                     }
                     options={entry?.branches ?? []}
-                    loading={!entry}
-                    disabled={!entry || (entry.isRepo === false && !entry.gitMissing)}
+                    loading={userRole !== "qa" && !entry}
+                    emptyHint={
+                      userRole === "qa"
+                        ? "暂无候选，可在上方直接输入业务分支"
+                        : undefined
+                    }
+                    // 测试任务的业务分支必须始终允许手填：远端新分支可能尚未出现在
+                    // 本地 refs，分支探测失败也不能把唯一入口永久禁用。
+                    disabled={
+                      userRole !== "qa" &&
+                      (!entry || (entry.isRepo === false && !entry.gitMissing))
+                    }
                     placeholder={
                       entry?.isRepo === false
                         ? entry.pathMissing
@@ -429,7 +465,9 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
                           : entry.gitMissing
                             ? "未检测到 git、可手填分支"
                             : "非 git 仓库"
-                        : "留空自动建 feature/…"
+                        : userRole === "qa"
+                          ? "选择或填写业务分支"
+                          : "留空自动建 feature/…"
                     }
                     className="min-w-0 flex-1"
                   />
@@ -490,25 +528,26 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
         </div>
       )}
 
-      {/* worktree 开关：日常 / 已有分支时强制不用 worktree、隐藏勾选
+      {/* 测试角色不出现 worktree 概念；其它角色在日常 / 已有分支时强制不用并隐藏勾选
           （runInRepo state 保留、条件解除后恢复）。文案围绕 worktree 表述 */}
-      {forceOriginalRepo ? (
-        <p className="text-xs text-muted-foreground">
-          {isDailyLaunch
-            ? "日常任务直接在原仓库当前分支运行"
-            : "已填已有分支、本任务不使用 worktree、直接在原仓库该分支上运行"}
-        </p>
-      ) : (
-        <CheckboxRow
-          checkboxId="l-use-worktree"
-          checked={!runInRepo}
-          onCheckedChange={(v) => setRunInRepo(!v)}
-        >
-          <span className="text-sm font-normal leading-none">
-            使用 worktree 隔离运行（不影响原仓库、并行任务互不干扰）
-          </span>
-        </CheckboxRow>
-      )}
+      {showWorktreeOptions &&
+        (forceOriginalRepo ? (
+          <p className="text-xs text-muted-foreground">
+            {isDailyLaunch
+              ? "日常任务直接在原仓库当前分支运行"
+              : "已填已有分支、本任务不使用 worktree、直接在原仓库该分支上运行"}
+          </p>
+        ) : (
+          <CheckboxRow
+            checkboxId="l-use-worktree"
+            checked={!runInRepo}
+            onCheckedChange={(v) => setRunInRepo(!v)}
+          >
+            <span className="text-sm font-normal leading-none">
+              使用 worktree 隔离运行（不影响原仓库、并行任务互不干扰）
+            </span>
+          </CheckboxRow>
+        ))}
 
       {/* 启动 + 缺项引导 */}
       <div className="flex items-center gap-3">

@@ -30,6 +30,7 @@ import type {
   TaskMode,
   TaskSummary,
   TokenUsageRollup,
+  UserRole,
 } from "@/lib/types";
 import { dataRoot, RenameAbortedError, renameWithRetry } from "./data-root";
 import { failpoint } from "./failpoints";
@@ -162,6 +163,8 @@ export interface TaskMetaV06 {
    */
   titleAutoPending?: boolean;
   mode?: TaskMode;
+  /** 创建时工作角色快照；测试任务的分支语义据此保持稳定。 */
+  workRole?: UserRole;
   repoStatus: RepoStatus;
   runStatus: RunStatus;
   currentActionId: string | null;
@@ -265,7 +268,8 @@ const TaskMetaV06Schema = z
     currentActionId: z.string().nullable(),
     actions: z.array(ActionRecordLooseSchema),
     mrs: z.array(z.looseObject({})),
-    // role 已退役：历史 meta 里残留的 role 字段靠 looseObject 自然忽略、不校验不读入
+    // 旧 role 已退役；workRole 是新任务创建时的稳定角色快照。
+    workRole: z.enum(["fe", "be", "qa", "other"]).optional(),
     repoPaths: z.array(z.string()),
     pinned: z.boolean().optional(),
     createdAt: z.number(),
@@ -1125,6 +1129,7 @@ export const assembleTask = (
   title: meta.title,
   titleAutoPending: meta.titleAutoPending,
   mode: meta.mode,
+  workRole: meta.workRole,
   repoStatus: meta.repoStatus,
   runStatus: meta.runStatus,
   currentActionId: meta.currentActionId,
@@ -1198,6 +1203,7 @@ export const hydrateTaskSummary = (meta: TaskMetaV06): TaskSummary => {
     title: meta.title,
     titleAutoPending: meta.titleAutoPending,
     mode: meta.mode,
+    workRole: meta.workRole,
     repoStatus: meta.repoStatus,
     runStatus: meta.runStatus,
     currentActionId: meta.currentActionId,

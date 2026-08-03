@@ -1046,6 +1046,11 @@ export interface GitBranchInfo {
   repoPath: string;
   name: string;
   baseBranch: string;
+  /**
+   * 测试任务在 Action 启动前实际检出的提交。用于把「被测分支」和当时验证的代码版本
+   * 对上；普通开发任务可不填。
+   */
+  headCommit?: string;
 }
 
 /**
@@ -1264,6 +1269,12 @@ export interface Task {
   mode?: TaskMode;
 
   /**
+   * 创建任务时的工作角色快照。测试任务的分支 / worktree 语义必须跟任务走，不能因为
+   * 用户之后在全局设置里切换角色而改变。旧任务缺省时沿用普通任务行为。
+   */
+  workRole?: UserRole;
+
+  /**
    * V0.6：任务级仓库状态机（跟 MR 生命周期对齐）
    */
   repoStatus: RepoStatus;
@@ -1458,6 +1469,7 @@ export type NewTaskInput = Pick<
   | "repoDevBranches"
   | "repoBranchTemplates"
   | "isolateWorktree"
+  | "workRole"
 > & {
   mode?: TaskMode;
 };

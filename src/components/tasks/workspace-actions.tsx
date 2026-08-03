@@ -8,7 +8,7 @@
  * 2. 复制该仓实际工作目录路径——终端 cd 用
  * 3. 预览（按仓多预览位）——设置页配了「预览启动命令」才显示；组内挂载；
  *    不同仓可同时预览、同仓被别的任务占着时再起会顶掉
- * 4. 「任务文件夹」固定整条末尾
+ * 4. 「任务文件夹」固定整条末尾（点击后用系统文件管理器打开）
  *
  * 预览状态轮询 /api/preview（仅本组件挂载期间、4s 一次、本地调用很轻）。
  */
@@ -60,6 +60,8 @@ export const WorkspaceActions = ({ task }: Props) => {
   const [slots, setSlots] = useState<PreviewSlotStatus[]>([]);
   // 启动 / 停止请求进行中（防双击）
   const [busy, setBusy] = useState(false);
+  // 打开任务目录请求进行中（独立于预览操作，避免互相禁用）
+  const [openingTaskDir, setOpeningTaskDir] = useState(false);
 
   useEffect(() => {
     void initSettings().then(() => {
@@ -103,13 +105,9 @@ export const WorkspaceActions = ({ task }: Props) => {
   const workCwd = task.workCwd;
   // 任务数据目录（actions/ artifact + workspace/ 产出）——server hydrate 时算好带下来；
   // 无仓任务也有、单独判断（不跟 workCwd 一起 early return）
-  const taskDirAnchor = task.taskDirPath
-    ? getIdeAnchorProps(task.taskDirPath, undefined, prefs?.jumpIde ?? "cursor", {
-        newWindow: true,
-      })
-    : null;
+  const taskDirPath = task.taskDirPath?.trim() ?? "";
   const hasRepoBar = !!workCwd && task.repoPaths.length > 0;
-  if (!hasRepoBar && !taskDirAnchor) return null;
+  if (!hasRepoBar && !taskDirPath) return null;
 
   // V0.12.3：IDE 逐仓打开各自项目根、不再打开多仓公共父目录（同事实测 IDEA 把整个
   // D:/IdeaProjects 当项目开了）；每仓一个按钮、单仓时不带短名后缀
@@ -131,6 +129,30 @@ export const WorkspaceActions = ({ task }: Props) => {
       toast.success("工作区路径已复制");
     } catch {
       toast.error("复制失败、请手动复制");
+    }
+  };
+
+  const openTaskFolder = async () => {
+    if (!taskDirPath || openingTaskDir) return;
+    setOpeningTaskDir(true);
+    try {
+      const res = await fetch("/api/system/open-path", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: taskDirPath }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as {
+          error?: string;
+        } | null;
+        throw new Error(data?.error ?? `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      toast.error(
+        `打开任务文件夹失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setOpeningTaskDir(false);
     }
   };
 
@@ -370,24 +392,23 @@ export const WorkspaceActions = ({ task }: Props) => {
         );
       })}
 
-      {/* 打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
-      {taskDirAnchor && (
+      {/* 用系统文件管理器打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
+      {taskDirPath && (
         <Tooltip
-          content={`打开任务文件夹（artifact / workspace 产出都在这）\n${task.taskDirPath}`}
+          content={`在文件管理器打开任务文件夹（artifact / workspace 产出都在这）\n${taskDirPath}`}
         >
           <Button
             variant="ghost"
             size="sm"
             className={BTN_CLS}
-            nativeButton={false}
-            render={
-              <a
-                {...taskDirAnchor}
-                className="no-underline"
-              />
-            }
+            disabled={openingTaskDir}
+            onClick={() => void openTaskFolder()}
           >
-            <FolderOpen className="size-3" />
+            {openingTaskDir ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <FolderOpen className="size-3" />
+            )}
             任务文件夹
           </Button>
         </Tooltip>

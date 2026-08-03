@@ -28,6 +28,7 @@ import type {
   Task,
 } from "@/lib/types";
 import { ACTION_LABEL } from "@/lib/types";
+import { isTestingRequirementTask } from "@/lib/testing-task";
 
 /** bash 单引号包裹：内部 `'` → `'\''`，防分支名里的 `;` `$()` 反引号等注入 */
 const shellQuoteSingle = (s: string): string =>
@@ -165,6 +166,9 @@ export const checkActionPrerequisites = (
 export const planBranchesForBuild = (
   task: Task,
 ): { infos: GitBranchInfo[]; promptHint: string } | null => {
+  // 测试任务只使用用户明确填写的被测业务分支，runner 会在每个 Action 前硬校验并检出；
+  // 绝不能沿用开发任务的「留空自动创建 feature 分支」。
+  if (isTestingRequirementTask(task)) return null;
   // storyId 必需（默认 + 各模板都含 {storyId}）、feishuStoryUrl 空则不建分支
   if (!task.feishuStoryUrl || task.feishuStoryUrl.trim().length === 0) {
     return null;

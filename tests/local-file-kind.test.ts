@@ -5,6 +5,8 @@ import {
   canPreviewInSheet,
   detectLocalFileKind,
   extToShikiLang,
+  resolveLocalFileOpenTarget,
+  shouldOpenLocalFileInBrowser,
 } from "@/lib/local-file-kind";
 
 describe("detectLocalFileKind", () => {
@@ -18,6 +20,34 @@ describe("detectLocalFileKind", () => {
     expect(detectLocalFileKind("deck.pptx")).toBe("pptx");
     expect(detectLocalFileKind("app.exe")).toBe("binary");
     expect(detectLocalFileKind("noext")).toBe("unknown");
+  });
+});
+
+describe("shouldOpenLocalFileInBrowser", () => {
+  it("html / htm 直接进入系统默认浏览器", () => {
+    expect(shouldOpenLocalFileInBrowser("/tmp/report.html")).toBe(true);
+    expect(shouldOpenLocalFileInBrowser("C:\\tmp\\REPORT.HTM")).toBe(true);
+  });
+
+  it("只识别 HTML 扩展名", () => {
+    expect(shouldOpenLocalFileInBrowser("/tmp/report.tsx")).toBe(false);
+    expect(shouldOpenLocalFileInBrowser("/tmp/report.html.txt")).toBe(false);
+  });
+});
+
+describe("resolveLocalFileOpenTarget", () => {
+  it("HTML 页面进浏览器，带行号的 HTML 进 IDE", () => {
+    expect(resolveLocalFileOpenTarget("/tmp/report.html")).toBe("browser");
+    expect(resolveLocalFileOpenTarget("C:\\tmp\\REPORT.HTM")).toBe("browser");
+    expect(resolveLocalFileOpenTarget("/tmp/report.html", 42)).toBe("ide");
+  });
+
+  it("代码文件进 IDE，非代码文件留在应用内预览", () => {
+    expect(resolveLocalFileOpenTarget("/tmp/report.tsx")).toBe("ide");
+    expect(resolveLocalFileOpenTarget("/tmp/report.py", 7)).toBe("ide");
+    expect(resolveLocalFileOpenTarget("/tmp/readme.md", 7)).toBe("preview");
+    expect(resolveLocalFileOpenTarget("/tmp/screenshot.png")).toBe("preview");
+    expect(resolveLocalFileOpenTarget("/tmp/report.pdf")).toBe("preview");
   });
 });
 

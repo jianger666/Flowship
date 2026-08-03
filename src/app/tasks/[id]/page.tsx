@@ -77,6 +77,11 @@ import {
 import { prepareRunArgs } from "@/lib/run-args";
 import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import {
+  isTestingTask,
+  isTestingRequirementTask,
+  testingTaskMissingBranchRepoPaths,
+} from "@/lib/testing-task";
+import {
   fetchTask,
   finalizeTask,
   mergeTaskEvents,
@@ -783,6 +788,34 @@ const TaskDetailPage = () => {
                     日常
                   </Badge>
                 )}
+                {isTestingTask(task) && (
+                  <Tooltip
+                    content={
+                      isTestingRequirementTask(task) &&
+                      testingTaskMissingBranchRepoPaths(task).length > 0
+                        ? "被测业务分支尚未全部就绪，可先做需求分析和测试用例，之后从编辑任务补上"
+                        : isTestingRequirementTask(task)
+                          ? "测试任务：Action 启动前会校验并切到被测业务分支"
+                          : "测试角色的日常任务"
+                    }
+                  >
+                    <Badge
+                      variant={
+                        isTestingRequirementTask(task) &&
+                        testingTaskMissingBranchRepoPaths(task).length > 0
+                          ? "outline"
+                          : "secondary"
+                      }
+                      size="xs"
+                      className="font-normal"
+                    >
+                      {isTestingRequirementTask(task) &&
+                      testingTaskMissingBranchRepoPaths(task).length > 0
+                        ? "测试 · 待补分支"
+                        : "测试"}
+                    </Badge>
+                  </Tooltip>
+                )}
                 {task.runStatus === "error" ? (
                   <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-muted-foreground">
                     <span className="size-1.5 rounded-full bg-destructive/80" />
@@ -795,7 +828,7 @@ const TaskDetailPage = () => {
                 ) : null}
                 {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
                 {task.runStatus !== "running" && (
-                  <Tooltip content="编辑任务：角色 / 标题 / 飞书链接 / 模型 / 工作分支">
+                  <Tooltip content="编辑任务：标题 / 飞书链接 / 工作分支">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -858,7 +891,9 @@ const TaskDetailPage = () => {
                   <Tooltip
                     content={task.gitBranches
                       .map((b) =>
-                        `${b.repoPath.split("/").pop()}: based on ${b.baseBranch || "?"}`,
+                        isTestingRequirementTask(task)
+                          ? `${b.repoPath.split("/").pop()}: ${b.name}${b.headCommit ? ` @ ${b.headCommit.slice(0, 12)}` : ""}`
+                          : `${b.repoPath.split("/").pop()}: based on ${b.baseBranch || "?"}`,
                       )
                       .join("\n")}
                   >

@@ -60,9 +60,37 @@ const DropdownMenuItem = ({
   />
 );
 
+const DropdownMenuLinkItem = ({
+  className,
+  ...props
+}: MenuPrimitive.LinkItem.Props) => (
+  <MenuPrimitive.LinkItem
+    data-slot="dropdown-menu-link-item"
+    className={cn(
+      "flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none select-none",
+      "data-highlighted:bg-accent data-highlighted:text-accent-foreground",
+      "data-disabled:pointer-events-none data-disabled:opacity-50",
+      className,
+    )}
+    {...props}
+  />
+);
+
+const DropdownMenuSeparator = ({
+  className,
+  ...props
+}: MenuPrimitive.Separator.Props) => (
+  <MenuPrimitive.Separator
+    className={cn("my-1 h-px bg-border", className)}
+    {...props}
+  />
+);
+
 export {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLinkItem,
+  DropdownMenuSeparator,
 };

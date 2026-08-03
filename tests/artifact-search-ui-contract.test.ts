@@ -60,6 +60,18 @@ describe("事件流内联搜索 UI", () => {
     expect(eventStream).not.toContain("document\n        .querySelector");
   });
 
+  it("chat 搜索悬浮在内容区，不再常驻占用一整行", () => {
+    expect(eventStream).toContain(
+      '"absolute right-3 top-2 z-20 rounded-lg border border-border/60 bg-background/90 shadow-sm backdrop-blur"',
+    );
+    expect(eventStream).toContain(
+      '"w-[min(28rem,calc(100%-1.5rem))] p-1"',
+    );
+    expect(eventStream).not.toContain(
+      'className="shrink-0 justify-end border-b px-4 py-1.5"',
+    );
+  });
+
   it("不再仅用卡片边框高亮", () => {
     expect(eventStream).not.toContain("resolveSearchHighlightForItem");
     expect(eventStream).not.toContain("ring-brand/50 bg-brand/10");

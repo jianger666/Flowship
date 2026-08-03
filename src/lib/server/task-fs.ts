@@ -1317,6 +1317,7 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     id: newTaskId(),
     title: finalTitle,
     mode: input.mode,
+    workRole: input.mode === "task" ? input.workRole : undefined,
     // chat 首轮后用 SDK auto 生成短标题；task 模式不设
     titleAutoPending: input.mode === "chat" ? true : undefined,
     repoStatus: "developing",
@@ -1967,6 +1968,15 @@ export const updateTaskFields = async (
         }
         meta.repoFeatureBranches =
           Object.keys(cleaned).length > 0 ? cleaned : undefined;
+      }
+      // 测试任务改 / 清被测业务分支后，旧 gitBranches 不能继续冒充当前配置。
+      // 分支名仍一致的记录保留提交 SHA；变化或清空的记录等下个 Action 重新准备并写入。
+      if (meta.workRole === "qa" && meta.gitBranches) {
+        meta.gitBranches = meta.gitBranches.filter(
+          (info) =>
+            meta.repoFeatureBranches?.[info.repoPath]?.trim() === info.name,
+        );
+        if (meta.gitBranches.length === 0) delete meta.gitBranches;
       }
     }
 

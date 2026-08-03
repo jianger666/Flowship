@@ -23,7 +23,7 @@ import { failpoint } from "@/lib/server/failpoints";
 import { prewarmTaskWorkspace } from "@/lib/server/task-runner";
 import { isValidReqId } from "@/lib/req-id";
 import { buildPlaceholderChatTitle } from "@/lib/task-display";
-import type { NewTaskInput, TaskMode } from "@/lib/types";
+import { USER_ROLES, type NewTaskInput, type TaskMode, type UserRole } from "@/lib/types";
 
 // 飞书桥接 bootstrap 锚点：任务列表是 app 启动后最早被请求的 API 之一，
 // 挂这里保证 server 起来后桥接 consumer/出向 tap 尽快就位
@@ -114,6 +114,10 @@ export const POST = async (req: Request) => {
       title,
       repoPaths,
       mode,
+      workRole:
+        USER_ROLES.includes(body.workRole as UserRole)
+          ? (body.workRole as UserRole)
+          : undefined,
       repoBaseBranches: sanitizeRepoBranchMap(body.repoBaseBranches),
       repoFeatureBranches: sanitizeRepoBranchMap(body.repoFeatureBranches),
       // V0.6.25 修 pre-existing bug：V0.6.7 的 test/dev/模板 三个 per-repo 快照之前在 route 层漏接、

@@ -1418,8 +1418,8 @@ const EventStreamImpl = ({
       data-pane-search="event-stream"
       onPointerDown={() => setActivePaneSearchScope("event-stream")}
     >
-      {/* chat 形态：顶栏只放搜索；log 形态带「事件流」标题 */}
-      {!isChat ? (
+      {/* log 形态保留固定标题栏；chat 搜索改为内容区右上角悬浮，不占垂直布局。 */}
+      {!isChat && (
         <EventStreamSearchBar
           active={searchActive}
           query={searchQuery}
@@ -1436,26 +1436,32 @@ const EventStreamImpl = ({
           leading={<span className="flex-1">事件流</span>}
           className="h-10 shrink-0 border-b px-4"
         />
-      ) : (
-        <EventStreamSearchBar
-          active={searchActive}
-          query={searchQuery}
-          hitIndex={searchHitIndex}
-          hitCount={searchOccurrences.length}
-          onActivate={activateStreamSearch}
-          onQueryChange={setSearchQuery}
-          onClose={closeStreamSearch}
-          onPrev={goToPrevSearchHit}
-          onNext={goToNextSearchHit}
-          inputRef={searchInputRef}
-          placeholder="搜索 AI 回复…"
-          ariaLabel="搜索 AI 回复"
-          className="shrink-0 justify-end border-b px-4 py-1.5"
-        />
       )}
       {/* min-h-0 让 flex-1 子项能正确 shrink、Virtuoso 拿到确定高度才能内部 scroll。
-          relative：给「AI 在等你回答」悬浮条定位 */}
+          relative：给 chat 搜索与「AI 在等你回答」悬浮条定位 */}
       <div className="relative min-h-0 flex-1">
+        {isChat && (
+          <EventStreamSearchBar
+            active={searchActive}
+            query={searchQuery}
+            hitIndex={searchHitIndex}
+            hitCount={searchOccurrences.length}
+            onActivate={activateStreamSearch}
+            onQueryChange={setSearchQuery}
+            onClose={closeStreamSearch}
+            onPrev={goToPrevSearchHit}
+            onNext={goToNextSearchHit}
+            inputRef={searchInputRef}
+            placeholder="搜索 AI 回复…"
+            ariaLabel="搜索 AI 回复"
+            className={cn(
+              "absolute right-3 top-2 z-20 rounded-lg border border-border/60 bg-background/90 shadow-sm backdrop-blur",
+              searchActive
+                ? "w-[min(28rem,calc(100%-1.5rem))] p-1"
+                : "p-0.5",
+            )}
+          />
+        )}
         {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn） */}
         {isChat && (
           <div

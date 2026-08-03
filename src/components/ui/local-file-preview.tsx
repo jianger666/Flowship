@@ -9,7 +9,7 @@
  * - 签名元素 = 扩展名徽章 + 可点路径复制；文件动作与关分层
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   ExternalLink,
   FolderOpen,
@@ -248,6 +248,10 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     });
     setOpen(true);
   }, []);
+  const previewContext = useMemo(
+    () => ({ open: openPreview, ide }),
+    [openPreview, ide],
+  );
 
   // 关窗动画结束后再卸内容（DialogContent duration-100，留一点余量）
   useEffect(() => {
@@ -333,7 +337,7 @@ export const LocalFilePreviewProvider = ({ children }: { children: ReactNode }) 
     : "";
 
   return (
-    <LocalFilePreviewContext.Provider value={{ open: openPreview }}>
+    <LocalFilePreviewContext.Provider value={previewContext}>
       {children}
       {/*
         与推进弹窗同一套 Dialog + DialogContent：共享蒙层、开关动画、右上角 Close。

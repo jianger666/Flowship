@@ -105,6 +105,33 @@ export const canPreviewInSheet = (kind: LocalFileKind): boolean =>
   kind === "docx" ||
   kind === "xlsx";
 
+/** HTML 的主意图是查看页面：无源码位置时交给系统默认浏览器。 */
+export const shouldOpenLocalFileInBrowser = (absolutePath: string): boolean => {
+  const p = absolutePath.trim().toLowerCase();
+  return p.endsWith(".html") || p.endsWith(".htm");
+};
+
+export type LocalFileOpenTarget = "browser" | "ide" | "preview";
+
+/**
+ * 本地文件链接的主动作：
+ * - HTML 无行号是可运行产物，去浏览器看渲染结果；
+ * - HTML 有行号及其他代码文件是源码导航，去用户配置的 IDE；
+ * - 文档、图片等留在 Flowship 预览。
+ */
+export const resolveLocalFileOpenTarget = (
+  absolutePath: string,
+  line?: number,
+): LocalFileOpenTarget => {
+  if (shouldOpenLocalFileInBrowser(absolutePath) && line == null) {
+    return "browser";
+  }
+  if (detectLocalFileKind(absolutePath) === "code") {
+    return "ide";
+  }
+  return "preview";
+};
+
 /** Shiki / fenced 块语言 id（扩展名 → streamdown 语言） */
 export const extToShikiLang = (ext: string): string => {
   const e = ext.toLowerCase().replace(/^\./, "");

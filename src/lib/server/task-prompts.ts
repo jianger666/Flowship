@@ -50,6 +50,10 @@ import type {
 import { TEST_STRATEGY_LABEL } from "@/lib/types";
 import { computeBatchProgress } from "@/lib/task-display";
 import { buildNextActionHead } from "@/lib/protocol-signals";
+import {
+  isTestingRequirementTask,
+  testingTaskMissingBranchRepoPaths,
+} from "@/lib/testing-task";
 
 // ----------------- 配置 -----------------
 
@@ -424,6 +428,9 @@ const renderRepoSection = (task: Task): string => {
  */
 export const renderReadonlyRepoDirective = (task: Task): string => {
   if ((task.readonlyRepoPaths ?? []).length === 0) return "";
+  if (isTestingRequirementTask(task)) {
+    return "只读仓：不改内容 / 不建分支 / 不 commit / 不 push / 不提 MR；仅使用本任务明确配置的被测业务分支做验证。";
+  }
   return "只读仓：不改内容 / 不建分支 / 不 commit / 不 push / 不提 MR；允许 `git pull` 与切到该仓测试分支拉最新做验证。";
 };
 
@@ -439,14 +446,16 @@ export const renderScriptRepoDirective = (task: Task): string => {
 // V0.6.7：渲染「仓库分支配置」段注入 super prompt——ship 读测试分支、各 action 兜底参考
 // 每仓列：线上分支（feature 拉取基线）/ 测试分支（ship 提测 MR 目标）/ dev 分支
 // 非 git 目录：无分支概念、只标「直接在该目录使用」；只读仓行尾标 🔒 只读、脚本仓标 📜 脚本仓
-const renderRepoBranchSection = (task: Task): string => {
+export const renderRepoBranchSection = (task: Task): string => {
   const repoPaths = task.repoPaths ?? [];
   if (repoPaths.length === 0) return "（无绑定仓库）";
   // V0.10：隔离 task 括号里展示 worktree 路径（agent 实际干活的目录、别引它 cd 回原仓库）
   // 判断 git / 只读 / 脚本仓读快照（不 existsSync）
   const workPaths = getTaskWorkRepoPaths(task);
   const lines: string[] = [
-    "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
+    isTestingRequirementTask(task)
+      ? "测试任务的仓库分支配置（被测业务分支由用户指定、不会自动创建）："
+      : "每个仓的分支配置（建 task 时从设置页快照固化、ship 提测目标分支以此为准）：",
     "",
   ];
   let hasReadonly = false;
@@ -468,10 +477,39 @@ const renderRepoBranchSection = (task: Task): string => {
     const online = task.repoBaseBranches?.[p]?.trim();
     const test = task.repoTestBranches?.[p]?.trim();
     const dev = task.repoDevBranches?.[p]?.trim();
+    if (isTestingRequirementTask(task)) {
+      const business = task.repoFeatureBranches?.[p]?.trim();
+      const recorded = task.gitBranches?.find((b) => b.repoPath === p);
+      lines.push(
+        `- \`${tail}\`（${workPaths[i]}）：被测业务分支=${business || "（未就绪）"}` +
+          (recorded?.headCommit
+            ? `、当前记录提交=${recorded.headCommit.slice(0, 12)}`
+            : "") +
+          flagTag,
+      );
+    } else {
+      lines.push(
+        `- \`${tail}\`（${workPaths[i]}）：线上分支=${online || "（未配、自动探测）"}、` +
+          `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}${flagTag}`,
+      );
+    }
+  }
+  if (isTestingRequirementTask(task)) {
+    const missing = testingTaskMissingBranchRepoPaths(task);
+    lines.push("");
     lines.push(
-      `- \`${tail}\`（${workPaths[i]}）：线上分支=${online || "（未配、自动探测）"}、` +
-        `测试分支=${test || "test（默认）"}、dev 分支=${dev || "（未配）"}${flagTag}`,
+      "测试任务规则：禁止创建 feature 分支、禁止自行切到 test / dev 分支替代被测业务分支。",
     );
+    if (missing.length > 0) {
+      const names = missing.map((p) => `\`${p.split("/").filter(Boolean).pop() ?? p}\``);
+      lines.push(
+        `以下仓库的被测业务分支尚未就绪：${names.join("、")}。可以读取需求、现有目录结构和历史代码来设计测试用例 / 测试方案；但当前 checkout **不代表本需求实现**，不得据此执行需求验收、宣称测试通过或提交针对本需求实现的代码修改。需要验证实现时，先请用户在任务编辑中补充分支。`,
+      );
+    } else {
+      lines.push(
+        "系统已在 Action 启动前检出上面指定的被测业务分支；围绕这些分支进行测试，不要自行切换到其它分支。",
+      );
+    }
   }
   // 只读 / 脚本仓约定各自独立一行（解耦：只读讲权限、脚本仓讲性质；组合场景 agent 自行推导）
   if (hasReadonly || hasScript) lines.push("");

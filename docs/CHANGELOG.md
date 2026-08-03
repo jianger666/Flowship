@@ -15,6 +15,20 @@
 
 ---
 
+### 2026-08-03 v1.7.0：栏内搜索、文件打开体验与测试角色工作流
+
+- **栏内搜索**：产物区和事件流支持 `Cmd/Ctrl+F`、命中高亮、上下条定位与关闭；事件流只检索 AI 回复，聊天模式改为不占内容高度的悬浮入口。
+- **本地文件交互**：HTML 默认交给浏览器，带行号的代码交给配置的 IDE，文档继续在 Flowship 预览；右键或产物链接旁的更多菜单可切换打开方式、定位文件和复制路径；「任务文件夹」改用 macOS Finder / Windows Explorer 打开。
+- **测试角色工作流**：设置页与建任务页移除 worktree 概念；需求任务可按仓选择或手填被测业务分支，也可先留空编写分析和测试用例、之后在任务内补齐。每个 Action 启动前确定性校验并检出已配置分支，脏工作区会阻止自动切换，实际提交写入任务分支信息。
+- **兼容与修复**：REQ-ID 对测试角色隐藏、其它角色统一命名；修复 Combobox 触发器被 Tooltip 吞掉交互、导致业务分支下拉点击无响应的问题；仓库与更新地址正式切换为 `jianger666/Flowship`，保留既有 appId、userData 与安装包名保证升级兼容。
+- **门禁**：typecheck、lint、全量测试与 standalone test 包构建通过；依赖本地监听端口 / 子进程的用例在沙箱外复跑通过。
+
+### 2026-08-03 GitHub 仓库正式改名 Flowship
+
+- GitHub 仓库从 `jianger666/fe-ai-flow` 改为 `jianger666/Flowship`；执行时公开版本已到 v1.6.2，早于改名保护线的 v1.1.14 已经过多个版本窗口。
+- 壳内 latest release / manifest / dmg 三条地址、`electron-builder.yml` 的 `publish.repo`、README 下载链接与本地 origin 同步切到新仓库。
+- 更新兼容底线不动：`appId=com.jianger.fe-ai-flow`、userData `fe-ai-flow` / `fe-ai-flow-test`、安装包 `fe-ai-flow-*` 永久保留；旧客户端通过 GitHub 旧仓库名重定向续更，禁止重新创建名为 `fe-ai-flow` 的仓库覆盖重定向。
+
 ### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
 
 > HANDOFF「最近演进」有精简版（干了什么 + 口径 + 欠账）。本段是过程档案：双模型交叉 review 的逐条结论、
@@ -4203,5 +4217,3 @@ feat(users): 加用户列表批量导出
 - **cost / token dashboard**
 
 ---
-
-

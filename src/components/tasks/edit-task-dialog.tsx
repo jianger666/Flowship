@@ -46,6 +46,7 @@ import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings } from "@/lib/local-store";
 import { normalizeReqId, reqIdPatchValue } from "@/lib/req-id";
 import { updateTaskFields } from "@/lib/task-store";
+import { isTestingRequirementTask } from "@/lib/testing-task";
 import type { RepoConfig, Task } from "@/lib/types";
 
 interface Props {
@@ -57,6 +58,7 @@ interface Props {
 }
 
 export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => {
+  const testingTask = isTestingRequirementTask(task);
   // 任务标题（必填）
   const [title, setTitle] = useState(task.title);
   // 飞书项目链接草稿：需求任务可改具体 URL；日常任务禁用（身份创建后不可有↔无）
@@ -225,9 +227,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
           </div>
 
           {/* wk 需求编号：只对需求任务有意义（日常任务推进面板不出 wk 流程组） */}
-          {storyUrlLockedHas && (
+          {storyUrlLockedHas && !testingTask && (
             <div className="grid gap-1.5">
-              <Label htmlFor="edit-req-id">需求编号</Label>
+              <Label htmlFor="edit-req-id">REQ-ID</Label>
               <Input
                 id="edit-req-id"
                 value={reqId}
@@ -289,13 +291,22 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             </div>
           )}
 
-          {/* 已有工作分支：per-repo（已绑仓 + 本次追加仓）。
+          {/* 工作分支：per-repo（已绑仓 + 本次追加仓）。测试任务中是可后补的被测分支。
               v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用。
               隔离任务（isolateWorktree 建完定死）填已有分支可能与原仓检出冲突——只提示、不强制改 isolate */}
           {task.repoPaths.length + addRepos.length > 0 && (
             <div className="grid gap-1.5">
-              <Label>已有工作分支（选填）</Label>
-              {task.isolateWorktree === true && (
+              <Label>
+                {testingTask
+                  ? "被测业务分支（可后补）"
+                  : "已有工作分支（选填）"}
+              </Label>
+              {testingTask && (
+                <p className="text-xs text-muted-foreground">
+                  补上后从下一个 Action 起生效；留空时 AI 只把当前仓库作为结构参考，不视为需求实现
+                </p>
+              )}
+              {!testingTask && task.isolateWorktree === true && (
                 <p className="text-xs text-muted-foreground">
                   隔离任务填已有分支可能与原仓检出冲突
                 </p>
@@ -316,8 +327,16 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                           setFeatureBranches((prev) => ({ ...prev, [p]: v }))
                         }
                         options={entry?.branches ?? []}
-                        loading={!entry}
-                        disabled={!entry || (entry.isRepo === false && !entry.gitMissing)}
+                        loading={!testingTask && !entry}
+                        emptyHint={
+                          testingTask
+                            ? "暂无候选，可在上方直接输入业务分支"
+                            : undefined
+                        }
+                        disabled={
+                          !testingTask &&
+                          (!entry || (entry.isRepo === false && !entry.gitMissing))
+                        }
                         placeholder={
                           entry?.isRepo === false
                             ? entry.pathMissing
@@ -325,7 +344,9 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                               : entry.gitMissing
                                 ? "未检测到 git、可手填分支"
                                 : "非 git 仓库"
-                            : "留空自动建 feature/…"
+                            : testingTask
+                              ? "选择或填写业务分支"
+                              : "留空自动建 feature/…"
                         }
                         className="min-w-0 flex-1"
                       />

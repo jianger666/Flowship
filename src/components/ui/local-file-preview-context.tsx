@@ -9,6 +9,7 @@
 import { createContext, useContext } from "react";
 
 import { resolveIdeTarget } from "@/lib/path-utils";
+import type { JumpIde } from "@/lib/types";
 
 export interface OpenLocalFileOptions {
   /** 相对路径解析基准（task cwd） */
@@ -19,6 +20,8 @@ export interface OpenLocalFileOptions {
 
 interface LocalFilePreviewContextValue {
   open: (pathLike: string, opts?: OpenLocalFileOptions) => void;
+  /** Provider 统一读取一次，避免每个事件流文件链接各自初始化设置。 */
+  ide: JumpIde;
 }
 
 export const LocalFilePreviewContext =

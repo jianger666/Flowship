@@ -16,7 +16,7 @@
 
 ## 安装
 
-从 [Releases](https://github.com/jianger666/fe-ai-flow/releases/latest) 下载对应平台安装包：
+从 [Releases](https://github.com/jianger666/Flowship/releases/latest) 下载对应平台安装包：
 
 | 平台 | 包 | 安装 |
 |---|---|---|

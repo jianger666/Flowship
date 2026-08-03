@@ -274,6 +274,7 @@ const buildMarkdownComponents = (
             linker={linker}
             parsedPath={parsed.path}
             segments={parsed.segments}
+            showActions
           />
         );
       }
@@ -296,6 +297,7 @@ const buildMarkdownComponents = (
         <LocalFileLink
           linker={linker}
           path={text}
+          showActions
           linkClassName="font-mono text-[0.85em] text-info underline-offset-2 hover:underline"
         >
           {pathDisplayLabel(resolved.absolute)}

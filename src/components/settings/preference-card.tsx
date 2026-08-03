@@ -33,6 +33,7 @@ import {
 } from "@/lib/branch-template";
 import { openSystemNotificationSettings } from "@/lib/shell-notify";
 import { SUBMIT_SHORTCUT_LABEL } from "@/lib/submit-shortcut";
+import { roleSupportsWorktree } from "@/lib/role-worktree";
 import {
   JUMP_IDES,
   JUMP_IDE_LABEL,
@@ -367,16 +368,18 @@ export const PreferenceSections = ({
         }
       />
 
-      <SettingRow
-        label="新任务默认使用 worktree"
-        hint="worktree = 隔离工作区、任务改动不影响原仓库；关掉后新任务默认直接在原仓库运行"
-        control={
-          <Switch
-            checked={isolateWorktreeDefault}
-            onCheckedChange={onIsolateWorktreeDefaultChange}
-          />
-        }
-      />
+      {roleSupportsWorktree(userRole) && (
+        <SettingRow
+          label="新任务默认使用 worktree"
+          hint="worktree = 隔离工作区、任务改动不影响原仓库；关掉后新任务默认直接在原仓库运行"
+          control={
+            <Switch
+              checked={isolateWorktreeDefault}
+              onCheckedChange={onIsolateWorktreeDefaultChange}
+            />
+          }
+        />
+      )}
 
       {/* 通知开关本质在系统层（用户拍板：不放 app 层 Switch）——这行只做「找回入口」 */}
       <SettingRow

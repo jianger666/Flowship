@@ -6,7 +6,7 @@
 
 站在 Cursor SDK 肩膀上的**项目级 AI Harness 平台 · 飞书 story → MR 自动化**。核心是 Harness（缰绳）：每个 action 边界用确定性工具（artifact 落盘 / 必备段 lint / review 只读指纹 / 基底 commit 校验 / MR 门禁 / HITL ack）压住 LLM 非确定性、保证产出可观测、可回退、可复用。
 
-> 产品显示名 **Flowship**（v1.1.0 起、原「AI工作流」）；发版链内部标识（appId / userData `fe-ai-flow` / artifactName / 仓库名）永远不改。代码内标识已全面 Flowship 化（v1.1.x：包名 `flowship`、MCP `flowshipChat`、env `FLOWSHIP_*`、globalThis `__flowship*`、localStorage `flowship:*`）；仍保留旧值的仅剩：持久化 marker（`<!--fe-ai-flow-rev-split-->`、`refs/ai-flow/checkpoints`）、退役迁移 key（`fe-ai-flow:settings`）。
+> 产品显示名与 GitHub 仓库名均为 **Flowship**（v1.1.0 起、原「AI工作流」；仓库于 2026-08-03 从 `fe-ai-flow` 改名）。发版链稳定内部标识（appId / userData `fe-ai-flow` / artifactName）永远不改。代码内标识已全面 Flowship 化（v1.1.x：包名 `flowship`、MCP `flowshipChat`、env `FLOWSHIP_*`、globalThis `__flowship*`、localStorage `flowship:*`）；仍保留旧值的仅剩：持久化 marker（`<!--fe-ai-flow-rev-split-->`、`refs/ai-flow/checkpoints`）、退役迁移 key（`fe-ai-flow:settings`）。
 
 ## 给 AI 接力的最小上下文
 

@@ -52,4 +52,17 @@ describe("planBranchesForBuild bash hint 防注入", () => {
     expect(r!.promptHint).not.toContain("evil;rm");
     expect(r!.promptHint).toMatch(/git checkout '[^']+'/);
   });
+
+  it("测试任务不走开发任务的自动建 feature 分支", () => {
+    expect(
+      planBranchesForBuild(
+        baseTask({
+          workRole: "qa",
+          repoFeatureBranches: {
+            "/tmp/fake-repo-for-hint": "feature/ready",
+          },
+        }),
+      ),
+    ).toBeNull();
+  });
 });

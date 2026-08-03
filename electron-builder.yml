@@ -97,11 +97,11 @@ dmg:
 
 # electron-builder 自动产 latest.yml 一起传 GitHub Release、electron-updater 靠它发现新版。
 # releaseType: release——CI 的 build-release job 先建好正式 release、electron 矩阵 job 往同 tag 追加安装包 asset
-# 2026-07-15 改名事故复盘：改成 Flowship 当天发现旧壳 fetchLatestVersion 只读第一跳重定向、
-# 全体存量客户端更新链断、当日改回 fe-ai-flow。改名 Flowship 的正确姿势：先发一版「重定向安全」
-# 的壳（fetchLatestVersion 已修）、等全员升级后再改仓库名（GitHub 旧名重定向会兜住）。
+# 2026-07-15 改名事故复盘：旧壳 fetchLatestVersion 只读第一跳重定向，仓库改名会断 mac 更新。
+# v1.1.14 已改为跟随到最终 URL；2026-08-03 在当前版本 v1.6.2 后正式改名 Flowship。
+# 旧客户端继续依赖 GitHub 的 fe-ai-flow → Flowship 重定向，禁止再创建同名 fe-ai-flow 仓库。
 publish:
   provider: github
   owner: jianger666
-  repo: fe-ai-flow
+  repo: Flowship
   releaseType: release

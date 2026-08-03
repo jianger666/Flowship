@@ -118,6 +118,14 @@ import {
 } from "./cursor-config";
 import { resolveEffectiveGitHost } from "./gitlab-host";
 import { enrichMcpServersWithOAuth } from "./mcp-oauth";
+import {
+  prepareTestingTaskBranches,
+  TestingBranchLeaseLostError,
+} from "./testing-task-branches";
+import {
+  isTestingRequirementTask,
+  testingTaskConfiguredBranchRepoPaths,
+} from "@/lib/testing-task";
 import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
 import { setTaskSessionAgentId } from "./task-fs";
@@ -1067,6 +1075,40 @@ const advanceTaskCore = async (
     if (refreshed) task = refreshed;
   }
 
+  // 测试任务直接使用原仓库，但不能把「当前随便停在哪个分支」当成被测实现。
+  // 已填写的被测业务分支在每个 Action 前由 runner 硬校验 + 检出；未填写的仓库不切换，
+  // prompt 会限制为需求分析 / 测试设计，且绝不沿用 build 的自动建 feature 分支逻辑。
+  if (
+    isTestingRequirementTask(task) &&
+    testingTaskConfiguredBranchRepoPaths(task).length > 0
+  ) {
+    await writeOwnedEventAndPublish(
+      task.id,
+      () => !isTaskOpStale(task.id, opGen),
+      { kind: "info", text: "正在准备被测业务分支…" },
+    );
+    let infos;
+    try {
+      infos = await prepareTestingTaskBranches(
+        task,
+        () => !isTaskOpStale(task.id, opGen),
+      );
+    } catch (err) {
+      if (err instanceof TestingBranchLeaseLostError) {
+        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+      }
+      throw err;
+    }
+    for (const info of infos) {
+      await upsertGitBranch(
+        task.id,
+        info,
+        () => !isTaskOpStale(task.id, opGen),
+      );
+    }
+    task = (await getTask(task.id)) ?? task;
+  }
+
   // V0.10：隔离工作区 task → 推进前确定性建 / 复用 worktree（幂等、已存在秒过）。
   //   分支检出由 runner 硬保证（替代 build checkout hint 的 prompt 软约束）；
   //   创建失败直接抛（带处置建议）、不带病起 agent。
@@ -1547,6 +1589,32 @@ const resumeCurrentActionCore = async (
   publish(fresh.id, { kind: "task", task: patchedTask });
   publish(fresh.id, { kind: "action", action: patchedAction });
   let startTask = patchedTask;
+
+  // 唤醒当前 Action 也重新确认测试任务所在分支；否则用户在两轮之间手动切仓库，
+  // 新 agent 会在错误分支继续。这里已有 opHandle，直接用 owner lease。
+  if (
+    isTestingRequirementTask(startTask) &&
+    testingTaskConfiguredBranchRepoPaths(startTask).length > 0
+  ) {
+    let infos;
+    try {
+      infos = await prepareTestingTaskBranches(
+        startTask,
+        () => isOpOwner(opHandle),
+      );
+    } catch (err) {
+      if (err instanceof TestingBranchLeaseLostError) {
+        releaseTaskOpIf(opHandle);
+        throw new Error(TASK_OP_STALE_HTTP_MESSAGE);
+      }
+      throw err;
+    }
+    for (const info of infos) {
+      await upsertGitBranch(fresh.id, info, () => isOpOwner(opHandle));
+    }
+    startTask = (await getTask(fresh.id)) ?? startTask;
+    await abortIfTaskOpStale(fresh.id, opGen);
+  }
 
   // owner 语境（resume 链已 claim）——opHandle lease
   await writeOwnedEventAndPublish(
