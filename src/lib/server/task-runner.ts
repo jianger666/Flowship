@@ -1142,10 +1142,11 @@ const advanceTaskCore = async (
         upcomingWkCommand === "wk:repo-execute" ||
         upcomingWkCommand === "wk:repo-review"
       ) {
-        branchSelection = {
-          kind: "explicit",
-          infos: await resolveWkWorktreeBranchInfos(task),
-        };
+        // 有现成业务分支就帮切；解析不到不硬拦——分支门禁交给团队规范 / AI
+        const wkInfos = await resolveWkWorktreeBranchInfos(task);
+        if (wkInfos.length > 0) {
+          branchSelection = { kind: "explicit", infos: wkInfos };
+        }
       }
       ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen), {
         deferDepClone: true,
@@ -2637,14 +2638,7 @@ export const buildSessionBridges = (
         askLease,
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
-      // ask 成功路径显式 accepted；queueMicrotask 让 MCP 先把 [ASK_SUBMITTED] 回给工具层再软停 stream，
-      // 防 SDK 注入 Please continue 续跑——cancelled 分支见 consumeSessionRun askPending 软停。
-      queueMicrotask(() => {
-        if (!askLease()) return;
-        const rec = runningTasks.get(task.id);
-        if (!rec) return;
-        rec.softCancelStream?.();
-      });
+      // ask 成功路径显式 accepted
       return "accepted";
     }
 
@@ -4115,12 +4109,6 @@ const consumeSessionRun = async (
           /* noop */
         });
       },
-      softCancelStream: () => {
-        cancelled = true;
-        void run.cancel().catch(() => {
-          /* noop */
-        });
-      },
     });
 
     hardTimer = setTimeout(() => {
@@ -4216,19 +4204,6 @@ const consumeSessionRun = async (
           task.id,
           () => isTaskOpCurrent(opts.opHandle),
           { kind: "done", task: freshQ ?? task, ok: true },
-        );
-        return;
-      }
-      // ask 软停：pendingAsk 仍在（与用户 stop 清 pending 区分）→ 不 finalize / 不关 session / 不写 idle
-      const askPendingOnCancel = !!getPendingAsk(task.id);
-      if (askPendingOnCancel) {
-        if (lostStartOwner()) return;
-        if (yieldIfSuperseded()) return;
-        const freshAsk = await getTask(task.id);
-        publishIfCurrent(
-          task.id,
-          () => isTaskOpCurrent(opts.opHandle),
-          { kind: "done", task: freshAsk ?? task, ok: true },
         );
         return;
       }

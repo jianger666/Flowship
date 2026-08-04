@@ -404,14 +404,15 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     expect(git(wkWorkDir, "branch", "--show-current")).toBe("");
     expect(git(repo, "branch", "--show-current")).toBe("main");
 
-    await expect(
-      ensureTaskWorktrees(wkTask, () => true, {
-        branchSelection: {
-          kind: "explicit",
-          infos: [{ repoPath: repo, name: "feature/REQ-777", baseBranch: "" }],
-        },
-      }),
-    ).rejects.toThrow(/找不到 WK 业务分支/);
+    // 分支尚不存在：帮切软跳过，不硬拦推进（worktree 保持 detached）
+    await expect(resolveWkWorktreeBranchInfos(wkTask)).resolves.toEqual([]);
+    await ensureTaskWorktrees(wkTask, () => true, {
+      branchSelection: {
+        kind: "explicit",
+        infos: [{ repoPath: repo, name: "feature/REQ-777", baseBranch: "" }],
+      },
+    });
+    expect(git(wkWorkDir, "branch", "--show-current")).toBe("");
 
     git(repo, "branch", "feature/REQ-777", "main");
     await expect(resolveWkWorktreeBranchInfos(wkTask)).resolves.toEqual([

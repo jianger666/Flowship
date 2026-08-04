@@ -461,7 +461,7 @@ export interface EnsureWorktreesOptions {
    * 工作区与分支所有权分离：
    * - flowship：按 Flowship 模板规划 / 创建任务分支（旧流程）
    * - detached：只创建物理 worktree，不抢先创建业务分支（新任务预热 / WK 文档阶段）
-   * - explicit：检出调用方已解析的 WK 分支；分支不存在时拒绝凭空创建
+   * - explicit：检出调用方已解析的现成分支；某仓解析不到 / 分支不存在时该仓按 detached 处理（不硬拦）
    */
   branchSelection?:
     | { kind: "flowship" }
@@ -737,7 +737,8 @@ const ensureTaskWorktreesInner = async (ctx: {
     }
 
     const info = infoByRepo.get(repoPath);
-    if (!info && selection.kind !== "detached") {
+    // flowship 必须有规划分支；explicit 某仓解析不到 → 当 detached 处理（帮切是锦上添花）
+    if (!info && selection.kind === "flowship") {
       throw new Error(`仓库 ${repoPath} 缺少目标分支信息，无法准备隔离工作区`);
     }
 
@@ -776,6 +777,8 @@ const ensureTaskWorktreesInner = async (ctx: {
           assertLease();
           // hot checkout 挂 abort——stop/finalize revoke 可中止
           let checkoutArgs = ["checkout", branch];
+          /** explicit 找不到现成分支时跳过帮切，不硬拦 */
+          let skipCheckout = false;
           if (selection.kind === "explicit") {
             await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
             assertLease();
@@ -796,11 +799,11 @@ const ensureTaskWorktreesInner = async (ctx: {
               )
             ).ok;
             if (!localExists && !remoteExists) {
-              throw new Error(
-                `仓库 ${repoPath} 找不到 WK 业务分支「${branch}」（本地 / origin 均不存在），请先创建或推送该分支后重试`,
+              console.warn(
+                `[task-worktrees] 跳过帮切：仓库 ${repoPath} 找不到业务分支「${branch}」（本地 / origin 均不存在）`,
               );
-            }
-            if (!localExists && remoteExists) {
+              skipCheckout = true;
+            } else if (!localExists && remoteExists) {
               checkoutArgs = [
                 "checkout",
                 "--no-track",
@@ -842,17 +845,19 @@ const ensureTaskWorktreesInner = async (ctx: {
                 : ["checkout", "--no-track", "-b", branch];
             }
           }
-          const switched = await runGit(workDir, checkoutArgs, 60_000, job);
-          if (!switched.ok) {
-            // 工作区脏 / 冲突等会导致 checkout 失败——抛清晰提示，让用户先处理，不带病推进
-            const where = currentBranch || "detached HEAD";
-            throw new Error(
-              `仓库 ${repoPath} 当前在 ${where} 分支、任务分支是 ${branch}、自动切回失败：${switched.stderr || switched.stdout}`,
+          if (!skipCheckout) {
+            const switched = await runGit(workDir, checkoutArgs, 60_000, job);
+            if (!switched.ok) {
+              // 工作区脏 / 冲突等会导致 checkout 失败——抛清晰提示，让用户先处理，不带病推进
+              const where = currentBranch || "detached HEAD";
+              throw new Error(
+                `仓库 ${repoPath} 当前在 ${where} 分支、任务分支是 ${branch}、自动切回失败：${switched.stderr || switched.stdout}`,
+              );
+            }
+            console.log(
+              `[task-worktrees] worktree 已切回任务分支：${workDir}（${currentBranch || "detached HEAD"} → ${branch}）`,
             );
           }
-          console.log(
-            `[task-worktrees] worktree 已切回任务分支：${workDir}（${currentBranch || "detached HEAD"} → ${branch}）`,
-          );
         }
         // 热路径 dep clone：oneshot/defer 跳过同步拷贝；正式路径逐单元验 lease
         if (!skipDepClone) {
@@ -961,9 +966,57 @@ const ensureTaskWorktreesInner = async (ctx: {
             `origin/${branch}`,
           ];
         } else if (selection.kind === "explicit") {
-          throw new Error(
-            `仓库 ${repoPath} 找不到 WK 业务分支「${branch}」（本地 / origin 均不存在），请先创建或推送该分支后重试`,
+          // 帮切找不到现成分支 → 退回 detached 物理隔离，不硬拦（规范侧自己管分支）
+          console.warn(
+            `[task-worktrees] 跳过帮切、改 detached：仓库 ${repoPath} 找不到业务分支「${branch}」`,
           );
+          let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";
+          if (!base) {
+            const head = await runGit(
+              repoPath,
+              ["symbolic-ref", "refs/remotes/origin/HEAD"],
+              60_000,
+              job,
+            );
+            base = head.ok
+              ? head.stdout.replace("refs/remotes/origin/", "")
+              : "";
+          }
+          if (!base || !isSafeBranchName(base)) {
+            throw new Error(
+              `仓库 ${repoPath} 探不到合法主分支——去设置页给该仓配「线上分支」后重试`,
+            );
+          }
+          await runGit(repoPath, ["fetch", "origin", base], 30_000, job);
+          assertLease();
+          const remoteBase = (
+            await runGit(
+              repoPath,
+              ["rev-parse", "--verify", "--quiet", `origin/${base}`],
+              60_000,
+              job,
+            )
+          ).ok;
+          const localBase = (
+            await runGit(
+              repoPath,
+              ["show-ref", "--verify", "--quiet", `refs/heads/${base}`],
+              60_000,
+              job,
+            )
+          ).ok;
+          const startPoint = remoteBase
+            ? `origin/${base}`
+            : localBase
+              ? base
+              : "";
+          if (!startPoint) {
+            throw new Error(
+              `仓库 ${repoPath} 找不到线上分支「${base}」（远程 / 本地都没有）`,
+            );
+          }
+          resolvedBase = base;
+          addArgs = ["worktree", "add", "--detach", workDir, startPoint];
         } else {
           // 全新分支：基于线上分支建。base = 设置页快照、缺省探 origin/HEAD
           let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";

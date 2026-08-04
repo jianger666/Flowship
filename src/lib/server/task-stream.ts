@@ -82,11 +82,6 @@ export interface RunningTaskRecord {
   // V0.6.6 热更：agent 启动时的 {title,role,feishuStoryUrl} 快照、reused 推进时 diff 出变更注入 directive
   startSnapshot: TaskFieldsSnapshot;
   cancel: () => void;
-  /**
-   * ask 软停：只掐 SDK stream、不 cancelPending——供 ask_user accepted 后防 Please continue 续跑；
-   * 仅 consumeSessionRun 登记；用户 stop / 硬超时仍走 cancel()。
-   */
-  softCancelStream?: () => void;
 }
 
 /**
