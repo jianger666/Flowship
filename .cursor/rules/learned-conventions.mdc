@@ -29,7 +29,6 @@ alwaysApply: true
 
 ## 本地测试桌面 app：用 test 实例、别碰 8876（2026-06-12 用户修订）
 
-- **迭代期默认不每次重启 FlowshipTest（2026-08-04 用户拍板）**：多轮小改 / 交互打磨先攒着改，**不要**每改完就 `pnpm electron:test:restart`；用户明确说「重启 / 验收 / 打 test 包」时再打包重启一起验。覆盖 `AGENTS.md` 里「改完可直接重启」的默认授权（用户主动喊重启时仍可执行）。
 - **用户本机日常运行着「Flowship」（v1.1.0 改名、原「AI工作流」）桌面 app（8876 端口 + `~/Library/Application Support/fe-ai-flow`）当生产环境用**——禁止 curl 8876 / 杀 8876 进程 / osascript 关正式窗口。
 - **可以**本地起测试实例验证、但必须走隔离三件套（v0.7.9 已实装）：
   - **⚠️ 打 test 包前必须先退掉正在跑的 test 实例（2026-07-02 踩过、把用户测试环境搞半残）**：`electron:dist:test` 会把 `dist/electron/mac-arm64/FlowshipTest.app`（v1.1.0 前叫 AI工作流test.app）**整个删掉重建**——老进程还在跑时脚下 bundle 被换、已加载的路由还能服务（boot 200、curl 冒烟全过、**假象**）、但之后 agent 每次执行 shell、SDK 沙箱的 zsh state-dump helper 因 bundle 资源失配**永久挂死**（僵尸 `/bin/zsh -ilc dump_zsh_state` 进程、每跑一条 shell 挂一个）→ wait curl 发不出去、任务永远「运行中」假卡死。另一个坑：打完 `open` 只会聚焦老进程（单实例锁）、**你以为在冒烟新包、实际测的是老进程老代码**。正确顺序：`osascript -e 'tell application "FlowshipTest" to quit'` → 完整 3 步打包 → `open` → **核对主进程 lstart 晚于打包时间**再冒烟。
