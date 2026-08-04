@@ -24,32 +24,40 @@ import { formatUnreadBadge } from "@/lib/mr-inbox";
 export const MrInboxBell = () => {
   const { unreadCount } = useMrInbox();
 
+  // PopoverTrigger 的 render 必须是可交互 DOM（Button）。
+  // 之前把 Tooltip 塞进 render：Base UI 的 onClick/ref/children 落到不透传的 Tooltip 上 →
+  // Inbox 图标进不了 Button（空方块）、点击打不开面板（combobox.tsx 同款坑）。
+  // Tooltip 包外层 span，hover tip 与 Popover 点击各走各的。
   return (
     <Popover>
-      <PopoverTrigger
-        render={
-          <Tooltip content="收件箱">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="relative [&_svg:not([class*='size-'])]:size-4.5"
-              aria-label={
-                unreadCount > 0 ? `收件箱（${unreadCount} 条未读）` : "收件箱"
-              }
-            />
-          </Tooltip>
-        }
-      >
-        <Inbox />
-        {unreadCount > 0 && (
-          <span
-            aria-hidden
-            className="absolute top-0.5 right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] leading-none font-medium text-white"
+      <Tooltip content="收件箱">
+        <span className="inline-flex">
+          <PopoverTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon"
+                className="relative [&_svg:not([class*='size-'])]:size-4.5"
+                aria-label={
+                  unreadCount > 0
+                    ? `收件箱（${unreadCount} 条未读）`
+                    : "收件箱"
+                }
+              />
+            }
           >
-            {formatUnreadBadge(unreadCount)}
-          </span>
-        )}
-      </PopoverTrigger>
+            <Inbox />
+            {unreadCount > 0 && (
+              <span
+                aria-hidden
+                className="absolute top-0.5 right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] leading-none font-medium text-white"
+              >
+                {formatUnreadBadge(unreadCount)}
+              </span>
+            )}
+          </PopoverTrigger>
+        </span>
+      </Tooltip>
       <PopoverContent align="end" sideOffset={8} className="p-2">
         <MrInboxPanel />
       </PopoverContent>

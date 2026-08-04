@@ -3,8 +3,9 @@
 import * as React from "react"
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog"
 
-import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim"
+import { cn } from "@/lib/utils"
 import { XIcon } from "lucide-react"
 
 function Dialog({ ...props }: DialogPrimitive.Root.Props) {
@@ -27,6 +28,8 @@ function DialogOverlay({
   className,
   ...props
 }: DialogPrimitive.Backdrop.Props) {
+  // Windows titleBarOverlay 在 web 蒙层之上：打开时压暗原生按钮条底色（见 useTitleBarOverlayDim）
+  useTitleBarOverlayDim()
   return (
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"

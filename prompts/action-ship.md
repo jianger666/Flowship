@@ -4,30 +4,40 @@ ship action 的目标：把当前 task 所有仓的代码改动 push 到 origin�
 
 > **测试分支从哪来**：每仓的测试分支见 super prompt 顶部「## 仓库分支配置」段（建 task 时从设置页快照）。某仓没配 → 回退默认 `test`。下文凡是 `<测试分支>` / 写死的 `test` 都指「该仓配置的测试分支、没配则 test」。
 
+## 源分支：普通流程与 WK 流程
+
+- 历史没有 `wk:*` 主流程 action：保持原逻辑，使用 Flowship 已检出的 feature 分支（`task.gitBranches`）。
+- 历史执行过 `wk:*` 主流程 action：**不要使用 `task.gitBranches` 猜分支**，逐仓按团队 wk-harness 的分支规则确定 source：
+  1. 读 `wk-doc/requirements/<REQ-ID>/status.yaml`；顶层 `expected_git_branch` / `git_branch` / `branch` 第一个非空值就是明确分支。
+  2. 有明确分支：当前分支相同则直接用；不同且工作区干净才检出；有未提交改动先 `ask_user`，不得直接切换。
+  3. 没有明确分支：当前分支名包含 `REQ-ID` 就直接用；否则同时查本地和 `origin` 中包含 `REQ-ID` 的分支。只有一个候选且工作区干净时检出；零个、多个或工作区不干净都用 `ask_user` 请用户确认。
+  4. 检出后重新执行 `git branch --show-current`，真实当前分支才是 source；禁止直接把 `REQ-ID` 当完整分支名。
+- 多仓逐仓解析，不得拿第一个仓的分支套给其它仓。
+
 ## 工作流约定（公司内部场景、不要绕开）
 
 - **🔒 铁律：绝不把测试分支的内容弄到 feature 分支上**——不许 `git merge <测试分支>` / `git rebase <测试分支>` / `git pull origin <测试分支>` 到 feature、也不许 force push feature/测试分支。feature 只能单向往测试分支提测、本体永远保持干净。
   - 遇冲突时 `ask_user` 问用户「AI 智能解 / 自己解」（详见 §3.5）。选「AI 智能解」时**也不动 feature**——合并只发生在另建的一次性 `__conflict` 分支上（详见 §3.6）。这是铁律的唯一豁免口、边界看 §3.6。
-- 所有仓 MR 一律 **`feature/...` → 该仓测试分支**（提测）、测试分支通过测试后才人工合 master / main
+- 所有仓 MR 一律 **`<本仓确定的业务源分支>` → 该仓测试分支**（提测）、测试分支通过测试后才人工合 master / main
 - `submit_mr` 的 `target_branch` 入参 **填该仓的测试分支**（见「## 仓库分支配置」段、没配则 `test`）、不要探测 `origin/HEAD`（那个拿到的是默认主分支 master / main、跟提测工作流不对）
-- feature 分支名见「## 仓库分支配置」/ task.gitBranches（build 时已 checkout）、各仓可能同名也可能不同名（取决于命名模板）
+- 普通流程的 feature 分支见「## 仓库分支配置」/ `task.gitBranches`；WK 流程按上面的 wk-harness 规则确定，各仓可能不同名。
 
 ## 单仓 vs 多仓
 
 - 单仓 task（task.repoPaths 长度 = 1）：一次 push + 一次 submit_mr
-- 多仓 task（task.repoPaths 长度 > 1）：对每个仓独立 `cd` + push + submit_mr——每个仓产出 1 条 MR、共用同名 source branch、target 都是 `test`
+- 多仓 task（task.repoPaths 长度 > 1）：对每个仓独立 `cd` + push + submit_mr——每个仓产出 1 条 MR、source 按本仓独立确定、target 都是该仓测试分支
 - 某仓本次无改动（`git diff origin/test...HEAD` 为空）：跳过该仓、不 push 也不调 submit_mr、在 artifact «§3 push + MR» 表里写「跳过、原因：本仓无改动」
 
 ## 准入条件（runner 已校验、agent 不用重复检查）
 
-- 至少 1 个已通过的 build action
 - settings 已配 GitLab Host + Personal Access Token（不然 runner 准入直接拒）
 
 ## 执行步骤（按顺序）
 
 ### 1. 读上下文
 
-- 读最新 build artifact（必读、commit message 的依据）
+- 普通流程：读最新 build artifact（必读、commit message 的依据），并按下面“有效实现来源”规则追溯。
+- WK 流程：不要求存在内置 build artifact；逐仓读取 `status.yaml`、`repo-completion-report.md`、`verification.md`，结合当前 git diff / commit 作为 commit message 和 MR description 的依据。
 - 如果最新 build artifact 写了「本轮无代码改动 / 有效实现来源：沿用 build #N（`actions/N-build.md`）」：必须继续 read `actions/N-build.md`，把它作为本次 MR description / commit message 的实际代码改动来源；最新 build 只用于记录“本轮评估后不改”的决策，不足以描述业务改动。
 - 如果 #N 也是无代码改动 build，沿「有效实现来源」继续递归追溯，直到找到真正有代码改动的 build；找不到有效来源时，不要编 MR 描述，artifact 写明「缺少有效实现来源」、等待用户处理。
 - 读最新 review artifact（如有、写进 MR description）
@@ -83,7 +93,7 @@ cd <repoPath>
 # 目标分支 = 该仓的测试分支（见「## 仓库分支配置」段、没配则 test）、不要探 origin/HEAD
 TARGET=<该仓测试分支、默认 test>
 
-# 探当前 branch（task.gitBranches 里该仓对应的 source branch、build 时已 checkout 好）
+# 探当前 branch（普通流程由 Flowship 检出；WK 流程已按「源分支」规则确认）
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 # 拉一下 test 看本仓相对 test 有没有改动
@@ -313,15 +323,15 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 
 ## 方案
 
-<最新 plan artifact 的摘要 / 直接链接到 Flowship 详情页>
+<普通流程：最新 plan artifact 摘要；WK 流程：repo-design / completion report 摘要>
 
 ## 改动概览
 
-<有效实现来源 build artifact 的「Task 完成情况」段、按 plan 对照；如果最新 build 本轮无代码改动，必须使用其指向的 build #N>
+<普通流程：有效 build artifact 的 Task 完成情况；WK 流程：repo-completion-report + 当前 diff/commit 摘要>
 
 ## 复核
 
-<如有 review artifact、贴 4 类差异段；没 review 写「未做 review、由代码评审人把关」>
+<普通流程读 review artifact；WK 流程读 repo-review / verification 结论；都没有则如实说明>
 
 ## 自检
 
@@ -332,7 +342,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 ---
 
 <如果是 v2+、加：## v\${mrVersion} 更新（\${ISO 日期}）>
-<本次相对上一版的改动摘要、引用本轮 build artifact>
+<本次相对上一版的改动摘要；普通流程引用 build，WK 流程引用 completion report / verification>
 ```
 
 ## artifact 骨架
@@ -344,7 +354,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 
 - task: <task.id> <task.title>
 - 飞书 story: <task.feishuStoryUrl>
-- branch（共用）: <branch name>
+- source branches: <逐仓 branch name>
 - 仓数: <repoPaths.length>
 
 ## §2 飞书测试人员
@@ -400,7 +410,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 - ❌ mention 传 lark_user_id 或加 `lark_user_id_` 前缀（2026-06-12 起服务端按纯数字 user_key 校验、报 `cross tenant` / `no permission`）
 - ❌ 先跑 `meegle auth status` 预检再决定要不要做 §4.5（auth status 瞬态失败会被误判成未登录、直接跳过流转）
 - ❌ 强推到 master / main（GitLab 禁、且违反工作流）
-- ❌ commit message 跟 build artifact 实际改动不一致
+- ❌ commit message 跟实际改动来源不一致（普通流程看 build，WK 流程看完成报告、验证与 git diff）
 - ❌ 拿到 `submit_mr` 失败结果时自动重试 / force push（**绝对不**、artifact 记错、让用户手动处理）
 - ❌ 跳过的仓没在 artifact §3 写原因（后置检查会挡）
 - ❌ artifact 没写 `task.feishuTesterUserKeys` 来源（A / C / 沿用、需可审计）

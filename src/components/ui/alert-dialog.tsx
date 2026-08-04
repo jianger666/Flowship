@@ -3,8 +3,9 @@
 import * as React from "react"
 import { AlertDialog as AlertDialogPrimitive } from "@base-ui/react/alert-dialog"
 
-import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim"
+import { cn } from "@/lib/utils"
 
 function AlertDialog({ ...props }: AlertDialogPrimitive.Root.Props) {
   return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />
@@ -26,6 +27,7 @@ function AlertDialogOverlay({
   className,
   ...props
 }: AlertDialogPrimitive.Backdrop.Props) {
+  useTitleBarOverlayDim()
   return (
     <AlertDialogPrimitive.Backdrop
       data-slot="alert-dialog-overlay"

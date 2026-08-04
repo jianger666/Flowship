@@ -13,15 +13,25 @@
   nsExec::Exec 'ie4uinit.exe -show'
 !macroend
 
-; 安装器启动时先清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因）：
+; 手动安装器启动时先清残留进程（同事实测「安装一直卡住、提示 Flowship 无法关闭」的根因）：
 ; Windows 上内置 server 子进程就是 Flowship.exe 本体（ELECTRON_RUN_AS_NODE、无窗口）——
 ; app 崩溃 / 被强杀后它会变成隐形孤儿进程、NSIS 的「应用正在运行」检查永远过不去、
 ; 而用户看不到任何可关的窗口。这里直接 taskkill 整棵进程树（任务数据全程落盘、无损）。
+;
+; 自动更新必须跳过：electron-updater 先从 Flowship.exe 派生 NSIS 安装器，再异步退出 App；
+; 此时对 Flowship.exe 使用 /T 会把刚派生的安装器也当作子进程杀掉，表现为「App 已关、
+; 长时间不重启、手动打开仍是旧版本」。electron-updater 固定传 --updated，electron-builder
+; 将它映射为 ${isUpdated}；更新路径由 App before-quit 按 server PID 精确清理进程树。
 !macro customInit
-  nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+  ${ifNot} ${isUpdated}
+    nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+  ${endIf}
 !macroend
 
-; 卸载同款清理（卸载器的「应用正在运行」检查同样会被孤儿卡住）
+; 手动卸载同款清理。升级时新安装器会给旧卸载器传 --updated；同样必须跳过，
+; 否则旧卸载器仍会沿 Flowship 的进程树反杀新安装器。
 !macro customUnInit
-  nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+  ${ifNot} ${isUpdated}
+    nsExec::Exec 'taskkill /F /T /IM "Flowship.exe"'
+  ${endIf}
 !macroend

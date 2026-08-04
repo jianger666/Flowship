@@ -14,12 +14,16 @@ import { buildRevealInFolderSpec } from "@/lib/local-file-os";
 
 export const runtime = "nodejs";
 
-const runSpawn = (command: string, args: string[]): Promise<string | null> =>
+const runSpawn = (
+  command: string,
+  args: string[],
+  opts?: { ignoreNonZeroExit?: boolean },
+): Promise<string | null> =>
   new Promise((resolve) => {
     const child = spawn(command, args, { stdio: "ignore", detached: true });
     child.on("error", () => resolve(`无法执行 ${command}`));
     child.on("exit", (code) => {
-      if (code === 0) resolve(null);
+      if (code === 0 || opts?.ignoreNonZeroExit) resolve(null);
       else resolve(`在文件夹中显示失败（退出码 ${code ?? "?"}）`);
     });
     child.unref();
@@ -38,8 +42,11 @@ export const POST = async (req: Request) => {
     return NextResponse.json({ error: "path 必须是绝对路径" }, { status: 400 });
   }
 
-  const { command, args } = buildRevealInFolderSpec(p, os.platform());
-  const failure = await runSpawn(command, args);
+  const { command, args, ignoreNonZeroExit } = buildRevealInFolderSpec(
+    p,
+    os.platform(),
+  );
+  const failure = await runSpawn(command, args, { ignoreNonZeroExit });
   if (failure) return NextResponse.json({ error: failure }, { status: 400 });
   return NextResponse.json({ ok: true });
 };

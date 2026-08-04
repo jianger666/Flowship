@@ -37,7 +37,12 @@ import {
   isSafeBranchName,
   renderBranchName,
 } from "@/lib/branch-template";
-import type { GitBranchInfo, Task, TaskMode } from "@/lib/types";
+import { resolveFlowLock } from "@/lib/flow-mutex";
+import type {
+  GitBranchInfo,
+  Task,
+  TaskMode,
+} from "@/lib/types";
 
 /** re-export：调用方 / 单测可从本模块取分支名白名单校验 */
 export { isSafeBranchName };
@@ -149,9 +154,11 @@ export interface WorktreeTaskLike {
 
 // ----------------- 纯函数：判定 + 路径映射 -----------------
 
-/** 本 task 是否走隔离工作区（chat 模式 / 逃生口 / 无仓库一律不隔离） */
+/** 本 task 是否走隔离工作区（只描述物理隔离，不参与主流程 / 分支所有权判断） */
 export const isWorktreeTask = (t: WorktreeTaskLike): boolean =>
-  t.mode !== "chat" && t.isolateWorktree === true && t.repoPaths.length > 0;
+  t.mode !== "chat" &&
+  t.isolateWorktree === true &&
+  t.repoPaths.length > 0;
 
 /**
  * 建 task 时的 isolateWorktree 落盘决策（单一来源）。
@@ -275,7 +282,7 @@ export const resolveOriginalRepoPath = (
 // ----------------- 分支规划（worktree 检出用、跟 planBranchesForBuild 同规则） -----------------
 
 /**
- * 逐仓算本 task 的工作分支（已有 gitBranches 记录 > 用户指定已有分支 > 模板渲染）。
+ * 逐仓算本 task 的工作分支（已有 gitBranches 记录 > 模板渲染）。
  * 跟 action-gates.planBranchesForBuild 同一套命名规则；区别是这里必须**总能**给出
  * 分支名（worktree 创建不能没分支）——storyId 抠不到时兜底用 task id 的时间戳段。
  *
@@ -293,15 +300,12 @@ export const planWorktreeBranchInfos = (task: Task): GitBranchInfo[] => {
     .map((repoPath) => {
       const old = existing.find((b) => b.repoPath === repoPath);
       if (old) return old;
-      const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
       return {
         repoPath,
-        name:
-          explicitName ||
-          renderBranchName(
-            task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
-            { storyId, taskTitle: task.title },
-          ),
+        name: renderBranchName(
+          task.repoBranchTemplates?.[repoPath] || DEFAULT_BRANCH_TEMPLATE,
+          { storyId, taskTitle: task.title },
+        ),
         baseBranch: "",
       };
     });
@@ -453,7 +457,31 @@ export interface EnsureWorktreesResult {
 export interface EnsureWorktreesOptions {
   skipDepClone?: boolean;
   deferDepClone?: boolean;
+  /**
+   * 工作区与分支所有权分离：
+   * - flowship：按 Flowship 模板规划 / 创建任务分支（旧流程）
+   * - detached：只创建物理 worktree，不抢先创建业务分支（新任务预热 / WK 文档阶段）
+   * - explicit：检出调用方已解析的 WK 分支；分支不存在时拒绝凭空创建
+   */
+  branchSelection?:
+    | { kind: "flowship" }
+    | { kind: "detached" }
+    | { kind: "explicit"; infos: GitBranchInfo[] };
 }
+
+const defaultBranchSelection = (
+  task: Task,
+): NonNullable<EnsureWorktreesOptions["branchSelection"]> => {
+  if (resolveFlowLock(task.actions) !== "wk") return { kind: "flowship" };
+  const infos = task.gitBranches ?? [];
+  const coveredRepos = new Set(infos.map((info) => info.repoPath));
+  const allWritableGitReposCovered = task.repoPaths
+    .filter((repoPath) => !skipsWorktreeIsolation(task, repoPath))
+    .every((repoPath) => coveredRepos.has(repoPath));
+  return infos.length > 0 && allWritableGitReposCovered
+    ? { kind: "explicit", infos }
+    : { kind: "detached" };
+};
 
 /**
  * 确保本 task 每个仓的 worktree 都存在且检出了任务分支（幂等、可反复调）。
@@ -498,7 +526,13 @@ export const ensureTaskWorktrees = async (
     // 动态 import 避 task-worktrees → task-stream → task-fs → task-worktrees 静态环。
     const { snapshotTaskOp } = await import("./task-stream");
     const entryHandle = snapshotTaskOp(task.id);
-    const infos = planWorktreeBranchInfos(task);
+    const selection = opts?.branchSelection ?? defaultBranchSelection(task);
+    const infos =
+      selection.kind === "flowship"
+        ? planWorktreeBranchInfos(task)
+        : selection.kind === "explicit"
+          ? selection.infos
+          : [];
     // 混合隔离后 infos 只含 git 仓、跟 repoPaths 不再 index 对齐——按 repoPath 查
     const infoByRepo = new Map(infos.map((info) => [info.repoPath, info]));
     const workPaths = getTaskWorkRepoPaths(task);
@@ -517,6 +551,7 @@ export const ensureTaskWorktrees = async (
       lease,
       entryHandle,
       job,
+      selection,
       // skip / defer 都跳过同步 clone；defer 由 caller 调 cloneMissingTaskDepDirs 后台补
       skipDepClone: !!(opts?.skipDepClone || opts?.deferDepClone),
     });
@@ -654,6 +689,7 @@ const ensureTaskWorktreesInner = async (ctx: {
   entryHandle: { opId: number | null; gen: number; claimSeq: number };
   /** resource job——长 git / cp 子进程挂 abort */
   job: ResourceJobHandle;
+  selection: NonNullable<EnsureWorktreesOptions["branchSelection"]>;
   /** true = 跳过同步 dep clone（oneshot skip / 正式路径 defer） */
   skipDepClone: boolean;
 }): Promise<EnsureWorktreesResult> => {
@@ -668,6 +704,7 @@ const ensureTaskWorktreesInner = async (ctx: {
     lease,
     entryHandle,
     job,
+    selection,
     skipDepClone,
   } = ctx;
 
@@ -700,14 +737,13 @@ const ensureTaskWorktreesInner = async (ctx: {
     }
 
     const info = infoByRepo.get(repoPath);
-    if (!info) {
-      // planWorktreeBranchInfos 已 filter 非 git、此处不应缺失——防御性跳过
-      continue;
+    if (!info && selection.kind !== "detached") {
+      throw new Error(`仓库 ${repoPath} 缺少目标分支信息，无法准备隔离工作区`);
     }
 
     // 分支名白名单：拒空串 / 前导 - / 空白 / .. / 非法 ref 字符（防 git argv 当 flag）
-    const branch = info.name;
-    if (!isSafeBranchName(branch)) {
+    const branch = info?.name ?? "";
+    if (info && !isSafeBranchName(branch)) {
       throw new Error(
         `仓库 ${repoPath} 任务分支名非法「${branch}」、拒绝创建 / 切换隔离工作区`,
       );
@@ -734,17 +770,79 @@ const ensureTaskWorktreesInner = async (ctx: {
           job,
         );
         const currentBranch = show.ok ? show.stdout : "";
-        if (currentBranch !== branch) {
+        if (info && currentBranch !== branch) {
           // 已有 worktree 的 hot checkout 前插桩 + 验 lease
           await failpoint("ensure.beforeHotCheckout");
           assertLease();
           // hot checkout 挂 abort——stop/finalize revoke 可中止
-          const switched = await runGit(
-            workDir,
-            ["checkout", branch],
-            60_000,
-            job,
-          );
+          let checkoutArgs = ["checkout", branch];
+          if (selection.kind === "explicit") {
+            await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
+            assertLease();
+            const localExists = (
+              await runGit(
+                repoPath,
+                ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+                60_000,
+                job,
+              )
+            ).ok;
+            const remoteExists = (
+              await runGit(
+                repoPath,
+                ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
+                60_000,
+                job,
+              )
+            ).ok;
+            if (!localExists && !remoteExists) {
+              throw new Error(
+                `仓库 ${repoPath} 找不到 WK 业务分支「${branch}」（本地 / origin 均不存在），请先创建或推送该分支后重试`,
+              );
+            }
+            if (!localExists && remoteExists) {
+              checkoutArgs = [
+                "checkout",
+                "--no-track",
+                "-b",
+                branch,
+                `origin/${branch}`,
+              ];
+            }
+          } else if (selection.kind === "flowship" && !currentBranch) {
+            // detached 预热后的首次旧流程推进：分支尚不存在时在当前基线原地创建；
+            // 若远端已有同名分支则优先承接远端，不另造历史。
+            await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
+            assertLease();
+            const localExists = (
+              await runGit(
+                repoPath,
+                ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+                60_000,
+                job,
+              )
+            ).ok;
+            const remoteExists = (
+              await runGit(
+                repoPath,
+                ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
+                60_000,
+                job,
+              )
+            ).ok;
+            if (!localExists) {
+              checkoutArgs = remoteExists
+                ? [
+                    "checkout",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    `origin/${branch}`,
+                  ]
+                : ["checkout", "--no-track", "-b", branch];
+            }
+          }
+          const switched = await runGit(workDir, checkoutArgs, 60_000, job);
           if (!switched.ok) {
             // 工作区脏 / 冲突等会导致 checkout 失败——抛清晰提示，让用户先处理，不带病推进
             const where = currentBranch || "detached HEAD";
@@ -781,109 +879,152 @@ const ensureTaskWorktreesInner = async (ctx: {
     // 清「目录没了但 git 还记着」的僵尸 worktree 注册（否则 add 同路径报错）
     await runGit(repoPath, ["worktree", "prune"], 60_000, job);
 
-    const localBranchExists = (
-      await runGit(
-        repoPath,
-        ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-        60_000,
-        job,
-      )
-    ).ok;
-
     // addArgs 存下来：撞「已删任务孤儿占用」时可 force-remove 后原样重试一次
     let addArgs: string[];
-    let resolvedBase = info.baseBranch;
-    if (localBranchExists) {
-      // 本地已有任务分支（返工 / 用户自己建过）→ 直接挂到 worktree
-      addArgs = ["worktree", "add", workDir, branch];
-    } else {
-      // 远程可能有同名分支（用户在别的机器 / 之前推过）→ fetch 后基于它建本地。
-      // best-effort、30s 上限：fetch 只是「拿最新」的锦上添花、慢网络 / 被墙远程（github）
-      // 挂太久会把整个推进卡住（实测 120s×2 把 advance 拖到 4 分钟+）、超时就用本地现有引用
-      // fetch 挂 abort（可达 30s）
-      await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
-      // fetch（可达 30s）完成后验 lease——期间 finalize 可已终结任务
+    let resolvedBase = info?.baseBranch ?? "";
+
+    // detached 预热只建立物理隔离，不创建 / 占用任何业务分支。
+    if (!info) {
+      let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";
+      if (!base) {
+        const head = await runGit(
+          repoPath,
+          ["symbolic-ref", "refs/remotes/origin/HEAD"],
+          60_000,
+          job,
+        );
+        base = head.ok ? head.stdout.replace("refs/remotes/origin/", "") : "";
+      }
+      if (!base || !isSafeBranchName(base)) {
+        throw new Error(
+          `仓库 ${repoPath} 探不到合法主分支——去设置页给该仓配「线上分支」后重试`,
+        );
+      }
+      await runGit(repoPath, ["fetch", "origin", base], 30_000, job);
       assertLease();
-      const remoteBranchExists = (
+      const remoteBase = (
         await runGit(
           repoPath,
-          ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
+          ["rev-parse", "--verify", "--quiet", `origin/${base}`],
           60_000,
           job,
         )
       ).ok;
-      if (remoteBranchExists) {
-        addArgs = [
-          "worktree",
-          "add",
-          "--no-track",
-          "-b",
-          branch,
-          workDir,
-          `origin/${branch}`,
-        ];
+      const localBase = (
+        await runGit(
+          repoPath,
+          ["show-ref", "--verify", "--quiet", `refs/heads/${base}`],
+          60_000,
+          job,
+        )
+      ).ok;
+      const startPoint = remoteBase ? `origin/${base}` : localBase ? base : "";
+      if (!startPoint) {
+        throw new Error(`仓库 ${repoPath} 找不到线上分支「${base}」（远程 / 本地都没有）`);
+      }
+      resolvedBase = base;
+      addArgs = ["worktree", "add", "--detach", workDir, startPoint];
+    } else {
+      const localBranchExists = (
+        await runGit(
+          repoPath,
+          ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+          60_000,
+          job,
+        )
+      ).ok;
+      if (localBranchExists) {
+        // 本地已有任务分支（返工 / 用户自己建过）→ 直接挂到 worktree
+        addArgs = ["worktree", "add", workDir, branch];
       } else {
-        // 全新分支：基于线上分支建。base = 设置页快照、缺省探 origin/HEAD
-        let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";
-        if (!base) {
-          const head = await runGit(
-            repoPath,
-            ["symbolic-ref", "refs/remotes/origin/HEAD"],
-            60_000,
-            job,
-          );
-          base = head.ok ? head.stdout.replace("refs/remotes/origin/", "") : "";
-        }
-        if (!base) {
-          throw new Error(
-            `仓库 ${repoPath} 探不到主分支（origin/HEAD 未设置）——去设置页给该仓配「线上分支」后重试`,
-          );
-        }
-        if (!isSafeBranchName(base)) {
-          throw new Error(
-            `仓库 ${repoPath} 线上分支名非法「${base}」、拒绝创建隔离工作区`,
-          );
-        }
-        // base fetch 挂 abort
-        await runGit(repoPath, ["fetch", "origin", base], 30_000, job);
-        // base fetch 完成后同样验 lease
+        // 远程可能有同名分支（用户在别的机器 / 之前推过）→ fetch 后基于它建本地。
+        // best-effort、30s 上限：fetch 只是「拿最新」的锦上添花、慢网络 / 被墙远程（github）
+        // 挂太久会把整个推进卡住（实测 120s×2 把 advance 拖到 4 分钟+）、超时就用本地现有引用
+        await runGit(repoPath, ["fetch", "origin", branch], 30_000, job);
         assertLease();
-        // 起点优先 origin/<base>（最新）、离线 / 无远程时回退本地 <base>
-        const startPoint = (
+        const remoteBranchExists = (
           await runGit(
             repoPath,
-            ["rev-parse", "--verify", "--quiet", `origin/${base}`],
+            ["rev-parse", "--verify", "--quiet", `origin/${branch}`],
             60_000,
             job,
           )
-        ).ok
-          ? `origin/${base}`
-          : (
-                await runGit(
-                  repoPath,
-                  ["show-ref", "--verify", "--quiet", `refs/heads/${base}`],
-                  60_000,
-                  job,
-                )
-              ).ok
-            ? base
-            : "";
-        if (!startPoint) {
+        ).ok;
+        if (remoteBranchExists) {
+          addArgs = [
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            workDir,
+            `origin/${branch}`,
+          ];
+        } else if (selection.kind === "explicit") {
           throw new Error(
-            `仓库 ${repoPath} 找不到线上分支「${base}」（远程 / 本地都没有）——核对设置页该仓的线上分支名`,
+            `仓库 ${repoPath} 找不到 WK 业务分支「${branch}」（本地 / origin 均不存在），请先创建或推送该分支后重试`,
           );
+        } else {
+          // 全新分支：基于线上分支建。base = 设置页快照、缺省探 origin/HEAD
+          let base = task.repoBaseBranches?.[repoPath]?.trim() ?? "";
+          if (!base) {
+            const head = await runGit(
+              repoPath,
+              ["symbolic-ref", "refs/remotes/origin/HEAD"],
+              60_000,
+              job,
+            );
+            base = head.ok
+              ? head.stdout.replace("refs/remotes/origin/", "")
+              : "";
+          }
+          if (!base) {
+            throw new Error(
+              `仓库 ${repoPath} 探不到主分支（origin/HEAD 未设置）——去设置页给该仓配「线上分支」后重试`,
+            );
+          }
+          if (!isSafeBranchName(base)) {
+            throw new Error(
+              `仓库 ${repoPath} 线上分支名非法「${base}」、拒绝创建隔离工作区`,
+            );
+          }
+          await runGit(repoPath, ["fetch", "origin", base], 30_000, job);
+          assertLease();
+          const startPoint = (
+            await runGit(
+              repoPath,
+              ["rev-parse", "--verify", "--quiet", `origin/${base}`],
+              60_000,
+              job,
+            )
+          ).ok
+            ? `origin/${base}`
+            : (
+                  await runGit(
+                    repoPath,
+                    ["show-ref", "--verify", "--quiet", `refs/heads/${base}`],
+                    60_000,
+                    job,
+                  )
+                ).ok
+              ? base
+              : "";
+          if (!startPoint) {
+            throw new Error(
+              `仓库 ${repoPath} 找不到线上分支「${base}」（远程 / 本地都没有）——核对设置页该仓的线上分支名`,
+            );
+          }
+          resolvedBase = base;
+          addArgs = [
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            workDir,
+            startPoint,
+          ];
         }
-        resolvedBase = base;
-        // --no-track：防 git 自动设 upstream=origin/<线上>、之后裸 push 误推线上（同 build hint 老规则）
-        addArgs = [
-          "worktree",
-          "add",
-          "--no-track",
-          "-b",
-          branch,
-          workDir,
-          startPoint,
-        ];
       }
     }
 
@@ -912,7 +1053,7 @@ const ensureTaskWorktreesInner = async (ctx: {
         ? "——该分支已在原仓库或其它任务的工作区检出：去原仓库把这个分支切走（checkout 别的分支）、或删掉占用它的任务后重试；若本机还开着另一个实例（正式 / test）、检查是否它的工作区占用了该分支"
         : "";
       throw new Error(
-        `仓库 ${repoPath} 创建隔离工作区失败（分支 ${branch}）：${added.stderr || added.stdout}${hint}`,
+        `仓库 ${repoPath} 创建隔离工作区失败（${info ? `分支 ${branch}` : "detached 预热"}）：${added.stderr || added.stdout}${hint}`,
       );
     }
 
@@ -925,7 +1066,7 @@ const ensureTaskWorktreesInner = async (ctx: {
       await yieldAfterCompensate();
     }
 
-    info.baseBranch = resolvedBase;
+    if (info) info.baseBranch = resolvedBase;
     // .env copy / dep clone 前与期间验 lease；失主补偿本轮新建
     try {
       assertLease();

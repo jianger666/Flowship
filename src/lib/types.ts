@@ -1024,7 +1024,7 @@ export interface GitBranchState {
  * 仓库分支候选列表（v0.9.11、前后端共用）
  *
  * 读自 git-branches.listRepoBranches：本地 + 远端合并去重（远端去 origin/ 前缀）、
- * 给设置页仓库分支字段 / 任务 dialog「已有工作分支」的下拉候选用。
+ * 给设置页仓库分支字段 / 测试任务「被测业务分支」的下拉候选用。
  * 跟 GitBranchState 的区别：这份含远端分支（线上 / test / develop 常常本地没 checkout 过）、不关心当前分支。
  */
 export interface RepoBranchList {
@@ -1349,12 +1349,10 @@ export interface Task {
    */
   repoBaseBranches?: Record<string, string>;
   /**
-   * V0.6.3：每个仓的「已有工作分支」覆盖（per-repo、key=repoPath、value=分支名、选填）
-   * - 场景：用户（尤其后端）建 task 前已自己 checkout 了分支、做了一部分 → 建 task 时填进来、
-   *   build 不再按算法名建新分支、而是复用这个已有分支（git show-ref 命中 → checkout、他的代码都在）
-   * - 来源：建 task 弹窗 per-repo 现填（每个需求不一样、不是仓库级固定属性、故不放设置页）
-   * - 没填（key 不存在 / 空）→ build 按分支模板生成（默认 `feature/<storyId>-<title>`）
-   * - 落到 gitBranches[].name = 这个名、ship 提测自动用对（MR 源分支取自 gitBranches[].name）
+   * V0.6.3：每个仓的「被测业务分支」（per-repo、key=repoPath、value=分支名、选填、仅 QA 测试任务）
+   * - 场景：测试任务验证开发分支 → QA 建 task 时填或后补；开发侧不再使用此字段覆盖 build 分支名
+   * - 来源：建 task / 编辑弹窗 per-repo 现填（可后补）
+   * - 没填 → 测试链路按 testing-task-branches 规则处理（不自动建 feature 分支）
    */
   repoFeatureBranches?: Record<string, string>;
   /**

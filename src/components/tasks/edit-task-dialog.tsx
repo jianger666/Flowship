@@ -4,7 +4,7 @@
  * 编辑任务 Dialog（V0.6.6）
  *
  * 详情页「编辑」按钮打开、改建任务时填的软配置字段：
- *   标题 / 飞书链接（仅需求任务可改具体 URL） / 已有工作分支（per-repo）
+ *   标题 / 飞书链接（仅需求任务可改具体 URL） / 被测业务分支（仅测试任务、per-repo）
  *
  * 刻意不在此改：
  *   - 模型 model（SDK Run 启动时绑定的硬约束、改了只能换新 agent、要换走推进 dialog 的模型选择）
@@ -70,7 +70,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
   // wk 需求编号草稿：回填库里存的值、没有就空着（我们不猜、不预填任何派生值）。
   // 清空并保存 = 这个 task 没有 REQ-ID（后端删字段、wk 门禁跳过）
   const [reqId, setReqId] = useState(() => normalizeReqId(task.reqId) ?? "");
-  // per-repo「已有工作分支」草稿（key=repoPath）
+  // 测试任务 per-repo 被测业务分支草稿（key=repoPath）
   const [featureBranches, setFeatureBranches] = useState<
     Record<string, string>
   >(task.repoFeatureBranches ?? {});
@@ -116,8 +116,10 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     [settingsRepos, task.repoPaths],
   );
 
-  // v0.9.11：分支候选（已绑仓 + 本次追加仓、「已有工作分支」Combobox 用）
-  const branchMap = useRepoBranches([...task.repoPaths, ...addRepos]);
+  // v0.9.11：分支候选（测试任务 Combobox 用）
+  const branchMap = useRepoBranches(
+    testingTask ? [...task.repoPaths, ...addRepos] : [],
+  );
 
   // 需求任务改链接时不可清空（身份闸门）；日常任务不传 feishuStoryUrl
   const canSubmit =
@@ -129,11 +131,13 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      // 收集 per-repo 已有工作分支（已绑仓 + 本次追加仓、去空）；后端还会再清洗一道
+      // 测试任务：收集 per-repo 被测业务分支（已绑仓 + 本次追加仓、去空）
       const cleanedBranches: Record<string, string> = {};
-      for (const p of [...task.repoPaths, ...addRepos]) {
-        const b = featureBranches[p]?.trim();
-        if (b) cleanedBranches[p] = b;
+      if (testingTask) {
+        for (const p of [...task.repoPaths, ...addRepos]) {
+          const b = featureBranches[p]?.trim();
+          if (b) cleanedBranches[p] = b;
+        }
       }
 
       // V0.6.28：新追加仓的 per-repo 快照（跟 new-task-dialog 建 task 时同款逻辑）——
@@ -164,8 +168,14 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
           : {}),
         // 需求编号：填了什么存什么、清空落 null（后端删字段 = 这个 task 没有 REQ-ID）
         ...(storyUrlLockedHas ? { reqId: reqIdPatchValue(reqId) } : {}),
-        repoFeatureBranches:
-          Object.keys(cleanedBranches).length > 0 ? cleanedBranches : null,
+        ...(testingTask
+          ? {
+              repoFeatureBranches:
+                Object.keys(cleanedBranches).length > 0
+                  ? cleanedBranches
+                  : null,
+            }
+          : {}),
         ...(addRepos.length > 0
           ? {
               addRepoPaths: addRepos,
@@ -291,26 +301,13 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
             </div>
           )}
 
-          {/* 工作分支：per-repo（已绑仓 + 本次追加仓）。测试任务中是可后补的被测分支。
-              v0.9.11 换 Combobox：候选自动拉该仓本地 + 远端分支、可搜索、缺分支可手填；非 git 禁用。
-              隔离任务（isolateWorktree 建完定死）填已有分支可能与原仓检出冲突——只提示、不强制改 isolate */}
-          {task.repoPaths.length + addRepos.length > 0 && (
+          {/* 被测业务分支：仅测试任务展示（per-repo、已绑仓 + 本次追加仓） */}
+          {testingTask && task.repoPaths.length + addRepos.length > 0 && (
             <div className="grid gap-1.5">
-              <Label>
-                {testingTask
-                  ? "被测业务分支（可后补）"
-                  : "已有工作分支（选填）"}
-              </Label>
-              {testingTask && (
-                <p className="text-xs text-muted-foreground">
-                  补上后从下一个 Action 起生效；留空时 AI 只把当前仓库作为结构参考，不视为需求实现
-                </p>
-              )}
-              {!testingTask && task.isolateWorktree === true && (
-                <p className="text-xs text-muted-foreground">
-                  隔离任务填已有分支可能与原仓检出冲突
-                </p>
-              )}
+              <Label>被测业务分支（可后补）</Label>
+              <p className="text-xs text-muted-foreground">
+                补上后从下一个 Action 起生效；留空时 AI 只把当前仓库作为结构参考，不视为需求实现
+              </p>
               <div className="grid gap-2">
                 {[...task.repoPaths, ...addRepos].map((p) => {
                   const entry = branchMap[p];
@@ -327,16 +324,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                           setFeatureBranches((prev) => ({ ...prev, [p]: v }))
                         }
                         options={entry?.branches ?? []}
-                        loading={!testingTask && !entry}
-                        emptyHint={
-                          testingTask
-                            ? "暂无候选，可在上方直接输入业务分支"
-                            : undefined
-                        }
-                        disabled={
-                          !testingTask &&
-                          (!entry || (entry.isRepo === false && !entry.gitMissing))
-                        }
+                        emptyHint="暂无候选，可在上方直接输入业务分支"
                         placeholder={
                           entry?.isRepo === false
                             ? entry.pathMissing
@@ -344,9 +332,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
                               : entry.gitMissing
                                 ? "未检测到 git、可手填分支"
                                 : "非 git 仓库"
-                            : testingTask
-                              ? "选择或填写业务分支"
-                              : "留空自动建 feature/…"
+                            : "选择或填写业务分支"
                         }
                         className="min-w-0 flex-1"
                       />

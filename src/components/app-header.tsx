@@ -30,6 +30,10 @@ import { UpdateBadge } from "@/components/update-badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useAppMode, type AppMode } from "@/hooks/use-app-mode";
+import {
+  syncTitleBarOverlayTheme,
+  type TitleBarOverlayTheme,
+} from "@/lib/titlebar-overlay";
 import { cn } from "@/lib/utils";
 
 declare global {
@@ -44,14 +48,6 @@ declare global {
     };
   }
 }
-
-// 底色 = globals.css --background 的 oklch 精确换算 hex（深 oklch(0.17 0.005 264)、
-// 浅 oklch(0.967 0.002 247)）——写死值跟真实背景差一截会让 win 控制按钮条一眼异色（同事实测踩过）。
-// 改主题色时这里（和 electron-app/main.js 的 HEADER_BG_*）要一起换算更新。
-const TITLEBAR_OVERLAY_COLOR = {
-  dark: { color: "#0e0f12", symbolColor: "#e5e5e5" },
-  light: { color: "#f3f4f5", symbolColor: "#404040" },
-};
 
 interface AppHeaderProps {
   // 侧栏是否展开（决定 toggle 的 aria / title 文案）
@@ -70,6 +66,7 @@ interface AppHeaderProps {
  */
 const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
   const router = useRouter();
+  const pathname = usePathname();
   const segments: Array<{ key: AppMode; label: string; icon: React.ReactNode; href: string }> = [
     { key: "work", label: "工作台", icon: <LayoutDashboard className="size-4" />, href: "/" },
     { key: "chat", label: "对话", icon: <MessageSquare className="size-4" />, href: "/chats" },
@@ -87,8 +84,14 @@ const ModeSwitch = ({ mode }: { mode: AppMode | null }) => {
             key={s.key}
             role="tab"
             aria-selected={active}
-            // 已在当前模式再点会 push /chats → Loading → replace 回详情，整页闪一下。
             onClick={() => {
+              // 工作台：模式含任务详情，但「家」是甘特——已高亮再点一次仍回 `/`
+              // （用户实测：详情里点工作台期望回看板，旧 guard 直接吞掉点击）
+              if (active && s.key === "work") {
+                if (pathname !== "/") router.push("/");
+                return;
+              }
+              // 对话：再点会 /chats → Loading → replace 回同一详情，整页闪一下，保持 no-op
               if (active) return;
               router.push(s.href);
             }}
@@ -136,10 +139,10 @@ export const AppHeader = ({
     if (!shell || shell.platform === "darwin") return;
     // 不读 computed color：主题 token 是 OKLCH，Chromium 可能原样返回 oklch(...)
     // 让 rgb parser 失效，Windows overlay 留在启动期黑色。这里用壳侧同款 hex。
+    const theme: TitleBarOverlayTheme =
+      resolvedTheme === "dark" ? "dark" : "light";
     const id = requestAnimationFrame(() => {
-      shell.setTitleBarOverlay(
-        TITLEBAR_OVERLAY_COLOR[resolvedTheme === "dark" ? "dark" : "light"],
-      );
+      syncTitleBarOverlayTheme(theme);
     });
     return () => cancelAnimationFrame(id);
   }, [resolvedTheme]);

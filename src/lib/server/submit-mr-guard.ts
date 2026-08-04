@@ -16,6 +16,10 @@ import { promisify } from "node:util";
 import type { ChatTaskAction } from "./chat-pending";
 import type { Task } from "../types";
 import { parseHostFromRemoteUrl, parseProjectPathFromRemoteUrl } from "../git-remote";
+import {
+  taskUsesWkPrimaryFlow,
+  validateWkSubmitSourceBranch,
+} from "./wk-source-branch";
 
 export { parseProjectPathFromRemoteUrl };
 
@@ -157,8 +161,16 @@ export const validateSubmitMr = async (
     }
   }
   // 4) source_branch 必须是该仓 feature 分支、或一次性 <feature>__conflict 解冲突分支
+  const wkFlow = taskUsesWkPrimaryFlow(task);
   const known = task.gitBranches?.find((b) => b.repoPath === a.repoPath)?.name;
-  if (known) {
+  if (wkFlow) {
+    const validWkSource = await validateWkSubmitSourceBranch(
+      task,
+      a.repoPath,
+      a.sourceBranch,
+    );
+    if (!validWkSource.ok) return validWkSource;
+  } else if (known) {
     if (a.sourceBranch !== known && a.sourceBranch !== `${known}__conflict`) {
       return {
         ok: false,

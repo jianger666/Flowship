@@ -133,7 +133,7 @@ describe("parseFlowshipActionMeta", () => {
 });
 
 describe("computeDefaultSkillStates", () => {
-  it("首次初始化：表外新名一律 enabled（存量不让用户挨个装）", () => {
+  it("首次初始化：skills/ 共享未装、knowledge/ 团队规范默认开", () => {
     const added = computeDefaultSkillStates({
       skills: [
         // 组内普通沉淀（含角色分组路径）
@@ -142,12 +142,12 @@ describe("computeDefaultSkillStates", () => {
           name: "group-fe-plain",
           relDir: "skills/fe/group-fe-plain",
         },
-        // 组内 action 壳 skill 也默认装（推进 action 随之派生出现）
+        // 组内 action 壳：共享，首次不自动装
         {
           name: "group-action",
           relDir: "skills/common/group-action",
         },
-        // global 与工程级知识库 skill 同样默认装
+        // 团队规范默认开
         {
           name: "requirement-analyzer",
           relDir: "knowledge/skills/global/eng/requirement-analyzer",
@@ -160,10 +160,11 @@ describe("computeDefaultSkillStates", () => {
       known: new Set(),
       isFirstInit: true,
     });
+    // 首次：skills/ 共享（含 action 壳）未装；knowledge/ 团队规范默认开
     expect(added).toEqual({
-      "group-plain": "enabled",
-      "group-fe-plain": "enabled",
-      "group-action": "enabled",
+      "group-plain": "disabled",
+      "group-fe-plain": "disabled",
+      "group-action": "disabled",
       "requirement-analyzer": "enabled",
       "fe-helper": "enabled",
     });
@@ -211,7 +212,7 @@ describe("computeDefaultSkillStates", () => {
       known: new Set(),
       isFirstInit: true,
     });
-    expect(added).toEqual({ x: "enabled" });
+    expect(added).toEqual({ x: "disabled" }); // 同批首个在 skills/ → 共享未装
   });
 });
 

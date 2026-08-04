@@ -45,7 +45,7 @@ const sanitizeMode = (v: unknown): TaskMode => {
   return v === "chat" ? "chat" : "task";
 };
 
-// V0.6.3：per-repo 分支映射清洗（线上分支 / 已有工作分支共用）。只收 plain object + string value、去空
+// V0.6.3：per-repo 分支映射清洗（线上分支 / 被测业务分支等共用）。只收 plain object + string value、去空
 const sanitizeRepoBranchMap = (
   v: unknown,
 ): Record<string, string> | undefined => {

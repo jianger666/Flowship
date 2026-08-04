@@ -383,7 +383,7 @@ const renderActionHistorySection = (task: Task): string => {
 const renderReqIdLine = (task: Task): string => {
   const reqId = resolveReqId(task);
   if (!reqId) return "";
-  return `- REQ-ID：\`${reqId}\`（团队 wk-harness 规范流程的需求编号；仅执行 wk:* 相关 action 时使用，用户在需求描述中另行指定了 REQ-ID 则以用户的为准；非 wk 流程忽略本行）`;
+  return `- REQ-ID：\`${reqId}\`（团队 wk-harness 规范流程的需求编号；执行 wk:* 以及承接 WK 分支的联调/提测时使用，用户在需求描述中另行指定了 REQ-ID 则以用户的为准；普通流程忽略本行）`;
 };
 
 // 渲染「任务基本信息」的仓库段：非隔离 = 原样列原仓库路径；隔离 task 额外拼一段

@@ -7,6 +7,16 @@ dev action 的目标：把当前 task 各仓的代码改动送到该仓的 **dev
 
 > **dev 分支从哪来**：每仓的 dev 分支见 super prompt 顶部「## 仓库分支配置」段（建 task 时从设置页快照）。**没配 dev 分支的仓本 action 跳过**（联调必须显式配 dev 分支才知道推哪）、artifact 里写「跳过、原因：未配 dev 分支」。下文 `<dev>` 都指「该仓配置的 dev 分支」。
 
+## 源分支：普通流程与 WK 流程
+
+- 历史没有 `wk:*` 主流程 action：保持原逻辑，使用 Flowship 已检出的 feature 分支（`task.gitBranches`）。
+- 历史执行过 `wk:*` 主流程 action：逐仓读取 `wk-doc/requirements/<REQ-ID>/status.yaml`，按团队 wk-harness 规则确定 source：
+  1. 顶层 `expected_git_branch` / `git_branch` / `branch` 第一个非空值为明确分支。
+  2. 有明确分支：当前一致直接用；不一致且工作区干净才检出；有未提交改动先 `ask_user`。
+  3. 没有明确分支：当前分支名包含 `REQ-ID` 就直接用；否则查本地和 `origin` 中包含 `REQ-ID` 的分支。唯一候选且工作区干净才检出；零个、多个或工作区不干净都 `ask_user`。
+  4. 检出后重新执行 `git branch --show-current`，用真实当前分支；禁止直接把 `REQ-ID` 当完整分支名。
+- 多仓逐仓解析。WK 流程的提交说明和联调记录读取各仓 `status.yaml`、`repo-completion-report.md`、`verification.md` 与当前 git diff / commit，不强依赖内置 build artifact。
+
 ## 🔒 铁律（跟 ship 一致、务必遵守）
 
 - **绝不把 dev 分支的内容弄到 feature 分支上**——不许 `git merge <dev>` / `git rebase <dev>` / `git pull origin <dev>` 到 feature、不许 force push feature。feature 永远保持干净、只单向往 dev 送。
@@ -34,7 +44,7 @@ dev action 的目标：把当前 task 各仓的代码改动送到该仓的 **dev
 ```bash
 cd <repoPath>
 DEV=<该仓 dev 分支>                          # 见「## 仓库分支配置」段、没配则跳过本仓
-FEATURE=$(git rev-parse --abbrev-ref HEAD)  # 当前 feature 分支、全程不动它
+FEATURE=$(git rev-parse --abbrev-ref HEAD)  # 已按普通/WK规则确定的业务源分支、全程不动它
 
 # fail-fast：fetch 不到 dev 直接退（远程没该分支 / 网络异常、别在脏状态上瞎合）
 if ! git fetch origin "$DEV" 2>&1; then
@@ -44,7 +54,7 @@ fi
 # 先把 feature 工作区改动 commit（build 铁律不碰 .git、改动停在工作区、必须先 commit 才推得动）
 if [ -n "$(git status --porcelain)" ]; then
   git add -A
-  git commit -m "<commit msg>"   # conventional commit 风格、跟 build artifact 实际改动一致
+  git commit -m "<commit msg>"   # conventional commit；普通流程参考 build，WK 参考完成报告/验证与实际 diff
 fi
 
 # 判本仓相对 dev 有没有要联调的改动

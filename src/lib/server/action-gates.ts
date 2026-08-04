@@ -196,10 +196,8 @@ export const planBranchesForBuild = (
       { storyId, taskTitle: task.title },
     );
 
-  // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch）
-  // V0.6.3：用户给某仓填了「已有工作分支」→ 用它当 name（build 复用、不另建）；否则按模板渲染。
-  //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个、自动用对。
-  //   分支名过白名单（非法则清洗）；清洗后仍非法的仓不进 infos / hint（防命令注入）。
+  // 每仓 1 条 GitBranchInfo（已存在的保留历史记录、不覆盖 baseBranch）；否则按模板渲染。
+  //   name 落库到 gitBranches[].name、ship 提测的 MR 源分支也取这个。
   const existing = task.gitBranches ?? [];
   const infos: GitBranchInfo[] = [];
   for (const repoPath of repoPaths) {
@@ -210,8 +208,7 @@ export const planBranchesForBuild = (
       infos.push(safe === old.name ? old : { ...old, name: safe });
       continue;
     }
-    const explicitName = task.repoFeatureBranches?.[repoPath]?.trim();
-    const rawName = explicitName || renderForRepo(repoPath);
+    const rawName = renderForRepo(repoPath);
     const name = safeBranchForHint(rawName);
     if (!name) continue;
     infos.push({ repoPath, name, baseBranch: "" });
@@ -221,7 +218,7 @@ export const planBranchesForBuild = (
   // 多仓 hint：逐仓 idempotent checkout（branch 存在则 checkout、不存在则建）
   const hintRepos = infos.map((i) => i.repoPath);
   const isMultiRepo = hintRepos.length > 1;
-  // V0.6.3：每仓实际分支名取自 infos（可能因用户指定「已有工作分支」而各仓不同名）
+  // V0.6.3：每仓实际分支名取自 infos（模板渲染或历史 gitBranches 记录）
   const uniqueNames = [...new Set(infos.map((i) => i.name))];
   const lines: string[] = [];
   lines.push("## 准入：build 第一动作、逐仓 idempotent checkout 分支");

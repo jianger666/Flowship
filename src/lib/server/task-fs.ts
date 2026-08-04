@@ -1286,11 +1286,13 @@ export const createTask = async (input: NewTaskInput): Promise<Task> => {
     if (allowedRepos.has(repo) && b) repoBaseBranches[repo] = b;
   }
 
-  // V0.6.3：同样清洗 per-repo「已有工作分支」覆盖（用户建 task 时填、key 限定 repoPaths、value trim）
+  // V0.6.3：清洗 per-repo 被测业务分支（仅 QA 任务；key 限定 repoPaths、value trim）
   const repoFeatureBranches: Record<string, string> = {};
-  for (const [repo, branch] of Object.entries(input.repoFeatureBranches ?? {})) {
-    const b = branch?.trim();
-    if (allowedRepos.has(repo) && b) repoFeatureBranches[repo] = b;
+  if (input.workRole === "qa") {
+    for (const [repo, branch] of Object.entries(input.repoFeatureBranches ?? {})) {
+      const b = branch?.trim();
+      if (allowedRepos.has(repo) && b) repoFeatureBranches[repo] = b;
+    }
   }
 
   // V0.6.7：清洗测试分支 / dev 分支 / 命名模板快照（同款：key 限定 repoPaths、value trim 去空）
@@ -1906,7 +1908,7 @@ export const updateTaskFields = async (
     }
 
     // V0.6.28：追加仓库（只增不删、并集语义）——必须在 repoFeatureBranches 清洗之前处理、
-    // 否则同一次请求里「新仓 + 新仓的已有工作分支」会被旧 repoPaths 集合误清掉
+    // 否则同一次请求里「新仓 + 新仓的被测业务分支」会被旧 repoPaths 集合误清掉
     if (input.addRepoPaths !== undefined) {
       const existing = new Set(meta.repoPaths);
       const added = input.addRepoPaths
@@ -1953,8 +1955,8 @@ export const updateTaskFields = async (
       }
     }
 
-    // 已有工作分支：跟 createTask 同款清洗——key 限定在本 task 的 repoPaths 内、value trim 去空
-    if (input.repoFeatureBranches !== undefined) {
+    // 被测业务分支：仅 QA 任务可改（跟 createTask 同款清洗）
+    if (input.repoFeatureBranches !== undefined && meta.workRole === "qa") {
       if (input.repoFeatureBranches === null) {
         meta.repoFeatureBranches = undefined;
       } else {

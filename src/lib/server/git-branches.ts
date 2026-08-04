@@ -67,7 +67,7 @@ export const readGitBranchState = async (
 };
 
 /**
- * 列某仓的分支候选：本地 + 远端合并去重（v0.9.11、设置页分支下拉 / 任务 dialog「已有工作分支」用）。
+ * 列某仓的分支候选：本地 + 远端合并去重（v0.9.11、设置页分支下拉 / 测试任务被测分支 Combobox 用）。
  *
  * 跟 readGitBranchState 的区别：线上 / test / develop 这类长期分支本地常常没 checkout 过、
  * 只列本地分支会缺——所以一并列 refs/remotes、去掉 remote 名前缀后合并。

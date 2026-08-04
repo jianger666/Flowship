@@ -205,7 +205,7 @@ build action 每次跑前、runner 拼 `GitBranchInfo[]`（每仓 1 条 branch�
 
 - 占位符：`{storyId}`（从 feishuStoryUrl 抠）/ `{taskTitle}` / `{date:FORMAT}`、每个值各自 branch-safe 化（含路径分隔 `/`、模板字面的 `/` 才是层级）；老任务快照里的 `{username}` 渲染为空段、由 `/` 清理兜住
 - 模板层级：per-repo 覆盖 > 全局默认 > 内置默认；建 task 时由 client `resolveBranchTemplate` 算「有效模板」固化进 `task.repoBranchTemplates`、build 直接渲染——**不同仓可用不同模板**（如后端 `feature/{date:MM-dd}/{storyId}-{taskTitle}`）
-- 用户在新建 / 编辑 dialog 给某仓填了「已有工作分支」(`repoFeatureBranches`) → 用它当 name（build 复用、不另建）
+- 开发侧已移除「已有工作分支」；`repoFeatureBranches` 仅测试任务用作「被测业务分支」（QA 填、可后补）
 
 agent 用 SDK shell 对每个仓跑一段 idempotent 命令（base 分支：配了线上分支用配的、没配则自探 master/main/develop）：
 
@@ -298,7 +298,7 @@ ai-flow-action-hub/
 
 - **模块**：`team-library.ts`（sync / 上传 / 镜像 / 安装卸载，git 网络操作走 inline credential helper + env 传 token——不进命令行/config/FETCH_HEAD；对外错误统一 `redactGitText` 脱敏；`withTeamLibraryLock` 全局仓锁互斥）+ `team-skill-states.ts`（安装态存储、零依赖小模块）
 - **skills 第四源「team」**：loader 扫 clone 两目录注入；`knowledge/skills/**` 条目带 `kbRoot`（skill 内库相对路径的解析根）；同名优先级最低；`loadSkillsForTask(repoPaths)` 按任务仓 basename 强制注入命中的工程档案 skill（无视安装态）
-- **市场模型**：team skill = 安装/卸载（`skill-states.json`、单一 owner = team-library 模块，settings.disabledSkills 只管自管源）；**默认全量安装**（首次发现一律 enabled、用户不动 = 全都有）；用户改过的永不被默认策略覆盖
+- **市场模型**：team skill = 安装/卸载（`skill-states.json`、单一 owner = team-library 模块，settings.disabledSkills 只管自管源）；**首次默认**：`skills/` 共享（含派生 action）未装、按需安装；`knowledge/skills/` 团队规范默认开；增量新名一律未装；用户改过的永不被默认策略覆盖
 - **共享 action 派生**：带 `.flowship-action.json` 的已安装 team skill 实时派生虚拟 CustomActionDef（id `team:<skill名>`、origin "team"），合成点在 custom-action-fs 读入口——安装/卸载一份状态、无第二份定义文件可撕裂；写入口对 `team:` id 防护（PATCH 拒绝、DELETE 转卸载）
 - **上传**：勾自管 skill → 选角色分类（默认 userRole）→ commit+push main；被保护分支拒 → 自动推临时分支 + GitLab REST 开 MR（pendingReview + mrUrl、maintainer 审批）
 - **知识库镜像**：`canMirror` 按 gitToken 对源仓的真实权限探测显隐；镜像 = 拉 `wukong/wk-harness-platform` → 拷进 `knowledge/` → push；同事无源仓权限也能用全套规范

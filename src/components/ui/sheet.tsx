@@ -14,8 +14,9 @@ import * as React from "react";
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
 
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim";
+import { cn } from "@/lib/utils";
 
 function Sheet({
   modal = false,
@@ -40,6 +41,7 @@ function SheetOverlay({
   className,
   ...props
 }: DialogPrimitive.Backdrop.Props) {
+  useTitleBarOverlayDim();
   return (
     <DialogPrimitive.Backdrop
       data-slot="sheet-overlay"

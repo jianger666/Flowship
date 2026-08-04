@@ -906,17 +906,15 @@ const TaskDetailPage = () => {
                       )}
                     </span>
                   </Tooltip>
-                ) : (
-                  // gitBranches 只在 build / worktree 链路写入——全 custom action 的任务
-                  // 永远没记录（2026-07-21 同事实测「没展示分支」）。用户手动配置的
-                  // feature 分支兜底展示（agent 实际也按它工作、只是没落权威记录）
+                ) : isTestingRequirementTask(task) ? (
+                  // 测试任务：gitBranches 未写入前，用 repoFeatureBranches 兜底展示被测分支
                   (() => {
                     const configured = task.repoPaths
                       .map((p) => task.repoFeatureBranches?.[p]?.trim())
                       .filter((b): b is string => !!b);
                     if (configured.length === 0) return null;
                     return (
-                      <Tooltip content="任务配置的工作分支">
+                      <Tooltip content="任务配置的被测业务分支">
                         <span className="ml-2 font-mono">
                           @ {configured[0]}
                           {configured.length > 1 && (
@@ -928,7 +926,7 @@ const TaskDetailPage = () => {
                       </Tooltip>
                     );
                   })()
-                )}
+                ) : null}
                 </div>
               </Tooltip>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）

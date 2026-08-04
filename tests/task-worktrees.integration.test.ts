@@ -21,6 +21,7 @@ import {
   getTaskWorkRepoPaths,
   removeTaskWorktrees,
 } from "@/lib/server/task-worktrees";
+import { resolveWkWorktreeBranchInfos } from "@/lib/server/wk-source-branch";
 
 const REPO = path.join(TMP_ROOT, "origin-repo");
 const DATA_DIR = process.env.FLOWSHIP_DATA_DIR!;
@@ -374,5 +375,93 @@ describe("ensureTaskWorktrees / removeTaskWorktrees 真 git 集成", () => {
     await expect(
       fs.readFile(path.join(onlyScripts, "a.py"), "utf8"),
     ).resolves.toBe("print(1)\n");
+  });
+
+  it("WK：先 detached 预热物理工作区，业务分支就绪后再原地绑定", async () => {
+    const repo = path.join(TMP_ROOT, "wk-worktree-repo");
+    await fs.mkdir(repo, { recursive: true });
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.email", "t@t.local");
+    git(repo, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo, "wk.txt"), "base\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "init");
+
+    const wkTask = makeTask({
+      id: "t_1700000000007_wk",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      reqId: "REQ-777",
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/REQ-777",
+    });
+    await markTaskAlive(wkTask.id);
+    const wkWorkDir = getTaskWorkRepoPaths(wkTask)[0];
+
+    const prewarmed = await ensureTaskWorktrees(wkTask, () => true, {
+      branchSelection: { kind: "detached" },
+    });
+    expect(prewarmed.infos).toEqual([]);
+    expect(git(wkWorkDir, "branch", "--show-current")).toBe("");
+    expect(git(repo, "branch", "--show-current")).toBe("main");
+
+    await expect(
+      ensureTaskWorktrees(wkTask, () => true, {
+        branchSelection: {
+          kind: "explicit",
+          infos: [{ repoPath: repo, name: "feature/REQ-777", baseBranch: "" }],
+        },
+      }),
+    ).rejects.toThrow(/找不到 WK 业务分支/);
+
+    git(repo, "branch", "feature/REQ-777", "main");
+    await expect(resolveWkWorktreeBranchInfos(wkTask)).resolves.toEqual([
+      { repoPath: repo, name: "feature/REQ-777", baseBranch: "" },
+    ]);
+    const bound = await ensureTaskWorktrees(wkTask, () => true, {
+      branchSelection: {
+        kind: "explicit",
+        infos: [{ repoPath: repo, name: "feature/REQ-777", baseBranch: "" }],
+      },
+    });
+    expect(bound.createdRepos).toEqual([]);
+    expect(git(wkWorkDir, "branch", "--show-current")).toBe(
+      "feature/REQ-777",
+    );
+    expect(git(repo, "branch", "--show-current")).toBe("main");
+
+    await removeTaskWorktrees(wkTask);
+  });
+
+  it("普通流程：detached 预热后首次 ensure 在原地创建 Flowship 分支", async () => {
+    const repo = path.join(TMP_ROOT, "legacy-prewarm-repo");
+    await fs.mkdir(repo, { recursive: true });
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.email", "t@t.local");
+    git(repo, "config", "user.name", "t");
+    await fs.writeFile(path.join(repo, "base.txt"), "base\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "init");
+
+    const legacyTask = makeTask({
+      id: "t_1700000000008_legacy",
+      repoPaths: [repo],
+      repoBaseBranches: { [repo]: "main" },
+      feishuStoryUrl: "https://project.feishu.cn/x/story/detail/999001",
+    });
+    await markTaskAlive(legacyTask.id);
+    const workDir = getTaskWorkRepoPaths(legacyTask)[0];
+    await ensureTaskWorktrees(legacyTask, () => true, {
+      branchSelection: { kind: "detached" },
+    });
+    expect(git(workDir, "branch", "--show-current")).toBe("");
+
+    const bound = await ensureTaskWorktrees(legacyTask, () => true);
+    expect(bound.infos[0].name).toBe("feature/999001-集成测试");
+    expect(git(workDir, "branch", "--show-current")).toBe(
+      "feature/999001-集成测试",
+    );
+    expect(git(repo, "branch", "--show-current")).toBe("main");
+
+    await removeTaskWorktrees(legacyTask);
   });
 });

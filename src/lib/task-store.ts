@@ -1403,3 +1403,93 @@ export const shareToGroup = async (
     membershipUnknown: ok.membershipUnknown === true,
   };
 };
+
+/** 只建/取需求群（不发卡片）；死绑定同 share 走 needGroupRebuild */
+export type EnsureRequirementGroupResult =
+  | {
+      ok: true;
+      chatId: string;
+      chatName?: string;
+      created: boolean;
+      membershipUnknown?: boolean;
+    }
+  | {
+      ok: false;
+      error: string;
+      needGroupRebuild?: boolean;
+      chatId?: string;
+      chatName?: string;
+    };
+
+/**
+ * 确保需求群存在（可建可复用）。业务失败不抛；HTTP / 解析失败抛 ApiRequestError。
+ */
+export const ensureRequirementGroup = async (
+  taskId: string,
+  opts: { recreateFrom?: string } = {},
+): Promise<EnsureRequirementGroupResult> => {
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(taskId)}/requirement-group`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        opts.recreateFrom ? { recreateFrom: opts.recreateFrom } : {},
+      ),
+    },
+  );
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiRequestError(`HTTP ${res.status}`, res.status);
+  }
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    !res.ok &&
+    "error" in data &&
+    typeof (data as { error: unknown }).error === "string"
+  ) {
+    const err = data as {
+      error: string;
+      code?: unknown;
+      chatId?: unknown;
+      chatName?: unknown;
+    };
+    return {
+      ok: false,
+      error: err.error.trim() || `打开需求群失败（HTTP ${res.status}）`,
+      needGroupRebuild: GROUP_REBUILD_CODES.has(String(err.code ?? "")),
+      chatId: typeof err.chatId === "string" ? err.chatId : undefined,
+      chatName: typeof err.chatName === "string" ? err.chatName : undefined,
+    };
+  }
+  if (!res.ok) {
+    const msg =
+      typeof data === "object" &&
+      data !== null &&
+      "error" in data &&
+      typeof (data as { error: unknown }).error === "string"
+        ? (data as { error: string }).error
+        : `HTTP ${res.status}`;
+    throw new ApiRequestError(msg, res.status);
+  }
+  const ok = data as {
+    ok?: unknown;
+    chatId?: unknown;
+    chatName?: unknown;
+    created?: unknown;
+    membershipUnknown?: unknown;
+  };
+  if (ok.ok !== true) {
+    throw new ApiRequestError("需求群响应异常", res.status || 500);
+  }
+  return {
+    ok: true,
+    chatId: typeof ok.chatId === "string" ? ok.chatId : "",
+    chatName: typeof ok.chatName === "string" ? ok.chatName : undefined,
+    created: ok.created === true,
+    membershipUnknown: ok.membershipUnknown === true,
+  };
+};

@@ -106,6 +106,15 @@ import {
   filterAdvanceGroupsForDailyTask,
   isLightweightDailyTask,
 } from "@/lib/lightweight-task";
+import { resolveSessionModel } from "@/lib/task-model";
+import {
+  flowMutexBuiltinDisabledReason,
+  flowMutexWkDisabledReason,
+  isAdvanceKeyFlowMutexDisabled,
+  resolveFlowLock,
+  type FlowLock,
+} from "@/lib/flow-mutex";
+import { wkCommandForAction } from "@/lib/wk-command";
 import { isCompanyEnvConfigured } from "@/lib/company-env";
 import { SettingsLink } from "@/lib/settings-link";
 import { cn } from "@/lib/utils";
@@ -148,8 +157,13 @@ const selectFirstVisibleAction = (
   visibleKeys: string[],
   setActionType: (v: ActionType | null) => void,
   setSelectedCustomActionId: (v: string | null) => void,
+  flowLock: FlowLock = null,
+  customMap: ReadonlyMap<string, CustomActionDef> = new Map(),
 ): void => {
-  const first = visibleKeys[0];
+  const first =
+    visibleKeys.find(
+      (k) => !isAdvanceKeyFlowMutexDisabled(k, flowLock, customMap),
+    ) ?? visibleKeys[0];
   if (first === undefined) {
     // 全部 action 被隐藏（且无自定义）——无选中、chips 区显示空态引导
     setActionType(null);
@@ -396,19 +410,13 @@ export const AdvanceDialog = ({
   const batchProgress = useMemo(() => computeBatchProgress(task), [task]);
   const hasBatches = batchProgress.total > 0;
 
-  // dialog 打开时模型默认值的「task 派生部分」：优先本 task 最近一个 action 实际用的模型
-  //（沿用我在这个任务一直用的模型、不必每次推进都重挑 opus）、再回退 task.model；都没有返 undefined、
-  // 由 open-effect 当次再读最新 settings.defaultModel 兜底。只是 UI 默认值、不回写任何持久字段。
-  // settings 兜底放 effect 不放这里：getSettings 不是响应式、塞进 memo([task]) 会用到 stale settings
-  //（开 dialog 只触发 render、task 引用不一定变 → 拿不到刚改的设置页默认模型）。
-  const defaultPickedModel = useMemo<ModelSelection | undefined>(() => {
-    const lastWithModel = [...task.actions]
-      .reverse()
-      .find((a) => a.agentModel?.id?.trim());
-    if (lastWithModel?.agentModel?.id?.trim()) return lastWithModel.agentModel;
-    if (task.model?.id?.trim()) return task.model;
-    return undefined;
-  }, [task]);
+  // dialog 打开时模型默认值的「task 派生部分」：跟 resolveSessionModel / runner resume 同口径
+  //（最近 action.agentModel → task.model）；都没有返 undefined，由 open-effect 读 settings.defaultModel。
+  // settings 兜底放 effect 不放这里：getSettings 不是响应式、塞进 memo([task]) 会用到 stale settings。
+  const defaultPickedModel = useMemo<ModelSelection | undefined>(
+    () => resolveSessionModel(task),
+    [task],
+  );
   // 用 ref 持最新默认值：open-effect 只在「打开瞬间」读它、不进 effect 依赖——
   // 否则 SSE 推 task（每次新引用）会让这个 memo 变、连带打回用户已改的表单。
   const defaultPickedModelRef = useRef(defaultPickedModel);
@@ -504,6 +512,9 @@ export const AdvanceDialog = ({
   // 日常轻量态判定用（open / fetch effect 不进 task 依赖、靠 ref 读最新）
   const feishuStoryUrlRef = useRef(task.feishuStoryUrl);
   feishuStoryUrlRef.current = task.feishuStoryUrl;
+  // 主流程互斥：open / fetch effect 读打开瞬间 actions 快照、不进 deps（防 SSE 重置表单）
+  const taskActionsRef = useRef(task.actions);
+  taskActionsRef.current = task.actions;
   // 打开瞬间快照：本次正在创建的 plan 提交后会进 task.actions、但快照不变——
   // 首次 plan 提交时（dialog 还 loading）不会误闪「会追加到现有方案」文案
   const [hasPlanHistory, setHasPlanHistory] = useState(false);
@@ -649,6 +660,8 @@ export const AdvanceDialog = ({
       visibleKeys,
       setActionType,
       setSelectedCustomActionId,
+      resolveFlowLock(taskActionsRef.current, customMap),
+      customMap,
     );
     // setInstruction 引用稳定（弹窗不带草稿 scope）、进 deps 不会让本 effect 多跑
   }, [open, defaultRemoveSourceBranch, setInstruction]);
@@ -783,6 +796,8 @@ export const AdvanceDialog = ({
             visible,
             setActionType,
             setSelectedCustomActionId,
+            resolveFlowLock(taskActionsRef.current, customMap),
+            customMap,
           );
           return;
         }
@@ -797,6 +812,8 @@ export const AdvanceDialog = ({
             visible,
             setActionType,
             setSelectedCustomActionId,
+            resolveFlowLock(taskActionsRef.current, customMap),
+            customMap,
           );
         }
       })
@@ -821,6 +838,8 @@ export const AdvanceDialog = ({
             visible,
             setActionType,
             setSelectedCustomActionId,
+            resolveFlowLock(taskActionsRef.current, new Map()),
+            new Map(),
           );
         }
       });
@@ -868,6 +887,10 @@ export const AdvanceDialog = ({
     () => visibleGroups.flatMap((g) => g.keys),
     [visibleGroups],
   );
+  const flowLock = useMemo(
+    () => resolveFlowLock(task.actions, customById),
+    [task.actions, customById],
+  );
 
   const toggleGroupCollapsed = (key: ActionGroupKey) => {
     setCollapsedGroups((prev) => {
@@ -890,6 +913,11 @@ export const AdvanceDialog = ({
         hostError: gitHostError,
         devBranches: liveDevBranches,
       });
+      const mutexReason =
+        type === "plan" || type === "build" || type === "review"
+          ? flowMutexBuiltinDisabledReason(type, flowLock)
+          : null;
+      const disabledHint = reason ?? (mutexReason ? <>{mutexReason}</> : null);
       const selected = actionType === type;
       return (
         // 外包 relative：disabled 的 button 不触发子元素 hover、角标必须叠在外层挂 tooltip；
@@ -904,7 +932,7 @@ export const AdvanceDialog = ({
                 setActionType(type);
                 setSelectedCustomActionId(null);
               }}
-              disabled={submitting || !!reason}
+              disabled={submitting || !!disabledHint}
               className={actionCardClass(selected)}
             >
               <ActionCardContent
@@ -914,8 +942,8 @@ export const AdvanceDialog = ({
               />
             </ChoiceButton>
             {/* 不可选原因收进角标警告 icon 的 tooltip、hover 才看完整说明 */}
-            {reason && (
-              <Tooltip content={reason}>
+            {disabledHint && (
+              <Tooltip content={disabledHint}>
                 <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-warning">
                   <AlertTriangle className="size-3.5" />
                 </span>
@@ -929,6 +957,11 @@ export const AdvanceDialog = ({
     const def = customById.get(key);
     if (!def) return null;
     const selected = actionType === "custom" && selectedCustomActionId === def.id;
+    const wkMutexReason =
+      wkCommandForAction(def) != null
+        ? flowMutexWkDisabledReason(def, flowLock)
+        : null;
+    const customDisabledHint = wkMutexReason ? <>{wkMutexReason}</> : null;
     return (
       // 自定义 action 名可长（如「飞书项目周报生成」）、截断后靠 hover Tooltip 看全名 + skill 标识符
       <Tooltip key={key} content={def.skill ? `${def.label}（${def.skill}）` : def.label}>
@@ -941,7 +974,7 @@ export const AdvanceDialog = ({
               setActionType("custom");
               setSelectedCustomActionId(def.id);
             }}
-            disabled={submitting}
+            disabled={submitting || !!customDisabledHint}
             className={actionCardClass(selected)}
           >
             <ActionCardContent
@@ -950,24 +983,56 @@ export const AdvanceDialog = ({
               selected={selected}
             />
           </ChoiceButton>
+          {customDisabledHint && (
+            <Tooltip content={customDisabledHint}>
+              <span className="absolute right-1 top-1 inline-flex cursor-help items-center justify-center rounded-full bg-background/80 p-0.5 text-warning">
+                <AlertTriangle className="size-3.5" />
+              </span>
+            </Tooltip>
+          )}
         </div>
       </Tooltip>
     );
   };
 
   // 用户当前选的 action 是不是被准入条件挡住（实装类型 + 满足准入）；无选中时无所谓准入
-  const disabledReason = useMemo(
-    () =>
-      actionType
-        ? inferDisabledReason(task, actionType, {
-            token: gitToken,
-            resolvedHost: resolvedGitHost,
-            hostError: gitHostError,
-            devBranches: liveDevBranches,
-          })
-        : null,
-    [task, actionType, gitToken, resolvedGitHost, gitHostError, liveDevBranches],
-  );
+  const disabledReason = useMemo(() => {
+    if (!actionType) return null;
+    const gateReason = inferDisabledReason(task, actionType, {
+      token: gitToken,
+      resolvedHost: resolvedGitHost,
+      hostError: gitHostError,
+      devBranches: liveDevBranches,
+    });
+    if (gateReason) return gateReason;
+    if (
+      actionType === "plan" ||
+      actionType === "build" ||
+      actionType === "review"
+    ) {
+      const mutex = flowMutexBuiltinDisabledReason(actionType, flowLock);
+      return mutex ? <>{mutex}</> : null;
+    }
+    if (actionType === "custom" && selectedCustomActionId) {
+      const def = customById.get(selectedCustomActionId);
+      const mutex =
+        def && wkCommandForAction(def)
+          ? flowMutexWkDisabledReason(def, flowLock)
+          : null;
+      return mutex ? <>{mutex}</> : null;
+    }
+    return null;
+  }, [
+    task,
+    actionType,
+    gitToken,
+    resolvedGitHost,
+    gitHostError,
+    liveDevBranches,
+    flowLock,
+    selectedCustomActionId,
+    customById,
+  ]);
   const canSubmit = useMemo(() => {
     if (submitting) return false;
     // v0.9.12：无选中（全部 action 被隐藏）不能提交

@@ -128,6 +128,10 @@ import {
 } from "@/lib/testing-task";
 import { filterHealthyMcp, invalidateMcpProbeCache } from "./mcp-probe";
 import { getCustomAction } from "./custom-action-fs";
+import { wkCommandForAction } from "@/lib/wk-command";
+import { resolveFlowLock } from "@/lib/flow-mutex";
+import { resolveSessionModel } from "@/lib/task-model";
+import { resolveWkWorktreeBranchInfos } from "./wk-source-branch";
 import { setTaskSessionAgentId } from "./task-fs";
 import {
   agentSessions,
@@ -938,7 +942,11 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
       if (!(await stillPrewarm())) return;
 
       // lease 进资源函数内部——失效抛 WorktreeLeaseLostError 让位（不吞）
-      const ensured = await ensureTaskWorktrees(task, lease);
+      const ensured = await ensureTaskWorktrees(task, lease, {
+        // 新任务只预热物理隔离；首个主流程 action 再决定由 Flowship 还是 WK 绑定分支。
+        branchSelection:
+          task.actions.length === 0 ? { kind: "detached" } : undefined,
+      });
 
       // worktree add 返回后再复查——终态后不 upsert、不写 info
       if (!(await stillPrewarm())) return;
@@ -970,7 +978,7 @@ export const prewarmTaskWorkspace = (taskId: string): void => {
           lease,
           {
             kind: "info",
-            text: `已后台预热任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
+            text: `已后台预热任务隔离工作区（git worktree）${ensured.infos.length > 0 ? "并检出任务分支" : "（分支将在首次流程操作时绑定）"}：${ensured.createdRepos
               .map((p) => p.split("/").filter(Boolean).pop() ?? p)
               .join("、")}${cloneNote}——推进时无需再等待创建`,
           },
@@ -1058,6 +1066,7 @@ const advanceTaskCore = async (
     actionType === "custom" && customActionId
       ? await getCustomAction(customActionId)
       : null;
+  const upcomingWkCommand = wkCommandForAction(customDef);
 
   // V0.8.18：推进新 action 前、取消上一 action 可能还在后台跑的 check（结果对新 action 无意义、且防状态交错）
   abortRunningCheck(task.id);
@@ -1119,14 +1128,28 @@ const advanceTaskCore = async (
     // lease 失效抛 WorktreeLeaseLostError → 转 stale、不得 upsert / 写事件）
     // deferDepClone：worktree/分支先就绪，依赖拷贝交给 internalStartAgent 后台
     let ensured;
+    let branchSelection: EnsureWorktreesOptions["branchSelection"];
     try {
       await writeOwnedEventAndPublish(
         task.id,
         () => !isTaskOpStale(task.id, opGen),
         { kind: "info", text: "正在准备工作区…" },
       );
+      if (upcomingWkCommand && resolveFlowLock(task.actions) === null) {
+        branchSelection = { kind: "detached" };
+      }
+      if (
+        upcomingWkCommand === "wk:repo-execute" ||
+        upcomingWkCommand === "wk:repo-review"
+      ) {
+        branchSelection = {
+          kind: "explicit",
+          infos: await resolveWkWorktreeBranchInfos(task),
+        };
+      }
       ensured = await ensureTaskWorktrees(task, () => !isTaskOpStale(task.id, opGen), {
         deferDepClone: true,
+        branchSelection,
       });
     } catch (err) {
       // 让位不吞——显式终态，不继续 upsertGitBranch / info
@@ -1135,11 +1158,11 @@ const advanceTaskCore = async (
       }
       throw err;
     }
-    // 仅新仓 upsert gitBranches（老条目保留 baseBranch 历史值、跟 build hint 老规则一致）
+    // Flowship 仍只补新仓；WK 显式绑定以 status/REQ-ID 结果覆盖旧记录，作为重开/续跑快照。
     // finalGuard = admission lease（失主拒写）
     const existingRepos = new Set((task.gitBranches ?? []).map((b) => b.repoPath));
     for (const info of ensured.infos) {
-      if (!existingRepos.has(info.repoPath)) {
+      if (branchSelection?.kind === "explicit" || !existingRepos.has(info.repoPath)) {
         await upsertGitBranch(
           task.id,
           info,
@@ -1155,7 +1178,7 @@ const advanceTaskCore = async (
         () => !isTaskOpStale(task.id, opGen),
         {
           kind: "info",
-          text: `已创建任务隔离工作区（git worktree）并检出任务分支：${ensured.createdRepos
+          text: `已创建任务隔离工作区（git worktree）${ensured.infos.length > 0 ? "并检出任务分支" : "（分支将在 WK 代码阶段绑定）"}：${ensured.createdRepos
             .map((p) => p.split("/").filter(Boolean).pop() ?? p)
             .join("、")}；依赖目录后台准备中`,
         },
@@ -2614,7 +2637,14 @@ export const buildSessionBridges = (
         askLease,
       );
       if (updated) publish(task.id, { kind: "task", task: updated });
-      // ask 成功路径显式 accepted
+      // ask 成功路径显式 accepted；queueMicrotask 让 MCP 先把 [ASK_SUBMITTED] 回给工具层再软停 stream，
+      // 防 SDK 注入 Please continue 续跑——cancelled 分支见 consumeSessionRun askPending 软停。
+      queueMicrotask(() => {
+        if (!askLease()) return;
+        const rec = runningTasks.get(task.id);
+        if (!rec) return;
+        rec.softCancelStream?.();
+      });
       return "accepted";
     }
 
@@ -4085,6 +4115,12 @@ const consumeSessionRun = async (
           /* noop */
         });
       },
+      softCancelStream: () => {
+        cancelled = true;
+        void run.cancel().catch(() => {
+          /* noop */
+        });
+      },
     });
 
     hardTimer = setTimeout(() => {
@@ -4180,6 +4216,19 @@ const consumeSessionRun = async (
           task.id,
           () => isTaskOpCurrent(opts.opHandle),
           { kind: "done", task: freshQ ?? task, ok: true },
+        );
+        return;
+      }
+      // ask 软停：pendingAsk 仍在（与用户 stop 清 pending 区分）→ 不 finalize / 不关 session / 不写 idle
+      const askPendingOnCancel = !!getPendingAsk(task.id);
+      if (askPendingOnCancel) {
+        if (lostStartOwner()) return;
+        if (yieldIfSuperseded()) return;
+        const freshAsk = await getTask(task.id);
+        publishIfCurrent(
+          task.id,
+          () => isTaskOpCurrent(opts.opHandle),
+          { kind: "done", task: freshAsk ?? task, ok: true },
         );
         return;
       }
@@ -4741,12 +4790,9 @@ export const resumeTaskSession = async (
   opts?: { closedSessionInstanceId?: number; opHandle?: TaskOpHandle },
 ): Promise<AgentSessionRecord | null> => {
   if (!task.sessionAgentId || !creds.apiKey) return null;
-  // resume 后 send 必须有显式 model：优先「原会话实际在用的模型」（最近带 agentModel 的 action）、
-  // 兜底 client 传来的（settings 默认模型）
-  const model =
-    [...task.actions].reverse().find((a) => a.agentModel)?.agentModel ??
-    task.model ??
-    creds.model;
+  // resume 后 send 必须有显式 model：跟 UI「跟随会话」同一套 resolveSessionModel、
+  // 再兜底 client 传来的 settings 默认模型
+  const model = resolveSessionModel(task) ?? creds.model;
   if (!model) return null;
 
   /** 终态 / lifecycle / opHandle 综合准入（每个 await 后复用） */

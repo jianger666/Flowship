@@ -24,6 +24,7 @@ import { useModels } from "@/hooks/use-models";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
 import { getSettings } from "@/lib/local-store";
+import { resolveSessionModel } from "@/lib/task-model";
 import { submitTaskQuestion } from "@/lib/task-store";
 import { loadDraft } from "@/lib/view-memory";
 import type { ModelSelection, Task } from "@/lib/types";
@@ -67,16 +68,17 @@ export const TaskTalkComposer = ({
     if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
   }, [models.length, fetchModels]);
 
-  // 跟随态 trigger：带上会话实际模型名（task.model 快照）；未跑过 / 无模型时退回原占位
+  // 跟随态 trigger：跟服务端 resume 同口径（最近 action.agentModel → task.model）
+  // 切勿只读 task.model——推进换模型不回写该字段，会一直显示建任务时的旧模型
   const followPlaceholder = useMemo(() => {
-    const id = task.model?.id?.trim();
+    const id = resolveSessionModel(task)?.id?.trim();
     if (!id) return "模型 · 跟随会话";
     const m = models.find((x) => x.id === id);
     const raw = m?.displayName;
     // displayName 是图标 token 时退显 id（与 ModelSelect 同口径）
     const name = !raw || /:icon-/.test(raw) ? id : raw;
     return `${name} · 跟随会话`;
-  }, [task.model, models]);
+  }, [task, models]);
 
   // 切 task 时整条输入态重置再换载对应草稿（详情页在不同任务间导航时组件可能不重挂）。
   // 必须 reset() 全清、不能只清路径附件：贴好的截图 / 已引用的 skill 会跟着串到下一个

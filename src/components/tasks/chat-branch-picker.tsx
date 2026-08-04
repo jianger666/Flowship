@@ -107,10 +107,11 @@ export const ChatBranchPicker = ({ task }: Props) => {
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
-      <PopoverTrigger
-        render={
-          <Tooltip content={`当前分支：${label}`}>
-            <span className="inline-flex">
+      {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 包外层 span（同 combobox / 收件箱坑） */}
+      <Tooltip content={`当前分支：${label}`}>
+        <span className="inline-flex">
+          <PopoverTrigger
+            render={
               <button
                 type="button"
                 disabled={running || saving}
@@ -127,10 +128,10 @@ export const ChatBranchPicker = ({ task }: Props) => {
                 <span className="min-w-0 flex-1 truncate text-left">{label}</span>
                 <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
               </button>
-            </span>
-          </Tooltip>
-        }
-      />
+            }
+          />
+        </span>
+      </Tooltip>
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">
         {/* 搜索框：分支多时实时过滤 */}
         <div className="flex items-center gap-2 border-b px-2.5 py-2">

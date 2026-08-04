@@ -125,10 +125,11 @@ export const ChatWorkdirPicker = forwardRef<ChatWorkdirPickerHandle, Props>(
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
-      <PopoverTrigger
-        render={
-          <Tooltip content={current || unsetHint}>
-            <span className="inline-flex">
+      {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 包外层 span（同 combobox / 收件箱坑） */}
+      <Tooltip content={current || unsetHint}>
+        <span className="inline-flex">
+          <PopoverTrigger
+            render={
               <button
                 type="button"
                 disabled={running || saving}
@@ -152,10 +153,10 @@ export const ChatWorkdirPicker = forwardRef<ChatWorkdirPickerHandle, Props>(
                 </span>
                 <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
               </button>
-            </span>
-          </Tooltip>
-        }
-      />
+            }
+          />
+        </span>
+      </Tooltip>
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">
         {/* 顶部：当前工作目录 + 完整路径（不截断、避免「路径看不清」的痛点） */}
         <div className="border-b px-3 py-2">

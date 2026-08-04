@@ -38,12 +38,10 @@ describe("planBranchesForBuild bash hint 防注入", () => {
     expect(planBranchesForBuild(baseTask({ feishuStoryUrl: "  " }))).toBeNull();
   });
 
-  it("用户指定含 ; /$() 的分支名 → 清洗后再进 hint", () => {
+  it("任务标题含 ; /$() → 清洗后再进 hint", () => {
     const r = planBranchesForBuild(
       baseTask({
-        repoFeatureBranches: {
-          "/tmp/fake-repo-for-hint": "evil;rm -rf /",
-        },
+        title: "evil;rm -rf /",
       }),
     );
     expect(r).not.toBeNull();
@@ -51,6 +49,18 @@ describe("planBranchesForBuild bash hint 防注入", () => {
     expect(r!.infos[0].name).not.toContain(";");
     expect(r!.promptHint).not.toContain("evil;rm");
     expect(r!.promptHint).toMatch(/git checkout '[^']+'/);
+  });
+
+  it("非测试任务忽略 repoFeatureBranches 覆盖、仍走模板", () => {
+    const r = planBranchesForBuild(
+      baseTask({
+        repoFeatureBranches: {
+          "/tmp/fake-repo-for-hint": "feature/override",
+        },
+      }),
+    );
+    expect(r).not.toBeNull();
+    expect(r!.infos[0].name).toBe("feature/123456-测-hint");
   });
 
   it("测试任务不走开发任务的自动建 feature 分支", () => {

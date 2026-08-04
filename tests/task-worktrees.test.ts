@@ -101,6 +101,53 @@ describe("isWorktreeTask 隔离判定", () => {
     expect(isWorktreeTask(baseTask({ isolateWorktree: undefined }))).toBe(false);
     expect(isWorktreeTask(baseTask({ repoPaths: [] }))).toBe(false);
   });
+
+  it("worktree 物理隔离不再受 WK / 普通主流程影响", () => {
+    const wk = baseTask({
+      actions: [
+        {
+          id: "act_1",
+          n: 1,
+          type: "custom",
+          customActionId: "team:wk-repo-execute",
+          status: "running",
+          cwd: REPO_WEB,
+        },
+      ],
+    } as Partial<Task>);
+    const legacy = baseTask({
+      actions: [
+        {
+          id: "act_1",
+          n: 1,
+          type: "plan",
+          status: "running",
+          cwd: `${DATA}/worktrees/t_1700000000000_abc123/crm-web`,
+        },
+      ],
+    } as Partial<Task>);
+    expect(isWorktreeTask(wk)).toBe(true);
+    expect(getTaskWorkRepoPaths(wk)[0]).not.toBe(REPO_WEB);
+    expect(isWorktreeTask(legacy)).toBe(true);
+  });
+
+  it("兼容老版本已在 worktree 中执行的 WK 任务", () => {
+    const oldWkCwd = `${DATA}/worktrees/t_1700000000000_abc123/crm-web`;
+    const oldWk = baseTask({
+      actions: [
+        {
+          id: "act_1",
+          n: 1,
+          type: "custom",
+          customActionId: "team:wk-repo-design",
+          status: "completed",
+          cwd: oldWkCwd,
+        },
+      ],
+    } as Partial<Task>);
+    expect(isWorktreeTask(oldWk)).toBe(true);
+    expect(getTaskCwd(oldWk)).toBe(oldWkCwd);
+  });
 });
 
 describe("日常轻量态（无飞书链接）— 原仓 + 不建分支", () => {
@@ -314,12 +361,12 @@ describe("planWorktreeBranchInfos 分支规划", () => {
     expect(again[0]).toEqual(existing);
   });
 
-  it("用户指定「已有工作分支」优先于模板", () => {
+  it("非测试任务忽略 repoFeatureBranches、仍按模板渲染", () => {
     const t = baseTask({
       feishuStoryUrl: "https://project.feishu.cn/x/story/detail/123456",
       repoFeatureBranches: { [REPO_WEB]: "feature/mine" },
     });
-    expect(planWorktreeBranchInfos(t)[0].name).toBe("feature/mine");
+    expect(planWorktreeBranchInfos(t)[0].name).toBe("feature/123456-测试需求");
   });
 
   it("无飞书 URL（抠不到 storyId）兜底用 task id 时间戳段、分支名仍合法非空", () => {

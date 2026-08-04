@@ -170,7 +170,7 @@ export const mergeTeamLibraryConfig = (
 
 /**
  * 团队流程核心 skill（UI「推荐」标 + 卸载时 toast 提醒用；
- * 2026-07-22 起默认策略改全量安装、本名单不再参与默认启停判定）
+ * 不参与默认启停判定——首次策略按目录区分共享 / 团队规范，见 computeDefaultSkillStates）
  */
 export const KNOWLEDGE_GLOBAL_DEFAULT_ENABLED = [
   "requirement-analyzer",
@@ -179,15 +179,24 @@ export const KNOWLEDGE_GLOBAL_DEFAULT_ENABLED = [
 ] as const;
 
 /**
- * 默认启停策略（两种场景，2026-07-24 拆开）：
+ * 组共享沉淀目录（`skills/…`）——能力页「共享」市场、含派生 action 壳。
+ * 团队规范在 `knowledge/skills/…`，不走这条。
+ */
+export const isSharedGroupSkillRelDir = (relDir: string): boolean => {
+  const n = relDir.replace(/\\/g, "/");
+  return n === "skills" || n.startsWith("skills/");
+};
+
+/**
+ * 默认启停策略（两种场景；首次对「共享」与「团队规范」拆开）：
  *
  * 1. **首次初始化**（`isFirstInit: true`）：skill-states 表空 / 文件不存在。
- *    团队库刚 clone，存量几十个 skill 不能让用户挨个点安装 → 表外新名一律
- *    `enabled`（对齐「同步即全量可用」；实测 ≈ 1.5 万 tokens 可接受）。
+ *    - `skills/`（共享市场，含 `.flowship-action` 派生的推进 action）→ `disabled`
+ *      （按需安装；新用户不应一 sync 就把组里全部共享 action 装上）
+ *    - `knowledge/skills/`（团队规范镜像）→ `enabled`（wk-harness 等开箱可用）
  *
  * 2. **后续 sync 增量**（`isFirstInit: false`）：表已非空，表外新名 = 同事新上传。
- *    一律 `disabled`（未安装）——用户在共享市场手动点「安装」才进注入集。
- *    旧逻辑把增量也写成 enabled，等于 sync 后自动安装，不合理。
+ *    一律 `disabled`——用户在共享市场手动点「安装」才进注入集。
  *
  * 已在表里（known）的一律不动——用户改过的永不被策略覆盖。
  * 调用方须自行判定 isFirstInit；损坏保护在 apply 层（trusted:false 绝不当首次）。
@@ -195,7 +204,7 @@ export const KNOWLEDGE_GLOBAL_DEFAULT_ENABLED = [
  * @returns 仅含新写入项的增量表（known 里的名字不出现）
  */
 export const computeDefaultSkillStates = (input: {
-  /** 每个 team skill：name + 相对 clone 根的目录（hasActionMarker 已退役、不再参与判定） */
+  /** 每个 team skill：name + 相对 clone 根的目录（用 relDir 区分共享 / 团队规范） */
   skills: Array<{ name: string; relDir: string }>;
   /** 已在 skill-states 表里的名字（含用户手动改过的） */
   known: ReadonlySet<string>;
@@ -206,12 +215,17 @@ export const computeDefaultSkillStates = (input: {
   isFirstInit: boolean;
 }): Record<string, TeamSkillState> => {
   const next: Record<string, TeamSkillState> = {};
-  // 首次全装；增量未装（市场里点「安装」）
-  const defaultState: TeamSkillState = input.isFirstInit ? "enabled" : "disabled";
   for (const s of input.skills) {
     // 已在表里（用户改过 / 早批次默认）→ 不动；同批重名首个胜出
     if (input.known.has(s.name) || s.name in next) continue;
-    next[s.name] = defaultState;
+    if (!input.isFirstInit) {
+      next[s.name] = "disabled";
+      continue;
+    }
+    // 首次：共享按需；团队规范默认开
+    next[s.name] = isSharedGroupSkillRelDir(s.relDir)
+      ? "disabled"
+      : "enabled";
   }
   return next;
 };
@@ -845,7 +859,7 @@ export const applyDefaultSkillStates = async (
   const disabledCount = addedNames.length - enabledCount;
   console.log(
     isFirstInit
-      ? `[team-library] 首次初始化 team skill ${addedNames.length} 个（默认安装 ${enabledCount}）`
+      ? `[team-library] 首次初始化 team skill ${addedNames.length} 个（默认安装 ${enabledCount}、共享未装 ${disabledCount}）`
       : `[team-library] sync 增量发现 team skill ${addedNames.length} 个（默认未安装 ${disabledCount}）`,
   );
 };

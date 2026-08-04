@@ -24,6 +24,7 @@ import {
 } from "react";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
 
+import { useTitleBarOverlayDim } from "@/hooks/use-titlebar-overlay-dim";
 import { toLoadableImageSrc } from "@/lib/local-image-src";
 import { cn } from "@/lib/utils";
 
@@ -56,6 +57,8 @@ interface PreviewState {
 export const ImagePreviewProvider = ({ children }: { children: ReactNode }) => {
   // 当前预览态：null = 关闭；非 null = 展示 images[index]
   const [state, setState] = useState<PreviewState | null>(null);
+  // Windows：全屏 lightbox 同样盖不住原生 titleBarOverlay，打开时压暗按钮条
+  useTitleBarOverlayDim(!!state);
 
   const open = useCallback((images: PreviewImage[], index = 0) => {
     if (images.length === 0) return;

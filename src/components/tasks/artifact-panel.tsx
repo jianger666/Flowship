@@ -331,7 +331,7 @@ interface Props {
    */
   onArtifactMetaChange?: (meta: { filename: string } | null) => void;
   /**
-   * 是否可「分享到需求群」。日常轻量任务（无飞书链接）为 false → 隐藏分享按钮。
+   * 是否可「分享到需求群 / 打开需求群」。日常轻量任务（无飞书链接）为 false → 隐藏按钮。
    * 由父组件用 isLightweightDailyTask 判定后传入。
    */
   canShareToGroup?: boolean;
@@ -965,7 +965,8 @@ export const ArtifactPanel = ({
               className="mr-1"
             />
           )}
-          {/* 有飞书链接 + 有产物正文才显示；日常轻量任务隐藏 */}
+          {/* 有飞书链接 + 有产物正文才显示；日常轻量任务隐藏。
+              「需求群」建/进群入口在 task 顶栏 WorkspaceActions，不挂产物栏 */}
           {canShareToGroup && currentArtifact && (
             <Tooltip content="分享到需求群">
               <span className="inline-flex">

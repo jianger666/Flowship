@@ -69,10 +69,11 @@ export const ChatMcpPicker = ({ task, onTaskUpdate }: Props) => {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        render={
-          <Tooltip content="选本次对话启用哪些 MCP">
-            <span className="inline-flex">
+      {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 包外层 span（同 combobox / 收件箱坑） */}
+      <Tooltip content="选本次对话启用哪些 MCP">
+        <span className="inline-flex">
+          <PopoverTrigger
+            render={
               <button
                 type="button"
                 disabled={running}
@@ -88,10 +89,10 @@ export const ChatMcpPicker = ({ task, onTaskUpdate }: Props) => {
                 </span>
                 <ChevronDown className="pointer-events-none size-3.5 shrink-0 text-muted-foreground" />
               </button>
-            </span>
-          </Tooltip>
-        }
-      />
+            }
+          />
+        </span>
+      </Tooltip>
       <PopoverContent align="start" sideOffset={6} className="w-80 p-0">
         {/* 顶部：标题 + 重新检测（有 server 才显示检测按钮） */}
         <div className="flex items-center justify-between gap-2 border-b px-3 py-2">

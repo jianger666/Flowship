@@ -1,0 +1,197 @@
+/**
+ * WK 业务分支解析与联调 / 提测源分支校验。
+ *
+ * status.yaml / REQ-ID 是团队规范的权威来源：repo-execute / repo-review 用它给
+ * worktree 绑定分支，联调 / 提测也复用同一规则，避免两套分支判断漂移。
+ */
+
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+import { resolveFlowLock } from "@/lib/flow-mutex";
+import { resolveReqId } from "@/lib/req-id";
+import type { GitBranchInfo, Task } from "@/lib/types";
+
+import { getTaskWorkRepoPaths } from "./task-worktrees";
+
+const STATUS_BRANCH_KEYS = [
+  "expected_git_branch",
+  "git_branch",
+  "branch",
+] as const;
+
+const execFileAsync = promisify(execFile);
+
+export const parseWkExpectedBranch = (statusText: string): string | null => {
+  for (const key of STATUS_BRANCH_KEYS) {
+    // 只认顶层字段；integration.readiness.branch 等嵌套字段不属于 repo-execute 分支门禁。
+    // 不能用 `\s*`：它会跨过空值后的换行，把下一行（如 `integration:`）吞成字段值。
+    const match = statusText.match(
+      new RegExp(`^${key}:[ \\t]*([^\\r\\n]*)$`, "m"),
+    );
+    const value = match?.[1]?.trim().replace(/^["']|["']$/g, "");
+    if (value && !["null", "None", "~"].includes(value)) return value;
+  }
+  return null;
+};
+
+const repoWorkPath = (task: Task, repoPath: string): string => {
+  const index = task.repoPaths.indexOf(repoPath);
+  return index >= 0 ? getTaskWorkRepoPaths(task)[index] : repoPath;
+};
+
+const readExpectedBranch = async (
+  task: Task,
+  repoPath: string,
+  reqId: string,
+): Promise<string | null> => {
+  const roots = [repoWorkPath(task, repoPath), repoPath];
+  for (const root of new Set(roots)) {
+    const statusPath = path.join(
+      root,
+      "wk-doc",
+      "requirements",
+      reqId,
+      "status.yaml",
+    );
+    try {
+      const expected = parseWkExpectedBranch(
+        await fs.readFile(statusPath, "utf8"),
+      );
+      if (expected) return expected;
+    } catch {
+      // detached 预热可能还看不到业务分支上的 status.yaml，继续回退原仓 / refs。
+    }
+  }
+  return null;
+};
+
+const branchesContainingReqId = async (
+  repoPath: string,
+  reqId: string,
+): Promise<string[]> => {
+  const names: string[] = [];
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      [
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads",
+        "refs/remotes/origin",
+      ],
+      { cwd: repoPath, timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+    );
+    names.push(
+      ...stdout
+        .split(/\r?\n/)
+        .map((name) => name.trim().replace(/^origin\//, ""))
+        .filter((name) => name && name !== "HEAD" && name.includes(reqId)),
+    );
+  } catch {
+    // 继续探远端；离线时最终使用已收集到的引用。
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["ls-remote", "--heads", "origin"],
+      { cwd: repoPath, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    names.push(
+      ...stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim().split(/\s+/)[1] ?? "")
+        .map((ref) => ref.replace(/^refs\/heads\//, ""))
+        .filter((name) => name.includes(reqId)),
+    );
+  } catch {
+    // 无 origin / 离线不阻断本地分支发现。
+  }
+  return [...new Set(names)].sort();
+};
+
+/**
+ * WK 进入代码执行 / 复核前，把团队规范认可的业务分支解析为 worktree 显式分支。
+ * status.yaml 优先；未声明时只接受唯一一个包含 REQ-ID 的本地 / origin 分支。
+ */
+export const resolveWkWorktreeBranchInfos = async (
+  task: Task,
+): Promise<GitBranchInfo[]> => {
+  const reqId = resolveReqId(task);
+  if (!reqId) {
+    throw new Error("WK 流程缺少 REQ-ID，无法为隔离工作区定位业务分支");
+  }
+
+  const infos: GitBranchInfo[] = [];
+  for (const repoPath of task.repoPaths) {
+    if ((task.nonGitRepoPaths ?? []).includes(repoPath)) continue;
+    if ((task.readonlyRepoPaths ?? []).includes(repoPath)) continue;
+
+    const declared = await readExpectedBranch(task, repoPath, reqId);
+    if (declared) {
+      infos.push({ repoPath, name: declared, baseBranch: "" });
+      continue;
+    }
+
+    const recorded = (task.gitBranches ?? []).find(
+      (item) => item.repoPath === repoPath && item.name.includes(reqId),
+    );
+    if (recorded) {
+      infos.push(recorded);
+      continue;
+    }
+
+    const candidates = await branchesContainingReqId(repoPath, reqId);
+    if (candidates.length === 1) {
+      infos.push({ repoPath, name: candidates[0], baseBranch: "" });
+      continue;
+    }
+    if (candidates.length === 0) {
+      throw new Error(
+        `仓库 ${repoPath} 未找到 WK 业务分支：请在 status.yaml 声明 expected_git_branch / git_branch / branch，或先创建包含 REQ-ID「${reqId}」的分支`,
+      );
+    }
+    throw new Error(
+      `仓库 ${repoPath} 找到多个包含 REQ-ID「${reqId}」的分支（${candidates.join("、")}），请在 status.yaml 明确声明目标分支`,
+    );
+  }
+  return infos;
+};
+
+export const taskUsesWkPrimaryFlow = (task: Task): boolean =>
+  resolveFlowLock(task.actions) === "wk";
+
+export const validateWkSubmitSourceBranch = async (
+  task: Task,
+  repoPath: string,
+  sourceBranch: string,
+): Promise<{ ok: true } | { ok: false; error: string }> => {
+  const reqId = resolveReqId(task);
+  if (!reqId) {
+    return {
+      ok: false,
+      error: "WK 流程缺少 REQ-ID，无法确认联调/提测源分支",
+    };
+  }
+
+  const source = sourceBranch.trim();
+  const baseSource = source.endsWith("__conflict")
+    ? source.slice(0, -"__conflict".length)
+    : source;
+  const expected = await readExpectedBranch(task, repoPath, reqId);
+  if (expected) {
+    if (baseSource === expected) return { ok: true };
+    return {
+      ok: false,
+      error: `WK source_branch 必须是 status.yaml 声明的「${expected}」或其 __conflict 分支，收到「${sourceBranch}」`,
+    };
+  }
+
+  if (baseSource.includes(reqId)) return { ok: true };
+  return {
+    ok: false,
+    error: `WK status.yaml 未声明分支时，source_branch 必须包含 REQ-ID「${reqId}」，收到「${sourceBranch}」`,
+  };
+};

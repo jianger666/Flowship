@@ -198,7 +198,7 @@ export interface TaskMetaV06 {
   scriptRepoPaths?: string[];
   /** V0.6.3：per-repo 线上分支（key=repoPath、建 task 时从 settings 快照、空则 build 探 origin/HEAD） */
   repoBaseBranches?: Record<string, string>;
-  /** V0.6.3：per-repo「已有工作分支」覆盖（key=repoPath、建 task 时用户填、空则 build 用算法名） */
+  /** V0.6.3：per-repo 被测业务分支（仅 QA 测试任务、key=repoPath、选填可后补） */
   repoFeatureBranches?: Record<string, string>;
   /** V0.6.7：per-repo 测试分支快照（ship 提测目标、空则回退默认 test） */
   repoTestBranches?: Record<string, string>;

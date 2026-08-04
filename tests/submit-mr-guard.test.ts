@@ -5,7 +5,7 @@
  * remote 绕过）。合法用例用临时 git 仓 + 已知 origin；另有用例锁「读不到 → 拒」。
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -138,6 +138,82 @@ describe("validateSubmitMr", () => {
       sourceBranch: "random-branch",
     });
     expect(r.ok).toBe(false);
+  });
+
+  it("WK 流程优先使用 status.yaml 声明的源分支，不受旧 gitBranches 记录影响", async () => {
+    const reqId = "REQ-WK-123";
+    const statusDir = join(REPO, "wk-doc", "requirements", reqId);
+    mkdirSync(statusDir, { recursive: true });
+    writeFileSync(
+      join(statusDir, "status.yaml"),
+      `req_id: ${reqId}\nexpected_git_branch: feature/${reqId}-impl\nintegration:\n  readiness:\n    branch: ignored-nested\n`,
+    );
+    const task = baseTask({
+      reqId,
+      actions: [
+        {
+          id: "act_1",
+          n: 1,
+          type: "custom",
+          customActionId: "team:wk-repo-execute",
+          status: "completed",
+          cwd: REPO,
+        },
+        { id: "act_3", n: 3, type: "ship", status: "running" },
+      ],
+    } as Partial<Task>);
+
+    expect(
+      (
+        await validateSubmitMr(task, {
+          ...baseMr(),
+          sourceBranch: `feature/${reqId}-impl`,
+        })
+      ).ok,
+    ).toBe(true);
+    expect(
+      (
+        await validateSubmitMr(task, {
+          ...baseMr(),
+          sourceBranch: `feature/${reqId}-impl__conflict`,
+        })
+      ).ok,
+    ).toBe(true);
+    expect((await validateSubmitMr(task, baseMr())).ok).toBe(false);
+  });
+
+  it("WK status.yaml 未声明分支时，source_branch 只需包含 REQ-ID", async () => {
+    const reqId = "REQ-WK-EMPTY";
+    const statusDir = join(REPO, "wk-doc", "requirements", reqId);
+    mkdirSync(statusDir, { recursive: true });
+    writeFileSync(
+      join(statusDir, "status.yaml"),
+      `req_id: ${reqId}\nexpected_git_branch:\n`,
+    );
+    const task = baseTask({
+      reqId,
+      actions: [
+        {
+          id: "act_1",
+          n: 1,
+          type: "custom",
+          customActionId: "team:wk-repo-design",
+          status: "completed",
+          cwd: REPO,
+        },
+        { id: "act_3", n: 3, type: "ship", status: "running" },
+      ],
+    } as Partial<Task>);
+
+    expect(
+      (
+        await validateSubmitMr(task, {
+          ...baseMr(),
+          sourceBranch: `feature/me/${reqId}-detail`,
+        })
+      ).ok,
+    ).toBe(true);
+    expect((await validateSubmitMr(task, baseMr())).ok).toBe(false);
   });
 
   it("gitBranches 没记录该仓 → 退化兜底：非空且 ≠ 目标分支，但禁保护分支作 source", async () => {

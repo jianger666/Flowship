@@ -401,10 +401,19 @@ describe("team-skill-states 存储", () => {
     ).toBe(true);
   });
 
-  it("ENOENT + 有 skill → applyDefaultSkillStates 写默认 enabled", async () => {
+  it("ENOENT + 共享 skill → applyDefaultSkillStates 写默认 disabled", async () => {
     await writeSkill(path.join(sharedSkills(), "fe", "fresh"), "fresh");
     await applyDefaultSkillStates(teamRepo());
-    expect(await readTeamSkillStates()).toEqual({ fresh: "enabled" });
+    expect(await readTeamSkillStates()).toEqual({ fresh: "disabled" });
+  });
+
+  it("ENOENT + knowledge skill → applyDefaultSkillStates 写默认 enabled", async () => {
+    await writeSkill(
+      path.join(teamRepo(), "knowledge", "skills", "global", "eng", "kb-fresh"),
+      "kb-fresh",
+    );
+    await applyDefaultSkillStates(teamRepo());
+    expect(await readTeamSkillStates()).toEqual({ "kb-fresh": "enabled" });
   });
 });
 

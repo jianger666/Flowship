@@ -8,7 +8,8 @@
  * 2. 复制该仓实际工作目录路径——终端 cd 用
  * 3. 预览（按仓多预览位）——设置页配了「预览启动命令」才显示；组内挂载；
  *    不同仓可同时预览、同仓被别的任务占着时再起会顶掉
- * 4. 「任务文件夹」固定整条末尾（点击后用系统文件管理器打开）
+ * 4. 「需求群」——需求任务建/打开飞书需求群（日常轻量任务隐藏）
+ * 5. 「任务文件夹」固定整条末尾（点击后用系统文件管理器打开）
  *
  * 预览状态轮询 /api/preview（仅本组件挂载期间、4s 一次、本地调用很轻）。
  */
@@ -22,6 +23,7 @@ import {
   Play,
   Square,
   SquareArrowOutUpRight,
+  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -33,7 +35,9 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { useRequirementGroup } from "@/hooks/use-requirement-group";
 import { getIdeAnchorProps } from "@/lib/ide-open";
+import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { getRepoWorkDirs, shellQuotePath } from "@/lib/path-utils";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
@@ -62,6 +66,11 @@ export const WorkspaceActions = ({ task }: Props) => {
   const [busy, setBusy] = useState(false);
   // 打开任务目录请求进行中（独立于预览操作，避免互相禁用）
   const [openingTaskDir, setOpeningTaskDir] = useState(false);
+  // 「需求群」飞行中（建/取群 + 打开飞书）
+  const [ensuringGroup, setEnsuringGroup] = useState(false);
+  const { runEnsureGroup } = useRequirementGroup();
+  // 需求任务才显示「需求群」（日常轻量任务无飞书工作项）
+  const showRequirementGroup = !isLightweightDailyTask(task);
 
   useEffect(() => {
     void initSettings().then(() => {
@@ -392,6 +401,32 @@ export const WorkspaceActions = ({ task }: Props) => {
         );
       })}
 
+      {/* 需求群：task 级入口（不挂产物栏）——建/取群并打开飞书；日常任务隐藏 */}
+      {showRequirementGroup && (
+        <Tooltip content="创建或加入需求群">
+          <Button
+            variant="ghost"
+            size="sm"
+            className={BTN_CLS}
+            disabled={ensuringGroup}
+            onClick={() => {
+              if (ensuringGroup) return;
+              setEnsuringGroup(true);
+              void runEnsureGroup(task.id).finally(() =>
+                setEnsuringGroup(false),
+              );
+            }}
+          >
+            {ensuringGroup ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <Users className="size-3" />
+            )}
+            需求群
+          </Button>
+        </Tooltip>
+      )}
+
       {/* 用系统文件管理器打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
       {taskDirPath && (
         <Tooltip
@@ -420,20 +455,19 @@ export const WorkspaceActions = ({ task }: Props) => {
 // 预览日志 popover（启动失败排查 / 看 dev server 输出）
 const PreviewLogPopover = ({ slot }: { slot: PreviewSlotStatus }) => (
   <Popover>
-    <PopoverTrigger
-      render={
-        <Tooltip content="查看 dev server 最近输出">
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-          >
-            <FileTerminal className="size-3" />
-            日志
-          </Button>
-        </Tooltip>
-      }
-    />
+    {/* PopoverTrigger.render 必须是可交互 DOM；Tooltip 不能塞进 render（同 combobox / 收件箱坑） */}
+    <Tooltip content="查看 dev server 最近输出">
+      <span className="inline-flex">
+        <PopoverTrigger
+          render={
+            <Button variant="ghost" size="sm" className={BTN_CLS}>
+              <FileTerminal className="size-3" />
+              日志
+            </Button>
+          }
+        />
+      </span>
+    </Tooltip>
     <PopoverContent align="start" className="w-[480px] p-2">
       <Tooltip content={slot.command}>
         <div className="mb-1 truncate font-mono text-[11px] text-muted-foreground">
