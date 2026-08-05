@@ -370,6 +370,14 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-08-05 交卷/提问收尾收敛 + 任务详情头部重构 + 每仓分支切换（v1.7.1）
+
+- **交卷 / 提问收尾协议收敛**：`submit_work` 成功即刻由平台补发固定收尾「已完成，产出已更新，请审阅。」（AI 播报形态、内容统一）；交卷 / 提问成功后的模型输出落盘带 `meta.muted` 标记但**不 SSE 广播**（审计保留、UI 不渲染；顺带修掉消音事件广播导致的滚动抖动回归）；删「Action 产出完成、等待 ack」info 里程碑；prompt / 工具返回文案同步「收到宿主 Please continue 直接结束、不重问不调查」。
+- **任务详情头部重构**：标题/操作行 + 任务级入口行（任务上下文 / MCP / 分批 │ 需求群 / 任务文件夹）+ 按仓项目卡片；上下文文档→任务上下文、MCP servers→MCP；未分批入口隐藏（半兼容）；单仓 / 多仓统一短名。
+- **每仓分支展示 + 切换**：项目卡片内分支 chip + 切换弹层（带警告）；worktree 未就绪禁切；分支下拉统一为 `BranchSwitcher`（chat select / task chip）。
+- **产物区 / 操作区打磨**：产物文件名并入 ArtifactPanel toolbar；timeline chip / 主操作按钮去冗余 tooltip；拖拽柄修点击黑框（outline-none）；预览 tooltip 只显示命令。
+- **门禁**：typecheck / lint 干净；vitest 全量通过（本地端口 / 子进程用例沙箱外复跑通过）；test 包构建通过。
+
 ### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
 
 > 双模型交叉 review 的逐条结论与判断过程存 `docs/CHANGELOG.md` 同名条目。本段只留「这批干了什么 + 口径」。

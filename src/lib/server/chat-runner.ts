@@ -66,6 +66,7 @@ import {
 } from "./shell-output-bridge";
 import {
   handleSdkMessage,
+  maybeEmitSubmitFixedText,
   type AssistantBufferCtx,
 } from "./sdk-message-handler";
 import {
@@ -1860,6 +1861,12 @@ const consumeChatRun = async (
         }${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
       );
     }
+
+    // chat 模式不交卷（submitSeen 恒 false）→ no-op；
+    // task 模式固定收尾已在流内补发（handleSdkMessage），这里仅作兜底、once 守卫防重复
+    await maybeEmitSubmitFixedText(ctx, (ev) =>
+      writeOwnedEventAndPublish(task.id, chatLease, ev),
+    );
 
     // 自然 finished 也必须查 instance——旧实现完全不查、空窗可覆盖 B
     await finalizeChatRunIfCurrent(task.id, myInstanceId, "finished", {

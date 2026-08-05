@@ -18,12 +18,10 @@ import {
   Copy,
   ExternalLink,
   FileTerminal,
-  FolderOpen,
   Loader2,
   Play,
   Square,
   SquareArrowOutUpRight,
-  Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -35,9 +33,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { useRequirementGroup } from "@/hooks/use-requirement-group";
 import { getIdeAnchorProps } from "@/lib/ide-open";
-import { isLightweightDailyTask } from "@/lib/lightweight-task";
 import { getRepoWorkDirs, shellQuotePath } from "@/lib/path-utils";
 import { getSettings, initSettings } from "@/lib/local-store";
 import {
@@ -46,13 +42,14 @@ import {
   stopTaskPreview,
 } from "@/lib/task-store";
 import type { JumpIde, PreviewSlotStatus, Task } from "@/lib/types";
+import { BranchSwitcher } from "./branch-switcher";
 
 interface Props {
   task: Task;
 }
 
-// 小号按钮统一样式（这行是辅助操作、视觉上要比主操作区收敛）
-const BTN_CLS = "h-6 gap-1 px-1.5 text-xs text-muted-foreground hover:text-foreground";
+// 小号纯图标按钮统一样式（省空间、给项目名/分支腾位置；语义靠 Tooltip）
+const BTN_CLS = "size-6 shrink-0 justify-center p-0 text-muted-foreground hover:text-foreground";
 
 export const WorkspaceActions = ({ task }: Props) => {
   // 设置快照（jumpIde + 每仓预览命令）——挂载时读一次、设置页改完回来重新挂载自然刷新
@@ -64,13 +61,6 @@ export const WorkspaceActions = ({ task }: Props) => {
   const [slots, setSlots] = useState<PreviewSlotStatus[]>([]);
   // 启动 / 停止请求进行中（防双击）
   const [busy, setBusy] = useState(false);
-  // 打开任务目录请求进行中（独立于预览操作，避免互相禁用）
-  const [openingTaskDir, setOpeningTaskDir] = useState(false);
-  // 「需求群」飞行中（建/取群 + 打开飞书）
-  const [ensuringGroup, setEnsuringGroup] = useState(false);
-  const { runEnsureGroup } = useRequirementGroup();
-  // 需求任务才显示「需求群」（日常轻量任务无飞书工作项）
-  const showRequirementGroup = !isLightweightDailyTask(task);
 
   useEffect(() => {
     void initSettings().then(() => {
@@ -112,11 +102,9 @@ export const WorkspaceActions = ({ task }: Props) => {
   }, [candidates.length, refreshSlots]);
 
   const workCwd = task.workCwd;
-  // 任务数据目录（actions/ artifact + workspace/ 产出）——server hydrate 时算好带下来；
-  // 无仓任务也有、单独判断（不跟 workCwd 一起 early return）
-  const taskDirPath = task.taskDirPath?.trim() ?? "";
   const hasRepoBar = !!workCwd && task.repoPaths.length > 0;
-  if (!hasRepoBar && !taskDirPath) return null;
+  // 任务级工具（需求群 / 任务文件夹）已拆到 TaskUtilityActions，这里只管按仓操作
+  if (!hasRepoBar) return null;
 
   // V0.12.3：IDE 逐仓打开各自项目根、不再打开多仓公共父目录（同事实测 IDEA 把整个
   // D:/IdeaProjects 当项目开了）；每仓一个按钮、单仓时不带短名后缀
@@ -138,30 +126,6 @@ export const WorkspaceActions = ({ task }: Props) => {
       toast.success("工作区路径已复制");
     } catch {
       toast.error("复制失败、请手动复制");
-    }
-  };
-
-  const openTaskFolder = async () => {
-    if (!taskDirPath || openingTaskDir) return;
-    setOpeningTaskDir(true);
-    try {
-      const res = await fetch("/api/system/open-path", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: taskDirPath }),
-      });
-      if (!res.ok) {
-        const data = (await res.json().catch(() => null)) as {
-          error?: string;
-        } | null;
-        throw new Error(data?.error ?? `HTTP ${res.status}`);
-      }
-    } catch (err) {
-      toast.error(
-        `打开任务文件夹失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setOpeningTaskDir(false);
     }
   };
 
@@ -198,8 +162,7 @@ export const WorkspaceActions = ({ task }: Props) => {
     }
   };
 
-  // 多仓才画组边框 + 短名 label；单仓保持扁平、避免无谓加重
-  const multi = ideTargets.length > 1;
+  // 单仓 / 多仓统一：每仓一组边框 + 短名 label（task 头部展示口径对齐）
   const ideRepoSet = new Set(ideTargets.map((t) => t.repoPath));
   // candidates 理论上都挂在 ideTargets 上；对不上的兜底单独放（避免预览按钮消失）
   const orphanCandidates = candidates.filter((c) => !ideRepoSet.has(c.repoPath));
@@ -233,8 +196,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                   />
                 }
               >
-                <ExternalLink className="size-3" />
-                打开
+                <ExternalLink className="size-3.5" />
               </Button>
             </Tooltip>
           )}
@@ -248,8 +210,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                 disabled={busy}
                 onClick={() => void stop(repoPath)}
               >
-                {busy ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
-                停止
+                {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Square className="size-3.5" />}
               </Button>
             </span>
           </Tooltip>
@@ -261,7 +222,7 @@ export const WorkspaceActions = ({ task }: Props) => {
         <>
           <span className="inline-flex items-center gap-1 px-1 text-xs text-destructive/80">
             <span className="size-1.5 rounded-full bg-destructive/80" />
-            预览已退出{mine.exitCode !== null ? `（exit ${mine.exitCode}）` : ""}
+            已退出
           </span>
           <PreviewLogPopover slot={mine} />
           <Tooltip content="用同一命令重新启动预览">
@@ -273,8 +234,7 @@ export const WorkspaceActions = ({ task }: Props) => {
                 disabled={busy}
                 onClick={() => void start(mine.repoPath)}
               >
-                <Play className="size-3" />
-                重试
+                <Play className="size-3.5" />
               </Button>
             </span>
           </Tooltip>
@@ -284,19 +244,8 @@ export const WorkspaceActions = ({ task }: Props) => {
     // 本任务本仓未占预览位：有命令才显示启动钮
     const c = candidates.find((x) => x.repoPath === repoPath);
     if (!c) return null;
-    // 同仓被别的任务占着且未退出 → title 提示会顶掉
-    const occupiedByOther = slots.find(
-      (s) => s.repoPath === repoPath && s.taskId !== task.id && !s.exited,
-    );
     return (
-      <Tooltip
-        content={
-          `在任务工作区起 dev server：${c.command}` +
-          (occupiedByOther
-            ? `\n（会停掉「${occupiedByOther.taskTitle}」对该仓的预览）`
-            : "")
-        }
-      >
+      <Tooltip content={c.command}>
         <span className="inline-flex">
           <Button
             variant="ghost"
@@ -305,8 +254,7 @@ export const WorkspaceActions = ({ task }: Props) => {
             disabled={busy}
             onClick={() => void start(c.repoPath)}
           >
-            {busy ? <Loader2 className="size-3 animate-spin" /> : <Play className="size-3" />}
-            预览
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
           </Button>
         </span>
       </Tooltip>
@@ -323,13 +271,10 @@ export const WorkspaceActions = ({ task }: Props) => {
         const anchor = getIdeAnchorProps(t.workDir, undefined, prefs?.jumpIde ?? "cursor", {
           newWindow: true,
         });
-        const groupInner = (
+        const actions = (
           <>
-            {multi && (
-              <span className="px-1 text-[11px] text-muted-foreground">{t.shortName}</span>
-            )}
             {anchor && (
-              <Tooltip content={`在 IDE 打开项目\n${t.workDir}`}>
+              <Tooltip content="在 IDE 打开项目">
                 <Button
                   variant="ghost"
                   size="sm"
@@ -342,35 +287,40 @@ export const WorkspaceActions = ({ task }: Props) => {
                     />
                   }
                 >
-                  <SquareArrowOutUpRight className="size-3" />
-                  在 IDE 打开
+                  <SquareArrowOutUpRight className="size-3.5" />
                 </Button>
               </Tooltip>
             )}
-            <Tooltip content={`复制工作区路径\n${t.workDir}`}>
+            <Tooltip content="复制工作区路径">
               <Button
                 variant="ghost"
                 size="sm"
                 className={BTN_CLS}
                 onClick={() => void copyPath(t.workDir)}
               >
-                <Copy className="size-3" />
-                复制路径
+                <Copy className="size-3.5" />
               </Button>
             </Tooltip>
             {renderPreviewForRepo(t.repoPath)}
           </>
         );
-        return multi ? (
+        return (
           <div
             key={t.repoPath}
-            className="inline-flex items-center gap-0.5 rounded-md border border-border/50 px-1 py-0.5"
+            className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/50 px-2 py-1"
           >
-            {groupInner}
-          </div>
-        ) : (
-          <div key={t.repoPath} className="contents">
-            {groupInner}
+            {/* 单行：项目短名（截断）+ 分支 chip（可切换）+ 分隔线 + 操作按钮（不换行） */}
+            <span className="min-w-0 max-w-36 truncate text-[11px] font-medium text-foreground">
+              {t.shortName}
+            </span>
+            <BranchSwitcher
+              task={task}
+              repoPath={t.repoPath}
+              variant="chip"
+              warning="切到非任务相关分支可能会有一些未知问题，请谨慎操作"
+            />
+            <span className="h-3 w-px shrink-0 bg-border" />
+            <div className="flex shrink-0 items-center gap-0.5">{actions}</div>
           </div>
         );
       })}
@@ -379,75 +329,22 @@ export const WorkspaceActions = ({ task }: Props) => {
       {orphanCandidates.map((c) => {
         const orphanInner = (
           <>
-            {multi && (
-              <span className="px-1 text-[11px] text-muted-foreground">
-                {c.repoPath.split("/").filter(Boolean).pop()}
-              </span>
-            )}
+            <span className="px-1 text-[11px] text-muted-foreground">
+              {c.repoPath.split("/").filter(Boolean).pop()}
+            </span>
             {renderPreviewForRepo(c.repoPath)}
           </>
         );
-        return multi ? (
+        return (
           <div
             key={`orphan-${c.repoPath}`}
-            className="inline-flex items-center gap-0.5 rounded-md border border-border/50 px-1 py-0.5"
+            className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/50 px-2 py-1"
           >
-            {orphanInner}
-          </div>
-        ) : (
-          <div key={`orphan-${c.repoPath}`} className="contents">
             {orphanInner}
           </div>
         );
       })}
 
-      {/* 需求群：task 级入口（不挂产物栏）——建/取群并打开飞书；日常任务隐藏 */}
-      {showRequirementGroup && (
-        <Tooltip content="创建或加入需求群">
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            disabled={ensuringGroup}
-            onClick={() => {
-              if (ensuringGroup) return;
-              setEnsuringGroup(true);
-              void runEnsureGroup(task.id).finally(() =>
-                setEnsuringGroup(false),
-              );
-            }}
-          >
-            {ensuringGroup ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <Users className="size-3" />
-            )}
-            需求群
-          </Button>
-        </Tooltip>
-      )}
-
-      {/* 用系统文件管理器打开任务数据目录——整条操作栏最后；无仓任务也只剩这一颗 */}
-      {taskDirPath && (
-        <Tooltip
-          content={`在文件管理器打开任务文件夹（artifact / workspace 产出都在这）\n${taskDirPath}`}
-        >
-          <Button
-            variant="ghost"
-            size="sm"
-            className={BTN_CLS}
-            disabled={openingTaskDir}
-            onClick={() => void openTaskFolder()}
-          >
-            {openingTaskDir ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <FolderOpen className="size-3" />
-            )}
-            任务文件夹
-          </Button>
-        </Tooltip>
-      )}
     </div>
   );
 };
@@ -461,9 +358,8 @@ const PreviewLogPopover = ({ slot }: { slot: PreviewSlotStatus }) => (
         <PopoverTrigger
           render={
             <Button variant="ghost" size="sm" className={BTN_CLS}>
-              <FileTerminal className="size-3" />
-              日志
-            </Button>
+            <FileTerminal className="size-3.5" />
+          </Button>
           }
         />
       </span>

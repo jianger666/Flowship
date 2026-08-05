@@ -506,7 +506,11 @@ const eventsForStreamRender = (
   events: TaskEvent[],
   isChat: boolean,
 ): TaskEvent[] => {
-  const base = events.filter((e) => !isAskSkipMarkerEvent(e));
+  // muted 事件 = 交卷 / 提问成功后被平台消音的模型输出（thinking / 正文 / 工具），
+  // 落盘留审计、UI 一律不渲染（live SSE 与回放分页共用此过滤）
+  const base = events.filter(
+    (e) => !isAskSkipMarkerEvent(e) && e.meta?.muted !== true,
+  );
   return isChat
     ? base.filter((e) => !isChatStartupNoiseInfo(e) && !isBootStageInfo(e))
     : base;

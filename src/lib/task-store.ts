@@ -265,29 +265,36 @@ export const setTaskRepoPaths = async (
 };
 
 /**
- * V0.8：读 chat 工作目录（repoPaths[0]）的本地 git 分支状态（GET /api/tasks/[id]/branches）
- * 非 git 仓返回 isRepo=false、调用方据此隐藏分支选择器。
+ * V0.8：读某仓工作目录的本地 git 分支状态（GET /api/tasks/[id]/branches）
+ * 带 repoPath = task 模式按仓；缺省 = chat 单仓。非 git 仓返回 isRepo=false。
  */
 export const fetchTaskBranches = async (
   id: string,
+  repoPath?: string,
 ): Promise<GitBranchState> => {
-  const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/branches`);
+  const q = repoPath
+    ? `?repoPath=${encodeURIComponent(repoPath)}`
+    : "";
+  const res = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/branches${q}`,
+  );
   const data = await handleJson<{ state: GitBranchState }>(res);
   return data.state;
 };
 
 /**
- * V0.8：切 chat 工作目录的 git 分支（POST /api/tasks/[id]/branches、body {branch}）
- * 成功返回切换后的最新分支状态；失败（分支冲突 / 工作区脏）抛 git stderr。
+ * V0.8：切某仓工作目录的 git 分支（POST /api/tasks/[id]/branches、body {branch, repoPath?}）
+ * 带 repoPath = task 模式按仓切；缺省 = chat 单仓。成功返回切换后的最新分支状态。
  */
 export const checkoutTaskBranch = async (
   id: string,
   branch: string,
+  repoPath?: string,
 ): Promise<GitBranchState> => {
   const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/branches`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ branch }),
+    body: JSON.stringify({ branch, ...(repoPath ? { repoPath } : {}) }),
   });
   const data = await handleJson<{ ok: true; state: GitBranchState }>(res);
   return data.state;

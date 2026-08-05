@@ -72,7 +72,7 @@ export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
         onClick={() => setOpen(true)}
       >
         <Plug />
-        MCP servers
+        MCP
         <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
           {enabledCount}/{availableServers.length}
         </span>
@@ -81,7 +81,7 @@ export const TaskMcpPanel = ({ task, onTaskUpdate }: TaskMcpPanelProps) => {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>MCP servers</DialogTitle>
+            <DialogTitle>MCP</DialogTitle>
             <DialogDescription>
               选本任务启用哪些 MCP
             </DialogDescription>

@@ -26,13 +26,10 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import {
-  ExternalLink,
   Flag,
   Loader2,
-  Lock,
   Pencil,
   RotateCcw,
-  ScrollText,
   Sparkles,
   XCircle,
   Zap,
@@ -50,6 +47,7 @@ import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
+import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
 import { TaskTalkComposer } from "@/components/tasks/task-talk-composer";
 import { WorkspaceActions } from "@/components/tasks/workspace-actions";
 import { Badge } from "@/components/ui/badge";
@@ -97,15 +95,12 @@ import {
 } from "@/lib/task-terminal";
 import {
   actionDisplayLabel,
-  MR_KIND_LABEL,
   REPO_STATUS_LABEL,
   REPO_STATUS_VARIANT,
   RUN_STATUS_LABEL,
   RUN_STATUS_VARIANT,
   deriveEffectiveBatches,
   isStopButtonVisible,
-  mrKindOf,
-  mrTargetBranchOf,
 } from "@/lib/task-display";
 import {
   getEffectiveCwd,
@@ -168,14 +163,6 @@ const TaskDetailPage = () => {
   const [stopping, setStopping] = useState(false);
   // V0.6.6「编辑任务」dialog 开关（改角色 / 标题 / 飞书链接 / 模型 / 工作分支）
   const [editDialogOpen, setEditDialogOpen] = useState(false);
-  // 当前 artifact 文件名：ArtifactPanel 上报、透传给工作区 Header 显示（filename 归 Header）
-  const [artifactFilename, setArtifactFilename] = useState<string | null>(null);
-  const handleArtifactMeta = useCallback(
-    (meta: { filename: string } | null) => {
-      setArtifactFilename(meta?.filename ?? null);
-    },
-    [],
-  );
   // 全局 confirm hook（终结任务 / 停止 / 划除二次确认用）
   const { confirm } = useDialog();
   // 侧栏全局任务列表：把当前任务关键状态同步进去（侧栏运行态实时 + 触发条件轮询）
@@ -828,7 +815,7 @@ const TaskDetailPage = () => {
                 ) : null}
                 {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
                 {task.runStatus !== "running" && (
-                  <Tooltip content="编辑任务：标题 / 飞书链接 / 工作分支">
+              <Tooltip content="编辑任务：标题 / 飞书链接 / 工作分支">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -840,227 +827,84 @@ const TaskDetailPage = () => {
                   </Tooltip>
                 )}
               </div>
-              <Tooltip content={task.repoPaths.join("\n")}>
-                <div className="min-w-0 max-w-full text-xs text-muted-foreground">
-                {task.repoPaths.length > 0 ? (
-                  <span className="flex min-w-0 max-w-full flex-wrap items-center gap-x-1">
-                    {task.repoPaths.map((p, i) => {
-                      const readonly = (task.readonlyRepoPaths ?? []).includes(p);
-                      const script = (task.scriptRepoPaths ?? []).includes(p);
-                      const label =
-                        task.repoPaths.length === 1
-                          ? p
-                          : p.replace(/\/+$/, "").split("/").pop() || p;
-                      return (
-                        <span
-                          key={p}
-                          className="inline-flex min-w-0 max-w-full items-center gap-0.5"
-                        >
-                          {i > 0 && <span className="text-muted-foreground">+</span>}
-                          <span className="min-w-0 max-w-full truncate">
-                            {label}
-                          </span>
-                          {readonly && (
-                            <Tooltip content="只读仓库">
-                              <span className="inline-flex">
-                                <Lock
-                                  className="size-3 text-muted-foreground"
-                                  aria-label="只读仓库"
-                                />
-                              </span>
-                            </Tooltip>
-                          )}
-                          {script && (
-                            <Tooltip content="脚本仓">
-                              <span className="inline-flex">
-                                <ScrollText
-                                  className="size-3 text-muted-foreground"
-                                  aria-label="脚本仓"
-                                />
-                              </span>
-                            </Tooltip>
-                          )}
-                        </span>
-                      );
-                    })}
-                  </span>
-                ) : (
-                  "(未绑仓库、agent 在 home 跑)"
-                )}
-                {(task.gitBranches?.length ?? 0) > 0 && task.gitBranches?.[0]?.name ? (
-                  <Tooltip
-                    content={task.gitBranches
-                      .map((b) =>
-                        isTestingRequirementTask(task)
-                          ? `${b.repoPath.split("/").pop()}: ${b.name}${b.headCommit ? ` @ ${b.headCommit.slice(0, 12)}` : ""}`
-                          : `${b.repoPath.split("/").pop()}: based on ${b.baseBranch || "?"}`,
-                      )
-                      .join("\n")}
-                  >
-                    <span className="ml-2 font-mono">
-                      @ {task.gitBranches[0].name}
-                      {task.gitBranches.length > 1 && (
-                        <span className="ml-1 text-muted-foreground">
-                          ({task.gitBranches.length} 仓)
-                        </span>
-                      )}
-                    </span>
-                  </Tooltip>
-                ) : isTestingRequirementTask(task) ? (
-                  // 测试任务：gitBranches 未写入前，用 repoFeatureBranches 兜底展示被测分支
-                  (() => {
-                    const configured = task.repoPaths
-                      .map((p) => task.repoFeatureBranches?.[p]?.trim())
-                      .filter((b): b is string => !!b);
-                    if (configured.length === 0) return null;
-                    return (
-                      <Tooltip content="任务配置的被测业务分支">
-                        <span className="ml-2 font-mono">
-                          @ {configured[0]}
-                          {configured.length > 1 && (
-                            <span className="ml-1 text-muted-foreground">
-                              ({configured.length} 仓)
-                            </span>
-                          )}
-                        </span>
-                      </Tooltip>
-                    );
-                  })()
-                ) : null}
-                </div>
-              </Tooltip>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
                   ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
               <WorkspaceActions task={task} />
-              {/* V0.6.1：MR 链接（ship action 落档后展示、多仓 task 平铺多条） */}
-              {task.mrs.length > 0 && (
-                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  {task.mrs.map((mr) => {
-                    const tail =
-                      mr.repoPath.split("/").filter(Boolean).pop() ?? mr.repoPath;
-                    const versionTag = mr.version > 1 ? ` v${mr.version}` : "";
-                    // V0.x：标注提测 / 联调（同仓提测 MR→test 和联调 MR→dev 可并存、按目标分支区分）
-                    const kind = mrKindOf(
-                      mr,
-                      task.repoTestBranches,
-                      task.repoDevBranches,
-                    );
-                    const target = mrTargetBranchOf(mr, task.repoTestBranches);
-                    return (
-                      <Tooltip
-                        key={`${mr.repoPath}-${target}-${mr.version}`}
-                        content={`${MR_KIND_LABEL[kind]} → ${target}\n${mr.title}\n${mr.url}\nstatus: ${mr.status}`}
-                      >
-                        <a
-                          href={mr.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline"
-                        >
-                          <ExternalLink className="size-3" />
-                          <Badge variant="outline" size="xs" className="font-normal">
-                            {MR_KIND_LABEL[kind]}
-                          </Badge>
-                          {tail}
-                          {versionTag}
-                        </a>
-                      </Tooltip>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           </div>
 
           {/* 主操作区 */}
           <div className="flex items-center gap-2">
             {canAdvance && (
-              <Tooltip content="推进任务：选下一个 action（plan / build / review / ship / dev）">
-                <span className="inline-flex">
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={() => setAdvanceDialogOpen(true)}
-                    disabled={starting}
-                  >
-                    {starting ? <Loader2 className="animate-spin" /> : <Zap />}
-                    推进
-                  </Button>
-                </span>
-              </Tooltip>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => setAdvanceDialogOpen(true)}
+                disabled={starting}
+              >
+                {starting ? <Loader2 className="animate-spin" /> : <Zap />}
+                推进
+              </Button>
             )}
             {canFinalize && (
               <>
-                <Tooltip content="已合入 main、终结本任务">
-                  <span className="inline-flex">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleFinalize("merged")}
-                      disabled={starting}
-                    >
-                      <Flag />
-                      已合入
-                    </Button>
-                  </span>
-                </Tooltip>
-                <Tooltip content="放弃本任务、终结 run">
-                  <span className="inline-flex">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleFinalize("abandoned")}
-                      disabled={starting}
-                      className="text-muted-foreground hover:text-destructive"
-                    >
-                      <XCircle />
-                      放弃
-                    </Button>
-                  </span>
-                </Tooltip>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleFinalize("merged")}
+                  disabled={starting}
+                >
+                  <Flag />
+                  已合入
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleFinalize("abandoned")}
+                  disabled={starting}
+                  className="text-muted-foreground hover:text-destructive"
+                >
+                  <XCircle />
+                  放弃
+                </Button>
               </>
             )}
             {isStopButtonVisible(task) && !canAck && (
               // 转圈 +「停止」合体：运行中一体按钮、hover 变红；stopping 防双击
-              <Tooltip content="停止当前 action（中断 agent、可重新推进）">
-                <span className="inline-flex">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleStop}
-                    disabled={stopping}
-                    className="text-muted-foreground hover:text-destructive"
-                  >
-                    <Loader2 className="animate-spin" />
-                    停止
-                  </Button>
-                </span>
-              </Tooltip>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleStop}
+                disabled={stopping}
+                className="text-muted-foreground hover:text-destructive"
+              >
+                <Loader2 className="animate-spin" />
+                停止
+              </Button>
             )}
             {canReopen && (
-              <Tooltip content="恢复任务：拉回开发中、可重新推进">
-                <span className="inline-flex">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleReopen}
-                    disabled={starting}
-                  >
-                    {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-                    恢复
-                  </Button>
-                </span>
-              </Tooltip>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleReopen}
+                disabled={starting}
+              >
+                {starting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+                恢复
+              </Button>
             )}
           </div>
         </div>
 
-        {/* 上下文文档 + MCP + 批次：都是 chip + 点开 dialog、同一行、不各占一行 */}
+        {/* 任务级辅助入口同排：弹窗触发 chip（任务上下文 / MCP / 分批）+ 竖分隔线 +
+            执行型按钮（需求群 / 任务文件夹）——按交互类型分组 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <ContextDocsPanel task={task} onTaskUpdate={absorbTask} />
           <TaskMcpPanel task={task} onTaskUpdate={absorbTask} />
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
           <BatchProgress task={task} />
+          <div className="h-4 w-px shrink-0 bg-border" />
+          <TaskUtilityActions task={task} />
         </div>
         {/* 提测收件箱提醒条：本需求（feishuStoryUrl 对应工作项）有未读待测 MR 时挂出 */}
         <MrInboxTaskBanner feishuStoryUrl={task.feishuStoryUrl} className="mt-3" />
@@ -1090,19 +934,16 @@ const TaskDetailPage = () => {
             <div className="flex h-full flex-col">
               <ActionWorkbenchHeader
                 actions={task.actions}
-                selectedAction={selectedAction}
                 selectedActionId={selectedActionId}
                 onSelectAction={setSelectedActionId}
                 onToggleExclude={handleToggleExclude}
-                artifactFilename={artifactFilename}
               />
               <div className="min-h-0 flex-1">
                 {selectedAction ? (
                   <ArtifactPanel
                     // P1：按 action.id remount——切 action 时彻底重置内部产物状态
                     // （content/revisions/diff/filename），避免「Header 身份已切到新
-                    // action、正文/filename 还停在旧 action」的错误配对；卸载时回调
-                    // 上报 filename=null、Header 同步进入过渡态。
+                    // action、正文/filename 还停在旧 action」的错误配对。
                     key={selectedAction.id}
                     action={selectedAction}
                     taskId={task.id}
@@ -1140,7 +981,6 @@ const TaskDetailPage = () => {
                       );
                       if (target) setSelectedActionId(target.id);
                     }}
-                    onArtifactMetaChange={handleArtifactMeta}
                     canShareToGroup={!isLightweightDailyTask(task)}
                   />
                 ) : (

@@ -35,7 +35,6 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
   DialogContent,
@@ -50,8 +49,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { useImageAttach } from "@/hooks/use-image-attach";
 import { addContextDoc, removeContextDoc } from "@/lib/task-store";
 import type { Task, TaskContextDoc, TaskContextDocType } from "@/lib/types";
-
-const TITLE_PRESETS: string[] = ["后端技术方案"];
 
 const renderTypeIcon = (type: TaskContextDocType) => {
   switch (type) {
@@ -210,7 +207,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
         onClick={() => setOpen(true)}
       >
         <Notebook />
-        上下文文档
+        任务上下文
         <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
           {docs.length}
         </span>
@@ -323,7 +320,7 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
           ) : (
             <>
           <DialogHeader>
-            <DialogTitle>上下文文档</DialogTitle>
+            <DialogTitle>任务上下文</DialogTitle>
             <DialogDescription>
               agent 启动时会看到清单、按需读取（点条目看全文）
             </DialogDescription>
@@ -418,22 +415,8 @@ export const ContextDocsPanel = ({ task, onTaskUpdate }: Props) => {
                 id="ctx-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="如：后端技术方案 / 设计稿 / 开发补充（仅贴图可省）"
+                placeholder="如：后端技术方案 / 设计稿 / 开发补充"
               />
-              {TITLE_PRESETS.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 pt-1">
-                  {TITLE_PRESETS.map((preset) => (
-                    <ChoiceButton
-                      key={preset}
-                      shape="chip"
-                      selected={title === preset}
-                      onClick={() => setTitle(preset)}
-                    >
-                      {preset}
-                    </ChoiceButton>
-                  ))}
-                </div>
-              )}
             </div>
 
             <div className="grid gap-1.5">

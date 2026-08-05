@@ -1018,6 +1018,8 @@ export interface GitBranchState {
   current: string | null;
   /** 本地分支名列表（不含 remote、按最近提交倒序） */
   branches: string[];
+  /** task 隔离 worktree 尚未建好（任务未启动 / worktree 已清）——只读提示、禁止切换 */
+  worktreeMissing?: boolean;
 }
 
 /**

@@ -23,7 +23,7 @@ import { Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 import { ChatModelPicker } from "@/components/tasks/chat-model-picker";
-import { ChatBranchPicker } from "@/components/tasks/chat-branch-picker";
+import { BranchSwitcher } from "@/components/tasks/branch-switcher";
 import {
   ChatWorkdirPicker,
   type ChatWorkdirPickerHandle,
@@ -712,7 +712,7 @@ export const ChatView = ({
                 task={task}
                 onTaskUpdate={onTaskUpdate}
               />
-              <ChatBranchPicker task={task} />
+              <BranchSwitcher task={task} variant="select" />
               <ChatMcpPicker task={task} onTaskUpdate={onTaskUpdate} />
             </>
           }

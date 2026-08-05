@@ -63,66 +63,49 @@ const ActionChip = ({
   const isExcluded = action.excluded === true;
   // timeline 只表达「正在查看」和「是否划除」：
   // action 运行状态会被长 shell 等待放大成噪音，不在导航条里再额外染色。
-  // postCheck 未过：列表上一眼可见的警示标（详情在 title、面板正文有完整红条）
+  // postCheck 未过：列表上一眼可见的警示标（详情在警示标 tooltip、面板正文有完整红条）
   const postCheckFailed = action.postCheck?.passed === false;
   const postCheckSummary = postCheckFailed
     ? action.postCheck!.details.split("\n")[0]!.slice(0, 120)
     : "";
-  const titleParts = [
-    `#${action.n} ${actionDisplayLabel(action, "short")}`,
-  ];
-  if (isSelected) {
-    titleParts.push("当前正在查看");
-  }
-  if (isExcluded) {
-    titleParts.push("已划除、不进 agent 上下文");
-  }
-  if (postCheckFailed) {
-    titleParts.push(`后置检查未通过：${postCheckSummary}`);
-  }
-  const title =
-    titleParts.length > 1
-      ? `${titleParts[0]}（${titleParts.slice(1).join("、")}）`
-      : titleParts[0];
   return (
     <div className="group/chip relative inline-flex items-center">
-      <Tooltip content={title}>
-        <ChoiceButton
-          shape="tab"
-          selected={isSelected}
-          onClick={() => onSelectAction(action.id)}
+      {/* 主 chip 不再包 tooltip——chip 上的文字本身就是标签、悬停提示冗余 */}
+      <ChoiceButton
+        shape="tab"
+        selected={isSelected}
+        onClick={() => onSelectAction(action.id)}
+        className={cn(
+          "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
+          // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
+          // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
+          // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
+          // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
+          isSelected && "text-foreground ring-1 ring-ring/70",
+          isExcluded && "line-through opacity-60",
+        )}
+      >
+        <span
           className={cn(
-            "flex items-center gap-1 text-foreground/85 hover:bg-muted/50 hover:text-foreground",
-            // 当前查看 = ring 描边 + 正文色提亮（底色由 ChoiceButton tab 的 bg-selected 给）。
-            // 原来这里单独引了一套靛蓝、是全站唯一的第三种彩色体系，收编回全局选中态规范。
-            // ring 是 box-shadow、不占盒模型；不加 border / 不改 padding / 不改字重 ⇒
-            // 选中前后宽高完全一致、点击切换不抖动（这个结构决策保留不动）。
-            isSelected && "text-foreground ring-1 ring-ring/70",
-            isExcluded && "line-through opacity-60",
+            "text-[11px] text-muted-foreground/80",
+            isSelected && "text-foreground/70",
           )}
         >
-          <span
-            className={cn(
-              "text-[11px] text-muted-foreground/80",
-              isSelected && "text-foreground/70",
-            )}
-          >
-            #{action.n}
-          </span>
-          {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
-          <span>{actionDisplayLabel(action, "short")}</span>
-          {postCheckFailed && (
-            <Tooltip content={postCheckSummary}>
-              <span className="inline-flex">
-                <AlertTriangle
-                  className="size-3 text-destructive"
-                  aria-label="后置检查未通过"
-                />
-              </span>
-            </Tooltip>
-          )}
-        </ChoiceButton>
-      </Tooltip>
+          #{action.n}
+        </span>
+        {/* 注意：选中态不改 font-weight——medium 比 normal 宽、会让 chip 变宽触发抖动 */}
+        <span>{actionDisplayLabel(action, "short")}</span>
+        {postCheckFailed && (
+          <Tooltip content={postCheckSummary}>
+            <span className="inline-flex">
+              <AlertTriangle
+                className="size-3 text-destructive"
+                aria-label="后置检查未通过"
+              />
+            </span>
+          </Tooltip>
+        )}
+      </ChoiceButton>
       {onToggleExclude && (
         <Tooltip
           content={

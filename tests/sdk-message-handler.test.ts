@@ -17,11 +17,20 @@ type WriteOwnedFn = (
   event: WrittenEvent,
 ) => Promise<void>;
 
+type AppendEventFn = (
+  taskId: string,
+  event: WrittenEvent,
+  lease?: () => boolean,
+  onCommitted?: (event: unknown) => void,
+) => Promise<unknown>;
+
 const writeOwnedEventAndPublish = vi.fn<WriteOwnedFn>(async () => {});
+const appendEvent = vi.fn<AppendEventFn>(async () => null);
 
 vi.mock("@/lib/server/task-fs", () => ({
   getTask: vi.fn(),
   patchActionIfOwner: vi.fn(),
+  appendEvent,
 }));
 
 vi.mock("@/lib/server/failpoints", () => ({
@@ -59,6 +68,8 @@ vi.mock("@/lib/server/tool-result-persist", () => ({
 
 const {
   handleSdkMessage,
+  maybeEmitSubmitFixedText,
+  SUBMIT_COMPLETED_TEXT,
   __resetToolCallRunningSeenForTest,
 } = await import("@/lib/server/sdk-message-handler");
 
@@ -78,6 +89,247 @@ const toolResultEvents = (): WrittenEvent[] =>
   writeOwnedEventAndPublish.mock.calls
     .map((c) => c[2])
     .filter((e): e is WrittenEvent => e != null && e.kind === "tool_result");
+
+/** 消音审计落盘（appendEvent）里的事件 */
+const mutedEvents = (): WrittenEvent[] =>
+  appendEvent.mock.calls
+    .map((c) => c[1])
+    .filter((e) => e.meta?.muted === true);
+
+describe("handleSdkMessage 交卷后消音 + 固定收尾", () => {
+  beforeEach(() => {
+    writeOwnedEventAndPublish.mockClear();
+    appendEvent.mockClear();
+    __resetToolCallRunningSeenForTest();
+  });
+
+  const submitWorkCompleted = (result: string) =>
+    ({
+      type: "tool_call",
+      call_id: "call-submit",
+      name: "mcp",
+      status: "completed",
+      args: { providerIdentifier: "flowshipChat", toolName: "submit_work" },
+      result,
+    }) as never;
+
+  it("交卷成功（[SUBMITTED]）后：thinking / assistant 带 muted 标记落盘，固定收尾只补一次", async () => {
+    const ctx = { buffer: "", flush: async () => {}, submitSeen: false };
+
+    // 交卷前的正常正文仍进 buffer
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "正文结论" }],
+        },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.buffer).toContain("正文结论");
+
+    await handleSdkMessage("task-1", submitWorkCompleted("[SUBMITTED] action=act_1 已交卷、系统正在后台跑质量检查"), ctx, leaseOk);
+    expect(ctx.submitSeen).toBe(true);
+
+    // 交卷后的 thinking / assistant 照常落盘（appendEvent、不广播）、带 muted 标记
+    await handleSdkMessage("task-1", { type: "thinking", text: "系统提示用户继续。" } as never, ctx, leaseOk);
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "The answer is complete. Turn complete." }],
+        },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.buffer).not.toContain("Turn complete");
+    const mutedThinking = mutedEvents().filter((e) => e.kind === "thinking");
+    expect(mutedThinking).toHaveLength(1);
+    const mutedAssistant = mutedEvents().filter(
+      (e) =>
+        e.kind === "assistant_message" &&
+        (e.text ?? "").includes("Turn complete"),
+    );
+    expect(mutedAssistant).toHaveLength(1);
+    // 无未标记（会渲染）的交卷后输出；muted 事件只走 appendEvent、不碰 SSE 广播
+    expect(
+      writeOwnedEventAndPublish.mock.calls.some(
+        (c) =>
+          (c[2].kind === "thinking" || c[2].kind === "assistant_message") &&
+          c[2].meta?.muted !== true &&
+          c[2].text !== SUBMIT_COMPLETED_TEXT,
+      ),
+    ).toBe(false);
+    expect(writeOwnedEventAndPublish.mock.calls.some((c) => c[2].kind === "thinking")).toBe(false);
+
+    // 交卷成功一刻：固定收尾立即补发一次、内容平台固定、不含「交卷」术语
+    const fixedEvents = writeOwnedEventAndPublish.mock.calls
+      .map((c) => c[2])
+      .filter(
+        (e) =>
+          e.kind === "assistant_message" &&
+          e.text === SUBMIT_COMPLETED_TEXT,
+      );
+    expect(fixedEvents).toHaveLength(1);
+    expect(fixedEvents[0]!.text).not.toMatch(/交卷|submit_work/i);
+
+    // 重复调用不再补发
+    const wroteAgain = await maybeEmitSubmitFixedText(ctx, async () => {});
+    expect(wroteAgain).toBe(false);
+  });
+
+  it("交卷失败（未受理）不消音：模型后续正文仍正常缓冲", async () => {
+    const ctx = { buffer: "", flush: async () => {}, submitSeen: false };
+
+    await handleSdkMessage(
+      "task-1",
+      submitWorkCompleted("交卷未受理：MR claim 在飞超时、请稍后重试 submit_work"),
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.submitSeen).toBe(false);
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "交卷没成功，我重试一下。" }],
+        },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.buffer).toContain("交卷没成功");
+  });
+
+  it("提问成功（[ASK_SUBMITTED]）后：thinking / 正文 / 工具带 muted 标记落盘、不补固定文案", async () => {
+    const ctx = { buffer: "", flush: async () => {}, askSeen: false };
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-ask",
+        name: "mcp",
+        status: "completed",
+        args: { providerIdentifier: "flowshipChat", toolName: "ask_user" },
+        result: "[ASK_SUBMITTED] 问题组 ask_x 已推送给用户（UI 答题卡）。",
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.askSeen).toBe(true);
+
+    // 提问后的 thinking / 正文 / 工具照常落盘（appendEvent、不广播）、全部带 muted 标记
+    await handleSdkMessage("task-1", { type: "thinking", text: "系统提示用户继续。" } as never, ctx, leaseOk);
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "正在查看用户对答题卡的回复。" }],
+        },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-read",
+        name: "read",
+        status: "running",
+        args: { path: "/some/events.jsonl" },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-read",
+        name: "read",
+        status: "completed",
+        args: { path: "/some/events.jsonl" },
+        result: "ok",
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.buffer).not.toContain("正在查看");
+    const mutedThinking = mutedEvents().filter((e) => e.kind === "thinking");
+    expect(mutedThinking).toHaveLength(1);
+    const mutedAssistant = mutedEvents().filter(
+      (e) =>
+        e.kind === "assistant_message" &&
+        (e.text ?? "").includes("正在查看"),
+    );
+    expect(mutedAssistant).toHaveLength(1);
+    // 提问后的工具调用带 muted 标记（call-read）
+    const mutedToolCalls = mutedEvents().filter(
+      (e) => e.kind === "tool_call" && e.meta?.callId === "call-read",
+    );
+    expect(mutedToolCalls).toHaveLength(1);
+    // 不补任何固定文案：除消音正文外没有其他未标记 assistant_message
+    expect(
+      writeOwnedEventAndPublish.mock.calls.some(
+        (c) =>
+          c[2].kind === "assistant_message" && c[2].meta?.muted !== true,
+      ),
+    ).toBe(false);
+    // 消音事件不经过 SSE 广播（writeOwnedEventAndPublish 里不应有任何 muted 标记事件；
+    // ask_user 自身那次正常 tool_result 仍走广播、属预期）
+    expect(
+      writeOwnedEventAndPublish.mock.calls.some(
+        (c) => c[2].meta?.muted === true,
+      ),
+    ).toBe(false);
+  });
+
+  it("提问失败（未受理）不消音：模型后续正文仍正常缓冲", async () => {
+    const ctx = { buffer: "", flush: async () => {}, askSeen: false };
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "tool_call",
+        call_id: "call-ask-fail",
+        name: "mcp",
+        status: "completed",
+        args: { providerIdentifier: "flowshipChat", toolName: "ask_user" },
+        result: "交卷未受理：任务当前没有活跃会话桥、请结束本轮回复",
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.askSeen).toBe(false);
+
+    await handleSdkMessage(
+      "task-1",
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "提问没成功，我重试一下。" }],
+        },
+      } as never,
+      ctx,
+      leaseOk,
+    );
+    expect(ctx.buffer).toContain("提问没成功");
+  });
+});
 
 beforeEach(() => {
   writeOwnedEventAndPublish.mockClear();

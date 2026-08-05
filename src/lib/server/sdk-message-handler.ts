@@ -12,7 +12,7 @@
 
 import type { SDKMessage } from "@cursor/sdk";
 
-import { getTask, patchActionIfOwner } from "./task-fs";
+import { appendEvent, getTask, patchActionIfOwner } from "./task-fs";
 import { failpoint } from "./failpoints";
 import {
   publish,
@@ -23,12 +23,40 @@ import {
 } from "./task-stream";
 import { buildToolResultMeta } from "./tool-result-persist";
 
+/**
+ * 交卷成功后的固定收尾文案（AI 播报形态、内容平台统一固定）。
+ * 不出现「交卷 / submit_work」等内部术语——用户只需要知道「产出已更新、等审阅」。
+ * 模型交卷后再输出的任何文本都不再上屏、回合自然结束时由平台补发这一句。
+ */
+export const SUBMIT_COMPLETED_TEXT = "已完成，产出已更新，请审阅。";
+
 // assistant 文本的流式缓冲：delta 先 publish 给 UI 打字机、攒到下个非 assistant 消息时 flush 落盘
 export interface AssistantBufferCtx {
   buffer: string;
   flush: () => Promise<void>;
   sdkErrorMessage?: string;
+  /** 本回合已交卷成功（submit_work 返回 [SUBMITTED] / [NO_WAIT_NEEDED]）：之后模型输出消音、由固定收尾代替 */
+  submitSeen?: boolean;
+  /** 固定收尾是否已补发（防重复） */
+  fixedSent?: boolean;
+  /** 本回合已提问成功（ask_user 返回 [ASK_SUBMITTED]）：之后模型输出（含工具）全部消音（答题卡即收尾） */
+  askSeen?: boolean;
 }
+
+/**
+ * 补发固定收尾（交卷成功才补、一次）。
+ * 主调用点：流内 submit_work 成功返回那一刻立即补发（用户不等 run 结束就能看到收尾）；
+ * task-runner / chat-runner 在 run 自然结束时保留兜底调用——once 守卫保证只发一次。
+ */
+export const maybeEmitSubmitFixedText = async (
+  ctx: AssistantBufferCtx,
+  write: (ev: { kind: "assistant_message"; text: string }) => Promise<unknown>,
+): Promise<boolean> => {
+  if (!ctx.submitSeen || ctx.fixedSent) return false;
+  ctx.fixedSent = true;
+  await write({ kind: "assistant_message", text: SUBMIT_COMPLETED_TEXT });
+  return true;
+};
 
 // ----------------- tool_call running 去重（同 callId 只落一条） -----------------
 // SDK 对长 args 工具（task / edit）会流式补全 args、对同一 call_id 发多次 status=running；
@@ -162,6 +190,8 @@ const emitToolResult = async (
   stillCurrent: () => boolean,
   /** 旁路 run 身份（属主主链 undefined）——见 handleSdkMessage 的 origin 参数 */
   origin?: string,
+  /** 消音审计：事件照常落盘但带 muted 标记、UI 不渲染 */
+  muted?: boolean,
 ): Promise<void> => {
   try {
     const meta = await buildToolResultMeta({
@@ -179,16 +209,18 @@ const emitToolResult = async (
       meta.status === "error"
         ? `工具失败 ${meta.name}`
         : `工具完成 ${meta.name}`;
-    await writeOwnedEventAndPublish(
-      taskId,
-      stillCurrent,
-      {
-        kind: "tool_result",
-        text: summary,
-        meta,
-      },
-      origin,
-    );
+    const event = {
+      kind: "tool_result" as const,
+      text: summary,
+      meta: muted ? { ...meta, muted: true } : meta,
+    };
+    if (muted) {
+      // 消音审计：只落盘、不 SSE 广播——广播会让前端每来一条 muted chunk 重渲染整条
+      // 事件流、贴底跟随反复触发（和用户上滚打架 = 高频抖动，实测回归）
+      await appendEvent(taskId, event, stillCurrent);
+    } else {
+      await writeOwnedEventAndPublish(taskId, stillCurrent, event, origin);
+    }
   } catch (err) {
     console.warn(
       `[sdk-message-handler] emitToolResult 失败 task=${taskId} call=${msg.call_id}`,
@@ -232,6 +264,22 @@ export const handleSdkMessage = async (
     case "thinking": {
       await assistantCtx.flush();
       if (!stillCurrent()) return;
+      // 交卷 / 提问成功后模型仍在 thinking（常是对宿主「Please continue」的反应）——
+      // 照常落盘但带 muted 标记（审计保留、UI 不渲染）
+      if (assistantCtx.submitSeen || assistantCtx.askSeen) {
+        // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
+        await appendEvent(taskId, {
+          kind: "thinking",
+          text: msg.text,
+          meta: {
+            ...(msg.thinking_duration_ms
+              ? { durationMs: msg.thinking_duration_ms }
+              : {}),
+            muted: true,
+          },
+        }, stillCurrent);
+        break;
+      }
       await writeEv({
         kind: "thinking",
         text: msg.text,
@@ -248,6 +296,49 @@ export const handleSdkMessage = async (
       const argsAny = (msg.args ?? {}) as Record<string, unknown>;
       const innerToolName =
         typeof argsAny.toolName === "string" ? argsAny.toolName : "";
+      // 已交卷 / 已提问成功后：本回合剩余工具全部消音（照常落盘带 muted 标记、审计保留）——
+      // 模型若把宿主 Please continue 当用户消息去调查 / 重问，痕迹留在 events.jsonl、UI 不渲染；
+      // 不走 artifact 面板 / ask 检测等副作用分支。
+      if (assistantCtx.submitSeen || assistantCtx.askSeen) {
+        if (msg.status === "running") {
+          if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
+          const { argsStr, truncateMax } = stringifyToolCallArgs(
+            msg.name,
+            msg.args,
+          );
+          if (!stillCurrent()) return;
+          await appendEvent(taskId, {
+            kind: "tool_call",
+            text: `调用 ${msg.name}${
+              argsStr ? `:${truncate(argsStr, 120)}` : ""
+            }`,
+            meta: {
+              callId: msg.call_id,
+              name: msg.name,
+              innerToolName: innerToolName || undefined,
+              args: argsStr ? truncate(argsStr, truncateMax) : undefined,
+              muted: true,
+            },
+          }, stillCurrent);
+        } else if (msg.status === "error") {
+          const resStr = stringifyMeta(msg.result);
+          if (!stillCurrent()) return;
+          await appendEvent(taskId, {
+            kind: "error",
+            text: `工具调用失败 ${msg.name}：${truncate(resStr, 200)}`,
+            meta: {
+              callId: msg.call_id,
+              name: msg.name,
+              result: truncate(resStr),
+              muted: true,
+            },
+          }, stillCurrent);
+          await emitToolResult(taskId, msg, stillCurrent, origin, true);
+        } else if (msg.status === "completed") {
+          await emitToolResult(taskId, msg, stillCurrent, origin, true);
+        }
+        break;
+      }
       // 必须连 MCP wrapper 一起认——漏认会把 submit_work 写成普通 tool_call、
       // 被兜底 A 误当「答后又干活」拦下（2026-06-16 线上事故根因）
       const isWaitForUser =
@@ -335,6 +426,22 @@ export const handleSdkMessage = async (
             kind: "error",
             text: `submit_work 工具调用失败：${truncate(resStr, 200)}`,
           });
+        } else if (msg.status === "completed") {
+          // 交卷成功才进「已交卷」状态：之后模型输出全部消音、固定收尾**立即**补发——
+          // 不等 run 结束（模型交卷后的 Please continue 空转被消音、但会拖慢 run 结束，
+          // 若挂在 run 结束才补发，用户会明显感知到收尾延迟）。
+          // 失败文案（未受理 / stale / busy / 无桥 / mismatch）不消音——模型还要解释怎么处理。
+          const resStr =
+            typeof msg.result === "string"
+              ? msg.result
+              : stringifyMeta(msg.result ?? {});
+          const rejected =
+            resStr.length > 0 &&
+            /交卷未受理|已被后续操作取代|没有活跃会话桥|CALLER_MISMATCH/.test(resStr);
+          if (!rejected) {
+            assistantCtx.submitSeen = true;
+            await maybeEmitSubmitFixedText(assistantCtx, (ev) => writeEv(ev));
+          }
         }
         break;
       }
@@ -376,6 +483,26 @@ export const handleSdkMessage = async (
         // Phase 1：completed 结果落盘（此前完全忽略 → shell/read 输出用户看不见）
         await emitToolResult(taskId, msg, stillCurrent, origin);
       }
+
+      // ask_user 成功（[ASK_SUBMITTED]）：进入「已提问」状态——之后全部消音（答题卡即收尾）。
+      // 放在 tool_result 落盘之后（同一条消息先走正常落盘、再置消音状态）；
+      // 失败文案（未受理 / stale / busy / 无桥 / mismatch）不消音——模型还要解释怎么处理。
+      const isAskUser =
+        innerToolName === "ask_user" ||
+        msg.name === "ask_user" ||
+        msg.name === "Ask User";
+      if (isAskUser && msg.status === "completed" && !assistantCtx.askSeen) {
+        const resStr =
+          typeof msg.result === "string"
+            ? msg.result
+            : stringifyMeta(msg.result ?? {});
+        const rejected =
+          resStr.length > 0 &&
+          /未受理|已被后续操作取代|没有活跃会话桥|CALLER_MISMATCH/.test(resStr);
+        if (!rejected && resStr.includes("[ASK_SUBMITTED]")) {
+          assistantCtx.askSeen = true;
+        }
+      }
       break;
     }
 
@@ -391,6 +518,17 @@ export const handleSdkMessage = async (
       }
       if (text.length > 0) {
         if (!stillCurrent()) return;
+        // 交卷 / 提问成功后的模型输出（常是宿主 Please continue 引发的旁白 / 多余收尾）：
+        // 照常落盘但带 muted 标记（审计保留、UI 不渲染）；交卷有平台固定收尾、提问以答题卡收尾
+        if (assistantCtx.submitSeen || assistantCtx.askSeen) {
+          // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
+          await appendEvent(taskId, {
+            kind: "assistant_message",
+            text,
+            meta: { muted: true },
+          }, stillCurrent);
+          break;
+        }
         assistantCtx.buffer += text;
         // streaming delta 也走 publishIfCurrent——失主不清 B 的 UI
         publishIfCurrent(taskId, stillCurrent, {

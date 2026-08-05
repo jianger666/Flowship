@@ -204,6 +204,7 @@ import {
 } from "./action-gates";
 import {
   handleSdkMessage,
+  maybeEmitSubmitFixedText,
   type AssistantBufferCtx,
 } from "./sdk-message-handler";
 import type {
@@ -547,7 +548,8 @@ const broadcastActionToGroup = async (
  * # 为什么后台跑（线上踩过）
  * check 若在 awaitingNotifier 里被 `submit_work` MCP 工具**同步 await**、工具就要阻塞到
  * check 跑完才返回、慢了会撞 Cursor SDK ~60s 工具超时 → agent 收到「超时」后困惑乱来。
- * 改成：notifier 立即返回、check 在这里后台跑、跑完再落结果 + 切 awaiting_ack + 发「产出完成」事件。
+ * 改成：notifier 立即返回、check 在这里后台跑、跑完再落结果 + 切 awaiting_ack
+ * （不再单独写「产出完成」里程碑事件——交卷后的固定收尾由平台在回合结束时补发）。
  * （交付诚实性检查多为 artifact 读文件 + git status hash、通常秒级；
  *   review 多仓 git 指纹仍可能上秒、后台架构保留。）
  *
@@ -678,25 +680,6 @@ const runActionPostCheck = (
       publish(taskId, { kind: "task", task: patched });
       const a = patched.actions.find((x) => x.id === actionId);
       if (a) publish(taskId, { kind: "action", action: a });
-      // post-check 事件写带 check 租约
-      await writeOwnedEventAndPublish(
-        taskId,
-        () => stillOwner(),
-        {
-          kind: "info",
-          actionId,
-          text: `Action 产出完成、等待用户 ack${
-            artifactPath ? `（artifact=${artifactPath}）` : ""
-          }`,
-          meta: {
-            artifactPath,
-            // 留个标志位给将来 UI 调试面板用、文本里不展示
-            postCheckPassed: postCheck?.passed,
-            // 里程碑标记：UI 事件流默认展开（action 产出完成等 ack、用户要看 artifact 决定 approve / revise）
-            awaitingAck: true,
-          },
-        },
-    );
       // 需求群自动播报（第三批）：这里是 action「完成」的唯一收口点，
       // 播报挂在收尾持有者（check 租约）路径里、不另开写路径。
       // broadcastActionCompletion 绝不抛、失败自行降级成一条 info 事件。
@@ -2648,7 +2631,8 @@ export const buildSessionBridges = (
       // V0.8.18：后置 deterministic check（build 的 lint/typecheck 可达 120s）改后台异步跑——
       // 这样 notifier 立即返回、agent 的 submit_work 工具秒回引导、第一时间挂上 curl long-poll 等 ack
       // （以前同步 await check 会把工具调用阻塞到超时、agent 收到「submit_work 失败」乱来、线上踩过）。
-      // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack + 发「产出完成」事件。
+      // check 跑完再由 runActionPostCheck 落 postCheck + 切 awaiting_ack
+      // （固定收尾文案由平台在回合结束时补发、不再写里程碑事件）。
       // postCheck 独立租约、不传 run opHandle
       // waitAndClaimPostCheck 等 mr 清空后同 tick claim / 换 token——关交接空窗与 ABA
       await failpoint("mcp.submitWork.beforeCheckStart");
@@ -4243,6 +4227,16 @@ const consumeSessionRun = async (
         `agent run status=${result.status}${inlineResult}${sdkErr}\n--- SDK result dump ---\n${resultDump}`,
       );
     }
+
+    // 交卷成功后的固定收尾在流内 submit_work 返回那一刻已补发（见 handleSdkMessage）；
+    // 这里仅作 run 自然结束时的兜底——once 守卫（fixedSent）保证不会重复。
+    await maybeEmitSubmitFixedText(assistantCtx, (ev) =>
+      writeOwnedEventAndPublish(
+        task.id,
+        () => isTaskOpCurrent(opts.opHandle),
+        ev,
+      ),
+    );
 
     // V0.11：run 自然 finished = 正常出口。判定 agent 这轮是否「有交代」：
     //   - 交卷了（notifier 同步注册的后置 check 在跑 / action 已 awaiting_ack）→ 正常

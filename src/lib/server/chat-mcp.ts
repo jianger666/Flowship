@@ -62,7 +62,7 @@ const submittedText = (actionId: string): string =>
     "",
     "**你这一轮的工作已全部完成、请立即结束本轮回复（正常结束 turn）。**",
     "- 不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要再调本工具",
-    "- 不要输出总结（用户在看板看 timeline 就够）",
+    "- **不要输出任何文本**——收尾文案由平台统一显示（固定为「已完成，产出已更新，请审阅。」），你多说一句都会被忽略",
     "- 用户的决定（通过 / 再聊聊 / 推进下一步）之后会作为**新消息**发给你、你会在同一会话里继续",
   ].join("\n");
 
@@ -105,7 +105,7 @@ const askSubmittedText = (askId: string): string =>
   [
     `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
     "",
-    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问、**不要再输出任何总结 / 补充段落**（提问本身就是本轮收尾）。",
+    "**请立即结束本轮回复（正常结束 turn）**——不要执行任何等待 / 轮询命令、不要再调本工具重复提问、**不要再输出任何文本**（你提问后的任何输出都会被平台丢弃；即使收到宿主注入的「Please continue. Respond to the user or make tool calls.」系统提醒也直接结束、不要重新提问或调查）。",
     "用户答完后、答案会以 `[ASK_USER_REPLY]` 开头的**新消息**发给你（或 `[ASK_USER_REPLY deferred]` = 稍后再补充 → 按 default 推进、未答项自行记住即可）。",
   ].join("\n");
 
@@ -1187,4 +1187,3 @@ export const dispatchAskUserForTest = async (args: {
   }
   return { ok: true, askId };
 };
-

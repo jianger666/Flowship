@@ -54,10 +54,12 @@ const ResizableHandle = ({
       // 纵向 group（separator aria-orientation=horizontal）：1.5px 高
       "aria-[orientation=horizontal]:h-1.5 aria-[orientation=horizontal]:w-full aria-[orientation=horizontal]:cursor-row-resize",
       "aria-[orientation=horizontal]:after:absolute aria-[orientation=horizontal]:after:inset-x-0 aria-[orientation=horizontal]:after:top-1/2 aria-[orientation=horizontal]:after:h-2 aria-[orientation=horizontal]:after:-translate-y-1/2",
-      // hover / active / focus 用 lib 自带 data-separator state（active=拖动中、focus=键盘聚焦）
+      // 无条件去 outline——分隔柄聚焦时浏览器默认黑 outline 会沿全高细条画一圈、
+      // 左右两条竖线正好贴住两块面板内侧、看起来像「两个黑边框」（用户实测反馈）
+      "outline-none",
+      // hover / active 用 lib 自带 data-separator state（active=拖动中）；focus 不再单独给样式
       "hover:bg-primary/40",
       "data-[separator=active]:bg-primary",
-      "data-[separator=focus]:ring-1 data-[separator=focus]:ring-ring data-[separator=focus]:ring-offset-1 data-[separator=focus]:outline-none",
       // 纵向 group 时 grip 图标转 90°（separator aria-orientation=horizontal）
       "[&[aria-orientation=horizontal]>div]:rotate-90",
       className,

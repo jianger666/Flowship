@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 const source = readFileSync(
   path.resolve(
     import.meta.dirname,
-    "../src/components/tasks/workspace-actions.tsx",
+    // V0.7.x：任务文件夹入口从 WorkspaceActions 拆到 TaskUtilityActions
+    "../src/components/tasks/task-utility-actions.tsx",
   ),
   "utf-8",
 );

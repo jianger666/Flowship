@@ -326,11 +326,6 @@ interface Props {
   priorPlans?: Array<{ n: number }>;
   onArtifactRefClick?: (ref: ActionArtifactRef) => void;
   /**
-   * 当前 artifact 文件名上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
-   * null = 没有产物 / 加载中尚无内容。父组件需用 useCallback 稳定引用、否则 effect 反复触发。
-   */
-  onArtifactMetaChange?: (meta: { filename: string } | null) => void;
-  /**
    * 是否可「分享到需求群 / 打开需求群」。日常轻量任务（无飞书链接）为 false → 隐藏按钮。
    * 由父组件用 isLightweightDailyTask 判定后传入。
    */
@@ -356,7 +351,6 @@ export const ArtifactPanel = ({
   effectiveBatches,
   priorPlans,
   onArtifactRefClick,
-  onArtifactMetaChange,
   canShareToGroup = false,
 }: Props) => {
   const actionTitle = formatActionTitle(action.type);
@@ -561,15 +555,6 @@ export const ArtifactPanel = ({
     },
     [],
   );
-
-  // filename 上报给工作区 Header（V0.7：filename 归 Header、Panel toolbar 不再显示）。
-  // 卸载（selected 切到空态）时报 null、避免 Header 残留上一个产物的文件名。
-  useEffect(() => {
-    onArtifactMetaChange?.(
-      currentArtifact ? { filename: currentArtifact.filename } : null,
-    );
-  }, [currentArtifact, onArtifactMetaChange]);
-  useEffect(() => () => onArtifactMetaChange?.(null), [onArtifactMetaChange]);
 
   // artifact 内容 + revision 列表一起拉
   // 依赖：action.id + action.endedAt（agent 写完 artifact 会 patchAction(endedAt) ）+ action.status
@@ -921,7 +906,8 @@ export const ArtifactPanel = ({
       onPointerDown={() => setActivePaneSearchScope("artifact")}
     >
       {/* toolbar：左视图切换 / 右修订 + 搜索（跟修订同栏、切换别抢戏） */}
-      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-4 text-xs">
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4 text-xs">
+        {/* 左组：视图切换 tabs + 当前产物文件名（跟在后面、左对齐、截断） */}
         <div className="flex min-w-0 flex-1 items-center gap-0.5">
           <Tooltip content="查看产物">
             <ChoiceButton
@@ -945,6 +931,18 @@ export const ArtifactPanel = ({
               等待
             </ChoiceButton>
           </Tooltip>
+          {currentArtifact && (
+            <>
+              <span className="mx-2 h-4 w-px shrink-0 bg-border/60" />
+              <Tooltip content={currentArtifact.filename}>
+                <span className="flex min-w-0 items-center text-muted-foreground/80">
+                  <span className="min-w-0 truncate font-mono text-[11px]">
+                    {currentArtifact.filename}
+                  </span>
+                </span>
+              </Tooltip>
+            </>
+          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
