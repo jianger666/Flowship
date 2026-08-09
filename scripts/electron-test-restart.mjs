@@ -16,6 +16,7 @@
  * 用法：pnpm electron:test:restart
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -198,9 +199,14 @@ async function main() {
   await runSpawn(buildPnpmSpawnSpec(["electron:server"]), { label: "electron:server" });
 
   log("3/6", "pnpm exec electron-builder 打 staging unpacked test 包");
-  await runSpawn(buildElectronBuilderDistTestSpawnSpec(platform), {
-    label: "electron:dist:test (staging)",
-  });
+  // electron-builder 默认会去 GitHub 下载/校验 Electron 运行时 zip；本地已有
+  // node_modules/electron/dist 时直接指给它，test 打包完全离线（远程缺失时保留原行为）
+  const localElectronDist = "node_modules/electron/dist";
+  const electronDistPath = existsSync(localElectronDist) ? localElectronDist : undefined;
+  await runSpawn(
+    buildElectronBuilderDistTestSpawnSpec(platform, { electronDistPath }),
+    { label: "electron:dist:test (staging)" },
+  );
 
   log("4/6", `确认 staging 产物 ${layout.stagingArtifactPath}`);
   await verifyArtifact(layout.stagingArtifactPath, "staging 产物");

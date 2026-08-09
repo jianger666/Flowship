@@ -156,14 +156,17 @@ const InlineDiff = ({
       className="mt-1.5 min-w-0 max-w-full"
     >
       <div className="max-h-64 w-full max-w-full overflow-auto rounded-md border border-border/60 bg-muted/20">
-        {lines.map((line, i) => (
-          <DiffLine key={i} line={line} linker={linker} filePath={filePath} />
-        ))}
-        {truncated && (
-          <div className="border-t border-border/50 px-2 py-1 text-[11px] text-muted-foreground">
-            diff 已截断
-          </div>
-        )}
+        {/* min-w-max：横滚内容宽 = 最长行，行级 diff 高亮铺满整行（否则背景只到容器宽、右侧无底色） */}
+        <div className="min-w-max">
+          {lines.map((line, i) => (
+            <DiffLine key={i} line={line} linker={linker} filePath={filePath} />
+          ))}
+          {truncated && (
+            <div className="border-t border-border/50 px-2 py-1 text-[11px] text-muted-foreground">
+              diff 已截断
+            </div>
+          )}
+        </div>
       </div>
     </CopyableBlock>
   );

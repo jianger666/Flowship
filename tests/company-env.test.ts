@@ -24,7 +24,6 @@ const pgRow = (over: Partial<CompanyEnvPg> = {}): CompanyEnvPg => ({
   port: 5432,
   user: "u",
   password: "p",
-  dbTemplates: [],
   readonly: true,
   ...over,
 });
@@ -72,13 +71,8 @@ describe("companyEnvToEnvVars", () => {
     expect(vars.FS_ENV_PG_TEST_NAME).toBe("CRM 测试库");
     expect(vars.FS_ENV_PG_TEST_HOST).toBe("10.0.3.20");
     expect(vars.FS_ENV_PG_TEST_PORT).toBe("5432");
-    expect(vars.FS_ENV_PG_TEST_DB_TEMPLATES).toBe(
-      "{project}-test\n{project}-dev",
-    );
     expect(vars.FS_ENV_PG_TEST_READONLY).toBe("1");
     expect(vars.FS_ENV_PG_PRE_HOST).toBe("10.0.4.20");
-    expect(vars.FS_ENV_PG_PRE_DB_TEMPLATES).toBe("{project}-pre");
-    expect(vars.FS_ENV_LOG_PATH_TEMPLATES).toContain("/apps/{project}/logs");
     expect(vars.FS_ENV_XXLJOB_TEST_BASE_URL).toContain("xxljob-test");
     expect(vars.FS_ENV_XXLJOB_TEST_READONLY).toBe("1");
     expect(vars.FS_ENV_NACOS_TEST_NAME).toBe("测试集群");
@@ -241,7 +235,7 @@ describe("parseCompanyEnvImport / normalizeCompanyEnv", () => {
           { name: "bad", env: "prod", host: "x" },
           "not-object",
         ],
-        logPathTemplates: ["/a", 1, ""],
+        custom: [{ name: "x", content: 1 }],
         xxljob: [
           {
             env: "test",
@@ -256,7 +250,7 @@ describe("parseCompanyEnvImport / normalizeCompanyEnv", () => {
     if (!r.ok) return;
     expect(r.value.servers).toHaveLength(1);
     expect(r.value.servers[0].host).toBe("h");
-    expect(r.value.logPathTemplates).toEqual(["/a"]);
+    expect(r.value.custom).toEqual([{ name: "x", content: "" }]);
     expect(r.value.xxljob).toHaveLength(1);
     expect(r.value.xxljob[0].readonly).toBe(true);
     expect(r.warnings.length).toBeGreaterThan(0);
@@ -269,7 +263,7 @@ describe("parseCompanyEnvImport / normalizeCompanyEnv", () => {
     });
     expect(n.servers).toEqual([]);
     expect(n.xxljob).toEqual([]);
-    expect(n.logPathTemplates).toEqual([]);
+    expect(n.custom).toEqual([]);
     expect(n.httpApis).toEqual([]);
     expect(n.elk).toEqual([]);
     expect(n.pg[0].readonly).toBe(true);
@@ -299,7 +293,6 @@ describe("parseCompanyEnvImport / normalizeCompanyEnv", () => {
     const r = parseCompanyEnvImport(
       JSON.stringify({
         servers: [],
-        logPathTemplates: [],
         xxljob: [],
         httpApis: [
           { name: "A", env: "test", baseUrl: "https://a", auth: { type: "none" } },
@@ -363,7 +356,6 @@ describe("parseCompanyEnvImport / normalizeCompanyEnv", () => {
           port: 5432,
           user: "u",
           password: "p",
-          dbTemplates: [],
           readonly: false,
         },
       ],
@@ -411,10 +403,8 @@ describe("normalizeCompanyEnv 旧单对象格式升级", () => {
       port: 15432,
       user: "readonly_user",
       password: "pg-Secret!@#123",
-      dbTemplates: ["{project}-test"],
       readonly: false,
     },
-    logPathTemplates: ["/apps/{project}/logs/console.log*"],
     xxljob: [],
     nacos: {
       baseUrl: "http://nacos.example.com:8848",
@@ -440,7 +430,6 @@ describe("normalizeCompanyEnv 旧单对象格式升级", () => {
     expect(n.pg[0].port).toBe(15432);
     expect(n.pg[0].user).toBe("readonly_user");
     expect(n.pg[0].password).toBe("pg-Secret!@#123");
-    expect(n.pg[0].dbTemplates).toEqual(["{project}-test"]);
     // 显式 false 不被「默认只读」覆盖
     expect(n.pg[0].readonly).toBe(false);
 
@@ -494,7 +483,6 @@ describe("cloneCompanyEnv", () => {
 
     expect(copy.pg).not.toBe(src.pg);
     expect(copy.pg[0]).not.toBe(src.pg[0]);
-    expect(copy.pg[0].dbTemplates).not.toBe(src.pg[0].dbTemplates);
     expect(copy.nacos[0]).not.toBe(src.nacos[0]);
     expect(copy.nacos[0].namespaces).not.toBe(src.nacos[0].namespaces);
     expect(copy.elk).not.toBe(src.elk);
@@ -502,11 +490,9 @@ describe("cloneCompanyEnv", () => {
 
     // 改副本不回写源
     copy.pg[0].password = "changed";
-    copy.pg[0].dbTemplates.push("extra");
     copy.nacos[0].namespaces.push("extra");
     copy.elk[0].dataView = "changed";
     expect(src.pg[0].password).toBe("【填写】");
-    expect(src.pg[0].dbTemplates).toEqual(["{project}-test", "{project}-dev"]);
     expect(src.nacos[0].namespaces).toEqual(["test", "dev"]);
     expect(src.elk[0].dataView).toBe("app-logs-*");
   });
@@ -581,7 +567,7 @@ describe("buildCompanyEnvBrief", () => {
           },
         ],
       },
-      ABS,
+      "/tmp/fe-data/company-env.json",
     );
     expect(brief).toContain("## 公司环境");
     expect(brief).toContain("HTTP API 1 条");
@@ -603,7 +589,7 @@ describe("buildCompanyEnvBrief", () => {
             },
           ],
         },
-        ABS,
+        "/tmp/fe-data/company-env.json",
       ),
     ).toContain("XXL-Job");
     expect(
@@ -622,7 +608,7 @@ describe("buildCompanyEnvBrief", () => {
             },
           ],
         },
-        ABS,
+        "/tmp/fe-data/company-env.json",
       ),
     ).toContain("Nacos 1 个集群");
     expect(
@@ -640,7 +626,7 @@ describe("buildCompanyEnvBrief", () => {
             },
           ],
         },
-        ABS,
+        "/tmp/fe-data/company-env.json",
       ),
     ).toContain("ELK 1 个实例");
   });
@@ -653,7 +639,7 @@ describe("buildCompanyEnvBrief", () => {
     expect(brief).toContain(
       "PostgreSQL 2 个实例（只读——只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DDL）",
     );
-    expect(brief).toContain("日志路径模板");
+    expect(brief).toContain("自定义 2 条");
     expect(brief).toContain(
       "XXL-Job（只读——只允许查看任务与日志、禁止触发/修改任务）",
     );
@@ -699,7 +685,7 @@ describe("buildCompanyEnvBrief", () => {
           },
         ],
       },
-      ABS,
+      "/tmp/fe-data/company-env.json",
     );
     expect(brief).toContain(
       "PostgreSQL 3 个实例（其中 2 个只读——只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DDL；其余可写，以配置文件里每条的 readonly 为准）",
@@ -725,7 +711,7 @@ describe("buildCompanyEnvBrief", () => {
           },
         ],
       },
-      ABS,
+      "/tmp/fe-data/company-env.json",
     );
     expect(brief).toContain("PostgreSQL 1 个实例");
     expect(brief).not.toContain("ELK");
@@ -767,7 +753,7 @@ describe("buildCompanyEnvBrief", () => {
           },
         ],
       },
-      ABS,
+      "/tmp/fe-data/company-env.json",
     );
     expect(brief).toContain("PostgreSQL 1 个实例、");
     expect(brief).not.toContain("只允许 SELECT");
@@ -784,10 +770,86 @@ describe("buildCompanyEnvBrief", () => {
         ...emptyCompanyEnv(),
         pg: [pgRow({ host: "db.example", password: "nope" })],
       },
-      ABS,
+      "/tmp/fe-data/company-env.json",
     );
     expect(brief).toContain("PostgreSQL 1 个实例（只读——");
     expect(brief).toContain("只允许 SELECT");
     expect(brief).not.toContain("nope");
+  });
+});
+
+describe("companyEnv redis / kafka / appProperties", () => {
+  it("导出：Redis / Kafka / 应用配置路径模板按约定命名", () => {
+    const env: CompanyEnv = {
+      ...emptyCompanyEnv(),
+      redis: [
+        {
+          name: "测试缓存",
+          env: "test",
+          host: "10.0.5.10",
+          port: 6379,
+          db: 2,
+          password: "pw",
+          readonly: true,
+        },
+      ],
+      custom: [
+        { name: "日志路径模板", content: "/apps/{project}/logs/console.log*" },
+      ],
+    };
+    const vars = companyEnvToEnvVars(env);
+    expect(vars.FS_ENV_REDIS_TEST_NAME).toBe("测试缓存");
+    expect(vars.FS_ENV_REDIS_TEST_HOST).toBe("10.0.5.10");
+    expect(vars.FS_ENV_REDIS_TEST_PORT).toBe("6379");
+    expect(vars.FS_ENV_REDIS_TEST_DB).toBe("2");
+    expect(vars.FS_ENV_REDIS_TEST_PASSWORD).toBe("pw");
+    expect(vars.FS_ENV_REDIS_TEST_READONLY).toBe("1");
+    // 自定义不进 env 变量（自由格式无规律），只落 json / brief
+    expect(vars.FS_ENV_CUSTOM).toBeUndefined();
+  });
+
+  it("normalize：旧配置缺 redis / custom 不炸、旧 kafka 键被忽略", () => {
+    const n = normalizeCompanyEnv({
+      servers: [],
+      pg: [],
+      redis: [
+        {
+          name: "缓存",
+          env: "test",
+          host: "10.0.5.10",
+          port: "6379",
+          db: 0,
+          password: "pw",
+        },
+      ],
+      kafka: [{ name: "集群", env: "test", bootstrapServers: "", note: "  " }],
+    });
+    expect(n.redis[0].port).toBe(6379);
+    expect(n.redis[0].readonly).toBe(true);
+    // 旧 kafka 键被 normalize 忽略（不崩、不进结果）
+    expect("kafka" in n).toBe(false);
+    expect(n.custom).toEqual([]);
+  });
+
+  it("brief：Redis / 自定义进声明、密码不泄露", () => {
+    const brief = buildCompanyEnvBrief(
+      {
+        ...emptyCompanyEnv(),
+        redis: [{
+          name: "缓存",
+          env: "test",
+          host: "10.0.5.10",
+          port: 6379,
+          db: 0,
+          password: "secret-redis",
+          readonly: true,
+        }],
+        custom: [{ name: "应用配置文件路径", content: "/apps/{project}/application.properties" }],
+      },
+      "/tmp/fe-data/company-env.json",
+    );
+    expect(brief).toContain("Redis 1 个实例");
+    expect(brief).toContain("自定义 1 条");
+    expect(brief).not.toContain("secret-redis");
   });
 });

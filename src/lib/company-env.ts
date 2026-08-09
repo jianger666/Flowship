@@ -8,11 +8,13 @@
 
 import type {
   CompanyEnv,
+  CompanyEnvCustom,
   CompanyEnvElk,
   CompanyEnvHttpApi,
   CompanyEnvHttpApiAuth,
   CompanyEnvNacos,
   CompanyEnvPg,
+  CompanyEnvRedis,
   CompanyEnvServer,
   CompanyEnvXxlJob,
 } from "./types";
@@ -21,7 +23,8 @@ import type {
 export const emptyCompanyEnv = (): CompanyEnv => ({
   servers: [],
   pg: [],
-  logPathTemplates: [],
+  redis: [],
+  custom: [],
   xxljob: [],
   nacos: [],
   elk: [],
@@ -57,7 +60,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       port: 5432,
       user: "readonly",
       password: "【填写】",
-      dbTemplates: ["{project}-test", "{project}-dev"],
       readonly: true,
     },
     {
@@ -67,11 +69,32 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       port: 5432,
       user: "readonly",
       password: "【填写】",
-      dbTemplates: ["{project}-pre"],
       readonly: true,
     },
   ],
-  logPathTemplates: ["/apps/{project}/logs/console.log*"],
+  // Redis / 自定义：真实凭据不进模板（预览/导入空态用），
+  // 用户在自己配置里填实际值
+  redis: [
+    {
+      name: "测试缓存",
+      env: "test",
+      host: "10.0.5.10",
+      port: 6379,
+      db: 0,
+      password: "【填写】",
+      readonly: true,
+    },
+  ],
+  custom: [
+    {
+      name: "日志路径模板",
+      content: "/apps/{project}/logs/console.log*\n/apps/{project}/logs/{project}*",
+    },
+    {
+      name: "应用配置文件路径",
+      content: "/apps/{project}/application.properties",
+    },
+  ],
   xxljob: [
     {
       env: "test",
@@ -223,8 +246,21 @@ const normalizePg = (o: Record<string, unknown>): CompanyEnvPg => ({
   port: asPort(o.port, 5432),
   user: asTrimmedString(o.user) ?? "",
   password: typeof o.password === "string" ? o.password : "",
-  dbTemplates: asStringArray(o.dbTemplates),
   readonly: asReadonlyDefaultTrue(o.readonly),
+});
+
+const normalizeRedis = (o: Record<string, unknown>): CompanyEnvRedis => ({
+  ...instanceId(o),
+  host: asTrimmedString(o.host) ?? "",
+  port: asPort(o.port, 6379),
+  db: typeof o.db === "number" && Number.isFinite(o.db) && o.db >= 0 ? Math.floor(o.db) : 0,
+  password: typeof o.password === "string" ? o.password : "",
+  readonly: asReadonlyDefaultTrue(o.readonly),
+});
+
+const normalizeCustom = (o: Record<string, unknown>): CompanyEnvCustom => ({
+  name: asTrimmedString(o.name) ?? "",
+  content: typeof o.content === "string" ? o.content.trim() : "",
 });
 
 const normalizeNacos = (o: Record<string, unknown>): CompanyEnvNacos => ({
@@ -384,7 +420,8 @@ export const normalizeCompanyEnv = (
   return {
     servers,
     pg: normalizeInstanceList(o.pg, "pg", warnings, normalizePg),
-    logPathTemplates: asStringArray(o.logPathTemplates),
+    redis: normalizeInstanceList(o.redis, "redis", warnings, normalizeRedis),
+    custom: normalizeInstanceList(o.custom, "custom", warnings, normalizeCustom),
     xxljob,
     nacos: normalizeInstanceList(o.nacos, "nacos", warnings, normalizeNacos),
     elk: normalizeInstanceList(o.elk, "elk", warnings, normalizeElk),
@@ -403,7 +440,9 @@ const isFlowshipCompanyEnvShape = (raw: unknown): boolean => {
   return (
     "servers" in o ||
     "pg" in o ||
-    "logPathTemplates" in o ||
+    "redis" in o ||
+    "kafka" in o ||
+    "custom" in o ||
     "xxljob" in o ||
     "nacos" in o ||
     "elk" in o ||
@@ -485,7 +524,17 @@ export const buildCompanyEnvBrief = (
       )}`,
     );
   }
-  if (env.logPathTemplates.some((t) => t.trim())) parts.push("日志路径模板");
+  const customRows = env.custom.filter((c) => c.name.trim() || c.content.trim());
+  if (customRows.length > 0) parts.push(`自定义 ${customRows.length} 条`);
+  const redisRows = env.redis.filter((r) => r.host.trim());
+  if (redisRows.length > 0) {
+    parts.push(
+      `Redis ${redisRows.length} 个实例${readonlyNote(
+        redisRows,
+        "只允许读 key / 查缓存，禁止写入",
+      )}`,
+    );
+  }
   if (env.xxljob.some((x) => x.baseUrl.trim())) {
     parts.push(
       isXxljobReadonly(env.xxljob)
@@ -522,6 +571,8 @@ export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => 
   if (!env) return false;
   if (env.servers.some((s) => s.host.trim())) return true;
   if (env.pg.some((p) => p.host.trim())) return true;
+  if (env.redis.some((r) => r.host.trim())) return true;
+  if (env.custom.some((c) => c.name.trim() || c.content.trim())) return true;
   if (env.xxljob.some((x) => x.baseUrl.trim())) return true;
   if (env.nacos.some((n) => n.baseUrl.trim())) return true;
   if (env.elk.some((e) => e.baseUrl.trim())) return true;
@@ -599,13 +650,17 @@ export const companyEnvToEnvVars = (
     put(out, `${prefix}_USER`, p.user.trim());
     put(out, `${prefix}_PASSWORD`, p.password);
     put(out, `${prefix}_READONLY`, p.readonly !== false ? "1" : "0");
-    if (p.dbTemplates.length > 0) {
-      put(out, `${prefix}_DB_TEMPLATES`, p.dbTemplates.join("\n"));
-    }
   }
 
-  if (env.logPathTemplates.length > 0) {
-    put(out, "FS_ENV_LOG_PATH_TEMPLATES", env.logPathTemplates.join("\n"));
+  const redisCount = new Map<string, number>();
+  for (const r of env.redis) {
+    const prefix = instanceVarPrefix("REDIS", r.env, redisCount);
+    put(out, `${prefix}_NAME`, r.name.trim());
+    put(out, `${prefix}_HOST`, r.host.trim());
+    put(out, `${prefix}_PORT`, r.port);
+    put(out, `${prefix}_DB`, r.db);
+    put(out, `${prefix}_PASSWORD`, r.password);
+    put(out, `${prefix}_READONLY`, r.readonly !== false ? "1" : "0");
   }
 
   const xxlCount = new Map<string, number>();
@@ -684,8 +739,9 @@ const cloneHttpAuth = (auth: CompanyEnvHttpApiAuth): CompanyEnvHttpApiAuth => {
 /** 深拷贝（settings clone / dirty 比较前防共享引用） */
 export const cloneCompanyEnv = (env: CompanyEnv): CompanyEnv => ({
   servers: env.servers.map((s) => ({ ...s })),
-  pg: env.pg.map((p) => ({ ...p, dbTemplates: [...p.dbTemplates] })),
-  logPathTemplates: [...env.logPathTemplates],
+  pg: env.pg.map((p) => ({ ...p })),
+  redis: env.redis.map((r) => ({ ...r })),
+  custom: env.custom.map((c) => ({ ...c })),
   xxljob: env.xxljob.map((x) => ({ ...x })),
   nacos: env.nacos.map((n) => ({ ...n, namespaces: [...n.namespaces] })),
   elk: env.elk.map((e) => ({ ...e })),

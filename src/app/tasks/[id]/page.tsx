@@ -45,6 +45,7 @@ import { ChatView } from "@/components/tasks/chat-view";
 import { ContextDocsPanel } from "@/components/tasks/context-docs-panel";
 import { EditTaskDialog } from "@/components/tasks/edit-task-dialog";
 import { EventStream } from "@/components/tasks/event-stream";
+import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import { TaskMcpPanel } from "@/components/tasks/task-mcp-panel";
 import { TASK_SEEN_EVENT } from "@/components/tasks/task-list-item";
 import { TaskUtilityActions } from "@/components/tasks/task-utility-actions";
@@ -627,6 +628,10 @@ const TaskDetailPage = () => {
       setAdvancePrefill(null);
     } catch (err) {
       toast.error(`推进失败：${toastLine((err as Error).message)}`);
+      // 推进失败也关弹窗：门禁 / baseline 类失败详情在事件流里、弹窗内容没得救，
+      // 留在原地反而要用户手动关；关掉并清预填、让用户直接看事件流
+      setAdvanceDialogOpen(false);
+      setAdvancePrefill(null);
     } finally {
       setStarting(false);
     }
@@ -813,19 +818,6 @@ const TaskDetailPage = () => {
                     {RUN_STATUS_LABEL[task.runStatus]}
                   </Badge>
                 ) : null}
-                {/* V0.6.6 编辑任务：紧跟标题（改任务属性、跟身份信息绑定）、running 时隐藏 */}
-                {task.runStatus !== "running" && (
-              <Tooltip content="编辑任务：标题 / 飞书链接 / 工作分支">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setEditDialogOpen(true)}
-                      className="size-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-                    >
-                      <Pencil className="size-3.5" />
-                    </Button>
-                  </Tooltip>
-                )}
               </div>
               {/* V0.10.1：工作区快捷操作（IDE 打开 / 复制路径 / 单预览位）
                   ——本分支已是 task 模式（chat 模式在上面提前 return ChatView） */}
@@ -896,9 +888,22 @@ const TaskDetailPage = () => {
           </div>
         </div>
 
-        {/* 任务级辅助入口同排：弹窗触发 chip（任务上下文 / MCP / 分批）+ 竖分隔线 +
-            执行型按钮（需求群 / 任务文件夹）——按交互类型分组 */}
+        {/* 任务级辅助入口同排：弹窗触发 chip（基本信息 / 任务上下文 / MCP / 分批）+
+            竖分隔线 + 执行型按钮（需求群 / 任务文件夹）——按交互类型分组 */}
         <div className="mt-3 flex flex-wrap items-center gap-2">
+          {/* 任务基本信息：编辑任务 dialog 入口（标题 / 角色 / 飞书链接 / 模型 / 分支）；
+              跟标题同排会混进状态 Badge、放这排入口 chip 组首位；running 时隐藏 */}
+          {task.runStatus !== "running" && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setEditDialogOpen(true)}
+            >
+              <Pencil />
+              基本信息
+            </Button>
+          )}
           <ContextDocsPanel task={task} onTaskUpdate={absorbTask} />
           <TaskMcpPanel task={task} onTaskUpdate={absorbTask} />
           {/* V0.6.24：分批进度 chip（拆了=「批次进度 N/M」、没拆=灰色「未分批」、点开看详情） */}
@@ -1017,6 +1022,12 @@ const TaskDetailPage = () => {
                   onPrependEvents={handlePrependEvents}
                 />
               </div>
+              {/* 疑似卡住提示：挂在输入条上方，chat / task 共用 SuspectStuckHint */}
+              <SuspectStuckHint
+                task={task}
+                streamingText={streamingText}
+                className="shrink-0 px-6 py-1.5"
+              />
               {/* V0.13.x 统一「跟 AI 说」入口：单一消息语义、AI 自主二分类（服务端按状态附交卷上下文） */}
               <TaskTalkComposer
                 task={task}

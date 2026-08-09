@@ -107,19 +107,30 @@ export function buildPnpmSpawnSpec(
   };
 }
 
-/** electron-builder 打 unpacked test 包到 staging 目录的 CLI 参数 */
+/**
+ * electron-builder 打 unpacked test 包到 staging 目录的 CLI 参数
+ * @param {NodeJS.Platform} [platform]
+ * @param {{ stagingOutputRelative?: string; electronDistPath?: string }} [options]
+ */
 export function buildDistTestArgs(
   platform = process.platform,
-  { stagingOutputRelative = path.join(ELECTRON_OUTPUT_DIR, STAGING_SUBDIR) } = {},
+  {
+    stagingOutputRelative = path.join(ELECTRON_OUTPUT_DIR, STAGING_SUBDIR),
+    electronDistPath,
+  } = {},
 ) {
   const productNameFlag = `-c.productName=${TEST_PRODUCT_NAME}`;
   const outputFlag = `-c.directories.output=${stagingOutputRelative}`;
 
   if (platform === "darwin") {
-    return ["--mac", "--dir", productNameFlag, outputFlag];
+    const args = ["--mac", "--dir", productNameFlag, outputFlag];
+    if (electronDistPath) args.push(`-c.electronDist=${electronDistPath}`);
+    return args;
   }
   if (platform === "win32") {
-    return ["--win", "--dir", productNameFlag, outputFlag];
+    const args = ["--win", "--dir", productNameFlag, outputFlag];
+    if (electronDistPath) args.push(`-c.electronDist=${electronDistPath}`);
+    return args;
   }
 
   throw new Error(

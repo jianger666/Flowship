@@ -165,32 +165,36 @@ describe("mergeGroupMemberRegistries", () => {
 describe("pickGroupCreationTargets", () => {
   const registry = registryOf({
     "dev@x.com": { openId: "ou_dev", botAppId: "cli_dev", updatedAt: 1 },
-    "qa@x.com": { openId: "ou_qa", botAppId: "cli_qa", updatedAt: 1 },
+    // qa 与发起人同属一个应用（cli_me）——只有同应用的 open_id 能进 user_id_list
+    "qa@x.com": { openId: "ou_qa", botAppId: "cli_me", updatedAt: 1 },
     "nobot@x.com": { openId: "ou_nobot", botAppId: "", updatedAt: 1 },
   });
 
-  it("命中：发起人首位 + 角色成员 open_id，bot 取各自 app_id", () => {
+  it("命中：同应用成员的 open_id 进 user_id_list，跨应用成员只加 bot 不加本人", () => {
     const t = pickGroupCreationTargets({
       ownerOpenId: "ou_me",
       ownBotAppId: "cli_me",
       roleEmails: ["dev@x.com", "QA@x.com "],
       registry,
     });
-    expect(t.userIdList).toEqual(["ou_me", "ou_dev", "ou_qa"]);
-    // 本机 bot 建群自动入群、不该白占 ≤5 额度
-    expect(t.botIdList).toEqual(["cli_dev", "cli_qa"]);
+    // dev 的 open_id 属于 cli_dev（别的应用）→ 跳过本人；qa 同应用 → 进列表
+    expect(t.userIdList).toEqual(["ou_me", "ou_qa"]);
+    expect(t.crossAppEmails).toEqual(["dev@x.com"]);
+    // 本机 bot 建群自动入群、不该白占 ≤5 额度（qa 的 bot 就是本机 cli_me、被排除）
+    expect(t.botIdList).toEqual(["cli_dev"]);
     expect(t.matchedEmails).toEqual(["dev@x.com", "qa@x.com"]);
     expect(t.missedEmails).toEqual([]);
   });
 
-  it("未命中的人跳过不报错、还没配 bot 的人只进 user_id_list", () => {
+  it("未命中的人跳过不报错；没配 bot 的人 open_id 无法确认所属应用、同样跳过本人", () => {
     const t = pickGroupCreationTargets({
       ownerOpenId: "ou_me",
       ownBotAppId: "cli_me",
       roleEmails: ["nobot@x.com", "stranger@x.com", "不是邮箱"],
       registry,
     });
-    expect(t.userIdList).toEqual(["ou_me", "ou_nobot"]);
+    expect(t.userIdList).toEqual(["ou_me"]);
+    expect(t.crossAppEmails).toEqual(["nobot@x.com"]);
     expect(t.botIdList).toEqual([]);
     expect(t.missedEmails).toEqual(["stranger@x.com"]);
   });
@@ -212,7 +216,7 @@ describe("pickGroupCreationTargets", () => {
     ).toEqual([]);
   });
 
-  it("去重 + 飞书硬上限（user ≤50 / bot ≤5）", () => {
+  it("去重 + 飞书硬上限（user ≤50 / bot ≤5）——跨应用成员只占 bot 额度", () => {
     const many = registryOf(
       Object.fromEntries(
         Array.from({ length: 80 }, (_, i) => [
@@ -230,8 +234,9 @@ describe("pickGroupCreationTargets", () => {
       ],
       registry: many,
     });
-    expect(t.userIdList.length).toBe(50);
-    expect(new Set(t.userIdList).size).toBe(50);
+    // 只有 u0（与发起人同应用 cli_0）的 open_id 能进；其余 79 人跨应用、跳过本人
+    expect(t.userIdList).toEqual(["ou_0"]);
+    expect(t.crossAppEmails.length).toBe(79);
     expect(t.botIdList.length).toBe(5);
     expect(t.botIdList).not.toContain("cli_0");
   });

@@ -113,6 +113,17 @@ describe("buildDistTestArgs", () => {
       `-c.directories.output=${stagingOut}`,
     ]);
   });
+
+  it("指定 electronDistPath 时复用本地 Electron 运行时", () => {
+    const stagingOut = path.join(ELECTRON_OUTPUT_DIR, STAGING_SUBDIR);
+    expect(buildDistTestArgs("darwin", { electronDistPath: "node_modules/electron/dist" })).toEqual([
+      "--mac",
+      "--dir",
+      `-c.productName=${TEST_PRODUCT_NAME}`,
+      `-c.directories.output=${stagingOut}`,
+      "-c.electronDist=node_modules/electron/dist",
+    ]);
+  });
 });
 
 describe("buildPnpmSpawnSpec", () => {
@@ -143,6 +154,7 @@ describe("buildElectronBuilderDistTestSpawnSpec", () => {
       buildElectronBuilderDistTestSpawnSpec("win32", {
         execPath: EXEC_PATH,
         npmExecPath: NPM_EXECPATH,
+        electronDistPath: "node_modules/electron/dist",
       }),
     ).toEqual({
       command: EXEC_PATH,
@@ -154,6 +166,7 @@ describe("buildElectronBuilderDistTestSpawnSpec", () => {
         "--dir",
         `-c.productName=${TEST_PRODUCT_NAME}`,
         `-c.directories.output=${path.join(ELECTRON_OUTPUT_DIR, STAGING_SUBDIR)}`,
+        "-c.electronDist=node_modules/electron/dist",
       ],
     });
   });

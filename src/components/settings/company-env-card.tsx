@@ -8,7 +8,9 @@
  */
 
 import {
+  Boxes,
   ChevronDown,
+  ClipboardList,
   Copy,
   Database,
   Download,
@@ -18,7 +20,6 @@ import {
   HardDrive,
   Layers,
   Plus,
-  ScrollText,
   Server,
   Timer,
   Trash2,
@@ -61,8 +62,10 @@ import type {
   CompanyEnvElk,
   CompanyEnvHttpApi,
   CompanyEnvHttpApiAuth,
+  CompanyEnvCustom,
   CompanyEnvNacos,
   CompanyEnvPg,
+  CompanyEnvRedis,
   CompanyEnvServer,
   CompanyEnvXxlJob,
 } from "@/lib/types";
@@ -70,7 +73,8 @@ import type {
 type SectionId =
   | "servers"
   | "pg"
-  | "logs"
+  | "redis"
+  | "custom"
   | "xxljob"
   | "nacos"
   | "elk"
@@ -168,7 +172,7 @@ const InstanceCardHeader = ({
         value={env}
         onChange={(e) => onEnvChange(e.target.value)}
         onBlur={onBlur}
-        placeholder="test"
+        placeholder="环境名"
         className="h-8"
       />
     </MiniField>
@@ -277,6 +281,7 @@ const EnvSection = ({
   id,
   icon: Icon,
   title,
+  subtitle,
   configured,
   summary,
   open,
@@ -286,6 +291,8 @@ const EnvSection = ({
   id: SectionId;
   icon: LucideIcon;
   title: string;
+  /** 标题下的说明行（仅个别小节用，如「自定义」） */
+  subtitle?: string;
   configured: boolean;
   summary: string;
   open: boolean;
@@ -295,12 +302,19 @@ const EnvSection = ({
   <div className="border-b last:border-b-0">
     <button
       type="button"
-      className="flex w-full items-center gap-2.5 py-2.5 text-left transition-colors hover:bg-muted/40"
+      className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-muted/40"
       onClick={() => onToggle(id)}
       aria-expanded={open}
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 flex-1 truncate text-sm font-medium">{title}</span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-sm font-medium">{title}</span>
+        {subtitle && (
+          <span className="truncate text-[11px] font-normal text-muted-foreground/70">
+            {subtitle}
+          </span>
+        )}
+      </span>
       <span className="flex min-w-0 max-w-[55%] items-center gap-1.5 shrink-0">
         <span
           className={cn(
@@ -350,12 +364,24 @@ const pgSummary = (
   return { configured: true, summary: `${filled.length} 个实例` };
 };
 
-const logsSummary = (
-  lines: string[],
+const redisSummary = (
+  rows: CompanyEnvRedis[],
 ): { configured: boolean; summary: string } => {
-  const n = lines.filter((s) => s.trim()).length;
-  if (n === 0) return { configured: false, summary: "未配置" };
-  return { configured: true, summary: `${n} 条路径` };
+  const filled = rows.filter((r) => r.host.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 个实例` };
+};
+
+
+
+
+
+const customSummary = (
+  rows: CompanyEnvCustom[],
+): { configured: boolean; summary: string } => {
+  const filled = rows.filter((c) => c.name.trim() || c.content.trim());
+  if (filled.length === 0) return { configured: false, summary: "未配置" };
+  return { configured: true, summary: `${filled.length} 条` };
 };
 
 const xxlSummary = (
@@ -502,13 +528,15 @@ export const CompanyEnvSection = ({
 
   const servers = value.servers;
   const pgList = value.pg;
+  const redisList = value.redis;
   const nacosList = value.nacos;
   const elkList = value.elk;
   const httpApis = value.httpApis ?? [];
 
   const sStat = serverSummary(servers);
   const pStat = pgSummary(pgList);
-  const lStat = logsSummary(value.logPathTemplates);
+  const rStat = redisSummary(redisList);
+  const cStat = customSummary(value.custom);
   const xStat = xxlSummary(value.xxljob);
   const nStat = nacosSummary(nacosList);
   const eStat = elkSummary(elkList);
@@ -557,7 +585,8 @@ export const CompanyEnvSection = ({
           </div>
         </div>
 
-        <div className="rounded-md border border-border/60 px-3">
+        {/* overflow-hidden：hover 行背景铺满整宽、首末行被容器圆角裁切 */}
+        <div className="overflow-hidden rounded-md border border-border/60">
           <EnvSection
             id="servers"
             icon={Server}
@@ -730,7 +759,7 @@ export const CompanyEnvSection = ({
                       name={p.name}
                       env={p.env}
                       readonly={p.readonly}
-                      namePlaceholder="测试库"
+                      namePlaceholder="实例名称"
                       onNameChange={(name) => patchPg({ ...p, name })}
                       onEnvChange={(env) => patchPg({ ...p, env })}
                       onReadonlyChange={(readonly) =>
@@ -794,22 +823,6 @@ export const CompanyEnvSection = ({
                         />
                       </MiniField>
                     </div>
-                    <div className="space-y-1">
-                      <div className="text-[11px] text-muted-foreground">
-                        库名模板
-                      </div>
-                      <StringListEditor
-                        lines={p.dbTemplates}
-                        placeholder="{project}-test"
-                        addLabel="添加模板"
-                        onChange={(dbTemplates) =>
-                          patchPg({ ...p, dbTemplates })
-                        }
-                        onCommit={(dbTemplates) =>
-                          commitPg({ ...p, dbTemplates })
-                        }
-                      />
-                    </div>
                   </InstanceCard>
                 );
               })}
@@ -818,12 +831,11 @@ export const CompanyEnvSection = ({
                 onClick={() => {
                   const row: CompanyEnvPg = {
                     name: "",
-                    env: "test",
+                    env: "",
                     host: "",
                     port: 5432,
                     user: "",
                     password: "",
-                    dbTemplates: [],
                     readonly: true,
                   };
                   commit({ ...value, pg: [...pgList, row] });
@@ -833,23 +845,116 @@ export const CompanyEnvSection = ({
           </EnvSection>
 
           <EnvSection
-            id="logs"
-            icon={ScrollText}
-            title="日志路径"
-            configured={lStat.configured}
-            summary={lStat.summary}
-            open={openId === "logs"}
+            id="redis"
+            icon={Boxes}
+            title="Redis"
+            configured={rStat.configured}
+            summary={rStat.summary}
+            open={openId === "redis"}
             onToggle={toggle}
           >
-            <StringListEditor
-              lines={value.logPathTemplates}
-              placeholder="/apps/{project}/logs/console.log*"
-              addLabel="添加路径"
-              onChange={(logPathTemplates) => patch({ logPathTemplates })}
-              onCommit={(logPathTemplates) =>
-                commit({ ...value, logPathTemplates })
-              }
-            />
+            <div className="space-y-2">
+              {redisList.map((r, i) => {
+                const patchRedis = (next: CompanyEnvRedis) =>
+                  patch({
+                    redis: redisList.map((row, j) => (j === i ? next : row)),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <InstanceCardHeader
+                      name={r.name}
+                      env={r.env}
+                      readonly={r.readonly}
+                      namePlaceholder="实例名称"
+                      onNameChange={(name) => patchRedis({ ...r, name })}
+                      onEnvChange={(env) => patchRedis({ ...r, env })}
+                      onReadonlyChange={(readonly) =>
+                        patchRedis({ ...r, readonly })
+                      }
+                      onBlur={() => onCommit(value)}
+                      onRemove={() =>
+                        commit({
+                          ...value,
+                          redis: redisList.filter((_, j) => j !== i),
+                        })
+                      }
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField label="主机">
+                        <Input
+                          value={r.host}
+                          onChange={(e) =>
+                            patchRedis({ ...r, host: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="端口"
+                        className="w-20 shrink-0 space-y-0.5"
+                      >
+                        <Input
+                          type="number"
+                          value={r.port}
+                          onChange={(e) =>
+                            patchRedis({
+                              ...r,
+                              port: Number(e.target.value) || 6379,
+                            })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="DB"
+                        className="w-16 shrink-0 space-y-0.5"
+                      >
+                        <Input
+                          type="number"
+                          value={r.db}
+                          onChange={(e) =>
+                            patchRedis({
+                              ...r,
+                              db: Math.max(0, Number(e.target.value) || 0),
+                            })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <MiniField label="密码">
+                        <PasswordInput
+                          value={r.password}
+                          onChange={(e) =>
+                            patchRedis({ ...r, password: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          autoComplete="off"
+                          className="h-8"
+                        />
+                      </MiniField>
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加实例"
+                onClick={() => {
+                  const row: CompanyEnvRedis = {
+                    name: "",
+                    env: "",
+                    host: "",
+                    port: 6379,
+                    db: 0,
+                    password: "",
+                    readonly: true,
+                  };
+                  commit({ ...value, redis: [...redisList, row] });
+                }}
+              />
+            </div>
           </EnvSection>
 
           <EnvSection
@@ -1474,6 +1579,80 @@ export const CompanyEnvSection = ({
                 <Plus className="size-3.5" />
                 添加 API
               </Button>
+            </div>
+          </EnvSection>
+
+          <EnvSection
+            id="custom"
+            icon={ClipboardList}
+            title="自定义"
+            subtitle="自由填写：路径模板 / 约定等任意信息（{project} 占位符 AI 会自动替换）"
+            configured={cStat.configured}
+            summary={cStat.summary}
+            open={openId === "custom"}
+            onToggle={toggle}
+          >
+            <div className="space-y-2">
+              {value.custom.map((c, i) => {
+                const patchCustom = (next: CompanyEnvCustom) =>
+                  patch({
+                    custom: value.custom.map((row, j) =>
+                      j === i ? next : row,
+                    ),
+                  });
+                return (
+                  <InstanceCard key={i}>
+                    <div className="flex flex-wrap gap-1.5">
+                      <MiniField label="名称" className="min-w-[10rem] flex-[1] space-y-0.5">
+                        <Input
+                          value={c.name}
+                          placeholder="如：日志路径模板"
+                          onChange={(e) =>
+                            patchCustom({ ...c, name: e.target.value })
+                          }
+                          onBlur={() => onCommit(value)}
+                          className="h-8"
+                        />
+                      </MiniField>
+                      <div className="w-full">
+                        <MiniField label="内容（可多行，{project} 等占位符 AI 会自动替换）">
+                          <Textarea
+                            value={c.content}
+                            rows={2}
+                            onChange={(e) =>
+                              patchCustom({ ...c, content: e.target.value })
+                            }
+                            onBlur={() => onCommit(value)}
+                            className="min-h-8 resize-y font-mono text-xs"
+                          />
+                        </MiniField>
+                      </div>
+                      <div className="flex w-full justify-end">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() =>
+                            commit({
+                              ...value,
+                              custom: value.custom.filter((_, j) => j !== i),
+                            })
+                          }
+                        >
+                          <Trash2 />
+                        </Button>
+                      </div>
+                    </div>
+                  </InstanceCard>
+                );
+              })}
+              <AddRowButton
+                label="添加条目"
+                onClick={() => {
+                  const row: CompanyEnvCustom = { name: "", content: "" };
+                  commit({ ...value, custom: [...value.custom, row] });
+                }}
+              />
             </div>
           </EnvSection>
         </div>

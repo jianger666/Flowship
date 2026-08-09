@@ -41,20 +41,32 @@ export interface AssistantBufferCtx {
   fixedSent?: boolean;
   /** 本回合已提问成功（ask_user 返回 [ASK_SUBMITTED]）：之后模型输出（含工具）全部消音（答题卡即收尾） */
   askSeen?: boolean;
+  /** 本轮是否写/改过 artifact（actions/*.md）——交卷时判定「产出是否真的更新」（事实信号、无语义判断） */
+  artifactWritten?: boolean;
+  /** 交卷前是否输出过可见正文——交卷后正文是否该静音的判定（事实信号） */
+  preSubmitTextSeen?: boolean;
+  /** 追问补交卷轮（runner 追问 send 启动的 run）——不启用交卷后静音豁免 */
+  followupTurn?: boolean;
 }
 
 /**
  * 补发固定收尾（交卷成功才补、一次）。
  * 主调用点：流内 submit_work 成功返回那一刻立即补发（用户不等 run 结束就能看到收尾）；
  * task-runner / chat-runner 在 run 自然结束时保留兜底调用——once 守卫保证只发一次。
+ * 本轮真写过 artifact 才发「已完成，产出已更新，请审阅。」横幅；
+ * 纯答疑（没动产出）只发轻量「已回复」标记、不发误导横幅。
  */
 export const maybeEmitSubmitFixedText = async (
   ctx: AssistantBufferCtx,
-  write: (ev: { kind: "assistant_message"; text: string }) => Promise<unknown>,
+  write: (ev: { kind: "assistant_message" | "info"; text: string }) => Promise<unknown>,
 ): Promise<boolean> => {
   if (!ctx.submitSeen || ctx.fixedSent) return false;
   ctx.fixedSent = true;
-  await write({ kind: "assistant_message", text: SUBMIT_COMPLETED_TEXT });
+  if (ctx.artifactWritten) {
+    await write({ kind: "assistant_message", text: SUBMIT_COMPLETED_TEXT });
+  } else {
+    await write({ kind: "info", text: "已回复" });
+  }
   return true;
 };
 
@@ -360,6 +372,8 @@ export const handleSdkMessage = async (
         (normalizedTarget.includes("/actions/") ||
           normalizedTarget.startsWith("actions/"))
       ) {
+        // 事实信号：本轮写/改过 artifact——交卷时据此判「产出是否真的更新」（横幅/收尾语义）
+        assistantCtx.artifactWritten = true;
         if (msg.status === "running") {
           // 同 callId 的二次 running（SDK 流式补 args）跳过，避免双工具块
           if (!tryMarkToolCallRunningSeen(msg.call_id)) break;
@@ -440,7 +454,15 @@ export const handleSdkMessage = async (
             /交卷未受理|已被后续操作取代|没有活跃会话桥|CALLER_MISMATCH/.test(resStr);
           if (!rejected) {
             assistantCtx.submitSeen = true;
-            await maybeEmitSubmitFixedText(assistantCtx, (ev) => writeEv(ev));
+            // 交卷前已输出过正文（合规：答案/结论说完了）→ 立即补发收尾——
+            // 横幅（写了产出）或「已回复」（纯答疑）；不等 run 结束，否则被
+            // 交卷后 Please continue 的废话生成拖慢数秒（实测 ~5s 延迟）。
+            // mis-order（交卷前没说话）→ 延到 run 结束补发，保证答案在前。
+            if (assistantCtx.preSubmitTextSeen) {
+              await maybeEmitSubmitFixedText(assistantCtx, (ev) =>
+                writeEv(ev),
+              );
+            }
           }
         }
         break;
@@ -518,17 +540,34 @@ export const handleSdkMessage = async (
       }
       if (text.length > 0) {
         if (!stillCurrent()) return;
-        // 交卷 / 提问成功后的模型输出（常是宿主 Please continue 引发的旁白 / 多余收尾）：
-        // 照常落盘但带 muted 标记（审计保留、UI 不渲染）；交卷有平台固定收尾、提问以答题卡收尾
+        // 交卷 / 提问成功后的模型输出：交卷有平台收尾、提问以答题卡收尾——
+        // 交卷后静音条件 = 提问过（答题卡收尾）∨ 交卷前已说过话（现在是废话）∨ 追问轮；
+        // 交卷后且交卷前没说过话（mis-order：答案写在交卷后）= 答案、正常广播不静音
         if (assistantCtx.submitSeen || assistantCtx.askSeen) {
-          // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
-          await appendEvent(taskId, {
-            kind: "assistant_message",
+          const mute =
+            assistantCtx.askSeen ||
+            assistantCtx.preSubmitTextSeen ||
+            assistantCtx.followupTurn;
+          if (mute) {
+            // 消音审计：只落盘、不广播（见 emitToolResult muted 注释）
+            await appendEvent(taskId, {
+              kind: "assistant_message",
+              text,
+              meta: { muted: true },
+            }, stillCurrent);
+            break;
+          }
+          // 不静音：跟正常正文同路径（buffer + delta 广播、flush 落盘）
+          assistantCtx.buffer += text;
+          publishIfCurrent(taskId, stillCurrent, {
+            kind: "assistant_delta",
             text,
-            meta: { muted: true },
-          }, stillCurrent);
+            ...(origin ? { origin } : {}),
+          });
           break;
         }
+        // 交卷前的可见正文——置位（供交卷后静音判定）
+        assistantCtx.preSubmitTextSeen = true;
         assistantCtx.buffer += text;
         // streaming delta 也走 publishIfCurrent——失主不清 B 的 UI
         publishIfCurrent(taskId, stillCurrent, {

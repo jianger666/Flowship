@@ -233,8 +233,6 @@ export interface CompanyEnvPg extends CompanyEnvInstanceId {
   port: number;
   user: string;
   password: string;
-  /** 库名模板，如 `{project}-test` */
-  dbTemplates: string[];
   /**
    * 只读软约束（默认 true）：落 company-env.json + brief 声明禁止写；
    * 非硬闸，靠 prompt 约束 AI。每个实例各自一份——测试库可写、预发库只读是常态。
@@ -297,12 +295,33 @@ export interface CompanyEnvHttpApi {
   note?: string;
 }
 
+/** Redis 实例（排查时 AI 连 Redis 查 key / 缓存） */
+export interface CompanyEnvRedis extends CompanyEnvInstanceId {
+  host: string;
+  port: number;
+  /** 逻辑库序号，如 0 */
+  db: number;
+  password: string;
+  /** 只读软约束（默认 true） */
+  readonly: boolean;
+}
+
+/** 自定义条目（自由填：路径模板 / 约定 / 任何提示 AI 的信息） */
+export interface CompanyEnvCustom {
+  /** 条目名，如「日志路径模板」「应用配置文件路径」 */
+  name: string;
+  /** 内容（可多行），`{project}` 等占位符由 AI 自行替换 */
+  content: string;
+}
+
 export interface CompanyEnv {
   servers: CompanyEnvServer[];
   /** PostgreSQL 实例（测试库 / 预发库 / 不同业务库各一条） */
   pg: CompanyEnvPg[];
-  /** 日志路径模板，如 `/apps/{project}/logs/console.log*` */
-  logPathTemplates: string[];
+  /** Redis 实例（可多套，按环境 / 业务分） */
+  redis: CompanyEnvRedis[];
+  /** 自定义条目（路径模板 / 约定等自由内容；Kafka 等连接信息需要时可加在这里） */
+  custom: CompanyEnvCustom[];
   xxljob: CompanyEnvXxlJob[];
   /** Nacos 集群（可多套） */
   nacos: CompanyEnvNacos[];

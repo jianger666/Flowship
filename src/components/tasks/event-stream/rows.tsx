@@ -301,6 +301,12 @@ export const ReconnectingRow = memo(
 );
 ReconnectingRow.displayName = "ReconnectingRow";
 
+/** 用户消息气泡：w-fit 短句收窄；max-w + min-w-0 + 内层 w-full wrap-anywhere 防长 URL 撑破 */
+const USER_REPLY_BUBBLE =
+  "ml-auto w-fit max-w-[85%] min-w-0 rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5";
+const USER_REPLY_TEXT =
+  "w-full min-w-0 wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed";
+
 /** 本地排队占位气泡（半透明 + 时钟；uncertain 显示确认中）——用户消息、跟正式气泡同样右对齐 */
 export const PendingLocalReplyRow = memo(
   ({
@@ -312,9 +318,14 @@ export const PendingLocalReplyRow = memo(
     uncertain?: boolean;
     ownerId: string;
   }) => (
-    <div className="ml-auto flex w-fit max-w-[85%] items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
+    <div className="ml-auto flex w-fit max-w-[85%] min-w-0 items-start gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3.5 py-2.5 opacity-70">
       <Clock className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-      <div className="min-w-0 flex-1 text-sm leading-relaxed text-muted-foreground">
+      <div
+        className={cn(
+          USER_REPLY_TEXT,
+          "flex-1 text-muted-foreground",
+        )}
+      >
         <span className="mb-0.5 block text-[11px] tracking-wide">
           {uncertain ? "发送状态未知、正在确认…" : "待发送"}
         </span>
@@ -685,14 +696,8 @@ const EventRowImpl = ({
       // 折叠判定纯逻辑在 lib/chat-stream-display（可单测）；行数阈值与 line-clamp-8 对应
       const userCollapsible = shouldCollapseUserMessage(ev.text);
       return (
-        // 右对齐收窄块（Codex 风、A1）：ml-auto + w-fit 右浮、max-w 85% 收窄，
-        // 与 AI 左侧平铺拉开、扫一眼分清谁说的
-        <div
-          className={cn(
-            MESSAGE_ACTION_HOST,
-            "ml-auto w-fit max-w-[85%] rounded-lg border border-border/60 bg-muted/40 px-3.5 py-2.5",
-          )}
-        >
+        // 右对齐收窄块（Codex 风、A1）：ml-auto + max-w 85%；min-w-0 + wrap-anywhere 防长 URL 撑破
+        <div className={cn(MESSAGE_ACTION_HOST, USER_REPLY_BUBBLE)}>
           <MessageActionBar
             actions={[
               canRewind && {
@@ -731,7 +736,7 @@ const EventRowImpl = ({
           )}
           <div
             className={cn(
-              "text-sm leading-relaxed",
+              USER_REPLY_TEXT,
               userCollapsible && !userExpanded && "line-clamp-8",
             )}
           >

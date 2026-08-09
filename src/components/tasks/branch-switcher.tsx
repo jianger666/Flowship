@@ -68,6 +68,9 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
   const [saving, setSaving] = useState(false);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
+  // 分支状态刷新节流（运行中 task.updatedAt 高频变化，git 读取不跟着每事件刷）
+  const lastFetchAtRef = useRef(0);
+  const lastTaskIdRef = useRef<string | undefined>(undefined);
 
   const running = task.runStatus === "running";
   // task 隔离 worktree 未建好：只读提示、禁止切换
@@ -77,7 +80,14 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
 
   useEffect(() => {
     let alive = true;
-    setState(null);
+    const now = Date.now();
+    const switchedTask = lastTaskIdRef.current !== task.id;
+    lastTaskIdRef.current = task.id;
+    // 切 task → 立即刷；同任务按 updatedAt 节流（2s 一次）——
+    // worktree 中途从 detached 变成正式分支时 chip 必须跟上（曾实测一直停在「游离 HEAD」）
+    if (!switchedTask && now - lastFetchAtRef.current < 2000) return;
+    lastFetchAtRef.current = now;
+    if (switchedTask) setState(null);
     void fetchTaskBranches(task.id, repoPath)
       .then((s) => {
         if (alive) setState(s);
@@ -88,7 +98,7 @@ export const BranchSwitcher = ({ task, repoPath, variant, warning }: Props) => {
     return () => {
       alive = false;
     };
-  }, [task.id, repoPath]);
+  }, [task.id, task.runStatus, task.updatedAt, repoPath]);
 
   const filtered = useMemo(() => {
     const all = state?.branches ?? [];

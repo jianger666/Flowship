@@ -28,7 +28,7 @@ import { promisify } from "node:util";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import { dataRoot } from "./data-root";
+import { dataRoot, renameWithRetry } from "./data-root";
 import { enqueueMeegle } from "./meegle-queue";
 
 const execFileAsync = promisify(execFile);
@@ -215,14 +215,15 @@ const fetchNpmLatestMeta = async (pkg: string): Promise<NpmLatestMeta> => {
 };
 
 // 二进制原子就位（CR-05）：先拷到 bin 目录内的临时名、chmod 后 rename 到最终名
-// （同目录 rename 原子）——安装失败绝不把已装好的旧版本覆盖成半截
+// （同目录 rename 原子）——安装失败绝不把已装好的旧版本覆盖成半截。
+// Windows rename 覆盖在跑/被杀软扫描的 exe 会 EPERM/EBUSY——走 renameWithRetry 短退避重试
 const installBinaryAtomic = async (src: string, dest: string): Promise<void> => {
   await fs.mkdir(path.dirname(dest), { recursive: true });
   const staged = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     await fs.copyFile(src, staged);
     if (!isWin) await fs.chmod(staged, 0o755);
-    await fs.rename(staged, dest);
+    await renameWithRetry(staged, dest);
   } catch (err) {
     await fs.rm(staged, { force: true }).catch(() => {});
     throw err;

@@ -214,6 +214,8 @@ export interface GroupCreationTargets {
   matchedEmails: string[];
   /** 未命中的邮箱（还没用过 Flowship 群功能的人、跳过不报错） */
   missedEmails: string[];
+  /** 命中但 open_id 属于其它 Flowship 应用（飞书 open_id 应用级隔离、不能跨应用拉人建群） */
+  crossAppEmails: string[];
 }
 
 /**
@@ -223,6 +225,9 @@ export interface GroupCreationTargets {
  *   不带人的话建群人自己都看不见这个群
  * - 本机 bot 从 `bot_id_list` 里排除（建群者的 bot 自动入群）
  * - 未命中的人直接跳过——「同事还没用过 Flowship 群功能」是常态、不是错误
+ * - **跨应用成员只加 bot、不加本人**：飞书 open_id 是应用级隔离的，A 应用名下的
+ *   open_id 塞进 B 应用的 `user_id_list` 必报「open_id cross app」、整次建群失败
+ *   （2026-08-05 同事实测）。`bot_id_list` 按 app_id 全局可用，跨应用同事的 bot 仍照加。
  */
 export const pickGroupCreationTargets = (input: {
   ownerOpenId?: string;
@@ -235,6 +240,7 @@ export const pickGroupCreationTargets = (input: {
   const botIdList: string[] = [];
   const matchedEmails: string[] = [];
   const missedEmails: string[] = [];
+  const crossAppEmails: string[] = [];
   const seenUser = new Set<string>();
   const seenBot = new Set<string>();
   const seenEmail = new Set<string>();
@@ -259,20 +265,24 @@ export const pickGroupCreationTargets = (input: {
     }
     matchedEmails.push(email);
 
-    const openId = hit.openId.trim();
-    if (openId && !seenUser.has(openId) && userIdList.length < MAX_GROUP_USER_IDS) {
-      seenUser.add(openId);
-      userIdList.push(openId);
-    }
     // 角色顺序即优先级：先到的先占 ≤5 的 bot 额度
     const botAppId = hit.botAppId.trim();
+    // 只有当前应用名下的 open_id 才能进 user_id_list；跨应用的跳过本人（bot 仍照加）
+    const sameApp = ownBot !== "" && botAppId === ownBot;
+    const openId = hit.openId.trim();
+    if (openId && sameApp && !seenUser.has(openId) && userIdList.length < MAX_GROUP_USER_IDS) {
+      seenUser.add(openId);
+      userIdList.push(openId);
+    } else if (openId && !sameApp) {
+      crossAppEmails.push(email);
+    }
     if (botAppId && !seenBot.has(botAppId) && botIdList.length < MAX_GROUP_BOT_IDS) {
       seenBot.add(botAppId);
       botIdList.push(botAppId);
     }
   }
 
-  return { userIdList, botIdList, matchedEmails, missedEmails };
+  return { userIdList, botIdList, matchedEmails, missedEmails, crossAppEmails };
 };
 
 /** 本机身份是否与表里已有那条一致（一致就不写、不 push、不产生空提交） */

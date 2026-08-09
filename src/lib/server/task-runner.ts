@@ -1708,6 +1708,27 @@ const resumeCurrentActionCore = async (
           ? startTask.model
           : input.fallbackModel;
 
+  // 把本次实际启动的模型写回 action.agentModel：换模型唤醒（forceModel）跟当初的
+  // agentModel 不同、不写回的话「跟随会话」会一直显示该 action 当初的旧模型、
+  // 与实际在跑的模型不符（task-model.resolveSessionModel 以 agentModel 为单一来源）。
+  if (JSON.stringify(model) !== JSON.stringify(startAction.agentModel)) {
+    const modelPatched = await patchActionIfOwner(
+      fresh.id,
+      action.id,
+      { agentModel: model },
+      () => isOpOwner(opHandle),
+    );
+    if (modelPatched) {
+      publish(fresh.id, { kind: "task", task: modelPatched });
+      const modelPatchedAction = modelPatched.actions.find(
+        (a) => a.id === action.id,
+      );
+      if (modelPatchedAction) {
+        publish(fresh.id, { kind: "action", action: modelPatchedAction });
+      }
+    }
+  }
+
   const replanDirective = buildPlanReplanDirective(startAction, startTask);
 
   await abortIfTaskOpStale(fresh.id, opGen);
@@ -3933,6 +3954,8 @@ const consumeSessionRun = async (
     questionRun?: boolean;
     // V0.13.x 自动重连计数（tryAutoReconnect 递归时递增、防无限重连）
     reconnectAttempt?: number;
+    // 追问补交卷轮（run 自然结束未交卷的 send 追问）——该轮不启用交卷后静音豁免
+    followupTurn?: boolean;
     /**
      * V12：op handle 必传——owner（启动链 claim）或 observer（ask/one-shot 快照）。
      * 状态写门控走 isOpOwner；observer 的 release 是 no-op。
@@ -4122,6 +4145,7 @@ const consumeSessionRun = async (
         );
       },
     };
+    assistantCtx.followupTurn = opts.followupTurn ?? false;
 
     // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
     const perfStreamStart = Date.now();
@@ -4490,7 +4514,10 @@ const consumeSessionRun = async (
           return;
         }
         // 追问本身也是一轮 run、走同一管道（计数已 +1、再未交卷会再追或标 error）
-        await consumeSessionRun(task, agent, nextRun, opts);
+        await consumeSessionRun(task, agent, nextRun, {
+          ...opts,
+          followupTurn: true,
+        });
         return;
       }
       // 追问次数用尽 / 会话已死 → 标 error + 关会话

@@ -150,8 +150,9 @@ describe("ensureRequirementGroup", () => {
 
   // 免审 scope 下 open_id 换不出来 → 只能靠「每人自动注册 email→open_id/app_id」这张
   // 共享表；建群是唯一能带人 / 带 bot 的时机，命中的必须一次带齐
-  it("注册表命中：建群带上角色成员的 open_id + 他们各自的 bot", async () => {
+  it("注册表命中：同应用成员的 open_id 进名单、跨应用成员只加 bot 并留痕", async () => {
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_team" });
+    const warnings: string[] = [];
     const fetchRoleMemberEmails = vi
       .fn()
       .mockResolvedValue(["dev@x.com", "QA@x.com", "pm@x.com"]);
@@ -162,7 +163,9 @@ describe("ensureRequirementGroup", () => {
       readMemberRegistry: async () =>
         registryOf({
           "dev@x.com": { openId: "ou_dev", botAppId: "cli_dev", updatedAt: 1 },
-          "qa@x.com": { openId: "ou_qa", botAppId: "cli_qa", updatedAt: 1 },
+          // qa 与发起人同应用（cli_self）→ open_id 可进 user_id_list
+          "qa@x.com": { openId: "ou_qa", botAppId: "cli_self", updatedAt: 1 },
+          // pm 没配 bot、无法确认 open_id 所属应用 → 跳过本人
           "pm@x.com": { openId: "ou_pm", botAppId: "", updatedAt: 1 },
         }),
       fetchGroupType: vi
@@ -175,20 +178,22 @@ describe("ensureRequirementGroup", () => {
       fetchWorkitemName: async () => "登录优化",
       getBotInfo: async () => ({ appId: "cli_self", ownerOpenId: "ou_me" }),
       decodeUrl: async () => ({ workItemId: "10001", simpleName: "space" }),
+      warn: (m) => warnings.push(m),
     });
 
     await ensureRequirementGroup(baseTask());
     expect(fetchRoleMemberEmails).toHaveBeenCalledWith("10001", "space");
     expect(createChat).toHaveBeenCalledWith({
       name: "登录优化需求群",
-      // 发起人首位；pm 没配 bot 也照样进人名单
-      userIdList: ["ou_me", "ou_dev", "ou_qa", "ou_pm"],
+      // 发起人首位 + 同应用 qa；dev / pm 跨应用 / 无法确认 → 只加 bot 或不加
+      userIdList: ["ou_me", "ou_qa"],
       // 本机 bot 建群自动入群、不占 ≤5 额度
-      botIdList: ["cli_dev", "cli_qa"],
+      botIdList: ["cli_dev"],
     });
+    expect(warnings.some((w) => w.includes("跨应用"))).toBe(true);
   });
 
-  it("注册表部分未命中：命中的照拉、没注册的跳过并留痕（不报错）", async () => {
+  it("注册表部分未命中：未注册的跳过留痕；跨应用的只加 bot 不拉本人（不报错）", async () => {
     const createChat = vi.fn().mockResolvedValue({ chat_id: "oc_part" });
     const warnings: string[] = [];
 
@@ -216,10 +221,12 @@ describe("ensureRequirementGroup", () => {
     expect(r.created).toBe(true);
     expect(createChat).toHaveBeenCalledWith({
       name: "登录优化需求群",
-      userIdList: ["ou_me", "ou_dev"],
+      // dev 的 open_id 属于 cli_dev（≠ cli_self）→ 跨应用跳过本人
+      userIdList: ["ou_me"],
       botIdList: ["cli_dev"],
     });
     expect(warnings.some((w) => w.includes("stranger@x.com"))).toBe(true);
+    expect(warnings.some((w) => w.includes("跨应用"))).toBe(true);
   });
 
   it("角色查询挂 / 注册表读不出 → 降级只拉发起人，绝不挡住建群", async () => {

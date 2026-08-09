@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
 import { ConversationComposer } from "@/components/conversation-composer";
+import { SuspectStuckHint } from "@/components/tasks/suspect-stuck-hint";
 import {
   resolveSkillReferences,
   fetchSkills,
@@ -1706,11 +1707,18 @@ const EventStreamImpl = ({
       {hideReplyComposer || !isChat ? null : (
         <div className="shrink-0 px-6 pb-5 pt-1">
           {/* 运行中粘性状态行：挂 Composer 上方，turn 结束（非 running）自然消失 */}
-          {activeStatus && (
-            <div className="mx-auto w-full max-w-3xl">
+          <div className="mx-auto w-full max-w-3xl">
+            {activeStatus && (
               <ActiveStatusLine status={activeStatus} />
-            </div>
-          )}
+            )}
+            {/* 疑似卡住提示：与 task 详情页输入条共用同一组件 */}
+            <SuspectStuckHint
+              task={task}
+              streamingText={streamingText}
+              liveToolOutputs={liveToolOutputs}
+              className="mt-1 mb-0.5"
+            />
+          </div>
           <ConversationComposer
             {...rich.bind}
             editorKey={task.id}

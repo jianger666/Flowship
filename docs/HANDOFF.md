@@ -377,6 +377,9 @@ ai-flow-action-hub/
 - **每仓分支展示 + 切换**：项目卡片内分支 chip + 切换弹层（带警告）；worktree 未就绪禁切；分支下拉统一为 `BranchSwitcher`（chat select / task chip）。
 - **产物区 / 操作区打磨**：产物文件名并入 ArtifactPanel toolbar；timeline chip / 主操作按钮去冗余 tooltip；拖拽柄修点击黑框（outline-none）；预览 tooltip 只显示命令。
 - **门禁**：typecheck / lint 干净；vitest 全量通过（本地端口 / 子进程用例沙箱外复跑通过）；test 包构建通过。
+- **已知问题（待排查）**：旧 task 输入条提问偶发「AI 串消息」——答了前一天另一个事件的问题。排查结论：三条注入链路都带的是新消息文本，嫌疑在 `sendToTaskSession` 的 `Agent.resume`——上一回合若被中断（checkpoint 存了可续跑回合），resume+send 时 SDK 可能先把旧回合续完，产出昨日问题的答案；Flowship 未传 `local.force` 也没有上一 run 终态护栏。待同事 task id 坐实后再修（候选：resume 前 force / 或降级一次性答疑）。
+- **已知问题（grep 卡住，2026-08-05 同事 task t_1785900078207_h2nrri 实锤）**：模型 grep 不带 path（全 CWD）或 path 给仓库根时，Windows 机器上单次遍历 60–185s；工具调用串行——一个慢 grep 占住后后续工具全在排队，UI 看“多个工具一起卡”。根因是仓库根目录遍历慢（非隔离任务直接在原仓库跑、根下可能有 node_modules/target 等重型目录）+ 模型 grep 没带精确子路径 + Flowship 无工具级超时。修复候选：prompt 写死 grep 纪律（必须带精确 path、glob 只配子目录用）；可选工具看门狗；或默认隔离 worktree。
+- **已知问题（建群 open_id cross app，2026-08-05 已修）**：点「创建需求群」报 `open_id cross app`——飞书 open_id 应用级隔离，注册表里别的 Flowship 应用名下的 open_id 不能塞进当前应用的 `user_id_list`。已修：`pickGroupCreationTargets` 只把 `botAppId === 当前应用` 的成员 open_id 进名单，跨应用成员跳过本人（bot 照加、按 app_id 全局可用），并留 warn。
 
 ### 2026-07-28 团队 wk 流程门禁 + 交付中心配置 + REQ-ID 可编辑（v1.6.0）
 

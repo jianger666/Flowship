@@ -200,7 +200,7 @@ export const EditTaskDialog = ({ open, onOpenChange, task, onSaved }: Props) => 
     <Dialog open={open} onOpenChange={onOpenChange} disablePointerDismissal>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>编辑任务</DialogTitle>
+          <DialogTitle>任务基本信息</DialogTitle>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-1">

@@ -931,7 +931,7 @@ export const ArtifactPanel = ({
               等待
             </ChoiceButton>
           </Tooltip>
-          {currentArtifact && (
+          {currentArtifact && !searchActive && (
             <>
               <span className="mx-2 h-4 w-px shrink-0 bg-border/60" />
               <Tooltip content={currentArtifact.filename}>

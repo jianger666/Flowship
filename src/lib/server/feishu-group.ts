@@ -460,6 +460,13 @@ const resolveGroupInvites = async (
         `建群按注册表命中 ${picked.matchedEmails.length} 人、跳过 ${picked.missedEmails.length} 位未注册成员（${picked.missedEmails.join("、")}）——他们用一次 Flowship 群功能就会自动登记`,
       );
     }
+    if (picked.crossAppEmails.length > 0) {
+      // open_id 应用级隔离：别的 Flowship 应用名下的 open_id 不能跨应用拉人建群、
+      // 飞书会报「open_id cross app」整次建群失败——跳过本人、他们的 bot 仍随群加入
+      getDeps().warn(
+        `建群跳过 ${picked.crossAppEmails.length} 位跨应用成员（${picked.crossAppEmails.join("、")}）——open_id 属于其它 Flowship 应用、不能跨应用拉人；这些人的 bot 已加入群`,
+      );
+    }
     return picked;
   } catch (err) {
     getDeps().warn(
