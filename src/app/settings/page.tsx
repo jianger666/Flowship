@@ -298,7 +298,7 @@ const SettingsPage = () => {
               <CompanyEnvSection
                 value={settings.companyEnv ?? emptyCompanyEnv()}
                 onChange={(next) => update("companyEnv", next)}
-                onCommit={(next) => void saveFieldValue("companyEnv", next)}
+                onCommit={(next) => saveFieldValue("companyEnv", next)}
               />
               <Separator />
               {/* 团队 wk-harness 接入：WK 产出目录 + Delivery Hub（写 ~/.wk/config.yaml、不进 settings） */}

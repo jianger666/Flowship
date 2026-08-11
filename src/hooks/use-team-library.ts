@@ -60,8 +60,13 @@ const normalizeStatus = (raw: Partial<TeamLibraryStatus> | null | undefined): Te
 
 /**
  * @param active false 时不拉（如所在 tab 未展示）——默认 true
+ * @param opts.autoSyncOnActive true = 激活（挂载）时先静默 sync 一次再读——
+ *   用于「共享市场」这类希望打开就看到最新的页面（git 拉取失败静默、读本地缓存兜底）
  */
-export const useTeamLibrary = (active = true): UseTeamLibraryResult => {
+export const useTeamLibrary = (
+  active = true,
+  opts?: { autoSyncOnActive?: boolean },
+): UseTeamLibraryResult => {
   // 共享库 clone / token / 镜像权限等
   const [status, setStatus] = useState<TeamLibraryStatus | null>(null);
   // 可安装的 team action 列表
@@ -111,12 +116,34 @@ export const useTeamLibrary = (active = true): UseTeamLibraryResult => {
 
   useEffect(() => {
     if (!active) return;
-    void refresh();
+    // 首次挂载 abortRef 还是 null：effect 自持一个 controller，sync 也可被
+    // 卸载 / 新 refresh 取消；refresh 内部会接管 abortRef，cleanup 取消最新请求
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const run = async () => {
+      if (opts?.autoSyncOnActive) {
+        // 静默 sync：失败不 toast（走本地缓存兜底）、手动「同步」按钮仍有自己的反馈
+        try {
+          const res = await fetch("/api/team-library/sync", {
+            method: "POST",
+            signal: ac.signal,
+          });
+          if (!res.ok) {
+            // 没配 token 等场景：读缓存展示、由页面状态引导
+          }
+        } catch {
+          // AbortError（卸载）/ 网络错：静默
+        }
+      }
+      if (ac.signal.aborted) return;
+      await refresh();
+    };
+    void run();
     return () => {
       // 卸载 / active 关掉：取消进行中的请求，防 setState on unmounted
       abortRef.current?.abort();
     };
-  }, [active, refresh]);
+  }, [active, refresh, opts?.autoSyncOnActive]);
 
   return { status, actions, loading, refresh };
 };

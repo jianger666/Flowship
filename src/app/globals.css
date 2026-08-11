@@ -271,6 +271,10 @@
 .overflow-y-auto,
 .overflow-auto {
   scrollbar-gutter: stable;
+  /* 关掉 Chromium 滚动锚定：虚拟列表（Virtuoso）里锚点节点随虚拟窗口卸载/重建、
+     浏览器反复调 scrollTop 找锚点 = 滚动条上下振荡（chat 往回滚到代码块一带实测抖动）。
+     内容流式增高也不该动用户滚动位置——本应用滚动位置由 scroll-follow 自己管。 */
+  overflow-anchor: none;
 }
 
 /* ---------- Streamdown 代码块 / 表格减重（v1.0.x、用户实测「双层卡片 + 操作栏太重」） ----------

@@ -276,7 +276,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
   };
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 rounded-xl bg-card p-4 text-card-foreground ring-1 ring-foreground/10">
       {/* 手动入口：显式二选，避免「留空链接」隐式触发日常 */}
       {urlEditable && (
         <div className="grid gap-1.5">

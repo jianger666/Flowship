@@ -112,6 +112,118 @@ const removeFilesByExt = async (dir, ext) => {
   }
 };
 
+// pnpm 会把 optionalDependencies 也建成 node_modules 内层 symlink；不随包时目标不存在，
+// 断链进包会让 mac codesign --verify 报 No such file。打包前清掉这类链接。
+const removeBrokenSymlinks = async (dir) => {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isSymbolicLink()) {
+      const target = await fs.readlink(p);
+      const resolved = path.resolve(path.dirname(p), target);
+      if (!(await exists(resolved))) {
+        await fs.rm(p, { force: true }).catch(() => {});
+      }
+    } else if (e.isDirectory()) {
+      await removeBrokenSymlinks(p);
+    }
+  }
+};
+
+const readJsonFile = async (p) => {
+  try {
+    return JSON.parse(await fs.readFile(p, "utf8"));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * 定位依赖实体。优先从 searchDir（父包的 node_modules）解析，找不到再回退根目录：
+ * pnpm 里 ssh2 的 asn1 / bcrypt-pbkdf 只存在于 .pnpm/ssh2 包的 node_modules 内层、
+ * 不在根 node_modules，必须按这个顺序找才能把依赖树补全。
+ */
+const locatePkgEntity = async (rootDir, pkgName, searchDir) => {
+  const candidates = [];
+  if (searchDir) candidates.push(path.join(searchDir, pkgName));
+  candidates.push(path.join(rootDir, "node_modules", pkgName));
+
+  for (const pkgPath of candidates) {
+    const stat = await fs.lstat(pkgPath).catch(() => null);
+    if (!stat) continue;
+    if (stat.isSymbolicLink()) {
+      const target = await fs.readlink(pkgPath);
+      const resolved = path.resolve(path.dirname(pkgPath), target);
+      // 实体目录 = .pnpm/<encoded>@<version>；向上找到 node_modules 的父级
+      let entityDir = path.dirname(path.dirname(resolved));
+      let dir = resolved;
+      while (path.basename(dir) !== "node_modules") {
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+      if (path.basename(dir) === "node_modules") entityDir = path.dirname(dir);
+      return { entityDir, pnpmName: path.basename(entityDir) };
+    }
+    if (stat.isDirectory()) return { entityDir: pkgPath, pnpmName: null };
+  }
+  return null;
+};
+
+/**
+ * 脚本运行时包不在 Next 模块图里、file tracing 追不到，按依赖树显式补进 standalone。
+ * 只补 dependencies：ssh2 的 cpu-features / nan 是 optionalDependencies，
+ * 运行时 require 有 try/catch 降级、不随包（省掉原生二进制体积）。
+ */
+const addRuntimePackage = async (
+  rootDir,
+  destDir,
+  pkgName,
+  seen = new Set(),
+  searchDir,
+) => {
+  const info = await locatePkgEntity(rootDir, pkgName, searchDir);
+  if (!info) {
+    console.warn(`[assemble] 本机缺 ${pkgName}、跳过补运行时包`);
+    return;
+  }
+  const seenKey = info.pnpmName ?? pkgName;
+  if (seen.has(seenKey)) return;
+  seen.add(seenKey);
+
+  const pkgDir = info.pnpmName
+    ? path.join(info.entityDir, "node_modules", pkgName)
+    : info.entityDir;
+  const pkgJson = await readJsonFile(path.join(pkgDir, "package.json"));
+  const depsDir = info.pnpmName
+    ? path.join(info.entityDir, "node_modules")
+    : path.join(rootDir, "node_modules");
+  for (const dep of Object.keys(pkgJson?.dependencies ?? {})) {
+    await addRuntimePackage(rootDir, destDir, dep, seen, depsDir);
+  }
+
+  const destEntity = info.pnpmName
+    ? path.join(destDir, "node_modules", ".pnpm", info.pnpmName)
+    : path.join(destDir, "node_modules", pkgName);
+  await cp(info.entityDir, destEntity);
+
+  if (info.pnpmName) {
+    const linkPath = path.join(destDir, "node_modules", pkgName);
+    await fs.mkdir(path.dirname(linkPath), { recursive: true });
+    await fs.rm(linkPath, { force: true, recursive: true }).catch(() => {});
+    await fs.symlink(
+      path.join(".pnpm", info.pnpmName, "node_modules", pkgName),
+      linkPath,
+    );
+  }
+  console.log(`[assemble] 已补运行时包 ${pkgName}`);
+};
+
 export const assembleServerLayout = async (rootDir, destDir) => {
   const standaloneDir = path.join(rootDir, ".next", "standalone");
   if (!(await exists(standaloneDir))) {
@@ -140,7 +252,17 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   // ---------- 2. 运行时按 cwd 读的目录（tracing 对动态 fs 读不保证、显式拷一遍兜底） ----------
   await cp(path.join(rootDir, "prompts"), path.join(destDir, "prompts"));
   await cp(path.join(rootDir, "skills"), path.join(destDir, "skills"));
+  // ssh-exec：公司环境 SSH 执行脚本（agent 用 shell 调、密码脚本内读配置）
+  await cp(
+    path.join(rootDir, "scripts", "ssh-exec.mjs"),
+    path.join(destDir, "scripts", "ssh-exec.mjs"),
+  );
+  // ssh2 在 ssh-exec.mjs 模块加载时就 require、Next 没有任何 import 会把它带进 standalone
+  await addRuntimePackage(rootDir, destDir, "ssh2");
 
   // ---------- 3. SDK 平台二进制包（standalone trace 漏的 optional 平台包）----------
   await addSdkPlatformPackage(rootDir, destDir);
+
+  // 兜底：剪掉未随包的 optional 依赖断链，避免 mac codesign --verify 失败
+  await removeBrokenSymlinks(destDir);
 };

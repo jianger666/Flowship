@@ -56,7 +56,8 @@
 
 ## 打 test 包并重启（禁止 UI 自动化验收）
 
-- 完成需要用户在 FlowshipTest 中查看效果的改动后，Agent 可以直接执行 test 打包和进程级重启，**无需等待用户再次授权或确认**；用户明确说不要打包或不要重启时除外。
+- **日常迭代走 8776 浏览器热更新验证（这样快）**：用户直接在浏览器看 `http://localhost:8776/settings`（仓库 `next dev`、HMR 秒刷新、`FLOWSHIP_DATA_DIR` 指 `~/Library/Application Support/fe-ai-flow-test/data`）。改完代码 typecheck/lint 过即可让用户刷新看效果，**不打包壳**。dev 模式依赖 `next.config.mjs` 的 server 侧 `node:` externals（否则 `next dev` 报 UnhandledSchemeError）。
+- **只有涉及到需要 app 才能验收的地方、或者用户明确要求时，才打包 app**（走下面 test 打包）；用户明确说不要打包或不要重启时除外。
 - test 打包和进程级重启不属于「操作 App」：授权范围仅是 **构建、组 server 布局、打 staging unpacked test 包、精确退出旧 FlowshipTest 进程、部署到规范路径、启动新 test 包**，不包含读取或操作界面。
 - 一条命令：`pnpm electron:test:restart`（内部顺序：`BUILD_STANDALONE=1 pnpm build` → `pnpm electron:server` → `pnpm exec electron-builder` 打 **staging**（`dist/electron/.test-restart-staging/`、`productName=FlowshipTest`）→ 确认 staging 产物 → 退出旧 FlowshipTest → 备份并替换规范路径（mac `dist/electron/mac-{arch}/FlowshipTest.app` / win `dist/electron/win-unpacked/FlowshipTest.exe`）→ 启动规范路径新包）。仅 `electron:dist:test` 仍可用于只打 mac test 包（仍写规范路径）。
 - 命令调用：`process.execPath` + `npm_execpath` 调 pnpm，`pnpm exec electron-builder` 调 builder；禁止依赖 `pnpm.cmd` / `electron-builder.cmd` 或 shell 拼接。

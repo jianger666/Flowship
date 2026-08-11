@@ -148,7 +148,7 @@ export const Combobox = ({
               const target = filtered[0] ?? customCandidate;
               if (target) pick(target);
             }}
-            placeholder="搜索或输入…"
+            placeholder="搜索或输入自定义选项"
             className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
         </div>

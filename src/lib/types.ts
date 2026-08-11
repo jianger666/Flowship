@@ -204,11 +204,9 @@ export const labelTeamCategoryBadge = (
  * 排查类 skill / action 用：服务器 SSH、PG、日志路径、XXL-Job、Nacos、ELK。
  * 凭据只进 config.json / company-env.json，不进 prompt / 共享库。
  */
-export type CompanyEnvServerEnv = "test" | "dev";
-
 export interface CompanyEnvServer {
-  name: string;
-  env: CompanyEnvServerEnv;
+  /** 环境标识（dev / test / production，可自定义） */
+  env: string;
   host: string;
   port: number;
   user: string;
@@ -216,19 +214,14 @@ export interface CompanyEnvServer {
 }
 
 /**
- * PG / Nacos / ELK 多实例的共同标识字段（取 servers 的 `name` + xxljob 的自由 `env` 并集）。
- * - `name`：人看的名字（「CRM 测试库」/「预发库」），实例卡标题 + `FS_ENV_*_NAME`
- * - `env`：环境段、自由字符串（test / pre / prod 都行，不做窄联合），决定
- *   `FS_ENV_<子系统>_<环境段>_*` 里的段名；留空 = 不带环境段
+ * PG / Nacos / ELK 多实例的共同标识字段：自由 `env` 字符串。
+ * 环境段 test / pre / prod 都行（不做窄联合），决定
+ * `FS_ENV_<子系统>_<环境段>_*` 里的段名；留空 = 不带环境段。
  *
- * 两者都不要求唯一：同一环境段下第 2 条起自动加 `_2` / `_3` 序号后缀。
+ * env 不要求唯一：同一环境段下第 2 条起自动加 `_2` / `_3` 序号后缀。
  */
-export interface CompanyEnvInstanceId {
-  name: string;
+export interface CompanyEnvPg {
   env: string;
-}
-
-export interface CompanyEnvPg extends CompanyEnvInstanceId {
   host: string;
   port: number;
   user: string;
@@ -250,7 +243,8 @@ export interface CompanyEnvXxlJob {
 }
 
 /** Nacos 集群：测试 / 生产通常是两套独立集群（namespaces 只是单个集群内部的隔离维度） */
-export interface CompanyEnvNacos extends CompanyEnvInstanceId {
+export interface CompanyEnvNacos {
+  env: string;
   baseUrl: string;
   username: string;
   password: string;
@@ -259,44 +253,29 @@ export interface CompanyEnvNacos extends CompanyEnvInstanceId {
   readonly: boolean;
 }
 
-export interface CompanyEnvElk extends CompanyEnvInstanceId {
+export interface CompanyEnvElk {
+  env: string;
   baseUrl: string;
   username: string;
   password: string;
   dataView: string;
 }
 
-/** HTTP API 认证：无 / 固定 Header / 登录换 token */
-export type CompanyEnvHttpApiAuth =
-  | { type: "none" }
-  | { type: "header"; headerName: string; headerValue: string }
-  | {
-      type: "login";
-      loginUrl: string;
-      username: string;
-      password: string;
-      /** 响应里 token 取值路径，如 `token` / `data.accessToken` */
-      tokenPath: string;
-      authHeaderName: string;
-      /** 如 `Bearer {token}` */
-      authHeaderTemplate: string;
-    };
-
 /**
  * 业务 HTTP API（排查时 AI 调业务接口验证）。
+ * 认证不单独配置：需要时用户在 note 里说明登录接口，AI 自己调用并从 JSON 响应取 token。
  * note 落 company-env.json 供 AI 读文件时看到；不进 prompt 常驻声明。
  */
 export interface CompanyEnvHttpApi {
-  name: string;
   env: string;
-  baseUrl: string;
-  auth: CompanyEnvHttpApiAuth;
+  url: string;
   /** 给 AI 的用法提示（选填），如分页参数 / token 有效期 */
   note?: string;
 }
 
 /** Redis 实例（排查时 AI 连 Redis 查 key / 缓存） */
-export interface CompanyEnvRedis extends CompanyEnvInstanceId {
+export interface CompanyEnvRedis {
+  env: string;
   host: string;
   port: number;
   /** 逻辑库序号，如 0 */

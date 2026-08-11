@@ -36,7 +36,30 @@ const nextConfig = {
   // @cursor/sdk 是 server-only 的大依赖、让 Next 不打进 bundle、
   // 运行时直接 require；同时回避 webpack 解析 SDK 自带的 .d.ts.map
   // 时报 "Module parse failed: Unexpected token" 的问题。
-  serverExternalPackages: ["@cursor/sdk"],
+  serverExternalPackages: ["@cursor/sdk", "ssh2"],
+  // dev 模式（next dev）：server 侧代码里的 `node:xxx` 内建模块让 webpack 全走
+  // 运行时 require（默认 externalsPresets 覆盖不到、会报 UnhandledSchemeError）。
+  // 仅 server 构建生效、不改 client bundle；standalone 构建同样受益、行为不变。
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      config.externals = config.externals ?? [];
+      const list = Array.isArray(config.externals) ? config.externals : [config.externals];
+      list.push(({ request }, callback) => {
+        if (request && request.startsWith("node:")) {
+          return callback(null, `commonjs ${request}`);
+        }
+        // ssh2 的可选原生依赖 cpu-features：本机没构建 .node 二进制、
+        // webpack 硬打包会 Module not found；外部化后运行时 require 失败
+        // 由 ssh2 自己的 try/catch 降级（纯 JS 实现照样可用）
+        if (request === "cpu-features") {
+          return callback(null, "commonjs cpu-features");
+        }
+        callback();
+      });
+      config.externals = list;
+    }
+    return config;
+  },
   // Electron 桌面端打包：CI 设 BUILD_STANDALONE=1 产出自包含 server.js + 最小 node_modules、
   // 由 assemble-electron-server.mjs 组进安装包 resources。日常 dev / `pnpm serve`（next start）
   // 不开——standalone 模式下 next start 不可用、两条路用 env 隔开互不影响。

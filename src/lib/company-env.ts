@@ -11,7 +11,6 @@ import type {
   CompanyEnvCustom,
   CompanyEnvElk,
   CompanyEnvHttpApi,
-  CompanyEnvHttpApiAuth,
   CompanyEnvNacos,
   CompanyEnvPg,
   CompanyEnvRedis,
@@ -31,11 +30,23 @@ export const emptyCompanyEnv = (): CompanyEnv => ({
   httpApis: [],
 });
 
+export type CompanyEnvServerIssue = "missing-env" | "missing-user";
+
+/** 已填 host 的服务器必须同时有 env 和 user，否则 ssh-exec 无法选中 / 连接 */
+export const findCompanyEnvServerIssue = (
+  env: Pick<CompanyEnv, "servers">,
+): CompanyEnvServerIssue | null => {
+  const missingEnv = env.servers.find((s) => s.host.trim() && !s.env.trim());
+  if (missingEnv) return "missing-env";
+  const missingUser = env.servers.find((s) => s.host.trim() && !s.user.trim());
+  if (missingUser) return "missing-user";
+  return null;
+};
+
 /** 模板预览用示例（密码统一 `【填写】`，导出给同事填） */
 export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   servers: [
     {
-      name: "app-test-01",
       env: "test",
       host: "10.0.1.10",
       port: 22,
@@ -43,7 +54,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       password: "【填写】",
     },
     {
-      name: "app-dev-01",
       env: "dev",
       host: "10.0.2.10",
       port: 22,
@@ -54,7 +64,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   // 两条：体现「不同环境 / 不同业务库是不同 host + 不同账号」的多实例用法
   pg: [
     {
-      name: "CRM 测试库",
       env: "test",
       host: "10.0.3.20",
       port: 5432,
@@ -63,7 +72,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
       readonly: true,
     },
     {
-      name: "CRM 预发库",
       env: "pre",
       host: "10.0.4.20",
       port: 5432,
@@ -76,7 +84,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   // 用户在自己配置里填实际值
   redis: [
     {
-      name: "测试缓存",
       env: "test",
       host: "10.0.5.10",
       port: 6379,
@@ -106,7 +113,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   ],
   nacos: [
     {
-      name: "测试集群",
       env: "test",
       baseUrl: "http://nacos-test.example.com:8848",
       username: "nacos",
@@ -117,7 +123,6 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   ],
   elk: [
     {
-      name: "Kibana 测试",
       env: "test",
       baseUrl: "https://kibana-test.example.com",
       username: "readonly",
@@ -127,29 +132,13 @@ export const COMPANY_ENV_TEMPLATE: CompanyEnv = {
   ],
   httpApis: [
     {
-      name: "CRM",
       env: "test",
-      baseUrl: "https://api-test.example.com",
-      auth: {
-        type: "login",
-        loginUrl: "https://api-test.example.com/auth/login",
-        username: "readonly",
-        password: "【填写】",
-        tokenPath: "token",
-        authHeaderName: "Authorization",
-        authHeaderTemplate: "Bearer {token}",
-      },
-      note: "登录后 token 有效期约 2h；分页参数用 page/pageSize",
+      url: "https://api-test.example.com",
+      note: "鉴权：先 POST /auth/login 拿 token（响应 JSON 的 token 字段），后续带 Authorization: Bearer <token>；分页参数用 page/pageSize",
     },
     {
-      name: "OpenAPI",
       env: "test",
-      baseUrl: "https://openapi-test.example.com",
-      auth: {
-        type: "header",
-        headerName: "X-Api-Key",
-        headerValue: "【填写】",
-      },
+      url: "https://openapi-test.example.com",
     },
   ],
 };
@@ -194,16 +183,17 @@ const normalizeServer = (
   }
   const o = raw as Record<string, unknown>;
   const envRaw = asTrimmedString(o.env);
-  const env =
-    envRaw === "test" || envRaw === "dev" ? envRaw : undefined;
-  if (!env) {
-    warnings.push(`servers[${idx}].env 非法、已跳过`);
-    return null;
+  const env = envRaw ?? "";
+  const host = asTrimmedString(o.host) ?? "";
+  if (host && !env) {
+    warnings.push(`servers[${idx}] 有主机但缺环境名、SSH 的 --env 无法选中（已保留，请补 env）`);
+  }
+  if (host && !(asTrimmedString(o.user) ?? "")) {
+    warnings.push(`servers[${idx}] 有主机但缺用户、SSH 无法连接（已保留，请补 user）`);
   }
   return {
-    name: asTrimmedString(o.name) ?? "",
     env,
-    host: asTrimmedString(o.host) ?? "",
+    host,
     port: asPort(o.port, 22),
     user: asTrimmedString(o.user) ?? "",
     password: typeof o.password === "string" ? o.password : "",
@@ -220,13 +210,8 @@ const normalizeXxl = (
     return null;
   }
   const o = raw as Record<string, unknown>;
-  const env = asTrimmedString(o.env);
-  if (!env) {
-    warnings.push(`xxljob[${idx}].env 缺失、已跳过`);
-    return null;
-  }
   return {
-    env,
+    env: asTrimmedString(o.env) ?? "",
     baseUrl: asTrimmedString(o.baseUrl) ?? "",
     username: asTrimmedString(o.username) ?? "",
     password: typeof o.password === "string" ? o.password : "",
@@ -234,14 +219,12 @@ const normalizeXxl = (
   };
 };
 
-/** 多实例小节的公共标识字段（name / env 都允许留空） */
-const instanceId = (o: Record<string, unknown>) => ({
-  name: asTrimmedString(o.name) ?? "",
-  env: asTrimmedString(o.env) ?? "",
-});
+/** 多实例小节的公共标识字段（env 允许留空；空 = 不带环境段） */
+const instanceEnv = (o: Record<string, unknown>): string =>
+  asTrimmedString(o.env) ?? "";
 
 const normalizePg = (o: Record<string, unknown>): CompanyEnvPg => ({
-  ...instanceId(o),
+  env: instanceEnv(o),
   host: asTrimmedString(o.host) ?? "",
   port: asPort(o.port, 5432),
   user: asTrimmedString(o.user) ?? "",
@@ -250,7 +233,7 @@ const normalizePg = (o: Record<string, unknown>): CompanyEnvPg => ({
 });
 
 const normalizeRedis = (o: Record<string, unknown>): CompanyEnvRedis => ({
-  ...instanceId(o),
+  env: instanceEnv(o),
   host: asTrimmedString(o.host) ?? "",
   port: asPort(o.port, 6379),
   db: typeof o.db === "number" && Number.isFinite(o.db) && o.db >= 0 ? Math.floor(o.db) : 0,
@@ -264,7 +247,7 @@ const normalizeCustom = (o: Record<string, unknown>): CompanyEnvCustom => ({
 });
 
 const normalizeNacos = (o: Record<string, unknown>): CompanyEnvNacos => ({
-  ...instanceId(o),
+  env: instanceEnv(o),
   baseUrl: asTrimmedString(o.baseUrl) ?? "",
   username: asTrimmedString(o.username) ?? "",
   password: typeof o.password === "string" ? o.password : "",
@@ -273,7 +256,7 @@ const normalizeNacos = (o: Record<string, unknown>): CompanyEnvNacos => ({
 });
 
 const normalizeElk = (o: Record<string, unknown>): CompanyEnvElk => ({
-  ...instanceId(o),
+  env: instanceEnv(o),
   baseUrl: asTrimmedString(o.baseUrl) ?? "",
   username: asTrimmedString(o.username) ?? "",
   password: typeof o.password === "string" ? o.password : "",
@@ -311,41 +294,6 @@ const normalizeInstanceList = <T>(
   return [one(raw as Record<string, unknown>)];
 };
 
-const normalizeHttpAuth = (
-  raw: unknown,
-  warnings: string[],
-  idx: number,
-): CompanyEnvHttpApiAuth => {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    warnings.push(`httpApis[${idx}].auth 缺失或非法、回落 none`);
-    return { type: "none" };
-  }
-  const a = raw as Record<string, unknown>;
-  const type = a.type;
-  if (type === "header") {
-    return {
-      type: "header",
-      headerName: asTrimmedString(a.headerName) ?? "",
-      headerValue: typeof a.headerValue === "string" ? a.headerValue : "",
-    };
-  }
-  if (type === "login") {
-    return {
-      type: "login",
-      loginUrl: asTrimmedString(a.loginUrl) ?? "",
-      username: asTrimmedString(a.username) ?? "",
-      password: typeof a.password === "string" ? a.password : "",
-      tokenPath: asTrimmedString(a.tokenPath) ?? "",
-      authHeaderName: asTrimmedString(a.authHeaderName) ?? "",
-      authHeaderTemplate: asTrimmedString(a.authHeaderTemplate) ?? "",
-    };
-  }
-  if (type !== "none" && type !== undefined) {
-    warnings.push(`httpApis[${idx}].auth.type 未知（${String(type)}）、回落 none`);
-  }
-  return { type: "none" };
-};
-
 const normalizeHttpApi = (
   raw: unknown,
   warnings: string[],
@@ -358,10 +306,8 @@ const normalizeHttpApi = (
   const o = raw as Record<string, unknown>;
   const note = asTrimmedString(o.note);
   return {
-    name: asTrimmedString(o.name) ?? "",
     env: asTrimmedString(o.env) ?? "",
-    baseUrl: asTrimmedString(o.baseUrl) ?? "",
-    auth: normalizeHttpAuth(o.auth, warnings, idx),
+    url: asTrimmedString(o.url) ?? "",
     ...(note ? { note } : {}),
   };
 };
@@ -441,7 +387,6 @@ const isFlowshipCompanyEnvShape = (raw: unknown): boolean => {
     "servers" in o ||
     "pg" in o ||
     "redis" in o ||
-    "kafka" in o ||
     "custom" in o ||
     "xxljob" in o ||
     "nacos" in o ||
@@ -491,7 +436,7 @@ const readonlyNote = (
   const readonlyCount = rows.filter((r) => r.readonly !== false).length;
   if (readonlyCount === 0) return "";
   if (readonlyCount === rows.length) return `（只读——${constraint}）`;
-  return `（其中 ${readonlyCount} 个只读——${constraint}；其余可写，以配置文件里每条的 readonly 为准）`;
+  return `（部分只读——${constraint}；其余可写，以配置文件里每条的 readonly 为准）`;
 };
 
 /**
@@ -502,6 +447,8 @@ const readonlyNote = (
 export const buildCompanyEnvBrief = (
   env: CompanyEnv | null | undefined,
   fileAbsPath: string,
+  /** SSH 执行脚本路径（agent 用 shell 调；缺省给名字、正式调用方传绝对路径） */
+  sshExecPath = "ssh-exec.mjs",
 ): string => {
   if (!env) return "";
   // 闸门与 isCompanyEnvConfigured 同一谓词：任一子系统有实质配置即注入
@@ -515,21 +462,27 @@ export const buildCompanyEnvBrief = (
   const elkCount = env.elk.filter((e) => e.baseUrl.trim()).length;
 
   const parts: string[] = [];
-  if (serverCount > 0) parts.push(`服务器 ${serverCount} 台`);
+  if (serverCount > 0) parts.push("服务器");
   if (pgRows.length > 0) {
     parts.push(
-      `PostgreSQL ${pgRows.length} 个实例${readonlyNote(
+      `PostgreSQL${readonlyNote(
         pgRows,
         "只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DDL",
       )}`,
     );
   }
   const customRows = env.custom.filter((c) => c.name.trim() || c.content.trim());
-  if (customRows.length > 0) parts.push(`自定义 ${customRows.length} 条`);
+  if (customRows.length > 0) {
+    // 名称是语义锚点（如「日志路径模板」让 AI 关联服务器 env 拼命令）——只列名称、不列内容
+    const names = customRows.map((c) => c.name.trim()).filter(Boolean);
+    parts.push(
+      names.length > 0 ? `自定义（${names.join("、")}）` : "自定义",
+    );
+  }
   const redisRows = env.redis.filter((r) => r.host.trim());
   if (redisRows.length > 0) {
     parts.push(
-      `Redis ${redisRows.length} 个实例${readonlyNote(
+      `Redis${readonlyNote(
         redisRows,
         "只允许读 key / 查缓存，禁止写入",
       )}`,
@@ -544,28 +497,32 @@ export const buildCompanyEnvBrief = (
   }
   if (nacosRows.length > 0) {
     parts.push(
-      `Nacos ${nacosRows.length} 个集群${readonlyNote(
+      `Nacos${readonlyNote(
         nacosRows,
         "只允许读配置、禁止发布修改",
       )}`,
     );
   }
-  if (elkCount > 0) parts.push(`ELK ${elkCount} 个实例`);
+  if (elkCount > 0) parts.push("ELK");
   const httpApiCount = (env.httpApis ?? []).filter((h) =>
-    h.baseUrl.trim(),
+    h.url.trim(),
   ).length;
-  if (httpApiCount > 0) parts.push(`HTTP API ${httpApiCount} 条`);
+  if (httpApiCount > 0) parts.push("HTTP API");
 
   const abs = fileAbsPath.trim() || "company-env.json";
+  const sshNote =
+    serverCount > 0
+      ? `SSH 登录服务器用平台脚本 \`node "${sshExecPath}" --config "${abs}" --env <环境名> [--user <用户>] -- '<远程命令>'\`（整个远程命令必须作为单个带引号的参数传入，脚本原样执行；凭据由脚本从本文件读取、命令不含密码），不要自行拼 ssh 命令。`
+      : "";
   return [
     "## 公司环境",
-    `公司环境已配置（配置文件：\`${abs}\`，已填：${parts.join("、")}）。需要查服务器日志 / 查测试库 / 看调度任务 / 查配置中心 / 调业务 API 时读取该文件使用；禁止 cat 整个文件或打印其中密码字段，只允许在命令中引用（如 PGPASSWORD 环境变量方式）。`,
+    `公司环境已配置（配置文件：\`${abs}\`，已填：${parts.join("、")}）。需要查服务器日志 / 查测试库 / 看调度任务 / 查配置中心 / 调业务 API 时读取该文件使用；禁止 cat 整个文件或打印其中密码字段。条目里的 note 字段是给 AI 的用法提示（尤其 HTTP API），读取 company-env.json 时注意。${sshNote}`,
   ].join("\n");
 };
 
 /**
  * 核心字段是否已配（推进弹窗缺配置提示用）。
- * 任一：有 host 的服务器 / PG host / XXL baseUrl / Nacos baseUrl / ELK baseUrl / HTTP baseUrl。
+ * 任一：有 host 的服务器 / PG host / XXL baseUrl / Nacos baseUrl / ELK baseUrl / HTTP url。
  */
 export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => {
   if (!env) return false;
@@ -576,7 +533,7 @@ export const isCompanyEnvConfigured = (env: CompanyEnv | undefined): boolean => 
   if (env.xxljob.some((x) => x.baseUrl.trim())) return true;
   if (env.nacos.some((n) => n.baseUrl.trim())) return true;
   if (env.elk.some((e) => e.baseUrl.trim())) return true;
-  if ((env.httpApis ?? []).some((h) => h.baseUrl.trim())) return true;
+  if ((env.httpApis ?? []).some((h) => h.url.trim())) return true;
   return false;
 };
 
@@ -627,24 +584,22 @@ export const companyEnvToEnvVars = (
   const out: Record<string, string> = {};
   if (!env) return out;
 
-  const envCount = new Map<string, number>();
+  const serverCount = new Map<string, number>();
   for (const s of env.servers) {
-    const seg = envSegment(s.env);
-    const n = (envCount.get(seg) ?? 0) + 1;
-    envCount.set(seg, n);
+    const seg = s.env.trim() ? envSegment(s.env) : "";
+    const n = (serverCount.get(seg) ?? 0) + 1;
+    serverCount.set(seg, n);
     const suffix = n === 1 ? "" : `_${n}`;
-    const prefix = `FS_ENV_${seg}_SSH${suffix}`;
+    const prefix = seg ? `FS_ENV_${seg}_SSH${suffix}` : `FS_ENV_SSH${suffix}`;
     put(out, `${prefix}_HOST`, s.host.trim());
     put(out, `${prefix}_PORT`, s.port);
     put(out, `${prefix}_USER`, s.user.trim());
     put(out, `${prefix}_PASSWORD`, s.password);
-    put(out, `${prefix}_NAME`, s.name.trim());
   }
 
   const pgCount = new Map<string, number>();
   for (const p of env.pg) {
     const prefix = instanceVarPrefix("PG", p.env, pgCount);
-    put(out, `${prefix}_NAME`, p.name.trim());
     put(out, `${prefix}_HOST`, p.host.trim());
     put(out, `${prefix}_PORT`, p.port);
     put(out, `${prefix}_USER`, p.user.trim());
@@ -655,7 +610,6 @@ export const companyEnvToEnvVars = (
   const redisCount = new Map<string, number>();
   for (const r of env.redis) {
     const prefix = instanceVarPrefix("REDIS", r.env, redisCount);
-    put(out, `${prefix}_NAME`, r.name.trim());
     put(out, `${prefix}_HOST`, r.host.trim());
     put(out, `${prefix}_PORT`, r.port);
     put(out, `${prefix}_DB`, r.db);
@@ -665,11 +619,7 @@ export const companyEnvToEnvVars = (
 
   const xxlCount = new Map<string, number>();
   for (const x of env.xxljob) {
-    const seg = envSegment(x.env);
-    const n = (xxlCount.get(seg) ?? 0) + 1;
-    xxlCount.set(seg, n);
-    const suffix = n === 1 ? "" : `_${n}`;
-    const prefix = `FS_ENV_XXLJOB_${seg}${suffix}`;
+    const prefix = instanceVarPrefix("XXLJOB", x.env, xxlCount);
     put(out, `${prefix}_BASE_URL`, x.baseUrl.trim());
     put(out, `${prefix}_USERNAME`, x.username.trim());
     put(out, `${prefix}_PASSWORD`, x.password);
@@ -679,7 +629,6 @@ export const companyEnvToEnvVars = (
   const nacosCount = new Map<string, number>();
   for (const n of env.nacos) {
     const prefix = instanceVarPrefix("NACOS", n.env, nacosCount);
-    put(out, `${prefix}_NAME`, n.name.trim());
     put(out, `${prefix}_BASE_URL`, n.baseUrl.trim());
     put(out, `${prefix}_USERNAME`, n.username.trim());
     put(out, `${prefix}_PASSWORD`, n.password);
@@ -692,7 +641,6 @@ export const companyEnvToEnvVars = (
   const elkCount = new Map<string, number>();
   for (const e of env.elk) {
     const prefix = instanceVarPrefix("ELK", e.env, elkCount);
-    put(out, `${prefix}_NAME`, e.name.trim());
     put(out, `${prefix}_BASE_URL`, e.baseUrl.trim());
     put(out, `${prefix}_USERNAME`, e.username.trim());
     put(out, `${prefix}_PASSWORD`, e.password);
@@ -701,39 +649,16 @@ export const companyEnvToEnvVars = (
 
   const httpCount = new Map<string, number>();
   for (const h of env.httpApis ?? []) {
-    const seg = envSegment(h.env || h.name || "API");
+    const seg = envSegment(h.env || "API");
     const n = (httpCount.get(seg) ?? 0) + 1;
     httpCount.set(seg, n);
     const suffix = n === 1 ? "" : `_${n}`;
     const prefix = `FS_ENV_HTTPAPI_${seg}${suffix}`;
-    put(out, `${prefix}_NAME`, h.name.trim());
-    put(out, `${prefix}_BASE_URL`, h.baseUrl.trim());
-    put(out, `${prefix}_AUTH_TYPE`, h.auth.type);
+    put(out, `${prefix}_URL`, h.url.trim());
     if (h.note?.trim()) put(out, `${prefix}_NOTE`, h.note.trim());
-    if (h.auth.type === "header") {
-      put(out, `${prefix}_HEADER_NAME`, h.auth.headerName.trim());
-      put(out, `${prefix}_HEADER_VALUE`, h.auth.headerValue);
-    } else if (h.auth.type === "login") {
-      put(out, `${prefix}_LOGIN_URL`, h.auth.loginUrl.trim());
-      put(out, `${prefix}_USERNAME`, h.auth.username.trim());
-      put(out, `${prefix}_PASSWORD`, h.auth.password);
-      put(out, `${prefix}_TOKEN_PATH`, h.auth.tokenPath.trim());
-      put(out, `${prefix}_AUTH_HEADER_NAME`, h.auth.authHeaderName.trim());
-      put(
-        out,
-        `${prefix}_AUTH_HEADER_TEMPLATE`,
-        h.auth.authHeaderTemplate.trim(),
-      );
-    }
   }
 
   return out;
-};
-
-const cloneHttpAuth = (auth: CompanyEnvHttpApiAuth): CompanyEnvHttpApiAuth => {
-  if (auth.type === "none") return { type: "none" };
-  if (auth.type === "header") return { ...auth };
-  return { ...auth };
 };
 
 /** 深拷贝（settings clone / dirty 比较前防共享引用） */
@@ -745,8 +670,5 @@ export const cloneCompanyEnv = (env: CompanyEnv): CompanyEnv => ({
   xxljob: env.xxljob.map((x) => ({ ...x })),
   nacos: env.nacos.map((n) => ({ ...n, namespaces: [...n.namespaces] })),
   elk: env.elk.map((e) => ({ ...e })),
-  httpApis: (env.httpApis ?? []).map((h) => ({
-    ...h,
-    auth: cloneHttpAuth(h.auth),
-  })),
+  httpApis: (env.httpApis ?? []).map((h) => ({ ...h })),
 });

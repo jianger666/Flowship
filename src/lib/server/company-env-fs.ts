@@ -31,7 +31,11 @@ export const loadCompanyEnvBriefSection = async (): Promise<string> => {
     const result = await readSettingsFile();
     if (result.status !== "ok") return "";
     const env = normalizeCompanyEnv(result.settings.companyEnv);
-    return buildCompanyEnvBrief(env, companyEnvFilePath());
+    return buildCompanyEnvBrief(
+      env,
+      companyEnvFilePath(),
+      path.join(process.cwd(), "scripts", "ssh-exec.mjs"),
+    );
   } catch {
     return "";
   }
@@ -40,7 +44,12 @@ export const loadCompanyEnvBriefSection = async (): Promise<string> => {
 /** 同步版：调用方已持有 CompanyEnv（避免重复读盘） */
 export const companyEnvBriefFromEnv = (
   env: CompanyEnv | null | undefined,
-): string => buildCompanyEnvBrief(env ?? null, companyEnvFilePath());
+): string =>
+  buildCompanyEnvBrief(
+    env ?? null,
+    companyEnvFilePath(),
+    path.join(process.cwd(), "scripts", "ssh-exec.mjs"),
+  );
 
 /** 把 CompanyEnv 原子写到 company-env.json（0600） */
 export const writeCompanyEnvFile = async (env: CompanyEnv): Promise<void> => {

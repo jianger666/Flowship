@@ -53,7 +53,10 @@ const categoryKeyFromDir = (dirPath: string): string | null => {
 
 export const InstallTeamActions = ({ onInstalled }: Props) => {
   const { confirm } = useDialog();
-  const { status, actions, loading, refresh } = useTeamLibrary(true);
+  const { status, actions, loading, refresh } = useTeamLibrary(true, {
+    // 切到共享市场即静默 sync 一次：同事刚上传的 action 打开就能看到（不用手动刷新）
+    autoSyncOnActive: true,
+  });
   // 分类 chip（"all" 或分类 key）
   const [activeChip, setActiveChip] = useState("all");
   // 同步中

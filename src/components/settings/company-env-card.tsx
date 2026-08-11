@@ -26,10 +26,11 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import { Tooltip } from "@/components/ui/tooltip";
 import {
   Dialog,
@@ -40,17 +41,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/ui/password-input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   companyEnvTemplateJson,
+  findCompanyEnvServerIssue,
   isCompanyEnvConfigured,
   isXxljobReadonly,
   parseCompanyEnvImport,
@@ -61,7 +56,6 @@ import type {
   CompanyEnv,
   CompanyEnvElk,
   CompanyEnvHttpApi,
-  CompanyEnvHttpApiAuth,
   CompanyEnvCustom,
   CompanyEnvNacos,
   CompanyEnvPg,
@@ -85,8 +79,26 @@ interface CompanyEnvSectionProps {
   /** 草稿变更（输入中） */
   onChange: (next: CompanyEnv) => void;
   /** 落盘（失焦 / 增删 / 导入） */
-  onCommit: (next: CompanyEnv) => void;
+  onCommit: (next: CompanyEnv) => Promise<boolean> | boolean;
 }
+
+/** 环境字段候选（Combobox 支持自由输入其它值） */
+const ENV_OPTIONS = ["dev", "test", "production"];
+
+/** 字段顺序无关的稳定序列化：落盘去重 key 不受对象键顺序影响 */
+const stableKey = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableKey).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableKey(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
 
 /** 迷你 label + 控件（并排字段用、禁 placeholder-only） */
 const MiniField = ({
@@ -100,7 +112,9 @@ const MiniField = ({
 }) => (
   <label className={className ?? "min-w-0 flex-1 space-y-0.5"}>
     <span className="text-[11px] text-muted-foreground">{label}</span>
-    {children}
+    {/* children 包一层 div：PopoverTrigger 弹层打开时会注入 FocusGuard 兄弟节点，
+       直接裸露会被 space-y 当成额外子元素、给控件加 2px margin（实测抖动） */}
+    <div>{children}</div>
   </label>
 );
 
@@ -131,54 +145,40 @@ const AddRowButton = ({
   </Button>
 );
 
-/**
- * 多实例卡片头：名称 + 环境 +（只读开关）+ 删除。
- * PG / Nacos / ELK 三处共用，字段布局与「服务器」小节的实例卡对齐。
- */
+/** 多实例卡片头：环境 +（只读开关）+ 删除，PG / Nacos / ELK 三处共用。 */
+/** 首行：环境字段（放最前）；只读 + 删除由 InstanceRowEnd 统一放行尾 */
 const InstanceCardHeader = ({
-  name,
   env,
-  readonly,
-  namePlaceholder,
-  onNameChange,
   onEnvChange,
+}: {
+  env: string;
+  onEnvChange: (next: string) => void;
+}) => (
+  <MiniField label="环境" className="w-28 shrink-0 space-y-0.5">
+    <Combobox
+      value={env}
+      onValueChange={onEnvChange}
+      options={ENV_OPTIONS}
+      placeholder="请选择"
+      className="h-8 w-full"
+    />
+  </MiniField>
+);
+
+/** 首行行尾簇：只读（可选）+ 删除——所有实例卡统一放第一排末尾 */
+const InstanceRowEnd = ({
+  readonly,
   onReadonlyChange,
-  onBlur,
   onRemove,
 }: {
-  name: string;
-  env: string;
   readonly?: boolean;
-  namePlaceholder?: string;
-  onNameChange: (next: string) => void;
-  onEnvChange: (next: string) => void;
   /** 不传 = 该子系统没有只读语义（ELK） */
   onReadonlyChange?: (next: boolean) => void;
-  onBlur: () => void;
   onRemove: () => void;
 }) => (
-  <div className="flex flex-wrap gap-1.5">
-    <MiniField label="名称">
-      <Input
-        value={name}
-        onChange={(e) => onNameChange(e.target.value)}
-        onBlur={onBlur}
-        placeholder={namePlaceholder}
-        className="h-8"
-      />
-    </MiniField>
-    <MiniField label="环境" className="w-24 shrink-0 space-y-0.5">
-      <Input
-        value={env}
-        onChange={(e) => onEnvChange(e.target.value)}
-        onBlur={onBlur}
-        placeholder="环境名"
-        className="h-8"
-      />
-    </MiniField>
+  <div className="flex shrink-0 items-end gap-1.5">
     {onReadonlyChange ? (
-      // mt-4 与上方 11px 迷你 label 让位、跟同排输入框基线对齐
-      <div className="mt-4 flex h-8 shrink-0 items-center gap-1.5">
+      <div className="flex h-8 items-center gap-1.5">
         <span className="text-[11px] text-muted-foreground">只读</span>
         <Switch
           checked={readonly !== false}
@@ -191,7 +191,7 @@ const InstanceCardHeader = ({
         type="button"
         variant="ghost"
         size="icon"
-        className="mt-4 size-8 shrink-0"
+        className="size-8"
         onClick={onRemove}
       >
         <Trash2 className="size-3.5" />
@@ -199,31 +199,6 @@ const InstanceCardHeader = ({
     </Tooltip>
   </div>
 );
-
-const emptyHttpAuth = (type: CompanyEnvHttpApiAuth["type"]): CompanyEnvHttpApiAuth => {
-  if (type === "header") {
-    return { type: "header", headerName: "", headerValue: "" };
-  }
-  if (type === "login") {
-    return {
-      type: "login",
-      loginUrl: "",
-      username: "",
-      password: "",
-      tokenPath: "token",
-      authHeaderName: "Authorization",
-      authHeaderTemplate: "Bearer {token}",
-    };
-  }
-  return { type: "none" };
-};
-
-/** 认证方式下拉展示文案（SelectValue 不自动取 Item 中文，需显式映射） */
-const HTTP_AUTH_TYPE_LABEL: Record<CompanyEnvHttpApiAuth["type"], string> = {
-  none: "无",
-  header: "固定 Header",
-  login: "登录换 token",
-};
 
 /** 逐条字符串列表（替代大 textarea）：每行 Input + 删 X + 底部添加 */
 const StringListEditor = ({
@@ -339,7 +314,12 @@ const EnvSection = ({
         )}
       />
     </button>
-    {open ? <div className="space-y-2.5 pb-3 pl-6">{children}</div> : null}
+    {/* 展开内容顶部加分隔线 + 间距：标题行 hover 灰底不会和表单贴死（与行间 border-b 同风格） */}
+    {open ? (
+      <div className="space-y-2.5 border-t border-border/60 px-6 pb-3 pt-2.5">
+        {children}
+      </div>
+    ) : null}
   </div>
 );
 
@@ -411,7 +391,7 @@ const elkSummary = (
 const httpApiSummary = (
   rows: CompanyEnvHttpApi[],
 ): { configured: boolean; summary: string } => {
-  const filled = rows.filter((h) => h.baseUrl.trim());
+  const filled = rows.filter((h) => h.url.trim());
   if (filled.length === 0) return { configured: false, summary: "未配置" };
   return { configured: true, summary: `${filled.length} 条` };
 };
@@ -427,10 +407,49 @@ export const CompanyEnvSection = ({
   const [templateOpen, setTemplateOpen] = useState(false);
   // 当前展开的小节（默认全收起；同时只开一个，扫完再编）
   const [openId, setOpenId] = useState<SectionId | null>(null);
+  // 落盘去重：同一完整状态写盘成功后不再重复 PUT；写盘期间同状态复用同一 promise
+  const lastSavedRef = useRef("");
+  const pendingCommitRef = useRef<{
+    key: string;
+    promise: Promise<boolean>;
+  } | null>(null);
 
-  const commit = (next: CompanyEnv) => {
+  /** 落盘前校验：已填主机的服务器必须有环境名和用户，否则 ssh-exec 永远选不中 */
+  const persist = (next: CompanyEnv): Promise<boolean> => {
+    const issue = findCompanyEnvServerIssue(next);
+    if (issue === "missing-env") {
+      toast.warning("已填主机的服务器需要先选择环境，否则 SSH 无法选中该台");
+      return Promise.resolve(false);
+    }
+    if (issue === "missing-user") {
+      toast.warning("已填主机的服务器需要填写用户，否则 SSH 无法连接");
+      return Promise.resolve(false);
+    }
+    const key = stableKey(next);
+    if (lastSavedRef.current === key) return Promise.resolve(true);
+    const pending = pendingCommitRef.current;
+    if (pending?.key === key) return pending.promise;
+    const promise = (async () => {
+      try {
+        const ok = await onCommit(next);
+        const saved = ok !== false;
+        if (saved) lastSavedRef.current = key;
+        return saved;
+      } catch {
+        return false;
+      } finally {
+        if (pendingCommitRef.current?.key === key) {
+          pendingCommitRef.current = null;
+        }
+      }
+    })();
+    pendingCommitRef.current = { key, promise };
+    return promise;
+  };
+
+  const commit = (next: CompanyEnv): Promise<boolean> => {
     onChange(next);
-    onCommit(next);
+    return persist(next);
   };
 
   const patch = (partial: Partial<CompanyEnv>) => {
@@ -485,8 +504,21 @@ export const CompanyEnvSection = ({
       }
       // 导入后保持收起——摘要变绿即感知生效
       setOpenId(null);
-      commit(parsed.value);
-      if (!isCompanyEnvConfigured(parsed.value)) {
+      const issue = findCompanyEnvServerIssue(parsed.value);
+      if (issue) {
+        onChange(parsed.value);
+        toast.warning(
+          issue === "missing-env"
+            ? "导入内容暂未保存：请补全服务器的 env 后重新保存"
+            : "导入内容暂未保存：请补全服务器的 user 后重新保存",
+        );
+        return;
+      }
+      const saved = await commit(parsed.value);
+      if (!saved) {
+        // saveFieldValue 失败时已弹「保存失败」toast，这里不重复提示
+        return;
+      } else if (!isCompanyEnvConfigured(parsed.value)) {
         toast.warning("已导入，但未填可用的服务器/数据库等字段");
       } else if (parsed.warnings.length > 0) {
         toast.success(
@@ -599,50 +631,46 @@ export const CompanyEnvSection = ({
             <div className="space-y-2">
               {servers.map((s, i) => (
                 <InstanceCard key={i}>
-                  <div className="flex flex-wrap gap-1.5">
-                    <MiniField label="名称">
-                      <Input
-                        value={s.name}
-                        onChange={(e) => {
-                          const next = servers.map((row, j) =>
-                            j === i ? { ...row, name: e.target.value } : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => onCommit(value)}
-                        className="h-8"
-                      />
-                    </MiniField>
+                  <div className="flex flex-wrap items-end gap-1.5">
                     <MiniField
                       label="环境"
-                      className="w-24 shrink-0 space-y-0.5"
+                      className="w-28 shrink-0 space-y-0.5"
                     >
-                      <Select
+                      <Combobox
                         value={s.env}
-                        onValueChange={(v) => {
-                          const env: CompanyEnvServer["env"] =
-                            v === "dev" ? "dev" : "test";
+                        onValueChange={(env) => {
                           const next: CompanyEnvServer[] = servers.map(
                             (row, j) => (j === i ? { ...row, env } : row),
                           );
                           commit({ ...value, servers: next });
                         }}
-                      >
-                        <SelectTrigger className="h-8 w-full">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="test">test</SelectItem>
-                          <SelectItem value="dev">dev</SelectItem>
-                        </SelectContent>
-                      </Select>
+                        options={ENV_OPTIONS}
+                        placeholder="请选择"
+                        className="h-8 w-full"
+                      />
+                    </MiniField>
+                    <MiniField
+                      label="主机"
+                      className="min-w-0 flex-1 space-y-0.5"
+                    >
+                      <Input
+                        value={s.host}
+                        onChange={(e) => {
+                          const next = servers.map((row, j) =>
+                            j === i ? { ...row, host: e.target.value } : row,
+                          );
+                          patch({ servers: next });
+                        }}
+                        onBlur={() => persist(value)}
+                        className="h-8 font-mono text-xs"
+                      />
                     </MiniField>
                     <Tooltip content="删除">
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon"
-                        className="mt-4 size-8 shrink-0"
+                        className="size-8"
                         onClick={() => {
                           commit({
                             ...value,
@@ -655,19 +683,6 @@ export const CompanyEnvSection = ({
                     </Tooltip>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <MiniField label="主机">
-                      <Input
-                        value={s.host}
-                        onChange={(e) => {
-                          const next = servers.map((row, j) =>
-                            j === i ? { ...row, host: e.target.value } : row,
-                          );
-                          patch({ servers: next });
-                        }}
-                        onBlur={() => onCommit(value)}
-                        className="h-8 font-mono text-xs"
-                      />
-                    </MiniField>
                     <MiniField
                       label="端口"
                       className="w-20 shrink-0 space-y-0.5"
@@ -682,7 +697,7 @@ export const CompanyEnvSection = ({
                           );
                           patch({ servers: next });
                         }}
-                        onBlur={() => onCommit(value)}
+                        onBlur={() => persist(value)}
                         className="h-8"
                       />
                     </MiniField>
@@ -695,7 +710,7 @@ export const CompanyEnvSection = ({
                           );
                           patch({ servers: next });
                         }}
-                        onBlur={() => onCommit(value)}
+                        onBlur={() => persist(value)}
                         className="h-8"
                       />
                     </MiniField>
@@ -710,7 +725,7 @@ export const CompanyEnvSection = ({
                           );
                           patch({ servers: next });
                         }}
-                        onBlur={() => onCommit(value)}
+                        onBlur={() => persist(value)}
                         autoComplete="off"
                         className="h-8"
                       />
@@ -722,7 +737,6 @@ export const CompanyEnvSection = ({
                 label="添加服务器"
                 onClick={() => {
                   const row: CompanyEnvServer = {
-                    name: "",
                     env: "test",
                     host: "",
                     port: 22,
@@ -755,35 +769,38 @@ export const CompanyEnvSection = ({
                   });
                 return (
                   <InstanceCard key={i}>
-                    <InstanceCardHeader
-                      name={p.name}
-                      env={p.env}
-                      readonly={p.readonly}
-                      namePlaceholder="实例名称"
-                      onNameChange={(name) => patchPg({ ...p, name })}
-                      onEnvChange={(env) => patchPg({ ...p, env })}
-                      onReadonlyChange={(readonly) =>
-                        commitPg({ ...p, readonly })
-                      }
-                      onBlur={() => onCommit(value)}
-                      onRemove={() =>
-                        commit({
-                          ...value,
-                          pg: pgList.filter((_, j) => j !== i),
-                        })
-                      }
-                    />
-                    <div className="flex flex-wrap gap-1.5">
-                      <MiniField label="主机">
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <InstanceCardHeader
+                        env={p.env}
+                        onEnvChange={(env) => commitPg({ ...p, env })}
+                      />
+                      <MiniField
+                        label="主机"
+                        className="min-w-0 flex-1 space-y-0.5"
+                      >
                         <Input
                           value={p.host}
                           onChange={(e) =>
                             patchPg({ ...p, host: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
+                      <InstanceRowEnd
+                        readonly={p.readonly}
+                        onReadonlyChange={(readonly) =>
+                          commitPg({ ...p, readonly })
+                        }
+                        onRemove={() =>
+                          commit({
+                            ...value,
+                            pg: pgList.filter((_, j) => j !== i),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       <MiniField
                         label="端口"
                         className="w-20 shrink-0 space-y-0.5"
@@ -797,7 +814,7 @@ export const CompanyEnvSection = ({
                               port: Number(e.target.value) || 5432,
                             })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -807,7 +824,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchPg({ ...p, user: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -817,7 +834,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchPg({ ...p, password: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           autoComplete="off"
                           className="h-8"
                         />
@@ -830,8 +847,7 @@ export const CompanyEnvSection = ({
                 label="添加实例"
                 onClick={() => {
                   const row: CompanyEnvPg = {
-                    name: "",
-                    env: "",
+                    env: "test",
                     host: "",
                     port: 5432,
                     user: "",
@@ -859,37 +875,45 @@ export const CompanyEnvSection = ({
                   patch({
                     redis: redisList.map((row, j) => (j === i ? next : row)),
                   });
+                const commitRedis = (next: CompanyEnvRedis) =>
+                  commit({
+                    ...value,
+                    redis: redisList.map((row, j) => (j === i ? next : row)),
+                  });
                 return (
                   <InstanceCard key={i}>
-                    <InstanceCardHeader
-                      name={r.name}
-                      env={r.env}
-                      readonly={r.readonly}
-                      namePlaceholder="实例名称"
-                      onNameChange={(name) => patchRedis({ ...r, name })}
-                      onEnvChange={(env) => patchRedis({ ...r, env })}
-                      onReadonlyChange={(readonly) =>
-                        patchRedis({ ...r, readonly })
-                      }
-                      onBlur={() => onCommit(value)}
-                      onRemove={() =>
-                        commit({
-                          ...value,
-                          redis: redisList.filter((_, j) => j !== i),
-                        })
-                      }
-                    />
-                    <div className="flex flex-wrap gap-1.5">
-                      <MiniField label="主机">
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <InstanceCardHeader
+                        env={r.env}
+                        onEnvChange={(env) => commitRedis({ ...r, env })}
+                      />
+                      <MiniField
+                        label="主机"
+                        className="min-w-0 flex-1 space-y-0.5"
+                      >
                         <Input
                           value={r.host}
                           onChange={(e) =>
                             patchRedis({ ...r, host: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
+                      <InstanceRowEnd
+                        readonly={r.readonly}
+                        onReadonlyChange={(readonly) =>
+                          commitRedis({ ...r, readonly })
+                        }
+                        onRemove={() =>
+                          commit({
+                            ...value,
+                            redis: redisList.filter((_, j) => j !== i),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       <MiniField
                         label="端口"
                         className="w-20 shrink-0 space-y-0.5"
@@ -903,7 +927,7 @@ export const CompanyEnvSection = ({
                               port: Number(e.target.value) || 6379,
                             })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -920,7 +944,7 @@ export const CompanyEnvSection = ({
                               db: Math.max(0, Number(e.target.value) || 0),
                             })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -930,7 +954,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchRedis({ ...r, password: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           autoComplete="off"
                           className="h-8"
                         />
@@ -943,8 +967,7 @@ export const CompanyEnvSection = ({
                 label="添加实例"
                 onClick={() => {
                   const row: CompanyEnvRedis = {
-                    name: "",
-                    env: "",
+                    env: "test",
                     host: "",
                     port: 6379,
                     db: 0,
@@ -974,20 +997,26 @@ export const CompanyEnvSection = ({
                       j === i ? next : row,
                     ),
                   });
+                const commitXxl = (next: CompanyEnvXxlJob) =>
+                  commit({
+                    ...value,
+                    xxljob: value.xxljob.map((row, j) =>
+                      j === i ? next : row,
+                    ),
+                  });
                 return (
                   <InstanceCard key={i}>
                     <div className="flex flex-wrap gap-1.5">
                       <MiniField
                         label="环境"
-                        className="w-24 shrink-0 space-y-0.5"
+                        className="w-28 shrink-0 space-y-0.5"
                       >
-                        <Input
+                        <Combobox
                           value={x.env}
-                          onChange={(e) =>
-                            patchXxl({ ...x, env: e.target.value })
-                          }
-                          onBlur={() => onCommit(value)}
-                          className="h-8"
+                          onValueChange={(env) => commitXxl({ ...x, env })}
+                          options={ENV_OPTIONS}
+                          placeholder="请选择"
+                          className="h-8 w-full"
                         />
                       </MiniField>
                       <MiniField
@@ -999,7 +1028,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchXxl({ ...x, baseUrl: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
@@ -1044,7 +1073,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchXxl({ ...x, username: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -1054,7 +1083,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchXxl({ ...x, password: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           autoComplete="off"
                           className="h-8"
                         />
@@ -1101,45 +1130,45 @@ export const CompanyEnvSection = ({
                   });
                 return (
                   <InstanceCard key={i}>
-                    <InstanceCardHeader
-                      name={n.name}
-                      env={n.env}
-                      readonly={n.readonly}
-                      namePlaceholder="测试集群"
-                      onNameChange={(name) => patchNacos({ ...n, name })}
-                      onEnvChange={(env) => patchNacos({ ...n, env })}
-                      onReadonlyChange={(readonly) =>
-                        commitNacos({ ...n, readonly })
-                      }
-                      onBlur={() => onCommit(value)}
-                      onRemove={() =>
-                        commit({
-                          ...value,
-                          nacos: nacosList.filter((_, j) => j !== i),
-                        })
-                      }
-                    />
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <InstanceCardHeader
+                        env={n.env}
+                        onEnvChange={(env) => commitNacos({ ...n, env })}
+                      />
                       <MiniField
                         label="Base URL"
-                        className="min-w-[10rem] flex-[2] space-y-0.5"
+                        className="min-w-0 flex-1 space-y-0.5"
                       >
                         <Input
                           value={n.baseUrl}
                           onChange={(e) =>
                             patchNacos({ ...n, baseUrl: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
+                      <InstanceRowEnd
+                        readonly={n.readonly}
+                        onReadonlyChange={(readonly) =>
+                          commitNacos({ ...n, readonly })
+                        }
+                        onRemove={() =>
+                          commit({
+                            ...value,
+                            nacos: nacosList.filter((_, j) => j !== i),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       <MiniField label="用户名">
                         <Input
                           value={n.username}
                           onChange={(e) =>
                             patchNacos({ ...n, username: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -1149,7 +1178,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchNacos({ ...n, password: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           autoComplete="off"
                           className="h-8"
                         />
@@ -1177,7 +1206,6 @@ export const CompanyEnvSection = ({
                 label="添加集群"
                 onClick={() => {
                   const row: CompanyEnvNacos = {
-                    name: "",
                     env: "test",
                     baseUrl: "",
                     username: "",
@@ -1206,43 +1234,48 @@ export const CompanyEnvSection = ({
                   patch({
                     elk: elkList.map((row, j) => (j === i ? next : row)),
                   });
+                const commitElk = (next: CompanyEnvElk) =>
+                  commit({
+                    ...value,
+                    elk: elkList.map((row, j) => (j === i ? next : row)),
+                  });
                 return (
                   <InstanceCard key={i}>
-                    <InstanceCardHeader
-                      name={e.name}
-                      env={e.env}
-                      namePlaceholder="Kibana 测试"
-                      onNameChange={(name) => patchElk({ ...e, name })}
-                      onEnvChange={(env) => patchElk({ ...e, env })}
-                      onBlur={() => onCommit(value)}
-                      onRemove={() =>
-                        commit({
-                          ...value,
-                          elk: elkList.filter((_, j) => j !== i),
-                        })
-                      }
-                    />
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <InstanceCardHeader
+                        env={e.env}
+                        onEnvChange={(env) => commitElk({ ...e, env })}
+                      />
                       <MiniField
                         label="Base URL"
-                        className="min-w-[10rem] flex-[2] space-y-0.5"
+                        className="min-w-0 flex-1 space-y-0.5"
                       >
                         <Input
                           value={e.baseUrl}
                           onChange={(ev) =>
                             patchElk({ ...e, baseUrl: ev.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
+                      <InstanceRowEnd
+                        onRemove={() =>
+                          commit({
+                            ...value,
+                            elk: elkList.filter((_, j) => j !== i),
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       <MiniField label="用户名">
                         <Input
                           value={e.username}
                           onChange={(ev) =>
                             patchElk({ ...e, username: ev.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -1252,7 +1285,7 @@ export const CompanyEnvSection = ({
                           onChange={(ev) =>
                             patchElk({ ...e, password: ev.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           autoComplete="off"
                           className="h-8"
                         />
@@ -1263,7 +1296,7 @@ export const CompanyEnvSection = ({
                           onChange={(ev) =>
                             patchElk({ ...e, dataView: ev.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8 font-mono text-xs"
                         />
                       </MiniField>
@@ -1275,7 +1308,6 @@ export const CompanyEnvSection = ({
                 label="添加实例"
                 onClick={() => {
                   const row: CompanyEnvElk = {
-                    name: "",
                     env: "test",
                     baseUrl: "",
                     username: "",
@@ -1297,7 +1329,7 @@ export const CompanyEnvSection = ({
             open={openId === "httpApis"}
             onToggle={toggle}
           >
-            <div className="space-y-3">
+            <div className="space-y-2">
               {httpApis.map((h, i) => {
                 const patchApi = (next: CompanyEnvHttpApi) => {
                   const list = httpApis.map((row, j) => (j === i ? next : row));
@@ -1309,40 +1341,34 @@ export const CompanyEnvSection = ({
                     httpApis: httpApis.map((row, j) => (j === i ? next : row)),
                   });
                 };
-                const auth = h.auth;
                 return (
-                  <div
-                    key={i}
-                    className="space-y-1.5 rounded-md border border-border/60 p-2"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
-                        <MiniField label="名称">
-                          <Input
-                            value={h.name}
-                            onChange={(e) =>
-                              patchApi({ ...h, name: e.target.value })
-                            }
-                            onBlur={() => onCommit(value)}
-                            placeholder="CRM"
-                            className="h-8"
-                          />
-                        </MiniField>
-                        <MiniField
-                          label="环境"
-                          className="w-24 shrink-0 space-y-0.5"
-                        >
-                          <Input
-                            value={h.env}
-                            onChange={(e) =>
-                              patchApi({ ...h, env: e.target.value })
-                            }
-                            onBlur={() => onCommit(value)}
-                            placeholder="test"
-                            className="h-8"
-                          />
-                        </MiniField>
-                      </div>
+                  <InstanceCard key={i}>
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      <MiniField
+                        label="环境"
+                        className="w-28 shrink-0 space-y-0.5"
+                      >
+                        <Combobox
+                          value={h.env}
+                          onValueChange={(env) => commitApi({ ...h, env })}
+                          options={ENV_OPTIONS}
+                          placeholder="请选择"
+                          className="h-8 w-full"
+                        />
+                      </MiniField>
+                      <MiniField
+                        label="URL"
+                        className="min-w-0 flex-1 space-y-0.5"
+                      >
+                        <Input
+                          value={h.url}
+                          onChange={(e) =>
+                            patchApi({ ...h, url: e.target.value })
+                          }
+                          onBlur={() => persist(value)}
+                          className="h-8 font-mono text-xs"
+                        />
+                      </MiniField>
                       <Button
                         type="button"
                         variant="ghost"
@@ -1359,189 +1385,7 @@ export const CompanyEnvSection = ({
                         <Trash2 className="size-3.5" />
                       </Button>
                     </div>
-                    <MiniField
-                      label="Base URL"
-                      className="min-w-0 w-full space-y-0.5"
-                    >
-                      <Input
-                        value={h.baseUrl}
-                        onChange={(e) =>
-                          patchApi({ ...h, baseUrl: e.target.value })
-                        }
-                        onBlur={() => onCommit(value)}
-                        className="h-8 font-mono text-xs"
-                      />
-                    </MiniField>
-                    <MiniField
-                      label="认证方式"
-                      className="min-w-[8rem] space-y-0.5"
-                    >
-                      <Select
-                        value={auth.type}
-                        onValueChange={(v) => {
-                          const type = (v ??
-                            "none") as CompanyEnvHttpApiAuth["type"];
-                          commitApi({ ...h, auth: emptyHttpAuth(type) });
-                        }}
-                      >
-                        <SelectTrigger className="h-8">
-                          <SelectValue>
-                            {HTTP_AUTH_TYPE_LABEL[auth.type]}
-                          </SelectValue>
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="none">无</SelectItem>
-                          <SelectItem value="header">固定 Header</SelectItem>
-                          <SelectItem value="login">登录换 token</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </MiniField>
-                    {auth.type === "header" && (
-                      <div className="flex flex-wrap gap-1.5">
-                        <MiniField label="Header 名">
-                          <Input
-                            value={auth.headerName}
-                            onChange={(e) =>
-                              patchApi({
-                                ...h,
-                                auth: {
-                                  type: "header",
-                                  headerName: e.target.value,
-                                  headerValue: auth.headerValue,
-                                },
-                              })
-                            }
-                            onBlur={() => onCommit(value)}
-                            placeholder="Authorization"
-                            className="h-8 font-mono text-xs"
-                          />
-                        </MiniField>
-                        <MiniField
-                          label="Header 值"
-                          className="min-w-[10rem] flex-[2] space-y-0.5"
-                        >
-                          <PasswordInput
-                            value={auth.headerValue}
-                            onChange={(e) =>
-                              patchApi({
-                                ...h,
-                                auth: {
-                                  type: "header",
-                                  headerName: auth.headerName,
-                                  headerValue: e.target.value,
-                                },
-                              })
-                            }
-                            onBlur={() => onCommit(value)}
-                            autoComplete="off"
-                            className="h-8 font-mono text-xs"
-                          />
-                        </MiniField>
-                      </div>
-                    )}
-                    {auth.type === "login" && (
-                      <>
-                        <MiniField
-                          label="登录 URL"
-                          className="min-w-0 w-full space-y-0.5"
-                        >
-                          <Input
-                            value={auth.loginUrl}
-                            onChange={(e) =>
-                              patchApi({
-                                ...h,
-                                auth: { ...auth, loginUrl: e.target.value },
-                              })
-                            }
-                            onBlur={() => onCommit(value)}
-                            className="h-8 font-mono text-xs"
-                          />
-                        </MiniField>
-                        <div className="flex flex-wrap gap-1.5">
-                          <MiniField label="用户名">
-                            <Input
-                              value={auth.username}
-                              onChange={(e) =>
-                                patchApi({
-                                  ...h,
-                                  auth: { ...auth, username: e.target.value },
-                                })
-                              }
-                              onBlur={() => onCommit(value)}
-                              className="h-8"
-                            />
-                          </MiniField>
-                          <MiniField label="密码">
-                            <PasswordInput
-                              value={auth.password}
-                              onChange={(e) =>
-                                patchApi({
-                                  ...h,
-                                  auth: { ...auth, password: e.target.value },
-                                })
-                              }
-                              onBlur={() => onCommit(value)}
-                              autoComplete="off"
-                              className="h-8"
-                            />
-                          </MiniField>
-                          <MiniField label="Token 路径">
-                            <Input
-                              value={auth.tokenPath}
-                              onChange={(e) =>
-                                patchApi({
-                                  ...h,
-                                  auth: { ...auth, tokenPath: e.target.value },
-                                })
-                              }
-                              onBlur={() => onCommit(value)}
-                              placeholder="token"
-                              className="h-8 font-mono text-xs"
-                            />
-                          </MiniField>
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          <MiniField label="Auth Header">
-                            <Input
-                              value={auth.authHeaderName}
-                              onChange={(e) =>
-                                patchApi({
-                                  ...h,
-                                  auth: {
-                                    ...auth,
-                                    authHeaderName: e.target.value,
-                                  },
-                                })
-                              }
-                              onBlur={() => onCommit(value)}
-                              placeholder="Authorization"
-                              className="h-8 font-mono text-xs"
-                            />
-                          </MiniField>
-                          <MiniField
-                            label="Header 模板"
-                            className="min-w-[10rem] flex-[2] space-y-0.5"
-                          >
-                            <Input
-                              value={auth.authHeaderTemplate}
-                              onChange={(e) =>
-                                patchApi({
-                                  ...h,
-                                  auth: {
-                                    ...auth,
-                                    authHeaderTemplate: e.target.value,
-                                  },
-                                })
-                              }
-                              onBlur={() => onCommit(value)}
-                              placeholder="Bearer {token}"
-                              className="h-8 font-mono text-xs"
-                            />
-                          </MiniField>
-                        </div>
-                      </>
-                    )}
-                    <div className="space-y-0.5">
+                    <div className="">
                       <div className="text-[11px] text-muted-foreground">
                         备注
                       </div>
@@ -1553,32 +1397,24 @@ export const CompanyEnvSection = ({
                             note: e.target.value || undefined,
                           })
                         }
-                        onBlur={() => onCommit(value)}
-                        placeholder="给 AI 看的用法提示，选填"
+                        onBlur={() => persist(value)}
+                        placeholder="给 AI 看的用法提示，选填；鉴权方式（登录接口、token 取值）也写这里"
                         className="min-h-14 text-xs"
                       />
                     </div>
-                  </div>
+                  </InstanceCard>
                 );
               })}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="w-full"
+              <AddRowButton
+                label="添加 API"
                 onClick={() => {
                   const row: CompanyEnvHttpApi = {
-                    name: "",
                     env: "test",
-                    baseUrl: "",
-                    auth: emptyHttpAuth("none"),
+                    url: "",
                   };
                   commit({ ...value, httpApis: [...httpApis, row] });
                 }}
-              >
-                <Plus className="size-3.5" />
-                添加 API
-              </Button>
+              />
             </div>
           </EnvSection>
 
@@ -1610,7 +1446,7 @@ export const CompanyEnvSection = ({
                           onChange={(e) =>
                             patchCustom({ ...c, name: e.target.value })
                           }
-                          onBlur={() => onCommit(value)}
+                          onBlur={() => persist(value)}
                           className="h-8"
                         />
                       </MiniField>
@@ -1622,7 +1458,7 @@ export const CompanyEnvSection = ({
                             onChange={(e) =>
                               patchCustom({ ...c, content: e.target.value })
                             }
-                            onBlur={() => onCommit(value)}
+                            onBlur={() => persist(value)}
                             className="min-h-8 resize-y font-mono text-xs"
                           />
                         </MiniField>
