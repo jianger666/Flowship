@@ -15,6 +15,8 @@
 import { DEFAULT_MEEGLE_PROJECT, JUMP_IDES, USER_ROLES } from "./types";
 import type {
   ActionLayoutPref,
+  AgentProviderId,
+  CustomProviderConfig,
   FeAiFlowSettings,
   ModelSelection,
   ModelUsageEntry,
@@ -40,6 +42,8 @@ const API_FULL = "/api/settings/full";
 
 export const DEFAULT_SETTINGS: FeAiFlowSettings = {
   apiKey: "",
+  // 默认走 Cursor SDK（历史行为不变）；切 custom 后 runtime 读 customProvider
+  provider: "cursor",
   defaultModel: { id: "" },
   repos: [],
   jumpIde: "cursor",
@@ -128,6 +132,26 @@ const readDefaultModel = (raw: unknown): ModelSelection => {
   return { id: "" };
 };
 
+// provider 枚举归一：非 "custom" 一律回退 cursor（旧档 / 手改坏不炸）
+const readProvider = (raw: unknown): AgentProviderId =>
+  raw === "custom" ? "custom" : "cursor";
+
+/**
+ * 自定义 provider 配置归一：baseUrl 空 = 未配置（整段弃、返 undefined）；
+ * apiKey 允许空串（本地无鉴权端点，如 LM Studio）；format 非 anthropic 回退 openai。
+ */
+const readCustomProvider = (raw: unknown): CustomProviderConfig | undefined => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const o = raw as { baseUrl?: unknown; apiKey?: unknown; format?: unknown };
+  const baseUrl = typeof o.baseUrl === "string" ? o.baseUrl.trim() : "";
+  if (!baseUrl) return undefined;
+  return {
+    baseUrl,
+    apiKey: typeof o.apiKey === "string" ? o.apiKey : "",
+    format: o.format === "anthropic" ? "anthropic" : "openai",
+  };
+};
+
 // 推进面板布局偏好归一：order / hidden / 分组字段；坏值回退缺省
 const normalizeActionLayout = (raw: unknown): ActionLayoutPref => {
   if (!raw || typeof raw !== "object") return emptyActionLayout();
@@ -204,6 +228,9 @@ export const normalizeSettings = (
     ...merged,
     // 与 gitToken 对称：非 string 脏值回落空串，避免后续当 string 用炸
     apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
+    // Agent 后端来源：枚举外回退 cursor；自定义 provider 配置坏值弃（= 未配置）
+    provider: readProvider(parsed.provider),
+    customProvider: readCustomProvider(parsed.customProvider),
     defaultModel: readDefaultModel(parsed.defaultModel),
     repos,
     // 代码跳转 IDE：枚举外的值（旧档 / 手改坏）回退 cursor

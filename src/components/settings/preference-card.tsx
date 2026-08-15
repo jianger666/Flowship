@@ -73,9 +73,10 @@ interface PreferenceSectionsProps {
   modelsError: string;
   modelSelection: ModelSelection;
   onModelChange: (next: ModelSelection) => void;
-  apiKey: string;
   modelsRefreshing: boolean;
-  onModelsRefresh: (apiKey: string) => void;
+  /** 当前 provider 凭据是否齐备（cursor 有 key / custom 有 baseUrl）——决定「获取列表」是否可点 */
+  canRefreshModels: boolean;
+  onModelsRefresh: () => void;
 }
 
 export const PreferenceSections = ({
@@ -98,8 +99,8 @@ export const PreferenceSections = ({
   modelsError,
   modelSelection,
   onModelChange,
-  apiKey,
   modelsRefreshing,
+  canRefreshModels,
   onModelsRefresh,
 }: PreferenceSectionsProps) => {
   // 本机探测到的可用 IDE 集合（后端扫安装位置 + PATH）；null = 还没回来（全部可选）
@@ -510,15 +511,19 @@ export const PreferenceSections = ({
         }
         labelExtra={
           <Tooltip
-            content={apiKey.trim() ? "重新拉取可用模型列表" : "请先填 API key"}
+            content={
+              canRefreshModels
+                ? "重新拉取可用模型列表"
+                : "请先填 API key / 自定义 provider 的 baseUrl"
+            }
           >
             <span className="inline-flex">
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => onModelsRefresh(apiKey)}
-                disabled={modelsRefreshing || !apiKey.trim()}
+                onClick={() => onModelsRefresh()}
+                disabled={modelsRefreshing || !canRefreshModels}
               >
                 {modelsRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                 获取列表

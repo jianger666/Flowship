@@ -82,6 +82,7 @@ import { useModels } from "@/hooks/use-models";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { buildActionInstructionHistory } from "@/lib/composer-history";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
+import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
 import {
   ACTION_LABEL,
   computeBatchProgress,
@@ -678,9 +679,8 @@ export const AdvanceDialog = ({
   // 本 effect 只负责拉取、不碰任何表单 state，所以 availableModels 变化导致它重跑也无副作用。
   useEffect(() => {
     if (!open) return;
-    const s = getSettings();
-    if (s.apiKey?.trim() && availableModels.length === 0) {
-      void fetchModels(s.apiKey);
+    if (hasActiveModelCreds() && availableModels.length === 0) {
+      void fetchModels(getActiveModelCreds());
     }
   }, [open, availableModels.length, fetchModels]);
 

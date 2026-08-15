@@ -37,6 +37,7 @@ import { useModels } from "@/hooks/use-models";
 import { useRepoBranches } from "@/hooks/use-repo-branches";
 import { resolveBranchTemplate } from "@/lib/branch-template";
 import { getSettings, initSettings, recordModelUsage } from "@/lib/local-store";
+import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
 import { reqIdPatchValue } from "@/lib/req-id";
 import {
   resolveLaunchIsolateWorktree,
@@ -141,7 +142,7 @@ export const TaskLaunchForm = ({ initialTitle, feishuStoryUrl, onCreated }: Prop
       // 只配了一个仓库时天然零操作：直接选它
       if (validPaths.length > 0) setRepoPaths(validPaths);
       else if (s.repos.length === 1) setRepoPaths([s.repos[0].path]);
-      if (s.apiKey?.trim()) void fetchModels(s.apiKey);
+      if (hasActiveModelCreds()) void fetchModels(getActiveModelCreds());
     })();
     return () => {
       alive = false;

@@ -155,11 +155,20 @@ const maskSecret = (v: unknown): string => {
  */
 export const maskSettingsSecrets = (
   settings: Record<string, unknown>,
-): Record<string, unknown> => ({
-  ...settings,
-  apiKey: maskSecret(settings.apiKey),
-  gitToken: maskSecret(settings.gitToken),
-});
+): Record<string, unknown> => {
+  const out: Record<string, unknown> = {
+    ...settings,
+    apiKey: maskSecret(settings.apiKey),
+    gitToken: maskSecret(settings.gitToken),
+  };
+  // 自定义 provider 的 apiKey 同级别脱敏（baseUrl / format 非敏感、保留原样）
+  const cp = settings.customProvider;
+  if (cp && typeof cp === "object" && !Array.isArray(cp)) {
+    const c = cp as Record<string, unknown>;
+    out.customProvider = { ...c, apiKey: maskSecret(c.apiKey) };
+  }
+  return out;
+};
 
 // 掩码特征（maskSecret 的产物）——PUT 进来带这个 = client 把脱敏展示值当真值回写了
 const MASK_MARKER = "已脱敏";
@@ -184,6 +193,26 @@ export const preserveSecretsOnPut = (
     if (inc.includes(MASK_MARKER)) {
       out[key] = cur;
       preserved.push(key);
+    }
+  }
+  // 自定义 provider 的 apiKey：client 误把脱敏展示值当真值回写时保留盘上真值
+  const incCp = out.customProvider;
+  const curCp = current.customProvider;
+  if (
+    incCp &&
+    typeof incCp === "object" &&
+    !Array.isArray(incCp) &&
+    curCp &&
+    typeof curCp === "object" &&
+    !Array.isArray(curCp)
+  ) {
+    const inc = incCp as Record<string, unknown>;
+    const cur = curCp as Record<string, unknown>;
+    const curKey = typeof cur.apiKey === "string" ? (cur.apiKey as string) : "";
+    const incKey = typeof inc.apiKey === "string" ? (inc.apiKey as string) : "";
+    if (curKey && incKey.includes(MASK_MARKER)) {
+      out.customProvider = { ...inc, apiKey: curKey };
+      preserved.push("customProvider.apiKey");
     }
   }
   return { settings: out, preserved };

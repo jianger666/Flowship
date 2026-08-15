@@ -23,6 +23,7 @@ import { toast } from "sonner";
 import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
 import { getSettings, recordModelUsage } from "@/lib/local-store";
+import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
 import { setTaskModel } from "@/lib/task-store";
 import type { ModelSelection, Task } from "@/lib/types";
 
@@ -64,18 +65,16 @@ export const ChatModelPicker = ({ task, onTaskUpdate }: Props) => {
   // 反查不到完整 displayName + 参数摘要（用户实测「首次进对话模型名不全、点一下才对」）。
   // useModels 有 SWR 缓存、命中立即填充、不会每次进对话都打网络。
   useEffect(() => {
-    const s = getSettings();
-    if (s.apiKey?.trim() && models.length === 0) {
-      void fetchModels(s.apiKey);
+    if (hasActiveModelCreds() && models.length === 0) {
+      void fetchModels(getActiveModelCreds());
     }
   }, [models.length, fetchModels]);
 
   // 打开时按需拉模型列表（已有则跳过、省请求）
   const handleOpenChange = (open: boolean) => {
     if (!open) return;
-    const s = getSettings();
-    if (s.apiKey?.trim() && models.length === 0) {
-      void fetchModels(s.apiKey);
+    if (hasActiveModelCreds() && models.length === 0) {
+      void fetchModels(getActiveModelCreds());
     }
   };
 

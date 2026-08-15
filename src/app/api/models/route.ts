@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
 import { Cursor } from "@cursor/sdk";
-import type { ModelOption } from "@/lib/types";
+import type { CustomProviderFormat, ModelOption } from "@/lib/types";
+import { listCustomModels } from "@/lib/server/custom-provider";
 
 export const runtime = "nodejs";
 
 interface RequestBody {
   apiKey?: string;
+  /** 有值 = 自定义 provider 路径（baseUrl + apiKey + format） */
+  baseUrl?: string;
+  format?: CustomProviderFormat;
 }
 
 // SDK 卡死时不能让 route 一直挂着、超过这个就当失败处理
@@ -16,6 +20,14 @@ const SDK_TIMEOUT_MS = 15_000;
 // 配合客户端 localStorage SWR（use-models.ts）、后台刷新也基本秒回
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const modelsCache = new Map<string, { models: ModelOption[]; ts: number }>();
+
+// 缓存 key：自定义 provider 按 baseUrl+apiKey+format 区分、cursor 按 apiKey
+const cacheKeyOf = (body: RequestBody): string => {
+  const fmt = body.format === "anthropic" ? "anthropic" : "openai";
+  return body.baseUrl
+    ? `custom:${body.baseUrl}:${fmt}:${body.apiKey ?? ""}`
+    : `cursor:${body.apiKey ?? ""}`;
+};
 
 // SDK 返回的 ModelListItem schema 比较杂、只挑前端实际要用的字段透传
 // 这样 SDK 升级加新字段不会立刻影响到前端 type / 攻击面也小
@@ -49,16 +61,14 @@ const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
   });
 
 /**
- * 拉 Cursor SDK 可用模型列表
+ * 拉可用模型列表
+ *
+ * - cursor：凭 apiKey 调 Cursor SDK（历史行为）
+ * - custom：baseUrl + apiKey + format 走自定义 HTTP provider 的 /v1/models
  *
  * 为什么走 server route：用户的 API key 在 localStorage、模型列表又必须
- * 凭这个 key 调 Cursor 接口、所以由前端 POST 上来 + server 端代理调用、
- * 不会暴露给第三方页面。响应里只回必要字段、避免 SDK schema 变化时
- * 前端 type 跟着变。
- *
- * 错误处理：
- * - SDK 卡死 → withTimeout 15s 后报失败、避免 route 永久挂起
- * - 错误响应只在 dev 时附带 stack 摘要、production 下不泄露 server 路径
+ * 凭这个 key 调对应接口、所以由前端 POST 上来 + server 端代理调用、
+ * 不会暴露给第三方页面。响应里只回必要字段、避免 schema 变化时前端 type 跟着变。
  */
 export const POST = async (req: Request) => {
   let body: RequestBody;
@@ -68,33 +78,50 @@ export const POST = async (req: Request) => {
     return NextResponse.json({ error: "无效的请求体" }, { status: 400 });
   }
 
-  const apiKey = body.apiKey?.trim();
-  if (!apiKey) {
-    return NextResponse.json({ error: "缺少 apiKey" }, { status: 400 });
-  }
-
-  // 命中且未过期：直接返回（不打 SDK）
-  const hit = modelsCache.get(apiKey);
+  // 命中且未过期：直接返回（不打 SDK / 不请求外部 provider）
+  const cacheKey = cacheKeyOf(body);
+  const hit = modelsCache.get(cacheKey);
   if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
     return NextResponse.json({ models: hit.models });
   }
 
   try {
-    const models = await withTimeout(
-      Cursor.models.list({ apiKey }),
-      SDK_TIMEOUT_MS,
-      "拉取模型"
-    );
-    // 按 displayName 字母排序、避免 SDK 返回顺序看着乱
-    const options: ModelOption[] = models
-      .map(pickModelFields)
-      .sort((a, b) =>
-        a.displayName.localeCompare(b.displayName, "en", { sensitivity: "base" })
+    let options: ModelOption[];
+    if (body.baseUrl) {
+      // 自定义 provider：baseUrl 必填；apiKey 允许空（本地无鉴权端点）
+      const baseUrl = body.baseUrl.trim();
+      if (!baseUrl) {
+        return NextResponse.json({ error: "缺少 baseUrl" }, { status: 400 });
+      }
+      const format: CustomProviderFormat =
+        body.format === "anthropic" ? "anthropic" : "openai";
+      options = await listCustomModels({
+        baseUrl,
+        apiKey: body.apiKey?.trim() ?? "",
+        format,
+      });
+    } else {
+      const apiKey = body.apiKey?.trim();
+      if (!apiKey) {
+        return NextResponse.json({ error: "缺少 apiKey" }, { status: 400 });
+      }
+      const models = await withTimeout(
+        Cursor.models.list({ apiKey }),
+        SDK_TIMEOUT_MS,
+        "拉取模型"
       );
-    modelsCache.set(apiKey, { models: options, ts: Date.now() });
+      // 按 displayName 字母排序、避免 SDK 返回顺序看着乱
+      options = models
+        .map(pickModelFields)
+        .sort((a, b) =>
+          a.displayName.localeCompare(b.displayName, "en", {
+            sensitivity: "base",
+          })
+        );
+    }
+    modelsCache.set(cacheKey, { models: options, ts: Date.now() });
     return NextResponse.json({ models: options });
   } catch (err) {
-    // SDK 经常抛 Error("Error")、message 没信息量、所以连 stack 一起打到 server log
     console.error("[/api/models] error:", err);
     const message = err instanceof Error ? err.message : String(err);
     // 仅 dev 把 stack 摘要随响应返、production 不泄露 server 路径 / 内部实现

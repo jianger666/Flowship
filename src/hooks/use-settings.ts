@@ -128,6 +128,8 @@ type FieldEqKind =
   | "defaultModel"
   | "meegleProject"
   | "companyEnv"
+  | "provider"
+  | "customProvider"
   | "ignore";
 
 const FIELD_EQ_KIND = {
@@ -153,6 +155,8 @@ const FIELD_EQ_KIND = {
   defaultModel: "defaultModel",
   meegleProject: "meegleProject",
   companyEnv: "companyEnv",
+  provider: "provider",
+  customProvider: "customProvider",
   modelUsage: "ignore",
 } as const satisfies Record<SettingsField, FieldEqKind>;
 
@@ -228,6 +232,13 @@ export const isFieldEqual = (
       return (
         JSON.stringify(a.companyEnv ?? {}) ===
         JSON.stringify(b.companyEnv ?? {})
+      );
+    case "provider":
+      return (a.provider ?? "cursor") === (b.provider ?? "cursor");
+    case "customProvider":
+      return (
+        JSON.stringify(a.customProvider ?? null) ===
+        JSON.stringify(b.customProvider ?? null)
       );
     case "ignore":
       return true;
@@ -320,6 +331,8 @@ export const useSettings = (): UseSettingsResult => {
         savedSettings,
       ),
       companyEnv: !isFieldEqual("companyEnv", settings, savedSettings),
+      provider: !isFieldEqual("provider", settings, savedSettings),
+      customProvider: !isFieldEqual("customProvider", settings, savedSettings),
     }),
     [settings, savedSettings]
   );

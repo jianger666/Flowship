@@ -23,7 +23,7 @@ import { ModelSelect } from "@/components/ui/model-select";
 import { useModels } from "@/hooks/use-models";
 import { useRichInput } from "@/hooks/use-rich-input";
 import { findPendingAskEvent } from "@/lib/ask-pending";
-import { getSettings } from "@/lib/local-store";
+import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
 import { resolveSessionModel } from "@/lib/task-model";
 import { submitTaskQuestion } from "@/lib/task-store";
 import { loadDraft } from "@/lib/view-memory";
@@ -67,8 +67,8 @@ export const TaskTalkComposer = ({
   // 模型列表：挂载即拉（跟随会话文案要反查 displayName）；打开选择器时再兜底一次
   const { models, fetchModels } = useModels();
   useEffect(() => {
-    const s = getSettings();
-    if (s.apiKey?.trim() && models.length === 0) void fetchModels(s.apiKey);
+    if (hasActiveModelCreds() && models.length === 0)
+      void fetchModels(getActiveModelCreds());
   }, [models.length, fetchModels]);
 
   // 跟随态 trigger：跟服务端 resume 同口径（最近 action.agentModel → task.model）
@@ -191,9 +191,8 @@ export const TaskTalkComposer = ({
               followOption="跟随会话"
               onOpenChange={(open) => {
                 if (!open) return;
-                const s = getSettings();
-                if (s.apiKey?.trim() && models.length === 0)
-                  void fetchModels(s.apiKey);
+                if (hasActiveModelCreds() && models.length === 0)
+                  void fetchModels(getActiveModelCreds());
               }}
             />
           }

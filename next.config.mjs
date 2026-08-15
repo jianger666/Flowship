@@ -36,7 +36,22 @@ const nextConfig = {
   // @cursor/sdk 是 server-only 的大依赖、让 Next 不打进 bundle、
   // 运行时直接 require；同时回避 webpack 解析 SDK 自带的 .d.ts.map
   // 时报 "Module parse failed: Unexpected token" 的问题。
-  serverExternalPackages: ["@cursor/sdk", "ssh2", "zod", "zod-to-json-schema"],
+  // @cursor/sdk / pi 都是 server-only 的大依赖、让 Next 不打进 bundle、
+  // 运行时直接 require；同时回避 webpack 解析 SDK 自带的 .d.ts.map
+  // 时报 "Module parse failed: Unexpected token" 的问题。
+  // pi 系列还依赖 bundler-opaque 的动态 import（./api/* ./providers/*），
+  // 必须外部化才能解析到其 dist 子路径。
+  serverExternalPackages: [
+    "@cursor/sdk",
+    "ssh2",
+    "zod",
+    "zod-to-json-schema",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai",
+    "openai",
+    "@anthropic-ai/sdk",
+  ],
   // dev 模式（next dev）：server 侧代码里的 `node:xxx` 内建模块让 webpack 全走
   // 运行时 require（默认 externalsPresets 覆盖不到、会报 UnhandledSchemeError）。
   // 仅 server 构建生效、不改 client bundle；standalone 构建同样受益、行为不变。

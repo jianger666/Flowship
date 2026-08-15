@@ -1,10 +1,10 @@
 "use client";
 
 /**
- * 拉 Cursor 模型列表的 hook
+ * 拉模型列表的 hook（cursor 与自定义 provider 共用）
  *
  * 抽出来主要解决两件事：
- * 1. race condition：用户连点「验证」或先后改 apiKey 再点、之前实现里
+ * 1. race condition：用户连点「验证」或先后改凭据再点、之前实现里
  *    后发请求未必后到、可能用旧响应覆盖新响应
  *    → AbortController + ref：每次新请求 abort 旧的、AbortError 静默吞掉
  * 2. 把 settings 页里跟模型相关的 4 个 state（models / loading / error / abort ref）打包
@@ -12,28 +12,39 @@
  * V0.7.13 加 SWR 缓存（用户实测「到处都要拉、很慢」）：
  * - localStorage 存 { keyHash, models, ts }、TTL 24h
  * - 命中：立即出缓存数据（不转圈）、后台静默 re-fetch、回来刷新缓存 + state
- * - 未命中 / key 换了：老流程（转圈等接口）
+ * - 未命中 / 凭据换了：老流程（转圈等接口）
  * - server 端 /api/models 另有 10 分钟内存缓存、双层叠加后台刷新也快
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import type { ModelOption } from "@/lib/types";
+import type { CustomProviderFormat, ModelOption } from "@/lib/types";
+
+export interface ModelsFetchInput {
+  apiKey: string;
+  /** 自定义 provider 的 baseUrl；有值走 /v1/models、无值走 Cursor SDK */
+  baseUrl?: string;
+  format?: CustomProviderFormat;
+}
 
 export interface UseModelsResult {
   models: ModelOption[];
   loading: boolean;
   error: string;
-  fetchModels: (apiKey: string) => Promise<void>;
+  fetchModels: (input: ModelsFetchInput) => Promise<void>;
 }
 
 const CACHE_KEY = "flowship:models-cache";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-// apiKey 摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）
-const keyHashOf = (apiKey: string): string =>
-  `${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}`;
+// 凭据摘要：缓存归属判定用（不存明文、本地工具够用的弱指纹）
+const keyHashOf = (input: ModelsFetchInput): string => {
+  const apiKey = input.apiKey ?? "";
+  const fmt = input.format ?? "";
+  const baseUrl = input.baseUrl ?? "";
+  return `${apiKey.length}:${apiKey.slice(0, 4)}:${apiKey.slice(-4)}|${baseUrl}|${fmt}`;
+};
 
 interface ModelsCache {
   keyHash: string;
@@ -41,12 +52,12 @@ interface ModelsCache {
   ts: number;
 }
 
-const readCache = (apiKey: string): ModelOption[] | null => {
+const readCache = (input: ModelsFetchInput): ModelOption[] | null => {
   try {
     const raw = window.localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const c = JSON.parse(raw) as ModelsCache;
-    if (c.keyHash !== keyHashOf(apiKey)) return null;
+    if (c.keyHash !== keyHashOf(input)) return null;
     if (Date.now() - c.ts > CACHE_TTL_MS) return null;
     return Array.isArray(c.models) && c.models.length > 0 ? c.models : null;
   } catch {
@@ -54,11 +65,11 @@ const readCache = (apiKey: string): ModelOption[] | null => {
   }
 };
 
-const writeCache = (apiKey: string, models: ModelOption[]) => {
+const writeCache = (input: ModelsFetchInput, models: ModelOption[]) => {
   try {
     window.localStorage.setItem(
       CACHE_KEY,
-      JSON.stringify({ keyHash: keyHashOf(apiKey), models, ts: Date.now() } satisfies ModelsCache),
+      JSON.stringify({ keyHash: keyHashOf(input), models, ts: Date.now() } satisfies ModelsCache),
     );
   } catch {
     // quota 满等失败不影响主流程
@@ -66,23 +77,25 @@ const writeCache = (apiKey: string, models: ModelOption[]) => {
 };
 
 export const useModels = (): UseModelsResult => {
-  // 通过 /api/models 拉到的模型列表（依赖有效 API key）
+  // 通过 /api/models 拉到的模型列表（依赖有效凭据）
   const [models, setModels] = useState<ModelOption[]>([]);
 
   // 模型列表加载中状态、控制刷新按钮 spinner（缓存命中时的后台刷新不置 true）
   const [loading, setLoading] = useState(false);
 
-  // 模型列表拉取的错误信息（API key 错 / 网络错 / 超时）
+  // 模型列表拉取的错误信息（凭据错 / 网络错 / 超时）
   const [error, setError] = useState("");
 
   // 当前 in-flight 请求的 controller、新请求来时 abort 旧的
   const abortRef = useRef<AbortController | null>(null);
 
-  const fetchModels = useCallback(async (apiKey: string) => {
+  const fetchModels = useCallback(async (input: ModelsFetchInput) => {
     abortRef.current?.abort();
 
-    const trimmed = apiKey.trim();
-    if (!trimmed) {
+    const trimmedKey = input.apiKey?.trim() ?? "";
+    const trimmedBaseUrl = input.baseUrl?.trim() ?? "";
+    // 无有效凭据（cursor 无 key / custom 无 baseUrl）→ 清空、不请求
+    if (!trimmedKey && !trimmedBaseUrl) {
       setModels([]);
       setError("");
       setLoading(false);
@@ -90,7 +103,12 @@ export const useModels = (): UseModelsResult => {
     }
 
     // SWR：缓存命中先出数据、后台静默刷新（silent=true 时不转圈、错误不打扰）
-    const cached = readCache(trimmed);
+    const normalized: ModelsFetchInput = {
+      apiKey: trimmedKey,
+      baseUrl: trimmedBaseUrl || undefined,
+      format: input.format,
+    };
+    const cached = readCache(normalized);
     const silent = cached !== null;
     if (cached) {
       setModels(cached);
@@ -108,7 +126,11 @@ export const useModels = (): UseModelsResult => {
       const res = await fetch("/api/models", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: trimmed }),
+        body: JSON.stringify({
+          apiKey: trimmedKey,
+          ...(trimmedBaseUrl ? { baseUrl: trimmedBaseUrl } : {}),
+          ...(input.format ? { format: input.format } : {}),
+        }),
         signal: ctrl.signal,
       });
       if (ctrl.signal.aborted) return;
@@ -126,7 +148,7 @@ export const useModels = (): UseModelsResult => {
       }
       const fresh: ModelOption[] = json.models || [];
       setModels(fresh);
-      writeCache(trimmed, fresh);
+      writeCache(normalized, fresh);
       // 静默刷新不弹 toast、首次（或缓存失效后）拉取保留成功提示
       if (!silent) toast.success(`已加载 ${fresh.length} 个模型`);
     } catch (err) {

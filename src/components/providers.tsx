@@ -24,7 +24,8 @@ import { SearchDialog } from "@/components/search-dialog";
 import { TaskAttentionWatcher } from "@/components/task-attention-watcher";
 import { TaskListProvider } from "@/hooks/use-task-list";
 import { MrInboxProvider } from "@/hooks/use-mr-inbox";
-import { getSettings, initSettings } from "@/lib/local-store";
+import { initSettings } from "@/lib/local-store";
+import { getActiveModelCreds, hasActiveModelCreds } from "@/lib/agent-provider";
 import { useModels } from "@/hooks/use-models";
 
 interface ProvidersProps {
@@ -37,10 +38,9 @@ interface ProvidersProps {
 const ModelsPrefetch = () => {
   const { fetchModels } = useModels();
   useEffect(() => {
-    // await 配置初始化后再读 apiKey（清理版删掉 localStorage 后、缓存只有 init 后才有值）
+    // await 配置初始化后再读凭据（清理版删掉 localStorage 后、缓存只有 init 后才有值）
     void initSettings().then(() => {
-      const key = getSettings().apiKey?.trim();
-      if (key) void fetchModels(key);
+      if (hasActiveModelCreds()) void fetchModels(getActiveModelCreds());
     });
   }, [fetchModels]);
   return null;

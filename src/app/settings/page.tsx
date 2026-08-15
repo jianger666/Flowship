@@ -34,11 +34,19 @@ import { Separator } from "@/components/ui/separator";
 import { useSettings } from "@/hooks/use-settings";
 import { useModels } from "@/hooks/use-models";
 import { useApiKeyInfo } from "@/hooks/use-api-key-info";
-import { getSettings } from "@/lib/local-store";
-import { DEFAULT_MEEGLE_PROJECT } from "@/lib/types";
+import {
+  DEFAULT_MEEGLE_PROJECT,
+  type AgentProviderId,
+  type CustomProviderConfig,
+  type CustomProviderFormat,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ApiKeySection } from "@/components/settings/api-key-card";
+import {
+  CustomProviderSection,
+  ProviderSection,
+} from "@/components/settings/custom-provider-card";
 import { RepoCard } from "@/components/settings/repo-card";
 import { StorageCard } from "@/components/settings/storage-card";
 import { GitLabSection } from "@/components/settings/git-card";
@@ -84,21 +92,79 @@ const SettingsPage = () => {
   // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在连接卡
   const { info: apiKeyInfo, loading: infoLoading, fetchInfo } = useApiKeyInfo();
 
-  // 一次「验证」同时拉模型列表 + 账号信息（两者都吃 SWR 缓存、重复调很便宜）
-  const validateApiKey = useCallback(
-    (key: string) => {
-      const trimmed = key.trim();
-      if (!trimmed) return;
-      void fetchModels(trimmed);
-      void fetchInfo(trimmed);
+  // 当前 agent 后端（默认 cursor）+ 自定义 provider 配置
+  const provider: AgentProviderId = settings.provider ?? "cursor";
+  const customProvider: CustomProviderConfig = settings.customProvider ?? {
+    baseUrl: "",
+    apiKey: "",
+    format: "openai",
+  };
+
+  // 拉模型列表（cursor 再顺带拉账号信息）。isCustom 决定凭据 / 接口走哪条
+  const pullModels = useCallback(
+    (
+      creds: {
+        apiKey: string;
+        baseUrl?: string;
+        format?: CustomProviderFormat;
+      },
+      isCustom: boolean,
+    ) => {
+      if (isCustom ? !creds.baseUrl?.trim() : !creds.apiKey?.trim()) return;
+      void fetchModels({
+        apiKey: creds.apiKey ?? "",
+        baseUrl: creds.baseUrl,
+        format: creds.format,
+      });
+      if (!isCustom) void fetchInfo(creds.apiKey);
     },
     [fetchModels, fetchInfo],
   );
 
+  // 用「当前 provider + 当前凭据」拉一次（Prefs 卡「获取列表」/ 初始自动验证用）
+  const pullModelsForCurrent = useCallback(() => {
+    pullModels(
+      provider === "custom"
+        ? {
+            apiKey: customProvider.apiKey,
+            baseUrl: customProvider.baseUrl,
+            format: customProvider.format,
+          }
+        : { apiKey: settings.apiKey },
+      provider === "custom",
+    );
+  }, [provider, customProvider, settings.apiKey, pullModels]);
+
   // apiKey 失焦落盘：顺带自动验证（省得用户手动点「验证」才出模型 / 账号信息）
   const handleApiKeyCommit = (value: string) => {
     saveFieldValue("apiKey", value);
-    validateApiKey(value);
+    pullModels({ apiKey: value }, false);
+  };
+
+  // 自定义 provider 失焦落盘：顺带自动验证
+  const handleCustomProviderCommit = (value: CustomProviderConfig) => {
+    saveFieldValue("customProvider", value);
+    pullModels(
+      { apiKey: value.apiKey, baseUrl: value.baseUrl, format: value.format },
+      true,
+    );
+  };
+
+  // 切换 provider：落盘 + 用新侧凭据拉一次
+  const handleProviderChange = (next: AgentProviderId) => {
+    saveFieldValue("provider", next);
+    if (next === "custom") {
+      pullModels(
+        {
+          apiKey: customProvider.apiKey,
+          baseUrl: customProvider.baseUrl,
+          format: customProvider.format,
+        },
+        true,
+      );
+    } else {
+      pullModels({ apiKey: settings.apiKey }, false);
+    }
   };
 
   // 仓库提交：只落盘 repos（host 不进 settings、推进 / ship 时按任务仓库 remote 现推）
@@ -112,16 +178,14 @@ const SettingsPage = () => {
     setAppVersion(window.__appVersion ?? null);
   }, []);
 
-  // 进设置页（配置加载完成）若已有 apiKey 就自动验证一次——读 SWR 缓存秒出模型 + 账号信息、
-  // 不用用户手动点「验证」。用 ref 保证只跑一次（读 getSettings 的落盘值、不依赖输入草稿、
-  // 避免把 apiKey 放进 deps 导致每次敲键都重拉）
+  // 进设置页（配置加载完成）若当前 provider 已配好凭据就自动验证一次——读 SWR 缓存秒出模型、
+  // 不用用户手动点「验证」。用 ref 保证只跑一次。
   const didInitValidate = useRef(false);
   useEffect(() => {
     if (!loaded || didInitValidate.current) return;
     didInitValidate.current = true;
-    const key = getSettings().apiKey?.trim();
-    if (key) validateApiKey(key);
-  }, [loaded, validateApiKey]);
+    pullModelsForCurrent();
+  }, [loaded, pullModelsForCurrent]);
 
   // 当前导航高亮项（点导航 / 滚动跟随都更新）
   const [activeFocus, setActiveFocus] = useState<string>(NAV_ITEMS[0].focus);
@@ -264,14 +328,35 @@ const SettingsPage = () => {
               <CardTitle>连接</CardTitle>
             </CardHeader>
             <CardContent className="space-y-5">
-              <ApiKeySection
-                apiKey={settings.apiKey}
-                info={apiKeyInfo}
-                onChange={(v) => update("apiKey", v)}
-                onCommit={handleApiKeyCommit}
-                onValidate={validateApiKey}
-                validating={modelsLoading || infoLoading}
-              />
+              <ProviderSection value={provider} onChange={handleProviderChange} />
+              <Separator />
+              {provider === "custom" ? (
+                <CustomProviderSection
+                  value={customProvider}
+                  onChange={(v) => update("customProvider", v)}
+                  onCommit={handleCustomProviderCommit}
+                  onValidate={(v) =>
+                    pullModels(
+                      {
+                        apiKey: v.apiKey,
+                        baseUrl: v.baseUrl,
+                        format: v.format,
+                      },
+                      true,
+                    )
+                  }
+                  validating={modelsLoading}
+                />
+              ) : (
+                <ApiKeySection
+                  apiKey={settings.apiKey}
+                  info={apiKeyInfo}
+                  onChange={(v) => update("apiKey", v)}
+                  onCommit={handleApiKeyCommit}
+                  onValidate={(k) => pullModels({ apiKey: k }, false)}
+                  validating={modelsLoading || infoLoading}
+                />
+              )}
               <Separator />
               <GitLabSection
                 gitToken={settings.gitToken ?? ""}
@@ -351,9 +436,13 @@ const SettingsPage = () => {
                 modelsError={modelsError}
                 modelSelection={settings.defaultModel}
                 onModelChange={(next) => saveFieldValue("defaultModel", next)}
-                apiKey={settings.apiKey}
                 modelsRefreshing={modelsLoading}
-                onModelsRefresh={fetchModels}
+                canRefreshModels={
+                  provider === "custom"
+                    ? !!customProvider.baseUrl?.trim()
+                    : !!settings.apiKey?.trim()
+                }
+                onModelsRefresh={pullModelsForCurrent}
               />
             </CardContent>
           </Card>,
