@@ -20,6 +20,7 @@
  *   - pi 无 task 子 agent 工具、无 delete 工具（内置 read/bash/edit/write/grep/find/ls）。
  */
 
+import path from "node:path";
 import type {
   ConversationStep,
   InteractionUpdate,
@@ -36,11 +37,17 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 
+import { dataRoot } from "./data-root";
+
 const PROVIDER_ID = "flowship-custom";
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 // 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
+
+// pi 的 agent 配置 / 会话文件都收进 app 数据目录、不污染 ~/.pi、也不和用户装的 pi 撞车
+const piAgentDir = (): string => path.join(dataRoot(), "pi-agent");
+const piSessionDir = (): string => path.join(dataRoot(), "pi-sessions");
 
 type Format = "openai" | "anthropic";
 const apiOf = (format: Format): "openai-completions" | "anthropic-messages" =>
@@ -357,9 +364,11 @@ export const createCustomAgent = async (
   const { runtime, model } = await buildRuntime(input);
   const { session } = await createAgentSession({
     cwd,
+    agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
     tools: [...BUILTIN_TOOLS],
+    sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
   const agentId = session.sessionFile ?? session.sessionId;
   return buildAdapter(session, agentId);
@@ -373,9 +382,10 @@ export const resumeCustomAgent = async (
   const { runtime, model } = await buildRuntime(input);
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接；
   // 打开失败（文件被清 / 不兼容）会抛、由调用方按 cursor 的 resume 失败口径降级新会话。
-  const sessionManager = SessionManager.open(agentId, undefined, cwd);
+  const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
   const { session } = await createAgentSession({
     cwd,
+    agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
     tools: [...BUILTIN_TOOLS],
@@ -393,9 +403,12 @@ export const promptOnceCustom = async (
   const { runtime, model } = await buildRuntime(input);
   const { session } = await createAgentSession({
     cwd,
+    agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
     noTools: "all",
+    // 一次性标题生成：不落会话文件
+    sessionManager: SessionManager.inMemory(cwd),
   });
   try {
     let result = "";
