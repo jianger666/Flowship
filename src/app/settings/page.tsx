@@ -15,7 +15,7 @@
  * 拆分约定：状态管理 → hooks；配置节 → components/settings/*-card.tsx；本文件只组合。
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
@@ -92,13 +92,13 @@ const SettingsPage = () => {
   // API Key 归属信息（Cursor.me）——验证时顺便拉、展示在连接卡
   const { info: apiKeyInfo, loading: infoLoading, fetchInfo } = useApiKeyInfo();
 
-  // 当前 agent 后端（默认 cursor）+ 自定义 provider 配置
+  // 当前 agent 后端（默认 cursor）+ 自定义 provider 配置（useMemo 保持引用稳定、供 useCallback deps）
   const provider: AgentProviderId = settings.provider ?? "cursor";
-  const customProvider: CustomProviderConfig = settings.customProvider ?? {
-    baseUrl: "",
-    apiKey: "",
-    format: "openai",
-  };
+  const customProvider: CustomProviderConfig = useMemo(
+    () =>
+      settings.customProvider ?? { baseUrl: "", apiKey: "", format: "openai" },
+    [settings.customProvider],
+  );
 
   // 拉模型列表（cursor 再顺带拉账号信息）。isCustom 决定凭据 / 接口走哪条
   const pullModels = useCallback(
