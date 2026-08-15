@@ -58,13 +58,13 @@ describe("nextFollowing", () => {
     );
   });
 
-  it("上滚幅度还在贴底阈值内（误触）→ 维持跟随、不惩罚手滑", () => {
+  it("上滚意图优先于几何贴底——即使距底还在 48px 内（底部附近往回滚），也该离开跟随，否则流式增长会把用户拽回底部造成上下抖动", () => {
     expect(
       nextFollowing(true, {
         distanceFromBottom: FOLLOW_PIN_THRESHOLD - 1,
         userIntentUp: true,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("非跟随态滚回底部 → 自动恢复跟随", () => {

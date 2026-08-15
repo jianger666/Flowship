@@ -358,11 +358,23 @@ export const wkScriptsDir = (): string =>
  * 「WK 产出目录里没有这个需求目录」的两种语境——旧文案混成一句、还一律诱导用户去改编号。
  * `wk:biz-analyze` 正是建这个目录的指令，首次跑目录本来就不该存在；其余指令走到这里
  * 才真的可能是「前置没跑」或「编号填错了」。
+ *
+ * 2026-08-12：**没配 Delivery Hub**（本地没有 = 真没有、没有远端可拉）和
+ * **配了 Hub**（本地没有 = 正常、远端会有）分开提示——前者不再把锅甩给「编号填错」。
  */
-const missingReqDirMessage = (command: WkCommand, reqId: string): string =>
-  command === "wk:biz-analyze"
-    ? `${reqId} 的需求目录还没建（本次 wk:biz-analyze 跑完才有）、跳过 wk 门禁`
-    : `WK产出目录里没有 ${reqId} 的需求目录、本次跳过 wk 门禁（先跑 wk:biz-analyze、编号填错了可在任务详情页改）`;
+const missingReqDirMessage = (
+  command: WkCommand,
+  reqId: string,
+  noHub: boolean,
+): string => {
+  if (command === "wk:biz-analyze") {
+    return `${reqId} 的需求目录还没建（本次 wk:biz-analyze 跑完才有）、跳过 wk 门禁`;
+  }
+  if (noHub) {
+    return `WK产出目录里没有 ${reqId} 的需求目录、也没配 Delivery Hub 可从远端拉取，本次跳过 wk 门禁（先跑 wk:biz-analyze，或去设置页 → 团队 配 Delivery Hub 后由门禁自动拉取）`;
+  }
+  return `WK产出目录里没有 ${reqId} 的需求目录、本次跳过 wk 门禁（先跑 wk:biz-analyze、编号填错了可在任务详情页改）`;
+};
 
 /**
  * preflight 会不会走网络：`doc-quality-gate.py --command` 在 delivery 配置的
@@ -443,9 +455,20 @@ export const planWkGate = async (
     );
   }
 
+  // 业务级产物目录（<docRepo>/requirements/<REQ-ID>）。
+  // 本地没有 ≠ 没有业务方案：owner 可能在别处 / 另一台机器跑完 biz 指令、
+  // 方案同步在远端 Delivery Hub（非 owner 开发者拿 REQ-ID 直接开跑 repo-design 的常态）。
+  // 配了 Hub → 建空目录放行，preflight 的 baseline pull 会把远端方案拉回本地再校验
+  // （doc-quality-gate.py 要求 --biz-path 目录先存在，而 pull 的 download_to 会建父目录）；
+  // 只有没配 Hub（本地没有 = 真没有）才降级跳过。
+  const pullsBaseline = await detectBaselinePull(cfg, repoRoot);
   const bizDir = path.join(cfg.docRepoPath, "requirements", reqId);
-  if (!(await dirExists(bizDir))) {
-    return skip("no-req-dir", missingReqDirMessage(command, reqId));
+  const hasBizDir = await dirExists(bizDir);
+  if (!hasBizDir && !pullsBaseline) {
+    return skip("no-req-dir", missingReqDirMessage(command, reqId, true));
+  }
+  if (!hasBizDir) {
+    await fs.mkdir(bizDir, { recursive: true });
   }
 
   return {
@@ -462,7 +485,7 @@ export const planWkGate = async (
     hasContextInit: await fileExists(
       path.join(scriptsDir, "wk-context-init.py"),
     ),
-    pullsBaseline: await detectBaselinePull(cfg, repoRoot),
+    pullsBaseline,
     repoName:
       (task.repoPaths[0] ?? repoRoot).split(/[\\/]/).filter(Boolean).pop() ??
       "repo",

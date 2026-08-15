@@ -1221,8 +1221,10 @@ const advanceTaskCore = async (
   await assertTaskNotTerminalForAdvance(task.id);
 
   // 1) 准入条件（V0.6 门槛 1）：host 按任务仓库 remote 现推（多实例不一致会 throw）
+  //    脚本仓不参与推导（不 ship、origin 可能挂在别的实例）
   const effectiveGitHost =
-    (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
+    (await resolveEffectiveGitHost(task.repoPaths, task.scriptRepoPaths)) ??
+    undefined;
   const pre = checkActionPrerequisites(task, actionType, {
     gitHost: effectiveGitHost,
     gitToken,
@@ -2134,7 +2136,10 @@ export const buildSessionBridges = (
     if (taskAction.kind === "submit_mr") {
       let gitHost: string | null = null;
       try {
-        gitHost = await resolveEffectiveGitHost(task.repoPaths);
+        gitHost = await resolveEffectiveGitHost(
+          task.repoPaths,
+          task.scriptRepoPaths,
+        );
       } catch (err) {
         return {
           ok: false,
@@ -2861,8 +2866,10 @@ const internalStartAgent = async (input: StartAgentInput): Promise<void> => {
     const perfWorkspaceMs = Date.now() - perfStart;
 
     // host 按任务仓库 remote 现推（多实例不一致会 throw、起 agent 失败可见）
+    // 脚本仓不参与推导（不 ship、origin 可能挂在别的实例）
     const effectiveGitHost =
-      (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
+      (await resolveEffectiveGitHost(task.repoPaths, task.scriptRepoPaths)) ??
+      undefined;
 
     // advance 在步骤 4 只 snapshot 一次 activeRun——one-shot 可能在
     // 那之后、走到这里之前才完成 send 预登记。持 opHandle 的正式启动意图
@@ -3954,8 +3961,6 @@ const consumeSessionRun = async (
     questionRun?: boolean;
     // V0.13.x 自动重连计数（tryAutoReconnect 递归时递增、防无限重连）
     reconnectAttempt?: number;
-    // 追问补交卷轮（run 自然结束未交卷的 send 追问）——该轮不启用交卷后静音豁免
-    followupTurn?: boolean;
     /**
      * V12：op handle 必传——owner（启动链 claim）或 observer（ask/one-shot 快照）。
      * 状态写门控走 isOpOwner；observer 的 release 是 no-op。
@@ -4145,7 +4150,6 @@ const consumeSessionRun = async (
         );
       },
     };
-    assistantCtx.followupTurn = opts.followupTurn ?? false;
 
     // 打点：send 受理到首个流事件（≈首 token）的等待——量化「首包预填」开销
     const perfStreamStart = Date.now();
@@ -4516,7 +4520,6 @@ const consumeSessionRun = async (
         // 追问本身也是一轮 run、走同一管道（计数已 +1、再未交卷会再追或标 error）
         await consumeSessionRun(task, agent, nextRun, {
           ...opts,
-          followupTurn: true,
         });
         return;
       }

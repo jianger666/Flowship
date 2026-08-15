@@ -509,6 +509,9 @@ export const AdvanceDialog = ({
   // ref 持本 task 各仓路径——open effect 读设置页 dev 分支时用、不进 effect 依赖（同 hasPlanHistoryRef 套路）
   const repoPathsRef = useRef(task.repoPaths);
   repoPathsRef.current = task.repoPaths;
+  // ref 持脚本仓快照——open effect 请求 host 推导时排除、不进 deps（同 repoPathsRef 套路）
+  const scriptRepoPathsRef = useRef(task.scriptRepoPaths ?? []);
+  scriptRepoPathsRef.current = task.scriptRepoPaths ?? [];
   // 日常轻量态判定用（open / fetch effect 不进 task 依赖、靠 ref 读最新）
   const feishuStoryUrlRef = useRef(task.feishuStoryUrl);
   feishuStoryUrlRef.current = task.feishuStoryUrl;
@@ -575,8 +578,13 @@ export const AdvanceDialog = ({
     setResolvedGitHost(undefined);
     setGitHostError(null);
     if (repoPathsRef.current.length > 0) {
+      // 脚本仓排除出 host 推导（与 server resolveEffectiveGitHost 同口径、防误报多实例）
+      const scriptPaths = scriptRepoPathsRef.current.filter((p) =>
+        repoPathsRef.current.includes(p),
+      );
       const q = encodeURIComponent(repoPathsRef.current.join(","));
-      void fetch(`/api/repo-remote-meta?paths=${q}`)
+      const sq = encodeURIComponent(scriptPaths.join(","));
+      void fetch(`/api/repo-remote-meta?paths=${q}&scriptPaths=${sq}`)
         .then((r) => r.json())
         .then((d: { host?: string | null; error?: string }) => {
           if (d.error?.trim()) {

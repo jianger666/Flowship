@@ -31,12 +31,17 @@ export const pickUnifiedGitHost = (
 /**
  * 按任务 repoPaths 从各仓 origin remote 推导统一 GitLab host。
  * 推不出返 null；多仓分属不同实例则抛 MULTI_GITLAB_HOST_ERROR。
+ * @param excludeRepoPaths 不参与推导的仓（如脚本仓——不 ship / 不提 MR、
+ *   origin 常挂在别的 GitLab 实例，参与推导会误伤 fail-fast）
  */
 export const resolveEffectiveGitHost = async (
   repoPaths: string[],
+  excludeRepoPaths?: ReadonlyArray<string> | ReadonlySet<string>,
 ): Promise<string | null> => {
+  const exclude = new Set(excludeRepoPaths ?? []);
   const hosts: Array<string | null> = [];
   for (const repoPath of repoPaths) {
+    if (exclude.has(repoPath)) continue;
     hosts.push(await deriveHostFromRepo(repoPath));
   }
   return pickUnifiedGitHost(hosts);

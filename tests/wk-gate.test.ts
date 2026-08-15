@@ -288,8 +288,46 @@ describe("planWkGate 降级判定", () => {
 
     expect(analyze.message).toContain("wk:biz-analyze");
     expect(analyze.message).not.toContain("改需求编号");
-    // 其余指令才是「前置没跑 / 编号填错了」，给改编号的指引
-    expect(execute.message).toContain("编号填错了");
+    // 其余指令（这里没配 Hub）→ 说明真实原因：本地没有、也没 Hub 可拉，指引去配 Hub 或先跑 biz-analyze
+    expect(execute.message).toContain("Delivery Hub");
+    expect(execute.message).not.toContain("编号填错了");
+  });
+
+  it("没配 Hub 时的 no-req-dir 提示说明真实原因（本地没有且没有 Hub 可拉），不把锅全甩给编号", async () => {
+    await setupHappyWorld();
+    const plan = await planWkGate(makeTask({ reqId: "REQ-NO-DIR" }), WK_DEF);
+    if (plan.applies) throw new Error("预期降级");
+    expect(plan.message).toContain("没配 Delivery Hub");
+    expect(plan.message).toContain("设置页");
+  });
+
+  it("配了 Delivery Hub + 本地没需求目录 → 不降级：建空目录放行、由 preflight 的 baseline pull 拉远端方案（非 owner 开发者直接跑 repo-design 的常态）", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "https://hub.example.com";
+    wkCfg.requireBaseline = true;
+    const bizDir = path.join(DOC_REPO, "requirements", "REQ-FROM-HUB");
+    expect(
+      await fs
+        .stat(bizDir)
+        .then((s) => s.isDirectory())
+        .catch(() => false),
+    ).toBe(false);
+
+    const plan = await planWkGate(makeTask({ reqId: "REQ-FROM-HUB" }), WK_DEF);
+    if (!plan.applies) throw new Error(`预期 active、实际降级：${plan.reason}`);
+    expect(plan.pullsBaseline).toBe(true);
+    expect(plan.bizDir).toBe(bizDir);
+    // 空目录已自动建好、preflight 的 baseline pull 会把远端产物下载进来
+    expect((await fs.stat(bizDir)).isDirectory()).toBe(true);
+  });
+
+  it("配了 Hub + 本地有目录 → 照常 active（原有目录不动、仍走 preflight 校验）", async () => {
+    await setupHappyWorld();
+    wkCfg.hubBaseUrl = "https://hub.example.com";
+    wkCfg.requireBaseline = true;
+    const plan = await expectActive(makeTask());
+    expect(plan.pullsBaseline).toBe(true);
+    expect(plan.bizDir).toBe(path.join(DOC_REPO, "requirements", REQ_ID));
   });
 
   it("老版本团队库没有 wk-context-init.py → 仍能跑门禁、plan 标记这一步不做", async () => {

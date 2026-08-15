@@ -230,32 +230,44 @@
 
 /* ---------- 全局滚动条（V0.7.13、用户实测「默认滚动条在 dark 下格格不入」） ----------
    薄轨 + 半透明拇指、hover 提亮；按主题切换拇指色（dark 用浅灰、light 用深灰半透明、
-   类 macOS overlay）；Firefox 走 scrollbar-width/color 等价配置 */
+   类 macOS overlay）；Firefox 走 scrollbar-width/color 等价配置。
+   2026-08 可见性修正（用户实测「几乎隐形、看不出可滚动」）：
+   - 默认拇指 alpha 0.32 → 0.45、hover 0.5 → 0.62
+   - 轨道给极浅底色（0.06 → hover 0.12），滚动通道可辨、不再浮一条线 */
 :root {
-  --sb-thumb: oklch(0.45 0.006 264 / 0.32);
-  --sb-thumb-hover: oklch(0.4 0.006 264 / 0.5);
+  --sb-thumb: oklch(0.45 0.006 264 / 0.45);
+  --sb-thumb-hover: oklch(0.4 0.006 264 / 0.62);
+  --sb-track: oklch(0.45 0.006 264 / 0.06);
+  --sb-track-hover: oklch(0.45 0.006 264 / 0.12);
 }
 .dark {
-  --sb-thumb: oklch(0.45 0.008 264 / 0.45);
-  --sb-thumb-hover: oklch(0.55 0.008 264 / 0.65);
+  --sb-thumb: oklch(0.45 0.008 264 / 0.55);
+  --sb-thumb-hover: oklch(0.55 0.008 264 / 0.72);
+  --sb-track: oklch(0.6 0.008 264 / 0.08);
+  --sb-track-hover: oklch(0.6 0.008 264 / 0.15);
 }
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--sb-thumb) transparent;
+  scrollbar-color: var(--sb-thumb) var(--sb-track);
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-track {
-  background: transparent;
+  background: var(--sb-track);
+  border-radius: 4px;
 }
 *::-webkit-scrollbar-thumb {
   background: var(--sb-thumb);
   border-radius: 4px;
 }
-*::-webkit-scrollbar-thumb:hover {
+*::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:active {
   background: var(--sb-thumb-hover);
+}
+*::-webkit-scrollbar-track:hover {
+  background: var(--sb-track-hover);
 }
 *::-webkit-scrollbar-corner {
   background: transparent;

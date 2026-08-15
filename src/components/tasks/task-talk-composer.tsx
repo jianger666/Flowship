@@ -37,6 +37,8 @@ interface Props {
   onStop?: () => void;
   // 停止请求飞行中——Composer 红方块键 disabled、防双击
   stopping?: boolean;
+  // 父级锁存的 run 进行中状态（latch 到 done 才松、跨过 awaiting_ack 的流式窗口）
+  runActive?: boolean;
 }
 
 export const TaskTalkComposer = ({
@@ -44,11 +46,12 @@ export const TaskTalkComposer = ({
   onTaskUpdate,
   onStop,
   stopping = false,
+  runActive = false,
 }: Props) => {
   // 请求飞行中：防双击
   const [submitting, setSubmitting] = useState(false);
   // agent 在跑时不可说（发送禁用）；运行中 Composer 右侧换成 spinner + 停止键（对齐 chat）
-  const isRunning = task.runStatus === "running";
+  const isRunning = runActive;
   const busy = submitting || isRunning;
 
   // 输入态整套（草稿 + skill + 图 + 路径附件 + 聚焦句柄）走公共 hook、跟 chat 输入岛同一份实现

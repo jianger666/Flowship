@@ -458,9 +458,9 @@ const StreamFloatingBar = ({
     following,
     prependDelta,
   );
+  const newCount = countNewItems(baselineRef.current, contentCount);
   // 贴底跟随中 = 最新内容就在眼前，两条都不用出
   if (following) return null;
-  const newCount = countNewItems(baselineRef.current, contentCount);
 
   return (
     <>
@@ -1467,12 +1467,13 @@ const EventStreamImpl = ({
             )}
           />
         )}
-        {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn） */}
-        {isChat && (
-          <div
-            ref={stickyRootRef}
-            className="pointer-events-none absolute inset-x-0 top-0 z-10 hidden"
-          >
+        {/* E1 sticky 轮次头：默认 hidden，rangeChanged 里命令式显隐（见 applyStickyTurn）。
+            chat / task 都启用：task 事件流里用户也会直接发消息提问（user_reply）、
+            回滚看历史时同样需要「回到最近提问」的锚 */}
+        <div
+          ref={stickyRootRef}
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 hidden"
+        >
             <div className="mx-auto w-full max-w-3xl px-6">
               <Tooltip content="回到本轮开头">
                 <button
@@ -1499,7 +1500,6 @@ const EventStreamImpl = ({
               </Tooltip>
             </div>
           </div>
-        )}
         {/* 底部悬浮层：回到最新（带新增条数）+ 未答提问提示条。
             显隐由子组件自己订阅跟随态，主组件不参与（滚动路径零重渲）。
             key 挂 task.id：详情页内切任务不重挂 EventStream、计数基线得跟着重来 */}
@@ -1555,9 +1555,8 @@ const EventStreamImpl = ({
               const list = itemsRef.current;
               const localIdx = range.startIndex - firstItemIndex;
               // E1 sticky：纯函数算目标 + 命令式 DOM，滚动路径零 setState
-              if (isChat) {
-                applyStickyTurn(resolveStickyTurn(list, localIdx));
-              }
+              // chat / task 都启用（task 事件流里用户也会直接发消息提问、同样需要锚）
+              applyStickyTurn(resolveStickyTurn(list, localIdx));
               const top = list[localIdx];
               if (!top || top.id.startsWith("__")) return;
               saveScrollAnchor(task.id, {

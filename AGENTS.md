@@ -1,58 +1,16 @@
 # 项目 Agent 工作规则
 
-## cursor-delegate 已弃用（仅保留借 Cursor 识图）
-
-- 自 2026-08 起停用 Cursor Composer 的编码任务委派：不得再用 `cursor-delegate` 派发实现、修复类编码任务；相关编码委派持续授权随之冻结。
-- 机械性子任务改由 opencode subagent 方案承接；该方案配置就绪前，编排代理直接完成，不再外派。
-- 「借 Cursor 识图」流程不受停用影响，保持可用：当前模型无视觉能力且需要识图时，仍按该章节执行，包括读取 Cursor SDK Key 并联网调用 SDK 完成识图的授权。
-- 防递归规则对识图 worker 继续有效：提示词说明当前进程已是委派 worker、或设置了 `CURSOR_DELEGATE_ACTIVE=1` 时，禁止再次委派。
-- 下方与编码委派相关的章节（委派选择、编码授权细节等）暂时冻结，仅作历史参考。
-
-## 按任务性质选择委派
-
-- `cursor-delegate` 优先用于繁琐、耗 token、边界明确且判断成本低的任务，例如仓库搜索、批量改名、机械性重构、测试样板、文档同步和明确纯函数实现。
-- 需要精细判断、体验取舍、复杂集成或复杂时序的关键实现，由编排代理直接完成和验收。
-- 一个任务可以拆分：Composer 负责机械性子任务，编排代理负责关键设计、集成、边界修复和最终验收。
-- 是否委派以判断成本和验收可靠性为准，而不是以任务大小为准；在交付质量、额度消耗和完成效率之间按风险平衡。决定直接处理时，修改前简要说明判断依据即可。
-
-## Cursor 委派持续授权
-
-- 仓库所有者已明确授权：对于符合本文件范围的仓库编码任务，`cursor-delegate` 可以读取完成任务所必需的仓库代码与上下文，并将这些内容发送给 Cursor Composer 2.5 执行实现和验证；无需就同类委派或相关代码传输重复询问。
-- 仓库所有者已明确授权：`cursor-delegate` 可以从已配置的操作系统凭据存储中读取 Cursor SDK Key 并联网调用 Cursor SDK；禁止在输出、日志、任务简报或仓库文件中暴露该 Key。
-- 上述持续授权不扩展任务范围，也不覆盖下方“不委派的情况”；遇到客户数据、其他秘密、生产权限、部署或不可逆操作时仍须停止并单独确认。
-
-## 不委派的情况
-
-- 涉及凭据、Token、客户数据或其他秘密。
-- 涉及安全边界、生产事故、发布、部署、外部写操作或不可逆操作。
-- 涉及破坏性数据迁移、重大架构决策或尚未明确的业务取舍。
-- 正在修改 `cursor-delegate` 自身、它的凭据存储或 SDK 执行安全机制。
-- 用户明确要求不要委派。
-
-## 防止递归委派
-
-- 当提示词说明当前 Agent 已经是由 `cursor-delegate` 启动的 implementation worker 时，必须直接完成任务，禁止再次调用 `cursor-delegate`、Cursor SDK 委派或其他嵌套 Agent。
-- 委派脚本设置了 `CURSOR_DELEGATE_ACTIVE=1` 时，同样表示当前进程已经是 worker，禁止二次委派。
-
-## 修改与验收
-
-- 始终保留用户已有改动，禁止为清理工作区而擅自执行 stash、reset、restore 或 checkout。
-- Composer 返回 `ok: true` 不等于验收通过；编排代理仍需按风险查看变更和检查结果。
-- 对体验或集成质量敏感的改动，源码字符串契约和浅层单测只能作为辅助证据，不能单独判定完成。
-- 除非检查失败或结果存在矛盾，编排代理不要重复 Composer 已完成的全仓搜索和完整修复循环。
-
 ## 借 Cursor 识图（无视觉能力的模型）
 
 - 当当前模型没有图像输入能力、但需要识别图片（截图、界面选项、报错画面等）时，借用 `cursor-delegate` 让 Composer 2.5 识图，而不是直接回"看不了"。
-- 步骤：
-  1. 确定图片路径。**opencode 宿主中用户粘贴的图片不落磁盘文件**，而是以 base64 data URL 存在 SQLite：`~/.local/share/opencode/opencode.db` 的 `part` 表（`data` 列为 JSON：`{"type":"file","mime":"image/png","filename":"image.png","url":"data:image/png;base64,..."}`）。用 `sqlite3 opencode.db "SELECT id, substr(data,1,200) FROM part WHERE data LIKE '%image%';"` 按 `rowid` 倒序找最新一张（通常与用户最近一条消息对应）。提取到临时文件：
-     `sqlite3 opencode.db "SELECT data FROM part WHERE id='<part_id>';" | python3 -c "import json,sys,base64; d=json.load(sys.stdin); open('.agents/tmp-vision/screenshot.png','wb').write(base64.b64decode(d['url'].split(',',1)[1]))"`
-     其他宿主（Cursor/Codex 等）存储位置未知、或库中找不到对应图片时，再请用户提供文件路径。
-  2. 清理机制：每次识图前先清空 `.agents/tmp-vision/` 内残留的旧图片，再把新图片复制进去（目录已入 `.gitignore`）；简报中使用相对工作区路径；worker 沙箱只允许读写工作区，不要把工作区外的路径直接交给它。
-  3. 执行 `node .agents/skills/cursor-delegate/scripts/run-cursor-agent.mjs --workspace <绝对路径> --task <简报>`；简报需说明：这是只读识图任务、图片相对路径、用户的具体问题，并要求逐项详细描述图片内容（文字、选项、状态、高亮等）。
-  4. 把 worker 返回的识别结果转述给用户；无论成功还是失败，本轮结束后删除对应临时图片，保证 `.agents/tmp-vision/` 只在任务进行中存在文件。
-  5. 识图结果是辅助证据：转述时说明来自 Composer 委派，不要声称是当前模型亲自看到。
-- 与"不委派的情况"一致：截图可能包含客户数据或其他秘密时，先向用户确认再委派（图片会发送给 Cursor 服务）；worker 返回 `ok: false` 时如实报告，不要编造识别结果。
+- 图片获取：
+  1. DSH 宿主已配置文本模型图片兜底（`textModelImageFallback: save-to-inbox`、`imageInboxDir: .agents/tmp-vision`）：用户贴图发送后，当前模型会收到一条插件源通知，其中包含图片已保存到 `.agents/tmp-vision/` 的文件相对路径，直接使用该路径即可。
+  2. 其他宿主或通知缺失时，请用户提供图片文件路径。
+- 清理机制：每次识图前先清空 `.agents/tmp-vision/` 内残留的旧图片（目录已入 `.gitignore`；DSH 侧另有 24 小时 TTL 兜底清理）；简报中使用相对工作区路径；worker 沙箱只允许读写工作区，不要把工作区外的路径直接交给它。
+- 执行 `node .agents/skills/cursor-delegate/scripts/run-cursor-agent.mjs --workspace <绝对路径> --task <简报>`；简报需说明：这是只读识图任务、图片相对路径、用户的具体问题，并要求逐项详细描述图片内容（文字、选项、状态、高亮等）。
+- 把 worker 返回的识别结果转述给用户；无论成功还是失败，本轮结束后删除对应临时图片，保证 `.agents/tmp-vision/` 只在任务进行中存在文件。
+- 识图结果是辅助证据：转述时说明来自 Composer 委派，不要声称是当前模型亲自看到。
+- 截图可能包含客户数据或其他秘密时，先向用户确认再委派（图片会发送给 Cursor 服务）；worker 返回 `ok: false` 时如实报告，不要编造识别结果。
 
 ## 打 test 包并重启（禁止 UI 自动化验收）
 

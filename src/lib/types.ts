@@ -310,9 +310,50 @@ export interface CompanyEnv {
   httpApis: CompanyEnvHttpApi[];
 }
 
+/**
+ * Agent 后端来源（v1.2.x 引入自定义 provider）：
+ * - `cursor`：走 @cursor/sdk（默认、历史行为不变）
+ * - `custom`：走自定义 HTTP provider（baseUrl + apiKey），底层用轻量 agent 库 pi 承接
+ */
+export type AgentProviderId = "cursor" | "custom";
+
+export const AGENT_PROVIDER_LABEL: Record<AgentProviderId, string> = {
+  cursor: "Cursor SDK",
+  custom: "自定义 Provider",
+};
+
+/**
+ * 自定义 provider 的 HTTP 协议（pi 原生支持两套）：
+ * - openai：`/v1/chat/completions` + `Authorization: Bearer <key>`
+ * - anthropic：`/v1/messages` + `x-api-key: <key>`
+ */
+export type CustomProviderFormat = "openai" | "anthropic";
+
+export const CUSTOM_PROVIDER_FORMAT_LABEL: Record<CustomProviderFormat, string> = {
+  openai: "OpenAI 兼容",
+  anthropic: "Anthropic 兼容",
+};
+
+/** 自定义 provider 配置（仅在 provider === "custom" 时生效） */
+export interface CustomProviderConfig {
+  /** 用户 HTTP API 的 baseUrl（不含 /v1 尾巴也行、运行时归一） */
+  baseUrl: string;
+  /** 用户 HTTP API 的 apiKey */
+  apiKey: string;
+  /** HTTP 协议：openai / anthropic */
+  format: CustomProviderFormat;
+}
+
 export interface FeAiFlowSettings {
   apiKey: string;
   defaultModel: ModelSelection;
+  /**
+   * Agent 后端来源（默认 cursor、历史行为不变）。
+   * custom 时 runtime 读 customProvider.baseUrl/apiKey、模型走 /v1/models + 手填兜底。
+   */
+  provider?: AgentProviderId;
+  /** 自定义 provider 配置（provider === "custom" 时读取） */
+  customProvider?: CustomProviderConfig;
   /** 代码路径点击跳转的 IDE、默认 cursor */
   jumpIde?: JumpIde;
   /** 输入框提交快捷键：默认 Cmd/Ctrl+Enter，Enter 换行 */

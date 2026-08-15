@@ -20,6 +20,13 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { ChoiceButton } from "@/components/ui/choice-button";
 import {
   Dialog,
@@ -394,77 +401,88 @@ const ActionsPanel = () => {
 
   return (
     <div>
-      {/* Action 内子 tab：我的 = 本机列表；共享市场 = 可安装的共享 action */}
-      <div className="mb-4 flex items-center gap-1">
-        <ChoiceButton
-          shape="tab"
-          selected={actionSubTab === "mine"}
-          onClick={() => setActionSubTab("mine")}
-        >
-          我的
-        </ChoiceButton>
-        <ChoiceButton
-          shape="tab"
-          selected={actionSubTab === "market"}
-          onClick={() => setActionSubTab("market")}
-        >
-          共享市场
-        </ChoiceButton>
-      </div>
-
-      {actionSubTab === "mine" && (
-        <>
-          {/* 工具行：说明 + 上传 / 对话创建 / 新建 */}
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm text-muted-foreground">
-              自定义 action = 把某个 skill 挂到任务链上跑；拖拽调顺序、开关控显隐
-            </p>
-            <div className="flex shrink-0 flex-wrap items-center gap-2">
-              <UploadToTeamLibraryButton mode="action" />
-              <Tooltip content="开个对话、AI 按你的描述生成 skill 并挂成 action">
-                <span className="inline-flex">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleAiCreate()}
-                    disabled={aiCreating}
-                  >
-                    {aiCreating ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <Sparkles />
-                    )}
-                    对话创建
-                  </Button>
-                </span>
-              </Tooltip>
-              <Button size="sm" onClick={handleNew}>
-                <Plus />
-                新建
-              </Button>
-            </div>
+      {/* 内容统一进 Card（与 Skill / MCP / Rules tab 同套白底容器规范） */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Action</CardTitle>
+          <CardDescription>
+            推进动作：内置 + 自定义统一列表，拖拽排序 / 显隐 / 编辑 / 对话创建
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {/* Action 内子 tab：我的 = 本机列表；共享市场 = 可安装的共享 action */}
+          <div className="flex items-center gap-1">
+            <ChoiceButton
+              shape="tab"
+              selected={actionSubTab === "mine"}
+              onClick={() => setActionSubTab("mine")}
+            >
+              我的
+            </ChoiceButton>
+            <ChoiceButton
+              shape="tab"
+              selected={actionSubTab === "market"}
+              onClick={() => setActionSubTab("market")}
+            >
+              共享市场
+            </ChoiceButton>
           </div>
 
-          {loading ? (
-            <LoadingState variant="card" />
-          ) : (
-            <ActionLayoutConfig
-              customActions={actions}
-              knownSkills={knownSkills}
-              appSkillNames={appSkillNames}
-              onEdit={handleEdit}
-              onDelete={handleDelete}
-              onViewLegacy={setViewingLegacy}
-              onConvertLegacy={(def) => void handleConvertLegacy(def)}
-              convertingLegacyId={convertingLegacyId}
-            />
-          )}
-        </>
-      )}
+          {actionSubTab === "mine" && (
+            <>
+              {/* 工具行：说明 + 上传 / 对话创建 / 新建 */}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm text-muted-foreground">
+                  自定义 action = 把某个 skill 挂到任务链上跑；拖拽调顺序、开关控显隐
+                </p>
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <UploadToTeamLibraryButton mode="action" />
+                  <Tooltip content="开个对话、AI 按你的描述生成 skill 并挂成 action">
+                    <span className="inline-flex">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void handleAiCreate()}
+                        disabled={aiCreating}
+                      >
+                        {aiCreating ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <Sparkles />
+                        )}
+                        对话创建
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  <Button size="sm" onClick={handleNew}>
+                    <Plus />
+                    新建
+                  </Button>
+                </div>
+              </div>
 
-      {actionSubTab === "market" && (
-        <InstallTeamActions onInstalled={() => void load()} />
-      )}
+              {loading ? (
+                <LoadingState variant="inline" />
+              ) : (
+                <ActionLayoutConfig
+                  customActions={actions}
+                  knownSkills={knownSkills}
+                  appSkillNames={appSkillNames}
+                  onEdit={handleEdit}
+                  onDelete={handleDelete}
+                  onViewLegacy={setViewingLegacy}
+                  onConvertLegacy={(def) => void handleConvertLegacy(def)}
+                  convertingLegacyId={convertingLegacyId}
+                />
+              )}
+            </>
+          )}
+
+          {actionSubTab === "market" && (
+            <InstallTeamActions onInstalled={() => void load()} />
+          )}
+        </CardContent>
+      </Card>
 
       <CustomActionEditor
         open={editorOpen}

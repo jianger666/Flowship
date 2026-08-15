@@ -48,13 +48,15 @@ export interface FollowInput {
 /**
  * 跟随态状态机（唯一判定入口）。
  *
- * 优先级：**回到底部 > 上滚意图**——用户上滚一点点又停在贴底范围内时按「没走」算，
- * 免得手滑一下就永久掉出跟随（老实现是反过来的：距离说了算、意图完全没人听）。
+ * 优先级：**用户上滚意图 > 几何贴底**——只要用户主动上滚（不管滚多远）就离开跟随；
+ * 滚回底部（距底 <= pin）才恢复。老实现反过来：距离 <= 48px 就强制维持跟随，
+ * 用户在底部附近往回滚时意图被无视 → 流式内容一增长就被拽回底部 → 上下抖动
+ * （用户实测「往回滚到某些消息时滚动条一直上下抖」）。
  */
 export const nextFollowing = (prev: boolean, input: FollowInput): boolean => {
   const pin = input.pinThreshold ?? FOLLOW_PIN_THRESHOLD;
-  if (input.distanceFromBottom <= pin) return true;
   if (input.userIntentUp) return false;
+  if (input.distanceFromBottom <= pin) return true;
   return prev;
 };
 

@@ -128,6 +128,9 @@ export const ChatView = ({
   const submitTokenRef = useRef<string | null>(null);
   // 「停止」按钮提交锁——中断 running 的 chat agent 期间禁用、防连点
   const [stopping, setStopping] = useState(false);
+  // run 进行中锁：runStatus 交卷后会从 running → awaiting_ack、但 run 还在流式吐消息；
+  // 用 latch 把「输入框 loading」保持到 run 真正结束（done 事件）再放开。
+  const [runActive, setRunActive] = useState(false);
   // shell 流式输出：callId → 尾部窗口文本（ephemeral，不进 task.events）
   const [liveToolOutputs, setLiveToolOutputs] = useState<
     Record<string, string>
@@ -205,10 +208,17 @@ export const ChatView = ({
     setIsSubmitting(false);
     setStopping(false);
     setLiveToolOutputs({});
+    setRunActive(false);
     // 立即投影当前 ledger，再订阅后续 dispatch
     applyLedgerToUi(getChatOpLedger(task.id));
     return subscribeChatOp(task.id, applyLedgerToUi);
   }, [task.id, applyLedgerToUi]);
+
+  // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松开——
+  // 交卷后（awaiting_ack）run 还在流式吐消息时、输入框 loading 不会提前关掉。
+  useEffect(() => {
+    if (task.runStatus === "running") setRunActive(true);
+  }, [task.runStatus]);
 
   // 是否渲染本地占位只看 persistence（与 terminal/network 轴正交）
   const pendingForStream = useMemo(
@@ -310,6 +320,7 @@ export const ChatView = ({
     onDone: (t) => {
       setStreamingText("");
       setLiveToolOutputs({});
+      setRunActive(false);
       const remaining = pendingLocalRepliesRef.current.length;
       // done_clear 只清已有明确终态；无终态保持 uncertain/persisted
       if (
@@ -694,7 +705,7 @@ export const ChatView = ({
           canReply={canReply}
           submitting={isSubmitting}
           disabledHint={disabledHint}
-          isRunning={task.runStatus === "running"}
+          isRunning={runActive}
           onStop={handleStop}
           stopping={stopping}
           onPrependEvents={onPrependEvents}

@@ -238,6 +238,17 @@ export const assembleServerLayout = async (rootDir, destDir) => {
     path.join(rootDir, ".next", "static"),
     path.join(destDir, ".next", "static"),
   );
+  // Next 15.5.20 standalone 已知坑：webpack-runtime.js 引用 ./chunks/vendor-chunks/*、
+  // 但 standalone 产物缺该目录（file tracing 漏了它）→ 内置 server 启动直接
+  // MODULE_NOT_FOUND（「启动超时：内部服务 30 秒内没有就绪」）。源 .next/server/
+  // 下 vendor-chunks/ 是有的、显式补拷兜底（目录可能因版本/配置不存在、条件拷贝）。
+  const vendorChunksSrc = path.join(rootDir, ".next", "server", "vendor-chunks");
+  if (await exists(vendorChunksSrc)) {
+    await cp(
+      vendorChunksSrc,
+      path.join(destDir, ".next", "server", "vendor-chunks"),
+    );
+  }
   if (await exists(path.join(rootDir, "public"))) {
     await cp(path.join(rootDir, "public"), path.join(destDir, "public"));
   }

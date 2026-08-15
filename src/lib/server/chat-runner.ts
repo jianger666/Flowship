@@ -943,9 +943,13 @@ export const runChatSession = async (
       const gitToken =
         typeof settings?.gitToken === "string" ? settings.gitToken.trim() : "";
       if (!gitToken) return "";
-      // host 一律按任务仓库 remote 现推（不再读 settings.gitHost）
+      // host 一律按任务仓库 remote 现推（不再读 settings.gitHost）；
+      // 脚本仓不参与推导（不 ship、origin 可能挂在别的实例）
       const effectiveHost =
-        (await resolveEffectiveGitHost(task.repoPaths)) ?? undefined;
+        (await resolveEffectiveGitHost(
+          task.repoPaths,
+          task.scriptRepoPaths,
+        )) ?? undefined;
       return buildGitlabAccessDirective(effectiveHost, dataRoot());
     })();
     gitlabAccessPromise.catch(() => {});

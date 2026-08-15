@@ -151,6 +151,9 @@ const TaskDetailPage = () => {
   // 但它的工具调用照样进事件流：不并进「运行中」判定，那些工具块会被渲染成「已中断」。
   // 值由 SSE 的 restricted_run 帧维护（每次连接 bootstrap 都会补发当前值）
   const [restrictedRunActive, setRestrictedRunActive] = useState(false);
+  // 主 run 进行中 latch：runStatus 交卷后会 running → awaiting_ack、但 run 还在流式吐消息；
+  // 锁到 done 事件才松、让输入条 / 事件流的「运行中」跨过 awaiting_ack 的流式窗口。
+  const [runActive, setRunActive] = useState(false);
   // 「推进」dialog 开关——V0.6.0.1 末段砍掉 ActionTimeline retry 入口、所有推进都从顶部按钮进、不再有预填
   const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
   // 收件箱「改bug」深链带来的指令 + 预选 custom action（打开 dialog 后消费掉）
@@ -193,7 +196,14 @@ const TaskDetailPage = () => {
     setSelectedActionId(null);
     // 旁路在飞是 per-task 信号（新任务的 bootstrap 会补发它自己的值）
     setRestrictedRunActive(false);
+    setRunActive(false);
   }, [id]);
+
+  // run 进行中 latch：runStatus 一旦进入 running 就锁上、直到 done 事件才松——
+  // 交卷后（awaiting_ack）run 还在流式吐消息时、输入条 loading 不会提前关掉。
+  useEffect(() => {
+    if (task?.runStatus === "running") setRunActive(true);
+  }, [task?.runStatus]);
 
   // v1.0.x 事件懒加载：所有「服务端 task 快照 → 本地 state」都走 absorbTask、
   // events 按 id 并集（本地可能已上拉加载了更早分页、直接 setTask(next) 会把历史冲掉）
@@ -379,6 +389,7 @@ const TaskDetailPage = () => {
       },
       onDone: (t) => {
         setStreamingText("");
+        setRunActive(false);
         absorbTask(t);
       },
       onAssistantDelta: (text) => setStreamingText((p) => p + text),
@@ -1018,7 +1029,7 @@ const TaskDetailPage = () => {
                   // 必传：漏了会让运行中的长 shell / subagent 被当成脏数据渲染成「已中断」。
                   // 旁路答疑（需求群非属主提问）同样在往这条流里写工具事件、
                   // 但它刻意不写 runStatus——必须并进来，否则它跑着的工具全成「已中断」
-                  isRunning={task.runStatus === "running" || restrictedRunActive}
+                  isRunning={runActive || restrictedRunActive}
                   onPrependEvents={handlePrependEvents}
                 />
               </div>
@@ -1034,6 +1045,7 @@ const TaskDetailPage = () => {
                 onTaskUpdate={absorbTask}
                 onStop={() => void handleStop()}
                 stopping={stopping}
+                runActive={runActive}
               />
             </aside>
           </ResizablePanel>

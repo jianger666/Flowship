@@ -97,7 +97,7 @@ const mutedEvents = (): WrittenEvent[] =>
     .map((c) => c[1])
     .filter((e) => e.meta?.muted === true);
 
-describe("handleSdkMessage 交卷后消音 + 固定收尾", () => {
+describe("handleSdkMessage 交卷/提问后收尾（交卷后答案照常广播、横幅在 run 结束）", () => {
   beforeEach(() => {
     writeOwnedEventAndPublish.mockClear();
     appendEvent.mockClear();
@@ -135,29 +135,14 @@ describe("handleSdkMessage 交卷后消音 + 固定收尾", () => {
   const bannerEvents = (): WrittenEvent[] =>
     writeOwnedEventAndPublish.mock.calls
       .map((c) => c[2])
-      .filter(
-        (e) =>
-          e.kind === "assistant_message" && e.text === SUBMIT_COMPLETED_TEXT,
-      );
+      .filter((e) => e.kind === "info" && e.text === SUBMIT_COMPLETED_TEXT);
 
-  it("交卷成功（[SUBMITTED]）后：thinking / assistant 带 muted 标记落盘，固定收尾只补一次", async () => {
+  it("交卷成功后：交卷后正文照常广播（答案给用户看）、固定横幅只在 run 结束兜底补发一次", async () => {
     const ctx: AssistantBufferCtx = { buffer: "", flush: async () => {}, submitSeen: false };
 
     // 交卷前的正常正文仍进 buffer
-    await handleSdkMessage(
-      "task-1",
-      {
-        type: "assistant",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "正文结论" }],
-        },
-      } as never,
-      ctx,
-      leaseOk,
-    );
+    await handleSdkMessage("task-1", assistantText("正文结论"), ctx, leaseOk);
     expect(ctx.buffer).toContain("正文结论");
-    expect(ctx.preSubmitTextSeen).toBe(true);
 
     // 本轮写了 artifact（事实信号）——固定横幅的发放前提
     await handleSdkMessage("task-1", artifactWriteToolCall(), ctx, leaseOk);
@@ -166,124 +151,65 @@ describe("handleSdkMessage 交卷后消音 + 固定收尾", () => {
     await handleSdkMessage("task-1", submitWorkCompleted("[SUBMITTED] action=act_1 已交卷、系统正在后台跑质量检查"), ctx, leaseOk);
     expect(ctx.submitSeen).toBe(true);
 
-    // 交卷后的 thinking / assistant 照常落盘（appendEvent、不广播）、带 muted 标记
+    // 交卷后 thinking 照常广播、不静音
     await handleSdkMessage("task-1", { type: "thinking", text: "系统提示用户继续。" } as never, ctx, leaseOk);
-    await handleSdkMessage(
-      "task-1",
-      {
-        type: "assistant",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "The answer is complete. Turn complete." }],
-        },
-      } as never,
-      ctx,
-      leaseOk,
-    );
-    expect(ctx.buffer).not.toContain("Turn complete");
-    const mutedThinking = mutedEvents().filter((e) => e.kind === "thinking");
-    expect(mutedThinking).toHaveLength(1);
-    const mutedAssistant = mutedEvents().filter(
-      (e) =>
-        e.kind === "assistant_message" &&
-        (e.text ?? "").includes("Turn complete"),
-    );
-    expect(mutedAssistant).toHaveLength(1);
-    // 无未标记（会渲染）的交卷后输出；muted 事件只走 appendEvent、不碰 SSE 广播
-    expect(
-      writeOwnedEventAndPublish.mock.calls.some(
-        (c) =>
-          (c[2].kind === "thinking" || c[2].kind === "assistant_message") &&
-          c[2].meta?.muted !== true &&
-          c[2].text !== SUBMIT_COMPLETED_TEXT,
-      ),
-    ).toBe(false);
-    expect(writeOwnedEventAndPublish.mock.calls.some((c) => c[2].kind === "thinking")).toBe(false);
+    expect(mutedEvents().filter((e) => e.kind === "thinking")).toHaveLength(0);
 
-    // 交卷成功一刻：固定收尾立即补发一次、内容平台固定、不含「交卷」术语
-    const fixedEvents = writeOwnedEventAndPublish.mock.calls
-      .map((c) => c[2])
-      .filter(
-        (e) =>
-          e.kind === "assistant_message" &&
-          e.text === SUBMIT_COMPLETED_TEXT,
-      );
-    expect(fixedEvents).toHaveLength(1);
-    expect(fixedEvents[0]!.text).not.toMatch(/交卷|submit_work/i);
+    // 交卷后正文（答案）照常广播、进 buffer，不再静音
+    await handleSdkMessage("task-1", assistantText("这就是本轮答案。"), ctx, leaseOk);
+    expect(ctx.buffer).toContain("这就是本轮答案");
+    expect(
+      mutedEvents().some((e) => (e.text ?? "").includes("这就是本轮答案")),
+    ).toBe(false);
+
+    // 交卷成功一刻：不立即补发横幅（等 run 结束兜底）
+    expect(bannerEvents()).toHaveLength(0);
+
+    // run 结束兜底：补发固定横幅一次、内容平台固定、不含「交卷」术语
+    const wrote = await maybeEmitSubmitFixedText(ctx, async (ev) => {
+      writeOwnedEventAndPublish("task-1", leaseOk, ev as WrittenEvent);
+    });
+    expect(wrote).toBe(true);
+    expect(bannerEvents()).toHaveLength(1);
+    expect(bannerEvents()[0]!.text).not.toMatch(/交卷|submit_work/i);
 
     // 重复调用不再补发
     const wroteAgain = await maybeEmitSubmitFixedText(ctx, async () => {});
     expect(wroteAgain).toBe(false);
   });
 
-  it("纯答疑重新交卷（本轮没写 artifact）：不发固定横幅、交卷瞬间发「已回复」、交卷后正文仍静音", async () => {
+  it("纯答疑重新交卷（没写 artifact）：交卷后正文照常广播、run 结束发「已回复」", async () => {
     const ctx: AssistantBufferCtx = { buffer: "", flush: async () => {}, submitSeen: false };
 
     await handleSdkMessage("task-1", assistantText("这个文案是哪个需求改的？"), ctx, leaseOk);
-    expect(ctx.preSubmitTextSeen).toBe(true);
     await handleSdkMessage("task-1", submitWorkCompleted("[SUBMITTED] action=act_1 已交卷"), ctx, leaseOk);
     expect(ctx.submitSeen).toBe(true);
-    // 没写 artifact → 不发固定横幅、交卷瞬间发轻量「已回复」（不等 run 结束）
+
+    // 没写 artifact → 交卷成功一刻不发横幅、也不发「已回复」（等 run 结束）
     expect(bannerEvents()).toHaveLength(0);
     expect(
       writeOwnedEventAndPublish.mock.calls.some(
         (c) => c[2].kind === "info" && c[2].text === "已回复",
       ),
-    ).toBe(true);
-
-    // 交卷前已说过话 → 交卷后正文照旧静音（废话不广播）
-    await handleSdkMessage("task-1", assistantText("没有新的指令。你可以继续聊。"), ctx, leaseOk);
-    expect(ctx.buffer).not.toContain("没有新的指令");
-    expect(
-      mutedEvents().some((e) => (e.text ?? "").includes("没有新的指令")),
-    ).toBe(true);
-
-    // run 结束兜底已是 no-op（交卷瞬间发过）
-    const wrote = await maybeEmitSubmitFixedText(ctx, async () => {});
-    expect(wrote).toBe(false);
-    expect(bannerEvents()).toHaveLength(0);
-  });
-
-  it("mis-order 且本轮写了产出：交卷后答案不静音、run 结束兜底补发固定横幅", async () => {
-    const ctx: AssistantBufferCtx = { buffer: "", flush: async () => {}, submitSeen: false };
-
-    await handleSdkMessage("task-1", artifactWriteToolCall(), ctx, leaseOk);
-    expect(ctx.artifactWritten).toBe(true);
-    await handleSdkMessage("task-1", submitWorkCompleted("[SUBMITTED] action=act_1 已交卷"), ctx, leaseOk);
-    expect(ctx.submitSeen).toBe(true);
-    expect(ctx.preSubmitTextSeen).toBeFalsy();
-    // 交卷前没说话 → 不立即发横幅
-    expect(bannerEvents()).toHaveLength(0);
-
-    // 交卷后正文是答案 → 不静音、正常进 buffer + delta
-    await handleSdkMessage("task-1", assistantText("这就是答案：白名单命中才出现。"), ctx, leaseOk);
-    expect(ctx.buffer).toContain("这就是答案");
-    expect(
-      mutedEvents().some((e) => (e.text ?? "").includes("这就是答案")),
     ).toBe(false);
 
-    // run 结束兜底：写了产出 → 补发固定横幅（答案在前、横幅在后）
+    // 交卷后正文照常广播、不静音
+    await handleSdkMessage("task-1", assistantText("补充说明。"), ctx, leaseOk);
+    expect(ctx.buffer).toContain("补充说明");
+    expect(
+      mutedEvents().some((e) => (e.text ?? "").includes("补充说明")),
+    ).toBe(false);
+
+    // run 结束兜底：没写 artifact → 发轻量「已回复」
     const wrote = await maybeEmitSubmitFixedText(ctx, async (ev) => {
       writeOwnedEventAndPublish("task-1", leaseOk, ev as WrittenEvent);
     });
     expect(wrote).toBe(true);
-    expect(bannerEvents()).toHaveLength(1);
-  });
-
-  it("追问轮（followupTurn）：交卷后正文不启用静音豁免、照旧静音", async () => {
-    const ctx: AssistantBufferCtx = {
-      buffer: "",
-      flush: async () => {},
-      submitSeen: false,
-      followupTurn: true,
-    };
-
-    await handleSdkMessage("task-1", submitWorkCompleted("[SUBMITTED] action=act_1 已交卷"), ctx, leaseOk);
-    expect(ctx.submitSeen).toBe(true);
-    await handleSdkMessage("task-1", assistantText("已交卷。"), ctx, leaseOk);
-    expect(ctx.buffer).not.toContain("已交卷");
+    expect(bannerEvents()).toHaveLength(0);
     expect(
-      mutedEvents().some((e) => (e.text ?? "").includes("已交卷")),
+      writeOwnedEventAndPublish.mock.calls.some(
+        (c) => c[2].kind === "info" && c[2].text === "已回复",
+      ),
     ).toBe(true);
   });
 

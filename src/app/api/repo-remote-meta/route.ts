@@ -1,8 +1,9 @@
 /**
- * GET /api/repo-remote-meta?path=... 或 ?paths=a,b
+ * GET /api/repo-remote-meta?path=... 或 ?paths=a,b（可带 scriptPaths=c,d 排除脚本仓）
  *
  * 从仓库 origin remote 推导 GitLab host / project path（推进 dialog 用）。
  * 多仓 host 不一致时返回 error（与 resolveEffectiveGitHost fail-fast 同口径）。
+ * 脚本仓不参与 host 推导——不 ship / 不提 MR、origin 可能挂在别的 GitLab 实例。
  */
 import { NextResponse } from "next/server";
 
@@ -33,12 +34,20 @@ export const GET = async (req: Request): Promise<Response> => {
   if (paths.length === 0) {
     return errorResponse("缺少 path 或 paths 参数", 400);
   }
+  // 脚本仓排除集（client 传 task.scriptRepoPaths 快照、与 server resolveEffectiveGitHost 同口径）
+  const scriptPaths = new Set(
+    (url.searchParams.get("scriptPaths") ?? "")
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean),
+  );
 
   const hosts: Record<string, string | null> = {};
   const projectPaths: Record<string, string | null> = {};
   let projectPath: string | null = null;
 
   for (const repoPath of paths) {
+    if (scriptPaths.has(repoPath)) continue;
     const [h, pp] = await Promise.all([
       deriveHostFromRepo(repoPath),
       deriveProjectPathFromRepo(repoPath),

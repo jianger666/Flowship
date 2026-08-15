@@ -4,9 +4,9 @@
  * 设置页（壳子）
  *
  * v1.0.x 整合（用户拍板「太零散、一个 tab 下只有一两个设置项」）：8 张卡收成 4 组——
- *   连接（Cursor API Key + GitLab Token + 飞书集成 + 环境配置 + 团队 wk 流程）/ 偏好（跳转 IDE + 分支模板 +
- *   提交快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储。
- * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航四项。
+ *   连接（Cursor API Key + GitLab Token + 飞书集成 + 环境配置）/ 团队（wk 流程：WK 产出目录 + Delivery Hub）/
+ *   偏好（跳转 IDE + 分支模板 + 提交快捷键 + 续用 Agent + 默认模型）/ 仓库 / 存储。
+ * 各配置块以「节」组件（*-card.tsx 里的 XxxSection）拼进组卡、左侧锚点导航五项。
  *
  * - 能力类配置（MCP / Skill / Action）在 /actions 能力页 tab 管理
  * - 旧深链兼容：?focus=api-key|feishu|git|env → 连接、profile|preference|model → 偏好、
@@ -50,9 +50,10 @@ import { FeishuCliSection } from "@/components/settings/feishu-cli-card";
 import { WkHarnessSection } from "@/components/settings/wk-harness-card";
 import { emptyCompanyEnv } from "@/lib/company-env";
 
-// 左侧锚点导航（四组）：id 同 ?focus= 新取值
+// 左侧锚点导航（五组）：id 同 ?focus= 新取值
 const NAV_ITEMS: Array<{ focus: string; label: string }> = [
   { focus: "connect", label: "连接" },
+  { focus: "team", label: "团队" },
   { focus: "prefs", label: "偏好" },
   { focus: "repos", label: "仓库" },
   { focus: "storage", label: "存储" },
@@ -300,8 +301,18 @@ const SettingsPage = () => {
                 onChange={(next) => update("companyEnv", next)}
                 onCommit={(next) => saveFieldValue("companyEnv", next)}
               />
-              <Separator />
-              {/* 团队 wk-harness 接入：WK 产出目录 + Delivery Hub（写 ~/.wk/config.yaml、不进 settings） */}
+            </CardContent>
+          </Card>,
+        )}
+
+        {/* ---- 团队：wk-harness 接入（WK 产出目录 + Delivery Hub，写 ~/.wk/config.yaml、不进 settings） ---- */}
+        {wrapCard(
+          "team",
+          <Card>
+            <CardHeader>
+              <CardTitle>团队</CardTitle>
+            </CardHeader>
+            <CardContent>
               <WkHarnessSection />
             </CardContent>
           </Card>,

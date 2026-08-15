@@ -203,8 +203,8 @@ const LayoutRow = ({
       onDragStart={onDragSessionStart}
       onDragEnd={onDragEnd}
       className={cn(
-        // 操作区相对整行垂直居中
-        "flex items-center gap-2 rounded-md border bg-card px-2 py-2.5",
+        // 外层已是 Card 白底、行内不再叠 bg-card，留边框分隔
+        "flex items-center gap-2 rounded-md border border-border/60 px-2 py-2.5",
         (skillDisabled || knowledgeDisabled) && "opacity-60",
       )}
     >
