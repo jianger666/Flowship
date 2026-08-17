@@ -46,11 +46,12 @@ const nextConfig = {
     "ssh2",
     "zod",
     "zod-to-json-schema",
+    // 仅 pi 系列需要 external：它们用 bundler-opaque 动态 import（./api/* ./providers/*）、
+    // webpack 打包会 resolve 不到这些子路径；openai/anthropic/glob/typebox 都是普通 ESM、
+    // webpack 能正常打包、external 反而当 CJS 处理会炸
     "@earendil-works/pi-coding-agent",
     "@earendil-works/pi-agent-core",
     "@earendil-works/pi-ai",
-    "openai",
-    "@anthropic-ai/sdk",
   ],
   // dev 模式（next dev）：server 侧代码里的 `node:xxx` 内建模块让 webpack 全走
   // 运行时 require（默认 externalsPresets 覆盖不到、会报 UnhandledSchemeError）。

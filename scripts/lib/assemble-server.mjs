@@ -271,6 +271,11 @@ export const assembleServerLayout = async (rootDir, destDir) => {
   // ssh2 在 ssh-exec.mjs 模块加载时就 require、Next 没有任何 import 会把它带进 standalone
   await addRuntimePackage(rootDir, destDir, "ssh2");
 
+  // pi（自定义 provider 后端）是 external + bundler-opaque 动态 import（./api/* ./providers/*），
+  // nft 静态分析追不到这些子路径、运行时 lazy import 会 MODULE_NOT_FOUND——整包补。
+  // cursor 默认路径不加载 pi、对存量包行为/启动无影响（只是体积增加）。
+  await addRuntimePackage(rootDir, destDir, "@earendil-works/pi-coding-agent");
+
   // ---------- 3. SDK 平台二进制包（standalone trace 漏的 optional 平台包）----------
   await addSdkPlatformPackage(rootDir, destDir);
 
