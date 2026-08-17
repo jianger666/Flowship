@@ -102,7 +102,8 @@ const idleWaitText = (): string =>
   ].join("\n");
 
 // ask_user 提交成功后的返回：答题卡已推、结束回复等答案以新消息送达
-const askSubmittedText = (askId: string): string =>
+// 导出供 pi 后端（customTools 桥接）复用同一文案（sdk-message-handler 靠 [ASK_SUBMITTED] 判 askSeen）
+export const askSubmittedText = (askId: string): string =>
   [
     `[ASK_SUBMITTED] 问题组 ${askId} 已推送给用户（UI 答题卡）。`,
     "",

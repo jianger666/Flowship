@@ -34,10 +34,12 @@ import {
 import type {
   AgentSession,
   AgentSessionEvent,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 
 import { dataRoot } from "./data-root";
+import { flowShipTools } from "./flowship-tools";
 
 const PROVIDER_ID = "flowship-custom";
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -148,6 +150,42 @@ const buildRuntime = async (
   });
   return { runtime, model: buildModel(modelId, input) };
 };
+
+// ----------------- Flowship 自有工具桥接（pi customTools） -----------------
+
+/**
+ * 从 cursor 形状的 mcpServers 里解 flowshipChat 的 caller token。
+ * runner（chat-runner / task-runner）总是把 flowshipChat MCP 塞进 mcpServers、
+ * pi 不用 MCP、但借它 URL 里的 `?caller=` 身份给工具 handler 核对（同 MCP 路径口径）。
+ */
+const extractCallerToken = (mcpServers: unknown): string | undefined => {
+  if (!mcpServers || typeof mcpServers !== "object") return undefined;
+  const flowshipChat = (mcpServers as Record<string, unknown>).flowshipChat;
+  if (!flowshipChat || typeof flowshipChat !== "object") return undefined;
+  const url = (flowshipChat as { url?: unknown }).url;
+  if (typeof url !== "string") return undefined;
+  try {
+    return new URL(url).searchParams.get("caller") ?? undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Flowship 自有工具 → pi ToolDefinition[]（execute 直连 handler、返回 AgentToolResult） */
+const buildCustomTools = (callerToken: string | undefined): ToolDefinition[] =>
+  flowShipTools.map(
+    (t) =>
+      ({
+        name: t.name,
+        label: t.label,
+        description: t.description,
+        parameters: t.parameters,
+        execute: async (_toolCallId: string, params: unknown) => {
+          const r = await t.handler(params as Record<string, unknown>, callerToken);
+          return { content: r.content, details: undefined };
+        },
+      }) as unknown as ToolDefinition,
+  );
 
 // ----------------- run 适配器 -----------------
 
@@ -362,12 +400,14 @@ export const createCustomAgent = async (
 ): Promise<PiAgentAdapter> => {
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model } = await buildRuntime(input);
+  const callerToken = extractCallerToken(input.mcpServers);
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
     tools: [...BUILTIN_TOOLS],
+    customTools: buildCustomTools(callerToken),
     sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
   const agentId = session.sessionFile ?? session.sessionId;
@@ -380,6 +420,7 @@ export const resumeCustomAgent = async (
 ): Promise<PiAgentAdapter> => {
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model } = await buildRuntime(input);
+  const callerToken = extractCallerToken(input.mcpServers);
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接；
   // 打开失败（文件被清 / 不兼容）会抛、由调用方按 cursor 的 resume 失败口径降级新会话。
   const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
@@ -389,6 +430,7 @@ export const resumeCustomAgent = async (
     modelRuntime: runtime,
     model,
     tools: [...BUILTIN_TOOLS],
+    customTools: buildCustomTools(callerToken),
     sessionManager,
   });
   return buildAdapter(session, agentId);
