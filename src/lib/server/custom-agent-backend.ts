@@ -40,9 +40,14 @@ import type { Model } from "@earendil-works/pi-ai";
 
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
+import { buildCodingToolDefs } from "./pi-coding-tools";
 
 const PROVIDER_ID = "flowship-custom";
-const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+// pi 原生里名字跟规范面一致的内置工具（read/grep/edit/write）；
+// bash→shell、find→glob、delete/task 由 buildCodingToolDefs 补成 customTools
+const NATIVE_TOOLS = ["read", "edit", "write", "grep"];
+// 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / flowshipChat 工具——防递归与副作用
+const SUBAGENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 // 自定义端点元数据缺省（用户 endpoint 不提供时给合理兜底）
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
@@ -171,9 +176,62 @@ const extractCallerToken = (mcpServers: unknown): string | undefined => {
   }
 };
 
-/** Flowship 自有工具 → pi ToolDefinition[]（execute 直连 handler、返回 AgentToolResult） */
-const buildCustomTools = (callerToken: string | undefined): ToolDefinition[] =>
-  flowShipTools.map(
+/** 进程内嵌套子会话：给 task 工具用——起一个只带编码工具的子 agent、跑完返最终文本 */
+const runSubagent = async (
+  prompt: string,
+  opts: {
+    runtime: Awaited<ReturnType<typeof ModelRuntime.create>>;
+    model: Model<never>;
+    cwd: string;
+  },
+): Promise<string> => {
+  const { session } = await createAgentSession({
+    cwd: opts.cwd,
+    agentDir: piAgentDir(),
+    modelRuntime: opts.runtime,
+    model: opts.model,
+    tools: [...SUBAGENT_TOOLS],
+    // 子 agent 不落会话文件（一次性）
+    sessionManager: SessionManager.inMemory(opts.cwd),
+  });
+  try {
+    let result = "";
+    await new Promise<void>((resolve) => {
+      const unsub = session.subscribe((ev) => {
+        if (ev.type === "message_update") {
+          const inner = ev.assistantMessageEvent;
+          if (inner?.type === "text_delta" && inner.delta) result += inner.delta;
+        } else if (ev.type === "agent_settled") {
+          unsub();
+          resolve();
+        }
+      });
+      void session.prompt(prompt).catch(() => {
+        unsub();
+        resolve();
+      });
+    });
+    return result.trim();
+  } finally {
+    try {
+      session.dispose();
+    } catch {
+      /* noop */
+    }
+  }
+};
+
+/**
+ * Flowship 自有工具 + 规范编码工具 → pi ToolDefinition[]。
+ * 编码工具（shell/glob/delete/task）由 buildCodingToolDefs 提供、task 的 runSubagent 闭包绑好 runtime/model/cwd。
+ */
+const buildCustomTools = (
+  callerToken: string | undefined,
+  cwd: string,
+  subagentRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>,
+  subagentModel: Model<never>,
+): ToolDefinition[] => [
+  ...flowShipTools.map(
     (t) =>
       ({
         name: t.name,
@@ -185,7 +243,11 @@ const buildCustomTools = (callerToken: string | undefined): ToolDefinition[] =>
           return { content: r.content, details: undefined };
         },
       }) as unknown as ToolDefinition,
-  );
+  ),
+  ...buildCodingToolDefs(cwd, (prompt) =>
+    runSubagent(prompt, { runtime: subagentRuntime, model: subagentModel, cwd }),
+  ),
+];
 
 // ----------------- run 适配器 -----------------
 
@@ -406,8 +468,8 @@ export const createCustomAgent = async (
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
-    tools: [...BUILTIN_TOOLS],
-    customTools: buildCustomTools(callerToken),
+    tools: [...NATIVE_TOOLS],
+    customTools: buildCustomTools(callerToken, cwd, runtime, model),
     sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
   const agentId = session.sessionFile ?? session.sessionId;
@@ -429,8 +491,8 @@ export const resumeCustomAgent = async (
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
-    tools: [...BUILTIN_TOOLS],
-    customTools: buildCustomTools(callerToken),
+    tools: [...NATIVE_TOOLS],
+    customTools: buildCustomTools(callerToken, cwd, runtime, model),
     sessionManager,
   });
   return buildAdapter(session, agentId);

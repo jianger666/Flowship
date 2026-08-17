@@ -26,7 +26,7 @@
  * - chat prompt 里没有 [NEXT_ACTION] / [USER_MESSAGE] 任务容器概念
  */
 
-import { Agent, getActiveProviderKind } from "./agent-backend";
+import { Agent } from "./agent-backend";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
 
 import {
@@ -522,30 +522,6 @@ interface InitialUserMessage {
  * 有 firstMessage：直接拼进 prompt、agent 第一 turn 就回答
  * 无 firstMessage：起手等用户发第一句（边界情况）
  */
-/** 「你能用的工具」段——按 agent 后端给不同工具清单（cursor SDK vs pi） */
-const renderBuiltinToolsSection = (provider: "cursor" | "custom"): string[] =>
-  provider === "custom"
-    ? [
-        "## 你能用的工具",
-        "",
-        "内置编码工具：",
-        "  - `read` 读文件（图片自动走 vision）　`grep` 搜内容　`find` 找文件名　`ls` 列目录",
-        "  - `bash` 跑命令　`edit` 改已有文件　`write` 建新文件 / 整文件覆盖",
-        "",
-        "另外还有 Flowship 自带工具、按场景用：`submit_work` 交卷 / `ask_user` 提问 / `submit_mr` 提 MR / `set_feishu_testers` 记测试人 / `set_plan_batches` 报批次 / `create_custom_action` 挂动作 / `share_to_group` 分享群。",
-        "",
-      ]
-    : [
-        "## 你能用的工具",
-        "",
-        "SDK 内置工具（**名字不带 `_file` 后缀**、就是 `read` / `edit` / `write`、不是 `read_file` 之类）：",
-        "  - `read` 读文件（图片自动走 vision）　`grep` 搜内容　`glob` 找文件名",
-        "  - `shell` 跑命令　`edit` 改已有文件　`write` 建新文件 / 整文件覆盖　`delete` 删文件　`task` 分派子任务",
-        "",
-        "另外还有用户配的其他 MCP（飞书 / context7 等）、按场景用。",
-        "",
-      ];
-
 const buildInitialPrompt = (
   task: Task,
   skills: SkillEntry[],
@@ -559,8 +535,6 @@ const buildInitialPrompt = (
   larkCliAuthSection = "",
   /** 公司环境常驻声明（有 servers/PG 时非空） */
   companyEnvBriefSection = "",
-  /** agent 后端（cursor/custom）、决定工具清单措辞 */
-  provider: "cursor" | "custom" = "cursor",
 ): string => {
   const eventsLogPath = getEventsLogPath(task.id);
 
@@ -579,7 +553,15 @@ const buildInitialPrompt = (
     // 回合协议（正常多轮对话、说完自然结束回复）单一源、见 wait-protocol-prompt.ts
     chatTurnProtocolSection(),
     "",
-    ...renderBuiltinToolsSection(provider),
+    // 工具清单 = 规范工具面（cursor / pi / 未来 cc、codex 都对齐同一组名，见 docs/pi-api-spec.md）
+    "## 你能用的工具",
+    "",
+    "SDK 内置工具（**名字不带 `_file` 后缀**、就是 `read` / `edit` / `write`、不是 `read_file` 之类）：",
+    "  - `read` 读文件（图片自动走 vision）　`grep` 搜内容　`glob` 找文件名",
+    "  - `shell` 跑命令　`edit` 改已有文件　`write` 建新文件 / 整文件覆盖　`delete` 删文件　`task` 分派子任务",
+    "",
+    "另外还有用户配的其他 MCP（飞书 / context7 等）、按场景用。",
+    "",
   );
   // 仅 win32 注入（PowerShell 语法条再按当前壳判定）——mac 用户不吃无关内容
   const windowsToolDiscipline = buildWindowsToolDisciplineDirective();
@@ -1043,7 +1025,6 @@ export const runChatSession = async (
       gitlabAccessSection,
       buildLarkCliAuthMissingRule(),
       companyEnvBriefSection,
-      await getActiveProviderKind(),
     );
     const perfPromptMs = Date.now() - perfPromptStart;
 
