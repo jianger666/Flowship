@@ -24,6 +24,7 @@ import path from "node:path";
 import type {
   ConversationStep,
   InteractionUpdate,
+  McpServerConfig,
   SDKMessage,
 } from "@cursor/sdk";
 import {
@@ -41,6 +42,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { buildCodingToolDefs } from "./pi-coding-tools";
+import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
 
 const PROVIDER_ID = "flowship-custom";
 // pi 原生里名字跟规范面一致的内置工具（read/grep/edit/write）；
@@ -176,6 +178,65 @@ const extractCallerToken = (mcpServers: unknown): string | undefined => {
   }
 };
 
+/** 从 mcpServers 里抽用户 MCP（排除我们自己的 flowshipChat、它走 flowship-tools 直连） */
+const extractUserMcpServers = (
+  mcpServers: unknown,
+): Record<string, McpServerConfig> => {
+  if (!mcpServers || typeof mcpServers !== "object") return {};
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, cfg] of Object.entries(mcpServers as Record<string, unknown>)) {
+    if (name === "flowshipChat") continue;
+    if (cfg && typeof cfg === "object") out[name] = cfg as McpServerConfig;
+  }
+  return out;
+};
+
+/** 用户 MCP → pi customTools（每个 server 起 MCP client 枚举工具）；单个失败只 warn、跳过 */
+const bridgeUserMcpServers = async (
+  mcpServers: unknown,
+): Promise<{ toolDefs: ToolDefinition[]; closeAll: () => void }> => {
+  const servers = extractUserMcpServers(mcpServers);
+  const entries = await Promise.all(
+    Object.entries(servers).map(async ([name, cfg]) => {
+      try {
+        return await connectMcpServer(name, cfg);
+      } catch (err) {
+        console.warn(
+          `[custom-agent-backend] MCP「${name}」桥接失败、跳过：`,
+          err instanceof Error ? err.message : err,
+        );
+        return null;
+      }
+    }),
+  );
+  const bridges = entries.filter((b): b is BridgedMcpServer => b !== null);
+  const toolDefs: ToolDefinition[] = bridges.flatMap((b) =>
+    b.tools.map(
+      (t) =>
+        ({
+          name: t.name,
+          label: t.name,
+          description: t.description || `MCP 工具 ${t.name}`,
+          // MCP 返回 JSON Schema、直接透传（pi 侧不再二次校验、交给 MCP server 自己验）
+          parameters: t.inputSchema,
+          execute: async (_toolCallId: string, params: unknown) => {
+            const r = await t.call(params as Record<string, unknown>);
+            return {
+              content: r.content,
+              details: r.isError ? { isError: true } : undefined,
+            };
+          },
+        }) as unknown as ToolDefinition,
+    ),
+  );
+  return {
+    toolDefs,
+    closeAll: () => {
+      for (const b of bridges) void b.close().catch(() => {});
+    },
+  };
+};
+
 /** 进程内嵌套子会话：给 task 工具用——起一个只带编码工具的子 agent、跑完返最终文本 */
 const runSubagent = async (
   prompt: string,
@@ -230,6 +291,7 @@ const buildCustomTools = (
   cwd: string,
   subagentRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>,
   subagentModel: Model<never>,
+  mcpToolDefs: ToolDefinition[],
 ): ToolDefinition[] => [
   ...flowShipTools.map(
     (t) =>
@@ -247,6 +309,7 @@ const buildCustomTools = (
   ...buildCodingToolDefs(cwd, (prompt) =>
     runSubagent(prompt, { runtime: subagentRuntime, model: subagentModel, cwd }),
   ),
+  ...mcpToolDefs,
 ];
 
 // ----------------- run 适配器 -----------------
@@ -436,6 +499,7 @@ interface PiAgentAdapter {
 const buildAdapter = async (
   session: AgentSession,
   agentId: string,
+  onClose?: () => void,
 ): Promise<PiAgentAdapter> => {
   return {
     agentId,
@@ -453,6 +517,11 @@ const buildAdapter = async (
       } catch {
         /* noop */
       }
+      try {
+        onClose?.();
+      } catch {
+        /* noop */
+      }
     },
   };
 };
@@ -463,17 +532,18 @@ export const createCustomAgent = async (
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model } = await buildRuntime(input);
   const callerToken = extractCallerToken(input.mcpServers);
+  const mcp = await bridgeUserMcpServers(input.mcpServers);
   const { session } = await createAgentSession({
     cwd,
     agentDir: piAgentDir(),
     modelRuntime: runtime,
     model,
     tools: [...NATIVE_TOOLS],
-    customTools: buildCustomTools(callerToken, cwd, runtime, model),
+    customTools: buildCustomTools(callerToken, cwd, runtime, model, mcp.toolDefs),
     sessionManager: SessionManager.create(cwd, piSessionDir()),
   });
   const agentId = session.sessionFile ?? session.sessionId;
-  return buildAdapter(session, agentId);
+  return buildAdapter(session, agentId, mcp.closeAll);
 };
 
 export const resumeCustomAgent = async (
@@ -483,6 +553,7 @@ export const resumeCustomAgent = async (
   const cwd = input.local?.cwd || process.cwd();
   const { runtime, model } = await buildRuntime(input);
   const callerToken = extractCallerToken(input.mcpServers);
+  const mcp = await bridgeUserMcpServers(input.mcpServers);
   // agentId 存的是上次的 sessionFile 路径 → SessionManager.open 续接；
   // 打开失败（文件被清 / 不兼容）会抛、由调用方按 cursor 的 resume 失败口径降级新会话。
   const sessionManager = SessionManager.open(agentId, piSessionDir(), cwd);
@@ -492,10 +563,10 @@ export const resumeCustomAgent = async (
     modelRuntime: runtime,
     model,
     tools: [...NATIVE_TOOLS],
-    customTools: buildCustomTools(callerToken, cwd, runtime, model),
+    customTools: buildCustomTools(callerToken, cwd, runtime, model, mcp.toolDefs),
     sessionManager,
   });
-  return buildAdapter(session, agentId);
+  return buildAdapter(session, agentId, mcp.closeAll);
 };
 
 /** chat 标题生成用的一次性 prompt（对应 cursor Agent.prompt） */
