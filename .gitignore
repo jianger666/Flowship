@@ -28,3 +28,6 @@ scripts/.smoke-*.json
 
 # 借 Cursor 识图临时图片（用完即删，不入库）
 .agents/tmp-vision/
+
+# DSH vision toolkit 临时图片（用完即删，不入库）
+.dsh-vision-toolkit/
