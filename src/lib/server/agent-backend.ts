@@ -70,6 +70,13 @@ export const resolveBackendCreds = async (
   return { kind: "cursor", apiKey: clientApiKey };
 };
 
+/**
+ * 当前生效的 agent 后端种类（供 prompt 按 provider 给不同工具清单）。
+ * 轻量封装 resolveBackendCreds、只关心 cursor/custom。
+ */
+export const getActiveProviderKind = async (): Promise<"cursor" | "custom"> =>
+  (await resolveBackendCreds("")).kind;
+
 /** 懒加载 custom 后端（只在 custom 分支触发，避免 pi 进 server bundle 主链） */
 const loadCustomBackend = () => import("./custom-agent-backend");
 
