@@ -32,8 +32,9 @@
  *    投给对应登记。别在这条链上新增「不带 origin 的 publish」。
  */
 
-import { Agent } from "@cursor/sdk";
 import type { ModelSelection } from "@cursor/sdk";
+
+import { Agent } from "./cursor-sdk-agent";
 
 import type { Task } from "@/lib/types";
 

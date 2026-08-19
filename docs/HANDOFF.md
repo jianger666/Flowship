@@ -370,6 +370,12 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### 2026-08-19 SDK store 改挂 JSONL（v1.8.2）
+
+- **为什么**：同事 Windows 长 run 收尾报 `[internal] unable to open database file`。这是 Cursor SDK 默认 SQLite store（`~/.cursor` 下 WAL）被杀毒 / OneDrive 拦掉，不是 Flowship 自己的库。
+- **改了什么**：`Agent.create` / `resume` / `prompt` 经 `cursor-sdk-agent` 统一挂 `dataRoot/sdk-agent-store` 的 `JsonlLocalAgentStore`（不写用户主目录）。Flowship 会话恢复仍走 `events.jsonl`；升级后内存里的旧 agent 会随重启丢掉，下一次续聊 `Agent.resume` 对不上 JSONL 会清锚点、按事件流起新会话。
+- **故意不动**：不在 instrumentation 里 `Cursor.configure`（那个 bundle 不能碰 `@cursor/sdk`）。不附带本机杀毒检修脚本（Windows PowerShell 编码坑、同事跑不通）。
+
 ### 2026-08-05 交卷/提问收尾收敛 + 任务详情头部重构 + 每仓分支切换（v1.7.1）
 
 - **交卷 / 提问收尾协议收敛**：`submit_work` 成功即刻由平台补发固定收尾「已完成，产出已更新，请审阅。」（AI 播报形态、内容统一）；交卷 / 提问成功后的模型输出落盘带 `meta.muted` 标记但**不 SSE 广播**（审计保留、UI 不渲染；顺带修掉消音事件广播导致的滚动抖动回归）；删「Action 产出完成、等待 ack」info 里程碑；prompt / 工具返回文案同步「收到宿主 Please continue 直接结束、不重问不调查」。
@@ -456,6 +462,7 @@ ai-flow-action-hub/
 | Electron 桌面端发版链（V0.7.0 薄壳 + 打包 + 自更新；v0.7.15 起唯一发版链、server 布局组包走公共函数 assemble-server） | `electron-app/main.js` + `electron-builder.yml` + `scripts/assemble-electron-server.mjs` + `scripts/lib/assemble-server.mjs` + `src/lib/server/data-root.ts` |
 | **light/dark 三态主题 + 自定义同色一体标题栏（v0.7.23、next-themes 三态跟随系统 + 壳 hiddenInset/titleBarOverlay 顶栏；色板/prism/滚动条全主题变量化）** | `src/components/app-header.tsx` + `src/components/theme-toggle.tsx` + `src/app/globals.css` + `electron-app/{main.js,preload.cjs}` |
 | **chat 模式独立 runner（V0.6.0.1 新、v0.7.23 进入即占位注册修「停止后还回复」冷启动竞态）** | `src/lib/server/chat-runner.ts` |
+| **SDK 本地 agent store（躲开 `~/.cursor` SQLite WAL）** | `src/lib/server/sdk-agent-store.ts` + `src/lib/server/cursor-sdk-agent.ts` |
 | **chat 模式 UI（V0.6.0.1 新）** | `src/components/tasks/chat-view.tsx` |
 | **chat 模式 API** | `src/app/api/tasks/[id]/chat-reply/route.ts` |
 | MCP server 本体（v0.9.8 瘦身：工具注册 + premature 兜底 + session transport；V0.11 起 wait 协议退役、submit_work / ask_user 非阻塞） | `src/lib/server/chat-mcp.ts` |

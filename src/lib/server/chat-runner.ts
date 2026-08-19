@@ -26,8 +26,9 @@
  * - chat prompt 里没有 [NEXT_ACTION] / [USER_MESSAGE] 任务容器概念
  */
 
-import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+
+import { Agent } from "./cursor-sdk-agent";
 
 import {
   clearTaskSessionAgentIdIf,

@@ -28,8 +28,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { Agent } from "@cursor/sdk";
 import type { McpServerConfig, ModelSelection } from "@cursor/sdk";
+
+import { Agent } from "./cursor-sdk-agent";
 
 import { dataRoot } from "./data-root";
 
