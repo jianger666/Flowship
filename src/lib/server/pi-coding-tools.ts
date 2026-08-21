@@ -9,6 +9,10 @@
  *   - bash → shell、find → glob：这里包成 customTools 重命名（排除 pi 原生的 bash/find）
  *   - delete：pi 没有、这里补一个（node fs.rm）
  *   - task（子 agent 分派）：pi 无子 agent，在 custom-agent-backend.ts 里用进程内嵌套会话实现
+ *
+ * 参数形状：prompt / artifact-writer 按 Cursor 写死（fileText / globPattern / oldText 顶层）。
+ * pi 校验在 execute 之前、多余字段会炸。所以 prepareArguments 把 Cursor 别名收成
+ * pi 规范字段再交给原生 execute（customTools 同名会盖掉 builtin）。
  */
 
 import { exec } from "node:child_process";
@@ -22,7 +26,12 @@ import {
   Optional as TBOptional,
   String as TBString,
 } from "typebox/type";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  createEditToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 
 const execAsync = promisify(exec);
 
@@ -61,6 +70,112 @@ export const formatShellFailureText = (opts: {
   return out || opts.message || "命令执行失败";
 };
 
+// ----------------- Cursor 参数别名 → pi 规范字段 -----------------
+// prompt 教 fileText / globPattern；pi schema 要 content / pattern。校验在 execute 前，
+// 别名必须先收成规范名、再删掉多余键，否则 TypeBox additionalProperties 会拒。
+
+const PATH_ALIASES = ["file_path", "target_file", "filePath"] as const;
+const CONTENT_ALIASES = ["fileText", "file_text", "contents"] as const;
+const GLOB_PATTERN_ALIASES = ["globPattern", "glob_pattern"] as const;
+const DIR_ALIASES = ["targetDirectory", "target_directory"] as const;
+const WORKING_DIR_ALIASES = ["working_directory", "cwd"] as const;
+
+const asArgsRecord = (input: unknown): Record<string, unknown> | null =>
+  input !== null && typeof input === "object" && !Array.isArray(input)
+    ? { ...(input as Record<string, unknown>) }
+    : null;
+
+const firstString = (
+  obj: Record<string, unknown>,
+  keys: readonly string[],
+): string | undefined => {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string") return v;
+  }
+  return undefined;
+};
+
+const stripKeys = (obj: Record<string, unknown>, keys: readonly string[]): void => {
+  for (const k of keys) delete obj[k];
+};
+
+/** 规范字段缺了才用别名填；规范字段已在就保留（含空串）。 */
+const fillStringIfMissing = (
+  obj: Record<string, unknown>,
+  canonical: string,
+  aliases: readonly string[],
+): void => {
+  if (typeof obj[canonical] === "string") return;
+  const alt = firstString(obj, aliases);
+  if (alt !== undefined) obj[canonical] = alt;
+};
+
+export const prepareWriteArgs = (input: unknown): unknown => {
+  const a = asArgsRecord(input);
+  if (!a) return input;
+  fillStringIfMissing(a, "content", CONTENT_ALIASES);
+  fillStringIfMissing(a, "path", PATH_ALIASES);
+  stripKeys(a, [...CONTENT_ALIASES, ...PATH_ALIASES]);
+  return a;
+};
+
+export const prepareReadArgs = (input: unknown): unknown => {
+  const a = asArgsRecord(input);
+  if (!a) return input;
+  fillStringIfMissing(a, "path", PATH_ALIASES);
+  stripKeys(a, PATH_ALIASES);
+  return a;
+};
+
+/** 路径别名；顶层 oldText/newText → edits[] 交给原生 edit.prepareArguments */
+export const prepareEditPathArgs = (input: unknown): unknown => {
+  const a = asArgsRecord(input);
+  if (!a) return input;
+  fillStringIfMissing(a, "path", PATH_ALIASES);
+  stripKeys(a, PATH_ALIASES);
+  return a;
+};
+
+export const prepareGlobArgs = (input: unknown): unknown => {
+  const a = asArgsRecord(input);
+  if (!a) return input;
+  fillStringIfMissing(a, "pattern", GLOB_PATTERN_ALIASES);
+  fillStringIfMissing(a, "path", DIR_ALIASES);
+  stripKeys(a, [...GLOB_PATTERN_ALIASES, ...DIR_ALIASES]);
+  return a;
+};
+
+export const prepareShellArgs = (input: unknown): unknown => {
+  const a = asArgsRecord(input);
+  if (!a) return input;
+  fillStringIfMissing(a, "workingDirectory", WORKING_DIR_ALIASES);
+  stripKeys(a, WORKING_DIR_ALIASES);
+  return a;
+};
+
+const withPrepare = (
+  def: unknown,
+  prepare: (input: unknown) => unknown,
+): ToolDefinition => {
+  const d = asTool(def);
+  const prev = d.prepareArguments;
+  return asTool({
+    ...d,
+    prepareArguments: (input: unknown) => {
+      const first = prepare(input);
+      return prev ? prev(first) : first;
+    },
+  });
+};
+
+/** 盖掉 pi 原生 write/edit/read：同名 customTools 后注册胜出 */
+export const buildNativeToolAliasWrappers = (cwd: string): ToolDefinition[] => [
+  withPrepare(createWriteToolDefinition(cwd), prepareWriteArgs),
+  withPrepare(createEditToolDefinition(cwd), prepareEditPathArgs),
+  withPrepare(createReadToolDefinition(cwd), prepareReadArgs),
+];
+
 // ----------------- shell（= pi 的 bash） -----------------
 
 const shellTool = (cwd: string): ToolDefinition =>
@@ -72,11 +187,24 @@ const shellTool = (cwd: string): ToolDefinition =>
     parameters: TBObject({
       command: TBString(),
       timeout: TBOptional(TBNumber()),
+      workingDirectory: TBOptional(TBString()),
     }),
+    prepareArguments: prepareShellArgs,
     execute: async (_toolCallId: string, params: unknown) => {
-      const p = params as { command?: unknown; timeout?: unknown };
+      const p = params as {
+        command?: unknown;
+        timeout?: unknown;
+        workingDirectory?: unknown;
+      };
       const command = typeof p.command === "string" ? p.command : "";
       const timeout = resolveShellTimeoutMs(p.timeout);
+      const workCwdRaw =
+        typeof p.workingDirectory === "string" ? p.workingDirectory.trim() : "";
+      const workCwd = workCwdRaw
+        ? path.isAbsolute(workCwdRaw)
+          ? workCwdRaw
+          : path.resolve(cwd, workCwdRaw)
+        : cwd;
       if (!command.trim()) {
         return {
           content: [{ type: "text", text: "command 不能为空" }],
@@ -85,7 +213,7 @@ const shellTool = (cwd: string): ToolDefinition =>
       }
       try {
         const { stdout, stderr } = await execAsync(command, {
-          cwd,
+          cwd: workCwd,
           timeout,
           maxBuffer: 10 * 1024 * 1024,
           shell: process.platform === "win32" ? "cmd.exe" : "/bin/bash",
@@ -134,6 +262,7 @@ const globTool = (cwd: string): ToolDefinition =>
       pattern: TBString(),
       path: TBOptional(TBString()),
     }),
+    prepareArguments: prepareGlobArgs,
     execute: async (_toolCallId: string, params: unknown) => {
       const p = params as { pattern?: unknown; path?: unknown };
       const pattern = typeof p.pattern === "string" ? p.pattern.trim() : "";
@@ -225,6 +354,7 @@ const deleteTool = (cwd: string): ToolDefinition =>
     description:
       "删除任务工作目录下的文件或目录（相对路径基于 cwd、也接受绝对路径）。删除不可逆、谨慎使用。",
     parameters: TBObject({ path: TBString() }),
+    prepareArguments: prepareReadArgs,
     execute: async (_toolCallId: string, params: unknown) => {
       const p = params as { path?: unknown };
       const target = typeof p.path === "string" ? p.path.trim() : "";
@@ -256,9 +386,8 @@ const deleteTool = (cwd: string): ToolDefinition =>
   });
 
 /**
- * pi 后端的规范编码工具（shell / glob / delete / task）。
- * read / grep / edit / write 走 pi 原生（createAgentSession.tools 里留同名），
- * 这里补需要重命名 / 新增的四个；task 子 agent 靠传入的 runSubagent 回调（进程内嵌套会话）。
+ * pi 后端的规范编码工具（shell / glob / delete / task + 盖掉原生 write/edit/read 的别名包装）。
+ * grep 形状跟 prompt 一致、仍走 pi 原生。task 子 agent 靠传入的 runSubagent 回调。
  */
 export const buildCodingToolDefs = (
   cwd: string,
@@ -268,6 +397,7 @@ export const buildCodingToolDefs = (
   globTool(cwd),
   deleteTool(cwd),
   taskTool(runSubagent),
+  ...buildNativeToolAliasWrappers(cwd),
 ];
 
 /** 供 subagent 提示 / 其它处复用：规范编码工具名清单（含原生同名 + 这里补的） */

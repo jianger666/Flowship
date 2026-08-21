@@ -41,10 +41,30 @@ export type WorkGroupItem = {
 export type ChatRenderItem = StreamRenderItem | WorkGroupItem;
 
 export type ActiveStatus = {
-  /** 主文案：当前工具「正在执行 shell」/ thinking 首行截断 /「正在回复…」 */
+  /** 主文案：当前工具「正在执行 shell」/ thinking 首行截断 /「处理中…」/「正在回复…」 */
   label: string;
   /** 可选细节：工具摘要 / liveOutput 尾行（单行截断 ~80 字） */
   detail?: string;
+};
+
+/** 工具都跑完、下一句还没出来：空等挂在这一句，不挂在 write 上 */
+export const PROCESSING_PLACEHOLDER_LABEL = "处理中…";
+
+/**
+ * 工作过程组末尾要不要挂「处理中…」。
+ * 本组已是流尾、没有还在跑的工具、正文还没开始流；末成员是 thinking 时思考行本身就是进度，不再叠一行。
+ */
+export const shouldShowProcessingPlaceholder = (input: {
+  isRunning: boolean;
+  isLastItem: boolean;
+  hasRunning: boolean;
+  hasStreamingText: boolean;
+  lastMemberKind?: string;
+}): boolean => {
+  if (!input.isRunning || !input.isLastItem) return false;
+  if (input.hasRunning || input.hasStreamingText) return false;
+  if (input.lastMemberKind === "thinking") return false;
+  return true;
 };
 
 export const isWorkGroup = (it: ChatRenderItem): it is WorkGroupItem =>
@@ -213,12 +233,19 @@ const summarizeToolCallArgs = (ev: TaskEvent): string | undefined => {
 /**
  * 粘性状态行文案：从尾部回扫最近的 agent 活动。
  * 调用方只在 isRunning 时调用；本函数不判断 running。
+ * `streaming`：正文已经在流，工具刚跑完也改口「正在回复…」，别停在「处理中…」。
  */
 export const deriveActiveStatus = (
   events: readonly TaskEvent[],
   liveToolOutputs?: Record<string, string>,
+  opts?: { streaming?: boolean },
 ): ActiveStatus | null => {
   if (events.length === 0) return null;
+
+  const waitingAfterTools = (): ActiveStatus =>
+    opts?.streaming
+      ? { label: "正在回复…" }
+      : { label: PROCESSING_PLACEHOLDER_LABEL };
 
   // 先收集已完成的 callId（有对应 tool_result）
   const doneCallIds = new Set<string>();
@@ -240,8 +267,8 @@ export const deriveActiveStatus = (
     if (ev.kind === "tool_call") {
       const cid = getCallId(ev);
       if (cid && doneCallIds.has(cid)) {
-        // 已完成的 tool_call：视为「无明确活动」、正在等回复
-        return { label: "正在回复…" };
+        // 已完成的 tool_call：等下一轮模型（交卷 / 结论 / 下一个工具）
+        return waitingAfterTools();
       }
       const name = getToolName(ev);
       // task 子代理特殊文案
@@ -262,9 +289,9 @@ export const deriveActiveStatus = (
       };
     }
 
-    // 已完成的 tool_result：agent 刚忙完、等下一句 → 正在回复
+    // 已完成的 tool_result：等下一轮模型，不是已经在写回复
     if (ev.kind === "tool_result") {
-      return { label: "正在回复…" };
+      return waitingAfterTools();
     }
 
     // ephemeral 增量不参与判定

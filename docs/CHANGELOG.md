@@ -15,6 +15,14 @@
 
 ---
 
+### v1.9.1（2026-08-21）交卷收尾 / 系统通知对齐话说完 / Windows 自更新快捷方式
+
+- **交卷收尾槽位**：写完产物先 `submit_work`，回执后再说 1–3 句业务结论。write 后事件流挂「处理中…」，完成后自动收起。系统通知等到这一轮 consume 结束（不再交卷当下就弹）。
+- **中途 503 不误重连**：pi 内部重试成功后，settle 只认最后一条 assistant。
+- **停止后立刻重发**：cancelled / error / idle 也先等 runner 摘掉再唤醒。
+- **事件流本地图空格路径**：destination 包进 `<>` 再走 `/api/local-image`。
+- **Windows 自更新**：升级时 `taskkill` 不带 `/T`（避免把刚派生的安装器杀掉），但仍杀 `Flowship.exe` 清隐形 server；装完强制重建桌面 / 开始菜单快捷方式；`quitAndInstall` 把 `/D=` 钉在当前安装目录。已经点升级后快捷方式「找不到应用」的同事：到 GitHub Release 下载本版 exe 手动装一次（数据在 `fe-ai-flow`，不会丢）。
+
 ### v1.9.0（2026-08-21）自定义 HTTP 提供方
 
 - **窗口自己的后端**：设置页可新增多条自定义提供方；`settings.provider` 只影响新建。老任务没有 `task.provider` 的继续走 Cursor，不会被设置页默认劫持。旧单槽 `customProvider` 读盘迁成 `cp_legacy`。chat / 推进 / 答题走同一套 `agent-backend`（cursor = SDK，自定义 = pi）。

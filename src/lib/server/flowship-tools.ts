@@ -68,7 +68,7 @@ const submitWorkDef: FlowshipToolDef = {
   description: [
     "Task 模式（action 容器）专用：完成一个 action（写完 artifact）后调本工具交卷。",
     "系统后台跑质量检查后通知用户审阅。非阻塞、立即返回。",
-    "调完把要给用户的话说完再结束本轮；不要轮询 / 重复调本工具。",
+    "产物写好后先调本工具交卷；拿到 [SUBMITTED] 后再说 1-3 句业务结论并结束本轮。不要轮询 / 重复调本工具。",
     "Chat 模式（自由对话）不需要调本工具。",
   ].join("\n"),
   parameters: TBObject({

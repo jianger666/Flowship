@@ -26,7 +26,8 @@ import { buildToolResultMeta } from "./tool-result-persist";
 /**
  * 交卷成功后的固定收尾文案（AI 播报形态、内容平台统一固定）。
  * 不出现「交卷 / submit_work」等内部术语——用户只需要知道「产出已更新、等审阅」。
- * 模型交卷后说出的答案照常上屏、回合自然结束时由平台在答案之后补发这一句。
+ * 结论须在交卷前说完；交卷后正文照常上屏（Cursor 宿主空完成会塞续跑），
+ * 回合自然结束时由平台在答案之后补发这一句横幅。
  */
 export const SUBMIT_COMPLETED_TEXT = "已完成，产出已更新，请审阅。";
 
@@ -68,7 +69,7 @@ export interface AssistantBufferCtx {
   /** 本段思考累加的 durationMs（最后一条 SDK thinking 常带） */
   thinkingDurationMs?: number;
   sdkErrorMessage?: string;
-  /** 本回合已交卷成功（submit_work 返回 [SUBMITTED] / [NO_WAIT_NEEDED]）：之后模型输出（答案）照常广播、固定收尾延到 run 结束 */
+  /** 本回合已交卷成功：之后模型输出（答案）照常广播、固定收尾延到 run 结束 */
   submitSeen?: boolean;
   /** 固定收尾是否已补发（防重复） */
   fixedSent?: boolean;
@@ -215,13 +216,8 @@ const WRITE_TOOL_NAMES = new Set([
   "apply_patch",
 ]);
 
-// 交卷工具：V0.11.9 改名 submit_work、旧名 wait_for_user 仍以 alias 存在
-const SUBMIT_TOOL_NAMES = new Set([
-  "submit_work",
-  "Submit Work",
-  "wait_for_user",
-  "Wait For User",
-]);
+// 交卷工具（展示名「Submit Work」是 MCP title 映射，模型应调 submit_work）
+const SUBMIT_TOOL_NAMES = new Set(["submit_work", "Submit Work"]);
 
 /** 落一条 tool_result（completed / error 共用）；失败只打日志、不挡主流程 */
 const emitToolResult = async (
@@ -355,7 +351,7 @@ export const handleSdkMessage = async (
       }
       // 必须连 MCP wrapper 一起认——漏认会把 submit_work 写成普通 tool_call、
       // 被兜底 A 误当「答后又干活」拦下（2026-06-16 线上事故根因）
-      const isWaitForUser =
+      const isSubmitWork =
         SUBMIT_TOOL_NAMES.has(msg.name) || SUBMIT_TOOL_NAMES.has(innerToolName);
 
       // V0.6：write / edit 写 actions/N-<type>.md 时推一份「在写 artifact」事件给 UI
@@ -421,7 +417,7 @@ export const handleSdkMessage = async (
         break;
       }
 
-      if (isWaitForUser) {
+      if (isSubmitWork) {
         // status 维护：notifier 自己处理 awaiting；这里只记 error
         if (msg.status === "error") {
           const resStr = stringifyMeta(msg.result);

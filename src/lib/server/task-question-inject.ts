@@ -185,15 +185,22 @@ const runTaskQuestionInject = async (
   // 收口（见下方 beginAskSkip）。旧逻辑「先回答上方提问」在网断 / 会话死后把输入条
   // 和答题卡对锁——只能重新推进（同事反馈）。
 
-  // run 还在跑：真·干活中 → 409；已交卷（awaiting_ack）但收尾旁白未完 → 等收敛再发。
-  // 窗口期：submit_work 后 action 已 awaiting_ack、UI 放开输入框，但 runningTasks /
-  // runStatus 仍真几秒~几十秒——用户一说话必撞旧 409。
+  // run 还在表里：真·干活中 → 409；下面两类只是收尾还没 drain → 等 runner 退出再发。
+  // - 已交卷（awaiting_ack）但收尾旁白未完：UI 已放开输入框，runningTasks 还占着
+  // - 刚点停止：action 已 cancelled / runStatus 已 idle，但 consume finally 还没
+  //   摘 runningTasks——这时 409「正在跑」会让用户停完立刻重发必失败（2026-08-21 实测）
   if (runningTasks.has(task.id) || task.runStatus === "running") {
     const currentActionId = task.currentActionId;
     const currentWhileRunning = task.actions.find(
       (a) => a.id === currentActionId,
     );
-    if (currentWhileRunning?.status === "awaiting_ack") {
+    const drainStatus = currentWhileRunning?.status;
+    const waitingForDrain =
+      drainStatus === "awaiting_ack" ||
+      drainStatus === "cancelled" ||
+      drainStatus === "error" ||
+      task.runStatus === "idle";
+    if (waitingForDrain) {
       const stopped = await waitForTaskToStop(task.id, 20_000);
       if (!stopped) {
         return errorResponse("agent 正在跑、等它说完这轮再问", 409);
@@ -205,11 +212,13 @@ const runTaskQuestionInject = async (
       const freshCurrent = fresh.actions.find(
         (a) => a.id === fresh.currentActionId,
       );
+      if (runningTasks.has(fresh.id) || fresh.runStatus === "running") {
+        return errorResponse("任务状态刚变化（可能已推进）、请重新发送", 409);
+      }
       if (
-        runningTasks.has(fresh.id) ||
-        fresh.runStatus === "running" ||
-        freshCurrent?.id !== currentActionId ||
-        freshCurrent?.status !== "awaiting_ack"
+        drainStatus === "awaiting_ack" &&
+        (freshCurrent?.id !== currentActionId ||
+          freshCurrent?.status !== "awaiting_ack")
       ) {
         return errorResponse("任务状态刚变化（可能已推进）、请重新发送", 409);
       }

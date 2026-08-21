@@ -5,6 +5,8 @@ import {
   groupChatRenderItems,
   isLatestErrorEvent,
   isWorkGroup,
+  PROCESSING_PLACEHOLDER_LABEL,
+  shouldShowProcessingPlaceholder,
   type WorkGroupItem,
 } from "../src/lib/chat-turns";
 import type { StreamRenderItem, ToolBlock, ToolVerbGroup } from "../src/lib/tool-display";
@@ -429,7 +431,7 @@ describe("deriveActiveStatus", () => {
     expect(status?.detail).toBe("第二行很长的思考内容");
   });
 
-  it("纯 assistant / 已完成工具 → 正在回复…", () => {
+  it("纯 assistant → 正在回复…；已完成工具 → 处理中…", () => {
     expect(
       deriveActiveStatus([
         ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
@@ -459,7 +461,30 @@ describe("deriveActiveStatus", () => {
         },
       }),
     ]);
-    expect(done).toEqual({ label: "正在回复…" });
+    expect(done).toEqual({ label: PROCESSING_PLACEHOLDER_LABEL });
+  });
+
+  it("正文已在流时，已完成工具改口正在回复…", () => {
+    const events = [
+      ev({ id: "u", kind: "user_reply", text: "q", ts: 1 }),
+      ev({
+        id: "c",
+        kind: "tool_call",
+        text: "调用",
+        ts: 2,
+        meta: { callId: "x", name: "write" },
+      }),
+      ev({
+        id: "r",
+        kind: "tool_result",
+        text: "完成",
+        ts: 3,
+        meta: { callId: "x", name: "write", status: "success" },
+      }),
+    ];
+    expect(deriveActiveStatus(events, undefined, { streaming: true })).toEqual({
+      label: "正在回复…",
+    });
   });
 
   it("user_reply 后无活动 → 正在启动…", () => {
@@ -536,5 +561,37 @@ describe("deriveActiveStatus", () => {
     );
     expect(status?.detail?.length).toBeLessThanOrEqual(81);
     expect(status?.detail?.endsWith("…")).toBe(true);
+  });
+});
+
+describe("shouldShowProcessingPlaceholder", () => {
+  const on = {
+    isRunning: true,
+    isLastItem: true,
+    hasRunning: false,
+    hasStreamingText: false,
+    lastMemberKind: "__tool_block__",
+  };
+
+  it("流尾、工具已完成、正文还没出来 → 挂处理中", () => {
+    expect(shouldShowProcessingPlaceholder(on)).toBe(true);
+  });
+
+  it("工具还在跑 / 已在流正文 / 末行是思考 → 不挂", () => {
+    expect(shouldShowProcessingPlaceholder({ ...on, hasRunning: true })).toBe(
+      false,
+    );
+    expect(
+      shouldShowProcessingPlaceholder({ ...on, hasStreamingText: true }),
+    ).toBe(false);
+    expect(
+      shouldShowProcessingPlaceholder({ ...on, lastMemberKind: "thinking" }),
+    ).toBe(false);
+    expect(shouldShowProcessingPlaceholder({ ...on, isLastItem: false })).toBe(
+      false,
+    );
+    expect(shouldShowProcessingPlaceholder({ ...on, isRunning: false })).toBe(
+      false,
+    );
   });
 });

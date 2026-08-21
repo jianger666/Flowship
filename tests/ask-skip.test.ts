@@ -742,3 +742,61 @@ describe("ask-reply 唤醒兜底：答题卡终态排在投递成功之后", () 
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// 停止后立刻重发：action 已 cancelled / idle，但 runningTasks 还没 drain
+// ─────────────────────────────────────────────────────────────
+describe("task 模式：停止后立刻重发等 drain", () => {
+  const body = {
+    text: "停完立刻再说一句",
+    bootArgs: { apiKey: "sk-test", model: { id: "m1" } },
+  };
+
+  const cancelledIdleTask = (): Task =>
+    ({
+      ...taskWithAsk("tok"),
+      events: [],
+      runStatus: "idle",
+      actions: [
+        {
+          id: "act-1",
+          n: 1,
+          type: "plan",
+          status: "cancelled",
+          userInstruction: "",
+          artifactPath: null,
+          startedAt: Date.now(),
+          endedAt: Date.now(),
+        },
+      ],
+    }) as unknown as Task;
+
+  it("cancelled + idle、表里还有 runner → 等 drain 后唤醒，不立刻 409", async () => {
+    const task = cancelledIdleTask();
+    getTask.mockResolvedValue(task);
+    runningTasks.set(TASK_ID, {});
+    agentSessions.clear();
+    deliverTaskQuestion.mockResolvedValue("no_session");
+    waitForTaskToStop.mockImplementation(async () => {
+      runningTasks.delete(TASK_ID);
+      return true;
+    });
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body);
+    expect(resp.status).toBe(200);
+    expect(waitForTaskToStop).toHaveBeenCalled();
+    expect(resumeCurrentActionWithMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("真·干活中（running）→ 立刻 409、不等 drain", async () => {
+    getTask.mockResolvedValue(taskWithAsk("tok"));
+    runningTasks.set(TASK_ID, {});
+
+    const resp = await handleTaskQuestionInject(TASK_ID, body);
+    expect(resp.status).toBe(409);
+    expect(waitForTaskToStop).not.toHaveBeenCalled();
+    expect(resumeCurrentActionWithMessage).not.toHaveBeenCalled();
+    const err = String((await resp.json()).error);
+    expect(err).toContain("正在跑");
+  });
+});

@@ -44,6 +44,7 @@ import {
   parseUnifiedDiff,
   todoListSummary,
   toolBlockDefaultCollapsed,
+  toolBlockAutoCollapsed,
   toolBlockDetailLine,
   toolBlockExpandedArgsPreview,
   toolBlockFilePath,
@@ -576,10 +577,11 @@ const RegularToolBlockRow = ({
   liveOutput,
   nested = false,
 }: ToolBlockRowProps) => {
-  // GB：读/搜/shell 默认折叠；edit/write 默认展开看 diff
-  const [collapsed, setCollapsed] = useState(() =>
-    toolBlockDefaultCollapsed(block.name, nested),
-  );
+  // write 完成后收起（产物栏已有文件）；用户点过则以手动为准。
+  // 其余工具仍走 toolBlockDefaultCollapsed（edit 展开看 diff；读/shell 折叠）。
+  const [manualCollapsed, setManualCollapsed] = useState<boolean | null>(null);
+  const autoCollapsed = toolBlockAutoCollapsed(block.name, block.status, nested);
+  const collapsed = manualCollapsed ?? autoCollapsed;
   // 第二层：完整 output（默认折叠；展开一层只看摘要/命令）
   const [outputOpen, setOutputOpen] = useState(false);
   // edit diff：默认展开（collapsed_edit_blocks=OFF）
@@ -655,7 +657,7 @@ const RegularToolBlockRow = ({
     <div className={cn("group/tool min-w-0 max-w-full", nested && "pl-0")}>
       <button
         type="button"
-        onClick={() => setCollapsed((c) => !c)}
+        onClick={() => setManualCollapsed(!collapsed)}
         className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
       >
         <CollapseChevron open={!collapsed} />

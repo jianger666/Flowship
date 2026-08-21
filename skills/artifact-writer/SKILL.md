@@ -57,15 +57,7 @@ args: {
 
 `fileText` 是**完整文件内容**、不是补丁、不是「在末尾追加 X」。从一级标题开始、按该 action prompt 模板的章节顺序写完。
 
-### 2. emit 一条简短 assistant_message
-
-格式：「**已写入 actions/<n>-<type>.md、请审阅**」（一句话、不要总结全文）。也可按 super-prompt：先给用户 1-3 句简短结论。
-
-**禁说**的话：
-- 把整份 artifact 内容粘回 assistant_message（用户已经能在左侧看到、不要重复）
-- 把 SDK 协议名（`submit_work` / `ask_user` 等）告诉用户
-
-### 3. 立刻调 submit_work 交卷
+### 2. 立刻调 submit_work 交卷
 
 ```
 tool_use: submit_work
@@ -76,7 +68,13 @@ args: {
 }
 ```
 
-交卷后**正常结束本轮回复**——不要再调已退役的 `wait_for_user` / curl 长轮询；收尾文案由平台统一显示（固定为「已完成，产出已更新，请审阅。」），**不要自己输出总结 / 收尾 / 旁白**。用户的下一步（推进 / 再聊聊 / 回答提问）会作为新消息续同一会话。
+调本工具前不要输出给用户看的结论。不要 curl 长轮询。
+
+### 3. 拿到 `[SUBMITTED]` 后再说结论
+
+用 1-3 句说业务结论（改了什么 / 结果如何 / 有无遗留；答疑该长就长）。详情在 artifact 里、用户左侧能看到，不要把全文粘回对话。禁止复述交卷、禁止提工具名。说完结束本轮。
+
+用户的下一步（推进 / 输入条说话 / 回答提问）会作为新消息续同一会话。
 
 ## 收到用户 revise（改类反馈）时的写法
 
@@ -85,7 +83,7 @@ args: {
 - **改局部段落** → 用 `edit` 工具 `{ path, oldText, newText }`、不是 `write` 整文件覆盖（保留 git diff 干净）
 - **结构性大改** → 用 `write` 整文件覆盖（一次写完）
 
-判断标准：影响超过 3 段就走 write 整覆盖；3 段以内就 edit 局部。改完再调一次 `submit_work`（同 action_id、同 artifact_path）重新交卷。
+判断标准：影响超过 3 段就走 write 整覆盖；3 段以内就 edit 局部。改完再调一次 `submit_work`（同 action_id、同 artifact_path）重新交卷；拿到 `[SUBMITTED]` 后再说 1-3 句这次改了什么。
 
 ## 排错清单（写失败时按这个序走）
 

@@ -87,6 +87,7 @@ import {
   useSelectionFloat,
 } from "@/components/ui/selection-float";
 import { useShareToGroup } from "@/hooks/use-share-to-group";
+import { wrapLocalMarkdownImageDestinations } from "@/lib/local-image-src";
 import { extractMrUrlsFromText } from "@/lib/mr-inbox";
 import {
   SHARE_TO_GROUP_CONTENT_MAX,
@@ -1223,7 +1224,9 @@ export const ArtifactPanel = ({
                       components={markdownComponents}
                       controls={STREAMDOWN_CONTROLS}
                     >
-                      {currentArtifact.content}
+                      {wrapLocalMarkdownImageDestinations(
+                        currentArtifact.content,
+                      )}
                     </Streamdown>
                   </div>
                 </div>

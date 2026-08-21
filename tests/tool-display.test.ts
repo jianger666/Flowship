@@ -13,6 +13,7 @@ import {
   parseUnifiedDiff,
   todoListSummary,
   toolBlockDefaultCollapsed,
+  toolBlockAutoCollapsed,
   toolBlockExpandedArgsPreview,
   toolBlockSummary,
   type ToolBlock,
@@ -263,6 +264,13 @@ describe("tool-display merge / GB 折叠规则", () => {
     expect(toolBlockDefaultCollapsed("shell")).toBe(true);
     expect(toolBlockDefaultCollapsed("read")).toBe(true);
     expect(toolBlockDefaultCollapsed("edit")).toBe(false);
+  });
+
+  it("write 完成后自动折叠，跑着时仍展开", () => {
+    expect(toolBlockAutoCollapsed("write", "running")).toBe(false);
+    expect(toolBlockAutoCollapsed("write", "success")).toBe(true);
+    expect(toolBlockAutoCollapsed("write", "error")).toBe(true);
+    expect(toolBlockAutoCollapsed("edit", "success")).toBe(false);
   });
 
   it("countDiffStats 数 +/−", () => {

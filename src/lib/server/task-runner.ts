@@ -572,7 +572,7 @@ const broadcastActionToGroup = async (
 /**
  * 后置 check 独立租约——不再借用会在 consume finally 释放的 run opHandle。
  * 存活凭据三件：① runningChecks 仍是 self；② 启动时快照的 opGen 未变（stop/DELETE revoke）；
- * ③ lifecycle === null。落状态仍走条件事务（awaiting_ack + awaiting_user + 结构条件）。
+ * ③ lifecycle === null。落状态仍走条件事务（awaiting_ack；runStatus 见下：收尾旁白还在跑就保持 running）。
  */
 const runActionPostCheck = (
   taskId: string,
@@ -677,11 +677,15 @@ const runActionPostCheck = (
       dropSelf();
       return;
     }
+    // 收尾旁白还在跑（runningTasks 仍占着）→ runStatus 保持 running。
+    // 系统通知跟 awaiting_user 走；交卷当下就切的话，点通知回来会发现还在说话。
+    // consume 自然结束时若 action 已 awaiting_ack，会把 runStatus 补成 awaiting_user。
+    const wrapUpStillGoing = runningTasks.has(taskId);
     const patched = await patchActionAndRunStatusIfOpFresh(
       taskId,
       actionId,
       "awaiting_ack",
-      "awaiting_user",
+      wrapUpStillGoing ? "running" : "awaiting_user",
       () => stillOwner(),
       { currentActionId: actionId, actionStatus: "running" },
       postCheck ? { postCheck } : undefined,
@@ -4641,8 +4645,9 @@ const consumeSessionRun = async (
         if (updated) publish(task.id, { kind: "task", task: updated });
       }
     } else if (lastAction.status === "awaiting_ack") {
-      // 等审阅期间的续接 run（如 revise 处理完自然结束）兜底回等待位。
-      // 正常交卷路径 runStatus 早被 notifier 落成 awaiting_user、这里 compare-set 不动它。
+      // 交卷 check 已落 awaiting_ack、但收尾旁白当时还在跑 → runStatus 仍是 running。
+      // 话说完才切 awaiting_user（系统通知 / 侧栏琥珀点对齐「可以回来看了」）。
+      // 检查比旁白慢时，post-check 自己会切 awaiting_user，这里 compare-set 不动。
       const freshest = await getTask(task.id);
       if (freshest?.runStatus === "running") {
         const updated = await setTaskRunStatusIfRunOwner(

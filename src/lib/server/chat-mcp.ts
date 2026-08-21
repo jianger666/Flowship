@@ -55,16 +55,10 @@ const callerMismatchContent = () => ({
 
 // ----------------- 工具返回文本（V0.11：非阻塞、指示 agent 结束本轮回复） -----------------
 
-// submit_work 交卷成功后的返回：明确「结束回复、别等待」——这是 run 自然结束的正常出口
+// submit_work 交卷成功后的返回：工具循环下一轮本来就会打模型，把那一轮收成正式收尾槽位
 const submittedText = (actionId: string): string =>
   [
-    `[SUBMITTED] action=${actionId} 已交卷、系统正在后台跑质量检查、用户会收到通知。`,
-    "",
-    "**把要对用户说的话（结论 / 答案）说完、然后结束本轮回复。**",
-    "- 如果结论还没说、现在补上；说完了就直接结束、别再补充多余的话",
-    "- 不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要再调本工具",
-    "- 平台会在你说完后自动挂「已完成，产出已更新，请审阅。」横幅、你自己不用说这句",
-    "- 用户的决定（通过 / 再聊聊 / 推进下一步）之后会作为**新消息**发给你、你会在同一会话里继续",
+    `[SUBMITTED] action=${actionId} 已交卷，后台在跑检查。现在把要给用户看的话说完（收尾 1-3 句业务结论，答疑该长就长；详情指向产物），然后结束本轮。不要再调本工具、不要轮询、不要复述交卷或提工具名。`,
   ].join("\n");
 
 /**
@@ -126,11 +120,10 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
     version: "1.0.0",
   });
 
-  // V0.11.9 改名：wait_for_user → submit_work（语义早就是「交卷」不是「等待」、名字跟上）。
-  // 抽出 config / handler 供双注册：旧名保留一版作 alias（升级前启动的会话 in-context prompt
-  // 还教的旧名、断代会让在跑任务交不了卷）、下个大版本删。
+  // V0.11.9 改名：wait_for_user → submit_work（语义早就是「交卷」不是「等待」）。
+  // 旧名 alias 已删（无在跑会话还教旧名）。
   const submitWorkConfig = {
-      title: "交卷：宣告当前 action 完成（非阻塞、调完把要说的话说完就结束）",
+      title: "交卷：宣告当前 action 完成（非阻塞）",
       description: [
         "Task 模式（action 容器）专用：完成一个 action（写完 artifact）后调本工具**交卷**。",
         "系统会在后台跑质量检查、然后通知用户来审。**本工具立即返回、不会阻塞**。",
@@ -139,9 +132,8 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         "",
         "- **完成一个 action（写完 artifact）后必须调一次本工具**——不调 = action 没完成、runner 会把任务标 failed",
         "- **不要写完 artifact 只输出一句「请你确认」的回复就结束**——必须调本工具交卷",
-        "- **调完本工具后、把要对用户说的话（结论 / 答案）说完再结束本轮**——先交卷再说答案也行；说完平台会自动挂「已完成」横幅、你不用自己说这句",
-        "- 不要执行任何等待 / 轮询命令（curl / sleep / watch 都不要）、不要再调本工具",
-        "- 用户的决定（通过 / 再聊聊 / 推进下一步）会作为**新消息**发给你、你在同一会话里继续",
+        "- **产物写好后先调本工具交卷**；拿到 `[SUBMITTED]` 后再说 1-3 句业务结论并结束本轮。不要再调本工具、不要 curl / sleep / watch",
+        "- 用户的下一步（推进下一步 / 输入条说话 / 回答提问）会作为**新消息**发给你、你在同一会话里继续",
         "",
         "## 用法",
         "",
@@ -151,7 +143,7 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
         "",
         "## 调用礼仪",
         "  - 每完成一个 action 调一次（不要每写一句就调、也不要写完了不调）",
-        "  - 调用前 / 后都不要在正文里讲本工具的存在、对用户透明",
+        "  - 调本工具前不要输出给用户看的结论；返回后再说。正文里不要提本工具名",
         "  - Chat 模式（自由对话）**不需要**调本工具——直接把回复正文输出、说完自然结束回复即可",
       ].join("\n"),
       inputSchema: {
@@ -244,17 +236,6 @@ const buildMcpServer = (callerToken: string | undefined): McpServer => {
     };
 
   srv.registerTool("submit_work", submitWorkConfig, submitWorkHandler);
-  // 旧名 alias（仅为升级前启动的在跑会话兜底、新 prompt 全部教 submit_work、下版本删）
-  srv.registerTool(
-    "wait_for_user",
-    {
-      ...submitWorkConfig,
-      title: "（旧名、= submit_work）交卷：宣告当前 action 完成",
-      description:
-        "本工具已改名 `submit_work`、行为完全一致——这是旧名 alias、仅供升级前启动的会话使用；能用 submit_work 就用它。",
-    },
-    submitWorkHandler,
-  );
 
   // ----------------- ask_user 工具（V0.3.2 一次打包多问题、modal 形态、V0.11 非阻塞）-----------------
   //

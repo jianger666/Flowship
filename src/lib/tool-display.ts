@@ -251,6 +251,20 @@ export const toolBlockDefaultCollapsed = (
   return true;
 };
 
+/**
+ * 渲染时实际折叠态。write 一完成就收起：产物已经在产物栏，展开区只是再铺路径，
+ * 交卷前「处理中…」空等时尤其吵。用户点开仍以手动为准（调用方管）。
+ * edit 仍默认展开看 diff。
+ */
+export const toolBlockAutoCollapsed = (
+  name: string,
+  status: ToolBlockStatus,
+  nested = false,
+): boolean => {
+  if (name.toLowerCase() === "write" && status !== "running") return true;
+  return toolBlockDefaultCollapsed(name, nested);
+};
+
 /** 剥 stringifyMeta 截断后缀后再 JSON.parse；失败返 null */
 export const parseToolArgsJson = (
   args?: string,

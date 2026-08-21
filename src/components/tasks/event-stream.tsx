@@ -83,6 +83,7 @@ import type { Task, TaskEvent } from "@/lib/types";
 import {
   deriveActiveStatus,
   groupChatRenderItems,
+  shouldShowProcessingPlaceholder,
   type WorkGroupItem,
 } from "@/lib/chat-turns";
 import {
@@ -834,6 +835,9 @@ const EventStreamImpl = ({
     }
     return null;
   }, [orderedItems]);
+  // 流的最后一项是不是工作过程组（后面已经有正文 / 流式占位就不再挂「处理中…」）
+  const lastItemIsWorkGroup =
+    orderedItems[orderedItems.length - 1]?.kind === "__work_group__";
 
   // 粘性状态行的输入切片：只保留「最近一条 user_reply 起」的本轮事件。
   //
@@ -859,9 +863,11 @@ const EventStreamImpl = ({
   const activeStatus = useMemo(
     () =>
       isChat && isRunning
-        ? deriveActiveStatus(statusEvents, liveToolOutputs)
+        ? deriveActiveStatus(statusEvents, liveToolOutputs, {
+            streaming: !!streamingText,
+          })
         : null,
-    [isChat, isRunning, statusEvents, liveToolOutputs],
+    [isChat, isRunning, statusEvents, liveToolOutputs, streamingText],
   );
 
   // 轮次分割判定用的 kind 序列。挂 orderedItems 不挂 items：虚拟项一律追加在尾部、
@@ -1647,6 +1653,14 @@ const EventStreamImpl = ({
                     variant={variant}
                     liveToolOutputs={liveToolOutputs}
                     isRunningTail={item.id === lastGroupId && isRunning}
+                    showProcessingPlaceholder={shouldShowProcessingPlaceholder({
+                      isRunning,
+                      isLastItem:
+                        lastItemIsWorkGroup && item.id === lastGroupId,
+                      hasRunning: item.hasRunning,
+                      hasStreamingText: !!streamingText,
+                      lastMemberKind: item.members[item.members.length - 1]?.kind,
+                    })}
                   />
                 ) : isToolBlock(item) ? (
                   <ToolBlockRow

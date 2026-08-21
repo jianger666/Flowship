@@ -15,11 +15,28 @@ export const isLightweightDailyTask = (t: {
 export const LIGHTWEIGHT_DAILY_PROMPT_DIRECTIVE =
   "本任务是日常任务（无关联飞书需求）：未建独立分支、直接工作在原仓当前分支。修改文件可以直接做；但 commit / push / 建分支等 git 副作用操作必须先询问用户确认。流程中需要飞书需求链接 / 状态机的步骤一律跳过并在产物中说明。";
 
-/** super prompt 段：轻量态才非空；正式任务返空串（占位保留字面） */
+/**
+ * 已隔离工作区时不要再注入「原仓当前分支」——两条会打架。
+ * 判定与 isWorktreeTask 同口径，不 import task-worktrees（那边有 server 专用依赖）。
+ */
+const isIsolatedWorktreeLike = (t: {
+  mode?: string;
+  isolateWorktree?: boolean;
+  repoPaths?: string[];
+}): boolean =>
+  t.mode !== "chat" &&
+  t.isolateWorktree === true &&
+  (t.repoPaths?.length ?? 0) > 0;
+
+/** super prompt 段：轻量态才非空；正式任务 / 已隔离工作区返空串 */
 export const renderLightweightDailySection = (t: {
   feishuStoryUrl?: string;
+  mode?: string;
+  isolateWorktree?: boolean;
+  repoPaths?: string[];
 }): string => {
   if (!isLightweightDailyTask(t)) return "";
+  if (isIsolatedWorktreeLike(t)) return "";
   return `> ${LIGHTWEIGHT_DAILY_PROMPT_DIRECTIVE}`;
 };
 

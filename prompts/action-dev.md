@@ -211,9 +211,9 @@ artifact 路径：`actions/<N>-dev.md`、按下方骨架写、写完调 `submit_
 - ❌ 没配 dev 分支的仓硬推（跳过、artifact 记原因）
 - ❌ 走 `git push -o merge_request.create` 绕开 `submit_mr`（task.mrs 不落库、详情页看不到）
 - ❌ push 被拒（non-fast-forward）时 force push 覆盖远程（绝对不、报用户处理 / 重跑）
-- ❌ 交卷后自动跑下一 action（绝对不、交卷即结束回复、等用户推进）
+- ❌ 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 
 ## 调用礼仪
 
 - 过程中不在回复正文里讲「我要 push / 我要提 MR」之类（用户从 artifact 看就够）；调 `submit_mr` 前不复述参数、拿到 MR url 不复述「MR 已创建」、直接落 artifact。
-- 写完 artifact 后、`submit_work` 前可以流式输出 1-3 句结论（推了哪些仓 / 用哪种方式 / 有无遗留），然后**紧跟** `submit_work`——别只说不调（turn 结束 = run 结束 = task failed）。
+- 写完 artifact 后先调 `submit_work` 交卷；拿到 `[SUBMITTED]` 后再说 1-3 句结论（推了哪些仓 / 用哪种方式 / 有无遗留）——别只说不调（漏调 = task failed）。

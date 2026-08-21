@@ -195,6 +195,12 @@ describe("日常轻量态（无飞书链接）— 原仓 + 不建分支", () => 
         feishuStoryUrl: "https://project.feishu.cn/x/story/detail/1",
       }),
     ).toBe("");
+    expect(
+      renderLightweightDailySection({
+        isolateWorktree: true,
+        repoPaths: ["/tmp/repo"],
+      }),
+    ).toBe("");
   });
 
   it("推进分组过滤：日常只留 custom（隐藏 builtin/team/shared），正式原样", () => {

@@ -43,6 +43,10 @@ import {
   fatalAssistantError,
 } from "@/lib/custom-openai-compat";
 import {
+  settleErrorFromTranscript,
+  stickyErrorAfterMessageEnd,
+} from "@/lib/pi-run-settle";
+import {
   reasoningFieldsFromCatalog,
   thinkingLevelFromParams,
   type ThinkingLevelMap,
@@ -57,12 +61,13 @@ import { mcpDisplayName } from "@/lib/mcp-tool-name";
 import { dataRoot } from "./data-root";
 import { flowShipTools } from "./flowship-tools";
 import { connectMcpServer, type BridgedMcpServer } from "./mcp-tool-bridge";
-import { buildCodingToolDefs } from "./pi-coding-tools";
+import { buildCodingToolDefs, buildNativeToolAliasWrappers } from "./pi-coding-tools";
 import { injectSdkRgPath } from "./sdk-platform-bin";
 
 const PROVIDER_ID = "flowship-custom";
 // pi 原生里名字跟规范面一致的内置工具（read/grep/edit/write）；
-// bash→shell、find→glob、delete/task 由 buildCodingToolDefs 补成 customTools
+// bash→shell、find→glob、delete/task 由 buildCodingToolDefs 补成 customTools。
+// write/edit/read 另有同名 custom 包装（认 Cursor 字段别名、盖掉 builtin）。
 const NATIVE_TOOLS = ["read", "edit", "write", "grep"];
 // 子 agent 用 pi 原生全套（读/写/跑命令），不带 task / flowshipChat 工具——防递归与副作用
 const SUBAGENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -110,37 +115,6 @@ interface ModelConfigEntry {
 type SendOptions = {
   onDelta?: (args: { update: InteractionUpdate }) => void;
   onStep?: (args: { step: ConversationStep }) => void;
-};
-
-/**
- * pi 把 HTTP 400 等失败写进 assistant 消息（stopReason=error），prompt() 不抛。
- * 从消息里抠 errorMessage，供 run 以 error 收尾而不是卡死等 agent_settled。
- */
-const readAssistantError = (msg: unknown): string | null => {
-  if (!msg || typeof msg !== "object") return null;
-  const m = msg as {
-    role?: unknown;
-    stopReason?: unknown;
-    errorMessage?: unknown;
-  };
-  if (m.role !== "assistant") return null;
-  if (m.stopReason !== "error" && m.stopReason !== "aborted") return null;
-  const raw =
-    typeof m.errorMessage === "string" && m.errorMessage.trim()
-      ? m.errorMessage.trim()
-      : `模型请求失败（${String(m.stopReason)}）`;
-  // 流已写完、只是上游没给 finish_reason：不当失败，否则 chat/task 的
-  // wait() 都过不了 finished 闸、正文后面跟一张红框。
-  return fatalAssistantError(raw);
-};
-
-const findAssistantError = (messages: unknown): string | null => {
-  if (!Array.isArray(messages)) return readAssistantError(messages);
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const err = readAssistantError(messages[i]);
-    if (err) return err;
-  }
-  return null;
 };
 
 // ----------------- Model / runtime 构造 -----------------
@@ -325,6 +299,7 @@ const runSubagent = async (
     modelRuntime: opts.runtime,
     model: opts.model,
     tools: [...SUBAGENT_TOOLS],
+    customTools: buildNativeToolAliasWrappers(opts.cwd),
     thinkingLevel: opts.thinkingLevel,
     // 子 agent 不落会话文件（一次性）
     sessionManager: SessionManager.inMemory(opts.cwd),
@@ -496,14 +471,19 @@ class PiRunAdapter {
           break;
         }
         case "message_end": {
-          const err = readAssistantError(ev.message);
-          if (err) this.lastAssistantError = err;
+          // 后续成功 stop/toolUse 必须清掉中途 503，否则 agent_settled 会拿粘性错误去重连
+          this.lastAssistantError = stickyErrorAfterMessageEnd(
+            this.lastAssistantError,
+            ev.message,
+          );
           break;
         }
         case "agent_end": {
           if (ev.willRetry) break;
-          const err =
-            findAssistantError(ev.messages) ?? this.lastAssistantError;
+          const err = settleErrorFromTranscript(
+            ev.messages,
+            this.lastAssistantError,
+          );
           if (err) {
             this.lastAssistantError = err;
             // pi 的 HTTP 400 写在 assistant 消息里、prompt() 不抛；不在这里 settle
@@ -513,17 +493,20 @@ class PiRunAdapter {
           break;
         }
         case "auto_retry_end": {
-          if (!ev.success) {
-            const err = fatalAssistantError(
-              ev.finalError || this.lastAssistantError || "模型请求失败",
-            );
-            // 缺 finish_reason：正文已在，按成功收尾，避免再等 agent_settled
-            this.settle(
-              err
-                ? { status: "error", result: err }
-                : { status: this.cancelled ? "cancelled" : "finished" },
-            );
+          if (ev.success) {
+            // 内部重试已恢复：清粘性错误，等后续 assistant / agent_settled 按最后一条收尾
+            this.lastAssistantError = null;
+            break;
           }
+          const err = fatalAssistantError(
+            ev.finalError || this.lastAssistantError || "模型请求失败",
+          );
+          // 缺 finish_reason：正文已在，按成功收尾，避免再等 agent_settled
+          this.settle(
+            err
+              ? { status: "error", result: err }
+              : { status: this.cancelled ? "cancelled" : "finished" },
+          );
           break;
         }
         case "tool_execution_end": {
@@ -563,11 +546,12 @@ class PiRunAdapter {
           break;
         }
         case "agent_settled": {
-          const fromState =
-            this.session.state.errorMessage?.trim() ||
-            findAssistantError(this.session.state.messages);
-          const err = fatalAssistantError(
-            this.lastAssistantError ?? fromState,
+          // 只认最后一条 assistant：中途 503 已被后续成功回复覆盖则 finished，不触发自动重连
+          const err = settleErrorFromTranscript(
+            this.session.state.messages,
+            this.lastAssistantError ??
+              this.session.state.errorMessage?.trim() ??
+              null,
           );
           if (err && !this.cancelled) {
             this.settle({ status: "error", result: err });

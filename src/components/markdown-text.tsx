@@ -51,6 +51,7 @@ import {
   parsePathSegments,
   pathDisplayLabel,
 } from "@/lib/path-utils";
+import { wrapLocalMarkdownImageDestinations } from "@/lib/local-image-src";
 import { rehypeRewriteLocalImages } from "@/lib/rehype-rewrite-local-images";
 import { remarkCodeReference } from "@/lib/remark-code-reference";
 import { remarkKeepTrailingUnderscore } from "@/lib/remark-keep-trailing-underscore";
@@ -201,6 +202,11 @@ const MarkdownTextImpl = ({
     () => buildMarkdownComponents(linker),
     [linker],
   );
+  // Application Support 等路径带空格：裸 markdown 图 destination 会被截断，包 <> 后再解析
+  const displayText = useMemo(
+    () => wrapLocalMarkdownImageDestinations(text),
+    [text],
+  );
   const ctxHighlight = useSearchFieldGlobalOffset(
     searchOwnerId ?? "",
     searchField,
@@ -257,7 +263,7 @@ const MarkdownTextImpl = ({
       // 行号视觉上不要（globals.css 藏 ::before 计数器）、但 **不能传 lineNumbers=false**：
       // 上游该路径行 span 不带 block class 也不吐换行、整块代码塌成一行（headless 实测）
     >
-      {text}
+      {displayText}
     </Streamdown>
   </div>
   );

@@ -350,9 +350,9 @@ git diff HEAD --name-only      # 改动文件名清单（便于后面 grep 对�
 - `action_id=<本 action 的 id>`
 - `artifact_path=actions/<n>-review.md`
 
-拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**。用户的下一步会以新消息送达：
+拿到 `[SUBMITTED]` 后说 1-3 句业务结论，然后结束本轮回复。用户的下一步会以新消息送达：
 
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句、如「为什么 §2 标红了？」「这处差异严重吗？」）→ 直接回复答疑、不弹窗、不动 artifact；**改类**（其他、含「改回 plan」「修改 plan 描述」「补做 task N」「这条不算差异、删掉」等、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才动文件、动完后**用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核；带图先 read 图再分类。先回应再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句、如「为什么 §2 标红了？」「这处差异严重吗？」）→ 不弹窗、不动 artifact；**改类**（其他、含「改回 plan」「修改 plan 描述」「补做 task N」「这条不算差异、删掉」等、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才动文件、动完后**用 `edit` 把本轮修正追加到 review artifact 的 `## 修改记录` 段末尾**（格式 / 禁项见「跨 action 共享规范 §5.1」）、重新跑 git diff 复核；带图先 read 图再分类。先调一次 `submit_work`（同 action_id + artifact_path）重新交卷，拿到 `[SUBMITTED]` 后再说回应、结束回复
   - **特例·用户对 bug 表态（V0.6.17）**：若 feedback 是对「## bug 复审」里某条 🔴/🟡 的处理决定（「这个不用改」「二期再说」「这个本次修」）→ 复述确认后、把裁决追加到「## bug 复审 → ### 用户裁决」子段（**bug 本体保留**、别从表里删——bug 是事实、裁决是决定）、review 本身**不改代码**。后续 build 读 review 就知道哪些 bug 用户已否决、**不重复问**（决定链落 md）。
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行、**绝对不自动进入 ship**——下一个 action 类型由用户在 UI 选
 

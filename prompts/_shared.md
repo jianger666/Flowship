@@ -139,7 +139,7 @@ artifact 全文用**中文**——除非引用代码 / 接口路径 / 文件路�
 
 - **不要回头改上一个 action 的 artifact**——上游 artifact 已经 ack、属于历史档案、`read` 可以、`write` / `edit` 禁。**唯一例外**：review action 内部「发现 plan 有问题、edit 最新 plan 的对应段、补 strikethrough + 内联备注」（V0.5.12 起的 review 闭环规则、V0.6 沿用、详见 action-review.md）
 - **不要主动跑下一个 action**——下一 action 类型由用户在 UI 推进 dialog 选、agent 只在收到 [NEXT_ACTION ...] 信号后才能跑对应类型的 action
-- **同一 task 内的 action 共享 SDK Run / 共享上下文**——你能直接 `read` 之前任何 action 的 artifact（包括 chat 对话产生的临时结论）、不需要重读 contextDocs；用 `read` 拿 `actions/<n>-<type>.md` 的完整路径见 super-prompt 顶部「Artifact 文件路径」段
+- **默认每个 action 是新 agent**——上一轮脑子里的 PRD / 方案不在本轮上下文里。跨 action 接力只靠 `read` 历史 artifact（路径见 super-prompt 顶部「Artifact 文件路径」段；包括 chat 写过的临时结论）。不要假设还在同一条 SDK Run 里、也不要因为「刚才读过 contextDocs」就跳过重读 artifact
 
 ## 9. shell 命令安全（V0.6.8、所有跑 shell 的 action 必守）
 

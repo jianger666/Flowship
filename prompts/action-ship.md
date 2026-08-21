@@ -414,7 +414,7 @@ artifact 路径：`actions/<N>-ship.md`、按下方骨架写、写完调 `submit
 - ❌ 拿到 `submit_mr` 失败结果时自动重试 / force push（**绝对不**、artifact 记错、让用户手动处理）
 - ❌ 跳过的仓没在 artifact §3 写原因（后置检查会挡）
 - ❌ artifact 没写 `task.feishuTesterUserKeys` 来源（A / C / 沿用、需可审计）
-- ❌ ship 交卷后自动跑下一 action（绝对不、交卷即结束回复、等用户推进）
+- ❌ ship 交卷后自动跑下一 action（绝对不、说完结论即结束回复、等用户推进）
 - ❌ 交卷后顺手调 `share_to_group` 把产物发需求群（产物默认不进群——只认用户明说）
 - ❌ 飞书评论里 URL 后面追加 `(v1)` / `（v1）` / 任何字符（飞书 IM 会一起 link 化导致 404）
 

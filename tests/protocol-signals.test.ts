@@ -17,7 +17,7 @@ import {
   SIGNAL_PREFIXES,
   buildNextActionHead,
 } from "@/lib/protocol-signals";
-import { askSubmittedText } from "@/lib/server/chat-mcp";
+import { askSubmittedText, mapSubmitWorkNotifyToToolText } from "@/lib/server/chat-mcp";
 
 const promptsDir = path.resolve(import.meta.dirname, "..", "prompts");
 const superMd = readFileSync(path.join(promptsDir, "_super.md"), "utf-8");
@@ -51,6 +51,15 @@ describe("信号常量 ↔ _super.md 一致性", () => {
     expect(superMd).not.toContain("不要再输出任何文本");
   });
 
+  it("交卷顺序是先调 submit_work、拿到 SUBMITTED 后再说结论", () => {
+    expect(superMd).toContain("拿到 `[SUBMITTED]` 后再说");
+    expect(superMd).not.toContain("先说再交卷");
+    expect(superMd).not.toContain("说一句无妨");
+    expect(superMd).not.toContain("交卷后再开口");
+    expect(superMd).not.toContain("你不用自己说这句");
+  });
+
+
   it("旧协议残留不该再出现在 _super.md（已退役）", () => {
     for (const legacy of [
       "[SHELL_WAIT_GUIDE",
@@ -61,6 +70,8 @@ describe("信号常量 ↔ _super.md 一致性", () => {
       "[INVALID_TOKEN]",
       "wait-ack",
       "long-poll",
+      "wait_for_user",
+      "先交卷再补说",
       // V0.13.x：revise / 问一问 双通道并入 [USER_MESSAGE] 统一消息
       "[ACTION_ACK",
       "[USER_QUESTION]",
@@ -179,5 +190,15 @@ describe("ask_user 收尾文案（对齐 Cursor SDK、去掉空完成硬限制�
     expect(text).toContain("静音");
     expect(text).toContain("[ASK_SUBMITTED]");
     expect(text).toContain("[ASK_USER_REPLY]");
+  });
+});
+
+describe("submit_work 回执（收尾槽位）", () => {
+  it("交卷成功回执引导 1-3 句业务结论、禁止复述交卷", () => {
+    const text = mapSubmitWorkNotifyToToolText({ status: "accepted" }, "act_1");
+    expect(text).toContain("[SUBMITTED]");
+    expect(text).toContain("1-3 句");
+    expect(text).toContain("不要再调本工具");
+    expect(text).toContain("不要复述交卷");
   });
 });

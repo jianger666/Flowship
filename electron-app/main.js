@@ -1669,6 +1669,8 @@ const promptWinInstall = async (version) => {
     if (response !== 0) return; // 「稍后」：phase 保持 ready、退出时 autoInstallOnAppQuit 兜底
     quitting = true;
     setUpdateState({ phase: "installing", version, error: null });
+    // /D= 已在 ensureWinAutoUpdater 钉成当前安装目录；这里再写一次防中途被改。
+    winAutoUpdater.installDirectory = path.dirname(process.execPath);
     winAutoUpdater.quitAndInstall(true, true);
   } finally {
     promptWinInstallInFlight = false;
@@ -1681,6 +1683,8 @@ const ensureWinAutoUpdater = async () => {
   const { default: updater } = await import("electron-updater");
   winAutoUpdater = updater.autoUpdater;
   winAutoUpdater.autoDownload = false; // 关键：检查时不下载、点按钮才 downloadUpdate（对齐 mac）
+  // 静默升级把 /D= 钉在当前 exe 目录，避免卸旧路径、装到默认路径导致快捷方式悬空
+  winAutoUpdater.installDirectory = path.dirname(process.execPath);
   // 下载进度 → 任务栏进度条 + 页面徽标进度（对齐 mac 的 Dock + 页面双通道）
   winAutoUpdater.on("download-progress", (p) => {
     if (typeof p?.percent !== "number") return;

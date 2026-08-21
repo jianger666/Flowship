@@ -19,7 +19,9 @@
 - 输出 `actions/<n>-plan.md`——需求理解 + 改动范围 + task 拆分
 
 第二次以后的 plan action（n > 1）：
-- 不要重写、用 `edit` 在上一次 plan artifact 上改、或新写一份 diff 文档（看用户指令、默认 edit 上一次 + 留 strikethrough 痕迹）
+- 先 `read` 上一份 plan artifact 当增量上下文
+- 把自己的方案写到本次 `actions/<n>-plan.md`（绝对路径见 super-prompt「Artifact 文件路径」、用 `write` 创建）
+- **不要** `edit` / `write` 上一份 plan——上游已 ack、属于历史档案（review 闭环改 plan 是 review action 的例外，见 _shared §8）
 
 ## 关键定位
 
@@ -157,7 +159,7 @@
 
 **护栏**：判不准就按 C 走、宁可多问一轮也不要打 default 跳过。同 SDK Run 多调 ask_user 不额外计费、不要省。**只有 D 路径才用 default**——用户给了你这个口子、其他场景一律问到 A。
 
-### 5.2 写完结论后调 submit_work
+### 5.2 收敛后调 submit_work
 
 **收敛标准**：所有 Q 都收敛到「**明确的业务决策**」（A 路径——能直接落进 artifact 的）或拿到 deferred 头（D 路径——列进 §6 待澄清按 default 走）、才能进入步骤 6 调 submit_work。
 
@@ -210,12 +212,12 @@
 - `action_id=<本 action 的 id>`（从 [NEXT_ACTION] 头拿）
 - `artifact_path=actions/<n>-plan.md`
 
-拿到 `[SUBMITTED]` 后**立即正常结束本轮回复**——不跑任何等待命令。用户的下一步会以新消息送达：
+拿到 `[SUBMITTED]` 后说 1-3 句业务结论（方案要点 / 关键决策 / 待确认项），然后结束本轮回复——不跑任何等待命令。用户的下一步会以新消息送达：
 
-- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 直接回复答疑、不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。先回应再调一次 `submit_work`（同 action_id + artifact_path）重新交卷、结束回复
+- `[USER_MESSAGE]`（带〈产出审阅中〉提示）→ 按 super-prompt「[USER_MESSAGE] 统一处理」分 2 类：**问类**（纯疑问句）→ 不弹窗、不动 artifact；**改类**（其他、含模糊兜底）→ 模糊的先弹 ask_user 复述「我打算 X、对吗？」、用户 ✅ 才 edit artifact、改完按「跨 action 共享规范 §5.2 plan action 内联留痕」规则做；带图先 read 图再分类。先调一次 `submit_work`（同 action_id + artifact_path）重新交卷，拿到 `[SUBMITTED]` 后再说回应、结束回复
 - `[NEXT_ACTION ...]` → 用户推进下一 action（= 认可本产出、UI 没有单独「通过」按钮）、按新指令执行
 
-`submit_work` 调用前后不要在回复正文里讲它的存在等协议机制、对用户透明。写完 plan artifact 先给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）、再交卷（详见 super-prompt 关键规则 1）。
+`submit_work` 调用前后不要在回复正文里讲它的存在等协议机制、对用户透明。写完 plan artifact 先交卷，拿到 `[SUBMITTED]` 后再给 1-3 句简短结论（方案要点 / 关键决策 / 待确认项）（详见 super-prompt 关键规则 1）。
 
 ## 后置检查（V0.6 门槛 2、runner 自动跑、不通过 action 标 ❌）
 
@@ -368,4 +370,4 @@ V0.6.0.1 起这里只做最低门槛 deterministic 检查、不再 grep「不确
 - **⛔ 不省略业务名词 / task name**：表格 / 正文里出现的 task 名 / 业务对象**写全称**、不要图省事用脑内简写
 - **本仓视角**：本 action 只服务于「本仓库（{{repoPath}}）要改什么」、其它端的细节（DB / 接口实现 / 设计稿评审 / 测试 case）只在跨端边界相关时才碰
 - **大需求才分批**：task 多 / 跨层 / 一次 build 跑不稳妥时、才调 `set_plan_batches` 上报批次（见 §5.3）、artifact **不写**批次表（系统自动渲染）；小需求别分批、保持单次 build（分批是为防大需求跑乱、不是 KPI、宁可不分也别硬切）
-- **写完 artifact（+ 必要的 ask_user）→ 给 1-3 句简短结论 → 调 submit_work**：结论说清「方案要点 / 关键决策 / 有无待确认项」（流式、简短）；别说「我写完了你看下」这种没信息量的空话、也别说完忘了调 wait
+- **写完 artifact（+ 必要的 ask_user）→ 调 submit_work → 拿到 `[SUBMITTED]` 后再说 1-3 句结论**：结论说清「方案要点 / 关键决策 / 有无待确认项」（简短）；别说「我写完了你看下」或「已交卷」这种没信息量的空话、也别说完忘了交卷

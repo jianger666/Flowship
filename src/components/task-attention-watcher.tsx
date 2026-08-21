@@ -7,6 +7,9 @@
  *  - 某任务 runStatus 转入 awaiting_user（AI 停下来等人）且窗口不在前台
  *    → 发系统通知；点通知壳聚焦窗口 + 回传 taskId、这里 router.push 跳详情页
  *
+ * task 交卷：后置检查只把 action 标 awaiting_ack；收尾旁白还在跑时 runStatus 仍是
+ * running。话说完 consume 才切 awaiting_user——通知不会在「点回来还在处理中」时响。
+ *
  * 只做「转变沿」检测：mount 时已在等待的任务不补发（陈旧噪声）。
  * V0.13.x 起 error 也通知：网络类失败已有自动重连兜底（重试 5 次）、真落到 error
  * 的都是需要人处理的问题、值得叫人回来（原「断线 error 噪声」的前提不再成立）。

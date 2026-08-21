@@ -132,7 +132,7 @@ V0.6.26 以前默认「单 SDK Run 跑全 task、forceNewAgent 是例外」、V0
 **会话内协议（V0.11 起「create + 多轮 send」、run 自然结束）**：
 
 - 用户每次「推进」action → 默认起新 agent + super prompt 冷启动；勾续用 → 对存活会话 `agent.send([NEXT_ACTION ...])` 接力
-- agent 跑完 action → 调 `submit_work(action_id)` **交卷**（非阻塞、返回「结束回复」；旧名 `wait_for_user` 仍为 alias）→ agent 正常结束 turn、run finished；runner **后台异步**跑后置检查（V0.8.18）、跑完把 action 标 `awaiting_ack`
+- agent 跑完 action → 写完 artifact 后调 `submit_work(action_id)` **交卷**（非阻塞）→ 拿到 `[SUBMITTED]` 后说 1-3 句业务结论并结束 turn（固定横幅在 run 结束补发）→ runner **后台异步**跑后置检查（V0.8.18）、跑完把 action 标 `awaiting_ack`
 - 用户操作以 send 送达：再聊聊 = `send([ACTION_ACK revise]+feedback)`、ask 答案 = `send([ASK_USER_REPLY]…)`；**通过纯服务端落状态**（agent 不需要收信号）
 - 终结 task → finalize 直接 cancel 活 run + 关会话（不再发 [TASK_DONE] 信号）
 
@@ -370,18 +370,22 @@ ai-flow-action-hub/
 
 > 写入规则：新子版本完成后在本段顶部追加、超过 2 个时把最老的迁到 `docs/CHANGELOG.md`。
 
+### v1.9.1（2026-08-21）交卷收尾槽位 / 系统通知对齐话说完 / Windows 自更新
+
+- **停止后立刻重发 409**：stop 已把 action 标 cancelled、runStatus idle，但 `runningTasks` 要等 consume finally 才摘。输入条把「表里还有 runner」当成真干活，回「agent 正在跑」。现对 cancelled / error / idle 跟 awaiting_ack 一样先 `waitForTaskToStop` 再走唤醒。
+- **交卷收尾槽位**：写完产物先调 `submit_work`；工具循环下一轮本来就会打模型，回执把它收成 1-3 句业务结论再结束。不 abort、不做同轮正文检测。`ask_user` 仍静音豁免。
+- **事件流本地图带空格**：`![二维码](/Users/…/Application Support/…/qr.png)` 会被 CommonMark 在空格截断、显示成原文。渲染前把这类 destination 包进 `<>`，再走 `/api/local-image`。
+- **中途 503 误触发自动重连**：pi 把 `Endpoint is unavailable` 写进 assistant 后内部重试成功，结论已经上屏，但 settle 从后往前扫整段会话仍命中那条 503 → wait() error →「连接中断、正在自动重连」。现只认最后一条 assistant；后续 stop/toolUse 清掉粘性错误。真重试耗尽仍走重连。
+- **write 后空等**：交卷不进事件流，write 打勾之后下一轮模型还要几秒。工作过程组末尾挂独立「处理中…」，底部状态行同样改口；正文开始流再切回「正在回复…」。不暴露 `submit_work`。write 完成后自动收起（产物栏已有文件），避免处理中时路径展开区一直占着。
+- **系统通知对齐话说完**：交卷后置检查只把 action 标 `awaiting_ack`；收尾旁白还在跑时 `runStatus` 保持 `running`。consume 结束（或检查比旁白慢）才切 `awaiting_user`。mac/win 系统通知跟这个状态走，避免点回来还在「处理中」。
+- **Windows 自更新卸完装不上**：升级时 `taskkill` 去掉 `/T`（不把刚派生的安装器杀掉），仍杀 `Flowship.exe` 清隐形 server；装完强制重建桌面 / 开始菜单快捷方式；`quitAndInstall` 把 `/D=` 钉在当前安装目录。已经点升级后快捷方式「找不到应用」的同事：到 GitHub Release 下载本版 exe 手动装一次（数据在 `fe-ai-flow`，不会丢）。
+
 ### v1.9.0（2026-08-21）自定义 HTTP 提供方：task / chat 都能推
 
 - **为什么**：设置页只能 Cursor / 一条自定义二选一，改默认会劫持所有窗口；老用户升级不能把已有 Cursor 任务悄悄改去跑 HTTP API。
 - **改了什么**：设置页是目录（Cursor SDK 固定第一项，自定义可新增多条）。`settings.provider` 只给**新建**拷到 `task.provider`。已有窗口用自己的提供方；task 创建后、chat 发出第一条后不能再切（PATCH 409）。旧 `{ provider: "custom", customProvider }` 读盘迁成 `cp_legacy`。**没有 `task.provider` 的老任务一律 Cursor**（即使设置页默认已是自定义）。chat / 推进 / 答题 / 标题都走 `agent-backend`：cursor 仍是 SDK + JSONL store，自定义走 pi。自定义允许空 Key。提供方+模型并排 picker；常用改成每提供方最多 2 个星标。`pg-exec.mjs` 查库（brief 有 PG 才注入）。飞书桥接「本机另一处已在收」改注意态，不当失败红叉。pi `shell` 超时按秒理解；SDK 自带 `rg` 注入 PATH；回合内工具失败不再当红框崩溃。
 - **故意不动**：不把 Cursor 会话转成 pi 会话；不按 URL 猜 OpenCode Go。
 - **升级**：未配自定义的老用户路径不变。已配旧单槽自定义的会看见 `cp_legacy`。Cursor 会话恢复口径与 v1.8.2 相同（JSONL store）。
-
-### 2026-08-19 SDK store 改挂 JSONL（v1.8.2）
-
-- **为什么**：同事 Windows 长 run 收尾报 `[internal] unable to open database file`。这是 Cursor SDK 默认 SQLite store（`~/.cursor` 下 WAL）被杀毒 / OneDrive 拦掉，不是 Flowship 自己的库。
-- **改了什么**：`Agent.create` / `resume` / `prompt` 经 `dataRoot/sdk-agent-store` 的 `JsonlLocalAgentStore`（不写用户主目录）。v1.9.0 起入口是 `agent-backend`（cursor 分支仍走这份 store）。Flowship 会话恢复仍走 `events.jsonl`；升级后内存里的旧 agent 会随重启丢掉，下一次续聊 `Agent.resume` 对不上 JSONL 会清锚点、按事件流起新会话。
-- **故意不动**：不在 instrumentation 里 `Cursor.configure`（那个 bundle 不能碰 `@cursor/sdk`）。
 
 ## 关键文件索引
 

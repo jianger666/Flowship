@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatShellFailureText,
+  prepareEditPathArgs,
+  prepareGlobArgs,
+  prepareReadArgs,
+  prepareShellArgs,
+  prepareWriteArgs,
   resolveShellTimeoutMs,
 } from "../src/lib/server/pi-coding-tools";
 
@@ -55,5 +60,55 @@ describe("formatShellFailureText", () => {
         message: "Command failed",
       }),
     ).toBe("oops");
+  });
+});
+
+describe("Cursor 参数别名 → pi 规范字段", () => {
+  it("write：fileText → content，已有 content 不覆盖", () => {
+    expect(prepareWriteArgs({ path: "/a.md", fileText: "hello" })).toEqual({
+      path: "/a.md",
+      content: "hello",
+    });
+    expect(
+      prepareWriteArgs({ path: "/a.md", content: "keep", fileText: "ignore" }),
+    ).toEqual({ path: "/a.md", content: "keep" });
+  });
+
+  it("write：target_file / file_path → path", () => {
+    expect(prepareWriteArgs({ target_file: "/b.md", contents: "x" })).toEqual({
+      path: "/b.md",
+      content: "x",
+    });
+  });
+
+  it("glob：globPattern / targetDirectory → pattern / path", () => {
+    expect(
+      prepareGlobArgs({ globPattern: "**/*.ts", targetDirectory: "src" }),
+    ).toEqual({ pattern: "**/*.ts", path: "src" });
+    expect(prepareGlobArgs({ pattern: "*.md" })).toEqual({ pattern: "*.md" });
+  });
+
+  it("shell：working_directory / cwd → workingDirectory", () => {
+    expect(prepareShellArgs({ command: "ls", cwd: "/tmp" })).toEqual({
+      command: "ls",
+      workingDirectory: "/tmp",
+    });
+    expect(
+      prepareShellArgs({ command: "ls", workingDirectory: "/keep", cwd: "/no" }),
+    ).toEqual({ command: "ls", workingDirectory: "/keep" });
+  });
+
+  it("read / edit：只收路径别名，不动其余字段", () => {
+    expect(prepareReadArgs({ file_path: "/x.ts", offset: 2 })).toEqual({
+      path: "/x.ts",
+      offset: 2,
+    });
+    expect(
+      prepareEditPathArgs({
+        target_file: "/y.ts",
+        oldText: "a",
+        newText: "b",
+      }),
+    ).toEqual({ path: "/y.ts", oldText: "a", newText: "b" });
   });
 });

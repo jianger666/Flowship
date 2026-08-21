@@ -14,7 +14,10 @@ import { ChevronRight, Loader2, X } from "lucide-react";
 
 import { usePaneSearchHighlight } from "@/components/ui/pane-search-highlight-context";
 import { useStreamFollowContext } from "@/hooks/use-stream-follow";
-import type { WorkGroupItem } from "@/lib/chat-turns";
+import {
+  PROCESSING_PLACEHOLDER_LABEL,
+  type WorkGroupItem,
+} from "@/lib/chat-turns";
 import { formatDurationCoarse } from "@/lib/duration-display";
 import { shouldPinWorkGroupOpen } from "@/lib/scroll-follow";
 import {
@@ -106,6 +109,14 @@ const CollapseChevron = ({ open }: { open: boolean }) => (
 
 // ---------- WorkGroupRow ----------
 
+/** 工具都完成后的空等：转圈挂在这一行，不让 write 一直像没结束 */
+const ProcessingPlaceholderRow = () => (
+  <div className="flex w-full min-w-0 items-center gap-1.5 px-1 py-0.5 text-xs text-muted-foreground">
+    <Loader2 className="size-3.5 shrink-0 animate-spin text-info" />
+    <span className="text-[11px]">{PROCESSING_PLACEHOLDER_LABEL}</span>
+  </div>
+);
+
 const WorkGroupRowImpl = ({
   group,
   taskId,
@@ -113,6 +124,7 @@ const WorkGroupRowImpl = ({
   variant = "chat",
   liveToolOutputs,
   isRunningTail,
+  showProcessingPlaceholder,
 }: {
   group: WorkGroupItem;
   taskId: string;
@@ -123,6 +135,8 @@ const WorkGroupRowImpl = ({
   liveToolOutputs?: Record<string, string>;
   /** 本组是全流最后一个组且 agent 正在 running（展开判定用） */
   isRunningTail?: boolean;
+  /** 流尾空等：write 已完成、下一句还没出来 */
+  showProcessingPlaceholder?: boolean;
 }) => {
   // null = 未手动干预，跟随 autoExpanded；boolean = 用户点过，以手动为准
   const [manual, setManual] = useState<boolean | null>(null);
@@ -160,8 +174,14 @@ const WorkGroupRowImpl = ({
     hasSearchHitInGroup ||
     (manual ?? (autoExpanded || stickyOpenRef.current));
 
-  const runningTail =
-    !expanded && group.hasRunning ? lastRunningName(group.members) : null;
+  // 折叠且 running / 处理中：右侧一眼活动，组头要极淡不抢戏
+  let runningTail: string | null = null;
+  if (!expanded) {
+    if (group.hasRunning) runningTail = lastRunningName(group.members);
+    else if (showProcessingPlaceholder) {
+      runningTail = PROCESSING_PLACEHOLDER_LABEL;
+    }
+  }
 
   return (
     <div className="min-w-0">
@@ -208,6 +228,7 @@ const WorkGroupRowImpl = ({
               liveToolOutputs={liveToolOutputs}
             />
           ))}
+          {showProcessingPlaceholder ? <ProcessingPlaceholderRow /> : null}
         </div>
       )}
     </div>

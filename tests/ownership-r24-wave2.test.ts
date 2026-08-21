@@ -258,6 +258,48 @@ describe("ownership R24 wave2", () => {
     expect(runningChecks.has(id)).toBe(false);
   }, 15_000);
 
+  it("R24-1 收尾旁白还在跑：check 完成只落 awaiting_ack，runStatus 仍 running", async () => {
+    const id = alloc();
+    await seedRunningAction(id);
+    const task = (await getTask(id))!;
+    const callerToken = String(allocTaskRunInstanceId());
+    const runHandle = claimTaskOp(id, getTaskOpGeneration(id))!;
+    const { awaitingNotifier } = registerBridgesForTest(task, {
+      callerToken,
+    });
+    // consume 还没结束：占着 runningTasks，系统通知不该在交卷当下响
+    runningTasks.set(id, {
+      instanceId: 1,
+      agentId: "wrap-up",
+      startedAt: Date.now(),
+      startSnapshot: {} as never,
+      cancel: () => {},
+    });
+    releaseTaskOpIf(runHandle);
+
+    void awaitingNotifier(
+      {
+        kind: "awaiting_start",
+        actionId: "act_shared",
+        artifactPath: "actions/1-plan.md",
+      },
+      { callerStillValid: () => true },
+    );
+    await waitUntil(() => runningChecks.has(id));
+    releaseCheckGate?.();
+    await waitUntil(async () => {
+      const m = await readMetaV06(id);
+      return (
+        m?.actions.find((a) => a.id === "act_shared")?.status ===
+        "awaiting_ack"
+      );
+    }, 8000);
+
+    const m = await readMetaV06(id);
+    expect(m?.runStatus).toBe("running");
+    expect(runningChecks.has(id)).toBe(false);
+  }, 15_000);
+
   it("R24-1 接管：check 期间 stop revoke → 不落状态 + runningChecks 摘掉", async () => {
     const id = alloc();
     await seedRunningAction(id);
